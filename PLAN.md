@@ -45,13 +45,14 @@ nftables · uci · l2disco · ipcbus · pollworker · chunkframe · lenframe/jso
 ## Progress
 
 - ✅ **T1 `netaddr`** — done + verified (RFC 6724, zero-alloc). Committed.
-- ✅ **T2 `http` Phase 1** — done + verified (HTTP/1.1 client over TLS). Committed. *(Ph2 server codec, Ph3 h2 = later.)*
+- ✅ **T2 `http` Phase 1** — done + verified (HTTP/1.1 client over TLS). Committed `55245f3`.
+- ✅ **T2 `http` Phase 2** — done + verified (HTTP/1.1 server codec + serving loop, `http.Server`; 125/125). Committed `445f597`. *(Ph3 h2 = later.)*
 - ✅ **T3 `dns` + DoH** — done + verified (codec golden/fuzz, UDP+TC→TCP, TCP, DoH POST/GET + DoH-JSON,
   hosts/resolv.conf/search, PTR via netaddr; live round-trips green, skip cleanly in a netns). Committed `400174a`.
 
 ## Current agent assignment
 
-**T2 `http` Phase 2 — server codec + serving loop** (spec: `SPEC-http-server.md`). Adds `http.Server`
-on top of the Phase-1 `h1.zig` codec; unblocks the REST/API cluster (internet-behind-Caddy goal).
-In-process dogfood test = our Client vs our Server. Read `BRIEF.md`, `CONVENTIONS.md`, `SPEC-http-server.md`.
-Do NOT start HTTP/2 (Phase 3).
+**T5.1 `router`** (spec: `SPEC-router.md`) — REST routing on `http.Server`: method+path patterns
+(params/wildcards), middleware chain, groups, 404/405. First module of the Web/API cluster; the
+integration point ratelimit/abuseguard/throttle/openapi/cors/metrics plug into. Read `BRIEF.md`,
+`CONVENTIONS.md`, `SPEC-router.md`. Then the cluster middleware follows.
