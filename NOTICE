@@ -62,5 +62,10 @@ audit is pending before any public release.
                Authors; slot semantics only), Netflix concurrency-limits
                (Apache-2.0; design notes only), SEDA (Welsh et al., SOSP '01
                paper — bounded-queue load shedding).
+  security-headers — design ref: helmet.js (MIT; defaults vocabulary + the
+               `csp_helmet_default` constant reproducing helmet's default
+               policy VALUE as configuration data, no source copied), OWASP
+               Secure Headers Project; header semantics from RFC 6797 (HSTS),
+               CSP Level 3, Fetch/HTML specs (COOP/CORP/COEP), RFC 9110.
 
 See each module's README "Provenance" note for its specific seed and reference.

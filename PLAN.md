@@ -73,6 +73,11 @@ later additions.
 
 - ✅ **T5.5 `throttle`** — done + verified (max-in-flight semaphore + 503 load-shedding, bounded wait; 213/213). Committed `cab3480`.
 
+- ✅ **T5.6 `security-headers`** — done + verified (stateless secure-by-default header middleware:
+  HSTS/CSP-opt-in/nosniff/XFO-DENY/Referrer/Permissions/COOP/CORP/COEP-opt-in + Server replacement;
+  precomputed values, allocation-free hot path; `@import("security-headers")` hyphen name proven;
+  224/224 Debug + ReleaseFast, integration over loopback). Uncommitted (awaiting review).
+
 ## Current agent assignment
 
 **T5.6 `security-headers`** (spec: `SPEC-security-headers.md`) — secure-by-default response headers
