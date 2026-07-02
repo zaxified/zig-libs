@@ -67,5 +67,10 @@ audit is pending before any public release.
                policy VALUE as configuration data, no source copied), OWASP
                Secure Headers Project; header semantics from RFC 6797 (HSTS),
                CSP Level 3, Fetch/HTML specs (COOP/CORP/COEP), RFC 9110.
+  cors       — design ref: rs/cors (Go, MIT; preflight interception + the
+               origin/method/header gate semantics) and expressjs/cors (MIT;
+               reflect-request-headers default); protocol semantics from the
+               WHATWG Fetch standard (CORS protocol) and RFC 9110. No source
+               copied.
 
 See each module's README "Provenance" note for its specific seed and reference.

@@ -27,6 +27,7 @@ const module_list = [_]Module{
     // Importable as @import("security-headers") — module names are plain
     // strings, the hyphen is fine (cf. the community's "known-folders").
     .{ .name = "security-headers", .deps = &.{ "router", "http" } },
+    .{ .name = "cors", .deps = &.{ "router", "http" } },
     // Scaffold more here (copy modules/_template) — see the catalog in
     // ~/CML/zig-libs-plan.md for the full candidate list.
 };

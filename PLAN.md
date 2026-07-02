@@ -80,6 +80,11 @@ later additions.
 
 - ✅ **T5.6 `security-headers`** — done + verified (secure-by-default header middleware; 224/224). Committed `d02aa54`.
 
+- ✅ **T5.7 `cors`** — done + verified (global-middleware CORS: preflight interception → 204 no-body
+  before 404/405, origin/method/header gates, `.none` opt-in default, `*`+credentials rejected at
+  init, reflect-or-list allowed headers, init-time joins = allocation-free hot path; 238/238 Debug +
+  ReleaseFast, integration over loopback). Uncommitted (awaiting review).
+
 ## Current agent assignment
 
 **T5.7 `cors`** (spec: `SPEC-cors.md`) — CORS preflight + header injection as a global `router`
