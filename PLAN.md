@@ -71,8 +71,10 @@ later additions.
   Retry-After middleware; optional bounded wait via Io futex + capped waiter queue;
   213/213 Debug + ReleaseFast, integration exercised over loopback). Uncommitted (awaiting review).
 
+- ✅ **T5.5 `throttle`** — done + verified (max-in-flight semaphore + 503 load-shedding, bounded wait; 213/213). Committed `cab3480`.
+
 ## Current agent assignment
 
-**T5.5 `throttle`** (spec: `SPEC-throttle.md`) — global concurrency limiter + load-shedding (503 +
-Retry-After) as a `router` middleware; separable semaphore primitive. Read `BRIEF.md`, `CONVENTIONS.md`,
-`SPEC-throttle.md`. Then: `security-headers` → `openapi` → `cors` → `validate` → `metrics` → `resilience`.
+**T5.6 `security-headers`** (spec: `SPEC-security-headers.md`) — secure-by-default response headers
+(HSTS/CSP/nosniff/frame-options/referrer/permissions/COOP-CORP) as a stateless `router` middleware.
+Read `BRIEF.md`, `CONVENTIONS.md`, `SPEC-security-headers.md`. Then: `openapi` → `cors` → `validate` → `metrics` → `resilience`.
