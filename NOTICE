@@ -55,5 +55,8 @@ audit is pending before any public release.
                (BSD-3-Clause).
   ratelimit  — design ref: golang.org/x/time/rate (BSD-3-Clause, The Go
                Authors), nginx limit_req.
+  abuseguard — design ref: nginx limit_conn (BSD-2-Clause), fail2ban
+               (GPL-2.0 — documented behavior only, no code consulted or
+               copied).
 
 See each module's README "Provenance" note for its specific seed and reference.

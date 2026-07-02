@@ -22,6 +22,7 @@ const module_list = [_]Module{
     .{ .name = "ramcache" },
     .{ .name = "router", .deps = &.{"http"} },
     .{ .name = "ratelimit", .deps = &.{ "router", "http", "netaddr" } },
+    .{ .name = "abuseguard", .deps = &.{ "http", "netaddr", "router" } },
     // Scaffold more here (copy modules/_template) — see the catalog in
     // ~/CML/zig-libs-plan.md for the full candidate list.
 };
