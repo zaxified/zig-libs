@@ -50,9 +50,11 @@ nftables · uci · l2disco · ipcbus · pollworker · chunkframe · lenframe/jso
 - ✅ **T3 `dns` + DoH** — done + verified (codec golden/fuzz, UDP+TC→TCP, TCP, DoH POST/GET + DoH-JSON,
   hosts/resolv.conf/search, PTR via netaddr; live round-trips green, skip cleanly in a netns). Committed `400174a`.
 
+- ✅ **T5.1 `router`** — done + verified (trie matcher, middleware struct, 404/405). Committed `5741ce0`.
+
 ## Current agent assignment
 
-**T5.1 `router`** (spec: `SPEC-router.md`) — REST routing on `http.Server`: method+path patterns
-(params/wildcards), middleware chain, groups, 404/405. First module of the Web/API cluster; the
-integration point ratelimit/abuseguard/throttle/openapi/cors/metrics plug into. Read `BRIEF.md`,
-`CONVENTIONS.md`, `SPEC-router.md`. Then the cluster middleware follows.
+**T5.2 `ratelimit`** (spec: `SPEC-ratelimit.md`) — token-bucket limiter + `router` middleware (429 +
+Retry-After), clock-injected, per-key bounded store, XFF key extraction. First consumer of
+`router.Middleware`. Read `BRIEF.md`, `CONVENTIONS.md`, `SPEC-ratelimit.md`.
+Remaining cluster after: `abuseguard`, `throttle`, `openapi`, `cors`, `metrics` (independent — can fan out).
