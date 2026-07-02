@@ -34,6 +34,19 @@ This brief is self-contained — you do not need any other context to work here.
   syscalls) — no portable fallback required.
 - Full conventions + the `meta` tag vocabulary: see `CONVENTIONS.md`.
 
+## Licensing & provenance (IMPORTANT)
+
+- **License = MIT** (see `LICENSE`). Put `// SPDX-License-Identifier: MIT` as the first line of
+  every module's `src/root.zig`.
+- **Only take code from:** our own seed projects (bxp/axp = Apache-2.0, relicensed to MIT here by
+  the copyright holder; poc-wf-analytic; zig-fping) — OR **clean-room reimplement from a public
+  spec/RFC**. NEVER copy from GPL/AGPL/LGPL or unknown-license third-party source. "Model after X"
+  means study the design and reimplement — do not paste code.
+- **Record provenance** in the module `README.md`: a `Provenance:` line = the seed (+ its license)
+  and/or "clean-room from <spec>", plus any third-party design reference and its license.
+- `netaddr` is fping-derived → the fping attribution is in `NOTICE`. If you introduce a new
+  third-party design reference, add it to `NOTICE`.
+
 ## Repo shape
 
 ```

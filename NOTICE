@@ -1,0 +1,59 @@
+zig-libs
+Copyright (c) 2026 zig-libs contributors
+Licensed under the MIT License (see LICENSE).
+
+This product includes software derived from, or designed with reference to,
+the third parties listed below. All are permissive (MIT/BSD-family) and
+MIT-compatible. Where actual code was ported (not merely modeled), the
+required attribution is reproduced.
+
+====================================================================
+1. REQUIRED ATTRIBUTION — ported code
+====================================================================
+
+## fping  (affects module: netaddr)
+
+The `netaddr` module's address-selection logic was extracted from the
+authors' `zig-fping` project, which is a Zig port of fping
+(https://github.com/schweikert/fping). fping's license therefore applies to
+the derived portions and is reproduced here as its terms require:
+
+    Original author:      Roland Schemers   <schemers@stanford.edu>
+    IPv6 Support:         Jeroen Massar
+    Improved main loop:   David Schweikert
+    Debian Merge, TOS:    Tobi Oetiker
+    Bugfixes, byte order & seq numbers: Stephan Fuhrmann
+
+    Redistribution and use in source and binary forms are permitted
+    provided that the above copyright notice and this paragraph are
+    duplicated in all such forms and that any documentation, advertising
+    materials, and other materials related to such distribution and use
+    acknowledge that the software was developed by Stanford University.
+    The name of the University may not be used to endorse or promote
+    products derived from this software without specific prior written
+    permission. THIS SOFTWARE IS PROVIDED "AS IS" AND WITHOUT ANY EXPRESS
+    OR IMPLIED WARRANTIES.
+
+====================================================================
+2. DESIGN REFERENCES — clean-room (recorded for provenance)
+====================================================================
+
+The following were used as DESIGN references only: the code was reimplemented
+from public specifications (RFCs) or from the authors' own projects (bxp, axp
+= Apache-2.0, relicensed by their copyright holder to MIT here; poc-wf-analytic
+= same authors). No third-party source was copied. Listed with their upstream
+license so any future line-level reuse is attributed correctly. A provenance
+audit is pending before any public release.
+
+  netaddr    — RFC 6724, RFC 5952 (specs); cross-checked vs Go net/addrselect
+               (BSD-3-Clause, The Go Authors) + glibc getaddrinfo algorithm.
+  http       — RFC 7230/9110 (HTTP/1.1); design ref: nghttp2 (MIT) for future
+               HTTP/2; TLS via Zig std.crypto.tls.
+  dns        — RFC 1035 (wire), RFC 8484 (DoH); design ref: miekg/dns
+               (BSD-3-Clause) + c-ares.
+  router     — design ref: go-chi/chi (MIT), julienschmidt/httprouter
+               (BSD-3-Clause).
+  ratelimit  — design ref: golang.org/x/time/rate (BSD-3-Clause, The Go
+               Authors), nginx limit_req.
+
+See each module's README "Provenance" note for its specific seed and reference.

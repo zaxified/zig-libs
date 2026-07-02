@@ -40,8 +40,17 @@ Rule: **prefer Zig 0.16 std** for a dep; only promote a sub-dependency to its ow
 std has a *real gap* and it makes sense to own it. (std already has `std.json`, `std.crypto.tls`
 client, `std.compress` flate/zstd decode — adopt those; build where they fall short.)
 
+## Licensing & provenance
+
+zig-libs is **MIT** (`LICENSE`). Every module `src/root.zig` starts with
+`// SPDX-License-Identifier: MIT`. Take code only from our own seed projects or clean-room from a
+spec/RFC — never copy GPL/AGPL/LGPL or unknown-license third-party source. Each module README has a
+`Provenance:` line (seed + license, or "clean-room from <spec>", + any design reference). Third-party
+attributions live in `NOTICE` (fping is already there for `netaddr`).
+
 ## Adding a module
 
-1. `cp -r modules/_template modules/<name>` and fill in `src/root.zig` + `README.md`.
+1. `cp -r modules/_template modules/<name>`, fill `src/root.zig` (SPDX line + `meta` + API + tests)
+   and `README.md` (incl. a `Provenance:` line).
 2. Add `.{ .name = "<name>", .deps = &.{...} }` to `module_list` in `build.zig`.
 3. `zig build test-<name>`.
