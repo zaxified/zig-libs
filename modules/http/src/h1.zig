@@ -1,10 +1,12 @@
 //! h1 — pure HTTP/1.1 wire framing. No sockets, no allocation: everything
 //! operates on `std.Io.Reader`/`std.Io.Writer` interfaces and caller buffers,
-//! so it is fully testable offline and reusable by the Phase 2 server codec.
+//! so it is fully testable offline and shared by the client and the server.
 //!
-//! Contents: response-head reader + parser, chunked transfer-coding decoder
-//! (`ChunkedReader`) and encoder (`ChunkedWriter`), and a Content-Length
-//! bounded body reader that detects truncation (`ContentLengthReader`).
+//! Contents: message-head reader, response-head parser (`ResponseHead`,
+//! client side), request-head parser (`RequestHead`, server side), chunked
+//! transfer-coding decoder (`ChunkedReader`) and encoder (`ChunkedWriter`),
+//! and a Content-Length bounded body reader that detects truncation
+//! (`ContentLengthReader`).
 
 const std = @import("std");
 const Reader = std.Io.Reader;
@@ -45,14 +47,69 @@ fn trimLineEnd(line: []const u8) []const u8 {
     return std.mem.trimEnd(u8, line, "\r\n");
 }
 
-// ── response head parsing ───────────────────────────────────────────────────
+// ── header fields (shared by request + response heads) ─────────────────────
 
 pub const HeadParseError = error{
-    /// Not a syntactically valid HTTP/1.x response head.
+    /// Not a syntactically valid HTTP/1.x message head.
     MalformedHead,
     /// An HTTP version this module does not speak (e.g. HTTP/2 on the wire).
     UnsupportedVersion,
 };
+
+pub const HeaderEntry = struct { name: []const u8, value: []const u8 };
+
+/// Strict header-line split (no obs-fold, no whitespace around the name);
+/// the value is trimmed of optional whitespace. `line` must be non-empty and
+/// already stripped of its line ending.
+fn parseHeaderLine(line: []const u8) HeadParseError!HeaderEntry {
+    if (line[0] == ' ' or line[0] == '\t') return error.MalformedHead; // obs-fold
+    const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.MalformedHead;
+    const name = line[0..colon];
+    if (name.len == 0 or std.mem.indexOfAny(u8, name, " \t") != null)
+        return error.MalformedHead;
+    return .{ .name = name, .value = std.mem.trim(u8, line[colon + 1 ..], " \t") };
+}
+
+/// Lenient wire-order iterator over a raw header block (lines that fail to
+/// split are skipped — parse validated them already).
+pub const HeaderIterator = struct {
+    lines: std.mem.SplitIterator(u8, .scalar),
+
+    pub fn next(it: *HeaderIterator) ?HeaderEntry {
+        while (it.lines.next()) |raw| {
+            const line = trimLineEnd(raw);
+            if (line.len == 0) continue;
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            return .{
+                .name = line[0..colon],
+                .value = std.mem.trim(u8, line[colon + 1 ..], " \t"),
+            };
+        }
+        return null;
+    }
+};
+
+fn iterateHeaderBlock(block: []const u8) HeaderIterator {
+    return .{ .lines = std.mem.splitScalar(u8, block, '\n') };
+}
+
+fn findHeader(block: []const u8, name: []const u8) ?[]const u8 {
+    var it = iterateHeaderBlock(block);
+    while (it.next()) |entry| {
+        if (std.ascii.eqlIgnoreCase(entry.name, name)) return entry.value;
+    }
+    return null;
+}
+
+/// Latch a Content-Length value; duplicates must agree (RFC 7230 §3.3.2).
+fn latchContentLength(current: *?u64, value: []const u8) HeadParseError!void {
+    const n = std.fmt.parseInt(u64, value, 10) catch return error.MalformedHead;
+    if (current.*) |prev| {
+        if (prev != n) return error.MalformedHead; // conflicting lengths
+    } else current.* = n;
+}
+
+// ── response head parsing ───────────────────────────────────────────────────
 
 /// A parsed response head. All slices point into the head block passed to
 /// `parse` — keep that buffer alive as long as the head is used.
@@ -105,22 +162,14 @@ pub const ResponseHead = struct {
         while (lines.next()) |raw| {
             const line = trimLineEnd(raw);
             if (line.len == 0) continue; // tolerate a trailing empty split
-            if (line[0] == ' ' or line[0] == '\t') return error.MalformedHead; // obs-fold
-            const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.MalformedHead;
-            const name = line[0..colon];
-            if (name.len == 0 or std.mem.indexOfAny(u8, name, " \t") != null)
-                return error.MalformedHead;
-            const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+            const entry = try parseHeaderLine(line);
 
-            if (std.ascii.eqlIgnoreCase(name, "content-length")) {
-                const n = std.fmt.parseInt(u64, value, 10) catch return error.MalformedHead;
-                if (head.content_length) |prev| {
-                    if (prev != n) return error.MalformedHead; // conflicting lengths
-                } else head.content_length = n;
-            } else if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
-                if (tokenListContains(value, "chunked")) head.chunked = true;
-            } else if (std.ascii.eqlIgnoreCase(name, "connection")) {
-                if (tokenListContains(value, "close")) head.connection_close = true;
+            if (std.ascii.eqlIgnoreCase(entry.name, "content-length")) {
+                try latchContentLength(&head.content_length, entry.value);
+            } else if (std.ascii.eqlIgnoreCase(entry.name, "transfer-encoding")) {
+                if (tokenListContains(entry.value, "chunked")) head.chunked = true;
+            } else if (std.ascii.eqlIgnoreCase(entry.name, "connection")) {
+                if (tokenListContains(entry.value, "close")) head.connection_close = true;
             }
         }
 
@@ -131,44 +180,135 @@ pub const ResponseHead = struct {
 
     /// First value of header `name` (case-insensitive), or null.
     pub fn header(h: *const ResponseHead, name: []const u8) ?[]const u8 {
-        var it = h.iterate();
-        while (it.next()) |entry| {
-            if (std.ascii.eqlIgnoreCase(entry.name, name)) return entry.value;
-        }
-        return null;
+        return findHeader(h.header_block, name);
     }
 
-    pub const HeaderEntry = struct { name: []const u8, value: []const u8 };
-
-    pub const Iterator = struct {
-        lines: std.mem.SplitIterator(u8, .scalar),
-
-        pub fn next(it: *Iterator) ?HeaderEntry {
-            while (it.lines.next()) |raw| {
-                const line = trimLineEnd(raw);
-                if (line.len == 0) continue;
-                const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
-                return .{
-                    .name = line[0..colon],
-                    .value = std.mem.trim(u8, line[colon + 1 ..], " \t"),
-                };
-            }
-            return null;
-        }
-    };
+    pub const Iterator = HeaderIterator;
 
     /// Iterate all header name/value pairs in wire order.
-    pub fn iterate(h: *const ResponseHead) Iterator {
-        return .{ .lines = std.mem.splitScalar(u8, h.header_block, '\n') };
+    pub fn iterate(h: *const ResponseHead) HeaderIterator {
+        return iterateHeaderBlock(h.header_block);
     }
 };
 
-fn tokenListContains(list: []const u8, token: []const u8) bool {
+/// True when the comma-separated `list` contains `token` (case-insensitive,
+/// optional whitespace) — e.g. `Connection: keep-alive, close`.
+pub fn tokenListContains(list: []const u8, token: []const u8) bool {
     var it = std.mem.splitScalar(u8, list, ',');
     while (it.next()) |t| {
         if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, t, " \t"), token)) return true;
     }
     return false;
+}
+
+// ── request head parsing ────────────────────────────────────────────────────
+
+/// A parsed request head (server side). All slices point into the head block
+/// passed to `parse` — keep that buffer alive as long as the head is used.
+/// Purely syntactic: semantic rejections (missing Host on 1.1, unsupported
+/// Transfer-Encoding, unknown method) are the server's call.
+pub const RequestHead = struct {
+    /// The method token as sent, e.g. "GET" (validated: non-empty, tchars).
+    method: []const u8,
+    /// The raw request-target, e.g. "/path?q=1" (validated: non-empty, no
+    /// whitespace/control bytes; form not interpreted here).
+    target: []const u8,
+    /// True for `HTTP/1.0` (no persistent connection unless keep-alive).
+    http1_0: bool,
+    /// Raw header lines (request line excluded), for `header`/`iterate`.
+    header_block: []const u8,
+    /// The `Host` header value; null if absent (required by HTTP/1.1).
+    host: ?[]const u8 = null,
+    /// Parsed `Content-Length`, null if absent or overridden by chunked.
+    content_length: ?u64 = null,
+    /// `Transfer-Encoding` includes `chunked`.
+    chunked: bool = false,
+    /// A `Transfer-Encoding` header is present at all. When set without
+    /// `chunked` the body cannot be framed — reject the request.
+    has_transfer_encoding: bool = false,
+    /// `Connection: close` was sent.
+    connection_close: bool = false,
+    /// `Connection: keep-alive` was sent (HTTP/1.0 opt-in).
+    connection_keep_alive: bool = false,
+    /// `Expect: 100-continue` was sent.
+    expect_continue: bool = false,
+
+    /// Parse a raw head block as produced by `readHead` (lenient about bare
+    /// `\n` line endings; strict about syntax — same header rules as
+    /// `ResponseHead.parse`, plus: single Host only, method must be a token).
+    pub fn parse(block: []const u8) HeadParseError!RequestHead {
+        var lines = std.mem.splitScalar(u8, block, '\n');
+        const request_line = trimLineEnd(lines.next() orelse return error.MalformedHead);
+
+        // "METHOD SP request-target SP HTTP/1.x"
+        const sp1 = std.mem.indexOfScalar(u8, request_line, ' ') orelse return error.MalformedHead;
+        const sp2 = std.mem.lastIndexOfScalar(u8, request_line, ' ').?;
+        if (sp2 <= sp1) return error.MalformedHead; // fewer than two spaces
+        const method = request_line[0..sp1];
+        const target = request_line[sp1 + 1 .. sp2];
+        const version = request_line[sp2 + 1 ..];
+
+        if (method.len == 0) return error.MalformedHead;
+        for (method) |c| if (!isTchar(c)) return error.MalformedHead;
+        if (target.len == 0) return error.MalformedHead;
+        for (target) |c| if (c <= ' ' or c == 0x7f) return error.MalformedHead;
+        if (version.len != 8 or !std.mem.startsWith(u8, version, "HTTP/"))
+            return error.MalformedHead;
+        if (version[5] != '1' or version[6] != '.') return error.UnsupportedVersion;
+        const minor = version[7];
+        if (minor != '0' and minor != '1') return error.UnsupportedVersion;
+
+        var head: RequestHead = .{
+            .method = method,
+            .target = target,
+            .http1_0 = minor == '0',
+            .header_block = block[@min(block.len, lines.index orelse block.len)..],
+        };
+
+        while (lines.next()) |raw| {
+            const line = trimLineEnd(raw);
+            if (line.len == 0) continue; // tolerate a trailing empty split
+            const entry = try parseHeaderLine(line);
+
+            if (std.ascii.eqlIgnoreCase(entry.name, "content-length")) {
+                try latchContentLength(&head.content_length, entry.value);
+            } else if (std.ascii.eqlIgnoreCase(entry.name, "transfer-encoding")) {
+                head.has_transfer_encoding = true;
+                if (tokenListContains(entry.value, "chunked")) head.chunked = true;
+            } else if (std.ascii.eqlIgnoreCase(entry.name, "connection")) {
+                if (tokenListContains(entry.value, "close")) head.connection_close = true;
+                if (tokenListContains(entry.value, "keep-alive")) head.connection_keep_alive = true;
+            } else if (std.ascii.eqlIgnoreCase(entry.name, "host")) {
+                if (head.host != null) return error.MalformedHead; // request smuggling
+                head.host = entry.value;
+            } else if (std.ascii.eqlIgnoreCase(entry.name, "expect")) {
+                if (std.ascii.eqlIgnoreCase(entry.value, "100-continue")) head.expect_continue = true;
+            }
+        }
+
+        // Chunked wins over Content-Length (RFC 7230 §3.3.3).
+        if (head.chunked) head.content_length = null;
+        return head;
+    }
+
+    /// First value of header `name` (case-insensitive), or null.
+    pub fn header(h: *const RequestHead, name: []const u8) ?[]const u8 {
+        return findHeader(h.header_block, name);
+    }
+
+    /// Iterate all header name/value pairs in wire order.
+    pub fn iterate(h: *const RequestHead) HeaderIterator {
+        return iterateHeaderBlock(h.header_block);
+    }
+};
+
+/// RFC 7230 token characters (method names, header names).
+fn isTchar(c: u8) bool {
+    return switch (c) {
+        'a'...'z', 'A'...'Z', '0'...'9' => true,
+        '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => true,
+        else => false,
+    };
 }
 
 // ── chunked transfer-coding decoder ─────────────────────────────────────────
@@ -462,6 +602,83 @@ test "ResponseHead.parse: framing headers" {
 
     const cc = try ResponseHead.parse("HTTP/1.1 200 OK\r\nConnection: keep-alive, Close\r\n");
     try testing.expect(cc.connection_close);
+}
+
+test "RequestHead.parse: happy paths" {
+    const get = try RequestHead.parse("GET /x/y?q=1 HTTP/1.1\r\nHost: example.com\r\nAccept: */*\r\n");
+    try testing.expectEqualStrings("GET", get.method);
+    try testing.expectEqualStrings("/x/y?q=1", get.target);
+    try testing.expect(!get.http1_0);
+    try testing.expectEqualStrings("example.com", get.host.?);
+    try testing.expectEqualStrings("*/*", get.header("accept").?);
+    try testing.expectEqual(@as(?u64, null), get.content_length);
+    try testing.expect(!get.chunked and !get.connection_close);
+
+    const post = try RequestHead.parse("POST /submit HTTP/1.1\r\nHost: h\r\nContent-Length: 11\r\n");
+    try testing.expectEqualStrings("POST", post.method);
+    try testing.expectEqual(@as(?u64, 11), post.content_length);
+
+    const chunked = try RequestHead.parse("PUT /up HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n");
+    try testing.expect(chunked.chunked);
+    try testing.expect(chunked.has_transfer_encoding);
+    try testing.expectEqual(@as(?u64, null), chunked.content_length); // chunked wins
+
+    const old = try RequestHead.parse("GET / HTTP/1.0\r\nConnection: Keep-Alive\r\n");
+    try testing.expect(old.http1_0);
+    try testing.expect(old.connection_keep_alive);
+    try testing.expect(old.host == null);
+
+    const star = try RequestHead.parse("OPTIONS * HTTP/1.1\r\nHost: h\r\n");
+    try testing.expectEqualStrings("*", star.target);
+
+    const expect_hdr = try RequestHead.parse("POST /u HTTP/1.1\r\nHost: h\r\nExpect: 100-Continue\r\nContent-Length: 1\r\n");
+    try testing.expect(expect_hdr.expect_continue);
+
+    const closing = try RequestHead.parse("DELETE /d HTTP/1.1\r\nHost: h\r\nConnection: close\r\n");
+    try testing.expect(closing.connection_close);
+}
+
+test "RequestHead.parse: malformed heads never panic" {
+    const malformed = [_][]const u8{
+        "",
+        "\r\n",
+        "GET\r\n",
+        "GET /\r\n", // missing version
+        "GET  HTTP/1.1\r\n", // empty target
+        " / HTTP/1.1\r\n", // empty method
+        "GET / HTTP/1.1 extra\r\n", // junk after version
+        "G@T / HTTP/1.1\r\n", // non-token method byte
+        "GET / http/1.1\r\n", // lowercase version
+        "GET / HTTP/11\r\n", // version too short
+        "GET / XTTP/1.1\r\n",
+        "GET / HTTP/1.11\r\n", // version too long
+        "GET / HTTP/1.1\r\nNoColonHere\r\n",
+        "GET / HTTP/1.1\r\n: empty-name\r\n",
+        "GET / HTTP/1.1\r\nBad Name: x\r\n",
+        "GET / HTTP/1.1\r\nA: 1\r\n folded\r\n",
+        "GET / HTTP/1.1\r\nContent-Length: 12x\r\n",
+        "GET / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 6\r\n",
+        "GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n", // duplicate Host
+    };
+    for (malformed) |m| try testing.expectError(error.MalformedHead, RequestHead.parse(m));
+
+    try testing.expectError(error.UnsupportedVersion, RequestHead.parse("GET / HTTP/2.0\r\n"));
+    try testing.expectError(error.UnsupportedVersion, RequestHead.parse("GET / HTTP/1.9\r\n"));
+    try testing.expectError(error.UnsupportedVersion, RequestHead.parse("PRI * HTTP/2.0\r\n"));
+}
+
+test "RequestHead: duplicate identical Content-Length tolerated" {
+    const dup = try RequestHead.parse("POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 7\r\nContent-Length: 7\r\n");
+    try testing.expectEqual(@as(?u64, 7), dup.content_length);
+}
+
+test "RequestHead.iterate walks wire order" {
+    const h = try RequestHead.parse("GET / HTTP/1.1\r\nHost: h\r\nX-A: 1\r\nX-B: 2\r\n");
+    var it = h.iterate();
+    try testing.expectEqualStrings("Host", it.next().?.name);
+    try testing.expectEqualStrings("X-A", it.next().?.name);
+    try testing.expectEqualStrings("2", it.next().?.value);
+    try testing.expect(it.next() == null);
 }
 
 test "ResponseHead.header lookup and iteration" {

@@ -1,15 +1,17 @@
-//! http — HTTP/1.1 client over TCP + TLS (`std.crypto.tls`), pure Zig.
+//! http — HTTP/1.1 client + server, pure Zig (TLS via `std.crypto.tls`).
 //!
-//! Phase 1 (this code): `Client` — HTTP/1.1 over TCP and TLS, streaming
-//! bodies both ways, chunked + Content-Length framing, RFC-conformant
-//! redirect following. Phase 2 will add the `Server` codec; Phase 3 HTTP/2
-//! (framing + HPACK, h2spec-verified). Deliberately NOT built on
-//! `std.http.Client` (API churn is the reason this module exists); TLS is
-//! strictly `std.crypto.tls`.
+//! Phase 1: `Client` — HTTP/1.1 over TCP and TLS, streaming bodies both
+//! ways, chunked + Content-Length framing, RFC-conformant redirect
+//! following. Phase 2 (this code): `Server` — request codec, response
+//! writer and a thread-per-connection serving loop (plain HTTP/1.1; a
+//! reverse proxy terminates TLS). Phase 3 will add HTTP/2 (framing + HPACK,
+//! h2spec-verified). Deliberately NOT built on `std.http` (API churn is the
+//! reason this module exists); client TLS is strictly `std.crypto.tls`.
 //!
 //! Layout: this file owns the shared vocabulary (methods, URL parsing,
 //! redirect rules); `h1.zig` is the pure HTTP/1.1 wire codec (offline
-//! testable, reused by the future server); `Client.zig` is the transport.
+//! testable, shared by both sides); `Client.zig` / `Server.zig` are the
+//! transports.
 
 const std = @import("std");
 const netaddr = @import("netaddr");
@@ -17,18 +19,25 @@ const netaddr = @import("netaddr");
 pub const meta = .{
     .status = .extract, // client shape seeded in axp-core/src/httpclient.zig
     .platform = .any,
-    .role = .client, // becomes .both when the Phase 2 server codec lands
-    .concurrency = .single_owner, // one thread owns a Client and its responses
-    .model_after = "lalinsky/dusty (1.1 client shape) + Go net/http (redirect semantics); nghttp2 later for h2",
+    .role = .both, // Client + Server submodules
+    // One thread owns a Client (and its responses) or drives a Server;
+    // the Server runs its own connection threads internally — handlers
+    // must be thread-safe if they share state.
+    .concurrency = .single_owner,
+    .model_after = "lalinsky/dusty (1.1 client shape) + Go net/http (redirect semantics, Server shape); nghttp2 later for h2",
     .deps = .{ "netaddr", "std.crypto.tls", "std.Io.net" },
 };
 
-/// Pure HTTP/1.1 wire framing (head parse, chunked codec) — shared with the
-/// future Phase 2 server codec.
+/// Pure HTTP/1.1 wire framing (request/response head parse, chunked codec,
+/// Content-Length reader) — shared by the client and the server.
 pub const h1 = @import("h1.zig");
 
 /// The HTTP/1.1 client. See `Client.init` / `Client.request`.
 pub const Client = @import("Client.zig");
+
+/// The HTTP/1.1 server: `Server.Request`, `Server.ResponseWriter`, the
+/// socket-free `Server.serveStream` codec loop, and the TCP serving loop.
+pub const Server = @import("Server.zig");
 
 // ── request vocabulary ──────────────────────────────────────────────────────
 
@@ -284,6 +293,7 @@ const testing = std.testing;
 test {
     _ = h1;
     _ = Client;
+    _ = Server;
 }
 
 test "Url.parse: happy paths" {
