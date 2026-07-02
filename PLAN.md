@@ -57,8 +57,8 @@ later): expose the matched route pattern on `Ctx` (metrics label + openapi), and
 
 ## Current agent assignment
 
-**T5.10 `resilience`** (spec: `SPEC-resilience.md`) — circuit breaker + retry-with-backoff +
-timeout, generic over any operation (std-only, no deps). Then: router route-enumeration enhancement
-→ `openapi` (last cluster module).
+**T5.11 router route-enumeration + `openapi`** (spec: `SPEC-openapi.md`) — Step 1: router exposes
+`routes()` + `Ctx.matchedPattern()` + optional `addDoc`/`RouteDoc`; Step 2: `openapi` module generates
+an OpenAPI 3.1 spec from the route table + serves `/openapi.json`. **Closes the Web/API cluster.**
 
-*Done since last PLAN sync: T5.9 `validate` `010bce7` (290 tests).*
+*Done since last PLAN sync: T5.9 `validate` `010bce7` (290), T5.10 `resilience` `820ceeb` (310).*
