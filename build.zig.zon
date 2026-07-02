@@ -1,0 +1,14 @@
+.{
+    .name = .zig_libs,
+    .version = "0.0.0",
+    .minimum_zig_version = "0.16.0",
+    .fingerprint = 0x411fad481a34245a,
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "modules",
+        "README.md",
+        "CONVENTIONS.md",
+    },
+    .dependencies = .{},
+}
