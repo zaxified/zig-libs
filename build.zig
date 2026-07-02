@@ -20,6 +20,7 @@ const module_list = [_]Module{
     .{ .name = "http", .deps = &.{"netaddr"} },
     .{ .name = "dns", .deps = &.{ "netaddr", "http" } },
     .{ .name = "ramcache" },
+    .{ .name = "router", .deps = &.{"http"} },
     // Scaffold more here (copy modules/_template) — see the catalog in
     // ~/CML/zig-libs-plan.md for the full candidate list.
 };
