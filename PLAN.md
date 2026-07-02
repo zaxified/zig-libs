@@ -85,8 +85,10 @@ later additions.
   init, reflect-or-list allowed headers, init-time joins = allocation-free hot path; 238/238 Debug +
   ReleaseFast, integration over loopback). Uncommitted (awaiting review).
 
+- ✅ **T5.7 `cors`** — done + verified (global-middleware CORS; 238/238). Committed `0ce4c4d`.
+
 ## Current agent assignment
 
-**T5.7 `cors`** (spec: `SPEC-cors.md`) — CORS preflight + header injection as a global `router`
-middleware. Read `BRIEF.md`, `CONVENTIONS.md`, `SPEC-cors.md`. Then: `metrics` → `validate` →
-`resilience` → (router route-enumeration enhancement) → `openapi`.
+**T5.8 `metrics`** (spec: `SPEC-metrics.md`) — thread-safe registry (counter/gauge/histogram) +
+Prometheus text exposition + `/metrics` handler + request-metrics middleware. Read `BRIEF.md`,
+`CONVENTIONS.md`, `SPEC-metrics.md`. Then: `validate` → `resilience` → (router route-enumeration) → `openapi`.
