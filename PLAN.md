@@ -67,6 +67,9 @@ real client, so `http.Server` must expose it. TLS-terminating server + gzip resp
 later additions.
 
 - ✅ **T5.4 `abuseguard`** — done + verified (per-IP/global conn caps, ban/greylist, strike→ban; 198/198). Committed `0d62a43`.
+- ✅ **T5.5 `throttle`** — done + verified (max-in-flight semaphore, atomics-only; 503 +
+  Retry-After middleware; optional bounded wait via Io futex + capped waiter queue;
+  213/213 Debug + ReleaseFast, integration exercised over loopback). Uncommitted (awaiting review).
 
 ## Current agent assignment
 

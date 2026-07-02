@@ -58,5 +58,9 @@ audit is pending before any public release.
   abuseguard — design ref: nginx limit_conn (BSD-2-Clause), fail2ban
                (GPL-2.0 — documented behavior only, no code consulted or
                copied).
+  throttle   — design ref: golang.org/x/sync/semaphore (BSD-3-Clause, The Go
+               Authors; slot semantics only), Netflix concurrency-limits
+               (Apache-2.0; design notes only), SEDA (Welsh et al., SOSP '01
+               paper — bounded-queue load shedding).
 
 See each module's README "Provenance" note for its specific seed and reference.

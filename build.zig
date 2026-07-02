@@ -23,6 +23,7 @@ const module_list = [_]Module{
     .{ .name = "router", .deps = &.{"http"} },
     .{ .name = "ratelimit", .deps = &.{ "router", "http", "netaddr" } },
     .{ .name = "abuseguard", .deps = &.{ "http", "netaddr", "router" } },
+    .{ .name = "throttle", .deps = &.{ "router", "http" } },
     // Scaffold more here (copy modules/_template) — see the catalog in
     // ~/CML/zig-libs-plan.md for the full candidate list.
 };
