@@ -52,9 +52,19 @@ nftables · uci · l2disco · ipcbus · pollworker · chunkframe · lenframe/jso
 
 - ✅ **T5.1 `router`** — done + verified (trie matcher, middleware struct, 404/405). Committed `5741ce0`.
 
+- ✅ **T5.2 `ratelimit`** — done + verified (token bucket + 429/Retry-After, XFF rightmost-trusted). Committed `e28456a`.
+- ✅ **Licensing** — MIT + NOTICE (fping attribution) + provenance discipline. Committed `29515a7`.
+
+## Scope note (2026-07-02): direct-internet is IN SCOPE
+
+The API may run **directly on the internet without Caddy** → build the Web/API cluster **max
+security / feature-rich** (abuseguard is NOT redundant; it's the edge). Consequence: peer IP = the
+real client, so `http.Server` must expose it. TLS-terminating server + gzip response are noted as
+later additions.
+
 ## Current agent assignment
 
-**T5.2 `ratelimit`** (spec: `SPEC-ratelimit.md`) — token-bucket limiter + `router` middleware (429 +
-Retry-After), clock-injected, per-key bounded store, XFF key extraction. First consumer of
-`router.Middleware`. Read `BRIEF.md`, `CONVENTIONS.md`, `SPEC-ratelimit.md`.
-Remaining cluster after: `abuseguard`, `throttle`, `openapi`, `cors`, `metrics` (independent — can fan out).
+**T5.3 `http.Server` hardening (Phase 2.1)** (spec: `SPEC-http-hardening.md`) — expose peer address,
+add an accept/connection hook (`on_connect(peer) → accept|reject`) + active-connection accounting,
+configurable max-request/header size (413/431). Mechanism for abuseguard/throttle; fixes ratelimit's
+peer fallback. Then: `abuseguard` (policy) → `throttle` → `openapi` → `cors` → `metrics` (+ security-headers).
