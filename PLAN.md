@@ -46,6 +46,8 @@ nftables · uci · l2disco · ipcbus · pollworker · chunkframe · lenframe/jso
 
 - ✅ **T1 `netaddr`** — done + verified (RFC 6724, zero-alloc). Committed.
 - ✅ **T2 `http` Phase 1** — done + verified (HTTP/1.1 client over TLS). Committed. *(Ph2 server codec, Ph3 h2 = later.)*
+- ✅ **T3 `dns` + DoH** — done + verified (codec golden/fuzz, UDP+TC→TCP, TCP, DoH POST/GET + DoH-JSON,
+  hosts/resolv.conf/search, PTR via netaddr; live round-trips green, skip cleanly in a netns). Uncommitted.
 
 ## Current agent assignment
 
