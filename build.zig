@@ -29,6 +29,7 @@ const module_list = [_]Module{
     .{ .name = "security-headers", .deps = &.{ "router", "http" } },
     .{ .name = "cors", .deps = &.{ "router", "http" } },
     .{ .name = "metrics", .deps = &.{ "router", "http" } },
+    .{ .name = "validate", .deps = &.{ "router", "http" } },
     // Scaffold more here (copy modules/_template) — see the catalog in
     // ~/CML/zig-libs-plan.md for the full candidate list.
 };
