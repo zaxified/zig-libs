@@ -31,6 +31,12 @@
 //! - **Raw matching:** paths match byte-for-byte — no percent-decoding, no
 //!   case folding. `:param` never matches an empty segment; `*wildcard`
 //!   matches the whole remainder (without the leading slash), possibly "".
+//!
+//! Introspection (what `openapi`/`metrics` build on): `Router.routes()`
+//! enumerates the registered route table in registration order, `addDoc`
+//! attaches optional plain-data `RouteDoc` metadata to a route, and
+//! `Ctx.matchedPattern()` reports the matched route's pattern during
+//! dispatch (null in the 404/405 fallbacks).
 
 const std = @import("std");
 const http = @import("http");
@@ -96,6 +102,18 @@ pub const Ctx = struct {
     /// at request-scoped data for inner middleware/handlers (e.g. aaa-gate
     /// attaching the authenticated identity).
     data: ?*anyopaque = null,
+    /// Pattern of the matched route — see `matchedPattern`.
+    matched_pattern: ?[]const u8 = null,
+
+    /// The pattern of the route serving this request (e.g. "/users/:id"),
+    /// router-owned. Null in the 404 and 405 fallback handlers (no route
+    /// endpoint matched). A HEAD request auto-routed to the GET handler
+    /// reports the GET route's pattern. Middleware see it too — the value
+    /// is stashed before the chain runs (this is the bounded-cardinality
+    /// label `metrics`/`openapi` need, unlike the raw request path).
+    pub fn matchedPattern(ctx: *const Ctx) ?[]const u8 {
+        return ctx.matched_pattern;
+    }
 };
 
 /// A route endpoint. Errors propagate to `http.Server`, which turns them
@@ -159,6 +177,43 @@ pub const GroupError = error{
     InvalidPrefix,
 };
 
+// ── route metadata ──────────────────────────────────────────────────────────
+
+/// Optional per-route documentation, attached via `addDoc`. Plain data the
+/// router copies (deep, into its arena) and returns through `routes()` —
+/// the router itself never interprets it; `openapi` renders it. All fields
+/// are optional (empty defaults).
+pub const RouteDoc = struct {
+    /// Short one-line summary (OpenAPI `summary`).
+    summary: ?[]const u8 = null,
+    /// Longer free-form description (OpenAPI `description`).
+    description: ?[]const u8 = null,
+    /// Grouping tags (OpenAPI `tags`).
+    tags: []const []const u8 = &.{},
+    /// JSON Schema for the request body, as JSON text — `openapi` validates
+    /// and embeds it (normalized) under
+    /// `requestBody.content."application/json".schema`.
+    request_schema: ?[]const u8 = null,
+    /// Documented responses; empty ⇒ consumers fall back to a default 200.
+    responses: []const Response = &.{},
+    deprecated: bool = false,
+
+    pub const Response = struct {
+        /// HTTP status code (the OpenAPI responses key).
+        status: u16,
+        description: []const u8,
+    };
+};
+
+/// One registered route, as enumerated by `Router.routes()`.
+pub const Route = struct {
+    method: http.Method,
+    /// Full pattern (group prefixes included), arena-owned by the Router.
+    pattern: []const u8,
+    /// Metadata attached via `addDoc`, null for plain registrations.
+    doc: ?*const RouteDoc = null,
+};
+
 // ── the router ──────────────────────────────────────────────────────────────
 
 pub const Router = struct {
@@ -175,6 +230,8 @@ pub const Router = struct {
     method_not_allowed: Handler = defaultMethodNotAllowed,
     trailing_slash: TrailingSlash = .redirect,
     routes_added: bool = false,
+    /// Registered routes in registration order (see `routes`).
+    route_list: std.ArrayList(Route),
 
     /// All registration state (nodes, patterns, chains, groups) lives in an
     /// internal arena owned by the Router — `deinit` frees everything.
@@ -183,6 +240,7 @@ pub const Router = struct {
             .arena = std.heap.ArenaAllocator.init(gpa),
             .root = .{},
             .mws = .empty,
+            .route_list = .empty,
         };
     }
 
@@ -202,7 +260,22 @@ pub const Router = struct {
     /// segments; `:name` captures one non-empty segment; a final `*name`
     /// captures the whole remainder. See the module doc for precedence.
     pub fn add(r: *Router, method: http.Method, pattern: []const u8, h: Handler) AddError!void {
-        return addRoute(r, null, method, pattern, h);
+        return addRoute(r, null, method, pattern, h, null);
+    }
+
+    /// `add` with attached documentation metadata. `doc` is deep-copied
+    /// into the router's arena — stack temporaries are safe.
+    pub fn addDoc(r: *Router, method: http.Method, pattern: []const u8, h: Handler, doc: RouteDoc) AddError!void {
+        return addRoute(r, null, method, pattern, h, doc);
+    }
+
+    /// All registered routes, in registration order (deterministic). The
+    /// slice and everything it references are router-owned (arena) — valid
+    /// until `deinit`, do not free; a later `add` may grow (reallocate) the
+    /// slice, so re-fetch after registering. Group routes appear with their
+    /// full (prefixed) pattern.
+    pub fn routes(r: *const Router) []const Route {
+        return r.route_list.items;
     }
 
     pub fn get(r: *Router, pattern: []const u8, h: Handler) AddError!void {
@@ -254,7 +327,13 @@ pub const Router = struct {
         var params: Params = .{};
         if (matchRec(&r.root, req.path[1..], false, &params)) |node| {
             if (endpointFor(node, req.method)) |ep| {
-                var ctx: Ctx = .{ .req = req, .res = rw, .params = params, .state = r.state };
+                var ctx: Ctx = .{
+                    .req = req,
+                    .res = rw,
+                    .params = params,
+                    .state = r.state,
+                    .matched_pattern = ep.pattern,
+                };
                 const next: Next = .{ .chain = ep.chain, .endpoint = ep.handler };
                 return next.run(&ctx);
             }
@@ -310,15 +389,45 @@ pub const Router = struct {
 
     // ── registration internals ──────────────────────────────────────────
 
-    fn addRoute(r: *Router, g: ?*Group, method: http.Method, pattern: []const u8, h: Handler) AddError!void {
+    fn addRoute(r: *Router, g: ?*Group, method: http.Method, pattern: []const u8, h: Handler, doc: ?RouteDoc) AddError!void {
         if (pattern.len == 0 or pattern[0] != '/') return error.InvalidPattern;
         const a = r.arena.allocator();
-        const full = if (g) |gr| try std.mem.concat(a, u8, &.{ gr.prefix, pattern }) else pattern;
+        // Arena-duplicated: the full pattern is stored in the route table
+        // and stashed as Ctx.matched_pattern — the caller's slice may be a
+        // stack temporary.
+        const full = if (g) |gr|
+            try std.mem.concat(a, u8, &.{ gr.prefix, pattern })
+        else
+            try a.dupe(u8, pattern);
         const chain = try r.buildChain(g);
+        const doc_copy: ?*const RouteDoc = if (doc) |d| try dupeDoc(a, d) else null;
         try r.insert(method, full, h, chain);
+        try r.route_list.append(a, .{ .method = method, .pattern = full, .doc = doc_copy });
         r.routes_added = true;
         var it: ?*Group = g;
         while (it) |gr| : (it = gr.parent) gr.routes_added = true;
+    }
+
+    /// Deep-copy a RouteDoc into the arena (strings, tags, responses), so
+    /// callers may pass stack temporaries.
+    fn dupeDoc(a: Allocator, d: RouteDoc) Allocator.Error!*const RouteDoc {
+        const tags = try a.alloc([]const u8, d.tags.len);
+        for (tags, d.tags) |*slot, t| slot.* = try a.dupe(u8, t);
+        const responses = try a.alloc(RouteDoc.Response, d.responses.len);
+        for (responses, d.responses) |*slot, resp| slot.* = .{
+            .status = resp.status,
+            .description = try a.dupe(u8, resp.description),
+        };
+        const copy = try a.create(RouteDoc);
+        copy.* = .{
+            .summary = if (d.summary) |s| try a.dupe(u8, s) else null,
+            .description = if (d.description) |s| try a.dupe(u8, s) else null,
+            .tags = tags,
+            .request_schema = if (d.request_schema) |s| try a.dupe(u8, s) else null,
+            .responses = responses,
+            .deprecated = d.deprecated,
+        };
+        return copy;
     }
 
     /// Concatenate router-mws ++ group-mws (root→leaf) into an arena-owned
@@ -403,7 +512,7 @@ pub const Router = struct {
         }
         const idx = @intFromEnum(method);
         if (node.endpoints[idx] != null) return error.DuplicateRoute;
-        node.endpoints[idx] = .{ .handler = h, .chain = chain };
+        node.endpoints[idx] = .{ .handler = h, .chain = chain, .pattern = pattern };
         try r.rebuildAllow(node);
     }
 
@@ -443,7 +552,12 @@ pub const Group = struct {
     }
 
     pub fn add(g: *Group, method: http.Method, pattern: []const u8, h: Handler) AddError!void {
-        return Router.addRoute(g.router, g, method, pattern, h);
+        return Router.addRoute(g.router, g, method, pattern, h, null);
+    }
+
+    /// `add` with attached documentation metadata (see `Router.addDoc`).
+    pub fn addDoc(g: *Group, method: http.Method, pattern: []const u8, h: Handler, doc: RouteDoc) AddError!void {
+        return Router.addRoute(g.router, g, method, pattern, h, doc);
     }
 
     pub fn get(g: *Group, pattern: []const u8, h: Handler) AddError!void {
@@ -532,6 +646,8 @@ const Node = struct {
 const Endpoint = struct {
     handler: Handler,
     chain: []const Middleware,
+    /// Full arena-owned route pattern (what `Ctx.matchedPattern` reports).
+    pattern: []const u8,
 };
 
 fn endpointFor(node: *const Node, method: http.Method) ?Endpoint {
@@ -1091,6 +1207,139 @@ test "add: pattern validation, duplicates, param conflicts, caps" {
     try testing.expectError(error.ParamNameConflict, r.get("/w/*tail", hHello));
 
     try testing.expectError(error.TooManyParams, r.get("/:p" ** (max_params + 1), hHello));
+}
+
+// ── tests: route enumeration + matched pattern ──────────────────────────────
+
+fn hMatchedUser(ctx: *Ctx) anyerror!void {
+    // A failed expectation errors → 500, so the 200 assertion below proves it.
+    try testing.expectEqualStrings("/users/:id", ctx.matchedPattern().?);
+    try ctx.res.writeAll("ok");
+}
+fn hMatchedWild(ctx: *Ctx) anyerror!void {
+    try testing.expectEqualStrings("/static/*path", ctx.matchedPattern().?);
+    try ctx.res.writeAll("ok");
+}
+fn hNfNullPattern(ctx: *Ctx) anyerror!void {
+    try testing.expectEqual(@as(?[]const u8, null), ctx.matchedPattern());
+    ctx.res.setStatus(404);
+    try ctx.res.writeAll("nf");
+}
+fn hMnaNullPattern(ctx: *Ctx) anyerror!void {
+    try testing.expectEqual(@as(?[]const u8, null), ctx.matchedPattern());
+    ctx.res.setStatus(405);
+    try ctx.res.writeAll("mna");
+}
+fn mwSeesPattern(_: ?*anyopaque, ctx: *Ctx, next: Next) anyerror!void {
+    // Middleware run before the handler already see the stashed pattern.
+    if (ctx.matchedPattern()) |p| try testing.expect(p[0] == '/');
+    try next.run(ctx);
+}
+
+test "routes(): registration-order enumeration with docs and group prefixes" {
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    try r.get("/hello", hHello);
+    try r.addDoc(.post, "/users", hCreated, .{
+        .summary = "Create a user",
+        .description = "Creates one user.",
+        .tags = &.{ "users", "write" },
+        .request_schema = "{\"type\":\"object\"}",
+        .responses = &.{.{ .status = 201, .description = "Created" }},
+    });
+    const api = try r.group("/api");
+    try api.get("/things/:id", hUser);
+    try api.addDoc(.delete, "/things/:id", hUser, .{ .deprecated = true });
+
+    const rs = r.routes();
+    try testing.expectEqual(@as(usize, 4), rs.len);
+
+    try testing.expectEqual(http.Method.get, rs[0].method);
+    try testing.expectEqualStrings("/hello", rs[0].pattern);
+    try testing.expect(rs[0].doc == null);
+
+    try testing.expectEqual(http.Method.post, rs[1].method);
+    try testing.expectEqualStrings("/users", rs[1].pattern);
+    const doc = rs[1].doc.?;
+    try testing.expectEqualStrings("Create a user", doc.summary.?);
+    try testing.expectEqualStrings("Creates one user.", doc.description.?);
+    try testing.expectEqual(@as(usize, 2), doc.tags.len);
+    try testing.expectEqualStrings("users", doc.tags[0]);
+    try testing.expectEqualStrings("write", doc.tags[1]);
+    try testing.expectEqualStrings("{\"type\":\"object\"}", doc.request_schema.?);
+    try testing.expectEqual(@as(usize, 1), doc.responses.len);
+    try testing.expectEqual(@as(u16, 201), doc.responses[0].status);
+    try testing.expectEqualStrings("Created", doc.responses[0].description);
+    try testing.expect(!doc.deprecated);
+
+    // Group routes carry the full prefixed pattern.
+    try testing.expectEqual(http.Method.get, rs[2].method);
+    try testing.expectEqualStrings("/api/things/:id", rs[2].pattern);
+    try testing.expect(rs[2].doc == null);
+    try testing.expectEqual(http.Method.delete, rs[3].method);
+    try testing.expect(rs[3].doc.?.deprecated);
+
+    // Failed registrations never enter the table.
+    try testing.expectError(error.DuplicateRoute, r.get("/hello", hRoot));
+    try testing.expectEqual(@as(usize, 4), r.routes().len);
+}
+
+test "routes(): empty router enumerates nothing" {
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    try testing.expectEqual(@as(usize, 0), r.routes().len);
+}
+
+test "addDoc/add copy their inputs (stack temporaries are safe)" {
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    {
+        var pat_buf: [16]u8 = undefined;
+        var sum_buf: [16]u8 = undefined;
+        var tag_buf: [8]u8 = undefined;
+        const pat = try std.fmt.bufPrint(&pat_buf, "/v{d}/users", .{1});
+        const sum = try std.fmt.bufPrint(&sum_buf, "Sum {d}", .{7});
+        const tag = try std.fmt.bufPrint(&tag_buf, "t{d}", .{9});
+        try r.addDoc(.get, pat, hHello, .{ .summary = sum, .tags = &.{tag} });
+        pat_buf = @splat(0xAA); // scribble the caller's memory
+        sum_buf = @splat(0xAA);
+        tag_buf = @splat(0xAA);
+    }
+    const rt = r.routes()[0];
+    try testing.expectEqualStrings("/v1/users", rt.pattern);
+    try testing.expectEqualStrings("Sum 7", rt.doc.?.summary.?);
+    try testing.expectEqualStrings("t9", rt.doc.?.tags[0]);
+    // ...and the route still dispatches.
+    var buf: [1024]u8 = undefined;
+    try testing.expectEqualStrings("hello", bodyOf(runWire(&r, wire("GET", "/v1/users"), &buf)));
+}
+
+test "matchedPattern: the matched route's pattern on hit, null on 404/405" {
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(.{ .run = mwSeesPattern });
+    try r.get("/users/:id", hMatchedUser);
+    try r.get("/static/*path", hMatchedWild);
+    r.not_found = hNfNullPattern;
+    r.method_not_allowed = hMnaNullPattern;
+
+    var buf: [1024]u8 = undefined;
+    // Hit: handler asserts the pattern, then answers 200 "ok".
+    var got = runWire(&r, wire("GET", "/users/42"), &buf);
+    try expectStatus(got, "200");
+    try testing.expectEqualStrings("ok", bodyOf(got));
+    got = runWire(&r, wire("GET", "/static/a/b.css"), &buf);
+    try expectStatus(got, "200");
+    try testing.expectEqualStrings("ok", bodyOf(got));
+    // HEAD auto-routed to GET reports the GET route's pattern.
+    try expectStatus(runWire(&r, wire("HEAD", "/users/42"), &buf), "200");
+    // Miss: overridden fallbacks assert null.
+    got = runWire(&r, wire("GET", "/nope"), &buf);
+    try expectStatus(got, "404");
+    try testing.expectEqualStrings("nf", bodyOf(got));
+    got = runWire(&r, wire("POST", "/users/42"), &buf);
+    try expectStatus(got, "405");
+    try testing.expectEqualStrings("mna", bodyOf(got));
 }
 
 test "query string stays available to handlers" {

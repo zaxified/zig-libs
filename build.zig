@@ -30,6 +30,7 @@ const module_list = [_]Module{
     .{ .name = "cors", .deps = &.{ "router", "http" } },
     .{ .name = "metrics", .deps = &.{ "router", "http" } },
     .{ .name = "validate", .deps = &.{ "router", "http" } },
+    .{ .name = "openapi", .deps = &.{ "router", "http" } },
     .{ .name = "resilience" },
     // Scaffold more here (copy modules/_template) — see the catalog in
     // ~/CML/zig-libs-plan.md for the full candidate list.

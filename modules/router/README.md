@@ -55,10 +55,21 @@ try server.listen();
 
 Handlers get a `*Ctx`: the parsed `req` (`http.Server.Request`, including
 `query`), the `res` writer, `params.get("name")`, the app-wide `state`
-pointer (`Router.state`), and a per-request `data` slot middleware can
-point at request-scoped values (how `aaa-gate` will attach an identity).
-Stateful middleware carry their own `Middleware.state` (how `ratelimit`
-carries its buckets) — no globals anywhere.
+pointer (`Router.state`), a per-request `data` slot middleware can
+point at request-scoped values (how `aaa-gate` will attach an identity),
+and `matchedPattern()` — the matched route's pattern (e.g. `"/users/:id"`,
+null in the 404/405 fallbacks), the bounded-cardinality label
+`metrics`/`openapi` need. Stateful middleware carry their own
+`Middleware.state` (how `ratelimit` carries its buckets) — no globals
+anywhere.
+
+Introspection: `Router.routes()` enumerates the registered table in
+registration order as `{ method, pattern, doc }` (router-owned slice, valid
+until `deinit`); `addDoc(method, pattern, handler, RouteDoc)` — on Router
+and Group — attaches optional plain-data documentation (`summary`,
+`description`, `tags`, `request_schema`, `responses`, `deprecated`;
+deep-copied, stack temporaries safe) that `openapi` renders into an
+OpenAPI 3.1 document.
 
 ## Semantics (documented choices)
 

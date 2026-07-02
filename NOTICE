@@ -78,5 +78,11 @@ audit is pending before any public release.
                delay/jitter policy shapes), AWS Architecture Blog
                "Exponential Backoff And Jitter" (Brooker, 2015; jitter
                taxonomy). Behavior only, no source copied.
+  openapi    — design ref: FastAPI (MIT; the generated-spec shape and
+               defaults, e.g. the default "Successful Response" 200 and
+               path-parameter objects), utoipa (MIT OR Apache-2.0;
+               route-metadata→spec mapping); document format per the
+               OpenAPI Specification 3.1.0 (Apache-2.0, OpenAPI
+               Initiative). Behavior only, no source copied.
 
 See each module's README "Provenance" note for its specific seed and reference.
