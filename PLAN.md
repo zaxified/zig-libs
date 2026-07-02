@@ -47,10 +47,11 @@ nftables · uci · l2disco · ipcbus · pollworker · chunkframe · lenframe/jso
 - ✅ **T1 `netaddr`** — done + verified (RFC 6724, zero-alloc). Committed.
 - ✅ **T2 `http` Phase 1** — done + verified (HTTP/1.1 client over TLS). Committed. *(Ph2 server codec, Ph3 h2 = later.)*
 - ✅ **T3 `dns` + DoH** — done + verified (codec golden/fuzz, UDP+TC→TCP, TCP, DoH POST/GET + DoH-JSON,
-  hosts/resolv.conf/search, PTR via netaddr; live round-trips green, skip cleanly in a netns). Uncommitted.
+  hosts/resolv.conf/search, PTR via netaddr; live round-trips green, skip cleanly in a netns). Committed `400174a`.
 
 ## Current agent assignment
 
-**T3 `dns` + DoH** (spec: `SPEC-dns.md`). Message codec + UDP/TCP + DoH (via the `http` module) +
-PTR/reverse. Validates that `http` works as a dependency. Read `BRIEF.md`, `CONVENTIONS.md`,
-`SPEC-dns.md` first. Do NOT start `http` Phase 2/3.
+**T2 `http` Phase 2 — server codec + serving loop** (spec: `SPEC-http-server.md`). Adds `http.Server`
+on top of the Phase-1 `h1.zig` codec; unblocks the REST/API cluster (internet-behind-Caddy goal).
+In-process dogfood test = our Client vs our Server. Read `BRIEF.md`, `CONVENTIONS.md`, `SPEC-http-server.md`.
+Do NOT start HTTP/2 (Phase 3).
