@@ -78,8 +78,10 @@ later additions.
   precomputed values, allocation-free hot path; `@import("security-headers")` hyphen name proven;
   224/224 Debug + ReleaseFast, integration over loopback). Uncommitted (awaiting review).
 
+- ✅ **T5.6 `security-headers`** — done + verified (secure-by-default header middleware; 224/224). Committed `d02aa54`.
+
 ## Current agent assignment
 
-**T5.6 `security-headers`** (spec: `SPEC-security-headers.md`) — secure-by-default response headers
-(HSTS/CSP/nosniff/frame-options/referrer/permissions/COOP-CORP) as a stateless `router` middleware.
-Read `BRIEF.md`, `CONVENTIONS.md`, `SPEC-security-headers.md`. Then: `openapi` → `cors` → `validate` → `metrics` → `resilience`.
+**T5.7 `cors`** (spec: `SPEC-cors.md`) — CORS preflight + header injection as a global `router`
+middleware. Read `BRIEF.md`, `CONVENTIONS.md`, `SPEC-cors.md`. Then: `metrics` → `validate` →
+`resilience` → (router route-enumeration enhancement) → `openapi`.
