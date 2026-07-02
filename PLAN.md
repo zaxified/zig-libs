@@ -66,9 +66,10 @@ security / feature-rich** (abuseguard is NOT redundant; it's the edge). Conseque
 real client, so `http.Server` must expose it. TLS-terminating server + gzip response are noted as
 later additions.
 
+- ✅ **T5.4 `abuseguard`** — done + verified (per-IP/global conn caps, ban/greylist, strike→ban; 198/198). Committed `0d62a43`.
+
 ## Current agent assignment
 
-**T5.4 `abuseguard`** (spec: `SPEC-abuseguard.md`) — IP reputation + connection-abuse policy on the
-Phase-2.1 hooks: per-IP + global concurrent-connection caps (`on_connect`/`on_conn_state`), ban +
-auto-expiring greylist, strike→auto-ban, bounded store. Read `BRIEF.md`, `CONVENTIONS.md`,
-`SPEC-abuseguard.md`. Then: `throttle` → `security-headers` → `openapi` → `cors` → `validate` → `metrics` → `resilience`.
+**T5.5 `throttle`** (spec: `SPEC-throttle.md`) — global concurrency limiter + load-shedding (503 +
+Retry-After) as a `router` middleware; separable semaphore primitive. Read `BRIEF.md`, `CONVENTIONS.md`,
+`SPEC-throttle.md`. Then: `security-headers` → `openapi` → `cors` → `validate` → `metrics` → `resilience`.
