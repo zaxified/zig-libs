@@ -54,6 +54,10 @@ nftables · uci · l2disco · ipcbus · pollworker · chunkframe · lenframe/jso
 
 - ✅ **T5.2 `ratelimit`** — done + verified (token bucket + 429/Retry-After, XFF rightmost-trusted). Committed `e28456a`.
 - ✅ **Licensing** — MIT + NOTICE (fping attribution) + provenance discipline. Committed `29515a7`.
+- ✅ **T5.3 `http.Server` hardening (Phase 2.1)** — done + verified (peer address + request index
+  on `Request`, `on_connect` accept/reject + `activeConnections()`, ConnState observer,
+  431/414/413 limits with streamed body cap, whole-request read deadline + write timeout;
+  `ratelimit` peer fallback rewired). 176/176 Debug + ReleaseFast. Uncommitted (awaiting review).
 
 ## Scope note (2026-07-02): direct-internet is IN SCOPE
 

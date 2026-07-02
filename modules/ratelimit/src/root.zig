@@ -13,12 +13,12 @@
 //!   to `next` untouched; denied ones get a 429 with `Retry-After` and IETF
 //!   draft `RateLimit-*` headers, and `next` is never called.
 //!
-//! ## Client-key trust policy (X-Forwarded-For)
+//! ## Client-key trust policy (X-Forwarded-For / socket peer)
 //!
-//! The default key (`KeySource.forwarded_ip`) is the client IP **as
-//! established by a trusted reverse proxy** (the intended deployment is
-//! behind Caddy, which terminates TLS and always appends the peer address to
-//! `X-Forwarded-For`). Policy, in order:
+//! The default key (`KeySource.forwarded_ip`) is the client IP — as
+//! established by a trusted reverse proxy when one is in front, or the
+//! socket peer address when the server faces the internet directly. Policy,
+//! in order:
 //!
 //! 1. **Rightmost element of the last `X-Forwarded-For` header.** Every
 //!    compliant proxy hop *appends* the address it observed, so the final
@@ -29,20 +29,26 @@
 //! 2. **`X-Real-IP`** as a fallback for proxies that set it instead
 //!    (nginx-style). Only trustworthy when your proxy overwrites it —
 //!    a client talking to the server directly can forge it.
-//! 3. **`fallback_key`** — one shared bucket for everything else.
-//!    `http.Server` does not expose the socket peer address to handlers, so
-//!    direct (unproxied) clients cannot be told apart; behind the intended
-//!    proxy deployment this case never happens (XFF is always present).
+//! 3. **The socket peer address** (`http.Server.Request.peerAddress`) —
+//!    the real client when no proxy is in the way (direct-internet
+//!    deployment). Keys are the IP only (ports vary per connection);
+//!    IPv4-mapped IPv6 peers key as their plain IPv4 form.
+//! 4. **`fallback_key`** — one shared bucket, only reachable when even the
+//!    socket peer is unknown (driving the codec socket-free via
+//!    `serveStream` without a `peer`).
 //!
-//! This "rightmost, one trusted hop" policy assumes the app is reachable
-//! *only* through the proxy. If clients can reach the server directly, they
-//! can forge any of these headers and choose their own bucket — bind to
-//! localhost / a private network so only the proxy can connect.
+//! **Caveat when directly reachable:** clients can then send forged
+//! `X-Forwarded-For` / `X-Real-IP` headers and steps 1–2 will honor them —
+//! choosing their own bucket (a per-client limiter, not an unkeyed
+//! bypass). If you are *not* behind a proxy that always sets XFF, use a
+//! `KeySource.custom` extractor that goes straight to
+//! `req.peerAddress()`, or strip those headers at the edge.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const router = @import("router");
 const http = @import("http");
+const netaddr = @import("netaddr");
 
 pub const meta = .{
     .status = .gap,
@@ -52,7 +58,7 @@ pub const meta = .{
     // O(1) critical section); the bare `TokenBucket` is single_owner.
     .concurrency = .threadsafe,
     .model_after = "Go golang.org/x/time/rate (token bucket) + nginx limit_req (keyed store)",
-    .deps = .{ "router", "http" },
+    .deps = .{ "router", "http", "netaddr" },
 };
 
 const Allocator = std.mem.Allocator;
@@ -188,9 +194,9 @@ pub const KeyFn = struct {
 /// What identifies a client for the middleware (the pure `Limiter.allow`
 /// takes explicit keys and ignores this).
 pub const KeySource = union(enum) {
-    /// Trusted-proxy client IP — see the trust policy in the module doc:
-    /// rightmost element of the last `X-Forwarded-For`, else `X-Real-IP`,
-    /// else `fallback_key`.
+    /// Client IP — see the trust policy in the module doc: rightmost
+    /// element of the last `X-Forwarded-For`, else `X-Real-IP`, else the
+    /// socket peer address, else `fallback_key`.
     forwarded_ip,
     /// Value of this request header (e.g. an API key). Requests without the
     /// header fall back to the `forwarded_ip` chain.
@@ -199,11 +205,14 @@ pub const KeySource = union(enum) {
     custom: KeyFn,
 };
 
-/// Key used when no forwarded/real-IP header is present. `http.Server` does
-/// not expose the socket peer address to handlers, so all direct (unproxied)
-/// clients share this one bucket; behind the intended proxy deployment the
-/// forwarded header is always present.
+/// Key used when neither a forwarded/real-IP header nor a socket peer
+/// address exists — only possible when the codec is driven socket-free
+/// (`http.Server.serveStream` without `StreamOptions.peer`); a socket-served
+/// request always has a peer.
 pub const fallback_key = "(no-client-ip)";
+
+/// Buffer size for `clientKey`'s peer-address formatting.
+pub const peer_key_len_max = netaddr.max_ip_text_len;
 
 pub const Options = struct {
     /// Sustained per-key rate, tokens (requests) per second. Must be > 0.
@@ -359,7 +368,8 @@ fn lockSpin(m: *std.atomic.Mutex) void {
 
 fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
     const l: *Limiter = @ptrCast(@alignCast(state.?));
-    const decision = l.allow(keyOf(l, ctx));
+    var peer_buf: [peer_key_len_max]u8 = undefined; // outlives the allow call; the store copies
+    const decision = l.allow(keyOf(l, ctx, &peer_buf));
     if (decision.allowed) return next.run(ctx);
 
     // Deny. Header values are formatted on this stack frame, so the head
@@ -391,15 +401,15 @@ fn ceilDivMsToS(ms: u64) u64 {
 
 // ── key extraction ──────────────────────────────────────────────────────────
 
-fn keyOf(l: *const Limiter, ctx: *router.Ctx) []const u8 {
+fn keyOf(l: *const Limiter, ctx: *router.Ctx, peer_buf: *[peer_key_len_max]u8) []const u8 {
     switch (l.options.key) {
-        .forwarded_ip => return forwardedClientKey(ctx.req),
+        .forwarded_ip => return clientKey(ctx.req, peer_buf),
         .header => |name| {
             if (ctx.req.header(name)) |v| {
                 const trimmed = std.mem.trim(u8, v, " \t");
                 if (trimmed.len != 0) return trimmed;
             }
-            return forwardedClientKey(ctx.req);
+            return clientKey(ctx.req, peer_buf);
         },
         .custom => |k| return k.keyFor(k.ctx, ctx),
     }
@@ -408,9 +418,13 @@ fn keyOf(l: *const Limiter, ctx: *router.Ctx) []const u8 {
 /// The client key per the module's trust policy (see the module doc):
 /// rightmost element of the **last** `X-Forwarded-For` header (the one the
 /// nearest trusted proxy appended — the only part a client cannot forge),
-/// else `X-Real-IP`, else `fallback_key`. Exposed for reuse by other
-/// middleware (logging, abuseguard).
-pub fn forwardedClientKey(req: *const http.Server.Request) []const u8 {
+/// else `X-Real-IP`, else the **socket peer IP** (formatted into
+/// `peer_buf`, port excluded so one client is one bucket; IPv4-mapped IPv6
+/// unified with plain IPv4), else `fallback_key`. The result either borrows
+/// from the request or points into `peer_buf` — treat its lifetime as the
+/// shorter of the two. Exposed for reuse by other middleware (logging,
+/// abuseguard).
+pub fn clientKey(req: *const http.Server.Request, peer_buf: *[peer_key_len_max]u8) []const u8 {
     var xff: ?[]const u8 = null;
     var it = req.iterateHeaders();
     while (it.next()) |h| {
@@ -424,6 +438,13 @@ pub fn forwardedClientKey(req: *const http.Server.Request) []const u8 {
     if (req.header("x-real-ip")) |v| {
         const ip = std.mem.trim(u8, v, " \t");
         if (ip.len != 0) return ip;
+    }
+    if (req.peerAddress()) |peer| {
+        const ip: netaddr.Ip = switch (peer) {
+            .ip4 => |a| .{ .v4 = a.bytes },
+            .ip6 => |a| .{ .v6 = a.bytes },
+        };
+        return netaddr.formatIp(ip.unmap(), peer_buf);
     }
     return fallback_key;
 }
@@ -652,8 +673,8 @@ const Reader = std.Io.Reader;
 const Writer = std.Io.Writer;
 
 /// Drive a router through `http.Server.serveStream` with canned wire bytes
-/// (same harness as the router's own tests).
-fn runWire(r: *router.Router, bytes: []const u8, out_buf: []u8) []const u8 {
+/// (same harness as the router's own tests), optionally with a socket peer.
+fn runWirePeer(r: *router.Router, bytes: []const u8, out_buf: []u8, peer: ?std.Io.net.IpAddress) []const u8 {
     var in: Reader = .fixed(bytes);
     var out: Writer = .fixed(out_buf);
     var head_buf: [2048]u8 = undefined;
@@ -664,6 +685,7 @@ fn runWire(r: *router.Router, bytes: []const u8, out_buf: []u8) []const u8 {
         .handler = r.handler(),
         .context = r,
         .server_name = null, // keep goldens free of Server/Date noise
+        .peer = peer,
     }, &in, &out, .{
         .head = &head_buf,
         .request_body = &request_body_buf,
@@ -671,6 +693,10 @@ fn runWire(r: *router.Router, bytes: []const u8, out_buf: []u8) []const u8 {
         .chunk = &chunk_buf,
     });
     return out.buffered();
+}
+
+fn runWire(r: *router.Router, bytes: []const u8, out_buf: []u8) []const u8 {
+    return runWirePeer(r, bytes, out_buf, null);
 }
 
 fn wire(comptime headers: []const u8) []const u8 {
@@ -770,11 +796,40 @@ test "middleware: key extraction — XFF forms, X-Real-IP, fallback key" {
     // …and XFF wins over X-Real-IP when both exist.
     try expectStatus(runWire(&rl.r, wire("X-Forwarded-For: 3.3.3.3\r\nX-Real-IP: 5.5.5.5\r\n"), &buf), "200");
 
-    // No client headers at all: everything shares the one fallback bucket.
+    // No client headers and no socket peer (this harness is socket-free):
+    // everything shares the one fallback bucket.
     try expectStatus(runWire(&rl.r, wire(""), &buf), "200");
     try expectStatus(runWire(&rl.r, wire(""), &buf), "429");
     // Empty XFF value also falls through to the fallback bucket.
     try expectStatus(runWire(&rl.r, wire("X-Forwarded-For:\r\n"), &buf), "429");
+}
+
+test "middleware: socket peer address is the fallback key (port-insensitive, v4-mapped unified)" {
+    var tc: TestClock = .{};
+    var l = Limiter.init(testing.allocator, .{ .rate_per_s = 0.01, .burst = 1, .clock = tc.clock() });
+    defer l.deinit();
+    var rl = try RouterUnderLimit.init(&l);
+    defer rl.deinit();
+    rl.start();
+    var buf: [1024]u8 = undefined;
+
+    const ip = std.Io.net.IpAddress;
+    const peer_a1: ip = ip.parseIp4("10.0.0.1", 1111) catch unreachable;
+    const peer_a2: ip = ip.parseIp4("10.0.0.1", 2222) catch unreachable;
+    const peer_a6: ip = ip.parseIp6("::ffff:10.0.0.1", 3333) catch unreachable;
+    const peer_b: ip = ip.parseIp4("10.0.0.2", 1111) catch unreachable;
+
+    // Without forwarded headers the socket peer is the key…
+    try expectStatus(runWirePeer(&rl.r, wire(""), &buf, peer_a1), "200");
+    // …the port is excluded (a new connection is not a new bucket)…
+    try expectStatus(runWirePeer(&rl.r, wire(""), &buf, peer_a2), "429");
+    // …and an IPv4-mapped IPv6 peer is the same client as its IPv4 form.
+    try expectStatus(runWirePeer(&rl.r, wire(""), &buf, peer_a6), "429");
+    // A different peer IP is a different bucket.
+    try expectStatus(runWirePeer(&rl.r, wire(""), &buf, peer_b), "200");
+    // Forwarded headers still win over the socket peer when present.
+    try expectStatus(runWirePeer(&rl.r, wire("X-Forwarded-For: 9.9.9.9\r\n"), &buf, peer_a1), "200");
+    try testing.expectEqual(@as(usize, 3), l.keyCount()); // 10.0.0.1, 10.0.0.2, 9.9.9.9
 }
 
 test "middleware: API-key header as the key, with forwarded-IP fallback" {
@@ -903,13 +958,13 @@ test "integration: limited route over loopback — 200s, 429 + Retry-After, key 
         try testing.expectEqual(@as(u16, 200), res.status);
     }
 
-    { // no forwarded header → the shared fallback bucket, still fresh
+    { // no forwarded header → keyed by the socket peer (127.0.0.1), fresh
         var res = try client.request(.get, url, .{});
         defer res.deinit();
         try testing.expectEqual(@as(u16, 200), res.status);
     }
 
-    try testing.expectEqual(@as(usize, 3), l.keyCount()); // 1.2.3.4, 5.6.7.8, fallback
+    try testing.expectEqual(@as(usize, 3), l.keyCount()); // 1.2.3.4, 5.6.7.8, 127.0.0.1
 }
 
 fn hHello(ctx: *router.Ctx) anyerror!void {

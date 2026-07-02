@@ -20,7 +20,11 @@ HTTP/1.1 client **and server** in pure Zig (client TLS over `std.crypto.tls`).
 
 1. **DONE — HTTP/1.1 client over TCP + TLS.**
 2. **DONE — HTTP/1.1 server** (request codec, response writer, serving
-   loop). Plain HTTP only — a reverse proxy (Caddy) terminates TLS.
+   loop). **Phase 2.1 (DONE) hardened it for direct internet exposure** —
+   peer address + request index on `Request`, `on_connect` accept hook +
+   `activeConnections()`, 431/414/413 size limits, stall + whole-request +
+   write timeouts (details below). Still plain HTTP only: a TLS-terminating
+   server is a separate later task (a reverse proxy also works).
 3. TODO — HTTP/2 (framing + HPACK), verified against h2spec. Not started.
 
 ## Client API
@@ -61,7 +65,9 @@ defer res2.deinit();
 fn handler(req: *http.Server.Request, rw: *http.Server.ResponseWriter) anyerror!void {
     // req: .method (http.Method), .target, .path, .query,
     //      .header("name"), .iterateHeaders(), .reader() (streaming body,
-    //      Content-Length + chunked already decoded), .context.
+    //      Content-Length + chunked already decoded), .context,
+    //      .peerAddress() (socket peer, the direct client),
+    //      .connRequestIndex() (Nth request on this keep-alive connection).
     if (std.mem.eql(u8, req.path, "/hello")) {
         try rw.setHeader("Content-Type", "text/plain");
         try rw.writeAll("hello");            // or stream via rw.writer()
@@ -76,11 +82,18 @@ var server = http.Server.init(threaded.io(), gpa, .{
     .handler = handler,
     .addr = "127.0.0.1",
     .port = 0, // ephemeral; resolved port via server.boundAddress()
+    // Hardening knobs (defaults shown; see "Direct-internet posture"):
+    // .read_timeout_ms = 10_000, .request_timeout_ms = 60_000,
+    // .write_timeout_ms = 10_000, .max_header_bytes = 16 * 1024,
+    // .max_request_line_bytes = 8 * 1024, .max_body_bytes = 1 << 20,
+    // .on_connect = myGate, .on_connect_ctx = &gate,   // accept/reject
+    // .on_conn_state = myMetrics,                      // Go ConnState-style
 });
 defer server.deinit();
 try server.bind();                    // boundAddress() valid from here
 try server.serve();                   // accept loop; or server.listen() = bind+serve
-// From another thread: server.shutdown() → serve() drains and returns.
+// From another thread: server.shutdown() → serve() drains and returns;
+// server.activeConnections() = admitted, not-yet-closed connections.
 ```
 
 The codec works **without a socket**: `h1.RequestHead.parse` +
@@ -114,18 +127,67 @@ Reader/Writer pair — that is what the offline tests (and the future
   by the writer (`setHeader("Connection", "close")` requests a close,
   Transfer-Encoding is ignored). `setHeader` replaces same-named headers —
   repeated fields (multiple Set-Cookie) are not supported yet.
-- **Errors:** malformed head → 400; oversized head → 431; unsupported
-  HTTP version → 505; unknown method token → 501; missing Host on 1.1 →
-  400; `Transfer-Encoding` without chunked → 400 (Go answers 501 here);
+- **Errors:** malformed head → 400; oversized head → 431; over-long
+  request line → 414; oversized body → 413; unsupported HTTP version →
+  505; unknown method token → 501; missing Host on 1.1 → 400;
+  `Transfer-Encoding` without chunked → 400 (Go answers 501 here);
   handler error → 500 when nothing was sent, otherwise the connection dies
   mid-response. `Expect: 100-continue` is acknowledged eagerly. Absolute-
-  form request targets are rejected (origin-form + `*` only; fine behind a
-  reverse proxy).
-- **Timeout:** one `read_timeout_ms` (default 10 s) bounds every read
-  *stall* — head wait, body wait, keep-alive idle — via poll(2) before
-  blocking reads. A dribbling client can extend the total time; slowloris
-  hardening belongs to the later `abuseguard` module.
-- **No TLS in the server** — Caddy (or any reverse proxy) terminates TLS.
+  form request targets are rejected (origin-form + `*` only).
+- **No TLS in the server** — terminate TLS in front (Caddy/any proxy); a
+  native TLS-terminating server is a separate later task.
+
+## Direct-internet posture (Phase 2.1 hardening)
+
+The server is built to run **without a reverse proxy in front**. Model:
+Go `net/http` (`ConnState`, `MaxHeaderBytes`, `ReadTimeout`) + nginx
+(`client_max_body_size`, `limit_conn`).
+
+**Client identity.** `req.peerAddress()` is the socket peer (`?IpAddress`;
+null only when the codec runs socket-free via `serveStream` without
+`StreamOptions.peer`), `req.connRequestIndex()` the 0-based request ordinal
+on the connection. `ratelimit` keys on the peer when no trusted
+`X-Forwarded-For` is present; `abuseguard` (next) builds per-IP caps/bans
+on the same surface.
+
+**Admission.** `Options.on_connect(ctx, peer) → .accept | .reject` runs on
+the accept loop right after `accept`, before any allocation or read —
+keep it fast and thread-safe. A `.reject` **closes the socket without
+writing anything** (no 429/503; nginx `limit_conn` answers 503, we drop at
+the TCP level so abusive peers cost no response bytes — a polite 503 can
+be layered as middleware). `Server.activeConnections()` is a thread-safe
+count of admitted, not-yet-closed connections — the enforcement input for
+a global cap. `Options.on_conn_state` optionally observes
+`new / active / idle / closed` per connection (Go ConnState-style;
+`active` fires when a request head arrived, not on the first byte;
+rejected connections fire nothing).
+
+**Size limits** (all configurable in `Options`):
+
+| Limit | Default | Response |
+|---|---|---|
+| `max_header_bytes` — whole request head | 16 KiB | 431 |
+| `max_request_line_bytes` — request line (within the head budget; null = off) | 8 KiB | 414 |
+| `max_body_bytes` — request body (null = off) | 1 MiB | 413 |
+
+An over-limit **declared** Content-Length is refused before the handler
+runs (and before any `100 Continue`). A **chunked** body is capped *while
+streaming*: the handler's body reader fails once decoded bytes cross the
+cap, the server answers 413 (if nothing was sent) and closes. Bodies are
+never buffered — memory per connection is a fixed buffer slab regardless
+of body size; the cap protects body-buffering handlers and bandwidth, not
+server memory.
+
+**Timeouts** (poll(2)-based; compile-time disabled on platforms without
+poll — then none of these fire):
+
+| Timeout | Default | Bounds |
+|---|---|---|
+| `read_timeout_ms` | 10 s | any single read **stall**: head wait, body wait, keep-alive idle |
+| `request_timeout_ms` | 60 s | one whole request-read cycle — keep-alive idle + head + body, **dribble included** (Go `ReadTimeout` semantics; re-checked at every refill, so slowloris byte-trickling is bounded). Handler compute and response writing are not counted |
+| `write_timeout_ms` | 10 s | any single write **stall** (peer stops reading — slow-read attack); polled before every socket write. A trickle-reading peer restarts the window per write |
+
+0 (or null for the size limits) disables the individual bound.
 
 ## Client behavior notes
 
@@ -167,13 +229,23 @@ functions; `http.Server.serveStream` / `http.Server.ResponseWriter` /
   fabricated responses; server: golden response bytes (fixed, chunked,
   HEAD/204, error pages), keep-alive two-requests-from-one-buffer, chunked +
   Content-Length request body decode, 100-continue, HTTP/1.0 fallback,
-  declared-Content-Length enforcement, handler-error 500, IMF-fixdate.
+  declared-Content-Length enforcement, handler-error 500, IMF-fixdate;
+  hardening: over-long request line → 414 (configurable), declared
+  Content-Length over cap → golden 413 before the handler, chunked body
+  over cap → 413 mid-stream with the body larger than all serving buffers
+  combined (bounded-memory proof), exact-at-cap passes + keep-alive
+  survives, peer address + request index surfaced socket-free, ConnState
+  sequence `new→active→idle→active→closed`.
 - **In-process integration (dogfood, not skipped):** the Phase-1 `Client`
   drives the `Server` on `127.0.0.1:0` — GET with query + headers, POST
   with body (echo), chunked response decode; a raw TCP connection proves
-  keep-alive (two requests, one connection, close honored) and the read
-  timeout (stalled half-request gets dropped). Skips via `SkipZigTest` only
-  if loopback is unavailable.
+  keep-alive (two requests, one connection, close honored), the read
+  timeout (stalled half-request gets dropped), the loopback peer address +
+  rising request index across keep-alive reuse (`on_connect` fires once
+  per connection), an `on_connect` reject (handshake completes, first read
+  fails, never admitted) and `activeConnections()` around an in-flight
+  request (0 → 1 → 0). Skips via `SkipZigTest` only if loopback is
+  unavailable.
 - Live client tests (auto-skipped without network): `GET
   https://example.com` over TLS returns 200 + body; an `http://` request
   completes.

@@ -13,7 +13,7 @@ zero globals.
   `Limiter` is internally synchronized (a spinlock around a hash lookup +
   O(1) LRU relink; Zig 0.16 std has no io-less blocking mutex — this is the
   std `SmpAllocator` pattern). The bare `TokenBucket` is single-owner.
-- **Deps:** `router`, `http`.
+- **Deps:** `router`, `http`, `netaddr` (peer-IP key formatting).
 
 ## Layers
 
@@ -21,7 +21,7 @@ zero globals.
 |---|---|---|
 | `TokenBucket` | the bare algorithm | none — caller passes `now_ns` |
 | `Limiter` | per-key buckets, bounded LRU store | injected `Clock`, internal lock |
-| `Limiter.middleware()` | `router.Middleware`, 429 + `Retry-After` | key from request headers |
+| `Limiter.middleware()` | `router.Middleware`, 429 + `Retry-After` | key from request headers / socket peer |
 
 The algorithm never reads a wall clock: time comes from `Options.clock`
 (default = OS `CLOCK_MONOTONIC`), so tests are fully deterministic
@@ -59,12 +59,12 @@ plus an idle TTL that releases memory early and resets long-idle keys.
 `allow` is infallible — on allocator exhaustion a *new* key is admitted
 untracked (fail-open: the limiter must not turn OOM into an outage).
 
-## Client-key trust policy (X-Forwarded-For) — security relevant
+## Client-key trust policy (X-Forwarded-For / socket peer) — security relevant
 
-The default key (`KeySource.forwarded_ip`) is the client IP **as established
-by a trusted reverse proxy** (the intended deployment is behind Caddy, which
-terminates TLS and always appends the peer address to `X-Forwarded-For`).
-Resolution order:
+The default key (`KeySource.forwarded_ip`) is the client IP — as established
+by a trusted reverse proxy when one is in front, or the **socket peer
+address** when the server faces the internet directly. Resolution order
+(`ratelimit.clientKey`, reusable by other middleware):
 
 1. **Rightmost element of the last `X-Forwarded-For` header.** Every
    compliant proxy hop *appends* the peer address it observed, so the final
@@ -76,17 +76,24 @@ Resolution order:
 2. **`X-Real-IP`** as a fallback for proxies that set it instead
    (nginx-style). Only trustworthy when the proxy overwrites it — a client
    that can reach the server directly can forge it freely.
-3. **`ratelimit.fallback_key`** — one shared bucket for everything else.
-   `http.Server` does not expose the socket peer address to handlers, so
-   direct (unproxied) clients cannot be told apart; behind the intended
-   proxy deployment this case does not occur (XFF is always present).
+3. **The socket peer address** (`http.Server.Request.peerAddress()`) — the
+   real client in a direct-internet deployment. The key is the IP only
+   (ports vary per connection, so one client stays one bucket) and
+   IPv4-mapped IPv6 peers key as their plain IPv4 form (dual-stack
+   listeners see one client, one bucket).
+4. **`ratelimit.fallback_key`** — one shared bucket, only reachable when
+   even the peer is unknown, i.e. driving the codec socket-free
+   (`serveStream` without `StreamOptions.peer`). A socket-served request
+   always has a peer.
 
-**Assumption: the app is reachable only through the proxy.** If clients can
-bypass the proxy, they control all of these headers and can choose their own
-bucket — bind the server to localhost / a private interface so that only the
-proxy can connect. If you chain *multiple* trusted proxies, the rightmost
-entry is your outermost proxy's peer, not the client — supply a
-`KeySource.custom` extractor that walks the chain past your own hops.
+**Caveat for direct exposure:** a directly-reachable client can send forged
+`X-Forwarded-For` / `X-Real-IP` headers and steps 1–2 will honor them. That
+still yields a per-client bucket (it is a key, not a bypass), but if you are
+*not* behind a proxy that always sets XFF, prefer a `KeySource.custom`
+extractor that goes straight to `req.peerAddress()`, or strip those headers
+at the edge. If you chain *multiple* trusted proxies, the rightmost entry is
+your outermost proxy's peer, not the client — supply a `KeySource.custom`
+extractor that walks the chain past your own hops.
 
 `KeySource.header` (API-key limiting) uses the named header's value as the
 key and falls back to the forwarded-IP chain when the header is absent.
@@ -110,7 +117,9 @@ key and falls back to the forwarded-IP chain when the header is absent.
 and `retry_after` exactness, per-key isolation, LRU eviction + TTL sweep, an
 8-thread over-admission race check, fail-open OOM), middleware goldens over
 the socket-free `http.Server.serveStream` (429 wire bytes, XFF/X-Real-IP/
-API-key/custom key extraction, spoof resistance), and an in-process
-integration run (`router` + `http.Server` + `http.Client` over loopback:
-burst → 200s, then 429 + `Retry-After`, key isolation, XFF exercised) that
-only skips when loopback binding is unavailable.
+API-key/custom key extraction, spoof resistance, peer-address fallback —
+port-insensitive, IPv4-mapped unified, headers win over peer), and an
+in-process integration run (`router` + `http.Server` + `http.Client` over
+loopback: burst → 200s, then 429 + `Retry-After`, key isolation, XFF
+exercised, headerless requests keyed by the loopback peer) that only skips
+when loopback binding is unavailable.

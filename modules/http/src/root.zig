@@ -3,10 +3,15 @@
 //! Phase 1: `Client` — HTTP/1.1 over TCP and TLS, streaming bodies both
 //! ways, chunked + Content-Length framing, RFC-conformant redirect
 //! following. Phase 2 (this code): `Server` — request codec, response
-//! writer and a thread-per-connection serving loop (plain HTTP/1.1; a
-//! reverse proxy terminates TLS). Phase 3 will add HTTP/2 (framing + HPACK,
-//! h2spec-verified). Deliberately NOT built on `std.http` (API churn is the
-//! reason this module exists); client TLS is strictly `std.crypto.tls`.
+//! writer and a thread-per-connection serving loop; Phase 2.1 hardened it
+//! for **direct internet exposure** (peer address on requests, accept
+//! hook + connection accounting, 431/414/413 size limits, stall +
+//! whole-request + write timeouts — see `Server`), though it still speaks
+//! plain HTTP/1.1 only (a TLS-terminating server is a separate later
+//! task; a reverse proxy also works). Phase 3 will add HTTP/2 (framing +
+//! HPACK, h2spec-verified). Deliberately NOT built on `std.http` (API
+//! churn is the reason this module exists); client TLS is strictly
+//! `std.crypto.tls`.
 //!
 //! Layout: this file owns the shared vocabulary (methods, URL parsing,
 //! redirect rules); `h1.zig` is the pure HTTP/1.1 wire codec (offline

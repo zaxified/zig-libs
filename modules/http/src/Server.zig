@@ -18,11 +18,26 @@
 //! shares state. Concurrency *limiting* is deliberately out of scope (the
 //! later `throttle` module); the kernel backlog is the only cap.
 //!
-//! Timeout model: a poll(2)-based read timeout bounds every read *stall*
-//! (request head, body, keep-alive idle) at `read_timeout_ms`. A dribbling
-//! client can extend the total head time — slowloris hardening belongs to
-//! the later `abuseguard` module. On platforms without poll(2) the timeout
-//! is compile-time disabled.
+//! Timeout model (poll(2)-based; compile-time disabled where poll is
+//! unavailable): `read_timeout_ms` bounds every read *stall* (request head,
+//! body, keep-alive idle); `request_timeout_ms` is a whole-request read
+//! deadline (Go ReadTimeout shape: keep-alive idle + head + body share one
+//! budget, so a dribbling client cannot stretch a request forever);
+//! `write_timeout_ms` bounds every write stall (a peer that stops reading).
+//!
+//! Hardening (Phase 2.1, SPEC-http-hardening.md) — built to face the
+//! internet without a reverse proxy: the handler sees the socket peer
+//! address and a per-connection request index (`Request.peerAddress` /
+//! `Request.connRequestIndex`); `Options.on_connect` accepts or rejects a
+//! connection right after accept (the mechanism for `abuseguard`'s per-IP
+//! caps + bans; a reject closes the socket silently, see the option doc);
+//! `Server.activeConnections()` exposes a thread-safe connection count;
+//! size limits answer 431 (`max_header_bytes`), 414
+//! (`max_request_line_bytes`) and 413 (`max_body_bytes` — an oversized
+//! declared Content-Length is refused before the handler runs, a chunked
+//! body is capped while streaming; a request body is never buffered). An
+//! optional Go-ConnState-style `on_conn_state` callback observes
+//! new/active/idle/closed transitions for metrics.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -40,10 +55,30 @@ options: Options,
 listener: ?net.Server,
 /// Tracks the per-connection tasks; awaited before `serve` returns.
 group: std.Io.Group,
+/// Connections currently admitted and being served (see
+/// `activeConnections`). Atomic: touched by the accept loop and every
+/// connection task.
+active_conns: std.atomic.Value(usize),
 
 /// Called once per request, from the connection's thread. Errors turn into
 /// a 500 when nothing was sent yet, otherwise the connection is closed.
 pub const Handler = *const fn (*Request, *ResponseWriter) anyerror!void;
+
+/// Verdict of an `on_connect` hook.
+pub const ConnDecision = enum { accept, reject };
+
+/// Accept hook — see `Options.on_connect`.
+pub const OnConnectFn = *const fn (?*anyopaque, peer: net.IpAddress) ConnDecision;
+
+/// Connection lifecycle phases, mirroring Go net/http's `ConnState`:
+/// `.new` when serving starts (right after admission), `.active` once a
+/// request head has arrived, `.idle` between keep-alive requests, `.closed`
+/// when the connection is done. Rejected connections fire nothing.
+pub const ConnState = enum { new, active, idle, closed };
+
+/// Lifecycle observer — see `Options.on_conn_state`. `peer` is null only
+/// when driven socket-free (`serveStream` without `StreamOptions.peer`).
+pub const ConnStateFn = *const fn (?*anyopaque, peer: ?net.IpAddress, state: ConnState) void;
 
 pub const Options = struct {
     handler: Handler,
@@ -53,15 +88,55 @@ pub const Options = struct {
     addr: []const u8 = "127.0.0.1",
     /// TCP port; 0 picks an ephemeral port (see `boundAddress`).
     port: u16 = 0,
+    /// Called on the accept-loop thread right after `accept`, with the
+    /// socket peer address, before the connection is admitted (before any
+    /// allocation, read or task spawn) — the plug-in point for per-IP
+    /// connection caps, bans and global load shedding (`abuseguard` /
+    /// `throttle`). `.reject` closes the socket immediately and **writes
+    /// nothing** — no 429/503 (nginx `limit_conn` answers 503; we drop at
+    /// the TCP level instead so abusive peers cost no response bytes; a
+    /// polite 503 can always be layered as middleware since it needs the
+    /// request anyway). Must be fast and thread-safe: it runs inline in the
+    /// accept loop, stalling all other incoming connections while it runs.
+    on_connect: ?OnConnectFn = null,
+    /// Opaque pointer passed to `on_connect`.
+    on_connect_ctx: ?*anyopaque = null,
+    /// Optional Go-ConnState-style lifecycle observer (metrics/debugging);
+    /// runs on the connection's task. See `ConnState`.
+    on_conn_state: ?ConnStateFn = null,
+    /// Opaque pointer passed to `on_conn_state`.
+    on_conn_state_ctx: ?*anyopaque = null,
     /// Max time a single read may stall (head wait, body wait, keep-alive
     /// idle) before the connection is dropped; 0 = no timeout.
     read_timeout_ms: u32 = 10_000,
+    /// Whole-request read deadline (Go `ReadTimeout` semantics): keep-alive
+    /// idle + request head + request body must all complete within this
+    /// budget, dribble included — the hard slowloris bound that
+    /// `read_timeout_ms` alone cannot give. Response writing and handler
+    /// compute time are not counted. 0 = no deadline.
+    request_timeout_ms: u32 = 60_000,
+    /// Max time a single write may stall because the peer stopped reading
+    /// (slow-read attack): the socket is polled for writability before
+    /// every write; 0 = no timeout.
+    write_timeout_ms: u32 = 10_000,
     /// Per-connection read buffer; also bounds a single request head line.
     read_buffer_size: usize = 16 * 1024,
     /// Socket write buffer.
     write_buffer_size: usize = 4 * 1024,
-    /// Upper bound for a whole request head (431 beyond it).
-    max_head_bytes: usize = 16 * 1024,
+    /// Upper bound for a whole request head (Go `MaxHeaderBytes`) → 431.
+    max_header_bytes: usize = 16 * 1024,
+    /// Upper bound for the request line (method + target + version) → 414.
+    /// Applies to lines within `max_header_bytes`; a request line so long
+    /// it blows the whole head budget gets the 431. null = no extra bound.
+    max_request_line_bytes: ?usize = 8 * 1024,
+    /// Upper bound for a request body → 413 (nginx `client_max_body_size`
+    /// shape): an over-limit declared Content-Length is refused before the
+    /// handler runs; a chunked body is capped while streaming — the
+    /// handler's body reader fails once decoded bytes cross the limit, and
+    /// the connection closes. Bodies are never buffered either way; this
+    /// cap protects handlers that buffer and bounds bandwidth, not server
+    /// memory. null = unlimited.
+    max_body_bytes: ?u64 = 1 << 20,
     /// Response body buffering: bodies fully written within this get an
     /// exact Content-Length, larger ones stream chunked.
     response_buffer_size: usize = 4 * 1024,
@@ -80,7 +155,16 @@ pub fn init(io: std.Io, gpa: std.mem.Allocator, options: Options) Server {
         .options = options,
         .listener = null,
         .group = .init,
+        .active_conns = .init(0),
     };
+}
+
+/// Number of connections currently admitted and being served (accepted,
+/// past `on_connect`, not yet closed). Thread-safe; callable from any
+/// thread while `serve` runs — the enforcement point for a global
+/// connection cap (`throttle`) inside an `on_connect` hook.
+pub fn activeConnections(s: *const Server) usize {
+    return s.active_conns.load(.monotonic);
 }
 
 /// Closes the listener if still open. Only call after `serve` returned.
@@ -140,6 +224,16 @@ pub fn serve(s: *Server) ServeError!void {
             },
             else => return error.AcceptFailed,
         };
+        // Admission control, before anything is spent on the connection.
+        // A reject closes the socket without writing a byte (documented on
+        // `Options.on_connect`) and never counts as active.
+        if (s.options.on_connect) |hook| {
+            if (hook(s.options.on_connect_ctx, stream.socket.address) == .reject) {
+                stream.close(s.io);
+                continue;
+            }
+        }
+        _ = s.active_conns.fetchAdd(1, .monotonic); // connMain decrements
         s.group.concurrent(s.io, connMain, .{ s, stream }) catch {
             // No concurrency available: serve the connection inline rather
             // than drop it.
@@ -180,9 +274,10 @@ const max_unread_body_drain = 256 * 1024;
 
 fn connMain(s: *Server, stream: net.Stream) void {
     defer stream.close(s.io);
+    defer _ = s.active_conns.fetchSub(1, .monotonic); // paired with serve()
 
     const o = &s.options;
-    const total = o.read_buffer_size + o.write_buffer_size + o.max_head_bytes +
+    const total = o.read_buffer_size + o.write_buffer_size + o.max_header_bytes +
         o.response_buffer_size + body_scratch_len + chunk_scratch_len;
     const slab = s.gpa.alloc(u8, total) catch return; // overloaded: drop the connection
     defer s.gpa.free(slab);
@@ -193,25 +288,32 @@ fn connMain(s: *Server, stream: net.Stream) void {
     const write_buf = slab[off..][0..o.write_buffer_size];
     off += o.write_buffer_size;
     const bufs: StreamBuffers = .{
-        .head = slab[off..][0..o.max_head_bytes],
-        .response_body = slab[off + o.max_head_bytes ..][0..o.response_buffer_size],
-        .request_body = slab[off + o.max_head_bytes + o.response_buffer_size ..][0..body_scratch_len],
-        .chunk = slab[off + o.max_head_bytes + o.response_buffer_size + body_scratch_len ..][0..chunk_scratch_len],
+        .head = slab[off..][0..o.max_header_bytes],
+        .response_body = slab[off + o.max_header_bytes ..][0..o.response_buffer_size],
+        .request_body = slab[off + o.max_header_bytes + o.response_buffer_size ..][0..body_scratch_len],
+        .chunk = slab[off + o.max_header_bytes + o.response_buffer_size + body_scratch_len ..][0..chunk_scratch_len],
     };
 
     // All read buffering lives in the TimeoutReader (bounds head lines and
     // lets the timeout check see leftover bytes); the stream reader itself
-    // is unbuffered.
+    // is unbuffered. Same shape on the write side: the TimeoutWriter owns
+    // the buffer so every socket write passes its writability poll.
     var sr = stream.reader(s.io, read_buf[0..0]);
-    var tr: TimeoutReader = .init(&sr.interface, stream.socket.handle, o.read_timeout_ms, read_buf);
-    var sw = stream.writer(s.io, write_buf);
+    var tr: TimeoutReader = .init(&sr.interface, stream.socket.handle, o.read_timeout_ms, o.request_timeout_ms, read_buf);
+    var sw = stream.writer(s.io, write_buf[0..0]);
+    var tw: TimeoutWriter = .init(&sw.interface, stream.socket.handle, o.write_timeout_ms, write_buf);
 
-    serveStream(.{
+    serveLoop(.{
         .handler = o.handler,
         .context = o.context,
         .server_name = o.server_name,
         .now = .{ .ctx = @ptrCast(&s.io), .epochSeconds = ioEpochSeconds },
-    }, &tr.reader, &sw.interface, bufs);
+        .peer = stream.socket.address,
+        .max_request_line_bytes = o.max_request_line_bytes,
+        .max_body_bytes = o.max_body_bytes,
+        .on_conn_state = o.on_conn_state,
+        .on_conn_state_ctx = o.on_conn_state_ctx,
+    }, &tr.reader, &tw.writer, bufs, &tr);
 }
 
 fn ioEpochSeconds(ctx: ?*anyopaque) i64 {
@@ -220,25 +322,43 @@ fn ioEpochSeconds(ctx: ?*anyopaque) i64 {
     return @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_s));
 }
 
-const have_read_timeout = builtin.os.tag != .windows and std.posix.pollfd != void;
+const have_poll_timeouts = builtin.os.tag != .windows and std.posix.pollfd != void;
+
+/// Monotonic now in nanoseconds for the whole-request deadline (only
+/// compiled where `have_poll_timeouts`). A clock failure returns 0 —
+/// deadlines then degrade to per-refill budgets instead of failing hard.
+fn monotonicNowNs() u64 {
+    var ts: std.posix.timespec = undefined;
+    if (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts)) != .SUCCESS)
+        return 0;
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
 
 /// Wraps the connection reader: whenever a refill would block, first polls
-/// the socket with the configured timeout; a stalled peer becomes
-/// `error.ReadFailed` with `timed_out` set and the connection is dropped.
+/// the socket with the configured stall timeout, clamped to the remaining
+/// whole-request deadline (armed per request by the serving loop); a
+/// stalled peer or an expired deadline becomes `error.ReadFailed` with
+/// `timed_out` set and the connection is dropped. Because the deadline is
+/// re-checked on every refill, a dribbling client (one byte per poll
+/// window) is bounded too — the stall timeout alone cannot do that.
 ///
 /// Not movable after `reader` has been handed out.
 const TimeoutReader = struct {
     in: *Reader,
     handle: net.Socket.Handle,
     timeout_ms: u32,
+    request_timeout_ms: u32,
+    /// Monotonic whole-request deadline; 0 = unarmed.
+    deadline_ns: u64 = 0,
     reader: Reader,
     timed_out: bool = false,
 
-    fn init(in: *Reader, handle: net.Socket.Handle, timeout_ms: u32, buffer: []u8) TimeoutReader {
+    fn init(in: *Reader, handle: net.Socket.Handle, timeout_ms: u32, request_timeout_ms: u32, buffer: []u8) TimeoutReader {
         return .{
             .in = in,
             .handle = handle,
             .timeout_ms = timeout_ms,
+            .request_timeout_ms = request_timeout_ms,
             .reader = .{
                 .vtable = &.{ .stream = streamFn },
                 .buffer = buffer,
@@ -248,15 +368,34 @@ const TimeoutReader = struct {
         };
     }
 
+    /// Start the whole-request read budget (Go ReadTimeout shape): from
+    /// here, keep-alive idle + head + body reads share one deadline.
+    fn armRequest(t: *TimeoutReader) void {
+        if (!have_poll_timeouts or t.request_timeout_ms == 0) return;
+        t.deadline_ns = monotonicNowNs() + @as(u64, t.request_timeout_ms) * std.time.ns_per_ms;
+    }
+
     fn streamFn(r: *Reader, w: *Writer, limit: std.Io.Limit) Reader.StreamError!usize {
         const t: *TimeoutReader = @alignCast(@fieldParentPtr("reader", r));
-        if (have_read_timeout and t.timeout_ms != 0 and t.in.bufferedLen() == 0) {
+        if (have_poll_timeouts and t.in.bufferedLen() == 0 and
+            (t.timeout_ms != 0 or t.deadline_ns != 0))
+        {
+            var wait_ms: u64 = if (t.timeout_ms != 0) t.timeout_ms else std.math.maxInt(i32);
+            if (t.deadline_ns != 0) {
+                const now = monotonicNowNs();
+                if (now >= t.deadline_ns) {
+                    t.timed_out = true;
+                    return error.ReadFailed;
+                }
+                // Round up so we never poll(0)-spin just before the deadline.
+                wait_ms = @min(wait_ms, (t.deadline_ns - now + std.time.ns_per_ms - 1) / std.time.ns_per_ms);
+            }
             var fds = [_]std.posix.pollfd{.{
                 .fd = t.handle,
                 .events = std.posix.POLL.IN,
                 .revents = 0,
             }};
-            const timeout: i32 = std.math.cast(i32, t.timeout_ms) orelse std.math.maxInt(i32);
+            const timeout: i32 = std.math.cast(i32, wait_ms) orelse std.math.maxInt(i32);
             const ready = std.posix.poll(&fds, timeout) catch return error.ReadFailed;
             if (ready == 0) {
                 t.timed_out = true;
@@ -264,6 +403,75 @@ const TimeoutReader = struct {
             }
         }
         return t.in.stream(w, limit);
+    }
+};
+
+/// Wraps the connection writer: polls the socket for writability (bounded
+/// by `write_timeout_ms`) before every socket write, so a peer that stops
+/// reading while a response streams (slow-read attack) becomes
+/// `error.WriteFailed` with `timed_out` set instead of pinning the
+/// connection task. Caveat (mirror of the read side): a peer that drains a
+/// trickle restarts the window per write — only full stalls are bounded.
+///
+/// Not movable after `writer` has been handed out.
+const TimeoutWriter = struct {
+    out: *Writer,
+    handle: net.Socket.Handle,
+    timeout_ms: u32,
+    writer: Writer,
+    timed_out: bool = false,
+
+    fn init(out: *Writer, handle: net.Socket.Handle, timeout_ms: u32, buffer: []u8) TimeoutWriter {
+        return .{
+            .out = out,
+            .handle = handle,
+            .timeout_ms = timeout_ms,
+            .writer = .{
+                .vtable = &.{ .drain = drainFn },
+                .buffer = buffer,
+            },
+        };
+    }
+
+    fn pollOut(t: *TimeoutWriter) Writer.Error!void {
+        if (!have_poll_timeouts or t.timeout_ms == 0) return;
+        var fds = [_]std.posix.pollfd{.{
+            .fd = t.handle,
+            .events = std.posix.POLL.OUT,
+            .revents = 0,
+        }};
+        const timeout: i32 = std.math.cast(i32, t.timeout_ms) orelse std.math.maxInt(i32);
+        const ready = std.posix.poll(&fds, timeout) catch return error.WriteFailed;
+        if (ready == 0) {
+            t.timed_out = true;
+            return error.WriteFailed;
+        }
+    }
+
+    /// Write all of `bytes` to the (unbuffered) socket writer, polling
+    /// before each partial write.
+    fn sendAll(t: *TimeoutWriter, bytes: []const u8) Writer.Error!void {
+        var rem = bytes;
+        while (rem.len != 0) {
+            try t.pollOut();
+            const n = try t.out.write(rem);
+            rem = rem[n..];
+        }
+    }
+
+    fn drainFn(w: *Writer, data: []const []const u8, splat: usize) Writer.Error!usize {
+        const t: *TimeoutWriter = @alignCast(@fieldParentPtr("writer", w));
+        try t.sendAll(w.buffered());
+        w.end = 0;
+        var consumed: usize = 0;
+        for (data[0 .. data.len - 1]) |d| {
+            try t.sendAll(d);
+            consumed += d.len;
+        }
+        const last = data[data.len - 1];
+        for (0..splat) |_| try t.sendAll(last);
+        consumed += last.len * splat;
+        return consumed;
     }
 };
 
@@ -278,12 +486,32 @@ pub const StreamOptions = struct {
     server_name: ?[]const u8 = "zig-libs-http/0.1",
     /// Wall-clock source for the auto `Date` header; null = omit Date.
     now: ?Now = null,
+    /// The socket peer address, surfaced on every `Request` of this
+    /// connection (`Request.peerAddress`); null = unknown (socket-free).
+    /// The serving loop always fills it from the accepted socket.
+    peer: ?net.IpAddress = null,
+    /// Request line longer than this → 414 (see `Options`). null = no
+    /// extra bound (the head buffer still applies).
+    max_request_line_bytes: ?usize = null,
+    /// Request body cap → 413 (see `Options`); enforced up front for a
+    /// declared Content-Length, while streaming for chunked. null =
+    /// unlimited (default here so plain codec runs stay permissive; the
+    /// socket serving loop passes the hardened `Options` default).
+    max_body_bytes: ?u64 = null,
+    /// Optional lifecycle observer — see `ConnState`. Driven socket-free,
+    /// the whole stream counts as one connection.
+    on_conn_state: ?ConnStateFn = null,
+    on_conn_state_ctx: ?*anyopaque = null,
 
     pub const Now = struct {
         ctx: ?*anyopaque = null,
         epochSeconds: *const fn (?*anyopaque) i64,
     };
 };
+
+fn fireConnState(opts: *const StreamOptions, state: ConnState) void {
+    if (opts.on_conn_state) |hook| hook(opts.on_conn_state_ctx, opts.peer, state);
+}
 
 /// Caller-supplied working memory for one connection.
 pub const StreamBuffers = struct {
@@ -303,12 +531,27 @@ pub const StreamBuffers = struct {
 /// Reader/Writer logic: the serving loop wraps it around a socket, tests
 /// drive it with fixed buffers.
 pub fn serveStream(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers) void {
-    while (serveOne(opts, in, out, bufs) == .keep_alive) {}
+    serveLoop(opts, in, out, bufs, null);
+}
+
+/// The per-connection loop behind `serveStream`; the socket serving loop
+/// additionally passes its TimeoutReader so the whole-request deadline is
+/// re-armed at every request boundary.
+fn serveLoop(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers, tr: ?*TimeoutReader) void {
+    fireConnState(&opts, .new);
+    var req_index: u32 = 0;
+    while (true) {
+        if (tr) |t| t.armRequest();
+        if (serveOne(opts, in, out, bufs, req_index) == .close) break;
+        req_index += 1;
+        fireConnState(&opts, .idle);
+    }
+    fireConnState(&opts, .closed);
 }
 
 const ConnDisposition = enum { keep_alive, close };
 
-fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers) ConnDisposition {
+fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers, req_index: u32) ConnDisposition {
     // Wait for the next request (keep-alive idle); any failure here — client
     // hung up between requests, idle timeout — is a quiet close.
     _ = in.peekByte() catch return .close;
@@ -320,6 +563,16 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers)
         error.HeadTooLarge => return respondError(opts, out, date, 431),
         error.ReadFailed, error.ConnectionClosed => return .close,
     };
+    fireConnState(&opts, .active);
+
+    // Request-line bound (Go checks its URI length the same way, after the
+    // line is in memory — the head buffer already bounds the read itself).
+    if (opts.max_request_line_bytes) |max| {
+        const eol = std.mem.indexOfScalar(u8, block, '\n') orelse block.len;
+        if (std.mem.trimEnd(u8, block[0..eol], "\r").len > max)
+            return respondError(opts, out, date, 414);
+    }
+
     const head = h1.RequestHead.parse(block) catch |err| return respondError(opts, out, date, switch (err) {
         error.UnsupportedVersion => 505,
         error.MalformedHead => 400,
@@ -347,13 +600,25 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers)
     // to close; HTTP/1.0 always closes (keep-alive opt-in not implemented).
     const keep_alive = !head.http1_0 and !head.connection_close;
 
+    // Body cap, declared-length half: refuse before the handler runs (and
+    // before any 100-continue invites the body onto the wire) — the nginx
+    // `client_max_body_size` behavior. Chunked bodies (length unknown) are
+    // capped while streaming, below.
+    if (opts.max_body_bytes) |max| {
+        if ((head.content_length orelse 0) > max)
+            return respondError(opts, out, date, 413);
+    }
+
     const has_body = head.chunked or (head.content_length orelse 0) != 0;
     if (head.expect_continue and has_body) {
         out.writeAll("HTTP/1.1 100 Continue\r\n\r\n") catch return .close;
         out.flush() catch return .close;
     }
 
-    var body: RequestBody = .init(&head, in, bufs.request_body);
+    var body: RequestBody = if (opts.max_body_bytes) |max|
+        .initCapped(&head, in, bufs.request_body, max)
+    else
+        .init(&head, in, bufs.request_body);
     var req: Request = .{
         .method = method,
         .target = head.target,
@@ -362,6 +627,8 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers)
         .head = head,
         .body = &body,
         .context = opts.context,
+        .peer = opts.peer,
+        .conn_request_index = req_index,
     };
     var rw: ResponseWriter = .init(out, bufs.response_body, bufs.chunk, .{
         .head_request = method == .head,
@@ -375,6 +642,11 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers)
         // Nothing on the wire yet → a clean 500; otherwise the response
         // framing is broken and the connection must die.
         if (rw.sent_head) return .close;
+        // A body that crossed max_body_bytes failed the handler's reads —
+        // that is the request's fault, not the handler's: answer 413 and
+        // close (the remaining body is unbounded, never drain it).
+        if (body == .capped and body.capped.exceeded)
+            return respondError(opts, out, date, 413);
         rw.reset();
         rw.setStatus(500);
         rw.setHeader("Content-Type", "text/plain") catch return .close;
@@ -445,6 +717,25 @@ pub const Request = struct {
     body: *RequestBody,
     /// `Options.context` passthrough for stateful handlers.
     context: ?*anyopaque,
+    /// Socket peer address — see `peerAddress`.
+    peer: ?net.IpAddress = null,
+    /// 0-based request ordinal on this connection — see `connRequestIndex`.
+    conn_request_index: u32 = 0,
+
+    /// The socket peer address (the direct client — meaningful as a client
+    /// identity only when no trusted proxy sits in front; `ratelimit` /
+    /// `abuseguard` key on it when no forwarded header is present). Null
+    /// only when the request was served socket-free (`serveStream` without
+    /// `StreamOptions.peer`).
+    pub fn peerAddress(req: *const Request) ?net.IpAddress {
+        return req.peer;
+    }
+
+    /// 0-based index of this request on its keep-alive connection (Nth
+    /// request served over the same socket).
+    pub fn connRequestIndex(req: *const Request) u32 {
+        return req.conn_request_index;
+    }
 
     /// First value of header `name` (case-insensitive), or null.
     pub fn header(req: *const Request, name: []const u8) ?[]const u8 {
@@ -471,6 +762,8 @@ pub const RequestBody = union(enum) {
     none: Reader,
     limited: h1.ContentLengthReader,
     chunked: h1.ChunkedReader,
+    /// Chunked body under a `max_body_bytes` cap.
+    capped: Capped,
 
     pub fn init(head: *const h1.RequestHead, in: *Reader, scratch: []u8) RequestBody {
         if (head.chunked) return .{ .chunked = .init(in, scratch) };
@@ -479,13 +772,77 @@ pub const RequestBody = union(enum) {
         return .{ .none = .fixed("") };
     }
 
+    /// Like `init`, additionally capping bodies whose size is not known up
+    /// front (chunked) at `max_body` decoded bytes. Content-Length bodies
+    /// are inherently bounded by their declared length — the caller must
+    /// reject declared lengths above the cap (the serving loop answers 413
+    /// before the handler runs).
+    pub fn initCapped(head: *const h1.RequestHead, in: *Reader, scratch: []u8, max_body: u64) RequestBody {
+        if (head.chunked) return .{ .capped = .init(in, max_body, scratch) };
+        return RequestBody.init(head, in, scratch);
+    }
+
     pub fn reader(b: *RequestBody) *Reader {
         return switch (b.*) {
             .none => |*r| r,
             .limited => |*lr| &lr.reader,
             .chunked => |*cr| &cr.reader,
+            .capped => |*cc| &cc.reader,
         };
     }
+
+    /// `max_body_bytes` enforcement for chunked request bodies: streams
+    /// decoded bytes through until the cap, then fails the read with
+    /// `exceeded` set (the serving loop turns that into a 413 when nothing
+    /// was sent yet, and closes the connection either way). Memory use is
+    /// the caller's `scratch` — nothing is buffered beyond it.
+    ///
+    /// Not movable after `reader` has been handed out.
+    pub const Capped = struct {
+        /// The framing decoder underneath; its interface stays unbuffered
+        /// (all its reads write straight through), the consumer-facing
+        /// buffer lives on `reader`.
+        inner: h1.ChunkedReader,
+        /// Decoded bytes still allowed.
+        remaining: u64,
+        exceeded: bool = false,
+        reader: Reader,
+
+        pub fn init(in: *Reader, max_body: u64, scratch: []u8) Capped {
+            return .{
+                .inner = .init(in, scratch[0..0]),
+                .remaining = max_body,
+                .reader = .{
+                    .vtable = &.{ .stream = streamFn },
+                    .buffer = scratch,
+                    .seek = 0,
+                    .end = 0,
+                },
+            };
+        }
+
+        fn streamFn(r: *Reader, w: *Writer, limit: std.Io.Limit) Reader.StreamError!usize {
+            const c: *Capped = @alignCast(@fieldParentPtr("reader", r));
+            if (c.remaining == 0) {
+                // At the cap: the body must end exactly here. Probe one
+                // byte — a clean end-of-body passes, anything more is over
+                // the limit.
+                while (true) {
+                    const n = c.inner.reader.discard(.limited(1)) catch |err| switch (err) {
+                        error.EndOfStream => return error.EndOfStream,
+                        error.ReadFailed => return error.ReadFailed,
+                    };
+                    if (n != 0) {
+                        c.exceeded = true;
+                        return error.ReadFailed;
+                    }
+                }
+            }
+            const n = try c.inner.reader.stream(w, limit.min(.limited64(c.remaining)));
+            c.remaining -= n;
+            return n;
+        }
+    };
 };
 
 // ── the response writer ─────────────────────────────────────────────────────
@@ -908,6 +1265,26 @@ fn testHandler(req: *Request, rw: *ResponseWriter) anyerror!void {
         try rw.setHeader("X-Dropped", "yes");
         try rw.writeAll("partial");
         return error.Boom;
+    } else if (std.mem.eql(u8, req.path, "/connmeta")) {
+        // Report what the hardening surfaced: peer address + request index.
+        var buf: [96]u8 = undefined;
+        var w: Writer = .fixed(&buf);
+        if (req.peerAddress()) |p| try w.print("{f}", .{p}) else try w.writeAll("none");
+        try w.print(" #{d}", .{req.connRequestIndex()});
+        try rw.writeAll(w.buffered());
+    } else if (std.mem.eql(u8, req.path, "/drain")) {
+        // Stream-discard the whole body (bounded memory by construction).
+        var total: u64 = 0;
+        const r = req.reader();
+        while (true) {
+            const n = r.discard(.limited(4096)) catch |err| switch (err) {
+                error.EndOfStream => break,
+                error.ReadFailed => return error.BodyReadFailed,
+            };
+            total += n;
+        }
+        var buf: [32]u8 = undefined;
+        try rw.writeAll(try std.fmt.bufPrint(&buf, "drained {d}", .{total}));
     } else {
         rw.setStatus(404);
         try rw.writeAll("not found\n");
@@ -920,9 +1297,20 @@ fn fixedEpoch(_: ?*anyopaque) i64 {
 
 const test_date = "Sun, 06 Nov 1994 08:49:37 GMT";
 
+/// Hardening knobs for `runStreamWith` (defaults = the permissive
+/// `StreamOptions` defaults, so `runStream` behaves as before).
+const StreamTweaks = struct {
+    peer: ?net.IpAddress = null,
+    max_request_line_bytes: ?usize = null,
+    max_body_bytes: ?u64 = null,
+    on_conn_state: ?ConnStateFn = null,
+    on_conn_state_ctx: ?*anyopaque = null,
+};
+
 /// Run `serveStream` over canned wire bytes with small test buffers
-/// (response buffer 64 → bodies beyond it stream chunked).
-fn runStream(ctx: ?*anyopaque, wire: []const u8, out_buf: []u8) []const u8 {
+/// (response buffer 64 → bodies beyond it stream chunked). The buffers
+/// dwarf nothing: any body larger than ~1.5 KiB total proves streaming.
+fn runStreamWith(tweaks: StreamTweaks, ctx: ?*anyopaque, wire: []const u8, out_buf: []u8) []const u8 {
     var in: Reader = .fixed(wire);
     var out: Writer = .fixed(out_buf);
     var head_buf: [1024]u8 = undefined;
@@ -934,6 +1322,11 @@ fn runStream(ctx: ?*anyopaque, wire: []const u8, out_buf: []u8) []const u8 {
         .context = ctx,
         .server_name = "test",
         .now = .{ .epochSeconds = fixedEpoch },
+        .peer = tweaks.peer,
+        .max_request_line_bytes = tweaks.max_request_line_bytes,
+        .max_body_bytes = tweaks.max_body_bytes,
+        .on_conn_state = tweaks.on_conn_state,
+        .on_conn_state_ctx = tweaks.on_conn_state_ctx,
     }, &in, &out, .{
         .head = &head_buf,
         .request_body = &request_body_buf,
@@ -941,6 +1334,10 @@ fn runStream(ctx: ?*anyopaque, wire: []const u8, out_buf: []u8) []const u8 {
         .chunk = &chunk_buf,
     });
     return out.buffered();
+}
+
+fn runStream(ctx: ?*anyopaque, wire: []const u8, out_buf: []u8) []const u8 {
+    return runStreamWith(.{}, ctx, wire, out_buf);
 }
 
 test "serveStream: golden fixed-length response" {
@@ -1183,6 +1580,124 @@ test "methodFromToken" {
     try testing.expectEqual(@as(?http.Method, null), methodFromToken("BREW"));
 }
 
+// ── tests (offline — Phase 2.1 hardening) ───────────────────────────────────
+
+test "serveStream: over-long request line → 414; limit is configurable" {
+    var out_buf: [4096]u8 = undefined;
+    const wire_bytes = "GET /" ++ ("a" ** 100) ++ " HTTP/1.1\r\nHost: t\r\n\r\n";
+    try testing.expect(std.mem.startsWith(
+        u8,
+        runStreamWith(.{ .max_request_line_bytes = 64 }, null, wire_bytes, &out_buf),
+        "HTTP/1.1 414 URI Too Long\r\n",
+    ));
+    // The same wire under a permissive limit routes normally (404 path).
+    try testing.expect(std.mem.startsWith(
+        u8,
+        runStreamWith(.{ .max_request_line_bytes = 512 }, null, wire_bytes, &out_buf),
+        "HTTP/1.1 404 Not Found\r\n",
+    ));
+}
+
+test "serveStream: declared Content-Length over max_body_bytes → golden 413 before the handler" {
+    var hits: Hits = .init(0);
+    var out_buf: [4096]u8 = undefined;
+    const got = runStreamWith(.{ .max_body_bytes = 16 }, &hits, "POST /drain HTTP/1.1\r\nHost: t\r\nContent-Length: 17\r\n\r\n" ++ ("b" ** 17), &out_buf);
+    try testing.expectEqualStrings("HTTP/1.1 413 Content Too Large\r\n" ++
+        "Date: " ++ test_date ++ "\r\n" ++
+        "Server: test\r\n" ++
+        "Content-Type: text/plain\r\n" ++
+        "Content-Length: 18\r\n" ++
+        "Connection: close\r\n" ++
+        "\r\n" ++
+        "Content Too Large\n", got);
+    try testing.expectEqual(@as(u32, 0), hits.load(.monotonic)); // handler never ran
+
+    // Exactly at the limit passes.
+    const ok = runStreamWith(.{ .max_body_bytes = 16 }, &hits, "POST /drain HTTP/1.1\r\nHost: t\r\nContent-Length: 16\r\n\r\n" ++ ("b" ** 16), &out_buf);
+    try testing.expect(std.mem.endsWith(u8, ok, "drained 16"));
+    try testing.expectEqual(@as(u32, 1), hits.load(.monotonic));
+}
+
+test "serveStream: chunked body over max_body_bytes → 413 while streaming, memory bounded" {
+    var hits: Hits = .init(0);
+    var out_buf: [4096]u8 = undefined;
+    // 4 KiB of decoded body in 64-byte chunks — more than every serving
+    // buffer combined (head 1 KiB + request-body 256 + response 64 + chunk
+    // 128), so it can only be handled streaming; the cap fires long before
+    // the wire ends and nothing is ever buffered whole.
+    const chunk = "40\r\n" ++ ("x" ** 0x40) ++ "\r\n";
+    const wire_bytes = "POST /drain HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+        (chunk ** 64) ++ "0\r\n\r\n" ++
+        "GET /hello HTTP/1.1\r\nHost: t\r\n\r\n";
+    const got = runStreamWith(.{ .max_body_bytes = 1024 }, &hits, wire_bytes, &out_buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 413 Content Too Large\r\n"));
+    // One response only — the connection closed, the pipelined request died.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "HTTP/1.1"));
+    try testing.expectEqual(@as(u32, 1), hits.load(.monotonic)); // handler ran; its read failed
+}
+
+test "serveStream: chunked body exactly at max_body_bytes passes; unread overrun closes" {
+    var hits: Hits = .init(0);
+    var out_buf: [4096]u8 = undefined;
+    const chunk = "40\r\n" ++ ("x" ** 0x40) ++ "\r\n";
+    const exact = "POST /drain HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+        (chunk ** 16) ++ "0\r\n\r\n" ++
+        "GET /hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n";
+    const got = runStreamWith(.{ .max_body_bytes = 1024 }, &hits, exact, &out_buf);
+    try testing.expect(std.mem.indexOf(u8, got, "drained 1024") != null);
+    try testing.expectEqual(@as(u32, 2), hits.load(.monotonic)); // keep-alive survived
+
+    // A handler that ignores an over-cap body still responds, but the
+    // post-handler drain hits the cap → the connection closes.
+    hits = .init(0);
+    const unread = "POST /hello HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+        (chunk ** 64) ++ "0\r\n\r\n" ++
+        "GET /hello HTTP/1.1\r\nHost: t\r\n\r\n";
+    const got2 = runStreamWith(.{ .max_body_bytes = 1024 }, &hits, unread, &out_buf);
+    try testing.expect(std.mem.startsWith(u8, got2, "HTTP/1.1 200 OK\r\n"));
+    try testing.expectEqual(@as(u32, 1), hits.load(.monotonic)); // pipelined request dropped
+}
+
+test "serveStream: peer address and request index reach the handler" {
+    var out_buf: [4096]u8 = undefined;
+    const wire_bytes = "GET /connmeta HTTP/1.1\r\nHost: t\r\n\r\n" ++
+        "GET /connmeta HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n";
+
+    // Socket-free without a peer: null surfaces, the index still counts.
+    const bare = runStream(null, wire_bytes, &out_buf);
+    try testing.expect(std.mem.indexOf(u8, bare, "none #0") != null);
+    try testing.expect(std.mem.indexOf(u8, bare, "none #1") != null);
+
+    // With `StreamOptions.peer` the handler sees the address on every
+    // request of the connection.
+    const peer = net.IpAddress.parseIp4("192.0.2.7", 4242) catch unreachable;
+    const with_peer = runStreamWith(.{ .peer = peer }, null, wire_bytes, &out_buf);
+    try testing.expect(std.mem.indexOf(u8, with_peer, "192.0.2.7:4242 #0") != null);
+    try testing.expect(std.mem.indexOf(u8, with_peer, "192.0.2.7:4242 #1") != null);
+}
+
+const StateLog = struct {
+    saw: [8]ConnState = undefined,
+    len: usize = 0,
+
+    fn record(ctx: ?*anyopaque, peer: ?net.IpAddress, state: ConnState) void {
+        _ = peer;
+        const log: *StateLog = @ptrCast(@alignCast(ctx.?));
+        if (log.len < log.saw.len) {
+            log.saw[log.len] = state;
+            log.len += 1;
+        }
+    }
+};
+
+test "serveStream: ConnState callback sees new→active→idle→active→closed" {
+    var log: StateLog = .{};
+    var out_buf: [4096]u8 = undefined;
+    _ = runStreamWith(.{ .on_conn_state = StateLog.record, .on_conn_state_ctx = &log }, null, "GET /hello HTTP/1.1\r\nHost: t\r\n\r\n" ++
+        "GET /hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out_buf);
+    try testing.expectEqualSlices(ConnState, &.{ .new, .active, .idle, .active, .closed }, log.saw[0..log.len]);
+}
+
 // ── tests (in-process integration — Phase-1 client vs this server) ──────────
 
 fn serveWrap(s: *Server) void {
@@ -1333,4 +1848,161 @@ test "integration: stalled client is dropped after the read timeout" {
     try sw.interface.writeAll("GET /hel");
     try sw.interface.flush();
     try testing.expectError(error.EndOfStream, sr.interface.take(1));
+}
+
+// ── tests (in-process integration — Phase 2.1 hardening) ────────────────────
+
+/// Poll `activeConnections` until it reaches `want` (bounded ≈ 10 s).
+fn waitForActive(server: *Server, io: std.Io, want: usize) !void {
+    var tries: usize = 0;
+    while (server.activeConnections() != want) : (tries += 1) {
+        if (tries > 1000) return error.TestTimeout;
+        try sleepMs(io, 10);
+    }
+}
+
+fn acceptCounting(ctx: ?*anyopaque, peer: net.IpAddress) ConnDecision {
+    _ = peer;
+    const n: *Hits = @ptrCast(@alignCast(ctx.?));
+    _ = n.fetchAdd(1, .monotonic);
+    return .accept;
+}
+
+fn rejectLoopback(_: ?*anyopaque, peer: net.IpAddress) ConnDecision {
+    return switch (peer) {
+        .ip4 => |a| if (std.mem.eql(u8, &a.bytes, &.{ 127, 0, 0, 1 })) .reject else .accept,
+        .ip6 => .accept,
+    };
+}
+
+test "integration: handler sees the loopback peer + rising request index; on_connect fires per connection" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var conns: Hits = .init(0);
+    var server = init(io, testing.allocator, .{
+        .handler = testHandler,
+        .on_connect = acceptCounting,
+        .on_connect_ctx = &conns,
+    });
+    defer server.deinit();
+    server.bind() catch |err| {
+        std.debug.print("loopback bind failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+
+    const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err| {
+        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer stream.close(io);
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [1024]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    var sw = stream.writer(io, &wbuf);
+    var head_buf: [2048]u8 = undefined;
+
+    // Request 1: peer = loopback, index 0.
+    try sw.interface.writeAll("GET /connmeta HTTP/1.1\r\nHost: t\r\n\r\n");
+    try sw.interface.flush();
+    const res1 = try h1.ResponseHead.parse(try h1.readHead(&sr.interface, &head_buf));
+    try testing.expectEqual(@as(u16, 200), res1.status);
+    const body1 = try sr.interface.take(res1.content_length.?);
+    try testing.expect(std.mem.startsWith(u8, body1, "127.0.0.1:"));
+    try testing.expect(std.mem.endsWith(u8, body1, " #0"));
+
+    // Request 2 on the same connection: index rose to 1.
+    try sw.interface.writeAll("GET /connmeta HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    try sw.interface.flush();
+    const res2 = try h1.ResponseHead.parse(try h1.readHead(&sr.interface, &head_buf));
+    try testing.expectEqual(@as(u16, 200), res2.status);
+    const body2 = try sr.interface.take(res2.content_length.?);
+    try testing.expect(std.mem.startsWith(u8, body2, "127.0.0.1:"));
+    try testing.expect(std.mem.endsWith(u8, body2, " #1"));
+
+    // One connection, two requests → the accept hook fired exactly once.
+    try testing.expectEqual(@as(u32, 1), conns.load(.monotonic));
+}
+
+test "integration: on_connect rejecting the peer refuses the connection" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server = init(io, testing.allocator, .{
+        .handler = testHandler,
+        .on_connect = rejectLoopback, // we connect from 127.0.0.1 → rejected
+    });
+    defer server.deinit();
+    server.bind() catch |err| {
+        std.debug.print("loopback bind failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+
+    // The TCP handshake completes (kernel backlog), then the server closes
+    // without writing a byte: the first read fails.
+    const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err| {
+        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer stream.close(io);
+    var rbuf: [64]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    if (sr.interface.take(1)) |_| {
+        return error.TestUnexpectedResult; // the server must not serve us
+    } else |err| {
+        try testing.expect(err == error.EndOfStream or err == error.ReadFailed);
+    }
+    // A rejected connection is never admitted.
+    try testing.expectEqual(@as(usize, 0), server.activeConnections());
+}
+
+test "integration: activeConnections reflects an in-flight request" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server = init(io, testing.allocator, .{ .handler = testHandler });
+    defer server.deinit();
+    server.bind() catch |err| {
+        std.debug.print("loopback bind failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+
+    try testing.expectEqual(@as(usize, 0), server.activeConnections());
+
+    const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err| {
+        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer stream.close(io);
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [1024]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    var sw = stream.writer(io, &wbuf);
+    var head_buf: [2048]u8 = undefined;
+
+    // Head only — the handler blocks reading the body, keeping the
+    // connection in flight while we observe the counter.
+    try sw.interface.writeAll("POST /echo HTTP/1.1\r\nHost: t\r\nConnection: close\r\nContent-Length: 4\r\n\r\n");
+    try sw.interface.flush();
+    try waitForActive(&server, io, 1);
+
+    // Release the request; the response completes and the connection ends.
+    try sw.interface.writeAll("ping");
+    try sw.interface.flush();
+    const res = try h1.ResponseHead.parse(try h1.readHead(&sr.interface, &head_buf));
+    try testing.expectEqual(@as(u16, 200), res.status);
+    try testing.expectEqualStrings("ping", try sr.interface.take(4));
+    try waitForActive(&server, io, 0);
 }

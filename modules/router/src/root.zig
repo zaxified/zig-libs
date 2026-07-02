@@ -547,7 +547,7 @@ fn endpointFor(node: *const Node, method: http.Method) ?Endpoint {
 /// param sibling). `rest` is the remaining path after the leading '/';
 /// null = all segments consumed. `extra` appends one virtual "" segment
 /// (used to probe `path ++ "/"` without building the string). Recursion
-/// depth = segment count, bounded by the server's max_head_bytes.
+/// depth = segment count, bounded by the server's max_header_bytes.
 fn matchRec(node: *const Node, rest: ?[]const u8, extra: bool, params: *Params) ?*const Node {
     const r = rest orelse {
         if (extra) return matchRec(node, "", false, params);
