@@ -42,8 +42,13 @@ nftables · uci · l2disco · ipcbus · pollworker · chunkframe · lenframe/jso
 
 ---
 
+## Progress
+
+- ✅ **T1 `netaddr`** — done + verified (RFC 6724, zero-alloc). Committed.
+- ✅ **T2 `http` Phase 1** — done + verified (HTTP/1.1 client over TLS). Committed. *(Ph2 server codec, Ph3 h2 = later.)*
+
 ## Current agent assignment
 
-**First run (Fable5): T1 `netaddr` → T2 `http` Phase 1 (HTTP/1.1 client + TLS).**
-Server codec (T2 Ph2) and HTTP/2 (T2 Ph3) are deferred to follow-up specs. Do not start h2 yet.
-Read `BRIEF.md`, `CONVENTIONS.md`, `SPEC-netaddr.md`, `SPEC-http.md` first.
+**T3 `dns` + DoH** (spec: `SPEC-dns.md`). Message codec + UDP/TCP + DoH (via the `http` module) +
+PTR/reverse. Validates that `http` works as a dependency. Read `BRIEF.md`, `CONVENTIONS.md`,
+`SPEC-dns.md` first. Do NOT start `http` Phase 2/3.
