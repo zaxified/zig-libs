@@ -87,6 +87,15 @@ later additions.
 
 - ✅ **T5.7 `cors`** — done + verified (global-middleware CORS; 238/238). Committed `0ce4c4d`.
 
+- ✅ **T5.8 `metrics`** — done + verified (thread-safe registry: atomic counter/gauge +
+  spinlocked histogram, get-or-register semantics per client_golang; exact Prometheus text
+  exposition incl. escaping + cumulative `le="+Inf"` buckets, golden-byte tested; `Endpoint`
+  intercepting middleware serves GET/HEAD /metrics (router.Handler can't close over state —
+  documented deviation); `RequestMetrics` middleware records method+class counter, latency
+  histogram (injectable clock), in-flight gauge + access-log hook; cardinality footgun
+  documented, route-pattern label deferred until router exposes matched patterns;
+  254/254 Debug + ReleaseFast, integration over loopback). Uncommitted (awaiting review).
+
 ## Current agent assignment
 
 **T5.8 `metrics`** (spec: `SPEC-metrics.md`) — thread-safe registry (counter/gauge/histogram) +
