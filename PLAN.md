@@ -68,7 +68,7 @@ later additions.
 
 ## Current agent assignment
 
-**T5.3 `http.Server` hardening (Phase 2.1)** (spec: `SPEC-http-hardening.md`) — expose peer address,
-add an accept/connection hook (`on_connect(peer) → accept|reject`) + active-connection accounting,
-configurable max-request/header size (413/431). Mechanism for abuseguard/throttle; fixes ratelimit's
-peer fallback. Then: `abuseguard` (policy) → `throttle` → `openapi` → `cors` → `metrics` (+ security-headers).
+**T5.4 `abuseguard`** (spec: `SPEC-abuseguard.md`) — IP reputation + connection-abuse policy on the
+Phase-2.1 hooks: per-IP + global concurrent-connection caps (`on_connect`/`on_conn_state`), ban +
+auto-expiring greylist, strike→auto-ban, bounded store. Read `BRIEF.md`, `CONVENTIONS.md`,
+`SPEC-abuseguard.md`. Then: `throttle` → `security-headers` → `openapi` → `cors` → `validate` → `metrics` → `resilience`.
