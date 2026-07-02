@@ -57,6 +57,8 @@ later): expose the matched route pattern on `Ctx` (metrics label + openapi), and
 
 ## Current agent assignment
 
-**T5.9 `validate`** (spec: `SPEC-validate.md`) — request input validation (body/query/params) →
-structured 400 errors, as a `router` middleware + helper. Then: `resilience` → router
-route-enumeration enhancement → `openapi`.
+**T5.10 `resilience`** (spec: `SPEC-resilience.md`) — circuit breaker + retry-with-backoff +
+timeout, generic over any operation (std-only, no deps). Then: router route-enumeration enhancement
+→ `openapi` (last cluster module).
+
+*Done since last PLAN sync: T5.9 `validate` `010bce7` (290 tests).*
