@@ -32,6 +32,7 @@ const module_list = [_]Module{
     .{ .name = "validate", .deps = &.{ "router", "http" } },
     .{ .name = "openapi", .deps = &.{ "router", "http" } },
     .{ .name = "resilience" },
+    .{ .name = "acme", .deps = &.{ "http", "router" } },
     // Scaffold more here (copy modules/_template) — see the catalog in
     // ~/CML/zig-libs-plan.md for the full candidate list.
 };
