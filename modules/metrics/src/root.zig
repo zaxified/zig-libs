@@ -789,7 +789,7 @@ fn responseBytes(res: *const http.Server.ResponseWriter) ?u64 {
         // Streaming against a declared length — enforced exact at end().
         .identity => res.declared_len.?,
         .discard => 0, // HEAD / 204 / 304: no body on the wire
-        .chunked, .until_close => null, // streamed; no running total kept
+        .chunked, .until_close, .gzip => null, // streamed; no running total kept
     };
 }
 

@@ -23,7 +23,9 @@ HTTP/1.1 client **and server** in pure Zig (client TLS over `std.crypto.tls`).
    loop). **Phase 2.1 (DONE) hardened it for direct internet exposure** —
    peer address + request index on `Request`, `on_connect` accept hook +
    `activeConnections()`, 431/414/413 size limits, stall + whole-request +
-   write timeouts (details below). Still plain HTTP only: a TLS-terminating
+   write timeouts (details below). **Phase 2.2 (DONE) added negotiated
+   gzip response compression** (`Options.compression`, off by default —
+   see "Response compression"). Still plain HTTP only: a TLS-terminating
    server is a separate later task (a reverse proxy also works).
 3. TODO — HTTP/2 (framing + HPACK), verified against h2spec. Not started.
 
@@ -88,6 +90,7 @@ var server = http.Server.init(threaded.io(), gpa, .{
     // .max_request_line_bytes = 8 * 1024, .max_body_bytes = 1 << 20,
     // .on_connect = myGate, .on_connect_ctx = &gate,   // accept/reject
     // .on_conn_state = myMetrics,                      // Go ConnState-style
+    // .compression = .{},   // negotiated gzip; off when omitted (see below)
 });
 defer server.deinit();
 try server.bind();                    // boundAddress() valid from here
@@ -189,6 +192,58 @@ poll — then none of these fire):
 
 0 (or null for the size limits) disables the individual bound.
 
+## Response compression (Phase 2.2)
+
+Negotiated **gzip** response compression, `Options.compression: ?Compression`
+— modeled after the Go `net/http` gzip-handler / nginx `gzip` semantics
+(std `std.compress.flate` + RFC 9110/1952 behavior, no third-party code).
+
+**Posture: off by default** (`null` — zero behavior change); `.{}` enables
+with safe defaults:
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `min_size` | 1 KiB | plain-body size below which compression is skipped (nginx `gzip_min_length`). A body whose size is *unknown* when it starts streaming (no declared length, outgrew the response buffer) is compressed regardless — nginx's unknown-length behavior |
+| `level` | 6 | flate level 1 (fastest) … 9 (best); 6 = zlib / Go default. Out-of-range clamps |
+| `content_types` | see below | compressible-type allowlist |
+
+**Default allowlist:** `text/` (every text subtype), `application/json`,
+`application/javascript`, `application/xml`, plus the structured-syntax
+suffixes `+json` / `+xml` (covers `image/svg+xml`,
+`application/problem+json`, Atom/RSS…). Entries match the response
+`Content-Type` case-insensitively with parameters (`; charset=…`) stripped;
+entry forms: exact, `type/` prefix (trailing `/`), `+suffix` (leading `+`).
+No `Content-Type` → never compressed.
+
+**Negotiation (RFC 9110):** compressed only when the request's
+`Accept-Encoding` admits gzip — an explicit `gzip` (or `x-gzip`) entry wins
+over `*`; `q=0` is a refusal; an **absent header compresses nothing** (the
+conservative Go/nginx middleware posture). **Eligibility:** a body must
+exist (HEAD/1xx/204/304 never compress; HEAD advertises the identity
+variant), the response must not already carry a `Content-Encoding`
+(handler-set = pre-compressed → passed through, never double-compressed),
+HTTP/1.1 only (nginx `gzip_http_version 1.1`; 1.0 has no chunked framing).
+
+**Encoding path — streaming** (the SPEC's preferred option): handler bytes
+→ `std.compress.flate` gzip encoder → the existing chunked framing.
+Handler code is unchanged — it writes normally and the server compresses
+transparently in bounded memory. Compressed responses are therefore always
+`Transfer-Encoding: chunked` with **no** `Content-Length` — a
+handler-declared length is dropped from the wire, exactly like Go's gzip
+middleware and nginx (the declared byte count is still enforced against
+what the handler writes). **`Vary: Accept-Encoding` goes on every response
+while compression is enabled** — compressed or not — so caches key
+correctly for clients that didn't opt in (added next to a handler-set
+`Vary` unless that one already covers Accept-Encoding or `*`).
+
+**Cost:** one gzip encoder state per connection while enabled — ~290 KiB
+(deflate's inherent window + match tables; zlib pays the same), allocated
+at connection admission, reused across keep-alive requests. Socket-free
+`serveStream` callers pass it via `StreamBuffers.gzip`
+(`Server.GzipScratch`); without it, `StreamOptions.compression` stays
+inert. `deflate` and `brotli` response codings are not implemented (gzip
+covers the client population; `deflate` adds nothing over it).
+
 ## Client behavior notes
 
 - **Redirects:** 301/302/303 rewrite non-GET/HEAD to GET and drop the body;
@@ -235,7 +290,14 @@ functions; `http.Server.serveStream` / `http.Server.ResponseWriter` /
   over cap → 413 mid-stream with the body larger than all serving buffers
   combined (bounded-memory proof), exact-at-cap passes + keep-alive
   survives, peer address + request index surfaced socket-free, ConnState
-  sequence `new→active→idle→active→closed`.
+  sequence `new→active→idle→active→closed`; compression:
+  Accept-Encoding negotiation table (gzip/absent/`q=0`/`*`/alias/
+  precedence), content-type allowlist matching, gzip round-trip through a
+  `GzipScratch`, compressed responses (streaming + fully-buffered paths)
+  decode chunked→gunzip back to the exact handler bytes, identity fallbacks
+  (no opt-in / refusal / HTTP 1.0 / tiny body / non-listed type /
+  pre-encoded) each with `Vary` present, HEAD/204 exclusion, declared
+  Content-Length dropped, keep-alive across a compressed response.
 - **In-process integration (dogfood, not skipped):** the Phase-1 `Client`
   drives the `Server` on `127.0.0.1:0` — GET with query + headers, POST
   with body (echo), chunked response decode; a raw TCP connection proves
@@ -244,8 +306,12 @@ functions; `http.Server.serveStream` / `http.Server.ResponseWriter` /
   rising request index across keep-alive reuse (`on_connect` fires once
   per connection), an `on_connect` reject (handshake completes, first read
   fails, never admitted) and `activeConnections()` around an in-flight
-  request (0 → 1 → 0). Skips via `SkipZigTest` only if loopback is
-  unavailable.
+  request (0 → 1 → 0); compression on over loopback — a gzip-accepting
+  request to a >1 KiB JSON route comes back `Content-Encoding: gzip` +
+  `Vary` + chunked and gunzips (via `std.compress.flate`, since the
+  Phase-1 client leaves decode to the caller) to the exact JSON, the same
+  route without the opt-in arrives plain, a tiny body stays uncompressed.
+  Skips via `SkipZigTest` only if loopback is unavailable.
 - Live client tests (auto-skipped without network): `GET
   https://example.com` over TLS returns 200 + body; an `http://` request
   completes.

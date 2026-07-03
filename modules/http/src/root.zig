@@ -8,10 +8,12 @@
 //! hook + connection accounting, 431/414/413 size limits, stall +
 //! whole-request + write timeouts — see `Server`), though it still speaks
 //! plain HTTP/1.1 only (a TLS-terminating server is a separate later
-//! task; a reverse proxy also works). Phase 3 will add HTTP/2 (framing +
-//! HPACK, h2spec-verified). Deliberately NOT built on `std.http` (API
-//! churn is the reason this module exists); client TLS is strictly
-//! `std.crypto.tls`.
+//! task; a reverse proxy also works). Phase 2.2 adds negotiated gzip
+//! response compression (`Server.Options.compression`, off by default;
+//! `std.compress.flate` streaming into the chunked framing). Phase 3
+//! will add HTTP/2 (framing + HPACK, h2spec-verified). Deliberately NOT
+//! built on `std.http` (API churn is the reason this module exists);
+//! client TLS is strictly `std.crypto.tls`.
 //!
 //! Layout: this file owns the shared vocabulary (methods, URL parsing,
 //! redirect rules); `h1.zig` is the pure HTTP/1.1 wire codec (offline
@@ -29,8 +31,8 @@ pub const meta = .{
     // the Server runs its own connection threads internally — handlers
     // must be thread-safe if they share state.
     .concurrency = .single_owner,
-    .model_after = "lalinsky/dusty (1.1 client shape) + Go net/http (redirect semantics, Server shape); nghttp2 later for h2",
-    .deps = .{ "netaddr", "std.crypto.tls", "std.Io.net" },
+    .model_after = "lalinsky/dusty (1.1 client shape) + Go net/http (redirect semantics, Server shape, gzip handler); nghttp2 later for h2",
+    .deps = .{ "netaddr", "std.crypto.tls", "std.Io.net", "std.compress.flate" },
 };
 
 /// Pure HTTP/1.1 wire framing (request/response head parse, chunked codec,

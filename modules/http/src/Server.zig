@@ -38,11 +38,24 @@
 //! body is capped while streaming; a request body is never buffered). An
 //! optional Go-ConnState-style `on_conn_state` callback observes
 //! new/active/idle/closed transitions for metrics.
+//!
+//! Compression (Phase 2.2, SPEC-http-gzip.md): `Options.compression`
+//! (null = off) enables negotiated gzip response compression. Eligible
+//! responses — the request's Accept-Encoding admits gzip, the
+//! content-type is on the allowlist, the body is worth it — are
+//! compressed transparently (handler code unchanged), **streaming**:
+//! handler bytes → `std.compress.flate` gzip encoder → the existing
+//! chunked framing (an explicit Content-Length is dropped from the wire,
+//! like Go's gzip middleware / nginx — the byte count is still
+//! enforced). `Vary: Accept-Encoding` goes on every response while
+//! enabled. Negotiation/eligibility helpers live in `gzip.zig`.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const http = @import("root.zig");
 const h1 = @import("h1.zig");
+const gzip = @import("gzip.zig");
+const flate = std.compress.flate;
 const net = std.Io.net;
 const Reader = std.Io.Reader;
 const Writer = std.Io.Writer;
@@ -79,6 +92,17 @@ pub const ConnState = enum { new, active, idle, closed };
 /// Lifecycle observer — see `Options.on_conn_state`. `peer` is null only
 /// when driven socket-free (`serveStream` without `StreamOptions.peer`).
 pub const ConnStateFn = *const fn (?*anyopaque, peer: ?net.IpAddress, state: ConnState) void;
+
+/// Gzip response-compression config — see `Options.compression` and
+/// `gzip.zig` (min_size 1 KiB / level 6 / text+JSON+XML+JS defaults).
+pub const Compression = gzip.Compression;
+
+/// Working memory for the gzip encoder (deflate state + 64 KiB window,
+/// ~290 KiB): one per connection while compression is enabled; the
+/// serving loop allocates it, `serveStream` callers pass it via
+/// `StreamBuffers.gzip`. Re-initialized per response — provide the
+/// memory, nothing else.
+pub const GzipScratch = gzip.Scratch;
 
 pub const Options = struct {
     handler: Handler,
@@ -140,6 +164,14 @@ pub const Options = struct {
     /// Response body buffering: bodies fully written within this get an
     /// exact Content-Length, larger ones stream chunked.
     response_buffer_size: usize = 4 * 1024,
+    /// Negotiated gzip response compression (SPEC-http-gzip.md). null =
+    /// off (the default — zero behavior change); `.{}` = on with safe
+    /// defaults (compress bodies ≥ 1 KiB of text/JSON/XML/JS at level 6
+    /// when the request's Accept-Encoding admits gzip — see
+    /// `Compression`). Compressed responses always stream chunked; while
+    /// enabled every response carries `Vary: Accept-Encoding`, and each
+    /// connection costs an extra ~290 KiB of encoder state.
+    compression: ?Compression = null,
     /// Auto `Server` response header, overridable per response.
     server_name: []const u8 = "zig-libs-http/0.1",
     kernel_backlog: u31 = 128,
@@ -282,6 +314,14 @@ fn connMain(s: *Server, stream: net.Stream) void {
     const slab = s.gpa.alloc(u8, total) catch return; // overloaded: drop the connection
     defer s.gpa.free(slab);
 
+    // Compression working memory (deflate state + window), only when the
+    // feature is on. Same overload policy as the slab.
+    const gz: ?*GzipScratch = if (o.compression != null)
+        s.gpa.create(GzipScratch) catch return
+    else
+        null;
+    defer if (gz) |p| s.gpa.destroy(p);
+
     var off: usize = 0;
     const read_buf = slab[off..][0..o.read_buffer_size];
     off += o.read_buffer_size;
@@ -292,6 +332,7 @@ fn connMain(s: *Server, stream: net.Stream) void {
         .response_body = slab[off + o.max_header_bytes ..][0..o.response_buffer_size],
         .request_body = slab[off + o.max_header_bytes + o.response_buffer_size ..][0..body_scratch_len],
         .chunk = slab[off + o.max_header_bytes + o.response_buffer_size + body_scratch_len ..][0..chunk_scratch_len],
+        .gzip = gz,
     };
 
     // All read buffering lives in the TimeoutReader (bounds head lines and
@@ -313,6 +354,7 @@ fn connMain(s: *Server, stream: net.Stream) void {
         .max_body_bytes = o.max_body_bytes,
         .on_conn_state = o.on_conn_state,
         .on_conn_state_ctx = o.on_conn_state_ctx,
+        .compression = o.compression,
     }, &tr.reader, &tw.writer, bufs, &tr);
 }
 
@@ -502,6 +544,9 @@ pub const StreamOptions = struct {
     /// the whole stream counts as one connection.
     on_conn_state: ?ConnStateFn = null,
     on_conn_state_ctx: ?*anyopaque = null,
+    /// Negotiated gzip response compression (see `Options.compression`);
+    /// active only when `StreamBuffers.gzip` is also provided. null = off.
+    compression: ?Compression = null,
 
     pub const Now = struct {
         ctx: ?*anyopaque = null,
@@ -521,8 +566,14 @@ pub const StreamBuffers = struct {
     request_body: []u8,
     /// Response body buffering; also the auto-Content-Length threshold.
     response_body: []u8,
-    /// Chunked-encoder scratch (small, must be non-empty).
+    /// Chunked-encoder scratch (small, must be non-empty; with
+    /// compression enabled it must be at least 9 bytes — the gzip
+    /// encoder's output-buffer floor).
     chunk: []u8,
+    /// Gzip-encoder working memory; required for
+    /// `StreamOptions.compression` to take effect (compression stays off
+    /// without it). The serving loop allocates one per connection.
+    gzip: ?*GzipScratch = null,
 };
 
 /// Serve HTTP/1.1 requests from `in`, responding on `out`, until the
@@ -630,12 +681,18 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
         .peer = opts.peer,
         .conn_request_index = req_index,
     };
+    // Compression is considered only when configured AND the working
+    // memory is there; the Accept-Encoding negotiation is per request.
+    const compression_on = opts.compression != null and bufs.gzip != null;
     var rw: ResponseWriter = .init(out, bufs.response_body, bufs.chunk, .{
         .head_request = method == .head,
         .http1_0 = head.http1_0,
         .date = date,
         .server_name = opts.server_name,
         .close_connection = !keep_alive,
+        .compression = if (compression_on) opts.compression else null,
+        .gzip_scratch = if (compression_on) bufs.gzip else null,
+        .accept_gzip = compression_on and gzip.acceptsGzip(head.header("accept-encoding")),
     });
 
     opts.handler(&req, &rw) catch {
@@ -862,6 +919,14 @@ const max_response_headers = 32;
 /// name/value slices must outlive the response. HEAD/204/304 responses
 /// discard body writes and frame correctly.
 ///
+/// Compression (when `InitOptions.compression` is set): eligible bodies
+/// are routed through a gzip encoder into the chunked framing —
+/// transparent to the handler; a handler-declared `Content-Length` is
+/// then dropped from the wire (the written byte count stays enforced),
+/// a handler-set `Content-Encoding` disables it (never double-compress),
+/// and `Vary: Accept-Encoding` is added to every response unless the
+/// handler's own `Vary` already covers it.
+///
 /// Not movable once `writer` has been handed out.
 pub const ResponseWriter = struct {
     out: *Writer,
@@ -871,6 +936,14 @@ pub const ResponseWriter = struct {
     head_request: bool,
     http1_0: bool,
     close_connection: bool,
+    /// Compression config; null = this response never compresses.
+    compression: ?Compression = null,
+    /// Gzip working memory; present whenever `compression` is set.
+    gzip_scratch: ?*GzipScratch = null,
+    /// The request's Accept-Encoding admits gzip (negotiation input).
+    accept_gzip: bool = false,
+    /// Compression engaged: emit `Content-Encoding: gzip` with the head.
+    content_encoding_gzip: bool = false,
     status: u16 = 200,
     headers: [max_response_headers]http.Header = undefined,
     headers_len: usize = 0,
@@ -894,6 +967,20 @@ pub const ResponseWriter = struct {
         until_close,
         /// HEAD / 204 / 304: body writes are dropped.
         discard,
+        /// Compressed streaming: plain handler bytes → gzip encoder →
+        /// chunked framing (Phase 2.2).
+        gzip: GzipBody,
+    };
+
+    const GzipBody = struct {
+        /// Chunked encoder the compressed bytes feed (owns `chunk_buf`).
+        chunked: h1.ChunkedWriter,
+        /// The flate gzip encoder; its state lives in `gzip_scratch`.
+        compress: *flate.Compress,
+        /// Plain-body bytes still owed against a declared Content-Length
+        /// (enforced exactly like the identity sink, though the length
+        /// itself never reaches the wire); null = no declared length.
+        plain_remaining: ?u64,
     };
 
     pub const InitOptions = struct {
@@ -907,11 +994,21 @@ pub const ResponseWriter = struct {
         server_name: ?[]const u8 = null,
         /// Emit `Connection: close` (the connection won't be reused).
         close_connection: bool = false,
+        /// Negotiated gzip response compression (Phase 2.2); null = off.
+        /// Requires `gzip_scratch`, and `chunk_buf` of at least 9 bytes.
+        /// While set, every response carries `Vary: Accept-Encoding`.
+        compression: ?Compression = null,
+        /// Working memory for the gzip encoder (usually per-connection).
+        gzip_scratch: ?*GzipScratch = null,
+        /// The request's Accept-Encoding admits gzip (`gzip.acceptsGzip`)
+        /// — evaluated by the serving loop, the negotiation input here.
+        accept_gzip: bool = false,
     };
 
     /// `body_buf` is the buffering/auto-Content-Length threshold;
     /// `chunk_buf` is small scratch for the chunked encoder (non-empty).
     pub fn init(out: *Writer, body_buf: []u8, chunk_buf: []u8, opts: InitOptions) ResponseWriter {
+        std.debug.assert(opts.compression == null or opts.gzip_scratch != null);
         return .{
             .out = out,
             .chunk_buf = chunk_buf,
@@ -920,6 +1017,9 @@ pub const ResponseWriter = struct {
             .head_request = opts.head_request,
             .http1_0 = opts.http1_0,
             .close_connection = opts.close_connection,
+            .compression = opts.compression,
+            .gzip_scratch = opts.gzip_scratch,
+            .accept_gzip = opts.accept_gzip,
             .interface = .{
                 .vtable = &.{ .drain = drainFn },
                 .buffer = body_buf,
@@ -989,6 +1089,20 @@ pub const ResponseWriter = struct {
     pub fn end(rw: *ResponseWriter) Writer.Error!void {
         if (rw.ended) return;
         rw.ended = true;
+        if (rw.body == .buffering and rw.shouldCompress(rw.interface.buffered().len)) {
+            // Fully buffered body, eligible: compress it through the
+            // streaming pipeline (single encoding path — see beginGzip).
+            const body_bytes = rw.interface.buffered();
+            defer rw.interface.end = 0;
+            const n = rw.declared_len orelse body_bytes.len;
+            if (n != body_bytes.len) {
+                rw.failed = true; // body ≠ declared Content-Length
+                return error.WriteFailed;
+            }
+            try rw.beginGzip(null); // length already validated above
+            try rw.body.gzip.compress.writer.writeAll(body_bytes);
+            return rw.finishGzip();
+        }
         switch (rw.body) {
             .buffering => {
                 const body_bytes = rw.interface.buffered();
@@ -1023,6 +1137,10 @@ pub const ResponseWriter = struct {
                     return error.WriteFailed;
                 }
             },
+            .gzip => {
+                try rw.interface.flush();
+                try rw.finishGzip();
+            },
             .until_close, .discard => try rw.interface.flush(),
         }
     }
@@ -1036,6 +1154,7 @@ pub const ResponseWriter = struct {
         rw.declared_len = null;
         rw.ended = false;
         rw.failed = false;
+        rw.content_encoding_gzip = false;
         rw.body = .buffering;
         rw.interface.end = 0;
     }
@@ -1045,23 +1164,103 @@ pub const ResponseWriter = struct {
             (rw.status >= 100 and rw.status < 200);
     }
 
+    /// The Phase 2.2 eligibility gate: negotiated (Accept-Encoding admits
+    /// gzip), a body exists (not HEAD/1xx/204/304), HTTP/1.1 (chunked
+    /// framing is how compressed bodies stream; nginx also requires
+    /// ≥ 1.1), not already Content-Encoding'd (never double-compress),
+    /// compressible content-type, and worth it: `known_len` is the plain
+    /// body size when known (fully buffered, or declared) and must reach
+    /// `min_size`; null = size unknown at streaming time → compress
+    /// (nginx's behavior for unknown-length responses).
+    fn shouldCompress(rw: *const ResponseWriter, known_len: ?u64) bool {
+        const cfg = rw.compression orelse return false;
+        if (!rw.accept_gzip) return false;
+        if (rw.http1_0) return false;
+        if (rw.noBody()) return false;
+        if (known_len) |n| {
+            if (n < cfg.min_size) return false;
+        }
+        var content_type: ?[]const u8 = null;
+        for (rw.headers[0..rw.headers_len]) |hd| {
+            if (std.ascii.eqlIgnoreCase(hd.name, "content-encoding")) return false;
+            if (std.ascii.eqlIgnoreCase(hd.name, "content-type")) content_type = hd.value;
+        }
+        const ct = content_type orelse return false;
+        return gzip.contentTypeCompressible(ct, cfg.content_types);
+    }
+
+    /// Put the head on the wire (`Content-Encoding: gzip` + chunked
+    /// framing) and stand up the compression pipeline: handler bytes →
+    /// gzip encoder (state + window in `gzip_scratch`) → chunked encoder
+    /// → `out`. A declared Content-Length is dropped from the wire but
+    /// still enforced via `plain_remaining` (pass null when the byte
+    /// count was already validated).
+    fn beginGzip(rw: *ResponseWriter, plain_remaining: ?u64) Writer.Error!void {
+        std.debug.assert(!rw.sent_head);
+        const scratch = rw.gzip_scratch.?;
+        rw.content_encoding_gzip = true;
+        try rw.writeHead(.chunked);
+        rw.body = .{ .gzip = .{
+            .chunked = .init(rw.out, rw.chunk_buf),
+            .compress = &scratch.compress,
+            .plain_remaining = plain_remaining,
+        } };
+        // Emits the 10-byte gzip container header — it lands in the
+        // chunked encoder's buffer, safely after the response head. The
+        // chunked writer must be at its final address by now (the
+        // encoder keeps a pointer to it).
+        scratch.compress = try flate.Compress.init(
+            &rw.body.gzip.chunked.writer,
+            &scratch.window,
+            .gzip,
+            gzip.levelOptions(rw.compression.?.level),
+        );
+    }
+
+    /// Terminate a compressed body: enforce a declared length, flush the
+    /// deflate tail + gzip footer, then the chunked 0-terminator.
+    fn finishGzip(rw: *ResponseWriter) Writer.Error!void {
+        const g = &rw.body.gzip;
+        if (g.plain_remaining) |rem| {
+            if (rem != 0) {
+                rw.failed = true; // under-delivered declared length
+                return error.WriteFailed;
+            }
+        }
+        try g.compress.finish();
+        try g.chunked.finish();
+    }
+
     const Framing = union(enum) { none, content_length: u64, chunked };
 
     /// Emit the status line + headers. Header order: user headers (set
-    /// order), then auto Date/Server, Connection, framing.
+    /// order), then auto Date/Server, Vary/Content-Encoding (compression),
+    /// Connection, framing.
     fn writeHead(rw: *ResponseWriter, framing: Framing) Writer.Error!void {
         const out = rw.out;
         try out.print("HTTP/1.1 {d} {s}\r\n", .{ rw.status, reasonPhrase(rw.status) });
 
         var saw_date = false;
         var saw_server = false;
+        var vary_covered = false;
         for (rw.headers[0..rw.headers_len]) |hd| {
             if (std.ascii.eqlIgnoreCase(hd.name, "date")) saw_date = true;
             if (std.ascii.eqlIgnoreCase(hd.name, "server")) saw_server = true;
+            if (std.ascii.eqlIgnoreCase(hd.name, "vary") and
+                (h1.tokenListContains(hd.value, "accept-encoding") or
+                    h1.tokenListContains(hd.value, "*"))) vary_covered = true;
             try out.print("{s}: {s}\r\n", .{ hd.name, hd.value });
         }
         if (!saw_date) if (rw.date) |d| try out.print("Date: {s}\r\n", .{d});
         if (!saw_server) if (rw.server_name) |sn| try out.print("Server: {s}\r\n", .{sn});
+        // Cache safety: while compression is enabled, every response
+        // could differ by Accept-Encoding — tell caches so, whether or
+        // not this particular response is compressed (Go gzip-handler
+        // behavior; an additional Vary line is legal next to a
+        // handler-set one covering other headers).
+        if (rw.compression != null and !vary_covered)
+            try out.writeAll("Vary: Accept-Encoding\r\n");
+        if (rw.content_encoding_gzip) try out.writeAll("Content-Encoding: gzip\r\n");
         if (rw.close_connection) try out.writeAll("Connection: close\r\n");
         switch (framing) {
             .none => {},
@@ -1080,6 +1279,10 @@ pub const ResponseWriter = struct {
             const framing: Framing = if (rw.declared_len) |n| .{ .content_length = n } else .none;
             try rw.writeHead(framing);
             rw.body = .discard;
+        } else if (rw.shouldCompress(rw.declared_len)) {
+            // Streaming body: the size is the declared length when there
+            // is one, else unknown (already outgrew the buffer).
+            try rw.beginGzip(rw.declared_len);
         } else if (rw.declared_len) |n| {
             try rw.writeHead(.{ .content_length = n });
             rw.body = .{ .identity = n };
@@ -1102,6 +1305,23 @@ pub const ResponseWriter = struct {
             .buffering => unreachable,
             .chunked => |*cw| return forwardDrain(w, &cw.writer, data, splat),
             .until_close => return forwardDrain(w, rw.out, data, splat),
+            .gzip => |*g| {
+                if (g.plain_remaining) |rem| {
+                    // Same over-delivery guard as the identity sink —
+                    // counted in plain bytes, pre-compression.
+                    var total: u64 = w.end;
+                    for (data[0 .. data.len - 1]) |d| total += d.len;
+                    total += data[data.len - 1].len * splat;
+                    if (total > rem) {
+                        rw.failed = true;
+                        return error.WriteFailed;
+                    }
+                    const consumed = try forwardDrain(w, &g.compress.writer, data, splat);
+                    g.plain_remaining = rem - total;
+                    return consumed;
+                }
+                return forwardDrain(w, &g.compress.writer, data, splat);
+            },
             .identity => {
                 var total: u64 = w.end;
                 for (data[0 .. data.len - 1]) |d| total += d.len;
@@ -1233,6 +1453,15 @@ fn bumpHits(req: *Request) void {
 /// forces chunked streaming there.
 const big_body = ("0123456789" ** 8) ++ "ABCDEFG";
 
+/// 32 bytes of JSON — fits the offline response buffer (64), so it takes
+/// the fully-buffered path; above the tests' min_size 16, below the 1 KiB
+/// default.
+const small_json = "{\"k\":\"" ++ ("v" ** 24) ++ "\"}";
+
+/// ~1.8 KiB of repetitive JSON — above the default 1 KiB compression
+/// min_size and every offline serving buffer, so it always streams.
+const json_body = "{\"data\":[" ++ ("\"abcdefgh\"," ** 160) ++ "\"end\"]}";
+
 fn testHandler(req: *Request, rw: *ResponseWriter) anyerror!void {
     bumpHits(req);
     if (std.mem.eql(u8, req.path, "/hello")) {
@@ -1272,6 +1501,27 @@ fn testHandler(req: *Request, rw: *ResponseWriter) anyerror!void {
         if (req.peerAddress()) |p| try w.print("{f}", .{p}) else try w.writeAll("none");
         try w.print(" #{d}", .{req.connRequestIndex()});
         try rw.writeAll(w.buffered());
+    } else if (std.mem.eql(u8, req.path, "/json")) {
+        try rw.setHeader("Content-Type", "application/json");
+        try rw.writeAll(small_json);
+    } else if (std.mem.eql(u8, req.path, "/jsonbig")) {
+        try rw.setHeader("Content-Type", "application/json; charset=utf-8");
+        try rw.writeAll(json_body);
+    } else if (std.mem.eql(u8, req.path, "/declgz")) {
+        // Declared Content-Length on a compressible body.
+        try rw.setHeader("Content-Type", "application/json");
+        var len_buf: [8]u8 = undefined;
+        try rw.setHeader("Content-Length", try std.fmt.bufPrint(&len_buf, "{d}", .{json_body.len}));
+        try rw.writeAll(json_body);
+    } else if (std.mem.eql(u8, req.path, "/bin")) {
+        // Big but not a compressible type.
+        try rw.setHeader("Content-Type", "application/octet-stream");
+        try rw.writeAll(json_body);
+    } else if (std.mem.eql(u8, req.path, "/pregz")) {
+        // Pretend pre-compressed content: must pass through untouched.
+        try rw.setHeader("Content-Type", "application/json");
+        try rw.setHeader("Content-Encoding", "gzip");
+        try rw.writeAll("FAKE-GZIP-BYTES-FAKE-GZIP-BYTES");
     } else if (std.mem.eql(u8, req.path, "/drain")) {
         // Stream-discard the whole body (bounded memory by construction).
         var total: u64 = 0;
@@ -1305,6 +1555,7 @@ const StreamTweaks = struct {
     max_body_bytes: ?u64 = null,
     on_conn_state: ?ConnStateFn = null,
     on_conn_state_ctx: ?*anyopaque = null,
+    compression: ?Compression = null,
 };
 
 /// Run `serveStream` over canned wire bytes with small test buffers
@@ -1317,6 +1568,10 @@ fn runStreamWith(tweaks: StreamTweaks, ctx: ?*anyopaque, wire: []const u8, out_b
     var request_body_buf: [256]u8 = undefined;
     var response_body_buf: [64]u8 = undefined;
     var chunk_buf: [128]u8 = undefined;
+    var gz: ?*GzipScratch = null;
+    defer if (gz) |p| testing.allocator.destroy(p);
+    if (tweaks.compression != null)
+        gz = testing.allocator.create(GzipScratch) catch @panic("OOM");
     serveStream(.{
         .handler = testHandler,
         .context = ctx,
@@ -1327,11 +1582,13 @@ fn runStreamWith(tweaks: StreamTweaks, ctx: ?*anyopaque, wire: []const u8, out_b
         .max_body_bytes = tweaks.max_body_bytes,
         .on_conn_state = tweaks.on_conn_state,
         .on_conn_state_ctx = tweaks.on_conn_state_ctx,
+        .compression = tweaks.compression,
     }, &in, &out, .{
         .head = &head_buf,
         .request_body = &request_body_buf,
         .response_body = &response_body_buf,
         .chunk = &chunk_buf,
+        .gzip = gz,
     });
     return out.buffered();
 }
@@ -1698,6 +1955,152 @@ test "serveStream: ConnState callback sees new→active→idle→active→closed
     try testing.expectEqualSlices(ConnState, &.{ .new, .active, .idle, .active, .closed }, log.saw[0..log.len]);
 }
 
+// ── tests (offline — Phase 2.2 gzip response compression) ───────────────────
+
+test {
+    _ = gzip; // pull in gzip.zig's negotiation/eligibility unit tests
+}
+
+/// min_size below `small_json.len` so both the buffered and the streaming
+/// paths engage with the tiny offline buffers.
+const gz_on: Compression = .{ .min_size = 16 };
+
+/// Parse a raw compressed response: expect 200 + `Content-Encoding: gzip`
+/// + `Vary: Accept-Encoding` + chunked framing (no Content-Length), then
+/// decode both layers and compare against the plain body.
+fn expectGzipResponse(raw: []const u8, expected_body: []const u8) !void {
+    var r: Reader = .fixed(raw);
+    var head_buf: [1024]u8 = undefined;
+    const res = try h1.ResponseHead.parse(try h1.readHead(&r, &head_buf));
+    try testing.expectEqual(@as(u16, 200), res.status);
+    try testing.expectEqualStrings("gzip", res.header("content-encoding").?);
+    try testing.expectEqualStrings("Accept-Encoding", res.header("vary").?);
+    try testing.expect(res.chunked); // streaming framing…
+    try testing.expectEqual(@as(?u64, null), res.content_length); // …never a length
+
+    // Chunked-decode to the compressed bytes…
+    var cbuf: [128]u8 = undefined;
+    var cr: h1.ChunkedReader = .init(&r, &cbuf);
+    var compressed_buf: [4096]u8 = undefined;
+    var cw: Writer = .fixed(&compressed_buf);
+    _ = try cr.reader.streamRemaining(&cw);
+
+    // …then gunzip and compare: exactly what the handler wrote.
+    var zin: Reader = .fixed(cw.buffered());
+    var dc: flate.Decompress = .init(&zin, .gzip, &.{});
+    var plain_buf: [4096]u8 = undefined;
+    var pw: Writer = .fixed(&plain_buf);
+    _ = try dc.reader.streamRemaining(&pw);
+    try testing.expectEqualStrings(expected_body, pw.buffered());
+}
+
+test "serveStream gzip: negotiated response compresses and round-trips (streaming path)" {
+    var out_buf: [4096]u8 = undefined;
+    const got = runStreamWith(.{ .compression = gz_on }, null, "GET /jsonbig HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n", &out_buf);
+    try expectGzipResponse(got, json_body);
+    // Actually smaller on the wire — headers included — than the body alone.
+    try testing.expect(got.len < json_body.len);
+}
+
+test "serveStream gzip: fully buffered body compresses too" {
+    var out_buf: [4096]u8 = undefined;
+    const got = runStreamWith(.{ .compression = gz_on }, null, "GET /json HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n", &out_buf);
+    try expectGzipResponse(got, small_json);
+}
+
+test "serveStream gzip: no Accept-Encoding → identity, Vary still set" {
+    var out_buf: [4096]u8 = undefined;
+    const got = runStreamWith(.{ .compression = gz_on }, null, "GET /json HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out_buf);
+    var r: Reader = .fixed(got);
+    var head_buf: [1024]u8 = undefined;
+    const res = try h1.ResponseHead.parse(try h1.readHead(&r, &head_buf));
+    try testing.expect(res.header("content-encoding") == null);
+    try testing.expectEqualStrings("Accept-Encoding", res.header("vary").?);
+    try testing.expectEqual(@as(?u64, small_json.len), res.content_length);
+    try testing.expect(std.mem.endsWith(u8, got, small_json));
+}
+
+test "serveStream gzip: q=0 refusal and HTTP/1.0 stay identity" {
+    var out_buf: [4096]u8 = undefined;
+    const refused = runStreamWith(.{ .compression = gz_on }, null, "GET /json HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip;q=0\r\nConnection: close\r\n\r\n", &out_buf);
+    try testing.expect(std.mem.indexOf(u8, refused, "Content-Encoding") == null);
+    try testing.expect(std.mem.endsWith(u8, refused, small_json));
+
+    // HTTP/1.0 cannot take chunked framing → never compressed (nginx
+    // `gzip_http_version 1.1` behavior).
+    var out_buf2: [4096]u8 = undefined;
+    const old = runStreamWith(.{ .compression = gz_on }, null, "GET /jsonbig HTTP/1.0\r\nAccept-Encoding: gzip\r\n\r\n", &out_buf2);
+    try testing.expect(std.mem.indexOf(u8, old, "Content-Encoding") == null);
+    try testing.expect(std.mem.endsWith(u8, old, json_body));
+}
+
+test "serveStream gzip: below min_size stays identity" {
+    var out_buf: [4096]u8 = undefined;
+    const got = runStreamWith(.{ .compression = .{ .min_size = 1024 } }, null, "GET /json HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n", &out_buf);
+    try testing.expect(std.mem.indexOf(u8, got, "Content-Encoding") == null);
+    try testing.expect(std.mem.indexOf(u8, got, "Vary: Accept-Encoding\r\n") != null);
+    try testing.expect(std.mem.endsWith(u8, got, small_json));
+}
+
+test "serveStream gzip: content-type outside the allowlist stays identity" {
+    var out_buf: [4096]u8 = undefined;
+    const got = runStreamWith(.{ .compression = gz_on }, null, "GET /bin HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n", &out_buf);
+    try testing.expect(std.mem.indexOf(u8, got, "Content-Encoding") == null);
+    // Big identity body → a *plain* chunked stream; decode and compare.
+    var r: Reader = .fixed(got);
+    var head_buf: [1024]u8 = undefined;
+    const res = try h1.ResponseHead.parse(try h1.readHead(&r, &head_buf));
+    try testing.expect(res.chunked);
+    var cbuf: [128]u8 = undefined;
+    var cr: h1.ChunkedReader = .init(&r, &cbuf);
+    var plain_buf: [4096]u8 = undefined;
+    var pw: Writer = .fixed(&plain_buf);
+    _ = try cr.reader.streamRemaining(&pw);
+    try testing.expectEqualStrings(json_body, pw.buffered());
+}
+
+test "serveStream gzip: pre-encoded response is never re-compressed" {
+    var out_buf: [4096]u8 = undefined;
+    const got = runStreamWith(.{ .compression = gz_on }, null, "GET /pregz HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n", &out_buf);
+    // The handler's own Content-Encoding header + bytes pass through verbatim.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "Content-Encoding"));
+    try testing.expect(std.mem.endsWith(u8, got, "FAKE-GZIP-BYTES-FAKE-GZIP-BYTES"));
+}
+
+test "serveStream gzip: HEAD and 204 are never compressed (Vary still set)" {
+    var out_buf: [4096]u8 = undefined;
+    const head_res = runStreamWith(.{ .compression = gz_on }, null, "HEAD /json HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n", &out_buf);
+    try testing.expect(std.mem.indexOf(u8, head_res, "Content-Encoding") == null);
+    try testing.expect(std.mem.indexOf(u8, head_res, "Vary: Accept-Encoding\r\n") != null);
+    // HEAD mirrors the identity variant's length.
+    try testing.expect(std.mem.indexOf(u8, head_res, "Content-Length: 32\r\n") != null);
+
+    var out_buf2: [4096]u8 = undefined;
+    const nocontent = runStreamWith(.{ .compression = gz_on }, null, "GET /nocontent HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n", &out_buf2);
+    try testing.expect(std.mem.startsWith(u8, nocontent, "HTTP/1.1 204 No Content\r\n"));
+    try testing.expect(std.mem.indexOf(u8, nocontent, "Content-Encoding") == null);
+    try testing.expect(std.mem.indexOf(u8, nocontent, "Vary: Accept-Encoding\r\n") != null);
+}
+
+test "serveStream gzip: declared Content-Length is dropped when compressing" {
+    var out_buf: [4096]u8 = undefined;
+    const got = runStreamWith(.{ .compression = gz_on }, null, "GET /declgz HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n", &out_buf);
+    try testing.expect(std.mem.indexOf(u8, got, "Content-Length") == null);
+    try expectGzipResponse(got, json_body);
+}
+
+test "serveStream gzip: keep-alive survives a compressed response" {
+    var hits: Hits = .init(0);
+    var out_buf: [8192]u8 = undefined;
+    const got = runStreamWith(.{ .compression = gz_on }, &hits, "GET /jsonbig HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\n\r\n" ++
+        "GET /hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out_buf);
+    try testing.expectEqual(@as(u32, 2), hits.load(.monotonic));
+    // The compressed chunked stream terminated cleanly right before the
+    // second (identity) response.
+    try testing.expect(std.mem.indexOf(u8, got, "0\r\n\r\nHTTP/1.1 200 OK\r\n") != null);
+    try testing.expect(std.mem.endsWith(u8, got, "hello"));
+}
+
 // ── tests (in-process integration — Phase-1 client vs this server) ──────────
 
 fn serveWrap(s: *Server) void {
@@ -2005,4 +2408,82 @@ test "integration: activeConnections reflects an in-flight request" {
     try testing.expectEqual(@as(u16, 200), res.status);
     try testing.expectEqualStrings("ping", try sr.interface.take(4));
     try waitForActive(&server, io, 0);
+}
+
+// ── tests (in-process integration — Phase 2.2 gzip compression) ─────────────
+
+test "integration: negotiated gzip compression over loopback" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server = init(io, testing.allocator, .{
+        .handler = testHandler,
+        .compression = .{}, // defaults: min 1 KiB, level 6, text/JSON/XML/JS
+        // Small response buffer so /jsonbig (~1.8 KiB) exercises the real
+        // streaming (chunked) gzip encoder over the wire.
+        .response_buffer_size = 256,
+    });
+    defer server.deinit();
+    server.bind() catch |err| {
+        std.debug.print("loopback bind failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+
+    const port = server.boundAddress().getPort();
+    var client = http.Client.init(io, testing.allocator, .{});
+    defer client.deinit();
+    var url_buf: [64]u8 = undefined;
+
+    { // Accept-Encoding: gzip → compressed; decompresses to the exact JSON.
+        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/jsonbig", .{port});
+        var res = try client.request(.get, url, .{
+            .headers = &.{.{ .name = "Accept-Encoding", .value = "gzip" }},
+        });
+        defer res.deinit();
+        try testing.expectEqual(@as(u16, 200), res.status);
+        try testing.expectEqualStrings("gzip", res.header("content-encoding").?);
+        try testing.expectEqualStrings("Accept-Encoding", res.header("vary").?);
+        try testing.expect(res.head.chunked); // compressed = streamed, no length
+
+        // The Phase-1 client leaves gzip decode to the caller — do it here.
+        const compressed = try res.readAllAlloc(testing.allocator, 1 << 16);
+        defer testing.allocator.free(compressed);
+        try testing.expect(compressed.len < json_body.len);
+        var zin: Reader = .fixed(compressed);
+        var dc: flate.Decompress = .init(&zin, .gzip, &.{});
+        var plain: Writer.Allocating = .init(testing.allocator);
+        defer plain.deinit();
+        _ = try dc.reader.streamRemaining(&plain.writer);
+        try testing.expectEqualStrings(json_body, plain.written());
+    }
+
+    { // No gzip opt-in (client default = identity) → plain body, no
+        // Content-Encoding, but Vary still marks the negotiation point.
+        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/jsonbig", .{port});
+        var res = try client.request(.get, url, .{});
+        defer res.deinit();
+        try testing.expectEqual(@as(u16, 200), res.status);
+        try testing.expect(res.header("content-encoding") == null);
+        try testing.expectEqualStrings("Accept-Encoding", res.header("vary").?);
+        const body = try res.readAllAlloc(testing.allocator, 1 << 16);
+        defer testing.allocator.free(body);
+        try testing.expectEqualStrings(json_body, body);
+    }
+
+    { // Tiny body under min_size → identity even though gzip was accepted.
+        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/hello", .{port});
+        var res = try client.request(.get, url, .{
+            .headers = &.{.{ .name = "Accept-Encoding", .value = "gzip" }},
+        });
+        defer res.deinit();
+        try testing.expectEqual(@as(u16, 200), res.status);
+        try testing.expect(res.header("content-encoding") == null);
+        const body = try res.readAllAlloc(testing.allocator, 1024);
+        defer testing.allocator.free(body);
+        try testing.expectEqualStrings("hello", body);
+    }
 }
