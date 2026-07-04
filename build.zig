@@ -41,6 +41,7 @@ const module_list = [_]Module{
     .{ .name = "icmp", .deps = &.{ "seqmap", "netaddr" } },
     .{ .name = "mcp" },
     .{ .name = "kv" },
+    .{ .name = "blobmsg" },
     // Scaffold more here (copy modules/_template) — see the catalog in
     // ~/CML/zig-libs-plan.md for the full candidate list.
 };

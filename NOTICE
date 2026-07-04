@@ -119,4 +119,12 @@ audit is pending before any public release.
                implementation. Clean-room: behavior/approach only, no
                source consulted or copied.
 
+  blobmsg    — extracted from the authors' axp project (axp-core/src/
+               ubus.zig; Apache-2.0, relicensed MIT by the copyright
+               holder); design ref: OpenWRT libubox (blob.h/blobmsg.h; ISC)
+               and OpenWRT ubus (ubusmsg.h/libubus-io.c; LGPL-2.1) — wire
+               format only, clean-room, no source consulted for this
+               extraction and no source copied; byte-parity verified against
+               `ubus -S` output on real hardware.
+
 See each module's README "Provenance" note for its specific seed and reference.
