@@ -66,8 +66,7 @@ TLS termination via a proxy meanwhile.
 
 ## Current agent assignment
 
-**T6 `kv`** (spec: `SPEC-kv.md`) — flagship: embedded crash-consistent KV store (Bitcask-style
-log + in-memory keydir + atomic compaction) with an **injectable Storage** and a **deterministic
-fault-injection sweep** (mini-VOPR: crash at every I/O point, assert recovery). Full VOPR / MVCC /
-ordered-scan = noted phases. Dep-free. Greenfield.
-*(P1 batch done: netlink `4373dd7`; decimal `85337ff`; ramcache `3fa82db`; icmp+seqmap `7ff4d7c`; aaa-gate `ca36228`; mcp `c570ba2` (500).)*
+**P2 `blobmsg`** (spec: `SPEC-blobmsg.md`) — native ubus client + blob/blobmsg wire codec (OpenWRT).
+Extract axp `axp-core/ubus.zig` (clean-room byte-parity port of the OpenWRT C wire format). Codec
+platform-pure + byte-exact + fuzzed; socket client Linux-gated. Dep-free. First of the AXP batch.
+*(FLAGSHIP `kv` `bfdb009` (529) DONE. All P0 + high-value P1 committed; now the P2 AXP extractions.)*
