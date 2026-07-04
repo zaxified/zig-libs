@@ -66,7 +66,7 @@ TLS termination via a proxy meanwhile.
 
 ## Current agent assignment
 
-**P1 `aaa-gate`** (spec: `SPEC-aaa-gate.md`) — bearer-token auth + audit hook + denied-request
-throttle as a `router` middleware; the auth layer the Web/API cluster was missing. Extract axp
-`rest.zig` (AuditThrottle/token/audit). deps router+http. Constant-time compare; identity → ctx.data.
-*(netlink `4373dd7`; decimal `85337ff`; ramcache `3fa82db`; icmp+seqmap `7ff4d7c` (456).)*
+**P1 `mcp`** (spec: `SPEC-mcp.md`) — MCP server: JSON-RPC 2.0 + initialize/tools over a generic
+reader/writer transport (stdio built in), threading app state via a ctx pointer on tools. Extract
+bxp `bxp-mcp/src/server.zig`. Dep-free (std.json). The cross-project shared lib bxp+axp both want.
+*(netlink `4373dd7`; decimal `85337ff`; ramcache `3fa82db`; icmp+seqmap `7ff4d7c`; aaa-gate `ca36228` (476).)*
