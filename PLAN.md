@@ -66,6 +66,7 @@ TLS termination via a proxy meanwhile.
 
 ## Current agent assignment
 
-**T4 `netlink`** (spec: `SPEC-netlink.md`) — pure-Zig rtnetlink transport (routes / links /
-neighbors) over `NETLINK_ROUTE`; retires shell-outs to `ip` + `/proc/net` parsing; substrate for a
-future `wireguard` module. Linux-only, netns-verified. Standalone (no deps).
+**P1 `decimal`** (spec: `SPEC-decimal.md`) — extract bxp's i128 fixed-point decimal (scale 1e12,
+exact +−×, half-away-from-zero ÷/round, float-free parse/format) as a standalone dep-free module.
+Foundation for `numparse`/`finstats`/`exprcalc`. Portable, cross-OS.
+*(T4 `netlink` done `4373dd7`, 393 tests.)*
