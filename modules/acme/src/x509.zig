@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 //! Minimal X.509/PKCS building blocks for ACME: a small DER encoder, the
 //! PKCS#10 certification request (RFC 2986) with a subjectAltName extension
 //! request — the one ASN.1 structure an ACME client must *produce* — plus

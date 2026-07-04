@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 //! ratelimit — token-bucket request limiting: a pure keyed limiter plus a
 //! `router` middleware answering **429 + Retry-After**.
 //!

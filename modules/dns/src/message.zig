@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 //! DNS wire-format message codec (RFC 1035 §4) — pure and transport-agnostic.
 //!
 //! Encodes queries and decodes responses: header, question and resource-record

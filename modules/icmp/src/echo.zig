@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 //! ICMP echo packet construction and parsing for IPv4 and IPv6.
 //!
 //! All multi-byte header fields are written and read in network byte order.

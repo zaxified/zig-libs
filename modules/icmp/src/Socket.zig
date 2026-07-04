@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 //! Non-blocking ICMP sockets for IPv4/IPv6 on Linux.
 //!
 //! Tries an unprivileged SOCK_DGRAM ICMP socket first (requires

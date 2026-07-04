@@ -11,7 +11,7 @@ required attribution is reproduced.
 1. REQUIRED ATTRIBUTION — ported code
 ====================================================================
 
-## fping  (affects modules: netaddr, icmp, seqmap)
+## fping  (affects modules: netaddr, dns, icmp, seqmap)
 
 The `netaddr` module's address-selection logic, the `icmp` module (echo
 codec, ICMP sockets and the paced ping engine) and the `seqmap` module

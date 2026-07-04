@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 //! System resolver configuration — /etc/resolv.conf and /etc/hosts parsing,
 //! plus the search-list candidate iterator. Pure string logic (no I/O), so
 //! everything here is unit-testable on fixtures.

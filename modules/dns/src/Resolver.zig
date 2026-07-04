@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 //! DNS resolver — UDP (with TC-bit → TCP retry), TCP (RFC 1035 §4.2.2
 //! two-byte length prefix) and DoH (RFC 8484, `application/dns-message` over
 //! the sibling `http` module; plus the common `application/dns-json` variant

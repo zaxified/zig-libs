@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 //! router — REST routing on top of `http.Server`.
 //!
 //! Maps `(method, path pattern)` to handlers: static segments, named params

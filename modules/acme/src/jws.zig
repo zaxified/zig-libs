@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 //! JOSE building blocks for ACME: base64url (no padding), ES256 JWS in the
 //! flattened JSON serialization (RFC 7515 §7.2.2), P-256 JWK rendering, the
 //! RFC 7638 JWK thumbprint and the RFC 8555 §8.1 key authorization.

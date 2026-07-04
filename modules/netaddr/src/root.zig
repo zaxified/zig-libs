@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 //! netaddr — IP address parse/format + RFC 6724 destination/source selection.
 //!
 //! Pure address logic with no I/O dependency: IPv4/IPv6 literal parsing and

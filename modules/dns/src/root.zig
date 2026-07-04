@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 //! dns — DNS resolver: RFC 1035 message codec + UDP/TCP/DoH transports +
 //! forward (A/AAAA) and reverse (PTR) lookups.
 //!

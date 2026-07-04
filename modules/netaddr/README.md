@@ -7,6 +7,7 @@ IP address parse/format + **RFC 6724** destination/source address selection.
   extended to the full RFC 6724 destination rule set.
 - **Model after:** Go `net/addrselect.go` + glibc `getaddrinfo` (UDP-connect
   route-probe trick). Policy table and rule coverage match Go row-for-row.
+- **Provenance:** extracted from zig-fping `src/netutil.zig` (fping-derived — see the fping attribution in [NOTICE](../../NOTICE)); design refs (Go `net/addrselect`, glibc) in NOTICE.
 - **Why:** RFC 6724 selection ("several candidate addresses for a dual-stack
   host — which do I connect to, in what order") is a real gap in Zig std;
   foundational for `http`, `dns`, `icmp`.

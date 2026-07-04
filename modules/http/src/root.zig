@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 //! http — HTTP/1.1 client + server, pure Zig (TLS via `std.crypto.tls`).
 //!
 //! Phase 1: `Client` — HTTP/1.1 over TCP and TLS, streaming bodies both

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 //! The ping engine: schedules probes across many targets with global and
 //! per-subnet pacing, tracks timeouts and statistics.
 //!

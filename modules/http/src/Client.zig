@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 //! HTTP/1.1 client over TCP + TLS.
 //!
 //! One `Client` is a lightweight config + lazily-loaded CA bundle; each

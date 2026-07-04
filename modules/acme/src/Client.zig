@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 //! The ACME v2 (RFC 8555) client: directory discovery, nonce management,
 //! account registration, order → authorization → HTTP-01 challenge →
 //! finalize (CSR) → certificate download. Modeled on

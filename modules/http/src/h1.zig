@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 //! h1 — pure HTTP/1.1 wire framing. No sockets, no allocation: everything
 //! operates on `std.Io.Reader`/`std.Io.Writer` interfaces and caller buffers,
 //! so it is fully testable offline and shared by the client and the server.

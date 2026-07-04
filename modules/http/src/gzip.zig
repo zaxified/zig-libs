@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 //! gzip — negotiated response compression for `http.Server` (Phase 2.2,
 //! SPEC-http-gzip.md). Modeled after the Go net/http gzip-handler /
 //! nginx `gzip` semantics: compress only when the request's

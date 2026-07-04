@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 //! HTTP/1.1 server: request codec + serving loop (Phase 2), modeled after
 //! Go `net/http`'s Server (minimal subset). No TLS — Caddy (or any reverse
 //! proxy) terminates TLS and forwards plain HTTP/1.1.
