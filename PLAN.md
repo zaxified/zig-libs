@@ -66,8 +66,7 @@ TLS termination via a proxy meanwhile.
 
 ## Current agent assignment
 
-**P1 `icmp` + `seqmap`** (spec: `SPEC-icmp.md`) — extract zig-fping's ICMP echo engine + 65k-slot
-sequence map (two modules; icmp deps seqmap+netaddr). fping-derived → fping NOTICE attribution.
-seqmap portable; icmp Linux-only (raw sockets, unprivileged ping fallback). netaddr was the first
-carve-out from this seed.
-*(netlink `4373dd7` (393); decimal `85337ff` (411); ramcache `3fa82db` (425, stub replaced).)*
+**P1 `aaa-gate`** (spec: `SPEC-aaa-gate.md`) — bearer-token auth + audit hook + denied-request
+throttle as a `router` middleware; the auth layer the Web/API cluster was missing. Extract axp
+`rest.zig` (AuditThrottle/token/audit). deps router+http. Constant-time compare; identity → ctx.data.
+*(netlink `4373dd7`; decimal `85337ff`; ramcache `3fa82db`; icmp+seqmap `7ff4d7c` (456).)*
