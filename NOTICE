@@ -85,6 +85,14 @@ audit is pending before any public release.
                OpenAPI Specification 3.1.0 (Apache-2.0, OpenAPI
                Initiative). Behavior only, no source copied.
 
+  netlink    — kernel UAPI headers (linux/netlink.h, linux/rtnetlink.h,
+               linux/if_link.h, linux/if_addr.h, linux/neighbour.h,
+               linux/if.h; GPL-2.0 WITH Linux-syscall-note — constants and
+               struct layouts are the OS ABI) + RFC 3549 (spec); design ref:
+               libmnl (LGPL-2.1; validation/framing behavior only, no source
+               consulted), vishvananda/netlink (Go, Apache-2.0; typed-query
+               shape only). Clean-room, no source copied.
+
   acme       — RFC 8555 (ACME), RFC 7515 (JWS), RFC 7638 (JWK thumbprint),
                RFC 2986 (PKCS#10), RFC 5915 (EC private keys); design ref:
                golang.org/x/crypto/acme (BSD-3-Clause, The Go Authors;
