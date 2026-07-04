@@ -66,7 +66,8 @@ TLS termination via a proxy meanwhile.
 
 ## Current agent assignment
 
-**P1 `mcp`** (spec: `SPEC-mcp.md`) — MCP server: JSON-RPC 2.0 + initialize/tools over a generic
-reader/writer transport (stdio built in), threading app state via a ctx pointer on tools. Extract
-bxp `bxp-mcp/src/server.zig`. Dep-free (std.json). The cross-project shared lib bxp+axp both want.
-*(netlink `4373dd7`; decimal `85337ff`; ramcache `3fa82db`; icmp+seqmap `7ff4d7c`; aaa-gate `ca36228` (476).)*
+**T6 `kv`** (spec: `SPEC-kv.md`) — flagship: embedded crash-consistent KV store (Bitcask-style
+log + in-memory keydir + atomic compaction) with an **injectable Storage** and a **deterministic
+fault-injection sweep** (mini-VOPR: crash at every I/O point, assert recovery). Full VOPR / MVCC /
+ordered-scan = noted phases. Dep-free. Greenfield.
+*(P1 batch done: netlink `4373dd7`; decimal `85337ff`; ramcache `3fa82db`; icmp+seqmap `7ff4d7c`; aaa-gate `ca36228`; mcp `c570ba2` (500).)*
