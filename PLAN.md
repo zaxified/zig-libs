@@ -50,15 +50,22 @@ datefmt · tz · encoding · unaccent · numparse · tar · zipstream · blobsto
 | T5.6 | `security-headers` | 224 | `d02aa54` |
 | T5.7 | `cors` | 238 | `0ce4c4d` |
 | T5.8 | `metrics` | 254 | `2c5f1d7` |
+| T5.7 | `cors` | 238 | `0ce4c4d` |
+| T5.9 | `validate` | 290 | `010bce7` |
+| T5.10 | `resilience` | 310 | `820ceeb` |
+| T5.11 | router route-enum + `openapi` | 321 | `c2e3119` |
+| T5.12 | `acme` (Let's Encrypt) | 346 | `29e1435` |
+| T5.13 | `http` gzip (Ph2.2) | 363 | `12683e4` |
 
-**11 registered modules, 254 tests. API security core complete.** Router follow-ups surfaced (for
-later): expose the matched route pattern on `Ctx` (metrics label + openapi), and a stateful
-`Handler` variant (bare fn-ptr can't close over state — metrics used an Endpoint middleware).
+**15 registered modules, 363 tests. Web/API cluster COMPLETE + ACME + gzip.**
+
+**Direct-HTTPS TLS-terminating server: DEFERRED (2026-07-04).** std 0.16 has `tls.Client` only;
+the best pure-Zig TLS server (`ianic/tls.zig`) requires Zig **0.17-dev** and won't compile on 0.16.
+Revisit at Zig 0.17 stable, or when std ships a TLS server. `acme` + gzip + hardened `http` stand;
+TLS termination via a proxy meanwhile.
 
 ## Current agent assignment
 
-**T5.11 router route-enumeration + `openapi`** (spec: `SPEC-openapi.md`) — Step 1: router exposes
-`routes()` + `Ctx.matchedPattern()` + optional `addDoc`/`RouteDoc`; Step 2: `openapi` module generates
-an OpenAPI 3.1 spec from the route table + serves `/openapi.json`. **Closes the Web/API cluster.**
-
-*Done since last PLAN sync: T5.9 `validate` `010bce7` (290), T5.10 `resilience` `820ceeb` (310).*
+**T4 `netlink`** (spec: `SPEC-netlink.md`) — pure-Zig rtnetlink transport (routes / links /
+neighbors) over `NETLINK_ROUTE`; retires shell-outs to `ip` + `/proc/net` parsing; substrate for a
+future `wireguard` module. Linux-only, netns-verified. Standalone (no deps).
