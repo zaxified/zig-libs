@@ -66,7 +66,8 @@ TLS termination via a proxy meanwhile.
 
 ## Current agent assignment
 
-**P1 `ramcache`** (spec: `SPEC-ramcache.md`) — extract poc-wf's bounded cache (TTL + generation
-invalidation, byte/entry cap, expired-then-LRU, single-owner) as a standalone dep-free module;
-**replaces the current stub**. Portable, deterministic (injected clock/gen).
-*(T4 `netlink` `4373dd7` (393); P1 `decimal` `85337ff` (411).)*
+**P1 `icmp` + `seqmap`** (spec: `SPEC-icmp.md`) — extract zig-fping's ICMP echo engine + 65k-slot
+sequence map (two modules; icmp deps seqmap+netaddr). fping-derived → fping NOTICE attribution.
+seqmap portable; icmp Linux-only (raw sockets, unprivileged ping fallback). netaddr was the first
+carve-out from this seed.
+*(netlink `4373dd7` (393); decimal `85337ff` (411); ramcache `3fa82db` (425, stub replaced).)*
