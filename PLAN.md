@@ -66,7 +66,7 @@ TLS termination via a proxy meanwhile.
 
 ## Current agent assignment
 
-**P2 `blobmsg`** (spec: `SPEC-blobmsg.md`) — native ubus client + blob/blobmsg wire codec (OpenWRT).
-Extract axp `axp-core/ubus.zig` (clean-room byte-parity port of the OpenWRT C wire format). Codec
-platform-pure + byte-exact + fuzzed; socket client Linux-gated. Dep-free. First of the AXP batch.
-*(FLAGSHIP `kv` `bfdb009` (529) DONE. All P0 + high-value P1 committed; now the P2 AXP extractions.)*
+**P2 `tar`** (spec: `SPEC-tar.md`) — ustar/GNU tar reader+writer preserving uid/gid/mtime (std.tar
+drops them) + gzip packer. Extract axp `tar.zig` + vault `backup.zig`. Codec portable; statx dir-packer
+Linux. Dep-free. AXP batch.
+*(AXP batch: `blobmsg` `1e3836e` (553) done. Then: hashdigest+sealedbox, procnet+argsafe, l2disco, stun/sntp.)*
