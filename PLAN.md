@@ -66,7 +66,7 @@ TLS termination via a proxy meanwhile.
 
 ## Current agent assignment
 
-**P1 `decimal`** (spec: `SPEC-decimal.md`) — extract bxp's i128 fixed-point decimal (scale 1e12,
-exact +−×, half-away-from-zero ÷/round, float-free parse/format) as a standalone dep-free module.
-Foundation for `numparse`/`finstats`/`exprcalc`. Portable, cross-OS.
-*(T4 `netlink` done `4373dd7`, 393 tests.)*
+**P1 `ramcache`** (spec: `SPEC-ramcache.md`) — extract poc-wf's bounded cache (TTL + generation
+invalidation, byte/entry cap, expired-then-LRU, single-owner) as a standalone dep-free module;
+**replaces the current stub**. Portable, deterministic (injected clock/gen).
+*(T4 `netlink` `4373dd7` (393); P1 `decimal` `85337ff` (411).)*
