@@ -11,10 +11,12 @@ required attribution is reproduced.
 1. REQUIRED ATTRIBUTION — ported code
 ====================================================================
 
-## fping  (affects module: netaddr)
+## fping  (affects modules: netaddr, icmp, seqmap)
 
-The `netaddr` module's address-selection logic was extracted from the
-authors' `zig-fping` project, which is a Zig port of fping
+The `netaddr` module's address-selection logic, the `icmp` module (echo
+codec, ICMP sockets and the paced ping engine) and the `seqmap` module
+(sequence-number correlation map, after fping's seqmap.c) were extracted from
+the authors' `zig-fping` project, which is a Zig port of fping
 (https://github.com/schweikert/fping). fping's license therefore applies to
 the derived portions and is reproduced here as its terms require:
 
