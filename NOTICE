@@ -109,4 +109,14 @@ audit is pending before any public release.
                certbot (Apache-2.0; flow shape only). Behavior only, no
                source copied.
 
+  kv         — design ref: Bitcask (Basho; Apache-2.0 — the published
+               log-structured model: append-only CRC'd record file +
+               in-memory keydir + merge/compaction; paper/design only),
+               LMDB (OpenLDAP Public License) and xitdb (MIT) — embedded
+               single-writer semantics only; TigerBeetle (Apache-2.0) —
+               the VOPR deterministic fault-injection *approach* (simulate
+               storage faults at every I/O step, assert recovery), not its
+               implementation. Clean-room: behavior/approach only, no
+               source consulted or copied.
+
 See each module's README "Provenance" note for its specific seed and reference.
