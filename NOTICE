@@ -95,6 +95,13 @@ audit is pending before any public release.
                consulted), vishvananda/netlink (Go, Apache-2.0; typed-query
                shape only). Clean-room, no source copied.
 
+  aaa-gate   — extracted from the authors' axp project (axp-central/src/
+               rest.zig: admin-token gate, auditMutation, AuditThrottle;
+               Apache-2.0, relicensed MIT by the copyright holder); design
+               ref: envoy ext_authz (Apache-2.0) and oauth2-proxy (MIT) —
+               bearer-gate behavior only, no source consulted or copied;
+               bearer semantics per RFC 6750, auth framework per RFC 9110.
+
   acme       — RFC 8555 (ACME), RFC 7515 (JWS), RFC 7638 (JWK thumbprint),
                RFC 2986 (PKCS#10), RFC 5915 (EC private keys); design ref:
                golang.org/x/crypto/acme (BSD-3-Clause, The Go Authors;

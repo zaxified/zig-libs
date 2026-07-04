@@ -31,6 +31,8 @@ const module_list = [_]Module{
     .{ .name = "metrics", .deps = &.{ "router", "http" } },
     .{ .name = "validate", .deps = &.{ "router", "http" } },
     .{ .name = "openapi", .deps = &.{ "router", "http" } },
+    // Importable as @import("aaa-gate") — hyphen OK, like security-headers.
+    .{ .name = "aaa-gate", .deps = &.{ "router", "http" } },
     .{ .name = "resilience" },
     .{ .name = "acme", .deps = &.{ "http", "router" } },
     .{ .name = "netlink" },
