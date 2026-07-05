@@ -52,7 +52,7 @@ Pre-public: ✅ license/provenance audit (`8b9094e`) · ✅ README module index 
 | `tar` | 573 | `15fbdc2` |
 | license audit (SPDX+Provenance) | — | `8b9094e` |
 | README 24-module index | — | `b71377e` |
-| `latency-stats` | 580 | _this commit_ |
+| `latency-stats` | 580 | `ea476cf` |
 
 ---
 
