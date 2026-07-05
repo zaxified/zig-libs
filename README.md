@@ -8,7 +8,7 @@ Not a dumping ground: ship **solid, not many**. Most members are *extracted* fro
 across sibling projects (bxp, axp, zig-fping, poc-wf-analytic); a few fill genuine gaps in the Zig
 ecosystem.
 
-**Status:** 24 modules · 573 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 25 modules · 580 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ## Modules
@@ -43,6 +43,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `netlink` | rtnetlink dumps: links / addresses / routes / neighbors | linux | — |
 | `icmp` | ICMP echo (ping) engine — v4/v6 codec, batched socket, pacing | linux | seqmap, netaddr |
 | `seqmap` | Fixed 65 536-slot 16-bit request/reply correlation map, O(1) | any | — |
+| `latency-stats` | Online RTT stats — min/max/mean/stddev + RFC 3550 jitter + loss %, O(1)/sample, no alloc | any | — |
 
 ### Data & storage
 

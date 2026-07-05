@@ -13,12 +13,12 @@ verifies + commits.**
 
 ---
 
-## Status (2026-07-05)
+## Status (2026-07-06)
 
-**24 registered modules · 573 tests (1 skip = ubus socket absent) · Debug + ReleaseFast green · MIT.**
+**25 registered modules · 580 tests (1 skip = ubus socket absent) · Debug + ReleaseFast green · MIT.**
 Web/API cluster complete (incl. auth + ACME + gzip); flagship `kv` done; network + key extractions done.
 Pre-public: ✅ license/provenance audit (`8b9094e`) · ✅ README module index (`b71377e`).
-**PAUSED for Fable5 credit reset.** Resume at "Next up" below.
+**Fable5 credit near-exhausted (reset ~1 month out).** Resume at "Next up" below when credit returns.
 
 ## Progress (committed; each independently re-verified Debug+ReleaseFast+fmt before commit)
 
@@ -52,6 +52,7 @@ Pre-public: ✅ license/provenance audit (`8b9094e`) · ✅ README module index 
 | `tar` | 573 | `15fbdc2` |
 | license audit (SPDX+Provenance) | — | `8b9094e` |
 | README 24-module index | — | `b71377e` |
+| `latency-stats` | 580 | _this commit_ |
 
 ---
 
@@ -63,7 +64,7 @@ size-0 /proc files) + NaCl sealed-box (anonymous-sender X25519). Dep-free, porta
 
 ## Queued — rest of the AXP batch
 `procnet` + `argsafe` (axp task.zig — /proc parsers + injection-safe argv validators) · `l2disco`
-(axp — LLDP/CDP/ARP/DHCP codecs) · `stun` + `sntp` + `latency-stats` (axp probes) · `rawsock`
+(axp — LLDP/CDP/ARP/DHCP codecs) · `stun` + `sntp` (axp probes; `latency-stats` ✅ done) · `rawsock`
 (axp AF_PACKET) · `blobstore` (axp-vault CAS).
 
 ## Queued — P2 from bxp / poc-wf (extractions)
