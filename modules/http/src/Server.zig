@@ -57,6 +57,15 @@
 //! knowledge — the only cleartext path; RFC 9113 removed `Upgrade: h2c`)
 //! is served by `h2_server.zig` through the same `Options.handler`;
 //! everything else takes the HTTP/1.1 loop below unchanged.
+//!
+//! Bring-your-own-TLS (Phase 3.3): `serveStream` doubles as the
+//! h1-over-provided-stream entry — a caller that terminates TLS itself
+//! dispatches on the negotiated ALPN protocol (`http.protocolFromAlpn`,
+//! RFC 7301) and hands the TLS connection's plaintext reader/writer either
+//! here (`.http11`/`.unknown`) or to `h2_server.serveStream` (`.h2`); pass
+//! the socket peer via `StreamOptions.peer` so `Request.peerAddress` keeps
+//! working. The accept loop and `enable_h2c` detection are untouched by
+//! this — they remain the cleartext path.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -656,7 +665,11 @@ pub const StreamBuffers = struct {
 /// connection is done (Connection: close, protocol error, read failure or a
 /// clean client close). `out` is flushed after every response. Pure
 /// Reader/Writer logic: the serving loop wraps it around a socket, tests
-/// drive it with fixed buffers.
+/// drive it with fixed buffers. This is also the BYO-TLS h1 entry point:
+/// when a caller-terminated TLS handshake negotiated ALPN "http/1.1" (or
+/// nothing — `http.protocolFromAlpn` returns `.unknown`), hand the TLS
+/// connection's plaintext reader/writer here (`h2_server.serveStream` is
+/// the "h2" counterpart).
 pub fn serveStream(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers) void {
     serveLoop(opts, in, out, bufs, null);
 }

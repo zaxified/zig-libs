@@ -4,9 +4,16 @@
 //! over a byte transport (`std.Io.Reader`/`std.Io.Writer` — socket-free, so
 //! tests run from fixed buffers). `Client.connectH2c` binds it to a TCP
 //! stream for cleartext HTTP/2 via **prior knowledge** (RFC 9113 §3.3 —
-//! the client just opens with the connection preface); h2-over-TLS (ALPN)
-//! slots in later by handing a TLS plaintext reader/writer to
-//! `Session.init` once the TLS-adapter seam lands.
+//! the client just opens with the connection preface). For h2-over-TLS the
+//! seam is `Session.init` itself (Phase 3.3, bring-your-own-TLS): do the
+//! TLS handshake with your own library offering `http.alpn_offer`, and
+//! when the negotiated ALPN protocol is "h2" (`http.protocolFromAlpn`,
+//! RFC 7301; over TLS h2 is selected only via ALPN, RFC 9113 §3.3) hand
+//! the TLS connection's plaintext reader/writer to `Session.init` — or use
+//! `Client.connectH2Over`, the convenience wrapper that also carries the
+//! default `:authority`. The wire shape is identical to h2c from the
+//! preface onward; remember `:scheme` should be "https" on requests over
+//! TLS (`RequestOptions.scheme`, RFC 9113 §8.3.1).
 //!
 //! Model: one `Session` **multiplexes** any number of requests over one
 //! connection. `request` opens a stream (§5.1.1: odd, monotonic ids) and
@@ -33,8 +40,9 @@
 //! (`error.GoawayReceived`).
 //!
 //! Provenance: clean-room from RFC 9113 (client preface §3.4, streams
-//! §5.1, flow control §5.2/§6.9, GOAWAY §6.8, HTTP semantics §8.1–§8.3);
-//! no HTTP/2 client implementation source was consulted or copied.
+//! §5.1, flow control §5.2/§6.9, GOAWAY §6.8, HTTP semantics §8.1–§8.3)
+//! and RFC 7301 (ALPN — consumed, not implemented); no HTTP/2 client
+//! implementation source was consulted or copied.
 
 const std = @import("std");
 const http = @import("root.zig");

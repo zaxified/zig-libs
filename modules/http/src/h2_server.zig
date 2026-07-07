@@ -1,12 +1,27 @@
 // SPDX-License-Identifier: MIT
 
-//! h2c server integration (Phase 3.1): serves HTTP/2 over cleartext TCP via
+//! h2 server integration (Phase 3.1): serves HTTP/2 over cleartext TCP via
 //! **prior knowledge** (RFC 9113 §3.3 — the client just opens with the
 //! HTTP/2 connection preface; RFC 9113 removed the HTTP/1.1 `Upgrade: h2c`
 //! mechanism, so this is *the* cleartext path). `Server.zig` peeks for the
 //! preface after accept (`Options.enable_h2c`) and hands the connection
 //! here; everything handler-facing is shared with the HTTP/1.1 path — the
 //! same `Server.Request` / `Server.ResponseWriter` / `Options.handler`.
+//!
+//! **Bring-your-own-TLS (Phase 3.3):** over TLS, HTTP/2 is selected via the
+//! ALPN id "h2" (RFC 7301; RFC 9113 §3.3 — no upgrade mechanism exists).
+//! This module deliberately ships no TLS server; instead `serveStream` is
+//! the seam: terminate TLS yourself (an external Zig TLS library, or a
+//! future std TLS server — today a reverse proxy in front of the cleartext
+//! `Server` fills the same role), offer `http.alpn_offer` in the handshake,
+//! and when the negotiated protocol maps to `.h2`
+//! (`http.protocolFromAlpn`), call `serveStream` with the TLS connection's
+//! plaintext reader/writer. The engine is byte-identical from there — the
+//! client connection preface (§3.4) still opens the stream, exactly as on
+//! h2c, so the serve loop is shared, not duplicated. When ALPN selected
+//! "http/1.1" (or nothing), hand the same reader/writer to
+//! `Server.serveStream` — both protocols serve one already-established
+//! connection through the same `Options.handler`.
 //!
 //! Model (correct over fancy): frames are demultiplexed as they arrive —
 //! per-stream request state (decoded header list + a copy of the DATA
@@ -47,8 +62,9 @@
 //!
 //! Provenance: clean-room from RFC 9113 (prior knowledge §3.3, malformed
 //! requests §8.1.1, header validity §8.2.1/§8.2.2, request pseudo-headers
-//! §8.3.1, flow control §5.2/§6.9, CONTINUATION/DoS considerations §10.5)
-//! and the public CVE-2023-44487 / CVE-2024-27316 advisories (behavior
+//! §8.3.1, flow control §5.2/§6.9, CONTINUATION/DoS considerations §10.5),
+//! RFC 7301 (ALPN — consumed, not implemented, see `serveStream`) and the
+//! public CVE-2023-44487 / CVE-2024-27316 advisories (behavior
 //! descriptions only); no HTTP/2 server implementation was consulted or
 //! copied.
 
@@ -151,6 +167,39 @@ pub fn serve(gpa: Allocator, opts: Options, in: *Reader, out: *Writer) void {
     };
     defer s.deinit();
     s.run();
+}
+
+/// BYO-TLS entry point: serve HTTP/2 on one **already-established**
+/// connection — the caller owns the transport (typically a TLS connection
+/// whose handshake negotiated ALPN "h2", see `http.protocolFromAlpn`) and
+/// hands in its plaintext reader/writer plus the socket peer address.
+/// Identical to `serve` with `Options.peer` folded in: the client
+/// connection preface (RFC 9113 §3.4) is read from byte 0 — the same wire
+/// shape over TLS and h2c — and the function returns when the connection
+/// is done (peer hang-up, GOAWAY completed, or a connection error). It
+/// never fails; closing the underlying transport afterwards is the
+/// caller's job.
+///
+/// Intended flow (no TLS library required or referenced here):
+///
+///     // caller's TLS layer: accept, handshake offering http.alpn_offer
+///     // negotiated = the ALPN protocol the handshake selected
+///     switch (http.protocolFromAlpn(negotiated)) {
+///         .h2 => h2_server.serveStream(gpa, tls_reader, tls_writer, peer, .{
+///             .handler = my_handler,
+///         }),
+///         .http11, .unknown => // Server.serveStream — the h1 equivalent
+///     }
+pub fn serveStream(
+    gpa: Allocator,
+    in: *Reader,
+    out: *Writer,
+    peer: ?std.Io.net.IpAddress,
+    options: Options,
+) void {
+    var opts = options;
+    opts.peer = peer;
+    serve(gpa, opts, in, out);
 }
 
 /// One request stream being assembled: HEADERS (+ CONTINUATION) decoded,

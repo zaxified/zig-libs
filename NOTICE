@@ -57,7 +57,10 @@ audit is pending before any public release.
                static/Huffman tables and Appendix C vectors are the RFC's own
                data) + RFC 9113 (HTTP/2 framing + stream state machine + flow
                control; RFC 7540 consulted only where it clarifies the same
-               rules); clean-room from the RFCs, no HPACK/HTTP-2/nghttp2 source
+               rules) + RFC 7301 (ALPN — consumed for h2-over-TLS dispatch, not
+               implemented); the HTTP/2 DoS mitigations are clean-room from the
+               public CVE-2023-44487 / CVE-2024-27316 advisories (behavior
+               only). Clean-room from the RFCs, no HPACK/HTTP-2/nghttp2 source
                consulted or copied; TLS via Zig std.crypto.tls.
   dns        — RFC 1035 (wire), RFC 8484 (DoH), RFC 2782 (SRV), RFC 8659
                (CAA); design ref: miekg/dns (BSD-3-Clause) + c-ares —

@@ -25,7 +25,12 @@
 //! `H2Session` that multiplexes any number of requests over that one
 //! connection (the `h2_client` engine over this client's socket plumbing).
 //! The h1 `request` path is byte-for-byte unchanged — h2 is strictly
-//! opt-in; h2 over TLS (ALPN) arrives with the TLS-adapter seam later.
+//! opt-in. For h2 over TLS, `connectH2Over` (Phase 3.3) is the
+//! bring-your-own-TLS seam: establish the TLS connection with your own
+//! library offering `http.alpn_offer`, and when ALPN negotiated "h2"
+//! (`http.protocolFromAlpn`, RFC 7301; RFC 9113 §3.3) hand the plaintext
+//! reader/writer over — the same `H2Session` drives it, transport owned by
+//! the caller.
 
 const std = @import("std");
 const netaddr = @import("netaddr");
@@ -342,19 +347,30 @@ pub fn putFile(c: *Client, url: []const u8, dir: std.Io.Dir, sub_path: []const u
 
 // ── HTTP/2 cleartext (h2c, prior knowledge) ─────────────────────────────────
 
-/// One HTTP/2 cleartext connection (RFC 9113 §3.3 prior knowledge — the
-/// peer must speak h2c, e.g. `Server` with `enable_h2c`), multiplexing any
-/// number of requests: call `request` N times, then `awaitResponse` each
-/// returned stream id in any order. Created by `connectH2c`; released with
-/// `close`. Single-owner like the h1 client: one task drives a session.
+/// One HTTP/2 connection, multiplexing any number of requests: call
+/// `request` N times, then `awaitResponse` each returned stream id in any
+/// order. Created by `connectH2c` (cleartext h2c over an owned TCP socket,
+/// RFC 9113 §3.3 prior knowledge — the peer must speak h2c, e.g. `Server`
+/// with `enable_h2c`) or `connectH2Over` (caller-provided stream, e.g.
+/// after a TLS handshake negotiated ALPN "h2"); released with `close`.
+/// Single-owner like the h1 client: one task drives a session.
 pub const H2Session = struct {
-    client: *Client,
-    stream: net.Stream,
-    sr: net.Stream.Reader,
-    sw: net.Stream.Writer,
+    gpa: std.mem.Allocator,
+    /// The socket transport when this client opened it (`connectH2c`);
+    /// null when the session runs over a caller-provided stream
+    /// (`connectH2Over`) — then the caller owns the transport and closes
+    /// it after `close`.
+    owned: ?Owned,
     session: h2_client.Session,
-    slab: []u8,
     authority: []u8,
+
+    const Owned = struct {
+        client: *Client,
+        stream: net.Stream,
+        sr: net.Stream.Reader,
+        sw: net.Stream.Writer,
+        slab: []u8,
+    };
 
     /// Start a request on its own stream (many may be in flight at once).
     /// `:authority` defaults to the connected host[:port].
@@ -375,14 +391,19 @@ pub const H2Session = struct {
         return hs.session.awaitResponse(stream_id);
     }
 
-    /// Graceful GOAWAY (best effort), close the socket, free everything.
+    /// Graceful GOAWAY (best effort), close the socket when this client
+    /// owns it (`connectH2c`), free everything. Over a caller-provided
+    /// stream (`connectH2Over`) the transport is left open — close it
+    /// yourself afterwards (e.g. the TLS close_notify + socket close).
     pub fn close(hs: *H2Session) void {
         hs.session.shutdown();
         hs.session.deinit();
-        hs.stream.close(hs.client.io);
-        const gpa = hs.client.gpa;
+        const gpa = hs.gpa;
+        if (hs.owned) |*o| {
+            o.stream.close(o.client.io);
+            gpa.free(o.slab);
+        }
         gpa.free(hs.authority);
-        gpa.free(hs.slab);
         gpa.destroy(hs);
     }
 };
@@ -411,23 +432,78 @@ pub fn connectH2c(c: *Client, host: []const u8, port: u16, options: h2_client.Op
     errdefer stream.close(c.io);
 
     hs.* = .{
-        .client = c,
-        .stream = stream,
-        .sr = undefined,
-        .sw = undefined,
+        .gpa = c.gpa,
+        .owned = .{
+            .client = c,
+            .stream = stream,
+            .sr = undefined,
+            .sw = undefined,
+            .slab = slab,
+        },
         .session = undefined,
-        .slab = slab,
         .authority = authority,
     };
     // Reader/writer (and the session pointing at them) must be initialized
     // at the connection's final heap address.
-    hs.sr = stream.reader(c.io, slab[0..c.options.read_buffer_size]);
-    hs.sw = stream.writer(c.io, slab[c.options.read_buffer_size..]);
-    hs.session = h2_client.Session.init(c.gpa, &hs.sr.interface, &hs.sw.interface, options) catch |err|
+    const o = &hs.owned.?;
+    o.sr = stream.reader(c.io, slab[0..c.options.read_buffer_size]);
+    o.sw = stream.writer(c.io, slab[c.options.read_buffer_size..]);
+    hs.session = h2_client.Session.init(c.gpa, &o.sr.interface, &o.sw.interface, options) catch |err|
         switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.WriteFailed,
         };
+    return hs;
+}
+
+/// BYO-TLS entry point: run the multiplexing HTTP/2 client over an
+/// **already-established** byte stream the caller owns — typically a TLS
+/// connection whose handshake (offering `http.alpn_offer`) negotiated the
+/// ALPN protocol "h2" (`http.protocolFromAlpn`; RFC 7301, RFC 9113 §3.3 —
+/// over TLS h2 is selected only via ALPN, never an upgrade). The client
+/// connection preface + SETTINGS are sent immediately (RFC 9113 §3.4),
+/// exactly as on h2c — the wire is identical from here on.
+///
+/// `in`/`out` must outlive the session and stay untouched by the caller
+/// while it lives; `close` releases the session but leaves the transport
+/// open (closing it — TLS close_notify, socket — stays the caller's job).
+/// `authority` is copied and becomes the default `:authority` pseudo-header
+/// (host[:port] — what was presented as the TLS server name). Over TLS,
+/// pass `.scheme = "https"` in each request's `RequestOptions`
+/// (RFC 9113 §8.3.1).
+///
+/// Intended flow (no TLS library required or referenced here):
+///
+///     // caller's TLS layer: connect, handshake offering http.alpn_offer
+///     // negotiated = the ALPN protocol the handshake selected
+///     if (http.protocolFromAlpn(negotiated) == .h2) {
+///         const hs = try Client.connectH2Over(gpa, tls_reader, tls_writer,
+///             "example.com", .{});
+///         defer hs.close();
+///         const sid = try hs.request(.get, "/", .{ .scheme = "https" });
+///         ...
+///     } // else: the HTTP/1.1 client path over the same stream
+pub fn connectH2Over(
+    gpa: std.mem.Allocator,
+    in: *std.Io.Reader,
+    out: *std.Io.Writer,
+    authority: []const u8,
+    options: h2_client.Options,
+) Error!*H2Session {
+    const hs = try gpa.create(H2Session);
+    errdefer gpa.destroy(hs);
+    const auth = try gpa.dupe(u8, authority);
+    errdefer gpa.free(auth);
+    hs.* = .{
+        .gpa = gpa,
+        .owned = null,
+        .session = undefined,
+        .authority = auth,
+    };
+    hs.session = h2_client.Session.init(gpa, in, out, options) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.WriteFailed,
+    };
     return hs;
 }
 
@@ -1029,6 +1105,160 @@ test "h2c dogfood: large response streams past the initial window (flow control,
         @as(i64, h2.default_initial_window_size),
         hs.session.conn.conn_recv_window,
     );
+}
+
+// ── tests (BYO-TLS seam dogfood: in-memory duplex pipe, no TLS, no sockets) ──
+
+const h2s = @import("h2_server.zig");
+
+/// One direction of the in-memory duplex "TLS stream" stand-in: a blocking
+/// byte queue with a `Reader` and a `Writer` endpoint — exactly the
+/// plaintext reader/writer shape a TLS library hands out after its
+/// handshake. One reader task + one writer task; `shutdown` is the
+/// writer-side close (readers drain what is buffered, then EOF). Not
+/// movable after the endpoints have been handed out.
+const TestPipe = struct {
+    io: std.Io,
+    mutex: std.Io.Mutex = .init,
+    cond: std.Io.Condition = .init,
+    data: std.array_list.Managed(u8),
+    closed: bool = false,
+    reader: std.Io.Reader,
+    writer: std.Io.Writer,
+
+    fn init(io: std.Io, rbuf: []u8, wbuf: []u8) TestPipe {
+        return .{
+            .io = io,
+            .data = .init(testing.allocator),
+            .reader = .{
+                .vtable = &.{ .stream = streamFn },
+                .buffer = rbuf,
+                .seek = 0,
+                .end = 0,
+            },
+            .writer = .{
+                .vtable = &.{ .drain = drainFn },
+                .buffer = wbuf,
+            },
+        };
+    }
+
+    fn deinit(p: *TestPipe) void {
+        p.data.deinit();
+    }
+
+    /// Writer side done: pending and future reads see EOF once drained.
+    fn shutdown(p: *TestPipe) void {
+        p.mutex.lockUncancelable(p.io);
+        p.closed = true;
+        p.cond.broadcast(p.io);
+        p.mutex.unlock(p.io);
+    }
+
+    fn streamFn(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const p: *TestPipe = @alignCast(@fieldParentPtr("reader", r));
+        p.mutex.lockUncancelable(p.io);
+        defer p.mutex.unlock(p.io);
+        while (p.data.items.len == 0) {
+            if (p.closed) return error.EndOfStream;
+            p.cond.waitUncancelable(p.io, &p.mutex);
+        }
+        const n = limit.minInt(p.data.items.len);
+        const sent = w.write(p.data.items[0..n]) catch return error.WriteFailed;
+        const remaining = p.data.items.len - sent;
+        std.mem.copyForwards(u8, p.data.items[0..remaining], p.data.items[sent..]);
+        p.data.shrinkRetainingCapacity(remaining);
+        return sent;
+    }
+
+    fn drainFn(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const p: *TestPipe = @alignCast(@fieldParentPtr("writer", w));
+        p.mutex.lockUncancelable(p.io);
+        defer p.mutex.unlock(p.io);
+        p.data.appendSlice(w.buffered()) catch return error.WriteFailed;
+        w.end = 0;
+        var consumed: usize = 0;
+        for (data[0 .. data.len - 1]) |d| {
+            p.data.appendSlice(d) catch return error.WriteFailed;
+            consumed += d.len;
+        }
+        const last = data[data.len - 1];
+        for (0..splat) |_| p.data.appendSlice(last) catch return error.WriteFailed;
+        consumed += last.len * splat;
+        p.cond.signal(p.io);
+        return consumed;
+    }
+};
+
+/// The server side of the seam: HTTP/2 on one already-established stream,
+/// exactly what a TLS accept loop calls when ALPN selected "h2".
+fn tlsStandInServe(c2s: *TestPipe, s2c: *TestPipe) void {
+    h2s.serveStream(testing.allocator, &c2s.reader, &s2c.writer, null, .{
+        .handler = h2LoopbackHandler,
+        .server_name = "h2tls",
+    });
+    s2c.shutdown(); // transport close after the h2 connection ended
+}
+
+test "BYO-TLS dogfood: connectH2Over ↔ serveStream over an in-memory duplex pipe" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // The "TLS connection": one blocking in-memory byte queue per direction.
+    // No TLS and no sockets anywhere — the seam only ever sees the plaintext
+    // reader/writer pair, which is all a real TLS stream would present.
+    var c2s_rbuf: [4096]u8 = undefined;
+    var c2s_wbuf: [4096]u8 = undefined;
+    var s2c_rbuf: [4096]u8 = undefined;
+    var s2c_wbuf: [4096]u8 = undefined;
+    var c2s: TestPipe = .init(io, &c2s_rbuf, &c2s_wbuf); // client → server
+    defer c2s.deinit();
+    var s2c: TestPipe = .init(io, &s2c_rbuf, &s2c_wbuf); // server → client
+    defer s2c.deinit();
+
+    // The caller's TLS layer negotiated ALPN (RFC 7301); dispatch on it.
+    const negotiated = "h2"; // ← what the handshake would hand back
+    try testing.expectEqual(http.AlpnProtocol.h2, http.protocolFromAlpn(negotiated));
+
+    const thread = try std.Thread.spawn(.{}, tlsStandInServe, .{ &c2s, &s2c });
+    defer thread.join();
+    defer c2s.shutdown(); // client-side transport close (unblocks the server)
+
+    const hs = try connectH2Over(gpa, &s2c.reader, &c2s.writer, "tls.test", .{});
+    defer hs.close();
+
+    { // GET round-trip.
+        const sid = try hs.request(.get, "/hello", .{ .scheme = "https" });
+        var res = try hs.awaitResponse(sid);
+        defer res.deinit(gpa);
+        try testing.expectEqual(@as(u16, 200), res.status);
+        try testing.expectEqualStrings("text/plain", res.header("content-type").?);
+        try testing.expectEqualStrings("hello h2", res.body);
+        try testing.expectEqualStrings("h2tls", res.header("server").?);
+    }
+    { // POST round-trip: the request body crosses the pipe and comes back.
+        const sid = try hs.request(.post, "/echo", .{
+            .scheme = "https",
+            .body = "over the TLS stand-in",
+        });
+        var res = try hs.awaitResponse(sid);
+        defer res.deinit(gpa);
+        try testing.expectEqual(@as(u16, 200), res.status);
+        try testing.expectEqualStrings("over the TLS stand-in", res.body);
+    }
+    { // Two concurrent streams in flight before either response is read;
+        // collected in reverse order — demux by stream id must hold.
+        const sid_a = try hs.request(.post, "/echo", .{ .scheme = "https", .body = "stream A" });
+        const sid_b = try hs.request(.post, "/echo", .{ .scheme = "https", .body = "stream B" });
+        var res_b = try hs.awaitResponse(sid_b);
+        defer res_b.deinit(gpa);
+        var res_a = try hs.awaitResponse(sid_a);
+        defer res_a.deinit(gpa);
+        try testing.expectEqualStrings("stream B", res_b.body);
+        try testing.expectEqualStrings("stream A", res_a.body);
+    }
 }
 
 // ── tests (live network — skipped when unavailable) ─────────────────────────

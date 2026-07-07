@@ -19,7 +19,14 @@
 //! serves both protocols. Phase 3.2 adds the client side and makes the
 //! h2 stack bidirectional: `h2_client.Session` multiplexes requests
 //! over one connection, and `Client.connectH2c` binds it to a TCP
-//! stream (h2c prior knowledge; ALPN follows the TLS-adapter seam).
+//! stream (h2c prior knowledge). Phase 3.3 closes the loop with the
+//! **TLS-adapter seam**: bring your own TLS (a reverse proxy, an
+//! external Zig TLS library, a future std TLS server) and run the h2
+//! stack over the established stream — `alpn_offer`/`protocolFromAlpn`
+//! consume the ALPN result (RFC 7301; over TLS h2 is selected only via
+//! ALPN, RFC 9113 §3.3), then `h2_server.serveStream` serves it and
+//! `Client.connectH2Over` drives the client side; `Server.serveStream`
+//! is the matching h1-over-provided-stream path.
 //! Deliberately NOT built on `std.http` (API
 //! churn is the reason this module exists); client TLS is strictly
 //! `std.crypto.tls`.
@@ -64,8 +71,16 @@ pub const h2 = @import("h2.zig");
 /// `h2.Connection` in client role over any byte transport, multiplexing
 /// requests (demux by stream id) with §5.2/§6.9 flow control and typed
 /// GOAWAY/RST_STREAM handling. `Client.connectH2c` binds it to a TCP
-/// stream for cleartext h2c via prior knowledge (RFC 9113 §3.3).
+/// stream for cleartext h2c via prior knowledge (RFC 9113 §3.3);
+/// `Client.connectH2Over` binds it to a caller-provided (e.g. TLS)
+/// stream after ALPN selected `alpn_h2`.
 pub const h2_client = @import("h2_client.zig");
+
+/// HTTP/2 server integration: the h2c serve loop behind
+/// `Server.Options.enable_h2c`, and `h2_server.serveStream` — the
+/// BYO-TLS entry point that serves HTTP/2 on one already-established
+/// (e.g. TLS) connection when ALPN selected `alpn_h2`.
+pub const h2_server = @import("h2_server.zig");
 
 /// The HTTP/1.1 client (plus opt-in HTTP/2 h2c via `Client.connectH2c`).
 /// See `Client.init` / `Client.request`.
@@ -279,6 +294,56 @@ pub fn resolveLocation(base: Url, location: []const u8, out: []u8) ResolveError!
 /// Scratch bound for relative-redirect path merging.
 pub const max_merged_path = 4096;
 
+// ── ALPN (RFC 7301) — the bring-your-own-TLS seam ───────────────────────────
+//
+// This module ships no TLS server: TLS termination is the caller's (a
+// reverse proxy in front of the h1/h2c `Server`, an external Zig TLS
+// library, a future std TLS server). ALPN itself is negotiated inside the
+// caller's TLS handshake (RFC 7301) — the vocabulary below is for *feeding*
+// that handshake (`alpn_offer`) and *consuming* its result
+// (`protocolFromAlpn`). Over TLS, HTTP/2 is selected exclusively via the
+// ALPN id "h2" (RFC 9113 §3.3 — there is no request-based upgrade), so the
+// intended deployment flow is:
+//
+//     terminate TLS with your library, offering `http.alpn_offer`
+//     switch (http.protocolFromAlpn(negotiated)) {
+//         .h2     => h2_server.serveStream(gpa, in, out, peer, .{ .handler = h });
+//         .http11 => Server.serveStream(opts, in, out, bufs);   // or unknown:
+//         .unknown => Server.serveStream(opts, in, out, bufs),  // h1 default
+//     }
+//
+// where `in`/`out` are the TLS connection's plaintext reader/writer. The
+// client side mirrors it: offer `alpn_offer`, and when "h2" comes back call
+// `Client.connectH2Over` on the TLS stream (RFC 7301 §3.2: an empty or
+// absent ALPN result means the server chose nothing — HTTP/1.1 is the safe
+// default, hence `.unknown` maps to the h1 path above).
+
+/// ALPN protocol id selecting HTTP/2 over TLS (RFC 9113 §3.3).
+pub const alpn_h2 = "h2";
+
+/// ALPN protocol id selecting HTTP/1.1 (RFC 7301 §6 IANA registry).
+pub const alpn_http11 = "http/1.1";
+
+/// The protocol list to offer in a TLS handshake, most-preferred first
+/// (RFC 7301 §3.1): clients send it in the ClientHello, servers use it as
+/// their preference order when picking against the client's list.
+pub const alpn_offer = [_][]const u8{ alpn_h2, alpn_http11 };
+
+/// Dispatch verdict for a negotiated ALPN protocol id — see `protocolFromAlpn`.
+pub const AlpnProtocol = enum { http11, h2, unknown };
+
+/// Map the ALPN protocol id the caller's TLS layer negotiated to the module
+/// entry point to use: `.h2` → `h2_server.serveStream` /
+/// `Client.connectH2Over`, `.http11` → `Server.serveStream` / the h1
+/// `Client`. `.unknown` (anything else, including "" when ALPN was not
+/// used) should be treated as HTTP/1.1 per RFC 7301 §3.2 fallback custom.
+/// Comparison is exact and case-sensitive — ALPN ids are opaque bytes.
+pub fn protocolFromAlpn(selected: []const u8) AlpnProtocol {
+    if (std.mem.eql(u8, selected, alpn_h2)) return .h2;
+    if (std.mem.eql(u8, selected, alpn_http11)) return .http11;
+    return .unknown;
+}
+
 /// RFC 3986 §5.2.4 remove_dot_segments, in place; returns the new length.
 pub fn removeDotSegments(path: []u8) usize {
     var r: usize = 0;
@@ -331,8 +396,31 @@ test {
     _ = hpack;
     _ = h2;
     _ = h2_client;
+    _ = h2_server;
     _ = Client;
     _ = Server;
+}
+
+test "protocolFromAlpn: exact ALPN ids dispatch, anything else is unknown" {
+    try testing.expectEqual(AlpnProtocol.h2, protocolFromAlpn("h2"));
+    try testing.expectEqual(AlpnProtocol.http11, protocolFromAlpn("http/1.1"));
+    // Not negotiated / ALPN absent → the caller falls back to HTTP/1.1.
+    try testing.expectEqual(AlpnProtocol.unknown, protocolFromAlpn(""));
+    // Unsupported protocols we never offer.
+    try testing.expectEqual(AlpnProtocol.unknown, protocolFromAlpn("h3"));
+    try testing.expectEqual(AlpnProtocol.unknown, protocolFromAlpn("http/1.0"));
+    // ALPN ids are opaque bytes — no case folding, no prefix matching.
+    try testing.expectEqual(AlpnProtocol.unknown, protocolFromAlpn("H2"));
+    try testing.expectEqual(AlpnProtocol.unknown, protocolFromAlpn("h2c"));
+}
+
+test "alpn_offer: h2 preferred, http/1.1 fallback, nothing else" {
+    try testing.expectEqual(@as(usize, 2), alpn_offer.len);
+    try testing.expectEqualStrings(alpn_h2, alpn_offer[0]);
+    try testing.expectEqualStrings(alpn_http11, alpn_offer[1]);
+    // Every offered id round-trips through the dispatcher.
+    try testing.expectEqual(AlpnProtocol.h2, protocolFromAlpn(alpn_offer[0]));
+    try testing.expectEqual(AlpnProtocol.http11, protocolFromAlpn(alpn_offer[1]));
 }
 
 test "Url.parse: happy paths" {
