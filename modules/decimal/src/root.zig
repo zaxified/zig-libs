@@ -15,13 +15,21 @@
 //! widen to `i256` intermediates so a product of two large operands cannot
 //! overflow before the rescale.
 //!
-//! Rounding contract (all rounding is half-away-from-zero — "school" rounding,
-//! matching what Excel / LibreOffice present):
+//! Rounding contract (the classic ops round half-away-from-zero — "school"
+//! rounding, matching what Excel / LibreOffice present):
 //!   `+ −`   exact; a result beyond the i128 range → `error.Overflow`.
 //!   `× ÷`   round the 12th fractional digit half-away-from-zero (a product or
 //!           quotient with more than 12 fractional digits is rounded, not
 //!           truncated); result beyond i128 → `error.Overflow`.
 //!   `round` re-quantises with the same mode.
+//!
+//! Controlled rounding (IEEE 754-2008 / General Decimal Arithmetic): the
+//! `RoundingMode` enum — `half_even` (banker's, the GDA default), `half_up`,
+//! `half_down`, `up`, `down`, `ceiling`, `floor` — drives `rescale`,
+//! `roundToIntegral`, `quantize` and `divRound` (division computed at an
+//! explicit result scale). Modelled after Java `BigDecimal.RoundingMode` and
+//! the IBM General Decimal Arithmetic spec; pure integer paths, overflow →
+//! typed `error.Overflow`.
 //! No Inf/NaN, no silent wrap-around, never UB: everything that can exceed the
 //! range returns a clean error (`round`/`floor`/`ceil` return the value
 //! unchanged instead — see their doc comments).
@@ -37,8 +45,35 @@ pub const meta = .{
     .platform = .any, // pure integer logic, no OS calls
     .role = .util,
     .concurrency = .reentrant, // no shared state, no allocation
-    .model_after = "Java BigDecimal / DB DECIMAL(38,12)",
+    .model_after = "Java BigDecimal (incl. RoundingMode) / IBM General Decimal Arithmetic / DB DECIMAL(38,12)",
     .deps = .{}, // std only
+};
+
+/// IEEE 754-2008 / General Decimal Arithmetic rounding modes. Clean-room from
+/// the published definitions (Java `BigDecimal.RoundingMode` javadoc, IBM GDA
+/// spec, Python `decimal` docs) — every mode is exact on the discarded
+/// remainder, no floating point involved.
+pub const RoundingMode = enum {
+    /// Round to nearest; a tie goes to the even neighbour (banker's rounding,
+    /// IEEE 754 roundTiesToEven, the GDA default). 2.5 → 2, 3.5 → 4, -2.5 → -2.
+    half_even,
+    /// Round to nearest; a tie goes away from zero (Excel ROUND, "school"
+    /// rounding). 2.5 → 3, -2.5 → -3.
+    half_up,
+    /// Round to nearest; a tie goes toward zero. 2.5 → 2, -2.5 → -2.
+    half_down,
+    /// Round away from zero: any nonzero discarded fraction increments the
+    /// magnitude. 2.1 → 3, -2.1 → -3.
+    up,
+    /// Round toward zero: truncate the discarded fraction. 2.9 → 2, -2.9 → -2.
+    down,
+    /// Round toward +infinity. 2.1 → 3, -2.9 → -2.
+    ceiling,
+    /// Round toward -infinity. 2.9 → 2, -2.1 → -3.
+    floor,
+
+    /// The IEEE 754 / GDA default mode.
+    pub const default: RoundingMode = .half_even;
 };
 
 pub const Decimal = struct {
@@ -168,6 +203,89 @@ pub const Decimal = struct {
         const scaled = q * divisor;
         if (scaled > std.math.maxInt(i128) or scaled < std.math.minInt(i128)) return self;
         return .{ .raw = @intCast(scaled) };
+    }
+
+    /// Re-quantise to `new_scale` fractional digits with an explicit rounding
+    /// mode (Java `setScale(new_scale, mode)`). Increasing the scale is exact:
+    /// this fixed-point representation already carries 12 fractional digits,
+    /// so `new_scale >= 12` is the identity (a pure zero-pad). Decreasing the
+    /// scale drops digits and resolves the discarded remainder with `mode`
+    /// (exact half-way detection on the remainder — no floats). A negative
+    /// `new_scale` rounds to tens/hundreds/…. `error.Overflow` when the
+    /// rounded value leaves the i128 range (e.g. `ceiling` at the maximum).
+    pub fn rescale(self: Decimal, new_scale: i32, mode: RoundingMode) Error!Decimal {
+        if (new_scale >= @as(i32, @intCast(scale))) return self;
+        const drop64: i64 = @as(i64, scale) - new_scale; // >= 1
+        // Past 10^48 every representable value truncates to 0 and any nonzero
+        // rounded result overflows i128 anyway — clamping keeps the discarded
+        // remainder strictly below the half-way point, so results (0 or
+        // error.Overflow) are identical to the un-clamped math.
+        const drop: u32 = if (drop64 > max_pow10) max_pow10 else @intCast(drop64);
+        const divisor = pow10_256(drop);
+        const q = divRoundWithMode(@as(i256, self.raw), divisor, mode);
+        const scaled = q * divisor;
+        if (scaled > std.math.maxInt(i128) or scaled < std.math.minInt(i128)) return error.Overflow;
+        return .{ .raw = @intCast(scaled) };
+    }
+
+    /// Round to an integral value with an explicit mode (GDA
+    /// round-to-integral-value; Java `setScale(0, mode)`). Sugar for
+    /// `rescale(0, mode)`.
+    pub fn roundToIntegral(self: Decimal, mode: RoundingMode) Error!Decimal {
+        return self.rescale(0, mode);
+    }
+
+    /// Python/GDA-style quantize: round so the last significant place is
+    /// `10^exponent` — exponent −2 keeps two fractional digits, +2 rounds to
+    /// hundreds. Equivalent to `rescale(-exponent, mode)`.
+    pub fn quantize(self: Decimal, exponent: i32, mode: RoundingMode) Error!Decimal {
+        const ns: i64 = -@as(i64, exponent);
+        if (ns >= @as(i64, scale)) return self; // at/beyond max precision: exact
+        return self.rescale(@intCast(ns), mode);
+    }
+
+    /// a/b with the quotient computed at `result_scale` fractional digits and
+    /// the discarded remainder resolved by `mode` (Java
+    /// `divide(b, scale, roundingMode)`) — the operation exact fixed-point
+    /// cannot express otherwise. `result_scale` above 12 is clamped to 12
+    /// (the representation's precision ceiling); a negative scale rounds the
+    /// quotient to tens/hundreds/…. `error.DivisionByZero` on b = 0;
+    /// `error.Overflow` when the rounded quotient leaves the i128 range.
+    pub fn divRound(a: Decimal, b: Decimal, result_scale: i32, mode: RoundingMode) DivError!Decimal {
+        if (b.raw == 0) return error.DivisionByZero;
+        if (a.raw == 0) return Decimal.zero;
+        const result_neg = (a.raw < 0) != (b.raw < 0);
+        const s: i64 = @min(@as(i64, result_scale), @as(i64, scale));
+        const back: i64 = @as(i64, scale) - s; // digits to re-pad below the rounding place
+        var num: i256 = a.raw;
+        if (num < 0) num = -num;
+        var den: i256 = b.raw;
+        if (den < 0) den = -den;
+        // Quotient magnitude at the rounding place: |a.raw|·10^s / |b.raw|.
+        var q: i256 = undefined;
+        if (s >= 0) {
+            // s <= 12: num <= ~1.7e38 · 1e12 = 1.7e50, comfortably inside i256.
+            q = divRoundMag(num * pow10_256(@intCast(s)), den, result_neg, mode);
+        } else if (-s <= 60) {
+            // Negative scale: scale the divisor instead. den·10^60 can exceed
+            // i256 — an overflowed divisor dwarfs 2·num, so the quotient is a
+            // fraction strictly below one half.
+            const m = @mulWithOverflow(den, pow10_256(@intCast(-s)));
+            q = if (m[1] != 0)
+                @intFromBool(roundsAwayWhenBelowHalf(result_neg, mode))
+            else
+                divRoundMag(num, m[0], result_neg, mode);
+        } else {
+            // 10^61+ alone dwarfs any representable numerator: fraction < 1/2.
+            q = @intFromBool(roundsAwayWhenBelowHalf(result_neg, mode));
+        }
+        if (q == 0) return Decimal.zero;
+        // A nonzero digit at a place past 10^48 cannot fit the i128 range.
+        if (back > max_pow10) return error.Overflow;
+        const scaled = q * pow10_256(@intCast(back));
+        const signed: i256 = if (result_neg) -scaled else scaled;
+        if (signed > std.math.maxInt(i128) or signed < std.math.minInt(i128)) return error.Overflow;
+        return .{ .raw = @intCast(signed) };
     }
 
     pub fn order(a: Decimal, b: Decimal) std.math.Order {
@@ -323,8 +441,9 @@ pub const Decimal = struct {
     }
 };
 
-/// 10^e as i256, for e in [0, max_pow10]. Runtime loop — the exponent is
-/// bounded and small, so this is not a hot path worth a lookup table.
+/// 10^e as i256, for e in [0, 60] (10^60 ≪ i256 max ≈ 5.7e76; callers bound
+/// e — most at `max_pow10`, `divRound` up to 60). Runtime loop — the exponent
+/// is bounded and small, so this is not a hot path worth a lookup table.
 fn pow10_256(e: u32) i256 {
     var r: i256 = 1;
     var k: u32 = 0;
@@ -333,15 +452,56 @@ fn pow10_256(e: u32) i256 {
 }
 
 /// num / den rounded half-away-from-zero, sign-aware. `den` must be non-zero.
-/// Excel-compatible: 2.5 → 3, −2.5 → −3.
+/// Excel-compatible: 2.5 → 3, −2.5 → −3. (Half-away-from-zero is exactly
+/// `RoundingMode.half_up` — this legacy entry point now shares the one
+/// mode-aware implementation.)
 fn divRoundHalfAway(num: i256, den: i256) i256 {
+    return divRoundWithMode(num, den, .half_up);
+}
+
+/// Sign-aware rounded division: num / den with the discarded remainder
+/// resolved by `mode`. `den` must be non-zero.
+fn divRoundWithMode(num: i256, den: i256, mode: RoundingMode) i256 {
     const result_neg = (num < 0) != (den < 0);
     const n: i256 = if (num < 0) -num else num;
     const d: i256 = if (den < 0) -den else den;
+    const q = divRoundMag(n, d, result_neg, mode);
+    return if (result_neg) -q else q;
+}
+
+/// Rounded division on non-negative magnitudes: n/d with the discarded
+/// remainder resolved by `mode`; `result_neg` is the sign of the eventual
+/// result (the directed modes `ceiling`/`floor` depend on it). `d` must be
+/// positive. Half-way detection is exact integer math: `r == d - r` iff
+/// `2r == d` (written subtraction-side to rule out doubling overflow).
+fn divRoundMag(n: i256, d: i256, result_neg: bool, mode: RoundingMode) i256 {
     var q = @divTrunc(n, d);
     const r = @rem(n, d);
-    if (r * 2 >= d) q += 1; // a tie (or more) rounds up, away from zero
-    return if (result_neg) -q else q;
+    if (r != 0) {
+        const bump = switch (mode) {
+            .up => true,
+            .down => false,
+            .ceiling => !result_neg,
+            .floor => result_neg,
+            .half_up => r >= d - r,
+            .half_down => r > d - r,
+            .half_even => if (r != d - r) r > d - r else @rem(q, 2) != 0,
+        };
+        if (bump) q += 1;
+    }
+    return q;
+}
+
+/// Rounding decision for a quotient whose magnitude is a fraction strictly
+/// inside (0, 1/2): the truncated quotient is 0 and no half-way tie is
+/// possible, so only the away-from-zero directions produce a nonzero result.
+fn roundsAwayWhenBelowHalf(result_neg: bool, mode: RoundingMode) bool {
+    return switch (mode) {
+        .up => true,
+        .ceiling => !result_neg,
+        .floor => result_neg,
+        .down, .half_up, .half_down, .half_even => false,
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -547,4 +707,140 @@ test "std.fmt {f} integration" {
     var buf: [64]u8 = undefined;
     const s = try std.fmt.bufPrint(&buf, "{f}", .{dec("-12.75")});
     try testing.expectEqualStrings("-12.75", s);
+}
+
+// ---------------------------------------------------------------------------
+// RoundingMode tests — clean-room: expected values hand-derived from the Java
+// BigDecimal.RoundingMode javadoc table, the IBM General Decimal Arithmetic
+// spec and the Python `decimal` docs (definitions only, no code copied).
+// ---------------------------------------------------------------------------
+
+test "rounding truth table — all modes at scale 0 (BigDecimal javadoc inputs)" {
+    try testing.expect(RoundingMode.default == .half_even);
+    const modes = [_]RoundingMode{ .up, .down, .ceiling, .floor, .half_up, .half_down, .half_even };
+    const Case = struct { in: []const u8, want: [7][]const u8 };
+    // Column order matches `modes`: up, down, ceiling, floor, half_up,
+    // half_down, half_even.
+    const cases = [_]Case{
+        .{ .in = "5.5", .want = .{ "6", "5", "6", "5", "6", "5", "6" } },
+        .{ .in = "3.5", .want = .{ "4", "3", "4", "3", "4", "3", "4" } },
+        .{ .in = "2.6", .want = .{ "3", "2", "3", "2", "3", "3", "3" } },
+        .{ .in = "2.5", .want = .{ "3", "2", "3", "2", "3", "2", "2" } },
+        .{ .in = "2.4", .want = .{ "3", "2", "3", "2", "2", "2", "2" } },
+        .{ .in = "1.6", .want = .{ "2", "1", "2", "1", "2", "2", "2" } },
+        .{ .in = "1.1", .want = .{ "2", "1", "2", "1", "1", "1", "1" } },
+        .{ .in = "1.0", .want = .{ "1", "1", "1", "1", "1", "1", "1" } },
+        .{ .in = "-1.0", .want = .{ "-1", "-1", "-1", "-1", "-1", "-1", "-1" } },
+        .{ .in = "-1.1", .want = .{ "-2", "-1", "-1", "-2", "-1", "-1", "-1" } },
+        .{ .in = "-1.6", .want = .{ "-2", "-1", "-1", "-2", "-2", "-2", "-2" } },
+        .{ .in = "-2.4", .want = .{ "-3", "-2", "-2", "-3", "-2", "-2", "-2" } },
+        .{ .in = "-2.5", .want = .{ "-3", "-2", "-2", "-3", "-3", "-2", "-2" } },
+        .{ .in = "-2.6", .want = .{ "-3", "-2", "-2", "-3", "-3", "-3", "-3" } },
+        .{ .in = "-3.5", .want = .{ "-4", "-3", "-3", "-4", "-4", "-3", "-4" } },
+        .{ .in = "-5.5", .want = .{ "-6", "-5", "-5", "-6", "-6", "-5", "-6" } },
+    };
+    for (cases) |c| {
+        const v = dec(c.in);
+        for (modes, c.want) |m, w| {
+            try expectStr(try v.roundToIntegral(m), w);
+        }
+    }
+}
+
+test "half-way at two fractional digits — every mode, both signs" {
+    // 0.125 → 2 dp: the discarded remainder is an exact half.
+    try expectStr(try dec("0.125").rescale(2, .half_even), "0.12"); // 12 even → stay
+    try expectStr(try dec("0.135").rescale(2, .half_even), "0.14"); // 13 odd → bump
+    try expectStr(try dec("0.125").rescale(2, .half_up), "0.13");
+    try expectStr(try dec("0.125").rescale(2, .half_down), "0.12");
+    try expectStr(try dec("0.125").rescale(2, .up), "0.13");
+    try expectStr(try dec("0.125").rescale(2, .down), "0.12");
+    try expectStr(try dec("0.125").rescale(2, .ceiling), "0.13");
+    try expectStr(try dec("0.125").rescale(2, .floor), "0.12");
+    try expectStr(try dec("-0.125").rescale(2, .half_even), "-0.12");
+    try expectStr(try dec("-0.125").rescale(2, .half_up), "-0.13");
+    try expectStr(try dec("-0.125").rescale(2, .half_down), "-0.12");
+    try expectStr(try dec("-0.125").rescale(2, .up), "-0.13");
+    try expectStr(try dec("-0.125").rescale(2, .down), "-0.12");
+    try expectStr(try dec("-0.125").rescale(2, .ceiling), "-0.12");
+    try expectStr(try dec("-0.125").rescale(2, .floor), "-0.13");
+}
+
+test "rescale — scale up exact, scale down rounds, overflow is typed" {
+    // Scale-up / identity: at or above the internal 12-digit precision.
+    try testing.expect((try dec("1.5").rescale(12, .down)).eql(dec("1.5")));
+    try testing.expect((try dec("1.5").rescale(30, .down)).eql(dec("1.5")));
+    // Exact when nothing is discarded — the mode is irrelevant.
+    try expectStr(try dec("1.5").rescale(4, .floor), "1.5");
+    try expectStr(try dec("-2.44").rescale(2, .up), "-2.44");
+    // Negative scale rounds to tens/hundreds.
+    try expectStr(try dec("1250").rescale(-2, .half_even), "1200"); // 12.5 tie → 12 (even)
+    try expectStr(try dec("1250").rescale(-2, .half_up), "1300");
+    try expectStr(try dec("1350").rescale(-2, .half_even), "1400"); // 13.5 tie → 14 (even)
+    // Rounding place beyond the whole range: toward zero → 0, away → error.
+    try expectStr(try dec("5").rescale(-40, .down), "0");
+    try expectStr(try dec("-5").rescale(-40, .half_even), "0");
+    try testing.expectError(error.Overflow, dec("5").rescale(-40, .up));
+    try testing.expectError(error.Overflow, dec("-5").rescale(-40, .floor));
+    // At the i128 boundary a step outward is unrepresentable → error.Overflow.
+    const near_max = Decimal{ .raw = std.math.maxInt(i128) };
+    try testing.expectError(error.Overflow, near_max.rescale(0, .ceiling));
+    try expectStr(try near_max.rescale(0, .floor), "170141183460469231731687303");
+    const near_min = Decimal{ .raw = std.math.minInt(i128) };
+    try testing.expectError(error.Overflow, near_min.rescale(0, .floor));
+    try expectStr(try near_min.rescale(0, .ceiling), "-170141183460469231731687303");
+}
+
+test "divRound — quotient at an explicit scale" {
+    try expectStr(try dec("1").divRound(dec("3"), 4, .half_even), "0.3333");
+    try expectStr(try dec("2").divRound(dec("3"), 4, .half_even), "0.6667");
+    try expectStr(try dec("1").divRound(dec("8"), 3, .down), "0.125"); // exact — mode moot
+    try expectStr(try dec("1").divRound(dec("8"), 3, .up), "0.125");
+    try expectStr(try dec("10").divRound(dec("4"), 1, .half_even), "2.5");
+    try expectStr(try dec("10").divRound(dec("4"), 0, .half_even), "2"); // 2.5 tie → even
+    try expectStr(try dec("10").divRound(dec("4"), 0, .half_up), "3");
+    try expectStr(try dec("7").divRound(dec("2"), 0, .half_even), "4"); // 3.5 tie → even
+    try expectStr(try dec("7").divRound(dec("2"), 0, .half_down), "3");
+    // Directed modes on a non-terminating quotient, both signs.
+    try expectStr(try dec("1").divRound(dec("3"), 4, .ceiling), "0.3334");
+    try expectStr(try dec("1").divRound(dec("3"), 4, .floor), "0.3333");
+    try expectStr(try dec("-1").divRound(dec("3"), 4, .half_even), "-0.3333");
+    try expectStr(try dec("-1").divRound(dec("3"), 4, .ceiling), "-0.3333");
+    try expectStr(try dec("-1").divRound(dec("3"), 4, .floor), "-0.3334");
+    try expectStr(try dec("-1").divRound(dec("3"), 4, .up), "-0.3334");
+    try expectStr(try dec("-1").divRound(dec("3"), 4, .down), "-0.3333");
+    // result_scale above 12 clamps to the representation's precision ceiling.
+    try testing.expect((try dec("1").divRound(dec("3"), 20, .down)).eql(dec("0.333333333333")));
+    // Negative scale: 100/3 = 33.33… rounded to tens.
+    try expectStr(try dec("100").divRound(dec("3"), -1, .half_even), "30");
+    try expectStr(try dec("100").divRound(dec("3"), -1, .up), "40");
+}
+
+test "divRound — errors and edges" {
+    try testing.expectError(error.DivisionByZero, dec("1").divRound(Decimal.zero, 2, .half_even));
+    // 2e14 / 1e-12 = 2e26, beyond the ±1.7e26 range → typed overflow.
+    try testing.expectError(
+        error.Overflow,
+        dec("200000000000000").divRound(dec("0.000000000001"), 12, .half_even),
+    );
+    // Zero dividend is zero at any scale and any mode.
+    try testing.expect((try Decimal.zero.divRound(dec("3"), -100, .up)).isZero());
+    // A rounding place too coarse for any nonzero value: toward zero → 0,
+    // away from zero → the ±10^40 result overflows → error.
+    try expectStr(try dec("5").divRound(dec("1"), -40, .down), "0");
+    try testing.expectError(error.Overflow, dec("5").divRound(dec("1"), -40, .up));
+    try expectStr(try dec("5").divRound(dec("1"), -100, .half_even), "0");
+    try testing.expectError(error.Overflow, dec("-5").divRound(dec("1"), -100, .floor));
+}
+
+test "quantize — GDA/Python-style exponent" {
+    try expectStr(try dec("1.2345").quantize(-2, .half_even), "1.23");
+    try expectStr(try dec("2.665").quantize(-2, .half_even), "2.66"); // tie, 66 even
+    try expectStr(try dec("2.665").quantize(-2, .half_up), "2.67");
+    try expectStr(try dec("2.675").quantize(-2, .half_even), "2.68"); // tie, 67 odd
+    try expectStr(try dec("1250").quantize(2, .half_even), "1200"); // +2 → hundreds
+    try expectStr(try dec("1250").quantize(2, .half_up), "1300");
+    try expectStr(try dec("1.5").quantize(-12, .down), "1.5"); // exponent −12 = full precision
+    try expectStr(try dec("1.5").quantize(-30, .down), "1.5"); // beyond precision: exact
+    try testing.expectError(error.Overflow, dec("5").quantize(40, .up));
 }

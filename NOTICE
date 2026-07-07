@@ -175,4 +175,12 @@ audit is pending before any public release.
                libuci source was consulted or copied; the file format is the
                documented interface.
 
+  decimal    — extracted from the authors' bxp project (Apache-2.0, relicensed
+               MIT). The rounding modes (half_even/half_up/half_down/up/down/
+               ceiling/floor + rescale/quantize/divRound) are clean-room from
+               the published definitions: Java BigDecimal.RoundingMode javadoc,
+               the IBM General Decimal Arithmetic specification, and the Python
+               `decimal` docs — definitions/truth-tables only, no source code
+               consulted or copied.
+
 See each module's README "Provenance" note for its specific seed and reference.

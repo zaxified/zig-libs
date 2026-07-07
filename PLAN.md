@@ -35,6 +35,12 @@ zig-libs exists to ship the **good** version of each library, not a copy of the 
   license so NOTICE records the design ref. (Ongoing so the pre-public audit has material.)
 
 **DONE (Fable, value-add, 2026-07-07):**
+- `decimal` **+ rounding modes** ✅ — added `RoundingMode` (half_even default / half_up / half_down /
+  up / down / ceiling / floor) with `rescale`, `roundToIntegral`, `quantize`, and `divRound`
+  (rounded division at a target scale — the piece exact fixed-point can't do). Pure i128, typed
+  Overflow/DivisionByZero, additive (existing API + 18 tests intact). 24 tests (6 new); BigDecimal
+  javadoc truth-table verified. Debug+ReleaseFast+fmt green. Clean-room from Java BigDecimal / IBM GDA
+  / Python decimal definitions (no source copied).
 - `netaddr` **+ CIDR/prefix ops** ✅ — added a `Prefix` type (parse/format/masked/contains/
   containsPrefix/overlaps/supernet/network/broadcast/firstHost/lastHost/hostCount + zero-alloc
   address iterator) and range↔prefix `summarize`/`mergePrefixes` (netipx IPSet algorithm), v4+v6,
