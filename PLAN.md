@@ -35,6 +35,11 @@ zig-libs exists to ship the **good** version of each library, not a copy of the 
   license so NOTICE records the design ref. (Ongoing so the pre-public audit has material.)
 
 **DONE (Fable, value-add, 2026-07-07):**
+- `netaddr` **+ CIDR/prefix ops** ✅ — added a `Prefix` type (parse/format/masked/contains/
+  containsPrefix/overlaps/supernet/network/broadcast/firstHost/lastHost/hostCount + zero-alloc
+  address iterator) and range↔prefix `summarize`/`mergePrefixes` (netipx IPSet algorithm), v4+v6,
+  all bit math on u128 big-endian, additive (existing API + 28 tests intact). 40 tests (12 new).
+  Debug+ReleaseFast+fmt green. Clean-room from Go net/netip + go4.org/netipx (BSD-3, behavior only).
 - `rdap` **NEW module** ✅ — `modules/rdap/src/root.zig` (~1100 L): RDAP (RFC 7480-7484/9082/9083)
   client — query-URL builder (domain/ip/autnum/nameserver/entity, percent-encoded, rdap+json Accept),
   tolerant typed JSON response model (objects/events/entities+jCard/nameservers/links/ip-net/autnum +

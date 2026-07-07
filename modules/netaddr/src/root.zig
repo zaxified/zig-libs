@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: MIT
 
-//! netaddr — IP address parse/format + RFC 6724 destination/source selection.
+//! netaddr — IP address parse/format, CIDR/prefix math + RFC 6724 selection.
 //!
 //! Pure address logic with no I/O dependency: IPv4/IPv6 literal parsing and
-//! RFC 5952 canonical formatting, `host:port` splitting, address scope/policy
-//! classification, and the RFC 6724 "which address do I connect to first"
-//! ordering that `http`, `dns` and `icmp` build on.
+//! RFC 5952 canonical formatting, `host:port` splitting, CIDR prefix
+//! operations (`Prefix`: mask/contains/overlap, host math, supernet, address
+//! iteration; `IpRange` with `summarize` and `mergePrefixes`), address
+//! scope/policy classification, and the RFC 6724 "which address do I connect
+//! to first" ordering that `http`, `dns` and `icmp` build on.
 //!
 //! The RFC 6724 logic is ported from zig-fping's `src/netutil.zig`
 //! (`sortByDestinationPolicy`, `policyPrecedence`, `destinationReachable`) and
@@ -14,7 +16,13 @@
 //! skipped (rule 3 deprecated addresses, rule 4 home addresses, rule 7 native
 //! transport).
 //!
-//! No allocation anywhere; everything works on caller-provided buffers/slices.
+//! The prefix/CIDR ops model after Go `net/netip.Prefix` + `go4.org/netipx`
+//! (behavior only, clean-room — implemented from documented semantics, not
+//! from their source).
+//!
+//! Scalar operations never allocate and work on caller-provided
+//! buffers/slices; only the slice-returning `summarize` and `mergePrefixes`
+//! allocate, via a caller-passed allocator.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -24,7 +32,7 @@ pub const meta = .{
     .platform = .any, // pure logic; `systemSource` helper is Linux-only
     .role = .util,
     .concurrency = .reentrant,
-    .model_after = "Go net/addrselect.go + glibc getaddrinfo (RFC 6724)",
+    .model_after = "Go net/addrselect.go + glibc getaddrinfo (RFC 6724); Go net/netip.Prefix + go4.org/netipx (CIDR/prefix ops)",
     .deps = .{}, // std only
 };
 
@@ -300,6 +308,348 @@ fn parsePort(text: []const u8) ?u16 {
         v = v * 10 + (c - '0');
     }
     return if (v <= std.math.maxInt(u16)) @intCast(v) else null;
+}
+
+// ── CIDR prefixes ───────────────────────────────────────────────────────────
+//
+// Model after Go `net/netip.Prefix` + `go4.org/netipx` (IPSet normalize /
+// range summarize) — behavior only, clean-room. All bit math is done on the
+// address as an unsigned integer in big-endian (network) byte order, so
+// numeric comparison matches address order for both families.
+
+/// Address family tag (`.v4` / `.v6`) of the `Ip` union.
+const IpFamily = std.meta.Tag(Ip);
+
+fn widthOf(ip: Ip) u8 {
+    return switch (ip) {
+        .v4 => 32,
+        .v6 => 128,
+    };
+}
+
+/// The address value as an unsigned integer in the low `widthOf(ip)` bits.
+fn ipToInt(ip: Ip) u128 {
+    return switch (ip) {
+        .v4 => |q| std.mem.readInt(u32, &q, .big),
+        .v6 => |b| std.mem.readInt(u128, &b, .big),
+    };
+}
+
+fn ipFromInt(fam: IpFamily, value: u128) Ip {
+    switch (fam) {
+        .v4 => {
+            var q: [4]u8 = undefined;
+            std.mem.writeInt(u32, &q, @truncate(value), .big);
+            return .{ .v4 = q };
+        },
+        .v6 => {
+            var b: [16]u8 = undefined;
+            std.mem.writeInt(u128, &b, value, .big);
+            return .{ .v6 = b };
+        },
+    }
+}
+
+/// Network mask for a `bits`-long prefix in a `width`-bit family, as ones in
+/// the low `width` bits. `bits` is clamped to `width`; never panics.
+fn netMask(width: u8, bits: u8) u128 {
+    const b = @min(bits, width);
+    if (b == 0) return 0;
+    const host: u7 = @intCast(width - b); // b >= 1 → host <= 127
+    const all: u128 = if (width == 128)
+        std.math.maxInt(u128)
+    else
+        (@as(u128, 1) << @intCast(width)) - 1;
+    return all & ~((@as(u128, 1) << host) - 1);
+}
+
+/// Host mask: the complement of `netMask` within the family width.
+fn hostMask(width: u8, bits: u8) u128 {
+    const host = width - @min(bits, width);
+    if (host >= 128) return std.math.maxInt(u128);
+    return (@as(u128, 1) << @intCast(host)) - 1;
+}
+
+/// Enough for any output of `formatPrefix` (`max_ip_text_len` + "/128").
+pub const max_prefix_text_len = max_ip_text_len + 4;
+
+/// An IP network in CIDR notation: an address plus a prefix length. The
+/// address may carry host bits (`192.0.2.5/24` is representable; every
+/// operation masks internally — call `masked` for the canonical network
+/// form). The v4/v6 distinction is strict: a v4 prefix never contains an
+/// IPv4-mapped v6 address — `Ip.unmap` inputs first when mixing is possible.
+pub const Prefix = struct {
+    addr: Ip,
+    bits: u8,
+
+    pub fn eql(a: Prefix, b: Prefix) bool {
+        return a.bits == b.bits and a.addr.eql(b.addr);
+    }
+
+    /// Family width in bits: 32 for v4, 128 for v6.
+    pub fn width(p: Prefix) u8 {
+        return widthOf(p.addr);
+    }
+
+    /// True when the prefix denotes exactly one address (/32 or /128).
+    pub fn isSingleIp(p: Prefix) bool {
+        return p.bits >= p.width();
+    }
+
+    /// Canonical form: host bits zeroed and `bits` clamped to the family
+    /// width. `192.0.2.5/24` → `192.0.2.0/24`.
+    pub fn masked(p: Prefix) Prefix {
+        const w = p.width();
+        const b = @min(p.bits, w);
+        return .{
+            .addr = ipFromInt(std.meta.activeTag(p.addr), ipToInt(p.addr) & netMask(w, b)),
+            .bits = b,
+        };
+    }
+
+    /// The network address (the `masked` address; both families).
+    pub fn network(p: Prefix) Ip {
+        return p.masked().addr;
+    }
+
+    /// The v4 directed-broadcast address (host bits all-ones); null for v6,
+    /// which has no broadcast. For /31 and /32 this is simply the last
+    /// address (RFC 3021 point-to-point links have no broadcast either).
+    pub fn broadcast(p: Prefix) ?Ip {
+        if (p.addr != .v4) return null;
+        const net = ipToInt(p.addr) & netMask(32, p.bits);
+        return ipFromInt(.v4, net | hostMask(32, p.bits));
+    }
+
+    /// First usable host address: network + 1 for v4 prefixes up to /30;
+    /// the network address itself for v4 /31 + /32 (RFC 3021) and for v6.
+    pub fn firstHost(p: Prefix) Ip {
+        const w = p.width();
+        const b = @min(p.bits, w);
+        const net = ipToInt(p.addr) & netMask(w, b);
+        const reserve = p.addr == .v4 and b <= 30;
+        return ipFromInt(std.meta.activeTag(p.addr), if (reserve) net + 1 else net);
+    }
+
+    /// Last usable host address: broadcast − 1 for v4 prefixes up to /30;
+    /// the last address for v4 /31 + /32 (RFC 3021) and for v6.
+    pub fn lastHost(p: Prefix) Ip {
+        const w = p.width();
+        const b = @min(p.bits, w);
+        const last = (ipToInt(p.addr) & netMask(w, b)) | hostMask(w, b);
+        const reserve = p.addr == .v4 and b <= 30;
+        return ipFromInt(std.meta.activeTag(p.addr), if (reserve) last - 1 else last);
+    }
+
+    /// Number of addresses the prefix covers (2^host-bits), saturating at
+    /// `maxInt(u128)` for a v6 /0.
+    pub fn hostCount(p: Prefix) u128 {
+        const w = p.width();
+        const host = w - @min(p.bits, w);
+        if (host >= 128) return std.math.maxInt(u128);
+        return @as(u128, 1) << @intCast(host);
+    }
+
+    /// True when `ip` falls inside the prefix. Family-checked: always false
+    /// across v4/v6 (including IPv4-mapped v6 against a v4 prefix).
+    pub fn contains(p: Prefix, ip: Ip) bool {
+        if (std.meta.activeTag(p.addr) != std.meta.activeTag(ip)) return false;
+        const m = netMask(p.width(), p.bits);
+        return (ipToInt(ip) & m) == (ipToInt(p.addr) & m);
+    }
+
+    /// True when `other` is a subnet of (or equal to) `p`.
+    pub fn containsPrefix(p: Prefix, other: Prefix) bool {
+        if (std.meta.activeTag(p.addr) != std.meta.activeTag(other.addr)) return false;
+        const w = p.width();
+        if (@min(other.bits, w) < @min(p.bits, w)) return false;
+        return p.contains(other.addr);
+    }
+
+    /// True when the two prefixes share at least one address.
+    pub fn overlaps(p: Prefix, other: Prefix) bool {
+        if (std.meta.activeTag(p.addr) != std.meta.activeTag(other.addr)) return false;
+        const w = p.width();
+        const m = netMask(w, @min(@min(p.bits, w), @min(other.bits, w)));
+        return (ipToInt(p.addr) & m) == (ipToInt(other.addr) & m);
+    }
+
+    /// The enclosing prefix at `new_bits` (a shorter prefix length), masked.
+    /// Null when `new_bits` is longer than `p.bits`; never panics.
+    pub fn supernet(p: Prefix, new_bits: u8) ?Prefix {
+        if (new_bits > @min(p.bits, p.width())) return null;
+        return (Prefix{ .addr = p.addr, .bits = new_bits }).masked();
+    }
+
+    /// The inclusive address range the prefix covers (network … last).
+    pub fn range(p: Prefix) IpRange {
+        const w = p.width();
+        const net = ipToInt(p.addr) & netMask(w, p.bits);
+        const fam = std.meta.activeTag(p.addr);
+        return .{
+            .from = ipFromInt(fam, net),
+            .to = ipFromInt(fam, net | hostMask(w, p.bits)),
+        };
+    }
+
+    /// Iterate every address in the prefix, network to last address.
+    /// Caller-driven and allocation-free; host bits are masked away first.
+    pub fn addresses(p: Prefix) AddrIterator {
+        const r = p.range();
+        return .{
+            .family = std.meta.activeTag(p.addr),
+            .cur = ipToInt(r.from),
+            .last = ipToInt(r.to),
+        };
+    }
+};
+
+/// Parse CIDR notation (`192.0.2.0/24`, `2001:db8::/32`). The address part
+/// may carry host bits (tolerated; see `Prefix.masked`); the prefix length
+/// must be decimal without leading zeros and at most 32 for v4 / 128 for v6.
+/// Returns null on malformed input; never panics.
+pub fn parsePrefix(text: []const u8) ?Prefix {
+    const slash = std.mem.indexOfScalar(u8, text, '/') orelse return null;
+    const addr = parseIp(text[0..slash]) orelse return null;
+    const bits_text = text[slash + 1 ..];
+    if (bits_text.len == 0 or bits_text.len > 3) return null;
+    if (bits_text.len > 1 and bits_text[0] == '0') return null;
+    var v: u16 = 0;
+    for (bits_text) |c| {
+        if (c < '0' or c > '9') return null;
+        v = v * 10 + (c - '0');
+    }
+    if (v > widthOf(addr)) return null;
+    return .{ .addr = addr, .bits = @intCast(v) };
+}
+
+/// Format as CIDR notation, the address part canonical per `formatIp`.
+/// Asserts `buf.len >= max_prefix_text_len`.
+pub fn formatPrefix(p: Prefix, buf: []u8) []const u8 {
+    std.debug.assert(buf.len >= max_prefix_text_len);
+    const ip_text = formatIp(p.addr, buf);
+    const bits_text = std.fmt.bufPrint(buf[ip_text.len..], "/{d}", .{p.bits}) catch unreachable;
+    return buf[0 .. ip_text.len + bits_text.len];
+}
+
+/// An inclusive address range. Well-formed when both ends share a family and
+/// `from <= to`; `summarize` rejects anything else with `InvalidRange`.
+pub const IpRange = struct { from: Ip, to: Ip };
+
+/// Caller-driven address iterator (see `Prefix.addresses`).
+pub const AddrIterator = struct {
+    family: IpFamily,
+    cur: u128,
+    last: u128,
+    done: bool = false,
+
+    pub fn next(it: *AddrIterator) ?Ip {
+        if (it.done) return null;
+        const ip = ipFromInt(it.family, it.cur);
+        if (it.cur == it.last) it.done = true else it.cur += 1;
+        return ip;
+    }
+};
+
+pub const SummarizeError = error{ OutOfMemory, InvalidRange };
+
+/// Aggregate an inclusive range into the minimal ordered list of CIDR
+/// prefixes covering exactly that range (the netipx range-summarize
+/// algorithm). `InvalidRange` on a family mismatch or `from > to`. Caller
+/// owns the returned slice.
+pub fn summarize(gpa: std.mem.Allocator, r: IpRange) SummarizeError![]Prefix {
+    const fam = std.meta.activeTag(r.from);
+    if (fam != std.meta.activeTag(r.to)) return error.InvalidRange;
+    const from = ipToInt(r.from);
+    const to = ipToInt(r.to);
+    if (from > to) return error.InvalidRange;
+    var out: std.ArrayList(Prefix) = .empty;
+    errdefer out.deinit(gpa);
+    try appendRangePrefixes(gpa, &out, fam, from, to);
+    return out.toOwnedSlice(gpa);
+}
+
+/// Append the minimal prefixes covering `[from, to]` (in-family values,
+/// `from <= to`). Greedy: at each step emit the largest block that starts at
+/// `from` (limited by alignment) and still fits inside the range.
+fn appendRangePrefixes(
+    gpa: std.mem.Allocator,
+    out: *std.ArrayList(Prefix),
+    fam: IpFamily,
+    from: u128,
+    to: u128,
+) error{OutOfMemory}!void {
+    const w: u8 = switch (fam) {
+        .v4 => 32,
+        .v6 => 128,
+    };
+    var cur = from;
+    while (true) {
+        // Host bits of the block: limited by the alignment of `cur`
+        // (trailing zeros) and by how much of the range remains.
+        const tz: u8 = @min(w, @ctz(cur));
+        const span = to - cur; // invariant: cur <= to
+        const avail: u8 = if (span == std.math.maxInt(u128))
+            128 // whole v6 space; span + 1 would overflow
+        else
+            @intCast(127 - @clz(span + 1)); // floor(log2(addresses left))
+        const h = @min(tz, avail);
+        const block_hosts: u128 = if (h == 128)
+            std.math.maxInt(u128)
+        else
+            (@as(u128, 1) << @intCast(h)) - 1;
+        try out.append(gpa, .{ .addr = ipFromInt(fam, cur), .bits = w - h });
+        const block_last = cur + block_hosts; // cur is 2^h-aligned: no overflow
+        if (block_last >= to) return;
+        cur = block_last + 1;
+    }
+}
+
+const RangeKey = struct { fam: IpFamily, from: u128, to: u128 };
+
+fn rangeKeyLess(_: void, a: RangeKey, b: RangeKey) bool {
+    if (a.fam != b.fam) return @intFromEnum(a.fam) < @intFromEnum(b.fam);
+    if (a.from != b.from) return a.from < b.from;
+    return a.to < b.to;
+}
+
+/// Coalesce a prefix list: mask every prefix, then merge overlapping and
+/// adjacent ones into the minimal equivalent prefix list (the netipx IPSet
+/// normalize step). v4 and v6 never merge with each other; the result is
+/// sorted (v4 first, then by address). Caller owns the returned slice.
+pub fn mergePrefixes(gpa: std.mem.Allocator, prefixes: []const Prefix) error{OutOfMemory}![]Prefix {
+    const ranges = try gpa.alloc(RangeKey, prefixes.len);
+    defer gpa.free(ranges);
+    for (prefixes, ranges) |p, *rk| {
+        const r = p.range();
+        rk.* = .{
+            .fam = std.meta.activeTag(p.addr),
+            .from = ipToInt(r.from),
+            .to = ipToInt(r.to),
+        };
+    }
+    std.sort.pdq(RangeKey, ranges, {}, rangeKeyLess);
+
+    var out: std.ArrayList(Prefix) = .empty;
+    errdefer out.deinit(gpa);
+    var i: usize = 0;
+    while (i < ranges.len) {
+        const fam = ranges[i].fam;
+        const from = ranges[i].from;
+        var to = ranges[i].to;
+        var j = i + 1;
+        // Absorb every overlapping or directly adjacent range. When `to` is
+        // the family maximum the first clause already matches everything, so
+        // `to + 1` below can never overflow.
+        while (j < ranges.len and ranges[j].fam == fam and
+            (ranges[j].from <= to or ranges[j].from == to + 1)) : (j += 1)
+        {
+            to = @max(to, ranges[j].to);
+        }
+        try appendRangePrefixes(gpa, &out, fam, from, to);
+        i = j;
+    }
+    return out.toOwnedSlice(gpa);
 }
 
 // ── RFC 6724 classification ─────────────────────────────────────────────────
@@ -943,4 +1293,270 @@ test "Ip classification helpers" {
     try testing.expect(mkIp("::ffff:1.2.3.4").isIpv4Mapped());
     try testing.expect(!mkIp("1.2.3.4").isIpv4Mapped());
     try testing.expect(mkIp("::ffff:1.2.3.4").unmap().eql(mkIp("1.2.3.4")));
+}
+
+// ── tests: prefixes / CIDR ──────────────────────────────────────────────────
+
+fn mkPrefix(text: []const u8) Prefix {
+    return parsePrefix(text).?;
+}
+
+fn expectPrefixText(expected: []const u8, p: Prefix) !void {
+    var buf: [max_prefix_text_len]u8 = undefined;
+    try testing.expectEqualStrings(expected, formatPrefix(p, &buf));
+}
+
+fn expectIpText(expected: []const u8, ip: Ip) !void {
+    var buf: [max_ip_text_len]u8 = undefined;
+    try testing.expectEqualStrings(expected, formatIp(ip, &buf));
+}
+
+fn expectPrefixList(expected: []const []const u8, got: []const Prefix) !void {
+    try testing.expectEqual(expected.len, got.len);
+    for (expected, got) |e, p| try expectPrefixText(e, p);
+}
+
+test "parsePrefix accepts CIDR notation" {
+    const p4 = mkPrefix("192.0.2.0/24");
+    try testing.expect(p4.addr.eql(mkIp("192.0.2.0")));
+    try testing.expectEqual(@as(u8, 24), p4.bits);
+    const p6 = mkPrefix("2001:db8::/32");
+    try testing.expect(p6.addr.eql(mkIp("2001:db8::")));
+    try testing.expectEqual(@as(u8, 32), p6.bits);
+    // Host bits tolerated; /0 and full-width accepted.
+    try testing.expect(parsePrefix("192.0.2.5/24") != null);
+    try testing.expect(parsePrefix("0.0.0.0/0") != null);
+    try testing.expect(parsePrefix("192.0.2.1/32") != null);
+    try testing.expect(parsePrefix("::/0") != null);
+    try testing.expect(parsePrefix("2001:db8::1/128") != null);
+}
+
+test "parsePrefix rejects malformed input" {
+    const bad = [_][]const u8{
+        "",              "192.0.2.0",       "192.0.2.0/",     "/24",
+        "192.0.2.0/33",  "192.0.2.0/64",    "2001:db8::/129", "192.0.2.0/-1",
+        "192.0.2.0/024", "192.0.2.0/2 4",   "192.0.2.0/a",    "192.0.2.0//24",
+        "1.2.3/24",      "2001:db8::/1281",
+    };
+    for (bad) |t| try testing.expect(parsePrefix(t) == null);
+}
+
+test "formatPrefix and masked canonicalization" {
+    try expectPrefixText("192.0.2.5/24", mkPrefix("192.0.2.5/24")); // host bits kept
+    try expectPrefixText("192.0.2.0/24", mkPrefix("192.0.2.5/24").masked());
+    try expectPrefixText("2001:db8::/32", mkPrefix("2001:db8:ffff::1/32").masked());
+    try expectPrefixText("0.0.0.0/0", mkPrefix("255.255.255.255/0").masked());
+    try expectPrefixText("::/0", mkPrefix("2001:db8::1/0").masked());
+    // masked is idempotent on already-canonical prefixes.
+    try testing.expect(mkPrefix("10.0.0.0/8").masked().eql(mkPrefix("10.0.0.0/8")));
+}
+
+test "Prefix.contains across boundaries" {
+    const p = mkPrefix("192.0.2.0/24");
+    try testing.expect(p.contains(mkIp("192.0.2.0")));
+    try testing.expect(p.contains(mkIp("192.0.2.130")));
+    try testing.expect(p.contains(mkIp("192.0.2.255")));
+    try testing.expect(!p.contains(mkIp("192.0.1.255")));
+    try testing.expect(!p.contains(mkIp("192.0.3.0")));
+    // Host bits on the prefix address don't matter.
+    try testing.expect(mkPrefix("192.0.2.5/24").contains(mkIp("192.0.2.200")));
+    // v6.
+    const p6 = mkPrefix("2001:db8::/32");
+    try testing.expect(p6.contains(mkIp("2001:db8::1")));
+    try testing.expect(p6.contains(mkIp("2001:db8:ffff:ffff:ffff:ffff:ffff:ffff")));
+    try testing.expect(!p6.contains(mkIp("2001:db9::")));
+    try testing.expect(!p6.contains(mkIp("2001:db7:ffff::")));
+    // Family-checked: never true across v4/v6, even for mapped addresses.
+    try testing.expect(!p.contains(mkIp("2001:db8::1")));
+    try testing.expect(!p6.contains(mkIp("192.0.2.1")));
+    try testing.expect(!p.contains(mkIp("::ffff:192.0.2.1")));
+    // /0 contains the whole family; /32 only itself.
+    try testing.expect(mkPrefix("0.0.0.0/0").contains(mkIp("203.0.113.7")));
+    try testing.expect(mkPrefix("192.0.2.1/32").contains(mkIp("192.0.2.1")));
+    try testing.expect(!mkPrefix("192.0.2.1/32").contains(mkIp("192.0.2.2")));
+}
+
+test "containsPrefix and overlaps" {
+    const p8 = mkPrefix("10.0.0.0/8");
+    const p16 = mkPrefix("10.1.0.0/16");
+    try testing.expect(p8.containsPrefix(p16));
+    try testing.expect(!p16.containsPrefix(p8));
+    try testing.expect(p8.containsPrefix(p8));
+    try testing.expect(!p8.containsPrefix(mkPrefix("11.0.0.0/16")));
+    try testing.expect(!p8.containsPrefix(mkPrefix("2001:db8::/32")));
+
+    try testing.expect(p8.overlaps(p16));
+    try testing.expect(p16.overlaps(p8));
+    try testing.expect(p8.overlaps(p8));
+    try testing.expect(!mkPrefix("10.0.0.0/25").overlaps(mkPrefix("10.0.0.128/25")));
+    try testing.expect(!p8.overlaps(mkPrefix("11.0.0.0/8")));
+    try testing.expect(!p8.overlaps(mkPrefix("::/0"))); // family mismatch
+    const p6a = mkPrefix("2001:db8::/32");
+    const p6b = mkPrefix("2001:db8:aaaa::/48");
+    try testing.expect(p6a.overlaps(p6b) and p6a.containsPrefix(p6b));
+    try testing.expect(!p6b.overlaps(mkPrefix("2001:db8:bbbb::/48")));
+}
+
+test "network, broadcast, first/last host" {
+    const p = mkPrefix("192.0.2.5/24");
+    try expectIpText("192.0.2.0", p.network());
+    try expectIpText("192.0.2.255", p.broadcast().?);
+    try expectIpText("192.0.2.1", p.firstHost());
+    try expectIpText("192.0.2.254", p.lastHost());
+    // /31 + /32: no network/broadcast reservation (RFC 3021).
+    const p31 = mkPrefix("192.0.2.0/31");
+    try expectIpText("192.0.2.0", p31.firstHost());
+    try expectIpText("192.0.2.1", p31.lastHost());
+    const p32 = mkPrefix("192.0.2.9/32");
+    try expectIpText("192.0.2.9", p32.firstHost());
+    try expectIpText("192.0.2.9", p32.lastHost());
+    // v6 has no broadcast; hosts span the whole prefix.
+    const p6 = mkPrefix("2001:db8::/64");
+    try testing.expect(p6.broadcast() == null);
+    try expectIpText("2001:db8::", p6.firstHost());
+    try expectIpText("2001:db8::ffff:ffff:ffff:ffff", p6.lastHost());
+}
+
+test "hostCount" {
+    try testing.expectEqual(@as(u128, 256), mkPrefix("192.0.2.0/24").hostCount());
+    try testing.expectEqual(@as(u128, 2), mkPrefix("192.0.2.0/31").hostCount());
+    try testing.expectEqual(@as(u128, 1), mkPrefix("192.0.2.1/32").hostCount());
+    try testing.expectEqual(@as(u128, 1) << 32, mkPrefix("0.0.0.0/0").hostCount());
+    try testing.expectEqual(@as(u128, 1), mkPrefix("2001:db8::1/128").hostCount());
+    try testing.expectEqual(@as(u128, 1) << 64, mkPrefix("2001:db8::/64").hostCount());
+    // v6 /0 saturates (2^128 does not fit in u128).
+    try testing.expectEqual(std.math.maxInt(u128), mkPrefix("::/0").hostCount());
+}
+
+test "isSingleIp and supernet" {
+    try testing.expect(mkPrefix("192.0.2.1/32").isSingleIp());
+    try testing.expect(!mkPrefix("192.0.2.0/31").isSingleIp());
+    try testing.expect(mkPrefix("2001:db8::1/128").isSingleIp());
+    try testing.expect(!mkPrefix("2001:db8::/127").isSingleIp());
+
+    try expectPrefixText("192.0.2.0/24", mkPrefix("192.0.2.128/25").supernet(24).?);
+    try testing.expect(mkPrefix("192.0.2.0/24").supernet(25) == null); // longer → null
+    try expectPrefixText("0.0.0.0/0", mkPrefix("192.0.2.0/24").supernet(0).?);
+    try expectPrefixText("2001:db8::/32", mkPrefix("2001:db8:aaaa::/48").supernet(32).?);
+}
+
+test "address iterator yields the exact sequence" {
+    var it = mkPrefix("192.0.2.8/30").addresses();
+    try expectIpText("192.0.2.8", it.next().?);
+    try expectIpText("192.0.2.9", it.next().?);
+    try expectIpText("192.0.2.10", it.next().?);
+    try expectIpText("192.0.2.11", it.next().?);
+    try testing.expect(it.next() == null);
+    try testing.expect(it.next() == null); // stays exhausted
+
+    var single = mkPrefix("10.0.0.1/32").addresses();
+    try expectIpText("10.0.0.1", single.next().?);
+    try testing.expect(single.next() == null);
+
+    // Host bits are masked away before iterating.
+    var it6 = mkPrefix("2001:db8::1/127").addresses();
+    try expectIpText("2001:db8::", it6.next().?);
+    try expectIpText("2001:db8::1", it6.next().?);
+    try testing.expect(it6.next() == null);
+}
+
+test "summarize: minimal covering prefix list" {
+    const gpa = testing.allocator;
+    // 192.0.2.0–192.0.2.130 → /25 + /31 + /32.
+    {
+        const ps = try summarize(gpa, .{ .from = mkIp("192.0.2.0"), .to = mkIp("192.0.2.130") });
+        defer gpa.free(ps);
+        try expectPrefixList(&.{ "192.0.2.0/25", "192.0.2.128/31", "192.0.2.130/32" }, ps);
+    }
+    // Aligned range → a single prefix.
+    {
+        const ps = try summarize(gpa, .{ .from = mkIp("10.0.0.0"), .to = mkIp("10.0.0.255") });
+        defer gpa.free(ps);
+        try expectPrefixList(&.{"10.0.0.0/24"}, ps);
+    }
+    // Single address.
+    {
+        const ps = try summarize(gpa, .{ .from = mkIp("10.0.0.7"), .to = mkIp("10.0.0.7") });
+        defer gpa.free(ps);
+        try expectPrefixList(&.{"10.0.0.7/32"}, ps);
+    }
+    // v6 range.
+    {
+        const ps = try summarize(gpa, .{ .from = mkIp("2001:db8::"), .to = mkIp("2001:db8::5") });
+        defer gpa.free(ps);
+        try expectPrefixList(&.{ "2001:db8::/126", "2001:db8::4/127" }, ps);
+    }
+    // Whole address space (exercises the overflow-free paths).
+    {
+        const ps = try summarize(gpa, .{ .from = mkIp("0.0.0.0"), .to = mkIp("255.255.255.255") });
+        defer gpa.free(ps);
+        try expectPrefixList(&.{"0.0.0.0/0"}, ps);
+    }
+    {
+        const ps = try summarize(gpa, .{
+            .from = mkIp("::"),
+            .to = mkIp("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"),
+        });
+        defer gpa.free(ps);
+        try expectPrefixList(&.{"::/0"}, ps);
+    }
+    // Invalid ranges: reversed or family-mixed — an error, never a panic.
+    try testing.expectError(error.InvalidRange, summarize(gpa, .{
+        .from = mkIp("10.0.0.9"),
+        .to = mkIp("10.0.0.1"),
+    }));
+    try testing.expectError(error.InvalidRange, summarize(gpa, .{
+        .from = mkIp("10.0.0.1"),
+        .to = mkIp("2001:db8::1"),
+    }));
+}
+
+test "Prefix.range round-trips through summarize" {
+    const gpa = testing.allocator;
+    const cases = [_][]const u8{
+        "192.0.2.0/24",  "10.0.0.0/8",      "192.0.2.1/32", "0.0.0.0/0",
+        "2001:db8::/32", "2001:db8::1/128",
+    };
+    for (cases) |t| {
+        const p = mkPrefix(t);
+        const ps = try summarize(gpa, p.range());
+        defer gpa.free(ps);
+        try testing.expectEqual(@as(usize, 1), ps.len);
+        try testing.expect(ps[0].eql(p.masked()));
+    }
+}
+
+test "mergePrefixes coalesces adjacent and overlapping prefixes" {
+    const gpa = testing.allocator;
+    { // adjacent halves → the parent /24
+        const ps = try mergePrefixes(gpa, &.{ mkPrefix("10.0.0.0/25"), mkPrefix("10.0.0.128/25") });
+        defer gpa.free(ps);
+        try expectPrefixList(&.{"10.0.0.0/24"}, ps);
+    }
+    { // overlap: the /25 is inside the /24
+        const ps = try mergePrefixes(gpa, &.{ mkPrefix("10.0.0.0/24"), mkPrefix("10.0.0.128/25") });
+        defer gpa.free(ps);
+        try expectPrefixList(&.{"10.0.0.0/24"}, ps);
+    }
+    { // unsorted input, a disjoint island, v6 alongside v4
+        const ps = try mergePrefixes(gpa, &.{
+            mkPrefix("192.0.2.128/25"),
+            mkPrefix("2001:db8::/33"),
+            mkPrefix("10.0.0.0/24"),
+            mkPrefix("192.0.2.0/25"),
+            mkPrefix("2001:db8:8000::/33"),
+        });
+        defer gpa.free(ps);
+        try expectPrefixList(&.{ "10.0.0.0/24", "192.0.2.0/24", "2001:db8::/32" }, ps);
+    }
+    { // adjacent but not alignable: stays two prefixes
+        const ps = try mergePrefixes(gpa, &.{ mkPrefix("10.0.1.0/24"), mkPrefix("10.0.2.0/24") });
+        defer gpa.free(ps);
+        try expectPrefixList(&.{ "10.0.1.0/24", "10.0.2.0/24" }, ps);
+    }
+    { // empty input
+        const ps = try mergePrefixes(gpa, &.{});
+        defer gpa.free(ps);
+        try testing.expectEqual(@as(usize, 0), ps.len);
+    }
 }

@@ -49,6 +49,10 @@ audit is pending before any public release.
 
   netaddr    — RFC 6724, RFC 5952 (specs); cross-checked vs Go net/addrselect
                (BSD-3-Clause, The Go Authors) + glibc getaddrinfo algorithm.
+               The CIDR/prefix operations (Prefix, summarize, mergePrefixes)
+               model after Go net/netip.Prefix (BSD-3-Clause) and go4.org/
+               netipx (BSD-3-Clause) — behavior only, clean-room, no source
+               consulted or copied.
   http       — RFC 7230/9110 (HTTP/1.1) + RFC 7541 (HPACK header compression,
                static/Huffman tables and Appendix C vectors are the RFC's own
                data) + RFC 9113 (HTTP/2 framing + stream state machine + flow
