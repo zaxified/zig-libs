@@ -19,11 +19,19 @@
 //! Io implementation; the total timeout is checked between phases (connect,
 //! head read, redirect hops). TODO: enforce deadlines inside body reads via
 //! async races once needed.
+//!
+//! HTTP/2 (Phase 3.2, opt-in): `connectH2c` opens a **cleartext h2c**
+//! connection via prior knowledge (RFC 9113 §3.3) and returns an
+//! `H2Session` that multiplexes any number of requests over that one
+//! connection (the `h2_client` engine over this client's socket plumbing).
+//! The h1 `request` path is byte-for-byte unchanged — h2 is strictly
+//! opt-in; h2 over TLS (ALPN) arrives with the TLS-adapter seam later.
 
 const std = @import("std");
 const netaddr = @import("netaddr");
 const http = @import("root.zig");
 const h1 = @import("h1.zig");
+const h2_client = @import("h2_client.zig");
 const net = std.Io.net;
 const tls = std.crypto.tls;
 
@@ -330,6 +338,97 @@ pub fn putFile(c: *Client, url: []const u8, dir: std.Io.Dir, sub_path: []const u
     var res = try up.finish();
     defer res.deinit();
     return res.status;
+}
+
+// ── HTTP/2 cleartext (h2c, prior knowledge) ─────────────────────────────────
+
+/// One HTTP/2 cleartext connection (RFC 9113 §3.3 prior knowledge — the
+/// peer must speak h2c, e.g. `Server` with `enable_h2c`), multiplexing any
+/// number of requests: call `request` N times, then `awaitResponse` each
+/// returned stream id in any order. Created by `connectH2c`; released with
+/// `close`. Single-owner like the h1 client: one task drives a session.
+pub const H2Session = struct {
+    client: *Client,
+    stream: net.Stream,
+    sr: net.Stream.Reader,
+    sw: net.Stream.Writer,
+    session: h2_client.Session,
+    slab: []u8,
+    authority: []u8,
+
+    /// Start a request on its own stream (many may be in flight at once).
+    /// `:authority` defaults to the connected host[:port].
+    pub fn request(
+        hs: *H2Session,
+        method: http.Method,
+        path: []const u8,
+        options: h2_client.RequestOptions,
+    ) h2_client.Error!u31 {
+        var opts = options;
+        if (opts.authority == null) opts.authority = hs.authority;
+        return hs.session.request(method, path, opts);
+    }
+
+    /// Block until the response for `stream_id` is complete (pumping the
+    /// connection, which advances every in-flight stream) and hand it over.
+    pub fn awaitResponse(hs: *H2Session, stream_id: u31) h2_client.Error!h2_client.Response {
+        return hs.session.awaitResponse(stream_id);
+    }
+
+    /// Graceful GOAWAY (best effort), close the socket, free everything.
+    pub fn close(hs: *H2Session) void {
+        hs.session.shutdown();
+        hs.session.deinit();
+        hs.stream.close(hs.client.io);
+        const gpa = hs.client.gpa;
+        gpa.free(hs.authority);
+        gpa.free(hs.slab);
+        gpa.destroy(hs);
+    }
+};
+
+/// Open an HTTP/2 cleartext connection to `host:port` via prior knowledge
+/// (RFC 9113 §3.3): the client preface + SETTINGS are sent immediately.
+/// Reuses the client's connect plumbing (`connect_timeout_ms`, buffer
+/// sizing); the returned session multiplexes requests until `close`.
+pub fn connectH2c(c: *Client, host: []const u8, port: u16, options: h2_client.Options) Error!*H2Session {
+    const url: http.Url = .{ .scheme = .http, .host = host, .port = port, .path = "/", .query = "" };
+
+    // Default `:authority` — the wire form of the authority, brackets and
+    // non-default port included (same shape as the h1 Host header).
+    var auth_buf: [280]u8 = undefined;
+    var auth_w: std.Io.Writer = .fixed(&auth_buf);
+    url.writeHostHeaderValue(&auth_w) catch return error.BadUrl;
+
+    const hs = try c.gpa.create(H2Session);
+    errdefer c.gpa.destroy(hs);
+    const slab = try c.gpa.alloc(u8, c.options.read_buffer_size + c.options.write_buffer_size);
+    errdefer c.gpa.free(slab);
+    const authority = try c.gpa.dupe(u8, auth_w.buffered());
+    errdefer c.gpa.free(authority);
+
+    const stream = try c.connectStream(url);
+    errdefer stream.close(c.io);
+
+    hs.* = .{
+        .client = c,
+        .stream = stream,
+        .sr = undefined,
+        .sw = undefined,
+        .session = undefined,
+        .slab = slab,
+        .authority = authority,
+    };
+    // Reader/writer (and the session pointing at them) must be initialized
+    // at the connection's final heap address.
+    hs.sr = stream.reader(c.io, slab[0..c.options.read_buffer_size]);
+    hs.sw = stream.writer(c.io, slab[c.options.read_buffer_size..]);
+    hs.session = h2_client.Session.init(c.gpa, &hs.sr.interface, &hs.sw.interface, options) catch |err|
+        switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.WriteFailed,
+        };
+    return hs;
 }
 
 // ── connection internals ────────────────────────────────────────────────────
@@ -781,6 +880,155 @@ test "setupBody framing decisions on fabricated heads" {
     // Neither → read-until-close.
     setupBody(&conn, .get, try h1.ResponseHead.parse("HTTP/1.1 200 OK\r\n"));
     try testing.expect(conn.body == .until_close);
+}
+
+// ── tests (h2c dogfood: our h2 client against our h2c server, loopback) ─────
+
+const Server = @import("Server.zig");
+const h2 = @import("h2.zig");
+
+/// 200 KiB — far past the 65 535-octet initial flow-control window, so the
+/// response only completes if the client keeps granting WINDOW_UPDATEs.
+const huge_blocks = 200;
+
+fn h2LoopbackHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+    if (std.mem.eql(u8, req.path, "/hello")) {
+        try rw.setHeader("Content-Type", "text/plain");
+        try rw.writeAll("hello h2");
+    } else if (std.mem.eql(u8, req.path, "/echo")) {
+        var buf: [4096]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        _ = try req.reader().streamRemaining(&w);
+        try rw.writeAll(w.buffered());
+    } else if (std.mem.eql(u8, req.path, "/huge")) {
+        var block: [1024]u8 = undefined;
+        for (0..huge_blocks) |i| {
+            @memset(&block, 'A' + @as(u8, @intCast(i % 26)));
+            try rw.writeAll(&block);
+        }
+    } else {
+        rw.setStatus(404);
+        try rw.writeAll("nope");
+    }
+}
+
+fn h2ServeWrap(s: *Server) void {
+    s.serve() catch {};
+}
+
+fn h2LoopbackServer(io: std.Io) !*Server {
+    const server = try testing.allocator.create(Server);
+    errdefer testing.allocator.destroy(server);
+    server.* = Server.init(io, testing.allocator, .{
+        .handler = h2LoopbackHandler,
+        .enable_h2c = true,
+    });
+    server.bind() catch |err| {
+        server.deinit();
+        testing.allocator.destroy(server);
+        std.debug.print("loopback bind failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    return server;
+}
+
+test "h2c dogfood: GET, POST and multiplexed requests on one connection (loopback)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const server = try h2LoopbackServer(io);
+    defer testing.allocator.destroy(server);
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, h2ServeWrap, .{server});
+    defer thread.join();
+    defer server.shutdown();
+    const port = server.boundAddress().getPort();
+
+    var client = Client.init(io, gpa, .{});
+    defer client.deinit();
+    const hs = client.connectH2c("127.0.0.1", port, .{}) catch |err| {
+        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer hs.close();
+
+    { // GET: status + headers + body.
+        const sid = try hs.request(.get, "/hello", .{});
+        var res = try hs.awaitResponse(sid);
+        defer res.deinit(gpa);
+        try testing.expectEqual(@as(u16, 200), res.status);
+        try testing.expectEqualStrings("text/plain", res.header("content-type").?);
+        try testing.expectEqualStrings("hello h2", res.body);
+    }
+    { // POST: the body crosses and comes back through the shared handler.
+        const sid = try hs.request(.post, "/echo", .{ .body = "h2 upload body" });
+        var res = try hs.awaitResponse(sid);
+        defer res.deinit(gpa);
+        try testing.expectEqual(@as(u16, 200), res.status);
+        try testing.expectEqualStrings("h2 upload body", res.body);
+    }
+    { // Multiplexing: two requests in flight on the same connection before
+        // either response is read; collected in reverse order, each response
+        // must match its own request.
+        const sid_a = try hs.request(.post, "/echo", .{ .body = "first stream" });
+        const sid_b = try hs.request(.post, "/echo", .{ .body = "second stream" });
+        var res_b = try hs.awaitResponse(sid_b);
+        defer res_b.deinit(gpa);
+        var res_a = try hs.awaitResponse(sid_a);
+        defer res_a.deinit(gpa);
+        try testing.expectEqualStrings("second stream", res_b.body);
+        try testing.expectEqualStrings("first stream", res_a.body);
+    }
+    { // 404 still carries a full response (not an error).
+        const sid = try hs.request(.get, "/missing", .{});
+        var res = try hs.awaitResponse(sid);
+        defer res.deinit(gpa);
+        try testing.expectEqual(@as(u16, 404), res.status);
+    }
+}
+
+test "h2c dogfood: large response streams past the initial window (flow control, loopback)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const server = try h2LoopbackServer(io);
+    defer testing.allocator.destroy(server);
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, h2ServeWrap, .{server});
+    defer thread.join();
+    defer server.shutdown();
+    const port = server.boundAddress().getPort();
+
+    var client = Client.init(io, gpa, .{});
+    defer client.deinit();
+    const hs = client.connectH2c("127.0.0.1", port, .{}) catch |err| {
+        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer hs.close();
+
+    const sid = try hs.request(.get, "/huge", .{});
+    var res = try hs.awaitResponse(sid);
+    defer res.deinit(gpa);
+    try testing.expectEqual(@as(u16, 200), res.status);
+    try testing.expectEqual(@as(usize, huge_blocks * 1024), res.body.len);
+    for (0..huge_blocks) |i| {
+        const expected: u8 = 'A' + @as(u8, @intCast(i % 26));
+        try testing.expectEqual(expected, res.body[i * 1024]);
+        try testing.expectEqual(expected, res.body[i * 1024 + 1023]);
+    }
+    // §6.9 reconciliation: every received octet was granted back, so the
+    // connection receive window is back at its initial value — proof the
+    // WINDOW_UPDATE path actually ran (the server could not have finished
+    // a 200 KiB body inside a 64 KiB window otherwise).
+    try testing.expectEqual(
+        @as(i64, h2.default_initial_window_size),
+        hs.session.conn.conn_recv_window,
+    );
 }
 
 // ── tests (live network — skipped when unavailable) ─────────────────────────

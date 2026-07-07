@@ -8,7 +8,7 @@ Not a dumping ground: ship **solid, not many**. Most members are *extracted* fro
 across sibling projects (bxp, axp, zig-fping, poc-wf-analytic); a few fill genuine gaps in the Zig
 ecosystem.
 
-**Status:** 37 modules · 973 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 37 modules · 981 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ## Modules
@@ -20,7 +20,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 
 | Module | What it does | Deps |
 |---|---|---|
-| `http` | HTTP/1.1 client (TLS via `std.crypto.tls`) **and** server, hardened for direct exposure (peer addr, conn caps, size limits, slowloris timeouts, gzip). Also speaks **HTTP/2** — HPACK (RFC 7541) + framing/flow-control (RFC 9113) + an opt-in **h2c** server (same handler as h1), **DoS-hardened** (rapid-reset / CONTINUATION-flood / concurrent-stream / flood caps). Not `std.http`. | netaddr |
+| `http` | HTTP/1.1 client (TLS via `std.crypto.tls`) **and** server, hardened for direct exposure (peer addr, conn caps, size limits, slowloris timeouts, gzip). Also speaks **HTTP/2** (bidirectional) — HPACK (RFC 7541) + framing/flow-control (RFC 9113) + an opt-in **h2c** server (same handler as h1, **DoS-hardened**) + a **multiplexing h2 client**. Not `std.http`. | netaddr |
 | `router` | REST routing — trie matcher (params/wildcards), middleware chain, groups, 404/405 | http |
 | `ratelimit` | Token-bucket per-client rate limit → 429 + Retry-After | router, http |
 | `abuseguard` | Per-IP + global connection caps, ban/greylist, strike→ban (accept-time) | http, netaddr, router |

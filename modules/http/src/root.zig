@@ -16,7 +16,11 @@
 //! framing/state machine/flow control), and Phase 3.1 wires them into
 //! the server as opt-in cleartext h2c via prior knowledge
 //! (`Server.Options.enable_h2c`, RFC 9113 §3.3) — the same handler
-//! serves both protocols. Deliberately NOT built on `std.http` (API
+//! serves both protocols. Phase 3.2 adds the client side and makes the
+//! h2 stack bidirectional: `h2_client.Session` multiplexes requests
+//! over one connection, and `Client.connectH2c` binds it to a TCP
+//! stream (h2c prior knowledge; ALPN follows the TLS-adapter seam).
+//! Deliberately NOT built on `std.http` (API
 //! churn is the reason this module exists); client TLS is strictly
 //! `std.crypto.tls`.
 //!
@@ -56,7 +60,15 @@ pub const hpack = @import("hpack.zig");
 /// (`Server.Options.enable_h2c`, prior knowledge per RFC 9113 §3.3).
 pub const h2 = @import("h2.zig");
 
-/// The HTTP/1.1 client. See `Client.init` / `Client.request`.
+/// HTTP/2 client engine (Phase 3.2): `h2_client.Session` drives
+/// `h2.Connection` in client role over any byte transport, multiplexing
+/// requests (demux by stream id) with §5.2/§6.9 flow control and typed
+/// GOAWAY/RST_STREAM handling. `Client.connectH2c` binds it to a TCP
+/// stream for cleartext h2c via prior knowledge (RFC 9113 §3.3).
+pub const h2_client = @import("h2_client.zig");
+
+/// The HTTP/1.1 client (plus opt-in HTTP/2 h2c via `Client.connectH2c`).
+/// See `Client.init` / `Client.request`.
 pub const Client = @import("Client.zig");
 
 /// The HTTP/1.1 server: `Server.Request`, `Server.ResponseWriter`, the
@@ -318,6 +330,7 @@ test {
     _ = h1;
     _ = hpack;
     _ = h2;
+    _ = h2_client;
     _ = Client;
     _ = Server;
 }

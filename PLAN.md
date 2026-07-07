@@ -35,6 +35,15 @@ zig-libs exists to ship the **good** version of each library, not a copy of the 
   license so NOTICE records the design ref. (Ongoing so the pre-public audit has material.)
 
 **DONE (Fable, value-add, 2026-07-07):**
+- `http` **HTTP/2 client** ✅ (h2-completion batch 2) — new `modules/http/src/h2_client.zig` (704 L) +
+  `Client.zig` integration: a transport-free `Session` driving `h2.Connection` in client role
+  (preface+SETTINGS, `request` sends pseudo-headers+HEADERS[+DATA under flow control], `awaitResponse`
+  pumps + demuxes by stream id). **Real multiplexing** — N concurrent requests on one connection, an
+  `AutoArrayHashMap` stream-demux read loop, auto WINDOW_UPDATE replenish. `Client.connectH2c(host,
+  port)` reuses the h1 connect plumbing (h1 path byte-for-byte unchanged); shared Response type.
+  GOAWAY/RST semantics (§5.4.2/§6.8), never panics. 8 tests (164/164 http): dogfood GET/POST vs our
+  h2c server, 2 concurrent streams, 200 KiB body via live WINDOW_UPDATE, RST/GOAWAY/garbage negatives.
+  Debug+ReleaseFast+fmt green. Clean-room RFC 9113. **Stack is now bidirectional (h2 client + server).**
 - `http` **HTTP/2 DoS hardening** ✅ (h2-completion batch 1) — `h2.zig`/`h2_server.zig`: all the known
   h2 DoS mitigations, additive + configurable (safe defaults, so `enable_h2c=true` is hardened out of
   the box): **rapid-reset (CVE-2023-44487)** (reset-stream counter both directions → GOAWAY
@@ -232,8 +241,8 @@ zig-libs exists to ship the **good** version of each library, not a copy of the 
 1. **Network-tail:** `wireguard` ✅ → `traceroute` ✅ → `probe` ✅ — **COMPLETE.**
 2. **h2-completion** — decoupled from the stalled 0.17 TLS server. Batches:
    - ✅ **CVE hardening** (rapid-reset + CONTINUATION-flood + max-concurrent + flood budgets) — DONE.
-   - ☐ concurrent stream multiplexing (h2c server currently serves streams sequentially).
-   - ☐ **HTTP/2 client** — wire `h2.Connection` client role into `http.Client`.
+   - ✅ **HTTP/2 client** — `h2.Connection` client role wired into `http.Client` (multiplexing) — DONE.
+   - ☐ concurrent stream multiplexing on the h2c **server** (it currently serves streams sequentially).
    - ☐ **TLS-adapter seam** — documented bring-your-own-TLS so h2-over-TLS works without a std server.
 3. **`l2disco`** — the one worthwhile "extract" candidate, and it's actually greenfield (see AXP tail).
 
