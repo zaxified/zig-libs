@@ -35,6 +35,14 @@ zig-libs exists to ship the **good** version of each library, not a copy of the 
   license so NOTICE records the design ref. (Ongoing so the pre-public audit has material.)
 
 **DONE (Fable, value-add, 2026-07-07):**
+- `probe` **NEW module** ✅ — `modules/probe/src/root.zig` (~620 L): TCP-connect service-reachability
+  prober — `probeTcp` (up/refused/timeout/error + connect RTT), `probeTarget` (N reps → min/avg/max/
+  loss via latency-stats), `probeMany` (fan-out with bounded concurrency, order-stable), all behind a
+  `Connector` seam (default = std.Io.net); optional app-check hook. 8 tests (scripted fake connector +
+  virtual clock: classify, aggregate, concurrency-bound asserted, `Target.parse` incl. `[v6]:port`;
+  1 hermetic self-bound-listener live test). Debug+ReleaseFast+fmt green. (Fable wrote it; Opus rescued
+  it past the session limit: 5 const-slice fixes + `std.time.Instant`→CLOCK_MONOTONIC.) Clean-room
+  (standard technique). deps netaddr/latency-stats. **Completes the network-tail.**
 - `traceroute` **NEW module** ✅ — `modules/traceroute/src/root.zig` (~950 L): ICMP-echo path
   discovery on the `icmp` module — TTL-stepped probes (IP_TTL/IPV6_UNICAST_HOPS), Time-Exceeded/
   Dest-Unreachable/Echo-Reply classification with embedded ident/seq correlation (reuses icmp's
@@ -212,7 +220,7 @@ zig-libs exists to ship the **good** version of each library, not a copy of the 
 
 ## Next up (resume here) — user-approved sequence 2026-07-07
 
-1. **Network-tail:** `wireguard` ✅ → `traceroute` ✅ → `probe` **← last**.
+1. **Network-tail:** `wireguard` ✅ → `traceroute` ✅ → `probe` ✅ — **COMPLETE.**
 2. **h2-completion** — decouple from the stalled 0.17 TLS server (PR #23005 open since Feb 2025; ianic
    server "minimal") and close the h2 stack at the app layer: **rapid-reset (CVE-2023-44487) +
    CONTINUATION-flood (CVE-2024-27316) hardening** (the core), concurrent stream multiplexing, an
@@ -263,9 +271,8 @@ axp *fakes* these in `axp-sim/src/synth.zig` or *shells out* to daemons (`lldpd`
   but the user deprioritized them 2026-07-07 — l2disco is the only value-add "extract" kept.)
 - poc-wf: `pollworker` · `chunkframe` · axp: `lenframe`/`jsonwire`.
 
-## Queued — network control tail
-`probe` **← last one** (TCP-connect / service reachability probe).
-(`nftables`+`modbus`+`whois`+`uci`+`rdap`+`mqtt`+`snmp`+`wireguard`+`traceroute` ✅ done — see DONE above.)
+## Network control tail — ✅ COMPLETE
+`nftables`+`modbus`+`whois`+`uci`+`rdap`+`mqtt`+`snmp`+`wireguard`+`traceroute`+`probe` all done.
 
 ## Capstone
 `exprcalc` (bxp Excel-like evaluator) — build LAST; composes `decimal` (✅) + `datefmt` + `tz` +
