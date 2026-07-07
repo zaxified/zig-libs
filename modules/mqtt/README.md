@@ -1,0 +1,74 @@
+# mqtt
+
+Pure-Zig **MQTT 3.1.1 client**: control-packet codec + client state machine.
+Pairs with `modbus` for the IoT / industrial (SCADA-sim) work: a typed,
+allocation-free wire codec plus a transport-agnostic client that is fully
+offline-testable.
+
+- **Status:** gap — no mature pure-Zig MQTT library exists.
+- **Platform:** any (codec + client are pure computation; only the optional
+  `TcpTransport` adapter touches `std.Io.net`).
+- **Model after:** MQTT 3.1.1 (OASIS) / mosquitto+paho behavior.
+- **Scope:**
+  - **Codec** (`packet`): encode + decode for all 14 control-packet types —
+    CONNECT (clean session, keep-alive, will topic/message/QoS/retain,
+    username/password), CONNACK (typed return codes 0 accepted / 1–5
+    refused), PUBLISH (QoS 0/1/2, DUP, RETAIN, packet id for QoS > 0),
+    PUBACK, PUBREC, PUBREL, PUBCOMP, SUBSCRIBE (per-filter requested QoS),
+    SUBACK (granted QoS incl. 0x80 failure), UNSUBSCRIBE, UNSUBACK,
+    PINGREQ, PINGRESP, DISCONNECT. Remaining-length varint (1–4 bytes,
+    max 268 435 455) with malformed/overlong guards; 2-byte-length-prefixed
+    UTF-8 strings validated (U+0000 and bad UTF-8 rejected). Decode is
+    zero-copy and stream-friendly: `null` means "need more bytes";
+    malformed/hostile bytes return typed errors, never a panic.
+  - **Topics** (`topic`): `matches(filter, topic)` with the `+`
+    single-level and trailing-`#` multi-level wildcard rules and the
+    `$`-topic exclusion for leading wildcards; `validateName` /
+    `validateFilter` per spec 4.7.
+  - **Client** (`Client`): behind a caller-provided `Transport` write seam;
+    incoming bytes via `feed`, `poll(now)` decodes server packets, advances
+    the QoS state machines on both sides — QoS 1 PUBLISH→PUBACK, QoS 2
+    PUBLISH→PUBREC→PUBREL→PUBCOMP with automatic acks and exactly-once
+    dedup on receive — and surfaces typed events (connack, message, puback,
+    pubcomp, suback, unsuback, pingresp). Bounded packet-id pool (wrap
+    65535→1, in-use guard). Caller drives the clock (`now` in ms, no hidden
+    time calls); `tick` sends keep-alive PINGREQ and reports ping timeouts.
+    `publishDup` retransmits an unacked QoS > 0 publish with the DUP flag.
+    Retained-session replay (buffering payloads) is deliberately the
+    caller's job.
+
+```zig
+const mqtt = @import("mqtt");
+
+var tt = try mqtt.TcpTransport.connect(io, address); // or any Transport impl
+defer tt.close();
+var rx: [4096]u8 = undefined;
+var tx: [4096]u8 = undefined;
+var client = mqtt.Client.init(tt.transport(), .{ .rx = &rx, .tx = &tx });
+
+try client.connect(now(), .{ .client_id = "sensor-1", .keep_alive_s = 30 });
+_ = try client.subscribe(now(), &.{.{ .filter = "plant/+/state" }});
+_ = try client.publish(now(), "plant/1/cmd", "on", .{ .qos = .at_least_once });
+
+// pump loop: read → feed → poll → tick
+const n = try tt.readSome(&net_buf);
+try client.feed(net_buf[0..n]);
+while (try client.poll(now())) |event| switch (event) {
+    .message => |m| handle(m.topic, m.payload),
+    else => {},
+};
+try client.tick(now());
+```
+
+Tests are fully offline: golden-byte known-answer tests against the spec's
+wire layout (CONNECT with will + credentials, CONNACK, QoS 1 PUBLISH
+round-trip, SUBSCRIBE/SUBACK with mixed granted QoS incl. 0x80, all
+remaining-length varint boundary values with overlong/5-byte rejection), a
+scripted fake broker drives the full QoS 1 and QoS 2 handshakes, DUP
+retransmission and dedup, keep-alive/ping timeout, packet-id wrap and pool
+exhaustion, plus a topic-match truth table and 2×1000-iteration
+garbage-byte no-panic sweeps (codec and client).
+
+Provenance: clean-room from the OASIS MQTT Version 3.1.1 specification
+(open standard, royalty-free); mosquitto (EPL/EDL) and Eclipse Paho
+referenced for behavior only, no source consulted or copied.

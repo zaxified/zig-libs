@@ -35,6 +35,13 @@ zig-libs exists to ship the **good** version of each library, not a copy of the 
   license so NOTICE records the design ref. (Ongoing so the pre-public audit has material.)
 
 **DONE (Fable, value-add, 2026-07-07):**
+- `mqtt` **NEW module** ✅ — `modules/mqtt/src/` (packet+topic+client, ~2300 L): full MQTT 3.1.1
+  client — all 14 control-packet types encode/decode (remaining-length varint, UTF-8 fields, will/
+  creds), QoS 0/1/2 state machine both send+receive (exactly-once dedup, bounded packet-id pool),
+  topic-filter wildcard matching + validation, caller-clocked keep-alive, all behind a transport seam
+  (offline; optional std.Io TCP adapter). 37 tests: golden-byte KATs + scripted-broker QoS flows +
+  varint boundaries + 3×1000 garbage sweeps. Debug+ReleaseFast+fmt green. Clean-room from the OASIS
+  MQTT 3.1.1 spec. Pairs with `modbus` for IoT/industrial.
 - `validate` **+ format validators** ✅ — added the JSON Schema `format` vocabulary: email, uri/
   uri_reference, uuid, ipv4/ipv6 (dogfoods `netaddr.parseIp` → new netaddr dep), hostname, date/time/
   date_time (RFC 3339 with real range + leap-year checks), duration, json_pointer. Wired as a per-field

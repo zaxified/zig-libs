@@ -160,6 +160,11 @@ audit is pending before any public release.
                only — no libmodbus source was consulted or copied; the
                protocol itself is the open spec.
 
+  mqtt       — clean-room from the OASIS MQTT Version 3.1.1 specification (an
+               open, royalty-free standard). mosquitto (EPL/EDL) and Eclipse
+               Paho are cited as behavior design references only — no source
+               was consulted or copied.
+
   latency-stats — the streaming moment stats (min/max/mean/stddev + RFC 3550
                jitter) are from the authors' zig-fping/axp work (see the fping
                attribution above). The `Histogram` percentile support is
