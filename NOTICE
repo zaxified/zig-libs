@@ -148,4 +148,11 @@ audit is pending before any public release.
                interface — no libnftables (or other nftables) source was
                consulted or copied.
 
+  modbus     — clean-room from the public Modbus specifications: Modbus
+               Application Protocol Specification V1.1b3 + Modbus over Serial
+               Line V1.02 (modbus.org, openly published and royalty-free).
+               libmodbus (LGPL-2.1+) is cited as a behavior design reference
+               only — no libmodbus source was consulted or copied; the
+               protocol itself is the open spec.
+
 See each module's README "Provenance" note for its specific seed and reference.

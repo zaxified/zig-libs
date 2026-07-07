@@ -35,6 +35,11 @@ zig-libs exists to ship the **good** version of each library, not a copy of the 
   license so NOTICE records the design ref. (Ongoing so the pre-public audit has material.)
 
 **DONE (Fable, value-add, 2026-07-07):**
+- `modbus` **NEW module** ✅ — `modules/modbus/src/root.zig` (~1050 L): Modbus **TCP** (MBAP) + **RTU**
+  (CRC-16) codec + master client — FC 01/02/03/04/05/06/0F/10/17, exception mapping, spec quantity
+  limits, a transport seam (offline-testable; optional `std.Io` TCP adapter). 32 tests: Modbus
+  V1.1b3 byte-exact KATs + a Python-cross-checked CRC. Debug+ReleaseFast+fmt green. Clean-room from
+  the public modbus.org spec (libmodbus LGPL = behavior ref only). Feeds the axp SCADA-sim research.
 - `nftables` **NEW module** ✅ — `modules/nftables/src/root.zig` (1503 L): typed builder for the
   libnftables JSON ruleset format → feed to `nft -j -f -`. Families/chains/hooks/policies, rules with
   a typed expr/statement vocabulary (match/payload/meta/ct/sets/ranges + accept/drop/reject/jump/
@@ -151,8 +156,8 @@ poc-wf: `finstats` · `ipcbus` · `pollworker` · `chunkframe`.
 axp: `lenframe`/`jsonwire`.
 
 ## Queued — network control tail
-`wireguard` (on `netlink`) · `uci` · `traceroute` (on `icmp`) · `probe` · `whois` · `rdap` · `modbus`.
-(`nftables` ✅ done — see DONE above.)
+`wireguard` (on `netlink`) · `uci` · `traceroute` (on `icmp`) · `probe` · `whois` · `rdap`.
+(`nftables` + `modbus` ✅ done — see DONE above.)
 
 ## Capstone
 `exprcalc` (bxp Excel-like evaluator) — build LAST; composes `decimal` (✅) + `datefmt` + `tz` +
