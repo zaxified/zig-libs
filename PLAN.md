@@ -35,6 +35,11 @@ zig-libs exists to ship the **good** version of each library, not a copy of the 
   license so NOTICE records the design ref. (Ongoing so the pre-public audit has material.)
 
 **DONE (Fable, value-add, 2026-07-07):**
+- `hashdigest` **+ multi-algorithm** ✅ — added an `Algorithm` enum (sha256/512/384/224/512_256,
+  sha3_256/512, blake2b256, blake3) with `digestLength`/`hexLength`, variable-length `hex`/`hexAlloc`,
+  comptime `HexOf`, a runtime `MultiHasher` (streaming), `hashFile` (any algo, /proc-safe), and
+  `matchesAlgo` — thin over `std.crypto`, existing SHA-256 names untouched. 17 tests (10 new): official
+  empty/"abc" KATs for all 9 algos. Debug+ReleaseFast+fmt green. std.crypto only (no NOTICE change).
 - `decimal` **+ rounding modes** ✅ — added `RoundingMode` (half_even default / half_up / half_down /
   up / down / ceiling / floor) with `rescale`, `roundToIntegral`, `quantize`, and `divRound`
   (rounded division at a target scale — the piece exact fixed-point can't do). Pure i128, typed
