@@ -37,8 +37,13 @@ zig-libs exists to ship the **good** version of each library, not a copy of the 
 **IN PROGRESS (Fable, value-add, 2026-07-07):**
 - `http` **HPACK (RFC 7541)** — new `modules/http/src/hpack.zig`, full codec verified vs RFC 7541
   Appendix C vectors. The codec core for HTTP/2; framing (RFC 9113) is the next batch on top of it.
-- `ramcache` **→ W-TinyLFU** — admission+eviction upgrade (Caffeine/ristretto design, TinyLFU paper),
-  backward-compatible API (wgs consumes it), hit-ratio benchmark vs LRU as the gate.
+
+**DONE (Fable, value-add, 2026-07-07):**
+- `ramcache` **→ W-TinyLFU** ✅ — window + SLRU + 4-bit Count-Min sketch (doorkeeper + aging)
+  admission/eviction; API backward-compatible (wgs consumes it), `Stats` extended additively
+  (`admissions`/`rejections`). Gate met: hit ratio **23.7% vs 14.5% plain-LRU (+63%)** on a Zipf
+  trace; 22 tests (7 new), Debug+ReleaseFast+fmt green. Clean-room from the TinyLFU paper (NOTICE
+  updated: Caffeine Apache-2.0 + ristretto MIT, design only).
 
 ## Progress (committed; each independently re-verified Debug+ReleaseFast+fmt before commit)
 

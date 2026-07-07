@@ -50,7 +50,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | Module | What it does | Deps |
 |---|---|---|
 | `kv` | Crash-consistent embedded KV store (Bitcask-style log + fault-injection–verified recovery) | — |
-| `ramcache` | Bounded in-memory cache with TTL + generation invalidation | — |
+| `ramcache` | Bounded in-memory cache — **W-TinyLFU** admission/eviction (window+SLRU+CMS sketch) + TTL + generation invalidation | — |
 | `decimal` | Exact i128 fixed-point decimal (money math), float-free | — |
 
 ### Crypto

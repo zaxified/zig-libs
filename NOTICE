@@ -127,4 +127,13 @@ audit is pending before any public release.
                extraction and no source copied; byte-parity verified against
                `ubus -S` output on real hardware.
 
+  ramcache   — original seed extracted from the authors' poc-wf-analytic
+               (`cache.zig`; TTL + generation invalidation + byte/entry caps).
+               The W-TinyLFU admission/eviction upgrade is clean-room from the
+               TinyLFU paper (Einziger & Friedman, "TinyLFU: A Highly Efficient
+               Cache Admission Policy") with design refs Caffeine (Apache-2.0;
+               window + SLRU probation/protected structure) and ristretto (Go,
+               MIT; admission anti-starvation tie-break) — algorithm/behavior
+               only, no source consulted or copied.
+
 See each module's README "Provenance" note for its specific seed and reference.
