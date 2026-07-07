@@ -4,8 +4,9 @@
 //!
 //! Encodes queries and decodes responses: header, question and resource-record
 //! sections, name-compression pointers (decode side; encode never compresses),
-//! rdata for A/AAAA/PTR/CNAME/NS/MX/TXT/SOA, and the EDNS(0) OPT pseudo-record
-//! (RFC 6891). Modeled after Go `x/net/dns/dnsmessage` and miekg/dns.
+//! rdata for A/AAAA/PTR/CNAME/NS/MX/TXT/SOA (RFC 1035), SRV (RFC 2782),
+//! CAA (RFC 8659), and the EDNS(0) OPT pseudo-record (RFC 6891). Modeled
+//! after Go `x/net/dns/dnsmessage` and miekg/dns.
 //!
 //! Robustness rules for adversarial input (this file must be bulletproof):
 //! - a compression pointer must point strictly backwards, before its own
@@ -27,8 +28,9 @@ const std = @import("std");
 
 // ── wire vocabulary ─────────────────────────────────────────────────────────
 
-/// Resource-record / query type (RFC 1035 §3.2.2, RFC 3596, RFC 6891).
-/// Non-exhaustive: unlisted values decode as `.unknown` rdata.
+/// Resource-record / query type (RFC 1035 §3.2.2, RFC 3596, RFC 2782,
+/// RFC 8659, RFC 6891). Non-exhaustive: unlisted values decode as `.unknown`
+/// rdata.
 pub const Type = enum(u16) {
     a = 1,
     ns = 2,
@@ -38,7 +40,9 @@ pub const Type = enum(u16) {
     mx = 15,
     txt = 16,
     aaaa = 28,
+    srv = 33,
     opt = 41,
+    caa = 257,
     _,
 };
 
@@ -128,9 +132,12 @@ pub const Record = struct {
         ns: []const u8,
         ptr: []const u8,
         mx: Mx,
-        /// TXT character-strings, one slice per string.
+        /// TXT character-strings, one slice per string. See `Record.txtConcat`
+        /// for the joined form most consumers (SPF, verification tokens) want.
         txt: []const []const u8,
         soa: Soa,
+        srv: Srv,
+        caa: Caa,
         opt: Opt,
         /// Raw RDATA of any type not decoded above (`Record.ty` still tells
         /// which one it is).
@@ -151,6 +158,37 @@ pub const Record = struct {
         expire: u32,
         minimum: u32,
     };
+
+    /// SRV service locator (RFC 2782). The RFC forbids compressing the
+    /// target on the wire, but real servers emit it anyway, so the decoder
+    /// accepts pointers there (miekg/dns and Go dnsmessage do the same).
+    pub const Srv = struct {
+        priority: u16,
+        weight: u16,
+        port: u16,
+        target: []const u8,
+    };
+
+    /// CAA property (RFC 8659 §4.1), e.g. `0 issue "letsencrypt.org"`.
+    pub const Caa = struct {
+        /// Bit 7 (0x80) is the "issuer critical" flag; the rest is reserved.
+        flags: u8,
+        /// Property tag, 1–15 alphanumeric chars per the RFC (e.g. "issue",
+        /// "issuewild", "iodef"); the decoder only enforces non-empty.
+        tag: []const u8,
+        /// Property value — the rest of the RDATA, may be empty.
+        value: []const u8,
+    };
+
+    /// For a TXT record: the character-strings concatenated in wire order —
+    /// the form SPF/DKIM/verification-token consumers expect. Null for any
+    /// other record type. Caller owns the returned bytes.
+    pub fn txtConcat(r: *const Record, gpa: std.mem.Allocator) error{OutOfMemory}!?[]u8 {
+        return switch (r.data) {
+            .txt => |strings| try std.mem.concat(gpa, u8, strings),
+            else => null,
+        };
+    }
 
     /// EDNS(0) OPT pseudo-record fields (RFC 6891 §6.1). The wire class/ttl
     /// fields are overloaded; they are decoded here and left raw in
@@ -490,6 +528,25 @@ fn takeRecord(d: *Decoder, arena: std.mem.Allocator) DecodeError!Record {
                 .minimum = try d.takeInt(u32),
             } };
         },
+        .srv => .{ .srv = .{
+            .priority = try d.takeInt(u16),
+            .weight = try d.takeInt(u16),
+            .port = try d.takeInt(u16),
+            .target = try takeRdataName(d, arena, rdata_end),
+        } },
+        .caa => blk: {
+            // flags (1) + tag length (1); tag must be non-empty and fit,
+            // value is whatever RDATA remains (may be empty).
+            if (rdlength < 2) return error.BadRecord;
+            const tag_len: usize = d.bytes[rdata_start + 1];
+            if (tag_len == 0 or tag_len > rdlength - 2) return error.BadRecord;
+            const tag_start = rdata_start + 2;
+            break :blk .{ .caa = .{
+                .flags = d.bytes[rdata_start],
+                .tag = try arena.dupe(u8, d.bytes[tag_start..][0..tag_len]),
+                .value = try arena.dupe(u8, d.bytes[tag_start + tag_len .. rdata_end]),
+            } };
+        },
         .opt => .{ .opt = .{
             .udp_payload_size = class_raw,
             .extended_rcode = @truncate(ttl >> 24),
@@ -726,6 +783,96 @@ test "decode: PTR response (seed shape)" {
     try testing.expectEqualStrings("dns.google", msg.answers[0].data.ptr);
 }
 
+test "decode: SRV answer with a compressed target (RFC 2782 _sip._tcp shape)" {
+    const resp = "\x00\x03" ++ "\x81\x80" ++ "\x00\x01\x00\x01\x00\x00\x00\x00" ++
+        // question @12: _sip._tcp.example.com SRV IN ("example.com" @22 = 0x16)
+        "\x04_sip\x04_tcp\x07example\x03com\x00" ++ "\x00\x21" ++ "\x00\x01" ++
+        // answer @39: SRV 10 60 5060 sipserver.example.com, ttl 300
+        "\xc0\x0c" ++ "\x00\x21" ++ "\x00\x01" ++ "\x00\x00\x01\x2c" ++
+        "\x00\x12" ++ "\x00\x0a\x00\x3c\x13\xc4" ++ "\x09sipserver\xc0\x16";
+
+    var msg = try decode(testing.allocator, resp);
+    defer msg.deinit();
+
+    try testing.expectEqualStrings("_sip._tcp.example.com", msg.questions[0].name);
+    try testing.expectEqual(Type.srv, msg.questions[0].ty);
+    try testing.expectEqual(@as(usize, 1), msg.answers.len);
+    try testing.expectEqual(Type.srv, msg.answers[0].ty);
+    const srv = msg.answers[0].data.srv;
+    try testing.expectEqual(@as(u16, 10), srv.priority);
+    try testing.expectEqual(@as(u16, 60), srv.weight);
+    try testing.expectEqual(@as(u16, 5060), srv.port);
+    try testing.expectEqualStrings("sipserver.example.com", srv.target);
+}
+
+test "decode: CAA answers (RFC 8659), including an empty value" {
+    const resp = "\x00\x04" ++ "\x81\x80" ++ "\x00\x01\x00\x02\x00\x00\x00\x00" ++
+        // question @12: example.com CAA IN
+        "\x07example\x03com\x00" ++ "\x01\x01" ++ "\x00\x01" ++
+        // answer 1 @29: CAA 0 issue "letsencrypt.org", ttl 3600
+        "\xc0\x0c" ++ "\x01\x01" ++ "\x00\x01" ++ "\x00\x00\x0e\x10" ++
+        "\x00\x16" ++ "\x00" ++ "\x05issue" ++ "letsencrypt.org" ++
+        // answer 2: CAA with critical flag, tag iodef, empty value
+        "\xc0\x0c" ++ "\x01\x01" ++ "\x00\x01" ++ "\x00\x00\x0e\x10" ++
+        "\x00\x07" ++ "\x80" ++ "\x05iodef";
+
+    var msg = try decode(testing.allocator, resp);
+    defer msg.deinit();
+
+    try testing.expectEqual(Type.caa, msg.questions[0].ty);
+    try testing.expectEqual(@as(usize, 2), msg.answers.len);
+    const c1 = msg.answers[0].data.caa;
+    try testing.expectEqual(@as(u8, 0), c1.flags);
+    try testing.expectEqualStrings("issue", c1.tag);
+    try testing.expectEqualStrings("letsencrypt.org", c1.value);
+    const c2 = msg.answers[1].data.caa;
+    try testing.expectEqual(@as(u8, 0x80), c2.flags);
+    try testing.expectEqualStrings("iodef", c2.tag);
+    try testing.expectEqualStrings("", c2.value);
+}
+
+test "decode: TXT with zero character-strings decodes as an empty set" {
+    const resp = "\x00\x05" ++ "\x81\x80" ++ "\x00\x01\x00\x01\x00\x00\x00\x00" ++
+        "\x01a\x00" ++ "\x00\x10" ++ "\x00\x01" ++
+        "\xc0\x0c" ++ "\x00\x10" ++ "\x00\x01" ++ "\x00\x00\x00\x3c" ++ "\x00\x00";
+    var msg = try decode(testing.allocator, resp);
+    defer msg.deinit();
+    try testing.expectEqual(@as(usize, 0), msg.answers[0].data.txt.len);
+}
+
+test "Record.txtConcat joins TXT strings; null for other types" {
+    const txt: Record = .{
+        .name = "x",
+        .ty = .txt,
+        .class = .in,
+        .ttl = 0,
+        .data = .{ .txt = &.{ "hello", "world" } },
+    };
+    const joined = (try txt.txtConcat(testing.allocator)).?;
+    defer testing.allocator.free(joined);
+    try testing.expectEqualStrings("helloworld", joined);
+
+    const empty: Record = .{
+        .name = "x",
+        .ty = .txt,
+        .class = .in,
+        .ttl = 0,
+        .data = .{ .txt = &.{} },
+    };
+    const none = (try empty.txtConcat(testing.allocator)).?;
+    defer testing.allocator.free(none);
+    try testing.expectEqualStrings("", none);
+
+    const a: Record = .{
+        .name = "x",
+        .ty = .a,
+        .class = .in,
+        .ttl = 0,
+        .data = .{ .a = .{ 192, 0, 2, 1 } },
+    };
+    try testing.expectEqual(@as(?[]u8, null), try a.txtConcat(testing.allocator));
+}
+
 test "decode: NXDOMAIN rcode surfaces" {
     const resp = "\x00\x02" ++ "\x81\x83" ++ // rcode 3
         "\x00\x01\x00\x00\x00\x00\x00\x00" ++
@@ -828,6 +975,24 @@ test "decode: bad rdata lengths are rejected" {
     // CNAME whose name bytes run past RDLENGTH.
     try expectDecodeError(error.BadRecord, head ++ "\x01a\x00" ++ "\x00\x05\x00\x01" ++
         "\x00\x00\x00\x00" ++ "\x00\x02" ++ "\x03www\x00");
+    // SRV RDLENGTH shorter than the fixed fields, packet continuing after.
+    try expectDecodeError(error.BadRecord, head ++ "\x01a\x00" ++ "\x00\x21\x00\x01" ++
+        "\x00\x00\x00\x00" ++ "\x00\x04" ++ "\x00\x0a\x00\x3c" ++ "\x13\xc4\x00");
+    // SRV RDLENGTH shorter than the fixed fields at the packet end.
+    try expectDecodeError(error.Truncated, head ++ "\x01a\x00" ++ "\x00\x21\x00\x01" ++
+        "\x00\x00\x00\x00" ++ "\x00\x04" ++ "\x00\x0a\x00\x3c");
+    // SRV target with a pointer past the packet end.
+    try expectDecodeError(error.BadPointer, head ++ "\x01a\x00" ++ "\x00\x21\x00\x01" ++
+        "\x00\x00\x00\x00" ++ "\x00\x08" ++ "\x00\x0a\x00\x3c\x13\xc4" ++ "\xc0\xff");
+    // CAA RDATA shorter than flags + tag length.
+    try expectDecodeError(error.BadRecord, head ++ "\x01a\x00" ++ "\x01\x01\x00\x01" ++
+        "\x00\x00\x00\x00" ++ "\x00\x01" ++ "\x00");
+    // CAA tag length overruns RDLENGTH.
+    try expectDecodeError(error.BadRecord, head ++ "\x01a\x00" ++ "\x01\x01\x00\x01" ++
+        "\x00\x00\x00\x00" ++ "\x00\x04" ++ "\x00\x09ab");
+    // CAA with an empty tag (RFC 8659 requires 1+ chars).
+    try expectDecodeError(error.BadRecord, head ++ "\x01a\x00" ++ "\x01\x01\x00\x01" ++
+        "\x00\x00\x00\x00" ++ "\x00\x03" ++ "\x00\x00x");
 }
 
 test "decode: empty and header-only packets" {

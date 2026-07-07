@@ -35,6 +35,11 @@ zig-libs exists to ship the **good** version of each library, not a copy of the 
   license so NOTICE records the design ref. (Ongoing so the pre-public audit has material.)
 
 **DONE (Fable, value-add, 2026-07-07):**
+- `dns` **+ record types** ✅ — added **SRV** (RFC 2782) + **CAA** (RFC 8659) parsing and a
+  `txtConcat` helper to the typed `Record.Data` union (A/AAAA/PTR/CNAME/NS/MX/TXT/SOA were already
+  there), reusing the existing compression-safe name reader + RDLENGTH bounds guard. 46 test-dns
+  (SRV/CAA KATs with compression pointer, TXT-zero, malformed→typed error). Debug+ReleaseFast+fmt
+  green. Clean-room from the RFCs.
 - `sealedbox` **+ key serialization** ✅ — added base64 + hex import/export for public and secret
   keys (fixed-size, allocation-free, typed errors, no panic), plus `publicFromSecret` /
   `keyPairFromSecretKey` (via std `X25519.recoverPublicKey`) so a stored secret round-trips a keypair.

@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT
 
 //! dns — DNS resolver: RFC 1035 message codec + UDP/TCP/DoH transports +
-//! forward (A/AAAA) and reverse (PTR) lookups.
+//! forward (A/AAAA) and reverse (PTR) lookups. The codec decodes the common
+//! record set — A/AAAA/PTR/CNAME/NS/MX/TXT/SOA (RFC 1035), SRV (RFC 2782),
+//! CAA (RFC 8659) — plus EDNS(0) OPT; anything else surfaces as raw rdata.
 //!
 //! Layout mirrors the http module: this file owns the shared vocabulary and
 //! the netaddr-powered helpers; `message.zig` is the pure, transport-agnostic
@@ -31,7 +33,7 @@ pub const meta = .{
     .platform = .any, // lookupIp's RFC 6724 ordering kicks in on Linux only
     .role = .client,
     .concurrency = .blocking, // every lookup blocks; one owner per Resolver
-    .model_after = "Go net dnsclient + miekg/dns (codec) / c-ares; RFC 1035 (wire), RFC 8484 (DoH)",
+    .model_after = "Go net dnsclient + miekg/dns (codec) / c-ares; RFC 1035/2782/8659 (wire), RFC 8484 (DoH)",
     .deps = .{ "netaddr", "http", "std.json", "std.Io.net" },
 };
 

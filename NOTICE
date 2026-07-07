@@ -59,8 +59,9 @@ audit is pending before any public release.
                control; RFC 7540 consulted only where it clarifies the same
                rules); clean-room from the RFCs, no HPACK/HTTP-2/nghttp2 source
                consulted or copied; TLS via Zig std.crypto.tls.
-  dns        — RFC 1035 (wire), RFC 8484 (DoH); design ref: miekg/dns
-               (BSD-3-Clause) + c-ares.
+  dns        — RFC 1035 (wire), RFC 8484 (DoH), RFC 2782 (SRV), RFC 8659
+               (CAA); design ref: miekg/dns (BSD-3-Clause) + c-ares —
+               behavior only, no source copied.
   router     — design ref: go-chi/chi (MIT), julienschmidt/httprouter
                (BSD-3-Clause).
   ratelimit  — design ref: golang.org/x/time/rate (BSD-3-Clause, The Go

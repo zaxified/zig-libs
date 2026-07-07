@@ -8,7 +8,7 @@ Not a dumping ground: ship **solid, not many**. Most members are *extracted* fro
 across sibling projects (bxp, axp, zig-fping, poc-wf-analytic); a few fill genuine gaps in the Zig
 ecosystem.
 
-**Status:** 32 modules · 822 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 32 modules · 832 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ## Modules
@@ -39,7 +39,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | Module | What it does | Platform | Deps |
 |---|---|---|---|
 | `netaddr` | IP parse/format (RFC 5952) + RFC 6724 source/dest selection + **CIDR/Prefix** ops (contains/overlaps/supernet, range↔prefix summarize) | any | — |
-| `dns` | RFC 1035 resolver — A/AAAA + PTR over UDP/TCP + DoH | any | netaddr, http |
+| `dns` | RFC 1035 resolver — A/AAAA/PTR/CNAME/NS/MX/TXT/SOA/SRV/CAA over UDP/TCP + DoH | any | netaddr, http |
 | `netlink` | rtnetlink dumps: links / addresses / routes / neighbors | linux | — |
 | `nftables` | Typed firewall-ruleset builder → libnftables JSON for `nft -j -f -` (families/chains/rules/sets, match + verdict statements) | any (apply: linux) | — |
 | `modbus` | Modbus TCP (MBAP) + RTU (CRC-16) codec + master client — core function codes, exceptions, transport-agnostic seam | any | — |
