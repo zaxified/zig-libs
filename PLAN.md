@@ -35,6 +35,14 @@ zig-libs exists to ship the **good** version of each library, not a copy of the 
   license so NOTICE records the design ref. (Ongoing so the pre-public audit has material.)
 
 **DONE (Fable, value-add, 2026-07-07):**
+- `http` **HTTP/2 server (h2c)** ✅ — `modules/http/src/h2_server.zig` (~1200 L) wires `h2.Connection`
+  into `http.Server` over cleartext h2c prior-knowledge (RFC 9113 §3.3). New `Options.enable_h2c`
+  (off by default → server byte-for-byte unchanged); incremental preface peek, else falls through to
+  h1. **Same handler serves h1 and h2** (pseudo-headers→Request, stock ResponseWriter re-framed as
+  HEADERS+DATA, flow-control + WINDOW_UPDATE honored, 413/400/500/501 h1-parity). One h2.zig gap-fill:
+  `recoverStreamError` (§5.4.2 stream-scoped errors → RST_STREAM, connection survives). 11 new tests
+  (143/143 http), Debug+ReleaseFast+fmt green. Clean-room RFC 9113. **The HPACK→framing→server arc is
+  complete; TLS/ALPN h2 waits on the 0.17 TLS server.**
 - `http` **HTTP/2 framing (RFC 9113)** ✅ — new `modules/http/src/h2.zig` (2265 L): 9-octet frame
   codec + all §6 frame types, §5 stream state machine (idle→open→half-closed→closed, id rules),
   §5.2 dual-window flow control, §3.4 preface, HEADERS+CONTINUATION assembler over `hpack`. Typed

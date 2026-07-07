@@ -8,14 +8,17 @@
 //! writer and a thread-per-connection serving loop; Phase 2.1 hardened it
 //! for **direct internet exposure** (peer address on requests, accept
 //! hook + connection accounting, 431/414/413 size limits, stall +
-//! whole-request + write timeouts — see `Server`), though it still speaks
-//! plain HTTP/1.1 only (a TLS-terminating server is a separate later
-//! task; a reverse proxy also works). Phase 2.2 adds negotiated gzip
-//! response compression (`Server.Options.compression`, off by default;
-//! `std.compress.flate` streaming into the chunked framing). Phase 3
-//! will add HTTP/2 (framing + HPACK, h2spec-verified). Deliberately NOT
-//! built on `std.http` (API churn is the reason this module exists);
-//! client TLS is strictly `std.crypto.tls`.
+//! whole-request + write timeouts — see `Server`); TLS termination is a
+//! separate later task (a reverse proxy also works). Phase 2.2 adds
+//! negotiated gzip response compression (`Server.Options.compression`,
+//! off by default; `std.compress.flate` streaming into the chunked
+//! framing). Phase 3 adds HTTP/2: `hpack` (RFC 7541) + `h2` (RFC 9113
+//! framing/state machine/flow control), and Phase 3.1 wires them into
+//! the server as opt-in cleartext h2c via prior knowledge
+//! (`Server.Options.enable_h2c`, RFC 9113 §3.3) — the same handler
+//! serves both protocols. Deliberately NOT built on `std.http` (API
+//! churn is the reason this module exists); client TLS is strictly
+//! `std.crypto.tls`.
 //!
 //! Layout: this file owns the shared vocabulary (methods, URL parsing,
 //! redirect rules); `h1.zig` is the pure HTTP/1.1 wire codec (offline
@@ -49,7 +52,8 @@ pub const hpack = @import("hpack.zig");
 /// HTTP/2 framing + connection/stream state machine (RFC 9113): the §4/§6
 /// frame codec, §5 stream lifecycle, §5.2 flow control and the
 /// HEADERS+CONTINUATION assembler over `hpack` — see `h2.Connection`.
-/// Pure wire layer; Server/Client integration is the next phase.
+/// Pure wire layer; the server integrates it as opt-in cleartext h2c
+/// (`Server.Options.enable_h2c`, prior knowledge per RFC 9113 §3.3).
 pub const h2 = @import("h2.zig");
 
 /// The HTTP/1.1 client. See `Client.init` / `Client.request`.

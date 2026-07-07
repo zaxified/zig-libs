@@ -51,11 +51,19 @@
 //! like Go's gzip middleware / nginx — the byte count is still
 //! enforced). `Vary: Accept-Encoding` goes on every response while
 //! enabled. Negotiation/eligibility helpers live in `gzip.zig`.
+//!
+//! HTTP/2 (Phase 3.1, opt-in): with `Options.enable_h2c` a connection
+//! that opens with the HTTP/2 client preface (RFC 9113 §3.3 prior
+//! knowledge — the only cleartext path; RFC 9113 removed `Upgrade: h2c`)
+//! is served by `h2_server.zig` through the same `Options.handler`;
+//! everything else takes the HTTP/1.1 loop below unchanged.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const http = @import("root.zig");
 const h1 = @import("h1.zig");
+const h2 = @import("h2.zig");
+const h2s = @import("h2_server.zig");
 const gzip = @import("gzip.zig");
 const flate = std.compress.flate;
 const net = std.Io.net;
@@ -178,6 +186,14 @@ pub const Options = struct {
     server_name: []const u8 = "zig-libs-http/0.1",
     kernel_backlog: u31 = 128,
     reuse_address: bool = false,
+    /// Opt-in cleartext HTTP/2 (h2c via **prior knowledge**, RFC 9113
+    /// §3.3 — RFC 9113 removed the `Upgrade: h2c` mechanism): when a
+    /// connection opens with the HTTP/2 client preface it is served as
+    /// HTTP/2 through the same `handler` (see `h2_server.zig`); anything
+    /// else takes the HTTP/1.1 path unchanged. Off (the default) the
+    /// server never even peeks — behavior is byte-for-byte the h1 server.
+    /// Detection needs `read_buffer_size` ≥ 24 (the preface length).
+    enable_h2c: bool = false,
 };
 
 /// `io` must support the net + concurrency vtable operations (e.g.
@@ -346,6 +362,32 @@ fn connMain(s: *Server, stream: net.Stream) void {
     var sw = stream.writer(s.io, write_buf[0..0]);
     var tw: TimeoutWriter = .init(&sw.interface, stream.socket.handle, o.write_timeout_ms, write_buf);
 
+    // h2c (opt-in): a connection that opens with the HTTP/2 client preface
+    // is served as HTTP/2 with the same handler; anything else falls
+    // through to the HTTP/1.1 loop below with nothing consumed. The stall
+    // timeout guards the peek; the whole-request deadline stays h1-only
+    // (it has no natural shape on a multiplexed connection).
+    if (o.enable_h2c) {
+        const is_h2 = detectH2Preface(&tr.reader) catch return; // stalled/reset: drop
+        if (is_h2) {
+            h2s.serve(s.gpa, .{
+                .handler = o.handler,
+                .context = o.context,
+                .server_name = o.server_name,
+                .now = .{ .ctx = @ptrCast(&s.io), .epochSeconds = ioEpochSeconds },
+                .peer = stream.socket.address,
+                .max_header_bytes = o.max_header_bytes,
+                .max_body_bytes = o.max_body_bytes,
+                .response_buffer_size = o.response_buffer_size,
+                .compression = o.compression,
+                .gzip_scratch = gz,
+                .on_conn_state = o.on_conn_state,
+                .on_conn_state_ctx = o.on_conn_state_ctx,
+            }, &tr.reader, &tw.writer);
+            return;
+        }
+    }
+
     serveLoop(.{
         .handler = o.handler,
         .context = o.context,
@@ -358,6 +400,28 @@ fn connMain(s: *Server, stream: net.Stream) void {
         .on_conn_state_ctx = o.on_conn_state_ctx,
         .compression = o.compression,
     }, &tr.reader, &tw.writer, bufs, &tr);
+}
+
+/// Peek (never consume) whether the connection opens with the HTTP/2
+/// client preface (RFC 9113 §3.3 prior knowledge). Compares incrementally
+/// against whatever has arrived, so a short HTTP/1.1 request never blocks
+/// waiting for 24 bytes — any real h1 method token diverges from
+/// "PRI * HTTP/2.0" within its first bytes.
+fn detectH2Preface(in: *Reader) error{ReadFailed}!bool {
+    if (in.buffer.len < h2.preface.len) return false; // cannot peek that far
+    var need: usize = 1;
+    while (true) {
+        const got = in.peekGreedy(need) catch |err| switch (err) {
+            // Closed before 24 bytes: not a preface — the h1 path answers
+            // (or quietly closes), exactly as without detection.
+            error.EndOfStream => return false,
+            error.ReadFailed => return error.ReadFailed,
+        };
+        const n = @min(got.len, h2.preface.len);
+        if (!std.mem.eql(u8, got[0..n], h2.preface[0..n])) return false;
+        if (got.len >= h2.preface.len) return true;
+        need = got.len + 1;
+    }
 }
 
 fn ioEpochSeconds(ctx: ?*anyopaque) i64 {
@@ -751,7 +815,9 @@ fn writeErrorResponse(opts: StreamOptions, out: *Writer, date: ?[]const u8, stat
     try out.print("{s}\n", .{reason});
 }
 
-fn methodFromToken(token: []const u8) ?http.Method {
+/// Method-token lookup against the shared vocabulary (case-sensitive, as
+/// the wire demands); also used by the h2 path to map `:method`.
+pub fn methodFromToken(token: []const u8) ?http.Method {
     inline for (@typeInfo(http.Method).@"enum".fields) |f| {
         const m: http.Method = @enumFromInt(f.value);
         if (std.mem.eql(u8, token, comptime m.token())) return m;
@@ -1961,6 +2027,7 @@ test "serveStream: ConnState callback sees new→active→idle→active→closed
 
 test {
     _ = gzip; // pull in gzip.zig's negotiation/eligibility unit tests
+    _ = h2s; // pull in the h2c serving-loop tests (Phase 3.1)
 }
 
 /// min_size below `small_json.len` so both the buffered and the streaming

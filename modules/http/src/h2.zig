@@ -995,6 +995,21 @@ pub const Connection = struct {
         try encodeGoaway(c.gpa, out, last, code, debug);
     }
 
+    /// §5.4.2 stream-error recovery: when the last `recv` failure was
+    /// stream-scoped, close the offending stream, clear the violation and
+    /// return it — the caller answers with RST_STREAM (carrying the
+    /// returned code) and may keep using the connection, including calling
+    /// `recv` again to drain frames already buffered behind the bad one.
+    /// Returns null (and changes nothing) for connection-scoped violations,
+    /// which stay fatal (§5.4.1: GOAWAY and close).
+    pub fn recoverStreamError(c: *Connection) ?Violation {
+        const v = c.violation orelse return null;
+        if (v.scope != .stream) return null;
+        if (c.streams.getPtr(v.stream_id)) |st| st.state = .closed;
+        c.violation = null;
+        return v;
+    }
+
     // ── receive side ────────────────────────────────────────────────────────
 
     pub const RecvError = Error || Allocator.Error;
@@ -2224,6 +2239,42 @@ test "connection: frames on a half-closed(remote) stream → STREAM_CLOSED" {
     try encodeData(gpa, &wire, 1, "late", .{});
     try expectViolation(&conn, wire.items, error.StreamClosed, .stream);
     try testing.expectEqual(@as(u31, 1), conn.violation.?.stream_id);
+}
+
+test "connection: recoverStreamError clears a stream violation; connection error stays fatal" {
+    const gpa = testing.allocator;
+    var conn = try testServer();
+    defer conn.deinit();
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    try encodeHeaders(gpa, &wire, 1, &.{0x82}, .{ .end_stream = true });
+    try encodeData(gpa, &wire, 1, "late", .{}); // → stream-scope STREAM_CLOSED
+    try expectViolation(&conn, wire.items, error.StreamClosed, .stream);
+
+    // Recover: violation reported + cleared, stream closed, connection lives.
+    const v = conn.recoverStreamError().?;
+    try testing.expectEqual(@as(u31, 1), v.stream_id);
+    try testing.expectEqual(ErrorCode.stream_closed, v.code);
+    try testing.expectEqual(@as(?Violation, null), conn.violation);
+    try testing.expectEqual(StreamState.closed, conn.stream(1).?.state);
+
+    // The connection accepts further traffic (a new stream works).
+    wire.clearRetainingCapacity();
+    try encodeHeaders(gpa, &wire, 3, &.{0x82}, .{ .end_stream = true });
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var events: std.ArrayList(Event) = .empty;
+    defer freeEvents(&events);
+    try conn.recv(wire.items, &out, &events);
+    try testing.expectEqual(@as(usize, 1), events.items.len);
+    try testing.expectEqual(@as(u31, 3), events.items[0].headers.stream_id);
+
+    // Connection-scoped violations are not recoverable.
+    wire.clearRetainingCapacity();
+    try encodeRawFrame(gpa, &wire, .settings, 0, 1, &.{}); // SETTINGS on a stream
+    try expectViolation(&conn, wire.items, error.ProtocolError, .connection);
+    try testing.expectEqual(@as(?Violation, null), conn.recoverStreamError());
+    try testing.expect(conn.violation != null);
 }
 
 test "connection: PRIORITY with bad length is a stream-scope FRAME_SIZE_ERROR" {
