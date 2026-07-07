@@ -13,12 +13,13 @@ verifies + commits.**
 
 ---
 
-## Status (2026-07-06)
+## Status (2026-07-07)
 
-**25 registered modules · 580 tests (1 skip = ubus socket absent) · Debug + ReleaseFast green · MIT.**
-Web/API cluster complete (incl. auth + ACME + gzip); flagship `kv` done; network + key extractions done.
+**27 registered modules · 592 tests (1 skip = ubus socket absent) · Debug + ReleaseFast green · MIT.**
+Web/API cluster complete (incl. auth + ACME + gzip); flagship `kv` done; network + key extractions +
+crypto leaves (`hashdigest`/`sealedbox`) done.
 Pre-public: ✅ license/provenance audit (`8b9094e`) · ✅ README module index (`b71377e`).
-**Fable5 credit near-exhausted (reset ~1 month out).** Resume at "Next up" below when credit returns.
+Resume at "Next up" below.
 
 ## Progress (committed; each independently re-verified Debug+ReleaseFast+fmt before commit)
 
@@ -53,14 +54,36 @@ Pre-public: ✅ license/provenance audit (`8b9094e`) · ✅ README module index 
 | license audit (SPDX+Provenance) | — | `8b9094e` |
 | README 24-module index | — | `b71377e` |
 | `latency-stats` | 580 | `ea476cf` |
+| `hashdigest` + `sealedbox` (crypto leaves) | 592 | _this commit_ |
 
 ---
 
-## Next up (resume here — spec written, agent NOT yet launched)
+## Next up (resume here)
 
-**`hashdigest` + `sealedbox`** (spec: `SPEC-crypto.md`, committed) — two small crypto leaves,
-thin over `std.crypto`, extracted from axp `digest.zig` / `sealed.zig`. Streaming SHA-256 (works on
-size-0 /proc files) + NaCl sealed-box (anonymous-sender X25519). Dep-free, portable, offline-verifiable.
+**`dataset`** (wgs anchor) — the highest-leverage next extraction: the canonical columnar table the
+whole wgs compute family + `finstats` sit on. Seed: wgs `src/dataset.zig`. Build it, then `tabular`
+(transforms+series), `jsonshape`, `finstats` (on `dataset`, seed wgs `finance.zig`), and `roquery`.
+Alternatively continue the AXP tail (`stun`/`sntp`/`procnet`/`argsafe`/`l2disco`/`rawsock`/`blobstore`).
+
+## Queued — wgs data/compute family (NEW 2026-07-07; from `~/workspace/wgs` survey)
+A foundational columnar-dataframe stack, well-factored + tested in wgs (all pure `std`, arena, no libc
+except sqlite). Extract in dependency order — `dataset` is the anchor everything else imports.
+- `dataset` (anchor) — canonical columnar table `{columns,rows}` + 5-variant `Value` union
+  (null/int/float/text/bool), eql/order/asFloat, projection, compact binary ser/de, toJson, ISO-date
+  helpers. Seed: wgs `src/dataset.zig` (~434 lines). any · util · std-only.
+- `tabular` — generic `dataset→dataset` algebra: map/aggregate(+fx)/weighted_group_sum/sort/top_n/
+  pivot/resample + cumsum/drawdown/rolling/pct_change/rebase/ffill/merge/join/date_part. Seed: wgs
+  `src/transforms.zig` (~879) + `src/series.zig` (~522). Dep: `dataset`.
+- `jsonshape` — JSON→dataset reshaper (dot-path to array node, typed column projection). Seed: wgs
+  `src/jsonshape.zig` (~222). Dep: `dataset` + `std.json`.
+- `roquery` (security) — hardened read-only SQLite→rows: `SQLITE_OPEN_READONLY` + `PRAGMA query_only`
+  + authorizer allow-list (deny ATTACH/PRAGMA/writes/DDL/load_extension) + hard row cap + `:name`
+  binding. Seed: wgs `src/sqlite.zig` (~296). Dep: sqlite amalgamation + `dataset`. libc (sqlite).
+- **`finstats` seed upgraded** — build it on the new `dataset` module, seeding from wgs `src/finance.zig`
+  (~802: xirr/twr/risk_metrics/beta_alpha/monte_carlo/correlation_matrix/drawdown_episodes, fully
+  tested) instead of the poc-wf source; far more mature. (Was queued under poc-wf below.)
+- Note: wgs carries a redundant 2nd cache copy (`src/cache.zig` vs `deps/ramcache`) — consolidate onto
+  extracted `ramcache` when wgs adopts the lib (housekeeping, not a new module).
 
 ## Queued — rest of the AXP batch
 `procnet` + `argsafe` (axp task.zig — /proc parsers + injection-safe argv validators) · `l2disco`

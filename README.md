@@ -8,7 +8,7 @@ Not a dumping ground: ship **solid, not many**. Most members are *extracted* fro
 across sibling projects (bxp, axp, zig-fping, poc-wf-analytic); a few fill genuine gaps in the Zig
 ecosystem.
 
-**Status:** 25 modules · 580 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 27 modules · 592 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ## Modules
@@ -52,6 +52,13 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `kv` | Crash-consistent embedded KV store (Bitcask-style log + fault-injection–verified recovery) | — |
 | `ramcache` | Bounded in-memory cache with TTL + generation invalidation | — |
 | `decimal` | Exact i128 fixed-point decimal (money math), float-free | — |
+
+### Crypto
+
+| Module | What it does | Platform | Deps |
+|---|---|---|---|
+| `hashdigest` | Streaming SHA-256 — one-shot / incremental / file (reads to EOF, so correct on size-0 `/proc` files) | any | — |
+| `sealedbox` | NaCl `crypto_box_seal` — anonymous-sender X25519 public-key encryption (thin over `std.crypto`) | any | — |
 
 ### Serialization / OS / agent
 
