@@ -34,11 +34,12 @@ zig-libs exists to ship the **good** version of each library, not a copy of the 
   agents work **clean-room from the spec/paper**, never copy source, and report the reference + its
   license so NOTICE records the design ref. (Ongoing so the pre-public audit has material.)
 
-**IN PROGRESS (Fable, value-add, 2026-07-07):**
-- `http` **HPACK (RFC 7541)** — new `modules/http/src/hpack.zig`, full codec verified vs RFC 7541
-  Appendix C vectors. The codec core for HTTP/2; framing (RFC 9113) is the next batch on top of it.
-
 **DONE (Fable, value-add, 2026-07-07):**
+- `http` **HPACK (RFC 7541)** ✅ — new `modules/http/src/hpack.zig` (1477 L): full Encoder/Decoder,
+  integer/Huffman/static+dynamic table, all §6 representations, decompression-bomb guard. Verified
+  vs RFC 7541 Appendix C vectors exactly (encoded bytes + decoded fields + dynamic-table state each
+  step). 20 tests, `test-http` 100/100, Debug+ReleaseFast+fmt green. Clean-room from the RFC (no
+  nghttp2 source). **The codec core for HTTP/2; framing (RFC 9113) is the next batch on top of it.**
 - `ramcache` **→ W-TinyLFU** ✅ — window + SLRU + 4-bit Count-Min sketch (doorkeeper + aging)
   admission/eviction; API backward-compatible (wgs consumes it), `Stats` extended additively
   (`admissions`/`rejections`). Gate met: hit ratio **23.7% vs 14.5% plain-LRU (+63%)** on a Zipf

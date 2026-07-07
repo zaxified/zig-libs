@@ -41,6 +41,11 @@ pub const meta = .{
 /// Content-Length reader) — shared by the client and the server.
 pub const h1 = @import("h1.zig");
 
+/// HPACK header compression for HTTP/2 (RFC 7541): `hpack.Encoder` /
+/// `hpack.Decoder`. Pure codec, verified against the RFC Appendix C
+/// vectors; the HTTP/2 framing layer (Phase 3) will build on it.
+pub const hpack = @import("hpack.zig");
+
 /// The HTTP/1.1 client. See `Client.init` / `Client.request`.
 pub const Client = @import("Client.zig");
 
@@ -301,6 +306,7 @@ const testing = std.testing;
 
 test {
     _ = h1;
+    _ = hpack;
     _ = Client;
     _ = Server;
 }
