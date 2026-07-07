@@ -35,6 +35,13 @@ zig-libs exists to ship the **good** version of each library, not a copy of the 
   license so NOTICE records the design ref. (Ongoing so the pre-public audit has material.)
 
 **DONE (Fable, value-add, 2026-07-07):**
+- `rdap` **NEW module** ✅ — `modules/rdap/src/root.zig` (~1100 L): RDAP (RFC 7480-7484/9082/9083)
+  client — query-URL builder (domain/ip/autnum/nameserver/entity, percent-encoded, rdap+json Accept),
+  tolerant typed JSON response model (objects/events/entities+jCard/nameservers/links/ip-net/autnum +
+  error objects), RFC 9224 bootstrap (longest-suffix TLD / longest-prefix CIDR / ASN-range), fetch
+  behind a seam (offline-testable; `HttpFetcher` over our `http` client). Deps: http + netaddr.
+  19 tests (URL KATs + canned RFC 9083 response/error/sparse/malformed + bootstrap + stub client).
+  Debug+ReleaseFast+fmt green. Clean-room from the RFCs. Pairs with `whois`.
 - `uci` **NEW module** ✅ — `modules/uci/src/root.zig`: OpenWRT UCI config parser + serializer +
   typed model (Package/Section/Option, named/anonymous sections, option/list, full quoting/escaping
   rules, comments), stable round-trip (parse∘serialize∘parse), typed errors with line numbers, arena
@@ -173,8 +180,8 @@ poc-wf: `finstats` · `ipcbus` · `pollworker` · `chunkframe`.
 axp: `lenframe`/`jsonwire`.
 
 ## Queued — network control tail
-`wireguard` (on `netlink`) · `traceroute` (on `icmp`) · `probe` · `rdap`.
-(`nftables` + `modbus` + `whois` + `uci` ✅ done — see DONE above.)
+`wireguard` (on `netlink`) · `traceroute` (on `icmp`) · `probe`.
+(`nftables` + `modbus` + `whois` + `uci` + `rdap` ✅ done — see DONE above.)
 
 ## Capstone
 `exprcalc` (bxp Excel-like evaluator) — build LAST; composes `decimal` (✅) + `datefmt` + `tz` +
