@@ -54,7 +54,7 @@ Resume at "Next up" below.
 | license audit (SPDX+Provenance) | — | `8b9094e` |
 | README 24-module index | — | `b71377e` |
 | `latency-stats` | 580 | `ea476cf` |
-| `hashdigest` + `sealedbox` (crypto leaves) | 592 | _this commit_ |
+| `hashdigest` + `sealedbox` (crypto leaves) | 592 | `6ab35e8` |
 
 ---
 
