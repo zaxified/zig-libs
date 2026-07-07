@@ -35,6 +35,14 @@ zig-libs exists to ship the **good** version of each library, not a copy of the 
   license so NOTICE records the design ref. (Ongoing so the pre-public audit has material.)
 
 **DONE (Fable, value-add, 2026-07-07):**
+- `kv` **full randomized VOPR** ✅ — new `modules/kv/src/vopr.zig` (641 L): seeded deterministic
+  simulator (splitmix64, no clock/OS-rng) that fuzzes recovery across randomized workload+fault
+  schedules (torn/partial writes, short reads, garbage tails, crash points ×3 modes, chained epochs)
+  and model-checks 6 durability invariants after each crash+recovery. Has teeth: min-fault-count
+  asserts + a **sabotage self-test** (a recovery that loses committed data MUST be caught,
+  error.InvariantViolation, ≥10/12 seeds). Reproducible from seed. 3 tests, Debug+ReleaseFast+fmt
+  green (~17s). (Fable wrote it whole before the session limit; Opus finished the 1 const-fix + wired
+  it in.) Supersedes the deferred "Full VOPR" phase; MVCC/HAMT/ordered-scans/txns still deferred.
 - `http` **HPACK (RFC 7541)** ✅ — new `modules/http/src/hpack.zig` (1477 L): full Encoder/Decoder,
   integer/Huffman/static+dynamic table, all §6 representations, decompression-bomb guard. Verified
   vs RFC 7541 Appendix C vectors exactly (encoded bytes + decoded fields + dynamic-table state each
@@ -133,8 +141,8 @@ axp: `lenframe`/`jsonwire`.
 - `http` **HTTP/2** (Ph3) — framing + HPACK on `std.crypto.tls`, verify against h2spec.
 - **TLS-terminating server** — parked on Zig 0.17 (std 0.16 has `tls.Client` only; `ianic/tls.zig`
   needs 0.17-dev). Revisit at 0.17 stable / std TLS server. TLS via proxy meanwhile.
-- **Full VOPR** for `kv` (randomized long-running fault injection at scale); MVCC/HAMT on-disk,
-  ordered scans, txns, secondary indexes, cross-process lock.
+- `kv` **MVCC/HAMT on-disk, ordered scans, txns, secondary indexes, cross-process lock** (the
+  randomized VOPR itself is now DONE — see above; these on-disk/txn features remain deferred).
 
 ## Pre-public checklist
 - ✅ License/provenance audit (SPDX on all files, Provenance on all READMEs, NOTICE, no contamination).

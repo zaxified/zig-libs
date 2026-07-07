@@ -751,6 +751,7 @@ const testing = std.testing;
 test {
     _ = @import("sim.zig");
     _ = @import("fault_test.zig");
+    _ = @import("vopr.zig");
 }
 
 fn expectGet(db: *Db, key: []const u8, want: ?[]const u8) !void {

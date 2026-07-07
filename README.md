@@ -8,7 +8,7 @@ Not a dumping ground: ship **solid, not many**. Most members are *extracted* fro
 across sibling projects (bxp, axp, zig-fping, poc-wf-analytic); a few fill genuine gaps in the Zig
 ecosystem.
 
-**Status:** 27 modules · 619 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 27 modules · 622 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ## Modules
@@ -49,7 +49,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 
 | Module | What it does | Deps |
 |---|---|---|
-| `kv` | Crash-consistent embedded KV store (Bitcask-style log + fault-injection–verified recovery) | — |
+| `kv` | Crash-consistent embedded KV store (Bitcask-style log + **randomized seeded VOPR**: model-checked crash recovery across fuzzed fault schedules) | — |
 | `ramcache` | Bounded in-memory cache — **W-TinyLFU** admission/eviction (window+SLRU+CMS sketch) + TTL + generation invalidation | — |
 | `decimal` | Exact i128 fixed-point decimal (money math), float-free | — |
 
