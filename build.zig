@@ -51,6 +51,7 @@ const module_list = [_]Module{
     .{ .name = "whois" },
     .{ .name = "uci" },
     .{ .name = "mqtt" },
+    .{ .name = "snmp" },
     .{ .name = "rdap", .deps = &.{ "http", "netaddr" } },
     // Scaffold more here (copy modules/_template) — see the catalog in
     // ~/CML/zig-libs-plan.md for the full candidate list.

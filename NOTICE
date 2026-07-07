@@ -165,6 +165,11 @@ audit is pending before any public release.
                Paho are cited as behavior design references only — no source
                was consulted or copied.
 
+  snmp       — clean-room from RFC 1157 (SNMPv1), RFC 1905/3416 (SNMPv2c
+               protocol operations), RFC 2578 (SMI types) and ITU-T X.690
+               (BER). net-snmp (BSD-like) is cited as a behavior reference
+               only — no source was consulted or copied.
+
   latency-stats — the streaming moment stats (min/max/mean/stddev + RFC 3550
                jitter) are from the authors' zig-fping/axp work (see the fping
                attribution above). The `Histogram` percentile support is

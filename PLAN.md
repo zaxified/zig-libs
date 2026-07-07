@@ -35,6 +35,13 @@ zig-libs exists to ship the **good** version of each library, not a copy of the 
   license so NOTICE records the design ref. (Ongoing so the pre-public audit has material.)
 
 **DONE (Fable, value-add, 2026-07-07):**
+- `snmp` **NEW module** ✅ — `modules/snmp/src/` (ber+oid+message+client, 5 files): SNMP v1 + v2c —
+  a BER/ASN.1 codec (definite-length TLV + all SNMP application types incl. Counter64 + v2c
+  exceptions), an OID type (dotted parse/format, wire packing, prefix/order), all 8 PDUs
+  (Get/GetNext/GetBulk/Set/Response/Traps), and a manager client behind a transport seam (get/getNext/
+  getBulk/set + a MIB walker; optional std.Io UDP). 35 tests: BER + message golden KATs, length
+  boundaries, scripted-agent round-trips, garbage sweep. Debug+ReleaseFast+fmt green. Clean-room from
+  RFC 1157/1905/3416/2578 + X.690. The reusable BER codec is a bonus building block.
 - `mqtt` **NEW module** ✅ — `modules/mqtt/src/` (packet+topic+client, ~2300 L): full MQTT 3.1.1
   client — all 14 control-packet types encode/decode (remaining-length varint, UTF-8 fields, will/
   creds), QoS 0/1/2 state machine both send+receive (exactly-once dedup, bounded packet-id pool),
