@@ -8,7 +8,7 @@ Not a dumping ground: ship **solid, not many**. Most members are *extracted* fro
 across sibling projects (bxp, axp, zig-fping, poc-wf-analytic); a few fill genuine gaps in the Zig
 ecosystem.
 
-**Status:** 30 modules · 741 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 31 modules · 771 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ## Modules
@@ -70,6 +70,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `tar` | ustar/GNU tar reader+writer (preserves uid/gid/mtime) + gzip | any (packer: linux) | — |
 | `blobmsg` | OpenWRT ubus client + blob/blobmsg wire codec | any (client: linux) | — |
 | `mcp` | Model Context Protocol server (JSON-RPC 2.0 + tools, app-state ctx) | any | — |
+| `uci` | OpenWRT UCI config parser + serializer + typed model (stable round-trip) | any | — |
 
 ## Using a module
 

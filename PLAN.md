@@ -35,6 +35,12 @@ zig-libs exists to ship the **good** version of each library, not a copy of the 
   license so NOTICE records the design ref. (Ongoing so the pre-public audit has material.)
 
 **DONE (Fable, value-add, 2026-07-07):**
+- `uci` **NEW module** ✅ — `modules/uci/src/root.zig`: OpenWRT UCI config parser + serializer +
+  typed model (Package/Section/Option, named/anonymous sections, option/list, full quoting/escaping
+  rules, comments), stable round-trip (parse∘serialize∘parse), typed errors with line numbers, arena
+  alloc. Retires axp `uci` shell-outs. 30 tests (golden network KAT + canonical-form bytes + quoting
+  matrix + malformed line-number cases). Debug+ReleaseFast+fmt green. Clean-room from the documented
+  format (libuci LGPL = format ref only).
 - `whois` **NEW module** ✅ — `modules/whois/src/root.zig`: RFC 3912 query formatting + response field
   extraction + **referral chasing** (IANA `refer:` → `ReferralServer:`/`Registrar WHOIS Server:` →
   authoritative), transport seam (offline-testable) + optional `std.Io` TCP helper; depth/cycle/byte
@@ -167,8 +173,8 @@ poc-wf: `finstats` · `ipcbus` · `pollworker` · `chunkframe`.
 axp: `lenframe`/`jsonwire`.
 
 ## Queued — network control tail
-`wireguard` (on `netlink`) · `uci` · `traceroute` (on `icmp`) · `probe` · `rdap`.
-(`nftables` + `modbus` + `whois` ✅ done — see DONE above.)
+`wireguard` (on `netlink`) · `traceroute` (on `icmp`) · `probe` · `rdap`.
+(`nftables` + `modbus` + `whois` + `uci` ✅ done — see DONE above.)
 
 ## Capstone
 `exprcalc` (bxp Excel-like evaluator) — build LAST; composes `decimal` (✅) + `datefmt` + `tz` +

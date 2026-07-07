@@ -165,4 +165,10 @@ audit is pending before any public release.
                (MIT OR Apache-2.0) — behavior/format only, no source consulted
                or copied.
 
+  uci        — clean-room from the documented OpenWRT UCI (Unified
+               Configuration Interface) file format (OpenWRT wiki/docs).
+               libuci (LGPL-2.1) is referenced for the format only — no
+               libuci source was consulted or copied; the file format is the
+               documented interface.
+
 See each module's README "Provenance" note for its specific seed and reference.
