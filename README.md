@@ -8,7 +8,7 @@ Not a dumping ground: ship **solid, not many**. Most members are *extracted* fro
 across sibling projects (bxp, axp, zig-fping, poc-wf-analytic); a few fill genuine gaps in the Zig
 ecosystem.
 
-**Status:** 32 modules · 846 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 32 modules · 859 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ## Modules
@@ -27,7 +27,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `throttle` | Global concurrency limit + load-shedding → 503 | router, http |
 | `security-headers` | Secure-by-default response headers (HSTS/CSP/nosniff/frame/referrer/COOP/CORP) | router, http |
 | `cors` | CORS preflight + header injection (secure defaults) | router, http |
-| `validate` | Request body/query/params validation → aggregated 400 (typed + schema) | router, http |
+| `validate` | Request body/query/params validation → aggregated 400 (typed + schema + string `format`: email/uri/uuid/ip/hostname/date-time/…) | router, http, netaddr |
 | `metrics` | Prometheus registry (counter/gauge/histogram) + `/metrics` + request middleware | router, http |
 | `resilience` | Circuit breaker + retry/backoff + timeout for calling upstreams (generic) | — |
 | `openapi` | OpenAPI 3.1 spec generated from the route table + `/openapi.json` | router, http |

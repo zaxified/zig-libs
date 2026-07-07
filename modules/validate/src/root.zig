@@ -13,7 +13,11 @@
 //!   inclusive), `min_len`/`max_len` (string chars / array items), `one_of`
 //!   (the JSON-Schema `enum` keyword — `enum` is a Zig keyword), `pattern`
 //!   (literal/prefix/suffix/charset — **regex is out of scope**, see TODO
-//!   below) and a `custom` predicate — validated against a `std.json.Value`.
+//!   below), `format` (the JSON Schema 2020-12 `format` vocabulary as
+//!   assertions: `email`, `uri`/`uri_reference`, `uuid`, `ipv4`/`ipv6`,
+//!   `hostname`, `date`/`time`/`date_time`, `duration`, `json_pointer` —
+//!   also standalone via `validateFormat`) and a `custom` predicate —
+//!   validated against a `std.json.Value`.
 //!   Every error is **aggregated** into `{ path, code, message }` — never
 //!   fail-fast; users hate fixing one field at a time (pydantic behavior).
 //! - **Body**: the idiomatic **typed** style `parseInto(T, gpa, body)` — a
@@ -33,7 +37,7 @@
 //!   `TypedBody(T).get` / `queryValues` getters — stackable, see below).
 //!
 //! Error `code`s follow **pydantic v2** vocabulary (`missing`, `int_type`,
-//! `greater_than_equal`, `string_too_short`, `too_long`, `enum`,
+//! `greater_than_equal`, `string_too_short`, `too_long`, `enum`, `format`,
 //! `string_pattern_mismatch`, `int_parsing`, `json_invalid`, …), with
 //! `array_type`/`object_type` renamed from pydantic's `list_type`/`dict_type`
 //! to match JSON vocabulary. Keyword *meanings* follow JSON Schema 2020-12:
@@ -63,6 +67,7 @@
 const std = @import("std");
 const router = @import("router");
 const http = @import("http");
+const netaddr = @import("netaddr");
 
 pub const meta = .{
     .status = .gap,
@@ -72,8 +77,8 @@ pub const meta = .{
     // and every per-request allocation is request-scoped — reentrant across
     // all of http.Server's connection threads.
     .concurrency = .reentrant,
-    .model_after = "pydantic v2 (error shape + codes) + JSON Schema 2020-12 (keyword semantics) + go-playground/validator (middleware ergonomics)",
-    .deps = .{ "router", "http" },
+    .model_after = "pydantic v2 (error shape + codes) + JSON Schema 2020-12 (keyword semantics + format vocabulary) + go-playground/validator (middleware ergonomics)",
+    .deps = .{ "router", "http", "netaddr" },
 };
 
 const Allocator = std.mem.Allocator;
@@ -97,6 +102,45 @@ pub const Pattern = union(enum) {
     charset: []const u8,
 };
 
+/// String format assertions — the JSON Schema 2020-12 `format` vocabulary
+/// with **assertion** behavior (a mismatch is a validation error, not an
+/// annotation). Checked by `validateFormat` and the `Rule.format` constraint.
+/// Semantics per format (see the validators below for the exact profiles):
+///
+/// - `email` — practical RFC 5321 subset: dot-atom local part (1–64 chars,
+///   no quoted strings) `@` a hostname containing a dot, ≤ 254 total.
+/// - `uri` — RFC 3986 structural check: valid scheme + only URI characters,
+///   well-formed `%XX` escapes, at most one `#`. `uri_reference` is the
+///   same without requiring a scheme ("" and relative refs are valid).
+/// - `uuid` — the 8-4-4-4-12 hex shape, case-insensitive. The variant and
+///   version nibbles are deliberately **not** checked (any hex accepted).
+/// - `ipv4` / `ipv6` — `netaddr.parseIp`, asserting the parsed family.
+/// - `hostname` — RFC 1123: labels 1–63 alnum/hyphen chars, hyphen not at
+///   label ends, ≤ 253 total, no empty labels.
+/// - `date` / `time` / `date_time` — RFC 3339 profile with real range
+///   checks (month 1–12, day per month incl. leap years, hour ≤ 23,
+///   minute ≤ 59, second ≤ 60 — `23:59:60` is accepted since RFC 3339
+///   permits leap seconds). The UTC offset (`Z` / `±HH:MM`) is validated
+///   strictly when present but is **optional** (offset-less local times
+///   are accepted — ISO 8601 profile, slightly laxer than RFC 3339).
+/// - `duration` — the RFC 3339 appendix-A ISO 8601 grammar (`P…` with
+///   ordered Y/M/D and T-separated H/M/S components, or the week form).
+/// - `json_pointer` — RFC 6901: "" or `/`-prefixed, `~` only as `~0`/`~1`.
+pub const Format = enum {
+    email,
+    uri,
+    uri_reference,
+    uuid,
+    ipv4,
+    ipv6,
+    hostname,
+    date,
+    time,
+    date_time,
+    duration,
+    json_pointer,
+};
+
 /// Caller-supplied predicate, run after all built-in checks pass the type
 /// gate. Runs on the request thread — must be fast and thread-safe.
 pub const Custom = struct {
@@ -112,9 +156,9 @@ pub const Custom = struct {
 };
 
 /// One field rule. Constraints apply per kind: `min`/`max` to numerics,
-/// `min_len`/`max_len` to strings (bytes) and arrays (items), `one_of` and
-/// `pattern` to strings, `fields` to objects, `items` to arrays. Constraints
-/// for other kinds are ignored.
+/// `min_len`/`max_len` to strings (bytes) and arrays (items), `one_of`,
+/// `pattern` and `format` to strings, `fields` to objects, `items` to
+/// arrays. Constraints for other kinds are ignored.
 pub const Rule = struct {
     /// Object key this rule applies to (ignored on `items` element rules).
     field: []const u8,
@@ -136,6 +180,9 @@ pub const Rule = struct {
     /// `one_of` because `enum` is a Zig keyword).
     one_of: ?[]const []const u8 = null,
     pattern: ?Pattern = null,
+    /// String format assertion (JSON Schema 2020-12 `format` keyword);
+    /// a mismatch yields the `format` error code.
+    format: ?Format = null,
     custom: ?Custom = null,
     /// Nested rules for `.object` fields (JSON Schema `properties`); error
     /// paths become "parent.child".
@@ -323,6 +370,8 @@ fn checkRule(b: *Builder, path: []const u8, v: Value, rule: *const Rule) Allocat
                 }
             }
             if (rule.pattern) |p| try checkPattern(b, path, s, p);
+            if (rule.format) |f| if (!validateFormat(f, s))
+                try b.append(path, "format", formatMessage(f));
         },
         .array => {
             const items = v.array.items;
@@ -416,6 +465,277 @@ fn checkPattern(b: *Builder, path: []const u8, s: []const u8, p: Pattern) Alloca
             }
         },
     }
+}
+
+// ── string format validators (JSON Schema 2020-12 `format`) ─────────────────
+//
+// Clean-room from the JSON Schema 2020-12 format-annotation vocabulary and
+// the underlying RFCs (5321, 3986, 4122, 1123, 3339, 6901). Pure functions:
+// no allocation, never panic — any byte sequence (empty, huge, non-UTF-8)
+// is simply valid or not.
+
+/// True when `s` conforms to `format` (see `Format` for each profile).
+/// Standalone entry point; the schema path uses it via `Rule.format`.
+pub fn validateFormat(format: Format, s: []const u8) bool {
+    return switch (format) {
+        .email => isEmail(s),
+        .uri => isUri(s, true),
+        .uri_reference => isUri(s, false),
+        .uuid => isUuid(s),
+        .ipv4 => if (netaddr.parseIp(s)) |ip| ip == .v4 else false,
+        .ipv6 => if (netaddr.parseIp(s)) |ip| ip == .v6 else false,
+        .hostname => isHostname(s),
+        .date => isDate(s),
+        .time => isTime(s),
+        .date_time => isDateTime(s),
+        .duration => isDuration(s),
+        .json_pointer => isJsonPointer(s),
+    };
+}
+
+/// Static (arena-free) message for the `format` error code.
+fn formatMessage(format: Format) []const u8 {
+    return switch (format) {
+        .email => "Input should be a valid email address",
+        .uri => "Input should be a valid URI",
+        .uri_reference => "Input should be a valid URI reference",
+        .uuid => "Input should be a valid UUID",
+        .ipv4 => "Input should be a valid IPv4 address",
+        .ipv6 => "Input should be a valid IPv6 address",
+        .hostname => "Input should be a valid hostname",
+        .date => "Input should be a valid date",
+        .time => "Input should be a valid time",
+        .date_time => "Input should be a valid date-time",
+        .duration => "Input should be a valid duration",
+        .json_pointer => "Input should be a valid JSON Pointer",
+    };
+}
+
+/// Practical RFC 5321 subset: dot-atom local part `@` dotted hostname.
+/// No quoted-string locals, no address literals, no full RFC 5322.
+fn isEmail(s: []const u8) bool {
+    if (s.len < 3 or s.len > 254) return false;
+    const at = std.mem.indexOfScalar(u8, s, '@') orelse return false;
+    if (std.mem.indexOfScalarPos(u8, s, at + 1, '@') != null) return false;
+    const local = s[0..at];
+    const domain = s[at + 1 ..];
+    if (local.len == 0 or local.len > 64) return false;
+    if (local[0] == '.' or local[local.len - 1] == '.') return false;
+    var prev_dot = false;
+    for (local) |c| {
+        if (c == '.') {
+            if (prev_dot) return false; // no ".." (dot-atom)
+            prev_dot = true;
+        } else {
+            prev_dot = false;
+            if (!isAtext(c)) return false;
+        }
+    }
+    // Deliverable addresses need a dotted FQDN, not a bare label.
+    return isHostname(domain) and std.mem.indexOfScalar(u8, domain, '.') != null;
+}
+
+/// RFC 5321 atext: the characters allowed in an unquoted local-part atom.
+fn isAtext(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or
+        std.mem.indexOfScalar(u8, "!#$%&'*+-/=?^_`{|}~", c) != null;
+}
+
+/// RFC 3986 structural check: every byte a valid URI character, `%XX`
+/// escapes well-formed, at most one `#`. With `require_scheme` the string
+/// must additionally start `scheme:` (ALPHA *(ALPHA/DIGIT/"+"/"-"/".")) —
+/// that is `uri`; without, any (even empty) relative reference passes —
+/// that is `uri_reference`. Not a full parser: component splitting and
+/// authority shape are out of scope.
+fn isUri(s: []const u8, require_scheme: bool) bool {
+    var fragments: usize = 0;
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        const c = s[i];
+        if (c == '%') {
+            if (i + 2 >= s.len) return false;
+            if (!std.ascii.isHex(s[i + 1]) or !std.ascii.isHex(s[i + 2])) return false;
+            i += 2;
+        } else if (c == '#') {
+            fragments += 1;
+            if (fragments > 1) return false;
+        } else if (!isUriChar(c)) {
+            return false;
+        }
+    }
+    if (!require_scheme) return true;
+    const colon = std.mem.indexOfScalar(u8, s, ':') orelse return false;
+    if (colon == 0 or !std.ascii.isAlphabetic(s[0])) return false;
+    for (s[1..colon]) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '+' and c != '-' and c != '.') return false;
+    }
+    // The first ':' must be the scheme separator, not path/query/fragment.
+    return std.mem.indexOfAny(u8, s[0..colon], "/?#") == null;
+}
+
+/// unreserved / gen-delims / sub-delims ('%' and '#' are handled above).
+fn isUriChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or
+        std.mem.indexOfScalar(u8, "-._~:/?[]@!$&'()*+,;=", c) != null;
+}
+
+/// The canonical 8-4-4-4-12 hex shape, case-insensitive. Shape only: the
+/// RFC 4122 variant/version nibbles are not asserted (documented choice —
+/// JSON Schema test-suite behavior, and NIL/max UUIDs stay valid).
+fn isUuid(s: []const u8) bool {
+    if (s.len != 36) return false;
+    for (s, 0..) |c, i| {
+        switch (i) {
+            8, 13, 18, 23 => if (c != '-') return false,
+            else => if (!std.ascii.isHex(c)) return false,
+        }
+    }
+    return true;
+}
+
+/// RFC 1123 hostname: dot-separated labels of 1–63 alphanumeric/hyphen
+/// characters, hyphen not at label ends, 253 bytes total. No trailing dot
+/// (an empty label anywhere is rejected); all-numeric labels are allowed.
+fn isHostname(s: []const u8) bool {
+    if (s.len == 0 or s.len > 253) return false;
+    var it = std.mem.splitScalar(u8, s, '.');
+    while (it.next()) |label| {
+        if (label.len == 0 or label.len > 63) return false;
+        if (label[0] == '-' or label[label.len - 1] == '-') return false;
+        for (label) |c| {
+            if (!std.ascii.isAlphanumeric(c) and c != '-') return false;
+        }
+    }
+    return true;
+}
+
+/// RFC 3339 full-date `YYYY-MM-DD` with real calendar ranges: month 1–12,
+/// day 1–{28,29,30,31} per month with Gregorian leap years.
+fn isDate(s: []const u8) bool {
+    if (s.len != 10 or s[4] != '-' or s[7] != '-') return false;
+    const y = parseDigits(s[0..4]) orelse return false;
+    const m = parseDigits(s[5..7]) orelse return false;
+    const d = parseDigits(s[8..10]) orelse return false;
+    if (m < 1 or m > 12) return false;
+    return d >= 1 and d <= daysInMonth(y, m);
+}
+
+/// `HH:MM:SS[.frac][Z|±HH:MM]` with ranges: hour ≤ 23, minute ≤ 59,
+/// second ≤ 60 (60 = leap second, which RFC 3339 permits — accepted at any
+/// time of day since the grammar cannot know the leap-second table). The
+/// offset is validated strictly when present but is optional (ISO 8601
+/// local-time profile; RFC 3339 proper would require it).
+fn isTime(s: []const u8) bool {
+    if (s.len < 8 or s[2] != ':' or s[5] != ':') return false;
+    const h = parseDigits(s[0..2]) orelse return false;
+    const m = parseDigits(s[3..5]) orelse return false;
+    const sec = parseDigits(s[6..8]) orelse return false;
+    if (h > 23 or m > 59 or sec > 60) return false;
+    var i: usize = 8;
+    if (i < s.len and s[i] == '.') {
+        i += 1;
+        const start = i;
+        while (i < s.len and std.ascii.isDigit(s[i])) i += 1;
+        if (i == start) return false; // '.' needs at least one digit
+    }
+    if (i == s.len) return true; // offset-less local time
+    return isUtcOffset(s[i..]);
+}
+
+/// `Z`/`z` or `±HH:MM` (hour ≤ 23, minute ≤ 59).
+fn isUtcOffset(s: []const u8) bool {
+    if (s.len == 1 and (s[0] == 'Z' or s[0] == 'z')) return true;
+    if (s.len != 6 or (s[0] != '+' and s[0] != '-') or s[3] != ':') return false;
+    const h = parseDigits(s[1..3]) orelse return false;
+    const m = parseDigits(s[4..6]) orelse return false;
+    return h <= 23 and m <= 59;
+}
+
+/// RFC 3339 date-time: `full-date "T" time` (`T` case-insensitive; a space
+/// separator is rejected). Offset optionality follows `isTime`.
+fn isDateTime(s: []const u8) bool {
+    if (s.len < 12) return false;
+    if (s[10] != 'T' and s[10] != 't') return false;
+    return isDate(s[0..10]) and isTime(s[11..]);
+}
+
+/// ISO 8601 duration per the RFC 3339 appendix-A grammar (what JSON Schema
+/// `duration` cites): `P` + date components in Y→M→D order and/or `T` +
+/// time components in H→M→S order, each at most once, at least one overall;
+/// or the exclusive week form `P<n>W`.
+fn isDuration(s: []const u8) bool {
+    if (s.len < 3 or s[0] != 'P') return false;
+    const body = s[1..];
+    if (body[body.len - 1] == 'W') return allDigits(body[0 .. body.len - 1]);
+    var i: usize = 0;
+    var in_time = false;
+    var order: usize = 0; // strictly increasing index into "YMD" / "HMS"
+    var any = false;
+    while (i < body.len) {
+        if (!in_time and body[i] == 'T') {
+            in_time = true;
+            order = 0;
+            i += 1;
+            if (i == body.len) return false; // bare trailing 'T'
+            continue;
+        }
+        const start = i;
+        while (i < body.len and std.ascii.isDigit(body[i])) i += 1;
+        if (i == start or i == body.len) return false; // need digits + unit
+        const units: []const u8 = if (in_time) "HMS" else "YMD";
+        const pos = std.mem.indexOfScalar(u8, units, body[i]) orelse return false;
+        if (pos < order) return false; // out of order or repeated
+        order = pos + 1;
+        i += 1;
+        any = true;
+    }
+    return any;
+}
+
+/// RFC 6901 JSON Pointer: "" (whole document) or `/`-prefixed tokens where
+/// `~` appears only as the escapes `~0` / `~1`.
+fn isJsonPointer(s: []const u8) bool {
+    if (s.len == 0) return true;
+    if (s[0] != '/') return false;
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        if (s[i] == '~') {
+            if (i + 1 >= s.len or (s[i + 1] != '0' and s[i + 1] != '1')) return false;
+            i += 1;
+        }
+    }
+    return true;
+}
+
+/// Fixed-width all-digit parse (≤ 4 chars at every call site — no overflow).
+fn parseDigits(s: []const u8) ?u32 {
+    var v: u32 = 0;
+    for (s) |c| {
+        if (!std.ascii.isDigit(c)) return null;
+        v = v * 10 + (c - '0');
+    }
+    return v;
+}
+
+fn allDigits(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| {
+        if (!std.ascii.isDigit(c)) return false;
+    }
+    return true;
+}
+
+fn daysInMonth(y: u32, m: u32) u32 {
+    return switch (m) {
+        1, 3, 5, 7, 8, 10, 12 => 31,
+        4, 6, 9, 11 => 30,
+        2 => if (isLeapYear(y)) @as(u32, 29) else 28,
+        else => unreachable, // caller checked 1–12
+    };
+}
+
+fn isLeapYear(y: u32) bool {
+    return (y % 4 == 0 and y % 100 != 0) or y % 400 == 0;
 }
 
 // ── query + path params (strings → coerce + check) ──────────────────────────
@@ -1096,6 +1416,311 @@ test "pattern: literal / prefix / suffix / charset → string_pattern_mismatch" 
     for (bad.errors) |e| try testing.expectEqualStrings("string_pattern_mismatch", e.code);
 }
 
+// ── tests: string formats ───────────────────────────────────────────────────
+
+fn expectFormat(f: Format, valid: []const []const u8, invalid: []const []const u8) !void {
+    for (valid) |s| {
+        if (!validateFormat(f, s)) {
+            std.debug.print("{s}: expected VALID: \"{s}\"\n", .{ @tagName(f), s });
+            return error.TestUnexpectedResult;
+        }
+    }
+    for (invalid) |s| {
+        if (validateFormat(f, s)) {
+            std.debug.print("{s}: expected INVALID: \"{s}\"\n", .{ @tagName(f), s });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "format truth table: email" {
+    try expectFormat(.email, &.{
+        "a@b.com",
+        "user.name+tag@example.co.uk",
+        "x_1!#$%&'*=?@foo-bar.example.com",
+        "1@2.3", // all-numeric labels are RFC 1123 legal
+    }, &.{
+        "",
+        "a@b", // no dot in domain
+        "@b.com", // empty local
+        "a@", // empty domain
+        "a b@c.com", // space
+        "a@@b.com", // two '@'
+        "a@b..com", // empty domain label
+        ".a@b.com", // dot at local start
+        "a.@b.com", // dot at local end
+        "a..b@c.com", // consecutive dots
+        "a@-b.com", // hyphen at label start
+        ("a" ** 65) ++ "@b.com", // local > 64
+    });
+}
+
+test "format truth table: uri + uri_reference" {
+    try expectFormat(.uri, &.{
+        "https://example.com/path?q=1#frag",
+        "mailto:user@example.com",
+        "urn:isbn:0451450523",
+        "ftp://ftp.example.com:21/files",
+        "a+b-c.d://x", // exotic but legal scheme chars
+    }, &.{
+        "",
+        "example.com/path", // no scheme
+        "//host/path", // scheme-relative, not absolute
+        "http://exa mple.com", // space
+        "1http://x", // scheme starts with a digit
+        "http://x/%zz", // bad percent escape
+        "http://x/%4", // truncated percent escape
+        "http://x#a#b", // two fragments
+        "http://x/\x01", // control byte
+    });
+    try expectFormat(.uri_reference, &.{
+        "", // empty relative ref is valid (RFC 3986)
+        "/path/to?x=1",
+        "//host/p",
+        "#frag",
+        "foo/bar",
+        "https://e.com",
+    }, &.{
+        "a b", // space
+        "%3", // truncated escape
+        "%GG", // non-hex escape
+        "\xff\xfe", // non-URI bytes
+    });
+}
+
+test "format truth table: uuid (shape only, case-insensitive)" {
+    try expectFormat(.uuid, &.{
+        "123e4567-e89b-12d3-a456-426614174000",
+        "123E4567-E89B-12D3-A456-426614174000",
+        "00000000-0000-0000-0000-000000000000", // NIL — version not asserted
+        "ffffffff-ffff-ffff-ffff-ffffffffffff",
+    }, &.{
+        "",
+        "123e4567-e89b-12d3-a456-42661417400", // 35 chars
+        "123e4567-e89b-12d3-a456-4266141740000", // 37 chars
+        "123e4567e89b12d3a456426614174000", // no hyphens
+        "123e4567-e89b-12d3-a456-42661417400g", // non-hex
+        "123e4567_e89b_12d3_a456_426614174000", // wrong separators
+    });
+}
+
+test "format truth table: ipv4 + ipv6 (via netaddr, family asserted)" {
+    try expectFormat(.ipv4, &.{
+        "192.0.2.1",
+        "0.0.0.0",
+        "255.255.255.255",
+    }, &.{
+        "",
+        "256.0.0.1", // octet out of range
+        "::1", // v6 is not v4
+        "1.2.3",
+        "1.2.3.4.5",
+        "01.2.3.4", // leading zero
+        "1.2.3.x",
+    });
+    try expectFormat(.ipv6, &.{
+        "2001:db8::1",
+        "::1",
+        "::",
+        "::ffff:192.0.2.1", // v4-mapped parses as the v6 family
+        "2001:0db8:0000:0000:0000:0000:0000:0001",
+    }, &.{
+        "",
+        "192.0.2.1", // v4 is not v6
+        "2001:db8::1::2", // two '::'
+        "gggg::1", // non-hex group
+        "2001:db8", // too few groups
+        "fe80::1%eth0", // zone rejected by netaddr policy
+    });
+}
+
+test "format truth table: hostname" {
+    try expectFormat(.hostname, &.{
+        "foo.example.com",
+        "localhost",
+        "a",
+        "xn--nxasmq6b.example", // punycode shape
+        "123.example",
+        ("a" ** 63) ++ ".example", // longest legal label
+    }, &.{
+        "",
+        "-bad.example", // hyphen at label start
+        "bad-.example", // hyphen at label end
+        "a..b", // empty label
+        "foo.example.com.", // trailing dot = empty last label
+        "foo_bar.example", // underscore
+        ("a" ** 64) ++ ".example", // label > 63
+        // 257 bytes of valid labels → total-length limit trips:
+        ("a" ** 63) ++ "." ++ ("b" ** 63) ++ "." ++ ("c" ** 63) ++ "." ++ ("d" ** 63) ++ ".e",
+    });
+}
+
+test "format truth table: date (calendar-correct, incl. leap years)" {
+    try expectFormat(.date, &.{
+        "2024-02-29", // leap year
+        "2000-02-29", // 400-rule leap year
+        "2023-12-31",
+        "2023-01-01",
+        "2023-04-30",
+    }, &.{
+        "",
+        "2023-02-29", // not a leap year
+        "1900-02-29", // 100-rule non-leap
+        "2024-13-01", // month 13
+        "2024-00-10", // month 0
+        "2024-01-00", // day 0
+        "2024-01-32", // day 32
+        "2024-04-31", // April has 30
+        "2024-1-01", // not zero-padded
+        "20240101", // no separators
+        "2024/01/01",
+    });
+}
+
+test "format truth table: time (leap second 23:59:60 ACCEPTED per RFC 3339)" {
+    try expectFormat(.time, &.{
+        "00:00:00",
+        "23:59:59",
+        "23:59:60", // leap second — documented accept
+        "12:30:45.123",
+        "12:30:45Z",
+        "12:30:45z",
+        "12:30:45.5+02:00",
+        "12:30:45-23:59",
+    }, &.{
+        "",
+        "24:00:00", // hour 24
+        "12:60:00", // minute 60
+        "12:00:61", // second 61
+        "12:00:00.", // empty fraction
+        "12:00:00+2:00", // unpadded offset hour
+        "12:00:00+24:00", // offset hour out of range
+        "12:00:00+02:60", // offset minute out of range
+        "12:00:00X", // junk suffix
+        "1:00:00", // not zero-padded
+    });
+}
+
+test "format truth table: date_time (combined form; T required)" {
+    try expectFormat(.date_time, &.{
+        "2024-01-02T03:04:05Z",
+        "2024-01-02T03:04:05+02:00",
+        "2024-01-02t03:04:05z", // lowercase t/z (RFC 3339 case-insensitive)
+        "2024-02-29T23:59:60Z", // leap day + leap second
+        "2024-01-02T03:04:05.123-07:00",
+        "2024-01-02T03:04:05", // offset-less accepted (documented ISO profile)
+    }, &.{
+        "",
+        "2024-01-02 03:04:05Z", // space instead of T
+        "2024-01-0203:04:05Z", // missing separator entirely
+        "2023-02-29T00:00:00Z", // invalid date part
+        "2024-01-02T25:00:00Z", // invalid time part
+        "2024-01-02T03:04:05+2:00", // bad offset
+        "2024-01-02T", // no time
+        "03:04:05Z", // no date
+    });
+}
+
+test "format truth table: duration + json_pointer (optional formats)" {
+    try expectFormat(.duration, &.{
+        "P1Y2M3DT4H5M6S",
+        "P1D",
+        "PT1S",
+        "PT0S",
+        "P1W", // week form
+        "P3Y6M4DT12H30M5S",
+    }, &.{
+        "",
+        "P", // no components
+        "PT", // bare T
+        "1Y", // missing P
+        "P1S", // time unit in the date part
+        "P1D2Y", // out of order
+        "PT1S2H", // out of order
+        "P1Y1Y", // repeated unit
+        "P1W2D", // week form is exclusive
+        "-P1D",
+        "P1.5D", // fractions not in the cited grammar
+    });
+    try expectFormat(.json_pointer, &.{
+        "", // whole document
+        "/",
+        "/foo/bar",
+        "/a~0b/c~1d", // ~0 and ~1 escapes
+        "/foo/0",
+    }, &.{
+        "foo", // must start with '/'
+        "/a~2", // bad escape
+        "/a~", // dangling '~'
+    });
+}
+
+test "format robustness: every format rejects hostile input without panicking" {
+    const hostile = [_][]const u8{
+        "", // empty
+        "\xff\xfe\x80garbage\x00", // non-UTF-8 bytes + NUL
+        "a" ** 5000, // huge
+        "%", "~", "-", ".", ":", "@", // lone specials near each grammar
+    };
+    inline for (@typeInfo(Format).@"enum".fields) |f| {
+        const format: Format = @enumFromInt(f.value);
+        for (hostile) |s| _ = validateFormat(format, s);
+    }
+    // And the huge/garbage cases really are invalid everywhere.
+    inline for (@typeInfo(Format).@"enum".fields) |f| {
+        const format: Format = @enumFromInt(f.value);
+        try testing.expect(!validateFormat(format, "\xff\xfe\x80garbage\x00"));
+    }
+}
+
+test "format rule: aggregated errors with field paths + the format code" {
+    const schema = [_]Rule{
+        .{ .field = "email", .kind = .string, .required = true, .format = .email },
+        .{ .field = "host", .kind = .string, .format = .hostname },
+        .{ .field = "when", .kind = .string, .format = .date_time },
+        .{ .field = "peer", .kind = .object, .fields = &.{
+            .{ .field = "ip", .kind = .string, .format = .ipv6 },
+        } },
+    };
+    var bad = try validateJson(testing.allocator,
+        \\{"email":"not-an-email","host":"-x.example","when":"2024-13-01T00:00:00Z","peer":{"ip":"192.0.2.1"}}
+    , &schema);
+    defer bad.deinit();
+    try testing.expectEqual(@as(usize, 4), bad.errors.len);
+    try expectError(&bad, "email", "format");
+    try expectError(&bad, "host", "format");
+    try expectError(&bad, "when", "format");
+    try expectError(&bad, "peer.ip", "format"); // nested path composes
+    try testing.expectEqualStrings("Input should be a valid email address", bad.errors[0].message);
+    try testing.expectEqualStrings("Input should be a valid IPv6 address", bad.errors[3].message);
+
+    var good = try validateJson(testing.allocator,
+        \\{"email":"a@b.com","host":"x.example","when":"2024-01-02T03:04:05Z","peer":{"ip":"2001:db8::1"}}
+    , &schema);
+    defer good.deinit();
+    try testing.expect(good.ok());
+
+    // Wrong type → one <kind>_type error, format never runs (type gate).
+    var wrong = try validateJson(testing.allocator, "{\"email\":5}", &schema);
+    defer wrong.deinit();
+    try expectError(&wrong, "email", "string_type");
+    try testing.expect(wrong.find("email").?.code.len > 0);
+    for (wrong.errors) |e| try testing.expect(!std.mem.eql(u8, e.code, "format"));
+}
+
+test "format rule: applies to coerced query strings too" {
+    const schema = [_]Rule{
+        .{ .field = "cb", .kind = .string, .required = true, .format = .uri },
+    };
+    var bad = try validateQuery(testing.allocator, "cb=not%20a%20uri", &schema);
+    defer bad.deinit();
+    try expectError(&bad, "cb", "format");
+
+    var good = try validateQuery(testing.allocator, "cb=https%3A%2F%2Fe.com%2Fhook", &schema);
+    defer good.deinit();
+    try testing.expect(good.ok());
+}
+
 fn evenCheck(ctx: ?*anyopaque, v: Value) bool {
     const counter: *u32 = @ptrCast(@alignCast(ctx.?));
     counter.* += 1;
@@ -1585,6 +2210,43 @@ test "Body middleware: over-limit body → 413" {
     try expectStatus(got, "413");
     try testing.expect(std.mem.indexOf(u8, got, "\"code\":\"too_large\"") != null);
     try testing.expect(!probe.invoked);
+}
+
+const contact_schema = [_]Rule{
+    .{ .field = "email", .kind = .string, .required = true, .format = .email },
+    .{ .field = "website", .kind = .string, .format = .uri },
+};
+
+fn hContact(ctx: *router.Ctx) anyerror!void {
+    Probe.of(ctx).invoked = true;
+    try ctx.res.writeAll("contact ok");
+}
+
+test "Body middleware: format failure → aggregated 400 with path + format code" {
+    var probe: Probe = .{};
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &probe;
+    const body_mw: Body = .{ .gpa = testing.allocator, .schema = &contact_schema };
+    try r.use(body_mw.middleware());
+    try r.post("/contacts", hContact);
+
+    var buf: [2048]u8 = undefined;
+    const bad = runWire(&r, postWire("/contacts",
+        \\{"email":"nope","website":"not a uri"}
+    ), &buf);
+    try expectStatus(bad, "400");
+    try testing.expectEqualStrings(
+        \\{"errors":[{"path":"email","code":"format","message":"Input should be a valid email address"},{"path":"website","code":"format","message":"Input should be a valid URI"}]}
+    , bodyOf(bad));
+    try testing.expect(!probe.invoked);
+
+    const good = runWire(&r, postWire("/contacts",
+        \\{"email":"a@b.com","website":"https://example.com/x"}
+    ), &buf);
+    try expectStatus(good, "200");
+    try testing.expectEqualStrings("contact ok", bodyOf(good));
+    try testing.expect(probe.invoked);
 }
 
 const TypedThing = TypedBody(Widget);

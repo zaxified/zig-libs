@@ -35,6 +35,12 @@ zig-libs exists to ship the **good** version of each library, not a copy of the 
   license so NOTICE records the design ref. (Ongoing so the pre-public audit has material.)
 
 **DONE (Fable, value-add, 2026-07-07):**
+- `validate` **+ format validators** ✅ — added the JSON Schema `format` vocabulary: email, uri/
+  uri_reference, uuid, ipv4/ipv6 (dogfoods `netaddr.parseIp` → new netaddr dep), hostname, date/time/
+  date_time (RFC 3339 with real range + leap-year checks), duration, json_pointer. Wired as a per-field
+  `.format` rule into the aggregated 400 path + a standalone `validateFormat`. Pure, zero-alloc,
+  no-panic. 49 test-validate (+13 truth-table + schema/400 wire). Debug+ReleaseFast+fmt green.
+  Clean-room from JSON Schema 2020-12 + RFC 5321/3986/1123/3339/6901.
 - `mcp` **+ resources + prompts** ✅ — extended the MCP server from tools-only to all three primitives:
   `resources/list`·`read` (text+base64 blob)·`templates/list` and `prompts/list`·`get` (arg-validated,
   rendered messages), with matching `addResource`/`addResourceTemplate`/`addPrompt` registration
