@@ -16,9 +16,32 @@
 //! layer up: feed received bytes to `Connection.recv` and write out the
 //! bytes it and the `send*` calls append to `out`.
 //!
+//! Denial-of-service hardening (all limits configurable via
+//! `Connection.Options`, breaches surface as `error.EnhanceYourCalm` so
+//! the caller answers GOAWAY(ENHANCE_YOUR_CALM) and closes, §5.4.1):
+//! - **Rapid reset (CVE-2023-44487)**: streams reset before completing —
+//!   RST_STREAM received on a non-closed stream, or reset by us after a
+//!   stream-scoped violation — are counted; over `max_reset_streams` the
+//!   connection dies instead of doing unbounded setup/teardown work.
+//! - **CONTINUATION flood (CVE-2024-27316)**: one header sequence may use
+//!   at most `max_continuation_frames` CONTINUATION frames (so a stream of
+//!   zero-length CONTINUATIONs that never sets END_HEADERS dies) *and* at
+//!   most `max_header_block` reassembled octets. Connection-scoped, since
+//!   the header block is part of the shared HPACK compression context. The
+//!   HPACK decoder's own `max_header_list_size` decompression-bomb guard
+//!   (RFC 7541) applies after reassembly, independently.
+//! - **Control-frame floods**: frames that make no progress (PING,
+//!   SETTINGS after the handshake, PRIORITY, zero-length DATA without
+//!   END_STREAM, repeated HEADERS on an existing stream, unknown types)
+//!   consume a shared budget of `max_unproductive_frames` consecutive
+//!   frames; progress (a new request stream, DATA that carries bytes or
+//!   END_STREAM) resets it. PINGs are still answered while under budget.
+//!
 //! Provenance: clean-room implementation from RFC 9113 (with RFC 7540
-//! consulted only where it clarifies the same rules, e.g. §5.1/§6.9.2);
-//! no HTTP/2 implementation source was consulted or copied.
+//! consulted only where it clarifies the same rules, e.g. §5.1/§6.9.2)
+//! plus, for the hardening, RFC 9113 §10.5 and the public CVE-2023-44487 /
+//! CVE-2024-27316 advisories (behavior descriptions only); no HTTP/2
+//! implementation source was consulted or copied.
 
 const std = @import("std");
 const hpack = @import("hpack.zig");
@@ -769,6 +792,19 @@ pub const Connection = struct {
     /// Set when `recv` returns an `Error`: what to answer before closing.
     violation: ?Violation = null,
     max_header_block: usize,
+    max_continuation_frames: u32,
+    max_reset_streams: u32,
+    max_unproductive_frames: u32,
+    /// Streams reset before completing useful work (RST_STREAM received on
+    /// a non-closed stream + local `recoverStreamError` resets) —
+    /// CVE-2023-44487 rapid-reset accounting.
+    reset_streams: u32 = 0,
+    /// Consecutive no-progress frames (see the module doc); reset by
+    /// productive frames.
+    unproductive_frames: u32 = 0,
+    /// Total peer-initiated streams ever opened on this connection; the
+    /// serve layer's `max_streams_per_connection` cap reads this.
+    remote_streams_total: u32 = 0,
 
     const Assembly = struct {
         kind: enum { headers, push_promise },
@@ -776,6 +812,8 @@ pub const Connection = struct {
         promised_id: u31 = 0,
         end_stream: bool = false,
         buf: std.ArrayList(u8) = .empty,
+        /// CONTINUATION frames consumed by this sequence (CVE-2024-27316).
+        frames: u32 = 0,
     };
 
     pub const Options = struct {
@@ -784,8 +822,19 @@ pub const Connection = struct {
         /// per-stream receive windows; `max_frame_size` bounds inbound frames.
         settings: Settings = .{},
         /// Cap on one reassembled HEADERS+CONTINUATION block; a peer
-        /// exceeding it gets `error.EnhanceYourCalm`.
+        /// exceeding it gets `error.EnhanceYourCalm` (connection scope —
+        /// the block is part of the shared HPACK context, §4.3).
         max_header_block: usize = 1 << 20,
+        /// CONTINUATION frames allowed in one header sequence
+        /// (CVE-2024-27316 flood guard — catches zero-length CONTINUATION
+        /// streams the size cap cannot); over → `error.EnhanceYourCalm`.
+        max_continuation_frames: u32 = 32,
+        /// Streams the peer may reset before completion (CVE-2023-44487
+        /// rapid-reset guard); over → `error.EnhanceYourCalm`.
+        max_reset_streams: u32 = 100,
+        /// Budget of consecutive no-progress frames (PING/SETTINGS/
+        /// PRIORITY/empty DATA/unknown/…); over → `error.EnhanceYourCalm`.
+        max_unproductive_frames: u32 = 1024,
         hpack_huffman: hpack.Encoder.HuffmanMode = .auto,
     };
 
@@ -809,6 +858,9 @@ pub const Connection = struct {
             .next_local_stream_id = if (role == .client) 1 else 2,
             .preface_pending = role == .server,
             .max_header_block = options.max_header_block,
+            .max_continuation_frames = options.max_continuation_frames,
+            .max_reset_streams = options.max_reset_streams,
+            .max_unproductive_frames = options.max_unproductive_frames,
         };
     }
 
@@ -1006,6 +1058,11 @@ pub const Connection = struct {
         const v = c.violation orelse return null;
         if (v.scope != .stream) return null;
         if (c.streams.getPtr(v.stream_id)) |st| st.state = .closed;
+        // CVE-2023-44487: a stream we must reset counts against the same
+        // budget as peer resets — a peer forcing us to reset stream after
+        // stream is doing the rapid-reset dance in reverse. The next
+        // `recv` call fails with `error.EnhanceYourCalm` once exceeded.
+        c.reset_streams += 1;
         c.violation = null;
         return v;
     }
@@ -1031,6 +1088,10 @@ pub const Connection = struct {
             _ = v;
             return error.ProtocolError;
         }
+        // CVE-2023-44487 rapid reset: too many streams reset before
+        // completion (peer RST_STREAMs and/or our own error recoveries).
+        if (c.reset_streams > c.max_reset_streams)
+            return c.fail(.connection, 0, error.EnhanceYourCalm);
         // Compact the consumed prefix, then buffer the new bytes. Event
         // slices handed out by the previous recv() die here — documented.
         if (c.recv_pos > 0) {
@@ -1078,10 +1139,12 @@ pub const Connection = struct {
                 return c.fail(.connection, h.stream_id, error.ProtocolError);
         }
         // §3.4: the peer's first frame must be its SETTINGS.
+        var handshake_settings = false;
         if (c.first_settings_pending) {
             if (h.frame_type != .settings or h.flags & Flags.ack != 0)
                 return c.fail(.connection, h.stream_id, error.ProtocolError);
             c.first_settings_pending = false;
+            handshake_settings = true;
         }
 
         const frame = parseFrame(h, payload) catch |err| {
@@ -1114,6 +1177,12 @@ pub const Connection = struct {
                     .open, .half_closed_local => {},
                     else => return c.fail(.stream, d.stream_id, error.StreamClosed),
                 }
+                // Zero-length DATA without END_STREAM makes no progress —
+                // an empty-frame flood burns the unproductive budget.
+                if (d.data.len == 0 and !d.end_stream)
+                    try c.noteUnproductive()
+                else
+                    c.unproductive_frames = 0;
                 if (d.end_stream) recvEndStream(st);
                 try events.append(c.gpa, .{ .data = .{
                     .stream_id = d.stream_id,
@@ -1128,6 +1197,10 @@ pub const Connection = struct {
                         .reserved_remote => st.state = .half_closed_local,
                         else => return c.fail(.stream, hd.stream_id, error.StreamClosed),
                     }
+                    // Repeat HEADERS on an existing stream (trailers at
+                    // best) are not new work — a trailer flood on one
+                    // stream burns the unproductive budget.
+                    try c.noteUnproductive();
                 } else {
                     // New peer-initiated stream: §5.1.1 — clients initiate
                     // odd ids toward a server, monotonically, never reused;
@@ -1137,6 +1210,8 @@ pub const Connection = struct {
                     if (hd.stream_id % 2 == 0 or hd.stream_id <= c.highest_remote_stream_id)
                         return c.fail(.connection, hd.stream_id, error.ProtocolError);
                     c.highest_remote_stream_id = hd.stream_id;
+                    c.remote_streams_total +|= 1;
+                    c.unproductive_frames = 0; // a new request stream is progress
                     try c.streams.put(c.gpa, hd.stream_id, .{
                         .id = hd.stream_id,
                         .state = .open,
@@ -1159,7 +1234,9 @@ pub const Connection = struct {
                 }
             },
             .priority => |p| {
-                // Legal in any state, including idle (§6.3 / RFC 7540 §5.1).
+                // Legal in any state, including idle (§6.3 / RFC 7540 §5.1)
+                // — but advisory only, so it burns the unproductive budget.
+                try c.noteUnproductive();
                 try events.append(c.gpa, .{ .priority = .{
                     .stream_id = p.stream_id,
                     .priority = p.priority,
@@ -1168,13 +1245,25 @@ pub const Connection = struct {
             .rst_stream => |r| {
                 const st = c.streams.getPtr(r.stream_id) orelse
                     return c.fail(.connection, r.stream_id, error.ProtocolError); // idle (§6.4)
+                // CVE-2023-44487 rapid reset: a reset of a stream that had
+                // not completed (both sides closed) is cancelled work.
+                const was_done = st.state == .closed;
                 st.state = .closed;
+                if (!was_done) {
+                    c.reset_streams += 1;
+                    if (c.reset_streams > c.max_reset_streams)
+                        return c.fail(.connection, r.stream_id, error.EnhanceYourCalm);
+                }
                 try events.append(c.gpa, .{ .stream_reset = .{
                     .stream_id = r.stream_id,
                     .code = r.code,
                 } });
             },
             .settings => |s| {
+                // SETTINGS beyond the §3.4 handshake one (and every ACK)
+                // burn the unproductive budget — a SETTINGS flood makes us
+                // re-apply state and emit an ACK per frame.
+                if (!handshake_settings) try c.noteUnproductive();
                 if (s.ack) {
                     try events.append(c.gpa, .settings_ack);
                 } else {
@@ -1215,6 +1304,10 @@ pub const Connection = struct {
                 }
             },
             .ping => |p| {
+                // PING flood guard: still answered while under budget, but
+                // a peer pinging faster than it does real work gets CALM
+                // before we amplify its bytes any further.
+                try c.noteUnproductive();
                 if (p.ack) {
                     try events.append(c.gpa, .{ .ping_ack = .{ .data = p.data } });
                 } else {
@@ -1254,6 +1347,13 @@ pub const Connection = struct {
                 if (c.assembling == null)
                     return c.fail(.connection, ct.stream_id, error.ProtocolError);
                 const a = &c.assembling.?;
+                // CVE-2024-27316 CONTINUATION flood: bound the frame count
+                // (zero-length frames dodge the size cap below) and the
+                // reassembled size. Connection-scoped — §4.3: the header
+                // block is part of the shared HPACK compression context.
+                a.frames += 1;
+                if (a.frames > c.max_continuation_frames)
+                    return c.fail(.connection, ct.stream_id, error.EnhanceYourCalm);
                 if (a.buf.items.len + ct.fragment.len > c.max_header_block)
                     return c.fail(.connection, ct.stream_id, error.EnhanceYourCalm);
                 try a.buf.appendSlice(c.gpa, ct.fragment);
@@ -1277,11 +1377,21 @@ pub const Connection = struct {
                     }
                 }
             },
-            .unknown => {}, // §4.1: ignore frames of unknown type
+            // §4.1: ignore frames of unknown type — but an ignored frame is
+            // still parse work, so a flood of them burns the budget.
+            .unknown => try c.noteUnproductive(),
         }
     }
 
     // ── internals ───────────────────────────────────────────────────────────
+
+    /// Charge one no-progress frame against the flood budget; breach it and
+    /// the connection dies with `error.EnhanceYourCalm` (§5.4.1 GOAWAY).
+    fn noteUnproductive(c: *Connection) Error!void {
+        c.unproductive_frames += 1;
+        if (c.unproductive_frames > c.max_unproductive_frames)
+            return c.fail(.connection, 0, error.EnhanceYourCalm);
+    }
 
     /// Record the violation detail and hand back the typed error.
     fn fail(
@@ -2313,4 +2423,195 @@ test "connection: send-side guards — windows, states, stream ids" {
     const sid2 = try client.startStream(&out, &.{.{ .name = ":method", .value = "GET" }}, true);
     try testing.expectEqual(@as(u31, 3), sid2);
     try testing.expectEqual(StreamState.half_closed_local, client.stream(sid2).?.state);
+}
+
+// ── DoS-hardening tests (CVE-2023-44487, CVE-2024-27316, flood guards) ──────
+
+/// A server `Connection` with custom options, handshake already consumed.
+fn testServerWith(options: Connection.Options) !Connection {
+    const gpa = testing.allocator;
+    var conn: Connection = .init(gpa, .server, options);
+    errdefer conn.deinit();
+    var handshake: std.ArrayList(u8) = .empty;
+    defer handshake.deinit(gpa);
+    try handshake.appendSlice(gpa, preface);
+    try encodeSettings(gpa, &handshake, .{});
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var events: std.ArrayList(Event) = .empty;
+    defer freeEvents(&events);
+    try conn.recv(handshake.items, &out, &events);
+    return conn;
+}
+
+test "connection: rapid reset (CVE-2023-44487) → ENHANCE_YOUR_CALM" {
+    const gpa = testing.allocator;
+    var conn = try testServerWith(.{ .max_reset_streams = 3 });
+    defer conn.deinit();
+
+    // Three open-then-cancel rounds stay within the budget…
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    var sid: u31 = 1;
+    for (0..3) |_| {
+        try encodeHeaders(gpa, &wire, sid, &.{0x82}, .{});
+        try encodeRstStream(gpa, &wire, sid, .cancel);
+        sid += 2;
+    }
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var events: std.ArrayList(Event) = .empty;
+    defer freeEvents(&events);
+    try conn.recv(wire.items, &out, &events);
+    try testing.expectEqual(@as(u32, 3), conn.reset_streams);
+    clearEvents(&events);
+
+    // …the fourth breaches: connection-scoped ENHANCE_YOUR_CALM.
+    wire.clearRetainingCapacity();
+    try encodeHeaders(gpa, &wire, sid, &.{0x82}, .{});
+    try encodeRstStream(gpa, &wire, sid, .cancel);
+    try expectViolation(&conn, wire.items, error.EnhanceYourCalm, .connection);
+}
+
+test "connection: repeated forced stream errors count as resets (rapid reset, server side)" {
+    const gpa = testing.allocator;
+    var conn = try testServerWith(.{ .max_reset_streams = 2 });
+    defer conn.deinit();
+
+    // Each round: a valid request stream, then DATA on the now half-closed
+    // stream → stream-scoped STREAM_CLOSED that we recover (= we RST it).
+    var sid: u31 = 1;
+    for (0..2) |_| {
+        var wire: std.ArrayList(u8) = .empty;
+        defer wire.deinit(gpa);
+        try encodeHeaders(gpa, &wire, sid, &.{0x82}, .{ .end_stream = true });
+        try encodeData(gpa, &wire, sid, "late", .{});
+        try expectViolation(&conn, wire.items, error.StreamClosed, .stream);
+        try testing.expect(conn.recoverStreamError() != null);
+        sid += 2;
+    }
+    try testing.expectEqual(@as(u32, 2), conn.reset_streams);
+
+    // Budget exhausted: the next recv round convicts the connection.
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    try encodeHeaders(gpa, &wire, sid, &.{0x82}, .{ .end_stream = true });
+    try encodeData(gpa, &wire, sid, "late", .{});
+    try expectViolation(&conn, wire.items, error.StreamClosed, .stream);
+    try testing.expect(conn.recoverStreamError() != null);
+    try expectViolation(&conn, "", error.EnhanceYourCalm, .connection);
+}
+
+test "connection: CONTINUATION frame flood (CVE-2024-27316) → ENHANCE_YOUR_CALM" {
+    const gpa = testing.allocator;
+    var conn = try testServerWith(.{ .max_continuation_frames = 8 });
+    defer conn.deinit();
+
+    // Zero-length CONTINUATIONs never trip the size cap — the frame-count
+    // cap has to convict. END_HEADERS is never set.
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    try encodeHeaders(gpa, &wire, 1, &.{}, .{ .end_headers = false });
+    for (0..9) |_| try encodeContinuation(gpa, &wire, 1, &.{}, false);
+    try expectViolation(&conn, wire.items, error.EnhanceYourCalm, .connection);
+}
+
+test "connection: CONTINUATIONs under the limit still assemble" {
+    const gpa = testing.allocator;
+    var conn = try testServerWith(.{ .max_continuation_frames = 8 });
+    defer conn.deinit();
+
+    // :method GET (0x82) split into one-octet nothing-burgers: HEADERS with
+    // an empty fragment + 2 CONTINUATIONs — well under the limit of 8.
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    try encodeHeaders(gpa, &wire, 1, &.{}, .{ .end_headers = false, .end_stream = true });
+    try encodeContinuation(gpa, &wire, 1, &.{}, false);
+    try encodeContinuation(gpa, &wire, 1, &.{0x82}, true);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var events: std.ArrayList(Event) = .empty;
+    defer freeEvents(&events);
+    try conn.recv(wire.items, &out, &events);
+    try testing.expectEqual(@as(usize, 1), events.items.len);
+    try testing.expectEqualStrings(":method", events.items[0].headers.headers.fields[0].name);
+    try testing.expectEqual(@as(?Violation, null), conn.violation);
+}
+
+test "connection: header block over max_header_block → ENHANCE_YOUR_CALM" {
+    const gpa = testing.allocator;
+    // (a) The first fragment alone blows the cap.
+    {
+        var conn = try testServerWith(.{ .max_header_block = 64 });
+        defer conn.deinit();
+        var wire: std.ArrayList(u8) = .empty;
+        defer wire.deinit(gpa);
+        try encodeHeaders(gpa, &wire, 1, &(.{0} ** 65), .{ .end_headers = false });
+        try expectViolation(&conn, wire.items, error.EnhanceYourCalm, .connection);
+    }
+    // (b) CONTINUATION growth crosses the cap.
+    {
+        var conn = try testServerWith(.{ .max_header_block = 64 });
+        defer conn.deinit();
+        var wire: std.ArrayList(u8) = .empty;
+        defer wire.deinit(gpa);
+        try encodeHeaders(gpa, &wire, 1, &(.{0} ** 40), .{ .end_headers = false });
+        try encodeContinuation(gpa, &wire, 1, &(.{0} ** 40), false);
+        try expectViolation(&conn, wire.items, error.EnhanceYourCalm, .connection);
+    }
+}
+
+test "connection: PING flood → ENHANCE_YOUR_CALM; productive frames reset the budget" {
+    const gpa = testing.allocator;
+    {
+        var conn = try testServerWith(.{ .max_unproductive_frames = 4 });
+        defer conn.deinit();
+        var wire: std.ArrayList(u8) = .empty;
+        defer wire.deinit(gpa);
+        for (0..8) |_| try encodePing(gpa, &wire, .{0} ** 8, false);
+        try expectViolation(&conn, wire.items, error.EnhanceYourCalm, .connection);
+    }
+    // The same number of PINGs interleaved with real requests is fine —
+    // each new request stream resets the budget.
+    {
+        var conn = try testServerWith(.{ .max_unproductive_frames = 4 });
+        defer conn.deinit();
+        var wire: std.ArrayList(u8) = .empty;
+        defer wire.deinit(gpa);
+        var sid: u31 = 1;
+        for (0..4) |_| {
+            try encodePing(gpa, &wire, .{0} ** 8, false);
+            try encodePing(gpa, &wire, .{0} ** 8, false);
+            try encodeHeaders(gpa, &wire, sid, &.{0x82}, .{ .end_stream = true });
+            sid += 2;
+        }
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(gpa);
+        var events: std.ArrayList(Event) = .empty;
+        defer freeEvents(&events);
+        try conn.recv(wire.items, &out, &events);
+        try testing.expectEqual(@as(?Violation, null), conn.violation);
+        try testing.expectEqual(@as(u32, 4), conn.remote_streams_total);
+    }
+}
+
+test "connection: SETTINGS and empty-DATA floods → ENHANCE_YOUR_CALM" {
+    const gpa = testing.allocator;
+    { // SETTINGS spam (each also costs us an ACK).
+        var conn = try testServerWith(.{ .max_unproductive_frames = 4 });
+        defer conn.deinit();
+        var wire: std.ArrayList(u8) = .empty;
+        defer wire.deinit(gpa);
+        for (0..8) |_| try encodeSettings(gpa, &wire, .{});
+        try expectViolation(&conn, wire.items, error.EnhanceYourCalm, .connection);
+    }
+    { // Zero-length DATA without END_STREAM on a live stream.
+        var conn = try testServerWith(.{ .max_unproductive_frames = 4 });
+        defer conn.deinit();
+        var wire: std.ArrayList(u8) = .empty;
+        defer wire.deinit(gpa);
+        try encodeHeaders(gpa, &wire, 1, &.{0x82}, .{});
+        for (0..8) |_| try encodeData(gpa, &wire, 1, "", .{});
+        try expectViolation(&conn, wire.items, error.EnhanceYourCalm, .connection);
+    }
 }

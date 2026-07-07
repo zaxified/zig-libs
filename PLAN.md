@@ -35,6 +35,15 @@ zig-libs exists to ship the **good** version of each library, not a copy of the 
   license so NOTICE records the design ref. (Ongoing so the pre-public audit has material.)
 
 **DONE (Fable, value-add, 2026-07-07):**
+- `http` **HTTP/2 DoS hardening** ✅ (h2-completion batch 1) — `h2.zig`/`h2_server.zig`: all the known
+  h2 DoS mitigations, additive + configurable (safe defaults, so `enable_h2c=true` is hardened out of
+  the box): **rapid-reset (CVE-2023-44487)** (reset-stream counter both directions → GOAWAY
+  ENHANCE_YOUR_CALM), **CONTINUATION-flood (CVE-2024-27316)** (frame-count + block-size caps, conn-
+  scoped), **SETTINGS_MAX_CONCURRENT_STREAMS** (advertised + enforced via REFUSED_STREAM),
+  control-frame flood budget (PING/SETTINGS/empty-DATA/trailer), total-streams-per-conn cap (graceful
+  GOAWAY). Knobs on `Server.Options.h2_limits` + `h2.Connection.Options`. 13 attack-sim tests (156/156
+  http; rapid-reset proves 0 handler runs). Debug+ReleaseFast+fmt green. Clean-room from RFC 9113 +
+  the public CVE advisories.
 - `probe` **NEW module** ✅ — `modules/probe/src/root.zig` (~620 L): TCP-connect service-reachability
   prober — `probeTcp` (up/refused/timeout/error + connect RTT), `probeTarget` (N reps → min/avg/max/
   loss via latency-stats), `probeMany` (fan-out with bounded concurrency, order-stable), all behind a
@@ -221,11 +230,11 @@ zig-libs exists to ship the **good** version of each library, not a copy of the 
 ## Next up (resume here) — user-approved sequence 2026-07-07
 
 1. **Network-tail:** `wireguard` ✅ → `traceroute` ✅ → `probe` ✅ — **COMPLETE.**
-2. **h2-completion** — decouple from the stalled 0.17 TLS server (PR #23005 open since Feb 2025; ianic
-   server "minimal") and close the h2 stack at the app layer: **rapid-reset (CVE-2023-44487) +
-   CONTINUATION-flood (CVE-2024-27316) hardening** (the core), concurrent stream multiplexing, an
-   **HTTP/2 client**, and a **TLS-adapter seam** (bring-your-own TLS). Makes a complete, self-contained
-   small h2 API stack independent of the TLS saga.
+2. **h2-completion** — decoupled from the stalled 0.17 TLS server. Batches:
+   - ✅ **CVE hardening** (rapid-reset + CONTINUATION-flood + max-concurrent + flood budgets) — DONE.
+   - ☐ concurrent stream multiplexing (h2c server currently serves streams sequentially).
+   - ☐ **HTTP/2 client** — wire `h2.Connection` client role into `http.Client`.
+   - ☐ **TLS-adapter seam** — documented bring-your-own-TLS so h2-over-TLS works without a std server.
 3. **`l2disco`** — the one worthwhile "extract" candidate, and it's actually greenfield (see AXP tail).
 
 Extractions (dataset/tabular/jsonshape/finstats/bxp text libs) stay **Opus + deferred** — verified

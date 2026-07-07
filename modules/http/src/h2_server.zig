@@ -29,10 +29,28 @@
 //! answers RST_STREAM and the connection lives on
 //! (`h2.Connection.recoverStreamError`). Peer bytes never panic.
 //!
+//! Denial-of-service hardening (`Options.limits`, safe defaults — an
+//! `enable_h2c` server is hardened out of the box):
+//! - **Rapid reset (CVE-2023-44487)** and **CONTINUATION flood
+//!   (CVE-2024-27316)** guards plus a control-frame flood budget live in
+//!   `h2.Connection` (see its module doc); breaches surface here as
+//!   connection violations answered with GOAWAY(ENHANCE_YOUR_CALM).
+//!   Handlers run sequentially on the connection's task, so cancelled
+//!   streams never fan out concurrent server-side work.
+//! - **SETTINGS_MAX_CONCURRENT_STREAMS** (`max_concurrent_streams`) is
+//!   advertised in the server preface and enforced: request streams above
+//!   the limit are refused with RST_STREAM(REFUSED_STREAM) — safely
+//!   retryable per §8.7 — and the connection keeps serving the rest.
+//! - **`max_streams_per_connection`** bounds total streams on one
+//!   connection; once reached, ready requests finish and the connection
+//!   closes with a graceful GOAWAY(NO_ERROR) so the client reconnects.
+//!
 //! Provenance: clean-room from RFC 9113 (prior knowledge §3.3, malformed
 //! requests §8.1.1, header validity §8.2.1/§8.2.2, request pseudo-headers
-//! §8.3.1, flow control §5.2/§6.9); no HTTP/2 server implementation was
-//! consulted or copied.
+//! §8.3.1, flow control §5.2/§6.9, CONTINUATION/DoS considerations §10.5)
+//! and the public CVE-2023-44487 / CVE-2024-27316 advisories (behavior
+//! descriptions only); no HTTP/2 server implementation was consulted or
+//! copied.
 
 const std = @import("std");
 const http = @import("root.zig");
@@ -75,6 +93,36 @@ pub const Options = struct {
     /// connection, .active/.idle around each request stream served.
     on_conn_state: ?Server.ConnStateFn = null,
     on_conn_state_ctx: ?*anyopaque = null,
+    /// DoS-hardening limits; the defaults are safe for exposure.
+    limits: Limits = .{},
+};
+
+/// Per-connection DoS-hardening limits for the h2 serve loop (see the
+/// module doc). Every breach ends in a clean GOAWAY or RST_STREAM — never
+/// a panic and never unbounded work.
+pub const Limits = struct {
+    /// SETTINGS_MAX_CONCURRENT_STREAMS advertised to the peer and enforced:
+    /// request streams above it are refused with RST_STREAM(REFUSED_STREAM)
+    /// (retryable, §8.7) while the connection keeps serving.
+    max_concurrent_streams: u32 = 100,
+    /// Total request streams allowed on one connection; once reached the
+    /// server finishes what is ready and closes with GOAWAY(NO_ERROR).
+    max_streams_per_connection: u32 = 10_000,
+    /// CVE-2023-44487 (rapid reset): streams reset before completion
+    /// (peer RST_STREAMs + server-side error resets) allowed before
+    /// GOAWAY(ENHANCE_YOUR_CALM).
+    max_reset_streams: u32 = 100,
+    /// CVE-2024-27316 (CONTINUATION flood): CONTINUATION frames allowed in
+    /// one header sequence before GOAWAY(ENHANCE_YOUR_CALM).
+    max_continuation_frames: u32 = 32,
+    /// One reassembled HEADERS+CONTINUATION block, total octets; over →
+    /// GOAWAY(ENHANCE_YOUR_CALM). (The HPACK decoder's decompression-bomb
+    /// guard, `max_header_bytes`, bounds the *decoded* list separately.)
+    max_header_block: usize = 1 << 20,
+    /// Budget of consecutive no-progress frames (PING/SETTINGS/PRIORITY/
+    /// empty DATA/unknown) before GOAWAY(ENHANCE_YOUR_CALM); any new
+    /// request stream or productive DATA resets it.
+    max_unproductive_frames: u32 = 1024,
 };
 
 /// Serve HTTP/2 requests from `in`, responding on `out`, until the peer
@@ -91,9 +139,14 @@ pub fn serve(gpa: Allocator, opts: Options, in: *Reader, out: *Writer) void {
         .conn = .init(gpa, .server, .{
             .settings = .{
                 .enable_push = false, // §8.4: we never push
+                .max_concurrent_streams = opts.limits.max_concurrent_streams,
                 .max_header_list_size = std.math.cast(u32, opts.max_header_bytes) orelse
                     std.math.maxInt(u32),
             },
+            .max_header_block = opts.limits.max_header_block,
+            .max_continuation_frames = opts.limits.max_continuation_frames,
+            .max_reset_streams = opts.limits.max_reset_streams,
+            .max_unproductive_frames = opts.limits.max_unproductive_frames,
         }),
     };
     defer s.deinit();
@@ -160,6 +213,14 @@ const Session = struct {
                 s.req_index += 1;
                 s.fireConnState(.idle);
                 if (disp == .close) return;
+            }
+            // Total-streams cap: enough streams for one connection — what
+            // was ready has been served; close gracefully (NO_ERROR) so a
+            // legitimate client just reconnects.
+            if (s.conn.remote_streams_total >= s.opts.limits.max_streams_per_connection) {
+                s.conn.sendGoaway(&s.wire, .no_error, "") catch {};
+                s.flushWire() catch {};
+                return;
             }
             // Graceful shutdown: the peer said GOAWAY and nothing is left.
             if (s.peer_goaway and s.jobs.count() == 0) return;
@@ -228,6 +289,16 @@ const Session = struct {
             // the fields are dropped; END_STREAM completes the request.
             hd.headers.deinit(s.gpa);
             if (hd.end_stream) job.complete = true;
+            return;
+        }
+        // Enforce our advertised SETTINGS_MAX_CONCURRENT_STREAMS (§5.1.2):
+        // excess streams are refused — REFUSED_STREAM is safely retryable
+        // (§8.7) — and the connection keeps serving the admitted ones. This
+        // also caps in-flight request state (the jobs map): a peer cannot
+        // force unbounded buffered streams awaiting the handler.
+        if (s.jobs.count() >= s.opts.limits.max_concurrent_streams) {
+            hd.headers.deinit(s.gpa);
+            s.conn.sendRstStream(&s.wire, hd.stream_id, .refused_stream) catch {};
             return;
         }
         s.jobs.put(s.gpa, hd.stream_id, .{
@@ -935,6 +1006,161 @@ test "h2c serve: stream error → RST_STREAM, connection keeps serving (offline)
     // …and the connection lived on to answer the next stream.
     try testing.expectEqual(@as(u16, 200), peer.resp(sid3).status);
     try testing.expectEqualStrings("hello", peer.resp(sid3).body.items);
+    try testing.expectEqual(@as(?h2.ErrorCode, null), peer.goaway);
+}
+
+// ── DoS-hardening attack simulations (offline) ──────────────────────────────
+
+/// Counts invocations through `Request.context` — proves handlers did (not)
+/// run under attack, independent of what reached the wire.
+fn countingHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+    const runs: *usize = @ptrCast(@alignCast(req.context.?));
+    runs.* += 1;
+    try rw.writeAll("ok");
+}
+
+test "h2c serve: rapid reset (CVE-2023-44487) → GOAWAY(ENHANCE_YOUR_CALM), no handler ran" {
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+
+    // Open-and-immediately-cancel, more times than the budget allows. None
+    // of the streams ever completes, so no handler run is legitimate.
+    try peer.conn.sendPreface(&peer.wire);
+    for (0..6) |_| {
+        const sid = try peer.conn.startStream(&peer.wire, &get_fields, false);
+        try peer.conn.sendRstStream(&peer.wire, sid, .cancel);
+    }
+
+    var handler_runs: usize = 0;
+    var out_buf: [4096]u8 = undefined;
+    try runOffline(&peer, .{
+        .handler = countingHandler,
+        .context = &handler_runs,
+        .limits = .{ .max_reset_streams = 4 },
+    }, &out_buf);
+
+    try testing.expectEqual(@as(?h2.ErrorCode, h2.ErrorCode.enhance_your_calm), peer.goaway);
+    try testing.expectEqual(@as(usize, 0), handler_runs); // no unbounded work
+}
+
+test "h2c serve: CONTINUATION flood (CVE-2024-27316) → GOAWAY(ENHANCE_YOUR_CALM)" {
+    const gpa = testing.allocator;
+    { // Frame-count flood: endless zero-length CONTINUATIONs, no END_HEADERS.
+        var peer: TestPeer = .init(gpa, .{});
+        defer peer.deinit();
+        try peer.conn.sendPreface(&peer.wire);
+        try h2.encodeHeaders(gpa, &peer.wire, 1, &.{}, .{ .end_headers = false });
+        for (0..10) |_| try h2.encodeContinuation(gpa, &peer.wire, 1, &.{}, false);
+        var out_buf: [1024]u8 = undefined;
+        try runOffline(&peer, .{
+            .handler = testHandler,
+            .limits = .{ .max_continuation_frames = 8 },
+        }, &out_buf);
+        try testing.expectEqual(@as(?h2.ErrorCode, h2.ErrorCode.enhance_your_calm), peer.goaway);
+        try testing.expectEqual(@as(usize, 0), peer.resps.count());
+    }
+    { // Size flood: the reassembled block crosses max_header_block.
+        var peer: TestPeer = .init(gpa, .{});
+        defer peer.deinit();
+        try peer.conn.sendPreface(&peer.wire);
+        try h2.encodeHeaders(gpa, &peer.wire, 1, &(.{0} ** 200), .{ .end_headers = false });
+        try h2.encodeContinuation(gpa, &peer.wire, 1, &(.{0} ** 200), false);
+        var out_buf: [1024]u8 = undefined;
+        try runOffline(&peer, .{
+            .handler = testHandler,
+            .limits = .{ .max_header_block = 256 },
+        }, &out_buf);
+        try testing.expectEqual(@as(?h2.ErrorCode, h2.ErrorCode.enhance_your_calm), peer.goaway);
+    }
+}
+
+test "h2c serve: streams over SETTINGS_MAX_CONCURRENT_STREAMS → RST_STREAM(REFUSED_STREAM)" {
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+
+    // Three streams concurrently open against an advertised limit of 2:
+    // the third must be refused, the two admitted ones served.
+    try peer.conn.sendPreface(&peer.wire);
+    const sid1 = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/echo"), false);
+    const sid2 = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/echo"), false);
+    const sid3 = try peer.conn.startStream(&peer.wire, &get_fields, true);
+    try peer.conn.sendData(&peer.wire, sid1, "one", true);
+    try peer.conn.sendData(&peer.wire, sid2, "two", true);
+
+    var out_buf: [4096]u8 = undefined;
+    try runOffline(&peer, .{
+        .handler = testHandler,
+        .limits = .{ .max_concurrent_streams = 2 },
+    }, &out_buf);
+
+    // The server advertised the limit in its SETTINGS…
+    try testing.expectEqual(@as(?u32, 2), peer.conn.remote_settings.max_concurrent_streams);
+    // …the excess stream was refused (retryable), the connection survived…
+    try testing.expectEqual(@as(?h2.ErrorCode, h2.ErrorCode.refused_stream), peer.resp(sid3).rst);
+    try testing.expectEqual(@as(?h2.ErrorCode, null), peer.goaway);
+    // …and the admitted streams were served normally.
+    try testing.expectEqual(@as(u16, 200), peer.resp(sid1).status);
+    try testing.expectEqualStrings("one", peer.resp(sid1).body.items);
+    try testing.expectEqual(@as(u16, 200), peer.resp(sid2).status);
+    try testing.expectEqualStrings("two", peer.resp(sid2).body.items);
+}
+
+test "h2c serve: PING flood → GOAWAY(ENHANCE_YOUR_CALM)" {
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+
+    try peer.conn.sendPreface(&peer.wire);
+    for (0..20) |_| try peer.conn.sendPing(&peer.wire, .{0xaa} ** 8);
+
+    var out_buf: [2048]u8 = undefined;
+    try runOffline(&peer, .{
+        .handler = testHandler,
+        .limits = .{ .max_unproductive_frames = 8 },
+    }, &out_buf);
+    try testing.expectEqual(@as(?h2.ErrorCode, h2.ErrorCode.enhance_your_calm), peer.goaway);
+}
+
+test "h2c serve: total-streams cap → graceful GOAWAY(NO_ERROR) after serving" {
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+
+    try peer.conn.sendPreface(&peer.wire);
+    const sid1 = try peer.conn.startStream(&peer.wire, &get_fields, true);
+    const sid2 = try peer.conn.startStream(&peer.wire, &get_fields, true);
+
+    var out_buf: [4096]u8 = undefined;
+    try runOffline(&peer, .{
+        .handler = testHandler,
+        .limits = .{ .max_streams_per_connection = 2 },
+    }, &out_buf);
+
+    // Both requests were answered, then the connection retired NO_ERROR —
+    // a well-behaved client simply reconnects.
+    try testing.expectEqual(@as(u16, 200), peer.resp(sid1).status);
+    try testing.expectEqual(@as(u16, 200), peer.resp(sid2).status);
+    try testing.expectEqual(@as(?h2.ErrorCode, h2.ErrorCode.no_error), peer.goaway);
+}
+
+test "h2c serve: legit request with CONTINUATIONs under the limit succeeds" {
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+
+    // Force the client to fragment its header block into CONTINUATIONs
+    // (test-only: a real peer could never advertise a max_frame_size < 16384).
+    peer.conn.remote_settings.max_frame_size = 16;
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try peer.conn.startStream(&peer.wire, &get_fields, true);
+
+    var out_buf: [4096]u8 = undefined;
+    try runOffline(&peer, .{ .handler = testHandler }, &out_buf); // default limits
+
+    try testing.expectEqual(@as(u16, 200), peer.resp(sid).status);
+    try testing.expectEqualStrings("hello", peer.resp(sid).body.items);
     try testing.expectEqual(@as(?h2.ErrorCode, null), peer.goaway);
 }
 

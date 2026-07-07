@@ -194,7 +194,16 @@ pub const Options = struct {
     /// server never even peeks — behavior is byte-for-byte the h1 server.
     /// Detection needs `read_buffer_size` ≥ 24 (the preface length).
     enable_h2c: bool = false,
+    /// HTTP/2 DoS-hardening limits (rapid reset CVE-2023-44487,
+    /// CONTINUATION flood CVE-2024-27316, SETTINGS_MAX_CONCURRENT_STREAMS,
+    /// control-frame floods, total streams per connection). Only meaningful
+    /// with `enable_h2c`; the defaults harden an h2c server out of the box.
+    /// See `h2_server.Limits`.
+    h2_limits: H2Limits = .{},
 };
+
+/// Re-export of `h2_server.Limits` for `Options.h2_limits`.
+pub const H2Limits = h2s.Limits;
 
 /// `io` must support the net + concurrency vtable operations (e.g.
 /// `std.Io.Threaded`). The allocator provides per-connection buffers.
@@ -383,6 +392,7 @@ fn connMain(s: *Server, stream: net.Stream) void {
                 .gzip_scratch = gz,
                 .on_conn_state = o.on_conn_state,
                 .on_conn_state_ctx = o.on_conn_state_ctx,
+                .limits = o.h2_limits,
             }, &tr.reader, &tw.writer);
             return;
         }
