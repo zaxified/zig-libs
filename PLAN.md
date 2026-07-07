@@ -35,6 +35,12 @@ zig-libs exists to ship the **good** version of each library, not a copy of the 
   license so NOTICE records the design ref. (Ongoing so the pre-public audit has material.)
 
 **DONE (Fable, value-add, 2026-07-07):**
+- `latency-stats` **+ HdrHistogram** ✅ — added a `Histogram` type (logarithmic bucketing + linear
+  sub-buckets, configurable sigfigs) for accurate **percentiles** (p50/p90/p95/p99/p99.9/max) with
+  bounded memory + guaranteed relative error, alongside the existing zero-alloc moment stats (API
+  back-compat). Measured worst error ≤ guarantee (sf2 5.0e-3≤7.8e-3, sf3 5.3e-4≤9.8e-4); never
+  under-reports. `add()` merge, `reset`, clamp policy. 19 tests (12 new), Debug+ReleaseFast+fmt green.
+  Clean-room from Gil Tene's HdrHistogram design (no HdrHistogram source).
 - `modbus` **NEW module** ✅ — `modules/modbus/src/root.zig` (~1050 L): Modbus **TCP** (MBAP) + **RTU**
   (CRC-16) codec + master client — FC 01/02/03/04/05/06/0F/10/17, exception mapping, spec quantity
   limits, a transport seam (offline-testable; optional `std.Io` TCP adapter). 32 tests: Modbus

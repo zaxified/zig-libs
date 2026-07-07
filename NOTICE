@@ -155,4 +155,14 @@ audit is pending before any public release.
                only — no libmodbus source was consulted or copied; the
                protocol itself is the open spec.
 
+  latency-stats — the streaming moment stats (min/max/mean/stddev + RFC 3550
+               jitter) are from the authors' zig-fping/axp work (see the fping
+               attribution above). The `Histogram` percentile support is
+               clean-room from Gil Tene's HdrHistogram design (logarithmic
+               bucketing with linear sub-buckets, bounded relative error);
+               design refs HdrHistogram_c (BSD-2-Clause/CC0), HdrHistogram
+               Java (CC0-1.0/BSD-2), and the Rust `hdrhistogram` crate
+               (MIT OR Apache-2.0) — behavior/format only, no source consulted
+               or copied.
+
 See each module's README "Provenance" note for its specific seed and reference.
