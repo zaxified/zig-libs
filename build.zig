@@ -46,6 +46,7 @@ const module_list = [_]Module{
     .{ .name = "latency-stats" },
     .{ .name = "hashdigest" },
     .{ .name = "sealedbox" },
+    .{ .name = "nftables" },
     // Scaffold more here (copy modules/_template) — see the catalog in
     // ~/CML/zig-libs-plan.md for the full candidate list.
 };

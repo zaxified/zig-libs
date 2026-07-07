@@ -140,4 +140,12 @@ audit is pending before any public release.
                MIT; admission anti-starvation tie-break) — algorithm/behavior
                only, no source consulted or copied.
 
+  nftables   — clean-room from the DOCUMENTED libnftables JSON schema
+               (libnftables-json(5) man page + the nftables wiki "JSON
+               representation"). The module emits the stable `nft -j`
+               interchange format only; libnftables itself is GPL-2.0 and was
+               referenced solely as the specification of its JSON input/output
+               interface — no libnftables (or other nftables) source was
+               consulted or copied.
+
 See each module's README "Provenance" note for its specific seed and reference.

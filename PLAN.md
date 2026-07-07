@@ -35,6 +35,12 @@ zig-libs exists to ship the **good** version of each library, not a copy of the 
   license so NOTICE records the design ref. (Ongoing so the pre-public audit has material.)
 
 **DONE (Fable, value-add, 2026-07-07):**
+- `nftables` **NEW module** ✅ — `modules/nftables/src/root.zig` (1503 L): typed builder for the
+  libnftables JSON ruleset format → feed to `nft -j -f -`. Families/chains/hooks/policies, rules with
+  a typed expr/statement vocabulary (match/payload/meta/ct/sets/ranges + accept/drop/reject/jump/
+  nat/masquerade/counter/log/limit), arena `Ruleset` + fluent `RuleBuilder`. Retires axp's `nft`
+  shell-outs. 15 tests: golden-JSON KATs + parse-back + `nft -c` check (ran, nft installed).
+  Debug+ReleaseFast+fmt green. Clean-room from the documented JSON schema (no GPL libnftables source).
 - `http` **HTTP/2 server (h2c)** ✅ — `modules/http/src/h2_server.zig` (~1200 L) wires `h2.Connection`
   into `http.Server` over cleartext h2c prior-knowledge (RFC 9113 §3.3). New `Options.enable_h2c`
   (off by default → server byte-for-byte unchanged); incremental preface peek, else falls through to
@@ -145,8 +151,8 @@ poc-wf: `finstats` · `ipcbus` · `pollworker` · `chunkframe`.
 axp: `lenframe`/`jsonwire`.
 
 ## Queued — network control tail
-`wireguard` (on `netlink`) · `nftables` (JSON→`nft -j`) · `uci` · `traceroute` (on `icmp`) · `probe`
-· `whois` · `rdap` · `modbus`.
+`wireguard` (on `netlink`) · `uci` · `traceroute` (on `icmp`) · `probe` · `whois` · `rdap` · `modbus`.
+(`nftables` ✅ done — see DONE above.)
 
 ## Capstone
 `exprcalc` (bxp Excel-like evaluator) — build LAST; composes `decimal` (✅) + `datefmt` + `tz` +
