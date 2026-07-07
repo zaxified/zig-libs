@@ -194,12 +194,18 @@ zig-libs exists to ship the **good** version of each library, not a copy of the 
 
 ---
 
-## Next up (resume here)
+## Next up (resume here) — user-approved sequence 2026-07-07
 
-**`dataset`** (wgs anchor) — the highest-leverage next extraction: the canonical columnar table the
-whole wgs compute family + `finstats` sit on. Seed: wgs `src/dataset.zig`. Build it, then `tabular`
-(transforms+series), `jsonshape`, `finstats` (on `dataset`, seed wgs `finance.zig`), and `roquery`.
-Alternatively continue the AXP tail (`stun`/`sntp`/`procnet`/`argsafe`/`l2disco`/`rawsock`/`blobstore`).
+1. **Network-tail:** `wireguard` (on netlink/genetlink) **← in progress** → `traceroute` (on icmp) → `probe`.
+2. **h2-completion** — decouple from the stalled 0.17 TLS server (PR #23005 open since Feb 2025; ianic
+   server "minimal") and close the h2 stack at the app layer: **rapid-reset (CVE-2023-44487) +
+   CONTINUATION-flood (CVE-2024-27316) hardening** (the core), concurrent stream multiplexing, an
+   **HTTP/2 client**, and a **TLS-adapter seam** (bring-your-own TLS). Makes a complete, self-contained
+   small h2 API stack independent of the TLS saga.
+3. **`l2disco`** — the one worthwhile "extract" candidate, and it's actually greenfield (see AXP tail).
+
+Extractions (dataset/tabular/jsonshape/finstats/bxp text libs) stay **Opus + deferred** — verified
+2026-07-07 to have little value-add headroom (below).
 
 ## Queued — wgs data/compute family (NEW 2026-07-07; from `~/workspace/wgs` survey)
 A foundational columnar-dataframe stack, well-factored + tested in wgs (all pure `std`, arena, no libc
@@ -221,29 +227,41 @@ except sqlite). Extract in dependency order — `dataset` is the anchor everythi
 - Note: wgs carries a redundant 2nd cache copy (`src/cache.zig` vs `deps/ramcache`) — consolidate onto
   extracted `ramcache` when wgs adopts the lib (housekeeping, not a new module).
 
-## Queued — rest of the AXP batch
-`procnet` + `argsafe` (axp task.zig — /proc parsers + injection-safe argv validators) · `l2disco`
-(axp — LLDP/CDP/ARP/DHCP codecs) · `stun` + `sntp` (axp probes; `latency-stats` ✅ done) · `rawsock`
-(axp AF_PACKET) · `blobstore` (axp-vault CAS).
+## Queued — AXP tail (verified against the axp source 2026-07-07 — these are GREENFIELD, not extractions)
+axp *fakes* these in `axp-sim/src/synth.zig` or *shells out* to daemons (`lldpd`/`chronyc`) — there is
+**no real impl to extract**, so building them = genuine clean-room value-add from spec (real Fable work):
+- **`l2disco`** ✅ worth it (user-approved) — LLDP (802.1AB) + CDP + ARP + DHCP option codecs; no Zig
+  lib exists. Build as a proper NEW module (golden-packet KATs).
+- `stun` (RFC 8489) · `sntp` (RFC 4330) — smaller real gaps; follow-ups after l2disco.
+- `rawsock` (AF_PACKET capture) — greenfield, Linux-runtime-heavy; lower priority.
+- Real extractions (mechanical copies, LOW headroom → **Opus, not Fable**): `procnet` + `argsafe`
+  (really in axp `task.zig`) · `blobstore` (axp-vault `store.zig`).
 
-## Queued — P2 from bxp / poc-wf (extractions)
-bxp: `datefmt` · `tz` · `encoding` · `unaccent` · `numparse` · `json5` · `zipstream` · `csvstream`
-· `csvsafe` · `diagnostics`.
-poc-wf: `finstats` · `ipcbus` · `pollworker` · `chunkframe`.
-axp: `lenframe`/`jsonwire`.
+## Queued — bxp / poc-wf (mechanical extractions = Opus, NOT Fable; verified 2026-07-07)
+**No meaningful value-add headroom** — do as plain Opus extraction when actually needed:
+- `finstats` — the wgs `finance.zig` seed is ALREADY advanced (VaR/CVaR/ulcer/sortino/calmar/beta/
+  monte-carlo/correlation/drawdown); only Brinson/factor missing → marginal, not worth a Fable pass.
+- `ipcbus` — not even a clean seed (unix-socket logic embedded in poc `main.zig`); pure glue.
+- bxp copy-tier: `datefmt` · `tz` · `encoding` · `unaccent` · `numparse` · `json5` · `zipstream` ·
+  `csvstream` · `csvsafe` · `diagnostics`. (`tz`/`encoding` have theoretical spec-completeness headroom
+  but the user deprioritized them 2026-07-07 — l2disco is the only value-add "extract" kept.)
+- poc-wf: `pollworker` · `chunkframe` · axp: `lenframe`/`jsonwire`.
 
 ## Queued — network control tail
-`wireguard` (on `netlink`) · `traceroute` (on `icmp`) · `probe`.
-(`nftables` + `modbus` + `whois` + `uci` + `rdap` ✅ done — see DONE above.)
+`wireguard` (on `netlink`, genetlink) **← in progress** · `traceroute` (on `icmp`) · `probe`.
+(`nftables` + `modbus` + `whois` + `uci` + `rdap` + `mqtt` + `snmp` ✅ done — see DONE above.)
 
 ## Capstone
 `exprcalc` (bxp Excel-like evaluator) — build LAST; composes `decimal` (✅) + `datefmt` + `tz` +
 `encoding` + `numparse` + adopted regex.
 
-## Phases (deferred, not new modules)
-- `http` **HTTP/2** (Ph3) — framing + HPACK on `std.crypto.tls`, verify against h2spec.
-- **TLS-terminating server** — parked on Zig 0.17 (std 0.16 has `tls.Client` only; `ianic/tls.zig`
-  needs 0.17-dev). Revisit at 0.17 stable / std TLS server. TLS via proxy meanwhile.
+## Phases
+- `http` **HTTP/2 completion** — HPACK + framing + h2c server ✅ DONE. To *close the stack* (planned,
+  step 2 in "Next up", decoupled from TLS): rapid-reset (CVE-2023-44487) + CONTINUATION-flood
+  (CVE-2024-27316) hardening, concurrent stream multiplexing, an HTTP/2 client, a TLS-adapter seam.
+- **TLS-terminating server** — DECOUPLED (not blocking). 0.17 std TLS server is stalled (PR #23005 open
+  since Feb 2025; ianic server "minimal"). The h2 stack takes bring-your-own-TLS via the seam (reverse
+  proxy today; ianic/std adapter later). Revisit only if 0.17 ships a real server.
 - `kv` **MVCC/HAMT on-disk, ordered scans, txns, secondary indexes, cross-process lock** (the
   randomized VOPR itself is now DONE — see above; these on-disk/txn features remain deferred).
 
