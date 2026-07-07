@@ -8,7 +8,7 @@ Not a dumping ground: ship **solid, not many**. Most members are *extracted* fro
 across sibling projects (bxp, axp, zig-fping, poc-wf-analytic); a few fill genuine gaps in the Zig
 ecosystem.
 
-**Status:** 27 modules · 622 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 27 modules · 654 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ## Modules
@@ -20,7 +20,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 
 | Module | What it does | Deps |
 |---|---|---|
-| `http` | HTTP/1.1 client (TLS via `std.crypto.tls`) **and** server, hardened for direct exposure (peer addr, conn caps, size limits, slowloris timeouts, gzip). Includes an **HPACK** (RFC 7541) codec — the HTTP/2 header-compression core. Not `std.http`. | netaddr |
+| `http` | HTTP/1.1 client (TLS via `std.crypto.tls`) **and** server, hardened for direct exposure (peer addr, conn caps, size limits, slowloris timeouts, gzip). Includes an **HPACK** (RFC 7541) codec + **HTTP/2 framing & stream state machine** (RFC 9113). Not `std.http`. | netaddr |
 | `router` | REST routing — trie matcher (params/wildcards), middleware chain, groups, 404/405 | http |
 | `ratelimit` | Token-bucket per-client rate limit → 429 + Retry-After | router, http |
 | `abuseguard` | Per-IP + global connection caps, ban/greylist, strike→ban (accept-time) | http, netaddr, router |

@@ -46,6 +46,12 @@ pub const h1 = @import("h1.zig");
 /// vectors; the HTTP/2 framing layer (Phase 3) will build on it.
 pub const hpack = @import("hpack.zig");
 
+/// HTTP/2 framing + connection/stream state machine (RFC 9113): the §4/§6
+/// frame codec, §5 stream lifecycle, §5.2 flow control and the
+/// HEADERS+CONTINUATION assembler over `hpack` — see `h2.Connection`.
+/// Pure wire layer; Server/Client integration is the next phase.
+pub const h2 = @import("h2.zig");
+
 /// The HTTP/1.1 client. See `Client.init` / `Client.request`.
 pub const Client = @import("Client.zig");
 
@@ -307,6 +313,7 @@ const testing = std.testing;
 test {
     _ = h1;
     _ = hpack;
+    _ = h2;
     _ = Client;
     _ = Server;
 }

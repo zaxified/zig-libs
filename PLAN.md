@@ -35,6 +35,13 @@ zig-libs exists to ship the **good** version of each library, not a copy of the 
   license so NOTICE records the design ref. (Ongoing so the pre-public audit has material.)
 
 **DONE (Fable, value-add, 2026-07-07):**
+- `http` **HTTP/2 framing (RFC 9113)** ✅ — new `modules/http/src/h2.zig` (2265 L): 9-octet frame
+  codec + all §6 frame types, §5 stream state machine (idle→open→half-closed→closed, id rules),
+  §5.2 dual-window flow control, §3.4 preface, HEADERS+CONTINUATION assembler over `hpack`. Typed
+  errors carry §7 codes (→ GOAWAY/RST). Verified offline: per-type round-trips + a scripted
+  client↔server in-memory-pipe exchange (handshake→request→response→END_STREAM→WINDOW_UPDATE→
+  PING→GOAWAY, windows reconcile) + h2spec-style negatives. 32 tests, Debug+ReleaseFast+fmt green.
+  Clean-room from RFC 9113. **Next batch: bolt `h2.Connection` onto http.Server (h2c prior-knowledge).**
 - `kv` **full randomized VOPR** ✅ — new `modules/kv/src/vopr.zig` (641 L): seeded deterministic
   simulator (splitmix64, no clock/OS-rng) that fuzzes recovery across randomized workload+fault
   schedules (torn/partial writes, short reads, garbage tails, crash points ×3 modes, chained epochs)
