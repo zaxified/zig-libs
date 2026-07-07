@@ -35,6 +35,12 @@ zig-libs exists to ship the **good** version of each library, not a copy of the 
   license so NOTICE records the design ref. (Ongoing so the pre-public audit has material.)
 
 **DONE (Fable, value-add, 2026-07-07):**
+- `sealedbox` **+ key serialization** ✅ — added base64 + hex import/export for public and secret
+  keys (fixed-size, allocation-free, typed errors, no panic), plus `publicFromSecret` /
+  `keyPairFromSecretKey` (via std `X25519.recoverPublicKey`) so a stored secret round-trips a keypair.
+  Closes the "can't represent a recipient key as text" gap. 9 tests (4 new): RFC 7748-cross-checked
+  KATs + end-to-end serialize→deserialize→seal/open + malformed-input errors. Debug+ReleaseFast+fmt
+  green. std base64/hex only (no NOTICE change).
 - `hashdigest` **+ multi-algorithm** ✅ — added an `Algorithm` enum (sha256/512/384/224/512_256,
   sha3_256/512, blake2b256, blake3) with `digestLength`/`hexLength`, variable-length `hex`/`hexAlloc`,
   comptime `HexOf`, a runtime `MultiHasher` (streaming), `hashFile` (any algo, /proc-safe), and
