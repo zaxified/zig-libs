@@ -21,6 +21,25 @@ crypto leaves (`hashdigest`/`sealedbox`) done.
 Pre-public: ✅ license/provenance audit (`8b9094e`) · ✅ README module index (`b71377e`).
 Resume at "Next up" below.
 
+## Working policy (2026-07-07) — extraction vs value-add
+
+zig-libs exists to ship the **good** version of each library, not a copy of the minimal
+"for-purpose" versions already living in axp/bxp/wgs. Division of labour:
+- **Mechanical extraction / faithful port of a minimal seed = Opus does it inline** (scaffold +
+  carve-out + verify + commit). No Fable spend on pure copying.
+- **Fable5 = value-add only**: complete a module to full RFC/IETF/spec compliance, or port a mature
+  advanced library from another language, so the result beats the minimal seed. Every Fable brief
+  points at the spec / reference impl and says "here's the working minimum, make it best-in-class."
+- **License discipline on value-add is stricter**: value-add often ports from a named foreign lib →
+  agents work **clean-room from the spec/paper**, never copy source, and report the reference + its
+  license so NOTICE records the design ref. (Ongoing so the pre-public audit has material.)
+
+**IN PROGRESS (Fable, value-add, 2026-07-07):**
+- `http` **HPACK (RFC 7541)** — new `modules/http/src/hpack.zig`, full codec verified vs RFC 7541
+  Appendix C vectors. The codec core for HTTP/2; framing (RFC 9113) is the next batch on top of it.
+- `ramcache` **→ W-TinyLFU** — admission+eviction upgrade (Caffeine/ristretto design, TinyLFU paper),
+  backward-compatible API (wgs consumes it), hit-ratio benchmark vs LRU as the gate.
+
 ## Progress (committed; each independently re-verified Debug+ReleaseFast+fmt before commit)
 
 | Module | Cumulative tests | Commit |
