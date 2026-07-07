@@ -35,6 +35,14 @@ zig-libs exists to ship the **good** version of each library, not a copy of the 
   license so NOTICE records the design ref. (Ongoing so the pre-public audit has material.)
 
 **DONE (Fable, value-add, 2026-07-07):**
+- `wireguard` **NEW module** ✅ — `modules/wireguard/src/` (root+genl): native WireGuard device config
+  over the kernel **genetlink** API (reuses the `netlink` codec + a self-contained genl layer:
+  `genlmsghdr` + `CTRL_CMD_GETFAMILY` resolve + a `NETLINK_GENERIC` socket). Typed `Device`/`Peer`/
+  `AllowedIp` model, base64 key codecs, `getDevice` (multipart reassembly incl. peer continuation),
+  `setDevice` (peer/allowed-ip nested attrs, REPLACE flags, wg-tool message-splitting). Retires axp
+  `wg set` shell-outs. 14 tests (golden SET/GETFAMILY bytes, split+reassemble, multipart parse, live
+  unprivileged nlctrl resolve; 1 root-gated live round-trip skips). Debug+ReleaseFast+fmt green.
+  Clean-room from the WG netlink UAPI (NOTICE updated). Linux; dep `netlink`.
 - `snmp` **NEW module** ✅ — `modules/snmp/src/` (ber+oid+message+client, 5 files): SNMP v1 + v2c —
   a BER/ASN.1 codec (definite-length TLV + all SNMP application types incl. Counter64 + v2c
   exceptions), an OID type (dotted parse/format, wire packing, prefix/order), all 8 PDUs
@@ -196,7 +204,7 @@ zig-libs exists to ship the **good** version of each library, not a copy of the 
 
 ## Next up (resume here) — user-approved sequence 2026-07-07
 
-1. **Network-tail:** `wireguard` (on netlink/genetlink) **← in progress** → `traceroute` (on icmp) → `probe`.
+1. **Network-tail:** `wireguard` ✅ → `traceroute` (on icmp) **← next** → `probe`.
 2. **h2-completion** — decouple from the stalled 0.17 TLS server (PR #23005 open since Feb 2025; ianic
    server "minimal") and close the h2 stack at the app layer: **rapid-reset (CVE-2023-44487) +
    CONTINUATION-flood (CVE-2024-27316) hardening** (the core), concurrent stream multiplexing, an
@@ -248,8 +256,8 @@ axp *fakes* these in `axp-sim/src/synth.zig` or *shells out* to daemons (`lldpd`
 - poc-wf: `pollworker` · `chunkframe` · axp: `lenframe`/`jsonwire`.
 
 ## Queued — network control tail
-`wireguard` (on `netlink`, genetlink) **← in progress** · `traceroute` (on `icmp`) · `probe`.
-(`nftables` + `modbus` + `whois` + `uci` + `rdap` + `mqtt` + `snmp` ✅ done — see DONE above.)
+`traceroute` (on `icmp`) **← next** · `probe`.
+(`nftables` + `modbus` + `whois` + `uci` + `rdap` + `mqtt` + `snmp` + `wireguard` ✅ done — see DONE above.)
 
 ## Capstone
 `exprcalc` (bxp Excel-like evaluator) — build LAST; composes `decimal` (✅) + `datefmt` + `tz` +

@@ -104,6 +104,15 @@ audit is pending before any public release.
                consulted), vishvananda/netlink (Go, Apache-2.0; typed-query
                shape only). Clean-room, no source copied.
 
+  wireguard  — clean-room from the documented WireGuard netlink UAPI
+               (uapi/wireguard.h; GPL-2.0 WITH Linux-syscall-note — the
+               command/attribute/flag constants and layouts are the kernel's
+               OS ABI, not copyrightable interface code) and linux/genetlink.h
+               (genlmsghdr + nlctrl CTRL_CMD_GETFAMILY); design ref: wgctrl-go
+               (golang.zx2c4.com/wireguard/wgctrl, MIT) and the wg tool's
+               protocol usage (message-splitting/continuation behavior) —
+               behavior/attribute-shape only, no source consulted or copied.
+
   aaa-gate   — extracted from the authors' axp project (axp-central/src/
                rest.zig: admin-token gate, auditMutation, AuditThrottle;
                Apache-2.0, relicensed MIT by the copyright holder); design
