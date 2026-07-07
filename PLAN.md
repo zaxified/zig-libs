@@ -35,6 +35,12 @@ zig-libs exists to ship the **good** version of each library, not a copy of the 
   license so NOTICE records the design ref. (Ongoing so the pre-public audit has material.)
 
 **DONE (Fable, value-add, 2026-07-07):**
+- `mcp` **+ resources + prompts** ✅ — extended the MCP server from tools-only to all three primitives:
+  `resources/list`·`read` (text+base64 blob)·`templates/list` and `prompts/list`·`get` (arg-validated,
+  rendered messages), with matching `addResource`/`addResourceTemplate`/`addPrompt` registration
+  (ctx-threaded, mirrors `addTool`) and `initialize` capabilities advertising all three. Spec errors
+  (-32002 resource-not-found, -32602 param validation). 36 test-mcp (+14). Debug+ReleaseFast+fmt green.
+  Clean-room from the MCP spec (subscriptions deferred, `subscribe:false` advertised).
 - `dns` **+ record types** ✅ — added **SRV** (RFC 2782) + **CAA** (RFC 8659) parsing and a
   `txtConcat` helper to the typed `Record.Data` union (A/AAAA/PTR/CNAME/NS/MX/TXT/SOA were already
   there), reusing the existing compression-safe name reader + RDLENGTH bounds guard. 46 test-dns
