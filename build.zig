@@ -48,6 +48,7 @@ const module_list = [_]Module{
     .{ .name = "sealedbox" },
     .{ .name = "nftables" },
     .{ .name = "modbus" },
+    .{ .name = "whois" },
     // Scaffold more here (copy modules/_template) — see the catalog in
     // ~/CML/zig-libs-plan.md for the full candidate list.
 };
