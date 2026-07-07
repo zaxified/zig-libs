@@ -113,6 +113,11 @@ audit is pending before any public release.
                protocol usage (message-splitting/continuation behavior) —
                behavior/attribute-shape only, no source consulted or copied.
 
+  traceroute — clean-room from the classic traceroute(8)/mtr ICMP method
+               (Van Jacobson's TTL-stepping, a public technique) + RFC 792
+               (ICMP message formats, via the sibling `icmp` codec) —
+               behavior only, no traceroute/mtr source consulted or copied.
+
   aaa-gate   — extracted from the authors' axp project (axp-central/src/
                rest.zig: admin-token gate, auditMutation, AuditThrottle;
                Apache-2.0, relicensed MIT by the copyright holder); design

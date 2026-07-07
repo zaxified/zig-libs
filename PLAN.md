@@ -35,6 +35,14 @@ zig-libs exists to ship the **good** version of each library, not a copy of the 
   license so NOTICE records the design ref. (Ongoing so the pre-public audit has material.)
 
 **DONE (Fable, value-add, 2026-07-07):**
+- `traceroute` **NEW module** ✅ — `modules/traceroute/src/root.zig` (~950 L): ICMP-echo path
+  discovery on the `icmp` module — TTL-stepped probes (IP_TTL/IPV6_UNICAST_HOPS), Time-Exceeded/
+  Dest-Unreachable/Echo-Reply classification with embedded ident/seq correlation (reuses icmp's
+  codec — zero re-impl), a `Trace`/`Hop`/`Probe` model with per-hop min/avg/max/loss (via
+  `latency-stats`) + load-balanced-path annotation, all behind a transport seam. 15 tests (14 offline
+  canned-packet + virtual-clock: TE/reply/unreachable/timeout/two-address/late-reply/stats/v6/
+  malformed; 1 root-gated live skips). Debug+ReleaseFast+fmt green. Clean-room from the traceroute/mtr
+  technique + RFC 792. Linux; deps icmp/netaddr/latency-stats.
 - `wireguard` **NEW module** ✅ — `modules/wireguard/src/` (root+genl): native WireGuard device config
   over the kernel **genetlink** API (reuses the `netlink` codec + a self-contained genl layer:
   `genlmsghdr` + `CTRL_CMD_GETFAMILY` resolve + a `NETLINK_GENERIC` socket). Typed `Device`/`Peer`/
@@ -204,7 +212,7 @@ zig-libs exists to ship the **good** version of each library, not a copy of the 
 
 ## Next up (resume here) — user-approved sequence 2026-07-07
 
-1. **Network-tail:** `wireguard` ✅ → `traceroute` (on icmp) **← next** → `probe`.
+1. **Network-tail:** `wireguard` ✅ → `traceroute` ✅ → `probe` **← last**.
 2. **h2-completion** — decouple from the stalled 0.17 TLS server (PR #23005 open since Feb 2025; ianic
    server "minimal") and close the h2 stack at the app layer: **rapid-reset (CVE-2023-44487) +
    CONTINUATION-flood (CVE-2024-27316) hardening** (the core), concurrent stream multiplexing, an
@@ -256,8 +264,8 @@ axp *fakes* these in `axp-sim/src/synth.zig` or *shells out* to daemons (`lldpd`
 - poc-wf: `pollworker` · `chunkframe` · axp: `lenframe`/`jsonwire`.
 
 ## Queued — network control tail
-`traceroute` (on `icmp`) **← next** · `probe`.
-(`nftables` + `modbus` + `whois` + `uci` + `rdap` + `mqtt` + `snmp` + `wireguard` ✅ done — see DONE above.)
+`probe` **← last one** (TCP-connect / service reachability probe).
+(`nftables`+`modbus`+`whois`+`uci`+`rdap`+`mqtt`+`snmp`+`wireguard`+`traceroute` ✅ done — see DONE above.)
 
 ## Capstone
 `exprcalc` (bxp Excel-like evaluator) — build LAST; composes `decimal` (✅) + `datefmt` + `tz` +
