@@ -35,6 +35,16 @@ zig-libs exists to ship the **good** version of each library, not a copy of the 
   license so NOTICE records the design ref. (Ongoing so the pre-public audit has material.)
 
 **DONE (Fable, value-add, 2026-07-07):**
+- `l2disco` **NEW module** ✅ (step 3 — the one worthwhile "extract", built greenfield) —
+  `modules/l2disco/src/` (root+lldp+cdp+arp+dhcp+mac, 6 files): a pure L2/neighbor-discovery codec.
+  **LLDP** (802.1AB: 7+9 TLV, mandatory + optional + org-specific 802.1/802.3, typed `Lldpdu` +
+  iterators + builder), **CDP** (Cisco: header+checksum + Device/Port/Addresses/Capabilities/Version/
+  Platform/VLAN/Duplex TLVs), **ARP** (RFC 826: generic + Eth/IPv4 + gratuitous/probe), **DHCP** (RFC
+  2131/2132: header+cookie + typed option model, all 8 message types, overload), **MAC** (EUI-48
+  helper). No sockets, no hot-path alloc; unknown TLVs pass through. 31 tests (golden-byte KAT +
+  round-trip + garbage sweep per protocol). Debug+ReleaseFast+fmt green. Clean-room from the specs.
+  (Agent hit a transient API error mid-build; resumed via SendMessage to finish LLDP+root.) Retires
+  axp's faked LLDP/CDP/DHCP.
 - `http` **HTTP/2 TLS-adapter seam + ALPN** ✅ (h2-completion batch 3 — closes the stack) — ALPN API
   (`alpn_h2`/`alpn_http11`/`alpn_offer`/`protocolFromAlpn`) + stream-level entry points
   `h2_server.serveStream(gpa, in, out, peer, opts)` and `Client.connectH2Over(gpa, in, out, authority,
@@ -256,8 +266,9 @@ zig-libs exists to ship the **good** version of each library, not a copy of the 
    - **h2-completion COMPLETE** — a self-contained, DoS-hardened, bidirectional, TLS-deployable h2 API
      stack, independent of the 0.17 TLS server. Optional future perf: concurrent stream multiplexing on
      the h2c **server** (currently sequential-per-connection — correct + bounded by the DoS caps).
-3. **`l2disco`** ← NEXT — the one worthwhile "extract" candidate, and it's actually greenfield (see
-   AXP tail): a proper LLDP (802.1AB) + CDP + ARP + DHCP option codec.
+3. **`l2disco`** ✅ DONE — LLDP (802.1AB) + CDP + ARP + DHCP option codec (greenfield).
+
+**→ The user-approved sequence (network-tail → h2-completion → l2disco) is COMPLETE.** Next direction TBD.
 
 Extractions (dataset/tabular/jsonshape/finstats/bxp text libs) stay **Opus + deferred** — verified
 2026-07-07 to have little value-add headroom (below).

@@ -8,7 +8,7 @@ Not a dumping ground: ship **solid, not many**. Most members are *extracted* fro
 across sibling projects (bxp, axp, zig-fping, poc-wf-analytic); a few fill genuine gaps in the Zig
 ecosystem.
 
-**Status:** 37 modules · 984 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 38 modules · 1015 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ## Modules
@@ -51,6 +51,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `icmp` | ICMP echo (ping) engine — v4/v6 codec, batched socket, pacing | linux | seqmap, netaddr |
 | `traceroute` | ICMP-echo path discovery — TTL-stepped probes, per-hop address + RTT stats, load-balanced-path aware | linux | icmp, netaddr, latency-stats |
 | `probe` | TCP-connect reachability prober — up/refused/timeout + RTT, fan-out with bounded concurrency, latency aggregation | any | netaddr, latency-stats |
+| `l2disco` | Layer-2 / neighbor discovery codec — LLDP (802.1AB) + CDP + ARP (RFC 826) + DHCP options (RFC 2131/2132) + MAC helper | any | netaddr |
 | `seqmap` | Fixed 65 536-slot 16-bit request/reply correlation map, O(1) | any | — |
 | `latency-stats` | Online RTT stats — min/max/mean/stddev + RFC 3550 jitter + loss % (O(1)/sample, no alloc) + an **HdrHistogram** for bounded-error percentiles (p50–p99.9) | any | — |
 

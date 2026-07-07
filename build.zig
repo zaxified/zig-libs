@@ -55,6 +55,7 @@ const module_list = [_]Module{
     .{ .name = "wireguard", .deps = &.{"netlink"} },
     .{ .name = "traceroute", .deps = &.{ "icmp", "netaddr", "latency-stats" } },
     .{ .name = "probe", .deps = &.{ "netaddr", "latency-stats" } },
+    .{ .name = "l2disco", .deps = &.{"netaddr"} },
     .{ .name = "rdap", .deps = &.{ "http", "netaddr" } },
     // Scaffold more here (copy modules/_template) — see the catalog in
     // ~/CML/zig-libs-plan.md for the full candidate list.

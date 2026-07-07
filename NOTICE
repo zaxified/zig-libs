@@ -187,6 +187,13 @@ audit is pending before any public release.
                (BER). net-snmp (BSD-like) is cited as a behavior reference
                only — no source was consulted or copied.
 
+  l2disco    — clean-room from IEEE 802.1AB (LLDP) + the IEEE 802.1/802.3
+               org-TLV definitions, RFC 826 (ARP), and RFC 2131/2132 (DHCP);
+               the Cisco CDP frame format is a Cisco-documented / publicly
+               described (reverse-engineered) format used as a behavior
+               reference only. No packet-dissector source (Wireshark / lldpd /
+               net-snmp / tcpdump) was consulted or copied.
+
   latency-stats — the streaming moment stats (min/max/mean/stddev + RFC 3550
                jitter) are from the authors' zig-fping/axp work (see the fping
                attribution above). The `Histogram` percentile support is
