@@ -1,8 +1,8 @@
 # cookies
 
-HTTP cookies (RFC 6265). **P1 (done):** the `Cookie` request-header parser —
-iterate the `name=value` pairs a client sends back. **Next:** `Set-Cookie`
-building with attributes (Path/Domain/Max-Age/Expires/Secure/HttpOnly/SameSite).
+HTTP cookies (RFC 6265): the `Cookie` request-header **parser** and the
+`Set-Cookie` response-header **builder** (attributes Path/Domain/Max-Age/
+Expires/Secure/HttpOnly/SameSite, with header-injection validation).
 
 Allocation-free — parsed pairs borrow the header.
 
@@ -19,6 +19,12 @@ const sid = cookies.find(req.header("cookie") orelse "", "session") orelse retur
   strip a matching pair of surrounding DQUOTEs, skip empty-name segments.
 - `find(header, name) ?[]const u8` — the first value for `name`
   (case-sensitive).
+- `SetCookie{ name, value, path?, domain?, max_age?, expires?, secure, http_only,
+  same_site? }` + `write(w)` / `bufPrint(buf)` — the `Set-Cookie` header value,
+  attributes in RFC 6265 §4.1 order. Validates FIRST (name token, value
+  cookie-octet, no header-injection bytes) so a rejected cookie never leaves a
+  half-written header; `SameSite=None` without `Secure` → `InsecureSameSiteNone`.
+  `expires` is a pre-formatted date (module is std-only/dateless; prefer `max_age`).
 
 The parser is deliberately liberal (no charset validation on read); strictness
 belongs on the `Set-Cookie` build side (next part).
@@ -31,6 +37,8 @@ third-party source consulted or copied.
 
 ## Verification
 
-`zig build test-cookies` — 6 offline tests (simple pairs + `find`, OWS trimming,
-valueless cookies, quoted/unbalanced values, empty-name skipping + first-`=`
-split, empty/degenerate headers), green in Debug + ReleaseFast.
+`zig build test-cookies` — 16 offline tests. Parser (6): simple pairs + `find`,
+OWS trimming, valueless cookies, quoted/unbalanced values, empty-name skipping,
+degenerate headers. Builder (10): full attribute set, minimal, Domain+Expires,
+negative Max-Age, Strict, invalid name/value/Path/Domain rejection, SameSite=None
+both branches, BufferTooSmall. Green in Debug + ReleaseFast.

@@ -8,7 +8,7 @@ Not a dumping ground: ship **solid, not many**. Most members are *extracted* fro
 across sibling projects (bxp, axp, zig-fping, poc-wf-analytic); a few fill genuine gaps in the Zig
 ecosystem.
 
-**Status:** 49 modules · 1282 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 49 modules · 1292 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ## Modules
@@ -84,7 +84,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 |---|---|---|---|
 | `tar` | ustar/GNU tar reader+writer (preserves uid/gid/mtime) + gzip | any (packer: linux) | — |
 | `linkheader` | Web Linking (RFC 8288) `Link` header build + parse (rel/title/type), `pagination` (first/prev/next/last), `find(rel)` — zero-alloc | any | — |
-| `cookies` | HTTP cookies (RFC 6265) — `Cookie` request-header parser (`parse`/`find`); `Set-Cookie` building w/ SameSite/HttpOnly/Secure is a follow-up | any | — |
+| `cookies` | HTTP cookies (RFC 6265) — `Cookie` request parser (`parse`/`find`) **and** `Set-Cookie` builder (`SetCookie` w/ Path/Domain/Max-Age/Expires/**Secure/HttpOnly/SameSite**, injection-guarded, SameSite=None⇒Secure) | any | — |
 | `blobmsg` | OpenWRT ubus client + blob/blobmsg wire codec | any (client: linux) | — |
 | `mcp` | Model Context Protocol server (JSON-RPC 2.0) — tools + resources + prompts, app-state ctx | any | — |
 | `mcp-http` | MCP **Streamable HTTP** transport (2025-06-18) — `POST /mcp` → JSON-RPC response (`application/json` **or live SSE** with tool-progress streaming) / 202, as a `router` middleware over a `mcp.Server`. Optional **sessions** (`Mcp-Session-Id` + `GET /mcp` server→client SSE stream with `Last-Event-ID` resumable replay + `DELETE` teardown); built-in **Origin** (DNS-rebinding) guard, size cap, Lock seam | any | router, http, mcp |
