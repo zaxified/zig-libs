@@ -8,7 +8,7 @@ Not a dumping ground: ship **solid, not many**. Most members are *extracted* fro
 across sibling projects (bxp, axp, zig-fping, poc-wf-analytic); a few fill genuine gaps in the Zig
 ecosystem.
 
-**Status:** 40 modules · 1157 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 42 modules · 1167 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ## Modules
@@ -29,6 +29,8 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `cors` | CORS preflight + header injection (secure defaults) | router, http |
 | `validate` | Request body/query/params validation → aggregated 400 (typed + schema + string `format`: email/uri/uuid/ip/hostname/date-time/…) + **JSON DoS caps** (depth/array/field) | router, http, netaddr |
 | `metrics` | Prometheus registry (counter/gauge/histogram) + `/metrics` + request middleware + **access-log writer** (combined/JSON) | router, http |
+| `health` | Liveness (`/healthz`) + readiness (`/readyz`) probe middleware — 200/503 from registered dependency checks (k8s probe contract) | router, http |
+| `requestid` | Request/correlation-ID middleware — adopt incoming `X-Request-Id` or generate, echo on the response, expose via `current()` (composes with auth) | router, http |
 | `resilience` | Circuit breaker + retry/backoff + timeout + **bulkhead** (concurrency limiter) for calling upstreams (generic) | — |
 | `upstream` | Load-balanced upstream pool + failover — round-robin/weighted/least-conn/EWMA strategies, per-upstream breaker+bulkhead, active+passive health | resilience, probe |
 | `openapi` | OpenAPI 3.1 spec generated from the route table + `/openapi.json` | router, http |

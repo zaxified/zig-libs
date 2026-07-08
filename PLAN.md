@@ -293,8 +293,12 @@ fmt green. **Still open:** request-ID mw · health helper · conditional-req · 
   proxy). 1 line, Server. **Opus.**
 - 🟡 **JSON DoS caps** — depth / array-element / field-count (today only 1 MiB body size). validate ext. **small-med · Opus.**
 - 🟡 **path normalization + `..` traversal** (router matches byte-for-byte; no dot-seg collapse / percent-decode). router/http. **small-med.**
-- 🟡 **request-ID / correlation-ID** middleware (gen + echo `X-Request-Id`). **small · Opus.**
-- 🟡 **health/readiness** endpoint helper (LB/k8s probes). **small · Opus.**
+- ✅ **request-ID / correlation-ID** middleware — NEW `requestid` module (Opus): adopt incoming
+  `X-Request-Id` (validated) or generate a portable 32-hex correlation ID (mono-ns + per-thread nonce +
+  counter, no OS entropy), echo on the response, expose via `current()` (avoids Ctx.data → composes with
+  auth). +6 tests.
+- ✅ **health/readiness** — NEW `health` module (Opus): `/healthz` (always 200) + `/readyz` (200, or 503
+  listing failing registered dependency checks) probe middleware, k8s contract. +4 tests.
 - 🟡 **access-log writer** — the `on_request`/`AccessEntry` hook exists (metrics:610), ship a default writer. **small · Opus.**
 - 🟡 **API-key auth** (`X-Api-Key`) — aaa-gate is Bearer-only. aaa-gate ext. **small.**
 - ✅ **conditional requests** — `http.conditional` (RFC 9110 §8.8/§13): ETag weak/strong + `If-Match` /
