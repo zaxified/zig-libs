@@ -205,9 +205,11 @@ audit is pending before any public release.
   coap       — clean-room from RFC 7252 (the Constrained Application Protocol),
                an open IETF standard: the §3 message format (header / token /
                delta-encoded options / payload), the §5.10 option registry +
-               §5.4.6 class bits + §3.2 uint value format, and the §6 URI ↔
-               options mapping (with RFC 3986 percent-encoding). No third-party
-               CoAP source (libcoap, aiocoap, californium, …) was consulted or
+               §5.4.6 class bits + §3.2 uint value format, the §6 URI ↔ options
+               mapping (with RFC 3986 percent-encoding), and the §4 message
+               layer (§4.2 Confirmable retransmission timers, §4.5 message-ID
+               deduplication, §4.8 transmission parameters). No third-party CoAP
+               source (libcoap, aiocoap, californium, …) was consulted or
                copied.
 
   snmp       — clean-room from RFC 1157 (SNMPv1), RFC 1905/3416 (SNMPv2c

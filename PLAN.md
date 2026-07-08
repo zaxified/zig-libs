@@ -348,7 +348,10 @@ fmt green. **Still open:** request-ID mw · health helper · conditional-req · 
 options/payload, `parse`/`serialize`/`encodedLen`, zero-alloc, transport-agnostic; Fable, 7 tests). **C2 ✅**
 `coap.options` — §5.10 registry + class bits, CoAP uint (§3.2), typed accessors (Content-Format/Accept/
 Max-Age/Uri-Path/Uri-Query), §6 URI↔options mapping (`optionsFromUri`/`uriFromOptions`); Fable, 19 tests.
-Remaining: C3 CON/ACK reliability + MID dedup · C4 client · C5 server (C6/C7 block-wise + observe deferred).
+**C3 ✅** `coap.reliability` — CON retransmission w/ exponential backoff + deterministic jitter (§4.2),
+message-ID dedup window (§4.5), empty-ACK/RST helpers, §4.8 params; clock-agnostic (caller `now_ms`,
+offline-testable); Fable, 9 tests. Remaining: C4 client · C5 server (both Opus-inline — join C1-C3 over a
+UDP seam, not value-add spec; C6/C7 block-wise + observe deferred).
 · 5. **MQTT broker** (large) — G IoT hub.
 Extraction backlog (Opus, NOT Fable — low/no value-add headroom): `rawsock` (axp `openPacketCapture`
 AF_PACKET layer is REAL) · data-family (dataset/tabular/jsonshape/finstats; **`roquery` has a security-

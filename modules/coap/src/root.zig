@@ -47,6 +47,11 @@ pub const meta = .{
 /// Max-Age / Uri-Path / Uri-Query), and the §6 URI ↔ options mapping.
 pub const options = @import("options.zig");
 
+/// The message/reliability layer (C3): Confirmable retransmission with
+/// exponential backoff (§4.2), message-ID deduplication (§4.5), and the
+/// empty-ACK / Reset helpers — transport- and clock-agnostic.
+pub const reliability = @import("reliability.zig");
+
 /// CoAP version in the 2-bit Ver field (always 1 for RFC 7252).
 pub const version = 1;
 
