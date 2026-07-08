@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: MIT
 
-//! Proactive content negotiation (RFC 9110 §12) — **N1: the `Accept`
-//! media-range + q-value parser**.
+//! Proactive content negotiation (RFC 9110 §12) — a full `Accept` /
+//! `Accept-Language` / `Accept-Encoding` parser + negotiator.
 //!
-//! This layer parses the `Accept` request header (RFC 9110 §12.5.1) into a list
-//! of media-ranges, each with its quality weight `q`. It is pure syntax: it does
-//! NOT pick a representation — matching the client's ranges against a server's
-//! offers and applying the precedence rules is N2 (`negotiate`), and the sibling
-//! `Accept-Language` (RFC 4647) / `Accept-Encoding` headers are N3. Keeping the
-//! parse standalone lets a handler inspect what the client asked for before it
-//! knows what it can offer.
+//! Three layers:
+//!  - **N1** — the `Accept` media-range + q-value parser (`MediaRange`,
+//!    `accept`/`parse`, `parseQvalue`); pure syntax.
+//!  - **N2** — `negotiate(accept, offers)`: match the client's media-ranges
+//!    against the server's offered media types and pick the best (most-specific
+//!    range → highest weight → server preference), null → 406.
+//!    `negotiateContentType(req, offers)` is the request-header convenience.
+//!  - **N3** — the sibling `Accept-Language` (RFC 4647 §3.3.1 basic filtering,
+//!    `negotiateLanguage`) and `Accept-Encoding` (RFC 9110 §12.5.3,
+//!    `encodingQuality`/`negotiateEncoding` with the implicit-`identity` rules),
+//!    over a shared `#( token [weight] )` `TokenList`.
+//!
+//! Everything is allocation-free and float-free (weights are integer
+//! milli-units). N1 is documented immediately below; N2 and N3 follow.
 //!
 //! ## Grammar (RFC 9110 §12.5.1)
 //!
@@ -297,6 +304,200 @@ fn splitType(mt: []const u8) ?TypePair {
     const subtype_ = std.mem.trim(u8, range[slash + 1 ..], " \t");
     if (type_.len == 0 or subtype_.len == 0) return null;
     return .{ .type = type_, .subtype = subtype_ };
+}
+
+// ── N3: Accept-Language (RFC 4647) + Accept-Encoding (RFC 9110 §12.5.3) ───────
+//
+// Both headers share the shape `#( token [ weight ] )` — a comma-separated list
+// of a bare token (a language-range or a content-coding) with an optional `;q=`
+// weight — which is simpler than a media-range (no `/`, no media params). The
+// `TokenList` iterator + `parseTokenElement` below parse that shared shape,
+// reusing N1's `parseQvalue`; the language and encoding helpers layer their
+// matching rules on top.
+
+/// One `#( token [weight] )` element: a bare token with its quality weight.
+pub const WeightedToken = struct {
+    /// The token as written (a language-range like `en-US` or a content-coding
+    /// like `gzip`; may be `*`). Compare case-insensitively.
+    token: []const u8,
+    /// Quality in milli-units 0..1000 (`q_default` when no `;q=`). `q=0` =
+    /// "not acceptable".
+    weight: u16,
+};
+
+/// A lenient, allocation-free iterator over an `Accept-Language` /
+/// `Accept-Encoding` header (a `#( token [weight] )` list). Skips malformed
+/// elements, null at the end.
+pub const TokenList = struct {
+    /// Remaining header text, advanced by `next`.
+    rest: []const u8,
+
+    /// Yield the next well-formed weighted token, or null at the end.
+    pub fn next(self: *TokenList) ?WeightedToken {
+        while (true) {
+            // Skip leading OWS and stray commas (the #rule allows empty
+            // elements).
+            self.rest = std.mem.trimStart(u8, self.rest, " \t,");
+            if (self.rest.len == 0) return null;
+            const end = std.mem.indexOfScalar(u8, self.rest, ',') orelse self.rest.len;
+            const elem = std.mem.trim(u8, self.rest[0..end], " \t");
+            self.rest = if (end < self.rest.len) self.rest[end + 1 ..] else "";
+            if (parseTokenElement(elem)) |wt| return wt;
+            // Malformed element — lenient: skip it and try the next one.
+        }
+    }
+};
+
+/// Build a `TokenList` over a raw `Accept-Language` / `Accept-Encoding` value.
+pub fn tokenList(header: []const u8) TokenList {
+    return .{ .rest = header };
+}
+
+/// Parse ONE already-comma-split, OWS-trimmed element (`gzip;q=0.5`, `en-US`,
+/// `*`) into a `WeightedToken`, or null if malformed.
+pub fn parseTokenElement(elem: []const u8) ?WeightedToken {
+    // Split token vs params at the first ';'.
+    const semi = std.mem.indexOfScalar(u8, elem, ';');
+    const token = std.mem.trim(u8, if (semi) |i| elem[0..i] else elem, " \t");
+    const tail = if (semi) |i| elem[i + 1 ..] else "";
+    if (token.len == 0) return null;
+
+    // Walk the tail as ';'-separated params; the first param named "q"
+    // (case-insensitive) is the weight. Anything else is ignored.
+    var weight: u16 = q_default;
+    var pos: usize = 0;
+    while (pos < tail.len) {
+        const seg_end = std.mem.indexOfScalarPos(u8, tail, pos, ';') orelse tail.len;
+        const seg = tail[pos..seg_end];
+        const eq = std.mem.indexOfScalar(u8, seg, '=') orelse seg.len;
+        const name = std.mem.trim(u8, seg[0..eq], " \t");
+        if (std.ascii.eqlIgnoreCase(name, "q")) {
+            const value = if (eq < seg.len) seg[eq + 1 ..] else "";
+            weight = parseQvalue(value) orelse return null;
+            break;
+        }
+        pos = seg_end + 1;
+    }
+
+    return .{ .token = token, .weight = weight };
+}
+
+// ── Accept-Language (RFC 4647 §3.3.1 basic filtering) ────────────────────────
+
+/// RFC 4647 §3.3.1 **basic filtering**: does language-range `range` match
+/// language `tag`? Case-insensitive. `*` matches any tag. Otherwise `range`
+/// matches iff it equals `tag` OR is a prefix of `tag` at a subtag boundary —
+/// i.e. `tag` equals `range` or begins with `range` immediately followed by a
+/// `-`. So `en` matches `en`, `en-US`, `en-GB-oxendict`; `en-US` matches `en-US`
+/// and `en-US-x-…` but NOT `en` or `en-GB`.
+pub fn languageMatches(range: []const u8, tag: []const u8) bool {
+    if (std.mem.eql(u8, range, "*")) return true;
+    if (std.ascii.eqlIgnoreCase(range, tag)) return true;
+    return tag.len > range.len and tag[range.len] == '-' and
+        std.ascii.eqlIgnoreCase(range, tag[0..range.len]);
+}
+
+/// Pick the best language for an `Accept-Language` header from the server's
+/// offered `tags` (concrete language tags, server-preference order). Mirrors
+/// `negotiate`: each offer's quality is the weight of the **most specific**
+/// matching range (specificity = subtag count of the range, `*` = 0); the winner
+/// is the highest-weight acceptable offer, ties → server preference; no-match /
+/// `q=0` dropped; null → 406. Empty/absent header → the first offer at
+/// `q_default`.
+pub fn negotiateLanguage(header: []const u8, tags: []const []const u8) ?Negotiated {
+    // Step A — empty-header shortcut: no ranges at all means the client
+    // accepts anything → the first tag wins at q_default.
+    var probe = tokenList(header);
+    if (probe.next() == null) {
+        if (tags.len == 0) return null;
+        return .{ .index = 0, .media_type = tags[0], .weight = q_default };
+    }
+
+    // Step B — score each tag independently by the most specific matching
+    // range, then keep the highest-weight acceptable tag (ties → earliest).
+    var best: ?Negotiated = null;
+    for (tags, 0..) |tag, i| {
+        // Find this tag's best-matching range: highest specificity, then
+        // (on equal specificity) highest weight, then earliest position.
+        var matched = false;
+        var best_spec: i16 = -1;
+        var best_weight: u16 = 0;
+        var it = tokenList(header);
+        while (it.next()) |wt| {
+            if (!languageMatches(wt.token, tag)) continue;
+            const spec: i16 = subtagCount(wt.token);
+            if (!matched or spec > best_spec or (spec == best_spec and wt.weight > best_weight)) {
+                matched = true;
+                best_spec = spec;
+                best_weight = wt.weight;
+            }
+        }
+        if (!matched or best_weight == 0) continue; // unacceptable (no match / q=0)
+        // Keep the highest-weight tag; ties → earliest (so strict >).
+        if (best == null or best_weight > best.?.weight) {
+            best = .{ .index = i, .media_type = tag, .weight = best_weight };
+        }
+    }
+    return best;
+}
+
+/// Subtag count of a language-range for specificity: `*` → 0, otherwise
+/// 1 + the number of `-` separators (`en` → 1, `en-US` → 2).
+fn subtagCount(range: []const u8) u8 {
+    if (std.mem.eql(u8, range, "*")) return 0;
+    const dashes: u8 = @intCast(std.mem.count(u8, range, "-"));
+    return 1 + dashes;
+}
+
+// ── Accept-Encoding (RFC 9110 §12.5.3) ───────────────────────────────────────
+
+/// The acceptability weight of content-coding `coding` (a concrete token like
+/// `gzip`, `br`, `identity`; never `*`) under an `Accept-Encoding` header, or
+/// null if `coding` is **not acceptable** (RFC 9110 §12.5.3). Rules:
+///   - an explicit (case-insensitive) token entry decides it: its weight, or
+///     null when `q=0`;
+///   - else a `*` entry decides it: its weight, or null when `q=0`;
+///   - else `identity` is implicitly acceptable (`q_default`) — any other
+///     unmentioned coding is not acceptable (null);
+///   - an absent/empty header accepts anything (`q_default`).
+/// (These rules make `identity` acceptable by default unless excluded by
+/// `identity;q=0` or a bare `*;q=0` with no identity override.)
+pub fn encodingQuality(header: []const u8, coding: []const u8) ?u16 {
+    var explicit: ?u16 = null;
+    var star: ?u16 = null;
+    var any = false;
+    var it = tokenList(header);
+    while (it.next()) |wt| {
+        any = true;
+        if (explicit == null and std.ascii.eqlIgnoreCase(wt.token, coding)) {
+            explicit = wt.weight;
+        } else if (star == null and std.mem.eql(u8, wt.token, "*")) {
+            star = wt.weight;
+        }
+    }
+    if (!any) return q_default; // empty/absent header → accept anything
+    if (explicit) |w| return if (w > 0) w else null;
+    if (star) |w| return if (w > 0) w else null;
+    if (std.ascii.eqlIgnoreCase(coding, "identity")) return q_default;
+    return null;
+}
+
+/// Pick the best content-coding for an `Accept-Encoding` header from the
+/// server's offered `codings` (server-preference order). Each offer's quality is
+/// `encodingQuality(header, coding)`; the highest-quality acceptable offer wins,
+/// ties → server preference; null when none is acceptable (the caller then
+/// serves `identity`, which is itself acceptable unless the header forbade it —
+/// test with `encodingQuality(header, "identity")`).
+pub fn negotiateEncoding(header: []const u8, codings: []const []const u8) ?Negotiated {
+    var best: ?Negotiated = null;
+    for (codings, 0..) |coding, i| {
+        const q = encodingQuality(header, coding) orelse continue;
+        if (q == 0) continue; // encodingQuality already nulls q=0, but be safe
+        if (best == null or q > best.?.weight) {
+            best = .{ .index = i, .media_type = coding, .weight = q };
+        }
+    }
+    return best;
 }
 
 const testing = std.testing;
@@ -620,4 +821,252 @@ test "negotiateContentType: reads the request's Accept header" {
     try testing.expectEqual(@as(usize, 0), nb.index);
     try testing.expectEqualStrings("text/html", nb.media_type);
     try testing.expectEqual(q_default, nb.weight);
+}
+
+test "parseTokenElement: bare token -> q=1000" {
+    const gz = parseTokenElement("gzip").?;
+    try testing.expectEqualStrings("gzip", gz.token);
+    try testing.expectEqual(q_default, gz.weight);
+
+    const en = parseTokenElement("en-US").?;
+    try testing.expectEqualStrings("en-US", en.token);
+    try testing.expectEqual(q_default, en.weight);
+
+    const star = parseTokenElement("*").?;
+    try testing.expectEqualStrings("*", star.token);
+    try testing.expectEqual(q_default, star.weight);
+}
+
+test "parseTokenElement: explicit weight" {
+    const gz = parseTokenElement("gzip;q=0.5").?;
+    try testing.expectEqualStrings("gzip", gz.token);
+    try testing.expectEqual(@as(u16, 500), gz.weight);
+
+    const star = parseTokenElement("*;q=0").?;
+    try testing.expectEqualStrings("*", star.token);
+    try testing.expectEqual(@as(u16, 0), star.weight);
+
+    // OWS around ';' and case-insensitive q name.
+    const ows = parseTokenElement("br ; Q=0.9").?;
+    try testing.expectEqualStrings("br", ows.token);
+    try testing.expectEqual(@as(u16, 900), ows.weight);
+}
+
+test "parseTokenElement: malformed -> null" {
+    try testing.expect(parseTokenElement("") == null);
+    try testing.expect(parseTokenElement("gzip;q=2") == null);
+    try testing.expect(parseTokenElement("gzip;q=") == null);
+    try testing.expect(parseTokenElement(";q=0.5") == null);
+}
+
+test "tokenList: typical Accept-Encoding header" {
+    var it = tokenList("gzip, br;q=0.9, *;q=0");
+
+    const a = it.next().?;
+    try testing.expectEqualStrings("gzip", a.token);
+    try testing.expectEqual(q_default, a.weight);
+
+    const b = it.next().?;
+    try testing.expectEqualStrings("br", b.token);
+    try testing.expectEqual(@as(u16, 900), b.weight);
+
+    const c = it.next().?;
+    try testing.expectEqualStrings("*", c.token);
+    try testing.expectEqual(@as(u16, 0), c.weight);
+
+    try testing.expect(it.next() == null);
+    try testing.expect(it.next() == null); // stays exhausted
+}
+
+test "tokenList: stray commas are skipped" {
+    var it = tokenList("gzip,,br");
+    try testing.expectEqualStrings("gzip", it.next().?.token);
+    try testing.expectEqualStrings("br", it.next().?.token);
+    try testing.expect(it.next() == null);
+}
+
+test "tokenList: empty header yields no elements" {
+    var it = tokenList("");
+    try testing.expect(it.next() == null);
+
+    var ws = tokenList("  , ,\t");
+    try testing.expect(ws.next() == null);
+}
+
+test "tokenList: malformed element in the middle is skipped" {
+    var it = tokenList("gzip, br;q=abc, deflate;q=0.5");
+    try testing.expectEqualStrings("gzip", it.next().?.token);
+    const d = it.next().?;
+    try testing.expectEqualStrings("deflate", d.token);
+    try testing.expectEqual(@as(u16, 500), d.weight);
+    try testing.expect(it.next() == null);
+}
+
+test "languageMatches: wildcard and exact" {
+    try testing.expect(languageMatches("*", "en-US"));
+    try testing.expect(languageMatches("*", "fr"));
+    try testing.expect(languageMatches("en", "en"));
+    try testing.expect(languageMatches("en-US", "en-US"));
+}
+
+test "languageMatches: prefix at a subtag boundary" {
+    try testing.expect(languageMatches("en", "en-US"));
+    try testing.expect(languageMatches("en", "en-GB-x-a"));
+    try testing.expect(!languageMatches("en", "eng")); // not at a '-' boundary
+    try testing.expect(!languageMatches("e", "en")); // ditto
+    try testing.expect(languageMatches("en-US", "en-US-x-1"));
+    try testing.expect(!languageMatches("en-US", "en"));
+    try testing.expect(!languageMatches("en-US", "en-GB"));
+}
+
+test "languageMatches: case-insensitive" {
+    try testing.expect(languageMatches("EN", "en-us"));
+    try testing.expect(languageMatches("en-us", "en-US"));
+    try testing.expect(languageMatches("EN-US", "en-us-x-1"));
+}
+
+test "subtagCount: * -> 0, en -> 1, en-US -> 2" {
+    try testing.expectEqual(@as(u8, 0), subtagCount("*"));
+    try testing.expectEqual(@as(u8, 1), subtagCount("en"));
+    try testing.expectEqual(@as(u8, 2), subtagCount("en-US"));
+    try testing.expectEqual(@as(u8, 3), subtagCount("en-GB-oxendict"));
+}
+
+test "negotiateLanguage: most specific range wins" {
+    const tags = [_][]const u8{ "en-US", "en-GB" };
+    const n = negotiateLanguage("en;q=0.5, en-US;q=0.9", &tags).?;
+    // en-US gets the specific range's q=0.9 (beats the bare en range);
+    // en-GB only matches en at q=0.5.
+    try testing.expectEqual(@as(usize, 0), n.index);
+    try testing.expectEqualStrings("en-US", n.media_type);
+    try testing.expectEqual(@as(u16, 900), n.weight);
+}
+
+test "negotiateLanguage: highest weight across tags" {
+    const tags = [_][]const u8{ "en", "de" };
+    const n = negotiateLanguage("de;q=0.9, en;q=0.4", &tags).?;
+    try testing.expectEqual(@as(usize, 1), n.index);
+    try testing.expectEqualStrings("de", n.media_type);
+    try testing.expectEqual(@as(u16, 900), n.weight);
+}
+
+test "negotiateLanguage: server preference breaks a weight tie" {
+    const tags = [_][]const u8{ "fr", "de" };
+    const n = negotiateLanguage("*", &tags).?;
+    try testing.expectEqual(@as(usize, 0), n.index);
+    try testing.expectEqualStrings("fr", n.media_type);
+    try testing.expectEqual(q_default, n.weight);
+}
+
+test "negotiateLanguage: q=0 excludes a tag" {
+    // The only tag's most-specific match is q=0 → nothing acceptable.
+    const only = [_][]const u8{"en-US"};
+    try testing.expect(negotiateLanguage("en, en-US;q=0", &only) == null);
+
+    // With a second tag, the excluded one is skipped and en-GB wins via the
+    // bare en range at q=1000.
+    const tags = [_][]const u8{ "en-US", "en-GB" };
+    const n = negotiateLanguage("en, en-US;q=0", &tags).?;
+    try testing.expectEqual(@as(usize, 1), n.index);
+    try testing.expectEqualStrings("en-GB", n.media_type);
+    try testing.expectEqual(@as(u16, 1000), n.weight);
+}
+
+test "negotiateLanguage: no matching range -> null" {
+    const tags = [_][]const u8{"en"};
+    try testing.expect(negotiateLanguage("fr, de;q=0.5", &tags) == null);
+}
+
+test "negotiateLanguage: empty header -> first tag at q_default" {
+    const tags = [_][]const u8{ "en", "de" };
+    const n = negotiateLanguage("", &tags).?;
+    try testing.expectEqual(@as(usize, 0), n.index);
+    try testing.expectEqualStrings("en", n.media_type);
+    try testing.expectEqual(q_default, n.weight);
+
+    // Whitespace/comma-only header also counts as "no ranges".
+    const ws = negotiateLanguage("  , ,\t", &tags).?;
+    try testing.expectEqual(@as(usize, 0), ws.index);
+
+    // No tags at all → null even on the empty-header path.
+    try testing.expect(negotiateLanguage("", &.{}) == null);
+}
+
+test "encodingQuality: explicit tokens and implicit identity" {
+    const h = "gzip, br;q=0.8";
+    try testing.expectEqual(@as(u16, 1000), encodingQuality(h, "gzip").?);
+    try testing.expectEqual(@as(u16, 800), encodingQuality(h, "br").?);
+    try testing.expectEqual(q_default, encodingQuality(h, "identity").?); // implicit
+    try testing.expect(encodingQuality(h, "deflate") == null);
+    // Case-insensitive coding match.
+    try testing.expectEqual(@as(u16, 1000), encodingQuality(h, "GZIP").?);
+}
+
+test "encodingQuality: *;q=0 excludes everything unmentioned" {
+    const h = "gzip, *;q=0";
+    try testing.expectEqual(@as(u16, 1000), encodingQuality(h, "gzip").?);
+    try testing.expect(encodingQuality(h, "br") == null);
+    try testing.expect(encodingQuality(h, "identity") == null); // no override
+}
+
+test "encodingQuality: explicit identity override beats *;q=0" {
+    const h = "*;q=0, identity;q=1";
+    try testing.expectEqual(@as(u16, 1000), encodingQuality(h, "identity").?);
+    try testing.expect(encodingQuality(h, "gzip") == null);
+}
+
+test "encodingQuality: explicit q=0 exclusions" {
+    try testing.expect(encodingQuality("identity;q=0", "identity") == null);
+    try testing.expect(encodingQuality("gzip;q=0", "gzip") == null);
+}
+
+test "encodingQuality: * with a positive weight applies to unmentioned codings" {
+    const h = "gzip;q=0.5, *;q=0.3";
+    try testing.expectEqual(@as(u16, 500), encodingQuality(h, "gzip").?);
+    try testing.expectEqual(@as(u16, 300), encodingQuality(h, "br").?);
+    try testing.expectEqual(@as(u16, 300), encodingQuality(h, "identity").?);
+}
+
+test "encodingQuality: empty header accepts anything" {
+    try testing.expectEqual(q_default, encodingQuality("", "gzip").?);
+    try testing.expectEqual(q_default, encodingQuality("", "identity").?);
+    try testing.expectEqual(q_default, encodingQuality("  , ,\t", "br").?);
+}
+
+test "negotiateEncoding: highest quality wins" {
+    const offers = [_][]const u8{ "gzip", "br" };
+    const n = negotiateEncoding("br;q=1, gzip;q=0.5", &offers).?;
+    try testing.expectEqual(@as(usize, 1), n.index);
+    try testing.expectEqualStrings("br", n.media_type);
+    try testing.expectEqual(@as(u16, 1000), n.weight);
+}
+
+test "negotiateEncoding: *;q=0 excludes an offer" {
+    const offers = [_][]const u8{ "br", "gzip" };
+    const n = negotiateEncoding("gzip, *;q=0", &offers).?;
+    try testing.expectEqual(@as(usize, 1), n.index);
+    try testing.expectEqualStrings("gzip", n.media_type);
+    try testing.expectEqual(@as(u16, 1000), n.weight);
+}
+
+test "negotiateEncoding: no acceptable offer -> null" {
+    const offers = [_][]const u8{ "gzip", "br" };
+    try testing.expect(negotiateEncoding("*;q=0", &offers) == null);
+    try testing.expect(negotiateEncoding("deflate", &offers) == null);
+}
+
+test "negotiateEncoding: server preference breaks a weight tie" {
+    const offers = [_][]const u8{ "br", "gzip" };
+    const n = negotiateEncoding("*", &offers).?;
+    try testing.expectEqual(@as(usize, 0), n.index);
+    try testing.expectEqualStrings("br", n.media_type);
+    try testing.expectEqual(q_default, n.weight);
+}
+
+test "negotiateEncoding: empty header -> first offer at q_default" {
+    const offers = [_][]const u8{ "gzip", "br" };
+    const n = negotiateEncoding("", &offers).?;
+    try testing.expectEqual(@as(usize, 0), n.index);
+    try testing.expectEqualStrings("gzip", n.media_type);
+    try testing.expectEqual(q_default, n.weight);
 }

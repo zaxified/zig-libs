@@ -70,8 +70,10 @@ audit is pending before any public release.
                sec 5.1 (multipart/form-data). The Range request-header parser
                is clean-room from RFC 7233 sec 2.1 (byte-range-set); the 206
                resolution + Content-Range emitter follows RFC 7233 sec 4. The
-               content-negotiation Accept parser is clean-room from RFC 9110
-               sec 12.5.1 (media-range) + sec 12.4.2 (qvalue). Clean-room
+               content-negotiation parsers are clean-room from RFC 9110
+               sec 12.5.1 (Accept media-range) + sec 12.4.2 (qvalue) +
+               sec 12.5.3 (Accept-Encoding) and RFC 4647 sec 3.3.1
+               (Accept-Language basic filtering). Clean-room
                from the RFCs, no HPACK/HTTP-2/nghttp2 source consulted or
                copied; TLS via Zig std.crypto.tls.
   dns        — RFC 1035 (wire), RFC 8484 (DoH), RFC 2782 (SRV), RFC 8659

@@ -344,8 +344,11 @@ fmt green. **Still open:** request-ID mw · health helper · conditional-req · 
   `specificity`, lenient `accept` iterator + `parse`, `parseQvalue`; Fable, 17 tests). · ✅ **N2** (RFC 9110
   §12.5.1 — `negotiate(accept, offers) ?Negotiated`: most-specific matching range → highest weight →
   server-preference tie-break, drops no-match/`q=0`, null → 406; + `negotiateContentType(req, offers)`
-  convenience; Fable, 9 tests). **Still open:** conneg **N3** (`Accept-Language` RFC 4647 basic-filtering +
-  `Accept-Encoding` identity/`*` rules) · response-trailer write · HTTP/3 (large, deferred/never).
+  convenience; Fable, 9 tests). · ✅ **N3** (`Accept-Language` RFC 4647 §3.3.1 basic filtering +
+  `Accept-Encoding` RFC 9110 §12.5.3 with the implicit-`identity` rules; shared `TokenList` +
+  `languageMatches`/`negotiateLanguage` + `encodingQuality`/`negotiateEncoding`; Fable, 28 tests).
+  **Content negotiation is now COMPLETE.** **Still open:** response-trailer write · HTTP/3 (large,
+  deferred/never).
 - 🐛 **Test-wiring audit (2026-07-08):** found that a `pub const x = @import("x.zig")` re-export does NOT pull
   the imported file's `test` blocks into the module test binary — they run only when referenced from a
   `test { _ = x; }` block (or refAllDecls). `http` (conditional/body/multipart/sse/range = 57 tests) and `coap`
