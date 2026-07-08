@@ -51,19 +51,81 @@ zig-libs ships the **good** (RFC/spec-complete) version of each library, not a c
 - **coap** (RFC 7252) — C1–C5 full client/server stack ✅. Deferred: **C6** block-wise (RFC 7959) ·
   **C7** observe (RFC 7641).
 
-## Backlog
+## Candidate program (2026-07-09 audit — full backlog, categorized)
 
-- **App-elevation value-add (Fable, when reset):** MQTT **broker** (large; `mqtt` has the client).
-- **Extraction / new candidates (Opus, low value-add headroom):** the OPEN list in
-  [`docs/CANDIDATES.md`](docs/CANDIDATES.md) — `rawsock` (real AF_PACKET layer in axp `task.zig`;
-  wires l2disco/arp/icmp onto the wire) · wgs data/compute family `dataset`→`tabular`→`jsonshape`→
-  `finstats` + **`roquery`** (read-only-SQLite hardening sliver) · `exprcalc` (capstone; sandbox
-  sliver) · `procnet`/`argsafe`/`blobstore` · bxp text libs (`datefmt`/`tz`/`encoding`/`unaccent`/
-  `numparse`/`json5`/`zipstream`/`csvstream`/`csvsafe`/`diagnostics`) · `stun`/`sntp` · `testkit`
-  (shared golden-diff / netns / VOPR harness).
-- **Candidate audit (planned):** survey axp/bxp/wgs/poc + the Zig ecosystem for gaps → decide which
-  OPEN candidates (and any new ones) round out a coherent, production-ready set. Best run as a Sonnet
-  breadth-sweep → Opus synthesis.
+Every candidate from the audit (sibling-seed sweep + ecosystem adopt-vs-build) + the prior catalog,
+with **why** and who builds it. Full per-candidate detail (Model-after/Seed) in
+[`docs/CANDIDATES.md`](docs/CANDIDATES.md). Legend — **Type:** `extract` (real seed in a sibling →
+lift+harden) · `build` (greenfield gap) · `adopt` (mature external lib → wire as a dep, don't
+rebuild). **By:** **Opus** = extraction, integration, adoption-glue, standard-pattern builds,
+research (no Fable budget). **Fable** = RFC/spec-complete value-add + non-trivial crypto/algorithms
+(⚠️ Fable5 capped 2026-07-08 — Fable rows are paused until reset; Opus can pinch-hit on the smaller
+RFC codecs). Archetypes: ① HTTP/SaaS backend · ② netops · ③ IoT · ④ AI-agent/MCP · ⑤ data/analytics.
+
+### ADOPT — wire as `deps`, do NOT build (Opus writes any thin integration/glue only)
+| Capability | Lib (MIT unless noted) | Why adopt |
+|---|---|---|
+| PostgreSQL wire v3 | `karlseguin/pg.zig` (→0.16) | proven; **makes ① backend cheap** — no build |
+| SQLite | `vrischmann/zig-sqlite` / `zqlite.zig` | poc uses it; substrate for `roquery`, `jobqueue` |
+| MySQL/MariaDB | `speed2exe/myzql` | only option (smaller community) |
+| SMTP | `karlseguin/smtp_client.zig` | ① email; recheck TLS-1.2 on 0.16 |
+| WebSocket | `karlseguin/websocket.zig` | ①④ realtime; upgrades from our http |
+| protobuf | `Arwalk/zig-protobuf` | enables a contained gRPC build on our h2 |
+| TOML | `mattyhall/tomlz` | config |
+| Template (mustache) | `batiati/mustache-zig` | HTML; Jinja-with-logic still a BUILD gap |
+| Regex | `mnemnion/mvzr` / `zig-utils/zig-regex` | (already ADOPT) |
+| Structured logging | `karlseguin/log.zig` | every app; cleanest "just use it" |
+| S3 | `lobo/aws-sdk-for-zig` | object storage; SigV4 built in |
+| Redis/Valkey · YAML · cron-parse | okredis · ymlz · dying-will-bullet/cron | PARTIAL — usable, verify per use |
+
+### EXTRACT → Opus (real seed; low value-add headroom, so no Fable)
+| Candidate | Unlocks | Why chosen |
+|---|---|---|
+| **`procrun`** ⭐ | universal (agent-tools/CI/ETL) | battle-tested subprocess + cross-platform reap-race fix (bxp-bridge) |
+| `dataset`→`tabular`→`jsonshape` | ⑤ (anchor family) | mature, tested wgs seeds; the analytics spine |
+| `roquery` | ⑤ + safe reporting | hardened read-only SQLite (adopts zig-sqlite); real security sliver |
+| `finstats` | ⑤ finance | wgs `finance.zig` is already advanced (VaR/sortino/monte-carlo) |
+| `filestore` | ① DB-less persist | third storage shape between `kv`/`blobstore`; add atomic rename |
+| `taskqueue` | ③ fleet C2 | proven offline-device job pattern (or fold into `jobqueue`) |
+| `rawsock` | ② capture/inject | real AF_PACKET in axp; base for l2disco/arp/icmp on the wire |
+| `procnet` · `argsafe` · `blobstore` | ②/hardening | /proc-parse · argv-injection guard · CAS store (axp seeds) |
+| bxp text libs: `datefmt`·`tz`·`encoding`·`unaccent`·`numparse`·`json5`·`zipstream`·`csvstream`·`csvsafe`·`diagnostics` | ⑤ + i18n | copy-tier; `tz`/`encoding` have spec headroom → could be Fable |
+| `ipcbus`·`pollworker`·`chunkframe`·`lenframe`/`jsonwire` | same-host IPC | thin glue seeds (poc/axp) |
+
+### BUILD → Opus (greenfield, standard pattern / integration)
+| Candidate | Unlocks | Why chosen |
+|---|---|---|
+| **`sessions`** + CSRF | ① stateful web | no lib/seed; small, standard, composes `cookies` |
+| **`jobqueue`** (SQLite lease/retry/DLQ + cron loop) | ①③ background work | nothing durable pure-Zig; medium; fits zig-sqlite + adopted cron |
+| **`llmclient`** (Anthropic/OpenAI) | ④ AI-agent | cheap on our `http`+`sse`+`json`; types + streaming |
+| `testkit` | all (verification) | shared golden-diff/netns/VOPR harness; stop re-inventing |
+| `ssh` (bind `libssh2` first) | ② netops automation | pure-Zig SSH is huge → ergonomic binding first, Zig automation API |
+
+### BUILD → Fable (RFC/spec-complete value-add + crypto — paused until reset)
+| Candidate | Unlocks | Why Fable |
+|---|---|---|
+| **SNMP T-G** priv (DES-CBC + AES-128-CFB) + **T-H** time-window | ② finish v3 | in-flight; crypto value-add (Opus-inline possible now) |
+| `coap` **C6** block-wise (7959) + **C7** observe (7641) | ③ | RFC-complete protocol value-add |
+| `stun` (8489) · `sntp` (4330) · `syslog` (5424) | ②/netops | clean-room RFC codecs (syslog small → Opus-able) |
+| `exprcalc` (capstone) | ③ rules / config transforms | Excel-like evaluator; composes decimal/datefmt/tz/encoding/numparse/regex |
+| `grpc` (framing/streaming/status over our h2 + adopted protobuf) | microservices | no trustworthy pure-Zig; contained since we own h2 |
+| **MQTT broker** | ③ IoT hub | server side of `mqtt`; large protocol value-add |
+
+### Deferred / big commitments (decide per product need)
+`kafka` (large / bind librdkafka) · full **YAML 1.2** (upgrade ymlz) · **Jinja** template engine ·
+`imap` (only if a product ingests mail) · **`Reconcilable(T)`** (generalize axp `resource.zig`
+desired/applied-generation + anti-brick rollback → k8s-controller-lite for config-mgmt/fleet) ·
+`kv` on-disk/MVCC/txn/ordered-scans · pure-Zig SSH (post-binding) · OPC-UA (huge, IoT).
+
+### Recommended sequence
+1. **Wave 1 (cheap, high unlock, Opus, now):** `procrun` + `sessions`+CSRF → with adopted pg/smtp/ws/
+   log/toml this makes ① a deployable backend stack.
+2. **Wave 2 (Opus):** `jobqueue` · `llmclient` · `filestore`/`taskqueue`.
+3. **Big cheap win (Opus, parallel track):** the **wgs data family** (`dataset`→`tabular`→
+   `jsonshape`→`roquery`→`finstats`) → unlocks ⑤ wholesale; seeds ready.
+4. **When Fable resets:** finish SNMP T-G/T-H, then `stun`/`sntp`/`syslog`, `exprcalc`, MQTT broker,
+   coap C6/C7.
+5. **Then decide:** `ssh` (bind), `grpc`, and the deferred big items per which product you commit to.
 
 ## Key decisions & deferred
 
