@@ -6,8 +6,9 @@
 //!
 //! Scope so far: compact-token **parsing** into typed models (P1),
 //! **registered-claims validation** (`exp`/`nbf`/`iat`/`iss`/`aud`, P1), and
-//! **JWS signature verification** (P2) for HS256/384/512 (HMAC-SHA-2),
-//! ES256/ES384 (ECDSA P-256/P-384) and EdDSA (Ed25519) — plus the one-call
+//! **JWS signature verification** (P2+P3) for HS256/384/512 (HMAC-SHA-2),
+//! ES256/ES384 (ECDSA P-256/P-384), EdDSA (Ed25519) and RS256/384/512
+//! (RSASSA-PKCS1-v1_5, the OIDC default) — plus the one-call
 //! `parseAndVerify` that chains all three.
 //!
 //! ## SECURITY — `parse()` alone does NOT verify signatures
@@ -24,8 +25,8 @@
 //! of the provided key (`AlgKeyMismatch`) so an attacker cannot downgrade an
 //! asymmetric token to HMAC-with-the-public-key.
 //!
-//! Planned parts: P3 RSA (RS256/…) · P4 JWKS key sets · P5 fetch/OIDC
-//! discovery · P6 resource-server middleware.
+//! Planned parts: P4 JWKS key sets · P5 fetch/OIDC discovery ·
+//! P6 resource-server middleware.
 //!
 //! ## Usage
 //!
@@ -67,7 +68,7 @@ pub const meta = .{
     .platform = .any,
     .role = .util, // P6 adds the resource-server middleware on top.
     .concurrency = .reentrant,
-    .model_after = "RFC 7515 (JWS) + RFC 7519 (JWT) + RFC 7518 (JWA) verify, RFC 8725 hardening; OAuth2/OIDC resource server",
+    .model_after = "RFC 7515 (JWS) + RFC 7519 (JWT) + RFC 7518 (JWA) verify incl. RS256 (RSASSA-PKCS1-v1_5, RFC 8017), RFC 8725 hardening; OAuth2/OIDC resource server",
     .deps = .{},
 };
 
@@ -369,6 +370,21 @@ pub const EcdsaP384Sha384 = std.crypto.sign.ecdsa.EcdsaP384Sha384;
 pub const Ed25519 = std.crypto.sign.Ed25519;
 
 const hmac_sha2 = std.crypto.auth.hmac.sha2;
+const sha2 = std.crypto.hash.sha2;
+/// std's RSA verify machinery (it lives under Certificate because TLS
+/// certificate validation is its std consumer; the math is generic
+/// RFC 8017 RSASSA-PKCS1-v1_5 over std.crypto.ff big-integer modexp).
+const cert_rsa = std.crypto.Certificate.rsa;
+
+/// An RSA public verification key: the validated `(n, e)` pair plus the
+/// modulus octet length `k` (RFC 8017 §4.1) — an RS* JWS signature is
+/// valid only if it is exactly `k` bytes (RFC 7518 §3.3). Built via
+/// `Key.rsaFromModExp`; supports the common 2048/3072/4096-bit sizes.
+pub const RsaPublicKey = struct {
+    inner: cert_rsa.PublicKey,
+    /// Modulus length in octets: 256, 384 or 512.
+    modulus_len: usize,
+};
 
 /// Errors from the `Key` constructors: the bytes do not encode a valid key
 /// (point not on the curve, non-canonical encoding, …).
@@ -377,8 +393,8 @@ pub const KeyError = error{InvalidKey};
 /// A verification key. The union *tag* is part of the security model: the
 /// token's `alg` must match the key's type (see `verify`), which is what
 /// blocks the classic RS/ES→HS256 algorithm-confusion downgrade
-/// (RFC 8725 §2.1). Part 3 adds `.rsa`; Part 4 builds these from JWKS
-/// entries (`kty`/`crv`/`x`/`y`/`k`).
+/// (RFC 8725 §2.1). Part 4 builds these from JWKS entries
+/// (`kty`/`crv`/`x`/`y`/`k`/`n`/`e`).
 pub const Key = union(enum) {
     /// Symmetric HMAC secret for HS256/HS384/HS512. Borrowed, not copied —
     /// must outlive the `verify` call (it always does; `verify` returns
@@ -390,6 +406,8 @@ pub const Key = union(enum) {
     ecdsa_p384: EcdsaP384Sha384.PublicKey,
     /// Ed25519 public key for EdDSA (RFC 8037).
     ed25519: Ed25519.PublicKey,
+    /// RSA public key for RS256/RS384/RS512 (RSASSA-PKCS1-v1_5).
+    rsa: RsaPublicKey,
 
     /// P-256 key from raw big-endian affine coordinates — exactly a JWK's
     /// decoded `x`/`y` (RFC 7518 §6.2.1).
@@ -418,6 +436,29 @@ pub const Key = union(enum) {
         const pk = Ed25519.PublicKey.fromBytes(bytes) catch return error.InvalidKey;
         return .{ .ed25519 = pk };
     }
+
+    /// RSA key from big-endian modulus + public-exponent bytes — exactly a
+    /// JWK's decoded `n`/`e` (RFC 7518 §6.3.1); leading zero bytes are
+    /// tolerated on both. Accepts the common 2048/3072/4096-bit modulus
+    /// sizes and rejects everything else as `InvalidKey`: zero/empty or
+    /// odd-sized or oversized modulus, and (via std's checks, which mirror
+    /// what TLS accepts) an even exponent, e < 3, or e ≥ 2^32.
+    pub fn rsaFromModExp(n: []const u8, e: []const u8) KeyError!Key {
+        const n_bytes = std.mem.trimStart(u8, n, &.{0});
+        const e_bytes = std.mem.trimStart(u8, e, &.{0});
+        if (n_bytes.len == 0 or e_bytes.len == 0) return error.InvalidKey;
+        // std validates: modulus ≥ 512 bits (and ≤ 4096 by construction),
+        // exponent odd, in [3, 2^32). Anything off → InvalidKey.
+        const pk = cert_rsa.PublicKey.fromBytes(e_bytes, n_bytes) catch
+            return error.InvalidKey;
+        // k = the modulus octet length = the required signature length.
+        const k = (pk.n.bits() + 7) / 8;
+        switch (k) {
+            256, 384, 512 => {},
+            else => return error.InvalidKey,
+        }
+        return .{ .rsa = .{ .inner = pk, .modulus_len = k } };
+    }
 };
 
 /// Errors from `verify`. Signature/key bytes never panic — every failure
@@ -429,7 +470,7 @@ pub const VerifyError = error{
     /// HS256 token offered an EC/Ed public key, or ES256 vs a P-384 key).
     AlgKeyMismatch,
     /// `alg` is unrecognized, or recognized but not implemented here
-    /// (RS*/PS* until Part 3; ES512 — std.crypto has no P-521).
+    /// (PS* — RSA-PSS; ES512 — std.crypto has no P-521).
     UnsupportedAlg,
     /// The signature has the wrong length for the alg, or does not verify
     /// over `signing_input`.
@@ -448,11 +489,14 @@ pub fn verify(parsed: *const ParsedToken, key: Key) VerifyError!void {
     switch (parsed.alg) {
         .none => return error.UnsecuredToken,
         .unknown => return error.UnsupportedAlg,
-        // Part 3 (RSA). PS* needs RSA-PSS; ES512 needs P-521 (not in std).
-        .RS256, .RS384, .RS512, .PS256, .PS384, .PS512, .ES512 => return error.UnsupportedAlg,
+        // PS* needs RSA-PSS; ES512 needs P-521 (not in std).
+        .PS256, .PS384, .PS512, .ES512 => return error.UnsupportedAlg,
         .HS256 => try verifyHmac(hmac_sha2.HmacSha256, parsed, key),
         .HS384 => try verifyHmac(hmac_sha2.HmacSha384, parsed, key),
         .HS512 => try verifyHmac(hmac_sha2.HmacSha512, parsed, key),
+        .RS256 => try verifyRsaPkcs1(sha2.Sha256, parsed, key),
+        .RS384 => try verifyRsaPkcs1(sha2.Sha384, parsed, key),
+        .RS512 => try verifyRsaPkcs1(sha2.Sha512, parsed, key),
         .ES256 => switch (key) {
             .ecdsa_p256 => |pk| try verifyEcdsa(EcdsaP256Sha256, pk, parsed),
             else => return error.AlgKeyMismatch,
@@ -522,6 +566,34 @@ fn verifyEcdsa(comptime Scheme: type, public_key: Scheme.PublicKey, parsed: *con
     if (parsed.signature.len != sig_len) return error.BadSignature;
     const sig: Scheme.Signature = .fromBytes(parsed.signature[0..sig_len].*);
     sig.verify(parsed.signing_input, public_key) catch return error.BadSignature;
+}
+
+/// RS256/384/512: RSASSA-PKCS1-v1_5 (RFC 8017 §8.2.2) via std —
+/// `s^e mod n` (std.crypto.ff modexp), then the full EMSA-PKCS1-v1_5
+/// check (`0x00 01 FF…FF 00 || DigestInfo(hash)`) against the SHA-2
+/// digest of `signing_input`. The signature must be exactly the modulus
+/// length (RFC 7518 §3.3); anything else — wrong length, s ≥ n, bad
+/// padding, wrong hash OID, digest mismatch — is `BadSignature`.
+fn verifyRsaPkcs1(comptime Hash: type, parsed: *const ParsedToken, key: Key) VerifyError!void {
+    const pk = switch (key) {
+        .rsa => |k| k,
+        else => return error.AlgKeyMismatch,
+    };
+    if (parsed.signature.len != pk.modulus_len) return error.BadSignature;
+    switch (pk.modulus_len) {
+        inline 256, 384, 512 => |k_len| {
+            cert_rsa.PKCS1v1_5Signature.verify(
+                k_len,
+                parsed.signature[0..k_len].*,
+                parsed.signing_input,
+                pk.inner,
+                Hash,
+            ) catch return error.BadSignature;
+        },
+        // A hand-assembled RsaPublicKey with a modulus_len the constructor
+        // never produces: refuse rather than trust it.
+        else => return error.InvalidKey,
+    }
 }
 
 // ── internals ───────────────────────────────────────────────────────────────
@@ -1369,7 +1441,7 @@ test "verify: alg confusion — token alg must match the key type" {
 
 test "verify: unknown and not-yet-supported algs → UnsupportedAlg" {
     var buf: [512]u8 = undefined;
-    inline for (.{ "XS999", "RS256", "RS512", "PS256", "ES512" }) |alg_name| {
+    inline for (.{ "XS999", "PS256", "PS512", "ES512" }) |alg_name| {
         const si = signingInputInto(&buf, "{\"alg\":\"" ++ alg_name ++ "\"}",
             \\{"exp":1000}
         );
@@ -1484,5 +1556,350 @@ test "parseAndVerify: end-to-end happy path and each failure stage" {
         "not-a-token",
         .{ .hmac = secret },
         .{ .now_s = 1000 },
+    ));
+}
+
+// ── tests: RSA signature verification (Part 3) ──────────────────────────────
+
+/// RFC 7515 §A.2.1 RSA-2048 key, transcribed from the JWK in the RFC
+/// (base64url `n` / `e`, plus the private exponent `d` used only by the
+/// test-local signer below).
+const rfc7515_a2_n_b64 =
+    "ofgWCuLjybRlzo0tZWJjNiuSfb4p4fAkd_wWJcyQoTbji9k0l8W26mPddxHmfHQp" ++
+    "-Vaw-4qPCJrcS2mJPMEzP1Pt0Bm4d4QlL-yRT-SFd2lZS-pCgNMsD1W_YpRPEwOW" ++
+    "vG6b32690r2jZ47soMZo9wGzjb_7OMg0LOL-bSf63kpaSHSXndS5z5rexMdbBYUs" ++
+    "LA9e-KXBdQOS-UTo7WTBEMa2R2CapHg665xsmtdVMTBQY4uDZlxvb3qCo5ZwKh9k" ++
+    "G4LT6_I5IhlJH7aGhyxXFvUK-DWNmoudF8NAco9_h9iaGNj8q2ethFkMLs91kzk2" ++
+    "PAcDTW9gb54h4FRWyuXpoQ";
+const rfc7515_a2_e_b64 = "AQAB";
+const rfc7515_a2_d_b64 =
+    "Eq5xpGnNCivDflJsRQBXHx1hdR1k6Ulwe2JZD50LpXyWPEAeP88vLNO97IjlA7_G" ++
+    "Q5sLKMgvfTeXZx9SE-7YwVol2NXOoAJe46sui395IW_GO-pWJ1O0BkTGoVEn2bKV" ++
+    "RUCgu-GjBVaYLU6f3l9kJfFNS3E0QbVdxzubSu3Mkqzjkn439X0M_V51gfpRLI9J" ++
+    "YanrC4D4qAdGcopV_0ZHHzQlBjudU2QvXt4ehNYTCBr6XCLQUShb1juUO1ZdiYoF" ++
+    "aFQT5Tw8bGUl_x_jTj3ccPDVZFD9pIuhLhBOneufuBiB4cS98l2SR_RQyGWSeWjn" ++
+    "czT0QU91p1DhOVRuOopznQ";
+
+/// RFC 7515 §A.2: header {"alg":"RS256"}, the §A.1 payload, and the
+/// RSASSA-PKCS1-v1_5 SHA-256 signature from the RFC.
+const rfc7515_a2_token =
+    "eyJhbGciOiJSUzI1NiJ9" ++
+    "." ++
+    "eyJpc3MiOiJqb2UiLA0KICJleHAiOjEzMDA4MTkzODAsDQogImh0dHA6Ly9leGFt" ++
+    "cGxlLmNvbS9pc19yb290Ijp0cnVlfQ" ++
+    "." ++
+    "cC4hiUPoj9Eetdgtv3hF80EGrhuB__dzERat0XF9g2VtQgr9PJbu3XOiZj5RZmh7" ++
+    "AAuHIm4Bh-0Qc_lF5YKt_O8W2Fp5jujGbds9uJdbF9CUAr7t1dnZcAcQjbKBYNX4" ++
+    "BAynRFdiuB--f_nZLgrnbyTyWzO75vRK5h6xBArLIARNPvkSjtQBMHlb1L07Qe7K" ++
+    "0GarZRmB_eSN9383LcOLn6_dO--xi12jzDwusC-eOkHWEsqtFZESc6BfI7noOPqv" ++
+    "hJ1phCnvWh6IeYI2w9QOYEUipUTI8np6LbgGY9Fs98rqVt5AXLIhWkWywlVmtVrB" ++
+    "p0igcN_IoypGlUPQGe77Rw";
+
+/// Build the RFC A.2 public key via the JWK-shaped constructor.
+fn rfc7515A2Key() Key {
+    var n_buf: [256]u8 = undefined;
+    var e_buf: [8]u8 = undefined;
+    return Key.rsaFromModExp(
+        b64uDecode(&n_buf, rfc7515_a2_n_b64),
+        b64uDecode(&e_buf, rfc7515_a2_e_b64),
+    ) catch unreachable;
+}
+
+/// Test-only RSASSA-PKCS1-v1_5 signer (RFC 8017 §8.2.1): EMSA-PKCS1-v1_5
+/// encode with the SHA-2 DigestInfo prefixes from §9.2 Notes 1, then
+/// `em^d mod n` via std.crypto.ff. Only exists so RS384/RS512 (which have
+/// no RFC KAT) get real round-trip coverage without leaving std.
+fn rsaTestSign(
+    comptime Hash: type,
+    comptime k: usize,
+    signing_input: []const u8,
+    n_bytes: []const u8,
+    d_bytes: []const u8,
+) [k]u8 {
+    const digest_info: []const u8 = switch (Hash) {
+        sha2.Sha256 => &.{
+            0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01,
+            0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20,
+        },
+        sha2.Sha384 => &.{
+            0x30, 0x41, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01,
+            0x65, 0x03, 0x04, 0x02, 0x02, 0x05, 0x00, 0x04, 0x30,
+        },
+        sha2.Sha512 => &.{
+            0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01,
+            0x65, 0x03, 0x04, 0x02, 0x03, 0x05, 0x00, 0x04, 0x40,
+        },
+        else => @compileError("unsupported hash"),
+    };
+    // EM = 0x00 01 FF…FF 00 || DigestInfo || H(signing_input).
+    var em: [k]u8 = undefined;
+    const t_len = digest_info.len + Hash.digest_length;
+    em[0] = 0x00;
+    em[1] = 0x01;
+    @memset(em[2 .. k - t_len - 1], 0xFF);
+    em[k - t_len - 1] = 0x00;
+    @memcpy(em[k - t_len ..][0..digest_info.len], digest_info);
+    Hash.hash(signing_input, em[k - Hash.digest_length ..][0..Hash.digest_length], .{});
+    // s = em^d mod n.
+    const M = std.crypto.ff.Modulus(4096);
+    const n = M.fromBytes(n_bytes, .big) catch unreachable;
+    const m = M.Fe.fromBytes(n, &em, .big) catch unreachable;
+    const s = n.powWithEncodedExponent(m, d_bytes, .big) catch unreachable;
+    var sig: [k]u8 = undefined;
+    s.toBytes(&sig, .big) catch unreachable;
+    return sig;
+}
+
+test "verify: RFC 7515 A.2 RS256 known-answer token" {
+    const key = rfc7515A2Key();
+
+    // The exact RFC token verifies.
+    var parsed = try parse(testing.allocator, rfc7515_a2_token);
+    defer parsed.deinit();
+    try testing.expectEqual(Alg.RS256, parsed.alg);
+    try testing.expectEqual(@as(usize, 256), parsed.signature.len);
+    try verify(&parsed, key);
+
+    // One flipped signature byte → BadSignature (swap a mid-signature
+    // base64 char so the segment stays valid base64url).
+    var tampered_buf: [1024]u8 = undefined;
+    const tampered = tampered_buf[0..rfc7515_a2_token.len];
+    @memcpy(tampered, rfc7515_a2_token);
+    const last_dot = std.mem.lastIndexOfScalar(u8, tampered, '.').?;
+    tampered[last_dot + 20] = if (tampered[last_dot + 20] == 'A') 'B' else 'A';
+    var p_tampered = try parse(testing.allocator, tampered);
+    defer p_tampered.deinit();
+    try testing.expectError(error.BadSignature, verify(&p_tampered, key));
+
+    // The same signature over a tampered payload → BadSignature.
+    var buf: [1024]u8 = undefined;
+    var sig_buf: [256]u8 = undefined;
+    const rfc_sig = b64uDecode(&sig_buf, rfc7515_a2_token[last_dot + 1 ..]);
+    const si = signingInputInto(&buf,
+        \\{"alg":"RS256"}
+    ,
+        \\{"iss":"mallory","exp":1300819380}
+    );
+    const forged = finishToken(&buf, si.len, rfc_sig);
+    var p_forged = try parse(testing.allocator, forged);
+    defer p_forged.deinit();
+    try testing.expectError(error.BadSignature, verify(&p_forged, key));
+}
+
+test "verify: RS256/RS384/RS512 generated round-trip, tampering, cross-alg" {
+    var n_buf: [256]u8 = undefined;
+    var d_buf: [256]u8 = undefined;
+    const n_bytes = b64uDecode(&n_buf, rfc7515_a2_n_b64);
+    const d_bytes = b64uDecode(&d_buf, rfc7515_a2_d_b64);
+    const key = rfc7515A2Key();
+
+    inline for (.{
+        .{ sha2.Sha256, "RS256", Alg.RS256 },
+        .{ sha2.Sha384, "RS384", Alg.RS384 },
+        .{ sha2.Sha512, "RS512", Alg.RS512 },
+    }) |case| {
+        var buf: [1024]u8 = undefined;
+        const si = signingInputInto(&buf, "{\"alg\":\"" ++ case[1] ++ "\"}",
+            \\{"exp":1000,"iss":"joe","scope":"read"}
+        );
+        const sig = rsaTestSign(case[0], 256, si, n_bytes, d_bytes);
+        const token = finishToken(&buf, si.len, &sig);
+
+        var parsed = try parse(testing.allocator, token);
+        defer parsed.deinit();
+        try testing.expectEqual(case[2], parsed.alg);
+        try verify(&parsed, key);
+
+        // Same signature over a different payload → BadSignature.
+        var buf2: [1024]u8 = undefined;
+        const si2 = signingInputInto(&buf2, "{\"alg\":\"" ++ case[1] ++ "\"}",
+            \\{"exp":1000,"iss":"joe","scope":"admin"}
+        );
+        const forged = finishToken(&buf2, si2.len, &sig);
+        var p_forged = try parse(testing.allocator, forged);
+        defer p_forged.deinit();
+        try testing.expectError(error.BadSignature, verify(&p_forged, key));
+
+        // Corrupted signature byte → BadSignature.
+        var bad_sig = sig;
+        bad_sig[100] ^= 0x01;
+        var buf3: [1024]u8 = undefined;
+        const si3 = signingInputInto(&buf3, "{\"alg\":\"" ++ case[1] ++ "\"}",
+            \\{"exp":1000,"iss":"joe","scope":"read"}
+        );
+        const corrupted = finishToken(&buf3, si3.len, &bad_sig);
+        var p_corrupted = try parse(testing.allocator, corrupted);
+        defer p_corrupted.deinit();
+        try testing.expectError(error.BadSignature, verify(&p_corrupted, key));
+    }
+
+    // A signature computed for RS256 presented under an RS512 header —
+    // right length, wrong DigestInfo/digest → BadSignature (bad padding).
+    var buf: [1024]u8 = undefined;
+    const si256 = signingInputInto(&buf,
+        \\{"alg":"RS256"}
+    ,
+        \\{"exp":1000}
+    );
+    const sig256 = rsaTestSign(sha2.Sha256, 256, si256, n_bytes, d_bytes);
+    var buf2: [1024]u8 = undefined;
+    const si512 = signingInputInto(&buf2,
+        \\{"alg":"RS512"}
+    ,
+        \\{"exp":1000}
+    );
+    const cross = finishToken(&buf2, si512.len, &sig256);
+    var p_cross = try parse(testing.allocator, cross);
+    defer p_cross.deinit();
+    try testing.expectError(error.BadSignature, verify(&p_cross, key));
+}
+
+test "verify: RSA alg confusion — RS tokens vs non-RSA keys and vice versa" {
+    const rsa_key = rfc7515A2Key();
+
+    // The RFC RS256 token offered every non-RSA key type → AlgKeyMismatch.
+    var parsed = try parse(testing.allocator, rfc7515_a2_token);
+    defer parsed.deinit();
+    const ed_kp = try Ed25519.KeyPair.generateDeterministic([_]u8{9} ** 32);
+    const ec256_kp = try EcdsaP256Sha256.KeyPair.generateDeterministic([_]u8{9} ** 32);
+    const ec384_kp = try EcdsaP384Sha384.KeyPair.generateDeterministic([_]u8{9} ** 48);
+    try testing.expectError(error.AlgKeyMismatch, verify(&parsed, .{ .hmac = "secret" }));
+    try testing.expectError(error.AlgKeyMismatch, verify(&parsed, .{ .ed25519 = ed_kp.public_key }));
+    try testing.expectError(error.AlgKeyMismatch, verify(&parsed, .{ .ecdsa_p256 = ec256_kp.public_key }));
+    try testing.expectError(error.AlgKeyMismatch, verify(&parsed, .{ .ecdsa_p384 = ec384_kp.public_key }));
+
+    // Non-RSA tokens offered the RSA key → AlgKeyMismatch (incl. the
+    // RFC 8725 downgrade shape: an HS256 token MAC'd with public-key
+    // bytes must refuse before any MAC math).
+    var buf: [512]u8 = undefined;
+    inline for (.{ "HS256", "ES256", "ES384", "EdDSA" }) |alg_name| {
+        const si = signingInputInto(&buf, "{\"alg\":\"" ++ alg_name ++ "\"}",
+            \\{"exp":1000}
+        );
+        const t = finishToken(&buf, si.len, "dummy-signature-bytes");
+        var p = try parse(testing.allocator, t);
+        defer p.deinit();
+        try testing.expectError(error.AlgKeyMismatch, verify(&p, rsa_key));
+    }
+
+    // alg:none stays UnsecuredToken even with an RSA key.
+    const unsecured = "eyJhbGciOiJub25lIn0.eyJpc3MiOiJqb2UifQ.";
+    var p_none = try parse(testing.allocator, unsecured);
+    defer p_none.deinit();
+    try testing.expectError(error.UnsecuredToken, verify(&p_none, rsa_key));
+}
+
+test "verify: RSA wrong-length and garbage signatures never panic" {
+    const key = rfc7515A2Key();
+
+    // Any length ≠ the 256-byte modulus length → BadSignature.
+    var buf: [1024]u8 = undefined;
+    inline for (.{ 0, 1, 64, 255, 257, 384, 512 }) |bad_len| {
+        const si = signingInputInto(&buf,
+            \\{"alg":"RS256"}
+        ,
+            \\{"exp":1000}
+        );
+        const token = finishToken(&buf, si.len, &([_]u8{0xAB} ** bad_len));
+        var parsed = try parse(testing.allocator, token);
+        defer parsed.deinit();
+        try testing.expectError(error.BadSignature, verify(&parsed, key));
+    }
+
+    // Right length, garbage bytes. 0xAB… as an integer exceeds n (top
+    // byte 0xa1) → the s ≥ n reject path; 0x00… decrypts to a padding
+    // failure. Both are BadSignature, never a panic.
+    inline for (.{ 0xAB, 0x00, 0x01 }) |fill| {
+        const si = signingInputInto(&buf,
+            \\{"alg":"RS256"}
+        ,
+            \\{"exp":1000}
+        );
+        const token = finishToken(&buf, si.len, &([_]u8{fill} ** 256));
+        var parsed = try parse(testing.allocator, token);
+        defer parsed.deinit();
+        try testing.expectError(error.BadSignature, verify(&parsed, key));
+    }
+}
+
+test "Key.rsaFromModExp: invalid modulus/exponent shapes → InvalidKey" {
+    var n_buf: [256]u8 = undefined;
+    const n_bytes = b64uDecode(&n_buf, rfc7515_a2_n_b64);
+    const e_ok = [_]u8{ 0x01, 0x00, 0x01 };
+
+    // Happy path, and leading zeros tolerated on both n and e.
+    _ = try Key.rsaFromModExp(n_bytes, &e_ok);
+    var padded_n: [258]u8 = undefined;
+    padded_n[0] = 0;
+    padded_n[1] = 0;
+    @memcpy(padded_n[2..], n_bytes);
+    const padded_e = [_]u8{ 0x00, 0x01, 0x00, 0x01 };
+    _ = try Key.rsaFromModExp(&padded_n, &padded_e);
+
+    // Empty / all-zero modulus or exponent.
+    try testing.expectError(error.InvalidKey, Key.rsaFromModExp("", &e_ok));
+    try testing.expectError(error.InvalidKey, Key.rsaFromModExp(&([_]u8{0} ** 256), &e_ok));
+    try testing.expectError(error.InvalidKey, Key.rsaFromModExp(n_bytes, ""));
+    try testing.expectError(error.InvalidKey, Key.rsaFromModExp(n_bytes, &.{ 0, 0 }));
+
+    // Too-small (512-bit), odd-sized (800-bit) and oversized (8192-bit)
+    // moduli — only 2048/3072/4096 pass.
+    try testing.expectError(error.InvalidKey, Key.rsaFromModExp(&([_]u8{0xFF} ** 64), &e_ok));
+    try testing.expectError(error.InvalidKey, Key.rsaFromModExp(&([_]u8{0xFF} ** 100), &e_ok));
+    try testing.expectError(error.InvalidKey, Key.rsaFromModExp(&([_]u8{0xFF} ** 1024), &e_ok));
+
+    // Even modulus (an RSA modulus is a product of odd primes).
+    var even_n: [256]u8 = undefined;
+    @memcpy(&even_n, n_bytes);
+    even_n[255] &= 0xFE;
+    try testing.expectError(error.InvalidKey, Key.rsaFromModExp(&even_n, &e_ok));
+
+    // Bad exponents: even, too small, ≥ 2^32.
+    try testing.expectError(error.InvalidKey, Key.rsaFromModExp(n_bytes, &.{0x04}));
+    try testing.expectError(error.InvalidKey, Key.rsaFromModExp(n_bytes, &.{0x01}));
+    try testing.expectError(error.InvalidKey, Key.rsaFromModExp(n_bytes, &.{ 0x01, 0x00, 0x00, 0x00, 0x01 }));
+}
+
+test "parseAndVerify: RS256 end-to-end" {
+    const gpa = testing.allocator;
+    var n_buf: [256]u8 = undefined;
+    var d_buf: [256]u8 = undefined;
+    const n_bytes = b64uDecode(&n_buf, rfc7515_a2_n_b64);
+    const d_bytes = b64uDecode(&d_buf, rfc7515_a2_d_b64);
+    const key = rfc7515A2Key();
+
+    var buf: [1024]u8 = undefined;
+    const si = signingInputInto(&buf,
+        \\{"alg":"RS256"}
+    ,
+        \\{"iss":"https://issuer.example","aud":"api://svc","exp":2000,"scope":"read"}
+    );
+    const sig = rsaTestSign(sha2.Sha256, 256, si, n_bytes, d_bytes);
+    const token = finishToken(&buf, si.len, &sig);
+
+    var verified = try parseAndVerify(gpa, token, key, .{
+        .now_s = 1000,
+        .issuer = "https://issuer.example",
+        .audience = "api://svc",
+    });
+    defer verified.deinit();
+    try testing.expectEqualStrings("read", verified.claims.claimStr("scope").?);
+
+    // Valid signature but expired → Expired (and no leak on the way out).
+    try testing.expectError(error.Expired, parseAndVerify(gpa, token, key, .{ .now_s = 5000 }));
+    // Wrong key type → AlgKeyMismatch.
+    try testing.expectError(error.AlgKeyMismatch, parseAndVerify(
+        gpa,
+        token,
+        .{ .hmac = "secret" },
+        .{ .now_s = 1000 },
+    ));
+    // RFC KAT through the one-call API (its exp is long past → Expired
+    // proves the signature check passed first and claims ran).
+    try testing.expectError(error.Expired, parseAndVerify(
+        gpa,
+        rfc7515_a2_token,
+        key,
+        .{ .now_s = 1600000000 },
     ));
 }

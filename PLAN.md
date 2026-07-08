@@ -301,9 +301,10 @@ fmt green. **Still open:** request-ID mw · health helper · conditional-req · 
 - 🟡 **multipart/form-data + x-www-form-urlencoded** body parsing (if the API takes forms/uploads). **medium · Fable.**
 - 🟡 **JWT/JWKS OAuth2/OIDC resource-server** — split into 6 committable parts (large, Fable, NEW `jwt`
   module). **P1 ✅** (parse + claims, 19 tests) · **P2 ✅** (HS/ES/EdDSA verify + RFC 7515/8037 KATs +
-  RFC 8725 alg-confusion defenses + `parseAndVerify`, +12 tests). Remaining: **P3** RSA (RS256/384/512)
-  verify · **P4** JWKS parse + JWK→key + verify-by-kid · **P5** JWKS fetch/cache + OIDC discovery
-  (http+ramcache) · **P6** aaa-gate resource-server middleware.
+  RFC 8725 alg-confusion defenses + `parseAndVerify`, +12 tests) · **P3 ✅** (RS256/384/512 via std
+  `Certificate.rsa` PKCS1v1.5 + RFC 7515 A.2 KAT + `rsaFromModExp`, +6 tests — **full JWS alg set now
+  verifies**). Remaining: **P4** JWKS parse + JWK→key + verify-by-kid · **P5** JWKS fetch/cache + OIDC
+  discovery (http+ramcache) · **P6** aaa-gate resource-server middleware.
 - 🟢 nice-to-have: cookies + Set-Cookie(HttpOnly/Secure/SameSite) · Range/206 · inbound gzip request body ·
   traceparent/OTel · per-conn request-count cap · auto-OPTIONS in router · content negotiation · Link
   pagination · Idempotency-Key · request trailers · strict bare-LF reject · HMAC signing · HTTP/3.

@@ -3,18 +3,22 @@
 A JWT/JWS validator for OAuth2/OIDC resource servers: compact-serialization
 parsing (RFC 7515 §3.1) into typed models, registered-claims validation
 (RFC 7519 §4.1), and JWS signature verification (RFC 7515 §5.2 + RFC 7518)
-for **HS256/384/512** (HMAC-SHA-2), **ES256/ES384** (ECDSA P-256/P-384) and
-**EdDSA** (Ed25519, RFC 8037). std-only and dependency-free —
+for **HS256/384/512** (HMAC-SHA-2), **ES256/ES384** (ECDSA P-256/P-384),
+**EdDSA** (Ed25519, RFC 8037) and **RS256/384/512** (RSASSA-PKCS1-v1_5,
+RFC 8017 — the OIDC default). std-only and dependency-free —
 `std.base64.url_safe_no_pad` for the segments, `std.json` for
-header/payload, `std.crypto` for the signatures.
+header/payload, `std.crypto` for the signatures (RSA via
+`std.crypto.Certificate.rsa`'s PKCS1-v1_5 verify over `std.crypto.ff`
+modexp).
 
 Provenance: clean-room from RFC 7515 (JWS), RFC 7519 (JWT), RFC 7518 (JWA),
-RFC 8037 (EdDSA in JOSE) and RFC 8725 (JWT Best Current Practices). No
-third-party JWT source consulted or copied.
+RFC 8037 (EdDSA in JOSE), RFC 8017 (PKCS #1 v2.2) and RFC 8725 (JWT Best
+Current Practices). No third-party JWT source consulted or copied.
 
 - **Status:** `gap`.
-- **Model after:** RFC 7515 (JWS) + RFC 7519 (JWT) + RFC 7518 (JWA) verify,
-  RFC 8725 hardening; OAuth2/OIDC resource server.
+- **Model after:** RFC 7515 (JWS) + RFC 7519 (JWT) + RFC 7518 (JWA) verify
+  incl. RS256 (RSASSA-PKCS1-v1_5, RFC 8017), RFC 8725 hardening;
+  OAuth2/OIDC resource server.
 - **Platform:** any. **Role:** util (Part 6 adds the resource-server
   middleware). **Concurrency:** reentrant — no shared or global state; each
   `ParsedToken` owns its own arena.
@@ -39,13 +43,18 @@ that. Never authorize from a `ParsedToken` alone.
 - **HMAC comparison is constant-time** (`std.crypto.timing_safe.eql`).
 - **JWS ECDSA signatures are the raw fixed-width `R‖S`** (RFC 7518 §3.4;
   32+32 for P-256, 48+48 for P-384) — not DER.
-- Unknown or not-yet-implemented algs (`RS*`/`PS*` until Part 3; ES512 —
-  no P-521 in std) → `UnsupportedAlg`; wrong-length or garbage signatures
-  → `BadSignature`, never a panic.
+- **RS\* signatures must be exactly the modulus length** (RFC 7518 §3.3);
+  the full EMSA-PKCS1-v1_5 encoding (`0x00 01 FF…FF 00 || DigestInfo`) is
+  checked, including the SHA-2 OID — wrong length, `s ≥ n`, bad padding or
+  a wrong-hash DigestInfo are all `BadSignature`. Keys are validated at
+  construction (2048/3072/4096-bit modulus; odd exponent in `[3, 2^32)`).
+- Unknown or not-yet-implemented algs (`PS*` — RSA-PSS; ES512 — no P-521
+  in std) → `UnsupportedAlg`; wrong-length or garbage signatures →
+  `BadSignature`, never a panic.
 
-Delivery plan: P1 parse + claims · P2 signature verify (HS/ES/EdDSA) —
-**both done** · P3 RSA · P4 JWKS key sets · P5 fetch/OIDC discovery ·
-P6 middleware.
+Delivery plan: P1 parse + claims · P2 signature verify (HS/ES/EdDSA) ·
+P3 RSA (RS256/384/512) — **all three done** · P4 JWKS key sets ·
+P5 fetch/OIDC discovery · P6 middleware.
 
 ## API
 
@@ -58,7 +67,7 @@ P6 middleware.
 | `Audience` | `none` \| `single` \| `many` — `aud` as string OR array, with `contains()` |
 | `validateClaims(claims, Options) ValidateError!void` | RFC 7519 §4.1 checks; pure, allocation-free |
 | `Alg` | RFC 7518 names (`HS256`…`EdDSA`, `none`, `unknown`) — the verify dispatch |
-| `Key` | tagged union: `.hmac` (secret bytes) \| `.ecdsa_p256` \| `.ecdsa_p384` \| `.ed25519` (std public keys); constructors `ecdsaP256FromCoords(x, y)` / `ecdsaP384FromCoords(x, y)` / `ed25519FromBytes(x)` take exactly a JWK's decoded coordinates (`KeyError.InvalidKey` on bad points) |
+| `Key` | tagged union: `.hmac` (secret bytes) \| `.ecdsa_p256` \| `.ecdsa_p384` \| `.ed25519` (std public keys) \| `.rsa` (`RsaPublicKey`); constructors `ecdsaP256FromCoords(x, y)` / `ecdsaP384FromCoords(x, y)` / `ed25519FromBytes(x)` / `rsaFromModExp(n, e)` take exactly a JWK's decoded parameters (`KeyError.InvalidKey` on bad points/moduli/exponents) |
 | `verify(&parsed, key) VerifyError!void` | recompute/check the signature over `signing_input`; RFC 8725 defenses baked in |
 | `parseAndVerify(gpa, token, key, Options) !ParsedToken` | the one-call API: parse → verify → validateClaims; frees on any failure |
 
@@ -118,8 +127,8 @@ try jwt.validateClaims(parsed.claims, .{ .now_s = now_seconds });
 
 ## Verification
 
-`zig build test-jwt` — 31 fully offline tests (19 from P1, 12 from P2),
-green under Debug and ReleaseFast.
+`zig build test-jwt` — 37 fully offline tests (19 from P1, 12 from P2,
+6 from P3), green under Debug and ReleaseFast.
 
 P1 (parse + claims): the RFC 7519 §3.1 example token end-to-end (header,
 claims incl. the `http://example.com/is_root` custom claim, signing input,
@@ -153,9 +162,31 @@ token → parse → verify OK; tampered payload, corrupted signature and
 wrong-keypair key each → `BadSignature`); the RFC 8725 alg-confusion
 matrix (`alg:none` with any key → `UnsecuredToken`; HS token vs EC/Ed keys
 and ES/EdDSA tokens vs HMAC keys and cross-curve keys → `AlgKeyMismatch`;
-unknown/`RS*`/`PS*`/`ES512` → `UnsupportedAlg`); wrong-length and
+unknown/`PS*`/`ES512` → `UnsupportedAlg`); wrong-length and
 garbage-but-right-length signatures → `BadSignature`, never a panic;
 invalid key bytes (off-curve points, non-canonical Ed25519) →
 `KeyError.InvalidKey`; and `parseAndVerify` end-to-end (good → claims
 readable; bad key / wrong key type / expired / malformed → the right typed
 error, with `std.testing.allocator` proving nothing leaks on failure).
+
+P3 (RSA, RS256/384/512):
+
+- **RFC 7515 A.2 (RS256)**: the RFC's exact token verifies against the key
+  built by `rsaFromModExp` from the RFC JWK's `n`/`e` — exactly the path
+  Part 4's JWKS will feed; a flipped signature byte and the RFC signature
+  over a tampered payload each → `BadSignature`.
+- **RS256/RS384/RS512 round-trips** with a test-local RFC 8017 §8.2.1
+  signer (EMSA-PKCS1-v1_5 encode + `em^d mod n` via `std.crypto.ff`, using
+  the RFC A.2 private exponent `d`): verify OK; tampered payload /
+  corrupted signature / an RS256 signature under an RS512 header (right
+  length, wrong DigestInfo) each → `BadSignature`.
+- **Alg confusion**: the RS256 token vs HMAC/EC/Ed keys and HS/ES/EdDSA
+  tokens vs the RSA key → `AlgKeyMismatch`; `alg:none` with an RSA key →
+  `UnsecuredToken`.
+- **Robustness**: every wrong signature length (0/1/64/255/257/384/512 vs
+  the 256-byte modulus) and right-length garbage (`s ≥ n`, all-zero, …) →
+  `BadSignature`; `rsaFromModExp` rejects empty/all-zero, too-small,
+  odd-sized and oversized moduli, even moduli, and even/tiny/oversized
+  exponents → `InvalidKey` — never a panic.
+- **`parseAndVerify` RS256 end-to-end** (good → claims readable; expired /
+  wrong key type → typed errors; the RFC KAT through the one-call API).
