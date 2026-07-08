@@ -230,4 +230,15 @@ audit is pending before any public release.
                `decimal` docs — definitions/truth-tables only, no source code
                consulted or copied.
 
+  jwt        — clean-room from the JOSE/OAuth2 RFCs: RFC 7515 (JWS), RFC 7519
+               (JWT), RFC 7517 (JWK/JWKS), RFC 7518 (JWA), RFC 8037 (EdDSA in
+               JOSE), RFC 8017 (PKCS #1 v2.2), RFC 8725 (JWT BCP), OpenID
+               Connect Discovery 1.0 + RFC 8414 (issuer metadata, the cached
+               `Provider`), and RFC 6750 (the Bearer resource-server
+               middleware; challenge/error codes). RFC known-answer vectors
+               (7515 A.1/A.2/A.3, 8037 A.4) are transcribed from the RFCs for
+               tests. No third-party JWT library source (jose, jsonwebtoken,
+               golang-jwt, …) was consulted or copied; the signatures use
+               `std.crypto`.
+
 See each module's README "Provenance" note for its specific seed and reference.

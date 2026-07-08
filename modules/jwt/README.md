@@ -7,26 +7,42 @@ for **HS256/384/512** (HMAC-SHA-2), **ES256/ES384** (ECDSA P-256/P-384),
 **EdDSA** (Ed25519, RFC 8037) and **RS256/384/512** (RSASSA-PKCS1-v1_5,
 RFC 8017 — the OIDC default), and **JWKS key sets** (RFC 7517): parse a
 `{"keys":[…]}` document into a typed `JwkSet`, select the key by the token
-header's `kid`, verify via `verifyWithJwks`/`parseVerifyJwks`. std-only and
-dependency-free — `std.base64.url_safe_no_pad` for the segments, `std.json`
+header's `kid`, verify via `verifyWithJwks`/`parseVerifyJwks`. The signature
+core is std-only — `std.base64.url_safe_no_pad` for the segments, `std.json`
 for header/payload/JWKS, `std.crypto` for the signatures (RSA via
 `std.crypto.Certificate.rsa`'s PKCS1-v1_5 verify over `std.crypto.ff`
 modexp).
 
+On top of the offline core sit two turnkey layers: the **networked
+`Provider`** (P5) — OpenID Connect Discovery 1.0 (`<issuer>/.well-known/
+openid-configuration` → `jwks_uri`), JWKS fetch through a `Fetcher` seam
+(`HttpFetcher` adapts the `http` client), and a cache with TTL + key-rotation
+refresh — whose `Provider.verify` is the one-call resource-server check; and
+the **`ResourceServer` `router` middleware** (P6, RFC 6750) that reads
+`Authorization: Bearer <token>`, runs `Provider.verify`, and either attaches a
+verified `Identity` to the request (`identityOf(ctx)`) or short-circuits with
+the Bearer challenge — **401** `error="invalid_token"` (bare `Bearer` when no
+credential is presented) or **403** `error="insufficient_scope"`.
+
 Provenance: clean-room from RFC 7515 (JWS), RFC 7517 (JWK), RFC 7519 (JWT),
-RFC 7518 (JWA), RFC 8037 (EdDSA in JOSE), RFC 8017 (PKCS #1 v2.2) and
-RFC 8725 (JWT Best Current Practices). No third-party JWT source consulted
-or copied.
+RFC 7518 (JWA), RFC 8037 (EdDSA in JOSE), RFC 8017 (PKCS #1 v2.2), RFC 8725
+(JWT Best Current Practices), OpenID Connect Discovery 1.0 / RFC 8414 (issuer
+metadata, `Provider`) and RFC 6750 (Bearer resource-server middleware). No
+third-party JWT source consulted or copied.
 
 - **Status:** `gap`.
 - **Model after:** RFC 7515 (JWS) + RFC 7519 (JWT) + RFC 7518 (JWA) verify
   incl. RS256 (RSASSA-PKCS1-v1_5, RFC 8017) + RFC 7517 (JWK/JWKS key sets),
-  RFC 8725 hardening; OAuth2/OIDC resource server.
-- **Platform:** any. **Role:** util (Part 6 adds the resource-server
-  middleware). **Concurrency:** reentrant — no shared or global state; each
-  `ParsedToken` and `JwkSet` owns its own arena, and a `JwkSet` is immutable
-  after parse (share freely across threads).
-- **Deps:** none (std only).
+  RFC 8725 hardening + OpenID Connect Discovery 1.0 / RFC 8414 (`Provider`) +
+  RFC 6750 Bearer middleware; OAuth2/OIDC resource server.
+- **Platform:** any. **Role:** server (a `router` middleware guarding routes;
+  the offline core is pure logic). **Concurrency:** reentrant — the offline
+  core has no shared state (each `ParsedToken`/`JwkSet` owns its arena; a
+  `JwkSet` is immutable after parse), **except `Provider`**, which holds one
+  mutable JWKS cache and needs external sync under a threaded server — inject
+  `ResourceServer.lock` (see its docs).
+- **Deps:** `http` (the `HttpFetcher` + the middleware's request/response
+  types), `router` (the middleware). The signature core needs neither.
 
 ## SECURITY
 
@@ -64,9 +80,10 @@ that. Never authorize from a `ParsedToken` alone.
   A token without `kid` resolves only against a set with exactly one
   usable key — the module never guesses among keys.
 
-Delivery plan: P1 parse + claims · P2 signature verify (HS/ES/EdDSA) ·
-P3 RSA (RS256/384/512) · P4 JWKS key sets — **all four done** ·
-P5 fetch/OIDC discovery · P6 middleware.
+Delivery plan (**all six done**): P1 parse + claims · P2 signature verify
+(HS/ES/EdDSA) · P3 RSA (RS256/384/512) · P4 JWKS key sets · P5 OIDC
+discovery + JWKS fetch + caching `Provider` · P6 `ResourceServer` `router`
+middleware.
 
 ## API
 
@@ -89,6 +106,14 @@ P5 fetch/OIDC discovery · P6 middleware.
 | `JwkSet.selectKey(header) ?ResolvedKey` | header-aware selection: by `kid` (honoring `use` + pinned `alg`), or the single usable key when the token has no `kid` |
 | `verifyWithJwks(&parsed, jwks) VerifyError!void` | `selectKey` → `verify`; no usable key → `NoMatchingKey` |
 | `parseVerifyJwks(gpa, token, jwks, Options) !ParsedToken` | the one-call JWKS API: parse → resolve by `kid` + verify → validateClaims |
+| `Fetcher` / `HttpFetcher` | GET-a-URL seam (offline-testable); `HttpFetcher` adapts `http.Client` |
+| `discover(gpa, fetcher, issuer) !Metadata` · `fetchJwks(gpa, fetcher, url) !JwkSet` | OIDC discovery + JWKS fetch |
+| `Provider.init(gpa, fetcher, .{issuer OR jwks_uri, ttl_s, min_refresh_interval_s})` | cached, rotation-aware key source |
+| `Provider.verify(gpa, token, now_s, ClaimOptions) !ParsedToken` | turnkey: lazy-load/TTL-refresh JWKS, resolve `kid` (one rate-limited refresh on rotation), verify + validateClaims with issuer injected |
+| `ResourceServer.init(gpa, Options) !ResourceServer` (+ `deinit`) | build the `router` middleware; `Options`: `provider`, `claim_opts`, `required_scopes`, `protect` (`all`/`mutations`), `clock`, `lock`, `realm` |
+| `ResourceServer.middleware() router.Middleware` | register before routes; verifies each request's Bearer token |
+| `identityOf(ctx) ?*Identity` | the attached identity — `subject()`, `claims()`, `scopes()` (RFC 6749 space-split), `hasScope()` |
+| `Clock` / `Lock` | injected wall-clock (`.system`) and Provider-serialization seams (`.none` default) |
 
 `Options`: `now_s` (REQUIRED — caller-supplied seconds since epoch, no
 hidden clock, same injected-time rule as `resilience`/`probe`), `leeway_s`
@@ -168,8 +193,14 @@ try jwt.validateClaims(parsed.claims, .{ .now_s = now_seconds });
 
 ## Verification
 
-`zig build test-jwt` — 47 fully offline tests (19 from P1, 12 from P2,
-6 from P3, 10 from P4), green under Debug and ReleaseFast.
+`zig build test-jwt` — 60 fully offline tests (19 from P1, 12 from P2,
+6 from P3, 10 from P4, 9 from P5, 4 from P6), green under Debug and
+ReleaseFast. P5 drives the `Provider` over a scripted `Fetcher` (discovery,
+fetch, TTL/rotation refresh, rate limit, typed failures); P6 runs the
+middleware end-to-end over a real `router` + `http.Server.serveStream`
+(valid → 200 + identity; missing/invalid/expired/wrong-scheme → 401 with the
+right challenge; insufficient scope → 403; `protect=.mutations` lets reads
+through untouched; `ScopeIter` + `InvalidRealm`).
 
 P1 (parse + claims): the RFC 7519 §3.1 example token end-to-end (header,
 claims incl. the `http://example.com/is_root` custom claim, signing input,

@@ -35,7 +35,13 @@
 //! of the provided key (`AlgKeyMismatch`) so an attacker cannot downgrade an
 //! asymmetric token to HMAC-with-the-public-key.
 //!
-//! Planned parts: P6 resource-server middleware (wrapping `Provider.verify`).
+//! On top of that sits the `router` layer (P6): `ResourceServer` is a
+//! `router.Middleware` that reads `Authorization: Bearer <token>`, runs it
+//! through `Provider.verify`, and either attaches the verified `Identity` to
+//! the request (`identityOf(ctx)`) and continues, or short-circuits with the
+//! RFC 6750 challenge — **401** `WWW-Authenticate: Bearer error="invalid_token"`
+//! (or a bare `Bearer` when no credential was presented) and **403**
+//! `error="insufficient_scope"` when a required scope is missing.
 //!
 //! ## Usage
 //!
@@ -64,6 +70,17 @@
 //!     .audience = "api://my-service", // issuer is enforced automatically
 //! });
 //! defer t.deinit();
+//!
+//! // The router layer (P6): guard routes with the same Provider. Register
+//! // the middleware once, before routes; it verifies each request's bearer
+//! // token and hands the handler an Identity via `jwt.identityOf(ctx)`.
+//! var rs = try jwt.ResourceServer.init(gpa, .{
+//!     .provider = &provider,
+//!     .claim_opts = .{ .audience = "api://my-service" },
+//!     .required_scopes = &.{"read"},
+//! });
+//! defer rs.deinit();
+//! try my_router.use(rs.middleware());
 //!
 //! // With a JWKS you already hold (fully offline):
 //! var jwks = try jwt.parseJwks(gpa, jwks_json);
@@ -94,17 +111,17 @@
 //! - Malformed input returns typed errors; it never panics.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const http = @import("http");
+const router = @import("router");
 
 pub const meta = .{
     .status = .gap,
     .platform = .any, // pure logic over the Fetcher seam; HttpFetcher uses `http`
-    .role = .util, // P6 adds the resource-server middleware on top.
-    .concurrency = .reentrant, // except Provider — one mutable cache, external sync
-    .model_after = "RFC 7515 (JWS) + RFC 7519 (JWT) + RFC 7518 (JWA) verify incl. RS256 (RSASSA-PKCS1-v1_5, RFC 8017) + RFC 7517 (JWK/JWKS key sets), RFC 8725 hardening + OpenID Connect Discovery 1.0 / RFC 8414 (issuer metadata -> jwks_uri) with cached, rotation-aware Provider; OAuth2/OIDC resource server",
-    // ramcache is wired in build.zig for P6; P5 keeps the *parsed* JwkSet in
-    // the Provider (no raw-byte cache — see Provider docs).
-    .deps = .{"http"},
+    .role = .server, // P6 is a `router` middleware guarding routes with a Provider.
+    .concurrency = .reentrant, // except Provider — one mutable cache, external sync (inject ResourceServer.lock under a threaded server)
+    .model_after = "RFC 7515 (JWS) + RFC 7519 (JWT) + RFC 7518 (JWA) verify incl. RS256 (RSASSA-PKCS1-v1_5, RFC 8017) + RFC 7517 (JWK/JWKS key sets), RFC 8725 hardening + OpenID Connect Discovery 1.0 / RFC 8414 (issuer metadata -> jwks_uri) with cached, rotation-aware Provider; RFC 6750 Bearer resource-server middleware; OAuth2/OIDC resource server",
+    .deps = .{ "http", "router" },
 };
 
 // ── public API ──────────────────────────────────────────────────────────────
@@ -1353,6 +1370,365 @@ pub const Provider = struct {
         return now_s -| last >= @as(i64, p.options.min_refresh_interval_s);
     }
 };
+
+// ── Part 6: RFC 6750 Bearer resource-server middleware ───────────────────────
+//
+// A `router.Middleware` that turns a `Provider` into a route guard. The wire
+// contract mirrors the aaa-gate sibling: a denied request is answered here
+// (401/403 + `WWW-Authenticate`) and the chain is short-circuited (the handler
+// never runs); an admitted request carries an `Identity` on `ctx.data` for the
+// duration of the inner chain, then `ctx.data` is restored.
+
+/// Wall-clock source giving `now_s` (Unix epoch seconds) to `Provider.verify`
+/// — injected so tests are deterministic, mirroring the module's caller-clock
+/// rule. Only the default `.system` clock ever touches the OS.
+pub const Clock = struct {
+    ctx: ?*anyopaque = null,
+    nowFn: *const fn (?*anyopaque) i64,
+
+    /// The OS wall clock (`std.time.timestamp`). The production default.
+    pub const system: Clock = .{ .nowFn = systemNowS };
+
+    pub fn now(c: Clock) i64 {
+        return c.nowFn(c.ctx);
+    }
+};
+
+fn systemNowS(_: ?*anyopaque) i64 {
+    // Wall clock (Unix epoch seconds). std has no `time.timestamp` in 0.16.
+    switch (builtin.os.tag) {
+        .windows => {
+            // 100 ns ticks since 1601-01-01; shift to the Unix epoch.
+            const hns: i64 = std.os.windows.ntdll.RtlGetSystemTimePrecise();
+            return @divFloor(hns - 116444736000000000, 10_000_000);
+        },
+        else => {
+            var ts: std.posix.timespec = undefined;
+            if (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts)) != .SUCCESS) return 0;
+            return @intCast(ts.sec);
+        },
+    }
+}
+
+/// Serialization seam for the `Provider` under a multi-threaded server.
+///
+/// `Provider` keeps one mutable JWKS cache and is **not** internally
+/// synchronized (see its docs). `http.Server` serves from several connection
+/// threads, so `ResourceServer.middleware` calls `Provider.verify` under this
+/// lock. It is a *blocking* lock, not a spinlock: `verify` may, rarely, refresh
+/// the JWKS over the network while holding it (TTL expiry / key rotation), so a
+/// spin would burn a core for the duration of a fetch.
+///
+/// The default `.none` is a no-op — correct for a single-threaded server or
+/// when the caller synchronizes the `Provider` some other way. For the default
+/// threaded `http.Server`, plug a real mutex in (`std.Thread.Mutex` when
+/// threading is enabled), e.g.:
+///
+/// ```zig
+/// var mu: std.Thread.Mutex = .{};
+/// const lock: jwt.Lock = .{
+///     .ctx = &mu,
+///     .lockFn = struct { fn f(c: ?*anyopaque) void {
+///         @as(*std.Thread.Mutex, @ptrCast(@alignCast(c.?))).lock();
+///     } }.f,
+///     .unlockFn = struct { fn f(c: ?*anyopaque) void {
+///         @as(*std.Thread.Mutex, @ptrCast(@alignCast(c.?))).unlock();
+///     } }.f,
+/// };
+/// ```
+pub const Lock = struct {
+    ctx: ?*anyopaque = null,
+    lockFn: *const fn (?*anyopaque) void = noop,
+    unlockFn: *const fn (?*anyopaque) void = noop,
+
+    /// No synchronization (single-threaded / caller-synchronized Provider).
+    pub const none: Lock = .{};
+
+    fn noop(_: ?*anyopaque) void {}
+    fn acquire(l: Lock) void {
+        l.lockFn(l.ctx);
+    }
+    fn release(l: Lock) void {
+        l.unlockFn(l.ctx);
+    }
+};
+
+/// Which methods require a valid token.
+pub const Protect = enum {
+    /// Every method is gated (the default — secure by default). Register
+    /// `cors` before this middleware so browser preflights (which cannot carry
+    /// Authorization) are answered before they would 401.
+    all,
+    /// Only mutations (POST/PUT/PATCH/DELETE) are gated; GET/HEAD/OPTIONS stay
+    /// open (no token, no `Identity`).
+    mutations,
+};
+
+/// What the middleware attaches to `ctx.data` for admitted requests. It
+/// borrows the verified `ParsedToken` on the middleware's stack frame — valid
+/// only for the inner chain + handler call; do not retain it past the handler.
+pub const Identity = struct {
+    /// The verified token. Its claims are trustworthy: signature checked
+    /// against the JWKS and `exp`/`nbf`/`iss`/`aud` validated per `claim_opts`.
+    token: *const ParsedToken,
+
+    /// The `sub` (subject) claim, or null when the token omits it.
+    pub fn subject(id: Identity) ?[]const u8 {
+        return id.token.claims.sub;
+    }
+
+    /// The full verified claim set (registered fields + `claim*` accessors).
+    pub fn claims(id: Identity) Claims {
+        return id.token.claims;
+    }
+
+    /// Iterate the granted scopes — the space-delimited `scope` claim
+    /// (RFC 8693 §4.2 / OAuth2 RFC 6749 §3.3). Empty when `scope` is absent.
+    pub fn scopes(id: Identity) ScopeIter {
+        return .{ .rest = id.token.claims.claimStr("scope") orelse "" };
+    }
+
+    /// Whether the granted scopes include `want` (exact token match).
+    pub fn hasScope(id: Identity, want: []const u8) bool {
+        var it = id.scopes();
+        while (it.next()) |s| if (std.mem.eql(u8, s, want)) return true;
+        return false;
+    }
+};
+
+/// Splits a `scope` claim value into individual scope tokens on ASCII space
+/// (RFC 6749 §3.3 uses one SP; runs and surrounding SP are tolerated).
+pub const ScopeIter = struct {
+    rest: []const u8,
+
+    pub fn next(it: *ScopeIter) ?[]const u8 {
+        while (it.rest.len > 0 and it.rest[0] == ' ') it.rest = it.rest[1..];
+        if (it.rest.len == 0) return null;
+        const end = std.mem.indexOfScalar(u8, it.rest, ' ') orelse it.rest.len;
+        const tok = it.rest[0..end];
+        it.rest = it.rest[end..];
+        return tok;
+    }
+};
+
+/// Retrieve the `Identity` a `ResourceServer` attached, or null (out-of-scope
+/// method, or no such middleware ran). Only valid inside the middleware's inner
+/// chain. NOTE: `ctx.data` is a single shared slot — do not stack this behind
+/// another identity-attaching middleware (e.g. aaa-gate) on the same routes.
+pub fn identityOf(ctx: *const router.Ctx) ?*Identity {
+    return @ptrCast(@alignCast(ctx.data orelse return null));
+}
+
+/// A `router.Middleware` enforcing a JWT Bearer policy backed by a `Provider`.
+/// Precomputes its `WWW-Authenticate` challenge strings at `init` (they must be
+/// stable memory — `router`'s response writer stores header slices, it does not
+/// copy them). The `ResourceServer` and its `Provider` must outlive the Router,
+/// at stable addresses (the middleware's `state` points at the ResourceServer).
+pub const ResourceServer = struct {
+    gpa: std.mem.Allocator,
+    provider: *Provider,
+    claim_opts: Provider.ClaimOptions,
+    protect: Protect,
+    clock: Clock,
+    lock: Lock,
+    /// Required scopes (conjunction — every one must be present), gpa-owned.
+    required_scopes: [][]const u8,
+    /// `WWW-Authenticate` for a missing/malformed credential (bare `Bearer`,
+    /// no `error=` — RFC 6750 §3), gpa-owned.
+    challenge_missing: []const u8,
+    /// `WWW-Authenticate` for a present-but-rejected token
+    /// (`error="invalid_token"`), gpa-owned.
+    challenge_invalid: []const u8,
+    /// `WWW-Authenticate` for a missing scope
+    /// (`error="insufficient_scope", scope="…"`); null when no scope is
+    /// required. gpa-owned.
+    challenge_scope: ?[]const u8,
+
+    pub const Options = struct {
+        /// The verifier backing the guard. Must outlive the Router.
+        provider: *Provider,
+        /// Claim policy handed to `Provider.verify` (issuer is enforced
+        /// automatically for issuer-configured providers; set `audience` here
+        /// to bind tokens to this resource server, per RFC 8725 §3.9).
+        claim_opts: Provider.ClaimOptions = .{},
+        /// Scopes every in-scope request must carry (ALL required). Empty ⇒
+        /// authenticate only, no scope check.
+        required_scopes: []const []const u8 = &.{},
+        /// Which methods require a token.
+        protect: Protect = .all,
+        /// Wall clock for `now_s`. Injected for tests; `.system` in production.
+        clock: Clock = .system,
+        /// Serialization for the Provider cache under a threaded server (see
+        /// `Lock`). Default `.none` = single-threaded / externally synced.
+        lock: Lock = .none,
+        /// Optional protection-space label placed in the challenge
+        /// (`Bearer realm="…"`). Must not contain '"', CR, LF or NUL.
+        realm: ?[]const u8 = null,
+    };
+
+    pub const InitError = error{ OutOfMemory, InvalidRealm };
+
+    pub fn init(gpa: std.mem.Allocator, options: ResourceServer.Options) InitError!ResourceServer {
+        if (options.realm) |r| {
+            for (r) |c| if (c == '"' or c == '\r' or c == '\n' or c == 0) return error.InvalidRealm;
+        }
+        const realm_part: []const u8 = if (options.realm) |r|
+            try std.fmt.allocPrint(gpa, " realm=\"{s}\"", .{r})
+        else
+            "";
+        defer if (realm_part.len != 0) gpa.free(realm_part);
+
+        const challenge_missing = try std.fmt.allocPrint(gpa, "Bearer{s}", .{realm_part});
+        errdefer gpa.free(challenge_missing);
+        const challenge_invalid = try std.fmt.allocPrint(gpa, "Bearer{s} error=\"invalid_token\"", .{realm_part});
+        errdefer gpa.free(challenge_invalid);
+
+        // Own the required scopes (the config slice may be transient) and, if
+        // any, precompute the space-joined insufficient-scope challenge.
+        var scopes = try gpa.alloc([]const u8, options.required_scopes.len);
+        errdefer gpa.free(scopes);
+        var owned: usize = 0;
+        errdefer for (scopes[0..owned]) |s| gpa.free(s);
+        for (options.required_scopes, 0..) |s, i| {
+            scopes[i] = try gpa.dupe(u8, s);
+            owned = i + 1;
+        }
+
+        const challenge_scope: ?[]const u8 = if (options.required_scopes.len == 0) null else blk: {
+            var b: std.ArrayList(u8) = .empty;
+            defer b.deinit(gpa);
+            try b.appendSlice(gpa, "Bearer");
+            try b.appendSlice(gpa, realm_part);
+            try b.appendSlice(gpa, " error=\"insufficient_scope\", scope=\"");
+            for (options.required_scopes, 0..) |s, i| {
+                if (i != 0) try b.append(gpa, ' ');
+                try b.appendSlice(gpa, s);
+            }
+            try b.append(gpa, '"');
+            break :blk try b.toOwnedSlice(gpa);
+        };
+
+        return .{
+            .gpa = gpa,
+            .provider = options.provider,
+            .claim_opts = options.claim_opts,
+            .protect = options.protect,
+            .clock = options.clock,
+            .lock = options.lock,
+            .required_scopes = scopes,
+            .challenge_missing = challenge_missing,
+            .challenge_invalid = challenge_invalid,
+            .challenge_scope = challenge_scope,
+        };
+    }
+
+    pub fn deinit(rs: *ResourceServer) void {
+        for (rs.required_scopes) |s| rs.gpa.free(s);
+        rs.gpa.free(rs.required_scopes);
+        rs.gpa.free(rs.challenge_missing);
+        rs.gpa.free(rs.challenge_invalid);
+        if (rs.challenge_scope) |c| rs.gpa.free(c);
+        rs.* = undefined;
+    }
+
+    /// A `router.Middleware` enforcing this policy (`state` = the
+    /// ResourceServer). Register it once, before routes.
+    pub fn middleware(rs: *ResourceServer) router.Middleware {
+        return .{ .state = rs, .run = middlewareRun };
+    }
+};
+
+fn resourceMethodMutating(m: http.Method) bool {
+    return switch (m) {
+        .post, .put, .delete, .patch => true,
+        .get, .head, .options => false,
+    };
+}
+
+/// The bearer token of the request, or null when the Authorization header is
+/// absent, uses another scheme, or is malformed. Never panics; scheme match is
+/// case-insensitive (RFC 9110), surrounding whitespace tolerated.
+fn resourceBearerToken(req: *const http.Server.Request) ?[]const u8 {
+    const auth = req.header("authorization") orelse return null;
+    const value = std.mem.trim(u8, auth, " \t");
+    if (value.len < "Bearer ".len) return null;
+    if (!std.ascii.eqlIgnoreCase(value[0..6], "Bearer")) return null;
+    if (value[6] != ' ') return null;
+    const tok = std.mem.trim(u8, value[7..], " \t");
+    if (tok.len == 0) return null;
+    return tok;
+}
+
+/// Human-readable reason for the 401 body — the `WWW-Authenticate` header
+/// carries only the RFC 6750 error *code*; the specific cause goes in the body
+/// (written through the response writer, which copies, so a transient string is
+/// fine here). Nothing token-derived is echoed.
+fn resourceInvalidReason(err: anyerror) []const u8 {
+    return switch (err) {
+        error.Expired => "token expired",
+        error.NotYetValid => "token not yet valid",
+        error.IssuedInFuture => "token issued in the future",
+        error.IssuerMismatch => "issuer mismatch",
+        error.AudienceMismatch => "audience mismatch",
+        error.MissingExpiration => "token missing exp",
+        error.BadSignature => "bad signature",
+        error.UnsecuredToken => "unsecured token rejected",
+        error.AlgKeyMismatch, error.UnsupportedAlg => "unsupported algorithm",
+        error.NoMatchingKey => "no matching key",
+        error.DiscoveryFailed, error.JwksFetchFailed => "key set unavailable",
+        error.MalformedToken, error.InvalidBase64, error.InvalidJson, error.NotAnObject => "malformed token",
+        else => "invalid token",
+    };
+}
+
+fn resourceDeny(
+    ctx: *router.Ctx,
+    status: u16,
+    challenge: []const u8,
+    body: []const u8,
+) anyerror!void {
+    ctx.res.setStatus(status);
+    try ctx.res.setHeader("WWW-Authenticate", challenge);
+    try ctx.res.setHeader("Content-Type", "text/plain");
+    try ctx.res.writeAll(body);
+}
+
+fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
+    const rs: *ResourceServer = @ptrCast(@alignCast(state.?));
+
+    const in_scope = switch (rs.protect) {
+        .all => true,
+        .mutations => resourceMethodMutating(ctx.req.method),
+    };
+    if (!in_scope) return next.run(ctx);
+
+    const token = resourceBearerToken(ctx.req) orelse
+        return resourceDeny(ctx, 401, rs.challenge_missing, "Unauthorized\n");
+
+    const now_s = rs.clock.now();
+    rs.lock.acquire();
+    const verify_result = rs.provider.verify(rs.gpa, token, now_s, rs.claim_opts);
+    rs.lock.release();
+
+    var verified = verify_result catch |err| {
+        // Provider.verify only fails the request — it never leaks a token.
+        // OOM is a server fault (500), not an auth failure: propagate it.
+        if (err == error.OutOfMemory) return err;
+        return resourceDeny(ctx, 401, rs.challenge_invalid, resourceInvalidReason(err));
+    };
+    defer verified.deinit();
+
+    var ident: Identity = .{ .token = &verified };
+    for (rs.required_scopes) |need| {
+        if (!ident.hasScope(need))
+            return resourceDeny(ctx, 403, rs.challenge_scope.?, "Insufficient scope\n");
+    }
+
+    const saved = ctx.data;
+    ctx.data = &ident;
+    defer ctx.data = saved;
+    return next.run(ctx);
+}
 
 // ── internals ───────────────────────────────────────────────────────────────
 
@@ -3640,4 +4016,270 @@ test "HttpFetcher compiles (never dialed in tests)" {
     _ = HttpFetcher.fetchFn;
     _ = HttpFetcher.fetcher;
     _ = http.Client.request;
+}
+
+// ── tests: resource-server middleware (Part 6) ───────────────────────────────
+// End-to-end over a real `router` + `http.Server.serveStream`, offline: the
+// Provider's JWKS comes from a scripted fetcher, tokens are minted with the RFC
+// A.2 RSA key, and the clock is a fixed virtual `now_s`.
+
+const Reader = std.Io.Reader;
+const Writer = std.Io.Writer;
+
+/// The RFC 7515 A.2 RSA public key served as the issuer's JWKS under kid "rs".
+const rs_jwks_json = "{\"keys\":[{\"kty\":\"RSA\",\"kid\":\"rs\",\"use\":\"sig\"," ++
+    "\"n\":\"" ++ rfc7515_a2_n_b64 ++ "\",\"e\":\"" ++ rfc7515_a2_e_b64 ++ "\"}]}";
+
+/// Mint an RS256 token (kid "rs") over `payload_json`, signed with the A.2 key,
+/// into `buf`. Returns the compact token.
+fn mintRs256(buf: []u8, payload_json: []const u8) []const u8 {
+    var n_buf: [256]u8 = undefined;
+    var d_buf: [256]u8 = undefined;
+    const n_bytes = b64uDecode(&n_buf, rfc7515_a2_n_b64);
+    const d_bytes = b64uDecode(&d_buf, rfc7515_a2_d_b64);
+    const si = signingInputInto(buf,
+        \\{"alg":"RS256","kid":"rs"}
+    , payload_json);
+    const sig = rsaTestSign(sha2.Sha256, 256, si, n_bytes, d_bytes);
+    return finishToken(buf, si.len, &sig);
+}
+
+/// A fixed virtual clock for the middleware under test.
+const FixedClock = struct {
+    now_s: i64,
+    fn clock(fc: *const FixedClock) Clock {
+        return .{ .ctx = @constCast(fc), .nowFn = read };
+    }
+    fn read(ctx: ?*anyopaque) i64 {
+        return @as(*const FixedClock, @ptrCast(@alignCast(ctx.?))).now_s;
+    }
+};
+
+fn resRunWire(r: *router.Router, bytes: []const u8, out_buf: []u8) []const u8 {
+    var in: Reader = .fixed(bytes);
+    var out: Writer = .fixed(out_buf);
+    var head_buf: [2048]u8 = undefined;
+    var request_body_buf: [256]u8 = undefined;
+    var response_body_buf: [512]u8 = undefined;
+    var chunk_buf: [128]u8 = undefined;
+    http.Server.serveStream(.{
+        .handler = r.handler(),
+        .context = r,
+        .server_name = null,
+        .peer = null,
+    }, &in, &out, .{
+        .head = &head_buf,
+        .request_body = &request_body_buf,
+        .response_body = &response_body_buf,
+        .chunk = &chunk_buf,
+    });
+    return out.buffered();
+}
+
+fn resWire(buf: []u8, method: []const u8, target: []const u8, auth: ?[]const u8) []const u8 {
+    if (auth) |a| {
+        return std.fmt.bufPrint(buf, "{s} {s} HTTP/1.1\r\nHost: t\r\nAuthorization: {s}\r\nConnection: close\r\n\r\n", .{ method, target, a }) catch unreachable;
+    }
+    return std.fmt.bufPrint(buf, "{s} {s} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{ method, target }) catch unreachable;
+}
+
+fn resExpectStatus(got: []const u8, comptime status: []const u8) !void {
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 " ++ status));
+}
+
+fn resExpectHeaderLine(got: []const u8, comptime line: []const u8) !void {
+    try testing.expect(std.mem.indexOf(u8, got, "\r\n" ++ line ++ "\r\n") != null);
+}
+
+var res_test_hits: u32 = 0;
+
+/// Protected handler: proves the identity is attached and trustworthy.
+fn resProtectedHandler(ctx: *router.Ctx) anyerror!void {
+    const id = identityOf(ctx) orelse return error.NoIdentity;
+    try testing.expectEqualStrings("alice", id.subject().?);
+    try testing.expect(id.hasScope("read"));
+    res_test_hits += 1;
+    try ctx.res.writeAll("ok");
+}
+
+/// Handler asserting NO identity was attached (out-of-scope read).
+fn resNoIdentityHandler(ctx: *router.Ctx) anyerror!void {
+    try testing.expectEqual(@as(?*Identity, null), identityOf(ctx));
+    res_test_hits += 1;
+    try ctx.res.writeAll("open");
+}
+
+test "ResourceServer: valid token → 200 + identity; missing/invalid/expired/insufficient short-circuit" {
+    const gpa = testing.allocator;
+    var stub: ScriptFetcher = .{ .script = &.{
+        .{ .url = test_jwks_url, .body = rs_jwks_json },
+    } };
+    var provider = Provider.init(gpa, stub.fetcher(), .{
+        .jwks_uri = test_jwks_url,
+        .ttl_s = 1000000,
+    });
+    defer provider.deinit();
+
+    var fc: FixedClock = .{ .now_s = 1000 };
+    var rs = try ResourceServer.init(gpa, .{
+        .provider = &provider,
+        .claim_opts = .{ .issuer = "https://issuer.example", .audience = "api://svc" },
+        .required_scopes = &.{"read"},
+        .clock = fc.clock(),
+    });
+    defer rs.deinit();
+
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(rs.middleware());
+    try r.get("/data", resProtectedHandler);
+
+    const good_claims =
+        \\{"iss":"https://issuer.example","aud":"api://svc","sub":"alice","exp":2000,"scope":"read write"}
+    ;
+    var tok_buf: [1024]u8 = undefined;
+    const good = mintRs256(&tok_buf, good_claims);
+    var bearer_buf: [1100]u8 = undefined;
+    const bearer = std.fmt.bufPrint(&bearer_buf, "Bearer {s}", .{good}) catch unreachable;
+
+    var req_buf: [1400]u8 = undefined;
+    var out_buf: [1024]u8 = undefined;
+
+    // Valid token → handler runs, 200.
+    res_test_hits = 0;
+    {
+        const req = resWire(&req_buf, "GET", "/data", bearer);
+        const got = resRunWire(&r, req, &out_buf);
+        try resExpectStatus(got, "200");
+        try testing.expectEqual(@as(u32, 1), res_test_hits);
+    }
+
+    // No Authorization → 401, bare Bearer challenge, handler never runs.
+    {
+        const req = resWire(&req_buf, "GET", "/data", null);
+        const got = resRunWire(&r, req, &out_buf);
+        try resExpectStatus(got, "401");
+        try resExpectHeaderLine(got, "WWW-Authenticate: Bearer");
+        try testing.expectEqual(@as(u32, 1), res_test_hits);
+    }
+
+    // Garbage token → 401 invalid_token.
+    {
+        const req = resWire(&req_buf, "GET", "/data", "Bearer not.a.jwt");
+        const got = resRunWire(&r, req, &out_buf);
+        try resExpectStatus(got, "401");
+        try resExpectHeaderLine(got, "WWW-Authenticate: Bearer error=\"invalid_token\"");
+    }
+
+    // Wrong scheme → treated as missing credential (bare challenge, 401).
+    {
+        const req = resWire(&req_buf, "GET", "/data", "Basic Zm9vOmJhcg==");
+        const got = resRunWire(&r, req, &out_buf);
+        try resExpectStatus(got, "401");
+        try resExpectHeaderLine(got, "WWW-Authenticate: Bearer");
+    }
+}
+
+test "ResourceServer: expired and insufficient-scope tokens, and the scope challenge" {
+    const gpa = testing.allocator;
+    var stub: ScriptFetcher = .{ .script = &.{
+        .{ .url = test_jwks_url, .body = rs_jwks_json },
+    } };
+    var provider = Provider.init(gpa, stub.fetcher(), .{ .jwks_uri = test_jwks_url, .ttl_s = 1000000 });
+    defer provider.deinit();
+
+    var fc: FixedClock = .{ .now_s = 1000 };
+    var rs = try ResourceServer.init(gpa, .{
+        .provider = &provider,
+        .claim_opts = .{ .audience = "api://svc" },
+        .required_scopes = &.{"admin"},
+        .clock = fc.clock(),
+        .realm = "svc",
+    });
+    defer rs.deinit();
+
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(rs.middleware());
+    try r.get("/data", resProtectedHandler);
+
+    var req_buf: [1400]u8 = undefined;
+    var out_buf: [1024]u8 = undefined;
+    var tok_buf: [1024]u8 = undefined;
+    var bearer_buf: [1100]u8 = undefined;
+
+    // Valid signature but expired (exp 500 < now 1000) → 401 invalid_token
+    // (challenge carries the configured realm).
+    {
+        const expired = mintRs256(&tok_buf,
+            \\{"aud":"api://svc","sub":"alice","exp":500,"scope":"admin"}
+        );
+        const bearer = std.fmt.bufPrint(&bearer_buf, "Bearer {s}", .{expired}) catch unreachable;
+        const req = resWire(&req_buf, "GET", "/data", bearer);
+        const got = resRunWire(&r, req, &out_buf);
+        try resExpectStatus(got, "401");
+        try resExpectHeaderLine(got, "WWW-Authenticate: Bearer realm=\"svc\" error=\"invalid_token\"");
+    }
+
+    // Valid + fresh but missing the required "admin" scope → 403.
+    {
+        const narrow = mintRs256(&tok_buf,
+            \\{"aud":"api://svc","sub":"alice","exp":2000,"scope":"read"}
+        );
+        const bearer = std.fmt.bufPrint(&bearer_buf, "Bearer {s}", .{narrow}) catch unreachable;
+        const req = resWire(&req_buf, "GET", "/data", bearer);
+        const got = resRunWire(&r, req, &out_buf);
+        try resExpectStatus(got, "403");
+        try resExpectHeaderLine(got, "WWW-Authenticate: Bearer realm=\"svc\" error=\"insufficient_scope\", scope=\"admin\"");
+    }
+}
+
+test "ResourceServer: protect=.mutations lets unauthenticated reads through with no identity" {
+    const gpa = testing.allocator;
+    var stub: ScriptFetcher = .{ .script = &.{
+        .{ .url = test_jwks_url, .body = rs_jwks_json },
+    } };
+    var provider = Provider.init(gpa, stub.fetcher(), .{ .jwks_uri = test_jwks_url, .ttl_s = 1000000 });
+    defer provider.deinit();
+
+    var fc: FixedClock = .{ .now_s = 1000 };
+    var rs = try ResourceServer.init(gpa, .{
+        .provider = &provider,
+        .protect = .mutations,
+        .clock = fc.clock(),
+    });
+    defer rs.deinit();
+
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(rs.middleware());
+    try r.get("/data", resNoIdentityHandler);
+
+    var req_buf: [512]u8 = undefined;
+    var out_buf: [1024]u8 = undefined;
+    res_test_hits = 0;
+    const req = resWire(&req_buf, "GET", "/data", null);
+    const got = resRunWire(&r, req, &out_buf);
+    try resExpectStatus(got, "200");
+    try testing.expectEqual(@as(u32, 1), res_test_hits);
+    // The JWKS was never fetched — a read never touched the Provider.
+    try testing.expectEqual(@as(usize, 0), stub.calls);
+}
+
+test "ResourceServer: ScopeIter splits on single/multiple spaces; InvalidRealm rejected" {
+    var it: ScopeIter = .{ .rest = "  read   write openid " };
+    try testing.expectEqualStrings("read", it.next().?);
+    try testing.expectEqualStrings("write", it.next().?);
+    try testing.expectEqualStrings("openid", it.next().?);
+    try testing.expectEqual(@as(?[]const u8, null), it.next());
+
+    var empty: ScopeIter = .{ .rest = "" };
+    try testing.expectEqual(@as(?[]const u8, null), empty.next());
+
+    var provider = Provider.init(testing.allocator, undefined, .{ .jwks_uri = "https://x/jwks" });
+    defer provider.deinit();
+    try testing.expectError(error.InvalidRealm, ResourceServer.init(testing.allocator, .{
+        .provider = &provider,
+        .realm = "bad\"realm",
+    }));
 }

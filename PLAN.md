@@ -306,8 +306,10 @@ fmt green. **Still open:** request-ID mw · health helper · conditional-req · 
   (JWKS parse RSA/EC/OKP/oct + `verifyWithJwks` by-kid + skip-tolerance + smuggling defenses, RFC 7517
   vectors, +10 tests — complete offline JWT/JWKS validator) · **P5 ✅** (OIDC discovery + JWKS fetch +
   `Provider` cache/TTL/key-rotation-refresh/rate-limit + turnkey `Provider.verify`, fetch seam, +9 tests
-  — **complete OIDC resource-server validator now; dep http**). Remaining: **P6** aaa-gate
-  resource-server middleware (wraps `Provider.verify`) — the last part.
+  — **complete OIDC resource-server validator now; dep http**) · **P6 ✅** (`ResourceServer` `router`
+  middleware wrapping `Provider.verify`: RFC 6750 Bearer challenge — 401 `invalid_token` / 403
+  `insufficient_scope` — `Identity` on ctx via `identityOf`, injected clock + Provider lock seam, +4
+  tests; dep +router). **jwt is 6/6 complete.**
 - 🟢 nice-to-have: cookies + Set-Cookie(HttpOnly/Secure/SameSite) · Range/206 · inbound gzip request body ·
   traceparent/OTel · per-conn request-count cap · auto-OPTIONS in router · content negotiation · Link
   pagination · Idempotency-Key · request trailers · strict bare-LF reject · HMAC signing · HTTP/3.
