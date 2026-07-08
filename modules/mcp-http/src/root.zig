@@ -4,19 +4,26 @@
 //! `router` middleware, so a `mcp.Server` (JSON-RPC 2.0 tools / resources /
 //! prompts) is reachable remotely over HTTP instead of only over stdio.
 //!
-//! This is the request/response half: a single endpoint (`/mcp` by default)
-//! where the client **POST**s one JSON-RPC message and gets back either the
-//! JSON-RPC response (`application/json`) or — for a notification / anything
-//! with no reply — **202 Accepted** with no body. It wraps the transport-
-//! agnostic `mcp.Server.handleMessage`, which already does all protocol work
-//! (version negotiation, dispatch, error objects) and, per the MCP spec,
-//! rejects JSON-RPC batches.
+//! A single endpoint (`/mcp` by default) where the client **POST**s one
+//! JSON-RPC message. The response is delivered one of two ways:
 //!
-//! Deliberately out of scope here (later parts): the server→client **SSE
-//! stream** on `GET /mcp` (progress / server-initiated messages) and
-//! **session management** (`Mcp-Session-Id`). This transport is **stateless** —
-//! it assigns no session id, which the spec permits; every POST is handled
-//! independently. `GET`/`DELETE` on the endpoint answer **405** for now.
+//! - **`application/json`** — a single response object (the default; also the
+//!   only mode a client that doesn't `Accept: text/event-stream` gets).
+//! - **SSE** (`text/event-stream`) — when the client accepts it, the response
+//!   is an event stream so a tool call's `notifications/progress` reach the
+//!   client **live**; each JSON-RPC message the server emits becomes one SSE
+//!   `data:` event, and the stream closes after the response.
+//!
+//! A notification (or anything with no reply) answers **202 Accepted**, no
+//! body, in either mode. It wraps the transport-agnostic
+//! `mcp.Server.handleMessage`, which does all protocol work (version
+//! negotiation, dispatch, error objects) and, per the MCP spec, rejects
+//! JSON-RPC batches.
+//!
+//! Deliberately out of scope here (later parts): the standing server→client
+//! **SSE stream** on `GET /mcp` and **session management** (`Mcp-Session-Id`).
+//! This transport is **stateless** — it assigns no session id, which the spec
+//! permits; every POST is handled independently. `GET`/`DELETE` answer **405**.
 //!
 //! ## Security
 //!
@@ -105,6 +112,16 @@ pub const Transport = struct {
     /// attack this blocks is browser-driven. List full origins,
     /// e.g. `"http://localhost:7717"`.
     allowed_origins: []const []const u8 = &.{},
+    /// Response delivery policy. `.auto` (default): when the client's `Accept`
+    /// header includes `text/event-stream`, the POST response is delivered as
+    /// an **SSE stream** so a tool call's `notifications/progress` reach the
+    /// client live (each JSON-RPC message becomes one SSE `data:` event; the
+    /// stream closes after the response). Clients that don't accept SSE still
+    /// get a single `application/json` response. `.off`: always
+    /// `application/json` (no streaming).
+    stream: StreamMode = .auto,
+
+    pub const StreamMode = enum { auto, off };
 
     pub fn middleware(t: *const Transport) router.Middleware {
         return .{ .state = @constCast(t), .run = middlewareRun };
@@ -148,6 +165,12 @@ fn originAllowed(t: *const Transport, req: *const http.Server.Request) bool {
     return false;
 }
 
+/// Whether the client's `Accept` header admits an SSE response.
+fn acceptsSse(req: *const http.Server.Request) bool {
+    const accept = req.header("accept") orelse return false;
+    return std.ascii.indexOfIgnoreCase(accept, "text/event-stream") != null;
+}
+
 fn handlePost(t: *const Transport, ctx: *router.Ctx) anyerror!void {
     const body = ctx.req.reader().allocRemaining(t.gpa, .limited(t.max_body)) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -166,7 +189,14 @@ fn handlePost(t: *const Transport, ctx: *router.Ctx) anyerror!void {
     };
     defer t.gpa.free(body);
 
-    // Capture the one JSON-RPC response line (if any) the server writes.
+    if (t.stream == .auto and acceptsSse(ctx.req)) return streamResponse(t, ctx, body);
+    return jsonResponse(t, ctx, body);
+}
+
+/// The single-JSON-response path (client did not ask for SSE): capture the one
+/// response line the server writes and return `application/json`, or 202 for a
+/// notification.
+fn jsonResponse(t: *const Transport, ctx: *router.Ctx, body: []const u8) anyerror!void {
     var out: std.Io.Writer.Allocating = .init(t.gpa);
     defer out.deinit();
 
@@ -188,6 +218,96 @@ fn handlePost(t: *const Transport, ctx: *router.Ctx) anyerror!void {
     try ctx.res.writeAll(resp); // writeAll copies, so freeing `out` after is safe
 }
 
+/// The SSE-response path: run the server against an adapter that re-frames each
+/// JSON-RPC line the server writes (progress notifications, then the response)
+/// as an SSE `data:` event, flushed live. If the message was a notification
+/// (the server wrote nothing), no stream is started and we answer 202.
+fn streamResponse(t: *const Transport, ctx: *router.Ctx, body: []const u8) anyerror!void {
+    var buf: [4096]u8 = undefined;
+    var adapter = SseAdapter.init(t.gpa, ctx.res, &buf);
+    defer adapter.deinit();
+
+    t.lock.acquire();
+    const rc = t.server.handleMessage(body, &adapter.writer);
+    t.lock.release();
+    adapter.writer.flush() catch {}; // drain any bytes still buffered
+    adapter.finish(); // emit a trailing partial line (defensive; mcp ends with \n)
+    rc catch |err| return err;
+
+    if (!adapter.started) ctx.res.setStatus(202); // notification: no stream, no body
+    // else: the SSE stream carried the response; returning ends it (end() writes
+    // the terminating chunk), which is the server-closes-after-response contract.
+}
+
+/// A `std.Io.Writer` that turns the server's newline-delimited JSON-RPC output
+/// into SSE `data:` events on `rw`. Each complete line (the server writes one
+/// JSON object per line, flushing after each) is emitted as its own event and
+/// flushed to the socket; the `text/event-stream` head is written lazily on the
+/// first event, so a no-output notification leaves the response free for a 202.
+const SseAdapter = struct {
+    rw: *http.Server.ResponseWriter,
+    gpa: std.mem.Allocator,
+    pending: std.ArrayList(u8) = .empty,
+    es: http.sse.EventStream = undefined,
+    started: bool = false,
+    writer: std.Io.Writer,
+
+    fn init(gpa: std.mem.Allocator, rw: *http.Server.ResponseWriter, buffer: []u8) SseAdapter {
+        return .{
+            .rw = rw,
+            .gpa = gpa,
+            .writer = .{ .vtable = &.{ .drain = drainFn }, .buffer = buffer },
+        };
+    }
+
+    fn deinit(self: *SseAdapter) void {
+        self.pending.deinit(self.gpa);
+    }
+
+    fn drainFn(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *SseAdapter = @alignCast(@fieldParentPtr("writer", w));
+        self.pending.appendSlice(self.gpa, w.buffered()) catch return error.WriteFailed;
+        w.end = 0;
+        var consumed: usize = 0;
+        for (data[0 .. data.len - 1]) |d| {
+            self.pending.appendSlice(self.gpa, d) catch return error.WriteFailed;
+            consumed += d.len;
+        }
+        const last = data[data.len - 1];
+        for (0..splat) |_| self.pending.appendSlice(self.gpa, last) catch return error.WriteFailed;
+        consumed += last.len * splat;
+        try self.emitComplete();
+        return consumed;
+    }
+
+    /// Emit every complete (newline-terminated) line currently buffered.
+    fn emitComplete(self: *SseAdapter) std.Io.Writer.Error!void {
+        while (std.mem.indexOfScalar(u8, self.pending.items, '\n')) |nl| {
+            try self.emitLine(self.pending.items[0..nl]);
+            const rest = self.pending.items.len - (nl + 1);
+            std.mem.copyForwards(u8, self.pending.items[0..rest], self.pending.items[nl + 1 ..]);
+            self.pending.shrinkRetainingCapacity(rest);
+        }
+    }
+
+    fn emitLine(self: *SseAdapter, line: []const u8) std.Io.Writer.Error!void {
+        const trimmed = std.mem.trimEnd(u8, line, "\r"); // tolerate CRLF
+        if (trimmed.len == 0) return; // never seen from mcp, but skip blanks
+        if (!self.started) {
+            self.es = http.sse.EventStream.start(self.rw) catch return error.WriteFailed;
+            self.started = true;
+        }
+        self.es.send(.{ .data = trimmed }) catch return error.WriteFailed;
+    }
+
+    /// Flush a trailing line with no final newline (defensive — mcp always ends
+    /// its messages with one). Best-effort.
+    fn finish(self: *SseAdapter) void {
+        const rest = std.mem.trimEnd(u8, self.pending.items, "\r\n");
+        if (rest.len != 0) self.emitLine(rest) catch {};
+    }
+};
+
 // ── tests (offline — through http.Server.serveStream + a real router) ───────
 
 const testing = std.testing;
@@ -199,6 +319,13 @@ fn echoTool(_: ?*anyopaque, call: *mcp.ToolCall) bool {
     return false;
 }
 
+fn workTool(_: ?*anyopaque, call: *mcp.ToolCall) bool {
+    call.reportProgress(1, 2, "step one"); // no-op unless the client sent a token
+    call.reportProgress(2, 2, "step two");
+    call.write("{\"done\":true}");
+    return false;
+}
+
 fn buildServer(gpa: std.mem.Allocator) !mcp.Server {
     var server = mcp.Server.init(gpa, .{ .name = "test", .version = "1.0" });
     errdefer server.deinit();
@@ -207,6 +334,12 @@ fn buildServer(gpa: std.mem.Allocator) !mcp.Server {
         .description = "echo",
         .input_schema = "{\"type\":\"object\"}",
         .handler = echoTool,
+    });
+    try server.addTool(.{
+        .name = "work",
+        .description = "work with progress",
+        .input_schema = "{\"type\":\"object\"}",
+        .handler = workTool,
     });
     return server;
 }
@@ -242,6 +375,13 @@ fn postOrigin(comptime origin: []const u8, comptime json: []const u8) []const u8
     return std.fmt.comptimePrint(
         "POST /mcp HTTP/1.1\r\nHost: t\r\nOrigin: {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
         .{ origin, json.len, json },
+    );
+}
+
+fn postAccept(comptime accept: []const u8, comptime json: []const u8) []const u8 {
+    return std.fmt.comptimePrint(
+        "POST /mcp HTTP/1.1\r\nHost: t\r\nAccept: {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+        .{ accept, json.len, json },
     );
 }
 
@@ -372,6 +512,87 @@ test "Origin allowlist: match → 200, mismatch → 403, absent → allowed" {
         \\{"jsonrpc":"2.0","id":3,"method":"tools/list"}
     ), &b3);
     try testing.expect(std.mem.startsWith(u8, no_origin, "HTTP/1.1 200"));
+}
+
+test "SSE-on-POST: Accept text/event-stream → response delivered as an SSE data event" {
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    var transport = Transport{ .gpa = gpa, .server = &server };
+
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+
+    var buf: [8192]u8 = undefined;
+    const got = runWire(&r, postAccept("application/json, text/event-stream",
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/list"}
+    ), &buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
+    try testing.expect(std.mem.indexOf(u8, got, "Content-Type: text/event-stream") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "Transfer-Encoding: chunked") != null);
+    // The JSON-RPC response is framed as one SSE data event (whole event in one
+    // chunk, so the substrings are contiguous).
+    try testing.expect(std.mem.indexOf(u8, got, "data: {\"jsonrpc\"") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "\"echo\"") != null);
+}
+
+test "SSE-on-POST: tool progress notifications stream live, then the result" {
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    var transport = Transport{ .gpa = gpa, .server = &server };
+
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+
+    var buf: [8192]u8 = undefined;
+    const got = runWire(&r, postAccept("text/event-stream",
+        \\{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"work","arguments":{},"_meta":{"progressToken":"p1"}}}
+    ), &buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
+    // Two progress notifications + the final result = 3 data events.
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, got, "notifications/progress"));
+    try testing.expect(std.mem.count(u8, got, "data: ") >= 3);
+    try testing.expect(std.mem.indexOf(u8, got, "\\\"done\\\":true") != null);
+}
+
+test "SSE-on-POST: a notification with SSE Accept → 202, no stream started" {
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    var transport = Transport{ .gpa = gpa, .server = &server };
+
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+
+    var buf: [4096]u8 = undefined;
+    const got = runWire(&r, postAccept("text/event-stream",
+        \\{"jsonrpc":"2.0","method":"notifications/initialized"}
+    ), &buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 202"));
+    try testing.expect(std.mem.indexOf(u8, got, "text/event-stream") == null);
+}
+
+test "stream=.off forces application/json even when the client accepts SSE" {
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    var transport = Transport{ .gpa = gpa, .server = &server, .stream = .off };
+
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+
+    var buf: [4096]u8 = undefined;
+    const got = runWire(&r, postAccept("text/event-stream",
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/list"}
+    ), &buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
+    try testing.expect(std.mem.indexOf(u8, got, "Content-Type: application/json") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "text/event-stream") == null);
 }
 
 test "oversized POST body → 413" {

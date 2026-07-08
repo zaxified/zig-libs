@@ -334,9 +334,11 @@ fmt green. **Still open:** request-ID mw · health helper · conditional-req · 
    bxp-gui Dart/`mcp_dart` speaks HTTP/SSE = behavioral ref; MCP core already in `mcp`). **DONE:**
    `http.ResponseWriter.flush()` (incremental streaming, `b376427`); **T3** `http.sse` WHATWG EventSource encoder
    (Fable, +2 tests); **T1** NEW `mcp-http` module — Streamable HTTP `POST /mcp` → JSON-RPC/202, stateless,
-   Lock seam, +5 tests (Opus). **T2 ✅** built-in `Origin` allowlist (DNS-rebinding guard, +1 test; bearer = reuse aaa-gate/jwt in
-   front). **Remaining:** T4 SSE-on-POST progress + `GET /mcp` stream (uses `http.sse`); T5 session registry
-   (`Mcp-Session-Id`) + resumable push (deferred, the hard part). · 2. ✅ **upstream LB + health routing (+bulkhead)** DONE (`resilience.Bulkhead` + new `upstream` module: strategies/health/failover; 23 tests)
+   Lock seam, +5 tests (Opus). **T2 ✅** built-in `Origin` allowlist (DNS-rebinding guard; bearer = reuse aaa-gate/jwt in front).
+   **T4 ✅** SSE-on-POST: `Accept: text/event-stream` → the response streams as SSE with tool-call
+   `notifications/progress` delivered live (each JSON-RPC line → one `data:` event via a line-to-SSE
+   adapter; notification → 202; `stream=.off` opt-out), +4 tests. **Remaining:** T5 standing `GET /mcp`
+   stream + session registry (`Mcp-Session-Id`) + resumable push (deferred, the hard part). · 2. ✅ **upstream LB + health routing (+bulkhead)** DONE (`resilience.Bulkhead` + new `upstream` module: strategies/health/failover; 23 tests)
 — C gateway. Remaining: 3. **SNMP trap receiver + v3** (small-med) — A async alerts · 4. **coap** RFC 7252
 (med) — G IoT · 5. **MQTT broker** (large) — G IoT hub.
 Extraction backlog (Opus, NOT Fable — low/no value-add headroom): `rawsock` (axp `openPacketCapture`
