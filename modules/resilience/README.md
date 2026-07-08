@@ -1,7 +1,8 @@
 # resilience
 
 Client-side fault tolerance for calling flaky upstreams: **circuit breaker +
-retry-with-backoff + timeout**, generic over any fallible operation. When the
+retry-with-backoff + timeout + bulkhead**, generic over any fallible
+operation. When the
 API calls other services, a flaky/slow dependency shouldn't cascade into our
 failure — this is the generic control logic that wraps such calls. std-only
 and dependency-free, so it is reusable well beyond HTTP (the caller composes
@@ -10,7 +11,8 @@ it with `http.Client` or anything else that can fail).
 Provenance: clean-room — no seed project and no third-party code. Design
 references (behavior only, no source consulted line-level or copied):
 resilience4j (Apache-2.0; breaker state machine, composition order, retry
-`maxAttempts`/interval semantics), Polly (BSD-3-Clause; consecutive-failure
+`maxAttempts`/interval semantics, semaphore Bulkhead —
+`maxConcurrentCalls`/`maxWaitDuration`), Polly (BSD-3-Clause; consecutive-failure
 count breaker), failsafe-go (Apache-2.0; delay/jitter policy shapes) and the
 AWS Architecture Blog "Exponential Backoff And Jitter" (Brooker, 2015; the
 full/equal jitter taxonomy). Clock/delay-injection and spinlock patterns
@@ -22,7 +24,8 @@ follow the `ratelimit`/`throttle` siblings.
   errno form; the default delay uses posix `nanosleep`) — both injectable,
   everything else is pure logic. **Role:** util. **Concurrency:** threadsafe —
   `CircuitBreaker` is internally synchronized (documented spinlock, O(1)
-  critical sections, no allocation); `Retry`/`Deadline` are immutable values.
+  critical sections, no allocation); `Bulkhead` is lock-free (a CAS loop on
+  one atomic counter); `Retry`/`Deadline` are immutable values.
 - **Deps:** none (std only).
 
 ## Layers
@@ -30,6 +33,7 @@ follow the `ratelimit`/`throttle` siblings.
 | Layer | What | Needs |
 |---|---|---|
 | `CircuitBreaker` | `closed → open → half_open`, fast-fail, probes | an injected `Clock` |
+| `Bulkhead` | ≤ `max_concurrent` calls in flight; full = `error.BulkheadFull` (or a bounded wait) | injected `Clock`/`Delay` only for the bounded wait |
 | `Retry` | pure backoff math: `nextDelay(attempt, random)` | a seeded `std.Random` for jitter |
 | `Deadline` | cooperative time budget (`expired()`/`remainingMs()`) | an injected `Clock` |
 | `run(op, policy)` | one-call composition: breaker → retry → timeout | all of the above, injected |
@@ -109,6 +113,17 @@ the point; call `run` again later to probe after the cooldown.
   an `anyerror` predicate can match any operation's error set.
 - **Retried attempts may repeat side effects** — only wrap idempotent work
   (the standard retry caveat).
+- **Bulkhead** (resilience4j's semaphore bulkhead, behavior only): at most
+  `max_concurrent` calls in flight; a full bulkhead rejects with
+  `error.BulkheadFull` immediately (`max_wait_ns = 0`, the default) or
+  after a bounded wait. Pair every successful `tryAcquire()`/`acquire()`
+  with exactly one `release()`, or use `Bulkhead.run(op)` which releases on
+  the error path too. The bounded wait is a **poll** over the injected
+  `Clock`/`Delay` (granularity `poll_ns`) — this module is std-only with no
+  `Io`, so there is no futex to park on; the `throttle` sibling has the
+  futex-parked variant. The breaker reacts to *failures*, the bulkhead to
+  *saturation* — compose both when calling a fleet (see the `upstream`
+  module).
 
 ## Timeout — what it can and cannot do
 
@@ -144,4 +159,9 @@ cooperative deadline reaches the operation; composition (M<threshold
 failures then success never trips; persistent failure trips mid-run, then
 fast-fails without invoking the operation; recovery after cooldown); plus an
 8-thread breaker check (no lost failure counts, exact half-open probe
-admission).
+admission). Bulkhead: N acquires then immediate N+1 rejection; `run` returns
+the slot on success and on the error path and fast-fails a full bulkhead
+without invoking the op; the bounded wait succeeds when a slot frees within
+the (virtual-time) budget and times out poll-by-poll when none does; a real
+cross-thread handover; and an 8-thread `run()` hammer asserting in-flight
+never exceeds `max_concurrent` and no slot leaks.

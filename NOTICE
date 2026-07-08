@@ -87,11 +87,23 @@ audit is pending before any public release.
                WHATWG Fetch standard (CORS protocol) and RFC 9110. No source
                copied.
   resilience — design ref: resilience4j (Apache-2.0; breaker state machine,
-               composition order, retry semantics), Polly (BSD-3-Clause;
-               consecutive-failure count breaker), failsafe-go (Apache-2.0;
-               delay/jitter policy shapes), AWS Architecture Blog
-               "Exponential Backoff And Jitter" (Brooker, 2015; jitter
-               taxonomy). Behavior only, no source copied.
+               composition order, retry semantics, semaphore Bulkhead —
+               maxConcurrentCalls/maxWaitDuration/BulkheadFullException
+               behavior), Polly (BSD-3-Clause; consecutive-failure count
+               breaker), failsafe-go (Apache-2.0; delay/jitter policy
+               shapes), AWS Architecture Blog "Exponential Backoff And
+               Jitter" (Brooker, 2015; jitter taxonomy). Behavior only, no
+               source copied.
+  upstream   — design ref: Envoy (Apache-2.0) and HAProxy (GPL-2.0 —
+               documented behavior only, no code consulted or copied)
+               upstream-cluster semantics: health-checked member set,
+               pluggable load-balancing policy, per-member circuit breaking
+               and concurrency caps. The load-balancing algorithms
+               themselves (round-robin, smooth weighted round-robin as
+               popularized by nginx, least-connections, EWMA latency) are
+               public, decades-old techniques; the per-upstream concurrency
+               cap models resilience4j's Bulkhead (see the resilience
+               entry). Behavior only, no source copied.
   openapi    — design ref: FastAPI (MIT; the generated-spec shape and
                defaults, e.g. the default "Successful Response" 200 and
                path-parameter objects), utoipa (MIT OR Apache-2.0;

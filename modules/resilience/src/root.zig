@@ -20,6 +20,13 @@
 //!   Backoff And Jitter"; `equal` and `none` also available), and a
 //!   `retryable(err)` predicate. `nextDelay()` is a pure function — the
 //!   caller (or `run`) does the waiting via an injected `Delay`.
+//! - `Bulkhead` — bounded concurrent execution (resilience4j's semaphore
+//!   bulkhead): at most `max_concurrent` calls in flight at once. When
+//!   full, `acquire()` fails fast with `error.BulkheadFull`; with
+//!   `max_wait_ns > 0` it instead waits up to that budget for a slot
+//!   (a poll over the injected `Clock`/`Delay` — see the type doc).
+//!   `Bulkhead.run(op)` wraps acquire → call → release (the slot is
+//!   returned on the error path too).
 //! - `Deadline` — a cooperative time budget (`expired()`/`remainingMs()`)
 //!   the operation can check or map onto its own I/O timeouts.
 //! - `run(op, policy)` — one-call composition: breaker → retry → timeout
@@ -107,7 +114,8 @@
 //! any thread. The lock is a spinlock (`std.atomic.Mutex` + `spinLoopHint`,
 //! the std SmpAllocator pattern — Zig 0.16 std has no io-less blocking
 //! mutex); every critical section is a few branches on plain fields, no
-//! allocation, no I/O. `Retry` and `Deadline` are immutable values
+//! allocation, no I/O. `Bulkhead` is lock-free (a CAS loop on one atomic
+//! counter). `Retry` and `Deadline` are immutable values
 //! (reentrant). `run` itself owns no shared state — concurrent `run`s may
 //! share one `*CircuitBreaker` (that is the intended use) but each needs
 //! its own operation value unless the operation synchronizes itself; an
@@ -128,9 +136,9 @@ pub const meta = .{
     .platform = .posix,
     .role = .util,
     // CircuitBreaker internally synchronized (documented spinlock);
-    // Retry/Deadline are immutable values.
+    // Bulkhead is pure atomics; Retry/Deadline are immutable values.
     .concurrency = .threadsafe,
-    .model_after = "resilience4j (composition + breaker states) + Polly (consecutive-failure trip) + failsafe-go (delay shapes) + AWS full-jitter backoff",
+    .model_after = "resilience4j (composition + breaker states + semaphore Bulkhead) + Polly (consecutive-failure trip) + failsafe-go (delay shapes) + AWS full-jitter backoff",
     .deps = .{},
 };
 
@@ -345,6 +353,140 @@ pub const CircuitBreaker = struct {
 fn lockSpin(m: *std.atomic.Mutex) void {
     while (!m.tryLock()) std.atomic.spinLoopHint();
 }
+
+// ── bulkhead (bounded concurrent execution) ─────────────────────────────────
+
+/// Bounded concurrent-execution limiter: at most `max_concurrent` calls may
+/// be in flight at once — the "don't let one slow dependency eat every
+/// thread" isolation piece, sibling to the breaker (which reacts to
+/// *failures*; the bulkhead reacts to *saturation*).
+///
+/// Provenance: clean-room — models resilience4j's semaphore Bulkhead
+/// (Apache-2.0; behavior only: `maxConcurrentCalls` + `maxWaitDuration`,
+/// full ⇒ `BulkheadFullException` ⇒ `error.BulkheadFull` here). No source
+/// consulted or copied.
+///
+/// Modes:
+/// - `max_wait_ns = 0` (default) — non-blocking: a full bulkhead rejects
+///   with `error.BulkheadFull` immediately; a failed acquire consumes
+///   nothing.
+/// - `max_wait_ns > 0` — bounded wait: `acquire()` re-tries for up to the
+///   budget before rejecting. The wait is a **poll** over the injected
+///   `Clock`/`Delay` (granularity `poll_ns`) — this module is std-only with
+///   no `Io`, so there is no futex to park on (the `throttle` sibling has
+///   the futex variant); tests inject a virtual clock/delay and never sleep.
+///
+/// Usage contract: pair every successful `tryAcquire()`/`acquire()` with
+/// exactly one `release()` — or use `run(op)`, which releases on the error
+/// path too. Thread-safe: a CAS loop on one atomic counter (the counter can
+/// never exceed the cap — the CAS refuses — nor go negative: `release`
+/// asserts in Debug and saturates at 0 in release builds). No allocation,
+/// nothing to deinit.
+pub const Bulkhead = struct {
+    options: Options,
+    /// Slots currently held (0 ≤ n ≤ max_concurrent, CAS-enforced).
+    in_flight: std.atomic.Value(u32) = .init(0),
+
+    /// The one error the bulkhead adds: no slot within the (possibly zero)
+    /// wait budget. Fast-fail and shed/queue elsewhere — that is the point.
+    pub const Error = error{BulkheadFull};
+
+    pub const Options = struct {
+        /// Hard cap on concurrently admitted calls. Must be ≥ 1.
+        max_concurrent: u32,
+        /// How long `acquire()` may wait for a slot before giving up.
+        /// 0 (default) = never wait, reject immediately.
+        max_wait_ns: u64 = 0,
+        /// Poll granularity of the bounded wait (clamped to the remaining
+        /// budget). Only consulted when `max_wait_ns > 0`.
+        poll_ns: u64 = 100 * std.time.ns_per_us,
+        /// Time source for the wait deadline — inject a fake for
+        /// deterministic tests. Never consulted when `max_wait_ns = 0`.
+        clock: Clock = .monotonic,
+        /// How the bounded wait sleeps between polls — tests inject a
+        /// virtual delay that advances the fake clock. Never consulted when
+        /// `max_wait_ns = 0`.
+        delay: Delay = .blocking,
+    };
+
+    pub fn init(options: Options) Bulkhead {
+        std.debug.assert(options.max_concurrent >= 1);
+        return .{ .options = options };
+    }
+
+    /// Take a slot if one is free — never blocks, never over-admits; a
+    /// failed attempt consumes nothing. Pair every success with exactly one
+    /// `release()`.
+    pub fn tryAcquire(b: *Bulkhead) bool {
+        var cur = b.in_flight.load(.seq_cst);
+        while (true) {
+            if (cur >= b.options.max_concurrent) return false;
+            cur = b.in_flight.cmpxchgWeak(cur, cur + 1, .seq_cst, .seq_cst) orelse
+                return true;
+        }
+    }
+
+    /// `tryAcquire` as an error union, plus the bounded wait when
+    /// configured: at capacity with `max_wait_ns > 0`, poll for a freed
+    /// slot until the deadline, then reject. A rejected acquire holds
+    /// nothing — do not `release()` after `error.BulkheadFull`.
+    pub fn acquire(b: *Bulkhead) Error!void {
+        if (b.tryAcquire()) return;
+        if (b.options.max_wait_ns == 0) return error.BulkheadFull;
+
+        const clock = b.options.clock;
+        const deadline_ns = clock.now() +| b.options.max_wait_ns;
+        while (true) {
+            const now_ns = clock.now();
+            if (now_ns >= deadline_ns) return error.BulkheadFull;
+            b.options.delay.sleep(@max(1, @min(b.options.poll_ns, deadline_ns - now_ns)));
+            if (b.tryAcquire()) return;
+        }
+    }
+
+    /// Return a slot taken by a successful `tryAcquire`/`acquire`.
+    /// Releasing more than was acquired is a caller bug: asserts in Debug;
+    /// in release builds the counter saturates at 0 instead of wrapping.
+    pub fn release(b: *Bulkhead) void {
+        var cur = b.in_flight.load(.seq_cst);
+        while (true) {
+            std.debug.assert(cur > 0); // release without a matching acquire
+            if (cur == 0) return; // ReleaseFast: saturate, don't wrap
+            cur = b.in_flight.cmpxchgWeak(cur, cur - 1, .seq_cst, .seq_cst) orelse
+                return;
+        }
+    }
+
+    /// Slots currently held — a point-in-time snapshot (observability).
+    pub fn activeCount(b: *const Bulkhead) u32 {
+        return b.in_flight.load(.seq_cst);
+    }
+
+    /// Slots currently free (`max_concurrent - activeCount`) — a racy
+    /// snapshot: a true answer here does not reserve anything, only
+    /// `tryAcquire`/`acquire` admit.
+    pub fn availableSlots(b: *const Bulkhead) u32 {
+        return b.options.max_concurrent -| b.activeCount();
+    }
+
+    /// The result type `run(op)` returns for an operation of type `Op`:
+    /// the operation's own error union widened with `error.BulkheadFull`.
+    pub fn RunResult(comptime Op: type) type {
+        const info = @typeInfo(CallReturn(Op)).error_union;
+        return (info.error_set || Error)!info.payload;
+    }
+
+    /// Run `op` (same operation shape as the module-level `run`: any value
+    /// with a `call()` method returning an error union) inside one slot:
+    /// acquire → call → release. The slot is released whether the call
+    /// succeeds or errors; a full bulkhead returns `error.BulkheadFull`
+    /// without invoking the operation at all.
+    pub fn run(b: *Bulkhead, op: anytype) Bulkhead.RunResult(@TypeOf(op)) {
+        try b.acquire();
+        defer b.release();
+        return op.call();
+    }
+};
 
 // ── retry with backoff ──────────────────────────────────────────────────────
 
@@ -795,6 +937,216 @@ test "CircuitBreaker: concurrent failure counting and probe admission stay exact
     for (handles) |h| h.join();
     try testing.expectEqual(3, admitted.load(.seq_cst));
     try testing.expectEqual(.half_open, cb.state());
+}
+
+// ── tests: bulkhead ─────────────────────────────────────────────────────────
+
+/// Virtual sleep for the bulkhead's bounded wait: advances the shared
+/// TestClock by the requested amount and can free a slot after a scripted
+/// number of sleeps (a "concurrent release" in virtual time).
+const BulkheadTestDelay = struct {
+    tc: *TestClock,
+    bh: ?*Bulkhead = null,
+    /// Release one slot on the Nth sleep (0 = never release).
+    release_after: usize = 0,
+    sleeps: usize = 0,
+
+    fn delay(t: *BulkheadTestDelay) Delay {
+        return .{ .ctx = t, .sleepFn = sleepFn };
+    }
+    fn sleepFn(ctx: ?*anyopaque, ns: u64) void {
+        const t: *BulkheadTestDelay = @ptrCast(@alignCast(ctx.?));
+        t.tc.ns += ns;
+        t.sleeps += 1;
+        if (t.bh) |bh| {
+            if (t.sleeps == t.release_after) bh.release();
+        }
+    }
+};
+
+test "Bulkhead: N acquires succeed, N+1 rejects immediately (non-blocking); release frees" {
+    var bh: Bulkhead = .init(.{ .max_concurrent = 3 });
+    try testing.expectEqual(0, bh.activeCount());
+    try testing.expectEqual(3, bh.availableSlots());
+
+    try bh.acquire();
+    try bh.acquire();
+    try bh.acquire();
+    try testing.expectEqual(3, bh.activeCount());
+    try testing.expectEqual(0, bh.availableSlots());
+
+    // Full: rejects immediately, consumes nothing — repeatably.
+    try testing.expectError(error.BulkheadFull, bh.acquire());
+    try testing.expect(!bh.tryAcquire());
+    try testing.expectError(error.BulkheadFull, bh.acquire());
+    try testing.expectEqual(3, bh.activeCount());
+
+    // One release frees exactly one slot.
+    bh.release();
+    try testing.expectEqual(1, bh.availableSlots());
+    try testing.expect(bh.tryAcquire());
+    try testing.expect(!bh.tryAcquire());
+
+    // Full drain returns to zero and the slots stay reusable.
+    bh.release();
+    bh.release();
+    bh.release();
+    try testing.expectEqual(0, bh.activeCount());
+    try bh.acquire();
+    bh.release();
+}
+
+test "Bulkhead.run: slot released on success AND on the error path; full = fast-fail, op not invoked" {
+    var bh: Bulkhead = .init(.{ .max_concurrent = 1 });
+
+    // Success path: value passes through, slot returned.
+    var ok: ScriptedOp = .{ .script = &.{.{ .result = 7 }} };
+    try testing.expectEqual(7, try bh.run(&ok));
+    try testing.expectEqual(0, bh.activeCount());
+
+    // Error path: the operation's error propagates and the slot is still
+    // returned (release on the error path).
+    var bad: ScriptedOp = .{ .script = &.{.{ .result = error.Boom }} };
+    try testing.expectError(error.Boom, bh.run(&bad));
+    try testing.expectEqual(0, bh.activeCount());
+    try testing.expectEqual(1, bad.calls);
+
+    // Full bulkhead: BulkheadFull without invoking the operation at all.
+    try bh.acquire();
+    var never: ScriptedOp = .{ .script = &.{.{ .result = 9 }} };
+    try testing.expectError(error.BulkheadFull, bh.run(&never));
+    try testing.expectEqual(0, never.calls);
+    bh.release();
+    // And the bulkhead still works after all of the above.
+    try testing.expectEqual(9, try bh.run(&never));
+    try testing.expectEqual(0, bh.activeCount());
+}
+
+test "Bulkhead: bounded wait succeeds when a slot frees within the budget (virtual time)" {
+    var tc: TestClock = .{};
+    var td: BulkheadTestDelay = .{ .tc = &tc };
+    var bh: Bulkhead = .init(.{
+        .max_concurrent = 1,
+        .max_wait_ns = 10 * std.time.ns_per_ms,
+        .poll_ns = 1 * std.time.ns_per_ms,
+        .clock = tc.clock(),
+        .delay = td.delay(),
+    });
+    td.bh = &bh;
+    td.release_after = 3; // a "concurrent" holder releases on the 3rd poll
+
+    try testing.expect(bh.tryAcquire()); // saturate
+    try bh.acquire(); // polls 3 times in virtual time, then takes the slot
+    try testing.expectEqual(3, td.sleeps);
+    try testing.expectEqual(3 * std.time.ns_per_ms, tc.ns); // well inside the budget
+    try testing.expectEqual(1, bh.activeCount()); // handed over, not leaked
+    bh.release();
+}
+
+test "Bulkhead: bounded wait times out with BulkheadFull when nobody releases (virtual time)" {
+    var tc: TestClock = .{};
+    var td: BulkheadTestDelay = .{ .tc = &tc }; // never releases
+    var bh: Bulkhead = .init(.{
+        .max_concurrent = 1,
+        .max_wait_ns = 10 * std.time.ns_per_ms,
+        .poll_ns = 1 * std.time.ns_per_ms,
+        .clock = tc.clock(),
+        .delay = td.delay(),
+    });
+
+    try testing.expect(bh.tryAcquire()); // saturate
+    try testing.expectError(error.BulkheadFull, bh.acquire());
+    try testing.expectEqual(10, td.sleeps); // exactly the budget, poll by poll
+    try testing.expectEqual(10 * std.time.ns_per_ms, tc.ns); // full wait honored
+    try testing.expectEqual(1, bh.activeCount()); // the holder's slot untouched
+    bh.release();
+
+    // The poll is clamped to the remaining budget: a poll_ns larger than
+    // max_wait_ns still times out after exactly one (shortened) sleep.
+    var tc2: TestClock = .{};
+    var td2: BulkheadTestDelay = .{ .tc = &tc2 };
+    var bh2: Bulkhead = .init(.{
+        .max_concurrent = 1,
+        .max_wait_ns = 5 * std.time.ns_per_ms,
+        .poll_ns = 100 * std.time.ns_per_ms,
+        .clock = tc2.clock(),
+        .delay = td2.delay(),
+    });
+    try testing.expect(bh2.tryAcquire());
+    try testing.expectError(error.BulkheadFull, bh2.acquire());
+    try testing.expectEqual(1, td2.sleeps);
+    try testing.expectEqual(5 * std.time.ns_per_ms, tc2.ns);
+    bh2.release();
+}
+
+test "Bulkhead: blocking acquire is handed a slot freed by another thread (real time)" {
+    var bh: Bulkhead = .init(.{
+        .max_concurrent = 1,
+        .max_wait_ns = 30 * std.time.ns_per_s, // success must come via the release
+    });
+    try testing.expect(bh.tryAcquire()); // saturate
+
+    const Releaser = struct {
+        fn run(b: *Bulkhead) void {
+            Delay.blocking.sleep(20 * std.time.ns_per_ms);
+            b.release();
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Releaser.run, .{&bh});
+    defer t.join();
+
+    try bh.acquire(); // woken well before the 30 s budget
+    try testing.expectEqual(1, bh.activeCount());
+    bh.release();
+}
+
+test "Bulkhead: concurrent run() never exceeds max_concurrent and leaks no slot" {
+    const cap = 4;
+    const n_threads = 8;
+    const iters = 10_000;
+
+    var bh: Bulkhead = .init(.{ .max_concurrent = cap });
+
+    const Shared = struct {
+        gauge: std.atomic.Value(i32) = .init(0),
+        violations: std.atomic.Value(u32) = .init(0),
+        successes: std.atomic.Value(u64) = .init(0),
+        rejections: std.atomic.Value(u64) = .init(0),
+    };
+    // The wrapped operation itself audits the in-flight invariant — if run()
+    // ever admits more than `cap` concurrently, the gauge catches it.
+    const GaugeOp = struct {
+        s: *Shared,
+        pub fn call(self: *@This()) error{Never}!u32 {
+            const cur = self.s.gauge.fetchAdd(1, .seq_cst) + 1;
+            if (cur > cap) _ = self.s.violations.fetchAdd(1, .seq_cst);
+            std.atomic.spinLoopHint(); // hold the slot briefly
+            _ = self.s.gauge.fetchSub(1, .seq_cst);
+            return 1;
+        }
+    };
+    const Worker = struct {
+        fn hammer(b: *Bulkhead, s: *Shared) void {
+            for (0..iters) |_| {
+                var op: GaugeOp = .{ .s = s };
+                if (b.run(&op)) |_| {
+                    _ = s.successes.fetchAdd(1, .seq_cst);
+                } else |_| {
+                    _ = s.rejections.fetchAdd(1, .seq_cst);
+                }
+            }
+        }
+    };
+
+    var shared: Shared = .{};
+    var handles: [n_threads]std.Thread = undefined;
+    for (&handles) |*h| h.* = try std.Thread.spawn(.{}, Worker.hammer, .{ &bh, &shared });
+    for (handles) |h| h.join();
+
+    try testing.expectEqual(0, shared.violations.load(.seq_cst));
+    try testing.expectEqual(0, shared.gauge.load(.seq_cst));
+    try testing.expectEqual(0, bh.activeCount()); // every slot came back
+    try testing.expect(shared.successes.load(.seq_cst) > 0);
 }
 
 // ── tests: retry backoff ────────────────────────────────────────────────────

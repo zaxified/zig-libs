@@ -308,8 +308,8 @@ fmt green. **Still open:** request-ID mw · health helper · conditional-req · 
   (JWT/JWKS only if OAuth2/OIDC). Most are **Opus-inline extensions of existing modules**, not new modules.
 
 ### B) App-elevation value-add (Fable) — user-ordered 2026-07-08 (rawsock/data-family/exprcalc removed → extraction)
-1. **MCP HTTP/SSE transport** (small) — D AI-netops remote · 2. **upstream LB + health routing (+bulkhead)**
-(med-large) — C gateway · 3. **SNMP trap receiver + v3** (small-med) — A async alerts · 4. **coap** RFC 7252
+1. **MCP HTTP/SSE transport** (small) — D AI-netops remote · 2. ✅ **upstream LB + health routing (+bulkhead)** DONE (`resilience.Bulkhead` + new `upstream` module: strategies/health/failover; 23 tests)
+— C gateway. Remaining: 3. **SNMP trap receiver + v3** (small-med) — A async alerts · 4. **coap** RFC 7252
 (med) — G IoT · 5. **MQTT broker** (large) — G IoT hub.
 Extraction backlog (Opus, NOT Fable — low/no value-add headroom): `rawsock` (axp `openPacketCapture`
 AF_PACKET layer is REAL) · data-family (dataset/tabular/jsonshape/finstats; **`roquery` has a security-
