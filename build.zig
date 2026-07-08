@@ -68,6 +68,9 @@ const module_list = [_]Module{
     .{ .name = "upstream", .deps = &.{ "resilience", "probe" } },
     .{ .name = "jwt", .deps = &.{ "http", "router" } },
     .{ .name = "rdap", .deps = &.{ "http", "netaddr" } },
+    .{ .name = "blobstore", .deps = &.{"hashdigest"} },
+    .{ .name = "procnet", .deps = &.{"netaddr"} },
+    .{ .name = "procrun" },
     // Scaffold more here (copy modules/_template) — see the candidate catalog
     // in docs/CANDIDATES.md for the full list.
 };
