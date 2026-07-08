@@ -1,41 +1,52 @@
 // SPDX-License-Identifier: MIT
 
 //! jwt — JWT/JWS validator for OAuth2/OIDC resource servers
-//! (RFC 7515 compact JWS serialization + RFC 7519 JWT claims).
+//! (RFC 7515 compact JWS serialization + RFC 7519 JWT claims + RFC 7518
+//! JWA signature algorithms).
 //!
-//! Part 1 scope (this file): compact-token **parsing** into typed models and
-//! **registered-claims validation** (`exp`/`nbf`/`iat`/`iss`/`aud`), with the
-//! raw signing input and signature bytes preserved for the verify step.
+//! Scope so far: compact-token **parsing** into typed models (P1),
+//! **registered-claims validation** (`exp`/`nbf`/`iat`/`iss`/`aud`, P1), and
+//! **JWS signature verification** (P2) for HS256/384/512 (HMAC-SHA-2),
+//! ES256/ES384 (ECDSA P-256/P-384) and EdDSA (Ed25519) — plus the one-call
+//! `parseAndVerify` that chains all three.
 //!
-//! ## SECURITY — NO SIGNATURE VERIFICATION YET (Part 1)
+//! ## SECURITY — `parse()` alone does NOT verify signatures
 //!
-//! `parse()` only *decodes* a token — it does **not** verify the signature.
-//! A `ParsedToken` is **UNTRUSTED, attacker-controlled input** until Part 2's
-//! `verify(parsed, key)` (or the all-in-one `parseAndVerify`) has run.
-//! Never make an authorization decision from a `ParsedToken` alone; anyone
-//! can mint a syntactically valid token with any claims. The parsed
-//! `signing_input` + `signature` + `alg` exist precisely so the verify step
-//! can be layered on without re-parsing.
+//! `parse()` only *decodes* a token. A `ParsedToken` is **UNTRUSTED,
+//! attacker-controlled input** until `verify(parsed, key)` (or the
+//! all-in-one `parseAndVerify`) has run. Never make an authorization
+//! decision from a `ParsedToken` alone; anyone can mint a syntactically
+//! valid token with any claims. The parsed `signing_input` + `signature` +
+//! `alg` exist precisely so the verify step layers on without re-parsing.
 //!
-//! Planned parts: P2 signature verify (HS*/dispatch skeleton) · P3 RSA ·
-//! P4 JWKS key sets · P5 fetch/OIDC discovery · P6 resource-server
-//! middleware.
+//! `verify` implements the RFC 8725 hardening rules: `alg:"none"` is always
+//! rejected (`UnsecuredToken`), and the token's `alg` must match the *type*
+//! of the provided key (`AlgKeyMismatch`) so an attacker cannot downgrade an
+//! asymmetric token to HMAC-with-the-public-key.
+//!
+//! Planned parts: P3 RSA (RS256/…) · P4 JWKS key sets · P5 fetch/OIDC
+//! discovery · P6 resource-server middleware.
 //!
 //! ## Usage
 //!
 //! ```zig
 //! const jwt = @import("jwt");
 //!
-//! var parsed = try jwt.parse(gpa, bearer_token);
-//! defer parsed.deinit();
-//! // parsed is NOT verified — see the security note above.
-//!
-//! try jwt.validateClaims(parsed.claims, .{
+//! // One call: parse → verify signature → validate claims.
+//! var token = try jwt.parseAndVerify(gpa, bearer_token, .{ .hmac = secret }, .{
 //!     .now_s = now_seconds, // caller-supplied clock, no hidden time source
 //!     .issuer = "https://issuer.example",
 //!     .audience = "api://my-service",
 //! });
-//! const scope = parsed.claims.claimStr("scope") orelse "";
+//! defer token.deinit();
+//! const scope = token.claims.claimStr("scope") orelse "";
+//!
+//! // Or step by step (e.g. pick the key from the header's `kid` first):
+//! var parsed = try jwt.parse(gpa, bearer_token);
+//! defer parsed.deinit();
+//! const key = pickKey(parsed.header.kid); // P4 will do this from a JWKS
+//! try jwt.verify(&parsed, key);
+//! try jwt.validateClaims(parsed.claims, .{ .now_s = now_seconds });
 //! ```
 //!
 //! Design notes:
@@ -56,7 +67,7 @@ pub const meta = .{
     .platform = .any,
     .role = .util, // P6 adds the resource-server middleware on top.
     .concurrency = .reentrant,
-    .model_after = "RFC 7515 (JWS) + RFC 7519 (JWT); OAuth2/OIDC resource server",
+    .model_after = "RFC 7515 (JWS) + RFC 7519 (JWT) + RFC 7518 (JWA) verify, RFC 8725 hardening; OAuth2/OIDC resource server",
     .deps = .{},
 };
 
@@ -347,6 +358,170 @@ pub fn validateClaims(claims: Claims, opts: Options) ValidateError!void {
     if (opts.audience) |want| {
         if (!claims.aud.contains(want)) return error.AudienceMismatch;
     }
+}
+
+// ── signature verification (RFC 7515 §5.2, RFC 7518, RFC 8037) ─────────────
+
+/// std signature schemes re-exported so callers (and P4's JWKS) can name the
+/// key types without spelling out the std.crypto paths.
+pub const EcdsaP256Sha256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+pub const EcdsaP384Sha384 = std.crypto.sign.ecdsa.EcdsaP384Sha384;
+pub const Ed25519 = std.crypto.sign.Ed25519;
+
+const hmac_sha2 = std.crypto.auth.hmac.sha2;
+
+/// Errors from the `Key` constructors: the bytes do not encode a valid key
+/// (point not on the curve, non-canonical encoding, …).
+pub const KeyError = error{InvalidKey};
+
+/// A verification key. The union *tag* is part of the security model: the
+/// token's `alg` must match the key's type (see `verify`), which is what
+/// blocks the classic RS/ES→HS256 algorithm-confusion downgrade
+/// (RFC 8725 §2.1). Part 3 adds `.rsa`; Part 4 builds these from JWKS
+/// entries (`kty`/`crv`/`x`/`y`/`k`).
+pub const Key = union(enum) {
+    /// Symmetric HMAC secret for HS256/HS384/HS512. Borrowed, not copied —
+    /// must outlive the `verify` call (it always does; `verify` returns
+    /// before control leaves the caller).
+    hmac: []const u8,
+    /// P-256 public key for ES256.
+    ecdsa_p256: EcdsaP256Sha256.PublicKey,
+    /// P-384 public key for ES384.
+    ecdsa_p384: EcdsaP384Sha384.PublicKey,
+    /// Ed25519 public key for EdDSA (RFC 8037).
+    ed25519: Ed25519.PublicKey,
+
+    /// P-256 key from raw big-endian affine coordinates — exactly a JWK's
+    /// decoded `x`/`y` (RFC 7518 §6.2.1).
+    pub fn ecdsaP256FromCoords(x: [32]u8, y: [32]u8) KeyError!Key {
+        var sec1: [65]u8 = undefined;
+        sec1[0] = 0x04; // uncompressed SEC1 point
+        @memcpy(sec1[1..33], &x);
+        @memcpy(sec1[33..65], &y);
+        const pk = EcdsaP256Sha256.PublicKey.fromSec1(&sec1) catch return error.InvalidKey;
+        return .{ .ecdsa_p256 = pk };
+    }
+
+    /// P-384 key from raw big-endian affine coordinates (JWK `x`/`y`).
+    pub fn ecdsaP384FromCoords(x: [48]u8, y: [48]u8) KeyError!Key {
+        var sec1: [97]u8 = undefined;
+        sec1[0] = 0x04;
+        @memcpy(sec1[1..49], &x);
+        @memcpy(sec1[49..97], &y);
+        const pk = EcdsaP384Sha384.PublicKey.fromSec1(&sec1) catch return error.InvalidKey;
+        return .{ .ecdsa_p384 = pk };
+    }
+
+    /// Ed25519 key from its 32-byte encoding — a JWK's decoded `x`
+    /// (RFC 8037 §2).
+    pub fn ed25519FromBytes(bytes: [32]u8) KeyError!Key {
+        const pk = Ed25519.PublicKey.fromBytes(bytes) catch return error.InvalidKey;
+        return .{ .ed25519 = pk };
+    }
+};
+
+/// Errors from `verify`. Signature/key bytes never panic — every failure
+/// shape maps to one of these.
+pub const VerifyError = error{
+    /// `alg: "none"` — always rejected, key or no key (RFC 8725 §2.1).
+    UnsecuredToken,
+    /// The token's `alg` does not match the provided key's type (e.g. an
+    /// HS256 token offered an EC/Ed public key, or ES256 vs a P-384 key).
+    AlgKeyMismatch,
+    /// `alg` is unrecognized, or recognized but not implemented here
+    /// (RS*/PS* until Part 3; ES512 — std.crypto has no P-521).
+    UnsupportedAlg,
+    /// The signature has the wrong length for the alg, or does not verify
+    /// over `signing_input`.
+    BadSignature,
+    /// The key itself is unusable (e.g. an empty HMAC secret).
+    InvalidKey,
+};
+
+/// Verify `parsed.signature` over `parsed.signing_input` with `key`
+/// (RFC 7515 §5.2). Constant-time comparison for HMAC; JWS ECDSA signatures
+/// are the raw fixed-width `R‖S` concatenation (RFC 7518 §3.4), NOT DER.
+///
+/// This checks the signature ONLY — pair it with `validateClaims` (or use
+/// `parseAndVerify`, which chains parse → verify → validateClaims).
+pub fn verify(parsed: *const ParsedToken, key: Key) VerifyError!void {
+    switch (parsed.alg) {
+        .none => return error.UnsecuredToken,
+        .unknown => return error.UnsupportedAlg,
+        // Part 3 (RSA). PS* needs RSA-PSS; ES512 needs P-521 (not in std).
+        .RS256, .RS384, .RS512, .PS256, .PS384, .PS512, .ES512 => return error.UnsupportedAlg,
+        .HS256 => try verifyHmac(hmac_sha2.HmacSha256, parsed, key),
+        .HS384 => try verifyHmac(hmac_sha2.HmacSha384, parsed, key),
+        .HS512 => try verifyHmac(hmac_sha2.HmacSha512, parsed, key),
+        .ES256 => switch (key) {
+            .ecdsa_p256 => |pk| try verifyEcdsa(EcdsaP256Sha256, pk, parsed),
+            else => return error.AlgKeyMismatch,
+        },
+        .ES384 => switch (key) {
+            .ecdsa_p384 => |pk| try verifyEcdsa(EcdsaP384Sha384, pk, parsed),
+            else => return error.AlgKeyMismatch,
+        },
+        .EdDSA => switch (key) {
+            .ed25519 => |pk| {
+                if (parsed.signature.len != Ed25519.Signature.encoded_length)
+                    return error.BadSignature;
+                const sig: Ed25519.Signature = .fromBytes(parsed.signature[0..Ed25519.Signature.encoded_length].*);
+                sig.verify(parsed.signing_input, pk) catch return error.BadSignature;
+            },
+            else => return error.AlgKeyMismatch,
+        },
+    }
+}
+
+/// Errors from the one-call `parseAndVerify`.
+pub const ParseAndVerifyError = ParseError || VerifyError || ValidateError;
+
+/// The one-call API: parse (P1) → verify signature (P2) → validate claims
+/// (P1). Returns the token only when ALL THREE pass; on any failure the
+/// partially built token is freed and the typed error returned. Order
+/// matters: the signature is checked before any claim is trusted.
+pub fn parseAndVerify(
+    gpa: std.mem.Allocator,
+    token: []const u8,
+    key: Key,
+    claim_opts: Options,
+) ParseAndVerifyError!ParsedToken {
+    var parsed = try parse(gpa, token);
+    errdefer parsed.deinit();
+    try verify(&parsed, key);
+    try validateClaims(parsed.claims, claim_opts);
+    return parsed;
+}
+
+/// HS256/384/512: recompute the MAC over the signing input and compare in
+/// constant time (std.crypto.timing_safe — never std.mem.eql on a MAC).
+fn verifyHmac(comptime Mac: type, parsed: *const ParsedToken, key: Key) VerifyError!void {
+    const secret = switch (key) {
+        .hmac => |s| s,
+        else => return error.AlgKeyMismatch,
+    };
+    // An empty secret would make every attacker-computable MAC "valid".
+    if (secret.len == 0) return error.InvalidKey;
+    // Length is public information — checking it early leaks nothing.
+    if (parsed.signature.len != Mac.mac_length) return error.BadSignature;
+    var expected: [Mac.mac_length]u8 = undefined;
+    Mac.create(&expected, parsed.signing_input, secret);
+    if (!std.crypto.timing_safe.eql(
+        [Mac.mac_length]u8,
+        expected,
+        parsed.signature[0..Mac.mac_length].*,
+    )) return error.BadSignature;
+}
+
+/// ES256/ES384: the JWS signature is the raw fixed-width big-endian `R‖S`
+/// (32+32 for P-256, 48+48 for P-384; RFC 7518 §3.4) — `Signature.fromBytes`
+/// takes exactly that layout. Any crypto-level rejection (non-canonical
+/// scalar, identity element, mismatch) is `BadSignature`.
+fn verifyEcdsa(comptime Scheme: type, public_key: Scheme.PublicKey, parsed: *const ParsedToken) VerifyError!void {
+    const sig_len = Scheme.Signature.encoded_length;
+    if (parsed.signature.len != sig_len) return error.BadSignature;
+    const sig: Scheme.Signature = .fromBytes(parsed.signature[0..sig_len].*);
+    sig.verify(parsed.signing_input, public_key) catch return error.BadSignature;
 }
 
 // ── internals ───────────────────────────────────────────────────────────────
@@ -862,4 +1037,452 @@ test "garbage sweep: arbitrary bytes never panic" {
             owned.deinit(); // astronomically unlikely, but must not leak
         } else |_| {}
     }
+}
+
+// ── tests: signature verification (Part 2) ──────────────────────────────────
+
+/// base64url-decode a test constant into `buf` (test-only; asserts validity).
+fn b64uDecode(buf: []u8, s: []const u8) []const u8 {
+    const decoder = std.base64.url_safe_no_pad.Decoder;
+    const n = decoder.calcSizeForSlice(s) catch unreachable;
+    decoder.decode(buf[0..n], s) catch unreachable;
+    return buf[0..n];
+}
+
+/// Encode `b64url(header) '.' b64url(payload)` into `buf`; returns the
+/// signing-input slice. Sign it, then call `finishToken`.
+fn signingInputInto(buf: []u8, header_json: []const u8, payload_json: []const u8) []const u8 {
+    const enc = std.base64.url_safe_no_pad.Encoder;
+    var w: usize = 0;
+    w += enc.encode(buf[w..], header_json).len;
+    buf[w] = '.';
+    w += 1;
+    w += enc.encode(buf[w..], payload_json).len;
+    return buf[0..w];
+}
+
+/// Append `'.' b64url(sig)` after the signing input already in `buf`.
+fn finishToken(buf: []u8, signing_input_len: usize, sig: []const u8) []const u8 {
+    const enc = std.base64.url_safe_no_pad.Encoder;
+    buf[signing_input_len] = '.';
+    const n = enc.encode(buf[signing_input_len + 1 ..], sig).len;
+    return buf[0 .. signing_input_len + 1 + n];
+}
+
+/// RFC 7515 §A.1.1 HMAC key (the JWK's `k` member, base64url).
+const rfc7515_a1_hmac_key_b64 =
+    "AyM1SysPpbyDfgZld3umj1qzKObwVMkoqQ-EstJQLr_T-1qS0gZH75aKtMN3Yj0iPS4hcgUuTwjAzZr1Z9CAow";
+
+test "verify: RFC 7515 A.1 HS256 known-answer token" {
+    var key_buf: [64]u8 = undefined;
+    const secret = b64uDecode(&key_buf, rfc7515_a1_hmac_key_b64);
+    const key: Key = .{ .hmac = secret };
+
+    // The exact RFC token (== rfc7519_example_token) verifies.
+    var parsed = try parse(testing.allocator, rfc7519_example_token);
+    defer parsed.deinit();
+    try verify(&parsed, key);
+
+    // Wrong secret → BadSignature.
+    try testing.expectError(error.BadSignature, verify(&parsed, .{ .hmac = "wrong-secret" }));
+
+    // One flipped signature byte → BadSignature (flip a mid-signature base64
+    // char so the segment stays valid base64url).
+    var tampered_buf: [256]u8 = undefined;
+    const tampered = tampered_buf[0..rfc7519_example_token.len];
+    @memcpy(tampered, rfc7519_example_token);
+    const last_dot = std.mem.lastIndexOfScalar(u8, tampered, '.').?;
+    tampered[last_dot + 5] = if (tampered[last_dot + 5] == 'A') 'B' else 'A';
+    var p_tampered = try parse(testing.allocator, tampered);
+    defer p_tampered.deinit();
+    try testing.expectError(error.BadSignature, verify(&p_tampered, key));
+
+    // Truncated signature (wrong length for HS256) → BadSignature.
+    const truncated = rfc7519_example_token[0 .. rfc7519_example_token.len - 8];
+    var p_trunc = try parse(testing.allocator, truncated);
+    defer p_trunc.deinit();
+    try testing.expectError(error.BadSignature, verify(&p_trunc, key));
+}
+
+test "verify: RFC 7515 A.3 ES256 known-answer token" {
+    // RFC 7515 §A.3.1 public key (JWK x/y) and §A.3.1/§A.3.3 token.
+    var x_buf: [32]u8 = undefined;
+    var y_buf: [32]u8 = undefined;
+    _ = b64uDecode(&x_buf, "f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU");
+    _ = b64uDecode(&y_buf, "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0");
+    const key = try Key.ecdsaP256FromCoords(x_buf, y_buf);
+
+    const token =
+        "eyJhbGciOiJFUzI1NiJ9" ++
+        "." ++
+        "eyJpc3MiOiJqb2UiLA0KICJleHAiOjEzMDA4MTkzODAsDQogImh0dHA6Ly9leGFtcGxlLmNvbS9pc19yb290Ijp0cnVlfQ" ++
+        "." ++
+        "DtEhU3ljbEg8L38VWAfUAqOyKAM6-Xx-F4GawxaepmXFCgfTjDxw5djxLa8ISlSApmWQxfKTUJqPP3-Kg6NU1Q";
+    var parsed = try parse(testing.allocator, token);
+    defer parsed.deinit();
+    try testing.expectEqual(Alg.ES256, parsed.alg);
+    try verify(&parsed, key);
+
+    // Same signature over a tampered payload → BadSignature.
+    var buf: [512]u8 = undefined;
+    var sig_buf: [64]u8 = undefined;
+    const si = signingInputInto(&buf,
+        \\{"alg":"ES256"}
+    ,
+        \\{"iss":"mallory","exp":1300819380}
+    );
+    const forged = finishToken(&buf, si.len, b64uDecode(&sig_buf, "DtEhU3ljbEg8L38VWAfUAqOyKAM6-Xx-F4GawxaepmXFCgfTjDxw5djxLa8ISlSApmWQxfKTUJqPP3-Kg6NU1Q"));
+    var p_forged = try parse(testing.allocator, forged);
+    defer p_forged.deinit();
+    try testing.expectError(error.BadSignature, verify(&p_forged, key));
+}
+
+test "verify: RFC 8037 A.4 Ed25519 known-answer signature" {
+    // RFC 8037's JWS payload is the plain string "Example of Ed25519
+    // signing" — not a JSON claims object — so it cannot go through
+    // `parse`; exercise `verify` directly on a hand-built ParsedToken
+    // (verify only reads alg/signing_input/signature).
+    var x_buf: [32]u8 = undefined;
+    _ = b64uDecode(&x_buf, "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo");
+    const key = try Key.ed25519FromBytes(x_buf);
+
+    var sig_buf: [64]u8 = undefined;
+    const sig = b64uDecode(&sig_buf, "hgyY0il_MGCjP0JzlnLWG1PPOt7-09PGcvMg3AIbQR6dWbhijcNR4ki4iylGjg5BhVsPt9g7sVvpAr_MuM0KAg");
+    const signing_input = "eyJhbGciOiJFZERTQSJ9.RXhhbXBsZSBvZiBFZDI1NTE5IHNpZ25pbmc";
+
+    var kat: ParsedToken = .{
+        .header = .{ .alg = "EdDSA" },
+        .claims = .{ .raw = .null },
+        .signing_input = signing_input,
+        .signature = sig,
+        .alg = .EdDSA,
+        .arena = undefined, // never deinit'd; verify does not touch it
+    };
+    try verify(&kat, key);
+
+    // Flip one signature byte → BadSignature.
+    sig_buf[7] ^= 0x01;
+    try testing.expectError(error.BadSignature, verify(&kat, key));
+    sig_buf[7] ^= 0x01;
+    // Flip the signing input instead → BadSignature.
+    kat.signing_input = "eyJhbGciOiJFZERTQSJ9.RXhhbXBsZSBvZiBFZDI1NTE5IHNpZ25pbmd";
+    try testing.expectError(error.BadSignature, verify(&kat, key));
+}
+
+test "verify: HS384/HS512 round-trip, cross-length rejection" {
+    const secret = "another-shared-secret-of-decent-length";
+
+    inline for (.{
+        .{ hmac_sha2.HmacSha384, "HS384" },
+        .{ hmac_sha2.HmacSha512, "HS512" },
+    }) |case| {
+        const Mac = case[0];
+        var buf: [512]u8 = undefined;
+        const si = signingInputInto(&buf, "{\"alg\":\"" ++ case[1] ++ "\"}",
+            \\{"exp":1000,"iss":"joe"}
+        );
+        var mac: [Mac.mac_length]u8 = undefined;
+        Mac.create(&mac, si, secret);
+        const token = finishToken(&buf, si.len, &mac);
+
+        var parsed = try parse(testing.allocator, token);
+        defer parsed.deinit();
+        try verify(&parsed, .{ .hmac = secret });
+        try testing.expectError(error.BadSignature, verify(&parsed, .{ .hmac = "not-it" }));
+        // Empty HMAC secret is never usable.
+        try testing.expectError(error.InvalidKey, verify(&parsed, .{ .hmac = "" }));
+    }
+
+    // An HS384-length MAC on an HS512 token is a length mismatch.
+    var buf: [512]u8 = undefined;
+    const si = signingInputInto(&buf,
+        \\{"alg":"HS512"}
+    ,
+        \\{"exp":1000}
+    );
+    var mac384: [hmac_sha2.HmacSha384.mac_length]u8 = undefined;
+    hmac_sha2.HmacSha384.create(&mac384, si, secret);
+    const token = finishToken(&buf, si.len, &mac384);
+    var parsed = try parse(testing.allocator, token);
+    defer parsed.deinit();
+    try testing.expectError(error.BadSignature, verify(&parsed, .{ .hmac = secret }));
+}
+
+test "verify: ES256/ES384 generated round-trip, tampering" {
+    inline for (.{
+        .{ EcdsaP256Sha256, "ES256", Alg.ES256 },
+        .{ EcdsaP384Sha384, "ES384", Alg.ES384 },
+    }) |case| {
+        const Scheme = case[0];
+        const kp = try Scheme.KeyPair.generateDeterministic(
+            [_]u8{0x42} ** Scheme.KeyPair.seed_length,
+        );
+        // Wrap via the coords constructor — the same path P4's JWK takes.
+        const sec1 = kp.public_key.toUncompressedSec1();
+        const fe_len = (sec1.len - 1) / 2;
+        const key = if (fe_len == 32)
+            try Key.ecdsaP256FromCoords(sec1[1..33].*, sec1[33..65].*)
+        else
+            try Key.ecdsaP384FromCoords(sec1[1..49].*, sec1[49..97].*);
+
+        var buf: [512]u8 = undefined;
+        const si = signingInputInto(&buf, "{\"alg\":\"" ++ case[1] ++ "\"}",
+            \\{"exp":1000,"iss":"joe","scope":"read"}
+        );
+        const sig = try kp.sign(si, null);
+        const sig_bytes = sig.toBytes(); // raw fixed-width R‖S — JWS layout
+        const token = finishToken(&buf, si.len, &sig_bytes);
+
+        var parsed = try parse(testing.allocator, token);
+        defer parsed.deinit();
+        try testing.expectEqual(case[2], parsed.alg);
+        try verify(&parsed, key);
+
+        // Same signature over a different payload → BadSignature.
+        var buf2: [512]u8 = undefined;
+        const si2 = signingInputInto(&buf2, "{\"alg\":\"" ++ case[1] ++ "\"}",
+            \\{"exp":1000,"iss":"joe","scope":"admin"}
+        );
+        const forged = finishToken(&buf2, si2.len, &sig_bytes);
+        var p_forged = try parse(testing.allocator, forged);
+        defer p_forged.deinit();
+        try testing.expectError(error.BadSignature, verify(&p_forged, key));
+
+        // Corrupted signature byte → BadSignature.
+        var bad_sig = sig_bytes;
+        bad_sig[10] ^= 0x01;
+        var buf3: [512]u8 = undefined;
+        const si3 = signingInputInto(&buf3, "{\"alg\":\"" ++ case[1] ++ "\"}",
+            \\{"exp":1000,"iss":"joe","scope":"read"}
+        );
+        const corrupted = finishToken(&buf3, si3.len, &bad_sig);
+        var p_corrupted = try parse(testing.allocator, corrupted);
+        defer p_corrupted.deinit();
+        try testing.expectError(error.BadSignature, verify(&p_corrupted, key));
+
+        // A different keypair's key → BadSignature.
+        const other = try Scheme.KeyPair.generateDeterministic(
+            [_]u8{0x43} ** Scheme.KeyPair.seed_length,
+        );
+        const other_key = switch (Scheme) {
+            EcdsaP256Sha256 => Key{ .ecdsa_p256 = other.public_key },
+            EcdsaP384Sha384 => Key{ .ecdsa_p384 = other.public_key },
+            else => unreachable,
+        };
+        try testing.expectError(error.BadSignature, verify(&parsed, other_key));
+    }
+}
+
+test "verify: EdDSA generated round-trip through a full token" {
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x24} ** 32);
+    const key = try Key.ed25519FromBytes(kp.public_key.toBytes());
+
+    var buf: [512]u8 = undefined;
+    const si = signingInputInto(&buf,
+        \\{"alg":"EdDSA"}
+    ,
+        \\{"exp":1000,"sub":"user-1"}
+    );
+    const sig = try kp.sign(si, null);
+    const sig_bytes = sig.toBytes();
+    const token = finishToken(&buf, si.len, &sig_bytes);
+
+    var parsed = try parse(testing.allocator, token);
+    defer parsed.deinit();
+    try testing.expectEqual(Alg.EdDSA, parsed.alg);
+    try verify(&parsed, key);
+
+    // Tampered payload under the same signature → BadSignature.
+    var buf2: [512]u8 = undefined;
+    const si2 = signingInputInto(&buf2,
+        \\{"alg":"EdDSA"}
+    ,
+        \\{"exp":1000,"sub":"user-2"}
+    );
+    const forged = finishToken(&buf2, si2.len, &sig_bytes);
+    var p_forged = try parse(testing.allocator, forged);
+    defer p_forged.deinit();
+    try testing.expectError(error.BadSignature, verify(&p_forged, key));
+
+    // A different keypair's public key → BadSignature.
+    const other = try Ed25519.KeyPair.generateDeterministic([_]u8{0x25} ** 32);
+    try testing.expectError(error.BadSignature, verify(&parsed, .{ .ed25519 = other.public_key }));
+}
+
+test "verify: alg none is always rejected, key or no key (RFC 8725 §2.1)" {
+    const unsecured = "eyJhbGciOiJub25lIn0.eyJpc3MiOiJqb2UifQ.";
+    var parsed = try parse(testing.allocator, unsecured);
+    defer parsed.deinit();
+
+    try testing.expectError(error.UnsecuredToken, verify(&parsed, .{ .hmac = "secret" }));
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{7} ** 32);
+    try testing.expectError(error.UnsecuredToken, verify(&parsed, .{ .ed25519 = kp.public_key }));
+}
+
+test "verify: alg confusion — token alg must match the key type" {
+    const ed_kp = try Ed25519.KeyPair.generateDeterministic([_]u8{9} ** 32);
+    const ec256_kp = try EcdsaP256Sha256.KeyPair.generateDeterministic([_]u8{9} ** 32);
+    const ec384_kp = try EcdsaP384Sha384.KeyPair.generateDeterministic([_]u8{9} ** 48);
+
+    // The RFC 8725 §2.1 downgrade: attacker takes a server that holds an
+    // asymmetric PUBLIC key, mints an HS256 token HMAC'd with those public
+    // key bytes. The tag check must refuse before any MAC math happens.
+    const pub_bytes = ed_kp.public_key.toBytes();
+    var buf: [512]u8 = undefined;
+    const si = signingInputInto(&buf,
+        \\{"alg":"HS256"}
+    ,
+        \\{"exp":1000,"admin":true}
+    );
+    var mac: [32]u8 = undefined;
+    hmac_sha2.HmacSha256.create(&mac, si, &pub_bytes);
+    const hs_token = finishToken(&buf, si.len, &mac);
+    var hs_parsed = try parse(testing.allocator, hs_token);
+    defer hs_parsed.deinit();
+    try testing.expectError(error.AlgKeyMismatch, verify(&hs_parsed, .{ .ed25519 = ed_kp.public_key }));
+    try testing.expectError(error.AlgKeyMismatch, verify(&hs_parsed, .{ .ecdsa_p256 = ec256_kp.public_key }));
+    try testing.expectError(error.AlgKeyMismatch, verify(&hs_parsed, .{ .ecdsa_p384 = ec384_kp.public_key }));
+
+    // Asymmetric algs offered an HMAC key (or the wrong curve) also refuse.
+    var buf2: [512]u8 = undefined;
+    inline for (.{ "ES256", "ES384", "EdDSA" }) |alg_name| {
+        const si2 = signingInputInto(&buf2, "{\"alg\":\"" ++ alg_name ++ "\"}",
+            \\{"exp":1000}
+        );
+        const t = finishToken(&buf2, si2.len, "dummy-signature-bytes");
+        var p = try parse(testing.allocator, t);
+        defer p.deinit();
+        try testing.expectError(error.AlgKeyMismatch, verify(&p, .{ .hmac = "secret" }));
+    }
+    // Right family, wrong curve.
+    const si3 = signingInputInto(&buf2,
+        \\{"alg":"ES256"}
+    ,
+        \\{"exp":1000}
+    );
+    const es_token = finishToken(&buf2, si3.len, "dummy-signature-bytes");
+    var es_parsed = try parse(testing.allocator, es_token);
+    defer es_parsed.deinit();
+    try testing.expectError(error.AlgKeyMismatch, verify(&es_parsed, .{ .ecdsa_p384 = ec384_kp.public_key }));
+    try testing.expectError(error.AlgKeyMismatch, verify(&es_parsed, .{ .ed25519 = ed_kp.public_key }));
+}
+
+test "verify: unknown and not-yet-supported algs → UnsupportedAlg" {
+    var buf: [512]u8 = undefined;
+    inline for (.{ "XS999", "RS256", "RS512", "PS256", "ES512" }) |alg_name| {
+        const si = signingInputInto(&buf, "{\"alg\":\"" ++ alg_name ++ "\"}",
+            \\{"exp":1000}
+        );
+        const token = finishToken(&buf, si.len, "some-signature");
+        var parsed = try parse(testing.allocator, token);
+        defer parsed.deinit();
+        try testing.expectError(error.UnsupportedAlg, verify(&parsed, .{ .hmac = "secret" }));
+    }
+}
+
+test "verify: wrong-length or garbage signatures never panic" {
+    const ec_kp = try EcdsaP256Sha256.KeyPair.generateDeterministic([_]u8{1} ** 32);
+    const ed_kp = try Ed25519.KeyPair.generateDeterministic([_]u8{1} ** 32);
+    const ec_key: Key = .{ .ecdsa_p256 = ec_kp.public_key };
+    const ed_key: Key = .{ .ed25519 = ed_kp.public_key };
+
+    var buf: [512]u8 = undefined;
+    // Truncated (63), oversized (65), empty, and garbage-but-right-length
+    // (64) signatures for ES256; same lengths against EdDSA.
+    inline for (.{ "ES256", "EdDSA" }) |alg_name| {
+        const key = if (comptime std.mem.eql(u8, alg_name, "ES256")) ec_key else ed_key;
+        inline for (.{ 0, 1, 63, 65, 96, 128 }) |bad_len| {
+            const si = signingInputInto(&buf, "{\"alg\":\"" ++ alg_name ++ "\"}",
+                \\{"exp":1000}
+            );
+            const token = finishToken(&buf, si.len, &([_]u8{0xAB} ** bad_len));
+            var parsed = try parse(testing.allocator, token);
+            defer parsed.deinit();
+            try testing.expectError(error.BadSignature, verify(&parsed, key));
+        }
+        // Right length, arbitrary bytes: rejected, not a panic.
+        const si = signingInputInto(&buf, "{\"alg\":\"" ++ alg_name ++ "\"}",
+            \\{"exp":1000}
+        );
+        const token = finishToken(&buf, si.len, &([_]u8{0xAB} ** 64));
+        var parsed = try parse(testing.allocator, token);
+        defer parsed.deinit();
+        try testing.expectError(error.BadSignature, verify(&parsed, key));
+    }
+
+    // ES384 with an ES256-length signature.
+    const si = signingInputInto(&buf,
+        \\{"alg":"ES384"}
+    ,
+        \\{"exp":1000}
+    );
+    const token = finishToken(&buf, si.len, &([_]u8{0xCD} ** 64));
+    var parsed = try parse(testing.allocator, token);
+    defer parsed.deinit();
+    const ec384_kp = try EcdsaP384Sha384.KeyPair.generateDeterministic([_]u8{1} ** 48);
+    try testing.expectError(error.BadSignature, verify(&parsed, .{ .ecdsa_p384 = ec384_kp.public_key }));
+}
+
+test "Key constructors: invalid key bytes → InvalidKey, never a panic" {
+    // (0,0) is not on P-256/P-384 (b != 0), and all-0xFF exceeds the field.
+    try testing.expectError(error.InvalidKey, Key.ecdsaP256FromCoords([_]u8{0} ** 32, [_]u8{0} ** 32));
+    try testing.expectError(error.InvalidKey, Key.ecdsaP256FromCoords([_]u8{0xFF} ** 32, [_]u8{0xFF} ** 32));
+    try testing.expectError(error.InvalidKey, Key.ecdsaP384FromCoords([_]u8{0} ** 48, [_]u8{0} ** 48));
+    try testing.expectError(error.InvalidKey, Key.ecdsaP384FromCoords([_]u8{0xFF} ** 48, [_]u8{0xFF} ** 48));
+    // Non-canonical Ed25519 encoding.
+    try testing.expectError(error.InvalidKey, Key.ed25519FromBytes([_]u8{0xFF} ** 32));
+}
+
+test "parseAndVerify: end-to-end happy path and each failure stage" {
+    const gpa = testing.allocator;
+    const secret = "shared-secret-for-the-e2e-test";
+
+    var buf: [512]u8 = undefined;
+    const si = signingInputInto(&buf,
+        \\{"alg":"HS256"}
+    ,
+        \\{"iss":"https://issuer.example","aud":"api://svc","exp":2000,"scope":"read write"}
+    );
+    var mac: [32]u8 = undefined;
+    hmac_sha2.HmacSha256.create(&mac, si, secret);
+    const token = finishToken(&buf, si.len, &mac);
+
+    // Good token + key + claims → the one call succeeds.
+    var verified = try parseAndVerify(gpa, token, .{ .hmac = secret }, .{
+        .now_s = 1000,
+        .issuer = "https://issuer.example",
+        .audience = "api://svc",
+    });
+    defer verified.deinit();
+    try testing.expectEqualStrings("read write", verified.claims.claimStr("scope").?);
+
+    // Bad signature → BadSignature (and no leak — testing.allocator checks).
+    try testing.expectError(error.BadSignature, parseAndVerify(
+        gpa,
+        token,
+        .{ .hmac = "wrong" },
+        .{ .now_s = 1000 },
+    ));
+    // Wrong key type → AlgKeyMismatch.
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{3} ** 32);
+    try testing.expectError(error.AlgKeyMismatch, parseAndVerify(
+        gpa,
+        token,
+        .{ .ed25519 = kp.public_key },
+        .{ .now_s = 1000 },
+    ));
+    // Valid signature but expired claims → Expired.
+    try testing.expectError(error.Expired, parseAndVerify(
+        gpa,
+        token,
+        .{ .hmac = secret },
+        .{ .now_s = 5000 },
+    ));
+    // Malformed token → the parse error surfaces unchanged.
+    try testing.expectError(error.MalformedToken, parseAndVerify(
+        gpa,
+        "not-a-token",
+        .{ .hmac = secret },
+        .{ .now_s = 1000 },
+    ));
 }
