@@ -60,6 +60,19 @@ pub const HeadParseError = error{
 
 pub const HeaderEntry = struct { name: []const u8, value: []const u8 };
 
+/// Strict line unwrap for a CRLF-framed head: `raw` is one segment of the
+/// block split on `\n`, and must carry the preceding `\r`. Per RFC 9112 §2.2
+/// a recipient MUST NOT treat a bare LF as a line terminator — accepting one
+/// opens a request-smuggling desync where a front-end and back-end disagree
+/// on message framing. Returns the line with its trailing CR removed, or
+/// `error.MalformedHead` if the CR is missing (a bare-LF terminator). Callers
+/// must skip the trailing empty split (the segment after the final CRLF)
+/// before calling this.
+fn stripCrlf(raw: []const u8) HeadParseError![]const u8 {
+    if (raw.len == 0 or raw[raw.len - 1] != '\r') return error.MalformedHead;
+    return raw[0 .. raw.len - 1];
+}
+
 /// Strict header-line split (no obs-fold, no whitespace around the name);
 /// the value is trimmed of optional whitespace. `line` must be non-empty and
 /// already stripped of its line ending.
@@ -239,12 +252,14 @@ pub const RequestHead = struct {
     /// `Expect: 100-continue` was sent.
     expect_continue: bool = false,
 
-    /// Parse a raw head block as produced by `readHead` (lenient about bare
-    /// `\n` line endings; strict about syntax — same header rules as
-    /// `ResponseHead.parse`, plus: single Host only, method must be a token).
+    /// Parse a raw head block as produced by `readHead`. Strict about line
+    /// endings: every line MUST be CRLF-terminated — a bare LF is rejected as
+    /// `error.MalformedHead` (RFC 9112 §2.2, request-smuggling hardening; see
+    /// `stripCrlf`). Strict about syntax too — same header rules as
+    /// `ResponseHead.parse`, plus: single Host only, method must be a token.
     pub fn parse(block: []const u8) HeadParseError!RequestHead {
         var lines = std.mem.splitScalar(u8, block, '\n');
-        const request_line = trimLineEnd(lines.next() orelse return error.MalformedHead);
+        const request_line = try stripCrlf(lines.next() orelse return error.MalformedHead);
 
         // "METHOD SP request-target SP HTTP/1.x"
         const sp1 = std.mem.indexOfScalar(u8, request_line, ' ') orelse return error.MalformedHead;
@@ -272,8 +287,9 @@ pub const RequestHead = struct {
         };
 
         while (lines.next()) |raw| {
-            const line = trimLineEnd(raw);
-            if (line.len == 0) continue; // tolerate a trailing empty split
+            if (raw.len == 0) continue; // trailing empty split after the final CRLF
+            const line = try stripCrlf(raw); // bare-LF terminator → MalformedHead
+            if (line.len == 0) continue; // tolerate a stray blank CRLF line
             const entry = try parseHeaderLine(line);
 
             if (std.ascii.eqlIgnoreCase(entry.name, "content-length")) {
@@ -666,12 +682,28 @@ test "RequestHead.parse: malformed heads never panic" {
         "GET / HTTP/1.1\r\nContent-Length: 12x\r\n",
         "GET / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 6\r\n",
         "GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n", // duplicate Host
+        "GET / HTTP/1.1\nHost: h\r\n", // bare-LF after the request line
+        "GET / HTTP/1.1\r\nHost: h\nAccept: x\r\n", // bare-LF between headers
+        "GET / HTTP/1.1\r\nHost: h\n", // bare-LF terminating the last header
     };
     for (malformed) |m| try testing.expectError(error.MalformedHead, RequestHead.parse(m));
 
     try testing.expectError(error.UnsupportedVersion, RequestHead.parse("GET / HTTP/2.0\r\n"));
     try testing.expectError(error.UnsupportedVersion, RequestHead.parse("GET / HTTP/1.9\r\n"));
     try testing.expectError(error.UnsupportedVersion, RequestHead.parse("PRI * HTTP/2.0\r\n"));
+}
+
+test "RequestHead.parse: bare-LF line endings are rejected (RFC 9112 §2.2)" {
+    // A bare LF anywhere in the head is a request-smuggling vector (a
+    // front-end and back-end can disagree on line framing), so it must be a
+    // hard MalformedHead — the serving loop maps that to 400.
+    try testing.expectError(error.MalformedHead, RequestHead.parse("GET / HTTP/1.1\nHost: h\r\n"));
+    try testing.expectError(error.MalformedHead, RequestHead.parse("GET / HTTP/1.1\r\nHost: h\nAccept: */*\r\n"));
+    try testing.expectError(error.MalformedHead, RequestHead.parse("GET / HTTP/1.1\r\nHost: h\n"));
+    // A well-formed all-CRLF request is unaffected.
+    const ok = try RequestHead.parse("GET / HTTP/1.1\r\nHost: h\r\nAccept: */*\r\n");
+    try testing.expectEqualStrings("h", ok.host.?);
+    try testing.expectEqualStrings("*/*", ok.header("accept").?);
 }
 
 test "RequestHead: duplicate identical Content-Length tolerated" {

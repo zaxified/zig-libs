@@ -1911,6 +1911,25 @@ test "serveStream: malformed request line → golden 400, connection closes" {
     try testing.expectEqual(@as(u32, 0), hits.load(.monotonic));
 }
 
+test "serveStream: bare-LF in the request head → 400, connection closes (smuggling guard)" {
+    var hits: Hits = .init(0);
+    var out_buf: [4096]u8 = undefined;
+    // Bare LF terminating the request line (RFC 9112 §2.2: a recipient MUST
+    // NOT treat it as a line terminator) — answered 400 like any malformed
+    // head, and the pipelined request behind it is never served.
+    const req_line = runStream(&hits, "GET /hello HTTP/1.1\nHost: t\r\n\r\n" ++
+        "GET /hello HTTP/1.1\r\nHost: t\r\n\r\n", &out_buf);
+    try testing.expect(std.mem.startsWith(u8, req_line, "HTTP/1.1 400 Bad Request\r\n"));
+    try testing.expect(std.mem.endsWith(u8, req_line, "Connection: close\r\n\r\nBad Request\n"));
+    try testing.expectEqual(@as(u32, 0), hits.load(.monotonic));
+    // Bare LF between two header lines is rejected the same way.
+    const between = runStream(null, "GET /hello HTTP/1.1\r\nHost: t\nAccept: */*\r\n\r\n", &out_buf);
+    try testing.expect(std.mem.startsWith(u8, between, "HTTP/1.1 400 Bad Request\r\n"));
+    // The all-CRLF control still succeeds.
+    const ok = runStream(null, "GET /hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out_buf);
+    try testing.expect(std.mem.startsWith(u8, ok, "HTTP/1.1 200 OK\r\n"));
+}
+
 test "serveStream: protocol rejections (505, 501, 400s, 431)" {
     var out_buf: [4096]u8 = undefined;
     try testing.expect(std.mem.startsWith(u8, runStream(null, "GET / HTTP/2.0\r\n\r\n", &out_buf), "HTTP/1.1 505 HTTP Version Not Supported\r\n"));
