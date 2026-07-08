@@ -359,6 +359,156 @@ pub fn apply(
     return .{ .outcome = .multiple, .ranges = ranges };
 }
 
+// ── R3: multipart/byteranges body for a multi-range 206 (RFC 7233 §4.1) ──────
+
+/// Assemble a `multipart/byteranges` body (RFC 7233 §4.1, wire form per RFC 2046
+/// §5.1.1) for an `apply` outcome of `.multiple`. R2 resolved the ranges; this
+/// writes the multipart envelope — one body-part per range, each carrying its
+/// own `Content-Type` (the selected representation's media type) and
+/// `Content-Range`. The body-part order matches `ranges` (request order).
+///
+/// Flow after `apply` returns `.multiple`:
+/// ```zig
+/// const mp = http.range.MultipartRanges{ .boundary = boundary, .content_type = "application/pdf" };
+/// try mp.setContentType(rw); // safe: per-thread stable storage (setHeader no-copy)
+/// try mp.writeBody(rw.writer(), applied.ranges, representation);
+/// // The server frames Content-Length from the buffered body automatically. To
+/// // declare it up front (e.g. a streaming body via writePartHeader/writeClose),
+/// // setHeader("Content-Length", <bufPrint of mp.bodyLen(applied.ranges)>) first.
+/// ```
+///
+/// The `boundary` MUST be a token that does not occur in any served byte range
+/// (RFC 2046 §5.1.1); the caller owns choosing a sufficiently unique one (a
+/// random token is the usual choice) and both `boundary` and `content_type`
+/// must outlive the writes. On-wire layout (CRLF shown as ⏎):
+/// ```
+/// --BOUNDARY⏎  Content-Type: CT⏎  Content-Range: bytes s-e/total⏎  ⏎  <bytes>⏎
+/// … repeated … --BOUNDARY--⏎
+/// ```
+pub const MultipartRanges = struct {
+    /// The boundary token (without the leading `--`), e.g. `THIS_STRING_SEPARATES`.
+    boundary: []const u8,
+    /// The selected representation's media type, emitted as each part's
+    /// `Content-Type` (e.g. `application/pdf`, `text/plain`).
+    content_type: []const u8,
+
+    /// Fixed overhead: `"multipart/byteranges; boundary="`.
+    const ct_prefix = "multipart/byteranges; boundary=";
+
+    /// Set the response `Content-Type: multipart/byteranges; boundary=<boundary>`
+    /// header safely — the value is kept in per-thread stable storage. Prefer
+    /// this to `contentType`: `setHeader` stores the value slice WITHOUT copying,
+    /// and the response head is emitted only after the handler returns, so a
+    /// handler-local stack buffer would dangle (Debug may survive it; ReleaseFast
+    /// reuses the slot → a corrupted header). `error.BoundaryTooLong` if the
+    /// boundary exceeds the RFC 2046 §5.1.1 limit of 70 characters.
+    pub fn setContentType(
+        self: MultipartRanges,
+        rw: *Server.ResponseWriter,
+    ) (Server.ResponseWriter.SetHeaderError || error{BoundaryTooLong})!void {
+        const v = self.contentType(&ct_header_buf) catch return error.BoundaryTooLong;
+        try rw.setHeader("Content-Type", v);
+    }
+
+    /// The response `Content-Type` header VALUE:
+    /// `multipart/byteranges; boundary=<boundary>`. Written into `buf`, which
+    /// **must outlive the response** — `setHeader` does not copy, and the head is
+    /// emitted after the handler returns (see `setContentType`, which handles the
+    /// lifetime for you; use this only when you own long-lived storage, e.g. a
+    /// streaming responder). Returns `error.BufferTooSmall` when `buf` is shorter
+    /// than `ct_prefix.len + boundary.len`.
+    pub fn contentType(self: MultipartRanges, buf: []u8) error{BufferTooSmall}![]const u8 {
+        var fw = std.Io.Writer.fixed(buf);
+        fw.writeAll(ct_prefix) catch return error.BufferTooSmall;
+        fw.writeAll(self.boundary) catch return error.BufferTooSmall;
+        return fw.buffered();
+    }
+
+    /// Exact byte length of the body `writeBody` will emit for `ranges` — for a
+    /// `Content-Length` header. Kept in lockstep with `writeBody` (a test asserts
+    /// they agree). Sums, per part, the delimiter + `Content-Type` +
+    /// `Content-Range` header lines + blank line + the range bytes + trailing
+    /// CRLF, plus the closing delimiter.
+    pub fn bodyLen(self: MultipartRanges, ranges: []const ResolvedRange) u64 {
+        var total: u64 = 0;
+        for (ranges) |r| {
+            // "--" boundary CRLF
+            total += 2 + self.boundary.len + 2;
+            // "Content-Type: " content_type CRLF
+            total += 14 + self.content_type.len + 2;
+            // "Content-Range: " "bytes s-e/total" CRLF
+            total += 15 + contentRangeValueLen(r) + 2;
+            // blank CRLF, the range bytes, trailing CRLF
+            total += 2 + r.len() + 2;
+        }
+        // "--" boundary "--" CRLF
+        total += 2 + self.boundary.len + 2 + 2;
+        return total;
+    }
+
+    /// Write the full multipart body, taking each part's bytes from `data`
+    /// (the entire selected representation; `data.len` must equal the `total`
+    /// used to resolve the ranges, so `data[r.start .. r.end + 1]` is in bounds).
+    /// For representations not held in memory, use the lower-level
+    /// `writePartHeader` / `writeClose` and stream each range's bytes yourself.
+    pub fn writeBody(
+        self: MultipartRanges,
+        w: *std.Io.Writer,
+        ranges: []const ResolvedRange,
+        data: []const u8,
+    ) std.Io.Writer.Error!void {
+        for (ranges) |r| {
+            try self.writePartHeader(w, r);
+            try w.writeAll(data[r.start .. r.end + 1]);
+            try w.writeAll("\r\n");
+        }
+        try self.writeClose(w);
+    }
+
+    /// Write one part's delimiter + header lines + the blank line that ends the
+    /// part header (RFC 2046). The caller then writes exactly `r.len()` body
+    /// bytes followed by a CRLF, before the next `writePartHeader` or
+    /// `writeClose`. The leading `--boundary` carries no preceding CRLF — the
+    /// prior part's trailing CRLF serves as the delimiter's leading CRLF, and
+    /// the first part starts the body.
+    pub fn writePartHeader(
+        self: MultipartRanges,
+        w: *std.Io.Writer,
+        r: ResolvedRange,
+    ) std.Io.Writer.Error!void {
+        try w.print("--{s}\r\nContent-Type: {s}\r\nContent-Range: ", .{ self.boundary, self.content_type });
+        try r.writeContentRange(w);
+        try w.writeAll("\r\n\r\n");
+    }
+
+    /// Write the closing delimiter `--boundary--\r\n` after the last part.
+    pub fn writeClose(self: MultipartRanges, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.print("--{s}--\r\n", .{self.boundary});
+    }
+};
+
+// Per-thread stable storage for the multipart Content-Type header value (see
+// `MultipartRanges.setContentType`). Sized for the fixed prefix + the RFC 2046
+// §5.1.1 maximum boundary length (70). One response is served per thread, so a
+// single buffer per thread suffices, as with `apply`'s `content_range_buf`.
+threadlocal var ct_header_buf: [MultipartRanges.ct_prefix.len + 70]u8 = undefined;
+
+/// Decimal length of `bytes s-e/total` (the `Content-Range` value for a resolved
+/// range), used by `bodyLen` without materializing the string.
+fn contentRangeValueLen(r: ResolvedRange) u64 {
+    // "bytes " + start + "-" + end + "/" + total
+    return 6 + decimalLen(r.start) + 1 + decimalLen(r.end) + 1 + decimalLen(r.total);
+}
+
+/// Number of decimal digits in `n` (1 for 0).
+fn decimalLen(n: u64) u64 {
+    if (n == 0) return 1;
+    var v = n;
+    var d: u64 = 0;
+    while (v != 0) : (v /= 10) d += 1;
+    return d;
+}
+
 const testing = std.testing;
 
 test "single absolute range" {
@@ -671,4 +821,161 @@ test "apply: malformed Range ignored → 200 whole body" {
         "Content-Length: 10\r\n" ++
         "\r\n" ++
         "0123456789", got);
+}
+
+// ── R3 tests ─────────────────────────────────────────────────────────────────
+
+test "MultipartRanges.contentType formats the header value" {
+    const mp = MultipartRanges{ .boundary = "SEP", .content_type = "text/plain" };
+    var buf: [96]u8 = undefined;
+    try testing.expectEqualStrings("multipart/byteranges; boundary=SEP", try mp.contentType(&buf));
+    // Buffer exactly large enough succeeds; one short fails.
+    var tight: [34]u8 = undefined; // len("multipart/byteranges; boundary=SEP") == 34
+    try testing.expectEqualStrings("multipart/byteranges; boundary=SEP", try mp.contentType(&tight));
+    var small: [33]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, mp.contentType(&small));
+}
+
+test "MultipartRanges.writeBody: byte-exact multipart/byteranges envelope" {
+    const data = "0123456789"; // total = 10
+    const mp = MultipartRanges{ .boundary = "SEP", .content_type = "text/plain" };
+    var specbuf: [4]ByteRangeSpec = undefined;
+    const specs = try parse("bytes=0-3, -2", &specbuf);
+    var out: [4]ResolvedRange = undefined;
+    const ranges = resolve(specs, data.len, &out);
+    try testing.expectEqual(@as(usize, 2), ranges.len);
+
+    var w: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer w.deinit();
+    try mp.writeBody(&w.writer, ranges, data);
+
+    const expected =
+        "--SEP\r\n" ++
+        "Content-Type: text/plain\r\n" ++
+        "Content-Range: bytes 0-3/10\r\n" ++
+        "\r\n" ++
+        "0123" ++
+        "\r\n" ++
+        "--SEP\r\n" ++
+        "Content-Type: text/plain\r\n" ++
+        "Content-Range: bytes 8-9/10\r\n" ++
+        "\r\n" ++
+        "89" ++
+        "\r\n" ++
+        "--SEP--\r\n";
+    try testing.expectEqualStrings(expected, w.written());
+}
+
+test "MultipartRanges.bodyLen matches writeBody's output length" {
+    const data = "abcdefghijklmnopqrstuvwxyz"; // total = 26
+    const cases = [_][]const u8{
+        "bytes=0-0",
+        "bytes=0-5, 10-19",
+        "bytes=-1, 0-25, 13-13",
+        "bytes=25-25, -26",
+    };
+    inline for (.{ "X", "THIS_STRING_SEPARATES" }) |boundary| {
+        inline for (.{ "text/plain", "application/octet-stream" }) |ct| {
+            const mp = MultipartRanges{ .boundary = boundary, .content_type = ct };
+            for (cases) |c| {
+                var specbuf: [8]ByteRangeSpec = undefined;
+                const specs = try parse(c, &specbuf);
+                var out: [8]ResolvedRange = undefined;
+                const ranges = resolve(specs, data.len, &out);
+                var w: std.Io.Writer.Allocating = .init(testing.allocator);
+                defer w.deinit();
+                try mp.writeBody(&w.writer, ranges, data);
+                try testing.expectEqual(w.written().len, mp.bodyLen(ranges));
+            }
+        }
+    }
+}
+
+test "MultipartRanges: streaming writePartHeader/writeClose equals writeBody" {
+    const data = "0123456789";
+    const mp = MultipartRanges{ .boundary = "B", .content_type = "text/plain" };
+    var specbuf: [4]ByteRangeSpec = undefined;
+    const specs = try parse("bytes=1-2, -3", &specbuf);
+    var out: [4]ResolvedRange = undefined;
+    const ranges = resolve(specs, data.len, &out);
+
+    var a: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer a.deinit();
+    try mp.writeBody(&a.writer, ranges, data);
+
+    // Hand-driven streaming path must produce identical bytes.
+    var b: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer b.deinit();
+    for (ranges) |r| {
+        try mp.writePartHeader(&b.writer, r);
+        try b.writer.writeAll(data[r.start .. r.end + 1]);
+        try b.writer.writeAll("\r\n");
+    }
+    try mp.writeClose(&b.writer);
+
+    try testing.expectEqualStrings(a.written(), b.written());
+}
+
+// End-to-end: apply() → .multiple → build the body, over a real serveStream.
+const mp_body = "ABCDEFGHIJ"; // len 10
+
+fn multiHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+    var out: [4]ResolvedRange = undefined;
+    const applied = try apply(req, rw, mp_body.len, &out);
+    switch (applied.outcome) {
+        .no_range => {
+            rw.setStatus(200);
+            try rw.writeAll(mp_body);
+        },
+        .single => {
+            const r = applied.ranges[0];
+            try rw.writeAll(mp_body[r.start .. r.end + 1]);
+        },
+        .not_satisfiable => try rw.writeAll(""),
+        .multiple => {
+            const mp = MultipartRanges{ .boundary = "SEP", .content_type = "text/plain" };
+            try mp.setContentType(rw);
+            try mp.writeBody(rw.writer(), applied.ranges, mp_body);
+        },
+    }
+}
+
+fn runMultiStream(wire: []const u8, out_buf: []u8) []const u8 {
+    var in: std.Io.Reader = .fixed(wire);
+    var out: std.Io.Writer = .fixed(out_buf);
+    var head_buf: [1024]u8 = undefined;
+    var request_body_buf: [256]u8 = undefined;
+    var response_body_buf: [512]u8 = undefined;
+    var chunk_buf: [256]u8 = undefined;
+    Server.serveStream(.{
+        .handler = multiHandler,
+        .server_name = "test",
+    }, &in, &out, .{
+        .head = &head_buf,
+        .request_body = &request_body_buf,
+        .response_body = &response_body_buf,
+        .chunk = &chunk_buf,
+    });
+    return out.buffered();
+}
+
+test "apply: golden 206 multipart/byteranges for two ranges" {
+    var out_buf: [4096]u8 = undefined;
+    const got = runMultiStream("GET / HTTP/1.1\r\nHost: t\r\n" ++
+        "Range: bytes=0-2, -3\r\nConnection: close\r\n\r\n", &out_buf);
+    const body =
+        "--SEP\r\nContent-Type: text/plain\r\nContent-Range: bytes 0-2/10\r\n\r\nABC\r\n" ++
+        "--SEP\r\nContent-Type: text/plain\r\nContent-Range: bytes 7-9/10\r\n\r\nHIJ\r\n" ++
+        "--SEP--\r\n";
+    var lenbuf: [8]u8 = undefined;
+    const clen = try std.fmt.bufPrint(&lenbuf, "{d}", .{body.len});
+    const expected = try std.fmt.allocPrint(testing.allocator, "HTTP/1.1 206 Partial Content\r\n" ++
+        "Accept-Ranges: bytes\r\n" ++
+        "Content-Type: multipart/byteranges; boundary=SEP\r\n" ++
+        "Server: test\r\n" ++
+        "Connection: close\r\n" ++
+        "Content-Length: {s}\r\n" ++
+        "\r\n{s}", .{ clen, body });
+    defer testing.allocator.free(expected);
+    try testing.expectEqualStrings(expected, got);
 }

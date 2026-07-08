@@ -335,8 +335,12 @@ fmt green. **Still open:** request-ID mw · health helper · conditional-req · 
   `bytes=` set → validated `ByteRangeSpec` range/from/suffix, zero-alloc iterator + strict `parse`; Fable, 14
   tests). · ✅ **Range/206 R2** (RFC 7233 §4 — `resolveSpec`/`resolve` against a representation length +
   `ResolvedRange`/`Content-Range` + `apply` staging 206 single / 416 / multipart-hint; added the 416 reason
-  phrase to `Server`; Opus, 11 tests). **Still open:** Range **R3** (`multipart/byteranges` body) · content
-  negotiation (Fable) · response-trailer write · HTTP/3 (large, deferred/never).
+  phrase to `Server`; Opus, 11 tests). · ✅ **Range/206 R3** (RFC 7233 §4.1 — `MultipartRanges`
+  `multipart/byteranges` body writer for the `.multiple` outcome: per-range parts with own
+  `Content-Type`/`Content-Range`, `contentType`/`setContentType` (threadlocal, setHeader-no-copy-safe),
+  `bodyLen` in lockstep with `writeBody`, streaming `writePartHeader`/`writeClose`; Opus, 5 tests).
+  **Range/206 is now COMPLETE.** **Still open:** content negotiation (Fable) · response-trailer write ·
+  HTTP/3 (large, deferred/never).
 - 🐛 **Test-wiring audit (2026-07-08):** found that a `pub const x = @import("x.zig")` re-export does NOT pull
   the imported file's `test` blocks into the module test binary — they run only when referenced from a
   `test { _ = x; }` block (or refAllDecls). `http` (conditional/body/multipart/sse/range = 57 tests) and `coap`
