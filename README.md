@@ -8,7 +8,7 @@ Not a dumping ground: ship **solid, not many**. Most members are *extracted* fro
 across sibling projects (bxp, axp, zig-fping, poc-wf-analytic); a few fill genuine gaps in the Zig
 ecosystem.
 
-**Status:** 40 modules · 1102 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 40 modules · 1112 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ## Modules
@@ -33,7 +33,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `upstream` | Load-balanced upstream pool + failover — round-robin/weighted/least-conn/EWMA strategies, per-upstream breaker+bulkhead, active+passive health | resilience, probe |
 | `openapi` | OpenAPI 3.1 spec generated from the route table + `/openapi.json` | router, http |
 | `aaa-gate` | Bearer + **API-key** auth (constant-time) + audit hook + denied-request throttle | router, http |
-| `jwt` | JWT/JWS validator (RFC 7515/7519/8725) — parse + claims + **signature verify** (HS/ES/EdDSA/**RSA**, alg-confusion-safe) _(JWKS + OIDC: in progress)_ | — |
+| `jwt` | JWT/JWS validator (RFC 7515/7519/7517/8725) — parse + claims + signature verify (HS/ES/EdDSA/RSA, alg-confusion-safe) + **JWKS** verify-by-`kid` _(OIDC fetch/discovery: in progress)_ | — |
 | `acme` | Let's Encrypt / ACME v2 (RFC 8555): HTTP-01 issuance + renewal, ES256 JWS, CSR | http, router |
 
 ### Networking

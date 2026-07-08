@@ -5,11 +5,14 @@
 //! JWA signature algorithms).
 //!
 //! Scope so far: compact-token **parsing** into typed models (P1),
-//! **registered-claims validation** (`exp`/`nbf`/`iat`/`iss`/`aud`, P1), and
+//! **registered-claims validation** (`exp`/`nbf`/`iat`/`iss`/`aud`, P1),
 //! **JWS signature verification** (P2+P3) for HS256/384/512 (HMAC-SHA-2),
 //! ES256/ES384 (ECDSA P-256/P-384), EdDSA (Ed25519) and RS256/384/512
 //! (RSASSA-PKCS1-v1_5, the OIDC default) — plus the one-call
-//! `parseAndVerify` that chains all three.
+//! `parseAndVerify` that chains all three — and **JWKS key sets** (P4,
+//! RFC 7517): parse a `{"keys":[…]}` document into a typed `JwkSet`,
+//! select the key by the token header's `kid`, and verify via
+//! `verifyWithJwks` / `parseVerifyJwks`.
 //!
 //! ## SECURITY — `parse()` alone does NOT verify signatures
 //!
@@ -25,8 +28,7 @@
 //! of the provided key (`AlgKeyMismatch`) so an attacker cannot downgrade an
 //! asymmetric token to HMAC-with-the-public-key.
 //!
-//! Planned parts: P4 JWKS key sets · P5 fetch/OIDC discovery ·
-//! P6 resource-server middleware.
+//! Planned parts: P5 fetch/OIDC discovery · P6 resource-server middleware.
 //!
 //! ## Usage
 //!
@@ -42,11 +44,21 @@
 //! defer token.deinit();
 //! const scope = token.claims.claimStr("scope") orelse "";
 //!
+//! // With a JWKS (the issuer's published key set, fetched by the caller —
+//! // P5 adds the fetch/cache; this stays offline):
+//! var jwks = try jwt.parseJwks(gpa, jwks_json);
+//! defer jwks.deinit();
+//! var token2 = try jwt.parseVerifyJwks(gpa, bearer_token, jwks, .{
+//!     .now_s = now_seconds,
+//!     .issuer = "https://issuer.example",
+//! });
+//! defer token2.deinit();
+//!
 //! // Or step by step (e.g. pick the key from the header's `kid` first):
 //! var parsed = try jwt.parse(gpa, bearer_token);
 //! defer parsed.deinit();
-//! const key = pickKey(parsed.header.kid); // P4 will do this from a JWKS
-//! try jwt.verify(&parsed, key);
+//! const jwk = jwks.selectKey(parsed.header) orelse return error.NoMatchingKey;
+//! try jwt.verify(&parsed, jwk.key);
 //! try jwt.validateClaims(parsed.claims, .{ .now_s = now_seconds });
 //! ```
 //!
@@ -68,7 +80,7 @@ pub const meta = .{
     .platform = .any,
     .role = .util, // P6 adds the resource-server middleware on top.
     .concurrency = .reentrant,
-    .model_after = "RFC 7515 (JWS) + RFC 7519 (JWT) + RFC 7518 (JWA) verify incl. RS256 (RSASSA-PKCS1-v1_5, RFC 8017), RFC 8725 hardening; OAuth2/OIDC resource server",
+    .model_after = "RFC 7515 (JWS) + RFC 7519 (JWT) + RFC 7518 (JWA) verify incl. RS256 (RSASSA-PKCS1-v1_5, RFC 8017) + RFC 7517 (JWK/JWKS key sets), RFC 8725 hardening; OAuth2/OIDC resource server",
     .deps = .{},
 };
 
@@ -477,6 +489,12 @@ pub const VerifyError = error{
     BadSignature,
     /// The key itself is unusable (e.g. an empty HMAC secret).
     InvalidKey,
+    /// JWKS resolution failed (`verifyWithJwks`/`parseVerifyJwks` only):
+    /// no JWK matches the token's `kid`, none of the matches is usable for
+    /// signature verification (`use:"enc"`, pinned `alg` disagreeing with
+    /// the token's), or the token has no `kid` and the set does not contain
+    /// exactly one usable key.
+    NoMatchingKey,
 };
 
 /// Verify `parsed.signature` over `parsed.signing_input` with `key`
@@ -594,6 +612,357 @@ fn verifyRsaPkcs1(comptime Hash: type, parsed: *const ParsedToken, key: Key) Ver
         // never produces: refuse rather than trust it.
         else => return error.InvalidKey,
     }
+}
+
+// ── JWKS key sets (Part 4, RFC 7517) ────────────────────────────────────────
+
+/// Errors from `parseJwks`. Anything wrong with an *individual* JWK inside
+/// a well-formed set is NOT an error — that key is skipped and recorded in
+/// `JwkSet.skipped` (a JWKS routinely contains keys a verifier does not
+/// use, RFC 7517 §5).
+pub const JwksError = error{
+    /// The document is not valid JSON.
+    InvalidJson,
+    /// Valid JSON, but not a JSON object with a `keys` array (RFC 7517 §5).
+    NotAJwks,
+    OutOfMemory,
+};
+
+/// The `use` (Public Key Use) member, RFC 7517 §4.2. `other` covers any
+/// value besides `sig`/`enc` — such keys are never selected for signature
+/// verification (fail closed on semantics we do not know).
+pub const KeyUse = enum { sig, enc, other };
+
+/// Why a JWK inside a set was skipped rather than converted to a `Key`.
+pub const JwkSkipReason = enum {
+    /// The `keys` array element is not a JSON object.
+    not_an_object,
+    /// `kty` is absent (it is the only REQUIRED member, RFC 7517 §4.1).
+    missing_kty,
+    /// `kty` is none of RSA / EC / OKP / oct.
+    unsupported_kty,
+    /// EC/OKP without the `crv` member.
+    missing_crv,
+    /// `crv` names a curve this module does not support (P-521, X25519, …).
+    unsupported_crv,
+    /// A required key-material member (`n`/`e`, `x`/`y`, `k`) is absent or
+    /// not a JSON string.
+    missing_member,
+    /// Key material is not valid base64url-without-padding.
+    invalid_base64,
+    /// Material decoded but is not a valid key: wrong coordinate length,
+    /// point not on the curve, bad modulus/exponent, empty `oct` secret.
+    invalid_key,
+    /// A metadata member (`kid`/`use`/`alg`/`kty`/`crv`) has the wrong
+    /// JSON type.
+    invalid_member,
+};
+
+/// Record of one skipped JWK: its index in the original `keys` array plus
+/// the reason. Present so operators can log *why* a key was dropped instead
+/// of silently shrinking the set.
+pub const SkippedJwk = struct {
+    index: usize,
+    reason: JwkSkipReason,
+};
+
+/// One usable key from a JWKS: the converted `Key` plus the selection
+/// metadata (RFC 7517 §4). Slices point into the owning `JwkSet`'s arena.
+pub const Jwk = struct {
+    key: Key,
+    /// `kid` (§4.5) — matched against the token header's `kid`.
+    kid: ?[]const u8 = null,
+    /// `use` (§4.2) — `enc`/`other` keys are never selected for signature
+    /// verification.
+    use: ?KeyUse = null,
+    /// `alg` (§4.4) — when present the JWK is pinned to that algorithm and
+    /// is only selected for tokens with exactly that `alg`.
+    alg: ?Alg = null,
+};
+
+/// What key selection hands back: a pointer into `JwkSet.keys`, valid until
+/// the set's `deinit`. `resolved.key` goes straight into `verify`.
+pub const ResolvedKey = *const Jwk;
+
+/// A parsed JWK Set (RFC 7517 §5). Everything it references lives in its
+/// internal arena; call `deinit()` when done. Immutable after parse —
+/// share freely across threads (the module-wide reentrancy rule).
+pub const JwkSet = struct {
+    /// The usable keys, in document order.
+    keys: []const Jwk,
+    /// JWKs that could not be used, with reasons (see `JwkSkipReason`).
+    skipped: []const SkippedJwk,
+
+    arena: *std.heap.ArenaAllocator,
+
+    pub fn deinit(self: *JwkSet) void {
+        const gpa = self.arena.child_allocator;
+        self.arena.deinit();
+        gpa.destroy(self.arena);
+        self.* = undefined;
+    }
+
+    /// First key with this `kid` that is usable for signature verification
+    /// (`use` absent or `"sig"`). No alg check — use `selectKey` when you
+    /// have the token header.
+    pub fn keyForKid(self: *const JwkSet, kid: []const u8) ?ResolvedKey {
+        for (self.keys) |*jwk| {
+            if (!usableForSig(jwk)) continue;
+            const jwk_kid = jwk.kid orelse continue;
+            if (std.mem.eql(u8, jwk_kid, kid)) return jwk;
+        }
+        return null;
+    }
+
+    /// Select the verification key for a token header (RFC 7517 §4.5 spirit):
+    ///
+    /// - Token has a `kid` → the first key matching that `kid` which is
+    ///   usable for signatures (`use` absent or `"sig"`) and whose pinned
+    ///   `alg` (if any) equals the token's `alg`.
+    /// - Token has no `kid` → only an unambiguous set resolves: exactly one
+    ///   sig-usable key (whose `alg` pin, if any, must also match). More
+    ///   than one candidate → null; guessing among keys is not verification.
+    ///
+    /// Selection cannot smuggle a mismatched key past the RFC 8725 checks:
+    /// whatever this returns still goes through `verify`, which enforces
+    /// that the key *type* matches the token's `alg`.
+    pub fn selectKey(self: *const JwkSet, header: Header) ?ResolvedKey {
+        const token_alg = Alg.fromString(header.alg);
+        if (header.kid) |kid| {
+            for (self.keys) |*jwk| {
+                if (!usableForSig(jwk)) continue;
+                const jwk_kid = jwk.kid orelse continue;
+                if (!std.mem.eql(u8, jwk_kid, kid)) continue;
+                if (jwk.alg) |pinned| {
+                    if (pinned != token_alg) continue;
+                }
+                return jwk;
+            }
+            return null;
+        }
+        var found: ?ResolvedKey = null;
+        for (self.keys) |*jwk| {
+            if (!usableForSig(jwk)) continue;
+            if (found != null) return null; // ambiguous — refuse to guess
+            found = jwk;
+        }
+        const jwk = found orelse return null;
+        if (jwk.alg) |pinned| {
+            if (pinned != token_alg) return null;
+        }
+        return jwk;
+    }
+
+    fn usableForSig(jwk: *const Jwk) bool {
+        const use = jwk.use orelse return true;
+        return use == .sig;
+    }
+};
+
+/// Parse a JWKS document (`{"keys":[{JWK},…]}`, RFC 7517 §5) into a typed
+/// `JwkSet`. Supported key types (RFC 7518 §6 / RFC 8037 §2 parameters):
+///
+/// - `kty:"RSA"` — `n`/`e` → `Key.rsaFromModExp` (for RS256/384/512).
+/// - `kty:"EC"`, `crv:"P-256"|"P-384"` — `x`/`y` →
+///   `ecdsaP256FromCoords`/`ecdsaP384FromCoords` (ES256/ES384).
+/// - `kty:"OKP"`, `crv:"Ed25519"` — `x` → `ed25519FromBytes` (EdDSA).
+/// - `kty:"oct"` — `k` → `.hmac`. Parsed for completeness (HS* dev/test
+///   setups); a *symmetric* key has no business in a *published* JWKS —
+///   anyone who can read it can mint tokens.
+///
+/// Individual JWKs that are malformed or unsupported are skipped and
+/// recorded in `skipped` — a set-wide error is returned only when the
+/// document itself is not a JWKS. Arbitrary bytes never panic.
+pub fn parseJwks(gpa: std.mem.Allocator, json: []const u8) JwksError!JwkSet {
+    const arena_state = try gpa.create(std.heap.ArenaAllocator);
+    errdefer gpa.destroy(arena_state);
+    arena_state.* = .init(gpa);
+    errdefer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const val = std.json.parseFromSliceLeaky(std.json.Value, arena, json, .{}) catch |err|
+        switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidJson,
+        };
+    if (val != .object) return error.NotAJwks;
+    const keys_val = val.object.get("keys") orelse return error.NotAJwks;
+    if (keys_val != .array) return error.NotAJwks;
+
+    var keys: std.ArrayList(Jwk) = .empty;
+    var skipped: std.ArrayList(SkippedJwk) = .empty;
+    for (keys_val.array.items, 0..) |item, i| {
+        const jwk = jwkFromValue(arena, item) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => |reason| {
+                try skipped.append(arena, .{ .index = i, .reason = skipReason(reason) });
+                continue;
+            },
+        };
+        try keys.append(arena, jwk);
+    }
+
+    return .{
+        .keys = try keys.toOwnedSlice(arena),
+        .skipped = try skipped.toOwnedSlice(arena),
+        .arena = arena_state,
+    };
+}
+
+/// Verify `parsed`'s signature against a JWKS: resolve the key via
+/// `JwkSet.selectKey` (kid + `use`/`alg` constraints), then run the
+/// existing `verify` — all its RFC 8725 hardening (alg/key-type match,
+/// `none` rejection) applies unchanged. No usable key → `NoMatchingKey`.
+pub fn verifyWithJwks(parsed: *const ParsedToken, jwks: JwkSet) VerifyError!void {
+    const jwk = jwks.selectKey(parsed.header) orelse return error.NoMatchingKey;
+    try verify(parsed, jwk.key);
+}
+
+/// The one-call JWKS API: parse (P1) → resolve key + verify signature (P4)
+/// → validate claims (P1). Same contract as `parseAndVerify`, with the key
+/// picked from the set by the token's `kid`.
+pub fn parseVerifyJwks(
+    gpa: std.mem.Allocator,
+    token: []const u8,
+    jwks: JwkSet,
+    claim_opts: Options,
+) ParseAndVerifyError!ParsedToken {
+    var parsed = try parse(gpa, token);
+    errdefer parsed.deinit();
+    try verifyWithJwks(&parsed, jwks);
+    try validateClaims(parsed.claims, claim_opts);
+    return parsed;
+}
+
+/// Per-JWK conversion failures — mapped 1:1 onto `JwkSkipReason` by the
+/// `parseJwks` loop (only OutOfMemory propagates).
+const JwkFailure = error{
+    NotAnObject,
+    MissingKty,
+    UnsupportedKty,
+    MissingCrv,
+    UnsupportedCrv,
+    MissingMember,
+    InvalidBase64,
+    InvalidKeyMaterial,
+    InvalidMember,
+};
+
+fn skipReason(err: JwkFailure) JwkSkipReason {
+    return switch (err) {
+        error.NotAnObject => .not_an_object,
+        error.MissingKty => .missing_kty,
+        error.UnsupportedKty => .unsupported_kty,
+        error.MissingCrv => .missing_crv,
+        error.UnsupportedCrv => .unsupported_crv,
+        error.MissingMember => .missing_member,
+        error.InvalidBase64 => .invalid_base64,
+        error.InvalidKeyMaterial => .invalid_key,
+        error.InvalidMember => .invalid_member,
+    };
+}
+
+/// Convert one `keys` array element into a `Jwk` (RFC 7517 §4 members +
+/// RFC 7518 §6 / RFC 8037 §2 key material).
+fn jwkFromValue(
+    arena: std.mem.Allocator,
+    val: std.json.Value,
+) (JwkFailure || error{OutOfMemory})!Jwk {
+    if (val != .object) return error.NotAnObject;
+    const obj = val.object;
+
+    const key: Key = blk: {
+        const kty = (try jwkString(obj, "kty")) orelse return error.MissingKty;
+        if (std.mem.eql(u8, kty, "RSA")) {
+            // RFC 7518 §6.3.1: n, e as base64url big-endian integers.
+            const n = try jwkMaterial(arena, obj, "n");
+            const e = try jwkMaterial(arena, obj, "e");
+            break :blk Key.rsaFromModExp(n, e) catch return error.InvalidKeyMaterial;
+        }
+        if (std.mem.eql(u8, kty, "EC")) {
+            // RFC 7518 §6.2.1: crv + x, y — fixed-width big-endian coords.
+            // Curve support is checked *before* touching the material so an
+            // unsupported curve reports as such, not as a material error.
+            const crv = (try jwkString(obj, "crv")) orelse return error.MissingCrv;
+            if (std.mem.eql(u8, crv, "P-256")) {
+                const x = try jwkMaterial(arena, obj, "x");
+                const y = try jwkMaterial(arena, obj, "y");
+                if (x.len != 32 or y.len != 32) return error.InvalidKeyMaterial;
+                break :blk Key.ecdsaP256FromCoords(x[0..32].*, y[0..32].*) catch
+                    return error.InvalidKeyMaterial;
+            }
+            if (std.mem.eql(u8, crv, "P-384")) {
+                const x = try jwkMaterial(arena, obj, "x");
+                const y = try jwkMaterial(arena, obj, "y");
+                if (x.len != 48 or y.len != 48) return error.InvalidKeyMaterial;
+                break :blk Key.ecdsaP384FromCoords(x[0..48].*, y[0..48].*) catch
+                    return error.InvalidKeyMaterial;
+            }
+            return error.UnsupportedCrv; // P-521: no std P-521 support
+        }
+        if (std.mem.eql(u8, kty, "OKP")) {
+            // RFC 8037 §2: crv + x (the raw public key bytes).
+            const crv = (try jwkString(obj, "crv")) orelse return error.MissingCrv;
+            if (!std.mem.eql(u8, crv, "Ed25519")) return error.UnsupportedCrv;
+            const x = try jwkMaterial(arena, obj, "x");
+            if (x.len != 32) return error.InvalidKeyMaterial;
+            break :blk Key.ed25519FromBytes(x[0..32].*) catch return error.InvalidKeyMaterial;
+        }
+        if (std.mem.eql(u8, kty, "oct")) {
+            // RFC 7518 §6.4.1: k — the symmetric secret. See parseJwks doc.
+            const k = try jwkMaterial(arena, obj, "k");
+            if (k.len == 0) return error.InvalidKeyMaterial; // unusable as HMAC secret
+            break :blk .{ .hmac = k };
+        }
+        return error.UnsupportedKty;
+    };
+
+    const use: ?KeyUse = blk: {
+        const s = (try jwkString(obj, "use")) orelse break :blk null;
+        if (std.mem.eql(u8, s, "sig")) break :blk .sig;
+        if (std.mem.eql(u8, s, "enc")) break :blk .enc;
+        break :blk .other;
+    };
+    const alg: ?Alg = blk: {
+        const s = (try jwkString(obj, "alg")) orelse break :blk null;
+        // Unrecognized names pin as .unknown — the token side maps them the
+        // same way and verify rejects .unknown, so nothing slips through.
+        break :blk Alg.fromString(s);
+    };
+
+    return .{
+        .key = key,
+        .kid = try jwkString(obj, "kid"),
+        .use = use,
+        .alg = alg,
+    };
+}
+
+/// Optional JWK member that, when present, must be a JSON string.
+fn jwkString(obj: std.json.ObjectMap, name: []const u8) error{InvalidMember}!?[]const u8 {
+    const v = obj.get(name) orelse return null;
+    return switch (v) {
+        .string => |s| s,
+        else => error.InvalidMember,
+    };
+}
+
+/// Required base64url key-material member, decoded into the arena.
+fn jwkMaterial(
+    arena: std.mem.Allocator,
+    obj: std.json.ObjectMap,
+    name: []const u8,
+) error{ MissingMember, InvalidBase64, OutOfMemory }![]u8 {
+    const v = obj.get(name) orelse return error.MissingMember;
+    const s = switch (v) {
+        .string => |str| str,
+        else => return error.MissingMember,
+    };
+    const decoder = std.base64.url_safe_no_pad.Decoder;
+    const n = decoder.calcSizeForSlice(s) catch return error.InvalidBase64;
+    const buf = try arena.alloc(u8, n);
+    decoder.decode(buf, s) catch return error.InvalidBase64;
+    return buf;
 }
 
 // ── internals ───────────────────────────────────────────────────────────────
@@ -1902,4 +2271,539 @@ test "parseAndVerify: RS256 end-to-end" {
         key,
         .{ .now_s = 1600000000 },
     ));
+}
+
+// ── tests: JWKS key sets (Part 4) ────────────────────────────────────────────
+
+/// RFC 7515 §A.3.1 P-256 public-key coordinates (JWK `x`/`y`), reused as
+/// JWK members by the P4 tests.
+const rfc7515_a3_x_b64 = "f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU";
+const rfc7515_a3_y_b64 = "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0";
+
+const test_jwks_hmac_secret = "jwks-multi-key-shared-secret";
+
+fn testEs256KeyPair() !EcdsaP256Sha256.KeyPair {
+    return EcdsaP256Sha256.KeyPair.generateDeterministic(
+        [_]u8{0x42} ** EcdsaP256Sha256.KeyPair.seed_length,
+    );
+}
+
+fn testEd25519KeyPair() !Ed25519.KeyPair {
+    return Ed25519.KeyPair.generateDeterministic([_]u8{0x24} ** 32);
+}
+
+/// Build the standard 4-key test JWKS: oct "hs" + EC P-256 "es" +
+/// RSA "rs" (the RFC 7515 A.2 modulus) + OKP Ed25519 "ed".
+fn testJwksJson(buf: []u8) ![]const u8 {
+    const enc = std.base64.url_safe_no_pad.Encoder;
+    var k_b64: [64]u8 = undefined;
+    var x_b64: [43]u8 = undefined;
+    var y_b64: [43]u8 = undefined;
+    var ed_b64: [43]u8 = undefined;
+    const k_s = enc.encode(&k_b64, test_jwks_hmac_secret);
+    const es = try testEs256KeyPair();
+    const sec1 = es.public_key.toUncompressedSec1();
+    const x_s = enc.encode(&x_b64, sec1[1..33]);
+    const y_s = enc.encode(&y_b64, sec1[33..65]);
+    const ed = try testEd25519KeyPair();
+    const ed_pub = ed.public_key.toBytes();
+    const ed_s = enc.encode(&ed_b64, &ed_pub);
+    return std.fmt.bufPrint(buf,
+        \\{{"keys":[
+        \\ {{"kty":"oct","kid":"hs","k":"{s}"}},
+        \\ {{"kty":"EC","kid":"es","use":"sig","crv":"P-256","x":"{s}","y":"{s}"}},
+        \\ {{"kty":"RSA","kid":"rs","n":"{s}","e":"AQAB"}},
+        \\ {{"kty":"OKP","kid":"ed","crv":"Ed25519","x":"{s}"}}
+        \\]}}
+    , .{ k_s, x_s, y_s, rfc7515_a2_n_b64, ed_s });
+}
+
+test "JWKS: RFC 7517 A.1 example set parses into typed keys" {
+    // RFC 7517 Appendix A.1 — two public keys: an EC P-256 encryption key
+    // and an RSA signature key.
+    const jwks_json =
+        \\{"keys":
+        \\  [
+        \\    {"kty":"EC",
+        \\     "crv":"P-256",
+        \\     "x":"MKBCTNIcKUSDii11ySs3526iDZ8AiTo7Tu6KPAqv7D4",
+        \\     "y":"4Etl6SRW2YiLUrN5vfvVHuhp7x8PxltmWWlbbM4IFyM",
+        \\     "use":"enc",
+        \\     "kid":"1"},
+        \\    {"kty":"RSA",
+        \\     "n":"0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw",
+        \\     "e":"AQAB",
+        \\     "alg":"RS256",
+        \\     "kid":"2011-04-29"}
+        \\  ]
+        \\}
+    ;
+    var jwks = try parseJwks(testing.allocator, jwks_json);
+    defer jwks.deinit();
+
+    try testing.expectEqual(@as(usize, 2), jwks.keys.len);
+    try testing.expectEqual(@as(usize, 0), jwks.skipped.len);
+
+    const ec = jwks.keys[0];
+    try testing.expect(ec.key == .ecdsa_p256);
+    try testing.expectEqualStrings("1", ec.kid.?);
+    try testing.expectEqual(KeyUse.enc, ec.use.?);
+    try testing.expect(ec.alg == null);
+
+    const rsa = jwks.keys[1];
+    try testing.expect(rsa.key == .rsa);
+    try testing.expectEqual(@as(usize, 256), rsa.key.rsa.modulus_len);
+    try testing.expectEqualStrings("2011-04-29", rsa.kid.?);
+    try testing.expectEqual(Alg.RS256, rsa.alg.?);
+
+    // kid lookup honors `use`: the enc key is never offered for signatures.
+    try testing.expect(jwks.keyForKid("2011-04-29") != null);
+    try testing.expect(jwks.keyForKid("1") == null);
+    try testing.expect(jwks.keyForKid("nope") == null);
+}
+
+test "JWKS: multi-key set — verifyWithJwks picks the right key by kid" {
+    var jwks_buf: [2048]u8 = undefined;
+    var jwks = try parseJwks(testing.allocator, try testJwksJson(&jwks_buf));
+    defer jwks.deinit();
+    try testing.expectEqual(@as(usize, 4), jwks.keys.len);
+    try testing.expectEqual(@as(usize, 0), jwks.skipped.len);
+
+    var n_buf: [256]u8 = undefined;
+    var d_buf: [256]u8 = undefined;
+    const n_bytes = b64uDecode(&n_buf, rfc7515_a2_n_b64);
+    const d_bytes = b64uDecode(&d_buf, rfc7515_a2_d_b64);
+    const es = try testEs256KeyPair();
+    const ed = try testEd25519KeyPair();
+
+    // HS256 by kid "hs".
+    {
+        var buf: [512]u8 = undefined;
+        const si = signingInputInto(&buf,
+            \\{"alg":"HS256","kid":"hs"}
+        ,
+            \\{"exp":1000}
+        );
+        var mac: [32]u8 = undefined;
+        hmac_sha2.HmacSha256.create(&mac, si, test_jwks_hmac_secret);
+        const token = finishToken(&buf, si.len, &mac);
+        var parsed = try parse(testing.allocator, token);
+        defer parsed.deinit();
+        try verifyWithJwks(&parsed, jwks);
+    }
+    // ES256 by kid "es".
+    {
+        var buf: [512]u8 = undefined;
+        const si = signingInputInto(&buf,
+            \\{"alg":"ES256","kid":"es"}
+        ,
+            \\{"exp":1000}
+        );
+        const sig = try es.sign(si, null);
+        const sig_bytes = sig.toBytes();
+        const token = finishToken(&buf, si.len, &sig_bytes);
+        var parsed = try parse(testing.allocator, token);
+        defer parsed.deinit();
+        try verifyWithJwks(&parsed, jwks);
+    }
+    // RS256 by kid "rs".
+    {
+        var buf: [1024]u8 = undefined;
+        const si = signingInputInto(&buf,
+            \\{"alg":"RS256","kid":"rs"}
+        ,
+            \\{"exp":1000}
+        );
+        const sig = rsaTestSign(sha2.Sha256, 256, si, n_bytes, d_bytes);
+        const token = finishToken(&buf, si.len, &sig);
+        var parsed = try parse(testing.allocator, token);
+        defer parsed.deinit();
+        try verifyWithJwks(&parsed, jwks);
+    }
+    // EdDSA by kid "ed".
+    {
+        var buf: [512]u8 = undefined;
+        const si = signingInputInto(&buf,
+            \\{"alg":"EdDSA","kid":"ed"}
+        ,
+            \\{"exp":1000}
+        );
+        const sig = try ed.sign(si, null);
+        const sig_bytes = sig.toBytes();
+        const token = finishToken(&buf, si.len, &sig_bytes);
+        var parsed = try parse(testing.allocator, token);
+        defer parsed.deinit();
+        try verifyWithJwks(&parsed, jwks);
+    }
+    // A kid nobody published → NoMatchingKey.
+    {
+        var buf: [512]u8 = undefined;
+        const si = signingInputInto(&buf,
+            \\{"alg":"HS256","kid":"ghost"}
+        ,
+            \\{"exp":1000}
+        );
+        var mac: [32]u8 = undefined;
+        hmac_sha2.HmacSha256.create(&mac, si, test_jwks_hmac_secret);
+        const token = finishToken(&buf, si.len, &mac);
+        var parsed = try parse(testing.allocator, token);
+        defer parsed.deinit();
+        try testing.expectError(error.NoMatchingKey, verifyWithJwks(&parsed, jwks));
+    }
+    // keyForKid resolves every published key to the right type.
+    try testing.expect(jwks.keyForKid("hs").?.key == .hmac);
+    try testing.expect(jwks.keyForKid("es").?.key == .ecdsa_p256);
+    try testing.expect(jwks.keyForKid("rs").?.key == .rsa);
+    try testing.expect(jwks.keyForKid("ed").?.key == .ed25519);
+}
+
+test "JWKS: kid selection cannot smuggle a mismatched key type (RFC 8725)" {
+    var jwks_buf: [2048]u8 = undefined;
+    var jwks = try parseJwks(testing.allocator, try testJwksJson(&jwks_buf));
+    defer jwks.deinit();
+
+    // HS256 token pointing (kid) at the RSA JWK: selection resolves the RSA
+    // key, but verify's type check still refuses — the downgrade where an
+    // attacker HMACs with public-key bytes stays dead under JWKS.
+    var buf: [512]u8 = undefined;
+    const si = signingInputInto(&buf,
+        \\{"alg":"HS256","kid":"rs"}
+    ,
+        \\{"exp":1000,"admin":true}
+    );
+    var mac: [32]u8 = undefined;
+    hmac_sha2.HmacSha256.create(&mac, si, "whatever");
+    const token = finishToken(&buf, si.len, &mac);
+    var parsed = try parse(testing.allocator, token);
+    defer parsed.deinit();
+    try testing.expectError(error.AlgKeyMismatch, verifyWithJwks(&parsed, jwks));
+
+    // ES256 token pointing at the Ed25519 key: same refusal.
+    var buf2: [512]u8 = undefined;
+    const si2 = signingInputInto(&buf2,
+        \\{"alg":"ES256","kid":"ed"}
+    ,
+        \\{"exp":1000}
+    );
+    const token2 = finishToken(&buf2, si2.len, "dummy-signature-bytes");
+    var parsed2 = try parse(testing.allocator, token2);
+    defer parsed2.deinit();
+    try testing.expectError(error.AlgKeyMismatch, verifyWithJwks(&parsed2, jwks));
+
+    // alg:none with a valid kid → still UnsecuredToken, never accepted.
+    var buf3: [512]u8 = undefined;
+    const si3 = signingInputInto(&buf3,
+        \\{"alg":"none","kid":"rs"}
+    ,
+        \\{"exp":1000}
+    );
+    const token3 = finishToken(&buf3, si3.len, "");
+    var parsed3 = try parse(testing.allocator, token3);
+    defer parsed3.deinit();
+    try testing.expectError(error.UnsecuredToken, verifyWithJwks(&parsed3, jwks));
+}
+
+test "JWKS: token without kid — single usable key resolves, ambiguity refuses" {
+    // Single-key set: the RFC 7515 A.1 HMAC key as an oct JWK (no kid on
+    // either side) verifies the RFC HS256 token.
+    const single = "{\"keys\":[{\"kty\":\"oct\",\"k\":\"" ++ rfc7515_a1_hmac_key_b64 ++ "\"}]}";
+    var jwks = try parseJwks(testing.allocator, single);
+    defer jwks.deinit();
+    var parsed = try parse(testing.allocator, rfc7519_example_token);
+    defer parsed.deinit();
+    try verifyWithJwks(&parsed, jwks);
+
+    // The same token against a multi-key set: no kid to pick by → refuse
+    // (guessing among keys is not verification).
+    var jwks_buf: [2048]u8 = undefined;
+    var multi = try parseJwks(testing.allocator, try testJwksJson(&jwks_buf));
+    defer multi.deinit();
+    try testing.expectError(error.NoMatchingKey, verifyWithJwks(&parsed, multi));
+
+    // Single-key set whose only key is use:"enc": nothing usable → refuse.
+    const enc_only = "{\"keys\":[{\"kty\":\"oct\",\"use\":\"enc\",\"k\":\"" ++
+        rfc7515_a1_hmac_key_b64 ++ "\"}]}";
+    var jwks_enc = try parseJwks(testing.allocator, enc_only);
+    defer jwks_enc.deinit();
+    try testing.expectError(error.NoMatchingKey, verifyWithJwks(&parsed, jwks_enc));
+
+    // An unrecognized use value is fail-closed the same way.
+    const other_use = "{\"keys\":[{\"kty\":\"oct\",\"use\":\"backup\",\"k\":\"" ++
+        rfc7515_a1_hmac_key_b64 ++ "\"}]}";
+    var jwks_other = try parseJwks(testing.allocator, other_use);
+    defer jwks_other.deinit();
+    try testing.expectError(error.NoMatchingKey, verifyWithJwks(&parsed, jwks_other));
+}
+
+test "JWKS: RFC 7515 A.2 (RSA) and A.3 (EC) keys as JWKs verify the RFC tokens" {
+    // A.3 P-256 key as a JWK; the RFC ES256 token has no kid → the
+    // single-key path resolves it.
+    const ec_set = "{\"keys\":[{\"kty\":\"EC\",\"crv\":\"P-256\",\"kid\":\"a3\",\"use\":\"sig\"," ++
+        "\"x\":\"" ++ rfc7515_a3_x_b64 ++ "\",\"y\":\"" ++ rfc7515_a3_y_b64 ++ "\"}]}";
+    var ec_jwks = try parseJwks(testing.allocator, ec_set);
+    defer ec_jwks.deinit();
+    try testing.expect(ec_jwks.keyForKid("a3").?.key == .ecdsa_p256);
+
+    const a3_token =
+        "eyJhbGciOiJFUzI1NiJ9" ++
+        "." ++
+        "eyJpc3MiOiJqb2UiLA0KICJleHAiOjEzMDA4MTkzODAsDQogImh0dHA6Ly9leGFtcGxlLmNvbS9pc19yb290Ijp0cnVlfQ" ++
+        "." ++
+        "DtEhU3ljbEg8L38VWAfUAqOyKAM6-Xx-F4GawxaepmXFCgfTjDxw5djxLa8ISlSApmWQxfKTUJqPP3-Kg6NU1Q";
+    var es_parsed = try parse(testing.allocator, a3_token);
+    defer es_parsed.deinit();
+    try verifyWithJwks(&es_parsed, ec_jwks);
+
+    // A.2 RSA key as a JWK (alg pinned to RS256, matching the token).
+    const rsa_set = "{\"keys\":[{\"kty\":\"RSA\",\"kid\":\"a2\",\"alg\":\"RS256\"," ++
+        "\"n\":\"" ++ rfc7515_a2_n_b64 ++ "\",\"e\":\"" ++ rfc7515_a2_e_b64 ++ "\"}]}";
+    var rsa_jwks = try parseJwks(testing.allocator, rsa_set);
+    defer rsa_jwks.deinit();
+    var rs_parsed = try parse(testing.allocator, rfc7515_a2_token);
+    defer rs_parsed.deinit();
+    try verifyWithJwks(&rs_parsed, rsa_jwks);
+
+    // RFC 8037 A.2 public-key JWK (kty OKP, crv Ed25519) parses to an
+    // Ed25519 key.
+    const okp_set = "{\"keys\":[{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"kid\":\"ed8037\"," ++
+        "\"x\":\"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo\"}]}";
+    var okp_jwks = try parseJwks(testing.allocator, okp_set);
+    defer okp_jwks.deinit();
+    try testing.expect(okp_jwks.keyForKid("ed8037").?.key == .ed25519);
+}
+
+test "JWKS: unsupported and enc keys don't break the set; good key resolves" {
+    const mixed =
+        "{\"keys\":[" ++
+        // P-521: recognized kty, unsupported curve → skipped.
+        "{\"kty\":\"EC\",\"crv\":\"P-521\",\"x\":\"AAAA\",\"y\":\"AAAA\",\"kid\":\"p521\"}," ++
+        // Unknown kty → skipped.
+        "{\"kty\":\"quantum\",\"kid\":\"q\"}," ++
+        // X25519 is key agreement, not signing → skipped.
+        "{\"kty\":\"OKP\",\"crv\":\"X25519\",\"x\":\"AAAA\",\"kid\":\"x25519\"}," ++
+        // Encryption key: parses fine but is never selected for signatures.
+        "{\"kty\":\"EC\",\"crv\":\"P-256\",\"use\":\"enc\",\"kid\":\"enc-ec\"," ++
+        "\"x\":\"" ++ rfc7515_a3_x_b64 ++ "\",\"y\":\"" ++ rfc7515_a3_y_b64 ++ "\"}," ++
+        // The one signing key.
+        "{\"kty\":\"RSA\",\"kid\":\"rs\",\"n\":\"" ++ rfc7515_a2_n_b64 ++ "\",\"e\":\"AQAB\"}" ++
+        "]}";
+    var jwks = try parseJwks(testing.allocator, mixed);
+    defer jwks.deinit();
+
+    try testing.expectEqual(@as(usize, 2), jwks.keys.len);
+    try testing.expectEqual(@as(usize, 3), jwks.skipped.len);
+    try testing.expectEqual(@as(usize, 0), jwks.skipped[0].index);
+    try testing.expectEqual(JwkSkipReason.unsupported_crv, jwks.skipped[0].reason);
+    try testing.expectEqual(@as(usize, 1), jwks.skipped[1].index);
+    try testing.expectEqual(JwkSkipReason.unsupported_kty, jwks.skipped[1].reason);
+    try testing.expectEqual(@as(usize, 2), jwks.skipped[2].index);
+    try testing.expectEqual(JwkSkipReason.unsupported_crv, jwks.skipped[2].reason);
+
+    // The good key still verifies a real token by kid.
+    var n_buf: [256]u8 = undefined;
+    var d_buf: [256]u8 = undefined;
+    const n_bytes = b64uDecode(&n_buf, rfc7515_a2_n_b64);
+    const d_bytes = b64uDecode(&d_buf, rfc7515_a2_d_b64);
+    var buf: [1024]u8 = undefined;
+    const si = signingInputInto(&buf,
+        \\{"alg":"RS256","kid":"rs"}
+    ,
+        \\{"exp":1000}
+    );
+    const sig = rsaTestSign(sha2.Sha256, 256, si, n_bytes, d_bytes);
+    const token = finishToken(&buf, si.len, &sig);
+    var parsed = try parse(testing.allocator, token);
+    defer parsed.deinit();
+    try verifyWithJwks(&parsed, jwks);
+
+    // The enc EC key exists in the set but is not selectable.
+    try testing.expect(jwks.keyForKid("enc-ec") == null);
+}
+
+test "JWKS: a JWK's pinned alg must match the token alg" {
+    // RSA key pinned to RS384.
+    const set = "{\"keys\":[{\"kty\":\"RSA\",\"kid\":\"rs\",\"alg\":\"RS384\"," ++
+        "\"n\":\"" ++ rfc7515_a2_n_b64 ++ "\",\"e\":\"AQAB\"}]}";
+    var jwks = try parseJwks(testing.allocator, set);
+    defer jwks.deinit();
+
+    var n_buf: [256]u8 = undefined;
+    var d_buf: [256]u8 = undefined;
+    const n_bytes = b64uDecode(&n_buf, rfc7515_a2_n_b64);
+    const d_bytes = b64uDecode(&d_buf, rfc7515_a2_d_b64);
+
+    // An RS256 token with the right kid but the wrong alg for the pin —
+    // even with a VALID RS256 signature — must not resolve the key.
+    var buf: [1024]u8 = undefined;
+    const si256 = signingInputInto(&buf,
+        \\{"alg":"RS256","kid":"rs"}
+    ,
+        \\{"exp":1000}
+    );
+    const sig256 = rsaTestSign(sha2.Sha256, 256, si256, n_bytes, d_bytes);
+    const t256 = finishToken(&buf, si256.len, &sig256);
+    var p256 = try parse(testing.allocator, t256);
+    defer p256.deinit();
+    try testing.expectError(error.NoMatchingKey, verifyWithJwks(&p256, jwks));
+    try testing.expect(jwks.selectKey(p256.header) == null);
+    // keyForKid alone (no alg context) still finds it — selectKey is the
+    // header-aware entry point.
+    try testing.expect(jwks.keyForKid("rs") != null);
+
+    // The matching RS384 token verifies.
+    var buf2: [1024]u8 = undefined;
+    const si384 = signingInputInto(&buf2,
+        \\{"alg":"RS384","kid":"rs"}
+    ,
+        \\{"exp":1000}
+    );
+    const sig384 = rsaTestSign(sha2.Sha384, 256, si384, n_bytes, d_bytes);
+    const t384 = finishToken(&buf2, si384.len, &sig384);
+    var p384 = try parse(testing.allocator, t384);
+    defer p384.deinit();
+    try verifyWithJwks(&p384, jwks);
+
+    // The no-kid single-key path honors the pin the same way.
+    const nokid_set = "{\"keys\":[{\"kty\":\"RSA\",\"alg\":\"RS384\"," ++
+        "\"n\":\"" ++ rfc7515_a2_n_b64 ++ "\",\"e\":\"AQAB\"}]}";
+    var jwks2 = try parseJwks(testing.allocator, nokid_set);
+    defer jwks2.deinit();
+    var buf3: [1024]u8 = undefined;
+    const si_nk = signingInputInto(&buf3,
+        \\{"alg":"RS256"}
+    ,
+        \\{"exp":1000}
+    );
+    const sig_nk = rsaTestSign(sha2.Sha256, 256, si_nk, n_bytes, d_bytes);
+    const t_nk = finishToken(&buf3, si_nk.len, &sig_nk);
+    var p_nk = try parse(testing.allocator, t_nk);
+    defer p_nk.deinit();
+    try testing.expectError(error.NoMatchingKey, verifyWithJwks(&p_nk, jwks2));
+}
+
+test "JWKS: malformed JWKs are skipped with reasons, never a panic" {
+    const set =
+        "{\"keys\":[" ++
+        "42," ++ // not an object
+        "{}," ++ // no kty
+        "{\"kty\":42}," ++ // kty of the wrong type
+        "{\"kty\":\"RSA\",\"n\":\"!!!\",\"e\":\"AQAB\"}," ++ // bad base64url n
+        "{\"kty\":\"RSA\",\"e\":\"AQAB\"}," ++ // n missing
+        "{\"kty\":\"EC\",\"x\":\"AAAA\",\"y\":\"AAAA\"}," ++ // crv missing
+        "{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"" ++ ("A" ** 22) ++
+        "\",\"y\":\"" ++ ("A" ** 22) ++ "\"}," ++ // 16-byte coords: wrong length
+        "{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"" ++ ("A" ** 43) ++
+        "\",\"y\":\"" ++ ("A" ** 43) ++ "\"}," ++ // (0,0): not on the curve
+        "{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"" ++ ("_" ** 42) ++
+        "8\"}," ++ // 0xFF…: non-canonical Ed25519
+        "{\"kty\":\"oct\",\"k\":\"\"}," ++ // empty secret: unusable
+        "{\"kty\":\"oct\",\"k\":\"c2VjcmV0\",\"kid\":42}," ++ // kid wrong type
+        "{\"kty\":\"oct\",\"k\":\"c2VjcmV0\",\"kid\":\"good\"}" ++ // the survivor
+        "]}";
+    var jwks = try parseJwks(testing.allocator, set);
+    defer jwks.deinit();
+
+    try testing.expectEqual(@as(usize, 1), jwks.keys.len);
+    try testing.expectEqualStrings("good", jwks.keys[0].kid.?);
+    try testing.expect(jwks.keys[0].key == .hmac);
+    try testing.expectEqualStrings("secret", jwks.keys[0].key.hmac);
+
+    const expected = [_]JwkSkipReason{
+        .not_an_object,  .missing_kty, .invalid_member, .invalid_base64,
+        .missing_member, .missing_crv, .invalid_key,    .invalid_key,
+        .invalid_key,    .invalid_key, .invalid_member,
+    };
+    try testing.expectEqual(@as(usize, expected.len), jwks.skipped.len);
+    for (jwks.skipped, expected, 0..) |s, want, i| {
+        try testing.expectEqual(i, s.index);
+        try testing.expectEqual(want, s.reason);
+    }
+}
+
+test "JWKS: garbage documents → typed errors; empty set resolves nothing" {
+    const gpa = testing.allocator;
+    try testing.expectError(error.InvalidJson, parseJwks(gpa, "not json"));
+    try testing.expectError(error.InvalidJson, parseJwks(gpa, ""));
+    try testing.expectError(error.InvalidJson, parseJwks(gpa, "{\"keys\":[}"));
+    try testing.expectError(error.NotAJwks, parseJwks(gpa, "42"));
+    try testing.expectError(error.NotAJwks, parseJwks(gpa, "[]"));
+    try testing.expectError(error.NotAJwks, parseJwks(gpa, "{}"));
+    try testing.expectError(error.NotAJwks, parseJwks(gpa, "{\"keys\":42}"));
+    try testing.expectError(error.NotAJwks, parseJwks(gpa, "{\"keys\":{}}"));
+
+    // {"keys":[]} is a well-formed, useless set: everything → NoMatchingKey.
+    var empty = try parseJwks(gpa, "{\"keys\":[]}");
+    defer empty.deinit();
+    try testing.expectEqual(@as(usize, 0), empty.keys.len);
+    var parsed = try parse(gpa, rfc7519_example_token);
+    defer parsed.deinit();
+    try testing.expect(empty.selectKey(parsed.header) == null);
+    try testing.expect(empty.keyForKid("any") == null);
+    try testing.expectError(error.NoMatchingKey, verifyWithJwks(&parsed, empty));
+}
+
+test "parseVerifyJwks: end-to-end against a multi-key set" {
+    const gpa = testing.allocator;
+    var jwks_buf: [2048]u8 = undefined;
+    var jwks = try parseJwks(gpa, try testJwksJson(&jwks_buf));
+    defer jwks.deinit();
+
+    var n_buf: [256]u8 = undefined;
+    var d_buf: [256]u8 = undefined;
+    const n_bytes = b64uDecode(&n_buf, rfc7515_a2_n_b64);
+    const d_bytes = b64uDecode(&d_buf, rfc7515_a2_d_b64);
+
+    var buf: [1024]u8 = undefined;
+    const si = signingInputInto(&buf,
+        \\{"alg":"RS256","kid":"rs"}
+    ,
+        \\{"iss":"https://issuer.example","aud":"api://svc","exp":2000,"scope":"read"}
+    );
+    const sig = rsaTestSign(sha2.Sha256, 256, si, n_bytes, d_bytes);
+    const token = finishToken(&buf, si.len, &sig);
+
+    var verified = try parseVerifyJwks(gpa, token, jwks, .{
+        .now_s = 1000,
+        .issuer = "https://issuer.example",
+        .audience = "api://svc",
+    });
+    defer verified.deinit();
+    try testing.expectEqualStrings("read", verified.claims.claimStr("scope").?);
+
+    // Valid signature but expired → Expired (and nothing leaks on the way out).
+    try testing.expectError(error.Expired, parseVerifyJwks(gpa, token, jwks, .{
+        .now_s = 5000,
+    }));
+
+    // Token bearing a kid that was rotated away → NoMatchingKey.
+    var buf2: [1024]u8 = undefined;
+    const si2 = signingInputInto(&buf2,
+        \\{"alg":"RS256","kid":"rotated-away"}
+    ,
+        \\{"exp":2000}
+    );
+    const sig2 = rsaTestSign(sha2.Sha256, 256, si2, n_bytes, d_bytes);
+    const token2 = finishToken(&buf2, si2.len, &sig2);
+    try testing.expectError(error.NoMatchingKey, parseVerifyJwks(gpa, token2, jwks, .{
+        .now_s = 1000,
+    }));
+
+    // Right kid, corrupted signature → BadSignature.
+    var bad_sig = sig;
+    bad_sig[100] ^= 0x01;
+    var buf3: [1024]u8 = undefined;
+    const si3 = signingInputInto(&buf3,
+        \\{"alg":"RS256","kid":"rs"}
+    ,
+        \\{"iss":"https://issuer.example","aud":"api://svc","exp":2000,"scope":"read"}
+    );
+    const token3 = finishToken(&buf3, si3.len, &bad_sig);
+    try testing.expectError(error.BadSignature, parseVerifyJwks(gpa, token3, jwks, .{
+        .now_s = 1000,
+    }));
+
+    // Malformed token → the parse error surfaces unchanged.
+    try testing.expectError(error.MalformedToken, parseVerifyJwks(gpa, "nope", jwks, .{
+        .now_s = 1000,
+    }));
 }

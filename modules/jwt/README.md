@@ -2,26 +2,30 @@
 
 A JWT/JWS validator for OAuth2/OIDC resource servers: compact-serialization
 parsing (RFC 7515 §3.1) into typed models, registered-claims validation
-(RFC 7519 §4.1), and JWS signature verification (RFC 7515 §5.2 + RFC 7518)
+(RFC 7519 §4.1), JWS signature verification (RFC 7515 §5.2 + RFC 7518)
 for **HS256/384/512** (HMAC-SHA-2), **ES256/ES384** (ECDSA P-256/P-384),
 **EdDSA** (Ed25519, RFC 8037) and **RS256/384/512** (RSASSA-PKCS1-v1_5,
-RFC 8017 — the OIDC default). std-only and dependency-free —
-`std.base64.url_safe_no_pad` for the segments, `std.json` for
-header/payload, `std.crypto` for the signatures (RSA via
+RFC 8017 — the OIDC default), and **JWKS key sets** (RFC 7517): parse a
+`{"keys":[…]}` document into a typed `JwkSet`, select the key by the token
+header's `kid`, verify via `verifyWithJwks`/`parseVerifyJwks`. std-only and
+dependency-free — `std.base64.url_safe_no_pad` for the segments, `std.json`
+for header/payload/JWKS, `std.crypto` for the signatures (RSA via
 `std.crypto.Certificate.rsa`'s PKCS1-v1_5 verify over `std.crypto.ff`
 modexp).
 
-Provenance: clean-room from RFC 7515 (JWS), RFC 7519 (JWT), RFC 7518 (JWA),
-RFC 8037 (EdDSA in JOSE), RFC 8017 (PKCS #1 v2.2) and RFC 8725 (JWT Best
-Current Practices). No third-party JWT source consulted or copied.
+Provenance: clean-room from RFC 7515 (JWS), RFC 7517 (JWK), RFC 7519 (JWT),
+RFC 7518 (JWA), RFC 8037 (EdDSA in JOSE), RFC 8017 (PKCS #1 v2.2) and
+RFC 8725 (JWT Best Current Practices). No third-party JWT source consulted
+or copied.
 
 - **Status:** `gap`.
 - **Model after:** RFC 7515 (JWS) + RFC 7519 (JWT) + RFC 7518 (JWA) verify
-  incl. RS256 (RSASSA-PKCS1-v1_5, RFC 8017), RFC 8725 hardening;
-  OAuth2/OIDC resource server.
+  incl. RS256 (RSASSA-PKCS1-v1_5, RFC 8017) + RFC 7517 (JWK/JWKS key sets),
+  RFC 8725 hardening; OAuth2/OIDC resource server.
 - **Platform:** any. **Role:** util (Part 6 adds the resource-server
   middleware). **Concurrency:** reentrant — no shared or global state; each
-  `ParsedToken` owns its own arena.
+  `ParsedToken` and `JwkSet` owns its own arena, and a `JwkSet` is immutable
+  after parse (share freely across threads).
 - **Deps:** none (std only).
 
 ## SECURITY
@@ -51,9 +55,17 @@ that. Never authorize from a `ParsedToken` alone.
 - Unknown or not-yet-implemented algs (`PS*` — RSA-PSS; ES512 — no P-521
   in std) → `UnsupportedAlg`; wrong-length or garbage signatures →
   `BadSignature`, never a panic.
+- **JWKS selection cannot smuggle a mismatched key**: whatever
+  `JwkSet.selectKey` resolves still goes through `verify`'s key-type check
+  — a token whose `kid` points at the wrong key family gets
+  `AlgKeyMismatch`, not a downgrade. Selection itself honors the JWK's
+  `use` (only absent or `"sig"` is selectable; `"enc"` and unknown values
+  fail closed) and `alg` (when pinned, it must equal the token's `alg`).
+  A token without `kid` resolves only against a set with exactly one
+  usable key — the module never guesses among keys.
 
 Delivery plan: P1 parse + claims · P2 signature verify (HS/ES/EdDSA) ·
-P3 RSA (RS256/384/512) — **all three done** · P4 JWKS key sets ·
+P3 RSA (RS256/384/512) · P4 JWKS key sets — **all four done** ·
 P5 fetch/OIDC discovery · P6 middleware.
 
 ## API
@@ -70,6 +82,13 @@ P5 fetch/OIDC discovery · P6 middleware.
 | `Key` | tagged union: `.hmac` (secret bytes) \| `.ecdsa_p256` \| `.ecdsa_p384` \| `.ed25519` (std public keys) \| `.rsa` (`RsaPublicKey`); constructors `ecdsaP256FromCoords(x, y)` / `ecdsaP384FromCoords(x, y)` / `ed25519FromBytes(x)` / `rsaFromModExp(n, e)` take exactly a JWK's decoded parameters (`KeyError.InvalidKey` on bad points/moduli/exponents) |
 | `verify(&parsed, key) VerifyError!void` | recompute/check the signature over `signing_input`; RFC 8725 defenses baked in |
 | `parseAndVerify(gpa, token, key, Options) !ParsedToken` | the one-call API: parse → verify → validateClaims; frees on any failure |
+| `parseJwks(gpa, json) JwksError!JwkSet` | parse an RFC 7517 `{"keys":[…]}` document; per-JWK problems skip that key (recorded in `skipped`), only a non-JWKS document errors |
+| `JwkSet` | `keys: []const Jwk` (converted, usable) + `skipped: []const SkippedJwk` (index + `JwkSkipReason`) + `deinit()`; one arena owns everything |
+| `Jwk` | `key: Key` + selection metadata: `kid`, `use` (`sig`/`enc`/`other`), `alg` (pinned `Alg`) |
+| `JwkSet.keyForKid(kid) ?ResolvedKey` | first sig-usable key with that `kid` (no alg context) |
+| `JwkSet.selectKey(header) ?ResolvedKey` | header-aware selection: by `kid` (honoring `use` + pinned `alg`), or the single usable key when the token has no `kid` |
+| `verifyWithJwks(&parsed, jwks) VerifyError!void` | `selectKey` → `verify`; no usable key → `NoMatchingKey` |
+| `parseVerifyJwks(gpa, token, jwks, Options) !ParsedToken` | the one-call JWKS API: parse → resolve by `kid` + verify → validateClaims |
 
 `Options`: `now_s` (REQUIRED — caller-supplied seconds since epoch, no
 hidden clock, same injected-time rule as `resilience`/`probe`), `leeway_s`
@@ -82,7 +101,8 @@ Typed errors, never a panic: `ParseError` = `MalformedToken` ·
 `InvalidClaim` · `OutOfMemory`; `ValidateError` = `Expired` · `NotYetValid`
 · `IssuedInFuture` · `IssuerMismatch` · `AudienceMismatch` · `MissingExp`;
 `VerifyError` = `UnsecuredToken` · `AlgKeyMismatch` · `UnsupportedAlg` ·
-`BadSignature` · `InvalidKey`.
+`BadSignature` · `InvalidKey` · `NoMatchingKey` (JWKS resolution only);
+`JwksError` = `InvalidJson` · `NotAJwks` · `OutOfMemory`.
 
 ## Usage
 
@@ -98,12 +118,21 @@ var token = try jwt.parseAndVerify(gpa, bearer_token, .{ .hmac = secret }, .{
 defer token.deinit();
 const scope = token.claims.claimStr("scope") orelse "";
 
-// Or step by step — e.g. pick the key from the header's kid first
-// (Part 4's JWKS will do exactly this):
+// With a JWKS — the issuer's published key set, fetched by the caller
+// (Part 5 adds the fetch/cache; this stays offline):
+var jwks = try jwt.parseJwks(gpa, jwks_json);
+defer jwks.deinit();
+var token2 = try jwt.parseVerifyJwks(gpa, bearer_token, jwks, .{
+    .now_s = now_seconds,
+    .issuer = "https://issuer.example",
+});
+defer token2.deinit();
+
+// Or step by step — e.g. pick the key from the header's kid first:
 var parsed = try jwt.parse(gpa, bearer_token);
 defer parsed.deinit();
-const key = try jwt.Key.ecdsaP256FromCoords(jwk_x, jwk_y);
-try jwt.verify(&parsed, key);
+const jwk = jwks.selectKey(parsed.header) orelse return error.NoMatchingKey;
+try jwt.verify(&parsed, jwk.key);
 try jwt.validateClaims(parsed.claims, .{ .now_s = now_seconds });
 ```
 
@@ -123,12 +152,24 @@ try jwt.validateClaims(parsed.claims, .{ .now_s = now_seconds });
   entry in an `aud` array, …) are rejected at parse time (`InvalidClaim`)
   rather than silently dropped.
 - **HMAC keys are borrowed** — `Key.hmac` slices are not copied; they only
-  need to outlive the `verify` call itself.
+  need to outlive the `verify` call itself. (An `oct` JWK's decoded `k` is
+  arena-owned by its `JwkSet`, so this holds automatically there.)
+- **JWKS is skip-tolerant per key, strict per document** (RFC 7517 §5): a
+  set routinely publishes keys a verifier does not use, so an individual
+  JWK that is unsupported (`P-521`, `X25519`, unknown `kty`) or malformed
+  (bad base64url, wrong-length coordinates, off-curve point, bad
+  modulus/exponent, wrong-typed members) is *skipped* and recorded in
+  `JwkSet.skipped` with a `JwkSkipReason` — only a document that is not a
+  JWKS at all errors (`InvalidJson`/`NotAJwks`). Arbitrary bytes never
+  panic.
+- **`kty:"oct"` parses for completeness** (HS\* dev/test setups) — but a
+  *symmetric* key has no business in a *published* JWKS; anyone who can
+  read it can mint tokens.
 
 ## Verification
 
-`zig build test-jwt` — 37 fully offline tests (19 from P1, 12 from P2,
-6 from P3), green under Debug and ReleaseFast.
+`zig build test-jwt` — 47 fully offline tests (19 from P1, 12 from P2,
+6 from P3, 10 from P4), green under Debug and ReleaseFast.
 
 P1 (parse + claims): the RFC 7519 §3.1 example token end-to-end (header,
 claims incl. the `http://example.com/is_root` custom claim, signing input,
@@ -190,3 +231,38 @@ P3 (RSA, RS256/384/512):
   exponents → `InvalidKey` — never a panic.
 - **`parseAndVerify` RS256 end-to-end** (good → claims readable; expired /
   wrong key type → typed errors; the RFC KAT through the one-call API).
+
+P4 (JWKS, RFC 7517):
+
+- **RFC 7517 A.1 example set**: parses into the typed EC P-256 + RSA keys
+  with `kid`/`use`/`alg` intact; `keyForKid` finds the RSA signature key
+  and refuses the `use:"enc"` EC key.
+- **RFC keys as JWKs verify the RFC tokens**: the RFC 7515 A.2 RSA JWK
+  (`n`/`e`, `alg:"RS256"` pinned) verifies the A.2 RS256 token, the A.3
+  P-256 JWK (`x`/`y`) verifies the A.3 ES256 token, the A.1 `oct` JWK
+  verifies the A.1 HS256 token (all via the no-`kid` single-key path);
+  the RFC 8037 A.2 OKP JWK parses to an Ed25519 key.
+- **Selection by `kid`**: a 4-key mixed set (oct + EC + RSA + OKP) where
+  real HS256/ES256/RS256/EdDSA tokens each verify against their own `kid`;
+  an unpublished `kid` → `NoMatchingKey`.
+- **No smuggling**: an HS256 token whose `kid` points at the RSA JWK (the
+  RFC 8725 downgrade shape) and an ES256 token pointing at the OKP key →
+  `AlgKeyMismatch` from `verify`'s type check; `alg:"none"` with a valid
+  `kid` → `UnsecuredToken`.
+- **`use`/`alg` constraints**: `enc`-only and unknown-`use` sets →
+  `NoMatchingKey`; a JWK pinned `alg:"RS384"` refuses an RS256 token *with
+  a valid RS256 signature* (`NoMatchingKey`) yet verifies the RS384 one —
+  on both the `kid` and the no-`kid` path.
+- **Skip tolerance**: a set mixing P-521 / unknown-`kty` / X25519 /
+  `use:"enc"` with one good RSA key — three skipped with the right
+  reasons, the good key still verifies by `kid`; an 11-way malformed-JWK
+  matrix (non-object, missing/wrong-typed `kty`, bad base64url, missing
+  members, wrong-length and off-curve coordinates, non-canonical Ed25519,
+  empty `oct` secret, wrong-typed `kid`) — every reason asserted, the one
+  good key survives, never a panic.
+- **Document-level errors**: garbage / truncated JSON → `InvalidJson`;
+  valid-JSON non-JWKS shapes → `NotAJwks`; `{"keys":[]}` parses and
+  resolves nothing (`NoMatchingKey`).
+- **`parseVerifyJwks` end-to-end** (good → claims readable; expired /
+  rotated-away `kid` / corrupted signature / malformed token → the right
+  typed error, `std.testing.allocator` proving nothing leaks).
