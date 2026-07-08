@@ -116,6 +116,18 @@ fn findHeader(block: []const u8, name: []const u8) ?[]const u8 {
     return null;
 }
 
+/// First value of field `name` (case-insensitive) in a raw CRLF header/
+/// trailer block, or null — for callers holding a block directly (e.g. a
+/// request's captured chunked trailers).
+pub fn blockHeader(block: []const u8, name: []const u8) ?[]const u8 {
+    return findHeader(block, name);
+}
+
+/// Iterate a raw CRLF header/trailer block's fields in wire order.
+pub fn blockIterator(block: []const u8) HeaderIterator {
+    return iterateHeaderBlock(block);
+}
+
 /// Latch a Content-Length value; duplicates must agree (RFC 7230 §3.3.2).
 fn latchContentLength(current: *?u64, value: []const u8) HeadParseError!void {
     const n = std.fmt.parseInt(u64, value, 10) catch return error.MalformedHead;
@@ -337,9 +349,17 @@ pub fn isTchar(c: u8) bool {
 // ── chunked transfer-coding decoder ─────────────────────────────────────────
 
 /// Streaming decoder for `Transfer-Encoding: chunked` response bodies,
-/// exposed as a `std.Io.Reader` (`.reader`). Trailer fields are consumed and
-/// discarded. On protocol violation or a truncated stream it returns
-/// `error.ReadFailed` and records the cause in `fail_reason`.
+/// exposed as a `std.Io.Reader` (`.reader`). On protocol violation or a
+/// truncated stream it returns `error.ReadFailed` and records the cause in
+/// `fail_reason`.
+///
+/// Trailer fields (RFC 7230 §4.1.2) are consumed and — by default —
+/// discarded. Construct with `initCapturingTrailers` to instead capture the
+/// trailer section into a caller buffer, readable via `trailers` / `trailer`
+/// / `iterateTrailers` once the reader has reached end-of-stream (the whole
+/// body has been consumed). A trailer section larger than the buffer is
+/// truncated (the overflow is still drained off the wire), flagged by
+/// `trailers_overflow`.
 ///
 /// Not movable after `reader` has been handed out (the interface points back
 /// into this struct).
@@ -348,6 +368,14 @@ pub const ChunkedReader = struct {
     reader: Reader,
     state: State,
     fail_reason: ?FailReason = null,
+    /// Optional trailer-capture buffer; empty (the default) discards
+    /// trailers as before. Holds trailer lines as a raw header block
+    /// (CRLF-terminated, `HeaderIterator`-parseable).
+    trailer_buf: []u8 = &.{},
+    trailer_len: usize = 0,
+    /// The trailer section did not fit `trailer_buf`; excess lines were
+    /// dropped (still consumed off the wire).
+    trailers_overflow: bool = false,
 
     pub const FailReason = enum { malformed_chunk, truncated_body };
 
@@ -370,6 +398,32 @@ pub const ChunkedReader = struct {
                 .end = 0,
             },
         };
+    }
+
+    /// Like `init`, but capture the incoming trailer section into
+    /// `trailer_buf` instead of discarding it (see the type doc). Pass an
+    /// empty `trailer_buf` to disable capture (equivalent to `init`).
+    pub fn initCapturingTrailers(in: *Reader, buffer: []u8, trailer_buf: []u8) ChunkedReader {
+        var cr = init(in, buffer);
+        cr.trailer_buf = trailer_buf;
+        return cr;
+    }
+
+    /// The captured trailer section as a raw header block (empty unless
+    /// constructed with `initCapturingTrailers` and the body was fully
+    /// read). Parse with `iterateTrailers`/`trailer`.
+    pub fn trailers(c: *const ChunkedReader) []const u8 {
+        return c.trailer_buf[0..c.trailer_len];
+    }
+
+    /// First captured trailer field `name` (case-insensitive), or null.
+    pub fn trailer(c: *const ChunkedReader, name: []const u8) ?[]const u8 {
+        return findHeader(c.trailers(), name);
+    }
+
+    /// Iterate the captured trailer fields in wire order.
+    pub fn iterateTrailers(c: *const ChunkedReader) HeaderIterator {
+        return iterateHeaderBlock(c.trailers());
     }
 
     fn streamFn(r: *Reader, w: *Writer, limit: Limit) Reader.StreamError!usize {
@@ -403,8 +457,18 @@ pub const ChunkedReader = struct {
                     c.state = .chunk_header;
                 },
                 .trailers => {
-                    // Consume (and discard) trailer fields up to the blank line.
-                    if (trimLineEnd(try c.takeLine()).len == 0) c.state = .done;
+                    // Consume trailer fields up to the blank line; capture
+                    // them (with their CRLF, so the block parses like a head)
+                    // when a buffer was provided, else just discard.
+                    const line = try c.takeLine();
+                    if (trimLineEnd(line).len == 0) {
+                        c.state = .done;
+                    } else if (c.trailer_buf.len != 0) {
+                        if (c.trailer_len + line.len <= c.trailer_buf.len) {
+                            @memcpy(c.trailer_buf[c.trailer_len..][0..line.len], line);
+                            c.trailer_len += line.len;
+                        } else c.trailers_overflow = true;
+                    }
                 },
             }
         }
@@ -784,6 +848,40 @@ test "ChunkedReader rejects malformed and truncated input" {
         try testing.expectError(error.ReadFailed, cr.reader.streamRemaining(&w));
         try testing.expectEqual(case.reason, cr.fail_reason.?);
     }
+}
+
+test "ChunkedReader captures trailers when a buffer is provided" {
+    // Body decodes as before; the trailer fields are now readable.
+    var src: Reader = .fixed("3\r\nabc\r\n0\r\nX-Checksum: deadbeef\r\nX-Rows: 3\r\n\r\n");
+    var cbuf: [64]u8 = undefined;
+    var tbuf: [128]u8 = undefined;
+    var cr: ChunkedReader = .initCapturingTrailers(&src, &cbuf, &tbuf);
+    var out: [64]u8 = undefined;
+    var w: Writer = .fixed(&out);
+    _ = try cr.reader.streamRemaining(&w);
+    try testing.expectEqualStrings("abc", w.buffered());
+    // Trailers are available once the body is fully consumed.
+    try testing.expectEqualStrings("deadbeef", cr.trailer("x-checksum").?); // case-insensitive
+    try testing.expectEqualStrings("3", cr.trailer("X-Rows").?);
+    try testing.expect(cr.trailer("x-missing") == null);
+    try testing.expect(!cr.trailers_overflow);
+    var it = cr.iterateTrailers();
+    try testing.expectEqualStrings("X-Checksum", it.next().?.name);
+    try testing.expectEqualStrings("X-Rows", it.next().?.name);
+    try testing.expect(it.next() == null);
+}
+
+test "ChunkedReader: trailer capture overflow is flagged, body still decodes" {
+    var src: Reader = .fixed("3\r\nabc\r\n0\r\nX-Big: " ++ ("z" ** 200) ++ "\r\n\r\n");
+    var cbuf: [64]u8 = undefined;
+    var tbuf: [16]u8 = undefined; // too small for the trailer line
+    var cr: ChunkedReader = .initCapturingTrailers(&src, &cbuf, &tbuf);
+    var out: [64]u8 = undefined;
+    var w: Writer = .fixed(&out);
+    _ = try cr.reader.streamRemaining(&w); // body unaffected, overflow drained
+    try testing.expectEqualStrings("abc", w.buffered());
+    try testing.expect(cr.trailers_overflow);
+    try testing.expect(cr.trailer("x-big") == null); // dropped, not truncated-in
 }
 
 test "ContentLengthReader yields exactly n bytes" {

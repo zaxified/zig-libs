@@ -57,6 +57,48 @@ pub const Scratch = struct {
     window: [flate.max_window_len]u8,
 };
 
+/// Handler-facing buffer for the decompressed request-body reader (the cap
+/// wrapper's `std.Io.Reader` buffer). Small — the decoder streams straight
+/// through, this only backs buffered reads (peek/take) the handler may do.
+pub const decode_out_len = 4096;
+
+/// Working memory for the inbound gzip request-body decoder (Task 1): the
+/// `std.compress.flate` decoder plus its 64 KiB history window (~64 KiB
+/// total). The serving loop allocates one per connection while request
+/// decoding is enabled; the loop re-initializes `decompress` per request,
+/// so the owner only provides the memory (no init/deinit).
+pub const DecodeScratch = struct {
+    decompress: flate.Decompress = undefined,
+    window: [flate.max_window_len]u8 = undefined,
+    out: [decode_out_len]u8 = undefined,
+};
+
+/// A request's `Content-Encoding` classified for the inbound-decode path.
+pub const RequestEncoding = enum {
+    /// Absent, empty, or `identity` — the body is already plaintext.
+    identity,
+    /// A single `gzip` (or its `x-gzip` alias) coding — decodable.
+    gzip,
+    /// Anything we do not decode (deflate, br, a multi-coding list, …) →
+    /// the server answers 415 rather than hand the handler opaque bytes.
+    unsupported,
+};
+
+/// Classify a request `Content-Encoding` header for transparent inbound
+/// decoding. Only a single `gzip`/`x-gzip` coding is decodable here; a
+/// coding list (`gzip, br`) is treated as unsupported (we do not unwrap
+/// stacked codings). Absent/empty/`identity` means the body is plaintext.
+pub fn requestContentEncoding(content_encoding: ?[]const u8) RequestEncoding {
+    const raw = content_encoding orelse return .identity;
+    const value = std.mem.trim(u8, raw, " \t");
+    if (value.len == 0) return .identity;
+    if (std.mem.indexOfScalar(u8, value, ',') != null) return .unsupported;
+    if (std.ascii.eqlIgnoreCase(value, "identity")) return .identity;
+    if (std.ascii.eqlIgnoreCase(value, "gzip") or std.ascii.eqlIgnoreCase(value, "x-gzip"))
+        return .gzip;
+    return .unsupported;
+}
+
 /// Whether a request `Accept-Encoding` value admits gzip (RFC 9110
 /// §12.5.3): an explicit `gzip` (or its `x-gzip` alias) entry wins over a
 /// `*` wildcard; `q=0` on the winning entry is a refusal; an **absent
@@ -165,6 +207,24 @@ test "acceptsGzip: negotiation table" {
     try testing.expect(!acceptsGzip("gzip; Q=0"));
     try testing.expect(!acceptsGzip("*;q=0"));
     try testing.expect(!acceptsGzip("*;q=1, gzip;q=0")); // explicit beats wildcard
+}
+
+test "requestContentEncoding: classification" {
+    try testing.expectEqual(RequestEncoding.identity, requestContentEncoding(null));
+    try testing.expectEqual(RequestEncoding.identity, requestContentEncoding(""));
+    try testing.expectEqual(RequestEncoding.identity, requestContentEncoding("  "));
+    try testing.expectEqual(RequestEncoding.identity, requestContentEncoding("identity"));
+    try testing.expectEqual(RequestEncoding.identity, requestContentEncoding("Identity"));
+
+    try testing.expectEqual(RequestEncoding.gzip, requestContentEncoding("gzip"));
+    try testing.expectEqual(RequestEncoding.gzip, requestContentEncoding("GZIP"));
+    try testing.expectEqual(RequestEncoding.gzip, requestContentEncoding(" gzip "));
+    try testing.expectEqual(RequestEncoding.gzip, requestContentEncoding("x-gzip"));
+
+    try testing.expectEqual(RequestEncoding.unsupported, requestContentEncoding("deflate"));
+    try testing.expectEqual(RequestEncoding.unsupported, requestContentEncoding("br"));
+    try testing.expectEqual(RequestEncoding.unsupported, requestContentEncoding("gzip, br")); // list not unwrapped
+    try testing.expectEqual(RequestEncoding.unsupported, requestContentEncoding("gzip, gzip"));
 }
 
 test "contentTypeCompressible: default allowlist" {

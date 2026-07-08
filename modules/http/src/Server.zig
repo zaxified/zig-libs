@@ -123,6 +123,13 @@ pub const Compression = gzip.Compression;
 /// memory, nothing else.
 pub const GzipScratch = gzip.Scratch;
 
+/// Working memory for the inbound gzip request-body decoder (Task 1): the
+/// flate decoder + its 64 KiB history window (~68 KiB). One per connection
+/// while `Options.max_decompressed_request_bytes` is nonzero; the serving
+/// loop allocates it and passes it via `StreamBuffers.gunzip`. Re-initialized
+/// per request — provide the memory, nothing else.
+pub const GunzipScratch = gzip.DecodeScratch;
+
 pub const Options = struct {
     handler: Handler,
     /// Opaque pointer handed to the handler as `Request.context`.
@@ -197,6 +204,16 @@ pub const Options = struct {
     /// enabled every response carries `Vary: Accept-Encoding`, and each
     /// connection costs an extra ~290 KiB of encoder state.
     compression: ?Compression = null,
+    /// Transparent inbound gzip request-body decoding (Task 1): when a
+    /// request carries `Content-Encoding: gzip`, the body the handler reads
+    /// via `req.reader()` is decompressed on the fly, capped at this many
+    /// **decompressed** bytes (a zip-bomb bound — a small compressed body
+    /// can inflate enormously). 0 = off: a `Content-Encoding: gzip` request
+    /// is then refused with 415 rather than handing the handler compressed
+    /// bytes. Any other non-identity `Content-Encoding` answers 415
+    /// regardless of this knob. Costs an extra ~68 KiB (decoder window) per
+    /// connection while enabled.
+    max_decompressed_request_bytes: u64 = 0,
     /// Auto `Server` response header, overridable per response.
     server_name: []const u8 = "zig-libs-http/0.1",
     kernel_backlog: u31 = 128,
@@ -342,6 +359,9 @@ const body_scratch_len = 4096;
 /// Chunked-encoder scratch; only aggregates small writes, large writes pass
 /// through as single chunks.
 const chunk_scratch_len = 512;
+/// Capture buffer for an incoming chunked request's trailer section (Task 3);
+/// a trailer block larger than this is truncated (excess still drained).
+const trailer_scratch_len = 1024;
 /// How much unread request body to drain after the handler before giving up
 /// on keep-alive (Go's maxPostHandlerReadBytes).
 const max_unread_body_drain = 256 * 1024;
@@ -356,7 +376,7 @@ fn connMain(s: *Server, stream: net.Stream) void {
 
     const o = &s.options;
     const total = o.read_buffer_size + o.write_buffer_size + o.max_header_bytes +
-        o.response_buffer_size + body_scratch_len + chunk_scratch_len;
+        o.response_buffer_size + body_scratch_len + chunk_scratch_len + trailer_scratch_len;
     const slab = s.gpa.alloc(u8, total) catch return; // overloaded: drop the connection
     defer s.gpa.free(slab);
 
@@ -368,6 +388,14 @@ fn connMain(s: *Server, stream: net.Stream) void {
         null;
     defer if (gz) |p| s.gpa.destroy(p);
 
+    // Inbound gzip request-body decoder working memory (Task 1), only when
+    // request decoding is enabled. Same overload policy as the slab.
+    const gunzip: ?*GunzipScratch = if (o.max_decompressed_request_bytes != 0)
+        s.gpa.create(GunzipScratch) catch return
+    else
+        null;
+    defer if (gunzip) |p| s.gpa.destroy(p);
+
     var off: usize = 0;
     const read_buf = slab[off..][0..o.read_buffer_size];
     off += o.read_buffer_size;
@@ -378,7 +406,9 @@ fn connMain(s: *Server, stream: net.Stream) void {
         .response_body = slab[off + o.max_header_bytes ..][0..o.response_buffer_size],
         .request_body = slab[off + o.max_header_bytes + o.response_buffer_size ..][0..body_scratch_len],
         .chunk = slab[off + o.max_header_bytes + o.response_buffer_size + body_scratch_len ..][0..chunk_scratch_len],
+        .trailers = slab[off + o.max_header_bytes + o.response_buffer_size + body_scratch_len + chunk_scratch_len ..][0..trailer_scratch_len],
         .gzip = gz,
+        .gunzip = gunzip,
     };
 
     // All read buffering lives in the TimeoutReader (bounds head lines and
@@ -428,6 +458,7 @@ fn connMain(s: *Server, stream: net.Stream) void {
         .on_conn_state = o.on_conn_state,
         .on_conn_state_ctx = o.on_conn_state_ctx,
         .compression = o.compression,
+        .max_decompressed_request_bytes = o.max_decompressed_request_bytes,
         .max_requests_per_conn = o.max_requests_per_conn,
     }, &tr.reader, &tw.writer, bufs, &tr);
 }
@@ -643,6 +674,11 @@ pub const StreamOptions = struct {
     /// Negotiated gzip response compression (see `Options.compression`);
     /// active only when `StreamBuffers.gzip` is also provided. null = off.
     compression: ?Compression = null,
+    /// Transparent inbound gzip request-body decoding (see
+    /// `Options.max_decompressed_request_bytes`); active only when
+    /// `StreamBuffers.gunzip` is also provided. 0 = off (a gzip-encoded
+    /// request is then refused with 415).
+    max_decompressed_request_bytes: u64 = 0,
     /// Max requests served on this connection before it closes gracefully
     /// (see `Options.max_requests_per_conn`). 0 = unlimited (the default
     /// here, so the plain codec stays permissive; the socket serving loop
@@ -671,10 +707,19 @@ pub const StreamBuffers = struct {
     /// compression enabled it must be at least 9 bytes — the gzip
     /// encoder's output-buffer floor).
     chunk: []u8,
+    /// Capture buffer for an incoming chunked request's trailer fields
+    /// (Task 3), surfaced via `Request.trailer` / `iterateTrailers`. Empty
+    /// (the default) = trailers are consumed and discarded, as before.
+    trailers: []u8 = &.{},
     /// Gzip-encoder working memory; required for
     /// `StreamOptions.compression` to take effect (compression stays off
     /// without it). The serving loop allocates one per connection.
     gzip: ?*GzipScratch = null,
+    /// Inbound gzip request-body decoder working memory; required for
+    /// `StreamOptions.max_decompressed_request_bytes` to take effect
+    /// (request decoding stays off without it). The serving loop allocates
+    /// one per connection.
+    gunzip: ?*GunzipScratch = null,
 };
 
 /// Serve HTTP/1.1 requests from `in`, responding on `out`, until the
@@ -795,6 +840,17 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
             return respondError(opts, out, date, 413);
     }
 
+    // Inbound Content-Encoding (Task 1): a body we cannot decode must never
+    // reach the handler as opaque bytes. `gzip` is decoded transparently
+    // when enabled; anything else non-identity — and `gzip` while decoding
+    // is off — answers 415 before the handler (and before 100-continue
+    // invites the body onto the wire).
+    const req_encoding = gzip.requestContentEncoding(head.header("content-encoding"));
+    const decode_gzip = req_encoding == .gzip and
+        opts.max_decompressed_request_bytes != 0 and bufs.gunzip != null;
+    if (req_encoding == .unsupported or (req_encoding == .gzip and !decode_gzip))
+        return respondError(opts, out, date, 415);
+
     const has_body = head.chunked or (head.content_length orelse 0) != 0;
     if (head.expect_continue and has_body) {
         out.writeAll("HTTP/1.1 100 Continue\r\n\r\n") catch return .close;
@@ -802,9 +858,9 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
     }
 
     var body: RequestBody = if (opts.max_body_bytes) |max|
-        .initCapped(&head, in, bufs.request_body, max)
+        .initCappedWithTrailers(&head, in, bufs.request_body, max, bufs.trailers)
     else
-        .init(&head, in, bufs.request_body);
+        .initWithTrailers(&head, in, bufs.request_body, bufs.trailers);
     var req: Request = .{
         .method = method,
         .target = head.target,
@@ -816,6 +872,18 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
         .peer = opts.peer,
         .conn_request_index = req_index,
     };
+    // Inbound gzip decoding (Task 1): route the handler's `req.reader()`
+    // through the flate decoder wrapped in a decompressed-byte cap. The
+    // framing body (`body`) stays the raw source — it is what the
+    // post-handler drain consumes — while `req.decoded` overrides the
+    // handler-facing reader with the plaintext stream.
+    var gunzip_body: GunzipBody = undefined;
+    if (decode_gzip) {
+        const sc = bufs.gunzip.?;
+        sc.decompress = .init(body.reader(), .gzip, &sc.window);
+        gunzip_body = .init(&sc.decompress.reader, opts.max_decompressed_request_bytes, &sc.out);
+        req.decoded = &gunzip_body.reader;
+    }
     // Compression is considered only when configured AND the working
     // memory is there; the Accept-Encoding negotiation is per request.
     const compression_on = opts.compression != null and bufs.gzip != null;
@@ -836,8 +904,11 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
         if (rw.sent_head) return .close;
         // A body that crossed max_body_bytes failed the handler's reads —
         // that is the request's fault, not the handler's: answer 413 and
-        // close (the remaining body is unbounded, never drain it).
+        // close (the remaining body is unbounded, never drain it). Same for
+        // a gzip body that inflated past the decompressed cap (zip bomb).
         if (body == .capped and body.capped.exceeded)
+            return respondError(opts, out, date, 413);
+        if (decode_gzip and gunzip_body.exceeded)
             return respondError(opts, out, date, 413);
         rw.reset();
         rw.setStatus(500);
@@ -909,6 +980,10 @@ pub const Request = struct {
     /// The parsed head, for framing fields beyond `header`/`iterateHeaders`.
     head: h1.RequestHead,
     body: *RequestBody,
+    /// Transparent inbound-decoding override (Task 1): when set, `reader`
+    /// returns this decoded (e.g. gunzipped) stream instead of `body`'s raw
+    /// framing reader. The framing `body` remains the drain source.
+    decoded: ?*Reader = null,
     /// `Options.context` passthrough for stateful handlers.
     context: ?*anyopaque,
     /// Socket peer address — see `peerAddress`.
@@ -942,10 +1017,35 @@ pub const Request = struct {
     }
 
     /// Streaming request-body reader — Content-Length / chunked framing
-    /// already decoded; end-of-stream at the end of the body (immediately
-    /// for bodyless requests).
+    /// already decoded, and (when `Options.max_decompressed_request_bytes`
+    /// is enabled) a `Content-Encoding: gzip` body transparently
+    /// decompressed; end-of-stream at the end of the body (immediately for
+    /// bodyless requests).
     pub fn reader(req: *Request) *Reader {
-        return req.body.reader();
+        return req.decoded orelse req.body.reader();
+    }
+
+    /// Incoming chunked **trailer** fields (RFC 7230 §4.1.2), captured when
+    /// trailer support is enabled (`StreamBuffers.trailers` non-empty; the
+    /// socket serving loop provides a buffer by default). Valid only **after
+    /// the request body has been fully read** — trailers arrive on the wire
+    /// after the last chunk, so a handler must drain `reader()` to
+    /// end-of-stream first. Empty for non-chunked bodies or when capture is
+    /// off. `trailer` looks one up (case-insensitive); `iterateTrailers`
+    /// walks them in wire order; `trailers` returns the raw block.
+    pub fn trailer(req: *const Request, name: []const u8) ?[]const u8 {
+        return h1.blockHeader(req.body.trailerBlock(), name);
+    }
+
+    /// Iterate captured incoming chunked trailers in wire order (see
+    /// `trailer`).
+    pub fn iterateTrailers(req: *const Request) h1.HeaderIterator {
+        return h1.blockIterator(req.body.trailerBlock());
+    }
+
+    /// The raw captured incoming chunked trailer block (see `trailer`).
+    pub fn trailers(req: *const Request) []const u8 {
+        return req.body.trailerBlock();
     }
 };
 
@@ -960,7 +1060,15 @@ pub const RequestBody = union(enum) {
     capped: Capped,
 
     pub fn init(head: *const h1.RequestHead, in: *Reader, scratch: []u8) RequestBody {
-        if (head.chunked) return .{ .chunked = .init(in, scratch) };
+        return initWithTrailers(head, in, scratch, &.{});
+    }
+
+    /// Like `init`, additionally capturing an incoming chunked body's
+    /// trailer section (RFC 7230 §4.1.2) into `trailer_buf` — readable via
+    /// `trailerBlock` once the body is fully consumed. An empty `trailer_buf`
+    /// disables capture (identical to `init`).
+    pub fn initWithTrailers(head: *const h1.RequestHead, in: *Reader, scratch: []u8, trailer_buf: []u8) RequestBody {
+        if (head.chunked) return .{ .chunked = .initCapturingTrailers(in, scratch, trailer_buf) };
         const n = head.content_length orelse 0;
         if (n != 0) return .{ .limited = .init(in, n, scratch) };
         return .{ .none = .fixed("") };
@@ -972,8 +1080,14 @@ pub const RequestBody = union(enum) {
     /// reject declared lengths above the cap (the serving loop answers 413
     /// before the handler runs).
     pub fn initCapped(head: *const h1.RequestHead, in: *Reader, scratch: []u8, max_body: u64) RequestBody {
-        if (head.chunked) return .{ .capped = .init(in, max_body, scratch) };
-        return RequestBody.init(head, in, scratch);
+        return initCappedWithTrailers(head, in, scratch, max_body, &.{});
+    }
+
+    /// `initCapped` + chunked trailer capture into `trailer_buf` (see
+    /// `initWithTrailers`).
+    pub fn initCappedWithTrailers(head: *const h1.RequestHead, in: *Reader, scratch: []u8, max_body: u64, trailer_buf: []u8) RequestBody {
+        if (head.chunked) return .{ .capped = .initCapturingTrailers(in, max_body, scratch, trailer_buf) };
+        return initWithTrailers(head, in, scratch, trailer_buf);
     }
 
     pub fn reader(b: *RequestBody) *Reader {
@@ -982,6 +1096,18 @@ pub const RequestBody = union(enum) {
             .limited => |*lr| &lr.reader,
             .chunked => |*cr| &cr.reader,
             .capped => |*cc| &cc.reader,
+        };
+    }
+
+    /// The captured incoming chunked trailer section as a raw header block
+    /// (empty unless the body was chunked, trailer capture was enabled, and
+    /// the body has been fully read). Parse with `h1.blockHeader` /
+    /// `h1.blockIterator` — or use `Request.trailer` / `iterateTrailers`.
+    pub fn trailerBlock(b: *const RequestBody) []const u8 {
+        return switch (b.*) {
+            .chunked => |*cr| cr.trailers(),
+            .capped => |*cc| cc.inner.trailers(),
+            .none, .limited => "",
         };
     }
 
@@ -1015,6 +1141,14 @@ pub const RequestBody = union(enum) {
             };
         }
 
+        /// `init` + chunked trailer capture into `trailer_buf` (see
+        /// `ChunkedReader.initCapturingTrailers`).
+        pub fn initCapturingTrailers(in: *Reader, max_body: u64, scratch: []u8, trailer_buf: []u8) Capped {
+            var c = Capped.init(in, max_body, scratch);
+            c.inner.trailer_buf = trailer_buf;
+            return c;
+        }
+
         fn streamFn(r: *Reader, w: *Writer, limit: std.Io.Limit) Reader.StreamError!usize {
             const c: *Capped = @alignCast(@fieldParentPtr("reader", r));
             if (c.remaining == 0) {
@@ -1037,6 +1171,61 @@ pub const RequestBody = union(enum) {
             return n;
         }
     };
+};
+
+/// Decompressed-size cap for a transparently-decoded gzip request body
+/// (Task 1). Streams plaintext out of the `std.compress.flate` gzip decoder
+/// under a decompressed-byte budget; once the budget is spent it probes for
+/// a clean end of body — anything beyond it is a zip bomb, so the read fails
+/// with `exceeded` set (the serving loop maps that to 413 when nothing was
+/// sent yet, and closes the connection either way). Mirrors
+/// `RequestBody.Capped`, but the bounded quantity is *decompressed* bytes.
+///
+/// Not movable after `reader` has been handed out.
+pub const GunzipBody = struct {
+    /// The flate gzip decoder's reader (its window lives in `GunzipScratch`).
+    inner: *Reader,
+    /// Decompressed bytes still allowed.
+    remaining: u64,
+    exceeded: bool = false,
+    reader: Reader,
+
+    pub fn init(inner: *Reader, max_body: u64, buffer: []u8) GunzipBody {
+        return .{
+            .inner = inner,
+            .remaining = max_body,
+            .reader = .{
+                .vtable = &.{ .stream = streamFn },
+                .buffer = buffer,
+                .seek = 0,
+                .end = 0,
+            },
+        };
+    }
+
+    fn streamFn(r: *Reader, w: *Writer, limit: std.Io.Limit) Reader.StreamError!usize {
+        const c: *GunzipBody = @alignCast(@fieldParentPtr("reader", r));
+        if (c.remaining == 0) {
+            // At the cap: the decompressed body must end exactly here. Probe
+            // one byte — a clean end passes, anything more is a zip bomb.
+            while (true) {
+                const n = c.inner.discard(.limited(1)) catch |err| switch (err) {
+                    error.EndOfStream => return error.EndOfStream,
+                    error.ReadFailed => return error.ReadFailed,
+                };
+                if (n != 0) {
+                    c.exceeded = true;
+                    return error.ReadFailed;
+                }
+            }
+        }
+        const n = c.inner.stream(w, limit.min(.limited64(c.remaining))) catch |err| switch (err) {
+            error.EndOfStream => return error.EndOfStream,
+            error.ReadFailed, error.WriteFailed => |e| return e,
+        };
+        c.remaining -= n;
+        return n;
+    }
 };
 
 // ── the response writer ─────────────────────────────────────────────────────
@@ -1203,6 +1392,27 @@ pub const ResponseWriter = struct {
         }
         if (rw.headers_len == max_response_headers) return error.TooManyHeaders;
         rw.headers[rw.headers_len] = .{ .name = name, .value = value };
+        rw.headers_len += 1;
+    }
+
+    /// Append a `Set-Cookie` response header (RFC 6265) — the one response
+    /// header that is legitimately repeatable, which `setHeader`'s
+    /// replace-by-name semantics cannot express (only the last would
+    /// survive). Each call adds another line; `writeHead` emits every one on
+    /// its own `Set-Cookie:` line, in call order. The value gets the same
+    /// response-splitting validation `setHeader` applies (no CR/LF/NUL —
+    /// `error.InvalidHeader` otherwise); the name is fixed, so it is always a
+    /// valid token. Counts against the same `max_response_headers` budget
+    /// (`error.TooManyHeaders`) and is likewise rejected once the head is on
+    /// the wire (`error.HeadersSent`).
+    pub fn addSetCookie(rw: *ResponseWriter, value: []const u8) SetHeaderError!void {
+        if (rw.sent_head) return error.HeadersSent;
+        if (!validHeaderValue(value)) return error.InvalidHeader;
+        if (rw.headers_len == max_response_headers) return error.TooManyHeaders;
+        // Appended straight to the header table (no replace scan), so
+        // multiple Set-Cookie entries coexist and each is serialized by
+        // `writeHead` like any other header.
+        rw.headers[rw.headers_len] = .{ .name = "Set-Cookie", .value = value };
         rw.headers_len += 1;
     }
 
@@ -1719,6 +1929,19 @@ fn testHandler(req: *Request, rw: *ResponseWriter) anyerror!void {
         }
         var buf: [32]u8 = undefined;
         try rw.writeAll(try std.fmt.bufPrint(&buf, "drained {d}", .{total}));
+    } else if (std.mem.eql(u8, req.path, "/trailers")) {
+        // Drain the body to end-of-stream (trailers arrive after the last
+        // chunk), then echo a captured trailer field.
+        const r = req.reader();
+        while (true) {
+            _ = r.discard(.limited(4096)) catch |err| switch (err) {
+                error.EndOfStream => break,
+                error.ReadFailed => return error.BodyReadFailed,
+            };
+        }
+        const cs = req.trailer("X-Checksum") orelse "none";
+        var buf: [96]u8 = undefined;
+        try rw.writeAll(try std.fmt.bufPrint(&buf, "trailer={s}", .{cs}));
     } else if (std.mem.eql(u8, req.path, "/stream")) {
         // Incremental streaming: each write+flush becomes its own chunk on the
         // wire (proves flush() reaches the socket mid-handler — the SSE path).
@@ -1748,6 +1971,7 @@ const StreamTweaks = struct {
     on_conn_state: ?ConnStateFn = null,
     on_conn_state_ctx: ?*anyopaque = null,
     compression: ?Compression = null,
+    max_decompressed_request_bytes: u64 = 0,
     max_requests_per_conn: u32 = 0,
 };
 
@@ -1761,10 +1985,15 @@ fn runStreamWith(tweaks: StreamTweaks, ctx: ?*anyopaque, wire: []const u8, out_b
     var request_body_buf: [256]u8 = undefined;
     var response_body_buf: [64]u8 = undefined;
     var chunk_buf: [128]u8 = undefined;
+    var trailer_buf: [256]u8 = undefined;
     var gz: ?*GzipScratch = null;
     defer if (gz) |p| testing.allocator.destroy(p);
     if (tweaks.compression != null)
         gz = testing.allocator.create(GzipScratch) catch @panic("OOM");
+    var gunzip: ?*GunzipScratch = null;
+    defer if (gunzip) |p| testing.allocator.destroy(p);
+    if (tweaks.max_decompressed_request_bytes != 0)
+        gunzip = testing.allocator.create(GunzipScratch) catch @panic("OOM");
     serveStream(.{
         .handler = testHandler,
         .context = ctx,
@@ -1776,13 +2005,16 @@ fn runStreamWith(tweaks: StreamTweaks, ctx: ?*anyopaque, wire: []const u8, out_b
         .on_conn_state = tweaks.on_conn_state,
         .on_conn_state_ctx = tweaks.on_conn_state_ctx,
         .compression = tweaks.compression,
+        .max_decompressed_request_bytes = tweaks.max_decompressed_request_bytes,
         .max_requests_per_conn = tweaks.max_requests_per_conn,
     }, &in, &out, .{
         .head = &head_buf,
         .request_body = &request_body_buf,
         .response_body = &response_body_buf,
         .chunk = &chunk_buf,
+        .trailers = &trailer_buf,
         .gzip = gz,
+        .gunzip = gunzip,
     });
     return out.buffered();
 }
@@ -2066,6 +2298,50 @@ test "ResponseWriter: header CR/LF/NUL + invalid name rejected (response-splitti
         "Content-Length: 4\r\n" ++
         "\r\n" ++
         "body", wire);
+}
+
+test "ResponseWriter: addSetCookie emits multiple Set-Cookie lines (Task 2)" {
+    var out_buf: [256]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+    // A plain header alongside two cookies — all three survive; the cookies
+    // are NOT collapsed into one the way setHeader-replace would.
+    try rw.setHeader("Content-Type", "text/plain");
+    try rw.addSetCookie("sid=abc; HttpOnly");
+    try rw.addSetCookie("theme=dark; Path=/");
+    try rw.writeAll("ok");
+    try rw.end();
+    const wire = out.buffered();
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, wire, "Set-Cookie: "));
+    try testing.expect(std.mem.indexOf(u8, wire, "Set-Cookie: sid=abc; HttpOnly\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, wire, "Set-Cookie: theme=dark; Path=/\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, wire, "Content-Type: text/plain\r\n") != null);
+    // setHeader for a non-cookie header still replaces (semantics unchanged).
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, wire, "Content-Type: "));
+}
+
+test "ResponseWriter: addSetCookie validates the value + head-sent guard (Task 2)" {
+    var out_buf: [256]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+    // Same response-splitting guard as setHeader: an injected CRLF (or bare
+    // CR/LF/NUL) is refused, so a second Set-Cookie can never be smuggled in.
+    try testing.expectError(error.InvalidHeader, rw.addSetCookie("x=1\r\nSet-Cookie: pwned=1"));
+    try testing.expectError(error.InvalidHeader, rw.addSetCookie("x=1\n"));
+    try testing.expectError(error.InvalidHeader, rw.addSetCookie("x=1\r"));
+    try testing.expectError(error.InvalidHeader, rw.addSetCookie("x=1\x00"));
+    // A clean cookie still works, and none of the rejected bytes reached the wire.
+    try rw.addSetCookie("ok=1");
+    try rw.end();
+    const wire = out.buffered();
+    try testing.expect(std.mem.indexOf(u8, wire, "pwned") == null);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, wire, "Set-Cookie: "));
+    // Once the head is on the wire it is too late.
+    try testing.expectError(error.HeadersSent, rw.addSetCookie("late=1"));
 }
 
 test "request codec: standalone parse + body decode from fixed bytes" {
@@ -2417,6 +2693,115 @@ test "serveStream gzip: keep-alive survives a compressed response" {
     // second (identity) response.
     try testing.expect(std.mem.indexOf(u8, got, "0\r\n\r\nHTTP/1.1 200 OK\r\n") != null);
     try testing.expect(std.mem.endsWith(u8, got, "hello"));
+}
+
+// ── tests (offline — Task 3: incoming chunked trailers) ─────────────────────
+
+test "serveStream: chunked request trailers reach the handler (Task 3)" {
+    var out_buf: [4096]u8 = undefined;
+    const wire = "POST /trailers HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+        "4\r\nWiki\r\n5\r\npedia\r\n0\r\nX-Checksum: deadbeef\r\nX-Rows: 2\r\n\r\n";
+    // Default path (no body cap): trailers captured, handler reads them.
+    const got = runStream(null, wire, &out_buf);
+    try testing.expect(std.mem.endsWith(u8, got, "trailer=deadbeef"));
+    // Capped chunked path (max_body_bytes set) captures trailers too.
+    const capped = runStreamWith(.{ .max_body_bytes = 1024 }, null, wire, &out_buf);
+    try testing.expect(std.mem.endsWith(u8, capped, "trailer=deadbeef"));
+}
+
+test "serveStream: a body with no trailers reports none (Task 3)" {
+    var out_buf: [4096]u8 = undefined;
+    // Chunked but no trailer fields.
+    const chunked = runStream(null, "POST /trailers HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+        "3\r\nabc\r\n0\r\n\r\n", &out_buf);
+    try testing.expect(std.mem.endsWith(u8, chunked, "trailer=none"));
+    // Content-Length body: no trailer concept at all → none.
+    const cl = runStream(null, "POST /trailers HTTP/1.1\r\nHost: t\r\nContent-Length: 3\r\n\r\nabc", &out_buf);
+    try testing.expect(std.mem.endsWith(u8, cl, "trailer=none"));
+}
+
+// ── tests (offline — Task 1: inbound gzip request-body decoding) ────────────
+
+/// gzip-compress `plain` into a freshly allocated buffer (caller frees).
+fn gzipAlloc(plain: []const u8) ![]u8 {
+    const scratch = try testing.allocator.create(GzipScratch);
+    defer testing.allocator.destroy(scratch);
+    var aw: Writer.Allocating = try .initCapacity(testing.allocator, 64);
+    defer aw.deinit();
+    scratch.compress = try flate.Compress.init(&aw.writer, &scratch.window, .gzip, gzip.levelOptions(6));
+    try scratch.compress.writer.writeAll(plain);
+    try scratch.compress.finish();
+    return testing.allocator.dupe(u8, aw.written());
+}
+
+/// Build a `POST /echo` request whose body is `compressed` under the given
+/// `Content-Encoding` (caller frees).
+fn gzipRequest(content_encoding: []const u8, compressed: []const u8) ![]u8 {
+    return std.fmt.allocPrint(testing.allocator, "POST /echo HTTP/1.1\r\nHost: t\r\n" ++
+        "Content-Encoding: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{
+        content_encoding, compressed.len, compressed,
+    });
+}
+
+test "serveStream: gzip request body is decompressed for the handler" {
+    // 52 decompressed bytes: fits /echo's response buffer (64) so the reply
+    // is exact-Content-Length — endsWith(plain) proves the decoded plaintext.
+    const plain = "gzipped-body!" ** 4;
+    const compressed = try gzipAlloc(plain);
+    defer testing.allocator.free(compressed);
+    try testing.expect(compressed.len < plain.len); // repetitive → shrinks
+    const wire = try gzipRequest("gzip", compressed);
+    defer testing.allocator.free(wire);
+
+    var out_buf: [4096]u8 = undefined;
+    const got = runStreamWith(.{ .max_decompressed_request_bytes = 1 << 20 }, null, wire, &out_buf);
+    var lenbuf: [32]u8 = undefined;
+    const cl = try std.fmt.bufPrint(&lenbuf, "Content-Length: {d}\r\n", .{plain.len});
+    try testing.expect(std.mem.indexOf(u8, got, cl) != null);
+    try testing.expect(std.mem.endsWith(u8, got, plain));
+    // The x-gzip alias decodes identically.
+    const wire2 = try gzipRequest("x-gzip", compressed);
+    defer testing.allocator.free(wire2);
+    const got2 = runStreamWith(.{ .max_decompressed_request_bytes = 1 << 20 }, null, wire2, &out_buf);
+    try testing.expect(std.mem.endsWith(u8, got2, plain));
+}
+
+test "serveStream: gzip request body over the decompressed cap → 413 (zip-bomb guard)" {
+    const plain = "gzipped-body!" ** 4; // 52 decompressed bytes
+    const compressed = try gzipAlloc(plain);
+    defer testing.allocator.free(compressed);
+    const wire = try gzipRequest("gzip", compressed);
+    defer testing.allocator.free(wire);
+
+    var out_buf: [4096]u8 = undefined;
+    // Cap of 16 < 52 decoded → the handler's read fails, mapped to 413
+    // before the head is sent.
+    const got = runStreamWith(.{ .max_decompressed_request_bytes = 16 }, null, wire, &out_buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 413 Content Too Large\r\n"));
+    try testing.expect(std.mem.indexOf(u8, got, "Connection: close\r\n") != null);
+}
+
+test "serveStream: identity request body unchanged while gzip decoding is enabled" {
+    var out_buf: [4096]u8 = undefined;
+    const got = runStreamWith(.{ .max_decompressed_request_bytes = 1 << 20 }, null, "POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello", &out_buf);
+    try testing.expect(std.mem.indexOf(u8, got, "Content-Length: 5\r\n") != null);
+    try testing.expect(std.mem.endsWith(u8, got, "\r\n\r\nhello"));
+}
+
+test "serveStream: unsupported / disabled Content-Encoding → 415" {
+    var hits: Hits = .init(0);
+    var out_buf: [4096]u8 = undefined;
+    // An unknown coding is refused even with decoding enabled.
+    const br = runStreamWith(.{ .max_decompressed_request_bytes = 1 << 20 }, &hits, "POST /echo HTTP/1.1\r\nHost: t\r\nContent-Encoding: br\r\nContent-Length: 3\r\n\r\nabc", &out_buf);
+    try testing.expect(std.mem.startsWith(u8, br, "HTTP/1.1 415 Unsupported Media Type\r\n"));
+    // gzip while decoding is OFF (the default) is refused too — never hand
+    // the handler compressed bytes.
+    const off = runStream(&hits, "POST /echo HTTP/1.1\r\nHost: t\r\nContent-Encoding: gzip\r\nContent-Length: 3\r\n\r\nabc", &out_buf);
+    try testing.expect(std.mem.startsWith(u8, off, "HTTP/1.1 415 Unsupported Media Type\r\n"));
+    // A coding list is not unwrapped → 415.
+    const list = runStreamWith(.{ .max_decompressed_request_bytes = 1 << 20 }, &hits, "POST /echo HTTP/1.1\r\nHost: t\r\nContent-Encoding: gzip, br\r\nContent-Length: 3\r\n\r\nabc", &out_buf);
+    try testing.expect(std.mem.startsWith(u8, list, "HTTP/1.1 415 Unsupported Media Type\r\n"));
+    try testing.expectEqual(@as(u32, 0), hits.load(.monotonic)); // handler never ran
 }
 
 // ── tests (in-process integration — Phase-1 client vs this server) ──────────

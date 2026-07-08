@@ -326,9 +326,13 @@ fmt green. **Still open:** request-ID mw · health helper · conditional-req · 
   anti-smuggling RFC 9112 §2.2 → 400) · ✅ **auto-OPTIONS** in router (opt-in `auto_options` → 204 + Allow) ·
   ✅ **Link pagination** (NEW `linkheader`, RFC 8288) · ✅ **Idempotency-Key** (NEW `idempotency`, ramcache
   Store + replay middleware) · ✅ **HMAC signing** (NEW `webhooksig`, GitHub/Stripe const-time verify+rotation) ·
-  ✅ **traceparent/OTel** (NEW `tracecontext`, W3C Trace Context + `current()`). **Still open:** ✅ **cookies** (new `cookies` module — P1 `Cookie` parser `parse`/`find` + P2 `SetCookie` builder w/ SameSite/HttpOnly/Secure + injection guard; Fable, 16 tests) ·
-  Set-Cookie(SameSite) · Range/206 · inbound gzip request body · content negotiation · request trailers ·
-  per-conn request-count cap · HTTP/3 (large, deferred/never).
+  ✅ **traceparent/OTel** (NEW `tracecontext`, W3C Trace Context + `current()`). **DONE cont'd:** ✅ **cookies**
+  module (P1 parser + P2 SetCookie builder w/ SameSite + injection guard + P3 http get/set; Fable+Opus, 17
+  tests) · ✅ **inbound gzip request body** (`max_decompressed_request_bytes`, zip-bomb-capped→413,
+  unsupported→415) · ✅ **multiple Set-Cookie** (`ResponseWriter.addSetCookie`) · ✅ **chunked-trailer
+  capture** (read side; response-trailer write skipped — disproportionately invasive vs the 6-way body sink) ·
+  per-conn request-count cap (was already done). **Still open:** Range/206 · content negotiation (both Fable) ·
+  response-trailer write · HTTP/3 (large, deferred/never).
 - Excluded/decided: **TLS = proxy** (then ianic spike); **upstream LB/pool** = app-elevation #2 below.
 - **Bottom line:** NOT fundamentally unsafe — 1 small blocker + ~6 small-med hardening/ops items + 1 large
   (JWT/JWKS only if OAuth2/OIDC). Most are **Opus-inline extensions of existing modules**, not new modules.
