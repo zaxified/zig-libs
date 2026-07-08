@@ -249,4 +249,19 @@ audit is pending before any public release.
                golang-jwt, …) was consulted or copied; the signatures use
                `std.crypto`.
 
+  http.sse   — clean-room from the WHATWG HTML "server-sent events" standard
+               (the text/event-stream wire format: event/id/retry/data fields,
+               multi-line data, comment lines). No third-party source consulted
+               or copied.
+
+  mcp-http   — clean-room from the Model Context Protocol "Streamable HTTP"
+               transport specification (2025-06-18 revision) and the JSON-RPC
+               2.0 spec; the behavioral contract (POST /mcp, Mcp-Session-Id,
+               GET/DELETE, 202-for-notifications) was cross-checked against the
+               authors' own bxp-gui Dart server (which wraps the third-party
+               mcp_dart package) for parity — no mcp_dart or other MCP-transport
+               source was consulted or copied. Builds on the sibling `mcp`
+               module (JSON-RPC core, itself extracted from the authors'
+               bxp-mcp).
+
 See each module's README "Provenance" note for its specific seed and reference.

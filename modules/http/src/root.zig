@@ -105,6 +105,10 @@ pub const body = @import("body.zig");
 /// value — from a size-bounded in-memory body.
 pub const multipart = @import("multipart.zig");
 
+/// Server-Sent Events (`text/event-stream`) encoder over a streaming
+/// `ResponseWriter` — the push half of a live HTTP endpoint (SSE / MCP).
+pub const sse = @import("sse.zig");
+
 // ── request vocabulary ──────────────────────────────────────────────────────
 
 pub const Method = enum {

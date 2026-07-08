@@ -330,7 +330,13 @@ fmt green. **Still open:** request-ID mw · health helper · conditional-req · 
   (JWT/JWKS only if OAuth2/OIDC). Most are **Opus-inline extensions of existing modules**, not new modules.
 
 ### B) App-elevation value-add (Fable) — user-ordered 2026-07-08 (rawsock/data-family/exprcalc removed → extraction)
-1. **MCP HTTP/SSE transport** (small) — D AI-netops remote · 2. ✅ **upstream LB + health routing (+bulkhead)** DONE (`resilience.Bulkhead` + new `upstream` module: strategies/health/failover; 23 tests)
+1. 🟡 **MCP HTTP/SSE transport** — D AI-netops remote. Split T1–T5 (recon: axp-mcp/bxp-mcp are stdio-only, only
+   bxp-gui Dart/`mcp_dart` speaks HTTP/SSE = behavioral ref; MCP core already in `mcp`). **DONE:**
+   `http.ResponseWriter.flush()` (incremental streaming, `b376427`); **T3** `http.sse` WHATWG EventSource encoder
+   (Fable, +2 tests); **T1** NEW `mcp-http` module — Streamable HTTP `POST /mcp` → JSON-RPC/202, stateless,
+   Lock seam, +5 tests (Opus). **Remaining:** T2 Origin validation + bearer gate (small, reuse aaa-gate/jwt);
+   T4 SSE-on-POST progress + `GET /mcp` stream (uses `http.sse`); T5 session registry (`Mcp-Session-Id`) +
+   resumable push (deferred, the hard part). · 2. ✅ **upstream LB + health routing (+bulkhead)** DONE (`resilience.Bulkhead` + new `upstream` module: strategies/health/failover; 23 tests)
 — C gateway. Remaining: 3. **SNMP trap receiver + v3** (small-med) — A async alerts · 4. **coap** RFC 7252
 (med) — G IoT · 5. **MQTT broker** (large) — G IoT hub.
 Extraction backlog (Opus, NOT Fable — low/no value-add headroom): `rawsock` (axp `openPacketCapture`

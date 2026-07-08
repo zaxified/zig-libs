@@ -42,6 +42,7 @@ const module_list = [_]Module{
     .{ .name = "seqmap" },
     .{ .name = "icmp", .deps = &.{ "seqmap", "netaddr" } },
     .{ .name = "mcp" },
+    .{ .name = "mcp-http", .deps = &.{ "router", "http", "mcp" } },
     .{ .name = "kv" },
     .{ .name = "blobmsg" },
     .{ .name = "tar" },
