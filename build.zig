@@ -57,7 +57,7 @@ const module_list = [_]Module{
     .{ .name = "probe", .deps = &.{ "netaddr", "latency-stats" } },
     .{ .name = "l2disco", .deps = &.{"netaddr"} },
     .{ .name = "upstream", .deps = &.{ "resilience", "probe" } },
-    .{ .name = "jwt" },
+    .{ .name = "jwt", .deps = &.{ "http", "ramcache" } },
     .{ .name = "rdap", .deps = &.{ "http", "netaddr" } },
     // Scaffold more here (copy modules/_template) — see the catalog in
     // ~/CML/zig-libs-plan.md for the full candidate list.

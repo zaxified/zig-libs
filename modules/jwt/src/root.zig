@@ -12,7 +12,14 @@
 //! `parseAndVerify` that chains all three — and **JWKS key sets** (P4,
 //! RFC 7517): parse a `{"keys":[…]}` document into a typed `JwkSet`,
 //! select the key by the token header's `kid`, and verify via
-//! `verifyWithJwks` / `parseVerifyJwks`.
+//! `verifyWithJwks` / `parseVerifyJwks` — plus the **networked layer** (P5):
+//! OpenID Connect Discovery 1.0 (`discover` resolves
+//! `<issuer>/.well-known/openid-configuration` to the issuer's `jwks_uri`),
+//! `fetchJwks`, and the cached `Provider` (TTL + key-rotation refresh with a
+//! `min_refresh_interval_s` rate limit) whose `Provider.verify` is the
+//! turnkey resource-server call. All I/O goes through the `Fetcher` seam
+//! ("GET this URL, give me status + body"), so everything stays
+//! offline-testable; `HttpFetcher` adapts our `http.Client` for real use.
 //!
 //! ## SECURITY — `parse()` alone does NOT verify signatures
 //!
@@ -28,7 +35,7 @@
 //! of the provided key (`AlgKeyMismatch`) so an attacker cannot downgrade an
 //! asymmetric token to HMAC-with-the-public-key.
 //!
-//! Planned parts: P5 fetch/OIDC discovery · P6 resource-server middleware.
+//! Planned parts: P6 resource-server middleware (wrapping `Provider.verify`).
 //!
 //! ## Usage
 //!
@@ -44,8 +51,21 @@
 //! defer token.deinit();
 //! const scope = token.claims.claimStr("scope") orelse "";
 //!
-//! // With a JWKS (the issuer's published key set, fetched by the caller —
-//! // P5 adds the fetch/cache; this stays offline):
+//! // The networked turnkey path (P5): one Provider per issuer, JWKS
+//! // fetched via OIDC discovery, cached, refreshed on key rotation.
+//! var threaded = std.Io.Threaded.init(gpa, .{});
+//! var client = http.Client.init(threaded.io(), gpa, .{});
+//! var hf: jwt.HttpFetcher = .{ .client = &client };
+//! var provider = jwt.Provider.init(gpa, hf.fetcher(), .{
+//!     .issuer = "https://issuer.example",
+//! });
+//! defer provider.deinit();
+//! var t = try provider.verify(gpa, bearer_token, now_seconds, .{
+//!     .audience = "api://my-service", // issuer is enforced automatically
+//! });
+//! defer t.deinit();
+//!
+//! // With a JWKS you already hold (fully offline):
 //! var jwks = try jwt.parseJwks(gpa, jwks_json);
 //! defer jwks.deinit();
 //! var token2 = try jwt.parseVerifyJwks(gpa, bearer_token, jwks, .{
@@ -74,14 +94,17 @@
 //! - Malformed input returns typed errors; it never panics.
 
 const std = @import("std");
+const http = @import("http");
 
 pub const meta = .{
     .status = .gap,
-    .platform = .any,
+    .platform = .any, // pure logic over the Fetcher seam; HttpFetcher uses `http`
     .role = .util, // P6 adds the resource-server middleware on top.
-    .concurrency = .reentrant,
-    .model_after = "RFC 7515 (JWS) + RFC 7519 (JWT) + RFC 7518 (JWA) verify incl. RS256 (RSASSA-PKCS1-v1_5, RFC 8017) + RFC 7517 (JWK/JWKS key sets), RFC 8725 hardening; OAuth2/OIDC resource server",
-    .deps = .{},
+    .concurrency = .reentrant, // except Provider — one mutable cache, external sync
+    .model_after = "RFC 7515 (JWS) + RFC 7519 (JWT) + RFC 7518 (JWA) verify incl. RS256 (RSASSA-PKCS1-v1_5, RFC 8017) + RFC 7517 (JWK/JWKS key sets), RFC 8725 hardening + OpenID Connect Discovery 1.0 / RFC 8414 (issuer metadata -> jwks_uri) with cached, rotation-aware Provider; OAuth2/OIDC resource server",
+    // ramcache is wired in build.zig for P6; P5 keeps the *parsed* JwkSet in
+    // the Provider (no raw-byte cache — see Provider docs).
+    .deps = .{"http"},
 };
 
 // ── public API ──────────────────────────────────────────────────────────────
@@ -964,6 +987,372 @@ fn jwkMaterial(
     decoder.decode(buf, s) catch return error.InvalidBase64;
     return buf;
 }
+
+// ── networked layer (Part 5): discovery + JWKS fetch + cached Provider ──────
+// Clean-room from OpenID Connect Discovery 1.0 + RFC 8414 (OAuth 2.0
+// Authorization Server Metadata) + RFC 7517 §5. All network I/O goes through
+// the `Fetcher` seam so the logic (and every test) is offline; `HttpFetcher`
+// is the one real implementation, over our `http.Client`.
+
+/// Module-level alias so `Provider.verify` can reach the signature-check
+/// `verify` (the method name shadows it inside the struct namespace).
+const verifySignature = verify;
+
+/// Errors a `Fetcher` implementation may return.
+pub const FetchError = error{
+    /// Connect / TLS / send / receive failed.
+    FetchFailed,
+    /// The body did not fit the caller's buffer (byte cap). Implementations
+    /// MUST return this instead of truncating silently.
+    ResponseTooLarge,
+};
+
+/// The one I/O operation this module needs: GET `url`, return the HTTP
+/// status and the body bytes in `body_buf`. Same seam as the `rdap` sibling.
+/// Tests drive it with a scripted fake; production uses `HttpFetcher`.
+pub const Fetcher = struct {
+    ctx: *anyopaque,
+    fetchFn: *const fn (ctx: *anyopaque, url: []const u8, body_buf: []u8) FetchError!Result,
+
+    pub const Result = struct { status: u16, body_len: usize };
+    pub const Response = struct { status: u16, body: []const u8 };
+
+    pub fn fetch(f: Fetcher, url: []const u8, body_buf: []u8) FetchError!Response {
+        const r = try f.fetchFn(f.ctx, url, body_buf);
+        if (r.body_len > body_buf.len) return error.FetchFailed;
+        return .{ .status = r.status, .body = body_buf[0..r.body_len] };
+    }
+};
+
+/// Byte cap for one fetched document (discovery metadata or JWKS). Real
+/// provider JWKS documents are a few KiB; 64 KiB is generous headroom while
+/// still bounding what an issuer (or a MITM'd DNS answer) can make us buffer.
+pub const max_response_bytes: usize = 64 * 1024;
+
+/// Cap for the derived well-known URL (issuer + `well_known_path`).
+pub const max_url_len: usize = 2048;
+
+/// OpenID Connect Discovery 1.0 §4: the well-known suffix appended to the
+/// issuer URL (also the RFC 8414 §3 path, minus the legacy prefix ordering).
+pub const well_known_path = "/.well-known/openid-configuration";
+
+/// `Fetcher` implementation over `http.Client` (GET + JSON Accept header;
+/// redirects and HTTPS/TLS are the client's job). Compiled always, dialed
+/// never in tests.
+pub const HttpFetcher = struct {
+    client: *http.Client,
+
+    pub fn fetcher(f: *HttpFetcher) Fetcher {
+        return .{ .ctx = f, .fetchFn = fetchFn };
+    }
+
+    fn fetchFn(ctx: *anyopaque, url: []const u8, body_buf: []u8) FetchError!Fetcher.Result {
+        const f: *HttpFetcher = @ptrCast(@alignCast(ctx));
+        var res = f.client.request(.get, url, .{
+            .headers = &.{.{ .name = "Accept", .value = "application/json" }},
+        }) catch return error.FetchFailed;
+        defer res.deinit();
+
+        const n = res.reader().readSliceShort(body_buf) catch return error.FetchFailed;
+        if (n == body_buf.len) {
+            // Buffer exactly full — distinguish "fit exactly" from "more coming".
+            var extra: [1]u8 = undefined;
+            const m = res.reader().readSliceShort(&extra) catch return error.FetchFailed;
+            if (m != 0) return error.ResponseTooLarge;
+        }
+        return .{ .status = res.status, .body_len = n };
+    }
+};
+
+/// Errors from `discover`.
+pub const DiscoverError = FetchError || error{
+    /// The well-known endpoint answered with a non-200 status.
+    HttpStatus,
+    /// The response is not a usable discovery document: not JSON, not an
+    /// object, `issuer`/`jwks_uri` absent or not strings, the issuer too
+    /// long/empty, or a malformed optional member.
+    DiscoveryFailed,
+    /// The document's `issuer` differs from the one queried — per OIDC
+    /// Discovery §4.3 the two MUST be identical (an issuer answering for
+    /// another issuer is exactly the mix-up attack the check exists for).
+    IssuerMismatch,
+    OutOfMemory,
+};
+
+/// OIDC provider metadata (OpenID Connect Discovery 1.0 §3 / RFC 8414 §2) —
+/// just the members a resource-server validator needs. Everything it
+/// references lives in its internal arena; call `deinit()` when done.
+pub const Metadata = struct {
+    /// The document's `issuer` — what `Provider.verify` enforces as `iss`.
+    issuer: []const u8,
+    /// Where the issuer publishes its JWKS.
+    jwks_uri: []const u8,
+    /// Optional `id_token_signing_alg_values_supported`, verbatim.
+    id_token_signing_alg_values_supported: ?[]const []const u8 = null,
+
+    arena: *std.heap.ArenaAllocator,
+
+    pub fn deinit(self: *Metadata) void {
+        const gpa = self.arena.child_allocator;
+        self.arena.deinit();
+        gpa.destroy(self.arena);
+        self.* = undefined;
+    }
+};
+
+/// OpenID Connect Discovery 1.0: fetch
+/// `<issuer>/.well-known/openid-configuration` and extract the validator's
+/// view of the provider metadata. A trailing `/` on `issuer` is tolerated
+/// (stripped before deriving the URL and before the issuer comparison —
+/// several real IdPs are sloppy about it); otherwise the returned `issuer`
+/// must be identical to the requested one (`IssuerMismatch`).
+pub fn discover(
+    gpa: std.mem.Allocator,
+    fetcher: Fetcher,
+    issuer: []const u8,
+) DiscoverError!Metadata {
+    const want_issuer = std.mem.trimEnd(u8, issuer, "/");
+    if (want_issuer.len == 0) return error.DiscoveryFailed;
+    var url_buf: [max_url_len]u8 = undefined;
+    const url = std.fmt.bufPrint(&url_buf, "{s}" ++ well_known_path, .{want_issuer}) catch
+        return error.DiscoveryFailed;
+
+    const body_buf = try gpa.alloc(u8, max_response_bytes);
+    defer gpa.free(body_buf);
+    const res = try fetcher.fetch(url, body_buf);
+    if (res.status != 200) return error.HttpStatus;
+
+    const arena_state = try gpa.create(std.heap.ArenaAllocator);
+    errdefer gpa.destroy(arena_state);
+    arena_state.* = .init(gpa);
+    errdefer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // std.json Value parsing copies every string into the arena
+    // (.alloc_always), so nothing below borrows body_buf.
+    const val = std.json.parseFromSliceLeaky(std.json.Value, arena, res.body, .{}) catch |err|
+        switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.DiscoveryFailed,
+        };
+    if (val != .object) return error.DiscoveryFailed;
+    const obj = val.object;
+
+    const doc_issuer = stringMember(obj, "issuer") orelse return error.DiscoveryFailed;
+    const jwks_uri = stringMember(obj, "jwks_uri") orelse return error.DiscoveryFailed;
+    if (!std.mem.eql(u8, std.mem.trimEnd(u8, doc_issuer, "/"), want_issuer))
+        return error.IssuerMismatch;
+
+    const algs: ?[]const []const u8 = blk: {
+        const v = obj.get("id_token_signing_alg_values_supported") orelse break :blk null;
+        if (v != .array) return error.DiscoveryFailed;
+        const list = try arena.alloc([]const u8, v.array.items.len);
+        for (v.array.items, list) |item, *slot| switch (item) {
+            .string => |s| slot.* = s,
+            else => return error.DiscoveryFailed,
+        };
+        break :blk list;
+    };
+
+    return .{
+        .issuer = doc_issuer,
+        .jwks_uri = jwks_uri,
+        .id_token_signing_alg_values_supported = algs,
+        .arena = arena_state,
+    };
+}
+
+/// Member that must be a JSON string to count as present (discovery docs).
+fn stringMember(obj: std.json.ObjectMap, name: []const u8) ?[]const u8 {
+    const v = obj.get(name) orelse return null;
+    return switch (v) {
+        .string => |s| s,
+        else => null,
+    };
+}
+
+/// Errors from `fetchJwks`: the fetch seam's, a non-200 status, or the P4
+/// parse errors (`InvalidJson`/`NotAJwks`) verbatim.
+pub const FetchJwksError = FetchError || JwksError || error{HttpStatus};
+
+/// GET `jwks_uri` and parse the body via `parseJwks` (P4). The returned set
+/// owns arena copies of everything — the transfer buffer dies here.
+pub fn fetchJwks(
+    gpa: std.mem.Allocator,
+    fetcher: Fetcher,
+    jwks_uri: []const u8,
+) FetchJwksError!JwkSet {
+    const body_buf = try gpa.alloc(u8, max_response_bytes);
+    defer gpa.free(body_buf);
+    const res = try fetcher.fetch(jwks_uri, body_buf);
+    if (res.status != 200) return error.HttpStatus;
+    return parseJwks(gpa, res.body);
+}
+
+/// Errors from `Provider.refresh`. The two sides of a refresh collapse to
+/// one typed error each (the caller of a cached provider can't do anything
+/// finer-grained anyway); `discover`/`fetchJwks` keep the detailed sets for
+/// callers who drive the steps themselves.
+pub const RefreshError = error{
+    /// OIDC discovery failed (fetch, status, malformed document, issuer
+    /// mismatch) — only for issuer-configured providers.
+    DiscoveryFailed,
+    /// The JWKS fetch or parse failed.
+    JwksFetchFailed,
+    OutOfMemory,
+};
+
+/// A cached JWKS resolver for ONE issuer — the P5 turnkey type. Configure it
+/// with either the `issuer` (JWKS located via OIDC discovery, metadata cached
+/// for the provider's lifetime) or a direct `jwks_uri`. `verify` lazily
+/// fetches the key set, re-fetches when `ttl_s` has passed, and — when a
+/// token names a `kid` the cached set lacks (key rotation) — refreshes at
+/// most once per `min_refresh_interval_s`, so a flood of bogus-kid tokens
+/// cannot hammer the issuer.
+///
+/// Design notes:
+/// - The *parsed* `JwkSet` is the cache (not raw bytes in `ramcache`): one
+///   provider serves one issuer, so there is exactly one entry — a keyed
+///   byte cache would only add a re-parse per hit.
+/// - No hidden clock: every entry point takes `now_s`, like the rest of the
+///   module (and refresh scheduling is therefore deterministic in tests).
+/// - Fail closed: a failed TTL/rotation refresh surfaces as its typed error
+///   instead of silently serving stale keys forever. (P6 middleware can
+///   layer a serve-stale policy on top if wanted.)
+/// - NOT thread-safe (`refresh` swaps the set) — one Provider per thread, or
+///   external synchronization. Everything else in the module stays reentrant.
+pub const Provider = struct {
+    gpa: std.mem.Allocator,
+    fetcher: Fetcher,
+    options: ProviderOptions,
+    /// Cached discovery metadata (issuer-configured providers, after the
+    /// first refresh).
+    metadata: ?Metadata = null,
+    /// The current key set; null until the first successful refresh.
+    jwks: ?JwkSet = null,
+    /// When the current set was fetched (drives `ttl_s`).
+    fetched_at_s: i64 = 0,
+    /// When a refresh was last *attempted*, success or failure — the
+    /// `min_refresh_interval_s` reference point.
+    last_attempt_s: ?i64 = null,
+
+    pub const ProviderOptions = struct {
+        /// OIDC issuer URL — JWKS located via discovery. Exactly one of
+        /// `issuer`/`jwks_uri` should be set; `jwks_uri` wins when both are
+        /// (then `issuer` still serves as the expected `iss` for claims).
+        issuer: ?[]const u8 = null,
+        /// Direct JWKS URL — skips discovery.
+        jwks_uri: ?[]const u8 = null,
+        /// How long a fetched JWKS is served before `verify` re-fetches.
+        ttl_s: u32 = 300,
+        /// Floor between two rotation-driven refresh *attempts* (unknown
+        /// `kid`), measured from the last attempt of any kind. Lazy-load and
+        /// TTL refreshes are not gated — they are already bounded by `ttl_s`.
+        min_refresh_interval_s: u32 = 30,
+    };
+
+    /// Claim policy for `Provider.verify` — `Options` minus `now_s` (passed
+    /// per call) and with `issuer = null` meaning "enforce the discovered /
+    /// configured issuer" rather than "don't check".
+    pub const ClaimOptions = struct {
+        leeway_s: u32 = 60,
+        /// Override the expected `iss`. Default: the discovery document's
+        /// `issuer` (issuer-configured providers) or `options.issuer`; a
+        /// plain jwks_uri-configured provider checks nothing.
+        issuer: ?[]const u8 = null,
+        audience: ?[]const u8 = null,
+        require_exp: bool = true,
+        reject_future_iat: bool = false,
+    };
+
+    pub const Error = ParseAndVerifyError || RefreshError;
+
+    pub fn init(gpa: std.mem.Allocator, fetcher: Fetcher, options: ProviderOptions) Provider {
+        std.debug.assert(options.issuer != null or options.jwks_uri != null);
+        return .{ .gpa = gpa, .fetcher = fetcher, .options = options };
+    }
+
+    pub fn deinit(p: *Provider) void {
+        if (p.metadata) |*m| m.deinit();
+        if (p.jwks) |*s| s.deinit();
+        p.* = undefined;
+    }
+
+    /// Fetch the JWKS now (running discovery first, once, for
+    /// issuer-configured providers) and swap it in. Records the attempt for
+    /// rate-limiting whether it succeeds or fails; the old set stays in
+    /// place on failure.
+    pub fn refresh(p: *Provider, now_s: i64) RefreshError!void {
+        p.last_attempt_s = now_s;
+        const jwks_uri = p.options.jwks_uri orelse blk: {
+            if (p.metadata == null) {
+                p.metadata = discover(p.gpa, p.fetcher, p.options.issuer.?) catch |err|
+                    switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => return error.DiscoveryFailed,
+                    };
+            }
+            break :blk p.metadata.?.jwks_uri;
+        };
+        const fresh = fetchJwks(p.gpa, p.fetcher, jwks_uri) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.JwksFetchFailed,
+        };
+        if (p.jwks) |*old| old.deinit();
+        p.jwks = fresh;
+        p.fetched_at_s = now_s;
+    }
+
+    /// The turnkey call: ensure the JWKS is loaded and fresh (lazy first
+    /// fetch; re-fetch past `ttl_s`), parse the token, resolve its key from
+    /// the cached set — refreshing once (rate-limited) when the `kid` is
+    /// unknown, i.e. on key rotation — then run the P2-P4 signature check
+    /// and `validateClaims` with the issuer injected (see `ClaimOptions`).
+    /// Returns the verified token (caller `deinit`s) or a typed error;
+    /// nothing about a failed token is trusted.
+    pub fn verify(
+        p: *Provider,
+        gpa: std.mem.Allocator,
+        token: []const u8,
+        now_s: i64,
+        claim_opts: ClaimOptions,
+    ) Error!ParsedToken {
+        if (p.jwks == null or now_s -| p.fetched_at_s >= @as(i64, p.options.ttl_s)) {
+            try p.refresh(now_s);
+        }
+
+        var parsed = try parse(gpa, token);
+        errdefer parsed.deinit();
+
+        var jwk = p.jwks.?.selectKey(parsed.header);
+        if (jwk == null and p.refreshAllowed(now_s)) {
+            // Unknown kid — plausibly a rotation we haven't seen. One
+            // bounded re-fetch; a bogus-kid flood is absorbed by the rate
+            // limit and fails below without touching the network.
+            try p.refresh(now_s);
+            jwk = p.jwks.?.selectKey(parsed.header);
+        }
+        const resolved = jwk orelse return error.NoMatchingKey;
+        try verifySignature(&parsed, resolved.key);
+
+        const expected_issuer = claim_opts.issuer orelse
+            (if (p.metadata) |m| m.issuer else p.options.issuer);
+        try validateClaims(parsed.claims, .{
+            .now_s = now_s,
+            .leeway_s = claim_opts.leeway_s,
+            .issuer = expected_issuer,
+            .audience = claim_opts.audience,
+            .require_exp = claim_opts.require_exp,
+            .reject_future_iat = claim_opts.reject_future_iat,
+        });
+        return parsed;
+    }
+
+    fn refreshAllowed(p: *const Provider, now_s: i64) bool {
+        const last = p.last_attempt_s orelse return true;
+        return now_s -| last >= @as(i64, p.options.min_refresh_interval_s);
+    }
+};
 
 // ── internals ───────────────────────────────────────────────────────────────
 
@@ -2806,4 +3195,449 @@ test "parseVerifyJwks: end-to-end against a multi-key set" {
     try testing.expectError(error.MalformedToken, parseVerifyJwks(gpa, "nope", jwks, .{
         .now_s = 1000,
     }));
+}
+
+// ── tests: networked layer (Part 5) ─────────────────────────────────────────
+// Everything below runs offline: a scripted fake Fetcher plus a virtual
+// `now_s`. The network is never touched.
+
+/// Scripted fetcher: responses are consumed IN ORDER and each step pins the
+/// exact URL it expects. A call past the end of the script or with the wrong
+/// URL fails the fetch — and, via the call counter the tests assert on,
+/// fails the test loudly. This is what makes "the fetcher was NOT called
+/// again" provable in the rate-limit tests.
+const ScriptFetcher = struct {
+    script: []const Step,
+    next: usize = 0,
+    calls: usize = 0,
+
+    const Step = struct { url: []const u8, status: u16 = 200, body: []const u8 };
+
+    fn fetcher(s: *ScriptFetcher) Fetcher {
+        return .{ .ctx = s, .fetchFn = fetchFn };
+    }
+
+    fn fetchFn(ctx: *anyopaque, url: []const u8, body_buf: []u8) FetchError!Fetcher.Result {
+        const s: *ScriptFetcher = @ptrCast(@alignCast(ctx));
+        s.calls += 1;
+        if (s.next >= s.script.len) return error.FetchFailed;
+        const step = s.script[s.next];
+        s.next += 1;
+        if (!std.mem.eql(u8, step.url, url)) return error.FetchFailed;
+        if (step.body.len > body_buf.len) return error.ResponseTooLarge;
+        @memcpy(body_buf[0..step.body.len], step.body);
+        return .{ .status = step.status, .body_len = step.body.len };
+    }
+};
+
+const test_wellknown_url = "https://issuer.example" ++ well_known_path;
+const test_jwks_url = "https://issuer.example/jwks";
+const test_discovery_json =
+    \\{"issuer":"https://issuer.example",
+    \\ "jwks_uri":"https://issuer.example/jwks",
+    \\ "id_token_signing_alg_values_supported":["RS256","ES256"],
+    \\ "token_endpoint":"https://issuer.example/token",
+    \\ "response_types_supported":["code"]}
+;
+
+test "discover: canned well-known doc → issuer, jwks_uri, alg list" {
+    var stub: ScriptFetcher = .{ .script = &.{
+        .{ .url = test_wellknown_url, .body = test_discovery_json },
+    } };
+    var md = try discover(testing.allocator, stub.fetcher(), "https://issuer.example");
+    defer md.deinit();
+
+    try testing.expectEqual(@as(usize, 1), stub.calls);
+    try testing.expectEqualStrings("https://issuer.example", md.issuer);
+    try testing.expectEqualStrings(test_jwks_url, md.jwks_uri);
+    const algs = md.id_token_signing_alg_values_supported.?;
+    try testing.expectEqual(@as(usize, 2), algs.len);
+    try testing.expectEqualStrings("RS256", algs[0]);
+    try testing.expectEqualStrings("ES256", algs[1]);
+
+    // Trailing slash on the requested issuer: same URL, same match.
+    var stub2: ScriptFetcher = .{ .script = &.{
+        .{ .url = test_wellknown_url, .body = test_discovery_json },
+    } };
+    var md2 = try discover(testing.allocator, stub2.fetcher(), "https://issuer.example/");
+    defer md2.deinit();
+    try testing.expectEqual(@as(usize, 1), stub2.calls);
+    try testing.expectEqualStrings("https://issuer.example", md2.issuer);
+
+    // The alg list is optional — a doc without it still resolves.
+    var stub3: ScriptFetcher = .{ .script = &.{
+        .{
+            .url = test_wellknown_url,
+            .body =
+            \\{"issuer":"https://issuer.example","jwks_uri":"https://issuer.example/jwks"}
+            ,
+        },
+    } };
+    var md3 = try discover(testing.allocator, stub3.fetcher(), "https://issuer.example");
+    defer md3.deinit();
+    try testing.expect(md3.id_token_signing_alg_values_supported == null);
+}
+
+test "discover: issuer mismatch in the response → IssuerMismatch" {
+    const gpa = testing.allocator;
+    var stub: ScriptFetcher = .{ .script = &.{
+        .{
+            .url = test_wellknown_url,
+            .body =
+            \\{"issuer":"https://evil.example","jwks_uri":"https://issuer.example/jwks"}
+            ,
+        },
+    } };
+    try testing.expectError(
+        error.IssuerMismatch,
+        discover(gpa, stub.fetcher(), "https://issuer.example"),
+    );
+
+    // …but a trailing-slash-only difference is tolerated (both directions).
+    var stub2: ScriptFetcher = .{ .script = &.{
+        .{
+            .url = test_wellknown_url,
+            .body =
+            \\{"issuer":"https://issuer.example/","jwks_uri":"https://issuer.example/jwks"}
+            ,
+        },
+    } };
+    var md = try discover(gpa, stub2.fetcher(), "https://issuer.example");
+    defer md.deinit();
+    try testing.expectEqualStrings("https://issuer.example/", md.issuer);
+}
+
+test "discover: non-200, garbage JSON, missing/mistyped members → typed errors" {
+    const gpa = testing.allocator;
+    const cases = [_]struct { step: ScriptFetcher.Step, want: DiscoverError }{
+        .{
+            .step = .{ .url = test_wellknown_url, .status = 404, .body = "not found" },
+            .want = error.HttpStatus,
+        },
+        .{
+            .step = .{ .url = test_wellknown_url, .status = 500, .body = test_discovery_json },
+            .want = error.HttpStatus,
+        },
+        .{
+            .step = .{ .url = test_wellknown_url, .body = "]]]not json" },
+            .want = error.DiscoveryFailed,
+        },
+        .{
+            .step = .{ .url = test_wellknown_url, .body = "[1,2,3]" },
+            .want = error.DiscoveryFailed,
+        },
+        .{ // jwks_uri missing
+            .step = .{ .url = test_wellknown_url, .body = "{\"issuer\":\"https://issuer.example\"}" },
+            .want = error.DiscoveryFailed,
+        },
+        .{ // issuer missing
+            .step = .{ .url = test_wellknown_url, .body = "{\"jwks_uri\":\"https://issuer.example/jwks\"}" },
+            .want = error.DiscoveryFailed,
+        },
+        .{ // issuer of the wrong JSON type
+            .step = .{
+                .url = test_wellknown_url,
+                .body = "{\"issuer\":42,\"jwks_uri\":\"https://issuer.example/jwks\"}",
+            },
+            .want = error.DiscoveryFailed,
+        },
+        .{ // alg list present but not an array of strings
+            .step = .{
+                .url = test_wellknown_url,
+                .body = "{\"issuer\":\"https://issuer.example\"," ++
+                    "\"jwks_uri\":\"https://issuer.example/jwks\"," ++
+                    "\"id_token_signing_alg_values_supported\":[\"RS256\",42]}",
+            },
+            .want = error.DiscoveryFailed,
+        },
+    };
+    for (cases) |case| {
+        var stub: ScriptFetcher = .{ .script = &.{case.step} };
+        try testing.expectError(
+            case.want,
+            discover(gpa, stub.fetcher(), "https://issuer.example"),
+        );
+    }
+
+    // Transport failure propagates; an empty issuer never builds a URL.
+    var dead: ScriptFetcher = .{ .script = &.{} };
+    try testing.expectError(
+        error.FetchFailed,
+        discover(gpa, dead.fetcher(), "https://issuer.example"),
+    );
+    try testing.expectError(error.DiscoveryFailed, discover(gpa, dead.fetcher(), "///"));
+}
+
+test "fetchJwks: 200 parses via parseJwks; non-200 and garbage → typed errors" {
+    const gpa = testing.allocator;
+    const set = "{\"keys\":[{\"kty\":\"oct\",\"kid\":\"hs\",\"k\":\"c2VjcmV0\"}]}";
+
+    var stub: ScriptFetcher = .{ .script = &.{.{ .url = test_jwks_url, .body = set }} };
+    var jwks = try fetchJwks(gpa, stub.fetcher(), test_jwks_url);
+    defer jwks.deinit();
+    try testing.expectEqual(@as(usize, 1), jwks.keys.len);
+    try testing.expectEqualStrings("hs", jwks.keys[0].kid.?);
+
+    var stub2: ScriptFetcher = .{ .script = &.{
+        .{ .url = test_jwks_url, .status = 503, .body = set },
+    } };
+    try testing.expectError(error.HttpStatus, fetchJwks(gpa, stub2.fetcher(), test_jwks_url));
+
+    var stub3: ScriptFetcher = .{ .script = &.{
+        .{ .url = test_jwks_url, .body = "<html>oops</html>" },
+    } };
+    try testing.expectError(error.InvalidJson, fetchJwks(gpa, stub3.fetcher(), test_jwks_url));
+
+    var stub4: ScriptFetcher = .{ .script = &.{
+        .{ .url = test_jwks_url, .body = "{\"nokeys\":true}" },
+    } };
+    try testing.expectError(error.NotAJwks, fetchJwks(gpa, stub4.fetcher(), test_jwks_url));
+}
+
+test "Provider by jwks_uri: RFC 7515 A.2 RS256 token through the turnkey call" {
+    const gpa = testing.allocator;
+    // The RFC A.2 key served as the issuer's JWKS; the RFC token has no kid,
+    // so the single-usable-key path resolves it.
+    const rfc_set = "{\"keys\":[{\"kty\":\"RSA\",\"kid\":\"a2\",\"use\":\"sig\"," ++
+        "\"n\":\"" ++ rfc7515_a2_n_b64 ++ "\",\"e\":\"" ++ rfc7515_a2_e_b64 ++ "\"}]}";
+    var stub: ScriptFetcher = .{ .script = &.{
+        .{ .url = test_jwks_url, .body = rfc_set },
+    } };
+    var provider = Provider.init(gpa, stub.fetcher(), .{
+        .jwks_uri = test_jwks_url,
+        .ttl_s = 1000000, // keep TTL out of this test's way
+    });
+    defer provider.deinit();
+
+    // Lazy first fetch + verify (now before the token's 2011 exp).
+    var verified = try provider.verify(gpa, rfc7515_a2_token, 1300819000, .{});
+    defer verified.deinit();
+    try testing.expectEqualStrings("joe", verified.claims.iss.?);
+    try testing.expectEqual(@as(usize, 1), stub.calls);
+
+    // Second verify inside the TTL: served from cache, no fetch.
+    var again = try provider.verify(gpa, rfc7515_a2_token, 1300819100, .{});
+    again.deinit();
+    try testing.expectEqual(@as(usize, 1), stub.calls);
+
+    // Signature fine but claims stale → Expired (still no fetch).
+    try testing.expectError(
+        error.Expired,
+        provider.verify(gpa, rfc7515_a2_token, 1300819380 + 61, .{}),
+    );
+    try testing.expectEqual(@as(usize, 1), stub.calls);
+
+    // A jwks_uri provider has no discovered issuer — but an explicit
+    // ClaimOptions.issuer is enforced.
+    try testing.expectError(
+        error.IssuerMismatch,
+        provider.verify(gpa, rfc7515_a2_token, 1300819000, .{ .issuer = "https://other" }),
+    );
+}
+
+test "Provider by issuer: discovery + injected issuer end-to-end" {
+    const gpa = testing.allocator;
+    const enc = std.base64.url_safe_no_pad.Encoder;
+    const secret = "provider-discovery-e2e-secret";
+    var k_b64: [64]u8 = undefined;
+    var set_buf: [256]u8 = undefined;
+    const set = try std.fmt.bufPrint(&set_buf,
+        \\{{"keys":[{{"kty":"oct","kid":"hs","k":"{s}"}}]}}
+    , .{enc.encode(&k_b64, secret)});
+
+    var stub: ScriptFetcher = .{ .script = &.{
+        .{ .url = test_wellknown_url, .body = test_discovery_json },
+        .{ .url = test_jwks_url, .body = set },
+    } };
+    var provider = Provider.init(gpa, stub.fetcher(), .{ .issuer = "https://issuer.example" });
+    defer provider.deinit();
+
+    // Token minted by "the issuer": right iss, right key, kid "hs".
+    var buf: [512]u8 = undefined;
+    const si = signingInputInto(&buf,
+        \\{"alg":"HS256","kid":"hs"}
+    ,
+        \\{"iss":"https://issuer.example","aud":"api://svc","exp":2000,"scope":"read"}
+    );
+    var mac: [32]u8 = undefined;
+    hmac_sha2.HmacSha256.create(&mac, si, secret);
+    const token = finishToken(&buf, si.len, &mac);
+
+    var verified = try provider.verify(gpa, token, 1000, .{ .audience = "api://svc" });
+    defer verified.deinit();
+    try testing.expectEqualStrings("read", verified.claims.claimStr("scope").?);
+    // Exactly one discovery + one JWKS fetch; metadata is cached.
+    try testing.expectEqual(@as(usize, 2), stub.calls);
+    try testing.expectEqualStrings(test_jwks_url, provider.metadata.?.jwks_uri);
+
+    // A validly signed token from the WRONG issuer: the discovered issuer is
+    // injected as the expected `iss`, so it fails — no opt-in needed.
+    var buf2: [512]u8 = undefined;
+    const si2 = signingInputInto(&buf2,
+        \\{"alg":"HS256","kid":"hs"}
+    ,
+        \\{"iss":"https://evil.example","aud":"api://svc","exp":2000}
+    );
+    var mac2: [32]u8 = undefined;
+    hmac_sha2.HmacSha256.create(&mac2, si2, secret);
+    const evil = finishToken(&buf2, si2.len, &mac2);
+    try testing.expectError(error.IssuerMismatch, provider.verify(gpa, evil, 1000, .{}));
+
+    // Audience policy still applies on top.
+    try testing.expectError(
+        error.AudienceMismatch,
+        provider.verify(gpa, token, 1000, .{ .audience = "api://other" }),
+    );
+    // All of that ran from the cache.
+    try testing.expectEqual(@as(usize, 2), stub.calls);
+}
+
+test "Provider: key rotation refreshes once, rate limit stops a bogus-kid flood, TTL re-fetches" {
+    const gpa = testing.allocator;
+    const enc = std.base64.url_safe_no_pad.Encoder;
+    const secret_old = "rotation-secret-old";
+    const secret_new = "rotation-secret-new";
+    var old_b64: [64]u8 = undefined;
+    var new_b64: [64]u8 = undefined;
+    var v1_buf: [256]u8 = undefined;
+    var v2_buf: [256]u8 = undefined;
+    // v1: only kid "old". v2 (after rotation): only kid "new".
+    const jwks_v1 = try std.fmt.bufPrint(&v1_buf,
+        \\{{"keys":[{{"kty":"oct","kid":"old","k":"{s}"}}]}}
+    , .{enc.encode(&old_b64, secret_old)});
+    const jwks_v2 = try std.fmt.bufPrint(&v2_buf,
+        \\{{"keys":[{{"kty":"oct","kid":"new","k":"{s}"}}]}}
+    , .{enc.encode(&new_b64, secret_new)});
+
+    var stub: ScriptFetcher = .{
+        .script = &.{
+            .{ .url = test_jwks_url, .body = jwks_v1 }, // lazy first load
+            .{ .url = test_jwks_url, .body = jwks_v2 }, // rotation refresh
+            .{ .url = test_jwks_url, .body = jwks_v2 }, // rate-limited bogus-kid retry
+            .{ .url = test_jwks_url, .body = jwks_v2 }, // TTL re-fetch
+        },
+    };
+    var provider = Provider.init(gpa, stub.fetcher(), .{
+        .jwks_uri = test_jwks_url,
+        .ttl_s = 300,
+        .min_refresh_interval_s = 30,
+    });
+    defer provider.deinit();
+
+    // Each token gets its own buffer — they are slices into it and must
+    // all stay alive for the whole scenario.
+    var buf_old: [512]u8 = undefined;
+    var buf_new: [512]u8 = undefined;
+    var buf_ghost: [512]u8 = undefined;
+    var mac: [32]u8 = undefined;
+
+    // t=1000: token signed with the OLD key verifies off the first load.
+    const si_old = signingInputInto(&buf_old,
+        \\{"alg":"HS256","kid":"old"}
+    ,
+        \\{"exp":90000}
+    );
+    hmac_sha2.HmacSha256.create(&mac, si_old, secret_old);
+    const token_old = finishToken(&buf_old, si_old.len, &mac);
+    var v_old = try provider.verify(gpa, token_old, 1000, .{});
+    v_old.deinit();
+    try testing.expectEqual(@as(usize, 1), stub.calls);
+
+    // t=1040: the issuer rotated — a NEW-kid token arrives. Its kid is not
+    // in the cached set, the rate-limit window (30s since t=1000) has
+    // passed, so the provider refreshes ONCE and the token verifies.
+    const si_new = signingInputInto(&buf_new,
+        \\{"alg":"HS256","kid":"new"}
+    ,
+        \\{"exp":90000}
+    );
+    hmac_sha2.HmacSha256.create(&mac, si_new, secret_new);
+    const token_new = finishToken(&buf_new, si_new.len, &mac);
+    var v_new = try provider.verify(gpa, token_new, 1040, .{});
+    v_new.deinit();
+    try testing.expectEqual(@as(usize, 2), stub.calls);
+
+    // t=1050 and t=1055: bogus-kid tokens inside the min-refresh window.
+    // NoMatchingKey — and the fetcher is NOT called again (no fetch storm).
+    const si_ghost = signingInputInto(&buf_ghost,
+        \\{"alg":"HS256","kid":"ghost"}
+    ,
+        \\{"exp":90000}
+    );
+    hmac_sha2.HmacSha256.create(&mac, si_ghost, secret_new);
+    const token_ghost = finishToken(&buf_ghost, si_ghost.len, &mac);
+    try testing.expectError(error.NoMatchingKey, provider.verify(gpa, token_ghost, 1050, .{}));
+    try testing.expectError(error.NoMatchingKey, provider.verify(gpa, token_ghost, 1055, .{}));
+    try testing.expectEqual(@as(usize, 2), stub.calls);
+
+    // t=1080: the window has passed — the bogus kid earns one (single,
+    // rate-limited) refresh, which still doesn't know it → NoMatchingKey.
+    try testing.expectError(error.NoMatchingKey, provider.verify(gpa, token_ghost, 1080, .{}));
+    try testing.expectEqual(@as(usize, 3), stub.calls);
+
+    // The rotated-in set stays live: the new-kid token verifies from cache.
+    var v_new2 = try provider.verify(gpa, token_new, 1085, .{});
+    v_new2.deinit();
+    try testing.expectEqual(@as(usize, 3), stub.calls);
+
+    // t=1400: past fetched_at(1080)+ttl(300) — the next verify re-fetches.
+    var v_new3 = try provider.verify(gpa, token_new, 1400, .{});
+    v_new3.deinit();
+    try testing.expectEqual(@as(usize, 4), stub.calls);
+    try testing.expectEqual(stub.script.len, stub.next); // script fully consumed
+}
+
+test "Provider: refresh failures are typed, old keys survive a failed refresh" {
+    const gpa = testing.allocator;
+
+    // Discovery-side failure → DiscoveryFailed.
+    var bad_disco: ScriptFetcher = .{ .script = &.{
+        .{ .url = test_wellknown_url, .status = 500, .body = "boom" },
+    } };
+    var p1 = Provider.init(gpa, bad_disco.fetcher(), .{ .issuer = "https://issuer.example" });
+    defer p1.deinit();
+    try testing.expectError(
+        error.DiscoveryFailed,
+        p1.verify(gpa, rfc7515_a2_token, 1000, .{}),
+    );
+
+    // JWKS-side failure → JwksFetchFailed (here: discovery fine, JWKS 503).
+    var bad_jwks: ScriptFetcher = .{ .script = &.{
+        .{ .url = test_wellknown_url, .body = test_discovery_json },
+        .{ .url = test_jwks_url, .status = 503, .body = "later" },
+    } };
+    var p2 = Provider.init(gpa, bad_jwks.fetcher(), .{ .issuer = "https://issuer.example" });
+    defer p2.deinit();
+    try testing.expectError(
+        error.JwksFetchFailed,
+        p2.verify(gpa, rfc7515_a2_token, 1000, .{}),
+    );
+
+    // Malformed JWKS body is the same typed failure — and an explicit
+    // refresh() that fails leaves the previously good set in place.
+    const rfc_set = "{\"keys\":[{\"kty\":\"RSA\",\"kid\":\"a2\"," ++
+        "\"n\":\"" ++ rfc7515_a2_n_b64 ++ "\",\"e\":\"" ++ rfc7515_a2_e_b64 ++ "\"}]}";
+    var flaky: ScriptFetcher = .{ .script = &.{
+        .{ .url = test_jwks_url, .body = rfc_set },
+        .{ .url = test_jwks_url, .body = "<garbage>" },
+    } };
+    var p3 = Provider.init(gpa, flaky.fetcher(), .{
+        .jwks_uri = test_jwks_url,
+        .ttl_s = 4000000000, // the 1970→2011 time jump below must not expire it
+    });
+    defer p3.deinit();
+    try p3.refresh(1000);
+    try testing.expectError(error.JwksFetchFailed, p3.refresh(2000));
+    // The v1 set survived the failed swap: the RFC token still verifies.
+    var verified = try p3.verify(gpa, rfc7515_a2_token, 1300819000, .{});
+    verified.deinit();
+    try testing.expectEqual(@as(usize, 2), flaky.calls);
+}
+
+test "HttpFetcher compiles (never dialed in tests)" {
+    // Reference the real fetcher so it is semantically checked without any
+    // network activity.
+    _ = HttpFetcher.fetchFn;
+    _ = HttpFetcher.fetcher;
+    _ = http.Client.request;
 }
