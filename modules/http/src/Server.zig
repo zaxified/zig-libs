@@ -1217,6 +1217,26 @@ pub const ResponseWriter = struct {
         return rw.interface.writeAll(bytes);
     }
 
+    /// Push everything written so far all the way to the socket — the head (on
+    /// the first call) plus the buffered body, through the chunked framing and
+    /// the connection writer. This is what makes **streaming responses**
+    /// (Server-Sent Events, long-poll, progressive output) actually reach the
+    /// client incrementally instead of at `end()`: write an event, `flush()`,
+    /// repeat. The first flush commits the framing as chunked (no
+    /// Content-Length was declared) and writes the head, so set the status and
+    /// headers before it. A flush with nothing buffered is a no-op (the head
+    /// is not forced out until there is a byte to send). Does nothing useful on
+    /// HTTP/1.0 peers, which get an until-close identity body.
+    pub fn flush(rw: *ResponseWriter) Writer.Error!void {
+        try rw.interface.flush(); // interface buffer → sink (begins streaming)
+        switch (rw.body) {
+            .chunked => |*cw| try cw.writer.flush(), // chunk buffer → rw.out
+            .gzip => |*g| try g.chunked.writer.flush(),
+            else => {},
+        }
+        try rw.out.flush(); // connection writer → socket
+    }
+
     /// True once the response head is on the wire.
     pub fn headSent(rw: *const ResponseWriter) bool {
         return rw.sent_head;
@@ -1699,6 +1719,14 @@ fn testHandler(req: *Request, rw: *ResponseWriter) anyerror!void {
         }
         var buf: [32]u8 = undefined;
         try rw.writeAll(try std.fmt.bufPrint(&buf, "drained {d}", .{total}));
+    } else if (std.mem.eql(u8, req.path, "/stream")) {
+        // Incremental streaming: each write+flush becomes its own chunk on the
+        // wire (proves flush() reaches the socket mid-handler — the SSE path).
+        try rw.setHeader("Content-Type", "text/event-stream");
+        try rw.writeAll("A");
+        try rw.flush();
+        try rw.writeAll("B");
+        try rw.flush();
     } else {
         rw.setStatus(404);
         try rw.writeAll("not found\n");
@@ -1785,6 +1813,22 @@ test "serveStream: golden chunked response when the body outgrows the buffer" {
         "Transfer-Encoding: chunked\r\n" ++
         "\r\n" ++
         "57\r\n" ++ big_body ++ "\r\n0\r\n\r\n", got);
+}
+
+test "serveStream: flush() streams each write as its own chunk (SSE path)" {
+    var out_buf: [4096]u8 = undefined;
+    const got = runStream(null, "GET /stream HTTP/1.1\r\nHost: t\r\n\r\n", &out_buf);
+    // Chunked framing, event-stream content type, and — the point — "A" and
+    // "B" arrive as two separate 1-byte chunks (flush emitted each), not one.
+    try testing.expectEqualStrings("HTTP/1.1 200 OK\r\n" ++
+        "Content-Type: text/event-stream\r\n" ++
+        "Date: " ++ test_date ++ "\r\n" ++
+        "Server: test\r\n" ++
+        "Transfer-Encoding: chunked\r\n" ++
+        "\r\n" ++
+        "1\r\nA\r\n" ++
+        "1\r\nB\r\n" ++
+        "0\r\n\r\n", got);
 }
 
 test "serveStream: golden HEAD framing without a body" {
