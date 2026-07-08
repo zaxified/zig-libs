@@ -299,7 +299,10 @@ fmt green. **Still open:** request-ID mw · health helper · conditional-req · 
 - 🟡 **API-key auth** (`X-Api-Key`) — aaa-gate is Bearer-only. aaa-gate ext. **small.**
 - 🟡 **conditional requests** ETag/If-None-Match/Last-Modified → 304. http ResponseWriter helper. **small-med · Fable.**
 - 🟡 **multipart/form-data + x-www-form-urlencoded** body parsing (if the API takes forms/uploads). **medium · Fable.**
-- 🟡 **JWT/JWKS OAuth2/OIDC resource-server** validation (JWS verify — lean on `acme/jws.zig` — + JWKS fetch/cache + exp/aud/iss). **large · Fable · NEW module.**
+- 🟡 **JWT/JWKS OAuth2/OIDC resource-server** — split into 6 committable parts (large, Fable, NEW `jwt`
+  module). **P1 ✅ DONE** (compact parse + claims validation, 19 tests; signature verify explicitly NOT
+  done → token untrusted until P2). Remaining: P2 HS/ES/EdDSA verify · P3 RSA verify · P4 JWKS parse+
+  JWK→key+verify-by-kid · P5 JWKS fetch/cache + OIDC discovery (http+ramcache) · P6 aaa-gate RS middleware.
 - 🟢 nice-to-have: cookies + Set-Cookie(HttpOnly/Secure/SameSite) · Range/206 · inbound gzip request body ·
   traceparent/OTel · per-conn request-count cap · auto-OPTIONS in router · content negotiation · Link
   pagination · Idempotency-Key · request trailers · strict bare-LF reject · HMAC signing · HTTP/3.
