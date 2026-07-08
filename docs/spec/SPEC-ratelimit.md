@@ -1,63 +1,50 @@
 # SPEC — `ratelimit`
 
-Rate limiting as a `router` middleware (and a standalone limiter). Web/API cluster (T5.2).
-`gap · any · util · tsafe`. Model after: Go `golang.org/x/time/rate` (token bucket) + nginx
-`limit_req` (sliding window). Deps: `router`, `http`. New `build.zig` entry
-`.{ .name = "ratelimit", .deps = &.{ "router", "http" } }`.
+**Purpose** — Token-bucket request limiting: a pure keyed limiter plus a `router` middleware
+answering **429 + Retry-After**. First consumer of `router`'s `Middleware { state, run }`
+interface — per-instance state (the buckets), zero globals.
 
-## Why
+**Model after / Seed** — Clean-room (token bucket + keyed store). Model after Go
+`golang.org/x/time/rate` (float token balance, lazy refill, burst cap, denials consume nothing) +
+nginx `limit_req`'s keyed-store shape. Design refs in `NOTICE`.
 
-Anything internet-facing (behind Caddy) needs per-client request limiting. This is the first
-consumer of `router`'s `Middleware { state, run }` interface — it proves per-instance state
-(buckets) works without globals.
+**Design & invariants**
+- **Layered:** `TokenBucket` — the bare algorithm, no clock/lock/allocation, caller passes
+  `now_ns`. `Limiter` — per-key buckets in a bounded LRU store (`max_keys` + idle `ttl_ms`),
+  internally synchronized (spinlock around a hash lookup + O(1) LRU relink — the std
+  `SmpAllocator` pattern, since Zig 0.16 std has no io-less blocking mutex), clock injected via
+  `Options.clock` (default OS `CLOCK_MONOTONIC`). `Limiter.middleware()` — the `router.Middleware`.
+- **x/time/rate parity:** a fresh key's bucket starts full; refill is lazy and fractional
+  (`tokens += elapsed * rate`, capped at `burst`); denials consume nothing; `retry_after_ms` rounds
+  **up** so waiting exactly that long guarantees the next attempt passes.
+- **Fail-open by design:** `allow` is infallible — on allocator exhaustion a *new* key is admitted
+  untracked rather than rejected, because the limiter must not turn OOM into an outage.
+- **Client-key trust policy:** the default key resolves in order — rightmost element of the last
+  `X-Forwarded-For` (the only part of that header a client cannot forge, since every compliant
+  proxy hop appends its own observed peer) → `X-Real-IP` → the socket peer address → a shared
+  `fallback_key` (only reachable when even the peer is unknown, i.e. `serveStream` without a
+  peer). `KeySource.header` (API-key limiting) falls back to the same chain when the header is
+  absent.
+- **Concurrency:** `Limiter` threadsafe; the bare `TokenBucket` single-owner.
 
-## Scope
+**Threat model / out of scope** — Per-instance only: each process keeps its own bucket store, no
+cross-instance coordination — behind a naive load balancer with N instances the effective limit is
+N× the configured rate; a distributed limiter needs a shared backend this module does not provide.
+Fail-open is deliberate but means a determined allocator-exhaustion attack buys untracked (not
+unlimited) admits, never a hard block — document this tradeoff to operators. The XFF/`X-Real-IP`
+trust chain is only as trustworthy as the deployment: a directly-reachable client can forge both
+and land in a per-client-but-attacker-chosen bucket (a key, not a bypass) — behind multiple chained
+trusted proxies, or with no proxy at all, use a `KeySource.custom` extractor instead of the
+defaults. Not an authentication mechanism, and not a defense against connection-level abuse
+(`abuseguard` is the sibling for that).
 
-1. **Algorithm (standalone, clock-injected, no globals):** a **token bucket** limiter
-   (`rate` tokens/sec, `burst` capacity) — the primary. Optionally a fixed/sliding **window**
-   counter variant. Time comes from a caller-supplied monotonic clock (a `now_ns` fn or a clock
-   struct) so tests are deterministic — do NOT read the wall clock internally at the algorithm
-   layer. (Zig 0.16: no `std.time` timestamps; the default production clock uses
-   `std.posix.clock_gettime(.MONOTONIC)` — inject it, don't hardcode.)
-2. **Keyed store:** per-key buckets in a bounded map (cap + LRU/expiry eviction so idle keys don't
-   grow memory). Thread-safe (a mutex is fine; document it) — middleware runs on many connection
-   threads. Do NOT depend on `ramcache` (not built yet); a small internal bounded map is fine.
-3. **Key function:** configurable `keyFor(*Ctx) []const u8` — default = client IP. Behind Caddy the
-   real client is in a forwarded header; support `X-Forwarded-For` (rightmost/leftmost policy —
-   pick one, document; behind a trusted proxy leftmost is the client) / `X-Real-IP`, with a
-   fallback to the connection peer. Also allow an API-key header as the key.
-2. **Middleware:** `middleware(*Limiter) router.Middleware` — on allow → `next`; on deny → **429**
-   with a **`Retry-After`** header (seconds until a token frees) and a short body; do NOT call next.
-   Standard rate-limit headers (`RateLimit-Limit`/`-Remaining`/`-Reset`, IETF draft) are a nice-to-have.
+**Verification** — 16 tests (`zig build test-ratelimit`). Offline deterministic: bucket math,
+refill and `retry_after` exactness, per-key isolation, LRU eviction + TTL sweep, an 8-thread
+over-admission race check, fail-open OOM. Middleware goldens over the socket-free
+`http.Server.serveStream`: 429 wire bytes, XFF/`X-Real-IP`/API-key/custom key extraction, spoof
+resistance, peer-address fallback (port-insensitive, IPv4-mapped unified, headers win over peer).
+In-process integration (`router` + `http.Server` + `http.Client` over loopback): burst → 200s, then
+429 + `Retry-After`, key isolation, XFF exercised, headerless requests keyed by the loopback peer —
+skips only when loopback binding is unavailable.
 
-## Public API sketch (final shape your call)
-
-```zig
-pub const Limiter = struct {
-    pub fn init(gpa, Options) Limiter;   // Options: rate_per_s, burst, max_keys, ttl, clock, key_fn
-    pub fn deinit(*Limiter) void;
-    pub fn allow(self, key: []const u8) Decision;         // { allowed: bool, retry_after_ms: u64, remaining: u32 }
-    pub fn middleware(self) router.Middleware;            // 429 + Retry-After on deny
-};
-```
-
-## Acceptance / verification
-
-- **Offline unit tests (deterministic, injected clock):** token-bucket math — burst allowed then
-  throttled, refill over time, `retry_after` correctness; per-key isolation (key A throttled doesn't
-  affect key B); eviction when `max_keys` exceeded; window variant if implemented; concurrent
-  `allow` from multiple threads doesn't corrupt state (spawn a few threads, assert invariants).
-- **In-process integration (via `router` + `http.Server` + `http.Client`, must NOT skip normally):**
-  a route behind the limiter middleware — first N requests 200, next → **429 with Retry-After**;
-  a different key still 200. `X-Forwarded-For` key extraction exercised.
-- `zig build test-ratelimit` + `zig build test` (all) green, Debug + ReleaseFast; `zig fmt --check`
-  clean. Registered in `build.zig` (`deps = &.{"router","http"}`).
-
-## Notes for the implementer
-
-- Use the **zig skill** for Zig 0.16 (clock_gettime, threads/mutex, ArrayList unmanaged, StringHashMap).
-- Reuse `router.Middleware { state, run }` (the state pointer = your `*Limiter`) and `router.Ctx`
-  (req/res). Get the peer/forwarded IP from the request headers.
-- Keep the pure algorithm (bucket + keyed store) separable and unit-tested independently of HTTP —
-  it's reusable beyond the middleware.
-- Document the XFF trust policy clearly (it's a security-relevant choice behind a proxy).
+**Status** — `gap · any · util · threadsafe` · deps: `router`, `http`, `netaddr`.

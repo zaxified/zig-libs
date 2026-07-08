@@ -1,73 +1,67 @@
 # SPEC — `mcp`
 
-Model Context Protocol server: JSON-RPC 2.0 + the MCP handshake/tools over a generic transport
-(stdio built in). Wave P1. `extract · any · server · reentrant`. Model after: the **MCP spec
-(2025-11-25)** + JSON-RPC 2.0. **Seed: extract from `~/workspace/bxp/bxp-mcp/src/server.zig`
-(+ `tools.zig`, `progress.zig`)** — same authors' Apache-2.0 code, relicensed MIT; the stateless
-`inspect.zig` handler shape may inform the design. Deps: **none (std only — `std.json` + a generic
-reader/writer transport)**. New `build.zig` entry `.{ .name = "mcp" }`.
+**Purpose** — A Model Context Protocol **server** transport: JSON-RPC 2.0 + the MCP handshake, with
+tools, resources and prompts, over a generic reader/writer (stdio built in). The split it enforces
+is **server = transport, app = primitives**: the server owns the protocol (framing, `initialize`
+version negotiation, `tools/*`/`resources/*`/`prompts/*` dispatch, progress notifications); the
+application registers tools/resources/prompts whose handlers thread live **app state via a `ctx`
+pointer**. That ctx threading — a tool call is a plain function call into your running application,
+not a stateless echo — is the point of this module versus thin MCP libs.
 
-## Why
+**Model after / Seed** — MCP spec revision 2025-11-25 + the JSON-RPC 2.0 spec. Extracted from the
+authors' bxp `bxp-mcp/src/server.zig` (+ `tools.zig`, `progress.zig`; Apache-2.0, relicensed MIT);
+the JSON-RPC core is that seed, while resources + prompts were added clean-room from the MCP spec (no
+SDK source consulted). See `NOTICE` (the sibling `mcp-http` transport builds on this JSON-RPC core).
 
-Both bxp and axp expose themselves to AI agents over MCP and deliberately mirror the same
-"server = transport, app = tools" split; existing Zig MCP libs are too thin to thread app state.
-This lifts bxp's proven server out as the shared transport core. (This is the cross-project shared
-lib named in the catalog.)
+**Design & invariants**
+- **Newline-delimited JSON framing.** Every message in either direction is exactly one JSON object
+  followed by one `\n` (raw `\n`/`\r` inside a spliced JSON literal are stripped to preserve the
+  one-object-per-line invariant); no `Content-Length` headers. JSON-RPC **batch arrays are
+  unsupported** (MCP does not use them) → -32600.
+- **Protocol surface:** `initialize` (echo the client's requested revision when in
+  `supported_versions` = {2025-11-25, 2025-06-18}, else the latest; advertise tools/resources/prompts
+  capabilities with `subscribe:false`/`listChanged:false`), `notifications/initialized`,
+  `tools/list`, `tools/call`, `resources/list`, `resources/templates/list`, `resources/read`,
+  `prompts/list`, `prompts/get`, `ping`, and server→client `notifications/progress`. Subscriptions,
+  list-change notifications and pagination (`nextCursor`) are deliberately **not** implemented (the
+  advertised capabilities say so).
+- **Dispatch + ctx.** Tools dispatch by name; resources resolve by uri (exact static match first,
+  then each registered template handler in order — a template handler inspects the uri itself and
+  declines with `false`, this module does not evaluate uri templates); prompts dispatch by name with
+  declared required arguments validated by the server (-32602) before the handler runs. Every
+  handler receives the opaque `ctx` given at registration. `tools/call` results carry a text content
+  block plus `structuredContent` **only** when the tool allows it and its output is structurally a
+  single top-level JSON object (a brace-matcher rejects NDJSON/arrays); `isError:true` marks a tool
+  failure, while a deliberate domain `{"ok":false}` answer stays `isError:false`.
+- **Never-panic error policy.** Malformed input becomes the proper JSON-RPC error (-32700 / -32600 /
+  -32601 / -32602 / -32603, plus MCP's -32002 for an unresolvable `resources/read` uri), never a
+  panic or a Zig error; only OOM and transport write-failure surface as `error`. A request (has `id`)
+  gets exactly one response; a notification (no `id`) gets none (a stray id-less request-only line is
+  dropped).
+- **Allocation + concurrency.** Allocator-explicit; each message is handled on a per-message arena
+  freed after the response is written (handlers allocate freely on it, never store). Registered
+  metadata slices must outlive the server. `reentrant` — no globals; one `Server` = one owner (wrap
+  in a lock to share). Transports: `serve(reader,writer)` loops; `serveStdio(io)` wires stdin/stdout;
+  HTTP is one line inside an `http`/`router` handler (`server.handleMessage(body, w)`), no `http` dep.
 
-## Scope
+**Threat model / out of scope** — This is a transport, not an authorization boundary: it does **not**
+authenticate or authorize callers, rate-limit, or sandbox tool handlers — a registered tool runs
+with the app's full privileges, so exposing it (especially over HTTP) is the caller's trust
+decision. It hardens the framing/parse surface (malformed JSON, wrong types, batch arrays, stray
+notifications, an invalid registered schema literal → -32603 not a crash; a bounded per-message
+arena; the `structuredContent` structural re-check so a text/error blob never emits invalid
+structure). Out of scope: MCP client/host roles, sampling, roots, subscriptions and list-change
+notifications, pagination, and the HTTP/SSE session transport (the sibling `mcp-http` module).
 
-1. **JSON-RPC 2.0 core:** parse/encode requests / responses / notifications (id, method, params,
-   result, error with standard codes: -32700 parse, -32600 invalid request, -32601 method not
-   found, -32602 invalid params, -32603 internal). Batch not required (MCP doesn't use it — note if
-   skipped). Never panic on malformed input → a proper JSON-RPC error.
-2. **MCP server:** the `initialize` handshake with **protocol-version negotiation** + server
-   capabilities; `tools/list` and `tools/call` (with `structuredContent` / `outputSchema` and the
-   text-content fallback); `notifications/*` (e.g. `initialized`, progress). Resources/prompts are
-   OPTIONAL — include the shape if the seed has them, else note as extension points.
-3. **Tool registration:** register a tool = `{ name, description, input_schema (JSON Schema text),
-   output_schema? }` + a handler `fn(params, ctx) → result` that can thread **app state** (a context
-   pointer — the whole point vs. thin libs). Dispatch `tools/call` by name; unknown → method-not-found.
-4. **Transport:** a generic transport over a `*std.Io.Reader` + `*std.Io.Writer` (so it works over
-   stdio, a pipe, or an HTTP body). **Built-in stdio transport** matching MCP's stdio framing (match
-   the seed — newline-delimited JSON-RPC unless the seed uses Content-Length; document which).
-   `serve()` loops reading messages and writing responses. (HTTP transport = the caller wires the
-   handler into an `http`/`router` route — document the one-liner, don't add an http dep.)
-5. **Progress notifications:** the seed's `progress.zig` mechanism (server→client `notifications/
-   progress` during a long `tools/call`) — port it.
+**Verification** — Offline tests: JSON-RPC parse/encode for every standard error code, malformed
+JSON / non-object / missing-or-bad method → the right error only when an id is present, unknown
+method dropped when id-less; version negotiation + golden `initialize` (capabilities/serverInfo) and
+`tools/list` JSON; `tools/call` param validation, ctx-threading to app state, structuredContent
+gating (single-object emits, NDJSON and non-object outputs stay text-only), `isError` on handler
+failure, and progress notifications interleaving before the result; golden `resources/list`
+/`templates/list`/`prompts/list`, `resources/read` text + base64-blob + template-uri resolution +
+-32002 on an unresolvable uri, `prompts/get` argument substitution + -32602/-32603; duplicate
+registration rejected; blank-line/CRLF tolerance; and a full in-process `initialize → initialized →
+tools/list → tools/call` round-trip over an in-memory pipe via `serve`.
 
-## Public API sketch (final = the seed's shape)
-
-```zig
-pub const Server = struct {
-    pub fn init(gpa, Info) Server;              // Info: name, version, instructions
-    pub fn deinit(*Server) void;
-    pub fn addTool(self, Tool) !void;           // { name, description, input_schema, output_schema?, handler, ctx }
-    pub fn handleMessage(self, msg: []const u8, out: *std.Io.Writer) !void;  // one JSON-RPC message
-    pub fn serve(self, in: *std.Io.Reader, out: *std.Io.Writer) !void;      // stdio/pipe loop
-};
-```
-
-## Acceptance / verification
-
-- **Offline unit tests:** JSON-RPC parse/encode incl. all standard error codes; malformed JSON /
-  missing method / bad params → the right JSON-RPC error (no panic); `initialize` → correct
-  capabilities + negotiated protocol version; `tools/list` → the registered tools (golden JSON);
-  `tools/call` dispatch to a registered handler returning `structuredContent` (+ threads a ctx
-  pointer — assert app state was reached); unknown tool → -32601/-32602 per the seed; a notification
-  (no id) produces no response; progress notification emitted during a tool call.
-- **In-process integration (must NOT skip):** drive `serve()` over an in-memory pipe (or
-  `handleMessage` sequence) — full `initialize` → `initialized` → `tools/list` → `tools/call`
-  round-trip, asserting the JSON at each step. No network needed.
-- `zig build test-mcp` + `zig build test` (all) green, Debug + ReleaseFast; `zig fmt --check` clean.
-  Registered with no deps.
-
-## Notes for the implementer
-
-- Use the **zig skill** (std.json Value + Stringify, std.Io.Reader/Writer). This is an **EXTRACTION**
-  — keep the seed's proven protocol handling + version negotiation + `structuredContent`/progress;
-  port its behavior; adapt any 0.16 stdlib drift.
-- Keep it dependency-free: the transport is generic reader/writer; the app-state threading (ctx
-  pointer on tools) is the key feature — don't lose it.
-- Provenance: README `Provenance:` line = "extracted from bxp `bxp-mcp/src/server.zig` (same
-  authors, Apache-2.0, relicensed MIT); protocol per the MCP spec 2025-11-25". SPDX MIT header. No
-  NOTICE entry (own code) beyond noting the MCP spec.
+**Status** — `extract · any · server · reentrant` · deps: none (std only — `std.json` + `std.Io`).

@@ -1,67 +1,52 @@
 # SPEC — `ramcache`
 
-Bounded in-memory cache with **two independent freshness axes**: TTL (wall-time) + **generation**
-(logical invalidation — bump a counter to invalidate everything, stale entries drop lazily on next
-read, no sweep). Wave P1 (cleanest lift-out). `extract · any · util · single_owner`. **Seed: extract
-from `~/CML/poc-wf-analytic/src/cache.zig`** (same authors' code, relicense MIT). Deps: **none**.
-**This REPLACES the existing `modules/ramcache/` stub** (currently `isFresh` placeholder).
+**Purpose** — Serve a repeated lookup (same DB query, same fetched URL, same computed blob) from
+RAM in ~ns instead of re-executing it in ~ms. A bounded in-memory cache with **two independent
+freshness axes** — wall-time TTL and a logical *generation* counter (bump one counter to invalidate
+every derived entry at once) — under a W-TinyLFU admission/eviction policy that makes it
+scan-resistant. The hot cache in front of a query/fetch layer.
 
-## Why
+**Model after / Seed** — W-TinyLFU per Einziger & Friedman, *"TinyLFU: A Highly Efficient Cache
+Admission Policy"*; the window + SLRU probation/protected structure follows Caffeine (Apache-2.0)
+and the anti-starvation admission tie-break follows ristretto (Go, MIT) — algorithm/behavior only,
+clean-room, no source copied. The base (TTL + generation invalidation + byte/entry caps) was
+extracted from the authors' poc-wf-analytic `src/cache.zig`; the W-TinyLFU upgrade is new and the
+generation-tie freshness axis is novel. See `NOTICE`.
 
-A reusable bounded cache that expires by TTL *and* by a generation counter (invalidate-all on a data
-change, lazy drop). The poc-wf version is complete, pure-`std`, headless-tested (`zig build
-test-cache`, 8 tests) — lift it out as a standalone module. Consumers: any hot-path cache; `metrics`/
-`ratelimit`-style modules could use it later.
+**Design & invariants**
+- **Two freshness axes, both lazy.** `ttl_ns <= 0` = never expire by time; `gen == 0` = not tied to
+  a generation (TTL-only). A generation-tied entry is stale the instant the caller's `cur_gen`
+  differs. Stale entries are dropped **lazily on the next `get`** — there is no sweep, no timer.
+- **Bounded by count and by value bytes.** Eviction order: any TTL-expired entry first (a free win),
+  then the W-TinyLFU contest — the admission window's LRU *candidate* takes the main region's LRU
+  *victim*'s slot only if its estimated recent frequency is higher (a warm candidate can win a tie
+  via a deterministic ~1/128 coin so a rotating population cannot stall). One-hit wonders cannot
+  flush the proven-hot set. Frequency lives in a fixed 4-bit Count-Min Sketch + doorkeeper with
+  periodic halving ("aging"), sized to capacity.
+- **Clock + generation are injected on every call** (`now_ns`, `cur_gen`): zero global/time
+  dependency, every test deterministic.
+- **Ownership:** keys and values are duped into the cache's allocator on `put`, freed on
+  evict/replace/clear. A slice from `get` borrows cache storage — valid only until that key is next
+  replaced/evicted/cleared. `bytes` accounts value payloads only (the tunable cap).
+- **Never-fatal degradation:** `put` silently no-ops on OOM (a cache miss is never fatal); if the
+  frequency sketch itself cannot allocate, the cache degrades to plain LRU (gate always admits).
 
-## Scope
+**Threat model / out of scope** — Not a security primitive and **not thread-safe**:
+`concurrency = single_owner`, no internal lock by design — one thread/loop owns the instance; a
+caller sharing it across threads supplies its own lock. Key hashing is Wyhash (not a keyed/DoS-
+resistant hash), so it is not hardened against adversarial hash-collision flooding — intended for
+trusted internal keys (query strings, URLs), not attacker-chosen keys. No persistence, no eviction
+callbacks. An item larger than `max_bytes` is never stored. Region scans are linear (fine for the
+modest entry counts a hot query/fetch cache holds — not a million-entry store).
 
-1. **Extract + generalize:** read the seed, lift the cache out, drop poc-wf coupling. Keep the exact
-   semantics: TTL freshness + **generation-tie** (an entry stamped at generation G is stale once the
-   caller's current generation > G; dropped lazily on the next `get`, no sweep). Byte-cap + entry-cap
-   with **expired-then-LRU** eviction.
-2. **Clock + generation are caller-supplied** (as in the seed) → zero global/time dependency, fully
-   deterministic tests. `get`/`put` take `now_ns` (and the current generation) as parameters, or the
-   cache holds an injected clock — match the seed's shape.
-3. **Concurrency = single-owner (documented):** the seed is poll-loop-owned, no internal lock. Keep
-   that — the cache is NOT internally synchronized; the caller owns it from one thread (or guards it).
-   Document this clearly (it's the `single_owner` concurrency tag). Do not add a lock (a caller who
-   needs one wraps it).
-4. **Ops:** `put(key, value, ttl_ns, generation)`, `get(key, now_ns, generation) ?[]const u8`
-   (drops + returns null if expired or stale-gen), `clear`, `stats` (hits/misses/entries/bytes),
-   `config`/tunables (max_bytes, max_entries, default_ttl). Match the seed's surface. Keys/values are
-   byte slices; document ownership (the cache copies values into its own arena/buffer, or borrows —
-   match the seed).
+**Verification** — Deterministic unit tests (injected `now_ns`/generation, no real clock):
+hit/miss, TTL expiry, lazy generation invalidation + `gen==0` immunity, replace/byte-accounting,
+entry-cap + byte-cap LRU eviction, expired-before-LRU, clear-keeps-counters, value-copy-on-put,
+borrowed-slice lifetime, stats. Sketch tests: exact estimate for a lone key, CMS never
+underestimates under collision load, saturation at 15(+1 doorkeeper), aging halves + clears the
+doorkeeper. W-TinyLFU behavior: admission gate (frequent candidate evicts cold victim, cold
+rejected), scan resistance (a 150-key one-hit burst does not evict a 20-key hot set), and a 60k-op
+Zipf-skewed hit-ratio benchmark asserting W-TinyLFU strictly beats an inline plain-LRU baseline by
+≥10%.
 
-## Public API sketch (final = the seed's shape)
-
-```zig
-pub const Cache = struct {
-    pub fn init(gpa, Options) Cache;   // max_bytes, max_entries, default_ttl_ns
-    pub fn deinit(*Cache) void;
-    pub fn put(self, key: []const u8, value: []const u8, ttl_ns: i128, generation: u64) !void;
-    pub fn get(self, key: []const u8, now_ns: i128, generation: u64) ?[]const u8;  // lazy-drops stale
-    pub fn clear(self) void;
-    pub fn stats(self) Stats;   // { hits, misses, entries, bytes, evictions }
-};
-```
-
-## Acceptance / verification
-
-- **Offline unit tests (port the seed's 8 + add; deterministic via injected now/generation):** hit
-  within TTL, miss after TTL (advance `now`), **generation bump invalidates lazily** (old entry
-  returns null after gen increment, without a sweep), LRU eviction at `max_entries`, byte-cap
-  eviction at `max_bytes` (expired-then-LRU order), `clear`, `stats` counts (hits/misses/evictions),
-  value-ownership correctness (returned bytes valid until overwritten/evicted — match seed). No real
-  clock in tests.
-- `zig build test-ramcache` + `zig build test` (all) green, Debug + ReleaseFast; `zig fmt --check`
-  clean. (The build already registers `ramcache`; just replace the stub's `src/root.zig` + README.)
-
-## Notes for the implementer
-
-- Use the **zig skill** for Zig 0.16 (HashMap unmanaged, intrusive LRU list, arena/allocator for
-  value storage). This is an **EXTRACTION** — preserve the seed's proven eviction + generation logic
-  and port its tests; don't redesign.
-- Keep it dependency-free, portable, single-owner (no internal lock — documented).
-- Provenance: README `Provenance:` line = "extracted from poc-wf-analytic `src/cache.zig` (same
-  authors, relicensed MIT)". `model_after` = "groupcache / ristretto; generation-tie is the novel
-  bit". SPDX MIT header. No NOTICE entry (own code).
+**Status** — `extract · any · util · single_owner` · deps: none (std only).

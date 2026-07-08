@@ -34,8 +34,15 @@ MCP spec 2025-11-25.
 - `notifications/progress` — server→client during a `tools/call`, sent only
   when the client opted in via `params._meta.progressToken` (string or
   integer, echoed verbatim).
-- **Resources / prompts:** extension points — not implemented (the seed never
-  needed them); `resources/*` / `prompts/*` answer `-32601 Method not found`.
+- **Resources:** `resources/list`, `resources/read` (text + base64 blob), and
+  `resources/templates/list` — register with `addResource` /
+  `addResourceTemplate`; an unresolvable read answers `-32002` (resource not
+  found).
+- **Prompts:** `prompts/list` and `prompts/get` (argument-validated, rendered
+  messages) — register with `addPrompt`; a bad argument answers `-32602`.
+- `initialize` advertises the tools / resources / prompts capabilities it
+  actually serves. (Resource `subscribe` is not implemented —
+  `subscribe:false` is advertised.)
 
 Malformed input **never panics** — it yields the proper JSON-RPC error
 (`-32700` parse, `-32600` invalid request, `-32601` method not found,

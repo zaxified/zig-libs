@@ -1,79 +1,44 @@
-# SPEC — `icmp` + `seqmap`
+# SPEC — `icmp`
 
-Extract the **ICMP echo (ping) engine** and its **sequence map** from zig-fping. Two modules from
-one task. Wave P1 ("already a library, just carve out"). **Seeds:
-`~/workspace/zig-fping/src/{seqmap,icmp,socket,pinger}.zig`** (fping-derived → the **fping license
-attribution already in NOTICE for `netaddr` applies; extend/confirm the NOTICE entry**). Register:
-`.{ .name = "seqmap" }` (no deps) and `.{ .name = "icmp", .deps = &.{ "seqmap", "netaddr" } }`.
-`seqmap` = `extract · any · util · reentrant`; `icmp` = `extract · linux · client · single_owner`.
+**Purpose** — An ICMP echo (**ping**) engine for monitoring workloads that check thousands of hosts
+per cycle. std has no ICMP support and no small pure-Zig ICMP library exists, so this is the
+liveness half of the network tail (paired with `traceroute` for path and `probe` for service
+reachability). Three layers: a pure ICMPv4/v6 echo/timestamp wire codec, non-blocking Linux ICMP
+sockets, and `Pinger` — fping's `main_loop` as a library (global pacing, in-flight cap, per-subnet
+spacing, retries, reply correlation).
 
-## Why
+**Model after / Seed** — fping (schweikert/fping) `main_loop`, extracted from the authors'
+`zig-fping` `src/{icmp,socket,pinger}.zig` (a Zig port of fping) — plus that port's scaling
+additions: binary-heap scheduling, in-flight cap, per-subnet spacing, first-probe jitter,
+sendmmsg/recvmmsg. The required fping/Stanford attribution is in `NOTICE` (shared by
+netaddr/dns/icmp/seqmap). Wire formats per RFC 792 (ICMP), RFC 4443 (ICMPv6), RFC 1071 (checksum).
 
-zig-fping already IS a working pure-Zig ICMP library; `netaddr` was the first carve-out. This lifts
-the rest: the reusable **echo/reply codec + raw-socket + pacing engine** (`icmp`) and the O(1)
-**16-bit-id → in-flight correlation map** (`seqmap`). No small pure-Zig ICMP lib exists otherwise.
+**Design & invariants**
+- **Layered, codec is pure:** `echo` — build/parse + internet checksum, bounds-checked, never panics
+  on garbage; `Socket` — non-blocking sockets; `Pinger` — the paced engine.
+- **Unprivileged first:** `SOCK_DGRAM` + `IPPROTO_ICMP`/`ICMPV6` when `net.ipv4.ping_group_range`
+  covers the process group, `SOCK_RAW` fallback (needs CAP_NET_RAW/root). Batched sends via
+  `sendmmsg` (only when `interval_ns == 0`), batched receives via `recvmmsg`; kernel `SO_TIMESTAMPNS`
+  receive timestamps for accurate RTT under load. IPv6 echo checksum left zero (kernel owns the
+  pseudo-header for both DGRAM and RAW).
+- **Concurrency:** single_owner — one thread/loop owns a `Pinger`; `stop()` is async-signal-safe.
+  Reply correlation is delegated to the sibling `seqmap`, so the in-flight cap must stay < 65536.
+- **Platform:** Linux-only by design — errno-encoded `std.os.linux` raw syscalls, no libc
+  (a conscious ceiling per BRIEF); no portable fallback. Addresses via the sibling `netaddr`.
+- **Modes** mirror fping: `.alive` (stop a target at first reply, retry timeouts with backoff),
+  `.count` (exactly N), `.loop` (until `stop()`).
 
-## `seqmap` (small, do first)
+**Threat model / out of scope** — Raw/DGRAM ICMP sockets need CAP_NET_RAW or a permissive
+`ping_group_range`; the module does not acquire privilege, only uses what it is given. It does **not
+authenticate replies** — a reply is matched to a live probe by echo ident + sequence via `seqmap`, so
+a spoofed reply with a guessed id resolves as genuine (correlation, not authentication). ICMP errors
+(unreachable, time exceeded) are counted but the probe still resolves via timeout. Out of scope:
+non-Linux platforms, capture/BPF, and any anti-spoofing token.
 
-Fixed **65536-slot** round-robin map: 16-bit ICMP sequence id → in-flight probe state
-`{ target, probe_index, sent_ns }`. O(1) `add` (returns/consumes a seq), `fetch(seq)`, `release(seq)`;
-**no per-op allocation** (fixed array). Extract from `seqmap.zig` verbatim; generalize the stored
-payload to a small generic struct if clean, else keep the seed's fields. Model after fping
-`seqmap.c`. Dep-free, portable (pure logic — usable by any request/reply protocol, not just ICMP).
+**Verification** — Offline: RFC 1071 checksum goldens (vector + wire-byte goldens v4/v6, comptime +
+property variants), build→parse round trips, error-quote parsing, fuzzed parsers (never panic on
+garbage), scheduler/pacing units, seqmap correlation. Integration: pings `127.0.0.1` / `::1`
+end-to-end and asserts a correlated reply with plausible RTT, skipped via `error.SkipZigTest` when no
+ICMP socket can be opened (no CAP_NET_RAW and a restrictive `ping_group_range`).
 
-- Tests: add→fetch round-trip, release frees the slot, wraparound at 65536, full-table behavior,
-  O(1)/no-alloc (no allocator param). `zig build test-seqmap` green.
-
-## `icmp` (the engine)
-
-1. **Echo codec (pure, golden-tested):** build/parse ICMPv4 echo request/reply (type 8/0) and ICMPv6
-   echo (type 128/129); Internet checksum (v4) and the v6 pseudo-header handling as the seed does;
-   id/seq/payload. Bounds-checked parse, never panic on a short/garbage packet.
-2. **Socket:** the raw/datagram ICMP socket from the seed — prefer **unprivileged `SOCK_DGRAM` +
-   `IPPROTO_ICMP`/`ICMPV6`** (works without root when `ping_group_range` allows), fall back to
-   `SOCK_RAW` (needs CAP_NET_RAW). Errno-encoded `std.os.linux`, no libc (repo discipline). `sendmmsg`
-   batching if the seed has it — port faithfully.
-3. **Pinger:** send echoes to a set of targets and correlate replies via `seqmap`, measuring RTT;
-   the seed's global send-pacing / in-flight cap. Use `netaddr` for address parse/format. Port the
-   reusable engine core from `pinger.zig` faithfully — **do NOT redesign** the pacing (the known
-   subnet-pacing O(k log k) nit is a FUTURE improvement, out of scope; extract as-is).
-
-- Tests: **offline** — echo build→parse round-trip + checksum golden (v4 + v6), parse rejects
-  short/garbage (no panic), seqmap integration. **Integration (gate via `error.SkipZigTest` if the
-  socket can't open — no CAP_NET_RAW and restrictive `ping_group_range`):** ping **127.0.0.1** (v4)
-  and **::1** (v6) → a matching echo reply with a plausible RTT; assert id/seq correlation.
-- `zig build test-icmp` + `zig build test` (all) green, Debug + ReleaseFast; `zig fmt --check` clean.
-
-## Public API sketch (final = the seed's shape)
-
-```zig
-// seqmap
-pub const SeqMap = struct {
-    pub fn init() SeqMap;
-    pub fn add(self, entry: Entry) ?u16;      // null if full
-    pub fn fetch(self, seq: u16) ?Entry;
-    pub fn release(self, seq: u16) void;
-};
-// icmp
-pub const Pinger = struct {
-    pub fn init(gpa, Options) !Pinger;   // family, pacing, timeout, count
-    pub fn deinit(*Pinger) void;
-    pub fn add(self, target: netaddr.Ip) !void;
-    pub fn run(self) !void;               // or poll()/tick() — match the seed
-    // results: per-target RTT / loss
-};
-pub const echo = struct { pub fn build(...) []u8; pub fn parse(bytes) !Reply; };
-```
-
-## Notes for the implementer
-
-- Use the **zig skill** for Zig 0.16 raw syscalls (errno-encoded `std.os.linux`, `sendmmsg`/`recvmmsg`
-  if used — same discipline as the repo's http/dns/netlink raw paths). No libc.
-- This is an **EXTRACTION** of a proven fping port: keep the codec + pacing semantics and the seed's
-  tests; adapt module layout + any 0.16 stdlib drift. `icmp` depends on the already-built `seqmap` and
-  `netaddr`.
-- **Provenance/licensing:** `icmp`/`seqmap` are fping-derived (via zig-fping) → the **fping/Stanford
-  attribution is REQUIRED** (it's already in `NOTICE` for netaddr — add `icmp`/`seqmap` to that same
-  fping attribution note). README `Provenance:` line = "extracted from zig-fping `src/{...}.zig`
-  (fping-derived — see NOTICE)". SPDX MIT header.
-- Keep `seqmap` dep-free and portable; `icmp` is Linux-only by design (raw sockets).
+**Status** — `extract · linux · client · single_owner` · deps: `seqmap`, `netaddr`.

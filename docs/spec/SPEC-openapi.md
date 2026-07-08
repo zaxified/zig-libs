@@ -1,65 +1,65 @@
-# SPEC — router route-enumeration + `openapi` (T5.11)
+# SPEC — `openapi`
 
-Two coupled pieces, ONE task: (Step 1) a small `router` enhancement to expose the registered route
-table + the matched pattern, then (Step 2) the `openapi` module that generates an OpenAPI 3.1 spec
-from it. Closes the Web/API cluster. Model after: FastAPI auto-docs / utoipa (Rust) / swaggo.
-Deps (openapi): `router`, `http` (uses `std.json`). New entry
-`.{ .name = "openapi", .deps = &.{ "router", "http" } }`.
+**Purpose** — OpenAPI 3.1 document generation from a `router` route table, plus a ready-made
+`GET /openapi.json` endpoint middleware. "Self-documentation": the spec is derived from the live
+`Router.routes()` table and per-route `RouteDoc` metadata (`Router.addDoc`), so the docs cannot
+drift from the code. Closes the Web-service/API cluster.
 
-## Why
+**Model after / Seed** — Clean-room; no seed project, no third-party code. Design references
+(behavior only, no source consulted or copied, per `NOTICE`): FastAPI (the emitted document shape —
+operation key order, path-parameter objects, the default `"Successful Response"` 200) and utoipa
+(Rust; route-metadata→spec mapping). Document format per the OpenAPI Specification 3.1.0 (OpenAPI
+Initiative).
 
-"Self-documentation" — the API describes itself so docs can't drift from code. Also unblocks the
-deferred `metrics` route-pattern label (a future follow-up — do NOT touch `metrics` in this task).
+**Design & invariants**
+- **Two layers.** `Generator` walks `Router.routes()` and emits a valid OpenAPI 3.1 JSON document
+  (`openapi: "3.1.0"`, `info` from `Info`, `paths` with router patterns converted to templates —
+  `:id` → `{id}`, `*rest` → `{rest}` — methods grouped per path). `Endpoint` is an *intercepting*
+  `router.Middleware` (the `metrics.Endpoint` pattern, needed because `router.Handler` is a
+  stateless fn pointer and cannot close over state) serving the generated document on
+  `GET /openapi.json`; it must be registered *before* the routes it documents (chi's rule) but
+  generates the spec fresh per request, so it still sees routes registered after it.
+- **Deterministic, minified output:** paths in first-registration order, methods per path in
+  `http.Method` declaration order, fixed key order inside every object, no whitespace. Two runs over
+  the same router produce byte-identical documents.
+- **Documented FastAPI-shape compromises:** path parameters are always `required: true` with
+  `schema: {type: "string"}` (the router only captures raw path bytes, no richer typing); a
+  `*wildcard` segment becomes a plain `{param}` since OpenAPI has no cross-segment template (FastAPI's
+  own `:path` converter makes the same compromise). Undocumented routes get a minimal operation with
+  the default `responses: {"200": {"description": "Successful Response"}}`. `operationId` is
+  deliberately omitted — a fn-pointer route table has no stable name to derive one from. The
+  implicit HEAD→GET auto-route and 404/405 dispatch fallbacks are not emitted; they are dispatch
+  behavior, not operations.
+- **`RouteDoc.request_schema`** (JSON Schema as text) is parsed and re-emitted normalized/minified
+  under `requestBody.content."application/json".schema`; malformed text is a typed
+  `error.InvalidRequestSchema`, not a panic or silent drop.
+- **Concurrency:** reentrant — the generator is a pure function of an immutable (post-`build`)
+  `Router`; `Endpoint` regenerates the document per request with no shared mutable state, safe to
+  call concurrently from multiple request-handling threads.
+- **No external assets:** Swagger-UI needs CDN JS/CSS (a CSP and provenance problem), so it is
+  deliberately not served. The optional `docs_path` instead serves a tiny self-contained HTML viewer
+  (inline CSS + vanilla JS, zero external requests) that fetches the spec and lists operations.
 
-## Step 1 — router enhancement (edit `modules/router/src/root.zig`)
+**Threat model / out of scope** — Not a security boundary: the generated document exposes exactly
+the route/method/doc metadata already registered in the `Router` — anything sensitive in a
+`summary`/`description`/`request_schema` string is echoed verbatim into a public-by-default
+`/openapi.json`, so callers must not put secrets in `RouteDoc` fields. `Endpoint` does not add its
+own auth — gate `/openapi.json` (and the optional docs page) behind the router's own auth middleware
+if it should not be public. It does not validate that `request_schema`/`responses` describe the
+handler's *actual* behavior — it only validates that `request_schema` is well-formed JSON Schema
+text; a documented contract the handler doesn't honor is a caller bug this module cannot catch. It
+does not generate client SDKs, do request/response validation at runtime, or support anything beyond
+3.1.0 document generation (no OpenAPI 3.0/Swagger 2.0 output).
 
-Add, without breaking the existing public API or any existing test:
-1. **`Router.routes()`** — enumerate registered routes as `{ method, pattern, doc: ?RouteDoc }`
-   (iterator or an owned slice; document allocation/ownership). Deterministic order.
-2. **`Ctx.matchedPattern() ?[]const u8`** — the route pattern that matched this request (stashed in
-   `Ctx` during dispatch; null for 404). This is the thing `metrics`/`openapi` need.
-3. **Optional per-route doc metadata:** a registration variant, e.g. `addDoc(method, pattern, handler,
-   RouteDoc)` (or an overload), where `RouteDoc { summary, description, tags, request_schema,
-   responses, deprecated }` is all-optional. Existing `add`/`get`/`post` keep working (doc = null).
-   Keep `RouteDoc` a plain data struct the router just stores + returns.
-Add router tests for `routes()` enumeration + `matchedPattern()` on hit/miss. Router's own test
-count must stay green.
+**Verification** — `zig build test-openapi`, 7 tests. Offline: golden OpenAPI 3.1 JSON for a known
+route set (`:id`→`{id}` conversion, path parameters present and required, `RouteDoc` fields
+surfaced, default 200 for undocumented routes); empty router produces a valid empty-`paths`
+document with no panic; method grouping is deterministic by `http.Method` enum order rather than
+registration order; malformed `request_schema` returns `error.InvalidRequestSchema`; the endpoint
+serves the spec on GET/HEAD, returns 405 with `Allow` on other methods, and passes through
+everything else, driven socket-free via `http.Server.serveStream`; the self-contained docs page is
+checked for zero external asset references. In-process integration: a real `http.Server` + router +
+endpoint bound to `127.0.0.1:0`, fetched with `http.Client` — the served document parses and
+contains the registered routes/operations.
 
-## Step 2 — `openapi` module
-
-1. **Spec generation:** `Generator.build(router, Info) → std.json.Value` (or write directly) producing
-   a valid **OpenAPI 3.1** document: `openapi: "3.1.0"`, `info` (title/version/description from `Info`),
-   `paths` — convert `:param`→`{param}` and `*wild`→`{wild}`, group methods under each path, each
-   operation carries `parameters` (path params, `required:true`), and — when the route has a
-   `RouteDoc` — `summary`/`description`/`tags`/`requestBody`/`responses`/`deprecated`. Routes without a
-   doc get a minimal operation with a default `responses: { "200": {description} }`. Valid JSON,
-   deterministic key/order where feasible.
-2. **Serve:** an `Endpoint`-style intercepting middleware (same pattern as `metrics` — `router.Handler`
-   can't close over state) serving **`GET /openapi.json`** with `application/json`. Optionally a tiny
-   docs HTML page — but Swagger-UI needs external JS/CSS (CSP/bundling problem), so either skip it or
-   serve a minimal self-contained HTML that fetches the spec; **do NOT** pull external assets. Note
-   the choice.
-
-## Acceptance / verification
-
-- **Offline unit tests:** `router.routes()` returns the registered set (methods + patterns, doc
-  attached); `matchedPattern()` correct on hit + null on miss; openapi generation → a **golden**
-  OpenAPI 3.1 JSON for a known route set (assert `openapi`/`info`/`paths`, `:id`→`{id}` conversion,
-  path `parameters` present+required, doc fields surfaced, default 200 for undocumented); malformed/
-  empty router → a valid empty-`paths` doc, no panic.
-- **In-process integration (must NOT skip normally):** router (a few routes, some with `addDoc`) +
-  `http.Server` + `http.Client` + the openapi endpoint → `GET /openapi.json` returns 200 with a JSON
-  body that parses and contains the routes/operations.
-- `zig build test-openapi`, `zig build test-router`, and `zig build test` (all) green, Debug +
-  ReleaseFast; `zig fmt --check` clean. openapi registered with `deps = &.{"router","http"}`.
-
-## Notes for the implementer
-
-- Use the **zig skill** (std.json Value building/stringify, std.Io.Writer). Reuse `router`'s types +
-  `http.Server` ResponseWriter. Emit strict, valid OpenAPI 3.1 (validate the shape in tests).
-- Keep Step 1 minimal and backward-compatible — many modules depend on `router`; do not break them
-  (run `zig build test` after the router edit before starting openapi).
-- SPDX header + a `Provenance:` line on the new module (clean-room; design refs FastAPI MIT / utoipa
-  MIT-or-Apache / OpenAPI 3.1 spec). Update `NOTICE` with the design ref. Do NOT edit PLAN.md.
-- Follow-up (NOT this task, just note it in the openapi README): `metrics` can now use
-  `Ctx.matchedPattern()` for its route-pattern label.
+**Status** — `gap · any · util · reentrant` · deps: `router`, `http` (+ `std.json`).

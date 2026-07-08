@@ -1,76 +1,63 @@
 # SPEC — `blobmsg`
 
-Native **ubus** client + **blob/blobmsg** wire codec (OpenWRT's typed message bus). Wave P2 (AXP
-extraction). `extract · linux · client · reentrant` (the codec is platform-pure; the socket client
-is Linux). **Seed: extract from `~/workspace/axp/axp-core/ubus.zig`** (same authors' Apache-2.0
-code, relicensed MIT) — that code was itself **clean-room ported byte-for-byte from the OpenWRT C
-wire sources** (openwrt/libubox `blob.h`/`blobmsg.h`, openwrt/ubus `ubusmsg.h`/`libubus-io.c`) and
-**byte-parity-verified against `ubus -S` on real hardware**. Deps: **none (std only — `std.json`
-for JSON↔blobmsg)**. New `build.zig` entry `.{ .name = "blobmsg" }`.
+**Purpose** — Talk OpenWRT's ubus message bus natively: list objects (with decoded method
+signatures), invoke methods with JSON arguments, and subscribe to events — over the ubus unix
+socket, with no `ubus` CLI shell-outs, no libubox binding, no libc. Pairs a platform-pure
+blob/blobmsg wire **codec** (`codec.zig`) with a Linux socket **client**. No pure-Zig ubus/blobmsg
+implementation exists elsewhere (goubus is HTTP/rpcd; python-ubus/golangwrt are cgo wrappers).
 
-## Why
+**Model after / Seed** — the OpenWRT libubox/ubus wire format, clean-room. Extracted from the
+authors' axp `axp-core/src/ubus.zig` (Apache-2.0, relicensed MIT), where it replaced per-read `ubus`
+CLI forks on real devices. The wire format was clean-room ported byte-for-byte from the OpenWRT C
+sources (libubox `blob.h`/`blobmsg.h`, ubus `ubusmsg.h`/`libubus-io.c` — ISC / LGPL-2.1, **design
+reference only, no source copied for this extraction**) and byte-parity verified against `ubus -S`
+on real hardware. See `NOTICE`.
 
-OpenWRT's real control API is ubus (network/dhcp/system/wireless/firewall/service/file/log…).
-**No pure-Zig ubus/blobmsg lib exists** (goubus=HTTP/rpcd, python-ubus/golangwrt=cgo wrappers) — the
-axp module is a genuinely novel clean-room impl. High reuse for any OpenWRT/ubox tooling.
+**Design & invariants**
+- **The codec is the security boundary, and it is platform-pure.** `codec.zig` has no I/O and
+  compiles/tests on any OS. Big-endian, 4-byte-aligned wire format: `blob_attr`
+  `id_len = (EXTENDED<<31)|(id<<24)|len` (len counts the 4-byte header, pad does not); a `blobmsg`
+  is a blob_attr with EXTENDED set, `id` = value type, data = `blobmsg_hdr` (BE u16 namelen + name +
+  NUL + pad) + value. Every id_len/namelen is validated against the enclosing buffer before any
+  slice is formed; scalar sizes are exact (per libubox `blobmsg_check_attr`); each walk step advances
+  ≥4 bytes (iteration capped by construction); JSON decode caps nesting at `max_depth` (64). Malformed
+  input → `error.Truncated`/`BadLength`/`TooDeep`, never a panic or OOB read.
+- **JSON↔blobmsg mapping mirrors ubus's own:** object→TABLE, array→ARRAY, string→STRING, bool→INT8,
+  integer→INT32 (INT64 on i32 overflow), float→DOUBLE (BE u64 of the f64 bits).
+- **Client = one persistent connection, reentrant.** One `Client` per thread/loop (no globals). All
+  socket work is errno-encoded `std.os.linux` (Linux-only by `@compileError` elsewhere), with a
+  bounded recv timeout, `SOCK_CLOEXEC`, and a 1 MiB reply cap (= ubusd's `UBUS_MAX_MSG_LEN`). Each
+  request gets a fresh sequence number and replies are matched on it, so a prior request's stragglers
+  are skipped rather than misread; the HELLO greeting (its peer = the daemon-assigned client id) is
+  required.
+- **Two daemon behaviors ported verbatim** (ubusd depends on both): an INVOKE must carry a
+  `UBUS_ATTR_DATA` attr even with no args (INVALID_ARGUMENT otherwise); the INVOKE reply
+  choreography is ack-STATUS (no OBJID) → DATA → completion-STATUS (OBJID + return code), while
+  ubusd-internal objects (the event registry) answer directly with a single STATUS. `subscribe`
+  opens a dedicated connection (events are unsolicited INVOKEs that must not interleave with the
+  request/reply stream) and the "object" id it registers must be a blobmsg INT32, not the generic
+  JSON-int mapping.
 
-## Scope
+**Threat model / out of scope** — Trust boundary is a bit-flipped or hostile daemon reply: the codec
+walkers and JSON decoder are fuzzed and bounds-check every length, so no reply can panic, loop, read
+OOB, or blow the stack (nesting cap). The reply-size cap bounds memory. It does **not** authenticate
+the daemon or peers (ubus access control is the socket's unix permissions + ubusd ACLs — out of
+scope here), does not implement the ubus *server*/object-provider side, does not do TLS/remote
+transport (it is a local unix socket), and does not carry over the seed's CLI-fallback layer — this
+module reports typed errors and lets the caller decide. JSON args must be an object whose values all
+have a blobmsg mapping (null/non-object → `error.Unsupported`).
 
-1. **blob/blobmsg codec (platform-pure, byte-parity, the security-critical core):** encode/decode
-   the wire format exactly as the seed does — top `blob_attr` (id 0) wrapping children; blob
-   `id_len` BE = `(EXTENDED<<31)|(id<<24)|len` where len counts the 4B header, attrs **4-byte
-   padded**; blobmsg = a blob attr with EXTENDED set, data = `blobmsg_hdr` (namelen BE16 + name +
-   NUL + pad-to-4) + value; types INT8→bool, INT16/32/64 signed, DOUBLE=BE64 bits, STRING, TABLE/
-   ARRAY nested. **Bounds-checked** — a truncated/hostile buffer returns an error, never OOB/panic.
-   `JSON↔blobmsg`: decode blobmsg→`std.json`-shaped value/text; encode JSON args→blobmsg (object→
-   TABLE, array→ARRAY, string→STRING, bool→INT8, int→INT32/INT64, float→DOUBLE).
-2. **ubus unix-socket client:** connect to the ubus socket (`/var/run/ubus/ubus.sock`, overridable),
-   the msghdr (8B: version u8, type u8, seq BE16, peer BE32), and the operations the seed has:
-   **LOOKUP** (list objects/methods), **INVOKE** (call `<object>.<method>` with optional JSON args →
-   blobmsg-decoded result), and **event register/listen** (subscribe + drain events). Errno-encoded
-   `std.os.linux` unix socket (repo no-libc discipline). Port the seed's two decisive daemon
-   gotchas verbatim (INVOKE must carry a `UBUS_ATTR_DATA` even when empty; the ack-STATUS → DATA →
-   completion-STATUS(objid) reply sequence).
+**Verification** — A scripted in-process daemon (unix socket + thread) speaks the exact reply
+choreography — HELLO, LOOKUP DATA/STATUS, the ack→DATA→completion-STATUS(OBJID) sequence — and
+asserts **both daemon gotchas from the daemon side** (every INVOKE carried DATA; args round-tripped),
+covering list/filtered-list/invoke-with-args/void/error(UbusError)/unknown-object(NotFound) and the
+subscribe → event-delivery → EOF path, all without OpenWRT hardware. Codec tests pin golden wire
+bytes (blobmsg field encode, a LOOKUP frame, the empty-DATA INVOKE), decode nested TABLE/ARRAY,
+JSON→blobmsg→JSON round-trips, the INT32/INT64 split at the i32 boundary, DOUBLE golden BE bits, and
+reject truncated/bad-length/OOB attrs, hostile nesting depth, and oversized name/attr; a
+`std.testing.fuzz` case asserts the walkers + JSON decoder never crash/loop/read OOB. A real-ubusd
+integration test runs when `/var/run/ubus/ubus.sock` exists and skips cleanly otherwise. Ground truth
+remains the seed's qemu parity check (native output == `ubus -S`).
 
-## Public API sketch (final = the seed's shape)
-
-```zig
-// codec (platform-pure, separately testable)
-pub const blob = struct { pub const Iterator = ...; pub fn encode(...); };
-pub fn decodeToJson(gpa, blobmsg_bytes, out: *std.Io.Writer) !void;
-pub fn encodeArgs(gpa, json_value) ![]u8;   // JSON args → blobmsg DATA
-// client
-pub const Client = struct {
-    pub fn open(gpa, path: ?[]const u8) !Client;   pub fn close(*Client) void;
-    pub fn list(self, pattern: ?[]const u8) ![]Object;         // LOOKUP
-    pub fn invoke(self, object, method, args_json: ?[]const u8) ![]u8;  // → blobmsg-decoded JSON
-    pub fn subscribe(self, pattern) !EventStream;              // register + drain
-};
-```
-
-## Acceptance / verification
-
-- **Offline unit tests (the codec must be byte-exact + bulletproof — port the seed's):** blob/
-  blobmsg encode → **golden wire bytes** (hand-crafted, matching `ubus -S` output as the seed
-  verified); decode of canned frames → the right typed values incl. nested TABLE/ARRAY; JSON→blobmsg
-  →JSON round-trip; truncated / bad-len / OOB attrs → error (no panic — fuzz the walker); the
-  id_len/EXTENDED/padding edge cases.
-- **Integration (gate via `error.SkipZigTest` if the ubus socket is absent — it almost certainly is
-  in this environment):** if `/var/run/ubus/ubus.sock` exists, `list()` returns objects and
-  `invoke("system","board",null)` decodes typed data; otherwise SKIP cleanly.
-- `zig build test-blobmsg` + `zig build test` (all) green, Debug + ReleaseFast; `zig fmt --check`
-  clean. Registered with no deps.
-
-## Notes for the implementer
-
-- Use the **zig skill** for Zig 0.16 (errno-encoded `std.os.linux` unix socket, `std.json`
-  Value/Stringify, BE integer reads). No libc.
-- EXTRACTION: the seed is a proven byte-parity port — **keep the wire format exactly**, port its
-  tests, adapt module layout + any 0.16 drift. The codec is the value; make it separately testable
-  from the socket.
-- Provenance: README `Provenance:` line = "extracted from axp `axp-core/ubus.zig` (same authors,
-  Apache-2.0, relicensed MIT); the wire format is clean-room from the OpenWRT UAPI/C sources — see
-  NOTICE". Add a NOTICE design-ref entry (openwrt libubox/ubus, LGPL-2.1/ISC — **wire format only,
-  clean-room, no source copied**; byte-parity verified vs `ubus -S`). SPDX MIT header.
-- Codec is portable (any); the socket client is Linux — structure so the codec compiles/tests
-  everywhere and only the client is Linux-gated.
+**Status** — `extract · linux (codec: any) · client · reentrant` · deps: none (std only —
+`std.json` for the JSON↔blobmsg mapping).

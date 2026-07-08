@@ -1,64 +1,54 @@
 # SPEC — `http`
 
-HTTP client (and later server codec), pure-Zig, over `std.crypto.tls`.
-`extract+gap · any · both · async`. One module, `Client` + `Server` submodules.
-Model after: `lalinsky/dusty` (1.1 shape) + `nghttp2` (h2 framing/HPACK); verify h2 with **h2spec**.
-Seed: `~/workspace/axp/axp-core/httpclient.zig` (streaming client) + `http.zig` (server codec).
+**Purpose** — A pure-Zig HTTP client **and** server hardened for direct internet exposure (no
+reverse proxy required), speaking HTTP/1.1 and HTTP/2. The foundational module: `router`, `dns`
+(DoH), `rdap`, `acme`, `mcp-http`, and the whole REST/API cluster sit on it. Exists to replace
+shelling `curl` and to escape the churny `std.http.Client`.
 
-## Why
+**Model after / Seed** — the HTTP/1.1 client shape is extracted from the authors' axp
+(`axp-core/httpclient.zig` + `http.zig`; Apache-2.0, relicensed MIT). Design refs (behavior only):
+lalinsky/dusty (1.1 client), Go net/http (redirect semantics, server shape, gzip handler); RFCs
+7230/9110 (1.1), 7541 (HPACK), 9113 (h2), 7301 (ALPN), 7233 (Range), 9110 §8.8/12 (conditional /
+content-negotiation), 7578 (multipart). No HPACK/nghttp2 source consulted. TLS via
+`std.crypto.tls`; see NOTICE.
 
-The data plane / MCP / agent uploads all want a native HTTP client instead of shelling `curl` or
-depending on the churny `std.http.Client`. HTTP/2 is a genuine ecosystem gap. `dns` (DoH), `rdap`,
-and the REST/API cluster all sit on this. **Do NOT build on `std.http.Client`.**
+**Design & invariants**
+- **Submodules:** `Client` / `Server` (h1), `h1` (parser), `hpack` + `h2` + `h2_server` +
+  `h2_client` (HTTP/2), plus request/response feature layers `conditional`, `body`, `multipart`,
+  `sse`, `range`, `conneg`, `gzip`. One `test { _ = … }` aggregator pulls every submodule's tests
+  (the dark-tests rule).
+- **Same handler serves h1 and h2** — h2 pseudo-headers map to the stock `Request`; the
+  `ResponseWriter` is re-framed as HEADERS+DATA. h2 is opt-in (`enable_h2c`), off by default → the
+  h1 path is byte-for-byte unchanged.
+- **Streaming + backpressure:** `ResponseWriter.flush()` for incremental output; bodies stream with
+  flow control. `setHeader` stores the value slice **without copying** — dynamic header values need
+  caller-stable memory (documented per-helper).
+- **BYO-TLS seam:** `serveStream` / `connectH2Over` + ALPN run h2/h1 over a caller-terminated
+  (TLS) stream — TLS termination is out of this module (see Threat model).
+- **Never-panic:** malformed requests are typed errors → 400/413/414/431/500; handler errors/panics
+  become a clean 500.
 
-## Phased scope — THIS TASK IS PHASE 1 ONLY
+**Threat model / out of scope** — Hardened for direct exposure:
+- **Request smuggling:** duplicate/disagreeing Content-Length → 400; Content-Length **and**
+  Transfer-Encoding both present → 400 (no CL.TE); TE-without-chunked, duplicate Host, obs-fold, and
+  **bare-LF** line endings (RFC 9112 §2.2) all rejected.
+- **Resource/DoS:** slowloris read/request/write timeouts; size caps (413/431/414); per-connection
+  request-count cap; inbound gzip is zip-bomb-capped (`max_decompressed_request_bytes` → 413).
+- **HTTP/2 DoS:** rapid-reset (CVE-2023-44487), CONTINUATION-flood (CVE-2024-27316),
+  MAX_CONCURRENT_STREAMS, control-frame flood budgets, total-streams-per-conn cap — all
+  configurable, safe by default (so `enable_h2c` is hardened out of the box).
+- **Header injection:** outbound header names/values reject CR/LF/NUL (response-splitting guard).
+- **Response bodies of 304/204/1xx** are suppressed (framing correctness).
+- **Out of scope:** TLS termination (bring-your-own via the seam — reverse proxy today, ianic/std
+  server later), HTTP/3 (QUIC), auth (that's `aaa-gate`/`jwt`), rate limiting (`ratelimit`),
+  path-traversal normalization beyond what `router` does, and response-trailer *writing* (read side
+  only — deferred as disproportionately invasive).
 
-- **Phase 1 (DO NOW): HTTP/1.1 client over TCP + TLS.**
-- Phase 2 (later spec): server codec (request parse / response write, streaming).
-- Phase 3 (later spec): HTTP/2 (framing + HPACK) — verify against h2spec. **Do not start h2 yet.**
+**Verification** — HPACK vs RFC 7541 Appendix C vectors (bytes + decoded fields + dynamic-table
+state per step); h2 offline scripted client↔server pipe exchanges + h2spec-style negatives; h2 DoS
+attack-sim tests (rapid-reset proves 0 handler runs); serveStream goldens for conditional/range/
+multipart/content-neg; smuggling/timeout/size negatives; a BYO-TLS in-memory dogfood
+(connectH2Over ↔ serveStream). 302 tests.
 
-## Phase 1 requirements
-
-1. **Transport:** TCP connect via std net; TLS via `std.crypto.tls` for `https`. IP or hostname
-   (resolve via std for now; swap to the `dns` module once it lands). Use `netaddr` for address
-   parsing / `host:port` splitting.
-2. **Requests:** GET/POST/PUT/DELETE/HEAD; caller-set headers; request body (fixed length +
-   chunked). Sane defaults for Host, User-Agent, Accept-Encoding: identity.
-3. **Responses:** status line + headers parse (bounded header size), body via Content-Length
-   **and** chunked transfer-encoding; expose body as a streaming reader AND a read-all-to-buffer
-   helper. Decode is the caller's job for gzip (adopt std.compress if needed).
-4. **Redirects:** follow 3xx up to a caller-set cap (default e.g. 10), method/redirect rules per RFC.
-5. **Robustness:** connect + total timeouts; connection close handling; keep-alive optional
-   (can defer pooling to a follow-up). Never panic on malformed server output — return errors.
-6. **Streaming:** support bodies > memory without buffering the whole thing (the axp seed does
-   `putFile`/`getToFile` straight to/from disk — keep that streaming capability).
-
-## Public API sketch (keep small, allocator-explicit; final shape your call)
-
-```zig
-pub const Client = struct {
-    pub fn init(gpa: std.mem.Allocator, opts: Options) Client;
-    pub fn deinit(self: *Client) void;
-    pub fn request(self: *Client, method: Method, url: []const u8, opts: RequestOptions) !Response;
-    // convenience: getAlloc(url) -> owned body; getToFile(url, path); putFile(url, path)
-};
-pub const Options = struct { connect_timeout_ms: u32 = 5000, total_timeout_ms: u32 = 30000, max_redirects: u8 = 10, tls: TlsOptions = .{} };
-```
-
-## Acceptance / verification
-
-- **Offline unit tests** (the bulk, must pass in the sandbox): status/header parser on canned
-  byte buffers; chunked decoder incl. trailer + edge cases (0-chunk, split reads); URL parsing;
-  redirect-chain logic driven by fabricated responses. `zig build test-http` green.
-- **Live round-trip when the network is available:** `GET https://example.com` returns 200 +
-  body; a small JSON API GET parses; a redirect (http→https) follows. If the sandbox has no
-  network, note it and rely on the offline tests — do NOT fail the task for a missing network.
-- No dependency on `std.http.Client`. TLS strictly via `std.crypto.tls`.
-
-## Notes for the implementer
-
-- Use the **zig skill** for correct Zig 0.16 std APIs (`std.crypto.tls`, `std.Io` reader/writer
-  patterns, buffered I/O) — they differ from older training data.
-- Extract/adapt the streaming client shape from the axp seed; implement HTTP/1.1 framing yourself
-  (it's small and stable). Register `http` in `build.zig` with `deps = &.{"netaddr"}`.
-- Land Phase 1 as a clean, tested increment; leave clear TODOs where Phase 2/3 will hook in.
+**Status** — `extract+gap · any · both · single_owner` · deps: `netaddr` (+ `std.crypto.tls`,
+`std.Io.net`, `std.compress.flate`).

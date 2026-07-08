@@ -1,68 +1,50 @@
 # SPEC — `decimal`
 
-Exact base-10 **fixed-point decimal** (money/ETL math). Wave P1 (first extraction).
-`extract · any · util · reentrant`. Model after: Java `BigDecimal` / Python `decimal` semantics,
-but **fixed-scale** like a database `DECIMAL(38,12)`. **Seed: extract from
-`~/workspace/bxp/bxp-core/src/decimal.zig`** (same authors' Apache-2.0 code, relicensed MIT here).
-Deps: **none (std only)**. New `build.zig` entry `.{ .name = "decimal" }`.
+**Purpose** — Exact base-10 fixed-point arithmetic for money and ETL math, where `0.1 + 0.2` must
+be exactly `0.3` and no binary-float noise is tolerable. Values are an `i128` scaled by `10^12`
+(12 fractional digits) — like a database `DECIMAL(38,12)` — with parse, arithmetic and format all
+on pure integer paths (no `f64`/`f128` anywhere). The numeric leaf primitive other modules build on.
 
-## Why
+**Model after / Seed** — Java `BigDecimal` (incl. `RoundingMode`) / IBM General Decimal Arithmetic /
+Python `decimal` semantics, fixed-scale like DB `DECIMAL(38,12)`. Extracted from the authors' bxp
+`bxp-core/src/decimal.zig` (where it replaced an `f80` core, proven on 40M-row ETL; Apache-2.0,
+relicensed MIT). The seven rounding modes are clean-room from the published definitions/truth-tables
+(BigDecimal javadoc, GDA spec, Python docs) — definitions only, no source copied. See `NOTICE`.
 
-Zig std has no decimal type; `0.1 + 0.2 != 0.3` in float. Money and ETL need exact base-10.
-This is a foundational primitive that `numparse`, `finstats`, and `exprcalc` will build on. bxp
-already ships a battle-tested `i128` fixed-point decimal (scale 1e12, benchmarked on 40M rows) —
-this task **lifts it out** as a standalone, dependency-free library.
+**Design & invariants**
+- **Pure integer, no floats, never UB.** Range ±1.7e26 with step `1e-12`. `+ −` are exact; `× ÷`
+  widen to **i256 intermediates** so a product of two large operands cannot overflow before the
+  rescale. Any result beyond the i128 range is a typed `error.Overflow`; `÷` by zero is
+  `error.DivisionByZero`; there is no Inf/NaN and no silent wrap.
+- **Two rounding surfaces.** The classic ops (`mul`/`div`/`round`) round **half-away-from-zero**
+  ("school"/Excel display rounding). The controlled ops (`rescale`, `roundToIntegral`, `quantize`,
+  `divRound` at an explicit result scale) take an explicit `RoundingMode` —
+  `half_even` (default) / `half_up` / `half_down` / `up` / `down` / `ceiling` / `floor` — with exact
+  integer half-way detection (`r == d − r`), no doubling overflow.
+- **Boundary policy is explicit per op.** `floor`/`ceil`/`round` return the value unchanged in the
+  single unrepresentable case at the i128 extreme (rather than erroring); `rescale`/`quantize`/
+  `divRound` error on overflow. `neg`/`abs` error only at the asymmetric i128 minimum.
+- **Allocation-free, reentrant.** `toString` writes into a caller `[str_buf_len]u8`; a `{f}`
+  formatter integrates with `std.fmt`. No shared state.
+- **Parse** accepts sign, decimal point and scientific notation; fractional digits past 12 round
+  half-away-from-zero into the 12th; junk/empty/double-dot/thousands-grouped input →
+  `error.InvalidCharacter`, out-of-range or >60-digit mantissa → `error.Overflow`.
 
-## Scope
+**Threat model / out of scope** — Not security-sensitive; the contract is numerical correctness.
+The i256 scaling multiply and the parse accumulator are overflow-checked so hostile inputs (huge
+mantissa × exponent) yield a clean error, never a trap. Out of scope: arbitrary/unbounded precision
+(the scale is fixed at 12), locale/grouping-aware parsing (the caller strips separators), currency
+semantics, and any float interchange. Deltas from the seed are failure-path hardening only
+(`?Decimal` → error unions; div-quotient, parse-accumulator and `fromInt` overflow checks;
+`floor`/`ceil` in i256; allocation-free `toString`) — the value semantics are preserved exactly.
 
-1. **Extract + de-couple:** read the bxp seed and lift the `Decimal{ raw: i128 }` core out as a
-   clean standalone module — drop any bxp-app coupling, keep the exact semantics. Fixed scale
-   (1e12, i.e. 12 fractional digits) as in the seed; document it. Preserve behavior byte-for-byte
-   where the seed has tests (this is an extraction, not a redesign).
-2. **Arithmetic:** exact `add` / `sub` / `mul` (with **i256 intermediates** to avoid overflow before
-   rescale), `div` and `round` with **half-away-from-zero** ("school"/Excel) rounding. **No Inf/NaN.**
-   Overflow of the i128 result → a clean error (or documented saturation) — never UB.
-3. **Parse / format (float-free):** `parse([]const u8) !Decimal` (sign, integer + fractional digits,
-   reject junk/NaN/exponent unless the seed supports it — match the seed) and `format` to a canonical
-   string (no trailing-zero noise beyond the scale; match the seed). No float anywhere in the path.
-4. **Conversions + compare:** `fromInt`, `toInt`/truncation helpers, `order`/`eql`, `neg`, `abs`,
-   `isZero`. Keep the API small and match the seed's surface.
+**Verification** — Unit tests ported from the seed plus extraction additions: parse↔format
+round-trips, exact arithmetic (`0.02+0.08=0.10`, `0.1+0.2=0.3`), mul/div half-away rounding at the
+12th-digit boundary on both signs, i256-intermediate large-product correctness, clean `error.Overflow`
+at the ceiling (add/sub/mul/div/fromInt), range boundaries incl. the asymmetric minimum formatting
+exactly, and hostile parse (mantissa×exponent) not trapping. RoundingMode coverage is a 16-row × 7-mode
+truth table hand-derived from the BigDecimal/GDA/Python definitions, plus half-way-at-2dp for every
+mode on both signs, and `rescale`/`divRound`/`quantize` edges (scale-up exact, negative scale,
+i128-boundary overflow).
 
-## Public API sketch (final = the seed's shape; keep it small)
-
-```zig
-pub const Decimal = struct {
-    raw: i128,   // value × 10^scale
-    pub const scale = 12;
-    pub fn fromInt(i: i128) Decimal;
-    pub fn parse(text: []const u8) !Decimal;
-    pub fn format(self: Decimal, buf: []u8) []const u8;   // or a std.fmt formatter
-    pub fn add(a: Decimal, b: Decimal) !Decimal;
-    pub fn sub(a: Decimal, b: Decimal) !Decimal;
-    pub fn mul(a: Decimal, b: Decimal) !Decimal;          // i256 intermediate
-    pub fn div(a: Decimal, b: Decimal) !Decimal;          // half-away-from-zero
-    pub fn order(a: Decimal, b: Decimal) std.math.Order;
-    // neg/abs/isZero/toInt ...
-};
-```
-
-## Acceptance / verification
-
-- **Offline unit tests (port the seed's tests + add):** exactness (`0.1 + 0.2 == 0.3`,
-  `0.02 + 0.08 == 0.10`), mul/div rounding (half-away-from-zero at the boundary, negative operands),
-  i256-intermediate correctness on large mul (no premature overflow), i128-overflow → clean error,
-  parse round-trips (`"−123.456"` → format back, canonical), parse rejects junk / empty / too many
-  fractional digits (match the seed's policy), compare/order, zero/neg/abs edge cases. Float-free
-  (grep: no `f64`/`f128` in the arithmetic path).
-- `zig build test-decimal` + `zig build test` (all) green, Debug + ReleaseFast; `zig fmt --check`
-  clean. Registered with no deps.
-
-## Notes for the implementer
-
-- Use the **zig skill** for Zig 0.16 (i128/i256 math, `std.fmt` formatter, `std.math.Order`).
-- This is an **EXTRACTION**: start from the bxp seed, keep its proven semantics and tests; don't
-  redesign the rounding or scale. If the seed couples to bxp types, replace with std/primitive types.
-- Provenance: README `Provenance:` line = "extracted from bxp `bxp-core/src/decimal.zig` (same
-  authors, Apache-2.0, relicensed MIT here)". `model_after` = "Java BigDecimal / DB DECIMAL(38,12)".
-  No NOTICE entry needed (it is our own code, not third-party) — SPDX MIT header as usual.
-- Keep it dependency-free and portable (no OS calls) — it's a leaf primitive many modules will use.
+**Status** — `extract · any · util · reentrant` · deps: none (std only).

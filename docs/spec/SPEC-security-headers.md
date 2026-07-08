@@ -1,64 +1,55 @@
 # SPEC — `security-headers`
 
-Secure-by-default HTTP security response headers as a `router` middleware. Web/API cluster (T5.6).
-`gap · any · util · reent`. Model after: helmet.js defaults + OWASP Secure Headers Project. Deps:
-`router`, `http`. New `build.zig` entry `.{ .name = "security-headers", .deps = &.{ "router", "http" } }`.
-(Module dir `modules/security-headers/`; the importable name may be `security_headers` — pick the
-form `@import` accepts and register that exact string in `build.zig`; note it in the README.)
+**Purpose** — Secure-by-default HTTP security response headers as a stateless `router`
+middleware: HSTS, CSP (+ Report-Only), `X-Content-Type-Options`, `X-Frame-Options`,
+`Referrer-Policy`, `Permissions-Policy`, the Cross-Origin isolation trio (COOP/CORP/COEP) and an
+optional `Server` replacement — each individually overridable or disable-able. The hardening
+baseline for a directly-internet-facing API.
 
-## Why
+**Model after / Seed** — Clean-room, no seed project and no third-party code. Model after
+helmet.js (MIT; defaults vocabulary and per-header on/off model — no source copied; the
+`csp_helmet_default` constant reproduces helmet's default policy *value* as configuration data)
+and the OWASP Secure Headers Project (best-practice header catalog). Header semantics themselves
+come from the standards: RFC 6797 (HSTS), CSP Level 3, the Fetch/HTML specs (COOP/CORP/COEP), RFC
+9110. Design refs in `NOTICE`.
 
-A directly-internet-facing API should ship the standard hardening headers by default. This is a
-tiny, stateless middleware that sets them, configurable per header.
+**Design & invariants**
+- **Precomputed, stateless, reentrant:** an initialized `SecurityHeaders` is immutable — no clock,
+  no allocation, no locks on the hot path (the HSTS value string is formatted once at `init` into
+  an embedded buffer). Safe to share across all of `http.Server`'s connection threads.
+- **Middleware sets, handler wins:** headers are set on the `ResponseWriter` **before** `next`
+  runs, so the handler's head is written with them; `setHeader` replaces by case-insensitive
+  name, so a handler (or inner middleware) setting the same header again overrides the default
+  exactly once, no duplicates. The `server` replacement value likewise overrides `http.Server`'s
+  automatic `Server:` header.
+- **Deliberate deviations from helmet defaults:** `X-Frame-Options` is `DENY` (spec mandate;
+  helmet defaults to `SAMEORIGIN`); CSP is **off by default** — there is no universally-safe
+  policy (a browser-app policy and a JSON-API policy want opposite things), and this module's own
+  spec requires "CSP present only when configured" rather than silently shipping either. Two
+  ready-made postures ship as constants: `csp_api` (deny-everything, for pure JSON/binary APIs) and
+  `csp_helmet_default` (helmet's browser-app default, for servers that also serve HTML). COEP
+  (`require-corp`) is off by default, matching helmet — it blocks every embedded cross-origin
+  resource that doesn't opt in via CORP/CORS.
 
-## Scope
+**Threat model / out of scope** — Not a WAF or input validator: it only sets response headers, it
+never inspects or blocks requests. Known gap: when a handler *errors*, `http.Server` resets the
+response to build its own automatic 500 — that plain 500 (and the server's own 431/414/413
+replies, which bypass the router entirely) carries no security headers, since the middleware never
+gets a chance to run for those responses. HSTS is meaningful only over HTTPS — browsers ignore it
+over plain HTTP, so shipping it is harmless there, but deploying it on a host not actually served
+via TLS is a caller misconfiguration this module cannot detect (and once cached, browsers refuse
+plain-HTTP access for `max-age`, so `preload` is opt-in and effectively permanent). Helmet's
+legacy/no-longer-relevant extras (`X-DNS-Prefetch-Control`, `X-Download-Options`,
+`X-Permitted-Cross-Domain-Policies`, `X-XSS-Protection: 0`, `Origin-Agent-Cluster`) are
+consciously out of scope.
 
-Set these response headers (secure defaults; each individually overridable/disable-able):
+**Verification** — 11 tests (`zig build test-security-headers`). Offline goldens over the
+socket-free `http.Server.serveStream`: byte-exact default header set, per-header disable + all-off
+bare response, per-header value overrides, CSP/Report-Only opt-in, COEP opt-in, HSTS value for
+every flag combination including the `maxInt(u64)` buffer bound, handler-override precedence with
+no duplicate header, `Server` replacement over the auto value, 404/405 fallback coverage, bare
+`ResponseWriter.apply`. In-process integration (`router` + `http.Server` + `http.Client` over
+loopback): a normal 200 carries the full default set and no opt-in headers; a handler that sets its
+own `X-Frame-Options` wins — skips only when loopback binding is unavailable.
 
-- **`Strict-Transport-Security`** (HSTS): `max-age` (default ~1 year), `includeSubDomains`, optional
-  `preload`. Note in docs: only meaningful over HTTPS (harmless over plain HTTP; gate/config it).
-- **`Content-Security-Policy`**: caller-supplied policy string (no universally-safe default — default
-  to a restrictive `default-src 'self'` **or** off-by-default with a clear doc; pick one, document).
-  Optional `Content-Security-Policy-Report-Only`.
-- **`X-Content-Type-Options: nosniff`** (default on).
-- **`X-Frame-Options: DENY`** (default) — plus note CSP `frame-ancestors` is the modern form.
-- **`Referrer-Policy`** (default `no-referrer` or `strict-origin-when-cross-origin` — pick, document).
-- **`Permissions-Policy`** (caller-supplied; default minimal/empty).
-- **Cross-Origin isolation:** `Cross-Origin-Opener-Policy` (default `same-origin`),
-  `Cross-Origin-Resource-Policy` (default `same-origin`), `Cross-Origin-Embedder-Policy` (default
-  **off** — it breaks embeds; opt-in).
-- Remove/replace **`Server`** header value if configured (fingerprint reduction) — optional.
-
-## Public API sketch (final shape your call)
-
-```zig
-pub const SecurityHeaders = struct {
-    pub fn init(Options) SecurityHeaders;   // one bool/optional per header + string values
-    pub fn middleware(self) router.Middleware;   // sets headers, then next
-    // secure defaults constructor: SecurityHeaders.strict(.{}) or default init()
-};
-```
-
-Middleware sets the configured headers on the `ResponseWriter` **before** calling `next` (so the
-handler's head is written with them; a handler may still override a specific header). Stateless —
-`state` points at the immutable config; fully reentrant, no clock, no allocation on the hot path.
-
-## Acceptance / verification
-
-- **Offline unit tests:** with defaults, the middleware sets exactly the expected header set with the
-  expected values (assert each); disabling a header omits it; overriding a value works; CSP present
-  only when configured; HSTS format correct (`max-age=…; includeSubDomains; preload`).
-- **In-process integration (must NOT skip normally):** router+`http.Server`+`http.Client` — a normal
-  200 response carries the security headers; a handler that sets its own `X-Frame-Options` wins over
-  the default (document precedence).
-- `zig build test-security-headers` (or the registered name) + `zig build test` (all) green, Debug +
-  ReleaseFast; `zig fmt --check` clean.
-
-## Notes for the implementer
-
-- Use the **zig skill**. Reuse `router.Middleware {state,run}` (state = `*const Config`) and `Ctx`;
-  set headers via `ctx.res.setHeader`. No new HTTP logic.
-- Header value strings can be precomputed at `init` (e.g. the HSTS string) so the hot path is just
-  `setHeader` calls — keep it allocation-free per request.
-- Document the precedence (middleware sets, handler may override) and the HTTPS-only note for HSTS.
-- SPDX header + a `Provenance:` line (clean-room; design refs helmet.js MIT / OWASP).
+**Status** — `gap · any · util · reentrant` · deps: `router`, `http`.

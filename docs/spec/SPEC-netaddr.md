@@ -1,54 +1,44 @@
 # SPEC — `netaddr`
 
-IP address parsing/formatting + RFC 6724 destination/source address selection.
-`extract · any · util · reent`. Model after: glibc `getaddrinfo` reachability ordering /
-Go stdlib `net/addrselect.go`. Seed: `~/workspace/zig-fping/src/netutil.zig`.
+**Purpose** — The pure address logic a dual-stack networking stack needs before it touches a
+socket: parse/format IPv4 & IPv6 literals (RFC 5952 canonical form), split `host:port`, do
+CIDR/prefix math, and answer "given several candidate addresses for a host, which do I connect to,
+in what order" (RFC 6724). No I/O in the core — it is the shared substrate `http`, `dns` and `icmp`
+build on.
 
-## Why
+**Model after / Seed** — the RFC 6724 selection logic is *extracted* from zig-fping's
+`src/netutil.zig` (`sortByDestinationPolicy` / `policyPrecedence` / `destinationReachable`) and
+extended to the full destination rule set, cross-checked row-for-row against Go's
+`net/addrselect.go` + the glibc getaddrinfo algorithm. The CIDR/prefix ops model after Go
+`net/netip.Prefix` + `go4.org/netipx` (behavior only, clean-room). fping attribution + the Go/glibc/
+netipx design refs are in `NOTICE` (fping block shared with dns/icmp/seqmap).
 
-Zig std has address types but **no RFC 6724 destination/source selection** — the "given several
-candidate addresses for a dual-stack host, which do I connect to, in what order" logic. `http`,
-`dns`, `icmp` all need it. This module also provides ergonomic parse/format helpers.
+**Design & invariants**
+- **Allocation:** none in the scalar API — parse/format work on caller buffers (`max_ip_text_len` /
+  `max_prefix_text_len`), `sortDestinations` uses a fixed `max_sort_candidates` stack array. Only
+  `summarize` / `mergePrefixes` allocate, via a caller allocator, and return an owned slice.
+- **Never-panic parsing:** `parseIp*` / `parsePrefix` / `parseHostPort` return `null` on malformed
+  input; strict like Go `netip` (no leading zeros, no zone suffix, `::` must elide ≥ 1 group).
+- **Strict family distinction:** an IPv4-mapped v6 address stays `.v6`; a v4 `Prefix` never contains
+  a mapped-v6 address — mixing requires an explicit `Ip.unmap`. All prefix bit math runs on the
+  address as a big-endian unsigned int, so numeric order equals address order for both families.
+- **RFC 6724 rule coverage matches Go:** destination rules 1/2/5/6/8/9 (rule 9 IPv6-only, per Go
+  issues 13283/18518); source rules 1/2/6/8. Rules needing OS state (deprecated/home/interface/
+  transport) are skipped, as glibc and Go document. Sorts are stable (rule 10) via insertion sort.
+- **Scope** is a numeric-backed non-exhaustive enum so unnamed multicast scopes order correctly.
 
-## Scope (this task)
+**Threat model / out of scope** — Not security-sensitive; pure logic. `systemSource` is the only
+impure, Linux-only surface — a UDP-`connect` route probe (no packet is sent) + `getsockname` to
+learn the OS-chosen source, the glibc trick; it needs no privileges and returns `null` on an
+unreachable destination. Out of scope: DNS resolution, actually connecting, zone/scope-id handling
+(zones are rejected by the parsers, passed through untouched by `parseHostPort`), and the RFC 6724
+rules that require per-interface OS state.
 
-1. **Parse/format** — IPv4 and IPv6 literals ↔ bytes; parse `host:port` / `[v6]:port`; format
-   canonical (RFC 5952 for v6). Reject malformed input (no panics).
-2. **Address kind/scope classification** — loopback, link-local, ULA, multicast, global; the
-   scope + label + precedence tables RFC 6724 needs.
-3. **RFC 6724 destination ordering** — `sortDestinations(candidates, source_for)` ordering the
-   candidate list per the rule set (precedence, scope match, longest-matching-prefix, prefer
-   higher precedence, etc.). Port the logic from the zig-fping seed (`sortByDestinationPolicy`,
-   `policyPrecedence`, `destinationReachable`) and cross-check against Go `addrselect.go`.
-4. **Source selection** — best source address for a given destination (the rules that pair with
-   destination ordering). zig-fping stubs this; implement the common cases, document the corners.
+**Verification** — Unit tests only (the core needs no network): strict parse accept/reject tables
+for v4/v6/prefix/host:port, RFC 5952 canonical-format round-trips (zero-compression edge cases,
+mixed-notation mapped v4), the RFC 6724 §2.1 policy table + §2.2 `commonPrefixLen` + §10.2 worked
+pairwise-ordering examples, source-selection rules, CIDR ops (contains/overlaps/first-last-host/
+broadcast/supernet/iterator), and `summarize` / `mergePrefixes` minimal-covering checks. One
+Linux-only live test exercises `systemSource` against loopback.
 
-## Public API sketch (adjust to taste, keep it small + allocator-explicit)
-
-```zig
-pub const Ip = union(enum) { v4: [4]u8, v6: [16]u8 };
-pub fn parseIp(text: []const u8) ?Ip;
-pub fn formatIp(ip: Ip, buf: []u8) []const u8;          // RFC 5952 for v6
-pub const HostPort = struct { host: []const u8, port: u16 };
-pub fn parseHostPort(text: []const u8) ?HostPort;       // handles [v6]:port
-pub const Scope = enum { node_local, link_local, site_local, global };
-pub fn scopeOf(ip: Ip) Scope;
-pub fn precedenceOf(ip: Ip) u8;                          // RFC 6724 policy table
-/// Sort `dsts` in place into RFC 6724 connect-preference order.
-pub fn sortDestinations(dsts: []Ip, srcFor: *const fn (Ip) ?Ip) void;
-```
-
-## Acceptance / verification (headless)
-
-- Unit tests: parse/format round-trips for a table of v4 + v6 literals incl. canonicalization
-  (`2001:db8::1`, `::1`, `::ffff:1.2.3.4`, zero-compression edge cases), and rejection of malformed.
-- RFC 6724 ordering test vectors — reuse the ones the zig-fping seed uses; add the canonical
-  examples from RFC 6724 §10.
-- `scopeOf` / `precedenceOf` unit tests against the RFC 6724 policy table.
-- `zig build test-netaddr` green; no allocation in parse/format/classify (allocator only if a
-  sort needs scratch — prefer in-place).
-
-## Notes
-
-Platform `any` (pure logic). Keep it dependency-free (std only). This is the foundation `http`
-(T2) and `dns` (T3) build on, so land it first and keep the API stable.
+**Status** — `extract · any · util · reentrant` · deps: none (std only; `systemSource` Linux-only).

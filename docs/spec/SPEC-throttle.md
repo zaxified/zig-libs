@@ -1,65 +1,55 @@
 # SPEC — `throttle`
 
-Global concurrency limiting / load-shedding as a `router` middleware. Web/API cluster (T5.5).
-`extract · any · util · tsafe`. Model after: Netflix concurrency-limits / SEDA load-shedding +
-Go `golang.org/x/sync/semaphore`. Deps: `router`, `http`. New `build.zig` entry
-`.{ .name = "throttle", .deps = &.{ "router", "http" } }`.
+**Purpose** — Global concurrency limiting / load shedding: a max-in-flight semaphore plus a
+`router` middleware answering **503 + Retry-After**. `ratelimit` bounds request *rate per key*;
+`abuseguard` bounds *connections per IP*; `throttle` bounds **total concurrent in-flight
+requests** — when the server is saturated it sheds load (a fast 503) instead of collapsing under
+an unbounded queue. The "survive a spike" piece of the Web/API cluster.
 
-## Why
+**Model after / Seed** — Clean-room, no seed project and no third-party code. Model after Go
+`golang.org/x/sync/semaphore` (`tryAcquire` never blocks, failed attempts consume nothing,
+acquire/release pairing; slot semantics only) + SEDA (Welsh et al., SOSP '01; bounded-queue load
+shedding) + Netflix concurrency-limits (design notes only). Design refs in `NOTICE`.
 
-`ratelimit` bounds request *rate per key*; `abuseguard` bounds *connections per IP*. `throttle`
-bounds **total concurrent in-flight requests** to protect the backend from overload regardless of
-who — when the server is saturated it **sheds load** (fast 503) instead of collapsing under an
-unbounded queue. This is the "survive a spike" piece.
+**Design & invariants**
+- **Layered:** `tryAcquire()`/`release()` — the bare counting semaphore, lock-free (a CAS loop on
+  one atomic counter), zero allocation, no clock, no I/O; the counter can never exceed
+  `max_in_flight` (the CAS refuses) nor go negative (`release` asserts in Debug, saturates at 0 in
+  release builds). `acquire()` — the bounded-wait variant: waits up to `max_wait_ms` on
+  `Io.futexWaitTimeout` (Zig 0.16 moved futexes onto the `Io` vtable, hence `Options.io`) instead
+  of shedding immediately, with the waiter set itself capped (`max_waiters`, default =
+  `max_in_flight`) — an unbounded wait queue is just a slower way to fall over (SEDA's
+  bounded-queue rule). `middleware()` — a `router.Middleware`: acquires on entry, releases via
+  `defer` (also on handler error); at capacity, **503** + `Retry-After` + short body, `next` never
+  called.
+- **x/sync/semaphore parity, with one deliberate deviation:** freed slots are not handed to
+  waiters in FIFO order — `release` wakes all waiters and they re-contend with new arrivals
+  (barging). Under sustained saturation a waiter can lose every race until its deadline and shed at
+  `max_wait_ms`; acceptable because shedding under overload is the point, and it needs no
+  per-waiter queue memory (Go's waiter list is also unbounded; this one is capped).
+- **No exact retry time:** unlike `ratelimit`'s 429 (computable from bucket math), `Retry-After`
+  here is the configured `retry_after_ms` hint — in-flight handler duration is not predictable.
+- **Concurrency:** pure atomics, no mutex, no hidden globals; all orderings are deliberately
+  `seq_cst` so the waiter/releaser handoff (three atomic locations: slot counter, waiter counter,
+  release generation) stays auditable under a single total order.
 
-## Scope
+**Threat model / out of scope** — Not per-key: a single client can consume the whole in-flight
+budget the same as a legitimate burst — pair with `ratelimit` (per-key rate) or `abuseguard`
+(per-IP connections) for that. No adaptive limit discovery: `max_in_flight` is a static number the
+operator must size correctly (a Netflix Gradient-style AIMD variant is an explicit TODO, not
+implemented). Bounded wait requires the caller to pass an `Io` (the server's `std.Io.Threaded`)
+whenever `max_wait_ms > 0`; the default (immediate shed) touches no `Io` at all. A parked request
+keeps occupying its server connection task — the backpressure is real capacity held, bounded by
+`max_waiters × max_wait_ms`, not a queueing mechanism that frees resources while waiting.
 
-1. **Concurrency limiter (semaphore):** a max-in-flight counter. A `router.Middleware` acquires a
-   slot on entry; on success → `next`, release on exit (via `defer`, even on handler error). At
-   capacity → **503 Service Unavailable** + `Retry-After` + short body, `next` NOT called.
-2. **Optional bounded wait (backpressure):** `max_wait_ms` — instead of shedding immediately, wait
-   up to that long for a slot to free (bounded queue), then 503 if still full. Default 0 = shed
-   immediately. If you implement waiting, cap the number of waiters too (an unbounded waiter set is
-   itself a memory DoS) → shed when the wait-queue is full.
-3. **Observability:** `inFlight()` and (if waiting) `waiting()` getters; expose `max_in_flight` so
-   `metrics` can chart utilization later.
-4. **Thread-safe:** the counter is touched by every connection thread — atomics or a documented
-   mutex. No hidden globals.
-5. *(Optional, note as TODO if skipped):* an **adaptive** variant (AIMD on observed latency, Netflix
-   Gradient-style) that discovers the limit instead of a static number. The static max-in-flight is
-   the required primary.
+**Verification** — 15 tests (`zig build test-throttle`). Offline: acquire-to-cap/release
+semantics, 0-wait fast path, an 8-thread over-admission stress for both `tryAcquire` and the
+bounded-wait path, deadline shed with the full wait honored, release-inside-the-window handoff,
+waiter-cap immediate shed. Middleware goldens over the socket-free `http.Server.serveStream` (503
+wire bytes + `Retry-After` rounding, release-on-handler-error, throttled 404s, bounded-wait
+200-after-release and 503-after-deadline). In-process integration (`router` + `http.Server` +
+`http.Client` over loopback): N slots occupied by live blocked requests → request N+1 sheds with
+503 + `Retry-After`, a released slot serves a fresh request, everything drains to zero — skips only
+when loopback binding is unavailable.
 
-## Public API sketch (final shape your call)
-
-```zig
-pub const Throttle = struct {
-    pub fn init(gpa, Options) Throttle;   // Options: max_in_flight, max_wait_ms=0, max_waiters, clock, retry_after_ms
-    pub fn deinit(*Throttle) void;
-    pub fn middleware(self) router.Middleware;   // 503 + Retry-After on shed
-    pub fn inFlight(self) usize;
-    pub fn tryAcquire(self) bool;  pub fn release(self) void;   // the separable primitive
-};
-```
-
-## Acceptance / verification
-
-- **Offline unit tests:** `tryAcquire`/`release` semantics — acquire up to `max_in_flight` succeeds,
-  the next fails; release frees a slot; counter never goes negative or exceeds the cap; bounded-wait
-  behavior + waiter cap if implemented; a multi-thread stress (N threads hammering acquire/release,
-  assert the cap is never exceeded and the count returns to 0).
-- **In-process integration (must NOT skip normally):** router+`http.Server` with `max_in_flight = N`
-  and a handler that blocks on a caller-controlled signal; open N concurrent client requests (they
-  occupy all slots), then request N+1 → **503 with Retry-After** (not queued past the limit); release
-  the signal, let one finish, a fresh request now succeeds. Use threads + the `http.Client`.
-- `zig build test-throttle` + `zig build test` (all) green, Debug + ReleaseFast; `zig fmt --check`
-  clean. Registered with `deps = &.{"router","http"}`.
-
-## Notes for the implementer
-
-- Use the **zig skill** for Zig 0.16 (atomics, threads, condition/wait if you do bounded-wait; the
-  repo uses `std.Io.Group` for spawning and a documented spinlock for mutual exclusion — mirror
-  those). Reuse `router.Middleware {state,run}` (state = `*Throttle`) and its `Ctx`.
-- Keep the semaphore primitive (`tryAcquire`/`release`) separable + unit-tested without HTTP.
-- The 503 path mirrors ratelimit's 429 path (idempotent `ctx.res.end()` so stack-buffer header
-  values reach the wire before the frame unwinds — see ratelimit for the pattern).
-- SPDX header + a `Provenance:` line (clean-room; design refs Netflix concurrency-limits / x/sync).
+**Status** — `gap · posix · util · threadsafe` · deps: `router`, `http`.

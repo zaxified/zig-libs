@@ -1,68 +1,45 @@
 # SPEC — `dns`
 
-DNS resolver: forward (A/AAAA) + reverse (PTR) over UDP/TCP **and DoH**.
-`extract+gap · any · client · block`. Model after: Go `net` dnsclient + `miekg/dns` (message
-codec) / c-ares; RFC 1035 (wire), RFC 8484 (DoH). Seed: `~/workspace/zig-fping/src/rdns.zig`
-(working /etc/hosts + RFC 1035 UDP PTR client). Deps: `netaddr`, `http` (DoH), `std.json` (DoH-JSON),
-std udp/tcp. `dig`-style CLI can ship as a demo later (not required this task).
+**Purpose** — A DNS resolver where std stops short: `std.Io.net.HostName.lookup` is forward-only
+and opaque — no PTR, no explicit server/transport control, no DoH. `dns` is an RFC 1035 message
+codec plus a blocking client that does forward (A/AAAA) and reverse (PTR) lookups over UDP, TCP, and
+DNS-over-HTTPS, decoding the common record set (A/AAAA/PTR/CNAME/NS/MX/TXT/SOA, SRV, CAA) plus
+EDNS(0) OPT; anything else surfaces as raw rdata.
 
-## Why
+**Model after / Seed** — codec modelled on `miekg/dns` and c-ares behavior (RFC 1035 wire, RFC 2782
+SRV, RFC 8659 CAA, RFC 8484 DoH); the resolver's control flow follows Go `net`'s dnsclient. The
+`/etc/hosts` + UDP-PTR core is **extracted** from the authors' `zig-fping` `src/rdns.zig` (fping-
+derived — shared fping attribution in `NOTICE`, with netaddr/icmp/seqmap); the general codec, TCP,
+EDNS(0) and DoH are clean-room from the RFCs.
 
-`std.Io.net.HostName.lookup` is forward-only and opaque; there is no reverse (PTR), no explicit
-server/transport control, and no DoH in std. `http` (rdap, the REST cluster) and diagnostics want
-a real resolver. DoH = privacy/firewall-friendly and validates that `http` works as a dependency.
+**Design & invariants**
+- **Layered like `http`:** `message.zig` is the pure, transport-agnostic wire codec — the part that
+  must be bulletproof, golden-byte testable and fuzzed offline; `config.zig` is pure string logic
+  (`/etc/resolv.conf` + `/etc/hosts` parse, Go-`nameList` search-list expansion); `Resolver.zig` is
+  the blocking client over `std.Io.net` (UDP with TC→TCP retry, length-prefixed TCP) and the sibling
+  `http` module (DoH POST/GET `application/dns-message`, plus the DoH-JSON variant via `std.json`);
+  `root.zig` owns the shared vocabulary and the netaddr bridges (`reverseName`, `recordIp`).
+- **Name-compression safety:** pointers must point strictly backwards (Go dnsmessage rule); combined
+  with the 253-char name cap and a 16-jump budget, adversarial pointer loops always fail fast with a
+  typed error rather than spinning.
+- **Concurrency:** every lookup blocks; one owner per `Resolver` (no shared state to synchronize).
+- **Error policy:** malformed packets are typed errors, never panics. `resolve` returns the last
+  response even on NXDOMAIN/empty (inspect `Message.rcode()`); `lookupIp` returns an empty slice
+  when nothing resolves.
 
-## Scope (this task)
+**Threat model / out of scope** — Not a validating resolver: **no DNSSEC**, so answers are trusted
+as far as the transport is. UDP is spoofable; the query-id + compression-loop guards are robustness,
+not authentication — use DoH (TLS to the resolver, RFC 8484) when the path is untrusted. TLS/DoH
+transport security is the `http` client's concern, not this module's. Decoded names are dotted text
+without the trailing root dot and with no `\DDD` escape handling — labels are raw bytes; callers
+displaying them must escape. TCP/DoH connect timeouts fall back to the OS default until std's
+`Io.Threaded` grows a timeout on `netConnectIp*` (same TODO as `http.Client`).
 
-1. **Message codec (the core — shared by every transport).** Encode a query, decode a response:
-   header, question, RR sections; **name compression pointers** (encode may skip; decode MUST
-   handle); types A, AAAA, PTR, CNAME, NS, MX, TXT, SOA; IN class; TTL. Robust against malformed
-   input (no panics, bounded loops on compression pointers to prevent loops).
-2. **Transports:**
-   - **UDP** (primary) with **truncation (TC bit) → TCP retry**.
-   - **TCP** (2-byte length-prefixed messages).
-   - **DoH wire (RFC 8484):** `application/dns-message` — the SAME binary DNS message POSTed
-     (or GET w/ base64url `?dns=`) over the `http` module to a DoH endpoint. This is standard DoH.
-   - **DoH JSON (optional):** `application/dns-json` (Cloudflare/Google `/resolve?name=&type=`)
-     via `http` + `std.json` — the non-standard-but-common variant. Include if cheap; else TODO.
-   - **EDNS(0)** OPT record to advertise a larger UDP payload size.
-3. **Resolver API + config:** resolve(name, type) → records; reverse(ip) → names (build
-   `in-addr.arpa` / `ip6.arpa` from `netaddr`); read `/etc/resolv.conf` for servers + search, and
-   `/etc/hosts` first (port from the seed). Caller can pass explicit servers / a DoH URL to
-   override system config.
+**Verification** — 46 offline tests: golden query bytes; canned responses (name compression, CNAME
+chain, MX/TXT/SOA/OPT, PTR); adversarial packets (truncations at every offset, pointer loops, bad
+rdata lengths, hostile section counts); a fuzzed `decode`; resolv.conf/hosts fixtures and search-
+list ordering; reverse-name goldens incl. the RFC 3596 example and a codec round-trip. Live tests
+(UDP, TCP, DoH POST/GET, DoH-JSON, PTR of 8.8.8.8) skip via `error.SkipZigTest` when offline.
 
-## Public API sketch (small, allocator-explicit; final shape your call)
-
-```zig
-pub const Resolver = struct {
-    pub fn init(io, gpa, Options) Resolver;   // Options: servers, doh_url, timeout, use_hosts, edns_udp_size
-    pub fn deinit(*Resolver) void;
-    pub fn resolve(self, name: []const u8, ty: Type) !Answer;   // Answer owns records
-    pub fn lookupIp(self, name: []const u8) ![]Ip;              // A + AAAA convenience (netaddr.Ip)
-    pub fn reverse(self, ip: Ip) ![][]const u8;                 // PTR
-};
-pub const Type = enum(u16) { a=1, ns=2, cname=5, soa=6, ptr=12, mx=15, txt=16, aaaa=28, opt=41, _ };
-// low-level, transport-agnostic:
-pub const Message = struct { pub fn encodeQuery(...); pub fn decode(...); };
-```
-
-## Acceptance / verification
-
-- **Offline unit tests (the bulk):** message encode → exact golden bytes for a known query;
-  decode of canned responses incl. **compression pointers**, multiple RRs, A + AAAA + PTR + CNAME
-  chains; malformed/truncated/pointer-loop inputs return errors (no hang, no panic). resolv.conf /
-  hosts parsing on fixtures. Reverse-name construction (`8.8.8.8` → `8.8.8.8.in-addr.arpa`,
-  v6 nibble form). `zig build test-dns` green.
-- **Live (skip via `error.SkipZigTest` if no network):** resolve `example.com` A over UDP;
-  resolve the same over **DoH** (`https://dns.google/dns-query` or `cloudflare-dns.com`) — proving
-  the `http` dep works; a PTR lookup of a known IP.
-- No panics on any adversarial packet. Register `dns` in build.zig with `deps=&.{"netaddr","http"}`.
-
-## Notes for the implementer
-
-- Use the **zig skill** for Zig 0.16 std APIs. Reuse `netaddr` for all address parse/format and
-  the reverse-name construction; reuse `http.Client` for DoH (don't reinvent HTTP).
-- Extract the /etc/hosts + UDP PTR logic from the seed `rdns.zig`; build the general message codec
-  around it (the seed is PTR-focused — generalize to A/AAAA/etc.).
-- Keep the message codec transport-agnostic and separately testable (golden bytes) — it's the part
-  that must be bulletproof.
+**Status** — `extract+gap · any (RFC 6724 result order is Linux-only) · client · blocking` · deps:
+`netaddr`, `http`, `std.json`, `std.Io.net`.
