@@ -221,7 +221,8 @@ audit is pending before any public release.
 
   snmp       — clean-room from RFC 1157 (SNMPv1), RFC 1905/3416 (SNMPv2c
                protocol operations), RFC 3412 (SNMPv3 message processing /
-               ScopedPDU), RFC 2578 (SMI types) and ITU-T X.690 (BER).
+               ScopedPDU), RFC 3414 (USM security parameters), RFC 2578
+               (SMI types) and ITU-T X.690 (BER).
                net-snmp (BSD-like) is cited as a behavior reference only —
                no source was consulted or copied.
 

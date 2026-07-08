@@ -381,8 +381,10 @@ needsAck) + `Dispatcher`; transport-agnostic, on the existing decode layer; Opus
 `ackInform(event, buf)` — byte-faithful Response ack for an InformRequest (echoes request-id + verbatim
 varbinds, zero error slots; `NotAnInform` otherwise); Opus, 3 tests. **T-D ✅** `snmp.v3` — RFC 3412 message
 envelope + ScopedPDU framing (encode/decode, `MsgFlags`, plaintext/noAuthNoPriv; encryptedPDU captured for
-T-G) + a `message.decodePdu`/`encodePdu` refactor; Opus, 7 tests. **Remaining:** T-E USM params + T-F auth
-(HMAC+key-loc) + T-G priv (DES/AES) + T-H engine/time-window · 4. 🟡 **coap** RFC 7252
+T-G) + a `message.decodePdu`/`encodePdu` refactor; Opus, 7 tests. **T-E ✅** `snmp.usm` — RFC 3414 §2.4
+`UsmSecurityParameters` (de)serializer (engineID/boots/time/user/auth/priv; overflow-guarded; parse+encode);
+Fable, 8 tests. **Remaining:** T-F auth (HMAC+key-loc) + T-G priv (DES/AES) + T-H engine/time-window ·
+4. 🟡 **coap** RFC 7252
 (med) — G IoT: split C1–C5. **C1 ✅** NEW `coap` module — message codec (header/token/delta-encoded
 options/payload, `parse`/`serialize`/`encodedLen`, zero-alloc, transport-agnostic; Fable, 7 tests). **C2 ✅**
 `coap.options` — §5.10 registry + class bits, CoAP uint (§3.2), typed accessors (Content-Format/Accept/

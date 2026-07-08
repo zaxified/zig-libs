@@ -67,6 +67,10 @@ pub const receiver = @import("receiver.zig");
 /// plaintext / noAuthNoPriv level. USM security (RFC 3414) builds on top.
 pub const v3 = @import("v3.zig");
 
+/// USM — User-based Security Model (RFC 3414): the `UsmSecurityParameters`
+/// (de)serializer. Auth/privacy crypto build on top.
+pub const usm = @import("usm.zig");
+
 const client_mod = @import("client.zig");
 
 // Convenience re-exports of the surface types.
@@ -90,6 +94,7 @@ pub const ackInform = receiver.ackInform;
 pub const V3Message = v3.V3Message;
 pub const ScopedPdu = v3.ScopedPdu;
 pub const MsgFlags = v3.MsgFlags;
+pub const UsmSecurityParameters = usm.UsmSecurityParameters;
 
 pub const Client = client_mod.Client;
 pub const Transport = client_mod.Transport;
@@ -104,6 +109,7 @@ test {
     _ = client_mod;
     _ = receiver;
     _ = v3;
+    _ = usm;
 }
 
 test "meta is well-formed" {
