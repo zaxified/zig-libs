@@ -8,7 +8,7 @@ Not a dumping ground: ship **solid, not many**. Most members are *extracted* fro
 across sibling projects (bxp, axp, zig-fping, poc-wf-analytic); a few fill genuine gaps in the Zig
 ecosystem.
 
-**Status:** 49 modules · 1299 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 49 modules · 1313 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ## Modules
@@ -20,7 +20,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 
 | Module | What it does | Deps |
 |---|---|---|
-| `http` | HTTP/1.1 client (TLS via `std.crypto.tls`) **and** server, hardened for direct exposure (peer addr, conn caps, size limits, slowloris timeouts, gzip, **conditional requests** ETag/If-\* → 304/412, **request-body parsing** — `Content-Type`, urlencoded, **multipart/form-data** RFC 7578, **Server-Sent Events** encoder + incremental `flush()`, **inbound gzip** request bodies (zip-bomb-capped), **multiple Set-Cookie**, chunked-trailer capture). Also speaks **HTTP/2** (bidirectional, TLS-deployable) — HPACK (RFC 7541) + framing/flow-control (RFC 9113) + a **DoS-hardened h2c server** + a **multiplexing h2 client** + an **ALPN/bring-your-own-TLS seam**. Not `std.http`. | netaddr |
+| `http` | HTTP/1.1 client (TLS via `std.crypto.tls`) **and** server, hardened for direct exposure (peer addr, conn caps, size limits, slowloris timeouts, gzip, **conditional requests** ETag/If-\* → 304/412, **request-body parsing** — `Content-Type`, urlencoded, **multipart/form-data** RFC 7578, **Server-Sent Events** encoder + incremental `flush()`, **inbound gzip** request bodies (zip-bomb-capped), **multiple Set-Cookie**, chunked-trailer capture, **`Range` request parser** RFC 7233 → `bytes=` byte-range-set). Also speaks **HTTP/2** (bidirectional, TLS-deployable) — HPACK (RFC 7541) + framing/flow-control (RFC 9113) + a **DoS-hardened h2c server** + a **multiplexing h2 client** + an **ALPN/bring-your-own-TLS seam**. Not `std.http`. | netaddr |
 | `router` | REST routing — trie matcher (params/wildcards), middleware chain, groups, 404/405 | http |
 | `ratelimit` | Token-bucket per-client rate limit → 429 + Retry-After | router, http |
 | `abuseguard` | Per-IP + global connection caps, ban/greylist, strike→ban (accept-time) | http, netaddr, router |

@@ -109,6 +109,10 @@ pub const multipart = @import("multipart.zig");
 /// `ResponseWriter` — the push half of a live HTTP endpoint (SSE / MCP).
 pub const sse = @import("sse.zig");
 
+/// Range requests (RFC 7233): the `Range` request-header parser (R1) —
+/// `bytes=` byte-range-set into validated `ByteRangeSpec`s (range/from/suffix).
+pub const range = @import("range.zig");
+
 // ── request vocabulary ──────────────────────────────────────────────────────
 
 pub const Method = enum {

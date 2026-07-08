@@ -331,8 +331,10 @@ fmt green. **Still open:** request-ID mw · health helper · conditional-req · 
   tests) · ✅ **inbound gzip request body** (`max_decompressed_request_bytes`, zip-bomb-capped→413,
   unsupported→415) · ✅ **multiple Set-Cookie** (`ResponseWriter.addSetCookie`) · ✅ **chunked-trailer
   capture** (read side; response-trailer write skipped — disproportionately invasive vs the 6-way body sink) ·
-  per-conn request-count cap (was already done). **Still open:** Range/206 · content negotiation (both Fable) ·
-  response-trailer write · HTTP/3 (large, deferred/never).
+  per-conn request-count cap (was already done). · ✅ **Range parser R1** (`http.range`, RFC 7233 §2.1 —
+  `bytes=` set → validated `ByteRangeSpec` range/from/suffix, zero-alloc iterator + strict `parse`; Fable, 14
+  tests). **Still open:** Range/206 **R2** (206 + `Content-Range`/416 from a resource length) + **R3**
+  (`multipart/byteranges`) · content negotiation (Fable) · response-trailer write · HTTP/3 (large, deferred/never).
 - Excluded/decided: **TLS = proxy** (then ianic spike); **upstream LB/pool** = app-elevation #2 below.
 - **Bottom line:** NOT fundamentally unsafe — 1 small blocker + ~6 small-med hardening/ops items + 1 large
   (JWT/JWKS only if OAuth2/OIDC). Most are **Opus-inline extensions of existing modules**, not new modules.
