@@ -25,6 +25,12 @@
 //!   the router sets `Allow` (registered methods in `http.Method` order;
 //!   HEAD implied by GET) *before* invoking the 405 handler, so overrides
 //!   inherit it.
+//! - **Auto OPTIONS:** opt-in via `auto_options` (default off). When on and
+//!   an `OPTIONS` request hits a path that has routes but *no* explicit
+//!   OPTIONS handler, the router answers `204 No Content` with the same
+//!   `Allow` set the 405 path computes (runs behind the router-level
+//!   middleware, like the 404/405 fallbacks). An explicit OPTIONS route
+//!   always wins.
 //! - **Trailing slash:** `.redirect` (default, httprouter semantics)
 //!   answers 301 for GET/HEAD and 308 for other methods toward the slash
 //!   variant that has the route, preserving the query string; `.strict`
@@ -230,6 +236,12 @@ pub const Router = struct {
     /// Overridable wrong-method handler; `Allow` is already set on the
     /// response when it runs.
     method_not_allowed: Handler = defaultMethodNotAllowed,
+    /// Opt-in automatic OPTIONS: when true, an `OPTIONS` request on a path
+    /// that has registered routes but no explicit OPTIONS handler is
+    /// answered `204 No Content` with the same `Allow` the 405 path builds.
+    /// Off by default (existing behavior: such a request is a 405). A path
+    /// with an explicit OPTIONS route keeps using that handler.
+    auto_options: bool = false,
     trailing_slash: TrailingSlash = .redirect,
     routes_added: bool = false,
     /// Registered routes in registration order (see `routes`).
@@ -339,11 +351,17 @@ pub const Router = struct {
                 const next: Next = .{ .chain = ep.chain, .endpoint = ep.handler };
                 return next.run(&ctx);
             }
-            // Path exists, method doesn't: 405. Allow goes on first so an
-            // overridden handler inherits it.
+            // Path exists, method doesn't: 405 (or auto-204 for OPTIONS).
+            // Allow goes on first so an overridden handler inherits it.
             try rw.setHeader("Allow", node.allow);
+            // No explicit OPTIONS endpoint reached endpointFor above, so when
+            // auto_options is on we synthesize a 204 here instead of a 405.
+            const endpoint = if (r.auto_options and req.method == .options)
+                defaultAutoOptions
+            else
+                r.method_not_allowed;
             var ctx: Ctx = .{ .req = req, .res = rw, .params = params, .state = r.state };
-            const next: Next = .{ .chain = r.mws.items, .endpoint = r.method_not_allowed };
+            const next: Next = .{ .chain = r.mws.items, .endpoint = endpoint };
             return next.run(&ctx);
         }
 
@@ -621,6 +639,11 @@ fn defaultMethodNotAllowed(ctx: *Ctx) anyerror!void {
     ctx.res.setStatus(405);
     try ctx.res.setHeader("Content-Type", "text/plain");
     try ctx.res.writeAll("Method Not Allowed\n");
+}
+
+fn defaultAutoOptions(ctx: *Ctx) anyerror!void {
+    // dispatch already set the Allow header; 204 carries no body.
+    ctx.res.setStatus(204);
 }
 
 // ── the matcher ─────────────────────────────────────────────────────────────
@@ -969,6 +992,52 @@ test "405 without GET: Allow has no implied HEAD" {
     const got = runWire(&r, wire("GET", "/submit"), &buf);
     try expectStatus(got, "405");
     try expectHeaderLine(got, "Allow: POST");
+}
+
+test "auto_options off (default): OPTIONS on a routed path is a 405" {
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    try r.get("/thing", hHello);
+    try r.post("/thing", hCreated);
+
+    var buf: [1024]u8 = undefined;
+    const got = runWire(&r, wire("OPTIONS", "/thing"), &buf);
+    try expectStatus(got, "405");
+    try expectHeaderLine(got, "Allow: GET, HEAD, POST");
+}
+
+test "auto_options on: OPTIONS → 204 with Allow; runs router middleware" {
+    var count: u32 = 0;
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    r.auto_options = true;
+    try r.use(.{ .state = &count, .run = mwCount });
+    try r.get("/thing", hHello);
+    try r.post("/thing", hCreated);
+    try r.delete("/thing", hHello);
+
+    var buf: [1024]u8 = undefined;
+    const got = runWire(&r, wire("OPTIONS", "/thing"), &buf);
+    try expectStatus(got, "204");
+    try expectHeaderLine(got, "Allow: GET, HEAD, POST, DELETE");
+    // Router-level middleware wraps the auto-OPTIONS response (like 404/405).
+    try testing.expectEqual(@as(u32, 1), count);
+
+    // A non-OPTIONS wrong method on the same path is still a 405.
+    try expectStatus(runWire(&r, wire("PATCH", "/thing"), &buf), "405");
+}
+
+test "auto_options on: an explicit OPTIONS handler still wins" {
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    r.auto_options = true;
+    try r.get("/thing", hHello);
+    try r.options("/thing", hCreated); // explicit → 201 "created", not 204
+
+    var buf: [1024]u8 = undefined;
+    const got = runWire(&r, wire("OPTIONS", "/thing"), &buf);
+    try expectStatus(got, "201");
+    try testing.expectEqualStrings("created", bodyOf(got));
 }
 
 test "HEAD auto-routes to GET; explicit HEAD route wins" {
