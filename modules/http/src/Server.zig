@@ -1786,6 +1786,7 @@ pub fn reasonPhrase(status: u16) []const u8 {
         413 => "Content Too Large",
         414 => "URI Too Long",
         415 => "Unsupported Media Type",
+        416 => "Range Not Satisfiable",
         417 => "Expectation Failed",
         421 => "Misdirected Request",
         422 => "Unprocessable Content",

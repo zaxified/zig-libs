@@ -60,6 +60,16 @@ pub const client = @import("client.zig");
 /// (`piggyback` / `ackOnly` / `Server.separate`).
 pub const server = @import("server.zig");
 
+// Pull the submodules' tests into this module's test binary. A `pub const
+// @import(...)` re-export does NOT drag in the imported file's `test` blocks —
+// they run only when referenced from a `test` here (or via refAllDecls).
+test {
+    _ = options;
+    _ = reliability;
+    _ = client;
+    _ = server;
+}
+
 /// CoAP version in the 2-bit Ver field (always 1 for RFC 7252).
 pub const version = 1;
 

@@ -364,7 +364,7 @@ test "parseHttpDate: RFC 9110 example in all three formats" {
         parseHttpDate("Thursday, 01-Jan-70 00:00:00 GMT"),
     );
     try testing.expectEqual(
-        @as(?i64, 3124137600),
+        @as(?i64, 3124224000), // 2069-01-01T00:00:00Z (two-digit-year pivot 69 → 2069)
         parseHttpDate("Wednesday, 01-Jan-69 00:00:00 GMT"),
     );
     // asctime with a two-digit day (no padding).

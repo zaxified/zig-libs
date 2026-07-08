@@ -333,8 +333,18 @@ fmt green. **Still open:** request-ID mw · health helper · conditional-req · 
   capture** (read side; response-trailer write skipped — disproportionately invasive vs the 6-way body sink) ·
   per-conn request-count cap (was already done). · ✅ **Range parser R1** (`http.range`, RFC 7233 §2.1 —
   `bytes=` set → validated `ByteRangeSpec` range/from/suffix, zero-alloc iterator + strict `parse`; Fable, 14
-  tests). **Still open:** Range/206 **R2** (206 + `Content-Range`/416 from a resource length) + **R3**
-  (`multipart/byteranges`) · content negotiation (Fable) · response-trailer write · HTTP/3 (large, deferred/never).
+  tests). · ✅ **Range/206 R2** (RFC 7233 §4 — `resolveSpec`/`resolve` against a representation length +
+  `ResolvedRange`/`Content-Range` + `apply` staging 206 single / 416 / multipart-hint; added the 416 reason
+  phrase to `Server`; Opus, 11 tests). **Still open:** Range **R3** (`multipart/byteranges` body) · content
+  negotiation (Fable) · response-trailer write · HTTP/3 (large, deferred/never).
+- 🐛 **Test-wiring audit (2026-07-08):** found that a `pub const x = @import("x.zig")` re-export does NOT pull
+  the imported file's `test` blocks into the module test binary — they run only when referenced from a
+  `test { _ = x; }` block (or refAllDecls). `http` (conditional/body/multipart/sse/range = 57 tests) and `coap`
+  (client/options/reliability/server = 35 tests) were "dark" — never compiled/run. Now wired; this surfaced 3
+  real latent bugs: `body.zig` `std.mem.trimLeft` (gone in 0.16 → `trimStart`), a coap `isUnsafe(uri_path)`
+  test-expectation error (Uri-Path 11 IS unsafe), and a `conditional` `parseHttpDate` test constant off by one
+  day. All other multi-file modules audited clean (files-vs-running count matches; blobmsg/wireguard deltas are
+  env-gated skips).
 - Excluded/decided: **TLS = proxy** (then ianic spike); **upstream LB/pool** = app-elevation #2 below.
 - **Bottom line:** NOT fundamentally unsafe — 1 small blocker + ~6 small-med hardening/ops items + 1 large
   (JWT/JWKS only if OAuth2/OIDC). Most are **Opus-inline extensions of existing modules**, not new modules.

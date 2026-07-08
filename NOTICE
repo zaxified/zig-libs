@@ -68,7 +68,9 @@ audit is pending before any public release.
                sec 5.6.6 (Content-Type media type + parameters), the WHATWG URL
                application/x-www-form-urlencoded rules, and RFC 7578 / RFC 2046
                sec 5.1 (multipart/form-data). The Range request-header parser
-               is clean-room from RFC 7233 sec 2.1 (byte-range-set). Clean-room
+               is clean-room from RFC 7233 sec 2.1 (byte-range-set); the 206
+               resolution + Content-Range emitter follows RFC 7233 sec 4.
+               Clean-room
                from the RFCs, no HPACK/HTTP-2/nghttp2 source consulted or
                copied; TLS via Zig std.crypto.tls.
   dns        — RFC 1035 (wire), RFC 8484 (DoH), RFC 2782 (SRV), RFC 8659

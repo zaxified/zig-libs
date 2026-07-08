@@ -382,7 +382,8 @@ test "class bits" {
     try testing.expect(!isCritical(number.content_format)); // 12 even → elective
     try testing.expect(isCritical(number.uri_host));
     try testing.expect(isUnsafe(number.proxy_uri)); // 35: unsafe to forward
-    try testing.expect(!isUnsafe(number.uri_path));
+    try testing.expect(isUnsafe(number.uri_path)); // 11 = 0b1011 → critical AND unsafe (RFC 7252 Table 4)
+    try testing.expect(!isUnsafe(number.content_format)); // 12 = 0b1100 → safe to forward
     try testing.expect(noCacheKey(28)); // 0b11100 pattern
     try testing.expect(!noCacheKey(number.uri_path));
     try testing.expect(!noCacheKey(number.max_age));

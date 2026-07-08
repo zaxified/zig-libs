@@ -422,6 +422,11 @@ test {
     _ = h2_server;
     _ = Client;
     _ = Server;
+    _ = conditional;
+    _ = body;
+    _ = multipart;
+    _ = sse;
+    _ = range;
 }
 
 test "protocolFromAlpn: exact ALPN ids dispatch, anything else is unknown" {

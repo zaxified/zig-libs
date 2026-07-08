@@ -100,7 +100,7 @@ pub const ParamIterator = struct {
     pub fn next(it: *ParamIterator) ?Param {
         while (true) {
             // Trim leading separators/whitespace.
-            it.rest = std.mem.trimLeft(u8, it.rest, " \t;");
+            it.rest = std.mem.trimStart(u8, it.rest, " \t;");
             if (it.rest.len == 0) return null;
             const end = indexOfUnquoted(it.rest, ';') orelse it.rest.len;
             const seg = it.rest[0..end];

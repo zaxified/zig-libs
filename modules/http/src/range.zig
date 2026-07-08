@@ -200,6 +200,165 @@ fn parsePos(s: []const u8) Error!u64 {
     };
 }
 
+// ── R2: resolution + 206 / 416 response staging (RFC 7233 §4) ────────────────
+
+const Server = @import("Server.zig");
+
+/// A byte-range-spec resolved against a representation of known length: a
+/// concrete, satisfiable, inclusive interval `[start, end]` with `end < total`.
+/// This is what a 206 actually serves; its `Content-Range` names it on the wire.
+pub const ResolvedRange = struct {
+    /// First byte offset served (0-based).
+    start: u64,
+    /// Last byte offset served, inclusive.
+    end: u64,
+    /// Total length of the selected representation (the `/total` in
+    /// `Content-Range`, and what a `-suffix` / open-ended spec resolves against).
+    total: u64,
+
+    /// Number of bytes in `[start, end]` (always ≥ 1 for a satisfiable range).
+    pub fn len(self: ResolvedRange) u64 {
+        return self.end - self.start + 1;
+    }
+
+    /// Write the `Content-Range` header VALUE for a satisfiable range —
+    /// `bytes start-end/total` (RFC 7233 §4.2), without the header name.
+    pub fn writeContentRange(self: ResolvedRange, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.print("bytes {d}-{d}/{d}", .{ self.start, self.end, self.total });
+    }
+
+    /// `writeContentRange` into `buf`; returns the written slice or
+    /// `error.BufferTooSmall`. A 72-byte buffer always suffices (3×u64 + fixed).
+    pub fn bufPrintContentRange(self: ResolvedRange, buf: []u8) error{BufferTooSmall}![]const u8 {
+        var fw = std.Io.Writer.fixed(buf);
+        self.writeContentRange(&fw) catch return error.BufferTooSmall;
+        return fw.buffered();
+    }
+};
+
+/// Resolve one `ByteRangeSpec` against a representation of length `total`.
+/// Returns null when the spec is **unsatisfiable** against this length — which,
+/// per RFC 7233 §2.1, is:
+///   - `range`/`from`: `first >= total` (starts at or past the end); a `range`
+///     whose `last` runs past the end is NOT unsatisfiable, it clamps to
+///     `total-1`.
+///   - `suffix`: a suffix of 0 (selects zero bytes → treated as unsatisfiable,
+///     RFC 7233 §4.4 allows the 416).
+///   - any spec when `total == 0` (an empty representation satisfies no range).
+/// The caller drops unsatisfiable specs; if every spec in the set is
+/// unsatisfiable it responds 416.
+pub fn resolveSpec(spec: ByteRangeSpec, total: u64) ?ResolvedRange {
+    if (total == 0) return null;
+    switch (spec) {
+        .range => |r| {
+            if (r.first >= total) return null;
+            const end = if (r.last >= total) total - 1 else r.last;
+            return .{ .start = r.first, .end = end, .total = total };
+        },
+        .from => |first| {
+            if (first >= total) return null;
+            return .{ .start = first, .end = total - 1, .total = total };
+        },
+        .suffix => |n| {
+            if (n == 0) return null;
+            const count = if (n >= total) total else n;
+            return .{ .start = total - count, .end = total - 1, .total = total };
+        },
+    }
+}
+
+/// Resolve a whole byte-range-set against `total`, writing the satisfiable
+/// ranges into `out` (in request order) and returning that prefix. Unsatisfiable
+/// specs are dropped. An **empty** result means the entire set is unsatisfiable
+/// → the caller sends 416. Ranges beyond `out.len` are dropped (bound the set
+/// with `parse`'s buffer upstream so this cannot silently truncate a wanted
+/// range). Overlapping/unsorted ranges are returned as-is — coalescing is the
+/// caller's choice (RFC 7233 §6.1 permits, but does not require, it).
+pub fn resolve(specs: []const ByteRangeSpec, total: u64, out: []ResolvedRange) []ResolvedRange {
+    var n: usize = 0;
+    for (specs) |spec| {
+        if (n == out.len) break;
+        if (resolveSpec(spec, total)) |rr| {
+            out[n] = rr;
+            n += 1;
+        }
+    }
+    return out[0..n];
+}
+
+/// What `apply` decided, so the caller knows how to produce the body.
+pub const Outcome = enum {
+    /// No usable `Range` header (absent, malformed → ignored, or not `bytes`).
+    /// Nothing was staged; serve the whole representation as a normal 200.
+    no_range,
+    /// The set was valid but no range is satisfiable. `apply` staged **416**
+    /// + `Content-Range: bytes */total`; write no body (or a short error one).
+    not_satisfiable,
+    /// Exactly one satisfiable range. `apply` staged **206** + `Content-Range:
+    /// bytes s-e/total`; `out[0]` holds it — write those bytes.
+    single,
+    /// More than one satisfiable range. `apply` staged **206** only; `out[0..n]`
+    /// holds them. The caller emits a `multipart/byteranges` body (R3) and sets
+    /// its own `Content-Type` + per-part `Content-Range`.
+    multiple,
+};
+
+/// The result of `apply`: the `Outcome` plus the satisfiable ranges (valid for
+/// `.single` — one — and `.multiple` — the set).
+pub const Applied = struct {
+    outcome: Outcome,
+    ranges: []const ResolvedRange,
+};
+
+// Stable backing for the computed `Content-Range` value: `setHeader` stores the
+// slice WITHOUT copying, so a computed header needs memory that outlives the
+// call. Per-thread, overwritten on the next `apply` on this thread (one request
+// is handled to completion per thread, as in `requestid`).
+threadlocal var content_range_buf: [72]u8 = undefined;
+
+/// Read the request's `Range` header, resolve it against `total`, and stage the
+/// 206 / 416 response line + headers — the one-call server integration.
+///
+/// Returns an `Applied`: on `.single` / `.not_satisfiable` the status and
+/// `Content-Range` header are already set (plus `Accept-Ranges: bytes`), so the
+/// caller only writes the body; on `.multiple` the status is 206 and the ranges
+/// are handed back for an R3 `multipart/byteranges` body; on `.no_range`
+/// nothing is staged. `out` receives the satisfiable ranges (bound it; extra
+/// ranges are dropped — see `resolve`). Only `GET`/`HEAD` are range-eligible
+/// (RFC 7233 §3.1); any other method yields `.no_range`.
+pub fn apply(
+    req: *const Server.Request,
+    rw: *Server.ResponseWriter,
+    total: u64,
+    out: []ResolvedRange,
+) Server.ResponseWriter.SetHeaderError!Applied {
+    if (req.method != .get and req.method != .head) return .{ .outcome = .no_range, .ranges = &.{} };
+    const raw = req.header("range") orelse return .{ .outcome = .no_range, .ranges = &.{} };
+
+    var specbuf: [default_max_ranges]ByteRangeSpec = undefined;
+    const specs = parse(raw, &specbuf) catch return .{ .outcome = .no_range, .ranges = &.{} };
+
+    const ranges = resolve(specs, total, out);
+    if (ranges.len == 0) {
+        // Every range unsatisfiable → 416 with the unsatisfied-range Content-Range.
+        rw.setStatus(416);
+        try rw.setHeader("Accept-Ranges", "bytes");
+        var fw = std.Io.Writer.fixed(&content_range_buf);
+        fw.print("bytes */{d}", .{total}) catch unreachable; // 72 bytes >> "bytes */" + 20
+        try rw.setHeader("Content-Range", fw.buffered());
+        return .{ .outcome = .not_satisfiable, .ranges = ranges };
+    }
+
+    rw.setStatus(206);
+    try rw.setHeader("Accept-Ranges", "bytes");
+    if (ranges.len == 1) {
+        const cr = ranges[0].bufPrintContentRange(&content_range_buf) catch unreachable;
+        try rw.setHeader("Content-Range", cr);
+        return .{ .outcome = .single, .ranges = ranges };
+    }
+    return .{ .outcome = .multiple, .ranges = ranges };
+}
+
 const testing = std.testing;
 
 test "single absolute range" {
@@ -341,4 +500,175 @@ test "parseSpec direct shapes" {
     try testing.expectEqual(@as(u64, 5), r.range.first);
     try testing.expectEqual(@as(u64, 5), r.range.last);
     try testing.expectError(error.InvalidRange, parseSpec("5"));
+}
+
+// ── R2 tests ─────────────────────────────────────────────────────────────────
+
+test "resolveSpec: absolute range within, clamped, and past end" {
+    // within
+    try testing.expectEqual(
+        ResolvedRange{ .start = 0, .end = 499, .total = 10000 },
+        resolveSpec(.{ .range = .{ .first = 0, .last = 499 } }, 10000).?,
+    );
+    // last past end → clamp to total-1
+    try testing.expectEqual(
+        ResolvedRange{ .start = 9500, .end = 9999, .total = 10000 },
+        resolveSpec(.{ .range = .{ .first = 9500, .last = 100000 } }, 10000).?,
+    );
+    // first at/after end → unsatisfiable
+    try testing.expect(resolveSpec(.{ .range = .{ .first = 10000, .last = 10001 } }, 10000) == null);
+}
+
+test "resolveSpec: open-ended and suffix" {
+    try testing.expectEqual(
+        ResolvedRange{ .start = 9500, .end = 9999, .total = 10000 },
+        resolveSpec(.{ .from = 9500 }, 10000).?,
+    );
+    // suffix within
+    try testing.expectEqual(
+        ResolvedRange{ .start = 9500, .end = 9999, .total = 10000 },
+        resolveSpec(.{ .suffix = 500 }, 10000).?,
+    );
+    // suffix larger than total → whole representation
+    try testing.expectEqual(
+        ResolvedRange{ .start = 0, .end = 9999, .total = 10000 },
+        resolveSpec(.{ .suffix = 100000 }, 10000).?,
+    );
+    // suffix 0 → unsatisfiable
+    try testing.expect(resolveSpec(.{ .suffix = 0 }, 10000) == null);
+    // open-ended past end → unsatisfiable
+    try testing.expect(resolveSpec(.{ .from = 10000 }, 10000) == null);
+}
+
+test "resolveSpec: empty representation satisfies nothing" {
+    try testing.expect(resolveSpec(.{ .range = .{ .first = 0, .last = 0 } }, 0) == null);
+    try testing.expect(resolveSpec(.{ .from = 0 }, 0) == null);
+    try testing.expect(resolveSpec(.{ .suffix = 5 }, 0) == null);
+}
+
+test "resolve: drops unsatisfiable, keeps request order" {
+    var specbuf: [4]ByteRangeSpec = undefined;
+    const specs = try parse("bytes=0-99, 100000-200000, -50", &specbuf);
+    var out: [4]ResolvedRange = undefined;
+    const got = resolve(specs, 1000, &out);
+    try testing.expectEqual(@as(usize, 2), got.len);
+    try testing.expectEqual(ResolvedRange{ .start = 0, .end = 99, .total = 1000 }, got[0]);
+    try testing.expectEqual(ResolvedRange{ .start = 950, .end = 999, .total = 1000 }, got[1]);
+}
+
+test "resolve: all unsatisfiable → empty (caller sends 416)" {
+    var specbuf: [4]ByteRangeSpec = undefined;
+    const specs = try parse("bytes=5000-, -0", &specbuf);
+    var out: [4]ResolvedRange = undefined;
+    try testing.expectEqual(@as(usize, 0), resolve(specs, 1000, &out).len);
+}
+
+test "ResolvedRange: len and Content-Range formatting" {
+    const rr = ResolvedRange{ .start = 0, .end = 499, .total = 1234 };
+    try testing.expectEqual(@as(u64, 500), rr.len());
+    var buf: [72]u8 = undefined;
+    try testing.expectEqualStrings("bytes 0-499/1234", try rr.bufPrintContentRange(&buf));
+}
+
+// Golden apply harness — a range-serving handler over a canned wire request.
+const golden_body = "0123456789"; // len 10
+
+fn rangeHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+    var out: [4]ResolvedRange = undefined;
+    const applied = try apply(req, rw, golden_body.len, &out);
+    switch (applied.outcome) {
+        .no_range => {
+            rw.setStatus(200);
+            try rw.writeAll(golden_body);
+        },
+        .not_satisfiable => try rw.writeAll(""),
+        .single => {
+            const r = applied.ranges[0];
+            try rw.writeAll(golden_body[r.start .. r.end + 1]);
+        },
+        .multiple => try rw.writeAll("MULTI"), // R3 owns the real multipart body
+    }
+}
+
+fn runRangeStream(wire: []const u8, out_buf: []u8) []const u8 {
+    var in: std.Io.Reader = .fixed(wire);
+    var out: std.Io.Writer = .fixed(out_buf);
+    var head_buf: [1024]u8 = undefined;
+    var request_body_buf: [256]u8 = undefined;
+    var response_body_buf: [64]u8 = undefined;
+    var chunk_buf: [128]u8 = undefined;
+    Server.serveStream(.{
+        .handler = rangeHandler,
+        .server_name = "test",
+    }, &in, &out, .{
+        .head = &head_buf,
+        .request_body = &request_body_buf,
+        .response_body = &response_body_buf,
+        .chunk = &chunk_buf,
+    });
+    return out.buffered();
+}
+
+test "apply: golden 206 single range — Content-Range + sliced body" {
+    var out_buf: [4096]u8 = undefined;
+    const got = runRangeStream("GET / HTTP/1.1\r\nHost: t\r\n" ++
+        "Range: bytes=2-5\r\nConnection: close\r\n\r\n", &out_buf);
+    try testing.expectEqualStrings("HTTP/1.1 206 Partial Content\r\n" ++
+        "Accept-Ranges: bytes\r\n" ++
+        "Content-Range: bytes 2-5/10\r\n" ++
+        "Server: test\r\n" ++
+        "Connection: close\r\n" ++
+        "Content-Length: 4\r\n" ++
+        "\r\n" ++
+        "2345", got);
+}
+
+test "apply: golden 206 suffix range" {
+    var out_buf: [4096]u8 = undefined;
+    const got = runRangeStream("GET / HTTP/1.1\r\nHost: t\r\n" ++
+        "Range: bytes=-3\r\nConnection: close\r\n\r\n", &out_buf);
+    try testing.expectEqualStrings("HTTP/1.1 206 Partial Content\r\n" ++
+        "Accept-Ranges: bytes\r\n" ++
+        "Content-Range: bytes 7-9/10\r\n" ++
+        "Server: test\r\n" ++
+        "Connection: close\r\n" ++
+        "Content-Length: 3\r\n" ++
+        "\r\n" ++
+        "789", got);
+}
+
+test "apply: golden 416 on unsatisfiable range" {
+    var out_buf: [4096]u8 = undefined;
+    const got = runRangeStream("GET / HTTP/1.1\r\nHost: t\r\n" ++
+        "Range: bytes=50-60\r\nConnection: close\r\n\r\n", &out_buf);
+    try testing.expectEqualStrings("HTTP/1.1 416 Range Not Satisfiable\r\n" ++
+        "Accept-Ranges: bytes\r\n" ++
+        "Content-Range: bytes */10\r\n" ++
+        "Server: test\r\n" ++
+        "Connection: close\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n", got);
+}
+
+test "apply: golden no Range → 200 whole body" {
+    var out_buf: [4096]u8 = undefined;
+    const got = runRangeStream("GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out_buf);
+    try testing.expectEqualStrings("HTTP/1.1 200 OK\r\n" ++
+        "Server: test\r\n" ++
+        "Connection: close\r\n" ++
+        "Content-Length: 10\r\n" ++
+        "\r\n" ++
+        "0123456789", got);
+}
+
+test "apply: malformed Range ignored → 200 whole body" {
+    var out_buf: [4096]u8 = undefined;
+    const got = runRangeStream("GET / HTTP/1.1\r\nHost: t\r\n" ++
+        "Range: bytes=abc\r\nConnection: close\r\n\r\n", &out_buf);
+    try testing.expectEqualStrings("HTTP/1.1 200 OK\r\n" ++
+        "Server: test\r\n" ++
+        "Connection: close\r\n" ++
+        "Content-Length: 10\r\n" ++
+        "\r\n" ++
+        "0123456789", got);
 }
