@@ -22,6 +22,24 @@
 //!   `WWW-Authenticate: Bearer` and the chain is short-circuited (`next`
 //!   never runs). A valid request gets an `Identity` attached to
 //!   `ctx.data` (the slot `router` reserves for this module) and flows on.
+//! - **API-key scheme.** `Options.auth_mode` selects the accepted
+//!   scheme(s): `.bearer` (default — the behavior above, unchanged),
+//!   `.api_key`, or `.either`. The API key arrives in the `X-Api-Key`
+//!   header (configurable via `api_key_header`) or, when
+//!   `api_key_query_param` is set, as that query parameter (verbatim, not
+//!   percent-decoded — the header wins when both are present). It is
+//!   verified against the configured key set (`api_key` ∪
+//!   `extra_api_keys`) with the *same* constant-time digest compare as
+//!   bearer, or by a caller-supplied `api_key_verify` callback (an escape
+//!   hatch for a dynamic store — use `secretEqual` inside it, never
+//!   `std.mem.eql`, to avoid a timing leak). A failed API-key attempt is
+//!   audited and throttled exactly like a failed bearer attempt (401,
+//!   same challenge, same denied-request coalescing). In `.either` mode a
+//!   valid bearer **or** a valid API key passes; **bearer takes
+//!   precedence** — it is checked first and its `Identity.scheme` wins
+//!   when both are valid. The open plane (below) applies per mode: the
+//!   plane is open only when *no* credential for the active mode(s) is
+//!   configured.
 //! - **Scope.** `Options.protect` picks what needs auth: `.all` (the
 //!   default — secure by default; deviates from the seed, which gated
 //!   mutations only) or `.mutations` (the seed's R/W boundary: only
@@ -140,6 +158,40 @@ pub const Protect = enum {
     mutations,
 };
 
+/// Which authentication scheme(s) the gate accepts.
+pub const AuthMode = enum {
+    /// Only `Authorization: Bearer <token>` (the default — unchanged
+    /// behavior). API-key options are ignored.
+    bearer,
+    /// Only the API key (`X-Api-Key` header / query-param fallback).
+    /// Bearer options are ignored.
+    api_key,
+    /// A valid bearer **or** a valid API key passes. Bearer is checked
+    /// first and takes precedence — its `Identity.scheme` wins when both
+    /// are valid.
+    either,
+};
+
+/// Default header carrying the API key (`Options.api_key_header`).
+pub const default_api_key_header = "X-Api-Key";
+
+/// Caller-supplied API-key verifier — the escape hatch mirroring the
+/// bearer set for a dynamic key store. Receives the presented key
+/// verbatim; returns whether it is valid. **Must** compare in constant
+/// time (see `secretEqual`); never `std.mem.eql` on the secret. Called on
+/// the serving thread, after the static key set misses. `ctx` is
+/// `Options.api_key_verify_ctx` verbatim.
+pub const ApiKeyVerifyFn = *const fn (ctx: ?*anyopaque, presented_key: []const u8) bool;
+
+/// Constant-time equality for secret material (compares fixed-size
+/// SHA-256 digests via `std.crypto.timing_safe.eql`, so neither content
+/// nor length leaks). Exposed for `api_key_verify` callbacks so a custom
+/// key store reuses the module's timing-safe compare instead of the
+/// leaky `std.mem.eql`.
+pub fn secretEqual(a: []const u8, b: []const u8) bool {
+    return std.crypto.timing_safe.eql([Sha256.digest_length]u8, fingerprint(a), fingerprint(b));
+}
+
 /// What the gate attaches to `ctx.data` for requests it lets through.
 /// Lives on the middleware's stack frame — valid for the duration of the
 /// inner chain + handler call only; `ctx.data` is restored afterwards.
@@ -154,9 +206,12 @@ pub const Identity = struct {
     audit_detail: []const u8 = "",
 
     pub const Scheme = enum {
-        /// A configured token, verified in constant time.
+        /// A configured bearer token, verified in constant time.
         bearer,
-        /// No tokens configured — open plane (dev default, documented).
+        /// A configured API key (from the `X-Api-Key` header or the
+        /// optional query-param fallback), verified in constant time.
+        api_key,
+        /// No credentials configured — open plane (dev default, documented).
         open,
     };
 };
@@ -223,6 +278,30 @@ pub const Options = struct {
     extra_tokens: []const []const u8 = &.{},
     /// Which methods require auth. Default `.all` (see `Protect`).
     protect: Protect = .all,
+    /// Accepted authentication scheme(s). Default `.bearer` (existing
+    /// behavior). See `AuthMode`; the `api_key*` options below apply when
+    /// this is `.api_key` or `.either`.
+    auth_mode: AuthMode = .bearer,
+    /// The primary API key. Not retained — only its SHA-256 digest is
+    /// stored. Must be non-empty when set. With an empty key set and no
+    /// `api_key_verify`, the API-key scheme is an open plane (like an
+    /// empty token set).
+    api_key: ?[]const u8 = null,
+    /// Additional valid API keys (rotation set). Not retained.
+    extra_api_keys: []const []const u8 = &.{},
+    /// Caller-supplied API-key verifier (dynamic store); tried after the
+    /// static key set. See `ApiKeyVerifyFn` — must compare in constant
+    /// time. Its presence alone closes the API-key open plane.
+    api_key_verify: ?ApiKeyVerifyFn = null,
+    /// Opaque pointer handed to every `api_key_verify` call.
+    api_key_verify_ctx: ?*anyopaque = null,
+    /// Header the API key is read from (case-insensitive). Copied into the
+    /// gate. Default `X-Api-Key`.
+    api_key_header: []const u8 = default_api_key_header,
+    /// When set, the API key may also arrive as this query parameter
+    /// (value taken verbatim — not percent-decoded); the header wins when
+    /// both are present. Copied into the gate. Null ⇒ header only.
+    api_key_query_param: ?[]const u8 = null,
     /// Optional realm for the challenge: `WWW-Authenticate: Bearer
     /// realm="<realm>"`. Must be quoted-string-safe (no `"` or `\`).
     /// Null ⇒ plain `WWW-Authenticate: Bearer`.
@@ -253,6 +332,7 @@ pub const Options = struct {
 pub const Gate = struct {
     gpa: Allocator,
     protect: Protect,
+    auth_mode: AuthMode = .bearer,
     on_audit: ?AuditFn,
     on_audit_ctx: ?*anyopaque,
     window_ns: u64,
@@ -262,9 +342,18 @@ pub const Gate = struct {
     /// Precomputed `WWW-Authenticate` value, gpa-owned (stable across the
     /// response lifetime — no per-request formatting on the deny path).
     challenge: []const u8,
+    /// API-key verifier callback (dynamic store) + its ctx.
+    api_key_verify: ?ApiKeyVerifyFn = null,
+    api_key_verify_ctx: ?*anyopaque = null,
+    /// Header the API key is read from — gpa-owned copy.
+    api_key_header: []const u8 = default_api_key_header,
+    /// Optional query-param fallback name — gpa-owned copy, or null.
+    api_key_query_param: ?[]const u8 = null,
     lock: std.atomic.Mutex = .unlocked,
     /// SHA-256 digests of the valid tokens (never the tokens themselves).
     tokens: std.ArrayList([Sha256.digest_length]u8) = .empty,
+    /// SHA-256 digests of the valid API keys (never the keys themselves).
+    api_keys: std.ArrayList([Sha256.digest_length]u8) = .empty,
     throttle: Throttle = .{},
 
     /// Build a gate. Token/realm slices are consumed (hashed / formatted),
@@ -282,13 +371,33 @@ pub const Gate = struct {
             const fp = fingerprint(t);
             if (!containsFp(tokens.items, fp)) try tokens.append(gpa, fp);
         }
+        var api_keys: std.ArrayList([Sha256.digest_length]u8) = .empty;
+        errdefer api_keys.deinit(gpa);
+        if (options.api_key) |k| {
+            std.debug.assert(k.len != 0);
+            try api_keys.append(gpa, fingerprint(k));
+        }
+        for (options.extra_api_keys) |k| {
+            std.debug.assert(k.len != 0);
+            const fp = fingerprint(k);
+            if (!containsFp(api_keys.items, fp)) try api_keys.append(gpa, fp);
+        }
         const challenge = if (options.realm) |r|
             try std.fmt.allocPrint(gpa, "Bearer realm=\"{s}\"", .{r})
         else
             try gpa.dupe(u8, "Bearer");
+        errdefer gpa.free(challenge);
+        std.debug.assert(options.api_key_header.len != 0);
+        const api_key_header = try gpa.dupe(u8, options.api_key_header);
+        errdefer gpa.free(api_key_header);
+        const api_key_query_param = if (options.api_key_query_param) |q| blk: {
+            std.debug.assert(q.len != 0);
+            break :blk try gpa.dupe(u8, q);
+        } else null;
         return .{
             .gpa = gpa,
             .protect = options.protect,
+            .auth_mode = options.auth_mode,
             .on_audit = options.on_audit,
             .on_audit_ctx = options.on_audit_ctx,
             .window_ns = options.throttle_window_ms *| std.time.ns_per_ms,
@@ -296,13 +405,21 @@ pub const Gate = struct {
             .clock = options.clock,
             .throttle_key = options.throttle_key,
             .challenge = challenge,
+            .api_key_verify = options.api_key_verify,
+            .api_key_verify_ctx = options.api_key_verify_ctx,
+            .api_key_header = api_key_header,
+            .api_key_query_param = api_key_query_param,
             .tokens = tokens,
+            .api_keys = api_keys,
         };
     }
 
     pub fn deinit(g: *Gate) void {
         g.gpa.free(g.challenge);
+        g.gpa.free(g.api_key_header);
+        if (g.api_key_query_param) |q| g.gpa.free(q);
         g.tokens.deinit(g.gpa);
+        g.api_keys.deinit(g.gpa);
         g.throttle.deinit(g.gpa);
         g.* = undefined;
     }
@@ -315,9 +432,11 @@ pub const Gate = struct {
     }
 
     pub const Verdict = enum {
-        /// A configured token matched (constant-time).
+        /// A configured bearer token matched (constant-time).
         ok_bearer,
-        /// No tokens configured — open plane.
+        /// A configured API key matched (constant-time).
+        ok_api_key,
+        /// No credentials configured for the checked scheme — open plane.
         ok_open,
         denied,
     };
@@ -335,6 +454,65 @@ pub const Gate = struct {
         for (g.tokens.items) |want|
             ok = std.crypto.timing_safe.eql([Sha256.digest_length]u8, want, got) or ok;
         return if (ok) .ok_bearer else .denied;
+    }
+
+    /// The pure auth decision for a presented API key (null = none
+    /// presented). Reuses the *same* constant-time digest compare as
+    /// `verify` — never `std.mem.eql` on the secret. The static key set is
+    /// scanned in full (no early exit); on a miss the `api_key_verify`
+    /// callback (if any) is consulted outside the lock. Returns `.ok_open`
+    /// when no key set and no callback are configured.
+    pub fn verifyApiKey(g: *Gate, presented: ?[]const u8) Verdict {
+        const has_verify = g.api_key_verify != null;
+        const fp: ?[Sha256.digest_length]u8 = if (presented) |p| fingerprint(p) else null;
+        {
+            lockSpin(&g.lock);
+            defer g.lock.unlock();
+            if (g.api_keys.items.len == 0 and !has_verify) return .ok_open;
+            if (fp) |got| {
+                if (containsFp(g.api_keys.items, got)) return .ok_api_key;
+            }
+        }
+        // Static set missed; consult the dynamic verifier (caller code —
+        // kept outside the lock). Its own compare must be constant-time.
+        if (has_verify) {
+            if (presented) |p| {
+                if (g.api_key_verify.?(g.api_key_verify_ctx, p)) return .ok_api_key;
+            }
+        }
+        return .denied;
+    }
+
+    /// Add an API key to the valid set (rotation, mirrors `addToken`).
+    /// Idempotent; `key` is hashed, not retained; must be non-empty.
+    pub fn addApiKey(g: *Gate, key: []const u8) error{OutOfMemory}!void {
+        std.debug.assert(key.len != 0);
+        const fp = fingerprint(key);
+        lockSpin(&g.lock);
+        defer g.lock.unlock();
+        if (containsFp(g.api_keys.items, fp)) return;
+        try g.api_keys.append(g.gpa, fp);
+    }
+
+    /// Remove an API key from the valid set (mirrors `removeToken`; no-op
+    /// when absent).
+    pub fn removeApiKey(g: *Gate, key: []const u8) void {
+        const fp = fingerprint(key);
+        lockSpin(&g.lock);
+        defer g.lock.unlock();
+        var i: usize = 0;
+        while (i < g.api_keys.items.len) {
+            if (std.crypto.timing_safe.eql([Sha256.digest_length]u8, g.api_keys.items[i], fp)) {
+                _ = g.api_keys.swapRemove(i);
+            } else i += 1;
+        }
+    }
+
+    /// Number of currently valid API keys (diagnostics / tests).
+    pub fn apiKeyCount(g: *Gate) usize {
+        lockSpin(&g.lock);
+        defer g.lock.unlock();
+        return g.api_keys.items.len;
     }
 
     /// Add a token to the valid set (rotation step 1: add the new token,
@@ -521,6 +699,39 @@ fn bearerToken(req: *const http.Server.Request) ?[]const u8 {
     return tok;
 }
 
+/// The API key presented on the request: the (case-insensitive)
+/// `api_key_header` value, else the `api_key_query_param` query value when
+/// configured, else null. Both are trimmed of surrounding SP/TAB; an
+/// empty value counts as absent. The query value is taken verbatim (no
+/// percent-decoding), so the header is preferred for keys with reserved
+/// characters.
+fn apiKeyPresented(g: *const Gate, req: *const http.Server.Request) ?[]const u8 {
+    if (req.header(g.api_key_header)) |v| {
+        const k = std.mem.trim(u8, v, " \t");
+        if (k.len != 0) return k;
+    }
+    if (g.api_key_query_param) |name| {
+        if (queryValue(req.query, name)) |v| {
+            const k = std.mem.trim(u8, v, " \t");
+            if (k.len != 0) return k;
+        }
+    }
+    return null;
+}
+
+/// First value of query parameter `name` in a raw query string
+/// (`key=val&key2=val2`), or null. The name compare is a plain byte
+/// compare (the parameter name is not a secret); the value is returned
+/// verbatim.
+fn queryValue(query: []const u8, name: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, query, '&');
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        if (std.mem.eql(u8, pair[0..eq], name)) return pair[eq + 1 ..];
+    }
+    return null;
+}
+
 /// The throttle's client key per the trust rule shared with `ratelimit`
 /// (see the module doc): rightmost element of the **last**
 /// `X-Forwarded-For` header, else `X-Real-IP`, else the socket peer IP
@@ -571,6 +782,38 @@ fn formatV4(bytes: [4]u8, buf: *[client_key_len_max]u8) []const u8 {
 
 // ── the middleware ──────────────────────────────────────────────────────────
 
+/// The combined auth decision for a request under `g.auth_mode`. Returns
+/// the winning `Identity.Scheme`, or null when the request must be denied.
+/// Every configured scheme is checked with the module's constant-time
+/// digest compare. In `.either`, bearer is checked first and wins when
+/// both credentials are valid (documented precedence); the plane is open
+/// only when no credential is configured for the active mode(s).
+fn authorize(g: *Gate, req: *const http.Server.Request) ?Identity.Scheme {
+    switch (g.auth_mode) {
+        .bearer => return schemeOf(g.verify(bearerToken(req))),
+        .api_key => return schemeOf(g.verifyApiKey(apiKeyPresented(g, req))),
+        .either => {
+            const bearer_v = g.verify(bearerToken(req)); // ok_open ⇒ no tokens
+            const key_v = g.verifyApiKey(apiKeyPresented(g, req)); // ok_open ⇒ no keys
+            if (bearer_v == .ok_open and key_v == .ok_open) return .open;
+            if (bearer_v == .ok_bearer) return .bearer; // precedence
+            if (key_v == .ok_api_key) return .api_key;
+            return null;
+        },
+    }
+}
+
+/// Map a single-scheme `Verdict` to the identity scheme it admits, or null
+/// for `.denied`.
+fn schemeOf(v: Gate.Verdict) ?Identity.Scheme {
+    return switch (v) {
+        .ok_bearer => .bearer,
+        .ok_api_key => .api_key,
+        .ok_open => .open,
+        .denied => null,
+    };
+}
+
 fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
     const g: *Gate = @ptrCast(@alignCast(state.?));
 
@@ -580,19 +823,18 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
     };
     if (!in_scope) return next.run(ctx); // open read: no auth, no audit
 
-    const verdict = g.verify(bearerToken(ctx.req));
-    if (verdict == .denied) {
-        // 401, chain short-circuited. Header values are gate-owned stable
-        // memory, so no early end() is needed.
+    const scheme = authorize(g, ctx.req) orelse {
+        // Denied: 401, chain short-circuited. Header values are gate-owned
+        // stable memory, so no early end() is needed.
         ctx.res.setStatus(401);
         try ctx.res.setHeader("WWW-Authenticate", g.challenge);
         try ctx.res.setHeader("Content-Type", "text/plain");
         try ctx.res.writeAll("Unauthorized\n");
         auditDenied(g, ctx);
         return;
-    }
+    };
 
-    var ident: Identity = .{ .scheme = if (verdict == .ok_bearer) .bearer else .open };
+    var ident: Identity = .{ .scheme = scheme };
     const saved = ctx.data;
     ctx.data = &ident;
     defer ctx.data = saved;
@@ -809,6 +1051,84 @@ test "throttle: fail-open when the allocator is exhausted (audit not silenced)" 
     try testing.expectEqual(@as(usize, 0), g.throttleKeyCount());
     g.throttle.deinit(testing.allocator);
     g.tokens.deinit(testing.allocator);
+    g.api_keys.deinit(testing.allocator);
+}
+
+// ── tests: API-key scheme (pure pieces) ─────────────────────────────────────
+
+test "verifyApiKey: same constant-time compare — same-length wrong key rejected" {
+    var g = try Gate.init(testing.allocator, .{ .auth_mode = .api_key, .api_key = "k3y-abcdef" });
+    defer g.deinit();
+
+    try testing.expectEqual(Gate.Verdict.ok_api_key, g.verifyApiKey("k3y-abcdef"));
+    // Same length, single byte differs → must be denied (proves the
+    // decision is not a length/prefix check but the full digest compare).
+    try testing.expectEqual(Gate.Verdict.denied, g.verifyApiKey("k3y-abcdeF"));
+    try testing.expectEqual(Gate.Verdict.denied, g.verifyApiKey("k3y-abcde")); // shorter
+    try testing.expectEqual(Gate.Verdict.denied, g.verifyApiKey("k3y-abcdef-plus")); // longer
+    try testing.expectEqual(Gate.Verdict.denied, g.verifyApiKey(null)); // none presented
+    try testing.expectEqual(Gate.Verdict.denied, g.verifyApiKey("")); // empty candidate
+}
+
+test "verifyApiKey: open plane when no keys and no verifier configured" {
+    var g = try Gate.init(testing.allocator, .{ .auth_mode = .api_key });
+    defer g.deinit();
+    try testing.expectEqual(@as(usize, 0), g.apiKeyCount());
+    try testing.expectEqual(Gate.Verdict.ok_open, g.verifyApiKey(null));
+    try testing.expectEqual(Gate.Verdict.ok_open, g.verifyApiKey("anything"));
+}
+
+test "secretEqual: constant-time helper matches only equal secrets (incl. same length)" {
+    try testing.expect(secretEqual("hunter2", "hunter2"));
+    try testing.expect(!secretEqual("hunter2", "hunter3")); // same length, differs
+    try testing.expect(!secretEqual("hunter2", "hunter")); // shorter
+    try testing.expect(secretEqual("", "")); // equal (matching digests) — documented edge
+}
+
+test "api-key rotation: extra_api_keys, addApiKey/removeApiKey (mirrors bearer)" {
+    var g = try Gate.init(testing.allocator, .{
+        .auth_mode = .api_key,
+        .api_key = "primary-key",
+        .extra_api_keys = &.{ "spare-a", "spare-a", "spare-b" }, // dup collapses
+    });
+    defer g.deinit();
+    try testing.expectEqual(@as(usize, 3), g.apiKeyCount());
+    try testing.expectEqual(Gate.Verdict.ok_api_key, g.verifyApiKey("primary-key"));
+    try testing.expectEqual(Gate.Verdict.ok_api_key, g.verifyApiKey("spare-b"));
+
+    try g.addApiKey("fresh-key");
+    try g.addApiKey("fresh-key"); // idempotent
+    try testing.expectEqual(@as(usize, 4), g.apiKeyCount());
+    try testing.expectEqual(Gate.Verdict.ok_api_key, g.verifyApiKey("fresh-key"));
+
+    g.removeApiKey("primary-key");
+    g.removeApiKey("never-was"); // no-op
+    try testing.expectEqual(@as(usize, 3), g.apiKeyCount());
+    try testing.expectEqual(Gate.Verdict.denied, g.verifyApiKey("primary-key"));
+    try testing.expectEqual(Gate.Verdict.ok_api_key, g.verifyApiKey("fresh-key"));
+}
+
+/// A dynamic API-key verifier using the module's constant-time helper (the
+/// escape hatch: it must not leak timing via `std.mem.eql`).
+fn dynVerify(ctx: ?*anyopaque, presented: []const u8) bool {
+    const want: *const []const u8 = @ptrCast(@alignCast(ctx.?));
+    return secretEqual(presented, want.*);
+}
+
+test "verifyApiKey: caller-supplied verifier (escape hatch), consulted after the static set" {
+    var expected: []const u8 = "dyn-secret";
+    var g = try Gate.init(testing.allocator, .{
+        .auth_mode = .api_key,
+        .api_key = "static-key",
+        .api_key_verify = dynVerify,
+        .api_key_verify_ctx = @ptrCast(&expected),
+    });
+    defer g.deinit();
+
+    try testing.expectEqual(Gate.Verdict.ok_api_key, g.verifyApiKey("static-key")); // static set
+    try testing.expectEqual(Gate.Verdict.ok_api_key, g.verifyApiKey("dyn-secret")); // dynamic
+    try testing.expectEqual(Gate.Verdict.denied, g.verifyApiKey("dyn-secreT")); // same-length wrong
+    try testing.expectEqual(Gate.Verdict.denied, g.verifyApiKey(null));
 }
 
 // ── tests: middleware over the socket-free server codec ─────────────────────
@@ -1261,6 +1581,131 @@ test "rotation over the wire: new token works, old works until removed" {
     g.removeToken("old-tok");
     try expectStatus(runWire(&gr.r, wire("GET", "/t", "Authorization: Bearer old-tok\r\n"), &buf), "401");
     try expectStatus(runWire(&gr.r, wire("GET", "/t", "Authorization: Bearer new-tok\r\n"), &buf), "200");
+}
+
+/// Handler requiring the API-key identity (like `hSecretMutation` but for
+/// the api_key scheme); 201 proves the assertions passed.
+fn hApiKeyMutation(ctx: *router.Ctx) anyerror!void {
+    const id = identityOf(ctx) orelse return error.NoIdentity;
+    try testing.expectEqual(Identity.Scheme.api_key, id.scheme);
+    id.audit_target = "device-9";
+    id.audit_detail = "rekey";
+    if (ctx.state) |st| {
+        const s: *Sink = @ptrCast(@alignCast(st));
+        s.hits += 1;
+    }
+    ctx.res.setStatus(201);
+    try ctx.res.writeAll("done");
+}
+
+test "middleware api_key: valid X-Api-Key → 200/201 + api_key identity; missing/wrong → 401 audited + throttled" {
+    var tc: TestClock = .{};
+    var sink: Sink = .{};
+    var g = try Gate.init(testing.allocator, .{
+        .auth_mode = .api_key,
+        .api_key = "k3y-abcdef",
+        .on_audit = Sink.hook,
+        .on_audit_ctx = &sink,
+        .throttle_window_ms = 5_000,
+        .clock = tc.clock(),
+    });
+    defer g.deinit();
+
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &sink;
+    try r.use(g.middleware());
+    try r.get("/t", hHello);
+    try r.post("/t", hApiKeyMutation);
+    var buf: [1024]u8 = undefined;
+
+    tc.ns = std.time.ns_per_s;
+
+    // Valid key: GET → 200, POST → 201 (handler saw .api_key identity).
+    try expectStatus(runWire(&r, wire("GET", "/t", "X-Api-Key: k3y-abcdef\r\n"), &buf), "200");
+    const ok = runWire(&r, wire("POST", "/t", "X-Api-Key: k3y-abcdef\r\n"), &buf);
+    try expectStatus(ok, "201");
+    try testing.expectEqualStrings("done", bodyOf(ok));
+    try testing.expectEqual(@as(u32, 2), sink.hits);
+    // Authed mutation was audited with the handler's target.
+    try testing.expectEqual(@as(usize, 1), sink.len);
+    try testing.expect(sink.recs[0].authed);
+    try testing.expectEqualStrings("device-9", sink.recs[0].target());
+
+    // Missing key (client 1.1.1.1) → 401 + challenge, handler untouched,
+    // denial audited (new client key → admitted).
+    const miss = runWire(&r, wire("POST", "/t", "X-Forwarded-For: 1.1.1.1\r\n"), &buf);
+    try expectStatus(miss, "401");
+    try expectHeaderLine(miss, "WWW-Authenticate: Bearer");
+    try testing.expectEqual(@as(u32, 2), sink.hits);
+    try testing.expectEqual(@as(usize, 2), sink.len);
+    try testing.expect(!sink.recs[1].authed);
+    try testing.expectEqual(@as(u16, 401), sink.recs[1].status);
+
+    // Wrong same-length key from a different client (2.2.2.2) → 401,
+    // audited; a second wrong attempt from the SAME key is throttled
+    // (coalesced within the window — no new audit entry).
+    const cw = "X-Forwarded-For: 2.2.2.2\r\nX-Api-Key: k3y-abcdeF\r\n";
+    try expectStatus(runWire(&r, wire("POST", "/t", cw), &buf), "401");
+    try testing.expectEqual(@as(usize, 3), sink.len); // first wrong: admitted
+    try expectStatus(runWire(&r, wire("POST", "/t", cw), &buf), "401");
+    try testing.expectEqual(@as(usize, 3), sink.len); // coalesced within window
+}
+
+test "middleware api_key: custom header name and query-param fallback (header wins)" {
+    var g = try Gate.init(testing.allocator, .{
+        .auth_mode = .api_key,
+        .api_key = "sekret",
+        .api_key_header = "X-Company-Key",
+        .api_key_query_param = "api_key",
+    });
+    defer g.deinit();
+
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(g.middleware());
+    try r.get("/t", hHello);
+    var buf: [1024]u8 = undefined;
+
+    // Default X-Api-Key is NOT accepted when a custom header is configured.
+    try expectStatus(runWire(&r, wire("GET", "/t", "X-Api-Key: sekret\r\n"), &buf), "401");
+    // The configured custom header works.
+    try expectStatus(runWire(&r, wire("GET", "/t", "X-Company-Key: sekret\r\n"), &buf), "200");
+    // Query-param fallback works when no header present.
+    try expectStatus(runWire(&r, wire("GET", "/t?api_key=sekret", ""), &buf), "200");
+    try expectStatus(runWire(&r, wire("GET", "/t?api_key=wrong", ""), &buf), "401");
+    // Header wins over the query param (bad header, good query → header used → 401).
+    try expectStatus(runWire(&r, wire("GET", "/t?api_key=sekret", "X-Company-Key: wrong\r\n"), &buf), "401");
+}
+
+test "middleware either: a valid bearer OR a valid api key admits; bearer takes precedence" {
+    var g = try Gate.init(testing.allocator, .{
+        .auth_mode = .either,
+        .token = "b3arer",
+        .api_key = "ap1key",
+    });
+    defer g.deinit();
+
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(g.middleware());
+    try r.get("/t", hHello);
+    var buf: [1024]u8 = undefined;
+
+    // Bearer alone passes.
+    try expectStatus(runWire(&r, wire("GET", "/t", "Authorization: Bearer b3arer\r\n"), &buf), "200");
+    // API key alone passes.
+    try expectStatus(runWire(&r, wire("GET", "/t", "X-Api-Key: ap1key\r\n"), &buf), "200");
+    // Neither → 401.
+    try expectStatus(runWire(&r, wire("GET", "/t", ""), &buf), "401");
+    // Wrong both → 401.
+    try expectStatus(runWire(&r, wire("GET", "/t", "Authorization: Bearer no\r\nX-Api-Key: no\r\n"), &buf), "401");
+    // Both valid → passes; a bearer-asserting handler proves precedence.
+    var r2 = router.Router.init(testing.allocator);
+    defer r2.deinit();
+    try r2.use(g.middleware());
+    try r2.post("/t", hSecretMutation); // asserts .bearer scheme
+    try expectStatus(runWire(&r2, wire("POST", "/t", "Authorization: Bearer b3arer\r\nX-Api-Key: ap1key\r\n"), &buf), "201");
 }
 
 // ── tests: in-process integration (router + http.Server + http.Client) ──────

@@ -273,6 +273,48 @@ zig-libs exists to ship the **good** version of each library, not a copy of the 
 Extractions (dataset/tabular/jsonshape/finstats/bxp text libs) stay **Opus + deferred** — verified
 2026-07-07 to have little value-add headroom (below).
 
+## Roadmap 2026-07-08 — prod-API-server hardening + app-elevation
+
+### A) Production-API-server hardening (Opus-audited 2026-07-08 against the real code)
+Core framing is genuinely hardened + tested: request-smuggling (dup/disagreeing CL, TE-without-chunked,
+dup Host, truncation, obs-fold), timeouts (read/request/write, slowloris), 431/413/414, **graceful
+drain + h2 GOAWAY**, streaming/backpressure, **handler-error/panic → clean 500**. Remaining before
+internet exposure:
+
+**✅ DONE 2026-07-08 (4 parallel Opus agents, one hardening batch):** CR/LF header guard (blocker) ·
+CL+TE reject · JSON DoS caps (depth/array/members/nodes) · path `..` normalization + NUL reject ·
+per-conn request cap · API-key auth · access-log writer (combined+JSON). +27 tests, Debug+ReleaseFast+
+fmt green. **Still open:** request-ID mw · health helper · conditional-req · multipart · JWT/JWKS.
+(✅ marks below.)
+- ✅ ⛔ **BLOCKER — outbound header CR/LF injection guard (response splitting).** `setHeader`/`writeHead`
+  write header names+values verbatim (Server.zig:1131, 1343). Reject `\r`/`\n`/NUL + validate token
+  name. **Small · Opus.**
+- 🟡 reject **CL + TE:chunked when both present** → 400 (today "TE wins" → CL.TE smuggling via a trusting
+  proxy). 1 line, Server. **Opus.**
+- 🟡 **JSON DoS caps** — depth / array-element / field-count (today only 1 MiB body size). validate ext. **small-med · Opus.**
+- 🟡 **path normalization + `..` traversal** (router matches byte-for-byte; no dot-seg collapse / percent-decode). router/http. **small-med.**
+- 🟡 **request-ID / correlation-ID** middleware (gen + echo `X-Request-Id`). **small · Opus.**
+- 🟡 **health/readiness** endpoint helper (LB/k8s probes). **small · Opus.**
+- 🟡 **access-log writer** — the `on_request`/`AccessEntry` hook exists (metrics:610), ship a default writer. **small · Opus.**
+- 🟡 **API-key auth** (`X-Api-Key`) — aaa-gate is Bearer-only. aaa-gate ext. **small.**
+- 🟡 **conditional requests** ETag/If-None-Match/Last-Modified → 304. http ResponseWriter helper. **small-med · Fable.**
+- 🟡 **multipart/form-data + x-www-form-urlencoded** body parsing (if the API takes forms/uploads). **medium · Fable.**
+- 🟡 **JWT/JWKS OAuth2/OIDC resource-server** validation (JWS verify — lean on `acme/jws.zig` — + JWKS fetch/cache + exp/aud/iss). **large · Fable · NEW module.**
+- 🟢 nice-to-have: cookies + Set-Cookie(HttpOnly/Secure/SameSite) · Range/206 · inbound gzip request body ·
+  traceparent/OTel · per-conn request-count cap · auto-OPTIONS in router · content negotiation · Link
+  pagination · Idempotency-Key · request trailers · strict bare-LF reject · HMAC signing · HTTP/3.
+- Excluded/decided: **TLS = proxy** (then ianic spike); **upstream LB/pool** = app-elevation #2 below.
+- **Bottom line:** NOT fundamentally unsafe — 1 small blocker + ~6 small-med hardening/ops items + 1 large
+  (JWT/JWKS only if OAuth2/OIDC). Most are **Opus-inline extensions of existing modules**, not new modules.
+
+### B) App-elevation value-add (Fable) — user-ordered 2026-07-08 (rawsock/data-family/exprcalc removed → extraction)
+1. **MCP HTTP/SSE transport** (small) — D AI-netops remote · 2. **upstream LB + health routing (+bulkhead)**
+(med-large) — C gateway · 3. **SNMP trap receiver + v3** (small-med) — A async alerts · 4. **coap** RFC 7252
+(med) — G IoT · 5. **MQTT broker** (large) — G IoT hub.
+Extraction backlog (Opus, NOT Fable — low/no value-add headroom): `rawsock` (axp `openPacketCapture`
+AF_PACKET layer is REAL) · data-family (dataset/tabular/jsonshape/finstats; **`roquery` has a security-
+hardening sliver**) · `exprcalc` (sandbox sliver if user-facing) · procnet/argsafe/blobstore · bxp text libs.
+
 ## Queued — wgs data/compute family (NEW 2026-07-07; from `~/workspace/wgs` survey)
 A foundational columnar-dataframe stack, well-factored + tested in wgs (all pure `std`, arena, no libc
 except sqlite). Extract in dependency order — `dataset` is the anchor everything else imports.
@@ -299,9 +341,14 @@ axp *fakes* these in `axp-sim/src/synth.zig` or *shells out* to daemons (`lldpd`
 - **`l2disco`** ✅ worth it (user-approved) — LLDP (802.1AB) + CDP + ARP + DHCP option codecs; no Zig
   lib exists. Build as a proper NEW module (golden-packet KATs).
 - `stun` (RFC 8489) · `sntp` (RFC 4330) — smaller real gaps; follow-ups after l2disco.
-- `rawsock` (AF_PACKET capture) — greenfield, Linux-runtime-heavy; lower priority.
 - Real extractions (mechanical copies, LOW headroom → **Opus, not Fable**): `procnet` + `argsafe`
-  (really in axp `task.zig`) · `blobstore` (axp-vault `store.zig`).
+  (really in axp `task.zig`) · `blobstore` (axp-vault `store.zig`) · **`rawsock`** — CORRECTED
+  2026-07-08: axp DOES have a real AF_PACKET layer (`task.zig` `openPacketCapture` = AF_PACKET/SOCK_RAW
+  capture + SO_RCVTIMEO + CAP_NET_RAW handling, ARP send/recv over `sockaddr_ll`, raw-INET/ICMP sockets,
+  `ifNameOf` SIOCGIFNAME). Base `rawsock` = **extract**, not greenfield (my earlier "greenfield" call
+  was from a comment, not the code). Optional value-add sliver only: BPF-filter attach + `PACKET_MMAP`
+  zero-copy ring for high-rate capture (that part would be Fable). `rawsock` wires l2disco/arp/icmp onto
+  the wire (capture + inject).
 
 ## Queued — bxp / poc-wf (mechanical extractions = Opus, NOT Fable; verified 2026-07-07)
 **No meaningful value-add headroom** — do as plain Opus extraction when actually needed:

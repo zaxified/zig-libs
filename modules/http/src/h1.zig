@@ -223,6 +223,10 @@ pub const RequestHead = struct {
     host: ?[]const u8 = null,
     /// Parsed `Content-Length`, null if absent or overridden by chunked.
     content_length: ?u64 = null,
+    /// A `Content-Length` header was present at all (kept even when
+    /// `chunked` nulls `content_length`, so the server can reject a message
+    /// carrying both framings — the classic CL.TE smuggling vector).
+    has_content_length: bool = false,
     /// `Transfer-Encoding` includes `chunked`.
     chunked: bool = false,
     /// A `Transfer-Encoding` header is present at all. When set without
@@ -273,6 +277,7 @@ pub const RequestHead = struct {
             const entry = try parseHeaderLine(line);
 
             if (std.ascii.eqlIgnoreCase(entry.name, "content-length")) {
+                head.has_content_length = true;
                 try latchContentLength(&head.content_length, entry.value);
             } else if (std.ascii.eqlIgnoreCase(entry.name, "transfer-encoding")) {
                 head.has_transfer_encoding = true;
@@ -305,7 +310,7 @@ pub const RequestHead = struct {
 };
 
 /// RFC 7230 token characters (method names, header names).
-fn isTchar(c: u8) bool {
+pub fn isTchar(c: u8) bool {
     return switch (c) {
         'a'...'z', 'A'...'Z', '0'...'9' => true,
         '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => true,

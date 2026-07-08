@@ -793,6 +793,146 @@ fn responseBytes(res: *const http.Server.ResponseWriter) ?u64 {
     };
 }
 
+// ── default access-log writer ───────────────────────────────────────────────
+
+/// A ready-made structured access-log *writer* for the `AccessEntry` hook.
+/// `RequestMetrics` exposes the hook but ships no writer; this is the default
+/// one, so a caller need only wire the two together instead of hand-rolling a
+/// formatter:
+///
+/// ```zig
+/// var log_writer = std.fs.File.stdout().writer(&buf);
+/// var access = metrics.AccessLog.init(&log_writer.interface, .{});
+/// var rm = try metrics.RequestMetrics.init(&reg, .{
+///     .on_request = metrics.AccessLog.onRequest,
+///     .on_request_ctx = &access, // AccessLog must outlive the middleware
+/// });
+/// ```
+///
+/// **Default format is `.json`** — one object per line, machine-friendly for
+/// log pipelines. `.combined` emits the Apache/NGINX Common/Combined Log
+/// Format (a documented de-facto format).
+///
+/// Only the fields `AccessEntry` actually carries are emitted: method, path,
+/// status, `duration_ns`, bytes. The Combined format's host / ident / user /
+/// time / protocol / referer / user-agent slots have no counterpart on the
+/// entry, so each is rendered as the CLF placeholder `-` (`[-]` for the time);
+/// callers who want those must prepend/wrap their own. (A request-id field is
+/// not on `AccessEntry` today; when one lands it can be added here.)
+///
+/// Thread-safety: the hook fires on each request task, so by default the
+/// writer is guarded with the module spinlock (`synchronized = true`) — the
+/// whole line is written under the lock, so lines from concurrent connections
+/// never interleave. Set `synchronized = false` only when the caller already
+/// serializes writes to `writer`.
+///
+/// Allocation-free: every line is streamed straight to `writer` (no temp
+/// buffers). The writer is flushed after each line so records reach the sink
+/// promptly; pass a buffered `writer` if you would rather batch and flush
+/// yourself with `synchronized = false`. Writer errors are swallowed — an
+/// access log must never fail the request that produced it — and odd bytes in
+/// path/method are escaped, never panicked on.
+pub const AccessLog = struct {
+    writer: *std.Io.Writer,
+    options: Options,
+    lock: std.atomic.Mutex = .unlocked,
+
+    pub const Format = enum {
+        /// One JSON object per line (default).
+        json,
+        /// Apache/NGINX Combined Log Format.
+        combined,
+    };
+
+    pub const Options = struct {
+        format: Format = .json,
+        /// Guard the writer with the module spinlock so concurrent request
+        /// tasks never interleave lines. Disable only if the caller serializes
+        /// writes to `writer` itself.
+        synchronized: bool = true,
+    };
+
+    pub fn init(writer: *std.Io.Writer, options: Options) AccessLog {
+        return .{ .writer = writer, .options = options };
+    }
+
+    /// Adapter matching `RequestMetrics.Options.on_request`. Wire it as
+    /// `on_request = AccessLog.onRequest` with `on_request_ctx = &your_access_log`.
+    pub fn onRequest(ctx: ?*anyopaque, entry: AccessEntry) void {
+        const self: *AccessLog = @ptrCast(@alignCast(ctx.?));
+        self.log(entry);
+    }
+
+    /// Format one entry as a line and write it. Best-effort: writer errors are
+    /// swallowed. Holds the spinlock across the whole line when `synchronized`.
+    pub fn log(self: *AccessLog, entry: AccessEntry) void {
+        if (self.options.synchronized) lockSpin(&self.lock);
+        defer if (self.options.synchronized) self.lock.unlock();
+        self.writeLine(entry) catch {};
+        self.writer.flush() catch {};
+    }
+
+    fn writeLine(self: *AccessLog, entry: AccessEntry) std.Io.Writer.Error!void {
+        const w = self.writer;
+        switch (self.options.format) {
+            .json => {
+                try w.writeAll("{\"method\":");
+                try writeJsonString(w, entry.method.token());
+                try w.writeAll(",\"path\":");
+                try writeJsonString(w, entry.path);
+                try w.print(
+                    ",\"status\":{d},\"duration_ns\":{d},\"bytes\":",
+                    .{ entry.status, entry.duration_ns },
+                );
+                if (entry.bytes) |b| try w.print("{d}", .{b}) else try w.writeAll("null");
+                try w.writeAll("}\n");
+            },
+            .combined => {
+                // host ident authuser [time] "request" status bytes "referer" "ua"
+                // The entry carries none of host/ident/user/time/proto/referer/ua,
+                // so those slots are the CLF placeholder "-".
+                try w.writeAll("- - - [-] \"");
+                try writeClfQuoted(w, entry.method.token());
+                try w.writeByte(' ');
+                try writeClfQuoted(w, entry.path);
+                try w.print("\" {d} ", .{entry.status});
+                if (entry.bytes) |b| try w.print("{d}", .{b}) else try w.writeByte('-');
+                try w.writeAll(" \"-\" \"-\"\n");
+            },
+        }
+    }
+};
+
+/// Write `s` as a double-quoted JSON string, escaping the characters JSON
+/// requires (`"`, `\`, and control bytes). Bytes ≥ 0x20 pass through verbatim,
+/// so invalid UTF-8 can never trigger a decode panic.
+fn writeJsonString(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
+    try w.writeByte('"');
+    for (s) |c| switch (c) {
+        '"' => try w.writeAll("\\\""),
+        '\\' => try w.writeAll("\\\\"),
+        0x08 => try w.writeAll("\\b"),
+        0x09 => try w.writeAll("\\t"),
+        0x0A => try w.writeAll("\\n"),
+        0x0C => try w.writeAll("\\f"),
+        0x0D => try w.writeAll("\\r"),
+        0x00...0x07, 0x0B, 0x0E...0x1F => try w.print("\\u{x:0>4}", .{c}),
+        else => try w.writeByte(c),
+    };
+    try w.writeByte('"');
+}
+
+/// Write `s` escaped for a Combined-Log-Format quoted field: `"` and `\` are
+/// backslash-escaped, control bytes and DEL become `\xHH` (Apache convention).
+fn writeClfQuoted(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
+    for (s) |c| switch (c) {
+        '"' => try w.writeAll("\\\""),
+        '\\' => try w.writeAll("\\\\"),
+        0x00...0x1F, 0x7F => try w.print("\\x{x:0>2}", .{c}),
+        else => try w.writeByte(c),
+    };
+}
+
 // ── tests: instrument semantics (offline) ───────────────────────────────────
 
 const testing = std.testing;
@@ -1505,4 +1645,105 @@ test "integration: request middleware + /metrics endpoint over loopback" {
     try testing.expectEqual(1, std.mem.count(u8, body, "# TYPE http_requests_total counter"));
     try testing.expectEqual(1, std.mem.count(u8, body, "# TYPE http_request_duration_seconds histogram"));
     try testing.expectEqual(1, std.mem.count(u8, body, "# TYPE http_requests_in_flight gauge"));
+}
+
+// ── tests: access-log writer ─────────────────────────────────────────────────
+
+test "AccessLog: json format writes one object per request; specials escaped" {
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var access = AccessLog.init(&w, .{ .format = .json });
+
+    // Drive it through the exact hook adapter a caller would wire.
+    AccessLog.onRequest(&access, .{
+        .method = .get,
+        .path = "/api/\"weird\"\tpath",
+        .status = 200,
+        .duration_ns = 1500,
+        .bytes = 1234,
+    });
+
+    try testing.expectEqualStrings(
+        "{\"method\":\"GET\",\"path\":\"/api/\\\"weird\\\"\\tpath\"," ++
+            "\"status\":200,\"duration_ns\":1500,\"bytes\":1234}\n",
+        w.buffered(),
+    );
+}
+
+test "AccessLog: json bytes=null renders JSON null" {
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var access = AccessLog.init(&w, .{ .format = .json });
+
+    access.log(.{ .method = .head, .path = "/x", .status = 204, .duration_ns = 7, .bytes = null });
+
+    try testing.expectEqualStrings(
+        "{\"method\":\"HEAD\",\"path\":\"/x\",\"status\":204,\"duration_ns\":7,\"bytes\":null}\n",
+        w.buffered(),
+    );
+}
+
+test "AccessLog: combined format is CLF with placeholders and a quoted, escaped request" {
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var access = AccessLog.init(&w, .{ .format = .combined });
+
+    // bytes=null → the CLF "-"; the quote and space in the path stay inside
+    // the quoted request field, with the quote backslash-escaped.
+    access.log(.{
+        .method = .post,
+        .path = "/p a\"th",
+        .status = 404,
+        .duration_ns = 10,
+        .bytes = null,
+    });
+    // A second record with a real byte count appends a whole second line.
+    access.log(.{ .method = .get, .path = "/ok", .status = 200, .duration_ns = 1, .bytes = 0 });
+
+    try testing.expectEqualStrings(
+        "- - - [-] \"POST /p a\\\"th\" 404 - \"-\" \"-\"\n" ++
+            "- - - [-] \"GET /ok\" 200 0 \"-\" \"-\"\n",
+        w.buffered(),
+    );
+}
+
+test "AccessLog: synchronized writes never interleave across threads" {
+    var buf: [64 * 1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var access = AccessLog.init(&w, .{ .format = .json, .synchronized = true });
+
+    const Worker = struct {
+        fn run(a: *AccessLog, id: usize) void {
+            var i: usize = 0;
+            while (i < 100) : (i += 1) {
+                a.log(.{
+                    .method = .get,
+                    .path = "/t",
+                    .status = @intCast(200 + id),
+                    .duration_ns = 1,
+                    .bytes = 0,
+                });
+            }
+        }
+    };
+
+    const n_threads = 4;
+    var threads: [n_threads]std.Thread = undefined;
+    for (&threads, 0..) |*t, id| t.* = try std.Thread.spawn(.{}, Worker.run, .{ &access, id });
+    for (&threads) |t| t.join();
+
+    // Every '\n'-delimited line must be a whole, well-formed record — proof
+    // that no two threads' lines interleaved under the lock.
+    var it = std.mem.tokenizeScalar(u8, w.buffered(), '\n');
+    var count: usize = 0;
+    while (it.next()) |line| {
+        count += 1;
+        try testing.expect(line.len > 2 and line[0] == '{' and line[line.len - 1] == '}');
+        const ok = std.mem.indexOf(u8, line, "\"status\":200,") != null or
+            std.mem.indexOf(u8, line, "\"status\":201,") != null or
+            std.mem.indexOf(u8, line, "\"status\":202,") != null or
+            std.mem.indexOf(u8, line, "\"status\":203,") != null;
+        try testing.expect(ok);
+    }
+    try testing.expectEqual(@as(usize, n_threads * 100), count);
 }

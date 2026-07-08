@@ -183,6 +183,12 @@ pub const Options = struct {
     /// Response body buffering: bodies fully written within this get an
     /// exact Content-Length, larger ones stream chunked.
     response_buffer_size: usize = 4 * 1024,
+    /// Max requests served on a single keep-alive connection before it is
+    /// closed gracefully: the response to the last permitted request carries
+    /// `Connection: close` and the connection ends (Go `Server` /
+    /// nginx `keepalive_requests` shape — bounds a connection that pipelines
+    /// forever inside the timeouts). 0 = unlimited.
+    max_requests_per_conn: u32 = 1000,
     /// Negotiated gzip response compression (SPEC-http-gzip.md). null =
     /// off (the default — zero behavior change); `.{}` = on with safe
     /// defaults (compress bodies ≥ 1 KiB of text/JSON/XML/JS at level 6
@@ -339,6 +345,10 @@ const chunk_scratch_len = 512;
 /// How much unread request body to drain after the handler before giving up
 /// on keep-alive (Go's maxPostHandlerReadBytes).
 const max_unread_body_drain = 256 * 1024;
+/// Scratch bound for request-path normalization (a private copy so the raw
+/// `Request.target` is preserved). Covers the default `max_request_line_bytes`
+/// (8 KiB) — a longer origin-form path answers 414 rather than routing raw.
+const max_normalized_path = 8 * 1024;
 
 fn connMain(s: *Server, stream: net.Stream) void {
     defer stream.close(s.io);
@@ -418,6 +428,7 @@ fn connMain(s: *Server, stream: net.Stream) void {
         .on_conn_state = o.on_conn_state,
         .on_conn_state_ctx = o.on_conn_state_ctx,
         .compression = o.compression,
+        .max_requests_per_conn = o.max_requests_per_conn,
     }, &tr.reader, &tw.writer, bufs, &tr);
 }
 
@@ -632,6 +643,11 @@ pub const StreamOptions = struct {
     /// Negotiated gzip response compression (see `Options.compression`);
     /// active only when `StreamBuffers.gzip` is also provided. null = off.
     compression: ?Compression = null,
+    /// Max requests served on this connection before it closes gracefully
+    /// (see `Options.max_requests_per_conn`). 0 = unlimited (the default
+    /// here, so the plain codec stays permissive; the socket serving loop
+    /// passes the hardened `Options` default).
+    max_requests_per_conn: u32 = 0,
 
     pub const Now = struct {
         ctx: ?*anyopaque = null,
@@ -682,7 +698,11 @@ fn serveLoop(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers
     var req_index: u32 = 0;
     while (true) {
         if (tr) |t| t.armRequest();
-        if (serveOne(opts, in, out, bufs, req_index) == .close) break;
+        // Per-connection request cap: when this request reaches the limit
+        // its response is forced to `Connection: close` and the loop ends.
+        const cap = opts.max_requests_per_conn;
+        const force_close = cap != 0 and req_index + 1 >= cap;
+        if (serveOne(opts, in, out, bufs, req_index, force_close) == .close) break;
         req_index += 1;
         fireConnState(&opts, .idle);
     }
@@ -691,7 +711,7 @@ fn serveLoop(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers
 
 const ConnDisposition = enum { keep_alive, close };
 
-fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers, req_index: u32) ConnDisposition {
+fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers, req_index: u32, force_close: bool) ConnDisposition {
     // Wait for the next request (keep-alive idle); any failure here — client
     // hung up between requests, idle timeout — is a quiet close.
     _ = in.peekByte() catch return .close;
@@ -723,6 +743,13 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
     // methods in the shared vocabulary are dispatched.
     if (!head.http1_0 and head.host == null) return respondError(opts, out, date, 400);
     if (head.has_transfer_encoding and !head.chunked) return respondError(opts, out, date, 400);
+    // Request smuggling (RFC 9112 §6.1): a message carrying BOTH a
+    // Content-Length and a Transfer-Encoding is ambiguous. The parser lets
+    // TE override CL (smuggling-safe for us), but a fronting proxy that
+    // instead trusts CL yields a classic CL.TE desync — so reject outright
+    // and close, before the handler ever runs.
+    if (head.has_transfer_encoding and head.has_content_length)
+        return respondError(opts, out, date, 400);
     const method = methodFromToken(head.method) orelse return respondError(opts, out, date, 501);
 
     // Origin-form ("/path?query") and asterisk-form only — absolute-form is
@@ -736,9 +763,28 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
         query = head.target[i + 1 ..];
     }
 
+    // Path normalization + traversal protection (RFC 3986 §5.2.4): collapse
+    // `.`/`..` segments before routing so a `..` cannot walk a route prefix,
+    // and reject an embedded NUL / `%00` (path-truncation tricks). The raw
+    // `req.target` is preserved (normalization runs on a private copy);
+    // percent-encoding is NOT decoded, so `%2F`/`%2E` can never turn into a
+    // routing separator or dot-segment. `removeDotSegments` clamps at root
+    // (a leading `..` is dropped, never escapes). Origin-form only — the
+    // asterisk-form target ("*") is left untouched.
+    var norm_buf: [max_normalized_path]u8 = undefined;
+    if (path.len != 0 and path[0] == '/') {
+        if (path.len > norm_buf.len) return respondError(opts, out, date, 414);
+        if (std.mem.indexOfScalar(u8, path, 0) != null or
+            std.ascii.indexOfIgnoreCase(path, "%00") != null)
+            return respondError(opts, out, date, 400);
+        @memcpy(norm_buf[0..path.len], path);
+        path = norm_buf[0..http.removeDotSegments(norm_buf[0..path.len])];
+    }
+
     // Persistence: HTTP/1.1 defaults to keep-alive unless the client asked
     // to close; HTTP/1.0 always closes (keep-alive opt-in not implemented).
-    const keep_alive = !head.http1_0 and !head.connection_close;
+    // `force_close` (per-connection request cap reached) also ends it.
+    const keep_alive = !head.http1_0 and !head.connection_close and !force_close;
 
     // Body cap, declared-length half: refuse before the handler runs (and
     // before any 100-continue invites the body onto the wire) — the nginx
@@ -1128,8 +1174,18 @@ pub const ResponseWriter = struct {
 
     /// Set a header, replacing an existing one of the same name
     /// (case-insensitive). See the managed-header rules in the type doc.
+    ///
+    /// Response-splitting guard (RFC 9110 §5.1 / §5.5): the mechanism is
+    /// **reject at set time** (fail fast) — the single mutation path for the
+    /// header table, so a rejected header can never reach `writeHead` and
+    /// thus never the wire; no separate write-time scrub is needed. The
+    /// `name` must be a non-empty RFC 9110 token (tchar only); the `value`
+    /// must not contain CR, LF or NUL (the bytes that would inject a header
+    /// or split the response when a handler reflects user input into a
+    /// Location/Set-Cookie/filename header). Both fail with `InvalidHeader`.
     pub fn setHeader(rw: *ResponseWriter, name: []const u8, value: []const u8) SetHeaderError!void {
         if (rw.sent_head) return error.HeadersSent;
+        if (!validHeaderName(name) or !validHeaderValue(value)) return error.InvalidHeader;
         if (std.ascii.eqlIgnoreCase(name, "content-length")) {
             rw.declared_len = std.fmt.parseInt(u64, value, 10) catch return error.InvalidHeader;
             return;
@@ -1452,6 +1508,23 @@ pub const ResponseWriter = struct {
     }
 };
 
+/// A valid response header name: a non-empty RFC 9110 §5.1 token (tchar
+/// only). Rejects the space/`:`/control bytes that would break the
+/// `name: value` framing.
+fn validHeaderName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |c| if (!h1.isTchar(c)) return false;
+    return true;
+}
+
+/// A safe response header value: no CR, LF or NUL (RFC 9110 §5.5 — the
+/// bytes a reflected value would use to inject headers or split the
+/// response). Everything else (including obs-text) is passed through.
+fn validHeaderValue(value: []const u8) bool {
+    for (value) |c| if (c == '\r' or c == '\n' or c == 0) return false;
+    return true;
+}
+
 /// Canonical reason phrase for common status codes; "" when unknown (the
 /// status line stays valid: "HTTP/1.1 599 \r\n").
 pub fn reasonPhrase(status: u16) []const u8 {
@@ -1647,6 +1720,7 @@ const StreamTweaks = struct {
     on_conn_state: ?ConnStateFn = null,
     on_conn_state_ctx: ?*anyopaque = null,
     compression: ?Compression = null,
+    max_requests_per_conn: u32 = 0,
 };
 
 /// Run `serveStream` over canned wire bytes with small test buffers
@@ -1674,6 +1748,7 @@ fn runStreamWith(tweaks: StreamTweaks, ctx: ?*anyopaque, wire: []const u8, out_b
         .on_conn_state = tweaks.on_conn_state,
         .on_conn_state_ctx = tweaks.on_conn_state_ctx,
         .compression = tweaks.compression,
+        .max_requests_per_conn = tweaks.max_requests_per_conn,
     }, &in, &out, .{
         .head = &head_buf,
         .request_body = &request_body_buf,
@@ -1896,6 +1971,40 @@ test "ResponseWriter: header validation and managed headers" {
     try testing.expectError(error.HeadersSent, rw.setHeader("X-Late", "1"));
 }
 
+test "ResponseWriter: header CR/LF/NUL + invalid name rejected (response-splitting guard)" {
+    var out_buf: [256]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+
+    // Values that would inject a header / split the response (reflected
+    // Location redirect, echoed input, smuggled Set-Cookie).
+    try testing.expectError(error.InvalidHeader, rw.setHeader("Location", "/next\r\nSet-Cookie: pwned=1"));
+    try testing.expectError(error.InvalidHeader, rw.setHeader("X-Echo", "a\nb"));
+    try testing.expectError(error.InvalidHeader, rw.setHeader("X-Echo", "a\rb"));
+    try testing.expectError(error.InvalidHeader, rw.setHeader("X-Echo", "a\x00b"));
+    // Names that are not RFC 9110 tokens.
+    try testing.expectError(error.InvalidHeader, rw.setHeader("Bad Name", "x"));
+    try testing.expectError(error.InvalidHeader, rw.setHeader("X:Y", "x"));
+    try testing.expectError(error.InvalidHeader, rw.setHeader("X\r", "x"));
+    try testing.expectError(error.InvalidHeader, rw.setHeader("", "x"));
+
+    // A well-formed header still works — and the serialized bytes prove the
+    // injected header/value never reached the wire.
+    try rw.setHeader("X-Ok", "clean");
+    try rw.writeAll("body");
+    try rw.end();
+    const wire = out.buffered();
+    try testing.expect(std.mem.indexOf(u8, wire, "Set-Cookie") == null);
+    try testing.expect(std.mem.indexOf(u8, wire, "pwned") == null);
+    try testing.expectEqualStrings("HTTP/1.1 200 OK\r\n" ++
+        "X-Ok: clean\r\n" ++
+        "Content-Length: 4\r\n" ++
+        "\r\n" ++
+        "body", wire);
+}
+
 test "request codec: standalone parse + body decode from fixed bytes" {
     var in: Reader = .fixed("POST /up?k=v HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n" ++
         "3\r\nabc\r\n0\r\n\r\n");
@@ -2044,6 +2153,60 @@ test "serveStream: ConnState callback sees new→active→idle→active→closed
     _ = runStreamWith(.{ .on_conn_state = StateLog.record, .on_conn_state_ctx = &log }, null, "GET /hello HTTP/1.1\r\nHost: t\r\n\r\n" ++
         "GET /hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out_buf);
     try testing.expectEqualSlices(ConnState, &.{ .new, .active, .idle, .active, .closed }, log.saw[0..log.len]);
+}
+
+test "serveStream: Content-Length + Transfer-Encoding together → 400 (CL.TE smuggling guard)" {
+    var hits: Hits = .init(0);
+    var out_buf: [4096]u8 = undefined;
+    // Both framings present → rejected before the handler, connection closes.
+    const got = runStream(&hits, "POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n", &out_buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 400 Bad Request\r\n"));
+    try testing.expect(std.mem.indexOf(u8, got, "Connection: close\r\n") != null);
+    try testing.expectEqual(@as(u32, 0), hits.load(.monotonic)); // handler never ran
+    // Header order reversed is rejected identically.
+    const got2 = runStream(null, "POST /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n0\r\n\r\n", &out_buf);
+    try testing.expect(std.mem.startsWith(u8, got2, "HTTP/1.1 400 Bad Request\r\n"));
+}
+
+test "serveStream: request path normalized + traversal-clamped before routing" {
+    var out_buf: [4096]u8 = undefined;
+    // `..` and `.` segments collapse; the normalized path routes to /hello.
+    try testing.expect(std.mem.endsWith(u8, runStream(null, "GET /x/../hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out_buf), "\r\n\r\nhello"));
+    try testing.expect(std.mem.endsWith(u8, runStream(null, "GET /./hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out_buf), "\r\n\r\nhello"));
+    // A leading `..` is clamped at root (never escapes): `/../hello` → `/hello`.
+    try testing.expect(std.mem.endsWith(u8, runStream(null, "GET /../hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out_buf), "\r\n\r\nhello"));
+    // Query survives normalization of the path half.
+    const q = runStream(null, "GET /a/../hello?x=1 HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out_buf);
+    try testing.expect(std.mem.indexOf(u8, q, "X-Query: x=1\r\n") != null);
+    try testing.expect(std.mem.endsWith(u8, q, "\r\n\r\nhello"));
+    // Already-normal routes are byte-for-byte unaffected (404 path).
+    try testing.expect(std.mem.startsWith(u8, runStream(null, "GET /nope HTTP/1.1\r\nHost: t\r\n\r\n", &out_buf), "HTTP/1.1 404 Not Found\r\n"));
+}
+
+test "serveStream: NUL / encoded-NUL in the path → 400" {
+    var out_buf: [4096]u8 = undefined;
+    // Percent-encoded NUL: the parser passes it, normalization rejects it.
+    try testing.expect(std.mem.startsWith(u8, runStream(null, "GET /a%00b HTTP/1.1\r\nHost: t\r\n\r\n", &out_buf), "HTTP/1.1 400 Bad Request\r\n"));
+    // A raw NUL never even parses (control byte in the target) → 400.
+    try testing.expect(std.mem.startsWith(u8, runStream(null, "GET /a\x00b HTTP/1.1\r\nHost: t\r\n\r\n", &out_buf), "HTTP/1.1 400 Bad Request\r\n"));
+}
+
+test "serveStream: per-connection request cap closes the connection" {
+    var hits: Hits = .init(0);
+    var out_buf: [4096]u8 = undefined;
+    // Cap = 2 over three pipelined requests: two are served, the second
+    // carries Connection: close, and the third is never read.
+    const three = "GET /hello HTTP/1.1\r\nHost: t\r\n\r\n" ** 3;
+    const got = runStreamWith(.{ .max_requests_per_conn = 2 }, &hits, three, &out_buf);
+    try testing.expectEqual(@as(u32, 2), hits.load(.monotonic));
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, got, "HTTP/1.1 200 OK\r\n"));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "Connection: close\r\n"));
+
+    // Cap = 0 (unlimited): all three are served, none forced closed.
+    hits = .init(0);
+    const all = runStreamWith(.{ .max_requests_per_conn = 0 }, &hits, three, &out_buf);
+    try testing.expectEqual(@as(u32, 3), hits.load(.monotonic));
+    try testing.expect(std.mem.indexOf(u8, all, "Connection: close") == null);
 }
 
 // ── tests (offline — Phase 2.2 gzip response compression) ───────────────────

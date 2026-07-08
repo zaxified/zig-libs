@@ -51,6 +51,22 @@ try gate.addToken(new_token); // both valid now — migrate clients…
 gate.removeToken(primary_token); // …then retire the old one
 ```
 
+API-key auth (alone, or alongside bearer):
+
+```zig
+var gate = try aaa_gate.Gate.init(gpa, .{
+    .auth_mode = .either,                 // valid bearer OR valid API key
+    .token = bearer_token,                // bearer wins when both are valid
+    .api_key = primary_api_key,           // not retained (SHA-256 digest stored)
+    .extra_api_keys = &.{old_api_key},    // rotation set (addApiKey/removeApiKey too)
+    .api_key_header = "X-Api-Key",         // default; rename for a custom header
+    .api_key_query_param = "api_key",     // optional fallback ?api_key=… (header wins)
+    // Dynamic store instead of / in addition to the static set:
+    // .api_key_verify = myVerify,        // must compare in constant time
+    // .api_key_verify_ctx = &my_store,   // use aaa_gate.secretEqual inside it
+});
+```
+
 In a handler behind the gate:
 
 ```zig
@@ -76,6 +92,23 @@ middleware's `state` points at it).
   (`realm="…"` when configured), plain-text body, chain short-circuited.
   Pass → an `Identity` on `ctx.data` (the slot `router` reserved for
   this module; restored after the chain), then `next`.
+- **API-key scheme (`auth_mode`).** Besides bearer, the gate accepts an
+  API key. `Options.auth_mode` selects `.bearer` (default — unchanged),
+  `.api_key`, or `.either`. The key arrives in the `X-Api-Key` header
+  (rename via `api_key_header`) or, when `api_key_query_param` is set, as
+  that query parameter (verbatim, not percent-decoded; header wins). It is
+  checked against the configured set (`api_key` ∪ `extra_api_keys`,
+  rotatable at runtime via `addApiKey`/`removeApiKey`) with the **same**
+  SHA-256 + `std.crypto.timing_safe.eql` constant-time compare as bearer,
+  or by an `api_key_verify` callback (dynamic store — must itself compare
+  in constant time; use the exported `secretEqual`). A failed API-key
+  attempt is audited and throttled **exactly** like a failed bearer
+  attempt (same 401, same `WWW-Authenticate`, same denied-request
+  coalescing). In `.either` a valid bearer **or** a valid API key passes;
+  **bearer takes precedence** (checked first, its `Identity.scheme` wins
+  when both are valid). The open plane applies per mode: open only when no
+  credential for the active mode(s) is configured. `Identity.scheme` is
+  `.bearer`, `.api_key`, or `.open`.
 - **`protect` default = `.all`** — every method is gated. This is a
   deliberate deviation from the seed (which gated only mutations):
   secure by default for a standalone auth layer. `.mutations` restores

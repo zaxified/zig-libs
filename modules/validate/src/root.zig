@@ -299,10 +299,23 @@ pub fn validateValue(gpa: Allocator, value: Value, schema: []const Rule) Allocat
     return b.finish();
 }
 
-/// Parse a JSON document and validate it. Malformed JSON (syntax error,
-/// truncation, empty input, over-deep nesting) yields a single `json_invalid`
-/// error — never a panic, never a parse crash.
+/// Parse a JSON document and validate it, with the default structural
+/// `Limits` applied first. Malformed JSON (syntax error, truncation, empty
+/// input) yields a single `json_invalid` error; a document that breaches a
+/// structural limit yields the matching `too_deep` / `array_too_large` /
+/// `too_many_fields` / `too_many_nodes` error (see `validateJsonLimited`) —
+/// never a panic, never a parse crash.
 pub fn validateJson(gpa: Allocator, body: []const u8, schema: []const Rule) Allocator.Error!Report {
+    return validateJsonLimited(gpa, body, schema, .{});
+}
+
+/// Like `validateJson`, but with caller-chosen structural `Limits`. The body
+/// is first scanned by a fail-fast token walk (`jsonLimitError`); a document
+/// that exceeds any bound is rejected *before* it is materialized into a
+/// value tree, so an over-limit payload cannot blow up memory/CPU (JSON DoS).
+/// Only when the scan passes is the document parsed and validated normally.
+pub fn validateJsonLimited(gpa: Allocator, body: []const u8, schema: []const Rule, limits: Limits) Allocator.Error!Report {
+    if (try jsonLimitError(gpa, body, limits)) |e| return singleErrorReport(gpa, e);
     var parsed = std.json.parseFromSlice(Value, gpa, body, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return jsonInvalidReport(gpa, err),
@@ -316,6 +329,198 @@ fn jsonInvalidReport(gpa: Allocator, err: anyerror) Allocator.Error!Report {
     errdefer b.abort();
     try b.appendf("", "json_invalid", "Invalid JSON: {s}", .{@errorName(err)});
     return b.finish();
+}
+
+/// A Report carrying exactly one (static-string) error — used for the
+/// structural-limit rejections, which are not tied to any schema field.
+fn singleErrorReport(gpa: Allocator, e: Error) Allocator.Error!Report {
+    var b = Builder.init(gpa);
+    errdefer b.abort();
+    try b.append(e.path, e.code, e.message);
+    return b.finish();
+}
+
+// ── JSON structural limits (DoS mitigation) ─────────────────────────────────
+//
+// The byte cap (`max_body_bytes` → 413) bounds size, not shape: a 1 MiB body
+// that is deeply nested brackets, one gigantic array, or one object with a
+// huge member count is cheap to send yet expensive to fully parse into a
+// std.json.Value tree (unbounded recursion / allocation). These limits are
+// enforced by a streaming token scan (`std.json.Scanner`) that rejects as
+// soon as a bound is crossed — the over-limit document is never materialized.
+// Clean-room: generic JSON-DoS mitigation, no third-party source.
+
+/// Structural bounds enforced during a fail-fast token scan of a JSON body,
+/// *before* it is parsed into a value tree. The defaults are generous enough
+/// for ordinary API payloads while still cutting off pathological shapes, and
+/// are applied by every JSON body path in this module out of the box.
+pub const Limits = struct {
+    /// Maximum nesting depth of objects/arrays (the top-level container is
+    /// depth 1). Deeper → `too_deep`.
+    max_depth: usize = 32,
+    /// Maximum number of elements in any single array. Over → `array_too_large`.
+    max_array_elements: usize = 10_000,
+    /// Maximum number of members in any single object. Over → `too_many_fields`.
+    max_object_members: usize = 1_000,
+    /// Maximum total JSON value nodes (scalars + containers; object keys are
+    /// not counted). Over → `too_many_nodes`. Set to a very large value to
+    /// effectively disable this overall cap.
+    max_total_nodes: usize = 1_000_000,
+};
+
+const limit_too_deep: Error = .{ .path = "", .code = "too_deep", .message = "JSON nesting is too deep" };
+const limit_array_too_large: Error = .{ .path = "", .code = "array_too_large", .message = "JSON array has too many elements" };
+const limit_too_many_fields: Error = .{ .path = "", .code = "too_many_fields", .message = "JSON object has too many members" };
+const limit_too_many_nodes: Error = .{ .path = "", .code = "too_many_nodes", .message = "JSON document has too many nodes" };
+
+const ContainerKind = enum { object, array };
+
+/// Streaming structural-scan state: one `Frame` per currently-open container.
+/// The frame stack never grows past `max_depth` (we reject on the token that
+/// would exceed it), so it is bounded regardless of input size.
+const LimitScan = struct {
+    gpa: Allocator,
+    limits: Limits,
+    frames: std.ArrayList(Frame),
+    nodes: usize = 0,
+
+    const Frame = struct {
+        kind: ContainerKind,
+        /// Array elements or object members seen so far in this container.
+        count: usize = 0,
+        /// Objects only: the next item token is a key (vs. that key's value).
+        expect_key: bool = true,
+    };
+
+    fn top(s: *LimitScan) ?*Frame {
+        if (s.frames.items.len == 0) return null;
+        return &s.frames.items[s.frames.items.len - 1];
+    }
+
+    /// Register the start of one item — a value, or an object key. Sets
+    /// `is_value` (false only for an object key) and returns the first limit
+    /// violation, or null. Values bump the total-node count; keys do not.
+    fn begin(s: *LimitScan, is_value: *bool) Allocator.Error!?Error {
+        if (s.top()) |t| {
+            if (t.kind == .object and t.expect_key) {
+                t.count += 1;
+                t.expect_key = false;
+                is_value.* = false;
+                if (t.count > s.limits.max_object_members) return limit_too_many_fields;
+                return null;
+            }
+            if (t.kind == .array) {
+                t.count += 1;
+                if (t.count > s.limits.max_array_elements) return limit_array_too_large;
+            }
+        }
+        is_value.* = true;
+        s.nodes += 1;
+        if (s.nodes > s.limits.max_total_nodes) return limit_too_many_nodes;
+        return null;
+    }
+
+    /// Register that a value finished (a scalar just read, or a container just
+    /// closed): its enclosing object may expect the next key again.
+    fn complete(s: *LimitScan) void {
+        if (s.top()) |t| {
+            if (t.kind == .object) t.expect_key = true;
+        }
+    }
+
+    /// Enter a nested container (always a value): count it, enforce depth,
+    /// then push its frame.
+    fn enter(s: *LimitScan, kind: ContainerKind) Allocator.Error!?Error {
+        var is_value: bool = undefined;
+        if (try s.begin(&is_value)) |v| return v;
+        if (s.frames.items.len + 1 > s.limits.max_depth) return limit_too_deep;
+        try s.frames.append(s.gpa, .{ .kind = kind });
+        return null;
+    }
+};
+
+/// Scan `body` for the first structural-limit violation without materializing
+/// it, returning a ready-to-report `Error` (all-static strings, path "") or
+/// null. A malformed document also returns null: the syntax error is left for
+/// the real parser to surface as `json_invalid`, so this never changes the
+/// diagnosis of bad JSON — it only adds the structural caps. Allocation is
+/// transient (the scanner's bit-stack), freed before return.
+pub fn jsonLimitError(gpa: Allocator, body: []const u8, limits: Limits) Allocator.Error!?Error {
+    var scanner = std.json.Scanner.initCompleteInput(gpa, body);
+    defer scanner.deinit();
+
+    var scan: LimitScan = .{ .gpa = gpa, .limits = limits, .frames = .empty };
+    defer scan.frames.deinit(gpa);
+
+    // std.json.Scanner emits strings (and, across escapes, numbers) as a run
+    // of partial_* tokens ending in the whole token, even for complete input.
+    // Collapse each run to a single item: act on its first token only.
+    var in_string = false;
+    var in_number = false;
+    var string_is_value = false;
+
+    while (true) {
+        const token = scanner.next() catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return null, // malformed JSON → defer to the parser's json_invalid
+        };
+        switch (token) {
+            .object_begin => if (try scan.enter(.object)) |v| return v,
+            .array_begin => if (try scan.enter(.array)) |v| return v,
+            .object_end, .array_end => {
+                _ = scan.frames.pop();
+                scan.complete();
+            },
+            .true, .false, .null => {
+                var is_value: bool = undefined;
+                if (try scan.begin(&is_value)) |v| return v;
+                scan.complete(); // scalars are always values, and complete at once
+            },
+            // A number is always a value; count it once at its first token.
+            .number, .allocated_number => {
+                if (!in_number) {
+                    var is_value: bool = undefined;
+                    if (try scan.begin(&is_value)) |v| return v;
+                }
+                in_number = false;
+                scan.complete();
+            },
+            .partial_number => {
+                if (!in_number) {
+                    var is_value: bool = undefined;
+                    if (try scan.begin(&is_value)) |v| return v;
+                    in_number = true;
+                }
+            },
+            // A string may be an object key or a value; count it once at its
+            // first token, and only complete() the value case.
+            .string, .allocated_string => {
+                if (in_string) {
+                    in_string = false;
+                    if (string_is_value) scan.complete();
+                } else {
+                    var is_value: bool = undefined;
+                    if (try scan.begin(&is_value)) |v| return v;
+                    if (is_value) scan.complete();
+                }
+            },
+            .partial_string,
+            .partial_string_escaped_1,
+            .partial_string_escaped_2,
+            .partial_string_escaped_3,
+            .partial_string_escaped_4,
+            => {
+                if (!in_string) {
+                    var is_value: bool = undefined;
+                    if (try scan.begin(&is_value)) |v| return v;
+                    string_is_value = is_value;
+                    in_string = true;
+                }
+            },
+            .end_of_document => break,
+        }
+    }
+    return null;
 }
 
 /// Apply object-field rules to `value` (which must itself be an object).
@@ -986,6 +1191,18 @@ pub fn ParseResult(comptime T: type) type {
 /// errors, never as parse crashes; unknown fields are ignored (JSON Schema
 /// default). Only allocation errors propagate as Zig errors.
 pub fn parseInto(comptime T: type, gpa: Allocator, body: []const u8) Allocator.Error!ParseResult(T) {
+    return parseIntoLimited(T, gpa, body, .{});
+}
+
+/// Like `parseInto`, but with caller-chosen structural `Limits`. The body is
+/// scanned for limit breaches first (`jsonLimitError`) and rejected before it
+/// is materialized, so an over-limit payload becomes a clean validation error
+/// (`too_deep` / `array_too_large` / `too_many_fields` / `too_many_nodes`)
+/// instead of an expensive parse.
+pub fn parseIntoLimited(comptime T: type, gpa: Allocator, body: []const u8, limits: Limits) Allocator.Error!ParseResult(T) {
+    if (try jsonLimitError(gpa, body, limits)) |e|
+        return .{ .invalid = try singleErrorReport(gpa, e) };
+
     const schema = comptime rulesFor(T);
 
     var parsed = std.json.parseFromSlice(Value, gpa, body, .{}) catch |err| switch (err) {
@@ -1034,6 +1251,8 @@ pub const Body = struct {
     /// Request bodies beyond this answer 413 (the middleware buffers the
     /// body to parse it; `http.Server.max_body_bytes` caps the wire side).
     max_body_bytes: usize = 1 << 20,
+    /// Structural JSON caps enforced (fail-fast) before the body is parsed.
+    limits: Limits = .{},
 
     pub fn middleware(v: *const Body) router.Middleware {
         // state is a mutable pointer by type only — run() never writes.
@@ -1044,6 +1263,10 @@ pub const Body = struct {
         const v: *const Body = @ptrCast(@alignCast(state.?));
         const raw = (try readBody(ctx, v.gpa, v.max_body_bytes)) orelse return;
         defer v.gpa.free(raw);
+
+        // Structural DoS caps, enforced before the value tree is built.
+        if (try jsonLimitError(v.gpa, raw, v.limits)) |e|
+            return respondInvalid(ctx.res, &.{e}); // no next
 
         var parsed = std.json.parseFromSlice(Value, v.gpa, raw, .{}) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -1090,6 +1313,8 @@ pub fn TypedBody(comptime T: type) type {
         gpa: Allocator,
         /// See `Body.max_body_bytes`.
         max_body_bytes: usize = 1 << 20,
+        /// See `Body.limits`.
+        limits: Limits = .{},
 
         const Self = @This();
 
@@ -1109,7 +1334,7 @@ pub fn TypedBody(comptime T: type) type {
             const raw = (try readBody(ctx, v.gpa, v.max_body_bytes)) orelse return;
             defer v.gpa.free(raw);
 
-            var result = try parseInto(T, v.gpa, raw);
+            var result = try parseIntoLimited(T, v.gpa, raw, v.limits);
             defer result.deinit();
             switch (result) {
                 .invalid => |report| return respondInvalid(ctx.res, report.errors), // no next
@@ -1810,6 +2035,122 @@ test "malformed JSON: clean json_invalid error, never a panic" {
     }
 }
 
+// ── tests: JSON structural limits (DoS) ─────────────────────────────────────
+
+test "limits: depth beyond max_depth → too_deep, rejected before schema runs" {
+    // Schema demands a "name" field; the doc is over-deep AND lacks it. The
+    // fail-fast scan must win, yielding ONLY too_deep — proof the document is
+    // never parsed/validated against the schema.
+    const schema = [_]Rule{.{ .field = "name", .kind = .string, .required = true }};
+    var r = try validateJsonLimited(testing.allocator, "[[[[[[1]]]]]]", &schema, .{ .max_depth = 4 });
+    defer r.deinit();
+    try testing.expectEqual(@as(usize, 1), r.errors.len);
+    try expectError(&r, "", "too_deep");
+    try testing.expectEqualStrings("JSON nesting is too deep", r.errors[0].message);
+
+    // At the boundary (exactly max_depth) the scan passes → normal validation
+    // runs (root is an array, not an object → object_type, not too_deep).
+    var ok = try validateJsonLimited(testing.allocator, "[[[[1]]]]", &schema, .{ .max_depth = 4 });
+    defer ok.deinit();
+    try expectError(&ok, "", "object_type");
+}
+
+test "limits: array beyond max_array_elements → array_too_large" {
+    const schema = [_]Rule{.{ .field = "x", .kind = .int }};
+    var r = try validateJsonLimited(testing.allocator, "{\"x\":[1,2,3,4]}", &schema, .{ .max_array_elements = 3 });
+    defer r.deinit();
+    try testing.expectEqual(@as(usize, 1), r.errors.len);
+    try expectError(&r, "", "array_too_large");
+
+    var ok = try validateJsonLimited(testing.allocator, "{\"x\":1}", &schema, .{ .max_array_elements = 3 });
+    defer ok.deinit();
+    try testing.expect(ok.ok()); // 3-or-fewer arrays fine; x=1 passes .int
+}
+
+test "limits: object beyond max_object_members → too_many_fields" {
+    const schema = [_]Rule{.{ .field = "a", .kind = .int }};
+    var r = try validateJsonLimited(testing.allocator, "{\"a\":1,\"b\":2,\"c\":3}", &schema, .{ .max_object_members = 2 });
+    defer r.deinit();
+    try testing.expectEqual(@as(usize, 1), r.errors.len);
+    try expectError(&r, "", "too_many_fields");
+
+    // Nested object members are counted per-object, not globally.
+    var nested = try validateJsonLimited(testing.allocator, "{\"a\":1,\"b\":{\"p\":1,\"q\":2}}", &schema, .{ .max_object_members = 2 });
+    defer nested.deinit();
+    try testing.expect(nested.ok());
+}
+
+test "limits: total node cap → too_many_nodes" {
+    const schema = [_]Rule{.{ .field = "x", .kind = .any }};
+    // Object(node) + array(node) + 3 ints = 5 value nodes; keys don't count.
+    var r = try validateJsonLimited(testing.allocator, "{\"x\":[1,2,3]}", &schema, .{ .max_total_nodes = 4 });
+    defer r.deinit();
+    try testing.expectEqual(@as(usize, 1), r.errors.len);
+    try expectError(&r, "", "too_many_nodes");
+
+    var ok = try validateJsonLimited(testing.allocator, "{\"x\":[1,2,3]}", &schema, .{ .max_total_nodes = 5 });
+    defer ok.deinit();
+    try testing.expect(ok.ok());
+}
+
+test "limits: a document within limits parses and validates as usual" {
+    const schema = [_]Rule{
+        .{ .field = "name", .kind = .string, .required = true, .min_len = 1 },
+        .{ .field = "tags", .kind = .array, .items = &.{ .field = "", .kind = .string } },
+    };
+    // Well within every default bound.
+    var good = try validateJson(testing.allocator,
+        \\{"name":"ok","tags":["a","b","c"]}
+    , &schema);
+    defer good.deinit();
+    try testing.expect(good.ok());
+
+    // Escaped strings (which the scanner emits as partial-token runs) are
+    // handled: keys and values both counted correctly, no false positive.
+    var esc = try validateJsonLimited(testing.allocator,
+        \\{"na\tme":"a\"b","tags":["x\ny"]}
+    , &([_]Rule{.{ .field = "tags", .kind = .array }}), .{ .max_object_members = 2, .max_array_elements = 2 });
+    defer esc.deinit();
+    try testing.expect(esc.ok());
+}
+
+test "limits: defaults protect a caller who sets nothing (via validateJson)" {
+    const schema = [_]Rule{.{ .field = "x", .kind = .int }};
+    // 40 levels of nesting > the default max_depth of 32 → rejected out of the
+    // box, no explicit Limits passed.
+    const deep = ("[" ** 40) ++ ("]" ** 40);
+    var r = try validateJson(testing.allocator, deep, &schema);
+    defer r.deinit();
+    try testing.expectEqual(@as(usize, 1), r.errors.len);
+    try expectError(&r, "", "too_deep");
+}
+
+test "limits: malformed JSON still surfaces json_invalid, not a limit code" {
+    const schema = [_]Rule{.{ .field = "x", .kind = .int }};
+    // Over-deep for this tiny limit AND truncated: the scan defers to the
+    // parser, so the diagnosis stays json_invalid.
+    var r = try validateJsonLimited(testing.allocator, "{\"a\":", &schema, .{ .max_depth = 1 });
+    defer r.deinit();
+    try expectError(&r, "", "json_invalid");
+}
+
+test "limits: parseIntoLimited rejects over-limit body before decoding T" {
+    var result = try parseIntoLimited(Widget, testing.allocator,
+        \\{"name":"n","qty":1,"tags":["a","b","c","d"]}
+    , .{ .max_array_elements = 2 });
+    defer result.deinit();
+    try testing.expect(result == .invalid);
+    try testing.expectEqual(@as(usize, 1), result.invalid.errors.len);
+    try expectError(&result.invalid, "", "array_too_large");
+}
+
+test "limits: jsonLimitError is null within bounds, set past them" {
+    try testing.expectEqual(@as(?Error, null), try jsonLimitError(testing.allocator, "{\"a\":[1,2,3]}", .{}));
+    const v = (try jsonLimitError(testing.allocator, "[1,2,3,4,5]", .{ .max_array_elements = 4 })).?;
+    try testing.expectEqualStrings("array_too_large", v.code);
+    try testing.expectEqualStrings("", v.path);
+}
+
 test "golden: the 400 error-body JSON is well-formed and byte-stable" {
     const schema = [_]Rule{
         .{ .field = "name", .kind = .string, .required = true },
@@ -2209,6 +2550,28 @@ test "Body middleware: over-limit body → 413" {
     ), &buf);
     try expectStatus(got, "413");
     try testing.expect(std.mem.indexOf(u8, got, "\"code\":\"too_large\"") != null);
+    try testing.expect(!probe.invoked);
+}
+
+test "Body middleware: structurally over-limit body → 400 too_deep, handler NOT invoked" {
+    var probe: Probe = .{};
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &probe;
+    const body_mw: Body = .{
+        .gpa = testing.allocator,
+        .schema = &thing_schema,
+        .limits = .{ .max_depth = 3 },
+    };
+    try r.use(body_mw.middleware());
+    try r.post("/things", hEchoBody);
+
+    var buf: [2048]u8 = undefined;
+    const got = runWire(&r, postWire("/things",
+        \\{"a":{"b":{"c":{"d":1}}}}
+    ), &buf);
+    try expectStatus(got, "400");
+    try testing.expect(std.mem.indexOf(u8, got, "\"code\":\"too_deep\"") != null);
     try testing.expect(!probe.invoked);
 }
 
