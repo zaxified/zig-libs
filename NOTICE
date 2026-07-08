@@ -208,9 +208,10 @@ audit is pending before any public release.
                §5.4.6 class bits + §3.2 uint value format, the §6 URI ↔ options
                mapping (with RFC 3986 percent-encoding), and the §4 message
                layer (§4.2 Confirmable retransmission timers, §4.5 message-ID
-               deduplication, §4.8 transmission parameters). No third-party CoAP
-               source (libcoap, aiocoap, californium, …) was consulted or
-               copied.
+               deduplication, §4.8 transmission parameters), and the §5
+               request/response model (token/message-id correlation §5.3,
+               piggybacked/separate responses §5.2). No third-party CoAP source
+               (libcoap, aiocoap, californium, …) was consulted or copied.
 
   snmp       — clean-room from RFC 1157 (SNMPv1), RFC 1905/3416 (SNMPv2c
                protocol operations), RFC 2578 (SMI types) and ITU-T X.690

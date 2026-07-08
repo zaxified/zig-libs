@@ -52,6 +52,14 @@ pub const options = @import("options.zig");
 /// empty-ACK / Reset helpers — transport- and clock-agnostic.
 pub const reliability = @import("reliability.zig");
 
+/// The client layer (C4): request building (URI → options → datagram) + reply
+/// correlation (`Client`, `Exchange`, `Match`).
+pub const client = @import("client.zig");
+
+/// The server layer (C5): request dispatch (`isRequest`) + response building
+/// (`piggyback` / `ackOnly` / `Server.separate`).
+pub const server = @import("server.zig");
+
 /// CoAP version in the 2-bit Ver field (always 1 for RFC 7252).
 pub const version = 1;
 

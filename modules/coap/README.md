@@ -63,15 +63,33 @@ it with an absolute `now_ms` and its own socket):
   (window from first sight, soonest-to-expire eviction when full).
 - **`emptyAck(mid)` / `reset(mid)`** and the §4.8 `Params` / `exchange_lifetime_ms`.
 
+## Client / server (`coap.client`, `coap.server`)
+
+The §5 request/response endpoints, transport-agnostic (the caller owns the UDP
+socket and drives a `reliability.Retransmit`):
+
+- **`client.Client`** — `buildRequest(method, uri, .{payload, content_format,
+  accept, confirmable}, …)` turns a URI into a sorted-option datagram + an
+  `Exchange` (fresh message id + token). `Exchange.match(msg)` correlates a
+  reply: `piggybacked` / `separate` / `empty_ack` / `reset` / `unrelated`
+  (§5.3.2, by token + message id).
+- **`server`** — `isRequest(msg)` gates routing; `piggyback(req, code, opts,
+  payload)` builds the ACK-carried response, `ackOnly(req)` the bare ACK, and
+  `Server.separate(...)` a fresh-id CON/NON response (§5.2). Route with
+  `options.uriPath`, dedup with `reliability.Dedup`.
+
 ## Scope
 
-Done: the message codec (C1) + typed options / URI mapping (C2) + the §4
-reliability layer (C3). Follow-ups: the client (C4) / server (C5) over a UDP
-seam; block-wise transfer (RFC 7959) and Observe (RFC 7641) later.
+Done: the full client/server stack — message codec (C1), typed options / URI
+mapping (C2), the §4 reliability layer (C3), and the §5 client (C4) / server
+(C5). Follow-ups: block-wise transfer (RFC 7959) and Observe (RFC 7641).
 
 ## Verification
 
-`zig build test-coap` — 35 offline tests. Reliability (9): the retransmit
+`zig build test-coap` — 42 offline tests. Client/server (7): `buildRequest`
+option assembly + counter advance, `Exchange.match` across all five reply
+kinds, NON typing, `isRequest` gating, `piggyback`/`ackOnly`/`separate`
+builders, and an end-to-end client→server→client round-trip. Reliability (9): the retransmit
 schedule (jitter selection, the full 4-retransmit backoff to `timed_out`,
 `ack`/`onReset`, custom `max_retransmit`) and the dedup window (fresh/duplicate,
 expiry-from-first-sight, independence, full-storage eviction). Codec (7): a hand-built CON GET

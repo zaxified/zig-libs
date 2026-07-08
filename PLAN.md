@@ -350,8 +350,11 @@ options/payload, `parse`/`serialize`/`encodedLen`, zero-alloc, transport-agnosti
 Max-Age/Uri-Path/Uri-Query), §6 URI↔options mapping (`optionsFromUri`/`uriFromOptions`); Fable, 19 tests.
 **C3 ✅** `coap.reliability` — CON retransmission w/ exponential backoff + deterministic jitter (§4.2),
 message-ID dedup window (§4.5), empty-ACK/RST helpers, §4.8 params; clock-agnostic (caller `now_ms`,
-offline-testable); Fable, 9 tests. Remaining: C4 client · C5 server (both Opus-inline — join C1-C3 over a
-UDP seam, not value-add spec; C6/C7 block-wise + observe deferred).
+offline-testable); Fable, 9 tests. **C4 ✅** `coap.client` (Opus) — `buildRequest` (URI→options→datagram,
+sorted, token/mid counters) + `Exchange.match` reply correlation (piggybacked/separate/empty-ack/reset by
+token+mid §5.3.2), 3 tests. **C5 ✅** `coap.server` (Opus) — `isRequest` + `piggyback`/`ackOnly`/
+`Server.separate` response builders (§5.2), 4 tests incl. end-to-end client↔server. **coap C1–C5 = full
+client/server stack.** Deferred: C6 block-wise (RFC 7959) + C7 observe (RFC 7641).
 · 5. **MQTT broker** (large) — G IoT hub.
 Extraction backlog (Opus, NOT Fable — low/no value-add headroom): `rawsock` (axp `openPacketCapture`
 AF_PACKET layer is REAL) · data-family (dataset/tabular/jsonshape/finstats; **`roquery` has a security-
