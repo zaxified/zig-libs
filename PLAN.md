@@ -383,8 +383,10 @@ varbinds, zero error slots; `NotAnInform` otherwise); Opus, 3 tests. **T-D ✅**
 envelope + ScopedPDU framing (encode/decode, `MsgFlags`, plaintext/noAuthNoPriv; encryptedPDU captured for
 T-G) + a `message.decodePdu`/`encodePdu` refactor; Opus, 7 tests. **T-E ✅** `snmp.usm` — RFC 3414 §2.4
 `UsmSecurityParameters` (de)serializer (engineID/boots/time/user/auth/priv; overflow-guarded; parse+encode);
-Fable, 8 tests. **Remaining:** T-F auth (HMAC+key-loc) + T-G priv (DES/AES) + T-H engine/time-window ·
-4. 🟡 **coap** RFC 7252
+Fable, 8 tests. **T-F ✅** USM auth (`snmp.usm`) — password→user-key (RFC 3414 A.2 1 MB expansion) + engine
+localization + HMAC-MD5-96 / HMAC-SHA-1-96 `computeDigest`/`sign`/`verify` (constant-time compare via
+`std.crypto.timing_safe.eql`; verified against the RFC 3414 A.3 MD5+SHA-1 KATs; adversarial tamper tests);
+Fable(rescued), 11 tests. **Remaining:** T-G priv (DES/AES) + T-H engine/time-window · 4. 🟡 **coap** RFC 7252
 (med) — G IoT: split C1–C5. **C1 ✅** NEW `coap` module — message codec (header/token/delta-encoded
 options/payload, `parse`/`serialize`/`encodedLen`, zero-alloc, transport-agnostic; Fable, 7 tests). **C2 ✅**
 `coap.options` — §5.10 registry + class bits, CoAP uint (§3.2), typed accessors (Content-Format/Accept/
