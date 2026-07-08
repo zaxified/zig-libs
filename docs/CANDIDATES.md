@@ -59,6 +59,60 @@ except sqlite). Extract in dependency order — `dataset` is the anchor everythi
 
 ---
 
+## Candidate audit — production-app unlocks (2026-07-09)
+
+Two research sweeps (sibling-repo seeds + Zig-ecosystem adopt-vs-build) against five product archetypes
+(① HTTP/SaaS backend · ② netops platform · ③ IoT gateway · ④ AI-agent/MCP backend · ⑤ data/analytics).
+
+### ADOPT — mature pure-Zig libs; wire as `deps`, do NOT rebuild (verified early-2026)
+| Capability | Adopt | Notes |
+|---|---|---|
+| PostgreSQL (wire v3) | `karlseguin/pg.zig` (MIT, ~577★, master→0.16) | pooling + TLS; **the backend DB unlock is free** |
+| SQLite | `vrischmann/zig-sqlite` / `karlseguin/zqlite.zig` (MIT) | poc already uses it; substrate for `roquery` + job-queue |
+| MySQL/MariaDB | `speed2exe/myzql` (MIT) | only option; smaller community |
+| SMTP | `karlseguin/smtp_client.zig` (MIT) | TLS-1.2 caveat (SES) — recheck on 0.16 std TLS |
+| WebSocket | `karlseguin/websocket.zig` (MIT) | both roles; upgrades from our http |
+| protobuf | `Arwalk/zig-protobuf` (MIT, ~420★) | de-facto; enables a gRPC build over our h2 |
+| TOML | `mattyhall/tomlz` (MIT) | config |
+| Template (mustache) | `batiati/mustache-zig` (MIT) | Jinja-style logic engine still absent (BUILD if needed) |
+| Regex | `mnemnion/mvzr` (no captures) / `zig-utils/zig-regex` (captures) | (was already ADOPT) |
+| Structured logging | `karlseguin/log.zig` (MIT) | logfmt/JSON; cleanest "just use it" |
+| S3 | `lobo/aws-sdk-for-zig` (MIT, →0.16) | SigV4 built in; awkward packaging |
+| Redis/Valkey | `kristoff-it/zig-okredis` — **PARTIAL (alpha)** | best design, API churn |
+| YAML | `pwbh/ymlz` — **PARTIAL** (no full 1.2) | fine for tame config |
+
+### BUILD — genuine gaps worth zig-libs owning (new candidates from the audit)
+- **`procrun`** ⭐ (extract, ~900 L, `bxp/bxp-gui-bridge/src/main.zig`) — hardened subprocess runner:
+  capped/streaming stdout+stderr, cancel/kill, a fixed cross-platform double-reap race. Unlocks agent
+  tool-runners / CI / sandboxed exec / ETL shell-outs (universal). Medium extract. **Not previously listed.**
+- **`jobqueue`** (BUILD med, SQLite-backed) — durable lease/retry/dead-letter queue + a scheduler exec
+  loop (adopt `dying-will-bullet/cron` for parsing; note 0.16 removed `Thread.sleep` → drive via
+  `clock_gettime`+timerfd). Nothing durable exists pure-Zig. Unlocks ①③ background work. The axp
+  **`taskqueue`** seed (offline-device FIFO C2, `axp-central/store.zig nextPendingTask`) is the
+  file-based cousin — fold in or ship as a lighter sibling.
+- **`sessions`** (BUILD small, greenfield on `cookies`) — signed/rotating session store + CSRF-token
+  middleware. No lib, no seed. Completes ① stateful web.
+- **`filestore`** (extract small, `axp-central/src/store.zig` ~196 L) — one-file-per-record JSON store;
+  a third storage shape between `kv` (binary log) and `blobstore` (CAS). Add atomic temp+rename on lift.
+- **`syslog`** (BUILD small-med) — RFC 5424 sender + receiver; netops ingest, no lib/seed. Unlocks ②.
+- **`llmclient`** (BUILD small-med) — Anthropic/OpenAI client over our `http`+`sse`+`std.json` (types +
+  streaming). Unlocks ④; cheap on what we own.
+- **`ssh`** (BUILD large / bind `libssh2` first) — device-config automation next to snmp/modbus/netlink.
+  Pure-Zig SSH is huge; start as a hardened binding + a Zig automation API. Unlocks ② netops.
+- **`grpc`** (BUILD large-but-contained) — gRPC framing/streaming/status over our **existing HTTP/2** +
+  adopted `zig-protobuf`. No trustworthy pure-Zig gRPC. Unlocks microservice interop.
+- Deferred/optional: Kafka (large / bind librdkafka) · full YAML 1.2 · Jinja template engine · IMAP
+  (only if a product ingests mail) · **reconcile/drift** `Reconcilable(T)` (generalize axp
+  `resource.zig` desired/applied-generation + anti-brick rollback — a k8s-controller-lite for
+  config-mgmt/fleet apps).
+
+### Archetype readiness after adopting + building the above
+① backend → **near-complete** (adopt pg+smtp+ws+log+toml, build sessions + jobqueue). ⑤ data → the wgs
+family (seeds ready) + roquery. ③ IoT → jobqueue/taskqueue + MQTT broker (backlog). ④ AI-agent → llmclient.
+② netops → syslog + ssh + finish SNMP T-G/T-H.
+
+---
+
 ## Packaging decision (settle first — blocks repo shape)
 
 `zig fetch` **cannot** target a subdirectory of a git repo ([#23012](https://github.com/ziglang/zig/issues/23012), still open). So a GitHub dep URL is the **repo root**, never `.../zig-libs/modules/http`. Note: per-module *import* ≠ per-module *zon* — you get per-module import from a single package via named modules.
