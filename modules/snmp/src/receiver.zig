@@ -154,6 +154,43 @@ pub const Dispatcher = struct {
     }
 };
 
+/// `ackInform` errors: any encoder failure (`error.BufferTooSmall`), plus
+/// `NotAnInform` when the event is not an InformRequest.
+pub const AckError = ber.EncodeError || error{NotAnInform};
+
+/// Build the Response acknowledgement for an InformRequest (RFC 3416 §4.2.7):
+/// a Response-PDU echoing the inform's request-id, error-status = 0,
+/// error-index = 0, and the **identical** variable-bindings. Only informs are
+/// acknowledged — a v1/v2c Trap yields `error.NotAnInform`.
+///
+/// The response is written into `buf` (aligned to its END — the BER encoder
+/// writes backwards) and the encoded slice is returned; send those bytes back
+/// to the notifier's source address. The variable-bindings are copied verbatim
+/// from `event` (byte-faithful), so `event` must still borrow its datagram.
+pub fn ackInform(event: TrapEvent, buf: []u8) AckError![]const u8 {
+    if (event.kind != .inform) return error.NotAnInform;
+    const request_id = event.request_id orelse return error.NotAnInform;
+
+    var e = ber.Encoder.init(buf);
+
+    // variable-bindings: re-wrap the inform's raw varbind-list content verbatim.
+    const list_mark = e.len();
+    try e.prependBytes(event.varbinds.bytes);
+    try e.wrap(ber.tag.sequence, list_mark);
+
+    // error-index = 0, error-status = 0, request-id (echoed).
+    try e.prependInteger(ber.tag.integer, 0);
+    try e.prependInteger(ber.tag.integer, 0);
+    try e.prependInteger(ber.tag.integer, request_id);
+    try e.wrap(@intFromEnum(message.PduType.response), 0);
+
+    // community + version, then the outer message SEQUENCE.
+    try e.prependTlv(ber.tag.octet_string, event.community);
+    try e.prependInteger(ber.tag.integer, @intFromEnum(event.version));
+    try e.wrap(ber.tag.sequence, 0);
+    return e.encoded();
+}
+
 // ── tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -294,4 +331,55 @@ test "Dispatcher: routes a decoded event to the handler; skips it on error" {
     const req = try message.encode(&buf, .v2c, "public", .{ .type = .get_request, .request_id = 9 });
     try testing.expectError(error.NotATrap, d.dispatch(req));
     try testing.expectEqual(@as(usize, 1), ctx.count); // unchanged
+}
+
+test "ackInform: Response echoes request-id, zero error slots, identical varbinds" {
+    var in_buf: [128]u8 = undefined;
+    const trap_oid = try Oid.parse("1.3.6.1.6.3.1.1.5.3");
+    const inform = try encodeV2cNotify(&in_buf, .inform_request, 4242, 99, trap_oid);
+    const ev = try parseTrap(inform);
+    const inform_vb_bytes = ev.varbinds.bytes;
+
+    var ack_buf: [128]u8 = undefined;
+    const ack = try ackInform(ev, &ack_buf);
+
+    // The ack decodes as a v2c Response with the echoed request-id + zero errors.
+    const msg = try message.decode(ack);
+    try testing.expectEqual(message.Version.v2c, msg.version);
+    try testing.expectEqualStrings("public", msg.community);
+    const resp = msg.pdu.response;
+    try testing.expectEqual(@as(i32, 4242), resp.request_id);
+    try testing.expectEqual(message.ErrorStatus.no_error, resp.error_status);
+    try testing.expectEqual(@as(u32, 0), resp.error_index);
+    // Variable-bindings are byte-identical to the inform's.
+    try testing.expectEqualSlices(u8, inform_vb_bytes, resp.varbinds.bytes);
+    // And they still parse: snmpTrapOID.0 round-trips.
+    const ack_ev_oid = (TrapEvent{
+        .version = .v2c,
+        .community = "public",
+        .kind = .inform,
+        .request_id = 4242,
+        .varbinds = resp.varbinds,
+        .v1 = null,
+    }).snmpTrapOid().?;
+    try testing.expect(ack_ev_oid.eql(&trap_oid));
+}
+
+test "ackInform: refuses a non-inform notification" {
+    var buf: [128]u8 = undefined;
+    const dg = try encodeV2cNotify(&buf, .trap_v2, 1, 1, try Oid.parse("1.3.6.1.6.3.1.1.5.1"));
+    const ev = try parseTrap(dg);
+    var ack_buf: [128]u8 = undefined;
+    try testing.expectError(error.NotAnInform, ackInform(ev, &ack_buf));
+
+    const v1 = try parseTrap(&v1_trap_bytes);
+    try testing.expectError(error.NotAnInform, ackInform(v1, &ack_buf));
+}
+
+test "ackInform: buffer too small is a typed error, not a panic" {
+    var buf: [128]u8 = undefined;
+    const inform = try encodeV2cNotify(&buf, .inform_request, 7, 5, try Oid.parse("1.3.6.1.6.3.1.1.5.1"));
+    const ev = try parseTrap(inform);
+    var tiny: [8]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, ackInform(ev, &tiny));
 }

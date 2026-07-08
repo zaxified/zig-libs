@@ -81,6 +81,7 @@ pub const TrapEvent = receiver.TrapEvent;
 pub const TrapKind = receiver.TrapKind;
 pub const Dispatcher = receiver.Dispatcher;
 pub const parseTrap = receiver.parseTrap;
+pub const ackInform = receiver.ackInform;
 
 pub const Client = client_mod.Client;
 pub const Transport = client_mod.Transport;

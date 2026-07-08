@@ -8,7 +8,7 @@ Not a dumping ground: ship **solid, not many**. Most members are *extracted* fro
 across sibling projects (bxp, axp, zig-fping, poc-wf-analytic); a few fill genuine gaps in the Zig
 ecosystem.
 
-**Status:** 49 modules · 1394 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 49 modules · 1397 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ## Modules
@@ -53,7 +53,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `modbus` | Modbus TCP (MBAP) + RTU (CRC-16) codec + master client — core function codes, exceptions, transport-agnostic seam | any | — |
 | `mqtt` | MQTT 3.1.1 client — all 14 control packets, QoS 0/1/2 state machine, topic-filter wildcards, transport-agnostic seam | any | — |
 | `coap` | CoAP (RFC 7252) — a full client/server stack: message codec (header/token/**delta-encoded options**/payload), `options` (registry, CoAP uint, **URI ↔ options** §6), `reliability` (CON **retransmission** §4.2 + message-ID **dedup** §4.5), `client` (URI→request + reply correlation), `server` (dispatch + piggyback/separate responses). Zero-alloc, transport-/clock-agnostic (block-wise + observe are follow-ups) | any | — |
-| `snmp` | SNMP v1/v2c — BER/ASN.1 codec + OID + all 8 PDUs + manager client (get/next/bulk/set/walk) + a **trap/notification receiver** (v1 Trap / v2c Trap / Inform → one normalized `TrapEvent` + `Dispatcher`), transport-agnostic seam | any | — |
+| `snmp` | SNMP v1/v2c — BER/ASN.1 codec + OID + all 8 PDUs + manager client (get/next/bulk/set/walk) + a **trap/notification receiver** (v1 Trap / v2c Trap / Inform → one normalized `TrapEvent` + `Dispatcher` + `ackInform` byte-faithful Response ack), transport-agnostic seam | any | — |
 | `whois` | RFC 3912 whois client — query format + referral chasing (IANA→registrar) + field extraction, transport-agnostic seam | any | — |
 | `rdap` | RDAP client (RFC 7480–7484) — JSON-over-HTTPS whois successor: query URLs, typed response model, IANA bootstrap, fetch seam | any | http, netaddr |
 | `icmp` | ICMP echo (ping) engine — v4/v6 codec, batched socket, pacing | linux | seqmap, netaddr |

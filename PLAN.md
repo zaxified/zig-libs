@@ -377,9 +377,10 @@ fmt green. **Still open:** request-ID mw · health helper · conditional-req · 
    **`mcp-http` MCP HTTP/SSE transport is COMPLETE.** · 2. ✅ **upstream LB + health routing (+bulkhead)** DONE (`resilience.Bulkhead` + new `upstream` module: strategies/health/failover; 23 tests)
 — C gateway. Remaining: 3. **SNMP trap receiver + v3** (small-med) — A async alerts · **T-A ✅** `snmp.receiver`
 — decode+normalize v1 Trap / v2c Trap / Inform into one `TrapEvent` (sysUpTime/snmpTrapOID accessors,
-needsAck) + `Dispatcher`; transport-agnostic, on the existing decode layer; Opus, 7 tests. **Remaining:** T-B
-Inform ack (Response encode) · v3/USM T-D envelope + T-E USM params + T-F auth (HMAC+key-loc) + T-G priv
-(DES/AES) + T-H engine/time-window · 4. 🟡 **coap** RFC 7252
+needsAck) + `Dispatcher`; transport-agnostic, on the existing decode layer; Opus, 7 tests. **T-B ✅**
+`ackInform(event, buf)` — byte-faithful Response ack for an InformRequest (echoes request-id + verbatim
+varbinds, zero error slots; `NotAnInform` otherwise); Opus, 3 tests. **Remaining:** v3/USM T-D envelope +
+T-E USM params + T-F auth (HMAC+key-loc) + T-G priv (DES/AES) + T-H engine/time-window · 4. 🟡 **coap** RFC 7252
 (med) — G IoT: split C1–C5. **C1 ✅** NEW `coap` module — message codec (header/token/delta-encoded
 options/payload, `parse`/`serialize`/`encodedLen`, zero-alloc, transport-agnostic; Fable, 7 tests). **C2 ✅**
 `coap.options` — §5.10 registry + class bits, CoAP uint (§3.2), typed accessors (Content-Format/Accept/
