@@ -1,0 +1,52 @@
+# coap
+
+CoAP (RFC 7252) **message codec** — the binary wire format of the Constrained
+Application Protocol, the REST-over-UDP protocol used by constrained / IoT
+devices. This is the message layer (C1): `parse` and `serialize` a CoAP message
+— header, token, **delta-encoded options** and payload.
+
+Zero-allocation and transport-agnostic: `parse` fills a caller-provided option
+array from a datagram (values borrow the datagram); `serialize` writes a message
+into a caller buffer; `encodedLen` sizes it. Wire it to any UDP/DTLS transport.
+
+```zig
+var opts: [16]coap.Option = undefined;
+const msg = try coap.parse(datagram, &opts);
+// msg.type / msg.code / msg.message_id / msg.token / msg.options / msg.payload
+
+var out: [1152]u8 = undefined;
+const n = try coap.serialize(.{
+    .type = .confirmable, .code = .get, .message_id = 0x1234,
+    .options = &.{ .{ .number = 11, .value = "sensors" } }, // Uri-Path
+}, &out);
+```
+
+Codes carry their `class()`/`detail()` (`Code.content.class() == 2`), and any
+code builds with `Code.init(class, detail)`. Options are value-agnostic here —
+the typed registry (Uri-Path = 11, Content-Format = 12, …) is the next part.
+
+- **Status:** `gap`. **Role:** util. **Platform:** any. **Deps:** none (std
+  only). **Concurrency:** reentrant — no shared state; results borrow the
+  caller's buffers.
+
+Provenance: clean-room from RFC 7252 §3 (the CoAP message format: header /
+token / delta-encoded options / payload). No third-party CoAP source (libcoap,
+aiocoap, Californium, …) consulted or copied.
+
+## Scope
+
+Done: the message codec (C1). Follow-ups: the typed option registry + URI
+mapping (C2), the CON/ACK reliability + message-ID dedup layer (C3), and the
+client (C4) / server (C5); block-wise transfer (RFC 7959) and Observe
+(RFC 7641) later.
+
+## Verification
+
+`zig build test-coap` — 7 offline tests: a hand-built CON GET datagram with a
+token and repeated Uri-Path options round-trips to exact bytes; the extended
+option nibble forms across the 13 and 269 boundaries (incl. option number 300 →
+`0xE1 0x00 0x1F`); payload marker parse/serialize + a lone `0xFF` → EmptyPayload;
+the full parse-error matrix (TooShort / BadVersion / BadTokenLength / Truncated /
+BadOption / TooManyOptions) and serialize errors (OptionsNotSorted /
+BadTokenLength / BufferTooSmall); `encodedLen` agreement; `Code` helpers. Green
+in Debug + ReleaseFast.
