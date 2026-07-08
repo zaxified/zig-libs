@@ -18,12 +18,14 @@ new submodule to root.zig's `test { _ = … }` aggregator** — a bare `pub cons
 pull its tests in (see the dark-tests note under Decisions). **Agents never edit this file / commit /
 touch build.zig · README · PLAN · NOTICE — they report back; the owner verifies + commits.**
 
-## Status (2026-07-08)
+## Status (2026-07-09)
 
-**49 modules · 1423 tests** (1420 pass + 3 env-gated skips: ubus/wireguard/blobmsg live checks) ·
-Debug + ReleaseFast green · `zig fmt` clean · MIT. Latest commit `d57a667`.
+**52 modules · 1471 tests** (1468 pass + 3 env-gated skips: ubus/wireguard/blobmsg live checks) ·
+Debug + ReleaseFast green · `zig fmt` clean · MIT. Latest commit `b874389`.
 Web/API cluster, HTTP/1.1+HTTP/2 stack, `kv` (+VOPR), network family, crypto leaves, MCP (+HTTP/SSE
 transport), and the content-negotiation + Range/206 HTTP feature families are complete.
+**Extraction wave 1 landed 2026-07-09** (Opus-coordinated, agent-built): `blobstore` (`24833cf`),
+`procnet` (`b5bdc30`), `procrun` (`b874389`) — findings + reclassifications below.
 
 ## Working policy — extraction vs value-add
 
@@ -81,14 +83,16 @@ RFC codecs). Archetypes: ① HTTP/SaaS backend · ② netops · ③ IoT · ④ A
 ### EXTRACT → Opus (real seed; low value-add headroom, so no Fable)
 | Candidate | Unlocks | Why chosen |
 |---|---|---|
-| **`procrun`** ⭐ | universal (agent-tools/CI/ETL) | battle-tested subprocess + cross-platform reap-race fix (bxp-bridge) |
+| ✅ **`procrun`** ⭐ DONE `b874389` | universal (agent-tools/CI/ETL) | battle-tested subprocess + cross-platform reap-race fix (bxp-bridge). Extract-core + built the missing env/timeout/signal-escalation surface |
+| ✅ **`procnet`** DONE `b5bdc30` | ②/hardening | /proc+/sys parsers, typed netaddr returns + IPv6 (axp seed) |
+| ✅ **`blobstore`** DONE `24833cf` | ①/hardening | CAS store + put(reader)/verify/namespaced records (axp-vault seed) |
 | `dataset`→`tabular`→`jsonshape` | ⑤ (anchor family) | mature, tested wgs seeds; the analytics spine |
 | `roquery` | ⑤ + safe reporting | hardened read-only SQLite (adopts zig-sqlite); real security sliver |
 | `finstats` | ⑤ finance | wgs `finance.zig` is already advanced (VaR/sortino/monte-carlo) |
 | `filestore` | ① DB-less persist | third storage shape between `kv`/`blobstore`; add atomic rename |
 | `taskqueue` | ③ fleet C2 | proven offline-device job pattern (or fold into `jobqueue`) |
-| `rawsock` | ② capture/inject | real AF_PACKET in axp; base for l2disco/arp/icmp on the wire |
-| `procnet` · `argsafe` · `blobstore` | ②/hardening | /proc-parse · argv-injection guard · CAS store (axp seeds) |
+| ⚠️ `rawsock` → **reclassified BUILD** | ② capture/inject | seed is ~25 LOC receive-only (AF_PACKET open, duplicated 4× inline in axp); the real module — send/inject, BPF filter, promisc, iface enum — is mostly new construction, not extraction. Needs netns/root to verify |
+| ⚠️ `argsafe` → **reclassified BUILD** | hardening | no shared abstraction in the seed: 14 ad-hoc validator predicates across axp `task.zig`; the module is a *design consolidation* (composable `CharClass` + `safeArgv` builder), not a lift |
 | bxp text libs: `datefmt`·`tz`·`encoding`·`unaccent`·`numparse`·`json5`·`zipstream`·`csvstream`·`csvsafe`·`diagnostics` | ⑤ + i18n | copy-tier; `tz`/`encoding` have spec headroom → could be Fable |
 | `ipcbus`·`pollworker`·`chunkframe`·`lenframe`/`jsonwire` | same-host IPC | thin glue seeds (poc/axp) |
 
@@ -111,6 +115,20 @@ RFC codecs). Archetypes: ① HTTP/SaaS backend · ② netops · ③ IoT · ④ A
 | `grpc` (framing/streaming/status over our h2 + adopted protobuf) | microservices | no trustworthy pure-Zig; contained since we own h2 |
 | **MQTT broker** | ③ IoT hub | server side of `mqtt`; large protocol value-add |
 
+### Extraction wave-1 findings (2026-07-09) — deferred gaps, now backlog
+Each landed module shipped a spec-complete v1; these are the follow-ups the extraction surfaced
+(the point of the exercise — extract, and log where the seed was insufficient). All Opus-doable.
+- **`blobstore`**: GC / reachability sweep (`gc(keep)`) · reference counting for safe delete of a
+  blob shared by several manifests (today `delete` can dangle a reference) · configurable fan-out
+  depth for tens-of-millions-of-objects stores · cross-process locking (casCommit is check-then-
+  rename — harmless-since-identical, but the invariant should be documented/enforced).
+- **`procnet`**: `/proc/net/dev` iface byte/packet counters · `/proc/diskstats` · `/proc/<pid>/status`
+  (richer than `/stat`) · `/proc/net/ipv6_route` · statvfs/`/proc/mounts` disk usage (separate axis).
+- **`procrun`**: process-group/`setsid` + whole-tree kill (orphaned grandchildren) · rlimit (CPU/mem)
+  for sandboxed exec · streaming stdin after spawn (interactive protocols — wanted by `mcp` stdio) ·
+  line-delimited/NDJSON stdout mode · Windows reap-race coverage · compile-time double-wait guard ·
+  PATH-resolution policy + `argsafe` integration (once `argsafe` lands).
+
 ### Deferred / big commitments (decide per product need)
 `kafka` (large / bind librdkafka) · full **YAML 1.2** (upgrade ymlz) · **Jinja** template engine ·
 `imap` (only if a product ingests mail) · **`Reconcilable(T)`** (generalize axp `resource.zig`
@@ -118,8 +136,10 @@ desired/applied-generation + anti-brick rollback → k8s-controller-lite for con
 `kv` on-disk/MVCC/txn/ordered-scans · pure-Zig SSH (post-binding) · OPC-UA (huge, IoT).
 
 ### Recommended sequence
-1. **Wave 1 (cheap, high unlock, Opus, now):** `procrun` + `sessions`+CSRF → with adopted pg/smtp/ws/
-   log/toml this makes ① a deployable backend stack.
+0. ✅ **Extraction wave 1 (Opus, done 2026-07-09):** `procrun` + `procnet` + `blobstore`.
+1. **Wave 1 remainder (cheap, high unlock, Opus, now):** `sessions`+CSRF → with adopted pg/smtp/ws/
+   log/toml this makes ① a deployable backend stack. Then the `rawsock`/`argsafe` BUILDs (netops +
+   hardening) now that they're correctly scoped as build, not extract.
 2. **Wave 2 (Opus):** `jobqueue` · `llmclient` · `filestore`/`taskqueue`.
 3. **Big cheap win (Opus, parallel track):** the **wgs data family** (`dataset`→`tabular`→
    `jsonshape`→`roquery`→`finstats`) → unlocks ⑤ wholesale; seeds ready.
