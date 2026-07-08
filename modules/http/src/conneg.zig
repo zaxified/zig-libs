@@ -44,6 +44,7 @@
 
 const std = @import("std");
 const body = @import("body.zig");
+const Server = @import("Server.zig");
 
 /// The default quality when an element carries no `;q=` weight: `q=1` (RFC 9110
 /// §12.4.2), in milli-units.
@@ -207,6 +208,95 @@ pub fn parseQvalue(s: []const u8) ?u16 {
     }
     if (milli > q_max) return null;
     return milli;
+}
+
+// ── N2: negotiate a representation against the client's Accept (RFC 9110 §12.5.1) ──
+
+/// The outcome of `negotiate`: which server offer won, and the quality the
+/// client assigned it.
+pub const Negotiated = struct {
+    /// Index of the winning entry in the `offers` slice passed to `negotiate`.
+    index: usize,
+    /// The winning media type (aliases `offers[index]`).
+    media_type: []const u8,
+    /// The `q` weight (milli-units, 1..1000) of the most-specific `Accept`
+    /// range that selected this offer. `q_default` when the client sent no
+    /// `Accept` (everything is acceptable).
+    weight: u16,
+};
+
+/// Choose the best representation for the client's `Accept` header from the
+/// server's `offers` (concrete `type/subtype` media types, in server-preference
+/// order — earlier = preferred on ties). Returns null → the caller responds
+/// **406 Not Acceptable** (no offer matched, or every match was `q=0`).
+///
+/// Per RFC 9110 §12.5.1: an offer's quality is the weight of the **most
+/// specific** `Accept` range that matches it (`type/subtype` beats `type/*`
+/// beats `*/*`); the winner is the acceptable offer with the highest such
+/// weight, ties broken by server preference (offer order). An absent/empty
+/// `Accept` (no ranges) means "anything" — the first well-formed offer wins at
+/// `q_default`.
+pub fn negotiate(accept_header: []const u8, offers: []const []const u8) ?Negotiated {
+    // Step A — empty-Accept shortcut: no ranges at all means the client
+    // accepts anything → the first well-formed offer wins at q_default.
+    var probe = accept(accept_header);
+    if (probe.next() == null) {
+        for (offers, 0..) |offer, i| {
+            if (splitType(offer) == null) continue;
+            return .{ .index = i, .media_type = offer, .weight = q_default };
+        }
+        return null;
+    }
+
+    // Step B — score each offer independently by the most specific matching
+    // range, then keep the highest-weight acceptable offer (ties → earliest).
+    var best: ?Negotiated = null;
+    for (offers, 0..) |offer, i| {
+        const ot = splitType(offer) orelse continue; // skip malformed offers
+        // Find this offer's best-matching range: highest specificity, then
+        // (on equal specificity) highest weight, then earliest position.
+        var matched = false;
+        var best_spec: i8 = -1;
+        var best_weight: u16 = 0;
+        var it = accept(accept_header);
+        while (it.next()) |mr| {
+            if (!mr.matches(ot.type, ot.subtype)) continue;
+            const spec: i8 = mr.specificity();
+            if (!matched or spec > best_spec or (spec == best_spec and mr.weight > best_weight)) {
+                matched = true;
+                best_spec = spec;
+                best_weight = mr.weight;
+            }
+        }
+        if (!matched or best_weight == 0) continue; // unacceptable (no match / q=0)
+        // Keep the highest-weight offer; ties → earliest (so strict >).
+        if (best == null or best_weight > best.?.weight) {
+            best = .{ .index = i, .media_type = offer, .weight = best_weight };
+        }
+    }
+    return best;
+}
+
+/// Convenience over `negotiate` reading the request's `Accept` header directly
+/// (absent header → treated as "anything", so the first offer wins).
+pub fn negotiateContentType(req: *const Server.Request, offers: []const []const u8) ?Negotiated {
+    return negotiate(req.header("accept") orelse "", offers);
+}
+
+/// A concrete `type/subtype` split of a server offer.
+const TypePair = struct { type: []const u8, subtype: []const u8 };
+
+/// Split an offered media type `type/subtype` (OWS-trimmed, both parts
+/// non-empty). Returns null for a malformed offer (no `/`, empty half). Any
+/// `;`-parameters on the offer are ignored (an offer is matched by type only).
+fn splitType(mt: []const u8) ?TypePair {
+    const semi = std.mem.indexOfScalar(u8, mt, ';');
+    const range = std.mem.trim(u8, if (semi) |i| mt[0..i] else mt, " \t");
+    const slash = std.mem.indexOfScalar(u8, range, '/') orelse return null;
+    const type_ = std.mem.trim(u8, range[0..slash], " \t");
+    const subtype_ = std.mem.trim(u8, range[slash + 1 ..], " \t");
+    if (type_.len == 0 or subtype_.len == 0) return null;
+    return .{ .type = type_, .subtype = subtype_ };
 }
 
 const testing = std.testing;
@@ -401,4 +491,133 @@ test "parse: fills the prefix in header order" {
     try testing.expectEqual(@as(usize, 2), capped.len);
     try testing.expectEqualStrings("a", capped[0].type);
     try testing.expectEqualStrings("d", capped[1].subtype);
+}
+
+test "negotiate: most specific range wins" {
+    const offers = [_][]const u8{ "text/html", "text/plain" };
+    const n = negotiate("text/*;q=0.5, text/html;q=0.8", &offers).?;
+    // text/html gets the specific range's q=0.8 (beats the text/* range);
+    // text/plain only matches text/* at q=0.5.
+    try testing.expectEqual(@as(usize, 0), n.index);
+    try testing.expectEqualStrings("text/html", n.media_type);
+    try testing.expectEqual(@as(u16, 800), n.weight);
+}
+
+test "negotiate: highest weight across offers" {
+    const offers = [_][]const u8{ "text/html", "application/json" };
+    const n = negotiate("application/json;q=0.9, text/html;q=0.4", &offers).?;
+    try testing.expectEqual(@as(usize, 1), n.index);
+    try testing.expectEqualStrings("application/json", n.media_type);
+    try testing.expectEqual(@as(u16, 900), n.weight);
+}
+
+test "negotiate: server preference breaks a weight tie" {
+    const offers = [_][]const u8{ "application/json", "text/html" };
+    const n = negotiate("*/*", &offers).?;
+    try testing.expectEqual(@as(usize, 0), n.index);
+    try testing.expectEqualStrings("application/json", n.media_type);
+    try testing.expectEqual(q_default, n.weight);
+}
+
+test "negotiate: q=0 excludes an offer" {
+    // The only offer's most-specific match is q=0 → nothing acceptable.
+    const only = [_][]const u8{"text/html"};
+    try testing.expect(negotiate("text/*, text/html;q=0", &only) == null);
+
+    // With a second offer, the excluded one is skipped and text/plain wins
+    // via the text/* range at q=1000.
+    const offers = [_][]const u8{ "text/html", "text/plain" };
+    const n = negotiate("text/*, text/html;q=0", &offers).?;
+    try testing.expectEqual(@as(usize, 1), n.index);
+    try testing.expectEqualStrings("text/plain", n.media_type);
+    try testing.expectEqual(@as(u16, 1000), n.weight);
+}
+
+test "negotiate: no matching range -> null" {
+    const offers = [_][]const u8{"text/html"};
+    try testing.expect(negotiate("application/json", &offers) == null);
+}
+
+test "negotiate: empty Accept -> first well-formed offer at q_default" {
+    const offers = [_][]const u8{ "text/html", "application/json" };
+    const n = negotiate("", &offers).?;
+    try testing.expectEqual(@as(usize, 0), n.index);
+    try testing.expectEqualStrings("text/html", n.media_type);
+    try testing.expectEqual(q_default, n.weight);
+
+    // Whitespace/comma-only header also counts as "no ranges".
+    const ws = negotiate("  , ,\t", &offers).?;
+    try testing.expectEqual(@as(usize, 0), ws.index);
+
+    // Malformed leading offer is skipped even on the empty-Accept path.
+    const bad_first = [_][]const u8{ "garbage", "application/json" };
+    const nb = negotiate("", &bad_first).?;
+    try testing.expectEqual(@as(usize, 1), nb.index);
+    try testing.expectEqual(q_default, nb.weight);
+
+    // No well-formed offer at all → null.
+    const all_bad = [_][]const u8{ "garbage", "/x", "y/" };
+    try testing.expect(negotiate("", &all_bad) == null);
+}
+
+test "negotiate: malformed offer is skipped" {
+    const offers = [_][]const u8{ "garbage", "text/html" };
+    const n = negotiate("text/html", &offers).?;
+    try testing.expectEqual(@as(usize, 1), n.index);
+    try testing.expectEqualStrings("text/html", n.media_type);
+    try testing.expectEqual(q_default, n.weight);
+}
+
+test "negotiate: offer parameters are ignored when matching" {
+    const offers = [_][]const u8{"text/html;charset=utf-8"};
+    const n = negotiate("text/html", &offers).?;
+    try testing.expectEqual(@as(usize, 0), n.index);
+    // media_type aliases the offer verbatim, params and all.
+    try testing.expectEqualStrings("text/html;charset=utf-8", n.media_type);
+    try testing.expectEqual(q_default, n.weight);
+}
+
+test "negotiateContentType: reads the request's Accept header" {
+    const offers = [_][]const u8{ "text/html", "application/json" };
+
+    var body_none: Server.RequestBody = .{ .none = .fixed("") };
+    const req: Server.Request = .{
+        .method = .get,
+        .target = "/",
+        .path = "/",
+        .query = "",
+        .head = .{
+            .method = "GET",
+            .target = "/",
+            .http1_0 = false,
+            .header_block = "Accept: application/json\r\n",
+        },
+        .body = &body_none,
+        .context = null,
+    };
+    const n = negotiateContentType(&req, &offers).?;
+    try testing.expectEqual(@as(usize, 1), n.index);
+    try testing.expectEqualStrings("application/json", n.media_type);
+    try testing.expectEqual(q_default, n.weight);
+
+    // Absent Accept header → "anything" → the first offer wins.
+    var body_none2: Server.RequestBody = .{ .none = .fixed("") };
+    const bare: Server.Request = .{
+        .method = .get,
+        .target = "/",
+        .path = "/",
+        .query = "",
+        .head = .{
+            .method = "GET",
+            .target = "/",
+            .http1_0 = false,
+            .header_block = "",
+        },
+        .body = &body_none2,
+        .context = null,
+    };
+    const nb = negotiateContentType(&bare, &offers).?;
+    try testing.expectEqual(@as(usize, 0), nb.index);
+    try testing.expectEqualStrings("text/html", nb.media_type);
+    try testing.expectEqual(q_default, nb.weight);
 }

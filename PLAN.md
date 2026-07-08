@@ -341,10 +341,11 @@ fmt green. **Still open:** request-ID mw · health helper · conditional-req · 
   `bodyLen` in lockstep with `writeBody`, streaming `writePartHeader`/`writeClose`; Opus, 5 tests).
   **Range/206 is now COMPLETE.** · ✅ **Content-negotiation N1** (`http.conneg`, RFC 9110 §12.5.1 — `Accept`
   media-range + q-value parser: `MediaRange` type/subtype/weight(milli-units)/params, `matches`+wildcards,
-  `specificity`, lenient `accept` iterator + `parse`, `parseQvalue`; Fable, 17 tests). **Still open:** conneg
-  **N2** (negotiate: server offers × client prefs → best, precedence + specificity + weight) + **N3**
-  (`Accept-Language` RFC 4647 basic-filtering + `Accept-Encoding` identity/`*` rules) · response-trailer write ·
-  HTTP/3 (large, deferred/never).
+  `specificity`, lenient `accept` iterator + `parse`, `parseQvalue`; Fable, 17 tests). · ✅ **N2** (RFC 9110
+  §12.5.1 — `negotiate(accept, offers) ?Negotiated`: most-specific matching range → highest weight →
+  server-preference tie-break, drops no-match/`q=0`, null → 406; + `negotiateContentType(req, offers)`
+  convenience; Fable, 9 tests). **Still open:** conneg **N3** (`Accept-Language` RFC 4647 basic-filtering +
+  `Accept-Encoding` identity/`*` rules) · response-trailer write · HTTP/3 (large, deferred/never).
 - 🐛 **Test-wiring audit (2026-07-08):** found that a `pub const x = @import("x.zig")` re-export does NOT pull
   the imported file's `test` blocks into the module test binary — they run only when referenced from a
   `test { _ = x; }` block (or refAllDecls). `http` (conditional/body/multipart/sse/range = 57 tests) and `coap`
