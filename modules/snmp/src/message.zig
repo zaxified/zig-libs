@@ -197,7 +197,15 @@ pub fn decode(bytes: []const u8) DecodeError!Message {
     const pdu_tlv = try m.any();
     if (!m.done()) return error.TrailingData;
 
-    const pdu: Pdu = switch (pdu_tlv.tag) {
+    return .{ .version = version, .community = community, .pdu = try decodePdu(pdu_tlv) };
+}
+
+/// Decode one bare PDU TLV (the `[n] IMPLICIT SEQUENCE` body of an SNMP
+/// message) into the typed `Pdu` union. Used by `decode` for v1/v2c messages
+/// and by the v3 layer for the ScopedPDU's inner PDU. `error.UnknownPduType`
+/// for an unrecognized context tag.
+pub fn decodePdu(pdu_tlv: ber.Tlv) DecodeError!Pdu {
+    return switch (pdu_tlv.tag) {
         @intFromEnum(PduType.get_request) => .{ .get_request = try parseBasic(pdu_tlv.content) },
         @intFromEnum(PduType.get_next_request) => .{ .get_next_request = try parseBasic(pdu_tlv.content) },
         @intFromEnum(PduType.response) => .{ .response = try parseBasic(pdu_tlv.content) },
@@ -208,7 +216,6 @@ pub fn decode(bytes: []const u8) DecodeError!Message {
         @intFromEnum(PduType.trap_v2) => .{ .trap_v2 = try parseBasic(pdu_tlv.content) },
         else => return error.UnknownPduType,
     };
-    return .{ .version = version, .community = community, .pdu = pdu };
 }
 
 const PduFields = struct {
@@ -308,8 +315,20 @@ pub fn encode(
     community: []const u8,
     pdu: EncodePdu,
 ) EncodeError![]const u8 {
-    if (pdu.type == .trap_v1) return error.UnsupportedPdu;
     var e = ber.Encoder.init(buf);
+    try encodePdu(&e, pdu);
+    try e.prependTlv(ber.tag.octet_string, community);
+    try e.prependInteger(ber.tag.integer, @intFromEnum(version));
+    try e.wrap(ber.tag.sequence, 0);
+    return e.encoded();
+}
+
+/// Prepend one bare PDU TLV (varbind list + the three INTEGER slots, wrapped in
+/// the PDU's context tag) onto `e`. The building block shared by the v1/v2c
+/// `encode` and the v3 ScopedPDU builder. The v1 Trap-PDU has a different shape
+/// and is not encodable here (`error.UnsupportedPdu`).
+pub fn encodePdu(e: *ber.Encoder, pdu: EncodePdu) EncodeError!void {
+    if (pdu.type == .trap_v1) return error.UnsupportedPdu;
 
     const list_mark = e.len();
     var i = pdu.varbinds.len;
@@ -327,11 +346,6 @@ pub fn encode(
     try e.prependInteger(ber.tag.integer, pdu.error_status);
     try e.prependInteger(ber.tag.integer, pdu.request_id);
     try e.wrap(@intFromEnum(pdu.type), 0);
-
-    try e.prependTlv(ber.tag.octet_string, community);
-    try e.prependInteger(ber.tag.integer, @intFromEnum(version));
-    try e.wrap(ber.tag.sequence, 0);
-    return e.encoded();
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────

@@ -63,6 +63,10 @@ pub const message = @import("message.zig");
 /// v2c SNMPv2-Trap and InformRequest datagrams into a `TrapEvent`.
 pub const receiver = @import("receiver.zig");
 
+/// SNMPv3 message framing (RFC 3412): the message envelope + ScopedPDU at the
+/// plaintext / noAuthNoPriv level. USM security (RFC 3414) builds on top.
+pub const v3 = @import("v3.zig");
+
 const client_mod = @import("client.zig");
 
 // Convenience re-exports of the surface types.
@@ -83,6 +87,10 @@ pub const Dispatcher = receiver.Dispatcher;
 pub const parseTrap = receiver.parseTrap;
 pub const ackInform = receiver.ackInform;
 
+pub const V3Message = v3.V3Message;
+pub const ScopedPdu = v3.ScopedPdu;
+pub const MsgFlags = v3.MsgFlags;
+
 pub const Client = client_mod.Client;
 pub const Transport = client_mod.Transport;
 pub const TransportError = client_mod.TransportError;
@@ -95,6 +103,7 @@ test {
     _ = message;
     _ = client_mod;
     _ = receiver;
+    _ = v3;
 }
 
 test "meta is well-formed" {
