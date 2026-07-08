@@ -1,10 +1,30 @@
-# zig-libs — module plan & discussion
+# zig-libs — candidate catalog
 
-Working doc to discuss each candidate module **one at a time**. Skeleton is this repo
-(`zig build test` green, Zig 0.16.0). Durable index = CML memory `project_zig_libs_catalog.md`.
+The durable catalog of module candidates: what each is, why, its **`Model after:`** reference
+and **`Seed:`** source (the sibling-project code it was extracted from — provenance kept here).
+The forward roadmap and shipped-work status live in [`../PLAN.md`](../PLAN.md); the cross-project
+index is CML memory `project_zig_libs_catalog.md`. The detail below is preserved as-written (the
+`Decision:` fields are the original discussion notes).
 
-Each entry: **`name`** ⚡(if perf-critical) `status·platform·role·concurrency` — what it does & why.
-Then deps / model-after / seed / a **Decision:** field to fill during discussion.
+Each entry: **`name`** ⚡(if perf-critical) `status·platform·role·concurrency` — what it does & why,
+then deps / model-after / seed / **Decision:**.
+
+## Status (2026-07-08) — reconciliation
+
+**✅ BUILT (49 shipped modules)** — the root `README.md` table is authoritative for what exists
+and each module's current description. Several shipped modules (`jwt`, `acme`, `upstream`,
+`health`, `requestid`, `tracecontext`, `webhooksig`, `idempotency`, `linkheader`, `cookies`,
+content-negotiation `conneg`, `range`, `mcp-http`) were added beyond this original catalog.
+
+**☐ OPEN candidates (not yet built)** — the extraction / gap backlog, from the catalog below:
+`rawsock` (AF_PACKET — a cleaner base for `icmp`/`l2disco`) · `stun` · `sntp` · `ipcbus` ·
+`pollworker` · `chunkframe` · `lenframe`/`jsonwire` · `zipstream` · `json5` · `blobstore` ·
+`numparse` · `datefmt` · `tz` · `encoding` · `unaccent` · `finstats` · `procnet` · `argsafe` ·
+`diagnostics` · `csvstream` · `csvsafe` · `exprcalc` (capstone) · `testkit` (shared verify harness).
+These — plus the not-yet-finished app-elevation items (SNMP privacy/time-window T-G/T-H, MQTT
+broker) and the ADOPT decisions below — are the input to the next **candidate audit**.
+
+Each entry's tags below use this vocabulary:
 
 **Tags** — status: `extract` (seeded in our code, carve out) · `gap` (missing in Zig) · `adopt` (good Zig lib exists, don't build).
 platform: `any` (cross-OS) · `posix` · `linux` (raw syscalls/no-libc — conscious ceiling).

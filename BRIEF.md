@@ -52,13 +52,14 @@ This brief is self-contained — you do not need any other context to work here.
 ```
 build.zig          # registers each module by name + `test` / `test-<name>` steps
 build.zig.zon      # one manifest for the whole collection
-CONVENTIONS.md     # naming + meta tags + sublib rule
-BRIEF.md           # this file
-PLAN.md            # execution plan (waves, tasks, definition-of-done)
-SPEC-<name>.md     # detailed spec per module being built
-zig-libs-plan.md   # full candidate catalog + per-module discussion notes
+CONVENTIONS.md       # naming + meta tags + sublib rule
+BRIEF.md             # this file
+PLAN.md              # roadmap: status, in-flight, backlog, decisions, definition-of-done
+NOTICE               # canonical provenance + third-party design-refs + licenses
+docs/CANDIDATES.md   # full candidate catalog + per-module Model-after / Seed / discussion
+docs/spec/SPEC-*.md  # historical/partial design specs (older modules; see docs/spec/README.md)
 modules/
-  _template/       # copy to start a module
+  _template/         # copy to start a module
   <name>/src/root.zig + README.md
 ```
 
