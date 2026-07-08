@@ -34,6 +34,31 @@ Deps `(std)` = use Zig 0.16 std, don't rebuild.
 
 ---
 
+## wgs data/compute family (candidates, added 2026-07-07 from the `~/workspace/wgs` survey)
+
+A foundational columnar-dataframe stack, well-factored + tested in wgs (pure `std`, arena, no libc
+except sqlite). Extract in dependency order — `dataset` is the anchor everything else imports.
+
+- **`dataset`** (anchor) `extract·any·util·reent` — canonical columnar table `{columns,rows}` +
+  5-variant `Value` union (null/int/float/text/bool), eql/order/asFloat, projection, compact binary
+  ser/de, toJson, ISO-date helpers. Seed: wgs `src/dataset.zig` (~434 L). Deps: (std). **Decision:** —
+- **`tabular`** `extract·any·util·reent` — generic `dataset→dataset` algebra: map/aggregate(+fx)/
+  weighted_group_sum/sort/top_n/pivot/resample + cumsum/drawdown/rolling/pct_change/rebase/ffill/
+  merge/join/date_part. Seed: wgs `src/transforms.zig` (~879) + `src/series.zig` (~522). Dep: `dataset`.
+- **`jsonshape`** `extract·any·codec·reent` — JSON→dataset reshaper (dot-path to array node, typed
+  column projection). Seed: wgs `src/jsonshape.zig` (~222). Deps: `dataset` + `std.json`.
+- **`roquery`** (security) `extract·any·util·block` — hardened read-only SQLite→rows:
+  `SQLITE_OPEN_READONLY` + `PRAGMA query_only` + authorizer allow-list (deny ATTACH/PRAGMA/writes/DDL/
+  load_extension) + hard row cap + `:name` binding. **Has a real security-hardening value-add sliver.**
+  Seed: wgs `src/sqlite.zig` (~296). Deps: sqlite amalgamation + `dataset`. libc (sqlite).
+- **`finstats`** ⚡ — build on `dataset`, seeding from wgs `src/finance.zig` (~802: xirr/twr/
+  risk_metrics/beta_alpha/monte_carlo/correlation_matrix/drawdown_episodes, fully tested) — far more
+  mature than the earlier poc-wf source. Only Brinson/factor attribution missing (marginal). Dep: `dataset`.
+- Note: wgs carries a redundant 2nd cache copy (`src/cache.zig` vs `deps/ramcache`) — consolidate onto
+  the extracted `ramcache` when wgs adopts the lib (housekeeping, not a new module).
+
+---
+
 ## Packaging decision (settle first — blocks repo shape)
 
 `zig fetch` **cannot** target a subdirectory of a git repo ([#23012](https://github.com/ziglang/zig/issues/23012), still open). So a GitHub dep URL is the **repo root**, never `.../zig-libs/modules/http`. Note: per-module *import* ≠ per-module *zon* — you get per-module import from a single package via named modules.

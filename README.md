@@ -22,7 +22,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 |---|---|---|
 | `http` | HTTP/1.1 client (TLS via `std.crypto.tls`) **and** server, hardened for direct exposure (peer addr, conn caps, size limits, slowloris timeouts, gzip, **conditional requests** ETag/If-\* → 304/412, **request-body parsing** — `Content-Type`, urlencoded, **multipart/form-data** RFC 7578, **Server-Sent Events** encoder + incremental `flush()`, **inbound gzip** request bodies (zip-bomb-capped), **multiple Set-Cookie**, chunked-trailer capture, **`Range` / 206 Partial Content** RFC 7233 — `bytes=` parser + resolve-against-length → `Content-Range` + 206/416 response staging + `multipart/byteranges` body for multi-range requests, **content negotiation** — `Accept` / `Accept-Language` (RFC 4647) / `Accept-Encoding` parsers + `negotiate` server-offers→best-match / 406, RFC 9110 §12.5). Also speaks **HTTP/2** (bidirectional, TLS-deployable) — HPACK (RFC 7541) + framing/flow-control (RFC 9113) + a **DoS-hardened h2c server** + a **multiplexing h2 client** + an **ALPN/bring-your-own-TLS seam**. Not `std.http`. | netaddr |
 | `router` | REST routing — trie matcher (params/wildcards), middleware chain, groups, 404/405 | http |
-| `ratelimit` | Token-bucket per-client rate limit → 429 + Retry-After | router, http |
+| `ratelimit` | Token-bucket per-client rate limit → 429 + Retry-After | router, http, netaddr |
 | `abuseguard` | Per-IP + global connection caps, ban/greylist, strike→ban (accept-time) | http, netaddr, router |
 | `throttle` | Global concurrency limit + load-shedding → 503 | router, http |
 | `security-headers` | Secure-by-default response headers (HSTS/CSP/nosniff/frame/referrer/COOP/CORP) | router, http |

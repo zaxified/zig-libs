@@ -76,6 +76,12 @@ audit is pending before any public release.
                (Accept-Language basic filtering). Clean-room
                from the RFCs, no HPACK/HTTP-2/nghttp2 source consulted or
                copied; TLS via Zig std.crypto.tls.
+               The HTTP/1.1 client shape was extracted from the authors' axp
+               project (axp-core/src/httpclient.zig + http.zig; Apache-2.0,
+               relicensed MIT by the copyright holder). Design refs (behavior
+               only, no source copied): lalinsky/dusty (MIT; the 1.1 client
+               shape) and Go net/http (BSD-3-Clause; redirect semantics,
+               server shape, gzip handler).
   dns        — RFC 1035 (wire), RFC 8484 (DoH), RFC 2782 (SRV), RFC 8659
                (CAA); design ref: miekg/dns (BSD-3-Clause) + c-ares —
                behavior only, no source copied.
@@ -124,6 +130,15 @@ audit is pending before any public release.
                route-metadata→spec mapping); document format per the
                OpenAPI Specification 3.1.0 (Apache-2.0, OpenAPI
                Initiative). Behavior only, no source copied.
+  metrics    — design ref: Prometheus client_golang (Apache-2.0; the
+               counter/gauge/histogram registry model); wire format per the
+               Prometheus text exposition format 0.0.4 / OpenMetrics spec.
+               Behavior only, no source copied.
+  validate   — design ref: pydantic v2 (MIT) and go-playground/validator
+               (MIT; the field-rule + aggregated-error model); schema
+               semantics per JSON Schema draft 2020-12; the string `format`
+               vocabulary per RFC 5321/3986/1123/3339/6901. Behavior only,
+               no source copied.
 
   netlink    — kernel UAPI headers (linux/netlink.h, linux/rtnetlink.h,
                linux/if_link.h, linux/if_addr.h, linux/neighbour.h,

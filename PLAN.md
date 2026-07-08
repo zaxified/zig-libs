@@ -88,8 +88,12 @@ zig-libs ships the **good** (RFC/spec-complete) version of each library, not a c
 
 ## Pre-public checklist (not started — deferred per user 2026-07-08)
 
-- ✅ License/provenance audit (SPDX on all files, Provenance on all READMEs, NOTICE complete).
-- ✅ README module index (kept current).
+- ✅ SPDX on every source file · Provenance line in every module README (incl. `probe`, added
+  2026-07-08) · README module index kept current.
+- 🟡 NOTICE covers all third-party design-refs + code lineage (metrics/validate/http gaps closed
+  2026-07-08 doc-audit); a final completeness sweep — the NOTICE policy for pure-clean-room-from-RFC
+  modules (whois/rdap/tar), the `Provenance:` line format consistency (13 modules use a bold-list
+  variant), and the latency-stats/dns citation nits — is folded into the security/similarity review.
 - ☐ **Security / similarity review pass** (adversarial multi-agent, Opus 4.8): `acme` JWS/CSR ·
   `aaa-gate`/`jwt` const-time + alg-confusion + JWKS smuggling + rotation · `snmp.usm` const-time +
   md5/sha1 alg-confusion · `kv` fault-sweep · `http` redirect/auth-strip + h2 DoS + the parser cluster
