@@ -64,8 +64,12 @@ audit is pending before any public release.
                clean-room from RFC 9110 sec 8.8/13; the HTTP-date parser
                follows RFC 9110 sec 5.6.7 (all three formats) with the
                days-from-civil epoch conversion (Howard Hinnant's public
-               algorithm). Clean-room from the RFCs, no HPACK/HTTP-2/nghttp2
-               source consulted or copied; TLS via Zig std.crypto.tls.
+               algorithm). Request-body parsing is clean-room from RFC 9110
+               sec 5.6.6 (Content-Type media type + parameters), the WHATWG URL
+               application/x-www-form-urlencoded rules, and RFC 7578 / RFC 2046
+               sec 5.1 (multipart/form-data). Clean-room from the RFCs, no
+               HPACK/HTTP-2/nghttp2 source consulted or copied; TLS via Zig
+               std.crypto.tls.
   dns        — RFC 1035 (wire), RFC 8484 (DoH), RFC 2782 (SRV), RFC 8659
                (CAA); design ref: miekg/dns (BSD-3-Clause) + c-ares —
                behavior only, no source copied.

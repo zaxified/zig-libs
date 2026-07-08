@@ -301,7 +301,12 @@ fmt green. **Still open:** request-ID mw · health helper · conditional-req · 
   `If-None-Match` / `If-Modified-Since` / `If-Unmodified-Since` → 304 / 412 (optimistic-concurrency guard),
   `parseHttpDate` (all 3 HTTP-date formats), `apply()` handler helper (auto-emits ETag; 304 body-drop via
   the server core). +16 tests incl. serveStream goldens (Fable value-add, 2026-07-08).
-- 🟡 **multipart/form-data + x-www-form-urlencoded** body parsing (if the API takes forms/uploads). **medium · Fable.**
+- ✅ **multipart/form-data + x-www-form-urlencoded** body parsing — split 3 ways: **P1+P2** `http.body`
+  (Opus: `ContentType.parse` quoted-string-aware media-type+params RFC 9110 §5.6.6 + urlencoded in-place
+  decoder, +8 tests, `b4f4ec2`) · **P3** `http.multipart` (Fable: RFC 7578 buffer-based parser — boundary
+  state machine, per-part name/filename/Content-Type via `body.ContentType`, DoS limits max_parts/
+  max_header_bytes, binary-safe zero-copy part bodies, +8 tests). Streaming variant deferred (buffer bound
+  = upstream body-size limit).
 - 🟡 **JWT/JWKS OAuth2/OIDC resource-server** — split into 6 committable parts (large, Fable, NEW `jwt`
   module). **P1 ✅** (parse + claims, 19 tests) · **P2 ✅** (HS/ES/EdDSA verify + RFC 7515/8037 KATs +
   RFC 8725 alg-confusion defenses + `parseAndVerify`, +12 tests) · **P3 ✅** (RS256/384/512 via std

@@ -96,9 +96,14 @@ pub const Server = @import("Server.zig");
 pub const conditional = @import("conditional.zig");
 
 /// Request-body helpers: the `Content-Type` media-type + parameter parser and
-/// an `application/x-www-form-urlencoded` decoder. The streaming
-/// `multipart/form-data` parser lives in `multipart`.
+/// an `application/x-www-form-urlencoded` decoder. The `multipart/form-data`
+/// parser lives in `multipart`.
 pub const body = @import("body.zig");
+
+/// `multipart/form-data` body parser (RFC 7578): iterate a form's parts —
+/// field `name`, optional `filename`, `Content-Type`, and raw (binary-safe)
+/// value — from a size-bounded in-memory body.
+pub const multipart = @import("multipart.zig");
 
 // ── request vocabulary ──────────────────────────────────────────────────────
 
