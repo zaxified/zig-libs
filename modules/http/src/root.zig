@@ -113,6 +113,10 @@ pub const sse = @import("sse.zig");
 /// `bytes=` byte-range-set into validated `ByteRangeSpec`s (range/from/suffix).
 pub const range = @import("range.zig");
 
+/// Proactive content negotiation (RFC 9110 §12): the `Accept` media-range +
+/// q-value parser (N1) — media-ranges with integer milli-unit weights.
+pub const conneg = @import("conneg.zig");
+
 // ── request vocabulary ──────────────────────────────────────────────────────
 
 pub const Method = enum {
@@ -427,6 +431,7 @@ test {
     _ = multipart;
     _ = sse;
     _ = range;
+    _ = conneg;
 }
 
 test "protocolFromAlpn: exact ALPN ids dispatch, anything else is unknown" {
