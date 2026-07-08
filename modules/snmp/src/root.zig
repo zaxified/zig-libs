@@ -59,6 +59,10 @@ pub const oid = @import("oid.zig");
 /// SNMP message + PDU model (v1 + v2c).
 pub const message = @import("message.zig");
 
+/// Trap / notification receiver (manager side): decode + normalize v1 Trap,
+/// v2c SNMPv2-Trap and InformRequest datagrams into a `TrapEvent`.
+pub const receiver = @import("receiver.zig");
+
 const client_mod = @import("client.zig");
 
 // Convenience re-exports of the surface types.
@@ -73,6 +77,11 @@ pub const GenericTrap = message.GenericTrap;
 pub const Message = message.Message;
 pub const Pdu = message.Pdu;
 
+pub const TrapEvent = receiver.TrapEvent;
+pub const TrapKind = receiver.TrapKind;
+pub const Dispatcher = receiver.Dispatcher;
+pub const parseTrap = receiver.parseTrap;
+
 pub const Client = client_mod.Client;
 pub const Transport = client_mod.Transport;
 pub const TransportError = client_mod.TransportError;
@@ -84,6 +93,7 @@ test {
     _ = oid;
     _ = message;
     _ = client_mod;
+    _ = receiver;
 }
 
 test "meta is well-formed" {
