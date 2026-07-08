@@ -20,10 +20,13 @@
 //! negotiation, dispatch, error objects) and, per the MCP spec, rejects
 //! JSON-RPC batches.
 //!
-//! Deliberately out of scope here (later parts): the standing server→client
-//! **SSE stream** on `GET /mcp` and **session management** (`Mcp-Session-Id`).
-//! This transport is **stateless** — it assigns no session id, which the spec
-//! permits; every POST is handled independently. `GET`/`DELETE` answer **405**.
+//! **Sessions** (optional — set `Transport.sessions` to a `*Sessions`): the
+//! transport assigns an `Mcp-Session-Id` at `initialize`, validates it on later
+//! requests (unknown ⇒ 404 so the client re-initializes), tears one down on
+//! `DELETE /mcp`, and serves server→client messages on `GET /mcp` — a
+//! drain-and-close SSE stream with resumable replay (`Last-Event-ID`); enqueue
+//! with `Sessions.push`. Leave `sessions` null for a **stateless** server (no
+//! session id; `GET`/`DELETE` → 405). See `Sessions` for the delivery model.
 //!
 //! ## Security
 //!
@@ -88,6 +91,166 @@ pub const Lock = struct {
     }
 };
 
+fn lockSpin(m: *std.atomic.Mutex) void {
+    while (!m.tryLock()) std.atomic.spinLoopHint();
+}
+
+fn monoNs() u64 {
+    switch (@import("builtin").os.tag) {
+        .windows => {
+            var qpf: std.os.windows.LARGE_INTEGER = undefined;
+            var qpc: std.os.windows.LARGE_INTEGER = undefined;
+            if (!std.os.windows.ntdll.RtlQueryPerformanceFrequency(&qpf).toBool()) return 0;
+            if (!std.os.windows.ntdll.RtlQueryPerformanceCounter(&qpc).toBool()) return 0;
+            return @intCast(@as(u128, @as(u64, @bitCast(qpc))) * std.time.ns_per_s / @as(u64, @bitCast(qpf)));
+        },
+        else => {
+            var ts: std.posix.timespec = undefined;
+            if (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts)) != .SUCCESS) return 0;
+            return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+        },
+    }
+}
+
+/// Server-side session registry for the Streamable HTTP transport. Optional —
+/// leave `Transport.sessions` null for a **stateless** server (no session id;
+/// `GET`/`DELETE` → 405). When set, the transport assigns an `Mcp-Session-Id`
+/// at `initialize`, validates it on later requests (unknown ⇒ 404, so the
+/// client re-initializes), tears a session down on `DELETE`, and serves
+/// server→client messages on `GET /mcp`.
+///
+/// **Delivery model — the `GET` stream is drain-and-close** (a long-poll over
+/// SSE): a GET replays every event queued since the request's `Last-Event-ID`
+/// and then closes; the client's `EventSource` auto-reconnects (with
+/// `Last-Event-ID`) to receive later events. This fits the io-less handler
+/// model — a handler cannot cleanly park a connection waiting for a future push
+/// — and MCP's low-frequency server→client traffic. Nothing is lost within the
+/// bounded replay buffer (`replay_depth`); a client gone longer than that many
+/// events loses the overflow, so size it for your burst.
+///
+/// Thread-safe: all state sits behind one spinlock (short critical sections —
+/// a map touch / an event copy, never socket I/O). `push` may be called from
+/// any thread; `GET` handlers snapshot under the lock and write outside it, so
+/// a concurrent `DELETE` can free a session without a use-after-free.
+pub const Sessions = struct {
+    gpa: std.mem.Allocator,
+    lock: std.atomic.Mutex = .unlocked,
+    map: std.StringHashMapUnmanaged(*Session) = .empty,
+    seq: u64 = 0,
+    /// Buffered events retained per session for resumable replay. Older events
+    /// are evicted; a client reconnecting past this depth loses them.
+    replay_depth: usize = 256,
+
+    const Session = struct {
+        id: []const u8, // gpa-owned, stable for the session's life
+        events: std.ArrayList(StoredEvent) = .empty,
+        next_event_id: u64 = 1,
+        closing: bool = false,
+    };
+    const StoredEvent = struct { id: u64, data: []const u8 }; // data gpa-owned
+
+    pub fn init(gpa: std.mem.Allocator) Sessions {
+        return .{ .gpa = gpa };
+    }
+
+    pub fn deinit(self: *Sessions) void {
+        lockSpin(&self.lock);
+        var it = self.map.valueIterator();
+        while (it.next()) |sp| self.freeSession(sp.*);
+        self.map.deinit(self.gpa);
+        self.lock.unlock();
+        self.* = undefined;
+    }
+
+    fn freeSession(self: *Sessions, s: *Session) void {
+        for (s.events.items) |e| self.gpa.free(e.data);
+        s.events.deinit(self.gpa);
+        self.gpa.free(s.id);
+        self.gpa.destroy(s);
+    }
+
+    /// Create a session; returns its id (store-owned, stable). Caller echoes it
+    /// in the response `Mcp-Session-Id` header.
+    fn create(self: *Sessions) error{OutOfMemory}![]const u8 {
+        lockSpin(&self.lock);
+        defer self.lock.unlock();
+        self.seq += 1;
+        // Unique (seq, under lock) and hard to guess (monotonic clock + the
+        // store address mixed in) — NOT a CSPRNG token, so it is a routing key,
+        // not an auth secret; gate the endpoint with aaa-gate/jwt for auth.
+        const mixed = monoNs() ^ (@as(u64, @intCast(@intFromPtr(self))) *% 0x9E3779B97F4A7C15);
+        var idbuf: [32]u8 = undefined;
+        const id_txt = std.fmt.bufPrint(&idbuf, "{x:0>16}{x:0>16}", .{ mixed, self.seq }) catch unreachable;
+        const id = try self.gpa.dupe(u8, id_txt);
+        errdefer self.gpa.free(id);
+        const s = try self.gpa.create(Session);
+        errdefer self.gpa.destroy(s);
+        s.* = .{ .id = id };
+        try self.map.put(self.gpa, id, s);
+        return id;
+    }
+
+    fn exists(self: *Sessions, id: []const u8) bool {
+        lockSpin(&self.lock);
+        defer self.lock.unlock();
+        return self.map.contains(id);
+    }
+
+    /// Tear a session down (on `DELETE`). Returns whether it existed.
+    fn destroy(self: *Sessions, id: []const u8) bool {
+        lockSpin(&self.lock);
+        defer self.lock.unlock();
+        const kv = self.map.fetchRemove(id) orelse return false;
+        self.freeSession(kv.value);
+        return true;
+    }
+
+    /// Enqueue a server→client message for a session's `GET` stream (deliver on
+    /// the client's next connect/reconnect). Callable from any thread. Returns
+    /// false if the session is unknown. `data` is copied.
+    pub fn push(self: *Sessions, id: []const u8, data: []const u8) error{OutOfMemory}!bool {
+        lockSpin(&self.lock);
+        defer self.lock.unlock();
+        const s = self.map.get(id) orelse return false;
+        const copy = try self.gpa.dupe(u8, data);
+        errdefer self.gpa.free(copy);
+        if (s.events.items.len >= self.replay_depth) {
+            self.gpa.free(s.events.items[0].data);
+            _ = s.events.orderedRemove(0);
+        }
+        try s.events.append(self.gpa, .{ .id = s.next_event_id, .data = copy });
+        s.next_event_id += 1;
+        return true;
+    }
+
+    /// Mark a session closing — its next `GET` drains what is queued and ends.
+    pub fn close(self: *Sessions, id: []const u8) void {
+        lockSpin(&self.lock);
+        defer self.lock.unlock();
+        if (self.map.get(id)) |s| s.closing = true;
+    }
+
+    /// Snapshot (into `arena`) every event with id > `after`, returning them via
+    /// `out`; the bool is the session's `closing` flag. Null ⇒ unknown session.
+    /// Copies under the lock so the caller can write to the socket lock-free.
+    fn drainAfter(
+        self: *Sessions,
+        id: []const u8,
+        after: u64,
+        arena: std.mem.Allocator,
+        out: *std.ArrayList(StoredEvent),
+    ) error{OutOfMemory}!?bool {
+        lockSpin(&self.lock);
+        defer self.lock.unlock();
+        const s = self.map.get(id) orelse return null;
+        for (s.events.items) |e| {
+            if (e.id > after)
+                try out.append(arena, .{ .id = e.id, .data = try arena.dupe(u8, e.data) });
+        }
+        return s.closing;
+    }
+};
+
 /// The Streamable HTTP transport over one `mcp.Server`. Immutable config; the
 /// `server` and this `Transport` must outlive the Router.
 pub const Transport = struct {
@@ -120,6 +283,11 @@ pub const Transport = struct {
     /// get a single `application/json` response. `.off`: always
     /// `application/json` (no streaming).
     stream: StreamMode = .auto,
+    /// Optional session registry. Null ⇒ **stateless** (no `Mcp-Session-Id`;
+    /// `GET`/`DELETE` → 405). Set a `*Sessions` to enable session assignment /
+    /// validation and the server→client `GET /mcp` stream. Must outlive the
+    /// Router.
+    sessions: ?*Sessions = null,
 
     pub const StreamMode = enum { auto, off };
 
@@ -142,15 +310,23 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
 
     switch (ctx.req.method) {
         .post => return handlePost(t, ctx),
-        // The SSE stream (GET) and session teardown (DELETE) are later parts;
-        // until then the endpoint is POST-only.
-        else => {
-            ctx.res.setStatus(405);
-            try ctx.res.setHeader("Allow", "POST");
-            try ctx.res.setHeader("Content-Type", "text/plain");
-            try ctx.res.writeAll("Method Not Allowed\n");
-        },
+        .get => if (t.sessions != null) return handleGet(t, ctx) else return methodNotAllowed(t, ctx),
+        .delete => if (t.sessions != null) return handleDelete(t, ctx) else return methodNotAllowed(t, ctx),
+        else => return methodNotAllowed(t, ctx),
     }
+}
+
+fn methodNotAllowed(t: *const Transport, ctx: *router.Ctx) anyerror!void {
+    ctx.res.setStatus(405);
+    try ctx.res.setHeader("Allow", if (t.sessions != null) "POST, GET, DELETE" else "POST");
+    try ctx.res.setHeader("Content-Type", "text/plain");
+    try ctx.res.writeAll("Method Not Allowed\n");
+}
+
+fn notFound(ctx: *router.Ctx) anyerror!void {
+    ctx.res.setStatus(404);
+    try ctx.res.setHeader("Content-Type", "text/plain");
+    try ctx.res.writeAll("Session Not Found\n");
 }
 
 /// DNS-rebinding guard (MCP transport security): with a non-empty allowlist, a
@@ -171,6 +347,64 @@ fn acceptsSse(req: *const http.Server.Request) bool {
     return std.ascii.indexOfIgnoreCase(accept, "text/event-stream") != null;
 }
 
+/// Best-effort check whether a POST body is an `initialize` request (so the
+/// transport assigns a session). A throwaway parse; a malformed body is not an
+/// initialize (`handleMessage` will surface the real error).
+fn isInitialize(gpa: std.mem.Allocator, body: []const u8) bool {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const v = std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), body, .{}) catch return false;
+    if (v != .object) return false;
+    const m = v.object.get("method") orelse return false;
+    return m == .string and std.mem.eql(u8, m.string, "initialize");
+}
+
+/// The `Last-Event-ID` request header as a u64 (0 when absent/invalid ⇒ replay
+/// the whole buffer).
+fn parseLastEventId(req: *const http.Server.Request) u64 {
+    const h = req.header("last-event-id") orelse return 0;
+    return std.fmt.parseInt(u64, std.mem.trim(u8, h, " \t"), 10) catch 0;
+}
+
+/// `GET /mcp`: the server→client stream. Drain-and-close — replay every event
+/// queued since `Last-Event-ID`, then close (the client reconnects for more).
+fn handleGet(t: *const Transport, ctx: *router.Ctx) anyerror!void {
+    const sessions = t.sessions.?;
+    const sid = ctx.req.header("mcp-session-id") orelse return notFound(ctx);
+    const after = parseLastEventId(ctx.req);
+
+    var arena_state = std.heap.ArenaAllocator.init(t.gpa);
+    defer arena_state.deinit();
+
+    var batch: std.ArrayList(Sessions.StoredEvent) = .empty;
+    // Snapshot under the store lock (copies into the arena) so writing to the
+    // socket below holds no lock and races no concurrent DELETE.
+    _ = (try sessions.drainAfter(sid, after, arena_state.allocator(), &batch)) orelse return notFound(ctx);
+
+    var es = try http.sse.EventStream.start(ctx.res);
+    if (batch.items.len == 0) {
+        // Nothing queued: a heartbeat keeps the response well-formed; the
+        // client's EventSource reconnects (with Last-Event-ID) for later events.
+        try es.comment("keep-alive");
+        return;
+    }
+    for (batch.items) |e| {
+        var idbuf: [24]u8 = undefined;
+        const idstr = std.fmt.bufPrint(&idbuf, "{d}", .{e.id}) catch unreachable;
+        try es.send(.{ .id = idstr, .data = e.data });
+    }
+}
+
+/// `DELETE /mcp`: tear down the session named by `Mcp-Session-Id`.
+fn handleDelete(t: *const Transport, ctx: *router.Ctx) anyerror!void {
+    const sid = ctx.req.header("mcp-session-id") orelse return notFound(ctx);
+    if (t.sessions.?.destroy(sid)) {
+        ctx.res.setStatus(204);
+    } else {
+        return notFound(ctx);
+    }
+}
+
 fn handlePost(t: *const Transport, ctx: *router.Ctx) anyerror!void {
     const body = ctx.req.reader().allocRemaining(t.gpa, .limited(t.max_body)) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -188,6 +422,18 @@ fn handlePost(t: *const Transport, ctx: *router.Ctx) anyerror!void {
         },
     };
     defer t.gpa.free(body);
+
+    // Session handling (only when a registry is configured). The client gets a
+    // session id at `initialize` and must present it on every later request.
+    if (t.sessions) |sessions| {
+        if (isInitialize(t.gpa, body)) {
+            const sid = try sessions.create();
+            try ctx.res.setHeader("Mcp-Session-Id", sid);
+        } else {
+            const sid = ctx.req.header("mcp-session-id") orelse return notFound(ctx);
+            if (!sessions.exists(sid)) return notFound(ctx);
+        }
+    }
 
     if (t.stream == .auto and acceptsSse(ctx.req)) return streamResponse(t, ctx, body);
     return jsonResponse(t, ctx, body);
@@ -388,6 +634,41 @@ fn postAccept(comptime accept: []const u8, comptime json: []const u8) []const u8
 fn bodyOf(got: []const u8) []const u8 {
     const i = std.mem.indexOf(u8, got, "\r\n\r\n") orelse return "";
     return got[i + 4 ..];
+}
+
+/// Header value of `name` (case-insensitive) from a raw response, or null.
+fn headerValue(got: []const u8, name: []const u8) ?[]const u8 {
+    var it = std.mem.splitSequence(u8, got, "\r\n");
+    while (it.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " "), name))
+            return std.mem.trim(u8, line[colon + 1 ..], " ");
+    }
+    return null;
+}
+
+const init_body =
+    \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"c","version":"1"}}}
+;
+const list_body =
+    \\{"jsonrpc":"2.0","id":2,"method":"tools/list"}
+;
+
+fn postWithSession(buf: []u8, sid: []const u8, json: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, "POST /mcp HTTP/1.1\r\nHost: t\r\nMcp-Session-Id: {s}\r\n" ++
+        "Content-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ sid, json.len, json }) catch unreachable;
+}
+
+fn getWithSession(buf: []u8, sid: []const u8, last_event_id: ?[]const u8) []const u8 {
+    if (last_event_id) |lei| {
+        return std.fmt.bufPrint(buf, "GET /mcp HTTP/1.1\r\nHost: t\r\nMcp-Session-Id: {s}\r\n" ++
+            "Last-Event-ID: {s}\r\nConnection: close\r\n\r\n", .{ sid, lei }) catch unreachable;
+    }
+    return std.fmt.bufPrint(buf, "GET /mcp HTTP/1.1\r\nHost: t\r\nMcp-Session-Id: {s}\r\nConnection: close\r\n\r\n", .{sid}) catch unreachable;
+}
+
+fn deleteWithSession(buf: []u8, sid: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, "DELETE /mcp HTTP/1.1\r\nHost: t\r\nMcp-Session-Id: {s}\r\nConnection: close\r\n\r\n", .{sid}) catch unreachable;
 }
 
 fn hApp(ctx: *router.Ctx) anyerror!void {
@@ -593,6 +874,113 @@ test "stream=.off forces application/json even when the client accepts SSE" {
     try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
     try testing.expect(std.mem.indexOf(u8, got, "Content-Type: application/json") != null);
     try testing.expect(std.mem.indexOf(u8, got, "text/event-stream") == null);
+}
+
+test "sessions: initialize assigns Mcp-Session-Id; missing/unknown → 404; DELETE tears down" {
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    var sessions = Sessions.init(gpa);
+    defer sessions.deinit();
+    var transport = Transport{ .gpa = gpa, .server = &server, .sessions = &sessions };
+
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+
+    var rbuf: [1024]u8 = undefined;
+    var out: [4096]u8 = undefined;
+
+    // initialize → 200 + a session id.
+    const init = runWire(&r, postWithSession(&rbuf, "", init_body), &out);
+    try testing.expect(std.mem.startsWith(u8, init, "HTTP/1.1 200"));
+    const sid_hdr = headerValue(init, "Mcp-Session-Id") orelse return error.NoSession;
+    var sidbuf: [64]u8 = undefined;
+    @memcpy(sidbuf[0..sid_hdr.len], sid_hdr);
+    const sid = sidbuf[0..sid_hdr.len];
+
+    // A follow-up with no session id → 404.
+    const noid = runWire(&r, postWithSession(&rbuf, "", list_body), &out);
+    try testing.expect(std.mem.startsWith(u8, noid, "HTTP/1.1 404"));
+
+    // With a bogus session id → 404.
+    const bogus = runWire(&r, postWithSession(&rbuf, "deadbeef", list_body), &out);
+    try testing.expect(std.mem.startsWith(u8, bogus, "HTTP/1.1 404"));
+
+    // With the real session id → 200.
+    const okid = runWire(&r, postWithSession(&rbuf, sid, list_body), &out);
+    try testing.expect(std.mem.startsWith(u8, okid, "HTTP/1.1 200"));
+
+    // DELETE → 204; afterwards the id is gone → 404.
+    const del = runWire(&r, deleteWithSession(&rbuf, sid), &out);
+    try testing.expect(std.mem.startsWith(u8, del, "HTTP/1.1 204"));
+    const gone = runWire(&r, postWithSession(&rbuf, sid, list_body), &out);
+    try testing.expect(std.mem.startsWith(u8, gone, "HTTP/1.1 404"));
+}
+
+test "sessions: GET streams pushed events as SSE; Last-Event-ID replays only newer" {
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    var sessions = Sessions.init(gpa);
+    defer sessions.deinit();
+    var transport = Transport{ .gpa = gpa, .server = &server, .sessions = &sessions };
+
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+
+    var rbuf: [1024]u8 = undefined;
+    var out: [4096]u8 = undefined;
+
+    const init = runWire(&r, postWithSession(&rbuf, "", init_body), &out);
+    const sid_hdr = headerValue(init, "Mcp-Session-Id").?;
+    var sidbuf: [64]u8 = undefined;
+    @memcpy(sidbuf[0..sid_hdr.len], sid_hdr);
+    const sid = sidbuf[0..sid_hdr.len];
+
+    // Push to an unknown session is a no-op (false); to ours, true.
+    try testing.expect((try sessions.push("nope", "x")) == false);
+    try testing.expect((try sessions.push(sid, "{\"n\":1}")) == true);
+    try testing.expect((try sessions.push(sid, "{\"n\":2}")) == true);
+
+    // GET with no Last-Event-ID → both events, id-tagged, as SSE.
+    const got = runWire(&r, getWithSession(&rbuf, sid, null), &out);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
+    try testing.expect(std.mem.indexOf(u8, got, "Content-Type: text/event-stream") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "id: 1") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "data: {\"n\":1}") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "id: 2") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "data: {\"n\":2}") != null);
+
+    // GET with Last-Event-ID: 1 → only event 2 (resumable replay).
+    const got2 = runWire(&r, getWithSession(&rbuf, sid, "1"), &out);
+    try testing.expect(std.mem.indexOf(u8, got2, "id: 2") != null);
+    try testing.expect(std.mem.indexOf(u8, got2, "data: {\"n\":1}") == null);
+
+    // GET past the last id → nothing queued: a heartbeat comment, still 200.
+    const got3 = runWire(&r, getWithSession(&rbuf, sid, "2"), &out);
+    try testing.expect(std.mem.startsWith(u8, got3, "HTTP/1.1 200"));
+    try testing.expect(std.mem.indexOf(u8, got3, ": keep-alive") != null);
+    try testing.expect(std.mem.indexOf(u8, got3, "data:") == null);
+}
+
+test "sessions: GET/DELETE with an unknown session → 404" {
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    var sessions = Sessions.init(gpa);
+    defer sessions.deinit();
+    var transport = Transport{ .gpa = gpa, .server = &server, .sessions = &sessions };
+
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+
+    var rbuf: [512]u8 = undefined;
+    var out: [2048]u8 = undefined;
+    try testing.expect(std.mem.startsWith(u8, runWire(&r, getWithSession(&rbuf, "ghost", null), &out), "HTTP/1.1 404"));
+    try testing.expect(std.mem.startsWith(u8, runWire(&r, deleteWithSession(&rbuf, "ghost"), &out), "HTTP/1.1 404"));
 }
 
 test "oversized POST body → 413" {

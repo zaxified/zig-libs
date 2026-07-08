@@ -11,10 +11,18 @@ client **POST**s one JSON-RPC message and gets back either the response
 `mcp.Server.handleMessage`, which does all protocol work (version negotiation,
 dispatch, error objects) and, per the MCP spec, rejects JSON-RPC batches.
 
-**Stateless** — assigns no `Mcp-Session-Id` (the spec permits this); every POST
-is handled independently. `GET`/`DELETE` on the endpoint answer **405** for now:
-the server→client **SSE stream** (`GET /mcp`, built on `http.sse`) and
-**session management** are follow-up parts.
+**Sessions** are optional. Leave `Transport.sessions` null for a **stateless**
+server (no `Mcp-Session-Id`; `GET`/`DELETE` → 405; every POST independent — the
+spec permits this). Set a `*Sessions` to enable the full session model: an
+`Mcp-Session-Id` assigned at `initialize` and validated on later requests
+(unknown → 404, so the client re-initializes), `DELETE /mcp` teardown, and a
+server→client **`GET /mcp` stream**. That stream is **drain-and-close** (a
+long-poll over SSE): it replays every event queued since the request's
+`Last-Event-ID`, then closes; the client's `EventSource` auto-reconnects (with
+`Last-Event-ID`) for more. This fits the io-less handler model (a handler can't
+park a connection waiting for a future push) and MCP's low-frequency
+server→client traffic — nothing is lost within the bounded resumable replay
+buffer. Enqueue a message from any thread with `Sessions.push(id, data)`.
 
 ```zig
 var server = mcp.Server.init(gpa, .{ .name = "netops", .version = "1.0" });
@@ -50,7 +58,10 @@ parity — no `mcp_dart` or other MCP-transport source consulted or copied.
 
 ## Verification
 
-`zig build test-mcp-http` — 5 offline tests through a real `router` +
-`http.Server.serveStream` (initialize → 200 result, tools/list + tools/call,
-notification → 202, path pass-through + `GET` → 405, oversized body → 413),
-green in Debug + ReleaseFast.
+`zig build test-mcp-http` — 13 offline tests through a real `router` +
+`http.Server.serveStream`: request/response (initialize, tools/list, tools/call,
+notification → 202), SSE-on-POST (streamed result, **live tool progress**,
+notification → 202, `stream=.off`), Origin allowlist (match/mismatch/absent),
+sessions (assign + validate + 404 + DELETE, `GET` push + `Last-Event-ID` replay
++ heartbeat, unknown-session 404), path pass-through / 405, oversized → 413.
+Green in Debug + ReleaseFast.

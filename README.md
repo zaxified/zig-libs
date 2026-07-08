@@ -8,7 +8,7 @@ Not a dumping ground: ship **solid, not many**. Most members are *extracted* fro
 across sibling projects (bxp, axp, zig-fping, poc-wf-analytic); a few fill genuine gaps in the Zig
 ecosystem.
 
-**Status:** 43 modules · 1180 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 43 modules · 1183 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ## Modules
@@ -81,7 +81,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `tar` | ustar/GNU tar reader+writer (preserves uid/gid/mtime) + gzip | any (packer: linux) | — |
 | `blobmsg` | OpenWRT ubus client + blob/blobmsg wire codec | any (client: linux) | — |
 | `mcp` | Model Context Protocol server (JSON-RPC 2.0) — tools + resources + prompts, app-state ctx | any | — |
-| `mcp-http` | MCP **Streamable HTTP** transport (2025-06-18) — `POST /mcp` → JSON-RPC response (`application/json` **or live SSE** with tool-progress streaming) / 202, as a `router` middleware over a `mcp.Server`; built-in **Origin** (DNS-rebinding) guard, size cap, Lock seam (stateless; standing `GET` stream + sessions are follow-ups) | any | router, http, mcp |
+| `mcp-http` | MCP **Streamable HTTP** transport (2025-06-18) — `POST /mcp` → JSON-RPC response (`application/json` **or live SSE** with tool-progress streaming) / 202, as a `router` middleware over a `mcp.Server`. Optional **sessions** (`Mcp-Session-Id` + `GET /mcp` server→client SSE stream with `Last-Event-ID` resumable replay + `DELETE` teardown); built-in **Origin** (DNS-rebinding) guard, size cap, Lock seam | any | router, http, mcp |
 | `uci` | OpenWRT UCI config parser + serializer + typed model (stable round-trip) | any | — |
 
 ## Using a module

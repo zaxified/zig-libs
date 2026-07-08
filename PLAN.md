@@ -337,8 +337,12 @@ fmt green. **Still open:** request-ID mw · health helper · conditional-req · 
    Lock seam, +5 tests (Opus). **T2 ✅** built-in `Origin` allowlist (DNS-rebinding guard; bearer = reuse aaa-gate/jwt in front).
    **T4 ✅** SSE-on-POST: `Accept: text/event-stream` → the response streams as SSE with tool-call
    `notifications/progress` delivered live (each JSON-RPC line → one `data:` event via a line-to-SSE
-   adapter; notification → 202; `stream=.off` opt-out), +4 tests. **Remaining:** T5 standing `GET /mcp`
-   stream + session registry (`Mcp-Session-Id`) + resumable push (deferred, the hard part). · 2. ✅ **upstream LB + health routing (+bulkhead)** DONE (`resilience.Bulkhead` + new `upstream` module: strategies/health/failover; 23 tests)
+   adapter; notification → 202; `stream=.off` opt-out), +4 tests. **T5 ✅** `Sessions` registry — `Mcp-Session-Id` assigned at initialize + validated (unknown→404),
+   `DELETE` teardown, `GET /mcp` **drain-and-close** server→client SSE stream with `Last-Event-ID` resumable
+   replay (bounded per-session buffer), `Sessions.push` from any thread (one spinlock; snapshot-under-lock so
+   a concurrent DELETE can't UAF). Chose drain-and-close over a held-open loop — io-less handlers can't park
+   a connection on a future push, and EventSource auto-reconnect + LEI makes it lossless. +3 tests.
+   **`mcp-http` MCP HTTP/SSE transport is COMPLETE.** · 2. ✅ **upstream LB + health routing (+bulkhead)** DONE (`resilience.Bulkhead` + new `upstream` module: strategies/health/failover; 23 tests)
 — C gateway. Remaining: 3. **SNMP trap receiver + v3** (small-med) — A async alerts · 4. **coap** RFC 7252
 (med) — G IoT · 5. **MQTT broker** (large) — G IoT hub.
 Extraction backlog (Opus, NOT Fable — low/no value-add headroom): `rawsock` (axp `openPacketCapture`
