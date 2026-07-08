@@ -95,6 +95,11 @@ pub const Server = @import("Server.zig");
 /// `If-Unmodified-Since` → 304 Not Modified / 412 Precondition Failed.
 pub const conditional = @import("conditional.zig");
 
+/// Request-body helpers: the `Content-Type` media-type + parameter parser and
+/// an `application/x-www-form-urlencoded` decoder. The streaming
+/// `multipart/form-data` parser lives in `multipart`.
+pub const body = @import("body.zig");
+
 // ── request vocabulary ──────────────────────────────────────────────────────
 
 pub const Method = enum {
