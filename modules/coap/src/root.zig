@@ -42,6 +42,11 @@ pub const meta = .{
     .deps = .{},
 };
 
+/// The typed option layer (C2): the RFC 7252 §5.10 option registry + class
+/// bits, the CoAP uint value format, typed accessors (Content-Format / Accept /
+/// Max-Age / Uri-Path / Uri-Query), and the §6 URI ↔ options mapping.
+pub const options = @import("options.zig");
+
 /// CoAP version in the 2-bit Ver field (always 1 for RFC 7252).
 pub const version = 1;
 

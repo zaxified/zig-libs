@@ -345,9 +345,11 @@ fmt green. **Still open:** request-ID mw · health helper · conditional-req · 
    **`mcp-http` MCP HTTP/SSE transport is COMPLETE.** · 2. ✅ **upstream LB + health routing (+bulkhead)** DONE (`resilience.Bulkhead` + new `upstream` module: strategies/health/failover; 23 tests)
 — C gateway. Remaining: 3. **SNMP trap receiver + v3** (small-med) — A async alerts · 4. 🟡 **coap** RFC 7252
 (med) — G IoT: split C1–C5. **C1 ✅** NEW `coap` module — message codec (header/token/delta-encoded
-options/payload, `parse`/`serialize`/`encodedLen`, zero-alloc, transport-agnostic; Fable, 7 tests). Remaining:
-C2 options registry (Uri-Path/Content-Format + URI↔options) · C3 CON/ACK reliability + MID dedup · C4 client
-· C5 server (C6/C7 block-wise + observe deferred). · 5. **MQTT broker** (large) — G IoT hub.
+options/payload, `parse`/`serialize`/`encodedLen`, zero-alloc, transport-agnostic; Fable, 7 tests). **C2 ✅**
+`coap.options` — §5.10 registry + class bits, CoAP uint (§3.2), typed accessors (Content-Format/Accept/
+Max-Age/Uri-Path/Uri-Query), §6 URI↔options mapping (`optionsFromUri`/`uriFromOptions`); Fable, 19 tests.
+Remaining: C3 CON/ACK reliability + MID dedup · C4 client · C5 server (C6/C7 block-wise + observe deferred).
+· 5. **MQTT broker** (large) — G IoT hub.
 Extraction backlog (Opus, NOT Fable — low/no value-add headroom): `rawsock` (axp `openPacketCapture`
 AF_PACKET layer is REAL) · data-family (dataset/tabular/jsonshape/finstats; **`roquery` has a security-
 hardening sliver**) · `exprcalc` (sandbox sliver if user-facing) · procnet/argsafe/blobstore · bxp text libs.

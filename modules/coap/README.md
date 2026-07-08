@@ -33,16 +33,37 @@ Provenance: clean-room from RFC 7252 §3 (the CoAP message format: header /
 token / delta-encoded options / payload). No third-party CoAP source (libcoap,
 aiocoap, Californium, …) consulted or copied.
 
+## Typed options (`coap.options`)
+
+On top of the value-agnostic codec, `coap.options` gives options their meaning
+(RFC 7252 §5.10 / §6):
+
+- **Registry + class bits** — named `number.*` (Uri-Path = 11, Content-Format =
+  12, …), `content_format.*`, and `isCritical`/`isUnsafe`/`noCacheKey` (§5.4.6).
+- **CoAP uint** (§3.2) — `decodeUint`/`encodeUint` (minimal big-endian, no
+  leading zeros, empty = 0).
+- **Accessors** over a parsed `Message` — `contentFormat`, `accept`, `maxAge`
+  (default 60), and the `uriPath` / `uriQuery` segment iterators.
+- **URI ↔ options** (§6) — `optionsFromUri("coap://h/a/b?x=1")` → Uri-Host /
+  Uri-Port (non-default) / Uri-Path* / Uri-Query* in ascending order (feeds
+  `serialize` directly), and `uriFromOptions` back, with RFC 3986
+  percent-encoding.
+
 ## Scope
 
-Done: the message codec (C1). Follow-ups: the typed option registry + URI
-mapping (C2), the CON/ACK reliability + message-ID dedup layer (C3), and the
-client (C4) / server (C5); block-wise transfer (RFC 7959) and Observe
-(RFC 7641) later.
+Done: the message codec (C1) + typed options / URI mapping (C2). Follow-ups: the
+CON/ACK reliability + message-ID dedup layer (C3), and the client (C4) / server
+(C5); block-wise transfer (RFC 7959) and Observe (RFC 7641) later.
 
 ## Verification
 
-`zig build test-coap` — 7 offline tests: a hand-built CON GET datagram with a
+`zig build test-coap` — 26 offline tests. Codec (7): a hand-built CON GET
+datagram round-trips to exact bytes; extended option nibbles across the 13/269
+boundaries; payload marker + lone `0xFF`; the full parse/serialize error matrix;
+`encodedLen` agreement. Options (19): class bits, `decodeUint`/`encodeUint`
+boundaries + no-leading-zeros round-trip, the typed accessors, and
+`optionsFromUri`/`uriFromOptions` (host/port/path/query, percent-en/decoding,
+coaps, bad-scheme, URI round-trips). Original codec details: a hand-built CON GET datagram with a
 token and repeated Uri-Path options round-trips to exact bytes; the extended
 option nibble forms across the 13 and 269 boundaries (incl. option number 300 →
 `0xE1 0x00 0x1F`); payload marker parse/serialize + a lone `0xFF` → EmptyPayload;
