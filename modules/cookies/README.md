@@ -29,8 +29,14 @@ const sid = cookies.find(req.header("cookie") orelse "", "session") orelse retur
 The parser is deliberately liberal (no charset validation on read); strictness
 belongs on the `Set-Cookie` build side (next part).
 
-- **Status:** `gap`. **Role:** codec. **Platform:** any. **Deps:** none (std
-  only). **Concurrency:** reentrant — no state; results borrow the input.
+- `get(req, name) ?[]const u8` / `set(res, sc, buf) !void` — thin `http`
+  helpers: read a cookie off a request, or serialize a `SetCookie` into the
+  response's `Set-Cookie` header (the server emits one Set-Cookie per
+  response — `setHeader` replaces by name).
+
+- **Status:** `gap`. **Role:** codec. **Platform:** any. **Deps:** `http`
+  (the `get`/`set` helpers; the parser + builder are std-only logic).
+  **Concurrency:** reentrant — no state; results borrow the input.
 
 Provenance: clean-room from RFC 6265 (HTTP State Management Mechanism). No
 third-party source consulted or copied.

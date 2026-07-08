@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 
-//! cookies — HTTP cookies (RFC 6265). **P1**: the `Cookie` request-header
-//! parser — iterate the `name=value` pairs a client sends back. Building
-//! `Set-Cookie` (attributes: Path/Domain/Max-Age/Expires/Secure/HttpOnly/
-//! SameSite) is the next part. Allocation-free; parsed pairs borrow the header.
+//! cookies — HTTP cookies (RFC 6265): the `Cookie` request-header parser
+//! (`parse`/`find`), the `Set-Cookie` response builder (`SetCookie`, injection-
+//! guarded, SameSite=None⇒Secure), and thin `http` helpers (`get`/`set`).
+//! Allocation-free; parsed pairs borrow the header.
 //!
 //! ```zig
 //! var it = cookies.parse(req.header("cookie") orelse "");
@@ -12,6 +12,7 @@
 //! ```
 
 const std = @import("std");
+const http = @import("http");
 
 pub const meta = .{
     .status = .gap,
@@ -19,7 +20,7 @@ pub const meta = .{
     .role = .codec,
     .concurrency = .reentrant, // no state; results borrow the input header
     .model_after = "RFC 6265 (HTTP State Management Mechanism)",
-    .deps = .{},
+    .deps = .{"http"},
 };
 
 /// One cookie name/value pair from a `Cookie` request header. Both slices
@@ -209,6 +210,30 @@ pub const SetCookie = struct {
     }
 };
 
+// ── P3: http integration ────────────────────────────────────────────────────
+
+pub const SetError = WriteError || http.Server.ResponseWriter.SetHeaderError;
+
+/// Read the value of cookie `name` from a request's `Cookie` header, or null.
+/// Convenience for `find(req.header("cookie") orelse "", name)`.
+pub fn get(req: *const http.Server.Request, name: []const u8) ?[]const u8 {
+    return find(req.header("cookie") orelse "", name);
+}
+
+/// Serialize `sc` and set it as the response's `Set-Cookie` header. `buf` holds
+/// the header value and **must outlive the response** — the response writer
+/// stores the header slice without copying, so pass a buffer that lives until
+/// the response is flushed (e.g. on the handler's frame). Rejects an invalid
+/// cookie (`WriteError`) before touching the response.
+///
+/// NOTE: the server emits at most **one** `Set-Cookie` per response —
+/// `setHeader` replaces by name — so a second `set` overwrites the first.
+/// Setting multiple cookies in one response is not supported through this path.
+pub fn set(res: *http.Server.ResponseWriter, sc: SetCookie, buf: []u8) SetError!void {
+    const value = try sc.bufPrint(buf);
+    try res.setHeader("Set-Cookie", value);
+}
+
 // ── tests ──────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -368,4 +393,45 @@ test "SetCookie: bufPrint into too-small buffer" {
     var buf: [4]u8 = undefined;
     const sc: SetCookie = .{ .name = "name", .value = "value" };
     try testing.expectError(error.BufferTooSmall, sc.bufPrint(&buf));
+}
+
+// ── P3 tests: http integration (offline, through serveStream) ────────────────
+
+fn cookieHandler(req: *http.Server.Request, res: *http.Server.ResponseWriter) anyerror!void {
+    // Echo the requested "session" cookie back in the body, and set one.
+    const sid = get(req, "session") orelse "none";
+    var cbuf: [128]u8 = undefined; // must outlive the response → handler frame
+    try set(res, .{
+        .name = "session",
+        .value = "s3",
+        .path = "/",
+        .http_only = true,
+        .secure = true,
+        .same_site = .lax,
+    }, &cbuf);
+    try res.writeAll(sid);
+}
+
+test "get + set over serveStream" {
+    const Reader = std.Io.Reader;
+    const Writer = std.Io.Writer;
+    var in: Reader = .fixed("GET / HTTP/1.1\r\nHost: t\r\n" ++
+        "Cookie: a=1; session=abc; b=2\r\nConnection: close\r\n\r\n");
+    var out_buf: [2048]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var head_buf: [2048]u8 = undefined;
+    var req_body: [256]u8 = undefined;
+    var res_body: [512]u8 = undefined;
+    var chunk: [128]u8 = undefined;
+    http.Server.serveStream(.{ .handler = cookieHandler, .server_name = null }, &in, &out, .{
+        .head = &head_buf,
+        .request_body = &req_body,
+        .response_body = &res_body,
+        .chunk = &chunk,
+    });
+    const got = out.buffered();
+    // get() read the "session" cookie out of the multi-cookie header.
+    try testing.expect(std.mem.endsWith(u8, got, "\r\n\r\nabc"));
+    // set() emitted the Set-Cookie with attributes.
+    try testing.expect(std.mem.indexOf(u8, got, "Set-Cookie: session=s3; Path=/; Secure; HttpOnly; SameSite=Lax\r\n") != null);
 }

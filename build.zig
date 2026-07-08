@@ -34,7 +34,7 @@ const module_list = [_]Module{
     .{ .name = "health", .deps = &.{ "router", "http" } },
     .{ .name = "requestid", .deps = &.{ "router", "http" } },
     .{ .name = "linkheader" },
-    .{ .name = "cookies" },
+    .{ .name = "cookies", .deps = &.{"http"} },
     .{ .name = "idempotency", .deps = &.{ "router", "http", "ramcache" } },
     .{ .name = "webhooksig", .deps = &.{ "router", "http" } },
     .{ .name = "tracecontext", .deps = &.{ "router", "http" } },
