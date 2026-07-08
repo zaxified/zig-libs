@@ -8,7 +8,7 @@ Not a dumping ground: ship **solid, not many**. Most members are *extracted* fro
 across sibling projects (bxp, axp, zig-fping, poc-wf-analytic); a few fill genuine gaps in the Zig
 ecosystem.
 
-**Status:** 44 modules · 1225 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 48 modules · 1276 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ## Modules
@@ -31,6 +31,9 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `metrics` | Prometheus registry (counter/gauge/histogram) + `/metrics` + request middleware + **access-log writer** (combined/JSON) | router, http |
 | `health` | Liveness (`/healthz`) + readiness (`/readyz`) probe middleware — 200/503 from registered dependency checks (k8s probe contract) | router, http |
 | `requestid` | Request/correlation-ID middleware — adopt incoming `X-Request-Id` or generate, echo on the response, expose via `current()` (composes with auth) | router, http |
+| `tracecontext` | **W3C Trace Context** — `traceparent`/`tracestate` parse + generate + a propagation middleware (child span per hop, `current()`) for distributed tracing | router, http |
+| `webhooksig` | **HMAC webhook signatures** (GitHub/Stripe style) — `sign`/`verify` (constant-time) + a middleware gating requests by `HMAC-SHA256(secret, body)`, key rotation | router, http |
+| `idempotency` | **Idempotency-Key** dedup of unsafe retries — a middleware + ramcache-backed `Store` replaying a key's cached response without re-running the handler | router, http, ramcache |
 | `resilience` | Circuit breaker + retry/backoff + timeout + **bulkhead** (concurrency limiter) for calling upstreams (generic) | — |
 | `upstream` | Load-balanced upstream pool + failover — round-robin/weighted/least-conn/EWMA strategies, per-upstream breaker+bulkhead, active+passive health | resilience, probe |
 | `openapi` | OpenAPI 3.1 spec generated from the route table + `/openapi.json` | router, http |
@@ -80,6 +83,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | Module | What it does | Platform | Deps |
 |---|---|---|---|
 | `tar` | ustar/GNU tar reader+writer (preserves uid/gid/mtime) + gzip | any (packer: linux) | — |
+| `linkheader` | Web Linking (RFC 8288) `Link` header build + parse (rel/title/type), `pagination` (first/prev/next/last), `find(rel)` — zero-alloc | any | — |
 | `blobmsg` | OpenWRT ubus client + blob/blobmsg wire codec | any (client: linux) | — |
 | `mcp` | Model Context Protocol server (JSON-RPC 2.0) — tools + resources + prompts, app-state ctx | any | — |
 | `mcp-http` | MCP **Streamable HTTP** transport (2025-06-18) — `POST /mcp` → JSON-RPC response (`application/json` **or live SSE** with tool-progress streaming) / 202, as a `router` middleware over a `mcp.Server`. Optional **sessions** (`Mcp-Session-Id` + `GET /mcp` server→client SSE stream with `Last-Event-ID` resumable replay + `DELETE` teardown); built-in **Origin** (DNS-rebinding) guard, size cap, Lock seam | any | router, http, mcp |

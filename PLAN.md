@@ -322,9 +322,13 @@ fmt green. **Still open:** request-ID mw · health helper · conditional-req · 
   middleware wrapping `Provider.verify`: RFC 6750 Bearer challenge — 401 `invalid_token` / 403
   `insufficient_scope` — `Identity` on ctx via `identityOf`, injected clock + Provider lock seam, +4
   tests; dep +router). **jwt is 6/6 complete.**
-- 🟢 nice-to-have: cookies + Set-Cookie(HttpOnly/Secure/SameSite) · Range/206 · inbound gzip request body ·
-  traceparent/OTel · per-conn request-count cap · auto-OPTIONS in router · content negotiation · Link
-  pagination · Idempotency-Key · request trailers · strict bare-LF reject · HMAC signing · HTTP/3.
+- 🟢 nice-to-have — **DONE 2026-07-08 (6 Opus agents, parallel):** ✅ strict **bare-LF reject** (http h1.zig,
+  anti-smuggling RFC 9112 §2.2 → 400) · ✅ **auto-OPTIONS** in router (opt-in `auto_options` → 204 + Allow) ·
+  ✅ **Link pagination** (NEW `linkheader`, RFC 8288) · ✅ **Idempotency-Key** (NEW `idempotency`, ramcache
+  Store + replay middleware) · ✅ **HMAC signing** (NEW `webhooksig`, GitHub/Stripe const-time verify+rotation) ·
+  ✅ **traceparent/OTel** (NEW `tracecontext`, W3C Trace Context + `current()`). **Still open:** cookies +
+  Set-Cookie(SameSite) · Range/206 · inbound gzip request body · content negotiation · request trailers ·
+  per-conn request-count cap · HTTP/3 (large, deferred/never).
 - Excluded/decided: **TLS = proxy** (then ianic spike); **upstream LB/pool** = app-elevation #2 below.
 - **Bottom line:** NOT fundamentally unsafe — 1 small blocker + ~6 small-med hardening/ops items + 1 large
   (JWT/JWKS only if OAuth2/OIDC). Most are **Opus-inline extensions of existing modules**, not new modules.

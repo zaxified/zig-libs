@@ -275,4 +275,18 @@ audit is pending before any public release.
                module (JSON-RPC core, itself extracted from the authors'
                bxp-mcp).
 
+  linkheader — clean-room from RFC 8288 (Web Linking — the `Link` header
+               grammar). No third-party source consulted or copied.
+
+  idempotency — clean-room from the Idempotency-Key pattern (Stripe's public
+               API docs + the IETF draft-ietf-httpapi-idempotency-key-header).
+               Behavior/semantics only; caching over the sibling `ramcache`.
+
+  webhooksig — clean-room from RFC 2104 (HMAC) and the publicly-documented
+               GitHub/Stripe webhook-signature schemes (`sha256=<hex>` over the
+               body). HMAC via Zig `std.crypto`; no third-party source copied.
+
+  tracecontext — clean-room from the W3C Trace Context Level 1 recommendation
+               (`traceparent`/`tracestate`). No third-party source copied.
+
 See each module's README "Provenance" note for its specific seed and reference.
