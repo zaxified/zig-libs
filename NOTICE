@@ -289,4 +289,8 @@ audit is pending before any public release.
   tracecontext — clean-room from the W3C Trace Context Level 1 recommendation
                (`traceparent`/`tracestate`). No third-party source copied.
 
+  cookies    — clean-room from RFC 6265 (HTTP State Management Mechanism):
+               the Cookie request-header grammar (sec 5.4). No third-party
+               source consulted or copied.
+
 See each module's README "Provenance" note for its specific seed and reference.

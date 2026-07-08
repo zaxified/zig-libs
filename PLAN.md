@@ -326,7 +326,7 @@ fmt green. **Still open:** request-ID mw · health helper · conditional-req · 
   anti-smuggling RFC 9112 §2.2 → 400) · ✅ **auto-OPTIONS** in router (opt-in `auto_options` → 204 + Allow) ·
   ✅ **Link pagination** (NEW `linkheader`, RFC 8288) · ✅ **Idempotency-Key** (NEW `idempotency`, ramcache
   Store + replay middleware) · ✅ **HMAC signing** (NEW `webhooksig`, GitHub/Stripe const-time verify+rotation) ·
-  ✅ **traceparent/OTel** (NEW `tracecontext`, W3C Trace Context + `current()`). **Still open:** cookies +
+  ✅ **traceparent/OTel** (NEW `tracecontext`, W3C Trace Context + `current()`). **Still open:** cookies (🟡 **P1 Cookie parser DONE** — new `cookies` module, `parse`/`find`, Fable 6 tests; P2 Set-Cookie builder w/ SameSite next) ·
   Set-Cookie(SameSite) · Range/206 · inbound gzip request body · content negotiation · request trailers ·
   per-conn request-count cap · HTTP/3 (large, deferred/never).
 - Excluded/decided: **TLS = proxy** (then ianic spike); **upstream LB/pool** = app-elevation #2 below.
