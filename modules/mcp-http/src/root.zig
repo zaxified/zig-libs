@@ -20,12 +20,12 @@
 //!
 //! ## Security
 //!
-//! Bind the server to loopback for a local integration, or put auth in front:
-//! register an `aaa-gate`/`jwt` middleware **before** this one to gate the
-//! endpoint (MCP has no read/write method split, so gate every POST). The MCP
-//! spec also requires validating the `Origin` header against DNS-rebinding for
-//! locally-bound servers — do that with a dedicated middleware (a following
-//! part) or a reverse proxy. This module itself does no authentication.
+//! **Origin validation** (the MCP-mandated DNS-rebinding defense) is built in:
+//! set `Transport.allowed_origins` and a browser request forging another site's
+//! `Origin` gets 403 (empty ⇒ accept all — the dev default). **Authentication**
+//! is not: register an `aaa-gate`/`jwt` middleware **before** this one to gate
+//! the endpoint (MCP has no read/write method split, so gate every POST). Bind
+//! to loopback for a local integration, or terminate auth at a reverse proxy.
 //!
 //! ## Usage
 //!
@@ -95,6 +95,16 @@ pub const Transport = struct {
     max_body: usize = 4 << 20,
     /// Serialize `handleMessage` (see `Lock`). Default `.none`.
     lock: Lock = .none,
+    /// Allowed `Origin` header values (exact match) — the MCP-mandated
+    /// DNS-rebinding defense for a locally-bound server (browser JS on another
+    /// site cannot forge `Origin`). **Empty ⇒ every origin is accepted** (the
+    /// dev default; safe only when the port is not reachable by a browser, e.g.
+    /// loopback with no local web content, or auth in front). When non-empty, a
+    /// request whose `Origin` header is present but not listed gets **403**; a
+    /// request with **no** `Origin` (a non-browser client) is allowed — the
+    /// attack this blocks is browser-driven. List full origins,
+    /// e.g. `"http://localhost:7717"`.
+    allowed_origins: []const []const u8 = &.{},
 
     pub fn middleware(t: *const Transport) router.Middleware {
         return .{ .state = @constCast(t), .run = middlewareRun };
@@ -105,6 +115,13 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
     const t: *const Transport = @ptrCast(@alignCast(state.?));
 
     if (!std.mem.eql(u8, ctx.req.path, t.path)) return next.run(ctx);
+
+    if (!originAllowed(t, ctx.req)) {
+        ctx.res.setStatus(403);
+        try ctx.res.setHeader("Content-Type", "text/plain");
+        try ctx.res.writeAll("Forbidden\n");
+        return;
+    }
 
     switch (ctx.req.method) {
         .post => return handlePost(t, ctx),
@@ -117,6 +134,18 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
             try ctx.res.writeAll("Method Not Allowed\n");
         },
     }
+}
+
+/// DNS-rebinding guard (MCP transport security): with a non-empty allowlist, a
+/// present `Origin` must match exactly; an absent `Origin` (non-browser client)
+/// is allowed. An empty allowlist accepts everything.
+fn originAllowed(t: *const Transport, req: *const http.Server.Request) bool {
+    if (t.allowed_origins.len == 0) return true;
+    const origin = req.header("origin") orelse return true;
+    for (t.allowed_origins) |allowed| {
+        if (std.mem.eql(u8, allowed, origin)) return true;
+    }
+    return false;
 }
 
 fn handlePost(t: *const Transport, ctx: *router.Ctx) anyerror!void {
@@ -206,6 +235,13 @@ fn post(comptime target: []const u8, comptime json: []const u8) []const u8 {
     return std.fmt.comptimePrint(
         "POST {s} HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
         .{ target, json.len, json },
+    );
+}
+
+fn postOrigin(comptime origin: []const u8, comptime json: []const u8) []const u8 {
+    return std.fmt.comptimePrint(
+        "POST /mcp HTTP/1.1\r\nHost: t\r\nOrigin: {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+        .{ origin, json.len, json },
     );
 }
 
@@ -304,6 +340,38 @@ test "non-/mcp path passes through; GET /mcp → 405" {
     const get = runWire(&r, "GET /mcp HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &buf2);
     try testing.expect(std.mem.startsWith(u8, get, "HTTP/1.1 405"));
     try testing.expect(std.mem.indexOf(u8, get, "Allow: POST") != null);
+}
+
+test "Origin allowlist: match → 200, mismatch → 403, absent → allowed" {
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    const origins = [_][]const u8{"http://localhost:7717"};
+    var transport = Transport{ .gpa = gpa, .server = &server, .allowed_origins = &origins };
+
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+
+    var b1: [4096]u8 = undefined;
+    const ok = runWire(&r, postOrigin("http://localhost:7717",
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/list"}
+    ), &b1);
+    try testing.expect(std.mem.startsWith(u8, ok, "HTTP/1.1 200"));
+
+    var b2: [4096]u8 = undefined;
+    const bad = runWire(&r, postOrigin("http://evil.example",
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/list"}
+    ), &b2);
+    try testing.expect(std.mem.startsWith(u8, bad, "HTTP/1.1 403"));
+
+    // A client that sends no Origin (non-browser) is allowed even with an
+    // allowlist — the DNS-rebinding attack is browser-driven.
+    var b3: [4096]u8 = undefined;
+    const no_origin = runWire(&r, post("/mcp",
+        \\{"jsonrpc":"2.0","id":3,"method":"tools/list"}
+    ), &b3);
+    try testing.expect(std.mem.startsWith(u8, no_origin, "HTTP/1.1 200"));
 }
 
 test "oversized POST body → 413" {
