@@ -90,6 +90,11 @@ pub const Client = @import("Client.zig");
 /// socket-free `Server.serveStream` codec loop, and the TCP serving loop.
 pub const Server = @import("Server.zig");
 
+/// Conditional requests (RFC 9110 §8.8/§13): ETag / Last-Modified validators
+/// with `If-Match` / `If-None-Match` / `If-Modified-Since` /
+/// `If-Unmodified-Since` → 304 Not Modified / 412 Precondition Failed.
+pub const conditional = @import("conditional.zig");
+
 // ── request vocabulary ──────────────────────────────────────────────────────
 
 pub const Method = enum {

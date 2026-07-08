@@ -60,8 +60,12 @@ audit is pending before any public release.
                rules) + RFC 7301 (ALPN — consumed for h2-over-TLS dispatch, not
                implemented); the HTTP/2 DoS mitigations are clean-room from the
                public CVE-2023-44487 / CVE-2024-27316 advisories (behavior
-               only). Clean-room from the RFCs, no HPACK/HTTP-2/nghttp2 source
-               consulted or copied; TLS via Zig std.crypto.tls.
+               only). Conditional requests (ETag/If-* -> 304/412) are
+               clean-room from RFC 9110 sec 8.8/13; the HTTP-date parser
+               follows RFC 9110 sec 5.6.7 (all three formats) with the
+               days-from-civil epoch conversion (Howard Hinnant's public
+               algorithm). Clean-room from the RFCs, no HPACK/HTTP-2/nghttp2
+               source consulted or copied; TLS via Zig std.crypto.tls.
   dns        — RFC 1035 (wire), RFC 8484 (DoH), RFC 2782 (SRV), RFC 8659
                (CAA); design ref: miekg/dns (BSD-3-Clause) + c-ares —
                behavior only, no source copied.

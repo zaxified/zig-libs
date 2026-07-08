@@ -297,7 +297,10 @@ fmt green. **Still open:** request-ID mw · health helper · conditional-req · 
 - 🟡 **health/readiness** endpoint helper (LB/k8s probes). **small · Opus.**
 - 🟡 **access-log writer** — the `on_request`/`AccessEntry` hook exists (metrics:610), ship a default writer. **small · Opus.**
 - 🟡 **API-key auth** (`X-Api-Key`) — aaa-gate is Bearer-only. aaa-gate ext. **small.**
-- 🟡 **conditional requests** ETag/If-None-Match/Last-Modified → 304. http ResponseWriter helper. **small-med · Fable.**
+- ✅ **conditional requests** — `http.conditional` (RFC 9110 §8.8/§13): ETag weak/strong + `If-Match` /
+  `If-None-Match` / `If-Modified-Since` / `If-Unmodified-Since` → 304 / 412 (optimistic-concurrency guard),
+  `parseHttpDate` (all 3 HTTP-date formats), `apply()` handler helper (auto-emits ETag; 304 body-drop via
+  the server core). +16 tests incl. serveStream goldens (Fable value-add, 2026-07-08).
 - 🟡 **multipart/form-data + x-www-form-urlencoded** body parsing (if the API takes forms/uploads). **medium · Fable.**
 - 🟡 **JWT/JWKS OAuth2/OIDC resource-server** — split into 6 committable parts (large, Fable, NEW `jwt`
   module). **P1 ✅** (parse + claims, 19 tests) · **P2 ✅** (HS/ES/EdDSA verify + RFC 7515/8037 KATs +
