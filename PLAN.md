@@ -37,7 +37,8 @@ transport), and the content-negotiation + Range/206 HTTP feature families are co
 `ipcbus` (dep framing; dispatch refactored to a callback). **Wave 5 landed 2026-07-09 — pure-Opus
 extraction COMPLETE:** `csvstream` (merge csv.zig + ChunkReader, byte-offset streaming) · `csvsafe` (OWASP
 injection guard carved from 3 fused concerns) · `numparse` (grouped-number parse carved from expr.zig).
-**Only the two Fable-wait extractions remain (`encoding` full WHATWG, `unaccent` clean-room UCD).**
+**Extraction scope finalized 2026-07-09 (reuse-filter): `encoding` extracting now (Opus); `exprcalc` +
+`unaccent` DROPPED (app-specific / externally-coupled — kept in their home projects).**
 Findings + reclassifications below. **`roquery` DROPPED from the module set (decision 2026-07-09, see Key
 decisions): its hardening is C-level, and zig-libs stays 100% pure-Zig — it lives consumer-side over
 ADOPTed SQLite.**
@@ -105,13 +106,13 @@ RFC codecs). Archetypes: ① HTTP/SaaS backend · ② netops · ③ IoT · ④ A
 | ✅ **`tabular`** DONE `6e19fc1` | ⑤ | dataset algebra T0+T1 (wgs transforms+series seed) |
 | ✅ **`jsonshape`** DONE `6a74016` | ⑤ | JSON→dataset dot-path projection (wgs seed) |
 | ✅ **`finstats`** DONE `0813d5c` | ⑤ finance | xirr/TWR/risk/beta/MonteCarlo/corr (wgs finance.zig seed) |
-| 🟡 `exprcalc` → **Opus EXTRACT, dep-blocked** (reclassified from Fable 2026-07-09) | ③ rules / config transforms | **Mature seed: bxp-core/src/expr.zig — 6532 LOC, 157 tests** (the file numparse was carved from), so this is a faithful lift, NOT a Fable value-add build. Real blocker = deps: `datefmt`/`tz`/`decimal` ready ✓, but it imports `encoding` (Fable-wait), `unicode`=`unaccent` (Fable-wait), and **`regex`** (⚠️ no regex module in zig-libs — regex is ADOPT-only, an external dep vs the zero-dep invariant; exprcalc has regex builtins). **Path: extract a "core exprcalc" now with the regex/charset/unaccent builtins feature-gated** (most of the 157 tests are logic/text/number/date/lookup), add them when those deps land. Needs a carve-out scope |
+| ❌ `exprcalc` → **DROPPED (not a zig-libs module)** | ③ rules / config transforms | Mature seed (bxp expr.zig, 6532 LOC/157 tests) but **reuse-filter DROP 2026-07-09**: it's an app-specific spreadsheet/rules engine (the user won't reuse it cross-project) AND externally coupled (`regex` = external ADOPT vs zero-dep). Stays in bxp |
 | ❌ `roquery` → **DROPPED (not a zig-libs module)** | ⑤ + safe reporting | hardened read-only SQLite is **C-level** (the enforcement — `sqlite3_open_v2(READONLY)`, `PRAGMA query_only`, `sqlite3_set_authorizer`, `db_config` load-ext toggle — is raw C-API). Building it here would make zig-libs' first `@cImport` + libc user. **Decision 2026-07-09: keep the repo 100% pure-Zig → the hardened wrapper stays consumer-side over ADOPTed `zig-sqlite`.** `wgs/src/sqlite.zig` is the app-side reference impl |
 | ✅ **`filestore`** DONE `5d2956d` | ① DB-less persist | keyed kind/key files, atomic temp-rename + segmentSafe added (seed had neither); std-only, no hashdigest dep (axp-central seed) |
 | 🔀 `taskqueue` → **FOLD into `jobqueue`** | ③ fleet C2 | scope 2026-07-09: storage adds nothing over `filestore`; the value (lease/retry/DLQ) is jobqueue's job; only per-partition FIFO is worth keeping → build it as a `jobqueue` partition-key feature (`nextFor(partition)` + a real `priority` field), not a standalone module. Seed's id-arithmetic priority hack silently clobbers records |
 | ✅ `rawsock` → **BUILD DONE** `13149e3` | ② capture/inject | full AF_PACKET: capture/inject/BPF/promisc/iface-enum + typed frame decode; pure helpers root-free-testable, socket tests netns-gated (verified 9/9 under `unshare -rn`). Linux-only |
 | ✅ `argsafe` → **BUILD DONE** `a28d779` | hardening | consolidated axp's 14 ad-hoc validators into one composable `CharClass` + convenience predicates + a poison-on-reject `Argv` builder; flag-injection/NUL/`..` fixed as default |
-| bxp text libs (scoped 2026-07-09): ✅ `datefmt` `5d2956d` · ✅ `diagnostics` `5d2956d` · ✅ `json5` `5d2956d` · ✅ `zipstream` `5d2956d` | ⑤ + i18n | DONE (Wave 3). ✅ **`tz`** DONE (Wave 4). ✅ **`csvstream`** · ✅ **`csvsafe`** · ✅ **`numparse`** DONE (Wave 5). **All bxp-text-lib EXTRACTs done** except the two Fable-wait items (`encoding`/`unaccent`). **Fable-headroom (wait for reset):** `encoding` (5 code pages → full WHATWG), `unaccent` (⚠️ seed needs external `uucode` → violates zero-dep; Fable must clean-room UCD tables like `tz-gen`) |
+| bxp text libs (scoped 2026-07-09): ✅ `datefmt` `5d2956d` · ✅ `diagnostics` `5d2956d` · ✅ `json5` `5d2956d` · ✅ `zipstream` `5d2956d` | ⑤ + i18n | DONE (Wave 3). ✅ **`tz`** DONE (Wave 4). ✅ **`csvstream`** · ✅ **`csvsafe`** · ✅ **`numparse`** DONE (Wave 5). **All bxp-text-lib EXTRACTs done.** `encoding` (5 code pages, std-only) **extracting now (Opus)** — full WHATWG coverage is a deferred Fable enhancement. ❌ `unaccent` **DROPPED** (reuse-filter: seed is fully dependent on external `uucode`; not worth clean-rooming UCD tables for a marginal cross-project pull — stays in bxp) |
 | IPC glue (scoped 2026-07-09): ✅ `framing` = `lenframe`+`jsonwire` FOLDED `5d2956d` | same-host IPC | DONE (Wave 3). ✅ **`pollworker`** + **`ipcbus`** DONE (Wave 4). **`chunkframe` → SKIP** (~20 LOC base64+JSON-envelope glue with a narrow one-bridge `why`; documented pattern, not a module) |
 
 ### BUILD → Opus (greenfield, standard pattern / integration)
@@ -182,10 +183,15 @@ Six faithful spec-complete lifts landed. Deferred per-module:
   contradicted the module's atomicity claim; routed through temp+rename (`5d2956d`).
 
 ### Deferred / big commitments (decide per product need)
-`kafka` (large / bind librdkafka) · full **YAML 1.2** (upgrade ymlz) · **Jinja** template engine ·
-`imap` (only if a product ingests mail) · **`Reconcilable(T)`** (generalize axp `resource.zig`
-desired/applied-generation + anti-brick rollback → k8s-controller-lite for config-mgmt/fleet) ·
-`kv` on-disk/MVCC/txn/ordered-scans · pure-Zig SSH (post-binding) · OPC-UA (huge, IoT).
+- **`Reconcilable(T)`** — generalize axp `resource.zig`: desired/applied-generation + anti-brick rollback →
+  a small embeddable k8s-controller-lite reconcile loop for config-mgmt/fleet. Genuinely cross-project
+  (state-convergence pattern), pure-Zig-viable; extract only when a concrete need appears (needs a scope to
+  separate the generic loop from axp's specific resource types).
+- **`kv` on-disk/MVCC/txn/ordered-scans** — enhance the existing flagship.
+- **External-coupled → stay ADOPT/consumer-side, NOT zig-libs** (per the pure-Zig/reuse filter): `kafka`
+  (librdkafka bind), pure-Zig `ssh` (libssh2 bind), `OPC-UA` (huge), `grpc` (needs protobuf), `regex`
+  (deliberately external — two mature Zig regex projects already exist: `mnemnion/mvzr`, `zig-utils/zig-regex`).
+- **DROPPED — won't need (2026-07-09):** ~~full YAML 1.2~~ · ~~Jinja~~ · ~~imap~~ · ~~HTTP/3 (QUIC)~~.
 
 ### Recommended sequence
 0. ✅ **Extraction waves 1–3 DONE (Opus, 2026-07-09):** W1 `procrun`+`procnet`+`blobstore`; W2 wgs data
@@ -193,20 +199,19 @@ desired/applied-generation + anti-brick rollback → k8s-controller-lite for con
    `json5`+`zipstream` (+`blobstore.putNamed` atomicity fix). `roquery` dropped (C-level), `taskqueue`
    folded into jobqueue, `chunkframe` skipped.
 1. ✅ **Extraction COMPLETE (Opus, 2026-07-09):** Waves 4+5 done (`tz`/`pollworker`/`ipcbus`, then
-   `csvstream`/`csvsafe`/`numparse`). Only Fable-wait extractions remain (`encoding` full WHATWG ·
-   `unaccent` clean-room UCD tables, no external `uucode`).
+   `csvstream`/`csvsafe`/`numparse`). `encoding` extracting now (Opus lift; full WHATWG deferred). Reuse-
+   filter DROPPED: `exprcalc` (app rules engine + external regex) and `unaccent` (fully external `uucode`).
 2. **Pure-Opus BUILD phase — wave 1 DONE 2026-07-09:** ✅ `argsafe` · ✅ `sessions`+CSRF · ✅ `jobqueue`
    (over `kv`, taskqueue partition-FIFO folded) · ✅ `llmclient` (Anthropic + new client-side SSE parser).
    ✅ `rawsock` DONE (full AF_PACKET, verified under netns). **Build phase essentially COMPLETE.**
    `testkit` DEFERRED — its scope came back mostly stale (netns/VOPR don't exist to consolidate); the honest
    remainder (runWire+FakeClock dedup) needs a build.zig test-only-dep mechanism + a 19-module refactor to
    pay off. With adopted pg/smtp/ws/log/toml, ① is a deployable backend stack.
-3. **`exprcalc` — Opus EXTRACT now (not Fable):** mature bxp expr.zig seed (6532 LOC/157 tests); extract a
-   core with regex/charset/unaccent builtins feature-gated (its only missing deps). Needs a carve-out scope.
-4. **When Fable resets:** finish SNMP T-G/T-H, then `stun`/`sntp`/`syslog`, MQTT broker,
-   coap C6/C7, plus the Fable-wait extraction items (`encoding`/`unaccent`) — which also un-gate exprcalc's
-   charset/unaccent builtins.
-5. **Then decide:** `ssh` (bind), `grpc`, and the deferred big items per which product you commit to.
+3. **When Fable resets:** finish SNMP T-G/T-H, then `stun`/`sntp`/`syslog`, MQTT broker,
+   coap C6/C7. (`encoding` full-WHATWG coverage is an optional Fable enhancement on top of the Opus lift.)
+4. **Pre-public security/similarity review gate** (Opus, highest-value before any release) — see checklist below.
+5. **Then decide per product:** `Reconcilable(T)`, `kv` on-disk, and any external-coupled capability
+   (`ssh`/`grpc`/`kafka`/`OPC-UA`) as a consumer-side ADOPT, not a zig-libs module.
 
 ## Key decisions & deferred
 

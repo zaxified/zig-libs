@@ -104,8 +104,9 @@ Two research sweeps (sibling-repo seeds + Zig-ecosystem adopt-vs-build) against 
   Pure-Zig SSH is huge; start as a hardened binding + a Zig automation API. Unlocks ② netops.
 - **`grpc`** (BUILD large-but-contained) — gRPC framing/streaming/status over our **existing HTTP/2** +
   adopted `zig-protobuf`. No trustworthy pure-Zig gRPC. Unlocks microservice interop.
-- Deferred/optional: Kafka (large / bind librdkafka) · full YAML 1.2 · Jinja template engine · IMAP
-  (only if a product ingests mail) · **reconcile/drift** `Reconcilable(T)` (generalize axp
+- **DROPPED — won't need (2026-07-09):** ~~full YAML 1.2~~ · ~~Jinja~~ · ~~IMAP~~ · ~~HTTP/3~~. External-coupled
+  (Kafka/librdkafka, ssh/libssh2, grpc/protobuf, regex) stay consumer-side ADOPT, not modules.
+- Decide-per-need: **reconcile/drift** `Reconcilable(T)` (generalize axp
   `resource.zig` desired/applied-generation + anti-brick rollback — a k8s-controller-lite for
   config-mgmt/fleet apps).
 
@@ -174,7 +175,7 @@ hardened wrapper (ex-`roquery`, not a module). ③ IoT → jobqueue/taskqueue + 
 - **`datefmt`** ⚡ `extract·any·util·reent` — Parse/format dates with strftime-like patterns + a correct civil calendar (incl. pre-1970). Why: std has no date parse/format. Deps: (std). Model: Hinnant date/chrono. Seed: bxp datefmt.zig. **Decision:** —
 - **`tz`** `extract·any·util·reent` — Given a zone name + instant, return the DST-correct UTC offset (committed IANA tables). Why: std.Tz only parses TZif, no name→offset. Deps: std.Tz (build-time gen). Model: ICU / IANA tzdb. Seed: bxp tz.zig + tools/tz-gen. **Decision:** —
 - **`encoding`** `gap·any·codec·reent` — Convert legacy single-byte code pages (Windows-1250/1252, ISO-8859-*) ↔ UTF-8. Why: the iconv job; neither Zig unicode lib has it. Deps: (std). Model: iconv / WHATWG Encoding. Seed: bxp encoding.zig. **Decision:** —
-- **`unaccent`** `extract·any·util·reent` — Fold UTF-8 text: upper/lower incl. ß→SS, strip accents (slugify/search-normalize). Why: common need, no std answer (case tables from uucode). Deps: uucode *(adopt ext)*. Model: ICU translit / PG unaccent. Seed: bxp unicode.zig. **Decision:** —
+- ~~**`unaccent`**~~ **❌ DROPPED 2026-07-09** (reuse-filter): fully dependent on external `uucode` (case/decomposition tables), which violates the zero-dep invariant; not worth clean-rooming UCD tables for a marginal cross-project pull. Stays in bxp (`unicode.zig`). **Decision:** DROP.
 - **`finstats`** ⚡ `extract·any·util·tsafe` — Portfolio/return analytics, **advanced set**: XIRR/TWR, vol/Sharpe/Sortino/Calmar, max-drawdown + recovery, correlation, quantiles/EMA, Monte-Carlo — **plus** beta/alpha (CAPM), tracking error, information ratio, historical + parametric VaR/CVaR, Omega/Ulcer, rolling windows, Brinson attribution. Why: currently duplicated Zig + JS; consolidate and go deep. Deps: (std math). Model: Python empyrical/ffn, QuantLib subset. Seed: poc-wf reader.zig + widgets.js. **Decision:** advanced set.
 
 ## 6. Storage / concurrency / IPC / crypto
@@ -195,7 +196,7 @@ hardened wrapper (ex-`roquery`, not a module). ③ IoT → jobqueue/taskqueue + 
 - **`diagnostics`** `extract·any·util·reent` — Collect structured validation errors (path/line/severity/code + "did you mean") — LSP-style. Why: any config/DSL validator. Deps: (std). Model: LSP Diagnostic / rustc. Seed: bxp diagnostics.zig. **Decision:** —
 - **`csvstream`** ⚡ `extract·any·codec·owned` — Stream-read RFC 4180 CSV records with byte offsets (for parallel processing + drill-back-to-source). Why: no std CSV; offset-tracking is the value. Deps: (std). Model: Go encoding/csv, Rust csv. Seed: bxp csv.zig + ChunkReader. **Decision:** —
 - **`csvsafe`** `extract·any·util·reent` — Sanitize CSV cells against spreadsheet formula injection (`=`,`+`,`@`…). Why: security primitive when emitting CSV. Deps: (std). Model: OWASP CSV-injection. Seed: bxp writeSafeValue. **Decision:** —
-- **`exprcalc`** ⚡ `extract·any·util·tsafe` — An embeddable Excel-like formula/expression evaluator (70+ builtins). Why: rules engines/config transforms; **capstone** that composes decimal/datefmt/encoding — do last. Deps: decimal, datefmt, tz, encoding, regex *(adopt)*, numparse. Model: CEL / HyperFormula. Seed: bxp expr.zig. **Decision:** —
+- ~~**`exprcalc`**~~ **❌ DROPPED 2026-07-09** (reuse-filter): app-specific spreadsheet/rules engine (not reused cross-project) AND externally coupled (needs `regex` = external ADOPT vs zero-dep). Mature seed (bxp expr.zig, 6532 LOC/157 tests) but stays in bxp. **Decision:** DROP.
 - **`testkit`** `gap·any·util·reent` — Shared test-harness helpers: golden-diff runner, network-namespace (`unshare -rn`) setup, and a VOPR-style deterministic fault-injection simulator. Why: so each lib doesn't re-invent verification (decided). Deps: (std). Model: TigerBeetle VOPR / fping golden-diff. Seed: patterns across zig-fping + AXP wg-lab. **Decision:** yes (one shared).
 
 ## 8. Web service / API (internet-facing behind Caddy)
