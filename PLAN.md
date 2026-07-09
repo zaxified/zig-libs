@@ -191,12 +191,24 @@ Six faithful spec-complete lifts landed. Deferred per-module:
 - **Also fixed (not a new module):** `blobstore.putNamed` was non-atomic (`writeFile`, no temp+rename) —
   contradicted the module's atomicity claim; routed through temp+rename (`5d2956d`).
 
-### Deferred / big commitments (decide per product need)
-- **`Reconcilable(T)`** — generalize axp `resource.zig`: desired/applied-generation + anti-brick rollback →
-  a small embeddable k8s-controller-lite reconcile loop for config-mgmt/fleet. Genuinely cross-project
-  (state-convergence pattern), pure-Zig-viable; extract only when a concrete need appears (needs a scope to
-  separate the generic loop from axp's specific resource types).
-- **`kv` on-disk/MVCC/txn/ordered-scans** — enhance the existing flagship.
+### Deferred / big commitments — both research-verdicted DON'T-BUILD-YET (2026-07-09)
+- **`Reconcilable(T)`** → **DON'T-BUILD-YET** (ecosystem-scanned). No Zig lib to adopt; the ONE real prior
+  art (`antflydb/antfly`, 400★ active) hit the desired-vs-actual pattern TWICE in one codebase and
+  deliberately did NOT unify it → domain-specific apply/rollback dominates, generic core buys little. axp's
+  own impl isn't shaped as a reusable interface (3 shape-different mechanisms glued by a wire protocol).
+  **No 2nd consumer** (bxp/wgs grep clean). **When a 2nd consumer appears:** extract a tiny `RollbackTimer`
+  (arm/confirm/overdue — the JunOS `commit confirmed` pattern; the one cleanly-generic piece axp already
+  wrote well) FIRST; leave the diff/apply loop caller-owned (kube-rs division: lib owns scheduling/generation
+  bookkeeping, caller owns semantics). Model after k8s controller-runtime generation/observedGeneration +
+  Terraform plan/apply/refresh separation.
+- **`kv` on-disk/MVCC/txn/ordered-scans** → **DON'T-BUILD-YET** (ecosystem-scanned). Multi-week+ build
+  (B-tree + WAL + MVCC + crash-proof + VOPR sweep) with ZERO current consumers demanding scans/txn. No
+  adoptable Zig engine (turbodb/kvdb/wombat all self-labeled alpha; TigerBeetle production but fused to VSR,
+  not embeddable; C-bindings disqualified by zero-dep). **When greenlit: STEAL-PATTERNS** — B-tree over LSM
+  (matches kv's embedded/single-writer/VOPR profile), borrow `xitdb` (106★, targets 0.16, MIT — its HAMT/
+  B-tree + **immutable-snapshot-as-MVCC** trick maps onto kv's existing atomic-swap seam) + TigerBeetle's
+  VOPR methodology (not code). Phased: ordered-scan B-tree → atomic batches → MVCC snapshot reads →
+  secondary indexes. Bitcask kv is enough until then.
 - **External-coupled → stay ADOPT/consumer-side, NOT zig-libs** (per the pure-Zig/reuse filter): `kafka`
   (librdkafka bind), pure-Zig `ssh` (libssh2 bind), `OPC-UA` (huge), `grpc` (needs protobuf), `regex`
   (deliberately external — two mature Zig regex projects already exist: `mnemnion/mvzr`, `zig-utils/zig-regex`).
@@ -220,8 +232,9 @@ Six faithful spec-complete lifts landed. Deferred per-module:
    adoptable Zig lib), built clean-room from RFCs + reference designs + official test vectors.
 4. **When Fable resets:** finish SNMP T-G/T-H, coap C6/C7, MQTT broker (large; reuses our `mqtt` client).
 5. **Pre-public security/similarity review gate** (Opus, highest-value before any release) — see checklist below.
-6. **Then decide per product:** `Reconcilable(T)`, `kv` on-disk, and any external-coupled capability
-   (`ssh`/`grpc`/`kafka`/`OPC-UA`) as a consumer-side ADOPT, not a zig-libs module.
+6. **DON'T-BUILD-YET (research-verdicted, no consumer):** `Reconcilable(T)` + `kv` on-disk — build only when
+   a concrete 2nd/1st consumer appears (see Deferred section for the steal-patterns path). External-coupled
+   (`ssh`/`grpc`/`kafka`/`OPC-UA`) stay consumer-side ADOPT, never zig-libs modules.
 
 ## Key decisions & deferred
 
