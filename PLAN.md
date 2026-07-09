@@ -20,14 +20,16 @@ touch build.zig · README · PLAN · NOTICE — they report back; the owner veri
 
 ## Status (2026-07-09)
 
-**56 modules · 1516 tests** (1513 pass + 3 env-gated skips: ubus/wireguard/blobmsg live checks) ·
-Debug + ReleaseFast green · `zig fmt` clean · MIT. Latest commit `6e19fc1`.
+**62 modules · 1582 tests** (1579 pass + 3 env-gated skips: ubus/wireguard/blobmsg live checks) ·
+Debug + ReleaseFast green · `zig fmt` clean · MIT. Latest commit `5d2956d`.
 Web/API cluster, HTTP/1.1+HTTP/2 stack, `kv` (+VOPR), network family, crypto leaves, MCP (+HTTP/SSE
 transport), and the content-negotiation + Range/206 HTTP feature families are complete.
 **Extraction wave 1 landed 2026-07-09** (Opus-coordinated, agent-built): `blobstore` (`24833cf`),
 `procnet` (`b5bdc30`), `procrun` (`b874389`). **Wave 2 — the wgs data family (⑤ analytics) landed
 2026-07-09:** `dataset` (`3e2c5be`, anchor) → `tabular` (`6e19fc1`) + `jsonshape` (`6a74016`) +
-`finstats` (`0813d5c`) (parallel). Findings +
+`finstats` (`0813d5c`) (parallel). **Wave 3 — extraction backlog (Opus, 6 parallel builders) landed
+2026-07-09:** `filestore` · `framing` (folds lenframe+jsonwire) · `datefmt` · `diagnostics` · `json5` ·
+`zipstream`; plus a `blobstore.putNamed` atomicity bugfix surfaced during scoping. Findings +
 reclassifications below. **`roquery` DROPPED from the module set (decision 2026-07-09, see Key
 decisions): its hardening is C-level, and zig-libs stays 100% pure-Zig — it lives consumer-side over
 ADOPTed SQLite.**
@@ -96,12 +98,12 @@ RFC codecs). Archetypes: ① HTTP/SaaS backend · ② netops · ③ IoT · ④ A
 | ✅ **`jsonshape`** DONE `6a74016` | ⑤ | JSON→dataset dot-path projection (wgs seed) |
 | ✅ **`finstats`** DONE `0813d5c` | ⑤ finance | xirr/TWR/risk/beta/MonteCarlo/corr (wgs finance.zig seed) |
 | ❌ `roquery` → **DROPPED (not a zig-libs module)** | ⑤ + safe reporting | hardened read-only SQLite is **C-level** (the enforcement — `sqlite3_open_v2(READONLY)`, `PRAGMA query_only`, `sqlite3_set_authorizer`, `db_config` load-ext toggle — is raw C-API). Building it here would make zig-libs' first `@cImport` + libc user. **Decision 2026-07-09: keep the repo 100% pure-Zig → the hardened wrapper stays consumer-side over ADOPTed `zig-sqlite`.** `wgs/src/sqlite.zig` is the app-side reference impl |
-| `filestore` | ① DB-less persist | third storage shape between `kv`/`blobstore`; add atomic rename |
-| `taskqueue` | ③ fleet C2 | proven offline-device job pattern (or fold into `jobqueue`) |
+| ✅ **`filestore`** DONE `5d2956d` | ① DB-less persist | keyed kind/key files, atomic temp-rename + segmentSafe added (seed had neither); std-only, no hashdigest dep (axp-central seed) |
+| 🔀 `taskqueue` → **FOLD into `jobqueue`** | ③ fleet C2 | scope 2026-07-09: storage adds nothing over `filestore`; the value (lease/retry/DLQ) is jobqueue's job; only per-partition FIFO is worth keeping → build it as a `jobqueue` partition-key feature (`nextFor(partition)` + a real `priority` field), not a standalone module. Seed's id-arithmetic priority hack silently clobbers records |
 | ⚠️ `rawsock` → **reclassified BUILD** | ② capture/inject | seed is ~25 LOC receive-only (AF_PACKET open, duplicated 4× inline in axp); the real module — send/inject, BPF filter, promisc, iface enum — is mostly new construction, not extraction. Needs netns/root to verify |
 | ⚠️ `argsafe` → **reclassified BUILD** | hardening | no shared abstraction in the seed: 14 ad-hoc validator predicates across axp `task.zig`; the module is a *design consolidation* (composable `CharClass` + `safeArgv` builder), not a lift |
-| bxp text libs: `datefmt`·`tz`·`encoding`·`unaccent`·`numparse`·`json5`·`zipstream`·`csvstream`·`csvsafe`·`diagnostics` | ⑤ + i18n | copy-tier; `tz`/`encoding` have spec headroom → could be Fable |
-| `ipcbus`·`pollworker`·`chunkframe`·`lenframe`/`jsonwire` | same-host IPC | thin glue seeds (poc/axp) |
+| bxp text libs (scoped 2026-07-09): ✅ `datefmt` `5d2956d` · ✅ `diagnostics` `5d2956d` · ✅ `json5` `5d2956d` · ✅ `zipstream` `5d2956d` | ⑤ + i18n | DONE (Wave 3). Remaining EXTRACT: **`tz`** (dep datefmt; +5843-LOC IANA table + `tz-gen` tool; near spec-complete, minor Julian-day polish) → Wave 4. Design-first (carve-out before lift): **`csvstream`** (merge csv.zig `LineIterator` + a bxp-cli-private `ChunkReader`), **`csvsafe`** (split the OWASP formula-injection guard out of 3 fused concerns), **`numparse`** (carve from 6.5k-LOC expr.zig) → Wave 5. **Fable-headroom (wait for reset):** `encoding` (5 code pages → full WHATWG), `unaccent` (⚠️ seed needs external `uucode` → violates zero-dep; Fable must clean-room UCD tables like `tz-gen`) |
+| IPC glue (scoped 2026-07-09): ✅ `framing` = `lenframe`+`jsonwire` FOLDED `5d2956d` | same-host IPC | DONE (Wave 3). Remaining: **`pollworker`** (single-owner poll loop + fork/detach JobTable; genericize the curl-specific fork body; Linux) → Wave 4; **`ipcbus`** (dep framing; needs a real refactor — pull dispatch out of poc's `ctlHandleConn` into a callback) → Wave 4. **`chunkframe` → SKIP** (~20 LOC base64+JSON-envelope glue with a narrow one-bridge `why`; documented pattern, not a module) |
 
 ### BUILD → Opus (greenfield, standard pattern / integration)
 | Candidate | Unlocks | Why chosen |
@@ -157,6 +159,20 @@ All landed as faithful spec-complete v1 lifts (seed tests ported verbatim as the
   rejection, denied-query audit log, `.blob` support, concurrent-reader stress) belongs to the
   **consumer-side** wrapper over ADOPTed SQLite (`wgs/src/sqlite.zig`), not here.
 
+### Extraction wave-3 findings (2026-07-09, backlog + IPC/text libs) — deferred gaps
+Six faithful spec-complete lifts landed. Deferred per-module:
+- **`filestore`**: TTL/expiry (`putWithTTL`/`sweep`) · cross-process ingest locking · version/ETag
+  optimistic-concurrency writes.
+- **`framing`**: none substantive (max_frame parameterized; tag-keyed union confirmed).
+- **`datefmt`**: locale-aware month/day names · ISO-week-date · duration/period types · named canned
+  formats (RFC 2822/3339). (tz-aware formatting is the separate `tz` module, not this.)
+- **`diagnostics`**: rustc-style caret rendering · JSON serialization · sort-by-position.
+- **`json5`**: hex/leading-dot/trailing-dot numbers · ±Infinity/NaN · string line-continuations ·
+  formalize `AnnotatedResult` against the `diagnostics` module.
+- **`zipstream`**: zip64 (>4 GiB) · encrypted entries · bzip2/LZMA · ZIP writing.
+- **Also fixed (not a new module):** `blobstore.putNamed` was non-atomic (`writeFile`, no temp+rename) —
+  contradicted the module's atomicity claim; routed through temp+rename (`5d2956d`).
+
 ### Deferred / big commitments (decide per product need)
 `kafka` (large / bind librdkafka) · full **YAML 1.2** (upgrade ymlz) · **Jinja** template engine ·
 `imap` (only if a product ingests mail) · **`Reconcilable(T)`** (generalize axp `resource.zig`
@@ -164,18 +180,21 @@ desired/applied-generation + anti-brick rollback → k8s-controller-lite for con
 `kv` on-disk/MVCC/txn/ordered-scans · pure-Zig SSH (post-binding) · OPC-UA (huge, IoT).
 
 ### Recommended sequence
-0. ✅ **Extraction wave 1 (Opus, done 2026-07-09):** `procrun` + `procnet` + `blobstore`.
-   ✅ **Extraction wave 2 — wgs data family (Opus, done 2026-07-09):** `dataset` → `tabular` +
-   `jsonshape` + `finstats` (⑤ analytics spine landed; `roquery` dropped as C-level → consumer-side).
-1. **Next (Opus, now):** `sessions`+CSRF → with adopted pg/smtp/ws/log/toml this makes ① a deployable
-   backend stack. Then the `rawsock`/`argsafe` BUILDs (netops + hardening) now correctly scoped as build.
-2. **Wave 2 (Opus):** `jobqueue` · `llmclient` · `filestore`/`taskqueue`.
-3. ✅ **Big cheap win DONE (Opus, 2026-07-09):** the **wgs data family** — `dataset` is the sole root;
-   `tabular`/`jsonshape`/`finstats` depend only on it (NOT the serial chain the arrow implied) and were
-   built in parallel. Unlocks ⑤. `roquery` dropped (C-level → consumer-side; see Key decisions).
-4. **When Fable resets:** finish SNMP T-G/T-H, then `stun`/`sntp`/`syslog`, `exprcalc`, MQTT broker,
-   coap C6/C7.
-5. **Then decide:** `ssh` (bind), `grpc`, and the deferred big items per which product you commit to.
+0. ✅ **Extraction waves 1–3 DONE (Opus, 2026-07-09):** W1 `procrun`+`procnet`+`blobstore`; W2 wgs data
+   family `dataset`+`tabular`+`jsonshape`+`finstats`; W3 `filestore`+`framing`+`datefmt`+`diagnostics`+
+   `json5`+`zipstream` (+`blobstore.putNamed` atomicity fix). `roquery` dropped (C-level), `taskqueue`
+   folded into jobqueue, `chunkframe` skipped.
+1. **Finish extraction (Opus, next):**
+   - **Wave 4:** `tz` (dep datefmt) · `pollworker` (Linux) · `ipcbus` (dep framing, refactor).
+   - **Wave 5 (carve-out first):** `csvstream` · `csvsafe` · `numparse`.
+   - **Fable-wait:** `encoding` (full WHATWG) · `unaccent` (clean-room UCD tables, no external `uucode`).
+   - Also remaining EXTRACT: `rawsock`/`argsafe` are now **BUILD** (reclassified), do them in the build phase.
+2. **Then pure-Opus BUILD phase:** `sessions`+CSRF (① deployable backend with adopted pg/smtp/ws/log/toml)
+   · `jobqueue` (over pure-Zig `kv`, with the taskqueue partition-key feature) · `llmclient` · `rawsock` ·
+   `argsafe` · `testkit`.
+3. **When Fable resets:** finish SNMP T-G/T-H, then `stun`/`sntp`/`syslog`, `exprcalc`, MQTT broker,
+   coap C6/C7, plus the Fable-wait extraction items (`encoding`/`unaccent`).
+4. **Then decide:** `ssh` (bind), `grpc`, and the deferred big items per which product you commit to.
 
 ## Key decisions & deferred
 
