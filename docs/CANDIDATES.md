@@ -47,10 +47,13 @@ except sqlite). Extract in dependency order — `dataset` is the anchor everythi
   merge/join/date_part. Seed: wgs `src/transforms.zig` (~879) + `src/series.zig` (~522). Dep: `dataset`.
 - **`jsonshape`** `extract·any·codec·reent` — JSON→dataset reshaper (dot-path to array node, typed
   column projection). Seed: wgs `src/jsonshape.zig` (~222). Deps: `dataset` + `std.json`.
-- **`roquery`** (security) `extract·any·util·block` — hardened read-only SQLite→rows:
-  `SQLITE_OPEN_READONLY` + `PRAGMA query_only` + authorizer allow-list (deny ATTACH/PRAGMA/writes/DDL/
-  load_extension) + hard row cap + `:name` binding. **Has a real security-hardening value-add sliver.**
-  Seed: wgs `src/sqlite.zig` (~296). Deps: sqlite amalgamation + `dataset`. libc (sqlite).
+- ~~**`roquery`** (security)~~ **❌ DROPPED as a zig-libs module (decision 2026-07-09).** Hardened
+  read-only SQLite→rows (`SQLITE_OPEN_READONLY` + `PRAGMA query_only` + authorizer allow-list + row cap +
+  `:name` binding). The enforcement is **raw C-API** → building it here would need the sqlite amalgamation
+  + libc, breaking the repo's **pure-Zig, no-C** invariant (see PLAN Key decisions). It stays
+  **consumer-side** over ADOPTed `zig-sqlite`; `wgs/src/sqlite.zig` (~296) is the app-side reference. A
+  pure-Zig *SQL-statement validator / read-only policy* sliver could live here later, but the actual
+  connection/authorizer enforcement never can.
 - **`finstats`** ⚡ — build on `dataset`, seeding from wgs `src/finance.zig` (~802: xirr/twr/
   risk_metrics/beta_alpha/monte_carlo/correlation_matrix/drawdown_episodes, fully tested) — far more
   mature than the earlier poc-wf source. Only Brinson/factor attribution missing (marginal). Dep: `dataset`.
@@ -68,7 +71,7 @@ Two research sweeps (sibling-repo seeds + Zig-ecosystem adopt-vs-build) against 
 | Capability | Adopt | Notes |
 |---|---|---|
 | PostgreSQL (wire v3) | `karlseguin/pg.zig` (MIT, ~577★, master→0.16) | pooling + TLS; **the backend DB unlock is free** |
-| SQLite | `vrischmann/zig-sqlite` / `karlseguin/zqlite.zig` (MIT) | poc already uses it; substrate for `roquery` + job-queue |
+| SQLite | `vrischmann/zig-sqlite` / `karlseguin/zqlite.zig` (MIT) | poc/wgs use it. **SQLite is C → the hardened wrapper (ex-`roquery`) + any SQLite-backed queue live consumer-side; zig-libs stays pure-Zig** (durable queue → build over pure-Zig `kv`) |
 | MySQL/MariaDB | `speed2exe/myzql` (MIT) | only option; smaller community |
 | SMTP | `karlseguin/smtp_client.zig` (MIT) | TLS-1.2 caveat (SES) — recheck on 0.16 std TLS |
 | WebSocket | `karlseguin/websocket.zig` (MIT) | both roles; upgrades from our http |
@@ -108,8 +111,9 @@ Two research sweeps (sibling-repo seeds + Zig-ecosystem adopt-vs-build) against 
 
 ### Archetype readiness after adopting + building the above
 ① backend → **near-complete** (adopt pg+smtp+ws+log+toml, build sessions + jobqueue). ⑤ data → the wgs
-family (seeds ready) + roquery. ③ IoT → jobqueue/taskqueue + MQTT broker (backlog). ④ AI-agent → llmclient.
-② netops → syslog + ssh + finish SNMP T-G/T-H.
+family **DONE** (`dataset`/`tabular`/`jsonshape`/`finstats`); safe-reporting = adopt SQLite + consumer-side
+hardened wrapper (ex-`roquery`, not a module). ③ IoT → jobqueue/taskqueue + MQTT broker (backlog).
+④ AI-agent → llmclient. ② netops → syslog + ssh + finish SNMP T-G/T-H.
 
 ---
 

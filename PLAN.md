@@ -28,7 +28,9 @@ transport), and the content-negotiation + Range/206 HTTP feature families are co
 `procnet` (`b5bdc30`), `procrun` (`b874389`). **Wave 2 — the wgs data family (⑤ analytics) landed
 2026-07-09:** `dataset` (`3e2c5be`, anchor) → `tabular` (`6e19fc1`) + `jsonshape` (`6a74016`) +
 `finstats` (`0813d5c`) (parallel). Findings +
-reclassifications below. **`roquery` remains — blocked on a repo-shape change (SQLite adoption).**
+reclassifications below. **`roquery` DROPPED from the module set (decision 2026-07-09, see Key
+decisions): its hardening is C-level, and zig-libs stays 100% pure-Zig — it lives consumer-side over
+ADOPTed SQLite.**
 
 ## Working policy — extraction vs value-add
 
@@ -71,7 +73,7 @@ RFC codecs). Archetypes: ① HTTP/SaaS backend · ② netops · ③ IoT · ④ A
 | Capability | Lib (MIT unless noted) | Why adopt |
 |---|---|---|
 | PostgreSQL wire v3 | `karlseguin/pg.zig` (→0.16) | proven; **makes ① backend cheap** — no build |
-| SQLite | `vrischmann/zig-sqlite` / `zqlite.zig` | poc uses it; substrate for `roquery`, `jobqueue` |
+| SQLite | `vrischmann/zig-sqlite` / `zqlite.zig` | poc/wgs use it. **SQLite is C → the hardened read-only wrapper (ex-`roquery`) + any SQLite-backed queue live consumer-side; zig-libs stays pure-Zig** |
 | MySQL/MariaDB | `speed2exe/myzql` | only option (smaller community) |
 | SMTP | `karlseguin/smtp_client.zig` | ① email; recheck TLS-1.2 on 0.16 |
 | WebSocket | `karlseguin/websocket.zig` | ①④ realtime; upgrades from our http |
@@ -93,7 +95,7 @@ RFC codecs). Archetypes: ① HTTP/SaaS backend · ② netops · ③ IoT · ④ A
 | ✅ **`tabular`** DONE `6e19fc1` | ⑤ | dataset algebra T0+T1 (wgs transforms+series seed) |
 | ✅ **`jsonshape`** DONE `6a74016` | ⑤ | JSON→dataset dot-path projection (wgs seed) |
 | ✅ **`finstats`** DONE `0813d5c` | ⑤ finance | xirr/TWR/risk/beta/MonteCarlo/corr (wgs finance.zig seed) |
-| ⏸️ `roquery` → **BLOCKED (owner infra)** | ⑤ + safe reporting | hardened read-only SQLite. **Prereq: adopt `vrischmann/zig-sqlite` into build.zig.zon (first external dep + first libc user in the repo) + generalize the build.zig module loop for one module's per-module libc/link flags.** Hardening logic is a straight lift (raw C-API, never used zig-sqlite's ergonomic wrapper) once the amalgamation compiles. Owner-executed, not agent |
+| ❌ `roquery` → **DROPPED (not a zig-libs module)** | ⑤ + safe reporting | hardened read-only SQLite is **C-level** (the enforcement — `sqlite3_open_v2(READONLY)`, `PRAGMA query_only`, `sqlite3_set_authorizer`, `db_config` load-ext toggle — is raw C-API). Building it here would make zig-libs' first `@cImport` + libc user. **Decision 2026-07-09: keep the repo 100% pure-Zig → the hardened wrapper stays consumer-side over ADOPTed `zig-sqlite`.** `wgs/src/sqlite.zig` is the app-side reference impl |
 | `filestore` | ① DB-less persist | third storage shape between `kv`/`blobstore`; add atomic rename |
 | `taskqueue` | ③ fleet C2 | proven offline-device job pattern (or fold into `jobqueue`) |
 | ⚠️ `rawsock` → **reclassified BUILD** | ② capture/inject | seed is ~25 LOC receive-only (AF_PACKET open, duplicated 4× inline in axp); the real module — send/inject, BPF filter, promisc, iface enum — is mostly new construction, not extraction. Needs netns/root to verify |
@@ -105,7 +107,7 @@ RFC codecs). Archetypes: ① HTTP/SaaS backend · ② netops · ③ IoT · ④ A
 | Candidate | Unlocks | Why chosen |
 |---|---|---|
 | **`sessions`** + CSRF | ① stateful web | no lib/seed; small, standard, composes `cookies` |
-| **`jobqueue`** (SQLite lease/retry/DLQ + cron loop) | ①③ background work | nothing durable pure-Zig; medium; fits zig-sqlite + adopted cron |
+| **`jobqueue`** (lease/retry/DLQ + cron loop) | ①③ background work | ⚠️ a SQLite backend is C (same rule as ex-`roquery`) → for a pure-Zig zig-libs module build it over the **pure-Zig `kv`** module; a SQLite-backed variant stays consumer-side |
 | **`llmclient`** (Anthropic/OpenAI) | ④ AI-agent | cheap on our `http`+`sse`+`json`; types + streaming |
 | `testkit` | all (verification) | shared golden-diff/netns/VOPR harness; stop re-inventing |
 | `ssh` (bind `libssh2` first) | ② netops automation | pure-Zig SSH is huge → ergonomic binding first, Zig automation API |
@@ -150,9 +152,10 @@ All landed as faithful spec-complete v1 lifts (seed tests ported verbatim as the
   ratio · rolling-window metric variants · Brinson factor attribution (the one involved addition) ·
   arbitrary VaR confidence + annualization-frequency presets · confidence intervals/std errors · xirr
   Newton-with-bisection-fallback + configurable tolerance.
-- **`roquery`** (once unblocked): statement-execution timeout (progress_handler) · per-function allow-list ·
-  `max_statement_bytes` cap · multi-statement rejection · connection pooling · denied-query audit log
-  (pairs with `aaa-gate`) · real `.blob` Value variant · concurrent-reader stress test.
+- **`roquery`** — DROPPED as a zig-libs module (C-level; see Key decisions). Its hardening backlog
+  (statement-execution timeout, per-function allow-list, `max_statement_bytes` cap, multi-statement
+  rejection, denied-query audit log, `.blob` support, concurrent-reader stress) belongs to the
+  **consumer-side** wrapper over ADOPTed SQLite (`wgs/src/sqlite.zig`), not here.
 
 ### Deferred / big commitments (decide per product need)
 `kafka` (large / bind librdkafka) · full **YAML 1.2** (upgrade ymlz) · **Jinja** template engine ·
@@ -163,21 +166,28 @@ desired/applied-generation + anti-brick rollback → k8s-controller-lite for con
 ### Recommended sequence
 0. ✅ **Extraction wave 1 (Opus, done 2026-07-09):** `procrun` + `procnet` + `blobstore`.
    ✅ **Extraction wave 2 — wgs data family (Opus, done 2026-07-09):** `dataset` → `tabular` +
-   `jsonshape` + `finstats` (⑤ analytics spine landed; only `roquery` remains, blocked on SQLite adoption).
+   `jsonshape` + `finstats` (⑤ analytics spine landed; `roquery` dropped as C-level → consumer-side).
 1. **Next (Opus, now):** `sessions`+CSRF → with adopted pg/smtp/ws/log/toml this makes ① a deployable
    backend stack. Then the `rawsock`/`argsafe` BUILDs (netops + hardening) now correctly scoped as build.
-   **`roquery`** whenever the owner does the SQLite-adoption infra step (build.zig.zon dep + per-module
-   libc/link generalization) — then it's a straight lift.
 2. **Wave 2 (Opus):** `jobqueue` · `llmclient` · `filestore`/`taskqueue`.
 3. ✅ **Big cheap win DONE (Opus, 2026-07-09):** the **wgs data family** — `dataset` is the sole root;
    `tabular`/`jsonshape`/`finstats` depend only on it (NOT the serial chain the arrow implied) and were
-   built in parallel. Unlocks ⑤. Only `roquery` remains (SQLite-adoption blocker).
+   built in parallel. Unlocks ⑤. `roquery` dropped (C-level → consumer-side; see Key decisions).
 4. **When Fable resets:** finish SNMP T-G/T-H, then `stun`/`sntp`/`syslog`, `exprcalc`, MQTT broker,
    coap C6/C7.
 5. **Then decide:** `ssh` (bind), `grpc`, and the deferred big items per which product you commit to.
 
 ## Key decisions & deferred
 
+- **🚫 zig-libs is 100% pure-Zig — no C, no libc, no external deps.** Hard invariant (verified
+  2026-07-09: `build.zig.zon` deps empty, zero `@cImport`/`linkLibrary`/`.c` source; the two
+  `builtin.link_libc` hits in `procrun` are a compile-time *type* branch that only adapts IF a consumer
+  links libc — the module never forces it). **Consequence:** any capability whose value is **C-level** —
+  hardened SQLite (`roquery`: the `authorizer`/`db_config`/`query_only`/`open_v2(READONLY)` enforcement is
+  raw C-API), a SQLite-backed queue, `libssh2`/`librdkafka` bindings, `OPC-UA` stacks — does **NOT** belong
+  in the module set. It stays in the **ADOPT** table and lives **consumer-side** over the adopted binding
+  (or, for a durable queue, over the pure-Zig `kv` module). BYO-seam is the pattern (same spirit as
+  BYO-TLS below): zig-libs may ship the pure-Zig *policy/validation* half, never the C enforcement half.
 - **TLS = proxy / bring-your-own.** The h2 stack takes an already-terminated (TLS) stream via the
   `serveStream` / `connectH2Over` + ALPN seam. 0.17 std TLS server is stalled (PR #23005); revisit
   when it ships or via an opportunistic ianic spike. kTLS = phase 2.
@@ -208,8 +218,8 @@ desired/applied-generation + anti-brick rollback → k8s-controller-lite for con
 - ☐ **Security / similarity review pass** (adversarial multi-agent, Opus 4.8): `acme` JWS/CSR ·
   `aaa-gate`/`jwt` const-time + alg-confusion + JWKS smuggling + rotation · `snmp.usm` const-time +
   md5/sha1 alg-confusion · `kv` fault-sweep · `http` redirect/auth-strip + h2 DoS + the parser cluster
-  (body/multipart/mcp-http/webhooksig/cookies/range/conneg) · `sealedbox`/`hashdigest` · `roquery`
-  (once built). Plus the line-level provenance/similarity audit **and** the files-vs-running test-count
+  (body/multipart/mcp-http/webhooksig/cookies/range/conneg) · `sealedbox`/`hashdigest`. Plus the
+  line-level provenance/similarity audit **and** the files-vs-running test-count
   check. Highest-value step before any release.
 - ☐ Optional `testkit` shared harness (golden-diff / netns / VOPR helpers).
 - ☐ Re-run the axp qemu `ubus -S` parity check against the extracted `blobmsg`.
