@@ -323,15 +323,24 @@ pub const Store = struct {
         return std.fmt.bufPrint(buf, "{s}/named/{s}", .{ self.base, ns });
     }
 
-    /// Write (overwrite) a named record. Validates `ns`+`key`.
+    /// Write (overwrite) a named record. Validates `ns`+`key`. Atomic: the bytes
+    /// land in a hidden temp and are made visible by one `rename(2)`, so a crash
+    /// mid-write never leaves a torn record (matches the cas/raw layers).
     pub fn putNamed(self: Store, ns: []const u8, key: []const u8, bytes: []const u8) !void {
         if (!segmentSafe(ns) or !segmentSafe(key)) return error.InvalidName;
         var dbuf: [640]u8 = undefined;
         const dir = try self.namedDir(&dbuf, ns);
         try ensureDir(self.io, dir);
+        var uniq_buf: [40]u8 = undefined;
+        const uniq = nextUniq(&uniq_buf);
+        var tbuf: [820]u8 = undefined;
+        const tmp = try std.fmt.bufPrint(&tbuf, "{s}/.{s}.part", .{ dir, uniq });
         var pbuf: [768]u8 = undefined;
         const path = try std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ dir, key });
-        try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = bytes });
+        const cwd = std.Io.Dir.cwd();
+        try cwd.writeFile(self.io, .{ .sub_path = tmp, .data = bytes });
+        errdefer cwd.deleteFile(self.io, tmp) catch {};
+        try cwd.rename(tmp, cwd, path, self.io);
     }
 
     /// Read a named record (allocated in `arena`), or null if absent.
