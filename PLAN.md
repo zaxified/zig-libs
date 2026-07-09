@@ -20,12 +20,15 @@ touch build.zig · README · PLAN · NOTICE — they report back; the owner veri
 
 ## Status (2026-07-09)
 
-**52 modules · 1471 tests** (1468 pass + 3 env-gated skips: ubus/wireguard/blobmsg live checks) ·
-Debug + ReleaseFast green · `zig fmt` clean · MIT. Latest commit `b874389`.
+**56 modules · 1516 tests** (1513 pass + 3 env-gated skips: ubus/wireguard/blobmsg live checks) ·
+Debug + ReleaseFast green · `zig fmt` clean · MIT. Latest commit `6e19fc1`.
 Web/API cluster, HTTP/1.1+HTTP/2 stack, `kv` (+VOPR), network family, crypto leaves, MCP (+HTTP/SSE
 transport), and the content-negotiation + Range/206 HTTP feature families are complete.
 **Extraction wave 1 landed 2026-07-09** (Opus-coordinated, agent-built): `blobstore` (`24833cf`),
-`procnet` (`b5bdc30`), `procrun` (`b874389`) — findings + reclassifications below.
+`procnet` (`b5bdc30`), `procrun` (`b874389`). **Wave 2 — the wgs data family (⑤ analytics) landed
+2026-07-09:** `dataset` (`3e2c5be`, anchor) → `tabular` (`6e19fc1`) + `jsonshape` (`6a74016`) +
+`finstats` (`0813d5c`) (parallel). Findings +
+reclassifications below. **`roquery` remains — blocked on a repo-shape change (SQLite adoption).**
 
 ## Working policy — extraction vs value-add
 
@@ -86,9 +89,11 @@ RFC codecs). Archetypes: ① HTTP/SaaS backend · ② netops · ③ IoT · ④ A
 | ✅ **`procrun`** ⭐ DONE `b874389` | universal (agent-tools/CI/ETL) | battle-tested subprocess + cross-platform reap-race fix (bxp-bridge). Extract-core + built the missing env/timeout/signal-escalation surface |
 | ✅ **`procnet`** DONE `b5bdc30` | ②/hardening | /proc+/sys parsers, typed netaddr returns + IPv6 (axp seed) |
 | ✅ **`blobstore`** DONE `24833cf` | ①/hardening | CAS store + put(reader)/verify/namespaced records (axp-vault seed) |
-| `dataset`→`tabular`→`jsonshape` | ⑤ (anchor family) | mature, tested wgs seeds; the analytics spine |
-| `roquery` | ⑤ + safe reporting | hardened read-only SQLite (adopts zig-sqlite); real security sliver |
-| `finstats` | ⑤ finance | wgs `finance.zig` is already advanced (VaR/sortino/monte-carlo) |
+| ✅ **`dataset`** DONE `3e2c5be` | ⑤ (anchor) | canonical typed table; the analytics spine root (wgs seed) |
+| ✅ **`tabular`** DONE `6e19fc1` | ⑤ | dataset algebra T0+T1 (wgs transforms+series seed) |
+| ✅ **`jsonshape`** DONE `6a74016` | ⑤ | JSON→dataset dot-path projection (wgs seed) |
+| ✅ **`finstats`** DONE `0813d5c` | ⑤ finance | xirr/TWR/risk/beta/MonteCarlo/corr (wgs finance.zig seed) |
+| ⏸️ `roquery` → **BLOCKED (owner infra)** | ⑤ + safe reporting | hardened read-only SQLite. **Prereq: adopt `vrischmann/zig-sqlite` into build.zig.zon (first external dep + first libc user in the repo) + generalize the build.zig module loop for one module's per-module libc/link flags.** Hardening logic is a straight lift (raw C-API, never used zig-sqlite's ergonomic wrapper) once the amalgamation compiles. Owner-executed, not agent |
 | `filestore` | ① DB-less persist | third storage shape between `kv`/`blobstore`; add atomic rename |
 | `taskqueue` | ③ fleet C2 | proven offline-device job pattern (or fold into `jobqueue`) |
 | ⚠️ `rawsock` → **reclassified BUILD** | ② capture/inject | seed is ~25 LOC receive-only (AF_PACKET open, duplicated 4× inline in axp); the real module — send/inject, BPF filter, promisc, iface enum — is mostly new construction, not extraction. Needs netns/root to verify |
@@ -129,6 +134,26 @@ Each landed module shipped a spec-complete v1; these are the follow-ups the extr
   line-delimited/NDJSON stdout mode · Windows reap-race coverage · compile-time double-wait guard ·
   PATH-resolution policy + `argsafe` integration (once `argsafe` lands).
 
+### Extraction wave-2 findings (2026-07-09, wgs data family) — deferred gaps, now backlog
+All landed as faithful spec-complete v1 lifts (seed tests ported verbatim as the oracle). Opus-doable.
+- **`dataset`**: `.decimal` Value variant composing the `decimal` module (exact money — cross-module) ·
+  true columnar storage (typed per-column arrays/SIMD; today row-major boxed cells) · streaming/chunked
+  construction for large result sets · dataset-level `distinct`/dedup.
+- **`tabular`**: multi-column + numeric-aware sort (pivot col-key `strLess` mis-sorts unpadded numerics) ·
+  grouped-series TA nodes (per-group EMA/MACD/RSI; wgs STATUS flags it) · `unpivot`/`melt` · right/full-
+  outer + multi-column + anti/semi joins · `distinct` without summing · `limit`/`offset` · strict-ordering
+  guard for rolling/outlierFlag.
+- **`jsonshape`**: full JSONPath (indexing/wildcards/repeated array nodes/filters) · nested-object
+  flattening (dotted key → column) · streaming parse for huge payloads · JSON→JSON reshape · schema
+  inference · a `strict` mode (wrong-path vs genuinely-empty).
+- **`finstats`**: parametric VaR/CVaR (Gaussian/Cornish-Fisher) · tracking error + info ratio · Omega
+  ratio · rolling-window metric variants · Brinson factor attribution (the one involved addition) ·
+  arbitrary VaR confidence + annualization-frequency presets · confidence intervals/std errors · xirr
+  Newton-with-bisection-fallback + configurable tolerance.
+- **`roquery`** (once unblocked): statement-execution timeout (progress_handler) · per-function allow-list ·
+  `max_statement_bytes` cap · multi-statement rejection · connection pooling · denied-query audit log
+  (pairs with `aaa-gate`) · real `.blob` Value variant · concurrent-reader stress test.
+
 ### Deferred / big commitments (decide per product need)
 `kafka` (large / bind librdkafka) · full **YAML 1.2** (upgrade ymlz) · **Jinja** template engine ·
 `imap` (only if a product ingests mail) · **`Reconcilable(T)`** (generalize axp `resource.zig`
@@ -137,12 +162,16 @@ desired/applied-generation + anti-brick rollback → k8s-controller-lite for con
 
 ### Recommended sequence
 0. ✅ **Extraction wave 1 (Opus, done 2026-07-09):** `procrun` + `procnet` + `blobstore`.
-1. **Wave 1 remainder (cheap, high unlock, Opus, now):** `sessions`+CSRF → with adopted pg/smtp/ws/
-   log/toml this makes ① a deployable backend stack. Then the `rawsock`/`argsafe` BUILDs (netops +
-   hardening) now that they're correctly scoped as build, not extract.
+   ✅ **Extraction wave 2 — wgs data family (Opus, done 2026-07-09):** `dataset` → `tabular` +
+   `jsonshape` + `finstats` (⑤ analytics spine landed; only `roquery` remains, blocked on SQLite adoption).
+1. **Next (Opus, now):** `sessions`+CSRF → with adopted pg/smtp/ws/log/toml this makes ① a deployable
+   backend stack. Then the `rawsock`/`argsafe` BUILDs (netops + hardening) now correctly scoped as build.
+   **`roquery`** whenever the owner does the SQLite-adoption infra step (build.zig.zon dep + per-module
+   libc/link generalization) — then it's a straight lift.
 2. **Wave 2 (Opus):** `jobqueue` · `llmclient` · `filestore`/`taskqueue`.
-3. **Big cheap win (Opus, parallel track):** the **wgs data family** (`dataset`→`tabular`→
-   `jsonshape`→`roquery`→`finstats`) → unlocks ⑤ wholesale; seeds ready.
+3. ✅ **Big cheap win DONE (Opus, 2026-07-09):** the **wgs data family** — `dataset` is the sole root;
+   `tabular`/`jsonshape`/`finstats` depend only on it (NOT the serial chain the arrow implied) and were
+   built in parallel. Unlocks ⑤. Only `roquery` remains (SQLite-adoption blocker).
 4. **When Fable resets:** finish SNMP T-G/T-H, then `stun`/`sntp`/`syslog`, `exprcalc`, MQTT broker,
    coap C6/C7.
 5. **Then decide:** `ssh` (bind), `grpc`, and the deferred big items per which product you commit to.
