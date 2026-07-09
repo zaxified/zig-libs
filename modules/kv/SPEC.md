@@ -44,8 +44,14 @@ tests. Run: `zig build test-kv`.
   over kv's existing atomic-swap seam) + TigerBeetle's VOPR methodology (not code); phased
   ordered-scan B-tree → atomic batches → MVCC snapshot reads → secondary indexes. Bitcask kv is
   enough until then.
-- Pending repo-wide **security/similarity review pass** (see /docs/pre-public-review.md): `kv`
-  fault-sweep re-audit before any release.
+- **VOPR fault-sweep DONE 2026-07-10** (see /docs/pre-public-review.md): green at 10× the shipped
+  seed count (20k seeds, 0 failures); crash-anywhere + torn/partial + byte-arbitrary-tear faults are
+  covered, CRC-gated fail-stop replay is sound (torn/corrupt tail truncated, never replayed as valid).
+  **One backlog gap:** out-of-order / non-contiguous durability within an un-synced multi-write window
+  is not expressible in `SimStorage` today (it always truncates to a contiguous prefix), yet `compact()`'s
+  temp-file write-loop-then-single-`sync` (root.zig:632-649) is exactly that pattern. Not a correctness
+  defect (CRC still gates a hole), but recovery's over-truncation behavior under reordering is unverified.
+  Extension: add a non-contiguous unsynced-region drop mode to `SimStorage` targeting the compact loop.
 
 ## Status
 

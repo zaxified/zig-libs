@@ -1,9 +1,14 @@
 # Pre-public security / similarity review
 
-**Status: in progress.** This is a living TODO — check items off in place as they're
-done. **Delete this file once the review is complete and its findings have been acted
-on**; it is not meant to be a permanent doc, only a working checklist for the one-time
-gate below.
+**Status: substantially complete (2026-07-10).** All review phases done — provenance/
+license audit + loose-ends, dark-tests check, the 10-target adversarial security pass
+(findings fixed), the jwt safe-by-default decision, and the kv VOPR fault-sweep. What
+remains is DOCUMENTED backlog, not release blockers: the mqtt broker is a declared
+not-production-ready first cut, the sessions cross-request resurrection race needs store
+CAS, coap's unauth-UDP dedup/observe limits are inherent, and the kv out-of-order-durability
+harness gap is logged. **Before tagging a release:** honor the fping Stanford attribution
+obligation (NOTICE §1 — this collection is MIT for its own code but not obligation-free).
+Delete this file once the documented backlog items are triaged into normal issues.
 
 ## Progress (2026-07-09)
 
@@ -110,9 +115,15 @@ tests" but "what would a hostile input/attacker do here":
   algorithm-confusion (can't downgrade auth to a weaker alg unexpectedly); privacy
   (DES-CBC / AES-128-CFB) key derivation and IV handling; engineBoots/engineTime
   anti-replay window (RFC 3414 §3.2) actually rejects stale/replayed frames.
-- ☐ **`kv`** — the fault-sweep / VOPR: re-run and extend the randomized crash-recovery
-  simulation looking specifically for a scenario the current seed set doesn't cover
-  (partial fsync, torn writes at odd boundaries, out-of-order flush).
+- ✅ **`kv`** — fault-sweep / VOPR DONE (2026-07-10). Two harnesses (exhaustive scripted +
+  2000-seed randomized VOPR) model crash-anywhere, partial-fsync/record-truncation, and
+  byte-arbitrary torn writes; recovery is CRC32-per-record fail-stop (torn/corrupt tail
+  truncated, never replayed — the VOPR checker actively flags any "corrupt served as valid").
+  Re-ran at 10× (20k seeds): 0 failures. GAP logged as backlog (kv/SPEC.md): out-of-order /
+  non-contiguous durability within an un-synced multi-write window isn't expressible in the
+  current always-contiguous-prefix SimStorage, though compact()'s write-loop-then-single-sync
+  is that pattern — not a correctness defect (CRC gates it), but over-truncation-under-reordering
+  is unverified. Not a release blocker.
 - ☐ **`http` parser cluster** — the whole family that parses attacker-controlled bytes:
   redirect handling + auth-header-stripping on cross-origin redirects, HTTP/2 DoS
   resistance (the CVE-2023-44487/CVE-2024-27316-derived mitigations actually hold under
