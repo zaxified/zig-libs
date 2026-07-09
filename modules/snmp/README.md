@@ -35,10 +35,21 @@ management work (alongside `netlink`, `nftables`, `icmp`).
     matching, error-status surfacing, and a GetNext `walker` with subtree,
     endOfMibView/noSuchName, and OID-not-increasing guards. `UdpTransport`
     is an optional real `std.Io.net` adapter (UDP/161); tests never send.
-  - Out of scope for now: SNMPv3 (USM/auth/priv), agent side, trap
-    listening, MIB parsing.
+  - **SNMPv3** (`v3`, `usm`, `des`, `priv`, `timewin`): the RFC 3412 message
+    envelope + ScopedPDU; the RFC 3414 USM security parameters, password→key
+    derivation, key localization and HMAC-MD5/SHA-1-96 authentication
+    (sign/verify, constant-time compare); scoped-PDU **privacy** — CBC-DES
+    (RFC 3414 §8, from-scratch FIPS 46-3 DES) and AES-128-CFB128 (RFC 3826),
+    with the correct key/IV/salt derivation; and the RFC 3414 §3.2 **time-window
+    anti-replay** logic (engine boots/time bookkeeping, ±150 s window, both the
+    authoritative and non-authoritative roles). All KAT-verified: FIPS 46-3 DES
+    vector, NIST SP 800-38A CFB128-AES128 vectors, RFC 3414 A.3 key-derivation
+    vectors. Manager side only — no agent, no engine-ID discovery orchestration.
+  - Out of scope for now: agent side, trap listening beyond `receiver`, MIB
+    parsing, and the RFC 7860 SHA-2 auth variants.
 
 Provenance: clean-room from RFC 1157 (SNMPv1), RFC 1905/3416 (SNMPv2c
-protocol operations), RFC 2578 (SMI types) and ITU-T X.690 (BER); net-snmp
-(BSD-like license) referenced for behavior only, no source consulted or
-copied.
+protocol operations), RFC 2578 (SMI types), ITU-T X.690 (BER), RFC 3412/3414
+(SNMPv3 + USM), RFC 3826 (AES-CFB privacy), FIPS 46-3 (DES) and NIST SP
+800-38A (CFB mode); net-snmp (BSD-like license) referenced for behavior only,
+no source consulted or copied.

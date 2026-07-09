@@ -68,8 +68,18 @@ pub const receiver = @import("receiver.zig");
 pub const v3 = @import("v3.zig");
 
 /// USM — User-based Security Model (RFC 3414): the `UsmSecurityParameters`
-/// (de)serializer. Auth/privacy crypto build on top.
+/// (de)serializer plus key localization and HMAC-*-96 auth.
 pub const usm = @import("usm.zig");
+
+/// From-scratch DES (FIPS 46-3) block cipher + CBC, used by USM DES privacy.
+pub const des = @import("des.zig");
+
+/// USM privacy (RFC 3414 §8 DES-CBC, RFC 3826 AES-128-CFB): scoped-PDU
+/// encryption/decryption on top of `des` and `std.crypto` AES.
+pub const priv = @import("priv.zig");
+
+/// USM time-window anti-replay (RFC 3414 §3.2): engine boots/time bookkeeping.
+pub const timewin = @import("timewin.zig");
 
 const client_mod = @import("client.zig");
 
@@ -95,6 +105,9 @@ pub const V3Message = v3.V3Message;
 pub const ScopedPdu = v3.ScopedPdu;
 pub const MsgFlags = v3.MsgFlags;
 pub const UsmSecurityParameters = usm.UsmSecurityParameters;
+pub const AuthProtocol = usm.AuthProtocol;
+pub const PrivProtocol = priv.PrivProtocol;
+pub const EngineTimeState = timewin.EngineTimeState;
 
 pub const Client = client_mod.Client;
 pub const Transport = client_mod.Transport;
@@ -110,6 +123,9 @@ test {
     _ = receiver;
     _ = v3;
     _ = usm;
+    _ = des;
+    _ = priv;
+    _ = timewin;
 }
 
 test "meta is well-formed" {
