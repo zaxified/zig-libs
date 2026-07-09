@@ -46,7 +46,7 @@ test-idempotency`.
 
 ## Backlog / deferred
 None beyond the two explicit non-goals in Threat model (concurrent-first-flight locking,
-request-fingerprint verification) — PLAN.md groups `idempotency` in the prod-API hardening cluster
+request-fingerprint verification) — `idempotency` sits in the prod-API hardening cluster
 with no further per-module gap noted.
 
 ## Status

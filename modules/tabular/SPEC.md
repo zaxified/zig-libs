@@ -42,7 +42,7 @@ ordering (currently lexicographic — mis-sorts unpadded numeric keys like `2` v
 TA nodes (per-asset-group EMA/MACD/RSI — wgs STATUS flags this); `unpivot`/`melt`; right/full-outer
 joins, multi-column join keys, anti/semi-join; dataset-level `distinct`/dedup without summing
 (`mergeByKey` sums numerics); `limit`/`offset` pagination beyond `topN`; optional strict-ordering
-guard for `rolling`/`outlierFlag` (README + PLAN.md wave-2 findings, folded here).
+guard for `rolling`/`outlierFlag` (from the module README, folded here).
 
 ## Status
 `extract · any · util · reentrant` + deps: `dataset` — canonical source is `pub const meta` in

@@ -40,10 +40,10 @@ rejection, and malformed-key-input typed errors. 9 tests. Run: `zig build test-s
 ## Backlog / deferred
 
 - **Pre-public security/similarity review** — `sealedbox` is explicitly on the repo's pre-public
-  security-gate checklist (PLAN.md) alongside `hashdigest`, pending a dedicated adversarial pass
-  before any release; not yet run.
-- No other gaps found in PLAN.md or the module README — the full `crypto_box` (authenticated
-  two-party) API and secret zeroization are documented out-of-scope, not v1 gaps.
+  security-gate checklist (see /docs/pre-public-review.md) alongside `hashdigest`, pending a
+  dedicated adversarial pass before any release; not yet run.
+- No other gaps found — the full `crypto_box` (authenticated two-party) API and secret zeroization
+  are documented out-of-scope, not v1 gaps.
 
 ## Status
 

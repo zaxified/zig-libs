@@ -59,7 +59,7 @@ Run: `zig build test-mcp`.
 ## Backlog / deferred
 
 None recorded beyond the explicit out-of-scope list above (client/host roles, sampling, roots,
-subscriptions, pagination) — no PLAN.md deferred-gap note and the module README has no Deferred
+subscriptions, pagination) — no deferred-gap note and the module README has no Deferred
 section.
 
 ## Status

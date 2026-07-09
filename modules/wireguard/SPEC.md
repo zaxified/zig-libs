@@ -45,8 +45,9 @@ link add … type wireguard`. 13 tests. Run: `zig build test-wireguard`.
 
 ## Backlog / deferred
 The root-gated live test's `runIp()` helper shells out to the `ip` binary — the one external-process
-use in the whole repo (zig-libs is otherwise 100% pure-Zig/no-exec). Flagged in PLAN.md for the
-pure-Zig-invariant audit: either replace with a direct rtnetlink `RTM_NEWLINK`/`IFLA_LINKINFO` call
+use in the whole repo (zig-libs is otherwise 100% pure-Zig/no-exec). Flagged for the
+pure-Zig-invariant audit (see /docs/pre-public-review.md): either replace with a direct rtnetlink
+`RTM_NEWLINK`/`IFLA_LINKINFO` call
 (consistent with the module's own netlink-native style) or explicitly document/allowlist the
 exception. `listDevices()` (rtnetlink IFLA_LINKINFO kind filtering) and the multicast event group
 remain out of scope per the design.

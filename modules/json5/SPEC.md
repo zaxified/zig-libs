@@ -42,8 +42,7 @@ Full JSON5 spec gaps, not covered and not added in this extraction:
 - `+Infinity`, `-Infinity`, `NaN` numeric literals.
 - Line-continuations inside strings (backslash-newline).
 - Formalizing `AnnotatedResult` against a future `diagnostics` module (currently a raw
-  `{ out, next_id }` pair; no structured line/col/severity type yet) — PLAN.md wave-3 findings flag
-  this the same way.
+  `{ out, next_id }` pair; no structured line/col/severity type yet).
 
 ## Status
 

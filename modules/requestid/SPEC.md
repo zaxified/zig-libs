@@ -43,7 +43,7 @@ Debug + ReleaseFast. Run: `zig build test-requestid`.
 
 ## Backlog / deferred
 
-None found in PLAN.md or the module README.
+None recorded — the module README has no Deferred section.
 
 ## Status
 

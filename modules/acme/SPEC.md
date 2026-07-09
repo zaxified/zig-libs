@@ -36,7 +36,7 @@ key authorization over real HTTP, and parses+verifies the CSR before issuing the
 Skips only if the loopback bind fails.
 
 ## Backlog / deferred
-Pending pre-public **security/similarity review** (PLAN.md): JWS/CSR review pass, adversarial
+Pending pre-public **security/similarity review** (see /docs/pre-public-review.md): JWS/CSR review pass, adversarial
 multi-agent. A manual staging/production recipe (real domain, port 80) is documented in README but
 is out of CI scope by design.
 

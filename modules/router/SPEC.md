@@ -46,7 +46,7 @@ header, 404/405 + `Allow` over a real TCP connection). Run: `zig build test-rout
 
 ## Backlog / deferred
 
-None found in PLAN.md or the module README.
+None found in the module README.
 
 ## Status
 

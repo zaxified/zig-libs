@@ -46,7 +46,7 @@ follow and its fallback when the second hop fails). Run: `zig build test-rdap`.
 
 ## Backlog / deferred
 
-None found in PLAN.md or the module README beyond the explicit out-of-scope list above (RDAP
+None beyond the explicit out-of-scope list above (RDAP
 search, auth extensions, full schema validation are deliberate non-goals, not v1 gaps).
 
 ## Status

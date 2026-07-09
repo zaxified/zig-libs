@@ -47,7 +47,7 @@ money (deferred — cross-module dependency-direction decision, not yet made); t
 (typed per-column arrays, SIMD-friendly layout — a different representation, not a faithful
 extraction of the seed); streaming/chunked bounded-memory construction for very large result sets
 (current model materializes the whole `Dataset` up front); `distinct`/dedup at the dataset level
-(needs its own design pass — which rows compared, caller-picked key columns). Per PLAN.md, `dataset`
+(needs its own design pass — which rows compared, caller-picked key columns). `dataset`
 is the anchor of a sibling family already extracted (`tabular` = dataset algebra, `jsonshape` = JSON→
 dataset projection) — those are separate modules, not gaps in this one.
 

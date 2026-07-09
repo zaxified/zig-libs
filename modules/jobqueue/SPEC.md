@@ -57,7 +57,7 @@ of the durable id-counter/orphan-record invariant. Run: `zig build test-jobqueue
   (`reapExpiredLeases`) is caller-driven; `kv.compact` is the caller's to schedule.
 - **A per-partition priority heap** — v1 `dequeue` is a linear scan of the in-memory ready set
   (correct, simplest given the `run_at` visibility gate); a heap is the noted optimization.
-- Ex-`taskqueue` fold: PLAN.md notes the seed's id-arithmetic priority hack silently clobbered
+- Ex-`taskqueue` fold: the seed's id-arithmetic priority hack silently clobbered
   records — jobqueue's real `priority` field replaces it (already fixed, not an open gap).
 
 ## Status

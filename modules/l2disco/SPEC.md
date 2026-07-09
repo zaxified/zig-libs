@@ -38,7 +38,7 @@ garbage-sweep (never panics). Run: `zig build test-l2disco`.
 
 ## Backlog / deferred
 
-None recorded — no deferred-gap note in PLAN.md beyond the general Linux-only-members-accepted
+None recorded — no deferred-gap note beyond the general Linux-only-members-accepted
 scope note (raw-syscall nature, not a functional gap), and the module README has no Deferred
 section.
 

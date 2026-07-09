@@ -34,7 +34,7 @@ garbage-frame no-panic sweep. Run: `zig build test-modbus`.
 
 ## Backlog / deferred
 Server (slave) side is out of scope by design but the `pdu` codec is reusable for it. ASCII framing
-and broadcast (unit 0) not planned. No open PLAN.md gap beyond the noted batch-scheduling entry
+and broadcast (unit 0) not planned. No open gap beyond the noted batch-scheduling entry
 (shipped alongside `whois`/`uci`/`rdap`/`mqtt`/`snmp`/`coap` in the same extraction wave).
 
 ## Status

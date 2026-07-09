@@ -43,8 +43,8 @@ rejecting `..`/leading-dot/traversal attempts on every public entry point.
 ## Backlog / deferred
 From README "Backlog (deferred, not implemented)": **garbage collection** (`gc(keep)` reachability
 sweep to reclaim unreferenced CAS blobs + stale `.part` temps, needs a root set typically the
-`named` manifests); **reference counting** for safe individual delete of a deduped blob (also listed
-in PLAN.md); **configurable fan-out depth** (fixed 2-char/256-way; tens-of-millions-of-objects stores
+`named` manifests); **reference counting** for safe individual delete of a deduped blob;
+**configurable fan-out depth** (fixed 2-char/256-way; tens-of-millions-of-objects stores
 want deeper/tunable fan-out); **cross-process ingest isolation / advisory locking** (ingest temp
 names are unique only within a process).
 

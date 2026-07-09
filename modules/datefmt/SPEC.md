@@ -36,7 +36,7 @@ error paths. Run: `zig build test-datefmt` (also `-Doptimize=ReleaseFast`), `zig
 modules/datefmt`.
 
 ## Backlog / deferred
-Per PLAN.md wave-3 findings: locale-aware month/day names; ISO-week-date; duration/period types;
+Deferred from v1: locale-aware month/day names; ISO-week-date; duration/period types;
 named canned formats (RFC 2822/3339). Timezone-aware formatting is explicitly out of scope here —
 it lives in the separate `tz` module (dep on `datefmt`).
 

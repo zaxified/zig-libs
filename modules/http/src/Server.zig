@@ -27,7 +27,7 @@
 //! budget, so a dribbling client cannot stretch a request forever);
 //! `write_timeout_ms` bounds every write stall (a peer that stops reading).
 //!
-//! Hardening (Phase 2.1, docs/spec/SPEC-http.md) — built to face the
+//! Hardening (Phase 2.1, ../SPEC.md) — built to face the
 //! internet without a reverse proxy: the handler sees the socket peer
 //! address and a per-connection request index (`Request.peerAddress` /
 //! `Request.connRequestIndex`); `Options.on_connect` accepts or rejects a
@@ -41,7 +41,7 @@
 //! optional Go-ConnState-style `on_conn_state` callback observes
 //! new/active/idle/closed transitions for metrics.
 //!
-//! Compression (Phase 2.2, docs/spec/SPEC-http.md): `Options.compression`
+//! Compression (Phase 2.2, ../SPEC.md): `Options.compression`
 //! (null = off) enables negotiated gzip response compression. Eligible
 //! responses — the request's Accept-Encoding admits gzip, the
 //! content-type is on the allowlist, the body is worth it — are
@@ -196,7 +196,7 @@ pub const Options = struct {
     /// nginx `keepalive_requests` shape — bounds a connection that pipelines
     /// forever inside the timeouts). 0 = unlimited.
     max_requests_per_conn: u32 = 1000,
-    /// Negotiated gzip response compression (docs/spec/SPEC-http.md). null =
+    /// Negotiated gzip response compression (../SPEC.md). null =
     /// off (the default — zero behavior change); `.{}` = on with safe
     /// defaults (compress bodies ≥ 1 KiB of text/JSON/XML/JS at level 6
     /// when the request's Accept-Encoding admits gzip — see

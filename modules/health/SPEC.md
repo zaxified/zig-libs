@@ -32,7 +32,7 @@ registered → always ready), custom probe paths. Green in Debug + ReleaseFast. 
 test-health`.
 
 ## Backlog / deferred
-None recorded in PLAN.md beyond its place in the "prod-API hardening + nice-to-have cluster"
+None beyond its place in the "prod-API hardening + nice-to-have cluster"
 (requestid/health/conditional/multipart/cookies/...) — no per-module gap noted.
 
 ## Status

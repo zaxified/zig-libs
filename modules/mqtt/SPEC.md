@@ -54,10 +54,10 @@ socket-exercised). Run: `zig build test-mqtt`.
 
 ## Backlog / deferred
 Broker: QoS 2, persistent/offline sessions, DUP retransmit of unacked outbound publishes, Will/LWT,
-TLS, MQTT 5.0 (all documented deferrals, not bugs) — per PLAN.md this was shipped as a "first cut"
+TLS, MQTT 5.0 (all documented deferrals, not bugs) — this was shipped as a "first cut"
 (3.1.1/QoS0-1/clean-session/BYO-TLS) and **the broker (`broker.zig`, net-new conn state machine +
 subscription registry + PUBLISH fan-out) is on the pre-public security/similarity review list**
-(PLAN.md "Pre-public checklist") before any release — it has not yet had the adversarial pass the
+(see /docs/pre-public-review.md) before any release — it has not yet had the adversarial pass the
 client codec's fuzz sweeps stand in for. Client: MQTT 5.0 out of scope.
 
 ## Status

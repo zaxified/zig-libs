@@ -40,7 +40,7 @@ A live external cross-check writes an archive that system GNU `tar` must list (`
 round-trips real statx attrs on Linux. 20 tests. Run: `zig build test-tar`.
 
 ## Backlog / deferred
-None recorded in PLAN.md or README beyond the documented out-of-scope list (pax interpretation,
+None beyond the documented out-of-scope list (pax interpretation,
 sparse files, per-file compression, encryption/signing, special files).
 
 ## Status

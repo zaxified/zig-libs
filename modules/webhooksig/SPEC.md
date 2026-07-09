@@ -28,7 +28,7 @@ compare accept/reject, key-rotation (old+new secret) acceptance, tamper negative
 mutated body → reject). Run: `zig build test-webhooksig`.
 
 ## Backlog / deferred
-None recorded in PLAN.md or README beyond the documented replay-window-is-caller-policy and
+None beyond the documented replay-window-is-caller-policy and
 symmetric-only (no Ed25519) scope notes above.
 
 ## Status

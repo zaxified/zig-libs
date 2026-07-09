@@ -44,8 +44,7 @@ clean. Run: `zig build test-jsonshape`.
 
 ## Backlog / deferred
 
-Flagged by the extraction scope as follow-on work (also noted in PLAN.md wave-2 findings),
-intentionally out of scope for this v1 lift:
+Flagged by the extraction scope as follow-on work, intentionally out of scope for this v1 lift:
 - **Full JSONPath** — array indexing (`items[0]`), wildcards, and multiple/repeated array nodes
   (e.g. paginated pages spread across several array fields) are not supported; the module walks
   exactly one dot-path of object-key lookups to exactly one array node.

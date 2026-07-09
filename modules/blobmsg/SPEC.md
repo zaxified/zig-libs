@@ -48,7 +48,7 @@ when `/var/run/ubus/ubus.sock` exists and skips cleanly otherwise. Ground truth 
 qemu parity check (native output == `ubus -S`). Run: `zig build test-blobmsg`.
 
 ## Backlog / deferred
-Re-run the axp qemu `ubus -S` parity check against the extracted module (PLAN.md, not yet done since
+Re-run the axp qemu `ubus -S` parity check against the extracted module (not yet done since
 extraction).
 
 ## Status

@@ -46,7 +46,7 @@ Zipf-skewed hit-ratio benchmark asserting W-TinyLFU beats an inline plain-LRU ba
 
 ## Backlog / deferred
 
-None found in PLAN.md or the module README beyond what's already covered above (no eviction
+None beyond what's already covered above (no eviction
 callbacks/persistence/keyed-hash hardening — documented as out of scope, not a v1 gap).
 
 ## Status

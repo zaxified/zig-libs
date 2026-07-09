@@ -39,7 +39,7 @@ put/get/listTyped round-trip, and `listTyped`'s skipped-count reporting on an in
 file. Run: `zig build test-filestore`.
 
 ## Backlog / deferred
-Per PLAN.md wave-3 findings and the module README's own Backlog: TTL/expiry (`putWithTTL`/`sweep`,
+Deferred from v1, per the module README's own Backlog: TTL/expiry (`putWithTTL`/`sweep`,
 needs a place to store the expiry and a decision on expired-but-unswept visibility); cross-process
 ingest locking (`blobstore`-style, same last-write-wins caveat); reference/version metadata (ETag/
 version field for compare-and-swap writes).

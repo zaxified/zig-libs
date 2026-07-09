@@ -46,7 +46,7 @@ the loopback peer — skips only when loopback binding is unavailable. Run: `zig
 
 ## Backlog / deferred
 
-None found in PLAN.md or the module README beyond the documented out-of-scope items above
+None beyond the documented out-of-scope items above
 (distributed/cross-instance coordination is an explicit non-goal, not a v1 gap).
 
 ## Status

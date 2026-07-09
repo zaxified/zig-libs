@@ -37,7 +37,7 @@ length, delimiter, uppercase hex, all-zero ids), `childOf` plus id uniqueness/no
 Run: `zig build test-tracecontext`.
 
 ## Backlog / deferred
-None recorded in PLAN.md or README beyond the documented Level-2/vendor-tracestate/sampling-logic/
+None beyond the documented Level-2/vendor-tracestate/sampling-logic/
 tracer-export out-of-scope list above.
 
 ## Status

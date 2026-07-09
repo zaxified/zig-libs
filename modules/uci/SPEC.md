@@ -43,7 +43,7 @@ missing/too-many arguments, line-too-long, input-too-large. Plus accessor lookup
 test-uci`.
 
 ## Backlog / deferred
-None recorded in PLAN.md or README beyond the documented UCI-CLI-layer/typed-coercion out-of-scope
+None beyond the documented UCI-CLI-layer/typed-coercion out-of-scope
 list above.
 
 ## Status

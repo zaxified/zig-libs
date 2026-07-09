@@ -38,13 +38,13 @@ tests. Run: `zig build test-kv`.
 
 ## Backlog / deferred
 
-- **On-disk/MVCC/txn/ordered-scans → DON'T-BUILD-YET** (PLAN.md, ecosystem-scanned): multi-week+
+- **On-disk/MVCC/txn/ordered-scans → DON'T-BUILD-YET** (ecosystem-scanned): multi-week+
   build (B-tree + WAL + MVCC + crash-proof + VOPR sweep) with zero current consumers demanding
   scans/txn. When greenlit: steal-patterns from `xitdb` (HAMT/B-tree + immutable-snapshot-as-MVCC
   over kv's existing atomic-swap seam) + TigerBeetle's VOPR methodology (not code); phased
   ordered-scan B-tree → atomic batches → MVCC snapshot reads → secondary indexes. Bitcask kv is
   enough until then.
-- Pending repo-wide **security/similarity review pass** (PLAN.md pre-public checklist): `kv`
+- Pending repo-wide **security/similarity review pass** (see /docs/pre-public-review.md): `kv`
   fault-sweep re-audit before any release.
 
 ## Status

@@ -30,7 +30,7 @@ truth table hand-derived from BigDecimal/GDA/Python definitions, plus half-way-a
 both signs, and `rescale`/`divRound`/`quantize` edges. Run: `zig build test-decimal`.
 
 ## Backlog / deferred
-None recorded in PLAN.md beyond the module's own scope notes (dataset's `.decimal` Value variant
+None beyond the module's own scope notes (dataset's `.decimal` Value variant
 is the cross-module consumer, not a decimal-internal gap).
 
 ## Status

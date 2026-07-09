@@ -46,7 +46,7 @@ lying beyond the physical file. 7 tests. Run: `zig build test-zipstream`.
 
 ## Backlog / deferred
 zip64 (archives/entries > 4 GiB); encrypted entries; compression methods beyond Store/Deflate (bzip2,
-LZMA, …); ZIP writing. (README "Deferred (not built)"; also listed in PLAN.md wave-3 findings.)
+LZMA, …); ZIP writing. (README "Deferred (not built)".)
 
 ## Status
 `extract · any · codec (reader only) · reentrant` + deps: none (std only) — canonical source is

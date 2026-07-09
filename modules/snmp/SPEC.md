@@ -31,8 +31,8 @@ USM is the security-sensitive part.
   No MIB compiler/SMI parsing; no agent (server) role.
 - **Pre-public security-review flag:** `snmp.usm` const-time compare + auth/privacy algorithm
   confusion (MD5 vs SHA-1, DES vs AES selection) is on the pre-public security-review list
-  (PLAN.md checklist) — verify the algorithm-selection path can't be tricked into a weaker/wrong
-  primitive by a malicious agent reply.
+  (see /docs/pre-public-review.md) — verify the algorithm-selection path can't be tricked into a
+  weaker/wrong primitive by a malicious agent reply.
 
 ## Verification
 BER + message golden-byte KATs, length-boundary + garbage sweeps, scripted-agent round-trips
@@ -45,7 +45,7 @@ and time-window accept/reject. 71+ tests (grew with T-G/T-H). Run: `zig build te
 ## Backlog / deferred
 RFC 7860 SHA-2 auth protocols; MIB compiler/SMI parsing; agent (server) role. Pre-public: the
 security-review pass on `snmp.usm` const-time/alg-confusion (see Threat model above) is still open
-per PLAN.md's pre-public checklist.
+(see /docs/pre-public-review.md).
 
 ## Status
 `gap · any · codec+client · single_owner` + deps: none (std only) — canonical source is

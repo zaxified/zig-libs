@@ -41,7 +41,7 @@ Run: `zig build test-latency-stats`.
 
 ## Backlog / deferred
 
-- **NOTICE citation nit** (PLAN.md pre-public checklist): the latency-stats/dns citation
+- **NOTICE citation nit** (see /docs/pre-public-review.md): the latency-stats/dns citation
   consistency issue is folded into the pending repo-wide security/similarity review pass, not yet
   resolved standalone.
 - No functional/API backlog recorded (module README has no Deferred section).

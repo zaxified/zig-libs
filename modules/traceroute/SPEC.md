@@ -37,7 +37,7 @@ per-hop `latency-stats`, IPv4 raw-header shape, IPv6, option validation. One liv
 `127.0.0.1`, skipped without CAP_NET_RAW. 15 tests. Run: `zig build test-traceroute`.
 
 ## Backlog / deferred
-None recorded in PLAN.md or README beyond the documented out-of-scope list (parallel probing,
+None beyond the documented out-of-scope list (parallel probing,
 UDP/TCP methods, non-Linux live path, MTU/PMTU discovery).
 
 ## Status

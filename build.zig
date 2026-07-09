@@ -96,8 +96,8 @@ const module_list = [_]Module{
     .{ .name = "syslog" },
     .{ .name = "sntp" },
     .{ .name = "stun", .deps = &.{"netaddr"} },
-    // Scaffold more here (copy modules/_template) — see the candidate catalog
-    // in docs/CANDIDATES.md for the full list.
+    // Scaffold more here (copy modules/_template) — see CONVENTIONS.md
+    // "How to add a module" and the README "Roadmap / Non-goals" sections.
 };
 
 pub fn build(b: *std.Build) void {

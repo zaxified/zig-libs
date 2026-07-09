@@ -120,8 +120,9 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 
 ## Roadmap / not yet built
 
-Research-verdicted **DON'T-BUILD-YET** — no consumer demands them today; see `PLAN.md`
-for the full reasoning and the "when greenlit" path for each:
+Research-verdicted **DON'T-BUILD-YET** — no consumer demands them today; see each
+module's `SPEC.md` (once built) or the git history for the full reasoning and the
+"when greenlit" path for each:
 
 - **`testkit`** (shared test harness) — deferred; the honest remaining scope (a
   `runWire` HTTP-wire test wrapper + `expectStatus` family + fake-clocks) needs a
@@ -133,6 +134,48 @@ for the full reasoning and the "when greenlit" path for each:
 - **`kv` on-disk MVCC / transactions / ordered scans** — a multi-week B-tree + WAL build
   with zero current consumers demanding scans or transactions; the existing Bitcask-style
   log is enough until one does.
+
+## Non-goals — deliberately not built here
+
+Durable scope decisions (candidate audit, 2026-07-09): capabilities this collection will
+not own, and what to reach for instead.
+
+### Adopt instead of building
+
+| Capability | Adopt instead | Why not a module |
+|---|---|---|
+| Hardened/read-only SQLite | `vrischmann/zig-sqlite` or `karlseguin/zqlite.zig`, wrapped consumer-side | The enforcement (`authorizer`/`PRAGMA query_only`/`open_v2(READONLY)`) is raw C-API — breaks the pure-Zig/no-libc invariant |
+| SSH | bind `libssh2` | Pure-Zig SSH is a huge build; externally-coupled, stays consumer-side |
+| Kafka | bind `librdkafka` | External C client, no pure-Zig alternative |
+| gRPC | build over our HTTP/2 + adopt `Arwalk/zig-protobuf` | Needs an external protobuf codec; no trustworthy pure-Zig gRPC exists |
+| OPC-UA | adopt/bind an existing stack | Huge industrial protocol stack, not a Zig-native win |
+| Regex | `mnemnion/mvzr` (no captures) or `zig-utils/zig-regex` (captures) | Two mature pure-Zig libs already exist |
+| PostgreSQL (wire v3) | `karlseguin/pg.zig` | Mature MIT lib, pooling + TLS |
+| MySQL/MariaDB | `speed2exe/myzql` | Only viable option |
+| SMTP | `karlseguin/smtp_client.zig` | Mature MIT lib (TLS-1.2 caveat) |
+| WebSocket | `karlseguin/websocket.zig` | Mature MIT lib, both roles |
+| protobuf | `Arwalk/zig-protobuf` | De-facto pure-Zig implementation |
+| TOML | `mattyhall/tomlz` | Mature MIT config parser |
+| Templates | `jetzig/zmpl` (comptime-typed) / `batiati/mustache-zig` (logic-less) / `gremlin-labs/vibe-jinja` (runtime `.jinja` corpora only, pilot) | Zig comptime makes a runtime engine mostly unnecessary |
+| Structured logging | `karlseguin/log.zig` | Cleanest "just use it" |
+| S3 | `lobo/aws-sdk-for-zig` | SigV4 built in |
+| Redis/Valkey | `kristoff-it/zig-okredis` (partial/alpha) | Best available design |
+| YAML (flat/nested config) | `kubkon/zig-yaml` / `pwbh/ymlz` (both partial — no anchors/tags) | Fine for config; not 1.2-complete (see full YAML below) |
+
+### Dropped modules (considered, rejected)
+
+- **`exprcalc`** — app-specific spreadsheet/rules engine, not reused cross-project, and needs external regex.
+- **`unaccent`** — fully dependent on external `uucode` tables; stays in bxp.
+- **`roquery`** — C-level SQLite hardening (authorizer/query_only enforcement); lives consumer-side over adopted zig-sqlite.
+- **`taskqueue`** — folded into `jobqueue`.
+- **`chunkframe`** — too small to be a module; a documented ~20-LOC pattern instead.
+
+### Fully dropped formats/protocols
+
+- **YAML 1.2 (full spec)** — no adoptable complete pure-Zig implementation; the partial libs above cover config use.
+- **Jinja** — Zig comptime templating covers dev-authored use; `vibe-jinja` is a consumer-side pilot option for runtime `.jinja` corpora only.
+- **IMAP** — no mature pure-Zig lib; stays unbuilt.
+- **HTTP/3 (QUIC)** — not researched, stays dropped.
 
 ## Using a module
 
@@ -161,4 +204,4 @@ modules/<name>/README.md     # what it is + a Provenance line
 ```
 
 `CONVENTIONS.md` has the full rules; `modules/_template/` is the starting point for a new module.
-Design/roadmap notes live in `PLAN.md`.
+Roadmap notes live in the "Roadmap / not yet built" section above and the git history.

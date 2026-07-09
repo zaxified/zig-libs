@@ -35,7 +35,7 @@ verbatim passthrough), and invalid/truncated UTF-8 passthrough on encode. Run: `
 test-encoding`.
 
 ## Backlog / deferred
-Per PLAN.md (2026-07-09 extraction-scope note): broader/CJK coverage is explicitly out of scope, not
+Per the 2026-07-09 extraction-scope note: broader/CJK coverage is explicitly out of scope, not
 planned — no further backlog item recorded. The module README's "Out of scope" section is the
 canonical statement of this boundary.
 

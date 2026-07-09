@@ -43,7 +43,7 @@ Verified green in Debug and ReleaseFast; `zig fmt --check` clean. Run: `zig buil
 
 ## Backlog / deferred
 
-- **None substantive** (PLAN.md wave-3 findings): `max_frame` is already parameterized and the
+- **None substantive**: `max_frame` is already parameterized and the
   tag-keyed union behavior is confirmed — no open gap recorded.
 
 ## Status

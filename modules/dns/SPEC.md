@@ -37,7 +37,7 @@ test-dns`.
 
 ## Backlog / deferred
 None recorded beyond the design-level TODO already in Threat model (OS-default connect timeout on
-`Io.Threaded`, shared with `http.Client`). No PLAN.md deferred-gap entry beyond citation nits folded
+`Io.Threaded`, shared with `http.Client`). No deferred-gap entry beyond citation nits folded
 into the security/similarity review pass.
 
 ## Status

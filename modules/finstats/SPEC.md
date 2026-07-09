@@ -44,7 +44,7 @@ recovery). Run: `zig build test-finstats` (also `-Doptimize=ReleaseFast`), `zig 
 modules/finstats`.
 
 ## Backlog / deferred
-Per the module README's own Backlog and PLAN.md: parametric VaR/CVaR (Gaussian/Cornish-Fisher);
+Per the module README's own Backlog: parametric VaR/CVaR (Gaussian/Cornish-Fisher);
 tracking error + information ratio; Omega ratio; rolling-window variants of the scalar metrics;
 Brinson (factor) attribution (needs a weights input shape — the one genuinely involved addition);
 arbitrary VaR confidence level + annualization-frequency presets/validation; confidence intervals/

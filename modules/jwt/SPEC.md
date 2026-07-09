@@ -40,7 +40,7 @@ Provider cache/rotation/TTL tests behind a scripted fetcher. 60 tests. Run: `zig
 
 ## Backlog / deferred
 
-- Pending repo-wide **security/similarity review pass** (PLAN.md pre-public checklist, not yet
+- Pending repo-wide **security/similarity review pass** (see /docs/pre-public-review.md, not yet
   run): const-time + alg-confusion + JWKS-smuggling + rotation re-audit for `jwt`/`aaa-gate`
   specifically, adversarial multi-agent pass before any release.
 - No other module-local backlog recorded (README has no Deferred section).

@@ -73,8 +73,9 @@ rejected, query-param fallback. Plus the dark-tests aggregator pulling in `csrf.
 
 - **Pre-public security/similarity review** — `sessions` is server-side auth-adjacent state
   (session identity + CSRF) and should be added to the repo's pre-public security-gate checklist
-  (PLAN.md currently lists `aaa-gate`/`jwt`/`acme`/`snmp.usm`/`kv`/`http`/`sealedbox`/`hashdigest`
-  explicitly; `sessions` is not yet named there and should be folded in before any release).
+  (`/docs/pre-public-review.md` currently lists `aaa-gate`/`jwt`/`acme`/`snmp.usm`/`kv`/`http`/
+  `sealedbox`/`hashdigest` explicitly; `sessions` is not yet named there and should be folded in
+  before any release).
 - **Distributed `Store`** (Redis adapter) — implement the `Store` vtable; not built.
 - **Signed-cookie stateless sessions** — no server store variant; not built.
 - **`SameSite=None` cross-site flows** — not supported.

@@ -24,7 +24,7 @@ Unit tests: add/fetch/release lifecycle, round-robin non-reuse, exhaustion at 65
 release, `answered` dup-detection flag, `clear` for a new round. 5 tests. Run: `zig build test-seqmap`.
 
 ## Backlog / deferred
-None recorded in PLAN.md or README beyond the documented round-robin-wrap caveat above.
+None beyond the documented round-robin-wrap caveat above.
 
 ## Status
 `extract · any · util · reentrant` + deps: none (std only) — canonical source is `pub const meta` in

@@ -38,7 +38,7 @@ URL, up-front rejection of bad root/oversized query, transport-failure propagati
 test-whois`.
 
 ## Backlog / deferred
-None recorded in PLAN.md or README.
+None recorded.
 
 ## Status
 `gap · any (logic over a transport seam; optional TcpTransport is posix) · client · reentrant` +

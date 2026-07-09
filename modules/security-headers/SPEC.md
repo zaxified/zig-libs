@@ -51,10 +51,9 @@ binding is unavailable. Run: `zig build test-security-headers`.
 ## Backlog / deferred
 
 - **500/431/414/413 fallback responses carry no security headers** — a known gap (see threat model
-  above): those paths bypass the router/middleware entirely inside `http.Server`. No fix scheduled
-  in PLAN.md; documented as a caller-visible caveat.
-- No other gaps found in PLAN.md or the module README — the excluded helmet legacy headers are a
-  deliberate non-goal, not a v1 gap.
+  above): those paths bypass the router/middleware entirely inside `http.Server`. No fix scheduled;
+  documented as a caller-visible caveat.
+- No other gaps found — the excluded helmet legacy headers are a deliberate non-goal, not a v1 gap.
 
 ## Status
 

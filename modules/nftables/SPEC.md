@@ -43,7 +43,7 @@ confirms `nft -c` rejects a deliberately schema-invalid ruleset. Run: `zig build
 ## Backlog / deferred
 Maps, flowtables, and the introspection commands (`list`/`reset`/`monitor`) are explicitly out of
 scope for this builder (the schema's stateful/read-back half, not a ruleset-construction concern).
-No open PLAN.md backlog item beyond this documented coverage boundary.
+No open backlog item beyond this documented coverage boundary.
 
 ## Status
 `gap · any · codec · reentrant` + deps: none (std only) — canonical source is `pub const meta` in

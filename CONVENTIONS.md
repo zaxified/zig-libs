@@ -1,7 +1,7 @@
 # zig-libs conventions
 
-The single repo-rules document. `BRIEF.md` and `PLAN.md` carry history/roadmap; every
-durable *rule* lives here.
+This file is the sole repo-rules document — every durable *rule* lives here.
+Per-module design/threat-model lives in each module's `SPEC.md`.
 
 ## 1. Prime directives
 
@@ -32,7 +32,7 @@ durable *rule* lives here.
   SQLite wrapper's `sqlite3_set_authorizer`/`PRAGMA query_only`/`open_v2(READONLY)`
   enforcement, `libssh2`/`librdkafka` bindings, OPC-UA stacks) does **not** belong in the
   module set, even if a thin pure-Zig policy layer around it could. It stays in the
-  **ADOPT** table (see `docs/CANDIDATES.md`) and lives **consumer-side**, wired over the
+  **ADOPT** table (see the Non-goals section of README.md) and lives **consumer-side**, wired over the
   external binding by the application. zig-libs may ship the pure-Zig *policy/validation*
   half of such a thing, never the C enforcement half.
 - **TLS = proxy-terminate / bring-your-own.** No module implements a TLS *server*; the
@@ -62,17 +62,14 @@ durable *rule* lives here.
   build.zig            # registers each module by name + `test` / `test-<name>` steps
   build.zig.zon        # one manifest for the whole collection
   CONVENTIONS.md        # this file — all repo rules
-  BRIEF.md              # historical agent brief (superseded by this file + PLAN.md)
-  PLAN.md               # roadmap: status, in-flight, backlog, decisions, definition-of-done
   NOTICE                 # canonical provenance + third-party design-refs + licenses
-  docs/CANDIDATES.md     # full candidate catalog + per-module Model-after / Seed / discussion
   docs/pre-public-review.md  # living pre-release audit checklist (deleted once done)
   modules/
     _template/           # copy to start a module
     <name>/
       src/root.zig        # SPDX line + `pub const meta` + API + tests
       README.md            # how to use — consumer-facing
-      SPEC.md              # how/why built + threats — auditor-facing (module-local, not docs/spec/*)
+      SPEC.md              # how/why built + threats — auditor-facing (module-local)
   ```
 
 ## 4. The `meta` tag vocabulary
@@ -124,7 +121,7 @@ SPEC. Seed/provenance detail lives in `NOTICE`; README/SPEC merely reference it 
 3. **Multi-file modules:** add every new submodule to `root.zig`'s `test { _ = …; }`
    aggregator — a bare `pub const x = @import("x.zig")` re-export does **not** pull `x`'s
    tests into the test binary (the dark-tests rule; it hid 92 never-run tests before it
-   was caught — see PLAN.md).
+   was caught — see the dark-tests check in `docs/pre-public-review.md`).
 4. `zig build test-<name>` (per module) and `zig build test` (all) — both green in
    **Debug and ReleaseFast**; `zig fmt --check modules/<name>` clean.
 5. Update `NOTICE` with any third-party design reference + its license.
@@ -139,5 +136,5 @@ SPEC. Seed/provenance detail lives in `NOTICE`; README/SPEC merely reference it 
   property/round-trip.
 - **Clients** (`dns`, `whois`, `rdap`, `http` client): a live round-trip against a real
   server when the network is available, plus offline unit tests on parsing.
-- No shared `testkit` harness exists yet — it was scoped and **deferred** (see PLAN.md);
-  each module hand-rolls its own wire-test/fake-clock helpers for now.
+- No shared `testkit` harness exists yet — it was scoped and **deferred** (see the Roadmap
+  section of README.md); each module hand-rolls its own wire-test/fake-clock helpers for now.

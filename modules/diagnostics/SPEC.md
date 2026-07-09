@@ -30,9 +30,9 @@ pattern (arena-lifetime append then read), and structural field coverage (path/l
 byte-offset/code/message/suggest all round-trip through `items`). Run: `zig build test-diagnostics`.
 
 ## Backlog / deferred
-Per PLAN.md wave-3 findings and the module README: rendering to a human-readable string
+Deferred from v1, per the module README: rendering to a human-readable string
 (rustc-style caret/source-snippet output); JSON serialization of diagnostics; sorting diagnostics by
-source position. PLAN.md additionally notes the sibling `json5` module intends to formalize its
+source position. The sibling `json5` module additionally intends to formalize its
 `AnnotatedResult` against this module (a `json5`-side integration task, not a `diagnostics` gap).
 
 ## Status

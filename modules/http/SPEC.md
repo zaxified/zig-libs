@@ -46,8 +46,9 @@ neg; smuggling/timeout/size negatives; a BYO-TLS in-memory dogfood (connectH2Ove
 
 ## Backlog / deferred
 Response-trailer *writing* remains explicitly deferred (read side only) as disproportionately
-invasive. WebSocket and an MQTT broker are noted in PLAN.md as candidate consumers layered on top of
-`http`'s server template, not gaps in `http` itself. TLS termination stays BYO (reverse proxy today)
+invasive. WebSocket and an MQTT broker are noted (see the Non-goals section of /README.md) as
+candidate consumers layered on top of `http`'s server template, not gaps in `http` itself. TLS
+termination stays BYO (reverse proxy today)
 pending a native std TLS server.
 
 ## Status

@@ -43,8 +43,9 @@ loopback integration (`router`+`http.Server`+`http.Client`), skipping only when 
 unavailable. 28 tests.
 
 ## Backlog / deferred
-Pending pre-public **security/similarity review** (tracked in PLAN.md, not module-specific work
-yet): const-time compare + alg-confusion + JWKS-smuggling + rotation review, paired with `jwt`.
+Pending pre-public **security/similarity review** (see /docs/pre-public-review.md, not
+module-specific work yet): const-time compare + alg-confusion + JWKS-smuggling + rotation review,
+paired with `jwt`.
 
 ## Status
 `extract · any · server · threadsafe` + deps `router`, `http` — canonical source is `pub const meta`

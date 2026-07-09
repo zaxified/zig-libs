@@ -43,7 +43,7 @@ token match). Run: `zig build test-linkheader`.
 
 ## Backlog / deferred
 
-None recorded — no deferred-gap note found in PLAN.md (only a build-history mention among the
+None recorded — no deferred-gap note found (only a build-history mention among the
 prod-API hardening batch) and the module README has no Deferred section.
 
 ## Status

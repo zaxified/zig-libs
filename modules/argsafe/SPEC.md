@@ -39,7 +39,7 @@ poisons `slice()`). 17 tests. Green in Debug and ReleaseFast; `zig fmt --check` 
 
 ## Backlog / deferred
 Windows argv quoting and environment-variable-injection allowlisting are explicitly out of scope for
-v1 (see Threat model). No other deferred items in README or PLAN.md beyond the general pre-public
+v1 (see Threat model). No other deferred items in README beyond the general pre-public
 review pass.
 
 ## Status

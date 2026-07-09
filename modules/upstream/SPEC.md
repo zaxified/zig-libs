@@ -53,7 +53,7 @@ nothing was pickable; `healthTick` marks down/up, gates on the interval, and wal
 the per-upstream bulkhead cap is never exceeded and no slot leaks. Run: `zig build test-upstream`.
 
 ## Backlog / deferred
-None recorded in PLAN.md or README.
+None recorded.
 
 ## Status
 `gap · any (pure logic; active-health I/O via the injected seam) · client · threadsafe` + deps:
