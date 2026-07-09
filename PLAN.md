@@ -126,13 +126,16 @@ RFC codecs). Archetypes: ① HTTP/SaaS backend · ② netops · ③ IoT · ④ A
 | ⏸️ `testkit` → **DEFERRED (scope mostly stale, 2026-07-09)** | test-only | Scope verdict: golden-diff = LEAVE (std's `expectEqualStrings` already diffs); **netns = LEAVE (no netns code exists in the repo — the real idiom is loopback + `SkipZigTest`; building it would be net-new, not consolidation)**; VOPR = LEAVE (one consumer, kv→jobqueue via normal deps, zero duplication). Only genuinely duplicated: the `runWire` HTTP-wire test wrapper (~300 LOC across 19 modules) + `expectStatus` family + fake-clocks (~100 LOC/10 modules). Real yield ~550 LOC, BUT it needs a **build.zig test-only-dep mechanism** (no precedent; would be the repo's first) + a **19-module refactor** to pay off — otherwise it's a dead module. Recommend deferring; if built, do the honest small scope (runWire+FakeClock) + the build.zig shadow-test-module change, then refactor consumers as a separate mechanical wave. Also flagged: `wireguard`'s test `runIp()` shells out to `ip` — the one external-process use in the repo, for the pure-Zig-invariant audit |
 | `ssh` (bind `libssh2` first) | ② netops automation | pure-Zig SSH is huge → ergonomic binding first, Zig automation API |
 
-### BUILD → Fable (RFC/spec-complete value-add + crypto — paused until reset)
-| Candidate | Unlocks | Why Fable |
+### BUILD → Opus (the ex-"Fable" queue — assessment 2026-07-09: ALL OPUS-CAN-DO, no Fable-only concern)
+Fable5 is capped ~1 month; agents assessed the remaining "Fable" tasks and confirmed each is standard
+protocol/crypto engineering (no cryptographic novelty, no distributed-systems research) → Opus builds them
+now. They were only ever "Fable" for token-budget reasons, not capability.
+| Candidate | Plan | Test oracle |
 |---|---|---|
-| **SNMP T-G** priv (DES-CBC + AES-128-CFB) + **T-H** time-window | ② finish v3 | in-flight; crypto value-add (Opus-inline possible now) |
-| `coap` **C6** block-wise (7959) + **C7** observe (7641) | ③ | RFC-complete protocol value-add |
-| `grpc` (framing/streaming/status over our h2 + adopted protobuf) | microservices | no trustworthy pure-Zig; contained since we own h2 |
-| **MQTT broker** | ③ IoT hub | server side of `mqtt`; large protocol value-add. **Ecosystem scan 2026-07-09: BUILD (no adoptable Zig broker — all fail license/0.16/completeness; max 5★).** Reference (don't copy): `vibesrc/rawmq` architecture. **Reuses the existing `mqtt` client's packet codec + topic wildcard matcher** → broker net-new = TCP accept loop + session table + subscription registry + PUBLISH routing/QoS + retained store + keep-alive. Minimal first cut: 3.1.1, QoS 0/1, clean-session, BYO-TLS, single-thread |
+| **SNMP T-G** priv (DES-CBC + AES-128-CFB) + **T-H** time-window | new `priv.zig`: DES from-scratch (FIPS 46-3 tables) + DES-CBC, AES-128-CFB over `std.crypto.core.aes` (encrypt-only feedback), glue into `v3.decodeScopedPdu` `.encrypted` branch, T-H window (RFC 3414 §3.2). ~500-700 LOC, 4 parts | FIPS 46-3 DES KAT (+ OpenSSL legacy-provider cross-check, confirmed on box) · NIST SP 800-38A F.3.13/14 CFB · RFC-derived time-window units |
+| `coap` **C6** block-wise (7959) + **C7** observe (7641) | new `block.zig` (NUM:M:SZX packed codec + splitter/assembler) + `observe.zig` (subscription registry + 24-bit lollipop seq + push via `Server.separate`). ~800-1050 LOC, **2 independent parallel files**. Defer Block1+Block2-combined + SZX renegotiation | offline in-memory client↔server round-trips (>1-datagram block transfer; observe register + ordered notifications) |
+| **MQTT broker** | reuses `mqtt` client's `packet.zig` (dual-purpose decode/encode) + `topic.matches`; net-new = per-conn state machine + subscription registry + PUBLISH fan-out + QoS0/1 + retained + accept loop (template `http/Server.zig`). ~1300-2200 LOC, **5 phased commits** (handshake+keepalive → registry+QoS0 → QoS1 → retained → transport). first cut: 3.1.1/QoS0-1/clean-session/BYO-TLS | client's TestTransport pattern, hand-encoded bytes, socket-free for parts 1-4 |
+| `grpc` (framing/streaming/status over our h2 + adopted protobuf) | ⚫ still **consumer-side ADOPT** — needs external protobuf (violates zero-dep); not a zig-libs module | — |
 
 ### BUILD → Opus (RFC codecs — ecosystem-scanned 2026-07-09) — ✅ ALL DONE
 Research verdict: no adoptable Zig lib for any, so built clean-room from RFCs + reference designs + official test vectors.
@@ -243,7 +246,10 @@ Six faithful spec-complete lifts landed. Deferred per-module:
    pay off. With adopted pg/smtp/ws/log/toml, ① is a deployable backend stack.
 3. ✅ **Opus RFC codecs DONE 2026-07-09:** `syslog` · `sntp` · `stun` (client) — ecosystem-scanned (no
    adoptable Zig lib), built clean-room from RFCs + reference designs + official test vectors.
-4. **When Fable resets:** finish SNMP T-G/T-H, coap C6/C7, MQTT broker (large; reuses our `mqtt` client).
+4. **Ex-"Fable" queue — reassessed OPUS-CAN-DO 2026-07-09 (Fable capped ~1mo, don't wait):** coap C6/C7
+   (2 parallel files) · SNMP T-G/T-H (priv crypto, KAT-driven) · MQTT broker (5 phased commits over the mqtt
+   client). All standard protocol/crypto engineering — see the BUILD→Opus (ex-Fable) table. `grpc` stays
+   consumer-side (external protobuf).
 5. **Pre-public security/similarity review gate** (Opus, highest-value before any release) — see checklist below.
 6. **DON'T-BUILD-YET (research-verdicted, no consumer):** `Reconcilable(T)` + `kv` on-disk — build only when
    a concrete 2nd/1st consumer appears (see Deferred section for the steal-patterns path). External-coupled
