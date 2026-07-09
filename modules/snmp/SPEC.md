@@ -29,6 +29,13 @@ USM is the security-sensitive part.
   treat input as untrusted (never panics; caller decides trust).
 - MD5/SHA-1 are the RFC-3414 originals (weak by modern standards; RFC 7860 SHA-2 not implemented).
   No MIB compiler/SMI parsing; no agent (server) role.
+- **Salt uniqueness is a caller obligation, not enforced here:** the privacy layer (DES-CBC /
+  AES-128-CFB) requires the CALLER to supply a UNIQUE `msgPrivacyParameters` salt per message under
+  a given key/engineTime — this module neither generates the salt nor enforces/tracks its
+  uniqueness. Reusing a salt (e.g. a constant, or a counter that resets within the same
+  engineTime second) reuses the AES-CFB keystream or the DES-CBC IV under the same key, which leaks
+  plaintext via `C1 XOR C2 = P1 XOR P2`. Callers must use a strictly-increasing (or
+  cryptographically random, never repeated) salt for every encrypted message.
 - **Pre-public security-review flag:** `snmp.usm` const-time compare + auth/privacy algorithm
   confusion (MD5 vs SHA-1, DES vs AES selection) is on the pre-public security-review list
   (see /docs/pre-public-review.md) — verify the algorithm-selection path can't be tricked into a

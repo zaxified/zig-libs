@@ -746,14 +746,26 @@ fn clientKey(req: *const http.Server.Request, buf: *[client_key_len_max]u8) []co
     if (xff) |v| {
         const start = if (std.mem.lastIndexOfScalar(u8, v, ',')) |i| i + 1 else 0;
         const ip = std.mem.trim(u8, v[start..], " \t");
-        if (ip.len != 0) return ip;
+        if (ip.len != 0) return clampKey(ip, buf);
     }
     if (req.header("x-real-ip")) |v| {
         const ip = std.mem.trim(u8, v, " \t");
-        if (ip.len != 0) return ip;
+        if (ip.len != 0) return clampKey(ip, buf);
     }
     if (req.peerAddress()) |peer| return formatPeerIp(peer, buf);
     return fallback_key;
+}
+
+/// Clamp an attacker-controlled, header-derived key candidate to
+/// `client_key_len_max` bytes (copied into `buf`) so a forged
+/// `X-Forwarded-For`/`X-Real-IP` value of unbounded length can't blow up the
+/// bounded throttle store's per-entry key cost or evade coalescing by varying
+/// only past the cap — same bound the peer-IP path already gets from
+/// `formatPeerIp`/`formatV4`.
+fn clampKey(v: []const u8, buf: *[client_key_len_max]u8) []const u8 {
+    const n = @min(v.len, client_key_len_max);
+    @memcpy(buf[0..n], v[0..n]);
+    return buf[0..n];
 }
 
 /// Format a peer IP as a stable key: dotted quad for IPv4 (including
@@ -1565,6 +1577,39 @@ test "throttle keying: X-Real-IP fallback, socket peer (port-insensitive, v4-map
     try expectStatus(runWire(&gr.r, wire("POST", "/t", ""), &buf), "401");
     try expectStatus(runWire(&gr.r, wire("POST", "/t", ""), &buf), "401");
     try testing.expectEqual(@as(usize, 4), sink.len);
+}
+
+test "throttle keying: an oversized X-Forwarded-For is clamped to client_key_len_max, not stored unbounded" {
+    // Two distinct XFF values that agree on the first client_key_len_max
+    // bytes and differ only afterward must collapse to the SAME throttle
+    // key (proving the key is truncated, not the full attacker-controlled
+    // header) — otherwise an attacker could send unique multi-KB XFF values
+    // to blow up the bounded store and evade per-key audit coalescing.
+    var tc: TestClock = .{};
+    var sink: Sink = .{};
+    var g = try Gate.init(testing.allocator, .{
+        .token = "s3cr3t",
+        .on_audit = Sink.hook,
+        .on_audit_ctx = &sink,
+        .throttle_window_ms = 60_000,
+        .clock = tc.clock(),
+    });
+    defer g.deinit();
+    var gr = try GatedRouter.init(&g, &sink);
+    defer gr.deinit();
+    var buf: [4096]u8 = undefined;
+
+    tc.ns = std.time.ns_per_s;
+    const prefix = "9" ** client_key_len_max;
+    const xff_a = "X-Forwarded-For: " ++ prefix ++ "-tail-one\r\n";
+    const xff_b = "X-Forwarded-For: " ++ prefix ++ "-tail-two-is-much-longer\r\n";
+
+    try expectStatus(runWire(&gr.r, wire("POST", "/t", xff_a), &buf), "401");
+    try expectStatus(runWire(&gr.r, wire("POST", "/t", xff_b), &buf), "401");
+    // Both truncate to the same client_key_len_max-byte prefix -> one
+    // throttle key -> the second denial is coalesced, not a fresh entry.
+    try testing.expectEqual(@as(usize, 1), sink.len);
+    try testing.expectEqual(@as(usize, 1), g.throttleKeyCount());
 }
 
 test "rotation over the wire: new token works, old works until removed" {

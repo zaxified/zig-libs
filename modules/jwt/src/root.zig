@@ -1670,7 +1670,7 @@ fn resourceInvalidReason(err: anyerror) []const u8 {
         error.IssuedInFuture => "token issued in the future",
         error.IssuerMismatch => "issuer mismatch",
         error.AudienceMismatch => "audience mismatch",
-        error.MissingExpiration => "token missing exp",
+        error.MissingExp => "token missing exp",
         error.BadSignature => "bad signature",
         error.UnsecuredToken => "unsecured token rejected",
         error.AlgKeyMismatch, error.UnsupportedAlg => "unsupported algorithm",

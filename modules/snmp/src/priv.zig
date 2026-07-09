@@ -291,7 +291,7 @@ fn expectPrivRoundTrip(proto: PrivProtocol) !void {
     // Localize a privacy password to the example engine to get a realistic key.
     const engine_id = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2 };
     var key_buf: [usm.max_key_len]u8 = undefined;
-    const key = usm.passwordToKey(.hmac_sha1, "privpassword", &engine_id, &key_buf);
+    const key = try usm.passwordToKey(.hmac_sha1, "privpassword", &engine_id, &key_buf);
     const salt = [8]u8{ 0x00, 0x00, 0x00, 0x01, 0xde, 0xad, 0xbe, 0xef };
     const boots: u32 = 5;
     const time: u32 = 12345;

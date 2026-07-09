@@ -133,19 +133,29 @@ pub const AuthError = error{
     BadAuthParams,
 };
 
+/// Errors from the password->key derivation (RFC 3414 §2.6 / Appendix A.2).
+pub const KeyDerivationError = error{
+    /// `password` was empty — the cyclic expansion divides by `password.len`,
+    /// so an empty password has no well-defined key and is rejected rather
+    /// than dividing by zero.
+    EmptyPassword,
+};
+
 /// Derive the user key `Ku` from a password (RFC 3414 §2.6 / Appendix A.2): the
 /// password bytes are cycled to fill exactly 2^20 (1048576) octets, hashed once
 /// with the protocol's digest. Writes `proto.keyLen()` bytes into `out` (which
 /// must be at least that long) and returns that prefix. `password` must be
-/// non-empty.
-pub fn passwordToUserKey(proto: AuthProtocol, password: []const u8, out: []u8) []u8 {
+/// non-empty — `error.EmptyPassword` otherwise (never a division-by-zero
+/// panic).
+pub fn passwordToUserKey(proto: AuthProtocol, password: []const u8, out: []u8) KeyDerivationError![]u8 {
     return switch (proto) {
         .hmac_md5 => pwToUk(hash.Md5, password, out),
         .hmac_sha1 => pwToUk(hash.Sha1, password, out),
     };
 }
 
-fn pwToUk(comptime Hash: type, password: []const u8, out: []u8) []u8 {
+fn pwToUk(comptime Hash: type, password: []const u8, out: []u8) KeyDerivationError![]u8 {
+    if (password.len == 0) return error.EmptyPassword;
     // RFC 3414 Appendix A.2: cycle the password to fill exactly 2^20 octets,
     // digested in 64-byte blocks.
     var h = Hash.init(.{});
@@ -189,9 +199,11 @@ fn localizeT(comptime Hash: type, user_key: []const u8, engine_id: []const u8, o
 
 /// Convenience: `localizeKey(proto, passwordToUserKey(...), engineID)` — the
 /// full password→localized-key path. `out` must be ≥ `proto.keyLen()`.
-pub fn passwordToKey(proto: AuthProtocol, password: []const u8, engine_id: []const u8, out: []u8) []u8 {
+/// `error.EmptyPassword` propagates from `passwordToUserKey` for an empty
+/// password.
+pub fn passwordToKey(proto: AuthProtocol, password: []const u8, engine_id: []const u8, out: []u8) KeyDerivationError![]u8 {
     var uk_buf: [max_key_len]u8 = undefined;
-    const uk = passwordToUserKey(proto, password, &uk_buf);
+    const uk = try passwordToUserKey(proto, password, &uk_buf);
     return localizeKey(proto, uk, engine_id, out);
 }
 
@@ -449,7 +461,7 @@ test "keyLen: hmac_md5 -> 16, hmac_sha1 -> 20" {
 
 test "RFC 3414 A.3.1 KAT: MD5 Ku from password 'maplesyrup'" {
     var buf: [max_key_len]u8 = undefined;
-    const ku = passwordToUserKey(.hmac_md5, "maplesyrup", &buf);
+    const ku = try passwordToUserKey(.hmac_md5, "maplesyrup", &buf);
     try testing.expectEqualSlices(u8, &[_]u8{
         0x9f, 0xaf, 0x32, 0x83, 0x88, 0x4e, 0x92, 0x83,
         0x4e, 0xbc, 0x98, 0x47, 0xd8, 0xed, 0xd9, 0x63,
@@ -458,7 +470,7 @@ test "RFC 3414 A.3.1 KAT: MD5 Ku from password 'maplesyrup'" {
 
 test "RFC 3414 A.3.1 KAT: MD5 Kul localized to the example engine" {
     var buf: [max_key_len]u8 = undefined;
-    const kul = passwordToKey(.hmac_md5, "maplesyrup", &rfc3414_engine_id, &buf);
+    const kul = try passwordToKey(.hmac_md5, "maplesyrup", &rfc3414_engine_id, &buf);
     try testing.expectEqualSlices(u8, &[_]u8{
         0x52, 0x6f, 0x5e, 0xed, 0x9f, 0xcc, 0xe2, 0x6f,
         0x89, 0x64, 0xc2, 0x93, 0x07, 0x87, 0xd8, 0x2b,
@@ -467,7 +479,7 @@ test "RFC 3414 A.3.1 KAT: MD5 Kul localized to the example engine" {
 
 test "RFC 3414 A.3.2 KAT: SHA-1 Ku from password 'maplesyrup'" {
     var buf: [max_key_len]u8 = undefined;
-    const ku = passwordToUserKey(.hmac_sha1, "maplesyrup", &buf);
+    const ku = try passwordToUserKey(.hmac_sha1, "maplesyrup", &buf);
     try testing.expectEqualSlices(u8, &[_]u8{
         0x9f, 0xb5, 0xcc, 0x03, 0x81, 0x49, 0x7b, 0x37, 0x93, 0x52,
         0x89, 0x39, 0xff, 0x78, 0x8d, 0x5d, 0x79, 0x14, 0x52, 0x11,
@@ -476,7 +488,7 @@ test "RFC 3414 A.3.2 KAT: SHA-1 Ku from password 'maplesyrup'" {
 
 test "RFC 3414 A.3.2 KAT: SHA-1 Kul localized to the example engine" {
     var buf: [max_key_len]u8 = undefined;
-    const kul = passwordToKey(.hmac_sha1, "maplesyrup", &rfc3414_engine_id, &buf);
+    const kul = try passwordToKey(.hmac_sha1, "maplesyrup", &rfc3414_engine_id, &buf);
     try testing.expectEqualSlices(u8, &[_]u8{
         0x66, 0x95, 0xfe, 0xbc, 0x92, 0x88, 0xe3, 0x62, 0x82, 0x23,
         0x5f, 0xc7, 0x15, 0x1f, 0x12, 0x84, 0x97, 0xb3, 0x8f, 0x3f,
@@ -485,20 +497,28 @@ test "RFC 3414 A.3.2 KAT: SHA-1 Kul localized to the example engine" {
 
 test "SHA-1: passwordToKey == localizeKey(passwordToUserKey(...))" {
     var uk_buf: [max_key_len]u8 = undefined;
-    const uk = passwordToUserKey(.hmac_sha1, "maplesyrup", &uk_buf);
+    const uk = try passwordToUserKey(.hmac_sha1, "maplesyrup", &uk_buf);
     var kul_a_buf: [max_key_len]u8 = undefined;
     const kul_a = localizeKey(.hmac_sha1, uk, &rfc3414_engine_id, &kul_a_buf);
     var kul_b_buf: [max_key_len]u8 = undefined;
-    const kul_b = passwordToKey(.hmac_sha1, "maplesyrup", &rfc3414_engine_id, &kul_b_buf);
+    const kul_b = try passwordToKey(.hmac_sha1, "maplesyrup", &rfc3414_engine_id, &kul_b_buf);
     try testing.expectEqual(@as(usize, 20), kul_a.len);
     try testing.expectEqualSlices(u8, kul_a, kul_b);
+}
+
+test "passwordToUserKey / passwordToKey reject an empty password (typed error, no div-by-zero panic)" {
+    var buf: [max_key_len]u8 = undefined;
+    try testing.expectError(error.EmptyPassword, passwordToUserKey(.hmac_md5, "", &buf));
+    try testing.expectError(error.EmptyPassword, passwordToUserKey(.hmac_sha1, "", &buf));
+    try testing.expectError(error.EmptyPassword, passwordToKey(.hmac_md5, "", &rfc3414_engine_id, &buf));
+    try testing.expectError(error.EmptyPassword, passwordToKey(.hmac_sha1, "", &rfc3414_engine_id, &buf));
 }
 
 /// Build an authenticated v3 datagram (12-zero auth placeholder) in `msg_buf`,
 /// then sign it in place and verify; tamper checks included.
 fn expectSignVerifyRoundTrip(proto: AuthProtocol) !void {
     var key_buf: [max_key_len]u8 = undefined;
-    const key = passwordToKey(proto, "maplesyrup", &rfc3414_engine_id, &key_buf);
+    const key = try passwordToKey(proto, "maplesyrup", &rfc3414_engine_id, &key_buf);
 
     // USM blob carrying a 12-zero msgAuthenticationParameters placeholder.
     var usm_buf: [128]u8 = undefined;

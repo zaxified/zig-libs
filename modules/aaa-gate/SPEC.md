@@ -24,8 +24,21 @@ Auth + audit front for an API (Bearer/API-key gate). Usage: see ./README.md. Att
   `WWW-Authenticate`) on failure.
 
 ## Threat model / out of scope
-- Defends: credential brute-force (constant-time compare + denied-throttle) and provides an audit
-  trail for post-incident review.
+- Defends: the **timing oracle** on credential comparison (constant-time compare defeats
+  byte-by-byte token/key recovery via response-time measurement) and provides an audit trail for
+  post-incident review.
+- Does **NOT** defend: credential brute-force by request volume. The denied-request throttle only
+  rate-limits invocations of the **audit hook** (coalescing repeated 401 log entries from one
+  client key) — it never throttles responses; every denied request still gets its 401 as fast as
+  the gate can produce one. This module alone imposes no cap on attempt rate. Real brute-force
+  (guessing) protection requires separately wiring the `ratelimit` or `abuseguard` modules in
+  front of (or alongside) this gate.
+- The throttle key is derived from client-supplied, forgeable input (rightmost `X-Forwarded-For`
+  hop, else `X-Real-IP`, else socket peer IP) — see "Throttle key" above. Trusting those headers
+  (rather than only the socket peer) is meaningful only behind a trusted reverse proxy that
+  sanitizes/sets them; directly reachable, an attacker can pick any key value (subject to the
+  `client_key_len_max` clamp) to split across many audit-coalescing buckets or collide with a
+  victim's key.
 - Static shared-secret credentials only — not token issuance, not OAuth2/OIDC (use `jwt`), not
   session management; storage/rotation/zeroization is the caller's.
 - AuthZ is coarse (authenticates + can gate); fine-grained scopes/RBAC are the application's or
