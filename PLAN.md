@@ -20,8 +20,8 @@ touch build.zig · README · PLAN · NOTICE — they report back; the owner veri
 
 ## Status (2026-07-09)
 
-**62 modules · 1582 tests** (1579 pass + 3 env-gated skips: ubus/wireguard/blobmsg live checks) ·
-Debug + ReleaseFast green · `zig fmt` clean · MIT. Latest commit `5d2956d`.
+**65 modules · 1597 tests** (1594 pass + 3 env-gated skips: ubus/wireguard/blobmsg live checks) ·
+Debug + ReleaseFast green · `zig fmt` clean · MIT. Latest commit `fb3a910`.
 Web/API cluster, HTTP/1.1+HTTP/2 stack, `kv` (+VOPR), network family, crypto leaves, MCP (+HTTP/SSE
 transport), and the content-negotiation + Range/206 HTTP feature families are complete.
 **Extraction wave 1 landed 2026-07-09** (Opus-coordinated, agent-built): `blobstore` (`24833cf`),
@@ -29,7 +29,9 @@ transport), and the content-negotiation + Range/206 HTTP feature families are co
 2026-07-09:** `dataset` (`3e2c5be`, anchor) → `tabular` (`6e19fc1`) + `jsonshape` (`6a74016`) +
 `finstats` (`0813d5c`) (parallel). **Wave 3 — extraction backlog (Opus, 6 parallel builders) landed
 2026-07-09:** `filestore` · `framing` (folds lenframe+jsonwire) · `datefmt` · `diagnostics` · `json5` ·
-`zipstream`; plus a `blobstore.putNamed` atomicity bugfix surfaced during scoping. Findings +
+`zipstream`; plus a `blobstore.putNamed` atomicity bugfix surfaced during scoping. **Wave 4 landed
+2026-07-09:** `tz` (dep datefmt; verbatim IANA table) · `pollworker` (Linux poll loop + fork JobTable) ·
+`ipcbus` (dep framing; dispatch refactored to a callback). Findings +
 reclassifications below. **`roquery` DROPPED from the module set (decision 2026-07-09, see Key
 decisions): its hardening is C-level, and zig-libs stays 100% pure-Zig — it lives consumer-side over
 ADOPTed SQLite.**
@@ -102,8 +104,8 @@ RFC codecs). Archetypes: ① HTTP/SaaS backend · ② netops · ③ IoT · ④ A
 | 🔀 `taskqueue` → **FOLD into `jobqueue`** | ③ fleet C2 | scope 2026-07-09: storage adds nothing over `filestore`; the value (lease/retry/DLQ) is jobqueue's job; only per-partition FIFO is worth keeping → build it as a `jobqueue` partition-key feature (`nextFor(partition)` + a real `priority` field), not a standalone module. Seed's id-arithmetic priority hack silently clobbers records |
 | ⚠️ `rawsock` → **reclassified BUILD** | ② capture/inject | seed is ~25 LOC receive-only (AF_PACKET open, duplicated 4× inline in axp); the real module — send/inject, BPF filter, promisc, iface enum — is mostly new construction, not extraction. Needs netns/root to verify |
 | ⚠️ `argsafe` → **reclassified BUILD** | hardening | no shared abstraction in the seed: 14 ad-hoc validator predicates across axp `task.zig`; the module is a *design consolidation* (composable `CharClass` + `safeArgv` builder), not a lift |
-| bxp text libs (scoped 2026-07-09): ✅ `datefmt` `5d2956d` · ✅ `diagnostics` `5d2956d` · ✅ `json5` `5d2956d` · ✅ `zipstream` `5d2956d` | ⑤ + i18n | DONE (Wave 3). Remaining EXTRACT: **`tz`** (dep datefmt; +5843-LOC IANA table + `tz-gen` tool; near spec-complete, minor Julian-day polish) → Wave 4. Design-first (carve-out before lift): **`csvstream`** (merge csv.zig `LineIterator` + a bxp-cli-private `ChunkReader`), **`csvsafe`** (split the OWASP formula-injection guard out of 3 fused concerns), **`numparse`** (carve from 6.5k-LOC expr.zig) → Wave 5. **Fable-headroom (wait for reset):** `encoding` (5 code pages → full WHATWG), `unaccent` (⚠️ seed needs external `uucode` → violates zero-dep; Fable must clean-room UCD tables like `tz-gen`) |
-| IPC glue (scoped 2026-07-09): ✅ `framing` = `lenframe`+`jsonwire` FOLDED `5d2956d` | same-host IPC | DONE (Wave 3). Remaining: **`pollworker`** (single-owner poll loop + fork/detach JobTable; genericize the curl-specific fork body; Linux) → Wave 4; **`ipcbus`** (dep framing; needs a real refactor — pull dispatch out of poc's `ctlHandleConn` into a callback) → Wave 4. **`chunkframe` → SKIP** (~20 LOC base64+JSON-envelope glue with a narrow one-bridge `why`; documented pattern, not a module) |
+| bxp text libs (scoped 2026-07-09): ✅ `datefmt` `5d2956d` · ✅ `diagnostics` `5d2956d` · ✅ `json5` `5d2956d` · ✅ `zipstream` `5d2956d` | ⑤ + i18n | DONE (Wave 3). ✅ **`tz`** DONE (Wave 4). Remaining EXTRACT — design-first (carve-out before lift): **`csvstream`** (merge csv.zig `LineIterator` + a bxp-cli-private `ChunkReader`), **`csvsafe`** (split the OWASP formula-injection guard out of 3 fused concerns), **`numparse`** (carve from 6.5k-LOC expr.zig) → Wave 5. **Fable-headroom (wait for reset):** `encoding` (5 code pages → full WHATWG), `unaccent` (⚠️ seed needs external `uucode` → violates zero-dep; Fable must clean-room UCD tables like `tz-gen`) |
+| IPC glue (scoped 2026-07-09): ✅ `framing` = `lenframe`+`jsonwire` FOLDED `5d2956d` | same-host IPC | DONE (Wave 3). ✅ **`pollworker`** + **`ipcbus`** DONE (Wave 4). **`chunkframe` → SKIP** (~20 LOC base64+JSON-envelope glue with a narrow one-bridge `why`; documented pattern, not a module) |
 
 ### BUILD → Opus (greenfield, standard pattern / integration)
 | Candidate | Unlocks | Why chosen |
@@ -185,7 +187,7 @@ desired/applied-generation + anti-brick rollback → k8s-controller-lite for con
    `json5`+`zipstream` (+`blobstore.putNamed` atomicity fix). `roquery` dropped (C-level), `taskqueue`
    folded into jobqueue, `chunkframe` skipped.
 1. **Finish extraction (Opus, next):**
-   - **Wave 4:** `tz` (dep datefmt) · `pollworker` (Linux) · `ipcbus` (dep framing, refactor).
+   - ✅ **Wave 4 DONE:** `tz` · `pollworker` · `ipcbus`.
    - **Wave 5 (carve-out first):** `csvstream` · `csvsafe` · `numparse`.
    - **Fable-wait:** `encoding` (full WHATWG) · `unaccent` (clean-room UCD tables, no external `uucode`).
    - Also remaining EXTRACT: `rawsock`/`argsafe` are now **BUILD** (reclassified), do them in the build phase.
