@@ -58,16 +58,47 @@ logout-everywhere (no user→sessions index); concurrent same-session read-modif
 save wins — not a lost-update-safe store); automatic CSRF body form-field extraction (use
 `Csrf.verify` from the handler instead, so the middleware never touches the request body).
 
+**Known limitation — cross-request resurrection race (not fixed here):** the same-request case is
+closed (`middlewareRun` does not re-`save` a session that was `revoke()`'d or `regenerate()`'d
+during that request — see `Session.revoked` / `Session.regenerated`). A **deeper**, cross-request
+race remains: two genuinely concurrent requests can share a cookie (the same session id) — for
+example, one tab in flight while another tab logs out. Request A loads the session (a private,
+in-memory copy) before request B calls `revoke()`/`regenerate()` and deletes it from the store;
+when A finishes, its trailing `save()` still `put`s its (stale) copy back under the old id,
+resurrecting a session that was supposed to be dead, or reviving a fixed pre-auth id after a
+same-session regenerate raced it out. This needs store-level optimistic concurrency — a
+generation/version tag on the record, with `put` doing a compare-and-swap against the generation
+the request originally loaded, so a racing writer's stale `save` is rejected instead of silently
+overwriting a newer write or a delete. Not built; backlogged (see below) as a `Store` vtable change
+(`get` returning a generation, `put`/`delete` taking an expected generation).
+
+**Known limitation — thread-per-connection assumption for the `Set-Cookie` buffer:** `writeCookie`
+stages the `Set-Cookie` value in a **threadlocal** buffer (`cookie_buf`) because `http.Server`'s
+response writer keeps the header slice uncopied and serializes it lazily at `writeHead`, after the
+middleware itself has already returned — a stack buffer would dangle by then. This is only safe
+under a **thread-per-connection (blocking)** `std.Io` backend (e.g. `std.Io.Threaded`), where one
+OS thread serves exactly one connection's request at a time, so the threadlocal is never shared. A
+**cooperative/fiber `Io` backend** that multiplexes multiple connections onto one OS thread (e.g. an
+event-loop or green-thread scheduler) would let one connection's handler run, stage its
+`Set-Cookie` into `cookie_buf`, yield, and have a *different* connection's request run on the same
+OS thread before the first one's header is serialized — bleeding one user's `Set-Cookie` (and
+therefore session id) into another user's response. Callers **must** use a blocking, one-thread-
+per-connection `std.Io` implementation (or an equivalent scheduling guarantee) with this module;
+this is not currently enforced in code (there is no portable way to introspect the `Io`
+implementation's scheduling model from here), only documented.
+
 ## Verification
 
-16 offline tests (Debug + `-Doptimize=ReleaseFast`), `zig fmt --check modules/sessions`. Session
-core (6): create→save→load round-trip, forged id → absent, idle-expiry evict, absolute-cap expiry,
-regenerate (old id dead / data carried), insecure escape hatch. Middleware (3): hardened
-Set-Cookie + cookie round-trip, revoke expires+evicts, small-buffer early-flush (no cookie-buffer
-corruption). CSRF (6): token/verify round-trip + tamper, per-key distinctness, safe-GET issues a
-non-HttpOnly cookie, POST 403 without a token / 200 with the right one, cross-session token
-rejected, query-param fallback. Plus the dark-tests aggregator pulling in `csrf.zig`. Run:
-`zig build test-sessions`.
+19 offline tests (Debug + `-Doptimize=ReleaseFast`), `zig fmt --check modules/sessions`. Session
+core (7): create→save→load round-trip, forged id → absent, idle-expiry evict, absolute-cap expiry,
+regenerate (old id dead / data carried), `min_id_bytes` floor accepted at floor/default/ceiling,
+insecure escape hatch. Middleware (5): hardened Set-Cookie + cookie round-trip, revoke
+expires+evicts, same-request revoke does not get resurrected by the trailing save, same-request
+regenerate persists only the new id (old id stays dead, post-rotation data survives),
+small-buffer early-flush (no cookie-buffer corruption). CSRF (6): token/verify round-trip + tamper,
+per-key distinctness, safe-GET issues a non-HttpOnly cookie, POST 403 without a token / 200 with
+the right one, cross-session token rejected, query-param fallback. Plus the dark-tests aggregator
+pulling in `csrf.zig`. Run: `zig build test-sessions`.
 
 ## Backlog / deferred
 
@@ -84,7 +115,9 @@ rejected, query-param fallback. Plus the dark-tests aggregator pulling in `csrf.
 - **Logout-everywhere** (a user→sessions index) — not built; `revoke`/`regenerate` act on one
   session id only.
 - **Concurrent same-session read-modify-write races** — last save wins; no optimistic-concurrency
-  guard.
+  guard. Same underlying gap as the cross-request resurrection race in the Threat-model section
+  above: needs a generation/version tag on `Store` records and a CAS-style `put`/`delete` so a
+  stale concurrent `save` can be rejected instead of silently winning.
 - **Automatic CSRF body form-field extraction** — deliberately not done in the middleware (see
   design notes); callers use `Csrf.verify` directly.
 

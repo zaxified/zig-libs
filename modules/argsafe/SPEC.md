@@ -17,6 +17,13 @@ Usage: see ./README.md. Attribution/provenance: see /NOTICE.
   (validated). A rejected push **poisons** the builder so `slice()` returns `error.Rejected` even if
   the caller swallowed the earlier error — a validation failure can never silently ship a short
   argv.
+  - **Limitation:** "impossible to construct an invalid `Argv`" is an *API contract*, not a
+    compiler-enforced one — Zig has no field-level privacy (no `private`/module-boundary field
+    access control within the same file), so `Argv.items`/`Argv.ok` are technically reachable and a
+    caller could mutate them directly, bypassing every validator. Callers MUST treat the fields as
+    implementation detail and only ever go through `push`/`pushChecked`/`pushIf`/`slice`/`deinit`. A
+    future refactor should consider a stronger encapsulation (e.g. an opaque handle plus an
+    accessor in a separate file) to make the invariant harder to violate by accident.
 - Pure, reentrant, no shared state; every function is pure over its arguments. Std-only.
 
 ## Threat model / out of scope
@@ -32,10 +39,11 @@ are the proven-in-production ceilings carried from axp (path ≤4096, url ≤102
 
 ## Verification
 `zig build test-argsafe`. Golden allow/reject tables reconstructing the seed validators (incl.
-base64 exactly-44 with 43/45 rejected, `isSafePath` now rejecting the `..` the seed accepted), a
+base64 exactly-44 with 43/45 rejected, `isSafePath` now rejecting the `..` the seed accepted,
+`isSafeCidrList` rejecting a leading dash even when the caller's `sep` is `'-'` itself), a
 property-style adversarial sweep feeding every predicate a raw NUL/`\n`/leading-`-`/`..`/DEL/ESC and
 asserting none are accepted, and `Argv` tests (validated build; a rejected `pushChecked`/`pushIf`
-poisons `slice()`). 17 tests. Green in Debug and ReleaseFast; `zig fmt --check` clean.
+poisons `slice()`). 18 tests. Green in Debug and ReleaseFast; `zig fmt --check` clean.
 
 ## Backlog / deferred
 Windows argv quoting and environment-variable-injection allowlisting are explicitly out of scope for

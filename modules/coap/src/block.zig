@@ -129,20 +129,36 @@ pub fn split(payload: []const u8, szx: u3, num: u32) error{OutOfRange}!Chunk {
 /// Reassembles arriving blocks into a caller-provided buffer — the same
 /// caller-storage, zero-allocation pattern as `reliability.Dedup`. Each accepted
 /// block is written at `num * blockSize`; the transfer is complete once a block
-/// with M unset (the last) has been seen.
+/// with M unset (the last) has been seen **and** every byte from offset 0 up to
+/// it has actually been written by an accepted block (never a gap of
+/// never-written buffer contents).
 pub const Assembler = struct {
     /// Caller storage for the reassembled payload.
     buf: []u8,
-    /// Bytes written so far (the high-water mark → the payload length).
+    /// Bytes written so far — also the *contiguous* coverage from offset 0
+    /// (see `accept`'s gap check), so this doubles as the payload length.
     len: usize = 0,
     /// Set once the final (M==0) block has been accepted.
     done: bool = false,
+    /// SZX of the first accepted block; a later block with a different SZX is
+    /// a mid-transfer size renegotiation, which this assembler does not
+    /// support (see the module doc comment) and rejects rather than silently
+    /// mis-assembling.
+    szx: ?u3 = null,
 
     pub const Error = error{
         /// A block would write past the end of `buf`.
         BufferTooSmall,
         /// The block offset/length overflows a `usize`.
         Overflow,
+        /// The block's start offset is beyond the current contiguous coverage
+        /// — accepting it would leave a never-written gap in `buf` between the
+        /// existing coverage and this block (e.g. a lone high-`num` final
+        /// block on a fresh assembler). Rejected so `payload()`/`isComplete()`
+        /// can never expose never-written bytes.
+        NonContiguousBlock,
+        /// This block's SZX differs from the first accepted block's SZX.
+        SzxChanged,
     };
 
     /// Initialize over caller storage.
@@ -153,8 +169,20 @@ pub const Assembler = struct {
     /// Write `data` (block `blk`'s bytes) at its offset and note completion when
     /// `blk.more` is false. `data` should be `blk.size()` bytes except on the
     /// final block; the assembler does not itself require full blocks.
+    ///
+    /// Rejects (rather than silently mis-assembling) a block whose start
+    /// offset exceeds the current contiguous coverage (`error.NonContiguousBlock`
+    /// — closes a gap that would otherwise let a single high-`num`, `more=false`
+    /// block mark the transfer complete over never-written buffer bytes) and a
+    /// block whose SZX differs from the first accepted block's (`error.SzxChanged`).
     pub fn accept(self: *Assembler, blk: Block, data: []const u8) Error!void {
+        if (self.szx) |s| {
+            if (blk.szx != s) return error.SzxChanged;
+        } else {
+            self.szx = blk.szx;
+        }
         const start = std.math.mul(usize, blk.num, blk.size()) catch return error.Overflow;
+        if (start > self.len) return error.NonContiguousBlock;
         const end = std.math.add(usize, start, data.len) catch return error.Overflow;
         if (end > self.buf.len) return error.BufferTooSmall;
         @memcpy(self.buf[start..end], data);
@@ -249,9 +277,52 @@ test "Assembler: gather blocks then detect completion" {
     try testing.expect(asm_.isComplete());
     try testing.expectEqualStrings(src, asm_.payload());
 
-    // A block past the buffer end is rejected.
+    // A block past the buffer end is rejected (num=0 keeps it contiguous so
+    // this isolates the BufferTooSmall check from the gap check below).
     var tiny = Assembler.init(store[0..8]);
-    try testing.expectError(error.BufferTooSmall, tiny.accept(.{ .num = 1, .szx = 0 }, "0123456789abcdef"));
+    try testing.expectError(error.BufferTooSmall, tiny.accept(.{ .num = 0, .szx = 0 }, "0123456789abcdef"));
+}
+
+test "Assembler: a lone high-num final block is rejected, not reported complete" {
+    // Attack: a single block with a high NUM and more=false, on a fresh
+    // assembler. Without the gap check this would set done=true while
+    // [0, offset) was never written (stale pooled-buffer disclosure).
+    var store: [4096]u8 = undefined;
+    var asm_ = Assembler.init(&store);
+    const blk: Block = .{ .num = 10, .more = false, .szx = 0 }; // offset 160
+    try testing.expectError(error.NonContiguousBlock, asm_.accept(blk, "tail"));
+    try testing.expect(!asm_.isComplete());
+    try testing.expectEqual(@as(usize, 0), asm_.payload().len);
+}
+
+test "Assembler: in-order 0..N assembly still works" {
+    var store: [64]u8 = undefined;
+    var asm_ = Assembler.init(&store);
+    try asm_.accept(.{ .num = 0, .more = true, .szx = 0 }, "0123456789abcdef"); // [0,16)
+    try asm_.accept(.{ .num = 1, .more = true, .szx = 0 }, "ghijklmnopqrstuv"); // [16,32)
+    try asm_.accept(.{ .num = 2, .more = false, .szx = 0 }, "wxyz"); // [32,36)
+    try testing.expect(asm_.isComplete());
+    try testing.expectEqualStrings("0123456789abcdefghijklmnopqrstuvwxyz", asm_.payload());
+}
+
+test "Assembler: a gap between blocks is rejected" {
+    var store: [4096]u8 = undefined;
+    var asm_ = Assembler.init(&store);
+    try asm_.accept(.{ .num = 0, .more = true, .szx = 0 }, "0123456789abcdef"); // covers [0,16)
+    // Block 2 (offset 32) skips block 1's range [16,32): a gap.
+    try testing.expectError(error.NonContiguousBlock, asm_.accept(.{ .num = 2, .more = false, .szx = 0 }, "tail"));
+    try testing.expect(!asm_.isComplete());
+    // The transfer can still be completed properly by filling the gap.
+    try asm_.accept(.{ .num = 1, .more = true, .szx = 0 }, "ghijklmnopqrstuv");
+    try asm_.accept(.{ .num = 2, .more = false, .szx = 0 }, "tail");
+    try testing.expect(asm_.isComplete());
+}
+
+test "Assembler: rejects a mid-transfer SZX change instead of mis-assembling" {
+    var store: [4096]u8 = undefined;
+    var asm_ = Assembler.init(&store);
+    try asm_.accept(.{ .num = 0, .more = true, .szx = 0 }, "0123456789abcdef"); // szx 0 ⇒ 16-byte blocks
+    try testing.expectError(error.SzxChanged, asm_.accept(.{ .num = 1, .more = false, .szx = 1 }, "x"));
 }
 
 test "C6 end-to-end: Block2 GET transfers a 3000-byte body block by block" {

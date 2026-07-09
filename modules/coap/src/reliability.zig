@@ -163,6 +163,11 @@ pub const Dedup = struct {
     /// duplicate (already live in the window). Expired entries are reclaimed on
     /// the way.
     pub fn check(self: *Dedup, mid: u16, now_ms: u64) Verdict {
+        // Defensive: zero-length caller storage means dedup is impossible —
+        // treat everything as fresh rather than indexing an empty slice below
+        // (the eviction path would otherwise panic/UB on `entries[min_idx]`).
+        if (self.entries.len == 0) return .fresh;
+
         // Single pass: compact live entries down (dropping expired ones),
         // noting a duplicate and the soonest-to-expire live slot as we go.
         var keep: usize = 0;
@@ -308,6 +313,14 @@ test "Dedup: full storage evicts the soonest-to-expire entry" {
     try testing.expectEqual(Dedup.Verdict.duplicate, dd.check(2, 300));
     try testing.expectEqual(Dedup.Verdict.duplicate, dd.check(3, 300));
     try testing.expectEqual(Dedup.Verdict.fresh, dd.check(1, 300)); // was evicted
+}
+
+test "Dedup: zero-length storage never panics and always reports fresh" {
+    var storage: [0]Dedup.Entry = undefined;
+    var dd = Dedup.init(&storage, 1000);
+    try testing.expectEqual(Dedup.Verdict.fresh, dd.check(1, 0));
+    try testing.expectEqual(Dedup.Verdict.fresh, dd.check(1, 1)); // no storage ⇒ can't remember it either
+    try testing.expectEqual(@as(usize, 0), dd.len);
 }
 
 test "Dedup: expired entries are reclaimed on check" {

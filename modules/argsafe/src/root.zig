@@ -204,6 +204,11 @@ pub fn isSafeBase64(s: []const u8, exact_len: ?usize) bool {
 /// (which fixed `sep = ','`). The charset excludes `-` and NUL.
 pub fn isSafeCidrList(s: []const u8, sep: u8) bool {
     if (s.len == 0 or s.len > 256) return false;
+    // Explicit flag-injection guard, independent of `sep`: the charset below
+    // excludes '-' only incidentally (when the caller's `sep` isn't '-'). A
+    // caller passing `sep = '-'` would otherwise put '-' in the allowed set
+    // and reopen leading-dash flag injection (e.g. "-4", "--help").
+    if (s[0] == '-') return false;
     for (s) |c| {
         const ok = isHexDigit(c) or c == '.' or c == ':' or c == '/' or c == sep;
         if (!ok) return false;
@@ -423,6 +428,16 @@ test "isSafeCidrList" {
     try testing.expect(!isSafeCidrList("10.0.0.0/24;rm", ',')); // metachar
     try testing.expect(!isSafeCidrList("", ','));
     try testing.expect(!isSafeCidrList("-10.0.0.0/8", ',')); // '-' not in class
+}
+
+test "isSafeCidrList: leading dash rejected even when sep collides with '-'" {
+    // If a caller passes sep = '-', '-' joins the allowed charset; without an
+    // explicit leading-dash guard (independent of sep) this would reopen flag
+    // injection via a leading "-4" / "--help".
+    try testing.expect(!isSafeCidrList("-4", '-'));
+    try testing.expect(!isSafeCidrList("--help", '-'));
+    try testing.expect(isSafeCidrList("1.2.3.0/24", '-'));
+    try testing.expect(isSafeCidrList("1.2.3.0/24-fd00::/8", '-')); // '-' still works as separator
 }
 
 test "isSafeKvValue: token vs printable-ascii" {

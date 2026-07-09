@@ -145,7 +145,10 @@ pub fn request(c: *Client, method: http.Method, url_text: []const u8, options: R
     const deadline = c.totalDeadline();
 
     var url = try http.Url.parse(url_text);
-    const original_host = url.host;
+    // Slices in `original_url` point into `url_text` (caller-owned, valid for
+    // the whole call), so keeping this copy around stays valid even after
+    // `url` itself gets reassigned to a redirect target below.
+    const original_url = url;
     var current_method = method;
     var current_body = options.body;
     var url_owned: ?[]u8 = null;
@@ -157,9 +160,14 @@ pub fn request(c: *Client, method: http.Method, url_text: []const u8, options: R
         const conn = try c.openConn(url);
         errdefer conn.destroy();
 
-        const strip_auth = !std.ascii.eqlIgnoreCase(url.host, original_host);
+        // Strip credential-bearing headers unless this hop's target is the
+        // *exact same origin* (scheme + host + port) as the original request
+        // — a host-only check would keep sending Authorization/Cookie across
+        // a same-host https→http downgrade or a same-host port change
+        // (CVE-2018-18074 class: cleartext credential / cross-service leak).
+        const strip_sensitive = crossOrigin(original_url, url);
         const plan: BodyPlan = if (current_body) |b| .{ .content_length = b.len } else .none;
-        try writeRequestHead(conn.plainWriter(), current_method, url, options.headers, c.options.user_agent, plan, strip_auth);
+        try writeRequestHead(conn.plainWriter(), current_method, url, options.headers, c.options.user_agent, plan, strip_sensitive);
         if (current_body) |b| conn.plainWriter().writeAll(b) catch return error.WriteFailed;
         try conn.flushAll();
 
@@ -724,11 +732,25 @@ const BodyPlan = union(enum) {
     chunked,
 };
 
+/// True when `a` and `b` are different origins (RFC 6454): scheme, host
+/// (case-insensitive — DNS names) and port must ALL match. `Url.parse`
+/// already fills in the scheme's default port when the URL omits one, so a
+/// bare port comparison here correctly treats an explicit `:443` and an
+/// implicit `https://` origin as the same. Used to decide whether a redirect
+/// hop must strip credential-bearing headers (`Authorization`, `Cookie`) —
+/// a host-only check would keep sending them across a same-host scheme
+/// downgrade (https→http) or a same-host port change.
+fn crossOrigin(a: http.Url, b: http.Url) bool {
+    return !(a.scheme == b.scheme and a.port == b.port and std.ascii.eqlIgnoreCase(a.host, b.host));
+}
+
 /// Emit a full request head. Pure writer logic so tests can assert exact
 /// bytes. Managed headers: `Connection: close` always; `Content-Length` /
 /// `Transfer-Encoding` from `plan`; `Host`, `User-Agent`, `Accept-Encoding`
-/// defaulted unless the caller supplies them; `Authorization` dropped when
-/// `strip_authorization` (cross-host redirect).
+/// defaulted unless the caller supplies them; `Authorization` and `Cookie`
+/// both dropped when `strip_sensitive` (cross-origin redirect — see
+/// `crossOrigin`) since either can carry credentials that must not leak to a
+/// different scheme/host/port.
 fn writeRequestHead(
     w: *std.Io.Writer,
     method: http.Method,
@@ -736,7 +758,7 @@ fn writeRequestHead(
     headers: []const http.Header,
     user_agent: []const u8,
     plan: BodyPlan,
-    strip_authorization: bool,
+    strip_sensitive: bool,
 ) error{WriteFailed}!void {
     var custom_host: ?[]const u8 = null;
     var custom_ua = false;
@@ -747,7 +769,7 @@ fn writeRequestHead(
         if (std.ascii.eqlIgnoreCase(hd.name, "accept-encoding")) custom_ae = true;
     }
 
-    writeHead(w, method, url, headers, user_agent, plan, strip_authorization, custom_host, custom_ua, custom_ae) catch
+    writeHead(w, method, url, headers, user_agent, plan, strip_sensitive, custom_host, custom_ua, custom_ae) catch
         return error.WriteFailed;
 }
 
@@ -758,7 +780,7 @@ fn writeHead(
     headers: []const http.Header,
     user_agent: []const u8,
     plan: BodyPlan,
-    strip_authorization: bool,
+    strip_sensitive: bool,
     custom_host: ?[]const u8,
     custom_ua: bool,
     custom_ae: bool,
@@ -778,7 +800,8 @@ fn writeHead(
             std.ascii.eqlIgnoreCase(hd.name, "connection") or
             std.ascii.eqlIgnoreCase(hd.name, "content-length") or
             std.ascii.eqlIgnoreCase(hd.name, "transfer-encoding")) continue;
-        if (strip_authorization and std.ascii.eqlIgnoreCase(hd.name, "authorization")) continue;
+        if (strip_sensitive and (std.ascii.eqlIgnoreCase(hd.name, "authorization") or
+            std.ascii.eqlIgnoreCase(hd.name, "cookie"))) continue;
         try w.print("{s}: {s}\r\n", .{ hd.name, hd.value });
     }
 
@@ -884,6 +907,82 @@ test "writeRequestHead: Authorization stripped on cross-host redirect" {
     w = .fixed(&buf);
     try writeRequestHead(&w, .get, url, &hdrs, "a", .none, true);
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "Authorization") == null);
+}
+
+test "crossOrigin: scheme, host and port must ALL match (CVE-2018-18074 class)" {
+    const base = try http.Url.parse("https://example.com/a");
+
+    // Same origin, different path/query — not cross-origin.
+    try testing.expect(!crossOrigin(base, try http.Url.parse("https://example.com/b?x=1")));
+    // Host comparison is case-insensitive (DNS names).
+    try testing.expect(!crossOrigin(base, try http.Url.parse("https://EXAMPLE.com/a")));
+    // Explicit default port == implicit default port (both normalized by Url.parse).
+    try testing.expect(!crossOrigin(base, try http.Url.parse("https://example.com:443/a")));
+
+    // Same host, scheme downgrade https→http — cross-origin (must strip).
+    try testing.expect(crossOrigin(base, try http.Url.parse("http://example.com/a")));
+    // Same host+scheme, different (non-default) port — cross-origin.
+    try testing.expect(crossOrigin(base, try http.Url.parse("https://example.com:8443/a")));
+    // Different host entirely — cross-origin.
+    try testing.expect(crossOrigin(base, try http.Url.parse("https://other.example/a")));
+}
+
+test "writeRequestHead: Authorization and Cookie both stripped on cross-origin redirect, both kept on same-origin" {
+    var buf: [512]u8 = undefined;
+    const url = try http.Url.parse("http://other.example/");
+    const hdrs = [_]http.Header{
+        .{ .name = "Authorization", .value = "Bearer secret" },
+        .{ .name = "Cookie", .value = "session=abc123" },
+    };
+
+    // Same-origin hop: both credential headers are forwarded.
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeRequestHead(&w, .get, url, &hdrs, "a", .none, false);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "Authorization: Bearer secret") != null);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "Cookie: session=abc123") != null);
+
+    // Cross-origin hop: both are dropped (session-cookie / API-key leak
+    // otherwise — Cookie is just as sensitive as Authorization here).
+    w = .fixed(&buf);
+    try writeRequestHead(&w, .get, url, &hdrs, "a", .none, true);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "Authorization") == null);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "Cookie") == null);
+}
+
+test "request(): same-host scheme downgrade and same-host port change both strip Authorization+Cookie" {
+    // Exercises the same origin computation `request()` uses
+    // (`crossOrigin(original_url, url)`), offline: no network needed since
+    // the decision only depends on the two parsed URLs.
+    const original = try http.Url.parse("https://api.example/v1");
+    const hdrs = [_]http.Header{
+        .{ .name = "Authorization", .value = "Bearer secret" },
+        .{ .name = "Cookie", .value = "session=abc123" },
+    };
+    var buf: [512]u8 = undefined;
+
+    // Same host, https → http downgrade: must strip.
+    const downgraded = try http.Url.parse("http://api.example/v1");
+    try testing.expect(crossOrigin(original, downgraded));
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeRequestHead(&w, .get, downgraded, &hdrs, "a", .none, crossOrigin(original, downgraded));
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "Authorization") == null);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "Cookie") == null);
+
+    // Same host+scheme, different port: must strip.
+    const reported = try http.Url.parse("https://api.example:8443/v1");
+    try testing.expect(crossOrigin(original, reported));
+    w = .fixed(&buf);
+    try writeRequestHead(&w, .get, reported, &hdrs, "a", .none, crossOrigin(original, reported));
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "Authorization") == null);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "Cookie") == null);
+
+    // Truly same-origin hop (path-only change): both preserved.
+    const same_origin = try http.Url.parse("https://api.example/v2");
+    try testing.expect(!crossOrigin(original, same_origin));
+    w = .fixed(&buf);
+    try writeRequestHead(&w, .get, same_origin, &hdrs, "a", .none, crossOrigin(original, same_origin));
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "Authorization: Bearer secret") != null);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "Cookie: session=abc123") != null);
 }
 
 test "redirect chain on fabricated responses" {

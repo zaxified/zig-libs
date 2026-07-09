@@ -332,7 +332,12 @@ fn write(
     fallback_host: []const u8,
 ) std.Io.Writer.Error!void {
     try w.writeAll(if (secure) "coaps://" else "coap://");
-    try w.writeAll(firstOption(options, number.uri_host) orelse fallback_host);
+    // Percent-encode the host the same way path/query segments are: a
+    // Uri-Host option is caller/peer data (arrives on the wire like any other
+    // option) and, unescaped, a crafted value containing '/', '@', '#', '?',
+    // CR/LF or other controls could make a downstream URI parser resolve this
+    // string to a different host/path than intended (URI-parser confusion).
+    try std.Uri.Component.percentEncode(w, firstOption(options, number.uri_host) orelse fallback_host, isHostChar);
 
     if (firstOption(options, number.uri_port)) |port_bytes| {
         const port = decodeUint(port_bytes);
@@ -364,6 +369,15 @@ fn isUnreserved(c: u8) bool {
         '-', '.', '_', '~' => true,
         else => false,
     };
+}
+
+/// A char that may appear literally in the Uri-Host component. Deliberately
+/// narrower than a path segment (`pchar`) — no sub-delims, no `/ @ # ?` or
+/// control bytes, and no `:` (which would be ambiguous with a port separator)
+/// — so a hostile Uri-Host value is percent-encoded rather than able to smuggle
+/// URI-structural characters into the reconstructed string.
+fn isHostChar(c: u8) bool {
+    return isUnreserved(c);
 }
 
 /// A char that may appear literally in a URI path segment (RFC 3986 `pchar`).
@@ -601,6 +615,28 @@ test "uriFromOptions: segment needing encoding is re-encoded" {
     var out: [64]u8 = undefined;
     const len = try uriFromOptions(&opts, false, "", &out);
     try testing.expectEqualStrings("coap://h/a%20b%2Fc?k=a%26b", out[0..len]);
+}
+
+test "uriFromOptions: a hostile Uri-Host is percent-encoded, never emitted verbatim" {
+    // A crafted Uri-Host embedding '/' and '@' must not survive into the
+    // output string — otherwise a downstream URI parser could resolve this
+    // to a different host (userinfo@host confusion / extra path segments).
+    const opts = [_]Option{
+        .{ .number = number.uri_host, .value = "evil.com/@attacker.com" },
+    };
+    var out: [128]u8 = undefined;
+    const len = try uriFromOptions(&opts, false, "", &out);
+    const uri = out[0..len];
+    try testing.expect(std.mem.indexOfScalar(u8, uri, '@') == null);
+    try testing.expectEqualStrings("coap://evil.com%2F%40attacker.com/", uri);
+
+    // CR/LF and other controls are likewise escaped, not emitted raw.
+    const opts2 = [_]Option{
+        .{ .number = number.uri_host, .value = "host\r\nSet-Cookie: x" },
+    };
+    const len2 = try uriFromOptions(&opts2, false, "", &out);
+    try testing.expect(std.mem.indexOfScalar(u8, out[0..len2], '\r') == null);
+    try testing.expect(std.mem.indexOfScalar(u8, out[0..len2], '\n') == null);
 }
 
 test "uriFromOptions: BufferTooSmall" {

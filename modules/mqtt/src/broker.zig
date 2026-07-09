@@ -95,6 +95,8 @@ pub const Error = error{
     TransportFailed,
     /// SUBSCRIBE carried more filters than `max_filters_per_subscribe`.
     TooManySubscriptions,
+    /// `accept` refused a new connection: `Config.max_connections` reached.
+    ConnectionLimitReached,
     OutOfMemory,
 } || packet.DecodeError || packet.EncodeError;
 
@@ -233,6 +235,26 @@ pub const Config = struct {
     /// Per-connection receive and transmit buffer size; bounds the largest
     /// packet the broker will accept from or route to a client.
     max_packet_size: usize = 8 * 1024,
+    /// Hard cap on live connections; `accept` refuses (closes) past this
+    /// (resource-exhaustion guard — one thread/socket per connection).
+    max_connections: usize = 1024,
+    /// Hard cap on subscriptions across the whole broker; `registerSubscription`
+    /// refuses new filters past this rather than growing `subscriptions`
+    /// unboundedly.
+    max_subscriptions_total: usize = 65536,
+    /// Hard cap on subscriptions held by one connection (a single client
+    /// spamming SUBSCRIBE cannot alone exhaust the total budget).
+    max_subscriptions_per_conn: usize = 1024,
+    /// Hard cap on distinct retained topics; `storeRetained` refuses a new
+    /// topic past this (existing retained topics may still be updated in
+    /// place) rather than growing `retained` unboundedly.
+    max_retained: usize = 8192,
+    /// Bounded idle window (ms) a connection is given to send its CONNECT
+    /// before the accept-loop drops it (spec 3.1 requires CONNECT first, but
+    /// keep-alive is 0 — meaning "no timeout" — until CONNECT succeeds, so
+    /// without this a client that never sends CONNECT pins a slot forever).
+    /// Only consulted by `TcpServer`; the socket-free core has no clock.
+    connect_timeout_ms: u32 = 10_000,
 };
 
 /// The shared server-side state. Offline-testable: `accept` registers a
@@ -274,6 +296,8 @@ pub const Broker = struct {
     pub fn accept(b: *Broker, transport: Transport) Error!*Connection {
         b.mutex.lock();
         defer b.mutex.unlock();
+
+        if (b.connections.items.len >= b.config.max_connections) return error.ConnectionLimitReached;
 
         const conn = try b.allocator.create(Connection);
         errdefer b.allocator.destroy(conn);
@@ -427,6 +451,18 @@ pub const Broker = struct {
     }
 
     fn handleSubscribe(b: *Broker, conn: *Connection, s: packet.Subscribe) Error!void {
+        // Validate the filter count BEFORE registering anything. Counting
+        // first (a read-only pass over the iterator) means a >max_filters
+        // SUBSCRIBE is rejected as a whole — never partial-register-then-
+        // disconnect, which used to leave live subscriptions behind with no
+        // SUBACK ever sent.
+        var count: usize = 0;
+        var count_it = s.iterator();
+        while (count_it.next()) |_| {
+            count += 1;
+            if (count > max_filters_per_subscribe) return error.TooManySubscriptions;
+        }
+
         var codes: [max_filters_per_subscribe]u8 = undefined;
         var grants: [max_filters_per_subscribe]QoS = undefined;
         var filters: [max_filters_per_subscribe][]const u8 = undefined;
@@ -434,14 +470,21 @@ pub const Broker = struct {
 
         var it = s.iterator();
         while (it.next()) |req| {
-            if (n >= codes.len) return error.TooManySubscriptions;
             if (topic.validateFilter(req.filter)) |_| {
                 // We support up to QoS 1; grant min(requested, 1).
                 const granted = minQos(req.qos, .at_least_once);
-                try b.registerSubscription(conn, req.filter, granted);
-                codes[n] = @intFromEnum(granted);
-                grants[n] = granted;
-                filters[n] = req.filter;
+                if (try b.registerSubscription(conn, req.filter, granted)) {
+                    codes[n] = @intFromEnum(granted);
+                    grants[n] = granted;
+                    filters[n] = req.filter;
+                } else {
+                    // Over Config.max_subscriptions_total/_per_conn: refuse
+                    // this filter cleanly (0x80) rather than growing the
+                    // registry unboundedly.
+                    codes[n] = packet.suback_failure;
+                    grants[n] = .at_most_once;
+                    filters[n] = "";
+                }
             } else |_| {
                 codes[n] = packet.suback_failure;
                 grants[n] = .at_most_once;
@@ -464,16 +507,28 @@ pub const Broker = struct {
     }
 
     /// Add (or, for an exact re-subscribe, update the QoS of) a subscription.
-    fn registerSubscription(b: *Broker, conn: *Connection, filter: []const u8, qos: QoS) Error!void {
+    /// Returns `false` (no mutation) when `max_subscriptions_total` or
+    /// `max_subscriptions_per_conn` would be exceeded by a genuinely new
+    /// filter — the caller reports that as a per-filter SUBACK 0x80 rather
+    /// than growing the registry unboundedly.
+    fn registerSubscription(b: *Broker, conn: *Connection, filter: []const u8, qos: QoS) Error!bool {
         for (b.subscriptions.items) |*s| {
             if (s.conn == conn and std.mem.eql(u8, s.filter, filter)) {
                 s.qos = qos; // re-subscribe replaces the grant (spec 3.8.4-3)
-                return;
+                return true;
             }
         }
+        if (b.subscriptions.items.len >= b.config.max_subscriptions_total) return false;
+        var per_conn: usize = 0;
+        for (b.subscriptions.items) |s| {
+            if (s.conn == conn) per_conn += 1;
+        }
+        if (per_conn >= b.config.max_subscriptions_per_conn) return false;
+
         const owned = try b.allocator.dupe(u8, filter);
         errdefer b.allocator.free(owned);
         try b.subscriptions.append(b.allocator, .{ .conn = conn, .filter = owned, .qos = qos });
+        return true;
     }
 
     fn handleUnsubscribe(b: *Broker, conn: *Connection, u: packet.Unsubscribe) Error!void {
@@ -563,6 +618,11 @@ pub const Broker = struct {
         }
     }
 
+    /// Store (or update) one retained topic. Past `Config.max_retained`, a
+    /// genuinely new topic is refused (no-op — the live PUBLISH fan-out to
+    /// current subscribers still happens; only the retained copy is
+    /// dropped) rather than growing `retained` unboundedly. Updating an
+    /// already-retained topic is always allowed (no growth).
     fn storeRetained(b: *Broker, topic_name: []const u8, payload: []const u8, qos: QoS) Error!void {
         for (b.retained.items) |*r| {
             if (std.mem.eql(u8, r.topic, topic_name)) {
@@ -573,6 +633,7 @@ pub const Broker = struct {
                 return;
             }
         }
+        if (b.retained.items.len >= b.config.max_retained) return; // cap: refuse new retained topic
         const owned_topic = try b.allocator.dupe(u8, topic_name);
         errdefer b.allocator.free(owned_topic);
         const owned_payload = try b.allocator.dupe(u8, payload);
@@ -664,7 +725,14 @@ pub const TcpServer = struct {
                 else => continue,
             };
             s.group.concurrent(s.io, connMain, .{ s, stream }) catch {
-                connMain(s, stream); // no concurrency: serve inline
+                // A failed spawn must never run the handler inline on this
+                // accept thread — a client that never completes CONNECT
+                // (keep_alive_s == 0 ⇒ waitReadable blocks forever) would
+                // then wedge accept() permanently (total DoS). No logging
+                // seam exists in this module; reject the stream and keep
+                // accepting.
+                stream.close(s.io);
+                continue;
             };
         }
     }
@@ -677,8 +745,14 @@ pub const TcpServer = struct {
 
         var read_buf: [4096]u8 = undefined;
         while (true) {
-            if (!waitReadable(stream.socket.handle, conn.keep_alive_s)) {
-                // No data within the keep-alive window: check and drop.
+            if (!waitReadable(stream.socket.handle, connTimeoutMs(s.broker.config, conn))) {
+                // Pre-CONNECT: keep_alive_s is still 0 (unset), which would
+                // otherwise mean "wait forever" — bound it by
+                // connect_timeout_ms so a client that opens a socket and
+                // never sends CONNECT can't pin this slot/thread forever.
+                if (conn.state == .awaiting_connect) return;
+                // Post-CONNECT: no data within the keep-alive window; check
+                // and drop.
                 if (s.broker.keepAliveExpired(conn, milliTimestamp())) return;
                 continue;
             }
@@ -710,15 +784,24 @@ const SocketTransport = struct {
     }
 };
 
-/// Poll a socket for readability, bounded by the keep-alive window (1.5 ×
-/// keep-alive, or indefinitely when keep-alive is 0). Returns true if data is
-/// ready, false on timeout. A poll failure is reported as "ready" so the
-/// blocking read surfaces the real error.
-fn waitReadable(handle: std.Io.net.Socket.Handle, keep_alive_s: u16) bool {
+/// Poll a socket for readability, bounded by `timeout_ms` (-1 = indefinitely).
+/// Returns true if data is ready, false on timeout. A poll failure is
+/// reported as "ready" so the blocking read surfaces the real error.
+fn waitReadable(handle: std.Io.net.Socket.Handle, timeout_ms: i32) bool {
     var fds = [_]std.posix.pollfd{.{ .fd = handle, .events = std.posix.POLL.IN, .revents = 0 }};
-    const timeout: i32 = if (keep_alive_s == 0) -1 else @intCast(@as(u32, keep_alive_s) * 1500);
-    const ready = std.posix.poll(&fds, timeout) catch return true;
+    const ready = std.posix.poll(&fds, timeout_ms) catch return true;
     return ready != 0;
+}
+
+/// The poll timeout (ms) for one iteration of `connMain`'s read loop: bounded
+/// by `Config.connect_timeout_ms` before CONNECT succeeds (keep_alive_s is
+/// still 0 there, which would otherwise mean "wait forever"); after CONNECT,
+/// 1.5 × the client's keep-alive (spec 3.1.2.10), or indefinitely when the
+/// client asked for keep-alive 0.
+fn connTimeoutMs(config: Config, conn: *const Connection) i32 {
+    if (conn.state == .awaiting_connect) return @intCast(config.connect_timeout_ms);
+    if (conn.keep_alive_s == 0) return -1;
+    return @intCast(@as(u32, conn.keep_alive_s) * 1500);
 }
 
 /// Wall-clock milliseconds (std.time.milliTimestamp was removed in 0.16).

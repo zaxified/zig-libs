@@ -39,6 +39,45 @@ QoS 2 and DUP retransmit and Will/LWT are implemented, but the **broker's** firs
 omits QoS 2 (an inbound QoS 2 PUBLISH is a protocol violation that tears the connection down),
 persistent/offline sessions, DUP retransmit of an unacked outbound publish, and Will/LWT.
 
+## Broker: not production-ready — known limitations
+The broker is a functional first cut. It has been hardened against the trivial DoS/resource-
+exhaustion vectors an early adversarial pass turns up first: the accept loop never runs a
+connection handler inline on a failed task spawn (a stuck handler would otherwise wedge the whole
+server), `Config.max_connections` / `max_subscriptions_total` / `max_subscriptions_per_conn` /
+`max_retained` cap the shared connection set, subscription registry and retained store instead of
+growing them unboundedly, a `SUBSCRIBE` over `max_filters_per_subscribe` is rejected as a whole
+(never partial-registered then disconnected with no SUBACK), and a connection that opens a socket
+but never sends CONNECT is dropped after `Config.connect_timeout_ms` instead of pinning a
+slot/thread forever. It still requires the following work before it should face an untrusted
+network:
+
+- **PUBLISH fan-out is O(connections × subscriptions) under a single global spinlock** that
+  `accept()` also takes (`handle`/`process` hold `Broker.mutex` for the whole fan-out loop). A
+  large subscription set plus one PUBLISH can stall the entire broker — new connections, other
+  clients' PUBLISH/SUBSCRIBE, everything — for the duration. Needs a real subscription index (e.g.
+  a topic trie) and/or finer-grained locking before it can carry meaningful subscriber counts.
+- **A QoS 0→QoS 1 re-encode for one subscriber can overflow that subscriber's `tx_buf`** (its
+  own `max_packet_size`) — the packet id adds bytes the original QoS 0 publish didn't carry — and
+  today that failure (`EncodeError.BufferTooSmall`, or `TransportFailed` if the write itself fails)
+  is surfaced on the **publisher's** connection, because `deliver` runs inside the publisher's
+  `process`/`handlePublish` call and its error propagates there — i.e. one small-buffered
+  subscriber can get the *publisher* disconnected. Needs per-subscriber buffering/backpressure so
+  one subscriber's delivery failure cannot take down an unrelated connection.
+- **Session take-over does not close the superseded socket.** `takeover` drops the old
+  connection's routing state and flips it to `.disconnected`, but the actual `std.Io.net.Stream`
+  behind it is only closed when its own `TcpServer.connMain` notices (next read, next keep-alive
+  check, or — pre-CONNECT/keep-alive-0 — never on its own). A client that reconnects with the same
+  id while its old socket sits at `keep_alive_s == 0` leaks that thread/socket until the peer
+  closes it or the process exits.
+- **No authentication or ACL.** CONNECT `username`/`password` are decoded but never checked; any
+  client that completes a CONNECT can publish or subscribe to any topic, including `$SYS`. There is
+  no notion of per-client or per-topic authorization.
+
+None of the above are addressed by this pass — they are architectural and need real design work
+(subscription index, per-subscriber flow control, socket ownership on take-over, an auth/ACL
+layer) rather than a bounded cap. Treat the broker as a functional first cut for trusted-network
+use only until these are resolved.
+
 ## Verification
 Client + codec: 37 offline tests (folded into the module total below) — golden-byte KATs against
 the spec wire layout, every remaining-length varint boundary, a scripted fake broker driving full

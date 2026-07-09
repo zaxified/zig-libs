@@ -85,6 +85,11 @@ pub const csrf_token_hex_len = csrf.token_hex_len;
 /// cookie). 32 is the default; 64 is the ceiling.
 pub const max_id_bytes = 64;
 
+/// Hard floor on `Options.id_bytes` (128 bits of CSPRNG entropy).
+/// `Manager.init` rejects anything below this — a caller-configured
+/// `id_bytes` of, say, 1 (8 bits) would make the session id brute-forceable.
+pub const min_id_bytes = 16;
+
 /// Largest application payload one session may carry (kept inline in the
 /// `Session` so the request path never allocates). Larger blobs belong in a
 /// real datastore keyed by the session, not in the session itself.
@@ -257,6 +262,15 @@ pub const Session = struct {
     is_new: bool = true,
     /// Set by `revoke()` — the middleware destroys instead of saving.
     revoked: bool = false,
+    /// Set by `Manager.regenerate()` — the id in this `Session` has already
+    /// been rotated (the old id killed in the store) during this request.
+    /// The end-of-request save is still required (it persists the record
+    /// and issues the cookie for the *new* id — nothing has saved that yet),
+    /// but it can never resurrect the old id: `id()` already reflects the
+    /// new one. Tracked explicitly (rather than left implicit) so the
+    /// middleware's post-handler step is auditable and can't accidentally
+    /// regress into re-saving under a stale id if it's ever refactored.
+    regenerated: bool = false,
 
     /// The hex-encoded session id (borrows this session's buffer).
     pub fn id(s: *const Session) []const u8 {
@@ -301,7 +315,9 @@ pub const Options = struct {
     /// Injected clock for timeout accounting (a fake in tests).
     clock: Clock = .monotonic,
     /// Raw id length in bytes (hex-encoded to twice this in the cookie).
-    /// 1..=`max_id_bytes`; 32 (256 bits) is the OWASP-comfortable default.
+    /// `min_id_bytes`..=`max_id_bytes`; 32 (256 bits) is the OWASP-comfortable
+    /// default. Values below `min_id_bytes` (128 bits) are rejected outright
+    /// by `Manager.init` — anything smaller is brute-forceable.
     id_bytes: usize = 32,
     /// Reject a session unused for longer than this (rolling). 0 disables.
     idle_timeout_ns: i64 = default_idle_timeout_ns,
@@ -342,9 +358,10 @@ pub const Manager = struct {
 
     /// Build a manager. `gpa` is used only for the short-lived decode copies
     /// `Store.get` hands back (the store owns its own storage). Asserts
-    /// `1 <= id_bytes <= max_id_bytes`.
+    /// `min_id_bytes <= id_bytes <= max_id_bytes` — an `id_bytes` below the
+    /// floor would make session ids brute-forceable.
     pub fn init(gpa: Allocator, store: Store, options: Options) Manager {
-        std.debug.assert(options.id_bytes >= 1 and options.id_bytes <= max_id_bytes);
+        std.debug.assert(options.id_bytes >= min_id_bytes and options.id_bytes <= max_id_bytes);
         std.debug.assert(options.cookie_name.len != 0);
         return .{
             .store = store,
@@ -442,6 +459,17 @@ pub const Manager = struct {
 
     /// Evict the session from the store and overwrite the cookie with
     /// `Max-Age=-1` (logout). Best-effort on the cookie (see `save`).
+    ///
+    /// **Called by the middleware itself** when the handler set
+    /// `Session.revoke()` on the request's own session — that is the
+    /// supported way for a handler to log the current request out. Calling
+    /// `destroy` directly from a handler on the *current request's own*
+    /// session id is a footgun: the middleware doesn't know about it (only
+    /// `s.revoked` is consulted post-handler) and would still run `save`
+    /// at request end, re-`put`ting the just-destroyed record right back and
+    /// overwriting this `Max-Age=-1` cookie with a fresh, valid one. Use
+    /// this directly only to destroy a *different* session's id (e.g. an
+    /// admin ending someone else's session, or "log out my other devices").
     pub fn destroy(m: *const Manager, res: *http.Server.ResponseWriter, sid: []const u8) void {
         m.store.delete(sid);
         m.writeCookie(res, "", -1);
@@ -450,10 +478,16 @@ pub const Manager = struct {
     /// Rotate the session id, carrying the data over and killing the old id in
     /// the store — the session-fixation defense (call it right after a
     /// privilege change, e.g. login). The new id is persisted on the next
-    /// `save` (the middleware's post-handler save covers it).
+    /// `save` (the middleware's post-handler save covers it) — that save is
+    /// safe even though it's unconditional, because `s.id()` already reflects
+    /// the *new* id by the time it runs: it can only (re-)persist the new
+    /// record, never resurrect the old, just-deleted one. `s.regenerated` is
+    /// set so that invariant is explicit rather than implicit in `id()`'s
+    /// side effect.
     pub fn regenerate(m: *const Manager, s: *Session) void {
         m.store.delete(s.id()); // old id dead in the store
         m.newId(s); // overwrite id; created + data preserved
+        s.regenerated = true;
     }
 
     /// A `router.Middleware` that loads-or-creates the session, attaches it to
@@ -521,7 +555,23 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
 
     try next.run(ctx); // handler error → propagate, no save (nothing persisted)
 
-    if (s.revoked) m.destroy(ctx.res, s.id()) else m.save(ctx.res, &s);
+    // `s.revoked` (set by `Session.revoke()`) means the handler asked to log
+    // this session out: destroy it, and — critically — do NOT also save,
+    // which would immediately re-`put` the record right back and overwrite
+    // the `Max-Age=-1` cookie with a fresh valid one, undoing the logout.
+    //
+    // Otherwise, `save` runs unconditionally, including when
+    // `s.regenerated` (set by `Manager.regenerate()`) is true: that's safe,
+    // not a resurrection, because `s.id()` already reflects the *new* id at
+    // this point (`regenerate` overwrote it) and the *old* id was already
+    // deleted from the store — this save can only persist the new record
+    // and issue the cookie for the new id, which is required (nothing else
+    // does it) and never touches the old, dead id.
+    if (s.revoked) {
+        m.destroy(ctx.res, s.id());
+    } else {
+        m.save(ctx.res, &s);
+    }
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────
@@ -682,6 +732,18 @@ test "regenerate: new id, data carried, old id dead (fixation defense)" {
     try testing.expectEqual(Manager.LoadResult.absent, m.lookup(old_id, &lo));
 }
 
+test "min_id_bytes floor: default and at-floor id_bytes are accepted" {
+    var env = Env.init();
+    env.wire();
+    defer env.deinit();
+    // Default (32 bytes) — fine.
+    _ = Manager.init(testing.allocator, env.store.store(), .{ .io = testing.io });
+    // Exactly at the floor — fine.
+    _ = Manager.init(testing.allocator, env.store.store(), .{ .io = testing.io, .id_bytes = min_id_bytes });
+    // Exactly at the ceiling — fine.
+    _ = Manager.init(testing.allocator, env.store.store(), .{ .io = testing.io, .id_bytes = max_id_bytes });
+}
+
 test "insecure escape hatch drops Secure; default keeps it" {
     var env = Env.init();
     env.wire();
@@ -696,7 +758,7 @@ test "insecure escape hatch drops Secure; default keeps it" {
 
 const App = struct {
     manager: *Manager,
-    action: enum { touch, write_big, revoke } = .touch,
+    action: enum { touch, write_big, revoke, regenerate } = .touch,
 };
 
 fn hSession(ctx: *router.Ctx) anyerror!void {
@@ -716,6 +778,11 @@ fn hSession(ctx: *router.Ctx) anyerror!void {
         .revoke => {
             s.revoke();
             try ctx.res.writeAll("bye");
+        },
+        .regenerate => {
+            app.manager.regenerate(s);
+            try s.setData("uid=42"); // data set AFTER rotation must survive the final save
+            try ctx.res.writeAll(s.id()); // echo the NEW id
         },
     }
 }
@@ -828,6 +895,94 @@ test "middleware: revoke expires the cookie and evicts the session" {
     // And the session is gone from the store.
     var l: Session = .{};
     try testing.expectEqual(Manager.LoadResult.absent, m.lookup(id, &l));
+}
+
+test "middleware: the trailing end-of-request save does not resurrect a session revoke()'d mid-request" {
+    // Regression guard for the same-request part of the "end-of-request save
+    // resurrects a destroyed/regenerated session" finding: `middlewareRun`
+    // must not fall through to `m.save` after a handler called
+    // `Session.revoke()`, even though the request otherwise completes
+    // normally (handler returns no error, response is fully written).
+    var env = Env.init();
+    env.wire();
+    defer env.deinit();
+    var m = env.manager(.{ .idle = 10 * std.time.ns_per_s, .absolute = 100 * std.time.ns_per_s });
+    var app = App{ .manager = &m };
+
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &app;
+    try r.use(m.middleware());
+    try r.post("/", hSession);
+    try r.post("/logout", hSession);
+
+    app.action = .touch;
+    var out0: [4096]u8 = undefined;
+    var rb0: [1024]u8 = undefined;
+    const first = runWire(&r, "POST / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out0, &rb0);
+    const id = try testing.allocator.dupe(u8, cookieId(headerValue(first, "Set-Cookie").?));
+    defer testing.allocator.free(id);
+
+    app.action = .revoke;
+    const reqline = std.fmt.allocPrint(testing.allocator, "POST /logout HTTP/1.1\r\nHost: t\r\nCookie: session={s}\r\nConnection: close\r\n\r\n", .{id}) catch unreachable;
+    defer testing.allocator.free(reqline);
+    var out: [4096]u8 = undefined;
+    var rbody: [1024]u8 = undefined;
+    _ = runWire(&r, reqline, &out, &rbody);
+
+    // The old id must not resolve — a follow-up lookup (as a later,
+    // completely separate request would perform) proves the end-of-request
+    // path did not re-`put` it back after `destroy` ran.
+    var l: Session = .{};
+    try testing.expectEqual(Manager.LoadResult.absent, m.lookup(id, &l));
+}
+
+test "middleware: regenerate mid-request — old id dead, only the new id resolves, post-rotation data survives" {
+    // Regression guard for the "regenerate" half of the same finding: after
+    // `Manager.regenerate` mints a new id mid-handler, the trailing
+    // `m.save` must persist under the NEW id only — the old id must stay
+    // dead, and data set *after* regenerate() must still make it into the
+    // store (proving the final save is required, not merely harmless).
+    var env = Env.init();
+    env.wire();
+    defer env.deinit();
+    var m = env.manager(.{ .idle = 10 * std.time.ns_per_s, .absolute = 100 * std.time.ns_per_s });
+    var app = App{ .manager = &m };
+
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &app;
+    try r.use(m.middleware());
+    try r.post("/", hSession);
+    try r.post("/login", hSession);
+
+    app.action = .touch;
+    var out0: [4096]u8 = undefined;
+    var rb0: [1024]u8 = undefined;
+    const first = runWire(&r, "POST / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out0, &rb0);
+    const old_id = try testing.allocator.dupe(u8, cookieId(headerValue(first, "Set-Cookie").?));
+    defer testing.allocator.free(old_id);
+
+    app.action = .regenerate;
+    const reqline = std.fmt.allocPrint(testing.allocator, "POST /login HTTP/1.1\r\nHost: t\r\nCookie: session={s}\r\nConnection: close\r\n\r\n", .{old_id}) catch unreachable;
+    defer testing.allocator.free(reqline);
+    var out: [4096]u8 = undefined;
+    var rbody: [1024]u8 = undefined;
+    const got = runWire(&r, reqline, &out, &rbody);
+    const new_id = try testing.allocator.dupe(u8, cookieId(headerValue(got, "Set-Cookie").?));
+    defer testing.allocator.free(new_id);
+
+    try testing.expect(!std.mem.eql(u8, old_id, new_id)); // actually rotated
+    try testing.expectEqualStrings(new_id, bodyOf(got)); // handler echoed the new id
+
+    // Old id is dead — the trailing save did not resurrect it.
+    var lo: Session = .{};
+    try testing.expectEqual(Manager.LoadResult.absent, m.lookup(old_id, &lo));
+
+    // Only the new id resolves, and it carries the data set after rotation.
+    var ln: Session = .{};
+    try testing.expectEqual(Manager.LoadResult.loaded, m.lookup(new_id, &ln));
+    try testing.expectEqualStrings("uid=42", ln.data());
 }
 
 test "middleware: small response buffer forces an early flush — no cookie-buffer corruption" {
