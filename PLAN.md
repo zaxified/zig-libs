@@ -20,8 +20,11 @@ touch build.zig · README · PLAN · NOTICE — they report back; the owner veri
 
 ## Status (2026-07-09)
 
-**77 modules · 1763 tests** (1754 pass + 9 skips: live/netns-gated checks) ·
-Debug + ReleaseFast green · `zig fmt` clean · MIT. Latest commit `a91b0c9`.
+**77 modules · 1809 tests** (1799 pass + 10 skips: live/netns-gated checks) ·
+Debug + ReleaseFast green · `zig fmt` clean · MIT. Latest commit `2260b7c`.
+**Ex-"Fable" queue DONE 2026-07-09 (all Opus, no wait for Fable):** coap C6/C7 (block-wise + observe) ·
+SNMP T-G/T-H (v3 privacy DES/AES-CFB + time-window — SNMPv3 complete) · MQTT 3.1.1 broker first-cut. Only
+`grpc` stays consumer-side (external protobuf). **Remaining pure-Opus work = the pre-public security gate.**
 **+ `encoding`, `syslog`, `sntp`, `stun` landed 2026-07-09** (the RFC codecs, Opus — ecosystem-scanned, no
 adoptable Zig lib, built clean-room from RFCs + reference designs + official test vectors).
 **Pure-Opus BUILD phase landed 2026-07-09:** `argsafe` · `sessions`+CSRF · `jobqueue` · `llmclient` ·
