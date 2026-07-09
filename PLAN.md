@@ -20,8 +20,10 @@ touch build.zig · README · PLAN · NOTICE — they report back; the owner veri
 
 ## Status (2026-07-09)
 
-**73 modules · 1706 tests** (1700 pass + 6 skips: ubus/wireguard/blobmsg + llmclient live + rawsock 2 netns) ·
-Debug + ReleaseFast green · `zig fmt` clean · MIT. Latest commit `13149e3`.
+**77 modules · 1763 tests** (1754 pass + 9 skips: live/netns-gated checks) ·
+Debug + ReleaseFast green · `zig fmt` clean · MIT. Latest commit `a91b0c9`.
+**+ `encoding`, `syslog`, `sntp`, `stun` landed 2026-07-09** (the RFC codecs, Opus — ecosystem-scanned, no
+adoptable Zig lib, built clean-room from RFCs + reference designs + official test vectors).
 **Pure-Opus BUILD phase landed 2026-07-09:** `argsafe` · `sessions`+CSRF · `jobqueue` · `llmclient` ·
 `rawsock` (full AF_PACKET; verified 9/9 under `unshare -rn`). **Build phase essentially COMPLETE** — only
 `testkit` remains and its scope came back mostly-stale (see below): recommend deferring it.
@@ -132,13 +134,13 @@ RFC codecs). Archetypes: ① HTTP/SaaS backend · ② netops · ③ IoT · ④ A
 | `grpc` (framing/streaming/status over our h2 + adopted protobuf) | microservices | no trustworthy pure-Zig; contained since we own h2 |
 | **MQTT broker** | ③ IoT hub | server side of `mqtt`; large protocol value-add. **Ecosystem scan 2026-07-09: BUILD (no adoptable Zig broker — all fail license/0.16/completeness; max 5★).** Reference (don't copy): `vibesrc/rawmq` architecture. **Reuses the existing `mqtt` client's packet codec + topic wildcard matcher** → broker net-new = TCP accept loop + session table + subscription registry + PUBLISH routing/QoS + retained store + keep-alive. Minimal first cut: 3.1.1, QoS 0/1, clean-session, BYO-TLS, single-thread |
 
-### BUILD → Opus (RFC codecs — ecosystem-scanned 2026-07-09, small enough for Opus, no Fable)
-Research verdict: no adoptable Zig lib for any (all fail 0.16-verified + mature + standalone + permissive), so BUILD as pure-Zig zig-libs modules — but each is <500 LOC with a solid reference to steal patterns from.
-| Candidate | Reference to steal-patterns from | Notes |
+### BUILD → Opus (RFC codecs — ecosystem-scanned 2026-07-09) — ✅ ALL DONE
+Research verdict: no adoptable Zig lib for any, so built clean-room from RFCs + reference designs + official test vectors.
+| Candidate | Status | Notes |
 |---|---|---|
-| `syslog` (RFC 5424) | `joelreymont/pz` `src/core/syslog.zig` (spec-correct, pre-0.16 → port to `std.Io.net`) | formatter (`Facility`/`Severity`/`Priority` + RFC3339-ms timestamp + structured-data escaping + field-length validation) ~150-250 LOC + emitter UDP/TCP+RFC6587-octet-framing ~150-250 LOC |
-| `sntp` (RFC 4330/5905) | `FObersteiner/ntp_client` (Codeberg, **targets 0.16**, MIT, 435 LOC) | tiny: 48-byte packet codec + UDP round-trip + T1–T4 offset/delay math; composes netaddr/UDP |
-| `stun` client (RFC 8489) | `Corendos/ztun` (RFC-complete, MIT, 0.15.2) + **official RFC 5769 test vectors** | client Binding usage: header + XOR-MAPPED-ADDRESS + FINGERPRINT + MESSAGE-INTEGRITY (HMAC-SHA1) ~300-500 LOC; transport-agnostic core (encode/decode/verify, no I/O). Full client+server+long-term-auth ~1.5-2.5k = a later Fable pass if ever needed |
+| ✅ `syslog` (RFC 5424) DONE `a91b0c9` | done | formatter (Facility/Severity + RFC3339-ms timestamp + SD escaping + field limits) + UDP/TCP emitter (RFC 6587 octet framing) + RFC 3164 BSD; design ref joelreymont/pz. 20 tests |
+| ✅ `sntp` (RFC 4330) DONE `a91b0c9` | done | 48-byte packet codec + NTP↔Unix epoch + T1–T4 offset/delay + std.Io.net query; design ref FObersteiner/ntp_client. 13 tests |
+| ✅ `stun` client (RFC 8489) DONE `a91b0c9` | done | transport-agnostic core: XOR-MAPPED-ADDRESS + FINGERPRINT + MESSAGE-INTEGRITY (HMAC-SHA1, const-time); verified against RFC 5769 vectors; design ref Corendos/ztun. 12 tests. Full server+long-term-auth = a later Fable pass if ever needed |
 
 ### Extraction wave-1 findings (2026-07-09) — deferred gaps, now backlog
 Each landed module shipped a spec-complete v1; these are the follow-ups the extraction surfaced
@@ -214,8 +216,8 @@ Six faithful spec-complete lifts landed. Deferred per-module:
    `testkit` DEFERRED — its scope came back mostly stale (netns/VOPR don't exist to consolidate); the honest
    remainder (runWire+FakeClock dedup) needs a build.zig test-only-dep mechanism + a 19-module refactor to
    pay off. With adopted pg/smtp/ws/log/toml, ① is a deployable backend stack.
-3. **Opus RFC codecs now (ecosystem-scanned — not Fable):** `syslog` · `sntp` · `stun` (client) — each <500 LOC
-   with a reference impl to steal patterns from (see the BUILD→Opus table). No adoptable Zig lib exists.
+3. ✅ **Opus RFC codecs DONE 2026-07-09:** `syslog` · `sntp` · `stun` (client) — ecosystem-scanned (no
+   adoptable Zig lib), built clean-room from RFCs + reference designs + official test vectors.
 4. **When Fable resets:** finish SNMP T-G/T-H, coap C6/C7, MQTT broker (large; reuses our `mqtt` client).
 5. **Pre-public security/similarity review gate** (Opus, highest-value before any release) — see checklist below.
 6. **Then decide per product:** `Reconcilable(T)`, `kv` on-disk, and any external-coupled capability

@@ -330,4 +330,18 @@ audit is pending before any public release.
                the Cookie request-header grammar (sec 5.4). No third-party
                source consulted or copied.
 
+  sessions   — clean-room from the OWASP Session Management + CSRF Prevention
+               Cheat Sheets. No third-party source copied.
+
+  syslog     — clean-room from RFC 5424 (syslog protocol) + RFC 6587 (TCP
+               octet framing) + RFC 3164 (BSD legacy). DESIGN modeled after
+               joelreymont/pz src/core/syslog.zig (MIT); no source copied.
+
+  sntp       — clean-room from RFC 4330 (SNTPv4). DESIGN modeled after
+               FObersteiner/ntp_client (MIT, Codeberg); no source copied.
+
+  stun       — clean-room from RFC 8489 (STUN), verified against the RFC 5769
+               test vectors. Attribute-TLV DESIGN modeled after Corendos/ztun
+               (MIT); no source copied.
+
 See each module's README "Provenance" note for its specific seed and reference.
