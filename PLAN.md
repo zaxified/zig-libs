@@ -112,7 +112,7 @@ RFC codecs). Archetypes: ① HTTP/SaaS backend · ② netops · ③ IoT · ④ A
 | 🔀 `taskqueue` → **FOLD into `jobqueue`** | ③ fleet C2 | scope 2026-07-09: storage adds nothing over `filestore`; the value (lease/retry/DLQ) is jobqueue's job; only per-partition FIFO is worth keeping → build it as a `jobqueue` partition-key feature (`nextFor(partition)` + a real `priority` field), not a standalone module. Seed's id-arithmetic priority hack silently clobbers records |
 | ✅ `rawsock` → **BUILD DONE** `13149e3` | ② capture/inject | full AF_PACKET: capture/inject/BPF/promisc/iface-enum + typed frame decode; pure helpers root-free-testable, socket tests netns-gated (verified 9/9 under `unshare -rn`). Linux-only |
 | ✅ `argsafe` → **BUILD DONE** `a28d779` | hardening | consolidated axp's 14 ad-hoc validators into one composable `CharClass` + convenience predicates + a poison-on-reject `Argv` builder; flag-injection/NUL/`..` fixed as default |
-| bxp text libs (scoped 2026-07-09): ✅ `datefmt` `5d2956d` · ✅ `diagnostics` `5d2956d` · ✅ `json5` `5d2956d` · ✅ `zipstream` `5d2956d` | ⑤ + i18n | DONE (Wave 3). ✅ **`tz`** DONE (Wave 4). ✅ **`csvstream`** · ✅ **`csvsafe`** · ✅ **`numparse`** DONE (Wave 5). **All bxp-text-lib EXTRACTs done.** `encoding` (5 code pages, std-only) **extracting now (Opus)** — full WHATWG coverage is a deferred Fable enhancement. ❌ `unaccent` **DROPPED** (reuse-filter: seed is fully dependent on external `uucode`; not worth clean-rooming UCD tables for a marginal cross-project pull — stays in bxp) |
+| bxp text libs (scoped 2026-07-09): ✅ `datefmt` `5d2956d` · ✅ `diagnostics` `5d2956d` · ✅ `json5` `5d2956d` · ✅ `zipstream` `5d2956d` | ⑤ + i18n | DONE (Wave 3). ✅ **`tz`** DONE (Wave 4). ✅ **`csvstream`** · ✅ **`csvsafe`** · ✅ **`numparse`** DONE (Wave 5). **All bxp-text-lib EXTRACTs done.** ✅ `encoding` DONE (5 European code pages, std-only) — broader WHATWG/CJK coverage is **out of scope, not planned** (no in-house need). ❌ `unaccent` **DROPPED** (reuse-filter: seed is fully dependent on external `uucode`; not worth clean-rooming UCD tables for a marginal cross-project pull — stays in bxp) |
 | IPC glue (scoped 2026-07-09): ✅ `framing` = `lenframe`+`jsonwire` FOLDED `5d2956d` | same-host IPC | DONE (Wave 3). ✅ **`pollworker`** + **`ipcbus`** DONE (Wave 4). **`chunkframe` → SKIP** (~20 LOC base64+JSON-envelope glue with a narrow one-bridge `why`; documented pattern, not a module) |
 
 ### BUILD → Opus (greenfield, standard pattern / integration)
@@ -199,7 +199,7 @@ Six faithful spec-complete lifts landed. Deferred per-module:
    `json5`+`zipstream` (+`blobstore.putNamed` atomicity fix). `roquery` dropped (C-level), `taskqueue`
    folded into jobqueue, `chunkframe` skipped.
 1. ✅ **Extraction COMPLETE (Opus, 2026-07-09):** Waves 4+5 done (`tz`/`pollworker`/`ipcbus`, then
-   `csvstream`/`csvsafe`/`numparse`). `encoding` extracting now (Opus lift; full WHATWG deferred). Reuse-
+   `csvstream`/`csvsafe`/`numparse`). ✅ `encoding` DONE (5 European code pages; broader/CJK out of scope). Reuse-
    filter DROPPED: `exprcalc` (app rules engine + external regex) and `unaccent` (fully external `uucode`).
 2. **Pure-Opus BUILD phase — wave 1 DONE 2026-07-09:** ✅ `argsafe` · ✅ `sessions`+CSRF · ✅ `jobqueue`
    (over `kv`, taskqueue partition-FIFO folded) · ✅ `llmclient` (Anthropic + new client-side SSE parser).
@@ -207,8 +207,7 @@ Six faithful spec-complete lifts landed. Deferred per-module:
    `testkit` DEFERRED — its scope came back mostly stale (netns/VOPR don't exist to consolidate); the honest
    remainder (runWire+FakeClock dedup) needs a build.zig test-only-dep mechanism + a 19-module refactor to
    pay off. With adopted pg/smtp/ws/log/toml, ① is a deployable backend stack.
-3. **When Fable resets:** finish SNMP T-G/T-H, then `stun`/`sntp`/`syslog`, MQTT broker,
-   coap C6/C7. (`encoding` full-WHATWG coverage is an optional Fable enhancement on top of the Opus lift.)
+3. **When Fable resets:** finish SNMP T-G/T-H, then `stun`/`sntp`/`syslog`, MQTT broker, coap C6/C7.
 4. **Pre-public security/similarity review gate** (Opus, highest-value before any release) — see checklist below.
 5. **Then decide per product:** `Reconcilable(T)`, `kv` on-disk, and any external-coupled capability
    (`ssh`/`grpc`/`kafka`/`OPC-UA`) as a consumer-side ADOPT, not a zig-libs module.

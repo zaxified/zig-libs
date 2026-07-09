@@ -11,8 +11,10 @@ the read edge (decode → UTF-8) and the write edge (encode ← UTF-8).
   **Concurrency:** reentrant (no shared state — the tables are `const`).
 
 Provenance: extracted from bxp `bxp-core/src/encoding.zig` (same author, MIT).
-This is the WHATWG **single-byte European subset**; full WHATWG coverage
-(the other single-byte pages + all multi-byte/CJK) is deferred (see below). No
+This is the WHATWG **single-byte European subset** — the deliberate, complete
+scope of this module (the legacy code pages a European broker / Excel export is
+realistically saved in). Broader coverage (other single-byte pages, multi-byte/
+CJK, UTF-16) is intentionally **out of scope**, not planned — see below. No
 third-party code.
 
 ## Supported encodings
@@ -50,16 +52,14 @@ the target page becomes `'?'`, and invalid/truncated UTF-8 passes through
 verbatim byte-for-byte. Neither direction ever errors on content (only on
 allocation failure).
 
-## Deferred (future Fable pass)
+## Out of scope (not planned)
 
-Full WHATWG Encoding Standard coverage. The `build(&overrides)` table pattern
-generalizes trivially — the remaining work is *sourcing the correct per-encoding
-mapping tables* from the spec, not new logic:
-
-- **Other single-byte pages:** windows-1251/1253–1258, KOI8-R/U,
-  ISO-8859-3..14/16.
-- **Multi-byte / CJK:** Shift-JIS, EUC-JP, GBK/GB18030, Big5.
-- **UTF-16:** UTF-16LE / UTF-16BE (with BOM sniffing).
+Broader WHATWG Encoding Standard coverage — other single-byte pages
+(windows-1251/1253–1258, KOI8, ISO-8859-3..16), multi-byte/CJK (Shift-JIS,
+EUC-JP, GBK/GB18030, Big5), and UTF-16 — is **intentionally not built**. The
+`build(&overrides)` table pattern would generalize, but there is no in-house
+need beyond the European subset; a project that must ingest CJK/Cyrillic legacy
+text should handle that at its own edge. Reopen only on a concrete requirement.
 
 ## Verify
 
