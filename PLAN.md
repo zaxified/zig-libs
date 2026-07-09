@@ -212,7 +212,20 @@ Six faithful spec-complete lifts landed. Deferred per-module:
 - **External-coupled → stay ADOPT/consumer-side, NOT zig-libs** (per the pure-Zig/reuse filter): `kafka`
   (librdkafka bind), pure-Zig `ssh` (libssh2 bind), `OPC-UA` (huge), `grpc` (needs protobuf), `regex`
   (deliberately external — two mature Zig regex projects already exist: `mnemnion/mvzr`, `zig-utils/zig-regex`).
-- **DROPPED — won't need (2026-07-09):** ~~full YAML 1.2~~ · ~~Jinja~~ · ~~imap~~ · ~~HTTP/3 (QUIC)~~.
+- **DROPPED — won't need (2026-07-09), ecosystem-scanned → all confirm DROP (never zig-libs modules; if a
+  consumer ever needs one, here's the pointer):**
+  - ~~full YAML 1.2~~ → consumer-side **ADOPT `kubkon/zig-yaml`** (295★, Zig core-team, targets 0.16, parse+
+    emit+struct-deserialize) — BUT ~20% of the YAML test suite, no anchors/aliases/tags; fine for flat/nested
+    config, not 1.2-complete. `pwbh/ymlz` = reflection-ergonomics fallback (0.15.1).
+  - ~~Jinja~~ → Zig's **comptime** makes a runtime engine mostly unnecessary: use `zmpl` (compiles to typed
+    Zig, active, powers Jetzig) or plain comptime/`std.fmt` for dev-authored templates. Only for runtime-
+    loaded `.jinja` corpora (LLM chat templates): `gremlin-labs/vibe-jinja` (pure-Zig zero-dep Jinja2 clone,
+    feature-complete on paper but young/unverified-on-0.16 — pilot only). `batiati/mustache-zig` stays the
+    logic-less baseline.
+  - ~~imap~~ → nothing mature; `meszmate/imap.zig` (2★, comprehensive but single 10-day burst, untested 0.16)
+    is the on-radar candidate if a mail-ingesting product ever appears; a minimal read-client is ~few-hundred–
+    1000 LOC over the existing `http` TLS template.
+  - ~~HTTP/3 (QUIC)~~ → not researched; stays dropped.
 
 ### Recommended sequence
 0. ✅ **Extraction waves 1–3 DONE (Opus, 2026-07-09):** W1 `procrun`+`procnet`+`blobstore`; W2 wgs data

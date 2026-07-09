@@ -77,12 +77,12 @@ Two research sweeps (sibling-repo seeds + Zig-ecosystem adopt-vs-build) against 
 | WebSocket | `karlseguin/websocket.zig` (MIT) | both roles; upgrades from our http |
 | protobuf | `Arwalk/zig-protobuf` (MIT, ~420★) | de-facto; enables a gRPC build over our h2 |
 | TOML | `mattyhall/tomlz` (MIT) | config |
-| Template (mustache) | `batiati/mustache-zig` (MIT) | Jinja-style logic engine still absent (BUILD if needed) |
+| Template | `batiati/mustache-zig` (MIT, logic-less) · `jetzig/zmpl` (logic = real Zig, active) · `gremlin-labs/vibe-jinja` (Jinja2 clone, young/pilot) | scanned 2026-07-09: comptime/`zmpl` for dev templates; `vibe-jinja` only for runtime `.jinja` corpora (LLM chat templates) |
 | Regex | `mnemnion/mvzr` (no captures) / `zig-utils/zig-regex` (captures) | (was already ADOPT) |
 | Structured logging | `karlseguin/log.zig` (MIT) | logfmt/JSON; cleanest "just use it" |
 | S3 | `lobo/aws-sdk-for-zig` (MIT, →0.16) | SigV4 built in; awkward packaging |
 | Redis/Valkey | `kristoff-it/zig-okredis` — **PARTIAL (alpha)** | best design, API churn |
-| YAML | `pwbh/ymlz` — **PARTIAL** (no full 1.2) | fine for tame config |
+| YAML | `kubkon/zig-yaml` (295★, Zig core-team, 0.16) · `pwbh/ymlz` (0.15.1) — both **PARTIAL** (no full 1.2, no anchors/tags) | scanned 2026-07-09: ~20% of the YAML test suite; fine for flat/nested config, not 1.2-complete |
 
 ### BUILD — genuine gaps worth zig-libs owning (new candidates from the audit)
 - **`procrun`** ⭐ (extract, ~900 L, `bxp/bxp-gui-bridge/src/main.zig`) — hardened subprocess runner:
