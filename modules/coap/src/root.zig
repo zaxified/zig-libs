@@ -60,6 +60,22 @@ pub const client = @import("client.zig");
 /// (`piggyback` / `ackOnly` / `Server.separate`).
 pub const server = @import("server.zig");
 
+/// The block-wise transfer extension (C6, RFC 7959): the Block1/Block2 option
+/// value codec (`Block`), the payload `split` helper, and the caller-storage
+/// `Assembler` that reassembles arriving blocks.
+pub const block = @import("block.zig");
+
+/// The Observe extension (C7, RFC 7641): the subscription `Registry` over caller
+/// storage, the monotonic 24-bit `Sequence` generator, and the RFC 1982
+/// "lollipop" freshness test (`isNewer`).
+pub const observe = @import("observe.zig");
+
+// Flat convenience re-exports of the extensions' primary types.
+pub const Block = block.Block;
+pub const BlockAssembler = block.Assembler;
+pub const ObserveRegistry = observe.Registry;
+pub const ObserveSequence = observe.Sequence;
+
 // Pull the submodules' tests into this module's test binary. A `pub const
 // @import(...)` re-export does NOT drag in the imported file's `test` blocks —
 // they run only when referenced from a `test` here (or via refAllDecls).
@@ -68,6 +84,8 @@ test {
     _ = reliability;
     _ = client;
     _ = server;
+    _ = block;
+    _ = observe;
 }
 
 /// CoAP version in the 2-bit Ver field (always 1 for RFC 7252).
@@ -107,6 +125,9 @@ pub const Code = enum(u8) {
     valid = (2 << 5) | 3,
     changed = (2 << 5) | 4,
     content = (2 << 5) | 5,
+    /// 2.31 Continue — a block of a Block1 request body was accepted; send the
+    /// next block (RFC 7959 §2.9.1).
+    @"continue" = (2 << 5) | 31,
 
     // 4.xx — client error.
     bad_request = (4 << 5) | 0,
@@ -116,6 +137,9 @@ pub const Code = enum(u8) {
     not_found = (4 << 5) | 4,
     method_not_allowed = (4 << 5) | 5,
     not_acceptable = (4 << 5) | 6,
+    /// 4.08 Request Entity Incomplete — the block-wise request body arrived out
+    /// of order or a block was missing (RFC 7959 §2.9.2).
+    request_entity_incomplete = (4 << 5) | 8,
     request_entity_too_large = (4 << 5) | 13,
     unsupported_content_format = (4 << 5) | 15,
 

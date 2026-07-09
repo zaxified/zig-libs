@@ -22,6 +22,8 @@ pub const number = struct {
     pub const uri_host: u16 = 3;
     pub const etag: u16 = 4;
     pub const if_none_match: u16 = 5;
+    /// Observe (RFC 7641 §2).
+    pub const observe: u16 = 6;
     pub const uri_port: u16 = 7;
     pub const location_path: u16 = 8;
     pub const uri_path: u16 = 11;
@@ -30,6 +32,12 @@ pub const number = struct {
     pub const uri_query: u16 = 15;
     pub const accept: u16 = 17;
     pub const location_query: u16 = 20;
+    /// Block2 — block-wise transfer of a response body (RFC 7959 §2.1).
+    pub const block2: u16 = 23;
+    /// Block1 — block-wise transfer of a request body (RFC 7959 §2.1).
+    pub const block1: u16 = 27;
+    /// Size2 — the size of the Block2 body, when known (RFC 7959 §4).
+    pub const size2: u16 = 28;
     pub const proxy_uri: u16 = 35;
     pub const proxy_scheme: u16 = 39;
     pub const size1: u16 = 60;

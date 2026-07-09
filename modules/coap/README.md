@@ -78,15 +78,62 @@ socket and drives a `reliability.Retransmit`):
   `Server.separate(...)` a fresh-id CON/NON response (§5.2). Route with
   `options.uriPath`, dedup with `reliability.Dedup`.
 
+## Block-wise transfer (`coap.block`)
+
+RFC 7959 — moving a payload larger than one datagram in numbered blocks (C6),
+same caller-driven, borrow-the-buffer style:
+
+- **`Block`** — the Block1 (option 27) / Block2 (option 23) value codec: the
+  packed `NUM : M : SZX` field, `encode`/`decode` (minimal 0..3-byte value, no
+  leading zero bytes), `size()` = `2^(SZX+4)` (16 … 1024).
+- **`split(payload, szx, num)`** — carve block `num` out of a full payload, with
+  the `more` flag set at the boundary.
+- **`Assembler`** — reassemble arriving blocks into a caller buffer (written at
+  `num * blockSize`), `isComplete()` once the final (`M==0`) block lands — the
+  `Dedup`-style caller-storage pattern.
+- Also: response codes `2.31 Continue` / `4.08 Request Entity Incomplete` and the
+  `block1` / `block2` / `size2` option numbers.
+
+**Deferred** (documented in `block.zig`, not built): combined Block1+Block2 in a
+single exchange (RFC 7959 §3.3), and SZX renegotiation mid-transfer (the
+assembler tolerates a constant block size only).
+
+## Observe (`coap.observe`)
+
+RFC 7641 — a client subscribes with an `Observe` option (number 6) and the
+server pushes a notification on each change (C7):
+
+- **`Registry`** — the server's `(token, resource) → last sequence` table over
+  caller storage (`Dedup`-style bounded array + FIFO eviction): `register`,
+  `notify` (freshness-checked), `cancel`, `count`.
+- **`Sequence`** — the monotonic 24-bit notification-sequence generator, and
+  **`isNewer`** — the RFC 1982 "lollipop" comparison (accept newer, reject
+  stale/out-of-order), plus `encodeValue`/`decodeValue` for the option.
+- **Server push reuses `server.Server.separate` unchanged**: a notification is a
+  separate response echoing the observed token with an `Observe` option added —
+  no fresh request. A CON notification that exhausts `reliability.Retransmit`
+  (`.timed_out`) or is answered with a Reset cancels the subscription (caller
+  loop glue; `reliability.zig` is untouched).
+
 ## Scope
 
 Done: the full client/server stack — message codec (C1), typed options / URI
-mapping (C2), the §4 reliability layer (C3), and the §5 client (C4) / server
-(C5). Follow-ups: block-wise transfer (RFC 7959) and Observe (RFC 7641).
+mapping (C2), the §4 reliability layer (C3), the §5 client (C4) / server (C5),
+plus block-wise transfer (C6, RFC 7959) and Observe (C7, RFC 7641). Deferred
+within C6: combined Block1+Block2 in one exchange (RFC 7959 §3.3) and SZX
+renegotiation mid-transfer.
 
 ## Verification
 
-`zig build test-coap` — 42 offline tests. Client/server (7): `buildRequest`
+`zig build test-coap` — 55 offline tests. Block-wise / Observe (12): the Block
+value codec (field packing, SZX sizes, minimal encoding, reserved-SZX / too-long
+/ over-large-NUM errors), `split` boundary + `Assembler` completion, and two
+end-to-end block transfers (a 3000-byte Block2 GET loop reassembled and compared
+byte-for-byte; a Block1 PUT with `2.31 Continue` per non-final block); the
+Observe `Sequence` wrap, `isNewer` lollipop comparison, value round-trip, the
+`Registry` (freshness-checked notify, FIFO eviction, re-register refresh), an
+end-to-end observe register → notifications → stale-reject → cancel, and the
+CON-notification-timeout / RST cancellation glue. Client/server (7): `buildRequest`
 option assembly + counter advance, `Exchange.match` across all five reply
 kinds, NON typing, `isRequest` gating, `piggyback`/`ackOnly`/`separate`
 builders, and an end-to-end client→server→client round-trip. Reliability (9): the retransmit
