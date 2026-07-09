@@ -105,6 +105,7 @@ RFC codecs). Archetypes: ① HTTP/SaaS backend · ② netops · ③ IoT · ④ A
 | ✅ **`tabular`** DONE `6e19fc1` | ⑤ | dataset algebra T0+T1 (wgs transforms+series seed) |
 | ✅ **`jsonshape`** DONE `6a74016` | ⑤ | JSON→dataset dot-path projection (wgs seed) |
 | ✅ **`finstats`** DONE `0813d5c` | ⑤ finance | xirr/TWR/risk/beta/MonteCarlo/corr (wgs finance.zig seed) |
+| 🟡 `exprcalc` → **Opus EXTRACT, dep-blocked** (reclassified from Fable 2026-07-09) | ③ rules / config transforms | **Mature seed: bxp-core/src/expr.zig — 6532 LOC, 157 tests** (the file numparse was carved from), so this is a faithful lift, NOT a Fable value-add build. Real blocker = deps: `datefmt`/`tz`/`decimal` ready ✓, but it imports `encoding` (Fable-wait), `unicode`=`unaccent` (Fable-wait), and **`regex`** (⚠️ no regex module in zig-libs — regex is ADOPT-only, an external dep vs the zero-dep invariant; exprcalc has regex builtins). **Path: extract a "core exprcalc" now with the regex/charset/unaccent builtins feature-gated** (most of the 157 tests are logic/text/number/date/lookup), add them when those deps land. Needs a carve-out scope |
 | ❌ `roquery` → **DROPPED (not a zig-libs module)** | ⑤ + safe reporting | hardened read-only SQLite is **C-level** (the enforcement — `sqlite3_open_v2(READONLY)`, `PRAGMA query_only`, `sqlite3_set_authorizer`, `db_config` load-ext toggle — is raw C-API). Building it here would make zig-libs' first `@cImport` + libc user. **Decision 2026-07-09: keep the repo 100% pure-Zig → the hardened wrapper stays consumer-side over ADOPTed `zig-sqlite`.** `wgs/src/sqlite.zig` is the app-side reference impl |
 | ✅ **`filestore`** DONE `5d2956d` | ① DB-less persist | keyed kind/key files, atomic temp-rename + segmentSafe added (seed had neither); std-only, no hashdigest dep (axp-central seed) |
 | 🔀 `taskqueue` → **FOLD into `jobqueue`** | ③ fleet C2 | scope 2026-07-09: storage adds nothing over `filestore`; the value (lease/retry/DLQ) is jobqueue's job; only per-partition FIFO is worth keeping → build it as a `jobqueue` partition-key feature (`nextFor(partition)` + a real `priority` field), not a standalone module. Seed's id-arithmetic priority hack silently clobbers records |
@@ -128,7 +129,6 @@ RFC codecs). Archetypes: ① HTTP/SaaS backend · ② netops · ③ IoT · ④ A
 | **SNMP T-G** priv (DES-CBC + AES-128-CFB) + **T-H** time-window | ② finish v3 | in-flight; crypto value-add (Opus-inline possible now) |
 | `coap` **C6** block-wise (7959) + **C7** observe (7641) | ③ | RFC-complete protocol value-add |
 | `stun` (8489) · `sntp` (4330) · `syslog` (5424) | ②/netops | clean-room RFC codecs (syslog small → Opus-able) |
-| `exprcalc` (capstone) | ③ rules / config transforms | Excel-like evaluator; composes decimal/datefmt/tz/encoding/numparse/regex |
 | `grpc` (framing/streaming/status over our h2 + adopted protobuf) | microservices | no trustworthy pure-Zig; contained since we own h2 |
 | **MQTT broker** | ③ IoT hub | server side of `mqtt`; large protocol value-add |
 
@@ -201,9 +201,12 @@ desired/applied-generation + anti-brick rollback → k8s-controller-lite for con
    `testkit` DEFERRED — its scope came back mostly stale (netns/VOPR don't exist to consolidate); the honest
    remainder (runWire+FakeClock dedup) needs a build.zig test-only-dep mechanism + a 19-module refactor to
    pay off. With adopted pg/smtp/ws/log/toml, ① is a deployable backend stack.
-3. **When Fable resets:** finish SNMP T-G/T-H, then `stun`/`sntp`/`syslog`, `exprcalc`, MQTT broker,
-   coap C6/C7, plus the Fable-wait extraction items (`encoding`/`unaccent`).
-4. **Then decide:** `ssh` (bind), `grpc`, and the deferred big items per which product you commit to.
+3. **`exprcalc` — Opus EXTRACT now (not Fable):** mature bxp expr.zig seed (6532 LOC/157 tests); extract a
+   core with regex/charset/unaccent builtins feature-gated (its only missing deps). Needs a carve-out scope.
+4. **When Fable resets:** finish SNMP T-G/T-H, then `stun`/`sntp`/`syslog`, MQTT broker,
+   coap C6/C7, plus the Fable-wait extraction items (`encoding`/`unaccent`) — which also un-gate exprcalc's
+   charset/unaccent builtins.
+5. **Then decide:** `ssh` (bind), `grpc`, and the deferred big items per which product you commit to.
 
 ## Key decisions & deferred
 
