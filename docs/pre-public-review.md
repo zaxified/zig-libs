@@ -1,9 +1,42 @@
 # Pre-public security / similarity review
 
-**Status: not started.** This is a living TODO — check items off in place as they're
+**Status: in progress.** This is a living TODO — check items off in place as they're
 done. **Delete this file once the review is complete and its findings have been acted
 on**; it is not meant to be a permanent doc, only a working checklist for the one-time
 gate below.
+
+## Progress (2026-07-09)
+
+**✅ DONE — provenance / similarity audit + NOTICE completeness (the license-contamination
+pass).** Traced every module's seed back through the sibling projects (axp/bxp/wgs/
+poc-wf-analytic/zig-fping), not just their Apache-2/MIT surface. Fixes landed in commit
+`667b29d`. Key outcomes:
+- **fping lineage** (icmp/seqmap/netaddr/dns): fping = non-standard Stanford
+  BSD-with-advertising license → zig-libs carries a Stanford attribution obligation
+  (NOT obligation-free MIT). Restored the truncated NOTICE §1 clause; added README
+  licensing note.
+- **blobmsg**: LGPL-2.1 fear did NOT materialize — `libubus-io.c` contributed no code;
+  only uncopyrightable ubus protocol constants + msghdr struct present. Safe under MIT;
+  NOTICE/README rewordted to scope it accurately.
+- **tar** cleared (spec-based ustar, GNU tar only a black-box test oracle — SPEC was
+  overstating). **procnet/rawsock** SPECs corrected (gopsutil/libpcap never consulted).
+- **WealthFolio (AGPL-3.0)** in the finstats chain: data-only interop (SQL schema read,
+  no code linked/ported) — CLEAN, now documented in NOTICE.
+- bxp family (decimal/tz/zipstream/…): verified CLEAN.
+
+**☐ STILL OPEN under provenance/NOTICE:**
+- C3 doc/UAPI references not deep-traced (lower risk, all assert no-code-copied):
+  `nftables`/`uci`/`upstream`/`abuseguard`/`modbus` (cite GPL/LGPL project *docs*),
+  `netlink`/`wireguard` (cite GPL-2.0-WITH-Linux-syscall-note UAPI headers — rest on the
+  standard "OS-ABI, not copyrightable" position). Confirm each is behavior/spec-only.
+- `Provenance:` line FORMAT consistency across all module READMEs (some use a bold-list
+  variant) — normalize.
+- NOTICE policy for pure-clean-room-from-RFC modules (`whois`/`rdap`/`tar`): decide
+  whether a spec-only module needs a NOTICE entry.
+- Re-run the axp qemu `ubus -S` parity check against `blobmsg` (byte-compat confirmation).
+
+**☐ NOT STARTED — the adversarial SECURITY pass** (§ "Per-target adversarial review"
+below) and the **dark-tests files-vs-running test-count check** (§ below).
 
 ## Purpose
 
