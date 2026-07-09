@@ -20,8 +20,8 @@ touch build.zig · README · PLAN · NOTICE — they report back; the owner veri
 
 ## Status (2026-07-09)
 
-**65 modules · 1597 tests** (1594 pass + 3 env-gated skips: ubus/wireguard/blobmsg live checks) ·
-Debug + ReleaseFast green · `zig fmt` clean · MIT. Latest commit `fb3a910`.
+**68 modules · 1636 tests** (1633 pass + 3 env-gated skips: ubus/wireguard/blobmsg live checks) ·
+Debug + ReleaseFast green · `zig fmt` clean · MIT. Latest commit `65975f5`.
 Web/API cluster, HTTP/1.1+HTTP/2 stack, `kv` (+VOPR), network family, crypto leaves, MCP (+HTTP/SSE
 transport), and the content-negotiation + Range/206 HTTP feature families are complete.
 **Extraction wave 1 landed 2026-07-09** (Opus-coordinated, agent-built): `blobstore` (`24833cf`),
@@ -31,8 +31,11 @@ transport), and the content-negotiation + Range/206 HTTP feature families are co
 2026-07-09:** `filestore` · `framing` (folds lenframe+jsonwire) · `datefmt` · `diagnostics` · `json5` ·
 `zipstream`; plus a `blobstore.putNamed` atomicity bugfix surfaced during scoping. **Wave 4 landed
 2026-07-09:** `tz` (dep datefmt; verbatim IANA table) · `pollworker` (Linux poll loop + fork JobTable) ·
-`ipcbus` (dep framing; dispatch refactored to a callback). Findings +
-reclassifications below. **`roquery` DROPPED from the module set (decision 2026-07-09, see Key
+`ipcbus` (dep framing; dispatch refactored to a callback). **Wave 5 landed 2026-07-09 — pure-Opus
+extraction COMPLETE:** `csvstream` (merge csv.zig + ChunkReader, byte-offset streaming) · `csvsafe` (OWASP
+injection guard carved from 3 fused concerns) · `numparse` (grouped-number parse carved from expr.zig).
+**Only the two Fable-wait extractions remain (`encoding` full WHATWG, `unaccent` clean-room UCD).**
+Findings + reclassifications below. **`roquery` DROPPED from the module set (decision 2026-07-09, see Key
 decisions): its hardening is C-level, and zig-libs stays 100% pure-Zig — it lives consumer-side over
 ADOPTed SQLite.**
 
@@ -104,7 +107,7 @@ RFC codecs). Archetypes: ① HTTP/SaaS backend · ② netops · ③ IoT · ④ A
 | 🔀 `taskqueue` → **FOLD into `jobqueue`** | ③ fleet C2 | scope 2026-07-09: storage adds nothing over `filestore`; the value (lease/retry/DLQ) is jobqueue's job; only per-partition FIFO is worth keeping → build it as a `jobqueue` partition-key feature (`nextFor(partition)` + a real `priority` field), not a standalone module. Seed's id-arithmetic priority hack silently clobbers records |
 | ⚠️ `rawsock` → **reclassified BUILD** | ② capture/inject | seed is ~25 LOC receive-only (AF_PACKET open, duplicated 4× inline in axp); the real module — send/inject, BPF filter, promisc, iface enum — is mostly new construction, not extraction. Needs netns/root to verify |
 | ⚠️ `argsafe` → **reclassified BUILD** | hardening | no shared abstraction in the seed: 14 ad-hoc validator predicates across axp `task.zig`; the module is a *design consolidation* (composable `CharClass` + `safeArgv` builder), not a lift |
-| bxp text libs (scoped 2026-07-09): ✅ `datefmt` `5d2956d` · ✅ `diagnostics` `5d2956d` · ✅ `json5` `5d2956d` · ✅ `zipstream` `5d2956d` | ⑤ + i18n | DONE (Wave 3). ✅ **`tz`** DONE (Wave 4). Remaining EXTRACT — design-first (carve-out before lift): **`csvstream`** (merge csv.zig `LineIterator` + a bxp-cli-private `ChunkReader`), **`csvsafe`** (split the OWASP formula-injection guard out of 3 fused concerns), **`numparse`** (carve from 6.5k-LOC expr.zig) → Wave 5. **Fable-headroom (wait for reset):** `encoding` (5 code pages → full WHATWG), `unaccent` (⚠️ seed needs external `uucode` → violates zero-dep; Fable must clean-room UCD tables like `tz-gen`) |
+| bxp text libs (scoped 2026-07-09): ✅ `datefmt` `5d2956d` · ✅ `diagnostics` `5d2956d` · ✅ `json5` `5d2956d` · ✅ `zipstream` `5d2956d` | ⑤ + i18n | DONE (Wave 3). ✅ **`tz`** DONE (Wave 4). ✅ **`csvstream`** · ✅ **`csvsafe`** · ✅ **`numparse`** DONE (Wave 5). **All bxp-text-lib EXTRACTs done** except the two Fable-wait items (`encoding`/`unaccent`). **Fable-headroom (wait for reset):** `encoding` (5 code pages → full WHATWG), `unaccent` (⚠️ seed needs external `uucode` → violates zero-dep; Fable must clean-room UCD tables like `tz-gen`) |
 | IPC glue (scoped 2026-07-09): ✅ `framing` = `lenframe`+`jsonwire` FOLDED `5d2956d` | same-host IPC | DONE (Wave 3). ✅ **`pollworker`** + **`ipcbus`** DONE (Wave 4). **`chunkframe` → SKIP** (~20 LOC base64+JSON-envelope glue with a narrow one-bridge `why`; documented pattern, not a module) |
 
 ### BUILD → Opus (greenfield, standard pattern / integration)
@@ -186,14 +189,12 @@ desired/applied-generation + anti-brick rollback → k8s-controller-lite for con
    family `dataset`+`tabular`+`jsonshape`+`finstats`; W3 `filestore`+`framing`+`datefmt`+`diagnostics`+
    `json5`+`zipstream` (+`blobstore.putNamed` atomicity fix). `roquery` dropped (C-level), `taskqueue`
    folded into jobqueue, `chunkframe` skipped.
-1. **Finish extraction (Opus, next):**
-   - ✅ **Wave 4 DONE:** `tz` · `pollworker` · `ipcbus`.
-   - **Wave 5 (carve-out first):** `csvstream` · `csvsafe` · `numparse`.
-   - **Fable-wait:** `encoding` (full WHATWG) · `unaccent` (clean-room UCD tables, no external `uucode`).
-   - Also remaining EXTRACT: `rawsock`/`argsafe` are now **BUILD** (reclassified), do them in the build phase.
-2. **Then pure-Opus BUILD phase:** `sessions`+CSRF (① deployable backend with adopted pg/smtp/ws/log/toml)
-   · `jobqueue` (over pure-Zig `kv`, with the taskqueue partition-key feature) · `llmclient` · `rawsock` ·
-   `argsafe` · `testkit`.
+1. ✅ **Extraction COMPLETE (Opus, 2026-07-09):** Waves 4+5 done (`tz`/`pollworker`/`ipcbus`, then
+   `csvstream`/`csvsafe`/`numparse`). Only Fable-wait extractions remain (`encoding` full WHATWG ·
+   `unaccent` clean-room UCD tables, no external `uucode`).
+2. **NOW: pure-Opus BUILD phase** — `sessions`+CSRF (① deployable backend with adopted pg/smtp/ws/log/toml)
+   · `jobqueue` (over pure-Zig `kv`, folding the taskqueue partition-key feature) · `llmclient` · `rawsock`
+   (reclassified extract→build) · `argsafe` (reclassified extract→build) · `testkit`.
 3. **When Fable resets:** finish SNMP T-G/T-H, then `stun`/`sntp`/`syslog`, `exprcalc`, MQTT broker,
    coap C6/C7, plus the Fable-wait extraction items (`encoding`/`unaccent`).
 4. **Then decide:** `ssh` (bind), `grpc`, and the deferred big items per which product you commit to.
