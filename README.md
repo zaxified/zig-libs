@@ -8,7 +8,7 @@ Not a dumping ground: ship **solid, not many**. Most members are *extracted* fro
 across sibling projects (bxp, axp, zig-fping, poc-wf-analytic); a few fill genuine gaps in the Zig
 ecosystem.
 
-**Status:** 49 modules · 1423 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 77 modules · 1809 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ## Modules
@@ -40,6 +40,8 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `aaa-gate` | Bearer + **API-key** auth (constant-time) + audit hook + denied-request throttle | router, http |
 | `jwt` | JWT/JWS + **OIDC resource-server** validator (RFC 7515/7519/7517/8725) — parse + claims + verify (HS/ES/EdDSA/RSA, alg-confusion-safe) + JWKS-by-`kid` + **OIDC discovery/fetch** (cache + key-rotation) + a **`router` Bearer middleware** (RFC 6750 challenge, scope check, identity on ctx) | http, router |
 | `acme` | Let's Encrypt / ACME v2 (RFC 8555): HTTP-01 issuance + renewal, ES256 JWS, CSR | http, router |
+| `sessions` | Server-side web sessions + OWASP-hardened cookies + signed double-submit **CSRF** middleware | router, http, cookies, ramcache |
+| `llmclient` | Anthropic Messages API client (buffered + streaming SSE) over `http` — no third-party SDK | http |
 
 ### Networking
 
@@ -62,6 +64,11 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `l2disco` | Layer-2 / neighbor discovery codec — LLDP (802.1AB) + CDP + ARP (RFC 826) + DHCP options (RFC 2131/2132) + MAC helper | any | netaddr |
 | `seqmap` | Fixed 65 536-slot 16-bit request/reply correlation map, O(1) | any | — |
 | `latency-stats` | Online RTT stats — min/max/mean/stddev + RFC 3550 jitter + loss % (O(1)/sample, no alloc) + an **HdrHistogram** for bounded-error percentiles (p50–p99.9) | any | — |
+| `procnet` | Linux `/proc`+`/sys` parsers — ARP/routes/TCP+UDP sockets/conntrack/process stats/device health, typed | linux | netaddr |
+| `rawsock` | Linux **AF_PACKET** raw-frame capture + inject — BPF filter, promiscuous mode, typed frame decode | linux | netaddr |
+| `stun` | STUN client (RFC 8489) — NAT reflexive-address discovery: XOR-MAPPED-ADDRESS + MESSAGE-INTEGRITY + FINGERPRINT | any | netaddr |
+| `sntp` | SNTP client (RFC 4330) — NTP packet codec + UDP query, clock offset / round-trip delay | any | — |
+| `syslog` | RFC 5424 syslog formatter + emitter, RFC 3164 legacy encoder, RFC 6587 TCP octet framing | any | — |
 
 ### Data & storage
 
@@ -70,6 +77,13 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `kv` | Crash-consistent embedded KV store (Bitcask-style log + **randomized seeded VOPR**: model-checked crash recovery across fuzzed fault schedules) | — |
 | `ramcache` | Bounded in-memory cache — **W-TinyLFU** admission/eviction (window+SLRU+CMS sketch) + TTL + generation invalidation | — |
 | `decimal` | Exact i128 fixed-point decimal (money math), float-free — with IEEE/GDA rounding modes, rescale + rounded division | — |
+| `jobqueue` | Durable background-job queue over `kv` — lease/retry/DLQ, per-partition FIFO under priority, scheduled visibility | kv |
+| `blobstore` | Content-addressed blob store (git-object/restic style) + name-addressed + small named-record layers, crash-safe | hashdigest |
+| `filestore` | DB-less durable keyed document store — one atomically-written file per record + a typed-JSON convenience layer | — |
+| `dataset` | Canonical in-memory columnar-typed table — the normalization seam between data sources and consumers | — |
+| `tabular` | Dataset algebra (pandas/dplyr-style verbs) over `dataset` — aggregate/pivot/resample/rolling/join, fx-aware | dataset |
+| `jsonshape` | JSON → `dataset` reshaping — dot-path descent + typed column projection (jq-style minimal subset) | dataset |
+| `finstats` | Portfolio/financial statistics over `dataset` — XIRR/TWR/risk/beta/Monte-Carlo/correlation matrix | dataset |
 
 ### Crypto
 
@@ -89,6 +103,36 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `mcp` | Model Context Protocol server (JSON-RPC 2.0) — tools + resources + prompts, app-state ctx | any | — |
 | `mcp-http` | MCP **Streamable HTTP** transport (2025-06-18) — `POST /mcp` → JSON-RPC response (`application/json` **or live SSE** with tool-progress streaming) / 202, as a `router` middleware over a `mcp.Server`. Optional **sessions** (`Mcp-Session-Id` + `GET /mcp` server→client SSE stream with `Last-Event-ID` resumable replay + `DELETE` teardown); built-in **Origin** (DNS-rebinding) guard, size cap, Lock seam | any | router, http, mcp |
 | `uci` | OpenWRT UCI config parser + serializer + typed model (stable round-trip) | any | — |
+| `argsafe` | Allowlist validators + a typed argv builder — neutralizes argument/flag injection into an exec `argv` | any | — |
+| `procrun` | Subprocess runner: reap-race-tolerant wait, deadlock-free capped stdio capture, timeout, streaming + cancel | any | — |
+| `pollworker` | Single-owner `poll(2)` loop + a lock-free fork/exec job table for offloading blocking work off the loop thread | linux | — |
+| `ipcbus` | Same-host unix-socket control plane — request/reply server + a capped in-memory scratch key→bytes bus | linux | framing |
+| `framing` | Length-prefixed stream framing (`writeFrame`/`readFrame`) + a generic JSON tagged-union envelope codec | any | — |
+| `csvstream` | Streaming RFC 4180 CSV reader that preserves byte offsets, bounded memory regardless of file size | any | — |
+| `csvsafe` | OWASP CSV formula-injection guard (`=`/`+`/`-`/`@` cell leads) | any | — |
+| `json5` | Single-pass JSON5→JSON preprocessor (comments, unquoted keys, trailing commas, single-quoted strings) | any | — |
+| `zipstream` | Streaming ZIP archive reader — walk the central directory once, stream decompressed member bytes on demand | any | — |
+| `encoding` | Legacy single-byte code page ↔ UTF-8 transcoding (5 European code pages: windows-125x, ISO-8859-1/2/15) | any | — |
+| `datefmt` | Civil calendar + token-based date/time parse/format + calendar arithmetic, correct before 1970 | any | — |
+| `tz` | IANA time-zone offset lookup — zone name → UTC offset/DST at a given instant (600 zones + POSIX-TZ footer) | any | datefmt |
+| `numparse` | Locale-aware grouped-number parsing (thousands/decimal separators) into an exact `decimal.Decimal` | any | decimal |
+| `diagnostics` | LSP-style structured validation-finding collector — severity, dot-path, position, code, suggestion | any | — |
+
+## Roadmap / not yet built
+
+Research-verdicted **DON'T-BUILD-YET** — no consumer demands them today; see `PLAN.md`
+for the full reasoning and the "when greenlit" path for each:
+
+- **`testkit`** (shared test harness) — deferred; the honest remaining scope (a
+  `runWire` HTTP-wire test wrapper + `expectStatus` family + fake-clocks) needs a
+  `build.zig` test-only-dep mechanism with no precedent in this repo, plus a 19-module
+  refactor to pay off.
+- **`Reconcilable(T)`** (generic desired-vs-actual reconciler) — no second consumer
+  exists yet; extract a small `RollbackTimer` (arm/confirm/overdue) first, once one
+  appears.
+- **`kv` on-disk MVCC / transactions / ordered scans** — a multi-week B-tree + WAL build
+  with zero current consumers demanding scans or transactions; the existing Bitcask-style
+  log is enough until one does.
 
 ## Using a module
 
