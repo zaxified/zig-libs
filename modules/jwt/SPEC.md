@@ -23,9 +23,22 @@ This is the security core; the defenses are the point:
   downgrade); the expected algorithm/key type is fixed by the verifier, not the attacker.
 - **JWKS smuggling:** key selection is by `kid` against the *trusted* key set; an embedded `jwk`/
   `jku`/`x5u` in the token header is ignored — keys come only from the configured JWKS/Provider.
-- **Claims:** `exp`/`nbf`/`iat` validated against an injected clock with configurable skew; `iss`/
-  `aud` checked; scope enforced by P6 → 403 `insufficient_scope`, missing/invalid credential → 401
-  `invalid_token` (RFC 6750 challenge). HMAC compares are constant-time (`std.crypto`).
+- **Claims:** `exp`/`nbf`/`iat` validated against an injected clock with configurable skew; scope
+  enforced by P6 → 403 `insufficient_scope`, missing/invalid credential → 401 `invalid_token`
+  (RFC 6750 challenge). HMAC compares are constant-time (`std.crypto`).
+- **Mandatory audience/issuer — confused deputy (RFC 8725 §3.9), FIXED 2026-07-09:** `iss` and
+  `aud` validation are safe-by-default and cannot be skipped by omission. `Options.issuer`/
+  `Options.audience` are typed unions (`IssuerPolicy`/`AudiencePolicy`) with **no default** —
+  the caller must write `.{ .required = "…" }` (must match) or the explicit, greppable `.any`
+  (conscious opt-out). `Provider.ClaimOptions.audience` is likewise mandatory; its `.issuer`
+  defaults to `.provider` (enforce the discovered/configured issuer) and a jwks_uri-only provider
+  with no configured issuer **fails closed** (`IssuerNotConfigured`) rather than silently skipping.
+  Previously a same-IdP token minted for a *different* service was accepted unless the operator
+  opted in — the classic confused-deputy hole.
+- **Symmetric key from a fetched JWKS (RFC 8725 §3.5 / §2.1), FIXED 2026-07-09:** a network-fetched
+  JWKS (`fetchJwks`/`Provider`) **refuses** `kty:"oct"` keys (`JwkSkipReason.oct_from_network`) — a
+  published JWKS is attacker-readable, so a symmetric key there would let anyone forge HS\* tokens.
+  Symmetric keys are trusted only from a locally-configured `parseJwks` set.
 - **Out of scope:** token *issuance*/signing; encryption (JWE); `x5c` chain validation; revocation
   lists / token introspection (RFC 7662); OIDC ID-token-specific `nonce`/`c_hash` (this is a
   resource-server access-token validator, not an OIDC relying party). Provider trust rests on TLS
@@ -35,14 +48,17 @@ This is the security core; the defenses are the point:
 
 RFC known-answer vectors transcribed from the RFCs: JWS 7515 A.1 (HS256) / A.2 (RS256) / A.3
 (ES256), 8037 A.4 (Ed25519); JWK/JWKS 7517 vectors; plus adversarial negatives (alg=none,
-alg-confusion downgrade, kid mismatch, embedded-jwk ignored, expired/nbf, tampered signature) and
-Provider cache/rotation/TTL tests behind a scripted fetcher. 60 tests. Run: `zig build test-jwt`.
+alg-confusion downgrade, kid mismatch, embedded-jwk ignored, expired/nbf, tampered signature,
+mandatory-audience confused-deputy rejection, oct-from-network refusal) and Provider
+cache/rotation/TTL tests behind a scripted fetcher. 61 tests. Run: `zig build test-jwt`.
 
 ## Backlog / deferred
 
-- Pending repo-wide **security/similarity review pass** (see /docs/pre-public-review.md, not yet
-  run): const-time + alg-confusion + JWKS-smuggling + rotation re-audit for `jwt`/`aaa-gate`
-  specifically, adversarial multi-agent pass before any release.
+- **Mandatory audience/issuer + oct-from-network** were flagged as open decisions in the pre-public
+  review — now **RESOLVED** (safe-by-default, 2026-07-09; see Threat model above). The pending
+  repo-wide **security/similarity review pass** (see /docs/pre-public-review.md) still applies:
+  const-time + alg-confusion + JWKS-smuggling + rotation re-audit for `jwt`/`aaa-gate`, adversarial
+  multi-agent pass before any release.
 - No other module-local backlog recorded (README has no Deferred section).
 
 ## Status

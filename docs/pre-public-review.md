@@ -59,11 +59,15 @@ Highlights:
   (HIGH); argsafe CIDR leading-dash; jwt dead error-arm.
 
 **☐ OPEN — decisions / deferred (surfaced by the security pass, NOT yet actioned):**
-- **jwt insecure-defaults (DECISION):** `aud` and (for jwks_uri-only providers) `iss` are
-  NOT validated unless the operator opts in — a same-IdP token for another service is
-  accepted (RFC 8725 §3.9 confused-deputy). Decide: make audience/issuer validation
-  mandatory-or-explicit-opt-out (API change), or document loudly. Also: `oct` keys from a
-  fetched JWKS are usable for HS* (issuer-misconfig foot-gun) — consider refusing them.
+- **✅ RESOLVED 2026-07-09 — jwt insecure-defaults (was DECISION):** chose option (A),
+  safe-by-default with explicit conscious opt-out. `Options.issuer`/`Options.audience` (and
+  `Provider.ClaimOptions.audience`) are now mandatory typed unions with NO default —
+  `.{ .required = "…" }` or the greppable `.any` opt-out; a jwks_uri-only provider with no
+  configured issuer fails closed (`IssuerNotConfigured`). A same-IdP token for another service is
+  now rejected by default (RFC 8725 §3.9). Also: `oct` keys from a **network-fetched** JWKS are now
+  refused (`JwkSkipReason.oct_from_network`); locally-configured HMAC keys still work. See
+  modules/jwt/{src/root.zig,README.md,SPEC.md}; new `SECURITY: mandatory audience …` test + reworked
+  P5 tests (asymmetric keys over the fetcher). `test-jwt` green Debug + ReleaseFast.
 - **mqtt broker (ARCHITECTURAL, documented in mqtt/SPEC.md):** O(connections×subscriptions)
   fan-out under the single global spinlock that accept() also takes; QoS0→QoS1 re-encode can
   overflow a subscriber buffer and disconnect the PUBLISHER; session-takeover zombie

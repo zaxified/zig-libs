@@ -93,7 +93,8 @@ middleware.
 | `ParsedToken` | `header`, `claims`, `signing_input`, `signature` (raw bytes), `alg` (typed enum) + `deinit()` |
 | `Header` | `alg` (required), `typ`/`kid`/`cty` (optional) |
 | `Claims` | `iss`/`sub`/`aud`/`exp`/`nbf`/`iat`/`jti` + `raw` payload; `claim`/`claimStr`/`claimInt`/`claimBool` getters for custom claims (`scope`, …) |
-| `Audience` | `none` \| `single` \| `many` — `aud` as string OR array, with `contains()` |
+| `Audience` | `none` \| `single` \| `many` — the parsed `aud` (string OR array), with `contains()` |
+| `AudiencePolicy` / `IssuerPolicy` | mandatory-choice unions for `Options`: `.{ .required = "…" }` (must match) \| `.any` (conscious opt-out). No default — see "Mandatory audience/issuer" |
 | `validateClaims(claims, Options) ValidateError!void` | RFC 7519 §4.1 checks; pure, allocation-free |
 | `Alg` | RFC 7518 names (`HS256`…`EdDSA`, `none`, `unknown`) — the verify dispatch |
 | `Key` | tagged union: `.hmac` (secret bytes) \| `.ecdsa_p256` \| `.ecdsa_p384` \| `.ed25519` (std public keys) \| `.rsa` (`RsaPublicKey`); constructors `ecdsaP256FromCoords(x, y)` / `ecdsaP384FromCoords(x, y)` / `ed25519FromBytes(x)` / `rsaFromModExp(n, e)` take exactly a JWK's decoded parameters (`KeyError.InvalidKey` on bad points/moduli/exponents) |
@@ -109,7 +110,7 @@ middleware.
 | `Fetcher` / `HttpFetcher` | GET-a-URL seam (offline-testable); `HttpFetcher` adapts `http.Client` |
 | `discover(gpa, fetcher, issuer) !Metadata` · `fetchJwks(gpa, fetcher, url) !JwkSet` | OIDC discovery + JWKS fetch |
 | `Provider.init(gpa, fetcher, .{issuer OR jwks_uri, ttl_s, min_refresh_interval_s})` | cached, rotation-aware key source |
-| `Provider.verify(gpa, token, now_s, ClaimOptions) !ParsedToken` | turnkey: lazy-load/TTL-refresh JWKS, resolve `kid` (one rate-limited refresh on rotation), verify + validateClaims with issuer injected |
+| `Provider.verify(gpa, token, now_s, ClaimOptions) !ParsedToken` | turnkey: lazy-load/TTL-refresh JWKS, resolve `kid` (one rate-limited refresh on rotation), verify + validateClaims. `ClaimOptions.audience` REQUIRED; `.issuer` = `IssuerCheck` (default `.provider` = enforce discovered/configured issuer, else `IssuerNotConfigured`) |
 | `ResourceServer.init(gpa, Options) !ResourceServer` (+ `deinit`) | build the `router` middleware; `Options`: `provider`, `claim_opts`, `required_scopes`, `protect` (`all`/`mutations`), `clock`, `lock`, `realm` |
 | `ResourceServer.middleware() router.Middleware` | register before routes; verifies each request's Bearer token |
 | `identityOf(ctx) ?*Identity` | the attached identity — `subject()`, `claims()`, `scopes()` (RFC 6749 space-split), `hasScope()` |
@@ -117,9 +118,29 @@ middleware.
 
 `Options`: `now_s` (REQUIRED — caller-supplied seconds since epoch, no
 hidden clock, same injected-time rule as `resilience`/`probe`), `leeway_s`
-(default 60), `issuer`, `audience` (must be contained in `aud`),
-`require_exp` (default true), `reject_future_iat` (default false — `iat` is
-informational per RFC 7519).
+(default 60), `issuer` and `audience` (**both REQUIRED, no default** — see
+"Mandatory audience/issuer" below), `require_exp` (default true),
+`reject_future_iat` (default false — `iat` is informational per RFC 7519).
+
+### Mandatory audience/issuer (safe by default, RFC 8725 §3.9)
+
+Audience and issuer validation are **not optional and not skippable by
+omission** — that closes the confused-deputy foot-gun where a same-IdP token
+minted for a *different* service was silently accepted. Both are typed unions
+with **no default**, so the caller MUST choose:
+
+- `.issuer` / `.audience` = `.{ .required = "…" }` — the value MUST match
+  (`iss` equal / value contained in `aud`), else `IssuerMismatch` /
+  `AudienceMismatch`.
+- `.issuer` / `.audience` = `.any` — an **explicit, greppable, conscious
+  opt-out** of that check. This is the only way to skip validation.
+
+For the turnkey `Provider` / `ResourceServer`, `Provider.ClaimOptions.issuer`
+additionally defaults to `.provider` (enforce the discovered/configured
+issuer). A **jwks_uri-only** provider that configured no issuer has nothing to
+enforce, so `verify` **fails closed** with `IssuerNotConfigured` unless you
+pin `.issuer = .{ .required = "…" }` or opt out with `.issuer = .any`.
+`audience` has no default anywhere — it is always a conscious choice.
 
 Typed errors, never a panic: `ParseError` = `MalformedToken` ·
 `InvalidBase64` · `InvalidJson` · `NotAnObject` · `MissingAlg` ·
@@ -127,18 +148,22 @@ Typed errors, never a panic: `ParseError` = `MalformedToken` ·
 · `IssuedInFuture` · `IssuerMismatch` · `AudienceMismatch` · `MissingExp`;
 `VerifyError` = `UnsecuredToken` · `AlgKeyMismatch` · `UnsupportedAlg` ·
 `BadSignature` · `InvalidKey` · `NoMatchingKey` (JWKS resolution only);
-`JwksError` = `InvalidJson` · `NotAJwks` · `OutOfMemory`.
+`JwksError` = `InvalidJson` · `NotAJwks` · `OutOfMemory`. `Provider.verify`
+adds `IssuerNotConfigured` (default `.provider` issuer policy on a
+jwks_uri-only provider with no configured issuer — fail closed).
 
 ## Usage
 
 ```zig
 const jwt = @import("jwt");
 
-// One call: parse → verify signature → validate claims.
+// One call: parse → verify signature → validate claims. Issuer and audience
+// validation are MANDATORY: pin them with `.required`, or write `.any` to
+// consciously opt out. There is no silent skip (RFC 8725 §3.9).
 var token = try jwt.parseAndVerify(gpa, bearer_token, .{ .hmac = secret }, .{
     .now_s = now_seconds, // caller-supplied clock
-    .issuer = "https://issuer.example",
-    .audience = "api://my-service",
+    .issuer = .{ .required = "https://issuer.example" },
+    .audience = .{ .required = "api://my-service" },
 });
 defer token.deinit();
 const scope = token.claims.claimStr("scope") orelse "";
@@ -149,7 +174,8 @@ var jwks = try jwt.parseJwks(gpa, jwks_json);
 defer jwks.deinit();
 var token2 = try jwt.parseVerifyJwks(gpa, bearer_token, jwks, .{
     .now_s = now_seconds,
-    .issuer = "https://issuer.example",
+    .issuer = .{ .required = "https://issuer.example" },
+    .audience = .{ .required = "api://my-service" },
 });
 defer token2.deinit();
 
@@ -158,7 +184,11 @@ var parsed = try jwt.parse(gpa, bearer_token);
 defer parsed.deinit();
 const jwk = jwks.selectKey(parsed.header) orelse return error.NoMatchingKey;
 try jwt.verify(&parsed, jwk.key);
-try jwt.validateClaims(parsed.claims, .{ .now_s = now_seconds });
+try jwt.validateClaims(parsed.claims, .{
+    .now_s = now_seconds,
+    .issuer = .{ .required = "https://issuer.example" },
+    .audience = .{ .required = "api://my-service" },
+});
 ```
 
 ## Semantics notes
@@ -187,15 +217,22 @@ try jwt.validateClaims(parsed.claims, .{ .now_s = now_seconds });
   `JwkSet.skipped` with a `JwkSkipReason` — only a document that is not a
   JWKS at all errors (`InvalidJson`/`NotAJwks`). Arbitrary bytes never
   panic.
-- **`kty:"oct"` parses for completeness** (HS\* dev/test setups) — but a
-  *symmetric* key has no business in a *published* JWKS; anyone who can
-  read it can mint tokens.
+- **`kty:"oct"` (symmetric) keys are trusted only from a LOCAL set.** A
+  network-fetched JWKS (`fetchJwks` / `Provider`) **refuses** `oct` entries
+  (`JwkSkipReason.oct_from_network`): a published JWKS is attacker-readable, so
+  a symmetric key there is a forgery vector (anyone who reads it can mint HS\*
+  tokens — RFC 8725 §3.5 / §2.1). `parseJwks` — a locally-configured, trusted
+  set for HS\* dev/test setups — still accepts them.
 
 ## Verification
 
-`zig build test-jwt` — 60 fully offline tests (19 from P1, 12 from P2,
-6 from P3, 10 from P4, 9 from P5, 4 from P6), green under Debug and
-ReleaseFast. P5 drives the `Provider` over a scripted `Fetcher` (discovery,
+`zig build test-jwt` — 61 fully offline tests (20 from P1 incl. the
+mandatory-audience confused-deputy test, 12 from P2, 6 from P3, 10 from P4,
+9 from P5, 4 from P6), green under Debug and ReleaseFast. A dedicated
+`SECURITY: mandatory audience …` test proves a token minted for a sibling
+service is rejected by default and accepted only when the `aud` matches or
+`.any` is set; the P5 `fetchJwks` test proves a network-fetched `oct` key is
+refused (`oct_from_network`) while the same set is accepted locally. P5 drives the `Provider` over a scripted `Fetcher` (discovery,
 fetch, TTL/rotation refresh, rate limit, typed failures); P6 runs the
 middleware end-to-end over a real `router` + `http.Server.serveStream`
 (valid → 200 + identity; missing/invalid/expired/wrong-scheme → 401 with the

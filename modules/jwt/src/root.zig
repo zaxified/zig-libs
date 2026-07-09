@@ -48,11 +48,13 @@
 //! ```zig
 //! const jwt = @import("jwt");
 //!
-//! // One call: parse → verify signature → validate claims.
+//! // One call: parse → verify signature → validate claims. Issuer and
+//! // audience validation are MANDATORY: pin them with `.required`, or write
+//! // `.any` to consciously opt out (never a silent skip — RFC 8725 §3.9).
 //! var token = try jwt.parseAndVerify(gpa, bearer_token, .{ .hmac = secret }, .{
 //!     .now_s = now_seconds, // caller-supplied clock, no hidden time source
-//!     .issuer = "https://issuer.example",
-//!     .audience = "api://my-service",
+//!     .issuer = .{ .required = "https://issuer.example" },
+//!     .audience = .{ .required = "api://my-service" },
 //! });
 //! defer token.deinit();
 //! const scope = token.claims.claimStr("scope") orelse "";
@@ -67,7 +69,10 @@
 //! });
 //! defer provider.deinit();
 //! var t = try provider.verify(gpa, bearer_token, now_seconds, .{
-//!     .audience = "api://my-service", // issuer is enforced automatically
+//!     .audience = .{ .required = "api://my-service" },
+//!     // issuer defaults to `.provider` — the discovered/configured issuer is
+//!     // enforced automatically (a jwks_uri-only provider with no issuer must
+//!     // pin `.issuer = .{ .required = … }` or opt out with `.issuer = .any`).
 //! });
 //! defer t.deinit();
 //!
@@ -76,7 +81,7 @@
 //! // token and hands the handler an Identity via `jwt.identityOf(ctx)`.
 //! var rs = try jwt.ResourceServer.init(gpa, .{
 //!     .provider = &provider,
-//!     .claim_opts = .{ .audience = "api://my-service" },
+//!     .claim_opts = .{ .audience = .{ .required = "api://my-service" } },
 //!     .required_scopes = &.{"read"},
 //! });
 //! defer rs.deinit();
@@ -87,7 +92,8 @@
 //! defer jwks.deinit();
 //! var token2 = try jwt.parseVerifyJwks(gpa, bearer_token, jwks, .{
 //!     .now_s = now_seconds,
-//!     .issuer = "https://issuer.example",
+//!     .issuer = .{ .required = "https://issuer.example" },
+//!     .audience = .{ .required = "api://my-service" },
 //! });
 //! defer token2.deinit();
 //!
@@ -96,7 +102,11 @@
 //! defer parsed.deinit();
 //! const jwk = jwks.selectKey(parsed.header) orelse return error.NoMatchingKey;
 //! try jwt.verify(&parsed, jwk.key);
-//! try jwt.validateClaims(parsed.claims, .{ .now_s = now_seconds });
+//! try jwt.validateClaims(parsed.claims, .{
+//!     .now_s = now_seconds,
+//!     .issuer = .{ .required = "https://issuer.example" },
+//!     .audience = .{ .required = "api://my-service" },
+//! });
 //! ```
 //!
 //! Design notes:
@@ -156,9 +166,10 @@ pub const ValidateError = error{
     /// `iat` (− leeway) is in the future (checked only when
     /// `Options.reject_future_iat` is set — lenient by default).
     IssuedInFuture,
-    /// `Options.issuer` was given and `iss` is absent or different.
+    /// `Options.issuer` is `.required` and `iss` is absent or different.
     IssuerMismatch,
-    /// `Options.audience` was given and is not contained in `aud`.
+    /// `Options.audience` is `.required` and the value is not contained in
+    /// `aud` (RFC 8725 §3.9 confused-deputy defence).
     AudienceMismatch,
     /// `exp` is absent and `Options.require_exp` is set.
     MissingExp,
@@ -362,19 +373,49 @@ pub fn parse(gpa: std.mem.Allocator, token: []const u8) ParseError!ParsedToken {
     };
 }
 
+/// Audience-validation policy (RFC 7519 §4.1.3 + RFC 8725 §3.9). There is
+/// deliberately NO default and NO "skip" that a caller can reach by leaving a
+/// field unset: audience validation is mandatory, and the ONLY way to run
+/// without it is to write `.any` — a conscious, greppable opt-out. This is the
+/// fix for the confused-deputy foot-gun where a same-IdP token minted for a
+/// different service was silently accepted.
+pub const AudiencePolicy = union(enum) {
+    /// The token's `aud` MUST contain this value (else `AudienceMismatch`).
+    required: []const u8,
+    /// Explicitly skip audience validation. Choosing this accepts the
+    /// RFC 8725 §3.9 confused-deputy risk (a token minted for any sibling
+    /// service at the same issuer will pass) — only correct when the token's
+    /// `aud` is enforced elsewhere or the deployment has a single audience.
+    any,
+};
+
+/// Issuer-validation policy (RFC 7519 §4.1.1). Same shape and rationale as
+/// `AudiencePolicy`: no default, no silent skip — issuer validation is
+/// mandatory unless the caller consciously writes `.any`.
+pub const IssuerPolicy = union(enum) {
+    /// `iss` MUST be present and equal to this value (else `IssuerMismatch`).
+    required: []const u8,
+    /// Explicitly skip issuer validation (conscious opt-out).
+    any,
+};
+
 /// Claims-validation options. `now_s` is REQUIRED and caller-supplied
-/// (seconds since epoch) — this module has no hidden clock.
+/// (seconds since epoch) — this module has no hidden clock. `issuer` and
+/// `audience` are REQUIRED too and have no default: the caller must either
+/// pin a value (`.required = …`) or consciously opt out (`.any`). Neither can
+/// be silently skipped.
 pub const Options = struct {
     /// Current time, seconds since the Unix epoch.
     now_s: i64,
     /// Clock-skew allowance applied to `exp`/`nbf`/`iat` (RFC 7519 §4.1.4
     /// "usually no more than a few minutes").
     leeway_s: u32 = 60,
-    /// When set, `iss` must be present and equal (case-sensitive).
-    issuer: ?[]const u8 = null,
-    /// When set, this value must be contained in `aud` (single string or
-    /// any element of an array).
-    audience: ?[]const u8 = null,
+    /// Expected `iss` — `.required = "…"` enforces it, `.any` opts out. No
+    /// default: the choice is mandatory (RFC 8725 §3.8/§3.9 hardening).
+    issuer: IssuerPolicy,
+    /// Expected `aud` — `.required = "…"` must be contained in the token's
+    /// `aud`, `.any` opts out. No default: the choice is mandatory.
+    audience: AudiencePolicy,
     /// Reject tokens without `exp` (a resource server should not accept
     /// tokens that never expire).
     require_exp: bool = true,
@@ -404,12 +445,18 @@ pub fn validateClaims(claims: Claims, opts: Options) ValidateError!void {
             if (iat -| leeway > opts.now_s) return error.IssuedInFuture;
         }
     }
-    if (opts.issuer) |want| {
-        const iss = claims.iss orelse return error.IssuerMismatch;
-        if (!std.mem.eql(u8, iss, want)) return error.IssuerMismatch;
+    switch (opts.issuer) {
+        .required => |want| {
+            const iss = claims.iss orelse return error.IssuerMismatch;
+            if (!std.mem.eql(u8, iss, want)) return error.IssuerMismatch;
+        },
+        .any => {},
     }
-    if (opts.audience) |want| {
-        if (!claims.aud.contains(want)) return error.AudienceMismatch;
+    switch (opts.audience) {
+        .required => |want| {
+            if (!claims.aud.contains(want)) return error.AudienceMismatch;
+        },
+        .any => {},
     }
 }
 
@@ -696,7 +743,18 @@ pub const JwkSkipReason = enum {
     /// A metadata member (`kid`/`use`/`alg`/`kty`/`crv`) has the wrong
     /// JSON type.
     invalid_member,
+    /// A `kty:"oct"` (symmetric/HMAC) key appeared in a JWKS fetched over the
+    /// network. Refused: anyone who can read a published JWKS could otherwise
+    /// mint HS* tokens with it (RFC 8725 §3.5 / §2.1 algorithm confusion).
+    /// Symmetric keys are accepted ONLY from a locally-configured `parseJwks`.
+    oct_from_network,
 };
+
+/// Where a JWKS came from — decides whether `kty:"oct"` symmetric keys are
+/// trusted. A locally-configured set (`parseJwks`) may carry HMAC secrets; a
+/// network-fetched set (`fetchJwks`/`Provider`) may NOT — a public JWKS is
+/// readable by attackers, so an `oct` entry there is a forgery vector.
+pub const JwkSource = enum { local, network };
 
 /// Record of one skipped JWK: its index in the original `keys` array plus
 /// the reason. Present so operators can log *why* a key was dropped instead
@@ -806,14 +864,22 @@ pub const JwkSet = struct {
 /// - `kty:"EC"`, `crv:"P-256"|"P-384"` — `x`/`y` →
 ///   `ecdsaP256FromCoords`/`ecdsaP384FromCoords` (ES256/ES384).
 /// - `kty:"OKP"`, `crv:"Ed25519"` — `x` → `ed25519FromBytes` (EdDSA).
-/// - `kty:"oct"` — `k` → `.hmac`. Parsed for completeness (HS* dev/test
-///   setups); a *symmetric* key has no business in a *published* JWKS —
-///   anyone who can read it can mint tokens.
+/// - `kty:"oct"` — `k` → `.hmac`. Accepted ONLY here (a locally-configured,
+///   trusted set for HS* dev/test setups); a *symmetric* key has no business
+///   in a *published* JWKS — anyone who can read it can mint tokens — so the
+///   network path (`fetchJwks`/`Provider`) refuses it (`oct_from_network`).
 ///
 /// Individual JWKs that are malformed or unsupported are skipped and
 /// recorded in `skipped` — a set-wide error is returned only when the
 /// document itself is not a JWKS. Arbitrary bytes never panic.
 pub fn parseJwks(gpa: std.mem.Allocator, json: []const u8) JwksError!JwkSet {
+    return parseJwksSource(gpa, json, .local);
+}
+
+/// `parseJwks` with an explicit trust source (see `JwkSource`). The public
+/// `parseJwks` is the `.local` (trusted) entry point; `fetchJwks` uses
+/// `.network`, which refuses `kty:"oct"` symmetric keys.
+pub fn parseJwksSource(gpa: std.mem.Allocator, json: []const u8, source: JwkSource) JwksError!JwkSet {
     const arena_state = try gpa.create(std.heap.ArenaAllocator);
     errdefer gpa.destroy(arena_state);
     arena_state.* = .init(gpa);
@@ -832,7 +898,7 @@ pub fn parseJwks(gpa: std.mem.Allocator, json: []const u8) JwksError!JwkSet {
     var keys: std.ArrayList(Jwk) = .empty;
     var skipped: std.ArrayList(SkippedJwk) = .empty;
     for (keys_val.array.items, 0..) |item, i| {
-        const jwk = jwkFromValue(arena, item) catch |err| switch (err) {
+        const jwk = jwkFromValue(arena, item, source) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => |reason| {
                 try skipped.append(arena, .{ .index = i, .reason = skipReason(reason) });
@@ -886,6 +952,7 @@ const JwkFailure = error{
     InvalidBase64,
     InvalidKeyMaterial,
     InvalidMember,
+    OctFromNetwork,
 };
 
 fn skipReason(err: JwkFailure) JwkSkipReason {
@@ -899,6 +966,7 @@ fn skipReason(err: JwkFailure) JwkSkipReason {
         error.InvalidBase64 => .invalid_base64,
         error.InvalidKeyMaterial => .invalid_key,
         error.InvalidMember => .invalid_member,
+        error.OctFromNetwork => .oct_from_network,
     };
 }
 
@@ -907,6 +975,7 @@ fn skipReason(err: JwkFailure) JwkSkipReason {
 fn jwkFromValue(
     arena: std.mem.Allocator,
     val: std.json.Value,
+    source: JwkSource,
 ) (JwkFailure || error{OutOfMemory})!Jwk {
     if (val != .object) return error.NotAnObject;
     const obj = val.object;
@@ -949,7 +1018,11 @@ fn jwkFromValue(
             break :blk Key.ed25519FromBytes(x[0..32].*) catch return error.InvalidKeyMaterial;
         }
         if (std.mem.eql(u8, kty, "oct")) {
-            // RFC 7518 §6.4.1: k — the symmetric secret. See parseJwks doc.
+            // RFC 7518 §6.4.1: k — the symmetric secret. A symmetric key in a
+            // network-fetched (public) JWKS is a forgery vector — anyone who
+            // reads it can mint HS* tokens — so it is refused there and only
+            // trusted from a locally-configured set. See parseJwks doc.
+            if (source == .network) return error.OctFromNetwork;
             const k = try jwkMaterial(arena, obj, "k");
             if (k.len == 0) return error.InvalidKeyMaterial; // unusable as HMAC secret
             break :blk .{ .hmac = k };
@@ -1192,8 +1265,10 @@ fn stringMember(obj: std.json.ObjectMap, name: []const u8) ?[]const u8 {
 /// parse errors (`InvalidJson`/`NotAJwks`) verbatim.
 pub const FetchJwksError = FetchError || JwksError || error{HttpStatus};
 
-/// GET `jwks_uri` and parse the body via `parseJwks` (P4). The returned set
-/// owns arena copies of everything — the transfer buffer dies here.
+/// GET `jwks_uri` and parse the body via `parseJwksSource(…, .network)` (P4):
+/// the fetched set is trusted for asymmetric keys only — `kty:"oct"` entries
+/// are refused (`oct_from_network`). The returned set owns arena copies of
+/// everything — the transfer buffer dies here.
 pub fn fetchJwks(
     gpa: std.mem.Allocator,
     fetcher: Fetcher,
@@ -1203,7 +1278,10 @@ pub fn fetchJwks(
     defer gpa.free(body_buf);
     const res = try fetcher.fetch(jwks_uri, body_buf);
     if (res.status != 200) return error.HttpStatus;
-    return parseJwks(gpa, res.body);
+    // `.network`: a fetched JWKS is untrusted for symmetric keys — `oct`
+    // entries are refused (an attacker who reads the public set could
+    // otherwise forge HS* tokens).
+    return parseJwksSource(gpa, res.body, .network);
 }
 
 /// Errors from `Provider.refresh`. The two sides of a refresh collapse to
@@ -1268,21 +1346,46 @@ pub const Provider = struct {
         min_refresh_interval_s: u32 = 30,
     };
 
+    /// How `Provider.verify` decides the expected `iss`. Unlike the low-level
+    /// `IssuerPolicy`, the sensible default here is "enforce the provider's
+    /// own issuer", so `.provider` is the default — but a jwks_uri-only
+    /// provider that configured NO issuer has nothing to enforce, and rather
+    /// than silently skip (the old foot-gun) `verify` then fails closed with
+    /// `error.IssuerNotConfigured` unless the caller consciously picks `.any`.
+    pub const IssuerCheck = union(enum) {
+        /// Enforce the provider's issuer: the OIDC discovery document's
+        /// `issuer` (issuer-configured providers) or the configured
+        /// `ProviderOptions.issuer`. `error.IssuerNotConfigured` when neither
+        /// exists (raw jwks_uri, no issuer) — pick `.required`/`.any` instead.
+        provider,
+        /// Enforce this exact issuer, overriding the provider's own.
+        required: []const u8,
+        /// Consciously skip issuer validation (RFC 8725 §3.9 risk accepted).
+        any,
+    };
+
     /// Claim policy for `Provider.verify` — `Options` minus `now_s` (passed
-    /// per call) and with `issuer = null` meaning "enforce the discovered /
-    /// configured issuer" rather than "don't check".
+    /// per call). `audience` has NO default: binding the token to this
+    /// resource server is mandatory (`.required = "…"` or a conscious
+    /// `.any`). `issuer` defaults to `.provider` (enforce the discovered /
+    /// configured issuer); it is never silently skipped.
     pub const ClaimOptions = struct {
         leeway_s: u32 = 60,
-        /// Override the expected `iss`. Default: the discovery document's
-        /// `issuer` (issuer-configured providers) or `options.issuer`; a
-        /// plain jwks_uri-configured provider checks nothing.
-        issuer: ?[]const u8 = null,
-        audience: ?[]const u8 = null,
+        /// Expected `iss` policy — see `IssuerCheck`. Default `.provider`.
+        issuer: IssuerCheck = .provider,
+        /// Expected `aud` — `.required = "…"` or a conscious `.any`. No
+        /// default: the choice is mandatory (RFC 8725 §3.9).
+        audience: AudiencePolicy,
         require_exp: bool = true,
         reject_future_iat: bool = false,
     };
 
-    pub const Error = ParseAndVerifyError || RefreshError;
+    pub const Error = ParseAndVerifyError || RefreshError || error{
+        /// `ClaimOptions.issuer` was `.provider` (the default) but this
+        /// provider has no issuer to enforce (raw jwks_uri, none configured).
+        /// Fail closed: pin `.issuer = .{ .required = … }` or opt out `.any`.
+        IssuerNotConfigured,
+    };
 
     pub fn init(gpa: std.mem.Allocator, fetcher: Fetcher, options: ProviderOptions) Provider {
         std.debug.assert(options.issuer != null or options.jwks_uri != null);
@@ -1352,12 +1455,21 @@ pub const Provider = struct {
         const resolved = jwk orelse return error.NoMatchingKey;
         try verifySignature(&parsed, resolved.key);
 
-        const expected_issuer = claim_opts.issuer orelse
-            (if (p.metadata) |m| m.issuer else p.options.issuer);
+        // Resolve the mandatory issuer policy. `.provider` (the default) uses
+        // the discovered/configured issuer, and fails closed when there is
+        // none — issuer validation is never silently skipped.
+        const issuer_policy: IssuerPolicy = switch (claim_opts.issuer) {
+            .required => |s| .{ .required = s },
+            .any => .any,
+            .provider => blk: {
+                const iss = if (p.metadata) |m| m.issuer else p.options.issuer;
+                break :blk .{ .required = iss orelse return error.IssuerNotConfigured };
+            },
+        };
         try validateClaims(parsed.claims, .{
             .now_s = now_s,
             .leeway_s = claim_opts.leeway_s,
-            .issuer = expected_issuer,
+            .issuer = issuer_policy,
             .audience = claim_opts.audience,
             .require_exp = claim_opts.require_exp,
             .reject_future_iat = claim_opts.reject_future_iat,
@@ -1547,10 +1659,12 @@ pub const ResourceServer = struct {
     pub const Options = struct {
         /// The verifier backing the guard. Must outlive the Router.
         provider: *Provider,
-        /// Claim policy handed to `Provider.verify` (issuer is enforced
-        /// automatically for issuer-configured providers; set `audience` here
-        /// to bind tokens to this resource server, per RFC 8725 §3.9).
-        claim_opts: Provider.ClaimOptions = .{},
+        /// Claim policy handed to `Provider.verify`. REQUIRED — no default:
+        /// `Provider.ClaimOptions.audience` must be set (`.required = "…"` to
+        /// bind tokens to this resource server per RFC 8725 §3.9, or a
+        /// conscious `.any`). Issuer is enforced automatically for
+        /// issuer-configured providers.
+        claim_opts: Provider.ClaimOptions,
         /// Scopes every in-scope request must carry (ALL required). Empty ⇒
         /// authenticate only, no scope check.
         required_scopes: []const []const u8 = &.{},
@@ -1675,6 +1789,7 @@ fn resourceInvalidReason(err: anyerror) []const u8 {
         error.UnsecuredToken => "unsecured token rejected",
         error.AlgKeyMismatch, error.UnsupportedAlg => "unsupported algorithm",
         error.NoMatchingKey => "no matching key",
+        error.IssuerNotConfigured => "issuer not configured",
         error.DiscoveryFailed, error.JwksFetchFailed => "key set unavailable",
         error.MalformedToken, error.InvalidBase64, error.InvalidJson, error.NotAnObject => "malformed token",
         else => "invalid token",
@@ -1950,19 +2065,24 @@ test "validateClaims: expired, and leeway lets a just-expired token pass" {
     var parsed = try parse(testing.allocator, token);
     defer parsed.deinit();
 
-    // Well past exp + leeway.
+    // Well past exp + leeway. (This test is about time, not iss/aud, so both
+    // policies opt out explicitly with `.any` — the mandatory-choice API.)
     try testing.expectError(error.Expired, validateClaims(parsed.claims, .{
         .now_s = 1061,
         .leeway_s = 60,
+        .issuer = .any,
+        .audience = .any,
     }));
     // Just expired but inside the leeway window.
-    try validateClaims(parsed.claims, .{ .now_s = 1030, .leeway_s = 60 });
+    try validateClaims(parsed.claims, .{ .now_s = 1030, .leeway_s = 60, .issuer = .any, .audience = .any });
     // Exactly at the edge (exp + leeway == now) is still acceptable.
-    try validateClaims(parsed.claims, .{ .now_s = 1060, .leeway_s = 60 });
+    try validateClaims(parsed.claims, .{ .now_s = 1060, .leeway_s = 60, .issuer = .any, .audience = .any });
     // Zero leeway: one second past exp fails.
     try testing.expectError(error.Expired, validateClaims(parsed.claims, .{
         .now_s = 1001,
         .leeway_s = 0,
+        .issuer = .any,
+        .audience = .any,
     }));
 }
 
@@ -1979,10 +2099,12 @@ test "validateClaims: nbf in the future, leeway window" {
     try testing.expectError(error.NotYetValid, validateClaims(parsed.claims, .{
         .now_s = 4000,
         .leeway_s = 60,
+        .issuer = .any,
+        .audience = .any,
     }));
     // Inside leeway of nbf: acceptable.
-    try validateClaims(parsed.claims, .{ .now_s = 4950, .leeway_s = 60 });
-    try validateClaims(parsed.claims, .{ .now_s = 6000, .leeway_s = 60 });
+    try validateClaims(parsed.claims, .{ .now_s = 4950, .leeway_s = 60, .issuer = .any, .audience = .any });
+    try validateClaims(parsed.claims, .{ .now_s = 6000, .leeway_s = 60, .issuer = .any, .audience = .any });
 }
 
 test "validateClaims: iat in the future (lenient by default, opt-in reject)" {
@@ -1996,16 +2118,20 @@ test "validateClaims: iat in the future (lenient by default, opt-in reject)" {
     defer parsed.deinit();
 
     // Default: future iat tolerated.
-    try validateClaims(parsed.claims, .{ .now_s = 1000 });
+    try validateClaims(parsed.claims, .{ .now_s = 1000, .issuer = .any, .audience = .any });
     // Opt-in strictness.
     try testing.expectError(error.IssuedInFuture, validateClaims(parsed.claims, .{
         .now_s = 1000,
         .reject_future_iat = true,
+        .issuer = .any,
+        .audience = .any,
     }));
     try validateClaims(parsed.claims, .{
         .now_s = 4950,
         .leeway_s = 60,
         .reject_future_iat = true,
+        .issuer = .any,
+        .audience = .any,
     });
 }
 
@@ -2019,10 +2145,11 @@ test "validateClaims: issuer match, mismatch, and missing iss" {
     var parsed = try parse(testing.allocator, token);
     defer parsed.deinit();
 
-    try validateClaims(parsed.claims, .{ .now_s = 1000, .issuer = "https://issuer.example" });
+    try validateClaims(parsed.claims, .{ .now_s = 1000, .issuer = .{ .required = "https://issuer.example" }, .audience = .any });
     try testing.expectError(error.IssuerMismatch, validateClaims(parsed.claims, .{
         .now_s = 1000,
-        .issuer = "https://evil.example",
+        .issuer = .{ .required = "https://evil.example" },
+        .audience = .any,
     }));
 
     // Token with no iss at all: requiring an issuer must fail.
@@ -2036,7 +2163,8 @@ test "validateClaims: issuer match, mismatch, and missing iss" {
     defer parsed2.deinit();
     try testing.expectError(error.IssuerMismatch, validateClaims(parsed2.claims, .{
         .now_s = 1000,
-        .issuer = "https://issuer.example",
+        .issuer = .{ .required = "https://issuer.example" },
+        .audience = .any,
     }));
 }
 
@@ -2049,10 +2177,11 @@ test "validateClaims: audience string + array membership, mismatch, missing aud"
     );
     var p1 = try parse(testing.allocator, single);
     defer p1.deinit();
-    try validateClaims(p1.claims, .{ .now_s = 1000, .audience = "api://svc" });
+    try validateClaims(p1.claims, .{ .now_s = 1000, .issuer = .any, .audience = .{ .required = "api://svc" } });
     try testing.expectError(error.AudienceMismatch, validateClaims(p1.claims, .{
         .now_s = 1000,
-        .audience = "api://other",
+        .issuer = .any,
+        .audience = .{ .required = "api://other" },
     }));
 
     var buf2: [512]u8 = undefined;
@@ -2063,10 +2192,11 @@ test "validateClaims: audience string + array membership, mismatch, missing aud"
     );
     var p2 = try parse(testing.allocator, many);
     defer p2.deinit();
-    try validateClaims(p2.claims, .{ .now_s = 1000, .audience = "api://b" });
+    try validateClaims(p2.claims, .{ .now_s = 1000, .issuer = .any, .audience = .{ .required = "api://b" } });
     try testing.expectError(error.AudienceMismatch, validateClaims(p2.claims, .{
         .now_s = 1000,
-        .audience = "api://c",
+        .issuer = .any,
+        .audience = .{ .required = "api://c" },
     }));
 
     var buf3: [512]u8 = undefined;
@@ -2079,8 +2209,64 @@ test "validateClaims: audience string + array membership, mismatch, missing aud"
     defer p3.deinit();
     try testing.expectError(error.AudienceMismatch, validateClaims(p3.claims, .{
         .now_s = 1000,
-        .audience = "api://svc",
+        .issuer = .any,
+        .audience = .{ .required = "api://svc" },
     }));
+}
+
+test "SECURITY: mandatory audience — a token for a sibling service is rejected by default (RFC 8725 §3.9)" {
+    // The confused-deputy scenario: the SAME issuer mints a token whose `aud`
+    // names a DIFFERENT service ("api://billing"). Our resource server is
+    // "api://orders". With the mandatory-audience API there is no way to reach
+    // the validator WITHOUT a choice, so the cross-service token cannot slip
+    // through by omission.
+    const gpa = testing.allocator;
+    const secret = "mandatory-audience-secret";
+    var buf: [512]u8 = undefined;
+    const si = signingInputInto(&buf,
+        \\{"alg":"HS256"}
+    ,
+        \\{"iss":"https://issuer.example","aud":"api://billing","exp":2000}
+    );
+    var mac: [32]u8 = undefined;
+    hmac_sha2.HmacSha256.create(&mac, si, secret);
+    const token = finishToken(&buf, si.len, &mac);
+
+    // (1) Safe default: a validator that pins ITS OWN audience rejects the
+    //     sibling-service token — the whole point of the hardening.
+    try testing.expectError(error.AudienceMismatch, parseAndVerify(gpa, token, .{ .hmac = secret }, .{
+        .now_s = 1000,
+        .issuer = .{ .required = "https://issuer.example" },
+        .audience = .{ .required = "api://orders" },
+    }));
+
+    // (2) Accepted only when the audience actually matches …
+    var ok = try parseAndVerify(gpa, token, .{ .hmac = secret }, .{
+        .now_s = 1000,
+        .issuer = .{ .required = "https://issuer.example" },
+        .audience = .{ .required = "api://billing" },
+    });
+    ok.deinit();
+
+    // (3) … or when the operator CONSCIOUSLY opts out with `.any` (the only
+    //     way to skip the check — a greppable, deliberate decision).
+    var skipped = try parseAndVerify(gpa, token, .{ .hmac = secret }, .{
+        .now_s = 1000,
+        .issuer = .{ .required = "https://issuer.example" },
+        .audience = .any,
+    });
+    skipped.deinit();
+
+    // Pure claim-level check mirrors the same three outcomes.
+    var parsed = try parse(gpa, token);
+    defer parsed.deinit();
+    try testing.expectError(error.AudienceMismatch, validateClaims(parsed.claims, .{
+        .now_s = 1000,
+        .issuer = .any,
+        .audience = .{ .required = "api://orders" },
+    }));
+    try validateClaims(parsed.claims, .{ .now_s = 1000, .issuer = .any, .audience = .{ .required = "api://billing" } });
+    try validateClaims(parsed.claims, .{ .now_s = 1000, .issuer = .any, .audience = .any });
 }
 
 test "validateClaims: missing exp vs require_exp" {
@@ -2093,18 +2279,20 @@ test "validateClaims: missing exp vs require_exp" {
     var parsed = try parse(testing.allocator, token);
     defer parsed.deinit();
 
-    try testing.expectError(error.MissingExp, validateClaims(parsed.claims, .{ .now_s = 1000 }));
-    try validateClaims(parsed.claims, .{ .now_s = 1000, .require_exp = false });
+    try testing.expectError(error.MissingExp, validateClaims(parsed.claims, .{ .now_s = 1000, .issuer = .any, .audience = .any }));
+    try validateClaims(parsed.claims, .{ .now_s = 1000, .require_exp = false, .issuer = .any, .audience = .any });
 }
 
 test "validateClaims: RFC 7519 example token against its own exp" {
     var parsed = try parse(testing.allocator, rfc7519_example_token);
     defer parsed.deinit();
     // Just before exp: fine (with issuer pinned).
-    try validateClaims(parsed.claims, .{ .now_s = 1300819380 - 100, .issuer = "joe" });
+    try validateClaims(parsed.claims, .{ .now_s = 1300819380 - 100, .issuer = .{ .required = "joe" }, .audience = .any });
     // Past exp + leeway: expired.
     try testing.expectError(error.Expired, validateClaims(parsed.claims, .{
         .now_s = 1300819380 + 61,
+        .issuer = .any,
+        .audience = .any,
     }));
 }
 
@@ -2118,7 +2306,7 @@ test "validateClaims: saturating arithmetic at the i64 extremes" {
     var parsed = try parse(testing.allocator, token);
     defer parsed.deinit();
     // exp +| leeway and nbf -| leeway must not overflow.
-    try validateClaims(parsed.claims, .{ .now_s = 0, .leeway_s = 60 });
+    try validateClaims(parsed.claims, .{ .now_s = 0, .leeway_s = 60, .issuer = .any, .audience = .any });
 }
 
 test "malformed: segment count, empty segments" {
@@ -2653,21 +2841,24 @@ test "parseAndVerify: end-to-end happy path and each failure stage" {
     hmac_sha2.HmacSha256.create(&mac, si, secret);
     const token = finishToken(&buf, si.len, &mac);
 
-    // Good token + key + claims → the one call succeeds.
+    // Good token + key + claims → the one call succeeds (issuer + audience
+    // pinned, proving both are enforced end-to-end).
     var verified = try parseAndVerify(gpa, token, .{ .hmac = secret }, .{
         .now_s = 1000,
-        .issuer = "https://issuer.example",
-        .audience = "api://svc",
+        .issuer = .{ .required = "https://issuer.example" },
+        .audience = .{ .required = "api://svc" },
     });
     defer verified.deinit();
     try testing.expectEqualStrings("read write", verified.claims.claimStr("scope").?);
 
     // Bad signature → BadSignature (and no leak — testing.allocator checks).
+    // These failure-stage checks fail before/independent of iss/aud, so both
+    // policies opt out with `.any`.
     try testing.expectError(error.BadSignature, parseAndVerify(
         gpa,
         token,
         .{ .hmac = "wrong" },
-        .{ .now_s = 1000 },
+        .{ .now_s = 1000, .issuer = .any, .audience = .any },
     ));
     // Wrong key type → AlgKeyMismatch.
     const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{3} ** 32);
@@ -2675,21 +2866,21 @@ test "parseAndVerify: end-to-end happy path and each failure stage" {
         gpa,
         token,
         .{ .ed25519 = kp.public_key },
-        .{ .now_s = 1000 },
+        .{ .now_s = 1000, .issuer = .any, .audience = .any },
     ));
     // Valid signature but expired claims → Expired.
     try testing.expectError(error.Expired, parseAndVerify(
         gpa,
         token,
         .{ .hmac = secret },
-        .{ .now_s = 5000 },
+        .{ .now_s = 5000, .issuer = .any, .audience = .any },
     ));
     // Malformed token → the parse error surfaces unchanged.
     try testing.expectError(error.MalformedToken, parseAndVerify(
         gpa,
         "not-a-token",
         .{ .hmac = secret },
-        .{ .now_s = 1000 },
+        .{ .now_s = 1000, .issuer = .any, .audience = .any },
     ));
 }
 
@@ -3013,20 +3204,20 @@ test "parseAndVerify: RS256 end-to-end" {
 
     var verified = try parseAndVerify(gpa, token, key, .{
         .now_s = 1000,
-        .issuer = "https://issuer.example",
-        .audience = "api://svc",
+        .issuer = .{ .required = "https://issuer.example" },
+        .audience = .{ .required = "api://svc" },
     });
     defer verified.deinit();
     try testing.expectEqualStrings("read", verified.claims.claimStr("scope").?);
 
     // Valid signature but expired → Expired (and no leak on the way out).
-    try testing.expectError(error.Expired, parseAndVerify(gpa, token, key, .{ .now_s = 5000 }));
+    try testing.expectError(error.Expired, parseAndVerify(gpa, token, key, .{ .now_s = 5000, .issuer = .any, .audience = .any }));
     // Wrong key type → AlgKeyMismatch.
     try testing.expectError(error.AlgKeyMismatch, parseAndVerify(
         gpa,
         token,
         .{ .hmac = "secret" },
-        .{ .now_s = 1000 },
+        .{ .now_s = 1000, .issuer = .any, .audience = .any },
     ));
     // RFC KAT through the one-call API (its exp is long past → Expired
     // proves the signature check passed first and claims ran).
@@ -3034,7 +3225,7 @@ test "parseAndVerify: RS256 end-to-end" {
         gpa,
         rfc7515_a2_token,
         key,
-        .{ .now_s = 1600000000 },
+        .{ .now_s = 1600000000, .issuer = .any, .audience = .any },
     ));
 }
 
@@ -3529,8 +3720,8 @@ test "parseVerifyJwks: end-to-end against a multi-key set" {
 
     var verified = try parseVerifyJwks(gpa, token, jwks, .{
         .now_s = 1000,
-        .issuer = "https://issuer.example",
-        .audience = "api://svc",
+        .issuer = .{ .required = "https://issuer.example" },
+        .audience = .{ .required = "api://svc" },
     });
     defer verified.deinit();
     try testing.expectEqualStrings("read", verified.claims.claimStr("scope").?);
@@ -3538,6 +3729,8 @@ test "parseVerifyJwks: end-to-end against a multi-key set" {
     // Valid signature but expired → Expired (and nothing leaks on the way out).
     try testing.expectError(error.Expired, parseVerifyJwks(gpa, token, jwks, .{
         .now_s = 5000,
+        .issuer = .any,
+        .audience = .any,
     }));
 
     // Token bearing a kid that was rotated away → NoMatchingKey.
@@ -3551,6 +3744,8 @@ test "parseVerifyJwks: end-to-end against a multi-key set" {
     const token2 = finishToken(&buf2, si2.len, &sig2);
     try testing.expectError(error.NoMatchingKey, parseVerifyJwks(gpa, token2, jwks, .{
         .now_s = 1000,
+        .issuer = .any,
+        .audience = .any,
     }));
 
     // Right kid, corrupted signature → BadSignature.
@@ -3565,11 +3760,15 @@ test "parseVerifyJwks: end-to-end against a multi-key set" {
     const token3 = finishToken(&buf3, si3.len, &bad_sig);
     try testing.expectError(error.BadSignature, parseVerifyJwks(gpa, token3, jwks, .{
         .now_s = 1000,
+        .issuer = .any,
+        .audience = .any,
     }));
 
     // Malformed token → the parse error surfaces unchanged.
     try testing.expectError(error.MalformedToken, parseVerifyJwks(gpa, "nope", jwks, .{
         .now_s = 1000,
+        .issuer = .any,
+        .audience = .any,
     }));
 }
 
@@ -3744,15 +3943,31 @@ test "discover: non-200, garbage JSON, missing/mistyped members → typed errors
     try testing.expectError(error.DiscoveryFailed, discover(gpa, dead.fetcher(), "///"));
 }
 
-test "fetchJwks: 200 parses via parseJwks; non-200 and garbage → typed errors" {
+test "fetchJwks: 200 parses (network source); oct keys refused; non-200 and garbage → typed errors" {
     const gpa = testing.allocator;
-    const set = "{\"keys\":[{\"kty\":\"oct\",\"kid\":\"hs\",\"k\":\"c2VjcmV0\"}]}";
+    // A fetched set with an asymmetric key (kept) AND a symmetric oct key. The
+    // oct key is REFUSED on the network path (a public JWKS is attacker-
+    // readable, so an oct entry would let anyone forge HS* tokens) — it lands
+    // in `skipped` as `oct_from_network`, only the RSA key survives.
+    const set = "{\"keys\":[" ++
+        "{\"kty\":\"RSA\",\"kid\":\"rs\",\"n\":\"" ++ rfc7515_a2_n_b64 ++ "\",\"e\":\"AQAB\"}," ++
+        "{\"kty\":\"oct\",\"kid\":\"hs\",\"k\":\"c2VjcmV0\"}" ++
+        "]}";
 
     var stub: ScriptFetcher = .{ .script = &.{.{ .url = test_jwks_url, .body = set }} };
     var jwks = try fetchJwks(gpa, stub.fetcher(), test_jwks_url);
     defer jwks.deinit();
     try testing.expectEqual(@as(usize, 1), jwks.keys.len);
-    try testing.expectEqualStrings("hs", jwks.keys[0].kid.?);
+    try testing.expectEqualStrings("rs", jwks.keys[0].kid.?);
+    try testing.expectEqual(@as(usize, 1), jwks.skipped.len);
+    try testing.expectEqual(JwkSkipReason.oct_from_network, jwks.skipped[0].reason);
+
+    // The SAME oct-only document is fine when configured LOCALLY (trusted).
+    const oct_only = "{\"keys\":[{\"kty\":\"oct\",\"kid\":\"hs\",\"k\":\"c2VjcmV0\"}]}";
+    var local = try parseJwks(gpa, oct_only);
+    defer local.deinit();
+    try testing.expectEqual(@as(usize, 1), local.keys.len);
+    try testing.expectEqualStrings("hs", local.keys[0].kid.?);
 
     var stub2: ScriptFetcher = .{ .script = &.{
         .{ .url = test_jwks_url, .status = 503, .body = set },
@@ -3785,41 +4000,53 @@ test "Provider by jwks_uri: RFC 7515 A.2 RS256 token through the turnkey call" {
     });
     defer provider.deinit();
 
-    // Lazy first fetch + verify (now before the token's 2011 exp).
-    var verified = try provider.verify(gpa, rfc7515_a2_token, 1300819000, .{});
+    // A jwks_uri provider has NO configured issuer, so the default
+    // `.issuer = .provider` policy has nothing to enforce and FAILS CLOSED
+    // rather than silently skipping issuer validation (the old foot-gun).
+    try testing.expectError(
+        error.IssuerNotConfigured,
+        provider.verify(gpa, rfc7515_a2_token, 1300819000, .{ .audience = .any }),
+    );
+
+    // Lazy first fetch + verify (now before the token's 2011 exp). The token
+    // carries iss "joe"/no aud, so this consciously opts out of both.
+    var verified = try provider.verify(gpa, rfc7515_a2_token, 1300819000, .{ .issuer = .any, .audience = .any });
     defer verified.deinit();
     try testing.expectEqualStrings("joe", verified.claims.iss.?);
     try testing.expectEqual(@as(usize, 1), stub.calls);
 
     // Second verify inside the TTL: served from cache, no fetch.
-    var again = try provider.verify(gpa, rfc7515_a2_token, 1300819100, .{});
+    var again = try provider.verify(gpa, rfc7515_a2_token, 1300819100, .{ .issuer = .any, .audience = .any });
     again.deinit();
     try testing.expectEqual(@as(usize, 1), stub.calls);
 
     // Signature fine but claims stale → Expired (still no fetch).
     try testing.expectError(
         error.Expired,
-        provider.verify(gpa, rfc7515_a2_token, 1300819380 + 61, .{}),
+        provider.verify(gpa, rfc7515_a2_token, 1300819380 + 61, .{ .issuer = .any, .audience = .any }),
     );
     try testing.expectEqual(@as(usize, 1), stub.calls);
 
-    // A jwks_uri provider has no discovered issuer — but an explicit
-    // ClaimOptions.issuer is enforced.
+    // An explicit ClaimOptions.issuer override is still enforced.
     try testing.expectError(
         error.IssuerMismatch,
-        provider.verify(gpa, rfc7515_a2_token, 1300819000, .{ .issuer = "https://other" }),
+        provider.verify(gpa, rfc7515_a2_token, 1300819000, .{ .issuer = .{ .required = "https://other" }, .audience = .any }),
     );
 }
 
 test "Provider by issuer: discovery + injected issuer end-to-end" {
     const gpa = testing.allocator;
     const enc = std.base64.url_safe_no_pad.Encoder;
-    const secret = "provider-discovery-e2e-secret";
-    var k_b64: [64]u8 = undefined;
+    // Asymmetric (Ed25519) key: a fetched JWKS may not carry symmetric `oct`
+    // keys (they would be forgeable), so the issuer publishes a public key and
+    // signs with EdDSA.
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x51} ** 32);
+    const pub_bytes = kp.public_key.toBytes();
+    var x_b64: [43]u8 = undefined;
     var set_buf: [256]u8 = undefined;
     const set = try std.fmt.bufPrint(&set_buf,
-        \\{{"keys":[{{"kty":"oct","kid":"hs","k":"{s}"}}]}}
-    , .{enc.encode(&k_b64, secret)});
+        \\{{"keys":[{{"kty":"OKP","kid":"ed","crv":"Ed25519","x":"{s}"}}]}}
+    , .{enc.encode(&x_b64, &pub_bytes)});
 
     var stub: ScriptFetcher = .{ .script = &.{
         .{ .url = test_wellknown_url, .body = test_discovery_json },
@@ -3828,18 +4055,17 @@ test "Provider by issuer: discovery + injected issuer end-to-end" {
     var provider = Provider.init(gpa, stub.fetcher(), .{ .issuer = "https://issuer.example" });
     defer provider.deinit();
 
-    // Token minted by "the issuer": right iss, right key, kid "hs".
+    // Token minted by "the issuer": right iss, right key, kid "ed".
     var buf: [512]u8 = undefined;
     const si = signingInputInto(&buf,
-        \\{"alg":"HS256","kid":"hs"}
+        \\{"alg":"EdDSA","kid":"ed"}
     ,
         \\{"iss":"https://issuer.example","aud":"api://svc","exp":2000,"scope":"read"}
     );
-    var mac: [32]u8 = undefined;
-    hmac_sha2.HmacSha256.create(&mac, si, secret);
-    const token = finishToken(&buf, si.len, &mac);
+    const sig = (try kp.sign(si, null)).toBytes();
+    const token = finishToken(&buf, si.len, &sig);
 
-    var verified = try provider.verify(gpa, token, 1000, .{ .audience = "api://svc" });
+    var verified = try provider.verify(gpa, token, 1000, .{ .audience = .{ .required = "api://svc" } });
     defer verified.deinit();
     try testing.expectEqualStrings("read", verified.claims.claimStr("scope").?);
     // Exactly one discovery + one JWKS fetch; metadata is cached.
@@ -3847,22 +4073,22 @@ test "Provider by issuer: discovery + injected issuer end-to-end" {
     try testing.expectEqualStrings(test_jwks_url, provider.metadata.?.jwks_uri);
 
     // A validly signed token from the WRONG issuer: the discovered issuer is
-    // injected as the expected `iss`, so it fails — no opt-in needed.
+    // injected as the expected `iss` (the default `.provider` policy), so it
+    // fails — no opt-in needed.
     var buf2: [512]u8 = undefined;
     const si2 = signingInputInto(&buf2,
-        \\{"alg":"HS256","kid":"hs"}
+        \\{"alg":"EdDSA","kid":"ed"}
     ,
         \\{"iss":"https://evil.example","aud":"api://svc","exp":2000}
     );
-    var mac2: [32]u8 = undefined;
-    hmac_sha2.HmacSha256.create(&mac2, si2, secret);
-    const evil = finishToken(&buf2, si2.len, &mac2);
-    try testing.expectError(error.IssuerMismatch, provider.verify(gpa, evil, 1000, .{}));
+    const sig2 = (try kp.sign(si2, null)).toBytes();
+    const evil = finishToken(&buf2, si2.len, &sig2);
+    try testing.expectError(error.IssuerMismatch, provider.verify(gpa, evil, 1000, .{ .audience = .{ .required = "api://svc" } }));
 
     // Audience policy still applies on top.
     try testing.expectError(
         error.AudienceMismatch,
-        provider.verify(gpa, token, 1000, .{ .audience = "api://other" }),
+        provider.verify(gpa, token, 1000, .{ .audience = .{ .required = "api://other" } }),
     );
     // All of that ran from the cache.
     try testing.expectEqual(@as(usize, 2), stub.calls);
@@ -3871,19 +4097,22 @@ test "Provider by issuer: discovery + injected issuer end-to-end" {
 test "Provider: key rotation refreshes once, rate limit stops a bogus-kid flood, TTL re-fetches" {
     const gpa = testing.allocator;
     const enc = std.base64.url_safe_no_pad.Encoder;
-    const secret_old = "rotation-secret-old";
-    const secret_new = "rotation-secret-new";
-    var old_b64: [64]u8 = undefined;
-    var new_b64: [64]u8 = undefined;
+    // Asymmetric (Ed25519) keys — a fetched JWKS may not carry `oct` secrets.
+    const kp_old = try Ed25519.KeyPair.generateDeterministic([_]u8{0x61} ** 32);
+    const kp_new = try Ed25519.KeyPair.generateDeterministic([_]u8{0x62} ** 32);
+    const pub_old = kp_old.public_key.toBytes();
+    const pub_new = kp_new.public_key.toBytes();
+    var old_b64: [43]u8 = undefined;
+    var new_b64: [43]u8 = undefined;
     var v1_buf: [256]u8 = undefined;
     var v2_buf: [256]u8 = undefined;
     // v1: only kid "old". v2 (after rotation): only kid "new".
     const jwks_v1 = try std.fmt.bufPrint(&v1_buf,
-        \\{{"keys":[{{"kty":"oct","kid":"old","k":"{s}"}}]}}
-    , .{enc.encode(&old_b64, secret_old)});
+        \\{{"keys":[{{"kty":"OKP","kid":"old","crv":"Ed25519","x":"{s}"}}]}}
+    , .{enc.encode(&old_b64, &pub_old)});
     const jwks_v2 = try std.fmt.bufPrint(&v2_buf,
-        \\{{"keys":[{{"kty":"oct","kid":"new","k":"{s}"}}]}}
-    , .{enc.encode(&new_b64, secret_new)});
+        \\{{"keys":[{{"kty":"OKP","kid":"new","crv":"Ed25519","x":"{s}"}}]}}
+    , .{enc.encode(&new_b64, &pub_new)});
 
     var stub: ScriptFetcher = .{
         .script = &.{
@@ -3901,21 +4130,22 @@ test "Provider: key rotation refreshes once, rate limit stops a bogus-kid flood,
     defer provider.deinit();
 
     // Each token gets its own buffer — they are slices into it and must
-    // all stay alive for the whole scenario.
+    // all stay alive for the whole scenario. These tokens carry no iss/aud, so
+    // every verify consciously opts out of both (jwks_uri-only provider).
+    const opts: Provider.ClaimOptions = .{ .issuer = .any, .audience = .any };
     var buf_old: [512]u8 = undefined;
     var buf_new: [512]u8 = undefined;
     var buf_ghost: [512]u8 = undefined;
-    var mac: [32]u8 = undefined;
 
     // t=1000: token signed with the OLD key verifies off the first load.
     const si_old = signingInputInto(&buf_old,
-        \\{"alg":"HS256","kid":"old"}
+        \\{"alg":"EdDSA","kid":"old"}
     ,
         \\{"exp":90000}
     );
-    hmac_sha2.HmacSha256.create(&mac, si_old, secret_old);
-    const token_old = finishToken(&buf_old, si_old.len, &mac);
-    var v_old = try provider.verify(gpa, token_old, 1000, .{});
+    const sig_old = (try kp_old.sign(si_old, null)).toBytes();
+    const token_old = finishToken(&buf_old, si_old.len, &sig_old);
+    var v_old = try provider.verify(gpa, token_old, 1000, opts);
     v_old.deinit();
     try testing.expectEqual(@as(usize, 1), stub.calls);
 
@@ -3923,41 +4153,41 @@ test "Provider: key rotation refreshes once, rate limit stops a bogus-kid flood,
     // in the cached set, the rate-limit window (30s since t=1000) has
     // passed, so the provider refreshes ONCE and the token verifies.
     const si_new = signingInputInto(&buf_new,
-        \\{"alg":"HS256","kid":"new"}
+        \\{"alg":"EdDSA","kid":"new"}
     ,
         \\{"exp":90000}
     );
-    hmac_sha2.HmacSha256.create(&mac, si_new, secret_new);
-    const token_new = finishToken(&buf_new, si_new.len, &mac);
-    var v_new = try provider.verify(gpa, token_new, 1040, .{});
+    const sig_new = (try kp_new.sign(si_new, null)).toBytes();
+    const token_new = finishToken(&buf_new, si_new.len, &sig_new);
+    var v_new = try provider.verify(gpa, token_new, 1040, opts);
     v_new.deinit();
     try testing.expectEqual(@as(usize, 2), stub.calls);
 
     // t=1050 and t=1055: bogus-kid tokens inside the min-refresh window.
     // NoMatchingKey — and the fetcher is NOT called again (no fetch storm).
     const si_ghost = signingInputInto(&buf_ghost,
-        \\{"alg":"HS256","kid":"ghost"}
+        \\{"alg":"EdDSA","kid":"ghost"}
     ,
         \\{"exp":90000}
     );
-    hmac_sha2.HmacSha256.create(&mac, si_ghost, secret_new);
-    const token_ghost = finishToken(&buf_ghost, si_ghost.len, &mac);
-    try testing.expectError(error.NoMatchingKey, provider.verify(gpa, token_ghost, 1050, .{}));
-    try testing.expectError(error.NoMatchingKey, provider.verify(gpa, token_ghost, 1055, .{}));
+    const sig_ghost = (try kp_new.sign(si_ghost, null)).toBytes();
+    const token_ghost = finishToken(&buf_ghost, si_ghost.len, &sig_ghost);
+    try testing.expectError(error.NoMatchingKey, provider.verify(gpa, token_ghost, 1050, opts));
+    try testing.expectError(error.NoMatchingKey, provider.verify(gpa, token_ghost, 1055, opts));
     try testing.expectEqual(@as(usize, 2), stub.calls);
 
     // t=1080: the window has passed — the bogus kid earns one (single,
     // rate-limited) refresh, which still doesn't know it → NoMatchingKey.
-    try testing.expectError(error.NoMatchingKey, provider.verify(gpa, token_ghost, 1080, .{}));
+    try testing.expectError(error.NoMatchingKey, provider.verify(gpa, token_ghost, 1080, opts));
     try testing.expectEqual(@as(usize, 3), stub.calls);
 
     // The rotated-in set stays live: the new-kid token verifies from cache.
-    var v_new2 = try provider.verify(gpa, token_new, 1085, .{});
+    var v_new2 = try provider.verify(gpa, token_new, 1085, opts);
     v_new2.deinit();
     try testing.expectEqual(@as(usize, 3), stub.calls);
 
     // t=1400: past fetched_at(1080)+ttl(300) — the next verify re-fetches.
-    var v_new3 = try provider.verify(gpa, token_new, 1400, .{});
+    var v_new3 = try provider.verify(gpa, token_new, 1400, opts);
     v_new3.deinit();
     try testing.expectEqual(@as(usize, 4), stub.calls);
     try testing.expectEqual(stub.script.len, stub.next); // script fully consumed
@@ -3974,7 +4204,7 @@ test "Provider: refresh failures are typed, old keys survive a failed refresh" {
     defer p1.deinit();
     try testing.expectError(
         error.DiscoveryFailed,
-        p1.verify(gpa, rfc7515_a2_token, 1000, .{}),
+        p1.verify(gpa, rfc7515_a2_token, 1000, .{ .audience = .any }),
     );
 
     // JWKS-side failure → JwksFetchFailed (here: discovery fine, JWKS 503).
@@ -3986,7 +4216,7 @@ test "Provider: refresh failures are typed, old keys survive a failed refresh" {
     defer p2.deinit();
     try testing.expectError(
         error.JwksFetchFailed,
-        p2.verify(gpa, rfc7515_a2_token, 1000, .{}),
+        p2.verify(gpa, rfc7515_a2_token, 1000, .{ .audience = .any }),
     );
 
     // Malformed JWKS body is the same typed failure — and an explicit
@@ -4004,8 +4234,9 @@ test "Provider: refresh failures are typed, old keys survive a failed refresh" {
     defer p3.deinit();
     try p3.refresh(1000);
     try testing.expectError(error.JwksFetchFailed, p3.refresh(2000));
-    // The v1 set survived the failed swap: the RFC token still verifies.
-    var verified = try p3.verify(gpa, rfc7515_a2_token, 1300819000, .{});
+    // The v1 set survived the failed swap: the RFC token still verifies
+    // (jwks_uri-only provider, so iss/aud opt out).
+    var verified = try p3.verify(gpa, rfc7515_a2_token, 1300819000, .{ .issuer = .any, .audience = .any });
     verified.deinit();
     try testing.expectEqual(@as(usize, 2), flaky.calls);
 }
@@ -4123,7 +4354,7 @@ test "ResourceServer: valid token → 200 + identity; missing/invalid/expired/in
     var fc: FixedClock = .{ .now_s = 1000 };
     var rs = try ResourceServer.init(gpa, .{
         .provider = &provider,
-        .claim_opts = .{ .issuer = "https://issuer.example", .audience = "api://svc" },
+        .claim_opts = .{ .issuer = .{ .required = "https://issuer.example" }, .audience = .{ .required = "api://svc" } },
         .required_scopes = &.{"read"},
         .clock = fc.clock(),
     });
@@ -4191,7 +4422,9 @@ test "ResourceServer: expired and insufficient-scope tokens, and the scope chall
     var fc: FixedClock = .{ .now_s = 1000 };
     var rs = try ResourceServer.init(gpa, .{
         .provider = &provider,
-        .claim_opts = .{ .audience = "api://svc" },
+        // These tokens carry no iss (jwks_uri-only provider), so issuer
+        // validation is consciously opted out; audience stays enforced.
+        .claim_opts = .{ .issuer = .any, .audience = .{ .required = "api://svc" } },
         .required_scopes = &.{"admin"},
         .clock = fc.clock(),
         .realm = "svc",
@@ -4245,6 +4478,9 @@ test "ResourceServer: protect=.mutations lets unauthenticated reads through with
     var fc: FixedClock = .{ .now_s = 1000 };
     var rs = try ResourceServer.init(gpa, .{
         .provider = &provider,
+        // claim_opts is mandatory even though reads are out of scope here and
+        // never reach the Provider; both policies opt out.
+        .claim_opts = .{ .issuer = .any, .audience = .any },
         .protect = .mutations,
         .clock = fc.clock(),
     });
@@ -4280,6 +4516,7 @@ test "ResourceServer: ScopeIter splits on single/multiple spaces; InvalidRealm r
     defer provider.deinit();
     try testing.expectError(error.InvalidRealm, ResourceServer.init(testing.allocator, .{
         .provider = &provider,
+        .claim_opts = .{ .issuer = .any, .audience = .any },
         .realm = "bad\"realm",
     }));
 }
