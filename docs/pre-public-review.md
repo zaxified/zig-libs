@@ -41,8 +41,37 @@ all 10 skips accounted for (env/netns/live-gated). No dark tests. http/coap fixe
 no regressions. icmp uses `refAllDecls` (verified pulls everything), tz's only sibling
 has zero tests — both safe.
 
-**☐ NOT STARTED — the adversarial SECURITY pass** (§ "Per-target adversarial review"
-below): the 10 crypto/parser targets under active attack, not just correctness.
+**✅ DONE — adversarial SECURITY pass** (§ "Per-target adversarial review" below). All 10
+targets reviewed under active attack; findings fixed in commits `cdc273c` (wave 1) +
+`44f7420` (wave 2). Suite after fixes: 1814/1824 pass (10 skip), Debug+ReleaseFast green.
+Highlights:
+- **CLEAN** (well-hardened, no exploitable defect): `sealedbox`/`hashdigest` (faithful
+  std.crypto wrappers), `acme` (JWS/ES256/nonce/CSR all correct), `jwt` crypto core
+  (alg-confusion / `none` / jku-x5u-smuggling / const-time / sig-correctness all closed),
+  `snmp` DES/key-IV-derivation/time-window/const-time-auth, `http` H2 DoS
+  (rapid-reset/CONTINUATION/HPACK-bomb) + smuggling + multipart/range/HPACK, `mqtt`
+  varint/topic-matcher/state-machine, `coap` option decoder, `argsafe` CharClass predicates.
+- **FIXED**: http redirect Authorization host-only strip (CVE-2018-18074 class) + Cookie
+  cross-origin leak (both HIGH); sessions same-request fixation/logout resurrection (HIGH)
+  + id-entropy floor; coap block-Assembler never-written-bytes disclosure (HIGH) + Uri-Host
+  encoding + dedup zero-guard; mqtt accept-loop inline-wedge DoS (CRIT) + resource caps +
+  pre-CONNECT timeout; snmp.usm empty-password panic; aaa-gate throttle-key amplification
+  (HIGH); argsafe CIDR leading-dash; jwt dead error-arm.
+
+**☐ OPEN — decisions / deferred (surfaced by the security pass, NOT yet actioned):**
+- **jwt insecure-defaults (DECISION):** `aud` and (for jwks_uri-only providers) `iss` are
+  NOT validated unless the operator opts in — a same-IdP token for another service is
+  accepted (RFC 8725 §3.9 confused-deputy). Decide: make audience/issuer validation
+  mandatory-or-explicit-opt-out (API change), or document loudly. Also: `oct` keys from a
+  fetched JWKS are usable for HS* (issuer-misconfig foot-gun) — consider refusing them.
+- **mqtt broker (ARCHITECTURAL, documented in mqtt/SPEC.md):** O(connections×subscriptions)
+  fan-out under the single global spinlock that accept() also takes; QoS0→QoS1 re-encode can
+  overflow a subscriber buffer and disconnect the PUBLISHER; session-takeover zombie
+  (keep_alive=0); no auth/ACL. Broker is a functional first-cut, not production-ready.
+- **sessions cross-request race (documented):** two concurrent requests sharing a cookie can
+  resurrect a logged-out session; needs store-level generation/CAS.
+- **coap (documented):** dedup-flood replay + observe-registry eviction are inherent to
+  unauthenticated UDP (need DTLS + caller auth/rate-limit hook).
 
 ## Purpose
 
