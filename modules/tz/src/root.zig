@@ -1,0 +1,249 @@
+// SPDX-License-Identifier: MIT
+//! tz — IANA time-zone offset lookup: zone name → UTC offset/DST at an instant
+//! via committed transition table + POSIX-TZ footer rule. Composes datefmt.
+//!
+//! `tz_data.zig` (built by bxp `tools/tz-gen` from a pinned IANA tzdata
+//! release) holds each zone's UTC-offset transitions from 1970 onward plus
+//! its POSIX-TZ footer rule. This module resolves a zone by name and reports
+//! the UTC offset (and DST flag) at a given instant: a binary search over the
+//! explicit transitions, then the POSIX rule for instants past the last one
+//! (~2038+).
+
+const std = @import("std");
+const datefmt = @import("datefmt");
+const tz_data = @import("tz_data.zig");
+
+pub const meta = .{
+    .status = .extract, // seed: bxp-core/src/tz.zig + tz_data.zig
+    .platform = .any,
+    .role = .util,
+    .concurrency = .reentrant,
+    .model_after = "IANA tzdata (zic) + POSIX TZ footer rule",
+    .deps = .{"datefmt"},
+};
+
+pub const Zone = tz_data.Zone;
+pub const Transition = tz_data.Transition;
+pub const zones = tz_data.zones;
+
+pub const Offset = struct {
+    /// UTC offset in seconds (east of UTC positive: CEST = +7200).
+    off: i32,
+    dst: bool,
+};
+
+/// Resolve an IANA zone id (`"Europe/Prague"`, `"America/New_York"`, `"UTC"`).
+/// Case-sensitive, matching the IANA database. Returns null for unknown names.
+pub fn find(name: []const u8) ?*const tz_data.Zone {
+    // zones are emitted sorted by name → binary search.
+    var lo: usize = 0;
+    var hi: usize = tz_data.zones.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        switch (std.mem.order(u8, tz_data.zones[mid].name, name)) {
+            .lt => lo = mid + 1,
+            .gt => hi = mid,
+            .eq => return &tz_data.zones[mid],
+        }
+    }
+    return null;
+}
+
+/// UTC offset (+ DST flag) in `zone` at the given Unix instant.
+pub fn offsetAt(zone: *const tz_data.Zone, unix: i64) Offset {
+    const tr = zone.trans;
+    if (tr.len == 0) {
+        if (posixOffset(zone.posix, unix)) |o| return o;
+        return .{ .off = zone.init_off, .dst = zone.init_dst };
+    }
+    if (unix < tr[0].ts) return .{ .off = zone.init_off, .dst = zone.init_dst };
+    if (unix >= tr[tr.len - 1].ts) {
+        // Past the last explicit transition — apply the POSIX-TZ footer rule.
+        if (posixOffset(zone.posix, unix)) |o| return o;
+        const last = tr[tr.len - 1];
+        return .{ .off = last.off, .dst = last.dst };
+    }
+    // Rightmost transition with ts <= unix (unix is within [tr[0], tr[last])).
+    var lo: usize = 0;
+    var hi: usize = tr.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (tr[mid].ts <= unix) lo = mid + 1 else hi = mid;
+    }
+    const t = tr[lo - 1];
+    return .{ .off = t.off, .dst = t.dst };
+}
+
+// ---------------------------------------------------------------------------
+// POSIX-TZ footer evaluation (RFC 9636 §3.3 / the tzfile(5) footer)
+//   stdoffset[dst[offset][,start[/time],end[/time]]]
+// Only the `Mm.w.d` rule form is evaluated; a `Jn`/`n` rule (rare) returns null
+// so the caller falls back to the last explicit transition.
+// ---------------------------------------------------------------------------
+
+const DEFAULT_DST_TIME: i32 = 2 * 3600; // 02:00 local, POSIX default
+
+fn posixOffset(posix: []const u8, unix: i64) ?Offset {
+    if (posix.len == 0) return null;
+    var i: usize = 0;
+
+    skipAbbrev(posix, &i);
+    const std_written = parseOffsetSeconds(posix, &i) orelse return null;
+    const utc_std: i32 = -std_written; // POSIX offset is add-to-local-for-UTC
+
+    if (i >= posix.len) return .{ .off = utc_std, .dst = false }; // no DST → constant
+
+    skipAbbrev(posix, &i); // dst abbrev
+    // Optional explicit DST offset; default is one hour east of standard.
+    var utc_dst: i32 = utc_std + 3600;
+    if (i < posix.len and posix[i] != ',') {
+        const dst_written = parseOffsetSeconds(posix, &i) orelse return null;
+        utc_dst = -dst_written;
+    }
+
+    if (i >= posix.len or posix[i] != ',') return null; // no rules → cannot place DST
+    i += 1;
+    const start = parseRule(posix, &i) orelse return null;
+    const start_time = parseRuleTime(posix, &i);
+    if (i >= posix.len or posix[i] != ',') return null;
+    i += 1;
+    const end = parseRule(posix, &i) orelse return null;
+    const end_time = parseRuleTime(posix, &i);
+
+    const year = datefmt.unixToParts(unix).year;
+    const start_local = ruleDateUnix(year, start, start_time) orelse return null;
+    const end_local = ruleDateUnix(year, end, end_time) orelse return null;
+    // Transition instants: start is given in standard time, end in daylight time.
+    const start_utc = start_local - utc_std;
+    const end_utc = end_local - utc_dst;
+
+    const in_dst = if (start_utc <= end_utc)
+        (unix >= start_utc and unix < end_utc) // northern hemisphere
+    else
+        (unix >= start_utc or unix < end_utc); // southern hemisphere (wraps year)
+
+    return if (in_dst) .{ .off = utc_dst, .dst = true } else .{ .off = utc_std, .dst = false };
+}
+
+const Rule = struct { month: i32, week: i32, day: i32 }; // Mm.w.d
+
+fn skipAbbrev(s: []const u8, i: *usize) void {
+    if (i.* < s.len and s[i.*] == '<') {
+        while (i.* < s.len and s[i.*] != '>') i.* += 1;
+        if (i.* < s.len) i.* += 1; // consume '>'
+    } else {
+        while (i.* < s.len and std.ascii.isAlphabetic(s[i.*])) i.* += 1;
+    }
+}
+
+fn readInt(s: []const u8, i: *usize) ?i32 {
+    const start = i.*;
+    while (i.* < s.len and s[i.*] >= '0' and s[i.*] <= '9') i.* += 1;
+    if (i.* == start) return null;
+    return std.fmt.parseInt(i32, s[start..i.*], 10) catch null;
+}
+
+/// `[+-]hh[:mm[:ss]]` → seconds (as written; POSIX west-positive sign).
+fn parseOffsetSeconds(s: []const u8, i: *usize) ?i32 {
+    var neg = false;
+    if (i.* < s.len and (s[i.*] == '+' or s[i.*] == '-')) {
+        neg = s[i.*] == '-';
+        i.* += 1;
+    }
+    const h = readInt(s, i) orelse return null;
+    var secs: i32 = h * 3600;
+    if (i.* < s.len and s[i.*] == ':') {
+        i.* += 1;
+        const m = readInt(s, i) orelse return null;
+        secs += m * 60;
+        if (i.* < s.len and s[i.*] == ':') {
+            i.* += 1;
+            const sec = readInt(s, i) orelse return null;
+            secs += sec;
+        }
+    }
+    return if (neg) -secs else secs;
+}
+
+fn parseRule(s: []const u8, i: *usize) ?Rule {
+    if (i.* >= s.len or s[i.*] != 'M') return null; // only Mm.w.d supported
+    i.* += 1;
+    const m = readInt(s, i) orelse return null;
+    if (i.* >= s.len or s[i.*] != '.') return null;
+    i.* += 1;
+    const w = readInt(s, i) orelse return null;
+    if (i.* >= s.len or s[i.*] != '.') return null;
+    i.* += 1;
+    const d = readInt(s, i) orelse return null;
+    return .{ .month = m, .week = w, .day = d };
+}
+
+/// Optional `/time` after a rule; POSIX default is 02:00:00 local.
+fn parseRuleTime(s: []const u8, i: *usize) i32 {
+    if (i.* < s.len and s[i.*] == '/') {
+        i.* += 1;
+        return parseOffsetSeconds(s, i) orelse DEFAULT_DST_TIME;
+    }
+    return DEFAULT_DST_TIME;
+}
+
+/// Local pseudo-Unix (as if the wall-clock were UTC) for an Mm.w.d rule in
+/// `year` at `time_secs` past midnight. Null if the weekday doesn't exist.
+fn ruleDateUnix(year: i32, r: Rule, time_secs: i32) ?i64 {
+    const iso_dow: i32 = if (r.day == 0) 7 else r.day; // POSIX 0=Sun → ISO 7
+    const nth: i32 = if (r.week >= 5) -1 else r.week; // week 5 = last
+    const parts = datefmt.nthWeekdayOfMonth(year, r.month, iso_dow, nth) orelse return null;
+    return datefmt.partsToUnix(parts) + time_secs;
+}
+
+// ---------------------------------------------------------------------------
+// Tests (ported verbatim from the bxp seed)
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+test "find: known + unknown zones" {
+    try testing.expect(find("Europe/Prague") != null);
+    try testing.expect(find("America/New_York") != null);
+    try testing.expect(find("UTC") != null);
+    try testing.expect(find("Not/AZone") == null);
+}
+
+test "offsetAt: Prague CET/CEST across a known transition" {
+    const z = find("Europe/Prague").?;
+    // 2024-01-15 12:00 UTC → CET (+3600, no DST)
+    try testing.expectEqual(@as(i32, 3600), offsetAt(z, 1705320000).off);
+    try testing.expect(!offsetAt(z, 1705320000).dst);
+    // 2024-07-15 12:00 UTC → CEST (+7200, DST)
+    try testing.expectEqual(@as(i32, 7200), offsetAt(z, 1721044800).off);
+    try testing.expect(offsetAt(z, 1721044800).dst);
+}
+
+test "offsetAt: New York EST/EDT" {
+    const z = find("America/New_York").?;
+    // 2024-01-15 12:00 UTC → EST (-18000)
+    try testing.expectEqual(@as(i32, -18000), offsetAt(z, 1705320000).off);
+    // 2024-07-15 12:00 UTC → EDT (-14400)
+    try testing.expectEqual(@as(i32, -14400), offsetAt(z, 1721044800).off);
+}
+
+test "offsetAt: half-hour zone (Kolkata, no DST)" {
+    const z = find("Asia/Kolkata").?;
+    try testing.expectEqual(@as(i32, 5 * 3600 + 1800), offsetAt(z, 1721044800).off);
+}
+
+test "offsetAt: POSIX footer applies far in the future (Prague 2040 summer)" {
+    const z = find("Europe/Prague").?;
+    // 2040-07-01 12:00 UTC — well past the last explicit transition → POSIX rule.
+    const summer = datefmt.partsToUnix(.{ .year = 2040, .month = 7, .day = 1, .hour = 12 });
+    try testing.expectEqual(@as(i32, 7200), offsetAt(z, summer).off);
+    try testing.expect(offsetAt(z, summer).dst);
+    // 2040-01-01 → standard CET.
+    const winter = datefmt.partsToUnix(.{ .year = 2040, .month = 1, .day = 1, .hour = 12 });
+    try testing.expectEqual(@as(i32, 3600), offsetAt(z, winter).off);
+}
+
+test "offsetAt: fixed UTC" {
+    const z = find("UTC").?;
+    try testing.expectEqual(@as(i32, 0), offsetAt(z, 1721044800).off);
+}

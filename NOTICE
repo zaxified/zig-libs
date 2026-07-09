@@ -36,6 +36,20 @@ the derived portions and is reproduced here as its terms require:
     permission. THIS SOFTWARE IS PROVIDED "AS IS" AND WITHOUT ANY EXPRESS
     OR IMPLIED WARRANTIES.
 
+## IANA Time Zone Database  (affects module: tz)
+
+The `tz` module's zone table (`modules/tz/src/tz_data.zig`) is generated from
+the IANA Time Zone Database (tzdata 2026a, https://www.iana.org/time-zones)
+by the authors' `tz-gen` tool. The tz database is in the public domain, as
+stated in its own distribution:
+
+    This file is in the public domain, so clarified as of
+    2009-05-17 by Arthur David Olson.
+
+Only the UTC-offset transition data and POSIX-TZ footer rules are extracted
+(not the tz database source code). The offset-lookup logic is the authors'
+own (`bxp-core/src/tz.zig`, MIT).
+
 ====================================================================
 2. DESIGN REFERENCES — clean-room (recorded for provenance)
 ====================================================================
