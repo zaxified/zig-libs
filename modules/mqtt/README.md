@@ -1,9 +1,9 @@
 # mqtt
 
-Pure-Zig **MQTT 3.1.1 client**: control-packet codec + client state machine.
-Pairs with `modbus` for the IoT / industrial (SCADA-sim) work: a typed,
-allocation-free wire codec plus a transport-agnostic client that is fully
-offline-testable.
+Pure-Zig **MQTT 3.1.1 client + broker**: control-packet codec, a client state
+machine and a server (broker). Pairs with `modbus` for the IoT / industrial
+(SCADA-sim) work: a typed, allocation-free wire codec plus a
+transport-agnostic client and a broker, all fully offline-testable.
 
 - **Status:** gap — no mature pure-Zig MQTT library exists.
 - **Platform:** any (codec + client are pure computation; only the optional
@@ -36,6 +36,39 @@ offline-testable.
     `publishDup` retransmits an unacked QoS > 0 publish with the DUP flag.
     Retained-session replay (buffering payloads) is deliberately the
     caller's job.
+  - **Broker** (`Broker`): the server side, and the mirror image of `Client`
+    — the broker owns the shared state (the connection set, the subscription
+    registry and the retained store) and each `Connection` is a reversed
+    per-connection state machine. Same caller-driven, socket-free seam,
+    reversed: outgoing bytes to a client go through that connection's
+    `Transport`; incoming bytes go to `Broker.feed`; `Broker.process(conn,
+    now)` decodes buffered packets, drives the connection's state machine and
+    fans PUBLISHes out to every matching subscription. `now` (ms) is passed in
+    — no hidden clock — so the whole broker is drivable from in-memory buffers
+    in tests. `broker.TcpServer` is an optional `std.Io.net` accept loop
+    (thread-per-connection, one spinlock around the shared registry); tests
+    never listen or dial.
+
+    **First-cut broker scope (3.1.1):** CONNECT/CONNACK (protocol name+level
+    validated, client-id assigned — empty → server-generated — or rejected,
+    session take-over on a duplicate client-id, `session_present` always false
+    / clean-session only, keep-alive deadline = 1.5 × the client's keep-alive
+    checked against a caller-supplied last-packet timestamp); SUBSCRIBE/SUBACK
+    and UNSUBSCRIBE/UNSUBACK over a flat verbatim-filter registry (exact-string
+    UNSUBSCRIBE, `topic.matches` per PUBLISH — correct, no trie at this scale);
+    PUBLISH fan-out at min(publisher QoS, granted QoS), one copy per connection
+    at the highest granted QoS among overlapping filters; QoS 0 fire-and-forget
+    and QoS 1 (inbound → immediate PUBACK; outbound → an id allocated in the
+    *subscriber's* id space, tracked pending until its PUBACK); a retained
+    store (empty payload clears; matching retained delivered right after a new
+    SUBACK).
+
+    **Deliberately deferred (documented, not built):** QoS 2
+    (PUBREC/PUBREL/PUBCOMP — an inbound QoS 2 PUBLISH tears the connection
+    down), persistent / offline sessions (clean-session only), DUP retransmit
+    of an unacked outbound publish, Will / LWT, MQTT 5.0, and TLS (terminate in
+    front and hand `TcpServer` plaintext, or drive the socket-free core over a
+    TLS stream).
 
 ```zig
 const mqtt = @import("mqtt");
@@ -67,7 +100,15 @@ remaining-length varint boundary values with overlong/5-byte rejection), a
 scripted fake broker drives the full QoS 1 and QoS 2 handshakes, DUP
 retransmission and dedup, keep-alive/ping timeout, packet-id wrap and pool
 exhaustion, plus a topic-match truth table and 2×1000-iteration
-garbage-byte no-panic sweeps (codec and client).
+garbage-byte no-panic sweeps (codec and client). The broker tests mirror the
+same seam reversed — a scripted fake *client* hand-encodes raw
+CONNECT/SUBSCRIBE/PUBLISH bytes against broker-side connection objects (no
+socket): connect fan-in, subscribe→SUBACK→delivery, overlapping-filter
+single-copy fan-out, retain-before-subscribe, QoS 1 PUBACK + broker-assigned
+delivery id, exact-string unsubscribe, PINGRESP, DISCONNECT, keep-alive
+teardown, session take-over, and a 1000-iteration hostile-byte no-panic sweep;
+the `TcpServer` accept loop is compile-checked but gated behind
+`error.SkipZigTest`.
 
 Provenance: clean-room from the OASIS MQTT Version 3.1.1 specification
 (open standard, royalty-free); mosquitto (EPL/EDL) and Eclipse Paho

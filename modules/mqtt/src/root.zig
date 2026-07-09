@@ -60,6 +60,18 @@ pub const Message = client_mod.Message;
 pub const ConnectionState = client_mod.ConnectionState;
 pub const max_in_flight = client_mod.max_in_flight;
 
+/// MQTT 3.1.1 broker (server): connection registry + subscription fan-out +
+/// retained store, QoS 0/1, clean session. Caller-driven and socket-free like
+/// `Client` (reversed direction); `broker.TcpServer` is an optional accept
+/// loop over `std.Io.net`. See `broker.zig` for scope + deferred features.
+pub const broker = @import("broker.zig");
+
+pub const Broker = broker.Broker;
+pub const Connection = broker.Connection;
+pub const BrokerConfig = broker.Config;
+pub const BrokerTransport = broker.Transport;
+pub const TcpServer = broker.TcpServer;
+
 // Convenience re-exports of the codec types used at the client surface.
 pub const QoS = packet.QoS;
 pub const ConnectOptions = packet.Connect;
@@ -74,4 +86,5 @@ test {
     _ = packet;
     _ = topic;
     _ = client_mod;
+    _ = broker;
 }
