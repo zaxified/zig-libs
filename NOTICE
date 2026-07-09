@@ -8,6 +8,33 @@ MIT-compatible. Where actual code was ported (not merely modeled), the
 required attribution is reproduced.
 
 ====================================================================
+0. POLICY — what requires an entry here
+====================================================================
+
+A public specification or RFC is not itself a copyrightable work (merger
+doctrine: a protocol/format it describes has essentially one correct
+expression, and facts/ideas are not protected) — implementing one, however
+closely, is not "derived from" anyone's code. Accordingly:
+
+  - A module that is pure clean-room-from-a-public-spec/RFC, with NO
+    third-party source code ported and NO third-party implementation
+    studied as a design reference, needs NO entry in this file. Its
+    RFC/spec citation lives in the module's own SPEC.md ("Verification" /
+    design section) instead — see e.g. whois (RFC 3912), rdap (RFC
+    7480-family), tar (POSIX ustar + documented GNU extensions).
+  - This file is reserved for two things: (1) REQUIRED ATTRIBUTION —
+    third-party source actually ported/translated, license terms
+    reproduced below; (2) DESIGN REFERENCES — a named third-party
+    implementation that was consulted/studied for behavior, algorithm
+    shape, or API design, even when no source was copied (recorded for
+    provenance so any future line-level reuse is caught).
+  - Exercising an installed third-party binary purely as a black-box
+    compatibility test oracle (e.g. running `tar`/`nft` and diffing
+    output against this module's own encoder/decoder) is neither of the
+    above and needs no entry — no source or design was consulted, only
+    the program's observable behavior against its own documented format.
+
+====================================================================
 1. REQUIRED ATTRIBUTION — ported code
 ====================================================================
 
@@ -60,8 +87,9 @@ The following were used as DESIGN references only: the code was reimplemented
 from public specifications (RFCs) or from the authors' own projects (bxp, axp
 = Apache-2.0, relicensed by their copyright holder to MIT here; poc-wf-analytic
 = same authors). No third-party source was copied. Listed with their upstream
-license so any future line-level reuse is attributed correctly. A provenance
-audit is pending before any public release.
+license so any future line-level reuse is attributed correctly. A full
+provenance/license audit was completed 2026-07-09 (traced through the sibling
+projects; see docs/pre-public-review.md).
 
   netaddr    — RFC 6724, RFC 5952 (specs); cross-checked vs Go net/addrselect
                (BSD-3-Clause, The Go Authors) + glibc getaddrinfo algorithm.

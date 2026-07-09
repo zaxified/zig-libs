@@ -7,11 +7,12 @@ correct on size-0 virtual files (`/proc`, `/sys`).
   `matches`) + `axp-core/src/task.zig` (`sha256FileHex`, read-to-EOF loop).
 - **Model after:** Go `crypto/sha256` streaming. Thin over
   `std.crypto.hash.sha2.Sha256` — no custom crypto.
-- **Provenance:** extracted from axp (Apache-2.0, relicensed MIT by the
-  copyright holder); the construction is the public SHA-256 standard, so no
-  NOTICE entry (own code over std).
 - **Platform:** any (file path uses `std.Io`). **Role:** util.
   **Concurrency:** one-shot fns pure; `Hasher` single-owner. **Allocation:** none.
+
+Provenance: extracted from axp (Apache-2.0, relicensed MIT by the copyright
+holder); the construction is the public SHA-256 standard, so no NOTICE
+entry (own code over std).
 
 ## API
 

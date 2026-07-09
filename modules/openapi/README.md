@@ -15,10 +15,11 @@ code. Closes the Web service / API cluster.
   generator is a pure function of an immutable (post-build) Router; the
   endpoint generates per request with no shared mutable state.
 - **Deps:** `router`, `http` (+ `std.json`).
-- **Provenance:** clean-room. Design references: FastAPI (MIT;
-  generated-spec shape + defaults), utoipa (MIT OR Apache-2.0), OpenAPI
-  Specification 3.1.0 (Apache-2.0, OpenAPI Initiative). No third-party
-  source copied. See `NOTICE`.
+
+Provenance: clean-room. Design references: FastAPI (MIT; generated-spec
+shape + defaults), utoipa (MIT OR Apache-2.0), OpenAPI Specification 3.1.0
+(Apache-2.0, OpenAPI Initiative). No third-party source copied. See
+`NOTICE`.
 
 ## Usage
 

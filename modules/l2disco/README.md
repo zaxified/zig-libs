@@ -38,10 +38,8 @@ Each protocol has golden-byte KATs (transcribed from the specs) asserting
 the parsed typed model and round-tripping build → parse, plus
 malformed-input and 1000-iteration garbage-sweep tests.
 
-## Provenance
-
-Clean-room from the specifications: IEEE 802.1AB (LLDP) and the IEEE
-802.1 / 802.3 organizationally-specific TLV definitions, the publicly
+Provenance: clean-room from the specifications: IEEE 802.1AB (LLDP) and the
+IEEE 802.1 / 802.3 organizationally-specific TLV definitions, the publicly
 documented Cisco CDP frame format (a Cisco-proprietary but publicly
 described / reverse-engineered format — behaviour reference only), RFC 826
 (ARP), and RFC 2131 / RFC 2132 (DHCP). No third-party dissector source

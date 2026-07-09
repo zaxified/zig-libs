@@ -9,12 +9,14 @@ zero globals.
 - **Model after:** Go `golang.org/x/time/rate` (token bucket: float token
   balance, lazy refill, burst cap, denials consume nothing) + nginx
   `limit_req`'s keyed-store shape.
-- **Provenance:** clean-room (token-bucket + keyed store). Design refs (`x/time/rate`, nginx `limit_req`) in [NOTICE](../../NOTICE).
 - **Platform:** any. **Role:** util. **Concurrency:** threadsafe — the
   `Limiter` is internally synchronized (a spinlock around a hash lookup +
   O(1) LRU relink; Zig 0.16 std has no io-less blocking mutex — this is the
   std `SmpAllocator` pattern). The bare `TokenBucket` is single-owner.
 - **Deps:** `router`, `http`, `netaddr` (peer-IP key formatting).
+
+Provenance: clean-room (token-bucket + keyed store). Design refs
+(`x/time/rate`, nginx `limit_req`) in [NOTICE](../../NOTICE).
 
 ## Layers
 

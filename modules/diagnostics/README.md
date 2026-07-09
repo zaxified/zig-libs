@@ -9,11 +9,12 @@ did-you-mean suggestion.
 - **Status:** `extract` — from the authors' bxp-core config/json5/expr
   validation pass.
 - **Model after:** LSP `Diagnostic` / rustc diagnostics.
-- **Provenance:** extracted from `bxp-core/src/diagnostics.zig` (user's own
-  code, MIT) — no third-party source copied (see [NOTICE](../../NOTICE)).
 - **Platform:** any. **Role:** util. **Concurrency:** reentrant (no shared
   state — safe if not shared). **Allocation:** owned by the caller-supplied
   allocator; no internal ownership beyond the `items` list.
+
+Provenance: extracted from `bxp-core/src/diagnostics.zig` (user's own code,
+MIT) — no third-party source copied (see [NOTICE](../../NOTICE)).
 
 ## API
 

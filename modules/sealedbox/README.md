@@ -7,11 +7,11 @@ message); the recipient cannot identify the sender.
 - **Status:** `extract` — from axp `axp-core/src/sealed.zig` (enrollment path).
 - **Model after:** libsodium `crypto_box_seal` / Go `nacl/box`. Thin, faithful
   wrapper over `std.crypto.nacl.SealedBox` — **no custom crypto**.
-- **Provenance:** extracted from axp (Apache-2.0, relicensed MIT by the
-  copyright holder); the construction is the public NaCl standard, so no NOTICE
-  entry.
 - **Platform:** any. **Role:** util. **Concurrency:** reentrant.
   **Allocation:** none in the buffer API; `*Alloc` variants allocate the result.
+
+Provenance: extracted from axp (Apache-2.0, relicensed MIT by the copyright
+holder); the construction is the public NaCl standard, so no NOTICE entry.
 
 ## API
 

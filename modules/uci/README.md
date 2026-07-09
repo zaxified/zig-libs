@@ -6,15 +6,15 @@ Configuration Interface) file format — `config` / `option` / `list`.
 - **Status:** `gap` — no maintained pure-Zig UCI codec exists; this retires
   shelling out to the `uci` binary (axp).
 - **Model after:** OpenWRT UCI file format / libuci.
-- **Provenance:** clean-room from the documented OpenWRT UCI file format;
-  libuci (LGPL-2.1) referenced for the format only, no source consulted or
-  copied.
 - **Why:** axp manages OpenWRT-style device config; reading and writing UCI
   files natively removes an exec dependency and gives typed access + errors.
 - **Platform:** any (pure text codec, no I/O).
   **Role:** codec. **Concurrency:** reentrant (no shared state).
   **Allocation:** model memory lives in an internal arena — one
   `Package.deinit(gpa)` frees everything.
+
+Provenance: clean-room from the documented OpenWRT UCI file format; libuci
+(LGPL-2.1) referenced for the format only, no source consulted or copied.
 
 ## API
 

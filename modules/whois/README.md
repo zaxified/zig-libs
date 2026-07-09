@@ -7,10 +7,6 @@ chasing**, and a tiny `key: value` field extractor.
   in the Zig ecosystem.
 - **Model after:** RFC 3912 whois; the IANA/registry referral chain
   (`whois.iana.org` `refer:` bootstrap → registry → registrar).
-- **Provenance:** clean-room from RFC 3912 plus the documented IANA/registry
-  referral line conventions (IANA `refer:`, ARIN `ReferralServer:`, Verisign
-  `Registrar WHOIS Server:`). No third-party whois implementation consulted
-  or copied.
 - **Why:** RFC 3912 itself is one page; the real work is knowing *which*
   server to ask. `lookup` starts at the IANA bootstrap and follows referrals
   — depth-capped, cycle-guarded, byte-capped — to the terminal response.
@@ -20,6 +16,11 @@ chasing**, and a tiny `key: value` field extractor.
   `TcpTransport` uses `std.Io.net`). **Role:** client.
   **Concurrency:** reentrant (no shared state).
   **Allocation:** none — fixed buffers throughout.
+
+Provenance: clean-room from RFC 3912 plus the documented IANA/registry
+referral line conventions (IANA `refer:`, ARIN `ReferralServer:`, Verisign
+`Registrar WHOIS Server:`). No third-party whois implementation consulted
+or copied.
 
 ## API
 

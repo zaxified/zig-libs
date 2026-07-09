@@ -10,11 +10,6 @@ Events line-accumulator (`sse_parse`).
 - **Model after:** the Anthropic Messages API wire contract (request/response
   JSON shapes, SSE event sequence) and the WHATWG "server-sent events"
   grammar for `sse_parse`.
-- **Provenance:** clean-room implementation from the public Anthropic
-  Messages API documentation (request/response JSON shapes, streaming
-  event sequence, tool-use shape) and the WHATWG HTML Living Standard
-  §9.2 "server-sent events" (`text/event-stream` parsing grammar). No
-  third-party client library or SDK code copied.
 - **Why:** a native, dependency-free way to call Claude from other
   zig-libs modules/consumers without shelling `curl` or vendoring a
   generated SDK. `http.Client`'s h1 stack already does real HTTPS via
@@ -24,6 +19,12 @@ Events line-accumulator (`sse_parse`).
 - **Platform:** any. **Role:** client. **Concurrency:** single-owner
   (like `http.Client` itself — one task drives a `Client` and its
   in-flight `EventIterator`s). **Deps:** `http`.
+
+Provenance: clean-room implementation from the public Anthropic Messages
+API documentation (request/response JSON shapes, streaming event sequence,
+tool-use shape) and the WHATWG HTML Living Standard §9.2 "server-sent
+events" (`text/event-stream` parsing grammar). No third-party client
+library or SDK code copied.
 
 ## API
 

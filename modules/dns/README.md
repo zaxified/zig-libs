@@ -9,10 +9,14 @@ DNS resolver: RFC 1035 message codec + UDP/TCP/DoH transports, forward
   PTR, no server/transport control, no DoH).
 - **Model after:** Go `net` dnsclient + `miekg/dns` (message codec) / c-ares;
   RFC 1035 (wire format), RFC 8484 (DoH).
-- **Provenance:** the /etc/hosts + UDP-PTR core is extracted from zig-fping `src/rdns.zig` (fping-derived — see the fping attribution in [NOTICE](../../NOTICE)); the general codec / TCP / EDNS(0) / DoH are clean-room from RFC 1035 / RFC 8484.
 - **Deps:** `netaddr` (address parse/format, reverse-name construction,
   RFC 6724 result ordering), `http` (DoH transport), `std.json` (DoH-JSON),
   `std.Io.net` (UDP/TCP).
+
+Provenance: the /etc/hosts + UDP-PTR core is extracted from zig-fping
+`src/rdns.zig` (fping-derived — see the fping attribution in
+[NOTICE](../../NOTICE)); the general codec / TCP / EDNS(0) / DoH are
+clean-room from RFC 1035 / RFC 8484.
 
 ## Layout
 

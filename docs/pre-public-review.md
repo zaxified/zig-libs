@@ -24,16 +24,21 @@ poc-wf-analytic/zig-fping), not just their Apache-2/MIT surface. Fixes landed in
   no code linked/ported) — CLEAN, now documented in NOTICE.
 - bxp family (decimal/tz/zipstream/…): verified CLEAN.
 
-**☐ STILL OPEN under provenance/NOTICE:**
-- C3 doc/UAPI references not deep-traced (lower risk, all assert no-code-copied):
-  `nftables`/`uci`/`upstream`/`abuseguard`/`modbus` (cite GPL/LGPL project *docs*),
-  `netlink`/`wireguard` (cite GPL-2.0-WITH-Linux-syscall-note UAPI headers — rest on the
-  standard "OS-ABI, not copyrightable" position). Confirm each is behavior/spec-only.
-- `Provenance:` line FORMAT consistency across all module READMEs (some use a bold-list
-  variant) — normalize.
-- NOTICE policy for pure-clean-room-from-RFC modules (`whois`/`rdap`/`tar`): decide
-  whether a spec-only module needs a NOTICE entry.
-- Re-run the axp qemu `ubus -S` parity check against `blobmsg` (byte-compat confirmation).
+**✅ DONE — provenance/NOTICE loose-ends (2026-07-10):**
+- C3 doc/UAPI references deep-checked (nftables/uci/upstream/abuseguard/modbus cite
+  GPL/LGPL project *docs*; netlink/wireguard cite Linux-syscall-note UAPI headers): all
+  **CLEAN-ORIGINAL or FACTS-ONLY-OK** — no source translation; netlink/wireguard only use
+  the uncopyrightable ABI constants/struct layouts. No contamination.
+- `Provenance:` line format NORMALIZED across all 77 module READMEs (20 bold-list variants
+  → the plain single-`Provenance:`-line form; 57 already canonical; no facts lost).
+- NOTICE-entry POLICY decided + documented (NOTICE §0 + CONVENTIONS §5): a pure
+  clean-room-from-public-spec/RFC module needs NO NOTICE entry (RFC isn't copyrightable;
+  citation lives in its SPEC); NOTICE is for ported code + named design references only.
+  `whois`/`rdap`/`tar` confirmed compliant (correctly have no entry). Stale "audit pending"
+  note in NOTICE §2 + syslog README owner-note cleared.
+- blobmsg `ubus -S` byte-parity is pinned by committed OFFLINE golden-byte tests in the
+  module (green); a live re-run against the axp qemu image is out of scope for this repo's
+  CI (needs the axp environment) — the offline goldens cover the wire-compat regression.
 
 **✅ DONE — dark-tests files-vs-running test-count check** (§ below). Swept all 19
 multi-file modules: disk `test`-block count == running total (pass+skip) for every one;

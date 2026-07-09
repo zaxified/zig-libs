@@ -8,13 +8,14 @@ memory** — peak is the chunk size, not the file size.
 
 - **Status:** `extract` — carve + unify of the authors' own code.
 - **Model after:** RFC 4180 + byte-offset-preserving streaming.
-- **Provenance:** unified from two seeds in the authors' own projects, both MIT:
-  `bxp-core/src/csv.zig` (the in-memory `LineIterator`/`splitFields` core — its
-  22 tests are ported verbatim as the oracle) and `bxp-cli/src/pipeline.zig`
-  (the private `ChunkReader`, here publicized + parameterized). The composition
-  (`StreamReader`) is new.
 - **Platform:** any. **Role:** codec. **Concurrency:** reentrant (no shared
   state). **Deps:** none (std-only, pure Zig — no C/libc).
+
+Provenance: unified from two seeds in the authors' own projects, both MIT:
+`bxp-core/src/csv.zig` (the in-memory `LineIterator`/`splitFields` core — its
+22 tests are ported verbatim as the oracle) and `bxp-cli/src/pipeline.zig`
+(the private `ChunkReader`, here publicized + parameterized). The
+composition (`StreamReader`) is new.
 
 ## Two layers, one record model
 

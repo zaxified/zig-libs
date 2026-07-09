@@ -11,12 +11,13 @@ challenge → CSR finalize → PEM chain download, plus the renewal predicate.
   refill from every response, badNonce retry, POST-as-GET) and certbot's
   flow shape. Wire behavior straight from RFC 8555 (+ RFC 7515 JWS,
   RFC 7638 JWK thumbprint, RFC 2986 PKCS#10, RFC 5915 EC keys).
-- **Provenance:** clean-room implementation from RFC 8555 / RFC 7515 /
-  RFC 7638 / RFC 2986 / RFC 5915. Design references only (no code copied):
-  `golang.org/x/crypto/acme` (BSD-3-Clause), certbot (Apache-2.0).
 - **Deps:** `http` (all ACME requests via `http.Client`; the challenge
   server is `http.Server`), `router` (the challenge responder middleware),
   `std.crypto` (ecdsa P-256, sha2, Certificate), `std.json`, `std.base64`.
+
+Provenance: clean-room implementation from RFC 8555 / RFC 7515 / RFC 7638 /
+RFC 2986 / RFC 5915. Design references only (no code copied):
+`golang.org/x/crypto/acme` (BSD-3-Clause), certbot (Apache-2.0).
 
 ## ⚠ Staging by default
 

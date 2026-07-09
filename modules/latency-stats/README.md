@@ -7,12 +7,13 @@ O(1) per sample, zero allocation, no syscalls.
 - **Status:** `extract` — from the authors' axp probe-path latency accounting.
 - **Model after:** fping / iputils-ping summary stats + RFC 3550 §6.4.1
   interarrival jitter + Welford's online mean/variance.
-- **Provenance:** extracted from axp (Apache-2.0, relicensed MIT by the
-  copyright holder); jitter per RFC 3550, variance per Welford (Knuth TAOCP
-  vol 2 §4.2.2) — no third-party source copied (see [NOTICE](../../NOTICE)).
 - **Platform:** any (pure arithmetic). **Role:** util.
   **Concurrency:** single-owner (one `Accumulator` per probe stream).
   **Allocation:** none.
+
+Provenance: extracted from axp (Apache-2.0, relicensed MIT by the copyright
+holder); jitter per RFC 3550, variance per Welford (Knuth TAOCP vol 2
+§4.2.2) — no third-party source copied (see [NOTICE](../../NOTICE)).
 
 ## API
 

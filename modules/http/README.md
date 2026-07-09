@@ -7,7 +7,6 @@ HTTP/1.1 client **and server** in pure Zig (client TLS over `std.crypto.tls`).
 - **Model after:** `lalinsky/dusty` (1.1 client shape) + Go `net/http`
   (redirect/header semantics, Server shape); `nghttp2` + h2spec later for
   HTTP/2.
-- **Provenance:** client shape extracted from axp `axp-core/src/httpclient.zig` (same authors, Apache-2.0, relicensed MIT); the HTTP/1.1 framing + the server are clean-room from RFC 7230/9110. Design refs in [NOTICE](../../NOTICE).
 - **Why:** a native client instead of shelling `curl` or depending on the
   churny `std.http` (explicit non-dependency). `dns` (DoH), `rdap` and the
   REST cluster (`router` → `ratelimit` → …) sit on this.
@@ -16,6 +15,11 @@ HTTP/1.1 client **and server** in pure Zig (client TLS over `std.crypto.tls`).
   **Concurrency:** single-owner handles; the Server runs its own
   per-connection tasks — handlers must be thread-safe if they share state.
   **Deps:** `netaddr`, `std.crypto.tls`, `std.Io.net`.
+
+Provenance: client shape extracted from axp `axp-core/src/httpclient.zig`
+(same authors, Apache-2.0, relicensed MIT); the HTTP/1.1 framing + the
+server are clean-room from RFC 7230/9110. Design refs in
+[NOTICE](../../NOTICE).
 
 ## Phases
 

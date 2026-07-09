@@ -7,13 +7,14 @@ caller-owned pipeline arena) and returns a new `Dataset`.
 - **Status:** `extract` — faithful lift from the authors' wgs project.
 - **Model after:** pandas / dplyr verb algebra + technical-analysis
   rolling-window idioms.
-- **Provenance:** extracted from the authors' wgs project — `src/transforms.zig`
-  (Tier 0) and `src/series.zig` (Tier 1), both MIT, same authors. Faithful lift:
-  logic and hand-computed golden test values are unchanged; the only edit is the
-  dependency import (`@import("dataset")` instead of the seed's local
-  `dataset.zig`).
 - **Platform:** any. **Role:** util. **Concurrency:** reentrant (no shared
   state). **Deps:** `dataset`.
+
+Provenance: extracted from the authors' wgs project — `src/transforms.zig`
+(Tier 0) and `src/series.zig` (Tier 1), both MIT, same authors. Faithful
+lift: logic and hand-computed golden test values are unchanged; the only
+edit is the dependency import (`@import("dataset")` instead of the seed's
+local `dataset.zig`).
 
 ## Layout
 

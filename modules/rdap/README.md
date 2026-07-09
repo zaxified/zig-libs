@@ -7,9 +7,6 @@ Pairs with the `whois` module.
 - **Status:** `gap` — no typed, offline-testable RDAP client in the Zig
   ecosystem.
 - **Model after:** RFC 7480–7484 RDAP; ARIN/RIPE RDAP behavior.
-- **Provenance:** clean-room from RFCs 7480/7482/7483/7484/9224 (plus their
-  9082/9083 renumberings). No third-party RDAP implementation consulted or
-  copied.
 - **Why:** whois replies are freeform text per registry; RDAP is the same
   data as structured JSON over HTTPS. This module owns the three protocol
   layers — query-URL construction with correct percent-encoding, a tolerant
@@ -21,6 +18,10 @@ Pairs with the `whois` module.
   **Concurrency:** reentrant (no shared state).
   **Deps:** `http` (Accept header type + default fetcher), `netaddr`
   (bootstrap CIDR matching).
+
+Provenance: clean-room from RFCs 7480/7482/7483/7484/9224 (plus their
+9082/9083 renumberings). No third-party RDAP implementation consulted or
+copied.
 
 ## API
 

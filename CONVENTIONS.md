@@ -104,6 +104,16 @@ One fact lives in exactly one place; everywhere else links to it, never restates
 | all repo rules | this file (`CONVENTIONS.md`) | — |
 | module catalog | root `README.md` table | — |
 
+**When does NOTICE need an entry?** A public spec/RFC is not a copyrightable work (merger
+doctrine — implementing one, however closely, is not "derived from" anyone's code). A module that
+is pure clean-room-from-spec, with no third-party source ported and no third-party implementation
+studied as a design reference, needs **no NOTICE entry** — its RFC/spec citation lives in the
+module's own SPEC.md instead (see whois/rdap/tar). NOTICE is reserved for (1) **required
+attribution** — third-party source actually ported, license terms reproduced; and (2) **design
+references** — a named third-party implementation consulted for behavior/algorithm/API shape even
+without copying source. Running an installed third-party binary purely as a black-box compatibility
+test oracle (e.g. diffing output against `tar`/`nft`) is neither of the above and needs no entry.
+
 **Non-overlap rule:** README answers "how do I use this" (consumer altitude); SPEC
 answers "how/why was this built, and what could go wrong" (auditor altitude). A module's
 purpose is a full paragraph in the README and only a title + link back to the README in

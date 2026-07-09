@@ -9,17 +9,17 @@
 - **Model after:** RFC 5424 (message + wire format), RFC 6587 (transport
   framing), RFC 3164 (legacy BSD format). Design mirrors the `Message` /
   emitter split of `joelreymont/pz` `src/core/syslog.zig` (MIT).
-- **Provenance:** clean-room from RFC 5424, RFC 6587 and RFC 3164. The
-  `Message`/`Sender` *design* (a pure message codec split from the network
-  emitter, RFC 3339-ms timestamps, structured-data escaping, field-length
-  validation, octet framing) is referenced from `joelreymont/pz` (MIT) — no
-  third-party code was copied; all code here targets `std.Io.net` and was
-  written from the RFCs. **NOTE for owner:** RFC 5424/6587/3164 + the pz
-  design reference warrant a `NOTICE` entry.
 - **Platform:** any (pure codec core; the optional `UdpEmitter`/`TcpEmitter`
   use `std.Io.net`, `nowTimestamp` uses posix `clock_gettime`).
   **Role:** both (codec + client). **Concurrency:** reentrant (no shared
   state). **Allocation:** none — fixed buffers throughout.
+
+Provenance: clean-room from RFC 5424, RFC 6587 and RFC 3164. The
+`Message`/`Sender` *design* (a pure message codec split from the network
+emitter, RFC 3339-ms timestamps, structured-data escaping, field-length
+validation, octet framing) is referenced from `joelreymont/pz` (MIT) — no
+third-party code was copied; all code here targets `std.Io.net` and was
+written from the RFCs. See `NOTICE`.
 
 ## API
 

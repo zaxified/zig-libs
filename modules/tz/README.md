@@ -63,14 +63,12 @@ spelling exactly). `offsetAt`:
   (`tz-gen`) lives in the bxp repo (`bxp/tools/tz-gen`), not in this module —
   it is not ported here, only referenced.
 
-## Provenance
-
-- `src/root.zig` — extracted from bxp `bxp-core/src/tz.zig` (same authors,
-  MIT).
-- `src/tz_data.zig` — copied verbatim from bxp `bxp-core/src/tz_data.zig`
-  (same authors, MIT), which is itself **generated** by bxp's
-  `tools/tz-gen` from the **IANA tzdata 2026a** release (public domain).
-  600 zones, transitions from 1970 onward + POSIX-TZ footer rule per zone.
+Provenance: `src/root.zig` extracted from bxp `bxp-core/src/tz.zig` (same
+authors, MIT); `src/tz_data.zig` copied verbatim from bxp
+`bxp-core/src/tz_data.zig` (same authors, MIT), which is itself generated
+by bxp's `tools/tz-gen` from the IANA tzdata 2026a release (public domain)
+— 600 zones, transitions from 1970 onward plus POSIX-TZ footer rule per
+zone. See `NOTICE`.
 
 ## Verify
 
