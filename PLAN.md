@@ -20,11 +20,11 @@ touch build.zig · README · PLAN · NOTICE — they report back; the owner veri
 
 ## Status (2026-07-09)
 
-**72 modules · 1697 tests** (1693 pass + 4 skips: ubus/wireguard/blobmsg live checks + llmclient live API) ·
-Debug + ReleaseFast green · `zig fmt` clean · MIT. Latest commit `a28d779`.
-**Pure-Opus BUILD phase wave 1 landed 2026-07-09:** `argsafe` (14-validator consolidation) · `sessions`+CSRF
-(OWASP, signed double-submit) · `jobqueue` (durable over `kv`, folds taskqueue partition-FIFO) · `llmclient`
-(Anthropic Messages + client-side SSE parser). Remaining build: `rawsock` (netns to verify) · `testkit`.
+**73 modules · 1706 tests** (1700 pass + 6 skips: ubus/wireguard/blobmsg + llmclient live + rawsock 2 netns) ·
+Debug + ReleaseFast green · `zig fmt` clean · MIT. Latest commit `13149e3`.
+**Pure-Opus BUILD phase landed 2026-07-09:** `argsafe` · `sessions`+CSRF · `jobqueue` · `llmclient` ·
+`rawsock` (full AF_PACKET; verified 9/9 under `unshare -rn`). **Build phase essentially COMPLETE** — only
+`testkit` remains and its scope came back mostly-stale (see below): recommend deferring it.
 Web/API cluster, HTTP/1.1+HTTP/2 stack, `kv` (+VOPR), network family, crypto leaves, MCP (+HTTP/SSE
 transport), and the content-negotiation + Range/206 HTTP feature families are complete.
 **Extraction wave 1 landed 2026-07-09** (Opus-coordinated, agent-built): `blobstore` (`24833cf`),
@@ -108,7 +108,7 @@ RFC codecs). Archetypes: ① HTTP/SaaS backend · ② netops · ③ IoT · ④ A
 | ❌ `roquery` → **DROPPED (not a zig-libs module)** | ⑤ + safe reporting | hardened read-only SQLite is **C-level** (the enforcement — `sqlite3_open_v2(READONLY)`, `PRAGMA query_only`, `sqlite3_set_authorizer`, `db_config` load-ext toggle — is raw C-API). Building it here would make zig-libs' first `@cImport` + libc user. **Decision 2026-07-09: keep the repo 100% pure-Zig → the hardened wrapper stays consumer-side over ADOPTed `zig-sqlite`.** `wgs/src/sqlite.zig` is the app-side reference impl |
 | ✅ **`filestore`** DONE `5d2956d` | ① DB-less persist | keyed kind/key files, atomic temp-rename + segmentSafe added (seed had neither); std-only, no hashdigest dep (axp-central seed) |
 | 🔀 `taskqueue` → **FOLD into `jobqueue`** | ③ fleet C2 | scope 2026-07-09: storage adds nothing over `filestore`; the value (lease/retry/DLQ) is jobqueue's job; only per-partition FIFO is worth keeping → build it as a `jobqueue` partition-key feature (`nextFor(partition)` + a real `priority` field), not a standalone module. Seed's id-arithmetic priority hack silently clobbers records |
-| ⚠️ `rawsock` → **BUILD (remaining)** | ② capture/inject | seed ~25 LOC receive-only; real module = send/inject, BPF, promisc, iface enum — new construction. Needs netns/root to verify |
+| ✅ `rawsock` → **BUILD DONE** `13149e3` | ② capture/inject | full AF_PACKET: capture/inject/BPF/promisc/iface-enum + typed frame decode; pure helpers root-free-testable, socket tests netns-gated (verified 9/9 under `unshare -rn`). Linux-only |
 | ✅ `argsafe` → **BUILD DONE** `a28d779` | hardening | consolidated axp's 14 ad-hoc validators into one composable `CharClass` + convenience predicates + a poison-on-reject `Argv` builder; flag-injection/NUL/`..` fixed as default |
 | bxp text libs (scoped 2026-07-09): ✅ `datefmt` `5d2956d` · ✅ `diagnostics` `5d2956d` · ✅ `json5` `5d2956d` · ✅ `zipstream` `5d2956d` | ⑤ + i18n | DONE (Wave 3). ✅ **`tz`** DONE (Wave 4). ✅ **`csvstream`** · ✅ **`csvsafe`** · ✅ **`numparse`** DONE (Wave 5). **All bxp-text-lib EXTRACTs done** except the two Fable-wait items (`encoding`/`unaccent`). **Fable-headroom (wait for reset):** `encoding` (5 code pages → full WHATWG), `unaccent` (⚠️ seed needs external `uucode` → violates zero-dep; Fable must clean-room UCD tables like `tz-gen`) |
 | IPC glue (scoped 2026-07-09): ✅ `framing` = `lenframe`+`jsonwire` FOLDED `5d2956d` | same-host IPC | DONE (Wave 3). ✅ **`pollworker`** + **`ipcbus`** DONE (Wave 4). **`chunkframe` → SKIP** (~20 LOC base64+JSON-envelope glue with a narrow one-bridge `why`; documented pattern, not a module) |
@@ -119,7 +119,7 @@ RFC codecs). Archetypes: ① HTTP/SaaS backend · ② netops · ③ IoT · ④ A
 | ✅ **`sessions`** + CSRF DONE `a28d779` | ① stateful web | OWASP; io.random ids, signed double-submit CSRF, ramcache Store; composes cookies/router |
 | ✅ **`jobqueue`** DONE `a28d779` | ①③ background work | durable over pure-Zig `kv` (no SQLite); lease/retry/DLQ + taskqueue partition-FIFO fold + real priority; cron deferred |
 | ✅ **`llmclient`** DONE `a28d779` | ④ AI-agent | Anthropic Messages over http (real HTTPS via std.crypto.tls) + new client-side SSE parser; OpenAI variant deferred |
-| `testkit` | all (verification) | shared golden-diff/netns/VOPR harness; stop re-inventing — **remaining build** |
+| ⏸️ `testkit` → **DEFERRED (scope mostly stale, 2026-07-09)** | test-only | Scope verdict: golden-diff = LEAVE (std's `expectEqualStrings` already diffs); **netns = LEAVE (no netns code exists in the repo — the real idiom is loopback + `SkipZigTest`; building it would be net-new, not consolidation)**; VOPR = LEAVE (one consumer, kv→jobqueue via normal deps, zero duplication). Only genuinely duplicated: the `runWire` HTTP-wire test wrapper (~300 LOC across 19 modules) + `expectStatus` family + fake-clocks (~100 LOC/10 modules). Real yield ~550 LOC, BUT it needs a **build.zig test-only-dep mechanism** (no precedent; would be the repo's first) + a **19-module refactor** to pay off — otherwise it's a dead module. Recommend deferring; if built, do the honest small scope (runWire+FakeClock) + the build.zig shadow-test-module change, then refactor consumers as a separate mechanical wave. Also flagged: `wireguard`'s test `runIp()` shells out to `ip` — the one external-process use in the repo, for the pure-Zig-invariant audit |
 | `ssh` (bind `libssh2` first) | ② netops automation | pure-Zig SSH is huge → ergonomic binding first, Zig automation API |
 
 ### BUILD → Fable (RFC/spec-complete value-add + crypto — paused until reset)
@@ -197,9 +197,10 @@ desired/applied-generation + anti-brick rollback → k8s-controller-lite for con
    `unaccent` clean-room UCD tables, no external `uucode`).
 2. **Pure-Opus BUILD phase — wave 1 DONE 2026-07-09:** ✅ `argsafe` · ✅ `sessions`+CSRF · ✅ `jobqueue`
    (over `kv`, taskqueue partition-FIFO folded) · ✅ `llmclient` (Anthropic + new client-side SSE parser).
-   **Remaining build:** `rawsock` (AF_PACKET send/inject/BPF/promisc/enum; netns/root to verify — needs a
-   verification story) · `testkit` (shared golden-diff/netns/VOPR harness). With adopted pg/smtp/ws/log/toml,
-   ① is now a deployable backend stack (sessions+jobqueue landed).
+   ✅ `rawsock` DONE (full AF_PACKET, verified under netns). **Build phase essentially COMPLETE.**
+   `testkit` DEFERRED — its scope came back mostly stale (netns/VOPR don't exist to consolidate); the honest
+   remainder (runWire+FakeClock dedup) needs a build.zig test-only-dep mechanism + a 19-module refactor to
+   pay off. With adopted pg/smtp/ws/log/toml, ① is a deployable backend stack.
 3. **When Fable resets:** finish SNMP T-G/T-H, then `stun`/`sntp`/`syslog`, `exprcalc`, MQTT broker,
    coap C6/C7, plus the Fable-wait extraction items (`encoding`/`unaccent`).
 4. **Then decide:** `ssh` (bind), `grpc`, and the deferred big items per which product you commit to.
