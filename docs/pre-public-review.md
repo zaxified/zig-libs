@@ -35,8 +35,14 @@ poc-wf-analytic/zig-fping), not just their Apache-2/MIT surface. Fixes landed in
   whether a spec-only module needs a NOTICE entry.
 - Re-run the axp qemu `ubus -S` parity check against `blobmsg` (byte-compat confirmation).
 
+**✅ DONE — dark-tests files-vs-running test-count check** (§ below). Swept all 19
+multi-file modules: disk `test`-block count == running total (pass+skip) for every one;
+all 10 skips accounted for (env/netns/live-gated). No dark tests. http/coap fixes hold;
+no regressions. icmp uses `refAllDecls` (verified pulls everything), tz's only sibling
+has zero tests — both safe.
+
 **☐ NOT STARTED — the adversarial SECURITY pass** (§ "Per-target adversarial review"
-below) and the **dark-tests files-vs-running test-count check** (§ below).
+below): the 10 crypto/parser targets under active attack, not just correctness.
 
 ## Purpose
 
