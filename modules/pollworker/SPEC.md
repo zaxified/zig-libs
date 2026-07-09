@@ -1,6 +1,7 @@
 # pollworker — spec
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: original work of
+the zig-libs authors (MIT).
 
 ## Design & invariants
 Two independent building blocks sharing only the "single owner drives the loop" discipline.
@@ -22,11 +23,11 @@ may tear down or leak-check the allocator and the detached thread must not touch
 that signal. Children exec with an empty environment (`empty_envp`) — callers needing `PATH` etc.
 should exec absolute paths, which need none. `decodeStatus` decodes the raw `wait(2)` status word
 without libc `W*` macros. Back-pressure is purely the fixed slot count `N`: `claim` returns `null`
-and `spawnDetached` returns `error.TableFull` when every slot is busy — no queueing. Extracted and
-generalized from the authors' own `poc-wf-analytic/src/main.zig` (`runController` + the
-`g_http_jobs` HttpJob table); the curl-specific fetch body was deliberately not lifted —
+and `spawnDetached` returns `error.TableFull` when every slot is busy — no queueing. Original work
+of the zig-libs authors (MIT) — a single-owner event loop (`runController`) plus an HttpJob table;
+the curl-specific fetch body is deliberately not included —
 `spawnDetached` generalizes it to an arbitrary argv. Modeled after a single-owner event loop +
-detached-fork worker pool pattern — see NOTICE.
+detached-fork worker pool pattern.
 
 ## Threat model / out of scope
 Linux-only by design (raw `std.os.linux` errno-encoded syscalls: `poll`/`fork`/`execve`/`waitpid`/

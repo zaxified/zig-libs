@@ -4,9 +4,8 @@ Reshape JSON into a canonical [`dataset`](../dataset/README.md): dot-path
 descent to an array node + typed column projection (a jq-style minimal
 subset — one path, not a full JSONPath engine).
 
-- **Status:** `extract` — lifted from the authors' wgs `src/jsonshape.zig`,
-  the `http` connector's normalizer for `getDataview`/`dataviewGet`-shaped
-  remote feeds.
+- **Status:** `extract` — a normalizer for `http`-connector-style remote
+  feeds shaped like `getDataview`/`dataviewGet` responses.
 - **Model after:** jq-style path projection (minimal: one dot-path + field
   extraction), not a full JSONPath implementation.
 - **Platform:** any (pure logic, no I/O). **Role:** codec (parses JSON,
@@ -14,9 +13,8 @@ subset — one path, not a full JSONPath engine).
   **Concurrency:** reentrant (no shared state).
 - **Deps:** [`dataset`](../dataset/README.md).
 
-Provenance: extracted from the authors' wgs project (`src/jsonshape.zig`,
-MIT, same authors) — a faithful lift; ownership/error semantics preserved
-exactly. No third-party code (see [NOTICE](../../NOTICE)).
+Provenance: original work of the zig-libs authors (MIT); ownership/error
+semantics are deliberate design choices. No third-party code.
 
 ## What it does
 
@@ -90,7 +88,7 @@ scope for this v1 lift:
   a value out of a nested object per-row is not supported; `JsonCol.key`
   is a single top-level field name inside each item, not its own path.
 - **Streaming / bounded-memory parse** — the whole document is parsed with
-  `parseFromSliceLeaky` up front (matching the seed); very large payloads
+  `parseFromSliceLeaky` up front; very large payloads
   are not handled with a streaming/bounded-memory parser.
 - **JSON→JSON reshape** — output is always a `dataset.Dataset`; reshaping
   JSON into JSON (a jq-style transform staying in JSON) is a different

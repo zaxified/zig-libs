@@ -8,15 +8,14 @@ failure — this is the generic control logic that wraps such calls. std-only
 and dependency-free, so it is reusable well beyond HTTP (the caller composes
 it with `http.Client` or anything else that can fail).
 
-Provenance: clean-room — no seed project and no third-party code. Design
-references (behavior only, no source consulted line-level or copied):
+Provenance: original work of the zig-libs authors (MIT); modeled after
 resilience4j (Apache-2.0; breaker state machine, composition order, retry
 `maxAttempts`/interval semantics, semaphore Bulkhead —
 `maxConcurrentCalls`/`maxWaitDuration`), Polly (BSD-3-Clause; consecutive-failure
-count breaker), failsafe-go (Apache-2.0; delay/jitter policy shapes) and the
-AWS Architecture Blog "Exponential Backoff And Jitter" (Brooker, 2015; the
-full/equal jitter taxonomy). Clock/delay-injection and spinlock patterns
-follow the `ratelimit`/`throttle` siblings.
+count breaker), and failsafe-go (Apache-2.0; delay/jitter policy shapes), plus
+the AWS Architecture Blog "Exponential Backoff And Jitter" (Brooker, 2015; the
+full/equal jitter taxonomy) — see NOTICE. Clock/delay-injection and spinlock
+patterns follow the `ratelimit`/`throttle` siblings.
 
 - **Status:** `gap`.
 - **Model after:** resilience4j + Polly + failsafe-go (see above).

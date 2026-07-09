@@ -4,17 +4,20 @@ Parser + serializer + typed model for the **OpenWRT UCI** (Unified
 Configuration Interface) file format — `config` / `option` / `list`.
 
 - **Status:** `gap` — no maintained pure-Zig UCI codec exists; this retires
-  shelling out to the `uci` binary (axp).
+  shelling out to the `uci` binary for callers that manage OpenWRT-style
+  device config.
 - **Model after:** OpenWRT UCI file format / libuci.
-- **Why:** axp manages OpenWRT-style device config; reading and writing UCI
-  files natively removes an exec dependency and gives typed access + errors.
+- **Why:** OpenWRT-style device config is commonly read/written by shelling
+  out to `uci`; doing it natively removes an exec dependency and gives typed
+  access + errors.
 - **Platform:** any (pure text codec, no I/O).
   **Role:** codec. **Concurrency:** reentrant (no shared state).
   **Allocation:** model memory lives in an internal arena — one
   `Package.deinit(gpa)` frees everything.
 
-Provenance: clean-room from the documented OpenWRT UCI file format; libuci
-(LGPL-2.1) referenced for the format only, no source consulted or copied.
+Provenance: original work of the zig-libs authors (MIT); clean-room from
+the documented OpenWRT UCI file format — libuci (LGPL-2.1) referenced for
+the format only, no source consulted or copied — see NOTICE.
 
 ## API
 

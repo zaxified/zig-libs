@@ -1,14 +1,14 @@
 # jsonshape — spec
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: original work of
+the zig-libs authors (MIT).
 
 ## Design & invariants
 
 - **Reshape JSON into a canonical `dataset`:** dot-path descent to an array node + typed column
-  projection — a jq-style minimal subset (one path, not a full JSONPath engine). Extracted from the
-  authors' wgs `src/jsonshape.zig` (the `http` connector's normalizer for `getDataview`/
-  `dataviewGet`-shaped remote feeds), a faithful lift with ownership/error semantics preserved
-  exactly — see NOTICE.
+  projection — a jq-style minimal subset (one path, not a full JSONPath engine). Original work of
+  the zig-libs authors (MIT), designed as the `http` connector's normalizer for `getDataview`/
+  `dataviewGet`-shaped remote feeds, with ownership/error semantics as deliberate design choices.
 - **Algorithm:** parse the whole document (`std.json.parseFromSliceLeaky`) into an arena; walk
   `spec.path` as a dot-separated chain of object-key lookups from the root to find an array node
   (empty path = the root itself); project each array item into a row via either generic columns
@@ -53,7 +53,7 @@ Flagged by the extraction scope as follow-on work, intentionally out of scope fo
 - **Nested-object flattening** — a dotted column key like `meta.ts` to pull a value out of a nested
   object per-row is not supported; `JsonCol.key` is a single top-level field name.
 - **Streaming/bounded-memory parse** — the whole document is parsed with `parseFromSliceLeaky` up
-  front (matching the seed); very large payloads have no streaming/bounded-memory path.
+  front; very large payloads have no streaming/bounded-memory path.
 - **JSON→JSON reshape** — output is always a `dataset.Dataset`, not a jq-style JSON-to-JSON
   transform.
 - **Schema inference** — no auto-sniff of the first object's keys to build `columns`; the caller

@@ -2,10 +2,16 @@ zig-libs
 Copyright (c) 2026 zig-libs contributors
 Licensed under the MIT License (see LICENSE).
 
-This product includes software derived from, or designed with reference to,
-the third parties listed below. All are permissive (MIT/BSD-family) and
-MIT-compatible. Where actual code was ported (not merely modeled), the
-required attribution is reproduced.
+These modules are the original work of the zig-libs authors, consolidated
+here as the canonical home. The authors' other projects depend on zig-libs,
+not the reverse. A module's internal development origin — which of the
+authors' own projects it was first prototyped in — is NOT recorded here: it
+carries no attribution weight and would read backwards once those projects
+import zig-libs. This file records only genuine THIRD-PARTY obligations and
+design references — software derived from, or designed with reference to, the
+third parties listed below. All are permissive (MIT/BSD-family) and
+MIT-compatible. Where actual third-party code was ported (not merely
+modeled), the required attribution is reproduced.
 
 ====================================================================
 0. POLICY — what requires an entry here
@@ -43,10 +49,10 @@ closely, is not "derived from" anyone's code. Accordingly:
 The `netaddr` module's address-selection logic, the `icmp` module (echo
 codec, ICMP sockets and the paced ping engine), the `seqmap` module
 (sequence-number correlation map, after fping's seqmap.c), and the `dns`
-module's /etc/hosts + UDP-PTR core (after zig-fping's `src/rdns.zig`) were
-extracted from the authors' `zig-fping` project, which is a Zig port of fping
-(https://github.com/schweikert/fping). fping's license therefore applies to
-the derived portions and is reproduced here as its terms require:
+module's /etc/hosts + UDP-PTR core DERIVE FROM fping
+(https://github.com/schweikert/fping), a third-party work under the Stanford
+license reproduced below. fping's license therefore applies to the derived
+portions and is reproduced here as its terms require:
 
     Original author:      Roland Schemers   <schemers@stanford.edu>
     IPv6 Support:         Jeroen Massar
@@ -77,19 +83,18 @@ stated in its own distribution:
 
 Only the UTC-offset transition data and POSIX-TZ footer rules are extracted
 (not the tz database source code). The offset-lookup logic is the authors'
-own (`bxp-core/src/tz.zig`, MIT).
+own (MIT).
 
 ====================================================================
 2. DESIGN REFERENCES — clean-room (recorded for provenance)
 ====================================================================
 
-The following were used as DESIGN references only: the code was reimplemented
-from public specifications (RFCs) or from the authors' own projects (bxp, axp
-= Apache-2.0, relicensed by their copyright holder to MIT here; poc-wf-analytic
-= same authors). No third-party source was copied. Listed with their upstream
-license so any future line-level reuse is attributed correctly. A full
-provenance/license audit was completed 2026-07-09 (traced through the sibling
-projects; see docs/pre-public-review.md).
+The following modules are the authors' own original work, reimplemented from
+public specifications (RFCs) or designed with reference to the named
+third-party implementations below. No third-party source was copied. Each is
+listed with its upstream license so any future line-level reuse is attributed
+correctly. A full provenance/license audit was completed 2026-07-09; see
+docs/pre-public-review.md.
 
   netaddr    — RFC 6724, RFC 5952 (specs); cross-checked vs Go net/addrselect
                (BSD-3-Clause, The Go Authors) + glibc getaddrinfo algorithm.
@@ -119,13 +124,10 @@ projects; see docs/pre-public-review.md).
                sec 12.5.3 (Accept-Encoding) and RFC 4647 sec 3.3.1
                (Accept-Language basic filtering). Clean-room
                from the RFCs, no HPACK/HTTP-2/nghttp2 source consulted or
-               copied; TLS via Zig std.crypto.tls.
-               The HTTP/1.1 client shape was extracted from the authors' axp
-               project (axp-core/src/httpclient.zig + http.zig; Apache-2.0,
-               relicensed MIT by the copyright holder). Design refs (behavior
-               only, no source copied): lalinsky/dusty (MIT; the 1.1 client
-               shape) and Go net/http (BSD-3-Clause; redirect semantics,
-               server shape, gzip handler).
+               copied; TLS via Zig std.crypto.tls. Design refs (behavior only,
+               no source copied): lalinsky/dusty (MIT; the 1.1 client shape)
+               and Go net/http (BSD-3-Clause; redirect semantics, server shape,
+               gzip handler).
   dns        — RFC 1035 (wire), RFC 8484 (DoH), RFC 2782 (SRV), RFC 8659
                (CAA); design ref: miekg/dns (BSD-3-Clause) + c-ares —
                behavior only, no source copied.
@@ -203,15 +205,14 @@ projects; see docs/pre-public-review.md).
 
   traceroute — clean-room from the classic traceroute(8)/mtr ICMP method
                (Van Jacobson's TTL-stepping, a public technique) + RFC 792
-               (ICMP message formats, via the sibling `icmp` codec) —
+               (ICMP message formats, via the `icmp` module) —
                behavior only, no traceroute/mtr source consulted or copied.
 
-  aaa-gate   — extracted from the authors' axp project (axp-central/src/
-               rest.zig: admin-token gate, auditMutation, AuditThrottle;
-               Apache-2.0, relicensed MIT by the copyright holder); design
-               ref: envoy ext_authz (Apache-2.0) and oauth2-proxy (MIT) —
-               bearer-gate behavior only, no source consulted or copied;
-               bearer semantics per RFC 6750, auth framework per RFC 9110.
+  aaa-gate   — design ref: envoy ext_authz (Apache-2.0) and oauth2-proxy
+               (MIT) — bearer-gate behavior only, no source consulted or
+               copied; bearer semantics per RFC 6750, auth framework per
+               RFC 9110. Original work of the authors, no third-party source
+               copied.
 
   acme       — RFC 8555 (ACME), RFC 7515 (JWS), RFC 7638 (JWK thumbprint),
                RFC 2986 (PKCS#10), RFC 5915 (EC private keys); design ref:
@@ -230,20 +231,18 @@ projects; see docs/pre-public-review.md).
                implementation. Clean-room: behavior/approach only, no
                source consulted or copied.
 
-  blobmsg    — extracted from the authors' axp project (axp-core/src/
-               ubus.zig; Apache-2.0, relicensed MIT by the copyright
-               holder). The blob/blobmsg TLV codec (the bulk of the module)
-               implements the OpenWRT libubox wire format from its headers
-               blob.h/blobmsg.h (ISC) as the format specification —
-               independent Zig implementation, no libubox code copied. The
-               ubus message envelope uses the 8-byte msghdr struct layout and
-               the ubus protocol constants (MSG_*/ATTR_*) as declared in ubus
-               ubusmsg.h (LGPL-2.1); these are uncopyrightable protocol facts
-               (integer constants + a packed struct), re-derivable from the
-               `ubus -S` golden captures the module is tested against.
-               libubus-io.c (LGPL-2.1) contributed NO code: the unix-socket
-               transport (blocking read/write loops, single-buffer send,
-               fixed-header framing, seq-matched request/reply) is an
+  blobmsg    — an original Zig implementation. The blob/blobmsg TLV codec
+               (the bulk of the module) implements the OpenWRT libubox wire
+               format from its headers blob.h/blobmsg.h (ISC) as the format
+               specification — independent Zig implementation, no libubox code
+               copied. The ubus message envelope uses the 8-byte msghdr struct
+               layout and the ubus protocol constants (MSG_*/ATTR_*) as
+               declared in ubus ubusmsg.h (LGPL-2.1); these are uncopyrightable
+               protocol facts (integer constants + a packed struct),
+               re-derivable from the `ubus -S` golden captures the module is
+               tested against. libubus-io.c (LGPL-2.1) contributed NO code: the
+               unix-socket transport (blocking read/write loops, single-buffer
+               send, fixed-header framing, seq-matched request/reply) is an
                independent implementation — none of libubus-io.c's expression
                (writev/iovec scatter-gather, chunked reader, SCM_RIGHTS
                fd-passing, callback request-registry, reconnect state machine)
@@ -251,14 +250,14 @@ projects; see docs/pre-public-review.md).
                hardware. Published under MIT; the only copyleft touchpoint is
                the uncopyrightable ubus protocol facts above.
 
-  ramcache   — original seed extracted from the authors' poc-wf-analytic
-               (`cache.zig`; TTL + generation invalidation + byte/entry caps).
-               The W-TinyLFU admission/eviction upgrade is clean-room from the
-               TinyLFU paper (Einziger & Friedman, "TinyLFU: A Highly Efficient
-               Cache Admission Policy") with design refs Caffeine (Apache-2.0;
-               window + SLRU probation/protected structure) and ristretto (Go,
-               MIT; admission anti-starvation tie-break) — algorithm/behavior
-               only, no source consulted or copied.
+  ramcache   — the TTL + generation-invalidation + byte/entry-cap cache is the
+               authors' own original work. The W-TinyLFU admission/eviction
+               upgrade is clean-room from the TinyLFU paper (Einziger &
+               Friedman, "TinyLFU: A Highly Efficient Cache Admission Policy")
+               with design refs Caffeine (Apache-2.0; window + SLRU
+               probation/protected structure) and ristretto (Go, MIT;
+               admission anti-starvation tie-break) — algorithm/behavior only,
+               no source consulted or copied.
 
   nftables   — clean-room from the DOCUMENTED libnftables JSON schema
                (libnftables-json(5) man page + the nftables wiki "JSON
@@ -310,14 +309,13 @@ projects; see docs/pre-public-review.md).
                net-snmp / tcpdump) was consulted or copied.
 
   latency-stats — the streaming moment stats (min/max/mean/stddev + RFC 3550
-               jitter) are from the authors' zig-fping/axp work (see the fping
-               attribution above). The `Histogram` percentile support is
-               clean-room from Gil Tene's HdrHistogram design (logarithmic
-               bucketing with linear sub-buckets, bounded relative error);
-               design refs HdrHistogram_c (BSD-2-Clause/CC0), HdrHistogram
-               Java (CC0-1.0/BSD-2), and the Rust `hdrhistogram` crate
-               (MIT OR Apache-2.0) — behavior/format only, no source consulted
-               or copied.
+               jitter) are the authors' own original work. The `Histogram`
+               percentile support is clean-room from Gil Tene's HdrHistogram
+               design (logarithmic bucketing with linear sub-buckets, bounded
+               relative error); design refs HdrHistogram_c (BSD-2-Clause/CC0),
+               HdrHistogram Java (CC0-1.0/BSD-2), and the Rust `hdrhistogram`
+               crate (MIT OR Apache-2.0) — behavior/format only, no source
+               consulted or copied.
 
   uci        — clean-room from the documented OpenWRT UCI (Unified
                Configuration Interface) file format (OpenWRT wiki/docs).
@@ -325,8 +323,7 @@ projects; see docs/pre-public-review.md).
                libuci source was consulted or copied; the file format is the
                documented interface.
 
-  decimal    — extracted from the authors' bxp project (Apache-2.0, relicensed
-               MIT). The rounding modes (half_even/half_up/half_down/up/down/
+  decimal    — the rounding modes (half_even/half_up/half_down/up/down/
                ceiling/floor + rescale/quantize/divRound) are clean-room from
                the published definitions: Java BigDecimal.RoundingMode javadoc,
                the IBM General Decimal Arithmetic specification, and the Python
@@ -352,19 +349,17 @@ projects; see docs/pre-public-review.md).
   mcp-http   — clean-room from the Model Context Protocol "Streamable HTTP"
                transport specification (2025-06-18 revision) and the JSON-RPC
                2.0 spec; the behavioral contract (POST /mcp, Mcp-Session-Id,
-               GET/DELETE, 202-for-notifications) was cross-checked against the
-               authors' own bxp-gui Dart server (which wraps the third-party
-               mcp_dart package) for parity — no mcp_dart or other MCP-transport
-               source was consulted or copied. Builds on the sibling `mcp`
-               module (JSON-RPC core, itself extracted from the authors'
-               bxp-mcp).
+               GET/DELETE, 202-for-notifications) was cross-checked for parity
+               against a reference Dart server that wraps the third-party
+               mcp_dart package — no mcp_dart or other MCP-transport source was
+               consulted or copied. Builds on the `mcp` module (JSON-RPC core).
 
   linkheader — clean-room from RFC 8288 (Web Linking — the `Link` header
                grammar). No third-party source consulted or copied.
 
   idempotency — clean-room from the Idempotency-Key pattern (Stripe's public
                API docs + the IETF draft-ietf-httpapi-idempotency-key-header).
-               Behavior/semantics only; caching over the sibling `ramcache`.
+               Behavior/semantics only; caching over the `ramcache` module.
 
   webhooksig — clean-room from RFC 2104 (HMAC) and the publicly-documented
                GitHub/Stripe webhook-signature schemes (`sha256=<hex>` over the
@@ -391,33 +386,17 @@ projects; see docs/pre-public-review.md).
                test vectors. Attribute-TLV DESIGN modeled after Corendos/ztun
                (MIT); no source copied.
 
-  finstats   — extracted from the authors' wgs project (`src/finance.zig`,
-               MIT), itself a faithful port of poc-wf-analytic's `reader.zig`
-               (same authors); design ref (behavior/metric-set only, no code
-               consulted or copied): Python empyrical (Apache-2.0), ffn (MIT),
-               and a QuantLib subset (QuantLib license, BSD-style). The
-               ultimate data source in that lineage is WealthFolio
-               (AGPL-3.0); the relationship is data-only interop — only the
-               SQLite schema was read via SQL, no WealthFolio source or
-               crates were linked or ported — so no AGPL obligation attaches.
+  finstats   — the authors' own original work; design ref (behavior/metric-set
+               only, no code consulted or copied): Python empyrical
+               (Apache-2.0), ffn (MIT), and a QuantLib subset (QuantLib
+               license, BSD-style). The ultimate data source in that lineage
+               is WealthFolio (AGPL-3.0); the relationship is data-only
+               interop — only the SQLite schema was read via SQL, no
+               WealthFolio source or crates were linked or ported — so no AGPL
+               obligation attaches.
 
-  tabular    — the authors' own code (wgs `src/transforms.zig`/`src/
-               series.zig`, MIT); design ref: pandas (BSD-3-Clause) and dplyr
-               (MIT) — verb-algebra naming/behavior only, no source consulted
-               or copied.
+  tabular    — design ref: pandas (BSD-3-Clause) and dplyr (MIT) — verb-algebra
+               naming/behavior only, no source consulted or copied. Original
+               work of the authors, no third-party source copied.
 
-  dataset    — the authors' own code (wgs / poc-wf-analytic, MIT); no
-               third-party source consulted or copied.
-
-  jsonshape  — the authors' own code (wgs `src/jsonshape.zig`, MIT); no
-               third-party source consulted or copied.
-
-  ipcbus     — the authors' own code (extracted and refactored from
-               poc-wf-analytic's `src/main.zig`, MIT); no third-party source
-               consulted or copied.
-
-  pollworker — the authors' own code (extracted and generalized from
-               poc-wf-analytic's `src/main.zig`, MIT); no third-party source
-               consulted or copied.
-
-See each module's README "Provenance" note for its specific seed and reference.
+See each module's README "Provenance" note for its specific design references.

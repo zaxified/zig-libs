@@ -5,12 +5,12 @@ five European code pages a legacy broker / Excel export is realistically saved
 in. Internal currency everywhere else is always UTF-8; this module only runs at
 the read edge (decode → UTF-8) and the write edge (encode ← UTF-8).
 
-- **Status:** `extract` — lifted from bxp `bxp-core/src/encoding.zig`.
+- **Status:** `extract`.
 - **Model after:** WHATWG Encoding Standard (the single-byte European subset).
 - **Platform:** any (pure logic, no OS calls). **Role:** codec.
   **Concurrency:** reentrant (no shared state — the tables are `const`).
 
-Provenance: extracted from bxp `bxp-core/src/encoding.zig` (same author, MIT).
+Provenance: original work of the zig-libs authors (MIT).
 This is the WHATWG **single-byte European subset** — the deliberate, complete
 scope of this module (the legacy code pages a European broker / Excel export is
 realistically saved in). Broader coverage (other single-byte pages, multi-byte/

@@ -20,8 +20,8 @@ Pairs with the `whois` module.
   (bootstrap CIDR matching).
 
 Provenance: clean-room from RFCs 7480/7482/7483/7484/9224 (plus their
-9082/9083 renumberings). No third-party RDAP implementation consulted or
-copied.
+9082/9083 renumberings) — original work of the zig-libs authors (MIT). No
+third-party RDAP implementation consulted or copied.
 
 ## API
 

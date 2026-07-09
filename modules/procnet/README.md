@@ -6,16 +6,15 @@ health snapshot (uptime/load/memory/thermal/conntrack pressure) — all
 returning typed values (`netaddr.Ip`/`Prefix`, not allocated dotted-string
 IPs).
 
-Provenance: extracted and retyped from the authors' axp project
-(`axp-core/src/task.zig` — `routesOutcome`/`leHexToV4` for
-`/proc/net/route`, `socketsOutcome` for `/proc/net/{tcp,udp}`,
-`conntrackOutcome`/`kvField` for `/proc/net/nf_conntrack`, `parseProcStat`
-for `/proc/<pid>/stat`, plus the `snapshot`/thermal-zone/meminfo helpers;
-MIT, the authors' own code). `arp.zig` (`/proc/net/arp`) has no direct axp
-precedent — clean-room from `proc(5)`. IPv6 socket-table support
-(`tcp6`/`udp6`) and the little-endian-hex→`netaddr.Ip` decode for 16-byte
-addresses are new (verified against real kernel snapshots — see the test
-fixtures under `src/testdata/`), extending the axp seed's IPv4-only reads.
+Provenance: original work of the zig-libs authors (MIT) — typed parsers for
+`/proc/net/route` (`routesOutcome`/`leHexToV4`), `/proc/net/{tcp,udp}`
+(`socketsOutcome`), `/proc/net/nf_conntrack` (`conntrackOutcome`/`kvField`),
+and `/proc/<pid>/stat` (`parseProcStat`), plus the `snapshot`/thermal-zone/
+meminfo helpers. `arp.zig` (`/proc/net/arp`) is clean-room from `proc(5)`.
+IPv6 socket-table support (`tcp6`/`udp6`) and the little-endian-hex→
+`netaddr.Ip` decode for 16-byte addresses are verified against real kernel
+snapshots (see the test fixtures under `src/testdata/`), extending IPv4-only
+reads to full dual-stack coverage.
 
 - **Status:** `extract`.
 - **Model after:** gopsutil (Go) / procps-ng.
@@ -73,7 +72,7 @@ file yields an empty result, not an error.
 - Malformed rows are skipped, not fatal — one corrupt line never sinks the
   whole table.
 - `SocketEntry`/`parseTcp`/`parseUdp` return *every* row with its `state`
-  (not just `LISTEN`/bound, unlike the axp seed) — filtering is the
+  (not pre-filtered to `LISTEN`/bound) — filtering is the
   caller's job now that the type carries state.
 - `SockState` reuses the kernel's `net/tcp_states.h` values for UDP too:
   `.close` (0x07) means "unconnected/bound", `.established` (0x01) means
@@ -86,7 +85,7 @@ file yields an empty result, not an error.
 
 - `/proc/net/dev` interface byte/packet counters — a different shape
   (per-iface throughput, not a neighbor/route/socket table); own parser.
-- `/proc/diskstats` — disk I/O counters; no seed precedent, needs its own
+- `/proc/diskstats` — disk I/O counters; not yet covered, needs its own
   design pass.
 - `/proc/<pid>/status` — richer per-process fields (VmRSS breakdown, uid/gid,
   cgroup) beyond `stat`'s scalars; a `status.zig` sibling to `process.zig`.

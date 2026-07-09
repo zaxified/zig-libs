@@ -1,6 +1,6 @@
 # requestid — spec
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see ./README.md (no NOTICE entry — a generic HTTP convention, not third-party code).
 
 ## Design & invariants
 

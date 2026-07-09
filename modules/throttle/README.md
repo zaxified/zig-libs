@@ -7,12 +7,12 @@ bounds **total concurrent in-flight requests** — when the server is
 saturated it sheds load (a fast 503) instead of collapsing under an
 unbounded queue. The "survive a spike" piece of the Web/API cluster.
 
-Provenance: clean-room — no seed project and no third-party code. Design
-references: Go `golang.org/x/sync/semaphore` (BSD-3-Clause, The Go Authors;
-slot semantics only, no source copied), Netflix concurrency-limits
-(Apache-2.0; design notes only) and the SEDA architecture (Welsh et al.,
-SOSP '01; bounded-queue load shedding), plus the `ratelimit` sibling for the
-idempotent-503/clock-injection patterns.
+Provenance: original work of the zig-libs authors (MIT); modeled after Go
+`golang.org/x/sync/semaphore` (BSD-3-Clause, The Go Authors; slot semantics
+only, no source copied), Netflix concurrency-limits (Apache-2.0; design
+notes only) and the SEDA architecture (Welsh et al., SOSP '01; bounded-queue
+load shedding) — see NOTICE. Clock-injection patterns follow the
+`ratelimit` sibling module.
 
 - **Status:** `gap`.
 - **Model after:** Go `golang.org/x/sync/semaphore` (tryAcquire never

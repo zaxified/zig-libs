@@ -1,6 +1,7 @@
 # rawsock — spec
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: original work of
+the zig-libs authors (MIT).
 
 ## Design & invariants
 
@@ -8,13 +9,13 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
   one EtherType (or every frame, `eth_p.all`), decode the kernel's `sockaddr_ll` into a typed
   `Frame`, attach an in-kernel classic-BPF filter, toggle promiscuous mode, and cook-inject frames
   on a named interface (a `SOCK_DGRAM` socket where the kernel builds the Ethernet header) or
-  transmit a complete frame on the raw socket (`sendRaw`). Seeded from the authors' own axp
-  `axp-core/src/task.zig` (`openPacketCapture`/`ifNameOf`, MIT, the receive-only ~25-LOC core); the
+  transmit a complete frame on the raw socket (`sendRaw`). Original work of the zig-libs authors
+  (MIT), starting from a minimal receive-only ~25-LOC core (`openPacketCapture`/`ifNameOf`); the
   send path, `SO_ATTACH_FILTER` filtering, `PACKET_ADD_MEMBERSHIP` promiscuous mode, interface
   enumeration, and the typed `Frame`/`LinkAddr`/`EthHeader` decode are new construction. Wire layout
   clean-room from `packet(7)`, Linux UAPI headers (`<linux/if_packet.h>`, `<linux/if_ether.h>`,
   `<linux/filter.h>`), IEEE 802.3/802.1AB, and ARP, with EtherStruct (BSD-2-Clause) consulted
-  only as a header-field-order cross-check (no source copied) — see NOTICE. libpcap was not
+  only as a header-field-order cross-check (no source copied). libpcap was not
   consulted.
 - **Pure helpers need no socket/privilege:** `EthHeader.parse`/`.write`, `parseHwaddr`/
   `formatHwaddr` (MAC ⇄ `"aa:bb:cc:dd:ee:ff"`), `LinkAddr.fromSockaddr` (the `sockaddr_ll` decode
@@ -60,6 +61,6 @@ for the full socket path).
 
 ## Status
 
-`gap (built: seed = axp task.zig openPacketCapture/ifNameOf, receive-only) · linux · both
+`gap (built: from a minimal receive-only core, openPacketCapture/ifNameOf) · linux · both
 (capture + inject) · reentrant` + deps: `netaddr` — canonical source is `pub const meta` in
 src/root.zig.

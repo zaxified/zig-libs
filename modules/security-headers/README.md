@@ -7,12 +7,13 @@ Cross-Origin isolation trio (COOP/CORP/COEP) and an optional `Server`
 replacement — each individually overridable or disable-able. The hardening
 baseline for a directly-internet-facing API (T5.6 of the Web/API cluster).
 
-Provenance: clean-room — no seed project and no third-party code. Design
-references: helmet.js (MIT; defaults vocabulary and per-header on/off model —
-no source copied; the `csp_helmet_default` constant reproduces helmet's
-default policy *value* as configuration data) and the OWASP Secure Headers
-Project (best-practice header catalog). Header semantics from the standards:
-RFC 6797 (HSTS), CSP Level 3, Fetch/HTML specs (COOP/CORP/COEP), RFC 9110.
+Provenance: original work of the zig-libs authors (MIT); modeled after
+helmet.js (MIT; defaults vocabulary and per-header on/off model — no source
+copied; the `csp_helmet_default` constant reproduces helmet's default policy
+*value* as configuration data) and the OWASP Secure Headers Project
+(best-practice header catalog) — see NOTICE. Header semantics from the
+standards: RFC 6797 (HSTS), CSP Level 3, Fetch/HTML specs (COOP/CORP/COEP),
+RFC 9110.
 
 - **Status:** `gap`.
 - **Model after:** helmet.js defaults + OWASP Secure Headers Project.

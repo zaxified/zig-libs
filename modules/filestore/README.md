@@ -4,24 +4,19 @@ DB-less durable keyed document store: one flat file per record under
 `<base>/<kind>/<key>`, written atomically (temp-then-rename), with a thin
 typed-JSON convenience layer over the same raw-bytes files.
 
-- **Status:** `extract` — carved out of the authors' axp project
-  (`axp-central/src/store.zig`), then spec-completed (atomic writes, path
-  validation, listTyped skip-count — the seed had none of these).
-- **Model after:** flat-file document store (the axp resource store this was
-  seeded from).
+- **Status:** `extract` — spec-completed: atomic writes, path validation,
+  listTyped skip-count.
+- **Model after:** flat-file document store.
 - **Platform:** posix (visibility relies on atomic `rename(2)`; filesystem via
   `std.Io`). **Role:** util. **Concurrency:** reentrant — no shared state
   except a process-local atomic counter for ingest temp names.
 - **Deps:** none — std only.
 
-Provenance: extracted from the authors' own axp project
-(`axp-central/src/store.zig`; axp is the authors' code, MIT). The
-`kind/id.json` layout and the read/list/delete shape are the seed's; atomic
-temp-then-rename writes and `segmentSafe` path validation (the seed had
-*neither* — it wrote JSON directly with `writeFile` and built paths with no
-traversal guard) are written for this module, mirroring the sibling
-`blobstore` module's approach. The `listTyped` skipped-count report is also
-new — the seed's `listRecords` swallowed unparseable files via a silent
+Provenance: original work of the zig-libs authors (MIT). Atomic
+temp-then-rename writes and `segmentSafe` path validation (no JSON is ever
+written in place, and no path is built without a traversal guard) mirror the
+sibling `blobstore` module's approach. The `listTyped` skipped-count report
+surfaces unparseable files instead of swallowing them via a silent
 `catch continue`. No third-party source involved — no NOTICE entry.
 
 ## Layout
@@ -68,20 +63,18 @@ const all = try store.listTyped(MyRecord, arena, "devices");            // struc
 - **Typed JSON is a thin layer, not a second store.** `put`/`get`/`listTyped`
   serialize/parse JSON and call straight through to the raw-bytes layer — same
   atomicity, same path safety, same files. Mixing raw and typed access to the
-  same `kind` is the caller's own responsibility (as in the seed).
+  same `kind` is the caller's own responsibility.
 - **`listTyped` tolerance.** A kind directory may accumulate records from
   different code versions or a half-written record from a concurrent `put`
   racing a `list` snapshot. Rather than fail the whole listing, unparseable
   files are skipped — but the count is returned (`skipped`) so callers can
-  detect and alert on drift, instead of the seed's silent `catch continue`.
-- **Deltas vs the seed.** `axp-central/src/store.zig` wrote records directly
-  with `Dir.writeFile` (no temp, no rename — a crash mid-write could leave a
-  torn `.json` file) and built every path with plain `bufPrint` (no segment
-  validation — a hostile/buggy `id` containing `../` could escape `base`).
-  Both are fixed here. The per-resource one-liner wrappers (`putDevice`,
-  `putIdentity`, `putTask`, ...) and the `nextPendingTask` query are consumer
-  glue specific to axp's resource types and are not part of this generic
-  module.
+  detect and alert on drift, rather than silently dropping them.
+- **Crash safety by construction.** Records never land in place: every write
+  goes to a temp then a single `rename(2)` (a crash mid-write leaves only an
+  orphaned temp, never a torn file), and every path is built through
+  `segmentSafe` (a hostile/buggy `id` containing `../` can never escape
+  `base`). Per-resource one-liner wrappers and domain-specific queries are
+  consumer glue, not part of this generic module.
 
 ## Backlog (deferred, not implemented)
 

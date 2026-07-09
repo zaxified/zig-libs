@@ -52,9 +52,9 @@ Body reads and response framing happen outside the lock.
   `http`, `mcp`.
 
 Provenance: clean-room from the MCP Streamable HTTP transport specification
-(2025-06-18) + JSON-RPC 2.0; the behavioral contract was cross-checked against
-the authors' own bxp-gui Dart server (wrapping the third-party `mcp_dart`) for
-parity — no `mcp_dart` or other MCP-transport source consulted or copied.
+(2025-06-18) + JSON-RPC 2.0; the behavioral contract was cross-checked for
+parity against a reference Dart server wrapping the third-party `mcp_dart`
+package — no `mcp_dart` or other MCP-transport source consulted or copied.
 
 ## Verification
 

@@ -1,6 +1,6 @@
 # zipstream — spec
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see ./README.md (no NOTICE entry — own code; wire format is the public PKWARE ZIP spec).
 
 ## Design & invariants
 Streaming ZIP archive reader: walk the central directory once, then stream each member's
@@ -18,8 +18,8 @@ stream's input handle) — must be initialized in place via a `*Self` and never 
 share the `Archive`'s single file cursor, so one `EntryReader` must finish (or be abandoned) before
 the next opens. Reentrant — one `Archive` owns one file cursor; no globals, no shared state between
 instances. Std-only: `std.zip` for the wire structs/central-directory walk, `std.compress.flate` for
-Deflate. Extracted from the authors' bxp project (`bxp-core/src/zipstream.zig`); wire format is the
-public PKWARE ZIP spec (APPNOTE.TXT) — see NOTICE.
+Deflate. Original work of the zig-libs authors (MIT); wire format is the public PKWARE ZIP spec
+(APPNOTE.TXT) — no third-party source, no NOTICE entry needed.
 
 ## Threat model / out of scope
 Untrusted-archive hardening: a corrupted local file header signature → `EntryReader.init` returns

@@ -3,8 +3,8 @@
 Locale-aware **grouped-number parsing** — thousands + decimal separators into
 an exact `decimal.Decimal`, with strict structural validation.
 
-- **Status:** `extract` — carved from bxp `bxp-core/src/expr.zig`
-  (`parseGroupedNumber`), one function out of a ~6.5k-LOC expression engine.
+- **Status:** `extract` — one function's worth of scope, generalized as a
+  standalone module.
 - **Model after:** ICU `NumberFormat` parse (the western 3-digit grouping
   subset).
 - **Platform:** any (pure logic, no OS calls). **Role:** util.
@@ -12,10 +12,9 @@ an exact `decimal.Decimal`, with strict structural validation.
   normalized digits are rewritten into a stack buffer.
 - **Deps:** `decimal`.
 
-Provenance: extracted from bxp `bxp-core/src/expr.zig` (`parseGroupedNumber`;
-the user's own code, MIT). The expr-internal `Value.toNumber()` glue was
-replaced with a direct `decimal.Decimal.parse` on the normalized string. No
-third-party code.
+Provenance: original work of the zig-libs authors (MIT). The expr-internal
+`Value.toNumber()` glue was replaced with a direct `decimal.Decimal.parse` on
+the normalized string. No third-party code.
 
 ## Semantics
 
@@ -42,13 +41,13 @@ Grammar: `[-]?d{1,3}(<thousands>d{3})+(<decimal>d+)?`
   trailing characters) or when the normalized value is out of the `decimal`
   range.
 
-## Changes vs the seed
+## Implementation notes
 
 Semantics (grammar, strictness) are preserved exactly. Two mechanical
-adaptations from the expr-engine seed:
+adaptations from an earlier design iteration:
 
-- The final re-parse targets the extracted `decimal` module. Its `parse`
-  returns an error union (not the seed's `?Decimal`), so a malformed or
+- The final re-parse targets the `decimal` module. Its `parse`
+  returns an error union, so a malformed or
   out-of-range normalized string maps back to `null` via `catch null`.
 - Parameters renamed `thousands`/`decimal` → `thousands_sep`/`decimal_sep`
   (avoids colliding with the `decimal` dependency name).

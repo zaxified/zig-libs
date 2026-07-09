@@ -1,6 +1,7 @@
 # json5 — spec
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: original work of
+the zig-libs authors (MIT).
 
 ## Design & invariants
 
@@ -9,9 +10,8 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
   object keys (`foo:` → `"foo":`), removes trailing commas before `}`/`]`, and converts
   single-quoted strings to double-quoted — all string contexts are respected so none of the above
   transformations are applied inside string literals. Modeled after the JSON5 spec (json5.org)
-  preprocessor-to-JSON approach, but implements the practical subset the seed's config/editor use
-  case needs, not the full grammar (see Backlog). Extracted from `bxp-core/src/json5.zig`, ported
-  verbatim — see NOTICE.
+  preprocessor-to-JSON approach, but implements the practical subset a config/editor use
+  case needs, not the full grammar (see Backlog). Original work of the zig-libs authors (MIT).
 - **`preprocessAnnotated`** is a lenient variant for GUI/editor use: instead of failing on malformed
   input it recovers — missing colons, missing commas, unterminated strings, invalid bare literals —
   and surfaces each recovered problem as a synthetic `"$err_<N>": "<message>"` sibling entry in the

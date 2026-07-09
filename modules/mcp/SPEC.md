@@ -1,6 +1,7 @@
 # mcp — spec
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: original work of
+the zig-libs authors (MIT).
 
 ## Design & invariants
 
@@ -14,7 +15,7 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
   `prompts/list`, `prompts/get`, `ping`, and server→client `notifications/progress`. Subscriptions,
   list-change notifications and pagination (`nextCursor`) are deliberately not implemented (the
   advertised capabilities say so). Modeled after MCP spec revision 2025-11-25 + JSON-RPC 2.0; the
-  JSON-RPC core is extracted from the authors' bxp `bxp-mcp/src/server.zig` — see NOTICE.
+  JSON-RPC core is the zig-libs authors' original work (MIT).
 - **Dispatch + ctx.** Tools dispatch by name; resources resolve by uri (exact static match first,
   then each registered template handler in order); prompts dispatch by name with declared required
   arguments validated by the server (-32602) before the handler runs. Every handler receives the

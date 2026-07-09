@@ -7,7 +7,7 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
 - **Precomputed, stateless, reentrant:** an initialized `SecurityHeaders` is immutable — no clock,
   no allocation, no locks on the hot path (the HSTS value string is formatted once at `init` into
   an embedded buffer). Safe to share across all of `http.Server`'s connection threads. Clean-room,
-  no seed project; modeled after helmet.js (MIT; defaults vocabulary and per-header on/off model —
+  modeled after helmet.js (MIT; defaults vocabulary and per-header on/off model —
   no source copied, `csp_helmet_default` reproduces helmet's default policy *value* as configuration
   data) and the OWASP Secure Headers Project. Header semantics come from the standards: RFC 6797
   (HSTS), CSP Level 3, the Fetch/HTML specs (COOP/CORP/COEP), RFC 9110 — see NOTICE.

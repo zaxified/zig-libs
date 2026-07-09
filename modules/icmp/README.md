@@ -4,11 +4,11 @@ ICMP echo (**ping**) engine: pure ICMPv4/v6 **echo codec**, unprivileged/raw
 **ICMP sockets**, and a paced multi-target **Pinger** built for monitoring
 workloads (thousands of host checks per cycle).
 
-- **Status:** `extract` — lifted from zig-fping `src/{icmp,socket,pinger}.zig`
-  (netaddr was the first carve-out from the same seed).
-- **Model after:** fping (schweikert/fping) `main_loop`, via the authors'
-  zig-fping port — plus that port's scaling additions (binary-heap scheduling,
-  in-flight cap, per-subnet spacing, first-probe jitter, sendmmsg/recvmmsg).
+- **Status:** `extract` — derived from fping's icmp/socket/pinger logic
+  (netaddr was the first carve-out from the same lineage).
+- **Model after:** fping (schweikert/fping) `main_loop` — plus scaling
+  additions (binary-heap scheduling, in-flight cap, per-subnet spacing,
+  first-probe jitter, sendmmsg/recvmmsg).
 - **Why:** no small pure-Zig ICMP library exists; std has no ICMP support.
 - **Platform:** linux (raw errno-encoded `std.os.linux` syscalls, no libc —
   conscious ceiling per BRIEF). **Role:** client. **Concurrency:**
@@ -16,11 +16,9 @@ workloads (thousands of host checks per cycle).
   async-signal-safe).
 - **Deps:** `seqmap` (reply correlation), `netaddr` (address parse/format).
 
-Provenance: extracted from the authors' `zig-fping`
-`src/{icmp,socket,pinger}.zig`, a Zig reimplementation of fping
-(schweikert/fping) — the required fping/Stanford attribution is in the
-repository `NOTICE`. Wire formats per RFC 792 (ICMP), RFC 4443 (ICMPv6),
-RFC 1071 (internet checksum).
+Provenance: derived from fping (schweikert/fping) — the required fping/
+Stanford attribution is in the repository `NOTICE`. Wire formats per RFC 792
+(ICMP), RFC 4443 (ICMPv6), RFC 1071 (internet checksum).
 
 ## API
 

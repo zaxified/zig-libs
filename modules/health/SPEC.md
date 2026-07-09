@@ -15,7 +15,8 @@ assembled on the stack and written through the response writer. Concurrency: con
 after init (threadsafe); readiness is only as thread-safe as the caller's `Check.checkFn`, which
 runs on the connection thread — callers are told to keep it a non-blocking, thread-safe atomic-flag
 load. Clean-room from the documented Kubernetes liveness/readiness probe model and the conventional
-`/healthz`–`/readyz` endpoints; no seed, no NOTICE entry beyond the public k8s convention itself.
+`/healthz`–`/readyz` endpoints; original work of the zig-libs authors, no NOTICE entry beyond the
+public k8s convention itself.
 
 ## Threat model / out of scope
 Not a security boundary: the probe paths are intentionally unauthenticated (an orchestrator has no

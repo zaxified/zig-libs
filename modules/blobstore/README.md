@@ -5,22 +5,18 @@ get back its SHA-256 address; identical content is stored **once**. Plus a
 name-addressed raw layer and small opaque **named** records — all made
 crash-safe by temp-then-atomic-rename.
 
-- **Status:** `extract` — carved out of the authors' axp project
-  (`axp-vault/src/store.zig`), then spec-completed (single-pass `put`, `verify`,
-  segment validation, `Digest`, `named` generalization).
+- **Status:** `extract` — spec-completed: single-pass `put`, `verify`,
+  segment validation, `Digest`, `named` generalization.
 - **Model after:** git object store / restic (256-way hex fan-out, dedup).
 - **Platform:** posix (visibility relies on atomic `rename(2)`; filesystem via
   `std.Io`). **Role:** util. **Concurrency:** reentrant — no shared state except
   a process-local atomic counter for ingest temp names.
 - **Deps:** `hashdigest` (SHA-256; nothing cryptographic is reimplemented here).
 
-Provenance: extracted from the authors' own axp project
-(`axp-vault/src/store.zig`; bxp/axp are the authors' code, MIT). The raw / CAS /
-scratch / manifest storage substance and `segmentSafe` are the seed's; `put`
-(single-pass hash-while-write), `verify` (bit-rot detection), the `Digest` type,
-per-entry-point segment validation, and the `named` generalization past axp's
-`device/key.json` scheme are written for this module. SHA-256 comes from the
-sibling `hashdigest` module. No third-party source involved — no NOTICE entry.
+Provenance: original work of the zig-libs authors (MIT); modeled after the git
+object store / restic content-addressing design (256-way hex fan-out, dedup —
+behavior only, no source consulted or copied). SHA-256 comes from the sibling
+`hashdigest` module. No third-party source involved — no NOTICE entry.
 
 ## Layout
 
@@ -79,12 +75,11 @@ const keys = try store.listNamed(arena, "hostA");              // [][]const u8
 - **Verification.** `verify` re-reads the stored bytes to EOF (via
   `hashdigest.sha256File`, which does not trust `stat().size`) and compares the
   hash to the address — catching silent bit-rot or tampering.
-- **Deltas vs the seed.** The seed made the caller hash externally and pass the
-  hex to `casCommit`; here `put` owns the hash-while-write. `verify`, `Digest`,
-  and segment validation on entry points are new. axp's `raw/<device>/<key>` and
-  `manifests/<device>/<key>.json` are generalized to `raw/<ns>/<key>` and opaque
-  `named/<ns>/<key>` (any bytes, not just JSON). The JSON/Outcome wrapping axp
-  layered on top is dropped — this is pure storage.
+- **Design choices.** `put` owns the hash-while-write (a single streaming
+  pass), so callers never hash externally. `verify` re-reads to detect
+  bit-rot; `Digest` and per-entry-point segment validation guard every path.
+  The raw layer is `raw/<ns>/<key>` and opaque records are `named/<ns>/<key>`
+  (any bytes, not just JSON) — no JSON/Outcome wrapping, this is pure storage.
 
 ## Backlog (deferred, not implemented)
 

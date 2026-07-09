@@ -9,9 +9,9 @@ Usage: see ./README.md. Attribution/provenance: see /NOTICE.
   `reject_substrings`, `reject_leading_dash`, `reject_control`). `check()` never allocates or
   panics; `predicate()` adapts a comptime-known class to `fn([]const u8) bool`.
 - **Convenience predicates** (`isSafeIdentifier`, `isSafePath`, `isSafeUrl`, `isSafeBase64`,
-  `isSafeCidrList`, `isSafeKvValue`, `isInAllowlist`) reconstruct the 14 seed validators on top of
+  `isSafeCidrList`, `isSafeKvValue`, `isInAllowlist`) cover the common validator shapes on top of
   `CharClass`, with the safe behavior (leading-dash reject, `..` reject) as the **default** for all
-  of them — the seed only guarded some.
+  of them.
 - **`Argv`** builder makes an unvalidated element unrepresentable: the only append methods are
   `push` (comptime-literal only — cannot carry runtime input) and `pushChecked`/`pushIf`
   (validated). A rejected push **poisons** the builder so `slice()` returns `error.Rejected` even if
@@ -34,12 +34,12 @@ overridable), control-byte/newline injection, path traversal (`..`), and length 
 Windows `CommandLineToArgvW` quoting (POSIX argv only — Windows backslash-before-quote rules are a
 different hazard, not covered); environment-variable injection (`std.process.Child.env_map` is out
 of scope, argv only); no first-principles justification for the per-encoding length bounds — they
-are the proven-in-production ceilings carried from axp (path ≤4096, url ≤1024, cidr ≤256, base64
+are the proven-in-production ceilings carried from the pre-consolidation validators (path ≤4096, url ≤1024, cidr ≤256, base64
 44/≤512).
 
 ## Verification
-`zig build test-argsafe`. Golden allow/reject tables reconstructing the seed validators (incl.
-base64 exactly-44 with 43/45 rejected, `isSafePath` now rejecting the `..` the seed accepted,
+`zig build test-argsafe`. Golden allow/reject tables covering every validator (incl.
+base64 exactly-44 with 43/45 rejected, `isSafePath` rejecting `..`,
 `isSafeCidrList` rejecting a leading dash even when the caller's `sep` is `'-'` itself), a
 property-style adversarial sweep feeding every predicate a raw NUL/`\n`/leading-`-`/`..`/DEL/ESC and
 asserting none are accepted, and `Argv` tests (validated build; a rejected `pushChecked`/`pushIf`

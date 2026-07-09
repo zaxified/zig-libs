@@ -2,9 +2,8 @@
 
 IANA time-zone offset lookup: zone name → UTC offset/DST at a given instant.
 
-- **Status:** `extract` — lifted from bxp `bxp-core/src/tz.zig`, composing the
-  `datefmt` module (extracted separately) for the POSIX-TZ footer's calendar
-  math.
+- **Status:** `extract` — composes the `datefmt` module for the POSIX-TZ
+  footer's calendar math.
 - **Model after:** IANA tzdata (`zic`) + the POSIX `TZ` footer rule
   (RFC 9636 §3.3 / `tzfile(5)`).
 - **Platform:** any (pure logic, no OS calls, no filesystem — the whole
@@ -60,15 +59,14 @@ spelling exactly). `offsetAt`:
   implemented; `offsetAt` falls back to the last explicit transition's
   offset for a zone whose footer uses one of those (none currently do).
 - Regenerating `tz_data.zig` from a newer IANA tzdata release: the generator
-  (`tz-gen`) lives in the bxp repo (`bxp/tools/tz-gen`), not in this module —
-  it is not ported here, only referenced.
+  (`tz-gen`) is a separate tool, not ported into this module — it is not
+  included here, only referenced.
 
-Provenance: `src/root.zig` extracted from bxp `bxp-core/src/tz.zig` (same
-authors, MIT); `src/tz_data.zig` copied verbatim from bxp
-`bxp-core/src/tz_data.zig` (same authors, MIT), which is itself generated
-by bxp's `tools/tz-gen` from the IANA tzdata 2026a release (public domain)
-— 600 zones, transitions from 1970 onward plus POSIX-TZ footer rule per
-zone. See `NOTICE`.
+Provenance: `src/root.zig` is original work of the zig-libs authors (MIT);
+`src/tz_data.zig` is generated data — the UTC-offset transition tables and
+POSIX-TZ footer rule per zone (600 zones, transitions from 1970 onward),
+produced ahead of time by the `tz-gen` tool from the IANA Time Zone Database
+(tzdata 2026a release, public domain). See `NOTICE`.
 
 ## Verify
 

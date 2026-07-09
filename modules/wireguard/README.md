@@ -16,10 +16,11 @@ API: get/set devices, peers and allowed-ips — no `wg` shell-outs.
   kernel registers the family with `GENL_UNS_ADMIN_PERM`). Family *resolve*
   is unprivileged.
 
-Provenance: clean-room from the documented WireGuard netlink UAPI
-(`uapi/wireguard.h`, GPL-2.0 WITH Linux-syscall-note — the command/attribute/
-flag constants and layouts are the kernel's OS ABI, not copyrightable
-interface code) and `linux/genetlink.h`. Behavior modeled after wgctrl-go
+Provenance: original work of the zig-libs authors (MIT); clean-room from
+the documented WireGuard netlink UAPI (`uapi/wireguard.h`, GPL-2.0 WITH
+Linux-syscall-note — the command/attribute/flag constants and layouts are
+the kernel's OS ABI, not copyrightable interface code) and
+`linux/genetlink.h`. Behavior modeled after wgctrl-go
 (golang.zx2c4.com/wireguard/wgctrl, MIT) and the `wg` tool's protocol usage —
 behavior/attribute-shape reference only, no source consulted or copied.
 See `NOTICE`.

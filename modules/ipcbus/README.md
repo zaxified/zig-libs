@@ -4,14 +4,12 @@ Same-host **unix-socket control plane**: one owner process serves
 request/reply over a length-prefixed unix socket, plus a capped in-memory
 key→bytes scratch **bus**. Linux, libc-free (raw `std.os.linux` syscalls).
 
-Provenance: extracted + refactored from `poc-wf-analytic/src/main.zig` — the
-raw unix transport (`unixAddr`/`connectUnix`/`listenUnix`/`writeAllFd`/
-`readExact`), the `ctlHandleConn` accept/dispatch/reply loop, and the
-`bus_map`/`busSet` scratch KV — same author's own code, MIT. The key refactor:
-the seed's giant `if/else eql` command chain is **pulled out** into a
+Provenance: original work of the zig-libs authors (MIT). Raw unix transport
+(`unixAddr`/`connectUnix`/`listenUnix`/`writeAllFd`/`readExact`), an
+accept/dispatch/reply loop, and a scratch KV map. Command handling is a
 caller-supplied `dispatch` callback, so this module hosts no application
 commands. Framing is delegated to the `framing` module (no re-implemented
-length prefix).
+length prefix). No third-party code.
 
 - **Status:** extract. **Platform:** linux (raw syscalls, no libc — a
   conscious ceiling). **Role:** server. **Deps:** `framing`.

@@ -6,8 +6,9 @@ generation-tied entry at once; stale entries drop **lazily on the next `get`**,
 no sweep). Byte-cap + entry-cap, **expired-then-LRU** eviction (an already-expired
 entry is always the first victim, else the least-recently-used).
 
-Provenance: extracted from poc-wf-analytic `src/cache.zig` (same authors,
-relicensed MIT).
+Provenance: original work of the zig-libs authors (MIT); the W-TinyLFU
+admission/eviction upgrade is clean-room from the TinyLFU paper (Einziger &
+Friedman) with design refs Caffeine and ristretto — see NOTICE.
 
 - **Model after:** Go `groupcache` / `ristretto`; the generation-tie is the novel bit.
 - **Platform:** any (pure `std`, dependency-free). **Role:** util.

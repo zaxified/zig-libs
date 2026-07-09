@@ -28,7 +28,7 @@ quoting is a flagged field (`unbalanced_quote`), never a hang or OOB read.
 
 ## Verification
 `zig build test-csvstream` (headless; Debug + ReleaseFast). 29 tests: `line.zig` carries 22 verbatim
-oracle tests ported from the bxp-core seed; `stream.zig` has 6 file/streaming + integration tests
+oracle tests; `stream.zig` has 6 file/streaming + integration tests
 (offsets index the exact source bytes across a multi-chunk file; a positional re-read proves
 seek-back); `root.zig` is a dark-tests aggregator (`test { _ = line; _ = stream; }`) so both
 submodules' tests run under a bare re-export.
@@ -37,8 +37,7 @@ submodules' tests run under a bare re-export.
 From README "Deferred (not implemented in v1)": configurable delimiter at the `StreamReader` level
 (currently only the quote char is a stream option; delimiter is caller-split) and a distinct
 quote-vs-escape char (RFC 4180 reuses the same char; some dialects use `\`); header-row handling (no
-built-in capture/name→index map — left to callers, e.g. bxp's `parseCsvHeader` stayed in bxp as app
-policy); typed field coercion (fields stay `[]const u8`, no schema); CSV writing (read-only; RFC
+built-in capture/name→index map — left to callers as app policy); typed field coercion (fields stay `[]const u8`, no schema); CSV writing (read-only; RFC
 4180 quoting-on-output lives with the sibling `csvsafe` injection guard, not general writing); BOM
 handling (not detected/stripped); strict RFC 4180 opt-in mode (multi-line quoted fields spanning
 `\n`, trailing-delimiter → final empty field — both currently deviate by design); field-count

@@ -5,10 +5,9 @@ stream each member's *decompressed* bytes on demand. No whole-archive or
 whole-entry buffering — memory use is O(one decompression window) regardless
 of archive or entry size.
 
-- **Status:** `extract` — carved out of the authors' bxp project, where it
-  backs the XLSX reader (an .xlsx is a ZIP of XML parts) and a CLI's
-  parallel prepass that streams zipped `.csv` members without touching ZIP
-  internals itself.
+- **Status:** `extract` — a streaming ZIP reader; an .xlsx is a ZIP of XML
+  parts, and it streams zipped `.csv` members without exposing ZIP internals
+  to the caller.
 - **Model after:** the ZIP central-directory layout in APPNOTE.TXT (the
   public PKWARE ZIP spec) — behavior only, no third-party source.
 - **Platform:** `any` (pure `std.Io`/`std.zip`/`std.compress.flate`, no OS-
@@ -18,9 +17,9 @@ of archive or entry size.
 - **Deps:** none (std only — `std.zip` for the wire structs/central-directory
   walk, `std.compress.flate` for Deflate).
 
-Provenance: extracted from the authors' bxp project
-(`bxp-core/src/zipstream.zig`; same author, MIT). The wire format is the
-public PKWARE ZIP spec (APPNOTE.TXT) — no third-party source involved.
+Provenance: original work of the zig-libs authors (MIT). The wire
+format is the public PKWARE ZIP spec (APPNOTE.TXT) — no third-party source
+involved; no NOTICE entry needed.
 
 ## Why
 

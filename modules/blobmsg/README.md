@@ -6,8 +6,8 @@ with JSON arguments, and subscribe to events — no `ubus` CLI shell-outs, no
 libubox binding, no libc. No pure-Zig ubus/blobmsg implementation exists
 elsewhere (goubus is HTTP/rpcd, python-ubus/golangwrt are cgo wrappers).
 
-- **Status:** `extract` — carved out of the authors' axp agent, where it
-  replaced per-read `ubus` CLI forks on real OpenWRT devices.
+- **Status:** `extract` — replaces per-read `ubus` CLI forks with a native
+  client on real OpenWRT devices.
 - **Model after:** the OpenWRT libubox/ubus wire format (clean-room).
 - **Platform:** the codec (`codec.zig`) is platform-pure — no I/O, compiles
   and tests anywhere; the socket client is linux (raw `std.os.linux`
@@ -15,14 +15,13 @@ elsewhere (goubus is HTTP/rpcd, python-ubus/golangwrt are cgo wrappers).
   **Concurrency:** reentrant (no globals; one `Client` per thread/loop).
 - **Deps:** none (std only — `std.json` for the JSON↔blobmsg mapping).
 
-Provenance: extracted from the authors' axp project (`axp-core/src/ubus.zig`;
-same authors, Apache-2.0, relicensed MIT by the copyright holder). The
-blob/blobmsg TLV codec is an independent Zig implementation of the OpenWRT
-libubox wire format specified in its headers `blob.h`/`blobmsg.h` (ISC); the
-ubus envelope reuses only the ubus protocol constants + the packed msghdr
-layout from `ubusmsg.h` (LGPL-2.1) as uncopyrightable protocol facts.
-`libubus-io.c` contributed no code — the socket transport is original.
-Byte-parity verified against `ubus -S` on real hardware. See `NOTICE`.
+Provenance: original work of the zig-libs authors (MIT). The blob/blobmsg TLV
+codec is an independent Zig implementation of the OpenWRT libubox wire format
+specified in its headers `blob.h`/`blobmsg.h` (ISC); the ubus envelope reuses
+only the ubus protocol constants + the packed msghdr layout from `ubusmsg.h`
+(LGPL-2.1) as uncopyrightable protocol facts. `libubus-io.c` contributed no
+code — the socket transport is original. Byte-parity verified against
+`ubus -S` on real hardware. See `NOTICE`.
 
 ## API
 
@@ -86,25 +85,23 @@ bool→INT8, integer→INT32 (INT64 when it overflows i32), float→DOUBLE.
   `max_depth` (64) so hostile 16 MiB-deep nesting cannot blow the stack.
   Malformed input → `error.Truncated`/`BadLength`/`TooDeep`, never a panic
   or OOB read. Walkers and the JSON decoder are fuzzed (`std.testing.fuzz`).
-- **Two daemon gotchas ported verbatim from the seed** (ubusd depends on
-  both): an INVOKE must carry `UBUS_ATTR_DATA` even with no arguments
+- **Two daemon behaviors the ubusd daemon requires** (both mandatory): an
+  INVOKE must carry `UBUS_ATTR_DATA` even with no arguments
   (INVALID_ARGUMENT otherwise), and the INVOKE reply choreography is
   ack-STATUS (no OBJID) → DATA → completion-STATUS (OBJID + return code) —
   while ubusd-internal objects (the event registry) answer directly with a
   single STATUS. The event "object" id must be blobmsg INT32, not the
   generic JSON-int mapping.
-- **Deltas vs the seed** (hardening, wire format untouched): one persistent
-  connection with per-request sequence numbers and reply matching on seq
-  (the seed reconnected per call and ignored seq); LOOKUP replies are
-  drained to their closing STATUS so the stream stays in sync; SOCK_CLOEXEC
-  on the socket; the reply cap raised to ubusd's own 1 MiB UBUS_MAX_MSG_LEN;
-  the HELLO greeting is required (its peer = the daemon-assigned
-  `client_id`); no hidden allocators (the seed drained HELLO with
-  `page_allocator`). The seed's CLI-fallback layer stayed in axp — this
-  module reports errors and lets the caller decide.
+- **Hardening choices** (wire format untouched): one persistent
+  connection with per-request sequence numbers and reply matching on seq;
+  LOOKUP replies are drained to their closing STATUS so the stream stays in
+  sync; SOCK_CLOEXEC on the socket; the reply cap is ubusd's own 1 MiB
+  UBUS_MAX_MSG_LEN; the HELLO greeting is required (its peer = the
+  daemon-assigned `client_id`); no hidden allocators. There is no
+  CLI-fallback layer — this module reports errors and lets the caller decide.
 - **Testing without hardware:** a scripted in-process daemon (unix socket +
-  thread) speaks the exact reply choreography, asserting both gotchas from
-  the daemon side; golden byte tests pin the wire format; a real-ubusd
-  integration test runs when `/var/run/ubus/ubus.sock` exists and skips
-  cleanly otherwise. Ground truth remains the seed's qemu parity check
+  thread) speaks the exact reply choreography, asserting both required
+  behaviors from the daemon side; golden byte tests pin the wire format; a
+  real-ubusd integration test runs when `/var/run/ubus/ubus.sock` exists and
+  skips cleanly otherwise. Ground truth is a qemu parity check
   (native output == `ubus -S`).

@@ -14,8 +14,8 @@ dynamic header values need caller-stable memory (documented per-helper). BYO-TLS
 `serveStream` / `connectH2Over` + ALPN run h2/h1 over a caller-terminated (TLS) stream — TLS
 termination is out of this module. Never-panic: malformed requests are typed errors → 400/413/414/
 431/500; handler errors/panics become a clean 500. Foundational module: `router`, `dns` (DoH),
-`rdap`, `acme`, `mcp-http`, and the whole REST/API cluster sit on it. Client shape extracted from
-axp `axp-core/httpclient.zig`+`http.zig`; design refs (behavior only, no source copied):
+`rdap`, `acme`, `mcp-http`, and the whole REST/API cluster sit on it. Original work of the zig-libs
+authors; design refs (behavior only, no source copied):
 lalinsky/dusty (1.1 client), Go net/http (redirect semantics, server shape, gzip handler); RFCs
 7230/9110 (1.1), 7541 (HPACK), 9113 (h2), 7301 (ALPN), 7233 (Range), 9110 §8.8/12 (conditional/
 content-negotiation), 7578 (multipart); TLS via `std.crypto.tls`. See NOTICE.

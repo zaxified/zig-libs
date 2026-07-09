@@ -4,17 +4,15 @@ Dataset algebra over [`dataset`](../dataset): pure `dataset → dataset` verbs.
 Nothing mutates in place — every transform takes an allocator (normally a
 caller-owned pipeline arena) and returns a new `Dataset`.
 
-- **Status:** `extract` — faithful lift from the authors' wgs project.
+- **Status:** `extract` — dataset-algebra verbs over the `dataset` module.
 - **Model after:** pandas / dplyr verb algebra + technical-analysis
   rolling-window idioms.
 - **Platform:** any. **Role:** util. **Concurrency:** reentrant (no shared
   state). **Deps:** `dataset`.
 
-Provenance: extracted from the authors' wgs project — `src/transforms.zig`
-(Tier 0) and `src/series.zig` (Tier 1), both MIT, same authors. Faithful
-lift: logic and hand-computed golden test values are unchanged; the only
-edit is the dependency import (`@import("dataset")` instead of the seed's
-local `dataset.zig`).
+Provenance: original work of the zig-libs authors (MIT); modeled after
+pandas (BSD-3-Clause) and dplyr (MIT) verb-algebra naming/behavior — see
+NOTICE.
 
 ## Layout
 

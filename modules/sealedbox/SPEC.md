@@ -1,6 +1,6 @@
 # sealedbox — spec
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see ./README.md (no NOTICE entry — public NaCl standard, no third-party code).
 
 ## Design & invariants
 
@@ -9,8 +9,8 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
   plaintext, and prepend the ephemeral public key. `open` recomputes the nonce and unboxes; a
   forged/tampered ciphertext fails the Poly1305 tag (authenticated). Modeled after libsodium
   `crypto_box_seal` / Go `nacl/box` — the public NaCl sealed-box standard; a thin layer over
-  `std.crypto` (X25519 + XSalsa20-Poly1305 as provided by std). Extracted from the authors' axp
-  `sealed.zig` (Apache-2.0, relicensed MIT) — see NOTICE.
+  `std.crypto` (X25519 + XSalsa20-Poly1305 as provided by std). Original work of the zig-libs
+  authors (MIT); no NOTICE entry needed (public NaCl standard, no third-party code).
 - **Allocation-free**, reentrant; keys are fixed-size arrays. `publicFromSecret` /
   `keyPairFromSecretKey` recover a keypair from a stored secret (via std `X25519.recoverPublicKey`)
   so a persisted secret round-trips. Serialization is fixed-size base64/hex with typed errors.

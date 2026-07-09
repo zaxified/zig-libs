@@ -39,8 +39,8 @@ edge-assigned header or set the header yourself.
   is meaningful only from the connection thread handling the request.
 
 Provenance: clean-room from the conventional `X-Request-Id` correlation-ID
-pattern (nginx `request_id`, Envoy `x-request-id`). No third-party source
-consulted or copied.
+pattern (nginx `request_id`, Envoy `x-request-id`) — original work of the
+zig-libs authors (MIT). No third-party source consulted or copied.
 
 ## Verification
 

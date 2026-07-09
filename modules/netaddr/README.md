@@ -2,7 +2,7 @@
 
 IP address parse/format + **RFC 6724** destination/source address selection.
 
-- **Status:** `extract` — ported from `zig-fping` `src/netutil.zig`
+- **Status:** `extract` — derived from fping's address-selection logic
   (`sortByDestinationPolicy`, `policyPrecedence`, `destinationReachable`),
   extended to the full RFC 6724 destination rule set.
 - **Model after:** Go `net/addrselect.go` + glibc `getaddrinfo` (UDP-connect
@@ -14,9 +14,9 @@ IP address parse/format + **RFC 6724** destination/source address selection.
   **Role:** util. **Concurrency:** reentrant (no shared state).
   **Allocation:** none, anywhere.
 
-Provenance: extracted from zig-fping `src/netutil.zig` (fping-derived — see
-the fping attribution in [NOTICE](../../NOTICE)); design refs (Go
-`net/addrselect`, glibc) in NOTICE.
+Provenance: derived from fping's address-selection logic (see the fping
+attribution in [NOTICE](../../NOTICE)); design refs (Go `net/addrselect`,
+glibc) in NOTICE.
 
 ## API
 

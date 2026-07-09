@@ -1,6 +1,6 @@
 # whois — spec
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see ./README.md (no NOTICE entry — clean-room from public RFC 3912, no third-party code).
 
 ## Design & invariants
 Transport seam, zero allocation: `Transport` is one function — connect to `server:port`, send the

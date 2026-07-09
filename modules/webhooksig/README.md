@@ -7,9 +7,10 @@ cluster.
 
 Provenance: clean-room from the GitHub / Stripe webhook-HMAC convention
 (`X-Signature-256: sha256=<hex>` / `X-Hub-Signature-256`) and RFC 2104
-(HMAC) over FIPS 180-4 SHA-256; no third-party source consulted or copied.
-Constant-time compare and the middleware shape mirror the sibling
-`aaa-gate` module (same repo, MIT).
+(HMAC) over FIPS 180-4 SHA-256 — original work of the zig-libs authors
+(MIT); no third-party source consulted or copied — see NOTICE. Constant-time
+compare and the middleware shape mirror the sibling `aaa-gate` module (same
+repo, MIT).
 
 - **Status:** `gap`.
 - **Model after:** GitHub / Stripe webhook HMAC signatures; RFC 2104 HMAC.

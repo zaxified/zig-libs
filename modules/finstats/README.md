@@ -8,7 +8,7 @@ drawdown-episode state machine. Every function is a pure transform: `Dataset →
 Dataset` (table/series producers) or `Dataset → f64` (scalar reducers), over a
 caller-owned allocator (normally an arena).
 
-- **Status:** `extract` — lifted from the authors' wgs `src/finance.zig`.
+- **Status:** `extract`.
 - **Model after:** the Python `empyrical` / `ffn` metric set and a QuantLib
   subset — mirrored, not invented.
 - **Platform:** any (pure logic, no OS calls). **Role:** util.
@@ -17,12 +17,10 @@ caller-owned allocator (normally an arena).
   `decimal` dependency: risk statistics are inherently floating-point;
   `decimal` is for exact ledger arithmetic, not variance/quantile math.
 
-Provenance: extracted from the authors' wgs project (`src/finance.zig`, MIT,
-same authors) — a faithful lift; algorithms and constants preserved exactly.
-That seed is itself a faithful port of poc-wf-analytic's `reader.zig` (the
-scalar KPI + risk kernels), so the numeric behaviour has now been carried
-through three code bases unchanged and is pinned by the 11 ported tests. No
-third-party code (see [NOTICE](../../NOTICE)).
+Provenance: original work of the zig-libs authors (MIT); modeled after the
+Python `empyrical`/`ffn` metric set and a QuantLib subset (behavior/
+metric-set only, no code consulted or copied) — see NOTICE. Algorithms and
+constants are exact and the numeric behaviour is pinned by 11 tests.
 
 ## Numeric conventions (kept exact — these are decisions, not bugs)
 

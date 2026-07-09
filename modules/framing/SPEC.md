@@ -5,8 +5,7 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
 ## Design & invariants
 
 - **Two layers, one module:** length-prefixed stream framing (`writeFrame`/`readFrame`) plus a
-  generic JSON tagged-union envelope codec (`EnvelopeCodec(T)`) on top. Folds what used to be two
-  small seed files (`wire.zig` + `message.zig`, extracted from `axp-core`) into one — see NOTICE.
+  generic JSON tagged-union envelope codec (`EnvelopeCodec(T)`) on top.
 - **Wire shape:** a 4-byte little-endian `u32` byte length, then that many raw payload bytes. This
   is length-prefixed, not newline-delimited — a payload may freely contain `\n`, `\r`, `NUL`, or
   any other byte. (The MCP stdio newline-delimited convention is a different framing, served by the
@@ -34,7 +33,7 @@ codec's concern.
 
 ## Verification
 
-10 tests, all on a domain-free test-only `union(enum)` (no AXP types imported): frame round-trip,
+10 tests, all on a domain-free test-only `union(enum)` (no application types imported): frame round-trip,
 oversize rejection on both the write and read paths (incl. `max_frame` enforced independently of
 buffer size), envelope round-trip (normal + empty payload), an enum-payload variant, a payload
 with embedded newline/`\r\n`/`NUL` bytes (proving the framing is not newline-delimited), a full

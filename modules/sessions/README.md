@@ -83,9 +83,10 @@ cross-site flows; CSRF token rotation / synchronizer-token mode and
 concurrent same-session read-modify-write races (last save wins); automatic
 CSRF body form-field extraction (use `Csrf.verify` from the handler instead).
 
-Provenance: greenfield; clean-room from the OWASP Session Management and CSRF
-Prevention Cheat Sheets. No third-party source consulted or copied; built on the
-sibling `router`, `http`, `cookies` and `ramcache` modules.
+Provenance: original work of the zig-libs authors (MIT); modeled after the
+OWASP Session Management and CSRF Prevention Cheat Sheets — see NOTICE. No
+third-party source consulted or copied; built on the sibling `router`,
+`http`, `cookies` and `ramcache` modules.
 
 ## Verification
 

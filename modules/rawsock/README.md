@@ -6,9 +6,10 @@ EtherType (or every frame), decode the kernel's `sockaddr_ll` into a typed
 `Frame`, attach an in-kernel **classic-BPF** filter, toggle **promiscuous**
 mode, and cook-inject frames on a named interface. No libpcap, no libc.
 
-- **Status:** `gap` (built) — the seed (`openPacketCapture` / `ifNameOf`) was
-  receive-only and inlined; send, BPF filtering, promiscuous mode, interface
-  enumeration and the typed frame/`sockaddr_ll` decode are new construction.
+- **Status:** `gap` (built) — the initial receive-only core
+  (`openPacketCapture` / `ifNameOf`) was inlined and minimal; send, BPF
+  filtering, promiscuous mode, interface enumeration and the typed
+  frame/`sockaddr_ll` decode are new construction.
 - **Model after:** libpcap's AF_PACKET path; wire semantics from `packet(7)`
   and the BPF UAPI (`<linux/filter.h>` / `<linux/if_packet.h>`).
 - **Why:** std has no AF_PACKET support; there is no small pure-Zig raw-L2
@@ -24,8 +25,8 @@ mode, and cook-inject frames on a named interface. No libpcap, no libc.
   returns a distinct `error.AccessDenied`. Interface lookups (`ifaceByName`)
   are unprivileged.
 
-Provenance: seeded from the authors' own `axp` `axp-core/src/task.zig`
-(`openPacketCapture` + `ifNameOf`, MIT) — the receive-only ~25-LOC core. The
+Provenance: original work of the zig-libs authors (MIT), starting from a
+minimal receive-only ~25-LOC core (`openPacketCapture` + `ifNameOf`). The
 send path, `SO_ATTACH_FILTER` filtering, `PACKET_ADD_MEMBERSHIP` promiscuous
 mode, interface enumeration, the `EtherType`/`pkt`/`bpf` enums and the typed
 `Frame` / `LinkAddr` / `EthHeader` decode are new. Wire layout clean-room from

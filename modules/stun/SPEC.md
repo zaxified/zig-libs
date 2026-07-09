@@ -37,8 +37,7 @@ checks fail. 12 tests. Run: `zig build test-stun` (Debug and `-Doptimize=Release
 
 ## Backlog / deferred
 Server side; long-term credential mechanism (RFC 8489 §9.2); UNKNOWN-ATTRIBUTES generation; ICE
-integration; TURN; TCP/TLS transport. (README "Deferred (not in v1)".) Owner note carried from
-README: add a NOTICE entry for RFC 8489/5769 and the ztun design reference if not already present.
+integration; TURN; TCP/TLS transport. (README "Deferred (not in v1)".)
 
 ## Status
 `gap · any (core pure; optional query helper does I/O) · codec · reentrant` + deps: `netaddr` —

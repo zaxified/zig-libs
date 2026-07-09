@@ -6,9 +6,8 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
 
 - **Same-host unix-socket control plane:** one owner process serves request/reply over a
   length-prefixed unix socket, plus a capped in-memory key→bytes scratch `Bus`. Linux, libc-free
-  (raw `std.os.linux` syscalls). Extracted + refactored from `poc-wf-analytic/src/main.zig` — see
-  NOTICE. The seed's giant `if/else eql` command chain is pulled out into a caller-supplied
-  `dispatch` callback, so this module hosts no application commands.
+  (raw `std.os.linux` syscalls). Original work of the zig-libs authors. Command handling is a
+  caller-supplied `dispatch` callback, so this module hosts no application commands.
 - **One connection per request.** Every request is a fresh `connect → write one frame → read one
   frame → close`; `acceptOne`/`handleOne` service exactly one connection at a time. No persistent
   or multiplexed connection.

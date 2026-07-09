@@ -5,13 +5,13 @@ machine-readable errors: a standalone validator core plus `router` middleware
 that short-circuits invalid requests with a 400 and a
 `{"errors":[{path,code,message},…]}` JSON body. T5.9 of the Web/API cluster.
 
-Provenance: clean-room — no seed project and no third-party code. Design
-references: pydantic v2 (MIT — the error shape `{path, code, message}` and
-the error-code vocabulary; behavior only), JSON Schema draft 2020-12 (spec —
+Provenance: original work of the zig-libs authors (MIT); modeled after
+pydantic v2 (MIT — the error shape `{path, code, message}` and the
+error-code vocabulary; behavior only), JSON Schema draft 2020-12 (spec —
 keyword semantics: `1.0` is an integer, inclusive `minimum`/`maximum`,
 additional properties allowed, `enum`, `properties`/`items` nesting) and
 go-playground/validator (MIT — struct-tag-style ergonomics, mirrored here as
-comptime reflection; behavior only). No source copied.
+comptime reflection; behavior only) — see NOTICE. No source copied.
 
 - **Status:** `gap`.
 - **Model after:** pydantic v2 + JSON Schema 2020-12 + go-playground/validator.

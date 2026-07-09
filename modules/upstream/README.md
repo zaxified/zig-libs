@@ -8,8 +8,8 @@ health via a per-upstream `resilience.CircuitBreaker`), run caller-driven
 active health checks (`healthTick`) through `probe`'s connector seam, and
 route with automatic failover via `call()`.
 
-Provenance: clean-room — no seed project and no third-party code. Design
-references (behavior only, no source consulted or copied): Envoy
+Provenance: original work of the zig-libs authors (MIT); design references
+(behavior only, no source consulted or copied): Envoy
 (Apache-2.0) and HAProxy (documented behavior only) upstream-cluster
 semantics — health-checked member set, pluggable LB policy, per-member
 circuit breaking and concurrency caps; resilience4j (Apache-2.0) Bulkhead

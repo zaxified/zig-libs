@@ -46,7 +46,8 @@ input) through the real `icmp.echo` parsers on a deterministic virtual
 clock. One live test (trace to 127.0.0.1) runs only when CAP_NET_RAW is
 available and skips otherwise.
 
-Provenance: clean-room — models the classic traceroute(8) / mtr ICMP
-method (Van Jacobson's TTL-stepping technique, public knowledge) and
-RFC 792 ICMP message formats via the sibling `icmp` codec; no traceroute,
-mtr or other third-party source consulted or copied — behavior only.
+Provenance: original work of the zig-libs authors (MIT); models the
+classic traceroute(8) / mtr ICMP method (Van Jacobson's TTL-stepping
+technique, public knowledge) and RFC 792 ICMP message formats via the
+sibling `icmp` codec — see NOTICE. No traceroute, mtr or other third-party
+source consulted or copied — behavior only.

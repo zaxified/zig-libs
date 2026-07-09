@@ -5,16 +5,18 @@ Exact base-10 **fixed-point decimal** for money and ETL math. Values are an
 `DECIMAL(38,12)`. `0.1 + 0.2 == 0.3`, exactly; the whole parse → arithmetic →
 format path is pure integer (no `f64`/`f128` anywhere).
 
-- **Status:** `extract` — lifted from bxp `bxp-core/src/decimal.zig`, where it
-  replaced an `f80` core and is proven on 40M-row ETL runs.
+- **Status:** `extract` — pure-integer core (no `f80`), proven on 40M-row
+  ETL runs.
 - **Model after:** Java `BigDecimal` / Python `decimal` semantics, but
   fixed-scale like DB `DECIMAL(38,12)`.
 - **Platform:** any (pure logic, no OS calls). **Role:** util.
   **Concurrency:** reentrant (no shared state). **Allocation:** none —
   `toString` writes into a caller buffer.
 
-Provenance: extracted from bxp `bxp-core/src/decimal.zig` (same authors,
-Apache-2.0, relicensed MIT here). No third-party code.
+Provenance: original work of the zig-libs authors (MIT); rounding modes are
+clean-room from the published Java `BigDecimal.RoundingMode` / IBM General
+Decimal Arithmetic / Python `decimal` definitions (truth-tables only, no
+source consulted or copied) — see NOTICE.
 
 ## Semantics
 
@@ -66,21 +68,20 @@ fn eql(a, b) bool;
 fn isZero(self) bool;
 ```
 
-## Changes vs the seed
+## Failure-path design
 
-Semantics (rounding mode, scale, parse/format policy) are preserved exactly;
-the extraction made the failure paths explicit:
+Every failure path is explicit — no trap, no silent wrap:
 
-- `?Decimal` results became error unions (`Overflow` / `DivisionByZero` /
+- Fallible results are error unions (`Overflow` / `DivisionByZero` /
   `InvalidCharacter`).
-- `div` now range-checks the quotient (the seed's unchecked `@intCast` could
-  trap when dividing a large value by a sub-`1e-12` divisor).
-- `parse` now overflow-checks the i256 scaling multiply (huge mantissa ×
-  exponent combinations could overflow even the wide accumulator).
+- `div` range-checks the quotient, so dividing a large value by a sub-`1e-12`
+  divisor yields a clean error rather than a trap.
+- `parse` overflow-checks the i256 scaling multiply (a huge mantissa ×
+  exponent combination cannot overflow even the wide accumulator).
 - `fromInt` is overflow-checked.
 - `floor`/`ceil` compute in i256 and adopt `round`'s "unchanged if
-  unrepresentable" contract at the extreme i128 boundary (seed could trap).
-- `toString(alloc)` became allocation-free `toString(buf)` + a `{f}` formatter.
+  unrepresentable" contract at the extreme i128 boundary.
+- `toString(buf)` is allocation-free, plus a `{f}` formatter.
 
 ## Verify
 

@@ -14,8 +14,7 @@ Canonical in-memory columnar-typed table — the seam between data sources and c
   freshly allocated. Free everything at once via the arena — no piecemeal free.
 - `Date.ordinal()` uses Howard Hinnant's days-from-civil algorithm (proleptic Gregorian, 1970-01-01
   = 0): equal dates compare equal, later dates compare greater. It is a monotonic ordering key, **not
-  independently verified against every historical calendar reform** — a hedge carried forward
-  unchanged from the seed.
+  independently verified against every historical calendar reform**.
 - Serialize/deserialize is a compact binary wire format with exact round-trip (`error.Corrupt` on
   truncation/bad tag) plus a JSON projection (non-finite float → null).
 - **Known ceiling, by design:** row-major, boxed-`Value` representation (each cell a tagged union,
@@ -41,11 +40,11 @@ rejection, `toJson` shape (incl. non-finite float → null), `parseIsoDate` + `D
 ordering.
 
 ## Backlog / deferred
-From README "Deferred (backlog, not implemented here)", flagged at extraction scope time as v1
+From README "Deferred (backlog, not implemented here)", intentionally v1
 out-of-scope: a `.decimal` `ColumnType`/`Value` variant composing the `decimal` module for exact
 money (deferred — cross-module dependency-direction decision, not yet made); true columnar storage
-(typed per-column arrays, SIMD-friendly layout — a different representation, not a faithful
-extraction of the seed); streaming/chunked bounded-memory construction for very large result sets
+(typed per-column arrays, SIMD-friendly layout — a different representation entirely); streaming/
+chunked bounded-memory construction for very large result sets
 (current model materializes the whole `Dataset` up front); `distinct`/dedup at the dataset level
 (needs its own design pass — which rows compared, caller-picked key columns). `dataset`
 is the anchor of a sibling family already extracted (`tabular` = dataset algebra, `jsonshape` = JSON→

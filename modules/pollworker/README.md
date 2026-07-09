@@ -16,9 +16,9 @@ blocks that only share the "single owner drives the loop" discipline:
   argv, keeping the between-fork-and-exec window async-signal-safe (raw
   syscalls, no allocation in the child).
 
-- **Status:** `extract` — carved out of the authors' poc-wf-analytic controller,
-  where the loop drove a unix-socket accept + per-tick reap/publish, and the job
-  table offloaded cold HTTP fetches to detached curl workers.
+- **Status:** `extract` — a single-owner `poll(2)` loop plus a fork/detach
+  job table: the loop drives a unix-socket accept + per-tick reap/publish, and
+  the job table offloads cold HTTP fetches to detached curl workers.
 - **Model after:** a single-owner event loop + detached-fork worker pool.
 - **Platform:** `linux` — raw `std.os.linux` errno-encoded syscalls
   (`poll`/`fork`/`execve`/`waitpid`/`access`), a conscious no-libc ceiling.
@@ -27,11 +27,10 @@ blocks that only share the "single owner drives the loop" discipline:
   cross-thread state is each slot's atomic.
 - **Deps:** none (std only — `std.Thread`, `std.atomic`, `std.os.linux`).
 
-Provenance: extracted and generalized from the author's own
-`poc-wf-analytic/src/main.zig` (`runController` + the `g_http_jobs` HttpJob
-table: `httpJobFind`/`httpKickFetch`/`httpDrainJobs`/`httpFetchWorker`); same
-author, MIT. The curl-specific fetch body was **not** lifted — `spawnDetached`
-generalizes it to an arbitrary argv.
+Provenance: original work of the zig-libs authors (MIT) — a single-owner event
+loop (`runController`) plus an HttpJob table
+(job-find/kick-fetch/drain/fetch-worker). The curl-specific fetch body was
+**not** lifted — `spawnDetached` generalizes it to an arbitrary argv.
 
 ## API
 
@@ -87,5 +86,5 @@ the fixed slot count `N`: `claim` returns null and `spawnDetached` returns
   environment; exec absolute paths (which need no `PATH`). A caller-supplied
   envp is a future option.
 - **Back-pressure beyond a fixed slot count** (queueing/retry) — the caller
-  handles a full table (the seed re-tries on a later tick).
+  handles a full table (e.g. re-try on a later tick).
 - **Windows / non-Linux** — Linux-only by design (raw syscalls).

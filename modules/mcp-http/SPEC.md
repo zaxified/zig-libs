@@ -8,8 +8,8 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
   `application/json` (one result) or, when the client sends `Accept: text/event-stream`, a live
   SSE stream where each JSON-RPC line becomes one `data:` event (tool-call
   `notifications/progress` delivered as they happen); a pure notification → `202`. Clean-room from
-  the MCP "Streamable HTTP" transport spec (2025-06-18); bxp-gui's Dart `mcp_dart` client is the
-  behavioral reference — see NOTICE.
+  the MCP "Streamable HTTP" transport spec (2025-06-18); a reference Dart server wrapping the
+  third-party `mcp_dart` client is the behavioral reference — see NOTICE.
 - **Sessions (optional):** an `Mcp-Session-Id` is minted at `initialize` and validated thereafter
   (unknown → 404); `GET /mcp` opens a server→client SSE stream; `DELETE /mcp` tears it down.
 - **`GET` is drain-and-close, not held-open** — io-less handlers can't park a connection on a

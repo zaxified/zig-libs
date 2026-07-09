@@ -13,9 +13,9 @@ timestamp, so it has no lower-year limit. Calendar arithmetic (`addDays`/`addMon
 mechanism; `addMonths` clamps the day (Jan 31 +1mo → Feb 28/29). Platform: any (pure logic, no OS
 calls, no `std.time` timestamps). Role: util. Concurrency: reentrant (no shared state). Allocation:
 `format`/`formatIsoDate` take an allocator (output is an owned, variable-length string); everything
-else is allocation-free. Modeled after Howard Hinnant's chrono civil algorithms; extracted from bxp
-`bxp-core/src/datefmt.zig` (replaced a `sunrise`-based core there for exactly this pre-epoch
-correctness reason) — user's own code, no third-party source. See NOTICE.
+else is allocation-free. Modeled after Howard Hinnant's chrono civil algorithms; original work of the
+zig-libs authors — a pure-`std` civil-calendar core (no external dependency) chosen for exactly this
+pre-epoch correctness reason. No third-party source.
 
 ## Threat model / out of scope
 Not security-sensitive; the contract is calendar-arithmetic correctness. Malformed format strings

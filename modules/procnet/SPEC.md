@@ -1,6 +1,7 @@
 # procnet — spec
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: original work of
+the zig-libs authors (MIT).
 
 ## Design & invariants
 Layout mirrors the `dns`/`http` modules: `root.zig` owns the shared file-reading primitive
@@ -20,18 +21,19 @@ buffers for kernel-bounded strings (`if_name_max` = `IFNAMSIZ` = 16, `comm_max` 
 these buffers as a defensive belt-and-braces measure (inputs are already kernel-bounded, so this
 is not the expected path). Addresses are returned as typed `netaddr.Ip`/`Prefix`, not allocated
 dotted-string IPs — IPv6 socket addresses (`tcp6`/`udp6`) decode as four little-endian 32-bit words
-concatenated in address order (new vs. the axp seed, verified against real kernel captures under
+concatenated in address order (verified against real kernel captures under
 `src/testdata/`). Malformed rows are skipped, not fatal — one corrupt line never sinks the whole
 table. `SocketEntry` returns every row with its `state` (not pre-filtered to
-LISTEN/bound like the axp seed) — filtering is now the caller's job. `SockState` reuses the
+LISTEN/bound) — filtering is now the caller's job. `SockState` reuses the
 kernel's `net/tcp_states.h` values for UDP too (`.close` = unconnected/bound, `.established` =
 connect()-ed — UDP has no separate state space). Concurrency: reentrant, no shared state — each
-call is independent, callers may run them from any thread. Extracted and retyped from the authors'
-own axp project (`axp-core/src/task.zig` — `routesOutcome`/`leHexToV4`, `socketsOutcome`,
-`conntrackOutcome`/`kvField`, `parseProcStat`, the snapshot/thermal-zone/meminfo helpers; MIT, the
-authors' own code); `arp.zig` has no direct axp precedent (clean-room from `proc(5)`); IPv6
-socket-table support is a new extension beyond the IPv4-only axp seed. Written clean-room against
-the documented Linux `/proc` file format (`proc(5)`) and the kernel's own `/proc` ABI — see NOTICE.
+call is independent, callers may run them from any thread. Original work of the zig-libs authors
+(MIT): typed parsers for `/proc/net/route` (`routesOutcome`/`leHexToV4`), `/proc/net/{tcp,udp}`
+(`socketsOutcome`), `/proc/net/nf_conntrack` (`conntrackOutcome`/`kvField`), `/proc/<pid>/stat`
+(`parseProcStat`), plus the snapshot/thermal-zone/meminfo helpers; `arp.zig` is clean-room from
+`proc(5)`; IPv6 socket-table support extends IPv4-only reads to full dual-stack coverage. Written
+clean-room against the documented Linux `/proc` file format (`proc(5)`) and the kernel's own
+`/proc` ABI.
 
 ## Threat model / out of scope
 Not security-sensitive in the traditional sense — the untrusted input is the kernel's own
@@ -54,8 +56,8 @@ behavior. Run: `zig build test-procnet`.
 
 ## Backlog / deferred
 Per the module README's "DEFER" list: `/proc/net/dev` interface byte/packet counters (a different
-per-iface-throughput shape, needs its own parser); `/proc/diskstats` (disk I/O counters, no seed
-precedent); `/proc/<pid>/status` (richer per-process fields — VmRSS breakdown, uid/gid, cgroup —
+per-iface-throughput shape, needs its own parser); `/proc/diskstats` (disk I/O counters, not yet
+covered); `/proc/<pid>/status` (richer per-process fields — VmRSS breakdown, uid/gid, cgroup —
 beyond `stat`'s scalars, a planned `status.zig` sibling to `process.zig`); `/proc/net/ipv6_route`
 (different column layout from v4's `/proc/net/route`, not just a wider address); `statvfs`/
 `/proc/mounts` disk-usage (a different module axis, not a `/proc/net`/per-process concern).

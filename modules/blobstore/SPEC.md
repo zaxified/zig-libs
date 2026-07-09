@@ -18,11 +18,10 @@ named records. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
   which does not trust `stat().size`) and compares to the address, catching silent bit-rot/tampering.
 - Reentrant — no shared state beyond a process-local atomic ingest-temp-name counter. Posix
   (atomic-rename visibility; filesystem via `std.Io`).
-- Deltas vs the seed: `put` now owns hash-while-write (seed hashed externally then passed hex to
-  `casCommit`); `verify`, `Digest`, and per-entry-point segment validation are new; axp's
-  `raw/<device>/<key>` + `manifests/<device>/<key>.json` generalized to `raw/<ns>/<key>` + opaque
-  `named/<ns>/<key>` (any bytes, not just JSON) — the seed's JSON/Outcome wrapping is dropped, this
-  is pure storage.
+- Design choices: `put` owns hash-while-write (a single streaming pass, callers never hash
+  externally); `verify`, `Digest`, and per-entry-point segment validation guard every path; the raw
+  layer is `raw/<ns>/<key>` and opaque records are `named/<ns>/<key>` (any bytes, not just JSON) — no
+  JSON/Outcome wrapping, this is pure storage.
 
 ## Threat model / out of scope
 Not a security boundary against a co-resident attacker with filesystem access to `<base>` — no

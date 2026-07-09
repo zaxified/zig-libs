@@ -57,7 +57,8 @@ If you need CSPRNG ids, mint them yourself and set `traceparent`.
   thread handling the request.
 
 Provenance: clean-room from the W3C Trace Context specification (Level 1,
-`traceparent`/`tracestate`). No third-party source consulted or copied.
+`traceparent`/`tracestate`) — original work of the zig-libs authors (MIT).
+No third-party source consulted or copied — see NOTICE.
 
 ## Verification
 

@@ -19,7 +19,7 @@ nothing (the server's documented `on_connect` posture; no polite 503).
 - **Deps:** `http` (the Phase-2.1 server hooks), `netaddr` (IP keying),
   `router` (the optional auto-strike middleware).
 
-Provenance: clean-room — no seed project and no third-party code. Design
+Provenance: original work of the zig-libs authors (MIT) — no third-party code. Design
 references: nginx `limit_conn` (BSD-2-Clause; documented behavior only) and
 fail2ban (GPL-2.0; **documented behavior only — no source consulted or
 copied**), plus the `ratelimit` sibling for the bounded-LRU/clock-injection

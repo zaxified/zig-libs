@@ -1,6 +1,7 @@
 # procrun — spec
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: original work of
+the zig-libs authors (MIT).
 
 ## Design & invariants
 
@@ -9,11 +10,11 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
   `SIG_IGN` so the kernel auto-reaps), a child can be reaped out from under a runner. Zig 0.16's
   `std.process.Child.wait` treats the resulting `ECHILD` as an `errnoBug` and panics (a racy
   `SIGABRT`); `procrun.waitTolerant` maps `ECHILD` to `Term.unknown` and closes the child's stdio
-  handles itself instead. Extracted and rewritten from the authors' bxp `bxp-gui-bridge/src/main.zig`
+  handles itself instead. Original work of the zig-libs authors (MIT) —
   (`waitTolerant`/`reapTolerantPosix`/`statusToTerm`, the `SIGCHLD` fixup, and the capped 3-thread
-  drain/streaming-with-cancel machinery — Apache-2.0 → MIT relicense); the reap syscalls differ from
-  the seed (`std.posix.system.wait4`/`waitpid`, raw `std.os.linux` on Linux, not libc) to keep the
-  module libc-free. Model after Python `subprocess.run`/`Popen`, Go `os/exec` — see NOTICE.
+  drain/streaming-with-cancel machinery); the reap syscalls use
+  `std.posix.system.wait4`/`waitpid` (raw `std.os.linux` on Linux, not libc) to keep the
+  module libc-free. Model after Python `subprocess.run`/`Popen`, Go `os/exec`.
 - **Deadlock-free capped stdio capture:** separate stdin-writer / stdout-drainer / stderr-drainer
   threads, so a stdin body larger than the pipe buffer can't deadlock a child withholding stdout. A
   per-stream cap **keeps the prefix and keeps draining** past the cap (unlike `std.process.run`'s

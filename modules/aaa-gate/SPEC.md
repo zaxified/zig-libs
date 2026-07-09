@@ -5,15 +5,15 @@ Auth + audit front for an API (Bearer/API-key gate). Usage: see ./README.md. Att
 ## Design & invariants
 - Credential check is **constant-time** (never a short-circuiting `mem.eql`) so a network attacker
   cannot recover a valid token/key byte-by-byte via timing.
-- `protect` default = `.all` (every method gated) — secure-by-default, a deliberate deviation from
-  the seed (which gated only mutations, restorable via `.mutations`). Register `cors` before the
-  gate under `.all` (preflights carry no `Authorization`).
+- `protect` default = `.all` (every method gated) — secure-by-default; `.mutations` restores an
+  R/W split (gate only mutations). Register `cors` before the gate under `.all` (preflights carry no
+  `Authorization`).
 - **Open plane:** an empty token set (no `token`/`extra_tokens`) disables auth entirely
   (`Identity.scheme == .open`) — kept as the dev/demo default; configuring any token closes it.
 - **Audit** is a synchronous hook (`on_audit(entry)`), never a logger: fires on every authenticated
   mutation and every denial; authenticated reads are not audited. Entry slices borrow request-scoped
   memory.
-- **Denied-request throttle** (seed's `AuditThrottle`, per-key): coalesces repeated 401s from one
+- **Denied-request throttle** (`AuditThrottle`, per-key): coalesces repeated 401s from one
   client key within `throttle_window_ms`; suppressed count folds into the next admitted entry so
   nothing is silently dropped, while responses themselves are never throttled (every denial still
   gets its 401). Bounded store (`throttle_max_keys`, LRU); clock injected for deterministic tests;

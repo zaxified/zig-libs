@@ -1,6 +1,7 @@
 # llmclient — spec
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: original work of
+the zig-libs authors (MIT).
 
 ## Design & invariants
 An Anthropic Messages API client (`POST /v1/messages`) layered over the sibling `http` module:

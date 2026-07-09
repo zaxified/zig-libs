@@ -16,11 +16,10 @@ offset and round-trip delay.
   shared state).
 - **Deps:** `std.Io.net` (UDP datagram socket for `query`).
 
-Provenance: clean-room from RFC 4330 (and RFC 5905 for the timestamp format).
-The packet layout and offset/delay design are referenced from
-`FObersteiner/ntp_client` (Codeberg, MIT); **no third-party code was copied.**
-RFC 4330 and the `ntp_client` design reference should be added to the
-repository `NOTICE`.
+Provenance: clean-room from RFC 4330 (and RFC 5905 for the timestamp format)
+— original work of the zig-libs authors (MIT). The packet layout and
+offset/delay design are referenced from `FObersteiner/ntp_client` (Codeberg,
+MIT); **no third-party code was copied** — see NOTICE.
 
 ## Epoch & fixed-point model
 

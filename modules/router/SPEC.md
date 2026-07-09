@@ -6,11 +6,10 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
 
 - **Precomputed trie, allocation-free dispatch:** the matcher is a per-segment trie built at `add`
   time; `dispatch` is read-only, lock-free, and allocation-free (captured params live on the stack)
-  — one built `Router` safely serves all of `http.Server`'s connection threads at once. Dispatch
-  shape extracted from axp `axp-central/src/rest.zig` (same authors, Apache-2.0, relicensed MIT);
-  the trie matcher and middleware chain are clean-room, modeled after Go `chi` /
-  `julienschmidt/httprouter` (segment trie, deterministic precedence, 404/405 + `Allow`,
-  trailing-slash redirect) — see NOTICE.
+  — one built `Router` safely serves all of `http.Server`'s connection threads at once. Original
+  work of the zig-libs authors (MIT); the trie matcher and middleware chain are clean-room, modeled
+  after Go `chi` / `julienschmidt/httprouter` (segment trie, deterministic precedence, 404/405 +
+  `Allow`, trailing-slash redirect) — see NOTICE.
 - **Frozen middleware chains:** outer→inner = registration order (router `use` → group → nested
   group → handler), computed per route at `add` time. `use` after any route has been registered is
   `error.RoutesAlreadyRegistered` (chi's rule, surfaced as a typed error, not a footgun).

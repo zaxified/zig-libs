@@ -4,14 +4,14 @@ NaCl `crypto_box_seal` — **anonymous-sender** public-key encryption. Encrypt t
 recipient's X25519 public key with no sender key (a fresh ephemeral keypair per
 message); the recipient cannot identify the sender.
 
-- **Status:** `extract` — from axp `axp-core/src/sealed.zig` (enrollment path).
+- **Status:** `extract` — a thin, faithful wrapper over `std.crypto.nacl.SealedBox`.
 - **Model after:** libsodium `crypto_box_seal` / Go `nacl/box`. Thin, faithful
   wrapper over `std.crypto.nacl.SealedBox` — **no custom crypto**.
 - **Platform:** any. **Role:** util. **Concurrency:** reentrant.
   **Allocation:** none in the buffer API; `*Alloc` variants allocate the result.
 
-Provenance: extracted from axp (Apache-2.0, relicensed MIT by the copyright
-holder); the construction is the public NaCl standard, so no NOTICE entry.
+Provenance: original work of the zig-libs authors (MIT); the construction is
+the public NaCl `crypto_box_seal` standard, so no NOTICE entry.
 
 ## API
 

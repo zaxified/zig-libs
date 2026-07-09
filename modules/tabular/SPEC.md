@@ -14,12 +14,11 @@ flattened, since their spec type names collide): **Tier 0** (`transforms`) — `
 `outlierFlag` (optional guard) · `mergeByKey` · `datePart` · `join` (inner/left) · `stdSample`.
 fx-convert-before-sum is first-class on `aggregate`/`weightedGroupSum`: each row's numeric value is
 multiplied by its per-row fx rate *before* accumulation, and a null/absent rate means `1.0` — a real
-multi-currency correctness fix from the seed (income rows store a null rate), preserved exactly.
+multi-currency correctness fix (income rows store a null rate).
 `root.zig` carries a dark-tests aggregator (`test { _ = transforms; _ = series; }`) so both
 submodules' tests run — a bare re-export would not pull them in (repo-wide dark-tests gotcha).
-Reentrant — no shared state. Faithful lift from the authors' wgs project (`src/transforms.zig` Tier 0
-+ `src/series.zig` Tier 1): logic and hand-computed golden test values unchanged, only the dependency
-import path changed. Modeled after pandas/dplyr verb algebra + TA rolling-window idioms — see NOTICE.
+Reentrant — no shared state. Original work of the zig-libs authors (MIT); modeled after pandas/dplyr
+verb algebra + TA rolling-window idioms — see NOTICE.
 
 ## Threat model / out of scope
 Not a security boundary — a pure computational library over caller-provided in-memory datasets;
@@ -32,14 +31,13 @@ caller's arena/allocator is the only bound).
 
 ## Verification
 `zig build test-tabular` (headless; green in Debug and `-Doptimize=ReleaseFast`), 21 tests across
-`transforms`+`series`, ported from the wgs seed's own hand-computed golden values (used as the
-correctness oracle for the lift) plus new cases for the fx-convert-before-sum path. Run: `zig build
-test-tabular`.
+`transforms`+`series`, using hand-computed golden values as the correctness oracle for the lift plus
+new cases for the fx-convert-before-sum path. Run: `zig build test-tabular`.
 
 ## Backlog / deferred
 Multi-column sort (`SortSpec.key` is single-column, no tie-break) and numeric-aware pivot column-key
 ordering (currently lexicographic — mis-sorts unpadded numeric keys like `2` vs `10`); grouped-series
-TA nodes (per-asset-group EMA/MACD/RSI — wgs STATUS flags this); `unpivot`/`melt`; right/full-outer
+TA nodes (per-asset-group EMA/MACD/RSI); `unpivot`/`melt`; right/full-outer
 joins, multi-column join keys, anti/semi-join; dataset-level `distinct`/dedup without summing
 (`mergeByKey` sums numerics); `limit`/`offset` pagination beyond `topN`; optional strict-ordering
 guard for `rolling`/`outlierFlag` (from the module README, folded here).

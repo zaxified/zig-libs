@@ -2,8 +2,7 @@
 
 HTTP/1.1 client **and server** in pure Zig (client TLS over `std.crypto.tls`).
 
-- **Status:** `extract+gap` — client shape seeded in axp
-  (`axp-core/src/httpclient.zig`); HTTP/1.1 framing + server written here.
+- **Status:** `extract+gap` — HTTP/1.1 client + server, HTTP/2 in progress.
 - **Model after:** `lalinsky/dusty` (1.1 client shape) + Go `net/http`
   (redirect/header semantics, Server shape); `nghttp2` + h2spec later for
   HTTP/2.
@@ -16,9 +15,10 @@ HTTP/1.1 client **and server** in pure Zig (client TLS over `std.crypto.tls`).
   per-connection tasks — handlers must be thread-safe if they share state.
   **Deps:** `netaddr`, `std.crypto.tls`, `std.Io.net`.
 
-Provenance: client shape extracted from axp `axp-core/src/httpclient.zig`
-(same authors, Apache-2.0, relicensed MIT); the HTTP/1.1 framing + the
-server are clean-room from RFC 7230/9110. Design refs in
+Provenance: original work of the zig-libs authors (MIT); modeled after
+`lalinsky/dusty` (1.1 client shape) and Go `net/http` (redirect/header
+semantics, Server shape) — behavior only, no source copied. The HTTP/1.1
+framing + the server are clean-room from RFC 7230/9110. Design refs in
 [NOTICE](../../NOTICE).
 
 ## Phases

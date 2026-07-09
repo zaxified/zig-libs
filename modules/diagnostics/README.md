@@ -6,15 +6,15 @@ line/col (+ end position), an optional in-expression byte offset/length for
 token highlighting, a machine-readable code, a message, and an optional
 did-you-mean suggestion.
 
-- **Status:** `extract` — from the authors' bxp-core config/json5/expr
-  validation pass.
+- **Status:** `extract` — the structured-finding collector for
+  config/json5/expr validation.
 - **Model after:** LSP `Diagnostic` / rustc diagnostics.
 - **Platform:** any. **Role:** util. **Concurrency:** reentrant (no shared
   state — safe if not shared). **Allocation:** owned by the caller-supplied
   allocator; no internal ownership beyond the `items` list.
 
-Provenance: extracted from `bxp-core/src/diagnostics.zig` (user's own code,
-MIT) — no third-party source copied (see [NOTICE](../../NOTICE)).
+Provenance: original work of the zig-libs authors (MIT) — no third-party
+source copied.
 
 ## API
 

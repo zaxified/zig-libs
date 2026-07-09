@@ -15,7 +15,7 @@ destination-rule coverage matches Go: rules 1/2/5/6/8/9 (rule 9 IPv6-only, per G
 13283/18518); source rules 1/2/6/8. Rules needing OS state (deprecated/home/interface/transport)
 are skipped, as glibc and Go document. Sorts are stable (rule 10) via insertion sort. `Scope` is a
 numeric-backed non-exhaustive enum so unnamed multicast scopes order correctly. The RFC 6724
-selection logic is extracted from zig-fping's `src/netutil.zig`
+selection logic derives from fping's address-selection logic
 (`sortByDestinationPolicy`/`policyPrecedence`/`destinationReachable`), extended to the full rule
 set and cross-checked row-for-row against Go `net/addrselect.go` + glibc getaddrinfo; CIDR/prefix
 ops model after Go `net/netip.Prefix` + `go4.org/netipx` (behavior only, clean-room) — see NOTICE.

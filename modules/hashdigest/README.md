@@ -3,16 +3,16 @@
 Streaming SHA-256 helpers — one-shot, incremental, and **file** hashing that is
 correct on size-0 virtual files (`/proc`, `/sys`).
 
-- **Status:** `extract` — from axp `axp-core/src/digest.zig` (`sha256Hex`,
-  `matches`) + `axp-core/src/task.zig` (`sha256FileHex`, read-to-EOF loop).
+- **Status:** `extract` — one-shot (`sha256Hex`, `matches`), incremental,
+  and read-to-EOF file hashing (`sha256File`).
 - **Model after:** Go `crypto/sha256` streaming. Thin over
   `std.crypto.hash.sha2.Sha256` — no custom crypto.
 - **Platform:** any (file path uses `std.Io`). **Role:** util.
   **Concurrency:** one-shot fns pure; `Hasher` single-owner. **Allocation:** none.
 
-Provenance: extracted from axp (Apache-2.0, relicensed MIT by the copyright
-holder); the construction is the public SHA-256 standard, so no NOTICE
-entry (own code over std).
+Provenance: original work of the zig-libs authors (MIT); modeled after Go
+`crypto/sha256` streaming ergonomics. The construction is the public SHA-256
+standard, so no NOTICE entry (own code over std).
 
 ## API
 

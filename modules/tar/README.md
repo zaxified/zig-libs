@@ -6,9 +6,9 @@ packer**. One tar implementation for backup/restore pipelines: parse archives
 produced by GNU tar/busybox, emit archives GNU tar extracts, and round-trip
 byte-faithfully through both.
 
-- **Status:** `extract` — carved out of the authors' axp project, where the
-  writer packs device backups (`sysupgrade -b` style) and the reader ingests
-  them into a content-addressed vault.
+- **Status:** `extract` — the writer packs device backups (`sysupgrade -b`
+  style) and the
+  reader ingests them into a content-addressed vault.
 - **Model after:** GNU tar / libarchive (behavior only — headers implemented
   from the POSIX ustar + GNU extension layout).
 - **Platform:** the codec (`Reader`/`Writer`/`packTarGz`) is platform-pure —
@@ -19,10 +19,9 @@ byte-faithfully through both.
   `Reader`/`Writer` per stream).
 - **Deps:** none (std only — `std.compress.flate` for gzip).
 
-Provenance: extracted from the authors' axp project (`axp-core/src/tar.zig`
-writer/packer + `axp-vault/src/backup.zig` reader; same authors, Apache-2.0,
-relicensed MIT by the copyright holder). The wire format is the public POSIX
-ustar / GNU tar spec — no third-party source involved.
+Provenance: original work of the zig-libs authors (MIT). The wire format is
+the public POSIX ustar / GNU tar spec — no third-party source involved; no
+NOTICE entry needed.
 
 ## API
 
@@ -88,14 +87,13 @@ const stats = try tar.packDir(io, gpa, &.{"/etc/config"}, dst);
 - **Streaming/bounded memory.** Content is never buffered — `read()` streams
   it; only path/link-target strings are allocated (64 KiB cap, allocator
   explicit). `packTarGz`/`packDir` allocate one flate window.
-- **Deltas vs the seed** (behavior hardening, wire format untouched):
-  checksum verification added (the seed trusted its own transport); the ustar
-  `prefix` is honored only under the POSIX magic (the seed read it under GNU
-  magic too, where those bytes mean atime/ctime); hard links ('1') are
-  modeled instead of skipped; base-256 size emit for ≥ 8 GiB files;
+- **Hardening choices** (wire format untouched): every header is
+  checksum-verified; the ustar `prefix` is honored only under the POSIX magic
+  (never under GNU magic, where those bytes mean atime/ctime); hard links
+  ('1') are modeled rather than skipped; base-256 size emit for ≥ 8 GiB files;
   `packDir` zero-fills a file that turns unreadable after its header was
-  written (the seed could emit a header with no content, desyncing the
-  archive) and writes to a caller-supplied `*std.Io.Writer` instead of a
+  written (so a header is never emitted with no content, which would desync
+  the archive) and writes to a caller-supplied `*std.Io.Writer` rather than a
   path.
 - **Verification:** golden header bytes captured from GNU tar 1.35 are pinned
   in a test (read side) and field-compared against our emit (write side);

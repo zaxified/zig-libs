@@ -1,6 +1,6 @@
 # tar — spec
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see ./README.md (no NOTICE entry — own code; the installed GNU tar binary was used only as a black-box test oracle).
 
 ## Design & invariants
 Headers are the security boundary: every 512-byte header is checksum-verified (unsigned sum per
@@ -19,8 +19,8 @@ platform-pure (I/O only through the caller's `std.Io.Reader`/`Writer`); only `pa
 walker reading real attrs via raw `statx`/`readlink`) is Linux. Implements the public POSIX ustar
 format plus the documented GNU long-name/long-link ('L'/'K') header extensions; the installed GNU
 tar binary was used only as a black-box compatibility test oracle (see Verification) — its source
-was never consulted, and no GPL code is involved — see NOTICE (own code, no attribution entry
-needed).
+was never consulted, and no GPL code is involved — no NOTICE entry needed (own code, no third-party
+source).
 
 ## Threat model / out of scope
 Untrusted archives: the reader never panics or over-reads on malformed input, and caps name buffers

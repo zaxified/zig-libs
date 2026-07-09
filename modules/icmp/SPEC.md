@@ -14,10 +14,10 @@ and RAW). Concurrency: single_owner — one thread/loop owns a `Pinger`; `stop()
 safe. Reply correlation is delegated to the sibling `seqmap`, so the in-flight cap must stay <
 65536. Platform: Linux-only by design — errno-encoded `std.os.linux` raw syscalls, no libc, no
 portable fallback. Modes mirror fping: `.alive` (stop at first reply, retry timeouts with backoff),
-`.count` (exactly N), `.loop` (until `stop()`). Extracted from zig-fping `src/{icmp,socket,
-pinger}.zig` (a Zig port of fping) plus that port's scaling additions (binary-heap scheduling,
-in-flight cap, per-subnet spacing, first-probe jitter). Wire formats per RFC 792/4443/1071. See
-NOTICE (shared fping/Stanford attribution with netaddr/dns/seqmap).
+`.count` (exactly N), `.loop` (until `stop()`). Derived from fping (a Zig port of fping's
+icmp/socket/pinger logic) plus scaling additions (binary-heap scheduling, in-flight cap, per-subnet
+spacing, first-probe jitter). Wire formats per RFC 792/4443/1071. See NOTICE (shared fping/Stanford
+attribution with netaddr/dns/seqmap).
 
 ## Threat model / out of scope
 Raw/DGRAM ICMP sockets need CAP_NET_RAW or a permissive `ping_group_range`; the module does not

@@ -9,7 +9,7 @@ Portfolio/financial statistics over `dataset`: dated-flow IRR (`xirr`), daily ti
 (`monteCarlo`), a pairwise-Pearson correlation matrix (`correlationMatrix`), and a drawdown-episode
 state machine (`drawdownEpisodes`). Every function is a pure transform over a caller-owned allocator
 (normally an arena): `Dataset → Dataset` (table/series producers) or `Dataset → f64` (scalar
-reducers) — no hidden state, no I/O. Numeric conventions are preserved exactly from the seed
+reducers) — no hidden state, no I/O. Numeric conventions are exact and deliberate
 (decisions, not bugs): `xirr` is 200-iteration bisection over `[-0.99, 10]`, ACT/365.25 day-count,
 tolerance `1e-2`; `var95`/`cvar95` are historical (empirical), not a parametric fit; `monteCarlo`
 uses a fixed-seed deterministic PRNG (`std.Random.DefaultPrng`, seed `0x9E3779B97F4A7C15`) via
@@ -17,10 +17,10 @@ Box-Muller so percentile outputs are reproducible/regression-testable; `correlat
 pairs on `min_overlap` (default 30). f64 throughout — deliberately no `decimal` dependency: risk
 statistics are inherently floating-point, `decimal` is for exact ledger arithmetic, not variance/
 quantile math. Platform: any (pure logic, no OS calls). Role: util. Concurrency: reentrant (no
-shared state). Depends on `dataset` only. Modeled after the Python `empyrical`/`ffn` metric set and
-a QuantLib subset (mirrored, not invented); extracted from wgs `src/finance.zig` (same authors,
-MIT), itself a faithful port of poc-wf-analytic's `reader.zig` — the numeric behavior has carried
-through three code bases unchanged, pinned by the ported tests. No third-party code — see NOTICE.
+shared state). Depends on `dataset` only. Original work of the zig-libs authors, modeled after the
+Python `empyrical`/`ffn` metric set and a QuantLib subset (mirrored, not invented — behavior/
+metric-set only, no code consulted or copied); the numeric behavior is exact, pinned by the tests.
+See NOTICE.
 
 ## Threat model / out of scope
 Not security-sensitive; the contract is numerical fidelity to the documented conventions above, not
@@ -35,7 +35,7 @@ errors on the statistics; an xirr Newton-with-bisection-fallback (current is pur
 fixed tolerance).
 
 ## Verification
-11 tests ported from the wgs seed, pinning the numeric conventions above: xirr against known cash-
+11 tests pinning the numeric conventions above: xirr against known cash-
 flow fixtures, twrDaily Modified-Dietz with warm-up trim, riskMetrics' 9-metric row incl. historical
 VaR/CVaR and Sharpe/Sortino/Calmar/Ulcer, betaAlpha's cov/var/r² derivation, monteCarlo's
 reproducible percentile output under the fixed seed, correlationMatrix's min_overlap gating, and

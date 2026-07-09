@@ -3,15 +3,13 @@
 Bearer-token authentication + audit hook + denied-request throttle as a
 `router` middleware — the AAA layer of the Web/API cluster. Wave P1.
 
-Provenance: extracted from the authors' axp project
-(`axp-central/src/rest.zig` — the admin-token gate, `auditMutation` and
-`AuditThrottle`; Apache-2.0, relicensed MIT by the copyright holder).
-Design references: envoy ext_authz and oauth2-proxy (bearer-gate behavior
-only — no source consulted or copied); bearer semantics per RFC 6750,
-auth framework per RFC 9110. See `NOTICE`.
+Provenance: original work of the zig-libs authors (MIT); modeled after envoy
+ext_authz and oauth2-proxy (bearer-gate behavior only — no source consulted
+or copied); bearer semantics per RFC 6750, auth framework per RFC 9110. See
+`NOTICE`.
 
 - **Status:** `extract`.
-- **Model after:** the axp seed; envoy / oauth2-proxy (behavior only).
+- **Model after:** envoy / oauth2-proxy (behavior only).
 - **Platform:** any. **Role:** server. **Concurrency:** threadsafe —
   token set + throttle store behind one documented spinlock
   (`std.atomic.Mutex`, the ratelimit pattern); token hashing outside the
@@ -33,7 +31,7 @@ const router = @import("router");
 var gate = try aaa_gate.Gate.init(gpa, .{
     .token = primary_token,               // not retained (SHA-256 digest stored)
     .extra_tokens = &.{old_token},        // rotation set
-    .protect = .all,                      // default; .mutations = seed's R/W split
+    .protect = .all,                      // default; .mutations = R/W split (gate only mutations)
     .realm = "api",                       // optional: Bearer realm="api"
     .on_audit = myAuditHook,              // optional hook (not a logger)
     .on_audit_ctx = &my_sink,
@@ -46,7 +44,7 @@ try r.use(cors_mw);           // CORS first: preflights can't carry Authorizatio
 try r.use(gate.middleware()); // then the gate, before routes (chi rule)
 try r.post("/api/devices/:id/reboot", rebootHandler);
 
-// Zero-downtime rotation (the seed's admin_tokens_file idea, as an API):
+// Zero-downtime rotation (an admin-token-file rotation flow, as an API):
 try gate.addToken(new_token); // both valid now — migrate clients…
 gate.removeToken(primary_token); // …then retire the old one
 ```
@@ -109,16 +107,15 @@ middleware's `state` points at it).
   when both are valid). The open plane applies per mode: open only when no
   credential for the active mode(s) is configured. `Identity.scheme` is
   `.bearer`, `.api_key`, or `.open`.
-- **`protect` default = `.all`** — every method is gated. This is a
-  deliberate deviation from the seed (which gated only mutations):
-  secure by default for a standalone auth layer. `.mutations` restores
-  the seed's R/W boundary: POST/PUT/PATCH/DELETE gated, GET/HEAD/OPTIONS
+- **`protect` default = `.all`** — every method is gated: secure by
+  default for a standalone auth layer. `.mutations` selects an R/W
+  boundary instead: POST/PUT/PATCH/DELETE gated, GET/HEAD/OPTIONS
   open (out-of-scope requests get no identity and no audit). Under
   `.all`, register `cors` **before** the gate — browser preflights
   cannot carry `Authorization` and would otherwise 401.
 - **Open plane.** An empty token set (no `token`, no `extra_tokens`)
   disables authentication: everything passes with
-  `Identity.scheme == .open`. Kept from the seed as the dev/demo default
+  `Identity.scheme == .open`. A convenient dev/demo default
   — configuring any token closes the plane; removing the last token
   reopens it.
 - **Audit** = a hook (`on_audit(entry)`), never a logger. Fires
@@ -126,10 +123,10 @@ middleware's `state` points at it).
   final status + the `target`/`detail` the handler set on the Identity;
   a handler error is audited as the 500 the server will send) and every
   **denial** (401, any method; empty target/detail). Authenticated reads
-  are not audited (seed behavior). Entry slices borrow request-scoped
+  are not audited. Entry slices borrow request-scoped
   memory — copy what you keep. Entry shape:
   `{ method, path, target, detail, authed, status, suppressed }`.
-- **Denied-request throttle** (the seed's `AuditThrottle`, per-key):
+- **Denied-request throttle** (`AuditThrottle`, per-key):
   within `throttle_window_ms` (default **5 s**; `0` disables) repeated
   401s from one client key are coalesced — the hook stays quiet and the
   suppressed count is **folded into the next admitted entry**

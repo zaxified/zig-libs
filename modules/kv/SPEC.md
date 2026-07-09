@@ -21,8 +21,8 @@ Reliability, not adversarial security:
 - **Fault model:** torn writes, partial/short reads, garbage tails, and crash-at-any-point are the
   threats; the VOPR fuzzes these across randomized workload+fault schedules and asserts 6
   durability invariants after each crash+recovery, with a **sabotage self-test** (a recovery that
-  loses committed data MUST be caught → `error.InvariantViolation`). Reproducible from a seed
-  (splitmix64, no clock/OS-rng).
+  loses committed data MUST be caught → `error.InvariantViolation`). Reproducible from a fixed
+  PRNG value (splitmix64, no clock/OS-rng).
 - **Out of scope (deferred):** MVCC / multi-version reads, HAMT on-disk index, ordered scans /
   range queries, transactions, secondary indexes, and a cross-process lock — the randomized VOPR is
   done; these on-disk/txn features are future work. Not a networked/served DB (embedded,
@@ -31,9 +31,9 @@ Reliability, not adversarial security:
 
 ## Verification
 
-Unit tests + the randomized deterministic **VOPR** (`vopr.zig`): seeded fuzz of recovery across
+Unit tests + the randomized deterministic **VOPR** (`vopr.zig`): PRNG-driven fuzz of recovery across
 torn/partial writes, short reads, garbage tails, and crash points ×3 modes over chained epochs;
-min-fault-count asserts + the sabotage self-test (≥10/12 seeds catch a data-losing recovery). 32
+min-fault-count asserts + the sabotage self-test (≥10/12 runs catch a data-losing recovery). 32
 tests. Run: `zig build test-kv`.
 
 ## Backlog / deferred
@@ -45,7 +45,7 @@ tests. Run: `zig build test-kv`.
   ordered-scan B-tree → atomic batches → MVCC snapshot reads → secondary indexes. Bitcask kv is
   enough until then.
 - **VOPR fault-sweep DONE 2026-07-10** (see /docs/pre-public-review.md): green at 10× the shipped
-  seed count (20k seeds, 0 failures); crash-anywhere + torn/partial + byte-arbitrary-tear faults are
+  run count (20k runs, 0 failures); crash-anywhere + torn/partial + byte-arbitrary-tear faults are
   covered, CRC-gated fail-stop replay is sound (torn/corrupt tail truncated, never replayed as valid).
   **One backlog gap:** out-of-order / non-contiguous durability within an un-synced multi-write window
   is not expressible in `SimStorage` today (it always truncates to a contiguous prefix), yet `compact()`'s

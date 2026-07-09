@@ -15,12 +15,12 @@ scheduled visibility (`delay_ns` / `run_at`).
 - **Deps:** `kv` (its `Storage` seam is passed straight through, so production
   uses `kv.FsStorage` and tests use `kv.SimStorage`).
 
-Provenance: greenfield over `kv` — user's own code, no seed project and no
-third-party source consulted line-level or copied. The **partition-FIFO
-dispatch shape** folds axp's ex-`taskqueue` `nextPendingTask` / `nextFor`
-semantics (behavior only). Behavioral references (design only): Faktory and
-Sidekiq (lease/reserve, retry-with-backoff, dead-letter). The clock-injection
-and exponential-jitter-backoff shapes follow the `resilience` sibling. MIT.
+Provenance: original work of the zig-libs authors (MIT), greenfield over `kv`
+— no third-party source consulted line-level or copied. The
+**partition-FIFO dispatch shape** is original design work. Behavioral
+references (design only): Faktory and Sidekiq (lease/reserve,
+retry-with-backoff, dead-letter). The clock-injection and
+exponential-jitter-backoff shapes follow the `resilience` sibling.
 
 ## Why an in-memory index over `kv`
 

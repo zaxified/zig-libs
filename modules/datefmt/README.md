@@ -5,9 +5,8 @@ Correct for dates **before 1970** (Howard Hinnant's days-from-civil algorithm,
 signed `i64` epoch-day math) — unlike a `u64`-seconds-since-epoch core, which
 silently floors any pre-1970 date to 1970-01-01.
 
-- **Status:** `extract` — lifted from bxp `bxp-core/src/datefmt.zig`, where it
-  replaced a `sunrise`-based core (bxp-core's former only external dep) for
-  exactly this pre-epoch correctness reason.
+- **Status:** `extract` — pure-`std` civil-calendar core (no external
+  dependency) chosen for exactly this pre-epoch correctness reason.
 - **Model after:** Howard Hinnant chrono civil algorithms
   (https://howardhinnant.github.io/date_algorithms.html); a strftime-like
   token vocabulary for parse/format.
@@ -16,8 +15,7 @@ silently floors any pre-1970 date to 1970-01-01.
   **Allocation:** `format`/`formatIsoDate` take an allocator (output is an
   owned, variable-length string); everything else is allocation-free.
 
-Provenance: extracted from bxp `bxp-core/src/datefmt.zig` (user's own code,
-MIT). No third-party code.
+Provenance: original work of the zig-libs authors (MIT). No third-party code.
 
 ## Two layers
 
@@ -95,13 +93,12 @@ zig build test-datefmt -Doptimize=ReleaseFast
 zig fmt --check modules/datefmt
 ```
 
-## DEFER (not in this v1 — the seed doesn't need them, a spec-complete
-module would want)
+## DEFER (not in this v1 — a spec-complete module would want)
 
-- **Locale-aware month/day names** — the seed hardcodes English `Jan`…`Dec` /
-  `Mon`…`Sun`; no locale table or i18n hook.
+- **Locale-aware month/day names** — the name tables are English `Jan`…`Dec` /
+  `Mon`…`Sun` only; no locale table or i18n hook.
 - **ISO-week-date** (`YYYY-Www-D`, ISO 8601 week numbering) — not in the
-  seed's token vocabulary; `isoWeekday` gives weekday-in-week only, not
+  token vocabulary; `isoWeekday` gives weekday-in-week only, not
   week-of-year.
 - **Timezone-aware formatting/conversion** (IANA tz database, DST rules,
   offset lookup by zone name) — `ZZ` only carries a raw UTC-offset literal

@@ -6,8 +6,8 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
 
 - **Two types, split on purpose:** the `Accumulator` path is zero-allocation and syscall-free; the
   `Histogram` is a separate opt-in type (counts array fixed at `init`) so percentiles never
-  compromise the allocation-free moment path. Feed both the same samples. Moment stats extracted
-  from the authors' axp probe-path latency accounting; `Histogram` is clean-room from Gil Tene's
+  compromise the allocation-free moment path. Feed both the same samples. Moment stats are the
+  authors' own original work; `Histogram` is clean-room from Gil Tene's
   HdrHistogram design (logarithmic bucketing with linear sub-buckets) — see NOTICE.
 - **Numerically stable:** mean + variance via Welford's online algorithm (no sum-of-squares
   overflow); `stddev_ns` is the *population* stddev (divide-by-n), matching fping/iputils-ping

@@ -6,8 +6,7 @@ The split it enforces: **server = transport, app = tools** — you register
 tools whose handlers thread live **application state via a `ctx` pointer**
 (the point of this module versus thin MCP libs).
 
-Provenance: extracted from bxp `bxp-mcp/src/server.zig` (+ `tools.zig`,
-`progress.zig`) — same authors, Apache-2.0, relicensed MIT; protocol per the
+Provenance: original work of the zig-libs authors (MIT); protocol per the
 MCP spec 2025-11-25.
 
 - **Model after:** MCP spec 2025-11-25 + JSON-RPC 2.0.
@@ -28,7 +27,7 @@ MCP spec 2025-11-25.
 - `tools/call` — dispatch by name; result = text content block +
   `structuredContent` (when the tool allows it and its output is a single
   JSON object) + `isError` (tool failure; a domain `{"ok":false}` answer stays
-  `isError:false`). Unknown tool → `-32602` (the seed's/MCP's choice for a bad
+  `isError:false`). Unknown tool → `-32602` (a deliberate choice for a bad
   tool name on a valid method).
 - `ping` — `{}`.
 - `notifications/progress` — server→client during a `tools/call`, sent only
@@ -52,7 +51,7 @@ not supported** (MCP doesn't use them) → `-32600`.
 
 ## Framing
 
-**Newline-delimited JSON** — the MCP stdio framing, matching the seed: every
+**Newline-delimited JSON** — the MCP stdio framing: every
 message in either direction is exactly one JSON object followed by one `\n`
 (raw newlines inside spliced JSON are stripped). No `Content-Length` headers.
 

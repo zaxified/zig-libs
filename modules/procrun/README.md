@@ -17,14 +17,10 @@ a per-stream cap that **keeps the prefix and keeps draining** past the cap
 everything), env/cwd control, a hard timeout, and a streaming variant with
 signal-based cancel/kill and backpressure.
 
-Provenance: extracted and rewritten as a native Zig API from the authors' bxp
-project (`bxp-gui-bridge/src/main.zig` — the `waitTolerant` /
+Provenance: original work of the zig-libs authors (MIT) — the `waitTolerant` /
 `reapTolerantPosix` / `statusToTerm` reap-race core, the
 `ensureChildReaping` / `restoreChildReaping` `SIGCHLD` fixup, and the capped
-3-thread drain / streaming-with-cancel machinery; the authors' own code,
-Apache-2.0 → MIT relicense). The bridge's Dart-FFI/JSON shim is discarded; only
-the process-handling substance is kept. The reap decision differs from the seed:
-where the bridge used `std.c.waitpid` (libc), procrun uses
+3-thread drain / streaming-with-cancel machinery. procrun uses
 `std.posix.system.wait4`/`waitpid` — on Linux that is `std.os.linux`, i.e. raw
 syscalls, keeping the module **libc-free**.
 

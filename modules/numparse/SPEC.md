@@ -1,6 +1,7 @@
 # numparse — spec
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: original work of
+the zig-libs authors (MIT).
 
 ## Design & invariants
 A single pure function, `parseGroupedNumber(s, thousands_sep, decimal_sep) ?Decimal`, generalized
@@ -15,13 +16,11 @@ into a fixed 40-byte stack buffer (stripping the thousands separator, rewriting 
 separator to `.`) then re-parsing via `decimal.Decimal.parse`; the buffer size covers any value the
 fixed-point range can hold (~27 integer digits + dot + 12 fractional), far beyond what `3+N*4`
 digits can express, so the length guard inside the scan is a defensive bound, not a reachable
-truncation path. No allocation, no shared state — reentrant. Extracted verbatim in semantics from
-bxp `bxp-core/src/expr.zig` (`parseGroupedNumber`, the user's own MIT code, one function out of a
-~6.5k-LOC expression engine); modeled after ICU `NumberFormat` parse's western 3-digit-grouping
-subset. Two mechanical adaptations from the seed: the final re-parse targets the extracted
-`decimal` module, whose `parse` returns an error union rather than the seed's `?Decimal` (mapped
-back to `null` via `catch null`); parameters renamed `thousands`/`decimal` →
-`thousands_sep`/`decimal_sep` to avoid colliding with the `decimal` dependency's own name.
+truncation path. No allocation, no shared state — reentrant. Original work of the zig-libs authors
+(MIT), modeled after ICU `NumberFormat` parse's western 3-digit-grouping subset. The final re-parse
+targets the extracted `decimal` module, whose `parse` returns an error union (mapped back to `null`
+via `catch null`); parameters are named `thousands_sep`/`decimal_sep` to avoid colliding with the
+`decimal` dependency's own name.
 
 ## Threat model / out of scope
 Not security-sensitive — a pure text-classification/parse function with no I/O, no allocation, and
@@ -33,7 +32,7 @@ broader ICU `NumberFormat` locale coverage. A caller passing the wrong separator
 locale gets `null` (safe failure), not a mis-parsed number silently accepted.
 
 ## Verification
-2 tests (ported verbatim from the bxp seed, adapted only for `decimal`'s error-union `parse`):
+2 tests (covering both grouping conventions, adapted for `decimal`'s error-union `parse`):
 American-format accept cases (grouped integers/decimals, negative, exact group boundaries) and
 reject cases (ungrouped, wrong group size); European-format mirror of the same, plus a
 cross-locale negative (comma/dot swapped). Run: `zig build test-numparse`.

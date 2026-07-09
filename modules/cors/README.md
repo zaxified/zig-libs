@@ -5,7 +5,7 @@ Cross-Origin Resource Sharing as a global `router` middleware: preflight
 204, and `Access-Control-*` header injection on actual cross-origin
 requests. T5.7 of the Web/API cluster.
 
-Provenance: clean-room — no seed project and no third-party code. Design
+Provenance: original work of the zig-libs authors (MIT) — no third-party code. Design
 references: rs/cors (Go, MIT — the primary behavioral model: preflight
 always intercepted, origin/method/header gates, failed preflight = 204
 without CORS headers) and expressjs/cors (MIT — the reflect-request-headers

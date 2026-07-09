@@ -4,11 +4,12 @@ A curated collection of **foundational Zig modules** — performance-minded, uni
 possible, each modeled after a proven implementation in another language rather than invented from
 scratch.
 
-Not a dumping ground: ship **solid, not many**. Most members are *extracted* from working code
-across sibling projects (bxp, axp, zig-fping, poc-wf-analytic); a few fill genuine gaps in the Zig
-ecosystem.
+Not a dumping ground: ship **solid, not many**. Every member is a foundational,
+cross-project-reusable capability — a production-grade implementation of a protocol/format/algorithm,
+or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
+authors' other projects depend on it, not the reverse.
 
-**Status:** 77 modules · 1809 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 77 modules · 1825 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ### Licensing note
@@ -174,7 +175,7 @@ not own, and what to reach for instead.
 ### Dropped modules (considered, rejected)
 
 - **`exprcalc`** — app-specific spreadsheet/rules engine, not reused cross-project, and needs external regex.
-- **`unaccent`** — fully dependent on external `uucode` tables; stays in bxp.
+- **`unaccent`** — fully dependent on external `uucode` tables; not included.
 - **`roquery`** — C-level SQLite hardening (authorizer/query_only enforcement); lives consumer-side over adopted zig-sqlite.
 - **`taskqueue`** — folded into `jobqueue`.
 - **`chunkframe`** — too small to be a module; a documented ~20-LOC pattern instead.

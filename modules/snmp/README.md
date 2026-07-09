@@ -51,5 +51,6 @@ management work (alongside `netlink`, `nftables`, `icmp`).
 Provenance: clean-room from RFC 1157 (SNMPv1), RFC 1905/3416 (SNMPv2c
 protocol operations), RFC 2578 (SMI types), ITU-T X.690 (BER), RFC 3412/3414
 (SNMPv3 + USM), RFC 3826 (AES-CFB privacy), FIPS 46-3 (DES) and NIST SP
-800-38A (CFB mode); net-snmp (BSD-like license) referenced for behavior only,
-no source consulted or copied.
+800-38A (CFB mode) — original work of the zig-libs authors (MIT); net-snmp
+(BSD-like license) referenced for behavior only, no source consulted or
+copied — see NOTICE.

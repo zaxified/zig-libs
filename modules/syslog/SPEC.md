@@ -40,8 +40,7 @@ test-syslog` (Debug and `-Doptimize=ReleaseFast`).
 ## Backlog / deferred
 Parser/receiver side (RFC 5424 and RFC 3164 message parsing); TLS transport (RFC 5425, BYO-TLS seam);
 reliable delivery (reconnect/retry/backpressure for TCP); full RFC 3164 parsing tolerance (encoder
-only is provided today). (README "Not implemented (DEFER)".) Owner note carried from README: add a
-NOTICE entry for RFC 5424/6587/3164 + the `pz` design reference if not already present.
+only is provided today). (README "Not implemented (DEFER)".)
 
 ## Status
 `gap · any · both (codec+client) · reentrant` + deps: none (std only) — canonical source is

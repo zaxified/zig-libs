@@ -14,7 +14,7 @@ budget, adversarial pointer loops always fail fast with a typed error rather tha
 Concurrency: every lookup blocks, one owner per `Resolver` (no shared state to synchronize). Error
 policy: malformed packets are typed errors, never panics; `resolve` returns the last response even
 on NXDOMAIN/empty (inspect `Message.rcode()`); `lookupIp` returns an empty slice when nothing
-resolves. The `/etc/hosts` + UDP-PTR core is extracted from zig-fping `src/rdns.zig`; codec/TCP/
+resolves. The `/etc/hosts` + UDP-PTR core is derived from fping; codec/TCP/
 EDNS(0)/DoH are clean-room from RFC 1035/2782/8659/8484 — see NOTICE.
 
 ## Threat model / out of scope

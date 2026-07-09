@@ -1,6 +1,7 @@
 # probe — spec
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: original work of
+the zig-libs authors (MIT).
 
 ## Design & invariants
 Pure engine behind a `Connector` seam: all connect I/O goes through `connectFn(target,

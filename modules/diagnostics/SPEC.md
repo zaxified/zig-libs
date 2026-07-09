@@ -13,8 +13,8 @@ Allocation: owned by the caller-supplied allocator; the collector holds no owner
 `items` list — all strings referenced by an appended `Diagnostic` (path/message/suggest) are
 expected to outlive the collector, typically because both live in the same arena freed in one shot
 at the validation boundary; callers must dupe strings that need to outlive that arena. Modeled after
-LSP's `Diagnostic` type / rustc diagnostics; extracted from bxp-core's config/json5/expr validation
-pass (`bxp-core/src/diagnostics.zig`, user's own code) — no third-party source. See NOTICE.
+LSP's `Diagnostic` type / rustc diagnostics; original work of the zig-libs authors, the
+structured-finding collector for config/json5/expr validation — no third-party source.
 
 ## Threat model / out of scope
 Not security-sensitive; it is a passive data collector with no I/O, no parsing, and no trust

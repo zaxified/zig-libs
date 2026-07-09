@@ -13,8 +13,8 @@ buffer. Each page's low half (0x00–0x7F) is ASCII and maps to itself, so struc
 runs only at the read edge (decode → UTF-8) and the write edge (encode ← UTF-8) — internal currency
 everywhere else is always UTF-8. Platform: any (pure logic, no OS calls). Role: codec. Concurrency:
 reentrant (tables are `const`, no shared state). Modeled after the WHATWG Encoding Standard's
-single-byte European subset; extracted from bxp `bxp-core/src/encoding.zig` (same author, MIT) — no
-third-party code, no NOTICE entry beyond the standard's public definitions.
+single-byte European subset; original work of the zig-libs authors — no third-party code, no NOTICE
+entry beyond the standard's public definitions.
 
 ## Threat model / out of scope
 **Data-lenient — never traps.** On decode, an unmappable codepoint falls back to the verbatim

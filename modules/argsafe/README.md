@@ -3,11 +3,11 @@
 Allowlist validators + a typed argv builder that neutralize **argument / flag
 injection** when an exec `argv` is assembled from untrusted input.
 
-Provenance: consolidates the 14 ad-hoc `*Safe` predicates in
-`axp-core/src/task.zig` (user's own code, MIT) — `ubusNameSafe`, `readPathSafe`,
+Provenance: original work of the zig-libs authors (MIT) — a design
+consolidation of 14 ad-hoc `*Safe` predicates (`ubusNameSafe`, `readPathSafe`,
 `logLevelSafe`, `sysctlKeySafe`, `sysctlValueSafe`, `timeSpecSafe`, `uciNameSafe`,
 `fwKeySafe`, `fwValueSafe`, `wgKeySafe`, `wgAllowedIpsSafe`, `ledNameSafe`,
-`uciGetKeySafe`, `pkgNameSafe`, `urlSafe`, `svcNameSafe`. Each one hand-rolled a
+`uciGetKeySafe`, `pkgNameSafe`, `urlSafe`, `svcNameSafe`), each of which hand-rolled a
 character-class + length check guarding a `std.process.run(.{ .argv = ... })`
 call site, with no shared abstraction. This is a **design consolidation**
 (pattern distillation, not a copy): one composable `CharClass` primitive, a set
@@ -35,8 +35,8 @@ string. There is no shell to quote against. What we neutralize:
 | **Path traversal** (`..`) | reject configured substrings | on (`..`) |
 | Length abuse | `min_len` / `max_len` | on |
 
-The seed only guarded a leading `-` and `..` in *some* of its 14 copies; here the
-safe path is the **default** for all of them.
+The safe path is the **default** for every predicate — a leading `-` and `..` are
+guarded everywhere, not just in selected call sites.
 
 ## API
 
@@ -58,7 +58,7 @@ Fields: `allow_alnum` (default true), `extra: []const u8`, `min_len`/`max_len`
 
 ### Convenience predicates
 
-| Function | Shape | Seed origin |
+| Function | Shape | Covers |
 |---|---|---|
 | `isSafeIdentifier(s)` | `[A-Za-z0-9_-]`, first alnum, 1..128 | `svcNameSafe` / `ubusNameSafe` |
 | `isSafePath(s)` | absolute, no `..`, no control, ≤4096 | `readPathSafe` (**+`..` fix**) |
@@ -97,16 +97,16 @@ error — a validation failure can never silently ship a short argv.
   quoter is a separate concern and is **not** covered here.
 - **Environment-variable injection.** Scope is argv only; a validated allowlist
   for the child environment (`std.process.Child.env_map`) is out of scope.
-- **Per-encoding length rationale.** The convenience predicates keep the seed's
+- **Per-encoding length rationale.** The convenience predicates use fixed
   byte bounds (path ≤4096, url ≤1024, cidr ≤256, base64 44/≤512); a
-  first-principles justification per encoding is not attempted — they are the
-  proven-in-production ceilings from axp.
+  first-principles justification per encoding is not attempted — they are
+  proven-in-production ceilings.
 
 ## Verification
 
-`zig build test-argsafe` — golden allow/reject tables reconstructing the seed
-validators (incl. base64 exactly-44 with 43/45 rejected, `isSafePath` now
-rejecting the `..` the seed accepted), a property-style adversarial sweep
+`zig build test-argsafe` — golden allow/reject tables covering every
+validator (incl. base64 exactly-44 with 43/45 rejected, `isSafePath`
+rejecting `..`), a property-style adversarial sweep
 feeding every predicate a raw NUL / `\n` / leading `-` / `..` / DEL / ESC and
 asserting none are accepted, and `Argv` tests (validated build; a rejected
 `pushChecked`/`pushIf` poisons `slice()`). Green in Debug and

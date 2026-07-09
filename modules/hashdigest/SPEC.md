@@ -11,7 +11,8 @@ buffers; runtime `MultiHasher` for algorithm chosen at runtime. Allocation disci
 and incremental hashing paths are allocation-free; only the `*Alloc` hex helpers and file reads use
 the caller's allocator/reader (via `std.Io`). Reentrant for the pure one-shot fns; `Hasher`/
 `MultiHasher` instances are single-owner. A thin, ergonomic layer over `std.crypto.hash`, modeled
-after Go `crypto/sha256` streaming ergonomics generalized to multi-algorithm; see NOTICE.
+after Go `crypto/sha256` streaming ergonomics generalized to multi-algorithm; original work of the
+zig-libs authors — the construction is the public SHA-256 standard, so no NOTICE entry.
 
 ## Threat model / out of scope
 Provides integrity/fingerprinting, **not authentication** — a bare digest is not a MAC; an attacker

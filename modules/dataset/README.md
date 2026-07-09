@@ -6,16 +6,14 @@ transforms). Every origin is normalized to one shape: `{ columns:
 [{name,type}], rows: [[Value…]] }`. Consumers never see a source schema —
 only a `Dataset`.
 
-- **Status:** `extract` — lifted from the authors' wgs `src/dataset.zig`.
+- **Status:** `extract`.
 - **Model after:** the Arrow/Polars minimal-columnar-subset shape and the
   pandas DataFrame mental model — but see "Known ceiling" below, this is
   row-major boxed cells, not true columnar storage.
 - **Platform:** any (pure logic, no OS calls). **Role:** util.
   **Concurrency:** reentrant (no shared state).
 
-Provenance: extracted from the authors' wgs project (`src/dataset.zig`, MIT,
-same authors) — a faithful lift; ownership semantics preserved exactly. No
-third-party code (see [NOTICE](../../NOTICE)).
+Provenance: original work of the zig-libs authors (MIT). No third-party code.
 
 ## Memory model — read this before using the module
 
@@ -73,23 +71,20 @@ fn Date.ordinal(self: Date) i64;       // see caveat below
 proleptic-Gregorian day count: equal dates compare equal, later dates compare
 greater, and 1970-01-01 lands on ordinal 0. This is enough for range
 filtering, sorting and day-difference arithmetic. It is **not independently
-verified against every historical calendar reform** — this is the seed's own
-hedge, carried forward unchanged: treat it as a monotonic ordering key, not a
-certified calendar-math primitive.
+verified against every historical calendar reform** — treat it as a monotonic
+ordering key, not a certified calendar-math primitive.
 
 ## Known ceiling (by design, not a bug)
 
 This is a **row-major, boxed-`Value`** representation (each cell is a tagged
-union, each row a slice of them) — simple, allocator-friendly, and exactly
-what the seed needed. It is not a typed columnar layout, so it does not get
-SIMD-friendly per-column scans or Arrow-style memory density. Fine for
-dashboard-sized result sets; not the shape you'd want for a multi-million-row
-analytical engine.
+union, each row a slice of them) — simple and allocator-friendly. It is not a
+typed columnar layout, so it does not get SIMD-friendly per-column scans or
+Arrow-style memory density. Fine for dashboard-sized result sets; not the
+shape you'd want for a multi-million-row analytical engine.
 
 ## Deferred (backlog, not implemented here)
 
-Flagged by the extraction scope as follow-on work, intentionally out of
-scope for this v1 lift:
+Follow-on work, intentionally out of scope for v1:
 
 - **`.decimal` `ColumnType`/`Value` variant** composing the `decimal`
   module — exact money representation; deferred because it is a
@@ -97,8 +92,7 @@ scope for this v1 lift:
   or does a consumer layer bridge the two?) rather than a self-contained
   addition.
 - **True columnar storage** (typed per-column arrays / SIMD-friendly
-  layout) — see "Known ceiling" above; would be a different representation,
-  not a faithful extraction of the seed.
+  layout) — see "Known ceiling" above; a different representation entirely.
 - **Streaming / chunked bounded-memory construction** for very large result
   sets — the current model materializes the whole `Dataset` up front; a
   streaming builder is a separate API shape.
@@ -107,14 +101,12 @@ scope for this v1 lift:
   (which rows are compared, does the caller pick key columns) needs its own
   design pass.
 
-## Changes vs the seed
+## Design notes
 
-Semantics (typed columns, tagged-union cells, serialize/deserialize wire
-format, JSON shape, date ordinal) are preserved exactly — this is a faithful
-lift. Two additions, both flagged as safe/cheap in the extraction scope:
+Two convenience additions on top of the columnar-table core:
 
-- `Value.asInt` + `Value.cast(ColumnType)` — the seed only had
-  `asFloat`/`asText`; these round out the coercion surface the same way.
+- `Value.asInt` + `Value.cast(ColumnType)` round out the coercion surface
+  alongside `asFloat`/`asText`.
 - `Dataset.concat` — append the rows of a same-schema `Dataset`, producing a
   new `Dataset` per the transform-algebra memory model; `error.SchemaMismatch`
   on a column-name/type/count mismatch.

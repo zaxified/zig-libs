@@ -1,13 +1,10 @@
 # framing
 
 Length-prefixed stream framing (`writeFrame`/`readFrame`) plus a generic JSON
-tagged-union envelope codec (`EnvelopeCodec(T)`) on top — folds what used to
-be two small seed files (`wire.zig` + `message.zig`) into one module.
+tagged-union envelope codec (`EnvelopeCodec(T)`) on top — two small layers in
+one module.
 
-Provenance: extracted from `axp-core/src/wire.zig` (framing) +
-`axp-core/src/message.zig` (envelope codec, genericized from AXP's
-domain-specific `Message` union to `EnvelopeCodec(comptime T: type)`) — same
-author's own code, MIT.
+Provenance: original work of the zig-libs authors (MIT). No third-party code.
 
 - **Status:** extract. **Platform:** any (pure `std`: `std.Io.Writer`/
   `std.Io.Reader` + `std.json`; dependency-free). **Role:** codec.
@@ -64,7 +61,7 @@ against both the announced length and the caller's buffer capacity).
 ## Tests
 
 `zig build test-framing` — 10 tests, all on a domain-free test-only
-`union(enum)` (no AXP types imported): frame round-trip, oversize rejection
+`union(enum)` (no application types imported): frame round-trip, oversize rejection
 on both the write and read paths (incl. `max_frame` enforced independently of
 buffer size), envelope round-trip (normal + empty payload), an enum-payload
 variant, a payload with embedded newline/`\r\n`/`NUL` bytes (proving the

@@ -15,11 +15,10 @@ public entry point, so a request can never traverse out of `base`. `listTyped` t
 unparseable files are skipped rather than failing the whole listing, but the `skipped` count is
 returned so callers can detect/alert on drift. Platform: posix (visibility relies on atomic
 `rename(2)`; filesystem via `std.Io`). Role: util. Concurrency: reentrant — no shared state except
-the process-local ingest counter. Extracted from axp `axp-central/src/store.zig` (same authors,
-MIT); the `kind/key` layout and read/list/delete shape are the seed's, but atomic temp-then-rename
-writes, `segmentSafe` path validation, and the `listTyped` skip-count are new here — the seed had
-*none* of the three (it wrote JSON directly via `writeFile` with no traversal guard and swallowed
-unparseable records via a silent `catch continue`). No third-party source — no NOTICE entry.
+the process-local ingest counter. Original work of the zig-libs authors (MIT): atomic
+temp-then-rename writes, `segmentSafe` path validation, and the `listTyped` skip-count are
+first-class — no JSON is ever written in place, no path is built without a traversal guard, and no
+unparseable record is silently dropped. No third-party source — no NOTICE entry.
 
 ## Threat model / out of scope
 Path traversal via `kind`/`key` is the primary threat modeled: `segmentSafe` rejects any segment

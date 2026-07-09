@@ -32,16 +32,15 @@ defer alloc.free(r.out);
   allocator and a borrowed input slice). **Deps:** std-only.
 - **Model after:** the JSON5 spec (json5.org) preprocessor-to-JSON
   approach — this module does not implement the full JSON5 grammar (see
-  Deferred below), just the subset needed by its seed's config/editor
+  Deferred below), just the subset needed by a config/editor
   use case.
 
-Provenance: extracted from `bxp-core/src/json5.zig` (user's own project,
-MIT), ~949 LOC / 20 tests, ported verbatim.
+Provenance: original work of the zig-libs authors (MIT), ~949 LOC / 20 tests.
 
 ## Deferred (not covered — full JSON5 spec gaps)
 
-The seed implements a practical JSON5 subset, not the complete json5.org
-grammar. Not covered, and not added in this extraction:
+This module implements a practical JSON5 subset, not the complete json5.org
+grammar. Not covered:
 
 - Hex numeric literals (`0x1A`).
 - Leading-dot / trailing-dot numbers (`.5`, `5.`).

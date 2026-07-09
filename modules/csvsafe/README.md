@@ -8,27 +8,23 @@ evaluates it — the `=cmd|'/c calc'!A1` / DDE class of attack. This module
 neutralizes such a cell by prefixing a single apostrophe (`'`), forcing the
 spreadsheet to render the cell as literal text.
 
-- **Status:** `extract` — lifted from bxp `bxp-cli/src/pipeline.zig`
-  `writeSafeValue`, which **fused three concerns** (injection guard +
-  decimal-separator remap + RFC 4180 quoting). Only the injection guard is
-  carved out here; quoting and separator remapping stay with the CSV writer /
+- **Status:** `extract` — the injection guard only; decimal-separator
+  remapping and RFC 4180 quoting are deliberately left to the CSV writer /
   csvstream consumer.
 - **Model after:** OWASP CSV Injection prevention.
 - **Platform:** any (pure logic, no OS calls). **Role:** util.
   **Concurrency:** reentrant (no shared state). **Allocation:** `needsGuard`
   and `writeSafe` are allocation-free; only `guard` takes an allocator.
 
-Provenance: extracted from bxp `bxp-cli/src/pipeline.zig` (`writeSafeValue`,
-injection-guard concern only; user's own code, MIT). No third-party code.
+Provenance: original work of the zig-libs authors (MIT). No third-party code.
 
-## Signed-number exception (preserved from the seed)
+## Signed-number exception
 
 `+` and `-` also legitimately lead a number (`-12.34`, `+5`, `+.5`) or a
 `+`-prefixed international phone number (`+420 555 0101`). Guarding those would
 corrupt the value, so a `+`/`-` lead is guarded **only** when the byte after it
 is not a digit or the decimal separator — i.e. only when it is actually a
-formula/comment lead (`+SUM(...)`, `-- comment`, a lone `+`). This mirrors the
-seed's `next_is_numeric` check exactly.
+formula/comment lead (`+SUM(...)`, `-- comment`, a lone `+`).
 
 ## API
 

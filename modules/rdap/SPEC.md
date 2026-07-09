@@ -1,6 +1,6 @@
 # rdap — spec
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see ./README.md (no NOTICE entry — greenfield, clean-room from public RFCs).
 
 ## Design & invariants
 
@@ -14,7 +14,7 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
   `lookupAsn` resolve the authoritative base URL. `Client.query` = build URL → fetch → parse,
   optionally following one `rel:"related"` link (registry → registrar). Clean-room from RFCs
   7480/7482/7483/7484/9224 (plus the 9082/9083 renumberings) — no third-party RDAP implementation
-  consulted; no NOTICE entry (greenfield, no seed).
+  consulted; no NOTICE entry (greenfield, original work).
 - **Fetch seam:** I/O goes through a `Fetcher` ("GET url → status + body"); `HttpFetcher` adapts the
   `http.Client` for real use — the only network-touching code. Concurrency: reentrant, no shared
   state.

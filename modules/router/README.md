@@ -6,9 +6,8 @@ First module of the Web service / API cluster: `ratelimit`, `abuseguard`,
 `throttle`, `openapi`, `cors`, `validate` and `metrics` plug in here as
 middleware.
 
-- **Status:** `extract` — the dispatch shape is seeded in axp
-  (`axp-central/src/rest.zig`); the trie matcher + middleware chain are
-  built here.
+- **Status:** `extract` — a segment-trie matcher + middleware chain over
+  `http.Server`.
 - **Model after:** Go `chi` / `julienschmidt/httprouter` (segment trie,
   deterministic precedence, 404/405 + `Allow`, trailing-slash redirect).
 - **Platform:** any. **Role:** server. **Concurrency:** reentrant —
@@ -17,10 +16,10 @@ middleware.
   of `http.Server`'s connection threads at once.
 - **Deps:** `http`.
 
-Provenance: dispatch shape extracted from axp `axp-central/src/rest.zig`
-(same authors, Apache-2.0, relicensed MIT); the trie matcher + middleware
-chain are clean-room. Design refs (chi / httprouter) in
-[NOTICE](../../NOTICE).
+Provenance: original work of the zig-libs authors (MIT); the trie matcher +
+middleware chain are clean-room, modeled after Go `chi` /
+`julienschmidt/httprouter` (segment trie, deterministic precedence, 404/405 +
+`Allow`, trailing-slash redirect) — see [NOTICE](../../NOTICE).
 
 ## Usage
 

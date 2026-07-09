@@ -6,7 +6,7 @@ neighbours. It is a codec only: it works on frame-payload byte buffers and
 never opens a socket (raw capture via AF_PACKET / BPF is a separate module).
 
 Status: **gap** — no spec-complete pure-Zig LLDP (or combined L2-discovery)
-library exists; this fills it. Feeds the axp network-discovery work, which
+library exists; this fills it. Feeds network-discovery tooling that
 previously only faked these frames.
 
 ## What's in it

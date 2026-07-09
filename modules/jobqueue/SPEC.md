@@ -1,15 +1,15 @@
 # jobqueue — spec
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: original work of
+the zig-libs authors (MIT).
 
 ## Design & invariants
 
 - **Durable background-job queue over `kv`:** `enqueue` → `dequeue` (lease) → `ack`/`nack`, with
   retry+backoff, a dead-letter queue, per-partition FIFO ordering under a priority override, and
   scheduled visibility (`delay_ns`/`run_at`). Greenfield over `kv`; the partition-FIFO dispatch
-  shape folds axp's ex-`taskqueue` `nextPendingTask`/`nextFor` semantics (behavior only); Faktory/
-  Sidekiq (lease/reserve, retry-with-backoff, dead-letter) and the `resilience`/`jwt` sibling
-  clock-injection pattern are behavioral/design references only — see NOTICE.
+  shape is original design work; Faktory/Sidekiq (lease/reserve, retry-with-backoff, dead-letter)
+  and the `resilience`/`jwt` sibling clock-injection pattern are behavioral/design references only.
 - **In-memory index over a point store.** `kv` is `put`/`get`/`delete` by key only (no scan); a
   queue must *enumerate* ready work, so jobqueue keeps its own index (`jobs`, `ready`, `leased`,
   `dlq`) and uses `kv` purely as the durable record of truth, rebuilt on `open`.
@@ -57,7 +57,7 @@ of the durable id-counter/orphan-record invariant. Run: `zig build test-jobqueue
   (`reapExpiredLeases`) is caller-driven; `kv.compact` is the caller's to schedule.
 - **A per-partition priority heap** — v1 `dequeue` is a linear scan of the in-memory ready set
   (correct, simplest given the `run_at` visibility gate); a heap is the noted optimization.
-- Ex-`taskqueue` fold: the seed's id-arithmetic priority hack silently clobbered
+- An early id-arithmetic priority hack (from an earlier design iteration) silently clobbered
   records — jobqueue's real `priority` field replaces it (already fixed, not an open gap).
 
 ## Status

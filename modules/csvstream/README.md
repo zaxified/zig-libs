@@ -6,16 +6,14 @@ seek straight back to the exact source span (drill-down, `--trace`-style source
 locators, error reporting). Streams arbitrarily large files in **bounded
 memory** — peak is the chunk size, not the file size.
 
-- **Status:** `extract` — carve + unify of the authors' own code.
+- **Status:** `extract`.
 - **Model after:** RFC 4180 + byte-offset-preserving streaming.
 - **Platform:** any. **Role:** codec. **Concurrency:** reentrant (no shared
   state). **Deps:** none (std-only, pure Zig — no C/libc).
 
-Provenance: unified from two seeds in the authors' own projects, both MIT:
-`bxp-core/src/csv.zig` (the in-memory `LineIterator`/`splitFields` core — its
-22 tests are ported verbatim as the oracle) and `bxp-cli/src/pipeline.zig`
-(the private `ChunkReader`, here publicized + parameterized). The
-composition (`StreamReader`) is new.
+Provenance: original work of the zig-libs authors (MIT). Two layers — an
+in-memory `LineIterator`/`splitFields` core (pinned by 22 oracle tests) and a
+record-aligned `ChunkReader` — composed by `StreamReader`. No third-party code.
 
 ## Two layers, one record model
 
@@ -88,8 +86,8 @@ A spec-complete CSV toolkit would still add, as discrete backlog items:
   reader-level `delimiter`. Also: distinct quote vs escape char (RFC 4180 uses
   the same char; some dialects use `\`).
 - **Header-row handling.** No built-in header capture / name→index map /
-  name-based field access. Callers wire their own (bxp's `parseCsvHeader` was
-  left in bxp deliberately — it is app policy, not codec).
+  name-based field access. Callers wire their own (a `parseCsvHeader` was left
+  out deliberately — it is app policy, not codec).
 - **Typed field coercion.** Fields are `[]const u8`; no int/float/bool/date
   parsing or per-column schema.
 - **CSV writing.** Read-only. No RFC 4180 quoting-on-output (that concern lives

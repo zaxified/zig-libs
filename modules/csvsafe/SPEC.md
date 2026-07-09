@@ -6,9 +6,9 @@ Attribution/provenance: see /NOTICE.
 ## Design & invariants
 - Neutralizes a cell a spreadsheet would read as a formula (leading `=`, `+`, `-`, `@`, tab, CR) by
   prefixing a single apostrophe (`guard_char`), forcing literal-text rendering.
-- **Signed-number exception preserved from the seed:** a `+`/`-` lead is guarded only when the byte
+- **Signed-number exception:** a `+`/`-` lead is guarded only when the byte
   after it is not a digit or the decimal separator — so `-12.34`, `+.5`, and `+420 555 0101` pass
-  through unguarded, mirroring the seed's `next_is_numeric` check exactly.
+  through unguarded.
 - `needsGuard`/`writeSafe` are allocation-free (stream to `*std.Io.Writer`); only `guard` (returns
   an owned `[]u8`) takes an allocator. `*Sep` variants let a comma-decimal locale recognize
   `-12,34` as a number via `needsGuardSep`/`writeSafeSep`/`guardSep`.
@@ -16,8 +16,8 @@ Attribution/provenance: see /NOTICE.
 
 ## Threat model / out of scope
 Defends against the `=cmd|'/c calc'!A1` / DDE class of CSV formula-injection when the CSV is opened
-in a spreadsheet. Out of scope by design (carved deliberately narrow from a seed that fused three
-concerns): **RFC 4180 quoting** (delimiter/quote/CR-LF wrapping — the CSV writer's or `csvstream`'s
+in a spreadsheet. Out of scope by design (deliberately narrow — the injection guard and nothing
+else): **RFC 4180 quoting** (delimiter/quote/CR-LF wrapping — the CSV writer's or `csvstream`'s
 job, not this guard's); **decimal-separator remapping** for numeric output (this module only *reads*
 the separator to spot a signed number, never rewrites it); **Unicode formula-lead lookalikes** (ASCII
 leads only — a non-UTF-8/homoglyph lead is unguarded); **configurable guard char** (fixed to `'`,
