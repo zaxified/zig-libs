@@ -12,8 +12,10 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
   `axp-core/src/task.zig` (`openPacketCapture`/`ifNameOf`, MIT, the receive-only ~25-LOC core); the
   send path, `SO_ATTACH_FILTER` filtering, `PACKET_ADD_MEMBERSHIP` promiscuous mode, interface
   enumeration, and the typed `Frame`/`LinkAddr`/`EthHeader` decode are new construction. Wire layout
-  clean-room from `packet(7)`, `<linux/if_packet.h>`, `<linux/filter.h>`, IEEE 802.3, and ARP — see
-  NOTICE. Model after libpcap's minimal AF_PACKET path.
+  clean-room from `packet(7)`, Linux UAPI headers (`<linux/if_packet.h>`, `<linux/if_ether.h>`,
+  `<linux/filter.h>`), IEEE 802.3/802.1AB, and ARP, with EtherStruct (BSD-2-Clause) consulted
+  only as a header-field-order cross-check (no source copied) — see NOTICE. libpcap was not
+  consulted.
 - **Pure helpers need no socket/privilege:** `EthHeader.parse`/`.write`, `parseHwaddr`/
   `formatHwaddr` (MAC ⇄ `"aa:bb:cc:dd:ee:ff"`), `LinkAddr.fromSockaddr` (the `sockaddr_ll` decode
   `recv` uses), `bpf`/`etherTypeFilter` (classic-BPF program builder; wire-format `BpfInsn` is 8

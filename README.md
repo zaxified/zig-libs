@@ -11,6 +11,15 @@ ecosystem.
 **Status:** 77 modules · 1809 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
+### Licensing note
+
+zig-libs' own code is MIT throughout. Four modules — `icmp`, `seqmap`, `netaddr`, `dns` — descend
+from fping (https://github.com/schweikert/fping), which carries a non-standard Stanford
+"BSD-with-advertising" license, not a plain permissive one. That license affirmatively requires
+that documentation and advertising materials for redistributions acknowledge the software was
+developed by Stanford University. Redistributors of those four modules (or of zig-libs as a whole)
+must preserve that fping attribution, reproduced in full in `NOTICE` §1.
+
 ## Modules
 
 Every module is imported by its `name` (`@import("http")`); hyphenated names work too

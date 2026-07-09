@@ -16,9 +16,11 @@ magic — GNU reuses those bytes for atime/ctime), octal and GNU/star base-256 s
 ('x'/'g') payloads skipped (never fatal); unknown typeflags surface as `.other` (writer rejects with
 `error.UnsupportedKind`). Reentrant, portable codec / Linux packer: `Reader`/`Writer`/`packTarGz` are
 platform-pure (I/O only through the caller's `std.Io.Reader`/`Writer`); only `packDir` (filesystem
-walker reading real attrs via raw `statx`/`readlink`) is Linux. Modeled after GNU tar/libarchive
-behavior; headers implemented from the public POSIX ustar + GNU-extension layout, not third-party
-source — see NOTICE (own code, no attribution entry needed).
+walker reading real attrs via raw `statx`/`readlink`) is Linux. Implements the public POSIX ustar
+format plus the documented GNU long-name/long-link ('L'/'K') header extensions; the installed GNU
+tar binary was used only as a black-box compatibility test oracle (see Verification) — its source
+was never consulted, and no GPL code is involved — see NOTICE (own code, no attribution entry
+needed).
 
 ## Threat model / out of scope
 Untrusted archives: the reader never panics or over-reads on malformed input, and caps name buffers

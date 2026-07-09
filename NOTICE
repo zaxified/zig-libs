@@ -14,9 +14,10 @@ required attribution is reproduced.
 ## fping  (affects modules: netaddr, dns, icmp, seqmap)
 
 The `netaddr` module's address-selection logic, the `icmp` module (echo
-codec, ICMP sockets and the paced ping engine) and the `seqmap` module
-(sequence-number correlation map, after fping's seqmap.c) were extracted from
-the authors' `zig-fping` project, which is a Zig port of fping
+codec, ICMP sockets and the paced ping engine), the `seqmap` module
+(sequence-number correlation map, after fping's seqmap.c), and the `dns`
+module's /etc/hosts + UDP-PTR core (after zig-fping's `src/rdns.zig`) were
+extracted from the authors' `zig-fping` project, which is a Zig port of fping
 (https://github.com/schweikert/fping). fping's license therefore applies to
 the derived portions and is reproduced here as its terms require:
 
@@ -34,7 +35,8 @@ the derived portions and is reproduced here as its terms require:
     The name of the University may not be used to endorse or promote
     products derived from this software without specific prior written
     permission. THIS SOFTWARE IS PROVIDED "AS IS" AND WITHOUT ANY EXPRESS
-    OR IMPLIED WARRANTIES.
+    OR IMPLIED WARRANTIES, INCLUDING, WITHOUT LIMITATION, THE IMPLIED
+    WARRANTIES OF MERCHANTIBILITY AND FITNESS FOR A PARTICULAR PURPOSE.
 
 ## IANA Time Zone Database  (affects module: tz)
 
@@ -202,11 +204,24 @@ audit is pending before any public release.
 
   blobmsg    — extracted from the authors' axp project (axp-core/src/
                ubus.zig; Apache-2.0, relicensed MIT by the copyright
-               holder); design ref: OpenWRT libubox (blob.h/blobmsg.h; ISC)
-               and OpenWRT ubus (ubusmsg.h/libubus-io.c; LGPL-2.1) — wire
-               format only, clean-room, no source consulted for this
-               extraction and no source copied; byte-parity verified against
-               `ubus -S` output on real hardware.
+               holder). The blob/blobmsg TLV codec (the bulk of the module)
+               implements the OpenWRT libubox wire format from its headers
+               blob.h/blobmsg.h (ISC) as the format specification —
+               independent Zig implementation, no libubox code copied. The
+               ubus message envelope uses the 8-byte msghdr struct layout and
+               the ubus protocol constants (MSG_*/ATTR_*) as declared in ubus
+               ubusmsg.h (LGPL-2.1); these are uncopyrightable protocol facts
+               (integer constants + a packed struct), re-derivable from the
+               `ubus -S` golden captures the module is tested against.
+               libubus-io.c (LGPL-2.1) contributed NO code: the unix-socket
+               transport (blocking read/write loops, single-buffer send,
+               fixed-header framing, seq-matched request/reply) is an
+               independent implementation — none of libubus-io.c's expression
+               (writev/iovec scatter-gather, chunked reader, SCM_RIGHTS
+               fd-passing, callback request-registry, reconnect state machine)
+               is present. Byte-parity verified against `ubus -S` on real
+               hardware. Published under MIT; the only copyleft touchpoint is
+               the uncopyrightable ubus protocol facts above.
 
   ramcache   — original seed extracted from the authors' poc-wf-analytic
                (`cache.zig`; TTL + generation invalidation + byte/entry caps).
@@ -347,5 +362,34 @@ audit is pending before any public release.
   stun       — clean-room from RFC 8489 (STUN), verified against the RFC 5769
                test vectors. Attribute-TLV DESIGN modeled after Corendos/ztun
                (MIT); no source copied.
+
+  finstats   — extracted from the authors' wgs project (`src/finance.zig`,
+               MIT), itself a faithful port of poc-wf-analytic's `reader.zig`
+               (same authors); design ref (behavior/metric-set only, no code
+               consulted or copied): Python empyrical (Apache-2.0), ffn (MIT),
+               and a QuantLib subset (QuantLib license, BSD-style). The
+               ultimate data source in that lineage is WealthFolio
+               (AGPL-3.0); the relationship is data-only interop — only the
+               SQLite schema was read via SQL, no WealthFolio source or
+               crates were linked or ported — so no AGPL obligation attaches.
+
+  tabular    — the authors' own code (wgs `src/transforms.zig`/`src/
+               series.zig`, MIT); design ref: pandas (BSD-3-Clause) and dplyr
+               (MIT) — verb-algebra naming/behavior only, no source consulted
+               or copied.
+
+  dataset    — the authors' own code (wgs / poc-wf-analytic, MIT); no
+               third-party source consulted or copied.
+
+  jsonshape  — the authors' own code (wgs `src/jsonshape.zig`, MIT); no
+               third-party source consulted or copied.
+
+  ipcbus     — the authors' own code (extracted and refactored from
+               poc-wf-analytic's `src/main.zig`, MIT); no third-party source
+               consulted or copied.
+
+  pollworker — the authors' own code (extracted and generalized from
+               poc-wf-analytic's `src/main.zig`, MIT); no third-party source
+               consulted or copied.
 
 See each module's README "Provenance" note for its specific seed and reference.

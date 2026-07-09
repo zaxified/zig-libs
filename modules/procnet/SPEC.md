@@ -30,8 +30,8 @@ call is independent, callers may run them from any thread. Extracted and retyped
 own axp project (`axp-core/src/task.zig` — `routesOutcome`/`leHexToV4`, `socketsOutcome`,
 `conntrackOutcome`/`kvField`, `parseProcStat`, the snapshot/thermal-zone/meminfo helpers; MIT, the
 authors' own code); `arp.zig` has no direct axp precedent (clean-room from `proc(5)`); IPv6
-socket-table support is a new extension beyond the IPv4-only axp seed. Modeled after gopsutil (Go)
-/ procps-ng — see NOTICE.
+socket-table support is a new extension beyond the IPv4-only axp seed. Written clean-room against
+the documented Linux `/proc` file format (`proc(5)`) and the kernel's own `/proc` ABI — see NOTICE.
 
 ## Threat model / out of scope
 Not security-sensitive in the traditional sense — the untrusted input is the kernel's own

@@ -16,11 +16,13 @@ elsewhere (goubus is HTTP/rpcd, python-ubus/golangwrt are cgo wrappers).
 - **Deps:** none (std only — `std.json` for the JSON↔blobmsg mapping).
 
 Provenance: extracted from the authors' axp project (`axp-core/src/ubus.zig`;
-same authors, Apache-2.0, relicensed MIT by the copyright holder). The wire
-format was clean-room ported byte-for-byte from the OpenWRT UAPI/C sources
-(openwrt/libubox `blob.h`/`blobmsg.h`, openwrt/ubus `ubusmsg.h`/
-`libubus-io.c` — design reference only, no source copied) and byte-parity
-verified against `ubus -S` on real hardware. See `NOTICE`.
+same authors, Apache-2.0, relicensed MIT by the copyright holder). The
+blob/blobmsg TLV codec is an independent Zig implementation of the OpenWRT
+libubox wire format specified in its headers `blob.h`/`blobmsg.h` (ISC); the
+ubus envelope reuses only the ubus protocol constants + the packed msghdr
+layout from `ubusmsg.h` (LGPL-2.1) as uncopyrightable protocol facts.
+`libubus-io.c` contributed no code — the socket transport is original.
+Byte-parity verified against `ubus -S` on real hardware. See `NOTICE`.
 
 ## API
 
