@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: MIT
 
 //! opcua — an OPC-UA (IEC 62541 / OPC 10000) binary client: the opc.tcp wire
-//! protocol (OPC 10000-6) over `SecurityPolicy#None` (no signing/encryption —
-//! that's a separate later module, F9, layered on the `rsa` module).
+//! protocol (OPC 10000-6) over `SecurityPolicy#None` (the default) or
+//! `SecurityPolicy#Basic256Sha256` at SecurityMode Sign/SignAndEncrypt
+//! (`security.zig`, layered on the `rsa` module).
 //!
 //! This is F1 "core": the built-in type codec (`encoding`, OPC 10000-6 §5.2)
-//! and the opc.tcp transport framing (`transport`, OPC 10000-6 §7) are fully
-//! scaffolded (real types, stubbed codec bodies). The service layer riding on
-//! top — OpenSecureChannel/CloseSecureChannel (F1-b), CreateSession/
-//! ActivateSession/CloseSession (F1-c), and Read/Write/Browse/Call (F1-d) — is
-//! reserved here as one-line `@panic` stubs for a later implementing agent.
+//! and the opc.tcp transport framing (`transport`, OPC 10000-6 §7), with the
+//! service layer riding on top — OpenSecureChannel/CloseSecureChannel (F1-b),
+//! CreateSession/ActivateSession/CloseSession (F1-c), and
+//! Read/Write/Browse/Call (F1-d).
 //!
 //! Model: OPC 10000-6 (OPC UA Binary encoding + opc.tcp transport). Structure
 //! references open62541 (MPL-2.0) and node-opcua (MIT) — behavioral/API-shape
@@ -42,6 +42,15 @@ pub const transport = @import("transport.zig");
 /// below are built on.
 pub const services = @import("services.zig");
 
+/// The SecureChannel security layer (OPC 10000-6 §6.7, OPC 10000-7 security
+/// profiles) — SecurityMode Sign/SignAndEncrypt over
+/// SecurityPolicy#Basic256Sha256: RSA-OAEP/SHA-1 + RSA-PKCS1v1.5/SHA-256 for
+/// the OPN handshake (via the `rsa` module), P-SHA256 key derivation, and
+/// HMAC-SHA256 + AES-256-CBC for MSG/CLO chunks. `SecureChannel.open`'s
+/// SecurityMode=None behavior is unaffected: `OpenOptions.security` defaults
+/// to `null`.
+pub const security = @import("security.zig");
+
 // Pull the submodules' tests into this module's test binary — a bare
 // re-export does NOT drag in the imported file's `test` blocks (the
 // dark-tests rule; see CONVENTIONS.md §6.3).
@@ -49,6 +58,7 @@ test {
     _ = encoding;
     _ = transport;
     _ = services;
+    _ = security;
 }
 
 // ── F2: Secure Channel (SecurityPolicy#None) ────────────────────────────────
@@ -74,6 +84,16 @@ pub const SecureChannel = struct {
         requested_lifetime_ms: u32 = 3_600_000,
         /// `RequestHeader.TimeoutHint`, milliseconds (0 = no timeout).
         timeout_hint_ms: u32 = 10_000,
+        /// `null` (the default) opens the channel at SecurityMode=None,
+        /// byte-for-byte identical to F2's original behavior. Pass a
+        /// `security.SecurityContext` (`.policy = .basic256sha256`, `.mode
+        /// = .sign`/`.sign_and_encrypt`, `.credentials`, a pinned
+        /// `.server_certificate`, and a CSPRNG `.random`) to open a signed/
+        /// encrypted channel: the OPN request is RSA-signed + RSA-OAEP-
+        /// encrypted to the server certificate, the response verified +
+        /// decrypted, and the exchanged nonces run through P-SHA256
+        /// (`security.deriveKeys`) to key every subsequent MSG/CLO chunk.
+        security: ?security.SecurityContext = null,
     };
 
     /// Perform the OpenSecureChannel request/response (Issue, not Renew —
@@ -81,14 +101,27 @@ pub const SecureChannel = struct {
     /// `conn` must already have completed the Hello/Acknowledge handshake
     /// (`transport.connect`/`Connection.hello`).
     pub fn open(conn: *transport.Connection, allocator: std.mem.Allocator, options: OpenOptions) services.ServiceError!SecureChannel {
-        var ch: SecureChannel = .{ .io = .{ .conn = conn, .allocator = allocator } };
+        var ch: SecureChannel = .{ .io = .{ .conn = conn, .allocator = allocator, .security = options.security } };
+
+        const security_mode: services.MessageSecurityMode = if (options.security) |sec| sec.mode else .none;
+        const secure = security_mode != .none;
+
+        // OPC 10000-6 §6.7.5: the nonce length matches the symmetric key
+        // length (32 for the Sha256-keyed profiles). It is key material —
+        // wiped once the channel keys are derived.
+        var client_nonce: [32]u8 = undefined;
+        defer std.crypto.secureZero(u8, &client_nonce);
+        if (secure) {
+            const random = options.security.?.random orelse @panic("opcua security: SecurityMode != none requires SecurityContext.random");
+            random.bytes(&client_nonce);
+        }
 
         const request: services.OpenSecureChannelRequest = .{
             .request_header = ch.io.nextRequestHeader(services.null_node_id, options.timeout_hint_ms),
             .client_protocol_version = 0,
             .request_type = .issue,
-            .security_mode = .none,
-            .client_nonce = &.{}, // present-but-empty: unused at SecurityMode=None
+            .security_mode = security_mode,
+            .client_nonce = if (secure) &client_nonce else &.{}, // present-but-empty at SecurityMode=None
             .requested_lifetime = options.requested_lifetime_ms,
         };
         const response = try services.Channel.call(
@@ -109,6 +142,15 @@ pub const SecureChannel = struct {
         ch.io.token_id = response.security_token.token_id;
         ch.token_created_at = response.security_token.created_at;
         ch.token_lifetime_ms = response.security_token.revised_lifetime;
+
+        if (secure) {
+            const server_nonce = response.server_nonce orelse return error.InvalidSecureMessage;
+            if (server_nonce.len == 0) return error.InvalidSecureMessage;
+            ch.io.security.?.keys = security.deriveKeys(&client_nonce, server_nonce, options.security.?.policy);
+            // The server nonce is key material too — wipe the decoded copy
+            // before the deferred free above releases it.
+            std.crypto.secureZero(u8, @constCast(server_nonce));
+        }
         return ch;
     }
 
@@ -119,6 +161,14 @@ pub const SecureChannel = struct {
     /// — this does not wait for or expect one; the caller is expected to
     /// close the underlying socket next.
     pub fn close(ch: *SecureChannel) services.ServiceError!void {
+        // The derived channel keys die with the channel — wiped whether or
+        // not the CLO send itself succeeds.
+        defer if (ch.io.security) |*sec| {
+            if (sec.keys) |*keys| {
+                keys.wipe();
+                sec.keys = null;
+            }
+        };
         const request: services.CloseSecureChannelRequest = .{
             .request_header = ch.io.nextRequestHeader(services.null_node_id, 0),
         };
@@ -147,6 +197,10 @@ pub const Session = struct {
     /// `activate` scans it for an Anonymous `UserTokenPolicy` when the
     /// caller doesn't pin one down. Freed by `deinit`.
     server_endpoints: ?[]const services.EndpointDescription = null,
+    /// `CreateSessionResponse.ServerNonce`, kept (owned, freed by `deinit`)
+    /// because `activate`'s `clientSignature` over a secure channel signs
+    /// serverCertificate ‖ serverNonce (OPC 10000-4 §5.6.3.2).
+    server_nonce: ?[]const u8 = null,
     allocator: std.mem.Allocator = undefined,
 
     pub const CreateOptions = struct {
@@ -164,14 +218,22 @@ pub const Session = struct {
     pub fn create(channel: *SecureChannel, allocator: std.mem.Allocator, options: CreateOptions) services.ServiceError!Session {
         var session: Session = .{ .channel = channel, .allocator = allocator };
 
+        // Over a Sign/SignAndEncrypt channel the server validates that
+        // ClientCertificate matches the channel's client certificate and
+        // signs ClientNonce back (OPC 10000-4 §5.6.2.2) — both must be real.
+        const chan_sec = channel.io.security;
+        const secure = chan_sec != null and chan_sec.?.mode != .none;
+        var session_nonce: [32]u8 = undefined;
+        if (secure) chan_sec.?.random.?.bytes(&session_nonce);
+
         const request: services.CreateSessionRequest = .{
             .request_header = channel.io.nextRequestHeader(services.null_node_id, options.timeout_hint_ms),
             .client_description = options.client_description,
             .server_uri = options.server_uri,
             .endpoint_url = options.endpoint_url,
             .session_name = options.session_name,
-            .client_nonce = &.{},
-            .client_certificate = null,
+            .client_nonce = if (secure) &session_nonce else &.{},
+            .client_certificate = if (secure) chan_sec.?.credentials.?.certificate_der else null,
             .requested_session_timeout = options.requested_session_timeout_ms,
             .max_response_message_size = 0, // 0 = no limit
         };
@@ -193,11 +255,12 @@ pub const Session = struct {
         session.authentication_token = response.authentication_token;
         session.revised_timeout_ms = response.revised_session_timeout;
         session.server_endpoints = response.server_endpoints;
-        // response_header/session_id/authentication_token/server_nonce/
+        session.server_nonce = response.server_nonce; // kept for `activate`'s clientSignature
+        // response_header/session_id/authentication_token/
         // server_certificate carry no owned memory we need past this point
-        // except server_endpoints (kept above) — free the rest now.
+        // except server_endpoints + server_nonce (kept above) — free the
+        // rest now.
         services.freeResponseHeader(allocator, response.response_header);
-        if (response.server_nonce) |n| allocator.free(n);
         if (response.server_certificate) |c| allocator.free(c);
         return session;
     }
@@ -231,9 +294,36 @@ pub const Session = struct {
         var token_e = encoding.Encoder.init(&token_buf.writer);
         try services.encodeAnonymousIdentityToken(&token_e, .{ .policy_id = resolved_policy_id });
 
+        // Over a Sign/SignAndEncrypt channel the server requires a
+        // ClientSignature proving possession of the channel certificate's
+        // private key: the SecurityPolicy's asymmetric signature
+        // (RSA-PKCS1v1.5/SHA-256 for Basic256Sha256) over
+        // serverCertificate ‖ serverNonce (OPC 10000-4 §5.6.3.2, "SignedData"
+        // — open62541 `checkSignature` verifies exactly this
+        // concatenation). Null at SecurityMode=None, as before.
+        const chan_sec = session.channel.io.security;
+        const secure = chan_sec != null and chan_sec.?.mode != .none;
+        var signature_bytes: ?[]u8 = null;
+        defer if (signature_bytes) |s| session.allocator.free(s);
+        var client_signature: services.SignatureData = .{ .algorithm = null, .signature = null };
+        if (secure) {
+            const sec = chan_sec.?;
+            const server_cert = sec.server_certificate orelse @panic("opcua security: SecurityMode != none requires a pinned server certificate");
+            const server_nonce = session.server_nonce orelse &.{};
+            const to_sign = try session.allocator.alloc(u8, server_cert.len + server_nonce.len);
+            defer session.allocator.free(to_sign);
+            @memcpy(to_sign[0..server_cert.len], server_cert);
+            @memcpy(to_sign[server_cert.len..], server_nonce);
+            signature_bytes = try security.asymmetricSign(session.allocator, to_sign, sec.credentials.?.private_key);
+            client_signature = .{
+                .algorithm = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",
+                .signature = signature_bytes,
+            };
+        }
+
         const request: services.ActivateSessionRequest = .{
             .request_header = session.channel.io.nextRequestHeader(session.authentication_token, 10_000),
-            .client_signature = .{ .algorithm = null, .signature = null },
+            .client_signature = client_signature,
             .client_software_certificates = null,
             .locale_ids = null,
             .user_identity_token = .{
@@ -286,6 +376,10 @@ pub const Session = struct {
             for (endpoints) |ep| services.freeEndpointDescription(session.allocator, ep);
             session.allocator.free(endpoints);
             session.server_endpoints = null;
+        }
+        if (session.server_nonce) |nonce| {
+            session.allocator.free(nonce);
+            session.server_nonce = null;
         }
     }
 
@@ -1357,6 +1451,187 @@ test "Session.readAttribute: single-node/single-attribute ergonomic helper" {
     try testing.expectEqual(@as(f64, 21.5), dv.value.?.scalar.double);
 }
 
+test "secure offline self-consistency: sealed OPN handshake (Basic256Sha256/SignAndEncrypt) -> derived keys agree -> symmetric MSG round-trip" {
+    // Drives the REAL client code path (`SecureChannel.open` +
+    // `Channel.call`) with SecurityMode=SignAndEncrypt against a
+    // hand-played "server" that uses this module's own seal/open functions
+    // with the roles swapped — proving the two directions of the asymmetric
+    // OPN exchange and the P-SHA256-derived symmetric keys are mutually
+    // consistent end-to-end. (The LIVE open62541 secure interop test below
+    // is the independent oracle; this one runs offline everywhere.)
+    const testing = std.testing;
+    var prng = std.Random.DefaultCsprng.init([_]u8{42} ** 32);
+    const random = prng.random();
+
+    // Small keys keep this fast in Debug; nothing below hardcodes 2048-bit
+    // lengths (they're all derived from the certificates' moduli).
+    var client_creds = try security.ClientCredentials.generateSelfSigned(testing.allocator, random, .{
+        .modulus_bits = 512,
+        .common_name = "secure-selftest-client",
+        .not_before = "260101000000Z",
+        .not_after = "270101000000Z",
+        .application_uri = "urn:zig-libs:opcua:client",
+    });
+    defer client_creds.deinit(testing.allocator);
+    var server_creds = try security.ClientCredentials.generateSelfSigned(testing.allocator, random, .{
+        .modulus_bits = 768,
+        .common_name = "secure-selftest-server",
+        .not_before = "260101000000Z",
+        .not_after = "270101000000Z",
+    });
+    defer server_creds.deinit(testing.allocator);
+
+    const server_nonce = "server-nonce-abcdefghijklmnopqrs"; // 32 bytes
+
+    // ── Pre-render the sealed OPN response (the server's first reply;
+    // request id 1). The seal is deterministic in structure, so it can be
+    // rendered before the client's request exists.
+    var opn_resp_alloc = std.Io.Writer.Allocating.init(testing.allocator);
+    defer opn_resp_alloc.deinit();
+    var opn_e = encoding.Encoder.init(&opn_resp_alloc.writer);
+    try opn_e.writer.writeInt(u32, 7, .little); // SecureChannelId
+    try security.encodeAsymmetricAlgorithmSecurityHeader(&opn_e, .{
+        .security_policy_uri = security.SecurityPolicy.basic256sha256.uri(),
+        .sender_certificate = server_creds.certificate_der,
+        .receiver_certificate_thumbprint = &security.certificateThumbprint(client_creds.certificate_der),
+    });
+    const opn_resp_enc_offset = opn_resp_alloc.writer.buffered().len;
+    try opn_e.writer.writeInt(u32, 1, .little); // SequenceNumber
+    try opn_e.writer.writeInt(u32, 1, .little); // RequestId
+    try opn_e.encodeNodeId(services.type_id.open_secure_channel_response);
+    try services.encodeOpenSecureChannelResponse(&opn_e, .{
+        .response_header = .{ .timestamp = 0, .request_handle = 1, .service_result = 0, .service_diagnostics = .{}, .string_table = null, .additional_header = services.no_additional_header },
+        .server_protocol_version = 0,
+        .security_token = .{ .channel_id = 7, .token_id = 3, .created_at = 0, .revised_lifetime = 3_600_000 },
+        .server_nonce = server_nonce,
+    });
+    const sealed_opn_resp = try security.sealAsymmetricMessage(
+        testing.allocator,
+        random,
+        transport.MessageType.open_secure_channel.code(),
+        opn_resp_alloc.writer.buffered(),
+        opn_resp_enc_offset,
+        server_creds, // the server signs with ITS key…
+        client_creds.certificate_der, // …and encrypts to the CLIENT's certificate
+    );
+    defer testing.allocator.free(sealed_opn_resp);
+
+    // ── Client: real SecureChannel.open over the sealed response.
+    var client_out_buf: [8192]u8 = undefined;
+    var client_out_w: std.Io.Writer = .fixed(&client_out_buf);
+    var client_in_r: std.Io.Reader = .fixed(sealed_opn_resp);
+    var conn = transport.Connection.init(&client_in_r, &client_out_w);
+
+    var ch = try SecureChannel.open(&conn, testing.allocator, .{
+        .security = .{
+            .policy = .basic256sha256,
+            .mode = .sign_and_encrypt,
+            .credentials = client_creds,
+            .server_certificate = server_creds.certificate_der,
+            .random = random,
+        },
+    });
+    try testing.expectEqual(@as(u32, 7), ch.io.channel_id);
+    try testing.expectEqual(@as(u32, 3), ch.io.token_id);
+    try testing.expect(ch.io.security.?.keys != null);
+
+    // ── Server side: open the client's sealed OPN request with the server
+    // key + the client certificate, and check every security field.
+    const opn_req_wire = client_out_w.buffered();
+    try testing.expectEqualSlices(u8, "OPN", opn_req_wire[0..3]);
+    try testing.expectEqual(opn_req_wire.len, std.mem.readInt(u32, opn_req_wire[4..8], .little));
+    const opn_req_plain = try security.openAsymmetricMessage(
+        testing.allocator,
+        opn_req_wire[0..8],
+        opn_req_wire[8..],
+        server_creds.private_key,
+        client_creds.certificate_der,
+    );
+    defer testing.allocator.free(opn_req_plain);
+
+    var req_r: std.Io.Reader = .fixed(opn_req_plain);
+    try testing.expectEqual(@as(u32, 0), try req_r.takeInt(u32, .little)); // SecureChannelId (0 on the first OPN)
+    var req_d = encoding.Decoder.init(&req_r, testing.allocator);
+    const req_hdr = try security.decodeAsymmetricAlgorithmSecurityHeader(&req_d);
+    defer security.freeAsymmetricAlgorithmSecurityHeader(testing.allocator, req_hdr);
+    try testing.expectEqualStrings(security.SecurityPolicy.basic256sha256.uri(), req_hdr.security_policy_uri.?);
+    try testing.expectEqualSlices(u8, client_creds.certificate_der, req_hdr.sender_certificate.?);
+    try testing.expectEqualSlices(u8, &security.certificateThumbprint(server_creds.certificate_der), req_hdr.receiver_certificate_thumbprint.?);
+    try testing.expectEqual(@as(u32, 1), try req_r.takeInt(u32, .little)); // SequenceNumber
+    try testing.expectEqual(@as(u32, 1), try req_r.takeInt(u32, .little)); // RequestId
+    const req_type = try req_d.decodeNodeId();
+    try testing.expectEqualDeep(services.type_id.open_secure_channel_request, req_type);
+    const opn_req = try services.decodeOpenSecureChannelRequest(&req_d);
+    defer services.freeOpenSecureChannelRequest(testing.allocator, opn_req);
+    try testing.expectEqual(services.MessageSecurityMode.sign_and_encrypt, opn_req.security_mode);
+    try testing.expectEqual(@as(usize, 32), opn_req.client_nonce.?.len);
+
+    // The server's independent P-SHA256 derivation from the exchanged
+    // nonces must agree byte-for-byte with the client's channel keys.
+    const server_keys = security.deriveKeys(opn_req.client_nonce.?, server_nonce, .basic256sha256);
+    try testing.expectEqualSlices(u8, std.mem.asBytes(&ch.io.security.?.keys.?), std.mem.asBytes(&server_keys));
+
+    // ── Symmetric MSG round-trip through the real Channel.call path:
+    // pre-render a sealed CloseSessionResponse (request id 2) with the
+    // server-direction keys.
+    var msg_resp_alloc = std.Io.Writer.Allocating.init(testing.allocator);
+    defer msg_resp_alloc.deinit();
+    var msg_e = encoding.Encoder.init(&msg_resp_alloc.writer);
+    try msg_e.writer.writeInt(u32, 7, .little); // SecureChannelId
+    try msg_e.writer.writeInt(u32, 3, .little); // TokenId
+    try msg_e.writer.writeInt(u32, 2, .little); // SequenceNumber
+    try msg_e.writer.writeInt(u32, 2, .little); // RequestId
+    try msg_e.encodeNodeId(services.type_id.close_session_response);
+    try services.encodeCloseSessionResponse(&msg_e, .{
+        .response_header = .{ .timestamp = 0, .request_handle = 2, .service_result = 0, .service_diagnostics = .{}, .string_table = null, .additional_header = services.no_additional_header },
+    });
+    const sealed_msg_resp = try security.symmetricSignAndEncrypt(
+        testing.allocator,
+        transport.MessageType.message.code(),
+        msg_resp_alloc.writer.buffered(),
+        .sign_and_encrypt,
+        server_keys,
+        .server_to_client,
+    );
+    defer testing.allocator.free(sealed_msg_resp);
+
+    const msg_req_start = client_out_w.buffered().len;
+    client_in_r = .fixed(sealed_msg_resp); // conn holds the pointer — swap the stream in place
+
+    const close_resp = try services.Channel.call(
+        &ch.io,
+        .message,
+        services.type_id.close_session_request,
+        services.CloseSessionRequest,
+        .{ .request_header = ch.io.nextRequestHeader(services.null_node_id, 0), .delete_subscriptions = false },
+        services.encodeCloseSessionRequest,
+        services.CloseSessionResponse,
+        services.type_id.close_session_response,
+        services.decodeCloseSessionResponse,
+        services.result_fns.close_session,
+    );
+    services.freeCloseSessionResponse(testing.allocator, close_resp);
+    try testing.expectEqual(@as(encoding.StatusCode, 0), close_resp.response_header.service_result);
+
+    // And the client's outgoing MSG chunk opens cleanly with the
+    // server-side keys (sender direction = client).
+    const msg_req_wire = client_out_w.buffered()[msg_req_start..];
+    try testing.expectEqualSlices(u8, "MSG", msg_req_wire[0..3]);
+    const msg_req_plain = try security.symmetricDecryptAndVerify(
+        testing.allocator,
+        msg_req_wire[0..8],
+        msg_req_wire[8..],
+        .sign_and_encrypt,
+        server_keys,
+        .client_to_server,
+    );
+    defer testing.allocator.free(msg_req_plain);
+    try testing.expectEqual(@as(u32, 7), std.mem.readInt(u32, msg_req_plain[0..4], .little)); // SecureChannelId
+    try testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, msg_req_plain[4..8], .little)); // TokenId
+    try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, msg_req_plain[8..12], .little)); // SequenceNumber
+    try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, msg_req_plain[12..16], .little)); // RequestId
+}
+
 test "Subscription offline flow: CreateSubscription -> CreateMonitoredItems -> Publish(DataChangeNotification) -> ack next Publish -> DeleteSubscriptions" {
     // Same technique as the "full offline flow" test above: hand-render a
     // sequence of MSG responses (all ride plain `.message` chunks — none of
@@ -1912,4 +2187,192 @@ test "LIVE open62541 interop: subscriptions -> CreateSubscription -> CreateMonit
     try testing.expectEqual(@as(usize, 0), sub.monitored_items.items.len);
 
     try sub.delete();
+}
+
+const live_secure_container_name = "opcua-zig-libs-live-test-secure";
+
+/// One full secure client sequence against the live server: connect ->
+/// Hello -> OpenSecureChannel (Basic256Sha256, `mode`) -> CreateSession ->
+/// ActivateSession (clientSignature over serverCertificate ‖ serverNonce)
+/// -> Read i=2258 over the signed(-and-encrypted) channel -> teardown.
+fn liveSecureSequence(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    mode: security.SecurityMode,
+    credentials: security.ClientCredentials,
+    server_certificate: []const u8,
+    random: std.Random,
+) !void {
+    const testing = std.testing;
+
+    const addr = std.Io.net.IpAddress.parse("127.0.0.1", 4840) catch unreachable;
+    var stream = try addr.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+
+    var read_buf: [8192]u8 = undefined;
+    var write_buf: [8192]u8 = undefined;
+    var stream_reader = stream.reader(io, &read_buf);
+    var stream_writer = stream.writer(io, &write_buf);
+    var conn = transport.Connection.init(&stream_reader.interface, &stream_writer.interface);
+    _ = try conn.hello(.{
+        .protocol_version = 0,
+        .receive_buffer_size = 65536,
+        .send_buffer_size = 65536,
+        .max_message_size = 0,
+        .max_chunk_count = 0,
+        .endpoint_url = live_endpoint_url,
+    });
+
+    var ch = try SecureChannel.open(&conn, gpa, .{
+        .security = .{
+            .policy = .basic256sha256,
+            .mode = mode,
+            .credentials = credentials,
+            .server_certificate = server_certificate,
+            .random = random,
+        },
+    });
+    defer ch.close() catch {};
+    try testing.expect(ch.io.security.?.keys != null);
+
+    var session = try Session.create(&ch, gpa, .{
+        .client_description = .{
+            .application_uri = "urn:zig-libs:opcua:client",
+            .product_uri = "urn:zig-libs:opcua",
+            .application_name = .{ .locale = "en", .text = "zig-libs opcua client" },
+            .application_type = .client,
+            .gateway_server_uri = null,
+            .discovery_profile_uri = null,
+            .discovery_urls = null,
+        },
+        .endpoint_url = live_endpoint_url,
+    });
+    defer session.deinit();
+    try session.activate(null);
+    defer session.close(false) catch {};
+
+    // The proof: a DataValue read over the secured channel decrypts +
+    // verifies into a plausible server CurrentTime.
+    const current_time = try session.readAttribute(.{ .numeric = .{ .namespace = 0, .id = 2258 } }, services.attribute_id.value);
+    defer encoding.freeDataValue(gpa, current_time);
+    try testing.expect(current_time.value != null);
+    try testing.expect(current_time.value.? == .scalar);
+    try testing.expect(current_time.value.?.scalar == .date_time);
+    try testing.expect(current_time.value.?.scalar.date_time > 0);
+}
+
+test "LIVE open62541 secure interop: Basic256Sha256 SignAndEncrypt + Sign -> OPN -> session -> encrypted Read i=2258" {
+    // The real oracle for the whole security layer: a genuine open62541
+    // server (`server_ctt` with its baked-in certificate). The image's
+    // default CMD carries no trust list and its mbedtls verifier then
+    // rejects every client certificate as BadCertificateUntrusted (the
+    // startup "Any remote certificate will be accepted" warning
+    // notwithstanding — verified empirically), so the container is started
+    // with an explicit `--trustlistFolder /trust` and our freshly generated
+    // client certificate is copied in (`server_ctt` reloads the folder on
+    // every OPN). The server's certificate is pulled out of the container
+    // (`podman exec cat`) and pinned — exactly what a deployment would do
+    // out-of-band.
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    stopContainer(gpa, io, live_secure_container_name); // leftover cleanup, best-effort
+
+    var run_result = runPodman(gpa, io, &.{
+        "run",                                  "--rm",                                         "-d",                                         "--network",
+        "host",                                 "--name",                                       live_secure_container_name,                   "--pull=never",
+        "docker.io/open62541/open62541:latest",
+        // The image's CMD, minus its implicit empty trust list:
+        "/opt/open62541/build/bin/examples/server_ctt", "/opt/open62541/pki/created/server_cert.der", "/opt/open62541/pki/created/server_key.der",
+        "--trustlistFolder",                    "/trust",                                       "--enableUnencrypted",                        "--enableAnonymous",
+    }) catch |err| switch (err) {
+        error.SkipZigTest => {
+            std.debug.print("\nLIVE opcua secure interop test SKIPPED: `podman` is not available in this environment.\n", .{});
+            return error.SkipZigTest;
+        },
+        else => return err,
+    };
+    defer run_result.deinit(gpa);
+    if (run_result.exit_code != 0) {
+        std.debug.print(
+            "\nLIVE opcua secure interop test SKIPPED: `podman run` failed (image not pulled / podman unusable here).\nstderr: {s}\n",
+            .{run_result.stderr},
+        );
+        return error.SkipZigTest;
+    }
+    defer stopContainer(gpa, io, live_secure_container_name);
+
+    // Wait for the listener, then close the probe connection — the secure
+    // sequences below open their own.
+    {
+        var probe: std.Io.net.Stream = blk: {
+            var attempt: usize = 0;
+            while (attempt < 60) : (attempt += 1) {
+                const addr = std.Io.net.IpAddress.parse("127.0.0.1", 4840) catch unreachable;
+                if (addr.connect(io, .{ .mode = .stream })) |s| break :blk s else |_| {}
+                sleepMs(250);
+            }
+            std.debug.print("\nLIVE opcua secure interop test SKIPPED: could not connect to opc.tcp://127.0.0.1:4840 within 15s.\n", .{});
+            return error.SkipZigTest;
+        };
+        probe.close(io);
+    }
+
+    // Pin the server's certificate straight out of the running container.
+    var cert_result = try runPodman(gpa, io, &.{
+        "exec", live_secure_container_name, "cat", "/opt/open62541/pki/created/server_cert.der",
+    });
+    defer cert_result.deinit(gpa);
+    if (cert_result.exit_code != 0 or cert_result.stdout.len == 0) {
+        std.debug.print("\nLIVE opcua secure interop test SKIPPED: could not read the server certificate from the container.\nstderr: {s}\n", .{cert_result.stderr});
+        return error.SkipZigTest;
+    }
+    const server_certificate = cert_result.stdout;
+    // Sanity: it must parse as an RSA certificate (same helper the OPN
+    // seal/open path uses).
+    _ = try security.certificatePublicKey(server_certificate);
+
+    // A real (OS-entropy-seeded) CSPRNG — this handshake leaves the machine.
+    var seed: [32]u8 = undefined;
+    if (std.os.linux.getrandom(&seed, seed.len, 0) != seed.len) return error.SkipZigTest;
+    var csprng = std.Random.DefaultCsprng.init(seed);
+    const random = csprng.random();
+
+    // 2048-bit: the conventional Basic256Sha256 application-certificate
+    // size (`SecurityLengths.basic256sha256`'s documented shape).
+    var credentials = try security.ClientCredentials.generateSelfSigned(gpa, random, .{
+        .modulus_bits = 2048,
+        .common_name = "zig-libs opcua secure interop test",
+        .not_before = "260101000000Z",
+        .not_after = "270101000000Z",
+        .application_uri = "urn:zig-libs:opcua:client",
+    });
+    defer credentials.deinit(gpa);
+
+    // Get the client certificate into the server's trust-list folder:
+    // stage it on the host, `podman cp` it in.
+    const host_cert_path = "/tmp/opcua-zig-libs-live-secure-client-cert.der";
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = host_cert_path, .data = credentials.certificate_der });
+    defer std.Io.Dir.cwd().deleteFile(io, host_cert_path) catch {};
+    {
+        var mkdir_result = try runPodman(gpa, io, &.{ "exec", live_secure_container_name, "mkdir", "-p", "/trust" });
+        defer mkdir_result.deinit(gpa);
+        if (mkdir_result.exit_code != 0) return error.SkipZigTest;
+        var cp_result = try runPodman(gpa, io, &.{ "cp", host_cert_path, live_secure_container_name ++ ":/trust/client_cert.der" });
+        defer cp_result.deinit(gpa);
+        if (cp_result.exit_code != 0) {
+            std.debug.print("\nLIVE opcua secure interop test SKIPPED: `podman cp` into the container failed.\nstderr: {s}\n", .{cp_result.stderr});
+            return error.SkipZigTest;
+        }
+    }
+
+    // SignAndEncrypt is the headline mode; Sign proves the
+    // signature-only symmetric framing (no padding, no encryption) against
+    // the same server.
+    try liveSecureSequence(gpa, io, .sign_and_encrypt, credentials, server_certificate, random);
+    try liveSecureSequence(gpa, io, .sign, credentials, server_certificate, random);
 }

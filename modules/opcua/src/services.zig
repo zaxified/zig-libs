@@ -32,8 +32,10 @@
 const std = @import("std");
 const encoding = @import("encoding.zig");
 const transport = @import("transport.zig");
+const security = @import("security.zig");
 
-pub const ServiceError = encoding.EncodeError || encoding.DecodeError || transport.TransportError || error{
+pub const ServiceError = encoding.EncodeError || encoding.DecodeError || transport.TransportError ||
+    security.SealAsymmetricError || security.OpenAsymmetricError || security.SymmetricDecryptAndVerifyError || error{
     /// The peer answered with a ServiceFault instead of the expected
     /// response type. `Channel.last_service_result` holds the StatusCode
     /// from the fault's `ResponseHeader.service_result`.
@@ -48,9 +50,9 @@ pub const ServiceError = encoding.EncodeError || encoding.DecodeError || transpo
     UnexpectedResponseType,
 };
 
-/// `SecurityPolicy#None`'s URI (OPC 10000-7 §6.2.1) — the only SecurityPolicy
-/// this module (and this whole `opcua` module: no crypto, see `root.zig`'s
-/// doc comment) speaks.
+/// `SecurityPolicy#None`'s URI (OPC 10000-7 §6.2.1) — the SecurityPolicy the
+/// default (SecurityMode=None) code path speaks; the secure policies live in
+/// `security.SecurityPolicy.uri()`.
 pub const security_policy_none_uri = "http://opcfoundation.org/UA/SecurityPolicy#None";
 
 /// The wire's canonical "null NodeId" (namespace 0, numeric identifier 0,
@@ -2267,11 +2269,16 @@ const max_message_size: usize = 65536;
 /// per-channel bookkeeping (channel/token ids, sequence/request-id
 /// counters) and the OPN-vs-MSG/CLO security-header framing choice: OPN
 /// carries the `AsymmetricAlgorithmSecurityHeader` (SecurityPolicyUri +
-/// null sender-cert/receiver-thumbprint, SecurityMode=None never signs), MSG
-/// and CLO carry the `SymmetricAlgorithmSecurityHeader` (just the u32
-/// TokenId) — ground-truthed against open62541 (`UA_SecureChannel_
+/// sender certificate + receiver thumbprint — both null at
+/// SecurityMode=None), MSG and CLO carry the
+/// `SymmetricAlgorithmSecurityHeader` (just the u32 TokenId) —
+/// ground-truthed against open62541 (`UA_SecureChannel_
 /// sendAsymmetricOPNMessage`/`sendSymmetricMessage`), OPC 10000-6 §6.7.2/
-/// §7.2/§7.3 name the shapes but not which chunk types use which.
+/// §7.2/§7.3 name the shapes but not which chunk types use which. At
+/// SecurityMode Sign/SignAndEncrypt every outgoing/incoming chunk
+/// additionally rides through `security.zig`'s seal/open functions (OPN:
+/// RSA sign + OAEP encrypt; MSG/CLO: HMAC-SHA256 +, for SignAndEncrypt,
+/// AES-256-CBC).
 pub const Channel = struct {
     conn: *transport.Connection,
     allocator: std.mem.Allocator,
@@ -2282,6 +2289,12 @@ pub const Channel = struct {
     /// `ResponseHeader.service_result` (or a ServiceFault's) from the most
     /// recent call that returned `error.ServiceFault`/`error.BadServiceResult`.
     last_service_result: encoding.StatusCode = 0,
+    /// `null` (the default) keeps this channel's SecurityMode=None behavior
+    /// byte-for-byte unchanged — `sendService`/`recvService` only branch
+    /// into `security.zig`'s crypto when this is non-null *and*
+    /// `.mode != .none`. See `security.SecurityContext`; `root.
+    /// SecureChannel.open` populates `.keys` from the OPN nonce exchange.
+    security: ?security.SecurityContext = null,
 
     /// Build a `RequestHeader` for the next outgoing call, bumping
     /// `request_handle` — reuses the same monotonic counter as `request_id`/
@@ -2321,13 +2334,42 @@ pub const Channel = struct {
         var e = encoding.Encoder.init(&allocating.writer);
 
         try e.writer.writeInt(u32, ch.channel_id, .little);
+        const sec_mode: security.SecurityMode = if (ch.security) |sec| sec.mode else .none;
+        // For a secure OPN: where the encrypted region (the SequenceHeader)
+        // starts within the body being built — right after the
+        // AsymmetricAlgorithmSecurityHeader (OPC 10000-6 §6.7.2).
+        var opn_encrypted_region_offset: usize = 0;
         switch (message_type) {
             .open_secure_channel => {
-                try e.encodeString(security_policy_none_uri);
-                try e.encodeByteString(null); // SenderCertificate — none at SecurityMode=None
-                try e.encodeByteString(null); // ReceiverCertificateThumbprint
+                if (sec_mode == .none) {
+                    // Unchanged from before the security layer landed —
+                    // byte-identical to the original SecurityMode=None-only
+                    // code path.
+                    try e.encodeString(security_policy_none_uri);
+                    try e.encodeByteString(null); // SenderCertificate — none at SecurityMode=None
+                    try e.encodeByteString(null); // ReceiverCertificateThumbprint
+                } else {
+                    // Sign/SignAndEncrypt: the real
+                    // AsymmetricAlgorithmSecurityHeader, carrying this
+                    // client's certificate + the pinned server certificate's
+                    // SHA-1 thumbprint.
+                    const sec = ch.security.?;
+                    const creds = sec.credentials orelse @panic("opcua security: SecurityMode != none requires ClientCredentials");
+                    const server_cert = sec.server_certificate orelse @panic("opcua security: SecurityMode != none requires a pinned server certificate");
+                    const thumbprint = security.certificateThumbprint(server_cert);
+                    try security.encodeAsymmetricAlgorithmSecurityHeader(&e, .{
+                        .security_policy_uri = sec.policy.uri(),
+                        .sender_certificate = creds.certificate_der,
+                        .receiver_certificate_thumbprint = &thumbprint,
+                    });
+                    opn_encrypted_region_offset = allocating.writer.buffered().len;
+                }
             },
             .message, .close_secure_channel => {
+                // SymmetricAlgorithmSecurityHeader is just the TokenId at
+                // every SecurityMode — Sign/SignAndEncrypt instead change
+                // how the *body* is framed below (see the `body` hook after
+                // this switch), not this header.
                 try e.writer.writeInt(u32, ch.token_id, .little);
             },
             else => unreachable, // service calls only ever ride OPN/MSG/CLO
@@ -2343,6 +2385,41 @@ pub const Channel = struct {
 
         const body = allocating.writer.buffered();
         if (body.len > std.math.maxInt(u32) - 8) return error.MessageTooLarge;
+
+        // Sign/SignAndEncrypt: hand the plaintext body to security.zig,
+        // which returns the complete wire message (the 8-byte MessageHeader
+        // is part of the signed range, so the security layer builds it).
+        // `ch.security == null` or `.mode == .none` skips this block
+        // entirely — `body` is sent exactly as built above, unchanged.
+        if (ch.security) |sec| if (sec.mode != .none) {
+            const secured = switch (message_type) {
+                .open_secure_channel => blk: {
+                    // Presence of credentials/server certificate was already
+                    // enforced while encoding the asym header above.
+                    const random = sec.random orelse @panic("opcua security: SecurityMode != none requires SecurityContext.random");
+                    break :blk try security.sealAsymmetricMessage(
+                        ch.allocator,
+                        random,
+                        message_type.code(),
+                        body,
+                        opn_encrypted_region_offset,
+                        sec.credentials.?,
+                        sec.server_certificate.?,
+                    );
+                },
+                .message, .close_secure_channel => blk: {
+                    const keys = sec.keys orelse @panic("opcua security: SecurityMode != none requires derived ChannelKeys");
+                    break :blk try security.symmetricSignAndEncrypt(ch.allocator, message_type.code(), body, sec.mode, keys, .client_to_server);
+                },
+                else => unreachable,
+            };
+            defer ch.allocator.free(secured);
+            std.crypto.secureZero(u8, body); // the plaintext request is spent
+            try ch.conn.writer.writeAll(secured);
+            try ch.conn.writer.flush();
+            return;
+        };
+
         try ch.conn.sendChunk(.{
             .message_type = message_type,
             .chunk_type = .final,
@@ -2376,7 +2453,39 @@ pub const Channel = struct {
             const chunk = try ch.conn.recvChunk(&chunk_buf);
             if (chunk.header.message_type == .error_msg) return error.ServerError;
             if (chunk.header.message_type != message_type) return error.BadMessageType;
-            if (try assembler.feed(chunk.header.chunk_type, chunk.body)) |msg| break msg;
+
+            // Sign/SignAndEncrypt: decrypt + verify each chunk *before*
+            // reassembly (every chunk is individually secured — OPC 10000-6
+            // §6.7.2). The signature covers the 8-byte MessageHeader the
+            // transport already consumed, so it's reconstructed here.
+            // `ch.security == null` or `.mode == .none` feeds the chunk
+            // body through unchanged.
+            var fed: []const u8 = chunk.body;
+            var opened: ?[]u8 = null;
+            defer if (opened) |o| {
+                std.crypto.secureZero(u8, o);
+                ch.allocator.free(o);
+            };
+            if (ch.security) |sec| if (sec.mode != .none) {
+                var header_bytes: [8]u8 = undefined;
+                header_bytes[0..3].* = chunk.header.message_type.code().*;
+                header_bytes[3] = @intFromEnum(chunk.header.chunk_type);
+                std.mem.writeInt(u32, header_bytes[4..8], chunk.header.message_size, .little);
+                opened = switch (message_type) {
+                    .open_secure_channel => blk: {
+                        const creds = sec.credentials orelse @panic("opcua security: SecurityMode != none requires ClientCredentials");
+                        const server_cert = sec.server_certificate orelse @panic("opcua security: SecurityMode != none requires a pinned server certificate");
+                        break :blk try security.openAsymmetricMessage(ch.allocator, &header_bytes, chunk.body, creds.private_key, server_cert);
+                    },
+                    .message, .close_secure_channel => blk: {
+                        const keys = sec.keys orelse @panic("opcua security: SecurityMode != none requires derived ChannelKeys");
+                        break :blk try security.symmetricDecryptAndVerify(ch.allocator, &header_bytes, chunk.body, sec.mode, keys, .server_to_client);
+                    },
+                    else => unreachable,
+                };
+                fed = opened.?;
+            };
+            if (try assembler.feed(chunk.header.chunk_type, fed)) |msg| break msg;
         };
 
         var r: std.Io.Reader = .fixed(full);
@@ -2390,6 +2499,11 @@ pub const Channel = struct {
                 defer freeOptStr(ch.allocator, cert);
                 const thumb = try hd.decodeByteString();
                 defer freeOptStr(ch.allocator, thumb);
+                // At SecurityMode != None the OPN response was already
+                // decrypted + signature-verified per chunk above
+                // (`security.openAsymmetricMessage`, against the *pinned*
+                // server certificate) — the header fields decoded here are
+                // plaintext either way and need no further checks.
             },
             .message, .close_secure_channel => {
                 _ = try r.takeInt(u32, .little); // TokenId
