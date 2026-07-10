@@ -9,6 +9,17 @@ Zero-allocation and transport-agnostic: `parse` fills a caller-provided option
 array from a datagram (values borrow the datagram); `serialize` writes a message
 into a caller buffer; `encodedLen` sizes it. Wire it to any UDP/DTLS transport.
 
+**Transport security.** Every layer here — codec, reliability, client/server,
+block-wise, observe — only ever touches in-memory buffers; the caller owns the
+socket. That means the module runs unmodified over plain UDP *or* over a
+caller-terminated **DTLS** session (RFC 7252 §9's mandated CoAP transport
+security), the same "bring your own transport" seam this repo uses for BYO-TLS
+on TCP. **Production CoAP over an untrusted network MUST use that DTLS seam** —
+plain UDP is unauthenticated, so a source identity (needed by the Observe
+admission hook below) and duplicate suppression (`reliability.Dedup`) are only
+as trustworthy as the transport underneath them. See `SPEC.md`'s "Threat model"
+for the full reasoning.
+
 ```zig
 var opts: [16]coap.Option = undefined;
 const msg = try coap.parse(datagram, &opts);
@@ -60,7 +71,14 @@ it with an absolute `now_ms` and its own socket):
   to stop. `MAX_RETRANSMIT` retransmissions then a final wait → failure.
 - **`Dedup`** — a bounded, time-windowed set of recently-seen message IDs
   (§4.5) over caller storage; `check(mid, now_ms)` → `fresh` / `duplicate`
-  (window from first sight, soonest-to-expire eviction when full).
+  (window from first sight, soonest-to-expire eviction when full). Both the
+  table size (the caller's storage slice) and the remembered-duration
+  (`lifetime_ms`, an `init` argument) are caller-configurable — size them for
+  your expected authenticated-peer/exchange count. **`Dedup` is a reliability
+  control, not a replay-security control**: on plain UDP an attacker can flood
+  the window with distinct message IDs to evict a legitimate exchange before
+  its retransmission window elapses; it becomes a security boundary only once
+  the source is authenticated (the DTLS seam above).
 - **`emptyAck(mid)` / `reset(mid)`** and the §4.8 `Params` / `exchange_lifetime_ms`.
 
 ## Client / server (`coap.client`, `coap.server`)
@@ -114,6 +132,19 @@ server pushes a notification on each change (C7):
   no fresh request. A CON notification that exhausts `reliability.Retransmit`
   (`.timed_out`) or is answered with a Reset cancels the subscription (caller
   loop glue; `reliability.zig` is untouched).
+- **Admission (`Registry.tryRegister`, `AdmitFn`)** — on plain UDP, anyone can
+  send an Observe registration, and unconditional FIFO eviction lets an
+  attacker evict legitimate subscribers by registering enough new ones. Use
+  `tryRegister(source_id, tok, resource, seq)` instead of `register` on an
+  untrusted transport: it consults an optional `admit_fn`/`admit_ctx` hook
+  (`?*anyopaque` ctx, function pointer, no allocation/closures) and an optional
+  per-`source_id` cap (`max_per_source`) *before* touching the table, so a
+  rejected registration never evicts an existing one. `source_id` is the
+  caller's opaque peer identity — make it meaningful by deriving it from an
+  authenticated DTLS session (the seam above); a hook keyed off the
+  unauthenticated UDP source address isn't a real mitigation. `register`
+  itself is unchanged and still admits unconditionally, for callers that gate
+  admission themselves.
 
 ## Scope
 
@@ -125,15 +156,19 @@ renegotiation mid-transfer.
 
 ## Verification
 
-`zig build test-coap` — 55 offline tests. Block-wise / Observe (12): the Block
+`zig build test-coap` — 65 offline tests. Block-wise / Observe (16): the Block
 value codec (field packing, SZX sizes, minimal encoding, reserved-SZX / too-long
 / over-large-NUM errors), `split` boundary + `Assembler` completion, and two
 end-to-end block transfers (a 3000-byte Block2 GET loop reassembled and compared
 byte-for-byte; a Block1 PUT with `2.31 Continue` per non-final block); the
 Observe `Sequence` wrap, `isNewer` lollipop comparison, value round-trip, the
-`Registry` (freshness-checked notify, FIFO eviction, re-register refresh), an
-end-to-end observe register → notifications → stale-reject → cancel, and the
-CON-notification-timeout / RST cancellation glue. Client/server (7): `buildRequest`
+`Registry` (freshness-checked notify, FIFO eviction, re-register refresh),
+`Registry.tryRegister` admission policy (no-hook/no-cap parity with `register`,
+a rejected hook neither registers nor evicts an existing entry, an admitted
+source still registers when the table is full, a per-source cap bounds one
+source's share without evicting), an end-to-end observe register →
+notifications → stale-reject → cancel, and the CON-notification-timeout / RST
+cancellation glue. Client/server (7): `buildRequest`
 option assembly + counter advance, `Exchange.match` across all five reply
 kinds, NON typing, `isRequest` gating, `piggyback`/`ackOnly`/`separate`
 builders, and an end-to-end client→server→client round-trip. Reliability (9): the retransmit

@@ -30,6 +30,26 @@
 //! the subscription is dead: the caller calls `Registry.cancel(token, resource)`.
 //! (An RST correlates by message id, so the caller maps the notification's id
 //! back to its `(token, resource)` — a few lines in its own loop.)
+//!
+//! **Transport security / admission (see also `SPEC.md` "Threat model").** CoAP
+//! over plain UDP is unauthenticated: anyone who can send a datagram to the
+//! server can send an Observe registration. `register` (below) is the raw,
+//! unconditional primitive — same FIFO-eviction-when-full behavior as always,
+//! used internally and by callers that already gate admission themselves.
+//! `tryRegister` is the admission-checked entry point a caller wired to an
+//! untrusted transport should use instead: it consults an optional `admit_fn`
+//! hook and an optional per-`source_id` cap *before* touching the table, so a
+//! rejected request never evicts an existing subscription. `source_id` is
+//! whatever opaque peer identity the caller's transport can vouch for — in
+//! production that identity should come from a **caller-terminated DTLS**
+//! session (RFC 7252 §9 / RFC 7641 §8 both call out DTLS as the CoAP transport
+//! security mechanism), not from the UDP source address alone (trivially
+//! spoofed). This module stays transport-agnostic — it never touches a socket
+//! — so DTLS termination, like the rest of the transport, is the caller's BYO
+//! seam (mirroring this repo's BYO-TLS stance for TCP transports). Without
+//! *both* a real `admit_fn` policy and an authenticated `source_id`, the
+//! eviction attack described in `SPEC.md` remains possible — a hook that
+//! trusts an unauthenticated source is not a mitigation.
 
 const std = @import("std");
 const coap = @import("root.zig");
@@ -86,14 +106,40 @@ pub fn decodeValue(bytes: []const u8) u24 {
     return @truncate(v);
 }
 
+/// An admission hook consulted by `Registry.tryRegister` before a *new*
+/// subscription is added (not on a refresh of an existing one). `source_id` is
+/// the caller's opaque peer identity (e.g. derived from an authenticated DTLS
+/// session — see the module doc comment); `token`/`resource` identify the
+/// subscription being requested. Return `false` to reject the registration
+/// outright — rejection never touches the table, so it cannot evict an
+/// existing entry. No allocation, no closures: a plain function pointer plus
+/// an opaque context, in the same style as `aaa-gate.ApiKeyVerifyFn`.
+pub const AdmitFn = *const fn (ctx: ?*anyopaque, source_id: u64, token: []const u8, resource: u64) bool;
+
 /// A server-side table of active observations over caller storage — a bounded
 /// array of `(token, resource) → last sequence` entries with FIFO eviction when
 /// full, the same zero-allocation pattern as `reliability.Dedup`. The `resource`
 /// key is a caller-chosen identifier (e.g. a hash of the Uri-Path) so the table
 /// stays fixed-size.
+///
+/// `admit_fn`/`admit_ctx` and `max_per_source` are optional admission policy
+/// consulted only by `tryRegister` (see its doc comment); `register` ignores
+/// them and always succeeds/evicts as before. Both default to "off" (null /
+/// 0), so a `Registry` that never sets them or only ever calls `register`
+/// behaves exactly as before this policy was added.
 pub const Registry = struct {
     entries: []Entry,
     len: usize = 0,
+    /// Optional admission hook for `tryRegister`. `null` (default) = admit-all,
+    /// matching the pre-existing `register` behavior.
+    admit_fn: ?AdmitFn = null,
+    /// Opaque context handed verbatim to every `admit_fn` call.
+    admit_ctx: ?*anyopaque = null,
+    /// Optional per-`source_id` cap on live subscriptions, enforced only by
+    /// `tryRegister`. `0` (default) = unlimited. Bounds how much of the table
+    /// one admitted peer can occupy, so it can't monopolize (and thereby evict)
+    /// the shared FIFO even once admitted.
+    max_per_source: usize = 0,
 
     pub const Entry = struct {
         token_buf: [coap.max_token_len]u8 = undefined,
@@ -101,6 +147,10 @@ pub const Registry = struct {
         resource: u64 = 0,
         /// The sequence number stamped on the last notification for this entry.
         last_seq: u24 = 0,
+        /// The caller-supplied peer identity that registered this entry (`0`
+        /// when registered via the plain `register` primitive, which does not
+        /// take one). Used only by `tryRegister`'s per-source cap.
+        source_id: u64 = 0,
 
         pub fn token(e: *const Entry) []const u8 {
             return e.token_buf[0..e.token_len];
@@ -130,7 +180,46 @@ pub const Registry = struct {
     /// Register (or refresh) a subscription for `(tok, resource)` with the
     /// initial notification's `seq`. On a full registry the oldest entry is
     /// evicted (FIFO). Returns the live entry.
+    ///
+    /// Unconditional: ignores `admit_fn`/`max_per_source` entirely. This is
+    /// the right primitive when the caller has already gated admission itself
+    /// (or trusts its transport, e.g. a private link). On an untrusted
+    /// transport, prefer `tryRegister`, which checks that policy first — see
+    /// the module doc comment.
     pub fn register(self: *Registry, tok: []const u8, resource: u64, seq: u24) *Entry {
+        return self.registerRaw(0, tok, resource, seq);
+    }
+
+    /// Admission-checked registration: the entry point to use on an untrusted
+    /// (plain UDP) transport. `source_id` is the caller's opaque, ideally
+    /// DTLS-authenticated peer identity (module doc comment).
+    ///
+    /// Returns `null` — and leaves the table completely untouched, so no
+    /// existing subscription is evicted — when either:
+    /// - `admit_fn` is set and returns `false` for this `(source_id, tok,
+    ///   resource)`, or
+    /// - `max_per_source` is set (nonzero) and `source_id` already holds that
+    ///   many *distinct* subscriptions (a refresh of an existing one never
+    ///   counts against the cap).
+    ///
+    /// Otherwise behaves like `register` (including FIFO eviction of some
+    /// *other* source's oldest entry if the table is full — the cap bounds one
+    /// source's share, it does not reserve table space).
+    pub fn tryRegister(self: *Registry, source_id: u64, tok: []const u8, resource: u64, seq: u24) ?*Entry {
+        if (self.admit_fn) |admit| {
+            if (!admit(self.admit_ctx, source_id, tok, resource)) return null;
+        }
+        if (self.max_per_source > 0 and self.find(tok, resource) == null) {
+            var live: usize = 0;
+            for (self.entries[0..self.len]) |e| {
+                if (e.source_id == source_id) live += 1;
+            }
+            if (live >= self.max_per_source) return null;
+        }
+        return self.registerRaw(source_id, tok, resource, seq);
+    }
+
+    fn registerRaw(self: *Registry, source_id: u64, tok: []const u8, resource: u64, seq: u24) *Entry {
         if (self.find(tok, resource)) |e| {
             e.last_seq = seq;
             return e;
@@ -149,6 +238,7 @@ pub const Registry = struct {
         @memcpy(slot.token_buf[0..slot.token_len], tok[0..slot.token_len]);
         slot.resource = resource;
         slot.last_seq = seq;
+        slot.source_id = source_id;
         return slot;
     }
 
@@ -277,6 +367,83 @@ test "Registry: FIFO eviction when full, re-register refreshes" {
     try testing.expectEqual(@as(usize, 2), reg.count());
     try testing.expectEqual(Registry.Update.stale, reg.notify("b", 2, 9).?); // 9 < 10
     try testing.expectEqual(Registry.Update.accepted, reg.notify("b", 2, 11).?);
+}
+
+fn denyAll(_: ?*anyopaque, _: u64, _: []const u8, _: u64) bool {
+    return false;
+}
+
+fn admitSourceOne(_: ?*anyopaque, source_id: u64, _: []const u8, _: u64) bool {
+    return source_id == 1;
+}
+
+test "Registry.tryRegister: default (no hook, no cap) matches register" {
+    var storage: [2]Registry.Entry = undefined;
+    var reg = Registry.init(&storage);
+
+    try testing.expect(reg.tryRegister(1, "a", 1, 0) != null);
+    try testing.expectEqual(@as(usize, 1), reg.count());
+    try testing.expectEqual(Registry.Update.accepted, reg.notify("a", 1, 1).?);
+}
+
+test "Registry.tryRegister: rejected admission does not register and does not evict" {
+    var storage: [2]Registry.Entry = undefined;
+    var reg = Registry.init(&storage);
+
+    // A legitimate subscription is already in place.
+    _ = reg.register("a", 1, 0);
+    try testing.expectEqual(@as(usize, 1), reg.count());
+
+    reg.admit_fn = denyAll;
+    try testing.expectEqual(@as(?*Registry.Entry, null), reg.tryRegister(2, "b", 2, 0));
+    // Rejected: nothing new registered, and the existing entry survives untouched.
+    try testing.expectEqual(@as(usize, 1), reg.count());
+    try testing.expectEqual(Registry.Update.accepted, reg.notify("a", 1, 1).?);
+    try testing.expectEqual(@as(?Registry.Update, null), reg.notify("b", 2, 0));
+}
+
+test "Registry.tryRegister: admitted source registers normally, even when the table is full" {
+    var storage: [1]Registry.Entry = undefined;
+    var reg = Registry.init(&storage);
+    reg.admit_fn = admitSourceOne;
+
+    // source_id 2 is not admitted.
+    try testing.expectEqual(@as(?*Registry.Entry, null), reg.tryRegister(2, "x", 1, 0));
+    try testing.expectEqual(@as(usize, 0), reg.count());
+
+    // source_id 1 is admitted and registers (and may still FIFO-evict another
+    // *admitted* source's entry once the table is full — the hook gates
+    // whether an entry is added at all, not the table's eviction policy).
+    try testing.expect(reg.tryRegister(1, "y", 2, 0) != null);
+    try testing.expectEqual(@as(usize, 1), reg.count());
+    try testing.expectEqual(Registry.Update.accepted, reg.notify("y", 2, 1).?);
+}
+
+test "Registry.tryRegister: per-source cap bounds one source's share without evicting" {
+    var storage: [4]Registry.Entry = undefined;
+    var reg = Registry.init(&storage);
+    reg.max_per_source = 2;
+
+    try testing.expect(reg.tryRegister(1, "a", 1, 0) != null);
+    try testing.expect(reg.tryRegister(1, "b", 2, 0) != null);
+    try testing.expectEqual(@as(usize, 2), reg.count());
+
+    // A third distinct subscription from the same source hits the cap and is
+    // rejected — the two existing entries for source 1 are untouched.
+    try testing.expectEqual(@as(?*Registry.Entry, null), reg.tryRegister(1, "c", 3, 0));
+    try testing.expectEqual(@as(usize, 2), reg.count());
+    try testing.expectEqual(Registry.Update.accepted, reg.notify("a", 1, 1).?);
+    try testing.expectEqual(Registry.Update.accepted, reg.notify("b", 2, 1).?);
+    try testing.expectEqual(@as(?Registry.Update, null), reg.notify("c", 3, 0));
+
+    // A refresh of an already-held subscription is not new share and is not
+    // capped.
+    try testing.expect(reg.tryRegister(1, "a", 1, 5) != null);
+    try testing.expectEqual(@as(usize, 2), reg.count());
+
+    // A different, uncapped source can still register freely.
+    try testing.expect(reg.tryRegister(2, "d", 4, 0) != null);
+    try testing.expectEqual(@as(usize, 3), reg.count());
 }
 
 test "C7 end-to-end: observe register → notifications → freshness → cancel" {

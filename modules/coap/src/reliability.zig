@@ -20,6 +20,12 @@
 //! // on receiving the ACK/RST for this message id:
 //! rt.ack();
 //! ```
+//!
+//! **Transport security.** This layer is transport-agnostic — it never touches
+//! a socket, so it runs unchanged over plain UDP or over a caller-terminated
+//! DTLS session. `Dedup` (below) is a reliability mechanism, not a security
+//! one; see its doc comment and `SPEC.md` "Threat model" for what that does
+//! and doesn't protect against on an unauthenticated (plain UDP) transport.
 
 const std = @import("std");
 const coap = @import("root.zig");
@@ -136,6 +142,22 @@ pub const Retransmit = struct {
 /// retransmitted (duplicate) message so the handler processes each exchange
 /// once. Caller-provided storage (`[]Entry`), zero-allocation. Use one per
 /// remote endpoint (message IDs are only unique within a source).
+///
+/// **This is a RELIABILITY control (§4.5 duplicate suppression), not a
+/// replay-security control.** Both the table size (the caller's `storage`
+/// slice — size it for how many in-flight exchanges you expect per source) and
+/// the remembered-duration (`lifetime_ms`, passed to `init`) are already
+/// caller-configurable, so a deployment can size the window for its expected
+/// number of authenticated peers / concurrent exchanges. But sizing alone does
+/// not make it a security boundary: on plain UDP, an unauthenticated attacker
+/// who can inject packets can flood a peer's window with distinct message IDs
+/// (however large) to evict a legitimate in-flight exchange's entry before its
+/// own retransmission window elapses, after which a subsequently
+/// replayed/retransmitted datagram with that ID is no longer recognized as a
+/// duplicate and is reprocessed. `Dedup` only becomes a *security* boundary
+/// once the transport authenticates the source — i.e. run over a
+/// caller-terminated DTLS session per remote peer (RFC 7252 §9) — so that
+/// "flood one peer's dedup table" requires being that authenticated peer.
 pub const Dedup = struct {
     /// Ring storage of live entries; when full, an expired or the oldest slot
     /// is reused.

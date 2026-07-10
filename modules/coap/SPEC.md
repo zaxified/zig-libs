@@ -22,29 +22,51 @@ observe. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
   SZX, oversized NUM) are typed errors, never panics.
 
 ## Threat model / out of scope
-CoAP itself is unauthenticated/unencrypted on the wire; transport security is **DTLS, out of
-scope** (the caller supplies the transport). The dedup window (§4.5) mitigates duplicate/replayed
-message-IDs but is not an anti-replay security control. No congestion control beyond the §4.8
-transmission parameters. Within C6, **combined Block1+Block2 in a single exchange** (RFC 7959 §3.3)
-and **SZX renegotiation mid-transfer** are deliberately deferred (the assembler tolerates only a
-constant block size, and rejects a mid-transfer SZX change with a typed error rather than
-mis-assembling).
+CoAP itself is unauthenticated/unencrypted on the wire. This module is transport-agnostic — the
+caller supplies the datagram transport, and that transport can be **any** of: plain UDP, or a
+caller-terminated **DTLS** session (RFC 7252 §9 / RFC 7641 §8's mandated CoAP transport security).
+There is no CoAP-specific DTLS integration here — the same BYO-transport seam this repo uses for
+BYO-TLS on TCP — so wiring DTLS is purely a matter of handing this module's `parse`/`serialize`
+plaintext datagrams from/to whatever authenticated channel the caller already runs. **Production
+CoAP over an untrusted network MUST run over that DTLS seam**; plain UDP is only appropriate on an
+already-trusted link (e.g. a private network). No congestion control beyond the §4.8 transmission
+parameters. Within C6, **combined Block1+Block2 in a single exchange** (RFC 7959 §3.3) and **SZX
+renegotiation mid-transfer** are deliberately deferred (the assembler tolerates only a constant
+block size, and rejects a mid-transfer SZX change with a typed error rather than mis-assembling).
 
-Two further limitations are inherent to running CoAP over an unauthenticated, connectionless UDP
-transport and are **documented here, not mitigated in this library**: (1) the message-ID dedup
-window (§4.5, `reliability.Dedup`) is caller-storage-bounded — an attacker who can inject packets
-can flood it with distinct message IDs to evict a legitimate exchange's entry before its
-retransmission window elapses, after which a replayed/retransmitted message with that ID is no
-longer recognized as a duplicate and is reprocessed; (2) the Observe subscription registry (§C7,
-`observe.Registry`) FIFO-evicts the oldest subscription when full, with no authentication or
-rate-limit hook of its own — an attacker able to send Observe registrations can evict legitimate
-subscribers. Both are properties of unauthenticated CoAP itself, not bugs in this codec/state-
-tracking layer; the only real mitigation is DTLS (peer authentication) plus a caller-side
-rate-limit/auth hook in front of dedup and Registry admission, which is out of scope for this
-module.
+Two further items were flagged in pre-public review as attacker-triggerable **on an unauthenticated,
+connectionless UDP transport** and are now **addressed (admission hook + DTLS seam)** rather than
+merely documented:
+
+1. **Message-ID dedup window** (§4.5, `reliability.Dedup`) — caller-storage-bounded; an attacker who
+   can inject packets can flood it with distinct message IDs to evict a legitimate exchange's entry
+   before its retransmission window elapses, after which a replayed/retransmitted message with that
+   ID is no longer recognized as a duplicate and is reprocessed. `Dedup`'s table size (the caller's
+   storage slice) and remembered-duration (`lifetime_ms`) were already caller-configurable — a
+   deployment sizes both for its expected authenticated-peer/exchange count — but sizing alone
+   doesn't change what kind of control this is: **`Dedup` is a reliability control (duplicate
+   suppression), not a replay-security control.** It becomes a security boundary only once the
+   *source* is authenticated, i.e. run over the DTLS seam above, so that flooding one peer's window
+   requires being that peer. See `reliability.zig`'s `Dedup` doc comment.
+2. **Observe subscription registry** (§C7, `observe.Registry`) FIFO-evicts the oldest subscription
+   when full. `Registry` now offers an **admission hook**: `admit_fn`/`admit_ctx` (type
+   `observe.AdmitFn`, a plain function pointer + opaque context — no allocation, no closures) plus
+   an optional **per-source cap** (`max_per_source`), both consulted by the new `Registry.tryRegister`
+   entry point (the unconditional `register` primitive is unchanged, for callers that gate admission
+   themselves or trust their transport). A hook that returns `false`, or a source at its cap, is
+   rejected *before* the table is touched — no eviction of any existing entry. `source_id` is the
+   caller's opaque peer identity; it is only a meaningful admission signal when it comes from an
+   authenticated source (again, the DTLS seam) — a hook keyed off the unauthenticated UDP source
+   address is not a mitigation, since that address is trivially spoofed. See `observe.zig`'s module
+   and `Registry` doc comments for the full API and its `tryRegister` tests.
+
+Both remain properties of *unauthenticated* CoAP, not bugs in this codec/state-tracking layer: the
+hook and cap bound what an *admitted* or *uncapped* misbehaving source can do, but the real fix for
+an untrusted network is DTLS (peer authentication) terminated by the caller, feeding a real
+`source_id` and `admit_fn` policy into `Registry.tryRegister`.
 
 ## Verification
-`zig build test-coap` — 61 offline tests. Codec (7): golden-byte CON GET round-trip, extended
+`zig build test-coap` — 65 offline tests. Codec (7): golden-byte CON GET round-trip, extended
 option nibbles at the 13/269 boundaries, payload-marker edge cases, full parse/serialize error
 matrix, `encodedLen` agreement. Options (20): class bits, uint codec boundaries + round-trip, typed
 accessors, URI↔options mapping (percent-encoding, coaps, bad-scheme, a hostile Uri-Host escaped
@@ -52,13 +74,15 @@ rather than emitted verbatim). Reliability (10): retransmit schedule (jitter, fu
 `timed_out`, `ack`/`onReset`, custom `max_retransmit`), dedup window (fresh/duplicate/expiry/eviction,
 zero-length storage never panics). Client/server (7): request assembly + counter advance,
 `Exchange.match` across all five reply kinds, `isRequest` gating, response builders, an end-to-end
-client→server→client round-trip. Block-wise/Observe (17): Block codec edge cases, `split` boundary +
+client→server→client round-trip. Block-wise/Observe (21): Block codec edge cases, `split` boundary +
 `Assembler` completion (in-order assembly, a lone high-`num` final block rejected rather than
 reported complete, a mid-stream gap rejected, a mid-transfer SZX change rejected), two end-to-end
 block transfers (byte-exact 3000-byte Block2 GET reassembly; Block1 PUT with `2.31 Continue`),
 Sequence wrap + lollipop comparison, Registry (freshness-checked notify, FIFO eviction, re-register
-refresh), end-to-end observe register→notify→stale-reject→cancel, CON-notification-timeout/RST
-cancellation glue. Green in Debug + ReleaseFast.
+refresh), `Registry.tryRegister` admission policy (no-hook/no-cap parity with `register`, a rejected
+hook neither registers nor evicts, an admitted source registers even table-full, a per-source cap
+bounds one source's share without evicting), end-to-end observe register→notify→stale-reject→cancel,
+CON-notification-timeout/RST cancellation glue. Green in Debug + ReleaseFast.
 
 ## Backlog / deferred
 Combined Block1+Block2 in one exchange (RFC 7959 §3.3) and SZX renegotiation mid-transfer — both
