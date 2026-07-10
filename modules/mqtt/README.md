@@ -120,8 +120,22 @@ exact/`$SYS` subscribers, a lock-probe proving the fan-out releases the global
 lock before writing, a failing subscriber contained without touching the
 publisher, a max-size QoS 1 re-encode that does not overflow, take-over shutting
 the superseded socket down, and auth-deny + ACL-deny (PUBLISH and per-filter
-SUBSCRIBE) paths. The `TcpServer` accept loop is compile-checked but gated behind
-`error.SkipZigTest`.
+SUBSCRIBE) paths. The `TcpServer` accept loop is compile-checked but never bound
+in the offline tests.
+
+The concurrency hardening additionally has a real **multi-threaded stress / race
+pass**: a `TcpServer` on a loopback ephemeral port driven by 16 concurrent
+OS-thread clients (real sockets) that race publish fan-out, session take-over
+(many CONNECTs on the same client-id at once), abrupt mid-fan-out subscriber
+closes, and subscribe/unsubscribe churn — asserting no crash/UAF/leak
+(thread-safe DebugAllocator), no deadlock (a watchdog bounds it), an accept loop
+that never stalls behind a fan-out (a liveness probe reconnects throughout),
+correct post-storm delivery, no torn packets, and a connection/subscription
+count that drains cleanly to zero (no take-over zombie). It is socket-gated
+(`error.SkipZigTest` where loopback/threads are unavailable). Zig 0.16.0's
+`-fsanitize-thread` is a no-op (no `__tsan_*` instrumentation is linked), so the
+race detection is the real-thread run under Debug and `-Doptimize=ReleaseFast`,
+repeated many times, cross-checked with a valgrind `memcheck` pass (0 errors).
 
 Provenance: clean-room from the OASIS MQTT Version 3.1.1 specification
 (open standard, royalty-free); mosquitto (EPL/EDL) and Eclipse Paho

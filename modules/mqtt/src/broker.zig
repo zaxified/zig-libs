@@ -1855,3 +1855,468 @@ test "TcpServer compiles (never bound or dialed in tests)" {
     if (true) return error.SkipZigTest;
     std.testing.refAllDecls(TcpServer);
 }
+
+// ── multi-threaded stress / race pass (real loopback sockets) ────────────────
+//
+// The offline suite above validates the hardening single-threaded; this test is
+// the genuine MULTI-THREADED pass the SPEC asked for. It stands up a real
+// `TcpServer` on a loopback ephemeral port and drives it with many concurrent
+// OS-thread clients over real sockets, so the broker's own accept loop
+// (`std.Io.Group.concurrent`, one handler thread per connection — `concurrent`
+// is `.unlimited`) races against the client threads on all 8 cores.
+//
+// It deliberately induces the three interleavings the hardening targets:
+//   (a) FIX B — subscribers that read slowly, and subscribers that abruptly
+//       close their socket mid-fan-out (a broker write to them fails): the
+//       failure must be contained to that subscriber, never the publisher, and
+//       never wedge the broker.
+//   (b) FIX C — many workers CONNECT with the SAME client-id concurrently:
+//       session take-over must shut the superseded socket and its owner handler
+//       thread must reap promptly (a leaked/stuck handler would hang the
+//       `group.await` in `serve`'s teardown → the watchdog would fire).
+//   (c) FIX A — heavy subscribe/unsubscribe churn concurrent with wildcard
+//       fan-out: the snapshot-under-lock + per-connection `refs` must keep a
+//       disconnecting subscriber alive across the (lock-free) fan-out writes
+//       (no use-after-free of its `tx_buf`/socket ctx).
+//
+// Invariants asserted after the storm settles:
+//   - no crash / panic / UAF / double-free / leak — `std.testing.allocator` is
+//     a thread-safe DebugAllocator checking exactly this across every broker
+//     alloc/free from every handler thread;
+//   - no deadlock / hang — a watchdog thread panics past a generous deadline,
+//     turning a wedge into a failing test instead of a hung CI;
+//   - the accept loop never stalls while a large PUBLISH fans out — a liveness
+//     probe reconnects THROUGHOUT the storm and its CONNECT→CONNACK must always
+//     complete within a bound;
+//   - delivery still works end-to-end afterwards (a fresh sub+pub round-trips);
+//   - no torn/corrupt packet is ever received on a live stream;
+//   - counts stay consistent: once every client socket is closed and reaped,
+//     `connections` drains to 0 and `subscriptionCount()` to 0 — no zombie left
+//     by a take-over, no leaked or negative (wrapped) subscription count.
+//
+// Race-detection method: Zig 0.16.0's `-fsanitize-thread` is a NO-OP here (it
+// links no `__tsan_*` instrumentation and fails to flag a blatant data race),
+// so this is the ReleaseSafe/ReleaseFast real-thread fallback the SPEC allows —
+// run under Debug and `-Doptimize=ReleaseFast`, and repeatedly (many runs) for
+// the high-iteration sweep. `std.testing.allocator` + a valgrind `memcheck` run
+// stand in as the UAF/leak detector.
+
+const stress_workers: usize = 16;
+const stress_iters: usize = 40;
+const stress_deadline_ms: i64 = 90_000;
+
+const StressCtl = struct {
+    io: std.Io,
+    addr: std.Io.net.IpAddress,
+    iters: usize,
+    stop: std.atomic.Value(bool) = .init(false),
+    // Observability / invariants.
+    delivered: std.atomic.Value(usize) = .init(0),
+    torn_packets: std.atomic.Value(usize) = .init(0),
+    connect_failures: std.atomic.Value(usize) = .init(0),
+    connect_attempts: std.atomic.Value(usize) = .init(0),
+    probe_ok: std.atomic.Value(usize) = .init(0),
+    probe_stalls: std.atomic.Value(usize) = .init(0),
+    probe_max_ms: std.atomic.Value(u64) = .init(0),
+};
+
+fn stressNapMs(ms: u64) void {
+    var ts: std.posix.timespec = .{
+        .sec = @intCast(ms / 1000),
+        .nsec = @intCast((ms % 1000) * 1_000_000),
+    };
+    _ = std.os.linux.nanosleep(&ts, null);
+}
+
+/// One raw-socket MQTT client the workers hand-drive with the `packet` codec —
+/// the reversed image of `TestTransport`, but over a real loopback stream.
+const StressClient = struct {
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    rx: [16 * 1024]u8 = undefined,
+    rx_len: usize = 0,
+
+    fn dial(io: std.Io, addr: std.Io.net.IpAddress) !StressClient {
+        const stream = try addr.connect(io, .{ .mode = .stream });
+        return .{ .io = io, .stream = stream };
+    }
+
+    fn close(c: *StressClient) void {
+        c.stream.close(c.io);
+    }
+
+    fn writeAll(c: *StressClient, bytes: []const u8) !void {
+        var wbuf: [1024]u8 = undefined;
+        var sw = c.stream.writer(c.io, &wbuf);
+        sw.interface.writeAll(bytes) catch return error.WriteFailed;
+        sw.interface.flush() catch return error.WriteFailed;
+    }
+
+    fn sendConnect(c: *StressClient, client_id: []const u8) !void {
+        var buf: [320]u8 = undefined;
+        try c.writeAll(try packet.encodeConnect(&buf, .{ .client_id = client_id, .keep_alive_s = 0 }));
+    }
+    fn sendSubscribe(c: *StressClient, pid: u16, filters: []const packet.Subscription) !void {
+        var buf: [512]u8 = undefined;
+        try c.writeAll(try packet.encodeSubscribe(&buf, pid, filters));
+    }
+    fn sendUnsubscribe(c: *StressClient, pid: u16, filters: []const []const u8) !void {
+        var buf: [512]u8 = undefined;
+        try c.writeAll(try packet.encodeUnsubscribe(&buf, pid, filters));
+    }
+    fn sendPublish(c: *StressClient, p: packet.Publish) !void {
+        var buf: [1024]u8 = undefined;
+        try c.writeAll(try packet.encodePublish(&buf, p));
+    }
+    fn sendDisconnect(c: *StressClient) !void {
+        var buf: [4]u8 = undefined;
+        try c.writeAll(try packet.encodeDisconnect(&buf));
+    }
+
+    fn pollReadable(c: *StressClient, timeout_ms: i32) bool {
+        var fds = [_]std.posix.pollfd{.{ .fd = c.stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+        const ready = std.posix.poll(&fds, timeout_ms) catch return false;
+        return ready != 0;
+    }
+
+    /// Read whatever is available (waiting up to `block_ms`), decode every
+    /// complete packet, PUBACK inbound QoS 1, and tally deliveries / torn
+    /// packets. Returns false once the peer has closed.
+    fn pump(c: *StressClient, ctl: *StressCtl, block_ms: i32) bool {
+        if (!c.pollReadable(block_ms)) return true;
+        if (c.rx_len >= c.rx.len) c.rx_len = 0; // shouldn't happen (8K max pkt < 16K)
+        const n = std.posix.read(c.stream.socket.handle, c.rx[c.rx_len..]) catch return false;
+        if (n == 0) return false; // peer closed / socket shut down
+        c.rx_len += n;
+
+        var consumed: usize = 0;
+        while (true) {
+            const dec = (packet.decode(c.rx[consumed..c.rx_len]) catch {
+                _ = ctl.torn_packets.fetchAdd(1, .monotonic);
+                c.rx_len = 0;
+                return true;
+            }) orelse break;
+            consumed += dec.consumed;
+            switch (dec.packet) {
+                .publish => |pb| {
+                    _ = ctl.delivered.fetchAdd(1, .monotonic);
+                    if (pb.qos == .at_least_once) {
+                        var ab: [4]u8 = undefined;
+                        const bytes = packet.encodePuback(&ab, pb.packet_id) catch return true;
+                        c.writeAll(bytes) catch return false;
+                    }
+                },
+                else => {},
+            }
+        }
+        const rem = c.rx_len - consumed;
+        if (consumed > 0 and rem > 0) std.mem.copyForwards(u8, c.rx[0..rem], c.rx[consumed..c.rx_len]);
+        c.rx_len = rem;
+        return true;
+    }
+
+    /// Wait up to `timeout_ms` for a packet of tag `want`; returns whether one
+    /// arrived (draining anything before it).
+    fn waitFor(c: *StressClient, ctl: *StressCtl, want: std.meta.Tag(packet.Packet), timeout_ms: i64) bool {
+        const deadline = milliTimestamp() + timeout_ms;
+        while (milliTimestamp() < deadline) {
+            const remaining: i32 = @intCast(@max(1, deadline - milliTimestamp()));
+            if (!c.pollReadable(remaining)) continue;
+            const n = std.posix.read(c.stream.socket.handle, c.rx[c.rx_len..]) catch return false;
+            if (n == 0) return false;
+            c.rx_len += n;
+            var consumed: usize = 0;
+            var hit = false;
+            while (true) {
+                const dec = (packet.decode(c.rx[consumed..c.rx_len]) catch {
+                    _ = ctl.torn_packets.fetchAdd(1, .monotonic);
+                    c.rx_len = 0;
+                    return false;
+                }) orelse break;
+                consumed += dec.consumed;
+                if (dec.packet == .publish and dec.packet.publish.qos == .at_least_once) {
+                    var ab: [4]u8 = undefined;
+                    if (packet.encodePuback(&ab, dec.packet.publish.packet_id)) |bytes| {
+                        c.writeAll(bytes) catch {};
+                    } else |_| {}
+                }
+                if (std.meta.activeTag(dec.packet) == want) hit = true;
+            }
+            const rem = c.rx_len - consumed;
+            if (consumed > 0 and rem > 0) std.mem.copyForwards(u8, c.rx[0..rem], c.rx[consumed..c.rx_len]);
+            c.rx_len = rem;
+            if (hit) return true;
+        }
+        return false;
+    }
+};
+
+fn stressServeThread(server: *TcpServer) void {
+    server.serve() catch {};
+}
+
+fn stressWatchdog(ctl: *StressCtl) void {
+    const deadline = milliTimestamp() + stress_deadline_ms;
+    while (milliTimestamp() < deadline) {
+        if (ctl.stop.load(.acquire)) return;
+        stressNapMs(50);
+    }
+    if (ctl.stop.load(.acquire)) return;
+    std.debug.panic(
+        "mqtt stress watchdog: exceeded {d} ms — likely deadlock/hang in the broker",
+        .{stress_deadline_ms},
+    );
+}
+
+/// The overlapping filter set every subscriber registers: an exact leaf, a
+/// single-level wildcard and a multi-level wildcard all over the hot namespace
+/// (so one publish collapses to a single copy per connection — FIX A), plus a
+/// per-worker private branch that churns.
+fn stressSubscribe(c: *StressClient, id: usize) !void {
+    var pbuf: [24]u8 = undefined;
+    const priv = try std.fmt.bufPrint(&pbuf, "w/{d}/#", .{id});
+    try c.sendSubscribe(1, &.{
+        .{ .filter = "hot/#", .qos = .at_least_once },
+        .{ .filter = "hot/+", .qos = .at_most_once },
+        .{ .filter = "hot/2", .qos = .at_least_once },
+        .{ .filter = priv, .qos = .at_least_once },
+    });
+}
+
+fn stressWorker(ctl: *StressCtl, id: usize) void {
+    const role = id % 4;
+    var pid: u16 = 1;
+    for (0..ctl.iters) |iter| {
+        _ = ctl.connect_attempts.fetchAdd(1, .monotonic);
+
+        // Client-id policy: role 2 shares a tiny id pool so many workers CONNECT
+        // the SAME id concurrently (take-over storm, FIX C); the rest reuse a
+        // stable per-worker id, so each reconnect also re-takes-over its own
+        // just-closed session.
+        var idbuf: [32]u8 = undefined;
+        const client_id = if (role == 2)
+            std.fmt.bufPrint(&idbuf, "shared-{d}", .{id % 4}) catch unreachable
+        else
+            std.fmt.bufPrint(&idbuf, "w-{d}", .{id}) catch unreachable;
+
+        var c = StressClient.dial(ctl.io, ctl.addr) catch {
+            _ = ctl.connect_failures.fetchAdd(1, .monotonic);
+            stressNapMs(1);
+            continue;
+        };
+
+        // Any failure past here is EXPECTED under the storm (the broker may have
+        // shut our socket on take-over or on a contained delivery failure) — we
+        // just reconnect. The test's verdict is the global invariants, not any
+        // single client's fate.
+        blk: {
+            c.sendConnect(client_id) catch break :blk;
+            if (!c.waitFor(ctl, .connack, 2000)) break :blk;
+
+            switch (role) {
+                // Publisher: subscribe (to also receive fan-out), then hammer the
+                // hot namespace QoS0+QoS1 with interleaved unsub/resub churn.
+                0 => {
+                    stressSubscribe(&c, id) catch break :blk;
+                    for (0..24) |k| {
+                        var tbuf: [24]u8 = undefined;
+                        const hot = std.fmt.bufPrint(&tbuf, "hot/{d}", .{k % 4}) catch unreachable;
+                        pid +%= 1;
+                        if (pid == 0) pid = 1;
+                        c.sendPublish(.{ .topic = hot, .payload = "payload-xyz", .qos = if (k % 2 == 0) .at_most_once else .at_least_once, .packet_id = pid }) catch break :blk;
+                        var wbuf: [24]u8 = undefined;
+                        const priv = std.fmt.bufPrint(&wbuf, "w/{d}/x", .{id}) catch unreachable;
+                        c.sendPublish(.{ .topic = priv, .payload = "p", .qos = .at_most_once }) catch break :blk;
+                        if (k % 6 == 0) _ = c.pump(ctl, 0);
+                        if (k % 8 == 7) {
+                            c.sendUnsubscribe(2, &.{"hot/2"}) catch break :blk;
+                            c.sendSubscribe(3, &.{.{ .filter = "hot/2", .qos = .at_least_once }}) catch break :blk;
+                        }
+                    }
+                    _ = c.pump(ctl, 0);
+                    c.sendDisconnect() catch {};
+                },
+                // Abrupt closer (FIX B): subscribe QoS1 (forces the re-encode
+                // path), take a little fan-out, then CLOSE with no DISCONNECT —
+                // a broker write mid-fan-out now fails and must be contained.
+                1 => {
+                    stressSubscribe(&c, id) catch break :blk;
+                    _ = c.pump(ctl, 2);
+                    _ = c.pump(ctl, 0);
+                    // fall through to the abrupt close below (no DISCONNECT)
+                },
+                // Take-over racer (FIX C): grab the shared id, subscribe, a beat
+                // of activity, then close — the next same-id CONNECT supersedes.
+                2 => {
+                    c.sendSubscribe(1, &.{.{ .filter = "hot/#", .qos = .at_least_once }}) catch break :blk;
+                    if (iter % 2 == 0) {
+                        c.sendPublish(.{ .topic = "hot/1", .payload = "t", .qos = .at_most_once }) catch break :blk;
+                    }
+                    _ = c.pump(ctl, 1);
+                },
+                // Slow reader + churn (FIX A): overlapping subs, heavy
+                // subscribe/unsubscribe churn while others fan out, draining
+                // only slowly.
+                else => {
+                    stressSubscribe(&c, id) catch break :blk;
+                    for (0..16) |k| {
+                        var fbuf: [24]u8 = undefined;
+                        const f = std.fmt.bufPrint(&fbuf, "churn/{d}/#", .{k % 3}) catch unreachable;
+                        c.sendSubscribe(@intCast(10 + k), &.{.{ .filter = f, .qos = .at_least_once }}) catch break :blk;
+                        if (k % 3 == 0) c.sendPublish(.{ .topic = "hot/0", .payload = "s", .qos = .at_most_once }) catch break :blk;
+                        c.sendUnsubscribe(@intCast(200 + k), &.{f}) catch break :blk;
+                        if (k % 5 == 0) _ = c.pump(ctl, 1); // slow, infrequent drain
+                    }
+                    c.sendDisconnect() catch {};
+                },
+            }
+        }
+        c.close();
+    }
+}
+
+/// Reconnects throughout the storm and asserts CONNECT→CONNACK always completes
+/// within the bound — i.e. the accept loop is never stalled behind a fan-out.
+fn stressProbe(ctl: *StressCtl) void {
+    while (!ctl.stop.load(.acquire)) {
+        const t0 = milliTimestamp();
+        var c = StressClient.dial(ctl.io, ctl.addr) catch {
+            stressNapMs(2);
+            continue;
+        };
+        var stalled = true;
+        if (c.sendConnect("liveness-probe")) |_| {
+            if (c.waitFor(ctl, .connack, 2000)) stalled = false;
+        } else |_| {}
+        const dt: u64 = @intCast(@max(0, milliTimestamp() - t0));
+        // Publish the running max latency (compare-and-swap loop).
+        var cur = ctl.probe_max_ms.load(.monotonic);
+        while (dt > cur) {
+            cur = ctl.probe_max_ms.cmpxchgWeak(cur, dt, .monotonic, .monotonic) orelse break;
+        }
+        if (stalled) _ = ctl.probe_stalls.fetchAdd(1, .monotonic) else _ = ctl.probe_ok.fetchAdd(1, .monotonic);
+        c.close();
+        stressNapMs(2);
+    }
+}
+
+test "STRESS: multi-threaded fan-out / take-over / churn race pass over loopback" {
+    // Gate exactly like the other socket-dependent tests: this needs a real
+    // loopback stack and OS threads. Where the environment can't provide them
+    // (a single-threaded build, or a sandbox with no loopback), skip cleanly —
+    // never fail — so `zig build test` stays green in a constrained CI.
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    const alloc = testing.allocator; // thread-safe DebugAllocator: leak + double-free guard
+
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var broker = Broker.init(alloc, .{});
+    defer broker.deinit();
+
+    var server = TcpServer.init(io, &broker);
+    defer server.deinit();
+    // A bind/listen failure = no loopback in this sandbox → skip, don't fail.
+    server.bind("127.0.0.1", 0) catch return error.SkipZigTest;
+    const addr = server.boundAddress();
+
+    const server_thread = std.Thread.spawn(.{}, stressServeThread, .{&server}) catch
+        return error.SkipZigTest;
+
+    var ctl = StressCtl{ .io = io, .addr = addr, .iters = stress_iters };
+
+    const watchdog = std.Thread.spawn(.{}, stressWatchdog, .{&ctl}) catch {
+        // Can't arm the watchdog → don't run an unbounded stress test.
+        server.shutdown();
+        server_thread.join();
+        return error.SkipZigTest;
+    };
+    const probe = std.Thread.spawn(.{}, stressProbe, .{&ctl}) catch {
+        ctl.stop.store(true, .release);
+        watchdog.join();
+        server.shutdown();
+        server_thread.join();
+        return error.SkipZigTest;
+    };
+
+    // The storm: many concurrent client workers on real threads.
+    const workers = alloc.alloc(std.Thread, stress_workers) catch {
+        ctl.stop.store(true, .release);
+        probe.join();
+        watchdog.join();
+        server.shutdown();
+        server_thread.join();
+        return error.SkipZigTest;
+    };
+    var spawned: usize = 0;
+    for (workers) |*w| {
+        w.* = std.Thread.spawn(.{}, stressWorker, .{ &ctl, spawned }) catch break;
+        spawned += 1;
+    }
+    for (workers[0..spawned]) |w| w.join();
+
+    // ── liveness + correctness: the broker must still deliver end-to-end while
+    // it is still serving (proves it is not wedged and fan-out is intact). ──
+    var live_ok = false;
+    if (StressClient.dial(io, addr)) |*subp| {
+        var sub = subp.*;
+        sub.sendConnect("canary-sub") catch {};
+        if (sub.waitFor(&ctl, .connack, 2000)) {
+            sub.sendSubscribe(1, &.{.{ .filter = "canary/#", .qos = .at_least_once }}) catch {};
+            _ = sub.waitFor(&ctl, .suback, 2000);
+            if (StressClient.dial(io, addr)) |*pubp| {
+                var pubc = pubp.*;
+                pubc.sendConnect("canary-pub") catch {};
+                if (pubc.waitFor(&ctl, .connack, 2000)) {
+                    pubc.sendPublish(.{ .topic = "canary/ping", .payload = "PING", .qos = .at_least_once, .packet_id = 7 }) catch {};
+                    _ = pubc.waitFor(&ctl, .puback, 2000);
+                    live_ok = sub.waitFor(&ctl, .publish, 2000);
+                }
+                pubc.close();
+            } else |_| {}
+        }
+        sub.close();
+    } else |_| {}
+
+    // Stop the probe, then quiesce the broker: with every client socket now
+    // closed, each handler thread reads EOF and reaps its connection. Wait for
+    // the connection set to drain (a leaked take-over zombie would never drain).
+    ctl.stop.store(true, .release);
+    probe.join();
+
+    var drained = false;
+    const drain_deadline = milliTimestamp() + 10_000;
+    while (milliTimestamp() < drain_deadline) {
+        broker.mutex.lock();
+        const live = broker.connections.items.len;
+        broker.mutex.unlock();
+        if (live == 0) {
+            drained = true;
+            break;
+        }
+        stressNapMs(5);
+    }
+
+    // Tear the server down (this joins every handler task via serve()'s
+    // `group.await` — a stuck handler would hang here and trip the watchdog),
+    // then stand the watchdog down: from here nothing can hang.
+    server.shutdown();
+    server_thread.join();
+    ctl.stop.store(true, .release);
+    watchdog.join();
+    alloc.free(workers);
+
+    // ── verdict (all handler threads are joined now; broker state is stable) ──
+    try testing.expect(spawned == stress_workers); // the whole storm ran
+    try testing.expect(live_ok); // broker responsive + delivery correct after the storm
+    try testing.expect(drained); // no zombie connection left (take-over reaped cleanly)
+    try testing.expectEqual(@as(usize, 0), broker.connections.items.len);
+    try testing.expectEqual(@as(usize, 0), broker.subscriptionCount()); // no leak / no wrap-to-huge
+    try testing.expectEqual(@as(usize, 0), broker.retained.items.len);
+    try testing.expectEqual(@as(usize, 0), ctl.torn_packets.load(.monotonic)); // never a corrupt packet
+    try testing.expect(ctl.probe_stalls.load(.monotonic) == 0); // accept never stalled behind fan-out
+    try testing.expect(ctl.probe_ok.load(.monotonic) > 0); // the probe actually ran
+    try testing.expect(ctl.delivered.load(.monotonic) > 0); // fan-out actually happened
+}
