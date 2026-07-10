@@ -1,16 +1,19 @@
 // SPDX-License-Identifier: MIT
 //! rsa — pure-Zig RSA (PKCS#1 v2.2 / RFC 8017), built on `std.crypto.ff`.
 //!
-//! **P1+P2+P3+P4a IMPLEMENTED, P4b–P6 still stubs.** The RFC 8017 §5
+//! **P1+P2+P3+P4a+P6 IMPLEMENTED, P4b+P5 still stubs.** The RFC 8017 §5
 //! primitives (RSAEP/RSADP/RSASP1/RSAVP1, incl. the CRT fast path),
 //! `PublicKey.fromBytes`, `SecretKey.fromPrimes`, the RSASSA-PKCS1-v1_5
 //! scheme (`signPkcs1v15`/`verifyPkcs1v15`, SHA-1/224/256/384/512), the
 //! RSAES-OAEP scheme (`encryptOaep`/`decryptOaep`, MGF1, constant-time
 //! decode), the RSASSA-PSS scheme (`signPss`/`verifyPss`, branch-clean
-//! verify), and DER/PEM key parsing (`PublicKey.fromDer`/`fromPem`,
-//! `SecretKey.fromDer`/`fromPkcs8`/`fromPem`, cleartext PEM only) are real
-//! and tested against OpenSSL-generated known-answer vectors. Every P4b+
-//! function body is still `@panic("TODO(agent): ...")`.
+//! verify), DER/PEM key parsing (`PublicKey.fromDer`/`fromPem`,
+//! `SecretKey.fromDer`/`fromPkcs8`/`fromPem`, cleartext PEM only), and X.509
+//! v3 self-signed certificate generation (`selfSignedCert`, RFC 5280) are
+//! real and tested against OpenSSL-generated known-answer vectors and (for
+//! `selfSignedCert`) against `std.crypto.Certificate` as an independent
+//! parse/verify oracle. Every P4b/P5 function body is still
+//! `@panic("TODO(agent): ...")`.
 //! Phase plan:
 //!   P1  — EMSA-PKCS1-v1_5 sign/verify (`signPkcs1v15`/`verifyPkcs1v15`) — DONE.
 //!   P2  — RSAES-OAEP encrypt/decrypt (`encryptOaep`/`decryptOaep`) — DONE.
@@ -18,7 +21,7 @@
 //!   P4a — DER/PEM key parsing (PKCS#1/PKCS#8/SPKI, cleartext only) — DONE.
 //!   P4b — OpenSSH `PROTOCOL.key` parsing incl. bcrypt-pbkdf (`fromOpenSSH`).
 //!   P5  — keypair generation (`generate`).
-//!   P6  — self-signed certificate generation (`selfSignedCert`).
+//!   P6  — self-signed certificate generation (`selfSignedCert`) — DONE.
 //!
 //! Modular exponentiation is not reimplemented: this module builds on
 //! `std.crypto.ff` (`Uint`/`Modulus`/`Fe`), the same constant-time finite-field
@@ -1137,14 +1140,387 @@ pub fn generate(io: std.Io, bits: usize) !SecretKey {
     @panic("TODO(agent): P5 RSA keypair generation per RFC 8017 §3.2 (two probable primes, e.g. Miller-Rabin per NIST FIPS 186-5 Appendix B/C) + CRT param derivation");
 }
 
-// ── P6: self-signed certificate generation — reserved, not yet implemented ──
+// ── P6: X.509 v3 self-signed certificate generation (RFC 5280) ──────────────
+//
+// `selfSignedCert` builds `Certificate ::= SEQUENCE { tbsCertificate,
+// signatureAlgorithm, signatureValue BIT STRING }` and signs it with
+// `signPkcs1v15` (P1). The DER-encoding idiom below (`DerBuild`: an
+// arena-backed bottom-up TLV builder — every helper returns a complete
+// tag+length+value slice) is copied from `modules/acme/src/x509.zig`'s `Der`
+// helper (which builds a PKCS#10 CSR, a structurally similar problem), not
+// reimplemented from scratch; it is extended here with the extra primitive
+// shapes a full certificate needs beyond a bare CSR: INTEGER (serial number,
+// version), OCTET STRING + BOOLEAN (extension values), UTCTime (validity),
+// UTF8String (commonName), and the `[n] EXPLICIT`/`[n] IMPLICIT`
+// context-specific tags RFC 5280 uses for `version`/`extensions` and for
+// `GeneralName` SAN choices. `zero-dep` still holds — nothing here is `pub
+// use`d or `@import`ed from `acme`; the shape is copied by hand into this
+// module, same as this file's own provenance note requires for its
+// `std.crypto.ff`-derived shapes.
+//
+// `std.crypto.Certificate` (std's independent X.509 *parser*) is the primary
+// test oracle: the tests below parse a generated certificate back with it
+// and confirm `Parsed.verify` (issuer==subject, validity window, RSA
+// signature) succeeds — proving the DER structure and the signature are
+// both correct end-to-end, not just "well-formed enough to not crash." A
+// second test walks the same DER with this module's own P4a-style bounds
+// checked `Asn1.Element.decode` primitive (bypassing the `derElem`/`derChild`
+// wrappers, which enforce a universal tag class that the certificate's
+// context-specific `[0]`/`[3]` tags don't have) to independently recover the
+// embedded SPKI (fed back through `PublicKey.fromDer`) and the signature
+// (fed back through `verifyPkcs1v15`), so both directions of this module's
+// own code are cross-checked, not only std's.
 
-/// Generate a self-signed X.509 certificate for `sk`, DER-encoded.
-pub fn selfSignedCert(gpa: std.mem.Allocator, sk: SecretKey, subject: []const u8) ![]u8 {
-    _ = gpa;
-    _ = sk;
-    _ = subject;
-    @panic("TODO(agent): P6 self-signed X.509 cert generation: build TBSCertificate DER (RFC 5280) + RSASSA-PKCS1-v1_5-sign it (via signPkcs1v15)");
+const DerCertError = error{ OutOfMemory, ValueTooLarge };
+
+/// Arena-backed DER TLV builder (see the section doc comment above for
+/// provenance: the idiom, not the source, is copied from
+/// `modules/acme/src/x509.zig`'s `Der`). Every helper returns a complete TLV
+/// slice allocated from `a`; use an arena and free it all at once.
+const DerBuild = struct {
+    a: std.mem.Allocator,
+
+    fn encodeHeader(buf: *[4]u8, tag: u8, len: usize) DerCertError!usize {
+        buf[0] = tag;
+        if (len < 0x80) {
+            buf[1] = @intCast(len);
+            return 2;
+        }
+        if (len < 0x100) {
+            buf[1] = 0x81;
+            buf[2] = @intCast(len);
+            return 3;
+        }
+        if (len < 0x10000) {
+            buf[1] = 0x82;
+            buf[2] = @intCast(len >> 8);
+            buf[3] = @intCast(len & 0xff);
+            return 4;
+        }
+        return error.ValueTooLarge; // nothing built in this module gets remotely this large
+    }
+
+    fn tlv(d: DerBuild, tag: u8, content: []const u8) DerCertError![]const u8 {
+        var head: [4]u8 = undefined;
+        const head_len = try encodeHeader(&head, tag, content.len);
+        const out = try d.a.alloc(u8, head_len + content.len);
+        @memcpy(out[0..head_len], head[0..head_len]);
+        @memcpy(out[head_len..], content);
+        return out;
+    }
+
+    fn cat(d: DerBuild, parts: []const []const u8) DerCertError![]const u8 {
+        return std.mem.concat(d.a, u8, parts);
+    }
+
+    fn seq(d: DerBuild, parts: []const []const u8) DerCertError![]const u8 {
+        return d.tlv(0x30, try d.cat(parts));
+    }
+
+    fn oid(d: DerBuild, encoded: []const u8) DerCertError![]const u8 {
+        return d.tlv(0x06, encoded);
+    }
+
+    /// BIT STRING with zero unused bits.
+    fn bitString(d: DerBuild, bytes: []const u8) DerCertError![]const u8 {
+        return d.tlv(0x03, try d.cat(&.{ "\x00", bytes }));
+    }
+
+    fn octetString(d: DerBuild, bytes: []const u8) DerCertError![]const u8 {
+        return d.tlv(0x04, bytes);
+    }
+
+    fn boolean(d: DerBuild, value: bool) DerCertError![]const u8 {
+        return d.tlv(0x01, if (value) "\xff" else "\x00");
+    }
+
+    /// INTEGER from a big-endian magnitude (leading zeros tolerated and
+    /// stripped first; a single 0x00 pad byte is (re)inserted whenever the
+    /// top bit is set, since DER INTEGER is signed two's-complement and
+    /// every value this module encodes — serials, version, modulus,
+    /// exponent — is non-negative).
+    fn integer(d: DerBuild, magnitude: []const u8) DerCertError![]const u8 {
+        const m = stripLeadingZeros(magnitude);
+        if (m.len == 0) return d.tlv(0x02, "\x00");
+        if (m[0] & 0x80 != 0) return d.tlv(0x02, try d.cat(&.{ "\x00", m }));
+        return d.tlv(0x02, m);
+    }
+
+    fn integerU64(d: DerBuild, value: u64) DerCertError![]const u8 {
+        var buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &buf, value, .big);
+        return d.integer(&buf);
+    }
+
+    /// UTCTime (RFC 5280 §4.1.2.5.1: two-digit year, `YYMMDDHHMMSSZ`).
+    /// `text` must be exactly 13 bytes ending in 'Z' — enforced by the only
+    /// caller (`selfSignedCert`, via `validUtcTime`) before this is reached.
+    fn utcTime(d: DerBuild, text: []const u8) DerCertError![]const u8 {
+        std.debug.assert(text.len == 13);
+        return d.tlv(0x17, text);
+    }
+
+    fn utf8String(d: DerBuild, text: []const u8) DerCertError![]const u8 {
+        return d.tlv(0x0c, text);
+    }
+
+    /// `[n] EXPLICIT ...`: a context-specific *constructed* tag wrapping a
+    /// complete inner TLV (used for `version [0]` and `extensions [3]`).
+    fn explicit(d: DerBuild, tag_num: u5, content: []const u8) DerCertError![]const u8 {
+        return d.tlv(0xa0 | @as(u8, tag_num), content);
+    }
+
+    /// `[n] IMPLICIT ...`: a context-specific *primitive* tag carrying raw
+    /// content directly (used for the `GeneralName` CHOICE alternatives:
+    /// `dNSName [2]`, `uniformResourceIdentifier [6]`).
+    fn implicitPrimitive(d: DerBuild, tag_num: u5, content: []const u8) DerCertError![]const u8 {
+        return d.tlv(0x80 | @as(u8, tag_num), content);
+    }
+};
+
+const der_null = "\x05\x00"; // NULL — AlgorithmIdentifier.parameters for rsaEncryption/sha*WithRSAEncryption
+
+// sha*WithRSAEncryption OIDs (RFC 8017 Appendix C / RFC 4055 §5): the same
+// 1.2.840.113549.1.1.* arc as `oid_rsa_encryption` above, differing only in
+// the final arc (11/12/13). `std.crypto.Certificate.Algorithm.map` (see
+// P4a's provenance note on that struct) recognizes exactly these three plus
+// sha1/sha224/md2/md5 — only sha256/384/512 are offered here since RFC 8017
+// (this module's whole provenance) has no opinion on MD2/MD5/SHA-1 being
+// appropriate for *new* signatures, and P1's `signPkcs1v15` already restricts
+// `Hash` at compile time via `digestInfoPrefix`'s exhaustive switch.
+const oid_sha256_with_rsa_encryption = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b };
+const oid_sha384_with_rsa_encryption = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0c };
+const oid_sha512_with_rsa_encryption = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0d };
+
+const oid_common_name = [_]u8{ 0x55, 0x04, 0x03 }; // 2.5.4.3
+const oid_basic_constraints = [_]u8{ 0x55, 0x1d, 0x13 }; // 2.5.29.19
+const oid_key_usage = [_]u8{ 0x55, 0x1d, 0x0f }; // 2.5.29.15
+const oid_subject_alt_name = [_]u8{ 0x55, 0x1d, 0x11 }; // 2.5.29.17
+
+/// sha256/384/512WithRSAEncryption OID content bytes for `Hash` (RFC 8017
+/// Appendix C). X.509 signature-algorithm OIDs are a small fixed set, not a
+/// per-call runtime choice, so an unsupported `Hash` is a compile error.
+fn sigAlgOid(comptime Hash: type) []const u8 {
+    const sha2 = std.crypto.hash.sha2;
+    return switch (Hash) {
+        sha2.Sha256 => &oid_sha256_with_rsa_encryption,
+        sha2.Sha384 => &oid_sha384_with_rsa_encryption,
+        sha2.Sha512 => &oid_sha512_with_rsa_encryption,
+        else => @compileError("selfSignedCert: unsupported Hash (need sha256/384/512WithRSAEncryption): " ++ @typeName(Hash)),
+    };
+}
+
+/// One `GeneralName` SAN entry this module can emit (RFC 5280 §4.2.1.6):
+/// `dns_name` is `dNSName [2]`, `uri` is `uniformResourceIdentifier [6]`
+/// (both IA5String/ASCII content) — the two alternatives `CertOptions` needs
+/// today; an OPC-UA `applicationUri` is exactly a `.uri` value. Extending to
+/// other `GeneralName` choices (`otherName`, `iPAddress`, ...) is a matter of
+/// adding more `DerBuild.implicitPrimitive` calls in `buildSanExtnValue`
+/// below — the extension hook the module-level doc asked for.
+pub const SubjectAltName = union(enum) {
+    dns_name: []const u8,
+    uri: []const u8,
+};
+
+/// Parameters for `selfSignedCert`. `not_before`/`not_after` are
+/// caller-supplied UTCTime strings rather than a clock read: Zig 0.16 has no
+/// `std.time` timestamp API, and a certificate-generation library should
+/// never silently assume a clock source anyway.
+pub const CertOptions = struct {
+    /// Subject/issuer commonName. The certificate is self-signed (issuer ==
+    /// subject byte-for-byte), encoded as a single RDN, UTF8String-valued.
+    common_name: []const u8,
+    /// X.509 `serialNumber` (RFC 5280 §4.1.2.2: a positive integer, unique
+    /// per issuer — uniqueness is the caller's responsibility, this module
+    /// tracks no state). `u64` rather than an arbitrary byte string: every
+    /// value fits in 8 bytes, and P6 is a self-signed-cert generator, not a
+    /// general bignum-serial API.
+    serial: u64 = 1,
+    /// `notBefore`, UTCTime `"YYMMDDHHMMSSZ"` (RFC 5280 §4.1.2.5.1: exactly
+    /// 13 bytes, two-digit year, trailing 'Z').
+    not_before: []const u8,
+    /// `notAfter`, same UTCTime shape as `not_before`.
+    not_after: []const u8,
+    /// basicConstraints `cA` (RFC 5280 §4.2.1.9). Also gates whether
+    /// `keyCertSign`/`cRLSign` are set in the `keyUsage` extension.
+    is_ca: bool = false,
+    /// `subjectAltName` entries (RFC 5280 §4.2.1.6); the extension is
+    /// omitted entirely when empty.
+    subject_alt_names: []const SubjectAltName = &.{},
+};
+
+pub const SelfSignedCertError = error{
+    /// `common_name` is empty, or `not_before`/`not_after` is not a
+    /// 13-byte `"YYMMDDHHMMSSZ"` string.
+    InvalidCertOptions,
+} || DerCertError || SignPkcs1v15Error;
+
+/// RFC 5280 §4.1.2.5.1 UTCTime shape: exactly `YYMMDDHHMMSSZ` (13 bytes, all
+/// ASCII digits except the trailing 'Z'). Calendar validity (day-of-month
+/// bounds etc.) is not checked here — a garbage-but-shaped string still
+/// yields a syntactically valid, if semantically wrong, certificate;
+/// `std.crypto.Certificate`'s own `parseTimeDigits` bounds-checks the digits
+/// again on the parse side (see the P6 tests).
+fn validUtcTime(text: []const u8) bool {
+    if (text.len != 13 or text[12] != 'Z') return false;
+    for (text[0..12]) |c| {
+        if (c < '0' or c > '9') return false;
+    }
+    return true;
+}
+
+/// `Name ::= RDNSequence` with a single RDN carrying one
+/// `AttributeTypeAndValue { commonName, UTF8String }` — used for both
+/// `issuer` and `subject` (self-signed: identical bytes, reused verbatim).
+fn buildNameCn(d: DerBuild, common_name: []const u8) DerCertError![]const u8 {
+    const atv = try d.seq(&.{ try d.oid(&oid_common_name), try d.utf8String(common_name) });
+    const rdn = try d.tlv(0x31, atv); // RelativeDistinguishedName ::= SET OF AttributeTypeAndValue
+    return d.seq(&.{rdn}); // RDNSequence ::= SEQUENCE OF RelativeDistinguishedName
+}
+
+/// `RSAPublicKey ::= SEQUENCE { modulus INTEGER, publicExponent INTEGER }`
+/// (PKCS#1 Appendix A.1.1) — the same shape P4a's `publicKeyFromDerImpl`
+/// parses, built here instead of parsed.
+fn buildRsaPublicKeyDer(d: DerBuild, pk: PublicKey) DerCertError![]const u8 {
+    var n_buf: [max_modulus_len]u8 = undefined;
+    pk.n.toBytes(&n_buf, .big) catch unreachable; // n is its own modulus: always fits its own byte length
+    var e_buf: [max_modulus_len]u8 = undefined;
+    pk.e.toBytes(&e_buf, .big) catch unreachable; // e < n, so it fits n's byte length too
+
+    return d.seq(&.{
+        try d.integer(&n_buf),
+        try d.integer(&e_buf),
+    });
+}
+
+/// `SubjectPublicKeyInfo ::= SEQUENCE { AlgorithmIdentifier, BIT STRING }`
+/// wrapping a `buildRsaPublicKeyDer` value under the `rsaEncryption` OID
+/// (RFC 8017 Appendix C) — the SPKI shape P4a's `publicKeyFromDerImpl` also
+/// parses (and what `PublicKey.fromDer` on the extracted bytes round-trips
+/// through in the tests below).
+fn buildSpki(d: DerBuild, pk: PublicKey) DerCertError![]const u8 {
+    const rsa_pub_key_der = try buildRsaPublicKeyDer(d, pk);
+    return d.seq(&.{
+        try d.seq(&.{ try d.oid(&oid_rsa_encryption), der_null }),
+        try d.bitString(rsa_pub_key_der),
+    });
+}
+
+/// `GeneralNames ::= SEQUENCE OF GeneralName` — the `subjectAltName`
+/// extension's `extnValue` payload (RFC 5280 §4.2.1.6).
+fn buildSanExtnValue(d: DerBuild, sans: []const SubjectAltName) DerCertError![]const u8 {
+    const names = try d.a.alloc([]const u8, sans.len);
+    for (names, sans) |*slot, san| slot.* = switch (san) {
+        .dns_name => |name| try d.implicitPrimitive(2, name),
+        .uri => |uri| try d.implicitPrimitive(6, uri),
+    };
+    return d.seq(names);
+}
+
+/// `KeyUsage ::= BIT STRING` (RFC 5280 §4.2.1.3) with `digitalSignature`
+/// (bit 0) always set, plus `keyCertSign` (bit 5) and `cRLSign` (bit 6) for
+/// a CA certificate. DER's minimal BIT STRING encoding drops trailing
+/// zero *bits* by recording how many of the last content byte's low bits
+/// are unused (X.690 §11.2.7); `@ctz` of the single content byte is exactly
+/// that count for a one-byte KeyUsage value.
+fn keyUsageBitString(d: DerBuild, is_ca: bool) DerCertError![]const u8 {
+    const byte: u8 = if (is_ca) 0x86 else 0x80; // digitalSignature | (keyCertSign | cRLSign if CA)
+    const unused: u8 = @ctz(byte);
+    return d.tlv(0x03, try d.cat(&.{ &.{unused}, &.{byte} }));
+}
+
+/// `extensions [3] EXPLICIT Extensions` (RFC 5280 §4.1.2.9): always
+/// `basicConstraints` (critical, `cA` per `opts.is_ca`) and `keyUsage`
+/// (critical); `subjectAltName` (not critical) if `opts.subject_alt_names`
+/// is non-empty.
+fn buildExtensions(d: DerBuild, opts: CertOptions) DerCertError![]const u8 {
+    var list: std.ArrayList([]const u8) = .empty;
+
+    const basic_constraints_value = if (opts.is_ca)
+        try d.seq(&.{try d.boolean(true)}) // BasicConstraints ::= SEQUENCE { cA BOOLEAN DEFAULT FALSE, ... }
+    else
+        try d.seq(&.{}); // cA defaults to FALSE: an empty SEQUENCE says exactly that
+    try list.append(d.a, try d.seq(&.{
+        try d.oid(&oid_basic_constraints),
+        try d.boolean(true), // critical
+        try d.octetString(basic_constraints_value),
+    }));
+
+    try list.append(d.a, try d.seq(&.{
+        try d.oid(&oid_key_usage),
+        try d.boolean(true), // critical
+        try d.octetString(try keyUsageBitString(d, opts.is_ca)),
+    }));
+
+    if (opts.subject_alt_names.len > 0) {
+        try list.append(d.a, try d.seq(&.{
+            try d.oid(&oid_subject_alt_name),
+            try d.octetString(try buildSanExtnValue(d, opts.subject_alt_names)),
+        }));
+    }
+
+    return d.explicit(3, try d.seq(list.items));
+}
+
+/// Generate a self-signed X.509 v3 certificate (RFC 5280) for `sk`/`pk`
+/// (the caller-supplied `pk` must be the public key matching `sk` — this is
+/// not re-derived from `sk`, since `SecretKey` carries no cached `e`),
+/// signed with RSASSA-PKCS1-v1_5 over `Hash` (`signPkcs1v15`, P1). Returns
+/// `gpa`-owned DER bytes (`Certificate ::= SEQUENCE { tbsCertificate,
+/// signatureAlgorithm, signatureValue BIT STRING }`); an owned-slice return
+/// (mirroring `modules/acme/src/x509.zig`'s `csrDer`) is the natural shape
+/// here rather than a fixed `out` buffer, since the encoded length varies
+/// with `common_name`/SAN content and the caller has no simple formula to
+/// pre-size a buffer for that.
+pub fn selfSignedCert(
+    gpa: std.mem.Allocator,
+    sk: SecretKey,
+    pk: PublicKey,
+    comptime Hash: type,
+    opts: CertOptions,
+) SelfSignedCertError![]u8 {
+    if (opts.common_name.len == 0) return error.InvalidCertOptions;
+    if (!validUtcTime(opts.not_before) or !validUtcTime(opts.not_after)) return error.InvalidCertOptions;
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const d: DerBuild = .{ .a = arena.allocator() };
+
+    const name = try buildNameCn(d, opts.common_name); // issuer == subject: built once, reused twice below
+    const version = try d.explicit(0, try d.integerU64(2)); // v3
+    const serial = try d.integerU64(opts.serial);
+    const sig_alg_id = try d.seq(&.{ try d.oid(sigAlgOid(Hash)), der_null });
+    const validity = try d.seq(&.{ try d.utcTime(opts.not_before), try d.utcTime(opts.not_after) });
+    const spki = try buildSpki(d, pk);
+    const extensions = try buildExtensions(d, opts);
+
+    const tbs_certificate = try d.seq(&.{
+        version,
+        serial,
+        sig_alg_id,
+        name, // issuer
+        validity,
+        name, // subject
+        spki,
+        extensions,
+    });
+
+    // `signPkcs1v15`'s `out` must be at least the modulus length; `sk.n` is
+    // bounded by `max_modulus_bits` by construction (every `SecretKey`
+    // constructor routes through `Modulus.fromBytes`/`fromPrimitive`, which
+    // reject wider moduli), so a `max_modulus_len` stack buffer always
+    // suffices — `signPkcs1v15`'s own `BufferTooSmall` is therefore
+    // unreachable in practice but stays in `SelfSignedCertError` for type
+    // honesty (it is `signPkcs1v15`'s real error set).
+    var sig_buf: [max_modulus_len]u8 = undefined;
+    const sig = try signPkcs1v15(sk, Hash, tbs_certificate, &sig_buf);
+
+    const cert = try d.seq(&.{
+        tbs_certificate,
+        sig_alg_id, // RFC 5280 §4.1.1.2: MUST repeat tbsCertificate.signature verbatim
+        try d.bitString(sig),
+    });
+    return gpa.dupe(u8, cert);
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
@@ -2036,4 +2412,237 @@ test "PublicKey.fromPem/SecretKey.fromPem: missing block, corrupted base64, encr
     // secret keys, and vice versa) is also a label mismatch, not a crash.
     try testing.expectError(error.UnsupportedPemLabel, SecretKey.fromPem(kat2048_pem.pub_spki));
     try testing.expectError(error.UnsupportedPemLabel, PublicKey.fromPem(kat2048_pem.priv_pkcs1));
+}
+
+// ── P6 (self-signed X.509 certificate) tests ────────────────────────────────
+//
+// Fixture: the same `kat2048` key as every other section. Validity window
+// mirrors `modules/acme/src/x509.zig`'s own test fixtures (notBefore
+// 2025-01-01, notAfter 2030-12-31) so `verify_now` below (an arbitrary
+// instant inside that window) needs no clock and no epoch-math helper.
+
+fn testCertOptions(is_ca: bool) CertOptions {
+    return .{
+        .common_name = "zig-libs rsa self-signed test",
+        .serial = 7,
+        .not_before = "250101000000Z", // 2025-01-01T00:00:00Z
+        .not_after = "301231235959Z", // 2030-12-31T23:59:59Z
+        .is_ca = is_ca,
+    };
+}
+
+// Epoch seconds for 2027-06-15T00:00:00Z: comfortably inside the fixture's
+// validity window (computed once with Python: `int(datetime(2027,6,15,
+// tzinfo=timezone.utc).timestamp())`), used as `now_sec` for
+// `std.crypto.Certificate.Parsed.verify` below — never a clock read.
+const verify_now: i64 = 1813363200;
+
+test "selfSignedCert: std.crypto.Certificate parses + fully verifies it (self-signed oracle)" {
+    const sk = try kat2048.secretKey();
+    const pk = try kat2048.publicKey();
+
+    const cert_der = try selfSignedCert(testing.allocator, sk, pk, std.crypto.hash.sha2.Sha256, testCertOptions(true));
+    defer testing.allocator.free(cert_der);
+
+    const cert: std.crypto.Certificate = .{ .buffer = cert_der, .index = 0 };
+    const parsed = try cert.parse();
+
+    try testing.expectEqual(.v3, parsed.version);
+    try testing.expectEqual(.sha256WithRSAEncryption, parsed.signature_algorithm);
+    try testing.expect(parsed.pub_key_algo == .rsaEncryption);
+
+    // Self-signed: issuer and subject are byte-identical (the same `Name`
+    // DER, built once and reused for both fields).
+    try testing.expectEqualSlices(u8, parsed.issuer(), parsed.subject());
+    try testing.expectEqualStrings("zig-libs rsa self-signed test", parsed.commonName());
+
+    // Embedded public key round-trips to the exact kat2048 n/e.
+    const pk_components = try std.crypto.Certificate.rsa.PublicKey.parseDer(parsed.pubKey());
+    try testing.expectEqualSlices(u8, &kat2048.n, pk_components.modulus);
+    try testing.expectEqualSlices(u8, &kat2048.e, pk_components.exponent);
+
+    // The strongest oracle: std's full self-verify path (issuer==subject
+    // name match, validity window, RSA signature over the TBS bytes) all
+    // pass through `Parsed.verify` against itself.
+    try parsed.verify(parsed, verify_now);
+
+    // Outside the validity window, `verify` must reject — proving the
+    // notBefore/notAfter checks are real and not merely parsed-and-ignored.
+    try testing.expectError(error.CertificateNotYetValid, parsed.verify(parsed, 1_735_689_599)); // 1s before notBefore
+    try testing.expectError(error.CertificateExpired, parsed.verify(parsed, 1_924_992_000)); // 1s after notAfter
+
+    // A bit flip in the signature bytes (the certificate's last byte, deep
+    // inside the trailing signatureValue BIT STRING) must break the
+    // signature check without touching issuer/subject/validity — proving
+    // the RSA signature is actually checked, not just parsed and ignored.
+    // (A flip inside the commonName is not used here: issuer and subject
+    // both embed that same text as two separate copies, so corrupting the
+    // first occurrence trips the issuer/subject *name* mismatch check
+    // first, before the signature is ever verified.)
+    var tampered = try testing.allocator.dupe(u8, cert_der);
+    defer testing.allocator.free(tampered);
+    tampered[tampered.len - 1] ^= 0x01;
+    const tampered_cert: std.crypto.Certificate = .{ .buffer = tampered, .index = 0 };
+    const tampered_parsed = try tampered_cert.parse();
+    try testing.expectError(error.CertificateSignatureInvalid, tampered_parsed.verify(tampered_parsed, verify_now));
+}
+
+test "selfSignedCert: basicConstraints reflects is_ca (CA vs leaf)" {
+    const sk = try kat2048.secretKey();
+    const pk = try kat2048.publicKey();
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+
+    // Both are self-consistency checks against this module's own
+    // deterministic encoding (`buildExtensions`): `cA TRUE` only appears
+    // for a CA cert, `cA`-absent (empty inner SEQUENCE, DEFAULT FALSE) only
+    // for a leaf — proving `is_ca` actually reaches the DER, not just that
+    // the OID is present in both.
+    const ca_der = try selfSignedCert(testing.allocator, sk, pk, Sha256, testCertOptions(true));
+    defer testing.allocator.free(ca_der);
+    const leaf_der = try selfSignedCert(testing.allocator, sk, pk, Sha256, testCertOptions(false));
+    defer testing.allocator.free(leaf_der);
+
+    const ca_true_seq = [_]u8{ 0x30, 0x03, 0x01, 0x01, 0xff }; // SEQUENCE { BOOLEAN TRUE }
+    const ca_empty_seq = [_]u8{ 0x30, 0x00 }; // SEQUENCE {} (cA DEFAULT FALSE)
+
+    try testing.expect(std.mem.indexOf(u8, ca_der, &ca_true_seq) != null);
+    try testing.expect(std.mem.indexOf(u8, leaf_der, &ca_true_seq) == null);
+    try testing.expect(std.mem.indexOf(u8, leaf_der, &ca_empty_seq) != null);
+
+    // keyUsage differs too: CA sets keyCertSign+cRLSign (content byte 0x86,
+    // 1 unused bit), leaf sets only digitalSignature (0x80, 7 unused bits).
+    const ku_ca = [_]u8{ 0x03, 0x02, 0x01, 0x86 };
+    const ku_leaf = [_]u8{ 0x03, 0x02, 0x07, 0x80 };
+    try testing.expect(std.mem.indexOf(u8, ca_der, &ku_ca) != null);
+    try testing.expect(std.mem.indexOf(u8, leaf_der, &ku_leaf) != null);
+
+    // Both are still valid, verifiable certificates regardless of is_ca.
+    inline for (.{ ca_der, leaf_der }) |der_bytes| {
+        const cert: std.crypto.Certificate = .{ .buffer = der_bytes, .index = 0 };
+        const parsed = try cert.parse();
+        try parsed.verify(parsed, verify_now);
+    }
+}
+
+test "selfSignedCert: subjectAltName (dNSName + URI) round-trips through std's verifyHostName" {
+    const sk = try kat2048.secretKey();
+    const pk = try kat2048.publicKey();
+    var opts = testCertOptions(false);
+    opts.subject_alt_names = &.{
+        .{ .dns_name = "example.com" },
+        .{ .dns_name = "*.example.com" },
+        .{ .uri = "urn:zig-libs:rsa:test" },
+    };
+
+    const cert_der = try selfSignedCert(testing.allocator, sk, pk, std.crypto.hash.sha2.Sha256, opts);
+    defer testing.allocator.free(cert_der);
+    const cert: std.crypto.Certificate = .{ .buffer = cert_der, .index = 0 };
+    const parsed = try cert.parse();
+
+    try parsed.verifyHostName("example.com");
+    try parsed.verifyHostName("foo.example.com"); // matches the wildcard SAN
+    try testing.expectError(error.CertificateHostMismatch, parsed.verifyHostName("other.org"));
+
+    // The URI SAN is present in the raw subjectAltName bytes too (std has no
+    // dedicated URI accessor, so check the extnValue bytes directly).
+    try testing.expect(std.mem.indexOf(u8, parsed.subjectAltName(), "urn:zig-libs:rsa:test") != null);
+}
+
+test "selfSignedCert: rejects invalid CertOptions (empty CN, malformed UTCTime)" {
+    const sk = try kat2048.secretKey();
+    const pk = try kat2048.publicKey();
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+
+    var opts = testCertOptions(false);
+    opts.common_name = "";
+    try testing.expectError(error.InvalidCertOptions, selfSignedCert(testing.allocator, sk, pk, Sha256, opts));
+
+    opts = testCertOptions(false);
+    opts.not_before = "2025-01-01"; // wrong shape entirely
+    try testing.expectError(error.InvalidCertOptions, selfSignedCert(testing.allocator, sk, pk, Sha256, opts));
+
+    opts = testCertOptions(false);
+    opts.not_after = "301231235959"; // missing trailing 'Z'
+    try testing.expectError(error.InvalidCertOptions, selfSignedCert(testing.allocator, sk, pk, Sha256, opts));
+
+    opts = testCertOptions(false);
+    opts.not_before = "25010100000AZ"; // non-digit in the date portion
+    try testing.expectError(error.InvalidCertOptions, selfSignedCert(testing.allocator, sk, pk, Sha256, opts));
+}
+
+test "selfSignedCert: allocator exhaustion is reported, not panicked (BufferTooSmall analogue)" {
+    // selfSignedCert returns a gpa-owned slice sized to the (variable-length)
+    // encoded certificate rather than writing into a caller-fixed `out`
+    // buffer (see its doc comment for why); the equivalent "not enough room"
+    // negative for an allocator-returning API is allocator exhaustion, not a
+    // fixed-buffer-too-small error code.
+    const sk = try kat2048.secretKey();
+    const pk = try kat2048.publicKey();
+
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(
+        error.OutOfMemory,
+        selfSignedCert(failing.allocator(), sk, pk, std.crypto.hash.sha2.Sha256, testCertOptions(false)),
+    );
+}
+
+test "selfSignedCert: this module's own P4a parser round-trips the embedded SPKI and signature" {
+    // Independent of std.crypto.Certificate: walk the Certificate DER by
+    // hand with the same bounds-checked `Asn1.Element.decode` primitive
+    // P4a's `derElem`/`derChild` are built on (used directly here, not
+    // through those wrappers, since they require a universal tag class and
+    // `version [0]`/context-specific fields are not universal-class), then
+    // feed the extracted SPKI back through `PublicKey.fromDer` and the
+    // extracted signature back through `verifyPkcs1v15` — both P4a and P1
+    // cross-checked against this module's own P6 encoder, not just std's.
+    const sk = try kat2048.secretKey();
+    const pk = try kat2048.publicKey();
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+
+    const cert_der = try selfSignedCert(testing.allocator, sk, pk, Sha256, testCertOptions(false));
+    defer testing.allocator.free(cert_der);
+
+    const cert_elem = try Asn1.Element.decode(cert_der, 0);
+    const tbs_elem = try Asn1.Element.decode(cert_der, cert_elem.slice.start);
+
+    const version_elem = try Asn1.Element.decode(cert_der, tbs_elem.slice.start);
+    const serial_elem = try Asn1.Element.decode(cert_der, version_elem.slice.end);
+    const tbs_sig_alg_elem = try Asn1.Element.decode(cert_der, serial_elem.slice.end);
+    const issuer_elem = try Asn1.Element.decode(cert_der, tbs_sig_alg_elem.slice.end);
+    const validity_elem = try Asn1.Element.decode(cert_der, issuer_elem.slice.end);
+    const subject_elem = try Asn1.Element.decode(cert_der, validity_elem.slice.end);
+    const spki_elem = try Asn1.Element.decode(cert_der, subject_elem.slice.end);
+
+    // Issuer and subject are the exact same bytes (self-signed).
+    try testing.expectEqualSlices(
+        u8,
+        cert_der[issuer_elem.slice.start..issuer_elem.slice.end],
+        cert_der[subject_elem.slice.start..subject_elem.slice.end],
+    );
+
+    // `PublicKey.fromDer` expects a *complete* top-level SEQUENCE (header
+    // included); the SPKI's header starts exactly where `subject` ends.
+    const spki_full = cert_der[subject_elem.slice.end..spki_elem.slice.end];
+    const parsed_pk = try PublicKey.fromDer(spki_full);
+    try expectMatchesKat2048PublicKey(parsed_pk);
+
+    // signatureAlgorithm + signatureValue follow tbsCertificate in the outer
+    // Certificate SEQUENCE (siblings of `tbs_elem`, not children of it).
+    const outer_sig_alg_elem = try Asn1.Element.decode(cert_der, tbs_elem.slice.end);
+    const outer_sig_bits_elem = try Asn1.Element.decode(cert_der, outer_sig_alg_elem.slice.end);
+    const sig_bitstring_content = cert_der[outer_sig_bits_elem.slice.start..outer_sig_bits_elem.slice.end];
+    try testing.expect(sig_bitstring_content.len >= 1 and sig_bitstring_content[0] == 0); // 0 unused bits
+    const sig_bytes = sig_bitstring_content[1..];
+
+    // The signed message is the complete tbsCertificate TLV (header
+    // included) — `cert_elem.slice.start` is exactly where it begins.
+    const tbs_full = cert_der[cert_elem.slice.start..tbs_elem.slice.end];
+    try verifyPkcs1v15(pk, Sha256, tbs_full, sig_bytes);
+
+    // And the reverse-direction cross-check: corrupting one byte inside the
+    // signed TBS content must make our own verifier reject it too.
+    var tampered_tbs = try testing.allocator.dupe(u8, tbs_full);
+    defer testing.allocator.free(tampered_tbs);
+    tampered_tbs[tampered_tbs.len - 1] ^= 0x01;
+    try testing.expectError(error.SignatureVerificationFailed, verifyPkcs1v15(pk, Sha256, tampered_tbs, sig_bytes));
 }
