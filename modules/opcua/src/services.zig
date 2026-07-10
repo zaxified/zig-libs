@@ -70,7 +70,12 @@ pub fn isBad(sc: encoding.StatusCode) bool {
     return sc & 0x8000_0000 != 0;
 }
 
-fn nodeIdEql(a: encoding.NodeId, b: encoding.NodeId) bool {
+/// `NodeId` structural equality — used both by `Channel.recvService` (to
+/// match a response's leading type-id) and, from `root.zig`, to classify a
+/// `NotificationMessage`'s `NotificationData` `ExtensionObject`s by their
+/// `TypeId` (DataChangeNotification/StatusChangeNotification/
+/// EventNotificationList — OPC 10000-4 §5.13.5).
+pub fn nodeIdEql(a: encoding.NodeId, b: encoding.NodeId) bool {
     return switch (a) {
         .numeric => |av| switch (b) {
             .numeric => |bv| av.namespace == bv.namespace and av.id == bv.id,
@@ -117,6 +122,33 @@ pub const type_id = struct {
     pub const browse_next_response = n0(536);
     pub const call_request = n0(712);
     pub const call_response = n0(715);
+
+    // ── Part 5: subscriptions / monitored items / Publish (OPC 10000-4 §5.12/
+    // §5.13) — same source as the block above, fetched directly from the OPC
+    // Foundation `Schema/NodeIds.csv` during implementation.
+    pub const create_monitored_items_request = n0(751);
+    pub const create_monitored_items_response = n0(754);
+    pub const delete_monitored_items_request = n0(781);
+    pub const delete_monitored_items_response = n0(784);
+    pub const create_subscription_request = n0(787);
+    pub const create_subscription_response = n0(790);
+    pub const modify_subscription_request = n0(793);
+    pub const modify_subscription_response = n0(796);
+    pub const set_publishing_mode_request = n0(799);
+    pub const set_publishing_mode_response = n0(802);
+    /// The `NotificationData` union's concrete members — these ride as the
+    /// `TypeId` of an `ExtensionObject` inside `NotificationMessage.
+    /// NotificationData`, never as a top-level MSG body, but belong in this
+    /// well-known-ids table alongside the others.
+    pub const data_change_notification = n0(811);
+    pub const status_change_notification = n0(820);
+    pub const event_notification_list = n0(916);
+    pub const publish_request = n0(826);
+    pub const publish_response = n0(829);
+    pub const republish_request = n0(832);
+    pub const republish_response = n0(835);
+    pub const delete_subscriptions_request = n0(847);
+    pub const delete_subscriptions_response = n0(850);
 };
 
 /// `AttributeId` (OPC Foundation UA-Nodeset `Schema/AttributeIds.csv`, MIT
@@ -175,6 +207,10 @@ pub const BrowseDirection = enum(u32) { forward = 0, inverse = 1, both = 2, inva
 /// practice; `BrowseDescription.node_class_mask` ORs these together as a
 /// plain `u32`, not through this enum).
 pub const NodeClass = enum(u32) { unspecified = 0, object = 1, variable = 2, method = 4, object_type = 8, variable_type = 16, reference_type = 32, data_type = 64, view = 128 };
+/// OPC 10000-4 §5.12.1.2 (`MonitoredItemCreateRequest.MonitoringMode`) —
+/// ground-truthed against the OPC Foundation schema's `MonitoringMode`
+/// `EnumeratedType`.
+pub const MonitoringMode = enum(u32) { disabled = 0, sampling = 1, reporting = 2 };
 
 fn encodeEnum(e: *encoding.Encoder, comptime T: type, v: T) encoding.EncodeError!void {
     try e.writer.writeInt(u32, @intFromEnum(v), .little);
@@ -1434,6 +1470,788 @@ pub fn freeCallResponse(a: std.mem.Allocator, v: CallResponse) void {
     freeDiagnosticInfoArray(a, v.diagnostic_infos);
 }
 
+// ── Part 5: subscriptions / monitored items / Publish (OPC 10000-4 §5.12/
+// §5.13) ─────────────────────────────────────────────────────────────────────
+// Field order for every structure below is ground-truthed the same way Part 4
+// was: the OPC Foundation's `Schema/Opc.Ua.Types.bsd`, fetched directly during
+// implementation (`CreateSubscriptionRequest`, `MonitoringParameters`,
+// `MonitoredItemCreateRequest`/`Result`, `PublishRequest`/`Response`,
+// `NotificationMessage`, `DataChangeNotification`/`StatusChangeNotification`/
+// `EventNotificationList` all confirmed against that schema's `StructuredType`
+// definitions, not inferred from the prose spec).
+
+fn freeU32Array(a: std.mem.Allocator, arr: ?[]const u32) void {
+    if (arr) |items| a.free(items);
+}
+
+fn encodeU32Item(e: *encoding.Encoder, v: u32) encoding.EncodeError!void {
+    try e.writer.writeInt(u32, v, .little);
+}
+fn decodeU32Item(d: *encoding.Decoder) encoding.DecodeError!u32 {
+    return d.decodeUInt32();
+}
+
+// ── CreateSubscription (§5.13.2) ─────────────────────────────────────────────
+
+pub const CreateSubscriptionRequest = struct {
+    request_header: RequestHeader,
+    requested_publishing_interval: f64,
+    requested_lifetime_count: u32,
+    requested_max_keep_alive_count: u32,
+    max_notifications_per_publish: u32,
+    publishing_enabled: bool,
+    priority: u8,
+};
+
+pub fn encodeCreateSubscriptionRequest(e: *encoding.Encoder, v: CreateSubscriptionRequest) encoding.EncodeError!void {
+    try encodeRequestHeader(e, v.request_header);
+    try e.encodeDouble(v.requested_publishing_interval);
+    try e.writer.writeInt(u32, v.requested_lifetime_count, .little);
+    try e.writer.writeInt(u32, v.requested_max_keep_alive_count, .little);
+    try e.writer.writeInt(u32, v.max_notifications_per_publish, .little);
+    try e.encodeBoolean(v.publishing_enabled);
+    try e.encodeByte(v.priority);
+}
+
+pub fn decodeCreateSubscriptionRequest(d: *encoding.Decoder) encoding.DecodeError!CreateSubscriptionRequest {
+    return .{
+        .request_header = try decodeRequestHeader(d),
+        .requested_publishing_interval = try d.decodeDouble(),
+        .requested_lifetime_count = try d.decodeUInt32(),
+        .requested_max_keep_alive_count = try d.decodeUInt32(),
+        .max_notifications_per_publish = try d.decodeUInt32(),
+        .publishing_enabled = try d.decodeBoolean(),
+        .priority = try d.decodeByte(),
+    };
+}
+
+pub fn freeCreateSubscriptionRequest(a: std.mem.Allocator, v: CreateSubscriptionRequest) void {
+    freeRequestHeader(a, v.request_header);
+}
+
+pub const CreateSubscriptionResponse = struct {
+    response_header: ResponseHeader,
+    subscription_id: u32,
+    revised_publishing_interval: f64,
+    revised_lifetime_count: u32,
+    revised_max_keep_alive_count: u32,
+};
+
+pub fn encodeCreateSubscriptionResponse(e: *encoding.Encoder, v: CreateSubscriptionResponse) encoding.EncodeError!void {
+    try encodeResponseHeader(e, v.response_header);
+    try e.writer.writeInt(u32, v.subscription_id, .little);
+    try e.encodeDouble(v.revised_publishing_interval);
+    try e.writer.writeInt(u32, v.revised_lifetime_count, .little);
+    try e.writer.writeInt(u32, v.revised_max_keep_alive_count, .little);
+}
+
+pub fn decodeCreateSubscriptionResponse(d: *encoding.Decoder) encoding.DecodeError!CreateSubscriptionResponse {
+    return .{
+        .response_header = try decodeResponseHeader(d),
+        .subscription_id = try d.decodeUInt32(),
+        .revised_publishing_interval = try d.decodeDouble(),
+        .revised_lifetime_count = try d.decodeUInt32(),
+        .revised_max_keep_alive_count = try d.decodeUInt32(),
+    };
+}
+
+pub fn freeCreateSubscriptionResponse(a: std.mem.Allocator, v: CreateSubscriptionResponse) void {
+    freeResponseHeader(a, v.response_header);
+}
+
+// ── ModifySubscription (§5.13.3) ─────────────────────────────────────────────
+
+pub const ModifySubscriptionRequest = struct {
+    request_header: RequestHeader,
+    subscription_id: u32,
+    requested_publishing_interval: f64,
+    requested_lifetime_count: u32,
+    requested_max_keep_alive_count: u32,
+    max_notifications_per_publish: u32,
+    priority: u8,
+};
+
+pub fn encodeModifySubscriptionRequest(e: *encoding.Encoder, v: ModifySubscriptionRequest) encoding.EncodeError!void {
+    try encodeRequestHeader(e, v.request_header);
+    try e.writer.writeInt(u32, v.subscription_id, .little);
+    try e.encodeDouble(v.requested_publishing_interval);
+    try e.writer.writeInt(u32, v.requested_lifetime_count, .little);
+    try e.writer.writeInt(u32, v.requested_max_keep_alive_count, .little);
+    try e.writer.writeInt(u32, v.max_notifications_per_publish, .little);
+    try e.encodeByte(v.priority);
+}
+
+pub fn decodeModifySubscriptionRequest(d: *encoding.Decoder) encoding.DecodeError!ModifySubscriptionRequest {
+    return .{
+        .request_header = try decodeRequestHeader(d),
+        .subscription_id = try d.decodeUInt32(),
+        .requested_publishing_interval = try d.decodeDouble(),
+        .requested_lifetime_count = try d.decodeUInt32(),
+        .requested_max_keep_alive_count = try d.decodeUInt32(),
+        .max_notifications_per_publish = try d.decodeUInt32(),
+        .priority = try d.decodeByte(),
+    };
+}
+
+pub fn freeModifySubscriptionRequest(a: std.mem.Allocator, v: ModifySubscriptionRequest) void {
+    freeRequestHeader(a, v.request_header);
+}
+
+pub const ModifySubscriptionResponse = struct {
+    response_header: ResponseHeader,
+    revised_publishing_interval: f64,
+    revised_lifetime_count: u32,
+    revised_max_keep_alive_count: u32,
+};
+
+pub fn encodeModifySubscriptionResponse(e: *encoding.Encoder, v: ModifySubscriptionResponse) encoding.EncodeError!void {
+    try encodeResponseHeader(e, v.response_header);
+    try e.encodeDouble(v.revised_publishing_interval);
+    try e.writer.writeInt(u32, v.revised_lifetime_count, .little);
+    try e.writer.writeInt(u32, v.revised_max_keep_alive_count, .little);
+}
+
+pub fn decodeModifySubscriptionResponse(d: *encoding.Decoder) encoding.DecodeError!ModifySubscriptionResponse {
+    return .{
+        .response_header = try decodeResponseHeader(d),
+        .revised_publishing_interval = try d.decodeDouble(),
+        .revised_lifetime_count = try d.decodeUInt32(),
+        .revised_max_keep_alive_count = try d.decodeUInt32(),
+    };
+}
+
+pub fn freeModifySubscriptionResponse(a: std.mem.Allocator, v: ModifySubscriptionResponse) void {
+    freeResponseHeader(a, v.response_header);
+}
+
+// ── SetPublishingMode (§5.13.4) ──────────────────────────────────────────────
+
+pub const SetPublishingModeRequest = struct {
+    request_header: RequestHeader,
+    publishing_enabled: bool,
+    subscription_ids: ?[]const u32,
+};
+
+pub fn encodeSetPublishingModeRequest(e: *encoding.Encoder, v: SetPublishingModeRequest) encoding.EncodeError!void {
+    try encodeRequestHeader(e, v.request_header);
+    try e.encodeBoolean(v.publishing_enabled);
+    try encodeArray(e, u32, v.subscription_ids, encodeU32Item);
+}
+
+pub fn decodeSetPublishingModeRequest(d: *encoding.Decoder) encoding.DecodeError!SetPublishingModeRequest {
+    return .{
+        .request_header = try decodeRequestHeader(d),
+        .publishing_enabled = try d.decodeBoolean(),
+        .subscription_ids = try decodeArray(d, u32, decodeU32Item),
+    };
+}
+
+pub fn freeSetPublishingModeRequest(a: std.mem.Allocator, v: SetPublishingModeRequest) void {
+    freeRequestHeader(a, v.request_header);
+    freeU32Array(a, v.subscription_ids);
+}
+
+pub const SetPublishingModeResponse = struct {
+    response_header: ResponseHeader,
+    results: ?[]const encoding.StatusCode,
+    diagnostic_infos: ?[]const encoding.DiagnosticInfo,
+};
+
+pub fn encodeSetPublishingModeResponse(e: *encoding.Encoder, v: SetPublishingModeResponse) encoding.EncodeError!void {
+    try encodeResponseHeader(e, v.response_header);
+    try encodeArray(e, encoding.StatusCode, v.results, encoding.Encoder.encodeStatusCode);
+    try encodeArray(e, encoding.DiagnosticInfo, v.diagnostic_infos, encoding.Encoder.encodeDiagnosticInfo);
+}
+
+pub fn decodeSetPublishingModeResponse(d: *encoding.Decoder) encoding.DecodeError!SetPublishingModeResponse {
+    return .{
+        .response_header = try decodeResponseHeader(d),
+        .results = try decodeArray(d, encoding.StatusCode, encoding.Decoder.decodeStatusCode),
+        .diagnostic_infos = try decodeArray(d, encoding.DiagnosticInfo, encoding.Decoder.decodeDiagnosticInfo),
+    };
+}
+
+pub fn freeSetPublishingModeResponse(a: std.mem.Allocator, v: SetPublishingModeResponse) void {
+    freeResponseHeader(a, v.response_header);
+    if (v.results) |r| a.free(r);
+    freeDiagnosticInfoArray(a, v.diagnostic_infos);
+}
+
+// ── DeleteSubscriptions (§5.13.8) ────────────────────────────────────────────
+
+pub const DeleteSubscriptionsRequest = struct {
+    request_header: RequestHeader,
+    subscription_ids: ?[]const u32,
+};
+
+pub fn encodeDeleteSubscriptionsRequest(e: *encoding.Encoder, v: DeleteSubscriptionsRequest) encoding.EncodeError!void {
+    try encodeRequestHeader(e, v.request_header);
+    try encodeArray(e, u32, v.subscription_ids, encodeU32Item);
+}
+
+pub fn decodeDeleteSubscriptionsRequest(d: *encoding.Decoder) encoding.DecodeError!DeleteSubscriptionsRequest {
+    return .{
+        .request_header = try decodeRequestHeader(d),
+        .subscription_ids = try decodeArray(d, u32, decodeU32Item),
+    };
+}
+
+pub fn freeDeleteSubscriptionsRequest(a: std.mem.Allocator, v: DeleteSubscriptionsRequest) void {
+    freeRequestHeader(a, v.request_header);
+    freeU32Array(a, v.subscription_ids);
+}
+
+pub const DeleteSubscriptionsResponse = struct {
+    response_header: ResponseHeader,
+    results: ?[]const encoding.StatusCode,
+    diagnostic_infos: ?[]const encoding.DiagnosticInfo,
+};
+
+pub fn encodeDeleteSubscriptionsResponse(e: *encoding.Encoder, v: DeleteSubscriptionsResponse) encoding.EncodeError!void {
+    try encodeResponseHeader(e, v.response_header);
+    try encodeArray(e, encoding.StatusCode, v.results, encoding.Encoder.encodeStatusCode);
+    try encodeArray(e, encoding.DiagnosticInfo, v.diagnostic_infos, encoding.Encoder.encodeDiagnosticInfo);
+}
+
+pub fn decodeDeleteSubscriptionsResponse(d: *encoding.Decoder) encoding.DecodeError!DeleteSubscriptionsResponse {
+    return .{
+        .response_header = try decodeResponseHeader(d),
+        .results = try decodeArray(d, encoding.StatusCode, encoding.Decoder.decodeStatusCode),
+        .diagnostic_infos = try decodeArray(d, encoding.DiagnosticInfo, encoding.Decoder.decodeDiagnosticInfo),
+    };
+}
+
+pub fn freeDeleteSubscriptionsResponse(a: std.mem.Allocator, v: DeleteSubscriptionsResponse) void {
+    freeResponseHeader(a, v.response_header);
+    if (v.results) |r| a.free(r);
+    freeDiagnosticInfoArray(a, v.diagnostic_infos);
+}
+
+// ── MonitoringParameters (§5.12.1.2), MonitoredItemCreateRequest/Result
+// (§5.12.2) ───────────────────────────────────────────────────────────────────
+
+/// The canonical "no filter" `ExtensionObject` (`MonitoringParameters.Filter`
+/// left absent) — the basic data-change-monitoring case every `Filter`/
+/// `FilterResult` field in this section uses when the caller doesn't supply
+/// an event/deadband filter (out of this module's scope: filter *bodies*
+/// aren't modeled, only the ExtensionObject envelope carrying one, same as
+/// `RequestHeader.additional_header`'s `no_additional_header`).
+pub const no_filter: encoding.ExtensionObject = .{ .type_id = null_node_id, .encoding = .no_body };
+
+pub const MonitoringParameters = struct {
+    client_handle: u32,
+    sampling_interval: f64,
+    filter: encoding.ExtensionObject,
+    queue_size: u32,
+    discard_oldest: bool,
+};
+
+pub fn encodeMonitoringParameters(e: *encoding.Encoder, v: MonitoringParameters) encoding.EncodeError!void {
+    try e.writer.writeInt(u32, v.client_handle, .little);
+    try e.encodeDouble(v.sampling_interval);
+    try e.encodeExtensionObject(v.filter);
+    try e.writer.writeInt(u32, v.queue_size, .little);
+    try e.encodeBoolean(v.discard_oldest);
+}
+
+pub fn decodeMonitoringParameters(d: *encoding.Decoder) encoding.DecodeError!MonitoringParameters {
+    return .{
+        .client_handle = try d.decodeUInt32(),
+        .sampling_interval = try d.decodeDouble(),
+        .filter = try d.decodeExtensionObject(),
+        .queue_size = try d.decodeUInt32(),
+        .discard_oldest = try d.decodeBoolean(),
+    };
+}
+
+pub fn freeMonitoringParameters(a: std.mem.Allocator, v: MonitoringParameters) void {
+    if (v.filter.body.len != 0) a.free(v.filter.body);
+    encoding.freeNodeId(a, v.filter.type_id);
+}
+
+pub const MonitoredItemCreateRequest = struct {
+    item_to_monitor: ReadValueId,
+    monitoring_mode: MonitoringMode,
+    requested_parameters: MonitoringParameters,
+};
+
+pub fn encodeMonitoredItemCreateRequest(e: *encoding.Encoder, v: MonitoredItemCreateRequest) encoding.EncodeError!void {
+    try encodeReadValueId(e, v.item_to_monitor);
+    try encodeEnum(e, MonitoringMode, v.monitoring_mode);
+    try encodeMonitoringParameters(e, v.requested_parameters);
+}
+
+pub fn decodeMonitoredItemCreateRequest(d: *encoding.Decoder) encoding.DecodeError!MonitoredItemCreateRequest {
+    return .{
+        .item_to_monitor = try decodeReadValueId(d),
+        .monitoring_mode = try decodeEnum(d, MonitoringMode),
+        .requested_parameters = try decodeMonitoringParameters(d),
+    };
+}
+
+pub fn freeMonitoredItemCreateRequest(a: std.mem.Allocator, v: MonitoredItemCreateRequest) void {
+    freeReadValueId(a, v.item_to_monitor);
+    freeMonitoringParameters(a, v.requested_parameters);
+}
+
+fn freeMonitoredItemCreateRequestArray(a: std.mem.Allocator, arr: ?[]const MonitoredItemCreateRequest) void {
+    if (arr) |items| {
+        for (items) |it| freeMonitoredItemCreateRequest(a, it);
+        a.free(items);
+    }
+}
+
+pub const MonitoredItemCreateResult = struct {
+    status_code: encoding.StatusCode,
+    monitored_item_id: u32,
+    revised_sampling_interval: f64,
+    revised_queue_size: u32,
+    filter_result: encoding.ExtensionObject,
+};
+
+pub fn encodeMonitoredItemCreateResult(e: *encoding.Encoder, v: MonitoredItemCreateResult) encoding.EncodeError!void {
+    try e.encodeStatusCode(v.status_code);
+    try e.writer.writeInt(u32, v.monitored_item_id, .little);
+    try e.encodeDouble(v.revised_sampling_interval);
+    try e.writer.writeInt(u32, v.revised_queue_size, .little);
+    try e.encodeExtensionObject(v.filter_result);
+}
+
+pub fn decodeMonitoredItemCreateResult(d: *encoding.Decoder) encoding.DecodeError!MonitoredItemCreateResult {
+    return .{
+        .status_code = try d.decodeStatusCode(),
+        .monitored_item_id = try d.decodeUInt32(),
+        .revised_sampling_interval = try d.decodeDouble(),
+        .revised_queue_size = try d.decodeUInt32(),
+        .filter_result = try d.decodeExtensionObject(),
+    };
+}
+
+pub fn freeMonitoredItemCreateResult(a: std.mem.Allocator, v: MonitoredItemCreateResult) void {
+    if (v.filter_result.body.len != 0) a.free(v.filter_result.body);
+    encoding.freeNodeId(a, v.filter_result.type_id);
+}
+
+fn freeMonitoredItemCreateResultArray(a: std.mem.Allocator, arr: ?[]const MonitoredItemCreateResult) void {
+    if (arr) |items| {
+        for (items) |it| freeMonitoredItemCreateResult(a, it);
+        a.free(items);
+    }
+}
+
+// ── CreateMonitoredItems (§5.12.2) ───────────────────────────────────────────
+
+pub const CreateMonitoredItemsRequest = struct {
+    request_header: RequestHeader,
+    subscription_id: u32,
+    timestamps_to_return: TimestampsToReturn,
+    items_to_create: ?[]const MonitoredItemCreateRequest,
+};
+
+pub fn encodeCreateMonitoredItemsRequest(e: *encoding.Encoder, v: CreateMonitoredItemsRequest) encoding.EncodeError!void {
+    try encodeRequestHeader(e, v.request_header);
+    try e.writer.writeInt(u32, v.subscription_id, .little);
+    try encodeEnum(e, TimestampsToReturn, v.timestamps_to_return);
+    try encodeArray(e, MonitoredItemCreateRequest, v.items_to_create, encodeMonitoredItemCreateRequest);
+}
+
+pub fn decodeCreateMonitoredItemsRequest(d: *encoding.Decoder) encoding.DecodeError!CreateMonitoredItemsRequest {
+    return .{
+        .request_header = try decodeRequestHeader(d),
+        .subscription_id = try d.decodeUInt32(),
+        .timestamps_to_return = try decodeEnum(d, TimestampsToReturn),
+        .items_to_create = try decodeArray(d, MonitoredItemCreateRequest, decodeMonitoredItemCreateRequest),
+    };
+}
+
+pub fn freeCreateMonitoredItemsRequest(a: std.mem.Allocator, v: CreateMonitoredItemsRequest) void {
+    freeRequestHeader(a, v.request_header);
+    freeMonitoredItemCreateRequestArray(a, v.items_to_create);
+}
+
+pub const CreateMonitoredItemsResponse = struct {
+    response_header: ResponseHeader,
+    results: ?[]const MonitoredItemCreateResult,
+    diagnostic_infos: ?[]const encoding.DiagnosticInfo,
+};
+
+pub fn encodeCreateMonitoredItemsResponse(e: *encoding.Encoder, v: CreateMonitoredItemsResponse) encoding.EncodeError!void {
+    try encodeResponseHeader(e, v.response_header);
+    try encodeArray(e, MonitoredItemCreateResult, v.results, encodeMonitoredItemCreateResult);
+    try encodeArray(e, encoding.DiagnosticInfo, v.diagnostic_infos, encoding.Encoder.encodeDiagnosticInfo);
+}
+
+pub fn decodeCreateMonitoredItemsResponse(d: *encoding.Decoder) encoding.DecodeError!CreateMonitoredItemsResponse {
+    return .{
+        .response_header = try decodeResponseHeader(d),
+        .results = try decodeArray(d, MonitoredItemCreateResult, decodeMonitoredItemCreateResult),
+        .diagnostic_infos = try decodeArray(d, encoding.DiagnosticInfo, encoding.Decoder.decodeDiagnosticInfo),
+    };
+}
+
+pub fn freeCreateMonitoredItemsResponse(a: std.mem.Allocator, v: CreateMonitoredItemsResponse) void {
+    freeResponseHeader(a, v.response_header);
+    freeMonitoredItemCreateResultArray(a, v.results);
+    freeDiagnosticInfoArray(a, v.diagnostic_infos);
+}
+
+// ── DeleteMonitoredItems (§5.12.6) ───────────────────────────────────────────
+
+pub const DeleteMonitoredItemsRequest = struct {
+    request_header: RequestHeader,
+    subscription_id: u32,
+    monitored_item_ids: ?[]const u32,
+};
+
+pub fn encodeDeleteMonitoredItemsRequest(e: *encoding.Encoder, v: DeleteMonitoredItemsRequest) encoding.EncodeError!void {
+    try encodeRequestHeader(e, v.request_header);
+    try e.writer.writeInt(u32, v.subscription_id, .little);
+    try encodeArray(e, u32, v.monitored_item_ids, encodeU32Item);
+}
+
+pub fn decodeDeleteMonitoredItemsRequest(d: *encoding.Decoder) encoding.DecodeError!DeleteMonitoredItemsRequest {
+    return .{
+        .request_header = try decodeRequestHeader(d),
+        .subscription_id = try d.decodeUInt32(),
+        .monitored_item_ids = try decodeArray(d, u32, decodeU32Item),
+    };
+}
+
+pub fn freeDeleteMonitoredItemsRequest(a: std.mem.Allocator, v: DeleteMonitoredItemsRequest) void {
+    freeRequestHeader(a, v.request_header);
+    freeU32Array(a, v.monitored_item_ids);
+}
+
+pub const DeleteMonitoredItemsResponse = struct {
+    response_header: ResponseHeader,
+    results: ?[]const encoding.StatusCode,
+    diagnostic_infos: ?[]const encoding.DiagnosticInfo,
+};
+
+pub fn encodeDeleteMonitoredItemsResponse(e: *encoding.Encoder, v: DeleteMonitoredItemsResponse) encoding.EncodeError!void {
+    try encodeResponseHeader(e, v.response_header);
+    try encodeArray(e, encoding.StatusCode, v.results, encoding.Encoder.encodeStatusCode);
+    try encodeArray(e, encoding.DiagnosticInfo, v.diagnostic_infos, encoding.Encoder.encodeDiagnosticInfo);
+}
+
+pub fn decodeDeleteMonitoredItemsResponse(d: *encoding.Decoder) encoding.DecodeError!DeleteMonitoredItemsResponse {
+    return .{
+        .response_header = try decodeResponseHeader(d),
+        .results = try decodeArray(d, encoding.StatusCode, encoding.Decoder.decodeStatusCode),
+        .diagnostic_infos = try decodeArray(d, encoding.DiagnosticInfo, encoding.Decoder.decodeDiagnosticInfo),
+    };
+}
+
+pub fn freeDeleteMonitoredItemsResponse(a: std.mem.Allocator, v: DeleteMonitoredItemsResponse) void {
+    freeResponseHeader(a, v.response_header);
+    if (v.results) |r| a.free(r);
+    freeDiagnosticInfoArray(a, v.diagnostic_infos);
+}
+
+// ── NotificationMessage (§5.13.1.2), MonitoredItemNotification (§5.12.1.3),
+// DataChangeNotification/StatusChangeNotification/EventNotificationList
+// (§5.12.1.4/§5.13.6/§5.12.1.5) ──────────────────────────────────────────────
+// `DataChangeNotification`/`StatusChangeNotification`/`EventNotificationList`
+// are the concrete members of the `NotificationData` abstract base (itself
+// field-less — just an `ExtensionObject` tag) that rides inside
+// `NotificationMessage.NotificationData`; `root.zig`'s `Subscription.publish`/
+// `.republish` classify each element by its `ExtensionObject.type_id`
+// (`type_id.data_change_notification`/`.status_change_notification`/
+// `.event_notification_list`) and decode the ones it recognizes.
+
+pub const MonitoredItemNotification = struct {
+    client_handle: u32,
+    value: encoding.DataValue,
+};
+
+pub fn encodeMonitoredItemNotification(e: *encoding.Encoder, v: MonitoredItemNotification) encoding.EncodeError!void {
+    try e.writer.writeInt(u32, v.client_handle, .little);
+    try e.encodeDataValue(v.value);
+}
+
+pub fn decodeMonitoredItemNotification(d: *encoding.Decoder) encoding.DecodeError!MonitoredItemNotification {
+    return .{
+        .client_handle = try d.decodeUInt32(),
+        .value = try d.decodeDataValue(),
+    };
+}
+
+pub fn freeMonitoredItemNotification(a: std.mem.Allocator, v: MonitoredItemNotification) void {
+    encoding.freeDataValue(a, v.value);
+}
+
+fn freeMonitoredItemNotificationArray(a: std.mem.Allocator, arr: ?[]const MonitoredItemNotification) void {
+    if (arr) |items| {
+        for (items) |it| freeMonitoredItemNotification(a, it);
+        a.free(items);
+    }
+}
+
+pub const DataChangeNotification = struct {
+    monitored_items: ?[]const MonitoredItemNotification,
+    diagnostic_infos: ?[]const encoding.DiagnosticInfo,
+};
+
+pub fn encodeDataChangeNotification(e: *encoding.Encoder, v: DataChangeNotification) encoding.EncodeError!void {
+    try encodeArray(e, MonitoredItemNotification, v.monitored_items, encodeMonitoredItemNotification);
+    try encodeArray(e, encoding.DiagnosticInfo, v.diagnostic_infos, encoding.Encoder.encodeDiagnosticInfo);
+}
+
+pub fn decodeDataChangeNotification(d: *encoding.Decoder) encoding.DecodeError!DataChangeNotification {
+    return .{
+        .monitored_items = try decodeArray(d, MonitoredItemNotification, decodeMonitoredItemNotification),
+        .diagnostic_infos = try decodeArray(d, encoding.DiagnosticInfo, encoding.Decoder.decodeDiagnosticInfo),
+    };
+}
+
+pub fn freeDataChangeNotification(a: std.mem.Allocator, v: DataChangeNotification) void {
+    freeMonitoredItemNotificationArray(a, v.monitored_items);
+    freeDiagnosticInfoArray(a, v.diagnostic_infos);
+}
+
+pub const StatusChangeNotification = struct {
+    status: encoding.StatusCode,
+    diagnostic_info: encoding.DiagnosticInfo,
+};
+
+pub fn encodeStatusChangeNotification(e: *encoding.Encoder, v: StatusChangeNotification) encoding.EncodeError!void {
+    try e.encodeStatusCode(v.status);
+    try e.encodeDiagnosticInfo(v.diagnostic_info);
+}
+
+pub fn decodeStatusChangeNotification(d: *encoding.Decoder) encoding.DecodeError!StatusChangeNotification {
+    return .{
+        .status = try d.decodeStatusCode(),
+        .diagnostic_info = try d.decodeDiagnosticInfo(),
+    };
+}
+
+pub fn freeStatusChangeNotification(a: std.mem.Allocator, v: StatusChangeNotification) void {
+    freeDiagnosticInfo(a, v.diagnostic_info);
+}
+
+/// §5.12.1.5's `EventFieldList` — one Event occurrence's selected-field
+/// values (`Variant[]`, order matching the `EventFilter.SelectClauses` the
+/// caller specified when creating the event-monitored item; F1's `no_filter`
+/// means this module never actually builds one, but decoding an incoming
+/// `EventNotificationList` from a server that has one configured server-side
+/// still needs the shape modeled).
+pub const EventFieldList = struct {
+    client_handle: u32,
+    event_fields: ?[]const encoding.Variant,
+};
+
+pub fn encodeEventFieldList(e: *encoding.Encoder, v: EventFieldList) encoding.EncodeError!void {
+    try e.writer.writeInt(u32, v.client_handle, .little);
+    try encodeArray(e, encoding.Variant, v.event_fields, encoding.Encoder.encodeVariant);
+}
+
+pub fn decodeEventFieldList(d: *encoding.Decoder) encoding.DecodeError!EventFieldList {
+    return .{
+        .client_handle = try d.decodeUInt32(),
+        .event_fields = try decodeArray(d, encoding.Variant, encoding.Decoder.decodeVariant),
+    };
+}
+
+pub fn freeEventFieldList(a: std.mem.Allocator, v: EventFieldList) void {
+    freeVariantArray(a, v.event_fields);
+}
+
+fn freeEventFieldListArray(a: std.mem.Allocator, arr: ?[]const EventFieldList) void {
+    if (arr) |items| {
+        for (items) |it| freeEventFieldList(a, it);
+        a.free(items);
+    }
+}
+
+pub const EventNotificationList = struct {
+    events: ?[]const EventFieldList,
+};
+
+pub fn encodeEventNotificationList(e: *encoding.Encoder, v: EventNotificationList) encoding.EncodeError!void {
+    try encodeArray(e, EventFieldList, v.events, encodeEventFieldList);
+}
+
+pub fn decodeEventNotificationList(d: *encoding.Decoder) encoding.DecodeError!EventNotificationList {
+    return .{ .events = try decodeArray(d, EventFieldList, decodeEventFieldList) };
+}
+
+pub fn freeEventNotificationList(a: std.mem.Allocator, v: EventNotificationList) void {
+    freeEventFieldListArray(a, v.events);
+}
+
+pub const NotificationMessage = struct {
+    sequence_number: u32,
+    publish_time: encoding.DateTime,
+    notification_data: ?[]const encoding.ExtensionObject,
+};
+
+pub fn encodeNotificationMessage(e: *encoding.Encoder, v: NotificationMessage) encoding.EncodeError!void {
+    try e.writer.writeInt(u32, v.sequence_number, .little);
+    try e.encodeDateTime(v.publish_time);
+    try encodeArray(e, encoding.ExtensionObject, v.notification_data, encoding.Encoder.encodeExtensionObject);
+}
+
+pub fn decodeNotificationMessage(d: *encoding.Decoder) encoding.DecodeError!NotificationMessage {
+    return .{
+        .sequence_number = try d.decodeUInt32(),
+        .publish_time = try d.decodeDateTime(),
+        .notification_data = try decodeArray(d, encoding.ExtensionObject, encoding.Decoder.decodeExtensionObject),
+    };
+}
+
+/// Frees only the raw `ExtensionObject` envelopes (`TypeId` + body bytes) —
+/// NOT a decode of their bodies (that's `root.zig`'s `Subscription.publish`/
+/// `.republish`'s job, via `decodeDataChangeNotification` & co. on each
+/// element's `.body`). Used both when a caller wants a `NotificationMessage`
+/// freed without ever decoding its contents (e.g. a round-trip test) and, by
+/// `root.zig`, after each `ExtensionObject`'s body has already been decoded
+/// into an owned typed value and this raw form is no longer needed.
+pub fn freeNotificationMessage(a: std.mem.Allocator, v: NotificationMessage) void {
+    if (v.notification_data) |items| {
+        for (items) |eo| {
+            encoding.freeNodeId(a, eo.type_id);
+            if (eo.body.len != 0) a.free(eo.body);
+        }
+        a.free(items);
+    }
+}
+
+// ── SubscriptionAcknowledgement (§5.13.5.2) ──────────────────────────────────
+
+pub const SubscriptionAcknowledgement = struct {
+    subscription_id: u32,
+    sequence_number: u32,
+};
+
+pub fn encodeSubscriptionAcknowledgement(e: *encoding.Encoder, v: SubscriptionAcknowledgement) encoding.EncodeError!void {
+    try e.writer.writeInt(u32, v.subscription_id, .little);
+    try e.writer.writeInt(u32, v.sequence_number, .little);
+}
+
+pub fn decodeSubscriptionAcknowledgement(d: *encoding.Decoder) encoding.DecodeError!SubscriptionAcknowledgement {
+    return .{
+        .subscription_id = try d.decodeUInt32(),
+        .sequence_number = try d.decodeUInt32(),
+    };
+}
+
+fn freeSubscriptionAcknowledgementArray(a: std.mem.Allocator, arr: ?[]const SubscriptionAcknowledgement) void {
+    if (arr) |items| a.free(items);
+}
+
+// ── Publish (§5.13.5) ────────────────────────────────────────────────────────
+
+pub const PublishRequest = struct {
+    request_header: RequestHeader,
+    subscription_acknowledgements: ?[]const SubscriptionAcknowledgement,
+};
+
+pub fn encodePublishRequest(e: *encoding.Encoder, v: PublishRequest) encoding.EncodeError!void {
+    try encodeRequestHeader(e, v.request_header);
+    try encodeArray(e, SubscriptionAcknowledgement, v.subscription_acknowledgements, encodeSubscriptionAcknowledgement);
+}
+
+pub fn decodePublishRequest(d: *encoding.Decoder) encoding.DecodeError!PublishRequest {
+    return .{
+        .request_header = try decodeRequestHeader(d),
+        .subscription_acknowledgements = try decodeArray(d, SubscriptionAcknowledgement, decodeSubscriptionAcknowledgement),
+    };
+}
+
+pub fn freePublishRequest(a: std.mem.Allocator, v: PublishRequest) void {
+    freeRequestHeader(a, v.request_header);
+    freeSubscriptionAcknowledgementArray(a, v.subscription_acknowledgements);
+}
+
+pub const PublishResponse = struct {
+    response_header: ResponseHeader,
+    subscription_id: u32,
+    available_sequence_numbers: ?[]const u32,
+    more_notifications: bool,
+    notification_message: NotificationMessage,
+    results: ?[]const encoding.StatusCode,
+    diagnostic_infos: ?[]const encoding.DiagnosticInfo,
+};
+
+pub fn encodePublishResponse(e: *encoding.Encoder, v: PublishResponse) encoding.EncodeError!void {
+    try encodeResponseHeader(e, v.response_header);
+    try e.writer.writeInt(u32, v.subscription_id, .little);
+    try encodeArray(e, u32, v.available_sequence_numbers, encodeU32Item);
+    try e.encodeBoolean(v.more_notifications);
+    try encodeNotificationMessage(e, v.notification_message);
+    try encodeArray(e, encoding.StatusCode, v.results, encoding.Encoder.encodeStatusCode);
+    try encodeArray(e, encoding.DiagnosticInfo, v.diagnostic_infos, encoding.Encoder.encodeDiagnosticInfo);
+}
+
+pub fn decodePublishResponse(d: *encoding.Decoder) encoding.DecodeError!PublishResponse {
+    return .{
+        .response_header = try decodeResponseHeader(d),
+        .subscription_id = try d.decodeUInt32(),
+        .available_sequence_numbers = try decodeArray(d, u32, decodeU32Item),
+        .more_notifications = try d.decodeBoolean(),
+        .notification_message = try decodeNotificationMessage(d),
+        .results = try decodeArray(d, encoding.StatusCode, encoding.Decoder.decodeStatusCode),
+        .diagnostic_infos = try decodeArray(d, encoding.DiagnosticInfo, encoding.Decoder.decodeDiagnosticInfo),
+    };
+}
+
+pub fn freePublishResponse(a: std.mem.Allocator, v: PublishResponse) void {
+    freeResponseHeader(a, v.response_header);
+    freeU32Array(a, v.available_sequence_numbers);
+    freeNotificationMessage(a, v.notification_message);
+    if (v.results) |r| a.free(r);
+    freeDiagnosticInfoArray(a, v.diagnostic_infos);
+}
+
+// ── Republish (§5.13.6) ──────────────────────────────────────────────────────
+
+pub const RepublishRequest = struct {
+    request_header: RequestHeader,
+    subscription_id: u32,
+    retransmit_sequence_number: u32,
+};
+
+pub fn encodeRepublishRequest(e: *encoding.Encoder, v: RepublishRequest) encoding.EncodeError!void {
+    try encodeRequestHeader(e, v.request_header);
+    try e.writer.writeInt(u32, v.subscription_id, .little);
+    try e.writer.writeInt(u32, v.retransmit_sequence_number, .little);
+}
+
+pub fn decodeRepublishRequest(d: *encoding.Decoder) encoding.DecodeError!RepublishRequest {
+    return .{
+        .request_header = try decodeRequestHeader(d),
+        .subscription_id = try d.decodeUInt32(),
+        .retransmit_sequence_number = try d.decodeUInt32(),
+    };
+}
+
+pub fn freeRepublishRequest(a: std.mem.Allocator, v: RepublishRequest) void {
+    freeRequestHeader(a, v.request_header);
+}
+
+pub const RepublishResponse = struct {
+    response_header: ResponseHeader,
+    notification_message: NotificationMessage,
+};
+
+pub fn encodeRepublishResponse(e: *encoding.Encoder, v: RepublishResponse) encoding.EncodeError!void {
+    try encodeResponseHeader(e, v.response_header);
+    try encodeNotificationMessage(e, v.notification_message);
+}
+
+pub fn decodeRepublishResponse(d: *encoding.Decoder) encoding.DecodeError!RepublishResponse {
+    return .{
+        .response_header = try decodeResponseHeader(d),
+        .notification_message = try decodeNotificationMessage(d),
+    };
+}
+
+pub fn freeRepublishResponse(a: std.mem.Allocator, v: RepublishResponse) void {
+    freeResponseHeader(a, v.response_header);
+    freeNotificationMessage(a, v.notification_message);
+}
+
 // ── Channel: chunked send/recv of one service call ──────────────────────────
 
 /// Per-chunk body buffer and reassembly-scratch sizes. Sized comfortably
@@ -1647,6 +2465,30 @@ fn browseNextResult(r: BrowseNextResponse) encoding.StatusCode {
 fn callResult(r: CallResponse) encoding.StatusCode {
     return r.response_header.service_result;
 }
+fn createSubscriptionResult(r: CreateSubscriptionResponse) encoding.StatusCode {
+    return r.response_header.service_result;
+}
+fn modifySubscriptionResult(r: ModifySubscriptionResponse) encoding.StatusCode {
+    return r.response_header.service_result;
+}
+fn setPublishingModeResult(r: SetPublishingModeResponse) encoding.StatusCode {
+    return r.response_header.service_result;
+}
+fn deleteSubscriptionsResult(r: DeleteSubscriptionsResponse) encoding.StatusCode {
+    return r.response_header.service_result;
+}
+fn createMonitoredItemsResult(r: CreateMonitoredItemsResponse) encoding.StatusCode {
+    return r.response_header.service_result;
+}
+fn deleteMonitoredItemsResult(r: DeleteMonitoredItemsResponse) encoding.StatusCode {
+    return r.response_header.service_result;
+}
+fn publishResult(r: PublishResponse) encoding.StatusCode {
+    return r.response_header.service_result;
+}
+fn republishResult(r: RepublishResponse) encoding.StatusCode {
+    return r.response_header.service_result;
+}
 
 pub const result_fns = struct {
     pub const open_secure_channel = openSecureChannelResult;
@@ -1658,6 +2500,14 @@ pub const result_fns = struct {
     pub const browse = browseResponseResult;
     pub const browse_next = browseNextResult;
     pub const call = callResult;
+    pub const create_subscription = createSubscriptionResult;
+    pub const modify_subscription = modifySubscriptionResult;
+    pub const set_publishing_mode = setPublishingModeResult;
+    pub const delete_subscriptions = deleteSubscriptionsResult;
+    pub const create_monitored_items = createMonitoredItemsResult;
+    pub const delete_monitored_items = deleteMonitoredItemsResult;
+    pub const publish = publishResult;
+    pub const republish = republishResult;
 };
 
 // ── tests ──
@@ -2412,4 +3262,432 @@ test "ServiceFault-shaped ReadResponse: BadServiceResult surfaces via isBad" {
     const decoded = try decodeReadResponse(&d);
     defer freeReadResponse(testing.allocator, decoded);
     try testing.expect(isBad(decoded.response_header.service_result));
+}
+
+// ── Part 5 (Subscriptions/MonitoredItems/Publish) tests ─────────────────────
+
+test "MonitoringMode: ground-truthed constant values" {
+    // OPC Foundation UA-Nodeset Schema/Opc.Ua.Types.bsd `MonitoringMode`
+    // EnumeratedType, fetched directly during implementation.
+    try testing.expectEqual(@as(u32, 0), @intFromEnum(MonitoringMode.disabled));
+    try testing.expectEqual(@as(u32, 1), @intFromEnum(MonitoringMode.sampling));
+    try testing.expectEqual(@as(u32, 2), @intFromEnum(MonitoringMode.reporting));
+}
+
+test "well-known Encoding_DefaultBinary NodeIds: Part 5 constants" {
+    try testing.expectEqualDeep(n0(787), type_id.create_subscription_request);
+    try testing.expectEqualDeep(n0(790), type_id.create_subscription_response);
+    try testing.expectEqualDeep(n0(751), type_id.create_monitored_items_request);
+    try testing.expectEqualDeep(n0(754), type_id.create_monitored_items_response);
+    try testing.expectEqualDeep(n0(826), type_id.publish_request);
+    try testing.expectEqualDeep(n0(829), type_id.publish_response);
+    try testing.expectEqualDeep(n0(811), type_id.data_change_notification);
+    try testing.expectEqualDeep(n0(820), type_id.status_change_notification);
+    try testing.expectEqualDeep(n0(916), type_id.event_notification_list);
+    try testing.expectEqualDeep(n0(847), type_id.delete_subscriptions_request);
+    try testing.expectEqualDeep(n0(850), type_id.delete_subscriptions_response);
+}
+
+test "CreateSubscriptionRequest/Response round-trip" {
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var e = encoding.Encoder.init(&w);
+    const req: CreateSubscriptionRequest = .{
+        .request_header = .{ .authentication_token = null_node_id, .timestamp = 0, .request_handle = 1, .return_diagnostics = 0, .audit_entry_id = null, .timeout_hint = 0, .additional_header = no_additional_header },
+        .requested_publishing_interval = 250.0,
+        .requested_lifetime_count = 10000,
+        .requested_max_keep_alive_count = 10,
+        .max_notifications_per_publish = 0,
+        .publishing_enabled = true,
+        .priority = 0,
+    };
+    try encodeCreateSubscriptionRequest(&e, req);
+    var r: std.Io.Reader = .fixed(w.buffered());
+    var d = encoding.Decoder.init(&r, testing.allocator);
+    const decoded = try decodeCreateSubscriptionRequest(&d);
+    defer freeCreateSubscriptionRequest(testing.allocator, decoded);
+    try testing.expectEqual(@as(f64, 250.0), decoded.requested_publishing_interval);
+    try testing.expectEqual(@as(u32, 10000), decoded.requested_lifetime_count);
+    try testing.expectEqual(true, decoded.publishing_enabled);
+
+    var buf2: [256]u8 = undefined;
+    var w2: std.Io.Writer = .fixed(&buf2);
+    var e2 = encoding.Encoder.init(&w2);
+    const resp: CreateSubscriptionResponse = .{
+        .response_header = .{ .timestamp = 0, .request_handle = 1, .service_result = 0, .service_diagnostics = .{}, .string_table = null, .additional_header = no_additional_header },
+        .subscription_id = 42,
+        .revised_publishing_interval = 250.0,
+        .revised_lifetime_count = 10000,
+        .revised_max_keep_alive_count = 10,
+    };
+    try encodeCreateSubscriptionResponse(&e2, resp);
+    var r2: std.Io.Reader = .fixed(w2.buffered());
+    var d2 = encoding.Decoder.init(&r2, testing.allocator);
+    const decoded2 = try decodeCreateSubscriptionResponse(&d2);
+    defer freeCreateSubscriptionResponse(testing.allocator, decoded2);
+    try testing.expectEqual(@as(u32, 42), decoded2.subscription_id);
+    try testing.expectEqual(@as(u32, 10), decoded2.revised_max_keep_alive_count);
+}
+
+test "ModifySubscriptionRequest/Response + SetPublishingMode + DeleteSubscriptions round-trip" {
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var e = encoding.Encoder.init(&w);
+    const mod_req: ModifySubscriptionRequest = .{
+        .request_header = .{ .authentication_token = null_node_id, .timestamp = 0, .request_handle = 1, .return_diagnostics = 0, .audit_entry_id = null, .timeout_hint = 0, .additional_header = no_additional_header },
+        .subscription_id = 42,
+        .requested_publishing_interval = 500.0,
+        .requested_lifetime_count = 20000,
+        .requested_max_keep_alive_count = 20,
+        .max_notifications_per_publish = 100,
+        .priority = 1,
+    };
+    try encodeModifySubscriptionRequest(&e, mod_req);
+    var r: std.Io.Reader = .fixed(w.buffered());
+    var d = encoding.Decoder.init(&r, testing.allocator);
+    const mod_decoded = try decodeModifySubscriptionRequest(&d);
+    defer freeModifySubscriptionRequest(testing.allocator, mod_decoded);
+    try testing.expectEqual(@as(u32, 42), mod_decoded.subscription_id);
+    try testing.expectEqual(@as(f64, 500.0), mod_decoded.requested_publishing_interval);
+
+    var buf1b: [256]u8 = undefined;
+    var w1b: std.Io.Writer = .fixed(&buf1b);
+    var e1b = encoding.Encoder.init(&w1b);
+    const mod_resp: ModifySubscriptionResponse = .{
+        .response_header = .{ .timestamp = 0, .request_handle = 1, .service_result = 0, .service_diagnostics = .{}, .string_table = null, .additional_header = no_additional_header },
+        .revised_publishing_interval = 500.0,
+        .revised_lifetime_count = 20000,
+        .revised_max_keep_alive_count = 20,
+    };
+    try encodeModifySubscriptionResponse(&e1b, mod_resp);
+    var r1b: std.Io.Reader = .fixed(w1b.buffered());
+    var d1b = encoding.Decoder.init(&r1b, testing.allocator);
+    const mod_resp_decoded = try decodeModifySubscriptionResponse(&d1b);
+    defer freeModifySubscriptionResponse(testing.allocator, mod_resp_decoded);
+    try testing.expectEqual(@as(u32, 20000), mod_resp_decoded.revised_lifetime_count);
+
+    var buf2: [256]u8 = undefined;
+    var w2: std.Io.Writer = .fixed(&buf2);
+    var e2 = encoding.Encoder.init(&w2);
+    const sub_ids = [_]u32{ 42, 43 };
+    const spm_req: SetPublishingModeRequest = .{
+        .request_header = .{ .authentication_token = null_node_id, .timestamp = 0, .request_handle = 2, .return_diagnostics = 0, .audit_entry_id = null, .timeout_hint = 0, .additional_header = no_additional_header },
+        .publishing_enabled = false,
+        .subscription_ids = &sub_ids,
+    };
+    try encodeSetPublishingModeRequest(&e2, spm_req);
+    var r2: std.Io.Reader = .fixed(w2.buffered());
+    var d2 = encoding.Decoder.init(&r2, testing.allocator);
+    const spm_decoded = try decodeSetPublishingModeRequest(&d2);
+    defer freeSetPublishingModeRequest(testing.allocator, spm_decoded);
+    try testing.expectEqual(false, spm_decoded.publishing_enabled);
+    try testing.expectEqual(@as(usize, 2), spm_decoded.subscription_ids.?.len);
+
+    var buf3: [256]u8 = undefined;
+    var w3: std.Io.Writer = .fixed(&buf3);
+    var e3 = encoding.Encoder.init(&w3);
+    const spm_results = [_]encoding.StatusCode{ 0, 0x80740000 };
+    const spm_resp: SetPublishingModeResponse = .{
+        .response_header = .{ .timestamp = 0, .request_handle = 2, .service_result = 0, .service_diagnostics = .{}, .string_table = null, .additional_header = no_additional_header },
+        .results = &spm_results,
+        .diagnostic_infos = null,
+    };
+    try encodeSetPublishingModeResponse(&e3, spm_resp);
+    var r3: std.Io.Reader = .fixed(w3.buffered());
+    var d3 = encoding.Decoder.init(&r3, testing.allocator);
+    const spm_resp_decoded = try decodeSetPublishingModeResponse(&d3);
+    defer freeSetPublishingModeResponse(testing.allocator, spm_resp_decoded);
+    try testing.expect(isBad(spm_resp_decoded.results.?[1]));
+
+    var buf4: [256]u8 = undefined;
+    var w4: std.Io.Writer = .fixed(&buf4);
+    var e4 = encoding.Encoder.init(&w4);
+    const del_req: DeleteSubscriptionsRequest = .{
+        .request_header = .{ .authentication_token = null_node_id, .timestamp = 0, .request_handle = 3, .return_diagnostics = 0, .audit_entry_id = null, .timeout_hint = 0, .additional_header = no_additional_header },
+        .subscription_ids = &sub_ids,
+    };
+    try encodeDeleteSubscriptionsRequest(&e4, del_req);
+    var r4: std.Io.Reader = .fixed(w4.buffered());
+    var d4 = encoding.Decoder.init(&r4, testing.allocator);
+    const del_decoded = try decodeDeleteSubscriptionsRequest(&d4);
+    defer freeDeleteSubscriptionsRequest(testing.allocator, del_decoded);
+    try testing.expectEqual(@as(u32, 43), del_decoded.subscription_ids.?[1]);
+
+    var buf5: [256]u8 = undefined;
+    var w5: std.Io.Writer = .fixed(&buf5);
+    var e5 = encoding.Encoder.init(&w5);
+    const del_results = [_]encoding.StatusCode{ 0, 0 };
+    const del_resp: DeleteSubscriptionsResponse = .{
+        .response_header = .{ .timestamp = 0, .request_handle = 3, .service_result = 0, .service_diagnostics = .{}, .string_table = null, .additional_header = no_additional_header },
+        .results = &del_results,
+        .diagnostic_infos = null,
+    };
+    try encodeDeleteSubscriptionsResponse(&e5, del_resp);
+    var r5: std.Io.Reader = .fixed(w5.buffered());
+    var d5 = encoding.Decoder.init(&r5, testing.allocator);
+    const del_resp_decoded = try decodeDeleteSubscriptionsResponse(&d5);
+    defer freeDeleteSubscriptionsResponse(testing.allocator, del_resp_decoded);
+    try testing.expectEqual(@as(usize, 2), del_resp_decoded.results.?.len);
+}
+
+test "MonitoringParameters/MonitoredItemCreateRequest/CreateMonitoredItemsRequest round-trip (null filter)" {
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var e = encoding.Encoder.init(&w);
+    const items = [_]MonitoredItemCreateRequest{.{
+        .item_to_monitor = .{
+            .node_id = .{ .numeric = .{ .namespace = 0, .id = 2258 } },
+            .attribute_id = attribute_id.value,
+            .index_range = null,
+            .data_encoding = .{ .namespace_index = 0, .name = null },
+        },
+        .monitoring_mode = .reporting,
+        .requested_parameters = .{
+            .client_handle = 1,
+            .sampling_interval = 250.0,
+            .filter = no_filter,
+            .queue_size = 1,
+            .discard_oldest = true,
+        },
+    }};
+    const req: CreateMonitoredItemsRequest = .{
+        .request_header = .{ .authentication_token = null_node_id, .timestamp = 0, .request_handle = 1, .return_diagnostics = 0, .audit_entry_id = null, .timeout_hint = 0, .additional_header = no_additional_header },
+        .subscription_id = 42,
+        .timestamps_to_return = .both,
+        .items_to_create = &items,
+    };
+    try encodeCreateMonitoredItemsRequest(&e, req);
+    var r: std.Io.Reader = .fixed(w.buffered());
+    var d = encoding.Decoder.init(&r, testing.allocator);
+    const decoded = try decodeCreateMonitoredItemsRequest(&d);
+    defer freeCreateMonitoredItemsRequest(testing.allocator, decoded);
+    try testing.expectEqual(@as(u32, 42), decoded.subscription_id);
+    try testing.expectEqual(@as(usize, 1), decoded.items_to_create.?.len);
+    try testing.expectEqual(MonitoringMode.reporting, decoded.items_to_create.?[0].monitoring_mode);
+    try testing.expectEqual(@as(u32, 1), decoded.items_to_create.?[0].requested_parameters.client_handle);
+    try testing.expectEqual(ExtensionObjectEncodingNoBody, decoded.items_to_create.?[0].requested_parameters.filter.encoding);
+}
+
+const ExtensionObjectEncodingNoBody = encoding.ExtensionObjectEncoding.no_body;
+
+test "CreateMonitoredItemsResponse/DeleteMonitoredItems round-trip" {
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var e = encoding.Encoder.init(&w);
+    const results = [_]MonitoredItemCreateResult{.{
+        .status_code = 0,
+        .monitored_item_id = 1,
+        .revised_sampling_interval = 250.0,
+        .revised_queue_size = 1,
+        .filter_result = no_filter,
+    }};
+    const resp: CreateMonitoredItemsResponse = .{
+        .response_header = .{ .timestamp = 0, .request_handle = 1, .service_result = 0, .service_diagnostics = .{}, .string_table = null, .additional_header = no_additional_header },
+        .results = &results,
+        .diagnostic_infos = null,
+    };
+    try encodeCreateMonitoredItemsResponse(&e, resp);
+    var r: std.Io.Reader = .fixed(w.buffered());
+    var d = encoding.Decoder.init(&r, testing.allocator);
+    const decoded = try decodeCreateMonitoredItemsResponse(&d);
+    defer freeCreateMonitoredItemsResponse(testing.allocator, decoded);
+    try testing.expectEqual(@as(u32, 1), decoded.results.?[0].monitored_item_id);
+    try testing.expectEqual(@as(f64, 250.0), decoded.results.?[0].revised_sampling_interval);
+
+    var buf2: [256]u8 = undefined;
+    var w2: std.Io.Writer = .fixed(&buf2);
+    var e2 = encoding.Encoder.init(&w2);
+    const item_ids = [_]u32{1};
+    const del_req: DeleteMonitoredItemsRequest = .{
+        .request_header = .{ .authentication_token = null_node_id, .timestamp = 0, .request_handle = 2, .return_diagnostics = 0, .audit_entry_id = null, .timeout_hint = 0, .additional_header = no_additional_header },
+        .subscription_id = 42,
+        .monitored_item_ids = &item_ids,
+    };
+    try encodeDeleteMonitoredItemsRequest(&e2, del_req);
+    var r2: std.Io.Reader = .fixed(w2.buffered());
+    var d2 = encoding.Decoder.init(&r2, testing.allocator);
+    const del_decoded = try decodeDeleteMonitoredItemsRequest(&d2);
+    defer freeDeleteMonitoredItemsRequest(testing.allocator, del_decoded);
+    try testing.expectEqual(@as(u32, 1), del_decoded.monitored_item_ids.?[0]);
+
+    var buf3: [256]u8 = undefined;
+    var w3: std.Io.Writer = .fixed(&buf3);
+    var e3 = encoding.Encoder.init(&w3);
+    const del_results = [_]encoding.StatusCode{0};
+    const del_resp: DeleteMonitoredItemsResponse = .{
+        .response_header = .{ .timestamp = 0, .request_handle = 2, .service_result = 0, .service_diagnostics = .{}, .string_table = null, .additional_header = no_additional_header },
+        .results = &del_results,
+        .diagnostic_infos = null,
+    };
+    try encodeDeleteMonitoredItemsResponse(&e3, del_resp);
+    var r3: std.Io.Reader = .fixed(w3.buffered());
+    var d3 = encoding.Decoder.init(&r3, testing.allocator);
+    const del_resp_decoded = try decodeDeleteMonitoredItemsResponse(&d3);
+    defer freeDeleteMonitoredItemsResponse(testing.allocator, del_resp_decoded);
+    try testing.expect(!isBad(del_resp_decoded.results.?[0]));
+}
+
+test "NotificationMessage round-trip: DataChangeNotification ExtensionObject decodes back cleanly" {
+    // The shape `root.zig`'s `Subscription.publish` actually parses: a
+    // `NotificationMessage.NotificationData[0]` whose `TypeId` is
+    // `type_id.data_change_notification` and whose body is itself a
+    // binary-encoded `DataChangeNotification`.
+    var dcn_buf: [256]u8 = undefined;
+    var dcn_w: std.Io.Writer = .fixed(&dcn_buf);
+    var dcn_e = encoding.Encoder.init(&dcn_w);
+    const mi_notifications = [_]MonitoredItemNotification{.{
+        .client_handle = 7,
+        .value = .{ .value = .{ .scalar = .{ .date_time = 132223104000000000 } }, .status = 0 },
+    }};
+    try encodeDataChangeNotification(&dcn_e, .{ .monitored_items = &mi_notifications, .diagnostic_infos = null });
+    const dcn_body = dcn_w.buffered();
+
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var e = encoding.Encoder.init(&w);
+    const notif_data = [_]encoding.ExtensionObject{.{
+        .type_id = type_id.data_change_notification,
+        .encoding = .byte_string,
+        .body = dcn_body,
+    }};
+    const msg: NotificationMessage = .{
+        .sequence_number = 1,
+        .publish_time = 0,
+        .notification_data = &notif_data,
+    };
+    try encodeNotificationMessage(&e, msg);
+    var r: std.Io.Reader = .fixed(w.buffered());
+    var d = encoding.Decoder.init(&r, testing.allocator);
+    const decoded = try decodeNotificationMessage(&d);
+    defer freeNotificationMessage(testing.allocator, decoded);
+    try testing.expectEqual(@as(u32, 1), decoded.sequence_number);
+    try testing.expectEqual(@as(usize, 1), decoded.notification_data.?.len);
+    try testing.expect(nodeIdEql(decoded.notification_data.?[0].type_id, type_id.data_change_notification));
+
+    var inner_r: std.Io.Reader = .fixed(decoded.notification_data.?[0].body);
+    var inner_d = encoding.Decoder.init(&inner_r, testing.allocator);
+    const dcn = try decodeDataChangeNotification(&inner_d);
+    defer freeDataChangeNotification(testing.allocator, dcn);
+    try testing.expectEqual(@as(usize, 1), dcn.monitored_items.?.len);
+    try testing.expectEqual(@as(u32, 7), dcn.monitored_items.?[0].client_handle);
+    try testing.expectEqual(@as(encoding.DateTime, 132223104000000000), dcn.monitored_items.?[0].value.value.?.scalar.date_time);
+}
+
+test "StatusChangeNotification/EventNotificationList round-trip" {
+    var buf: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var e = encoding.Encoder.init(&w);
+    const scn: StatusChangeNotification = .{ .status = 0x80730000, .diagnostic_info = .{} }; // BadTimeout-shaped
+    try encodeStatusChangeNotification(&e, scn);
+    var r: std.Io.Reader = .fixed(w.buffered());
+    var d = encoding.Decoder.init(&r, testing.allocator);
+    const decoded = try decodeStatusChangeNotification(&d);
+    defer freeStatusChangeNotification(testing.allocator, decoded);
+    try testing.expect(isBad(decoded.status));
+
+    var buf2: [256]u8 = undefined;
+    var w2: std.Io.Writer = .fixed(&buf2);
+    var e2 = encoding.Encoder.init(&w2);
+    const event_fields = [_]encoding.Variant{.{ .scalar = .{ .int32 = 3 } }};
+    const events = [_]EventFieldList{.{ .client_handle = 9, .event_fields = &event_fields }};
+    const enl: EventNotificationList = .{ .events = &events };
+    try encodeEventNotificationList(&e2, enl);
+    var r2: std.Io.Reader = .fixed(w2.buffered());
+    var d2 = encoding.Decoder.init(&r2, testing.allocator);
+    const enl_decoded = try decodeEventNotificationList(&d2);
+    defer freeEventNotificationList(testing.allocator, enl_decoded);
+    try testing.expectEqual(@as(u32, 9), enl_decoded.events.?[0].client_handle);
+    try testing.expectEqual(@as(i32, 3), enl_decoded.events.?[0].event_fields.?[0].scalar.int32);
+}
+
+test "PublishRequest/Response round-trip (incl. SubscriptionAcknowledgement + DataChangeNotification)" {
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var e = encoding.Encoder.init(&w);
+    const acks = [_]SubscriptionAcknowledgement{.{ .subscription_id = 42, .sequence_number = 1 }};
+    const req: PublishRequest = .{
+        .request_header = .{ .authentication_token = null_node_id, .timestamp = 0, .request_handle = 1, .return_diagnostics = 0, .audit_entry_id = null, .timeout_hint = 0, .additional_header = no_additional_header },
+        .subscription_acknowledgements = &acks,
+    };
+    try encodePublishRequest(&e, req);
+    var r: std.Io.Reader = .fixed(w.buffered());
+    var d = encoding.Decoder.init(&r, testing.allocator);
+    const decoded = try decodePublishRequest(&d);
+    defer freePublishRequest(testing.allocator, decoded);
+    try testing.expectEqual(@as(u32, 42), decoded.subscription_acknowledgements.?[0].subscription_id);
+
+    var dcn_buf: [256]u8 = undefined;
+    var dcn_w: std.Io.Writer = .fixed(&dcn_buf);
+    var dcn_e = encoding.Encoder.init(&dcn_w);
+    const mi_notifications = [_]MonitoredItemNotification{.{
+        .client_handle = 1,
+        .value = .{ .value = .{ .scalar = .{ .double = 21.5 } }, .status = 0 },
+    }};
+    try encodeDataChangeNotification(&dcn_e, .{ .monitored_items = &mi_notifications, .diagnostic_infos = null });
+
+    var buf2: [1024]u8 = undefined;
+    var w2: std.Io.Writer = .fixed(&buf2);
+    var e2 = encoding.Encoder.init(&w2);
+    const notif_data = [_]encoding.ExtensionObject{.{ .type_id = type_id.data_change_notification, .encoding = .byte_string, .body = dcn_w.buffered() }};
+    const avail_seqs = [_]u32{1};
+    const resp: PublishResponse = .{
+        .response_header = .{ .timestamp = 0, .request_handle = 1, .service_result = 0, .service_diagnostics = .{}, .string_table = null, .additional_header = no_additional_header },
+        .subscription_id = 42,
+        .available_sequence_numbers = &avail_seqs,
+        .more_notifications = false,
+        .notification_message = .{ .sequence_number = 1, .publish_time = 0, .notification_data = &notif_data },
+        .results = null,
+        .diagnostic_infos = null,
+    };
+    try encodePublishResponse(&e2, resp);
+    var r2: std.Io.Reader = .fixed(w2.buffered());
+    var d2 = encoding.Decoder.init(&r2, testing.allocator);
+    const decoded2 = try decodePublishResponse(&d2);
+    defer freePublishResponse(testing.allocator, decoded2);
+    try testing.expectEqual(@as(u32, 42), decoded2.subscription_id);
+    try testing.expectEqual(@as(u32, 1), decoded2.available_sequence_numbers.?[0]);
+    try testing.expectEqual(@as(usize, 1), decoded2.notification_message.notification_data.?.len);
+    try testing.expect(nodeIdEql(decoded2.notification_message.notification_data.?[0].type_id, type_id.data_change_notification));
+}
+
+test "RepublishRequest/Response round-trip" {
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var e = encoding.Encoder.init(&w);
+    const req: RepublishRequest = .{
+        .request_header = .{ .authentication_token = null_node_id, .timestamp = 0, .request_handle = 1, .return_diagnostics = 0, .audit_entry_id = null, .timeout_hint = 0, .additional_header = no_additional_header },
+        .subscription_id = 42,
+        .retransmit_sequence_number = 1,
+    };
+    try encodeRepublishRequest(&e, req);
+    var r: std.Io.Reader = .fixed(w.buffered());
+    var d = encoding.Decoder.init(&r, testing.allocator);
+    const decoded = try decodeRepublishRequest(&d);
+    defer freeRepublishRequest(testing.allocator, decoded);
+    try testing.expectEqual(@as(u32, 42), decoded.subscription_id);
+    try testing.expectEqual(@as(u32, 1), decoded.retransmit_sequence_number);
+
+    var buf2: [512]u8 = undefined;
+    var w2: std.Io.Writer = .fixed(&buf2);
+    var e2 = encoding.Encoder.init(&w2);
+    var dcn_buf: [256]u8 = undefined;
+    var dcn_w: std.Io.Writer = .fixed(&dcn_buf);
+    var dcn_e = encoding.Encoder.init(&dcn_w);
+    const mi_notifications = [_]MonitoredItemNotification{.{
+        .client_handle = 1,
+        .value = .{ .value = .{ .scalar = .{ .double = 21.5 } }, .status = 0 },
+    }};
+    try encodeDataChangeNotification(&dcn_e, .{ .monitored_items = &mi_notifications, .diagnostic_infos = null });
+    const notif_data = [_]encoding.ExtensionObject{.{ .type_id = type_id.data_change_notification, .encoding = .byte_string, .body = dcn_w.buffered() }};
+    const resp: RepublishResponse = .{
+        .response_header = .{ .timestamp = 0, .request_handle = 1, .service_result = 0, .service_diagnostics = .{}, .string_table = null, .additional_header = no_additional_header },
+        .notification_message = .{ .sequence_number = 5, .publish_time = 0, .notification_data = &notif_data },
+    };
+    try encodeRepublishResponse(&e2, resp);
+    var r2: std.Io.Reader = .fixed(w2.buffered());
+    var d2 = encoding.Decoder.init(&r2, testing.allocator);
+    const decoded2 = try decodeRepublishResponse(&d2);
+    defer freeRepublishResponse(testing.allocator, decoded2);
+    try testing.expectEqual(@as(u32, 5), decoded2.notification_message.sequence_number);
+    try testing.expectEqual(@as(u32, 5), decoded2.notification_message.sequence_number);
 }

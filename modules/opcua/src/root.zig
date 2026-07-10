@@ -458,6 +458,55 @@ pub const Session = struct {
             services.result_fns.call,
         );
     }
+
+    // ── F3: subscription-list services ──────────────────────────────────────
+    // SetPublishingMode/DeleteSubscriptions operate on a list of subscription
+    // ids (possibly spanning more than one `Subscription` this client is
+    // tracking) — the multi-subscription form; `Subscription.
+    // setPublishingMode`/`.delete` are single-id convenience wrappers over
+    // these two.
+
+    /// SetPublishingMode (OPC 10000-4 §5.13.4) for one or more subscriptions.
+    pub fn setPublishingMode(session: *Session, subscription_ids: []const u32, enabled: bool) services.ServiceError!services.SetPublishingModeResponse {
+        const request: services.SetPublishingModeRequest = .{
+            .request_header = session.channel.io.nextRequestHeader(session.authentication_token, 10_000),
+            .publishing_enabled = enabled,
+            .subscription_ids = subscription_ids,
+        };
+        return services.Channel.call(
+            &session.channel.io,
+            .message,
+            services.type_id.set_publishing_mode_request,
+            services.SetPublishingModeRequest,
+            request,
+            services.encodeSetPublishingModeRequest,
+            services.SetPublishingModeResponse,
+            services.type_id.set_publishing_mode_response,
+            services.decodeSetPublishingModeResponse,
+            services.result_fns.set_publishing_mode,
+        );
+    }
+
+    /// DeleteSubscriptions (OPC 10000-4 §5.13.8) for one or more
+    /// subscriptions.
+    pub fn deleteSubscriptions(session: *Session, subscription_ids: []const u32) services.ServiceError!services.DeleteSubscriptionsResponse {
+        const request: services.DeleteSubscriptionsRequest = .{
+            .request_header = session.channel.io.nextRequestHeader(session.authentication_token, 10_000),
+            .subscription_ids = subscription_ids,
+        };
+        return services.Channel.call(
+            &session.channel.io,
+            .message,
+            services.type_id.delete_subscriptions_request,
+            services.DeleteSubscriptionsRequest,
+            request,
+            services.encodeDeleteSubscriptionsRequest,
+            services.DeleteSubscriptionsResponse,
+            services.type_id.delete_subscriptions_response,
+            services.decodeDeleteSubscriptionsResponse,
+            services.result_fns.delete_subscriptions,
+        );
+    }
 };
 
 // ── F1-d: top-level convenience wrappers ────────────────────────────────────
@@ -488,6 +537,536 @@ pub fn browse(session: *Session, nodes_to_browse: []const services.BrowseDescrip
 pub fn call(session: *Session, methods_to_call: []const services.CallMethodRequest) services.ServiceError!services.CallResponse {
     return session.call(methods_to_call);
 }
+
+// ── F3: Subscriptions / MonitoredItems / Publish (OPC 10000-4 §5.12/§5.13) ──
+// The last reserved part: CreateSubscription/ModifySubscription/
+// SetPublishingMode/DeleteSubscriptions (§5.13.2-4/§5.13.8), CreateMonitoredItems/
+// DeleteMonitoredItems (§5.12.2/§5.12.6), and the Publish/Republish long-poll
+// loop (§5.13.5/§5.13.6) that delivers `NotificationMessage`s — this module's
+// pub-style data-change notification path, the OPC UA feature `read`/`write`
+// polling can't replace. Still no crypto (`SecurityMode=None`, the module's
+// scope throughout); the wire shapes themselves carry no security-relevant
+// content this module would need to sign/encrypt anyway.
+
+/// One decoded `NotificationMessage.NotificationData[i]` — the entry's
+/// `ExtensionObject.TypeId` classifies which concrete `NotificationData`
+/// member it is (OPC 10000-4 §5.13.1.2); `.unrecognized` surfaces a type this
+/// client doesn't decode (e.g. a vendor-specific notification, or one of this
+/// module's own gaps) rather than silently dropping it.
+pub const Notification = union(enum) {
+    /// The common case: one or more monitored items' new values (OPC 10000-4
+    /// §5.12.1.4). Correlate `MonitoredItemNotification.client_handle` back to
+    /// what was actually monitored via `Subscription.findMonitoredItem`.
+    data_change: services.DataChangeNotification,
+    /// A subscription-level status change, e.g. the server is about to
+    /// delete this subscription (OPC 10000-4 §5.13.1.2 note; the notification
+    /// structure itself is §5.13.6's `StatusChangeNotification`).
+    status_change: services.StatusChangeNotification,
+    /// Event-monitored-item occurrences (OPC 10000-4 §5.12.1.5) — this
+    /// module never builds an `EventFilter` (`no_filter` is the only filter
+    /// shape F1 constructs), so a real server would only ever send this if
+    /// somehow configured out-of-band; modeled for decode-completeness.
+    event: services.EventNotificationList,
+    /// An `ExtensionObject` whose `TypeId` didn't match any of the three
+    /// known `NotificationData` members above — owned dup of the type id
+    /// (the original `ExtensionObject` this was read out of is freed once
+    /// every entry has been classified).
+    unrecognized: encoding.NodeId,
+};
+
+/// Frees whichever `Notification` variant is active.
+pub fn freeNotification(a: std.mem.Allocator, n: Notification) void {
+    switch (n) {
+        .data_change => |v| services.freeDataChangeNotification(a, v),
+        .status_change => |v| services.freeStatusChangeNotification(a, v),
+        .event => |v| services.freeEventNotificationList(a, v),
+        .unrecognized => |v| encoding.freeNodeId(a, v),
+    }
+}
+
+fn freeNotificationSlice(a: std.mem.Allocator, notifications: []const Notification) void {
+    for (notifications) |n| freeNotification(a, n);
+    a.free(notifications);
+}
+
+/// An owned copy of a `NodeId` — used only for `Notification.unrecognized`'s
+/// `type_id` (the source `ExtensionObject` it was read from is freed by the
+/// time the caller sees this). Not part of the wire codec (that's
+/// `encoding.zig`'s job, and it has no dup helper of its own since neither
+/// `Encoder`/`Decoder` ever needs one internally) — a small bookkeeping-only
+/// utility local to this module's Publish-decode path.
+fn dupNodeId(a: std.mem.Allocator, v: encoding.NodeId) std.mem.Allocator.Error!encoding.NodeId {
+    return switch (v) {
+        .numeric => |n| .{ .numeric = n },
+        .guid => |n| .{ .guid = n },
+        .string => |n| .{ .string = .{ .namespace = n.namespace, .id = if (n.id) |s| try a.dupe(u8, s) else null } },
+        .byte_string => |n| .{ .byte_string = .{ .namespace = n.namespace, .id = if (n.id) |s| try a.dupe(u8, s) else null } },
+    };
+}
+
+/// Classify and decode each `NotificationMessage.NotificationData[i]`
+/// (`ExtensionObject`) by its `TypeId` — shared by `Subscription.publish`/
+/// `.republish` (OPC 10000-4 §5.13.5/§5.13.6 both deliver the same
+/// `NotificationMessage` shape). Does not touch `notification_data` itself
+/// (the caller frees that raw form afterwards via `services.
+/// freeNotificationMessage`, once every entry's body has been decoded out of
+/// it here).
+fn decodeNotifications(allocator: std.mem.Allocator, notification_data: ?[]const encoding.ExtensionObject) services.ServiceError![]const Notification {
+    const data = notification_data orelse &.{};
+    var list = try std.ArrayList(Notification).initCapacity(allocator, data.len);
+    errdefer {
+        for (list.items) |n| freeNotification(allocator, n);
+        list.deinit(allocator);
+    }
+    for (data) |eo| {
+        if (services.nodeIdEql(eo.type_id, services.type_id.data_change_notification)) {
+            var r: std.Io.Reader = .fixed(eo.body);
+            var d = encoding.Decoder.init(&r, allocator);
+            list.appendAssumeCapacity(.{ .data_change = try services.decodeDataChangeNotification(&d) });
+        } else if (services.nodeIdEql(eo.type_id, services.type_id.status_change_notification)) {
+            var r: std.Io.Reader = .fixed(eo.body);
+            var d = encoding.Decoder.init(&r, allocator);
+            list.appendAssumeCapacity(.{ .status_change = try services.decodeStatusChangeNotification(&d) });
+        } else if (services.nodeIdEql(eo.type_id, services.type_id.event_notification_list)) {
+            var r: std.Io.Reader = .fixed(eo.body);
+            var d = encoding.Decoder.init(&r, allocator);
+            list.appendAssumeCapacity(.{ .event = try services.decodeEventNotificationList(&d) });
+        } else {
+            list.appendAssumeCapacity(.{ .unrecognized = try dupNodeId(allocator, eo.type_id) });
+        }
+    }
+    return try list.toOwnedSlice(allocator);
+}
+
+/// One `Publish`/`Republish` round trip's decoded payload (OPC 10000-4
+/// §5.13.5/§5.13.6) — owned; free with `freePublishResult`.
+pub const PublishResult = struct {
+    subscription_id: u32,
+    sequence_number: u32,
+    publish_time: encoding.DateTime,
+    /// `true` if the server has more notifications already queued for this
+    /// subscription right now — the caller may want to `publish()` again
+    /// immediately rather than however it'd normally pace the loop.
+    more_notifications: bool,
+    /// The decoded `NotificationMessage.NotificationData` — see
+    /// `Notification`.
+    notifications: []const Notification,
+    /// `PublishResponse.AvailableSequenceNumbers` (informational: sequence
+    /// numbers this subscription still has queued server-side). `publish`
+    /// already handles acknowledging the sequence number *this* result
+    /// carries on the *next* `publish()` call — nothing to do with this
+    /// field unless the caller wants to reason about backlog itself.
+    available_sequence_numbers: ?[]const u32,
+    /// `PublishResponse.Results` — the status of each acknowledgement this
+    /// call's request piggy-backed (`null` on the first `publish()` call, or
+    /// any `republish()`, when there was nothing pending to acknowledge yet).
+    ack_results: ?[]const encoding.StatusCode,
+};
+
+/// Frees a `PublishResult` returned by `Subscription.publish`/`.republish`.
+pub fn freePublishResult(a: std.mem.Allocator, r: PublishResult) void {
+    freeNotificationSlice(a, r.notifications);
+    if (r.available_sequence_numbers) |s| a.free(s);
+    if (r.ack_results) |s| a.free(s);
+}
+
+/// CreateSubscription/ModifySubscription/SetPublishingMode/
+/// DeleteSubscriptions (OPC 10000-4 §5.13.2-4/§5.13.8), CreateMonitoredItems/
+/// DeleteMonitoredItems (§5.12.2/§5.12.6), and the Publish/Republish loop
+/// (§5.13.5/§5.13.6) for one subscription on `session`.
+pub const Subscription = struct {
+    session: *Session,
+    allocator: std.mem.Allocator = undefined,
+    subscription_id: u32 = 0,
+    revised_publishing_interval: f64 = 0,
+    revised_lifetime_count: u32 = 0,
+    revised_max_keep_alive_count: u32 = 0,
+    /// Sequence numbers this client has received (via `publish`/`republish`)
+    /// but not yet acknowledged to the server. OPC 10000-4 §5.13.5:
+    /// acknowledgement piggy-backs the *next* `PublishRequest` rather than a
+    /// separate round trip, so `publish()` drains this into that request's
+    /// `SubscriptionAcknowledgements` and clears it at the start of every
+    /// call — the one exception being the very first call, which has nothing
+    /// to drain yet.
+    pending_acks: std.ArrayList(u32) = .empty,
+    /// `ClientHandle` -> `MonitoredItemId` correlation, populated by
+    /// `createMonitoredItems` for whichever items the server actually
+    /// created (a Bad `MonitoredItemCreateResult.StatusCode` is skipped —
+    /// nothing to correlate for an item that doesn't exist server-side).
+    /// `findMonitoredItem` looks a `MonitoredItemNotification.client_handle`
+    /// pulled out of a `publish()` result back up in this table.
+    monitored_items: std.ArrayList(MonitoredItemHandle) = .empty,
+
+    pub const MonitoredItemHandle = struct {
+        client_handle: u32,
+        monitored_item_id: u32,
+    };
+
+    pub const CreateOptions = struct {
+        /// Milliseconds; the server may revise this (`revised_publishing_
+        /// interval`) — 1s is open62541/node-opcua's client-default ballpark.
+        requested_publishing_interval_ms: f64 = 1000,
+        requested_lifetime_count: u32 = 10_000,
+        requested_max_keep_alive_count: u32 = 10,
+        /// 0 = no limit.
+        max_notifications_per_publish: u32 = 0,
+        publishing_enabled: bool = true,
+        priority: u8 = 0,
+        timeout_hint_ms: u32 = 10_000,
+    };
+
+    /// CreateSubscription (OPC 10000-4 §5.13.2).
+    pub fn create(session: *Session, allocator: std.mem.Allocator, options: CreateOptions) services.ServiceError!Subscription {
+        var sub: Subscription = .{ .session = session, .allocator = allocator };
+        const request: services.CreateSubscriptionRequest = .{
+            .request_header = session.channel.io.nextRequestHeader(session.authentication_token, options.timeout_hint_ms),
+            .requested_publishing_interval = options.requested_publishing_interval_ms,
+            .requested_lifetime_count = options.requested_lifetime_count,
+            .requested_max_keep_alive_count = options.requested_max_keep_alive_count,
+            .max_notifications_per_publish = options.max_notifications_per_publish,
+            .publishing_enabled = options.publishing_enabled,
+            .priority = options.priority,
+        };
+        const response = try services.Channel.call(
+            &session.channel.io,
+            .message,
+            services.type_id.create_subscription_request,
+            services.CreateSubscriptionRequest,
+            request,
+            services.encodeCreateSubscriptionRequest,
+            services.CreateSubscriptionResponse,
+            services.type_id.create_subscription_response,
+            services.decodeCreateSubscriptionResponse,
+            services.result_fns.create_subscription,
+        );
+        defer services.freeCreateSubscriptionResponse(allocator, response);
+        sub.subscription_id = response.subscription_id;
+        sub.revised_publishing_interval = response.revised_publishing_interval;
+        sub.revised_lifetime_count = response.revised_lifetime_count;
+        sub.revised_max_keep_alive_count = response.revised_max_keep_alive_count;
+        return sub;
+    }
+
+    pub const ModifyOptions = struct {
+        requested_publishing_interval_ms: f64,
+        requested_lifetime_count: u32,
+        requested_max_keep_alive_count: u32,
+        max_notifications_per_publish: u32 = 0,
+        priority: u8 = 0,
+        timeout_hint_ms: u32 = 10_000,
+    };
+
+    /// ModifySubscription (OPC 10000-4 §5.13.3).
+    pub fn modify(sub: *Subscription, options: ModifyOptions) services.ServiceError!void {
+        const request: services.ModifySubscriptionRequest = .{
+            .request_header = sub.session.channel.io.nextRequestHeader(sub.session.authentication_token, options.timeout_hint_ms),
+            .subscription_id = sub.subscription_id,
+            .requested_publishing_interval = options.requested_publishing_interval_ms,
+            .requested_lifetime_count = options.requested_lifetime_count,
+            .requested_max_keep_alive_count = options.requested_max_keep_alive_count,
+            .max_notifications_per_publish = options.max_notifications_per_publish,
+            .priority = options.priority,
+        };
+        const response = try services.Channel.call(
+            &sub.session.channel.io,
+            .message,
+            services.type_id.modify_subscription_request,
+            services.ModifySubscriptionRequest,
+            request,
+            services.encodeModifySubscriptionRequest,
+            services.ModifySubscriptionResponse,
+            services.type_id.modify_subscription_response,
+            services.decodeModifySubscriptionResponse,
+            services.result_fns.modify_subscription,
+        );
+        defer services.freeModifySubscriptionResponse(sub.allocator, response);
+        sub.revised_publishing_interval = response.revised_publishing_interval;
+        sub.revised_lifetime_count = response.revised_lifetime_count;
+        sub.revised_max_keep_alive_count = response.revised_max_keep_alive_count;
+    }
+
+    /// SetPublishingMode (OPC 10000-4 §5.13.4) for just this subscription —
+    /// the service itself operates on a list (see `Session.setPublishingMode`
+    /// for the multi-subscription form).
+    pub fn setPublishingMode(sub: *Subscription, enabled: bool) services.ServiceError!void {
+        const response = try sub.session.setPublishingMode(&.{sub.subscription_id}, enabled);
+        services.freeSetPublishingModeResponse(sub.allocator, response);
+    }
+
+    /// DeleteSubscriptions (OPC 10000-4 §5.13.8) for just this subscription.
+    /// After this call `sub` no longer names anything server-side; only
+    /// `deinit` (freeing local bookkeeping) is safe to call on it.
+    pub fn delete(sub: *Subscription) services.ServiceError!void {
+        const response = try sub.session.deleteSubscriptions(&.{sub.subscription_id});
+        services.freeDeleteSubscriptionsResponse(sub.allocator, response);
+    }
+
+    pub const MonitoredItemSpec = struct {
+        node_id: encoding.NodeId,
+        attribute_id: u32 = services.attribute_id.value,
+        /// Caller-chosen; echoed back on every `MonitoredItemNotification`
+        /// for this item (OPC 10000-4 §5.12.1.3) — `findMonitoredItem`
+        /// correlates it back to `MonitoredItemCreateResult.
+        /// monitored_item_id`. Must be unique within this `Subscription`.
+        client_handle: u32,
+        /// Milliseconds; `-1` (the OPC UA convention this defaults to) asks
+        /// the server for its fastest practical rate — the common "just tell
+        /// me when it changes" case. The server may revise this down to the
+        /// Subscription's own publishing interval or up to a minimum it
+        /// enforces (`MonitoredItemCreateResult.revised_sampling_interval`).
+        sampling_interval_ms: f64 = -1,
+        queue_size: u32 = 1,
+        discard_oldest: bool = true,
+        monitoring_mode: services.MonitoringMode = .reporting,
+    };
+
+    /// CreateMonitoredItems (OPC 10000-4 §5.12.2), no filter (`services.
+    /// no_filter` — deadband/event filters are out of this module's scope,
+    /// same as F1's crypto non-goal doc comment). Records a `ClientHandle` ->
+    /// `MonitoredItemId` entry in `monitored_items` for every `spec` the
+    /// server actually created (skips ones whose `MonitoredItemCreateResult.
+    /// status_code` came back Bad). Caller frees the returned response with
+    /// `services.freeCreateMonitoredItemsResponse`.
+    pub fn createMonitoredItems(sub: *Subscription, specs: []const MonitoredItemSpec, timestamps_to_return: services.TimestampsToReturn) services.ServiceError!services.CreateMonitoredItemsResponse {
+        var items = try std.ArrayList(services.MonitoredItemCreateRequest).initCapacity(sub.allocator, specs.len);
+        defer items.deinit(sub.allocator);
+        for (specs) |spec| {
+            items.appendAssumeCapacity(.{
+                .item_to_monitor = .{
+                    .node_id = spec.node_id,
+                    .attribute_id = spec.attribute_id,
+                    .index_range = null,
+                    .data_encoding = .{ .namespace_index = 0, .name = null },
+                },
+                .monitoring_mode = spec.monitoring_mode,
+                .requested_parameters = .{
+                    .client_handle = spec.client_handle,
+                    .sampling_interval = spec.sampling_interval_ms,
+                    .filter = services.no_filter,
+                    .queue_size = spec.queue_size,
+                    .discard_oldest = spec.discard_oldest,
+                },
+            });
+        }
+        const request: services.CreateMonitoredItemsRequest = .{
+            .request_header = sub.session.channel.io.nextRequestHeader(sub.session.authentication_token, 10_000),
+            .subscription_id = sub.subscription_id,
+            .timestamps_to_return = timestamps_to_return,
+            .items_to_create = items.items,
+        };
+        const response = try services.Channel.call(
+            &sub.session.channel.io,
+            .message,
+            services.type_id.create_monitored_items_request,
+            services.CreateMonitoredItemsRequest,
+            request,
+            services.encodeCreateMonitoredItemsRequest,
+            services.CreateMonitoredItemsResponse,
+            services.type_id.create_monitored_items_response,
+            services.decodeCreateMonitoredItemsResponse,
+            services.result_fns.create_monitored_items,
+        );
+        if (response.results) |results| {
+            for (results, 0..) |r, i| {
+                if (i >= specs.len) break;
+                if (services.isBad(r.status_code)) continue;
+                try sub.monitored_items.append(sub.allocator, .{ .client_handle = specs[i].client_handle, .monitored_item_id = r.monitored_item_id });
+            }
+        }
+        return response;
+    }
+
+    /// DeleteMonitoredItems (OPC 10000-4 §5.12.6). Drops every matching
+    /// `monitored_items` bookkeeping entry regardless of the per-item result
+    /// status — a caller asking to delete something this `Subscription` no
+    /// longer has a record of is harmless, but keeping a stale entry around
+    /// after asking the server to delete it would be worse (a later
+    /// notification could never legitimately arrive for it again). Caller
+    /// frees the returned response with `services.
+    /// freeDeleteMonitoredItemsResponse`.
+    pub fn deleteMonitoredItems(sub: *Subscription, monitored_item_ids: []const u32) services.ServiceError!services.DeleteMonitoredItemsResponse {
+        const request: services.DeleteMonitoredItemsRequest = .{
+            .request_header = sub.session.channel.io.nextRequestHeader(sub.session.authentication_token, 10_000),
+            .subscription_id = sub.subscription_id,
+            .monitored_item_ids = monitored_item_ids,
+        };
+        const response = try services.Channel.call(
+            &sub.session.channel.io,
+            .message,
+            services.type_id.delete_monitored_items_request,
+            services.DeleteMonitoredItemsRequest,
+            request,
+            services.encodeDeleteMonitoredItemsRequest,
+            services.DeleteMonitoredItemsResponse,
+            services.type_id.delete_monitored_items_response,
+            services.decodeDeleteMonitoredItemsResponse,
+            services.result_fns.delete_monitored_items,
+        );
+        var i: usize = 0;
+        while (i < sub.monitored_items.items.len) {
+            var found = false;
+            for (monitored_item_ids) |id| {
+                if (sub.monitored_items.items[i].monitored_item_id == id) {
+                    found = true;
+                    break;
+                }
+            }
+            if (found) {
+                _ = sub.monitored_items.swapRemove(i);
+            } else {
+                i += 1;
+            }
+        }
+        return response;
+    }
+
+    /// Look up the `MonitoredItemId` a `MonitoredItemNotification.
+    /// client_handle` (from a decoded `.data_change` `Notification`)
+    /// correlates to — the "which monitored item was this?" ergonomic helper
+    /// `createMonitoredItems` populates the bookkeeping for.
+    pub fn findMonitoredItem(sub: *const Subscription, client_handle: u32) ?u32 {
+        for (sub.monitored_items.items) |mih| {
+            if (mih.client_handle == client_handle) return mih.monitored_item_id;
+        }
+        return null;
+    }
+
+    pub const PublishOptions = struct {
+        /// `RequestHeader.TimeoutHint`, milliseconds. `0` (the default) means
+        /// "no timeout": Publish is meant to long-poll (OPC 10000-4 §5.13.5) —
+        /// the server itself bounds how long it holds the request open,
+        /// around `revised_max_keep_alive_count * revised_publishing_interval`.
+        timeout_hint_ms: u32 = 0,
+    };
+
+    /// Publish (OPC 10000-4 §5.13.5): send one `PublishRequest` —
+    /// acknowledging whatever sequence number the previous `publish`/
+    /// `republish` call on this `Subscription` returned (see `pending_acks`)
+    /// — and decode the response's `NotificationMessage`. The caller is
+    /// expected to call this in a loop: each call blocks (a normal
+    /// request/response over the same `Channel` every other service uses)
+    /// until the server has something to report or its keep-alive interval
+    /// elapses. Nothing further to do beyond freeing the returned
+    /// `PublishResult` with `freePublishResult` — acknowledgement bookkeeping
+    /// is handled automatically on the *next* call.
+    pub fn publish(sub: *Subscription, options: PublishOptions) services.ServiceError!PublishResult {
+        var acks = try std.ArrayList(services.SubscriptionAcknowledgement).initCapacity(sub.allocator, sub.pending_acks.items.len);
+        defer acks.deinit(sub.allocator);
+        for (sub.pending_acks.items) |seq| acks.appendAssumeCapacity(.{ .subscription_id = sub.subscription_id, .sequence_number = seq });
+        sub.pending_acks.clearRetainingCapacity();
+
+        const request: services.PublishRequest = .{
+            .request_header = sub.session.channel.io.nextRequestHeader(sub.session.authentication_token, options.timeout_hint_ms),
+            .subscription_acknowledgements = if (acks.items.len == 0) null else acks.items,
+        };
+        const response = try services.Channel.call(
+            &sub.session.channel.io,
+            .message,
+            services.type_id.publish_request,
+            services.PublishRequest,
+            request,
+            services.encodePublishRequest,
+            services.PublishResponse,
+            services.type_id.publish_response,
+            services.decodePublishResponse,
+            services.result_fns.publish,
+        );
+        services.freeResponseHeader(sub.allocator, response.response_header);
+        errdefer {
+            if (response.available_sequence_numbers) |s| sub.allocator.free(s);
+            services.freeNotificationMessage(sub.allocator, response.notification_message);
+            if (response.results) |r| sub.allocator.free(r);
+            if (response.diagnostic_infos) |infos| {
+                for (infos) |di| services.freeDiagnosticInfo(sub.allocator, di);
+                sub.allocator.free(infos);
+            }
+        }
+
+        const notifications = try decodeNotifications(sub.allocator, response.notification_message.notification_data);
+        errdefer freeNotificationSlice(sub.allocator, notifications);
+
+        try sub.pending_acks.append(sub.allocator, response.notification_message.sequence_number);
+
+        const sequence_number = response.notification_message.sequence_number;
+        const publish_time = response.notification_message.publish_time;
+        services.freeNotificationMessage(sub.allocator, response.notification_message);
+        if (response.diagnostic_infos) |infos| {
+            for (infos) |di| services.freeDiagnosticInfo(sub.allocator, di);
+            sub.allocator.free(infos);
+        }
+
+        return .{
+            .subscription_id = response.subscription_id,
+            .sequence_number = sequence_number,
+            .publish_time = publish_time,
+            .more_notifications = response.more_notifications,
+            .notifications = notifications,
+            .available_sequence_numbers = response.available_sequence_numbers,
+            .ack_results = response.results,
+        };
+    }
+
+    pub const RepublishOptions = struct {
+        timeout_hint_ms: u32 = 10_000,
+    };
+
+    /// Republish (OPC 10000-4 §5.13.6): re-request a `NotificationMessage`
+    /// the server already sent once but this client never acknowledged (its
+    /// sequence number is still in `PublishResponse.AvailableSequenceNumbers`
+    /// server-side — e.g. after a dropped/reconnected `Channel`). The
+    /// returned message still needs acknowledging like any other `publish()`
+    /// result — this queues its sequence number onto `pending_acks` the same
+    /// way.
+    pub fn republish(sub: *Subscription, retransmit_sequence_number: u32, options: RepublishOptions) services.ServiceError!PublishResult {
+        const request: services.RepublishRequest = .{
+            .request_header = sub.session.channel.io.nextRequestHeader(sub.session.authentication_token, options.timeout_hint_ms),
+            .subscription_id = sub.subscription_id,
+            .retransmit_sequence_number = retransmit_sequence_number,
+        };
+        const response = try services.Channel.call(
+            &sub.session.channel.io,
+            .message,
+            services.type_id.republish_request,
+            services.RepublishRequest,
+            request,
+            services.encodeRepublishRequest,
+            services.RepublishResponse,
+            services.type_id.republish_response,
+            services.decodeRepublishResponse,
+            services.result_fns.republish,
+        );
+        services.freeResponseHeader(sub.allocator, response.response_header);
+        errdefer services.freeNotificationMessage(sub.allocator, response.notification_message);
+
+        const notifications = try decodeNotifications(sub.allocator, response.notification_message.notification_data);
+        errdefer freeNotificationSlice(sub.allocator, notifications);
+
+        const sequence_number = response.notification_message.sequence_number;
+        const publish_time = response.notification_message.publish_time;
+        services.freeNotificationMessage(sub.allocator, response.notification_message);
+
+        try sub.pending_acks.append(sub.allocator, sequence_number);
+
+        return .{
+            .subscription_id = sub.subscription_id,
+            .sequence_number = sequence_number,
+            .publish_time = publish_time,
+            .more_notifications = false,
+            .notifications = notifications,
+            .available_sequence_numbers = null,
+            .ack_results = null,
+        };
+    }
+
+    /// Frees local bookkeeping (`pending_acks`/`monitored_items`) — does
+    /// *not* call `delete` (this module never does I/O implicitly); safe to
+    /// call whether or not `delete`/`Session.deleteSubscriptions` was called
+    /// first, or if `create` never succeeded.
+    pub fn deinit(sub: *Subscription) void {
+        sub.pending_acks.deinit(sub.allocator);
+        sub.monitored_items.deinit(sub.allocator);
+    }
+};
 
 // ── tests ──
 
@@ -778,6 +1357,146 @@ test "Session.readAttribute: single-node/single-attribute ergonomic helper" {
     try testing.expectEqual(@as(f64, 21.5), dv.value.?.scalar.double);
 }
 
+test "Subscription offline flow: CreateSubscription -> CreateMonitoredItems -> Publish(DataChangeNotification) -> ack next Publish -> DeleteSubscriptions" {
+    // Same technique as the "full offline flow" test above: hand-render a
+    // sequence of MSG responses (all ride plain `.message` chunks — none of
+    // Part 5's services are OPN/CLO-framed) and drive `Subscription` against
+    // them over a bare `SecureChannel`/`Session`, the same way the
+    // `Session.readAttribute` test above drives a bare `Channel` without
+    // `SecureChannel.open`'s full handshake.
+    const testing = std.testing;
+
+    const render = struct {
+        fn frame(w: *std.Io.Writer, request_id: u32, comptime Body: type, body: Body, comptime encodeFn: fn (*encoding.Encoder, Body) encoding.EncodeError!void, type_id: encoding.NodeId) !void {
+            var body_alloc = std.Io.Writer.Allocating.init(testing.allocator);
+            defer body_alloc.deinit();
+            var e = encoding.Encoder.init(&body_alloc.writer);
+            try e.writer.writeInt(u32, 7, .little); // SecureChannelId
+            try e.writer.writeInt(u32, 3, .little); // TokenId
+            try e.writer.writeInt(u32, request_id, .little); // SequenceNumber
+            try e.writer.writeInt(u32, request_id, .little); // RequestId
+            try e.encodeNodeId(type_id);
+            try encodeFn(&e, body);
+            const frame_body = body_alloc.writer.buffered();
+            var conn = transport.Connection.init(undefined, w);
+            try conn.sendChunk(.{ .message_type = .message, .chunk_type = .final, .message_size = 8 + @as(u32, @intCast(frame_body.len)) }, frame_body);
+        }
+    }.frame;
+
+    var server_buf: [8192]u8 = undefined;
+    var server_w: std.Io.Writer = .fixed(&server_buf);
+
+    try render(&server_w, 1, services.CreateSubscriptionResponse, .{
+        .response_header = .{ .timestamp = 0, .request_handle = 1, .service_result = 0, .service_diagnostics = .{}, .string_table = null, .additional_header = services.no_additional_header },
+        .subscription_id = 1,
+        .revised_publishing_interval = 250.0,
+        .revised_lifetime_count = 10000,
+        .revised_max_keep_alive_count = 10,
+    }, services.encodeCreateSubscriptionResponse, services.type_id.create_subscription_response);
+
+    const cmi_results = [_]services.MonitoredItemCreateResult{.{
+        .status_code = 0,
+        .monitored_item_id = 1,
+        .revised_sampling_interval = 250.0,
+        .revised_queue_size = 1,
+        .filter_result = services.no_filter,
+    }};
+    try render(&server_w, 2, services.CreateMonitoredItemsResponse, .{
+        .response_header = .{ .timestamp = 0, .request_handle = 2, .service_result = 0, .service_diagnostics = .{}, .string_table = null, .additional_header = services.no_additional_header },
+        .results = &cmi_results,
+        .diagnostic_infos = null,
+    }, services.encodeCreateMonitoredItemsResponse, services.type_id.create_monitored_items_response);
+
+    var dcn_buf: [256]u8 = undefined;
+    var dcn_w: std.Io.Writer = .fixed(&dcn_buf);
+    var dcn_e = encoding.Encoder.init(&dcn_w);
+    const mi_notifications = [_]services.MonitoredItemNotification{.{
+        .client_handle = 1,
+        .value = .{ .value = .{ .scalar = .{ .date_time = 132223104000000000 } }, .status = 0 },
+    }};
+    try services.encodeDataChangeNotification(&dcn_e, .{ .monitored_items = &mi_notifications, .diagnostic_infos = null });
+    const notif_data_1 = [_]encoding.ExtensionObject{.{ .type_id = services.type_id.data_change_notification, .encoding = .byte_string, .body = dcn_w.buffered() }};
+    try render(&server_w, 3, services.PublishResponse, .{
+        .response_header = .{ .timestamp = 0, .request_handle = 3, .service_result = 0, .service_diagnostics = .{}, .string_table = null, .additional_header = services.no_additional_header },
+        .subscription_id = 1,
+        .available_sequence_numbers = null,
+        .more_notifications = false,
+        .notification_message = .{ .sequence_number = 1, .publish_time = 0, .notification_data = &notif_data_1 },
+        .results = null,
+        .diagnostic_infos = null,
+    }, services.encodePublishResponse, services.type_id.publish_response);
+
+    const ack_results = [_]encoding.StatusCode{0};
+    try render(&server_w, 4, services.PublishResponse, .{
+        .response_header = .{ .timestamp = 0, .request_handle = 4, .service_result = 0, .service_diagnostics = .{}, .string_table = null, .additional_header = services.no_additional_header },
+        .subscription_id = 1,
+        .available_sequence_numbers = null,
+        .more_notifications = false,
+        .notification_message = .{ .sequence_number = 2, .publish_time = 0, .notification_data = null }, // keep-alive
+        .results = &ack_results, // ack of sequence 1 succeeded
+        .diagnostic_infos = null,
+    }, services.encodePublishResponse, services.type_id.publish_response);
+
+    const del_results = [_]encoding.StatusCode{0};
+    try render(&server_w, 5, services.DeleteSubscriptionsResponse, .{
+        .response_header = .{ .timestamp = 0, .request_handle = 5, .service_result = 0, .service_diagnostics = .{}, .string_table = null, .additional_header = services.no_additional_header },
+        .results = &del_results,
+        .diagnostic_infos = null,
+    }, services.encodeDeleteSubscriptionsResponse, services.type_id.delete_subscriptions_response);
+
+    var client_out_buf: [8192]u8 = undefined;
+    var client_out_w: std.Io.Writer = .fixed(&client_out_buf);
+    var client_in_r: std.Io.Reader = .fixed(server_w.buffered());
+    var conn = transport.Connection.init(&client_in_r, &client_out_w);
+    var ch: SecureChannel = .{ .io = .{ .conn = &conn, .allocator = testing.allocator, .channel_id = 7, .token_id = 3 } };
+    var session: Session = .{ .channel = &ch, .allocator = testing.allocator, .authentication_token = services.null_node_id };
+
+    var sub = try Subscription.create(&session, testing.allocator, .{ .requested_publishing_interval_ms = 250.0 });
+    defer sub.deinit();
+    try testing.expectEqual(@as(u32, 1), sub.subscription_id);
+    try testing.expectEqual(@as(f64, 250.0), sub.revised_publishing_interval);
+
+    const cmi_specs = [_]Subscription.MonitoredItemSpec{.{
+        .node_id = .{ .numeric = .{ .namespace = 0, .id = 2258 } },
+        .client_handle = 1,
+        .sampling_interval_ms = 250.0,
+    }};
+    const cmi_resp = try sub.createMonitoredItems(&cmi_specs, .both);
+    defer services.freeCreateMonitoredItemsResponse(testing.allocator, cmi_resp);
+    try testing.expectEqual(@as(usize, 1), sub.monitored_items.items.len);
+    try testing.expectEqual(@as(u32, 1), sub.findMonitoredItem(1).?);
+
+    // First publish: nothing pending to acknowledge yet, returns a
+    // DataChangeNotification whose client_handle correlates back to
+    // monitored_item_id 1 via `findMonitoredItem`.
+    try testing.expectEqual(@as(usize, 0), sub.pending_acks.items.len);
+    const pub1 = try sub.publish(.{});
+    defer freePublishResult(testing.allocator, pub1);
+    try testing.expectEqual(@as(usize, 1), pub1.notifications.len);
+    try testing.expect(pub1.notifications[0] == .data_change);
+    const dc = pub1.notifications[0].data_change;
+    try testing.expectEqual(@as(usize, 1), dc.monitored_items.?.len);
+    try testing.expectEqual(@as(u32, 1), dc.monitored_items.?[0].client_handle);
+    try testing.expectEqual(@as(u32, 1), sub.findMonitoredItem(dc.monitored_items.?[0].client_handle).?);
+    try testing.expectEqual(@as(encoding.DateTime, 132223104000000000), dc.monitored_items.?[0].value.value.?.scalar.date_time);
+    // Sequence number 1 is now queued to be acknowledged on the *next* Publish.
+    try testing.expectEqual(@as(usize, 1), sub.pending_acks.items.len);
+    try testing.expectEqual(@as(u32, 1), sub.pending_acks.items[0]);
+
+    // Second publish: drains+acks seq 1, gets back a keep-alive (empty
+    // notification_data) plus that ack's result.
+    const pub2 = try sub.publish(.{});
+    defer freePublishResult(testing.allocator, pub2);
+    try testing.expectEqual(@as(usize, 0), pub2.notifications.len);
+    try testing.expectEqual(@as(usize, 1), pub2.ack_results.?.len);
+    try testing.expect(!services.isBad(pub2.ack_results.?[0]));
+    // This response's own new sequence number (2) is now queued for next time.
+    try testing.expectEqual(@as(usize, 1), sub.pending_acks.items.len);
+    try testing.expectEqual(@as(u32, 2), sub.pending_acks.items[0]);
+
+    try sub.delete();
+}
+
 // ── LIVE open62541 interop (the real oracle) ────────────────────────────────
 // Not gated behind offline-only: this exercises the exact same client code
 // path against a real `open62541` server (`docker.io/open62541/open62541`,
@@ -849,12 +1568,16 @@ fn sleepMs(ms: u64) void {
     _ = std.os.linux.nanosleep(&ts, null);
 }
 
-/// Best-effort stop+remove of the live-test container — used both as
+/// Best-effort stop+remove of a live-test container by name — used both as
 /// leftover-cleanup before starting and as the `defer`'d teardown after
 /// (including on test failure: registered right after the container starts).
-fn stopLiveContainer(gpa: std.mem.Allocator, io: std.Io) void {
-    var result = runPodman(gpa, io, &.{ "stop", "-t", "1", live_container_name }) catch return;
+fn stopContainer(gpa: std.mem.Allocator, io: std.Io, name: []const u8) void {
+    var result = runPodman(gpa, io, &.{ "stop", "-t", "1", name }) catch return;
     result.deinit(gpa);
+}
+
+fn stopLiveContainer(gpa: std.mem.Allocator, io: std.Io) void {
+    stopContainer(gpa, io, live_container_name);
 }
 
 test "LIVE open62541 interop: connect -> OPN(None) -> CreateSession -> ActivateSession -> Read/Browse/Write/Call -> close" {
@@ -1027,4 +1750,166 @@ test "LIVE open62541 interop: connect -> OPN(None) -> CreateSession -> ActivateS
         // the response are both "decoded cleanly, didn't crash" outcomes.
         try testing.expect(err == error.ServiceFault or err == error.BadServiceResult);
     }
+}
+
+const live_subs_container_name = "opcua-zig-libs-live-test-subs";
+
+test "LIVE open62541 interop: subscriptions -> CreateSubscription -> CreateMonitoredItems -> Publish -> DataChangeNotification -> ack -> DeleteSubscriptions" {
+    // A separate container (own name/port-independent-but-same-host-network,
+    // started/torn down within this test) rather than folding this into the
+    // Read/Browse/Write/Call LIVE test above — keeps the two independently
+    // rerunnable and keeps this test's failure blast radius from taking the
+    // other down with it.
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    stopContainer(gpa, io, live_subs_container_name); // leftover cleanup, best-effort
+
+    var run_result = runPodman(gpa, io, &.{
+        "run",    "--rm",                   "-d",           "--network",                            "host",
+        "--name", live_subs_container_name, "--pull=never", "docker.io/open62541/open62541:latest",
+    }) catch |err| switch (err) {
+        error.SkipZigTest => {
+            std.debug.print("\nLIVE opcua subscriptions test SKIPPED: `podman` is not available in this environment.\n", .{});
+            return error.SkipZigTest;
+        },
+        else => return err,
+    };
+    defer run_result.deinit(gpa);
+    if (run_result.exit_code != 0) {
+        std.debug.print(
+            "\nLIVE opcua subscriptions test SKIPPED: `podman run` failed (image not pulled / podman unusable here).\nstderr: {s}\n",
+            .{run_result.stderr},
+        );
+        return error.SkipZigTest;
+    }
+    defer stopContainer(gpa, io, live_subs_container_name);
+
+    var stream: std.Io.net.Stream = blk: {
+        var attempt: usize = 0;
+        while (attempt < 60) : (attempt += 1) {
+            const addr = std.Io.net.IpAddress.parse("127.0.0.1", 4840) catch unreachable;
+            if (addr.connect(io, .{ .mode = .stream })) |s| break :blk s else |_| {}
+            sleepMs(250);
+        }
+        std.debug.print("\nLIVE opcua subscriptions test SKIPPED: could not connect to opc.tcp://127.0.0.1:4840 within 15s.\n", .{});
+        return error.SkipZigTest;
+    };
+    defer stream.close(io);
+
+    var read_buf: [8192]u8 = undefined;
+    var write_buf: [8192]u8 = undefined;
+    var stream_reader = stream.reader(io, &read_buf);
+    var stream_writer = stream.writer(io, &write_buf);
+    var conn = transport.Connection.init(&stream_reader.interface, &stream_writer.interface);
+    _ = try conn.hello(.{
+        .protocol_version = 0,
+        .receive_buffer_size = 65536,
+        .send_buffer_size = 65536,
+        .max_message_size = 0,
+        .max_chunk_count = 0,
+        .endpoint_url = live_endpoint_url,
+    });
+
+    var ch = try SecureChannel.open(&conn, gpa, .{});
+    defer ch.close() catch {};
+
+    var session = try Session.create(&ch, gpa, .{
+        .client_description = .{
+            .application_uri = "urn:zig-libs:opcua:client",
+            .product_uri = "urn:zig-libs:opcua",
+            .application_name = .{ .locale = "en", .text = "zig-libs opcua client" },
+            .application_type = .client,
+            .gateway_server_uri = null,
+            .discovery_profile_uri = null,
+            .discovery_urls = null,
+        },
+        .endpoint_url = live_endpoint_url,
+    });
+    defer session.deinit();
+    try session.activate(null);
+    defer session.close(false) catch {};
+
+    // ── CreateSubscription: fast publishing interval so i=2258 (Server
+    // CurrentTime, changes every tick) produces a notification quickly.
+    var sub = try Subscription.create(&session, gpa, .{
+        .requested_publishing_interval_ms = 250.0,
+        .requested_max_keep_alive_count = 20,
+        .requested_lifetime_count = 200,
+    });
+    defer sub.deinit();
+    try testing.expect(sub.subscription_id != 0);
+
+    // ── CreateMonitoredItems: i=2258 Server_ServerStatus_CurrentTime.
+    const monitor_client_handle: u32 = 1;
+    const cmi_specs = [_]Subscription.MonitoredItemSpec{.{
+        .node_id = .{ .numeric = .{ .namespace = 0, .id = 2258 } },
+        .client_handle = monitor_client_handle,
+        .sampling_interval_ms = 250.0,
+        .queue_size = 10,
+    }};
+    const cmi_resp = try sub.createMonitoredItems(&cmi_specs, .both);
+    defer services.freeCreateMonitoredItemsResponse(gpa, cmi_resp);
+    try testing.expectEqual(@as(usize, 1), cmi_resp.results.?.len);
+    try testing.expect(!services.isBad(cmi_resp.results.?[0].status_code));
+    try testing.expectEqual(@as(usize, 1), sub.monitored_items.items.len);
+    const created_monitored_item_id = sub.findMonitoredItem(monitor_client_handle).?;
+
+    // ── Publish loop: keep calling until a DataChangeNotification carrying
+    // our monitored item's value shows up (open62541 sends the item's
+    // current value on the very first Publish after CreateMonitoredItems in
+    // Reporting mode, so this should resolve in one or two iterations —
+    // bounded generously to tolerate scheduling jitter under CI/containers).
+    var found_data_change = false;
+    var found_client_handle_match = false;
+    var acked_sequence_number: ?u32 = null;
+    var attempt: usize = 0;
+    while (attempt < 40 and !found_data_change) : (attempt += 1) {
+        const pub_result = try sub.publish(.{ .timeout_hint_ms = 5_000 });
+        defer freePublishResult(gpa, pub_result);
+        for (pub_result.notifications) |n| {
+            switch (n) {
+                .data_change => |dcn| {
+                    for (dcn.monitored_items orelse &.{}) |mi| {
+                        if (mi.client_handle == monitor_client_handle) {
+                            found_data_change = true;
+                            found_client_handle_match = sub.findMonitoredItem(mi.client_handle) == created_monitored_item_id;
+                            try testing.expect(mi.value.value != null);
+                            try testing.expect(mi.value.value.? == .scalar);
+                            try testing.expect(mi.value.value.?.scalar == .date_time);
+                            try testing.expect(mi.value.value.?.scalar.date_time > 0);
+                            acked_sequence_number = pub_result.sequence_number;
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+    if (!found_data_change) {
+        std.debug.print("\nLIVE opcua subscriptions test: no DataChangeNotification observed after {d} Publish attempts.\n", .{attempt});
+    }
+    try testing.expect(found_data_change);
+    try testing.expect(found_client_handle_match);
+    try testing.expect(acked_sequence_number != null);
+
+    // One more Publish call actually sends the acknowledgement (queued in
+    // `sub.pending_acks` by the call above) to the server and gets back its
+    // result — verifying the ack round-trip, not just the local bookkeeping.
+    const ack_pub_result = try sub.publish(.{ .timeout_hint_ms = 5_000 });
+    defer freePublishResult(gpa, ack_pub_result);
+    if (ack_pub_result.ack_results) |results| {
+        for (results) |r| try testing.expect(!services.isBad(r));
+    }
+
+    // ── DeleteMonitoredItems + DeleteSubscriptions + session/channel teardown.
+    const del_mi_resp = try sub.deleteMonitoredItems(&.{created_monitored_item_id});
+    defer services.freeDeleteMonitoredItemsResponse(gpa, del_mi_resp);
+    try testing.expectEqual(@as(usize, 0), sub.monitored_items.items.len);
+
+    try sub.delete();
 }
