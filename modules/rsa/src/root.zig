@@ -1,17 +1,18 @@
 // SPDX-License-Identifier: MIT
 //! rsa — pure-Zig RSA (PKCS#1 v2.2 / RFC 8017), built on `std.crypto.ff`.
 //!
-//! **P1+P2 IMPLEMENTED, P3–P6 still stubs.** The RFC 8017 §5 primitives
+//! **P1+P2+P3 IMPLEMENTED, P4–P6 still stubs.** The RFC 8017 §5 primitives
 //! (RSAEP/RSADP/RSASP1/RSAVP1, incl. the CRT fast path), `PublicKey.fromBytes`,
 //! `SecretKey.fromPrimes`, the RSASSA-PKCS1-v1_5 scheme
-//! (`signPkcs1v15`/`verifyPkcs1v15`, SHA-1/224/256/384/512), and the
+//! (`signPkcs1v15`/`verifyPkcs1v15`, SHA-1/224/256/384/512), the
 //! RSAES-OAEP scheme (`encryptOaep`/`decryptOaep`, MGF1, constant-time
-//! decode) are real and tested against OpenSSL-generated known-answer
-//! vectors. Every P3+ function body is still `@panic("TODO(agent): ...")`.
+//! decode), and the RSASSA-PSS scheme (`signPss`/`verifyPss`, branch-clean
+//! verify) are real and tested against OpenSSL-generated known-answer
+//! vectors. Every P4+ function body is still `@panic("TODO(agent): ...")`.
 //! Phase plan:
 //!   P1 — EMSA-PKCS1-v1_5 sign/verify (`signPkcs1v15`/`verifyPkcs1v15`) — DONE.
 //!   P2 — RSAES-OAEP encrypt/decrypt (`encryptOaep`/`decryptOaep`) — DONE.
-//!   P3 — RSASSA-PSS sign/verify (`signPss`/`verifyPss`).
+//!   P3 — RSASSA-PSS sign/verify (`signPss`/`verifyPss`) — DONE.
 //!   P4 — key parsing (`fromPkcs8`/`fromOpenSSH`).
 //!   P5 — keypair generation (`generate`).
 //!   P6 — self-signed certificate generation (`selfSignedCert`).
@@ -679,29 +680,157 @@ pub fn decryptOaep(sk: SecretKey, comptime Hash: type, ct: []const u8, label: []
     return out[0..msg_len];
 }
 
-// ── P3: RSASSA-PSS (RFC 8017 §8.1) — reserved, not yet implemented ──────────
+// ── P3: RSASSA-PSS (RFC 8017 §8.1) ───────────────────────────────────────────
+//
+// PSS operates on emBits = modBits - 1 bits (§8.1.1 step 2), so the encoded
+// message can be one byte shorter than the modulus (when modBits ≡ 1 mod 8)
+// and its leftmost 8·emLen - emBits bits are always forced to zero — that is
+// what keeps EM < 2^emBits <= n/2 < n, so RSASP1's range check can never fire
+// on a well-formed encoding. MGF1 is reused from P2 (`mgf1Xor`); this module
+// follows the ubiquitous MGF-hash = message-hash convention (same as
+// `openssl dgst -sigopt rsa_padding_mode:pss` defaults).
 
-/// Sign `msg` with RSASSA-PSS (RFC 8017 §8.1.1). `salt_len` is the PSS salt
-/// length in bytes (`sLen`); `io` supplies the random salt. `out` must be at
-/// least as long as the modulus.
-pub fn signPss(sk: SecretKey, comptime Hash: type, io: std.Io, msg: []const u8, salt_len: usize, out: []u8) ![]u8 {
-    _ = sk;
-    _ = Hash;
-    _ = io;
-    _ = msg;
-    _ = salt_len;
-    _ = out;
-    @panic("TODO(agent): P3 RSASSA-PSS sign (EMSA-PSS-ENCODE + RSASP1) per RFC 8017 §8.1.1, §9.1.1");
+/// EMSA-PSS-ENCODE (RFC 8017 §9.1.1) with a caller-supplied salt, written
+/// into all of `em` (`em.len` must equal ceil(em_bits/8)):
+///   H = Hash((0x00 × 8) || Hash(msg) || salt)
+///   EM = (DB ^ MGF1(H)) || H || 0xbc, DB = PS(0x00…) || 0x01 || salt,
+/// with the leftmost 8·emLen - emBits bits of maskedDB cleared (step 11).
+fn emsaPssEncode(comptime Hash: type, msg: []const u8, salt: []const u8, em_bits: usize, em: []u8) EmsaEncodeError!void {
+    const h_len = Hash.digest_length;
+    const em_len = em.len;
+    std.debug.assert(em_len == byteLen(em_bits));
+    // §9.1.1 step 3: emLen >= hLen + sLen + 2.
+    if (em_len < h_len + 2 or salt.len > em_len - h_len - 2) return error.EncodedMessageTooShort;
+
+    const db = em[0 .. em_len - h_len - 1];
+    const h = em[em_len - h_len - 1 ..][0..h_len];
+
+    // steps 2, 5-6: mHash = Hash(M); H = Hash(M'),
+    // M' = (0x00 × 8) || mHash || salt.
+    var m_hash: [h_len]u8 = undefined;
+    Hash.hash(msg, &m_hash, .{});
+    var st = Hash.init(.{});
+    st.update(&[_]u8{0} ** 8);
+    st.update(&m_hash);
+    st.update(salt);
+    st.final(h);
+
+    // steps 7-8: DB = PS (zeros) || 0x01 || salt.
+    @memset(db[0 .. db.len - salt.len - 1], 0x00);
+    db[db.len - salt.len - 1] = 0x01;
+    @memcpy(db[db.len - salt.len ..], salt);
+
+    // steps 9-10: maskedDB = DB ^ MGF1(H, emLen - hLen - 1).
+    mgf1Xor(Hash, h, db);
+
+    // step 11: clear the leftmost 8·emLen - emBits bits of maskedDB so that
+    // OS2IP(EM) < 2^emBits.
+    em[0] &= @as(u8, 0xff) >> @intCast(8 * em_len - em_bits);
+
+    em[em_len - 1] = 0xbc; // step 12: trailer field.
 }
 
-/// Verify an RSASSA-PSS signature (RFC 8017 §8.1.2).
-pub fn verifyPss(pk: PublicKey, comptime Hash: type, msg: []const u8, sig: []const u8, salt_len: usize) !void {
-    _ = pk;
-    _ = Hash;
-    _ = msg;
-    _ = sig;
-    _ = salt_len;
-    @panic("TODO(agent): P3 RSASSA-PSS verify (RSAVP1 + EMSA-PSS-VERIFY) per RFC 8017 §8.1.2, §9.1.2");
+pub const SignPssError = EmsaEncodeError || error{BufferTooSmall};
+
+/// Sign `msg` with RSASSA-PSS (RFC 8017 §8.1.1): EMSA-PSS-ENCODE (§9.1.1)
+/// over emBits = modBits - 1, then the RSASP1 signature primitive (CRT fast
+/// path). `salt_len` is the PSS salt length in bytes (`sLen`): `0` yields
+/// deterministic signatures (and `random` is never drawn from),
+/// `Hash.digest_length` is the conventional default (what OpenSSL calls
+/// `rsa_pss_saltlen:digest`). `random` supplies the fresh salt and MUST be
+/// cryptographically secure for `salt_len > 0`. `out` must be at least as
+/// long as the modulus (`sk.n` byte length); returns the written
+/// (modulus-length) signature subslice.
+pub fn signPss(sk: SecretKey, comptime Hash: type, random: std.Random, msg: []const u8, salt_len: usize, out: []u8) SignPssError![]u8 {
+    const k = byteLen(sk.n.bits());
+    if (out.len < k) return error.BufferTooSmall;
+    const em_bits = sk.n.bits() - 1;
+    const em_len = byteLen(em_bits);
+    // Early salt bound so the fixed salt buffer below cannot overflow on an
+    // absurd salt_len; the precise §9.1.1 step 3 bound is re-checked inside
+    // emsaPssEncode.
+    if (salt_len >= em_len) return error.EncodedMessageTooShort;
+
+    var salt_buf: [max_modulus_len]u8 = undefined;
+    const salt = salt_buf[0..salt_len];
+    defer std.crypto.secureZero(u8, salt);
+    random.bytes(salt);
+
+    // EM is placed at the right edge of the k-byte representative; the
+    // leading pad byte (present only when modBits ≡ 1 mod 8) stays zero.
+    var em_buf: [max_modulus_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, em_buf[0..k]);
+    @memset(em_buf[0 .. k - em_len], 0x00);
+    try emsaPssEncode(Hash, msg, salt, em_bits, em_buf[k - em_len .. k]);
+
+    // §8.1.1 step 2: RSASP1. EM < 2^emBits < n by construction (step 11
+    // cleared the top bits), so the primitive's range check cannot fail.
+    privateOpCrt(sk, em_buf[0..k], out[0..k]) catch unreachable;
+    return out[0..k];
+}
+
+pub const VerifyPssError = error{SignatureVerificationFailed};
+
+/// Verify an RSASSA-PSS signature (RFC 8017 §8.1.2): RSAVP1 recovers the
+/// encoded message, which is checked per EMSA-PSS-VERIFY (§9.1.2) against
+/// `msg` for the given `salt_len` (must equal the signer's `sLen`; this
+/// implementation does not auto-detect salt length). All checks over the
+/// recovered encoding are accumulated branch-free into one validity flag
+/// (H comparison via `std.crypto.timing_safe.eql`) and every failure mode
+/// reports the single generic `error.SignatureVerificationFailed`.
+pub fn verifyPss(pk: PublicKey, comptime Hash: type, msg: []const u8, sig: []const u8, salt_len: usize) VerifyPssError!void {
+    const h_len = Hash.digest_length;
+    const k = byteLen(pk.n.bits());
+    // §8.1.2 step 1: the signature must be exactly k octets.
+    if (sig.len != k) return error.SignatureVerificationFailed;
+    const em_bits = pk.n.bits() - 1;
+    const em_len = byteLen(em_bits);
+    // §9.1.2 step 3: emLen >= hLen + sLen + 2. Public parameters only
+    // (modulus size, hash, expected salt length), so branching is harmless.
+    if (em_len < h_len + 2 or salt_len > em_len - h_len - 2) return error.SignatureVerificationFailed;
+
+    // §8.1.2 step 2: RSAVP1 (public-key operation; s >= n is public info).
+    var em_buf: [max_modulus_len]u8 = undefined;
+    publicOp(pk, sig, em_buf[0..k]) catch return error.SignatureVerificationFailed;
+
+    var ok: u8 = 1;
+    // When emLen < k the representative carries leading pad octets that a
+    // well-formed signature leaves zero.
+    for (em_buf[0 .. k - em_len]) |b| ok &= ctEqByte(b, 0x00);
+    const em = em_buf[k - em_len .. k];
+    const db = em[0 .. em_len - h_len - 1];
+    const h = em[em_len - h_len - 1 ..][0..h_len];
+
+    // §9.1.2 step 4: rightmost octet must be the 0xbc trailer.
+    ok &= ctEqByte(em[em_len - 1], 0xbc);
+
+    // step 6: the leftmost 8·emLen - emBits bits of maskedDB must be zero.
+    const top_mask = @as(u8, 0xff) >> @intCast(8 * em_len - em_bits);
+    ok &= ctEqByte(em[0] & ~top_mask, 0x00);
+
+    // steps 7-9: DB = maskedDB ^ MGF1(H), then clear the leftmost bits.
+    mgf1Xor(Hash, h, db);
+    db[0] &= top_mask;
+
+    // step 10: DB = PS (zeros) || 0x01 || salt.
+    const ps_len = em_len - h_len - salt_len - 2;
+    for (db[0..ps_len]) |b| ok &= ctEqByte(b, 0x00);
+    ok &= ctEqByte(db[ps_len], 0x01);
+    const salt = db[db.len - salt_len ..];
+
+    // steps 2, 12-13: H' = Hash((0x00 × 8) || Hash(msg) || salt).
+    var m_hash: [h_len]u8 = undefined;
+    Hash.hash(msg, &m_hash, .{});
+    var h_prime: [h_len]u8 = undefined;
+    var st = Hash.init(.{});
+    st.update(&[_]u8{0} ** 8);
+    st.update(&m_hash);
+    st.update(salt);
+    st.final(&h_prime);
+
+    // step 14: H == H', folded into the single decision point.
+    ok &= @intFromBool(std.crypto.timing_safe.eql([h_len]u8, h.*, h_prime));
+    if (ok != 1) return error.SignatureVerificationFailed;
 }
 
 // ── P4: key parsing — reserved, not yet implemented ─────────────────────────
@@ -766,6 +895,12 @@ pub fn selfSignedCert(gpa: std.mem.Allocator, sk: SecretKey, subject: []const u8
 //   the encrypt direction.
 // * MGF1 vectors: computed with Python 3.14 hashlib per RFC 8017 §B.2.1
 //   (seed || I2OSP(counter, 4), concatenated digests).
+// * PSS KATs: signatures produced against the same 2048-bit key with
+//   `openssl dgst -shaN -sigopt rsa_padding_mode:pss
+//   -sigopt rsa_pss_saltlen:<n> -sign` (OpenSSL 3.5.5, 2026-07-10; MGF1 hash
+//   = message hash, OpenSSL's default). PSS signing is randomized for
+//   sLen > 0, so those are verify-only KATs; the sLen = 0 vector is
+//   deterministic and doubles as a byte-exact sign KAT.
 
 const testing = std.testing;
 
@@ -1191,4 +1326,172 @@ test "PublicKey.fromBytes accepts/rejects per RFC 8017 §3.1 sanity rules" {
     // Modulus above max_modulus_bits.
     const huge_n = [_]u8{0xff} ** (max_modulus_len + 1);
     try testing.expectError(error.InvalidPublicKey, PublicKey.fromBytes(&huge_n, &kat2048.e));
+}
+
+// ── P3 (PSS) tests ───────────────────────────────────────────────────────────
+
+// PSS known-answer signatures for the kat2048 key (see the PSS bullet in the
+// provenance note above).
+const kat2048_pss = struct {
+    const msg = "zig-libs rsa: PSS known-answer test";
+    // -sha256 -sigopt rsa_pss_saltlen:32 (randomized -> verify-only KAT).
+    const sig_sha256_s32 = hexLit("21de593a077463eae5e5bf33955fc9603bac17cb9f6fdf978152a2dec9d0a5ac832947fc0eb466b6661ecd00a9a36e49bb1842037a889601863fa3280a30dd00367b93f63b8e6137e29d07689881036dc6bef12b76ac8738299f91423aa102835370954ae61a91e161c10c32bff3e22f1f6c8f95bc2ee3f2f0ab916a2382cab91c585360ed0ec1350e85dcc3328ad79a189210a714669b7a4a0a33da28c5bc72156880516fde01db01f6925781d7df01d8aa20ca1c32ebc036f2af5dacdacd0a04dc5a911dcf45d382e4d80af85834d0f33611721341e9f0713d0f6bcce6a192c960831cb9ac218db7a12383b6b26239d1d5383f00b8cf76b4a2a2bdcfe3538f");
+    // -sha256 -sigopt rsa_pss_saltlen:0 (deterministic -> byte-exact sign KAT).
+    const sig_sha256_s0 = hexLit("0232ff64e3172b8d9a4953f97f6a415054574f6f18e4a2690c3703662fda3ded6fc3ea916fdae81af5ad1b2b2873ff5684a15d0b101736f3f2ca95d0334aaf840ce8ea0225302f7e53747c93cfa3080d8895e21cc66f16cd7d2248ef5495364ce68913c164d0f1e9ca14d8bc9fa30bf7af6e7d5a34d60e64bbf5d22258d781458982cb48c6304d3d861c699f9268fcb8ba3a36489fd68b174b21cd831427e6ad8bb80bebd4b691be935db60f8ff1b24922b133a670d72e882697bf8e9582092498009fe5f348cd607cb0ace3ad36c346b366e441801aefa4bd13162625e99afed10fe6b0f07c77b2fe0db84bc9a7fe75fdbe877a638c33c949ca784d48183349");
+    // -sha512 -sigopt rsa_pss_saltlen:20 (randomized -> verify-only KAT).
+    const sig_sha512_s20 = hexLit("2010462129b3ebafdb3b2db227062c359bf78068229def1553477a12865b2f21293ed68434cefcfd48a1e506384f641a4e987bffab742044e208ea448d5cd5f212f875ba506f70d1c7737f4e50f4732884a2b6d35db38d0081f8887bf89ed7561134fb6e8f73292e435c1d93e21bbbee55dd7f3a22d099304e95e48520c562cb8c91eb889695618c2a795638d089cef37e9807cf229aa2d3696ad152e15857837add16114b3c922fb5e38f4af0321a7ba3ca406091a9308be84b68b25c5c096dd3096b7d545fce118eec4b9e99070ca52d2e0d7a94d6a75d762cdd28650c5be567a53cbc509e00720a32d43f02312253d4d9bbad722c4fa99a4bf3be79a84fac");
+};
+
+test "verifyPss accepts the OpenSSL known answers" {
+    const pk = try kat2048.publicKey();
+    const sha2 = std.crypto.hash.sha2;
+    try verifyPss(pk, sha2.Sha256, kat2048_pss.msg, &kat2048_pss.sig_sha256_s32, 32);
+    try verifyPss(pk, sha2.Sha256, kat2048_pss.msg, &kat2048_pss.sig_sha256_s0, 0);
+    try verifyPss(pk, sha2.Sha512, kat2048_pss.msg, &kat2048_pss.sig_sha512_s20, 20);
+}
+
+test "signPss with salt_len = 0 matches the deterministic OpenSSL answer" {
+    const sk = try kat2048.secretKey();
+    // sLen = 0 -> the signature is fully deterministic; the byte-exact match
+    // against OpenSSL's answer proves the PRNG below is never material.
+    var prng = std.Random.DefaultPrng.init(0);
+    var out: [max_modulus_len]u8 = undefined;
+    const sig = try signPss(sk, std.crypto.hash.sha2.Sha256, prng.random(), kat2048_pss.msg, 0, &out);
+    try testing.expectEqualSlices(u8, &kat2048_pss.sig_sha256_s0, sig);
+}
+
+test "signPss/verifyPss round-trip (hashes x salt lengths), 2048-bit key" {
+    const sk = try kat2048.secretKey();
+    const pk = try kat2048.publicKey();
+    var prng = std.Random.DefaultPrng.init(0x7073735f726e6421);
+    const random = prng.random();
+    var out: [max_modulus_len]u8 = undefined;
+
+    inline for (.{
+        std.crypto.hash.sha2.Sha256,
+        std.crypto.hash.sha2.Sha384,
+        std.crypto.hash.sha2.Sha512,
+    }) |Hash| {
+        for ([_]usize{ 0, Hash.digest_length, 20 }) |s_len| {
+            const sig = try signPss(sk, Hash, random, "fresh PSS round-trip message", s_len, &out);
+            try testing.expectEqual(256, sig.len);
+            try verifyPss(pk, Hash, "fresh PSS round-trip message", sig, s_len);
+            try testing.expectError(error.SignatureVerificationFailed, verifyPss(pk, Hash, "some other message", sig, s_len));
+        }
+    }
+
+    // PSS with sLen > 0 is randomized: two signatures over the same message
+    // differ (fresh salt each call) yet both verify.
+    var out2: [max_modulus_len]u8 = undefined;
+    const s1 = try signPss(sk, std.crypto.hash.sha2.Sha256, random, "same message", 32, &out);
+    const s2 = try signPss(sk, std.crypto.hash.sha2.Sha256, random, "same message", 32, &out2);
+    try testing.expect(!std.mem.eql(u8, s1, s2));
+    try verifyPss(pk, std.crypto.hash.sha2.Sha256, "same message", s1, 32);
+    try verifyPss(pk, std.crypto.hash.sha2.Sha256, "same message", s2, 32);
+}
+
+test "signPss/verifyPss round-trip on the 512-bit key (top-bit clearing path)" {
+    // modBits = 512 -> emBits = 511: emLen == k and exactly one leading bit
+    // of maskedDB is cleared/checked, exercising §9.1.1 step 11 / §9.1.2
+    // step 6 with a nontrivial mask.
+    const sk = try SecretKey.fromPrimes(&kat512.p, &kat512.q, &kat512.e);
+    const pk = try PublicKey.fromBytes(&kat512.n, &kat512.e);
+    var prng = std.Random.DefaultPrng.init(0x353132626974);
+    const random = prng.random();
+    var out: [max_modulus_len]u8 = undefined;
+
+    // Max sLen for k=64/SHA-256: emLen - hLen - 2 = 64 - 32 - 2 = 30.
+    for ([_]usize{ 0, 20, 30 }) |s_len| {
+        const sig = try signPss(sk, std.crypto.hash.sha2.Sha256, random, "small key", s_len, &out);
+        try testing.expectEqual(64, sig.len);
+        try verifyPss(pk, std.crypto.hash.sha2.Sha256, "small key", sig, s_len);
+    }
+
+    // sLen = 31 exceeds the §9.1.1 step 3 bound.
+    try testing.expectError(error.EncodedMessageTooShort, signPss(sk, std.crypto.hash.sha2.Sha256, random, "small key", 31, &out));
+    // SHA-512 cannot fit at all: emLen = 64 < hLen + 2 = 66.
+    try testing.expectError(error.EncodedMessageTooShort, signPss(sk, std.crypto.hash.sha2.Sha512, random, "small key", 0, &out));
+}
+
+test "verifyPss rejects tampering, wrong message/hash/salt_len/length" {
+    const pk = try kat2048.publicKey();
+    const sha2 = std.crypto.hash.sha2;
+
+    // Bit-flip anywhere in the signature.
+    var tampered = kat2048_pss.sig_sha256_s32;
+    tampered[0] ^= 0x01;
+    try testing.expectError(error.SignatureVerificationFailed, verifyPss(pk, sha2.Sha256, kat2048_pss.msg, &tampered, 32));
+    tampered = kat2048_pss.sig_sha256_s32;
+    tampered[255] ^= 0x80;
+    try testing.expectError(error.SignatureVerificationFailed, verifyPss(pk, sha2.Sha256, kat2048_pss.msg, &tampered, 32));
+
+    // Wrong message.
+    try testing.expectError(error.SignatureVerificationFailed, verifyPss(pk, sha2.Sha256, "not the signed message", &kat2048_pss.sig_sha256_s32, 32));
+
+    // Wrong hash function.
+    try testing.expectError(error.SignatureVerificationFailed, verifyPss(pk, sha2.Sha384, kat2048_pss.msg, &kat2048_pss.sig_sha256_s32, 32));
+
+    // Wrong salt_len at verify (both directions).
+    try testing.expectError(error.SignatureVerificationFailed, verifyPss(pk, sha2.Sha256, kat2048_pss.msg, &kat2048_pss.sig_sha256_s32, 20));
+    try testing.expectError(error.SignatureVerificationFailed, verifyPss(pk, sha2.Sha256, kat2048_pss.msg, &kat2048_pss.sig_sha256_s0, 32));
+
+    // Wrong signature length (RFC 8017 §8.1.2 step 1).
+    try testing.expectError(error.SignatureVerificationFailed, verifyPss(pk, sha2.Sha256, kat2048_pss.msg, kat2048_pss.sig_sha256_s32[0..255], 32));
+    const long_sig = kat2048_pss.sig_sha256_s32 ++ [_]u8{0};
+    try testing.expectError(error.SignatureVerificationFailed, verifyPss(pk, sha2.Sha256, kat2048_pss.msg, &long_sig, 32));
+
+    // salt_len over the §9.1.2 step 3 bound (emLen - hLen - 2 = 222).
+    try testing.expectError(error.SignatureVerificationFailed, verifyPss(pk, sha2.Sha256, kat2048_pss.msg, &kat2048_pss.sig_sha256_s32, 223));
+}
+
+test "verifyPss rejects a wrong trailer byte and nonzero top bits" {
+    const sk = try kat2048.secretKey();
+    const pk = try kat2048.publicKey();
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+    const msg = "trailer/top-bit negative test";
+
+    // Hand-build a fully valid EM (emBits = 2047, emLen = 256), then break
+    // exactly one property per case and push it through the raw RSASP1
+    // primitive — only the targeted check can catch it. The salt is searched
+    // so that em[0] | 0x80 stays below n's top byte (0xa2): the top-bit
+    // corruption below must keep the representative < n, or RSASP1's range
+    // check would reject it before verifyPss ever sees it.
+    var salt = [_]u8{0} ** 32;
+    var em: [256]u8 = undefined;
+    var found = false;
+    var s: usize = 0;
+    while (s < 256) : (s += 1) {
+        @memset(&salt, @intCast(s));
+        try emsaPssEncode(Sha256, msg, &salt, 2047, &em);
+        if (em[0] < 0x22) {
+            found = true;
+            break;
+        }
+    }
+    try testing.expect(found);
+
+    // Control: the untouched EM signs and verifies — proving the rejections
+    // below are the trailer/top-bit checks and nothing else.
+    const sig_ok = try rsasp1(256, em, sk);
+    try verifyPss(pk, Sha256, msg, &sig_ok, 32);
+
+    // Trailer != 0xbc (§9.1.2 step 4).
+    var em_bad = em;
+    em_bad[255] = 0xcc;
+    const sig_bad_trailer = try rsasp1(256, em_bad, sk);
+    try testing.expectError(error.SignatureVerificationFailed, verifyPss(pk, Sha256, msg, &sig_bad_trailer, 32));
+
+    // Nonzero leftmost bit of maskedDB (§9.1.2 step 6). Still < n (n's top
+    // byte is 0xa2), so only the top-bit check can reject it.
+    em_bad = em;
+    em_bad[0] |= 0x80;
+    const sig_bad_top = try rsasp1(256, em_bad, sk);
+    try testing.expectError(error.SignatureVerificationFailed, verifyPss(pk, Sha256, msg, &sig_bad_top, 32));
+}
+
+test "signPss rejects an undersized output buffer" {
+    const sk = try kat2048.secretKey();
+    var prng = std.Random.DefaultPrng.init(7);
+    var small: [255]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, signPss(sk, std.crypto.hash.sha2.Sha256, prng.random(), "m", 32, &small));
 }
