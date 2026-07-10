@@ -3,7 +3,7 @@
 **RFC 5424** syslog message formatter + emitter, with a legacy **RFC 3164**
 (BSD) encoder and **RFC 6587** octet-counting TCP framing.
 
-- **Status:** `gap` — no spec-correct, I/O-agnostic RFC 5424 formatter in the
+- No spec-correct, I/O-agnostic RFC 5424 formatter in the
   Zig ecosystem (the one correct reference is in another project; the popular
   `logly.zig` formatter emits a non-conformant timestamp).
 - **Model after:** RFC 5424 (message + wire format), RFC 6587 (transport

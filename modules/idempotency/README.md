@@ -81,7 +81,7 @@ owns its copies of the recorded status/`Content-Type`/body bytes.
 
 ## Attributes
 
-- **Status:** `gap`. **Role:** server. **Platform:** any. **Deps:** `router`,
+- **Role:** server. **Platform:** any. **Deps:** `router`,
   `http`, `ramcache`. **Concurrency:** threadsafe — the `ramcache` store sits
   behind an internal spinlock (`std.atomic.Mutex` + `spinLoopHint`, the std
   SmpAllocator pattern), so `respond` and the middleware may race across all

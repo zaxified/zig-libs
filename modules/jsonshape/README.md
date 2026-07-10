@@ -4,7 +4,7 @@ Reshape JSON into a canonical [`dataset`](../dataset/README.md): dot-path
 descent to an array node + typed column projection (a jq-style minimal
 subset — one path, not a full JSONPath engine).
 
-- **Status:** `extract` — a normalizer for `http`-connector-style remote
+- A normalizer for `http`-connector-style remote
   feeds shaped like `getDataview`/`dataviewGet` responses.
 - **Model after:** jq-style path projection (minimal: one dot-path + field
   extraction), not a full JSONPath implementation.

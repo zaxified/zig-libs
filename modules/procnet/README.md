@@ -16,7 +16,6 @@ IPv6 socket-table support (`tcp6`/`udp6`) and the little-endian-hex→
 snapshots (see the test fixtures under `src/testdata/`), extending IPv4-only
 reads to full dual-stack coverage.
 
-- **Status:** `extract`.
 - **Model after:** gopsutil (Go) / procps-ng.
 - **Platform:** linux (raw `/proc`+`/sys` reads). **Role:** util.
   **Concurrency:** reentrant (no shared state).

@@ -6,7 +6,7 @@ First module of the Web service / API cluster: `ratelimit`, `abuseguard`,
 `throttle`, `openapi`, `cors`, `validate` and `metrics` plug in here as
 middleware.
 
-- **Status:** `extract` — a segment-trie matcher + middleware chain over
+- A segment-trie matcher + middleware chain over
   `http.Server`.
 - **Model after:** Go `chi` / `julienschmidt/httprouter` (segment trie,
   deterministic precedence, 404/405 + `Allow`, trailing-slash redirect).

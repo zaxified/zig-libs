@@ -34,7 +34,7 @@ belongs on the `Set-Cookie` build side (next part).
   response's `Set-Cookie` header (the server emits one Set-Cookie per
   response — `setHeader` replaces by name).
 
-- **Status:** `gap`. **Role:** codec. **Platform:** any. **Deps:** `http`
+- **Role:** codec. **Platform:** any. **Deps:** `http`
   (the `get`/`set` helpers; the parser + builder are std-only logic).
   **Concurrency:** reentrant — no state; results borrow the input.
 

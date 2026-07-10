@@ -3,7 +3,7 @@
 Parser + serializer + typed model for the **OpenWRT UCI** (Unified
 Configuration Interface) file format — `config` / `option` / `list`.
 
-- **Status:** `gap` — no maintained pure-Zig UCI codec exists; this retires
+- No maintained pure-Zig UCI codec exists; this retires
   shelling out to the `uci` binary for callers that manage OpenWRT-style
   device config.
 - **Model after:** OpenWRT UCI file format / libuci.

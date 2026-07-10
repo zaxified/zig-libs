@@ -18,7 +18,6 @@ Round-robin, smooth weighted round-robin (the nginx algorithm),
 least-connections and EWMA latency balancing are public, decades-old
 techniques. See ../../NOTICE.
 
-- **Status:** `gap`.
 - **Model after:** Envoy/HAProxy upstream cluster + resilience4j Bulkhead.
 - **Platform:** any — pure logic; active-health I/O goes through the
   injected `HealthChecker`/`probe.Connector` seam. **Role:** client.

@@ -3,7 +3,7 @@
 Native **WireGuard device configuration** over the kernel's generic-netlink
 API: get/set devices, peers and allowed-ips — no `wg` shell-outs.
 
-- **Status:** `gap` — no maintained pure-Zig WireGuard-netlink client exists.
+- No maintained pure-Zig WireGuard-netlink client exists.
 - **Model after:** the WireGuard genetlink UAPI (`uapi/wireguard.h`) and
   wgctrl-go (typed device/peer model, config semantics).
 - **Platform:** linux (raw `std.os.linux` AF_NETLINK syscalls — a conscious

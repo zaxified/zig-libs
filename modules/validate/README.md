@@ -13,7 +13,6 @@ additional properties allowed, `enum`, `properties`/`items` nesting) and
 go-playground/validator (MIT — struct-tag-style ergonomics, mirrored here as
 comptime reflection; behavior only) — see NOTICE. No source copied.
 
-- **Status:** `gap`.
 - **Model after:** pydantic v2 + JSON Schema 2020-12 + go-playground/validator.
 - **Platform:** any. **Role:** util. **Concurrency:** reentrant — the
   validator core is pure; middleware state is immutable after init and every

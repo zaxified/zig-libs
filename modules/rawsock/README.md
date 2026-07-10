@@ -6,7 +6,7 @@ EtherType (or every frame), decode the kernel's `sockaddr_ll` into a typed
 `Frame`, attach an in-kernel **classic-BPF** filter, toggle **promiscuous**
 mode, and cook-inject frames on a named interface. No libpcap, no libc.
 
-- **Status:** `gap` (built) — the initial receive-only core
+- The initial receive-only core
   (`openPacketCapture` / `ifNameOf`) was inlined and minimal; send, BPF
   filtering, promiscuous mode, interface enumeration and the typed
   frame/`sockaddr_ll` decode are new construction.

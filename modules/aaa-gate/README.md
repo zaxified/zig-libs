@@ -8,7 +8,6 @@ ext_authz and oauth2-proxy (bearer-gate behavior only — no source consulted
 or copied); bearer semantics per RFC 6750, auth framework per RFC 9110. See
 `NOTICE`.
 
-- **Status:** `extract`.
 - **Model after:** envoy / oauth2-proxy (behavior only).
 - **Platform:** any. **Role:** server. **Concurrency:** threadsafe —
   token set + throttle store behind one documented spinlock

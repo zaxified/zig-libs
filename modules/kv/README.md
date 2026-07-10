@@ -6,7 +6,7 @@ place: an **injectable `Storage` seam** and a **deterministic fault-injection
 sweep** (bounded mini-VOPR) that crashes the simulated machine at *every*
 storage side effect and proves recovery each time.
 
-- **Status:** `gap` — Zig has no production embedded DB.
+- Zig has no production embedded DB.
 - **Model after:** **Bitcask** (log-structured shape: append-only data file,
   in-memory keydir, compaction), **LMDB** / **xitdb** (single-writer embedded
   semantics), **TigerBeetle VOPR** (reliability via deterministic fault

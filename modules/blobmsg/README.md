@@ -6,7 +6,7 @@ with JSON arguments, and subscribe to events — no `ubus` CLI shell-outs, no
 libubox binding, no libc. No pure-Zig ubus/blobmsg implementation exists
 elsewhere (goubus is HTTP/rpcd, python-ubus/golangwrt are cgo wrappers).
 
-- **Status:** `extract` — replaces per-read `ubus` CLI forks with a native
+- Replaces per-read `ubus` CLI forks with a native
   client on real OpenWRT devices.
 - **Model after:** the OpenWRT libubox/ubus wire format (clean-room).
 - **Platform:** the codec (`codec.zig`) is platform-pure — no I/O, compiles

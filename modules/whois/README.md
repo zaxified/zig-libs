@@ -3,7 +3,7 @@
 **RFC 3912** WHOIS client: query formatting, IANA/registry **referral
 chasing**, and a tiny `key: value` field extractor.
 
-- **Status:** `gap` — no I/O-agnostic RFC 3912 client with referral chasing
+- No I/O-agnostic RFC 3912 client with referral chasing
   in the Zig ecosystem.
 - **Model after:** RFC 3912 whois; the IANA/registry referral chain
   (`whois.iana.org` `refer:` bootstrap → registry → registrar).

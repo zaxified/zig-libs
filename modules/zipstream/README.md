@@ -5,7 +5,7 @@ stream each member's *decompressed* bytes on demand. No whole-archive or
 whole-entry buffering — memory use is O(one decompression window) regardless
 of archive or entry size.
 
-- **Status:** `extract` — a streaming ZIP reader; an .xlsx is a ZIP of XML
+- A streaming ZIP reader; an .xlsx is a ZIP of XML
   parts, and it streams zipped `.csv` members without exposing ZIP internals
   to the caller.
 - **Model after:** the ZIP central-directory layout in APPNOTE.TXT (the

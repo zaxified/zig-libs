@@ -3,7 +3,7 @@
 Locale-aware **grouped-number parsing** — thousands + decimal separators into
 an exact `decimal.Decimal`, with strict structural validation.
 
-- **Status:** `extract` — one function's worth of scope, generalized as a
+- One function's worth of scope, generalized as a
   standalone module.
 - **Model after:** ICU `NumberFormat` parse (the western 3-digit grouping
   subset).

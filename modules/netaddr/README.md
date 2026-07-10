@@ -2,7 +2,7 @@
 
 IP address parse/format + **RFC 6724** destination/source address selection.
 
-- **Status:** `extract` — derived from fping's address-selection logic
+- Derived from fping's address-selection logic
   (`sortByDestinationPolicy`, `policyPrecedence`, `destinationReachable`),
   extended to the full RFC 6724 destination rule set.
 - **Model after:** Go `net/addrselect.go` + glibc `getaddrinfo` (UDP-connect

@@ -14,7 +14,7 @@ call site, with no shared abstraction. This is a **design consolidation**
 of convenience predicates on top, and an `Argv` builder that makes an
 unvalidated argv element unrepresentable. No third-party code.
 
-- **Status:** `gap`. **Model after:** allowlist validators (shlex.quote-adjacent)
+- **Model after:** allowlist validators (shlex.quote-adjacent)
   + a typed argv builder.
 - **Platform:** any (pure byte checks; the *semantics* are POSIX argv — see
   Boundaries). **Role:** util. **Concurrency:** reentrant — every function is

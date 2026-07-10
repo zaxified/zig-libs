@@ -8,7 +8,6 @@ drawdown-episode state machine. Every function is a pure transform: `Dataset →
 Dataset` (table/series producers) or `Dataset → f64` (scalar reducers), over a
 caller-owned allocator (normally an arena).
 
-- **Status:** `extract`.
 - **Model after:** the Python `empyrical` / `ffn` metric set and a QuantLib
   subset — mirrored, not invented.
 - **Platform:** any (pure logic, no OS calls). **Role:** util.

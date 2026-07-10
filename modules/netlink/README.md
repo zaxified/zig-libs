@@ -4,7 +4,7 @@ Pure-Zig **rtnetlink** transport + query API over `NETLINK_ROUTE`: enumerate
 links, addresses, routes and neighbors straight from the kernel control plane
 — no `ip`/`ss` shell-outs, no `/proc/net` parsing, no libc.
 
-- **Status:** `gap` — no maintained pure-Zig netlink library exists.
+- No maintained pure-Zig netlink library exists.
 - **Model after:** libmnl (minimal framing + validation discipline) and
   vishvananda/netlink (Go; typed dump queries). Wire format from the kernel
   UAPI headers and RFC 3549.

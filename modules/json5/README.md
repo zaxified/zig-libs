@@ -27,7 +27,7 @@ defer alloc.free(r.out);
 // r.out is always valid JSON; r.next_id is the next unused $err_<N> id
 ```
 
-- **Status:** `extract`. **Role:** codec. **Platform:** any.
+- **Role:** codec. **Platform:** any.
   **Concurrency:** reentrant (no shared state; both functions take an
   allocator and a borrowed input slice). **Deps:** std-only.
 - **Model after:** the JSON5 spec (json5.org) preprocessor-to-JSON

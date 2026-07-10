@@ -13,7 +13,6 @@ semantics: get-or-register per (name, label values), lazy series creation,
 format 0.0.4 / OpenMetrics spec (format only). Behavior and format modeled,
 no source copied.
 
-- **Status:** `gap`.
 - **Model after:** Prometheus client_golang + text exposition format 0.0.4.
 - **Platform:** posix — the default latency clock is the posix
   `clock_gettime` errno form (CLOCK_MONOTONIC); everything else is

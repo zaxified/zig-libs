@@ -3,7 +3,7 @@
 Streaming SHA-256 helpers — one-shot, incremental, and **file** hashing that is
 correct on size-0 virtual files (`/proc`, `/sys`).
 
-- **Status:** `extract` — one-shot (`sha256Hex`, `matches`), incremental,
+- One-shot (`sha256Hex`, `matches`), incremental,
   and read-to-EOF file hashing (`sha256File`).
 - **Model after:** Go `crypto/sha256` streaming. Thin over
   `std.crypto.hash.sha2.Sha256` — no custom crypto.

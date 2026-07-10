@@ -5,7 +5,7 @@ Durable **background-job queue** over the pure-Zig [`kv`](../kv) log:
 dead-letter queue, per-partition FIFO ordering under a priority override, and
 scheduled visibility (`delay_ns` / `run_at`).
 
-- **Status:** `gap` — no production pure-Zig background-job queue exists.
+- No production pure-Zig background-job queue exists.
 - **Model after:** Faktory / Sidekiq (lease + retry + DLQ) over a Bitcask-style
   log; the injected-`Clock` pattern from the `resilience` / `jwt` siblings.
 - **Platform:** `posix` — the OS-default wall/monotonic clocks use

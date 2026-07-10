@@ -5,7 +5,7 @@ Correct for dates **before 1970** (Howard Hinnant's days-from-civil algorithm,
 signed `i64` epoch-day math) — unlike a `u64`-seconds-since-epoch core, which
 silently floors any pre-1970 date to 1970-01-01.
 
-- **Status:** `extract` — pure-`std` civil-calendar core (no external
+- Pure-`std` civil-calendar core (no external
   dependency) chosen for exactly this pre-epoch correctness reason.
 - **Model after:** Howard Hinnant chrono civil algorithms
   (https://howardhinnant.github.io/date_algorithms.html); a strftime-like

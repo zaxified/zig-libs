@@ -5,7 +5,7 @@ RFC 5389): a transport-agnostic codec that builds/parses/verifies STUN Binding
 messages so a host behind a NAT can learn its public "reflexive" transport
 address. Sits alongside the rest of the `netaddr`-based network family.
 
-- **Status:** gap — no mature pure-Zig STUN library to adopt.
+- No mature pure-Zig STUN library to adopt.
 - **Platform:** any (the core is pure computation over caller buffers; only the
   optional `query` helper touches `std.Io.net`).
 - **Role:** codec (no I/O in the core).

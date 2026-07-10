@@ -2,7 +2,7 @@
 
 IANA time-zone offset lookup: zone name → UTC offset/DST at a given instant.
 
-- **Status:** `extract` — composes the `datefmt` module for the POSIX-TZ
+- Composes the `datefmt` module for the POSIX-TZ
   footer's calendar math.
 - **Model after:** IANA tzdata (`zic`) + the POSIX `TZ` footer rule
   (RFC 9636 §3.3 / `tzfile(5)`).

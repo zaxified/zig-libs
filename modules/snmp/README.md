@@ -4,7 +4,7 @@ Pure-Zig **SNMP v1 + v2c manager**: a BER/ASN.1 codec, OID handling, the SNMP
 message/PDU model, and a transport-agnostic client. Feeds the network-device
 management work (alongside `netlink`, `nftables`, `icmp`).
 
-- **Status:** gap — no mature pure-Zig SNMP implementation exists.
+- No mature pure-Zig SNMP implementation exists.
 - **Platform:** any (codec, OID, message model and client are pure
   computation; only the optional `UdpTransport` adapter touches
   `std.Io.net`).

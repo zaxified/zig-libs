@@ -6,7 +6,6 @@ transforms). Every origin is normalized to one shape: `{ columns:
 [{name,type}], rows: [[Value…]] }`. Consumers never see a source schema —
 only a `Dataset`.
 
-- **Status:** `extract`.
 - **Model after:** the Arrow/Polars minimal-columnar-subset shape and the
   pandas DataFrame mental model — but see "Known ceiling" below, this is
   row-major boxed cells, not true columnar storage.

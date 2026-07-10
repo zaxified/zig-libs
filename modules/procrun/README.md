@@ -24,7 +24,6 @@ Provenance: original work of the zig-libs authors (MIT) — the `waitTolerant` /
 `std.posix.system.wait4`/`waitpid` — on Linux that is `std.os.linux`, i.e. raw
 syscalls, keeping the module **libc-free**.
 
-- **Status:** `extract`.
 - **Model after:** Python `subprocess.run`/`Popen`, Go `os/exec`.
 - **Platform:** any (full behavior on POSIX; the reap-race handling is
   POSIX-only, Windows falls back to `std.process.Child.wait`). **Role:** util.

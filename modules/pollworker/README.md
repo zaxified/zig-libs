@@ -16,7 +16,7 @@ blocks that only share the "single owner drives the loop" discipline:
   argv, keeping the between-fork-and-exec window async-signal-safe (raw
   syscalls, no allocation in the child).
 
-- **Status:** `extract` — a single-owner `poll(2)` loop plus a fork/detach
+- A single-owner `poll(2)` loop plus a fork/detach
   job table: the loop drives a unix-socket accept + per-tick reap/publish, and
   the job table offloads cold HTTP fetches to detached curl workers.
 - **Model after:** a single-owner event loop + detached-fork worker pool.

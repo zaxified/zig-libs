@@ -5,7 +5,6 @@ middleware answering **429 + Retry-After**. First consumer of `router`'s
 `Middleware { state, run }` interface — per-instance state (the buckets),
 zero globals.
 
-- **Status:** `gap`.
 - **Model after:** Go `golang.org/x/time/rate` (token bucket: float token
   balance, lazy refill, burst cap, denials consume nothing) + nginx
   `limit_req`'s keyed-store shape.

@@ -4,7 +4,7 @@
 (queries/responses renumbered as RFC 9082/9083, bootstrap as RFC 9224).
 Pairs with the `whois` module.
 
-- **Status:** `gap` — no typed, offline-testable RDAP client in the Zig
+- No typed, offline-testable RDAP client in the Zig
   ecosystem.
 - **Model after:** RFC 7480–7484 RDAP; ARIN/RIPE RDAP behavior.
 - **Why:** whois replies are freeform text per registry; RDAP is the same

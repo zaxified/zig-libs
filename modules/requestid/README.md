@@ -32,7 +32,7 @@ entropy call, fully portable. It is a **correlation** ID (unique for tracing),
 **not** an unpredictable security token; where unguessability matters, adopt an
 edge-assigned header or set the header yourself.
 
-- **Status:** `gap`. **Role:** util. **Platform:** any. **Deps:** `router`,
+- **Role:** util. **Platform:** any. **Deps:** `router`,
   `http`. **Concurrency:** threadsafe — per-request state is thread-local
   (the server is task-per-connection: one request at a time per thread, so the
   ID lives until the response is flushed); the config is immutable. `current()`

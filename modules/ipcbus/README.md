@@ -11,7 +11,7 @@ caller-supplied `dispatch` callback, so this module hosts no application
 commands. Framing is delegated to the `framing` module (no re-implemented
 length prefix). No third-party code.
 
-- **Status:** extract. **Platform:** linux (raw syscalls, no libc — a
+- **Platform:** linux (raw syscalls, no libc — a
   conscious ceiling). **Role:** server. **Deps:** `framing`.
 - **Concurrency:** single_owner — one thread/loop owns the listen socket and
   the `Bus`; the `Bus` is lock-free and must be touched from that thread only.

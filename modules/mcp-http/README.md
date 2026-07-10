@@ -48,7 +48,7 @@ several connection threads. Inject `Transport.lock` (a `Lock` seam, same shape
 as `jwt.Lock`) to serialize `handleMessage`, or run the server single-threaded.
 Body reads and response framing happen outside the lock.
 
-- **Status:** `gap`. **Role:** server. **Platform:** any. **Deps:** `router`,
+- **Role:** server. **Platform:** any. **Deps:** `router`,
   `http`, `mcp`.
 
 Provenance: clean-room from the MCP Streamable HTTP transport specification

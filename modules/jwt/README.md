@@ -30,7 +30,6 @@ RFC 7518 (JWA), RFC 8037 (EdDSA in JOSE), RFC 8017 (PKCS #1 v2.2), RFC 8725
 metadata, `Provider`) and RFC 6750 (Bearer resource-server middleware). No
 third-party JWT source consulted or copied.
 
-- **Status:** `gap`.
 - **Model after:** RFC 7515 (JWS) + RFC 7519 (JWT) + RFC 7518 (JWA) verify
   incl. RS256 (RSASSA-PKCS1-v1_5, RFC 8017) + RFC 7517 (JWK/JWKS key sets),
   RFC 8725 hardening + OpenID Connect Discovery 1.0 / RFC 8414 (`Provider`) +

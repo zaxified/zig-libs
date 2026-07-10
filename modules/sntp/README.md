@@ -4,7 +4,7 @@ SNTP client (RFC 4330): a pure 48-byte NTP packet **codec** plus a blocking
 UDP **query** that reads a public time server and computes the local clock
 offset and round-trip delay.
 
-- **Status:** `gap` — std has no NTP/SNTP support at all.
+- Std has no NTP/SNTP support at all.
 - **Model after:** RFC 4330 (SNTP for IPv4/IPv6); packet layout and the
   T1–T4 offset/delay arithmetic mirror the design of
   [`FObersteiner/ntp_client`](https://codeberg.org/FObersteiner/ntp_client)

@@ -11,7 +11,7 @@ within the timeout is `timeout`, and a DNS/other failure is `error`. Repeat N ti
 per target for min/avg/max/loss, and fan out across a target list with a bounded
 worker count.
 
-- **Status:** gap — no small pure-Zig TCP-connect prober exists.
+- No small pure-Zig TCP-connect prober exists.
 - **Platform:** any — all connection I/O goes through an injectable `Connector`
   seam (default = `std.Io.net`), so the classify/aggregate/fan-out logic is pure
   and offline-testable; only the default connector touches the OS.

@@ -8,7 +8,7 @@ Unreachable terminates the trace with its code recorded. Responses are
 correlated to their probe via the echo ident + sequence quoted inside the
 ICMP error, so late answers still land in the right hop slot.
 
-- **Status:** gap — no pure-Zig traceroute engine exists.
+- No pure-Zig traceroute engine exists.
 - **Platform:** linux — the live path is a raw ICMP socket (`icmp.Socket`,
   CAP_NET_RAW) with per-probe `IP_TTL` / `IPV6_UNICAST_HOPS`; the hop state
   machine itself is pure and runs behind an injectable `Transport` seam.

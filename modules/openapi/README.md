@@ -6,7 +6,7 @@ the spec is derived from the live `Router.routes()` table and per-route
 `RouteDoc` metadata (`Router.addDoc`), so the docs cannot drift from the
 code. Closes the Web service / API cluster.
 
-- **Status:** `gap` — nothing comparable in Zig std or the ecosystem.
+- Nothing comparable in Zig std or the ecosystem.
 - **Model after:** FastAPI's auto-generated spec (the emitted document
   shape — operation key order, path-parameter objects, the default
   `"Successful Response"` 200) and utoipa (Rust; route-metadata→spec

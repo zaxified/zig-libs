@@ -4,7 +4,7 @@ Online round-trip-time statistics for probe/ping engines — running
 min / max / mean / population-stddev / **RFC 3550 jitter** / packet-loss %,
 O(1) per sample, zero allocation, no syscalls.
 
-- **Status:** `extract` — probe-path latency accounting, generalized as a
+- Probe-path latency accounting, generalized as a
   standalone module.
 - **Model after:** fping / iputils-ping summary stats + RFC 3550 §6.4.1
   interarrival jitter + Welford's online mean/variance.

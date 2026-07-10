@@ -5,7 +5,6 @@ five European code pages a legacy broker / Excel export is realistically saved
 in. Internal currency everywhere else is always UTF-8; this module only runs at
 the read edge (decode → UTF-8) and the write edge (encode ← UTF-8).
 
-- **Status:** `extract`.
 - **Model after:** WHATWG Encoding Standard (the single-byte European subset).
 - **Platform:** any (pure logic, no OS calls). **Role:** codec.
   **Concurrency:** reentrant (no shared state — the tables are `const`).

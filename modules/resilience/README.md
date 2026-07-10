@@ -17,7 +17,6 @@ the AWS Architecture Blog "Exponential Backoff And Jitter" (Brooker, 2015; the
 full/equal jitter taxonomy) — see NOTICE. Clock/delay-injection and spinlock
 patterns follow the `ratelimit`/`throttle` siblings.
 
-- **Status:** `gap`.
 - **Model after:** resilience4j + Polly + failsafe-go (see above).
 - **Platform:** posix (the default clock uses the posix `clock_gettime`
   errno form; the default delay uses posix `nanosleep`) — both injectable,

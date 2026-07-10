@@ -15,7 +15,6 @@ copied; the `csp_helmet_default` constant reproduces helmet's default policy
 standards: RFC 6797 (HSTS), CSP Level 3, Fetch/HTML specs (COOP/CORP/COEP),
 RFC 9110.
 
-- **Status:** `gap`.
 - **Model after:** helmet.js defaults + OWASP Secure Headers Project.
 - **Platform:** any. **Role:** util. **Concurrency:** reentrant — an
   initialized `SecurityHeaders` is immutable; no clock, no allocation, no

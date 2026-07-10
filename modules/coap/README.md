@@ -36,7 +36,7 @@ Codes carry their `class()`/`detail()` (`Code.content.class() == 2`), and any
 code builds with `Code.init(class, detail)`. Options are value-agnostic here —
 the typed registry (Uri-Path = 11, Content-Format = 12, …) is the next part.
 
-- **Status:** `gap`. **Role:** util. **Platform:** any. **Deps:** none (std
+- **Role:** util. **Platform:** any. **Deps:** none (std
   only). **Concurrency:** reentrant — no shared state; results borrow the
   caller's buffers.
 

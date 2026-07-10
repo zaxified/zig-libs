@@ -4,7 +4,7 @@ Web Linking (**RFC 8288**) `Link` header **builder + parser** — the little
 codec every REST client needs for pagination:
 `<https://api/x?page=2>; rel="next", <https://api/x?page=1>; rel="prev"`.
 
-- **Status:** `gap` — std has no Web-Linking codec; clean-room from the RFC.
+- Std has no Web-Linking codec; clean-room from the RFC.
 - **Model after:** RFC 8288 (Web Linking), the `Link` header field.
 - **Platform:** any (pure byte logic, no OS calls). **Role:** codec.
   **Concurrency:** reentrant (no shared state). **Allocation:** none — the

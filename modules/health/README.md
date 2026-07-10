@@ -28,7 +28,7 @@ var h = health.Health{ .checks = &checks };
 try r.use(h.middleware());
 ```
 
-- **Status:** `gap`. **Role:** util. **Platform:** any. **Deps:** `router`,
+- **Role:** util. **Platform:** any. **Deps:** `router`,
   `http`. **Concurrency:** threadsafe — the config is immutable; readiness is as
   thread-safe as your `Check` callbacks (run on the connection thread; make
   them non-blocking atomic-flag loads).

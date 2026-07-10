@@ -3,7 +3,7 @@
 DNS resolver: RFC 1035 message codec + UDP/TCP/DoH transports, forward
 (A/AAAA) and reverse (PTR) lookups.
 
-- **Status:** extract + gap — the /etc/hosts + UDP-PTR core is derived from
+- The /etc/hosts + UDP-PTR core is derived from
   fping's rdns logic; the general codec, TCP, EDNS(0) and DoH fill a
   real std gap (`std.Io.net.HostName.lookup` is forward-only and opaque — no
   PTR, no server/transport control, no DoH).

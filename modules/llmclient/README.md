@@ -5,7 +5,7 @@ An Anthropic Messages API client (`POST /v1/messages`) over the sibling
 `Client.stream`/`EventIterator` built on a new client-side Server-Sent
 Events line-accumulator (`sse_parse`).
 
-- **Status:** gap — greenfield client for the Anthropic Messages API;
+- Greenfield client for the Anthropic Messages API;
   nothing in Zig std or the ecosystem worth adopting for this.
 - **Model after:** the Anthropic Messages API wire contract (request/response
   JSON shapes, SSE event sequence) and the WHATWG "server-sent events"

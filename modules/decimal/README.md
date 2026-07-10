@@ -5,7 +5,7 @@ Exact base-10 **fixed-point decimal** for money and ETL math. Values are an
 `DECIMAL(38,12)`. `0.1 + 0.2 == 0.3`, exactly; the whole parse → arithmetic →
 format path is pure integer (no `f64`/`f128` anywhere).
 
-- **Status:** `extract` — pure-integer core (no `f80`), proven on 40M-row
+- Pure-integer core (no `f80`), proven on 40M-row
   ETL runs.
 - **Model after:** Java `BigDecimal` / Python `decimal` semantics, but
   fixed-scale like DB `DECIMAL(38,12)`.

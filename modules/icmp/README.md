@@ -4,7 +4,7 @@ ICMP echo (**ping**) engine: pure ICMPv4/v6 **echo codec**, unprivileged/raw
 **ICMP sockets**, and a paced multi-target **Pinger** built for monitoring
 workloads (thousands of host checks per cycle).
 
-- **Status:** `extract` — derived from fping's icmp/socket/pinger logic
+- Derived from fping's icmp/socket/pinger logic
   (netaddr was the first carve-out from the same lineage).
 - **Model after:** fping (schweikert/fping) `main_loop` — plus scaling
   additions (binary-heap scheduling, in-flight cap, per-subnet spacing,

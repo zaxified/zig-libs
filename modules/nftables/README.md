@@ -6,7 +6,7 @@ representation, and feed the bytes to `nft -j -f -` (or `nft -c -j -f -` to
 check without applying). Lets a program manage the Linux firewall natively
 instead of assembling `nft` command strings by hand.
 
-- **Status:** gap — no pure-Zig nftables library exists.
+- No pure-Zig nftables library exists.
 - **Platform:** any (the JSON is portable data; *applying* it needs the Linux
   `nft` binary). We deliberately do not reimplement netlink or libnftables —
   the documented `nft -j` JSON schema is the stable interface.

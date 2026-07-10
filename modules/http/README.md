@@ -2,7 +2,7 @@
 
 HTTP/1.1 client **and server** in pure Zig (client TLS over `std.crypto.tls`).
 
-- **Status:** `extract+gap` — HTTP/1.1 client + server, HTTP/2 in progress.
+- HTTP/1.1 client + server, HTTP/2 in progress.
 - **Model after:** `lalinsky/dusty` (1.1 client shape) + Go `net/http`
   (redirect/header semantics, Server shape); `nghttp2` + h2spec later for
   HTTP/2.

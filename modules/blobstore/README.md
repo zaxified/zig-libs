@@ -5,7 +5,7 @@ get back its SHA-256 address; identical content is stored **once**. Plus a
 name-addressed raw layer and small opaque **named** records — all made
 crash-safe by temp-then-atomic-rename.
 
-- **Status:** `extract` — spec-completed: single-pass `put`, `verify`,
+- Spec-completed: single-pass `put`, `verify`,
   segment validation, `Digest`, `named` generalization.
 - **Model after:** git object store / restic (256-way hex fan-out, dedup).
 - **Platform:** posix (visibility relies on atomic `rename(2)`; filesystem via

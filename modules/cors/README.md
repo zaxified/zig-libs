@@ -12,7 +12,6 @@ without CORS headers) and expressjs/cors (MIT — the reflect-request-headers
 default). Protocol semantics from the WHATWG Fetch standard (CORS protocol)
 and RFC 9110. No source copied.
 
-- **Status:** `gap`.
 - **Model after:** rs/cors (Go) + expressjs/cors.
 - **Platform:** any. **Role:** util. **Concurrency:** reentrant — an
   initialized `Cors` is immutable; no clock, no locks, no hidden globals;

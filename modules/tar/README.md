@@ -6,7 +6,7 @@ packer**. One tar implementation for backup/restore pipelines: parse archives
 produced by GNU tar/busybox, emit archives GNU tar extracts, and round-trip
 byte-faithfully through both.
 
-- **Status:** `extract` — the writer packs device backups (`sysupgrade -b`
+- The writer packs device backups (`sysupgrade -b`
   style) and the
   reader ingests them into a content-addressed vault.
 - **Model after:** GNU tar / libarchive (behavior only — headers implemented

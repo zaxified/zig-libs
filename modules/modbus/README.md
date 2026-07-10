@@ -5,7 +5,7 @@ Pure-Zig **Modbus protocol codec + client (master)** for **Modbus TCP** and
 allocation-free wire codec plus a transport-agnostic master that can drive
 real devices or simulated fleets.
 
-- **Status:** gap — no mature pure-Zig Modbus library exists.
+- No mature pure-Zig Modbus library exists.
 - **Platform:** any (the codec and client are pure computation; only the
   optional `TcpTransport` demo adapter touches `std.Io.net`).
 - **Model after:** Modbus Application Protocol V1.1b3 / libmodbus (behavior).

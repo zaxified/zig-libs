@@ -8,7 +8,7 @@ evaluates it — the `=cmd|'/c calc'!A1` / DDE class of attack. This module
 neutralizes such a cell by prefixing a single apostrophe (`'`), forcing the
 spreadsheet to render the cell as literal text.
 
-- **Status:** `extract` — the injection guard only; decimal-separator
+- The injection guard only; decimal-separator
   remapping and RFC 4180 quoting are deliberately left to the CSV writer /
   csvstream consumer.
 - **Model after:** OWASP CSV Injection prevention.

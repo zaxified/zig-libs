@@ -4,7 +4,7 @@ Dataset algebra over [`dataset`](../dataset): pure `dataset → dataset` verbs.
 Nothing mutates in place — every transform takes an allocator (normally a
 caller-owned pipeline arena) and returns a new `Dataset`.
 
-- **Status:** `extract` — dataset-algebra verbs over the `dataset` module.
+- Dataset-algebra verbs over the `dataset` module.
 - **Model after:** pandas / dplyr verb algebra + technical-analysis
   rolling-window idioms.
 - **Platform:** any. **Role:** util. **Concurrency:** reentrant (no shared

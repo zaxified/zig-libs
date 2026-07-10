@@ -4,7 +4,7 @@ DB-less durable keyed document store: one flat file per record under
 `<base>/<kind>/<key>`, written atomically (temp-then-rename), with a thin
 typed-JSON convenience layer over the same raw-bytes files.
 
-- **Status:** `extract` — spec-completed: atomic writes, path validation,
+- Spec-completed: atomic writes, path validation,
   listTyped skip-count.
 - **Model after:** flat-file document store.
 - **Platform:** posix (visibility relies on atomic `rename(2)`; filesystem via

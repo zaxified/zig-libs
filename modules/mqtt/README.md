@@ -5,7 +5,7 @@ machine and a server (broker). Pairs with `modbus` for the IoT / industrial
 (SCADA-sim) work: a typed, allocation-free wire codec plus a
 transport-agnostic client and a broker, all fully offline-testable.
 
-- **Status:** gap — no mature pure-Zig MQTT library exists.
+- No mature pure-Zig MQTT library exists.
 - **Platform:** any (codec + client are pure computation; only the optional
   `TcpTransport` adapter touches `std.Io.net`).
 - **Model after:** MQTT 3.1.1 (OASIS) / mosquitto+paho behavior.

@@ -5,7 +5,7 @@ HTTP with the **HTTP-01** challenge (Let's Encrypt et al.) — directory
 discovery, nonce management, ES256 account (JWS), order → authorization →
 challenge → CSR finalize → PEM chain download, plus the renewal predicate.
 
-- **Status:** gap — no ACME client exists in Zig std or as a maintained
+- No ACME client exists in Zig std or as a maintained
   pure-Zig library worth adopting.
 - **Model after:** `golang.org/x/crypto/acme` (client semantics: nonce
   refill from every response, badNonce retry, POST-as-GET) and certbot's

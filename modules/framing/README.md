@@ -6,7 +6,7 @@ one module.
 
 Provenance: original work of the zig-libs authors (MIT). No third-party code.
 
-- **Status:** extract. **Platform:** any (pure `std`: `std.Io.Writer`/
+- **Platform:** any (pure `std`: `std.Io.Writer`/
   `std.Io.Reader` + `std.json`; dependency-free). **Role:** codec.
 - **Concurrency:** reentrant — no shared/global state.
 

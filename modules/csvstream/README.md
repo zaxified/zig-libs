@@ -6,7 +6,6 @@ seek straight back to the exact source span (drill-down, `--trace`-style source
 locators, error reporting). Streams arbitrarily large files in **bounded
 memory** — peak is the chunk size, not the file size.
 
-- **Status:** `extract`.
 - **Model after:** RFC 4180 + byte-offset-preserving streaming.
 - **Platform:** any. **Role:** codec. **Concurrency:** reentrant (no shared
   state). **Deps:** none (std-only, pure Zig — no C/libc).

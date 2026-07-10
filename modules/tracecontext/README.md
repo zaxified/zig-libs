@@ -49,7 +49,7 @@ portable. They are **correlation** identifiers (unique for tracing), **not**
 unpredictable security tokens; W3C requires trace-ids to be unique, not random.
 If you need CSPRNG ids, mint them yourself and set `traceparent`.
 
-- **Status:** `gap`. **Role:** util. **Platform:** any. **Deps:** `router`,
+- **Role:** util. **Platform:** any. **Deps:** `router`,
   `http`. **Concurrency:** threadsafe — per-request state is thread-local (the
   server is task-per-connection: one request at a time per thread, so the
   context and the formatted header live until the response is flushed); the

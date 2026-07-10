@@ -14,7 +14,6 @@ notes only) and the SEDA architecture (Welsh et al., SOSP '01; bounded-queue
 load shedding) — see NOTICE. Clock-injection patterns follow the
 `ratelimit` sibling module.
 
-- **Status:** `gap`.
 - **Model after:** Go `golang.org/x/sync/semaphore` (tryAcquire never
   blocks, failed attempts consume nothing, acquire/release pairing) + SEDA /
   Netflix concurrency-limits (static limit, bounded queue, fast rejection).

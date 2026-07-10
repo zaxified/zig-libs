@@ -7,7 +7,6 @@ IP reputation + connection-abuse defense for a **directly internet-facing**
 accept time — a reject costs the attacker only a TCP handshake and writes
 nothing (the server's documented `on_connect` posture; no polite 503).
 
-- **Status:** `gap`.
 - **Model after:** nginx `limit_conn` (per-key concurrent-connection caps,
   zone-exhaustion semantics) + fail2ban (strike → temporary ban → recidive
   escalation) + Cloudflare-style IP reputation (ban/greylist lists).

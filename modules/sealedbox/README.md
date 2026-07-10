@@ -4,7 +4,7 @@ NaCl `crypto_box_seal` — **anonymous-sender** public-key encryption. Encrypt t
 recipient's X25519 public key with no sender key (a fresh ephemeral keypair per
 message); the recipient cannot identify the sender.
 
-- **Status:** `extract` — a thin, faithful wrapper over `std.crypto.nacl.SealedBox`.
+- A thin, faithful wrapper over `std.crypto.nacl.SealedBox`.
 - **Model after:** libsodium `crypto_box_seal` / Go `nacl/box`. Thin, faithful
   wrapper over `std.crypto.nacl.SealedBox` — **no custom crypto**.
 - **Platform:** any. **Role:** util. **Concurrency:** reentrant.

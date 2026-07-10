@@ -12,7 +12,6 @@ Provenance: clean-room from the GitHub / Stripe webhook-HMAC convention
 compare and the middleware shape mirror the sibling `aaa-gate` module (same
 repo, MIT).
 
-- **Status:** `gap`.
 - **Model after:** GitHub / Stripe webhook HMAC signatures; RFC 2104 HMAC.
 - **Platform:** any. **Role:** server. **Concurrency:** threadsafe — the
   `Verifier` is immutable after `init` (fixed secret set + config, no
