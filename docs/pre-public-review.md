@@ -5,11 +5,14 @@ provenance/license audit + loose-ends, dark-tests check, the 10-target adversari
 pass (findings fixed), the jwt safe-by-default decision, the kv VOPR fault-sweep, AND the four
 previously-deferred production-readiness items (mqtt broker hardening, sessions cross-request
 CAS, coap admission-hook/DTLS-seam, kv out-of-order-durability) are now RESOLVED (see the
-per-item ✅ entries below). Suite: 1833/1843, Debug + ReleaseFast green. Remaining before a
-release tag: (1) honor the **fping Stanford attribution obligation** (NOTICE §1 — MIT for own
-code but not obligation-free); (2) a multi-threaded stress/race pass on the mqtt broker (its
-in-module tests are socket-free/single-threaded + a deterministic lock-probe). This file can be
-deleted once those two are handled — the review itself is done.
+per-item ✅ entries below). Suite: 1834/1844, Debug + ReleaseFast green. The mqtt broker's multi-threaded stress/race pass
+is now DONE (`ff88bd2` — 16 real threads over loopback + valgrind; no race/UAF/deadlock; note Zig
+0.16 `-fsanitize-thread` is a verified no-op, so the pass is real-thread stress + valgrind, not
+TSan). **Nothing actionable remains in the repo.** The only standing item is a REDISTRIBUTION
+constraint, not a task: the **fping Stanford attribution** (NOTICE §1) travels with the code and is
+already satisfied by the correct NOTICE + README licensing note being in place — anyone shipping
+zig-libs (or the 4 fping-lineage modules) must keep NOTICE §1. This file can be deleted; the review
+is complete.
 
 ## Progress (2026-07-09)
 
@@ -84,8 +87,9 @@ Highlights:
   (snapshot-under-lock, per-conn tx_lock, atomic refs for mid-fan-out safety; a LockProbe test
   proves the lock is dropped before writes); (B) per-subscriber delivery failure contained to that
   subscriber (publisher survives); (C) takeover shuts the superseded socket (zombie reaped); (D)
-  optional auth + ACL hooks. Residual (documented): QoS2/persistent-sessions/Will/TLS unimplemented;
-  a multi-threaded stress/race pass recommended before release. 58 tests, green Debug + RF.
+  optional auth + ACL hooks. The multi-threaded stress/race pass is now DONE (`ff88bd2` — 16 real
+  threads over loopback + adversarial interleavings + valgrind; no race/UAF/deadlock/leak).
+  Residual (documented scope, not blockers): QoS2/persistent-sessions/Will/TLS unimplemented. Green.
 - **✅ RESOLVED 2026-07-10 — sessions cross-request race (`c1bc3d7`):** store-level optimistic
   concurrency — each record carries a monotonic generation; save() is a CAS (write only if the
   generation matches load-time), delete/regenerate bump it so a stale save from another in-flight
