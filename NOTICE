@@ -439,4 +439,14 @@ project git history).
                golang.org/x/crypto bcrypt_pbkdf reference vectors — all cited
                inline at their tests.
 
+  opcua      — clean-room from OPC 10000-6 (OPC UA Binary encoding + the
+               opc.tcp transport) and OPC 10000-4 (Services); both are open,
+               royalty-free specifications published by the OPC Foundation.
+               Design ref (behavioral/structural only, no source consulted or
+               copied): open62541 (MPL-2.0; module/layering shape) and
+               node-opcua (MIT; client API shape). SecurityMode=None only —
+               no crypto in this module; the secure-channel signing/encryption
+               layer is a separate later module (F9) depending on the `rsa`
+               module.
+
 See each module's README "Provenance" note for its specific design references.
