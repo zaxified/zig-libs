@@ -107,6 +107,53 @@ pub const type_id = struct {
     pub const activate_session_response = n0(470);
     pub const close_session_request = n0(473);
     pub const close_session_response = n0(476);
+    pub const read_request = n0(631);
+    pub const read_response = n0(634);
+    pub const write_request = n0(673);
+    pub const write_response = n0(676);
+    pub const browse_request = n0(527);
+    pub const browse_response = n0(530);
+    pub const browse_next_request = n0(533);
+    pub const browse_next_response = n0(536);
+    pub const call_request = n0(712);
+    pub const call_response = n0(715);
+};
+
+/// `AttributeId` (OPC Foundation UA-Nodeset `Schema/AttributeIds.csv`, MIT
+/// License 1.00) — a plain namespace of `u32` constants, not an enum:
+/// `ReadValueId.attribute_id`/`WriteValue.attribute_id` carry it as a bare
+/// UInt32 on the wire (OPC 10000-4 §7.28/§5.10.2.2), never enum-decoded (a
+/// server may in principle reject an attribute id this list doesn't name
+/// with a Bad status rather than the wire itself rejecting it).
+pub const attribute_id = struct {
+    pub const node_id: u32 = 1;
+    pub const node_class: u32 = 2;
+    pub const browse_name: u32 = 3;
+    pub const display_name: u32 = 4;
+    pub const description: u32 = 5;
+    pub const write_mask: u32 = 6;
+    pub const user_write_mask: u32 = 7;
+    pub const is_abstract: u32 = 8;
+    pub const symmetric: u32 = 9;
+    pub const inverse_name: u32 = 10;
+    pub const contains_no_loops: u32 = 11;
+    pub const event_notifier: u32 = 12;
+    /// The common case: the attribute `Session.readAttribute` defaults to.
+    pub const value: u32 = 13;
+    pub const data_type: u32 = 14;
+    pub const value_rank: u32 = 15;
+    pub const array_dimensions: u32 = 16;
+    pub const access_level: u32 = 17;
+    pub const user_access_level: u32 = 18;
+    pub const minimum_sampling_interval: u32 = 19;
+    pub const historizing: u32 = 20;
+    pub const executable: u32 = 21;
+    pub const user_executable: u32 = 22;
+    pub const data_type_definition: u32 = 23;
+    pub const role_permissions: u32 = 24;
+    pub const user_role_permissions: u32 = 25;
+    pub const access_restrictions: u32 = 26;
+    pub const access_level_ex: u32 = 27;
 };
 
 // ── enumerations (OPC 10000-4, encoded as OPC 10000-6 §5.1.3 4-byte
@@ -117,6 +164,17 @@ pub const SecurityTokenRequestType = enum(u32) { issue = 0, renew = 1 };
 pub const MessageSecurityMode = enum(u32) { invalid = 0, none = 1, sign = 2, sign_and_encrypt = 3 };
 pub const ApplicationType = enum(u32) { server = 0, client = 1, client_and_server = 2, discovery_server = 3 };
 pub const UserTokenType = enum(u32) { anonymous = 0, user_name = 1, certificate = 2, issued_token = 3 };
+/// OPC 10000-4 §7.44 (ground-truthed against the OPC Foundation schema's
+/// `TimestampsToReturn` `EnumeratedType`, which also declares `invalid = 4`
+/// as an explicit reject-this-request sentinel value some servers echo back).
+pub const TimestampsToReturn = enum(u32) { source = 0, server = 1, both = 2, neither = 3, invalid = 4 };
+/// OPC 10000-4 §7.6 (`BrowseDescription.browse_direction`).
+pub const BrowseDirection = enum(u32) { forward = 0, inverse = 1, both = 2, invalid = 3 };
+/// OPC 10000-4 §7.20 (`ReferenceDescription.node_class`) — a bit-flag
+/// `EnumeratedType` per the schema (each node has exactly one class in
+/// practice; `BrowseDescription.node_class_mask` ORs these together as a
+/// plain `u32`, not through this enum).
+pub const NodeClass = enum(u32) { unspecified = 0, object = 1, variable = 2, method = 4, object_type = 8, variable_type = 16, reference_type = 32, data_type = 64, view = 128 };
 
 fn encodeEnum(e: *encoding.Encoder, comptime T: type, v: T) encoding.EncodeError!void {
     try e.writer.writeInt(u32, @intFromEnum(v), .little);
@@ -170,11 +228,22 @@ fn freeStringArray(a: std.mem.Allocator, arr: ?[]const ?[]const u8) void {
     }
 }
 
-fn freeDiagnosticInfo(a: std.mem.Allocator, di: encoding.DiagnosticInfo) void {
+pub fn freeDiagnosticInfo(a: std.mem.Allocator, di: encoding.DiagnosticInfo) void {
     freeOptStr(a, di.additional_info);
     if (di.inner_diagnostic_info) |p| {
         freeDiagnosticInfo(a, p.*);
         a.destroy(p);
+    }
+}
+
+/// Frees a `?[]const DiagnosticInfo` (the `DiagnosticInfos` sibling array
+/// every Part 4 response carries next to its `Results`) — shared by
+/// `freeReadResponse`/`freeWriteResponse`/`freeBrowseResponse`/
+/// `freeBrowseNextResponse`/`freeCallResponse` below.
+fn freeDiagnosticInfoArray(a: std.mem.Allocator, arr: ?[]const encoding.DiagnosticInfo) void {
+    if (arr) |infos| {
+        for (infos) |di| freeDiagnosticInfo(a, di);
+        a.free(infos);
     }
 }
 
@@ -800,6 +869,571 @@ pub fn freeServiceFault(a: std.mem.Allocator, v: ServiceFault) void {
     freeResponseHeader(a, v.response_header);
 }
 
+// ── Part 4: Read (§5.10.2), Write (§5.10.4), Browse/BrowseNext (§5.8.2/
+// §5.8.3), Call (§5.11.2) ────────────────────────────────────────────────────
+// Field order for every structure below is ground-truthed the same way F2's
+// was: the OPC Foundation's `Schema/Opc.Ua.Types.bsd` (structures) and
+// `Schema/AttributeIds.csv`/`Schema/NodeIds.csv` (the `AttributeId` constants
+// and each request/response's `..._Encoding_DefaultBinary` numeric NodeId),
+// fetched directly rather than inferred from the prose spec.
+
+pub const ReadValueId = struct {
+    node_id: encoding.NodeId,
+    attribute_id: u32,
+    index_range: ?[]const u8,
+    data_encoding: encoding.QualifiedName,
+};
+
+pub fn encodeReadValueId(e: *encoding.Encoder, v: ReadValueId) encoding.EncodeError!void {
+    try e.encodeNodeId(v.node_id);
+    try e.writer.writeInt(u32, v.attribute_id, .little);
+    try e.encodeString(v.index_range);
+    try e.encodeQualifiedName(v.data_encoding);
+}
+
+pub fn decodeReadValueId(d: *encoding.Decoder) encoding.DecodeError!ReadValueId {
+    return .{
+        .node_id = try d.decodeNodeId(),
+        .attribute_id = try d.decodeUInt32(),
+        .index_range = try d.decodeString(),
+        .data_encoding = try d.decodeQualifiedName(),
+    };
+}
+
+pub fn freeReadValueId(a: std.mem.Allocator, v: ReadValueId) void {
+    encoding.freeNodeId(a, v.node_id);
+    freeOptStr(a, v.index_range);
+    encoding.freeQualifiedName(a, v.data_encoding);
+}
+
+fn freeReadValueIdArray(a: std.mem.Allocator, arr: ?[]const ReadValueId) void {
+    if (arr) |items| {
+        for (items) |it| freeReadValueId(a, it);
+        a.free(items);
+    }
+}
+
+pub const ReadRequest = struct {
+    request_header: RequestHeader,
+    max_age: f64,
+    timestamps_to_return: TimestampsToReturn,
+    nodes_to_read: ?[]const ReadValueId,
+};
+
+pub fn encodeReadRequest(e: *encoding.Encoder, v: ReadRequest) encoding.EncodeError!void {
+    try encodeRequestHeader(e, v.request_header);
+    try e.encodeDouble(v.max_age);
+    try encodeEnum(e, TimestampsToReturn, v.timestamps_to_return);
+    try encodeArray(e, ReadValueId, v.nodes_to_read, encodeReadValueId);
+}
+
+pub fn decodeReadRequest(d: *encoding.Decoder) encoding.DecodeError!ReadRequest {
+    return .{
+        .request_header = try decodeRequestHeader(d),
+        .max_age = try d.decodeDouble(),
+        .timestamps_to_return = try decodeEnum(d, TimestampsToReturn),
+        .nodes_to_read = try decodeArray(d, ReadValueId, decodeReadValueId),
+    };
+}
+
+pub fn freeReadRequest(a: std.mem.Allocator, v: ReadRequest) void {
+    freeRequestHeader(a, v.request_header);
+    freeReadValueIdArray(a, v.nodes_to_read);
+}
+
+pub const ReadResponse = struct {
+    response_header: ResponseHeader,
+    results: ?[]const encoding.DataValue,
+    diagnostic_infos: ?[]const encoding.DiagnosticInfo,
+};
+
+pub fn encodeReadResponse(e: *encoding.Encoder, v: ReadResponse) encoding.EncodeError!void {
+    try encodeResponseHeader(e, v.response_header);
+    try encodeArray(e, encoding.DataValue, v.results, encoding.Encoder.encodeDataValue);
+    try encodeArray(e, encoding.DiagnosticInfo, v.diagnostic_infos, encoding.Encoder.encodeDiagnosticInfo);
+}
+
+pub fn decodeReadResponse(d: *encoding.Decoder) encoding.DecodeError!ReadResponse {
+    return .{
+        .response_header = try decodeResponseHeader(d),
+        .results = try decodeArray(d, encoding.DataValue, encoding.Decoder.decodeDataValue),
+        .diagnostic_infos = try decodeArray(d, encoding.DiagnosticInfo, encoding.Decoder.decodeDiagnosticInfo),
+    };
+}
+
+pub fn freeReadResponse(a: std.mem.Allocator, v: ReadResponse) void {
+    freeResponseHeader(a, v.response_header);
+    if (v.results) |items| {
+        for (items) |dv| encoding.freeDataValue(a, dv);
+        a.free(items);
+    }
+    freeDiagnosticInfoArray(a, v.diagnostic_infos);
+}
+
+pub const WriteValue = struct {
+    node_id: encoding.NodeId,
+    attribute_id: u32,
+    index_range: ?[]const u8,
+    value: encoding.DataValue,
+};
+
+pub fn encodeWriteValue(e: *encoding.Encoder, v: WriteValue) encoding.EncodeError!void {
+    try e.encodeNodeId(v.node_id);
+    try e.writer.writeInt(u32, v.attribute_id, .little);
+    try e.encodeString(v.index_range);
+    try e.encodeDataValue(v.value);
+}
+
+pub fn decodeWriteValue(d: *encoding.Decoder) encoding.DecodeError!WriteValue {
+    return .{
+        .node_id = try d.decodeNodeId(),
+        .attribute_id = try d.decodeUInt32(),
+        .index_range = try d.decodeString(),
+        .value = try d.decodeDataValue(),
+    };
+}
+
+pub fn freeWriteValue(a: std.mem.Allocator, v: WriteValue) void {
+    encoding.freeNodeId(a, v.node_id);
+    freeOptStr(a, v.index_range);
+    encoding.freeDataValue(a, v.value);
+}
+
+fn freeWriteValueArray(a: std.mem.Allocator, arr: ?[]const WriteValue) void {
+    if (arr) |items| {
+        for (items) |it| freeWriteValue(a, it);
+        a.free(items);
+    }
+}
+
+pub const WriteRequest = struct {
+    request_header: RequestHeader,
+    nodes_to_write: ?[]const WriteValue,
+};
+
+pub fn encodeWriteRequest(e: *encoding.Encoder, v: WriteRequest) encoding.EncodeError!void {
+    try encodeRequestHeader(e, v.request_header);
+    try encodeArray(e, WriteValue, v.nodes_to_write, encodeWriteValue);
+}
+
+pub fn decodeWriteRequest(d: *encoding.Decoder) encoding.DecodeError!WriteRequest {
+    return .{
+        .request_header = try decodeRequestHeader(d),
+        .nodes_to_write = try decodeArray(d, WriteValue, decodeWriteValue),
+    };
+}
+
+pub fn freeWriteRequest(a: std.mem.Allocator, v: WriteRequest) void {
+    freeRequestHeader(a, v.request_header);
+    freeWriteValueArray(a, v.nodes_to_write);
+}
+
+pub const WriteResponse = struct {
+    response_header: ResponseHeader,
+    results: ?[]const encoding.StatusCode,
+    diagnostic_infos: ?[]const encoding.DiagnosticInfo,
+};
+
+pub fn encodeWriteResponse(e: *encoding.Encoder, v: WriteResponse) encoding.EncodeError!void {
+    try encodeResponseHeader(e, v.response_header);
+    try encodeArray(e, encoding.StatusCode, v.results, encoding.Encoder.encodeStatusCode);
+    try encodeArray(e, encoding.DiagnosticInfo, v.diagnostic_infos, encoding.Encoder.encodeDiagnosticInfo);
+}
+
+pub fn decodeWriteResponse(d: *encoding.Decoder) encoding.DecodeError!WriteResponse {
+    return .{
+        .response_header = try decodeResponseHeader(d),
+        .results = try decodeArray(d, encoding.StatusCode, encoding.Decoder.decodeStatusCode),
+        .diagnostic_infos = try decodeArray(d, encoding.DiagnosticInfo, encoding.Decoder.decodeDiagnosticInfo),
+    };
+}
+
+pub fn freeWriteResponse(a: std.mem.Allocator, v: WriteResponse) void {
+    freeResponseHeader(a, v.response_header);
+    if (v.results) |r| a.free(r);
+    freeDiagnosticInfoArray(a, v.diagnostic_infos);
+}
+
+pub const ViewDescription = struct {
+    view_id: encoding.NodeId,
+    timestamp: encoding.DateTime,
+    view_version: u32,
+};
+
+/// The "no view" default (`ViewDescription` with a null `ViewId`) —
+/// `BrowseRequest.View` when the caller doesn't want a view-restricted
+/// browse (the common case).
+pub const no_view: ViewDescription = .{ .view_id = null_node_id, .timestamp = 0, .view_version = 0 };
+
+pub fn encodeViewDescription(e: *encoding.Encoder, v: ViewDescription) encoding.EncodeError!void {
+    try e.encodeNodeId(v.view_id);
+    try e.encodeDateTime(v.timestamp);
+    try e.writer.writeInt(u32, v.view_version, .little);
+}
+
+pub fn decodeViewDescription(d: *encoding.Decoder) encoding.DecodeError!ViewDescription {
+    return .{
+        .view_id = try d.decodeNodeId(),
+        .timestamp = try d.decodeDateTime(),
+        .view_version = try d.decodeUInt32(),
+    };
+}
+
+pub fn freeViewDescription(a: std.mem.Allocator, v: ViewDescription) void {
+    encoding.freeNodeId(a, v.view_id);
+}
+
+pub const BrowseDescription = struct {
+    node_id: encoding.NodeId,
+    browse_direction: BrowseDirection,
+    reference_type_id: encoding.NodeId,
+    include_subtypes: bool,
+    node_class_mask: u32,
+    result_mask: u32,
+};
+
+pub fn encodeBrowseDescription(e: *encoding.Encoder, v: BrowseDescription) encoding.EncodeError!void {
+    try e.encodeNodeId(v.node_id);
+    try encodeEnum(e, BrowseDirection, v.browse_direction);
+    try e.encodeNodeId(v.reference_type_id);
+    try e.encodeBoolean(v.include_subtypes);
+    try e.writer.writeInt(u32, v.node_class_mask, .little);
+    try e.writer.writeInt(u32, v.result_mask, .little);
+}
+
+pub fn decodeBrowseDescription(d: *encoding.Decoder) encoding.DecodeError!BrowseDescription {
+    return .{
+        .node_id = try d.decodeNodeId(),
+        .browse_direction = try decodeEnum(d, BrowseDirection),
+        .reference_type_id = try d.decodeNodeId(),
+        .include_subtypes = try d.decodeBoolean(),
+        .node_class_mask = try d.decodeUInt32(),
+        .result_mask = try d.decodeUInt32(),
+    };
+}
+
+pub fn freeBrowseDescription(a: std.mem.Allocator, v: BrowseDescription) void {
+    encoding.freeNodeId(a, v.node_id);
+    encoding.freeNodeId(a, v.reference_type_id);
+}
+
+fn freeBrowseDescriptionArray(a: std.mem.Allocator, arr: ?[]const BrowseDescription) void {
+    if (arr) |items| {
+        for (items) |it| freeBrowseDescription(a, it);
+        a.free(items);
+    }
+}
+
+pub const BrowseRequest = struct {
+    request_header: RequestHeader,
+    view: ViewDescription,
+    requested_max_references_per_node: u32,
+    nodes_to_browse: ?[]const BrowseDescription,
+};
+
+pub fn encodeBrowseRequest(e: *encoding.Encoder, v: BrowseRequest) encoding.EncodeError!void {
+    try encodeRequestHeader(e, v.request_header);
+    try encodeViewDescription(e, v.view);
+    try e.writer.writeInt(u32, v.requested_max_references_per_node, .little);
+    try encodeArray(e, BrowseDescription, v.nodes_to_browse, encodeBrowseDescription);
+}
+
+pub fn decodeBrowseRequest(d: *encoding.Decoder) encoding.DecodeError!BrowseRequest {
+    return .{
+        .request_header = try decodeRequestHeader(d),
+        .view = try decodeViewDescription(d),
+        .requested_max_references_per_node = try d.decodeUInt32(),
+        .nodes_to_browse = try decodeArray(d, BrowseDescription, decodeBrowseDescription),
+    };
+}
+
+pub fn freeBrowseRequest(a: std.mem.Allocator, v: BrowseRequest) void {
+    freeRequestHeader(a, v.request_header);
+    freeViewDescription(a, v.view);
+    freeBrowseDescriptionArray(a, v.nodes_to_browse);
+}
+
+pub const ReferenceDescription = struct {
+    reference_type_id: encoding.NodeId,
+    is_forward: bool,
+    node_id: encoding.ExpandedNodeId,
+    browse_name: encoding.QualifiedName,
+    display_name: encoding.LocalizedText,
+    node_class: NodeClass,
+    type_definition: encoding.ExpandedNodeId,
+};
+
+pub fn encodeReferenceDescription(e: *encoding.Encoder, v: ReferenceDescription) encoding.EncodeError!void {
+    try e.encodeNodeId(v.reference_type_id);
+    try e.encodeBoolean(v.is_forward);
+    try e.encodeExpandedNodeId(v.node_id);
+    try e.encodeQualifiedName(v.browse_name);
+    try e.encodeLocalizedText(v.display_name);
+    try encodeEnum(e, NodeClass, v.node_class);
+    try e.encodeExpandedNodeId(v.type_definition);
+}
+
+pub fn decodeReferenceDescription(d: *encoding.Decoder) encoding.DecodeError!ReferenceDescription {
+    return .{
+        .reference_type_id = try d.decodeNodeId(),
+        .is_forward = try d.decodeBoolean(),
+        .node_id = try d.decodeExpandedNodeId(),
+        .browse_name = try d.decodeQualifiedName(),
+        .display_name = try d.decodeLocalizedText(),
+        .node_class = try decodeEnum(d, NodeClass),
+        .type_definition = try d.decodeExpandedNodeId(),
+    };
+}
+
+pub fn freeReferenceDescription(a: std.mem.Allocator, v: ReferenceDescription) void {
+    encoding.freeNodeId(a, v.reference_type_id);
+    encoding.freeExpandedNodeId(a, v.node_id);
+    encoding.freeQualifiedName(a, v.browse_name);
+    encoding.freeLocalizedText(a, v.display_name);
+    encoding.freeExpandedNodeId(a, v.type_definition);
+}
+
+pub const BrowseResult = struct {
+    status_code: encoding.StatusCode,
+    continuation_point: ?[]const u8,
+    references: ?[]const ReferenceDescription,
+};
+
+pub fn encodeBrowseResult(e: *encoding.Encoder, v: BrowseResult) encoding.EncodeError!void {
+    try e.encodeStatusCode(v.status_code);
+    try e.encodeByteString(v.continuation_point);
+    try encodeArray(e, ReferenceDescription, v.references, encodeReferenceDescription);
+}
+
+pub fn decodeBrowseResult(d: *encoding.Decoder) encoding.DecodeError!BrowseResult {
+    return .{
+        .status_code = try d.decodeStatusCode(),
+        .continuation_point = try d.decodeByteString(),
+        .references = try decodeArray(d, ReferenceDescription, decodeReferenceDescription),
+    };
+}
+
+pub fn freeBrowseResult(a: std.mem.Allocator, v: BrowseResult) void {
+    freeOptStr(a, v.continuation_point);
+    if (v.references) |items| {
+        for (items) |r| freeReferenceDescription(a, r);
+        a.free(items);
+    }
+}
+
+fn freeBrowseResultArray(a: std.mem.Allocator, arr: ?[]const BrowseResult) void {
+    if (arr) |items| {
+        for (items) |it| freeBrowseResult(a, it);
+        a.free(items);
+    }
+}
+
+pub const BrowseResponse = struct {
+    response_header: ResponseHeader,
+    results: ?[]const BrowseResult,
+    diagnostic_infos: ?[]const encoding.DiagnosticInfo,
+};
+
+pub fn encodeBrowseResponse(e: *encoding.Encoder, v: BrowseResponse) encoding.EncodeError!void {
+    try encodeResponseHeader(e, v.response_header);
+    try encodeArray(e, BrowseResult, v.results, encodeBrowseResult);
+    try encodeArray(e, encoding.DiagnosticInfo, v.diagnostic_infos, encoding.Encoder.encodeDiagnosticInfo);
+}
+
+pub fn decodeBrowseResponse(d: *encoding.Decoder) encoding.DecodeError!BrowseResponse {
+    return .{
+        .response_header = try decodeResponseHeader(d),
+        .results = try decodeArray(d, BrowseResult, decodeBrowseResult),
+        .diagnostic_infos = try decodeArray(d, encoding.DiagnosticInfo, encoding.Decoder.decodeDiagnosticInfo),
+    };
+}
+
+pub fn freeBrowseResponse(a: std.mem.Allocator, v: BrowseResponse) void {
+    freeResponseHeader(a, v.response_header);
+    freeBrowseResultArray(a, v.results);
+    freeDiagnosticInfoArray(a, v.diagnostic_infos);
+}
+
+pub const BrowseNextRequest = struct {
+    request_header: RequestHeader,
+    release_continuation_points: bool,
+    continuation_points: ?[]const ?[]const u8,
+};
+
+pub fn encodeBrowseNextRequest(e: *encoding.Encoder, v: BrowseNextRequest) encoding.EncodeError!void {
+    try encodeRequestHeader(e, v.request_header);
+    try e.encodeBoolean(v.release_continuation_points);
+    try encodeArray(e, ?[]const u8, v.continuation_points, encodeStringItem);
+}
+
+pub fn decodeBrowseNextRequest(d: *encoding.Decoder) encoding.DecodeError!BrowseNextRequest {
+    return .{
+        .request_header = try decodeRequestHeader(d),
+        .release_continuation_points = try d.decodeBoolean(),
+        .continuation_points = try decodeArray(d, ?[]const u8, decodeStringItem),
+    };
+}
+
+pub fn freeBrowseNextRequest(a: std.mem.Allocator, v: BrowseNextRequest) void {
+    freeRequestHeader(a, v.request_header);
+    freeStringArray(a, v.continuation_points);
+}
+
+/// `BrowseNextResponse` is wire-identical in shape to `BrowseResponse` (same
+/// `Results: BrowseResult[]` + `DiagnosticInfos` pair — OPC 10000-4 §5.8.3);
+/// modeled as its own type (rather than a `const` alias) to keep every Part 4
+/// response a distinct type `Channel.call`'s `comptime Response` parameter can
+/// key on.
+pub const BrowseNextResponse = struct {
+    response_header: ResponseHeader,
+    results: ?[]const BrowseResult,
+    diagnostic_infos: ?[]const encoding.DiagnosticInfo,
+};
+
+pub fn encodeBrowseNextResponse(e: *encoding.Encoder, v: BrowseNextResponse) encoding.EncodeError!void {
+    try encodeResponseHeader(e, v.response_header);
+    try encodeArray(e, BrowseResult, v.results, encodeBrowseResult);
+    try encodeArray(e, encoding.DiagnosticInfo, v.diagnostic_infos, encoding.Encoder.encodeDiagnosticInfo);
+}
+
+pub fn decodeBrowseNextResponse(d: *encoding.Decoder) encoding.DecodeError!BrowseNextResponse {
+    return .{
+        .response_header = try decodeResponseHeader(d),
+        .results = try decodeArray(d, BrowseResult, decodeBrowseResult),
+        .diagnostic_infos = try decodeArray(d, encoding.DiagnosticInfo, encoding.Decoder.decodeDiagnosticInfo),
+    };
+}
+
+pub fn freeBrowseNextResponse(a: std.mem.Allocator, v: BrowseNextResponse) void {
+    freeResponseHeader(a, v.response_header);
+    freeBrowseResultArray(a, v.results);
+    freeDiagnosticInfoArray(a, v.diagnostic_infos);
+}
+
+pub const CallMethodRequest = struct {
+    object_id: encoding.NodeId,
+    method_id: encoding.NodeId,
+    input_arguments: ?[]const encoding.Variant,
+};
+
+fn freeVariantArray(a: std.mem.Allocator, arr: ?[]const encoding.Variant) void {
+    if (arr) |items| {
+        for (items) |v| encoding.freeVariant(a, v);
+        a.free(items);
+    }
+}
+
+pub fn encodeCallMethodRequest(e: *encoding.Encoder, v: CallMethodRequest) encoding.EncodeError!void {
+    try e.encodeNodeId(v.object_id);
+    try e.encodeNodeId(v.method_id);
+    try encodeArray(e, encoding.Variant, v.input_arguments, encoding.Encoder.encodeVariant);
+}
+
+pub fn decodeCallMethodRequest(d: *encoding.Decoder) encoding.DecodeError!CallMethodRequest {
+    return .{
+        .object_id = try d.decodeNodeId(),
+        .method_id = try d.decodeNodeId(),
+        .input_arguments = try decodeArray(d, encoding.Variant, encoding.Decoder.decodeVariant),
+    };
+}
+
+pub fn freeCallMethodRequest(a: std.mem.Allocator, v: CallMethodRequest) void {
+    encoding.freeNodeId(a, v.object_id);
+    encoding.freeNodeId(a, v.method_id);
+    freeVariantArray(a, v.input_arguments);
+}
+
+fn freeCallMethodRequestArray(a: std.mem.Allocator, arr: ?[]const CallMethodRequest) void {
+    if (arr) |items| {
+        for (items) |it| freeCallMethodRequest(a, it);
+        a.free(items);
+    }
+}
+
+pub const CallRequest = struct {
+    request_header: RequestHeader,
+    methods_to_call: ?[]const CallMethodRequest,
+};
+
+pub fn encodeCallRequest(e: *encoding.Encoder, v: CallRequest) encoding.EncodeError!void {
+    try encodeRequestHeader(e, v.request_header);
+    try encodeArray(e, CallMethodRequest, v.methods_to_call, encodeCallMethodRequest);
+}
+
+pub fn decodeCallRequest(d: *encoding.Decoder) encoding.DecodeError!CallRequest {
+    return .{
+        .request_header = try decodeRequestHeader(d),
+        .methods_to_call = try decodeArray(d, CallMethodRequest, decodeCallMethodRequest),
+    };
+}
+
+pub fn freeCallRequest(a: std.mem.Allocator, v: CallRequest) void {
+    freeRequestHeader(a, v.request_header);
+    freeCallMethodRequestArray(a, v.methods_to_call);
+}
+
+pub const CallMethodResult = struct {
+    status_code: encoding.StatusCode,
+    input_argument_results: ?[]const encoding.StatusCode,
+    input_argument_diagnostic_infos: ?[]const encoding.DiagnosticInfo,
+    output_arguments: ?[]const encoding.Variant,
+};
+
+pub fn encodeCallMethodResult(e: *encoding.Encoder, v: CallMethodResult) encoding.EncodeError!void {
+    try e.encodeStatusCode(v.status_code);
+    try encodeArray(e, encoding.StatusCode, v.input_argument_results, encoding.Encoder.encodeStatusCode);
+    try encodeArray(e, encoding.DiagnosticInfo, v.input_argument_diagnostic_infos, encoding.Encoder.encodeDiagnosticInfo);
+    try encodeArray(e, encoding.Variant, v.output_arguments, encoding.Encoder.encodeVariant);
+}
+
+pub fn decodeCallMethodResult(d: *encoding.Decoder) encoding.DecodeError!CallMethodResult {
+    return .{
+        .status_code = try d.decodeStatusCode(),
+        .input_argument_results = try decodeArray(d, encoding.StatusCode, encoding.Decoder.decodeStatusCode),
+        .input_argument_diagnostic_infos = try decodeArray(d, encoding.DiagnosticInfo, encoding.Decoder.decodeDiagnosticInfo),
+        .output_arguments = try decodeArray(d, encoding.Variant, encoding.Decoder.decodeVariant),
+    };
+}
+
+pub fn freeCallMethodResult(a: std.mem.Allocator, v: CallMethodResult) void {
+    if (v.input_argument_results) |r| a.free(r);
+    freeDiagnosticInfoArray(a, v.input_argument_diagnostic_infos);
+    freeVariantArray(a, v.output_arguments);
+}
+
+fn freeCallMethodResultArray(a: std.mem.Allocator, arr: ?[]const CallMethodResult) void {
+    if (arr) |items| {
+        for (items) |it| freeCallMethodResult(a, it);
+        a.free(items);
+    }
+}
+
+pub const CallResponse = struct {
+    response_header: ResponseHeader,
+    results: ?[]const CallMethodResult,
+    diagnostic_infos: ?[]const encoding.DiagnosticInfo,
+};
+
+pub fn encodeCallResponse(e: *encoding.Encoder, v: CallResponse) encoding.EncodeError!void {
+    try encodeResponseHeader(e, v.response_header);
+    try encodeArray(e, CallMethodResult, v.results, encodeCallMethodResult);
+    try encodeArray(e, encoding.DiagnosticInfo, v.diagnostic_infos, encoding.Encoder.encodeDiagnosticInfo);
+}
+
+pub fn decodeCallResponse(d: *encoding.Decoder) encoding.DecodeError!CallResponse {
+    return .{
+        .response_header = try decodeResponseHeader(d),
+        .results = try decodeArray(d, CallMethodResult, decodeCallMethodResult),
+        .diagnostic_infos = try decodeArray(d, encoding.DiagnosticInfo, encoding.Decoder.decodeDiagnosticInfo),
+    };
+}
+
+pub fn freeCallResponse(a: std.mem.Allocator, v: CallResponse) void {
+    freeResponseHeader(a, v.response_header);
+    freeCallMethodResultArray(a, v.results);
+    freeDiagnosticInfoArray(a, v.diagnostic_infos);
+}
+
 // ── Channel: chunked send/recv of one service call ──────────────────────────
 
 /// Per-chunk body buffer and reassembly-scratch sizes. Sized comfortably
@@ -998,12 +1632,32 @@ fn activateSessionResult(r: ActivateSessionResponse) encoding.StatusCode {
 fn closeSessionResult(r: CloseSessionResponse) encoding.StatusCode {
     return r.response_header.service_result;
 }
+fn readResult(r: ReadResponse) encoding.StatusCode {
+    return r.response_header.service_result;
+}
+fn writeResult(r: WriteResponse) encoding.StatusCode {
+    return r.response_header.service_result;
+}
+fn browseResponseResult(r: BrowseResponse) encoding.StatusCode {
+    return r.response_header.service_result;
+}
+fn browseNextResult(r: BrowseNextResponse) encoding.StatusCode {
+    return r.response_header.service_result;
+}
+fn callResult(r: CallResponse) encoding.StatusCode {
+    return r.response_header.service_result;
+}
 
 pub const result_fns = struct {
     pub const open_secure_channel = openSecureChannelResult;
     pub const create_session = createSessionResult;
     pub const activate_session = activateSessionResult;
     pub const close_session = closeSessionResult;
+    pub const read = readResult;
+    pub const write = writeResult;
+    pub const browse = browseResponseResult;
+    pub const browse_next = browseNextResult;
+    pub const call = callResult;
 };
 
 // ── tests ──
@@ -1486,4 +2140,276 @@ test "Channel.call: full OPN send + recv over an in-memory pipe, ServiceFault ma
         ));
         try testing.expectEqual(@as(encoding.StatusCode, 0x80010000), ch.last_service_result);
     }
+}
+
+// ── Part 4 (Read/Write/Browse/BrowseNext/Call) tests ────────────────────────
+
+test "AttributeId/TimestampsToReturn/BrowseDirection/NodeClass: ground-truthed constant values" {
+    // OPC Foundation UA-Nodeset Schema/AttributeIds.csv + Opc.Ua.Types.bsd,
+    // fetched directly during implementation (see the Part 4 section's doc
+    // comment) rather than inferred from memory.
+    try testing.expectEqual(@as(u32, 13), attribute_id.value);
+    try testing.expectEqual(@as(u32, 1), attribute_id.node_id);
+    try testing.expectEqual(@as(u32, 27), attribute_id.access_level_ex);
+    try testing.expectEqual(@as(u32, 0), @intFromEnum(TimestampsToReturn.source));
+    try testing.expectEqual(@as(u32, 2), @intFromEnum(TimestampsToReturn.both));
+    try testing.expectEqual(@as(u32, 0), @intFromEnum(BrowseDirection.forward));
+    try testing.expectEqual(@as(u32, 1), @intFromEnum(NodeClass.object));
+    try testing.expectEqual(@as(u32, 2), @intFromEnum(NodeClass.variable));
+}
+
+test "ReadValueId/ReadRequest/ReadResponse round-trip (incl. Variant-array DataValue)" {
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var e = encoding.Encoder.init(&w);
+    const nodes = [_]ReadValueId{
+        .{ .node_id = .{ .numeric = .{ .namespace = 0, .id = 2258 } }, .attribute_id = attribute_id.value, .index_range = null, .data_encoding = .{ .namespace_index = 0, .name = null } },
+        .{ .node_id = .{ .numeric = .{ .namespace = 0, .id = 2255 } }, .attribute_id = attribute_id.value, .index_range = null, .data_encoding = .{ .namespace_index = 0, .name = null } },
+    };
+    const req: ReadRequest = .{
+        .request_header = .{ .authentication_token = null_node_id, .timestamp = 0, .request_handle = 1, .return_diagnostics = 0, .audit_entry_id = null, .timeout_hint = 0, .additional_header = no_additional_header },
+        .max_age = 0,
+        .timestamps_to_return = .both,
+        .nodes_to_read = &nodes,
+    };
+    try encodeReadRequest(&e, req);
+    var r: std.Io.Reader = .fixed(w.buffered());
+    var d = encoding.Decoder.init(&r, testing.allocator);
+    const decoded = try decodeReadRequest(&d);
+    defer freeReadRequest(testing.allocator, decoded);
+    try testing.expectEqual(TimestampsToReturn.both, decoded.timestamps_to_return);
+    try testing.expectEqual(@as(usize, 2), decoded.nodes_to_read.?.len);
+    try testing.expectEqual(attribute_id.value, decoded.nodes_to_read.?[0].attribute_id);
+
+    var buf2: [1024]u8 = undefined;
+    var w2: std.Io.Writer = .fixed(&buf2);
+    var e2 = encoding.Encoder.init(&w2);
+    const ns_array = [_]?[]const u8{ "http://opcfoundation.org/UA/", "urn:example" };
+    const results = [_]encoding.DataValue{
+        .{ .value = .{ .scalar = .{ .date_time = 132223104000000000 } }, .status = 0 },
+        .{ .value = .{ .array = .{ .items = .{ .string = &ns_array } } }, .status = 0 },
+    };
+    const resp: ReadResponse = .{
+        .response_header = .{ .timestamp = 0, .request_handle = 1, .service_result = 0, .service_diagnostics = .{}, .string_table = null, .additional_header = no_additional_header },
+        .results = &results,
+        .diagnostic_infos = null,
+    };
+    try encodeReadResponse(&e2, resp);
+    var r2: std.Io.Reader = .fixed(w2.buffered());
+    var d2 = encoding.Decoder.init(&r2, testing.allocator);
+    const decoded2 = try decodeReadResponse(&d2);
+    defer freeReadResponse(testing.allocator, decoded2);
+    try testing.expectEqual(@as(usize, 2), decoded2.results.?.len);
+    try testing.expectEqual(@as(encoding.DateTime, 132223104000000000), decoded2.results.?[0].value.?.scalar.date_time);
+    const got_ns = decoded2.results.?[1].value.?.array.items.string.?;
+    try testing.expectEqualStrings("http://opcfoundation.org/UA/", got_ns[0].?);
+    try testing.expectEqualStrings("urn:example", got_ns[1].?);
+}
+
+test "WriteValue/WriteRequest/WriteResponse round-trip" {
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var e = encoding.Encoder.init(&w);
+    const nodes = [_]WriteValue{.{
+        .node_id = .{ .numeric = .{ .namespace = 2, .id = 42 } },
+        .attribute_id = attribute_id.value,
+        .index_range = null,
+        .value = .{ .value = .{ .scalar = .{ .double = 3.5 } } },
+    }};
+    const req: WriteRequest = .{
+        .request_header = .{ .authentication_token = null_node_id, .timestamp = 0, .request_handle = 1, .return_diagnostics = 0, .audit_entry_id = null, .timeout_hint = 0, .additional_header = no_additional_header },
+        .nodes_to_write = &nodes,
+    };
+    try encodeWriteRequest(&e, req);
+    var r: std.Io.Reader = .fixed(w.buffered());
+    var d = encoding.Decoder.init(&r, testing.allocator);
+    const decoded = try decodeWriteRequest(&d);
+    defer freeWriteRequest(testing.allocator, decoded);
+    try testing.expectEqual(@as(f64, 3.5), decoded.nodes_to_write.?[0].value.value.?.scalar.double);
+
+    var buf2: [256]u8 = undefined;
+    var w2: std.Io.Writer = .fixed(&buf2);
+    var e2 = encoding.Encoder.init(&w2);
+    const results = [_]encoding.StatusCode{ 0, 0x80740000 }; // BadNotWritable-shaped
+    const resp: WriteResponse = .{
+        .response_header = .{ .timestamp = 0, .request_handle = 1, .service_result = 0, .service_diagnostics = .{}, .string_table = null, .additional_header = no_additional_header },
+        .results = &results,
+        .diagnostic_infos = null,
+    };
+    try encodeWriteResponse(&e2, resp);
+    var r2: std.Io.Reader = .fixed(w2.buffered());
+    var d2 = encoding.Decoder.init(&r2, testing.allocator);
+    const decoded2 = try decodeWriteResponse(&d2);
+    defer freeWriteResponse(testing.allocator, decoded2);
+    try testing.expectEqual(@as(usize, 2), decoded2.results.?.len);
+    try testing.expect(isBad(decoded2.results.?[1]));
+}
+
+test "ViewDescription/BrowseDescription/BrowseRequest round-trip" {
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var e = encoding.Encoder.init(&w);
+    const nodes = [_]BrowseDescription{.{
+        .node_id = .{ .numeric = .{ .namespace = 0, .id = 85 } }, // Objects folder
+        .browse_direction = .forward,
+        .reference_type_id = null_node_id,
+        .include_subtypes = true,
+        .node_class_mask = 0,
+        .result_mask = 0x3f,
+    }};
+    const req: BrowseRequest = .{
+        .request_header = .{ .authentication_token = null_node_id, .timestamp = 0, .request_handle = 1, .return_diagnostics = 0, .audit_entry_id = null, .timeout_hint = 0, .additional_header = no_additional_header },
+        .view = no_view,
+        .requested_max_references_per_node = 0,
+        .nodes_to_browse = &nodes,
+    };
+    try encodeBrowseRequest(&e, req);
+    var r: std.Io.Reader = .fixed(w.buffered());
+    var d = encoding.Decoder.init(&r, testing.allocator);
+    const decoded = try decodeBrowseRequest(&d);
+    defer freeBrowseRequest(testing.allocator, decoded);
+    try testing.expectEqual(BrowseDirection.forward, decoded.nodes_to_browse.?[0].browse_direction);
+    try testing.expectEqual(@as(u32, 0x3f), decoded.nodes_to_browse.?[0].result_mask);
+}
+
+test "ReferenceDescription/BrowseResult/BrowseResponse round-trip (nested references)" {
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var e = encoding.Encoder.init(&w);
+    const refs = [_]ReferenceDescription{.{
+        .reference_type_id = .{ .numeric = .{ .namespace = 0, .id = 35 } }, // Organizes
+        .is_forward = true,
+        .node_id = .{ .node_id = .{ .numeric = .{ .namespace = 0, .id = 2253 } } }, // Server
+        .browse_name = .{ .namespace_index = 0, .name = "Server" },
+        .display_name = .{ .locale = "en", .text = "Server" },
+        .node_class = .object,
+        .type_definition = .{ .node_id = .{ .numeric = .{ .namespace = 0, .id = 2004 } } },
+    }};
+    const results = [_]BrowseResult{.{
+        .status_code = 0,
+        .continuation_point = null,
+        .references = &refs,
+    }};
+    const resp: BrowseResponse = .{
+        .response_header = .{ .timestamp = 0, .request_handle = 1, .service_result = 0, .service_diagnostics = .{}, .string_table = null, .additional_header = no_additional_header },
+        .results = &results,
+        .diagnostic_infos = null,
+    };
+    try encodeBrowseResponse(&e, resp);
+    var r: std.Io.Reader = .fixed(w.buffered());
+    var d = encoding.Decoder.init(&r, testing.allocator);
+    const decoded = try decodeBrowseResponse(&d);
+    defer freeBrowseResponse(testing.allocator, decoded);
+    try testing.expectEqual(@as(usize, 1), decoded.results.?.len);
+    const got_refs = decoded.results.?[0].references.?;
+    try testing.expectEqual(@as(usize, 1), got_refs.len);
+    try testing.expectEqualStrings("Server", got_refs[0].browse_name.name.?);
+    try testing.expectEqualStrings("Server", got_refs[0].display_name.text.?);
+    try testing.expectEqual(NodeClass.object, got_refs[0].node_class);
+    try testing.expectEqualDeep(refs[0].node_id, got_refs[0].node_id);
+}
+
+test "BrowseNextRequest/BrowseNextResponse round-trip (paging a continuation point)" {
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var e = encoding.Encoder.init(&w);
+    const cps = [_]?[]const u8{"\x01\x02\x03"};
+    const req: BrowseNextRequest = .{
+        .request_header = .{ .authentication_token = null_node_id, .timestamp = 0, .request_handle = 1, .return_diagnostics = 0, .audit_entry_id = null, .timeout_hint = 0, .additional_header = no_additional_header },
+        .release_continuation_points = false,
+        .continuation_points = &cps,
+    };
+    try encodeBrowseNextRequest(&e, req);
+    var r: std.Io.Reader = .fixed(w.buffered());
+    var d = encoding.Decoder.init(&r, testing.allocator);
+    const decoded = try decodeBrowseNextRequest(&d);
+    defer freeBrowseNextRequest(testing.allocator, decoded);
+    try testing.expectEqual(false, decoded.release_continuation_points);
+    try testing.expectEqualSlices(u8, "\x01\x02\x03", decoded.continuation_points.?[0].?);
+
+    var buf2: [512]u8 = undefined;
+    var w2: std.Io.Writer = .fixed(&buf2);
+    var e2 = encoding.Encoder.init(&w2);
+    const results = [_]BrowseResult{.{ .status_code = 0, .continuation_point = null, .references = null }};
+    const resp: BrowseNextResponse = .{
+        .response_header = .{ .timestamp = 0, .request_handle = 1, .service_result = 0, .service_diagnostics = .{}, .string_table = null, .additional_header = no_additional_header },
+        .results = &results,
+        .diagnostic_infos = null,
+    };
+    try encodeBrowseNextResponse(&e2, resp);
+    var r2: std.Io.Reader = .fixed(w2.buffered());
+    var d2 = encoding.Decoder.init(&r2, testing.allocator);
+    const decoded2 = try decodeBrowseNextResponse(&d2);
+    defer freeBrowseNextResponse(testing.allocator, decoded2);
+    try testing.expectEqual(@as(usize, 1), decoded2.results.?.len);
+}
+
+test "CallMethodRequest/CallRequest round-trip (Variant input arguments)" {
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var e = encoding.Encoder.init(&w);
+    const args = [_]encoding.Variant{
+        .{ .scalar = .{ .int32 = 42 } },
+        .{ .array = .{ .items = .{ .double = &[_]f64{ 1.5, 2.5 } } } },
+    };
+    const methods = [_]CallMethodRequest{.{
+        .object_id = .{ .numeric = .{ .namespace = 1, .id = 100 } },
+        .method_id = .{ .numeric = .{ .namespace = 1, .id = 101 } },
+        .input_arguments = &args,
+    }};
+    const req: CallRequest = .{
+        .request_header = .{ .authentication_token = null_node_id, .timestamp = 0, .request_handle = 1, .return_diagnostics = 0, .audit_entry_id = null, .timeout_hint = 0, .additional_header = no_additional_header },
+        .methods_to_call = &methods,
+    };
+    try encodeCallRequest(&e, req);
+    var r: std.Io.Reader = .fixed(w.buffered());
+    var d = encoding.Decoder.init(&r, testing.allocator);
+    const decoded = try decodeCallRequest(&d);
+    defer freeCallRequest(testing.allocator, decoded);
+    const got_args = decoded.methods_to_call.?[0].input_arguments.?;
+    try testing.expectEqual(@as(i32, 42), got_args[0].scalar.int32);
+    try testing.expectEqualSlices(f64, &[_]f64{ 1.5, 2.5 }, got_args[1].array.items.double.?);
+}
+
+test "CallMethodResult/CallResponse round-trip (nested StatusCode/Variant arrays)" {
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var e = encoding.Encoder.init(&w);
+    const input_results = [_]encoding.StatusCode{ 0, 0 };
+    const output_args = [_]encoding.Variant{.{ .scalar = .{ .boolean = true } }};
+    const results = [_]CallMethodResult{.{
+        .status_code = 0,
+        .input_argument_results = &input_results,
+        .input_argument_diagnostic_infos = null,
+        .output_arguments = &output_args,
+    }};
+    const resp: CallResponse = .{
+        .response_header = .{ .timestamp = 0, .request_handle = 1, .service_result = 0, .service_diagnostics = .{}, .string_table = null, .additional_header = no_additional_header },
+        .results = &results,
+        .diagnostic_infos = null,
+    };
+    try encodeCallResponse(&e, resp);
+    var r: std.Io.Reader = .fixed(w.buffered());
+    var d = encoding.Decoder.init(&r, testing.allocator);
+    const decoded = try decodeCallResponse(&d);
+    defer freeCallResponse(testing.allocator, decoded);
+    try testing.expectEqual(@as(usize, 2), decoded.results.?[0].input_argument_results.?.len);
+    try testing.expectEqual(true, decoded.results.?[0].output_arguments.?[0].scalar.boolean);
+}
+
+test "ServiceFault-shaped ReadResponse: BadServiceResult surfaces via isBad" {
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var e = encoding.Encoder.init(&w);
+    const resp: ReadResponse = .{
+        .response_header = .{ .timestamp = 0, .request_handle = 1, .service_result = 0x80390000, .service_diagnostics = .{}, .string_table = null, .additional_header = no_additional_header },
+        .results = null,
+        .diagnostic_infos = null,
+    };
+    try encodeReadResponse(&e, resp);
+    var r: std.Io.Reader = .fixed(w.buffered());
+    var d = encoding.Decoder.init(&r, testing.allocator);
+    const decoded = try decodeReadResponse(&d);
+    defer freeReadResponse(testing.allocator, decoded);
+    try testing.expect(isBad(decoded.response_header.service_result));
 }

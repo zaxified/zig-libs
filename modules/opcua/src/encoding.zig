@@ -177,23 +177,63 @@ pub const VariantScalar = union(enum) {
     extension_object: ExtensionObject,
 };
 
-/// A dynamically-typed value: `Read`/`Write`'s payload type. `scalar == null`
-/// is the empty Variant (encoding byte `0x00`, no value at all).
-pub const Variant = struct {
-    scalar: ?VariantScalar = null,
-    // TODO(agent): array support — the encoding byte's `0x80` (ValueIsArray)
-    // and `0x40` (ArrayDimensions present) bits, and the two shapes they
-    // imply: a flat array of `scalar`'s type, and (with `0x40`) a
-    // multi-dimensional `ArrayDimensions: Int32[]` alongside it. Not modeled
-    // yet — decide the storage (owned slice via the Decoder's allocator vs.
-    // a caller-supplied buffer) when this is filled in. `decodeVariant`
-    // surfaces `error.UnsupportedType` for any array-flagged input rather
-    // than silently misparsing it.
+/// A dynamically-typed value: `Read`/`Write`'s payload type — no value at all
+/// (`.empty`, wire mask `0x00`), one scalar of a built-in type (`.scalar`,
+/// mirrors `VariantScalar`), or an array of a built-in type (`.array`, wire
+/// mask bit `0x80`, optionally `0x40` for multi-dimensional — OPC 10000-6
+/// §5.2.2.16). A tagged union rather than `VariantScalar` plus a `bool` (or an
+/// optional array field alongside `scalar`) makes "scalar and array both set"
+/// — a combination the wire mask can never actually produce — unrepresentable.
+pub const Variant = union(enum) {
+    empty,
+    scalar: VariantScalar,
+    array: VariantArray,
+};
+
+/// The array-shaped half of `Variant`. `items` carries the flat element data
+/// (one slice per built-in type, `null` = the wire's "null array" i.e. Int32
+/// count `-1`, mirroring the `?[]const T` null/present-but-empty convention
+/// `services.zig`'s `encodeArray`/`decodeArray` already use for every other
+/// OPC UA array field — a present-but-empty slice is length 0, not `null`).
+/// `dimensions` is present (non-`null`) only when the wire's ArrayDimensions
+/// bit (`0x40`) is set: one `Int32` per dimension, product == the flat
+/// array's element count. Multi-dimensional arrays are stored flat in
+/// `items` either way — this module doesn't reshape them into a nested form.
+pub const VariantArray = struct {
+    items: VariantArrayItems,
+    dimensions: ?[]const i32 = null,
+};
+
+/// One array-of-T payload per built-in type (OPC 10000-6 §5.2.2.16 Table 14),
+/// the array-shaped mirror of `VariantScalar`.
+pub const VariantArrayItems = union(enum) {
+    boolean: ?[]const bool,
+    sbyte: ?[]const i8,
+    byte: ?[]const u8,
+    int16: ?[]const i16,
+    uint16: ?[]const u16,
+    int32: ?[]const i32,
+    uint32: ?[]const u32,
+    int64: ?[]const i64,
+    uint64: ?[]const u64,
+    float: ?[]const f32,
+    double: ?[]const f64,
+    string: ?[]const ?[]const u8,
+    date_time: ?[]const DateTime,
+    guid: ?[]const Guid,
+    byte_string: ?[]const ?[]const u8,
+    xml_element: ?[]const ?[]const u8,
+    node_id: ?[]const NodeId,
+    expanded_node_id: ?[]const ExpandedNodeId,
+    status_code: ?[]const StatusCode,
+    qualified_name: ?[]const QualifiedName,
+    localized_text: ?[]const LocalizedText,
+    extension_object: ?[]const ExtensionObject,
 };
 
 /// Maps a scalar's active tag to the Variant encoding byte's built-in type id
 /// (OPC 10000-6 §5.2.2.16 Table 14) — the mirror of the `switch` in
-/// `Decoder.decodeVariant`.
+/// `Decoder.decodeVariantScalarBody`.
 fn variantTypeId(v: VariantScalar) u8 {
     return switch (v) {
         .boolean => 1,
@@ -219,6 +259,63 @@ fn variantTypeId(v: VariantScalar) u8 {
         .localized_text => 21,
         .extension_object => 22,
     };
+}
+
+/// Same mapping as `variantTypeId`, over `VariantArrayItems`'s tags instead —
+/// the two enums name the same 22 built-in types 1:1, so the numeric ids
+/// match exactly.
+fn arrayTypeId(v: VariantArrayItems) u8 {
+    return switch (v) {
+        .boolean => 1,
+        .sbyte => 2,
+        .byte => 3,
+        .int16 => 4,
+        .uint16 => 5,
+        .int32 => 6,
+        .uint32 => 7,
+        .int64 => 8,
+        .uint64 => 9,
+        .float => 10,
+        .double => 11,
+        .string => 12,
+        .date_time => 13,
+        .guid => 14,
+        .byte_string => 15,
+        .xml_element => 16,
+        .node_id => 17,
+        .expanded_node_id => 18,
+        .status_code => 19,
+        .qualified_name => 20,
+        .localized_text => 21,
+        .extension_object => 22,
+    };
+}
+
+/// The array-of-`T` wire shape shared by every `VariantArrayItems` tag and by
+/// a multi-dimensional Variant's `ArrayDimensions` (`Int32` count, `-1` =
+/// null array — the same convention `services.zig`'s private `encodeArray`
+/// helper uses for every other OPC UA array field; duplicated here in miniature
+/// rather than imported since `encoding.zig` sits *below* `services.zig` in
+/// this module's dependency graph and can't import it back).
+fn encodeVariantArraySlice(e: *Encoder, comptime T: type, items: ?[]const T, comptime encodeItem: fn (*Encoder, T) EncodeError!void) EncodeError!void {
+    const arr = items orelse {
+        try e.writer.writeInt(i32, -1, .little);
+        return;
+    };
+    if (arr.len > std.math.maxInt(i32)) return error.ValueTooLarge;
+    try e.writer.writeInt(i32, @intCast(arr.len), .little);
+    for (arr) |item| try encodeItem(e, item);
+}
+
+fn decodeVariantArraySlice(d: *Decoder, comptime T: type, comptime decodeItem: fn (*Decoder) DecodeError!T) DecodeError!?[]T {
+    const len = try d.reader.takeInt(i32, .little);
+    if (len == -1) return null;
+    if (len < -1) return error.BadLength;
+    const n: usize = @intCast(len);
+    var list = try std.ArrayList(T).initCapacity(d.allocator, n);
+    errdefer list.deinit(d.allocator);
+    for (0..n) |_| list.appendAssumeCapacity(try decodeItem(d));
+    return try list.toOwnedSlice(d.allocator);
 }
 
 // ── DataValue (§5.2.2.17) ───────────────────────────────────────────────────
@@ -417,12 +514,7 @@ pub const Encoder = struct {
         }
     }
 
-    pub fn encodeVariant(e: *Encoder, value: Variant) EncodeError!void {
-        const scalar = value.scalar orelse {
-            try e.writer.writeByte(0);
-            return;
-        };
-        try e.writer.writeByte(variantTypeId(scalar));
+    fn encodeVariantScalarBody(e: *Encoder, scalar: VariantScalar) EncodeError!void {
         switch (scalar) {
             .boolean => |x| try e.encodeBoolean(x),
             .sbyte => |x| try e.encodeSByte(x),
@@ -446,6 +538,57 @@ pub const Encoder = struct {
             .qualified_name => |x| try e.encodeQualifiedName(x),
             .localized_text => |x| try e.encodeLocalizedText(x),
             .extension_object => |x| try e.encodeExtensionObject(x),
+        }
+    }
+
+    /// Writes just the array's element data (`Int32` count + elements, no
+    /// type-id/mask byte) — shared by every `VariantArrayItems` tag via
+    /// `encodeVariantArraySlice`.
+    fn encodeVariantArrayItems(e: *Encoder, items: VariantArrayItems) EncodeError!void {
+        switch (items) {
+            .boolean => |v| try encodeVariantArraySlice(e, bool, v, Encoder.encodeBoolean),
+            .sbyte => |v| try encodeVariantArraySlice(e, i8, v, Encoder.encodeSByte),
+            .byte => |v| try encodeVariantArraySlice(e, u8, v, Encoder.encodeByte),
+            .int16 => |v| try encodeVariantArraySlice(e, i16, v, Encoder.encodeInt16),
+            .uint16 => |v| try encodeVariantArraySlice(e, u16, v, Encoder.encodeUInt16),
+            .int32 => |v| try encodeVariantArraySlice(e, i32, v, Encoder.encodeInt32),
+            .uint32 => |v| try encodeVariantArraySlice(e, u32, v, Encoder.encodeUInt32),
+            .int64 => |v| try encodeVariantArraySlice(e, i64, v, Encoder.encodeInt64),
+            .uint64 => |v| try encodeVariantArraySlice(e, u64, v, Encoder.encodeUInt64),
+            .float => |v| try encodeVariantArraySlice(e, f32, v, Encoder.encodeFloat),
+            .double => |v| try encodeVariantArraySlice(e, f64, v, Encoder.encodeDouble),
+            .string => |v| try encodeVariantArraySlice(e, ?[]const u8, v, Encoder.encodeString),
+            .date_time => |v| try encodeVariantArraySlice(e, DateTime, v, Encoder.encodeDateTime),
+            .guid => |v| try encodeVariantArraySlice(e, Guid, v, Encoder.encodeGuid),
+            .byte_string => |v| try encodeVariantArraySlice(e, ?[]const u8, v, Encoder.encodeByteString),
+            .xml_element => |v| try encodeVariantArraySlice(e, ?[]const u8, v, Encoder.encodeXmlElement),
+            .node_id => |v| try encodeVariantArraySlice(e, NodeId, v, Encoder.encodeNodeId),
+            .expanded_node_id => |v| try encodeVariantArraySlice(e, ExpandedNodeId, v, Encoder.encodeExpandedNodeId),
+            .status_code => |v| try encodeVariantArraySlice(e, StatusCode, v, Encoder.encodeStatusCode),
+            .qualified_name => |v| try encodeVariantArraySlice(e, QualifiedName, v, Encoder.encodeQualifiedName),
+            .localized_text => |v| try encodeVariantArraySlice(e, LocalizedText, v, Encoder.encodeLocalizedText),
+            .extension_object => |v| try encodeVariantArraySlice(e, ExtensionObject, v, Encoder.encodeExtensionObject),
+        }
+    }
+
+    pub fn encodeVariant(e: *Encoder, value: Variant) EncodeError!void {
+        switch (value) {
+            .empty => try e.writer.writeByte(0),
+            .scalar => |scalar| {
+                try e.writer.writeByte(variantTypeId(scalar));
+                try e.encodeVariantScalarBody(scalar);
+            },
+            .array => |arr| {
+                var mask: u8 = 0x80 | arrayTypeId(arr.items);
+                if (arr.dimensions != null) mask |= 0x40;
+                try e.writer.writeByte(mask);
+                try e.encodeVariantArrayItems(arr.items);
+                if (arr.dimensions) |dims| {
+                    if (dims.len > std.math.maxInt(i32)) return error.ValueTooLarge;
+                    try e.writer.writeInt(i32, @intCast(dims.len), .little);
+                    for (dims) |dim| try e.writer.writeInt(i32, dim, .little);
+                }
+            },
         }
     }
 
@@ -672,14 +815,8 @@ pub const Decoder = struct {
         return .{ .type_id = type_id, .encoding = encoding, .body = body };
     }
 
-    pub fn decodeVariant(d: *Decoder) DecodeError!Variant {
-        const mask = try d.decodeByte();
-        if (mask == 0) return .{ .scalar = null };
-        // 0x80 ValueIsArray / 0x40 ArrayDimensions-present — deferred (see
-        // the TODO on `Variant`); surfaced as a typed error, never a panic.
-        if (mask & 0xc0 != 0) return error.UnsupportedType;
-        const type_id = mask & 0x3f;
-        const scalar: VariantScalar = switch (type_id) {
+    fn decodeVariantScalarBody(d: *Decoder, type_id: u8) DecodeError!VariantScalar {
+        return switch (type_id) {
             1 => .{ .boolean = try d.decodeBoolean() },
             2 => .{ .sbyte = try d.decodeSByte() },
             3 => .{ .byte = try d.decodeByte() },
@@ -703,11 +840,65 @@ pub const Decoder = struct {
             21 => .{ .localized_text = try d.decodeLocalizedText() },
             22 => .{ .extension_object = try d.decodeExtensionObject() },
             // 23=DataValue, 24=Variant, 25=DiagnosticInfo as a Variant payload
-            // — valid per spec but out of F1's scalar-Read/Write scope.
+            // — valid per spec but out of this module's scope (see the
+            // module doc comment: F1's Read/Write payload scope stops at the
+            // 22 "plain" built-in types; recursive Variant-of-Variant and
+            // DataValue/DiagnosticInfo-as-payload are deliberately not
+            // modeled, for scalars or arrays alike).
             23, 24, 25 => return error.UnsupportedType,
             else => return error.BadEncodingByte,
         };
-        return .{ .scalar = scalar };
+    }
+
+    /// Reads just the array's element data (`Int32` count + elements, no
+    /// mask byte) for built-in type id `type_id` (1..22) — the array-shaped
+    /// mirror of `decodeVariantScalarBody`.
+    fn decodeVariantArrayItems(d: *Decoder, type_id: u8) DecodeError!VariantArrayItems {
+        return switch (type_id) {
+            1 => .{ .boolean = try decodeVariantArraySlice(d, bool, Decoder.decodeBoolean) },
+            2 => .{ .sbyte = try decodeVariantArraySlice(d, i8, Decoder.decodeSByte) },
+            3 => .{ .byte = try decodeVariantArraySlice(d, u8, Decoder.decodeByte) },
+            4 => .{ .int16 = try decodeVariantArraySlice(d, i16, Decoder.decodeInt16) },
+            5 => .{ .uint16 = try decodeVariantArraySlice(d, u16, Decoder.decodeUInt16) },
+            6 => .{ .int32 = try decodeVariantArraySlice(d, i32, Decoder.decodeInt32) },
+            7 => .{ .uint32 = try decodeVariantArraySlice(d, u32, Decoder.decodeUInt32) },
+            8 => .{ .int64 = try decodeVariantArraySlice(d, i64, Decoder.decodeInt64) },
+            9 => .{ .uint64 = try decodeVariantArraySlice(d, u64, Decoder.decodeUInt64) },
+            10 => .{ .float = try decodeVariantArraySlice(d, f32, Decoder.decodeFloat) },
+            11 => .{ .double = try decodeVariantArraySlice(d, f64, Decoder.decodeDouble) },
+            12 => .{ .string = try decodeVariantArraySlice(d, ?[]const u8, Decoder.decodeString) },
+            13 => .{ .date_time = try decodeVariantArraySlice(d, DateTime, Decoder.decodeDateTime) },
+            14 => .{ .guid = try decodeVariantArraySlice(d, Guid, Decoder.decodeGuid) },
+            15 => .{ .byte_string = try decodeVariantArraySlice(d, ?[]const u8, Decoder.decodeByteString) },
+            16 => .{ .xml_element = try decodeVariantArraySlice(d, ?[]const u8, Decoder.decodeXmlElement) },
+            17 => .{ .node_id = try decodeVariantArraySlice(d, NodeId, Decoder.decodeNodeId) },
+            18 => .{ .expanded_node_id = try decodeVariantArraySlice(d, ExpandedNodeId, Decoder.decodeExpandedNodeId) },
+            19 => .{ .status_code = try decodeVariantArraySlice(d, StatusCode, Decoder.decodeStatusCode) },
+            20 => .{ .qualified_name = try decodeVariantArraySlice(d, QualifiedName, Decoder.decodeQualifiedName) },
+            21 => .{ .localized_text = try decodeVariantArraySlice(d, LocalizedText, Decoder.decodeLocalizedText) },
+            22 => .{ .extension_object = try decodeVariantArraySlice(d, ExtensionObject, Decoder.decodeExtensionObject) },
+            23, 24, 25 => return error.UnsupportedType,
+            else => return error.BadEncodingByte,
+        };
+    }
+
+    pub fn decodeVariant(d: *Decoder) DecodeError!Variant {
+        const mask = try d.decodeByte();
+        if (mask == 0) return .empty;
+        const type_id = mask & 0x3f;
+        const is_array = mask & 0x80 != 0;
+        const has_dims = mask & 0x40 != 0;
+        if (!is_array) {
+            // ArrayDimensions without ValueIsArray is a combination OPC
+            // 10000-6 §5.2.2.16 never produces — reject it like any other
+            // malformed encoding byte rather than silently ignoring the bit.
+            if (has_dims) return error.BadEncodingByte;
+            return .{ .scalar = try d.decodeVariantScalarBody(type_id) };
+        }
+        const items = try d.decodeVariantArrayItems(type_id);
+        errdefer freeVariantArrayItems(d.allocator, items);
+        const dimensions: ?[]const i32 = if (has_dims) try decodeVariantArraySlice(d, i32, Decoder.decodeInt32) else null;
+        return .{ .array = .{ .items = items, .dimensions = dimensions } };
     }
 
     pub fn decodeDataValue(d: *Decoder) DecodeError!DataValue {
@@ -743,6 +934,108 @@ pub const Decoder = struct {
     }
 };
 
+// ── free helpers ─────────────────────────────────────────────────────────────
+// Mirrors `services.zig`'s `free*` idiom (a plain function per owned type,
+// `allocator.free`/`.destroy` on exactly what `decode*` allocated) — needed
+// here now that `Variant`/`DataValue` can themselves own heap memory (array
+// elements, and scalar String/NodeId(string|byte_string)/QualifiedName/
+// LocalizedText/ExtensionObject payloads), which `services.zig`'s Part 4
+// response types (`ReadResponse`, `BrowseResponse`, …) embed.
+
+fn freeOptStr(a: std.mem.Allocator, s: ?[]const u8) void {
+    if (s) |bytes| a.free(bytes);
+}
+
+/// Frees the owned string inside a `.string`/`.byte_string` `NodeId`
+/// (`.numeric`/`.guid` own no memory).
+pub fn freeNodeId(a: std.mem.Allocator, v: NodeId) void {
+    switch (v) {
+        .numeric, .guid => {},
+        .string => |s| freeOptStr(a, s.id),
+        .byte_string => |s| freeOptStr(a, s.id),
+    }
+}
+
+pub fn freeExpandedNodeId(a: std.mem.Allocator, v: ExpandedNodeId) void {
+    freeNodeId(a, v.node_id);
+    freeOptStr(a, v.namespace_uri);
+}
+
+pub fn freeQualifiedName(a: std.mem.Allocator, v: QualifiedName) void {
+    freeOptStr(a, v.name);
+}
+
+pub fn freeLocalizedText(a: std.mem.Allocator, v: LocalizedText) void {
+    freeOptStr(a, v.locale);
+    freeOptStr(a, v.text);
+}
+
+pub fn freeExtensionObject(a: std.mem.Allocator, v: ExtensionObject) void {
+    freeNodeId(a, v.type_id);
+    if (v.body.len != 0) a.free(v.body);
+}
+
+pub fn freeVariantScalar(a: std.mem.Allocator, v: VariantScalar) void {
+    switch (v) {
+        .string, .byte_string, .xml_element => |s| freeOptStr(a, s),
+        .node_id => |n| freeNodeId(a, n),
+        .expanded_node_id => |en| freeExpandedNodeId(a, en),
+        .qualified_name => |q| freeQualifiedName(a, q),
+        .localized_text => |lt| freeLocalizedText(a, lt),
+        .extension_object => |eo| freeExtensionObject(a, eo),
+        .boolean, .sbyte, .byte, .int16, .uint16, .int32, .uint32, .int64, .uint64, .float, .double, .date_time, .guid, .status_code => {},
+    }
+}
+
+fn freeOptStrArray(a: std.mem.Allocator, arr: ?[]const ?[]const u8) void {
+    if (arr) |items| {
+        for (items) |s| freeOptStr(a, s);
+        a.free(items);
+    }
+}
+
+pub fn freeVariantArrayItems(a: std.mem.Allocator, v: VariantArrayItems) void {
+    switch (v) {
+        inline .boolean, .sbyte, .byte, .int16, .uint16, .int32, .uint32, .int64, .uint64, .float, .double, .date_time, .guid, .status_code => |arr| if (arr) |s| a.free(s),
+        .string, .byte_string, .xml_element => |arr| freeOptStrArray(a, arr),
+        .node_id => |arr| if (arr) |items| {
+            for (items) |n| freeNodeId(a, n);
+            a.free(items);
+        },
+        .expanded_node_id => |arr| if (arr) |items| {
+            for (items) |n| freeExpandedNodeId(a, n);
+            a.free(items);
+        },
+        .qualified_name => |arr| if (arr) |items| {
+            for (items) |q| freeQualifiedName(a, q);
+            a.free(items);
+        },
+        .localized_text => |arr| if (arr) |items| {
+            for (items) |lt| freeLocalizedText(a, lt);
+            a.free(items);
+        },
+        .extension_object => |arr| if (arr) |items| {
+            for (items) |eo| freeExtensionObject(a, eo);
+            a.free(items);
+        },
+    }
+}
+
+pub fn freeVariant(a: std.mem.Allocator, v: Variant) void {
+    switch (v) {
+        .empty => {},
+        .scalar => |s| freeVariantScalar(a, s),
+        .array => |arr| {
+            freeVariantArrayItems(a, arr.items);
+            if (arr.dimensions) |d| a.free(d);
+        },
+    }
+}
+
+pub fn freeDataValue(a: std.mem.Allocator, v: DataValue) void {
+    if (v.value) |val| freeVariant(a, val);
+}
+
 // ── tests ──
 
 test "types are constructible (no encode/decode invoked)" {
@@ -750,7 +1043,8 @@ test "types are constructible (no encode/decode invoked)" {
     const nid: NodeId = .{ .numeric = .{ .namespace = 0, .id = 2258 } };
     try testing.expect(nid == .numeric);
     const v: Variant = .{ .scalar = .{ .uint32 = 42 } };
-    try testing.expect(v.scalar.? == .uint32);
+    try testing.expect(v == .scalar);
+    try testing.expect(v.scalar == .uint32);
 }
 
 fn testWriter(buf: []u8) std.Io.Writer {
@@ -1085,7 +1379,7 @@ test "Variant: Int32 scalar KAT + round-trip" {
     var r: std.Io.Reader = .fixed(w.buffered());
     var d = Decoder.init(&r, testing.allocator);
     const decoded = try d.decodeVariant();
-    try testing.expectEqual(@as(i32, 42), decoded.scalar.?.int32);
+    try testing.expectEqual(@as(i32, 42), decoded.scalar.int32);
 }
 
 test "Variant: empty + String scalar round-trip" {
@@ -1095,12 +1389,12 @@ test "Variant: empty + String scalar round-trip" {
     {
         var w = testWriter(&buf);
         var e = Encoder.init(&w);
-        try e.encodeVariant(.{});
+        try e.encodeVariant(.empty);
         try testing.expectEqualSlices(u8, &.{0}, w.buffered());
         var r: std.Io.Reader = .fixed(w.buffered());
         var d = Decoder.init(&r, testing.allocator);
         const decoded = try d.decodeVariant();
-        try testing.expectEqual(@as(?VariantScalar, null), decoded.scalar);
+        try testing.expectEqual(@as(Variant, .empty), decoded);
     }
     {
         var w = testWriter(&buf);
@@ -1109,17 +1403,397 @@ test "Variant: empty + String scalar round-trip" {
         var r: std.Io.Reader = .fixed(w.buffered());
         var d = Decoder.init(&r, testing.allocator);
         const decoded = try d.decodeVariant();
-        defer testing.allocator.free(decoded.scalar.?.string.?);
-        try testing.expectEqualStrings("hi", decoded.scalar.?.string.?);
+        defer freeVariant(testing.allocator, decoded);
+        try testing.expectEqualStrings("hi", decoded.scalar.string.?);
     }
 }
 
-test "Variant: array-flagged input surfaces UnsupportedType, not a panic" {
+// ── Variant arrays (0x80 ValueIsArray / 0x40 ArrayDimensions) ───────────────
+
+test "Variant array: every built-in type round-trips (present array)" {
     const testing = std.testing;
-    var buf = [_]u8{ 0x80 | 6, 1, 0, 0, 0 }; // ValueIsArray | Int32
+    var buf: [1024]u8 = undefined;
+
+    {
+        var w = testWriter(&buf);
+        var e = Encoder.init(&w);
+        const arr = [_]bool{ true, false, true };
+        try e.encodeVariant(.{ .array = .{ .items = .{ .boolean = &arr } } });
+        try testing.expectEqualSlices(u8, &.{ 0x80 | 1, 3, 0, 0, 0, 1, 0, 1 }, w.buffered());
+        var r: std.Io.Reader = .fixed(w.buffered());
+        var d = Decoder.init(&r, testing.allocator);
+        const decoded = try d.decodeVariant();
+        defer freeVariant(testing.allocator, decoded);
+        try testing.expect(decoded == .array);
+        try testing.expectEqualSlices(bool, &arr, decoded.array.items.boolean.?);
+    }
+    {
+        var w = testWriter(&buf);
+        var e = Encoder.init(&w);
+        const arr = [_]i8{ -1, 2, -3 };
+        try e.encodeVariant(.{ .array = .{ .items = .{ .sbyte = &arr } } });
+        var r: std.Io.Reader = .fixed(w.buffered());
+        var d = Decoder.init(&r, testing.allocator);
+        const decoded = try d.decodeVariant();
+        defer freeVariant(testing.allocator, decoded);
+        try testing.expectEqualSlices(i8, &arr, decoded.array.items.sbyte.?);
+    }
+    {
+        var w = testWriter(&buf);
+        var e = Encoder.init(&w);
+        const arr = [_]u8{ 1, 2, 3 };
+        try e.encodeVariant(.{ .array = .{ .items = .{ .byte = &arr } } });
+        var r: std.Io.Reader = .fixed(w.buffered());
+        var d = Decoder.init(&r, testing.allocator);
+        const decoded = try d.decodeVariant();
+        defer freeVariant(testing.allocator, decoded);
+        try testing.expectEqualSlices(u8, &arr, decoded.array.items.byte.?);
+    }
+    {
+        var w = testWriter(&buf);
+        var e = Encoder.init(&w);
+        const arr = [_]i16{ -1, 2 };
+        try e.encodeVariant(.{ .array = .{ .items = .{ .int16 = &arr } } });
+        var r: std.Io.Reader = .fixed(w.buffered());
+        var d = Decoder.init(&r, testing.allocator);
+        const decoded = try d.decodeVariant();
+        defer freeVariant(testing.allocator, decoded);
+        try testing.expectEqualSlices(i16, &arr, decoded.array.items.int16.?);
+    }
+    {
+        var w = testWriter(&buf);
+        var e = Encoder.init(&w);
+        const arr = [_]u16{ 1, 2 };
+        try e.encodeVariant(.{ .array = .{ .items = .{ .uint16 = &arr } } });
+        var r: std.Io.Reader = .fixed(w.buffered());
+        var d = Decoder.init(&r, testing.allocator);
+        const decoded = try d.decodeVariant();
+        defer freeVariant(testing.allocator, decoded);
+        try testing.expectEqualSlices(u16, &arr, decoded.array.items.uint16.?);
+    }
+    {
+        var w = testWriter(&buf);
+        var e = Encoder.init(&w);
+        const arr = [_]i32{ -1, 2, 3 };
+        try e.encodeVariant(.{ .array = .{ .items = .{ .int32 = &arr } } });
+        var r: std.Io.Reader = .fixed(w.buffered());
+        var d = Decoder.init(&r, testing.allocator);
+        const decoded = try d.decodeVariant();
+        defer freeVariant(testing.allocator, decoded);
+        try testing.expectEqualSlices(i32, &arr, decoded.array.items.int32.?);
+    }
+    {
+        var w = testWriter(&buf);
+        var e = Encoder.init(&w);
+        const arr = [_]u32{ 1, 2, 3 };
+        try e.encodeVariant(.{ .array = .{ .items = .{ .uint32 = &arr } } });
+        var r: std.Io.Reader = .fixed(w.buffered());
+        var d = Decoder.init(&r, testing.allocator);
+        const decoded = try d.decodeVariant();
+        defer freeVariant(testing.allocator, decoded);
+        try testing.expectEqualSlices(u32, &arr, decoded.array.items.uint32.?);
+    }
+    {
+        var w = testWriter(&buf);
+        var e = Encoder.init(&w);
+        const arr = [_]i64{ -1, 2 };
+        try e.encodeVariant(.{ .array = .{ .items = .{ .int64 = &arr } } });
+        var r: std.Io.Reader = .fixed(w.buffered());
+        var d = Decoder.init(&r, testing.allocator);
+        const decoded = try d.decodeVariant();
+        defer freeVariant(testing.allocator, decoded);
+        try testing.expectEqualSlices(i64, &arr, decoded.array.items.int64.?);
+    }
+    {
+        var w = testWriter(&buf);
+        var e = Encoder.init(&w);
+        const arr = [_]u64{ 1, 2 };
+        try e.encodeVariant(.{ .array = .{ .items = .{ .uint64 = &arr } } });
+        var r: std.Io.Reader = .fixed(w.buffered());
+        var d = Decoder.init(&r, testing.allocator);
+        const decoded = try d.decodeVariant();
+        defer freeVariant(testing.allocator, decoded);
+        try testing.expectEqualSlices(u64, &arr, decoded.array.items.uint64.?);
+    }
+    {
+        var w = testWriter(&buf);
+        var e = Encoder.init(&w);
+        const arr = [_]f32{ 1.5, -2.5 };
+        try e.encodeVariant(.{ .array = .{ .items = .{ .float = &arr } } });
+        var r: std.Io.Reader = .fixed(w.buffered());
+        var d = Decoder.init(&r, testing.allocator);
+        const decoded = try d.decodeVariant();
+        defer freeVariant(testing.allocator, decoded);
+        try testing.expectEqualSlices(f32, &arr, decoded.array.items.float.?);
+    }
+    {
+        var w = testWriter(&buf);
+        var e = Encoder.init(&w);
+        const arr = [_]f64{ 1.5, -2.5 };
+        try e.encodeVariant(.{ .array = .{ .items = .{ .double = &arr } } });
+        var r: std.Io.Reader = .fixed(w.buffered());
+        var d = Decoder.init(&r, testing.allocator);
+        const decoded = try d.decodeVariant();
+        defer freeVariant(testing.allocator, decoded);
+        try testing.expectEqualSlices(f64, &arr, decoded.array.items.double.?);
+    }
+    {
+        var w = testWriter(&buf);
+        var e = Encoder.init(&w);
+        const arr = [_]?[]const u8{ "hello", "", null };
+        try e.encodeVariant(.{ .array = .{ .items = .{ .string = &arr } } });
+        var r: std.Io.Reader = .fixed(w.buffered());
+        var d = Decoder.init(&r, testing.allocator);
+        const decoded = try d.decodeVariant();
+        defer freeVariant(testing.allocator, decoded);
+        const got = decoded.array.items.string.?;
+        try testing.expectEqualStrings("hello", got[0].?);
+        try testing.expectEqual(@as(usize, 0), got[1].?.len);
+        try testing.expectEqual(@as(?[]const u8, null), got[2]);
+    }
+    {
+        var w = testWriter(&buf);
+        var e = Encoder.init(&w);
+        const arr = [_]DateTime{ 1, 2 };
+        try e.encodeVariant(.{ .array = .{ .items = .{ .date_time = &arr } } });
+        var r: std.Io.Reader = .fixed(w.buffered());
+        var d = Decoder.init(&r, testing.allocator);
+        const decoded = try d.decodeVariant();
+        defer freeVariant(testing.allocator, decoded);
+        try testing.expectEqualSlices(DateTime, &arr, decoded.array.items.date_time.?);
+    }
+    {
+        var w = testWriter(&buf);
+        var e = Encoder.init(&w);
+        const arr = [_]Guid{.{ .data1 = 1, .data2 = 2, .data3 = 3, .data4 = .{0} ** 8 }};
+        try e.encodeVariant(.{ .array = .{ .items = .{ .guid = &arr } } });
+        var r: std.Io.Reader = .fixed(w.buffered());
+        var d = Decoder.init(&r, testing.allocator);
+        const decoded = try d.decodeVariant();
+        defer freeVariant(testing.allocator, decoded);
+        try testing.expectEqualDeep(&arr, decoded.array.items.guid.?);
+    }
+    {
+        var w = testWriter(&buf);
+        var e = Encoder.init(&w);
+        const arr = [_]?[]const u8{ "\xde\xad", null };
+        try e.encodeVariant(.{ .array = .{ .items = .{ .byte_string = &arr } } });
+        var r: std.Io.Reader = .fixed(w.buffered());
+        var d = Decoder.init(&r, testing.allocator);
+        const decoded = try d.decodeVariant();
+        defer freeVariant(testing.allocator, decoded);
+        const got = decoded.array.items.byte_string.?;
+        try testing.expectEqualSlices(u8, "\xde\xad", got[0].?);
+        try testing.expectEqual(@as(?[]const u8, null), got[1]);
+    }
+    {
+        var w = testWriter(&buf);
+        var e = Encoder.init(&w);
+        const arr = [_]?[]const u8{"<a/>"};
+        try e.encodeVariant(.{ .array = .{ .items = .{ .xml_element = &arr } } });
+        var r: std.Io.Reader = .fixed(w.buffered());
+        var d = Decoder.init(&r, testing.allocator);
+        const decoded = try d.decodeVariant();
+        defer freeVariant(testing.allocator, decoded);
+        try testing.expectEqualStrings("<a/>", decoded.array.items.xml_element.?[0].?);
+    }
+    {
+        var w = testWriter(&buf);
+        var e = Encoder.init(&w);
+        const arr = [_]NodeId{ .{ .numeric = .{ .namespace = 0, .id = 2258 } }, .{ .string = .{ .namespace = 1, .id = "x" } } };
+        try e.encodeVariant(.{ .array = .{ .items = .{ .node_id = &arr } } });
+        var r: std.Io.Reader = .fixed(w.buffered());
+        var d = Decoder.init(&r, testing.allocator);
+        const decoded = try d.decodeVariant();
+        defer freeVariant(testing.allocator, decoded);
+        const got = decoded.array.items.node_id.?;
+        try testing.expectEqualDeep(arr[0], got[0]);
+        try testing.expectEqualStrings("x", got[1].string.id.?);
+    }
+    {
+        var w = testWriter(&buf);
+        var e = Encoder.init(&w);
+        const arr = [_]ExpandedNodeId{.{ .node_id = .{ .numeric = .{ .namespace = 0, .id = 5 } }, .namespace_uri = "urn:x", .server_index = 1 }};
+        try e.encodeVariant(.{ .array = .{ .items = .{ .expanded_node_id = &arr } } });
+        var r: std.Io.Reader = .fixed(w.buffered());
+        var d = Decoder.init(&r, testing.allocator);
+        const decoded = try d.decodeVariant();
+        defer freeVariant(testing.allocator, decoded);
+        try testing.expectEqualStrings("urn:x", decoded.array.items.expanded_node_id.?[0].namespace_uri.?);
+    }
+    {
+        var w = testWriter(&buf);
+        var e = Encoder.init(&w);
+        const arr = [_]StatusCode{ 0, 0x80010000 };
+        try e.encodeVariant(.{ .array = .{ .items = .{ .status_code = &arr } } });
+        var r: std.Io.Reader = .fixed(w.buffered());
+        var d = Decoder.init(&r, testing.allocator);
+        const decoded = try d.decodeVariant();
+        defer freeVariant(testing.allocator, decoded);
+        try testing.expectEqualSlices(StatusCode, &arr, decoded.array.items.status_code.?);
+    }
+    {
+        var w = testWriter(&buf);
+        var e = Encoder.init(&w);
+        const arr = [_]QualifiedName{.{ .namespace_index = 3, .name = "Temp" }};
+        try e.encodeVariant(.{ .array = .{ .items = .{ .qualified_name = &arr } } });
+        var r: std.Io.Reader = .fixed(w.buffered());
+        var d = Decoder.init(&r, testing.allocator);
+        const decoded = try d.decodeVariant();
+        defer freeVariant(testing.allocator, decoded);
+        try testing.expectEqualStrings("Temp", decoded.array.items.qualified_name.?[0].name.?);
+    }
+    {
+        var w = testWriter(&buf);
+        var e = Encoder.init(&w);
+        const arr = [_]LocalizedText{.{ .locale = "en", .text = "Hi" }};
+        try e.encodeVariant(.{ .array = .{ .items = .{ .localized_text = &arr } } });
+        var r: std.Io.Reader = .fixed(w.buffered());
+        var d = Decoder.init(&r, testing.allocator);
+        const decoded = try d.decodeVariant();
+        defer freeVariant(testing.allocator, decoded);
+        try testing.expectEqualStrings("Hi", decoded.array.items.localized_text.?[0].text.?);
+    }
+    {
+        var w = testWriter(&buf);
+        var e = Encoder.init(&w);
+        const arr = [_]ExtensionObject{.{ .type_id = .{ .numeric = .{ .namespace = 0, .id = 297 } }, .encoding = .byte_string, .body = "\x01\x02" }};
+        try e.encodeVariant(.{ .array = .{ .items = .{ .extension_object = &arr } } });
+        var r: std.Io.Reader = .fixed(w.buffered());
+        var d = Decoder.init(&r, testing.allocator);
+        const decoded = try d.decodeVariant();
+        defer freeVariant(testing.allocator, decoded);
+        try testing.expectEqualSlices(u8, "\x01\x02", decoded.array.items.extension_object.?[0].body);
+    }
+}
+
+test "Variant array: empty array vs null array are distinct, for a numeric/string/struct type each" {
+    const testing = std.testing;
+    var buf: [64]u8 = undefined;
+
+    // Empty (present, len 0) Int32 array: count 0, no elements.
+    {
+        var w = testWriter(&buf);
+        var e = Encoder.init(&w);
+        const arr = [_]i32{};
+        try e.encodeVariant(.{ .array = .{ .items = .{ .int32 = &arr } } });
+        try testing.expectEqualSlices(u8, &.{ 0x80 | 6, 0, 0, 0, 0 }, w.buffered());
+        var r: std.Io.Reader = .fixed(w.buffered());
+        var d = Decoder.init(&r, testing.allocator);
+        const decoded = try d.decodeVariant();
+        defer freeVariant(testing.allocator, decoded);
+        try testing.expectEqual(@as(usize, 0), decoded.array.items.int32.?.len);
+    }
+    // Null Int32 array: count -1, no elements, `items.int32 == null`.
+    {
+        var w = testWriter(&buf);
+        var e = Encoder.init(&w);
+        try e.encodeVariant(.{ .array = .{ .items = .{ .int32 = null } } });
+        try testing.expectEqualSlices(u8, &.{ 0x80 | 6, 0xff, 0xff, 0xff, 0xff }, w.buffered());
+        var r: std.Io.Reader = .fixed(w.buffered());
+        var d = Decoder.init(&r, testing.allocator);
+        const decoded = try d.decodeVariant();
+        defer freeVariant(testing.allocator, decoded);
+        try testing.expectEqual(@as(?[]const i32, null), decoded.array.items.int32);
+    }
+    // Empty String array.
+    {
+        var w = testWriter(&buf);
+        var e = Encoder.init(&w);
+        const arr = [_]?[]const u8{};
+        try e.encodeVariant(.{ .array = .{ .items = .{ .string = &arr } } });
+        var r: std.Io.Reader = .fixed(w.buffered());
+        var d = Decoder.init(&r, testing.allocator);
+        const decoded = try d.decodeVariant();
+        defer freeVariant(testing.allocator, decoded);
+        try testing.expectEqual(@as(usize, 0), decoded.array.items.string.?.len);
+    }
+    // Null String array.
+    {
+        var w = testWriter(&buf);
+        var e = Encoder.init(&w);
+        try e.encodeVariant(.{ .array = .{ .items = .{ .string = null } } });
+        var r: std.Io.Reader = .fixed(w.buffered());
+        var d = Decoder.init(&r, testing.allocator);
+        const decoded = try d.decodeVariant();
+        defer freeVariant(testing.allocator, decoded);
+        try testing.expectEqual(@as(?[]const ?[]const u8, null), decoded.array.items.string);
+    }
+    // Empty NodeId array (struct type).
+    {
+        var w = testWriter(&buf);
+        var e = Encoder.init(&w);
+        const arr = [_]NodeId{};
+        try e.encodeVariant(.{ .array = .{ .items = .{ .node_id = &arr } } });
+        var r: std.Io.Reader = .fixed(w.buffered());
+        var d = Decoder.init(&r, testing.allocator);
+        const decoded = try d.decodeVariant();
+        defer freeVariant(testing.allocator, decoded);
+        try testing.expectEqual(@as(usize, 0), decoded.array.items.node_id.?.len);
+    }
+    // Null NodeId array.
+    {
+        var w = testWriter(&buf);
+        var e = Encoder.init(&w);
+        try e.encodeVariant(.{ .array = .{ .items = .{ .node_id = null } } });
+        var r: std.Io.Reader = .fixed(w.buffered());
+        var d = Decoder.init(&r, testing.allocator);
+        const decoded = try d.decodeVariant();
+        defer freeVariant(testing.allocator, decoded);
+        try testing.expectEqual(@as(?[]const NodeId, null), decoded.array.items.node_id);
+    }
+}
+
+test "Variant array: multi-dimensional (ArrayDimensions) round-trip" {
+    const testing = std.testing;
+    var buf: [64]u8 = undefined;
+    var w = testWriter(&buf);
+    var e = Encoder.init(&w);
+    const flat = [_]i32{ 1, 2, 3, 4, 5, 6 }; // logically a 2x3 matrix
+    const dims = [_]i32{ 2, 3 };
+    try e.encodeVariant(.{ .array = .{ .items = .{ .int32 = &flat }, .dimensions = &dims } });
+    // mask = ValueIsArray | ArrayDimensions | Int32(6) = 0xc6.
+    try testing.expectEqual(@as(u8, 0x80 | 0x40 | 6), w.buffered()[0]);
+
+    var r: std.Io.Reader = .fixed(w.buffered());
+    var d = Decoder.init(&r, testing.allocator);
+    const decoded = try d.decodeVariant();
+    defer freeVariant(testing.allocator, decoded);
+    try testing.expectEqualSlices(i32, &flat, decoded.array.items.int32.?);
+    try testing.expectEqualSlices(i32, &dims, decoded.array.dimensions.?);
+}
+
+test "Variant: DataValue/Variant/DiagnosticInfo built-in type ids (23-25) remain out of scope, scalar or array" {
+    const testing = std.testing;
+    {
+        // Scalar, type id 24 (Variant-of-Variant).
+        var buf = [_]u8{24};
+        var r: std.Io.Reader = .fixed(&buf);
+        var d = Decoder.init(&r, testing.allocator);
+        try testing.expectError(error.UnsupportedType, d.decodeVariant());
+    }
+    {
+        // Array-flagged, type id 23 (DataValue array).
+        var buf = [_]u8{ 0x80 | 23, 0, 0, 0, 0 };
+        var r: std.Io.Reader = .fixed(&buf);
+        var d = Decoder.init(&r, testing.allocator);
+        try testing.expectError(error.UnsupportedType, d.decodeVariant());
+    }
+    {
+        // Array-flagged, type id 25 (DiagnosticInfo array).
+        var buf = [_]u8{ 0x80 | 25, 0, 0, 0, 0 };
+        var r: std.Io.Reader = .fixed(&buf);
+        var d = Decoder.init(&r, testing.allocator);
+        try testing.expectError(error.UnsupportedType, d.decodeVariant());
+    }
+}
+
+test "Variant array: ArrayDimensions bit without ValueIsArray is a malformed encoding byte" {
+    const testing = std.testing;
+    var buf = [_]u8{0x40 | 6}; // ArrayDimensions set, ValueIsArray clear
     var r: std.Io.Reader = .fixed(&buf);
     var d = Decoder.init(&r, testing.allocator);
-    try testing.expectError(error.UnsupportedType, d.decodeVariant());
+    try testing.expectError(error.BadEncodingByte, d.decodeVariant());
 }
 
 test "DataValue: nested Variant round-trip" {
@@ -1138,7 +1812,7 @@ test "DataValue: nested Variant round-trip" {
     var r: std.Io.Reader = .fixed(w.buffered());
     var d = Decoder.init(&r, testing.allocator);
     const decoded = try d.decodeDataValue();
-    try testing.expectEqual(@as(u32, 7), decoded.value.?.scalar.?.uint32);
+    try testing.expectEqual(@as(u32, 7), decoded.value.?.scalar.uint32);
     try testing.expectEqual(@as(?StatusCode, 0), decoded.status);
     try testing.expectEqual(@as(?DateTime, 132223104000000000), decoded.source_timestamp);
     try testing.expectEqual(@as(?u16, null), decoded.source_pico_seconds);
