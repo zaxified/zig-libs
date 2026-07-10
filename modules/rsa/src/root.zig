@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: MIT
 //! rsa — pure-Zig RSA (PKCS#1 v2.2 / RFC 8017), built on `std.crypto.ff`.
 //!
-//! **P1 IMPLEMENTED, P2–P6 still stubs.** The RFC 8017 §5 primitives
+//! **P1+P2 IMPLEMENTED, P3–P6 still stubs.** The RFC 8017 §5 primitives
 //! (RSAEP/RSADP/RSASP1/RSAVP1, incl. the CRT fast path), `PublicKey.fromBytes`,
-//! `SecretKey.fromPrimes`, and the RSASSA-PKCS1-v1_5 scheme
-//! (`signPkcs1v15`/`verifyPkcs1v15`, SHA-1/224/256/384/512) are real and
-//! tested against OpenSSL-generated known-answer vectors. Every P2+ function
-//! body is still `@panic("TODO(agent): ...")`. Phase plan:
+//! `SecretKey.fromPrimes`, the RSASSA-PKCS1-v1_5 scheme
+//! (`signPkcs1v15`/`verifyPkcs1v15`, SHA-1/224/256/384/512), and the
+//! RSAES-OAEP scheme (`encryptOaep`/`decryptOaep`, MGF1, constant-time
+//! decode) are real and tested against OpenSSL-generated known-answer
+//! vectors. Every P3+ function body is still `@panic("TODO(agent): ...")`.
+//! Phase plan:
 //!   P1 — EMSA-PKCS1-v1_5 sign/verify (`signPkcs1v15`/`verifyPkcs1v15`) — DONE.
-//!   P2 — RSAES-OAEP encrypt/decrypt (`encryptOaep`/`decryptOaep`).
+//!   P2 — RSAES-OAEP encrypt/decrypt (`encryptOaep`/`decryptOaep`) — DONE.
 //!   P3 — RSASSA-PSS sign/verify (`signPss`/`verifyPss`).
 //!   P4 — key parsing (`fromPkcs8`/`fromOpenSSH`).
 //!   P5 — keypair generation (`generate`).
@@ -522,30 +524,159 @@ pub fn verifyPkcs1v15(pk: PublicKey, comptime Hash: type, msg: []const u8, sig: 
     }
 }
 
-// ── P2: RSAES-OAEP (RFC 8017 §7.1) — reserved, not yet implemented ──────────
+// ── P2: RSAES-OAEP (RFC 8017 §7.1) ───────────────────────────────────────────
 
-/// Encrypt `msg` under RSAES-OAEP (RFC 8017 §7.1.1). `label` is the optional
-/// OAEP label (`L` in the RFC; pass `""` for the common no-label case). `io`
-/// supplies the random seed. `out` must be at least as long as the modulus.
-pub fn encryptOaep(pk: PublicKey, comptime Hash: type, io: std.Io, msg: []const u8, label: []const u8, out: []u8) ![]u8 {
-    _ = pk;
-    _ = Hash;
-    _ = io;
-    _ = msg;
-    _ = label;
-    _ = out;
-    @panic("TODO(agent): P2 RSAES-OAEP encrypt (EME-OAEP encode + RSAEP) per RFC 8017 §7.1.1");
+/// MGF1 mask generation function (RFC 8017 §B.2.1), XORed directly into
+/// `data` (`data ^= MGF1(seed, data.len)`). The XOR-in-place form serves both
+/// masking and unmasking (they are the same operation) without a second
+/// full-width mask buffer.
+fn mgf1Xor(comptime Hash: type, seed: []const u8, data: []u8) void {
+    var counter: u32 = 0;
+    var off: usize = 0;
+    while (off < data.len) : (counter += 1) {
+        // §B.2.1 step 3: Hash(seed || C) with C = I2OSP(counter, 4).
+        var c: [4]u8 = undefined;
+        std.mem.writeInt(u32, &c, counter, .big);
+        var st = Hash.init(.{});
+        st.update(seed);
+        st.update(&c);
+        var digest: [Hash.digest_length]u8 = undefined;
+        st.final(&digest);
+        const n = @min(digest.len, data.len - off);
+        for (data[off..][0..n], digest[0..n]) |*d, m| d.* ^= m;
+        off += n;
+    }
 }
 
-/// Decrypt an RSAES-OAEP ciphertext (RFC 8017 §7.1.2). `out` must be at least
-/// as long as the modulus; returns the written (plaintext-length) subslice.
-pub fn decryptOaep(sk: SecretKey, comptime Hash: type, ct: []const u8, label: []const u8, out: []u8) ![]u8 {
-    _ = sk;
-    _ = Hash;
-    _ = ct;
-    _ = label;
-    _ = out;
-    @panic("TODO(agent): P2 RSAES-OAEP decrypt (RSADP + EME-OAEP decode, constant-time error handling) per RFC 8017 §7.1.2");
+// Constant-time byte helpers for the OAEP decode (no data-dependent
+// branches; standard masking arithmetic, same shape as
+// `std.crypto.timing_safe.eql`'s accumulator).
+
+/// 1 if `x == y`, else 0 — branchless.
+fn ctEqByte(x: u8, y: u8) u8 {
+    const diff: u16 = x ^ y;
+    return @truncate(((diff -% 1) >> 8) & 1);
+}
+
+/// `if (v == 1) a else b` for v in {0, 1} — branchless.
+fn ctSelect(v: u8, a: usize, b: usize) usize {
+    const mask = @as(usize, 0) -% v; // all-ones iff v == 1
+    return (a & mask) | (b & ~mask);
+}
+
+pub const EncryptOaepError = error{ MessageTooLong, BufferTooSmall };
+
+/// Encrypt `msg` under RSAES-OAEP (RFC 8017 §7.1.1). `label` is the optional
+/// OAEP label (`L` in the RFC; pass `""` for the common no-label case).
+/// `random` supplies the mandatory fresh seed and MUST be cryptographically
+/// secure — OAEP's security proof assumes an unpredictable seed (a
+/// deterministic or low-entropy source voids CCA security). `out` must be at
+/// least as long as the modulus; returns the written (modulus-length)
+/// ciphertext subslice. `msg` is bounded by `k - 2*Hash.digest_length - 2`
+/// (§7.1.1 step 1.b).
+pub fn encryptOaep(pk: PublicKey, comptime Hash: type, random: std.Random, msg: []const u8, label: []const u8, out: []u8) EncryptOaepError![]u8 {
+    const h_len = Hash.digest_length;
+    const k = byteLen(pk.n.bits());
+    if (out.len < k) return error.BufferTooSmall;
+    // §7.1.1 step 1.b: mLen <= k - 2 hLen - 2 (also covers k too small for
+    // the hash at all).
+    if (k < 2 * h_len + 2 or msg.len > k - 2 * h_len - 2) return error.MessageTooLong;
+
+    // EM = 0x00 || maskedSeed (hLen) || maskedDB (k - hLen - 1), built in
+    // place (§7.1.1 step 2).
+    var em_buf: [max_modulus_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, em_buf[0..k]); // seed/DB are secret
+    const em = em_buf[0..k];
+    em[0] = 0x00;
+    const seed = em[1..][0..h_len];
+    const db = em[1 + h_len .. k];
+
+    // DB = lHash || PS (zeros) || 0x01 || M   (step 2.a-2.c)
+    Hash.hash(label, db[0..h_len], .{});
+    @memset(db[h_len .. db.len - msg.len - 1], 0x00);
+    db[db.len - msg.len - 1] = 0x01;
+    @memcpy(db[db.len - msg.len ..], msg);
+
+    // step 2.d-2.h: random seed, then the two MGF1 maskings. Order matters
+    // for the in-place XOR: DB is masked with the *raw* seed first, then the
+    // seed is masked with the already-masked DB.
+    random.bytes(seed);
+    mgf1Xor(Hash, seed, db); // maskedDB   = DB   ^ MGF1(seed)
+    mgf1Xor(Hash, db, seed); // maskedSeed = seed ^ MGF1(maskedDB)
+
+    // step 3: RSAEP. EM starts with 0x00, so OS2IP(EM) < n by construction
+    // (k = byteLen(n) and n's top byte is nonzero) — the range check cannot
+    // fire.
+    publicOp(pk, em, out[0..k]) catch unreachable;
+    return out[0..k];
+}
+
+pub const DecryptOaepError = error{ DecryptionError, BufferTooSmall };
+
+/// Decrypt an RSAES-OAEP ciphertext (RFC 8017 §7.1.2). `out` must be at
+/// least `k - 2*Hash.digest_length - 2` bytes (the maximum recoverable
+/// message length — checked up front so the buffer test never depends on the
+/// secret plaintext length); returns the written (plaintext-length) subslice.
+///
+/// All padding-decode failures (leading byte != 0x00, label-hash mismatch,
+/// missing/malformed 0x01 separator) are accumulated branch-free into one
+/// validity flag and reported as the single generic `error.DecryptionError` —
+/// per §7.1.2 "care must be taken to ensure that an opponent cannot
+/// distinguish the different error conditions" (Manger's CCA2 attack). The
+/// only length checks that branch early (`ct.len != k`, undersized `out`,
+/// RSADP range) depend purely on public values.
+pub fn decryptOaep(sk: SecretKey, comptime Hash: type, ct: []const u8, label: []const u8, out: []u8) DecryptOaepError![]u8 {
+    const h_len = Hash.digest_length;
+    const k = byteLen(sk.n.bits());
+    // §7.1.2 step 1: ciphertext must be exactly k octets and k >= 2 hLen + 2.
+    if (ct.len != k or k < 2 * h_len + 2) return error.DecryptionError;
+    const max_msg_len = k - 2 * h_len - 2;
+    if (out.len < max_msg_len) return error.BufferTooSmall;
+
+    // step 2: RSADP (CRT fast path). c >= n is public information (the
+    // ciphertext is public), so this early error is not an oracle.
+    var em_buf: [max_modulus_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, em_buf[0..k]);
+    const em = em_buf[0..k];
+    privateOpCrt(sk, ct, em) catch return error.DecryptionError;
+
+    // step 3: EME-OAEP decode, branch-free. EM = Y || maskedSeed || maskedDB.
+    const seed = em[1..][0..h_len];
+    const db = em[1 + h_len .. k];
+    mgf1Xor(Hash, db, seed); // seed = maskedSeed ^ MGF1(maskedDB)
+    mgf1Xor(Hash, seed, db); // DB   = maskedDB   ^ MGF1(seed)
+
+    var lhash: [h_len]u8 = undefined;
+    Hash.hash(label, &lhash, .{});
+    const y_ok = ctEqByte(em[0], 0x00);
+    const lhash_ok: u8 = @intFromBool(std.crypto.timing_safe.eql([h_len]u8, lhash, db[0..h_len].*));
+
+    // Scan DB[hLen..] = PS || 0x01 || M for the separator without revealing
+    // its position: `looking` stays 1 until the first 0x01; any nonzero,
+    // non-separator byte seen while still looking marks the padding invalid.
+    var looking: u8 = 1;
+    var invalid: u8 = 0;
+    var sep_idx: usize = 0; // index of the 0x01 separator within db
+    var i: usize = h_len;
+    while (i < db.len) : (i += 1) {
+        const is_one = ctEqByte(db[i], 0x01);
+        const is_zero = ctEqByte(db[i], 0x00);
+        sep_idx = ctSelect(looking & is_one, i, sep_idx);
+        looking &= is_one ^ 1;
+        invalid |= looking & (is_zero ^ 1);
+    }
+
+    // Single decision point: every failure mode collapses into one flag and
+    // one generic error. (`looking` still 1 = no separator found at all.)
+    const valid = y_ok & lhash_ok & (invalid ^ 1) & (looking ^ 1);
+    if (valid != 1) return error.DecryptionError;
+
+    // step 4: M = DB[sep_idx+1..]. Its length is part of the function's
+    // regular output (the returned slice), i.e. public on success — only
+    // failures must be indistinguishable, and none of them reach this point.
+    const msg_len = db.len - sep_idx - 1;
+    @memcpy(out[0..msg_len], db[sep_idx + 1 ..]);
+    return out[0..msg_len];
 }
 
 // ── P3: RSASSA-PSS (RFC 8017 §8.1) — reserved, not yet implemented ──────────
@@ -627,6 +758,14 @@ pub fn selfSignedCert(gpa: std.mem.Allocator, sk: SecretKey, subject: []const u8
 //   `openssl dgst -shaN -sign` (RSASSA-PKCS1-v1_5 is deterministic, so these
 //   are stable known answers). OpenSSL derives d = e⁻¹ mod λ(n), same as
 //   `fromPrimes`, so d/dP/dQ/qInv are compared verbatim.
+// * OAEP decrypt KATs: ciphertexts produced against the same 2048-bit key
+//   with `openssl pkeyutl -encrypt -pkeyopt rsa_padding_mode:oaep`
+//   (OpenSSL 3.5.5, 2026-07-10; `rsa_oaep_md`/`rsa_mgf1_md` = sha256 or
+//   sha1, `rsa_oaep_label` for the labeled vector). OAEP *encryption* is
+//   randomized, so only decrypt KATs can be static — round-trip tests cover
+//   the encrypt direction.
+// * MGF1 vectors: computed with Python 3.14 hashlib per RFC 8017 §B.2.1
+//   (seed || I2OSP(counter, 4), concatenated digests).
 
 const testing = std.testing;
 
@@ -850,6 +989,182 @@ test "512-bit key: SHA-256 round-trips, SHA-512 encoding is too short" {
 
     // k = 64 < tLen(SHA-512) + 11 = 94 -> RFC 8017 §9.2 step 3.
     try testing.expectError(error.EncodedMessageTooShort, signPkcs1v15(sk, std.crypto.hash.sha2.Sha512, "small key", &out));
+}
+
+// ── P2 (OAEP) tests ──────────────────────────────────────────────────────────
+
+// OAEP known-answer ciphertexts for the kat2048 key (see the OAEP bullet in
+// the provenance note above).
+const kat2048_oaep = struct {
+    const msg = "zig-libs rsa: OAEP known-answer test";
+    const label = "kat-label";
+    // rsa_oaep_md:sha256, rsa_mgf1_md:sha256, no label.
+    const ct_sha256 = hexLit("4da891fbebd835a537f462ee715d5820a3a5302a483a14bb0d34032acf0c3cf203a5c6eaad7eac42ec95822c1543f7056af1f20bafdcc505527880644b26dd6669f26d344c2e2081015db887b102248cdb83868f11a0199f5706177d5009b3e659fac64c780f18aa1f3ad349eb8779fec62d19190dc30cedf11c2c86b18787eac71613714ea5fea145ba607fa5ece466763c01603fb719a4901903a9c24c66603bcdfdee9aa3f4b25c5905507c9918dc19c556ed69edbea28d42aee4a013cfd5f55afe9633742297261afc74768e180e582c3124566854ec4394fe0228cff01d37c44163d41d16b6fe5c49a4e032d08d38aae631ac3f41ba3df5686530f7f9f9");
+    // rsa_oaep_md:sha1, rsa_mgf1_md:sha1, no label.
+    const ct_sha1 = hexLit("27c096515a140dae55fb4cfa72f5704be78439582a59f416ea173779fc8b60a6f2714fa012077bd693fe692552c50264191d4bd1e28ba3ae40332c1eb316dcc734558e90ff9c5537bad762b8772836a42c97a318cdcf3f4f916ce6e1363a72171e34be7821316053eb8a270ed9e47d2f90480c61a92dab549efc20af7f1b7d135bff327ba875719f762faed2cae8fdff49819ebeb0a95645ecd96078b48ae8b58128992b7870b49e5f19f72f2fb6d0dde1ebe1eaecb06f7629c6b3e18e06cc94d6251ed207736488ae1d911300aeb1a722810fece0231e4f227b12c95e1501784d6079708cc99a286672c2b67f17633f2bbf113356f87b1c72b57650ac7f7d93");
+    // rsa_oaep_md:sha256, rsa_mgf1_md:sha256, rsa_oaep_label:"kat-label".
+    const ct_sha256_label = hexLit("8187ffa66e94587003200c430a804fb8e1f1794411ebb97910b2ae78b54186da71b9eec18ee8f34db87c3108ba2ad6bec093066a402782d1cf3bb4247652282c69a0dbbd978df771cb983289de68106fe7d5224c156ed6d1729367785a64a781b2b9c9c3577c0ba72cd044dbcd9f715ee41f8dae60eabd6ab59d46b46a9e01edcaffc41d4a8a6c93b00cb34b125108c253c24a48c061be5687da32354a7a35074ab6382edbaa5e52dcdd2df8b1adce52d2c637d0165ccdb8fe8cbc4f0f2be64011c7fc72e66993f6d8f2bfc73dbdf953b0dfd7d9492a2a0105ec9714b67257321fe14e250da5233d23b2f015efcfd06a9667019ffc88e30776809210ab3655f6");
+};
+
+test "mgf1Xor matches Python hashlib cross-check vectors" {
+    // seed = "zig-libs mgf1 seed", mask length 41 (crosses a digest boundary
+    // for both hashes, exercising the counter increment).
+    const seed = "zig-libs mgf1 seed";
+
+    const want256 = comptime hexLit("35f1fc1965a11812ab455ff88faef9b68b9c3ab13edc4912b29fce6b9e5a280c6fe4e63efc05602280");
+    const want1 = comptime hexLit("b9b6810cbb2db3b1679dec9c8bedbe6c60e3178372f2d2a0d670720ab424e450a5ad46abf4f57aaf6c");
+
+    var mask256 = std.mem.zeroes([41]u8);
+    mgf1Xor(std.crypto.hash.sha2.Sha256, seed, &mask256);
+    try testing.expectEqualSlices(u8, &want256, &mask256);
+    // XOR-in-place involution: masking twice with the same seed restores zeros.
+    mgf1Xor(std.crypto.hash.sha2.Sha256, seed, &mask256);
+    try testing.expectEqualSlices(u8, &std.mem.zeroes([41]u8), &mask256);
+
+    var mask1 = std.mem.zeroes([41]u8);
+    mgf1Xor(std.crypto.hash.Sha1, seed, &mask1);
+    try testing.expectEqualSlices(u8, &want1, &mask1);
+}
+
+test "decryptOaep matches OpenSSL known answers (SHA-256, SHA-1, labeled)" {
+    const sk = try kat2048.secretKey();
+    const sha2 = std.crypto.hash.sha2;
+    var out: [max_modulus_len]u8 = undefined;
+
+    const m256 = try decryptOaep(sk, sha2.Sha256, &kat2048_oaep.ct_sha256, "", &out);
+    try testing.expectEqualStrings(kat2048_oaep.msg, m256);
+
+    const m1 = try decryptOaep(sk, std.crypto.hash.Sha1, &kat2048_oaep.ct_sha1, "", &out);
+    try testing.expectEqualStrings(kat2048_oaep.msg, m1);
+
+    const mlab = try decryptOaep(sk, sha2.Sha256, &kat2048_oaep.ct_sha256_label, kat2048_oaep.label, &out);
+    try testing.expectEqualStrings(kat2048_oaep.msg, mlab);
+}
+
+test "encryptOaep/decryptOaep round-trip (hashes x labels x message lengths)" {
+    const sk = try kat2048.secretKey();
+    const pk = try kat2048.publicKey();
+    // Deterministic PRNG is fine for tests (production callers must supply a
+    // CSPRNG — see the encryptOaep doc comment).
+    var prng = std.Random.DefaultPrng.init(0x6f6165705f726e67);
+    const random = prng.random();
+    var ct: [max_modulus_len]u8 = undefined;
+    var pt: [max_modulus_len]u8 = undefined;
+
+    var big_msg: [214]u8 = undefined; // 214 = max mLen for k=256 with SHA-1
+    random.bytes(&big_msg);
+
+    inline for (.{ std.crypto.hash.Sha1, std.crypto.hash.sha2.Sha256 }) |Hash| {
+        const max_len = 256 - 2 * Hash.digest_length - 2;
+        inline for (.{ "", "a label" }) |label| {
+            for ([_]usize{ 0, 1, 17, max_len }) |msg_len| {
+                const msg = big_msg[0..msg_len];
+                const c = try encryptOaep(pk, Hash, random, msg, label, &ct);
+                try testing.expectEqual(256, c.len);
+                const m = try decryptOaep(sk, Hash, c, label, &pt);
+                try testing.expectEqualSlices(u8, msg, m);
+            }
+        }
+    }
+
+    // OAEP is randomized: the same message never encrypts to the same
+    // ciphertext twice (fresh seed each call).
+    var ct2: [max_modulus_len]u8 = undefined;
+    const c1 = try encryptOaep(pk, std.crypto.hash.sha2.Sha256, random, "same message", "", &ct);
+    const c2 = try encryptOaep(pk, std.crypto.hash.sha2.Sha256, random, "same message", "", &ct2);
+    try testing.expect(!std.mem.eql(u8, c1, c2));
+}
+
+test "decryptOaep rejects corruption, wrong label/hash, wrong length (one generic error)" {
+    const sk = try kat2048.secretKey();
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+    var out: [max_modulus_len]u8 = undefined;
+
+    // Bit-flip anywhere in the ciphertext.
+    var bad = kat2048_oaep.ct_sha256;
+    bad[0] ^= 0x01;
+    try testing.expectError(error.DecryptionError, decryptOaep(sk, Sha256, &bad, "", &out));
+    bad = kat2048_oaep.ct_sha256;
+    bad[255] ^= 0x80;
+    try testing.expectError(error.DecryptionError, decryptOaep(sk, Sha256, &bad, "", &out));
+
+    // Label mismatch in both directions — while the same ciphertexts decrypt
+    // fine under the correct label (previous test).
+    try testing.expectError(error.DecryptionError, decryptOaep(sk, Sha256, &kat2048_oaep.ct_sha256, kat2048_oaep.label, &out));
+    try testing.expectError(error.DecryptionError, decryptOaep(sk, Sha256, &kat2048_oaep.ct_sha256_label, "", &out));
+
+    // Wrong hash function.
+    try testing.expectError(error.DecryptionError, decryptOaep(sk, Sha256, &kat2048_oaep.ct_sha1, "", &out));
+
+    // Wrong ciphertext length (RFC 8017 §7.1.2 step 1.b).
+    try testing.expectError(error.DecryptionError, decryptOaep(sk, Sha256, kat2048_oaep.ct_sha256[0..255], "", &out));
+    const long_ct = kat2048_oaep.ct_sha256 ++ [_]u8{0};
+    try testing.expectError(error.DecryptionError, decryptOaep(sk, Sha256, &long_ct, "", &out));
+
+    // Undersized output buffer (public-length check, distinct error is fine).
+    var small: [189]u8 = undefined; // max mLen for k=256/SHA-256 is 190
+    try testing.expectError(error.BufferTooSmall, decryptOaep(sk, Sha256, &kat2048_oaep.ct_sha256, "", &small));
+}
+
+test "decryptOaep rejects EM with nonzero leading byte (Y != 0x00)" {
+    const sk = try kat2048.secretKey();
+    const pk = try kat2048.publicKey();
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+
+    // Hand-build an otherwise perfectly valid EM but with Y = 0x01 (still
+    // < n, since n's top byte is 0xa2) and run it through the raw RSAEP
+    // primitive — only the Y check can catch it.
+    var em: [256]u8 = undefined;
+    em[0] = 0x01;
+    const seed = em[1..33];
+    const db = em[33..256];
+    Sha256.hash("", db[0..32], .{});
+    @memset(db[32 .. db.len - 4], 0x00);
+    db[db.len - 4] = 0x01;
+    @memcpy(db[db.len - 3 ..], "msg");
+    var prng = std.Random.DefaultPrng.init(42);
+    prng.random().bytes(seed);
+    mgf1Xor(Sha256, seed, db);
+    mgf1Xor(Sha256, db, seed);
+
+    var out: [max_modulus_len]u8 = undefined;
+    const ct_bad_y = try rsaep(256, em, pk);
+    try testing.expectError(error.DecryptionError, decryptOaep(sk, Sha256, &ct_bad_y, "", &out));
+
+    // Control: the identical EM with Y = 0x00 decrypts — proving the
+    // rejection above was the Y check and nothing else.
+    em[0] = 0x00;
+    const ct_ok = try rsaep(256, em, pk);
+    try testing.expectEqualStrings("msg", try decryptOaep(sk, Sha256, &ct_ok, "", &out));
+}
+
+test "encryptOaep rejects oversize messages and undersized buffers/keys" {
+    const pk = try kat2048.publicKey();
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+    var prng = std.Random.DefaultPrng.init(1);
+    const random = prng.random();
+    var ct: [max_modulus_len]u8 = undefined;
+
+    // Max mLen for k=256/SHA-256 is 190: 191 is rejected, 190 encrypts.
+    const big = [_]u8{0xaa} ** 191;
+    try testing.expectError(error.MessageTooLong, encryptOaep(pk, Sha256, random, &big, "", &ct));
+    _ = try encryptOaep(pk, Sha256, random, big[0..190], "", &ct);
+
+    // Output buffer shorter than the modulus.
+    var small_out: [255]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, encryptOaep(pk, Sha256, random, "m", "", &small_out));
+
+    // 512-bit key: k = 64 < 2*32 + 2 = 66 -> SHA-256 OAEP can never fit.
+    const pk512 = try PublicKey.fromBytes(&kat512.n, &kat512.e);
+    try testing.expectError(error.MessageTooLong, encryptOaep(pk512, Sha256, random, "", "", &ct));
+
+    // SHA-1 on the 512-bit key fits up to 64 - 2*20 - 2 = 22 bytes.
+    const sk512 = try SecretKey.fromPrimes(&kat512.p, &kat512.q, &kat512.e);
+    var pt: [max_modulus_len]u8 = undefined;
+    const c = try encryptOaep(pk512, std.crypto.hash.Sha1, random, "22-byte msg for sha1..", "", &ct);
+    try testing.expectEqual(64, c.len);
+    try testing.expectEqualStrings("22-byte msg for sha1..", try decryptOaep(sk512, std.crypto.hash.Sha1, c, "", &pt));
+    try testing.expectError(error.MessageTooLong, encryptOaep(pk512, std.crypto.hash.Sha1, random, "23-byte msg for sha-1..", "", &ct));
 }
 
 test "PublicKey.fromBytes accepts/rejects per RFC 8017 §3.1 sanity rules" {
