@@ -188,10 +188,8 @@ not own, and what to reach for instead.
 | Capability | Adopt instead | Why not a module |
 |---|---|---|
 | Hardened/read-only SQLite | `vrischmann/zig-sqlite` or `karlseguin/zqlite.zig`, wrapped consumer-side | The enforcement (`authorizer`/`PRAGMA query_only`/`open_v2(READONLY)`) is raw C-API — breaks the pure-Zig/no-libc invariant |
-| SSH | bind `libssh2` | Pure-Zig SSH is a huge build; externally-coupled, stays consumer-side |
 | Kafka | bind `librdkafka` | External C client, no pure-Zig alternative |
 | gRPC | build over our HTTP/2 + adopt `Arwalk/zig-protobuf` | Needs an external protobuf codec; no trustworthy pure-Zig gRPC exists |
-| OPC-UA | adopt/bind an existing stack | Huge industrial protocol stack, not a Zig-native win |
 | Regex | `mnemnion/mvzr` (no captures) or `zig-utils/zig-regex` (captures) | Two mature pure-Zig libs already exist |
 | PostgreSQL (wire v3) | `karlseguin/pg.zig` | Mature MIT lib, pooling + TLS |
 | MySQL/MariaDB | `speed2exe/myzql` | Only viable option |
