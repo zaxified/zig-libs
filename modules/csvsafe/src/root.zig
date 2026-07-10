@@ -21,7 +21,6 @@
 const std = @import("std");
 
 pub const meta = .{
-    .status = .extract, // seed: bxp-cli/src/pipeline.zig writeSafeValue (injection-guard slice only)
     .platform = .any,
     .role = .util,
     .concurrency = .reentrant,
@@ -113,7 +112,7 @@ fn expectSafe(value: []const u8, expected: []const u8) !void {
     try testing.expectEqualStrings(expected, w.buffered());
 }
 
-// ── Ported from bxp-cli/src/pipeline.zig writeSafeValue tests ──────────────
+// ── Formula-injection guard tests ──────────────
 
 test "writeSafe: formula-injection leads get an apostrophe guard" {
     // OWASP CSV-injection set: '=', '+', '@', tab (and CR) all open a formula

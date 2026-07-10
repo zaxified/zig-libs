@@ -5,7 +5,6 @@
 const std = @import("std");
 
 pub const meta = .{
-    .status = .extract, // seed: bxp-core/src/json5.zig
     .platform = .any,
     .role = .codec,
     .concurrency = .reentrant,

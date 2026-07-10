@@ -45,7 +45,6 @@ const router = @import("router");
 const http = @import("http");
 
 pub const meta = .{
-    .status = .gap,
     .platform = .any,
     .role = .util,
     // The middleware only reads its immutable config; readiness is as

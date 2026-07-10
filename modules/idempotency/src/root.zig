@@ -93,7 +93,6 @@ const http = @import("http");
 const ramcache = @import("ramcache");
 
 pub const meta = .{
-    .status = .gap,
     .platform = .any,
     .role = .server,
     // Internally synchronized: the ramcache store sits behind a documented

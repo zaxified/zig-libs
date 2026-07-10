@@ -54,7 +54,6 @@ const native_endian = builtin.cpu.arch.endian();
 pub const genl = @import("genl.zig");
 
 pub const meta = .{
-    .status = .gap, // no maintained pure-Zig WireGuard-netlink client exists
     .platform = .linux, // AF_NETLINK raw syscalls — conscious ceiling
     .role = .client,
     .concurrency = .reentrant, // no globals; one Wireguard per thread/loop

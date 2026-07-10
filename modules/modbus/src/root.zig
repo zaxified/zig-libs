@@ -37,7 +37,6 @@
 const std = @import("std");
 
 pub const meta = .{
-    .status = .gap, // no mature pure-Zig Modbus library exists
     .platform = .any, // codec + client are portable; TcpTransport uses std.Io.net
     .role = .client, // master + reusable wire codec
     .concurrency = .single_owner, // Client tracks the TCP transaction id
@@ -1160,7 +1159,6 @@ test "garbage frames never panic" {
 }
 
 test "meta is well-formed" {
-    try testing.expectEqual(.gap, meta.status);
     try testing.expectEqual(.any, meta.platform);
     try testing.expectEqual(.client, meta.role);
 }

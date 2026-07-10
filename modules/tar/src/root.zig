@@ -51,7 +51,6 @@ const flate = std.compress.flate;
 const Allocator = std.mem.Allocator;
 
 pub const meta = .{
-    .status = .extract, // seeded in axp (axp-core/src/tar.zig + axp-vault/src/backup.zig)
     .platform = .any, // codec is platform-pure; only packDir is Linux (statx)
     .role = .both, // reader + writer
     .concurrency = .reentrant, // no globals; one Reader/Writer per stream
@@ -625,7 +624,7 @@ fn stripUnsupported(e: WriteError) std.Io.Writer.Error {
     };
 }
 
-// ── tests: field primitives (ported from the seeds) ─────────────────────────
+// ── tests: field primitives ──────────────────────────────────────────────────
 
 const testing = std.testing;
 

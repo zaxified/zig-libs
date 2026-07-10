@@ -5,11 +5,9 @@
 //!
 //! Pure functions over `Dataset`. Scalar math fns (xirr/annualize/quantile)
 //! return the number directly (KPI reduce nodes call them); series/table
-//! producers return a `Dataset`. Algorithms + constants are a faithful lift of
-//! the seed (wgs `src/finance.zig`, itself a faithful port of poc-wf-analytic's
-//! `reader.zig`); the numeric behaviour is kept EXACT — VaR/CVaR are historical
-//! (empirical), the Monte-Carlo PRNG is fixed-seed deterministic. See README
-//! `Provenance:` for the lineage.
+//! producers return a `Dataset`. The numeric behaviour is exact — VaR/CVaR
+//! are historical (empirical), the Monte-Carlo PRNG is fixed-seed
+//! deterministic.
 
 const std = @import("std");
 const dsmod = @import("dataset");
@@ -18,7 +16,6 @@ const Column = dsmod.Column;
 const Value = dsmod.Value;
 
 pub const meta = .{
-    .status = .extract, // seed: wgs src/finance.zig
     .platform = .any,
     .role = .util,
     .concurrency = .reentrant,
@@ -390,7 +387,7 @@ pub fn betaAlpha(a: std.mem.Allocator, d: Dataset, spec: BetaSpec) Error!Dataset
     return oneRow(a, &.{ .{ "beta", beta }, .{ "alpha", alpha }, .{ "r2", r2 } });
 }
 
-// ── monte_carlo (GBM-ish monthly, Box-Muller — exact port, seeded) ──────────
+// ── monte_carlo (GBM-ish monthly, Box-Muller — fixed-seed) ──────────
 
 pub const MonteCarloSpec = struct {
     start: f64,

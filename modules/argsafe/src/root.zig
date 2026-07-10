@@ -2,13 +2,13 @@
 //! argsafe — allowlist validators + safe argv construction: neutralize
 //! argument/flag injection when building an exec argv from untrusted input.
 //!
-//! Provenance: consolidates the 14 ad-hoc `*Safe` predicates in axp-core's
-//! `src/task.zig` (user's own code, MIT) — each of which guarded a
-//! `std.process.run(.{ .argv = ... })` call site with a hand-rolled
-//! character-class + length check. There was no shared abstraction; this
-//! distills them into ONE composable primitive (`CharClass`), a set of
-//! convenience predicates built on it, and a typed `Argv` builder that makes
-//! it impossible to place an unvalidated byte into an argv element.
+//! Provenance: original work of the zig-libs authors (MIT). Distills the
+//! recurring "validate one argv token" pattern — a hand-rolled
+//! character-class + length check guarding each
+//! `std.process.run(.{ .argv = ... })` call site — into ONE composable
+//! primitive (`CharClass`), a set of convenience predicates built on it,
+//! and a typed `Argv` builder that makes it impossible to place an
+//! unvalidated byte into an argv element.
 //!
 //! Security model: POSIX argv semantics. The values validated here only ever
 //! go into ARRAY elements of an argv passed to `std.process.run` /
@@ -29,7 +29,6 @@
 const std = @import("std");
 
 pub const meta = .{
-    .status = .gap, // consolidates axp's 14 ad-hoc validator predicates
     .platform = .any, // pure byte checks; argv semantics are POSIX (see README)
     .role = .util,
     .concurrency = .reentrant, // no shared state; every fn is pure over its args
@@ -43,16 +42,16 @@ pub const meta = .{
 
 /// A byte-class + length + structural predicate over a single argv token.
 ///
-/// The default configuration is the *safe* one (this is the gap the seed left
-/// open in several of its copies): a leading `-`/`--` is rejected (flag
-/// injection), a raw NUL is rejected unconditionally, control bytes are
-/// rejected, and `..` is rejected. Opt out consciously per field.
+/// The default configuration is the *safe* one: a leading `-`/`--` is
+/// rejected (flag injection), a raw NUL is rejected unconditionally,
+/// control bytes are rejected, and `..` is rejected. Opt out consciously
+/// per field.
 ///
-/// Reconstructing a few of the seed predicates:
-///   * ubusNameSafe  → `.{ .extra = "_-.*", .first_char = .alnum }`
-///   * uciNameSafe   → `.{ .extra = "_", .max_len = 64, .first_char = .not_digit }`
-///   * sysctlKeySafe → `.{ .extra = "._-", .first_char = .alnum }`
-///   * svcNameSafe   → `.{ .extra = "_-", .max_len = 64, .first_char = .alnum }`
+/// A few example configurations:
+///   * name with `_-.*`  → `.{ .extra = "_-.*", .first_char = .alnum }`
+///   * strict name       → `.{ .extra = "_", .max_len = 64, .first_char = .not_digit }`
+///   * dotted key        → `.{ .extra = "._-", .first_char = .alnum }`
+///   * service name      → `.{ .extra = "_-", .max_len = 64, .first_char = .alnum }`
 pub const CharClass = struct {
     /// Allow `[A-Za-z0-9]`.
     allow_alnum: bool = true,
@@ -145,8 +144,8 @@ inline fn isHexDigit(c: u8) bool {
 // ---------------------------------------------------------------------------
 
 /// A conservative shell/exec-safe identifier: `[A-Za-z0-9_-]`, first byte
-/// alnum, 1..128 bytes. Covers the seed's `svcNameSafe`/`ubusNameSafe` shape
-/// (minus the `.`/`*` those allowed — use `CharClass` directly for those).
+/// alnum, 1..128 bytes. Covers the common service/name-token shape (for
+/// names that also allow `.`/`*`, use `CharClass` directly).
 pub fn isSafeIdentifier(s: []const u8) bool {
     const class: CharClass = .{ .extra = "_-", .max_len = 128, .first_char = .alnum };
     return class.check(s);
@@ -154,7 +153,7 @@ pub fn isSafeIdentifier(s: []const u8) bool {
 
 /// An absolute filesystem path safe to pass as one argv element: non-empty,
 /// `≤ 4096` bytes, starts with `/`, no `..` traversal, no control bytes / NUL.
-/// Fixes the seed's `readPathSafe`, which did NOT reject `..`.
+/// Rejects `..` traversal explicitly, unlike a naive absolute-path check.
 pub fn isSafePath(s: []const u8) bool {
     if (s.len == 0 or s.len > 4096) return false;
     if (s[0] != '/') return false; // absolute only (also rules out a leading '-')
@@ -166,8 +165,8 @@ pub fn isSafePath(s: []const u8) bool {
 /// An `http(s)://` URL safe to pass as one argv element: 8..1024 bytes, an
 /// `http://` or `https://` scheme, no control/space bytes, and none of the
 /// quoting metacharacters `" ' \` `` ` `` (defense-in-depth even though argv is
-/// not shell-parsed). The scheme guarantees no leading `-`. Mirrors the seed's
-/// `urlSafe`; note that argv semantics make `?`, `#`, `&`, `=` harmless, so —
+/// not shell-parsed). The scheme guarantees no leading `-`; note that argv
+/// semantics make `?`, `#`, `&`, `=` harmless, so —
 /// unlike a shell-quoting validator — those are intentionally allowed.
 pub fn isSafeUrl(s: []const u8) bool {
     if (s.len < 8 or s.len > 1024) return false;
@@ -200,8 +199,8 @@ pub fn isSafeBase64(s: []const u8, exact_len: ?usize) bool {
 }
 
 /// A `sep`-separated CIDR list: hex digits plus `. : /` and the separator only
-/// (IPv4/IPv6 CIDRs), 1..256 bytes. Generalizes the seed's `wgAllowedIpsSafe`
-/// (which fixed `sep = ','`). The charset excludes `-` and NUL.
+/// (IPv4/IPv6 CIDRs), 1..256 bytes. The separator is a parameter (e.g. `,`).
+/// The charset excludes `-` and NUL.
 pub fn isSafeCidrList(s: []const u8, sep: u8) bool {
     if (s.len == 0 or s.len > 256) return false;
     // Explicit flag-injection guard, independent of `sep`: the charset below
@@ -217,11 +216,11 @@ pub fn isSafeCidrList(s: []const u8, sep: u8) bool {
 }
 
 /// A key=value option *value* passed as one argv token, 1..128 bytes, leading
-/// `-` rejected (flag-injection guard the seed lacked here). Two shapes:
+/// `-` rejected (flag-injection guard). Two shapes:
 ///   * `printable_ascii = true`  → any printable ASCII `0x20..0x7e` (space
-///     included) — the seed's `sysctlValueSafe`.
+///     included).
 ///   * `printable_ascii = false` → the token set `[A-Za-z0-9._:/-]` (no spaces
-///     / metachars) — the seed's `fwValueSafe`.
+///     / metachars).
 pub fn isSafeKvValue(s: []const u8, printable_ascii: bool) bool {
     if (s.len == 0 or s.len > 128) return false;
     if (s[0] == '-') return false; // flag-injection guard
@@ -236,8 +235,8 @@ pub fn isSafeKvValue(s: []const u8, printable_ascii: bool) bool {
     return true;
 }
 
-/// Exact membership in a compile-time allowlist. Replaces the seed's
-/// `logLevelSafe` / `fwKeySafe` (fixed enumerations of accepted tokens). O(n)
+/// Exact membership in a compile-time allowlist — for fixed enumerations of
+/// accepted tokens (e.g. log levels, firewall keys). O(n)
 /// over `allowed`, unrolled at comptime.
 pub fn isInAllowlist(s: []const u8, comptime allowed: []const []const u8) bool {
     inline for (allowed) |a| {
@@ -329,7 +328,7 @@ pub const Argv = struct {
 
 const testing = std.testing;
 
-// --- CharClass: golden allow/reject reconstructing the seed validators ------
+// --- CharClass: golden allow/reject over representative validators ------
 
 test "CharClass reconstructs ubusNameSafe" {
     // ubus: alnum + `_-.*`, first alnum, ≤128, `..` allowed (a ubus glob).

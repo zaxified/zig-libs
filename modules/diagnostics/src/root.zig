@@ -13,13 +13,11 @@
 //! one shot at the validation boundary. Callers that need diagnostics to
 //! outlive that arena should dupe the strings first.
 //!
-//! Provenance: extracted from bxp-core/src/diagnostics.zig (user's own code,
-//! MIT). See ../README.md.
+//! Provenance: original work of the zig-libs authors (MIT). See ../README.md.
 
 const std = @import("std");
 
 pub const meta = .{
-    .status = .extract, // seed: bxp-core/src/diagnostics.zig
     .platform = .any,
     .role = .util,
     .concurrency = .reentrant,

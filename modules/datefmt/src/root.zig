@@ -23,7 +23,6 @@
 const std = @import("std");
 
 pub const meta = .{
-    .status = .extract, // seed: bxp-core/src/datefmt.zig
     .platform = .any,
     .role = .util,
     .concurrency = .reentrant,
@@ -857,7 +856,7 @@ pub fn firstInvalidFormatChar(fmt: []const u8) ?usize {
 }
 
 // ---------------------------------------------------------------------------
-// Tests (ported verbatim from the bxp seed)
+// Tests
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;

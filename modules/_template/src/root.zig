@@ -6,7 +6,6 @@
 const std = @import("std");
 
 pub const meta = .{
-    .status = .gap, // .extract | .gap | .adopt
     .platform = .any, // .any | .posix | .linux
     .role = .util, // .client | .server | .codec | .both | .util
     .concurrency = .reentrant, // .reentrant | .threadsafe | .single_owner | .blocking

@@ -21,19 +21,17 @@
 //! can never escape `base`. CAS hex keys are generated internally and always
 //! safe.
 //!
-//! Provenance: extracted + spec-completed from the authors' axp project
-//! (`axp-vault/src/store.zig`, MIT). The raw/CAS/scratch/manifest substance and
-//! `segmentSafe` are the seed's; `put` (single-pass hash-while-write), `verify`
-//! (bit-rot detection), the `Digest` type, segment validation on every entry
-//! point, and the `named` generalization past axp's device/key scheme are
-//! written for this module. sha256 comes from the sibling `hashdigest` module;
-//! nothing cryptographic is reimplemented here.
+//! Provenance: original work of the zig-libs authors (MIT). Provides the
+//! raw/CAS/scratch/manifest layers and `segmentSafe`, `put` (single-pass
+//! hash-while-write), `verify` (bit-rot detection), the `Digest` type,
+//! segment validation on every entry point, and a `named` record scheme
+//! (arbitrary namespace/key). sha256 comes from the sibling `hashdigest`
+//! module; nothing cryptographic is reimplemented here.
 
 const std = @import("std");
 const hashdigest = @import("hashdigest");
 
 pub const meta = .{
-    .status = .extract, // seed: axp-vault/src/store.zig
     .platform = .posix, // atomic rename-on-commit; std.Io filesystem API
     .role = .util,
     .concurrency = .reentrant, // no shared state bar a process-local ingest counter
@@ -316,8 +314,8 @@ pub const Store = struct {
     }
 
     // ── named records (opaque bytes under a namespace/key scheme) ──────────────
-    // `<base>/named/<ns>/<key>`; generalizes axp's `manifests/<device>/<key>.json`
-    // past device/key and past JSON — any small byte record (manifest, index).
+    // `<base>/named/<ns>/<key>`; any small byte record (manifest, index) under
+    // an arbitrary namespace/key — not restricted to JSON.
 
     fn namedDir(self: Store, buf: []u8, ns: []const u8) ![]const u8 {
         return std.fmt.bufPrint(buf, "{s}/named/{s}", .{ self.base, ns });

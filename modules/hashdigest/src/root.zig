@@ -13,18 +13,14 @@
 //! The SHA-256 names (`sha256Hex`, `Hasher`, `sha256File`, ...) are kept as
 //! stable conveniences; the `Algorithm`-parameterized API generalizes them.
 //!
-//! Provenance: extracted from the authors' axp project — `axp-core/src/digest.zig`
-//! (`sha256Hex`, `matches`) and `axp-core/src/task.zig` (`sha256FileHex`, the
-//! read-to-EOF streaming loop); Apache-2.0, relicensed MIT by the copyright
-//! holder. Multi-algorithm layer written for this module; the constructions are
-//! the public SHA-2 / SHA-3 / BLAKE2 / BLAKE3 standards via `std.crypto`.
+//! Provenance: original work of the zig-libs authors (MIT). The constructions
+//! are the public SHA-2 / SHA-3 / BLAKE2 / BLAKE3 standards via `std.crypto`.
 //! Model after Go `crypto/sha256` streaming. No third-party source copied.
 
 const std = @import("std");
 const builtin = @import("builtin");
 
 pub const meta = .{
-    .status = .extract,
     .platform = .any, // file API goes through std.Io; pure hashing is allocation-free
     .role = .util,
     .concurrency = .reentrant, // one-shot fns are pure; Hasher/MultiHasher are single-owner
@@ -39,7 +35,7 @@ pub const hex_len = Sha256.digest_length * 2;
 
 // ── one-shot ─────────────────────────────────────────────────────────────────
 
-/// Write the lowercase-hex SHA-256 of `data` into `out`. (Seed: axp digest.zig.)
+/// Write the lowercase-hex SHA-256 of `data` into `out`.
 pub fn sha256Hex(out: *[hex_len]u8, data: []const u8) void {
     var raw: [Sha256.digest_length]u8 = undefined;
     Sha256.hash(data, &raw, .{});
@@ -53,8 +49,8 @@ pub fn sha256HexBuf(data: []const u8) [hex_len]u8 {
     return out;
 }
 
-/// True iff the lowercase-hex SHA-256 of `data` equals `announced`. Content-address
-/// check for the reconcile channel ("device is the final authority"). (Seed: axp.)
+/// True iff the lowercase-hex SHA-256 of `data` equals `announced`. A
+/// content-address check (verify bytes against an announced digest).
 pub fn matches(data: []const u8, announced: []const u8) bool {
     if (announced.len != hex_len) return false;
     var hx: [hex_len]u8 = undefined;
@@ -89,7 +85,7 @@ pub const Hasher = struct {
 
 /// Hash the file at `path` by streaming to EOF; write lowercase hex into `out`,
 /// return the byte count, or `null` on open/read error. Correct on size-0 virtual
-/// files (reads until EOF, does not trust `stat().size`). (Seed: axp task.zig.)
+/// files (reads until EOF, does not trust `stat().size`).
 pub fn sha256File(io: std.Io, path: []const u8, out: *[hex_len]u8) ?u64 {
     var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return null;
     defer file.close(io);

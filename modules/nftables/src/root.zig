@@ -23,7 +23,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 pub const meta = .{
-    .status = .gap, // no pure-Zig nftables library exists
     .platform = .any, // the JSON is portable; applying it is Linux/nft
     .role = .codec,
     .concurrency = .reentrant,

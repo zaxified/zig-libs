@@ -19,7 +19,6 @@
 const std = @import("std");
 
 pub const meta = .{
-    .status = .extract, // seed: bxp-core/src/csv.zig + bxp-cli/src/pipeline.zig ChunkReader
     .platform = .any,
     .role = .codec,
     .concurrency = .reentrant,

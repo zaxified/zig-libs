@@ -2,8 +2,8 @@
 //! icmp — ICMP echo (ping) engine: wire codec, unprivileged/raw sockets and
 //! a paced multi-target prober.
 //!
-//! Extracted from the authors' zig-fping (a Zig reimplementation of fping —
-//! see NOTICE for the required fping attribution). Three layers:
+//! Derived from fping (schweikert/fping) — see NOTICE for the required
+//! attribution. Three layers:
 //!
 //!  * `echo` — pure ICMPv4/v6 echo + timestamp codec with the RFC 1071
 //!    internet checksum; bounds-checked parsing that never panics.
@@ -37,11 +37,10 @@
 const std = @import("std");
 
 pub const meta = .{
-    .status = .extract, // seeded in zig-fping/src/{icmp,socket,pinger}.zig
     .platform = .linux, // raw syscalls (ICMP sockets), no portable fallback
     .role = .client,
     .concurrency = .single_owner, // one thread/loop owns a Pinger (stop() is signal-safe)
-    .model_after = "fping (schweikert/fping), via the authors' zig-fping port",
+    .model_after = "fping (schweikert/fping)",
     .deps = .{ "seqmap", "netaddr" },
 };
 

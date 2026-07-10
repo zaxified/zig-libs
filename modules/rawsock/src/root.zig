@@ -50,7 +50,6 @@ comptime {
 }
 
 pub const meta = .{
-    .status = .gap, // built: seed = axp task.zig openPacketCapture/ifNameOf (receive-only)
     .platform = .linux,
     .role = .both,
     .concurrency = .reentrant, // no shared state; one Socket per thread/loop
@@ -239,9 +238,9 @@ pub fn etherTypeFilter(ethertype: u16) [4]BpfInsn {
 
 // ── pure: ARP codec (surfaces netaddr.Ip) ─────────────────────────────────────
 
-/// Minimal ARP-over-Ethernet codec (IPv4). Ported from the axp seed
-/// (`buildArpRequest` / `parseArpReply`); IP addresses surface as sibling
-/// `netaddr.Ip` values. Pure — no socket required.
+/// Minimal ARP-over-Ethernet codec (IPv4): `buildArpRequest` /
+/// `parseArpReply`. IP addresses surface as sibling `netaddr.Ip` values.
+/// Pure — no socket required.
 pub const arp = struct {
     /// Total length of an ARP-request Ethernet frame (header + ARP body).
     pub const request_len = 42;
@@ -283,7 +282,7 @@ pub const arp = struct {
 // ── errors ────────────────────────────────────────────────────────────────────
 
 pub const OpenError = error{
-    /// No `CAP_NET_RAW` (EPERM/EACCES) — a distinct error, matching the seed.
+    /// No `CAP_NET_RAW` (EPERM/EACCES) — a distinct error.
     AccessDenied,
     /// A named interface (`Options.iface`) does not exist.
     NoSuchInterface,

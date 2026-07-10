@@ -35,7 +35,6 @@
 const std = @import("std");
 
 pub const meta = .{
-    .status = .gap, // no mature pure-Zig MQTT library exists
     .platform = .any, // codec + client are portable; TcpTransport uses std.Io.net
     .role = .client, // client + reusable wire codec
     .concurrency = .single_owner, // one owner drives feed/poll/tick

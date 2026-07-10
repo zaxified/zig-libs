@@ -40,7 +40,6 @@
 const std = @import("std");
 
 pub const meta = .{
-    .status = .gap, // no spec-complete pure-Zig L2 discovery codec exists
     .platform = .any, // pure codec — no syscalls, no sockets
     .role = .codec, // parse/build frame payloads only
     .concurrency = .reentrant, // no shared state; safe if not shared
@@ -80,7 +79,6 @@ test {
 }
 
 test "meta is well-formed" {
-    try std.testing.expectEqual(.gap, meta.status);
     try std.testing.expectEqual(.any, meta.platform);
     try std.testing.expectEqual(.codec, meta.role);
     try std.testing.expectEqual(.reentrant, meta.concurrency);

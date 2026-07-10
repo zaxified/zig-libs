@@ -37,7 +37,6 @@ pub const Attr = codec.Attr;
 pub const AttrIterator = codec.AttrIterator;
 
 pub const meta = .{
-    .status = .gap, // no maintained pure-Zig netlink library exists
     .platform = .linux, // AF_NETLINK raw syscalls — conscious ceiling
     .role = .client,
     .concurrency = .reentrant, // no globals; one Socket per thread/loop

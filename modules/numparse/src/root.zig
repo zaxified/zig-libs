@@ -13,15 +13,13 @@
 //! what prevents false positives on dates ("2025,06,01") or on American input
 //! misread under European separators.
 //!
-//! Extracted from bxp `bxp-core/src/expr.zig` (`parseGroupedNumber`); the
-//! expr-internal `Value.toNumber()` glue became a direct
-//! `decimal.Decimal.parse` on the normalized string.
+//! Parsing normalizes the grouped string and hands it to
+//! `decimal.Decimal.parse`.
 
 const std = @import("std");
 const Decimal = @import("decimal").Decimal;
 
 pub const meta = .{
-    .status = .extract, // seed: bxp-core/src/expr.zig parseGroupedNumber
     .platform = .any, // pure logic, no OS calls
     .role = .util,
     .concurrency = .reentrant, // no shared state, no allocation
@@ -94,9 +92,8 @@ pub fn parseGroupedNumber(s: []const u8, thousands_sep: u8, decimal_sep: u8) ?De
 }
 
 // ---------------------------------------------------------------------------
-// Tests — ported verbatim from the bxp seed (bxp-core/src/expr.zig); the only
-// adaptation is `Decimal.parse(...).?` → `try Decimal.parse(...)` because the
-// extracted `decimal` module returns an error union rather than an optional.
+// Tests — `Decimal.parse` returns an error union, so results are unwrapped
+// with `try Decimal.parse(...)`.
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;

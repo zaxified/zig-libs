@@ -9,8 +9,7 @@
 //! record carries `chunk_start_in_file + record_start_in_chunk` — the exact
 //! source byte offset, so a consumer can seek back to the original bytes.
 //!
-//! Provenance: `ChunkReader` publicized + parameterized from the authors'
-//! bxp-cli/src/pipeline.zig (MIT); composition is new.
+//! Provenance: original work of the zig-libs authors (MIT).
 
 const std = @import("std");
 const line = @import("line.zig");

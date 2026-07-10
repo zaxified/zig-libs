@@ -4,9 +4,7 @@
 //! denied-request throttle as a `router` middleware: the AAA layer of the
 //! Web/API cluster.
 //!
-//! Extracted from the authors' axp project (`axp-central/src/rest.zig`:
-//! the admin-token gate, `auditMutation` and `AuditThrottle`), reshaped
-//! from a hand-rolled route dispatcher into `router.Middleware`. Behavior
+//! Provenance: original work of the zig-libs authors (MIT). Behavior
 //! modeled (design only) after envoy's ext_authz + oauth2-proxy's bearer
 //! handling; bearer semantics per RFC 6750.
 //!
@@ -41,23 +39,23 @@
 //!   plane is open only when *no* credential for the active mode(s) is
 //!   configured.
 //! - **Scope.** `Options.protect` picks what needs auth: `.all` (the
-//!   default — secure by default; deviates from the seed, which gated
-//!   mutations only) or `.mutations` (the seed's R/W boundary: only
-//!   POST/PUT/PATCH/DELETE are gated; GET/HEAD/OPTIONS stay open).
+//!   default — secure by default) or `.mutations` (the read/write
+//!   boundary: only POST/PUT/PATCH/DELETE are gated; GET/HEAD/OPTIONS
+//!   stay open).
 //!   Under `.all`, register `cors` *before* the gate so browser
 //!   preflights (which cannot carry Authorization) are intercepted
 //!   before they would 401.
 //! - **Open plane.** An empty token set means **no authentication** —
-//!   every request passes with `Identity.scheme == .open` (the seed's
-//!   dev/demo default, kept deliberately: turning auth on is providing a
-//!   token). If you want deny-by-default, always configure a token.
+//!   every request passes with `Identity.scheme == .open` (a deliberate
+//!   dev/demo default: turning auth on is providing a token). If you want
+//!   deny-by-default, always configure a token.
 //! - **Audit.** `Options.on_audit` is a hook, not a logger: it fires
 //!   synchronously with an `AuditEntry` for every **authenticated
 //!   mutation** (after the handler, with the final status and the
 //!   `target`/`detail` the handler put on the Identity) and for every
 //!   **denial** (401, any method). Reads are not audited. Entry slices
 //!   borrow request-scoped memory — copy what you keep.
-//! - **Denied-request throttle** (the seed's `AuditThrottle`, per-key).
+//! - **Denied-request throttle** (per-key).
 //!   Repeated 401s from one client are coalesced to ~1 audit entry per
 //!   `throttle_window_ms` (default 5 s), folding the suppressed count
 //!   into the next admitted entry (`AuditEntry.suppressed`) — an
@@ -72,9 +70,8 @@
 //!   `.monotonic` clock ever touches the OS.
 //! - **Rotation.** The token set = `Options.token` ∪
 //!   `Options.extra_tokens`, mutable at runtime via `addToken` /
-//!   `removeToken` — the seed's `admin_tokens_file` idea as an API (add
-//!   the new token, migrate clients, remove the old; no file, no
-//!   restart).
+//!   `removeToken` — token-file rotation as an API (add the new token,
+//!   migrate clients, remove the old; no file, no restart).
 //!
 //! ## Thread-safety
 //!
@@ -93,13 +90,12 @@ const router = @import("router");
 const http = @import("http");
 
 pub const meta = .{
-    .status = .extract, // axp-central/src/rest.zig: token gate + auditMutation + AuditThrottle
     .platform = .any,
     .role = .server,
     // Internally synchronized (documented spinlock over token set +
     // throttle store); safe from all connection threads at once.
     .concurrency = .threadsafe,
-    .model_after = "axp rest.zig gate (seed); envoy ext_authz / oauth2-proxy (bearer behavior only); RFC 6750",
+    .model_after = "envoy ext_authz / oauth2-proxy (bearer behavior only); RFC 6750",
     .deps = .{ "router", "http" },
 };
 
@@ -154,7 +150,7 @@ pub const Protect = enum {
     /// `cors` before the gate so preflights don't 401.
     all,
     /// Only mutations (POST/PUT/PATCH/DELETE) are gated; GET/HEAD/OPTIONS
-    /// stay open (the seed's R/W boundary).
+    /// stay open (the read/write boundary).
     mutations,
 };
 
@@ -199,7 +195,7 @@ pub const Identity = struct {
     /// How the request passed the gate.
     scheme: Scheme,
     /// Handlers may fill these so the audit entry records *what* the
-    /// mutation touched, not just the route (the seed's `AuditCtx`).
+    /// mutation touched, not just the route.
     /// Slices must stay valid until the handler returns (request-scoped
     /// or static memory).
     audit_target: []const u8 = "",
@@ -225,7 +221,7 @@ pub fn identityOf(ctx: *const router.Ctx) ?*Identity {
     return @ptrCast(@alignCast(p));
 }
 
-/// One audited request (the seed's audit-record fields, minus storage
+/// One audited request (the audit-record fields, minus storage
 /// concerns — persisting is the hook's job). All slices borrow
 /// request-scoped memory: valid for the duration of the hook call only.
 pub const AuditEntry = struct {
@@ -244,7 +240,7 @@ pub const AuditEntry = struct {
     status: u16,
     /// Denials only: how many earlier denials from the same client key
     /// were coalesced (not individually reported) since the last admitted
-    /// entry — the seed's "+N suppressed" fold, as data. 0 otherwise.
+    /// entry — the "+N suppressed" fold, as data. 0 otherwise.
     suppressed: u64,
 };
 
@@ -562,7 +558,7 @@ pub const Gate = struct {
     /// Denied-audit admission for `key` at the injected clock's now:
     /// null = coalesced (within the window — the hook stays quiet), else
     /// the number of previously suppressed denials to fold into the entry
-    /// written now (the seed's `AuditThrottle.decideDenied`, per key).
+    /// written now (the per-key denied-request decision).
     /// OOM tracking a new key fails open (the entry is admitted,
     /// untracked — an allocator hiccup must not silence the audit trail).
     fn deniedDecision(g: *Gate, key: []const u8) ?u64 {
@@ -598,7 +594,7 @@ fn lockSpin(m: *std.atomic.Mutex) void {
 
 // ── the denied-request throttle store ───────────────────────────────────────
 
-/// Per-key coalescing state (the seed's `AuditThrottle`, keyed + bounded).
+/// Per-key coalescing state (keyed + bounded).
 /// Guarded by the Gate's lock — no locking of its own.
 const Throttle = struct {
     /// Keyed by `Entry.key` (gpa-owned copies).
@@ -676,7 +672,7 @@ const Throttle = struct {
 
 // ── request parsing helpers ─────────────────────────────────────────────────
 
-/// A mutating method (the W half of the seed's R/W boundary).
+/// A mutating method (the write half of the read/write boundary).
 fn isMutating(m: http.Method) bool {
     return switch (m) {
         .post, .put, .delete, .patch => true,

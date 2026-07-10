@@ -44,7 +44,6 @@ const std = @import("std");
 const netaddr = @import("netaddr");
 
 pub const meta = .{
-    .status = .gap,
     .platform = .any, // core is pure; only the optional `query` helper does I/O
     .role = .codec,
     .concurrency = .reentrant, // no shared state; every call is over caller buffers

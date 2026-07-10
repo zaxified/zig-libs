@@ -72,7 +72,6 @@ const router = @import("router");
 const net = std.Io.net;
 
 pub const meta = .{
-    .status = .gap,
     .platform = .posix, // default clock uses the posix clock_gettime form
     .role = .server,
     // Internally synchronized (documented spinlock around O(1) critical

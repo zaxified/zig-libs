@@ -11,7 +11,6 @@
 const std = @import("std");
 
 pub const meta = .{
-    .status = .extract, // seed: wgs src/transforms.zig + src/series.zig
     .platform = .any,
     .role = .util,
     .concurrency = .reentrant,

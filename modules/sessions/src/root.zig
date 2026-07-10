@@ -63,7 +63,6 @@ const ramcache = @import("ramcache");
 const csrf = @import("csrf.zig");
 
 pub const meta = .{
-    .status = .gap,
     .platform = .any,
     .role = .server,
     // The Manager is immutable once built; the only mutable state is the

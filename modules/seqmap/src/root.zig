@@ -17,7 +17,6 @@
 const std = @import("std");
 
 pub const meta = .{
-    .status = .extract, // seeded in zig-fping/src/seqmap.zig
     .platform = .any, // pure logic, no OS calls
     .role = .util,
     .concurrency = .reentrant, // no shared/global state; don't share one instance

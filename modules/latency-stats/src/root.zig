@@ -22,8 +22,7 @@
 //!   • stddev is the *population* stddev (divide by n), matching what fping and
 //!     iputils `ping` print in their summary line.
 //!
-//! Provenance: extracted from the authors' axp project (latency accounting in
-//! the probe path; Apache-2.0, relicensed MIT by the copyright holder). Models
+//! Provenance: original work of the zig-libs authors (MIT). Models
 //! fping / iputils-ping summary stats + RFC 3550 §6.4.1 jitter + Welford's
 //! online variance. `Histogram` implements HdrHistogram percentiles per Gil
 //! Tene's HdrHistogram design (logarithmic bucketing with linear sub-buckets,
@@ -34,7 +33,6 @@
 const std = @import("std");
 
 pub const meta = .{
-    .status = .extract,
     .platform = .any, // pure arithmetic; no I/O, no clock
     .role = .util,
     .concurrency = .single_owner, // one Accumulator per probe stream; not shared

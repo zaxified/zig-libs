@@ -50,7 +50,6 @@ const std = @import("std");
 const http = @import("http");
 
 pub const meta = .{
-    .status = .extract, // dispatch shape seeded in axp-central/src/rest.zig; the trie matcher is built here
     .platform = .any,
     .role = .server,
     // Building (add/use/group) is single-owner; a built Router is immutable

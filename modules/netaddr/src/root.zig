@@ -9,9 +9,8 @@
 //! scope/policy classification, and the RFC 6724 "which address do I connect
 //! to first" ordering that `http`, `dns` and `icmp` build on.
 //!
-//! The RFC 6724 logic is ported from zig-fping's `src/netutil.zig`
-//! (`sortByDestinationPolicy`, `policyPrecedence`, `destinationReachable`) and
-//! extended to the full destination rule set, cross-checked against Go's
+//! The RFC 6724 logic is derived from fping (see ../../NOTICE) and extended to
+//! the full destination rule set, cross-checked against Go's
 //! `net/addrselect.go`. Like Go, rules that need OS state we don't track are
 //! skipped (rule 3 deprecated addresses, rule 4 home addresses, rule 7 native
 //! transport).
@@ -28,7 +27,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 pub const meta = .{
-    .status = .extract, // seeded in zig-fping/src/netutil.zig
     .platform = .any, // pure logic; `systemSource` helper is Linux-only
     .role = .util,
     .concurrency = .reentrant,
@@ -1098,14 +1096,14 @@ test "scopeOf follows RFC 6724 / Go classifyScope" {
 }
 
 test "policy precedence follows the RFC 6724 table" {
-    // Vectors from the zig-fping seed…
+    // Core RFC 6724 precedence-table vectors…
     try testing.expectEqual(@as(u8, 50), precedenceOf(mkIp("::1")));
     try testing.expectEqual(@as(u8, 40), precedenceOf(mkIp("2606:4700::1111")));
     try testing.expectEqual(@as(u8, 35), precedenceOf(mkIp("192.0.2.1")));
     try testing.expectEqual(@as(u8, 30), precedenceOf(mkIp("2002::1")));
     try testing.expectEqual(@as(u8, 5), precedenceOf(mkIp("2001:0::1")));
     try testing.expectEqual(@as(u8, 3), precedenceOf(mkIp("fd00::1")));
-    // …plus the rows the seed skipped.
+    // …plus the remaining site-local / 6bone rows.
     try testing.expectEqual(@as(u8, 1), precedenceOf(mkIp("fec0::1")));
     try testing.expectEqual(@as(u8, 1), precedenceOf(mkIp("3ffe::1")));
     try testing.expectEqual(@as(u8, 1), precedenceOf(mkIp("::0.0.0.2"))); // ::/96

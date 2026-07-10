@@ -61,7 +61,6 @@ const router = @import("router");
 const http = @import("http");
 
 pub const meta = .{
-    .status = .gap, // clean-room from the GitHub/Stripe webhook-HMAC convention + RFC 2104
     .platform = .any,
     .role = .server,
     // Immutable after init (secret set + config fixed); no shared mutable

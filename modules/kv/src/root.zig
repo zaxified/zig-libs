@@ -56,7 +56,6 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 pub const meta = .{
-    .status = .gap, // no production embedded KV store exists in Zig
     .platform = .any, // all I/O via std.Io through the Storage seam
     .role = .both, // embedded read+write store
     // Internally synchronized: one coarse spinlock over all operations

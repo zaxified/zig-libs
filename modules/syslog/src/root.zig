@@ -22,7 +22,6 @@
 const std = @import("std");
 
 pub const meta = .{
-    .status = .gap,
     .platform = .any,
     .role = .both,
     .concurrency = .reentrant,
@@ -95,7 +94,6 @@ test {
 }
 
 test "meta is well-formed" {
-    try std.testing.expectEqual(.gap, meta.status);
     try std.testing.expectEqual(.any, meta.platform);
     try std.testing.expectEqual(.both, meta.role);
     try std.testing.expectEqual(.reentrant, meta.concurrency);

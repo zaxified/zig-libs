@@ -126,7 +126,6 @@ const http = @import("http");
 const router = @import("router");
 
 pub const meta = .{
-    .status = .gap,
     .platform = .any, // pure logic over the Fetcher seam; HttpFetcher uses `http`
     .role = .server, // P6 is a `router` middleware guarding routes with a Provider.
     .concurrency = .reentrant, // except Provider — one mutable cache, external sync (inject ResourceServer.lock under a threaded server)

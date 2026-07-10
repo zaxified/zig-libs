@@ -19,8 +19,8 @@
 //! no panics, no hangs, no unbounded allocation.
 //!
 //! Decoded names are dotted ASCII text without the trailing root dot (root is
-//! the empty string); no `\DDD` escape handling (labels are raw bytes, like
-//! the seed impl). Allocation model: `decode` builds the whole `Message`
+//! the empty string); no `\DDD` escape handling (labels are raw bytes).
+//! Allocation model: `decode` builds the whole `Message`
 //! behind a single arena owned by the message (free with `Message.deinit`);
 //! `encodeQuery` writes into a caller-provided buffer, no allocation.
 

@@ -42,7 +42,6 @@
 const std = @import("std");
 
 pub const meta = .{
-    .status = .gap, // no mature pure-Zig SNMP implementation exists
     .platform = .any, // codec + client are portable; UdpTransport uses std.Io.net
     .role = .client, // manager + reusable wire codec
     .concurrency = .single_owner, // Client owns request-id counter + buffers
@@ -129,7 +128,6 @@ test {
 }
 
 test "meta is well-formed" {
-    try std.testing.expectEqual(.gap, meta.status);
     try std.testing.expectEqual(.any, meta.platform);
     try std.testing.expectEqual(.client, meta.role);
     try std.testing.expectEqual(.single_owner, meta.concurrency);

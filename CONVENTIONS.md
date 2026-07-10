@@ -78,8 +78,6 @@ Every `modules/<name>/src/root.zig` declares a `pub const meta` block — **this
 canonical source of a module's metadata**; a module's README shows a *derived* view of
 it, and SPEC.md does not restate it. Vocabulary:
 
-- `status`: `.extract` (seeded in one of our projects, carve out) · `.gap` (missing in
-  Zig, build/port) · `.adopt` (a good pure-Zig lib exists — don't build).
 - `platform`: `.any` (cross-OS) · `.posix` · `.linux` (raw syscalls / no-libc — a
   conscious ceiling, not a bug).
 - `role`: `.client` · `.server` · `.codec` (pure wire, no I/O) · `.both` · `.util`.
@@ -96,7 +94,7 @@ One fact lives in exactly one place; everywhere else links to it, never restates
 
 | Fact | Lives in | Everywhere else |
 |---|---|---|
-| meta tags (status/platform/role/concurrency/model_after/deps) | `pub const meta` in `src/root.zig` | README shows a derived view; SPEC does not restate |
+| meta tags (platform/role/concurrency/model_after/deps) | `pub const meta` in `src/root.zig` | README shows a derived view; SPEC does not restate |
 | one-line module purpose | root `README.md` catalog table | — |
 | paragraph purpose + API + import + verify steps | `modules/<m>/README.md` | — |
 | design & invariants, threat-model, verification detail, per-module backlog | `modules/<m>/SPEC.md` | — |

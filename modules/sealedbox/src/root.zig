@@ -12,15 +12,14 @@
 //! keys, so keys can live in config files and wire protocols. Parsing is strict
 //! (exact length, no whitespace) and returns typed errors — never panics.
 //!
-//! Provenance: extracted from the authors' axp project — `axp-core/src/sealed.zig`
-//! (the enrollment sealed-box wrapper); Apache-2.0, relicensed MIT by the
-//! copyright holder. Model after libsodium `crypto_box_seal` / Go `nacl/box`.
-//! No third-party source copied — the construction is the public NaCl standard.
+//! Provenance: original work of the zig-libs authors (MIT); a thin wrapper over
+//! std's public NaCl `crypto_box_seal` construction. Model after libsodium
+//! `crypto_box_seal` / Go `nacl/box`. No third-party source copied — the
+//! construction is the public NaCl standard.
 
 const std = @import("std");
 
 pub const meta = .{
-    .status = .extract,
     .platform = .any,
     .role = .util,
     .concurrency = .reentrant,
@@ -43,10 +42,10 @@ pub fn sealedLen(plaintext_len: usize) usize {
     return plaintext_len + overhead;
 }
 
-// ── buffer API (no allocation; matches the axp seed) ──────────────────────────
+// ── buffer API (no allocation) ────────────────────────────────────────────────
 
 /// Seal `msg` to `recipient_pk`. `out` must be exactly `msg.len + overhead` bytes.
-/// `io` supplies entropy for the per-message ephemeral keypair. (Seed: axp sealed.zig.)
+/// `io` supplies entropy for the per-message ephemeral keypair.
 pub fn seal(io: std.Io, out: []u8, msg: []const u8, recipient_pk: [public_length]u8) !void {
     std.debug.assert(out.len == msg.len + overhead);
     try SealedBox.seal(io, out, msg, recipient_pk);
@@ -54,7 +53,7 @@ pub fn seal(io: std.Io, out: []u8, msg: []const u8, recipient_pk: [public_length
 
 /// Open a sealed message with the recipient keypair. `out` must be exactly
 /// `sealed.len - overhead` bytes. Returns an error (never panics) on a too-short
-/// or tampered ciphertext. (Seed: axp sealed.zig.)
+/// or tampered ciphertext.
 pub fn open(out: []u8, sealed: []const u8, kp: KeyPair) !void {
     if (sealed.len < overhead or sealed.len != out.len + overhead)
         return error.InvalidCiphertext;

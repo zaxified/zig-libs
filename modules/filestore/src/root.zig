@@ -17,23 +17,20 @@
 //! (`[A-Za-z0-9._-]`, no leading dot, no `.`/`..`, no `/`), checked on every
 //! public entry point, so a request can never escape `base`.
 //!
-//! Provenance: extracted + spec-completed from the authors' axp project
-//! (`axp-central/src/store.zig`, MIT). The `kind/id.json` layout and the
-//! read/list/delete shape are the seed's; atomic temp-then-rename writes and
-//! `segmentSafe` path validation (the seed had *neither* — it wrote directly
-//! with no traversal guard), the raw-bytes-vs-typed-JSON split, and the
-//! `listTyped` skipped-count report (the seed's `listRecords` swallowed
-//! unparseable files with a silent `catch continue`) are written for this
-//! module.
+//! Provenance: original work of the zig-libs authors (MIT). A `kind/id.json`
+//! layout with a read/list/delete shape, atomic temp-then-rename writes,
+//! `segmentSafe` path validation (no traversal escape), a
+//! raw-bytes-vs-typed-JSON split, and a `listTyped` skipped-count report
+//! (unparseable files are tolerantly skipped but *counted*, never silently
+//! dropped).
 
 const std = @import("std");
 
 pub const meta = .{
-    .status = .extract, // seed: axp-central/src/store.zig
     .platform = .posix, // atomic rename-on-commit; std.Io filesystem API
     .role = .util,
     .concurrency = .reentrant, // no shared state bar a process-local ingest counter
-    .model_after = "flat-file document store (axp resource store)",
+    .model_after = "content-addressed / flat-file document store",
     .deps = .{},
 };
 
@@ -155,8 +152,8 @@ pub const Store = struct {
 
     /// Parse every `<base>/<kind>/*` file as `T`. A missing kind dir ⇒ empty
     /// result, not an error. Unparseable files are tolerantly skipped — but
-    /// *counted* (`skipped`), unlike the seed's `listRecords`, which discarded
-    /// them via a silent `catch continue`. Allocations in `arena`.
+    /// *counted* (`skipped`), never silently discarded via a bare
+    /// `catch continue`. Allocations in `arena`.
     pub fn listTyped(self: Store, comptime T: type, arena: std.mem.Allocator, kind: []const u8) !struct { items: []T, skipped: usize } {
         const keys = try self.list(arena, kind);
         var items: std.ArrayList(T) = .empty;

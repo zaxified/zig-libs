@@ -90,7 +90,7 @@ fn parseCapped(text: []const u8, cap: u8) ?u8 {
 }
 
 /// Parse an IP literal, tolerating a `%zone` suffix (dropped — routing scope
-/// is out of scope here, matching the seed).
+/// is out of scope here).
 fn parseIpMaybeZone(text: []const u8) ?netaddr.Ip {
     const bare = text[0 .. std.mem.indexOfScalar(u8, text, '%') orelse text.len];
     return netaddr.parseIp(bare);

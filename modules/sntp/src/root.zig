@@ -21,7 +21,6 @@ const builtin = @import("builtin");
 const net = std.Io.net;
 
 pub const meta = .{
-    .status = .gap,
     .platform = .any,
     .role = .client,
     .concurrency = .reentrant,

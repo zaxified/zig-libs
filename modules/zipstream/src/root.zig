@@ -26,7 +26,6 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 pub const meta = .{
-    .status = .extract, // seed: bxp-core/src/zipstream.zig
     .platform = .any,
     .role = .codec,
     .concurrency = .reentrant,

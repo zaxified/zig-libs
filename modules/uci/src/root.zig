@@ -40,7 +40,6 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 pub const meta = .{
-    .status = .gap,
     .platform = .any,
     .role = .codec,
     .concurrency = .reentrant,
@@ -901,6 +900,5 @@ test "quoted keys and types round-trip" {
 }
 
 test "meta is well-formed" {
-    try testing.expect(meta.status == .gap);
     try testing.expect(meta.role == .codec);
 }

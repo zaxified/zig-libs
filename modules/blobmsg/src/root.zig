@@ -18,11 +18,11 @@
 //! defer gpa.free(board);
 //! ```
 //!
-//! The wire format was clean-room ported byte-for-byte from the OpenWRT C
-//! sources (openwrt/ubus `ubusmsg.h` + `libubus-io.c`, openwrt/libubox
-//! `blob.h` + `blobmsg.h`) in the seed project and verified against a real
-//! daemon (native output must equal `ubus -S`). Two daemon behaviors are
-//! ported verbatim because ubusd depends on them:
+//! The wire format is a clean-room reimplementation, byte-for-byte from the
+//! OpenWRT C sources (openwrt/ubus `ubusmsg.h` + `libubus-io.c`,
+//! openwrt/libubox `blob.h` + `blobmsg.h`), verified against a real daemon
+//! (native output must equal `ubus -S`). Two daemon behaviors are
+//! reproduced exactly because ubusd depends on them:
 //!
 //! 1. An INVOKE must carry a `UBUS_ATTR_DATA` attr even when there are no
 //!    arguments — ubusd rejects an arg-less invoke with INVALID_ARGUMENT.
@@ -42,7 +42,6 @@ pub const FieldIterator = codec.FieldIterator;
 pub const Value = codec.Value;
 
 pub const meta = .{
-    .status = .extract, // seeded in axp axp-core/src/ubus.zig — carved out here
     .platform = .linux, // client = raw unix-socket syscalls; codec itself is .any
     .role = .client,
     .concurrency = .reentrant, // no globals; one Client per thread/loop
@@ -367,7 +366,7 @@ pub const Client = struct {
         codec.appendAttrU32(self.gpa, &children, codec.ATTR.OBJID, objid) catch |e| return mapEncode(e);
         codec.appendAttrString(self.gpa, &children, codec.ATTR.METHOD, method) catch |e| return mapEncode(e);
 
-        // Daemon gotcha #1 (ported verbatim from the seed): the INVOKE must
+        // Daemon gotcha #1: the INVOKE must
         // carry a UBUS_ATTR_DATA attr even when there are no arguments —
         // ubusd rejects an arg-less invoke with INVALID_ARGUMENT otherwise.
         const args = std.mem.trim(u8, args_json orelse "", " \t\r\n");
@@ -389,7 +388,7 @@ pub const Client = struct {
         var result: ?[]u8 = null;
         errdefer if (result) |r| self.gpa.free(r);
 
-        // Daemon gotcha #2 (ported verbatim): reply sequence = ack STATUS
+        // Daemon gotcha #2: reply sequence = ack STATUS
         // (no OBJID) → DATA (the result) → completion STATUS (carries OBJID
         // + the method's return code). Ignore the ack, capture the DATA,
         // stop on the completion — distinguished by the OBJID attr.

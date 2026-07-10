@@ -33,7 +33,6 @@
 const std = @import("std");
 
 pub const meta = .{
-    .status = .gap, // no ACME client in Zig std or ecosystem worth adopting
     .platform = .any,
     .role = .client,
     // The Responder is fully thread-safe (server threads read while the
@@ -122,6 +121,5 @@ test "needsRenewal: boundary at exactly within_days, expiry, malformed input" {
 }
 
 test "meta block sanity" {
-    try testing.expectEqual(.gap, meta.status);
     try testing.expectEqual(.client, meta.role);
 }

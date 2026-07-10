@@ -40,7 +40,6 @@ const std = @import("std");
 const netaddr = @import("netaddr");
 
 pub const meta = .{
-    .status = .extract, // client shape seeded in axp-core/src/httpclient.zig
     .platform = .any,
     .role = .both, // Client + Server submodules
     // One thread owns a Client (and its responses) or drives a Server;

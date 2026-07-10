@@ -2,11 +2,10 @@
 //! jsonshape — reshape JSON into a canonical `dataset`: dot-path descent to an
 //! array node + typed column projection (jq-style minimal subset).
 //!
-//! Lifts poc-wf-analytic's remote-feed shaping (`getDataview` / `dataviewGet`):
-//! walk a **dot-path** to an array node, then project each item into columns.
-//! Two modes:
+//! Remote-feed shaping (`getDataview` / `dataviewGet`): walk a **dot-path** to
+//! an array node, then project each item into columns. Two modes:
 //!   * **columns** (generic): `[]JsonCol{name,key,type}` — one column per field.
-//!   * **[x,y] default** (poc-compatible, when `columns` is empty): 2 columns from
+//!   * **[x,y] default** (when `columns` is empty): 2 columns from
 //!     `x`/`y` keys, or positional `item[0]/item[1]` for array items, or
 //!     `[index, item]` for scalars.
 //!
@@ -14,8 +13,7 @@
 //! declared `ColumnType`. Allocates into `a` (a caller-owned arena); the parsed
 //! JSON tree lives in the same arena, so string cells borrow it.
 //!
-//! Provenance: extracted from the authors' wgs project (src/jsonshape.zig, MIT,
-//! same authors) — faithful lift, ownership semantics unchanged.
+//! Provenance: original work of the zig-libs authors (MIT).
 
 const std = @import("std");
 const ds = @import("dataset");
@@ -25,7 +23,6 @@ const ColumnType = ds.ColumnType;
 const Value = ds.Value;
 
 pub const meta = .{
-    .status = .extract, // seed: wgs src/jsonshape.zig
     .platform = .any,
     .role = .codec,
     .concurrency = .reentrant,

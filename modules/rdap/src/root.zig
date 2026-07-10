@@ -34,7 +34,6 @@ const http = @import("http");
 const netaddr = @import("netaddr");
 
 pub const meta = .{
-    .status = .gap,
     .platform = .any, // pure logic over the Fetcher seam; HttpFetcher uses `http`
     .role = .client,
     .concurrency = .reentrant, // no shared state anywhere

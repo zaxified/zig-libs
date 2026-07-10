@@ -46,7 +46,6 @@ const Allocator = std.mem.Allocator;
 const kv = @import("kv");
 
 pub const meta = .{
-    .status = .gap,
     // The OS-default wall/monotonic clocks use posix `clock_gettime`; both
     // are injectable, everything else is pure logic + the `kv` store.
     .platform = .posix,

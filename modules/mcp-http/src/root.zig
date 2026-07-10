@@ -61,13 +61,12 @@ const http = @import("http");
 const mcp = @import("mcp");
 
 pub const meta = .{
-    .status = .gap,
     .platform = .any,
     .role = .server,
     // Reentrant except the shared mcp.Server — inject Lock under a threaded
     // http.Server (documented).
     .concurrency = .reentrant,
-    .model_after = "MCP Streamable HTTP transport (2025-06-18); bxp-gui/mcp_dart behavioral reference",
+    .model_after = "MCP Streamable HTTP transport (2025-06-18); mcp_dart behavioral reference",
     .deps = .{ "router", "http", "mcp" },
 };
 

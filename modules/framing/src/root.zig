@@ -13,7 +13,6 @@
 const std = @import("std");
 
 pub const meta = .{
-    .status = .extract, // seed: axp-core/src/wire.zig + message.zig
     .platform = .any,
     .role = .codec,
     .concurrency = .reentrant,
@@ -159,7 +158,7 @@ const TestPing = struct {
     state: TestStatus,
 };
 
-/// Domain-free stand-in for a real protocol union (e.g. AXP's `Message`) —
+/// Domain-free stand-in for a real protocol union (e.g. a message enum) —
 /// exercises the same shapes without importing any project-specific types.
 const TestEnvelope = union(enum) {
     empty: TestEmpty,

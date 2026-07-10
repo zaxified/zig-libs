@@ -30,7 +30,6 @@ const std = @import("std");
 const ascii = std.ascii;
 
 pub const meta = .{
-    .status = .gap, // no Web-Linking codec in std; build it
     .platform = .any, // pure byte logic, no OS calls
     .role = .codec, // pure wire format, no I/O of its own
     .concurrency = .reentrant, // no shared state, no allocation

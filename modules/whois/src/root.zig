@@ -28,7 +28,6 @@
 const std = @import("std");
 
 pub const meta = .{
-    .status = .gap,
     .platform = .any, // codec/logic; the optional TcpTransport helper is posix
     .role = .client,
     .concurrency = .reentrant, // no shared state anywhere

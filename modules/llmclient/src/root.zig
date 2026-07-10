@@ -43,7 +43,6 @@
 const std = @import("std");
 
 pub const meta = .{
-    .status = .gap,
     .platform = .any,
     .role = .client,
     .concurrency = .single_owner,

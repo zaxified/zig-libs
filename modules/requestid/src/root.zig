@@ -43,7 +43,6 @@ const router = @import("router");
 const http = @import("http");
 
 pub const meta = .{
-    .status = .gap,
     .platform = .any,
     .role = .util,
     // Per-request state lives in thread-local storage owned by the connection

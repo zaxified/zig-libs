@@ -15,7 +15,6 @@ const std = @import("std");
 const http = @import("http");
 
 pub const meta = .{
-    .status = .gap,
     .platform = .any,
     .role = .codec,
     .concurrency = .reentrant, // no state; results borrow the input header

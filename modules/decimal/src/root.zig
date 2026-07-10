@@ -34,14 +34,13 @@
 //! range returns a clean error (`round`/`floor`/`ceil` return the value
 //! unchanged instead — see their doc comments).
 //!
-//! Extracted from bxp `bxp-core/src/decimal.zig` (same authors); semantics are
-//! preserved, only the `?Decimal` results became explicit error unions and the
-//! overflow checks were completed (div quotient + parse accumulator).
+//! Provenance: original work of the zig-libs authors (MIT). Results are
+//! explicit error unions and every operation that can exceed the range is
+//! overflow-checked (div quotient + parse accumulator).
 
 const std = @import("std");
 
 pub const meta = .{
-    .status = .extract, // seeded in bxp bxp-core/src/decimal.zig (proven on 40M-row ETL)
     .platform = .any, // pure integer logic, no OS calls
     .role = .util,
     .concurrency = .reentrant, // no shared state, no allocation
@@ -505,7 +504,7 @@ fn roundsAwayWhenBelowHalf(result_neg: bool, mode: RoundingMode) bool {
 }
 
 // ---------------------------------------------------------------------------
-// Tests (ported from the bxp seed + extraction additions)
+// Tests
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;

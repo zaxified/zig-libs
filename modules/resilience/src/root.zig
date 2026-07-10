@@ -129,7 +129,6 @@
 const std = @import("std");
 
 pub const meta = .{
-    .status = .gap,
     // Default Clock (posix clock_gettime errno form) and default Delay
     // (posix nanosleep) are posix; both are injectable, everything else is
     // pure logic.

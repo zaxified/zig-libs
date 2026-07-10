@@ -40,7 +40,6 @@ const builtin = @import("builtin");
 const netaddr = @import("netaddr");
 
 pub const meta = .{
-    .status = .extract, // seed: axp-core/src/task.zig /proc parsers
     .platform = .linux,
     .role = .util,
     .concurrency = .reentrant,
@@ -243,9 +242,8 @@ pub fn snapshot(gpa: std.mem.Allocator, io: std.Io) std.mem.Allocator.Error!Snap
 }
 
 /// Enumerate every `/sys/class/thermal/thermal_zone*` and read its `temp` (+
-/// `type`). The seed hardcoded `thermal_zone0`; real hardware commonly has
-/// several (package, per-core, NVMe, Wi-Fi …) — enumerating is the only way
-/// to see all of them.
+/// `type`). Real hardware commonly has several zones (package, per-core, NVMe,
+/// Wi-Fi …) — enumerating is the only way to see all of them.
 fn readThermalZones(gpa: std.mem.Allocator, io: std.Io) std.mem.Allocator.Error![]ThermalZone {
     var out: std.ArrayList(ThermalZone) = .empty;
     errdefer out.deinit(gpa);

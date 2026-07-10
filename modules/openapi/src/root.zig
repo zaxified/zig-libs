@@ -52,7 +52,6 @@ const router = @import("router");
 const http = @import("http");
 
 pub const meta = .{
-    .status = .gap,
     .platform = .any,
     .role = .util,
     // Pure function of an immutable (post-build) Router — no shared state;

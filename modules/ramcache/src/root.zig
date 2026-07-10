@@ -53,7 +53,6 @@
 const std = @import("std");
 
 pub const meta = .{
-    .status = .extract, // extracted from poc-wf-analytic src/cache.zig (same authors)
     .platform = .any,
     .role = .util,
     .concurrency = .single_owner, // one thread/loop owns it, lock-free by design

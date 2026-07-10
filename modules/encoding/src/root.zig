@@ -16,7 +16,6 @@
 const std = @import("std");
 
 pub const meta = .{
-    .status = .extract, // seed: bxp-core/src/encoding.zig
     .platform = .any,
     .role = .codec,
     .concurrency = .reentrant,

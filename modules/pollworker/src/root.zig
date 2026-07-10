@@ -19,7 +19,6 @@ const builtin = @import("builtin");
 const linux = std.os.linux;
 
 pub const meta = .{
-    .status = .extract, // seed: poc-wf-analytic/src/main.zig (runController + HttpJob table)
     .platform = .linux,
     .role = .util,
     .concurrency = .single_owner,

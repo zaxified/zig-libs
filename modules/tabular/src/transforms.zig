@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! Dataset algebra **Tier 0** — the pure `dataset → dataset` primitives that
-//! unlock ~85% of the seed project's compute. Each is a pure function of
+//! cover the bulk of dataset transform workloads. Each is a pure function of
 //! `(allocator, Dataset, Spec) → Dataset`; nothing is mutated in place. The
 //! allocator is normally a caller-owned arena for the whole pipeline (see the
 //! memory model note in `dataset`).

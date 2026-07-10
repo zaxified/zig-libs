@@ -10,10 +10,9 @@
 //! request bodies can be streamed via `requestStreaming` (fixed length or
 //! chunked), so bodies larger than memory never get buffered.
 //!
-//! Adapted from the axp seed (`axp-core/src/httpclient.zig`), generalized:
-//! TLS via `std.crypto.tls` (never `std.http.Client`), hostname resolution
-//! via `std.Io.net.HostName` (to be swapped for the `dns` module when it
-//! lands), URL/host splitting via `netaddr`.
+//! Implementation notes: TLS via `std.crypto.tls` (never `std.http.Client`),
+//! hostname resolution via `std.Io.net.HostName` (to be swapped for the
+//! `dns` module when it lands), URL/host splitting via `netaddr`.
 //!
 //! Timeout model (Phase 1): the connect timeout is enforced natively by the
 //! Io implementation; the total timeout is checked between phases (connect,

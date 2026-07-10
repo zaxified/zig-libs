@@ -20,7 +20,6 @@ const framing = @import("framing");
 const linux = std.os.linux;
 
 pub const meta = .{
-    .status = .extract, // seed: poc-wf-analytic/src/main.zig (unix transport + ctlHandleConn + bus_map)
     .platform = .linux,
     .role = .server,
     .concurrency = .single_owner,

@@ -29,7 +29,6 @@ const std = @import("std");
 const netaddr = @import("netaddr");
 
 pub const meta = .{
-    .status = .extract, // hosts + UDP-PTR seeded in zig-fping/src/rdns.zig; codec/DoH fill a std gap
     .platform = .any, // lookupIp's RFC 6724 ordering kicks in on Linux only
     .role = .client,
     .concurrency = .blocking, // every lookup blocks; one owner per Resolver

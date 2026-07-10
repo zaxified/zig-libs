@@ -63,7 +63,6 @@ const router = @import("router");
 const http = @import("http");
 
 pub const meta = .{
-    .status = .gap,
     .platform = .posix, // default clock uses the posix clock_gettime errno form
     .role = .util,
     // Internally synchronized with atomics only (documented seq_cst policy);

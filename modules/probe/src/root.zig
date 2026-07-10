@@ -62,7 +62,6 @@ const net = std.Io.net;
 const Allocator = std.mem.Allocator;
 
 pub const meta = .{
-    .status = .gap, // no pure-Zig TCP-connect prober / fping-style fan-out exists
     .platform = .any, // pure engine; the default connector uses std.Io.net (cross-OS)
     .role = .client,
     .concurrency = .single_owner, // one prober run owns its results; fan-out threads touch disjoint slots

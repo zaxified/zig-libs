@@ -23,7 +23,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 pub const meta = .{
-    .status = .extract, // seed: bxp bxp-gui-bridge/src/main.zig (reap-race core)
     .platform = .any, // full behavior on POSIX; Windows compiles (reap-race is POSIX-only)
     .role = .util,
     .concurrency = .reentrant, // no shared module state (aside from the SIGCHLD-fixup guard)

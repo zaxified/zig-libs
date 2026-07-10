@@ -15,8 +15,7 @@
 //! allocated. Nothing is mutated in place, so borrowing is safe. Free
 //! everything at once via the arena.
 //!
-//! Provenance: extracted from the authors' wgs project (src/dataset.zig, MIT,
-//! same authors) — faithful lift, ownership semantics unchanged. Modeled
+//! Provenance: original work of the zig-libs authors (MIT). Modeled
 //! loosely after the Arrow/Polars minimal-columnar-subset shape and the
 //! pandas DataFrame mental model, but this is a row-major boxed-cell
 //! representation (see the DEFER note below), not true columnar storage.
@@ -24,7 +23,6 @@
 const std = @import("std");
 
 pub const meta = .{
-    .status = .extract, // seed: wgs src/dataset.zig
     .platform = .any,
     .role = .util,
     .concurrency = .reentrant,

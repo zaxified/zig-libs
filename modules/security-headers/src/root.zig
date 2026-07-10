@@ -79,7 +79,6 @@ const router = @import("router");
 const http = @import("http");
 
 pub const meta = .{
-    .status = .gap,
     .platform = .any,
     .role = .util,
     // An initialized SecurityHeaders is immutable; the middleware only reads

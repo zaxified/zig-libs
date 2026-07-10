@@ -74,8 +74,6 @@
 const std = @import("std");
 
 pub const meta = .{
-    .status = .extract, // extracted from bxp bxp-mcp/src/server.zig (same authors);
-    // resources + prompts added clean-room from the MCP spec (no SDK source)
     .platform = .any,
     .role = .server,
     .concurrency = .reentrant, // no globals; one Server instance = one owner
@@ -521,8 +519,8 @@ pub const Server = struct {
 
     /// Serve newline-delimited JSON-RPC until EOF: read one line, handle it,
     /// repeat. Works over any reader/writer pair — stdio, an in-memory pipe,
-    /// a socket. A read failure ends the loop like EOF (the seed behavior: a
-    /// dying peer is a session end, not a server error).
+    /// a socket. A read failure ends the loop like EOF (a dying peer is a
+    /// session end, not a server error).
     pub fn serve(self: *Server, in: *std.Io.Reader, out: *std.Io.Writer) Error!void {
         var line_buf: std.ArrayList(u8) = .empty;
         defer line_buf.deinit(self.gpa);
@@ -717,8 +715,8 @@ pub const Server = struct {
         if (name_v != .string) {
             return sendError(arena, out, id, error_code.invalid_params, "Invalid tool name");
         }
-        // Unknown tool => -32602 (the seed's choice; MCP treats an unknown
-        // tool name as invalid params on tools/call, not a missing method).
+        // Unknown tool => -32602 (MCP treats an unknown tool name as invalid
+        // params on tools/call, not a missing method).
         const tool = self.findTool(name_v.string) orelse {
             return sendError(arena, out, id, error_code.invalid_params, "Unknown tool");
         };

@@ -85,7 +85,6 @@ const probe = @import("probe");
 const Allocator = std.mem.Allocator;
 
 pub const meta = .{
-    .status = .gap, // no pure-Zig LB upstream pool with health + failover exists
     .platform = .any, // pure logic; health I/O goes through the injected seam
     .role = .client,
     // pick/report/call/healthTick internally synchronized (pool spinlock +

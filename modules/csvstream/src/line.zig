@@ -5,7 +5,7 @@
 //! the buffer (composed with an absolute `base_offset`); `splitFields` splits a
 //! single record into its fields.
 //!
-//! Provenance: lifted faithfully from the authors' bxp-core/src/csv.zig (MIT).
+//! Provenance: original work of the zig-libs authors (MIT).
 
 const std = @import("std");
 
@@ -179,7 +179,7 @@ fn unescapeQuotes(s: []const u8, quote: u8, alloc: std.mem.Allocator) ![]u8 {
 }
 
 // ============================================================
-// Tests — ported verbatim from bxp-core/src/csv.zig (the oracle).
+// Tests
 // ============================================================
 
 const t = std.testing;
