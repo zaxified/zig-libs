@@ -1,18 +1,20 @@
 // SPDX-License-Identifier: MIT
 //! rsa — pure-Zig RSA (PKCS#1 v2.2 / RFC 8017), built on `std.crypto.ff`.
 //!
-//! **P1+P2+P3+P4a+P6 IMPLEMENTED, P4b+P5 still stubs.** The RFC 8017 §5
+//! **P1+P2+P3+P4a+P5+P6 IMPLEMENTED, P4b still a stub.** The RFC 8017 §5
 //! primitives (RSAEP/RSADP/RSASP1/RSAVP1, incl. the CRT fast path),
 //! `PublicKey.fromBytes`, `SecretKey.fromPrimes`, the RSASSA-PKCS1-v1_5
 //! scheme (`signPkcs1v15`/`verifyPkcs1v15`, SHA-1/224/256/384/512), the
 //! RSAES-OAEP scheme (`encryptOaep`/`decryptOaep`, MGF1, constant-time
 //! decode), the RSASSA-PSS scheme (`signPss`/`verifyPss`, branch-clean
 //! verify), DER/PEM key parsing (`PublicKey.fromDer`/`fromPem`,
-//! `SecretKey.fromDer`/`fromPkcs8`/`fromPem`, cleartext PEM only), and X.509
-//! v3 self-signed certificate generation (`selfSignedCert`, RFC 5280) are
-//! real and tested against OpenSSL-generated known-answer vectors and (for
-//! `selfSignedCert`) against `std.crypto.Certificate` as an independent
-//! parse/verify oracle. Every P4b/P5 function body is still
+//! `SecretKey.fromDer`/`fromPkcs8`/`fromPem`, cleartext PEM only), keypair
+//! generation (`generate`: probable primes via sieve + Miller-Rabin,
+//! FIPS 186-5-style constraints), and X.509 v3 self-signed certificate
+//! generation (`selfSignedCert`, RFC 5280) are real and tested against
+//! OpenSSL-generated known-answer vectors and (for `selfSignedCert` and
+//! `generate`) against `std.crypto.Certificate` as an independent
+//! parse/verify oracle. P4b's function body is still
 //! `@panic("TODO(agent): ...")`.
 //! Phase plan:
 //!   P1  — EMSA-PKCS1-v1_5 sign/verify (`signPkcs1v15`/`verifyPkcs1v15`) — DONE.
@@ -20,7 +22,7 @@
 //!   P3  — RSASSA-PSS sign/verify (`signPss`/`verifyPss`) — DONE.
 //!   P4a — DER/PEM key parsing (PKCS#1/PKCS#8/SPKI, cleartext only) — DONE.
 //!   P4b — OpenSSH `PROTOCOL.key` parsing incl. bcrypt-pbkdf (`fromOpenSSH`).
-//!   P5  — keypair generation (`generate`).
+//!   P5  — keypair generation (`generate`) — DONE.
 //!   P6  — self-signed certificate generation (`selfSignedCert`) — DONE.
 //!
 //! Modular exponentiation is not reimplemented: this module builds on
@@ -1130,14 +1132,268 @@ pub fn fromOpenSSH(gpa: std.mem.Allocator, text: []const u8) !SecretKey {
     @panic("TODO(agent): P4b parse OpenSSH PROTOCOL.key format (base64 blob + bcrypt-pbkdf if encrypted; see OpenBSD PROTOCOL.key + bcrypt_pbkdf.c as design refs only)");
 }
 
-// ── P5: key generation — reserved, not yet implemented ──────────────────────
+// ── P5: key generation (RFC 8017 §3.2, FIPS 186-5 A.1.3-style checks) ───────
+//
+// `generate` draws two random probable primes p, q of `bits`/2 bits each
+// (top two bits forced so n = p·q lands on exactly `bits` bits), tests them
+// with a small-prime trial-division pre-sieve + Miller-Rabin, enforces the
+// FIPS 186-5 §A.1.3 structural constraints (p ≠ q with |p − q| large,
+// gcd(e, p−1) = gcd(e, q−1) = 1), and then routes the primes through the
+// existing `SecretKey.fromPrimes` (P1) for the n/d/dP/dQ/qInv derivation —
+// key assembly is *not* re-implemented here.
+//
+// Miller-Rabin round count: a uniform `mr_rounds = 64` for every candidate
+// at every size. FIPS 186-5 Table B.1's largest requirement (no companion
+// Lucas test) is 44 rounds (1024-bit primes, 2^-100 target); 64 rounds
+// dominates every table entry for all sizes this module supports and gives
+// a worst-case (adversarial-composite) error bound of 4^-64 = 2^-128 per
+// accepted candidate — for self-generated random candidates the
+// average-case error (Damgård-Landrock-Pomerance) is far smaller still.
+// Witnesses are drawn from the caller's `random`, uniformly in [2, n-2].
+//
+// Timing: prime generation is inherently variable-time (the search loop
+// itself is data-dependent — every implementation's is). The modexps inside
+// Miller-Rabin still use `ff`'s constant-time `powWithEncodedExponent`
+// path, and all candidate/intermediate buffers are `secureZero`ed; what
+// unavoidably remains observable is how *long* the search took, which
+// reveals nothing useful about the primes that were kept.
 
-/// Generate a fresh RSA keypair of `bits` modulus size (probable-prime search
-/// + CRT parameter derivation).
-pub fn generate(io: std.Io, bits: usize) !SecretKey {
-    _ = io;
-    _ = bits;
-    @panic("TODO(agent): P5 RSA keypair generation per RFC 8017 §3.2 (two probable primes, e.g. Miller-Rabin per NIST FIPS 186-5 Appendix B/C) + CRT param derivation");
+/// Miller-Rabin rounds per candidate — see the section comment above for the
+/// FIPS 186-5 Table B.1 rationale.
+const mr_rounds = 64;
+
+/// Odd primes below 1024 for the trial-division pre-sieve, generated at
+/// comptime (sieve of Eratosthenes). Filters ~84% of random odd candidates
+/// with cheap byte-wise remainders before any Miller-Rabin modexp runs.
+const sieve_primes = blk: {
+    @setEvalBranchQuota(20_000);
+    const limit = 1024;
+    var composite = [_]bool{false} ** limit;
+    var count: usize = 0;
+    var i: usize = 3;
+    while (i < limit) : (i += 2) {
+        if (composite[i]) continue;
+        count += 1;
+        var j = i * i;
+        while (j < limit) : (j += 2 * i) composite[j] = true;
+    }
+    var list: [count]u16 = undefined;
+    var idx: usize = 0;
+    i = 3;
+    while (i < limit) : (i += 2) {
+        if (composite[i]) continue;
+        list[idx] = i;
+        idx += 1;
+    }
+    break :blk list;
+};
+
+/// Big-endian unsigned `bytes` mod `divisor` (u128 intermediate: safe for any
+/// u64 divisor). Used for the pre-sieve and the p mod e reduction only —
+/// variable-time, never touches a kept secret in a data-dependent way beyond
+/// the (public-fate) reject/accept decision itself.
+fn bytesMod(bytes: []const u8, divisor: u64) u64 {
+    std.debug.assert(divisor != 0);
+    var r: u64 = 0;
+    for (bytes) |b| {
+        r = @intCast(((@as(u128, r) << 8) | b) % divisor);
+    }
+    return r;
+}
+
+/// In-place big-endian right shift by `s` bits (zero-fill from the left).
+fn shrBytesBe(buf: []u8, s: usize) void {
+    const byte_sh = s / 8;
+    const bit_sh: u4 = @intCast(s % 8);
+    var i: usize = buf.len;
+    while (i > 0) {
+        i -= 1;
+        const lo: u16 = if (i >= byte_sh) buf[i - byte_sh] else 0;
+        const hi: u16 = if (i >= byte_sh + 1) buf[i - byte_sh - 1] else 0;
+        buf[i] = @truncate(((hi << 8) | lo) >> bit_sh);
+    }
+}
+
+/// Set bit `bit` (LSB = 0) of a big-endian byte string.
+fn setBitBe(buf: []u8, bit: usize) void {
+    buf[buf.len - 1 - bit / 8] |= @as(u8, 1) << @intCast(bit % 8);
+}
+
+/// Uniform random Miller-Rabin witness in [2, n-2] by rejection sampling
+/// (mask to n's bit length, retry on out-of-range — expected < 2 draws).
+fn randomWitness(m: Modulus, random: std.Random) Fe {
+    const n_bits = m.bits();
+    const n_len = byteLen(n_bits);
+    const n_minus_1 = m.sub(m.zero, m.one());
+    var buf: [max_modulus_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, buf[0..n_len]);
+    while (true) {
+        random.bytes(buf[0..n_len]);
+        buf[0] &= @as(u8, 0xff) >> @intCast(8 * n_len - n_bits);
+        const a = Fe.fromBytes(m, buf[0..n_len], .big) catch continue; // >= n: redraw
+        if (a.isZero() or a.eql(m.one()) or a.eql(n_minus_1)) continue; // outside [2, n-2]
+        return a;
+    }
+}
+
+/// Miller-Rabin probable-prime test with `mr_rounds` random witnesses from
+/// `random`. `m` must be an odd integer >= 5 (every `Modulus` is odd by
+/// construction; callers here only ever pass >= 2^255). Returns false iff a
+/// witness proves `m` composite.
+fn isProbablePrime(m: Modulus, random: std.Random) bool {
+    const n_len = byteLen(m.bits());
+
+    // n - 1 = d * 2^s with d odd: n is odd, so n-1 is just n with the low
+    // bit cleared, s = ctz(n-1) >= 1, d = (n-1) >> s.
+    var d_buf: [max_modulus_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, d_buf[0..n_len]);
+    m.toBytes(d_buf[0..n_len], .big) catch unreachable; // buffer is exactly byteLen(bits)
+    d_buf[n_len - 1] &= 0xfe;
+    var s: usize = 0;
+    var i: usize = n_len;
+    while (i > 0) {
+        i -= 1;
+        if (d_buf[i] == 0) {
+            s += 8;
+        } else {
+            s += @ctz(d_buf[i]);
+            break;
+        }
+    }
+    shrBytesBe(d_buf[0..n_len], s);
+    const d_bytes = stripLeadingZeros(d_buf[0..n_len]);
+
+    const one = m.one();
+    const n_minus_1 = m.sub(m.zero, one);
+
+    var round: usize = 0;
+    rounds: while (round < mr_rounds) : (round += 1) {
+        const a = randomWitness(m, random);
+        // a^d mod n — constant-time modexp (the exponent d is n-derived).
+        var x = m.powWithEncodedExponent(a, d_bytes, .big) catch unreachable; // d is odd, never 0
+        if (x.eql(one) or x.eql(n_minus_1)) continue :rounds;
+        var j: usize = 1;
+        while (j < s) : (j += 1) {
+            x = m.sq(x);
+            if (x.eql(n_minus_1)) continue :rounds;
+            // A nontrivial square root of 1: composite for sure — stop early.
+            if (x.eql(one)) return false;
+        }
+        return false; // never hit n-1: `a` witnesses compositeness
+    }
+    return true;
+}
+
+/// Draw random odd candidates of exactly `prime_bits` bits with the top two
+/// bits set (so p·q of two such primes always reaches 2·`prime_bits` bits),
+/// pre-sieve by trial division, enforce gcd(e, candidate-1) = 1, and
+/// Miller-Rabin test until a probable prime lands in `out`
+/// (`out.len == byteLen(prime_bits)`).
+fn generatePrime(random: std.Random, prime_bits: usize, e: u64, out: []u8) void {
+    std.debug.assert(out.len == byteLen(prime_bits));
+    std.debug.assert(prime_bits >= 128); // callers: >= 256 (bits >= 512)
+    const top_mask = @as(u8, 0xff) >> @intCast(8 * out.len - prime_bits);
+    candidates: while (true) {
+        random.bytes(out);
+        out[0] &= top_mask;
+        setBitBe(out, prime_bits - 1); // exact bit length…
+        setBitBe(out, prime_bits - 2); // …and p·q >= 2^(2·prime_bits - 1)
+        out[out.len - 1] |= 1; // odd
+
+        // Trial-division pre-sieve. Candidates are >= 2^127, so a zero
+        // remainder always means a proper factor, never candidate == prime.
+        for (sieve_primes) |sp| {
+            if (bytesMod(out, sp) == 0) continue :candidates;
+        }
+
+        // gcd(e, p-1) = 1, via (p-1) mod e: e | p-1 (rem 0) or a shared
+        // factor both make e non-invertible mod λ(n) — reject either way.
+        const p_mod_e = bytesMod(out, e);
+        const p1_mod_e = (p_mod_e + e - 1) % e; // no overflow: e < 2^32
+        if (p1_mod_e == 0 or std.math.gcd(e, p1_mod_e) != 1) continue :candidates;
+
+        // Odd, >= 3, <= max_modulus_len bytes: Modulus.fromBytes can't fail.
+        const m = Modulus.fromBytes(out, .big) catch unreachable;
+        if (isProbablePrime(m, random)) return;
+    }
+}
+
+/// FIPS 186-5 §A.1.3 closeness guard: reject q when the top 100 bits of p
+/// and q coincide (a sufficient condition for |p − q| <= 2^(plen − 100),
+/// which would expose n to Fermat factorization). Also subsumes p == q.
+fn topBitsMatch(p: []const u8, q: []const u8) bool {
+    std.debug.assert(p.len == q.len and p.len >= 13);
+    if (!std.mem.eql(u8, p[0..12], q[0..12])) return false; // 96 bits
+    return (p[12] ^ q[12]) & 0xf0 == 0; // + 4 more = 100 bits
+}
+
+/// A freshly generated RSA keypair (`generate`'s result). The two halves are
+/// returned together because a `SecretKey` alone cannot reproduce its
+/// `PublicKey` — it does not store `e` (see `selfSignedCert`'s doc comment).
+pub const KeyPair = struct {
+    public_key: PublicKey,
+    secret_key: SecretKey,
+};
+
+pub const GenerateError = error{
+    /// `bits` is below 512, above `max_modulus_bits`, or odd.
+    InvalidBits,
+    /// `e` is even, < 3, or >= 2^32 (the same public-exponent cap
+    /// `PublicKey.fromBytes` enforces — a key this module's own parsers
+    /// would reject is never generated).
+    InvalidExponent,
+};
+
+/// Generate a fresh RSA keypair with a modulus of exactly `bits` bits
+/// (probable-prime search per the P5 section comment above + CRT parameter
+/// derivation via `SecretKey.fromPrimes`). `e` is the public exponent —
+/// pass the conventional 65537 unless there is a specific reason not to.
+/// `random` MUST be a cryptographically secure generator for real keys
+/// (the two primes are drawn straight from it); a seeded deterministic
+/// generator is acceptable only for tests. `bits` must be even, between 512
+/// and `max_modulus_bits`; expect roughly quadratic slowdown as `bits`
+/// grows (2048+ is noticeably slow in Debug builds).
+pub fn generate(random: std.Random, bits: usize, e: u64) GenerateError!KeyPair {
+    if (bits < min_modulus_bits or bits > max_modulus_bits or bits % 2 != 0) return error.InvalidBits;
+    if (e < 3 or e & 1 == 0 or e > std.math.maxInt(u32)) return error.InvalidExponent;
+
+    const half = bits / 2;
+    const half_len = byteLen(half);
+
+    var e_bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &e_bytes, e, .big);
+
+    var p_buf: [max_modulus_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, p_buf[0..half_len]);
+    var q_buf: [max_modulus_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, q_buf[0..half_len]);
+    const p_bytes = p_buf[0..half_len];
+    const q_bytes = q_buf[0..half_len];
+
+    while (true) {
+        generatePrime(random, half, e, p_bytes);
+        while (true) {
+            generatePrime(random, half, e, q_bytes);
+            if (!topBitsMatch(p_bytes, q_bytes)) break;
+        }
+
+        // p ≠ q, gcd(e, p-1) = gcd(e, q-1) = 1 and both (probable) primes:
+        // `fromPrimes` (P1) can only fail here if a Miller-Rabin false
+        // positive slipped through (probability <= 2^-128 per prime) and
+        // tripped its qInv self-check — restart the search instead of
+        // surfacing an error for an input the caller never chose.
+        const sk = SecretKey.fromPrimes(p_bytes, q_bytes, &e_bytes) catch continue;
+
+        // Both primes have their top two bits set, so
+        // n >= (3·2^(half-2))^2 = 9·2^(bits-4) > 2^(bits-1): exactly `bits`
+        // bits, and `PublicKey.fromBytes`'s n/e validation (n odd and wide
+        // enough, e odd, 3 <= e < 2^32) is satisfied by construction.
+        var n_buf: [max_modulus_len]u8 = undefined;
+        const n_len = byteLen(sk.n.bits());
+        sk.n.toBytes(n_buf[0..n_len], .big) catch unreachable;
+        const pk = PublicKey.fromBytes(n_buf[0..n_len], &e_bytes) catch unreachable;
+        return .{ .public_key = pk, .secret_key = sk };
+    }
 }
 
 // ── P6: X.509 v3 self-signed certificate generation (RFC 5280) ──────────────
@@ -2645,4 +2901,156 @@ test "selfSignedCert: this module's own P4a parser round-trips the embedded SPKI
     defer testing.allocator.free(tampered_tbs);
     tampered_tbs[tampered_tbs.len - 1] ^= 0x01;
     try testing.expectError(error.SignatureVerificationFailed, verifyPkcs1v15(pk, Sha256, tampered_tbs, sig_bytes));
+}
+
+// ── P5 (key generation) tests ───────────────────────────────────────────────
+//
+// All generation tests use a fixed-seed `std.Random.DefaultPrng` so CI is
+// reproducible (and CHACHA-free/fast); `generate`'s doc comment is explicit
+// that a deterministic generator is a test-only arrangement. Key sizes stay
+// at 512/1024 bits to keep the Debug-mode suite fast — the machinery is
+// size-independent (same code path up to `max_modulus_bits`).
+
+test "generate: rejects invalid bits and exponents" {
+    var prng = std.Random.DefaultPrng.init(0);
+    const random = prng.random();
+
+    // Too small, too large, odd — all before any prime search starts.
+    try testing.expectError(error.InvalidBits, generate(random, 0, 65537));
+    try testing.expectError(error.InvalidBits, generate(random, 256, 65537));
+    try testing.expectError(error.InvalidBits, generate(random, 511, 65537));
+    try testing.expectError(error.InvalidBits, generate(random, 513, 65537));
+    try testing.expectError(error.InvalidBits, generate(random, max_modulus_bits + 2, 65537));
+
+    // e must be odd, >= 3, and < 2^32 (the module-wide public-exponent cap).
+    try testing.expectError(error.InvalidExponent, generate(random, 512, 0));
+    try testing.expectError(error.InvalidExponent, generate(random, 512, 1));
+    try testing.expectError(error.InvalidExponent, generate(random, 512, 2));
+    try testing.expectError(error.InvalidExponent, generate(random, 512, 65536));
+    try testing.expectError(error.InvalidExponent, generate(random, 512, 1 << 33));
+}
+
+/// n == p·q cross-check via `std.math.big.int` (an arithmetic path fully
+/// independent of the `ff` code that produced the key).
+fn expectNisPQ(sk: SecretKey) !void {
+    var scratch: [128 * 1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&scratch);
+    const gpa = fba.allocator();
+
+    var p_bytes: [max_modulus_len]u8 = undefined;
+    const p_len = byteLen(sk.p.bits());
+    try sk.p.toBytes(p_bytes[0..p_len], .big);
+    var q_bytes: [max_modulus_len]u8 = undefined;
+    const q_len = byteLen(sk.q.bits());
+    try sk.q.toBytes(q_bytes[0..q_len], .big);
+
+    var bp = try bigFromBytes(gpa, p_bytes[0..p_len]);
+    var bq = try bigFromBytes(gpa, q_bytes[0..q_len]);
+    var product = try newBig(gpa);
+    try product.mul(&bp, &bq);
+
+    var n_bytes: [max_modulus_len]u8 = undefined;
+    const n_len = byteLen(sk.n.bits());
+    try sk.n.toBytes(n_bytes[0..n_len], .big);
+    const bn = try bigFromBytes(gpa, n_bytes[0..n_len]);
+
+    try testing.expect(product.order(bn) == .eq);
+}
+
+test "generate: 512-bit key structure (n exactly 512 bits, p/q prime, p != q, n = p*q, e)" {
+    var prng = std.Random.DefaultPrng.init(0x7273615f67656e35); // "rsa_gen5"
+    const random = prng.random();
+
+    const kp = try generate(random, 512, 65537);
+    const sk = kp.secret_key;
+    const pk = kp.public_key;
+
+    // Exact bit length, requested exponent, matching halves.
+    try testing.expectEqual(@as(usize, 512), sk.n.bits());
+    try testing.expectEqual(@as(usize, 512), pk.n.bits());
+    try testing.expect(pk.n.v.eql(sk.n.v));
+    try testing.expectEqual(@as(u32, 65537), try pk.e.toPrimitive(u32));
+
+    // p and q: exactly half-size, distinct, and each re-confirmed prime with
+    // 64 fresh Miller-Rabin rounds (independent witnesses — the PRNG has
+    // advanced past the generation draws).
+    try testing.expectEqual(@as(usize, 256), sk.p.bits());
+    try testing.expectEqual(@as(usize, 256), sk.q.bits());
+    try testing.expect(!sk.p.v.eql(sk.q.v));
+    try testing.expect(isProbablePrime(sk.p, random));
+    try testing.expect(isProbablePrime(sk.q, random));
+
+    // n == p·q via an independent bignum path.
+    try expectNisPQ(sk);
+}
+
+test "generate: honors a non-default exponent (e = 3)" {
+    var prng = std.Random.DefaultPrng.init(0x655f6571735f33); // "e_eqs_3"
+    const random = prng.random();
+
+    const kp = try generate(random, 512, 3);
+    try testing.expectEqual(@as(u32, 3), try kp.public_key.e.toPrimitive(u32));
+    try testing.expectEqual(@as(usize, 512), kp.secret_key.n.bits());
+    try testing.expect(isProbablePrime(kp.secret_key.p, random));
+    try testing.expect(isProbablePrime(kp.secret_key.q, random));
+}
+
+test "generate: 1024-bit key round-trips P1 sign/verify, P2 OAEP, and P6 selfSignedCert" {
+    var prng = std.Random.DefaultPrng.init(0x67656e5f65326531); // "gen_e2e1"
+    const random = prng.random();
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+
+    // 1024 bits: the smallest size std.crypto.Certificate's RSA verifier
+    // accepts (its modulus-length switch starts at 128 bytes), so the P6
+    // oracle below exercises the generated key end-to-end.
+    const kp = try generate(random, 1024, 65537);
+    const sk = kp.secret_key;
+    const pk = kp.public_key;
+    try testing.expectEqual(@as(usize, 1024), sk.n.bits());
+    try expectNisPQ(sk);
+
+    // P1: sign/verify round-trip, and the verifier still rejects a wrong
+    // message under this fresh key.
+    const msg = "generated-key end-to-end message";
+    var sig_buf: [max_modulus_len]u8 = undefined;
+    const sig = try signPkcs1v15(sk, Sha256, msg, &sig_buf);
+    try verifyPkcs1v15(pk, Sha256, msg, sig);
+    try testing.expectError(error.SignatureVerificationFailed, verifyPkcs1v15(pk, Sha256, "another message", sig));
+
+    // P2: OAEP encrypt/decrypt round-trip.
+    const secret = "oaep plaintext under a generated key";
+    var ct_buf: [max_modulus_len]u8 = undefined;
+    const ct = try encryptOaep(pk, Sha256, random, secret, "", &ct_buf);
+    var pt_buf: [max_modulus_len]u8 = undefined;
+    const pt = try decryptOaep(sk, Sha256, ct, "", &pt_buf);
+    try testing.expectEqualStrings(secret, pt);
+
+    // P6: a self-signed certificate for the generated key must fully verify
+    // under std.crypto.Certificate (parse + issuer/subject + validity +
+    // RSA signature over the TBS bytes).
+    const cert_der = try selfSignedCert(testing.allocator, sk, pk, Sha256, testCertOptions(false));
+    defer testing.allocator.free(cert_der);
+    const cert: std.crypto.Certificate = .{ .buffer = cert_der, .index = 0 };
+    const parsed = try cert.parse();
+    try parsed.verify(parsed, verify_now);
+}
+
+test "isProbablePrime: known primes pass, known composites fail" {
+    var prng = std.Random.DefaultPrng.init(0x6d725f6b6174); // "mr_kat"
+    const random = prng.random();
+
+    // 2^255 - 19 (Curve25519's prime) and 2^127 - 1 (Mersenne prime M127).
+    const p25519_bytes = comptime hexLit("7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffed");
+    const p25519 = try Modulus.fromBytes(&p25519_bytes, .big);
+    try testing.expect(isProbablePrime(p25519, random));
+    const m127 = try Modulus.fromPrimitive(u128, (1 << 127) - 1);
+    try testing.expect(isProbablePrime(m127, random));
+
+    // Composites, including pseudoprime bait: 1729 = 7·13·19 (a Carmichael
+    // number — Fermat-fools every coprime base, Miller-Rabin must not),
+    // 3215031751 = 151·751·28351 (the smallest strong pseudoprime to bases
+    // 2, 3, 5 and 7 simultaneously), and an odd perfect square.
+    try testing.expect(!isProbablePrime(try Modulus.fromPrimitive(u32, 1729), random));
+    try testing.expect(!isProbablePrime(try Modulus.fromPrimitive(u64, 3215031751), random));
+    try testing.expect(!isProbablePrime(try Modulus.fromPrimitive(u64, 1000003 * 1000003), random));
 }
