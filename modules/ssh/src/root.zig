@@ -1,39 +1,36 @@
 // SPDX-License-Identifier: MIT
 
-//! ssh — SSH-2.0 client. **Part 1 (this scaffold): the RFC 4253 transport
-//! layer only** — version exchange, KEXINIT negotiation, curve25519-sha256
-//! key exchange (RFC 8731), the Binary Packet Protocol, and cipher/MAC
-//! state. Userauth (RFC 4252, part 2) and connection-protocol channels (RFC
-//! 4254, part 3) are reserved top-level stubs below, not implemented in this
-//! pass.
+//! ssh — SSH-2.0 transport layer (RFC 4253), CLIENT and SERVER. Implemented:
+//! version exchange, KEXINIT negotiation, curve25519-sha256 key exchange
+//! (RFC 8731), the Binary Packet Protocol, `chacha20-poly1305@openssh.com` +
+//! `aes256-ctr`/`hmac-sha2-256` ciphers, and host-key verify (client) /
+//! host-key signing (server) for ssh-ed25519, rsa-sha2-256/512 (via the `rsa`
+//! module), and ecdsa-sha2-nistp256. `clientHandshake` (transport.zig) and
+//! `serverHandshake`/`accept` (server.zig) each establish an encrypted,
+//! host-authenticated `Transport`. Validated against live OpenSSH 10.2p1 both
+//! ways (our client ↔ real sshd; real ssh client ↔ our server).
 //!
-//! **SKELETON — NOT IMPLEMENTED.** Every function that touches crypto or
-//! protocol logic is a real, fully-typed `@panic("TODO(agent): ...")` stub —
-//! see `transport.zig` for the reserved API surface and `SPEC.md`/`README.md`
-//! for the phased implementation plan a follow-up crypto-implementation
-//! agent should follow. Only the pure RFC 4251 §5 wire-format helpers in
-//! `messages.zig` (byte string / mpint / name-list) are implemented for
-//! real; they have passing round-trip unit tests.
+//! Userauth (RFC 4252, part 2) and connection-protocol channels (RFC 4254,
+//! part 3) are reserved top-level stubs below — NOT yet implemented. The RFC
+//! 4251 §5 wire helpers are in `messages.zig`; the server reuses the client's
+//! packet codec / `KexInit` / `deriveKeys` / `Transport` rather than
+//! duplicating the protocol logic.
 //!
-//! Provenance: clean-room implementation from RFC 4253 (transport), RFC 4251
-//! (architecture/wire types), RFC 4252 (userauth, not yet implemented), RFC
-//! 4254 (connection protocol, not yet implemented), and RFC 8731
-//! (curve25519-sha256 key exchange); design reference =
-//! ringtailsoftware/misshod (MIT) for architecture SHAPE only — no source
-//! copied. Crypto primitives will come from Zig `std.crypto` (X25519,
-//! Ed25519, ChaCha20-Poly1305, P-256, SHA-2, HMAC) plus this repo's own
-//! `rsa` module for rsa-sha2 host-key verification. See `NOTICE` for the
-//! canonical design-reference entry and `README.md`/`SPEC.md` for the full
-//! statement.
+//! Provenance: clean-room from RFC 4253/4251/8731 (+ RFC 4252/4254 for the
+//! reserved parts); design reference ringtailsoftware/misshod (MIT) for
+//! architecture SHAPE only — no source copied. Crypto via Zig `std.crypto`
+//! (X25519, Ed25519, ChaCha20-Poly1305, P-256, SHA-2, HMAC) plus this repo's
+//! `rsa` module for rsa-sha2. See `NOTICE` / `README.md` / `SPEC.md`.
 
 const std = @import("std");
 
 pub const transport = @import("transport.zig");
 pub const messages = @import("messages.zig");
+pub const server = @import("server.zig");
 
 pub const meta = .{
     .platform = .any,
-    .role = .client,
+    .role = .both,
     // One Transport instance = one caller-owned connection with its own
     // sequence-number/cipher state; nothing shared/global.
     .concurrency = .single_owner,
@@ -76,6 +73,7 @@ pub fn exec() noreturn {
 test {
     _ = transport;
     _ = messages;
+    _ = server;
 }
 
 test "meta.deps names the rsa module (rsa-sha2 host-key verification)" {
