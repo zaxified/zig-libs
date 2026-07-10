@@ -417,18 +417,26 @@ project git history).
                naming/behavior only, no source consulted or copied. Original
                work of the authors, no third-party source copied.
 
-  rsa        — clean-room from RFC 8017 (PKCS #1 v2.2); design ref: Zig std's
-               internal `std.crypto.Certificate.rsa` (MIT, part of the Zig
-               standard library) for the Modulus/Fe/PublicKey shape and the
-               RSAEP/RSAVP1 primitive's structure — shape only, no source
-               copied (std's `rsa` struct is not `pub`, and is verify-only —
-               it has no SecretKey/CRT/signing counterpart to copy from).
-               SKELETON as of this entry: no cryptographic operation is
-               implemented yet (every function body is a TODO stub); this
-               entry is recorded up front so the design reference is on
-               record before implementation lands. Phase P4 (key parsing)
-               will add design references to the OpenSSH PROTOCOL.key
-               private-key format and OpenBSD bcrypt_pbkdf when implemented
-               (to be recorded here at that time).
+  rsa        — clean-room from published specifications; no third-party
+               source copied. Design references:
+               * RFC 8017 (PKCS #1 v2.2) — RSAEP/RSAVP1/RSADP/RSASP1
+                 primitives, EMSA-PKCS1-v1_5, RSAES-OAEP + MGF1, RSASSA-PSS.
+               * RFC 5280 (X.509), RFC 5208 (PKCS #8), RFC 7468 (PEM),
+                 RFC 4251 §5 (SSH string/mpint) — key parsing + certificate.
+               * Zig std's internal `std.crypto.Certificate.rsa` (MIT) for the
+                 Modulus/Fe/PublicKey shape only (that struct is not `pub` and
+                 is verify-only — no SecretKey/CRT/signing to copy from).
+               * OpenSSH `PROTOCOL.key` (openssh-key-v1 private-key container)
+                 — format only.
+               * B. Schneier, "Description of a New Variable-Length Key,
+                 64-Bit Block Cipher (Blowfish)", FSE '93 — Blowfish; the
+                 P-array/S-box pi constants were independently recomputed,
+                 not copied.
+               * OpenBSD `bcrypt_pbkdf` (Ted Unangst) — the KDF algorithm,
+                 implemented from its published description.
+               Test vectors (validation only, not design): OpenSSL-generated
+               KATs, Eric Young's Blowfish ECB vectors (schneier.com), and
+               golang.org/x/crypto bcrypt_pbkdf reference vectors — all cited
+               inline at their tests.
 
 See each module's README "Provenance" note for its specific design references.

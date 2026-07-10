@@ -1,27 +1,30 @@
 // SPDX-License-Identifier: MIT
 //! rsa — pure-Zig RSA (PKCS#1 v2.2 / RFC 8017), built on `std.crypto.ff`.
 //!
-//! **P1+P2+P3+P4a+P5+P6 IMPLEMENTED, P4b still a stub.** The RFC 8017 §5
+//! **ALL PHASES (P1–P6) IMPLEMENTED.** The RFC 8017 §5
 //! primitives (RSAEP/RSADP/RSASP1/RSAVP1, incl. the CRT fast path),
 //! `PublicKey.fromBytes`, `SecretKey.fromPrimes`, the RSASSA-PKCS1-v1_5
 //! scheme (`signPkcs1v15`/`verifyPkcs1v15`, SHA-1/224/256/384/512), the
 //! RSAES-OAEP scheme (`encryptOaep`/`decryptOaep`, MGF1, constant-time
 //! decode), the RSASSA-PSS scheme (`signPss`/`verifyPss`, branch-clean
 //! verify), DER/PEM key parsing (`PublicKey.fromDer`/`fromPem`,
-//! `SecretKey.fromDer`/`fromPkcs8`/`fromPem`, cleartext PEM only), keypair
+//! `SecretKey.fromDer`/`fromPkcs8`/`fromPem`, cleartext PEM only), OpenSSH
+//! `PROTOCOL.key` private-key parsing (`fromOpenSSH`: unencrypted and
+//! bcrypt/aes256-ctr/aes256-cbc encrypted, with a from-scratch Blowfish +
+//! bcrypt-pbkdf in `openssh.zig`), keypair
 //! generation (`generate`: probable primes via sieve + Miller-Rabin,
 //! FIPS 186-5-style constraints), and X.509 v3 self-signed certificate
 //! generation (`selfSignedCert`, RFC 5280) are real and tested against
-//! OpenSSL-generated known-answer vectors and (for `selfSignedCert` and
-//! `generate`) against `std.crypto.Certificate` as an independent
-//! parse/verify oracle. P4b's function body is still
-//! `@panic("TODO(agent): ...")`.
+//! OpenSSL/ssh-keygen-generated known-answer vectors and (for
+//! `selfSignedCert`, `generate`, and the bcrypt-pbkdf) against
+//! `std.crypto.Certificate` / `std.crypto.pwhash.bcrypt.opensshKdf` as
+//! independent oracles.
 //! Phase plan:
 //!   P1  — EMSA-PKCS1-v1_5 sign/verify (`signPkcs1v15`/`verifyPkcs1v15`) — DONE.
 //!   P2  — RSAES-OAEP encrypt/decrypt (`encryptOaep`/`decryptOaep`) — DONE.
 //!   P3  — RSASSA-PSS sign/verify (`signPss`/`verifyPss`) — DONE.
 //!   P4a — DER/PEM key parsing (PKCS#1/PKCS#8/SPKI, cleartext only) — DONE.
-//!   P4b — OpenSSH `PROTOCOL.key` parsing incl. bcrypt-pbkdf (`fromOpenSSH`).
+//!   P4b — OpenSSH `PROTOCOL.key` parsing incl. bcrypt-pbkdf (`fromOpenSSH`) — DONE.
 //!   P5  — keypair generation (`generate`) — DONE.
 //!   P6  — self-signed certificate generation (`selfSignedCert`) — DONE.
 //!
@@ -40,6 +43,10 @@
 //! `NOTICE` for the design-reference entry.
 
 const std = @import("std");
+
+/// Blowfish + OpenBSD bcrypt_pbkdf (P4b support primitives), re-exported
+/// for callers that need the KDF stand-alone.
+pub const openssh = @import("openssh.zig");
 
 pub const meta = .{
     // NOTE: CONVENTIONS.md's `meta` tag vocabulary (platform/role/concurrency/
@@ -213,9 +220,10 @@ pub const SecretKey = struct {
     /// Parse a private key from a PEM text block: `PRIVATE KEY` (PKCS#8
     /// `PrivateKeyInfo`, via `fromPkcs8`) or `RSA PRIVATE KEY` (bare PKCS#1
     /// `RSAPrivateKey`, via `fromDer`). The first matching block in `text` is
-    /// used. `ENCRYPTED PRIVATE KEY` and OpenSSH (`OPENSSH PRIVATE KEY`)
-    /// blocks are out of scope here (P4b) and report
-    /// `error.UnsupportedPemLabel`, never silently misparsed.
+    /// used. `ENCRYPTED PRIVATE KEY` (PKCS#8 `EncryptedPrivateKeyInfo`) is
+    /// out of scope and OpenSSH (`OPENSSH PRIVATE KEY`) blocks belong to
+    /// the module-level `fromOpenSSH`; both report
+    /// `error.UnsupportedPemLabel` here, never silently misparsed.
     pub fn fromPem(text: []const u8) PemError!SecretKey {
         const block = try pemDecodeBody(text);
         if (std.mem.eql(u8, block.label, "PRIVATE KEY")) {
@@ -1031,7 +1039,8 @@ pub const FromPkcs8Error = error{ InvalidDer, InvalidPrivateKey };
 /// wrapping an RFC 8017 Appendix A.1.2 `RSAPrivateKey`. Only the plain
 /// (unencrypted) `PrivateKeyInfo` shape is handled — `EncryptedPrivateKeyInfo`
 /// (`ENCRYPTED PRIVATE KEY` in PEM) is a distinct ASN.1 structure entirely
-/// and out of scope here (P4b, alongside OpenSSH).
+/// and out of scope (passphrase-protected keys are supported in the OpenSSH
+/// format instead, via `fromOpenSSH`).
 pub fn fromPkcs8(bytes: []const u8) FromPkcs8Error!SecretKey {
     return fromPkcs8Impl(bytes) catch |err| switch (err) {
         error.InvalidPrivateKey => error.InvalidPrivateKey,
@@ -1123,13 +1132,236 @@ fn pemDecodeBody(text: []const u8) PemError!PemBlock {
     return block;
 }
 
+// ── P4b: OpenSSH PROTOCOL.key private-key parsing ────────────────────────────
+//
+// Design references (specs only, no source copied): OpenSSH's PROTOCOL.key
+// document (the openssh-key-v1 container layout), RFC 4251 §5 (the SSH
+// `string`/`mpint` wire encodings), and the OpenBSD bcrypt_pbkdf(3)
+// algorithm — the latter implemented from scratch in openssh.zig together
+// with Blowfish (Schneier's spec); see that file's provenance note.
+
+pub const FromOpenSSHError = error{
+    MissingPemBlock,
+    InvalidPem,
+    UnsupportedPemLabel,
+    /// Structural failure: bad magic, truncated field, nkeys != 1,
+    /// trailing garbage, malformed kdf options, or bad padding.
+    InvalidOpenSSH,
+    /// The key parsed but is not `ssh-rsa` (e.g. ssh-ed25519, ecdsa-*).
+    UnsupportedKeyType,
+    /// A ciphername other than none/aes256-ctr/aes256-cbc.
+    UnsupportedCipher,
+    /// A kdfname other than none/bcrypt.
+    UnsupportedKdf,
+    /// The decrypted check-int pair does not match (wrong passphrase; also
+    /// reported for an empty passphrase against an encrypted key).
+    IncorrectPassphrase,
+    InvalidPrivateKey,
+};
+
+/// Minimal reader for the SSH wire primitives (RFC 4251 §5): u32
+/// length-prefixed `string`s (and `mpint`s, which share the outer shape)
+/// over a fixed buffer. Every read is bounds-checked; truncation is a
+/// structural error, never a panic.
+const SshReader = struct {
+    buf: []const u8,
+    pos: usize = 0,
+
+    fn readU32(r: *SshReader) error{InvalidOpenSSH}!u32 {
+        if (r.buf.len - r.pos < 4) return error.InvalidOpenSSH;
+        const v = std.mem.readInt(u32, r.buf[r.pos..][0..4], .big);
+        r.pos += 4;
+        return v;
+    }
+
+    fn readString(r: *SshReader) error{InvalidOpenSSH}![]const u8 {
+        const n = try r.readU32();
+        if (r.buf.len - r.pos < n) return error.InvalidOpenSSH;
+        const s = r.buf[r.pos..][0..n];
+        r.pos += n;
+        return s;
+    }
+
+    /// `mpint` (big-endian two's complement, leading 0x00 when the high
+    /// bit is set) — same length-prefixed wire shape as `string`; the RSA
+    /// consumers below strip the sign octet via `stripLeadingZeros`.
+    fn readMpint(r: *SshReader) error{InvalidOpenSSH}![]const u8 {
+        return r.readString();
+    }
+
+    fn rest(r: *const SshReader) []const u8 {
+        return r.buf[r.pos..];
+    }
+};
+
+/// Ciphers an openssh-key-v1 container may protect the private section
+/// with. OpenSSH's default is aes256-ctr; aes256-cbc is the legacy `-Z`
+/// choice. Both take a 32-byte key + 16-byte IV from bcrypt-pbkdf.
+const OpensshCipher = enum {
+    none,
+    aes256_ctr,
+    aes256_cbc,
+
+    fn fromName(name: []const u8) FromOpenSSHError!OpensshCipher {
+        if (std.mem.eql(u8, name, "none")) return .none;
+        if (std.mem.eql(u8, name, "aes256-ctr")) return .aes256_ctr;
+        if (std.mem.eql(u8, name, "aes256-cbc")) return .aes256_cbc;
+        return error.UnsupportedCipher;
+    }
+
+    fn blockLen(self: OpensshCipher) usize {
+        return switch (self) {
+            .none => 8, // "none" still pads the section to 8-byte blocks
+            .aes256_ctr, .aes256_cbc => 16,
+        };
+    }
+};
+
 /// Parse a private key from the OpenSSH `PROTOCOL.key` private-key text
-/// format (`-----BEGIN OPENSSH PRIVATE KEY-----`), including bcrypt-pbkdf
-/// decryption for passphrase-protected keys.
-pub fn fromOpenSSH(gpa: std.mem.Allocator, text: []const u8) !SecretKey {
-    _ = gpa;
-    _ = text;
-    @panic("TODO(agent): P4b parse OpenSSH PROTOCOL.key format (base64 blob + bcrypt-pbkdf if encrypted; see OpenBSD PROTOCOL.key + bcrypt_pbkdf.c as design refs only)");
+/// format (`-----BEGIN OPENSSH PRIVATE KEY-----`), including bcrypt-pbkdf +
+/// AES decryption for passphrase-protected keys (aes256-ctr and aes256-cbc;
+/// pass `""` for unencrypted keys). Only single-key files (`nkeys == 1`)
+/// holding an `ssh-rsa` key are accepted. As everywhere in this module,
+/// only `p`, `q`, `e` are taken from the file — `n`/`d`/CRT values are
+/// re-derived by `SecretKey.fromPrimes` (the on-disk `n` is then required
+/// to match the derived one as an integrity cross-check).
+pub fn fromOpenSSH(text: []const u8, passphrase: []const u8) FromOpenSSHError!SecretKey {
+    const block = pemDecodeBody(text) catch |err| return switch (err) {
+        error.MissingPemBlock => error.MissingPemBlock,
+        else => error.InvalidPem,
+    };
+    if (!std.mem.eql(u8, block.label, "OPENSSH PRIVATE KEY")) return error.UnsupportedPemLabel;
+    return fromOpensshBinary(block.der(), passphrase);
+}
+
+/// The decoded openssh-key-v1 container: magic, cipher/kdf negotiation,
+/// public-key blob, and the (possibly encrypted) private section.
+fn fromOpensshBinary(bin: []const u8, passphrase: []const u8) FromOpenSSHError!SecretKey {
+    const magic = "openssh-key-v1\x00";
+    if (bin.len < magic.len or !std.mem.eql(u8, bin[0..magic.len], magic)) {
+        return error.InvalidOpenSSH;
+    }
+    var r = SshReader{ .buf = bin, .pos = magic.len };
+    const ciphername = try r.readString();
+    const kdfname = try r.readString();
+    const kdfoptions = try r.readString();
+    const nkeys = try r.readU32();
+    if (nkeys != 1) return error.InvalidOpenSSH;
+    // The public-key blob duplicates key type + n + e; the private section
+    // is authoritative (and covered by the checkint test), so skip it.
+    _ = try r.readString();
+    const private_section = try r.readString();
+    if (r.rest().len != 0) return error.InvalidOpenSSH;
+
+    const cipher = try OpensshCipher.fromName(ciphername);
+    const kdf_none = std.mem.eql(u8, kdfname, "none");
+    const kdf_bcrypt = std.mem.eql(u8, kdfname, "bcrypt");
+    if (!kdf_none and !kdf_bcrypt) return error.UnsupportedKdf;
+
+    if (cipher == .none) {
+        // Unencrypted: kdf must be none with empty options.
+        if (!kdf_none or kdfoptions.len != 0) return error.InvalidOpenSSH;
+        return parsePrivateSection(private_section, cipher, false);
+    }
+
+    // Encrypted: kdf must be bcrypt; kdfoptions = string salt + u32 rounds.
+    if (!kdf_bcrypt) return error.InvalidOpenSSH;
+    var kr = SshReader{ .buf = kdfoptions };
+    const salt = try kr.readString();
+    const rounds = try kr.readU32();
+    if (kr.rest().len != 0 or salt.len == 0 or rounds == 0) return error.InvalidOpenSSH;
+    if (private_section.len == 0 or private_section.len % cipher.blockLen() != 0) {
+        return error.InvalidOpenSSH;
+    }
+
+    // Derive key (32) || IV (16). An empty passphrase is rejected by the
+    // KDF itself — report it like any other wrong passphrase.
+    var key_iv: [48]u8 = undefined;
+    defer std.crypto.secureZero(u8, &key_iv);
+    openssh.bcryptPbkdf(passphrase, salt, rounds, &key_iv) catch return error.IncorrectPassphrase;
+    const aes_key = key_iv[0..32];
+    const iv = key_iv[32..48];
+
+    var dec_buf: [max_pem_der_len]u8 = undefined;
+    const dec = dec_buf[0..private_section.len]; // <= bin.len <= max_pem_der_len
+    defer std.crypto.secureZero(u8, dec);
+    const aes = std.crypto.core.aes;
+    switch (cipher) {
+        .none => unreachable,
+        .aes256_ctr => {
+            const ctx = aes.Aes256.initEnc(aes_key.*);
+            std.crypto.core.modes.ctr(
+                aes.AesEncryptCtx(aes.Aes256),
+                ctx,
+                dec,
+                private_section,
+                iv.*,
+                .big,
+            );
+        },
+        .aes256_cbc => {
+            const ctx = aes.Aes256.initDec(aes_key.*);
+            var prev: [16]u8 = iv.*;
+            var off: usize = 0;
+            while (off < private_section.len) : (off += 16) {
+                const ct_block = private_section[off..][0..16];
+                var pt: [16]u8 = undefined;
+                ctx.decrypt(&pt, ct_block);
+                for (&pt, prev) |*b, x| b.* ^= x;
+                @memcpy(dec[off..][0..16], &pt);
+                prev = ct_block.*;
+            }
+        },
+    }
+    return parsePrivateSection(dec, cipher, true);
+}
+
+/// The (decrypted) private section: checkint pair, key type, the RSA
+/// mpints in OpenSSH order (n, e, d, iqmp, p, q), comment, then 1..n
+/// incrementing padding bytes filling up to the cipher block size.
+fn parsePrivateSection(section: []const u8, cipher: OpensshCipher, encrypted: bool) FromOpenSSHError!SecretKey {
+    var r = SshReader{ .buf = section };
+    const check1 = try r.readU32();
+    const check2 = try r.readU32();
+    if (check1 != check2) {
+        // Matching checkints are how OpenSSH detects a good passphrase; on
+        // an unencrypted key a mismatch can only mean corruption.
+        return if (encrypted) error.IncorrectPassphrase else error.InvalidOpenSSH;
+    }
+    const keytype = try r.readString();
+    if (!std.mem.eql(u8, keytype, "ssh-rsa")) return error.UnsupportedKeyType;
+
+    const n_wire = try r.readMpint();
+    const e_wire = try r.readMpint();
+    _ = try r.readMpint(); // d — re-derived by fromPrimes, never trusted
+    _ = try r.readMpint(); // iqmp — likewise
+    const p_wire = try r.readMpint();
+    const q_wire = try r.readMpint();
+    _ = try r.readString(); // comment — not needed for key material
+
+    // Deterministic padding: bytes 0x01, 0x02, ... up to (but excluding) a
+    // full cipher block. A wrong sequence means a parse misalignment or a
+    // corrupt/forged section.
+    const pad = r.rest();
+    if (pad.len >= cipher.blockLen()) return error.InvalidOpenSSH;
+    for (pad, 0..) |b, i| {
+        if (b != i + 1) return error.InvalidOpenSSH;
+    }
+
+    const sk = SecretKey.fromPrimes(
+        stripLeadingZeros(p_wire),
+        stripLeadingZeros(q_wire),
+        stripLeadingZeros(e_wire),
+    ) catch return error.InvalidPrivateKey;
+
+    // Integrity cross-check: the on-disk modulus must equal p*q.
+    const n_file = stripLeadingZeros(n_wire);
+    const k = byteLen(sk.n.bits());
+    var n_buf: [max_modulus_len]u8 = undefined;
+    sk.n.toBytes(n_buf[0..k], .big) catch return error.InvalidPrivateKey;
+    if (!std.mem.eql(u8, n_file, n_buf[0..k])) return error.InvalidPrivateKey;
+
+    return sk;
 }
 
 // ── P5: key generation (RFC 8017 §3.2, FIPS 186-5 A.1.3-style checks) ───────
@@ -1781,10 +2013,12 @@ pub fn selfSignedCert(
 
 // ── tests ────────────────────────────────────────────────────────────────────
 //
-// Single-file module (no submodules), so the CONVENTIONS.md "dark-tests" rule
-// (aggregate every submodule's tests into root.zig's `test { _ = ...; }`) does
-// not apply here — nothing to aggregate. None of these tests touch the
-// remaining P2–P6 @panic stubs.
+// CONVENTIONS.md "dark-tests" rule: openssh.zig's tests only run if the file
+// is referenced from a `test { _ = ...; }` block here.
+test {
+    _ = openssh;
+}
+
 //
 // Test-vector provenance:
 // * Textbook vector (p=61, q=53, e=17): the classic worked RSA example —
@@ -1809,6 +2043,11 @@ pub fn selfSignedCert(
 //   = message hash, OpenSSL's default). PSS signing is randomized for
 //   sLen > 0, so those are verify-only KATs; the sLen = 0 vector is
 //   deterministic and doubles as a byte-exact sign KAT.
+// * OpenSSH fixtures: one locally generated 2048-bit keypair stored three
+//   ways by ssh-keygen (OpenSSH_10.2p1 Ubuntu-2ubuntu3.2, OpenSSL 3.5.5,
+//   2026-07-10): unencrypted, aes256-ctr + bcrypt, aes256-cbc + bcrypt —
+//   see the fixture comment below for the exact commands. Blowfish and
+//   bcrypt-pbkdf vector provenance lives in openssh.zig.
 
 const testing = std.testing;
 
@@ -3053,4 +3292,243 @@ test "isProbablePrime: known primes pass, known composites fail" {
     try testing.expect(!isProbablePrime(try Modulus.fromPrimitive(u32, 1729), random));
     try testing.expect(!isProbablePrime(try Modulus.fromPrimitive(u64, 3215031751), random));
     try testing.expect(!isProbablePrime(try Modulus.fromPrimitive(u64, 1000003 * 1000003), random));
+}
+
+// ── P4b: OpenSSH fixtures + tests ────────────────────────────────────────────
+
+// One 2048-bit RSA keypair stored three ways by ssh-keygen (OpenSSH_10.2p1
+// Ubuntu-2ubuntu3.2, OpenSSL 3.5.5, 2026-07-10), temp files deleted after
+// embedding:
+//   ssh-keygen -t rsa -b 2048 -N ""        -C "zig-libs-rsa-p4b" -f k1
+//   cp k1 k2 && ssh-keygen -p -N "hunter2" -Z aes256-ctr -a 4 -f k2
+//   cp k1 k3 && ssh-keygen -p -N "hunter2" -Z aes256-cbc -a 4 -f k3
+// Same underlying key, so all three must parse to the same modulus.
+const openssh_fixture_plain =
+    \\-----BEGIN OPENSSH PRIVATE KEY-----
+    \\b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAABFwAAAAdzc2gtcn
+    \\NhAAAAAwEAAQAAAQEAjVsqQO9FbSWVx8o1ILSU2Y5ELsxlrmD+XzDh6zUQnNaYiWz4YPyd
+    \\9q93+Hj8krgxtWMJGDTu0Cqn5klvOAOfRBd83EGM40fwrlahtBmRV2tu2iyslUL6PTUbij
+    \\GNXexUiw0fVDVb3trjpVhISouCyuffxbDjQWe39lH/myxjCDgbnKpfs7acb/a6RV/XRb+8
+    \\fOrks8jVZnp9xqt3rVJ8Wf8eSu9AV/yfKNyvz4YRs7PeyjzYkm4h6fY41dMxcAIGJslR4t
+    \\PX1XfVsKTNyIoE22Dk0kZq38IhU5bVOorzA7RIvAfTRCwzD26WKcnSUw5SW8DJz6pFaSNR
+    \\Ed+EkqqbLQAAA8hUMuQjVDLkIwAAAAdzc2gtcnNhAAABAQCNWypA70VtJZXHyjUgtJTZjk
+    \\QuzGWuYP5fMOHrNRCc1piJbPhg/J32r3f4ePySuDG1YwkYNO7QKqfmSW84A59EF3zcQYzj
+    \\R/CuVqG0GZFXa27aLKyVQvo9NRuKMY1d7FSLDR9UNVve2uOlWEhKi4LK59/FsONBZ7f2Uf
+    \\+bLGMIOBucql+ztpxv9rpFX9dFv7x86uSzyNVmen3Gq3etUnxZ/x5K70BX/J8o3K/PhhGz
+    \\s97KPNiSbiHp9jjV0zFwAgYmyVHi09fVd9WwpM3IigTbYOTSRmrfwiFTltU6ivMDtEi8B9
+    \\NELDMPbpYpydJTDlJbwMnPqkVpI1ER34SSqpstAAAAAwEAAQAAAQAH/yXLSZ3wWEV6aXaK
+    \\9JxNGG7EBP0lmcgaI35MW5KmhL9ZWuhMOE5JY9DSJioHtNLfE4yyqV/vN9KKxRG9JftPE1
+    \\MVdMHfI7U6b50zPpUJ0IKTZh6XTRQx/TyjGz2HmDSKL0Jb9a7OUyy4sF9alDzgdLCkkuaw
+    \\TwlJrobaxO6PSuPB/gQWK3ETvts+Ft8OFkHqOXgHYoBSAMvGlellTzZhV8X3GU0b/66BU7
+    \\+qBFKbwHYJETbog9GT+DzKUfXYh5hAuhNWMaF4lWktZiDqT9k1J9MwGzg5Jm6Wisdyo5JF
+    \\CsawtvWcMZUCxa9M9fH6KQzmxeTy5kd+gxZ1XETI3GLjAAAAgD8zhug8WyogyBAOwh/k9t
+    \\QtC91FJqlF9Nr2Il566huilk9+095QvCXkYJOnbO6yVOq59Ss6ZC4GtjS4edXP0YeZdCZV
+    \\jYU53FolfMexdhl14w9LsPvaSq0fPAoD2zqXnrbvdHv6tvFC6LL37r5HUXgDauni7RREdI
+    \\vw156xOXX5AAAAgQDB+OU0hvB7sj2Bo6SPjmSydUmR1a59yn49dxtCpSnV+Ol8QZeGTKOE
+    \\+Bqa7hh3UcVYOoDUv+NQp2wjvFBLP6kJsclhzkVXNRCTC8TzVhImV1Y98EjseZ/JSGWwJG
+    \\0TzId1EkCKhrVOUJhx0zpRYHGLW4s4XGkWCX5/O7rzbcQEEwAAAIEAuo73rDcPcO3JT32l
+    \\PlQTZoXBsLcxC5X4VKdqXpWQavVkQj1Rf3hJoo/j82hrl4vf1TTiBzl6nnRNVe7SVC9Zue
+    \\fo1iI7C4nvnVGdTXy9BUlhzYVDc88UCMbpVZlgwJ5vX8yae7jtrbkpNACTyf6XLhp/H/KQ
+    \\zl+1DFv6pOIeS78AAAAQemlnLWxpYnMtcnNhLXA0YgECAw==
+    \\-----END OPENSSH PRIVATE KEY-----
+    \\
+;
+const openssh_fixture_ctr =
+    \\-----BEGIN OPENSSH PRIVATE KEY-----
+    \\b3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jdHIAAAAGYmNyeXB0AAAAGAAAABDm8zGt/d
+    \\qoG0Uzfsy5X7kfAAAABAAAAAEAAAEXAAAAB3NzaC1yc2EAAAADAQABAAABAQCNWypA70Vt
+    \\JZXHyjUgtJTZjkQuzGWuYP5fMOHrNRCc1piJbPhg/J32r3f4ePySuDG1YwkYNO7QKqfmSW
+    \\84A59EF3zcQYzjR/CuVqG0GZFXa27aLKyVQvo9NRuKMY1d7FSLDR9UNVve2uOlWEhKi4LK
+    \\59/FsONBZ7f2Uf+bLGMIOBucql+ztpxv9rpFX9dFv7x86uSzyNVmen3Gq3etUnxZ/x5K70
+    \\BX/J8o3K/PhhGzs97KPNiSbiHp9jjV0zFwAgYmyVHi09fVd9WwpM3IigTbYOTSRmrfwiFT
+    \\ltU6ivMDtEi8B9NELDMPbpYpydJTDlJbwMnPqkVpI1ER34SSqpstAAAD0CmpVFbQVaaZsN
+    \\2uZUcAh6MxbUjh+3MWKDIe5nIJ3R4aN5vK0uVNT7aeWZ0PQpw0qNW+KIBrE7SELnRtutLb
+    \\zkgR2rLM5A6oCx61GBq1XwXhwVrQXI4fhxpoU7PGUe8/KKLtKAGu+Z8fzCzJI8NwDr/JO2
+    \\58cUvbDcTLGEWTh9GrHcJ2k2KQOlCB1n/HEajyzGnvxcpeCT/MVbV8/yWIgS/MfTjiuogm
+    \\YcVY2fjcoOMOML7q7jV39kMclGSSc+G+mkqjmHsH85eKIEVzYz6OVj5VURPIUNFsOymWtD
+    \\TmZhueYcHnleh3JIasmtJdvzQ8O0cRbrqPYcGxhTJAFALK31iu9H3yG2wEVsPAiXfPzSc+
+    \\iN5vplq/5By6WX9cQ4jBYf4ieHAwnHLEQCy8qx7036ozBbeJtcxigct/FhKLoXdaupZH7v
+    \\XO9a7dfzr+x1P+SlnU7UWv4VgY3Hg+c4Iy6QNQglc5Lbyxsxxmi6e2k4LsyPWvQMHfH7Vq
+    \\aVh1esr+jMA01KYZZvfsYwS2/brGnbSme+kxuNlqXOCLYznMyv7SV6WkPNdSmHefWVo46V
+    \\MOr11Lha2yUG3L7IuYSylHdiMDseBwnyAxUhFWD0YYDx/Aqqco//ewEtrp1EhF9pvwoK6w
+    \\7qZNjIiLafyT9Bf7Ti1k4ikLA2MkkgVmerxhOgYhEtXHsYfYF+dap0Fc7qpxdM+paPxL+4
+    \\wkpdpPRO+BZhj8+F3Pc4tZJQa9rrcRCH1SX0fmo3brWE6UzPKl54CVKXZTEOR+lyWv9bf/
+    \\MpRBRy7Q1TvV1GyygpPxBWfG3emN4BS9x/sFZy7Mpcj5F03XVGQmr3eqdGrYkX8gftSgvh
+    \\+0vALh1lSeLzyCgQmsqfg8lZ9haO0Vo/w8RFNCPLoDx+UwKe/n6jYdInk3u81dcT1Zas9N
+    \\x4lmavzmTwC6x7sydj4u2t3li0hNImpKnZS13hPec89MOGrXYdMhTGiFGzcmimVQCTNmM0
+    \\VW1pZ3/ESKqG8h6L15clCafuzGMHj2vEtgOdvB/1SlcdlkTwio/3vf/ZNQ3VAAL+DPQtZC
+    \\XDrijDX4FUN4UZYXn6Q+S7vv6fqhpyFG9Ofy9xDxwR3V+wsXg+GJZ/NtWX3B/iCtbwIJXA
+    \\wKUXqQ1EDCMMxbj3ac/C6IMnUfmoG0YuBhaGY97I361V2FfbeoTjg6JhN/dEh/k2KcSZmY
+    \\Q3cVR9e2Q64UdazIThMVyVVAqIh4FC+ft6mi614n+g/lIHWzjxMsgczh0MSr/hE8BJica/
+    \\HT4Bon1zwpE+gPk84nq+V52nWDl+M=
+    \\-----END OPENSSH PRIVATE KEY-----
+    \\
+;
+const openssh_fixture_cbc =
+    \\-----BEGIN OPENSSH PRIVATE KEY-----
+    \\b3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jYmMAAAAGYmNyeXB0AAAAGAAAABCeFkEsJ1
+    \\imSchpU7c7O/5AAAAABAAAAAEAAAEXAAAAB3NzaC1yc2EAAAADAQABAAABAQCNWypA70Vt
+    \\JZXHyjUgtJTZjkQuzGWuYP5fMOHrNRCc1piJbPhg/J32r3f4ePySuDG1YwkYNO7QKqfmSW
+    \\84A59EF3zcQYzjR/CuVqG0GZFXa27aLKyVQvo9NRuKMY1d7FSLDR9UNVve2uOlWEhKi4LK
+    \\59/FsONBZ7f2Uf+bLGMIOBucql+ztpxv9rpFX9dFv7x86uSzyNVmen3Gq3etUnxZ/x5K70
+    \\BX/J8o3K/PhhGzs97KPNiSbiHp9jjV0zFwAgYmyVHi09fVd9WwpM3IigTbYOTSRmrfwiFT
+    \\ltU6ivMDtEi8B9NELDMPbpYpydJTDlJbwMnPqkVpI1ER34SSqpstAAAD0MtoRWM3d6mFTg
+    \\5loJrhltibguJCznq66OF7aYd+WOJxOegituf8hj1udal1z4LkiC8pNj/S7Y5OsmJMuIYo
+    \\vu0SuGq6jU0fahyVA3i+Fm9VA0vLkNWcxspIdyf3JQQTz60okTymYUZPkbhYSQW4PziMP6
+    \\FQ5zDk/bHRzmb1hNBh1HxIFhmQRojxz0XZwh3AXb4TjmGDRKuZdbJxSCVWufa5BJWWycQ8
+    \\fA7dgdhQEwIGrlM8OJg4JMjjcqPZcSPv1Yq64adD6Nmf9Ae/w9myeB18QUU4ClKqbTXVD6
+    \\CIWZ3NwmpVRMdS6xjwJBTcC4IxXwm8cn0XNh9W9VKqRgFH9UzhQSnslkVq1RzOBJvWpRuv
+    \\+JG5HRh5X9gCJr5pHwevmSRGCryZfQljjzUGcb+VNJvd3z0N/fDLWOusVCxvSbPaKyv8tp
+    \\hYhFIAZ9B2hAr5Kqk1dK/IX/YA+933Rdw+INV+9vOzhUfesNnYv+U6LjLk3EYtZusvoQb1
+    \\ebLP4qb2tHIUwBACmFIdMMMAVRQg53YCV1WNoIVqiwaIw3q6HAFQYcZijkFEkJLL8EN0l7
+    \\XjCigjHHQfw/CQyYTDCrW7Wy12pLATodWm3Zx/JRn4i7fBB9pKhQgGecJZtU+5NwZ2EvPB
+    \\n+ERL9ozQdd2WMdvhrJ0Va44xFCmtypX9+lY4n7Bxsz34NGgB9J4SU47/QRje66qoDQvYs
+    \\6lqPhMQHrz/mlBBT8uJZyBOn4AqARrd20fSqxfdTDrUKwaYHtLnSUDUZEmWvM9vzvhmCq2
+    \\v2JvzQTA45KYtNysZFu1w9kq8ATkpkCAwz3stqaU6y7CW2ykBCpnshLMOUK6bVcpa3d4mB
+    \\LKRo2bTr6Y9bZYtGEPKPtZFFY9nzUBvi+sCVORKNQ3JaavBcxPdNTelBcwJqLyWd0x9A/z
+    \\KCsYB47fbh6R4AFcH6p6z2I6fvmukrFzhfL8dv3JnRXCctq/ISPF6R0165Q4P0m9ufX9uh
+    \\H3lZPqpU74nSf/8UhgEoVJ47wxEowuDLLdZ01jReZqr93knazhN8O1f9tvyTDYNl/f/IMJ
+    \\GlWQd0/VZUAjZujeQBDe43Rmxx8xvtkcDfY6tvnJHNIQxBxuDlnJXXXt+YQ8Kf68KDqJ9P
+    \\+CrA5Ck21BWiyHxAqbsiZ9+13HffLTEnIBDq/A4eU+PJqPwPFtrN3/gb9ZHk6zsLQBSh4c
+    \\g36pMfM1CrZaoaWR4l/mNFqCqEZOR8jhH8Rgr34QH3Wn9VDo/m1SzCZ4DliXi6roZ1Tl8S
+    \\lmCiSOw5F5C5NkKKSGwjGiuE+V9g4=
+    \\-----END OPENSSH PRIVATE KEY-----
+    \\
+;
+
+test "fromOpenSSH: unencrypted key parses, signs and verifies (P1 round-trip)" {
+    const sk = try fromOpenSSH(openssh_fixture_plain, "");
+    const pk = PublicKey{ .n = sk.n, .e = try Fe.fromPrimitive(u32, sk.n, 65537) };
+    const msg = "zig-libs rsa: P4b openssh fixture";
+    var sig_buf: [max_modulus_len]u8 = undefined;
+    const sig = try signPkcs1v15(sk, std.crypto.hash.sha2.Sha256, msg, &sig_buf);
+    try verifyPkcs1v15(pk, std.crypto.hash.sha2.Sha256, msg, sig);
+}
+
+test "fromOpenSSH: bcrypt/aes256-ctr and aes256-cbc decrypt to the unencrypted sibling" {
+    const sk_plain = try fromOpenSSH(openssh_fixture_plain, "");
+    const k = byteLen(sk_plain.n.bits());
+    var n_plain: [max_modulus_len]u8 = undefined;
+    try sk_plain.n.toBytes(n_plain[0..k], .big);
+
+    inline for (.{ openssh_fixture_ctr, openssh_fixture_cbc }) |fixture| {
+        const sk = try fromOpenSSH(fixture, "hunter2");
+        try testing.expectEqual(sk_plain.n.bits(), sk.n.bits());
+        var n_enc: [max_modulus_len]u8 = undefined;
+        try sk.n.toBytes(n_enc[0..k], .big);
+        try testing.expectEqualSlices(u8, n_plain[0..k], n_enc[0..k]);
+    }
+}
+
+test "fromOpenSSH: wrong or empty passphrase is IncorrectPassphrase" {
+    try testing.expectError(error.IncorrectPassphrase, fromOpenSSH(openssh_fixture_ctr, "hunter3"));
+    try testing.expectError(error.IncorrectPassphrase, fromOpenSSH(openssh_fixture_ctr, ""));
+    try testing.expectError(error.IncorrectPassphrase, fromOpenSSH(openssh_fixture_cbc, "HUNTER2"));
+}
+
+/// Test helper: assemble a synthetic openssh-key-v1 binary image from SSH
+/// wire pieces, then armor it as an `OPENSSH PRIVATE KEY` PEM block.
+const OpensshTestBuilder = struct {
+    buf: [1024]u8 = undefined,
+    len: usize = 0,
+
+    fn raw(w: *OpensshTestBuilder, bytes: []const u8) *OpensshTestBuilder {
+        @memcpy(w.buf[w.len..][0..bytes.len], bytes);
+        w.len += bytes.len;
+        return w;
+    }
+
+    fn int(w: *OpensshTestBuilder, v: u32) *OpensshTestBuilder {
+        std.mem.writeInt(u32, w.buf[w.len..][0..4], v, .big);
+        w.len += 4;
+        return w;
+    }
+
+    fn str(w: *OpensshTestBuilder, s: []const u8) *OpensshTestBuilder {
+        return w.int(@intCast(s.len)).raw(s);
+    }
+
+    fn pem(w: *const OpensshTestBuilder, out: []u8) []const u8 {
+        const prefix = "-----BEGIN OPENSSH PRIVATE KEY-----\n";
+        const suffix = "\n-----END OPENSSH PRIVATE KEY-----\n";
+        @memcpy(out[0..prefix.len], prefix);
+        const b64 = std.base64.standard.Encoder.encode(out[prefix.len..], w.buf[0..w.len]);
+        @memcpy(out[prefix.len + b64.len ..][0..suffix.len], suffix);
+        return out[0 .. prefix.len + b64.len + suffix.len];
+    }
+};
+
+test "fromOpenSSH: rejects bad magic, truncation, nkeys != 1, trailing garbage" {
+    var pem_buf: [2048]u8 = undefined;
+
+    { // wrong magic
+        var b = OpensshTestBuilder{};
+        _ = b.raw("openssh-key-v2\x00").str("none").str("none").str("").int(1).str("").str("");
+        try testing.expectError(error.InvalidOpenSSH, fromOpenSSH(b.pem(&pem_buf), ""));
+    }
+    { // truncated container: stops after kdfname
+        var b = OpensshTestBuilder{};
+        _ = b.raw("openssh-key-v1\x00").str("none").str("none");
+        try testing.expectError(error.InvalidOpenSSH, fromOpenSSH(b.pem(&pem_buf), ""));
+    }
+    { // truncated string: private section claims more bytes than exist
+        var b = OpensshTestBuilder{};
+        _ = b.raw("openssh-key-v1\x00").str("none").str("none").str("").int(1).str("").int(64);
+        try testing.expectError(error.InvalidOpenSSH, fromOpenSSH(b.pem(&pem_buf), ""));
+    }
+    { // nkeys != 1
+        var b = OpensshTestBuilder{};
+        _ = b.raw("openssh-key-v1\x00").str("none").str("none").str("").int(2).str("").str("");
+        try testing.expectError(error.InvalidOpenSSH, fromOpenSSH(b.pem(&pem_buf), ""));
+    }
+    { // trailing garbage after the private section
+        var b = OpensshTestBuilder{};
+        _ = b.raw("openssh-key-v1\x00").str("none").str("none").str("").int(1).str("").str("").raw("x");
+        try testing.expectError(error.InvalidOpenSSH, fromOpenSSH(b.pem(&pem_buf), ""));
+    }
+}
+
+test "fromOpenSSH: rejects unsupported cipher/kdf and foreign PEM labels" {
+    var pem_buf: [2048]u8 = undefined;
+
+    { // cipher this module does not speak
+        var b = OpensshTestBuilder{};
+        _ = b.raw("openssh-key-v1\x00").str("chacha20-poly1305@openssh.com").str("bcrypt").str("").int(1).str("").str("");
+        try testing.expectError(error.UnsupportedCipher, fromOpenSSH(b.pem(&pem_buf), "pw"));
+    }
+    { // unknown kdf
+        var b = OpensshTestBuilder{};
+        _ = b.raw("openssh-key-v1\x00").str("aes256-ctr").str("argon2id").str("").int(1).str("").str("");
+        try testing.expectError(error.UnsupportedKdf, fromOpenSSH(b.pem(&pem_buf), "pw"));
+    }
+    { // inconsistent: encryption without a kdf
+        var b = OpensshTestBuilder{};
+        _ = b.raw("openssh-key-v1\x00").str("aes256-ctr").str("none").str("").int(1).str("").str("");
+        try testing.expectError(error.InvalidOpenSSH, fromOpenSSH(b.pem(&pem_buf), "pw"));
+    }
+
+    try testing.expectError(error.MissingPemBlock, fromOpenSSH("no pem block here", ""));
+    try testing.expectError(error.UnsupportedPemLabel, fromOpenSSH(
+        "-----BEGIN RSA PRIVATE KEY-----\nAAAA\n-----END RSA PRIVATE KEY-----\n",
+        "",
+    ));
+}
+
+test "fromOpenSSH: rejects checkint mismatch and non-RSA key types" {
+    var pem_buf: [2048]u8 = undefined;
+
+    { // checkint mismatch on an unencrypted key = corruption
+        var priv = OpensshTestBuilder{};
+        _ = priv.int(0xdeadbeef).int(0xdeadbee0);
+        var b = OpensshTestBuilder{};
+        _ = b.raw("openssh-key-v1\x00").str("none").str("none").str("").int(1).str("").str(priv.buf[0..priv.len]);
+        try testing.expectError(error.InvalidOpenSSH, fromOpenSSH(b.pem(&pem_buf), ""));
+    }
+    { // well-formed container holding an ssh-ed25519 key
+        var priv = OpensshTestBuilder{};
+        _ = priv.int(7).int(7).str("ssh-ed25519");
+        var b = OpensshTestBuilder{};
+        _ = b.raw("openssh-key-v1\x00").str("none").str("none").str("").int(1).str("").str(priv.buf[0..priv.len]);
+        try testing.expectError(error.UnsupportedKeyType, fromOpenSSH(b.pem(&pem_buf), ""));
+    }
 }
