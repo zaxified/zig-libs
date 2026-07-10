@@ -1,21 +1,24 @@
 // SPDX-License-Identifier: MIT
 //! rsa — pure-Zig RSA (PKCS#1 v2.2 / RFC 8017), built on `std.crypto.ff`.
 //!
-//! **P1+P2+P3 IMPLEMENTED, P4–P6 still stubs.** The RFC 8017 §5 primitives
-//! (RSAEP/RSADP/RSASP1/RSAVP1, incl. the CRT fast path), `PublicKey.fromBytes`,
-//! `SecretKey.fromPrimes`, the RSASSA-PKCS1-v1_5 scheme
-//! (`signPkcs1v15`/`verifyPkcs1v15`, SHA-1/224/256/384/512), the
+//! **P1+P2+P3+P4a IMPLEMENTED, P4b–P6 still stubs.** The RFC 8017 §5
+//! primitives (RSAEP/RSADP/RSASP1/RSAVP1, incl. the CRT fast path),
+//! `PublicKey.fromBytes`, `SecretKey.fromPrimes`, the RSASSA-PKCS1-v1_5
+//! scheme (`signPkcs1v15`/`verifyPkcs1v15`, SHA-1/224/256/384/512), the
 //! RSAES-OAEP scheme (`encryptOaep`/`decryptOaep`, MGF1, constant-time
-//! decode), and the RSASSA-PSS scheme (`signPss`/`verifyPss`, branch-clean
-//! verify) are real and tested against OpenSSL-generated known-answer
-//! vectors. Every P4+ function body is still `@panic("TODO(agent): ...")`.
+//! decode), the RSASSA-PSS scheme (`signPss`/`verifyPss`, branch-clean
+//! verify), and DER/PEM key parsing (`PublicKey.fromDer`/`fromPem`,
+//! `SecretKey.fromDer`/`fromPkcs8`/`fromPem`, cleartext PEM only) are real
+//! and tested against OpenSSL-generated known-answer vectors. Every P4b+
+//! function body is still `@panic("TODO(agent): ...")`.
 //! Phase plan:
-//!   P1 — EMSA-PKCS1-v1_5 sign/verify (`signPkcs1v15`/`verifyPkcs1v15`) — DONE.
-//!   P2 — RSAES-OAEP encrypt/decrypt (`encryptOaep`/`decryptOaep`) — DONE.
-//!   P3 — RSASSA-PSS sign/verify (`signPss`/`verifyPss`) — DONE.
-//!   P4 — key parsing (`fromPkcs8`/`fromOpenSSH`).
-//!   P5 — keypair generation (`generate`).
-//!   P6 — self-signed certificate generation (`selfSignedCert`).
+//!   P1  — EMSA-PKCS1-v1_5 sign/verify (`signPkcs1v15`/`verifyPkcs1v15`) — DONE.
+//!   P2  — RSAES-OAEP encrypt/decrypt (`encryptOaep`/`decryptOaep`) — DONE.
+//!   P3  — RSASSA-PSS sign/verify (`signPss`/`verifyPss`) — DONE.
+//!   P4a — DER/PEM key parsing (PKCS#1/PKCS#8/SPKI, cleartext only) — DONE.
+//!   P4b — OpenSSH `PROTOCOL.key` parsing incl. bcrypt-pbkdf (`fromOpenSSH`).
+//!   P5  — keypair generation (`generate`).
+//!   P6  — self-signed certificate generation (`selfSignedCert`).
 //!
 //! Modular exponentiation is not reimplemented: this module builds on
 //! `std.crypto.ff` (`Uint`/`Modulus`/`Fe`), the same constant-time finite-field
@@ -123,8 +126,22 @@ pub const PublicKey = struct {
     /// Parse a public key from a DER-encoded `RSAPublicKey` (PKCS#1 Appendix
     /// A.1.1) or an X.509 `SubjectPublicKeyInfo` wrapping one.
     pub fn fromDer(bytes: []const u8) FromDerError!PublicKey {
-        _ = bytes;
-        @panic("TODO(agent): DER/ASN.1 parse RSAPublicKey per RFC 8017 Appendix A.1.1, or SubjectPublicKeyInfo per RFC 5280, then delegate to fromBytes");
+        return publicKeyFromDerImpl(bytes) catch error.InvalidDer;
+    }
+
+    /// Parse a public key from a PEM text block: `PUBLIC KEY` (X.509
+    /// `SubjectPublicKeyInfo`) or `RSA PUBLIC KEY` (bare PKCS#1
+    /// `RSAPublicKey`). The first matching block in `text` is used; other
+    /// labels (including OpenSSH `authorized_keys`-style or unrecognized
+    /// blocks) are rejected with `error.UnsupportedPemLabel`.
+    pub fn fromPem(text: []const u8) PemError!PublicKey {
+        const block = try pemDecodeBody(text);
+        if (!std.mem.eql(u8, block.label, "PUBLIC KEY") and
+            !std.mem.eql(u8, block.label, "RSA PUBLIC KEY"))
+        {
+            return error.UnsupportedPemLabel;
+        }
+        return try PublicKey.fromDer(block.der());
     }
 };
 
@@ -169,6 +186,40 @@ pub const SecretKey = struct {
     /// key-import cost, not a per-operation leak.
     pub fn fromPrimes(p_bytes: []const u8, q_bytes: []const u8, e_bytes: []const u8) FromPrimesError!SecretKey {
         return fromPrimesImpl(p_bytes, q_bytes, e_bytes) catch error.InvalidPrivateKey;
+    }
+
+    pub const FromDerError = error{ InvalidDer, InvalidPrivateKey };
+
+    /// Parse a private key from a DER-encoded bare PKCS#1 `RSAPrivateKey`
+    /// (RFC 8017 Appendix A.1.2) — the format `openssl rsa -traditional`
+    /// writes (as opposed to `fromPkcs8`'s `PrivateKeyInfo` wrapper). Only
+    /// the two-prime form (version 0) is supported; multi-prime keys
+    /// (version 1, `otherPrimeInfos`) are rejected. `p`/`q`/`e` are extracted
+    /// and routed through `fromPrimes`, which re-derives `n`/`d`/the CRT
+    /// parameters itself rather than trusting the on-disk ones (see
+    /// `fromPrimes`'s doc comment).
+    pub fn fromDer(bytes: []const u8) FromDerError!SecretKey {
+        return secretKeyFromPkcs1Impl(bytes) catch |err| switch (err) {
+            error.InvalidPrivateKey => error.InvalidPrivateKey,
+            else => error.InvalidDer,
+        };
+    }
+
+    /// Parse a private key from a PEM text block: `PRIVATE KEY` (PKCS#8
+    /// `PrivateKeyInfo`, via `fromPkcs8`) or `RSA PRIVATE KEY` (bare PKCS#1
+    /// `RSAPrivateKey`, via `fromDer`). The first matching block in `text` is
+    /// used. `ENCRYPTED PRIVATE KEY` and OpenSSH (`OPENSSH PRIVATE KEY`)
+    /// blocks are out of scope here (P4b) and report
+    /// `error.UnsupportedPemLabel`, never silently misparsed.
+    pub fn fromPem(text: []const u8) PemError!SecretKey {
+        const block = try pemDecodeBody(text);
+        if (std.mem.eql(u8, block.label, "PRIVATE KEY")) {
+            return try fromPkcs8(block.der());
+        }
+        if (std.mem.eql(u8, block.label, "RSA PRIVATE KEY")) {
+            return try SecretKey.fromDer(block.der());
+        }
+        return error.UnsupportedPemLabel;
     }
 };
 
@@ -833,13 +884,238 @@ pub fn verifyPss(pk: PublicKey, comptime Hash: type, msg: []const u8, sig: []con
     if (ok != 1) return error.SignatureVerificationFailed;
 }
 
-// ── P4: key parsing — reserved, not yet implemented ─────────────────────────
+// ── P4a: DER/ASN.1 + PEM key parsing ─────────────────────────────────────────
+//
+// Low-level TLV reads go through `std.crypto.codecs.asn1.Element.decode`
+// (added in Zig 0.16) rather than the older `std.crypto.Certificate.der`
+// (also inspected: its `Element.parse` computes slice bounds from the
+// length octets without ever checking them against the input buffer, so a
+// truncated/malformed element can yield a slice that runs past `bytes.len` —
+// fine for std's own use where the caller pre-validates well-formedness, but
+// exactly the kind of thing that becomes a wild slice — undefined behavior
+// once actually indexed in `ReleaseFast` — when handed attacker- or
+// corruption-controlled key files). `codecs.asn1.Element.decode`'s own doc
+// comment guarantees it "does NOT read memory outside bytes" and "does NOT
+// return elements with slices outside bytes" (`error.EndOfStream` instead),
+// which is the property this module needs. `derChild` below adds the one
+// thing that primitive cannot: bounding a child element to its *logical*
+// parent's content range (a SEQUENCE's `[start, end)`), since
+// `Element.decode` only ever validates against the overall buffer.
+//
+// The higher-level `codecs.asn1.der.Decoder`/`der.decode(T, ...)` struct
+// reflection (also new in 0.16) is not used: PKCS#1/PKCS#8 have a small,
+// fixed number of shapes, each with only one wrinkle (RSAPrivateKey's
+// version-gated `otherPrimeInfos`, PrivateKeyInfo's optional `attributes`
+// context tag) that is simpler to reject/ignore by hand than to teach the
+// reflection layer's optional/implicit-tag machinery.
 
-/// Parse a private key from a DER-encoded PKCS#8 `PrivateKeyInfo` wrapping an
-/// RFC 8017 Appendix A.1.2 `RSAPrivateKey`.
-pub fn fromPkcs8(bytes: []const u8) !SecretKey {
-    _ = bytes;
-    @panic("TODO(agent): P4 parse PKCS#8 PrivateKeyInfo (RFC 5958) wrapping RSAPrivateKey per RFC 8017 Appendix A.1.2");
+const Asn1 = std.crypto.codecs.asn1;
+
+/// `rsaEncryption` algorithm OID (RFC 8017 Appendix C / RFC 3279 §2.3.1):
+/// 1.2.840.113549.1.1.1, DER content octets (tag/length excluded).
+const oid_rsa_encryption = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01 };
+
+const DerError = error{InvalidDer};
+
+/// Decode the element at `index`, requiring an exact universal-class
+/// tag/constructed-bit match. Thin wrapper over `Asn1.Element.decode` (see
+/// the section doc comment for why that primitive and not
+/// `std.crypto.Certificate.der`).
+fn derElem(bytes: []const u8, index: u32, number: Asn1.Tag.Number, constructed: bool) DerError!Asn1.Element {
+    const e = Asn1.Element.decode(bytes, index) catch return error.InvalidDer;
+    if (e.tag.number != number or e.tag.constructed != constructed or e.tag.class != .universal) {
+        return error.InvalidDer;
+    }
+    return e;
+}
+
+/// Like `derElem`, but the whole point of this module's DER walking: `index`
+/// must be strictly before `container_end`, and the decoded element must fit
+/// entirely within `[index, container_end)`. `Element.decode` alone cannot
+/// enforce this — it only knows about `bytes` as a whole, not any logical
+/// parent SEQUENCE's content range — so without this check a crafted
+/// sibling-length field could make one element's content "spill" into (or
+/// past) its parent's supposed end while still passing `Element.decode`.
+fn derChild(bytes: []const u8, index: u32, container_end: u32, number: Asn1.Tag.Number, constructed: bool) DerError!Asn1.Element {
+    if (index >= container_end) return error.InvalidDer;
+    const e = try derElem(bytes, index, number, constructed);
+    if (e.slice.end > container_end) return error.InvalidDer;
+    return e;
+}
+
+/// The outermost `SEQUENCE`, required to span the entire input — rejects
+/// trailing garbage after the structure DER is supposed to end at.
+fn derTopSequence(bytes: []const u8) DerError!Asn1.Element {
+    if (bytes.len > std.math.maxInt(u32)) return error.InvalidDer;
+    const top = try derElem(bytes, 0, .sequence, true);
+    if (top.slice.end != bytes.len) return error.InvalidDer;
+    return top;
+}
+
+fn derView(bytes: []const u8, e: Asn1.Element) []const u8 {
+    return e.slice.view(bytes);
+}
+
+/// `RSAPublicKey` (PKCS#1 Appendix A.1.1) or `SubjectPublicKeyInfo`
+/// (RFC 5280) — distinguished by the top SEQUENCE's first child: a bare
+/// INTEGER means PKCS#1, a nested SEQUENCE (AlgorithmIdentifier) means SPKI.
+fn publicKeyFromDerImpl(bytes: []const u8) !PublicKey {
+    const top = try derTopSequence(bytes);
+    if (top.slice.start >= top.slice.end) return error.InvalidDer; // empty SEQUENCE
+    const first = Asn1.Element.decode(bytes, top.slice.start) catch return error.InvalidDer;
+    if (first.slice.end > top.slice.end) return error.InvalidDer;
+
+    if (first.tag.class == .universal and !first.tag.constructed and first.tag.number == .integer) {
+        // RSAPublicKey ::= SEQUENCE { modulus INTEGER, publicExponent INTEGER }
+        const n = first;
+        const e = try derChild(bytes, n.slice.end, top.slice.end, .integer, false);
+        if (e.slice.end != top.slice.end) return error.InvalidDer; // exactly two fields
+        return PublicKey.fromBytes(derView(bytes, n), derView(bytes, e)) catch error.InvalidDer;
+    }
+
+    if (first.tag.class == .universal and first.tag.constructed and first.tag.number == .sequence) {
+        // SubjectPublicKeyInfo ::= SEQUENCE { AlgorithmIdentifier, subjectPublicKey BIT STRING }
+        const alg_id = first;
+        const oid_elem = try derChild(bytes, alg_id.slice.start, alg_id.slice.end, .oid, false);
+        if (!std.mem.eql(u8, derView(bytes, oid_elem), &oid_rsa_encryption)) return error.InvalidDer;
+        // AlgorithmIdentifier.parameters (conventionally a NULL for RSA) is
+        // not inspected further — `alg_id.slice.end` is where it ends either way.
+
+        const bit_str = try derChild(bytes, alg_id.slice.end, top.slice.end, .bitstring, false);
+        if (bit_str.slice.end != top.slice.end) return error.InvalidDer; // exactly two fields
+
+        const raw = derView(bytes, bit_str);
+        // The embedded RSAPublicKey DER must be byte-aligned: zero unused bits.
+        if (raw.len < 1 or raw[0] != 0) return error.InvalidDer;
+        return publicKeyFromDerImpl(raw[1..]);
+    }
+
+    return error.InvalidDer;
+}
+
+/// `RSAPrivateKey` (PKCS#1 Appendix A.1.2), two-prime form only (`version`
+/// 0): extracts `p`, `q`, `e` and routes them through `SecretKey.fromPrimes`
+/// (see that function's doc comment for why `n`/`d`/the CRT fields on the
+/// wire are not trusted). Multi-prime keys (`version` 1, `otherPrimeInfos`)
+/// are rejected rather than silently truncated.
+fn secretKeyFromPkcs1Impl(bytes: []const u8) !SecretKey {
+    const top = try derTopSequence(bytes);
+
+    const version = try derChild(bytes, top.slice.start, top.slice.end, .integer, false);
+    const version_bytes = derView(bytes, version);
+    if (!(version_bytes.len == 1 and version_bytes[0] == 0)) return error.InvalidDer;
+
+    const n = try derChild(bytes, version.slice.end, top.slice.end, .integer, false);
+    const e = try derChild(bytes, n.slice.end, top.slice.end, .integer, false);
+    const d = try derChild(bytes, e.slice.end, top.slice.end, .integer, false);
+    const p = try derChild(bytes, d.slice.end, top.slice.end, .integer, false);
+    const q = try derChild(bytes, p.slice.end, top.slice.end, .integer, false);
+    const dp = try derChild(bytes, q.slice.end, top.slice.end, .integer, false);
+    const dq = try derChild(bytes, dp.slice.end, top.slice.end, .integer, false);
+    const qinv = try derChild(bytes, dq.slice.end, top.slice.end, .integer, false);
+    if (qinv.slice.end != top.slice.end) return error.InvalidDer; // no otherPrimeInfos
+
+    // n/d/dP/dQ/qInv are on-the-wire CRT bookkeeping `fromPrimes` re-derives
+    // and cross-checks itself (see its doc comment) — only p, q, e feed it.
+    return SecretKey.fromPrimes(derView(bytes, p), derView(bytes, q), derView(bytes, e)) catch error.InvalidPrivateKey;
+}
+
+pub const FromPkcs8Error = error{ InvalidDer, InvalidPrivateKey };
+
+/// Parse a private key from a DER-encoded PKCS#8 `PrivateKeyInfo` (RFC 5958)
+/// wrapping an RFC 8017 Appendix A.1.2 `RSAPrivateKey`. Only the plain
+/// (unencrypted) `PrivateKeyInfo` shape is handled — `EncryptedPrivateKeyInfo`
+/// (`ENCRYPTED PRIVATE KEY` in PEM) is a distinct ASN.1 structure entirely
+/// and out of scope here (P4b, alongside OpenSSH).
+pub fn fromPkcs8(bytes: []const u8) FromPkcs8Error!SecretKey {
+    return fromPkcs8Impl(bytes) catch |err| switch (err) {
+        error.InvalidPrivateKey => error.InvalidPrivateKey,
+        else => error.InvalidDer,
+    };
+}
+
+fn fromPkcs8Impl(bytes: []const u8) !SecretKey {
+    const top = try derTopSequence(bytes);
+
+    // PrivateKeyInfo ::= SEQUENCE { version INTEGER, algorithm AlgorithmIdentifier,
+    //                               privateKey OCTET STRING, attributes [0] OPTIONAL }
+    const version = try derChild(bytes, top.slice.start, top.slice.end, .integer, false);
+    const version_bytes = derView(bytes, version);
+    // v1 (RFC 5208): version MUST be 0. v2 (RFC 5958, adds an OPTIONAL
+    // public key [1] field, version 1) is not produced by `openssl pkey`
+    // for plain RSA keys and is not accepted here.
+    if (!(version_bytes.len == 1 and version_bytes[0] == 0)) return error.InvalidDer;
+
+    const alg_id = try derChild(bytes, version.slice.end, top.slice.end, .sequence, true);
+    const oid_elem = try derChild(bytes, alg_id.slice.start, alg_id.slice.end, .oid, false);
+    if (!std.mem.eql(u8, derView(bytes, oid_elem), &oid_rsa_encryption)) return error.InvalidDer;
+
+    const priv_key = try derChild(bytes, alg_id.slice.end, top.slice.end, .octetstring, false);
+    // An OPTIONAL `attributes [0]` field may follow `priv_key`; it is not
+    // needed for RSA and is left unexamined (it can only ever occupy
+    // `(priv_key.slice.end, top.slice.end]`, already bounds-checked above).
+
+    return secretKeyFromPkcs1Impl(derView(bytes, priv_key));
+}
+
+// ── PEM (RFC 7468) ───────────────────────────────────────────────────────────
+
+pub const PemError = error{
+    MissingPemBlock,
+    InvalidPem,
+    UnsupportedPemLabel,
+    InvalidDer,
+    InvalidPrivateKey,
+};
+
+const max_pem_label_len = 32; // longest in use: "ENCRYPTED PRIVATE KEY" (21)
+const max_end_marker_len = "-----END -----".len + max_pem_label_len;
+
+/// Largest DER payload `pemDecodeBody` will produce: a PKCS#8-wrapped,
+/// `max_modulus_bits`-sized two-prime `RSAPrivateKey` is ~2.4 KiB in the
+/// worst case (8 big INTEGERs plus headers); this leaves comfortable
+/// headroom without needing an allocator.
+const max_pem_der_len = 8 * max_modulus_len;
+
+const PemBlock = struct {
+    label: []const u8,
+    der_buf: [max_pem_der_len]u8,
+    der_len: usize,
+
+    fn der(self: *const PemBlock) []const u8 {
+        return self.der_buf[0..self.der_len];
+    }
+};
+
+/// Decode the FIRST `-----BEGIN <label>-----`/`-----END <label>-----` block
+/// in `text` (surrounding/other-labeled text is ignored, matching common
+/// OpenSSL PEM-bundle tolerance) into its label and base64-decoded DER body.
+/// Callers (`PublicKey.fromPem`/`SecretKey.fromPem`) dispatch on the label —
+/// including recognizing but rejecting encrypted/unsupported ones
+/// (`ENCRYPTED PRIVATE KEY`, `OPENSSH PRIVATE KEY`) with a clear error
+/// instead of misparsing their DER/blob as if it were a cleartext key.
+fn pemDecodeBody(text: []const u8) PemError!PemBlock {
+    const begin_marker = "-----BEGIN ";
+    const dashes = "-----";
+
+    const bi = std.mem.indexOf(u8, text, begin_marker) orelse return error.MissingPemBlock;
+    const label_start = bi + begin_marker.len;
+    const label_end = std.mem.indexOfPos(u8, text, label_start, dashes) orelse return error.InvalidPem;
+    const label = text[label_start..label_end];
+    if (label.len > max_pem_label_len) return error.InvalidPem;
+
+    const body_start = label_end + dashes.len;
+    var end_marker_buf: [max_end_marker_len]u8 = undefined;
+    const end_marker = std.fmt.bufPrint(&end_marker_buf, "-----END {s}-----", .{label}) catch unreachable;
+    const ei = std.mem.indexOfPos(u8, text, body_start, end_marker) orelse return error.InvalidPem;
+    const body = text[body_start..ei];
+
+    const dec = std.base64.standard.decoderWithIgnore(" \t\r\n");
+    var block: PemBlock = .{ .label = label, .der_buf = undefined, .der_len = 0 };
+    const n = dec.decode(&block.der_buf, body) catch return error.InvalidPem;
+    if (n == 0) return error.InvalidPem;
+    block.der_len = n;
+    return block;
 }
 
 /// Parse a private key from the OpenSSH `PROTOCOL.key` private-key text
@@ -848,7 +1124,7 @@ pub fn fromPkcs8(bytes: []const u8) !SecretKey {
 pub fn fromOpenSSH(gpa: std.mem.Allocator, text: []const u8) !SecretKey {
     _ = gpa;
     _ = text;
-    @panic("TODO(agent): P4 parse OpenSSH PROTOCOL.key format (base64 blob + bcrypt-pbkdf if encrypted; see OpenBSD PROTOCOL.key + bcrypt_pbkdf.c as design refs only)");
+    @panic("TODO(agent): P4b parse OpenSSH PROTOCOL.key format (base64 blob + bcrypt-pbkdf if encrypted; see OpenBSD PROTOCOL.key + bcrypt_pbkdf.c as design refs only)");
 }
 
 // ── P5: key generation — reserved, not yet implemented ──────────────────────
@@ -1494,4 +1770,270 @@ test "signPss rejects an undersized output buffer" {
     var prng = std.Random.DefaultPrng.init(7);
     var small: [255]u8 = undefined;
     try testing.expectError(error.BufferTooSmall, signPss(sk, std.crypto.hash.sha2.Sha256, prng.random(), "m", 32, &small));
+}
+
+// ── P4a (DER/PEM key parsing) tests ──────────────────────────────────────────
+//
+// Fixture provenance: the SAME 2048-bit key as `kat2048` above (identical
+// p/q/e/d/dP/dQ/qInv) re-serialized to DER/PEM with OpenSSL 3.5.5
+// (2026-07-10):
+//   1. `kat2048`'s components were hand-encoded into a PKCS#1 `RSAPrivateKey`
+//      DER (plain ASN.1 SEQUENCE-of-INTEGER TLV encoding; no ASN.1 library
+//      involved in that one step) and round-tripped through
+//      `openssl rsa -inform der -check -text` to confirm OpenSSL reconstructs
+//      the exact same key (n/d/dP/dQ/qInv all matched `kat2048` byte-for-byte)
+//      — this is the `priv_pkcs1`/`priv_pkcs1` fixture below.
+//   2. `openssl pkcs8 -topk8 -nocrypt -inform der -in <1> -outform der|pem`
+//      -> the PKCS#8 (`priv_pkcs8`) fixtures.
+//   3. `openssl rsa -inform der -in <1> -pubout -outform der|pem`
+//      -> the X.509 SubjectPublicKeyInfo (`pub_spki`) fixtures.
+//   4. `openssl rsa -inform der -in <1> -RSAPublicKey_out -outform der|pem`
+//      -> the PKCS#1 `RSAPublicKey` (`pub_pkcs1`) fixtures.
+// Every fixture below therefore decodes to the exact `kat2048` n/e/p/q/d, and
+// `signPkcs1v15`/`verifyPkcs1v15` KATs from the `kat2048` block above are
+// reused as round-trip oracles.
+
+const kat2048_der = struct {
+    // openssl rsa -in kat2048.der -inform der -traditional -outform der
+    const priv_pkcs1 = hexLit("308204a30201000282010100a2056f805f21fbf8815681fc5f7bb07bb8c7cba3be6e10ef3c3905981d666aa60adde3a7ebd258efae4e0d120e109c42cde35c6c322287135644e25eb79640aa91bc69a63b96fc3a72d85641cf567f4d4775c70c11d3c319989e764bc94c68002eb159d8fb05b73cafe489fb33b99e8f58ada35d59577e657f5097bb0e7a3f53e74b3592dbb31772092b96ab5aac70cef3b2afb54d1a35da41e895222c898f0306f9cd9ecb5b4e3bee111dcd5bfc44b976e7620b0e01b3072d0d3f5e995dcf20aa78d6633ef658bc1468f311ac4e6e005b2cf37d18f82cdc661f7d8cbd93709a4c122dd732bd243632b4a9d51da2f1d3c677a54d0f36c8f8458165d2fefe9203020301000102820100181979e1323002643a37780f3b7ea647738fedbceb42eb96ecdcc875bcb872ad99ae86972acf22211df55dcc028be59fa988a398890934bbf8c2e1ef027216d2a83f1fc734fee62bfad02e086242f49d8b3f11693caf99ca1161a4a9423070c4722d8ecbe50eba6ce1a190afecf233b66668dc2f5d98d38eb2562108ec5987ae02819c97d0a2f60afa32d471766acdb8358b9a61cd8d4d4e1cd98aaa1193217558fb466be20ea48eda646929332e19c887f78ba423d573d44d05e74ce9757c79a59fb0377cace9e65f915b93dcc5b95fdc9cf026ab0ae69b48beed0e0238266b250ed55aa4e4bbf19ac8076a96a16e86b04058e565af55d8fc82726668d3062d02818100cd91a6496cfb79576c073ddea09edc423deebdaa3b103017d00572ebb61b1a05b9e7340239fd8019790b76ec74233842f786d620f80362ca455e6c0b26859db9e5c50d71c551759ffd2ef2facc98c10d6c2e8e0662a5d25a0d847c4fc54a062fc4bb75c552ae1cdef197916cd81c4dd102f314a8a4eb8c73c5c6b3e85c40a11d02818100c9c4dbb594569066caaaadbf5be98990357e0ea3d3619601b2155bac8ed96b28d6eec9578163dd3b08e0132a0f91a99c98a139b3e7b016f7e83dfe6e18d97b4448dccab617a3ac3aa6aa1359c3f5396473f4b0b20038252ae1d77e8cdf1fce2a9f4ea3208269f79d516e7b9a22e2fe4b4dad87621173348f896e2303cae5b59f02818001cceac5eddc6dfda406943624f5ff3bdd4b000243ae2a9daac6c170eb1165b2f323e142bbbb4aa9ee7379412ceb3a0cec1a143a09b20de573a216142aec34ab7225bdae676a053bb77df7c6d68fe7f0f4279c3ad61659b74c3302dbb800a3f93b21e1302f3f332588bc291be8f0a685d41ec8e989383eecaca8c6de9c203cc90281801fe07c1db9ebdb30824068e6dcac8ed13bc248a9d5518b9385011ed4aa54eb3b2e89d7417dedbb1c0290f43626f38a6a752ab3a51aab95556159ba02c6e645354a95a769115f086cd3bbf706ad90e69a5a3f8452faf9e3d55c8ce12f7c68d7f79fe79a9a1e4083a05527315beebb1215ef95c4d7d78dedf5e76e8115ae4e905d0281810099437ab1bf00d96eccd75400da8411fdc353abcf7ff206668e056bd3dff642233cd0b6758daa0f6a651fcc2f6a160e0e5daa37393627627667a3e4391633e46c2a6dec7b1f3cca7647d7294f34a3fe104ac106ee34045c0ad1c97ed23b17fe1f7bce97b1cbd633f86912a17055e96ae4c6c565975b38def64419f645db7b14d2");
+    // openssl pkcs8 -topk8 -nocrypt -in kat2048.der -inform der -outform der
+    const priv_pkcs8 = hexLit("308204bd020100300d06092a864886f70d0101010500048204a7308204a30201000282010100a2056f805f21fbf8815681fc5f7bb07bb8c7cba3be6e10ef3c3905981d666aa60adde3a7ebd258efae4e0d120e109c42cde35c6c322287135644e25eb79640aa91bc69a63b96fc3a72d85641cf567f4d4775c70c11d3c319989e764bc94c68002eb159d8fb05b73cafe489fb33b99e8f58ada35d59577e657f5097bb0e7a3f53e74b3592dbb31772092b96ab5aac70cef3b2afb54d1a35da41e895222c898f0306f9cd9ecb5b4e3bee111dcd5bfc44b976e7620b0e01b3072d0d3f5e995dcf20aa78d6633ef658bc1468f311ac4e6e005b2cf37d18f82cdc661f7d8cbd93709a4c122dd732bd243632b4a9d51da2f1d3c677a54d0f36c8f8458165d2fefe9203020301000102820100181979e1323002643a37780f3b7ea647738fedbceb42eb96ecdcc875bcb872ad99ae86972acf22211df55dcc028be59fa988a398890934bbf8c2e1ef027216d2a83f1fc734fee62bfad02e086242f49d8b3f11693caf99ca1161a4a9423070c4722d8ecbe50eba6ce1a190afecf233b66668dc2f5d98d38eb2562108ec5987ae02819c97d0a2f60afa32d471766acdb8358b9a61cd8d4d4e1cd98aaa1193217558fb466be20ea48eda646929332e19c887f78ba423d573d44d05e74ce9757c79a59fb0377cace9e65f915b93dcc5b95fdc9cf026ab0ae69b48beed0e0238266b250ed55aa4e4bbf19ac8076a96a16e86b04058e565af55d8fc82726668d3062d02818100cd91a6496cfb79576c073ddea09edc423deebdaa3b103017d00572ebb61b1a05b9e7340239fd8019790b76ec74233842f786d620f80362ca455e6c0b26859db9e5c50d71c551759ffd2ef2facc98c10d6c2e8e0662a5d25a0d847c4fc54a062fc4bb75c552ae1cdef197916cd81c4dd102f314a8a4eb8c73c5c6b3e85c40a11d02818100c9c4dbb594569066caaaadbf5be98990357e0ea3d3619601b2155bac8ed96b28d6eec9578163dd3b08e0132a0f91a99c98a139b3e7b016f7e83dfe6e18d97b4448dccab617a3ac3aa6aa1359c3f5396473f4b0b20038252ae1d77e8cdf1fce2a9f4ea3208269f79d516e7b9a22e2fe4b4dad87621173348f896e2303cae5b59f02818001cceac5eddc6dfda406943624f5ff3bdd4b000243ae2a9daac6c170eb1165b2f323e142bbbb4aa9ee7379412ceb3a0cec1a143a09b20de573a216142aec34ab7225bdae676a053bb77df7c6d68fe7f0f4279c3ad61659b74c3302dbb800a3f93b21e1302f3f332588bc291be8f0a685d41ec8e989383eecaca8c6de9c203cc90281801fe07c1db9ebdb30824068e6dcac8ed13bc248a9d5518b9385011ed4aa54eb3b2e89d7417dedbb1c0290f43626f38a6a752ab3a51aab95556159ba02c6e645354a95a769115f086cd3bbf706ad90e69a5a3f8452faf9e3d55c8ce12f7c68d7f79fe79a9a1e4083a05527315beebb1215ef95c4d7d78dedf5e76e8115ae4e905d0281810099437ab1bf00d96eccd75400da8411fdc353abcf7ff206668e056bd3dff642233cd0b6758daa0f6a651fcc2f6a160e0e5daa37393627627667a3e4391633e46c2a6dec7b1f3cca7647d7294f34a3fe104ac106ee34045c0ad1c97ed23b17fe1f7bce97b1cbd633f86912a17055e96ae4c6c565975b38def64419f645db7b14d2");
+    // openssl rsa -in kat2048.der -inform der -pubout -outform der
+    const pub_spki = hexLit("30820122300d06092a864886f70d01010105000382010f003082010a0282010100a2056f805f21fbf8815681fc5f7bb07bb8c7cba3be6e10ef3c3905981d666aa60adde3a7ebd258efae4e0d120e109c42cde35c6c322287135644e25eb79640aa91bc69a63b96fc3a72d85641cf567f4d4775c70c11d3c319989e764bc94c68002eb159d8fb05b73cafe489fb33b99e8f58ada35d59577e657f5097bb0e7a3f53e74b3592dbb31772092b96ab5aac70cef3b2afb54d1a35da41e895222c898f0306f9cd9ecb5b4e3bee111dcd5bfc44b976e7620b0e01b3072d0d3f5e995dcf20aa78d6633ef658bc1468f311ac4e6e005b2cf37d18f82cdc661f7d8cbd93709a4c122dd732bd243632b4a9d51da2f1d3c677a54d0f36c8f8458165d2fefe92030203010001");
+    // openssl rsa -in kat2048.der -inform der -RSAPublicKey_out -outform der
+    const pub_pkcs1 = hexLit("3082010a0282010100a2056f805f21fbf8815681fc5f7bb07bb8c7cba3be6e10ef3c3905981d666aa60adde3a7ebd258efae4e0d120e109c42cde35c6c322287135644e25eb79640aa91bc69a63b96fc3a72d85641cf567f4d4775c70c11d3c319989e764bc94c68002eb159d8fb05b73cafe489fb33b99e8f58ada35d59577e657f5097bb0e7a3f53e74b3592dbb31772092b96ab5aac70cef3b2afb54d1a35da41e895222c898f0306f9cd9ecb5b4e3bee111dcd5bfc44b976e7620b0e01b3072d0d3f5e995dcf20aa78d6633ef658bc1468f311ac4e6e005b2cf37d18f82cdc661f7d8cbd93709a4c122dd732bd243632b4a9d51da2f1d3c677a54d0f36c8f8458165d2fefe92030203010001");
+};
+
+const kat2048_pem = struct {
+    // openssl rsa -in kat2048.der -inform der -traditional -outform pem
+    const priv_pkcs1 =
+        \\-----BEGIN RSA PRIVATE KEY-----
+        \\MIIEowIBAAKCAQEAogVvgF8h+/iBVoH8X3uwe7jHy6O+bhDvPDkFmB1maqYK3eOn
+        \\69JY765ODRIOEJxCzeNcbDIihxNWROJet5ZAqpG8aaY7lvw6cthWQc9Wf01HdccM
+        \\EdPDGZiedkvJTGgALrFZ2PsFtzyv5In7M7mej1ito11ZV35lf1CXuw56P1PnSzWS
+        \\27MXcgkrlqtarHDO87KvtU0aNdpB6JUiLImPAwb5zZ7LW0477hEdzVv8RLl252IL
+        \\DgGzBy0NP16ZXc8gqnjWYz72WLwUaPMRrE5uAFss830Y+CzcZh99jL2TcJpMEi3X
+        \\Mr0kNjK0qdUdovHTxnelTQ82yPhFgWXS/v6SAwIDAQABAoIBABgZeeEyMAJkOjd4
+        \\Dzt+pkdzj+2860LrluzcyHW8uHKtma6GlyrPIiEd9V3MAovln6mIo5iJCTS7+MLh
+        \\7wJyFtKoPx/HNP7mK/rQLghiQvSdiz8RaTyvmcoRYaSpQjBwxHItjsvlDrps4aGQ
+        \\r+zyM7ZmaNwvXZjTjrJWIQjsWYeuAoGcl9Ci9gr6MtRxdmrNuDWLmmHNjU1OHNmK
+        \\qhGTIXVY+0Zr4g6kjtpkaSkzLhnIh/eLpCPVc9RNBedM6XV8eaWfsDd8rOnmX5Fb
+        \\k9zFuV/cnPAmqwrmm0i+7Q4COCZrJQ7VWqTku/GayAdqlqFuhrBAWOVlr1XY/IJy
+        \\ZmjTBi0CgYEAzZGmSWz7eVdsBz3eoJ7cQj3uvao7EDAX0AVy67YbGgW55zQCOf2A
+        \\GXkLdux0IzhC94bWIPgDYspFXmwLJoWdueXFDXHFUXWf/S7y+syYwQ1sLo4GYqXS
+        \\Wg2EfE/FSgYvxLt1xVKuHN7xl5Fs2BxN0QLzFKik64xzxcaz6FxAoR0CgYEAycTb
+        \\tZRWkGbKqq2/W+mJkDV+DqPTYZYBshVbrI7ZayjW7slXgWPdOwjgEyoPkamcmKE5
+        \\s+ewFvfoPf5uGNl7REjcyrYXo6w6pqoTWcP1OWRz9LCyADglKuHXfozfH84qn06j
+        \\IIJp951RbnuaIuL+S02th2IRczSPiW4jA8rltZ8CgYABzOrF7dxt/aQGlDYk9f87
+        \\3UsAAkOuKp2qxsFw6xFlsvMj4UK7u0qp7nN5QSzrOgzsGhQ6CbIN5XOiFhQq7DSr
+        \\ciW9rmdqBTu3fffG1o/n8PQnnDrWFlm3TDMC27gAo/k7IeEwLz8zJYi8KRvo8KaF
+        \\1B7I6Yk4PuysqMbenCA8yQKBgB/gfB2569swgkBo5tysjtE7wkip1VGLk4UBHtSq
+        \\VOs7LonXQX3tuxwCkPQ2JvOKanUqs6Uaq5VVYVm6AsbmRTVKladpEV8IbNO79wat
+        \\kOaaWj+EUvr549VcjOEvfGjX95/nmpoeQIOgVScxW+67EhXvlcTX143t9edugRWu
+        \\TpBdAoGBAJlDerG/ANluzNdUANqEEf3DU6vPf/IGZo4Fa9Pf9kIjPNC2dY2qD2pl
+        \\H8wvahYODl2qNzk2J2J2Z6PkORYz5Gwqbex7HzzKdkfXKU80o/4QSsEG7jQEXArR
+        \\yX7SOxf+H3vOl7HL1jP4aRKhcFXpauTGxWWXWzje9kQZ9kXbexTS
+        \\-----END RSA PRIVATE KEY-----
+        \\
+    ;
+    // openssl pkcs8 -topk8 -nocrypt -in kat2048.der -inform der -outform pem
+    const priv_pkcs8 =
+        \\-----BEGIN PRIVATE KEY-----
+        \\MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCiBW+AXyH7+IFW
+        \\gfxfe7B7uMfLo75uEO88OQWYHWZqpgrd46fr0ljvrk4NEg4QnELN41xsMiKHE1ZE
+        \\4l63lkCqkbxppjuW/Dpy2FZBz1Z/TUd1xwwR08MZmJ52S8lMaAAusVnY+wW3PK/k
+        \\ifszuZ6PWK2jXVlXfmV/UJe7Dno/U+dLNZLbsxdyCSuWq1qscM7zsq+1TRo12kHo
+        \\lSIsiY8DBvnNnstbTjvuER3NW/xEuXbnYgsOAbMHLQ0/XpldzyCqeNZjPvZYvBRo
+        \\8xGsTm4AWyzzfRj4LNxmH32MvZNwmkwSLdcyvSQ2MrSp1R2i8dPGd6VNDzbI+EWB
+        \\ZdL+/pIDAgMBAAECggEAGBl54TIwAmQ6N3gPO36mR3OP7bzrQuuW7NzIdby4cq2Z
+        \\roaXKs8iIR31XcwCi+WfqYijmIkJNLv4wuHvAnIW0qg/H8c0/uYr+tAuCGJC9J2L
+        \\PxFpPK+ZyhFhpKlCMHDEci2Oy+UOumzhoZCv7PIztmZo3C9dmNOOslYhCOxZh64C
+        \\gZyX0KL2Cvoy1HF2as24NYuaYc2NTU4c2YqqEZMhdVj7RmviDqSO2mRpKTMuGciH
+        \\94ukI9Vz1E0F50zpdXx5pZ+wN3ys6eZfkVuT3MW5X9yc8CarCuabSL7tDgI4Jmsl
+        \\DtVapOS78ZrIB2qWoW6GsEBY5WWvVdj8gnJmaNMGLQKBgQDNkaZJbPt5V2wHPd6g
+        \\ntxCPe69qjsQMBfQBXLrthsaBbnnNAI5/YAZeQt27HQjOEL3htYg+ANiykVebAsm
+        \\hZ255cUNccVRdZ/9LvL6zJjBDWwujgZipdJaDYR8T8VKBi/Eu3XFUq4c3vGXkWzY
+        \\HE3RAvMUqKTrjHPFxrPoXEChHQKBgQDJxNu1lFaQZsqqrb9b6YmQNX4Oo9NhlgGy
+        \\FVusjtlrKNbuyVeBY907COATKg+RqZyYoTmz57AW9+g9/m4Y2XtESNzKthejrDqm
+        \\qhNZw/U5ZHP0sLIAOCUq4dd+jN8fziqfTqMggmn3nVFue5oi4v5LTa2HYhFzNI+J
+        \\biMDyuW1nwKBgAHM6sXt3G39pAaUNiT1/zvdSwACQ64qnarGwXDrEWWy8yPhQru7
+        \\Sqnuc3lBLOs6DOwaFDoJsg3lc6IWFCrsNKtyJb2uZ2oFO7d998bWj+fw9CecOtYW
+        \\WbdMMwLbuACj+Tsh4TAvPzMliLwpG+jwpoXUHsjpiTg+7Kyoxt6cIDzJAoGAH+B8
+        \\Hbnr2zCCQGjm3KyO0TvCSKnVUYuThQEe1KpU6zsuiddBfe27HAKQ9DYm84pqdSqz
+        \\pRqrlVVhWboCxuZFNUqVp2kRXwhs07v3Bq2Q5ppaP4RS+vnj1VyM4S98aNf3n+ea
+        \\mh5Ag6BVJzFb7rsSFe+VxNfXje31526BFa5OkF0CgYEAmUN6sb8A2W7M11QA2oQR
+        \\/cNTq89/8gZmjgVr09/2QiM80LZ1jaoPamUfzC9qFg4OXao3OTYnYnZno+Q5FjPk
+        \\bCpt7HsfPMp2R9cpTzSj/hBKwQbuNARcCtHJftI7F/4fe86XscvWM/hpEqFwVelq
+        \\5MbFZZdbON72RBn2Rdt7FNI=
+        \\-----END PRIVATE KEY-----
+        \\
+    ;
+    // openssl rsa -in kat2048.der -inform der -pubout -outform pem
+    const pub_spki =
+        \\-----BEGIN PUBLIC KEY-----
+        \\MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAogVvgF8h+/iBVoH8X3uw
+        \\e7jHy6O+bhDvPDkFmB1maqYK3eOn69JY765ODRIOEJxCzeNcbDIihxNWROJet5ZA
+        \\qpG8aaY7lvw6cthWQc9Wf01HdccMEdPDGZiedkvJTGgALrFZ2PsFtzyv5In7M7me
+        \\j1ito11ZV35lf1CXuw56P1PnSzWS27MXcgkrlqtarHDO87KvtU0aNdpB6JUiLImP
+        \\Awb5zZ7LW0477hEdzVv8RLl252ILDgGzBy0NP16ZXc8gqnjWYz72WLwUaPMRrE5u
+        \\AFss830Y+CzcZh99jL2TcJpMEi3XMr0kNjK0qdUdovHTxnelTQ82yPhFgWXS/v6S
+        \\AwIDAQAB
+        \\-----END PUBLIC KEY-----
+        \\
+    ;
+    // openssl rsa -in kat2048.der -inform der -RSAPublicKey_out -outform pem
+    const pub_pkcs1 =
+        \\-----BEGIN RSA PUBLIC KEY-----
+        \\MIIBCgKCAQEAogVvgF8h+/iBVoH8X3uwe7jHy6O+bhDvPDkFmB1maqYK3eOn69JY
+        \\765ODRIOEJxCzeNcbDIihxNWROJet5ZAqpG8aaY7lvw6cthWQc9Wf01HdccMEdPD
+        \\GZiedkvJTGgALrFZ2PsFtzyv5In7M7mej1ito11ZV35lf1CXuw56P1PnSzWS27MX
+        \\cgkrlqtarHDO87KvtU0aNdpB6JUiLImPAwb5zZ7LW0477hEdzVv8RLl252ILDgGz
+        \\By0NP16ZXc8gqnjWYz72WLwUaPMRrE5uAFss830Y+CzcZh99jL2TcJpMEi3XMr0k
+        \\NjK0qdUdovHTxnelTQ82yPhFgWXS/v6SAwIDAQAB
+        \\-----END RSA PUBLIC KEY-----
+        \\
+    ;
+};
+
+fn expectMatchesKat2048PublicKey(pk: PublicKey) !void {
+    var n_buf: [256]u8 = undefined;
+    try pk.n.toBytes(&n_buf, .big);
+    try testing.expectEqualSlices(u8, &kat2048.n, &n_buf);
+    try testing.expectEqual(65537, try pk.e.toPrimitive(u32));
+}
+
+fn expectMatchesKat2048SecretKey(sk: SecretKey) !void {
+    var n_buf: [256]u8 = undefined;
+    try sk.n.toBytes(&n_buf, .big);
+    try testing.expectEqualSlices(u8, &kat2048.n, &n_buf);
+    var d_buf: [256]u8 = undefined;
+    try sk.d.toBytes(&d_buf, .big);
+    try testing.expectEqualSlices(u8, &kat2048.d, &d_buf);
+}
+
+test "PublicKey.fromDer parses SPKI and PKCS#1 DER, matches kat2048" {
+    const from_spki = try PublicKey.fromDer(&kat2048_der.pub_spki);
+    try expectMatchesKat2048PublicKey(from_spki);
+    try verifyPkcs1v15(from_spki, std.crypto.hash.sha2.Sha256, kat2048.msg, &kat2048.sig_sha256);
+
+    const from_pkcs1 = try PublicKey.fromDer(&kat2048_der.pub_pkcs1);
+    try expectMatchesKat2048PublicKey(from_pkcs1);
+    try verifyPkcs1v15(from_pkcs1, std.crypto.hash.sha2.Sha256, kat2048.msg, &kat2048.sig_sha256);
+}
+
+test "PublicKey.fromPem parses PUBLIC KEY and RSA PUBLIC KEY PEM, matches kat2048" {
+    const from_spki = try PublicKey.fromPem(kat2048_pem.pub_spki);
+    try expectMatchesKat2048PublicKey(from_spki);
+
+    const from_pkcs1 = try PublicKey.fromPem(kat2048_pem.pub_pkcs1);
+    try expectMatchesKat2048PublicKey(from_pkcs1);
+    try verifyPkcs1v15(from_pkcs1, std.crypto.hash.sha2.Sha256, kat2048.msg, &kat2048.sig_sha256);
+}
+
+test "SecretKey.fromDer parses bare PKCS#1 RSAPrivateKey DER, matches kat2048 and signs" {
+    const sk = try SecretKey.fromDer(&kat2048_der.priv_pkcs1);
+    try expectMatchesKat2048SecretKey(sk);
+
+    var out: [max_modulus_len]u8 = undefined;
+    const sig = try signPkcs1v15(sk, std.crypto.hash.sha2.Sha256, kat2048.msg, &out);
+    try testing.expectEqualSlices(u8, &kat2048.sig_sha256, sig); // deterministic -> byte-exact
+}
+
+test "fromPkcs8 parses PKCS#8 PrivateKeyInfo DER, matches kat2048 and signs" {
+    const sk = try fromPkcs8(&kat2048_der.priv_pkcs8);
+    try expectMatchesKat2048SecretKey(sk);
+
+    var out: [max_modulus_len]u8 = undefined;
+    const sig = try signPkcs1v15(sk, std.crypto.hash.sha2.Sha256, kat2048.msg, &out);
+    try testing.expectEqualSlices(u8, &kat2048.sig_sha256, sig);
+}
+
+test "SecretKey.fromPem parses RSA PRIVATE KEY and PRIVATE KEY PEM, matches kat2048" {
+    const from_pkcs1 = try SecretKey.fromPem(kat2048_pem.priv_pkcs1);
+    try expectMatchesKat2048SecretKey(from_pkcs1);
+
+    const from_pkcs8 = try SecretKey.fromPem(kat2048_pem.priv_pkcs8);
+    try expectMatchesKat2048SecretKey(from_pkcs8);
+
+    var out: [max_modulus_len]u8 = undefined;
+    const sig = try signPkcs1v15(from_pkcs1, std.crypto.hash.sha2.Sha256, kat2048.msg, &out);
+    try verifyPkcs1v15(try PublicKey.fromPem(kat2048_pem.pub_spki), std.crypto.hash.sha2.Sha256, kat2048.msg, sig);
+}
+
+test "PublicKey.fromDer/SecretKey.fromDer/fromPkcs8 reject truncated DER" {
+    inline for (.{ &kat2048_der.pub_spki, &kat2048_der.pub_pkcs1 }) |der_bytes| {
+        var l: usize = 0;
+        while (l < der_bytes.len) : (l += 7) {
+            try testing.expectError(error.InvalidDer, PublicKey.fromDer(der_bytes[0..l]));
+        }
+    }
+    {
+        var l: usize = 0;
+        while (l < kat2048_der.priv_pkcs1.len) : (l += 11) {
+            try testing.expectError(error.InvalidDer, SecretKey.fromDer(kat2048_der.priv_pkcs1[0..l]));
+        }
+    }
+    {
+        var l: usize = 0;
+        while (l < kat2048_der.priv_pkcs8.len) : (l += 11) {
+            try testing.expectError(error.InvalidDer, fromPkcs8(kat2048_der.priv_pkcs8[0..l]));
+        }
+    }
+}
+
+test "PublicKey.fromDer rejects a wrong leading tag (never panics)" {
+    var corrupt = kat2048_der.pub_spki;
+    corrupt[0] ^= 0xff; // SEQUENCE tag (0x30) mangled
+    try testing.expectError(error.InvalidDer, PublicKey.fromDer(&corrupt));
+
+    var corrupt1 = kat2048_der.pub_pkcs1;
+    corrupt1[0] ^= 0xff;
+    try testing.expectError(error.InvalidDer, PublicKey.fromDer(&corrupt1));
+}
+
+test "PublicKey.fromDer/fromPkcs8 reject a wrong AlgorithmIdentifier OID" {
+    var corrupt = kat2048_der.pub_spki;
+    const idx = std.mem.indexOf(u8, &corrupt, &oid_rsa_encryption).?;
+    corrupt[idx] ^= 0xff;
+    try testing.expectError(error.InvalidDer, PublicKey.fromDer(&corrupt));
+
+    var corrupt8 = kat2048_der.priv_pkcs8;
+    const idx8 = std.mem.indexOf(u8, &corrupt8, &oid_rsa_encryption).?;
+    corrupt8[idx8] ^= 0xff;
+    try testing.expectError(error.InvalidDer, fromPkcs8(&corrupt8));
+}
+
+test "SecretKey.fromDer rejects a corrupted version field" {
+    var corrupt = kat2048_der.priv_pkcs1;
+    // version INTEGER is `02 01 00` right after the outer SEQUENCE header;
+    // its content byte (must be 0x00) sits at offset 6.
+    try testing.expectEqual(@as(u8, 0x00), corrupt[6]);
+    corrupt[6] = 0x01; // multi-prime (version 1): rejected, not supported
+    try testing.expectError(error.InvalidDer, SecretKey.fromDer(&corrupt));
+}
+
+test "PublicKey.fromPem/SecretKey.fromPem: missing block, corrupted base64, encrypted/OpenSSH labels" {
+    try testing.expectError(error.MissingPemBlock, PublicKey.fromPem("no pem here"));
+    try testing.expectError(error.MissingPemBlock, SecretKey.fromPem("no pem here"));
+
+    try testing.expectError(error.InvalidPem, PublicKey.fromPem(
+        "-----BEGIN PUBLIC KEY-----\n!!!!not base64!!!!\n-----END PUBLIC KEY-----\n",
+    ));
+    try testing.expectError(error.InvalidPem, PublicKey.fromPem(
+        "-----BEGIN PUBLIC KEY-----\nAAAA", // no END marker
+    ));
+
+    // Encrypted PKCS#8 and OpenSSH private keys are recognized by label and
+    // rejected with a specific error (P4b territory) rather than being
+    // misparsed as cleartext DER or panicking on the OpenSSH blob shape.
+    try testing.expectError(error.UnsupportedPemLabel, SecretKey.fromPem(
+        "-----BEGIN ENCRYPTED PRIVATE KEY-----\nAAAA\n-----END ENCRYPTED PRIVATE KEY-----\n",
+    ));
+    try testing.expectError(error.UnsupportedPemLabel, SecretKey.fromPem(
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----\n",
+    ));
+    // Right key material, wrong accessor (a public PEM handed to fromPem for
+    // secret keys, and vice versa) is also a label mismatch, not a crash.
+    try testing.expectError(error.UnsupportedPemLabel, SecretKey.fromPem(kat2048_pem.pub_spki));
+    try testing.expectError(error.UnsupportedPemLabel, PublicKey.fromPem(kat2048_pem.priv_pkcs1));
 }
