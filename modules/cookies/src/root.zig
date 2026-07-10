@@ -220,10 +220,14 @@ pub fn get(req: *const http.Server.Request, name: []const u8) ?[]const u8 {
 }
 
 /// Serialize `sc` and set it as the response's `Set-Cookie` header. `buf` holds
-/// the header value and **must outlive the response** — the response writer
-/// stores the header slice without copying, so pass a buffer that lives until
-/// the response is flushed (e.g. on the handler's frame). Rejects an invalid
-/// cookie (`WriteError`) before touching the response.
+/// the header value and **must outlive the response flush** — the response
+/// writer stores the header slice without copying, and for a buffered response
+/// the head (this value included) is not serialized until the serving loop
+/// calls `end()`, **after the handler returns**. A buffer on the handler's own
+/// frame is therefore NOT safe (it is popped before the head is written); use
+/// storage that outlives the handler dispatch — request-lifetime memory reached
+/// via `StreamOptions.context`, or a caller buffer owned by the serving loop.
+/// Rejects an invalid cookie (`WriteError`) before touching the response.
 ///
 /// NOTE: the server emits at most **one** `Set-Cookie` per response —
 /// `setHeader` replaces by name — so a second `set` overwrites the first.
@@ -399,7 +403,11 @@ test "SetCookie: bufPrint into too-small buffer" {
 fn cookieHandler(req: *http.Server.Request, res: *http.Server.ResponseWriter) anyerror!void {
     // Echo the requested "session" cookie back in the body, and set one.
     const sid = get(req, "session") orelse "none";
-    var cbuf: [128]u8 = undefined; // must outlive the response → handler frame
+    // The Set-Cookie value is borrowed by the response until the serving loop
+    // flushes the head — which happens AFTER this handler returns — so the
+    // buffer must outlive the handler frame. Take it from `context` (here, the
+    // caller's frame), not a local array which would be popped first.
+    const cbuf: *[128]u8 = @ptrCast(@alignCast(req.context.?));
     try set(res, .{
         .name = "session",
         .value = "s3",
@@ -407,7 +415,7 @@ fn cookieHandler(req: *http.Server.Request, res: *http.Server.ResponseWriter) an
         .http_only = true,
         .secure = true,
         .same_site = .lax,
-    }, &cbuf);
+    }, cbuf);
     try res.writeAll(sid);
 }
 
@@ -422,7 +430,9 @@ test "get + set over serveStream" {
     var req_body: [256]u8 = undefined;
     var res_body: [512]u8 = undefined;
     var chunk: [128]u8 = undefined;
-    http.Server.serveStream(.{ .handler = cookieHandler, .server_name = null }, &in, &out, .{
+    // Cookie buffer lives on the test frame → outlives the response flush.
+    var cookie_buf: [128]u8 = undefined;
+    http.Server.serveStream(.{ .handler = cookieHandler, .server_name = null, .context = &cookie_buf }, &in, &out, .{
         .head = &head_buf,
         .request_body = &req_body,
         .response_body = &res_body,
