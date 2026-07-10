@@ -254,6 +254,10 @@ const Stats = struct {
     io_errors: usize = 0,
     short_reads: usize = 0,
     garbage_tails: usize = 0,
+    /// Crashes that persisted a non-contiguous subset of an un-synced
+    /// multi-write window (a real hole) — the teeth witness for the
+    /// `.reorder_unsynced` mode (out-of-order durability).
+    reorder_holes: usize = 0,
     /// Recoveries where the unacknowledged in-flight op survived (candidate
     /// B adopted) — proves the atomic-tail branch is actually exercised.
     inflight_survived: usize = 0,
@@ -576,8 +580,12 @@ fn runSeed(gpa: Allocator, seed: u64, cfg: Config, stats: *Stats) !void {
         faults.short_reads = prng.chance(1, 2);
         const plan = prng.below(10);
         if (plan < 6) { // crash the machine at a random side effect
-            const modes = [_]CrashMode{ .lose_unsynced, .keep_unsynced, .torn_tail };
+            const modes = [_]CrashMode{ .lose_unsynced, .keep_unsynced, .torn_tail, .reorder_unsynced };
             sim.crash_mode = modes[prng.below(modes.len)];
+            // Seed the non-contiguous keep/drop choice (consumed only by
+            // `.reorder_unsynced`; drawn unconditionally to keep the stream
+            // aligned across modes).
+            sim.reorder_seed = prng.next();
             sim.ops_until_crash = if (prng.chance(1, 3)) prng.below(8) else prng.below(120);
         } else if (plan < 8) { // transient I/O error (with torn prefix write)
             faults.error_countdown = if (prng.chance(1, 3)) prng.below(8) else prng.below(100);
@@ -587,6 +595,8 @@ fn runSeed(gpa: Allocator, seed: u64, cfg: Config, stats: *Stats) !void {
         const inflight = try v.runEpoch();
         try v.recoverAndVerify(inflight);
     }
+
+    stats.reorder_holes += sim.holes_punched;
 
     // Per-seed fingerprint of the surviving media (determinism witness).
     const content = sim.fileContent(db_name) orelse "";
@@ -610,6 +620,9 @@ test "VOPR: randomized fault schedules across seeds, model-checked recovery" {
     try testing.expect(stats.garbage_tails >= seed_count / 10);
     try testing.expect(stats.inflight_survived >= seed_count / 200);
     try testing.expect(stats.acked_ops >= seed_count * 10);
+    // The non-contiguous durability mode must have actually punched holes in
+    // an un-synced multi-write window (else out-of-order durability is untested).
+    try testing.expect(stats.reorder_holes >= seed_count / 200);
 }
 
 test "VOPR: identical seed reproduces the identical run" {

@@ -32,9 +32,9 @@ Reliability, not adversarial security:
 ## Verification
 
 Unit tests + the randomized deterministic **VOPR** (`vopr.zig`): PRNG-driven fuzz of recovery across
-torn/partial writes, short reads, garbage tails, and crash points ×3 modes over chained epochs;
-min-fault-count asserts + the sabotage self-test (≥10/12 runs catch a data-losing recovery). 32
-tests. Run: `zig build test-kv`.
+torn/partial writes, short reads, garbage tails, and crash points ×4 modes (incl. non-contiguous /
+out-of-order durability, see below) over chained epochs; min-fault-count asserts + the sabotage
+self-test (≥10/12 runs catch a data-losing recovery). 36 tests. Run: `zig build test-kv`.
 
 ## Backlog / deferred
 
@@ -47,11 +47,24 @@ tests. Run: `zig build test-kv`.
 - **VOPR fault-sweep DONE 2026-07-10** (see /docs/pre-public-review.md): green at 10× the shipped
   run count (20k runs, 0 failures); crash-anywhere + torn/partial + byte-arbitrary-tear faults are
   covered, CRC-gated fail-stop replay is sound (torn/corrupt tail truncated, never replayed as valid).
-  **One backlog gap:** out-of-order / non-contiguous durability within an un-synced multi-write window
-  is not expressible in `SimStorage` today (it always truncates to a contiguous prefix), yet `compact()`'s
-  temp-file write-loop-then-single-`sync` (root.zig:632-649) is exactly that pattern. Not a correctness
-  defect (CRC still gates a hole), but recovery's over-truncation behavior under reordering is unverified.
-  Extension: add a non-contiguous unsynced-region drop mode to `SimStorage` targeting the compact loop.
+- **Out-of-order / non-contiguous durability — COVERED 2026-07-10.** The former gap (`SimStorage`
+  could only collapse an un-synced window to a *contiguous prefix*) is closed: a new
+  `CrashMode.reorder_unsynced` tracks every `writeAll` since the last durability barrier as a
+  byte-range and, on crash, keeps a seed-driven **subset** of them — dropping an earlier range while
+  keeping a later one leaves a zero-filled *hole* between persisted regions (splitmix64,
+  deterministic, no clock/OS-rng). It is exercised generally in the VOPR (a 4th crash mode) and
+  targeted at `compact()`'s write-loop-then-single-`sync` temp-file window (root.zig ~632–648) by a
+  dedicated exhaustive sweep in `fault_test.zig` (every crash point × several seeds; a teeth assert
+  requires real holes to be punched). **Outcome: no defect — recovery is correct under
+  non-contiguous persistence.** Two structural reasons, now proven by the harness: (1) the CRC32
+  fail-stop replay truncates at the first hole, so a persisted-but-orphaned later record is *never*
+  resurrected, and committed records *before* a hole are never over-truncated (a hole can only sit
+  in the append-only tail, above every fsync'd record — direct replay-level test in `root.zig`);
+  (2) the only multi-write-before-`sync` window in the engine is `compact()`'s *temp* file, and the
+  temp is either discarded on reopen (crash before the rename) or adopted only *after* a full
+  `sync` (crash at/after the rename has no un-synced window), so recovery never depends on intra-file
+  write ordering. No product-code change was required — the temp-then-atomic-rename discipline was
+  already sound; the deliverable is the harness coverage that proves it.
 
 ## Status
 

@@ -896,6 +896,46 @@ test "corrupted byte mid-file truncates replay at the bad record" {
     try testing.expectEqual(second_rec_off, sim.fileContent("db").?.len);
 }
 
+test "non-contiguous persistence: a hole mid-log truncates there; a later durable record is not resurrected" {
+    // Models out-of-order durability: within an fsync-free window a LATER
+    // record persisted while an EARLIER one was lost, leaving a zero hole
+    // between two otherwise-valid records. Recovery must (a) keep every
+    // committed record BEFORE the hole (no over-truncation of durable data)
+    // and (b) NOT resurrect the orphaned record BEYOND the hole.
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var hole_off: usize = 0;
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+        defer db.close();
+        try db.put("first", "aaaa"); // committed (fsync'd) before the hole
+        try db.put("second", "bbbb"); // committed before the hole
+        hole_off = sim.fileContent("db").?.len;
+    }
+    // Punch a zero hole the size of one record where "third" would have gone,
+    // then append a fully-valid "third" record AFTER the hole (it reached
+    // media out of order). Both are marked durable.
+    const orphan_len = rec_fixed + "third".len + "cccc".len;
+    const hole = try testing.allocator.alloc(u8, orphan_len);
+    defer testing.allocator.free(hole);
+    @memset(hole, 0);
+    try sim.appendDurable("db", hole);
+    var orphan: [rec_fixed + 5 + 4]u8 = undefined;
+    encodeRecord(&orphan, op_put, "third", "cccc");
+    try sim.appendDurable("db", &orphan);
+
+    var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+    defer db.close();
+    // Committed records before the hole survive intact — no over-truncation.
+    try expectGet(&db, "first", "aaaa");
+    try expectGet(&db, "second", "bbbb");
+    // The orphan beyond the hole is NOT replayed as valid.
+    try expectGet(&db, "third", null);
+    try testing.expectEqual(@as(usize, 2), db.count());
+    // The file is truncated exactly at the hole (everything after discarded).
+    try testing.expectEqual(hole_off, sim.fileContent("db").?.len);
+}
+
 test "torn trailing record is truncated on open, committed data survives" {
     var sim = SimStorage.init(testing.allocator);
     defer sim.deinit();

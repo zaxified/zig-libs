@@ -26,6 +26,17 @@
 //!       - `.torn_tail`   — half of each file's un-synced tail survives, and
 //!         the write the crash landed on is itself torn in half (a partial
 //!         sector flush → a torn trailing record).
+//!       - `.reorder_unsynced` — models **non-contiguous durability**: within
+//!         a fsync-free multi-write window, real write-caching storage can
+//!         persist a LATER write while losing an EARLIER one (no ordering
+//!         barrier between them). Every `writeAll` since the last durability
+//!         barrier is tracked as a byte-range; on crash a seed-driven SUBSET
+//!         of those ranges survives, so dropping an earlier range while
+//!         keeping a later one leaves a zero-filled *hole* between persisted
+//!         regions. This is the only mode that can produce a non-prefix
+//!         surviving state; it targets `compact()`'s write-loop-then-single-
+//!         `sync` temp-file window (root.zig). Deterministic: the subset is a
+//!         function of `reorder_seed` (splitmix64), never a clock/OS-rng.
 //!     After the crash every further call fails with `error.Crashed` (the
 //!     process is dead) until `reboot()` — so a `defer close()` in the code
 //!     under test cannot accidentally mutate post-crash state.
@@ -52,6 +63,11 @@ pub const CrashMode = enum {
     keep_unsynced,
     /// Half of each un-synced tail survives; the in-flight write is torn.
     torn_tail,
+    /// A seed-driven SUBSET of the un-synced write-ranges survives — a later
+    /// write may persist while an earlier one is lost, leaving a zero-filled
+    /// hole between persisted regions (non-contiguous / out-of-order
+    /// durability). Driven by `reorder_seed`.
+    reorder_unsynced,
 };
 
 pub const SimStorage = struct {
@@ -73,11 +89,35 @@ pub const SimStorage = struct {
     crashed: bool = false,
     /// Total side effects observed (counting run → sweep bound).
     ops_seen: usize = 0,
+    /// `.reorder_unsynced` only: seeds the deterministic keep/drop choice
+    /// over each file's un-synced write-ranges (splitmix64, no OS-rng).
+    reorder_seed: u64 = 0,
+    /// `.reorder_unsynced` only: count of crashes that produced a genuine
+    /// non-contiguous hole (an earlier un-synced range dropped while a later
+    /// one survived). The teeth witness for the new mode — a sweep that never
+    /// punches a hole has not exercised out-of-order durability.
+    holes_punched: usize = 0,
+
+    /// A byte-range written to a file since its last durability barrier.
+    const Range = struct { off: usize, len: usize };
 
     const SimFile = struct {
         content: std.ArrayListUnmanaged(u8) = .empty,
         durable_len: usize = 0,
+        /// Byte-ranges written (in issue order) since the last `sync` /
+        /// `truncate` / `create_truncate` on this file. Consumed by
+        /// `.reorder_unsynced` to drop a subset; cleared by every barrier.
+        unsynced_writes: std.ArrayListUnmanaged(Range) = .empty,
     };
+
+    /// splitmix64 step (public-domain, S. Vigna) — the harness's only PRNG.
+    fn splitmix(state: *u64) u64 {
+        state.* +%= 0x9e3779b97f4a7c15;
+        var z = state.*;
+        z = (z ^ (z >> 30)) *% 0xbf58476d1ce4e5b9;
+        z = (z ^ (z >> 27)) *% 0x94d049bb133111eb;
+        return z ^ (z >> 31);
+    }
 
     pub fn init(gpa: Allocator) SimStorage {
         return .{ .gpa = gpa };
@@ -88,6 +128,7 @@ pub const SimStorage = struct {
         freeNames(self.gpa, &self.durable_names);
         for (self.all_files.items) |f| {
             f.content.deinit(self.gpa);
+            f.unsynced_writes.deinit(self.gpa);
             self.gpa.destroy(f);
         }
         self.all_files.deinit(self.gpa);
@@ -128,6 +169,7 @@ pub const SimStorage = struct {
         const f = self.names.get(path).?;
         try f.content.appendSlice(self.gpa, bytes);
         f.durable_len = f.content.items.len;
+        f.unsynced_writes.clearRetainingCapacity(); // all content is now durable
     }
 
     /// Test helper: create `path` with `bytes` as durable content and a
@@ -167,15 +209,58 @@ pub const SimStorage = struct {
                     f.content.shrinkRetainingCapacity(keep);
                     f.durable_len = keep;
                 },
+                .reorder_unsynced => self.crashReorder(f),
             }
+            // The surviving content is now what is on media; the un-synced
+            // window is consumed. (Post-crash the machine is dead until
+            // `reboot`, after which a fresh `open` reads only `content`.)
+            f.durable_len = f.content.items.len;
+            f.unsynced_writes.clearRetainingCapacity();
         }
         switch (self.crash_mode) {
             // The dying OS flushed the directory too.
             .keep_unsynced => copyNames(self.gpa, &self.durable_names, &self.names),
             // Volatile namespace changes since the last syncDir are gone.
-            .lose_unsynced, .torn_tail => copyNames(self.gpa, &self.names, &self.durable_names),
+            .lose_unsynced, .torn_tail, .reorder_unsynced => copyNames(self.gpa, &self.names, &self.durable_names),
         }
         self.crashed = true;
+    }
+
+    /// `.reorder_unsynced` collapse for one file: keep the fsync'd durable
+    /// prefix plus a seed-chosen SUBSET of the un-synced write-ranges. A
+    /// dropped range that sits below a kept later range becomes a zero-filled
+    /// hole — the non-contiguous / out-of-order durability the other modes
+    /// (which only ever keep a contiguous prefix) cannot express.
+    fn crashReorder(self: *SimStorage, f: *SimFile) void {
+        const ranges = f.unsynced_writes.items;
+        if (ranges.len == 0) {
+            // No un-synced window (or a single-write window that got dropped):
+            // nothing beyond the durable prefix survives — same as `.lose`.
+            f.content.shrinkRetainingCapacity(f.durable_len);
+            return;
+        }
+        // Pass 1: the surviving length = durable prefix ∪ (ends of kept ranges).
+        // Two passes over the same seed reproduce the identical keep/drop
+        // decisions without allocating a bitmap.
+        var s1 = self.reorder_seed;
+        var new_len: usize = f.durable_len;
+        for (ranges) |r| {
+            if (splitmix(&s1) & 1 == 0) new_len = @max(new_len, r.off + r.len);
+        }
+        // Pass 2: zero every dropped range that lies below `new_len` — the
+        // holes — and detect whether a genuine hole was produced.
+        var s2 = self.reorder_seed;
+        var punched = false;
+        for (ranges) |r| {
+            const keep = splitmix(&s2) & 1 == 0;
+            if (!keep and r.off < new_len) {
+                const end = @min(r.off + r.len, new_len);
+                @memset(f.content.items[r.off..end], 0);
+                punched = true;
+            }
+        }
+        f.content.shrinkRetainingCapacity(new_len);
+        if (punched) self.holes_punched += 1;
     }
 
     fn newFile(self: *SimStorage) !*SimFile {
@@ -243,6 +328,7 @@ pub const SimStorage = struct {
                     // Model O_TRUNC as immediately effective (see module doc).
                     existing.content.clearRetainingCapacity();
                     existing.durable_len = 0;
+                    existing.unsynced_writes.clearRetainingCapacity();
                 }
                 break :blk existing;
             }
@@ -299,6 +385,10 @@ pub const SimStorage = struct {
                     .lose_unsynced => 0,
                     .keep_unsynced => bytes.len,
                     .torn_tail => (bytes.len + 1) / 2,
+                    // The in-flight write fully reached the page cache; whether
+                    // it survives is then decided by the reorder subset (it is
+                    // just the last range in the un-synced window).
+                    .reorder_unsynced => bytes.len,
                 };
                 self.writeBytes(f, bytes[0..applied], off) catch return error.OutOfMemory;
                 self.doCrash();
@@ -310,6 +400,7 @@ pub const SimStorage = struct {
     }
 
     fn writeBytes(self: *SimStorage, f: *SimFile, bytes: []const u8, off: u64) !void {
+        if (bytes.len == 0) return;
         const end: usize = @intCast(off + bytes.len);
         if (end > f.content.items.len) {
             const old = f.content.items.len;
@@ -317,6 +408,9 @@ pub const SimStorage = struct {
             @memset(f.content.items[old..end], 0);
         }
         @memcpy(f.content.items[@intCast(off)..end], bytes);
+        // Track the write as un-synced (for `.reorder_unsynced`). The store is
+        // append-only over the durable prefix, so these ranges never overlap.
+        try f.unsynced_writes.append(self.gpa, .{ .off = @intCast(off), .len = bytes.len });
     }
 
     fn vSync(ctx: *anyopaque, h: Storage.Handle) Storage.Error!void {
@@ -325,6 +419,7 @@ pub const SimStorage = struct {
         if (self.inject()) return error.Crashed; // crash BEFORE durability advances
         const f = self.fileOf(h);
         f.durable_len = f.content.items.len;
+        f.unsynced_writes.clearRetainingCapacity(); // barrier: all writes durable
     }
 
     fn vTruncate(ctx: *anyopaque, h: Storage.Handle, len: u64) Storage.Error!void {
@@ -335,6 +430,20 @@ pub const SimStorage = struct {
         std.debug.assert(len <= f.content.items.len);
         f.content.shrinkRetainingCapacity(@intCast(len));
         f.durable_len = @min(f.durable_len, f.content.items.len);
+        dropUnsyncedAbove(f, @intCast(len)); // ranges past the cut are gone
+    }
+
+    /// Drop/clamp un-synced ranges lying at or beyond `len` (order-preserving).
+    fn dropUnsyncedAbove(f: *SimFile, len: usize) void {
+        var w: usize = 0;
+        for (f.unsynced_writes.items) |r| {
+            if (r.off >= len) continue; // fully truncated away
+            var rr = r;
+            if (rr.off + rr.len > len) rr.len = len - rr.off; // clamp straddler
+            f.unsynced_writes.items[w] = rr;
+            w += 1;
+        }
+        f.unsynced_writes.shrinkRetainingCapacity(w);
     }
 
     fn vClose(ctx: *anyopaque, h: Storage.Handle) void {
@@ -431,6 +540,88 @@ test "sim: torn_tail crash tears the in-flight write in half" {
     // Half of the in-flight write reached the cache (4+4=8), then the
     // global crash tears the un-synced tail in half again → 4 + 2 = 6.
     try testing.expectEqual(@as(u64, 6), try st.size(h2));
+}
+
+test "sim: reorder_unsynced can drop an earlier write while keeping a later one (a hole)" {
+    // Find a seed whose keep/drop choice keeps the LAST of three un-synced
+    // writes but drops an earlier one — the defining non-contiguous case.
+    var seed: u64 = 0;
+    const hole_seed: u64 = while (seed < 64) : (seed += 1) {
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        sim.crash_mode = .reorder_unsynced;
+        sim.reorder_seed = seed;
+        const st = sim.storage();
+        const h = try st.open("f", .open_or_create);
+        try st.writeAll(h, "AAAA", 0); // durable base
+        try st.sync(h);
+        try st.syncDir();
+        // Three un-synced writes, no sync between them (a compact-like window).
+        try st.writeAll(h, "1111", 4);
+        try st.writeAll(h, "2222", 8);
+        try st.writeAll(h, "3333", 12);
+        sim.ops_until_crash = 0;
+        try testing.expectError(error.Crashed, st.sync(h));
+        if (sim.holes_punched == 1) break seed; // a genuine hole was punched
+    } else {
+        return error.NoHoleSeedFound;
+    };
+
+    // Re-run that seed and assert the exact surviving shape: the durable base
+    // survives, at least one middle range is a zero hole, and the file extends
+    // past the hole to a kept later range (length > 8).
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.crash_mode = .reorder_unsynced;
+    sim.reorder_seed = hole_seed;
+    const st = sim.storage();
+    const h = try st.open("f", .open_or_create);
+    try st.writeAll(h, "AAAA", 0);
+    try st.sync(h);
+    try st.syncDir();
+    try st.writeAll(h, "1111", 4);
+    try st.writeAll(h, "2222", 8);
+    try st.writeAll(h, "3333", 12);
+    sim.ops_until_crash = 0;
+    try testing.expectError(error.Crashed, st.sync(h));
+    sim.reboot();
+
+    const h2 = try st.open("f", .open_or_create);
+    const size = try st.size(h2);
+    try testing.expect(size > 8); // extends past a dropped middle → a hole
+    var buf: [16]u8 = undefined;
+    _ = try st.pread(h2, buf[0..@intCast(size)], 0);
+    try testing.expectEqualStrings("AAAA", buf[0..4]); // durable prefix intact
+    // At least one 4-byte window in [4, size) is all-zero (the hole).
+    var found_hole = false;
+    var off: usize = 4;
+    while (off + 4 <= size) : (off += 4) {
+        if (std.mem.allEqual(u8, buf[off .. off + 4], 0)) found_hole = true;
+    }
+    try testing.expect(found_hole);
+}
+
+test "sim: reorder_unsynced is deterministic for a fixed seed" {
+    var sizes: [2]u64 = undefined;
+    for (&sizes) |*sz| {
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        sim.crash_mode = .reorder_unsynced;
+        sim.reorder_seed = 0xabcd_1234;
+        const st = sim.storage();
+        const h = try st.open("f", .open_or_create);
+        try st.writeAll(h, "base", 0);
+        try st.sync(h);
+        try st.writeAll(h, "aaaa", 4);
+        try st.writeAll(h, "bbbb", 8);
+        try st.writeAll(h, "cccc", 12);
+        sim.ops_until_crash = 0;
+        try testing.expectError(error.Crashed, st.sync(h));
+        sim.reboot();
+        const h2 = try st.open("f", .open_or_create);
+        sz.* = try st.size(h2);
+    }
+    try testing.expectEqual(sizes[0], sizes[1]);
 }
 
 test "sim: rename + delete are volatile until syncDir" {

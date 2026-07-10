@@ -202,6 +202,49 @@ test "fault-injection sweep: crash at EVERY storage side effect, all modes" {
     }
 }
 
+test "fault-injection sweep: non-contiguous (reordered) unsynced persistence" {
+    // The scripted workload runs two `compact()`s, each a write-loop-then-
+    // single-`sync` window over several live records — exactly the fsync-free
+    // multi-write window where out-of-order durability bites. Crash at every
+    // side effect under `.reorder_unsynced` for several seeds (each a
+    // different keep/drop subset of the un-synced ranges) and assert recovery
+    // is still correct: a persisted-but-orphaned record beyond a hole is
+    // never served, and no committed record before it is lost.
+    var total: usize = 0;
+    {
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        _ = runScript(&sim);
+        total = sim.ops_seen;
+    }
+
+    var holes: usize = 0;
+    for ([_]u64{ 1, 2, 3, 5, 8, 13, 21, 34 }) |seed| {
+        var point: usize = 0;
+        while (point < total) : (point += 1) {
+            var sim = SimStorage.init(testing.allocator);
+            defer sim.deinit();
+            sim.crash_mode = .reorder_unsynced;
+            sim.reorder_seed = seed;
+            sim.ops_until_crash = point;
+            const out = runScript(&sim);
+            try testing.expect(out.crashed);
+            const punched = sim.holes_punched;
+            verifyRecovery(&sim, out) catch |e| {
+                std.debug.print(
+                    "reorder sweep FAILED: seed={d} crash_point={d}/{d} completed_steps={d}\n",
+                    .{ seed, point, total, out.completed },
+                );
+                return e;
+            };
+            holes += punched;
+        }
+    }
+    // Teeth: the reorder collapse must have punched genuine non-contiguous
+    // holes in the compact windows (else this mode tested nothing new).
+    try testing.expect(holes > 0);
+}
+
 test "fault sweep is deterministic across repeats" {
     // Same crash point, same mode, twice → byte-identical surviving file.
     for ([_]usize{ 3, 17, 29 }) |point| {
