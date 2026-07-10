@@ -55,6 +55,7 @@ const module_list = [_]Module{
     .{ .name = "latency-stats" },
     .{ .name = "hashdigest" },
     .{ .name = "sealedbox" },
+    .{ .name = "rsa" },
     .{ .name = "nftables" },
     .{ .name = "modbus" },
     .{ .name = "whois" },

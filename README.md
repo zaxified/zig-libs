@@ -11,7 +11,7 @@ cross-project-reusable capability — a production-grade implementation of a pro
 or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
 authors' other projects depend on it, not the reverse.
 
-**Status:** 77 modules · 1844 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 78 modules · 1845 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ## Using a module
@@ -132,6 +132,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 |---|---|---|---|
 | `hashdigest` | Streaming digests — one-shot / incremental / file (EOF-read, size-0 `/proc` safe); SHA-256 convenience + a multi-algorithm layer (SHA-2/SHA-3/BLAKE2b/BLAKE3) | any | — |
 | `sealedbox` | NaCl `crypto_box_seal` — anonymous-sender X25519 public-key encryption (thin over `std.crypto`) + base64/hex key serialization | any | — |
+| `rsa` | Pure-Zig RSA (PKCS#1 v2.2, RFC 8017) over `std.crypto.ff` — public/CRT-private keys, EMSA-PKCS1-v1_5 sign/verify; OAEP/PSS/key-parsing/keygen/self-signed-cert reserved. **Skeleton — not yet implemented** | any | — |
 
 ### Serialization / OS / agent
 
