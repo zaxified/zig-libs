@@ -1,14 +1,15 @@
 # Pre-public security / similarity review
 
-**Status: substantially complete (2026-07-10).** All review phases done — provenance/
-license audit + loose-ends, dark-tests check, the 10-target adversarial security pass
-(findings fixed), the jwt safe-by-default decision, and the kv VOPR fault-sweep. What
-remains is DOCUMENTED backlog, not release blockers: the mqtt broker is a declared
-not-production-ready first cut, the sessions cross-request resurrection race needs store
-CAS, coap's unauth-UDP dedup/observe limits are inherent, and the kv out-of-order-durability
-harness gap is logged. **Before tagging a release:** honor the fping Stanford attribution
-obligation (NOTICE §1 — this collection is MIT for its own code but not obligation-free).
-Delete this file once the documented backlog items are triaged into normal issues.
+**Status: COMPLETE (2026-07-10).** All review phases done and all findings actioned —
+provenance/license audit + loose-ends, dark-tests check, the 10-target adversarial security
+pass (findings fixed), the jwt safe-by-default decision, the kv VOPR fault-sweep, AND the four
+previously-deferred production-readiness items (mqtt broker hardening, sessions cross-request
+CAS, coap admission-hook/DTLS-seam, kv out-of-order-durability) are now RESOLVED (see the
+per-item ✅ entries below). Suite: 1833/1843, Debug + ReleaseFast green. Remaining before a
+release tag: (1) honor the **fping Stanford attribution obligation** (NOTICE §1 — MIT for own
+code but not obligation-free); (2) a multi-threaded stress/race pass on the mqtt broker (its
+in-module tests are socket-free/single-threaded + a deterministic lock-probe). This file can be
+deleted once those two are handled — the review itself is done.
 
 ## Progress (2026-07-09)
 
@@ -78,14 +79,27 @@ Highlights:
   refused (`JwkSkipReason.oct_from_network`); locally-configured HMAC keys still work. See
   modules/jwt/{src/root.zig,README.md,SPEC.md}; new `SECURITY: mandatory audience …` test + reworked
   P5 tests (asymmetric keys over the fetcher). `test-jwt` green Debug + ReleaseFast.
-- **mqtt broker (ARCHITECTURAL, documented in mqtt/SPEC.md):** O(connections×subscriptions)
-  fan-out under the single global spinlock that accept() also takes; QoS0→QoS1 re-encode can
-  overflow a subscriber buffer and disconnect the PUBLISHER; session-takeover zombie
-  (keep_alive=0); no auth/ACL. Broker is a functional first-cut, not production-ready.
-- **sessions cross-request race (documented):** two concurrent requests sharing a cookie can
-  resurrect a logged-out session; needs store-level generation/CAS.
-- **coap (documented):** dedup-flood replay + observe-registry eviction are inherent to
-  unauthenticated UDP (need DTLS + caller auth/rate-limit hook).
+- **✅ RESOLVED 2026-07-10 — mqtt broker production-hardening (`254ad6d`):** (A) O(C×S) fan-out
+  replaced with a topic-filter TRIE index + the global lock released before socket writes
+  (snapshot-under-lock, per-conn tx_lock, atomic refs for mid-fan-out safety; a LockProbe test
+  proves the lock is dropped before writes); (B) per-subscriber delivery failure contained to that
+  subscriber (publisher survives); (C) takeover shuts the superseded socket (zombie reaped); (D)
+  optional auth + ACL hooks. Residual (documented): QoS2/persistent-sessions/Will/TLS unimplemented;
+  a multi-threaded stress/race pass recommended before release. 58 tests, green Debug + RF.
+- **✅ RESOLVED 2026-07-10 — sessions cross-request race (`c1bc3d7`):** store-level optimistic
+  concurrency — each record carries a monotonic generation; save() is a CAS (write only if the
+  generation matches load-time), delete/regenerate bump it so a stale save from another in-flight
+  request fails closed (never resurrects); absent==0 makes the stale CAS fail even if the tombstone
+  was LRU-evicted. Policy: delete/regenerate wins; concurrent data writes first-writer-wins. 22 tests.
+- **✅ RESOLVED 2026-07-10 — coap unauth-UDP (`ef9044a`):** observe Registry admission hook
+  (`tryRegister` + optional per-source cap; a rejected request evicts nothing) + DTLS-seam docs
+  (transport-agnostic → runs over caller-terminated DTLS; production MUST use DTLS); dedup documented
+  as reliability-not-security (a boundary only with source auth). 65 tests.
+- **✅ RESOLVED 2026-07-10 — kv out-of-order durability (`978c779`):** VOPR SimStorage now models
+  non-contiguous unsynced-region drop (holes) targeting compact()'s multi-write window; recovery
+  PROVEN correct (CRC32 fail-stop truncates at the hole; compact()'s only multi-write window is the
+  temp file, adopted only via atomic rename after a full sync — recovery never depends on write
+  ordering). No product defect. 36 tests.
 
 ## Purpose
 
