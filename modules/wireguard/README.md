@@ -96,3 +96,14 @@ use (all `pub`): the UAPI constant tables (`WG_CMD`, `WGDEVICE_A`,
   rtnetlink IFLA_LINKINFO kind filtering — belongs in `netlink`), key
   generation (X25519 via `std.crypto` — trivial for callers), and the
   multicast event group.
+
+## Cryptographic handshake (`noise.zig` / `handshake.zig`)
+
+The Noise_IKpsk2 data-plane handshake (message wire layouts + the
+`Handshake` state machine that produces/consumes them) lives alongside the
+netlink control-plane code above, sharing the module because both are the
+one WireGuard protocol. Implemented over `std.crypto` (X25519,
+ChaCha20-Poly1305, keyed BLAKE2s-128 for mac1, HKDF-over-HMAC-BLAKE2s); no
+`netlink` dependency. Verified with a full-handshake known-answer vector,
+initiator↔responder self-consistency, and a netns-gated live interop
+against the in-kernel WireGuard implementation. Provenance: see `/NOTICE`.

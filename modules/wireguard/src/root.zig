@@ -43,6 +43,12 @@
 //! (golang.zx2c4.com/wireguard/wgctrl, MIT) and the `wg` tool's protocol
 //! usage — behavior/attribute-shape reference only, no source consulted or
 //! copied.
+//!
+//! `noise.zig`/`handshake.zig` implement the OTHER half of the protocol — the
+//! Noise_IKpsk2 cryptographic data-plane handshake (initiation/response,
+//! transport-key derivation, mac1/mac2). It shares this module because both
+//! halves implement the one WireGuard protocol, but has no dependency on the
+//! netlink control-plane code above (std.crypto only).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -52,6 +58,12 @@ const codec = netlink.codec;
 const native_endian = builtin.cpu.arch.endian();
 
 pub const genl = @import("genl.zig");
+
+// Noise_IKpsk2 cryptographic handshake (data-plane). Independent of the
+// genetlink control-plane code above (no shared state, no shared deps;
+// std.crypto only). See the module-level doc-comments in noise.zig/handshake.zig.
+pub const noise = @import("noise.zig");
+pub const handshake = @import("handshake.zig");
 
 pub const meta = .{
     .platform = .linux, // AF_NETLINK raw syscalls — conscious ceiling
@@ -1504,4 +1516,6 @@ test "integration (root): set + get round-trip on a real wg interface" {
 
 test {
     _ = genl;
+    _ = noise;
+    _ = handshake;
 }

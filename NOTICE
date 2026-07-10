@@ -221,6 +221,21 @@ project git history).
                behavior) — behavior/attribute-shape only, no source
                consulted or copied.
 
+               The same module's noise.zig/handshake.zig (currently a
+               compiling scaffold, no crypto implemented — see those
+               files' own doc-comments) reserve the Noise_IKpsk2
+               cryptographic handshake: clean-room from the WireGuard
+               protocol whitepaper (J. A. Donenfeld, "WireGuard: Next
+               Generation Kernel Network Tunnel", NDSS 2017,
+               wireguard.com/papers/wireguard.pdf, and
+               wireguard.com/protocol/) and the Noise Protocol Framework
+               spec (noiseprotocol.org, pattern IKpsk2). Design ref:
+               wireguard-go (golang.zx2c4.com/wireguard, MIT) and the
+               Linux kernel WireGuard implementation (GPL-2.0) — message
+               layout / handshake step order only (the standardized wire
+               protocol, not copyrightable expression); no source
+               consulted or copied.
+
   traceroute — clean-room from the classic traceroute(8)/mtr ICMP method
                (Van Jacobson's TTL-stepping, a public technique) + RFC 792
                (ICMP message formats, via the `icmp` module) —

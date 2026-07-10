@@ -60,6 +60,31 @@ in this module's own backlog (pure-Zig-invariant audit): either replace with a d
 exception. `listDevices()` (rtnetlink IFLA_LINKINFO kind filtering) and the multicast event group
 remain out of scope per the design.
 
+## Cryptographic handshake (`noise.zig` / `handshake.zig`)
+
+The Noise_IKpsk2 data-plane handshake: real wire-layout declarations
+(`MessageInitiation`/`MessageResponse`/`CookieReply`/`MessageTransportHeader`, all comptime
+size-asserted) and the `Handshake` state machine (`createInitiation`/`consumeInitiation`/
+`createResponse`/`consumeResponse`/`deriveTransportKeys`/`computeMac1`/`computeMac2`) over std.crypto
+(X25519, ChaCha20-Poly1305, keyed BLAKE2s-128 for the 16-byte mac1, HKDF-over-HMAC-BLAKE2s KDF).
+Secret material (DH outputs, chaining key, ephemeral privates, KDF scratch) is `secureZero`'d;
+`consumeResponse` works on copies so a forged response can't corrupt a pending handshake. No `netlink`
+dependency (std.crypto only).
+
+Endianness: the `extern struct` wire layouts match the WireGuard byte layout only on a little-endian
+host (true of every platform this repo currently targets); a big-endian target would need explicit
+`std.mem.readInt`/`writeInt(..., .little)`, the same way `root.zig`'s `parseEndpoint`/`appendEndpoint`
+handle the control-plane messages.
+
+Verification: WireGuard publishes no official full-handshake test vector (only KDF vectors, from
+wireguard-go `device/kdf_test.go` — hardcoded here and passing). A fixed-input full-handshake KAT
+(byte-exact 148 B initiation, 92 B response, and both transport keys) was generated from an independent
+reference written from whitepaper §5.4, itself validated against the wireguard-go KDF vectors.
+Initiator↔responder self-consistency (both sides agree the transport-key pair; tampered message /
+wrong PSK fail closed). A netns-gated **live in-kernel WireGuard interop** test (Linux + euid 0 +
+`unshare -rn` + `ip`/wireguard module) runs a real handshake against the kernel and AEAD-decrypts a
+kernel-sent transport packet under the derived key, including a non-zero PSK.
+
 ## Status
 `gap · linux · client · reentrant` + deps: `netlink` — canonical source is `pub const meta` in
-src/root.zig.
+src/root.zig. (The handshake scaffold above has no dependency on `netlink`.)
