@@ -35,11 +35,15 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
   token cookie. Body form-field extraction is deliberately *not* done in the middleware — draining
   the streamed body there would steal it from the handler; callers use `Csrf.verify` directly for
   classic hidden-form-field flows.
-- **Concurrency & the no-copy cookie buffer:** a built `Manager`/`Csrf` is immutable and shared
-  across connection threads. The only mutable state is the `Store`; the default `RamcacheStore`
-  serializes every cache touch behind its own lock (`ramcache` itself is single-owner).
-  `ramcache` has no single-key delete, so deletion writes a zero-length **tombstone** (empty reads
-  as absent; a real record is always ≥ 16 bytes). The `Set-Cookie` value is staged in a
+- **Concurrency, optimistic-concurrency CAS & the no-copy cookie buffer:** a built `Manager`/`Csrf`
+  is immutable and shared across connection threads. The only mutable state is the `Store`; the
+  default `RamcacheStore` serializes every cache touch behind its own lock (`ramcache` itself is
+  single-owner). Each stored value is framed `[generation u64 LE] ++ record`; `save` is a
+  compare-and-swap against the loaded generation, atomic under that lock, so a stale save from a
+  concurrent request cannot resurrect a destroyed/rotated session (see the cross-request
+  resurrection note below). `ramcache` has no single-key delete, so deletion writes a **tombstone**
+  — the 8-byte bumped generation alone (reads as absent, but keeps the generation so the delete is
+  visible to a racing CAS; a live record is always ≥ 8 + 16 bytes). The `Set-Cookie` value is staged in a
   **thread-local** buffer — the response writer stores header slices uncopied and serializes them
   lazily at `writeHead` *after* the handler returns, so a stack buffer would dangle; task-per-
   connection makes the thread-local safe. The clock is injected (`Options.clock`) so timeout tests
@@ -54,23 +58,46 @@ double-submit, cookie hardening (HttpOnly/Secure/SameSite by default, opt-out is
 named). Out of scope / not handled (v1): a distributed `Store` (Redis adapter — implement the
 `Store` vtable); signed-cookie *stateless* sessions (no server store); `SameSite=None` cross-site
 flows; CSRF token rotation / synchronizer-token mode and `Csrf.key` provisioning/rotation;
-logout-everywhere (no user→sessions index); concurrent same-session read-modify-write races (last
-save wins — not a lost-update-safe store); automatic CSRF body form-field extraction (use
+logout-everywhere (no user→sessions index); automatic CSRF body form-field extraction (use
 `Csrf.verify` from the handler instead, so the middleware never touches the request body).
+Concurrent same-session writes are **generation/CAS-guarded** (see the cross-request resurrection
+note above): a delete/regenerate always wins over a stale save, and two concurrent data writes are
+first-writer-wins — the store is not a full lost-update-*merging* store, but a stale save can no
+longer silently overwrite a newer write or undo a delete.
 
-**Known limitation — cross-request resurrection race (not fixed here):** the same-request case is
-closed (`middlewareRun` does not re-`save` a session that was `revoke()`'d or `regenerate()`'d
-during that request — see `Session.revoked` / `Session.regenerated`). A **deeper**, cross-request
-race remains: two genuinely concurrent requests can share a cookie (the same session id) — for
-example, one tab in flight while another tab logs out. Request A loads the session (a private,
-in-memory copy) before request B calls `revoke()`/`regenerate()` and deletes it from the store;
-when A finishes, its trailing `save()` still `put`s its (stale) copy back under the old id,
-resurrecting a session that was supposed to be dead, or reviving a fixed pre-auth id after a
-same-session regenerate raced it out. This needs store-level optimistic concurrency — a
-generation/version tag on the record, with `put` doing a compare-and-swap against the generation
-the request originally loaded, so a racing writer's stale `save` is rejected instead of silently
-overwriting a newer write or a delete. Not built; backlogged (see below) as a `Store` vtable change
-(`get` returning a generation, `put`/`delete` taking an expected generation).
+**Cross-request resurrection race — FIXED (store-level optimistic concurrency).** Both the
+same-request case *and* the harder cross-request case are now closed. The same-request case is
+closed structurally (`middlewareRun` does not re-`save` a session that was `revoke()`'d or
+`regenerate()`'d during that request — see `Session.revoked` / `Session.regenerated`). The
+**cross-request** case — two genuinely concurrent requests sharing one cookie, e.g. one tab in
+flight while another tab logs out — is closed by a **generation (version) tag + compare-and-swap**
+on the `Store`:
+
+- Every stored record carries a monotonic `Generation` (`Store.Loaded.generation`); **absent or
+  tombstoned reads as generation 0, every live record is `>= 1`.** `lookup`/`load` tag the loaded
+  `Session` with the generation it read (`Session.generation`).
+- `save` (via `Manager.persist`) is a **compare-and-swap**: `Store.put(id, record, expected)` writes
+  only if the generation the store *currently* holds for `id` equals `expected` (the generation the
+  request loaded). The read-compare-write is atomic under the `RamcacheStore` mutex. On success it
+  returns the new (bumped) generation; on a mismatch it returns **null** and writes nothing.
+- `destroy`/`revoke` (`Store.delete`) and `regenerate` **bump the generation** — `delete` leaves a
+  tombstone that remembers the bumped generation; `regenerate` deletes the old id (bump) and resets
+  `Session.generation` to 0 so the new id is persisted as a fresh *create*-CAS. So the instant a
+  concurrent request destroys or rotates the session, any other in-flight request still holding the
+  old generation can no longer CAS-match: **a delete/rotate always wins over a concurrent stale
+  save.** Because an absent key reads as generation 0 and a stale save's `expected` is always `>= 1`,
+  the stale save fails even if the tombstone has since been LRU-evicted.
+
+**Save-CAS-failure policy (fail closed).** A `save` whose CAS loses the race is a **no-op**: nothing
+is written to the store and **no rolling `Set-Cookie` is issued**. The session stays whatever the
+winning request made it (dead after a logout, rotated after a regenerate); the browser keeps its
+current cookie and the next request re-resolves it (absent after a logout ⇒ a fresh login). For two
+concurrent *data* writes to a still-live session the policy is **first-writer-wins** (the later,
+now-stale save is dropped) — last-write-wins is not attempted; the only security-critical guarantee
+is that a delete/regenerate cannot be undone. `Manager.save` returns void (the middleware ignores
+the outcome); `Manager.persist` exposes the CAS result as a `bool` so a handler could observe/retry.
+A future distributed `Store` (Redis) implements the same CAS via a Lua script or `WATCH`/`MULTI` on
+the generation.
 
 **Known limitation — thread-per-connection assumption for the `Set-Cookie` buffer:** `writeCookie`
 stages the `Set-Cookie` value in a **threadlocal** buffer (`cookie_buf`) because `http.Server`'s
@@ -89,10 +116,14 @@ implementation's scheduling model from here), only documented.
 
 ## Verification
 
-19 offline tests (Debug + `-Doptimize=ReleaseFast`), `zig fmt --check modules/sessions`. Session
-core (7): create→save→load round-trip, forged id → absent, idle-expiry evict, absolute-cap expiry,
-regenerate (old id dead / data carried), `min_id_bytes` floor accepted at floor/default/ceiling,
-insecure escape hatch. Middleware (5): hardened Set-Cookie + cookie round-trip, revoke
+22 offline tests (Debug + `-Doptimize=ReleaseFast`), `zig fmt --check modules/sessions`. Session
+core (10): create→save→load round-trip, forged id → absent, idle-expiry evict, absolute-cap expiry,
+regenerate (old id dead / data carried), **cross-request race — stale save cannot resurrect a
+concurrently destroyed session**, **cross-request race — stale save cannot resurrect a concurrently
+regenerated (rotated) id (and the new id persists)**, **single-owner save succeeds + bumps the
+generation, a second concurrent stale save no-ops (first-writer-wins)**, `min_id_bytes` floor
+accepted at floor/default/ceiling, insecure escape hatch. Middleware (5): hardened Set-Cookie +
+cookie round-trip, revoke
 expires+evicts, same-request revoke does not get resurrected by the trailing save, same-request
 regenerate persists only the new id (old id stays dead, post-rotation data survives),
 small-buffer early-flush (no cookie-buffer corruption). CSRF (6): token/verify round-trip + tamper,
@@ -114,10 +145,13 @@ pulling in `csrf.zig`. Run: `zig build test-sessions`.
   the key is caller-supplied and static for the process lifetime.
 - **Logout-everywhere** (a user→sessions index) — not built; `revoke`/`regenerate` act on one
   session id only.
-- **Concurrent same-session read-modify-write races** — last save wins; no optimistic-concurrency
-  guard. Same underlying gap as the cross-request resurrection race in the Threat-model section
-  above: needs a generation/version tag on `Store` records and a CAS-style `put`/`delete` so a
-  stale concurrent `save` can be rejected instead of silently winning.
+- ~~**Cross-request resurrection race / concurrent same-session write CAS**~~ — **DONE.** Store
+  records carry a monotonic `Generation`; `save` is a compare-and-swap against the loaded
+  generation and `delete`/`regenerate` bump it, so a stale concurrent `save` is rejected (fail
+  closed, delete/rotate wins) instead of silently overwriting a newer write or undoing a delete.
+  See the cross-request resurrection note in the Threat-model section above. A full lost-update-
+  *merging* store (last-write-wins field merge) is still not attempted — first-writer-wins for
+  concurrent data writes.
 - **Automatic CSRF body form-field extraction** — deliberately not done in the middleware (see
   design notes); callers use `Csrf.verify` directly.
 
