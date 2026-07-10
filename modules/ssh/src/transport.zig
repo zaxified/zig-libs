@@ -27,6 +27,9 @@ const X25519 = std.crypto.dh.X25519;
 const Ed25519 = std.crypto.sign.Ed25519;
 const EcdsaP256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 const Aes256 = std.crypto.core.aes.Aes256;
+const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
+const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
+const MLKem768 = std.crypto.kem.ml_kem.MLKem768;
 const ChaCha = std.crypto.stream.chacha.ChaCha20With64BitNonce;
 const Poly1305 = std.crypto.onetimeauth.Poly1305;
 const Hmac = std.crypto.auth.hmac.Hmac(Sha256);
@@ -54,10 +57,23 @@ pub const software_version = "zig_ssh_0.1";
 
 // ── algorithm name-lists (RFC 4253 §7.1 negotiation; RFC 8731 curve25519) ──
 
-/// KEX methods this client offers, most-preferred first (RFC 8731).
+/// KEX methods this client offers, most-preferred first.
+///
+/// `mlkem768x25519-sha256` (OpenSSH `PROTOCOL`, draft-kampanakis-curdle-ssh-
+/// pq-ke — the post-quantum X25519+ML-KEM-768 hybrid, OpenSSH's current
+/// default) is listed FIRST so it is what we offer by default, matching
+/// OpenSSH 10.x; `curve25519-sha256` (RFC 8731) stays present right after as
+/// the classical fallback. `diffie-hellman-group14-sha256` (RFC 4253 §8.1 +
+/// RFC 3526 §3, SHA-256) / `diffie-hellman-group16-sha512` (RFC 3526 §5,
+/// SHA-512) are the classic MODP Diffie-Hellman groups. `pickFirst`/
+/// `negotiate` walk this list in order; every entry has a working KEX
+/// implementation (`mlkem768x25519Kex` / `curve25519Kex` / `dhGroupKex`).
 pub const kex_algorithms = [_][]const u8{
+    "mlkem768x25519-sha256",
     "curve25519-sha256",
     "curve25519-sha256@libssh.org",
+    "diffie-hellman-group14-sha256",
+    "diffie-hellman-group16-sha512",
 };
 
 /// Host-key algorithms this client accepts for server authentication.
@@ -69,9 +85,17 @@ pub const server_host_key_algorithms = [_][]const u8{
 };
 
 /// Symmetric ciphers this client offers (same list both directions).
+///
+/// `aes256-gcm@openssh.com` / `aes128-gcm@openssh.com` (RFC 5647 + the
+/// OpenSSH AES-GCM convention: the 4-byte packet-length field is AAD, not
+/// encrypted; a 16-byte GCM tag replaces a separate MAC) are AEAD ciphers,
+/// same as `chacha20-poly1305@openssh.com`; all install a real
+/// `CipherState` variant with a working `readPacket`/`writePacket` branch.
 pub const encryption_algorithms = [_][]const u8{
     "chacha20-poly1305@openssh.com",
     "aes256-ctr",
+    "aes256-gcm@openssh.com",
+    "aes128-gcm@openssh.com",
 };
 
 /// MAC algorithms this client offers. Not used with
@@ -305,6 +329,26 @@ pub const Aes256CtrHmacSha256State = struct {
     sequence_number: u32,
 };
 
+/// `aes256-gcm@openssh.com` / `aes128-gcm@openssh.com` (RFC 5647) per-
+/// direction state.
+///
+/// `key`/`key_bits` carry up to a 256-bit AES-GCM key (`key_bits` says how
+/// many of `key`'s leading bytes are the real aes128-gcm key vs the full
+/// aes256-gcm key). `fixed_iv` is the 4-byte fixed part of the RFC 5647 §7.1
+/// 12-byte GCM nonce (`fixed_iv || 8-byte invocation_counter`); the
+/// `invocation_counter` increments once per packet, and unlike
+/// `chacha20_poly1305`/`aes256_ctr_hmac_sha256` it is NOT the SSH sequence
+/// number (RFC 5647 keeps them as two separate 64-bit/32-bit counters that
+/// happen to increment in lockstep).
+pub const AesGcmState = struct {
+    key: [32]u8,
+    key_bits: enum { aes128, aes256 },
+    fixed_iv: [4]u8,
+    invocation_counter: u64,
+    /// See `Chacha20Poly1305State.sequence_number`.
+    sequence_number: u32,
+};
+
 /// Active per-direction cipher/MAC state a `readPacket`/`writePacket` call is
 /// keyed on. `.none` is what the plaintext KEX phase uses; a real variant is
 /// installed once `Transport.clientHandshake` completes NEWKEYS.
@@ -312,6 +356,8 @@ pub const CipherState = union(enum) {
     none,
     chacha20_poly1305: Chacha20Poly1305State,
     aes256_ctr_hmac_sha256: Aes256CtrHmacSha256State,
+    /// `aes256-gcm@openssh.com` / `aes128-gcm@openssh.com` — see `AesGcmState`.
+    aes_gcm: AesGcmState,
 };
 
 /// Big-endian 8-byte ChaCha20 nonce built from a 32-bit SSH sequence number
@@ -432,6 +478,49 @@ pub fn readPacket(r: *std.Io.Reader, cipher: *CipherState, buf: []u8) TransportE
                 .mac = buf[total_pt .. total_pt + 32],
             };
         },
+        .aes_gcm => |*st| {
+            // RFC 5647 + OpenSSH AES-GCM framing: the 4-byte packet-length
+            // field is authenticated-but-NOT-encrypted (GCM AAD); the rest
+            // (padding_length‖payload‖padding = `pkt_len` bytes) is GCM
+            // ciphertext, followed by a 16-byte tag. The 12-byte nonce is
+            // `fixed_iv || invocation_counter` (the counter increments once
+            // per packet, independent of the SSH sequence number).
+            const lenb = try r.takeArray(4);
+            @memcpy(buf[0..4], lenb);
+            const pkt_len = std.mem.readInt(u32, buf[0..4], .big);
+            // GCM plaintext (padlen‖payload‖padding) is a whole number of
+            // 16-byte blocks; the length field itself is excluded (RFC 5647).
+            if (pkt_len == 0 or pkt_len % 16 != 0 or pkt_len > messages.max_wire_string_len)
+                return error.ProtocolError;
+            const total = 4 + @as(usize, pkt_len) + 16;
+            if (total > buf.len) return error.PacketTooLarge;
+            try r.readSliceAll(buf[4 .. 4 + pkt_len]);
+            var tag: [16]u8 = undefined;
+            try r.readSliceAll(&tag);
+            var nonce: [12]u8 = undefined;
+            @memcpy(nonce[0..4], &st.fixed_iv);
+            std.mem.writeInt(u64, nonce[4..12], st.invocation_counter, .big);
+            const ct = buf[4 .. 4 + pkt_len];
+            switch (st.key_bits) {
+                .aes256 => Aes256Gcm.decrypt(ct, ct, tag, buf[0..4], nonce, st.key) catch
+                    return error.MacVerificationFailed,
+                .aes128 => Aes128Gcm.decrypt(ct, ct, tag, buf[0..4], nonce, st.key[0..16].*) catch
+                    return error.MacVerificationFailed,
+            }
+            st.invocation_counter +%= 1;
+            st.sequence_number +%= 1;
+            const padlen = buf[4];
+            if (@as(usize, padlen) + 1 > pkt_len) return error.ProtocolError;
+            const payload_len = pkt_len - 1 - padlen;
+            @memcpy(buf[4 + pkt_len .. 4 + pkt_len + 16], &tag);
+            return .{
+                .packet_length = pkt_len,
+                .padding_length = padlen,
+                .payload = buf[5 .. 5 + payload_len],
+                .padding = buf[5 + payload_len .. 4 + pkt_len],
+                .mac = buf[4 + pkt_len .. 4 + pkt_len + 16],
+            };
+        },
     }
 }
 
@@ -504,6 +593,35 @@ pub fn writePacket(w: *std.Io.Writer, cipher: *CipherState, payload: []const u8)
             try w.flush();
             st.sequence_number +%= 1;
         },
+        .aes_gcm => |*st| {
+            // RFC 5647 + OpenSSH AES-GCM framing (see the `readPacket` branch).
+            // Block-alignment excludes the (unencrypted) length field: total
+            // (padlen‖payload‖padding) is a multiple of 16, padding >= 4.
+            const block: usize = 16;
+            var padlen: usize = block - ((1 + payload.len) % block);
+            if (padlen < 4) padlen += block;
+            const pkt_len: u32 = @intCast(1 + payload.len + padlen);
+            const total = 4 + @as(usize, pkt_len) + 16;
+            if (total > buf.len) return error.PacketTooLarge;
+            std.mem.writeInt(u32, buf[0..4], pkt_len, .big); // AAD, cleartext
+            buf[4] = @intCast(padlen);
+            @memcpy(buf[5 .. 5 + payload.len], payload);
+            fillRandom(buf[5 + payload.len .. 4 + pkt_len]);
+            var nonce: [12]u8 = undefined;
+            @memcpy(nonce[0..4], &st.fixed_iv);
+            std.mem.writeInt(u64, nonce[4..12], st.invocation_counter, .big);
+            var tag: [16]u8 = undefined;
+            const pt = buf[4 .. 4 + pkt_len];
+            switch (st.key_bits) {
+                .aes256 => Aes256Gcm.encrypt(pt, &tag, pt, buf[0..4], nonce, st.key),
+                .aes128 => Aes128Gcm.encrypt(pt, &tag, pt, buf[0..4], nonce, st.key[0..16].*),
+            }
+            @memcpy(buf[4 + pkt_len .. 4 + pkt_len + 16], &tag);
+            try w.writeAll(buf[0..total]);
+            try w.flush();
+            st.invocation_counter +%= 1;
+            st.sequence_number +%= 1;
+        },
     }
 }
 
@@ -515,12 +633,56 @@ pub fn writePacket(w: *std.Io.Writer, cipher: *CipherState, payload: []const u8)
 /// known_hosts/TOFU/pinning policy backs this belongs to the caller.
 pub const HostKeyVerifier = *const fn (key_type: []const u8, key_blob: []const u8) bool;
 
+/// Largest `K`-as-hashed encoding: mpint of a 4096-bit (512-byte) DH shared
+/// secret is `uint32 len || <=1 sign-pad || 512 bytes` = 517 bytes.
+pub const max_k_enc_len = 520;
+
 /// Result of a completed key exchange (RFC 4253 §8 / RFC 8731 §4): the shared
 /// secret `K` and the exchange hash `H`. `H` from the *first* KEX becomes the
 /// fixed session id for the connection's lifetime.
+///
+/// The exchange hash is up to 64 bytes so a SHA-512 KEX
+/// (`diffie-hellman-group16-sha512`) fits; `hash_len` says how many bytes are
+/// valid (32 for the SHA-256 KEX methods). `k_enc` holds `K` in exactly the
+/// wire form fed to the exchange hash and the RFC 4253 §7.2 KDF — an mpint for
+/// curve25519 / diffie-hellman, a `string` (uint32 32 || 32-byte hash) for
+/// `mlkem768x25519-sha256`. If `k_enc_len == 0`, the legacy curve25519 path
+/// mpint-encodes `shared_secret` on demand instead (byte-identical result).
 pub const KexResult = struct {
-    shared_secret: [32]u8,
-    exchange_hash: [32]u8,
+    shared_secret: [32]u8 = [_]u8{0} ** 32,
+    exchange_hash: [64]u8 = [_]u8{0} ** 64,
+    hash_len: u8 = 32,
+    k_enc: [max_k_enc_len]u8 = undefined,
+    k_enc_len: u16 = 0,
+
+    /// The valid `hash_len` bytes of the exchange hash `H`.
+    pub fn hash(self: *const KexResult) []const u8 {
+        return self.exchange_hash[0..self.hash_len];
+    }
+
+    /// Zero every secret this result carries (the shared secret and the
+    /// encoded `K`). Called via `defer` once keys are derived.
+    pub fn zeroize(self: *KexResult) void {
+        std.crypto.secureZero(u8, &self.shared_secret);
+        std.crypto.secureZero(u8, &self.k_enc);
+    }
+};
+
+/// The connection's session id — the exchange hash `H` of the *first* KEX,
+/// fixed for the connection's lifetime. Up to 64 bytes (a SHA-512 first KEX).
+pub const SessionId = struct {
+    bytes: [64]u8 = undefined,
+    len: u8 = 0,
+
+    pub fn from(h: []const u8) SessionId {
+        var s = SessionId{ .len = @intCast(h.len) };
+        @memcpy(s.bytes[0..h.len], h);
+        return s;
+    }
+
+    pub fn slice(self: *const SessionId) []const u8 {
+        return self.bytes[0..self.len];
+    }
 };
 
 /// A non-allocating cursor over an SSH wire blob (`uint32 len || bytes`).
@@ -679,7 +841,333 @@ pub fn curve25519Kex(
     if (!verify_host_key(key_type, k_s)) return error.HostKeyVerificationFailed;
     try verifySignature(key_type, k_s, sig, &h);
 
-    return .{ .shared_secret = shared, .exchange_hash = h };
+    // Legacy path: `k_enc_len == 0` makes `buildCipher` mpint-encode
+    // `shared_secret` on demand (byte-identical to the pre-widening result).
+    var res = KexResult{ .shared_secret = shared, .hash_len = 32 };
+    @memcpy(res.exchange_hash[0..32], &h);
+    return res;
+}
+
+/// True for either negotiated curve25519 KEX name (both dispatch to
+/// `curve25519Kex` — `@libssh.org` is the pre-standardization alias for the
+/// same RFC 8731 algorithm, not a different one).
+fn isCurve25519Kex(name: []const u8) bool {
+    return std.mem.eql(u8, name, "curve25519-sha256") or
+        std.mem.eql(u8, name, "curve25519-sha256@libssh.org");
+}
+
+// ── classic MODP Diffie-Hellman (RFC 4253 §8 + RFC 3526) ────────────────────
+
+/// RFC 3526 §3 2048-bit MODP group prime (`diffie-hellman-group14-sha256`),
+/// verified byte-for-byte: computed from the RFC closed form
+/// `p = 2^2048 - 2^1984 - 1 + 2^64 * (floor(2^1918 * pi) + 124476)` and
+/// confirmed prime + equal to the RFC 3526 §3 hex (see the module's
+/// prime-bit-length tests). Generator is g = 2.
+const group14_prime_hex =
+    "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3BE39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA051015728E5A8AACAA68FFFFFFFFFFFFFFFF";
+
+/// RFC 3526 §5 4096-bit MODP group prime (`diffie-hellman-group16-sha512`),
+/// verified byte-for-byte the same way as `group14_prime_hex`
+/// (`p = 2^4096 - 2^4032 - 1 + 2^64 * (floor(2^3966 * pi) + 240904)`).
+/// Generator is g = 2.
+const group16_prime_hex =
+    "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3BE39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA051015728E5A8AAAC42DAD33170D04507A33A85521ABDF1CBA64ECFB850458DBEF0A8AEA71575D060C7DB3970F85A6E1E4C7ABF5AE8CDB0933D71E8C94E04A25619DCEE3D2261AD2EE6BF12FFA06D98A0864D87602733EC86A64521F2B18177B200CBBE117577A615D6C770988C0BAD946E208E24FA074E5AB3143DB5BFCE0FD108E4B82D120A92108011A723C12A787E6D788719A10BDBA5B2699C327186AF4E23C1A946834B6150BDA2583E9CA2AD44CE8DBBBC2DB04DE8EF92E8EFC141FBECAA6287C59474E6BC05D99B2964FA090C3A2233BA186515BE7ED1F612970CEE2D7AFB81BDD762170481CD0069127D5B05AA993B4EA988D8FDDC186FFB7DC90A6C08F4DF435C934063199FFFFFFFFFFFFFFFF";
+
+/// Decode a compile-time hex string into a byte array.
+fn hexBytes(comptime hex: []const u8) [hex.len / 2]u8 {
+    @setEvalBranchQuota(20000);
+    var out: [hex.len / 2]u8 = undefined;
+    _ = std.fmt.hexToBytes(&out, hex) catch unreachable;
+    return out;
+}
+
+const group14_prime = hexBytes(group14_prime_hex);
+const group16_prime = hexBytes(group16_prime_hex);
+
+/// RFC 3526 modulus large enough for both group14 (2048-bit) and group16
+/// (4096-bit) primes.
+const DhModulus = std.crypto.ff.Modulus(4096);
+
+/// The RFC 3526 group parameters (prime + which digest the KEX method hashes
+/// with) for one `diffie-hellman-group*` name. `pub` so the server-role
+/// `dhGroupKexServer` (server.zig) can reuse the same primes + digest choice.
+pub const DhGroup = struct {
+    prime: []const u8,
+    /// true → SHA-512 (group16), false → SHA-256 (group14).
+    sha512: bool,
+
+    pub fn forName(name: []const u8) ?DhGroup {
+        if (std.mem.eql(u8, name, "diffie-hellman-group14-sha256"))
+            return .{ .prime = &group14_prime, .sha512 = false };
+        if (std.mem.eql(u8, name, "diffie-hellman-group16-sha512"))
+            return .{ .prime = &group16_prime, .sha512 = true };
+        return null;
+    }
+};
+
+/// The largest DH-group prime magnitude byte length (group16, 4096-bit).
+pub const dh_max_prime_len = group16_prime.len;
+
+pub fn isDhGroupKex(name: []const u8) bool {
+    return DhGroup.forName(name) != null;
+}
+
+/// `update` a big-endian magnitude as an RFC 4251 §5 mpint (uint32 len ||
+/// bytes, with a leading 0x00 sign-pad byte if the top bit is set) into
+/// either a SHA-256 or SHA-512 exchange-hash context.
+pub fn hashMpint(comptime H: type, sh: *H, magnitude: []const u8) void {
+    var mbuf: [max_k_enc_len]u8 = undefined;
+    const enc = encodeMpint(&mbuf, magnitude);
+    sh.update(enc);
+}
+
+pub fn hashStringH(comptime H: type, sh: *H, data: []const u8) void {
+    var lb: [4]u8 = undefined;
+    std.mem.writeInt(u32, &lb, @intCast(data.len), .big);
+    sh.update(&lb);
+    sh.update(data);
+}
+
+/// Modular exponentiation `base^exp mod m` (constant-time, Montgomery) via
+/// `std.crypto.ff`, returning the minimal big-endian magnitude in `out`.
+fn dhModExp(m: DhModulus, base_be: []const u8, exp_be: []const u8, out: []u8) TransportError![]const u8 {
+    const base = DhModulus.Fe.fromBytes(m, base_be, .big) catch return error.KexFailed;
+    const res = m.powWithEncodedExponent(base, exp_be, .big) catch return error.KexFailed;
+    var full: [DhModulus.Fe.encoded_bytes]u8 = undefined;
+    res.toBytes(&full, .big) catch return error.KexFailed;
+    const mag = stripLeadingZeros(&full);
+    if (mag.len > out.len) return error.KexFailed;
+    @memcpy(out[0..mag.len], mag);
+    return out[0..mag.len];
+}
+
+/// `base^exp mod prime` for an RFC 3526 group prime, building the constant-time
+/// modulus internally. `pub` for `dhGroupKexServer`'s reuse.
+pub fn dhPowModPrime(prime_be: []const u8, base_be: []const u8, exp_be: []const u8, out: []u8) TransportError![]const u8 {
+    const m = DhModulus.fromBytes(prime_be, .big) catch return error.KexFailed;
+    return dhModExp(m, base_be, exp_be, out);
+}
+
+/// Run the client side of classic MODP Diffie-Hellman key exchange (RFC 4253
+/// §8.1, RFC 3526 groups): send SSH_MSG_KEXDH_INIT (`e = g^x mod p`), receive
+/// SSH_MSG_KEXDH_REPLY (`K_S`, `f = g^y mod p`, signature), compute
+/// `K = f^x mod p`, and `H = HASH(V_C‖V_S‖I_C‖I_S‖K_S‖e‖f‖K)` where `e`, `f`,
+/// `K` are mpints and HASH is SHA-256 (group14) or SHA-512 (group16). Then
+/// verify the host key and its signature over `H`.
+pub fn dhGroupKex(
+    r: *std.Io.Reader,
+    w: *std.Io.Writer,
+    cipher: *CipherState,
+    client_kexinit_payload: []const u8,
+    server_kexinit_payload: []const u8,
+    client_id: []const u8,
+    server_id: []const u8,
+    verify_host_key: HostKeyVerifier,
+    kex_name: []const u8,
+) TransportError!KexResult {
+    const group = DhGroup.forName(kex_name) orelse return error.UnsupportedAlgorithm;
+    const m = DhModulus.fromBytes(group.prime, .big) catch return error.KexFailed;
+    const g = [_]u8{2};
+
+    // Secret exponent x: a full prime-length random value (secrecy dominates;
+    // constant-time modexp keeps it side-channel-safe). Never zero.
+    var x: [group16_prime.len]u8 = undefined;
+    const xb = x[0..group.prime.len];
+    defer std.crypto.secureZero(u8, &x);
+    fillRandom(xb);
+    xb[0] &= 0x7f; // keep x < p (top bit clear is sufficient for these primes)
+    xb[xb.len - 1] |= 1; // ensure nonzero
+
+    // e = g^x mod p.
+    var ebuf: [group16_prime.len]u8 = undefined;
+    const e = try dhModExp(m, &g, xb, &ebuf);
+
+    // SSH_MSG_KEXDH_INIT: byte || mpint e.
+    var ibuf: [8 + group16_prime.len]u8 = undefined;
+    var iw: std.Io.Writer = .fixed(&ibuf);
+    iw.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_KEXDH_INIT)) catch return error.KexFailed;
+    messages.writeMpint(&iw, e) catch return error.KexFailed;
+    try writePacket(w, cipher, iw.buffered());
+
+    // SSH_MSG_KEXDH_REPLY: byte || string K_S || mpint f || string sig.
+    var buf: [16384]u8 = undefined;
+    const pkt = try readPacket(r, cipher, &buf);
+    if (msgType(pkt) != @intFromEnum(messages.MessageType.SSH_MSG_KEXDH_REPLY)) return error.KexFailed;
+    var cur = SliceReader{ .b = pkt.payload[1..] };
+    const k_s = try cur.string();
+    const f = try cur.string(); // mpint magnitude (leading sign-pad, if any)
+    const sig = try cur.string();
+
+    // 1 < f < p-1 (reject degenerate peer values).
+    const f_mag = stripLeadingZeros(f);
+    if (f_mag.len == 0 or (f_mag.len == 1 and f_mag[0] <= 1)) return error.KexFailed;
+    if (f_mag.len > group.prime.len) return error.KexFailed;
+
+    // K = f^x mod p.
+    var kbuf: [group16_prime.len]u8 = undefined;
+    defer std.crypto.secureZero(u8, &kbuf);
+    const k_mag = try dhModExp(m, f_mag, xb, &kbuf);
+
+    var res = KexResult{ .hash_len = if (group.sha512) 64 else 32 };
+    if (group.sha512) {
+        var sh = Sha512.init(.{});
+        hashStringH(Sha512, &sh, client_id);
+        hashStringH(Sha512, &sh, server_id);
+        hashStringH(Sha512, &sh, client_kexinit_payload);
+        hashStringH(Sha512, &sh, server_kexinit_payload);
+        hashStringH(Sha512, &sh, k_s);
+        hashMpint(Sha512, &sh, e);
+        hashMpint(Sha512, &sh, f_mag);
+        hashMpint(Sha512, &sh, k_mag);
+        sh.final(res.exchange_hash[0..64]);
+    } else {
+        var sh = Sha256.init(.{});
+        hashStringH(Sha256, &sh, client_id);
+        hashStringH(Sha256, &sh, server_id);
+        hashStringH(Sha256, &sh, client_kexinit_payload);
+        hashStringH(Sha256, &sh, server_kexinit_payload);
+        hashStringH(Sha256, &sh, k_s);
+        hashMpint(Sha256, &sh, e);
+        hashMpint(Sha256, &sh, f_mag);
+        hashMpint(Sha256, &sh, k_mag);
+        sh.final(res.exchange_hash[0..32]);
+    }
+
+    // K into the result's KDF-encoding buffer as an mpint.
+    {
+        var kw: std.Io.Writer = .fixed(&res.k_enc);
+        messages.writeMpint(&kw, k_mag) catch return error.KexFailed;
+        res.k_enc_len = @intCast(kw.buffered().len);
+    }
+
+    var ksr = SliceReader{ .b = k_s };
+    const key_type = try ksr.string();
+    if (!verify_host_key(key_type, k_s)) return error.HostKeyVerificationFailed;
+    try verifySignature(key_type, k_s, sig, res.hash());
+
+    return res;
+}
+
+// ── post-quantum hybrid KEX (mlkem768x25519-sha256) ─────────────────────────
+
+/// Byte lengths of the OpenSSH `mlkem768x25519-sha256` wire values (OpenSSH
+/// `PROTOCOL`, draft-kampanakis-curdle-ssh-pq-ke): the client init blob is
+/// `ML-KEM-768 encapsulation key || X25519 public`, the server reply blob is
+/// `ML-KEM-768 ciphertext || X25519 public`.
+pub const mlkem_pk_len = MLKem768.PublicKey.encoded_length; // 1184
+pub const mlkem_ct_len = MLKem768.ciphertext_length; // 1088
+pub const mlkem_x25519_len = 32;
+pub const mlkem_cinit_len = mlkem_pk_len + mlkem_x25519_len; // 1216
+pub const mlkem_sreply_len = mlkem_ct_len + mlkem_x25519_len; // 1120
+
+pub fn isMlkemKex(name: []const u8) bool {
+    return std.mem.eql(u8, name, "mlkem768x25519-sha256");
+}
+
+/// Compute the `mlkem768x25519-sha256` hybrid shared secret from the two
+/// component secrets, and write it into `res.k_enc` in the exact wire form
+/// OpenSSH feeds to the exchange hash and KDF: `K = SHA256(K_MLKEM ‖ K_X25519)`
+/// encoded as an SSH `string` (uint32 32 || 32-byte hash) — NOT an mpint.
+/// Returns the raw 32-byte `K` (for the exchange-hash string field), which is
+/// the same bytes as `res.k_enc[4..]`.
+pub fn mlkemSharedK(res: *KexResult, kem_shared: [32]u8, x25519_shared: [32]u8) [32]u8 {
+    var k_raw: [32]u8 = undefined;
+    var sh = Sha256.init(.{});
+    sh.update(&kem_shared); // ML-KEM shared secret first (OpenSSH order)
+    sh.update(&x25519_shared);
+    sh.final(&k_raw);
+    std.mem.writeInt(u32, res.k_enc[0..4], 32, .big);
+    @memcpy(res.k_enc[4..36], &k_raw);
+    res.k_enc_len = 36;
+    return k_raw;
+}
+
+/// Run the client side of `mlkem768x25519-sha256` (OpenSSH's post-quantum
+/// hybrid, its current default): generate an X25519 ephemeral keypair AND an
+/// ML-KEM-768 keypair, send `KEX_ECDH_INIT` with blob
+/// `C = ML-KEM_encapsulation_key(1184) ‖ X25519_pub(32)`, receive the reply's
+/// blob `S = ML-KEM_ciphertext(1088) ‖ X25519_server_pub(32)`, decapsulate +
+/// X25519-scalarmult to the two component secrets, then
+/// `K = SHA256(K_MLKEM ‖ K_X25519)` (encoded as a `string`) and
+/// `H = SHA256(V_C‖V_S‖I_C‖I_S‖K_S‖C‖S‖string(K))`. Verify the host key + sig.
+pub fn mlkem768x25519Kex(
+    r: *std.Io.Reader,
+    w: *std.Io.Writer,
+    cipher: *CipherState,
+    client_kexinit_payload: []const u8,
+    server_kexinit_payload: []const u8,
+    client_id: []const u8,
+    server_id: []const u8,
+    verify_host_key: HostKeyVerifier,
+) TransportError!KexResult {
+    // X25519 ephemeral.
+    var x_seed: [32]u8 = undefined;
+    fillRandom(&x_seed);
+    defer std.crypto.secureZero(u8, &x_seed);
+    const x_kp = X25519.KeyPair.generateDeterministic(x_seed) catch return error.KexFailed;
+
+    // ML-KEM-768 keypair (we are the decapsulator; we send the encaps key).
+    var kem_seed: [MLKem768.seed_length]u8 = undefined;
+    fillRandom(&kem_seed);
+    defer std.crypto.secureZero(u8, &kem_seed);
+    const kem_kp = MLKem768.KeyPair.generateDeterministic(kem_seed) catch return error.KexFailed;
+    const kem_pub = kem_kp.public_key.toBytes();
+
+    // C = ML-KEM_encapsulation_key(1184) || X25519_pub(32).
+    var cinit: [mlkem_cinit_len]u8 = undefined;
+    @memcpy(cinit[0..mlkem_pk_len], &kem_pub);
+    @memcpy(cinit[mlkem_pk_len..mlkem_cinit_len], &x_kp.public_key);
+
+    // SSH_MSG_KEX_ECDH_INIT: byte || string C.
+    var ibuf: [16 + mlkem_cinit_len]u8 = undefined;
+    var iw: std.Io.Writer = .fixed(&ibuf);
+    iw.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_KEXDH_INIT)) catch return error.KexFailed;
+    messages.writeString(&iw, &cinit) catch return error.KexFailed;
+    try writePacket(w, cipher, iw.buffered());
+
+    // SSH_MSG_KEX_ECDH_REPLY: byte || string K_S || string S || string sig.
+    var buf: [16384]u8 = undefined;
+    const pkt = try readPacket(r, cipher, &buf);
+    if (msgType(pkt) != @intFromEnum(messages.MessageType.SSH_MSG_KEXDH_REPLY)) return error.KexFailed;
+    var cur = SliceReader{ .b = pkt.payload[1..] };
+    const k_s = try cur.string();
+    const s_reply = try cur.string();
+    const sig = try cur.string();
+    if (s_reply.len != mlkem_sreply_len) return error.KexFailed;
+
+    // Decapsulate ML-KEM, scalarmult X25519.
+    var ct: [mlkem_ct_len]u8 = undefined;
+    @memcpy(&ct, s_reply[0..mlkem_ct_len]);
+    var kem_shared = kem_kp.secret_key.decaps(&ct) catch return error.KexFailed;
+    defer std.crypto.secureZero(u8, &kem_shared);
+    var x_srv: [32]u8 = undefined;
+    @memcpy(&x_srv, s_reply[mlkem_ct_len..mlkem_sreply_len]);
+    var x_shared = X25519.scalarmult(x_kp.secret_key, x_srv) catch return error.KexFailed;
+    defer std.crypto.secureZero(u8, &x_shared);
+
+    var res = KexResult{ .hash_len = 32 };
+    const k_raw = mlkemSharedK(&res, kem_shared, x_shared);
+
+    // H = SHA256(V_C || V_S || I_C || I_S || K_S || C || S || string(K)).
+    {
+        var sh = Sha256.init(.{});
+        hashString(&sh, client_id);
+        hashString(&sh, server_id);
+        hashString(&sh, client_kexinit_payload);
+        hashString(&sh, server_kexinit_payload);
+        hashString(&sh, k_s);
+        hashString(&sh, &cinit);
+        hashString(&sh, s_reply);
+        hashString(&sh, &k_raw); // K as a string: uint32 32 || 32-byte hash
+        sh.final(res.exchange_hash[0..32]);
+    }
+
+    var ksr = SliceReader{ .b = k_s };
+    const key_type = try ksr.string();
+    if (!verify_host_key(key_type, k_s)) return error.HostKeyVerificationFailed;
+    try verifySignature(key_type, k_s, sig, res.hash());
+
+    return res;
 }
 
 // ── key derivation (RFC 4253 §7.2) ──────────────────────────────────────────
@@ -741,17 +1229,59 @@ pub fn deriveKeys(shared_secret: [32]u8, exchange_hash: [32]u8, session_id: [32]
 
 const Direction = enum { c2s, s2c };
 
+/// RFC 4253 §7.2 KDF for one key letter, parameterized on the KEX method's
+/// hash `H` (SHA-256 for most, SHA-512 for `diffie-hellman-group16-sha512`).
+/// `k_enc` is `K` already in its exchange-hash wire form (mpint or string).
+fn deriveKeyBytesH(comptime H: type, out: []u8, letter: u8, k_enc: []const u8, h: []const u8, session_id: []const u8) void {
+    const dlen = H.digest_length;
+    var first: [64]u8 = undefined;
+    defer std.crypto.secureZero(u8, &first);
+    var s = H.init(.{});
+    s.update(k_enc);
+    s.update(h);
+    s.update(&[_]u8{letter});
+    s.update(session_id);
+    s.final(first[0..dlen]);
+    var written: usize = @min(out.len, dlen);
+    @memcpy(out[0..written], first[0..written]);
+    while (written < out.len) {
+        var s2 = H.init(.{});
+        s2.update(k_enc);
+        s2.update(h);
+        s2.update(out[0..written]);
+        var block: [64]u8 = undefined;
+        defer std.crypto.secureZero(u8, &block);
+        s2.final(block[0..dlen]);
+        const take = @min(dlen, out.len - written);
+        @memcpy(out[written .. written + take], block[0..take]);
+        written += take;
+    }
+}
+
+/// Derive `out` for one key letter, dispatching on the KEX method's hash width
+/// (`hash_len` 32 → SHA-256, 64 → SHA-512).
+fn deriveKey(out: []u8, letter: u8, k_enc: []const u8, h: []const u8, session_id: []const u8, hash_len: u8) void {
+    if (hash_len == 64) {
+        deriveKeyBytesH(Sha512, out, letter, k_enc, h, session_id);
+    } else {
+        deriveKeyBytesH(Sha256, out, letter, k_enc, h, session_id);
+    }
+}
+
 /// Build the installed `CipherState` for one direction from a negotiated
 /// cipher name and the KEX result, deriving exactly the needed key material.
-fn buildCipher(name: []const u8, dir: Direction, kr: KexResult, sid: [32]u8, seq: u32) TransportError!CipherState {
+fn buildCipher(name: []const u8, dir: Direction, kr: KexResult, sid: []const u8, seq: u32) TransportError!CipherState {
     var kmbuf: [4 + 33]u8 = undefined;
     defer std.crypto.secureZero(u8, &kmbuf);
-    const k_mpint = encodeMpint(&kmbuf, &kr.shared_secret);
-    const h = kr.exchange_hash;
+    // K as fed to the KDF: the KEX's explicit encoding, or (legacy curve25519)
+    // the mpint of the raw 32-byte shared secret.
+    const k_enc = if (kr.k_enc_len > 0) kr.k_enc[0..kr.k_enc_len] else encodeMpint(&kmbuf, &kr.shared_secret);
+    const h = kr.hash();
+    const hl = kr.hash_len;
     if (std.mem.eql(u8, name, "chacha20-poly1305@openssh.com")) {
         var km: [64]u8 = undefined;
         defer std.crypto.secureZero(u8, &km);
-        deriveKeyBytes(&km, if (dir == .c2s) 'C' else 'D', k_mpint, h, sid);
+        deriveKey(&km, if (dir == .c2s) 'C' else 'D', k_enc, h, sid, hl);
         return .{ .chacha20_poly1305 = .{
             .key_main = km[0..32].*,
             .key_header = km[32..64].*,
@@ -761,13 +1291,31 @@ fn buildCipher(name: []const u8, dir: Direction, kr: KexResult, sid: [32]u8, seq
         var iv: [16]u8 = undefined;
         var ek: [32]u8 = undefined;
         var mk: [32]u8 = undefined;
-        deriveKeyBytes(&iv, if (dir == .c2s) 'A' else 'B', k_mpint, h, sid);
-        deriveKeyBytes(&ek, if (dir == .c2s) 'C' else 'D', k_mpint, h, sid);
-        deriveKeyBytes(&mk, if (dir == .c2s) 'E' else 'F', k_mpint, h, sid);
+        deriveKey(&iv, if (dir == .c2s) 'A' else 'B', k_enc, h, sid, hl);
+        deriveKey(&ek, if (dir == .c2s) 'C' else 'D', k_enc, h, sid, hl);
+        deriveKey(&mk, if (dir == .c2s) 'E' else 'F', k_enc, h, sid, hl);
         return .{ .aes256_ctr_hmac_sha256 = .{
             .enc_key = ek,
             .enc_iv = iv,
             .mac_key = mk,
+            .sequence_number = seq,
+        } };
+    } else if (std.mem.eql(u8, name, "aes256-gcm@openssh.com") or
+        std.mem.eql(u8, name, "aes128-gcm@openssh.com"))
+    {
+        // RFC 5647: the 12-byte KDF IV (letter A/B) splits into a 4-byte fixed
+        // field and an 8-byte initial invocation counter.
+        var iv12: [12]u8 = undefined;
+        deriveKey(&iv12, if (dir == .c2s) 'A' else 'B', k_enc, h, sid, hl);
+        var key: [32]u8 = undefined;
+        defer std.crypto.secureZero(u8, &key);
+        const is256 = std.mem.eql(u8, name, "aes256-gcm@openssh.com");
+        deriveKey(key[0..if (is256) @as(usize, 32) else 16], if (dir == .c2s) 'C' else 'D', k_enc, h, sid, hl);
+        return .{ .aes_gcm = .{
+            .key = key,
+            .key_bits = if (is256) .aes256 else .aes128,
+            .fixed_iv = iv12[0..4].*,
+            .invocation_counter = std.mem.readInt(u64, iv12[4..12], .big),
             .sequence_number = seq,
         } };
     }
@@ -791,16 +1339,24 @@ const Negotiated = struct {
     cipher_s2c: []const u8,
 };
 
+/// True for a self-authenticating AEAD cipher (no separate negotiated MAC):
+/// `chacha20-poly1305@openssh.com` and the two AES-GCM ciphers.
+pub fn isAeadCipher(name: []const u8) bool {
+    return std.mem.eql(u8, name, "chacha20-poly1305@openssh.com") or
+        std.mem.eql(u8, name, "aes256-gcm@openssh.com") or
+        std.mem.eql(u8, name, "aes128-gcm@openssh.com");
+}
+
 fn negotiate(server_kex: KexInit) TransportError!Negotiated {
     const kex = pickFirst(&kex_algorithms, server_kex.kex_algorithms) orelse return error.UnsupportedAlgorithm;
     const host_key = pickFirst(&server_host_key_algorithms, server_kex.server_host_key_algorithms) orelse return error.UnsupportedAlgorithm;
     const c2s = pickFirst(&encryption_algorithms, server_kex.encryption_algorithms_client_to_server) orelse return error.UnsupportedAlgorithm;
     const s2c = pickFirst(&encryption_algorithms, server_kex.encryption_algorithms_server_to_client) orelse return error.UnsupportedAlgorithm;
     // MAC only matters for a non-AEAD cipher; require one is agreeable then.
-    if (!std.mem.eql(u8, c2s, "chacha20-poly1305@openssh.com")) {
+    if (!isAeadCipher(c2s)) {
         _ = pickFirst(&mac_algorithms, server_kex.mac_algorithms_client_to_server) orelse return error.UnsupportedAlgorithm;
     }
-    if (!std.mem.eql(u8, s2c, "chacha20-poly1305@openssh.com")) {
+    if (!isAeadCipher(s2c)) {
         _ = pickFirst(&mac_algorithms, server_kex.mac_algorithms_server_to_client) orelse return error.UnsupportedAlgorithm;
     }
     return .{ .kex = kex, .host_key = host_key, .cipher_c2s = c2s, .cipher_s2c = s2c };
@@ -815,8 +1371,9 @@ pub const Transport = struct {
     writer: *std.Io.Writer,
     read_cipher: CipherState = .none,
     write_cipher: CipherState = .none,
-    /// Fixed for the connection's lifetime once the first KEX completes.
-    session_id: ?[32]u8 = null,
+    /// Fixed for the connection's lifetime once the first KEX completes (the
+    /// exchange hash `H`; up to 64 bytes for a SHA-512 first KEX).
+    session_id: ?SessionId = null,
 
     pub fn init(reader: *std.Io.Reader, writer: *std.Io.Writer) Transport {
         return .{ .reader = reader, .writer = writer };
@@ -879,12 +1436,19 @@ pub const Transport = struct {
         // NB: a server that sets first_kex_packet_follows with a wrong guess is
         // not handled here (real OpenSSH never guesses); part 1 assumes none.
 
-        // KEX (curve25519Kex sends KEXDH_INIT seq 1, reads KEXDH_REPLY seq 1).
-        var kex_result = try curve25519Kex(t.reader, t.writer, &none_w, i_c, i_s, v_c, v_s, verify_host_key);
-        defer std.crypto.secureZero(u8, &kex_result.shared_secret);
+        // KEX (sends KEXDH_INIT seq 1, reads KEXDH_REPLY seq 1). `negotiate`
+        // only ever returns a name from `kex_algorithms`; every one of those
+        // dispatches to a working implementation here.
+        var kex_result = if (isMlkemKex(neg.kex))
+            try mlkem768x25519Kex(t.reader, t.writer, &none_w, i_c, i_s, v_c, v_s, verify_host_key)
+        else if (isCurve25519Kex(neg.kex))
+            try curve25519Kex(t.reader, t.writer, &none_w, i_c, i_s, v_c, v_s, verify_host_key)
+        else
+            try dhGroupKex(t.reader, t.writer, &none_w, i_c, i_s, v_c, v_s, verify_host_key, neg.kex);
+        defer kex_result.zeroize();
 
-        if (t.session_id == null) t.session_id = kex_result.exchange_hash;
-        const sid = t.session_id.?;
+        if (t.session_id == null) t.session_id = SessionId.from(kex_result.hash());
+        const sid = t.session_id.?.slice();
 
         // NEWKEYS both ways (still plaintext: seq 2 each direction).
         try writePacket(t.writer, &none_w, &[_]u8{@intFromEnum(messages.MessageType.SSH_MSG_NEWKEYS)});
@@ -960,7 +1524,7 @@ test "CipherState/Packet/Transport are constructible" {
     var r: std.Io.Reader = .fixed(&in_buf);
     var w: std.Io.Writer = .fixed(&out_buf);
     var transport_val = Transport.init(&r, &w);
-    try t.expectEqual(@as(?[32]u8, null), transport_val.session_id);
+    try t.expect(transport_val.session_id == null);
     _ = &cipher;
     _ = &transport_val;
 }
@@ -995,7 +1559,7 @@ test "KEXINIT encode/decode round-trip" {
     var got = try KexInit.decode(t.allocator, &r);
     defer got.deinit(t.allocator);
     try t.expectEqualSlices(u8, &cookie, &got.cookie);
-    try t.expectEqualStrings("curve25519-sha256", got.kex_algorithms[0]);
+    try t.expectEqualStrings("mlkem768x25519-sha256", got.kex_algorithms[0]);
     try t.expectEqualStrings("chacha20-poly1305@openssh.com", got.encryption_algorithms_client_to_server[0]);
     try t.expectEqual(@as(usize, 0), got.languages_client_to_server.len);
     try t.expectEqual(false, got.first_kex_packet_follows);
@@ -1116,6 +1680,96 @@ test "aes256-ctr detects MAC tampering" {
     try t.expectError(error.MacVerificationFailed, readPacket(&r, &rc, &rbuf));
 }
 
+test "RFC 3526 primes: exact bit lengths + canonical RFC bytes" {
+    const t = std.testing;
+    // group14 = exactly 2048 bits (256 bytes); group16 = exactly 4096 bits
+    // (512 bytes). Top bit set (no shorter) + full byte length (no longer).
+    try t.expectEqual(@as(usize, 256), group14_prime.len);
+    try t.expectEqual(@as(usize, 512), group16_prime.len);
+    try t.expect(group14_prime[0] & 0x80 != 0);
+    try t.expect(group16_prime[0] & 0x80 != 0);
+    // RFC 3526 §3/§5: both primes' top 64 bits and bottom 64 bits are all 1s.
+    try t.expectEqualSlices(u8, &[_]u8{0xFF} ** 8, group14_prime[0..8]);
+    try t.expectEqualSlices(u8, &[_]u8{0xFF} ** 8, group14_prime[248..256]);
+    try t.expectEqualSlices(u8, &[_]u8{0xFF} ** 8, group16_prime[0..8]);
+    try t.expectEqualSlices(u8, &[_]u8{0xFF} ** 8, group16_prime[504..512]);
+    // The RFC 3526 second 64-bit word is C90FDAA2 2168C234 for every group.
+    const w2 = [_]u8{ 0xC9, 0x0F, 0xDA, 0xA2, 0x21, 0x68, 0xC2, 0x34 };
+    try t.expectEqualSlices(u8, &w2, group14_prime[8..16]);
+    try t.expectEqualSlices(u8, &w2, group16_prime[8..16]);
+}
+
+test "packet codec round-trip: aes256-gcm@openssh (counter increments per packet)" {
+    const t = std.testing;
+    const key = [_]u8{0x11} ** 32;
+    const fixed_iv = [_]u8{ 0x22, 0x33, 0x44, 0x55 };
+    var wc: CipherState = .{ .aes_gcm = .{ .key = key, .key_bits = .aes256, .fixed_iv = fixed_iv, .invocation_counter = 5, .sequence_number = 3 } };
+    var rc: CipherState = .{ .aes_gcm = .{ .key = key, .key_bits = .aes256, .fixed_iv = fixed_iv, .invocation_counter = 5, .sequence_number = 3 } };
+
+    var out: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&out);
+    // Two packets: the 8-byte invocation counter must advance by 1 each,
+    // independent of the SSH sequence number.
+    try writePacket(&w, &wc, "first gcm packet");
+    try writePacket(&w, &wc, "second gcm packet, different length!!");
+    try t.expectEqual(@as(u64, 7), wc.aes_gcm.invocation_counter);
+    const wire = w.buffered();
+    // The 4-byte length field is AAD, NOT encrypted: it equals pkt_len (a
+    // multiple of 16 under the RFC 5647 block-alignment).
+    const pkt_len0 = std.mem.readInt(u32, wire[0..4], .big);
+    try t.expectEqual(@as(u32, 0), pkt_len0 % 16);
+
+    var r: std.Io.Reader = .fixed(wire);
+    var rbuf: [512]u8 = undefined;
+    const p1 = try readPacket(&r, &rc, &rbuf);
+    try t.expectEqualStrings("first gcm packet", p1.payload);
+    var rbuf2: [512]u8 = undefined;
+    const p2 = try readPacket(&r, &rc, &rbuf2);
+    try t.expectEqualStrings("second gcm packet, different length!!", p2.payload);
+    try t.expectEqual(@as(u64, 7), rc.aes_gcm.invocation_counter);
+}
+
+test "packet codec round-trip: aes128-gcm@openssh + GCM tag detects tampering" {
+    const t = std.testing;
+    var key = [_]u8{0} ** 32;
+    for (key[0..16], 0..) |*b, i| b.* = @intCast(i + 1);
+    const fixed_iv = [_]u8{ 1, 2, 3, 4 };
+    var wc: CipherState = .{ .aes_gcm = .{ .key = key, .key_bits = .aes128, .fixed_iv = fixed_iv, .invocation_counter = 0, .sequence_number = 0 } };
+    var out: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&out);
+    try writePacket(&w, &wc, "aes128-gcm authenticated payload");
+    const wire = w.buffered();
+
+    var rc: CipherState = .{ .aes_gcm = .{ .key = key, .key_bits = .aes128, .fixed_iv = fixed_iv, .invocation_counter = 0, .sequence_number = 0 } };
+    var r: std.Io.Reader = .fixed(wire);
+    var rbuf: [256]u8 = undefined;
+    const p = try readPacket(&r, &rc, &rbuf);
+    try t.expectEqualStrings("aes128-gcm authenticated payload", p.payload);
+
+    // Flip a ciphertext byte -> GCM tag must reject.
+    var tampered: [256]u8 = undefined;
+    @memcpy(tampered[0..wire.len], wire);
+    tampered[8] ^= 0x01;
+    var rc2: CipherState = .{ .aes_gcm = .{ .key = key, .key_bits = .aes128, .fixed_iv = fixed_iv, .invocation_counter = 0, .sequence_number = 0 } };
+    var r2: std.Io.Reader = .fixed(tampered[0..wire.len]);
+    var rbuf2: [256]u8 = undefined;
+    try t.expectError(error.MacVerificationFailed, readPacket(&r2, &rc2, &rbuf2));
+}
+
+test "ML-KEM-768 raw encaps/decaps round-trip + wire lengths" {
+    const t = std.testing;
+    try t.expectEqual(@as(usize, 1184), mlkem_pk_len);
+    try t.expectEqual(@as(usize, 1088), mlkem_ct_len);
+    var seed: [MLKem768.seed_length]u8 = undefined;
+    for (&seed, 0..) |*b, i| b.* = @intCast(i);
+    const kp = try MLKem768.KeyPair.generateDeterministic(seed);
+    var es: [MLKem768.encaps_seed_length]u8 = undefined;
+    for (&es, 0..) |*b, i| b.* = @intCast(i + 7);
+    const enc = kp.public_key.encapsDeterministic(&es);
+    const dec = try kp.secret_key.decaps(&enc.ciphertext);
+    try t.expectEqualSlices(u8, &enc.shared_secret, &dec);
+}
+
 test "KDF is deterministic and matches the RFC 4253 §7.2 formula for one block" {
     const t = std.testing;
     const ss = [_]u8{0x42} ** 32; // high bit clear -> mpint has no sign pad
@@ -1214,7 +1868,7 @@ fn readEd25519PubFromKeyFile(gpa: std.mem.Allocator, io: std.Io, path: []const u
     return out;
 }
 
-fn liveInterop(cipher_name: []const u8) !void {
+fn liveInterop(kex_name: []const u8, cipher_name: []const u8) !void {
     const gpa = std.testing.allocator;
 
     var threaded = std.Io.Threaded.init(gpa, .{});
@@ -1268,16 +1922,18 @@ fn liveInterop(cipher_name: []const u8) !void {
     defer gpa.free(port_opt);
     const ciphers_opt = try std.fmt.allocPrint(gpa, "Ciphers={s}", .{cipher_name});
     defer gpa.free(ciphers_opt);
+    const kex_opt = try std.fmt.allocPrint(gpa, "KexAlgorithms={s}", .{kex_name});
+    defer gpa.free(kex_opt);
 
     // Start sshd (foreground master; all config via -o, no config file).
     var sshd = std.process.spawn(io, .{
         .argv = &.{
-            sshd_path,                         "-D", "-e",                      "-f",
-            "/dev/null",                       "-h", hk_path,                   "-o",
-            port_opt,                          "-o", "ListenAddress=127.0.0.1", "-o",
-            "UsePAM=no",                       "-o", "StrictModes=no",          "-o",
-            "PidFile=none",                    "-o", "LogLevel=QUIET",          "-o",
-            "KexAlgorithms=curve25519-sha256", "-o", ciphers_opt,               "-o",
+            sshd_path,            "-D", "-e",                      "-f",
+            "/dev/null",          "-h", hk_path,                   "-o",
+            port_opt,             "-o", "ListenAddress=127.0.0.1", "-o",
+            "UsePAM=no",          "-o", "StrictModes=no",          "-o",
+            "PidFile=none",       "-o", "LogLevel=QUIET",          "-o",
+            kex_opt,              "-o", ciphers_opt,               "-o",
             "MACs=hmac-sha2-256",
         },
         .stdout = .ignore,
@@ -1317,14 +1973,38 @@ fn liveInterop(cipher_name: []const u8) !void {
     switch (transport.read_cipher) {
         .chacha20_poly1305 => try std.testing.expect(std.mem.eql(u8, cipher_name, "chacha20-poly1305@openssh.com")),
         .aes256_ctr_hmac_sha256 => try std.testing.expect(std.mem.eql(u8, cipher_name, "aes256-ctr")),
+        .aes_gcm => |st| switch (st.key_bits) {
+            .aes256 => try std.testing.expectEqualStrings("aes256-gcm@openssh.com", cipher_name),
+            .aes128 => try std.testing.expectEqualStrings("aes128-gcm@openssh.com", cipher_name),
+        },
         .none => return error.ProtocolError,
     }
 }
 
-test "live interop against OpenSSH sshd — chacha20-poly1305@openssh.com" {
-    try liveInterop("chacha20-poly1305@openssh.com");
+test "live interop against OpenSSH sshd — curve25519 + chacha20-poly1305@openssh.com" {
+    try liveInterop("curve25519-sha256", "chacha20-poly1305@openssh.com");
 }
 
-test "live interop against OpenSSH sshd — aes256-ctr" {
-    try liveInterop("aes256-ctr");
+test "live interop against OpenSSH sshd — curve25519 + aes256-ctr" {
+    try liveInterop("curve25519-sha256", "aes256-ctr");
+}
+
+test "live interop against OpenSSH sshd — diffie-hellman-group14-sha256" {
+    try liveInterop("diffie-hellman-group14-sha256", "aes256-ctr");
+}
+
+test "live interop against OpenSSH sshd — diffie-hellman-group16-sha512" {
+    try liveInterop("diffie-hellman-group16-sha512", "aes256-ctr");
+}
+
+test "live interop against OpenSSH sshd — mlkem768x25519-sha256" {
+    try liveInterop("mlkem768x25519-sha256", "chacha20-poly1305@openssh.com");
+}
+
+test "live interop against OpenSSH sshd — aes256-gcm@openssh.com" {
+    try liveInterop("curve25519-sha256", "aes256-gcm@openssh.com");
+}
+
+test "live interop against OpenSSH sshd — aes128-gcm@openssh.com" {
+    try liveInterop("curve25519-sha256", "aes128-gcm@openssh.com");
 }
