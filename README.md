@@ -110,6 +110,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `stun` | STUN client (RFC 8489) — NAT reflexive-address discovery: XOR-MAPPED-ADDRESS + MESSAGE-INTEGRITY + FINGERPRINT | any | netaddr |
 | `sntp` | SNTP client (RFC 4330) — NTP packet codec + UDP query, clock offset / round-trip delay | any | — |
 | `syslog` | RFC 5424 syslog formatter + emitter, RFC 3164 legacy encoder, RFC 6587 TCP octet framing | any | — |
+| `ssh` | SSH-2.0 client transport (RFC 4253) — version exchange, KEXINIT, curve25519-sha256 (RFC 8731), Binary Packet Protocol, cipher/MAC state; userauth/channels (RFC 4252/4254) reserved. **Skeleton — not yet implemented** | any | rsa |
 
 ### Data & storage
 

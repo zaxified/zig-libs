@@ -439,6 +439,26 @@ project git history).
                golang.org/x/crypto bcrypt_pbkdf reference vectors — all cited
                inline at their tests.
 
+  ssh        — clean-room implementation from RFC 4253 (SSH Transport Layer
+               Protocol), RFC 4251 (SSH Protocol Architecture — the mpint/
+               string/name-list wire types), RFC 4252 (Authentication
+               Protocol), RFC 4254 (Connection Protocol), and RFC 8731
+               (curve25519-sha256 key exchange). The `chacha20-poly1305@
+               openssh.com` cipher framing and (when implemented)
+               `aes-gcm`-family framing follow the OpenSSH `PROTOCOL` /
+               `PROTOCOL.chacha20poly1305` notes and RFC 5647, both public
+               documentation of OpenSSH's own protocol extensions, not
+               OpenSSH source. Design reference (architecture SHAPE only, no
+               source copied): ringtailsoftware/misshod (MIT). Crypto
+               primitives come from Zig `std.crypto` (X25519, Ed25519,
+               ChaCha20-Poly1305, P-256, SHA-2, HMAC) plus this repo's own
+               `rsa` module for rsa-sha2 (RFC 8332) host-key verification. No
+               GPL/LGPL source consulted or copied anywhere in this module.
+               **Status: skeleton — transport layer (part 1) API surface
+               reserved as `@panic("TODO(agent): ...")` stubs, not yet
+               implemented; userauth/channels (parts 2-3) not yet scaffolded
+               beyond top-level placeholders.**
+
   opcua      — clean-room from OPC 10000-6 (OPC UA Binary encoding + the
                opc.tcp transport) and OPC 10000-4 (Services); both are open,
                royalty-free specifications published by the OPC Foundation.
