@@ -129,7 +129,7 @@ docs/pre-public-review.md.
                and Go net/http (BSD-3-Clause; redirect semantics, server shape,
                gzip handler).
   dns        — RFC 1035 (wire), RFC 8484 (DoH), RFC 2782 (SRV), RFC 8659
-               (CAA); design ref: miekg/dns (BSD-3-Clause) + c-ares —
+               (CAA); design ref: miekg/dns (BSD-3-Clause) + c-ares (MIT) —
                behavior only, no source copied.
   router     — design ref: go-chi/chi (MIT), julienschmidt/httprouter
                (BSD-3-Clause).

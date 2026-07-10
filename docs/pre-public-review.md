@@ -117,18 +117,23 @@ release before this checklist is worked through.
 Each target below gets a dedicated adversarial pass — not just "does it pass its own
 tests" but "what would a hostile input/attacker do here":
 
-- ☐ **`acme`** — JWS signing correctness (ES256 over the right protected header/payload
+- ✅ **`acme`** — JWS signing correctness (ES256 over the right protected header/payload
   encoding) and CSR (PKCS#10) construction; nonce handling; replay/downgrade paths in the
-  ACME v2 (RFC 8555) client flow.
-- ☐ **`aaa-gate` / `jwt`** — constant-time comparison on every secret-bearing compare
+  ACME v2 (RFC 8555) client flow. — done (see Progress: adversarial SECURITY pass, listed
+  CLEAN — JWS/ES256/nonce/CSR all correct).
+- ✅ **`aaa-gate` / `jwt`** — constant-time comparison on every secret-bearing compare
   (bearer tokens, HMAC signatures); **alg-confusion** resistance (HS vs RS/ES/EdDSA
   cannot be swapped by an attacker-controlled `alg` header); JWKS handling — `kid`
   lookup can't be tricked into fetching or trusting an attacker-supplied key
-  ("JWKS smuggling"); key-rotation correctness under a JWKS refresh.
-- ☐ **`snmp.usm`** — constant-time HMAC-MD5/SHA-1-96 verification; MD5/SHA-1
+  ("JWKS smuggling"); key-rotation correctness under a JWKS refresh. — done (see Progress:
+  adversarial SECURITY pass — jwt crypto core CLEAN incl. alg-confusion/jku-x5u-smuggling;
+  aaa-gate throttle-key amplification FIXED; jwt insecure-defaults RESOLVED separately).
+- ✅ **`snmp.usm`** — constant-time HMAC-MD5/SHA-1-96 verification; MD5/SHA-1
   algorithm-confusion (can't downgrade auth to a weaker alg unexpectedly); privacy
   (DES-CBC / AES-128-CFB) key derivation and IV handling; engineBoots/engineTime
-  anti-replay window (RFC 3414 §3.2) actually rejects stale/replayed frames.
+  anti-replay window (RFC 3414 §3.2) actually rejects stale/replayed frames. — done (see
+  Progress: adversarial SECURITY pass — DES/key-IV-derivation/time-window/const-time-auth
+  CLEAN; empty-password panic FIXED).
 - ✅ **`kv`** — fault-sweep / VOPR DONE (2026-07-10). Two harnesses (exhaustive scripted +
   2000-seed randomized VOPR) model crash-anywhere, partial-fsync/record-truncation, and
   byte-arbitrary torn writes; recovery is CRC32-per-record fail-stop (torn/corrupt tail
@@ -138,31 +143,46 @@ tests" but "what would a hostile input/attacker do here":
   current always-contiguous-prefix SimStorage, though compact()'s write-loop-then-single-sync
   is that pattern — not a correctness defect (CRC gates it), but over-truncation-under-reordering
   is unverified. Not a release blocker.
-- ☐ **`http` parser cluster** — the whole family that parses attacker-controlled bytes:
+- ✅ **`http` parser cluster** — the whole family that parses attacker-controlled bytes:
   redirect handling + auth-header-stripping on cross-origin redirects, HTTP/2 DoS
   resistance (the CVE-2023-44487/CVE-2024-27316-derived mitigations actually hold under
   adversarial framing), and the body/multipart/mcp-http/webhooksig/cookies/range/conneg
   parser cluster (malformed multipart boundaries, cookie injection, oversized/negative
-  Range requests, conneg header abuse).
-- ☐ **`sealedbox` / `hashdigest`** — thin-wrapper correctness over `std.crypto` (no
+  Range requests, conneg header abuse). — done (see Progress: adversarial SECURITY pass —
+  H2 DoS + smuggling + multipart/range/HPACK CLEAN; redirect Authorization host-only strip
+  + cross-origin Cookie leak FIXED, both HIGH).
+- ✅ **`sealedbox` / `hashdigest`** — thin-wrapper correctness over `std.crypto` (no
   accidental weakening of the underlying primitive — e.g. key/nonce reuse, truncation,
-  or a fallback path that silently drops to something weaker).
-- ☐ **`sessions` / CSRF** (`sessions` module) — session-fixation resistance
+  or a fallback path that silently drops to something weaker). — done (see Progress:
+  adversarial SECURITY pass — listed CLEAN, faithful std.crypto wrappers).
+- ✅ **`sessions` / CSRF** (`sessions` module) — session-fixation resistance
   (`regenerate` actually kills the old id), constant-time CSRF token compare, double-submit
   binding to the right session, cookie hardening defaults (`Secure`/`HttpOnly`/`SameSite`)
-  can't be silently bypassed.
-- ☐ **`argsafe`** — the allowlist/CharClass predicates and the `Argv` builder: confirm no
+  can't be silently bypassed. — done (see Progress: adversarial SECURITY pass — fixation/
+  logout-resurrection + id-entropy floor FIXED; cross-request race separately RESOLVED via
+  CAS, commit `c1bc3d7`).
+- ✅ **`argsafe`** — the allowlist/CharClass predicates and the `Argv` builder: confirm no
   predicate can be tricked into accepting a flag-injection, NUL-smuggling, or `..`
   path-traversal payload; confirm a rejected `pushChecked`/`pushIf` always poisons the
-  builder (no code path can ship a short argv after a swallowed error).
-- ☐ **`mqtt` broker** — the first-cut broker (per-conn state machine, subscription
+  builder (no code path can ship a short argv after a swallowed error). — done (see
+  Progress: adversarial SECURITY pass — CharClass predicates CLEAN; CIDR leading-dash
+  FIXED).
+- ✅ **`mqtt` broker** — the first-cut broker (per-conn state machine, subscription
   registry, PUBLISH fan-out, QoS0/1): resource-exhaustion and malformed-packet handling
-  from an untrusted client connection.
-- ☐ **`coap`** — the reliability layer (CON retransmission, message-ID dedup) and the new
+  from an untrusted client connection. — done (see Progress: adversarial SECURITY pass —
+  varint/topic-matcher/state-machine CLEAN; accept-loop inline-wedge DoS FIXED (CRIT);
+  broader production-hardening separately RESOLVED, commit `254ad6d`).
+- ✅ **`coap`** — the reliability layer (CON retransmission, message-ID dedup) and the new
   C6/C7 block-wise + observe additions: replay/duplicate handling under adversarial
   timing, and the `options` decoder's handling of malformed delta-encoded option lengths.
+  — done (see Progress: adversarial SECURITY pass — options decoder CLEAN; block-Assembler
+  disclosure FIXED (HIGH); unauth-UDP separately RESOLVED, commit `ef9044a`).
 
 ## Line-level provenance / similarity audit
+
+**✅ Done — see Progress** (the provenance/similarity audit, commit `667b29d`, plus the
+2026-07-10 loose-ends pass). No checkboxes below; this section is the methodology
+description that audit followed.
 
 Independent of the security pass: for every module recorded as "clean-room from
 spec/RFC" or "model after X" in `NOTICE` / the module `README.md`, do a line-level
@@ -175,6 +195,10 @@ that boundary was actually respected, not just asserted).
 
 ## Files-vs-running test-count check (the dark-tests check)
 
+**✅ Done — see Progress** (dark-tests files-vs-running test-count check: all 19
+multi-file modules swept, disk-count == running total, no dark tests). No checkboxes
+below; this section is the methodology description that sweep followed.
+
 Repo-wide sweep for the **dark-tests bug** (found 2026-07-08): a bare
 `pub const x = @import("x.zig")` re-export does **not** pull `x`'s tests into the module's
 test binary — only a `test { _ = x; }` aggregator (or `refAllDecls`) does. Concretely:
@@ -186,16 +210,31 @@ would have caught — treat a mismatch as a release blocker, not a nice-to-have.
 
 ## NOTICE-completeness sweep
 
-- ☐ Every third-party design-reference actually used anywhere in the repo has a
+- ✅ Every third-party design-reference actually used anywhere in the repo has a
   corresponding `NOTICE` entry (cross-check against every module's `README.md`
   `Provenance:` line — nothing referenced in a README should be absent from `NOTICE`).
-- ☐ The `Provenance:` line format is consistent across all module READMEs (as of the
+  — done (see Progress: provenance/NOTICE loose-ends — C3 doc/UAPI references
+  deep-checked all CLEAN-ORIGINAL/FACTS-ONLY-OK; NOTICE-entry policy decided +
+  documented).
+- ✅ The `Provenance:` line format is consistent across all module READMEs (as of the
   last audit, roughly 13 modules use a bold-list variant instead of the plain-line
-  form — pick one and normalize).
-- ☐ Resolve the `latency-stats` and `dns` citation nits (flagged but not yet fixed as of
-  the last doc audit).
-- ☐ Confirm the NOTICE policy for pure-clean-room-from-RFC modules with no third-party
+  form — pick one and normalize). — done (see Progress: `Provenance:` line format
+  NORMALIZED across all 77 module READMEs — 20 bold-list variants converted; 57
+  already canonical).
+- ✅ Resolved the `latency-stats` and `dns` citation nits (2026-07-10). Explicit pass:
+  `latency-stats` NOTICE entry was rewritten during the provenance reframe and is now
+  complete + correct (moment stats = authors' own original work; HdrHistogram design refs
+  all carry licenses; RFC 3550 + Welford cited). `dns` had one real nit — `c-ares` was
+  cited without its license alongside `miekg/dns (BSD-3-Clause)`; annotated `c-ares (MIT)`.
+  Both NOTICE entries now license every design reference.
+- ✅ Confirm the NOTICE policy for pure-clean-room-from-RFC modules with no third-party
   code reference at all (`whois`, `rdap`, `tar`) — decide and document whether these need
-  a NOTICE entry (spec-only, no design reference) or are correctly NOTICE-absent.
-- ☐ Re-run the axp qemu `ubus -S` parity check against the extracted `blobmsg` module,
-  to confirm byte-for-byte wire compatibility still holds.
+  a NOTICE entry (spec-only, no design reference) or are correctly NOTICE-absent. — done
+  (see Progress: NOTICE-entry POLICY decided + documented, NOTICE §0 + CONVENTIONS §5;
+  `whois`/`rdap`/`tar` confirmed compliant, correctly have no entry).
+- ✅ Re-run the axp qemu `ubus -S` parity check against the extracted `blobmsg` module,
+  to confirm byte-for-byte wire compatibility still holds. — done differently (see
+  Progress: byte-parity pinned by committed OFFLINE golden-byte tests in the module,
+  green; a live re-run against the axp qemu image is explicitly out of scope for this
+  repo's CI since it needs the axp environment — the offline goldens cover the
+  wire-compat regression instead).
