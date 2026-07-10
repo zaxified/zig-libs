@@ -41,9 +41,9 @@ Run: `zig build test-latency-stats`.
 
 ## Backlog / deferred
 
-- **NOTICE citation nit** (see /docs/pre-public-review.md): the latency-stats/dns citation
-  consistency issue is folded into the pending repo-wide security/similarity review pass, not yet
-  resolved standalone.
+- **NOTICE citation nit — RESOLVED 2026-07-10:** the latency-stats NOTICE entry was rewritten
+  during the provenance reframe and is now complete and correct (moment stats attributed as the
+  authors' own original work; HdrHistogram design refs licensed; RFC 3550 + Welford cited).
 - No functional/API backlog recorded (module README has no Deferred section).
 
 ## Status

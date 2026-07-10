@@ -55,10 +55,10 @@ cache/rotation/TTL tests behind a scripted fetcher. 61 tests. Run: `zig build te
 ## Backlog / deferred
 
 - **Mandatory audience/issuer + oct-from-network** were flagged as open decisions in the pre-public
-  review — now **RESOLVED** (safe-by-default, 2026-07-09; see Threat model above). The pending
-  repo-wide **security/similarity review pass** (see /docs/pre-public-review.md) still applies:
-  const-time + alg-confusion + JWKS-smuggling + rotation re-audit for `jwt`/`aaa-gate`, adversarial
-  multi-agent pass before any release.
+  review — now **RESOLVED** (safe-by-default, 2026-07-09; see Threat model above). The repo-wide
+  adversarial security pass (2026-07-10) confirmed the rest: const-time compare, alg-confusion
+  resistance, and JWKS `kid`-smuggling/rotation correctness are all clean for `jwt`; the paired
+  `aaa-gate` throttle-key amplification issue found in that pass was fixed.
 - No other module-local backlog recorded (README has no Deferred section).
 
 ## Status

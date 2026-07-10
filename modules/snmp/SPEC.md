@@ -36,10 +36,10 @@ USM is the security-sensitive part.
   engineTime second) reuses the AES-CFB keystream or the DES-CBC IV under the same key, which leaks
   plaintext via `C1 XOR C2 = P1 XOR P2`. Callers must use a strictly-increasing (or
   cryptographically random, never repeated) salt for every encrypted message.
-- **Pre-public security-review flag:** `snmp.usm` const-time compare + auth/privacy algorithm
-  confusion (MD5 vs SHA-1, DES vs AES selection) is on the pre-public security-review list
-  (see /docs/pre-public-review.md) — verify the algorithm-selection path can't be tricked into a
-  weaker/wrong primitive by a malicious agent reply.
+- **Reviewed 2026-07-10 (adversarial security pass):** `snmp.usm` const-time compare and
+  auth/privacy algorithm confusion (MD5 vs SHA-1, DES vs AES selection) confirmed clean — the
+  algorithm-selection path can't be tricked into a weaker/wrong primitive by a malicious agent
+  reply; an empty-password panic found in the pass was fixed.
 
 ## Verification
 BER + message golden-byte KATs, length-boundary + garbage sweeps, scripted-agent round-trips
@@ -50,9 +50,8 @@ encode/decode round-trips incl. the encrypted-branch capture; USM RFC 3414 A.3 k
 and time-window accept/reject. 71+ tests (grew with T-G/T-H). Run: `zig build test-snmp`.
 
 ## Backlog / deferred
-RFC 7860 SHA-2 auth protocols; MIB compiler/SMI parsing; agent (server) role. Pre-public: the
-security-review pass on `snmp.usm` const-time/alg-confusion (see Threat model above) is still open
-(see /docs/pre-public-review.md).
+RFC 7860 SHA-2 auth protocols; MIB compiler/SMI parsing; agent (server) role. The security-review
+pass on `snmp.usm` const-time/alg-confusion (see Threat model above) is done — clean, 2026-07-10.
 
 ## Status
 `gap · any · codec+client · single_owner` + deps: none (std only) — canonical source is

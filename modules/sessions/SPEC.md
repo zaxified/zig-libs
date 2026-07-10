@@ -133,11 +133,11 @@ pulling in `csrf.zig`. Run: `zig build test-sessions`.
 
 ## Backlog / deferred
 
-- **Pre-public security/similarity review** — `sessions` is server-side auth-adjacent state
-  (session identity + CSRF) and should be added to the repo's pre-public security-gate checklist
-  (`/docs/pre-public-review.md` currently lists `aaa-gate`/`jwt`/`acme`/`snmp.usm`/`kv`/`http`/
-  `sealedbox`/`hashdigest` explicitly; `sessions` is not yet named there and should be folded in
-  before any release).
+- **Reviewed 2026-07-10** (adversarial security pass, alongside `aaa-gate`/`jwt`/`acme`/
+  `snmp.usm`/`kv`/`http`/`sealedbox`/`hashdigest`) — `sessions` is server-side auth-adjacent state
+  (session identity + CSRF): session-fixation and logout-resurrection issues (HIGH) plus an
+  id-entropy floor were found and fixed; the cross-request race was separately resolved via CAS
+  (commit `c1bc3d7`).
 - **Distributed `Store`** (Redis adapter) — implement the `Store` vtable; not built.
 - **Signed-cookie stateless sessions** — no server store variant; not built.
 - **`SameSite=None` cross-site flows** — not supported.

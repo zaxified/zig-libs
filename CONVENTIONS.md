@@ -63,7 +63,6 @@ Per-module design/threat-model lives in each module's `SPEC.md`.
   build.zig.zon        # one manifest for the whole collection
   CONVENTIONS.md        # this file — all repo rules
   NOTICE                 # canonical provenance + third-party design-refs + licenses
-  docs/pre-public-review.md  # living pre-release audit checklist (deleted once done)
   modules/
     _template/           # copy to start a module
     <name>/
@@ -118,6 +117,14 @@ purpose is a full paragraph in the README and only a title + link back to the RE
 SPEC. Seed/provenance detail lives in `NOTICE`; README/SPEC merely reference it (a short
 `Provenance:` line pointing at the NOTICE entry, not a restatement of it).
 
+**On length (they answer different questions, so neither is "the longer doc"):** a
+README's length tracks the module's **API surface** — a rich module (`http`, `jwt`) has a
+long README full of usage; a small one has a short README. A SPEC's length tracks its
+**design/threat complexity** — a module that is simple to reason about has a short SPEC,
+even if its API is large. So a big README + a terse SPEC is normal and correct; do **not**
+pad a SPEC to match a README (or vice-versa). The SPEC is a focused auditor/design
+reference, not a re-explanation of everything the README already covers.
+
 ## 6. How to add a module
 
 1. `cp -r modules/_template modules/<name>`, fill `src/root.zig` (SPDX line first,
@@ -129,7 +136,8 @@ SPEC. Seed/provenance detail lives in `NOTICE`; README/SPEC merely reference it 
 3. **Multi-file modules:** add every new submodule to `root.zig`'s `test { _ = …; }`
    aggregator — a bare `pub const x = @import("x.zig")` re-export does **not** pull `x`'s
    tests into the test binary (the dark-tests rule; it hid 92 never-run tests before it
-   was caught — see the dark-tests check in `docs/pre-public-review.md`).
+   was caught). Verify: `cat modules/<m>/src/*.zig | grep -c '^\s*test '` (blocks on
+   disk) must equal the running count from `zig build test-<m> --summary all`.
 4. `zig build test-<name>` (per module) and `zig build test` (all) — both green in
    **Debug and ReleaseFast**; `zig fmt --check modules/<name>` clean.
 5. Update `NOTICE` with any third-party design reference + its license.

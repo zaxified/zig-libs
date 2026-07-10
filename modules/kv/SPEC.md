@@ -44,7 +44,7 @@ self-test (≥10/12 runs catch a data-losing recovery). 36 tests. Run: `zig buil
   over kv's existing atomic-swap seam) + TigerBeetle's VOPR methodology (not code); phased
   ordered-scan B-tree → atomic batches → MVCC snapshot reads → secondary indexes. Bitcask kv is
   enough until then.
-- **VOPR fault-sweep DONE 2026-07-10** (see /docs/pre-public-review.md): green at 10× the shipped
+- **VOPR fault-sweep DONE (2026-07-10):** green at 10× the shipped
   run count (20k runs, 0 failures); crash-anywhere + torn/partial + byte-arbitrary-tear faults are
   covered, CRC-gated fail-stop replay is sound (torn/corrupt tail truncated, never replayed as valid).
 - **Out-of-order / non-contiguous durability — COVERED 2026-07-10.** The former gap (`SimStorage`

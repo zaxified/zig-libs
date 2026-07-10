@@ -161,8 +161,9 @@ cut — O(conns×subs) fan-out under a global lock held across I/O, publisher-ki
 delivery failures, take-over socket leak, and missing auth/ACL — are now fixed (trie index +
 snapshot-then-write off the lock + per-connection `tx_lock` + reference-counted teardown; contained
 per-subscriber failures; take-over socket shutdown; optional auth/ACL hooks). **The broker
-(`broker.zig`) remains on the pre-public security/similarity review list** (see
-/docs/pre-public-review.md) before any release. The concurrency hardening's recommended
+(`broker.zig`) was reviewed 2026-07-10 (adversarial security pass)** — varint/topic-matcher/
+state-machine handling confirmed clean; the accept-loop inline-wedge DoS (CRIT) found in that pass
+was fixed. The concurrency hardening's recommended
 multi-threaded stress/race pass is now **COVERED** — see Verification above (16 real-socket
 OS-thread clients racing fan-out / take-over / churn, run repeatedly under Debug + ReleaseFast and
 under valgrind memcheck, all clean; TSan is a no-op stub in Zig 0.16.0, so real-thread stress is the

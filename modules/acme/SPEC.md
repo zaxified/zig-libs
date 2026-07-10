@@ -36,9 +36,9 @@ key authorization over real HTTP, and parses+verifies the CSR before issuing the
 Skips only if the loopback bind fails.
 
 ## Backlog / deferred
-Pending pre-public **security/similarity review** (see /docs/pre-public-review.md): JWS/CSR review pass, adversarial
-multi-agent. A manual staging/production recipe (real domain, port 80) is documented in README but
-is out of CI scope by design.
+Reviewed 2026-07-10 (adversarial security pass) — clean: JWS/ES256/nonce/CSR construction and the
+ACME v2 (RFC 8555) replay/downgrade paths all confirmed correct. A manual staging/production recipe
+(real domain, port 80) is documented in README but is out of CI scope by design.
 
 ## Status
 `gap · any · client · threadsafe` + deps `http`, `router`, `std.crypto` (ECDSA P-256, `Certificate`),

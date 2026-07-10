@@ -93,8 +93,8 @@ The following modules are the authors' own original work, reimplemented from
 public specifications (RFCs) or designed with reference to the named
 third-party implementations below. No third-party source was copied. Each is
 listed with its upstream license so any future line-level reuse is attributed
-correctly. A full provenance/license audit was completed 2026-07-09; see
-docs/pre-public-review.md.
+correctly. A full provenance/license audit was completed 2026-07-09 (recorded in the
+project git history).
 
   netaddr    — RFC 6724, RFC 5952 (specs); cross-checked vs Go net/addrselect
                (BSD-3-Clause, The Go Authors) + glibc getaddrinfo algorithm.

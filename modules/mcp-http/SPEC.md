@@ -39,9 +39,9 @@ delivery, Origin accept/reject, session assign/validate/unknown-404, GET drain-a
 
 ## Backlog / deferred
 
-- Pending repo-wide **security/similarity review pass** (see /docs/pre-public-review.md): `mcp-http`
-  is named as part of the `http` parser-cluster re-audit (body/multipart/mcp-http/webhooksig/
-  cookies/range/conneg), not yet run.
+- Reviewed 2026-07-10 (adversarial security pass) as part of the `http` parser-cluster re-audit
+  (body/multipart/mcp-http/webhooksig/cookies/range/conneg) — clean; the cluster's redirect
+  Authorization-stripping and cross-origin Cookie-leak fixes (both HIGH) landed in `http` itself.
 - No functional backlog beyond the explicit out-of-scope list above (module README has no Deferred
   section).
 
