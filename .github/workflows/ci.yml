@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Linux-only: several modules (procnet, rawsock, netlink, wireguard, …) are
+# raw-syscall Linux members and are compiled by `zig build test`; socket/netns
+# tests SkipZigTest cleanly on a constrained runner.
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Format check
+        run: zig fmt --check build.zig build.zig.zon modules
+      - name: Build & test (Debug)
+        run: zig build test
+      - name: Build & test (ReleaseFast)
+        run: zig build test -Doptimize=ReleaseFast
