@@ -71,6 +71,12 @@ pub const BrokerConfig = broker.Config;
 pub const BrokerTransport = broker.Transport;
 pub const TcpServer = broker.TcpServer;
 
+// Optional authentication / ACL seam for the broker (default allow-all).
+pub const AuthDecision = broker.AuthDecision;
+pub const AuthRequest = broker.AuthRequest;
+pub const AclRequest = broker.AclRequest;
+pub const Operation = broker.Operation;
+
 // Convenience re-exports of the codec types used at the client surface.
 pub const QoS = packet.QoS;
 pub const ConnectOptions = packet.Connect;

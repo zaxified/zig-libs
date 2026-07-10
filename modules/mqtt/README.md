@@ -46,22 +46,30 @@ transport-agnostic client and a broker, all fully offline-testable.
     fans PUBLISHes out to every matching subscription. `now` (ms) is passed in
     — no hidden clock — so the whole broker is drivable from in-memory buffers
     in tests. `broker.TcpServer` is an optional `std.Io.net` accept loop
-    (thread-per-connection, one spinlock around the shared registry); tests
-    never listen or dial.
+    (thread-per-connection); tests never listen or dial.
 
-    **First-cut broker scope (3.1.1):** CONNECT/CONNACK (protocol name+level
-    validated, client-id assigned — empty → server-generated — or rejected,
-    session take-over on a duplicate client-id, `session_present` always false
-    / clean-session only, keep-alive deadline = 1.5 × the client's keep-alive
-    checked against a caller-supplied last-packet timestamp); SUBSCRIBE/SUBACK
-    and UNSUBSCRIBE/UNSUBACK over a flat verbatim-filter registry (exact-string
-    UNSUBSCRIBE, `topic.matches` per PUBLISH — correct, no trie at this scale);
-    PUBLISH fan-out at min(publisher QoS, granted QoS), one copy per connection
-    at the highest granted QoS among overlapping filters; QoS 0 fire-and-forget
-    and QoS 1 (inbound → immediate PUBACK; outbound → an id allocated in the
-    *subscriber's* id space, tracked pending until its PUBACK); a retained
-    store (empty payload clears; matching retained delivered right after a new
-    SUBACK).
+    **Broker scope (3.1.1, production-hardened):** CONNECT/CONNACK (protocol
+    name+level validated, client-id assigned — empty → server-generated — or
+    rejected, session take-over on a duplicate client-id which also shuts the
+    superseded socket down, `session_present` always false / clean-session only,
+    keep-alive deadline = 1.5 × the client's keep-alive checked against a
+    caller-supplied last-packet timestamp); optional authentication + per-topic
+    ACL hooks (function-pointer + opaque-ctx seam on `BrokerConfig`, default
+    allow-all — a denied CONNECT gets the proper CONNACK code, a denied
+    SUBSCRIBE gets per-filter `0x80`, a denied PUBLISH is dropped); SUBSCRIBE/
+    SUBACK and UNSUBSCRIBE/UNSUBACK over a **topic-filter trie index** (matching
+    only along a published topic's path, not an O(total-subscriptions) scan;
+    exact-string UNSUBSCRIBE); PUBLISH fan-out at min(publisher QoS, granted
+    QoS), one copy per connection at the highest granted QoS among overlapping
+    filters; QoS 0 fire-and-forget and QoS 1 (inbound → immediate PUBACK;
+    outbound → an id allocated in the *subscriber's* id space, tracked pending
+    until its PUBACK); a retained store (empty payload clears; matching retained
+    delivered right after a new SUBACK). Concurrency: the shared registry's
+    spinlock is never held across a socket write — a PUBLISH snapshots its
+    matching subscribers under the lock, then delivers off it under each
+    connection's own `tx_lock`, reference-counting targets so a mid-fan-out
+    disconnect never writes to freed memory, and containing any per-subscriber
+    delivery failure to that subscriber (never the publisher).
 
     **Deliberately deferred (documented, not built):** QoS 2
     (PUBREC/PUBREL/PUBCOMP — an inbound QoS 2 PUBLISH tears the connection
@@ -106,8 +114,13 @@ CONNECT/SUBSCRIBE/PUBLISH bytes against broker-side connection objects (no
 socket): connect fan-in, subscribe→SUBACK→delivery, overlapping-filter
 single-copy fan-out, retain-before-subscribe, QoS 1 PUBACK + broker-assigned
 delivery id, exact-string unsubscribe, PINGRESP, DISCONNECT, keep-alive
-teardown, session take-over, and a 1000-iteration hostile-byte no-panic sweep;
-the `TcpServer` accept loop is compile-checked but gated behind
+teardown, session take-over, and a 1000-iteration hostile-byte no-panic sweep —
+plus, for the production-hardening fixes: trie fan-out routing across `+`/`#`/
+exact/`$SYS` subscribers, a lock-probe proving the fan-out releases the global
+lock before writing, a failing subscriber contained without touching the
+publisher, a max-size QoS 1 re-encode that does not overflow, take-over shutting
+the superseded socket down, and auth-deny + ACL-deny (PUBLISH and per-filter
+SUBSCRIBE) paths. The `TcpServer` accept loop is compile-checked but gated behind
 `error.SkipZigTest`.
 
 Provenance: clean-room from the OASIS MQTT Version 3.1.1 specification
