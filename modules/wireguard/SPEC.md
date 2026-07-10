@@ -24,6 +24,14 @@ the documented WireGuard netlink UAPI (`uapi/wireguard.h`) and the genetlink UAP
 (`linux/genetlink.h`); behavior modeled after wgctrl-go and the `wg` tool's protocol usage —
 attribute-shape and config-splitting reference only, no source consulted or copied — see NOTICE.
 
+## Provenance / licensing
+The kernel UAPI headers this module cites (uapi/wireguard.h, linux/genetlink.h) are GPL-2.0, but
+that does not make the module a GPL derivative: only uncopyrightable ABI facts are taken from them
+(command/attribute/flag constants, struct layouts), and separately, those headers carry the
+**Linux-syscall-note** exception, which explicitly permits userspace of any license to use them to
+interface with the kernel. No kernel source was consulted or copied; wgctrl-go (MIT) was a
+behavior-only design reference. Full attribution in /NOTICE.
+
 ## Threat model / out of scope
 Both `getDevice` and `setDevice` need **CAP_NET_ADMIN** (the kernel registers the family with
 `GENL_UNS_ADMIN_PERM`); family *resolve* is unprivileged. This module moves key material

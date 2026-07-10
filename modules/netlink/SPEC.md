@@ -25,6 +25,14 @@ headers (`linux/netlink.h`, `linux/rtnetlink.h`, `linux/if_link.h`, `linux/if_ad
 references only (framing/validation discipline, typed-query shape) — constants/struct layouts are
 the OS ABI, see NOTICE.
 
+## Provenance / licensing
+The kernel UAPI headers this module cites are GPL-2.0, but that does not make the module a GPL
+derivative: only uncopyrightable ABI facts are taken from them (numeric constants, struct layouts),
+and separately, those headers carry the **Linux-syscall-note** exception, which explicitly permits
+userspace of any license to use them to interface with the kernel. No kernel or libmnl (LGPL-2.1)
+source was consulted or copied; the codec is an original pure-Zig implementation. Full attribution
+in /NOTICE.
+
 ## Threat model / out of scope
 The untrusted input is the kernel's reply bytes; the codec treats them as hostile and is fuzzed
 accordingly. Unprivileged: RTM_GET* dumps need no root. Out of scope (deliberate, additive

@@ -188,20 +188,38 @@ docs/pre-public-review.md.
 
   netlink    — kernel UAPI headers (linux/netlink.h, linux/rtnetlink.h,
                linux/if_link.h, linux/if_addr.h, linux/neighbour.h,
-               linux/if.h; GPL-2.0 WITH Linux-syscall-note — constants and
-               struct layouts are the OS ABI) + RFC 3549 (spec); design ref:
-               libmnl (LGPL-2.1; validation/framing behavior only, no source
-               consulted), vishvananda/netlink (Go, Apache-2.0; typed-query
-               shape only). Clean-room, no source copied.
+               linux/if.h; GPL-2.0 WITH Linux-syscall-note) + RFC 3549
+               (spec). No GPL header source is copied — only the
+               uncopyrightable ABI facts they document are used (numeric
+               message/attribute/flag constants, struct layouts). The
+               operative mechanism is the Linux-syscall-note exception
+               itself: it explicitly states that using these headers to
+               make syscalls / interface with the kernel does not bring
+               the resulting work under the GPL, for userspace of ANY
+               license — which is why this module is cleanly MIT despite
+               citing GPL-2.0 headers. Design ref: libmnl (LGPL-2.1;
+               validation/framing behavior only, no source consulted),
+               vishvananda/netlink (Go, Apache-2.0; typed-query shape
+               only). Original pure-Zig implementation, no GPL/LGPL
+               source ported.
 
-  wireguard  — clean-room from the documented WireGuard netlink UAPI
-               (uapi/wireguard.h; GPL-2.0 WITH Linux-syscall-note — the
-               command/attribute/flag constants and layouts are the kernel's
-               OS ABI, not copyrightable interface code) and linux/genetlink.h
-               (genlmsghdr + nlctrl CTRL_CMD_GETFAMILY); design ref: wgctrl-go
-               (golang.zx2c4.com/wireguard/wgctrl, MIT) and the wg tool's
-               protocol usage (message-splitting/continuation behavior) —
-               behavior/attribute-shape only, no source consulted or copied.
+  wireguard  — original pure-Zig reimplementation of the WireGuard
+               netlink protocol from the documented UAPI headers
+               (uapi/wireguard.h; GPL-2.0 WITH Linux-syscall-note) and
+               linux/genetlink.h (genlmsghdr + nlctrl
+               CTRL_CMD_GETFAMILY). No GPL header source is copied —
+               only the uncopyrightable ABI facts they document are used
+               (command/attribute/flag constants, struct layouts). The
+               operative mechanism is the Linux-syscall-note exception
+               itself: it explicitly states that using these headers to
+               make syscalls / interface with the kernel does not bring
+               the resulting work under the GPL, for userspace of ANY
+               license — which is why this module is cleanly MIT despite
+               citing GPL-2.0 headers. Design ref: wgctrl-go
+               (golang.zx2c4.com/wireguard/wgctrl, MIT) and the wg
+               tool's protocol usage (message-splitting/continuation
+               behavior) — behavior/attribute-shape only, no source
+               consulted or copied.
 
   traceroute — clean-room from the classic traceroute(8)/mtr ICMP method
                (Van Jacobson's TTL-stepping, a public technique) + RFC 792
