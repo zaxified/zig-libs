@@ -474,6 +474,24 @@ project git history).
                implemented; userauth/channels (parts 2-3) not yet scaffolded
                beyond top-level placeholders.**
 
+  noise      — clean-room from the Noise Protocol Framework specification
+               rev 34 (noiseprotocol.org/noise.html) — an open, public
+               spec. Design ref (API/behavior SHAPE only, no source
+               copied): cacophony (Haskell, BSD-2-Clause), noise-c
+               (github.com/rweather/noise-c, BSD-2-Clause), snow (Rust,
+               Apache-2.0 OR MIT). Distinct from — and has zero dependency
+               on — the `wireguard` module's noise.zig/handshake.zig,
+               which hard-wire WireGuard's fixed
+               Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s instantiation and
+               already implement its KDF; this module is the generic
+               framework (patterns as data, comptime DH/cipher/hash suite
+               selection). **Status: compiling scaffold —
+               CipherState/SymmetricState/HandshakeState (spec §5) API
+               surface reserved as `@panic("TODO(agent): ...")` stubs, not
+               yet implemented; the NN/NK/XX/IK handshake-pattern token
+               data (§7/§9) is real, since patterns are pure spec data,
+               not crypto.**
+
   opcua      — clean-room from OPC 10000-6 (OPC UA Binary encoding + the
                opc.tcp transport) and OPC 10000-4 (Services); both are open,
                royalty-free specifications published by the OPC Foundation.
