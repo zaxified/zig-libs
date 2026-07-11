@@ -80,7 +80,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `openapi` | OpenAPI 3.1 spec generated from the route table + `/openapi.json` | any | router, http |
 | `aaa-gate` | Bearer + **API-key** auth (constant-time) + audit hook + denied-request throttle | any | router, http |
 | `jwt` | JWT/JWS + **OIDC resource-server** validator (RFC 7515/7519/7517/8725) — parse + claims + verify (HS/ES/EdDSA/RSA, alg-confusion-safe) + JWKS-by-`kid` + **OIDC discovery/fetch** (cache + key-rotation) + a **`router` Bearer middleware** (RFC 6750 challenge, scope check, identity on ctx) | any | http, router |
-| `jwe` | JSON Web Encryption (RFC 7516/7518) compact serialization — `dir`/RSA-OAEP/RSA-OAEP-256/AxxxKW (RFC 3394)/AxxxGCMKW/PBES2 key management + A128GCM/A256GCM/A128CBC-HS256/A256CBC-HS512 content encryption, RFC-KAT-validated (incl. RFC 7516 A.3 byte-exact both directions); A192* unsupported (no AES-192 in std) | any | rsa |
+| `jwe` | JSON Web Encryption (RFC 7516/7518) compact serialization — `dir`/RSA-OAEP/RSA-OAEP-256/AxxxKW (RFC 3394)/AxxxGCMKW/PBES2/**ECDH-ES** (+A128KW/A256KW; P-256 + X25519 ephemeral, Concat KDF, RFC 7518 App. C KAT) key management + A128GCM/A256GCM/A128CBC-HS256/A256CBC-HS512 content encryption, RFC-KAT-validated (incl. RFC 7516 A.3 byte-exact both directions); A192* unsupported (no AES-192 in std) | any | rsa |
 | `acme` | Let's Encrypt / ACME v2 (RFC 8555): HTTP-01 issuance + renewal, ES256 JWS, CSR | any | http, router |
 | `sessions` | Server-side web sessions + OWASP-hardened cookies + signed double-submit **CSRF** middleware | any | router, http, cookies, ramcache |
 | `llmclient` | Anthropic Messages API client (buffered + streaming SSE) over `http` — no third-party SDK | any | http |

@@ -11,6 +11,12 @@
 //! shape of a compression/zip-bomb amplification attack (also the CRIME/BREACH
 //! family's root cause when compression crosses a trust boundary) — refusing
 //! it outright is cheaper and safer than bounding it. See SPEC.md.
+//!
+//! ECDH-ES (RFC 7518 §4.6.1) adds three params: `epk` (the ephemeral public
+//! key as a nested JWK object — `kty`/`crv` strings plus base64url `x` and,
+//! for EC curves, `y`) and the optional `apu`/`apv` PartyUInfo/PartyVInfo
+//! values (base64url). This file only moves their bytes; curve validation
+//! and the Concat KDF live in `ecdhes.zig`.
 
 const std = @import("std");
 const b64 = std.base64.url_safe_no_pad;
@@ -73,6 +79,21 @@ pub const Parsed = struct {
     p2s: ?[]const u8 = null,
     /// PBES2 iteration count (§4.8.1.2).
     p2c: ?u32 = null,
+    /// ECDH-ES ephemeral public key (RFC 7518 §4.6.1.1) — decoded
+    /// coordinates, curve NOT yet validated (that's `ecdhes.zig`'s job).
+    epk: ?ParsedEpk = null,
+    /// ECDH-ES Agreement PartyUInfo (§4.6.1.2), base64url-DECODED bytes.
+    apu: ?[]const u8 = null,
+    /// ECDH-ES Agreement PartyVInfo (§4.6.1.3), base64url-DECODED bytes.
+    apv: ?[]const u8 = null,
+};
+
+/// The `epk` JWK as parsed off the wire: `crv` verbatim, coordinates
+/// base64url-decoded. `y` is absent for OKP (X25519) keys.
+pub const ParsedEpk = struct {
+    crv: []const u8,
+    x: []const u8,
+    y: ?[]const u8 = null,
 };
 
 /// Parse a JWE Protected Header JSON object. `arena` owns every returned
@@ -101,6 +122,27 @@ pub fn parse(arena: std.mem.Allocator, header_json: []const u8) ParseError!Parse
         .tag = try optionalBase64(arena, obj, "tag"),
         .p2s = try optionalBase64(arena, obj, "p2s"),
         .p2c = try optionalUint(obj, "p2c"),
+        .epk = try optionalEpk(arena, obj),
+        .apu = try optionalBase64(arena, obj, "apu"),
+        .apv = try optionalBase64(arena, obj, "apv"),
+    };
+}
+
+fn optionalEpk(
+    arena: std.mem.Allocator,
+    obj: std.json.ObjectMap,
+) (error{OutOfMemory} || error{InvalidHeaderField})!?ParsedEpk {
+    const v = obj.get("epk") orelse return null;
+    if (v != .object) return error.InvalidHeaderField;
+    const jwk = v.object;
+    // RFC 7518 §4.6.1.1: epk MUST be a public JWK — `crv` and `x` are the
+    // members every supported curve requires; `y` only exists for EC keys.
+    const crv = (try optionalString(jwk, "crv")) orelse return error.InvalidHeaderField;
+    const x = (try optionalBase64(arena, jwk, "x")) orelse return error.InvalidHeaderField;
+    return .{
+        .crv = crv,
+        .x = x,
+        .y = try optionalBase64(arena, jwk, "y"),
     };
 }
 
@@ -149,6 +191,20 @@ pub const EncodeParams = struct {
     tag: ?[]const u8 = null,
     p2s: ?[]const u8 = null,
     p2c: ?u32 = null,
+    epk: ?EpkParams = null,
+    /// Raw PartyUInfo/PartyVInfo bytes — base64url encoding happens here.
+    apu: ?[]const u8 = null,
+    apv: ?[]const u8 = null,
+};
+
+/// What `encode` writes as the nested `epk` JWK. Coordinates are RAW bytes
+/// (base64url encoding happens inside `encode`); `y` is null for OKP
+/// (X25519) keys.
+pub const EpkParams = struct {
+    kty: []const u8,
+    crv: []const u8,
+    x: []const u8,
+    y: ?[]const u8 = null,
 };
 
 pub const EncodeError = error{BufferTooSmall};
@@ -172,6 +228,9 @@ fn writeAll(js: *std.json.Stringify, params: EncodeParams) std.Io.Writer.Error!v
     var iv_b64_buf: [b64.Encoder.calcSize(max_member_len)]u8 = undefined;
     var tag_b64_buf: [b64.Encoder.calcSize(max_member_len)]u8 = undefined;
     var p2s_b64_buf: [b64.Encoder.calcSize(max_member_len)]u8 = undefined;
+    var epk_b64_buf: [b64.Encoder.calcSize(max_member_len)]u8 = undefined;
+    var apu_b64_buf: [b64.Encoder.calcSize(max_member_len)]u8 = undefined;
+    var apv_b64_buf: [b64.Encoder.calcSize(max_member_len)]u8 = undefined;
 
     try js.beginObject();
     try js.objectField("alg");
@@ -201,6 +260,29 @@ fn writeAll(js: *std.json.Stringify, params: EncodeParams) std.Io.Writer.Error!v
     if (params.p2c) |v| {
         try js.objectField("p2c");
         try js.write(v);
+    }
+    if (params.epk) |e| {
+        try js.objectField("epk");
+        try js.beginObject();
+        try js.objectField("kty");
+        try js.write(e.kty);
+        try js.objectField("crv");
+        try js.write(e.crv);
+        try js.objectField("x");
+        try js.write(b64.Encoder.encode(&epk_b64_buf, e.x));
+        if (e.y) |y| {
+            try js.objectField("y");
+            try js.write(b64.Encoder.encode(&epk_b64_buf, y));
+        }
+        try js.endObject();
+    }
+    if (params.apu) |v| {
+        try js.objectField("apu");
+        try js.write(b64.Encoder.encode(&apu_b64_buf, v));
+    }
+    if (params.apv) |v| {
+        try js.objectField("apv");
+        try js.write(b64.Encoder.encode(&apv_b64_buf, v));
     }
     try js.endObject();
 }
@@ -255,6 +337,50 @@ test "encode + parse round-trip: PBES2 p2s/p2c" {
     try std.testing.expectEqual(Alg.@"PBES2-HS256+A128KW", parsed.alg);
     try std.testing.expectEqualSlices(u8, &salt, parsed.p2s.?);
     try std.testing.expectEqual(@as(?u32, 600_000), parsed.p2c);
+}
+
+test "encode + parse round-trip: ECDH-ES epk/apu/apv (EC and OKP shapes)" {
+    var buf: [max_header_json_len]u8 = undefined;
+    const x = [_]u8{0xaa} ** 32;
+    const y = [_]u8{0xbb} ** 32;
+    const json = try encode(&buf, .{
+        .alg = "ECDH-ES",
+        .enc = "A128GCM",
+        .epk = .{ .kty = "EC", .crv = "P-256", .x = &x, .y = &y },
+        .apu = "Alice",
+        .apv = "Bob",
+    });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try parse(arena.allocator(), json);
+    try std.testing.expectEqual(Alg.@"ECDH-ES", parsed.alg);
+    try std.testing.expectEqualStrings("P-256", parsed.epk.?.crv);
+    try std.testing.expectEqualSlices(u8, &x, parsed.epk.?.x);
+    try std.testing.expectEqualSlices(u8, &y, parsed.epk.?.y.?);
+    try std.testing.expectEqualStrings("Alice", parsed.apu.?);
+    try std.testing.expectEqualStrings("Bob", parsed.apv.?);
+
+    // OKP shape: no y, apu/apv absent.
+    const json2 = try encode(&buf, .{
+        .alg = "ECDH-ES+A256KW",
+        .enc = "A256GCM",
+        .epk = .{ .kty = "OKP", .crv = "X25519", .x = &x },
+    });
+    const parsed2 = try parse(arena.allocator(), json2);
+    try std.testing.expectEqualStrings("X25519", parsed2.epk.?.crv);
+    try std.testing.expectEqual(@as(?[]const u8, null), parsed2.epk.?.y);
+    try std.testing.expectEqual(@as(?[]const u8, null), parsed2.apu);
+}
+
+test "parse rejects malformed epk: non-object, missing crv/x, wrong types" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectError(error.InvalidHeaderField, parse(a, "{\"alg\":\"ECDH-ES\",\"enc\":\"A128GCM\",\"epk\":\"notanobject\"}"));
+    try std.testing.expectError(error.InvalidHeaderField, parse(a, "{\"alg\":\"ECDH-ES\",\"enc\":\"A128GCM\",\"epk\":{\"kty\":\"EC\",\"x\":\"AAAA\"}}"));
+    try std.testing.expectError(error.InvalidHeaderField, parse(a, "{\"alg\":\"ECDH-ES\",\"enc\":\"A128GCM\",\"epk\":{\"kty\":\"EC\",\"crv\":\"P-256\"}}"));
+    try std.testing.expectError(error.InvalidHeaderField, parse(a, "{\"alg\":\"ECDH-ES\",\"enc\":\"A128GCM\",\"epk\":{\"crv\":\"P-256\",\"x\":\"not base64!\"}}"));
 }
 
 test "parse rejects zip" {
