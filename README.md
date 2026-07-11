@@ -153,6 +153,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `procrun` | Subprocess runner: reap-race-tolerant wait, deadlock-free capped stdio capture, timeout, streaming + cancel | any | — |
 | `pollworker` | Single-owner `poll(2)` loop + a lock-free fork/exec job table for offloading blocking work off the loop thread | **linux** | — |
 | `ipcbus` | Same-host unix-socket control plane — request/reply server + a capped in-memory scratch key→bytes bus | **linux** | framing |
+| `sandbox` | Process self-hardening for an internet-facing server — `no_new_privs` + order-safe **privilege drop** (verified) + `setrlimit`/no-core-dumps + **Landlock** fs allow-list (ABI-negotiated) + a **seccomp-bpf** syscall allow-list (arch-guarded, configurable deny action) | **linux** | — |
 | `framing` | Length-prefixed stream framing (`writeFrame`/`readFrame`) + a generic JSON tagged-union envelope codec | any | — |
 | `csvstream` | Streaming RFC 4180 CSV reader that preserves byte offsets, bounded memory regardless of file size | any | — |
 | `csvsafe` | OWASP CSV formula-injection guard (`=`/`+`/`-`/`@` cell leads) | any | — |
