@@ -100,6 +100,7 @@ const module_list = [_]Module{
     .{ .name = "stun", .deps = &.{"netaddr"} },
     .{ .name = "opcua", .deps = &.{"rsa"} },
     .{ .name = "noise" },
+    .{ .name = "x509", .deps = &.{"rsa"} },
     .{ .name = "dnssec", .deps = &.{ "dns", "rsa" } },
     .{ .name = "dnp3" },
     .{ .name = "slhdsa" },
