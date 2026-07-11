@@ -1,0 +1,45 @@
+bip340 — provenance note
+=========================
+
+Kept as a module-local NOTICE (same placement as the sibling `tlsresume`/
+`dtls`/`falcon`/`slhdsa` modules, which are likewise self-contained crypto
+modules not folded into the root `NOTICE`).
+
+Provenance
+----------
+
+bip340 — clean-room implementation from BIP340 ("Schnorr Signatures for
+secp256k1", bitcoin/bips), covering: the tagged-hash construction
+("Design"), the x-only public key convention and `lift_x` ("Public Key
+Conversion"), the default signing algorithm ("Default Signing"), the
+verification algorithm ("Verification"), and batch verification ("Batch
+Verification"). BIP340 is a public, open Bitcoin Improvement Proposal —
+not a copyrightable work (merger doctrine; see CONVENTIONS.md §5) — so no
+third-party-source NOTICE entry is strictly required for the spec citation
+alone. No reference implementation's source was ported or consulted as a
+design reference — neither for the scaffold nor for the crypto pass that
+implemented the cores (`sign`/`verify`/`verifyBatch`): that pass worked
+from the BIP340 specification text and the public API of
+`std.crypto.ecc.Secp256k1` only (no `bitcoin-core/secp256k1` or other
+implementation consulted).
+
+The official BIP340 test vectors (`kat_vectors.zig`) were fetched directly
+from `bip-0340/test-vectors.csv` in the `bitcoin/bips` repository
+(https://raw.githubusercontent.com/bitcoin/bips/master/bip-0340/test-vectors.csv)
+for this pass. This is a public specification artifact — the BIP's own
+published conformance vectors — not copied from any other implementation's
+test suite.
+
+`std.crypto.ecc.Secp256k1` (field arithmetic, scalar arithmetic, point
+group law, `basePoint`, `mul`/`mulDoubleBasePublic`, `recoverY`) and
+`std.crypto.hash.sha2.Sha256` are used via their public APIs (MIT, part of
+Zig itself); see `root.zig`'s and `hash.zig`'s module docs for the specific
+recon findings (`recoverY` == BIP340's `lift_x`; `mulDoubleBasePublic` ==
+the verify equation's `s*G + (-e mod n)*P`).
+
+No GPL/LGPL/AGPL source was consulted or copied anywhere in this module.
+
+**Status: complete — tagged hash, x-only pubkey, key/signature codecs, and
+the crypto cores (`sign`/`verify`/`verifyBatch`) all implemented and
+KAT-validated byte-exact against all 19 official BIP340 test vectors**
+(Debug + ReleaseFast) — see `SPEC.md`'s "TODO(fable) — done" record.

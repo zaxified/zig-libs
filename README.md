@@ -11,7 +11,7 @@ cross-project-reusable capability — a production-grade implementation of a pro
 or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
 authors' other projects depend on it, not the reverse.
 
-**Status:** 92 modules · 2567 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 93 modules · 2585 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ## Using a module
@@ -141,6 +141,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `falcon` | Falcon-512 **and Falcon-1024** (FN-DSA, the NIST PQ lattice signature) — **verification + all key/signature codecs**, NIST-Round-3-KAT-verified for both parameter sets (degree-generic negacyclic NTT mod 12289, SHAKE256 hash-to-point, compressed-sig codec, sk→pk consistency); keygen/sign (ffSampling trapdoor sampler) reserved | any | — |
 | `tlsresume` | Server-side TLS 1.3 session-ticket resumption (RFC 8446 §4.2.11/§4.6.1/§7.1/§8) — `NewSessionTicket` codec + **AES-256-GCM STEK-ring** ticket seal/open (key-id-bound AAD, rotation-safe) + resumption-PSK/**binder** derivation (const-time verify) + ticket-age (de)obfuscation + single-use anti-replay register, **byte-exact KAT vs RFC 8448 §3/§4**. Engine-agnostic (owns no TLS state machine) | any | — |
 | `quic-crypto` | RFC 9001 (Using TLS to Secure QUIC) crypto seam — Initial-secret derivation (§5.2), per-secret key/iv/hp (§5.1), AEAD packet protection (§5.3), header protection (§5.4), key update (§6); engine-agnostic (no transport state machine), std-only. KAT-validated byte-exact against the RFC 9001 App. A vectors, both through `std.crypto` directly (independent oracle) and through the public API | any | — |
+| `bip340` | BIP340 Schnorr signatures over secp256k1 (Bitcoin Taproot's signature scheme) over `std.crypto.ecc.Secp256k1` — tagged hashing, x-only public keys (even-y `lift_x`), `sign` (constant-time nonce even-y select + mandatory self-verify), `verify` (`sG−eP` equation), `verifyBatch`, key/signature codecs; **byte-exact against all 19 official BIP340 test vectors** (8 sign + 10 negative-verify) | any | — |
 
 ### Serialization / OS / agent
 

@@ -111,6 +111,7 @@ const module_list = [_]Module{
     .{ .name = "tlsresume" },
     .{ .name = "quic-crypto" },
     .{ .name = "sandbox" },
+    .{ .name = "bip340" },
     // Scaffold more here (copy modules/_template) — see CONVENTIONS.md
     // "How to add a module" and the README "Roadmap / Non-goals" sections.
 };
