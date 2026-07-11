@@ -107,6 +107,7 @@ const module_list = [_]Module{
     .{ .name = "falcon" },
     .{ .name = "dtls" },
     .{ .name = "tlsresume" },
+    .{ .name = "quic-crypto" },
     .{ .name = "sandbox" },
     // Scaffold more here (copy modules/_template) — see CONVENTIONS.md
     // "How to add a module" and the README "Roadmap / Non-goals" sections.
