@@ -153,6 +153,12 @@ pub const ResponseHead = struct {
     chunked: bool = false,
     /// `Connection: close` was sent.
     connection_close: bool = false,
+    /// `Connection: keep-alive` was sent. Only relevant for an `HTTP/1.0`
+    /// response (`http1_0`) — 1.0 defaults to closing unless the server
+    /// opts into persistence; an `HTTP/1.1` response is persistent by
+    /// default regardless of this flag (`connection_close` is what matters
+    /// there).
+    connection_keep_alive: bool = false,
 
     /// Parse a raw head block as produced by `readHead` (lenient about bare
     /// `\n` line endings; strict about header syntax — no obs-fold, no
@@ -197,6 +203,7 @@ pub const ResponseHead = struct {
                 if (tokenListContains(entry.value, "chunked")) head.chunked = true;
             } else if (std.ascii.eqlIgnoreCase(entry.name, "connection")) {
                 if (tokenListContains(entry.value, "close")) head.connection_close = true;
+                if (tokenListContains(entry.value, "keep-alive")) head.connection_keep_alive = true;
             }
         }
 
@@ -689,6 +696,14 @@ test "ResponseHead.parse: framing headers" {
 
     const cc = try ResponseHead.parse("HTTP/1.1 200 OK\r\nConnection: keep-alive, Close\r\n");
     try testing.expect(cc.connection_close);
+    try testing.expect(cc.connection_keep_alive);
+
+    // HTTP/1.0 default-closes unless it opts into persistence.
+    const old_default = try ResponseHead.parse("HTTP/1.0 200 OK\r\n");
+    try testing.expect(!old_default.connection_keep_alive);
+    const old_ka = try ResponseHead.parse("HTTP/1.0 200 OK\r\nConnection: Keep-Alive\r\n");
+    try testing.expect(old_ka.connection_keep_alive);
+    try testing.expect(!old_ka.connection_close);
 }
 
 test "RequestHead.parse: happy paths" {

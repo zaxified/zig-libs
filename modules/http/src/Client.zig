@@ -2,9 +2,18 @@
 
 //! HTTP/1.1 client over TCP + TLS.
 //!
-//! One `Client` is a lightweight config + lazily-loaded CA bundle; each
-//! request opens its own connection (`Connection: close`) — connection
-//! pooling / keep-alive is an explicit Phase 1 non-goal (TODO: follow-up).
+//! One `Client` is a lightweight config + lazily-loaded CA bundle + a
+//! keyed idle-connection `Pool` (`Options.pool`, on by default). A request
+//! first asks the pool for a warm connection to the target origin
+//! (`scheme`/`host`/`port`); on a miss it dials fresh. A connection returns
+//! to the pool on `Response.deinit`/`Upload.finish` *only* when the
+//! response left it in a clean, fully-drained, keep-alive-eligible state
+//! (see `Conn.keep_alive_eligible` / `isBodyDrained`) — anything else
+//! (`Connection: close`, an HTTP/1.0 response without an explicit
+//! `keep-alive`, a `101` upgrade, a body that was not read to completion, or
+//! any read/write error) is closed instead, never pooled. Set
+//! `Options.pool.enabled = false` for the old one-shot-per-request
+//! behavior (`Connection: close` on every request, exactly as before).
 //! Streaming both directions: response bodies are exposed as a
 //! `std.Io.Reader` (chunked and Content-Length framing decoded on the fly),
 //! request bodies can be streamed via `requestStreaming` (fixed length or
@@ -30,6 +39,21 @@
 //! (`http.protocolFromAlpn`, RFC 7301; RFC 9113 §3.3) hand the plaintext
 //! reader/writer over — the same `H2Session` drives it, transport owned by
 //! the caller.
+//!
+//! h2 pooling seam: an `H2Session` already multiplexes every request over
+//! its ONE connection — that IS h2's pooling, so the h1 idle `Pool` below
+//! does not apply to it and never touches `H2Session`/`connectH2c`/
+//! `connectH2Over` (checking an h2 connection in/out exclusively per
+//! request the way h1 does would defeat multiplexing). What is missing is
+//! *reuse across calls to `connectH2c`* (each call dials a fresh h2c
+//! connection); a caller that wants that today just keeps its own
+//! `*H2Session` around and issues many `request`s on it — which is the
+//! natural h2 usage pattern anyway. Pooling *many* h2 sessions per origin
+//! (for parallelism beyond one connection's flow-control window) is a
+//! documented non-goal of this pass, not a half-implementation: it would
+//! need its own checkout policy (least-loaded session, not idle/warm), which
+//! is different enough from the h1 `Pool` to deserve its own design rather
+//! than a bolt-on.
 
 const std = @import("std");
 const netaddr = @import("netaddr");
@@ -47,6 +71,12 @@ options: Options,
 ca_bundle: std.crypto.Certificate.Bundle,
 ca_lock: std.Io.RwLock,
 ca_scanned: bool,
+pool: Pool,
+/// Lifetime count of fresh dials (pool misses + pooling disabled +
+/// stale-connection retries). Diagnostics/metrics and the main reuse proof
+/// in tests — a steady count across repeated same-origin requests means
+/// the pool is doing its job.
+dial_count: std.atomic.Value(usize) = .init(0),
 
 pub const Options = struct {
     /// Per-connection connect timeout; 0 = none. NOTE: currently NOT
@@ -68,6 +98,39 @@ pub const Options = struct {
     /// Upper bound for a whole response head (status line + headers).
     max_head_bytes: usize = 16 * 1024,
     user_agent: []const u8 = "zig-libs-http/0.1",
+    /// h1 keep-alive connection pooling (see the module doc). Defaults on;
+    /// set `.enabled = false` for the old one-connection-per-request
+    /// behavior (every request explicitly sends `Connection: close`).
+    pool: PoolOptions = .{},
+};
+
+/// Tunables for the idle-connection pool (`Options.pool`).
+pub const PoolOptions = struct {
+    /// Master switch. When false, `Client` behaves exactly as a
+    /// non-pooling client always has: every request dials fresh and sends
+    /// `Connection: close`.
+    enabled: bool = true,
+    /// Idle connections kept per `(scheme, host, port)` origin. Default 4:
+    /// a reverse proxy typically fans a modest number of concurrent
+    /// requests out to any one backend, so 4 warm sockets absorbs normal
+    /// burst concurrency without pinning FDs a backend never asked for;
+    /// callers fronting a hotter single backend can raise it.
+    max_idle_per_host: u16 = 4,
+    /// Idle connections kept across ALL origins combined. Default 64:
+    /// bounds the client's total idle-FD/memory footprint when it talks to
+    /// many distinct backends (a gateway in front of a large fleet), while
+    /// still comfortably covering the common "few backends" case.
+    max_idle_total: u16 = 64,
+    /// An idle connection older than this is reaped — checked
+    /// opportunistically whenever `acquire` scans the pool, and fully via
+    /// an explicit `Client.poolSweep` call (no background thread anywhere
+    /// in this module). Default 30s: comfortably under most reverse-proxy
+    /// and origin-server default keep-alive timeouts (nginx/Apache
+    /// commonly default to 60-75s), so a pooled connection is usually
+    /// reaped by *us* before the peer would have closed it — the
+    /// transparent one-shot retry (see the module doc / `request`) is the
+    /// backstop for the remainder.
+    idle_timeout_ms: u32 = 30_000,
 };
 
 pub const TlsOptions = struct {
@@ -127,12 +190,35 @@ pub fn init(io: std.Io, gpa: std.mem.Allocator, options: Options) Client {
         .ca_bundle = .empty,
         .ca_lock = .init,
         .ca_scanned = false,
+        .pool = Pool.init(gpa, options.pool),
     };
 }
 
 pub fn deinit(c: *Client) void {
+    c.pool.deinit();
     c.ca_bundle.deinit(c.gpa);
     c.* = undefined;
+}
+
+/// Lifetime count of fresh dials (see `dial_count`'s doc). Mainly for tests
+/// and metrics.
+pub fn dialCount(c: *Client) usize {
+    return c.dial_count.load(.monotonic);
+}
+
+/// Total idle pooled connections currently held (all origins). Mainly for
+/// tests and metrics.
+pub fn poolIdleCount(c: *Client) usize {
+    return c.pool.idleCount();
+}
+
+/// Reap idle connections older than `Options.pool.idle_timeout_ms` right
+/// now (this also happens opportunistically whenever `acquire` scans the
+/// pool). There is no background thread anywhere in this module — call
+/// this from your own timer/loop if you want proactive housekeeping instead
+/// of relying on next-acquire reaping.
+pub fn poolSweep(c: *Client) void {
+    c.pool.sweep(c.nowMs());
 }
 
 // ── the request/response exchange ───────────────────────────────────────────
@@ -156,8 +242,6 @@ pub fn request(c: *Client, method: http.Method, url_text: []const u8, options: R
     var redirects: u8 = 0;
     while (true) {
         try c.checkDeadline(deadline);
-        const conn = try c.openConn(url);
-        errdefer conn.destroy();
 
         // Strip credential-bearing headers unless this hop's target is the
         // *exact same origin* (scheme + host + port) as the original request
@@ -166,12 +250,30 @@ pub fn request(c: *Client, method: http.Method, url_text: []const u8, options: R
         // (CVE-2018-18074 class: cleartext credential / cross-service leak).
         const strip_sensitive = crossOrigin(original_url, url);
         const plan: BodyPlan = if (current_body) |b| .{ .content_length = b.len } else .none;
-        try writeRequestHead(conn.plainWriter(), current_method, url, options.headers, c.options.user_agent, plan, strip_sensitive);
-        if (current_body) |b| conn.plainWriter().writeAll(b) catch return error.WriteFailed;
-        try conn.flushAll();
 
-        try c.checkDeadline(deadline);
-        const head = try readResponseHead(conn);
+        var reused = false;
+        var conn = try c.acquireConn(url, &reused);
+        errdefer conn.destroy();
+
+        const head = c.sendAndReadHead(conn, current_method, url, options.headers, plan, current_body, strip_sensitive) catch |err| retry: {
+            // Retry exactly once, and only when BOTH hold: (1) `conn` came
+            // from the pool (`reused`), so it might have gone stale while
+            // parked — a freshly dialed connection failing this way is a
+            // real, non-retryable backend problem; (2) `isStaleConnError`
+            // says the failure means nothing of this exchange reached the
+            // peer as a live request (see its doc for the exact boundary).
+            // We still hold the full request (method/url/headers and, on
+            // this in-memory-body path, `current_body` itself) and can
+            // resend it byte-for-byte on a fresh connection.
+            //
+            // `requestStreaming`/`Upload` deliberately get a narrower version
+            // of this (only before any caller body byte is touched) — see
+            // its doc comment for why a blanket retry is not safe there.
+            if (!reused or !isStaleConnError(err)) return err;
+            conn.destroy();
+            conn = try c.dialConn(url);
+            break :retry try c.sendAndReadHead(conn, current_method, url, options.headers, plan, current_body, strip_sensitive);
+        };
 
         redirect: {
             if (!options.follow_redirects) break :redirect;
@@ -240,9 +342,18 @@ pub const Response = struct {
         };
     }
 
-    /// Close the connection and free all per-request buffers.
+    /// Return the connection to the pool when it left the exchange in a
+    /// clean, fully-drained, keep-alive-eligible state (see
+    /// `Conn.keep_alive_eligible` / `isBodyDrained`); otherwise close it.
+    /// Either way, frees this response's per-request buffers.
     pub fn deinit(res: *Response) void {
-        res.conn.destroy();
+        const conn = res.conn;
+        const c = conn.client;
+        if (c.options.pool.enabled and conn.keep_alive_eligible and isBodyDrained(conn)) {
+            c.pool.release(conn, c.nowMs());
+        } else {
+            conn.destroy();
+        }
         res.* = undefined;
     }
 };
@@ -286,10 +397,28 @@ pub const Upload = struct {
 pub fn requestStreaming(c: *Client, method: http.Method, url_text: []const u8, options: RequestOptions, content_length: ?u64) Error!Upload {
     std.debug.assert(options.body == null);
     const url = try http.Url.parse(url_text);
-    const conn = try c.openConn(url);
-    errdefer conn.destroy();
     const plan: BodyPlan = if (content_length) |n| .{ .content_length = n } else .chunked;
-    try writeRequestHead(conn.plainWriter(), method, url, options.headers, c.options.user_agent, plan, false);
+
+    var reused = false;
+    var conn = try c.acquireConn(url, &reused);
+    errdefer conn.destroy();
+
+    writeRequestHead(conn.plainWriter(), method, url, options.headers, c.options.user_agent, plan, false, !c.options.pool.enabled) catch |err| {
+        // Narrower than `request`'s retry: safe here ONLY because nothing
+        // of the caller-driven body has been touched yet — just the fixed
+        // request head, which we can regenerate byte-for-byte on a fresh
+        // connection. Once this function returns the `Upload` and the
+        // caller starts writing/streaming the body through it, no further
+        // retry is attempted anywhere in `Upload` (`writer`/`finish`): that
+        // body may come from a non-seekable source (a pipe, a generator)
+        // that cannot be replayed, so a stale connection discovered mid- or
+        // post-body surfaces as a normal request failure instead — the
+        // same class of failure any other backend outage already produces.
+        if (!reused or !isStaleConnError(err)) return err;
+        conn.destroy();
+        conn = try c.dialConn(url);
+        try writeRequestHead(conn.plainWriter(), method, url, options.headers, c.options.user_agent, plan, false, !c.options.pool.enabled);
+    };
     return .{
         .conn = conn,
         .method = method,
@@ -529,6 +658,16 @@ const Conn = struct {
     head_buf: []u8,
     body_buf: []u8,
     body: BodyState,
+    /// The origin this connection is dialed to — set once at dial time,
+    /// read back when a completed response decides whether to return the
+    /// connection to the pool (`Pool.release`'s key).
+    origin: Origin,
+    /// Whether the last response read on this connection left it eligible
+    /// for reuse (no `Connection: close`, not an HTTP/1.0 response without
+    /// explicit `keep-alive`, not a `101` upgrade) — set by `setupBody`.
+    /// Still requires `isBodyDrained` before actually pooling: an eligible
+    /// framing with an only-partially-read body cannot be reused either.
+    keep_alive_eligible: bool = false,
 
     const BodyState = union(enum) {
         unset,
@@ -566,7 +705,283 @@ const Conn = struct {
     }
 };
 
-fn openConn(c: *Client, url: http.Url) Error!*Conn {
+/// A connection's origin (`scheme`, `host`, `port`) — the pool's key.
+/// `host` is copied into a fixed inline buffer at dial time: the URL text
+/// it was parsed from is caller-owned and, for a redirect hop, sometimes
+/// freed before the connection this key describes is ever released back to
+/// the pool (see `request`'s `url_owned`), so the key cannot merely borrow
+/// it.
+const Origin = struct {
+    scheme: http.Url.Scheme,
+    port: u16,
+    host_buf: [max_origin_host]u8 = undefined,
+    host_len: u8 = 0,
+
+    /// DNS names top out at 253 octets; IP literals (with brackets) are
+    /// shorter still. A host longer than this (never in practice) is
+    /// truncated — worst case two such hosts sharing a 255-byte prefix
+    /// collide in the pool key, which only costs a redial, never a
+    /// correctness problem.
+    const max_origin_host = 255;
+
+    fn set(o: *Origin, scheme: http.Url.Scheme, port: u16, host_text: []const u8) void {
+        const n: u8 = @intCast(@min(host_text.len, max_origin_host));
+        o.* = .{ .scheme = scheme, .port = port, .host_len = n };
+        @memcpy(o.host_buf[0..n], host_text[0..n]);
+    }
+
+    fn host(o: *const Origin) []const u8 {
+        return o.host_buf[0..o.host_len];
+    }
+
+    fn eql(a: *const Origin, scheme: http.Url.Scheme, host_text: []const u8, port: u16) bool {
+        return a.scheme == scheme and a.port == port and std.ascii.eqlIgnoreCase(a.host(), host_text);
+    }
+};
+
+/// Keyed idle-connection pool (h1 only — see the module doc for the h2
+/// seam). Bounded (`max_idle_per_host`/`max_idle_total`), reaps entries
+/// older than `idle_timeout_ms`, internally synchronized (a tight
+/// `std.atomic.Mutex` spinlock — this repo's era of `std` has no
+/// `std.Thread.Mutex`/`Condition`; see `lockSpin`, the same idiom
+/// `sessions`/`abuseguard`/`acme` already use for shared state touched from
+/// every `http.Server` connection thread). No I/O ever happens while the
+/// lock is held: `acquire`/`release`/`sweep` only mutate the idle list
+/// under the lock, collecting anything to close into a stack buffer, and
+/// only call `Conn.destroy` (a socket close + a free) after unlocking.
+/// Takes `now_ms` as a plain parameter everywhere — it never reads a clock
+/// itself (`Client` is the one real clock reader, via `nowMs`), so the pool
+/// alone is fully deterministic to test.
+const Pool = struct {
+    gpa: std.mem.Allocator,
+    options: PoolOptions,
+    mutex: std.atomic.Mutex = .unlocked,
+    idle: std.ArrayList(Idle) = .empty,
+
+    const Idle = struct {
+        conn: *Conn,
+        idle_since_ms: i64,
+    };
+
+    /// Hard upper bound on how many connections one call closes in a
+    /// single pass — sized to cover any sane `max_idle_total` without
+    /// needing an allocation on the reap path. `init` asserts the
+    /// configured cap actually fits.
+    const max_reap_batch = 4096;
+
+    fn init(gpa: std.mem.Allocator, options: PoolOptions) Pool {
+        std.debug.assert(options.max_idle_total <= max_reap_batch);
+        return .{ .gpa = gpa, .options = options };
+    }
+
+    /// Close every idle connection and free the pool's own bookkeeping.
+    /// Not synchronized — call only once nothing else can touch the pool
+    /// (this mirrors `Client.deinit`'s own contract).
+    fn deinit(p: *Pool) void {
+        for (p.idle.items) |it| it.conn.destroy();
+        p.idle.deinit(p.gpa);
+    }
+
+    fn idleCount(p: *Pool) usize {
+        lockSpin(&p.mutex);
+        defer p.mutex.unlock();
+        return p.idle.items.len;
+    }
+
+    /// Pop a warm idle connection matching `(scheme, host, port)`, or null
+    /// (dial fresh). Opportunistically reaps any idle connection already
+    /// older than `idle_timeout_ms` encountered along the way. When several
+    /// idle connections match the key, the most recently released one wins
+    /// (keeps the warmest socket in play; older same-key idle connections
+    /// simply age out via the timeout or a later cap eviction).
+    fn acquire(p: *Pool, scheme: http.Url.Scheme, host: []const u8, port: u16, now_ms: i64) ?*Conn {
+        var reap_buf: [max_reap_batch]*Conn = undefined;
+        var reap_n: usize = 0;
+        var found: ?*Conn = null;
+        {
+            lockSpin(&p.mutex);
+            defer p.mutex.unlock();
+
+            var i: usize = 0;
+            while (i < p.idle.items.len) {
+                if (now_ms -| p.idle.items[i].idle_since_ms > p.options.idle_timeout_ms and reap_n < max_reap_batch) {
+                    reap_buf[reap_n] = p.idle.swapRemove(i).conn;
+                    reap_n += 1;
+                    continue; // swapRemove moved the tail into i — recheck it
+                }
+                i += 1;
+            }
+            var match_idx: ?usize = null;
+            for (p.idle.items, 0..) |it, idx| {
+                if (it.conn.origin.eql(scheme, host, port)) match_idx = idx;
+            }
+            if (match_idx) |idx| found = p.idle.orderedRemove(idx).conn;
+        }
+        for (reap_buf[0..reap_n]) |c| c.destroy();
+        return found;
+    }
+
+    /// Return `conn` to the idle pool, evicting the oldest same-origin
+    /// entry if `max_idle_per_host` would be exceeded and the oldest entry
+    /// overall if `max_idle_total` would be exceeded (both closed after the
+    /// lock is released). Fails closed under allocation pressure: if the
+    /// pool's own bookkeeping cannot grow, `conn` is simply closed instead
+    /// of pooled — a missed reuse opportunity, never a leak or a
+    /// correctness problem (mirrors `ramcache.put`'s silent-no-op-on-OOM
+    /// shape).
+    fn release(p: *Pool, conn: *Conn, now_ms: i64) void {
+        var evict_buf: [2]*Conn = undefined;
+        var evict_n: usize = 0;
+        var kept = true;
+        {
+            lockSpin(&p.mutex);
+            defer p.mutex.unlock();
+
+            var per_host: usize = 0;
+            var oldest_host_idx: ?usize = null;
+            var oldest_host_ms: i64 = std.math.maxInt(i64);
+            for (p.idle.items, 0..) |it, idx| {
+                if (!it.conn.origin.eql(conn.origin.scheme, conn.origin.host(), conn.origin.port)) continue;
+                per_host += 1;
+                if (it.idle_since_ms < oldest_host_ms) {
+                    oldest_host_ms = it.idle_since_ms;
+                    oldest_host_idx = idx;
+                }
+            }
+            if (per_host >= p.options.max_idle_per_host) {
+                if (oldest_host_idx) |idx| {
+                    evict_buf[evict_n] = p.idle.orderedRemove(idx).conn;
+                    evict_n += 1;
+                }
+            }
+            if (p.idle.items.len >= p.options.max_idle_total) {
+                var oldest_idx: ?usize = null;
+                var oldest_ms: i64 = std.math.maxInt(i64);
+                for (p.idle.items, 0..) |it, idx| {
+                    if (it.idle_since_ms < oldest_ms) {
+                        oldest_ms = it.idle_since_ms;
+                        oldest_idx = idx;
+                    }
+                }
+                if (oldest_idx) |idx| {
+                    evict_buf[evict_n] = p.idle.orderedRemove(idx).conn;
+                    evict_n += 1;
+                }
+            }
+            p.idle.append(p.gpa, .{ .conn = conn, .idle_since_ms = now_ms }) catch {
+                kept = false;
+            };
+        }
+        for (evict_buf[0..evict_n]) |c| c.destroy();
+        if (!kept) conn.destroy();
+    }
+
+    /// Reap every idle connection older than `idle_timeout_ms` right now
+    /// (closed after the lock is released). `acquire` also reaps
+    /// opportunistically, but only entries it happens to scan past —
+    /// `sweep` is the thorough, explicit version for a caller-driven
+    /// housekeeping tick (see `Client.poolSweep`).
+    fn sweep(p: *Pool, now_ms: i64) void {
+        var reap_buf: [max_reap_batch]*Conn = undefined;
+        var reap_n: usize = 0;
+        {
+            lockSpin(&p.mutex);
+            defer p.mutex.unlock();
+            var i: usize = 0;
+            while (i < p.idle.items.len) {
+                if (now_ms -| p.idle.items[i].idle_since_ms > p.options.idle_timeout_ms and reap_n < max_reap_batch) {
+                    reap_buf[reap_n] = p.idle.swapRemove(i).conn;
+                    reap_n += 1;
+                    continue;
+                }
+                i += 1;
+            }
+        }
+        for (reap_buf[0..reap_n]) |c| c.destroy();
+    }
+};
+
+/// Spin until `m` is acquired (this repo's era of `std` has no
+/// `std.Thread.Mutex`; see the `Pool` doc comment).
+fn lockSpin(m: *std.atomic.Mutex) void {
+    while (!m.tryLock()) std.atomic.spinLoopHint();
+}
+
+/// Acquire a connection to `url`'s origin: a warm pooled one when pooling is
+/// enabled and one is idle for that exact `(scheme, host, port)`, else a
+/// freshly dialed one. `reused.*` reports which — callers use it to decide
+/// whether a subsequent write/read failure is eligible for the transparent
+/// one-shot retry (see `request`'s doc comment on that retry's safety
+/// boundary).
+fn acquireConn(c: *Client, url: http.Url, reused: *bool) Error!*Conn {
+    if (c.options.pool.enabled) {
+        if (c.pool.acquire(url.scheme, url.host, url.port, c.nowMs())) |conn| {
+            reused.* = true;
+            return conn;
+        }
+    }
+    reused.* = false;
+    return c.dialConn(url);
+}
+
+/// Write the request head + optional in-memory body, flush, and read back
+/// the response head — one full h1 exchange on an already-acquired `conn`.
+/// Factored out of `request`'s hop loop so the stale-pooled-connection retry
+/// there can attempt it twice against two different connections without
+/// duplicating the write/flush/read sequence.
+fn sendAndReadHead(
+    c: *Client,
+    conn: *Conn,
+    method: http.Method,
+    url: http.Url,
+    headers: []const http.Header,
+    plan: BodyPlan,
+    body: ?[]const u8,
+    strip_sensitive: bool,
+) Error!h1.ResponseHead {
+    try writeRequestHead(conn.plainWriter(), method, url, headers, c.options.user_agent, plan, strip_sensitive, !c.options.pool.enabled);
+    if (body) |b| conn.plainWriter().writeAll(b) catch return error.WriteFailed;
+    try conn.flushAll();
+    return readResponseHead(conn);
+}
+
+/// The narrow set of failures that mean *this* connection was already dead
+/// before the exchange even produced a usable response — never bytes a live
+/// peer actually sent back. See `request`'s retry-site doc comment for the
+/// full reasoning. All three are purely transport-level and can only occur
+/// while `sendAndReadHead` is still writing the request or waiting for the
+/// response head:
+///   * `error.WriteFailed` — the write/flush itself bounced off an
+///     already-dead socket (e.g. `ECONNRESET`/`EPIPE` from a peer that
+///     already tore the connection down).
+///   * `error.ConnectionClosed` — the peer's FIN arrived with zero response
+///     bytes behind it (a clean idle-timeout close raced our checkout).
+///   * `error.ReadFailed` — the response-head read syscall itself failed
+///     (most commonly `ECONNRESET`: on a fast loopback the peer's reset can
+///     arrive *after* our write already succeeded locally, so the failure
+///     surfaces on the read instead of the write — same dead-connection
+///     cause, just discovered one step later).
+/// `error.HeadTooLarge`/`MalformedResponse`/`UnsupportedHttpVersion` are
+/// deliberately NOT included: those mean the peer *did* send real response
+/// bytes back (just broken/oversized ones) — a live peer misbehaving, not a
+/// stale connection, and redialing would not fix it.
+fn isStaleConnError(err: anyerror) bool {
+    return switch (err) {
+        error.WriteFailed, error.ConnectionClosed, error.ReadFailed => true,
+        else => false,
+    };
+}
+
+/// Milliseconds on the `awake` (monotonic) clock — the pool's only time
+/// source. Never called by `Pool` itself (it takes `now_ms` as a plain
+/// parameter, per this repo's no-hidden-clock rule), only by `Client` at the
+/// call sites that hand the pool its clock.
+fn nowMs(c: *Client) i64 {
+    const ts = std.Io.Clock.Timestamp.now(c.io, .awake);
+    return @intCast(@divTrunc(ts.raw.nanoseconds, std.time.ns_per_ms));
+}
+
+fn dialConn(c: *Client, url: http.Url) Error!*Conn {
     const o = &c.options;
     const io = c.io;
     const tls_needed = url.scheme == .https;
@@ -602,6 +1017,7 @@ fn openConn(c: *Client, url: http.Url) Error!*Conn {
 
     const stream = try c.connectStream(url);
     errdefer stream.close(io);
+    _ = c.dial_count.fetchAdd(1, .monotonic);
 
     conn.* = .{
         .client = c,
@@ -613,7 +1029,10 @@ fn openConn(c: *Client, url: http.Url) Error!*Conn {
         .head_buf = head_buf,
         .body_buf = body_buf,
         .body = .unset,
+        .origin = undefined,
+        .keep_alive_eligible = false,
     };
+    conn.origin.set(url.scheme, url.port, url.host);
     // The stream reader/writer (and the TLS client pointing at them) must be
     // initialized at the connection's final heap address.
     conn.sr = stream.reader(io, sock_r);
@@ -744,7 +1163,9 @@ fn crossOrigin(a: http.Url, b: http.Url) bool {
 }
 
 /// Emit a full request head. Pure writer logic so tests can assert exact
-/// bytes. Managed headers: `Connection: close` always; `Content-Length` /
+/// bytes. Managed headers: `Connection: close` when `send_close` (else
+/// omitted — HTTP/1.1 defaults to persistent, which is what makes the
+/// connection eligible for the pool afterwards); `Content-Length` /
 /// `Transfer-Encoding` from `plan`; `Host`, `User-Agent`, `Accept-Encoding`
 /// defaulted unless the caller supplies them; `Authorization` and `Cookie`
 /// both dropped when `strip_sensitive` (cross-origin redirect — see
@@ -758,6 +1179,7 @@ fn writeRequestHead(
     user_agent: []const u8,
     plan: BodyPlan,
     strip_sensitive: bool,
+    send_close: bool,
 ) error{WriteFailed}!void {
     var custom_host: ?[]const u8 = null;
     var custom_ua = false;
@@ -768,7 +1190,7 @@ fn writeRequestHead(
         if (std.ascii.eqlIgnoreCase(hd.name, "accept-encoding")) custom_ae = true;
     }
 
-    writeHead(w, method, url, headers, user_agent, plan, strip_sensitive, custom_host, custom_ua, custom_ae) catch
+    writeHead(w, method, url, headers, user_agent, plan, strip_sensitive, send_close, custom_host, custom_ua, custom_ae) catch
         return error.WriteFailed;
 }
 
@@ -780,6 +1202,7 @@ fn writeHead(
     user_agent: []const u8,
     plan: BodyPlan,
     strip_sensitive: bool,
+    send_close: bool,
     custom_host: ?[]const u8,
     custom_ua: bool,
     custom_ae: bool,
@@ -806,7 +1229,7 @@ fn writeHead(
 
     if (!custom_ua) try w.print("User-Agent: {s}\r\n", .{user_agent});
     if (!custom_ae) try w.writeAll("Accept-Encoding: identity\r\n");
-    try w.writeAll("Connection: close\r\n");
+    if (send_close) try w.writeAll("Connection: close\r\n");
     switch (plan) {
         .none => {},
         .content_length => |n| try w.print("Content-Length: {d}\r\n", .{n}),
@@ -833,7 +1256,10 @@ fn readResponseHead(conn: *Conn) Error!h1.ResponseHead {
     }
 }
 
-/// Select the body framing per RFC 7230 §3.3.3 (client side).
+/// Select the body framing per RFC 7230 §3.3.3 (client side), and latch
+/// whether this exchange leaves the connection eligible for the pool
+/// (`conn.keep_alive_eligible`) — still gated on `isBodyDrained` once the
+/// caller has actually read the body (or not) before it decides.
 fn setupBody(conn: *Conn, method: http.Method, head: h1.ResponseHead) void {
     if (method == .head or head.status == 204 or head.status == 304) {
         conn.body = .{ .none = .fixed("") };
@@ -844,6 +1270,37 @@ fn setupBody(conn: *Conn, method: http.Method, head: h1.ResponseHead) void {
     } else {
         conn.body = .until_close; // read to connection close
     }
+    conn.keep_alive_eligible = keepAliveEligible(head) and conn.body != .until_close;
+}
+
+/// Header-level poolability (RFC 7230 §6.3 client side): never on an
+/// explicit `Connection: close`, never on a `101` (the connection's
+/// semantics changed entirely — e.g. WebSocket upgrade — so h1 request/
+/// response framing no longer applies), never on an HTTP/1.0 response
+/// unless it opted into `keep-alive` (1.0 defaults to closing). Body-length
+/// framing (`until_close` can never be pooled — see the caller) is handled
+/// separately since it depends on the body union, not just the head.
+fn keepAliveEligible(head: h1.ResponseHead) bool {
+    if (head.status == 101) return false;
+    if (head.connection_close) return false;
+    if (head.http1_0 and !head.connection_keep_alive) return false;
+    return true;
+}
+
+/// Whether `conn`'s response body was read to completion with no framing
+/// error — the other half (with `Conn.keep_alive_eligible`) of "may this
+/// connection go back to the pool". A caller that `deinit`s a `Response`
+/// without reading the whole body (or that hit a body read error) leaves
+/// the connection in an indeterminate wire state, so it is closed instead,
+/// never pooled — silently draining the rest for them here would be
+/// surprise I/O in a `deinit` call, so this module does not attempt it.
+fn isBodyDrained(conn: *const Conn) bool {
+    return switch (conn.body) {
+        .none => true,
+        .limited => |r| r.remaining == 0 and !r.truncated,
+        .chunked => |r| r.state == .done and r.fail_reason == null,
+        .until_close, .unset => false,
+    };
 }
 
 // ── tests (offline) ─────────────────────────────────────────────────────────
@@ -854,7 +1311,7 @@ test "writeRequestHead: defaults" {
     var buf: [512]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     const url = try http.Url.parse("http://example.com/x/y?q=1");
-    try writeRequestHead(&w, .get, url, &.{}, "test-agent/1.0", .none, false);
+    try writeRequestHead(&w, .get, url, &.{}, "test-agent/1.0", .none, false, true);
     try testing.expectEqualStrings(
         "GET /x/y?q=1 HTTP/1.1\r\n" ++
             "Host: example.com\r\n" ++
@@ -875,7 +1332,7 @@ test "writeRequestHead: body plans, custom + managed headers" {
         .{ .name = "X-Extra", .value = "1" },
         .{ .name = "Connection", .value = "keep-alive" }, // managed → ignored
         .{ .name = "Content-Length", .value = "999" }, // managed → ignored
-    }, "default-agent", .{ .content_length = 11 }, false);
+    }, "default-agent", .{ .content_length = 11 }, false, true);
     try testing.expectEqualStrings(
         "POST /upload HTTP/1.1\r\n" ++
             "Host: [2001:db8::1]:8443\r\n" ++
@@ -889,7 +1346,7 @@ test "writeRequestHead: body plans, custom + managed headers" {
     );
 
     w = .fixed(&buf);
-    try writeRequestHead(&w, .put, url, &.{}, "a", .chunked, false);
+    try writeRequestHead(&w, .put, url, &.{}, "a", .chunked, false, true);
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "Transfer-Encoding: chunked\r\n") != null);
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "Content-Length") == null);
 }
@@ -900,11 +1357,11 @@ test "writeRequestHead: Authorization stripped on cross-host redirect" {
     const hdrs = [_]http.Header{.{ .name = "Authorization", .value = "Bearer secret" }};
 
     var w: std.Io.Writer = .fixed(&buf);
-    try writeRequestHead(&w, .get, url, &hdrs, "a", .none, false);
+    try writeRequestHead(&w, .get, url, &hdrs, "a", .none, false, true);
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "Authorization: Bearer secret") != null);
 
     w = .fixed(&buf);
-    try writeRequestHead(&w, .get, url, &hdrs, "a", .none, true);
+    try writeRequestHead(&w, .get, url, &hdrs, "a", .none, true, true);
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "Authorization") == null);
 }
 
@@ -936,14 +1393,14 @@ test "writeRequestHead: Authorization and Cookie both stripped on cross-origin r
 
     // Same-origin hop: both credential headers are forwarded.
     var w: std.Io.Writer = .fixed(&buf);
-    try writeRequestHead(&w, .get, url, &hdrs, "a", .none, false);
+    try writeRequestHead(&w, .get, url, &hdrs, "a", .none, false, true);
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "Authorization: Bearer secret") != null);
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "Cookie: session=abc123") != null);
 
     // Cross-origin hop: both are dropped (session-cookie / API-key leak
     // otherwise — Cookie is just as sensitive as Authorization here).
     w = .fixed(&buf);
-    try writeRequestHead(&w, .get, url, &hdrs, "a", .none, true);
+    try writeRequestHead(&w, .get, url, &hdrs, "a", .none, true, true);
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "Authorization") == null);
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "Cookie") == null);
 }
@@ -963,7 +1420,7 @@ test "request(): same-host scheme downgrade and same-host port change both strip
     const downgraded = try http.Url.parse("http://api.example/v1");
     try testing.expect(crossOrigin(original, downgraded));
     var w: std.Io.Writer = .fixed(&buf);
-    try writeRequestHead(&w, .get, downgraded, &hdrs, "a", .none, crossOrigin(original, downgraded));
+    try writeRequestHead(&w, .get, downgraded, &hdrs, "a", .none, crossOrigin(original, downgraded), true);
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "Authorization") == null);
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "Cookie") == null);
 
@@ -971,7 +1428,7 @@ test "request(): same-host scheme downgrade and same-host port change both strip
     const reported = try http.Url.parse("https://api.example:8443/v1");
     try testing.expect(crossOrigin(original, reported));
     w = .fixed(&buf);
-    try writeRequestHead(&w, .get, reported, &hdrs, "a", .none, crossOrigin(original, reported));
+    try writeRequestHead(&w, .get, reported, &hdrs, "a", .none, crossOrigin(original, reported), true);
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "Authorization") == null);
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "Cookie") == null);
 
@@ -979,7 +1436,7 @@ test "request(): same-host scheme downgrade and same-host port change both strip
     const same_origin = try http.Url.parse("https://api.example/v2");
     try testing.expect(!crossOrigin(original, same_origin));
     w = .fixed(&buf);
-    try writeRequestHead(&w, .get, same_origin, &hdrs, "a", .none, crossOrigin(original, same_origin));
+    try writeRequestHead(&w, .get, same_origin, &hdrs, "a", .none, crossOrigin(original, same_origin), true);
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "Authorization: Bearer secret") != null);
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "Cookie: session=abc123") != null);
 }
@@ -1401,4 +1858,427 @@ test "live: redirect follow (http → https)" {
     };
     defer res.deinit();
     try testing.expect(res.status >= 200 and res.status < 400);
+}
+
+// ── tests (connection pool: loopback + white-box) ────────────────────────────
+
+/// GET → "ok"; POST → echoes the body. Used by every pool loopback test
+/// below (a real `http.Server`, unmodified — it already supports h1
+/// keep-alive, which is exactly what these tests exercise from the client
+/// side).
+fn poolTestHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+    if (req.method == .post) {
+        var buf: [256]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        _ = try req.reader().streamRemaining(&w);
+        try rw.writeAll(w.buffered());
+        return;
+    }
+    try rw.writeAll("ok");
+}
+
+fn poolTestServeWrap(s: *Server) void {
+    s.serve() catch {};
+}
+
+/// Read the whole body to completion, then `deinit` — a `Response` is only
+/// pool-eligible once its body has actually been drained (see
+/// `isBodyDrained`); these loopback tests care about *pooling*, not body
+/// content, so they always fully drain before releasing.
+fn drainAndDeinit(res: *Response) void {
+    var sink: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&sink);
+    _ = res.reader().streamRemaining(&w) catch {};
+    res.deinit();
+}
+
+/// Bind a loopback `poolTestHandler` server (`max_requests_per_conn` 0 =
+/// `Server`'s own effectively-unlimited default for these short tests).
+/// Caller must spawn `poolTestServeWrap` on it and `defer server.shutdown()`
+/// / `defer server.deinit()` / `defer testing.allocator.destroy(server)`,
+/// same shape as the existing h2c-dogfood / proxy-integration loopback
+/// helpers in this module.
+fn poolTestLoopback(io: std.Io, max_requests_per_conn: u32) !*Server {
+    const server = try testing.allocator.create(Server);
+    errdefer testing.allocator.destroy(server);
+    server.* = Server.init(io, testing.allocator, .{
+        .handler = poolTestHandler,
+        .max_requests_per_conn = if (max_requests_per_conn == 0) 1000 else max_requests_per_conn,
+    });
+    server.bind() catch |err| {
+        server.deinit();
+        testing.allocator.destroy(server);
+        std.debug.print("pool test loopback bind failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    return server;
+}
+
+test "pool: two sequential requests to the same origin reuse one connection" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const server = try poolTestLoopback(io, 0);
+    defer testing.allocator.destroy(server);
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, poolTestServeWrap, .{server});
+    defer thread.join();
+    defer server.shutdown();
+    const port = server.boundAddress().getPort();
+
+    var client = Client.init(io, testing.allocator, .{});
+    defer client.deinit();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    var res1 = try client.request(.get, url, .{});
+    drainAndDeinit(&res1);
+    try testing.expectEqual(@as(usize, 1), client.dialCount());
+    try testing.expectEqual(@as(usize, 1), client.poolIdleCount());
+
+    // Second request to the exact same origin: no re-dial — proof the pool
+    // handed back the warm connection instead of opening a new one.
+    var res2 = try client.request(.get, url, .{});
+    drainAndDeinit(&res2);
+    try testing.expectEqual(@as(usize, 1), client.dialCount());
+    try testing.expectEqual(@as(usize, 1), client.poolIdleCount());
+}
+
+test "pool: requestStreaming also reuses pooled connections" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const server = try poolTestLoopback(io, 0);
+    defer testing.allocator.destroy(server);
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, poolTestServeWrap, .{server});
+    defer thread.join();
+    defer server.shutdown();
+    const port = server.boundAddress().getPort();
+
+    var client = Client.init(io, testing.allocator, .{});
+    defer client.deinit();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    {
+        var up = try client.requestStreaming(.post, url, .{}, 5);
+        try up.writer().writeAll("hello");
+        var res = try up.finish();
+        defer res.deinit();
+        try testing.expectEqual(@as(u16, 200), res.status);
+        const body = try res.readAllAlloc(testing.allocator, 64);
+        defer testing.allocator.free(body);
+        try testing.expectEqualStrings("hello", body);
+    }
+    try testing.expectEqual(@as(usize, 1), client.dialCount());
+
+    {
+        var up = try client.requestStreaming(.post, url, .{}, 5);
+        try up.writer().writeAll("world");
+        var res = try up.finish();
+        defer res.deinit();
+        const body = try res.readAllAlloc(testing.allocator, 64);
+        defer testing.allocator.free(body);
+        try testing.expectEqualStrings("world", body);
+    }
+    try testing.expectEqual(@as(usize, 1), client.dialCount()); // reused, no re-dial
+}
+
+test "pool: distinct origins do not cross-pollinate" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const server_a = try poolTestLoopback(io, 0);
+    defer testing.allocator.destroy(server_a);
+    defer server_a.deinit();
+    const thread_a = try std.Thread.spawn(.{}, poolTestServeWrap, .{server_a});
+    defer thread_a.join();
+    defer server_a.shutdown();
+    const port_a = server_a.boundAddress().getPort();
+
+    const server_b = try poolTestLoopback(io, 0);
+    defer testing.allocator.destroy(server_b);
+    defer server_b.deinit();
+    const thread_b = try std.Thread.spawn(.{}, poolTestServeWrap, .{server_b});
+    defer thread_b.join();
+    defer server_b.shutdown();
+    const port_b = server_b.boundAddress().getPort();
+
+    var client = Client.init(io, testing.allocator, .{});
+    defer client.deinit();
+    var buf_a: [64]u8 = undefined;
+    var buf_b: [64]u8 = undefined;
+    const url_a = try std.fmt.bufPrint(&buf_a, "http://127.0.0.1:{d}/", .{port_a});
+    const url_b = try std.fmt.bufPrint(&buf_b, "http://127.0.0.1:{d}/", .{port_b});
+
+    var r1 = try client.request(.get, url_a, .{});
+    drainAndDeinit(&r1);
+    try testing.expectEqual(@as(usize, 1), client.dialCount());
+
+    var r2 = try client.request(.get, url_b, .{});
+    drainAndDeinit(&r2);
+    try testing.expectEqual(@as(usize, 2), client.dialCount());
+    try testing.expectEqual(@as(usize, 2), client.poolIdleCount());
+
+    // Re-requesting either origin reuses its own warm connection — no
+    // re-dial, and never the other origin's connection.
+    var r3 = try client.request(.get, url_a, .{});
+    drainAndDeinit(&r3);
+    try testing.expectEqual(@as(usize, 2), client.dialCount());
+    var r4 = try client.request(.get, url_b, .{});
+    drainAndDeinit(&r4);
+    try testing.expectEqual(@as(usize, 2), client.dialCount());
+}
+
+test "pool: a Connection: close response is not pooled" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // `max_requests_per_conn = 1` is an existing, unmodified `Server`
+    // feature: it makes the server send `Connection: close` on the very
+    // first response and end the connection — exactly the "server declined
+    // to keep this alive" case the pool must respect.
+    const server = try poolTestLoopback(io, 1);
+    defer testing.allocator.destroy(server);
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, poolTestServeWrap, .{server});
+    defer thread.join();
+    defer server.shutdown();
+    const port = server.boundAddress().getPort();
+
+    var client = Client.init(io, testing.allocator, .{});
+    defer client.deinit();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    var res1 = try client.request(.get, url, .{});
+    try testing.expect(res1.head.connection_close);
+    res1.deinit();
+    try testing.expectEqual(@as(usize, 1), client.dialCount());
+    try testing.expectEqual(@as(usize, 0), client.poolIdleCount()); // NOT pooled
+
+    // A second request to the same origin has nothing to reuse — it must
+    // dial again.
+    var res2 = try client.request(.get, url, .{});
+    res2.deinit();
+    try testing.expectEqual(@as(usize, 2), client.dialCount());
+}
+
+/// One canned HTTP/1.1 200 response (Content-Length framed, no explicit
+/// `Connection: close` — keep-alive-eligible per the client's own framing
+/// rules), served over a raw accepted `net.Stream` and then hung up on —
+/// exactly a peer that idle-timed-out a connection it had otherwise agreed
+/// to keep alive. Used by the stale-connection-retry test below: a real
+/// `http.Server` cannot be made to behave this uncooperatively (it always
+/// advertises `Connection: close` before ending a connection), so this
+/// fakes the origin at the raw-socket level instead, the same plumbing
+/// (`net.Stream.reader`/`.writer`, `h1.readHead`) `Client`/`Server` both
+/// build on.
+fn staleConnOrigin(io: std.Io, listener: *net.Server, hung_up: *std.atomic.Value(bool)) void {
+    const s1 = listener.accept(io) catch return;
+    {
+        var rbuf: [1024]u8 = undefined;
+        var wbuf: [1024]u8 = undefined;
+        var sr = s1.reader(io, &rbuf);
+        var sw = s1.writer(io, &wbuf);
+        var head_buf: [1024]u8 = undefined;
+        _ = h1.readHead(&sr.interface, &head_buf) catch {};
+        sw.interface.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok") catch {};
+        sw.interface.flush() catch {};
+    }
+    s1.close(io); // hang up — the client has no idea yet, it is not reading right now
+    hung_up.store(true, .release);
+
+    // The client's redial after it notices the first connection went stale.
+    const s2 = listener.accept(io) catch return;
+    var rbuf: [1024]u8 = undefined;
+    var wbuf: [1024]u8 = undefined;
+    var sr = s2.reader(io, &rbuf);
+    var sw = s2.writer(io, &wbuf);
+    var head_buf: [1024]u8 = undefined;
+    _ = h1.readHead(&sr.interface, &head_buf) catch {};
+    sw.interface.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok") catch {};
+    sw.interface.flush() catch {};
+    s2.close(io);
+}
+
+test "pool: a stale reused connection (peer already closed it) is retried once transparently" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| {
+        std.debug.print("stale-conn test listen failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var hung_up = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, staleConnOrigin, .{ io, &listener, &hung_up });
+    defer thread.join();
+
+    var client = Client.init(io, testing.allocator, .{});
+    defer client.deinit();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    var res1 = try client.request(.get, url, .{});
+    drainAndDeinit(&res1);
+    try testing.expectEqual(@as(usize, 1), client.dialCount());
+    try testing.expectEqual(@as(usize, 1), client.poolIdleCount());
+
+    // Wait until the origin has actually hung up on connection #1 — avoids
+    // a timing race against the assertions below (the pool doesn't need to
+    // be told; it still believes the connection is good, exactly the
+    // scenario the retry exists for).
+    while (!hung_up.load(.acquire)) std.atomic.spinLoopHint();
+
+    // The pool hands back the now-dead connection; the write and/or
+    // response-head read against it fails in a way `isStaleConnError`
+    // recognizes, and `request` transparently redials and resends against
+    // the origin's second accepted connection — the caller never sees an
+    // error.
+    var res2 = try client.request(.get, url, .{});
+    defer res2.deinit();
+    try testing.expectEqual(@as(u16, 200), res2.status);
+    const body = try res2.readAllAlloc(testing.allocator, 64);
+    defer testing.allocator.free(body);
+    try testing.expectEqualStrings("ok", body);
+    try testing.expectEqual(@as(usize, 2), client.dialCount()); // original dial + the retry's redial
+}
+
+test "pool: max_idle_per_host and max_idle_total cap eviction (oldest first)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // A bare listener is enough: `dialConn` only needs the TCP handshake to
+    // complete, which the kernel does from its accept backlog even before
+    // `accept()` is ever called — no need for a serving loop at all for
+    // this bookkeeping-only test.
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| {
+        std.debug.print("pool cap test listen failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+    var url_buf: [64]u8 = undefined;
+    const url = try http.Url.parse(try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port}));
+
+    // Per-host cap: releasing a 3rd idle connection for the same origin
+    // evicts the oldest (lowest `idle_since_ms`) of the first two.
+    {
+        var client = Client.init(io, testing.allocator, .{ .pool = .{ .max_idle_per_host = 2, .max_idle_total = 100 } });
+        defer client.deinit();
+        const c0 = try client.dialConn(url);
+        const c1 = try client.dialConn(url);
+        const c2 = try client.dialConn(url);
+        client.pool.release(c0, 100);
+        client.pool.release(c1, 200);
+        try testing.expectEqual(@as(usize, 2), client.poolIdleCount());
+        client.pool.release(c2, 300); // 3rd for this origin, cap = 2
+        try testing.expectEqual(@as(usize, 2), client.poolIdleCount());
+    }
+
+    // Total cap: same shape, but the cap that binds is the pool-wide one.
+    {
+        var client = Client.init(io, testing.allocator, .{ .pool = .{ .max_idle_per_host = 100, .max_idle_total = 2 } });
+        defer client.deinit();
+        const c0 = try client.dialConn(url);
+        const c1 = try client.dialConn(url);
+        const c2 = try client.dialConn(url);
+        client.pool.release(c0, 100);
+        client.pool.release(c1, 200);
+        try testing.expectEqual(@as(usize, 2), client.poolIdleCount());
+        client.pool.release(c2, 300);
+        try testing.expectEqual(@as(usize, 2), client.poolIdleCount());
+    }
+}
+
+test "pool: idle_timeout_ms reaping via sweep" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| {
+        std.debug.print("pool sweep test listen failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+    var url_buf: [64]u8 = undefined;
+    const url = try http.Url.parse(try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port}));
+
+    var client = Client.init(io, testing.allocator, .{ .pool = .{ .idle_timeout_ms = 100 } });
+    defer client.deinit();
+
+    const conn = try client.dialConn(url);
+    client.pool.release(conn, 0); // idle_since_ms = 0
+    try testing.expectEqual(@as(usize, 1), client.poolIdleCount());
+
+    client.pool.sweep(50); // age 50ms <= 100ms: not stale yet
+    try testing.expectEqual(@as(usize, 1), client.poolIdleCount());
+
+    client.pool.sweep(150); // age 150ms > 100ms: reaped
+    try testing.expectEqual(@as(usize, 0), client.poolIdleCount());
+}
+
+test "pool: concurrent acquire/release from many threads is leak-free and race-free" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| {
+        std.debug.print("pool concurrency test listen failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var client = Client.init(io, testing.allocator, .{ .pool = .{ .max_idle_per_host = 8, .max_idle_total = 8 } });
+    defer client.deinit();
+
+    var url_buf: [64]u8 = undefined;
+    const url = try http.Url.parse(try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port}));
+
+    const n_threads = 8;
+    const iters = 200;
+
+    const Worker = struct {
+        fn run(c: *Client, u: http.Url, tid: usize) void {
+            // Each thread only ever holds ONE connection object at a time —
+            // exclusively either checked out (this thread's local `conn`)
+            // or parked in the pool between `release` and the next
+            // `acquire` — so there is never a concurrent touch of the same
+            // `*Conn` from two threads; only the pool's own bookkeeping is
+            // contended, which is exactly what this test exercises.
+            var conn = c.dialConn(u) catch return;
+            var now: i64 = @intCast(tid * 1_000_000);
+            for (0..iters) |_| {
+                c.pool.release(conn, now);
+                now += 1;
+                conn = c.pool.acquire(u.scheme, u.host, u.port, now) orelse (c.dialConn(u) catch return);
+            }
+            conn.destroy();
+        }
+    };
+
+    var threads: [n_threads]std.Thread = undefined;
+    for (0..n_threads) |i| threads[i] = try std.Thread.spawn(.{}, Worker.run, .{ &client, url, i });
+    for (threads) |t| t.join();
+
+    // Whatever is left idle is freed by `client.deinit()` (deferred above);
+    // `testing.allocator` catches any leak or double-free across the whole
+    // run.
+    try testing.expect(client.poolIdleCount() <= 8);
 }

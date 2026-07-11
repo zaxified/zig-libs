@@ -50,23 +50,28 @@
 //!
 //! ## Known gaps (this pass)
 //!
-//! - **No client connection pooling.** Each forwarded request opens (and
-//!   closes) its own backend connection — `Client` is one-connection-per-
-//!   request by design (its own documented Phase-1 non-goal). A pooling
-//!   `Client` is the highest-value follow-up for gateway throughput.
 //! - **HTTP/1.1 backends only.** The forward path uses the h1 `Client`;
 //!   h2/h2c upstreaming is not wired here.
 //! - **No response buffer pool** — the `ResponseWriter`'s per-connection
 //!   buffer is reused across keep-alive requests but not shared across
 //!   connections.
 //!
+//! Backend connection pooling is **not** a gap: `Client` keeps a keyed idle
+//! `Pool` (on by default, `Client.Options.pool`) and every backend
+//! connection this handler opens through `Client.request`/
+//! `Client.requestStreaming` is checked out of and returned to that pool
+//! transparently — nothing here has to ask for it. Set
+//! `.pool.enabled = false` on the `Client` passed into `Config` to fall
+//! back to one-connection-per-forwarded-request (e.g. for a backend that
+//! cannot be trusted to frame keep-alive correctly).
+//!
 //! ## Thread-safety
 //!
 //! One `ProxyHandler` (and its `*Client`) is shared by all of the server's
-//! connection threads — safe: `forward` owns no mutable shared state and
-//! each `Client.request` opens its own connection and buffers. As always
-//! with a shared `Client`, the allocator must be thread-safe (the server
-//! already requires that for its per-connection slabs).
+//! connection threads — safe: `forward` owns no mutable shared state, and
+//! `Client`'s pool is internally synchronized (see `Client`'s module doc).
+//! As always with a shared `Client`, the allocator must be thread-safe (the
+//! server already requires that for its per-connection slabs).
 
 const std = @import("std");
 const http = @import("root.zig");
