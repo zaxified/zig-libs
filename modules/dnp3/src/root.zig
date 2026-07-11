@@ -21,14 +21,14 @@
 //!   status/block (g40/g41), time-and-date (g50), and class-data read
 //!   markers (g60).
 //!
-//! Scaffolded, NOT implemented (`sa`): DNP3 Secure Authentication (IEEE
-//! 1815 Annex / IEC 62351-5), object group 120 — challenge, reply,
-//! aggregate MAC, session-key status/change, error. Only the object
-//! *shapes* (enums + structs) exist, so a later Fable crypto pass has a
-//! stable place to slot in HMAC/AES-GMAC/session-key handling. Every
-//! encode/decode on those types is a deliberate `@panic("TODO(agent): ...")`
-//! — see `sa.zig`'s module doc comment. No HMAC, no AES-GMAC, no key wrap,
-//! no challenge/reply crypto anywhere in this module.
+//! - **Secure Authentication, SAv2 symmetric core** (`sa`, §7 / IEC 62351-5,
+//!   object group 120): AES Key Wrap (RFC 3394), the SA MAC-algorithm
+//!   registry (HMAC-SHA-1/SHA-256 truncated, AES-GMAC), the g120 v1/v2/v3/v4/
+//!   v5/v6/v7/v9 message codecs, the challenge-response MAC-input construction,
+//!   and session-key wrap/unwrap + CSQ/KSQ/expiry state helpers. The SAv5/SAv6
+//!   asymmetric update-key change (g120 v8/v10–v15: RSA/DSA + certificates) is
+//!   out of scope — see `sa.zig`'s module doc comment for exactly what is
+//!   implemented and validated against what.
 //!
 //! Both master (build request / parse response) and outstation (parse
 //! request / build response) roles are supported symmetrically: every

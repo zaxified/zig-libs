@@ -44,11 +44,14 @@ requests and *parses* responses, an outstation *parses* requests and
 type in this base pass (no confirm/retry timers, no unsolicited-response
 state machine).
 
-**Scaffolded, not implemented — `sa` (Secure Authentication, g120):** only
-the object *shapes* (challenge, reply, aggregate MAC, session-key
-status/change, error) exist as types, for a later Fable crypto pass to slot
-into. Every `encode`/`decode` on those types `@panic`s on purpose — see
-`sa.zig`'s doc comment and SPEC.md.
+**Secure Authentication — `sa` (SAv2 symmetric core, g120):** AES Key Wrap
+(RFC 3394, byte-exact against the published vectors), the SA MAC-algorithm
+registry (HMAC-SHA-1/SHA-256 truncated, AES-GMAC, constant-time verify), the
+g120 v1/v2/v3/v4/v5/v6/v7/v9 message codecs, the challenge-response MAC-input
+construction, and session-key wrap/unwrap + CSQ/KSQ/expiry state helpers. The
+SAv5/SAv6 asymmetric update-key change (g120 v8/v10–v15: RSA/DSA +
+certificates) is out of scope — see `sa.zig`'s doc comment and SPEC.md for
+exactly what is implemented and validated against what.
 
 Out of scope for this pass: event object variations (g2/g11/g22/g32/g42
 etc.), file transfer, data sets, unsolicited-response confirmation/retry

@@ -341,9 +341,19 @@ project git history).
                consulted or copied): opendnp3 (Apache-2.0; object-group field
                shapes, function-code/status-enum values) and public DNP3
                primers (Triangle MicroWorks and others). Secure Authentication
-               (object group 120, IEEE 1815 Annex / IEC 62351-5) is scaffolded
-               only — types/enums, no crypto — pending a later Fable pass; see
-               the module's SPEC.md.
+               (object group 120, IEEE 1815-2012 §7 / IEC 62351-5), SAv2
+               symmetric core, is implemented: AES Key Wrap (byte-exact against
+               RFC 3394 §4 test vectors), the SA MAC-algorithm registry
+               (HMAC-SHA-1/SHA-256 truncated, AES-GMAC), and the g120 message
+               codecs + challenge-response flow. The g120 variation numbers,
+               field layouts, and MAC-algorithm / key-wrap / key-status enum
+               values were cross-checked against the Wireshark DNP3 dissector
+               (epan/dissectors/packet-dnp.c, GPL-2.0) — read as a wire-format
+               reference for the DNP3-SA object/variation numbers and field
+               layouts, which are facts of the IEEE 1815 wire format; no code
+               was copied or adapted. The
+               SAv5/SAv6 asymmetric update-key change (g120 v8/v10–v15, RSA/DSA
+               + certificates) remains out of scope; see the module's SPEC.md.
 
   l2disco    — clean-room from IEEE 802.1AB (LLDP) + the IEEE 802.1/802.3
                org-TLV definitions, RFC 826 (ARP), and RFC 2131/2132 (DHCP);
