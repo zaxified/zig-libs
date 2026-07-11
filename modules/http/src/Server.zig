@@ -20,6 +20,20 @@
 //! shares state. Concurrency *limiting* is deliberately out of scope (the
 //! later `throttle` module); the kernel backlog is the only cap.
 //!
+//! Multicore accept engine (opt-in, `Options.accept_threads` > 1): bind N
+//! listener sockets on the same address — each with SO_REUSEPORT
+//! (`reuse_address`, forced on in this mode) — and run N independent accept
+//! loops, each on its own OS thread pinned to a distinct core (Linux
+//! `sched_setaffinity`; a best-effort no-op elsewhere). The kernel
+//! load-balances incoming connections across the listeners
+//! (nginx/glommio model), so there is zero cross-core accept contention and
+//! no thundering herd on one listen queue — the shape an API gateway wants.
+//! Each accept loop owns its own `Io.Group` (no shared-group contention);
+//! `shutdown` drains all N. `accept_threads == 1` (the default) is the
+//! classic single accept loop on the caller's thread, byte-for-byte
+//! unchanged. io_uring is deliberately not used: its net vtable is
+//! `Unavailable` in std 0.16.
+//!
 //! Timeout model (poll(2)-based; compile-time disabled where poll is
 //! unavailable): `read_timeout_ms` bounds every read *stall* (request head,
 //! body, keep-alive idle); `request_timeout_ms` is a whole-request read
@@ -84,8 +98,15 @@ const Server = @This();
 io: std.Io,
 gpa: std.mem.Allocator,
 options: Options,
+/// Listener #0 — bound in both modes; `boundAddress` reports its address.
 listener: ?net.Server,
-/// Tracks the per-connection tasks; awaited before `serve` returns.
+/// Additional SO_REUSEPORT listeners #1..N-1 for the multicore accept
+/// engine (`Options.accept_threads` > 1); empty in the single-listener
+/// default. Heap-owned, freed in `deinit`.
+aux_listeners: []net.Server,
+/// Tracks the per-connection tasks of the single-listener path; awaited
+/// before `serve` returns. In the multicore path each accept thread owns
+/// its own group instead.
 group: std.Io.Group,
 /// Connections currently admitted and being served (see
 /// `activeConnections`). Atomic: touched by the accept loop and every
@@ -218,6 +239,16 @@ pub const Options = struct {
     server_name: []const u8 = "zig-libs-http/0.1",
     kernel_backlog: u31 = 128,
     reuse_address: bool = false,
+    /// Multicore accept engine (SO_REUSEPORT thread-per-core). 1 (the
+    /// default) = the classic single accept loop on the caller's thread. N >
+    /// 1 = bind N listener sockets on the same address (each SO_REUSEPORT —
+    /// `reuse_address` is forced on) and run N independent accept loops, each
+    /// on its own OS thread pinned to a distinct core; the kernel
+    /// load-balances accepts across them. `serve` returns only after every
+    /// listener's accept loop has drained its connections. `shutdown` stops
+    /// all N. Pass `Server.cpuCount()` for one listener per core. 0 is
+    /// treated as 1. See the module-level "Multicore accept engine" note.
+    accept_threads: u32 = 1,
     /// Opt-in cleartext HTTP/2 (h2c via **prior knowledge**, RFC 9113
     /// §3.3 — RFC 9113 removed the `Upgrade: h2c` mechanism): when a
     /// connection opens with the HTTP/2 client preface it is served as
@@ -245,9 +276,17 @@ pub fn init(io: std.Io, gpa: std.mem.Allocator, options: Options) Server {
         .gpa = gpa,
         .options = options,
         .listener = null,
+        .aux_listeners = &.{},
         .group = .init,
         .active_conns = .init(0),
     };
+}
+
+/// One listener/accept-thread per online CPU — the usual argument for
+/// `Options.accept_threads` in the multicore engine. Falls back to 1 when
+/// the count is unavailable.
+pub fn cpuCount() u32 {
+    return @intCast(std.Thread.getCpuCount() catch 1);
 }
 
 /// Number of connections currently admitted and being served (accepted,
@@ -258,9 +297,11 @@ pub fn activeConnections(s: *const Server) usize {
     return s.active_conns.load(.monotonic);
 }
 
-/// Closes the listener if still open. Only call after `serve` returned.
+/// Closes every listener if still open. Only call after `serve` returned.
 pub fn deinit(s: *Server) void {
     if (s.listener) |*l| l.deinit(s.io);
+    for (s.aux_listeners) |*l| l.deinit(s.io);
+    if (s.aux_listeners.len != 0) s.gpa.free(s.aux_listeners);
     s.* = undefined;
 }
 
@@ -271,15 +312,42 @@ pub const BindError = error{ BadAddress, ListenFailed, Canceled };
 /// the port before serving; `listen` does both.
 pub fn bind(s: *Server) BindError!void {
     std.debug.assert(s.listener == null);
-    const addr = net.IpAddress.parse(s.options.addr, s.options.port) catch
+    const n = @max(1, s.options.accept_threads);
+    // The multicore engine needs SO_REUSEPORT on every listener; the kernel
+    // refuses a second bind on the same address otherwise.
+    const reuse = s.options.reuse_address or n > 1;
+
+    const addr0 = net.IpAddress.parse(s.options.addr, s.options.port) catch
         return error.BadAddress;
-    s.listener = addr.listen(s.io, .{
+    s.listener = addr0.listen(s.io, .{
         .kernel_backlog = s.options.kernel_backlog,
-        .reuse_address = s.options.reuse_address,
+        .reuse_address = reuse,
     }) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
         else => return error.ListenFailed,
     };
+    if (n == 1) return;
+
+    // Bind the remaining N-1 listeners on the *resolved* port: with port 0
+    // each listener would otherwise be handed a different ephemeral port and
+    // the SO_REUSEPORT group would never form.
+    const resolved_port = s.listener.?.socket.address.getPort();
+    const addr = net.IpAddress.parse(s.options.addr, resolved_port) catch
+        return error.BadAddress;
+    const aux = s.gpa.alloc(net.Server, n - 1) catch return error.ListenFailed;
+    errdefer s.gpa.free(aux);
+    var bound: usize = 0;
+    errdefer for (aux[0..bound]) |*l| l.deinit(s.io);
+    while (bound < aux.len) : (bound += 1) {
+        aux[bound] = addr.listen(s.io, .{
+            .kernel_backlog = s.options.kernel_backlog,
+            .reuse_address = true,
+        }) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => return error.ListenFailed,
+        };
+    }
+    s.aux_listeners = aux;
 }
 
 /// The address actually bound, with the resolved port — for ephemeral-port
@@ -292,10 +360,21 @@ pub const ServeError = error{ AcceptFailed, Canceled };
 
 /// Accept loop: dispatches connections until `shutdown` is called from
 /// another thread (or accepting fails fatally), then waits for all
-/// connection tasks to finish before returning. Call `bind` first.
+/// connection tasks to finish before returning. Call `bind` first. With
+/// `Options.accept_threads` > 1 this fans the accept work out across N
+/// core-pinned threads (see `serveMulti`).
 pub fn serve(s: *Server) ServeError!void {
-    defer s.group.await(s.io) catch {};
-    const listener = &s.listener.?;
+    if (s.aux_listeners.len == 0) {
+        defer s.group.await(s.io) catch {};
+        return s.acceptLoop(&s.listener.?, &s.group);
+    }
+    return s.serveMulti();
+}
+
+/// One accept loop over `listener`, dispatching each admitted connection as
+/// a concurrent task into `group`. Returns on `shutdown` (the listener
+/// stops listening) or a fatal accept error; the caller awaits `group`.
+fn acceptLoop(s: *Server, listener: *net.Server, group: *std.Io.Group) ServeError!void {
     while (true) {
         const stream = listener.accept(s.io) catch |err| switch (err) {
             error.SocketNotListening => return, // shutdown()
@@ -325,12 +404,84 @@ pub fn serve(s: *Server) ServeError!void {
             }
         }
         _ = s.active_conns.fetchAdd(1, .monotonic); // connMain decrements
-        s.group.concurrent(s.io, connMain, .{ s, stream }) catch {
+        group.concurrent(s.io, connMain, .{ s, stream }) catch {
             // No concurrency available: serve the connection inline rather
             // than drop it.
             connMain(s, stream);
         };
     }
+}
+
+/// Per-listener accept thread: pin to a core, run the accept loop, then
+/// drain this thread's connection tasks before it exits.
+const AcceptThread = struct {
+    s: *Server,
+    listener: *net.Server,
+    group: std.Io.Group = .init,
+    cpu: usize,
+    result: ServeError!void = {},
+
+    fn main(t: *AcceptThread) void {
+        pinToCpu(t.cpu);
+        defer t.group.await(t.s.io) catch {};
+        t.result = t.s.acceptLoop(t.listener, &t.group);
+    }
+};
+
+/// Multicore accept engine: one core-pinned OS thread per listener, each
+/// with its own accept loop and connection group. Joins them all (drains
+/// every connection) before returning; reports the first fatal accept error.
+fn serveMulti(s: *Server) ServeError!void {
+    const n = s.aux_listeners.len + 1;
+    const gpa = s.gpa;
+
+    const threads = gpa.alloc(AcceptThread, n) catch return error.AcceptFailed;
+    defer gpa.free(threads);
+    const handles = gpa.alloc(?std.Thread, n) catch return error.AcceptFailed;
+    defer gpa.free(handles);
+
+    for (threads, 0..) |*t, i| {
+        t.* = .{
+            .s = s,
+            .listener = if (i == 0) &s.listener.? else &s.aux_listeners[i - 1],
+            .cpu = i,
+        };
+    }
+
+    var spawn_failed = false;
+    for (threads, handles) |*t, *h| {
+        h.* = std.Thread.spawn(.{}, AcceptThread.main, .{t}) catch blk: {
+            spawn_failed = true;
+            break :blk null;
+        };
+    }
+    // A spawn failure leaves some loops running; stop them all so the join
+    // below cannot hang, then report the failure.
+    if (spawn_failed) s.shutdown();
+
+    var first_err: ?ServeError = null;
+    for (threads, handles) |*t, h| {
+        if (h) |handle| {
+            handle.join();
+            if (t.result) |_| {} else |e| first_err = first_err orelse e;
+        }
+    }
+    if (spawn_failed) return error.AcceptFailed;
+    if (first_err) |e| return e;
+}
+
+/// Best-effort core pinning (Linux `sched_setaffinity`; a no-op elsewhere).
+/// `cpu` is taken modulo the online CPU count so more listeners than cores
+/// still spread deterministically instead of failing.
+fn pinToCpu(cpu: usize) void {
+    if (builtin.os.tag != .linux) return;
+    const ncpu = std.Thread.getCpuCount() catch return;
+    if (ncpu == 0) return;
+    const target = cpu % ncpu;
+    var set = std.mem.zeroes(std.os.linux.cpu_set_t);
+    const bits = @bitSizeOf(usize);
+    set[target / bits] |= @as(usize, 1) << @intCast(target % bits);
+    std.os.linux.sched_setaffinity(0, &set) catch {};
 }
 
 /// Convenience: `bind` + `serve`.
@@ -339,12 +490,18 @@ pub fn listen(s: *Server) (BindError || ServeError)!void {
     try s.serve();
 }
 
-/// Stop accepting: wakes a blocked `serve`, which then drains connection
-/// threads and returns. Safe to call from another thread while `serve` runs.
+/// Stop accepting: wakes every blocked accept loop (all N listeners in the
+/// multicore engine), which then drain their connections and return. Safe to
+/// call from another thread while `serve` runs.
 pub fn shutdown(s: *Server) void {
-    const l = s.listener orelse return;
-    const stream: net.Stream = .{ .socket = l.socket };
-    stream.shutdown(s.io, .both) catch {};
+    if (s.listener) |l| {
+        const stream: net.Stream = .{ .socket = l.socket };
+        stream.shutdown(s.io, .both) catch {};
+    }
+    for (s.aux_listeners) |l| {
+        const stream: net.Stream = .{ .socket = l.socket };
+        stream.shutdown(s.io, .both) catch {};
+    }
 }
 
 fn sleepMs(io: std.Io, ms: u32) error{Canceled}!void {
@@ -2874,6 +3031,52 @@ test "integration: Phase-1 client drives the server over loopback" {
     }
 
     try testing.expectEqual(@as(u32, 3), hits.load(.monotonic));
+}
+
+test "integration: multicore accept engine (SO_REUSEPORT) serves across N listeners" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const n_listeners = 4;
+    var hits: Hits = .init(0);
+    var server = init(io, testing.allocator, .{
+        .handler = testHandler,
+        .context = &hits,
+        .accept_threads = n_listeners, // bind 4 SO_REUSEPORT listeners
+    });
+    defer server.deinit();
+    server.bind() catch |err| {
+        std.debug.print("multicore bind failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    // All N listeners bound the same resolved port (SO_REUSEPORT group).
+    try testing.expectEqual(@as(usize, n_listeners - 1), server.aux_listeners.len);
+    const port = server.boundAddress().getPort();
+    for (server.aux_listeners) |l|
+        try testing.expectEqual(port, l.socket.address.getPort());
+
+    const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+
+    var client = http.Client.init(io, testing.allocator, .{});
+    defer client.deinit();
+    var url_buf: [64]u8 = undefined;
+
+    // The kernel spreads these fresh connections across the N listen queues;
+    // every one must be served regardless of which listener accepted it.
+    const requests = 24;
+    for (0..requests) |_| {
+        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/hello", .{port});
+        var res = try client.request(.get, url, .{});
+        defer res.deinit();
+        try testing.expectEqual(@as(u16, 200), res.status);
+        const body = try res.readAllAlloc(testing.allocator, 64);
+        defer testing.allocator.free(body);
+        try testing.expectEqualStrings("hello", body);
+    }
+    try testing.expectEqual(@as(u32, requests), hits.load(.monotonic));
 }
 
 test "integration: keep-alive — two requests on one TCP connection" {

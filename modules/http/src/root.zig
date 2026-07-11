@@ -89,6 +89,12 @@ pub const Client = @import("Client.zig");
 /// socket-free `Server.serveStream` codec loop, and the TCP serving loop.
 pub const Server = @import("Server.zig");
 
+/// Reverse-proxy handler (`proxy.ProxyHandler`): forwards a `Server`
+/// request to a backend via `Client`, streaming both ways, with hop-by-hop
+/// stripping, `X-Forwarded-*` / `Via` injection, and 502/503/504 mapping.
+/// Backend selection is a seam so `upstream`/`router` compose from above.
+pub const proxy = @import("proxy.zig");
+
 /// Conditional requests (RFC 9110 §8.8/§13): ETag / Last-Modified validators
 /// with `If-Match` / `If-None-Match` / `If-Modified-Since` /
 /// `If-Unmodified-Since` → 304 Not Modified / 412 Precondition Failed.
@@ -425,6 +431,7 @@ test {
     _ = h2_server;
     _ = Client;
     _ = Server;
+    _ = proxy;
     _ = conditional;
     _ = body;
     _ = multipart;

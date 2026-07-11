@@ -2,7 +2,8 @@
 
 HTTP/1.1 client **and server** in pure Zig (client TLS over `std.crypto.tls`).
 
-- HTTP/1.1 client + server, HTTP/2 in progress.
+- HTTP/1.1 **and HTTP/2** client + server, plus a reverse-proxy handler and
+  an opt-in multicore (SO_REUSEPORT thread-per-core) accept engine.
 - **Model after:** `lalinsky/dusty` (1.1 client shape) + Go `net/http`
   (redirect/header semantics, Server shape); `nghttp2` + h2spec later for
   HTTP/2.
@@ -32,7 +33,14 @@ framing + the server are clean-room from RFC 7230/9110. Design refs in
    gzip response compression** (`Options.compression`, off by default —
    see "Response compression"). Still plain HTTP only: a TLS-terminating
    server is a separate later task (a reverse proxy also works).
-3. TODO — HTTP/2 (framing + HPACK), verified against h2spec. Not started.
+3. **DONE — HTTP/2** (`hpack` RFC 7541 + `h2` RFC 9113 framing/state
+   machine/flow control): opt-in cleartext h2c on the server
+   (`Options.enable_h2c`, prior knowledge), a multiplexing client
+   (`Client.connectH2c`), and the bring-your-own-TLS seam
+   (`h2_server.serveStream` / `Client.connectH2Over` after ALPN "h2").
+4. **DONE — API-gateway building blocks:** a reverse-proxy handler
+   (`http.proxy`, see "Reverse proxy") and an opt-in multicore accept
+   engine (`Options.accept_threads`, see "Multicore accept engine").
 
 ## Client API
 
@@ -144,6 +152,66 @@ Reader/Writer pair — that is what the offline tests (and the future
   form request targets are rejected (origin-form + `*` only).
 - **No TLS in the server** — terminate TLS in front (Caddy/any proxy); a
   native TLS-terminating server is a separate later task.
+
+## Multicore accept engine (SO_REUSEPORT thread-per-core)
+
+`Options.accept_threads` (default 1 = the classic single accept loop on the
+caller's thread) opts into an N-listener engine: `bind` binds N listener
+sockets on the same address — each with SO_REUSEPORT (`reuse_address`,
+forced on) — and `serve` runs N independent accept loops, each on its own
+OS thread pinned to a distinct core (Linux `sched_setaffinity`; a
+best-effort no-op elsewhere). The kernel load-balances incoming connections
+across the listeners (the nginx/glommio model), so there is **zero
+cross-core accept contention** and no thundering herd on one listen queue.
+Each accept loop owns its own `Io.Group`; `shutdown` drains all N, `serve`
+returns once every listener's connections have drained. Pass
+`http.Server.cpuCount()` for one listener per core. With an ephemeral port
+(port 0) all N listeners share the *resolved* port. io_uring is deliberately
+not used — its net vtable is `Unavailable` in std 0.16.
+
+```zig
+var server = http.Server.init(io, gpa, .{
+    .handler = handler,
+    .accept_threads = http.Server.cpuCount(), // one core-pinned listener per CPU
+});
+```
+
+## Reverse proxy (`http.proxy`)
+
+`http.proxy.ProxyHandler` is a `Server.Handler` that forwards a request to a
+backend through the `Client` and streams the response back — the forwarding
+half of an API gateway. It strips hop-by-hop headers both ways (RFC 9110
+§7.6.1: `Connection`, `Keep-Alive`, `TE`, `Trailer`, `Transfer-Encoding`,
+`Upgrade`, every `Proxy-*`, and every field named in the request's
+`Connection`), appends the socket peer to `X-Forwarded-For`, sets
+`X-Forwarded-Proto` / `X-Forwarded-Host`, injects `Via: 1.1 <pseudonym>`
+(both directions), rewrites `Host` to the backend authority (default),
+streams request and response bodies without full buffering, and maps a
+dead backend → **502**, a timeout → **504**, no selectable backend → **503**.
+
+```zig
+var client = http.Client.init(io, gpa, .{});
+var ph = http.proxy.ProxyHandler.init(.{
+    .client = &client,
+    .backend = .{ .host = "10.0.0.1", .port = 8080 },
+});
+var server = http.Server.init(io, gpa, .{
+    .handler = http.proxy.ProxyHandler.handler,
+    .context = &ph,
+    .accept_threads = http.Server.cpuCount(),
+});
+```
+
+Backend selection is a **seam** (`Config.selector` — a `ctx + fn` returning
+a `Backend`), not a hard dependency, because `http` is foundational and
+`router`/`upstream` sit *on top of it* (importing them back would cycle or
+drag the resilience/probe stack into every `http` consumer). An
+`upstream.Pool` (load-balanced, health-checked backends) or a `router`
+route composes from above through that seam; `resilience` wraps the
+forward operation there too. **Known gaps this pass:** no `Client`
+connection pooling (one backend connection per request — `Client`'s own
+Phase-1 non-goal), HTTP/1.1 backends only (no h2 upstreaming), no shared
+response buffer pool.
 
 ## Direct-internet posture (Phase 2.1 hardening)
 
@@ -278,7 +346,11 @@ fully offline-testable and shared by both sides; `http.Url` / `http.Method`
 / `http.Header` — shared vocabulary; `http.redirectMethodFor` /
 `http.resolveLocation` (RFC 3986 §5.2) — the redirect state machine as pure
 functions; `http.Server.serveStream` / `http.Server.ResponseWriter` /
-`http.Server.RequestBody` — the server codec, socket-free.
+`http.Server.RequestBody` — the server codec, socket-free; `http.hpack` /
+`http.h2` / `http.h2_client` / `http.h2_server` — the HTTP/2 stack;
+`http.proxy` — the reverse-proxy handler (offline-testable pure helpers
+`isHopByHop` / `statusForBackendError` / URL + `Via` builders, plus a
+loopback origin↔proxy↔client integration test).
 
 ## Verification
 

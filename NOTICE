@@ -124,10 +124,16 @@ project git history).
                sec 12.5.3 (Accept-Encoding) and RFC 4647 sec 3.3.1
                (Accept-Language basic filtering). Clean-room
                from the RFCs, no HPACK/HTTP-2/nghttp2 source consulted or
-               copied; TLS via Zig std.crypto.tls. Design refs (behavior only,
-               no source copied): lalinsky/dusty (MIT; the 1.1 client shape)
-               and Go net/http (BSD-3-Clause; redirect semantics, server shape,
-               gzip handler).
+               copied; TLS via Zig std.crypto.tls. The reverse-proxy handler
+               (http.proxy) is clean-room from RFC 9110 sec 7.6 (hop-by-hop
+               fields, Via) + the RFC 7239 / de-facto X-Forwarded-* headers;
+               the SO_REUSEPORT thread-per-core accept engine is a standard
+               kernel-load-balancing technique (no source consulted). Design
+               refs (behavior only, no source copied): lalinsky/dusty (MIT; the
+               1.1 client shape), Go net/http (BSD-3-Clause; redirect
+               semantics, server shape, gzip handler) + Go
+               net/http/httputil.ReverseProxy (BSD-3-Clause) and nginx
+               proxy_pass (BSD-2-Clause) for the reverse-proxy behavior.
   dns        — RFC 1035 (wire), RFC 8484 (DoH), RFC 2782 (SRV), RFC 8659
                (CAA); design ref: miekg/dns (BSD-3-Clause) + c-ares (MIT) —
                behavior only, no source copied.
