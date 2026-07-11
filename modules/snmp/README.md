@@ -46,7 +46,8 @@ management work (alongside `netlink`, `nftables`, `icmp`).
     vector, NIST SP 800-38A CFB128-AES128 vectors, RFC 3414 A.3 key-derivation
     vectors. Manager side only — no agent, no engine-ID discovery orchestration.
   - Out of scope for now: agent side, trap listening beyond `receiver`, MIB
-    parsing, and the RFC 7860 SHA-2 auth variants.
+    parsing, the RFC 7860 SHA-2 auth variants, the AES-192/256 privacy drafts
+    (draft-blumenthal / Cisco variants), and SNMPv3 over TLS/DTLS (RFC 6353).
 
 Provenance: clean-room from RFC 1157 (SNMPv1), RFC 1905/3416 (SNMPv2c
 protocol operations), RFC 2578 (SMI types), ITU-T X.690 (BER), RFC 3412/3414

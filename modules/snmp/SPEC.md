@@ -13,7 +13,9 @@ transport-agnostic: codecs fill caller buffers; client/receiver take the transpo
 (optional `std.Io` UDP adapter), fully offline-testable. Never-panic: every length, OID arc count,
 and integer width is bounded; malformed agent bytes are typed errors. `v3` framing captures
 `msgSecurityParameters` as an opaque blob (parsed by `usm`) and surfaces an encrypted ScopedPDU
-verbatim as `.encrypted`; `decodeScopedPdu` is public for post-decrypt use. Clean-room from RFC 1157
+verbatim as `.encrypted`; `decodeScopedPdu` is public for post-decrypt use, and the send side is
+`encodeScopedPdu` (the plaintext TLV to encrypt) + `encodeEncrypted` (envelope with
+msgData = encryptedPDU). Clean-room from RFC 1157
 (v1), 1905/3416 (v2c), 3412 (v3 message processing), 3414 (USM), 3826 (AES priv), 2578 (SMI types),
 X.690 (BER) — see NOTICE.
 
@@ -23,7 +25,10 @@ USM is the security-sensitive part.
   (§A.2) + engine localization (`Kul = H(Ku ++ engineID ++ Ku)`). `verify` recomputes the digest with
   the auth field zero-filled and compares in **constant time** (`std.crypto.timing_safe.eql`, never
   `mem.eql`). Verified against RFC 3414 A.3 KATs.
-- **Privacy (RFC 3826/T-G, landed):** DES-CBC and AES-128-CFB decrypt of the ScopedPDU.
+- **Privacy (RFC 3414 §8 + RFC 3826, landed):** DES-CBC and AES-128-CFB encrypt + decrypt of the
+  ScopedPDU, wired into the message path both ways (`encodeScopedPdu`/`encodeEncrypted` on send,
+  `.encrypted` + `decryptScopedPdu` on receive). AES-192/256 (the draft-blumenthal / Cisco
+  variants) and SNMPv3 over TLS/DTLS (RFC 6353) are out of scope.
 - **Anti-replay window (T-H, landed):** engineBoots/engineTime window check (§3.2).
 - **v1/v2c is unauthenticated** — the community string is not a credential; the trap receiver must
   treat input as untrusted (never panics; caller decides trust).
@@ -47,7 +52,8 @@ BER + message golden-byte KATs, length-boundary + garbage sweeps, scripted-agent
 encode/decode round-trips incl. the encrypted-branch capture; USM RFC 3414 A.3 known-answer vectors
 (MD5 + SHA-1, Ku and localized Kul) + sign/verify with adversarial tamper (message byte / digest byte
 / wrong key → `AuthenticationFailed`); privacy KATs (DES-CBC + AES-128-CFB against NIST/RFC vectors)
-and time-window accept/reject. 71+ tests (grew with T-G/T-H). Run: `zig build test-snmp`.
+plus a full authPriv datagram round-trip (encodeScopedPdu → encrypt → encodeEncrypted → sign, then
+decode → verify → decrypt) and time-window accept/reject. 95 tests. Run: `zig build test-snmp`.
 
 ## Backlog / deferred
 RFC 7860 SHA-2 auth protocols; MIB compiler/SMI parsing; agent (server) role. The security-review

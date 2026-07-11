@@ -157,8 +157,9 @@ pub fn decodeScopedPdu(content: []const u8) DecodeError!ScopedPdu {
 
 /// Parameters for `encode` — the plaintext (noAuthNoPriv / authNoPriv) path.
 /// `security_parameters` is the caller-supplied opaque USM blob (build it with
-/// the USM layer, T-E/F); it may be empty for framing tests. Encrypting the
-/// ScopedPDU (privacy) is T-G.
+/// the USM layer, T-E/F); it may be empty for framing tests. For the privacy
+/// (authPriv) send path use `encodeScopedPdu` + the privacy layer's `encrypt` +
+/// `encodeEncrypted` instead.
 pub const EncodeParams = struct {
     msg_id: i32,
     msg_max_size: i32 = 65507,
@@ -182,21 +183,84 @@ pub fn encode(buf: []u8, params: EncodeParams) message.EncodeError![]const u8 {
     try e.prependTlv(ber.tag.octet_string, params.context_engine_id);
     try e.wrap(ber.tag.sequence, scoped_mark);
 
+    try prependEnvelope(&e, params.msg_id, params.msg_max_size, params.flags, params.security_model, params.security_parameters);
+    return e.encoded();
+}
+
+/// The ScopedPDU identity + payload — the plaintext the privacy layer encrypts.
+pub const ScopedPduParams = struct {
+    context_engine_id: []const u8,
+    context_name: []const u8 = &.{},
+    pdu: message.EncodePdu,
+};
+
+/// Encode a plaintext ScopedPDU — the full `SEQUENCE { contextEngineID,
+/// contextName, <PDU> }` TLV — into `buf`, returning the encoded slice (aligned
+/// to the END of `buf`). This is the outgoing privacy path's plaintext: feed the
+/// result to the privacy layer's `encrypt`, then frame the ciphertext with
+/// `encodeEncrypted`.
+pub fn encodeScopedPdu(buf: []u8, params: ScopedPduParams) message.EncodeError![]const u8 {
+    var e = ber.Encoder.init(buf);
+    const mark = e.len();
+    try message.encodePdu(&e, params.pdu);
+    try e.prependTlv(ber.tag.octet_string, params.context_name);
+    try e.prependTlv(ber.tag.octet_string, params.context_engine_id);
+    try e.wrap(ber.tag.sequence, mark);
+    return e.encoded();
+}
+
+/// Parameters for `encodeEncrypted` — the privacy (authPriv) send path. Same
+/// envelope fields as `EncodeParams`, but msgData is the already-encrypted
+/// ScopedPDU ciphertext (from the privacy layer's `encrypt` over an
+/// `encodeScopedPdu` buffer). Privacy always requires auth (RFC 3414 §1.4.2),
+/// so `flags` defaults to authPriv; the matching `msgPrivacyParameters` salt
+/// travels inside `security_parameters` (the USM blob).
+pub const EncodeEncryptedParams = struct {
+    msg_id: i32,
+    msg_max_size: i32 = 65507,
+    flags: MsgFlags = .{ .auth = true, .priv = true },
+    security_model: u32 = security_model_usm,
+    security_parameters: []const u8 = &.{},
+    /// The encrypted ScopedPDU bytes — written verbatim as the msgData
+    /// `encryptedPDU` OCTET STRING.
+    encrypted_pdu: []const u8,
+};
+
+/// Encode an SNMPv3 message whose msgData is an encryptedPDU OCTET STRING (the
+/// RFC 3412 privacy branch of ScopedPduData) into `buf`, returning the encoded
+/// slice. The caller then signs the datagram in place via the USM layer (the
+/// auth digest covers the whole message, ciphertext included).
+pub fn encodeEncrypted(buf: []u8, params: EncodeEncryptedParams) message.EncodeError![]const u8 {
+    var e = ber.Encoder.init(buf);
+    try e.prependTlv(ber.tag.octet_string, params.encrypted_pdu);
+    try prependEnvelope(&e, params.msg_id, params.msg_max_size, params.flags, params.security_model, params.security_parameters);
+    return e.encoded();
+}
+
+/// Prepend everything above msgData (which the caller has already prepended):
+/// msgSecurityParameters, msgGlobalData, msgVersion, and the outer SEQUENCE.
+fn prependEnvelope(
+    e: *ber.Encoder,
+    msg_id: i32,
+    msg_max_size: i32,
+    flags: MsgFlags,
+    security_model: u32,
+    security_parameters: []const u8,
+) message.EncodeError!void {
     // msgSecurityParameters (opaque).
-    try e.prependTlv(ber.tag.octet_string, params.security_parameters);
+    try e.prependTlv(ber.tag.octet_string, security_parameters);
 
     // msgGlobalData / HeaderData (prepended in reverse wire order).
     const hdr_mark = e.len();
-    try e.prependInteger(ber.tag.integer, params.security_model);
-    try e.prependTlv(ber.tag.octet_string, &.{params.flags.toByte()});
-    try e.prependInteger(ber.tag.integer, params.msg_max_size);
-    try e.prependInteger(ber.tag.integer, params.msg_id);
+    try e.prependInteger(ber.tag.integer, security_model);
+    try e.prependTlv(ber.tag.octet_string, &.{flags.toByte()});
+    try e.prependInteger(ber.tag.integer, msg_max_size);
+    try e.prependInteger(ber.tag.integer, msg_id);
     try e.wrap(ber.tag.sequence, hdr_mark);
 
     // msgVersion = 3, then the outer message SEQUENCE.
     try e.prependInteger(ber.tag.integer, 3);
     try e.wrap(ber.tag.sequence, 0);
-    return e.encoded();
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────
@@ -280,6 +344,61 @@ test "decode: privacy flag / encryptedPDU is surfaced verbatim for T-G" {
     const m = try decode(e.encoded());
     try testing.expect(m.header.flags.priv);
     try testing.expectEqualStrings(cipher, m.data.encrypted);
+}
+
+test "encodeEncrypted round-trip: msgData surfaces as .encrypted verbatim, authPriv flags" {
+    var buf: [128]u8 = undefined;
+    const cipher = "\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10";
+    const dg = try encodeEncrypted(&buf, .{
+        .msg_id = 4242,
+        .security_parameters = "usm-blob",
+        .encrypted_pdu = cipher,
+    });
+    const m = try decode(dg);
+    try testing.expectEqual(@as(i32, 4242), m.header.msg_id);
+    try testing.expect(m.header.flags.auth and m.header.flags.priv and !m.header.flags.reportable);
+    try testing.expectEqual(security_model_usm, m.header.security_model);
+    try testing.expectEqualStrings("usm-blob", m.security_parameters);
+    try testing.expectEqualStrings(cipher, m.data.encrypted);
+}
+
+test "encodeScopedPdu output decodes via decodeScopedPdu (after peeling the SEQUENCE)" {
+    const vbs = try sampleTrapVarbinds();
+    var buf: [256]u8 = undefined;
+    const tlv = try encodeScopedPdu(&buf, .{
+        .context_engine_id = "\x80\x00\x1f\x88\x80",
+        .context_name = "ctx",
+        .pdu = .{ .type = .trap_v2, .request_id = 31337, .varbinds = &vbs },
+    });
+    var d = ber.Decoder.init(tlv);
+    const content = try d.expect(ber.tag.sequence);
+    try testing.expect(d.done());
+    const scoped = try decodeScopedPdu(content);
+    try testing.expectEqualStrings("\x80\x00\x1f\x88\x80", scoped.context_engine_id);
+    try testing.expectEqualStrings("ctx", scoped.context_name);
+    try testing.expectEqual(@as(i32, 31337), scoped.pdu.trap_v2.request_id);
+}
+
+test "encodeScopedPdu matches the ScopedPDU bytes inside a plaintext encode()" {
+    // The plaintext-path msgData and the standalone ScopedPDU TLV must be
+    // byte-identical for the same inputs (the privacy plaintext IS that TLV).
+    const vbs = try sampleTrapVarbinds();
+    var tlv_buf: [256]u8 = undefined;
+    const tlv = try encodeScopedPdu(&tlv_buf, .{
+        .context_engine_id = "eng",
+        .context_name = "n",
+        .pdu = .{ .type = .trap_v2, .request_id = 5, .varbinds = &vbs },
+    });
+    var msg_buf: [256]u8 = undefined;
+    const dg = try encode(&msg_buf, .{
+        .msg_id = 1,
+        .context_engine_id = "eng",
+        .context_name = "n",
+        .pdu = .{ .type = .trap_v2, .request_id = 5, .varbinds = &vbs },
+    });
+    // The plaintext ScopedPDU SEQUENCE is the message's trailing bytes.
+    try testing.expect(dg.len >= tlv.len);
+    try testing.expectEqualSlices(u8, tlv, dg[dg.len - tlv.len ..]);
 }
 
 test "decode: a non-v3 message is NotV3" {

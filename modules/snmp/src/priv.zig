@@ -286,7 +286,10 @@ test "DES decrypt rejects non-multiple-of-8 ciphertext" {
     try testing.expectError(error.InvalidLength, decrypt(.des_cbc, &key16, 0, 0, &[_]u8{0} ** 8, &.{}, &out));
 }
 
-/// Round-trip both privacy protocols: encrypt a ScopedPDU, then decrypt back.
+/// Round-trip both privacy protocols end-to-end through the public message
+/// path: `v3.encodeScopedPdu` → `encrypt` → `v3.encodeEncrypted` → `usm.sign`,
+/// then `v3.decode` → `usm.verify` → `decryptScopedPdu` — a full authPriv
+/// datagram both ways.
 fn expectPrivRoundTrip(proto: PrivProtocol) !void {
     // Localize a privacy password to the example engine to get a realistic key.
     const engine_id = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2 };
@@ -296,19 +299,16 @@ fn expectPrivRoundTrip(proto: PrivProtocol) !void {
     const boots: u32 = 5;
     const time: u32 = 12345;
 
-    // Build a real plaintext ScopedPDU SEQUENCE TLV.
+    // Build a real plaintext ScopedPDU SEQUENCE TLV via the public seam.
     const Oid = @import("oid.zig").Oid;
     const vbs = [_]message.VarBind{
         .{ .name = try Oid.parse("1.3.6.1.2.1.1.3.0"), .value = .{ .time_ticks = 4242 } },
     };
     var scoped_buf: [256]u8 = undefined;
-    var se = ber.Encoder.init(&scoped_buf);
-    const scoped_mark = se.len();
-    try message.encodePdu(&se, .{ .type = .response, .request_id = 77, .varbinds = &vbs });
-    try se.prependTlv(ber.tag.octet_string, ""); // contextName
-    try se.prependTlv(ber.tag.octet_string, &engine_id); // contextEngineID
-    try se.wrap(ber.tag.sequence, scoped_mark);
-    const scoped_plain = se.encoded();
+    const scoped_plain = try v3.encodeScopedPdu(&scoped_buf, .{
+        .context_engine_id = &engine_id,
+        .pdu = .{ .type = .response, .request_id = 77, .varbinds = &vbs },
+    });
 
     var cipher_buf: [280]u8 = undefined;
     const cipher = try encrypt(proto, key, boots, time, &salt, scoped_plain, &cipher_buf);
@@ -321,7 +321,8 @@ fn expectPrivRoundTrip(proto: PrivProtocol) !void {
     // Ciphertext must differ from plaintext.
     try testing.expect(!std.mem.eql(u8, scoped_plain, cipher[0..scoped_plain.len]));
 
-    // Assemble a real v3 datagram whose msgData is the encryptedPDU OCTET STRING.
+    // Frame a real authPriv v3 datagram: msgData = encryptedPDU, the salt in
+    // msgPrivacyParameters, and a 12-zero auth placeholder to sign over.
     var usm_buf: [128]u8 = undefined;
     const usm_wire = try usm.encode(&usm_buf, .{
         .engine_id = &engine_id,
@@ -332,20 +333,24 @@ fn expectPrivRoundTrip(proto: PrivProtocol) !void {
         .priv_params = &salt,
     });
     var dg_buf: [512]u8 = undefined;
-    var e = ber.Encoder.init(&dg_buf);
-    try e.prependTlv(ber.tag.octet_string, cipher); // msgData = encryptedPDU
-    try e.prependTlv(ber.tag.octet_string, usm_wire); // msgSecurityParameters
-    const hdr_mark = e.len();
-    try e.prependInteger(ber.tag.integer, v3.security_model_usm);
-    try e.prependTlv(ber.tag.octet_string, &.{(v3.MsgFlags{ .auth = true, .priv = true }).toByte()});
-    try e.prependInteger(ber.tag.integer, 65507);
-    try e.prependInteger(ber.tag.integer, 4242);
-    try e.wrap(ber.tag.sequence, hdr_mark);
-    try e.prependInteger(ber.tag.integer, 3);
-    try e.wrap(ber.tag.sequence, 0);
+    const dg = try v3.encodeEncrypted(&dg_buf, .{
+        .msg_id = 4242,
+        .security_parameters = usm_wire,
+        .encrypted_pdu = cipher,
+    });
 
-    const m = try v3.decode(e.encoded());
-    try testing.expect(m.header.flags.priv);
+    // Sign in place (mutable copy — auth_params must point INTO the signed
+    // buffer), then run the full receive path: decode, verify, decrypt.
+    var msg_buf: [512]u8 = undefined;
+    @memcpy(msg_buf[0..dg.len], dg);
+    const msg = msg_buf[0..dg.len];
+    const m = try v3.decode(msg);
+    try testing.expect(m.header.flags.auth and m.header.flags.priv);
+    const sp = try usm.parse(m.security_parameters);
+    try testing.expectEqualSlices(u8, &salt, sp.priv_params);
+    const off = usm.authOffset(msg, sp) orelse return error.TestUnexpectedResult;
+    usm.sign(.hmac_sha1, key, msg, off);
+    try usm.verify(.hmac_sha1, key, msg, sp);
     const enc_bytes = m.data.encrypted;
 
     // Decrypt straight back through the parsing convenience.
@@ -359,9 +364,9 @@ fn expectPrivRoundTrip(proto: PrivProtocol) !void {
     // first block depends on the IV; for AES-CFB the whole stream does.
     const bad_salt = [8]u8{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
     var bad_buf: [280]u8 = undefined;
-    if (decryptScopedPdu(proto, key, boots, time, &bad_salt, enc_bytes, &bad_buf)) |sp| {
+    if (decryptScopedPdu(proto, key, boots, time, &bad_salt, enc_bytes, &bad_buf)) |bad_scoped| {
         // Decoded, but the corrupted plaintext must not match the real ScopedPDU.
-        try testing.expect(!std.mem.eql(u8, sp.context_engine_id, &engine_id));
+        try testing.expect(!std.mem.eql(u8, bad_scoped.context_engine_id, &engine_id));
     } else |_| {
         // A BER decode failure on garbage plaintext is the expected outcome.
     }
