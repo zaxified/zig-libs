@@ -242,6 +242,25 @@ project git history).
                protocol, not copyrightable expression); no source
                consulted or copied.
 
+  tc         — original pure-Zig traffic-control (netem qdisc) rtnetlink
+               client, clean-room from the documented kernel UAPI headers
+               linux/rtnetlink.h (struct tcmsg, TCA_*) and
+               linux/pkt_sched.h (struct tc_netem_qopt and friends,
+               TCA_NETEM_*), both GPL-2.0 WITH Linux-syscall-note. No GPL
+               header source is copied — only the uncopyrightable ABI
+               facts they document are used (struct layouts,
+               command/attribute/flag constants). The operative mechanism
+               is the same Linux-syscall-note exception already relied on
+               by `netlink`/`wireguard`: it explicitly permits userspace of
+               ANY license to use these headers to interface with the
+               kernel, which is why this module is cleanly MIT despite
+               citing GPL-2.0 headers. No third-party implementation
+               (iproute2 or otherwise) was consulted as a design
+               reference — the kernel headers were sufficient, and
+               rtnetlink attribute parsing is order-independent by
+               construction, so this module's own attribute-emission
+               order carries no external compatibility requirement.
+
   traceroute — clean-room from the classic traceroute(8)/mtr ICMP method
                (Van Jacobson's TTL-stepping, a public technique) + RFC 792
                (ICMP message formats, via the `icmp` module) —

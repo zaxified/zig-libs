@@ -64,6 +64,7 @@ const module_list = [_]Module{
     .{ .name = "mqtt" },
     .{ .name = "snmp" },
     .{ .name = "wireguard", .deps = &.{"netlink"} },
+    .{ .name = "tc", .deps = &.{"netlink"} },
     .{ .name = "traceroute", .deps = &.{ "icmp", "netaddr", "latency-stats" } },
     .{ .name = "probe", .deps = &.{ "netaddr", "latency-stats" } },
     .{ .name = "l2disco", .deps = &.{"netaddr"} },
