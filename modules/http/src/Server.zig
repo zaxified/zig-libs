@@ -194,6 +194,16 @@ pub const Options = struct {
     read_buffer_size: usize = 16 * 1024,
     /// Socket write buffer.
     write_buffer_size: usize = 4 * 1024,
+    /// Disable Nagle's algorithm (`TCP_NODELAY`) on every accepted
+    /// connection. Default **on**: an API/RPC server writes a complete
+    /// response and then waits for the next request, so Nagle buffering the
+    /// last small segment until an ACK — which delayed-ACK holds for up to
+    /// ~40 ms — adds a flat per-response latency floor that request/response
+    /// traffic never benefits from (measured ~41 ms p50 with it off). Set
+    /// false only for a connection that streams many tiny writes it wants
+    /// coalesced. Applies to the built-in accept loop; a bring-your-own-TLS
+    /// caller that owns the socket sets it via `setTcpNoDelay` on its fd.
+    tcp_nodelay: bool = true,
     /// Upper bound for a whole request head (Go `MaxHeaderBytes`) → 431.
     max_header_bytes: usize = 16 * 1024,
     /// Upper bound for the request line (method + target + version) → 414.
@@ -403,6 +413,7 @@ fn acceptLoop(s: *Server, listener: *net.Server, group: *std.Io.Group) ServeErro
                 continue;
             }
         }
+        if (s.options.tcp_nodelay) setTcpNoDelay(stream.socket.handle);
         _ = s.active_conns.fetchAdd(1, .monotonic); // connMain decrements
         group.concurrent(s.io, connMain, .{ s, stream }) catch {
             // No concurrency available: serve the connection inline rather
@@ -482,6 +493,23 @@ fn pinToCpu(cpu: usize) void {
     const bits = @bitSizeOf(usize);
     set[target / bits] |= @as(usize, 1) << @intCast(target % bits);
     std.os.linux.sched_setaffinity(0, &set) catch {};
+}
+
+/// Best-effort `TCP_NODELAY` on a socket fd — disables Nagle so a completed
+/// small response is not held back waiting for the peer's delayed ACK (see
+/// `Options.tcp_nodelay` for the latency rationale). Failure is ignored: a
+/// missing NODELAY only costs latency, never correctness, and a non-TCP fd
+/// (e.g. a Unix socket) simply rejects the option. Public so a
+/// bring-your-own-TLS server — which accepts the socket itself and hands the
+/// decrypted stream to `serveStream`, bypassing this module's accept loop —
+/// can apply the same tuning on the fd it owns.
+pub fn setTcpNoDelay(handle: std.posix.socket_t) void {
+    std.posix.setsockopt(
+        handle,
+        std.posix.IPPROTO.TCP,
+        std.posix.TCP.NODELAY,
+        &std.mem.toBytes(@as(c_int, 1)),
+    ) catch {};
 }
 
 /// Convenience: `bind` + `serve`.
