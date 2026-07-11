@@ -1,0 +1,52 @@
+dtls — provenance note
+======================
+
+NOTE ON PLACEMENT: this repository's actual convention (see the root
+`CONVENTIONS.md` §5 and the root `NOTICE` file) is ONE canonical NOTICE at
+the repo root, with one entry per module, not a per-module NOTICE file. This
+scaffolding pass was scoped to write only inside `modules/dtls/` and edit
+the root `build.zig` for registration — so the entry below lives here for
+now rather than being merged into the root `NOTICE`. Before this module
+ships, fold the paragraph below into the root `NOTICE` (alongside the
+`ssh`/`noise`/`opcua` entries it's modeled on) and delete this file, per the
+repo's real convention.
+
+Provenance
+----------
+
+dtls — clean-room implementation from RFC 9147 (Datagram Transport Layer
+Security 1.3) and RFC 8446 (TLS 1.3 — shared key-schedule and handshake
+message shapes, reused by DTLS 1.3 per RFC 9147 §5.8/§5.3/§5.4; no TLS 1.3
+code copied, only the specification's design reused as RFC 9147 itself
+mandates). Both are open, public IETF specifications — not copyrightable
+works (merger doctrine; see CONVENTIONS.md §5) — so no third-party-source
+NOTICE entry is strictly required for the RFC citations alone.
+
+This module additionally names the real design/code references consulted:
+Zig 0.16 std's `std.crypto.tls` (`lib/std/crypto/tls.zig`, MIT, part of Zig
+itself) — its `hello_retry_request_sequence` magic-value constant (RFC 8446
+§4.1.3) is re-exported directly (a spec-mandated public value), and its
+`hkdfExpandLabel` was read for reference. Note this module does NOT call
+`std.crypto.tls.hkdfExpandLabel`: that function hardcodes the TLS `"tls13 "`
+label prefix, whereas DTLS 1.3 (RFC 9147 §5.9) requires `"dtls13"`, so the
+`HkdfLabel` construction is re-implemented here (`keyschedule.expandLabel`)
+with a parameterized prefix. No source was copied from
+`std.crypto.tls.Client`'s private handshake state machine.
+
+The AEAD primitives (`std.crypto.aead.aes_gcm`, `chacha_poly`), the
+single-block AES-ECB (`std.crypto.core.aes`), the ChaCha20 block keystream
+(`std.crypto.stream.chacha`), HKDF/HMAC, and SHA-256/384 are used via their
+public std APIs (MIT, part of Zig). Verification used RFC 8448 "Example
+Handshake Traces for TLS 1.3" (IETF, public) as key-schedule KATs and the
+`cryptography` package (OpenSSL) as an independent AEAD/mask oracle at test
+time — neither is linked or vendored.
+
+**Status: crypto core implemented + validated; handshake flight engine
+deferred.** `keyschedule.zig`/`aead.zig` are real and KAT-validated;
+`Connection.zig`'s application-data record path is real. The record header,
+handshake framing/fragmentation, flight/ACK logic, and message-body framing
+(`record.zig`, `handshake.zig`, `flight.zig`, `messages.zig`) are real and
+tested. `Connection.startHandshake` (the handshake flight engine) is not yet
+built.
+
+No GPL/LGPL/AGPL source was consulted or copied anywhere in this module.

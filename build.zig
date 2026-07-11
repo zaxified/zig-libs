@@ -102,6 +102,7 @@ const module_list = [_]Module{
     .{ .name = "noise" },
     .{ .name = "dnssec", .deps = &.{ "dns", "rsa" } },
     .{ .name = "dnp3" },
+    .{ .name = "dtls" },
     // Scaffold more here (copy modules/_template) — see CONVENTIONS.md
     // "How to add a module" and the README "Roadmap / Non-goals" sections.
 };
