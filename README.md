@@ -113,7 +113,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `stun` | STUN client (RFC 8489) — NAT reflexive-address discovery: XOR-MAPPED-ADDRESS + MESSAGE-INTEGRITY + FINGERPRINT | any | netaddr |
 | `sntp` | SNTP client (RFC 4330) — NTP packet codec + UDP query, clock offset / round-trip delay | any | — |
 | `syslog` | RFC 5424 syslog formatter + emitter, RFC 3164 legacy encoder, RFC 6587 TCP octet framing | any | — |
-| `ssh` | SSH-2.0 client transport (RFC 4253) — version exchange, KEXINIT, curve25519-sha256 (RFC 8731), Binary Packet Protocol, cipher/MAC state; userauth/channels (RFC 4252/4254) reserved. **Skeleton — not yet implemented** | any | rsa |
+| `ssh` | SSH-2.0 (RFC 4253) **client + server** transport — version exchange, KEXINIT, curve25519-sha256 (RFC 8731) + diffie-hellman-group + ML-KEM-768 hybrid KEX, Binary Packet Protocol, aes-gcm/chacha20-poly1305; live-validated against OpenSSH. userauth (RFC 4252) + channels (RFC 4254) reserved (→ ssh-exec) | any | rsa |
 
 ### Data & storage
 
@@ -136,7 +136,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 |---|---|---|---|
 | `hashdigest` | Streaming digests — one-shot / incremental / file (EOF-read, size-0 `/proc` safe); SHA-256 convenience + a multi-algorithm layer (SHA-2/SHA-3/BLAKE2b/BLAKE3) | any | — |
 | `sealedbox` | NaCl `crypto_box_seal` — anonymous-sender X25519 public-key encryption (thin over `std.crypto`) + base64/hex key serialization | any | — |
-| `rsa` | Pure-Zig RSA (PKCS#1 v2.2, RFC 8017) over `std.crypto.ff` — public/CRT-private keys, EMSA-PKCS1-v1_5 sign/verify; OAEP/PSS/key-parsing/keygen/self-signed-cert reserved. **Skeleton — not yet implemented** | any | — |
+| `rsa` | Pure-Zig RSA (PKCS#1 v2.2, RFC 8017) over `std.crypto.ff` — public + CRT-private keys, PKCS1-v1_5 **and PSS** sign/verify, **OAEP** + PKCS1-v1_5 encrypt/decrypt, **keygen**, DER/PEM + **OpenSSH** (bcrypt-pbkdf) key parsing, X.509 self-signed certs; OpenSSL-KAT-validated | any | — |
 | `slhdsa` | SLH-DSA (FIPS 205, standardized SPHINCS+) post-quantum stateless hash-based signatures — **all twelve parameter sets** (SHA2 + SHAKE, 128/192/256 s/f) keygen/sign/verify (WOTS+ · XMSS · hypertree · FORS), each NIST-ACVP-KAT-verified; pre-hash variants reserved | any | — |
 | `falcon` | Falcon-512 **and Falcon-1024** (FN-DSA, the NIST PQ lattice signature) — **verification + all key/signature codecs**, NIST-Round-3-KAT-verified for both parameter sets (degree-generic negacyclic NTT mod 12289, SHAKE256 hash-to-point, compressed-sig codec, sk→pk consistency); keygen/sign (ffSampling trapdoor sampler) reserved | any | — |
 | `tlsresume` | Server-side TLS 1.3 session-ticket resumption (RFC 8446 §4.2.11/§4.6.1/§7.1/§8) — `NewSessionTicket` codec + **AES-256-GCM STEK-ring** ticket seal/open (key-id-bound AAD, rotation-safe) + resumption-PSK/**binder** derivation (const-time verify) + ticket-age (de)obfuscation + single-use anti-replay register, **byte-exact KAT vs RFC 8448 §3/§4**. Engine-agnostic (owns no TLS state machine) | any | — |
