@@ -534,4 +534,16 @@ project git history).
                independent oracle — used to generate/verify test zones only,
                not consulted as source.
 
+  falcon     — clean-room from the Falcon Round-3 specification
+               ("Falcon: Fast-Fourier Lattice-based Compact Signatures over
+               NTRU", falcon-sign.info — the NIST PQC Round-3 submission
+               document; FIPS 206 / FN-DSA is still a draft). Design ref: the
+               Round-3 reference implementation (MIT, Thomas Pornin) was
+               consulted to pin wire-format/behavior facts (the NIST-API
+               signed-message envelope, key/signature header bytes, codec
+               canonicality rules, the l2bound norm table) — no source ported
+               or copied. The submission package's falcon512-KAT.rsp vectors
+               are used purely as the test oracle (SHA-256 of the .rsp file
+               recorded in the module's SPEC.md).
+
 See each module's README "Provenance" note for its specific design references.

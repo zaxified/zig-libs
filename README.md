@@ -136,6 +136,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `sealedbox` | NaCl `crypto_box_seal` — anonymous-sender X25519 public-key encryption (thin over `std.crypto`) + base64/hex key serialization | any | — |
 | `rsa` | Pure-Zig RSA (PKCS#1 v2.2, RFC 8017) over `std.crypto.ff` — public/CRT-private keys, EMSA-PKCS1-v1_5 sign/verify; OAEP/PSS/key-parsing/keygen/self-signed-cert reserved. **Skeleton — not yet implemented** | any | — |
 | `slhdsa` | SLH-DSA (FIPS 205, standardized SPHINCS+) post-quantum stateless hash-based signatures — **all twelve parameter sets** (SHA2 + SHAKE, 128/192/256 s/f) keygen/sign/verify (WOTS+ · XMSS · hypertree · FORS), each NIST-ACVP-KAT-verified; pre-hash variants reserved | any | — |
+| `falcon` | Falcon-512 (FN-DSA, the NIST PQ lattice signature) — **verification + all key/signature codecs**, NIST-Round-3-KAT-verified (negacyclic NTT mod 12289, SHAKE256 hash-to-point, compressed-sig codec, sk→pk consistency); keygen/sign (ffSampling trapdoor sampler) reserved | any | — |
 
 ### Serialization / OS / agent
 
