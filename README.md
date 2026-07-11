@@ -135,6 +135,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `hashdigest` | Streaming digests — one-shot / incremental / file (EOF-read, size-0 `/proc` safe); SHA-256 convenience + a multi-algorithm layer (SHA-2/SHA-3/BLAKE2b/BLAKE3) | any | — |
 | `sealedbox` | NaCl `crypto_box_seal` — anonymous-sender X25519 public-key encryption (thin over `std.crypto`) + base64/hex key serialization | any | — |
 | `rsa` | Pure-Zig RSA (PKCS#1 v2.2, RFC 8017) over `std.crypto.ff` — public/CRT-private keys, EMSA-PKCS1-v1_5 sign/verify; OAEP/PSS/key-parsing/keygen/self-signed-cert reserved. **Skeleton — not yet implemented** | any | — |
+| `slhdsa` | SLH-DSA (FIPS 205, standardized SPHINCS+) post-quantum stateless hash-based signatures — **SLH-DSA-SHA2-128f** keygen/sign/verify (WOTS+ · XMSS · hypertree · FORS), NIST-ACVP-KAT-verified; other param sets/pre-hash reserved | any | — |
 
 ### Serialization / OS / agent
 
