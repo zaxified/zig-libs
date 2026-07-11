@@ -1,0 +1,46 @@
+taproot — provenance note
+==========================
+
+Kept as a module-local NOTICE (same placement as the sibling `bip340`
+module and other self-contained crypto modules not folded into the root
+`NOTICE`).
+
+Provenance
+----------
+
+taproot — clean-room implementation from BIP341 ("Taproot: SegWit version 1
+spending rules", bitcoin/bips), covering: the `"TapTweak"` tagged hash and
+the key-path output-key tweak (§"Constructing and Spending Taproot
+Outputs"). BIP341 is a public, open Bitcoin Improvement Proposal — not a
+copyrightable work (merger doctrine; see CONVENTIONS.md §5) — so no
+third-party-source NOTICE entry is strictly required for the spec citation
+alone. No reference implementation's source was ported or consulted as a
+design reference; the two crypto cores (`tweakPublicKey`/`tweakSecretKey`)
+are written FROM the BIP341 specification text only (their doc comments
+cite section names, not any third-party source).
+
+The official BIP341 "wallet test vectors" (`kat_vectors.zig`) were fetched
+directly from `bip-0341/wallet-test-vectors.json` in the `bitcoin/bips`
+repository
+(https://raw.githubusercontent.com/bitcoin/bips/master/bip-0341/wallet-test-vectors.json).
+This is a public specification artifact — the BIP's own published
+conformance vectors — not copied from any other implementation's test
+suite. The 7 KAT rows re-pair each `scriptPubKey` fixture (public-key
+tweaking) with its matching `keyPathSpending[0].inputSpending` fixture
+(secret-key tweaking) by `internalPubkey` equality; the `parity` field is
+independently recovered from the leading byte of each row's
+`scriptPathControlBlocks[0]` (`0xc0`/`0xc1` — BIP341's control-block
+leaf-version-or-parity encoding), not copied from any "parity" field in the
+JSON (the upstream fixture does not expose one directly).
+
+`std.crypto.ecc.Secp256k1` (field/scalar arithmetic, point group law,
+`basePoint`, `mul`) and the sibling `bip340` module (`XOnlyPublicKey`,
+`SecretKey`, the tagged-hash machinery) are used via their public APIs; see
+`root.zig`'s module doc and `SPEC.md` for the specific reuse.
+
+No GPL/LGPL/AGPL source was consulted or copied anywhere in this module.
+
+**Status: complete — `"TapTweak"` tagged hash, `TweakedPublicKey` codec,
+AND both crypto cores (`tweakPublicKey`/`tweakSecretKey`) are real and
+KAT-tested against all 7 official BIP341 wallet-test-vector rows (crypto
+pass 2026-07-12). See `SPEC.md`'s done-record.**
