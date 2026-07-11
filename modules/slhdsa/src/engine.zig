@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: MIT
 //! engine — the FIPS 205 SLH-DSA construction, generic over a parameter set.
 //!
-//! Implements every layer of the scheme: the §11.2 SHA2 (security category 1)
-//! tweakable hashes/PRFs, WOTS+ one-time signatures (§5), XMSS Merkle trees
-//! (§6), the hypertree (§7), FORS few-time signatures (§8), and the
+//! Implements every layer of the scheme: both §11 hash instantiations —
+//! SHAKE256 (§11.1) and SHA-2 (§11.2, incl. the category-3/5 SHA-512 split
+//! for H/T_l/H_msg/PRF_msg) — WOTS+ one-time signatures (§5), XMSS Merkle
+//! trees (§6), the hypertree (§7), FORS few-time signatures (§8), and the
 //! `slh_keygen_internal` / `slh_sign_internal` / `slh_verify_internal`
 //! top level (§9/§10) plus the pure external interface with context strings
 //! (§10.2, Algorithms 22/24). Pre-hash variants (HashSLH-DSA) are not
-//! implemented. Only the SHA2 category-1 instantiation (n = 16) is wired;
-//! instantiating with any other parameter set is a compile error.
+//! implemented. All twelve FIPS 205 parameter sets instantiate.
 
 const std = @import("std");
 const params = @import("params.zig");
@@ -16,17 +16,20 @@ const address = @import("address.zig");
 
 const Address = address.Address;
 const Sha256 = std.crypto.hash.sha2.Sha256;
+const Sha512 = std.crypto.hash.sha2.Sha512;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+const HmacSha512 = std.crypto.auth.hmac.sha2.HmacSha512;
+const Shake256 = std.crypto.hash.sha3.Shake256;
 
 /// Convert a byte string to base-2^b digits (FIPS 205 Algorithm 4).
-/// `b` <= 8; `x` must hold at least ceil(out.len * b / 8) bytes.
+/// `b` <= 16; `x` must hold at least ceil(out.len * b / 8) bytes.
 fn base2b(x: []const u8, comptime b: usize, out: []u32) void {
-    comptime std.debug.assert(b >= 1 and b <= 8);
+    comptime std.debug.assert(b >= 1 and b <= 16);
     var in: usize = 0;
-    var bits: u4 = 0;
-    // Meaningful low bits of `total` = `bits`; the u16 shift discards
-    // exhausted high bits, the mask below selects the digit.
-    var total: u16 = 0;
+    var bits: u5 = 0;
+    // Meaningful low bits of `total` = `bits` (< b + 8 <= 24); the shift
+    // discards exhausted high bits, the mask below selects the digit.
+    var total: u32 = 0;
     for (out) |*digit| {
         while (bits < b) {
             total = (total << 8) | x[in];
@@ -50,14 +53,20 @@ test "base2b splits into nibbles and 6-bit digits" {
     // Bitstream 10110|01101|10010 (0xB3, 0x64...) -> 22, 13, 18.
     base2b(&.{ 0b1011_0011, 0b0110_0100 }, 5, &out5);
     try std.testing.expectEqualSlices(u32, &.{ 22, 13, 18 }, &out5);
+    // Digits wider than a byte (FORS a = 12/14 in the s parameter sets).
+    var out12: [2]u32 = undefined;
+    base2b(&.{ 0xAB, 0xCD, 0xEF }, 12, &out12);
+    try std.testing.expectEqualSlices(u32, &.{ 0xABC, 0xDEF }, &out12);
+    var out14: [2]u32 = undefined;
+    // Bitstream 11111111111111|00000000000000 -> 16383, 0.
+    base2b(&.{ 0xFF, 0xFC, 0x00, 0x00 }, 14, &out14);
+    try std.testing.expectEqualSlices(u32, &.{ 16383, 0 }, &out14);
 }
 
 /// SLH-DSA over one FIPS 205 parameter set. Instantiate as e.g.
 /// `SlhDsa(params.sha2_128f)`; all state is per-call, no global state.
 pub fn SlhDsa(comptime P: params.Params) type {
     comptime P.validate();
-    if (P.hash != .sha2 or P.n != 16)
-        @compileError("slhdsa: only the SHA2 security-category-1 instantiation (n = 16) is implemented");
 
     return struct {
         /// The parameter set this instantiation implements.
@@ -135,72 +144,143 @@ pub fn SlhDsa(comptime P: params.Params) type {
             pk: PublicKey,
         };
 
-        // ── §11.2 SHA2 instantiation (security category 1) ────────────────
+        // ── §11 hash instantiations ───────────────────────────────────────
 
-        /// Tweakable-hash context. PK.seed || toByte(0, 64-n) is exactly one
-        /// SHA-256 compression block, so it is absorbed once here and the
-        /// midstate copied per call — the standard FIPS 205 SHA2 speedup.
-        const Thash = struct {
-            base: Sha256,
+        /// "Big" hash for H/T_l/H_msg/PRF_msg in the SHA2 family: SHA-256 at
+        /// security category 1 (§11.2.1), SHA-512 at categories 3/5
+        /// (§11.2.2). F and PRF stay SHA-256 at every category.
+        const Sha2Big = if (P.n == 16) Sha256 else Sha512;
+        const HmacBig = if (P.n == 16) HmacSha256 else HmacSha512;
 
-            fn init(pk_seed: [n]u8) Thash {
-                var st = Sha256.init(.{});
-                var block: [64]u8 = @splat(0);
-                block[0..n].* = pk_seed;
-                st.update(&block);
-                return .{ .base = st };
-            }
+        /// Tweakable-hash context, comptime-selected by `P.hash`. Both
+        /// variants absorb PK.seed once at init and copy the midstate per
+        /// call. For SHA2, PK.seed || toByte(0, block-n) is exactly one
+        /// compression block — the standard FIPS 205 speedup; SHAKE has no
+        /// block alignment to exploit but the state copy still saves work.
+        const Thash = switch (P.hash) {
+            .sha2 => struct {
+                base_f: Sha256,
+                base_h: Sha2Big,
 
-            /// Trunc_n(SHA-256(PK.seed || toByte(0,64-n) || ADRS_c || M...)).
-            /// Covers F, H, T_l and PRF — in the SHA2 category-1
-            /// instantiation they differ only in the input length.
-            fn hash(t: Thash, adrs: Address, parts: []const []const u8) [n]u8 {
-                var st = t.base;
-                st.update(&adrs.compressed());
-                for (parts) |p| st.update(p);
-                var digest: [Sha256.digest_length]u8 = undefined;
-                st.final(&digest);
-                return digest[0..n].*;
-            }
+                fn init(pk_seed: [n]u8) @This() {
+                    var st_f = Sha256.init(.{});
+                    var block_f: [Sha256.block_length]u8 = @splat(0);
+                    block_f[0..n].* = pk_seed;
+                    st_f.update(&block_f);
+                    var st_h = Sha2Big.init(.{});
+                    var block_h: [Sha2Big.block_length]u8 = @splat(0);
+                    block_h[0..n].* = pk_seed;
+                    st_h.update(&block_h);
+                    return .{ .base_f = st_f, .base_h = st_h };
+                }
+
+                /// F and PRF (§11.2): Trunc_n(SHA-256(PK.seed ||
+                /// toByte(0, 64-n) || ADRS_c || M...)).
+                fn f(t: @This(), adrs: Address, parts: []const []const u8) [n]u8 {
+                    var st = t.base_f;
+                    st.update(&adrs.compressed());
+                    for (parts) |p| st.update(p);
+                    var digest: [Sha256.digest_length]u8 = undefined;
+                    st.final(&digest);
+                    return digest[0..n].*;
+                }
+
+                /// H and T_l (§11.2): the same shape over the category hash
+                /// (SHA-512 padded to its 128-byte block for categories 3/5).
+                fn h(t: @This(), adrs: Address, parts: []const []const u8) [n]u8 {
+                    var st = t.base_h;
+                    st.update(&adrs.compressed());
+                    for (parts) |p| st.update(p);
+                    var digest: [Sha2Big.digest_length]u8 = undefined;
+                    st.final(&digest);
+                    return digest[0..n].*;
+                }
+            },
+            .shake => struct {
+                base: Shake256,
+
+                fn init(pk_seed: [n]u8) @This() {
+                    var st = Shake256.init(.{});
+                    st.update(&pk_seed);
+                    return .{ .base = st };
+                }
+
+                /// F/H/T_l/PRF (§11.1) are all one function:
+                /// SHAKE256(PK.seed || ADRS || M..., 8n) — the full 32-byte
+                /// ADRS, no compression in the SHAKE instantiation.
+                fn f(t: @This(), adrs: Address, parts: []const []const u8) [n]u8 {
+                    var st = t.base;
+                    st.update(&adrs.bytes);
+                    for (parts) |p| st.update(p);
+                    var out: [n]u8 = undefined;
+                    st.squeeze(&out);
+                    return out;
+                }
+
+                fn h(t: @This(), adrs: Address, parts: []const []const u8) [n]u8 {
+                    return t.f(adrs, parts);
+                }
+            },
         };
 
-        /// H_msg (§11.2.1): MGF1-SHA-256(R || PK.seed ||
-        /// SHA-256(R || PK.seed || PK.root || M), m). The message is taken
-        /// as parts so the §10.2 pure prefix needs no concatenation buffer.
+        /// H_msg: SHAKE256(R || PK.seed || PK.root || M, 8m) (§11.1), or
+        /// MGF1-Hash(R || PK.seed || Hash(R || PK.seed || PK.root || M), m)
+        /// with Hash = SHA-256 / SHA-512 by category (§11.2). The message is
+        /// taken as parts so the §10.2 pure prefix needs no concat buffer.
         fn hMsg(r: [n]u8, pk: PublicKey, msg_parts: []const []const u8) [P.m]u8 {
-            var st = Sha256.init(.{});
+            if (comptime P.hash == .shake) {
+                var st = Shake256.init(.{});
+                st.update(&r);
+                st.update(&pk.seed);
+                st.update(&pk.root);
+                for (msg_parts) |p| st.update(p);
+                var out: [P.m]u8 = undefined;
+                st.squeeze(&out);
+                return out;
+            }
+            var st = Sha2Big.init(.{});
             st.update(&r);
             st.update(&pk.seed);
             st.update(&pk.root);
             for (msg_parts) |p| st.update(p);
-            var inner: [Sha256.digest_length]u8 = undefined;
+            var inner: [Sha2Big.digest_length]u8 = undefined;
             st.final(&inner);
 
-            // MGF1: concat SHA-256(seed || counter_be32) blocks.
-            var seed: [2 * n + Sha256.digest_length + 4]u8 = undefined;
+            // MGF1: concat Hash(seed || counter_be32) blocks.
+            var seed: [2 * n + Sha2Big.digest_length + 4]u8 = undefined;
             seed[0..n].* = r;
             seed[n .. 2 * n].* = pk.seed;
-            seed[2 * n ..][0..Sha256.digest_length].* = inner;
+            seed[2 * n ..][0..Sha2Big.digest_length].* = inner;
             var out: [P.m]u8 = undefined;
             var counter: u32 = 0;
             var off: usize = 0;
             while (off < P.m) : (counter += 1) {
-                std.mem.writeInt(u32, seed[2 * n + Sha256.digest_length ..][0..4], counter, .big);
-                var block: [Sha256.digest_length]u8 = undefined;
-                Sha256.hash(&seed, &block, .{});
-                const take = @min(Sha256.digest_length, P.m - off);
+                std.mem.writeInt(u32, seed[2 * n + Sha2Big.digest_length ..][0..4], counter, .big);
+                var block: [Sha2Big.digest_length]u8 = undefined;
+                Sha2Big.hash(&seed, &block, .{});
+                const take = @min(Sha2Big.digest_length, P.m - off);
                 @memcpy(out[off..][0..take], block[0..take]);
                 off += take;
             }
             return out;
         }
 
-        /// PRF_msg (§11.2.1): Trunc_n(HMAC-SHA-256(SK.prf, opt_rand || M)).
+        /// PRF_msg: SHAKE256(SK.prf || opt_rand || M, 8n) (§11.1), or
+        /// Trunc_n(HMAC-Hash(SK.prf, opt_rand || M)) by category (§11.2).
         fn prfMsg(sk_prf: [n]u8, opt_rand: [n]u8, msg_parts: []const []const u8) [n]u8 {
-            var mac = HmacSha256.init(&sk_prf);
+            if (comptime P.hash == .shake) {
+                var st = Shake256.init(.{});
+                st.update(&sk_prf);
+                st.update(&opt_rand);
+                for (msg_parts) |p| st.update(p);
+                var out: [n]u8 = undefined;
+                st.squeeze(&out);
+                return out;
+            }
+            var mac = HmacBig.init(&sk_prf);
             mac.update(&opt_rand);
             for (msg_parts) |p| mac.update(p);
-            var out: [HmacSha256.mac_length]u8 = undefined;
+            var out: [HmacBig.mac_length]u8 = undefined;
             mac.final(&out);
             return out[0..n].*;
         }
@@ -213,7 +293,7 @@ pub fn SlhDsa(comptime P: params.Params) type {
             var j = i;
             while (j < i + s) : (j += 1) {
                 adrs.setHash(j);
-                tmp = th.hash(adrs.*, &.{&tmp});
+                tmp = th.f(adrs.*, &.{&tmp});
             }
             return tmp;
         }
@@ -248,14 +328,14 @@ pub fn SlhDsa(comptime P: params.Params) type {
             var tmp: [wots_sig_len]u8 = undefined;
             for (0..wots_len) |i| {
                 sk_adrs.setChain(@intCast(i));
-                const sk = th.hash(sk_adrs, &.{&sk_seed}); // PRF
+                const sk = th.f(sk_adrs, &.{&sk_seed}); // PRF
                 chain_adrs.setChain(@intCast(i));
                 tmp[i * n ..][0..n].* = chainF(th, sk, 0, w - 1, &chain_adrs);
             }
             var pk_adrs = adrs;
             pk_adrs.setTypeAndClear(.wots_pk);
             pk_adrs.setKeyPair(adrs.getKeyPair());
-            return th.hash(pk_adrs, &.{&tmp}); // T_len
+            return th.h(pk_adrs, &.{&tmp}); // T_len
         }
 
         /// Algorithm 7: WOTS+ signature over an n-byte message.
@@ -267,7 +347,7 @@ pub fn SlhDsa(comptime P: params.Params) type {
             var chain_adrs = adrs;
             for (0..wots_len) |i| {
                 sk_adrs.setChain(@intCast(i));
-                const sk = th.hash(sk_adrs, &.{&sk_seed}); // PRF
+                const sk = th.f(sk_adrs, &.{&sk_seed}); // PRF
                 chain_adrs.setChain(@intCast(i));
                 out[i * n ..][0..n].* = chainF(th, sk, 0, digits[i], &chain_adrs);
             }
@@ -291,7 +371,7 @@ pub fn SlhDsa(comptime P: params.Params) type {
             var pk_adrs = adrs;
             pk_adrs.setTypeAndClear(.wots_pk);
             pk_adrs.setKeyPair(adrs.getKeyPair());
-            return th.hash(pk_adrs, &.{&tmp}); // T_len
+            return th.h(pk_adrs, &.{&tmp}); // T_len
         }
 
         // ── §6 XMSS ───────────────────────────────────────────────────────
@@ -310,7 +390,7 @@ pub fn SlhDsa(comptime P: params.Params) type {
             node_adrs.setTypeAndClear(.tree);
             node_adrs.setTreeHeight(z);
             node_adrs.setTreeIndex(i);
-            return th.hash(node_adrs, &.{ &lnode, &rnode }); // H
+            return th.h(node_adrs, &.{ &lnode, &rnode }); // H
         }
 
         /// Algorithm 10: WOTS+ signature + authentication path for leaf idx.
@@ -341,10 +421,10 @@ pub fn SlhDsa(comptime P: params.Params) type {
                 const auth = sig[wots_sig_len + k * n ..][0..n];
                 if ((idx >> @intCast(k)) & 1 == 0) {
                     node_adrs.setTreeIndex(node_adrs.getTreeIndex() / 2);
-                    node = th.hash(node_adrs, &.{ &node, auth }); // H
+                    node = th.h(node_adrs, &.{ &node, auth }); // H
                 } else {
                     node_adrs.setTreeIndex((node_adrs.getTreeIndex() - 1) / 2);
-                    node = th.hash(node_adrs, &.{ auth, &node }); // H
+                    node = th.h(node_adrs, &.{ auth, &node }); // H
                 }
             }
             return node;
@@ -396,7 +476,7 @@ pub fn SlhDsa(comptime P: params.Params) type {
             sk_adrs.setTypeAndClear(.fors_prf);
             sk_adrs.setKeyPair(adrs.getKeyPair());
             sk_adrs.setTreeIndex(idx);
-            return th.hash(sk_adrs, &.{&sk_seed}); // PRF
+            return th.f(sk_adrs, &.{&sk_seed}); // PRF
         }
 
         /// Algorithm 15: Merkle node (i, z) across the k FORS trees.
@@ -406,13 +486,13 @@ pub fn SlhDsa(comptime P: params.Params) type {
                 const sk = forsSkGen(th, sk_seed, adrs, i);
                 node_adrs.setTreeHeight(0);
                 node_adrs.setTreeIndex(i);
-                return th.hash(node_adrs, &.{&sk}); // F
+                return th.f(node_adrs, &.{&sk}); // F
             }
             const lnode = forsNode(th, sk_seed, 2 * i, z - 1, adrs);
             const rnode = forsNode(th, sk_seed, 2 * i + 1, z - 1, adrs);
             node_adrs.setTreeHeight(z);
             node_adrs.setTreeIndex(i);
-            return th.hash(node_adrs, &.{ &lnode, &rnode }); // H
+            return th.h(node_adrs, &.{ &lnode, &rnode }); // H
         }
 
         /// Algorithm 16: k secret values + authentication paths.
@@ -450,16 +530,16 @@ pub fn SlhDsa(comptime P: params.Params) type {
                 const off = i * (1 + fors_a) * n;
                 node_adrs.setTreeHeight(0);
                 node_adrs.setTreeIndex(@intCast(i * (1 << fors_a) + indices[i]));
-                var node = th.hash(node_adrs, &.{sig[off..][0..n]}); // F
+                var node = th.f(node_adrs, &.{sig[off..][0..n]}); // F
                 for (0..fors_a) |j| {
                     const auth = sig[off + (1 + j) * n ..][0..n];
                     node_adrs.setTreeHeight(@intCast(j + 1));
                     if ((indices[i] >> @intCast(j)) & 1 == 0) {
                         node_adrs.setTreeIndex(node_adrs.getTreeIndex() / 2);
-                        node = th.hash(node_adrs, &.{ &node, auth }); // H
+                        node = th.h(node_adrs, &.{ &node, auth }); // H
                     } else {
                         node_adrs.setTreeIndex((node_adrs.getTreeIndex() - 1) / 2);
-                        node = th.hash(node_adrs, &.{ auth, &node }); // H
+                        node = th.h(node_adrs, &.{ auth, &node }); // H
                     }
                 }
                 roots[i * n ..][0..n].* = node;
@@ -467,7 +547,7 @@ pub fn SlhDsa(comptime P: params.Params) type {
             var pk_adrs = adrs;
             pk_adrs.setTypeAndClear(.fors_roots);
             pk_adrs.setKeyPair(adrs.getKeyPair());
-            return th.hash(pk_adrs, &.{&roots}); // T_k
+            return th.h(pk_adrs, &.{&roots}); // T_k
         }
 
         // ── §9/§10 SLH-DSA ────────────────────────────────────────────────
@@ -608,6 +688,27 @@ test "WOTS+ sign -> pkFromSig recovers pkGen's public key" {
     // A different message must not recover the same key.
     const other = TestScheme.wotsPkFromSig(th, &sig, testSeed(0x7F), adrs);
     try std.testing.expect(!std.mem.eql(u8, &pk, &other));
+}
+
+test "WOTS+ round-trip holds for the SHAKE and SHA2 category-3 hashes" {
+    inline for (.{ SlhDsa(params.shake_128f), SlhDsa(params.sha2_192f) }) |S| {
+        const seed: [S.n]u8 = @splat(0x27);
+        const th = S.Thash.init(seed);
+        var adrs: Address = .{};
+        adrs.setTypeAndClear(.wots_hash);
+        adrs.setKeyPair(1);
+        const sk_seed: [S.n]u8 = @splat(0x4D);
+        const pk = S.wotsPkGen(th, sk_seed, adrs);
+        const msg: [S.n]u8 = @splat(0xB2);
+        var sig: [S.wots_sig_len]u8 = undefined;
+        S.wotsSign(th, msg, sk_seed, adrs, &sig);
+        const recovered = S.wotsPkFromSig(th, &sig, msg, adrs);
+        try std.testing.expectEqualSlices(u8, &pk, &recovered);
+        var msg2 = msg;
+        msg2[0] ^= 1;
+        const other = S.wotsPkFromSig(th, &sig, msg2, adrs);
+        try std.testing.expect(!std.mem.eql(u8, &pk, &other));
+    }
 }
 
 test "XMSS sign -> pkFromSig recovers the tree root for every leaf" {

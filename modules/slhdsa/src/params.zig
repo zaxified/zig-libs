@@ -1,19 +1,19 @@
 // SPDX-License-Identifier: MIT
 //! params — SLH-DSA (FIPS 205) parameter sets.
 //!
-//! Only `sha2_128f` (SLH-DSA-SHA2-128f, Table 2 of FIPS 205) is wired to an
-//! implemented hash instantiation today; the struct carries every FIPS 205
-//! knob so the remaining eleven sets are a matter of adding the table rows
-//! plus the SHA2 category-3/5 and SHAKE hash instantiations in `engine.zig`.
+//! All twelve FIPS 205 Table 2 rows: SLH-DSA-SHA2-{128,192,256}{s,f} and
+//! SLH-DSA-SHAKE-{128,192,256}{s,f}. `engine.SlhDsa` implements both §11
+//! hash instantiations, so every row here is usable end-to-end.
 
 const std = @import("std");
 
 /// Which §11 hash instantiation a parameter set uses.
 pub const HashFamily = enum {
-    /// FIPS 205 §11.2 — SHA-2 family (SHA-256 throughout for security
-    /// category 1; categories 3/5 additionally use SHA-512).
+    /// FIPS 205 §11.2 — SHA-2 family: SHA-256 throughout for security
+    /// category 1 (§11.2.1); categories 3/5 keep SHA-256 for F/PRF but use
+    /// SHA-512 for H/T_l/H_msg/PRF_msg (§11.2.2).
     sha2,
-    /// FIPS 205 §11.1 — SHAKE256 for every function. Not implemented yet.
+    /// FIPS 205 §11.1 — SHAKE256 for every function, full 32-byte ADRS.
     shake,
 };
 
@@ -81,6 +81,8 @@ pub const Params = struct {
 
     /// Compile-time consistency checks (Table 2 internal relations).
     pub fn validate(comptime p: Params) void {
+        if (p.n != 16 and p.n != 24 and p.n != 32)
+            @compileError("params: FIPS 205 defines only n = 16, 24, 32");
         if (p.hp * p.d != p.h) @compileError("params: h' * d must equal h");
         if (p.m != p.mdLen() + p.idxTreeLen() + p.idxLeafLen())
             @compileError("params: m must match its three digest slices");
@@ -89,20 +91,83 @@ pub const Params = struct {
     }
 };
 
-/// SLH-DSA-SHA2-128f (FIPS 205 Table 2): security category 1, "fast"
-/// (larger signature, faster signing). pk 32 B, sk 64 B, sig 17 088 B.
-pub const sha2_128f: Params = .{
-    .name = "SLH-DSA-SHA2-128f",
-    .hash = .sha2,
-    .n = 16,
-    .h = 66,
-    .d = 22,
-    .hp = 3,
-    .a = 6,
-    .k = 33,
-    .lg_w = 4,
-    .m = 34,
+/// The six Table 2 numeric rows (shared by the SHA2 and SHAKE families).
+fn tableRow(
+    comptime name: []const u8,
+    comptime hash: HashFamily,
+    comptime n: usize,
+    comptime h: usize,
+    comptime d: usize,
+    comptime hp: usize,
+    comptime a: usize,
+    comptime k: usize,
+    comptime m: usize,
+) Params {
+    return .{
+        .name = name,
+        .hash = hash,
+        .n = n,
+        .h = h,
+        .d = d,
+        .hp = hp,
+        .a = a,
+        .k = k,
+        .lg_w = 4,
+        .m = m,
+    };
+}
+
+// FIPS 205 Table 2, all twelve parameter sets. "s" = small signature /
+// slow signing, "f" = fast signing / large signature. pk = 2n, sk = 4n.
+
+/// SLH-DSA-SHA2-128s: category 1, pk 32 B, sk 64 B, sig 7 856 B.
+pub const sha2_128s: Params = tableRow("SLH-DSA-SHA2-128s", .sha2, 16, 63, 7, 9, 12, 14, 30);
+/// SLH-DSA-SHA2-128f: category 1, pk 32 B, sk 64 B, sig 17 088 B.
+pub const sha2_128f: Params = tableRow("SLH-DSA-SHA2-128f", .sha2, 16, 66, 22, 3, 6, 33, 34);
+/// SLH-DSA-SHA2-192s: category 3, pk 48 B, sk 96 B, sig 16 224 B.
+pub const sha2_192s: Params = tableRow("SLH-DSA-SHA2-192s", .sha2, 24, 63, 7, 9, 14, 17, 39);
+/// SLH-DSA-SHA2-192f: category 3, pk 48 B, sk 96 B, sig 35 664 B.
+pub const sha2_192f: Params = tableRow("SLH-DSA-SHA2-192f", .sha2, 24, 66, 22, 3, 8, 33, 42);
+/// SLH-DSA-SHA2-256s: category 5, pk 64 B, sk 128 B, sig 29 792 B.
+pub const sha2_256s: Params = tableRow("SLH-DSA-SHA2-256s", .sha2, 32, 64, 8, 8, 14, 22, 47);
+/// SLH-DSA-SHA2-256f: category 5, pk 64 B, sk 128 B, sig 49 856 B.
+pub const sha2_256f: Params = tableRow("SLH-DSA-SHA2-256f", .sha2, 32, 68, 17, 4, 9, 35, 49);
+
+/// SLH-DSA-SHAKE-128s: category 1, pk 32 B, sk 64 B, sig 7 856 B.
+pub const shake_128s: Params = tableRow("SLH-DSA-SHAKE-128s", .shake, 16, 63, 7, 9, 12, 14, 30);
+/// SLH-DSA-SHAKE-128f: category 1, pk 32 B, sk 64 B, sig 17 088 B.
+pub const shake_128f: Params = tableRow("SLH-DSA-SHAKE-128f", .shake, 16, 66, 22, 3, 6, 33, 34);
+/// SLH-DSA-SHAKE-192s: category 3, pk 48 B, sk 96 B, sig 16 224 B.
+pub const shake_192s: Params = tableRow("SLH-DSA-SHAKE-192s", .shake, 24, 63, 7, 9, 14, 17, 39);
+/// SLH-DSA-SHAKE-192f: category 3, pk 48 B, sk 96 B, sig 35 664 B.
+pub const shake_192f: Params = tableRow("SLH-DSA-SHAKE-192f", .shake, 24, 66, 22, 3, 8, 33, 42);
+/// SLH-DSA-SHAKE-256s: category 5, pk 64 B, sk 128 B, sig 29 792 B.
+pub const shake_256s: Params = tableRow("SLH-DSA-SHAKE-256s", .shake, 32, 64, 8, 8, 14, 22, 47);
+/// SLH-DSA-SHAKE-256f: category 5, pk 64 B, sk 128 B, sig 49 856 B.
+pub const shake_256f: Params = tableRow("SLH-DSA-SHAKE-256f", .shake, 32, 68, 17, 4, 9, 35, 49);
+
+/// All twelve sets, for test iteration.
+pub const all = [_]Params{
+    sha2_128s,  sha2_128f,  sha2_192s,  sha2_192f,  sha2_256s,  sha2_256f,
+    shake_128s, shake_128f, shake_192s, shake_192f, shake_256s, shake_256f,
 };
+
+test "every set validates and derives the FIPS 205 Table 2 signature size" {
+    // (set, sig bytes) — signature sizes as printed in FIPS 205 Table 2.
+    const expected = [_]struct { Params, usize }{
+        .{ sha2_128s, 7856 },  .{ shake_128s, 7856 },
+        .{ sha2_128f, 17088 }, .{ shake_128f, 17088 },
+        .{ sha2_192s, 16224 }, .{ shake_192s, 16224 },
+        .{ sha2_192f, 35664 }, .{ shake_192f, 35664 },
+        .{ sha2_256s, 29792 }, .{ shake_256s, 29792 },
+        .{ sha2_256f, 49856 }, .{ shake_256f, 49856 },
+    };
+    inline for (expected) |case| {
+        comptime case[0].validate();
+        try std.testing.expectEqual(case[1], comptime case[0].sigLen());
+    }
+    try std.testing.expectEqual(expected.len, all.len);
+}
 
 test "derived lengths for SLH-DSA-SHA2-128f match FIPS 205 Table 2" {
     comptime sha2_128f.validate();
