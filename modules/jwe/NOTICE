@@ -1,0 +1,52 @@
+jwe — provenance note
+======================
+
+Kept as a module-local NOTICE (same placement precedent as the sibling
+`tlsresume`/`dtls` modules — self-contained crypto-adjacent modules not
+folded into the root `NOTICE`).
+
+Provenance
+----------
+
+jwe — clean-room implementation from RFC 7516 (JSON Web Encryption), RFC
+7518 (JSON Web Algorithms — the `alg`/`enc` algorithm definitions), and RFC
+3394 (AES Key Wrap, the `aeskw.zig` core). These are open,
+public IETF/informational specifications — not copyrightable works (merger
+doctrine; see CONVENTIONS.md §5) — so no third-party-source NOTICE entry is
+strictly required for the RFC citations alone.
+
+This module names one real design/code reference: `modules/dnp3/src/sa.zig`
+(this repo's own DNP3 Secure Authentication module), whose `aeskw` namespace
+already implements RFC 3394 AES Key Wrap (AES-128/256 KEK) and is byte-exact
+against the RFC 3394 §4 published vectors. `jwe`'s own `aeskw.zig` is
+**mirrored from that reference** (re-expressed against the RFC text, then
+independently validated against the same §4.1 vector) and does NOT import
+`dnp3` — sibling modules stay independent per CONVENTIONS.md's
+naming/structure rules; no code needed license care since both are this
+repo's own MIT-licensed work.
+
+`jwe` also names its sibling `jwt` (RFC 7515 JWS/RFC 7519 JWT) as the design
+precedent for this module's JOSE-header/base64url/error-handling house
+style (compact-serialization parsing shape, arena-per-call ownership,
+`fromString`-into-`.unknown` enum mapping) — again this repo's own work, no
+third-party source involved.
+
+`std.crypto.aead.aes_gcm`, `std.crypto.pwhash.pbkdf2`,
+`std.crypto.auth.hmac`, `std.json`, and `std.base64` are used via their
+public std APIs (MIT, part of Zig itself). The `rsa` module (this repo's
+own, RFC 8017 clean-room — see its own NOTICE/SPEC) supplies the RSA-OAEP
+primitives via its public `encryptOaep`/`decryptOaep`.
+
+No GPL/LGPL/AGPL source was consulted or copied anywhere in this module.
+
+**Status: real — no stubs remain.** `dir`, RSA-OAEP/RSA-OAEP-256 (wraps
+`rsa`), A128GCM/A256GCM content encryption, A128CBC-HS256/A256CBC-HS512
+content encryption (RFC 7518 §5.2, byte-exact against Appendix B.1/B.3),
+A128GCMKW/A256GCMKW key wrap, A128KW/A256KW + PBES2-* key wrap (RFC 3394,
+byte-exact against §4.1 and RFC 7516 A.3 both directions), the JOSE header
+codec, and the compact-serialization encrypt/decrypt dispatch — all tested
+(KATs where the assigned RFCs publish them; RFC 7516 A.1 decrypt-direction
+byte-exact). The only remaining limitation is AES-192 (`A192GCM`/
+`A192GCMKW`/`A192KW`/`A192CBC-HS384`): Zig 0.16's std ships no AES-192
+cipher at all — a typed `error.UnsupportedKeyLength`, documented in SPEC.md
+(the B.2 vector's HMAC half is still validated in tests).

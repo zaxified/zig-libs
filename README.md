@@ -11,7 +11,7 @@ cross-project-reusable capability — a production-grade implementation of a pro
 or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
 authors' other projects depend on it, not the reverse.
 
-**Status:** 91 modules · 2493 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 92 modules · 2523 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ## Using a module
@@ -80,6 +80,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `openapi` | OpenAPI 3.1 spec generated from the route table + `/openapi.json` | any | router, http |
 | `aaa-gate` | Bearer + **API-key** auth (constant-time) + audit hook + denied-request throttle | any | router, http |
 | `jwt` | JWT/JWS + **OIDC resource-server** validator (RFC 7515/7519/7517/8725) — parse + claims + verify (HS/ES/EdDSA/RSA, alg-confusion-safe) + JWKS-by-`kid` + **OIDC discovery/fetch** (cache + key-rotation) + a **`router` Bearer middleware** (RFC 6750 challenge, scope check, identity on ctx) | any | http, router |
+| `jwe` | JSON Web Encryption (RFC 7516/7518) compact serialization — `dir`/RSA-OAEP/RSA-OAEP-256/AxxxKW (RFC 3394)/AxxxGCMKW/PBES2 key management + A128GCM/A256GCM/A128CBC-HS256/A256CBC-HS512 content encryption, RFC-KAT-validated (incl. RFC 7516 A.3 byte-exact both directions); A192* unsupported (no AES-192 in std) | any | rsa |
 | `acme` | Let's Encrypt / ACME v2 (RFC 8555): HTTP-01 issuance + renewal, ES256 JWS, CSR | any | http, router |
 | `sessions` | Server-side web sessions + OWASP-hardened cookies + signed double-submit **CSRF** middleware | any | router, http, cookies, ramcache |
 | `llmclient` | Anthropic Messages API client (buffered + streaming SSE) over `http` — no third-party SDK | any | http |

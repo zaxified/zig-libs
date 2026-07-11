@@ -70,6 +70,7 @@ const module_list = [_]Module{
     .{ .name = "l2disco", .deps = &.{"netaddr"} },
     .{ .name = "upstream", .deps = &.{ "resilience", "probe" } },
     .{ .name = "jwt", .deps = &.{ "http", "router" } },
+    .{ .name = "jwe", .deps = &.{"rsa"} },
     .{ .name = "rdap", .deps = &.{ "http", "netaddr" } },
     .{ .name = "blobstore", .deps = &.{"hashdigest"} },
     .{ .name = "procnet", .deps = &.{"netaddr"} },
