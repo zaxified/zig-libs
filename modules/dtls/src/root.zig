@@ -29,24 +29,49 @@
 //!   `send`/`recv` do real record protection + sequence-number encryption,
 //!   proven by client↔server self-consistency (identical derived keys,
 //!   round-trip both directions, tamper→`error.DecryptionFailed`).
+//! - `Connection.zig`'s handshake FLIGHT ENGINE (`startHandshake`/
+//!   `handleFlight`/`poll`): a real RFC 9147 §5 PSK-only client+server
+//!   handshake, sequencing every sibling module above into a live wire
+//!   exchange — ClientHello (with a real PSK binder over the running
+//!   transcript) → ServerHello → {EncryptedExtensions, Finished} (epoch 2,
+//!   AEAD-protected under the derived handshake traffic keys) → client
+//!   Finished → application keys installed on both sides via the existing
+//!   `installApplicationKeys`. Both Finished `verify_data`s and the PSK
+//!   binder are checked with constant-time compares
+//!   (`std.crypto.timing_safe.eql`). `poll` retransmits the last flight on
+//!   a caller-clocked `flight.RetransmitTimer` if the peer's next flight
+//!   hasn't arrived. Proven by an in-memory client↔server interop test —
+//!   no external DTLS peer required (see `Connection.zig`'s tests).
 //!
-//! **What is real framing (unchanged from the scaffold):** the unified +
-//! legacy record headers (`record.zig`), handshake message framing +
-//! fragmentation/reassembly (`handshake.zig`), the RFC 9147 §7 ACK message +
-//! caller-clocked retransmission timer + flight bookkeeping (`flight.zig`),
-//! and ClientHello/ServerHello/EncryptedExtensions/Finished/HRR message
-//! bodies incl. the PSK extensions (`messages.zig`).
+//!   SCOPE CAVEAT (honest): the flight engine is validated for SELF-interop
+//!   (this module's client with this module's server), NOT yet as a drop-in
+//!   for a third-party DTLS 1.3 peer. Two deliberate wire simplifications
+//!   stand in the way of real-peer interop and are called out rather than
+//!   hidden: (1) the epoch-0 ServerHello is framed with the legacy
+//!   `PlaintextHeader` rather than RFC 9147's unified-header form, and (2)
+//!   the ClientHello omits the `supported_versions`/`cookie` extensions a
+//!   real peer expects for version negotiation. Closing these (plus
+//!   cross-`handleFlight` fragment reassembly, currently single-fragment
+//!   only) is the remaining work before an OpenSSL `s_server -dtls1_3 -psk`
+//!   live-interop test.
 //!
-//! **Out of scope (this crypto-core pass):** the full handshake FLIGHT
-//! ENGINE — `Connection.startHandshake` returns
-//! `error.HandshakeEngineNotImplemented` rather than faking a handshake. All
-//! the primitives a live handshake needs exist and are tested; only the
-//! sequencing/state machine (and, with it, a live wire-interop test against
-//! a real DTLS 1.3 PSK peer) is deferred. Also out of scope by design:
-//! X.509/certificate auth, 0-RTT/early data, session resumption
-//! (`res binder`/NewSessionTicket), key update, and the CCM suites (Zig 0.16
-//! std ships only a 13-byte-nonce CCM; the TLS/DTLS profile needs 12 — see
-//! `aead.zig`'s CCM caveat).
+//! **What is real framing (used directly by the flight engine, not just
+//! unit-tested in isolation):** the unified + legacy record headers
+//! (`record.zig`), handshake message framing + fragmentation/reassembly
+//! (`handshake.zig`), the RFC 9147 §7 ACK message + caller-clocked
+//! retransmission timer + flight bookkeeping (`flight.zig`), and
+//! ClientHello/ServerHello/EncryptedExtensions/Finished/HRR message bodies
+//! incl. the PSK extensions (`messages.zig`).
+//!
+//! **Out of scope (deliberate, not deferred-as-a-stub):** HelloRetryRequest
+//! / the stateless-cookie retry round trip (a HelloRetryRequest ServerHello
+//! is detected — RFC 8446 §4.1.3's magic `random` — and rejected with a
+//! typed error rather than silently mishandled); 0-RTT/early data; session
+//! resumption (`res binder`/NewSessionTicket); key update
+//! (RFC 8446 §4.6.3); X.509/certificate auth (this module is PSK-only by
+//! design, see above); and the CCM suites (Zig 0.16 std ships only a
+//! 13-byte-nonce CCM; the TLS/DTLS profile needs 12 — see `aead.zig`'s CCM
+//! caveat).
 //!
 //! **AEAD/CCM recon correction:** the scaffold claimed "AES-CCM is NOT a std
 //! gap." That is true for a 13-byte nonce but WRONG for the TLS/DTLS 1.3
@@ -91,8 +116,15 @@
 //! - **Full crypto-core composition:** client↔server self-consistency in
 //!   `Connection.zig` (identical derived keys, `send`→`recv` round-trip both
 //!   directions, sequence numbers encrypted on the wire, tamper→reject).
-//! - **Live DTLS 1.3 PSK wire handshake:** NOT performed — it needs the
-//!   handshake flight engine (out of scope this pass). Marked unproven.
+//! - **Live DTLS 1.3 PSK wire handshake:** a real in-memory client↔server
+//!   interop test drives `startHandshake`/`handleFlight` end to end for
+//!   both validated suites, asserting both sides reach `.connected` with
+//!   byte-identical derived application keys, a real `send`/`recv`
+//!   application-data round trip in both directions over those
+//!   freshly-installed keys, and rejection (typed errors, never a panic) of
+//!   a wrong PSK, a mismatched PSK identity, a corrupted ServerHello, and a
+//!   dropped-then-retransmitted (fake-clock-driven) ClientHello. No
+//!   external DTLS peer is used — see `Connection.zig`'s tests.
 
 const std = @import("std");
 
@@ -102,6 +134,7 @@ pub const flight = @import("flight.zig");
 pub const messages = @import("messages.zig");
 pub const keyschedule = @import("keyschedule.zig");
 pub const aead = @import("aead.zig");
+pub const engine = @import("engine.zig");
 pub const connection = @import("Connection.zig");
 
 pub const Connection = connection.Connection;
@@ -133,6 +166,7 @@ test {
     _ = messages;
     _ = keyschedule;
     _ = aead;
+    _ = engine;
     _ = connection;
 }
 
