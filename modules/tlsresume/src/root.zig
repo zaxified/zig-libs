@@ -22,6 +22,7 @@
 //! | `ticket.zig` | `NewSessionTicket` encode/decode (RFC 8446 §4.6.1) — pure wire codec, KAT-validated byte-for-byte against RFC 8448 §3's real NewSessionTicket message |
 //! | `stek.zig` | STEK ring (`rotate`/`findKey`/`activeKey` bookkeeping, no key generation) + `seal`/`open` (AES-256-GCM ticket-blob AEAD, key id bound as AAD) |
 //! | `psk.zig` | `derivePsk`/`earlySecret`/`binderKey`/`computeBinder`/`verifyBinder` (RFC 8446 §7.1/§4.2.11.2 HKDF/HMAC chain, byte-exact vs RFC 8448 §4) |
+//! | `earlydata.zig` | 0-RTT early-data key schedule (RFC 8446 §7.1 early branch + §7.3): `clientEarlyTrafficSecret`/`earlyExporterMasterSecret`/`earlyTrafficKeyIv` + `EarlyDataContext` convenience — byte-exact vs RFC 8448 §4's 0-RTT trace, incl. opening its real encrypted early-data record |
 //! | `replay.zig` | `obfuscateAge`/`deobfuscateAge`/`withinFreshnessWindow` (RFC 8446 §4.2.11.1) + `StrikeRegister` (RFC 8446 §8/§8.1 bounded single-use anti-replay) |
 //! | `select.zig` | `SessionState(rms_len)` (de)serialization (this module's own STEK-plaintext layout) + `selectPsk` (the server-side §4.2.11 selection loop composing all of the above) |
 //!
@@ -53,12 +54,14 @@ const std = @import("std");
 pub const stek = @import("stek.zig");
 pub const ticket = @import("ticket.zig");
 pub const psk = @import("psk.zig");
+pub const earlydata = @import("earlydata.zig");
 pub const replay = @import("replay.zig");
 pub const select = @import("select.zig");
 
 pub const StekRing = stek.StekRing;
 pub const NewSessionTicket = ticket.NewSessionTicket;
 pub const StrikeRegister = replay.StrikeRegister;
+pub const EarlyDataContext = earlydata.EarlyDataContext;
 
 pub const meta = .{
     .platform = .any,
@@ -86,6 +89,7 @@ test {
     _ = stek;
     _ = ticket;
     _ = psk;
+    _ = earlydata;
     _ = replay;
     _ = select;
 }

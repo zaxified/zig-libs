@@ -63,11 +63,16 @@ around.
 No GPL/LGPL/AGPL source was consulted or copied anywhere in this module.
 
 **Status: crypto core implemented + KAT-validated.** `psk.zig` (PSK
-derivation + binder) is byte-exact against RFC 8448 §4; `stek.zig`'s
-`seal`/`open` (AES-256-GCM ticket sealing, key-id-bound AAD), `replay.zig`'s
+derivation + binder) and `earlydata.zig` (0-RTT early-data key schedule —
+"c e traffic"/"e exp master"/record key+iv, RFC 8446 §7.1/§7.3) are
+byte-exact against RFC 8448 §4's resumed-0-RTT trace (earlydata.zig's KATs
+include opening that trace's actual encrypted early-data record — vectors
+fetched from the same rfc-editor.org source as psk.zig's, not copied from
+any implementation's test suite); `stek.zig`'s `seal`/`open` (AES-256-GCM
+ticket sealing, key-id-bound AAD), `replay.zig`'s
 `StrikeRegister.checkAndMark` (single-use anti-replay), and `select.zig`'s
 `selectPsk` (server-side identity selection + const-time binder verify) are
-real and tested (34/34, Debug + ReleaseFast). What this module deliberately
+real and tested (42/42, Debug + ReleaseFast). What this module deliberately
 does NOT own: the TLS handshake state machine / flight engine — it is the
 engine-agnostic resumption crypto + wire-codec seam only (the engine passes
 in transcript hashes and clocks), the same scoping as `dtls`.

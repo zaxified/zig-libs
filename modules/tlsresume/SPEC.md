@@ -22,10 +22,12 @@ touches a socket.
 |---|---|
 | §4.2.11 | `pre_shared_key` extension shape: a list of `PskIdentity` (opaque identity + `obfuscated_ticket_age`) and a separate, positionally-aligned list of binders — `select.zig`'s `OfferedIdentity`/`selectPsk` model this split directly. |
 | §4.2.11.1 | Obfuscated ticket age: `obfuscated_ticket_age = (age_ms + ticket_age_add) mod 2^32`; the server recomputes and freshness-checks it — `replay.zig`'s `obfuscateAge`/`deobfuscateAge`/`withinFreshnessWindow` (all REAL, no crypto). |
-| §4.2.11.2 | The PSK binder: `HMAC(finished_key, Transcript-Hash(Truncate(ClientHello)))`, `finished_key` derived from `binder_key` — `psk.zig`'s `computeBinder`/`verifyBinder` (STUB; the single highest-severity item in this module). |
+| §4.2.11.2 | The PSK binder: `HMAC(finished_key, Transcript-Hash(Truncate(ClientHello)))`, `finished_key` derived from `binder_key` — `psk.zig`'s `computeBinder`/`verifyBinder` (REAL; the single highest-severity item in this module). |
 | §4.6.1 | `NewSessionTicket` wire shape (`ticket_lifetime`/`ticket_age_add`/`ticket_nonce`/`ticket`/`extensions`, incl. `early_data`) — `ticket.zig` (REAL, KAT-validated against the actual RFC 8448 §3 wire bytes). |
-| §7.1 | The key-schedule labels this module needs: `PSK = HKDF-Expand-Label(resumption_master_secret, "resumption", ticket_nonce, Hash.length)`, `Early Secret = HKDF-Extract(0, PSK)`, `binder_key = Derive-Secret(early_secret, "res binder", "")` — `psk.zig`'s `derivePsk`/`earlySecret`/`binderKey` (all STUB). |
-| §8 / §8.1 / §8.2 | Anti-replay for single-use PSKs / 0-RTT: single-use tickets (chosen shape here), ClientHello recording, freshness-only — `replay.zig`'s `StrikeRegister` (STUB; the accept/reject + bounded-eviction *policy* is the deferred decision, not the type shape). |
+| §4.2.10 | `early_data`: the `max_early_data_size` advertisement lives in `ticket.zig` (`maxEarlyDataSize`/`earlyDataExtension`); the 0-RTT key derivation the advertisement enables is `earlydata.zig` (REAL, see the 0-RTT section below). |
+| §7.1 | The key-schedule labels this module needs: `PSK = HKDF-Expand-Label(resumption_master_secret, "resumption", ticket_nonce, Hash.length)`, `Early Secret = HKDF-Extract(0, PSK)`, `binder_key = Derive-Secret(early_secret, "res binder", "")` — `psk.zig`'s `derivePsk`/`earlySecret`/`binderKey` (all REAL) — plus the early branch `Derive-Secret(early_secret, "c e traffic"/"e exp master", ClientHello)` — `earlydata.zig` (REAL). |
+| §7.3 | Traffic-key calculation for early-data records: `key = HKDF-Expand-Label(secret, "key", "", key_len)`, `iv = …("iv", "", 12)` — `earlydata.zig`'s `earlyTrafficKeyIv` (REAL). |
+| §8 / §8.1 / §8.2 | Anti-replay for single-use PSKs / 0-RTT: single-use tickets (chosen shape here), ClientHello recording, freshness-only — `replay.zig`'s `StrikeRegister` (REAL, bounded fail-closed eviction). |
 
 ## Design & invariants
 
@@ -151,13 +153,55 @@ to be, in the original implementation order:
    forged binder can never consume a real ticket's single-use slot (no
    attacker-driven DoS of the legitimate client's resumption).
 
+## 0-RTT early-data key derivation — implemented (`earlydata.zig`)
+
+A follow-up pass on top of the crypto core above: the early-data branch of
+the RFC 8446 §7.1 key schedule, so a resuming client's 0-RTT records can be
+protected/opened before the handshake completes.
+
+- `clientEarlyTrafficSecret` = `Derive-Secret(early_secret, "c e traffic",
+  ClientHello)`; `earlyExporterMasterSecret` = `Derive-Secret(early_secret,
+  "e exp master", ClientHello)`. Both take the transcript hash of the
+  **complete** ClientHello (binders included) — deliberately distinct from
+  `psk.computeBinder`'s **truncated**-ClientHello hash; the doc comments and
+  KATs pin this distinction because it is the one wrong input a caller can
+  plausibly pass.
+- `earlyTrafficKeyIv` = the §7.3 record-protection pair (`"key"`/`"iv"`
+  labels, 12-byte IV; key_len 16 or 32 per the §B.4 suites; SHA-256 and
+  SHA-384 via the comptime `Hkdf` parameter, as everywhere in this module).
+- `EarlyDataContext(Hkdf, key_len).derive(psk, ch_hash)` — one-call
+  convenience: PSK → `early_secret` (REUSES `psk.earlySecret`) →
+  `client_early_traffic_secret` → key/iv.
+- What it does NOT own (cross-referenced, not reimplemented): the
+  `max_early_data_size` advertisement is `ticket.zig`'s (§4.2.10), and the
+  anti-replay defense 0-RTT REQUIRES (§8, §2.3 — early data is replayable
+  without it) is `replay.StrikeRegister` + `withinFreshnessWindow`. Deriving
+  early keys without wiring those is a replay vulnerability, not a working
+  configuration.
+
+**KAT sourcing for 0-RTT — official, not self-consistency:** RFC 8448 §4
+("Resumed 0-RTT Handshake") is itself a full 0-RTT trace and carries
+byte-exact vectors for the entire early branch: the `"tls13 c e traffic"`
+and `"tls13 e exp master"` derivations (complete-ClientHello hash
+`08ad0f…`), the early write key/iv, and even the client's actual encrypted
+early-data record (payload `"ABCDEF"`). `earlydata.zig`'s tests assert all
+of these byte-exact — including AEAD-opening the trace's real record with
+the derived key/iv and a seal/open round-trip in the other direction. The
+one thing RFC 8448 does NOT carry is a SHA-384 0-RTT vector (its trace is
+TLS_AES_128_GCM_SHA256 only), so the SHA-384/key_len-32 test asserts
+internal consistency (manual chain == convenience type, AES-256-GCM
+seal/open round-trip) rather than an external byte-exact target — the same
+honest split `psk.zig`'s SHA-384 test already makes.
+
 ## KAT sourcing (RFC 8448, fetched fresh for this module)
 
-`psk.zig`'s and `replay.zig`'s KAT constants were extracted directly from
-<https://www.rfc-editor.org/rfc/rfc8448> §3 ("Simple 1-RTT Handshake",
-whose NewSessionTicket trace `ticket.zig` decodes byte-for-byte) and §4
-("Resumed 0-RTT Handshake", whose PSK/binder-key/finished-key/binder chain
-`psk.zig` targets). This is the SAME source `dtls.keyschedule.zig` already
+`psk.zig`'s, `earlydata.zig`'s, and `replay.zig`'s KAT constants were
+extracted directly from <https://www.rfc-editor.org/rfc/rfc8448> §3
+("Simple 1-RTT Handshake", whose NewSessionTicket trace `ticket.zig`
+decodes byte-for-byte) and §4 ("Resumed 0-RTT Handshake", whose
+PSK/binder-key/finished-key/binder chain `psk.zig` targets and whose
+early-traffic-secret/early-key-iv/encrypted-early-record trace
+`earlydata.zig` targets). This is the SAME source `dtls.keyschedule.zig` already
 uses for its own (external-PSK, `"ext binder"`) binder KAT — the
 resumption-PSK chain here diverges from that one exactly at the `"res
 binder"` vs `"ext binder"` label, per RFC 8446 §7.1's two separate PSK
