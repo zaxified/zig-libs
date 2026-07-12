@@ -1,0 +1,60 @@
+musig2 — provenance note
+=========================
+
+Kept as a module-local NOTICE (same placement as the sibling `bip340`
+module, and `tlsresume`/`dtls`/`falcon`/`slhdsa` — self-contained crypto
+modules not folded into the root `NOTICE`).
+
+Provenance
+----------
+
+musig2 — clean-room implementation from BIP327 ("MuSig2 for
+BIP340-compatible Multi-Signatures", bitcoin/bips), covering: key
+aggregation and the "second key"/coefficient rule ("Key Generation and
+Aggregation"), nonce generation and aggregation ("Nonce Generation",
+"Nonce Aggregation"), the session-context/challenge construction ("Session
+Context"), signing, partial-signature verification, and partial-signature
+aggregation ("Signing", "Partial Signature Verification", "Partial
+Signature Aggregation"). BIP327 is a public, open Bitcoin Improvement
+Proposal — not a copyrightable work (merger doctrine; see
+CONVENTIONS.md §5) — so no third-party-source NOTICE entry is strictly
+required for the spec citation alone. No reference implementation's
+source was ported or consulted as a design reference — this scaffolding
+pass worked from the BIP327 specification text
+(`bitcoin/bips/blob/master/bip-0327.mediawiki`) and the public API of
+`std.crypto.ecc.Secp256k1` plus the sibling `bip340` module only (no
+`bitcoin-core/secp256k1`, no `jonasnick/bip327`/`sipa`-authored reference
+Python, or other implementation consulted for algorithm shape or code).
+
+The official BIP327 test vectors (`kat_vectors.zig`) were fetched directly
+from the JSON files under `bip-0327/vectors/` in the `bitcoin/bips`
+repository:
+https://raw.githubusercontent.com/bitcoin/bips/master/bip-0327/vectors/key_agg_vectors.json
+https://raw.githubusercontent.com/bitcoin/bips/master/bip-0327/vectors/key_sort_vectors.json
+https://raw.githubusercontent.com/bitcoin/bips/master/bip-0327/vectors/nonce_gen_vectors.json
+https://raw.githubusercontent.com/bitcoin/bips/master/bip-0327/vectors/nonce_agg_vectors.json
+https://raw.githubusercontent.com/bitcoin/bips/master/bip-0327/vectors/sign_verify_vectors.json
+https://raw.githubusercontent.com/bitcoin/bips/master/bip-0327/vectors/sig_agg_vectors.json
+These are public specification artifacts — the BIP's own published
+conformance vectors — not copied from any other implementation's test
+suite. Two published vector files were fetched but NOT embedded:
+`tweak_vectors.json` (tweaking is out of v1 scope — see `SPEC.md`) and
+`det_sign_vectors.json` (the optional single-signer `DeterministicSign`
+convenience wrapper, not part of the core signing flow scaffolded here).
+
+`std.crypto.ecc.Secp256k1` / `std.crypto.hash.sha2.Sha256` (MIT, part of
+Zig itself) and the sibling `bip340` module (this repository, MIT — see
+`../bip340/NOTICE`) are used via their public APIs; no new curve or hash
+primitive is implemented here.
+
+No GPL/LGPL/AGPL source was consulted or copied anywhere in this module.
+
+**Status: complete (v1, untweaked).** The full BIP327 core signing flow
+(wire codecs, `KeySort`, `NonceGen`, `KeyAgg`, `NonceAgg`,
+`GetSessionValues`, `Sign` with the mandatory self-verify,
+`PartialSigVerify`, `PartialSigAgg`) is implemented and byte-exact against
+the official BIP327 vectors; the aggregate signature verifies under plain
+`bip340.verify`. The crypto-core implementation pass, like the scaffold,
+worked from the BIP327 specification text only (no reference
+implementation consulted). Tweaking and `DeterministicSign` remain out of
+v1 scope — see `SPEC.md`'s "Out of scope" and "Done record".

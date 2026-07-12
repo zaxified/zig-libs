@@ -113,6 +113,7 @@ const module_list = [_]Module{
     .{ .name = "sandbox" },
     .{ .name = "bip340" },
     .{ .name = "taproot", .deps = &.{"bip340"} },
+    .{ .name = "musig2", .deps = &.{"bip340"} },
     // Scaffold more here (copy modules/_template) — see CONVENTIONS.md
     // "How to add a module" and the README "Roadmap / Non-goals" sections.
 };
