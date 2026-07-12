@@ -1,0 +1,89 @@
+adaptor — provenance note
+=========================
+
+Kept as a module-local NOTICE (same placement as the sibling `bip340`/
+`musig2` modules, and `tlsresume`/`dtls`/`falcon`/`slhdsa` — self-contained
+crypto modules not folded into the root `NOTICE`).
+
+Provenance
+----------
+
+adaptor — clean-room implementation of Schnorr adaptor signatures (a.k.a.
+"one-time verifiably encrypted signatures", the scriptless-scripts
+construction) over BIP340 Schnorr on secp256k1. Unlike `bip340`/`musig2`,
+NO BIP or other formal specification numbers this scheme — there is no
+`bitcoin/bips` document, no official test-vector file, and no single
+canonical "the spec" to cite the way BIP340/BIP327 are cited elsewhere in
+this repository. The construction implemented here (PreSign/PreVerify/
+Adapt/Extract, and — critically — the `needs_negation` parity bookkeeping
+that BIP340's even-y convention forces on any scheme that offsets a nonce
+by an externally-chosen point) was assembled from, and cross-validated
+against, the following public sources:
+
+1. **secp256kfun / schnorr_fun** (`LLFourn/secp256kfun`, 0BSD license —
+   https://github.com/LLFourn/secp256kfun,
+   `schnorr_fun/src/adaptor/mod.rs` +
+   `schnorr_fun/src/adaptor/encrypted_signature.rs`, fetched 2026-07-12).
+   This is a DESIGN REFERENCE, not ported source (CONVENTIONS.md §5): its
+   Rust `encrypted_sign`/`verify_encrypted_signature`/`decrypt_signature`/
+   `recover_decryption_key` functions were read to confirm the EXACT
+   parity/negation handling (the `needs_negation` flag: how it is derived
+   during signing, why it must be transmitted explicitly rather than
+   recomputed by a verifier, and how it flips the sign of the nonce scalar
+   during signing versus the sign of the adaptor secret during
+   decrypt/recover) — no source lines were copied; this module's Zig code,
+   API shape (`preSign`/`preVerify`/`adapt`/`extract`, distinct from
+   secp256kfun's `encrypted_sign`/`verify_encrypted_signature`/
+   `decrypt_signature`/`recover_decryption_key` naming), types
+   (`AdaptorPoint`, `PreSignature` — distinct from secp256kfun's
+   `Point`/`EncryptedSignature`), wire serialization (this module's own
+   65-byte `r || s_prime || needs_negation-byte` layout), and domain tags
+   (`adaptor/aux`, `adaptor/nonce` — project-local names; secp256kfun uses
+   a different nonce-derivation macro entirely) are independent designs
+   built on `bip340`. 0BSD is public-domain-equivalent (no attribution
+   condition), cited here purely as a design-reference courtesy per
+   CONVENTIONS.md §5, not because any license term requires it.
+2. **Bitcoin Optech, "Adaptor signatures" topic page**
+   (https://bitcoinops.org/en/topics/adaptor-signatures/) — general
+   conceptual confirmation of the PreSign/PreVerify/Adapt/Extract
+   four-algorithm shape and the `s = r + t + H(R+T‖P‖m)*p` /
+   `s' = s - t` relationship (i.e. the pre-signature omits the adaptor
+   secret; `Adapt` adds it back).
+3. **"Schnorr Adaptor Signature" (muens.io / Cyphertalk)**
+   (https://muens.io/schnorr-adaptor-signature/) — general conceptual
+   confirmation of the PreSign/PreVerify/Adapt/Extract naming and the
+   `R + T` adapted-nonce idea (does not itself address BIP340's even-y
+   parity requirement — that detail came from source (1) above).
+4. **BIP340** (`bitcoin/bips`, public spec — see `../bip340/NOTICE`) — the
+   base signature scheme this module extends; the even-y `lift_x`
+   convention that FORCES the `needs_negation` bookkeeping in the first
+   place is BIP340's, not this scheme's own invention.
+
+No GPL/LGPL/AGPL source was consulted or copied anywhere in this module.
+`std.crypto.ecc.Secp256k1` / `std.crypto.hash.sha2.Sha256` (MIT, part of
+Zig itself) and the sibling `bip340` module (this repository, MIT — see
+`../bip340/NOTICE`) are used via their public APIs; no new curve or hash
+primitive is implemented here.
+
+Self-authored reference vectors
+--------------------------------
+
+`kat_vectors.zig`'s six vectors were computed independently in Python (a
+from-scratch secp256k1 field/point implementation written for this pass —
+not libsecp256k1, not `bitcoin-core/secp256k1`, not secp256kfun's Rust
+code, and not any Zig code from this module) by directly transcribing the
+9-step `preSign` construction documented in `root.zig`'s doc comments, then
+cross-checked three independent ways (see `kat_vectors.zig`'s own doc
+comment for the three checks) before being embedded verbatim. This Python
+reference implementation was written for vector generation ONLY; it is not
+part of the repository and is not itself a design reference for the Zig
+code (the Zig `root.zig` doc comments are the authoritative construction
+description, written first).
+
+**Status: scaffold.** Wire codecs (`AdaptorPoint`, `PreSignature`) are
+implemented and tested for real. The four crypto cores (`preSign`,
+`preVerify`, `adapt`, `extract`) are `@panic("TODO(fable): ...")` stubs
+with their final signatures fixed and their exact construction fully
+specified in `root.zig`'s doc comments and `SPEC.md`; `kat_vectors.zig` /
+`kat_test.zig` are ready to validate a crypto-core implementation
+byte-exactly the moment one lands. See `SPEC.md`'s "TODO(fable)" section.
