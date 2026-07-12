@@ -121,6 +121,7 @@ const module_list = [_]Module{
     .{ .name = "frost", .deps = &.{"bip340"} },
     .{ .name = "oscore" },
     .{ .name = "spake2plus" },
+    .{ .name = "voprf" },
     // Scaffold more here (copy modules/_template) — see CONVENTIONS.md
     // "How to add a module" and the README "Roadmap / Non-goals" sections.
 };

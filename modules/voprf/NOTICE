@@ -1,0 +1,68 @@
+voprf — provenance note
+========================
+
+Kept as a module-local NOTICE (same placement as the sibling `bip340`/
+`frost`/`musig2`/`adaptor` modules — self-contained crypto modules not
+folded into the root `NOTICE`).
+
+Provenance
+----------
+
+voprf — clean-room implementation from RFC 9497 ("Oblivious
+Pseudorandom Functions (OPRFs) Using Prime-Order Groups", IRTF CFRG,
+December 2023), **ristretto255-SHA512 ciphersuite (§4.1) only**,
+covering: the prime-order-group interface (§2.1), the batched DLEQ
+proof system — `GenerateProof`/`ComputeCompositesFast` (§2.2.1) and
+`VerifyProof`/`ComputeComposites` (§2.2.2) — the protocol configuration
+and `CreateContextString` (§3.1), key generation including
+`DeriveKeyPair` (§3.2/§3.2.1), and the online protocols for all three
+modes: OPRF `Blind`/`BlindEvaluate`/`Finalize`/`Evaluate` (§3.3.1),
+VOPRF `BlindEvaluate`/`Finalize` (§3.3.2), and POPRF
+`Blind`/`BlindEvaluate`/`Finalize`/`Evaluate` (§3.3.3). RFC 9497 is a
+public IRTF/IETF specification — not a copyrightable work (merger
+doctrine; see CONVENTIONS.md §5) — so no third-party-source NOTICE
+entry is strictly required for the spec citation alone. No reference
+implementation's source was ported or consulted as a design reference —
+this pass worked from the RFC 9497 text
+(https://www.rfc-editor.org/rfc/rfc9497.txt) and the public API of
+`std.crypto.ecc.Ristretto255` only (no `cloudflare/voprf-ts`, no
+`bytemare/oprf`, no other OPRF implementation consulted for algorithm
+shape or code).
+
+`HashToGroup`/`HashToScalar`'s `expand_message_xmd` construction
+additionally follows RFC 9380 ("Hashing to Elliptic Curves", §5.4.1
+expand_message_xmd and Appendix B hash_to_ristretto255) — likewise a
+public IETF specification, not a copyrightable work, no reference
+implementation consulted; `expandMessageXmd` (`root.zig`) is a
+clean-room transcription of RFC 9380's own pseudocode, specialized to
+SHA-512 / `len_in_bytes <= 64` (`ell = 1`, this ciphersuite's only
+case), and cross-validated (`kat_test.zig`) against RFC 9380's own
+Appendix K.3 published vectors.
+
+The RFC 9497 Appendix A.1 "ristretto255-SHA512" test vectors
+(`kat_vectors.zig` — OPRF A.1.1, VOPRF A.1.2, POPRF A.1.3, including
+the batch-size-2 vectors) were transcribed directly from
+https://www.rfc-editor.org/rfc/rfc9497.txt for this pass. These are
+public specification artifacts — the RFC's own published conformance
+vectors — not copied from any other implementation's test suite. Only
+the ristretto255-SHA512 vectors (of the five ciphersuites RFC 9497
+Appendix A publishes — ristretto255, decaf448, P-256, P-384, P-521)
+are embedded; see `root.zig`'s module doc comment and `SPEC.md` for why
+the others are out of scope. The RFC 9380 Appendix K.3
+`expand_message_xmd(SHA-512)` vectors embedded alongside them have the
+same public-specification provenance.
+
+`std.crypto.ecc.Ristretto255` (group arithmetic, `basePoint`, `mul`,
+`add`/`sub`, `fromBytes`/`toBytes`, `fromUniform`, `rejectIdentity`),
+its `scalar` field arithmetic (`reduce64`, `add`/`sub`/`mul`,
+`rejectNonCanonical`, `Scalar.invert`), and `std.crypto.hash.sha2.
+Sha512` (all MIT, part of Zig itself) are used via their public APIs;
+no new curve or hash primitive is implemented here.
+
+No GPL/LGPL/AGPL source was consulted or copied anywhere in this
+module.
+
+**Status: complete.** All OPRF, VOPRF, and POPRF cores implemented and
+KAT-validated byte-exact against RFC 9497 Appendix A.1 (19/19 tests,
+Debug + ReleaseFast). See `SPEC.md` for the threat model and the DLEQ
+construction notes.
