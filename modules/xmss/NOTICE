@@ -1,0 +1,38 @@
+xmss — provenance note
+======================
+
+Kept as a module-local NOTICE (same placement as the sibling
+`bip340`/`slhdsa`/`falcon` modules — self-contained crypto modules not
+folded into the root NOTICE).
+
+Provenance
+----------
+
+xmss — clean-room implementation from RFC 8391 ("XMSS: eXtended Merkle
+Signature Scheme", IRTF, May 2018), covering: the hash-address scheme
+(Section 2.5), base_w (Section 2.6), WOTS+ (Section 3.1), the XMSS
+single-tree scheme (Section 4.1: RAND_HASH, L-trees, treeHash, keygen,
+sign, verify), the SHA-256 function instantiations (Section 5.1) and the
+XDR wire formats (Appendix B). RFC 8391 is a public specification; the
+algorithms were implemented from the RFC text.
+
+Test-vector oracle: the official XMSS reference implementation,
+https://github.com/XMSS/xmss-reference (the code referenced by RFC 8391
+Section 7; CC0/public-domain per its LICENSE). It was used as a
+BLACK-BOX oracle only — built unmodified and driven by a small local
+generator with fixed deterministic inputs to produce the byte-exact
+known-answer vectors embedded in src/kat_vectors.zig (primitive outputs,
+WOTS+ keys/signatures, XMSS public keys and signatures at h = 4 and
+h = 10). No source code from xmss-reference was ported into the module;
+two implementation-defined conventions were intentionally matched for
+interoperability and are documented in SPEC.md: (a) the NIST SP 800-208
+PRF_keygen WOTS+ secret-key derivation (toByte(4, 32) domain prefix),
+and (b) the keypair seed layout sk_seed || sk_prf || pub_seed used by
+the KAT generator.
+
+No other third-party source was ported or consulted. Uses only the Zig
+standard library (std.crypto.hash.sha2.Sha256).
+
+Intended first consumer: SCADA firmware signing (IEC 62443-style
+code-signing chains standardized around NIST SP 800-208 stateful
+hash-based signatures).
