@@ -1,0 +1,77 @@
+bolt8 — provenance note
+========================
+
+Kept as a module-local NOTICE (same placement as the sibling `sphinx`/
+`bip340`/`taproot`/`musig2`/`dtls`/`falcon`/`slhdsa` modules, which are
+likewise self-contained crypto/codec modules not folded into the root
+`NOTICE`).
+
+Provenance
+----------
+
+bolt8 — clean-room implementation from BOLT#8 ("Encrypted and
+Authenticated Transport", `lightning/bolts`), covering: "Cryptographic
+Messaging Overview", "Authenticated Key Agreement Handshake", "Handshake
+Versioning", "Noise Protocol Instantiation", "Authenticated Key Exchange
+Handshake Specification" (Handshake State / Handshake State Initialization
+/ Handshake Exchange — Acts One/Two/Three), "Lightning Message
+Specification" (Encrypting and Sending / Receiving and Decrypting
+Messages), and "Lightning Message Key Rotation". BOLT#8 is a public, open
+Lightning Network specification — not a copyrightable work (merger
+doctrine; see CONVENTIONS.md §5) — so no third-party-source NOTICE entry
+is strictly required for the spec citation alone. No reference
+implementation's source (lnd's `brontide`, core-lightning, eclair, ldk,
+etc.) was ported or consulted as a design reference for this module — it
+was built directly from the BOLT#8 specification text.
+
+This module is built ON this repo's own `noise` module (`../noise`,
+`Suite(DH, Cipher, Hash).SymmetricState`) — a from-scratch, clean-room
+implementation of the (also public, also non-copyrightable) Noise Protocol
+Framework specification. `noise` has no module-local NOTICE of its own;
+its provenance is recorded in the root `../../NOTICE`'s "noise" entry.
+Nothing in `noise` is Lightning-specific and nothing in this module was
+ported from `noise` (it is imported as a sibling dependency, per this
+repo's `deps` convention).
+
+The official BOLT#8 Appendix A "Transport Test Vectors" (`kat_vectors.
+zig`) were fetched directly from `lightning/bolts`, raw GitHub, `master`
+branch, for this pass:
+
+  - `08-transport.md`
+    (https://raw.githubusercontent.com/lightning/bolts/master/08-transport.md)
+
+This is a public specification/test artifact — the BOLT's own published
+conformance vectors — not copied from any Lightning implementation's test
+suite. Every hex constant transcribed into `kat_vectors.zig` was
+independently verified (exact byte length + exact substring match against
+the fetched source file) before being embedded, not merely eyeballed. The
+pre-Act-One chaining key (`ck_after_init`) and transcript hash were
+additionally recomputed from scratch via Python `hashlib` directly from
+BOLT#8's own "Handshake State Initialization" formulas (SHA-256 only, no
+Lightning-specific or Noise-specific library code) as an independent
+cross-check, not merely a second run of this module's own Zig code — see
+`SPEC.md`'s "Verification" section.
+
+`std.crypto.ecc.Secp256k1` (field/scalar arithmetic, point group law,
+`basePoint`, `mul`, `fromSec1`/`toCompressedSec1`), `std.crypto.aead.
+chacha_poly.ChaCha20Poly1305` (via `noise.CipherState`), and `std.crypto.
+hash.sha2.Sha256` are used via their public APIs (MIT, part of Zig
+itself). The `dh.zig` adapter's `fromSec1 -> mul -> toCompressedSec1 ->
+Sha256.hash` chain mirrors this repo's own `sphinx` module's IDENTICAL
+BOLT#4 `ECDH` primitive and `bip340`'s secp256k1 key-pair conventions —
+both already verified byte-exact against `std.crypto.ecc.Secp256k1`
+elsewhere in this repo; no new curve-arithmetic pattern was introduced.
+
+No GPL/LGPL/AGPL source was consulted or copied anywhere in this module.
+
+**Status: complete.** The act framing (`act.zig`), the secp256k1 DH
+adapter (`dh.zig`), the full three-act `Noise_XK` handshake driver
+(`handshake.zig`, including the six act-driver crypto cores
+`Initiator.genAct1`/`.readAct2`/`.genAct3` and
+`Responder.readAct1`/`.genAct2`/`.readAct3`, filled in from the BOLT#8
+spec text alone in the 2026-07-12 fill-in pass), and the entire
+post-handshake transport including key rotation (`transport.zig`) are
+implemented and KAT-tested byte-exact against the official BOLT#8
+Appendix A vectors, including all published negative vectors — zero
+skipped tests. See `SPEC.md`'s "TODO(fable) — done record" for the
+per-function verification detail.
