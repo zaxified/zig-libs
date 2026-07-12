@@ -6,9 +6,9 @@
 //! signers). Builds directly on the sibling `bip340` module for tagged
 //! hashing and x-only public-key handling.
 //!
-//! **Status: complete (v1, untweaked).** The full BIP327 core signing flow
-//! is implemented and byte-exact against the official BIP327 test vectors
-//! (`kat_test.zig`):
+//! **Status: complete (v2, tweak-aware).** The full BIP327 core signing
+//! flow AND key tweaking are implemented and byte-exact against the
+//! official BIP327 test vectors (`kat_test.zig`):
 //!
 //!   - `PlainPublicKey`/`PubNonce`/`AggNonce`/`SecNonce`/`PartialSignature`:
 //!     full BIP327 wire codecs (`cpoint`/`cpoint_ext`/`cbytes`/`cbytes_ext`,
@@ -36,14 +36,21 @@
 //!     accepts every official valid partial signature, rejects both official
 //!     wrong-signature/wrong-signer vectors.
 //!   - `partialSigAgg`: `s = Σs_i + e·g·tacc`, `sig = xbytes(R) ‖ bytes(s)`
-//!     — byte-exact against the official untweaked `sig_agg` vectors, and
-//!     the result verifies under plain `bip340.verify` (the scheme's
-//!     headline property, asserted end-to-end in `kat_test.zig`).
+//!     — byte-exact against ALL four official `sig_agg` vectors (untweaked
+//!     and tweaked), and the result verifies under plain `bip340.verify`
+//!     (the scheme's headline property, asserted end-to-end in
+//!     `kat_test.zig`).
+//!   - `KeyAggContext.applyTweak`: BIP327 `ApplyTweak` — plain (BIP32-style)
+//!     and x-only (Taproot-style) tweaks, composing in sequence via the
+//!     `gacc`/`tacc` accumulators (`Q' = g·Q + t·G`, `gacc' = g·gacc`,
+//!     `tacc' = t + g·tacc`); `SessionContext.tweaks` threads them through
+//!     `getSessionValues` into `sign`/`partialSigVerify`/`partialSigAgg`
+//!     (whose formulas were tweak-general from v1). Byte-exact against all
+//!     5 official `tweak_vectors.json` valid cases, plus the tweak error
+//!     cases (`t >= n`, tweaked key at infinity).
 //!
-//! Tweaking (`ApplyTweak`/`ApplyPlainTweak`/`ApplyXonlyTweak`) is out of v1
-//! scope entirely — see `SPEC.md`. `gacc`/`tacc` are threaded through every
-//! formula in their general (tweak-aware) form anyway, so a future tweak
-//! pass only needs to stop hardcoding `gacc = 1`/`tacc = 0`.
+//! Still out of scope: `DeterministicSign` (the optional single-signer
+//! convenience wrapper) — see `SPEC.md`.
 //!
 //! Zig std GAP: yes, same shape as `bip340` — `std.crypto.ecc.Secp256k1`
 //! supplies the curve group; this module (and `bip340` beneath it) supplies
@@ -448,12 +455,36 @@ fn keyAggCoeff(pks: []const PlainPublicKey, pk_bytes: [33]u8) Scalar {
 
 pub const KeyAggError = error{ InvalidPublicKey, PointAtInfinity };
 
+pub const ApplyTweakError = error{
+    /// `t = int(tweak) >= n` (BIP327 `ApplyTweak`: "Fail if t >= n") —
+    /// key_agg_vectors.json "Tweak is out of range" / tweak_vectors.json
+    /// "Tweak is invalid because it exceeds group size".
+    TweakOutOfRange,
+    /// `Q' = g·Q + t·G` is the point at infinity (BIP327 `ApplyTweak`:
+    /// "Fail if is_infinite(Q')") — key_agg_vectors.json "Intermediate
+    /// tweaking result is point at infinity".
+    TweakedKeyIsInfinite,
+};
+
+/// One BIP327 tweak: the 32-byte tweak value plus its mode. A PLAIN tweak
+/// (`is_xonly = false`, BIP32-style: the tweaked key stays a full 33-byte
+/// plain key) adds `t·G` to `Q` as-is; an X-ONLY tweak (`is_xonly = true`,
+/// Taproot/BIP341-style: the tweak is applied to the even-y x-only form of
+/// `Q`) first negates `Q` if it has odd y. Carried by `SessionContext.
+/// tweaks` (tweak + flag as ONE value, so the two lists BIP327 passes in
+/// parallel — `tweak_1..v` and `is_xonly_t_1..v` — can never disagree in
+/// length).
+pub const Tweak = struct {
+    tweak: [32]u8,
+    is_xonly: bool,
+};
+
 /// The KeyAgg Context (BIP327 §"KeyAgg Context"): the (possibly tweaked)
 /// aggregate point `Q`, plus the accumulated tweak bookkeeping `gacc`/
-/// `tacc` tweaking needs to let a signer recover the right secret-key sign
-/// flip (see `SPEC.md`'s threat model). v1 never tweaks, so every
-/// `KeyAggContext` this module produces has `gacc = 1`, `tacc = 0` — see
-/// `SPEC.md` "Out of scope" for why `ApplyTweak` itself is not implemented.
+/// `tacc` that lets a signer recover the right secret-key sign flip (see
+/// `SPEC.md`'s threat model). `keyAgg` produces the untweaked base context
+/// (`gacc = 1`, `tacc = 0`); `applyTweak` absorbs tweaks one at a time,
+/// updating all three fields.
 pub const KeyAggContext = struct {
     q: Secp256k1,
     gacc: Scalar,
@@ -467,6 +498,51 @@ pub const KeyAggContext = struct {
     /// Algorithm `GetPlainPubkey`: `cbytes(Q)`.
     pub fn getPlainPubkey(ctx: KeyAggContext) [33]u8 {
         return cbytes(ctx.q);
+    }
+
+    /// Algorithm `ApplyTweak(keyagg_ctx, tweak, is_xonly_t)` (BIP327
+    /// §"Applying Tweaks"):
+    ///
+    ///   1. `g = 1` for a plain tweak; for an x-only tweak, `g = 1` if
+    ///      `has_even_y(Q)` else `n - 1` (`gFromQ` — the SAME single-source
+    ///      helper `sign`/`partialSigVerifyInternal`/`partialSigAgg` use,
+    ///      so the tweak-time flip and the sign/verify-time flips can never
+    ///      disagree; see `SPEC.md`'s threat model).
+    ///   2. `t = int(tweak)`; fail (`error.TweakOutOfRange`) if `t >= n`.
+    ///   3. `Q' = g·Q + t·G`; fail (`error.TweakedKeyIsInfinite`) if `Q'`
+    ///      is the point at infinity (the tweak cancelled the key exactly
+    ///      — e.g. `t` maliciously chosen as the negation of the aggregate
+    ///      key's discrete log; refusing it fails closed).
+    ///   4. `gacc' = g·gacc mod n`, `tacc' = (t + g·tacc) mod n` — the
+    ///      accumulators that make multiple tweaks COMPOSE: `sign`'s
+    ///      `d = g·gacc·d'` and `partialSigAgg`'s `s = Σs_i + e·g·tacc`
+    ///      then absorb the whole tweak chain in one multiply/add each.
+    ///
+    /// Multiple tweaks compose by applying this repeatedly, in sequence
+    /// (`getSessionValues` does exactly that over `SessionContext.tweaks`).
+    /// Every operand here is PUBLIC (the aggregate key and the tweak), so
+    /// the variable-time `mulPublic` and the `hasEvenY` branch are fine —
+    /// same rationale as `keyAgg` itself.
+    pub fn applyTweak(ctx: KeyAggContext, tweak: [32]u8, is_xonly: bool) ApplyTweakError!KeyAggContext {
+        const g: Scalar = if (is_xonly) gFromQ(ctx.q) else Scalar.one;
+        const t = Scalar.fromBytes(tweak, .big) catch return error.TweakOutOfRange;
+
+        // Q' = g·Q + t·G. `g` is ±1 and `Q` is never the identity in a
+        // constructed context, so `g·Q` cannot be the identity; `t·G` is
+        // the identity only for `t == 0` (a legal tweak value), in which
+        // case it contributes nothing — both `mulPublic` identity-result
+        // errors are therefore total, not failures.
+        var q_prime = ctx.q.mulPublic(g.toBytes(.big), .big) catch Secp256k1.identityElement;
+        if (Secp256k1.basePoint.mulPublic(t.toBytes(.big), .big)) |tg| {
+            q_prime = q_prime.add(tg);
+        } else |_| {}
+        q_prime.rejectIdentity() catch return error.TweakedKeyIsInfinite;
+
+        return .{
+            .q = q_prime,
+            .gacc = g.mul(ctx.gacc),
+            .tacc = t.add(g.mul(ctx.tacc)),
+        };
     }
 };
 
@@ -497,8 +573,9 @@ pub fn findInvalidPubkey(pks: []const PlainPublicKey) ?usize {
 /// (per `bip340.verify`'s own precedent), accumulated with the complete
 /// `Secp256k1.add`. Fails with `error.PointAtInfinity` if `Q` is the point
 /// at infinity (BIP327: "Fail if is_infinite(Q)") — the scheme's defense
-/// against a rogue-key point-cancellation attack (see `SPEC.md`). v1: no
-/// tweak loop, so `gacc = 1`, `tacc = 0` always.
+/// against a rogue-key point-cancellation attack (see `SPEC.md`). The
+/// result is the UNTWEAKED base context (`gacc = 1`, `tacc = 0`); apply
+/// tweaks via `KeyAggContext.applyTweak`.
 pub fn keyAgg(pks: []const PlainPublicKey) KeyAggError!KeyAggContext {
     if (pks.len == 0) return error.InvalidPublicKey; // BIP327 requires 0 < u
     for (pks) |pk| _ = pk.point() catch return error.InvalidPublicKey;
@@ -568,15 +645,15 @@ pub fn findInvalidPubNonce(pubnonces: []const PubNonce) ?usize {
 
 // ── Session Context (BIP327 §"Session Context") ───────────────────────────
 
-/// The Session Context (BIP327 §"Session Context"). v1 OMITS the spec's
-/// tweak fields (`tweak_1..v`, `is_xonly_t_1..v`) entirely — tweaking is
-/// out of v1 scope (see `SPEC.md` "Out of scope"); a tweak-aware
-/// `SessionContext` would add `tweaks: []const [32]u8` and `is_xonly:
-/// []const bool` here and thread them through `GetSessionValues`'s
-/// `ApplyTweak` loop.
+/// The Session Context (BIP327 §"Session Context"). The spec's parallel
+/// tweak lists (`tweak_1..v`, `is_xonly_t_1..v`) are carried as ONE slice
+/// of `Tweak` values (tweak + mode can never disagree in length), applied
+/// in order by `getSessionValues`'s `ApplyTweak` loop. Defaults to no
+/// tweaks — an untweaked session is written exactly as before.
 pub const SessionContext = struct {
     aggnonce: AggNonce,
     pubkeys: []const PlainPublicKey,
+    tweaks: []const Tweak = &.{},
     msg: []const u8,
 };
 
@@ -592,8 +669,11 @@ pub const SessionValues = struct {
 
 /// `AggNonceError` is included so `getSessionValues` never has to panic
 /// even on a hand-constructed (never-`fromBytes`-validated) `SessionContext
-/// .aggnonce` — a `fromBytes`-built one can never trip it.
-pub const SessionError = KeyAggError || AggNonceError;
+/// .aggnonce` — a `fromBytes`-built one can never trip it. `ApplyTweakError`
+/// covers the tweak loop (an out-of-range tweak / a tweaked key at
+/// infinity is a session-level failure, per BIP327's `GetSessionValues`
+/// calling `ApplyTweak` itself).
+pub const SessionError = KeyAggError || AggNonceError || ApplyTweakError;
 
 /// Algorithm `GetSessionValues(session_ctx)` (BIP327 §"Session Context").
 ///
@@ -605,8 +685,12 @@ pub const SessionError = KeyAggError || AggNonceError;
 /// "invalid pubkey" vector) — only once THAT succeeds does this function
 /// reach the code below.
 ///
-/// The crypto core (v1: no tweak loop, so `keyagg_ctx_v == keyagg_ctx_0` —
-/// `Q`/`gacc`/`tacc` are directly `keyAgg`'s output):
+/// The crypto core:
+///   0. `keyagg_ctx_0 = keyAgg(pk_1..u)`, then `keyagg_ctx_i =
+///      ApplyTweak(keyagg_ctx_{i-1}, tweak_i, is_xonly_t_i)` for each of
+///      `ctx.tweaks` in order — `Q`/`gacc`/`tacc` below are the FINAL
+///      (tweaked) context's values; with no tweaks they are directly
+///      `keyAgg`'s output, exactly as before.
 ///   1. `b = int(taggedHash("MuSig/noncecoef", aggnonce_bytes ‖ xbytes(Q) ‖
 ///      m)) mod n`.
 ///   2. `R' = R1 + b·R2` — either or both of `R1`/`R2` may be the point at
@@ -621,7 +705,8 @@ pub const SessionError = KeyAggError || AggNonceError;
 ///      (`bip340.hash.challenge_tag`): the final aggregate signature must
 ///      be BIP340-challenge-compatible by design.
 pub fn getSessionValues(ctx: SessionContext) SessionError!SessionValues {
-    const keyagg_ctx = try keyAgg(ctx.pubkeys);
+    var keyagg_ctx = try keyAgg(ctx.pubkeys);
+    for (ctx.tweaks) |tw| keyagg_ctx = try keyagg_ctx.applyTweak(tw.tweak, tw.is_xonly);
     const qx = keyagg_ctx.getXonlyPubkey();
 
     var b_hasher = bip340.hash.taggedHasher(noncecoef_tag);
@@ -807,9 +892,12 @@ pub fn sign(secnonce: SecNonce, sk: bip340.SecretKey, ctx: SessionContext) SignE
 
 pub const PartialSigVerifyError = SessionError || NonceAggError || PartialSignatureError;
 
-/// Algorithm `PartialSigVerify(psig, pubnonce_1..u, pk_1..u, m, i)` (BIP327
-/// §"Partial Signature Verification") — the top-level entry point, which
-/// (per the spec) computes its own aggregate nonce first.
+/// Algorithm `PartialSigVerify(psig, pubnonce_1..u, pk_1..u, tweak_1..v,
+/// is_xonly_t_1..v, m, i)` (BIP327 §"Partial Signature Verification") —
+/// the top-level entry point, which (per the spec) computes its own
+/// aggregate nonce first. `tweaks` must be the SAME tweak sequence the
+/// signer's `SessionContext` carried (pass `&.{}` for an untweaked
+/// session).
 ///
 /// `psig` is already range-checked (`PartialSignature.fromBytes`, the
 /// caller's job before this call). `nonceAgg(pubnonces)` validates every
@@ -821,12 +909,13 @@ pub fn partialSigVerify(
     psig: PartialSignature,
     pubnonces: []const PubNonce,
     pubkeys: []const PlainPublicKey,
+    tweaks: []const Tweak,
     msg: []const u8,
     signer_index: usize,
 ) PartialSigVerifyError!void {
     _ = pubkeys[signer_index].point() catch return error.InvalidPublicKey;
     const aggnonce = try nonceAgg(pubnonces);
-    const ctx = SessionContext{ .aggnonce = aggnonce, .pubkeys = pubkeys, .msg = msg };
+    const ctx = SessionContext{ .aggnonce = aggnonce, .pubkeys = pubkeys, .tweaks = tweaks, .msg = msg };
     return partialSigVerifyInternal(psig, pubnonces[signer_index], pubkeys[signer_index], ctx);
 }
 
@@ -898,11 +987,12 @@ pub const PartialSigAggError = SessionError || PartialSignatureError;
 /// The crypto core, only reached once every `psigs[i]` is individually
 /// valid AND `getSessionValues` succeeds:
 ///   1. `g = 1` if `has_even_y(sv.q)`, else `g = -1 mod n` (`gFromQ`).
-///   2. `s = (s_1 + s_2 + ... + s_u + e·g·tacc) mod n` — v1: `tacc` is
-///      always `Scalar.zero` (no tweak is ever applied); the formula is
-///      written in full because this is the one place `tacc` re-enters the
-///      computation, and a future tweak-aware version only needs to stop
-///      hardcoding it to zero.
+///   2. `s = (s_1 + s_2 + ... + s_u + e·g·tacc) mod n` — this is the one
+///      place the accumulated tweak offset `tacc` re-enters the
+///      computation: the partial signatures each cover the signers' (sign-
+///      corrected) secret keys, and the single `e·g·tacc` term accounts
+///      for the entire tweak chain's shift of the aggregate key at once
+///      (`Scalar.zero`, contributing nothing, for an untweaked session).
 ///   3. `sig = xbytes(sv.r) ‖ bytes(32, s)` — a plain 64-byte
 ///      `bip340.Signature`, verifiable by `bip340.verify` with NO
 ///      knowledge that it was produced by MuSig2 (the scheme's headline

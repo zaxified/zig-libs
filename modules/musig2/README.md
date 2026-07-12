@@ -8,22 +8,25 @@ idea it was produced by more than one signer. Builds directly on `bip340`
 for tagged hashing, x-only public-key handling, and the final challenge
 hash.
 
-**Status: complete (v1, untweaked).** The full BIP327 core signing flow is
-implemented and byte-exact against the official BIP327 test vectors: key
-aggregation (with the rogue-key-resistant coefficient rule), nonce
+**Status: complete (v2, tweak-aware).** The full BIP327 core signing flow
+is implemented and byte-exact against the official BIP327 test vectors:
+key aggregation (with the rogue-key-resistant coefficient rule), nonce
 generation/aggregation (including the legal point-at-infinity encoding),
 the session challenge/nonce values (with the substitute-`G`-for-infinity
 rule), partial signing (with the spec's mandatory self-verify), partial
 verification, and final aggregation — whose 64-byte result verifies under
-plain `bip340.verify`. Tweaking (`ApplyTweak`) and `DeterministicSign` are
-out of v1 scope. See `SPEC.md` for the design, threat model (the
-parity/`g`/`gacc` sign-flip chain), and the implementation done-record.
+plain `bip340.verify`. Key tweaking (`ApplyTweak`) is implemented too:
+plain (BIP32-style) and x-only (Taproot-style) tweaks compose on a
+`KeyAggContext` via the `gacc`/`tacc` accumulators, byte-exact against
+the official `tweak_vectors.json`. `DeterministicSign` remains out of
+scope. See `SPEC.md` for the design, threat model (the parity/`g`/`gacc`
+sign-flip chain), and the implementation done-records.
 
 | File | Contents |
 |---|---|
-| `root.zig` | Every public type (`PlainPublicKey`, `PubNonce`, `AggNonce`, `SecNonce`, `PartialSignature`, `KeyAggContext`, `SessionContext`/`SessionValues`) + the full API surface (`keySort`, `nonceGen`, `keyAgg`, `nonceAgg`, `getSessionValues`, `sign`, `partialSigVerify`, `partialSigAgg`) |
-| `kat_vectors.zig` | Six of the eight official BIP327 vector files, embedded |
-| `kat_test.zig` | KAT assertions (every embedded official vector) + a 3-signer end-to-end protocol test ending in `bip340.verify` |
+| `root.zig` | Every public type (`PlainPublicKey`, `PubNonce`, `AggNonce`, `SecNonce`, `PartialSignature`, `KeyAggContext`, `Tweak`, `SessionContext`/`SessionValues`) + the full API surface (`keySort`, `nonceGen`, `keyAgg`, `nonceAgg`, `KeyAggContext.applyTweak`, `getSessionValues`, `sign`, `partialSigVerify`, `partialSigAgg`) |
+| `kat_vectors.zig` | Seven of the eight official BIP327 vector files, embedded (only `det_sign` is not) |
+| `kat_test.zig` | KAT assertions (every embedded official vector, tweaked included) + two 3-signer end-to-end protocol tests (untweaked; x-only-tweaked) ending in `bip340.verify` |
 
 ## Import
 
@@ -52,8 +55,18 @@ musig2.keySort(pubkey_slice); // sorts in place, lexicographic
 infinite aggregate):
 
 ```zig
-const ctx = try musig2.keyAgg(pubkeys); // KeyAggContext{ q, gacc, tacc }
+const ctx = try musig2.keyAgg(pubkeys); // KeyAggContext{ q, gacc, tacc } — untweaked base
 const aggpk_xonly = ctx.getXonlyPubkey(); // [32]u8, verifiable by bip340.verify
+```
+
+**Key tweaking** (`ApplyTweak` — plain/BIP32-style or x-only/Taproot-style;
+tweaks compose by applying in sequence):
+
+```zig
+const tweaked = try ctx.applyTweak(tweak32, true); // x-only; error.TweakOutOfRange / error.TweakedKeyIsInfinite
+const output_key = tweaked.getXonlyPubkey(); // e.g. the Taproot output key
+// For signing, put the SAME tweak chain in the SessionContext instead:
+const tweaks = [_]musig2.Tweak{.{ .tweak = tweak32, .is_xonly = true }};
 ```
 
 **Nonce generation** (`NonceGen`):
@@ -76,14 +89,16 @@ then the partial-signature formula with the spec's mandatory self-verify):
 
 ```zig
 const ctx = musig2.SessionContext{ .aggnonce = aggnonce, .pubkeys = pubkeys, .msg = msg };
+// Tweaked session: same, plus .tweaks = &tweaks (defaults to none).
 const psig = try musig2.sign(result.secnonce, sk, ctx); // musig2.PartialSignature
 ```
 
 **Partial signature verification** (`PartialSigVerify` — per-pubnonce/
-per-pubkey validation + the `s·G == Re* + e·a·g'·P` equation check):
+per-pubkey validation + the `s·G == Re* + e·a·g'·P` equation check;
+`tweaks` must match the signer's session — pass `&.{}` when untweaked):
 
 ```zig
-try musig2.partialSigVerify(psig, pubnonces, pubkeys, msg, signer_index);
+try musig2.partialSigVerify(psig, pubnonces, pubkeys, &.{}, msg, signer_index);
 ```
 
 **Partial signature aggregation** (`PartialSigAgg` — per-psig range check,
@@ -91,6 +106,7 @@ then the final aggregation):
 
 ```zig
 const sig64 = try musig2.partialSigAgg(psigs, ctx); // [64]u8 — a plain BIP340 signature
+// Verifies under the session's (tweaked) aggregate x-only key:
 const ok = bip340.verify(xonly_aggpk, msg, try bip340.Signature.fromBytes(sig64));
 ```
 
@@ -108,10 +124,10 @@ zig build test-musig2 -Doptimize=ReleaseFast # ReleaseFast
 zig fmt --check modules/musig2/
 ```
 
-21 pass / 0 skip (21 total) — every embedded official vector asserts
-byte-exact (valid AND "invalid contribution" cases across all six
-embedded vector files; the only unasserted vectors are `sig_agg`'s two
-TWEAKED cases, out of v1 scope), plus a 3-signer end-to-end protocol
-test ending in a plain `bip340.verify` accept.
+25 pass / 0 skip (25 total) — every embedded official vector asserts
+byte-exact (valid AND "invalid contribution"/error cases across all seven
+embedded vector files, tweaked cases included), plus two 3-signer
+end-to-end protocol tests (untweaked, and x-only/Taproot-style tweaked)
+each ending in a plain `bip340.verify` accept.
 
 Provenance: see [NOTICE](NOTICE).

@@ -6,11 +6,12 @@
 //! for this pass -- public BIP specification artifacts, not copied from any
 //! other implementation's test suite; see `../NOTICE`).
 //!
-//! Six of the eight published vector files are embedded here: `key_agg`,
-//! `key_sort`, `nonce_gen`, `nonce_agg`, `sign_verify`, `sig_agg`. NOT embedded:
-//! `tweak_vectors.json` (tweaking is out of v1 scope -- see `../SPEC.md`) and
-//! `det_sign_vectors.json` (the optional single-signer `DeterministicSign`
-//! convenience wrapper, not part of the core signing flow this module scaffolds).
+//! Seven of the eight published vector files are embedded here: `key_agg`
+//! (including its two tweak-related error cases), `key_sort`, `nonce_gen`,
+//! `nonce_agg`, `sign_verify`, `sig_agg`, and `tweak` (tweak_vectors.json,
+//! embedded in the tweaking pass). NOT embedded: `det_sign_vectors.json`
+//! (the optional single-signer `DeterministicSign` convenience wrapper,
+//! not part of the core signing flow this module implements).
 
 // ---- key_agg_vectors.json --------------------------------------------------
 
@@ -38,14 +39,27 @@ pub const key_agg = struct {
         .{ .key_indices = &.{ 0, 0, 1, 1 }, .expected = "69BC22BFA5D106306E48A20679DE1D7389386124D07571D0D872686028C26A3E" },
     };
 
-    /// Only the `contrib = "pubkey"` cases are embedded here -- the two
-    /// tweak-related error cases (indices 3/4 of the published file) are
-    /// tweak-out-of-scope-v1 (see `../SPEC.md`) and are not transcribed.
+    /// The `contrib = "pubkey"` cases (indices 0-2 of the published file).
     pub const ErrorCase = struct { key_indices: []const usize, invalid_signer: usize, comment: []const u8 };
     pub const error_test_cases = [_]ErrorCase{
         .{ .key_indices = &.{ 0, 3 }, .invalid_signer = 1, .comment = "Invalid public key" },
         .{ .key_indices = &.{ 0, 4 }, .invalid_signer = 1, .comment = "Public key exceeds field size" },
         .{ .key_indices = &.{ 5, 0 }, .invalid_signer = 0, .comment = "First byte of public key is not 2 or 3" },
+    };
+
+    /// The two tweak-related error cases (indices 3/4 of the published
+    /// file), transcribed in the tweaking pass: the first has `t = n`
+    /// exactly (out of range), the second's tweak is chosen so the plain-
+    /// tweaked single-key aggregate lands exactly on the point at infinity.
+    pub const TweakErrorCase = struct {
+        key_indices: []const usize,
+        tweak_indices: []const usize,
+        is_xonly: []const bool,
+        comment: []const u8,
+    };
+    pub const tweak_error_test_cases = [_]TweakErrorCase{
+        .{ .key_indices = &.{ 0, 1 }, .tweak_indices = &.{0}, .is_xonly = &.{true}, .comment = "Tweak is out of range" },
+        .{ .key_indices = &.{6}, .tweak_indices = &.{1}, .is_xonly = &.{false}, .comment = "Intermediate tweaking result is point at infinity" },
     };
 };
 
@@ -374,6 +388,114 @@ pub const sign_verify = struct {
             .signer_index = 0,
             .invalid_contrib = "pubkey",
             .comment = "Invalid pubkey",
+        },
+    };
+};
+
+// ---- tweak_vectors.json --------------------------------------------------
+
+pub const tweak = struct {
+    pub const sk = "7FB9E0E687ADA1EEBF7ECFE2F21E73EBDB51A7D450948DFE8D76D7F2D1007671";
+
+    pub const pubkeys: []const []const u8 = &.{
+        "03935F972DA013F80AE011890FA89B67A27B7BE6CCB24D3274D18B2D4067F261A9",
+        "02F9308A019258C31049344F85F89D5229B531C845836F99B08601F113BCE036F9",
+        "02DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659",
+    };
+
+    pub const secnonce = "508B81A611F100A6B2B6B29656590898AF488BCF2E1F55CF22E5CFB84421FE61FA27FD49B1D50085B481285E1CA205D55C82CC1B31FF5CD54A489829355901F703935F972DA013F80AE011890FA89B67A27B7BE6CCB24D3274D18B2D4067F261A9";
+
+    pub const pnonces: []const []const u8 = &.{
+        "0337C87821AFD50A8644D820A8F3E02E499C931865C2360FB43D0A0D20DAFE07EA0287BF891D2A6DEAEBADC909352AA9405D1428C15F4B75F04DAE642A95C2548480",
+        "0279BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F817980279BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798",
+        "032DE2662628C90B03F5E720284EB52FF7D71F4284F627B68A853D78C78E1FFE9303E4C5524E83FFE1493B9077CF1CA6BEB2090C93D930321071AD40B2F44E599046",
+    };
+
+    pub const aggnonce = "028465FCF0BBDBCF443AABCCE533D42B4B5A10966AC09A49655E8C42DAAB8FCD61037496A3CC86926D452CAFCFD55D25972CA1675D549310DE296BFF42F72EEEA8C9";
+
+    pub const tweaks: []const []const u8 = &.{
+        "E8F791FF9225A2AF0102AFFF4A9A723D9612A682A25EBE79802B263CDFCD83BB",
+        "AE2EA797CC0FE72AC5B97B97F3C6957D7E4199A167A58EB08BCAFFDA70AC0455",
+        "F52ECBC565B3D8BEA2DFD5B75A4F457E54369809322E4120831626F290FA87E0",
+        "1969AD73CC177FA0B4FCED6DF1F7BF9907E665FDE9BA196A74FED0A3CF5AEF9D",
+        "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141",
+    };
+
+    pub const msg = "F95466D086770E689964664219266FE5ED215C92AE20BAB5C9D79ADDDDF3C0CF";
+
+    pub const ValidCase = struct {
+        key_indices: []const usize,
+        nonce_indices: []const usize,
+        tweak_indices: []const usize,
+        is_xonly: []const bool,
+        signer_index: usize,
+        expected: []const u8,
+        comment: []const u8,
+    };
+    pub const valid_test_cases = [_]ValidCase{
+        .{
+            .key_indices = &.{ 1, 2, 0 },
+            .nonce_indices = &.{ 1, 2, 0 },
+            .tweak_indices = &.{0},
+            .is_xonly = &.{true},
+            .signer_index = 2,
+            .expected = "E28A5C66E61E178C2BA19DB77B6CF9F7E2F0F56C17918CD13135E60CC848FE91",
+            .comment = "A single x-only tweak",
+        },
+        .{
+            .key_indices = &.{ 1, 2, 0 },
+            .nonce_indices = &.{ 1, 2, 0 },
+            .tweak_indices = &.{0},
+            .is_xonly = &.{false},
+            .signer_index = 2,
+            .expected = "38B0767798252F21BF5702C48028B095428320F73A4B14DB1E25DE58543D2D2D",
+            .comment = "A single plain tweak",
+        },
+        .{
+            .key_indices = &.{ 1, 2, 0 },
+            .nonce_indices = &.{ 1, 2, 0 },
+            .tweak_indices = &.{ 0, 1 },
+            .is_xonly = &.{ false, true },
+            .signer_index = 2,
+            .expected = "408A0A21C4A0F5DACAF9646AD6EB6FECD7F7A11F03ED1F48DFFF2185BC2C2408",
+            .comment = "A plain tweak followed by an x-only tweak",
+        },
+        .{
+            .key_indices = &.{ 1, 2, 0 },
+            .nonce_indices = &.{ 1, 2, 0 },
+            .tweak_indices = &.{ 0, 1, 2, 3 },
+            .is_xonly = &.{ false, false, true, true },
+            .signer_index = 2,
+            .expected = "45ABD206E61E3DF2EC9E264A6FEC8292141A633C28586388235541F9ADE75435",
+            .comment = "Four tweaks: plain, plain, x-only, x-only.",
+        },
+        .{
+            .key_indices = &.{ 1, 2, 0 },
+            .nonce_indices = &.{ 1, 2, 0 },
+            .tweak_indices = &.{ 0, 1, 2, 3 },
+            .is_xonly = &.{ true, false, true, false },
+            .signer_index = 2,
+            .expected = "B255FDCAC27B40C7CE7848E2D3B7BF5EA0ED756DA81565AC804CCCA3E1D5D239",
+            .comment = "Four tweaks: x-only, plain, x-only, plain. If an implementation prohibits applying plain tweaks after x-only tweaks, it can skip this test vector or return an error.",
+        },
+    };
+
+    pub const ErrorCase = struct {
+        key_indices: []const usize,
+        nonce_indices: []const usize,
+        tweak_indices: []const usize,
+        is_xonly: []const bool,
+        signer_index: usize,
+        comment: []const u8,
+    };
+    pub const error_test_cases = [_]ErrorCase{
+        .{
+            .key_indices = &.{ 1, 2, 0 },
+            .nonce_indices = &.{ 1, 2, 0 },
+            .tweak_indices = &.{4},
+            .is_xonly = &.{false},
+            .signer_index = 2,
+            .comment = "Tweak is invalid because it exceeds group size",
         },
     };
 };

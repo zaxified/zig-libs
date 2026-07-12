@@ -4,13 +4,16 @@ MuSig2 multi-signature scheme over secp256k1 (BIP327); see
 [README.md](README.md) for purpose and API. Provenance: see
 [NOTICE](NOTICE).
 
-**Status: complete (v1, untweaked)** — the full BIP327 core signing flow
+**Status: complete (v2, tweak-aware)** — the full BIP327 core signing flow
 (`KeyAgg`/`NonceGen`/`NonceAgg`/`GetSessionValues`/`Sign`/
-`PartialSigVerify`/`PartialSigAgg`) is implemented and byte-exact against
-the official BIP327 vectors; the final aggregate signature verifies under
-plain `bip340.verify`. See "Out of scope" for what this v1 deliberately
-omits (tweaking, `DeterministicSign`) and "Done record" for the
-implementation pass's crypto-core notes.
+`PartialSigVerify`/`PartialSigAgg`) AND key tweaking (`ApplyTweak` —
+`KeyAggContext.applyTweak`, plain and x-only, composing via
+`gacc`/`tacc`) are implemented and byte-exact against the official BIP327
+vectors (including every `tweak_vectors.json` case and `sig_agg`'s two
+tweaked cases); the final aggregate signature verifies under plain
+`bip340.verify` against the (possibly tweaked) aggregate key. See "Out of
+scope" for what is still deliberately omitted (`DeterministicSign`) and
+"Done record" for the implementation passes' crypto-core notes.
 
 ## Design
 
@@ -117,14 +120,20 @@ implementation pass's crypto-core notes.
   even-Y final nonce — required because BIP340 signatures only ever
   commit to even-Y points, but an aggregate of arbitrary points is
   even-Y only by chance. Three DISTINCT sign-flips interact:
-    1. **KeyAgg's `gacc`/tweak accumulator** (BIP327 "Negation Of The
-       Secret Key When Signing") — always `1`/`Scalar.zero` in this v1
-       (no tweaking, see "Out of scope" below), but `sign`'s formula
-       (`d = g·gacc·d' mod n`) and `partialSigAgg`'s formula (`s = Σs_i +
-       e·g·tacc mod n`) are both written in terms of the general
-       (possibly-tweaked) values on purpose, so a future tweak-aware pass
-       only needs to stop hardcoding `gacc=1`/`tacc=0`, not rederive the
-       formulas.
+    1. **KeyAgg's `gacc`/`tacc` tweak accumulators** (BIP327 "Negation Of
+       The Secret Key When Signing") — `1`/`Scalar.zero` for an untweaked
+       session; each `applyTweak` step updates them as `gacc' = g·gacc`,
+       `tacc' = t + g·tacc` (where `g` is the x-only-tweak parity flip of
+       THAT step's pre-tweak `Q`, from the shared `gFromQ` helper — a plain
+       tweak always has `g = 1`). This composition is exactly what lets a
+       whole tweak CHAIN collapse into single terms downstream: `sign`'s
+       `d = g·gacc·d' mod n` un-flips the signer's secret through every
+       accumulated negation at once, and `partialSigAgg`'s `s = Σs_i +
+       e·g·tacc mod n` adds the entire accumulated tweak offset once.
+       Getting the ORDER wrong (e.g. `tacc' = g·(t + tacc)`) or applying
+       `g` to the wrong step's `Q` silently re-keys the signature — the
+       official `tweak_vectors.json` chains (plain/x-only in all four
+       orderings, up to 4 tweaks deep) pin every combination byte-exactly.
     2. **`g` = whether the (tweaked) aggregate key `Q` needed negating**
        to become the even-Y final public key — computed independently,
        and identically, by BOTH `sign` (to negate the signer's `d'`) and
@@ -171,29 +180,38 @@ implementation pass's crypto-core notes.
   check unconditionally and returns `error.SignatureVerificationFailed`
   (never the unverified `s`) if it does not pass.
 
-## Out of scope (v1)
+## Tweaking (implemented in v2)
 
-- **Tweaking** (`ApplyTweak`/`ApplyPlainTweak`/`ApplyXonlyTweak`, BIP327
-  §"Applying Tweaks"/"Tweaking Definition") is entirely OMITTED, not
-  merely stubbed: `SessionContext` carries no `tweaks`/`is_xonly_t`
-  fields, `KeyAggContext` always has `gacc = 1`/`tacc = Scalar.zero`
-  (never anything else), and `tweak_vectors.json` was fetched but not
-  transcribed into `kat_vectors.zig`. Rationale: the task's brief scoped
-  v1 to "the core signing flow" (KeyAgg/NonceGen/NonceAgg/Sign/
-  PartialSigVerify/PartialSigAgg) and asked that tweaking be scaffolded
-  as types-only or left out; it was left out entirely rather than
-  half-scaffolded, to avoid a `SessionContext` shape that would need to
-  change again once tweaking is added. A future
-  tweak-aware pass adds `tweaks: []const [32]u8`/`is_xonly: []const bool`
-  to `SessionContext`, implements `ApplyTweak` as a `KeyAggContext ->
-  KeyAggContext` step threaded through `getSessionValues` between
-  `keyAgg`'s output and the `b`/`R`/`e` computation, and un-hardcodes
-  `gacc`/`tacc` in `sign`/`partialSigVerifyInternal`/`partialSigAgg`'s
-  (already tweak-general) formulas — see the threat model above.
-  `sig_agg_vectors.json`'s valid cases 2/3 (which carry non-empty
-  `tweak_indices`) are consequently the only embedded official vectors
-  not asserted — guarded by an explicit `tweak_indices.len != 0` skip
-  plus a count check in `kat_test.zig`.
+Formerly out of scope; implemented exactly along the seam v1 left open
+(the formulas in `sign`/`partialSigVerifyInternal`/`partialSigAgg` were
+already written in their general `gacc`/`tacc` form — the tweak pass
+changed NONE of them, it only made the accumulators take non-trivial
+values):
+
+- **`KeyAggContext.applyTweak(tweak, is_xonly)`** = BIP327 `ApplyTweak`
+  (covering both `ApplyPlainTweak` and `ApplyXonlyTweak` via the flag):
+  `g = 1` (plain) or `gFromQ(Q)` (x-only — the flip only when the
+  CURRENT `Q` has odd y); `t = int(tweak)`, `error.TweakOutOfRange` if
+  `t >= n`; `Q' = g·Q + t·G`, `error.TweakedKeyIsInfinite` if infinite;
+  `gacc' = g·gacc`, `tacc' = t + g·tacc` (all mod n). Multiple tweaks
+  compose by repeated application — see the threat model's item 1 for why
+  the accumulator order matters and which vectors pin it. Plain tweaks
+  AFTER x-only tweaks are permitted (the spec leaves this optional; the
+  official vector for it asserts byte-exactly here).
+- **`SessionContext.tweaks: []const Tweak`** (default empty) — the spec's
+  parallel `tweak_1..v`/`is_xonly_t_1..v` lists as one slice of
+  `Tweak{ tweak, is_xonly }` values (no length-mismatch state exists).
+  `getSessionValues` folds them over `keyAgg`'s output before computing
+  `b`/`R`/`e`; the top-level `partialSigVerify` takes the same slice as a
+  parameter (BIP327's own `PartialSigVerify` signature).
+- Everything here is PUBLIC data (the aggregate key, the tweak values), so
+  `applyTweak` uses variable-time `mulPublic`/branches per `keyAgg`'s own
+  precedent; no secret ever enters the tweak path (the signer's secret is
+  only re-corrected inside `sign` via the constant-time `Scalar.mul`s of
+  `d = g·gacc·d'`, unchanged from v1).
+
+## Out of scope
+
 - **`DeterministicSign`** (BIP327 §"Deterministic and Stateless Signing
   for a Single Signer") — the optional single-signer convenience wrapper
   around `NonceGen`+`Sign` for the LAST signer in a session. Not part of
@@ -253,19 +271,41 @@ test (nonceGen → nonceAgg → sign → partialSigVerify → partialSigAgg →
 `bip340.verify`) closes the loop on fresh, non-vector data, including a
 cross-signer rejection check.
 
+## Done record — tweaking pass (v2)
+
+- **`KeyAggContext.applyTweak`** implemented per the "Tweaking" section
+  above; `SessionError` widened again (`|| ApplyTweakError`) since
+  BIP327's `GetSessionValues` runs the `ApplyTweak` loop itself.
+  `sign`/`partialSigVerifyInternal`/`partialSigAgg` needed NO formula
+  changes — audit confirmed all three already consumed the context's
+  `gacc`/`tacc` (`d = g·sv.gacc·d'`, `g' = g·sv.gacc`, `s = Σs_i +
+  e·g·sv.tacc`), never a hardcoded 1/0; the v1 "hardcoding" lived solely
+  in `keyAgg`'s output values.
+- **`partialSigVerify`** gained the `tweaks` parameter (BIP327's own
+  top-level signature); the previously-embedded-but-skipped `sig_agg`
+  tweaked cases 2/3 now assert byte-exactly, and the two key_agg tweak
+  error cases (t = n out of range; plain tweak landing the single-key
+  aggregate exactly on the point at infinity) were transcribed and assert
+  against `applyTweak`.
+- **KATs added**: all of `tweak_vectors.json` (5 valid chains — each
+  signed byte-exact, accepted by the tweak-aware `partialSigVerify`, and
+  REJECTED by an untweaked verify of the same psig; 1 error case, hit at
+  both the `applyTweak` leaf and through `sign`), plus a second end-to-end
+  test: 3 signers, a BIP341-shaped `TapTweak` x-only tweak, full protocol
+  → the 64-byte aggregate verifies under the TWEAKED x-only key via plain
+  `bip340.verify` and fails under the untweaked one.
+
 ## Verification
 
-- KAT oracles: the official BIP327 test vectors, six of the eight
+- KAT oracles: the official BIP327 test vectors, seven of the eight
   published JSON files under `bip-0327/vectors/` in `bitcoin/bips` (see
-  `NOTICE` for the fetch source and which two files were deliberately not
+  `NOTICE`; only `det_sign_vectors.json` remains deliberately not
   embedded), transcribed into `src/kat_vectors.zig`.
-- `zig build test-musig2` (Debug) and `-Doptimize=ReleaseFast`: 21 pass /
-  0 skip (of 21 total) — every embedded official vector asserts for real
-  (the only vectors not asserted are `sig_agg`'s two TWEAKED valid cases,
-  out of v1 scope, guarded by an explicit count check), plus the 3-signer
-  end-to-end test. `zig fmt --check modules/musig2/` clean; a repo-hygiene
-  grep for scratch/home-directory leakage over this module's tree has no
-  hits.
+- `zig build test-musig2` (Debug) and `-Doptimize=ReleaseFast`: 25 pass /
+  0 skip (of 25 total) — every embedded official vector asserts for real
+  (untweaked AND tweaked), plus the two end-to-end tests. `zig fmt
+  --check modules/musig2/` clean; a repo-hygiene grep for
+  scratch/home-directory leakage over this module's tree has no hits.
 - Disk-vs-running test count (CONVENTIONS.md §6 step 3): counting
-  top-level `test` blocks across `src/*.zig` sums to 21, matching
-  `zig build test-musig2 --summary all`'s "21 total".
+  top-level `test` blocks across `src/*.zig` sums to 25, matching
+  `zig build test-musig2 --summary all`'s "25 total".

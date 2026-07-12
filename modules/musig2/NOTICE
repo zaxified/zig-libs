@@ -11,11 +11,13 @@ Provenance
 musig2 — clean-room implementation from BIP327 ("MuSig2 for
 BIP340-compatible Multi-Signatures", bitcoin/bips), covering: key
 aggregation and the "second key"/coefficient rule ("Key Generation and
-Aggregation"), nonce generation and aggregation ("Nonce Generation",
-"Nonce Aggregation"), the session-context/challenge construction ("Session
-Context"), signing, partial-signature verification, and partial-signature
-aggregation ("Signing", "Partial Signature Verification", "Partial
-Signature Aggregation"). BIP327 is a public, open Bitcoin Improvement
+Aggregation"), key tweaking ("Applying Tweaks"/"Tweaking Definition" —
+plain and x-only, with the gacc/tacc accumulators), nonce generation and
+aggregation ("Nonce Generation", "Nonce Aggregation"), the
+session-context/challenge construction ("Session Context"), signing,
+partial-signature verification, and partial-signature aggregation
+("Signing", "Partial Signature Verification", "Partial Signature
+Aggregation"). BIP327 is a public, open Bitcoin Improvement
 Proposal — not a copyrightable work (merger doctrine; see
 CONVENTIONS.md §5) — so no third-party-source NOTICE entry is strictly
 required for the spec citation alone. No reference implementation's
@@ -35,12 +37,14 @@ https://raw.githubusercontent.com/bitcoin/bips/master/bip-0327/vectors/nonce_gen
 https://raw.githubusercontent.com/bitcoin/bips/master/bip-0327/vectors/nonce_agg_vectors.json
 https://raw.githubusercontent.com/bitcoin/bips/master/bip-0327/vectors/sign_verify_vectors.json
 https://raw.githubusercontent.com/bitcoin/bips/master/bip-0327/vectors/sig_agg_vectors.json
+https://raw.githubusercontent.com/bitcoin/bips/master/bip-0327/vectors/tweak_vectors.json
 These are public specification artifacts — the BIP's own published
 conformance vectors — not copied from any other implementation's test
-suite. Two published vector files were fetched but NOT embedded:
-`tweak_vectors.json` (tweaking is out of v1 scope — see `SPEC.md`) and
-`det_sign_vectors.json` (the optional single-signer `DeterministicSign`
-convenience wrapper, not part of the core signing flow scaffolded here).
+suite. `tweak_vectors.json` (and key_agg_vectors.json's two tweak error
+cases) were embedded in the tweaking pass. One published vector file was
+fetched but NOT embedded: `det_sign_vectors.json` (the optional
+single-signer `DeterministicSign` convenience wrapper, not part of the
+core signing flow implemented here).
 
 `std.crypto.ecc.Secp256k1` / `std.crypto.hash.sha2.Sha256` (MIT, part of
 Zig itself) and the sibling `bip340` module (this repository, MIT — see
@@ -49,12 +53,14 @@ primitive is implemented here.
 
 No GPL/LGPL/AGPL source was consulted or copied anywhere in this module.
 
-**Status: complete (v1, untweaked).** The full BIP327 core signing flow
+**Status: complete (v2, tweak-aware).** The full BIP327 core signing flow
 (wire codecs, `KeySort`, `NonceGen`, `KeyAgg`, `NonceAgg`,
 `GetSessionValues`, `Sign` with the mandatory self-verify,
-`PartialSigVerify`, `PartialSigAgg`) is implemented and byte-exact against
-the official BIP327 vectors; the aggregate signature verifies under plain
-`bip340.verify`. The crypto-core implementation pass, like the scaffold,
-worked from the BIP327 specification text only (no reference
-implementation consulted). Tweaking and `DeterministicSign` remain out of
-v1 scope — see `SPEC.md`'s "Out of scope" and "Done record".
+`PartialSigVerify`, `PartialSigAgg`) and key tweaking (`ApplyTweak`,
+plain + x-only, composing via the gacc/tacc accumulators) are implemented
+and byte-exact against the official BIP327 vectors; the aggregate
+signature verifies under plain `bip340.verify` against the (possibly
+tweaked) aggregate key. Every implementation pass — scaffold, crypto
+core, and tweaking — worked from the BIP327 specification text only (no
+reference implementation consulted). `DeterministicSign` remains out of
+scope — see `SPEC.md`'s "Out of scope" and "Done record".

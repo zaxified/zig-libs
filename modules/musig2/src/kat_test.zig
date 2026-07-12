@@ -8,24 +8,27 @@
 //!   - Every "valid" vector: byte-exact — `key_agg`'s 4 aggregate keys,
 //!     `nonce_agg`'s 2 aggregate nonces (including the point-at-infinity
 //!     encoding), `sign_verify`'s 6 partial signatures (each additionally
-//!     re-checked through the top-level `partialSigVerify`), and
-//!     `sig_agg`'s 2 untweaked final signatures (each additionally
-//!     verified under plain `bip340.verify` — the scheme's headline
-//!     property). `sig_agg`'s 2 tweaked cases need `ApplyTweak` (out of v1
-//!     scope — see `SPEC.md`) and are skipped by an explicit
-//!     `tweak_indices.len != 0` guard with a count check.
+//!     re-checked through the top-level `partialSigVerify`), `tweak`'s 5
+//!     tweaked partial signatures (each additionally re-checked through
+//!     the tweak-aware `partialSigVerify`), and ALL 4 of `sig_agg`'s final
+//!     signatures — untweaked and tweaked — (each additionally verified
+//!     under plain `bip340.verify` against the possibly-tweaked aggregate
+//!     key — the scheme's headline property).
 //!   - Every official "invalid contribution"/failure vector: exercised
 //!     against the real leaf codec (`PlainPublicKey.fromBytes` /
 //!     `PubNonce.fromBytes` / `AggNonce.fromBytes` / `SecNonce.k1Scalar` /
-//!     `PartialSignature.fromBytes`) AND — wherever the composite call's
-//!     own blame ordering surfaces that same failure (see each test's
-//!     comment) — the composite function itself (`keyAgg`, `nonceAgg`,
-//!     `sign`, `partialSigVerify`, `partialSigAgg`), including both
-//!     equation-level `verify_fail` rejections (wrong signature = the
-//!     negation of a valid one, and wrong signer).
-//!   - An end-to-end 3-signer protocol run (not a published vector):
-//!     nonceGen → nonceAgg → sign → partialSigVerify → partialSigAgg →
-//!     `bip340.verify` accepts the aggregate.
+//!     `PartialSignature.fromBytes` / `KeyAggContext.applyTweak`) AND —
+//!     wherever the composite call's own blame ordering surfaces that same
+//!     failure (see each test's comment) — the composite function itself
+//!     (`keyAgg`, `nonceAgg`, `sign`, `partialSigVerify`,
+//!     `partialSigAgg`), including both equation-level `verify_fail`
+//!     rejections (wrong signature = the negation of a valid one, and
+//!     wrong signer) and the tweak error cases (`t >= n` at both the
+//!     `applyTweak` leaf and through `sign`; tweaked key at infinity).
+//!   - Two end-to-end 3-signer protocol runs (not published vectors):
+//!     untweaked, and with an x-only (Taproot-style) tweak — nonceGen →
+//!     nonceAgg → sign → partialSigVerify → partialSigAgg →
+//!     `bip340.verify` accepts the aggregate under the (tweaked) key.
 
 const std = @import("std");
 const musig2 = @import("root.zig");
@@ -60,6 +63,13 @@ fn rawPubnonces(buf: []musig2.PubNonce, hex_list: []const []const u8, indices: [
     return buf[0..indices.len];
 }
 
+/// Assembles a `[]musig2.Tweak` from a vector's parallel
+/// `tweak_indices`/`is_xonly` selections over its hex tweak list.
+fn tweakList(buf: []musig2.Tweak, hex_list: []const []const u8, indices: []const usize, is_xonly: []const bool) []musig2.Tweak {
+    for (indices, is_xonly, 0..) |idx, xo, i| buf[i] = .{ .tweak = hexN(32, hex_list[idx]), .is_xonly = xo };
+    return buf[0..indices.len];
+}
+
 // ── key_agg ─────────────────────────────────────────────────────────────
 
 test "KAT key_agg: error_test_cases — real cpoint parsing rejects the blamed signer (leaf AND composite)" {
@@ -86,6 +96,29 @@ test "KAT key_agg: valid_test_cases — aggregate x-only key is byte-exact" {
         }
         const ctx = try musig2.keyAgg(buf[0..case.key_indices.len]);
         try std.testing.expectEqualSlices(u8, &hexN(32, case.expected), &ctx.getXonlyPubkey());
+    }
+}
+
+test "KAT key_agg: tweak_error_test_cases — out-of-range tweak and infinite tweaked key are rejected" {
+    // Case 0: t = n exactly (x-only) → TweakOutOfRange. Case 1: a plain
+    // tweak crafted so g·Q + t·G is EXACTLY the point at infinity →
+    // TweakedKeyIsInfinite (the fail-closed "tweak cancelled the key"
+    // rejection).
+    const expected_errors = [_]anyerror{ error.TweakOutOfRange, error.TweakedKeyIsInfinite };
+    for (v.key_agg.tweak_error_test_cases, expected_errors) |case, expected| {
+        var buf: [8]musig2.PlainPublicKey = undefined;
+        for (case.key_indices, 0..) |idx, i| {
+            buf[i] = try musig2.PlainPublicKey.fromBytes(hexN(33, v.key_agg.pubkeys[idx]));
+        }
+        var ctx = try musig2.keyAgg(buf[0..case.key_indices.len]);
+        var failed: ?anyerror = null;
+        for (case.tweak_indices, case.is_xonly) |tweak_idx, is_xonly| {
+            ctx = ctx.applyTweak(hexN(32, v.key_agg.tweaks[tweak_idx]), is_xonly) catch |err| {
+                failed = err;
+                break;
+            };
+        }
+        try std.testing.expectEqual(@as(?anyerror, expected), failed);
     }
 }
 
@@ -267,7 +300,7 @@ test "KAT sign_verify: valid_test_cases — partial signatures byte-exact; parti
         try std.testing.expectEqualSlices(u8, &hexN(32, case.expected), &psig.bytes);
 
         // And the top-level PartialSigVerify accepts what sign produced.
-        try musig2.partialSigVerify(psig, pns, pks, msg, case.signer_index);
+        try musig2.partialSigVerify(psig, pns, pks, &.{}, msg, case.signer_index);
     }
 }
 
@@ -303,6 +336,7 @@ test "KAT sign_verify: verify_fail_test_cases (0,1) — wrong signature / wrong 
             psig,
             pn_buf[0..case.nonce_indices.len],
             pk_buf[0..case.key_indices.len],
+            &.{},
             msg,
             case.signer_index,
         ));
@@ -325,7 +359,7 @@ test "KAT sign_verify: verify_error_test_cases (0) — invalid pubnonce" {
     // `nonceAgg(pubnonces)` (computed next, per BIP327's own algorithm)
     // finds the invalid pubnonce before ever reaching `keyAgg`.
     const msg = hexN(32, v.sign_verify.msgs[case.msg_index]);
-    try std.testing.expectError(error.InvalidPubNonce, musig2.partialSigVerify(psig, pns, pks, &msg, case.signer_index));
+    try std.testing.expectError(error.InvalidPubNonce, musig2.partialSigVerify(psig, pns, pks, &.{}, &msg, case.signer_index));
 }
 
 test "KAT sign_verify: verify_error_test_cases (1) — invalid pubkey" {
@@ -343,7 +377,74 @@ test "KAT sign_verify: verify_error_test_cases (1) — invalid pubkey" {
     var pn_buf: [8]musig2.PubNonce = undefined;
     const pns = rawPubnonces(&pn_buf, v.sign_verify.pnonces, case.nonce_indices);
     const msg = hexN(32, v.sign_verify.msgs[case.msg_index]);
-    try std.testing.expectError(error.InvalidPublicKey, musig2.partialSigVerify(psig, pns, pks, &msg, case.signer_index));
+    try std.testing.expectError(error.InvalidPublicKey, musig2.partialSigVerify(psig, pns, pks, &.{}, &msg, case.signer_index));
+}
+
+// ── tweak (tweak_vectors.json) ───────────────────────────────────────────
+
+test "KAT tweak: valid_test_cases — tweaked partial signatures byte-exact; tweak-aware partialSigVerify accepts" {
+    // All 5 official cases: a single x-only tweak, a single plain tweak,
+    // plain-then-x-only, and both 4-tweak orderings (including x-only
+    // BEFORE plain — this module permits it, per the vector's own note) —
+    // each pins the g/gacc/tacc composition through `sign`'s
+    // `d = g·gacc·d'` for a different tweak-chain shape.
+    const sk = try bip340.SecretKey.fromBytes(hexN(32, v.tweak.sk));
+    for (v.tweak.valid_test_cases) |case| {
+        var pk_buf: [8]musig2.PlainPublicKey = undefined;
+        for (case.key_indices, 0..) |idx, i| pk_buf[i] = try musig2.PlainPublicKey.fromBytes(hexN(33, v.tweak.pubkeys[idx]));
+        const pks = pk_buf[0..case.key_indices.len];
+
+        // The vector's published aggnonce is NonceAgg over its pubnonces.
+        var pn_buf: [8]musig2.PubNonce = undefined;
+        for (case.nonce_indices, 0..) |idx, i| pn_buf[i] = try musig2.PubNonce.fromBytes(hexN(66, v.tweak.pnonces[idx]));
+        const pns = pn_buf[0..case.nonce_indices.len];
+        const aggnonce = try musig2.AggNonce.fromBytes(hexN(66, v.tweak.aggnonce));
+        const computed_aggnonce = try musig2.nonceAgg(pns);
+        try std.testing.expectEqualSlices(u8, &aggnonce.bytes, &computed_aggnonce.bytes);
+
+        var tw_buf: [8]musig2.Tweak = undefined;
+        const tweaks = tweakList(&tw_buf, v.tweak.tweaks, case.tweak_indices, case.is_xonly);
+
+        const msg = hexN(32, v.tweak.msg);
+        const ctx = musig2.SessionContext{ .aggnonce = aggnonce, .pubkeys = pks, .tweaks = tweaks, .msg = &msg };
+
+        const secnonce = musig2.SecNonce.fromBytes(hexN(97, v.tweak.secnonce));
+        const psig = try musig2.sign(secnonce, sk, ctx);
+        try std.testing.expectEqualSlices(u8, &hexN(32, case.expected), &psig.bytes);
+
+        // The tweak-aware top-level PartialSigVerify accepts it (and its
+        // internal `g' = g·gacc` must mirror sign's flip for EVERY chain).
+        try musig2.partialSigVerify(psig, pns, pks, tweaks, &msg, case.signer_index);
+
+        // Cross-check: the SAME partial signature must NOT verify with
+        // the tweaks dropped (a verifier that ignores tweaks is broken).
+        try std.testing.expectError(error.InvalidPartialSignature, musig2.partialSigVerify(psig, pns, pks, &.{}, &msg, case.signer_index));
+    }
+}
+
+test "KAT tweak: error_test_cases — tweak >= n rejected (leaf applyTweak AND composite sign)" {
+    const case = v.tweak.error_test_cases[0];
+    const sk = try bip340.SecretKey.fromBytes(hexN(32, v.tweak.sk));
+
+    var pk_buf: [8]musig2.PlainPublicKey = undefined;
+    for (case.key_indices, 0..) |idx, i| pk_buf[i] = try musig2.PlainPublicKey.fromBytes(hexN(33, v.tweak.pubkeys[idx]));
+    const pks = pk_buf[0..case.key_indices.len];
+
+    // Leaf: ApplyTweak itself rejects t = n ("The tweak must be less
+    // than n.").
+    const keyagg_ctx = try musig2.keyAgg(pks);
+    try std.testing.expectError(error.TweakOutOfRange, keyagg_ctx.applyTweak(hexN(32, v.tweak.tweaks[case.tweak_indices[0]]), case.is_xonly[0]));
+
+    // Composite: `sign` hits the same rejection through
+    // `getSessionValues`'s tweak loop (all other inputs are valid, so the
+    // tweak check is genuinely what fires).
+    var tw_buf: [8]musig2.Tweak = undefined;
+    const tweaks = tweakList(&tw_buf, v.tweak.tweaks, case.tweak_indices, case.is_xonly);
+    const aggnonce = try musig2.AggNonce.fromBytes(hexN(66, v.tweak.aggnonce));
+    const msg = hexN(32, v.tweak.msg);
+    const ctx = musig2.SessionContext{ .aggnonce = aggnonce, .pubkeys = pks, .tweaks = tweaks, .msg = &msg };
+    const secnonce = musig2.SecNonce.fromBytes(hexN(97, v.tweak.secnonce));
+    try std.testing.expectError(error.TweakOutOfRange, musig2.sign(secnonce, sk, ctx));
 }
 
 // ── sig_agg ─────────────────────────────────────────────────────────────
@@ -360,28 +461,25 @@ test "KAT sig_agg: error_test_cases — real s<n check rejects the blamed signer
     // Composite: safe — `partialSigAgg`'s real per-psig loop (added
     // specifically because BIP327's own `PartialSigAgg` algorithm
     // performs this check itself, not a caller-side precondition) finds
-    // the out-of-range `s_i` before ever calling `getSessionValues`. Note:
-    // this vector also carries `tweak_indices`/`is_xonly` (tweaking is out
-    // of v1 scope, see SPEC.md) — irrelevant here since the psig check
-    // fires first regardless.
+    // the out-of-range `s_i` before ever calling `getSessionValues`. The
+    // vector's tweaks are passed through faithfully — irrelevant to the
+    // outcome, since the psig check fires first regardless.
     var pk_buf: [8]musig2.PlainPublicKey = undefined;
     const pks = rawPubkeys(&pk_buf, v.sig_agg.pubkeys, case.key_indices);
+    var tw_buf: [8]musig2.Tweak = undefined;
+    const tweaks = tweakList(&tw_buf, v.sig_agg.tweaks, case.tweak_indices, case.is_xonly);
     const aggnonce = try musig2.AggNonce.fromBytes(hexN(66, case.aggnonce));
     const msg = hexN(32, v.sig_agg.msg);
-    const ctx = musig2.SessionContext{ .aggnonce = aggnonce, .pubkeys = pks, .msg = &msg };
+    const ctx = musig2.SessionContext{ .aggnonce = aggnonce, .pubkeys = pks, .tweaks = tweaks, .msg = &msg };
 
     try std.testing.expectError(error.InvalidPartialSignature, musig2.partialSigAgg(psigs, ctx));
 }
 
-test "KAT sig_agg: valid_test_cases — untweaked cases byte-exact AND verify under plain bip340" {
-    // Cases 2/3 carry non-empty `tweak_indices` — tweaking is out of v1
-    // scope (see SPEC.md), so exactly the two untweaked cases are
-    // assertable; the trailing count check pins that neither silently
-    // stops being exercised.
-    var asserted: usize = 0;
+test "KAT sig_agg: valid_test_cases — all 4 cases (untweaked AND tweaked) byte-exact AND verify under plain bip340" {
+    // Cases 0/1 are untweaked; cases 2/3 carry non-empty `tweak_indices`
+    // (one plain tweak; a plain+x-only+x-only chain) — all four assert
+    // for real now that `applyTweak` exists.
     for (v.sig_agg.valid_test_cases) |case| {
-        if (case.tweak_indices.len != 0) continue;
-
         var pk_buf: [8]musig2.PlainPublicKey = undefined;
         for (case.key_indices, 0..) |idx, i| pk_buf[i] = try musig2.PlainPublicKey.fromBytes(hexN(33, v.sig_agg.pubkeys[idx]));
         const pks = pk_buf[0..case.key_indices.len];
@@ -396,20 +494,22 @@ test "KAT sig_agg: valid_test_cases — untweaked cases byte-exact AND verify un
         var ps_buf: [8]musig2.PartialSignature = undefined;
         for (case.psig_indices, 0..) |idx, i| ps_buf[i] = try musig2.PartialSignature.fromBytes(hexN(32, v.sig_agg.psigs[idx]));
 
+        var tw_buf: [8]musig2.Tweak = undefined;
+        const tweaks = tweakList(&tw_buf, v.sig_agg.tweaks, case.tweak_indices, case.is_xonly);
+
         const msg = hexN(32, v.sig_agg.msg);
-        const ctx = musig2.SessionContext{ .aggnonce = aggnonce, .pubkeys = pks, .msg = &msg };
+        const ctx = musig2.SessionContext{ .aggnonce = aggnonce, .pubkeys = pks, .tweaks = tweaks, .msg = &msg };
         const sig = try musig2.partialSigAgg(ps_buf[0..case.psig_indices.len], ctx);
         try std.testing.expectEqualSlices(u8, &hexN(64, case.expected), &sig);
 
         // The scheme's headline property: the aggregate is a plain BIP340
-        // signature under the aggregate x-only key — a vanilla
-        // `bip340.verify` accepts it with no MuSig2 knowledge.
-        const keyagg_ctx = try musig2.keyAgg(pks);
+        // signature under the (tweaked) aggregate x-only key — a vanilla
+        // `bip340.verify` accepts it with no MuSig2 (or tweak) knowledge.
+        var keyagg_ctx = try musig2.keyAgg(pks);
+        for (tweaks) |tw| keyagg_ctx = try keyagg_ctx.applyTweak(tw.tweak, tw.is_xonly);
         const aggpk = try bip340.XOnlyPublicKey.fromBytes(keyagg_ctx.getXonlyPubkey());
         try std.testing.expect(bip340.verify(aggpk, &msg, try bip340.Signature.fromBytes(sig)));
-        asserted += 1;
     }
-    try std.testing.expectEqual(@as(usize, 2), asserted);
 }
 
 // ── end-to-end (not a published vector: the full multi-signer protocol) ──
@@ -447,14 +547,71 @@ test "end-to-end: 3 signers, nonceGen→nonceAgg→sign→partialSigVerify→par
     var psigs: [3]musig2.PartialSignature = undefined;
     for (0..3) |i| {
         psigs[i] = try musig2.sign(secnonces[i], sks[i], ctx);
-        try musig2.partialSigVerify(psigs[i], &pubnonces, &pks, msg, i);
+        try musig2.partialSigVerify(psigs[i], &pubnonces, &pks, &.{}, msg, i);
     }
     // Cross-signer sanity: signer 0's partial signature must NOT verify
     // as signer 1's (the "Wrong signer" failure shape, on fresh data).
-    try std.testing.expectError(error.InvalidPartialSignature, musig2.partialSigVerify(psigs[0], &pubnonces, &pks, msg, 1));
+    try std.testing.expectError(error.InvalidPartialSignature, musig2.partialSigVerify(psigs[0], &pubnonces, &pks, &.{}, msg, 1));
 
     const sig = try musig2.partialSigAgg(&psigs, ctx);
     const keyagg_ctx = try musig2.keyAgg(&pks);
     const aggpk = try bip340.XOnlyPublicKey.fromBytes(keyagg_ctx.getXonlyPubkey());
     try std.testing.expect(bip340.verify(aggpk, msg, try bip340.Signature.fromBytes(sig)));
+}
+
+test "end-to-end: 3 signers with an x-only (Taproot-style) tweak — aggregate verifies under the TWEAKED key" {
+    const Secp256k1 = std.crypto.ecc.Secp256k1;
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const msg = "MuSig2 tweaked end-to-end over zig-libs bip340";
+
+    var sks: [3]bip340.SecretKey = undefined;
+    var pks: [3]musig2.PlainPublicKey = undefined;
+    var secnonces: [3]musig2.SecNonce = undefined;
+    var pubnonces: [3]musig2.PubNonce = undefined;
+    for (0..3) |i| {
+        var sk_bytes = [_]u8{0x51} ** 32; // arbitrary fixed test keys, well in range
+        sk_bytes[31] = @intCast(i + 1);
+        sks[i] = try bip340.SecretKey.fromBytes(sk_bytes);
+        const p = try Secp256k1.basePoint.mul(sk_bytes, .big);
+        pks[i] = try musig2.PlainPublicKey.fromBytes(p.toCompressedSec1());
+
+        var rand_prime = [_]u8{0xC3} ** 32; // per-signer distinct nonce randomness
+        rand_prime[0] = @intCast(i);
+        const ng = try musig2.nonceGen(sk_bytes, pks[i].bytes, null, msg, null, rand_prime, io);
+        secnonces[i] = ng.secnonce;
+        pubnonces[i] = ng.pubnonce;
+    }
+
+    // Taproot-shaped x-only tweak: t = taggedHash("TapTweak", xbytes(Q))
+    // over the untweaked aggregate key (BIP341's key-path-only commitment
+    // shape — a deterministic public value, canonical for this fixed
+    // signer set).
+    const base_ctx = try musig2.keyAgg(&pks);
+    const tweaks = [_]musig2.Tweak{
+        .{ .tweak = bip340.taggedHash("TapTweak", &base_ctx.getXonlyPubkey()), .is_xonly = true },
+    };
+
+    const aggnonce = try musig2.nonceAgg(&pubnonces);
+    const ctx = musig2.SessionContext{ .aggnonce = aggnonce, .pubkeys = &pks, .tweaks = &tweaks, .msg = msg };
+
+    var psigs: [3]musig2.PartialSignature = undefined;
+    for (0..3) |i| {
+        psigs[i] = try musig2.sign(secnonces[i], sks[i], ctx);
+        try musig2.partialSigVerify(psigs[i], &pubnonces, &pks, &tweaks, msg, i);
+    }
+
+    const sig = try musig2.partialSigAgg(&psigs, ctx);
+
+    // The aggregate verifies under the TWEAKED x-only key (the Taproot
+    // output key), and does NOT verify under the untweaked aggregate —
+    // proof the tweak genuinely entered the signature, not just the tests.
+    const tweaked_ctx = try base_ctx.applyTweak(tweaks[0].tweak, tweaks[0].is_xonly);
+    const tweaked_pk = try bip340.XOnlyPublicKey.fromBytes(tweaked_ctx.getXonlyPubkey());
+    try std.testing.expect(bip340.verify(tweaked_pk, msg, try bip340.Signature.fromBytes(sig)));
+    const untweaked_pk = try bip340.XOnlyPublicKey.fromBytes(base_ctx.getXonlyPubkey());
+    try std.testing.expect(!bip340.verify(untweaked_pk, msg, try bip340.Signature.fromBytes(sig)));
 }
