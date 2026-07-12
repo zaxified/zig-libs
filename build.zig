@@ -116,6 +116,7 @@ const module_list = [_]Module{
     .{ .name = "musig2", .deps = &.{"bip340"} },
     .{ .name = "sphinx" },
     .{ .name = "bolt8", .deps = &.{"noise"} },
+    .{ .name = "bolt3" },
     .{ .name = "hpke" },
     .{ .name = "adaptor", .deps = &.{"bip340"} },
     .{ .name = "frost", .deps = &.{"bip340"} },

@@ -1,0 +1,24 @@
+bolt3 — provenance note
+=======================
+
+Kept as a module-local NOTICE (same placement as the sibling `bolt8`/`sphinx`/
+`bip340`/`taproot`/`musig2` modules, which are likewise self-contained
+crypto/codec modules not folded into the root `NOTICE`).
+
+Provenance
+----------
+
+bolt3 — clean-room implementation from the Lightning BOLT#3 specification
+("Bitcoin Transaction and Script Formats", lightning/bolts), specifically the
+"Key Derivation" section (per-commitment and revocation public/secret keys)
+and Appendix D ("Per-commitment Secret Requirements"). Written from the spec
+text and its normative test vectors; no reference implementation was copied.
+
+The elliptic-curve group (secp256k1) and SHA-256 come from Zig's standard
+library (`std.crypto.ecc.Secp256k1`, `std.crypto.hash.sha2.Sha256`). The
+scalar-reduction idiom for hash-to-scalar mirrors this repository's own
+`bip340` module.
+
+Verification vectors are the BOLT#3 Appendix D (generation) and Appendix E
+(key derivation) test vectors from the lightning/bolts repository, reproduced
+byte-exact in the module's tests.
