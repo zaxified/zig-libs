@@ -11,7 +11,7 @@ cross-project-reusable capability — a production-grade implementation of a pro
 or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
 authors' other projects depend on it, not the reverse.
 
-**Status:** 95 modules · 2619 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 96 modules · 2662 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ## Using a module
@@ -144,6 +144,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `bip340` | BIP340 Schnorr signatures over secp256k1 (Bitcoin Taproot's signature scheme) over `std.crypto.ecc.Secp256k1` — tagged hashing, x-only public keys (even-y `lift_x`), `sign` (constant-time nonce even-y select + mandatory self-verify), `verify` (`sG−eP` equation), `verifyBatch`, key/signature codecs; **byte-exact against all 19 official BIP340 test vectors** (8 sign + 10 negative-verify) | any | — |
 | `taproot` | BIP341 Taproot key-path output-key tweaking — `"TapTweak"` tagged hash, `tweakPublicKey` (`Q = P + t·G`, x-only + parity) and `tweakSecretKey` (even-y-normalized `q = d + t mod n`, delegating normalization to `bip340`); byte-exact against all 7 official BIP341 wallet test vectors (tweaked pubkey + privkey + parity) + a tweaked-key sign→verify round-trip | any | bip340 |
 | `musig2` | MuSig2 multi-signature (BIP327) producing BIP340 signatures — key aggregation (rogue-key-safe coefficients + "second key" rule), 2-round nonce gen/aggregation, partial sign/verify, partial-sig aggregation, with the security-critical parity/`g` bookkeeping routed through one shared helper (signer/verifier/aggregator can't disagree); byte-exact against the official BIP327 key_agg/nonce_agg/sign_verify/sig_agg vectors + an end-to-end multi-signer → `bip340.verify` round-trip (v1: untweaked) | any | bip340 |
+| `sphinx` | Lightning **BOLT#4 Sphinx onion routing** (the mix-net that gives Lightning payment privacy) — forward ECDH + blinding-factor chain, `rho`/`mu`/`um`/`pad` key derivation, `construct` (filler generation + reverse-order layered wrap) and `process` (constant-time HMAC gate → `timing_safe.eql`, deobfuscate, peel one layer, blind the next ephemeral); `construct` reproduces the official BOLT#4 1366-byte onion packet **byte-exact** + a 5-hop construct→process round-trip | any | — |
 
 ### Serialization / OS / agent
 

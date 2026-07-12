@@ -1,0 +1,64 @@
+sphinx — provenance note
+=========================
+
+Kept as a module-local NOTICE (same placement as the sibling `bip340`/
+`taproot`/`musig2`/`dtls`/`falcon`/`slhdsa` modules, which are likewise
+self-contained crypto/codec modules not folded into the root `NOTICE`).
+
+Provenance
+----------
+
+sphinx — clean-room implementation from BOLT#4 ("Onion Routing Protocol",
+`lightning/bolts`), covering: "Key Generation", "Pseudo Random Byte
+Stream", "Packet Structure" (incl. the `payload` TLV format), "Shared
+Secret", "Blinding Ephemeral Onion Keys", "Packet Construction", "Onion
+Decryption", and "Filler Generation". BOLT#4 is a public, open Lightning
+Network specification — not a copyrightable work (merger doctrine; see
+CONVENTIONS.md §5) — so no third-party-source NOTICE entry is strictly
+required for the spec citation alone. No reference implementation's source
+(lnd, c-lightning/core-lightning, eclair, ldk, etc.) was ported or
+consulted as a design reference for this module — it was built directly
+from the BOLT#4 specification text.
+
+BOLT#1 ("Base Protocol") is cited for the `bigsize` variable-length integer
+encoding (`bigsize.zig`), also a public specification artifact.
+
+The official BOLT#4 test vector (`kat_vectors.zig`) was fetched directly
+from two files in the `lightning/bolts` repository, `master` branch, for
+this pass:
+
+  - `bolt04/onion-test.json`
+    (https://raw.githubusercontent.com/lightning/bolts/master/bolt04/onion-test.json)
+  - `04-onion-routing.md`
+    (https://raw.githubusercontent.com/lightning/bolts/master/04-onion-routing.md),
+    the "# Test Vector" section's worked error-message trace (source of the
+    5 per-hop `shared_secret` values; the JSON file does not itself publish
+    intermediate shared secrets).
+
+These are public specification/test artifacts — the BOLT's own published
+conformance vectors — not copied from any Lightning implementation's test
+suite. The 5 `shared_secret` values transcribed from `04-onion-routing.md`
+were additionally INDEPENDENTLY RE-DERIVED (not merely copied) for this
+pass: recomputed from `session_key`/the 5 node `pubkey`s via a from-scratch
+Python secp256k1 point-multiply + the BOLT#4 blinding-chain recipe (the
+`ecdsa` PyPI package for the underlying curve arithmetic only — no
+Lightning-specific or Sphinx-specific code of any kind), and matched
+byte-for-byte against the spec's published values before being embedded
+here. See `SPEC.md`'s design section for the verification log.
+
+`std.crypto.ecc.Secp256k1` (field/scalar arithmetic, point group law,
+`basePoint`, `mul`, `fromSec1`/`toCompressedSec1`), `std.crypto.stream.
+chacha.ChaCha20IETF`, `std.crypto.auth.hmac.sha2.HmacSha256`, and
+`std.crypto.hash.sha2.Sha256` are used via their public APIs (MIT, part of
+Zig itself); see `core.zig`'s and `keyderive.zig`'s module doc comments for
+the specific recon findings.
+
+No GPL/LGPL/AGPL source was consulted or copied anywhere in this module.
+
+**Status: complete.** The packet codec, key-derivation primitives,
+`bigsize` codec, per-hop TLV framing, and the three crypto cores
+(`core.deriveHopSecrets`/`.construct`/`.process`) are all implemented and
+KAT-tested against the official BOLT#4 test vector — `construct`
+reproduces the published 1366-byte onion packet byte-exact, and a full
+5-hop construct → process round-trip passes. See `SPEC.md`'s
+"TODO(fable) — done record" for the per-core verification detail.
