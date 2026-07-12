@@ -1,0 +1,77 @@
+frost — provenance note
+========================
+
+Kept as a module-local NOTICE (same placement as the sibling `bip340`/
+`musig2`/`adaptor` modules — self-contained crypto modules not folded
+into the root `NOTICE`).
+
+Provenance
+----------
+
+frost — clean-room scaffold from RFC 9591 ("The Flexible Round-Optimized
+Schnorr Threshold (FROST) Protocol for Two-Round Schnorr Signatures",
+IRTF CFRG, June 2024), **secp256k1/SHA-256 ciphersuite (§6.5) only**,
+covering: the prime-order-group/hash-function dependencies (§3), helper
+functions — nonce generation (§4.1), polynomials/`derive_interpolating
+_value` (§4.2), list operations (§4.3), binding-factor computation
+(§4.4), group-commitment computation (§4.5), signature-challenge
+computation (§4.6) — the two-round signing protocol (`commit`/§5.1,
+`sign`/§5.2, `aggregate`/§5.3, `verify_signature_share`/§5.3), the
+secp256k1/SHA-256 ciphersuite instantiation of `H1`..`H5` and
+`SerializeElement`/`SerializeScalar` (§6.5), the canonical signature
+encoding (Appendix A), `prime_order_sign`/`prime_order_verify` (Appendix
+B), and trusted-dealer key generation — `trusted_dealer_keygen`/
+`secret_share_shard`/`secret_share_combine`/`polynomial_evaluate`/
+`polynomial_interpolate_constant`/`vss_commit` (Appendix C). RFC 9591 is
+a public IRTF/IETF specification — not a copyrightable work (merger
+doctrine; see CONVENTIONS.md §5) — so no third-party-source NOTICE entry
+is strictly required for the spec citation alone. No reference
+implementation's source was ported or consulted as a design reference —
+this scaffolding pass worked from the RFC 9591 text
+(https://www.rfc-editor.org/rfc/rfc9591.txt) and the public API of
+`std.crypto.ecc.Secp256k1` only (no `ZcashFoundation/frost`, no
+`chelseakomlo`/other FROST implementation consulted for algorithm shape
+or code).
+
+`H1`/`H2`/`H3`'s `hash_to_field`/`expand_message_xmd` construction
+additionally follows RFC 9380 ("Hashing to Elliptic Curves", §5.3
+`hash_to_field` and §5.4.1 `expand_message_xmd`) — likewise a public
+IETF specification, not a copyrightable work, no reference implementation
+consulted; `expandMessageXmd48` (`root.zig`) is a clean-room transcription
+of RFC 9380's own pseudocode, specialized to SHA-256/`len_in_bytes = 48`
+(this ciphersuite's only value), and cross-validated (`kat_test.zig`)
+against RFC 9591's own Appendix E.5 intermediate values (which implicitly
+exercise `expand_message_xmd` — see `SPEC.md`).
+
+The RFC 9591 Appendix E.5 "FROST(secp256k1, SHA-256)" test vector
+(`kat_vectors.zig`) was transcribed directly from
+https://www.rfc-editor.org/rfc/rfc9591.txt, Appendix E.5, for this pass.
+This is a public specification artifact — the RFC's own published
+conformance vector — not copied from any other implementation's test
+suite. Only this one vector (of the five ciphersuites RFC 9591 Appendix E
+publishes — Ed25519, Ed448, ristretto255, P-256, secp256k1) is embedded;
+see `root.zig`'s module doc comment and `SPEC.md` for why the others are
+out of scope.
+
+`std.crypto.ecc.Secp256k1` (field/scalar arithmetic, `basePoint`,
+`mul`/`mulDoubleBasePublic`, `fromSec1`/`toCompressedSec1`,
+`scalar.reduce48`/`Scalar.fromBytes48`) and `std.crypto.hash.sha2.Sha256`
+(MIT, part of Zig itself) are used via their public APIs; no new curve or
+hash primitive is implemented here. The sibling `bip340` module is listed
+as a build dependency by the orchestrator but is NOT used by any function
+in this module — see `root.zig`'s explicit BIP340-incompatibility
+finding for why FROST(secp256k1, SHA-256) cannot share `bip340`'s
+sign/verify/codec logic.
+
+No GPL/LGPL/AGPL source was consulted or copied anywhere in this module.
+
+**Status: scaffold.** Wire codecs, RFC §4.3 list operations, and the five
+ciphersuite hash functions (`h1`..`h5`) plus `computeChallenge`/
+`nonceGenerate`/`generateNonces` are implemented and cross-validated
+byte-exact against RFC 9591 Appendix E.5's own intermediate values. The
+ten threshold-specific cryptographic cores (`computeBindingFactors`,
+`computeGroupCommitment`, `deriveInterpolatingValue`, `round1Commit`,
+`round2Sign`, `aggregate`, `verifySignatureShare`, `verify`,
+`trustedDealerKeygen`, `secretShareCombine`) are `@panic("TODO(fable):
+...")` stubs with fixed final signatures, awaiting a follow-up crypto
+pass. See `SPEC.md`'s "Done record" / "TODO(fable)" tracking.

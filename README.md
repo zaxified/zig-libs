@@ -11,7 +11,7 @@ cross-project-reusable capability — a production-grade implementation of a pro
 or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
 authors' other projects depend on it, not the reverse.
 
-**Status:** 99 modules · 2787 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 100 modules · 2819 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ## Using a module
@@ -148,6 +148,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `bolt8` | Lightning **BOLT#8 encrypted transport** (`Noise_XK_secp256k1_ChaChaPoly_SHA256`) — the `act1`/`act2`/`act3` handshake (driven over `noise`'s `SymmetricState` with a secp256k1 DH adapter, `ECDH = SHA256(compressed(k·P))`) + the post-handshake transport with 1000-message key rotation; act1/2/3 **byte-exact** against BOLT#8 Appendix A + a full initiator↔responder handshake yielding the published transport keys + a message-0 round-trip | any | noise |
 | `hpke` | **HPKE — Hybrid Public Key Encryption (RFC 9180)** — DHKEM(X25519 + P-256) Encap/Decap, the LabeledExtract/LabeledExpand key schedule (base/PSK/auth/auth-PSK modes), AEAD `seal`/`open` (seq-nonce, fail-closed overflow) + `export`, single-shot `sealBase`/`openBase`; byte-exact against RFC 9180 Appendix A.1 (X25519/AES-128-GCM), A.2 (ChaCha20Poly1305), A.3 (P-256) | any | — |
 | `adaptor` | **Schnorr adaptor signatures** (scriptless scripts / the crypto behind Lightning **PTLCs** + atomic swaps) over BIP340 — `preSign`/`preVerify`/`adapt`/`extract`: a pre-signature encrypted under an adaptor point `T = t·G`, which `adapt` completes into a plain BIP340 signature once `t` is known and `extract` turns back into `t` once that signature is public (the deliberate one-time key-leak). Const-time nonce parity + the non-recomputable `needs_negation` bit handled per secp256kfun; `adapt`'s output verifies under plain `bip340.verify` (chaining to BIP340's 19 official vectors); 6 self-authored byte-exact vectors (independent Python secp256k1 reference, both parity + both key-normalization branches) + full round-trip/tamper harness | any | bip340 |
+| `frost` | **FROST — Flexible Round-Optimized Schnorr Threshold signatures (RFC 9591)**, secp256k1/SHA-256 ciphersuite — a t-of-n threshold Schnorr scheme: trusted-dealer keygen (Shamir + Feldman VSS), 2-round signing (`round1Commit` nonces/commitments → `round2Sign` share), `aggregate` into one Schnorr signature, `verifySignatureShare` + `verify` (RFC 9591 App. B `prime_order_verify`). Lagrange interpolation via the scalar field's const-time modular inverse; binding factors (RFC 9380 `expand_message_xmd`, hash layer validated vs App. E.5 intermediates); secret-touching arithmetic const-time; `verify` guards signature `z` non-canonicality (malleability). Byte-exact against RFC 9591 Appendix E.5 (shares, binding factors, both signature shares, the aggregate signature) + a (2,3) end-to-end round-trip. NB: FROST-secp256k1's own Schnorr (33-byte compressed R, `"chal"`-DST challenge) — NOT BIP340-compatible | any | bip340 |
 
 ### Serialization / OS / agent
 
