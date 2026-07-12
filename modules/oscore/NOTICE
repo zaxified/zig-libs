@@ -1,0 +1,65 @@
+oscore — provenance note
+=========================
+
+Kept as a module-local NOTICE (same placement as the sibling `bip340`/
+`adaptor`/`frost`/`bolt8`/`dtls`/`falcon`/`slhdsa` modules — self-contained
+protocol/crypto modules not folded into the root `NOTICE`).
+
+Provenance
+----------
+
+oscore — clean-room implementation of OSCORE (Object Security for
+Constrained RESTful Environments), specified in RFC 8613 ("Object Security
+for Constrained RESTful Environments (OSCORE)", Selander/Mattsson/
+Palombini/Seitz, July 2019, IETF Standards Track). RFC 8613 is a public,
+open IETF specification — a public spec/RFC's text is not copyrightable
+expression (merger doctrine, CONVENTIONS.md §5); implementing it, however
+closely, is not "derived from" any third party's code. This module was
+built directly from the RFC 8613 text (fetched from
+https://www.rfc-editor.org/rfc/rfc8613.txt) — no third-party OSCORE
+implementation (e.g. the C `libcoap`/`oscore-uip`/`californium`
+ecosystem's OSCORE layers, or any other language's OSCORE library) was
+read, ported, or consulted as a design reference for this module's Zig
+code, types, or API shape. Every construction detail (the §3.2.1 `info`
+CBOR array, the §5.2 nonce XOR layout, the §5.4 AAD `Enc_structure`, the
+§6.1 compressed-option wire format, the §3.2.2 replay window) was
+transcribed directly from the RFC's own text and cross-checked by hand
+against Appendix C's official worked examples while writing this module
+(see `src/kat_vectors.zig`'s own doc comment and each `root.zig` function's
+doc comment for the specific section + worked-example cross-checks
+performed).
+
+`std.crypto.aead.aes_ccm.Aes128Ccm8` / `std.crypto.kdf.hkdf.HkdfSha256` /
+`std.crypto.hash.sha2.Sha256` (all MIT, part of Zig itself) supply the
+AEAD, KDF, and hash primitives via their public APIs; no new AEAD, KDF, or
+hash primitive is implemented here — RFC 8613's OWN construction on top of
+them (context derivation, nonce, AAD, compressed option, replay window) is
+this module's contribution, and RFC 8613 itself is the sole reference (no
+NOTICE-triggering third-party design reference exists for this pass —
+CONVENTIONS.md §5's "pure clean-room from spec, no NOTICE entry strictly
+required" case).
+
+No GPL/LGPL/AGPL source was consulted or copied anywhere in this module.
+
+Official test vectors
+----------------------
+
+`src/kat_vectors.zig`'s test vectors are RFC 8613 Appendix C's OWN
+published "Test Vectors" section (C.1 through C.8) — the spec's own
+official conformance data, transcribed byte-exact from the RFC text (not
+copied from any third-party implementation's test suite). Every hex field
+in `kat_vectors.zig` was hand-verified against the RFC 8613 Appendix C
+text at the time of writing (cross-checked arithmetically for the §5.2
+nonce XOR construction — see `kat_vectors.zig`'s own doc comment).
+
+**Status: scaffold.** The §3.2.1 `info` CBOR encoder (`encodeInfo`), the
+§5.4 `aad_array`/`Enc_structure` CBOR encoders (`encodeAadArray`,
+`encodeEncStructure`), the §6.1 compressed COSE option codec
+(`OscoreOption`), and the §3.2.2 anti-replay sliding window
+(`ReplayWindow`) are implemented and tested for real. The six crypto
+cores — `deriveKey`, `deriveContext`, `computeNonce`, `buildAad`,
+`protect`, `unprotect` — are `@panic("TODO(fable): ...")` stubs with their
+final signatures fixed and their exact RFC 8613 construction fully
+specified in `root.zig`'s doc comments and `SPEC.md`; `kat_vectors.zig` /
+`kat_test.zig` are ready to validate a crypto-core implementation
+byte-exactly the moment one lands. See `SPEC.md`'s "TODO(fable)" section.
