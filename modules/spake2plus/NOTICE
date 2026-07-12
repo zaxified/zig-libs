@@ -1,0 +1,102 @@
+spake2plus — provenance note
+=============================
+
+Kept as a module-local NOTICE (same placement as the sibling `bip340`/
+`frost`/`adaptor`/`oscore` modules — self-contained crypto modules not
+folded into the root `NOTICE`).
+
+Provenance
+----------
+
+spake2plus — clean-room implementation of SPAKE2+ from RFC 9383 ("SPAKE2+,
+an Augmented Password-Authenticated Key Exchange (PAKE) Protocol"),
+**P-256/SHA-256/HKDF-SHA256/HMAC-SHA256 ciphersuite only** (RFC 9383 §4's
+first table row). RFC 9383 is a public IETF specification — not a
+copyrightable work (merger doctrine; see CONVENTIONS.md §5) — so no
+third-party-source NOTICE entry is strictly required for the spec citation
+alone. No reference implementation's source was ported or consulted as a
+design reference for this scaffolding pass; it worked from the RFC 9383
+specification text
+(`https://www.rfc-editor.org/rfc/rfc9383.txt`, fetched 2026-07-12) and the
+public API of `std.crypto.ecc.P256` / `std.crypto.hash.sha2.Sha256` /
+`std.crypto.auth.hmac.sha2.HmacSha256` / `std.crypto.kdf.hkdf.HkdfSha256`
+only.
+
+**RFC 9383 vs. RFC 9382 — explicitly NOT confused.** RFC 9382 (a
+companion, separately-numbered IETF document, "SPAKE2, a
+Password-Authenticated Key Exchange") specifies the BALANCED (symmetric)
+variant of this family; this module implements RFC 9383's AUGMENTED
+(asymmetric) variant instead, on purpose — the Verifier-side registration
+record `L = w1*P` (never `w1` itself) is the entire point of building this
+module against 9383. See `root.zig`'s module doc comment for the detailed
+distinction; RFC 9383 §4 itself notes that its `M`/`N` point-generation
+seeds "are identical to those used in the companion SPAKE2 specification
+[RFC9382]" — the RECOMMENDED shared point-generation ALGORITHM is common
+to both specs, but the protocol equations, the `w0`/`w1` split, and the
+`L` registration record are 9383-specific and are NOT present in 9382 at
+all.
+
+The official RFC 9383 Appendix C test vector for the
+`P256-SHA256-HKDF-SHA256-HMAC-SHA256` ciphersuite (`kat_vectors.zig`) was
+transcribed byte-exact from the RFC 9383 text fetched at the URL above —
+this is a public specification artifact (the RFC's own published
+conformance vector, the only one RFC 9383 publishes for this ciphersuite),
+not copied from any third-party implementation's test suite. Every
+multi-line hex field in the RFC's plaintext rendering (line-wrapped at the
+IETF's standard ~72-column width) was reassembled by concatenating
+continuation lines with no separator, per the RFC's own plaintext
+formatting convention — independently double-checked by reconstructing
+the published `TT` transcript from its OWN constituent fields (`Context`,
+`idProver`, `idVerifier`, `M`/`N` re-derived from RFC 9383 §4's separately
+published P-256 table, `shareP`, `shareV`, `Z`, `V`, `w0`) using RFC
+9383's own `ComputeTranscript` field order and 8-byte-little-endian
+length-prefix format, and confirming the reassembly matches the
+transcribed `tt` field byte-for-byte (570 bytes total, this ciphersuite's
+vector). This cross-check is ALSO re-run inside the Zig test suite itself,
+against the real (not stubbed) `computeTranscript` function —
+`kat_test.zig`'s "REAL TODAY" section — so the transcription is verified
+twice, independently, by two different programs.
+
+`M`/`N` (RFC 9383 §4's fixed P-256 constants, SEC1-compressed as printed
+in the RFC's own ciphersuite table) were likewise transcribed byte-exact
+from the same fetched RFC text and cross-checked against the OFFICIAL
+vector's `TT` field: the vector's `TT` embeds `M`/`N` in UNCOMPRESSED SEC1
+form (a different encoding from the ciphersuite table's compressed
+listing — see `root.zig`'s `share_length` doc comment), and the
+uncompressed X-coordinate bytes extracted from `TT` at the known offset
+match the compressed constants' own X-coordinate bytes exactly — an
+independent confirmation that both the compressed constants AND the
+`TT` vector were transcribed correctly (a transcription error in either
+one would have broken this cross-check).
+
+`std.crypto.ecc.P256` (field arithmetic, scalar arithmetic, point group
+law, `basePoint`, `mul`/`mulDoubleBasePublic`, `fromSec1`/
+`toUncompressedSec1`/`toCompressedSec1`), `std.crypto.hash.sha2.Sha256`,
+`std.crypto.auth.hmac.sha2.HmacSha256`, and `std.crypto.kdf.hkdf.
+HkdfSha256` are used via their public APIs (MIT, part of Zig itself); no
+new curve, hash, MAC, or KDF primitive is implemented here.
+
+No GPL/LGPL/AGPL source was consulted or copied anywhere in this module.
+
+Consumer note (Matter/Thread)
+------------------------------
+
+The `P256-SHA256-HKDF-SHA256-HMAC-SHA256` ciphersuite this module targets
+is the one the Matter (formerly "Project CHIP") and Thread smart-home
+device-commissioning protocols use for their PASE (Password-Authenticated
+Session Establishment) exchange — cited here only as the motivating
+consumer for WHY this ciphersuite (of RFC 9383's several) was picked for
+this pass; this module does not itself implement, and has no dependency
+on, any Matter- or Thread-specific framing, only the underlying RFC 9383
+SPAKE2+ primitive.
+
+**Status: scaffold.** Wire constants/encoders (`m_compressed_sec1`/
+`n_compressed_sec1`, `mPoint`/`nPoint`, `computeTranscript`, the `hash`/
+`mac`/`kdf` primitive wrappers) are implemented and tested for real. The
+seven crypto cores (`computeW0W1`, `computeL`, `proverStart`,
+`verifierStart`, `deriveKeys`, `proverFinish`, `verifierFinish`) are
+`@panic("TODO(fable): ...")` stubs with their final signatures fixed and
+their exact construction fully specified in `root.zig`'s doc comments and
+`SPEC.md`; `kat_vectors.zig` / `kat_test.zig` are ready to validate a
+crypto-core implementation byte-exactly the moment one lands. See
+`SPEC.md`'s "TODO(fable)" section.
