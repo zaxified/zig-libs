@@ -11,7 +11,7 @@ cross-project-reusable capability — a production-grade implementation of a pro
 or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
 authors' other projects depend on it, not the reverse.
 
-**Status:** 97 modules · 2700 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 98 modules · 2741 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ## Using a module
@@ -146,6 +146,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `musig2` | MuSig2 multi-signature (BIP327) producing BIP340 signatures — key aggregation (rogue-key-safe coefficients + "second key" rule), 2-round nonce gen/aggregation, partial sign/verify, partial-sig aggregation, with the security-critical parity/`g` bookkeeping routed through one shared helper (signer/verifier/aggregator can't disagree); byte-exact against the official BIP327 key_agg/nonce_agg/sign_verify/sig_agg vectors + an end-to-end multi-signer → `bip340.verify` round-trip (v1: untweaked) | any | bip340 |
 | `sphinx` | Lightning **BOLT#4 Sphinx onion routing** (the mix-net that gives Lightning payment privacy) — forward ECDH + blinding-factor chain, `rho`/`mu`/`um`/`pad` key derivation, `construct` (filler generation + reverse-order layered wrap) and `process` (constant-time HMAC gate → `timing_safe.eql`, deobfuscate, peel one layer, blind the next ephemeral); `construct` reproduces the official BOLT#4 1366-byte onion packet **byte-exact** + a 5-hop construct→process round-trip | any | — |
 | `bolt8` | Lightning **BOLT#8 encrypted transport** (`Noise_XK_secp256k1_ChaChaPoly_SHA256`) — the `act1`/`act2`/`act3` handshake (driven over `noise`'s `SymmetricState` with a secp256k1 DH adapter, `ECDH = SHA256(compressed(k·P))`) + the post-handshake transport with 1000-message key rotation; act1/2/3 **byte-exact** against BOLT#8 Appendix A + a full initiator↔responder handshake yielding the published transport keys + a message-0 round-trip | any | noise |
+| `hpke` | **HPKE — Hybrid Public Key Encryption (RFC 9180)** — DHKEM(X25519 + P-256) Encap/Decap, the LabeledExtract/LabeledExpand key schedule (base/PSK/auth/auth-PSK modes), AEAD `seal`/`open` (seq-nonce, fail-closed overflow) + `export`, single-shot `sealBase`/`openBase`; byte-exact against RFC 9180 Appendix A.1 (X25519/AES-128-GCM), A.2 (ChaCha20Poly1305), A.3 (P-256) | any | — |
 
 ### Serialization / OS / agent
 

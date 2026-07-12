@@ -1,0 +1,56 @@
+hpke — provenance note
+======================
+
+Kept as a module-local NOTICE (same placement as the sibling `bip340`/
+`tlsresume`/`dtls`/`noise`/`falcon`/`slhdsa` modules, which are likewise
+self-contained crypto modules not folded into the root `NOTICE`).
+
+Provenance
+----------
+
+hpke — clean-room implementation from RFC 9180 ("Hybrid Public Key
+Encryption", IETF CFRG), covering: §4 (`LabeledExtract`/`LabeledExpand`,
+the ciphersuite `suite_id` construction), §4.1 (DHKEM `Encap`/`Decap`/
+`AuthEncap`/`AuthDecap`), §5.1 (`KeySchedule`), §5.2 (`Context.Seal`/
+`Open`, the nonce-derivation arithmetic), §5.3 (`Context.Export`), §6.1
+(the single-shot `SealBase`/`OpenBase` API), and §7.1/§7.1.1/§7.1.2/§7.1.3
+(the two DHKEM instantiations this module names — X25519 and P-256, both
+paired with HKDF-SHA256 — and `DeriveKeyPair`). RFC 9180 is a public,
+open IETF specification — not a copyrightable work (merger doctrine; see
+CONVENTIONS.md §5) — so no third-party-source NOTICE entry is strictly
+required for the spec citation alone. No reference implementation's
+source was ported or consulted as a design reference for this scaffolding
+pass — it worked from the RFC 9180 specification text and the public API
+of `std.crypto.dh.X25519`/`std.crypto.ecc.P256`/
+`std.crypto.kdf.hkdf.HkdfSha256`/`std.crypto.aead.aes_gcm`/
+`std.crypto.aead.chacha_poly` only.
+
+The RFC 9180 Appendix A known-answer test vectors (`kat_rfc9180.zig`) were
+fetched directly from <https://www.rfc-editor.org/rfc/rfc9180> for this
+pass (A.1 `DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM` embedded
+in full; A.2 `.../ChaCha20Poly1305` and A.3 `DHKEM(P-256, HKDF-SHA256),
+HKDF-SHA256, AES-128-GCM` embedded as headers). This is a public
+specification artifact — the RFC's own published conformance vectors —
+not copied from any other implementation's test suite.
+
+`std.crypto.dh.X25519`, `std.crypto.ecc.P256`,
+`std.crypto.kdf.hkdf.HkdfSha256` (`.extract`/`.extractInit`/`.expand`),
+`std.crypto.aead.aes_gcm.{Aes128Gcm,Aes256Gcm}`, and
+`std.crypto.aead.chacha_poly.ChaCha20Poly1305` are used via their public APIs
+(MIT, part of Zig itself) — see `suite.zig`/`dhkem.zig`/`schedule.zig`'s
+module docs for the specific API recon (e.g. P-256's raw ECDH is
+`P256.fromSec1(pk).mul(sk, .big).affineCoordinates().x.toBytes(.big)` —
+the shared X coordinate only, per RFC 9180 §7.1.2 — since std ships no
+packaged "P-256 DH keypair" type the way it does `X25519.KeyPair`).
+
+No GPL/LGPL/AGPL source was consulted or copied anywhere in this module.
+
+**Status: complete — crypto-implementation pass done (2026-07-12).** All
+former stubs (DHKEM `Encap`/`Decap`/`AuthEncap`/`AuthDecap`/
+`DeriveKeyPair` for X25519 and P-256, `KeySchedule`, `Context.seal`/
+`.open`/`.exportSecret`, `sealBase`/`openBase`) are implemented
+clean-room from the RFC 9180 text and KAT-validated byte-exact against
+the RFC's own Appendix A.1 (full vector, end-to-end), A.2
+(ChaCha20Poly1305), and A.3 (P-256) conformance vectors — 41/41 tests,
+Debug and ReleaseFast. See `SPEC.md`'s done-record for the per-item
+verification detail.
