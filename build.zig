@@ -124,6 +124,7 @@ const module_list = [_]Module{
     .{ .name = "voprf" },
     .{ .name = "opaque", .deps = &.{"voprf"} },
     .{ .name = "xmss" },
+    .{ .name = "otp" },
     // Scaffold more here (copy modules/_template) — see CONVENTIONS.md
     // "How to add a module" and the README "Roadmap / Non-goals" sections.
 };

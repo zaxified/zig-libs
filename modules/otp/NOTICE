@@ -1,0 +1,44 @@
+otp — provenance note
+=====================
+
+Kept as a module-local NOTICE (same placement as the sibling `bip340`/
+`dtls`/`falcon`/`slhdsa` modules, which are likewise self-contained
+crypto-adjacent modules not folded into the root `NOTICE`).
+
+Provenance
+----------
+
+otp — clean-room implementation from RFC 4226 ("HOTP: An HMAC-Based
+One-Time Password Algorithm", IETF, 2005) and RFC 6238 ("TOTP: Time-Based
+One-Time Password Algorithm", IETF, 2011), covering: the HOTP
+construction and dynamic truncation (RFC 4226 §5.3, worked example §5.4),
+the digits/security considerations (§5.3, §7.3), and TOTP's time-step
+mapping and resynchronization window (RFC 6238 §4.2, §5.2, §1.2 for the
+SHA-256/SHA-512 extension). Both are public, open IETF specifications;
+the algorithms are fully determined by the spec text (merger doctrine —
+see CONVENTIONS.md §5). No reference implementation's source was ported
+or consulted — the module was written from the RFC prose and the public
+API of `std.crypto.auth.hmac` only (the RFCs' Java reference listings
+were not used).
+
+The test vectors (`src/kat_vectors.zig`) are transcribed from the RFCs'
+own published conformance appendices — RFC 4226 Appendix D (secret,
+counts 0..9, intermediate HMAC digests, truncated integers, 6-digit
+codes) and RFC 6238 Appendix B (6 unix times × SHA-1/SHA-256/SHA-512,
+8-digit codes). These are public specification artifacts, not copied from
+any implementation's test suite. Note on the RFC 6238 secrets: the
+Appendix B codes only reproduce with per-mode secret lengths (ASCII
+"1234567890" repeated to 20 bytes for SHA-1, 32 for SHA-256, 64 for
+SHA-512) — the errata-confirmed behavior of the RFC's reference program,
+documented in `src/kat_vectors.zig`.
+
+`std.crypto.auth.hmac.HmacSha1` / `.sha2.HmacSha256` / `.sha2.HmacSha512`
+are used via their public APIs (MIT, part of Zig itself); nothing is
+reimplemented.
+
+No GPL/LGPL/AGPL source was consulted or copied anywhere in this module.
+
+**Status: complete — HOTP, TOTP, formatting, and ±skew verification all
+implemented and KAT-validated byte-exact against RFC 4226 Appendix D
+(all 10 counts, including intermediates) and the full RFC 6238 Appendix B
+table (all 18 rows)** (Debug + ReleaseFast).
