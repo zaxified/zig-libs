@@ -1,0 +1,70 @@
+opaque — provenance note
+=========================
+
+Kept as a module-local NOTICE (same placement as the sibling `voprf`/
+`frost`/`bip340`/`musig2` modules — self-contained crypto modules not
+folded into the root `NOTICE`).
+
+Provenance
+----------
+
+opaque — clean-room implementation from RFC 9807 ("The OPAQUE
+Augmented Password-Authenticated Key Exchange (aPAKE) Protocol", IRTF
+CFRG, July 2025), **ristretto255-SHA-512 configuration with the 3DH
+key exchange only**, covering: client credential storage and key
+recovery with the internal-keying Envelope (§4/§4.1 —
+`CreateCleartextCredentials`, `Store`, `Recover`,
+`DeriveDiffieHellmanKeyPair`), the offline registration flow (§5 —
+`CreateRegistrationRequest`, `CreateRegistrationResponse`,
+`FinalizeRegistrationRequest`), and the online authenticated key
+exchange (§6 — `GenerateKE1`/`GenerateKE2`/`GenerateKE3`/
+`ServerFinish`, the §6.3 credential retrieval with the masking-key XOR
+pad, and the §6.4 3DH functions and TLS 1.3-style key schedule:
+`Preamble`, `Expand-Label`/`Derive-Secret`, `DeriveKeys`). RFC 9807 is
+a public IRTF/IETF specification — not a copyrightable work (merger
+doctrine; see CONVENTIONS.md §5) — so no third-party-source NOTICE
+entry is strictly required for the spec citation alone. No reference
+implementation's source was ported or consulted as a design reference —
+this pass worked from the RFC 9807 text
+(https://www.rfc-editor.org/rfc/rfc9807.txt), the public API of the
+sibling `voprf` module (this repo, MIT), and the public std.crypto
+APIs only (no `facebook/opaque-ke`, no `bytemare/opaque`, no other
+OPAQUE implementation consulted for algorithm shape or code).
+
+The OPRF layer is NOT implemented here: per RFC 9807 §2.1 it is
+exactly RFC 9497's modeOPRF, and this module calls the sibling `voprf`
+module (`blind`, `blindEvaluate`, `finalize`, `deriveKeyPair`,
+`Element`) for all of it — that reuse is the point of the dependency.
+
+The RFC 9807 Appendix C.1 OPAQUE-3DH "Real" test vectors for
+ristretto255-SHA-512 (`kat_vectors.zig` — C.1.1 without identities and
+C.1.2 with client_identity/server_identity, every published input,
+intermediate, and output) were extracted mechanically from
+https://www.rfc-editor.org/rfc/rfc9807.txt for this pass. These are
+public specification artifacts — the RFC's own published conformance
+vectors — not copied from any other implementation's test suite. Only
+the two ristretto255-SHA-512 real vectors are embedded; C.1.3-C.1.6
+(curve25519/P-256 groups) and the C.2 "Fake" vectors are out of scope
+(see `SPEC.md`).
+
+`std.crypto.kdf.hkdf.HkdfSha512` (Extract/Expand),
+`std.crypto.auth.hmac.sha2.HmacSha512`, `std.crypto.hash.sha2.Sha512`,
+`std.crypto.timing_safe`, and — via `voprf` —
+`std.crypto.ecc.Ristretto255` (all MIT, part of Zig itself) are used
+via their public APIs; no new primitive is implemented here. The one
+local KDF helper (`expandMulti`, a two-block RFC 5869 HKDF-Expand with
+multi-part info over HmacSha512) is pinned against
+`HkdfSha512.expand` by a unit test.
+
+No GPL/LGPL/AGPL source was consulted or copied anywhere in this
+module.
+
+Intended consumers: password-less/password-backed auth flows behind
+the `aaa-gate` and `sessions` modules (password authentication without
+the server ever seeing a password, plus the client-side `export_key`
+for encrypting user vault material).
+
+**Status: complete.** Registration and login/AKE flows implemented and
+KAT-validated byte-exact against RFC 9807 Appendix C.1.1 + C.1.2
+(11/11 tests, Debug + ReleaseFast). See `SPEC.md` for the threat model
+and the 3DH schedule notes.
