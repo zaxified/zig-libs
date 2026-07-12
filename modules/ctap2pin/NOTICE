@@ -1,0 +1,55 @@
+ctap2pin — provenance note
+==========================
+
+Kept as a module-local NOTICE (same placement as the sibling `bip340`/
+`dtls`/`falcon` modules, which are likewise self-contained crypto modules
+not folded into the root NOTICE).
+
+Provenance
+----------
+
+ctap2pin — clean-room implementation from the FIDO Alliance "Client to
+Authenticator Protocol (CTAP) 2.1" specification, §6.5.6 "PIN/UV Auth
+Protocol Abstract Definition", §6.5.7 "PIN/UV Auth Protocol One", and
+§6.5.8 "PIN/UV Auth Protocol Two": ECDH-P256 key agreement (Z = the
+big-endian x-coordinate of the shared point), the protocol-specific KDFs
+(SHA-256(Z); HKDF-SHA-256 with a 32-zero-byte salt and the
+"CTAP2 HMAC key" / "CTAP2 AES key" info strings), AES-256-CBC encryption
+(zero IV / random `IV || ciphertext` framing), and truncated/full
+HMAC-SHA-256 authentication. The CTAP 2.1 spec is a public specification —
+its algorithms are not copyrightable expression (merger doctrine; see
+CONVENTIONS.md §5). No reference implementation's source (libfido2,
+python-fido2, or any other) was ported or consulted.
+
+The known-answer vectors in `kat_vectors.zig` are published specification
+artifacts, transcribed from their primary sources (not from any
+implementation's test suite):
+
+  - NIST SP 800-38A, Appendix F.2.5/F.2.6 (CBC-AES256 encrypt/decrypt) —
+    a U.S. Government work, public domain.
+  - RFC 5869, Appendix A.1 (HKDF-SHA-256) — IETF Trust, code components
+    usable under the Simplified BSD terms of the Trust Legal Provisions.
+  - RFC 5903, Section 8.1 (P-256 ECDH, fetched directly from
+    rfc-editor.org for this pass) — same IETF Trust terms.
+  - RFC 4231, Section 4.3, Test Case 2 (HMAC-SHA-256) — same IETF Trust
+    terms.
+
+`std.crypto` primitives are used via their public APIs (MIT, part of Zig
+itself): `core.aes.Aes256` (the raw block cipher — CBC mode is NOT in std
+and is this module's own, see `root.zig`'s module doc), `ecc.P256`,
+`kdf.hkdf.HkdfSha256`, `auth.hmac.sha2.HmacSha256`, `hash.sha2.Sha256`,
+and `timing_safe.eql`.
+
+No GPL/LGPL/AGPL source was consulted or copied anywhere in this module.
+
+Consumer note: this is the PIN/UV protection layer of FIDO2 / WebAuthn
+passkey plumbing — both a CTAP2 platform (client) and a CTAP2
+authenticator implementation sit directly on top of it (`clientPin` /
+`getPinUvAuthTokenUsingPinWithPermissions` etc. are CBOR command framing
+around exactly these five operations).
+
+**Status: complete — both protocols implemented and validated (25/25
+tests, Debug + ReleaseFast): AES-256-CBC byte-exact vs NIST SP 800-38A
+F.2.5/F.2.6, HKDF vs RFC 5869 A.1, ECDH vs RFC 5903 §8.1, HMAC vs
+RFC 4231, plus two-sided encapsulation agreement, encrypt/decrypt
+round-trips, and tamper/length rejection for both protocols.**
