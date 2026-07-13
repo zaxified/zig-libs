@@ -1,0 +1,75 @@
+// SPDX-License-Identifier: MIT
+//! bls12_381 — the BLS12-381 pairing-friendly elliptic curve: the base
+//! field `Fp` and its extension tower `Fp2`/`Fp6`/`Fp12`, the scalar
+//! field `Fr`, and the two pairing groups `G1`/`G2`. This is the
+//! foundation for BLS signatures, KZG polynomial commitments, and
+//! threshold-BLS schemes — see `README.md` for the full multi-part arc
+//! this module is Part 1 of.
+//!
+//! **Status: Part 1 complete.** Full field-tower and group arithmetic,
+//! every constant independently verified (see `NOTICE`), constant-time
+//! scalar multiplication, and KAT coverage in Debug and ReleaseFast.
+//! See `SPEC.md` for the full design record and the BLS subgroup-check
+//! pitfall this module's API is built around (deserialization does NOT
+//! subgroup-check; callers at trust boundaries must).
+//!
+//! The pairing itself (`e: G1 x G2 -> Gt`, the Miller loop + final
+//! exponentiation) is Part 2 — NOT in this module yet; `fp12.zig` leaves
+//! `// TODO(part2)` markers for its pairing-specific helpers.
+
+const std = @import("std");
+
+pub const fp = @import("fp.zig");
+pub const fp2 = @import("fp2.zig");
+pub const fp6 = @import("fp6.zig");
+pub const fp12 = @import("fp12.zig");
+pub const g1 = @import("g1.zig");
+pub const g2 = @import("g2.zig");
+pub const scalar = @import("scalar.zig");
+
+pub const Fp = fp.Fp;
+pub const Fp2 = fp2.Fp2;
+pub const Fp6 = fp6.Fp6;
+pub const Fp12 = fp12.Fp12;
+pub const Fr = scalar.Fr;
+pub const G1 = g1;
+pub const G2 = g2;
+
+pub const meta = .{
+    .platform = .any,
+    .role = .util, // pure computation — no I/O, no wire framing beyond point (de)serialization
+    .concurrency = .reentrant, // no globals; every type here is a plain value type
+    .model_after = "draft-irtf-cfrg-pairing-friendly-curves (the BLS12-381 parameter set) + the ZCash/IETF BLS12-381 point-serialization convention; std.crypto.ff supplies the constant-time Montgomery modular arithmetic Fp/Fr are built on",
+    .deps = .{}, // std only (std.crypto.ff)
+};
+
+// ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────
+//
+// A bare `pub const x = @import("x.zig")` re-export does NOT pull x's
+// tests into the test binary on its own — every submodule must be named
+// here too (the dark-tests rule; see CONVENTIONS.md).
+test {
+    _ = fp;
+    _ = fp2;
+    _ = fp6;
+    _ = fp12;
+    _ = g1;
+    _ = g2;
+    _ = scalar;
+}
+
+test "meta.model_after names the pairing-friendly-curves draft" {
+    try std.testing.expect(std.mem.indexOf(u8, meta.model_after, "pairing-friendly-curves") != null);
+}
+
+test "field tower encoded widths compose correctly" {
+    try std.testing.expectEqual(@as(usize, 48), Fp.encoded_bytes);
+    try std.testing.expectEqual(@as(usize, 96), Fp2.encoded_bytes);
+    try std.testing.expectEqual(@as(usize, 288), Fp6.encoded_bytes);
+    try std.testing.expectEqual(@as(usize, 576), Fp12.encoded_bytes);
+    try std.testing.expectEqual(@as(usize, 32), Fr.encoded_bytes);
+    try std.testing.expectEqual(@as(usize, 48), G1.compressed_bytes);
+    try std.testing.expectEqual(@as(usize, 96), G1.uncompressed_bytes);
+    try std.testing.expectEqual(@as(usize, 96), G2.compressed_bytes);
+    try std.testing.expectEqual(@as(usize, 192), G2.uncompressed_bytes);
+}

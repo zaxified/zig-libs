@@ -1,0 +1,212 @@
+bls12_381 — provenance note
+============================
+
+Kept as a module-local NOTICE (same placement as the sibling `bip340`/
+`adaptor`/`musig2`/`slhdsa`/`falcon` modules — self-contained crypto
+modules not folded into the root `NOTICE`).
+
+Provenance
+----------
+
+bls12_381 — clean-room implementation of the BLS12-381 pairing-friendly
+elliptic curve, from public specifications and design references (no
+third-party SOURCE was ported into this module):
+
+1. **draft-irtf-cfrg-pairing-friendly-curves** (IETF CFRG draft) — the
+   BLS12-381 parameter family definition (the defining polynomials
+   `p(z)`, `r(z)`, `t(z)` for the BLS12 curve family and the specific
+   parameter `z = -0xd201000000010000` that BLS12-381 instantiates them
+   with). A public IETF draft/specification — not a copyrightable work
+   (merger doctrine, `CONVENTIONS.md` §5) — cited here for completeness,
+   not because attribution is a license condition.
+2. **The ZCash/IETF BLS12-381 point-serialization convention**
+   (originally specified by the ZCash project for BLS12-381 pairing
+   output/point encoding; the same convention was later carried into
+   `draft-irtf-cfrg-pairing-friendly-curves`' own serialization
+   appendix, `hash_to_curve`'s companion specs, and is what every
+   reference implementation cited below implements): the flag-bit
+   layout (`compression`/`infinity`/`sort` in the top 3 bits of the
+   first serialized byte), the compressed (48/96-byte) and uncompressed
+   (96/192-byte) point formats for `G1`/`G2`, and — the easy-to-miss
+   detail this module's `fp2.zig` documents prominently — that an `Fp2`
+   element `c0 + c1*u` serializes as `c1 || c0` (HIGH component first),
+   not `c0 || c1`.
+3. **EIP-2537** (Ethereum "Precompile for BLS12-381 curve operations") —
+   consulted for a SEPARATE, simpler wire convention (fixed-width
+   64/128-byte big-endian field-element padding, no flag bits) used by
+   that precompile — NOT the encoding this module implements (this
+   module follows convention (2) above throughout) — cited here only
+   because it independently corroborates the `p`/`r`/generator constant
+   VALUES this module embeds (cross-referenced, not used as the
+   authoritative source for any of them).
+4. **`ethereum/py_ecc`** (MIT license,
+   https://github.com/ethereum/py_ecc) — a DESIGN/FACT reference, not
+   ported source (`CONVENTIONS.md` §5): two of its files —
+   `py_ecc/optimized_bls12_381/optimized_curve.py` and
+   `py_ecc/bls12_381/bls12_381_curve.py` — were fetched (2026-07-14) and
+   found to AGREE byte-for-byte on `field_modulus`, `curve_order`, the
+   `G1`/`G2` curve constant `b`/`b2`, and the `G1`/`G2` generator point
+   coordinates. Those coordinate VALUES (decimal integers in the
+   Python source) were converted to hex and embedded in this module's
+   `g1.zig`/`g2.zig` as plain numeric constants — no Python (or any
+   other) SOURCE CODE, algorithm, or API shape was copied; only the
+   numeric FACTS (which are not independently copyrightable — a
+   mathematical constant is not an expression) were taken, and even
+   those were independently re-verified rather than trusted (see
+   "Verification performed" below).
+5. **`zkcrypto/bls12_381`** (Rust, MIT/Apache-2.0,
+   https://github.com/zkcrypto/bls12_381) and **`supranational/blst`**
+   (C/assembly, Apache-2.0, https://github.com/supranational/blst) —
+   named as the two most widely-deployed BLS12-381 reference
+   implementations for the FIELD-ARITHMETIC CONSTRUCTIONS this module
+   uses (`Fp2`'s Karatsuba 3-multiplication form, `Fp6`/`Fp12`'s
+   Devegili-et-al.-style tower multiplication/squaring/inversion, the
+   complex-method `Fp2.sqrt`). NEITHER repository's source code was
+   read line-by-line during EITHER pass (scaffold or crypto-core): the
+   crypto-core pass implemented every formula from the ACADEMIC
+   references below ((6), (8), (9)) and validated them against
+   independently-computed vectors (see "Verification performed"); the
+   zkcrypto constant names mentioned in two test comments
+   (`FROBENIUS_COEFF_*`) refer to published NUMERIC values compared as
+   numbers, not to consulted code.
+6. **Devegili, Ó hÉigeartaigh, Scott, Dahab, "Multiplication and
+   Squaring on Pairing-Friendly Fields"** (Cryptology ePrint 2006/471)
+   — the standard reference for `Fp6`/`Fp12` Karatsuba-style tower
+   arithmetic formulas, cited directly in `fp6.zig`/`fp12.zig`'s doc
+   comments. A public academic paper — cited for attribution courtesy,
+   not a license requirement.
+7. **Bowe, "Faster Subgroup Checks for BLS12-381"** (Cryptology ePrint
+   2019/814) — the untwist-Frobenius-twist subgroup-check/cofactor-
+   clearing technique named (not implemented) in `g1.zig`/`g2.zig`'s
+   `subgroupCheck`/`clearCofactor` doc comments as the eventual
+   fast-path alternative to the simple `scalarMul`-by-order/cofactor
+   forms actually implemented (the always-correct first version).
+8. **Adj & Rodriguez-Henriquez, "Square root computation over even
+   extension fields"** (Cryptology ePrint 2012/685, Algorithm 9) — the
+   "complex method" square root over `Fp2` for `p ≡ 3 (mod 4)` base
+   fields, implemented in `fp2.zig`'s `sqrt`. A public academic paper —
+   cited for attribution courtesy.
+9. **Bernstein & Lange, "Explicit-Formulas Database"** (EFD,
+   https://hyperelliptic.org/EFD/) — the `add-2007-bl` Jacobian
+   addition and `dbl-2009-l` doubling formulas (`shortw/jacobian-0`)
+   implemented in `g1.zig`/`g2.zig`. A public formula catalogue —
+   cited for attribution courtesy.
+
+No GPL/LGPL/AGPL source was consulted or copied anywhere in this module.
+`std.crypto.ff` (`Modulus`/`Fe`/`Uint` — MIT, part of Zig itself) is used
+via its public API for all Montgomery modular arithmetic underneath `Fp`/
+`Fr`; no new big-integer or modular-arithmetic primitive is implemented
+by this module.
+
+Verification performed
+-----------------------
+
+Every numeric constant this scaffold embeds was INDEPENDENTLY
+RE-DERIVED or cross-checked, not merely transcribed from a single
+source, before being committed to source:
+
+- **`p`, `r`**: both re-derived directly from the BLS12-381 defining
+  parameter `z = -0xd201000000010000` via the pairing-friendly-curves
+  family formulas `r(z) = z^4 - z^2 + 1` and `p(z) = (z-1)^2 * (z^4 -
+  z^2 + 1) / 3 + z`, and confirmed to equal the values fetched from
+  source (4) above, byte-for-byte.
+- **`G1`/`G2` generator coordinates**: fetched from source (4)'s TWO
+  independent files (which agreed with each other), then independently
+  confirmed ON-CURVE by direct modular arithmetic — `y^2 == x^3 + 4 (mod
+  p)` for `G1`, and `y^2 == x^3 + 4(1+u) (mod p)` in `Fp2` (using the
+  `u^2 = -1` non-residue convention this module documents throughout)
+  for `G2` — rather than trusted on citation alone.
+- **`G1`/`G2` compressed/uncompressed serialization bytes** (the KAT
+  vectors embedded in `g1.zig`/`g2.zig`'s tests): computed FROM the
+  above independently-verified generator coordinates by direct,
+  from-scratch application of the documented ZCash/IETF flag-bit
+  encoding rule (source (2) above) — NOT copied from any third-party
+  test suite. The resulting compressed `G1` generator bytes
+  (`97f1d3a7...`) match the well-known publicly-cited value for this
+  constant, corroborating both the generator coordinates and the
+  encoding-rule implementation independently.
+- **`h1` (`G1` cofactor)**: re-derived from `z` via `#E(Fp) = p + 1 -
+  (z+1)`, `h1 = #E(Fp) / r`, and confirmed the division is EXACT (zero
+  remainder) — not transcribed from any single source.
+- **`h2` (`G2` cofactor)** — **CORRECTED during the crypto-core pass
+  (2026-07-14): the scaffold's original derivation was WRONG.** The
+  scaffold computed `p^2 + 1 - t2` (`t2 = t^2 - 2p`, `t = z+1`) — but
+  that is the order of `E(Fp2)` (the ORIGINAL curve over `Fp2`), not of
+  the SEXTIC twist `E'` that `g2.zig` implements. `#E(Fp2)` is also
+  divisible by `r` (it contains `E(Fp) ⊇ G1`), so the scaffold's
+  exact-division cross-check passed despite describing the wrong
+  curve; the resulting value differed from the true `h2` in its last
+  16 bytes (`...4f83786ecdc4edc75b1ce38e1c72e38f` instead of
+  `...1616ec6e786f0c70cf1c38e31c7238e5`). The corrected value was
+  re-derived from the CM equation for the sextic twists —
+  `f^2 = (4p^2 - t2^2)/3`, `#E'(Fp2) = p^2 + 1 - (t2 - 3f)/2`
+  (the `(t2 + 3f)/2` sign gives the other sextic twist, whose order is
+  NOT divisible by `r` — cross-checked), `h2 = #E'(Fp2)/r` EXACT — and
+  verified two more independent ways: (a) it matches the h2 published
+  across BLS12-381 implementations (kilic/bls12-381 `bls12_381.go`,
+  paulmillr/noble-bls12-381 `math.ts`, and the
+  pairing-friendly-curves draft's parameter listing); (b) EMPIRICALLY,
+  for several independently-constructed non-subgroup points `P` on
+  `E'(Fp2)`, `[#E']P == O` and `[r]([h2]P) == O` hold with the
+  corrected value and BOTH FAIL with the scaffold's old value
+  (Lagrange's theorem rules the old value out as a multiple of any
+  point order). `g2.zig`'s tests enforce the behavioral consequence
+  (`clearCofactor` of a non-subgroup point passes `subgroupCheck`).
+
+All of the above re-derivation was performed with an independent
+Python scratch computation (not part of this repository, not itself a
+design reference — see `bip340`/`adaptor`'s precedent for this same
+"compute independently, don't just cite" pattern) during the
+scaffolding pass, 2026-07-14; the `h2` correction and the additional
+verification below during the crypto-core pass, same date.
+
+Verification performed (crypto-core pass, 2026-07-14)
+------------------------------------------------------
+
+The pass that filled in every arithmetic body added the following
+independently-computed test vectors and cross-checks (all wired into
+the module's tests):
+
+- **`G1`/`G2` scalar-multiplication cross-check vectors** (`[2]G`,
+  `[k]G`, `[2]G2`, `[k]G2` compressed, for
+  `k = 0x0123...cdef` — see `g1.zig`/`g2.zig`'s KAT comments): computed
+  with an independent from-scratch big-integer implementation using
+  TEXTBOOK AFFINE-coordinate formulas (chord-and-tangent with a modular
+  inverse per operation) — deliberately a different algorithm family
+  from the module's Jacobian/Montgomery arithmetic, so agreement is a
+  genuine cross-check rather than a shared-bug echo.
+- **`Fp6`/`Fp12` Frobenius coefficients**: computed PROGRAMMATICALLY in
+  the module (`γ_1 = ξ^((p-1)/3)`, `γ = ξ^((p-1)/6)` via `Fp2.pow` with
+  comptime-derived exponents — no transcribed table), then (a) verified
+  DEFINITIONALLY by tests asserting `frobenius(a) == a^p` computed with
+  nothing but `mul`/`square`, and (b) cross-checked against the same
+  values independently recomputed with Python big-integer
+  exponentiation — which also match the published
+  `FROBENIUS_COEFF_FP6_C1[1]`/`FROBENIUS_COEFF_FP12_C1[1]` constants in
+  zkcrypto/bls12_381 (constants compared as numbers; that source's CODE
+  remains unread, per the Provenance section).
+- **Quadratic-residue facts used by tests**: `x^3 + 4` is a QR mod `p`
+  for `x = 4` (and NOT for `x = 1..3`); `ξ = 1 + u` is a quadratic
+  non-residue in `Fp2` (`ξ^((p^2-1)/2) == -1`); the `G1` point with
+  `x = 4` and the `G2` point with `x = u` are on-curve but NOT in the
+  order-`r` subgroups (`[r]P != O`) — all computed independently with
+  Python big-integer arithmetic.
+- **`Fr.reduceWide` 64-byte vector**: `(2^512 - 1) mod r` computed
+  independently and embedded as a byte-exact KAT.
+
+Frobenius coefficients (resolution of "Deliberately NOT sourced")
+------------------------------------------------------------------
+
+The scaffold deliberately left the `Fp6`/`Fp12` Frobenius coefficients
+un-hardcoded. The crypto-core pass resolved this with the scaffold's
+recommended option (a): the coefficients are DERIVED IN CODE from the
+verified `p` (comptime-derived exponents + runtime `Fp2.pow`) — no
+hand-transcribed constant table exists anywhere in the module; the
+tests above pin the derived values byte-exactly.
+
+**Status: Part 1 COMPLETE (crypto-core pass done, 2026-07-14).** All
+field-tower and group arithmetic is implemented and KAT/property-tested
+(94 tests, Debug and ReleaseFast both green). The only remaining stub
+is `Fp12.cyclotomicSquare` (`@panic("TODO(part2)")`) — a
+pairing-specific fast path that lands with its only consumer, the
+Part-2 final exponentiation. See `SPEC.md`'s Status and Backlog.
