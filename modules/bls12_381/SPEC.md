@@ -6,13 +6,15 @@ purpose and API. Provenance: see [NOTICE](NOTICE).
 
 ## Purpose
 
-Parts 1-2 of a multi-part arc (`README.md`). Part 1: the base field `Fp`,
+Parts 1-3 of a multi-part arc (`README.md`). Part 1: the base field `Fp`,
 the extension tower `Fp2`/`Fp6`/`Fp12`, the scalar field `Fr`, and the two
 pairing groups `G1`/`G2` — everything the pairing function needs as its
-foundation. Part 2 (`pairing.zig`, SCAFFOLDED this pass): the pairing
-itself, `e: G1 x G2 -> Gt`, `Gt ⊂ Fp12*` — the optimal ate Miller loop
-plus final exponentiation. This module does NOT implement hash-to-curve,
-BLS signatures, KZG, or threshold BLS — those are later parts.
+foundation. Part 2 (`pairing.zig`): the pairing itself, `e: G1 x G2 ->
+Gt`, `Gt ⊂ Fp12*` — the optimal ate Miller loop plus final
+exponentiation. Part 3 (`hash_to_curve.zig`): RFC 9380 hash-to-curve
+for `G1`/`G2` — the primitive BLS signatures (Part 4) use to hash a
+message onto the curve. This module does NOT implement BLS signatures,
+KZG, or threshold BLS — those are later parts.
 
 ## Model-after + seed
 
@@ -154,6 +156,89 @@ BLS signatures, KZG, or threshold BLS — those are later parts.
   byte-exact KAT layered on top" pattern from `adaptor`/`spake2plus`,
   now with both layers in place.
 
+## Part 3 design (hash-to-curve — COMPLETE, crypto-core pass 2026-07-14)
+
+- **Suites**: `BLS12381G1_XMD:SHA-256_SSWU_RO_` (RFC 9380 §8.8.1) and
+  `BLS12381G2_XMD:SHA-256_SSWU_RO_` (§8.8.2) — the two `hash_to_curve`
+  random-oracle encodings. Construction, per §3: `hash_to_field(msg,
+  2)` → `map_to_curve` each of the two field elements → add the two
+  curve points → `clear_cofactor`. `encode_to_curve` (the cheaper,
+  nonuniform one-element variant, suites
+  `BLS12381G{1,2}_XMD:SHA-256_SSWU_NU_`) is also implemented
+  (`encodeToCurveG1`/`encodeToCurveG2`) since it shares the same
+  `map_to_curve`/`clear_cofactor` machinery at near-zero extra cost.
+- **`map_to_curve`** (`mapToCurveG1`/`mapToCurveG2`): §6.6.3 Simplified
+  SWU for `AB == 0` — `sswuG1`/`sswuG2` (§6.6.2's Simplified SWU proper,
+  onto the isogenous curves `E1'`/`E2'`, using the new RFC-9380 `inv0`/
+  `sgn0` helpers on `Fp`/`Fp2`) then `isogenyMap11`/`isogenyMap3` (the
+  Appendix E.2/E.3 rational isogeny maps back onto `G1`/`G2`'s actual
+  curves — Horner evaluation over the 53-/13-coefficient tables, monic
+  leading denominator terms implicit, zero-denominator exceptional case
+  → identity). The SSWU `tv1 == 0` exceptional branch's totality (its
+  `g(B/(Z*A))` is always a QR, so the gx2 fallback never fails) was
+  verified numerically — see `NOTICE`.
+- **`clear_cofactor` = `h_eff` multiplication, NOT plain-cofactor
+  multiplication — a scaffold-plan CORRECTION.** The scaffold planned to
+  reuse Part 1's `clearCofactor` (multiply by the true cofactor `h`)
+  and documented both as "valid per §7"; that is WRONG for these
+  suites: §7 pins `clear_cofactor(P) := h_eff * P` (a fixed suite
+  parameter, §8.8.1/§8.8.2) and explicitly says plain-`h` multiplication
+  "does not generally give the same result ... and MUST NOT be used"
+  when `h_eff` comes from a fast clearing method (both BLS12-381
+  suites' do). Confirmed empirically: `[h]R != [h_eff]R` on the RFC's
+  own vector points, both groups — same subgroup, different point, so
+  the J.9.1/J.10.1 final-`P` KATs would fail with `h`. The compositions
+  multiply by the suites' `h_eff` via `scalarMulBytes` (`NOTICE`
+  entry 21); `g1`/`g2.Jacobian.clearCofactor` remains what it always
+  was — a correct way to land arbitrary points in the subgroup — it
+  just is not RFC 9380's `clear_cofactor`.
+- **`expand_message_xmd` reuse decision (flagged, not unilateral)**:
+  `modules/frost` and `modules/voprf` each already carry an in-module
+  `expand_message_xmd`, but both are hardcoded to a fixed `ell`
+  (frost: SHA-256/`ell=2`; voprf: SHA-512/`ell=1`) that is too narrow
+  for this module's needs (`G1`'s `hash_to_field(msg,2)` needs `ell=4`;
+  `G2`'s needs `ell=8`), and reusing either directly would add a
+  cross-module dependency edge from `bls12_381` to a threshold-signature
+  or OPRF module for one hash primitive — a layering smell. This pass
+  REIMPLEMENTS `expand_message_xmd` from the RFC 9380 §5.3.1 pseudocode
+  directly, generalized to any `ell <= 255` (frost's/voprf's versions
+  are each a specialization of this general shape) — a deliberate,
+  explicitly-flagged departure from a literal "reuse the existing
+  implementation" instruction; the owner may instead choose to factor a
+  shared `expand_message_xmd` helper across all three modules later,
+  but that is a cross-module refactor this scaffolding pass does not
+  make unilaterally.
+- **The `Fp` wide-reduction gap**: `hash_to_field`'s `OS2IP(tv) mod p`
+  step needs to reduce a 512-bit (`L=64`-byte) integer into `Fp`
+  (384-bit container). `scalar.zig`'s `Fr.reduceWide` already solves the
+  analogous problem for `Fr` (256-bit container, same 512-bit input)
+  via `std.crypto.ff.Uint(512).fromBytes` + `modulus.reduce(wide)` (the
+  latter generic in the input width). The identical construction works
+  unchanged for `Fp` — confirmed by reading `std.crypto.ff`'s
+  `Modulus.reduce` signature (`fn reduce(self: Self, x: anytype) Fe`) —
+  so this is REAL, not stubbed; kept as a file-local
+  `reduceWideToFp` in `hash_to_curve.zig` rather than promoted to a
+  public `Fp.reduceWide` in `fp.zig` (unlike `Fr`'s), since
+  `hash_to_field` is (so far) its only consumer — promote it if a
+  second caller appears.
+- **Constant provenance**: `g1_iso_z`/`g1_iso_a`/`g1_iso_b` and
+  `g2_iso_z`/`g2_iso_a`/`g2_iso_b` (the SSWU curve/`Z` parameters for
+  `E1'`/`E2'`) are single field-element constants cited verbatim from
+  RFC 9380 §8.8.1/§8.8.2's own raw text (re-confirmed against that text
+  during the crypto-core pass), the same citation discipline `fp.zig`'s
+  `p_bytes`/`g1.zig`'s generator already use. The 11-isogeny (`G1`,
+  Appendix E.2, 53 `Fp` constants) and 3-isogeny (`G2`, Appendix E.3,
+  13 `Fp2` constants) coefficient tables were NEVER hand-transcribed:
+  they were parsed programmatically from the RFC's raw text and emitted
+  as Zig literals mechanically, then validated end-to-end by an
+  independent big-integer implementation reproducing the RFC's own
+  `Q0`/`Q1`/`P` vectors on exactly those parsed values — see `NOTICE`'s
+  Part-3 crypto-core verification section. Every table entry is a
+  comptime `Fp.fromBytes` (`fpc`/`fp2c`), so a wrong-length or
+  non-canonical value fails the build outright. The suites' `h_eff`
+  scalars (§8.8.1/§8.8.2) are likewise cited from the raw text
+  (`NOTICE` entry 21).
+
 ## Threat model / limits
 
 - **The BLS subgroup-check pitfall — this module's central threat.**
@@ -227,8 +312,22 @@ BLS signatures, KZG, or threshold BLS — those are later parts.
   panic mid-loop — a loud failure, not a silent wrong value, and
   exactly the input class the module-wide subgroup-check obligation
   already excludes at trust boundaries.
-- **Out of scope for Parts 1-2**: hash-to-curve (Part 3), and every
-  downstream scheme (BLS signatures, KZG, threshold BLS — Parts 4-6).
+- **Hash-to-curve is VARIABLE-TIME — deliberately, same reasoning as the
+  pairing.** RFC 9380 hash-to-curve's input `msg` is, in every consumer
+  this module anticipates (BLS message hashing, Part 4), PUBLIC — it is
+  the message being signed/verified, never a secret. §6.6.2's Simplified
+  SWU map branches on `is_square`/`sgn0` (data-dependent), and §6.6.3's
+  isogeny map branches on its exceptional zero-denominator case; RFC
+  9380 §10.3 itself only mandates constant-time behavior for
+  password-hashing use cases (§10.2), which this module does not target.
+  Do NOT feed `hash_to_curve`/`encode_to_curve` a secret message without
+  revisiting this (no BLS/KZG/threshold-BLS consumer does).
+- **Out of scope for Parts 1-3**: BLS signatures, KZG, threshold BLS
+  (Parts 4-6). Also out of scope for Part 3 specifically: any suite
+  other than the two `_XMD:SHA-256_SSWU_RO_`/`_NU_` pairs BLS12-381
+  actually uses (e.g. `expand_message_xof`/SHAKE variants RFC 9380
+  defines for other curves) — this module implements only the SHA-256
+  `expand_message_xmd` variant.
 
 ## Verification
 
@@ -288,11 +387,32 @@ BLS signatures, KZG, or threshold BLS — those are later parts.
     draft-irtf-cfrg-pairing-friendly-curves-11 Appendix B optimal-ate
     vector (primary) plus the py_ecc-is-the-conjugate cross-check (see
     "Part 2 design" above).
-- **Green in both modes**: `zig build test-bls12_381` (Debug) and
-  `zig build test-bls12_381 -Doptimize=ReleaseFast` (ReleaseFast —
-  exercised deliberately, this repo has been bitten by
+- **Green in both modes (Parts 1-2)**: `zig build test-bls12_381`
+  (Debug) and `zig build test-bls12_381 -Doptimize=ReleaseFast`
+  (ReleaseFast — exercised deliberately, this repo has been bitten by
   Debug-only-green UB before) both report **112/112 tests pass, 0
   panics**. `zig fmt --check modules/bls12_381/` is clean.
+- **Part 3 vectors (`hash_to_curve.zig` + the new `fp.zig`/`fp2.zig`
+  helpers — ALL PASS)**: `expandMessageXmd` against RFC 9380
+  **Appendix K.1** (`expand_message_xmd(SHA-256)`, DST
+  `"QUUX-V01-CS02-with-expander-SHA256-128"`) for both published
+  `len_in_bytes` values, `0x20` (`ell=1`) and `0x80` (`ell=4`), all 5
+  messages each; `hashToFieldFp`/`hashToFieldFp2` against **Appendix
+  J.9.1**/**J.10.1**'s `u[0]`/`u[1]` intermediates;
+  `mapToCurveG1`/`mapToCurveG2` against J.9.1/J.10.1's **`Q0`/`Q1`**
+  intermediates (localizing any bug to the SSWU+isogeny map, plus
+  on-curve assertions); `hashToCurveG1`/`hashToCurveG2` against
+  J.9.1/J.10.1's **final `P`** — all 5 messages each, byte-exact, so
+  the entire chain (including the add + `h_eff` clear_cofactor tail)
+  is pinned at every stage the RFC publishes. Property tests:
+  `hashToCurve*`/`encodeToCurve*` outputs are on-curve AND pass
+  `subgroupCheck` for arbitrary non-vector messages; `sswuG1`/`sswuG2`
+  at `u = 0` exercise the `tv1 == 0` exceptional branch and land on
+  `E1'`/`E2'` with `sgn0(y) == 0`; `Fp`/`Fp2` `inv0`/`sgn0` unit tests
+  (including the `sgn0`-vs-`isLexicographicallyLargest` convention
+  distinction). **Net: `zig build test-bls12_381` reports 128/128
+  pass, 0 panics, in both Debug and ReleaseFast** (`zig fmt --check`
+  clean; disk test-block count == runtime count == 128).
 
 ## Status
 
@@ -311,6 +431,20 @@ verified — bilinearity property suite plus the byte-exact IETF-draft
 `e(G1,G2)` KAT with py_ecc conjugate cross-check. See "Part 2 design"
 above for the algorithm choices and the FCKRH-vs-exact-`d` and
 negative-seed-convention findings.
+
+**Part 3 COMPLETE (crypto-core pass, 2026-07-14).** The full RFC 9380
+chain — `expandMessageXmd` (§5.3.1, general `ell`), `hashToFieldFp`/
+`hashToFieldFp2` (§5.2), `sswuG1`/`sswuG2` (§6.6.2 Simplified SWU, on
+the new `Fp`/`Fp2` `inv0`/`sgn0` helpers), `isogenyMap11`/`isogenyMap3`
+(§6.6.3 iso_map over the programmatically-sourced Appendix E.2/E.3
+tables), and the `hashToCurve*`/`encodeToCurve*` compositions with
+`h_eff`-based `clear_cofactor` — is implemented and byte-exact against
+RFC 9380's own J.9.1/J.10.1 vectors at every published stage. See
+"Part 3 design" above for the `expand_message_xmd`
+reuse-vs-reimplement decision, the `Fp` wide-reduction finding, the
+constant-provenance discipline, and the `h_eff`-vs-plain-cofactor
+scaffold correction (the one place the scaffold's stated plan was
+wrong).
 
 ### Backlog (deferred)
 
@@ -340,3 +474,14 @@ negative-seed-convention findings.
    exponentiation for `pairingCheck` specifically when a cheaper
    not-equal-to-one test suffices (`pairingCheck`'s own `TODO(fable)`
    note).
+5. **Part 3 performance follow-ups** (correctness is DONE — see
+   Status): the endomorphism-based FAST `clear_cofactor` evaluation
+   (Scott [WB19] for `G1`, Budroni-Pintore [BP17]/Appendix G.3 for
+   `G2`) — the current implementation multiplies by the same suite
+   `h_eff` those methods are equivalent to, via the generic
+   constant-time `scalarMulBytes` (`G2`'s 636-bit `h_eff` makes this
+   the dominant hash-to-curve cost); §6.6.3's add-on-`E1'`-before-
+   `iso_map` homomorphism trick (saves one isogeny evaluation per
+   `hash_to_curve`); and a variable-time public-scalar multiplication
+   for the `h_eff` step (hash-to-curve input is public — see the
+   threat model).

@@ -262,6 +262,25 @@ pub const Fp = struct {
         return .{ .fe = fe };
     }
 
+    /// RFC 9380 §4's `inv0`: the zero-preserving multiplicative inverse
+    /// (`inv0(0) = 0`, otherwise `a^-1`) — the variant hash-to-curve's
+    /// Simplified SWU map (`hash_to_curve.zig`) is specified over, where
+    /// a zero denominator must flow through as zero rather than error.
+    pub fn inv0(a: Fp) Fp {
+        return a.inv() catch Fp.zero;
+    }
+
+    /// RFC 9380 §4.1's `sgn0_m_eq_1`: the "sign" of a base-field
+    /// element, defined as the PARITY of its canonical integer
+    /// representative (`x mod 2`). NOT the same notion of sign as
+    /// `isLexicographicallyLargest` (which compares MAGNITUDE against
+    /// `(p-1)/2` for the point-compression sort bit) — RFC 9380's
+    /// `sgn0` and the ZCash sort bit are different conventions; do not
+    /// conflate them.
+    pub fn sgn0(self: Fp) u1 {
+        return @intCast(self.toBytes()[encoded_bytes - 1] & 1);
+    }
+
     /// `a^e (mod p)`, `e` a big-endian byte string. Construction:
     /// `modulus.powWithEncodedExponent(a.fe, e, .big)` (secret exponent,
     /// constant time) or `...PublicExponent` (public exponent, faster) —
@@ -422,6 +441,21 @@ test "Fp.inv: a * a^-1 == 1; inv(0) errors; inv(1) == 1" {
     try std.testing.expect(a.mul(a_inv).eql(Fp.one));
     try std.testing.expectError(error.NotInvertible, Fp.zero.inv());
     try std.testing.expect((try Fp.one.inv()).eql(Fp.one));
+}
+
+test "Fp.inv0 (RFC 9380): inv0(0) == 0, inv0(a) == a^-1 otherwise" {
+    try std.testing.expect(Fp.zero.inv0().isZero());
+    const a = try Fp.fromInt(u64, 123_456_789);
+    try std.testing.expect(a.mul(a.inv0()).eql(Fp.one));
+}
+
+test "Fp.sgn0 (RFC 9380 sgn0_m_eq_1): parity of the canonical representative" {
+    try std.testing.expectEqual(@as(u1, 0), Fp.zero.sgn0());
+    try std.testing.expectEqual(@as(u1, 1), Fp.one.sgn0());
+    try std.testing.expectEqual(@as(u1, 0), (try Fp.fromInt(u8, 2)).sgn0());
+    // p is odd, so -1 = p-1 is even: sgn0(-1) == 0 (canonical
+    // representative's parity, NOT a magnitude-based sign).
+    try std.testing.expectEqual(@as(u1, 0), Fp.one.neg().sgn0());
 }
 
 test "Fp.pow: a^0 == 1, a^1 == a, a^2 == square(a)" {

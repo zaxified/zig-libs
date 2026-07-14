@@ -167,6 +167,52 @@ third-party SOURCE was ported into this module):
     generators). Matches this module's pairing output byte-for-byte.
     Same not-copyrightable-parameter status as entry 1.
 
+19. **RFC 9380** ("Hashing to Elliptic Curves", IETF CFRG/CFRG-adjacent
+    RFC) — the hash-to-curve specification Part 3 (`hash_to_curve.zig`,
+    SCAFFOLDED 2026-07-14) implements: `expand_message_xmd` (§5.3.1),
+    `hash_to_field` (§5.2), the Simplified SWU map for `AB == 0` curves
+    (§6.6.2/§6.6.3), and the two BLS12-381 suite definitions
+    `BLS12381G1_XMD:SHA-256_SSWU_RO_`/`BLS12381G2_XMD:SHA-256_SSWU_RO_`
+    (§8.8.1/§8.8.2, including the `Z`/`A'`/`B'` SSWU parameters for both
+    `G1`'s and `G2`'s isogenous curves, embedded directly in
+    `hash_to_curve.zig` as small cited constants — see entry 20). A
+    public IETF RFC — not a copyrightable work (merger doctrine, same
+    status as entry 1's pairing-friendly-curves draft), cited here for
+    completeness. Fetched as raw text
+    (`https://www.rfc-editor.org/rfc/rfc9380.txt`, 2026-07-14) — every
+    numeric constant and test vector this pass embeds was extracted
+    programmatically from that raw text (not retyped from a rendered
+    page, and not trusted from memory) and cross-checked for the
+    expected byte length before being committed to source; see
+    "Verification performed (Part-3 scaffold pass)" below.
+20. **RFC 9380 Appendix E.2/E.3** (the 11-isogeny map for `G1`, the
+    3-isogeny map for `G2`) — the rational-map coefficient tables
+    `isogenyMap11`/`isogenyMap3` (`hash_to_curve.zig`) embed: 53 `Fp`
+    constants (E.2: `x_num` 12, monic `x_den` 10, `y_num` 16, monic
+    `y_den` 15) and 13 `Fp2` constants (E.3: 4 + 2 + 4 + 3). SOURCED by
+    the Part-3 crypto-core pass (2026-07-14) programmatically from the
+    RFC's raw text — a scratch Python parser split the `k_(i,j) = ...`
+    entries of the fetched `rfc9380.txt` (entry 19's copy), joined the
+    multi-line hex continuations mechanically, range-checked every
+    value against `p`, and emitted the Zig table literals directly (no
+    hand retyping of any value at any point). Verified independently —
+    see "Verification performed (Part-3 crypto-core pass)" below. Same
+    not-copyrightable-parameter status as entry 19.
+21. **RFC 9380 §7 + §8.8.1/§8.8.2 `h_eff`** — the suite-pinned
+    `clear_cofactor` scalars `hash_to_curve.zig` embeds
+    (`g1_h_eff_bytes` = `0xd201000000010001`, `g2_h_eff_bytes` = the
+    636-bit §8.8.2 value), both cited from the RFC's raw text. §7
+    defines `clear_cofactor(P) := h_eff * P` and — for suites whose
+    `h_eff` comes from a fast clearing method, which both BLS12-381
+    suites' do (Scott [WB19] §5 for `G1`, Budroni-Pintore [BP17] §4.1
+    for `G2`, per the RFC's own suite notes) — states that plain
+    multiplication by the cofactor `h` "does not generally give the
+    same result ... and MUST NOT be used". This CORRECTED the
+    scaffold's stated plan to reuse `g1`/`g2.Jacobian.clearCofactor`
+    (multiply-by-true-`h`) for RFC 9380's `clear_cofactor`; see the
+    verification section below for the empirical confirmation that the
+    two differ.
+
 No GPL/LGPL/AGPL source was consulted or copied anywhere in this module.
 `std.crypto.ff` (`Modulus`/`Fe`/`Uint` — MIT, part of Zig itself) is used
 via its public API for all Montgomery modular arithmetic underneath `Fp`/
@@ -320,3 +366,106 @@ Miller loop, the full final exponentiation, `Fp12.cyclotomicSquare`
 the full bilinearity property suite are wired and green.
 `zig build test-bls12_381` passes 112/112 in Debug AND ReleaseFast.
 See `SPEC.md`'s Status and Backlog.
+
+Verification performed (Part-3 scaffold pass, 2026-07-14)
+------------------------------------------------------------
+
+- **RFC 9380's own text, not memory or a rendered page, was the
+  source**: `rfc9380.txt` (entry 19) was fetched and every constant/
+  vector this pass embeds — the K.1 `expand_message_xmd` vectors, the
+  J.9.1/J.10.1 `u[0]`/`u[1]`/`P` values, and the `G1`/`G2` SSWU `Z`/
+  `A'`/`B'` parameters (§8.8.1/§8.8.2) — was extracted from that raw
+  text programmatically (a scratch Python parser, not part of this
+  repository, same "compute independently, don't just cite" precedent
+  as Parts 1-2's own verification), with every extracted field's byte
+  length cross-checked against its expected width (48 bytes per `Fp`
+  element, 96 for a `c0`/`c1` pair) before being embedded in
+  `hash_to_curve.zig`.
+- **`g1_iso_a`'s left-padding, caught and fixed by this cross-check**:
+  RFC 9380's own text gives `A' = 0x144698a3...` — 94 hex digits (47
+  bytes), one byte SHORTER than `Fp`'s 48-byte canonical width (a
+  leading zero byte the RFC's own decimal-free hex notation omits, not
+  an error in the RFC). Left-padded to `0x00144698a3...` (48 bytes)
+  before embedding; `g1_iso_b` needed no padding (already exactly 96
+  hex digits). Both re-verified structurally: `hexBytes(48, ...)` at
+  comptime rejects any non-96-hex-digit-length input outright (compile
+  error), so a hypothetical wrong-length transcription would have
+  failed the build, not silently produced a wrong value.
+- **The two REAL functions this pass adds
+  (`expandMessageXmd`/`hashToFieldFp`/`hashToFieldFp2`) are pinned
+  byte-exact against RFC 9380's own vectors, not merely believed
+  correct by inspection**: `expandMessageXmd` against Appendix K.1 (all
+  5 published messages, both published `len_in_bytes` values 0x20 and
+  0x80 — the latter exercising `ell=4`, a case neither `frost`'s nor
+  `voprf`'s existing fixed-`ell` `expand_message_xmd` implementations
+  ever needed); `hashToFieldFp` against Appendix J.9.1's `u[0]`/`u[1]`
+  (all 5 messages); `hashToFieldFp2` against Appendix J.10.1's
+  `u[0]`/`u[1]` (`c0`/`c1` both checked, all 5 messages). All of these
+  tests are RUN, not merely wired — `zig build test-bls12_381` reports
+  them passing (see `SPEC.md`'s Verification section for the exact
+  count).
+- **The `Fp` wide-reduction construction** (`reduceWideToFp`,
+  `hash_to_curve.zig`) was confirmed, not assumed, to be a valid
+  generalization of `scalar.zig`'s existing `Fr.reduceWide`: by reading
+  `std.crypto.ff`'s `Modulus(bits).reduce` signature directly
+  (`fn reduce(self: Self, x: anytype) Fe` — generic in the input
+  width), not by pattern-matching `Fr`'s code and hoping it transfers.
+
+**Status: Part 3 SCAFFOLDED (2026-07-14).**
+`expandMessageXmd`/`hashToFieldFp`/`hashToFieldFp2` were implemented
+and byte-exact-KAT-verified against RFC 9380's own vectors (see
+above); `sswuG1`/`isogenyMap11`/`sswuG2`/`isogenyMap3` were left as
+`@panic("TODO(fable): ...")` stubs for the crypto-core pass below.
+
+Verification performed (Part-3 crypto-core pass, 2026-07-14)
+-------------------------------------------------------------
+
+The pass that filled in the `map_to_curve` core (`sswuG1`/`sswuG2`,
+`isogenyMap11`/`isogenyMap3`, plus the new `Fp.inv0`/`Fp.sgn0`/
+`Fp2.inv0`/`Fp2.sgn0` helpers in `fp.zig`/`fp2.zig`) verified its
+constants and construction as follows:
+
+- **Isogeny coefficient tables (entries 20)**: parsed programmatically
+  from `rfc9380.txt` (never retyped), then validated by an INDEPENDENT
+  scratch Python implementation of the entire chain —
+  `expand_message_xmd` → `hash_to_field` → §6.6.2 SSWU → Appendix
+  E.2/E.3 `iso_map` (Horner over the parsed tables) → affine point add
+  → `h_eff` scalar multiplication — using plain Python big-integer
+  arithmetic and textbook affine group formulas (a different algorithm
+  family from this module's `std.crypto.ff`/Jacobian arithmetic, so
+  agreement is a genuine cross-check, same discipline as Parts 1-2).
+  That independent implementation reproduces RFC 9380's OWN J.9.1 and
+  J.10.1 vectors byte-exactly at every published stage (`u[0]`/`u[1]`,
+  `Q0`/`Q1`, final `P`) for all 5 messages in both groups, where the
+  J-vectors themselves were ALSO parsed from the raw text rather than
+  retyped. Additionally, for arbitrary non-vector inputs, the parsed
+  tables were confirmed to map points of `E1'`/`E2'` onto points of
+  `E`/`E'` (curve-membership preservation — a whole-table structural
+  check no single vector exercises). The module's own Zig tests then
+  pin the same `Q0`/`Q1`/`P` vectors byte-exactly.
+- **`h_eff` vs plain-cofactor divergence (entry 21)**: confirmed
+  empirically with the independent implementation — for the RFC's own
+  vector points `R = Q0 + Q1`, `[h1]R != [h_eff_G1]R` and
+  `[h2]R != [h_eff_G2]R` in every case (both land in the order-`r`
+  subgroup, but on DIFFERENT points), so using Part 1's
+  `clearCofactor` here would silently break RFC 9380 suite conformance
+  — exactly what §7's MUST NOT warns about. `hash_to_curve.zig`
+  multiplies by `h_eff` via `scalarMulBytes` instead.
+- **SSWU exceptional-branch totality**: verified numerically that
+  `g(B/(Z*A))` is a quadratic residue on both `E1'` and `E2'` (so the
+  `tv1 == 0` exceptional case never falls through to the gx2 branch),
+  that `-1/Z` is a QR in `Fp` (both `u = 0` and `Z u^2 = -1` reach the
+  G1 exceptional branch) but a non-residue in `Fp2` (only `u = 0`
+  reaches G2's), and that the mapped points remain on `E1'`/`E2'` in
+  all these cases; a Zig test pins the `u = 0` case for both groups.
+- **Suite parameters re-confirmed**: the scaffold's embedded
+  `A'`/`B'`/`Z` values for both suites were re-checked against the
+  RFC's §8.8.1/§8.8.2 raw text during this pass (byte-for-byte,
+  including `g1_iso_a`'s documented left-pad).
+
+**Status: Part 3 COMPLETE (crypto-core pass, 2026-07-14).** The full
+RFC 9380 chain is implemented and byte-exact against the RFC's own
+vectors at every published stage; on-curve + subgroup property tests
+cover non-vector messages. `zig build test-bls12_381` passes 128/128
+in Debug AND ReleaseFast (0 panics); `zig fmt --check
+modules/bls12_381/` is clean. See `SPEC.md`'s Status and Backlog.

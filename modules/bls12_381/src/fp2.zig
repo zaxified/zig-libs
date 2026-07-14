@@ -161,6 +161,25 @@ pub const Fp2 = struct {
         };
     }
 
+    /// RFC 9380 §4's `inv0` lifted to `Fp2` (`inv0(0) = 0`, otherwise
+    /// `a^-1`) — see `Fp.inv0` (`fp.zig`) for the convention and its
+    /// hash-to-curve consumer.
+    pub fn inv0(a: Fp2) Fp2 {
+        return a.inv() catch Fp2.zero;
+    }
+
+    /// RFC 9380 §4.1's `sgn0_m_eq_2`: the "sign" of an `Fp2` element —
+    /// lexicographic over `(c0, c1)` by PARITY: `c0`'s parity decides
+    /// unless `c0 == 0`, in which case `c1`'s parity does. NOT
+    /// `isLexicographicallyLargest` (which compares MAGNITUDE against
+    /// `(p-1)/2`, `c1` first — the point-compression sort bit): a
+    /// different convention for a different purpose; do not conflate
+    /// the two.
+    pub fn sgn0(self: Fp2) u1 {
+        const zero0: u1 = @intFromBool(self.c0.isZero());
+        return self.c0.sgn0() | (zero0 & self.c1.sgn0());
+    }
+
     /// Multiplication by the `Fp6` non-residue `ξ = u+1` (`fp6.zig`'s
     /// `nonresidue`) — NOT a general `Fp2.mul`, but a dedicated
     /// operation because `Fp6`/`Fp12` arithmetic calls it extremely
@@ -333,6 +352,25 @@ test "Fp2.inv: a * a^-1 == 1; inv(0) errors" {
     const a = try testElement();
     try std.testing.expect(a.mul(try a.inv()).eql(Fp2.one));
     try std.testing.expectError(error.NotInvertible, Fp2.zero.inv());
+}
+
+test "Fp2.inv0 (RFC 9380): inv0(0) == 0, inv0(a) == a^-1 otherwise" {
+    try std.testing.expect(Fp2.zero.inv0().isZero());
+    const a = try testElement();
+    try std.testing.expect(a.mul(a.inv0()).eql(Fp2.one));
+}
+
+test "Fp2.sgn0 (RFC 9380 sgn0_m_eq_2): c0 parity decides, c1 breaks the c0 == 0 tie" {
+    try std.testing.expectEqual(@as(u1, 0), Fp2.zero.sgn0());
+    try std.testing.expectEqual(@as(u1, 1), Fp2.one.sgn0());
+    // c0 == 0: c1's parity decides.
+    const u = Fp2{ .c0 = Fp.zero, .c1 = Fp.one };
+    try std.testing.expectEqual(@as(u1, 1), u.sgn0());
+    const zero_two = Fp2{ .c0 = Fp.zero, .c1 = try Fp.fromInt(u8, 2) };
+    try std.testing.expectEqual(@as(u1, 0), zero_two.sgn0());
+    // c0 nonzero and even: c0 wins regardless of c1's parity.
+    const two_one = Fp2{ .c0 = try Fp.fromInt(u8, 2), .c1 = Fp.one };
+    try std.testing.expectEqual(@as(u1, 0), two_one.sgn0());
 }
 
 test "Fp2.mulByNonresidue == mul by (1+u)" {

@@ -6,7 +6,7 @@
 //! threshold-BLS schemes — see `README.md` for the full multi-part arc
 //! this module is Part 1 of.
 //!
-//! **Status: Parts 1 AND 2 complete.** Full field-tower and group
+//! **Status: Parts 1, 2 AND 3 complete.** Full field-tower and group
 //! arithmetic plus the pairing itself (`e: G1 x G2 -> Gt`,
 //! `pairing.zig`): the optimal ate Miller loop (D-type-twist line
 //! evaluation) and the full final exponentiation (easy part + the
@@ -16,10 +16,13 @@
 //! pairing is pinned byte-exactly against the IETF
 //! pairing-friendly-curves draft's official optimal-ate test vector
 //! plus a py_ecc cross-check, on top of a full bilinearity property
-//! suite. See `SPEC.md` for the design record and the BLS
-//! subgroup-check pitfall this module's API is built around
-//! (deserialization does NOT subgroup-check; callers at trust
-//! boundaries must).
+//! suite. Part 3 (`hash_to_curve.zig`) is RFC 9380 hash-to-curve for
+//! both groups (`BLS12381G{1,2}_XMD:SHA-256_SSWU_RO_`/`_NU_`), pinned
+//! byte-exact against RFC 9380's own Appendix J.9.1/J.10.1 vectors at
+//! every stage (`u`, `Q0`/`Q1`, final `P`). See `SPEC.md` for the
+//! design record and the BLS subgroup-check pitfall this module's API
+//! is built around (deserialization does NOT subgroup-check; callers
+//! at trust boundaries must).
 
 const std = @import("std");
 
@@ -31,6 +34,7 @@ pub const g1 = @import("g1.zig");
 pub const g2 = @import("g2.zig");
 pub const scalar = @import("scalar.zig");
 pub const pairing = @import("pairing.zig");
+pub const hash_to_curve = @import("hash_to_curve.zig");
 
 pub const Fp = fp.Fp;
 pub const Fp2 = fp2.Fp2;
@@ -63,6 +67,7 @@ test {
     _ = g2;
     _ = scalar;
     _ = pairing;
+    _ = hash_to_curve;
 }
 
 test "meta.model_after names the pairing-friendly-curves draft" {
