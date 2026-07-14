@@ -11,7 +11,7 @@ cross-project-reusable capability — a production-grade implementation of a pro
 or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
 authors' other projects depend on it, not the reverse.
 
-**Status:** 107 modules · 2951 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 110 modules · 3167 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ## Using a module
@@ -92,7 +92,8 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `netaddr` | IP parse/format (RFC 5952) + RFC 6724 source/dest selection + **CIDR/Prefix** ops (contains/overlaps/supernet, range↔prefix summarize) | any | — |
 | `dns` | RFC 1035 resolver — A/AAAA/PTR/CNAME/NS/MX/TXT/SOA/SRV/CAA over UDP/TCP + DoH | any | netaddr, http |
 | `netlink` | rtnetlink dumps: links / addresses / routes / neighbors | **linux** | — |
-| `wireguard` | Native WireGuard device config over genetlink — get/set device, peers, allowed-ips (retires `wg` shell-outs) | **linux** | netlink |
+| `genetlink` | Generic-netlink (genl) transport: genlmsghdr framing + nlctrl family-id resolution — the shared foundation for genetlink-family clients (ethtool/devlink/nl80211/wireguard) | **linux** | netlink |
+| `wireguard` | Native WireGuard device config over genetlink — get/set device, peers, allowed-ips (retires `wg` shell-outs) | **linux** | netlink, genetlink |
 | `tc` | Traffic control over rtnetlink — attach/replace/remove the **netem** qdisc (delay/jitter/loss/duplicate/reorder/corrupt/rate) as an interface's root, read-back verify (retires `tc` shell-outs) | **linux** | netlink |
 | `nftables` | Typed firewall-ruleset builder → libnftables JSON for `nft -j -f -` (families/chains/rules/sets, match + verdict statements) | any (apply: linux) | — |
 | `modbus` | Modbus TCP (MBAP) + RTU (CRC-16) codec + master client — core function codes, exceptions, transport-agnostic seam | any | — |

@@ -1,9 +1,16 @@
 // SPDX-License-Identifier: MIT
-//! Minimal generic-netlink (genetlink) layer: the 4-byte `genlmsghdr` that
-//! sits between the `nlmsghdr` and the attributes, family-id resolution via
-//! the nlctrl family (`CTRL_CMD_GETFAMILY`), and a blocking `NETLINK_GENERIC`
-//! socket. Wire framing and TLV walking are reused from the `netlink`
-//! module's codec; this file only adds what genetlink puts on top.
+//! genetlink — pure-Zig generic-netlink (genl) transport: the 4-byte
+//! `genlmsghdr` that sits between the `nlmsghdr` and the attributes,
+//! family-id resolution via the nlctrl family (`CTRL_CMD_GETFAMILY`), and a
+//! blocking `NETLINK_GENERIC` socket. Wire framing and TLV walking are
+//! reused from the `netlink` module's codec; this module only adds what
+//! genetlink puts on top.
+//!
+//! `genetlink` is to generic-netlink families (ethtool, devlink, nl80211,
+//! the `wireguard` family, …) what `netlink` is to rtnetlink: a
+//! transport-agnostic foundation. Family-specific commands, attributes and
+//! request/response layouts are the caller's job — this module ends at the
+//! generic layer.
 //!
 //! Wire format per the kernel UAPI `linux/genetlink.h`:
 //!
@@ -11,10 +18,24 @@
 //! genlmsghdr:  u8 cmd | u8 version | u16 reserved   (4 bytes)
 //! ```
 //!
+//! ```zig
+//! const genetlink = @import("genetlink");
+//!
+//! var sock = try genetlink.Socket.open(gpa);
+//! defer sock.close();
+//! const family_id = try sock.resolveFamily("wireguard");
+//! ```
+//!
 //! The socket mirrors `netlink.Socket`'s transport discipline (kernel-assigned
 //! portid, MSG_PEEK|MSG_TRUNC receive-buffer growth, non-kernel datagrams
-//! dropped) but speaks `NETLINK_GENERIC` and leaves request building to the
-//! caller — genetlink payloads are family-specific.
+//! dropped) but speaks `NETLINK_GENERIC` and leaves request building beyond
+//! family resolution to the caller — genetlink payloads are family-specific.
+//!
+//! Provenance: clean-room from the kernel UAPI (`linux/genetlink.h`,
+//! GPL-2.0 WITH Linux-syscall-note — the command/attribute constants and
+//! their layouts are the kernel's OS ABI, not copyrightable interface code).
+//! Extracted from the `wireguard` module, which was the first consumer; see
+//! `NOTICE`.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -22,6 +43,14 @@ const linux = std.os.linux;
 const netlink = @import("netlink");
 const codec = netlink.codec;
 const native_endian = builtin.cpu.arch.endian();
+
+pub const meta = .{
+    .platform = .linux, // AF_NETLINK raw syscalls — conscious ceiling
+    .role = .client,
+    .concurrency = .reentrant, // no globals; one Socket per thread/loop
+    .model_after = "netlink module's transport discipline + kernel UAPI linux/genetlink.h (nlctrl protocol)",
+    .deps = .{"netlink"}, // wire codec (nlmsghdr + nlattr TLV) is reused
+};
 
 // ── kernel UAPI constants (linux/genetlink.h) ───────────────────────────────
 
@@ -139,7 +168,7 @@ pub const Socket = struct {
 
     pub fn open(gpa: std.mem.Allocator) OpenError!Socket {
         if (comptime builtin.os.tag != .linux)
-            @compileError("genl.Socket is Linux-only (AF_NETLINK raw syscalls)");
+            @compileError("genetlink.Socket is Linux-only (AF_NETLINK raw syscalls)");
 
         const rc = linux.socket(
             linux.AF.NETLINK,
@@ -318,10 +347,42 @@ test "golden: CTRL_CMD_GETFAMILY request bytes" {
     }, req);
 }
 
+test "buildGetFamilyRequest rejects a name too long for GENL_NAMSIZ" {
+    try testing.expectError(error.NameTooLong, buildGetFamilyRequest(
+        testing.allocator,
+        1,
+        "a-family-name-way-too-long-for-genl-namsiz",
+    ));
+}
+
 test "splitPayload rejects a truncated genlmsghdr" {
     try testing.expectError(error.Truncated, splitPayload(&.{}));
     try testing.expectError(error.Truncated, splitPayload(&.{ 1, 1, 0 }));
     const p = try splitPayload(&.{ 0, 1, 0, 0, 0xaa });
     try testing.expectEqual(@as(u8, 0), p.cmd);
     try testing.expectEqualSlices(u8, &.{0xaa}, p.attrs);
+}
+
+test "appendHeader encodes cmd/version with a zeroed reserved field" {
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(testing.allocator);
+    try appendHeader(testing.allocator, &list, 3, 1);
+    try testing.expectEqualSlices(u8, &.{ 3, 1, 0, 0 }, list.items);
+}
+
+// ── integration tests (real kernel; unprivileged) ───────────────────────────
+
+test "integration: nlctrl family resolve (unprivileged)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var sock = Socket.open(testing.allocator) catch return error.SkipZigTest;
+    defer sock.close();
+
+    // A family that certainly does not exist (short enough for the
+    // GENL_NAMSIZ policy — a longer name would be EINVALed, not looked up).
+    try testing.expectError(error.FamilyNotFound, sock.resolveFamily("zig-libs-nope"));
+    try testing.expectError(error.NameTooLong, sock.resolveFamily("a-family-name-way-too-long"));
+
+    // nlctrl always resolves to itself.
+    const ctrl = try sock.resolveFamily("nlctrl");
+    try testing.expectEqual(GENL_ID_CTRL, ctrl);
 }

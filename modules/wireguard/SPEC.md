@@ -18,11 +18,14 @@ rejecting non-canonical trailing bits; all-zero keys mean "unset" → `null`. Er
 kernel replies → typed codec errors (`error.Truncated`/`BadLength`, never a panic); NLMSG_ERROR
 errnos map to typed errors (`AccessDenied`, `NoSuchDevice`, …). One `Wireguard` per thread/loop; no
 globals; all `Device` allocations use the `open` allocator. Depends on `netlink` for the
-bounds-checked nlmsghdr+nlattr codec; the generic-netlink layer (`genlmsghdr`, nlctrl
-`CTRL_CMD_GETFAMILY` resolve, `NETLINK_GENERIC` socket) lives here in `src/genl.zig`. Clean-room from
-the documented WireGuard netlink UAPI (`uapi/wireguard.h`) and the genetlink UAPI
-(`linux/genetlink.h`); behavior modeled after wgctrl-go and the `wg` tool's protocol usage —
-attribute-shape and config-splitting reference only, no source consulted or copied — see NOTICE.
+bounds-checked nlmsghdr+nlattr codec and on `genetlink` for the generic-netlink layer (`genlmsghdr`,
+nlctrl `CTRL_CMD_GETFAMILY` resolve, `NETLINK_GENERIC` socket) — re-exported here as `genl` for
+source compatibility with when it lived locally in `src/genl.zig`; that layer was extracted into its
+own module (`../genetlink/`) so other genetlink families (ethtool, devlink, nl80211, …) can reuse it
+without depending on `wireguard`. Clean-room from the documented WireGuard netlink UAPI
+(`uapi/wireguard.h`) and the genetlink UAPI (`linux/genetlink.h`); behavior modeled after wgctrl-go
+and the `wg` tool's protocol usage — attribute-shape and config-splitting reference only, no source
+consulted or copied — see NOTICE.
 
 ## Provenance / licensing
 The kernel UAPI headers this module cites (uapi/wireguard.h, linux/genetlink.h) are GPL-2.0, but
@@ -46,10 +49,12 @@ Offline golden-byte + parser + fuzz tests are the gate: WG_CMD_SET_DEVICE reques
 peer + allowed-ip) byte-exact (LE-only), ifindex-identity/remove-peer/config validation, a large
 config split across ≥2 messages then round-tripped back through the GET parser, multipart GET peer-
 continuation reassembly, malformed-reply → typed error, errno mapping, a `std.testing.fuzz` harness
-over the device parser, and (in `genl.zig`) golden `CTRL_CMD_GETFAMILY` request bytes + truncated-
-header rejection. Live tests: an unprivileged nlctrl family-resolve integration test, and a root-gated
-test (skipped otherwise) that set+get round-trips a config on a real `wg` interface created via `ip
-link add … type wireguard`. 13 tests. Run: `zig build test-wireguard`.
+over the device parser. The generic-netlink transport's own golden `CTRL_CMD_GETFAMILY` request
+bytes + truncated-header-rejection tests now live in and run under `zig build test-genetlink` (see
+`../genetlink/SPEC.md`) — extracted, not duplicated. Live tests here: an unprivileged nlctrl
+family-resolve integration test (this module's own, over the WireGuard family specifically), and a
+root-gated test (skipped otherwise) that set+get round-trips a config on a real `wg` interface
+created via `ip link add … type wireguard`. Run: `zig build test-wireguard`.
 
 ## Backlog / deferred
 The root-gated live test's `runIp()` helper shells out to the `ip` binary — the one external-process
@@ -86,5 +91,5 @@ wrong PSK fail closed). A netns-gated **live in-kernel WireGuard interop** test 
 kernel-sent transport packet under the derived key, including a non-zero PSK.
 
 ## Status
-`gap · linux · client · reentrant` + deps: `netlink` — canonical source is `pub const meta` in
-src/root.zig. (The handshake scaffold above has no dependency on `netlink`.)
+`gap · linux · client · reentrant` + deps: `netlink`, `genetlink` — canonical source is
+`pub const meta` in src/root.zig. (The handshake scaffold above has no dependency on either.)

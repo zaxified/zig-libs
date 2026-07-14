@@ -10,8 +10,11 @@ API: get/set devices, peers and allowed-ips — no `wg` shell-outs.
   ceiling). **Role:** client. **Concurrency:** reentrant (no globals; one
   `Wireguard` per thread/loop).
 - **Deps:** `netlink` — its bounds-checked wire codec (nlmsghdr + nlattr TLV
-  build/parse) is reused; the generic-netlink layer (`genlmsghdr`, nlctrl
-  family resolve, `NETLINK_GENERIC` socket) lives here in `src/genl.zig`.
+  build/parse) is reused; `genetlink` — the generic-netlink layer
+  (`genlmsghdr`, nlctrl family resolve, `NETLINK_GENERIC` socket), extracted
+  into its own module so other genetlink families (ethtool, devlink,
+  nl80211, …) can reuse it too. Re-exported here as `wireguard.genl` for
+  source compatibility.
 - **Privileges:** CAP_NET_ADMIN for both `getDevice` and `setDevice` (the
   kernel registers the family with `GENL_UNS_ADMIN_PERM`). Family *resolve*
   is unprivileged.
@@ -67,7 +70,8 @@ Keys are raw `[32]u8`; `keyToBase64` / `keyFromBase64` convert to/from the
 use (all `pub`): the UAPI constant tables (`WG_CMD`, `WGDEVICE_A`,
 `WGPEER_A`, `WGALLOWEDIP_A`, `WGDEVICE_F`, `WGPEER_F`), the pure
 `DeviceParser` / `buildSetRequests` codec pair, and `genl`
-(genlmsghdr + `CTRL_CMD_GETFAMILY` resolve + generic-netlink socket).
+(genlmsghdr + `CTRL_CMD_GETFAMILY` resolve + generic-netlink socket — a
+re-export of the `genetlink` module).
 
 ## Design notes
 

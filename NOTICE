@@ -209,23 +209,40 @@ project git history).
                only). Original pure-Zig implementation, no GPL/LGPL
                source ported.
 
+  genetlink  — original pure-Zig generic-netlink (genl) transport, clean-room
+               from linux/genetlink.h (genlmsghdr + nlctrl
+               CTRL_CMD_GETFAMILY family resolution; GPL-2.0 WITH
+               Linux-syscall-note). No GPL header source is copied — only
+               the uncopyrightable ABI facts it documents are used
+               (command/attribute/flag constants, struct layouts). The
+               operative mechanism is the same Linux-syscall-note exception
+               relied on by `netlink`/`wireguard`/`tc`: it explicitly
+               permits userspace of ANY license to use these headers to
+               interface with the kernel, which is why this module is
+               cleanly MIT despite citing a GPL-2.0 header. Extracted from
+               the `wireguard` module (its first consumer, where this layer
+               originally lived as a private `genl.zig`) so other
+               genetlink-family modules can depend on it directly; no new
+               third-party design reference beyond the kernel header.
+
   wireguard  — original pure-Zig reimplementation of the WireGuard
                netlink protocol from the documented UAPI headers
-               (uapi/wireguard.h; GPL-2.0 WITH Linux-syscall-note) and
-               linux/genetlink.h (genlmsghdr + nlctrl
-               CTRL_CMD_GETFAMILY). No GPL header source is copied —
-               only the uncopyrightable ABI facts they document are used
-               (command/attribute/flag constants, struct layouts). The
-               operative mechanism is the Linux-syscall-note exception
-               itself: it explicitly states that using these headers to
-               make syscalls / interface with the kernel does not bring
-               the resulting work under the GPL, for userspace of ANY
-               license — which is why this module is cleanly MIT despite
-               citing GPL-2.0 headers. Design ref: wgctrl-go
-               (golang.zx2c4.com/wireguard/wgctrl, MIT) and the wg
-               tool's protocol usage (message-splitting/continuation
-               behavior) — behavior/attribute-shape only, no source
-               consulted or copied.
+               (uapi/wireguard.h; GPL-2.0 WITH Linux-syscall-note). No GPL
+               header source is copied — only the uncopyrightable ABI
+               facts they document are used (command/attribute/flag
+               constants, struct layouts). The operative mechanism is the
+               Linux-syscall-note exception itself: it explicitly states
+               that using these headers to make syscalls / interface with
+               the kernel does not bring the resulting work under the
+               GPL, for userspace of ANY license — which is why this
+               module is cleanly MIT despite citing GPL-2.0 headers.
+               Design ref: wgctrl-go (golang.zx2c4.com/wireguard/wgctrl,
+               MIT) and the wg tool's protocol usage
+               (message-splitting/continuation behavior) —
+               behavior/attribute-shape only, no source consulted or
+               copied. The generic-netlink transport (genlmsghdr + nlctrl
+               family resolve) this module sits on is the `genetlink`
+               module — see its own entry above.
 
                The same module's noise.zig/handshake.zig (currently a
                compiling scaffold, no crypto implemented — see those

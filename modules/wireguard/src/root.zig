@@ -24,13 +24,14 @@
 //! });
 //! ```
 //!
-//! The wire work splits cleanly: `genl.zig` is the generic-netlink plumbing
-//! (genlmsghdr + nlctrl family resolve + a NETLINK_GENERIC socket), while
-//! this file speaks the WireGuard family — WG_CMD_GET_DEVICE dump parsing
-//! (incl. peers continued across multipart messages) and WG_CMD_SET_DEVICE
-//! request building (incl. splitting a large config across messages, the way
-//! the `wg` tool does). Both directions are pure functions over byte slices,
-//! so they are golden-byte-tested offline; the socket only ferries buffers.
+//! The wire work splits cleanly: the `genetlink` module is the generic-netlink
+//! plumbing (genlmsghdr + nlctrl family resolve + a NETLINK_GENERIC socket,
+//! shared with any other genetlink-family client), while this file speaks
+//! the WireGuard family — WG_CMD_GET_DEVICE dump parsing (incl. peers
+//! continued across multipart messages) and WG_CMD_SET_DEVICE request
+//! building (incl. splitting a large config across messages, the way the
+//! `wg` tool does). Both directions are pure functions over byte slices, so
+//! they are golden-byte-tested offline; the socket only ferries buffers.
 //!
 //! Privileges: both WG_CMD_GET_DEVICE and WG_CMD_SET_DEVICE require
 //! CAP_NET_ADMIN (the family registers with GENL_UNS_ADMIN_PERM).
@@ -57,7 +58,12 @@ const netlink = @import("netlink");
 const codec = netlink.codec;
 const native_endian = builtin.cpu.arch.endian();
 
-pub const genl = @import("genl.zig");
+/// The generic-netlink plumbing (genlmsghdr + nlctrl family resolve + a
+/// NETLINK_GENERIC socket) is shared with other genetlink-family clients —
+/// see the `genetlink` module. Re-exported under this name so the rest of
+/// this file (and its tests) reads unchanged from when it was a private
+/// `genl.zig`.
+pub const genl = @import("genetlink");
 
 // Noise_IKpsk2 cryptographic handshake (data-plane). Independent of the
 // genetlink control-plane code above (no shared state, no shared deps;
@@ -70,7 +76,7 @@ pub const meta = .{
     .role = .client,
     .concurrency = .reentrant, // no globals; one Wireguard per thread/loop
     .model_after = "WireGuard genetlink UAPI / wgctrl-go",
-    .deps = .{"netlink"}, // wire codec (nlmsghdr + nlattr TLV) is reused
+    .deps = .{ "netlink", "genetlink" }, // wire codec + genl transport are reused
 };
 
 // ── kernel UAPI constants (uapi/wireguard.h) ────────────────────────────────
@@ -1515,7 +1521,6 @@ test "integration (root): set + get round-trip on a real wg interface" {
 }
 
 test {
-    _ = genl;
     _ = noise;
     _ = handshake;
 }

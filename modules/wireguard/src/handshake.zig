@@ -5,8 +5,9 @@
 //! consumes them, ending in a split pair of transport data-plane keys.
 //!
 //! This is the DATA-PLANE crypto handshake — distinct from (and independent
-//! of) `../src/root.zig` + `genl.zig`, which speak the kernel's
-//! genetlink CONTROL-plane protocol (`wg`-style device/peer configuration).
+//! of) `../src/root.zig` (plus the `genetlink` module it builds on), which
+//! speak the kernel's genetlink CONTROL-plane protocol (`wg`-style
+//! device/peer configuration).
 //! A handshake never touches netlink; a configured `Wireguard` device never
 //! touches Noise. Both live under the one `wireguard` module because they
 //! are the same protocol's two halves.
@@ -42,16 +43,16 @@ comptime {
     // Option (a) of the endianness note below: the mac1/mac2 computations and
     // the KAT/interop tests view the extern structs as wire bytes via
     // `std.mem.asBytes`, which is only byte-exact on a little-endian host
-    // (matching the sibling `root.zig`/`genl.zig`, which assume native
-    // endianness). Port the u32/u64 fields to explicit `std.mem.writeInt`
+    // (matching the sibling `root.zig` and the `genetlink` module, which
+    // assume native endianness). Port the u32/u64 fields to explicit `std.mem.writeInt`
     // encoding before lifting this guard.
     std.debug.assert(builtin.cpu.arch.endian() == .little);
 }
 
 // Note: `pub const meta` is declared once, canonically, in `root.zig` (per
 // CONVENTIONS.md §4) — submodule files like this one do not repeat it. This
-// file itself has no dependency on `netlink` (that's the sibling
-// control-plane half of the module, root.zig/genl.zig).
+// file itself has no dependency on `netlink`/`genetlink` (those are the
+// sibling control-plane half of the module, in root.zig).
 
 // ── message type tag (first 4 bytes of every WireGuard wire message) ───────
 
