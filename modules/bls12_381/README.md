@@ -5,17 +5,18 @@ KZG polynomial commitments, and threshold-BLS schemes — the base field
 `Fp`, the extension tower `Fp2`/`Fp6`/`Fp12`, the scalar field `Fr`, the
 two pairing groups `G1`/`G2`, and the pairing `e: G1 x G2 -> Gt`.
 
-**Status: Parts 1, 2 AND 3 complete.** Part 1's full field-tower and
-group arithmetic, every curve/field constant independently verified
-(see `NOTICE` — including a G2-cofactor scaffold bug found and fixed
-during the crypto-core pass), constant-time scalar multiplication and
-branchless point addition. Part 2 (`pairing.zig`) is the real pairing:
-the optimal ate Miller loop (D-type-twist line evaluation, batched
-allocation-free multi-pairing) and the full final exponentiation (easy
-part + the Hayashida-Hayasaka-Teruya exact hard-part chain), verified
-by a full bilinearity property suite PLUS a byte-exact `e(G1,G2)` KAT
-against the IETF pairing-friendly-curves draft's official test vector
-(with a py_ecc cross-check). Part 3 (`hash_to_curve.zig`) is RFC 9380
+**Status: Parts 1-4 complete.** Part 1's full
+field-tower and group arithmetic, every curve/field constant
+independently verified (see `NOTICE` — including a G2-cofactor
+scaffold bug found and fixed during the crypto-core pass),
+constant-time scalar multiplication and branchless point addition.
+Part 2 (`pairing.zig`) is the real pairing: the optimal ate Miller loop
+(D-type-twist line evaluation, batched allocation-free multi-pairing)
+and the full final exponentiation (easy part + the
+Hayashida-Hayasaka-Teruya exact hard-part chain), verified by a full
+bilinearity property suite PLUS a byte-exact `e(G1,G2)` KAT against the
+IETF pairing-friendly-curves draft's official test vector (with a
+py_ecc cross-check). Part 3 (`hash_to_curve.zig`) is RFC 9380
 hash-to-curve for `G1`/`G2` (suites
 `BLS12381G{1,2}_XMD:SHA-256_SSWU_RO_`/`_NU_`): the full
 `expand_message_xmd` → `hash_to_field` → Simplified-SWU-plus-isogeny →
@@ -23,9 +24,15 @@ hash-to-curve for `G1`/`G2` (suites
 vectors at every published stage (Appendix K.1; J.9.1/J.10.1 `u`,
 `Q0`/`Q1`, final `P` — all 5 messages each), with the isogeny
 coefficient tables sourced programmatically from the RFC's raw text
-and verified by an independent implementation (see `NOTICE`).
-128/128 tests green in Debug AND ReleaseFast — see `SPEC.md` for the
-design record.
+and verified by an independent implementation (see `NOTICE`). Part 4
+(`bls_sig.zig`) is BLS signatures per draft-irtf-cfrg-bls-signature-05,
+minimal-pubkey-size/ProofOfPossession ciphersuite — `keyGen`/`skToPk`/
+`keyValidate`, `sign`/`verify`, signature/pubkey aggregation with
+`aggregateVerify`/`fastAggregateVerify`, and proof-of-possession
+(`popProve`/`popVerify`), byte-exact against `ethereum/bls12-381-tests`
+v0.1.2 vectors, with the mandatory subgroup/`KeyValidate` checks
+fail-closed at every verify entry point. 148/148 tests green in Debug
+AND ReleaseFast (see `SPEC.md` for the design record).
 
 ## The multi-part arc
 
@@ -36,7 +43,7 @@ This module is planned across several parts.
 | 1 | Field tower (`Fp`/`Fp2`/`Fp6`/`Fp12`) + groups (`G1`/`G2`) | **done** |
 | 2 | The pairing itself: Miller loop + final exponentiation | **done** |
 | 3 | Hash-to-curve (RFC 9380, for hashing messages onto `G1`/`G2`) | **done** |
-| 4 | BLS signatures (RFC 9380's BLS ciphersuites / the IETF BLS draft) | not started |
+| 4 | BLS signatures (draft-irtf-cfrg-bls-signature-05, min-pk/ProofOfPossession) | **done** |
 | 5 | KZG polynomial commitments | not started |
 | 6 | Threshold BLS (Shamir/FROST-style share aggregation) | not started |
 
@@ -86,6 +93,18 @@ const ok2 = bls12_381.pairing.pairingCheck(&.{
 const dst = "QUUX-V01-CS02-with-BLS12381G1_XMD:SHA-256_SSWU_RO_"; // caller-chosen, per RFC 9380 §3.1
 const h1 = bls12_381.hash_to_curve.hashToCurveG1("message", dst); // G1.Affine
 const h2 = bls12_381.hash_to_curve.hashToCurveG2("message", dst); // G2.Affine (a G2 suite DST in practice)
+
+// BLS signatures (Part 4 — min-pk/ProofOfPossession ciphersuite):
+const bls = bls12_381.bls_sig;
+const sk = try bls.keyGen("at least 32 bytes of IKM go here......", "");
+const pk = bls.skToPk(sk);
+const ok = bls.keyValidate(pk);               // REQUIRED on any external pk
+const sig = bls.sign(sk, "message");          // constant-time in sk
+const valid = bls.verify(pk, "message", sig); // fail-closed subgroup/KeyValidate checks
+const agg = try bls.aggregate(&.{ sig, sig2 });
+const ok3 = try bls.aggregateVerify(&.{ pk, pk2 }, &.{ "message", "msg2" }, agg);
+const proof = bls.popProve(sk);               // proof of possession (registration time)
+const ok4 = bls.popVerify(pk, proof);
 ```
 
 Deserialization (`fromBytesCompressed`/`fromBytesUncompressed`) checks
@@ -106,13 +125,14 @@ BLS pitfall; see `SPEC.md`'s threat model).
 | `g2.zig` | `G2`: the order-`r` subgroup of the sextic twist `E'(Fp2): y²=x³+4(1+u)` |
 | `pairing.zig` | Part 2: `e: G1 x G2 -> Gt`, the optimal ate Miller loop + final exponentiation |
 | `hash_to_curve.zig` | Part 3: RFC 9380 hash-to-curve — `expandMessageXmd`, `hashToFieldFp`/`hashToFieldFp2`, Simplified SWU + 11-/3-isogeny maps, `hashToCurveG1`/`G2` + `encodeToCurveG1`/`G2` |
+| `bls_sig.zig` | Part 4: BLS signatures — `keyGen`/`skToPk`/`keyValidate`, `sign`/`verify`, `aggregate`/`aggregatePublicKeys`, `coreAggregateVerify`/`aggregateVerify`/`fastAggregateVerify`, `popProve`/`popVerify` |
 | `root.zig` | Module entry: `meta`, re-exports, dark-tests aggregator |
 
 ## Verify
 
 ```
-zig build test-bls12_381                        # Debug — 128/128 pass
-zig build test-bls12_381 -Doptimize=ReleaseFast # ReleaseFast — same
+zig build test-bls12_381                        # Debug — 148/148 pass
+zig build test-bls12_381 -Doptimize=ReleaseFast # ReleaseFast — 148/148 pass
 zig fmt --check modules/bls12_381/
 ```
 

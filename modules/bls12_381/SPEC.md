@@ -6,15 +6,17 @@ purpose and API. Provenance: see [NOTICE](NOTICE).
 
 ## Purpose
 
-Parts 1-3 of a multi-part arc (`README.md`). Part 1: the base field `Fp`,
+Parts 1-4 of a multi-part arc (`README.md`). Part 1: the base field `Fp`,
 the extension tower `Fp2`/`Fp6`/`Fp12`, the scalar field `Fr`, and the two
 pairing groups `G1`/`G2` — everything the pairing function needs as its
 foundation. Part 2 (`pairing.zig`): the pairing itself, `e: G1 x G2 ->
 Gt`, `Gt ⊂ Fp12*` — the optimal ate Miller loop plus final
 exponentiation. Part 3 (`hash_to_curve.zig`): RFC 9380 hash-to-curve
-for `G1`/`G2` — the primitive BLS signatures (Part 4) use to hash a
-message onto the curve. This module does NOT implement BLS signatures,
-KZG, or threshold BLS — those are later parts.
+for `G1`/`G2` — the primitive BLS signatures use to hash a message onto
+the curve. Part 4 (`bls_sig.zig`, **COMPLETE**): BLS signatures per
+draft-irtf-cfrg-bls-signature-05, minimal-pubkey-size/ProofOfPossession
+ciphersuite. This module does NOT implement KZG or threshold BLS —
+those are later parts (5-6).
 
 ## Model-after + seed
 
@@ -239,6 +241,155 @@ KZG, or threshold BLS — those are later parts.
   scalars (§8.8.1/§8.8.2) are likewise cited from the raw text
   (`NOTICE` entry 21).
 
+## Part 4 design (BLS signatures — SCAFFOLDED 2026-07-14, crypto-core pass COMPLETE 2026-07-14)
+
+- **Ciphersuite: minimal-pubkey-size, ProofOfPossession, ONLY.**
+  `BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_`
+  (draft-irtf-cfrg-bls-signature-05 §4.2.3) — public keys in `G1`
+  (48-byte compressed), signatures in `G2` (96-byte compressed),
+  messages hashed via `hashToCurveG2` (Part 3) under this DST; proofs
+  of possession hashed under the SEPARATE `BLS_POP_...` DST. This is
+  the ciphersuite Ethereum's consensus layer (and most production BLS
+  deployments) actually use — the smaller (48-byte) element goes in
+  the more-frequently-transmitted slot (public keys, stored/gossiped
+  far more often than the signatures verifying them). **Explicitly OUT
+  OF SCOPE**: the min-sig variant (pubkeys in `G2`, signatures in
+  `G1`) — "Part 4b" if a consumer needs it later, not implemented
+  here; the Basic and MessageAugmentation schemes (draft §3.1/§3.2 —
+  different rogue-key mitigations than ProofOfPossession's).
+- **The exact verify equation, in this module's own argument
+  convention.** `pairing.pairing(p: G1.Affine, q: G2.Affine)` fixes
+  the FIRST argument to `G1`, second to `G2`. The draft's abstract
+  `CoreVerify` (§2.7) computes `C1 = pairing(Q, xP)` / `C2 =
+  pairing(R, P)` where, for min-pk, `Q`/`R` (message hash / signature)
+  are `G2` elements and `xP`/`P` (public key / `G1` generator) are
+  `G1` elements — so in THIS module's fixed argument order:
+  ```
+  C1 = pairing.pairing(pk.point, H(message))       = e(PK, H(m))
+  C2 = pairing.pairing(G1.Affine.generator, sig.point) = e(G1_gen, sig)
+  accept iff C1 == C2
+  ```
+  computed as ONE `pairingCheck` call (shared multi-Miller-loop + one
+  final exponentiation, not two separate `pairing` calls):
+  ```
+  pairing.pairingCheck(&.{
+      .{ .p = pk.point, .q = H(message) },
+      .{ .p = negatedG1Generator(), .q = sig.point },
+  })
+  ```
+  `coreAggregateVerify`/`fastAggregateVerify`/`popVerify` all reduce to
+  the SAME `pairingCheck` idiom — one `PairingPair` per (pubkey,
+  message-hash) term, plus one trailing `(-G1_generator, signature)`
+  term. `bls_sig.zig`'s doc comments spell out each one exactly.
+  **Crypto-core-pass implementation note (`coreAggregateVerify`)**: the
+  function takes no allocator and `n` is caller-controlled, so the
+  `n+1` pairs are not materialized as one slice; the raw Miller values
+  are accumulated over fixed-size STACK chunks of 8
+  (`multiMillerLoop` per chunk, `Fp12.mul` between chunks — 8 matches
+  `pairing.zig`'s own internal Miller batch width, so nothing is lost
+  versus one giant slice) and final-exponentiated ONCE — exactly
+  equivalent to a single `pairingCheck` call, because Miller values
+  multiply (`Fp12.conjugate` is multiplicative) and
+  `finalExponentiation` is a group homomorphism. A dedicated test
+  drives an 8-signer (9-pair) aggregate across the chunk boundary.
+  `fastAggregateVerify` is implemented draft-faithfully as
+  `aggregatePublicKeys` + `verify` on the aggregate: the mandatory
+  checks run on the AGGREGATE key and the signature; per-key validity
+  is the PoP registration-time precondition (below), not re-checked
+  per verify.
+- **Mandatory subgroup/`KeyValidate` checks — WHY, not just what.**
+  Every pairing-based entry point (`verify`, `coreAggregateVerify`,
+  `fastAggregateVerify`, `popVerify`) MUST, before touching the
+  pairing at all:
+  1. `signature_subgroup_check` on the signature's `G2` point
+     (`g2.Jacobian.subgroupCheck`) — an on-curve-but-wrong-subgroup
+     signature is exactly the "small-subgroup" attack class Part 1's
+     own threat model (below) already centers on: an attacker who
+     controls a low-order `E'(Fp2)` point as a "signature" can force a
+     degenerate, predictable pairing value, potentially satisfying the
+     verify equation for a value they never actually signed with a
+     real secret key.
+  2. `KeyValidate` on every public key involved (`keyValidate` — a
+     non-identity + `g1.Jacobian.subgroupCheck` check) — the ROGUE-KEY
+     attack class: without this, an attacker registering a public key
+     computed as `PK_attacker = [c]G1 - PK_victim` (for a self-chosen
+     `c`) can produce a valid-looking AGGREGATE signature for a set
+     including the victim's key without ever knowing the victim's
+     secret key, because the aggregate pairing check only constrains
+     the SUM of the underlying secret exponents, not each one
+     individually. The ProofOfPossession scheme (this ciphersuite)
+     defends against this at KEY-REGISTRATION time instead
+     (`popProve`/`popVerify` — every public key must publish a
+     self-signature over its own bytes before being accepted into any
+     aggregate; forging a PoP requires the same secret key as the
+     public key it is over, closing the rogue-key degree of freedom)
+     rather than re-`KeyValidate`-ing on every verify — this is
+     `fastAggregateVerify`'s documented, UNENFORCED-BY-CODE
+     precondition (draft §3.3.4: "the caller MUST know a proof of
+     possession for all PK_i, and PopVerify(...) MUST be VALID" —
+     checked once, at registration, never inside `fastAggregateVerify`
+     itself).
+  3. Splitting-zero / identity-input defense: `KeyValidate` also
+     rejects the `G1` identity point as a public key — an unchecked
+     identity public key can make `pairing(identity, anything) == 1`
+     trivially satisfy some malformed verify constructions (the
+     "splitting zero" pitfall the draft's own security considerations
+     warn about); this module's `keyValidate` rejects it explicitly,
+     ahead of the subgroup check.
+- **`KeyGen` (draft §2.3) — REAL, but deliberately NOT KAT-verified.**
+  Mechanical HKDF-Extract/Expand construction over `std.crypto.kdf.
+  hkdf.HkdfSha256` plus `Fr.reduceWide` (`OS2IP(OKM) mod r`) — both
+  already-real primitives, so implemented directly rather than
+  stubbed. NOT wired against a byte-exact external vector: the draft's
+  own Appendix B is "TBA" for KeyGen vectors as of `-05`, and EIP-2333
+  — despite an almost-identical HKDF shape and the same
+  `"BLS-SIG-KEYGEN-SALT-"` string — is a DIFFERENT algorithm (its
+  `derive_master_SK` pre-hashes the salt on the FIRST call, which the
+  draft's own text documents as the OLDER, `-04`-compatible behavior,
+  not `-05`'s). Conflating the two would silently pin the wrong
+  algorithm under a vector that looks plausible — flagged in
+  `bls_sig.zig`'s `keyGen` doc comment as a `TODO(fable)` rather than
+  guessed. `keyGen` is exercised today only by the self-consistent
+  round-trip test (`keyGen` -> `skToPk` -> ... -> `verify`).
+- **The `Aggregate`/`aggregatePublicKeys` vs. verify split.** Plain
+  point summation (`Aggregate`, draft §2.8, and its `G1`-side analogue)
+  needs NO pairing and no security judgment. Everything that CHECKS an
+  aggregate (`coreAggregateVerify`, `aggregateVerify`,
+  `fastAggregateVerify`) is where all the actual security lives (the
+  pairing-product equation, the subgroup/`KeyValidate` preconditions
+  above) — all implemented, fail-closed (verify-family functions return
+  `false` on any subgroup/identity failure, never panic; the only
+  error returns are the mechanical `EmptySet`/`LengthMismatch`/
+  decode preconditions).
+- **Test-vector sourcing.** `bls_sig.zig`'s wired KATs (`sign`,
+  `verify`, `aggregate`, `fastAggregateVerify`) come from
+  `ethereum/bls12-381-tests` (tag `v0.1.2`, JSON encoding), downloaded
+  and independently verified for this pass (see `NOTICE`) — the same
+  ciphersuite and test-case-category names (`sign`/`verify`/
+  `aggregate`/`fast_aggregate_verify`) as the Ethereum
+  `consensus-spec-tests` repo's `general/phase0/bls/` suite the
+  original task pointed at; that larger repo's actual vector files
+  ship only inside a ~200MB release tarball this pass did not download,
+  so the smaller, directly-fetched-and-verified sibling repo was used
+  instead — flagged here rather than silently assumed byte-identical.
+  All wired KATs — `aggregate`, `sign`, `verify` (accept + reject),
+  `fastAggregateVerify` — PASS byte-exactly since the crypto-core pass,
+  alongside the self-consistent `popProve`/`popVerify` and end-to-end
+  round trips.
+- **Part 4 constant-time choices (crypto-core pass).** The SECRET-key
+  paths — `keyGen`, `skToPk`, `sign`, `popProve` — touch `sk` only via
+  `Fr`'s ff-backed constant-time arithmetic and Part 1's constant-time
+  double-and-add-always `scalarMul` (`skToPk` on `G1`, `sign`/`popProve`
+  on `G2`); they contain no secret-dependent branches or memory
+  accesses (`keyGen`'s retry loop branches only on the derived scalar
+  being exactly zero — probability ~2^-255, and the draft's own
+  construction). The VERIFY family (`verify`, `coreAggregateVerify`/
+  `aggregateVerify`, `fastAggregateVerify`, `popVerify`) and
+  `aggregate`/`aggregatePublicKeys`/`keyValidate` operate exclusively
+  on PUBLIC data (public keys, signatures, messages) and are
+  variable-time, like the pairing and hash-to-curve they compose
+  (see "Constant-time choices" under Threat model).
+
 ## Threat model / limits
 
 - **The BLS subgroup-check pitfall — this module's central threat.**
@@ -328,6 +479,15 @@ KZG, or threshold BLS — those are later parts.
   actually uses (e.g. `expand_message_xof`/SHAKE variants RFC 9380
   defines for other curves) — this module implements only the SHA-256
   `expand_message_xmd` variant.
+- **Out of scope for Part 4** (see "Part 4 design" above for the
+  detailed reasoning): the **min-sig** ciphersuite variant (public keys
+  in `G2`, signatures in `G1` — the mirror image of this file's
+  min-pk); the **Basic** and **MessageAugmentation** BLS schemes
+  (draft §3.1/§3.2 — alternative rogue-key mitigations to
+  ProofOfPossession's, requiring either a distinct-messages precondition
+  or per-message public-key augmentation this module does not
+  implement); KZG and threshold BLS remain Parts 5-6, unaffected by
+  Part 4's scope.
 
 ## Verification
 
@@ -410,9 +570,42 @@ KZG, or threshold BLS — those are later parts.
   at `u = 0` exercise the `tv1 == 0` exceptional branch and land on
   `E1'`/`E2'` with `sgn0(y) == 0`; `Fp`/`Fp2` `inv0`/`sgn0` unit tests
   (including the `sgn0`-vs-`isLexicographicallyLargest` convention
-  distinction). **Net: `zig build test-bls12_381` reports 128/128
-  pass, 0 panics, in both Debug and ReleaseFast** (`zig fmt --check`
-  clean; disk test-block count == runtime count == 128).
+  distinction). **Net (Parts 1-3): `zig build test-bls12_381` reports
+  128/128 pass, 0 panics, in both Debug and ReleaseFast** (`zig fmt
+  --check` clean; disk test-block count == runtime count == 128).
+- **Part 4 (`bls_sig.zig`) — COMPLETE, 148 total tests (128 + 20
+  new)**: the 12 scaffold-era tests (wire codecs, `keyGen`
+  IKM/determinism, `skToPk`+`keyValidate`, `keyValidate` rejecting the
+  identity and a non-subgroup point, `aggregate`/`aggregatePublicKeys`
+  empty-set rejection, single-signature and commutativity/associativity
+  properties, `coreAggregateVerify`/`aggregateVerify`/
+  `fastAggregateVerify` precondition rejection, and the byte-exact
+  `aggregate` KAT against `ethereum/bls12-381-tests` v0.1.2's
+  `aggregate_0xabab...ab.json`); the 5 pairing-core tests, now passing:
+  `sign` against `sign_case_11b8c7cad5238946.json` (byte-exact 96-byte
+  signature), `verify` accept/reject against
+  `verify_valid_case_195246ee3bd3b6ec.json` (the reject case
+  substitutes a genuine mismatched signature rather than the upstream
+  byte-tampered vector, which fails to DESERIALIZE rather than
+  exercising `verify`'s pairing check — see that test's own comment),
+  `fastAggregateVerify` against
+  `fast_aggregate_verify_valid_3d7576f3c0e3570a.json`, a
+  self-consistent `popProve`/`popVerify` round trip (accept + a
+  wrong-key proof rejected), and a self-consistent end-to-end
+  `keyGen`->`skToPk`->`sign`->`verify`->`aggregate`->`aggregateVerify`
+  round trip with wrong-message/wrong-key/swapped-message tampering;
+  PLUS 3 new security-check tests proving the mandatory checks FIRE:
+  `verify`/`popVerify`/`aggregateVerify` reject the IDENTITY public
+  key (KeyValidate fires, fail-closed, no panic); `verify`/`popVerify`/
+  `aggregateVerify`/`fastAggregateVerify` reject an on-curve
+  NON-SUBGROUP `G2` signature (crafted via `mapToCurveG2` WITHOUT
+  cofactor clearing, its non-membership asserted as a test
+  precondition); and an 8-signer `aggregateVerify` round trip (9
+  pairing terms) crossing `coreAggregateVerify`'s Miller-chunk
+  boundary, with a cross-boundary message-swap tamper rejected.
+  **`zig build test-bls12_381` reports 148/148 pass, 0 panics, in both
+  Debug and ReleaseFast** (`zig fmt --check` clean; disk test-block
+  count == runtime count == 148).
 
 ## Status
 
@@ -445,6 +638,21 @@ reuse-vs-reimplement decision, the `Fp` wide-reduction finding, the
 constant-provenance discipline, and the `h_eff`-vs-plain-cofactor
 scaffold correction (the one place the scaffold's stated plan was
 wrong).
+
+**Part 4 COMPLETE (crypto-core pass, 2026-07-14).** Minimal-pubkey-size,
+ProofOfPossession BLS signatures (draft-irtf-cfrg-bls-signature-05):
+everything is real — wire codecs, `keyGen`, `skToPk`, `keyValidate`,
+`aggregate`/`aggregatePublicKeys`, and the pairing-based `sign`,
+`verify`, `coreAggregateVerify`/`aggregateVerify`,
+`fastAggregateVerify`, `popProve`/`popVerify` cores, each implementing
+exactly the construction its scaffold doc comment specified (see
+"Part 4 design" above, including the crypto-core-pass notes on the
+chunked Miller accumulator and the draft-faithful
+`fastAggregateVerify`). Byte-exact against the `ethereum/bls12-381-tests`
+v0.1.2 `sign`/`verify`/`aggregate`/`fast_aggregate_verify` vectors;
+mandatory subgroup/`KeyValidate` checks proven to fire by dedicated
+fail-closed tests. `zig build test-bls12_381`: 148/148 pass, 0 panics,
+Debug AND ReleaseFast — see "Verification" above.
 
 ### Backlog (deferred)
 
@@ -485,3 +693,9 @@ wrong).
    `hash_to_curve`); and a variable-time public-scalar multiplication
    for the `h_eff` step (hash-to-curve input is public — see the
    threat model).
+6. **Part 4 follow-ups (the crypto-core pass itself is DONE — see
+   Status)**: a byte-exact `keyGen` KAT if a `-05`-compatible one
+   surfaces (draft Appendix B is "TBA"; see "Part 4 design"'s EIP-2333
+   non-equivalence finding — until then `keyGen` is covered by the
+   deterministic/round-trip tests only); the min-sig ciphersuite
+   variant ("Part 4b", out of scope for now).

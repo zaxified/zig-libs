@@ -6,7 +6,7 @@
 //! threshold-BLS schemes — see `README.md` for the full multi-part arc
 //! this module is Part 1 of.
 //!
-//! **Status: Parts 1, 2 AND 3 complete.** Full field-tower and group
+//! **Status: Parts 1-4 complete.** Full field-tower and group
 //! arithmetic plus the pairing itself (`e: G1 x G2 -> Gt`,
 //! `pairing.zig`): the optimal ate Miller loop (D-type-twist line
 //! evaluation) and the full final exponentiation (easy part + the
@@ -19,10 +19,18 @@
 //! suite. Part 3 (`hash_to_curve.zig`) is RFC 9380 hash-to-curve for
 //! both groups (`BLS12381G{1,2}_XMD:SHA-256_SSWU_RO_`/`_NU_`), pinned
 //! byte-exact against RFC 9380's own Appendix J.9.1/J.10.1 vectors at
-//! every stage (`u`, `Q0`/`Q1`, final `P`). See `SPEC.md` for the
-//! design record and the BLS subgroup-check pitfall this module's API
-//! is built around (deserialization does NOT subgroup-check; callers
-//! at trust boundaries must).
+//! every stage (`u`, `Q0`/`Q1`, final `P`). Part 4 (`bls_sig.zig`) is
+//! **COMPLETE**: BLS signatures per draft-irtf-cfrg-bls-signature-05,
+//! minimal-pubkey-size/ProofOfPossession ciphersuite — wire codecs,
+//! `keyGen`, `skToPk`, `keyValidate`, aggregation, AND the pairing-based
+//! `sign`/`verify`/`coreAggregateVerify`/`fastAggregateVerify`/
+//! `popProve`/`popVerify` cores, byte-exact against
+//! `ethereum/bls12-381-tests` v0.1.2 vectors, with the mandatory
+//! subgroup/`KeyValidate` checks fail-closed at every verify entry
+//! point — see `bls_sig.zig`'s own module doc comment. See `SPEC.md`
+//! for the design record and the BLS subgroup-check pitfall this
+//! module's API is built around (deserialization does NOT
+//! subgroup-check; callers at trust boundaries must).
 
 const std = @import("std");
 
@@ -35,6 +43,7 @@ pub const g2 = @import("g2.zig");
 pub const scalar = @import("scalar.zig");
 pub const pairing = @import("pairing.zig");
 pub const hash_to_curve = @import("hash_to_curve.zig");
+pub const bls_sig = @import("bls_sig.zig");
 
 pub const Fp = fp.Fp;
 pub const Fp2 = fp2.Fp2;
@@ -68,6 +77,7 @@ test {
     _ = scalar;
     _ = pairing;
     _ = hash_to_curve;
+    _ = bls_sig;
 }
 
 test "meta.model_after names the pairing-friendly-curves draft" {

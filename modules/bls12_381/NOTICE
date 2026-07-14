@@ -469,3 +469,121 @@ vectors at every published stage; on-curve + subgroup property tests
 cover non-vector messages. `zig build test-bls12_381` passes 128/128
 in Debug AND ReleaseFast (0 panics); `zig fmt --check
 modules/bls12_381/` is clean. See `SPEC.md`'s Status and Backlog.
+
+Part 4 (bls_sig.zig) — provenance and test-vector sourcing
+------------------------------------------------------------
+
+1. **draft-irtf-cfrg-bls-signature-05** (IETF CFRG draft) — the BLS
+   signature scheme specification this file implements: ciphersuite
+   IDs/DSTs (§4.2.3), `KeyGen` (§2.3), `SkToPk`/`KeyValidate`
+   (§2.4/§2.5), `CoreSign`/`CoreVerify` (§2.6/§2.7), `Aggregate`
+   (§2.8), the ProofOfPossession scheme's `CoreAggregateVerify`/
+   `AggregateVerify`/`FastAggregateVerify`/`PopProve`/`PopVerify`
+   (§3.3.x). Fetched 2026-07-14 from
+   https://www.ietf.org/archive/id/draft-irtf-cfrg-bls-signature-05.txt
+   — a public IETF draft/specification, not a copyrightable work
+   (merger doctrine, `CONVENTIONS.md` §5) — cited for completeness,
+   not because attribution is a license condition. Every pseudocode
+   quotation in `bls_sig.zig`'s doc comments was fetched from this
+   exact document on this date; no third-party SOURCE CODE was read
+   or ported.
+2. **`ethereum/bls12-381-tests`** (tag `v0.1.2`, JSON encoding,
+   CC0-1.0-licensed test vectors — no attribution obligation, cited
+   for provenance only) — the source of `bls_sig.zig`'s wired `sign`,
+   `verify`, `aggregate`, and `fastAggregateVerify` KATs. Downloaded
+   2026-07-14 from
+   https://github.com/ethereum/bls12-381-tests/releases/download/v0.1.2/bls_tests_json.tar.gz,
+   extracted, and read directly (not transcribed from memory or a
+   secondary source):
+   - `sign/sign_case_11b8c7cad5238946.json` — the `sign` KAT.
+   - `verify/verify_valid_case_195246ee3bd3b6ec.json` — the `verify`
+     accept-case KAT. (The upstream repo's paired
+     `verify_tampered_signature_case_195246ee3bd3b6ec.json` was
+     DELIBERATELY NOT used for the reject case — confirmed empirically
+     that its byte-flipped signature fails `g2.fromBytesCompressed`
+     itself with `error.NotOnCurve`, i.e. it tests deserialization
+     rejection, not `verify`'s pairing-equation rejection, since this
+     module's `verify` takes an already-decoded `Signature`, not raw
+     bytes. The reject case instead substitutes
+     `aggregate_0xabab...ab.json`'s first signature — a genuine,
+     on-curve, in-subgroup point for a different signer/message — to
+     isolate the equation check itself.)
+   - `aggregate/aggregate_0xabababababababababababababababababababababababababababababababab.json`
+     — the `aggregate` KAT (all three of its input signatures are also
+     reused, one as the `verify` reject case above).
+   - `fast_aggregate_verify/fast_aggregate_verify_valid_3d7576f3c0e3570a.json`
+     — the `fastAggregateVerify` KAT (its signature is the SAME value
+     the `aggregate` KAT above independently reproduces).
+   This is the same ciphersuite and the same test-case-category naming
+   (`sign`/`verify`/`aggregate`/`fast_aggregate_verify`/
+   `eth_aggregate_pubkeys`/`eth_fast_aggregate_verify`) as the
+   Ethereum `consensus-spec-tests` repository's
+   `general/phase0/bls/` suite the originating task pointed at;
+   that repository's actual vector files ship only inside a
+   release tarball (`general.tar.gz`, ~200MB) this pass did not
+   download, so `bls12-381-tests` — the smaller, directly fetched and
+   independently verified sibling/generator project (same
+   organization, same ciphersuite, matching category names) — was
+   used instead. This substitution is recorded here explicitly rather
+   than silently presented as "the consensus-spec-tests vectors."
+3. **EIP-2333** ("BLS12-381 Key Generation") — consulted ONLY to
+   establish that it is NOT directly reusable as a `KeyGen` test
+   vector source for this file's `-05`-draft `keyGen`: EIP-2333's
+   `derive_master_SK` pre-hashes the KDF salt on its first call
+   (`salt = H("BLS-SIG-KEYGEN-SALT-")`), which
+   draft-irtf-cfrg-bls-signature-05 §2.3's own text documents as the
+   OLDER, `-04`-compatible behavior — NOT `-05`'s (raw ASCII salt on
+   the first call, hashing only on retry). No EIP-2333 vector or
+   constant was transcribed into this module.
+
+Verification performed (Part-4 scaffold pass, 2026-07-14)
+------------------------------------------------------------
+
+`bls_sig.zig`'s scaffold-era REAL functions (wire codecs, `keyGen`,
+`skToPk`, `keyValidate`, `aggregate`, `aggregatePublicKeys`,
+`negatedG1Generator`) were exercised against: property tests needing no
+external constant (round-trip codecs, `keyGen` determinism/IKM-length
+precondition, `keyValidate` accepting a freshly-derived key and
+rejecting the identity and a known non-subgroup point, `aggregate`
+commutativity/associativity); AND the byte-exact `aggregate` KAT above
+(entry 2), which passed already at scaffold time since `aggregate`
+requires no pairing. The five security-critical cores were left as
+`@panic("TODO(fable): ...")` stubs with their tests wired but
+crashing — the state the crypto-core pass below started from.
+
+Verification performed (Part-4 crypto-core pass, 2026-07-14)
+------------------------------------------------------------
+
+The five pairing-based cores (`sign`, `verify`, `coreAggregateVerify`/
+`aggregateVerify`, `fastAggregateVerify`, `popProve`/`popVerify`) were
+implemented exactly per the scaffold's doc-comment constructions (no
+third-party source code read or ported — the draft text of entry 1 and
+this module's own Parts 1-3 are the only inputs) and verified against:
+
+- The wired byte-exact KATs of entry 2, now PASSING: `sign` reproduces
+  the published 96-byte signature exactly; `verify` accepts the valid
+  vector and rejects the substituted mismatched signature;
+  `fastAggregateVerify` accepts the published 3-pubkey vector.
+- Self-consistent round trips: `popProve`/`popVerify` (accept + a
+  wrong-key proof rejected) and end-to-end `keyGen` -> `skToPk` ->
+  `sign` -> `verify` -> `aggregate` -> `aggregateVerify` with
+  wrong-message/wrong-key/swapped-message tampering rejected.
+- Dedicated fail-closed security-check tests proving the mandatory
+  draft §2.7/§3.3.3 preconditions actually fire: the IDENTITY public
+  key is rejected by `verify`/`popVerify`/`aggregateVerify`
+  (KeyValidate), and an on-curve NON-SUBGROUP `G2` point (crafted via
+  `mapToCurveG2` WITHOUT cofactor clearing; its non-membership asserted
+  in the test) is rejected as a signature by `verify`/`popVerify`/
+  `aggregateVerify`/`fastAggregateVerify` (signature_subgroup_check) —
+  all returning `false`, never panicking.
+- An 8-signer aggregate (9 pairing terms) crossing
+  `coreAggregateVerify`'s stack-chunked Miller-accumulator boundary,
+  accept + cross-boundary tamper reject.
+
+`zig build test-bls12_381` reports 148/148 tests passing, 0 panics, in
+BOTH Debug and ReleaseFast; `zig fmt --check modules/bls12_381/` is
+clean.
+
+**Status: Part 4 COMPLETE (crypto-core pass, 2026-07-14).** See
+`SPEC.md`'s "Part 4 design" section and `bls_sig.zig`'s module doc
+comment for the settled design record.
