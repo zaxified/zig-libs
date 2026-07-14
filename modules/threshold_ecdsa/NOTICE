@@ -63,10 +63,10 @@ module.
 
 No GPL/LGPL/AGPL source was consulted or copied anywhere in this module.
 
-**Status: scaffold.** The Shamir/Feldman/Lagrange core and the
-Paillier-keygen wiring are REAL (see `SPEC.md`'s "What's REAL vs STUBBED").
-`generateAuxParams` (the ring-Pedersen auxiliary-parameter number theory) is
-an `@panic("TODO(core): ...")` stub with its construction spelled out in its
-own doc comment, awaiting a follow-up crypto pass. See `SPEC.md`'s "Design
-decision" and "Backlog / deferred" sections for exactly what remains and the
-suggested follow-up tier.
+**Status: keygen + aux-params + MtA implemented.** The Shamir/Feldman/
+Lagrange keygen core, the Paillier-keygen wiring, the ring-Pedersen
+`generateAuxParams` safe-prime number theory, and the semi-honest MtA share
+conversion (`mta.zig`) are all real and self-consistency-tested (14/14). The
+GG20 range proofs / MtAwc (malicious security, Phase 2c) and the threshold
+signing rounds (Phase 2d) remain out of scope — see `SPEC.md`'s boundary and
+backlog sections.

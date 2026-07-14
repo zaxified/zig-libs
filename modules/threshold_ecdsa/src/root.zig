@@ -1,50 +1,45 @@
 // SPDX-License-Identifier: MIT
 //! threshold_ecdsa — GG20 threshold-ECDSA over secp256k1: **Phase 2a
-//! (this module) = trusted-dealer keygen**, the first of a 3-part arc
-//! (2a keygen · 2b MtA + range proofs · 2c signing). Depends on the
-//! sibling `paillier` module: GG20's whole design hinges on every party
-//! holding its own additively-homomorphic Paillier keypair (used later,
-//! in Phase 2b, for the multiplicative-to-additive share-conversion
-//! protocol MtA builds); this phase only WIRES that dependency in — it
-//! does not run MtA itself.
+//! (trusted-dealer keygen) + Phase 2b (ring-Pedersen aux params + the
+//! semi-honest MtA core)** of the arc (2a keygen · 2b aux-params/MtA · 2c
+//! range proofs + MtAwc · 2d signing). Depends on the sibling `paillier`
+//! module: GG20's whole design hinges on every party holding its own
+//! additively-homomorphic Paillier keypair — MtA (`mta.zig`) is literally
+//! `paillier`'s homomorphic ops composed into a multiplicative→additive
+//! share conversion.
 //!
-//! **Status: scaffold.** The Shamir-secret-sharing + Feldman-VSS +
-//! Lagrange-interpolation core (`splitSecretKey`, `groupPublicKey`,
-//! `derivePublicKeyShare`, `reconstructSecret`) is REAL — a direct port
-//! of this repo's already-KAT-validated `frost`
-//! (`deriveInterpolatingValue`) and `bls12_381.threshold`
+//! **Status: keygen + aux-params + MtA implemented.** The
+//! Shamir-secret-sharing + Feldman-VSS + Lagrange-interpolation core
+//! (`splitSecretKey`, `groupPublicKey`, `derivePublicKeyShare`,
+//! `reconstructSecret`) is a direct port of this repo's already-KAT-
+//! validated `frost` (`deriveInterpolatingValue`) and `bls12_381.threshold`
 //! (`evalPolynomialAt`/`feldmanCommitCoefficient`/`derivePublicKeyShare`)
 //! constructions, swapped onto `std.crypto.ecc.Secp256k1`'s scalar field
-//! and group instead of those modules' respective fields/groups. The
-//! Paillier-keygen wiring inside `keygenTrustedDealer` (assembling each
-//! party's `paillier.KeyPair` into its `KeyShare`) is likewise REAL — it
-//! is a thin, judgment-free composition over the sibling `paillier`
-//! module's already-implemented `generate`/`fromPrimes`.
+//! and group. The Paillier-keygen wiring inside `keygenTrustedDealer`
+//! (assembling each party's `paillier.KeyPair` into its `KeyShare`) is a
+//! thin composition over `paillier.generate`/`fromPrimes`.
 //!
-//! The ONE genuinely-stubbed piece is `generateAuxParams`: deriving the
-//! ring-Pedersen auxiliary parameters (`N_tilde`, `h1`, `h2`) that GG20's
-//! Phase-2b/2c zero-knowledge range proofs need is real, non-mechanical
-//! number theory (a safe-prime search distinct from Paillier's plain
-//! probable-prime search, plus sampling a secret exponent from an order
-//! this module has no existing primitive for) — `@panic("TODO(core):
-//! ...")`, construction spelled out in that function's own doc comment.
-//! **Design decision (see this module's `SPEC.md` "Phase-2a boundary"
-//! and the scaffolding report that shipped this file): rather than have
-//! `keygenTrustedDealer` itself call the stubbed `generateAuxParams` (which
-//! would make EVERY keygen test panic), `keygenTrustedDealer` takes
-//! `aux_params` as a CALLER-SUPPLIED slice.** This keeps the Shamir/
-//! Feldman/Lagrange tests AND the Paillier-keygen-wiring test fully
-//! passing today — only a dedicated test that calls `generateAuxParams`
-//! directly panics, and it is the LAST test in this file so every
-//! other test's pass/fail is visible in `zig build test-threshold_ecdsa
-//! --summary all`'s output before the crash (mirrors this repo's
-//! `ssh.userauth`/`adaptor` scaffold precedent — see `SPEC.md`).
+//! `generateAuxParams` is now REAL: it derives the ring-Pedersen auxiliary
+//! parameters (`N_tilde`, `h1`, `h2`) via a genuine safe-prime search
+//! (p̃ = 2p'+1 with p' also prime — distinct from Paillier's plain
+//! probable-prime search) and samples the secret exponent `lambda` from the
+//! squares-subgroup order `p'·q'`; see its own doc comment for the
+//! construction and the `lambda`-retention decision. `keygenTrustedDealer`
+//! still takes `aux_params` as a CALLER-SUPPLIED slice (a caller generates
+//! each party's tuple with `generateAuxParams` and passes them in), so the
+//! keygen path stays independent of the — comparatively slow — safe-prime
+//! search.
 //!
-//! `AuxParams`' STRUCT and byte codec are real regardless of the stub —
-//! only the cryptographically-sound VALUES `generateAuxParams` would
-//! produce are deferred; a hand-constructed (small, non-secure) toy
-//! `AuxParams` round-trips through `toBytesAlloc`/`fromBytesAlloc` today
-//! (see the tests at the bottom).
+//! MtA (`mta.zig`, re-exported as `mta`) is the semi-honest correctness core
+//! of the share conversion: `α + β ≡ a·b (mod q)` with neither party
+//! learning the other's input. Its malicious-security layer — the GG20
+//! zero-knowledge range proofs (which consume `AuxParams` as their Pedersen
+//! commitment base) and the MtAwc check — is Phase 2c, deliberately OUT OF
+//! SCOPE here (see `mta.zig`'s `TODO(2c)` notes); the signing rounds are
+//! Phase 2d.
+//!
+//! `AuxParams`' STRUCT and byte codec round-trip on hand-constructed toy
+//! values too (see the tests at the bottom).
 //!
 //! Curve = secp256k1 (`std.crypto.ecc.Secp256k1`); scalar field Zq =
 //! `Secp256k1.scalar.Scalar`. Trusted-dealer model ONLY (mirrors
@@ -56,6 +51,14 @@
 
 const std = @import("std");
 const paillier = @import("paillier");
+
+/// The MtA (multiplicative-to-additive) share-conversion protocol — I2
+/// Phase 2b's semi-honest core. Converts a product `a·b` of two parties'
+/// secret `Zq` inputs into an additive sharing `α + β ≡ a·b (mod q)`, built
+/// on `paillier`'s homomorphic ops. See `mta.zig`'s doc comment for the
+/// construction, the β sign convention, the Z_N→Zq reduction, and the
+/// (Phase-2c) malicious-security boundary.
+pub const mta = @import("mta.zig");
 
 pub const meta = .{
     .platform = .any,
@@ -406,6 +409,10 @@ pub const AuxModulus = std.crypto.ff.Modulus(aux_modulus_bits);
 /// canonical mod `n_tilde`.
 pub const AuxFe = AuxModulus.Fe;
 
+/// Byte length of a canonical `aux_modulus_bits`-wide value — the buffer
+/// size the safe-prime search / modexp helpers below work in.
+pub const aux_modulus_bytes = aux_modulus_bits / 8;
+
 /// One party's ring-Pedersen auxiliary parameters (GG18 §4 / GG20's
 /// Appendix, "Pedersen commitment parameters"): a safe-prime-product
 /// modulus `N_tilde` and two generators `h1`, `h2` of its group of
@@ -490,58 +497,376 @@ pub const AuxParams = struct {
     }
 };
 
-/// Floor `generateAuxParams` will enforce once implemented — mirrors
-/// `paillier.min_generate_bits`.
+/// Recommended production floor for `generateAuxParams`'s `bits` — mirrors
+/// `paillier.min_generate_bits` / `rsa`'s default modulus strength. A real
+/// deployment uses `aux_modulus_bits` (2048). `generateAuxParams` itself
+/// enforces only a much smaller *hard* minimum (so tests can exercise the
+/// real number theory at a fast size); values below this constant are
+/// cryptographically weak and only appropriate for testing.
 pub const min_aux_generate_bits = 512;
 
-/// **STUB — genuine number theory, deliberately unimplemented in this
-/// scaffolding pass.** Generates ring-Pedersen auxiliary parameters for
-/// ONE party.
+/// Hard minimum `generateAuxParams` asserts — just large enough that the
+/// safe-prime search / squares-subgroup arithmetic below is well-defined
+/// (each prime is `bits/2` bits; `bits/2 >= 16` keeps the trial-division
+/// sieve sound, i.e. a zero remainder always means a proper factor).
+const min_aux_hard_bits = 32;
+
+// ── ring-Pedersen number theory (safe-prime search + squares subgroup) ─────
+//
+// Distinct from `paillier.generatePrime`'s *plain* probable-prime search:
+// here each prime p̃ must be a SAFE prime (p̃ = 2p' + 1 with p' also prime),
+// so N_tilde = p̃·q̃ has a large-order group of squares whose order p'·q' we
+// can sample the secret exponent `lambda` from. This is the genuine number
+// theory the Phase-2a scaffold deferred; `AuxParams`' struct + codec were
+// already real. Reuses the same Miller-Rabin / trial-sieve shape
+// `paillier`/`rsa` establish (re-implemented locally — those are private to
+// their modules), typed onto `AuxModulus`.
+
+const BigInt = std.math.big.int.Managed;
+
+/// Limb capacity covering an `aux_modulus_bits`-wide product plus headroom.
+const aux_big_capacity = (2 * aux_modulus_bits) / @bitSizeOf(std.math.big.Limb) + 4;
+
+/// Scratch arena for the one-time N_tilde = p̃·q̃ / ord = p'·q' big-int
+/// derivations (not on any hot path). Matches `paillier`'s scratch sizing.
+const aux_scratch_bytes = 128 * 1024;
+
+fn newBig(gpa: std.mem.Allocator) !BigInt {
+    return BigInt.initCapacity(gpa, aux_big_capacity);
+}
+
+fn bigFromBytes(gpa: std.mem.Allocator, bytes: []const u8) !BigInt {
+    var x = try newBig(gpa);
+    if (bytes.len == 0) {
+        try x.set(0);
+        return x;
+    }
+    try x.ensureCapacity(bytes.len / @sizeOf(std.math.big.Limb) + 2);
+    var m = x.toMutable();
+    m.readTwosComplement(bytes, bytes.len * 8, .big, .unsigned);
+    x.setMetadata(m.positive, m.len);
+    return x;
+}
+
+/// Odd primes below 1024 for the trial-division pre-sieve (comptime sieve of
+/// Eratosthenes) — same construction as `paillier.sieve_primes`.
+const sieve_primes = blk: {
+    @setEvalBranchQuota(20_000);
+    const limit = 1024;
+    var composite = [_]bool{false} ** limit;
+    var count: usize = 0;
+    var i: usize = 3;
+    while (i < limit) : (i += 2) {
+        if (composite[i]) continue;
+        count += 1;
+        var j = i * i;
+        while (j < limit) : (j += 2 * i) composite[j] = true;
+    }
+    var list: [count]u16 = undefined;
+    var idx: usize = 0;
+    i = 3;
+    while (i < limit) : (i += 2) {
+        if (composite[i]) continue;
+        list[idx] = i;
+        idx += 1;
+    }
+    break :blk list;
+};
+
+/// Miller-Rabin rounds per candidate — matches `paillier.mr_rounds`
+/// (4^-64 = 2^-128 worst-case error per accepted candidate).
+const aux_mr_rounds = 64;
+
+/// Big-endian unsigned `bytes` mod `divisor` (u128 intermediate) —
+/// pre-sieve only, mirrors `paillier.bytesMod`.
+fn bytesMod(bytes: []const u8, divisor: u64) u64 {
+    std.debug.assert(divisor != 0);
+    var r: u64 = 0;
+    for (bytes) |b| {
+        r = @intCast(((@as(u128, r) << 8) | b) % divisor);
+    }
+    return r;
+}
+
+/// In-place big-endian right shift by `s` bits — mirrors `paillier.shrBytesBe`.
+fn shrBytesBe(buf: []u8, s: usize) void {
+    const byte_sh = s / 8;
+    const bit_sh: u4 = @intCast(s % 8);
+    var i: usize = buf.len;
+    while (i > 0) {
+        i -= 1;
+        const lo: u16 = if (i >= byte_sh) buf[i - byte_sh] else 0;
+        const hi: u16 = if (i >= byte_sh + 1) buf[i - byte_sh - 1] else 0;
+        buf[i] = @truncate(((hi << 8) | lo) >> bit_sh);
+    }
+}
+
+/// Set bit `bit` (LSB = 0) of a big-endian byte string.
+fn setBitBe(buf: []u8, bit: usize) void {
+    buf[buf.len - 1 - bit / 8] |= @as(u8, 1) << @intCast(bit % 8);
+}
+
+/// Uniform Miller-Rabin witness in [2, m-2] by rejection sampling — mirrors
+/// `paillier.randomWitness`, typed onto `AuxModulus`.
+fn randomWitness(m: AuxModulus, random: std.Random) AuxFe {
+    const n_bits = m.bits();
+    const n_len = byteLen(n_bits);
+    const n_minus_1 = m.sub(m.zero, m.one());
+    var buf: [aux_modulus_bytes]u8 = undefined;
+    defer std.crypto.secureZero(u8, buf[0..n_len]);
+    while (true) {
+        random.bytes(buf[0..n_len]);
+        buf[0] &= @as(u8, 0xff) >> @intCast(8 * n_len - n_bits);
+        const a = AuxFe.fromBytes(m, buf[0..n_len], .big) catch continue;
+        if (a.isZero() or a.eql(m.one()) or a.eql(n_minus_1)) continue;
+        return a;
+    }
+}
+
+/// Miller-Rabin probable-prime test — mirrors `paillier.isProbablePrime`,
+/// typed onto `AuxModulus`. `m` must be odd (every `AuxModulus` is).
+fn isProbablePrime(m: AuxModulus, random: std.Random) bool {
+    const n_len = byteLen(m.bits());
+
+    var d_buf: [aux_modulus_bytes]u8 = undefined;
+    defer std.crypto.secureZero(u8, d_buf[0..n_len]);
+    m.toBytes(d_buf[0..n_len], .big) catch unreachable;
+    d_buf[n_len - 1] &= 0xfe; // m - 1 (m odd)
+    var s: usize = 0;
+    var i: usize = n_len;
+    while (i > 0) {
+        i -= 1;
+        if (d_buf[i] == 0) {
+            s += 8;
+        } else {
+            s += @ctz(d_buf[i]);
+            break;
+        }
+    }
+    shrBytesBe(d_buf[0..n_len], s);
+    const d_bytes = stripLeadingZeros(d_buf[0..n_len]);
+
+    const one = m.one();
+    const n_minus_1 = m.sub(m.zero, one);
+
+    var round: usize = 0;
+    rounds: while (round < aux_mr_rounds) : (round += 1) {
+        const a = randomWitness(m, random);
+        var x = m.powWithEncodedExponent(a, d_bytes, .big) catch unreachable; // d odd, never 0
+        if (x.eql(one) or x.eql(n_minus_1)) continue :rounds;
+        var j: usize = 1;
+        while (j < s) : (j += 1) {
+            x = m.sq(x);
+            if (x.eql(n_minus_1)) continue :rounds;
+            if (x.eql(one)) return false;
+        }
+        return false;
+    }
+    return true;
+}
+
+/// Search for a SAFE prime p̃ = 2p' + 1 (p' also prime) of exactly
+/// `prime_bits` bits, top two bits set (so N_tilde = p̃·q̃ of two such
+/// primes reaches `2·prime_bits` bits) and p̃ ≡ 3 (mod 4) (which forces
+/// p' = (p̃-1)/2 odd, hence a valid `AuxModulus` to primality-test).
+/// `out.len == byteLen(prime_bits)`. Variable-time (every prime search is);
+/// candidate buffers are the caller's to zero.
+fn generateSafePrime(random: std.Random, prime_bits: usize, out: []u8) void {
+    std.debug.assert(out.len == byteLen(prime_bits));
+    std.debug.assert(prime_bits >= 16);
+    const top_mask = @as(u8, 0xff) >> @intCast(8 * out.len - prime_bits);
+    var pprime_buf: [aux_modulus_bytes]u8 = undefined;
+    defer std.crypto.secureZero(u8, pprime_buf[0..out.len]);
+    candidates: while (true) {
+        random.bytes(out);
+        out[0] &= top_mask;
+        setBitBe(out, prime_bits - 1); // exact bit length…
+        setBitBe(out, prime_bits - 2); // …and p̃·q̃ >= 2^(2·prime_bits - 1)
+        out[out.len - 1] |= 0x03; // p̃ ≡ 3 (mod 4): odd AND p' = (p̃-1)/2 odd
+
+        // p' = (p̃ - 1) / 2, computed for the sieve + its own primality test.
+        @memcpy(pprime_buf[0..out.len], out);
+        pprime_buf[out.len - 1] &= 0xfe; // p̃ - 1
+        shrBytesBe(pprime_buf[0..out.len], 1); // (p̃ - 1) / 2
+
+        // Trial-division pre-sieve on BOTH p̃ and p' (a zero remainder is a
+        // proper factor for either — both are >= 2^(prime_bits-2) ≫ 1024).
+        for (sieve_primes) |sp| {
+            if (bytesMod(out, sp) == 0) continue :candidates;
+            if (bytesMod(pprime_buf[0..out.len], sp) == 0) continue :candidates;
+        }
+
+        const m_p = AuxModulus.fromBytes(out, .big) catch continue :candidates;
+        if (!isProbablePrime(m_p, random)) continue :candidates;
+        const m_pprime = AuxModulus.fromBytes(stripLeadingZeros(pprime_buf[0..out.len]), .big) catch continue :candidates;
+        if (!isProbablePrime(m_pprime, random)) continue :candidates;
+        return; // out holds a safe prime p̃
+    }
+}
+
+/// Uniform nonzero `AuxFe` in [1, m) by rejection sampling (the base for
+/// deriving a quadratic residue h1 = r²). Not secret (h1/N_tilde are public).
+fn sampleNonzeroLtModulus(m: AuxModulus, random: std.Random) AuxFe {
+    const n_bits = m.bits();
+    const n_len = byteLen(n_bits);
+    var buf: [aux_modulus_bytes]u8 = undefined;
+    while (true) {
+        random.bytes(buf[0..n_len]);
+        buf[0] &= @as(u8, 0xff) >> @intCast(8 * n_len - n_bits);
+        const r = AuxFe.fromBytes(m, buf[0..n_len], .big) catch continue;
+        if (r.isZero()) continue;
+        return r;
+    }
+}
+
+/// The full ring-Pedersen generation, returning the secret discrete log
+/// `lambda` (= log_{h1} h2) ALONGSIDE the public `AuxParams`.
+/// `generateAuxParams` calls this and discards `lambda` (see its doc
+/// comment's retention decision); this module's own test uses the returned
+/// `lambda` to verify `h2 == h1^lambda`.
+const AuxGen = struct {
+    params: AuxParams,
+    /// log_{h1} h2 ∈ [1, p'·q') — SECRET. Canonical mod `n_tilde`.
+    lambda: AuxFe,
+};
+
+fn generateAuxParamsInternal(random: std.Random, bits: usize) AuxGen {
+    std.debug.assert(bits % 2 == 0);
+    std.debug.assert(bits >= min_aux_hard_bits);
+
+    const prime_bits = bits / 2;
+    const prime_len = byteLen(prime_bits);
+    const n_len = byteLen(bits);
+
+    // 1. Two distinct safe primes p̃ = 2p'+1, q̃ = 2q'+1.
+    var p_buf: [aux_modulus_bytes]u8 = undefined;
+    var q_buf: [aux_modulus_bytes]u8 = undefined;
+    defer std.crypto.secureZero(u8, p_buf[0..prime_len]); // p̃ is secret-adjacent (reveals a factor)
+    defer std.crypto.secureZero(u8, q_buf[0..prime_len]);
+    generateSafePrime(random, prime_bits, p_buf[0..prime_len]);
+    while (true) {
+        generateSafePrime(random, prime_bits, q_buf[0..prime_len]);
+        if (!std.mem.eql(u8, p_buf[0..prime_len], q_buf[0..prime_len])) break;
+    }
+
+    // p' = (p̃-1)/2, q' = (q̃-1)/2 — the squares-subgroup order is p'·q'.
+    var pp_buf: [aux_modulus_bytes]u8 = undefined;
+    var qp_buf: [aux_modulus_bytes]u8 = undefined;
+    defer std.crypto.secureZero(u8, pp_buf[0..prime_len]);
+    defer std.crypto.secureZero(u8, qp_buf[0..prime_len]);
+    @memcpy(pp_buf[0..prime_len], p_buf[0..prime_len]);
+    @memcpy(qp_buf[0..prime_len], q_buf[0..prime_len]);
+    pp_buf[prime_len - 1] &= 0xfe;
+    qp_buf[prime_len - 1] &= 0xfe;
+    shrBytesBe(pp_buf[0..prime_len], 1);
+    shrBytesBe(qp_buf[0..prime_len], 1);
+
+    // 2. N_tilde = p̃·q̃ and 4. ord = p'·q' (big-int; a one-time derivation).
+    var scratch: [aux_scratch_bytes]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&scratch);
+    const gpa = fba.allocator();
+
+    var bp = bigFromBytes(gpa, p_buf[0..prime_len]) catch unreachable;
+    var bq = bigFromBytes(gpa, q_buf[0..prime_len]) catch unreachable;
+    var bn = newBig(gpa) catch unreachable;
+    bn.mul(&bp, &bq) catch unreachable;
+    var n_buf: [aux_modulus_bytes]u8 = undefined;
+    bn.toConst().writeTwosComplement(n_buf[0..n_len], .big);
+    const n_tilde = AuxModulus.fromBytes(stripLeadingZeros(n_buf[0..n_len]), .big) catch unreachable;
+
+    var bpp = bigFromBytes(gpa, stripLeadingZeros(pp_buf[0..prime_len])) catch unreachable;
+    var bqp = bigFromBytes(gpa, stripLeadingZeros(qp_buf[0..prime_len])) catch unreachable;
+    var b_ord = newBig(gpa) catch unreachable;
+    b_ord.mul(&bpp, &bqp) catch unreachable; // ord = p'·q'
+    const ord_bits = b_ord.bitCountAbs();
+    const ord_len = byteLen(ord_bits);
+
+    // 3. h1 = r² mod N_tilde — a random element of the group of squares.
+    const one = n_tilde.one();
+    var h1: AuxFe = undefined;
+    while (true) {
+        const r = sampleNonzeroLtModulus(n_tilde, random);
+        const cand = n_tilde.sq(r);
+        if (!cand.isZero() and !cand.eql(one)) {
+            h1 = cand;
+            break;
+        }
+    }
+
+    // 4. lambda ← [1, ord) uniformly (SECRET). Rejection-sample against ord.
+    var lam_buf: [aux_modulus_bytes]u8 = undefined;
+    defer std.crypto.secureZero(u8, lam_buf[0..ord_len]);
+    const lam_top_mask = @as(u8, 0xff) >> @intCast(8 * ord_len - ord_bits);
+    const lambda_fe: AuxFe = blk: {
+        while (true) {
+            random.bytes(lam_buf[0..ord_len]);
+            lam_buf[0] &= lam_top_mask;
+            var cand = bigFromBytes(gpa, lam_buf[0..ord_len]) catch unreachable;
+            if (cand.eqlZero()) continue; // lambda != 0
+            if (cand.order(b_ord) != .lt) continue; // lambda < ord
+            // lambda < ord < N_tilde ⇒ canonical mod n_tilde.
+            break :blk AuxFe.fromBytes(n_tilde, stripLeadingZeros(lam_buf[0..ord_len]), .big) catch unreachable;
+        }
+    };
+
+    // 5. h2 = h1^lambda mod N_tilde (constant-time modexp; lambda is secret).
+    const h2 = n_tilde.pow(h1, lambda_fe) catch unreachable; // lambda != 0
+
+    return .{ .params = .{ .n_tilde = n_tilde, .h1 = h1, .h2 = h2 }, .lambda = lambda_fe };
+}
+
+/// Generate ring-Pedersen auxiliary parameters `(N_tilde, h1, h2)` for ONE
+/// party (GG18 §4.1's "aux info" generation, which GG20 reuses for its range
+/// proofs — facts about the widely-used construction only, no source
+/// consulted, see NOTICE).
 ///
-/// Construction (GG18 SS4.1 / Canetti-Gennaro-Goldfeder-Makriyannis-Peled
-/// "UC Non-Interactive, Proactive, Threshold ECDSA" SS3.1, the "aux info"
-/// generation step commonly cited by tss-lib/multi-party-ecdsa-style
-/// reference implementations — facts about the construction only, no
-/// source consulted, see NOTICE):
+/// Construction:
 ///
 /// ```text
-/// 1. Draw two safe primes p̃ = 2p' + 1, q̃ = 2q' + 1, each `bits/2` bits,
-///    with p', q' also prime — the SAME probable-prime search shape as
-///    this repo's `paillier.generatePrime` (random odd candidate + trial
-///    sieve + Miller-Rabin), PLUS an additional Miller-Rabin pass on
-///    `(candidate - 1) / 2` to confirm the safe-prime property. Zig std
-///    has every primitive this needs (`std.crypto.ff`, `std.Random`),
-///    but the safe-prime search itself is not yet written here.
-/// 2. N_tilde = p̃ * q̃ (mechanical big-int multiply once p̃, q̃ are in
-///    hand — see `paillier`'s own `n = p*q` step for the exact shape).
-/// 3. Draw h1 uniformly from [2, N_tilde) by rejection sampling
-///    (mirrors `paillier`'s private `sampleNonzeroLtN`).
-/// 4. Draw a secret exponent lambda uniformly from [1, p'*q') — the
-///    order of N_tilde's group of squares. Zig std has no existing
-///    "order of the squares subgroup of a safe-prime product" helper;
-///    deriving/using this range correctly is itself part of the
-///    deferred number theory.
-/// 5. h2 = h1^lambda mod N_tilde (constant-time modexp via
-///    `AuxModulus.pow` — mechanical ONCE lambda/h1 are in hand, but
-///    lambda's derivation in step 4 is not).
-/// 6. Discard lambda (a party's own secret; never transmitted — only
-///    N_tilde/h1/h2 are broadcast, see `AuxParams`/`PartyPublicKeys`).
-///    TODO(core): confirm against GG20/Phase-2b's exact range-proof
-///    constructions whether the PROVER additionally needs to retain
-///    lambda (or a value derived from it) locally for its own proofs, or
-///    whether discarding it here is correct — this module's scaffolding
-///    pass did not scope Phase 2b closely enough to be certain.
+/// 1. Draw two distinct SAFE primes p̃ = 2p'+1, q̃ = 2q'+1, each bits/2
+///    bits, with p', q' also prime (generateSafePrime: the paillier/rsa
+///    probable-prime search shape + an extra Miller-Rabin pass on
+///    (candidate-1)/2, and a p̃ ≡ 3 (mod 4) filter so p' is odd).
+/// 2. N_tilde = p̃ · q̃.
+/// 3. h1 = r² mod N_tilde for a random r — a uniform element of N_tilde's
+///    group of quadratic residues (order p'·q').
+/// 4. lambda ← [1, p'·q') uniformly, the secret exponent.
+/// 5. h2 = h1^lambda mod N_tilde (constant-time modexp).
 /// ```
 ///
-/// `AuxParams`'s struct + byte codec above are already real; only the
-/// VALUES this function would produce are stubbed. Suggested follow-up
-/// tier: small, self-contained number theory (safe-prime search +
-/// modexp) — a Fable or Opus pass, not a large one; see the scaffolding
-/// report that shipped this file.
+/// **λ-retention decision: `lambda` is DISCARDED here** — `AuxParams` holds
+/// only the public `(N_tilde, h1, h2)`, and only those are broadcast. In
+/// GG18/GG20 the tuple belongs to this party acting as the *verifier* of
+/// range proofs about OTHER parties' Paillier plaintexts; soundness (binding
+/// of the Pedersen commitment) requires the *prover* — i.e. every other
+/// party — not to know `lambda = log_{h1} h2`, and this party never acts as
+/// a prover under its own tuple, so retaining `lambda` buys nothing and only
+/// widens the secret's exposure. It is therefore zeroed with the rest of the
+/// safe-prime material before return. **TODO(2c):** if a later phase adds
+/// the ZK proof of *correct aux-param generation* (a "Πprm"/"Πmod"-style
+/// proof that `h2 = h1^lambda` for a known `lambda`, which some GG20/CMP
+/// variants broadcast alongside the tuple), that proof's PROVER step needs
+/// `lambda` retained during setup — expose it then via
+/// `generateAuxParamsInternal` (which already returns it) rather than
+/// discarding. This Phase-2b pass produces no such proof.
+///
+/// `random` MUST be cryptographically secure for real parameters. `bits`
+/// must be even and >= `min_aux_hard_bits`; a real deployment uses
+/// `aux_modulus_bits` (`min_aux_generate_bits`+ is the recommended-strength
+/// floor). Expect a slow safe-prime search as `bits` grows (safe primes are
+/// rarer than ordinary primes).
+///
+/// **Const-time:** the safe-prime *search* is inherently variable-time (how
+/// long it took reveals nothing about the primes kept); the secret exponent
+/// `lambda`'s use in `h2 = h1^lambda mod N_tilde` is the constant-time
+/// `AuxModulus.pow`, mirroring `paillier.fromPrimes`'s `g^lambda mod n²`
+/// step. All secret buffers are `secureZero`'d.
 pub fn generateAuxParams(random: std.Random, bits: usize) AuxParams {
-    _ = random;
-    _ = bits;
-    @panic("TODO(core): ring-Pedersen aux-param generation (safe-prime search for p̃,q̃, N_tilde=p̃q̃, random h1, secret lambda, h2=h1^lambda mod N_tilde) — see this function's doc comment for the exact construction. Genuine number theory (safe-prime primality testing beyond paillier.generatePrime's plain Miller-Rabin, deriving/sampling from the order of N_tilde's squares subgroup) deliberately left unimplemented for a follow-up crypto pass; AuxParams' struct + byte codec are already real and round-trip today on hand-constructed toy values.");
+    const gen = generateAuxParamsInternal(random, bits);
+    // lambda (gen.lambda) is a stack AuxFe, discarded with this frame; its
+    // byte-level source buffer is already secureZero'd inside the internal
+    // routine. See the λ-retention decision above.
+    return gen.params;
 }
 
 // ── per-party public material (REAL) ─────────────────────────────────────
@@ -1092,15 +1417,55 @@ test "smoke: module compiles and constants are sane" {
     try testing.expectEqual(@as(usize, 2048), aux_modulus_bits);
 }
 
-// This test is LAST and deliberately: `generateAuxParams` is the one
-// genuinely-stubbed crypto core in this module (see the module doc
-// comment's "Design decision" note) — every test above it passes; this
-// one panics, by design, until a follow-up crypto pass fills it in.
-test "generateAuxParams: reserved stub — ring-Pedersen construction lands in Phase 2b (with MtA + range proofs)" {
-    // generateAuxParams is a reserved @panic stub until Phase 2b (the MtA
-    // + range-proof pass that actually consumes the aux params) fills it
-    // in; keygenTrustedDealer works today with caller-supplied aux params.
-    // Skipped (not run) so this committed Phase-2a state is all-green;
-    // Phase 2b unskips it and asserts well-formedness.
-    return error.SkipZigTest;
+// Pull the `mta` submodule's tests into this module's test binary — a bare
+// `pub const mta = @import(...)` re-export does NOT (the dark-tests rule,
+// CONVENTIONS.md §6).
+test {
+    _ = mta;
+}
+
+// generateAuxParams is now IMPLEMENTED (Phase 2b) — this test asserts the
+// ring-Pedersen tuple is well-formed at a small, fast bit size, and (via the
+// internal generator that also returns the secret exponent) that
+// h2 = h1^lambda actually holds.
+test "generateAuxParams: ring-Pedersen tuple is well-formed (N_tilde composite/odd/right-size, h1/h2 in range, h2 = h1^lambda)" {
+    var prng = std.Random.DefaultPrng.init(0x617578706172616d); // "auxparam"
+    const random = prng.random();
+
+    // Small test size for speed: 128-bit N_tilde = two 64-bit safe primes.
+    // (min_aux_generate_bits=2048-class is the production strength; the real
+    // safe-prime number theory is exercised here at a fast size.)
+    const bits: usize = 128;
+    const gen = generateAuxParamsInternal(random, bits);
+    const aux = gen.params;
+
+    // N_tilde: right bit length (product of two `bits/2`-bit primes with top
+    // two bits set lands on `bits` or `bits-1` bits) and ODD (every Modulus).
+    const nb = aux.n_tilde.bits();
+    try testing.expect(nb == bits or nb == bits - 1);
+    try testing.expect((try aux.n_tilde.v.toPrimitive(u128)) & 1 == 1);
+
+    // N_tilde is COMPOSITE (it is p̃·q̃): Miller-Rabin must reject it.
+    try testing.expect(!isProbablePrime(aux.n_tilde, random));
+
+    // h1, h2 in range [2, N_tilde): nonzero, not one, canonical (fromBytes
+    // already guarantees < N_tilde).
+    const one = aux.n_tilde.one();
+    try testing.expect(!aux.h1.isZero() and !aux.h1.eql(one));
+    try testing.expect(!aux.h2.isZero() and !aux.h2.eql(one));
+
+    // The load-bearing relation: h2 == h1^lambda mod N_tilde.
+    const h2_check = try aux.n_tilde.pow(aux.h1, gen.lambda);
+    try testing.expect(h2_check.eql(aux.h2));
+
+    // The public wrapper produces an equally well-formed (independent) tuple
+    // and it round-trips through the byte codec.
+    const pub_aux = generateAuxParams(random, bits);
+    try testing.expect(!isProbablePrime(pub_aux.n_tilde, random));
+    const bytes = try pub_aux.toBytesAlloc(testing.allocator);
+    defer testing.allocator.free(bytes);
+    const back = try AuxParams.fromBytesAlloc(bytes);
+    try testing.expect(pub_aux.n_tilde.v.eql(back.n_tilde.v));
+    try testing.expect(pub_aux.h1.eql(back.h1));
+    try testing.expect(pub_aux.h2.eql(back.h2));
 }

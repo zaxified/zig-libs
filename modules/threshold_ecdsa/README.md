@@ -1,23 +1,32 @@
 # threshold_ecdsa
 
-Pure-Zig GG20 threshold-ECDSA over secp256k1. **This module is Phase 2a of a
-3-part arc: trusted-dealer keygen** (2a, this module) → MtA + range proofs
-(2b) → threshold signing (2c). Consumer: MPC custody (an ECDSA key whose
-signing authority is split across `t`-of-`n` parties, none of whom ever holds
-the whole key).
+Pure-Zig GG20 threshold-ECDSA over secp256k1. **This module covers Phase 2a
+(trusted-dealer keygen) + Phase 2b (ring-Pedersen aux params + the
+semi-honest MtA core)** of the arc: keygen (2a) → aux-params/MtA (2b) → range
+proofs + MtAwc (2c) → threshold signing (2d). Consumer: MPC custody (an ECDSA
+key whose signing authority is split across `t`-of-`n` parties, none of whom
+ever holds the whole key).
 
-**Status: scaffold.** The Shamir-secret-sharing + Feldman-VSS +
-Lagrange-interpolation core (`splitSecretKey`, `groupPublicKey`,
-`derivePublicKeyShare`, `reconstructSecret`) and the Paillier-keygen wiring
-inside `keygenTrustedDealer` are REAL — direct ports of this repo's
-already-KAT-validated `frost`/`bls12_381.threshold` constructions onto
-`std.crypto.ecc.Secp256k1`. One piece is genuinely stubbed:
-`generateAuxParams` (deriving the ring-Pedersen auxiliary parameters
-Phase-2b/2c's zero-knowledge range proofs need) is real, non-mechanical
-number theory — `@panic("TODO(core): ...")`, full construction in that
-function's doc comment. `zig build test-threshold_ecdsa`: **9/10 tests pass**
-in both Debug and ReleaseFast; the 10th (`generateAuxParams`'s own dedicated
-test, deliberately last) panics by design — see SPEC.md.
+**Status: keygen + aux-params + MtA implemented.** The Shamir-secret-sharing
++ Feldman-VSS + Lagrange-interpolation core (`splitSecretKey`,
+`groupPublicKey`, `derivePublicKeyShare`, `reconstructSecret`) and the
+Paillier-keygen wiring inside `keygenTrustedDealer` are direct ports of this
+repo's already-KAT-validated `frost`/`bls12_381.threshold` constructions onto
+`std.crypto.ecc.Secp256k1`. `generateAuxParams` derives the ring-Pedersen
+auxiliary parameters `(N_tilde, h1, h2)` via a real safe-prime search
+(p̃ = 2p'+1 with p' also prime) — see its doc comment. `mta` (the
+`mtaAliceInit`/`mtaBobResponse`/`mtaAliceFinalize` protocol) is the
+semi-honest multiplicative→additive share conversion: `α + β ≡ a·b (mod q)`,
+built on `paillier`'s homomorphic ops. `zig build test-threshold_ecdsa`:
+**14/14 tests pass** in both Debug and ReleaseFast (correctness net =
+`α+β = a·b` over many random inputs + edge cases + a real-keygen composition;
+`generateAuxParams` well-formedness incl. `h2 = h1^lambda`).
+
+**Not yet (later phases):** the GG20 zero-knowledge range proofs / MtAwc
+check that make MtA secure against a *malicious* party (Phase 2c — they
+consume `AuxParams` as their Pedersen commitment base), and the threshold
+signing rounds (Phase 2d). The MtA core here is correct but **semi-honest
+only**.
 
 - **Model after:** R. Gennaro, S. Goldfeder, "One Round Threshold ECDSA with
   Identifiable Abort" (GG20, IACR ePrint 2020/540); GG18 (ePrint 2019/114)
@@ -50,11 +59,11 @@ const coefficients: []const tecdsa.Scalar = ...; // length t-1
 //    deployment; paillier.fromPrimes for reproducible KATs).
 const paillier_keys: []const paillier.KeyPair = ...; // length n
 
-// 3. Each party's ring-Pedersen aux params. generateAuxParams is STUBBED
-//    today — see SPEC.md; callers must supply these themselves for now
-//    (e.g. hand-constructed toy values for tests, as this module's own
-//    tests do).
+// 3. Each party's ring-Pedersen aux params, from generateAuxParams
+//    (per-party; slow safe-prime search — use aux_modulus_bits in
+//    production). Kept caller-supplied so keygen doesn't pay for the search.
 const aux_params: []const tecdsa.AuxParams = ...; // length n
+// e.g.: for each party i: aux_params[i] = tecdsa.generateAuxParams(rng, tecdsa.aux_modulus_bits);
 
 const key_shares = try tecdsa.keygenTrustedDealer(
     allocator, t, n, secret_key, coefficients, paillier_keys, aux_params,
@@ -81,12 +90,13 @@ deployment never calls it.
 
 ## Backlog
 
-- `generateAuxParams`: the ring-Pedersen number theory (safe-prime search +
-  modexp) — see SPEC.md "Phase-2a boundary" and the function's own doc
-  comment for the exact construction to transcribe.
-- Phase 2b (separate later module): MtA (multiplicative-to-additive share
-  conversion) + the GG20 zero-knowledge range proofs that consume
-  `AuxParams`/`paillier` ciphertexts.
-- Phase 2c (separate later module): the actual threshold-signing protocol.
+- Phase 2c: the GG20 zero-knowledge range proofs + MtAwc check that upgrade
+  the semi-honest `mta` core to malicious security (they consume `AuxParams`
+  as their Pedersen commitment base). See `mta.zig`'s `TODO(2c)` notes.
+- Phase 2d: the actual threshold-signing protocol (the interactive rounds
+  that turn a message + `KeyShare`s + MtA outputs into one ECDSA signature).
 - Full Pedersen-style distributed key generation (no single dealer ever
   learns the group secret key) — this module is trusted-dealer only.
+- `generateAuxParams` aux-param-correctness ZK proof (Πprm/Πmod): if a later
+  variant broadcasts a proof that `h2 = h1^lambda`, retain `lambda` at setup
+  (`generateAuxParamsInternal` already returns it) instead of discarding.
