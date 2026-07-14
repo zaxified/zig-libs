@@ -79,8 +79,6 @@
 //! `verifyBobMtaWc` cover the "MtAwc" variant (Bob additionally proves
 //! his `b` matches the public `B = b·G`).
 //!
-//! ⚠ **KNOWN PARAMETERIZATION GAP (2d-blocking, do not ship sign
-//!
 //! ## Const-time posture
 //!
 //! MtA touches secrets `a`, `b`, `α`, `β`, `β'` and Alice's Paillier secret
@@ -251,8 +249,23 @@ fn samplePaillierRandomness(pk: paillier.PublicKey, random: std.Random) paillier
     while (true) {
         random.bytes(buf[0..n_len]);
         buf[0] &= @as(u8, 0xff) >> @intCast(8 * n_len - n_bits);
-        const r = paillier.Fe.fromBytes(pk.n_sq, buf[0..n_len], .big) catch continue;
-        if (r.isZero()) continue;
+        // Bug fix (surfaced by `signing.zig`'s end-to-end driver, which runs
+        // this sampler far more often per test than any prior caller): a
+        // masked n_bits-wide draw is only < 2^n_bits, NOT necessarily < N —
+        // this function's own doc comment promises `[1, pk.n)`. Checking
+        // canonicality mod `pk.n_sq` alone (as this used to do) is nearly a
+        // no-op (n_sq is ~2·n_bits wide, so it accepts almost everything,
+        // including values in [N, 2^n_bits)) and was silently violating the
+        // "r_a/r_b < N" witness precondition `zkproofs.zig`'s
+        // `proveAliceRangeInner`/`proveBobInner` document and rely on
+        // (`catch unreachable` on that exact invariant) — with real random
+        // 1024-bit keys this fires often enough (observed ~10% of draws) to
+        // crash real signing runs. Fix: reject-sample against `pk.n` itself
+        // (canonicality mod N IS "< N"), THEN re-encode the same bytes mod
+        // `n_sq` (always canonical there once it's `< N < n_sq`).
+        const in_range = paillier.Fe.fromBytes(pk.n, buf[0..n_len], .big) catch continue;
+        if (in_range.isZero()) continue;
+        const r = paillier.Fe.fromBytes(pk.n_sq, buf[0..n_len], .big) catch unreachable; // < N < n_sq: always canonical
         return r;
     }
 }

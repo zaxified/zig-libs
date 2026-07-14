@@ -25,6 +25,31 @@ implementation, clean-room from two public IACR ePrint papers:
     `verifyAliceRange`/`proveBobMta`/`verifyBobMta`/`proveBobMtaWc`/
     `verifyBobMtaWc` doc comments target.
 
+**Phase 2d (`signing.zig`) provenance.** The online signing protocol
+(`signWithShares` and its round-by-round construction: `k_i`/`γ_i`/`w_i`
+sampling, the Γ commit-reveal, the pairwise checked-MtA/MtAwc invocation
+pattern, `δ`/`R`/`r` derivation, `s_i`/`s` computation, low-S
+normalization, and the fail-closed final self-check) was implemented
+against GG20 (ePrint 2020/540)'s overall signing-protocol SHAPE (the
+MtA-driven `k·γ`/`k·x` share-conversion structure GG18 §4 and GG20 both
+document) — no specific paper section's exact round numbering or message
+formats were transcribed; this is this module's own composition of its
+ALREADY-implemented Phase 2b/2c primitives (`mta`/`zkproofs`), not a
+port of any external signing-round implementation. The Γ commit-reveal's
+knowledge-of-exponent proof (`signing.SchnorrProof`) is the well-known
+textbook non-interactive Schnorr Sigma protocol for discrete-log knowledge
+— common cryptographic folklore, not itself copyrightable, and NOT
+transcribed from GG20's own `Πzk` formalization (that section of the paper
+was not consulted for this pass — see `signing.zig`'s module doc comment
+and `SPEC.md`'s Phase 2d section for the resulting "not verified
+byte-for-byte against the paper's exact instantiation" caveat). GG20 §4's
+actual identifiable-abort culprit-naming apparatus was deliberately NOT
+implemented (left `@panic`-stubbed as `signing.identifyAbortCulprit`,
+referencing the paper section by name only — no attempt was made to guess
+its construction without reading it). The FINAL verification target,
+`std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256`, is Zig's own standard-library
+ECDSA implementation, used via its public API only.
+
 Both are public specifications/papers, not copyrightable works (merger
 doctrine — see `CONVENTIONS.md` §5) — no NOTICE entry is strictly required
 for citing them, but is included here for provenance clarity given the
@@ -90,18 +115,23 @@ module.
 
 No GPL/LGPL/AGPL source was consulted or copied anywhere in this module.
 
-**Status: keygen + aux-params + MtA + Phase-2c range proofs implemented.**
-The Shamir/Feldman/Lagrange keygen core, the Paillier-keygen wiring, the
-ring-Pedersen `generateAuxParams` safe-prime number theory, and the
-semi-honest MtA share conversion (`mta.zig`) are all real and
-self-consistency-tested. Phase 2c (`zkproofs.zig` + `mta.zig`'s
-`mtaAliceInitChecked`/`mtaBobResponseChecked`/`mtaAliceFinalizeChecked`) —
-the GG18 Appendix A zero-knowledge MtA range proofs (STRUCTS, byte codecs,
-Fiat-Shamir transcript, the six prove/verify functions, and the fail-closed
-checked-MtA control flow) — is now all real and tested (verified against the
-paper; see the Phase-2c provenance note above). `zig build
-test-threshold_ecdsa`: 31/31 tests pass, 0 panics, in both Debug and
-ReleaseFast. The threshold signing rounds (Phase 2d) remain out of scope —
-see `SPEC.md`'s boundary and backlog sections. External cryptographic review
-of `zkproofs.zig` against GG18 Appendix A is recommended before production
-signing use.
+**Status: keygen + aux-params + MtA + Phase-2c range proofs + Phase-2d
+online signing all implemented.** The Shamir/Feldman/Lagrange keygen core,
+the Paillier-keygen wiring, the ring-Pedersen `generateAuxParams`
+safe-prime number theory, and the semi-honest MtA share conversion
+(`mta.zig`) are all real and self-consistency-tested. Phase 2c
+(`zkproofs.zig` + `mta.zig`'s `mtaAliceInitChecked`/`mtaBobResponseChecked`/
+`mtaAliceFinalizeChecked`) — the GG18 Appendix A zero-knowledge MtA range
+proofs (STRUCTS, byte codecs, Fiat-Shamir transcript, the six prove/verify
+functions, and the fail-closed checked-MtA control flow) — is real and
+tested (verified against the paper; see the Phase-2c provenance note
+above). Phase 2d (`signing.zig`) composes 2b/2c into the full online
+signing protocol; its decisive test chains trusted-dealer keygen through
+signing to a real `std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256` verification
+and PASSES. The one deliberate Phase-2d scope cut — GG20's identifiable-
+abort culprit-naming apparatus, `@panic`-stubbed as
+`signing.identifyAbortCulprit` — is documented in `SPEC.md`'s Phase-2d
+section and does not affect the "never return an invalid signature"
+invariant. External cryptographic review of `zkproofs.zig` (and, by
+extension, `signing.zig`, which is built entirely on it) against GG18
+Appendix A is recommended before production signing use.

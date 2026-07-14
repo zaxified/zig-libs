@@ -74,6 +74,19 @@ pub const mta = @import("mta.zig");
 /// into the fail-closed checked-MtA flow.
 pub const zkproofs = @import("zkproofs.zig");
 
+/// **Phase 2d** — the GG20 online threshold-ECDSA SIGNING protocol: ties
+/// keygen (this file) + MtA (`mta`) + the range proofs/MtAwc (`zkproofs`)
+/// into a `t`-of-`n` signature that is a STANDARD secp256k1 ECDSA
+/// signature, verifiable under `std.crypto.sign.ecdsa
+/// .EcdsaSecp256k1Sha256` against `KeyShare.group_public_key`. Round
+/// orchestration, the MtA/MtAwc wiring, and the signature arithmetic are
+/// all REAL (`signWithShares` genuinely produces a verifying signature,
+/// end to end); the GG20 identifiable-abort culprit-naming apparatus is a
+/// documented, deliberate scope cut ("abort-only v1" — never returns a bad
+/// signature, but cannot name a culprit on abort) — see `signing.zig`'s
+/// module doc comment.
+pub const signing = @import("signing.zig");
+
 pub const meta = .{
     .platform = .any,
     .role = .util, // pure computation (no I/O of its own)
@@ -1491,4 +1504,13 @@ test "generateAuxParams: ring-Pedersen tuple is well-formed (N_tilde composite/o
 // `zkproofs.zig`'s tests pass — nothing here panics any more.
 test {
     _ = zkproofs;
+}
+
+// Pull the `signing` submodule's tests into this module's test binary —
+// same dark-tests rule. Phase 2d's `signWithShares` is REAL end to end
+// (its decisive std-ECDSA-verify test PASSES, does not panic); only
+// `identifyAbortCulprit` (not exercised by any test — it always panics by
+// design) represents deferred work. See `signing.zig`'s module doc comment.
+test {
+    _ = signing;
 }

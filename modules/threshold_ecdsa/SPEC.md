@@ -7,12 +7,12 @@ Attribution/provenance: see ./README.md "Provenance" + ./NOTICE.
 
 **Phase 2a (trusted-dealer keygen) + Phase 2b (ring-Pedersen aux params +
 the semi-honest MtA core) + Phase 2c (MtA zero-knowledge range proofs,
-GG18 Appendix A, verified against the paper) of the GG20 threshold-ECDSA
-arc** (2a keygen → 2b aux-params/MtA →
-2c range proofs + MtAwc → 2d signing), over secp256k1
+GG18 Appendix A, verified against the paper) + Phase 2d (online signing,
+`signing.zig`) of the GG20 threshold-ECDSA arc** (2a keygen → 2b
+aux-params/MtA → 2c range proofs + MtAwc → 2d signing), over secp256k1
 (`std.crypto.ecc.Secp256k1`, scalar field `Scalar` = Zq for q the group
-order). See the dedicated "Phase 2c" section below for that layer's design
-and status.
+order). See the dedicated "Phase 2c" and "Phase 2d" sections below for
+those layers' design and status.
 
 **Trusted-dealer model ONLY.** A single dealer holds the plaintext group
 ECDSA secret key `x`, Shamir-splits it into `n` shares (degree-`(t-1)`
@@ -26,9 +26,10 @@ complaint/justification sub-protocol, no single party ever learns `x`) is
 explicitly OUT OF SCOPE — a distinct follow-up module, not merely a
 different `splitSecretKey` signature.
 
-**What's implemented (all REAL, `zig build test-threshold_ecdsa`: 31/31
+**What's implemented (all REAL, `zig build test-threshold_ecdsa`: 39/39
 pass, 0 panics, in both Debug and ReleaseFast — Phase 2c's prove/verify
-number theory is now implemented and tested, see that section below):**
+number theory AND Phase 2d's online signing are now implemented and
+tested, see the dedicated sections below):**
 
 - **Keygen core** — `Element` (SEC1-compressed secp256k1 point codec),
   `scalarFromIndex`/`evalPolynomialAt` (Shamir, Horner's method over Zq),
@@ -306,6 +307,124 @@ weakened.
 - `generateAuxParams`'s own correctness proof (Πprm/Πmod, `h2 = h1^lambda`)
   remains a SEPARATE deferred item from Phase 2a — see below.
 
+## Phase 2d — online signing (`signing.zig`, REAL end to end)
+
+**Design.** GG20's headline result is a ONE-ROUND online signing protocol
+(after a preprocessing phase this module folds into the online path, same
+simplification tss-lib's "one-round" mode makes) that turns a message plus
+a `t`-subset of `KeyShare`s into a standard secp256k1 ECDSA signature. This
+module implements it as a single in-process driver,
+`signing.signWithShares(allocator, shares, message, random) -> Signature`,
+that runs every round over in-memory message passing rather than real
+network I/O (documented as a v1 simplification — "good enough to prove
+correctness + for the decisive test", per this module's task brief; see
+`signing.zig`'s module doc comment for the phase-by-phase construction):
+
+1. Each party samples `k_i, γ_i ← Zq` and computes its Lagrange-weighted
+   secret share `w_i = λ_i·x_i` (`λ_i` from `signing.lagrangeCoefficient`,
+   the SAME Lagrange-at-zero weights `reconstructSecret` uses internally,
+   chosen so `Σ_{i∈S} w_i = x` without ever reconstructing `x`).
+2. Each party computes `Γ_i = γ_i·G`, commits to it (SHA-256 hash), and
+   proves knowledge of `γ_i` via a standard Fiat-Shamir Schnorr NIZK
+   (`signing.SchnorrProof`/`provePoK`/`verifyPoK`) — every other party
+   verifies the commitment + proof before trusting `Γ_i`. This closes the
+   "last-mover" attack where a rushing party picks its `Γ_i` AFTER seeing
+   everyone else's, to bias the aggregated `R`.
+3. For every ORDERED pair `(i,j)`, `i≠j`, in the signing subset: the REAL
+   Phase-2c CHECKED MtA (`mta.mtaAliceInitChecked`/`mtaBobResponseChecked`/
+   `mtaAliceFinalizeChecked` + `zkproofs.proveAliceRange`/`verifyAliceRange`/
+   `proveBobMta`, GG18 Appendix A.1/A.3) converts `k_i·γ_j` into additive
+   shares, and the REAL CHECKED **MtAwc** (`zkproofs.proveBobMtaWc`/
+   `verifyBobMtaWc`, Appendix A.2) converts `k_i·w_j` into additive shares
+   bound to `j`'s PUBLIC Lagrange-weighted verifying share `W_j = λ_j·X_j`
+   — this is exactly where MtAwc (vs. plain MtA) is invoked, resolving the
+   open question the Phase-2c section below used to leave dangling. Summing
+   every party's diagonal term (`k_i·γ_i`/`k_i·w_i`) plus every pairwise
+   `α`/`β` share yields `δ_i`/`σ_i` with `Σδ_i = k·γ` and `Σσ_i = k·x` (the
+   standard telescoping-sum identity: for `Σ_i δ_i` to equal `Σ_{i,j} k_i·γ_j
+   = (Σk_i)(Σγ_j) = k·γ`, every ordered pair's `α_{ij} + β_{ij} = k_i·γ_j`
+   contribution must appear on exactly one side of exactly one party's sum —
+   see `signing.zig`'s module doc comment for the full derivation).
+4. `δ = Σδ_i` is revealed in the clear (a sum of already-additive shares,
+   no MtA needed to open it) → `δ⁻¹` → `R = (Σ Γ_i)^{δ⁻¹} = k⁻¹·G` →
+   `r = R.x mod q` (the SAME wide-reduction `std.crypto.sign.ecdsa`'s own
+   `Verifier.init` uses for its `r`/`s` canonicalization, so this module's
+   `r` and std's recomputed `r` are bit-for-bit comparable).
+5. Each party computes `s_i = m·k_i + r·σ_i` (`m` = the message SHA-256
+   digest reduced into `Zq` via the exact same wide-reduction
+   `std.crypto.sign.ecdsa`'s `Signer.finalizePrehashed` uses internally —
+   `signing.zig`'s local `scalarFromHash32` replicates it byte-for-byte) and
+   reveals it; `s = Σs_i`, normalized to the smaller of `{s, q-s}`
+   (canonical/low-S, BIP-62 convention).
+6. **Fail-closed self-check.** Before returning, `signWithShares` verifies
+   its own `(r,s)` against `group_public_key` via
+   `std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256.Signature.verify` — on any
+   failure it returns `error.SigningAborted` rather than an invalid
+   signature. This is a HARD invariant, tested directly (the decisive test
+   chains keygen → signing → std-ECDSA-verify).
+
+**The decisive test** (`signing.zig`, "decisive test — keygen(2,3) -> sign
+over 2 shares -> verifies under std EcdsaSecp256k1Sha256"): runs
+`root.keygenTrustedDealer(2, 3, ...)`, signs a message over 2 of the 3
+resulting `KeyShare`s via `signWithShares`, and asserts the output
+genuinely verifies under `std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256
+.Signature.verify` against `group_public_key`. This chains the WHOLE arc
+(Shamir/Feldman keygen → Paillier/ring-Pedersen aux params → checked
+MtA/MtAwc with real GG18 Appendix A proofs → the signing arithmetic) to
+real standard-library ECDSA correctness — the same "chain the whole arc to
+a real external verifier" pattern this repo's `threshold_bls` uses against
+`bls_sig`. It PASSES (does not panic) — Phase 2d is not a scaffold.
+
+**Identifiable-abort scope — the one deliberate, documented cut.** GG20's
+distinguishing contribution over GG18 is naming a culprit on failure, not
+just aborting. This module implements the weaker **"abort-only v1"**: every
+check it performs IS fail-closed (a cheating party can never cause a bad
+signature to be returned — only an error), but it does NOT close the
+specific residual gap of a party using an INCONSISTENT `k_i`/`γ_i`/`w_i`
+across different pairwise MtA sessions (each pairwise range/MtA proof
+attests only to that ONE session's witness in isolation — nothing here
+proves the SAME `k_i` was used in every session a party participates in).
+If that happens, step 6's self-check will (overwhelmingly likely) catch the
+resulting bad `(r,s)` and abort — so the "never return an invalid
+signature" integrity invariant holds regardless — but honest parties learn
+only THAT something was inconsistent, not WHO. Closing this (GG20 §4's
+actual "Identifiable Abort" rounds: retaining every pairwise MtA transcript
+and, on failure, an opening/decommitment sub-protocol that names a culprit)
+is left as `signing.identifyAbortCulprit`, `@panic`-stubbed with the
+construction referenced (not transcribed — this scaffold pass did not have
+that section of the paper open; see the function's own doc comment).
+
+**Const-time posture.** `k_i`/`γ_i`/`w_i`/`s_i` and every MtA/MtAwc
+intermediate are SECRET and flow entirely through already-constant-time
+primitives this module established in Phase 2b/2c (`Scalar.add`/`.mul`/
+`.invert`, `paillier`'s constant-time `pow`/homomorphic ops, `ff`'s
+constant-time `powWithEncodedExponent`) — `signing.zig` introduces no new
+secret-touching arithmetic beyond composing those calls and the Schnorr
+NIZK's own nonce/response (`k + e·γ`, plain `Scalar` ops). The ONE
+variable-time step specific to this file is the rejection-sampling retry
+loop in `provePoK` (redraws only on the astronomically-rare `IdentityElement`
+case, and the loop's own timing reveals nothing about `γ_i` — same posture
+as every other rejection sampler in this module). Inherited variable-time
+steps (Paillier's `L`-function division inside `decrypt`, safe-prime
+search) are documented in their own sections above, not repeated here.
+
+**Bug found and fixed by this pass:** `mta.zig`'s private
+`samplePaillierRandomness` (used by `mtaAliceInitChecked`/
+`mtaBobResponseChecked` to sample the fresh Paillier blinding factors
+`r_a`/`r_b`) checked canonicality mod `pk.n_sq` only, which is nearly a
+no-op (`n_sq` is roughly twice `n`'s bit width, so it accepts almost any
+masked `n_bits`-wide draw) — silently violating its own documented `[1,
+pk.n)` contract and the "`r_a`/`r_b` < N" witness precondition
+`zkproofs.zig`'s `proveAliceRangeInner`/`proveBobInner` rely on via `catch
+unreachable`. With small/fixed-seed test keys this rarely fired; `
+signing.zig`'s end-to-end driver, which calls this sampler far more often
+per test run than any prior caller, hit it reliably (~1 in 10 draws with
+real 1024-bit keys) and crashed. Fixed by rejection-sampling against `pk.n`
+itself before re-encoding the same (now provably in-range) bytes canonical
+mod `pk.n_sq` — see the function's updated doc comment. This is a
+correctness fix to already-existing Phase-2c wiring, not new Phase-2d
+scope; flagged here since it was surfaced by this pass.
+
 ## Phase 2a / 2b / 2c / 2d boundary
 
 - **Phase 2a (done, this module):** trusted-dealer Shamir+Feldman keygen,
@@ -322,18 +441,32 @@ weakened.
   Structs/transcript/wiring AND the six prove/verify functions are real and
   tested (self-consistency + reject contract; pending external review — see
   the section above).
-- **Phase 2d (out of scope, later):** the actual threshold ECDSA signing
-  protocol — the interactive rounds that turn a message + the parties'
-  `KeyShare`s + Phase-2c's CHECKED MtA outputs into a single valid ECDSA
-  signature verifiable under `KeyShare.group_public_key`, including where
-  MtAwc specifically gets invoked (the `k·x` share conversion).
+- **Phase 2d (IMPLEMENTED, this module — `signing.zig`):** the online
+  threshold-ECDSA signing protocol — the rounds that turn a message + the
+  parties' `KeyShare`s + Phase-2c's CHECKED MtA/MtAwc outputs into a single
+  valid ECDSA signature verifiable under `KeyShare.group_public_key` via
+  `std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256`. Round orchestration, the
+  MtA/MtAwc wiring (including exactly where MtAwc gets invoked — the `k·x`
+  share conversion, bound to each party's public verifying share), and the
+  signature arithmetic (`δ`/`R`/`r`/`s_i`/`s`) are all REAL; the
+  identifiable-abort CULPRIT-NAMING layer is a documented "abort-only v1"
+  scope cut (see the dedicated Phase 2d section above).
 
 ## Backlog / deferred
 
 - Phase 2c: independent cryptographic review of `zkproofs.zig`'s implemented
   constructions against GG18 Appendix A before production use (see the
-  dedicated Phase 2c section above for the verification-level breakdown).
-- Phase 2d: the threshold-signing protocol.
+  dedicated Phase 2c section above for the verification-level breakdown) —
+  Phase 2d inherits this same residual audit debt, since `signing.zig` is
+  built entirely on `zkproofs.zig`'s checked MtA/MtAwc.
+- Phase 2d: GG20's full identifiable-abort culprit-naming apparatus
+  (`signing.identifyAbortCulprit`, `@panic`-stubbed) — see the dedicated
+  Phase 2d section above for the exact boundary of what "abort-only v1"
+  does and does not cover.
+- Phase 2d's Γ commit-reveal knowledge proof (`signing.SchnorrProof`) is a
+  standard textbook Fiat-Shamir Schnorr NIZK, not verified byte-for-byte
+  against GG20's own `Πzk` instantiation (this scaffold pass did not have
+  that section of the paper open) — flagged for an independent check.
 - `generateAuxParams` aux-param-correctness ZK proof (Πprm/Πmod): if a later
   variant broadcasts a proof that `h2 = h1^lambda`, retain `lambda` at setup
   (`generateAuxParamsInternal` already returns it) instead of discarding —
