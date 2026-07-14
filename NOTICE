@@ -588,4 +588,28 @@ project git history).
                falcon1024-KAT.rsp vectors are used purely as the test oracle
                (SHA-256 of each .rsp file recorded in the module's SPEC.md).
 
+  paillier   — clean-room from the public Paillier 1999 paper (P. Paillier,
+               "Public-Key Cryptosystems Based on Composite Degree
+               Residuosity Classes", EUROCRYPT 1999) — a public academic
+               publication, not a copyrightable implementation; no
+               third-party source ported or consulted for design. Crypto core
+               COMPLETE (I2 Phase 1): keygen/encrypt/decrypt/homomorphic ops
+               implemented, 16/16 Debug+ReleaseFast, `phe` toy vectors
+               value-exact. ZK proofs / MtA = Phase 2 (threshold-ECDSA).
+               Test-vector cross-check only (not a design reference): the
+               module's `round-trip`/`homomorphic properties` unit tests use
+               a small fixed toy key (p=11, q=17) with concrete
+               `(m, r) -> ciphertext` vectors independently recomputed by the
+               scaffolding agent in Python and cross-checked against `phe`
+               (python-paillier) 1.5.0, PyPI, BSD-licensed
+               (github.com/data61/python-paillier) — specifically
+               `PaillierPublicKey.raw_encrypt`/`PaillierPrivateKey.raw_decrypt`
+               called with an explicit `r_value`, which implements the same
+               `g = n+1` standard variant this module uses. No `phe` source
+               was ported; it was exercised only as a black-box vector
+               oracle for the same reason `tar`/`nft` are exercised
+               elsewhere in this repo (see policy §0) — recorded here anyway
+               since a specific version and vector-generation method is a
+               fact worth pinning for anyone re-deriving the vectors.
+
 See each module's README "Provenance" note for its specific design references.

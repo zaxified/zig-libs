@@ -11,7 +11,7 @@ cross-project-reusable capability — a production-grade implementation of a pro
 or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
 authors' other projects depend on it, not the reverse.
 
-**Status:** 110 modules · 3167 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 111 modules · 3183 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ## Using a module
@@ -138,6 +138,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `hashdigest` | Streaming digests — one-shot / incremental / file (EOF-read, size-0 `/proc` safe); SHA-256 convenience + a multi-algorithm layer (SHA-2/SHA-3/BLAKE2b/BLAKE3) | any | — |
 | `sealedbox` | NaCl `crypto_box_seal` — anonymous-sender X25519 public-key encryption (thin over `std.crypto`) + base64/hex key serialization | any | — |
 | `rsa` | Pure-Zig RSA (PKCS#1 v2.2, RFC 8017) over `std.crypto.ff` — public + CRT-private keys, PKCS1-v1_5 **and PSS** sign/verify, **OAEP** + PKCS1-v1_5 encrypt/decrypt, **keygen**, DER/PEM + **OpenSSH** (bcrypt-pbkdf) key parsing, X.509 self-signed certs; OpenSSL-KAT-validated | any | — |
+| `paillier` | **Paillier additively-homomorphic PKE** (P. Paillier, EUROCRYPT 1999) over `std.crypto.ff` — 2048-bit keygen, encrypt/decrypt via the `g = 1+n` binomial form, and the homomorphic ops `E(m₁)·E(m₂)=E(m₁+m₂)` / `addPlaintext` / `E(m)ᵏ=E(k·m)`; the L-function decrypt rejects non-unit ciphertexts fail-closed, const-time secret paths (decrypt `c^λ`, keygen). Value-exact cross-checked against `phe` (python-paillier) + exhaustive round-trip / homomorphic-property tests. The foundational sub-primitive for GG20/CMP threshold-ECDSA (Phase 2 — ZK/range proofs + MtA out of scope here) | any | — |
 | `slhdsa` | SLH-DSA (FIPS 205, standardized SPHINCS+) post-quantum stateless hash-based signatures — **all twelve parameter sets** (SHA2 + SHAKE, 128/192/256 s/f) keygen/sign/verify (WOTS+ · XMSS · hypertree · FORS), each NIST-ACVP-KAT-verified; pre-hash variants reserved | any | — |
 | `falcon` | Falcon-512 **and Falcon-1024** (FN-DSA, the NIST PQ lattice signature) — **verification + all key/signature codecs**, NIST-Round-3-KAT-verified for both parameter sets (degree-generic negacyclic NTT mod 12289, SHAKE256 hash-to-point, compressed-sig codec, sk→pk consistency); keygen/sign (ffSampling trapdoor sampler) reserved | any | — |
 | `tlsresume` | Server-side TLS 1.3 session-ticket resumption (RFC 8446 §4.2.11/§4.6.1/§7.1/§8) — `NewSessionTicket` codec + **AES-256-GCM STEK-ring** ticket seal/open (key-id-bound AAD, rotation-safe) + resumption-PSK/**binder** derivation (const-time verify) + ticket-age (de)obfuscation + single-use anti-replay register + **0-RTT early-data key schedule** (§4.2.10/§7.3: `c e traffic` / `e exp master` / early record key+iv), **byte-exact KAT vs RFC 8448 §3/§4** (incl. opening the trace's real encrypted early-data record). Engine-agnostic (owns no TLS state machine) | any | — |
