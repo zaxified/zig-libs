@@ -42,8 +42,19 @@ canonical-field-element enforcement, `blobToKzgCommitment`,
 FFT/inverse-FFT and Pippenger `G1` multi-scalar-multiplication
 primitives — byte-exact against `ethereum/c-kzg-4844`'s official KAT
 vectors across every public function (see `kzg.zig`'s module doc
-comment and `SPEC.md`). 184/184 tests pass, 0 panics, in Debug AND
-ReleaseFast (see `SPEC.md` for the design record).
+comment and `SPEC.md`). Parts 1-6: 200/200 tests pass, 0 panics, in
+Debug AND ReleaseFast (see `SPEC.md` for the design record).
+
+**Part 6 (`threshold.zig`) is COMPLETE.** Trusted-dealer threshold BLS
+— Shamir secret sharing + Feldman verifiable secret sharing (VSS) +
+Lagrange-interpolation-in-the-exponent combining — built entirely on
+Part 4's min-pk ciphersuite (a partial signature IS a `bls_sig.sign`
+call under a Shamir share; a combined signature IS an ordinary
+`bls_sig.Signature`, byte-for-byte equal to `bls_sig.sign(sk, msg)` and
+verified with the ordinary `bls_sig.verify` — which transitively pins
+the threshold path to Part 4's `ethereum/bls12-381-tests` vectors). See
+`threshold.zig`'s own module doc comment and `SPEC.md`'s "Part 6
+design" (including the const-time breakdown for the secret paths).
 
 ## The multi-part arc
 
@@ -56,7 +67,7 @@ This module is planned across several parts.
 | 3 | Hash-to-curve (RFC 9380, for hashing messages onto `G1`/`G2`) | **done** |
 | 4 | BLS signatures (draft-irtf-cfrg-bls-signature-05, min-pk/ProofOfPossession) | **done** |
 | 5 | KZG polynomial commitments (EIP-4844 / deneb) | **done** |
-| 6 | Threshold BLS (Shamir/FROST-style share aggregation) | not started |
+| 6 | Threshold BLS (trusted-dealer Shamir + Feldman VSS + Lagrange combine) | **done** |
 
 ## Import
 
@@ -127,6 +138,16 @@ const ok5 = try kzg.verifyKzgProof(commitment, z_bytes, result.y, result.proof, 
 const blob_proof = try kzg.computeBlobKzgProof(allocator, &blob, commitment, &setup);
 const ok6 = try kzg.verifyBlobKzgProof(allocator, &blob, commitment, blob_proof, &setup);
 const ok7 = try kzg.verifyBlobKzgProofBatch(allocator, &blobs, &commitments, &proofs, &setup);
+
+// Threshold BLS (Part 6 — trusted-dealer, min-pk):
+const threshold = bls12_381.threshold;
+const split = try threshold.splitSecretKey(allocator, sk, 3, 5, coeffs); // t=3-of-5, coeffs.len == t-1
+defer allocator.free(split.shares);
+defer allocator.free(split.vvec.commitments);
+const partial1 = threshold.partialSign(split.shares[0], "message"); // thin over bls_sig.sign
+const ok8 = threshold.verifyPartialSignature(threshold.derivePublicKeyShare(split.vvec, 1), "message", partial1);
+const combined = try threshold.combineSignatures(&.{ partial1, partial2, partial3 }, 3); // == bls.sign(sk, "message")
+const ok9 = bls.verify(threshold.groupPublicKey(split.vvec), "message", combined); // ordinary bls_sig.verify
 ```
 
 Deserialization (`fromBytesCompressed`/`fromBytesUncompressed`) checks
@@ -151,13 +172,14 @@ BLS pitfall; see `SPEC.md`'s threat model).
 | `kzg.zig` | Part 5: EIP-4844 KZG — `loadTrustedSetup` (memoized), `blobToKzgCommitment`/`computeKzgProof`/`verifyKzgProof`/`computeBlobKzgProof`/`verifyBlobKzgProof`/`verifyBlobKzgProofBatch`, plus `fft`/`ifft` and `g1Msm` primitives |
 | `src/data/trusted_setup.txt` | The embedded official Ethereum KZG ceremony trusted setup (`@embedFile`d by `kzg.zig`) |
 | `src/data/kzg_test_vectors/` | Two embedded `c-kzg-4844` KAT blobs (constant-2 + random #4; see `NOTICE`) |
+| `threshold.zig` | Part 6: trusted-dealer threshold BLS — `splitSecretKey`/`groupPublicKey`/`derivePublicKeyShare` (Shamir+Feldman VSS), `partialSign`/`verifyPartialSignature` (thin over `bls_sig`), `combineSignatures` (Lagrange-in-the-exponent) |
 | `root.zig` | Module entry: `meta`, re-exports, dark-tests aggregator |
 
 ## Verify
 
 ```
-zig build test-bls12_381                        # Debug — 184/184 pass
-zig build test-bls12_381 -Doptimize=ReleaseFast # ReleaseFast — 184/184 pass
+zig build test-bls12_381                        # Debug — 200/200 pass (slow: the KZG KATs dominate, several minutes)
+zig build test-bls12_381 -Doptimize=ReleaseFast # ReleaseFast — 200/200 pass (~1 min)
 zig fmt --check modules/bls12_381/
 ```
 

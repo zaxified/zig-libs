@@ -17,8 +17,10 @@ the curve. Part 4 (`bls_sig.zig`, **COMPLETE**): BLS signatures per
 draft-irtf-cfrg-bls-signature-05, minimal-pubkey-size/ProofOfPossession
 ciphersuite. Part 5 (`kzg.zig`, **COMPLETE**): EIP-4844 (deneb)
 KZG polynomial commitments over the trusted-setup ceremony's `G1`/`G2`
-points. This module does NOT implement threshold BLS — that is the
-later Part 6.
+points. Part 6 (`threshold.zig`, **COMPLETE**): trusted-dealer
+threshold BLS — Shamir secret sharing + Feldman VSS +
+Lagrange-in-the-exponent combining, over Part 4's min-pk ciphersuite —
+see "Part 6 design" below.
 
 ## Model-after + seed
 
@@ -509,6 +511,85 @@ later Part 6.
   blob, `z`, or `y` with a non-canonical element is a malformed-input
   error, not a silently-reduced one.
 
+## Part 6 design (threshold BLS — COMPLETE, crypto-core pass 2026-07-14)
+
+- **Trusted-dealer Shamir + Feldman VSS, min-pk ciphersuite, reusing
+  Part 4 wholesale.** `threshold.zig` does not introduce a new
+  ciphersuite or wire convention: `SecretKeyShare`/`PublicKeyShare`/
+  `PartialSignature` are `bls_sig.SecretKey`/`PublicKey`/`Signature`
+  plus a `u32` participant index, and `partialSign`/
+  `verifyPartialSignature` are thin wrappers over `bls_sig.sign`/
+  `bls_sig.verify` — see `threshold.zig`'s own module doc comment for
+  why BLS's linear signing equation makes this possible with NO
+  interactive round (contrast the sibling `frost` module's two-round
+  Schnorr threshold protocol, which needs `SigningNonces`/binding
+  factors/a sorted `commitment_list` precisely because Schnorr's
+  challenge is NOT linear in the secret key the way BLS's `R = SK * Q`
+  is).
+- **Mirrors `frost`'s trusted-dealer shape, not its code.** `frost.
+  trustedDealerKeygen` (RFC 9591 Appendix C.1/C.2, already REAL in that
+  module) is the direct model for `splitSecretKey`: same two-part
+  construction (Shamir `secret_share_shard` + Feldman `vss_commit`),
+  same "caller-supplied coefficients, not internally sampled" shape,
+  same `vss_commitment[0] == group_public_key` identity
+  (`groupPublicKey`). `frost.secretShareCombine`'s Lagrange-coefficient
+  formula is likewise the direct model for `combineSignatures`'s —
+  restated over this module's own `Fr`/`u32` indices in
+  `combineSignatures`'s own doc comment. Only the FIELD/GROUP the
+  arithmetic runs over differs (`Fr`/`G1`/`G2` here vs. `Secp256k1.
+  scalar`/`Secp256k1` there); the crypto-core pass (2026-07-14) ported
+  `frost.zig`'s already-KAT-validated Horner-evaluation and Lagrange-
+  interpolation loops nearly verbatim, swapping the field/group types.
+  The Lagrange coefficient formula is `frost.deriveInterpolatingValue`'s
+  exact numerator/denominator-product form:
+  `lambda_i = Π_{j != i} x_j * (x_j - x_i)^-1` over `Fr`
+  (== `Π (0 - x_j)/(x_i - x_j)`), with the division done via `Fr.inv`.
+- **Part 6 const-time choices (secret paths).**
+  - `evalPolynomialAt` (Shamir share computation — the secret `sk`, the
+    secret coefficients, AND the output share): pure `Fr.add`/`Fr.mul`
+    Horner loop, constant-time via `std.crypto.ff`'s Montgomery
+    arithmetic; loop bound and evaluation point are public.
+  - `feldmanCommitCoefficient` (`[coeff]G1` for a secret coefficient):
+    `g1.Jacobian.scalarMul`, Part 1's constant-time
+    double-and-add-always ladder — exactly `bls_sig.skToPk`'s path.
+  - `partialSign` (secret share scalar): reuses Part 4's `bls_sig.sign`
+    wholesale, i.e. `g2.zig`'s constant-time `scalarMul`.
+  - `combineSignatures`' Lagrange coefficients are computed from PUBLIC
+    participant indices only (same reasoning as `frost.
+    deriveInterpolatingValue`), but `Fr.inv` is constant-time in its
+    base anyway (Fermat via `powWithEncodedExponent`, `scalar.zig`) —
+    conservative even if a deployment treats the signer set as
+    sensitive. The `(0 - x_j)`-product's `denominator.inv()` can never
+    fail: indices are distinct nonzero `u32`s (< `r`), so every
+    `x_j - x_i` factor is a nonzero `Fr` element.
+  - `derivePublicKeyShare`/`groupPublicKey`/`verifyPartialSignature`
+    operate on public inputs only — no const-time requirement (though
+    `derivePublicKeyShare` currently reuses the constant-time
+    `scalarMul` anyway; a variable-time ladder remains a possible
+    follow-up optimization, per its doc comment).
+- **Trusted-dealer ONLY — full DKG explicitly OUT OF SCOPE.** A
+  Pedersen-style (or Gennaro–Jarecki–Krawczyk–Rabin) distributed key
+  generation, where no single party ever learns `sk`, is a materially
+  different, INTERACTIVE protocol (every participant deals shares of
+  their OWN random polynomial to every other participant, plus a
+  complaint/justification sub-round to handle a cheating dealer) — not
+  a variant of `splitSecretKey`'s signature, but a distinct module/part
+  with its own network-message shapes. Flagged here as an explicit
+  non-goal for THIS pass, for the owner to schedule separately if a
+  no-trusted-dealer deployment is ever needed.
+- **The keystone test property**: `combineSignatures` of any `>= t`
+  distinctly-indexed partials from a `splitSecretKey` dealing MUST equal
+  `bls_sig.sign(sk, msg)` byte-for-byte, and MUST verify under
+  `groupPublicKey(vvec)` via the ORDINARY `bls_sig.verify` — i.e. a
+  threshold-BLS signature is not a new, parallel signature format that
+  needs its own verifier; it inherits Part 4's entire verification
+  surface (aggregation, KAT-pinned equation, mandatory subgroup checks)
+  for free. `threshold.zig`'s wired-but-stubbed tests assert exactly
+  this chain, plus Feldman VSS-consistency (`derivePublicKeyShare`
+  agreeing with a dealt share's own `bls_sig.skToPk`) and subset-
+  independence (any two distinct `t`-sized subsets of a `(t,n)` dealing
+  combine to the identical signature).
+
 ## Threat model / limits
 
 - **The BLS subgroup-check pitfall — this module's central threat.**
@@ -640,6 +721,25 @@ later Part 6.
   of this file's primitives, not required by EIP-4844 itself); any KZG
   ceremony/setup GENERATION code (this module only ever CONSUMES a
   published setup); threshold BLS (Part 6, unaffected by Part 5's scope).
+- **Out of scope for Part 6** (see "Part 6 design" above for the
+  detailed reasoning): a full Pedersen/GJKR-style **distributed key
+  generation (DKG)** — this file is trusted-dealer ONLY; the **min-sig**
+  ciphersuite variant, for the same reason Part 4 does not implement it
+  ("Part 4 design" above); any THRESHOLD-signing-time interactivity
+  (there is none needed — the entire point of BLS's linear signing
+  equation, per `threshold.zig`'s module doc comment) beyond a signer
+  calling `partialSign` once and a combiner calling `combineSignatures`
+  once shares reach it; and identifiable-abort tooling beyond the
+  single `verifyPartialSignature` check already provided (no
+  complaint/blame sub-protocol, since there is no interactive round to
+  misbehave in). `SecretKeyShare.scalar` carries the SAME sensitivity as
+  a `bls_sig.SecretKey.scalar` (see Part 4's constant-time notes above)
+  — the stubbed `evalPolynomialAt`/`feldmanCommitCoefficient` MUST,
+  once filled in, preserve that discipline (`Fr`'s constant-time ops,
+  `g1.zig`'s constant-time `scalarMul`); `combineSignatures`'s Lagrange
+  coefficients are computed from PUBLIC indices only, so no equivalent
+  constraint applies there (same reasoning as `frost.
+  deriveInterpolatingValue`'s own threat-model note).
 
 ## Verification
 
@@ -878,6 +978,35 @@ monomial-vs-Lagrange ceremony cross-checks and a full property suite —
 see "Verification" above. `zig build test-bls12_381`: 184/184 pass, 0
 panics, Debug AND ReleaseFast.
 
+**Part 6 COMPLETE (crypto-core pass 2026-07-14).** Trusted-dealer
+threshold BLS over Part 4's min-pk ciphersuite: the four crypto cores —
+`evalPolynomialAt` (Shamir evaluation), `feldmanCommitCoefficient`
+(Feldman commit), `derivePublicKeyShare` (Feldman
+evaluate-in-the-exponent), and `combineSignatures`'s interpolation step
+(Lagrange-in-the-exponent, `frost.deriveInterpolatingValue`'s exact
+coefficient formula `lambda_i = Π_{j != i} x_j * (x_j - x_i)^-1` via
+`Fr.inv`) — implemented per the constructions quoted in each doc
+comment; see "Part 6 design" above for the const-time breakdown. The
+verification chain that pins Part 6 transitively to REAL vectors: the
+keystone tests assert `splitSecretKey` -> `partialSign` (`t` distinct
+shares) -> `combineSignatures` equals `bls_sig.sign(sk, msg)`
+BYTE-FOR-BYTE and verifies via `bls_sig.verify(groupPublicKey(vvec),
+...)` — and Part 4's `sign`/`verify` are themselves pinned to
+`ethereum/bls12-381-tests` v0.1.2. Also covered: subset-independence
+(two different 3-of-5 subsets combine to the identical signature),
+Feldman VSS-consistency (`derivePublicKeyShare(vvec, i)` ==
+`bls_sig.skToPk(share_i)` for every dealt share), partial-signature
+verification over a real dealing (accepts every honest partial against
+its VSS-derived key share; rejects wrong-share and wrong-index
+partials), the `(t=2,n=3)` and `(t=n=4)` end-to-end cases, an
+over-determined combine (4 partials of a `t=3` dealing, same
+signature), a below-threshold sanity check (2 partials of a `t=3`
+dealing interpolate a WRONG signature that fails `bls_sig.verify` —
+`t` really is the threshold), and precondition rejection
+(too-few/duplicate-index/zero-index partials, invalid `(t, n,
+coefficients)` splits). `zig build test-bls12_381`: 200/200 pass, 0
+panics, Debug AND ReleaseFast.
+
 ### Backlog (deferred)
 
 1. **The Miller-loop sparse-multiplication optimization** — a freshly
@@ -933,3 +1062,15 @@ panics, Debug AND ReleaseFast.
    copy, but avoidable); EIP-7594/PeerDAS cell proofs (explicitly out
    of scope for Part 5 itself, `SPEC.md`'s threat model — `fft`/`ifft`
    are already in place for it).
+8. **Part 6 crypto-core pass (NOT started — see Status)**: fill in
+   `evalPolynomialAt` (Shamir), `feldmanCommitCoefficient` (Feldman
+   commit), `derivePublicKeyShare` (Feldman evaluate-in-the-exponent),
+   and `combineSignatures`'s Lagrange-in-the-exponent step — each
+   stub's doc comment in `threshold.zig` already quotes the exact
+   construction, and `frost.zig`'s already-implemented Horner-
+   evaluation/Lagrange-interpolation loops are a direct porting
+   reference (same shape, different field/group — see "Part 6 design").
+   Once filled in, a full Pedersen/GJKR-style DKG (explicitly out of
+   scope for this trusted-dealer pass, "Part 6 design"/"Out of scope
+   for Part 6" above) would be a genuinely separate follow-up
+   module/part, not an extension of `threshold.zig` itself.

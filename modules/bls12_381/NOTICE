@@ -787,3 +787,62 @@ crypto core are real; byte-exact against the `ethereum/c-kzg-4844`
 vectors listed above and in the scaffold entry, in Debug and
 ReleaseFast. See `SPEC.md`'s "Part 5 design" section and `kzg.zig`'s
 own module doc comment.
+
+Part 6 (threshold.zig) — SCAFFOLD + CRYPTO-CORE PASS (both 2026-07-14)
+------------------------------------------------------------------------------------
+
+`threshold.zig` — trusted-dealer threshold BLS (Shamir secret sharing +
+Feldman verifiable secret sharing + Lagrange-interpolation-in-the-
+exponent combining), min-pk ciphersuite, built entirely on top of this
+module's own Part 4 (`bls_sig.zig`) primitives. No external
+specification is implemented wholesale here (unlike Parts 1-5, which
+each pin a single named IETF/Ethereum spec): threshold BLS via Shamir +
+Feldman VSS is textbook/folklore cryptographic construction — Shamir
+("How to Share a Secret", CACM 1979) and Feldman ("A Practical Scheme
+for Non-interactive Verifiable Secret Sharing", FOCS 1987) are the
+named foundational references, cited for provenance/completeness (both
+public, decades-old, uncopyrightable mathematical constructions — no
+source of either was consulted or ported). The Lagrange-interpolation-
+at-zero combining step, and the overall "Shamir-share the exponent,
+Feldman-commit each coefficient, recombine linearly" shape, is the same
+construction the sibling `frost` module already implements for
+threshold Schnorr (RFC 9591 Appendix C, `frost.trustedDealerKeygen`/
+`frost.secretShareCombine`) — `threshold.zig`'s constructions are
+explicitly modeled after `frost.zig`'s ALREADY-REAL, KAT-validated
+Horner-evaluation and Lagrange-interpolation loops, ported
+conceptually (same algorithm shape, restated over this module's own
+`Fr`/`G1`/`G2` types rather than `Secp256k1`) — no `frost.zig` CODE was
+copied; `threshold.zig` does not `@import` `frost` and shares no types
+with it. The non-interactive one-round signing/combining structure this
+file exploits (no `frost`-style `SigningNonces`/binding-factor round
+needed, because `bls_sig.sign`'s `R = SK * Q` equation is linear in
+`SK`) is a well-known property of BLS in the threshold-signature
+literature (e.g. Boldyreva, "Threshold Signatures, Multisignatures and
+Blind Signatures Based on the Gap-Diffie-Hellman-Group Signature
+Scheme", PKC 2003 — cited for provenance, not read as source for this
+pass; the property itself follows directly from Part 4's own already-
+implemented, already-cited `sign` equation).
+
+No GPL/LGPL/AGPL source was consulted or copied anywhere in this
+module.
+
+**Status: Part 6 COMPLETE (scaffold + crypto-core pass, both
+2026-07-14).** All functions are real: wire codecs, parameter
+validation, `groupPublicKey`, the thin-over-`bls_sig` `partialSign`/
+`verifyPartialSignature`, and the four genuinely cryptographic cores —
+`evalPolynomialAt` (Shamir evaluation via Horner), `feldman
+CommitCoefficient` (Feldman commit, `bls_sig.skToPk`'s construction),
+`derivePublicKeyShare` (Feldman evaluate-in-the-exponent, Horner over
+`G1`), and `combineSignatures`'s Lagrange-interpolation-in-the-exponent
+step (`frost.deriveInterpolatingValue`'s exact coefficient formula over
+this module's `Fr`). No external test vectors exist for the
+trusted-dealer split itself (the coefficients are caller randomness);
+the verification chain instead pins Part 6 transitively to REAL
+vectors: the keystone tests assert that combining `t` partials equals
+`bls_sig.sign(sk, msg)` BYTE-FOR-BYTE and verifies under the ordinary
+`bls_sig.verify` — and Part 4's `sign`/`verify` are themselves pinned
+to `ethereum/bls12-381-tests` v0.1.2 (see the Part 4 section above). A
+full Pedersen/GJKR-style distributed key generation (no single trusted
+dealer) is explicitly OUT OF SCOPE for this file — see `SPEC.md`'s
+"Part 6 design"/"Out of scope for Part 6". See `SPEC.md`'s "Part 6
+design" section and `threshold.zig`'s own module doc comment.

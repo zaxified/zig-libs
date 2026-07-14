@@ -34,9 +34,16 @@
 //! `computeKzgProof`/`verifyKzgProof`, the blob-level proof functions
 //! and batch verification, plus reusable `Fr` FFT and Pippenger `G1`
 //! MSM primitives — byte-exact against `ethereum/c-kzg-4844`'s KAT
-//! vectors, see `kzg.zig`'s own module doc comment. See `SPEC.md`
-//! for the design record and the BLS subgroup-check pitfall this
-//! module's API is built around (deserialization does NOT
+//! vectors, see `kzg.zig`'s own module doc comment. Part 6
+//! (`threshold.zig`) is **COMPLETE**: trusted-dealer threshold BLS —
+//! Shamir secret sharing + Feldman VSS + Lagrange-in-the-exponent
+//! combining, over Part 4's min-pk ciphersuite. The keystone
+//! self-consistency chain (split → partial-sign → combine equals
+//! `bls_sig.sign` byte-for-byte, verifying under the group public key)
+//! transitively pins the threshold path to Part 4's eth-pinned vectors
+//! — see `threshold.zig`'s own module doc comment and `SPEC.md`.
+//! See `SPEC.md` for the design record and the BLS subgroup-check
+//! pitfall this module's API is built around (deserialization does NOT
 //! subgroup-check; callers at trust boundaries must).
 
 const std = @import("std");
@@ -52,6 +59,7 @@ pub const pairing = @import("pairing.zig");
 pub const hash_to_curve = @import("hash_to_curve.zig");
 pub const bls_sig = @import("bls_sig.zig");
 pub const kzg = @import("kzg.zig");
+pub const threshold = @import("threshold.zig");
 
 pub const Fp = fp.Fp;
 pub const Fp2 = fp2.Fp2;
@@ -87,6 +95,7 @@ test {
     _ = hash_to_curve;
     _ = bls_sig;
     _ = kzg;
+    _ = threshold;
 }
 
 test "meta.model_after names the pairing-friendly-curves draft" {
