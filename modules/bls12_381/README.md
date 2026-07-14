@@ -2,24 +2,30 @@
 
 BLS12-381: the pairing-friendly elliptic curve behind BLS signatures,
 KZG polynomial commitments, and threshold-BLS schemes — the base field
-`Fp`, the extension tower `Fp2`/`Fp6`/`Fp12`, the scalar field `Fr`, and
-the two pairing groups `G1`/`G2`.
+`Fp`, the extension tower `Fp2`/`Fp6`/`Fp12`, the scalar field `Fr`, the
+two pairing groups `G1`/`G2`, and the pairing `e: G1 x G2 -> Gt`.
 
-**Status: Part 1 complete.** Full field-tower and group arithmetic,
-every curve/field constant independently verified (see `NOTICE` —
-including a G2-cofactor scaffold bug found and fixed during the
-crypto-core pass), constant-time scalar multiplication and branchless
-point addition, and 94 tests green in Debug AND ReleaseFast — see
-`SPEC.md` for the design record. The pairing itself is Part 2.
+**Status: Parts 1 AND 2 complete.** Part 1's full field-tower and group
+arithmetic, every curve/field constant independently verified (see
+`NOTICE` — including a G2-cofactor scaffold bug found and fixed during
+the crypto-core pass), constant-time scalar multiplication and
+branchless point addition. Part 2 (`pairing.zig`) is the real pairing:
+the optimal ate Miller loop (D-type-twist line evaluation, batched
+allocation-free multi-pairing) and the full final exponentiation
+(easy part + the Hayashida-Hayasaka-Teruya exact hard-part chain),
+verified by a full bilinearity property suite PLUS a byte-exact
+`e(G1,G2)` KAT against the IETF pairing-friendly-curves draft's
+official test vector (with a py_ecc cross-check). 112 tests green in
+Debug AND ReleaseFast — see `SPEC.md` for the design record.
 
 ## The multi-part arc
 
-This module is planned across several parts; only Part 1 exists so far.
+This module is planned across several parts.
 
 | Part | Scope | Status |
 |---|---|---|
-| 1 | Field tower (`Fp`/`Fp2`/`Fp6`/`Fp12`) + groups (`G1`/`G2`) | **done (this)** |
-| 2 | The pairing itself: Miller loop + final exponentiation | not started |
+| 1 | Field tower (`Fp`/`Fp2`/`Fp6`/`Fp12`) + groups (`G1`/`G2`) | **done** |
+| 2 | The pairing itself: Miller loop + final exponentiation | **done** |
 | 3 | Hash-to-curve (RFC 9380, for hashing messages onto `G1`/`G2`) | not started |
 | 4 | BLS signatures (RFC 9380's BLS ciphersuites / the IETF BLS draft) | not started |
 | 5 | KZG polynomial commitments | not started |
@@ -56,6 +62,15 @@ const sum = a.add(a);                    // field ops: add/sub/neg/mul/square/in
 const doubled = p.double();              // point ops: add/double/negate/scalarMul/toAffine
 const pk = p.scalarMul(s);               // constant-time (secret-scalar-safe)
 const ok = pk.subgroupCheck();           // REQUIRED for untrusted points (see SPEC.md)
+
+// The pairing (Part 2 — subgroup inputs required, see SPEC.md):
+const gt = bls12_381.pairing.pairing(g1_gen, g2_gen); // e(G1, G2) ∈ Gt (== Fp12)
+const ok2 = bls12_381.pairing.pairingCheck(&.{
+    .{ .p = g1_gen, .q = g2_gen },
+    // ... more (P, Q) pairs — one shared Miller loop + one final
+    // exponentiation over the whole product, the shape BLS aggregate
+    // verification / KZG batch openings need.
+});
 ```
 
 Deserialization (`fromBytesCompressed`/`fromBytesUncompressed`) checks
@@ -74,13 +89,14 @@ BLS pitfall; see `SPEC.md`'s threat model).
 | `scalar.zig` | Scalar field `Fr` (mod `r`, the group order), built on `std.crypto.ff.Modulus(256)` |
 | `g1.zig` | `G1`: the order-`r` subgroup of `E(Fp): y²=x³+4` |
 | `g2.zig` | `G2`: the order-`r` subgroup of the sextic twist `E'(Fp2): y²=x³+4(1+u)` |
+| `pairing.zig` | Part 2: `e: G1 x G2 -> Gt`, the optimal ate Miller loop + final exponentiation |
 | `root.zig` | Module entry: `meta`, re-exports, dark-tests aggregator |
 
 ## Verify
 
 ```
-zig build test-bls12_381                        # Debug — 94/94 pass
-zig build test-bls12_381 -Doptimize=ReleaseFast # ReleaseFast — 94/94 pass
+zig build test-bls12_381                        # Debug — 112/112 pass
+zig build test-bls12_381 -Doptimize=ReleaseFast # ReleaseFast — 112/112 pass
 zig fmt --check modules/bls12_381/
 ```
 

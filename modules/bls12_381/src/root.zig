@@ -6,16 +6,20 @@
 //! threshold-BLS schemes — see `README.md` for the full multi-part arc
 //! this module is Part 1 of.
 //!
-//! **Status: Part 1 complete.** Full field-tower and group arithmetic,
-//! every constant independently verified (see `NOTICE`), constant-time
-//! scalar multiplication, and KAT coverage in Debug and ReleaseFast.
-//! See `SPEC.md` for the full design record and the BLS subgroup-check
-//! pitfall this module's API is built around (deserialization does NOT
-//! subgroup-check; callers at trust boundaries must).
-//!
-//! The pairing itself (`e: G1 x G2 -> Gt`, the Miller loop + final
-//! exponentiation) is Part 2 — NOT in this module yet; `fp12.zig` leaves
-//! `// TODO(part2)` markers for its pairing-specific helpers.
+//! **Status: Parts 1 AND 2 complete.** Full field-tower and group
+//! arithmetic plus the pairing itself (`e: G1 x G2 -> Gt`,
+//! `pairing.zig`): the optimal ate Miller loop (D-type-twist line
+//! evaluation) and the full final exponentiation (easy part + the
+//! Hayashida-Hayasaka-Teruya exact hard-part chain), every constant
+//! independently verified (see `NOTICE`), constant-time scalar
+//! multiplication, and KAT coverage in Debug and ReleaseFast — the
+//! pairing is pinned byte-exactly against the IETF
+//! pairing-friendly-curves draft's official optimal-ate test vector
+//! plus a py_ecc cross-check, on top of a full bilinearity property
+//! suite. See `SPEC.md` for the design record and the BLS
+//! subgroup-check pitfall this module's API is built around
+//! (deserialization does NOT subgroup-check; callers at trust
+//! boundaries must).
 
 const std = @import("std");
 
@@ -26,6 +30,7 @@ pub const fp12 = @import("fp12.zig");
 pub const g1 = @import("g1.zig");
 pub const g2 = @import("g2.zig");
 pub const scalar = @import("scalar.zig");
+pub const pairing = @import("pairing.zig");
 
 pub const Fp = fp.Fp;
 pub const Fp2 = fp2.Fp2;
@@ -34,6 +39,7 @@ pub const Fp12 = fp12.Fp12;
 pub const Fr = scalar.Fr;
 pub const G1 = g1;
 pub const G2 = g2;
+pub const Gt = pairing.Gt;
 
 pub const meta = .{
     .platform = .any,
@@ -56,6 +62,7 @@ test {
     _ = g1;
     _ = g2;
     _ = scalar;
+    _ = pairing;
 }
 
 test "meta.model_after names the pairing-friendly-curves draft" {

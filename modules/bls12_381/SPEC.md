@@ -6,12 +6,13 @@ purpose and API. Provenance: see [NOTICE](NOTICE).
 
 ## Purpose
 
-Part 1 of a multi-part arc (`README.md`): the base field `Fp`, the
-extension tower `Fp2`/`Fp6`/`Fp12`, the scalar field `Fr`, and the two
-pairing groups `G1`/`G2` — everything the Part-2 pairing function
-(`e: G1 x G2 -> Gt`), and every part built on top of it, needs as its
-foundation. This module does NOT implement the pairing itself, hash-to-
-curve, BLS signatures, KZG, or threshold BLS — those are later parts.
+Parts 1-2 of a multi-part arc (`README.md`). Part 1: the base field `Fp`,
+the extension tower `Fp2`/`Fp6`/`Fp12`, the scalar field `Fr`, and the two
+pairing groups `G1`/`G2` — everything the pairing function needs as its
+foundation. Part 2 (`pairing.zig`, SCAFFOLDED this pass): the pairing
+itself, `e: G1 x G2 -> Gt`, `Gt ⊂ Fp12*` — the optimal ate Miller loop
+plus final exponentiation. This module does NOT implement hash-to-curve,
+BLS signatures, KZG, or threshold BLS — those are later parts.
 
 ## Model-after + seed
 
@@ -95,6 +96,64 @@ curve, BLS signatures, KZG, or threshold BLS — those are later parts.
   alone cannot distinguish the twist's order from the curve's; a
   behavioral (Lagrange) test can.
 
+## Part 2 design (the pairing — crypto-core pass DONE, 2026-07-14)
+
+- **Construction: optimal ate pairing (Vercauteren 2010), BLS12 family.**
+  The standard choice for BLS12 curves — the shortest known Miller loop
+  for this embedding degree (`k=12`), keyed to the low-Hamming-weight
+  seed `x = -0xd201000000010000` (same `bls_x_abs` this file's siblings
+  already cite). `G2`'s sextic twist is D-TYPE (confirmed by `g2.zig`'s
+  own `b' = 4(1+u)` curve-equation choice and the `u^2=-1` non-residue
+  convention `SPEC.md`'s Part-1 section documents) — line evaluations
+  use the D-type untwisting map (Costello-Lange-Naehrig 2010).
+- **Miller loop (as implemented)**: per-pair `T` accumulators in AFFINE
+  twist coordinates (chord/tangent slope explicit for the line
+  function; one `Fp2.inv` per step — total, because the twist group's
+  order `r*h2` is odd, so no 2-torsion, and `T == ±Q` is impossible
+  for subgroup inputs; see the doc comments' non-degeneracy arguments).
+  Lines are evaluated at the TWISTED image of `P` — off the untwisted
+  line by a fixed `w^3` factor per line, which the final exponentiation
+  provably kills (`(w^3)^((p^12-1)/r) = 1`, derivation in `lineEval`'s
+  doc comment) — giving the sparse `c0.c0/c0.c1/c1.c1` ("014") shape,
+  promoted to a dense `Fp12.mul` in the correctness-first baseline.
+  Multi-pairing shares one seed-bit walk + one accumulator per batch of
+  up to 8 pairs (fixed stack storage, allocation-free; the batch
+  product is exact — squaring distributes — so batching only forgoes
+  cross-batch shared squarings). The negative seed is handled by ONE
+  final conjugation.
+- **Final exponentiation hard part (as implemented)**: the
+  Hayashida–Hayasaka–Teruya (ePrint 2020/875, BLS12 case) EXACT-`d`
+  cyclotomic identity `d = (p^4-p^2+1)/r = k*(x+p)*(x^2+p^2-1) + 1`
+  with `k = (x-1)^2/3` — chosen over the scaffold's FCKRH (ePrint
+  2011/465) suggestion because FCKRH's chain computes `f^(3d)` (a fixed
+  CUBE of the canonical pairing: bilinearity-equivalent, and
+  `pairingCheck`-equivalent since `gcd(3,r)=1`, but NOT byte-equal to
+  the IETF draft's `e(G1,G2)` test vector — verified numerically for
+  this exact seed before choosing). `k` is comptime-derived from
+  `bls_x_abs` (division-by-3 exactness enforced at comptime — no
+  transcribed constant); the whole chain runs on
+  `Fp12.cyclotomicSquare` (Granger–Scott, PKC 2010, via the `Fp4`
+  decomposition) + `Fp12.frobeniusMap` (naive repeated `frobenius`) +
+  conjugation-as-inversion (`p^6 ≡ -1 (mod p^4-p^2+1)`, verified
+  numerically).
+- **The negative-seed sign convention (a real cross-implementation
+  difference, discovered by the KAT work)**: this module — like
+  zkcrypto/blst and the IETF pairing-friendly-curves draft's official
+  test vector — conjugates the Miller accumulator for the negative
+  seed. `py_ecc` does NOT (its loop walks `|x|` with no adjustment), so
+  py_ecc's `e(G1,G2)` is exactly the canonical value's CONJUGATE (= Gt
+  inverse). Both are valid bilinear pairings; the IETF draft's is the
+  canonical one this module pins byte-exactly, and the py_ecc
+  relationship is itself pinned by a dedicated cross-check test.
+- **Verification net**: the bilinearity property suite (needs no
+  external constant: non-degeneracy, `e([a]P,[b]Q) == e(P,Q)^(ab)`,
+  additivity both sides, `e([a]P,Q) == e(P,[a]Q)`, `pairingCheck`
+  identities positive and negative, `e(G1,G2)^r == 1`) PLUS the
+  byte-exact `e(G1,G2)` KAT from the IETF draft (primary) and py_ecc
+  (conjugate cross-check) — the "property tests as the strong oracle,
+  byte-exact KAT layered on top" pattern from `adaptor`/`spake2plus`,
+  now with both layers in place.
+
 ## Threat model / limits
 
 - **The BLS subgroup-check pitfall — this module's central threat.**
@@ -155,14 +214,21 @@ curve, BLS signatures, KZG, or threshold BLS — those are later parts.
   public points, decompression) do not need — and some do not get —
   constant time; a faster public-scalar `scalarMul` variant is a
   possible later addition if a hot public-input call site appears.
-- **Out of scope for Part 1**: the pairing function itself (Miller
-  loop, final exponentiation — `fp12.zig`'s `// TODO(part2)` markers),
-  hash-to-curve (Part 3), and every downstream scheme (BLS signatures,
-  KZG, threshold BLS — Parts 4-6). `Fp12`'s `cyclotomicSquare`
-  signature is scaffolded but deliberately left `@panic("TODO(part2)")`
-  by the crypto-core pass — it is pairing-specific and lands with its
-  only consumer (its doc comment records a pairing-free test oracle
-  Part 2 can use on day one).
+- **The pairing is VARIABLE-TIME — deliberately.** Pairings operate on
+  PUBLIC inputs (public keys, signatures, commitments — every
+  BLS/KZG-style consumer verifies public data with them); the Miller
+  loop's affine steps branch and invert on input-derived values, the
+  final exponentiation's exponents are fixed public curve constants,
+  and no constant-time contortion is attempted or needed. Do NOT feed
+  the pairing secret points without revisiting this (no known scheme
+  does). The pairing also assumes SUBGROUP inputs for its internal
+  non-degeneracy arguments (the affine steps' `catch unreachable`
+  inversions): an on-curve but small-order non-subgroup point could
+  panic mid-loop — a loud failure, not a silent wrong value, and
+  exactly the input class the module-wide subgroup-check obligation
+  already excludes at trust boundaries.
+- **Out of scope for Parts 1-2**: hash-to-curve (Part 3), and every
+  downstream scheme (BLS signatures, KZG, threshold BLS — Parts 4-6).
 
 ## Verification
 
@@ -202,12 +268,31 @@ curve, BLS signatures, KZG, or threshold BLS — those are later parts.
     vector; uncompressed round-trips through real Jacobian arithmetic.
   - `root.zig`: every `encoded_bytes` constant matches its documented
     wire width; the dark-tests aggregator lists every submodule (disk
-    test-block count == runtime count == 94).
+    test-block count == runtime count == 112, Parts 1+2).
+  - `fp12.zig` (Part-2 additions): `cyclotomicSquare == square` on a
+    REAL cyclotomic-subgroup element (built pairing-free via the easy-
+    part construction, iterated 3 steps) and on `one`;
+    `frobeniusMap(k)` consistency for `k ∈ {0,1,2,3,6,12,13}`
+    (including `frobeniusMap(6) == conjugate` and the mod-12
+    reduction).
+  - `pairing.zig` (Part 2 — ALL PASS): `Gt`/`PairingPair`/`bls_x_abs`
+    sanity; `millerLoop` is definitionally `multiMillerLoop`'s `N=1`
+    case; non-degeneracy (`e(G1,G2) != 1`); bilinearity
+    (`e([3]P,[5]Q) == e(P,Q)^15`, additivity in both `G1` and `G2`,
+    `e([7]P,Q) == e(P,[7]Q) == e(P,Q)^7`); the `pairingCheck` identity
+    `e(P,Q)*e(-P,Q) == 1`, a 3-pair product-to-one check, and the
+    negative (`pairingCheck` on a single non-trivial pair rejects);
+    infinity-input handling (`e(O,Q) == e(P,O) == 1`, including inside
+    a multi-pairing); final-exp subgroup-membership sanity
+    (`e(G1,G2)^r == 1`); and the byte-exact `e(G1,G2)` KAT — the IETF
+    draft-irtf-cfrg-pairing-friendly-curves-11 Appendix B optimal-ate
+    vector (primary) plus the py_ecc-is-the-conjugate cross-check (see
+    "Part 2 design" above).
 - **Green in both modes**: `zig build test-bls12_381` (Debug) and
-  `zig build test-bls12_381 -Doptimize=ReleaseFast` both pass 94/94
-  (ReleaseFast exercised deliberately — this repo has been bitten by
-  Debug-only-green UB before). `zig fmt --check modules/bls12_381/` is
-  clean.
+  `zig build test-bls12_381 -Doptimize=ReleaseFast` (ReleaseFast —
+  exercised deliberately, this repo has been bitten by
+  Debug-only-green UB before) both report **112/112 tests pass, 0
+  panics**. `zig fmt --check modules/bls12_381/` is clean.
 
 ## Status
 
@@ -215,23 +300,43 @@ curve, BLS signatures, KZG, or threshold BLS — those are later parts.
 and group arithmetic implemented and verified — see "Design &
 invariants" for the settled design decisions (canonical storage,
 derived Frobenius coefficients, branchless point arithmetic, the fixed
-G2 cofactor) and "Verification" for the test inventory. The single
-remaining stub is `Fp12.cyclotomicSquare` (`TODO(part2)`, by design).
+G2 cofactor) and "Verification" for the test inventory.
+
+**Part 2 COMPLETE (crypto-core pass, 2026-07-14).** `multiMillerLoop`
+(optimal ate, affine D-type-twist line evaluation, allocation-free
+batched multi-pairing), `finalExpHardPart` (Hayashida–Hayasaka–Teruya
+exact-`d` cyclotomic chain), `Fp12.cyclotomicSquare` (Granger–Scott)
+and `Fp12.frobeniusMap` (naive repeated Frobenius) are all real and
+verified — bilinearity property suite plus the byte-exact IETF-draft
+`e(G1,G2)` KAT with py_ecc conjugate cross-check. See "Part 2 design"
+above for the algorithm choices and the FCKRH-vs-exact-`d` and
+negative-seed-convention findings.
 
 ### Backlog (deferred)
 
-1. **Part 2** (the pairing: Miller loop + final exponentiation,
-   including `Fp12.cyclotomicSquare` and the `// TODO(part2)` helpers
-   `fp12.zig` calls out) — a separate task.
+1. **The Miller-loop sparse-multiplication optimization** — a freshly
+   computed line value is structurally sparse (3 nonzero `Fp2`
+   coefficients out of 6 — the "014" shape `lineEval` documents); the
+   implemented baseline promotes it to a dense `Fp12` and uses the
+   general `mul`, correctness-first; a dedicated sparse-multiply is a
+   real, well-known follow-up optimization (`multiMillerLoop`'s own
+   `TODO` note), not a correctness prerequisite. Projective (inversion-
+   free) Miller-loop point steps belong to the same future performance
+   pass (the affine steps cost one `Fp2.inv` each — fine for
+   verification workloads, the only current consumers).
 2. **The fast subgroup-check / cofactor-clearing paths** (Bowe's
    untwist-Frobenius-twist technique, cited in `NOTICE`) — the simple,
    always-correct `scalarMul`-by-order/cofactor forms are implemented;
    the fast paths are marked `TODO` at their call sites.
-3. **Performance (Part-2 prerequisites)**: persistent Montgomery
-   storage for `Fp`/`Fr` (currently canonical-at-rest — see the
-   convention note in `fp.zig`), caching the `Fp6`/`Fp12` Frobenius
-   coefficients (currently recomputed per call), and a fixed-window
-   scalar multiplication (currently double-and-add-always).
+3. **Performance**: persistent Montgomery storage for
+   `Fp`/`Fr` (currently canonical-at-rest — see the convention note in
+   `fp.zig`), caching the `Fp6`/`Fp12` Frobenius coefficients (currently
+   recomputed per call — directly relevant to `Fp12.frobeniusMap`'s own
+   deferred caching choice), and a fixed-window scalar
+   multiplication (currently double-and-add-always).
 4. **Optional API additions if consumers appear**: a variable-time
    public-scalar `scalarMul` for verification-side hot paths; a
-   secret-exponent (ladder) `Fp2.pow`.
+   secret-exponent (ladder) `Fp2.pow`; skipping the full final
+   exponentiation for `pairingCheck` specifically when a cheaper
+   not-equal-to-one test suffices (`pairingCheck`'s own `TODO(fable)`
+   note).

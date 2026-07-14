@@ -92,6 +92,81 @@ third-party SOURCE was ported into this module):
    implemented in `g1.zig`/`g2.zig`. A public formula catalogue —
    cited for attribution courtesy.
 
+10. **Miller, "Short Programs for Functions on Curves"** (unpublished
+    manuscript, 1986) — the original Miller-loop construction: the
+    double-and-add walk that accumulates a rational function's evaluation
+    along a scalar multiple of a curve point, the basis of every pairing
+    algorithm since. Cited in `pairing.zig`'s module doc comment and
+    `multiMillerLoop`'s doc comment.
+11. **Vercauteren, "Optimal Pairings"** (IEEE Transactions on Information
+    Theory 56(1), 2010) — the "optimal ate" pairing variant this module's
+    Part 2 names and is scaffolded around: for the BLS12 curve family,
+    the shortest known Miller-loop length for the embedding degree
+    `k=12`, keyed to the low-Hamming-weight seed
+    `x = -0xd201000000010000`. A public academic paper — cited for
+    attribution courtesy.
+12. **Costello, Lange, Naehrig, "Faster Pairing Computations on Curves
+    with High-Degree Twists"** (PKC 2010) — the D-type-twist line-
+    evaluation/untwisting formulas `multiMillerLoop`'s doc comment points
+    Fable at (BLS12-381's `G2` sextic twist is D-type, confirmed by
+    `g2.zig`'s own `b' = 4(1+u)` curve constant and the `u²=-1`
+    non-residue convention — using the M-type untwisting instead is a
+    well-known BLS12-381 implementation footgun). A public academic
+    paper — cited for attribution courtesy.
+13. **Scott, Benger, Charlemagne, Perez, Kachisa, "On the Final
+    Exponentiation for Calculating Pairings on Ordinary Elliptic
+    Curves"** (Cryptology ePrint 2008/490) — the standard easy-part/
+    hard-part split `pairing.zig`'s `finalExponentiation` implements:
+    the easy part (`f^((p^6-1)(p^2+1))`) is a fixed composition of
+    `Fp12` primitives (see `finalExpEasyPart`'s doc comment for the
+    exact identity); the hard part is entry 17's chain.
+14. **Fuentes-Castañeda, Knapp, Rodríguez-Henríquez, "Faster Hashing to
+    G2"** (Cryptology ePrint 2011/465) — the BLS12-family hard-part
+    addition chain the scaffold originally pointed at. EVALUATED and
+    NOT used: its chain computes `f^(3d)` (`d = (p^4-p^2+1)/r`) — a
+    fixed cube of the canonical pairing, bilinearity-equivalent but not
+    byte-equal to the IETF draft's `e(G1,G2)` test vector (both facts
+    verified numerically for this exact seed before deciding) — see
+    entry 17 for the exact-`d` identity implemented instead. A public
+    academic paper — cited for attribution courtesy.
+15. **`zkcrypto/bls12_381`/`supranational/blst`** (already named in
+    entry 5 above, same license/non-read-source status) — named in
+    `pairing.zig` as the most widely deployed implementations sharing
+    this module's Miller-loop conventions (negative-seed conjugation,
+    D-type line evaluation). Their source remains UNREAD; the Part-2
+    crypto-core pass validated its own construction against the IETF
+    draft's official test vector and py_ecc instead (see "Verification
+    performed (Part-2 crypto-core pass)" below).
+16. **`ethereum/py_ecc`** (already named in entry 4 above, same
+    MIT/design-reference status) — the `e(G1,G2)` KAT CROSS-CHECK
+    source: `py_ecc.bls12_381.pairing` (version 8.0.0, installed from
+    PyPI 2026-07-14) was run to compute `e(G1,G2)` independently; its
+    output equals the IETF draft's canonical vector up to exactly one
+    conjugation (py_ecc's Miller loop walks `|x|` without the
+    negative-seed adjustment — determined by READING
+    `bls12_381_pairing.py`, which is MIT-licensed and was consulted
+    here as a FACT source about py_ecc's own convention, not as a
+    design source for this module's already-written loop). The
+    basis conversion used for the comparison (py_ecc's flat
+    `Fp[w]/(w^12-2w^6+2)` -> this module's tower, via `u = w^6-1`) was
+    validated as a ring isomorphism on random products before use.
+17. **Hayashida, Hayasaka, Teruya, "Efficient Final Exponentiation via
+    Cyclotomic Structure for Pairings over Families of Elliptic
+    Curves"** (Cryptology ePrint 2020/875) — the EXACT-`d` hard-part
+    identity `finalExpHardPart` implements (BLS12 case):
+    `d = (p^4-p^2+1)/r = k*(x+p)*(x^2+p^2-1) + 1`, `k = (x-1)^2/3`.
+    Re-verified numerically as an exact integer identity for this
+    module's seed before implementation; `k` is comptime-derived from
+    the seed in code (no transcribed constant). A public academic
+    paper — cited for attribution courtesy.
+18. **draft-irtf-cfrg-pairing-friendly-curves-11, Appendix B** — the
+    PRIMARY `e(G1,G2)` KAT source: the official BLS12-381 optimal-ate
+    test vector (`e_0..e_11`), fetched 2026-07-14 from ietf.org and
+    mechanically reordered into this module's tower/wire layout (the
+    draft's input points were confirmed to be this module's own
+    generators). Matches this module's pairing output byte-for-byte.
+    Same not-copyrightable-parameter status as entry 1.
+
 No GPL/LGPL/AGPL source was consulted or copied anywhere in this module.
 `std.crypto.ff` (`Modulus`/`Fe`/`Uint` — MIT, part of Zig itself) is used
 via its public API for all Montgomery modular arithmetic underneath `Fp`/
@@ -204,9 +279,44 @@ verified `p` (comptime-derived exponents + runtime `Fp2.pow`) — no
 hand-transcribed constant table exists anywhere in the module; the
 tests above pin the derived values byte-exactly.
 
+Verification performed (Part-2 crypto-core pass, 2026-07-14)
+-------------------------------------------------------------
+
+The pass that implemented the pairing added the following
+independently-computed checks (all beyond the module's own
+bilinearity property suite, which needs no external constant):
+
+- **The hard-part exponent identity** (entry 17): verified as an EXACT
+  integer equality (`k*(x+p)*(x^2+p^2-1) + 1 == (p^4-p^2+1)/r` for
+  `x = -0xd201000000010000`) with independent Python big-integer
+  arithmetic before implementation; the FCKRH chain (entry 14) was
+  likewise verified to equal `3d` — the reason it was NOT used. Also
+  verified numerically: `p^6 ≡ -1 (mod p^4-p^2+1)` (the
+  conjugation-as-inversion fact the chain relies on), and `3 | (x-1)^2`
+  (the comptime-enforced exactness of `k`).
+- **The `e(G1,G2)` KAT** (entries 16 and 18): the IETF draft's
+  Appendix B vector (primary, byte-for-byte) and py_ecc 8.0.0's
+  independently computed value (cross-check, equal up to exactly one
+  conjugation — the two projects' documented negative-seed-convention
+  difference; the c0 halves are byte-identical and the c1 halves
+  exactly negate mod p, both facts checked numerically). Two external
+  sources plus this module's from-scratch third implementation agreeing
+  (up to the documented convention) triangulate the value.
+- **The `w^3` line-normalization fact** (`lineEval`'s doc comment —
+  evaluating lines at the twisted image of `P` multiplies the Miller
+  value by `w^3` per line, which final exponentiation kills):
+  `(w^3)^((p^12-1)/r) = 1` follows from `(w^3)^(p^6-1) = -1` and
+  `2 | (p^2+1)`; the byte-exact KAT above confirms the end-to-end
+  normalization empirically.
+
 **Status: Part 1 COMPLETE (crypto-core pass done, 2026-07-14).** All
-field-tower and group arithmetic is implemented and KAT/property-tested
-(94 tests, Debug and ReleaseFast both green). The only remaining stub
-is `Fp12.cyclotomicSquare` (`@panic("TODO(part2)")`) — a
-pairing-specific fast path that lands with its only consumer, the
-Part-2 final exponentiation. See `SPEC.md`'s Status and Backlog.
+field-tower and group arithmetic is implemented and KAT/property-tested.
+
+**Status: Part 2 COMPLETE (crypto-core pass done, 2026-07-14 — see
+entries 10-18 above for its design references).** The optimal ate
+Miller loop, the full final exponentiation, `Fp12.cyclotomicSquare`
+(Granger–Scott) and `Fp12.frobeniusMap` are implemented; the byte-exact
+`e(G1,G2)` KAT (IETF draft primary + py_ecc conjugate cross-check) and
+the full bilinearity property suite are wired and green.
+`zig build test-bls12_381` passes 112/112 in Debug AND ReleaseFast.
+See `SPEC.md`'s Status and Backlog.

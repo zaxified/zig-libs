@@ -3,16 +3,17 @@
 //! i.e. `w^2 = v` (`v` = `Fp6`'s indeterminate, `fp6.zig`). An element is
 //! `c0 + c1*w`, `c0, c1 ∈ Fp6`. This is the pairing's TARGET field: the
 //! output of `e: G1 x G2 -> Gt`, `Gt` being the order-`r` subgroup of
-//! `Fp12*` (Part 2 — the Miller loop + final exponentiation, NOT
-//! scaffolded here beyond the markers below).
+//! `Fp12*` (the Miller loop + final exponentiation themselves live in
+//! `pairing.zig`; this file supplies the field ops they run on).
 //!
-//! **Status: implemented** (general field arithmetic: `add`/`sub`/
-//! `neg`/`mul`/`square`/`inv`/`conjugate`/`frobenius`). Pairing-SPECIFIC
-//! helpers remain Part 2's job: `cyclotomicSquare` (whose only consumer
-//! is the final exponentiation's hard part) is deliberately still a
-//! `@panic("TODO(part2)")` stub, and the sparse Miller-loop
-//! multiplication / final-exponentiation helpers are `// TODO(part2)`
-//! markers at the bottom of this file.
+//! **Status: implemented** — general field arithmetic (`add`/`sub`/
+//! `neg`/`mul`/`square`/`inv`/`conjugate`/`frobenius`) plus the two
+//! pairing-specific helpers the Part-2 crypto-core pass filled in:
+//! `cyclotomicSquare` (Granger–Scott, consumed by the final
+//! exponentiation's hard part) and `frobeniusMap` (repeated Frobenius).
+//! The sparse Miller-loop line multiplication remains a `// TODO`
+//! optimization marker at the bottom of the struct (dense `mul` is the
+//! correctness-first baseline `pairing.zig` uses).
 
 const std = @import("std");
 const fp = @import("fp.zig");
@@ -181,44 +182,110 @@ pub const Fp12 = struct {
 
     /// Squaring specialized to the CYCLOTOMIC SUBGROUP (elements `a`
     /// with `a^(p^4-p^2+1) = 1`, i.e. `a * conjugate(a) = 1` — the
-    /// subgroup every Miller-loop intermediate value and every
-    /// final-exponentiation intermediate lives in AFTER the easy part).
-    /// The Karabina / Granger–Scott compressed-cyclotomic-squaring
-    /// formula (the standard choice cited by every BLS12-381 pairing
-    /// implementation in `NOTICE`) is significantly cheaper than
-    /// `square` for exactly these elements — it is INCORRECT to call on
-    /// an arbitrary `Fp12` element that is NOT in the cyclotomic
-    /// subgroup (silently produces a wrong answer with no error, since
-    /// the formula's correctness relies on the subgroup's defining
-    /// relation, not on any input validation this function could
-    /// cheaply perform). Part 2 (the final exponentiation's
-    /// square-and-multiply-heavy "hard part") is the primary consumer;
-    /// scaffolded here (rather than deferred to `// TODO(part2)`) per
-    /// this task's explicit instruction to include it as an `Fp12` op.
+    /// subgroup every final-exponentiation intermediate lives in AFTER
+    /// the easy part). REAL (Part-2 crypto-core pass): the
+    /// Granger–Scott cyclotomic-squaring formula ("Faster Squaring in
+    /// the Cyclotomic Subgroup of Sixth Degree Extensions", PKC 2010 —
+    /// see `NOTICE`), via the `Fp4`-subfield decomposition: with
+    /// `s = w^3` (`s^2 = ξ`), an `Fp12` element splits into three `Fp4`
+    /// components `A = (a_0, a_3)`, `B = (a_1, a_4)`, `C = (a_2, a_5)`
+    /// (`a_i` = the `Fp2` coefficient of `w^i`), and for cyclotomic
+    /// inputs the square is
+    /// ```
+    /// A' = 3*A^2 - 2*conj(A)
+    /// B' = 3*s*C^2 + 2*conj(B)
+    /// C' = 3*B^2 - 2*conj(C)
+    /// ```
+    /// (Fp4 conjugation = negate the `s` component; `s*(x + y*s) =
+    /// ξ*y + x*s`.) 3 `fp4Square` calls — significantly cheaper than
+    /// the general `square`. It is INCORRECT to call this on an
+    /// arbitrary `Fp12` element NOT in the cyclotomic subgroup
+    /// (silently wrong answer, no error — the formula's correctness
+    /// relies on the subgroup's defining relation). Pinned by the
+    /// "cyclotomicSquare == square on subgroup elements" oracle test
+    /// below (the exact day-one oracle the Part-1 stub's comment
+    /// promised).
     pub fn cyclotomicSquare(a: Fp12) Fp12 {
-        _ = a;
-        // Deliberately NOT implemented in Part 1 (crypto-core pass
-        // included): this is a pairing-specific fast path whose only
-        // consumer is the Part-2 final exponentiation — per this
-        // module's Part-1 scope it lands WITH that consumer (and its
-        // Miller-loop-derived test vectors), not before. Note for the
-        // implementer: a cyclotomic test element CAN be built without
-        // the pairing (c = conjugate(a) * a^-1, then d = c.frobenius()
-        // .frobenius().mul(c) gives a^((p^6-1)(p^2+1))), so a
-        // "cyclotomicSquare == square on subgroup elements" oracle is
-        // available on day one of Part 2.
-        @panic("TODO(part2): Fp12.cyclotomicSquare — Granger-Scott compressed squaring; lands with the final exponentiation (its only consumer)");
+        // Fp4 pairs (a_i = Fp2 coefficient of w^i in the flat basis;
+        // tower slots: c0 = (a0, a2, a4), c1 = (a1, a3, a5)):
+        //   A = (a0, a3) = (c0.c0, c1.c1)
+        //   B = (a1, a4) = (c1.c0, c0.c2)
+        //   C = (a2, a5) = (c0.c1, c1.c2)
+        const asq = fp4Square(a.c0.c0, a.c1.c1);
+        const bsq = fp4Square(a.c1.c0, a.c0.c2);
+        const csq = fp4Square(a.c0.c1, a.c1.c2);
+
+        // A' = 3*A^2 - 2*conj(A): x' = 2(x2 - x) + x2, y' = 2(y2 + y) + y2.
+        var r00 = asq.c0.sub(a.c0.c0);
+        r00 = r00.add(r00).add(asq.c0);
+        var r11 = asq.c1.add(a.c1.c1);
+        r11 = r11.add(r11).add(asq.c1);
+
+        // C' = 3*B^2 - 2*conj(C) (B^2 feeds C' — the Granger–Scott
+        // cross-wiring): x' = 2(x2 - x) + x2, y' = 2(y2 + y) + y2.
+        var r01 = bsq.c0.sub(a.c0.c1);
+        r01 = r01.add(r01).add(bsq.c0);
+        var r12 = bsq.c1.add(a.c1.c2);
+        r12 = r12.add(r12).add(bsq.c1);
+
+        // B' = 3*s*C^2 + 2*conj(B), s*C^2 = (ξ*C2y, C2x):
+        //   x' = 2(ξ*C2y + x) + ξ*C2y, y' = 2(C2x - y) + C2x.
+        const t = csq.c1.mulByNonresidue();
+        var r10 = t.add(a.c1.c0);
+        r10 = r10.add(r10).add(t);
+        var r02 = csq.c0.sub(a.c0.c2);
+        r02 = r02.add(r02).add(csq.c0);
+
+        return .{
+            .c0 = .{ .c0 = r00, .c1 = r01, .c2 = r02 },
+            .c1 = .{ .c0 = r10, .c1 = r11, .c2 = r12 },
+        };
     }
 
-    // TODO(part2): pairing-specific Fp12 helpers NOT scaffolded here —
-    // e.g. a sparse "line-function times Fp12" multiplication (the
-    // Miller loop's inner accumulation step, which multiplies by a
-    // structurally-sparse Fp12 element much cheaper than a general
-    // `mul`), and the final-exponentiation "hard part" exponentiation
-    // itself (a fixed square-and-multiply chain keyed to the BLS
-    // parameter z = -0xd201000000010000). Both belong with the Miller
-    // loop / pairing function itself, not this field-arithmetic file.
+    /// `a^(p^power)`: the Frobenius endomorphism applied `power` times —
+    /// the repeated-Frobenius primitive `pairing.zig`'s final-exponentiation
+    /// HARD part needs (its factors get twisted by `p`, `p^2` before
+    /// being combined — see that file's `finalExpHardPart` doc comment).
+    /// REAL (Part-2 crypto-core pass): the NAIVE baseline — `power % 12`
+    /// repeated calls to the already-real `frobenius()` above
+    /// (`frobenius` has order 12 on `Fp12`, pinned by the order-12 test
+    /// below, so reducing mod 12 is exact, and `frobeniusMap(a, 12) ==
+    /// a` by construction). The precomputed power-indexed
+    /// Frobenius-coefficient table remains a deferred optimization
+    /// (`SPEC.md` Backlog — same entry as caching the single-application
+    /// coefficients): the hard part calls this a handful of times per
+    /// pairing, so the naive form costs a few extra fixed-exponent
+    /// `Fp2.pow`s per call, dwarfed by the Miller loop itself.
+    pub fn frobeniusMap(a: Fp12, power: usize) Fp12 {
+        var out = a;
+        for (0..power % 12) |_| out = out.frobenius();
+        return out;
+    }
+
+    // TODO: a sparse "line-function times Fp12" multiplication (the
+    // Miller loop's inner accumulation step multiplies by a
+    // structurally-sparse Fp12 element — only 3 of its 6 Fp2
+    // coefficients nonzero — much cheaper than the general `mul`
+    // pairing.zig's dense baseline uses). Deferred optimization, not a
+    // correctness prerequisite — see SPEC.md Backlog and
+    // `multiMillerLoop`'s own TODO note.
 };
+
+/// Squaring in the `Fp4` subfield `Fp2[s]/(s^2 - ξ)` (`s = w^3`), on a
+/// pair `(c0, c1)` representing `c0 + c1*s`:
+/// `(c0 + c1 s)^2 = (c0^2 + ξ c1^2) + 2 c0 c1 s`, with `2 c0 c1 =
+/// (c0+c1)^2 - c0^2 - c1^2` (no extra mul). `Fp12` itself never
+/// materializes an `Fp4` type — this helper exists solely as
+/// `cyclotomicSquare`'s building block (Granger–Scott decomposes the
+/// cyclotomic square into three `Fp4` squarings — see that function).
+fn fp4Square(c0: Fp2, c1: Fp2) struct { c0: Fp2, c1: Fp2 } {
+    const t0 = c0.square();
+    const t1 = c1.square();
+    return .{
+        .c0 = t1.mulByNonresidue().add(t0),
+        .c1 = c0.add(c1).square().sub(t0).sub(t1),
+    };
+}
 
 /// `(p-1)/6`, big-endian — the `Fp12` Frobenius-coefficient exponent
 /// (comptime-derived from `fp.zig`'s verified `p_bytes`; `p ≡ 1 (mod
@@ -330,6 +397,47 @@ test "Fp12.frobenius equals pow(p) (definitional) and has order 12" {
     x = a;
     for (0..6) |_| x = x.frobenius();
     try std.testing.expect(x.eql(a.conjugate()));
+}
+
+// Builds a REAL cyclotomic-subgroup element without any pairing: for any
+// unit a, c = conjugate(a) * a^-1 is a^(p^6-1), and d = frobenius^2(c) *
+// c is a^((p^6-1)(p^2+1)) — the exact easy-part construction, whose
+// output has order dividing p^4 - p^2 + 1 (the cyclotomic subgroup).
+// This is the day-one oracle Part 1's cyclotomicSquare stub promised.
+fn cyclotomicTestElement() !Fp12 {
+    const a = try testElement();
+    const c = a.conjugate().mul(try a.inv());
+    return c.frobenius().frobenius().mul(c);
+}
+
+test "Fp12.cyclotomicSquare == square on cyclotomic-subgroup elements" {
+    const d = try cyclotomicTestElement();
+    // Sanity: d really is cyclotomic (d * conjugate(d) == 1).
+    try std.testing.expect(d.mul(d.conjugate()).eql(Fp12.one));
+    // The oracle, iterated a few steps to catch shape-preserving bugs
+    // (a wrong formula that happens to agree once would still have to
+    // agree on its own outputs, which stay in the subgroup).
+    var x = d;
+    for (0..3) |_| {
+        try std.testing.expect(x.cyclotomicSquare().eql(x.square()));
+        x = x.cyclotomicSquare();
+    }
+    // Trivial subgroup element.
+    try std.testing.expect(Fp12.one.cyclotomicSquare().eql(Fp12.one));
+}
+
+test "Fp12.frobeniusMap: power 0/1/2/6/12 consistency with frobenius/conjugate" {
+    const a = try testElement();
+    try std.testing.expect(a.frobeniusMap(0).eql(a));
+    try std.testing.expect(a.frobeniusMap(1).eql(a.frobenius()));
+    try std.testing.expect(a.frobeniusMap(2).eql(a.frobenius().frobenius()));
+    try std.testing.expect(a.frobeniusMap(3).eql(a.frobenius().frobenius().frobenius()));
+    // frobenius^6 == conjugate (the same identity the frobenius test
+    // above pins), and frobenius^12 == identity — so frobeniusMap
+    // reduces its power mod 12 exactly.
+    try std.testing.expect(a.frobeniusMap(6).eql(a.conjugate()));
+    try std.testing.expect(a.frobeniusMap(12).eql(a));
+    try std.testing.expect(a.frobeniusMap(13).eql(a.frobenius()));
 }
 
 test "Fp12 Frobenius gamma matches the independently-derived constant" {
