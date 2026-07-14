@@ -1,0 +1,94 @@
+signal — provenance note
+=========================
+
+Kept as a module-local NOTICE (same placement as the sibling `bip340`/
+`adaptor`/`frost`/`bolt8`/`dtls`/`falcon`/`slhdsa`/`oscore`/`spake2plus`
+modules — self-contained protocol/crypto modules not folded into the root
+`NOTICE`).
+
+Provenance
+----------
+
+signal — clean-room implementation of the Signal Protocol's X3DH
+(Extended Triple Diffie-Hellman) key-agreement and XEdDSA signature
+scheme, specified in two public documents published by the Signal
+Foundation / Trevor Perrin:
+
+  - X3DH: "The X3DH Key Agreement Protocol", https://signal.org/docs/specifications/x3dh/
+  - XEdDSA: "The XEdDSA and VXEdDSA Signature Schemes", https://signal.org/docs/specifications/xeddsa/
+
+Both are public specifications — a public spec's text is not copyrightable
+expression (merger doctrine, CONVENTIONS.md §5); implementing it, however
+closely, is not "derived from" any third party's code. This module's
+scaffold pass (`x3dh.zig`'s DH+HKDF composition and wire codecs,
+`xeddsa.zig`'s doc comments describing the sign/verify construction) was
+built directly from the two specification texts above — no third-party
+X3DH/XEdDSA implementation (libsignal, in any of its C/Java/Rust/Swift
+incarnations; Signal's own Axolotl-era code; any other language's port)
+was read, ported, or consulted as a design reference for the Zig code,
+types, or API shape, and the later XEdDSA implementation pass filled the
+already-transcribed construction in unchanged (its ONLY libsignal
+consultation was test-vector sourcing and variant identification — see
+"Test vectors" below). Every construction detail in `xeddsa.zig`'s doc
+comments (the sign-0 point-forcing convention, the `hash1`-vs-`hash`
+domain separation, the four-DH `F || DH1..DH4` framing, the HKDF
+salt/info shape) was drawn from the specification text itself.
+
+`std.crypto.dh.X25519` / `std.crypto.ecc.Edwards25519` / `std.crypto.hash.
+sha2.Sha512` / `std.crypto.kdf.hkdf.HkdfSha256` (all MIT, part of Zig
+itself) supply the DH, curve, hash, and KDF primitives via their public
+APIs; no new DH function, curve arithmetic, hash, or KDF primitive is
+implemented here — the specifications' OWN composition of them (the
+four-DH agreement, the Montgomery<->Edwards signature scheme) is this
+module's contribution, and the two Signal specifications are the sole
+references (no NOTICE-triggering third-party design reference exists for
+this pass — CONVENTIONS.md §5's "pure clean-room from spec, no NOTICE
+entry strictly required" case; this file is kept anyway per this
+repository's established practice of a module-local NOTICE for
+self-contained protocol/crypto modules, mirroring `oscore`'s precedent).
+
+No GPL/LGPL/AGPL source was consulted or copied anywhere in this module.
+
+Test vectors
+------------
+
+Neither the X3DH nor the XEdDSA specification text publishes a numeric
+worked example (unlike, e.g., RFC 9383's Appendix C for SPAKE2+). The
+X3DH agreement is therefore covered by a SELF-CONSISTENCY harness in
+`src/kat_test.zig` (Alice's `initiateUnverified` and Bob's `respond`
+must land on the identical `SK`/`AD` from independently-derived DH
+computations — a property that would fail loudly on almost any
+construction bug, even without an external oracle).
+
+For XEdDSA, `src/kat_test.zig` embeds the known-answer vector from
+libsignal's own test suite (`test_curve25519_signature` in
+libsignal-protocol-c's `tests/test_curve25519.c`, GPLv3; the identical
+bytes ship in libsignal-protocol-java): one private key, its public key,
+one 33-byte message, and one 64-byte signature. These are NUMERIC FACTS
+(a keypair and a signature over a fixed message), not copyrightable
+expression — no libsignal code was ported, copied, or adapted. During
+the XEdDSA implementation pass, libsignal's Rust `curve25519.rs`
+(AGPL-3.0) and the C test file above were READ solely to (a) source that
+vector and (b) establish the FACT — stated verbatim in the Rust file's
+own doc comment — that deployed libsignal deviates from the XEdDSA paper
+by carrying the signer's Edwards sign bit in the top bit of `s` instead
+of forcing sign 0. This module's implementation itself was written from
+the specification text (already fully transcribed into `xeddsa.zig`'s
+doc comments during the scaffold pass, before any libsignal source was
+looked at) and implements the PAPER's convention, deliberately NOT the
+deployed variant — see `xeddsa.zig`'s module doc comment and `SPEC.md`.
+`sign` is additionally cross-checked against `std.crypto.sign.Ed25519`'s
+independent verifier (MIT, part of Zig).
+
+Status of this pass
+--------------------
+
+**Part 1 complete.** `x3dh.zig`'s four-DH + HKDF agreement
+(`initiateUnverified`/`respond`), both wire codecs (`PreKeyBundle`,
+`InitialMessage`), the fail-closed `initiate`/`generateSignedPreKey`
+entry points, and `xeddsa.zig`'s `sign`/`verify` (including
+`edwardsFromMontgomery`, the Montgomery->Edwards sign-0 point recovery
+std does not provide) are implemented and tested — 31/31 in Debug and
+ReleaseFast. Part 2 of this arc (the Double Ratchet,
+signal.org/docs/specifications/doubleratchet) remains out of scope —
+see `README.md`'s "Part 2 boundary" section.
