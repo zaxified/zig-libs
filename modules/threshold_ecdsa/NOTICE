@@ -1,0 +1,72 @@
+threshold_ecdsa — provenance note
+==================================
+
+Kept as a module-local NOTICE (same placement as the sibling `frost`/
+`adaptor`/`bls12_381` modules — self-contained crypto modules not folded
+into the root `NOTICE`).
+
+Provenance
+----------
+
+threshold_ecdsa — Phase 2a (trusted-dealer keygen) of a GG20 threshold-ECDSA
+implementation, clean-room from two public IACR ePrint papers:
+
+  - R. Gennaro, S. Goldfeder, "One Round Threshold ECDSA with Identifiable
+    Abort", IACR ePrint 2020/540 ("GG20") — the overall protocol this arc
+    (2a keygen / 2b MtA+range-proofs / 2c signing) targets.
+  - R. Gennaro, S. Goldfeder, "Fast Multiparty Threshold ECDSA with Fast
+    Trustless Setup", IACR ePrint 2019/114 ("GG18") — the ring-Pedersen
+    auxiliary-parameter construction `AuxParams`/`generateAuxParams`
+    references (GG18 §4.1's "aux info" generation, which GG20 also relies
+    on for its own range proofs).
+
+Both are public specifications/papers, not copyrightable works (merger
+doctrine — see `CONVENTIONS.md` §5) — no NOTICE entry is strictly required
+for citing them, but is included here for provenance clarity given the
+module's overall crypto-protocol nature (matching this repo's `frost`/
+`adaptor` precedent of a module-local NOTICE for self-contained crypto
+modules). No third-party SOURCE was ported or consulted; `generateAuxParams`'s
+doc comment additionally references, BY NAME ONLY (facts about the widely-
+used construction, not a source consulted), the "aux info" generation shape
+commonly cited by tss-lib- and multi-party-ecdsa-style reference
+implementations and by Canetti, Gennaro, Goldfeder, Makriyannis, Peled, "UC
+Non-Interactive, Proactive, Threshold ECDSA" §3.1 — no source from any of
+these was read or copied; this scaffolding pass worked from the GG18/GG20
+papers' own text.
+
+The Shamir-secret-sharing + Feldman-VSS + Lagrange-interpolation core
+(`splitSecretKey`, `groupPublicKey`, `derivePublicKeyShare`,
+`reconstructSecret`) is a direct, field/group-swapped PORT of this
+repo's OWN prior work — `frost.deriveInterpolatingValue` (RFC 9591 Appendix
+C, see `modules/frost/NOTICE`) and `bls12_381.threshold`'s
+`evalPolynomialAt`/`feldmanCommitCoefficient`/`derivePublicKeyShare`/
+`combineSignatures` (see `modules/bls12_381/NOTICE`) — same authorship,
+ported not copied from a third party. No new third-party source or design
+reference was introduced for this part.
+
+`std.crypto.ecc.Secp256k1` (curve group, `basePoint`/`identityElement`,
+`add`/`mul`, `fromSec1`/`toCompressedSec1`, `rejectIdentity`) and
+`std.crypto.ecc.Secp256k1.scalar.Scalar` (the scalar field Zq,
+`fromBytes`/`fromBytes48`/`toBytes`/`add`/`sub`/`mul`/`invert`/`random`) are
+used via their public APIs — the same primitives `frost`/`bip340`/`musig2`
+already build on in this repo. `std.crypto.ff.Modulus`/`.Fe`
+(`AuxModulus`/`AuxFe`) is the same fixed-width constant-time modular-
+arithmetic primitive `rsa`/`paillier` build on. No new curve, field, or hash
+primitive is implemented here.
+
+The sibling `paillier` module (see `modules/paillier/README.md` and its
+entry in the root `NOTICE`) is a build dependency: `keygenTrustedDealer`
+wires each party's `paillier.KeyPair` (from `paillier.generate` or
+`paillier.fromPrimes`) into its `KeyShare` — a thin, judgment-free
+composition, no new Paillier-specific crypto judgment introduced in this
+module.
+
+No GPL/LGPL/AGPL source was consulted or copied anywhere in this module.
+
+**Status: scaffold.** The Shamir/Feldman/Lagrange core and the
+Paillier-keygen wiring are REAL (see `SPEC.md`'s "What's REAL vs STUBBED").
+`generateAuxParams` (the ring-Pedersen auxiliary-parameter number theory) is
+an `@panic("TODO(core): ...")` stub with its construction spelled out in its
+own doc comment, awaiting a follow-up crypto pass. See `SPEC.md`'s "Design
+decision" and "Backlog / deferred" sections for exactly what remains and the
+suggested follow-up tier.
