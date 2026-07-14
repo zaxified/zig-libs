@@ -6,7 +6,7 @@ purpose and API. Provenance: see [NOTICE](NOTICE).
 
 ## Purpose
 
-Parts 1-4 of a multi-part arc (`README.md`). Part 1: the base field `Fp`,
+Parts 1-5 of a multi-part arc (`README.md`). Part 1: the base field `Fp`,
 the extension tower `Fp2`/`Fp6`/`Fp12`, the scalar field `Fr`, and the two
 pairing groups `G1`/`G2` — everything the pairing function needs as its
 foundation. Part 2 (`pairing.zig`): the pairing itself, `e: G1 x G2 ->
@@ -15,8 +15,10 @@ exponentiation. Part 3 (`hash_to_curve.zig`): RFC 9380 hash-to-curve
 for `G1`/`G2` — the primitive BLS signatures use to hash a message onto
 the curve. Part 4 (`bls_sig.zig`, **COMPLETE**): BLS signatures per
 draft-irtf-cfrg-bls-signature-05, minimal-pubkey-size/ProofOfPossession
-ciphersuite. This module does NOT implement KZG or threshold BLS —
-those are later parts (5-6).
+ciphersuite. Part 5 (`kzg.zig`, **COMPLETE**): EIP-4844 (deneb)
+KZG polynomial commitments over the trusted-setup ceremony's `G1`/`G2`
+points. This module does NOT implement threshold BLS — that is the
+later Part 6.
 
 ## Model-after + seed
 
@@ -390,6 +392,123 @@ those are later parts (5-6).
   variable-time, like the pairing and hash-to-curve they compose
   (see "Constant-time choices" under Threat model).
 
+## Part 5 design (KZG polynomial commitments — COMPLETE 2026-07-14)
+
+- **Model-after: `consensus-specs` `specs/deneb/polynomial-commitments.md`**
+  (the deneb/EIP-4844 KZG spec — fetched from the `master` branch,
+  2026-07-14; see `NOTICE` for the exact citation). Every constant
+  (`FIELD_ELEMENTS_PER_BLOB`, `BYTES_PER_*`, `BLS_MODULUS`,
+  `PRIMITIVE_ROOT_OF_UNITY`, the two Fiat-Shamir domain strings,
+  `G1_POINT_AT_INFINITY`) is copied verbatim from the fetched spec text,
+  not from memory — the same "cite, don't recall" discipline Parts 1-4
+  apply to every curve constant (`NOTICE`).
+- **The trusted setup: embedded, not fetched at runtime.** The official
+  Ethereum KZG ceremony ("Summoning Ceremony") `trusted_setup.txt`
+  (`ethereum/c-kzg-4844`'s copy — the de facto canonical distribution
+  format: 4096 `G1` Lagrange points, 65 `G2` monomial points, 4096 `G1`
+  monomial points, one 96-or-192-hex-char line each) is `@embedFile`d
+  into the binary (`data/trusted_setup.txt`, ~788 KiB) rather than
+  fetched over the network at load time — matching this repo's zero-I/O,
+  zero-dep posture (`CONVENTIONS.md` §2) and how every other embedded
+  data asset in this module (none, prior to this) would be handled if
+  one existed. `loadTrustedSetup` parses AND validates every point
+  (on-curve + subgroup check, REAL — Parts 1/2's own primitives) before
+  returning it; nothing downstream trusts an unchecked ceremony point.
+- **Basis-order finding (verified against `c-kzg-4844`'s own C loader,
+  not assumed): the file's `G1` Lagrange points are NOT pre-permuted.**
+  `c-kzg-4844`'s `src/setup/setup.c` reads the file into a plain array
+  and only THEN calls `bit_reversal_permutation(...)` on it in place
+  (the `_brp`-suffixed field name is the tell). This module's
+  `TrustedSetup.g1_lagrange` therefore stores the FILE's natural order;
+  `blobToKzgCommitment` applies `bitReversalPermutation` (REAL, this
+  file) itself, matching the spec's own
+  `bit_reversal_permutation(KZG_SETUP_G1_LAGRANGE)` composition in
+  `blob_to_kzg_commitment` — a scaffolding-time finding worth recording
+  explicitly (an easy point to get backwards, à la the Part-1 `g2`
+  cofactor and Part-3 `h_eff` corrections this module has already hit
+  once each).
+- **Crypto-core pass (2026-07-14) — implementation decisions.** Every
+  formerly-stubbed function is now real, each implementing exactly the
+  construction its scaffold doc comment specified (the spec text was
+  re-fetched and re-read during this pass, not recalled — `NOTICE`).
+  The settled decisions:
+  - **Trusted-setup loading is memoized process-wide** (`loadTrustedSetup`
+    / `validated_setup_cache`): the input is a `@embedFile`d compile-time
+    constant, so the first full validation's verdict holds for every
+    call — subsequent loads deep-copy the already-validated points into
+    the caller's allocator. NOTHING is skipped; the 8257-point on-curve +
+    subgroup validation simply isn't repeated per call (the scaffold's
+    per-call re-validation cost minutes per test binary for zero added
+    assurance). The cache is a write-once atomic pointer (lock-free; a
+    first-load race means redundant validation, never a wrong result).
+  - **First-load validation is parallelized and uses the variable-time
+    subgroup check for `G1`** (`parseAndValidateEmbeddedSetup` +
+    `subgroupCheckVartime`): setup points are PUBLIC (threat model
+    below), so the constant-time double-and-add-ALWAYS engine's ~3x
+    overhead buys nothing; the per-point checks are independent and fan
+    out across CPU cores (`std.Thread.spawn`, serial fallback if
+    spawning fails). The 65 `G2` points ride on worker 0 with the
+    existing constant-time check (not worth a `G2` vartime twin).
+  - **Variable-time `G1` helpers** (`jacAddVartime`/`jacMixedAddVartime`/
+    `jacScalarMulVartime`): the same EFD `add-2007-bl`/`madd-2007-bl`/
+    `dbl-2009-l` formulas as `g1.zig`, with ordinary branches instead of
+    branchless `ctSelect` resolution — pinned against the constant-time
+    versions across random AND every degenerate input class (identity
+    operands, `P == Q`, `P == -Q`) by dedicated tests. Used only on
+    public data (MSM, setup validation); `verifyKzgProofImpl`'s two
+    scalar multiplications stay on the constant-time engine (not worth
+    a vartime path).
+  - **`g1Msm` is Pippenger's bucket method** over the vartime helpers:
+    `c`-bit windows (`c` by input size, capped at 8), per-window bucket
+    accumulation via mixed addition, running-sum aggregation,
+    most-significant-window-first folding with `c` doublings between
+    windows — `O(n·256/c)` mixed additions versus naive double-and-add's
+    `O(n·256)` full add+double pairs. Zero digits skip bucket work, so
+    zero scalars/identity points drop out naturally; `n == 0` returns
+    the identity (spec's explicit case). It takes an allocator (scalar
+    bytes + bucket array) — a deliberate signature change from the
+    scaffold.
+  - **The primitive `2^32` root of unity is DERIVED, not embedded**
+    (`primitiveRootOfUnity2Pow32`): `7^((r-1)/2^32) mod r` per the
+    spec's own `compute_roots_of_unity` formula, with the exponent
+    comptime-derived from the verified `scalar.r_bytes`
+    (`root32_exponent_bytes` — `r`'s low 32 bits are `0x00000001`, so
+    `(r-1)/2^32` is a borrow-free decrement + 4-byte shift). Its order
+    is proven exactly `2^32` by tests (`w^(2^32) == 1`, `w^(2^31) ==
+    -1`), and the whole domain convention is pinned against the REAL
+    ceremony by the two monomial-vs-Lagrange cross-check tests (below).
+  - **`evaluatePolynomialInEvaluationForm` takes an allocator now**
+    (barycentric denominators are batch-inverted via the Montgomery
+    trick, `batchInvInPlace` — one `Fr.inv` + `3n` muls instead of 4096
+    Fermat exponentiations per evaluation); the in-domain branch
+    (direct indexing) is exercised by KAT-adjacent tests.
+  - **`computeKzgProofImpl`** batch-inverts the `x_i - z` denominators
+    with the in-domain index (if any) masked behind a placeholder, and
+    reuses those inverses for the spec's
+    `compute_quotient_eval_within_domain` special case
+    (`1/(z - x_i) == -1/(x_i - z)`).
+- **`fft`/`ifft` are real but unused by this file's own public API.**
+  EIP-4844's specific operations (`blob_to_kzg_commitment`,
+  `compute_kzg_proof`) stay in evaluation form throughout (barycentric
+  evaluation + direct Lagrange-basis MSM) — no coefficient-form
+  conversion is needed for this exact API surface. They are reusable
+  `Fr`-generic radix-2 Cooley-Tukey NTT primitives (a future consumer —
+  coefficient-form conversion, EIP-7594 cells, a faster batched-proof
+  scheme — will want them), verified against a naive DFT, the
+  `ifft ∘ fft == id` round trip, AND the real ceremony: the strongest
+  single test in the file recovers a KAT blob's coefficient form via
+  `ifft` and reproduces the c-kzg-4844 commitment through the MONOMIAL
+  setup basis — jointly pinning the root of unity, the
+  blob-element-i-is-`p(roots_brp[i])` domain convention, the
+  bit-reversal permutation, the `ifft`, and the MSM over both bases.
+- **Canonical-field-element enforcement is REAL and load-bearing.**
+  `bytesToBlsField`/`blobToPolynomial` REJECT (never reduce) any 32-byte
+  input `>= BLS_MODULUS` — matching the spec's `bytes_to_bls_field`
+  precisely (a REJECTING parse, unlike `Fr.reduceWide`'s wide-input
+  REDUCING parse used elsewhere in this module for hash outputs). A
+  blob, `z`, or `y` with a non-canonical element is a malformed-input
+  error, not a silently-reduced one.
+
 ## Threat model / limits
 
 - **The BLS subgroup-check pitfall — this module's central threat.**
@@ -488,6 +607,39 @@ those are later parts (5-6).
   or per-message public-key augmentation this module does not
   implement); KZG and threshold BLS remain Parts 5-6, unaffected by
   Part 4's scope.
+- **KZG runs on PUBLIC data — variable-time is fine (Part 5).** Every
+  KZG operation's inputs (blobs, commitments, proofs, the evaluation
+  point `z`) are public by construction in every consumer this module
+  anticipates (EIP-4844 blob transactions are broadcast in full; a
+  trusted-setup ceremony's own points are published) — there is no
+  secret-scalar path through `kzg.zig` analogous to Part 4's `sk`/
+  `sign`/`popProve`. AS IMPLEMENTED: `g1Msm` and the trusted-setup
+  subgroup validation run on dedicated variable-time `G1` arithmetic
+  (`jacAddVartime`/`jacMixedAddVartime`/`jacScalarMulVartime`,
+  `kzg.zig` — branchy twins of `g1.zig`'s constant-time formulas,
+  pinned equal by tests); the FFT, barycentric evaluation, batch
+  inversion, and pairing checks branch freely on input-derived values;
+  no constant-time contortion is attempted anywhere in `kzg.zig`,
+  consistent with `pairing.zig`'s and `hash_to_curve.zig`'s own
+  "public-input, variable-time" threat-model notes above. Do NOT feed
+  `kzg.zig` a secret value (or reuse its vartime helpers on secret
+  scalars/points) without revisiting this.
+- **Trusted-setup toxic waste is out of scope.** This module embeds and
+  validates a PUBLISHED ceremony's output; it has no role in, and makes
+  no claim about, the ceremony's own security (the "toxic waste" secret
+  `s` must have been destroyed by at least one honest participant — a
+  property of the ceremony process, not verifiable from the published
+  points alone). `loadTrustedSetup`'s validation (on-curve + subgroup)
+  only rules out MALFORMED points, not a compromised ceremony.
+- **Out of scope for Part 5**: the EIP-7594 (PeerDAS) cell/multi-proof
+  scheme (`compute_cells`, `compute_cells_and_kzg_proofs`,
+  `verify_cell_kzg_proof_batch`, `recover_cells_and_kzg_proofs` —
+  `c-kzg-4844`'s `tests/` directory carries vectors for these too, but
+  they are a materially larger, separate spec
+  (`specs/fulu/polynomial-commitments-sampling.md`-family) built on TOP
+  of this file's primitives, not required by EIP-4844 itself); any KZG
+  ceremony/setup GENERATION code (this module only ever CONSUMES a
+  published setup); threshold BLS (Part 6, unaffected by Part 5's scope).
 
 ## Verification
 
@@ -606,6 +758,53 @@ those are later parts (5-6).
   **`zig build test-bls12_381` reports 148/148 pass, 0 panics, in both
   Debug and ReleaseFast** (`zig fmt --check` clean; disk test-block
   count == runtime count == 148).
+- **Part 5 (`kzg.zig`) — COMPLETE, 36 tests**: constants cross-checked
+  against the fetched spec text (including an independent decimal->hex
+  conversion confirming `BLS_MODULUS == scalar.r_bytes`);
+  `G1_POINT_AT_INFINITY` cross-checked against `g1.zig`'s own compressed-
+  identity encoding; `isPowerOfTwo`/`reverseBits`/`bitReversalPermutation`
+  (the involution property, plus the spec's own order-8 worked example)
+  and `computePowers` (small worked cases, `n=0`). `loadTrustedSetup` is
+  exercised structurally (every slice's length) AND semantically
+  (`g1_monomial[0]`/`g2_monomial[0]` equal this module's own `G1`/`G2`
+  generators — the `[s^0]G = G` identity). `bytesToBlsField`/
+  `validateKzgG1`/`blobToPolynomial` are exercised for both their accept
+  AND reject paths (non-canonical field element, non-subgroup point).
+  **Byte-exact `ethereum/c-kzg-4844` KAT coverage across every EIP-4844
+  public function**, over TWO embedded blobs — the constant-2 blob
+  (permutation-invariant) and the "random" blob #4 (added by the
+  crypto-core pass precisely because it is permutation-SENSITIVE: it
+  would catch any bit-reversal/root-of-unity error the constant blob
+  cannot); `NOTICE` has every fetched file's path + sha256:
+  `blob_to_kzg_commitment_case_valid_blob_{1,4}`,
+  `compute_kzg_proof_case_valid_blob_1_0` and `_4_{2,5}`,
+  `verify_kzg_proof_case_correct_proof_1_0`/`_4_2` (accept) +
+  `verify_kzg_proof_case_incorrect_proof_0_0`/`_4_2` (reject),
+  `compute_blob_kzg_proof_case_valid_blob_{1,4}` (which pin
+  `computeChallenge`'s Fiat-Shamir transcript byte-exactly — the output
+  proof is an opening at the challenge point),
+  `verify_blob_kzg_proof_case_correct_proof_{1,4}` (accept) +
+  `verify_blob_kzg_proof_case_incorrect_proof_1` (reject), and a
+  two-blob batch of the pinned tuples (accept) with swapped proofs
+  (reject). PROPERTY layer: the vartime `G1` helpers against the
+  constant-time engine on random + every degenerate case; `g1Msm`
+  against naive scalar-mul (plus empty input, zero scalars, identity
+  points, a full-width scalar); the derived root of unity's order is
+  exactly `2^32` and the 4096-domain is primitive/complete; `fft`
+  against a naive DFT + `ifft ∘ fft == id`; TWO monomial-vs-Lagrange
+  ceremony cross-checks (the `ifft`-coefficient commitment of blob #4,
+  and a linear polynomial's `[c0]G + [c1][s]G1` prediction); barycentric
+  evaluation of a known linear polynomial (out-of-domain formula AND
+  in-domain indexing); `computeKzgProof` at an in-domain `z` (y indexes
+  the polynomial, proof verifies); a full pseudorandom-blob
+  commit->prove->verify round trip with wrong-`y`/wrong-proof/
+  tampered-blob rejections; `batchInvInPlace`; and fail-closed
+  non-canonical-field-element rejection at every bytes entry point. Plus
+  the scaffold's cross-check that the constant blob's KAT commitment
+  independently equals `g1.zig`'s own pre-existing `[2]G` KAT.
+  **`zig build test-bls12_381` (Debug) and `zig test -OReleaseFast`
+  report 184/184 pass, 0 panics** (`zig fmt --check` clean; disk
+  test-block count == runtime count).
 
 ## Status
 
@@ -654,6 +853,31 @@ mandatory subgroup/`KeyValidate` checks proven to fire by dedicated
 fail-closed tests. `zig build test-bls12_381`: 148/148 pass, 0 panics,
 Debug AND ReleaseFast — see "Verification" above.
 
+**Part 5 COMPLETE (crypto-core pass, 2026-07-14).** EIP-4844 (deneb)
+KZG polynomial commitments over this module's own
+`G1`/`G2`/`Fr`/pairing primitives — everything is real: the
+trusted-setup loader (embeds + validates the official Ethereum KZG
+ceremony's `trusted_setup.txt`, on-curve + subgroup-checking all 8257
+points ONCE per process, memoized — see "Part 5 design"),
+blob<->polynomial (de)serialization with canonical-field-element
+enforcement, `G1`/commitment/proof validation, the bit-reversal-
+permutation/`computePowers` helpers, `g1Msm` (Pippenger over
+variable-time public-data arithmetic), the `Fr` radix-2 NTT
+(`fft`/`ifft`) with the runtime-DERIVED primitive `2^32` root of unity,
+`evaluatePolynomialInEvaluationForm` (barycentric, batch-inverted
+denominators, in-domain special case), `computeKzgProofImpl`
+(evaluation-form quotient incl. the in-domain removable singularity),
+`verifyKzgProofImpl`/`verifyKzgProofBatchImpl` (the pairing-product
+checks: `e(proof, [s]₂ - [z]₂) == e(commitment - [y]₁, [1]₂)` as
+`pairingCheck({P - [y]G, -G2}, {proof, [s]₂ - [z]₂})`, and its
+`r`-powers random-linear-combination batch generalization), and
+`computeChallenge` (Fiat-Shamir). Byte-exact against
+`ethereum/c-kzg-4844` KATs across every public function, over both a
+constant and a permutation-sensitive random blob, plus two
+monomial-vs-Lagrange ceremony cross-checks and a full property suite —
+see "Verification" above. `zig build test-bls12_381`: 184/184 pass, 0
+panics, Debug AND ReleaseFast.
+
 ### Backlog (deferred)
 
 1. **The Miller-loop sparse-multiplication optimization** — a freshly
@@ -699,3 +923,13 @@ Debug AND ReleaseFast — see "Verification" above.
    non-equivalence finding — until then `keyGen` is covered by the
    deterministic/round-trip tests only); the min-sig ciphersuite
    variant ("Part 4b", out of scope for now).
+7. **Part 5 follow-ups (the crypto-core pass itself is DONE — see
+   Status)**: MSM performance beyond baseline Pippenger (signed/NAF
+   digits, affine batch-inverted bucket additions, per-window
+   parallelism — the implemented bucket method is already `O(n·256/c)`
+   but each addition still pays full Jacobian arithmetic); a
+   precomputed/cached bit-reversal-permuted Lagrange basis on
+   `TrustedSetup` (currently re-permuted per commitment/proof — a cheap
+   copy, but avoidable); EIP-7594/PeerDAS cell proofs (explicitly out
+   of scope for Part 5 itself, `SPEC.md`'s threat model — `fft`/`ifft`
+   are already in place for it).

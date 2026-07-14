@@ -587,3 +587,203 @@ clean.
 **Status: Part 4 COMPLETE (crypto-core pass, 2026-07-14).** See
 `SPEC.md`'s "Part 4 design" section and `bls_sig.zig`'s module doc
 comment for the settled design record.
+
+Part 5 (kzg.zig) — provenance and test-vector sourcing (SCAFFOLD PASS, 2026-07-14)
+------------------------------------------------------------------------------------
+
+1. **`consensus-specs` `specs/deneb/polynomial-commitments.md`** (Ethereum
+   Foundation, Apache-2.0/CC0-mixed license per the repo's own `LICENSE`
+   — a public spec, not a copyrightable work per the merger doctrine,
+   `CONVENTIONS.md` §5, same status as the pairing-friendly-curves draft
+   entry 1 above) — fetched 2026-07-14 from
+   `https://raw.githubusercontent.com/ethereum/consensus-specs/master/specs/deneb/polynomial-commitments.md`.
+   Every constant this pass embeds (`FIELD_ELEMENTS_PER_BLOB`,
+   `BYTES_PER_FIELD_ELEMENT`/`_COMMITMENT`/`_PROOF`/`_BLOB`,
+   `BLS_MODULUS`, `PRIMITIVE_ROOT_OF_UNITY`, `G1_POINT_AT_INFINITY`,
+   `FIAT_SHAMIR_PROTOCOL_DOMAIN`, `RANDOM_CHALLENGE_KZG_BATCH_DOMAIN`,
+   `NUM_G2_POINTS`/`KZG_SETUP_G2_LENGTH`) and every doc-comment
+   pseudocode quotation (`blob_to_kzg_commitment`, `verify_kzg_proof_impl`,
+   `verify_kzg_proof_batch`, `compute_kzg_proof_impl`,
+   `compute_quotient_eval_within_domain`, `compute_challenge`,
+   `evaluate_polynomial_in_evaluation_form`, `compute_roots_of_unity`,
+   the bit-reversal-permutation helpers) was extracted directly from this
+   fetched text, not from memory. `BLS_MODULUS`'s decimal literal
+   (`52435875175126190479447740508185965837690552500527637822603658699938581184513`)
+   was independently converted to hex and confirmed to equal
+   `scalar.r_bytes` (already independently re-derived and verified,
+   `scalar.zig`) byte-for-byte — see `kzg.zig`'s own wired test. The
+   `hash` primitive `compute_challenge`/`hash_to_bls_field` build on was
+   confirmed to be SHA-256 by additionally fetching
+   `specs/phase0/beacon-chain.md` (same repo, same fetch) and reading its
+   own "`def hash(data: bytes) -> Bytes32` is SHA256" glossary line
+   directly, rather than assumed from general Eth2 familiarity.
+2. **`ethereum/c-kzg-4844`** (Apache-2.0, `github.com/ethereum/c-kzg-4844`)
+   — TWO uses, both fetched 2026-07-14 from the `main` branch:
+   - **`src/trusted_setup.txt`** — the official Ethereum KZG ceremony
+     ("Summoning Ceremony") trusted setup, `@embedFile`d verbatim into
+     this module at `data/trusted_setup.txt` (807177 bytes; sha256
+     `d39b9f2d047cc9dca2de58f264b6a09448ccd34db967881a6713eacacf0f26b7`).
+     Structurally confirmed (line 1 = `4096`, line 2 = `65`, then 4096
+     96-hex-char `G1` lines, 65 192-hex-char `G2` lines, 4096 more
+     96-hex-char `G1` lines — `8259` lines total, matching) AND
+     semantically confirmed by this pass: the first `G1` monomial point
+     (`[s^0]G1`) decodes to the EXACT compressed bytes of THIS module's
+     own `g1.Affine.generator` (`97f1d3a7...`, `g1.zig`'s own
+     independently-verified generator KAT), and the first `G2` monomial
+     point likewise matches `g2.Affine.generator`'s compressed bytes
+     (`93e02b60...`, `g2.zig`'s own KAT) — i.e. the ceremony's monomial
+     basis at exponent 0 is confirmed to be exactly this module's own
+     curve generators, not merely assumed compatible. `loadTrustedSetup`
+     (`kzg.zig`) additionally validates EVERY one of the file's 8257
+     points on-curve AND subgroup-checked (REAL, Parts 1/2's own
+     primitives) before use — see `SPEC.md`'s Part 5 design section.
+     **Ceremony attribution**: this trusted setup is the output of the
+     public, multi-party "KZG Ceremony" (`ceremony.ethereum.org`,
+     run 2023) with contributions from thousands of independent
+     participants; its output is published/distributed as public domain
+     data by the Ethereum Foundation and the `c-kzg-4844` project (no
+     separate license file accompanies `trusted_setup.txt` itself in the
+     upstream repo; the repo's own top-level `LICENSE` is Apache-2.0).
+     Cited here for provenance, not because attribution is a license
+     condition of using published ceremony output.
+   - **`src/setup/setup.c`** — consulted (read directly, not ported) to
+     resolve an ambiguity the spec text alone does not settle: whether
+     `trusted_setup.txt`'s `G1` Lagrange points are stored pre-permuted
+     (bit-reversal order) or in natural order. Reading `load_trusted_setup`
+     directly showed the file is read into a plain array and ONLY THEN
+     bit-reversal-permuted in place (the `g1_values_lagrange_brp` field
+     name, and the `bit_reversal_permutation(...)` call immediately after
+     the read loop, not before) — confirming the FILE itself is natural-
+     order, a finding recorded in `TrustedSetup`'s own doc comment
+     (`kzg.zig`) and `SPEC.md`'s Part 5 design section, since it is
+     exactly the kind of easy-to-invert convention this module's own
+     history (the Part-1 `g2` cofactor, Part-3 `h_eff`) has been bitten
+     by before. `Apache-2.0`; this is a DESIGN-REFERENCE read (one
+     function, to resolve a file-format question), not ported source —
+     no code from `setup.c` appears in `kzg.zig`.
+   - **`tests/{blob_to_kzg_commitment,compute_kzg_proof,verify_kzg_proof,
+     verify_blob_kzg_proof}/kzg-mainnet/*/data.yaml`** — the KAT vectors
+     `kzg.zig`'s tests wire (see below). CC0-1.0-licensed test data (no
+     attribution obligation, cited for provenance only), fetched
+     2026-07-14 and read directly (not transcribed from memory or a
+     secondary source):
+     - `blob_to_kzg_commitment/kzg-mainnet/blob_to_kzg_commitment_case_valid_blob_1/data.yaml`
+     - `compute_kzg_proof/kzg-mainnet/compute_kzg_proof_case_valid_blob_1_0/data.yaml`
+     - `verify_kzg_proof/kzg-mainnet/verify_kzg_proof_case_correct_proof_1_0/data.yaml`
+     - `verify_kzg_proof/kzg-mainnet/verify_kzg_proof_case_incorrect_proof_0_0/data.yaml`
+     - `verify_blob_kzg_proof/kzg-mainnet/verify_blob_kzg_proof_case_correct_proof_1/data.yaml`
+     - `verify_blob_kzg_proof/kzg-mainnet/verify_blob_kzg_proof_case_incorrect_proof_1/data.yaml`
+     The FOUR "valid"/"correct" vectors above were confirmed, during this
+     pass, to all reference the EXACT SAME 131072-byte blob (the constant
+     polynomial `p(x) = 2`, byte-compared across all four fetched files)
+     — so `kzg.zig` embeds this one blob once
+     (`data/kzg_test_vectors/blob_constant_2.hex`, 262144 hex chars / sha256
+     `e9f27c2f13e7eabb5047782fee2442539a1c9ffbaa5c31bd41ea21297c528a94`)
+     and reuses it across all four KAT tests rather than embedding four
+     near-duplicate 128 KiB blobs. Its commitment
+     (`a572cbea904d67468808c8eb50a9450c9721db309128012543902d0ac358a62ae28f75bb8f1c7c42c39a8c5529bf0f4e`)
+     was additionally cross-checked, in this pass, against `g1.zig`'s OWN
+     pre-existing, independently-sourced `two_g_compressed_hex` KAT (the
+     compressed encoding of `[2] * G1_generator`, computed there by a
+     from-scratch Python affine-coordinates implementation with no KZG
+     involved) — both are byte-identical, an unplanned but genuine
+     cross-module confirmation (the constant-2 polynomial's KZG
+     commitment IS `[2] * G1_generator`, since the Lagrange basis sums to
+     the generator) wired as its own test in `kzg.zig`.
+   - The EIP-7594 (PeerDAS) `tests/{compute_cells,
+     compute_cells_and_kzg_proofs,compute_verify_cell_kzg_proof_batch_challenge,
+     recover_cells_and_kzg_proofs,verify_cell_kzg_proof_batch}/` categories
+     were NOT used — out of scope for Part 5 (`SPEC.md`'s Part 5 threat
+     model / out-of-scope note); EIP-4844 itself needs none of them.
+3. **`draft-irtf-cfrg-pairing-friendly-curves`/ZCash/IETF point-
+   serialization convention** (already named in entry 2 above) — `kzg.zig`
+   reuses `g1.zig`/`g2.zig`'s existing compressed-point codecs
+   (`fromBytesCompressed`/`toBytesCompressed`) unchanged; no new wire
+   format is introduced by Part 5.
+
+No GPL/LGPL/AGPL source was consulted or copied anywhere in this pass.
+
+Part 5 (kzg.zig) — CRYPTO-CORE PASS (2026-07-14)
+------------------------------------------------------------------------------------
+
+The formerly-stubbed crypto core (`g1Msm`, the `Fr` FFT and its
+primitive root of unity, `evaluatePolynomialInEvaluationForm`,
+`computeKzgProofImpl`, `verifyKzgProofImpl`/`verifyKzgProofBatchImpl`,
+`computeChallenge`) is now IMPLEMENTED. Provenance for this pass:
+
+1. **`consensus-specs` `specs/deneb/polynomial-commitments.md`** —
+   RE-fetched 2026-07-14 (same URL as scaffold entry 1; sha256 of the
+   fetched text
+   `1c7252d978ca09e73c0d7d48cc10756743fb3bd798ca1bf1965969ad8948d8ba`)
+   and re-read function-by-function during implementation rather than
+   trusting the scaffold's doc-comment quotations alone. Two details
+   confirmed directly against the text: `compute_challenge` uses a
+   16-byte big-endian `FIELD_ELEMENTS_PER_BLOB` width field, while
+   `verify_kzg_proof_batch`'s transcript uses 8-byte width AND count
+   fields (the spec genuinely differs between the two transcripts); and
+   the exact pairing-list signs of `verify_kzg_proof_impl` /
+   `verify_kzg_proof_batch`.
+2. **The primitive `2^32` root of unity in `Fr` is DERIVED, not
+   transcribed**: `7^((r-1)/2^32) mod r` at runtime, per the spec's own
+   `compute_roots_of_unity` formula (`PRIMITIVE_ROOT_OF_UNITY = 7`,
+   spec-cited), with the exponent comptime-derived from the
+   already-verified `scalar.r_bytes` (`root32_exponent_bytes`,
+   `kzg.zig`). No reference implementation's 32-byte root constant was
+   copied or even compared; the value's order is proven exactly `2^32`
+   by tests, and the derived 4096-element domain is pinned against the
+   REAL ceremony output by two monomial-vs-Lagrange commitment
+   cross-check tests (`kzg.zig`).
+3. **`ethereum/c-kzg-4844` `tests/` (CC0-1.0 test data)** — additional
+   KAT vectors fetched 2026-07-14 from the `main` branch (read
+   directly; sha256 of each fetched `data.yaml`):
+   - `blob_to_kzg_commitment/kzg-mainnet/blob_to_kzg_commitment_case_valid_blob_4/data.yaml`
+     (`cbb2b99859288e9b4d177c70c0011ffe69acf8fa7751ffe74f79b96797555f79`)
+     — the "random" blob #4 + its commitment. The blob is embedded at
+     `data/kzg_test_vectors/blob_random_4.hex` (262144 hex chars; sha256
+     `cdae0d24f86dd69ff8e034ac2fd82218eef5d14b6056251f8a23c68dc269e055`),
+     added because the scaffold's constant-2 blob is PERMUTATION-
+     INVARIANT and cannot detect bit-reversal/root-of-unity errors.
+   - `compute_kzg_proof/kzg-mainnet/compute_kzg_proof_case_valid_blob_4_2/data.yaml`
+     (`63d171f243203de27e607cec2f6cc0b2d0f060e75d29308f30d4c7418fdef1af`)
+   - `compute_kzg_proof/kzg-mainnet/compute_kzg_proof_case_valid_blob_4_5/data.yaml`
+     (`70028438c52222f12722afacf5364c0fabbbbdcfc49d346a3927bcf9629705d8`)
+   - `verify_kzg_proof/kzg-mainnet/verify_kzg_proof_case_correct_proof_4_2/data.yaml`
+     (`c564eb494049d3690cfcc6f699c04f3ceedc22f89b5dd97f19ef20397a3bc4e8`)
+   - `verify_kzg_proof/kzg-mainnet/verify_kzg_proof_case_incorrect_proof_4_2/data.yaml`
+     (`885b0730ec4772393f509c1c33c782b4894c1c4179b6aa10ce2d5d3a0fe86e42`)
+   - `compute_blob_kzg_proof/kzg-mainnet/compute_blob_kzg_proof_case_valid_blob_1/data.yaml`
+     (`2208dcc9af170a061d5f39f222e5b8c9809e431ce3daa31a61e1f12c27bfe5fe`)
+   - `compute_blob_kzg_proof/kzg-mainnet/compute_blob_kzg_proof_case_valid_blob_4/data.yaml`
+     (`6098ad6b41146e978e8f9967d6451463ab2415f10c888f76ea2459f35d457e42`)
+   - `verify_blob_kzg_proof/kzg-mainnet/verify_blob_kzg_proof_case_correct_proof_4/data.yaml`
+     (`4449e00ca5a87a096b0fd5b87e5c95d0bea165b9c2eadf993f818300957541b2`)
+   All `_4`-suffixed cases were confirmed during the fetch to reference
+   the byte-identical blob #4, so the ONE embedded blob serves five KAT
+   categories (same de-duplication reasoning as the scaffold's
+   constant-2 blob). The two-blob batch test composes tuples that are
+   each individually pinned byte-exact by the vectors above (c-kzg's
+   own batch cases only expose a boolean, and the batch challenge `r`
+   is unobservable in that boolean for both honest and tampered inputs
+   — the 8+8-byte transcript layout is therefore implemented from the
+   spec text (item 1) and cannot be pinned tighter by ANY black-box
+   vector).
+4. **Algorithm/design references (named, not read as source, same
+   status as `g1.zig`'s formula citations)**: the Bernstein–Lange
+   Explicit-Formulas Database `shortw/jacobian-0` `add-2007-bl` /
+   `madd-2007-bl` / `dbl-2009-l` formulas (the variable-time `G1`
+   helpers — the `add-2007-bl` and `dbl-2009-l` shapes were already in
+   `g1.zig` from Part 1; `madd-2007-bl` is its published `Z2 = 1`
+   specialization); Pippenger's bucket method for `g1Msm` (textbook
+   construction: windowed bucket accumulation + running-sum
+   aggregation); the standard iterative radix-2 Cooley-Tukey butterfly
+   network for the `Fr` NTT; and the Montgomery batch-inversion trick
+   for `batchInvInPlace`. No third-party CODE was consulted, read, or
+   ported for any of them.
+
+**Status: Part 5 COMPLETE (2026-07-14).** Trusted-setup loader (with
+process-wide memoization of the validated embedded setup — see
+`SPEC.md`'s "Part 5 design"), wire codecs/validation, and the full KZG
+crypto core are real; byte-exact against the `ethereum/c-kzg-4844`
+vectors listed above and in the scaffold entry, in Debug and
+ReleaseFast. See `SPEC.md`'s "Part 5 design" section and `kzg.zig`'s
+own module doc comment.

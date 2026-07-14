@@ -5,7 +5,7 @@ KZG polynomial commitments, and threshold-BLS schemes — the base field
 `Fp`, the extension tower `Fp2`/`Fp6`/`Fp12`, the scalar field `Fr`, the
 two pairing groups `G1`/`G2`, and the pairing `e: G1 x G2 -> Gt`.
 
-**Status: Parts 1-4 complete.** Part 1's full
+**Status: Parts 1-5 complete.** Part 1's full
 field-tower and group arithmetic, every curve/field constant
 independently verified (see `NOTICE` — including a G2-cofactor
 scaffold bug found and fixed during the crypto-core pass),
@@ -31,8 +31,19 @@ minimal-pubkey-size/ProofOfPossession ciphersuite — `keyGen`/`skToPk`/
 `aggregateVerify`/`fastAggregateVerify`, and proof-of-possession
 (`popProve`/`popVerify`), byte-exact against `ethereum/bls12-381-tests`
 v0.1.2 vectors, with the mandatory subgroup/`KeyValidate` checks
-fail-closed at every verify entry point. 148/148 tests green in Debug
-AND ReleaseFast (see `SPEC.md` for the design record).
+fail-closed at every verify entry point. Part 5 (`kzg.zig`) is EIP-4844
+(deneb) KZG polynomial commitments: the trusted-setup loader (parses
+and validates the embedded official Ethereum KZG ceremony
+`trusted_setup.txt`, on-curve + subgroup-checking all 8257 points —
+once per process, memoized), blob<->polynomial (de)serialization with
+canonical-field-element enforcement, `blobToKzgCommitment`,
+`computeKzgProof`/`verifyKzgProof`, `computeBlobKzgProof`/
+`verifyBlobKzgProof`/`verifyBlobKzgProofBatch`, plus reusable `Fr`
+FFT/inverse-FFT and Pippenger `G1` multi-scalar-multiplication
+primitives — byte-exact against `ethereum/c-kzg-4844`'s official KAT
+vectors across every public function (see `kzg.zig`'s module doc
+comment and `SPEC.md`). 184/184 tests pass, 0 panics, in Debug AND
+ReleaseFast (see `SPEC.md` for the design record).
 
 ## The multi-part arc
 
@@ -44,7 +55,7 @@ This module is planned across several parts.
 | 2 | The pairing itself: Miller loop + final exponentiation | **done** |
 | 3 | Hash-to-curve (RFC 9380, for hashing messages onto `G1`/`G2`) | **done** |
 | 4 | BLS signatures (draft-irtf-cfrg-bls-signature-05, min-pk/ProofOfPossession) | **done** |
-| 5 | KZG polynomial commitments | not started |
+| 5 | KZG polynomial commitments (EIP-4844 / deneb) | **done** |
 | 6 | Threshold BLS (Shamir/FROST-style share aggregation) | not started |
 
 ## Import
@@ -105,6 +116,17 @@ const agg = try bls.aggregate(&.{ sig, sig2 });
 const ok3 = try bls.aggregateVerify(&.{ pk, pk2 }, &.{ "message", "msg2" }, agg);
 const proof = bls.popProve(sk);               // proof of possession (registration time)
 const ok4 = bls.popVerify(pk, proof);
+
+// KZG polynomial commitments (Part 5 — EIP-4844/deneb):
+const kzg = bls12_381.kzg;
+var setup = try kzg.loadTrustedSetup(allocator); // embedded ceremony; validated once per process, memoized
+defer setup.deinit(allocator);
+const commitment = try kzg.blobToKzgCommitment(allocator, &blob, &setup);
+const result = try kzg.computeKzgProof(allocator, &blob, z_bytes, &setup); // .proof + .y
+const ok5 = try kzg.verifyKzgProof(commitment, z_bytes, result.y, result.proof, &setup);
+const blob_proof = try kzg.computeBlobKzgProof(allocator, &blob, commitment, &setup);
+const ok6 = try kzg.verifyBlobKzgProof(allocator, &blob, commitment, blob_proof, &setup);
+const ok7 = try kzg.verifyBlobKzgProofBatch(allocator, &blobs, &commitments, &proofs, &setup);
 ```
 
 Deserialization (`fromBytesCompressed`/`fromBytesUncompressed`) checks
@@ -126,13 +148,16 @@ BLS pitfall; see `SPEC.md`'s threat model).
 | `pairing.zig` | Part 2: `e: G1 x G2 -> Gt`, the optimal ate Miller loop + final exponentiation |
 | `hash_to_curve.zig` | Part 3: RFC 9380 hash-to-curve — `expandMessageXmd`, `hashToFieldFp`/`hashToFieldFp2`, Simplified SWU + 11-/3-isogeny maps, `hashToCurveG1`/`G2` + `encodeToCurveG1`/`G2` |
 | `bls_sig.zig` | Part 4: BLS signatures — `keyGen`/`skToPk`/`keyValidate`, `sign`/`verify`, `aggregate`/`aggregatePublicKeys`, `coreAggregateVerify`/`aggregateVerify`/`fastAggregateVerify`, `popProve`/`popVerify` |
+| `kzg.zig` | Part 5: EIP-4844 KZG — `loadTrustedSetup` (memoized), `blobToKzgCommitment`/`computeKzgProof`/`verifyKzgProof`/`computeBlobKzgProof`/`verifyBlobKzgProof`/`verifyBlobKzgProofBatch`, plus `fft`/`ifft` and `g1Msm` primitives |
+| `src/data/trusted_setup.txt` | The embedded official Ethereum KZG ceremony trusted setup (`@embedFile`d by `kzg.zig`) |
+| `src/data/kzg_test_vectors/` | Two embedded `c-kzg-4844` KAT blobs (constant-2 + random #4; see `NOTICE`) |
 | `root.zig` | Module entry: `meta`, re-exports, dark-tests aggregator |
 
 ## Verify
 
 ```
-zig build test-bls12_381                        # Debug — 148/148 pass
-zig build test-bls12_381 -Doptimize=ReleaseFast # ReleaseFast — 148/148 pass
+zig build test-bls12_381                        # Debug — 184/184 pass
+zig build test-bls12_381 -Doptimize=ReleaseFast # ReleaseFast — 184/184 pass
 zig fmt --check modules/bls12_381/
 ```
 

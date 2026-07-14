@@ -6,7 +6,7 @@
 //! threshold-BLS schemes — see `README.md` for the full multi-part arc
 //! this module is Part 1 of.
 //!
-//! **Status: Parts 1-4 complete.** Full field-tower and group
+//! **Status: Parts 1-5 complete.** Full field-tower and group
 //! arithmetic plus the pairing itself (`e: G1 x G2 -> Gt`,
 //! `pairing.zig`): the optimal ate Miller loop (D-type-twist line
 //! evaluation) and the full final exponentiation (easy part + the
@@ -27,7 +27,14 @@
 //! `popProve`/`popVerify` cores, byte-exact against
 //! `ethereum/bls12-381-tests` v0.1.2 vectors, with the mandatory
 //! subgroup/`KeyValidate` checks fail-closed at every verify entry
-//! point — see `bls_sig.zig`'s own module doc comment. See `SPEC.md`
+//! point — see `bls_sig.zig`'s own module doc comment. Part 5
+//! (`kzg.zig`) is **COMPLETE**: EIP-4844 (deneb) KZG polynomial
+//! commitments — the embedded official ceremony trusted setup
+//! (validated once per process, memoized), `blobToKzgCommitment`,
+//! `computeKzgProof`/`verifyKzgProof`, the blob-level proof functions
+//! and batch verification, plus reusable `Fr` FFT and Pippenger `G1`
+//! MSM primitives — byte-exact against `ethereum/c-kzg-4844`'s KAT
+//! vectors, see `kzg.zig`'s own module doc comment. See `SPEC.md`
 //! for the design record and the BLS subgroup-check pitfall this
 //! module's API is built around (deserialization does NOT
 //! subgroup-check; callers at trust boundaries must).
@@ -44,6 +51,7 @@ pub const scalar = @import("scalar.zig");
 pub const pairing = @import("pairing.zig");
 pub const hash_to_curve = @import("hash_to_curve.zig");
 pub const bls_sig = @import("bls_sig.zig");
+pub const kzg = @import("kzg.zig");
 
 pub const Fp = fp.Fp;
 pub const Fp2 = fp2.Fp2;
@@ -57,7 +65,7 @@ pub const Gt = pairing.Gt;
 pub const meta = .{
     .platform = .any,
     .role = .util, // pure computation — no I/O, no wire framing beyond point (de)serialization
-    .concurrency = .reentrant, // no globals; every type here is a plain value type
+    .concurrency = .reentrant, // every type is a plain value type; kzg's only global is a write-once atomic memo of the embedded (compile-time-constant) trusted setup
     .model_after = "draft-irtf-cfrg-pairing-friendly-curves (the BLS12-381 parameter set) + the ZCash/IETF BLS12-381 point-serialization convention; std.crypto.ff supplies the constant-time Montgomery modular arithmetic Fp/Fr are built on",
     .deps = .{}, // std only (std.crypto.ff)
 };
@@ -78,6 +86,7 @@ test {
     _ = pairing;
     _ = hash_to_curve;
     _ = bls_sig;
+    _ = kzg;
 }
 
 test "meta.model_after names the pairing-friendly-curves draft" {
