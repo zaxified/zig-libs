@@ -1,0 +1,87 @@
+blindrsa — provenance note
+===========================
+
+Kept as a module-local NOTICE (same placement as the sibling `adaptor`/
+`bip340`/`musig2` modules — self-contained crypto modules not folded into
+the root `NOTICE`).
+
+Provenance
+----------
+
+blindrsa implements **RFC 9474, "RSA Blind Signatures"** (F. Denis,
+F. Jacobs, C. A. Wood; IRTF, October 2023), a public IETF specification.
+Per CONVENTIONS.md §5's merger-doctrine note, implementing a public spec
+is not "derived from" anyone's copyrighted source — no NOTICE entry would
+strictly be required for that alone. It is included here anyway because
+this module's `pssEncode`/MGF1 helpers duplicate, by design, functionality
+the sibling `rsa` module already has privately (see SPEC.md's "Why this
+module carries its own pssEncode/MGF1"), and because one third-party
+implementation WAS consulted as a design reference (below).
+
+1. **RFC 9474 itself** — the specification implemented. Fetched directly
+   from https://www.rfc-editor.org/rfc/rfc9474.txt (the RFC Editor's own
+   plain-text rendering) on 2026-07-14, NOT from a summarized,
+   paraphrased, or third-party-rendered copy — the Appendix A test
+   vectors in `kat_vectors.zig` were extracted from that exact fetch by
+   line-range slicing (not free-text search, to avoid accidentally
+   matching the RFC's own Table of Contents, which repeats every section
+   title including the Appendix A subsection headings) and independently
+   cross-checked in Python before being embedded (see `kat_vectors.zig`'s
+   own doc comment for the specific algebraic identities checked: `p*q ==
+   n`, `e*d == 1 mod lcm(p-1,q-1)`, the Blind/BlindSign/Finalize relations
+   over `encoded_msg`/`inv`/`blinded_msg`/`blind_sig`/`sig`, and — for
+   `encoded_msg` specifically — an independent from-scratch Python
+   re-implementation of EMSA-PSS-ENCODE that reproduces the RFC's
+   published `encoded_msg` byte-for-byte for both Appendix A.1 and A.4).
+2. **jedisct1/zig-blind-rsa-signatures** (`jedisct1/rust-blind-rsa-signatures`'s
+   Zig sibling port, MIT license —
+   https://github.com/jedisct1/zig-blind-rsa-signatures). Consulted as a
+   DESIGN REFERENCE ONLY (CONVENTIONS.md §5): its public API shape
+   (separating a client-held blinding-context type from the raw
+   blind/finalize functions, and exposing the RSABSSA variants as
+   parameters rather than as separate function names) was read to confirm
+   this is a reasonable, idiomatic way to structure a Zig API around RFC
+   9474's client/server split. NO source lines were copied or ported —
+   this module's actual function names (`blind`/`blindSign`/`finalize`/
+   `verify`/`prepareIdentity`/`prepareRandomize`/`pssEncode`), types
+   (`Context`), error sets, and every line of Zig code are independently
+   written directly from RFC 9474's own algorithm text and RFC 8017's
+   EMSA-PSS-ENCODE/MGF1 specifications, not from jedisct1's Rust-derived
+   Zig code.
+3. **RFC 8017 (PKCS #1 v2.2)** — §9.1.1 (EMSA-PSS-ENCODE) and §B.2.1
+   (MGF1), independently re-implemented in `root.zig`'s `pssEncode`/
+   `mgf1Xor` because the sibling `rsa` module's own equivalents
+   (`emsaPssEncode`/`mgf1Xor`) are private/unexported (see SPEC.md). Same
+   public-spec/merger-doctrine basis as item 1 — this is clean-room
+   spec transcription, not a copy of `rsa`'s private source, and was
+   validated against RFC 9474's own published `encoded_msg` values before
+   being trusted (see item 1).
+
+No GPL/LGPL/AGPL source was consulted or copied anywhere in this module.
+`std.crypto.hash.sha2.Sha384`/`std.crypto.ff` (MIT, part of Zig itself)
+and the sibling `rsa` module (this repository, MIT — see `../rsa/
+README.md`'s "Provenance" section and the root `/NOTICE`) are used via
+their public APIs only.
+
+One additional derived value: `kat_vectors.zig`'s `r` (the blinding
+factor) is NOT published in RFC 9474 (the RFC publishes only `inv` =
+r⁻¹ mod n). It was recomputed as `pow(inv, -1, n)` in Python and
+cross-checked both ways (`r·inv ≡ 1 mod n`, and `blinded_msg ≡
+encoded_msg · r^e mod n` for both A.1 and A.4) before embedding — it is
+arithmetic derived from the RFC's own published values, not third-party
+data.
+
+Status
+------
+
+**Complete.** All four RFC 9474 §4 operations (`blind` — plus the
+deterministic `blindWithFactor` KAT seam — `blindSign` with §7.2
+private-op blinding, `finalize`, `verify`), `pssEncode`, and
+`prepareIdentity`/`prepareRandomize` are implemented and validated
+byte-exact against RFC 9474 Appendix A.1 and A.4 (36/36 tests, Debug and
+ReleaseFast). The formerly-missing composite-modulus modular inverse is
+implemented locally (`bigModInverse`, extended Euclid over
+`std.math.big.int` — independently written from the textbook algorithm,
+the same one `rsa`'s private key-derivation helper uses; flagged
+`TODO(dry)` for a future consolidation into `rsa`'s public API). See
+`SPEC.md`'s "Resolved design decisions" and "Constant-time posture".
