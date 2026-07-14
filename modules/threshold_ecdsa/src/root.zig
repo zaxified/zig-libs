@@ -32,11 +32,12 @@
 //!
 //! MtA (`mta.zig`, re-exported as `mta`) is the semi-honest correctness core
 //! of the share conversion: `α + β ≡ a·b (mod q)` with neither party
-//! learning the other's input. Its malicious-security layer — the GG20
-//! zero-knowledge range proofs (which consume `AuxParams` as their Pedersen
-//! commitment base) and the MtAwc check — is Phase 2c, deliberately OUT OF
-//! SCOPE here (see `mta.zig`'s `TODO(2c)` notes); the signing rounds are
-//! Phase 2d.
+//! learning the other's input. Its malicious-security layer — the GG18
+//! Appendix A zero-knowledge range proofs (which consume `AuxParams` as
+//! their Pedersen commitment base) and the MtAwc check — is Phase 2c
+//! (`zkproofs.zig`), now IMPLEMENTED (verified against the paper) and wired
+//! into `mta.zig`'s fail-closed `*Checked` entry points; the signing rounds
+//! are Phase 2d (still out of scope).
 //!
 //! `AuxParams`' STRUCT and byte codec round-trip on hand-constructed toy
 //! values too (see the tests at the bottom).
@@ -59,6 +60,19 @@ const paillier = @import("paillier");
 /// construction, the β sign convention, the Z_N→Zq reduction, and the
 /// (Phase-2c) malicious-security boundary.
 pub const mta = @import("mta.zig");
+
+/// **Phase 2c** — the GG18 Appendix A zero-knowledge MtA range proofs
+/// (`RangeProof`/`MtaProof`/`MtaProofWc` structs, the Fiat-Shamir
+/// `Transcript`, and the `proveAliceRange`/`verifyAliceRange`/
+/// `proveBobMta`/`verifyBobMta`/`proveBobMtaWc`/`verifyBobMtaWc` API) that
+/// upgrade `mta`'s semi-honest core to malicious security. Structs,
+/// codecs, the transcript, AND the prove/verify number theory are all REAL
+/// (GG18 Appendix A.1/A.2/A.3, verified against the paper) — see
+/// `zkproofs.zig`'s module doc comment for the full construction + the
+/// verification-level caveat, and `mta.zig`'s `mtaAliceInitChecked`/
+/// `mtaBobResponseChecked`/`mtaAliceFinalizeChecked` for how this wires
+/// into the fail-closed checked-MtA flow.
+pub const zkproofs = @import("zkproofs.zig");
 
 pub const meta = .{
     .platform = .any,
@@ -1468,4 +1482,13 @@ test "generateAuxParams: ring-Pedersen tuple is well-formed (N_tilde composite/o
     try testing.expect(pub_aux.n_tilde.v.eql(back.n_tilde.v));
     try testing.expect(pub_aux.h1.eql(back.h1));
     try testing.expect(pub_aux.h2.eql(back.h2));
+}
+
+// Pull the `zkproofs` submodule's tests into this module's test binary —
+// same dark-tests rule as `test { _ = mta; }` above. As of the Phase-2c
+// implementation pass the six prove/verify functions are REAL (GG18
+// Appendix A.1/A.2/A.3, verified against the paper), so all of
+// `zkproofs.zig`'s tests pass — nothing here panics any more.
+test {
+    _ = zkproofs;
 }

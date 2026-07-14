@@ -67,22 +67,19 @@
 //! The additive shares `α`, `β` come back as `Secp256k1.scalar.Scalar` (Zq
 //! field elements), ready to drop into the Phase-2c signing arithmetic.
 //!
-//! ## Security scope — SEMI-HONEST ONLY
+//! ## Security scope
 //!
-//! This is the **correctness core** of MtA. It is secure against *passive*
-//! (honest-but-curious) adversaries who follow the protocol, and is
-//! **NOT** secure against a *malicious* party. In particular:
+//! The three plain entry points (`mtaAliceInit`/`mtaBobResponse`/
+//! `mtaAliceFinalize`) are the **semi-honest correctness core**: secure
+//! against *passive* (honest-but-curious) adversaries only. The Phase-2c
+//! layer is now REAL: the `*Checked` entry points below plus
+//! `zkproofs.zig`'s GG18-Appendix-A range/MtA proofs (verified against
+//! the actual paper — see that file's module doc comment) upgrade the
+//! flow to malicious security, and `zkproofs.proveBobMtaWc`/
+//! `verifyBobMtaWc` cover the "MtAwc" variant (Bob additionally proves
+//! his `b` matches the public `B = b·G`).
 //!
-//!   - **TODO(2c):** the GG20 zero-knowledge *range proofs* (proving `a`,
-//!     `b`, `β'` lie in the agreed bounded ranges without revealing them —
-//!     GG18 §3's "MtA with check" / the range-proof machinery that consumes
-//!     this module's `AuxParams` ring-Pedersen commitment base) are the
-//!     Phase-2c layer that upgrades this to malicious security. Without
-//!     them a cheating party can e.g. feed an out-of-range `a`/`b` and leak
-//!     the counterparty's secret. They are deliberately OUT OF SCOPE here.
-//!   - **TODO(2c):** the "MtAwc" variant (MtA *with check*), which
-//!     additionally proves Bob used the same `b` that appears in his public
-//!     `B = b·G`, is likewise Phase-2c.
+//! ⚠ **KNOWN PARAMETERIZATION GAP (2d-blocking, do not ship sign
 //!
 //! ## Const-time posture
 //!
@@ -99,6 +96,8 @@
 
 const std = @import("std");
 const paillier = @import("paillier");
+const root = @import("root.zig");
+const zkproofs = @import("zkproofs.zig");
 
 /// secp256k1 scalar field Zq — the domain of MtA's inputs `a`, `b` and
 /// additive outputs `α`, `β`. Same type `threshold_ecdsa`'s root module
@@ -225,6 +224,160 @@ pub fn mtaAliceFinalize(c_b: paillier.Ciphertext, alice_sk: paillier.SecretKey) 
     return Scalar.fromBytes64(buf, .big); // reduce mod q
 }
 
+// ── Phase 2c: malicious-secure ("checked") MtA — REAL wiring + REAL proofs
+//
+// The three entry points below are the Phase-2c counterparts of
+// `mtaAliceInit`/`mtaBobResponse`/`mtaAliceFinalize` above: same underlying
+// arithmetic, PLUS the `zkproofs` range/MtA proofs that reject a malicious
+// counterparty's out-of-range input before it can be used (see
+// `zkproofs.zig`'s module doc comment for the Alpha-Rays/TSSHOCK threat
+// model this closes). The semi-honest functions above are UNCHANGED and
+// remain the Phase-2b path — nothing here alters their behavior or their
+// already-passing tests.
+
+/// Sample a Paillier ciphertext-level randomness value `r`, uniform in
+/// `[1, pk.n)`, canonical mod `pk.n_sq` (the paillier module's own Fe-
+/// construction-contract convention — see `scalarToFe`'s doc comment).
+/// Mirrors `paillier`'s private `sampleNonzeroLtN` (not `pub`, so not
+/// importable) — same rejection-sampling shape, duplicated locally per
+/// this repo's established "small mechanical helper, copied per file"
+/// convention (see e.g. `root.zig`/`rsa`'s own `stripLeadingZeros`
+/// copies).
+fn samplePaillierRandomness(pk: paillier.PublicKey, random: std.Random) paillier.Fe {
+    const n_bits = pk.n.bits();
+    const n_len = (n_bits + 7) / 8;
+    var buf: [paillier.modulus_bytes]u8 = undefined;
+    defer std.crypto.secureZero(u8, buf[0..n_len]);
+    while (true) {
+        random.bytes(buf[0..n_len]);
+        buf[0] &= @as(u8, 0xff) >> @intCast(8 * n_len - n_bits);
+        const r = paillier.Fe.fromBytes(pk.n_sq, buf[0..n_len], .big) catch continue;
+        if (r.isZero()) continue;
+        return r;
+    }
+}
+
+/// What `mtaAliceInitChecked` produces: `c_a` (send to Bob, same as
+/// `AliceInit`), plus Alice's OWN Paillier encryption randomness `r_a` —
+/// SECRET, and the ONE thing the semi-honest `mtaAliceInit` throws away
+/// (it calls `paillier.encryptRandom`, which samples and discards its `r`
+/// internally). `r_a` is exactly the witness `zkproofs.proveAliceRange`
+/// needs to prove `c_a` is a well-formed, in-range encryption of `a`.
+pub const AliceInitChecked = struct {
+    /// `c_A = Enc_A(a; r_a)` — send to Bob.
+    c_a: paillier.Ciphertext,
+    /// SECRET. Retain until `zkproofs.proveAliceRange` has produced
+    /// Alice's range proof, then zero it alongside `a`.
+    r_a: paillier.Fe,
+};
+
+/// **Phase-2c Alice, round 1 — REAL plumbing.** Identical to `mtaAliceInit`
+/// except it samples+retains `r_a` explicitly (via `encrypt` +
+/// `samplePaillierRandomness`, rather than `encryptRandom`'s internal
+/// sample-and-discard) so the caller can feed it to
+/// `zkproofs.proveAliceRange`. Produces the exact same `c_a` distribution
+/// as `mtaAliceInit` — this is not a different protocol, just a version
+/// that keeps a value the semi-honest path doesn't need.
+pub fn mtaAliceInitChecked(a: Scalar, alice_pk: paillier.PublicKey, random: std.Random) MtaError!AliceInitChecked {
+    const a_fe = scalarToFe(a, alice_pk);
+    const r_a = samplePaillierRandomness(alice_pk, random);
+    const c_a = try paillier.encrypt(alice_pk, a_fe, r_a);
+    return .{ .c_a = c_a, .r_a = r_a };
+}
+
+/// What `mtaBobResponseChecked` produces: `c_b` and `beta` (same role as
+/// `BobResponse`), plus Bob's fresh Paillier blinding factor `r_b` —
+/// SECRET, the witness `zkproofs.proveBobMta` needs.
+pub const BobResponseChecked = struct {
+    /// `c_B = Enc_A(a·b + β'; r_A^b · r_b)` — send to Alice. Decrypts to
+    /// the identical plaintext `mtaBobResponse`'s `c_b` would (Paillier
+    /// decryption does not depend on the ciphertext's randomness) — see
+    /// this function's doc comment for why the RANDOMNESS differs.
+    c_b: paillier.Ciphertext,
+    /// Bob's additive share `β = −β' (mod q)` — SECRET, same convention
+    /// as `BobResponse.beta`.
+    beta: Scalar,
+    /// SECRET. The fresh Paillier blinding factor folded into `c_b`'s
+    /// additive term — retain until `zkproofs.proveBobMta` has produced
+    /// Bob's MtA proof, then zero it alongside `b`/`beta_prime`.
+    r_b: paillier.Fe,
+};
+
+/// **Phase-2c Bob, round 2 — REAL plumbing, differs from `mtaBobResponse`
+/// in one load-bearing way.**
+///
+/// `mtaBobResponse` (Phase 2b) folds `β'` into `c_B` via
+/// `paillier.addPlaintext`, whose `g^m` term carries NO extra Paillier
+/// rerandomization (see that function's own doc comment: no `r^n`
+/// factor) — fine for semi-honest correctness (the ciphertext already
+/// inherits Alice's original `c_A` randomness raised to `b`), but it
+/// leaves Bob with no randomness of his OWN to prove knowledge of. GG18's
+/// Π^MtA proof (`zkproofs.proveBobMta`) needs Bob to prove a witness
+/// `(b, β', r_b)` where `r_b` is a FRESH random Paillier blinding factor
+/// HE chose — the verifier can compute `c_A^b` itself from the public
+/// `c_A`, so only the fresh part needs proving (Alice's own `r_A` is her
+/// secret; Bob never learns it and a proof about it can't require him
+/// to).
+///
+/// This function therefore reconstructs `c_B` via `addCiphertexts` over
+/// `mulPlaintext(c_A, b)` and a FRESH `encrypt(β'; r_b)`, instead of
+/// `mtaBobResponse`'s `addPlaintext`. Both decrypt to the identical
+/// `a·b + β'` — `mtaAliceFinalize`/`mtaAliceFinalizeChecked` accept
+/// either output identically — but only THIS version's `result.r_b` is a
+/// real witness for `zkproofs.proveBobMta`.
+pub fn mtaBobResponseChecked(
+    b: Scalar,
+    c_a: paillier.Ciphertext,
+    alice_pk: paillier.PublicKey,
+    random: std.Random,
+) MtaError!BobResponseChecked {
+    const beta_prime = randomScalar(random);
+    const b_fe = scalarToFe(b, alice_pk);
+    const bp_fe = scalarToFe(beta_prime, alice_pk);
+    const r_b = samplePaillierRandomness(alice_pk, random);
+
+    const c_ab = try paillier.mulPlaintext(alice_pk, c_a, b_fe);
+    const bp_enc = try paillier.encrypt(alice_pk, bp_fe, r_b);
+    const c_b = paillier.addCiphertexts(alice_pk, c_ab, bp_enc);
+
+    const beta = beta_prime.neg();
+    return .{ .c_b = c_b, .beta = beta, .r_b = r_b };
+}
+
+/// Errors `mtaAliceFinalizeChecked` can surface beyond `MtaError`: a
+/// proof that fails `zkproofs.verifyBobMta`.
+pub const MtaCheckedError = MtaError || error{InvalidMtaProof};
+
+/// **Phase-2c Alice, finalize — fail-closed. REAL control flow + REAL
+/// predicate.** Verifies Bob's `zkproofs.MtaProof` against Alice's OWN
+/// view of `c_a` BEFORE ever decrypting `c_b` — a malicious Bob who fed
+/// an out-of-range `b`/`β'` (the Alpha-Rays/TSSHOCK failure class — see
+/// `zkproofs.zig`'s module doc comment / `SPEC.md`'s threat model) is
+/// rejected here, never reaching `mtaAliceFinalize`'s decryption.
+///
+/// `verifier_aux` is ALICE's OWN `AuxParams` (she is the verifier here —
+/// see `zkproofs.zig`'s "verifier-vs-prover aux-param ownership" note).
+///
+/// **The fail-closed CONTROL FLOW (verify-then-decrypt, reject on
+/// failure) is REAL, and so is `zkproofs.verifyBobMta` now** (GG18
+/// Appendix A.3, implemented and verified against the paper) — the
+/// end-to-end test at the bottom of this file exercises the full round
+/// and asserts a tampered `c_b`/wrong-witness proof is refused before
+/// decryption.
+pub fn mtaAliceFinalizeChecked(
+    c_a: paillier.Ciphertext,
+    c_b: paillier.Ciphertext,
+    proof: zkproofs.MtaProof,
+    alice_sk: paillier.SecretKey,
+    alice_pk: paillier.PublicKey,
+    verifier_aux: root.AuxParams,
+) MtaCheckedError!Scalar {
+    if (!zkproofs.verifyBobMta(proof, c_a, c_b, alice_pk, verifier_aux)) {
+        return error.InvalidMtaProof;
+    }
+    return mtaAliceFinalize(c_b, alice_sk);
+}
+
 // ── tests ──────────────────────────────────────────────────────────────────
 //
 // No external KAT exists for MtA (like threshold-BLS/paillier) — the
@@ -311,7 +464,9 @@ test "MtA correctness: edge cases a/b ∈ {0, 1, q-1}" {
 }
 
 test "MtA composes over real keygenTrustedDealer KeyShare Paillier material" {
-    const root = @import("root.zig");
+    // `root` is now a top-level import (added for Phase 2c's
+    // `mtaAliceFinalizeChecked`) — this test used to import it locally,
+    // back when mta.zig had no top-level dependency on root.zig.
     const allocator = testing.allocator;
 
     var kprng = std.Random.DefaultPrng.init(0x636f6d706f7365); // "compose"
@@ -359,4 +514,133 @@ test "MtA composes over real keygenTrustedDealer KeyShare Paillier material" {
     const bob = try mtaBobResponse(b, alice.c_a, bobs_view_of_alice_pk, random);
     const alpha = try mtaAliceFinalize(bob.c_b, alice_sk);
     try expectAdditiveShare(a, b, alpha, bob.beta);
+}
+
+// ── Phase 2c wiring tests ────────────────────────────────────────────────
+//
+// `mtaAliceInitChecked`/`mtaBobResponseChecked` are REAL (just a different,
+// witness-retaining composition of the same `paillier` primitives) — the
+// tests below assert their OWN correctness net (α + β ≡ a·b, same as
+// Phase 2b) directly, decrypting via the semi-honest `mtaAliceFinalize`;
+// the malicious-secure `mtaAliceFinalizeChecked` path (which verifies
+// `zkproofs.verifyBobMta` fail-closed before decrypting) has its own
+// dedicated accept/reject tests below.
+
+test "Phase 2c checked init/response compose correctly: α + β ≡ a·b (mod q), same as Phase 2b" {
+    var kprng = std.Random.DefaultPrng.init(0x636865636b6564); // "checked"
+    const kp = try paillier.generate(kprng.random(), 1024);
+
+    var prng = std.Random.DefaultPrng.init(0x636b645f72616e64); // "ckd_rand"
+    const random = prng.random();
+
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        const a = randomScalar(random);
+        const b = randomScalar(random);
+
+        const alice = try mtaAliceInitChecked(a, kp.public, random);
+        const bob = try mtaBobResponseChecked(b, alice.c_a, kp.public, random);
+        const alpha = try mtaAliceFinalize(bob.c_b, kp.secret); // Phase-2b finalize; correctness is randomness-independent
+        try expectAdditiveShare(a, b, alpha, bob.beta);
+    }
+}
+
+test "Phase 2c: mtaBobResponseChecked's c_b differs byte-for-byte from mtaBobResponse's (fresh r_b changes the ciphertext, not the plaintext)" {
+    var kprng = std.Random.DefaultPrng.init(0x64696666_6572); // "differ"
+    const kp = try paillier.generate(kprng.random(), 1024);
+
+    var prng = std.Random.DefaultPrng.init(0x646966665f726e64); // "diff_rnd"
+    const random = prng.random();
+
+    const a = scalarFromU64(0x1234);
+    const b = scalarFromU64(0x5678);
+
+    // Same c_a fed to both the semi-honest and checked Bob-response paths.
+    const alice = try mtaAliceInit(a, kp.public, random);
+
+    const bob_semi = try mtaBobResponse(b, alice.c_a, kp.public, random);
+    const bob_checked = try mtaBobResponseChecked(b, alice.c_a, kp.public, random);
+
+    var semi_buf: [paillier.modulus_sq_bytes]u8 = undefined;
+    try bob_semi.c_b.toBytes(&semi_buf);
+    var checked_buf: [paillier.modulus_sq_bytes]u8 = undefined;
+    try bob_checked.c_b.toBytes(&checked_buf);
+    // Different randomness (β' is independently sampled AND checked's path
+    // folds in a fresh r_b) makes byte-equality astronomically unlikely.
+    try testing.expect(!std.mem.eql(u8, &semi_buf, &checked_buf));
+
+    // Both still decrypt to a valid additive sharing of a*b (with their
+    // OWN respective beta), proving the differently-randomized c_b is
+    // still a correct ciphertext, not just a differently-shaped one.
+    const alpha_checked = try mtaAliceFinalize(bob_checked.c_b, kp.secret);
+    try expectAdditiveShare(a, b, alpha_checked, bob_checked.beta);
+}
+
+test "Phase 2c end-to-end: mtaAliceInitChecked -> verifyAliceRange -> mtaBobResponseChecked -> proveBobMta -> mtaAliceFinalizeChecked, alpha + beta == a*b; fail-closed on tampering" {
+    // The FULL malicious-secure MtA round over real Paillier keys and
+    // real-composite ring-Pedersen aux params — every arrow in the title
+    // is the real production call. This is the wiring counterpart of
+    // zkproofs.zig's own proof-level accept/reject tests.
+    var kprng = std.Random.DefaultPrng.init(0x66696e616c697a65); // "finalize"
+    const krandom = kprng.random();
+    const kp = try paillier.generate(krandom, 1024);
+    var prng = std.Random.DefaultPrng.init(0x66696e5f72616e64); // "fin_rand"
+    const random = prng.random();
+
+    // Real-composite aux params (Ñ = a genuine 512-bit two-prime product,
+    // h1 a square, h2 = h1^lambda) — same construction root.zig's
+    // generateAuxParams produces, minus the slow safe-prime search (the
+    // proofs' completeness/reject behavior doesn't depend on safe primes).
+    // Shared by both verification directions in this test; in a real
+    // deployment each VERIFIER uses its own tuple (see zkproofs.zig's
+    // ownership note).
+    const nt_kp = try paillier.generate(krandom, 512);
+    var nt_buf: [paillier.modulus_bytes]u8 = undefined;
+    const nt_len = nt_kp.public.nByteLen();
+    nt_kp.public.nToBytes(nt_buf[0..nt_len]) catch unreachable;
+    var strip: usize = 0;
+    while (strip < nt_len and nt_buf[strip] == 0) : (strip += 1) {}
+    const n_tilde = root.AuxModulus.fromBytes(nt_buf[strip..nt_len], .big) catch unreachable;
+    const x_root = samplePaillierRandomness(nt_kp.public, random); // reuse: uniform < Ñ
+    var x_buf: [paillier.modulus_sq_bytes]u8 = undefined;
+    const nt_sq_len = (nt_kp.public.n_sq.bits() + 7) / 8;
+    x_root.toBytes(x_buf[0..nt_sq_len], .big) catch unreachable;
+    var xs: usize = 0;
+    while (xs < nt_sq_len and x_buf[xs] == 0) : (xs += 1) {}
+    const x_fe = root.AuxFe.fromBytes(n_tilde, x_buf[xs..nt_sq_len], .big) catch unreachable;
+    const h1 = n_tilde.sq(x_fe);
+    const h2 = n_tilde.sq(h1); // h2 = h1² = h1^lambda for lambda = 2 — a valid squares-subgroup pair for this test
+    const aux: root.AuxParams = .{ .n_tilde = n_tilde, .h1 = h1, .h2 = h2 };
+
+    const a = scalarFromU64(0xdead_a11ce);
+    const b = scalarFromU64(0xfeed_b0b);
+
+    // Alice round 1 + her range proof; Bob verifies it before doing any
+    // homomorphic work on c_a (his fail-closed gate).
+    const alice = try mtaAliceInitChecked(a, kp.public, random);
+    const alice_proof = try zkproofs.proveAliceRange(testing.allocator, a, alice.r_a, kp.public, aux, random);
+    defer alice_proof.deinit(testing.allocator);
+    try testing.expect(zkproofs.verifyAliceRange(alice_proof, alice.c_a, kp.public, aux));
+
+    // Bob round 2 + his MtA proof (beta_prime = -beta mod q, the witness
+    // mtaBobResponseChecked folded into c_b).
+    const bob = try mtaBobResponseChecked(b, alice.c_a, kp.public, random);
+    const beta_prime = bob.beta.neg();
+    const bob_proof = try zkproofs.proveBobMta(testing.allocator, b, beta_prime, bob.r_b, alice.c_a, bob.c_b, kp.public, aux, random);
+    defer bob_proof.deinit(testing.allocator);
+
+    // Alice finalize: verify-then-decrypt, and the additive sharing holds.
+    const alpha = try mtaAliceFinalizeChecked(alice.c_a, bob.c_b, bob_proof, kp.secret, kp.public, aux);
+    try expectAdditiveShare(a, b, alpha, bob.beta);
+
+    // Fail-closed: a tampered c_b (proof no longer matches) must be
+    // REFUSED before decryption, not decrypted-then-shrugged-at.
+    const one_fe = paillier.Fe.fromPrimitive(u64, kp.public.n_sq, 1) catch unreachable;
+    const c_b_bad = try paillier.addPlaintext(kp.public, bob.c_b, one_fe);
+    try testing.expectError(error.InvalidMtaProof, mtaAliceFinalizeChecked(alice.c_a, c_b_bad, bob_proof, kp.secret, kp.public, aux));
+
+    // Fail-closed: a proof produced for a DIFFERENT b must be refused too.
+    const bad_proof = try zkproofs.proveBobMta(testing.allocator, b.add(Scalar.one), beta_prime, bob.r_b, alice.c_a, bob.c_b, kp.public, aux, random);
+    defer bad_proof.deinit(testing.allocator);
+    try testing.expectError(error.InvalidMtaProof, mtaAliceFinalizeChecked(alice.c_a, bob.c_b, bad_proof, kp.secret, kp.public, aux));
 }

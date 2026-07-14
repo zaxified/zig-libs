@@ -18,7 +18,12 @@ implementation, clean-room from two public IACR ePrint papers:
     Trustless Setup", IACR ePrint 2019/114 ("GG18") — the ring-Pedersen
     auxiliary-parameter construction `AuxParams`/`generateAuxParams`
     references (GG18 §4.1's "aux info" generation, which GG20 also relies
-    on for its own range proofs).
+    on for its own range proofs), AND (Phase 2c, `zkproofs.zig`) GG18
+    Appendix A's zero-knowledge range-proof construction ("Alice's range
+    proof" Πᵢ and Bob's MtA proof Π^MtA/Π^MtAwc) that this module's
+    `RangeProof`/`MtaProof`/`MtaProofWc` scaffold and `proveAliceRange`/
+    `verifyAliceRange`/`proveBobMta`/`verifyBobMta`/`proveBobMtaWc`/
+    `verifyBobMtaWc` doc comments target.
 
 Both are public specifications/papers, not copyrightable works (merger
 doctrine — see `CONVENTIONS.md` §5) — no NOTICE entry is strictly required
@@ -33,6 +38,28 @@ implementations and by Canetti, Gennaro, Goldfeder, Makriyannis, Peled, "UC
 Non-Interactive, Proactive, Threshold ECDSA" §3.1 — no source from any of
 these was read or copied; this scaffolding pass worked from the GG18/GG20
 papers' own text.
+
+**Phase 2c (`zkproofs.zig`) provenance.** The Sigma-protocol prove/verify
+number theory (GG18 Appendix A.1 "Range Proof", A.2 "Respondent ZK Proof
+for MtAwc", A.3 "Respondent ZK Proof for MtA") was implemented against the
+ACTUAL GG18 paper text — retrieved during the implementation pass from the
+NSF Public Access mirror (par.nsf.gov/servlets/purl/10085440) of the CCS'18
+version, which carries the same Appendix A as ePrint 2019/114 — and
+structurally cross-checked against bnb-chain/tss-lib's `crypto/mta`
+(`range_proof.go`, `proofs.go`, `share_protocol.go`) for the exact sampling
+ranges and verifier bounds. The tss-lib cross-check was FACTS/STRUCTURE ONLY
+(which value is sampled from which range; which bound the verifier checks) —
+NO tss-lib source code was ported or transcribed; that project is
+MIT-licensed and is recorded here purely as a structure/bounds reference.
+Two verifier bounds (`t1 <= q^7` and the correspondingly wider `gamma`/`tau`
+sampling for Bob's `beta'` mask) follow tss-lib/GG20 practice and are
+STRICTLY STRONGER than the GG18 paper's own A.2/A.3 (which leave `beta'`
+unbounded) — documented as such in `zkproofs.zig`'s module doc comment and
+SPEC.md. The Fiat-Shamir transcript (SHA-256, domain-separated) is this
+module's own and is NOT byte-compatible with tss-lib's (SHA512/256), so no
+reference KAT exists; the tests are self-consistency + the reject contract.
+See SPEC.md's "verification level" note (external cryptographic review
+recommended before production use).
 
 The Shamir-secret-sharing + Feldman-VSS + Lagrange-interpolation core
 (`splitSecretKey`, `groupPublicKey`, `derivePublicKeyShare`,
@@ -63,10 +90,18 @@ module.
 
 No GPL/LGPL/AGPL source was consulted or copied anywhere in this module.
 
-**Status: keygen + aux-params + MtA implemented.** The Shamir/Feldman/
-Lagrange keygen core, the Paillier-keygen wiring, the ring-Pedersen
-`generateAuxParams` safe-prime number theory, and the semi-honest MtA share
-conversion (`mta.zig`) are all real and self-consistency-tested (14/14). The
-GG20 range proofs / MtAwc (malicious security, Phase 2c) and the threshold
-signing rounds (Phase 2d) remain out of scope — see `SPEC.md`'s boundary and
-backlog sections.
+**Status: keygen + aux-params + MtA + Phase-2c range proofs implemented.**
+The Shamir/Feldman/Lagrange keygen core, the Paillier-keygen wiring, the
+ring-Pedersen `generateAuxParams` safe-prime number theory, and the
+semi-honest MtA share conversion (`mta.zig`) are all real and
+self-consistency-tested. Phase 2c (`zkproofs.zig` + `mta.zig`'s
+`mtaAliceInitChecked`/`mtaBobResponseChecked`/`mtaAliceFinalizeChecked`) —
+the GG18 Appendix A zero-knowledge MtA range proofs (STRUCTS, byte codecs,
+Fiat-Shamir transcript, the six prove/verify functions, and the fail-closed
+checked-MtA control flow) — is now all real and tested (verified against the
+paper; see the Phase-2c provenance note above). `zig build
+test-threshold_ecdsa`: 31/31 tests pass, 0 panics, in both Debug and
+ReleaseFast. The threshold signing rounds (Phase 2d) remain out of scope —
+see `SPEC.md`'s boundary and backlog sections. External cryptographic review
+of `zkproofs.zig` against GG18 Appendix A is recommended before production
+signing use.

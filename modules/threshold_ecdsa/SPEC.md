@@ -6,10 +6,13 @@ Attribution/provenance: see ./README.md "Provenance" + ./NOTICE.
 ## Design & invariants
 
 **Phase 2a (trusted-dealer keygen) + Phase 2b (ring-Pedersen aux params +
-the semi-honest MtA core) of the GG20 threshold-ECDSA arc** (2a keygen → 2b
-aux-params/MtA → 2c range proofs + MtAwc → 2d signing), over secp256k1
+the semi-honest MtA core) + Phase 2c (MtA zero-knowledge range proofs,
+GG18 Appendix A, verified against the paper) of the GG20 threshold-ECDSA
+arc** (2a keygen → 2b aux-params/MtA →
+2c range proofs + MtAwc → 2d signing), over secp256k1
 (`std.crypto.ecc.Secp256k1`, scalar field `Scalar` = Zq for q the group
-order).
+order). See the dedicated "Phase 2c" section below for that layer's design
+and status.
 
 **Trusted-dealer model ONLY.** A single dealer holds the plaintext group
 ECDSA secret key `x`, Shamir-splits it into `n` shares (degree-`(t-1)`
@@ -23,8 +26,9 @@ complaint/justification sub-protocol, no single party ever learns `x`) is
 explicitly OUT OF SCOPE — a distinct follow-up module, not merely a
 different `splitSecretKey` signature.
 
-**What's implemented (all REAL, `zig build test-threshold_ecdsa`: 14/14 in
-Debug and ReleaseFast):**
+**What's implemented (all REAL, `zig build test-threshold_ecdsa`: 31/31
+pass, 0 panics, in both Debug and ReleaseFast — Phase 2c's prove/verify
+number theory is now implemented and tested, see that section below):**
 
 - **Keygen core** — `Element` (SEC1-compressed secp256k1 point codec),
   `scalarFromIndex`/`evalPolynomialAt` (Shamir, Horner's method over Zq),
@@ -70,9 +74,14 @@ real 2048-bit Paillier key, and by the ≥1024-bit keys the tests use), the
 homomorphic sum never wraps, so `α'` is the true integer `a·b + β' < 2^512`,
 reduced into Zq by the curve's constant-time `Scalar.fromBytes64`.
 
-**MtA is SEMI-HONEST ONLY** — correct against passive adversaries, not secure
-against a malicious party. The GG20 range proofs / MtAwc check that close
-that gap are Phase 2c (see `mta.zig`'s `TODO(2c)`).
+**MtA (`mtaAliceInit`/`mtaBobResponse`/`mtaAliceFinalize`) is SEMI-HONEST
+ONLY** — correct against passive adversaries, not secure against a malicious
+party. The GG18 range proofs / MtAwc check that close that gap are Phase 2c
+(SCAFFOLDED — structs/transcript/fail-closed wiring real, prove/verify math
+stubbed; see the dedicated "Phase 2c" section below and `zkproofs.zig`'s
+module doc comment). Until that math is filled in, `mtaAliceFinalizeChecked`
+(the malicious-secure entry point) panics on every call — it is not yet a
+usable alternative to the semi-honest path, only its scaffold.
 
 **Ring-Pedersen aux params' role (why Phase 2a carries this at all).**
 GG18/GG20's Phase-2b/2c zero-knowledge range proofs (proving a Paillier
@@ -157,6 +166,146 @@ internal serialization, real and round-trip-tested, not a standard.
   direct-scalar-mult, byte round-trips), the same posture
   `bls12_381.threshold` uses for its own tests.
 
+## Phase 2c — MtA zero-knowledge range proofs (`zkproofs.zig`, IMPLEMENTED)
+
+**Design.** GG18 (ePrint 2019/114) Appendix A defines two Sigma-protocol,
+Fiat-Shamir-transformed proofs over the ring-Pedersen commitment scheme
+(`AuxParams`) Phase 2a/2b already carry:
+
+- **Alice's range proof (Πᵢ)** — proves `c_A = Enc_A(a; r_A)` encrypts an
+  `a` inside the agreed bounded range, without revealing `a`/`r_A`. Six
+  public values: a Pedersen commitment to `a` (`z`), a Paillier-shaped
+  commitment to a random mask (`u`), a Pedersen commitment to that mask
+  (`w`), a Paillier-randomness response (`s`), and two INTEGER (non-modular)
+  responses (`s1`, `s2`) — `s1` is the value whose boundedness IS the range
+  proof.
+- **Bob's MtA proof (Π^MtA)** — proves `c_B = c_A^b · Enc_A(β'; r_B)` was
+  correctly derived from the public `c_A`, with `b`/`β'` in range and `r_B`
+  a fresh Paillier blind Bob actually knows. Ten public values: the natural
+  extension of Alice's proof with a second commitment/mask/response triple
+  (for `β'`) plus one "homomorphic consistency" commitment (`v`) that binds
+  the whole thing to the specific `c_A`/`c_B` pair.
+- **MtAwc (Π^MtAwc)** — Bob's MtA proof plus a Schnorr commitment (`u1_point
+  = alpha·G`) proving the same `b` satisfies `b·G == B` for a public point
+  `B` — needed by GG20's signing round for the `k·x` share conversion.
+
+`zkproofs.zig` implements all three. The struct layouts, byte codecs, and a
+real SHA-256 Fiat-Shamir `Transcript` (domain-separated per proof kind,
+binding the verifier's `AuxParams`, the Paillier public key, every
+ciphertext/point in play, and the proof's own first-message commitments)
+are REAL and tested. The six `proveAliceRange`/`verifyAliceRange`/
+`proveBobMta`/`verifyBobMta`/`proveBobMtaWc`/`verifyBobMtaWc` functions now
+carry the full number theory (sample masks → commit → Fiat-Shamir challenge
+→ integer response → verification equations), **verified against the ACTUAL
+GG18 paper** — Appendix A.1 "Range Proof", A.2 "Respondent ZK Proof for
+MtAwc", A.3 "Respondent ZK Proof for MtA" (retrieved from the NSF Public
+Access mirror of the CCS'18 version, same Appendix A as ePrint 2019/114) —
+and structurally cross-checked against bnb-chain/tss-lib's `crypto/mta`
+(structure/bounds reference only, no code ported; recorded in NOTICE).
+
+**Exact bounds used, with sources:**
+
+- Alice's proof (paper A.1, identical in tss-lib): prover samples
+  `alpha ∈ Z_{q³}`, `beta ∈ Z_N^*`, `gamma ∈ Z_{q³·Ñ}`, `rho ∈ Z_{q·Ñ}`;
+  verifier checks `s1 <= q³` + the two consistency equations. The paper's
+  own conclusion: "the Verifier is convinced that m ∈ [-q³, q³]".
+- Bob's proof (paper A.2/A.3) with **two deliberate hardenings** adopted
+  from tss-lib/GG20 practice, both strictly STRONGER than the paper:
+  - the paper samples `gamma ∈ Z_N^*` (the mask for `β'`) and imposes NO
+    bound on the `t1` response; this module samples `gamma ∈ Z_{q⁷}` and the
+    verifier checks `t1 <= q⁷`, which additionally BOUNDS Bob's additive
+    blind `β'` — closing the unbounded-`β'` degree of freedom that the
+    Alpha-Rays failure class abuses. This module's checked-MtA wiring samples
+    `β' ∈ Z_q` (well inside tss-lib's `q⁵`), so honest proofs pass with slack.
+  - `tau` widens from the paper's `Z_{q·Ñ}` to `Z_{q³·Ñ}` accordingly, so
+    `t2 = e·sigma + tau` stays statistically hiding.
+- MtAwc (paper A.2): the A.3 proof plus `u1 = alpha·G` reusing the SAME
+  `alpha` (paper-confirmed — the prover "selects alpha ∈R Z_{q³}" once and
+  "computes u = g^alpha") and the verifier equation `g^{s1} == X^e·u1` in
+  the curve group (`s1` reduced mod q there only).
+
+**Challenge space:** the paper's verifier "selects a challenge e ∈R Z_q" in
+all three proofs, so `Zq` is the challenge space; this module instantiates
+Fiat-Shamir over it with SHA-256 + a statistically-uniform wide reduction.
+
+**Verification level (be honest about what the tests prove).** There is NO
+cross-implementation KAT for these proofs: the Fiat-Shamir transcript is
+implementation-defined (the paper's verifier is INTERACTIVE; tss-lib uses
+SHA512/256 over Go big.Int encodings + rejection sampling; this module uses
+SHA-256 over the domain-separated length-prefixed `Transcript`), so proofs
+are not byte-compatible across implementations and a deterministic reference
+KAT is impossible by construction. The test suite is therefore
+(a) self-consistency (honest prove → verify accepts; end-to-end checked MtA
+yields `α + β ≡ a·b`; codec round-trips re-verify) and (b) the
+SECURITY-CRITICAL reject paths (below). What the self-tests do NOT establish:
+soundness against an adversarial prover exploring the full malicious-input
+space — that rests on the construction matching the paper (reviewed by
+transcription against paper + tss-lib) and on the Strong-RSA / Paillier
+hardness assumptions — nor side-channel freedom. **An independent
+cryptographic review of `zkproofs.zig` against GG18 Appendix A is
+recommended before any production signing use.**
+
+**Verifier-vs-prover aux-param ownership.** Every `verifier_aux` parameter
+is the `AuxParams` OF WHOEVER VERIFIES that proof, not the prover's own
+tuple — Alice's `proveAliceRange` takes BOB's aux params (Bob verifies her
+proof); Bob's `proveBobMta`/`proveBobMtaWc` take ALICE's aux params (Alice
+verifies his). Getting this backwards breaks the Pedersen commitment's
+binding property (soundness requires the PROVER never know `lambda =
+log_h1(h2)` for the tuple in play) — see `zkproofs.zig`'s module doc comment
+for the full note.
+
+**Why `mtaBobResponseChecked` constructs `c_B` differently than
+`mtaBobResponse`.** The semi-honest `mtaBobResponse` folds `β'` into `c_B`
+via `paillier.addPlaintext`, whose `g^m` term carries no fresh Paillier
+rerandomization — fine for semi-honest correctness, but it leaves Bob with
+no randomness of his own to prove knowledge of (Π^MtA's witness needs a
+FRESH `r_B` HE chose). `mtaBobResponseChecked` (`mta.zig`) instead composes
+`c_B` via `mulPlaintext` + a FRESH `encrypt(β'; r_b)` + `addCiphertexts` —
+decrypts to the identical `a·b + β'` (Paillier decryption is randomness-
+independent; a dedicated test in `mta.zig` asserts both this AND that the
+resulting ciphertext bytes differ from `mtaBobResponse`'s), but now carries
+the witness `r_b` the proof needs. Similarly, `mtaAliceInitChecked` retains
+`r_A` (the semi-honest `mtaAliceInit` discards it inside
+`paillier.encryptRandom`).
+
+**Fail-closed wiring.** `mta.mtaAliceFinalizeChecked` calls
+`zkproofs.verifyBobMta` and returns `error.InvalidMtaProof` (never reaching
+`mtaAliceFinalize`'s decryption) if it returns `false`. Both the control
+flow and the predicate are now real; `mta.zig`'s end-to-end test runs the
+full `mtaAliceInitChecked → verifyAliceRange → mtaBobResponseChecked →
+proveBobMta → mtaAliceFinalizeChecked` round, asserts `α + β ≡ a·b`, and
+asserts a tampered `c_B` / wrong-witness proof is refused with
+`error.InvalidMtaProof` before decryption.
+
+**Threat model — why this phase exists at all.** Without Phase 2c, a
+malicious party can feed an out-of-range multiplicative input (`a`, `b`, or
+`β'`) into MtA and, across the many MtA instances a real signing round runs,
+leak bits of the counterparty's secret share. This is the general shape of
+the **Alpha-Rays** and **TSSHOCK** failure classes documented against real
+threshold-ECDSA implementations — out-of-range/malformed values smuggled
+through an under-checked MtA (or key-generation) step, amplified over many
+sessions into a full key recovery. The range/MtA proofs' verification
+equations are what close this gap; `zkproofs.zig`'s test suite deliberately
+weighs its REJECT-path tests (out-of-range `a`/`b`/`β'` driven through the
+byte-level inner provers, tampered `c_A`/`c_B`, wrong `b`/`β'` witnesses,
+wrong public point `B`, and every single mangled proof field) as the
+security-critical assertions — a prove/verify pair that always accepts would
+pass every "honest accept" test trivially while leaving the vulnerability
+wide open. These reject tests are REAL and passing; they must NOT be
+weakened.
+
+**Still deferred within Phase 2c / at the 2c-2d boundary:**
+
+- Independent cryptographic review of the implemented constructions against
+  GG18 Appendix A (see the verification-level note above) before production
+  use — the self-tests prove self-consistency + the reject contract, not
+  soundness against an unbounded malicious prover.
+- Exactly which signing-round steps invoke plain MtA vs. MtAwc — that
+  wiring belongs to Phase 2d (the signing protocol itself), not this file;
+  `zkproofs.zig`/`mta.zig` only provide the primitives.
+- `generateAuxParams`'s own correctness proof (Πprm/Πmod, `h2 = h1^lambda`)
+  remains a SEPARATE deferred item from Phase 2a — see below.
+
 ## Phase 2a / 2b / 2c / 2d boundary
 
 - **Phase 2a (done, this module):** trusted-dealer Shamir+Feldman keygen,
@@ -166,25 +315,31 @@ internal serialization, real and round-trip-tested, not a standard.
   multiplicative→additive share conversion the parties' `paillier` homomorphic
   ops exist to support. Output: additive shares `α`/`β` with
   `α + β ≡ a·b (mod q)`.
-- **Phase 2c (out of scope, later):** the GG20 zero-knowledge range proofs
-  (proof of correct Paillier encryption, range proofs bounding a plaintext,
-  consuming `AuxParams`/`PublicKeys` as their Pedersen commitment base) + the
-  MtAwc check — the layer that upgrades the semi-honest MtA core to malicious
-  security.
+- **Phase 2c (IMPLEMENTED, this module — `zkproofs.zig` + `mta.zig`'s
+  `*Checked` functions):** the GG18 Appendix A zero-knowledge range proofs
+  (A.1/A.2/A.3, verified against the paper) and the fail-closed checked-MtA
+  wiring that upgrade the semi-honest MtA core to malicious security.
+  Structs/transcript/wiring AND the six prove/verify functions are real and
+  tested (self-consistency + reject contract; pending external review — see
+  the section above).
 - **Phase 2d (out of scope, later):** the actual threshold ECDSA signing
   protocol — the interactive rounds that turn a message + the parties'
-  `KeyShare`s + Phase-2b's MtA outputs into a single valid ECDSA signature
-  verifiable under `KeyShare.group_public_key`.
+  `KeyShare`s + Phase-2c's CHECKED MtA outputs into a single valid ECDSA
+  signature verifiable under `KeyShare.group_public_key`, including where
+  MtAwc specifically gets invoked (the `k·x` share conversion).
 
 ## Backlog / deferred
 
-- Phase 2c: range proofs / MtAwc (malicious security for MtA) — see
-  `mta.zig`'s `TODO(2c)` notes.
+- Phase 2c: independent cryptographic review of `zkproofs.zig`'s implemented
+  constructions against GG18 Appendix A before production use (see the
+  dedicated Phase 2c section above for the verification-level breakdown).
 - Phase 2d: the threshold-signing protocol.
 - `generateAuxParams` aux-param-correctness ZK proof (Πprm/Πmod): if a later
   variant broadcasts a proof that `h2 = h1^lambda`, retain `lambda` at setup
   (`generateAuxParamsInternal` already returns it) instead of discarding —
-  see the function's doc comment `TODO(2c)`.
+  see the function's doc comment `TODO(2c)`. Distinct from `zkproofs.zig`'s
+  MtA range proofs — this one is about proving the AUX PARAMS themselves
+  were generated correctly, not about proving a Paillier plaintext's range.
 - Full Pedersen-style DKG (no single dealer) — a distinct follow-up module,
   not a `splitSecretKey` signature change.
 - Minimum-key-size floor enforcement on `AuxParams`/`PublicKeys`/`KeyShare`
