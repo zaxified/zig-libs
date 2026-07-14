@@ -1,38 +1,42 @@
 // SPDX-License-Identifier: MIT
 //! signal — the Signal Protocol's core cryptographic building blocks,
-//! built entirely on `std.crypto`. Planned as a two-part arc:
+//! built entirely on `std.crypto`. A two-part arc, now BOTH complete —
+//! together a usable Signal-style end-to-end-encrypted session:
 //!
-//!   - **Part 1 (THIS pass): X3DH** (`x3dh.zig`) — Extended Triple
-//!     Diffie-Hellman, the asynchronous initial key-agreement
+//!   - **Part 1: X3DH** (`x3dh.zig`) — Extended Triple Diffie-Hellman, the
+//!     asynchronous initial key-agreement
 //!     (signal.org/docs/specifications/x3dh), plus **XEdDSA**
 //!     (`xeddsa.zig`) — the Montgomery-keypair signature scheme X3DH uses
 //!     to sign a signed prekey (signal.org/docs/specifications/xeddsa).
-//!   - **Part 2 (NOT in this pass): Double Ratchet** — the per-message
+//!   - **Part 2: Double Ratchet** (`ratchet.zig`) — the per-message
 //!     forward-secret/post-compromise-secure ratchet
 //!     (signal.org/docs/specifications/doubleratchet) that X3DH's output
-//!     (`SK`, `AD`) seeds as its initial root key. See this file's
-//!     "Part 2 boundary" note below — nothing in this module produces or
-//!     consumes ratchet state; `x3dh.InitialMessage.ciphertext` is opaque
-//!     bytes a Part-2 module would supply.
+//!     (`SK`, `AD`) seeds as its initial root key: `SK` becomes the
+//!     initial root key `RK`, `AD` is mixed into every message's AEAD
+//!     associated data.
 //!
-//! **Status: Part 1 COMPLETE.** X3DH's DH+HKDF composition, both wire
-//! codecs (`PreKeyBundle`, `InitialMessage`), and XEdDSA (`xeddsa.sign`/
-//! `xeddsa.verify` — the one genuinely novel piece of cryptography here,
-//! a Montgomery->Edwards point conversion std does not expose in the
-//! direction XEdDSA needs, `xeddsa.edwardsFromMontgomery`) are all real
-//! and tested, including the fail-closed `x3dh.initiate` and
-//! `x3dh.generateSignedPreKey`. XEdDSA follows the SPEC's sign-0
+//! **Status: Part 1 + Part 2 COMPLETE.** X3DH's DH+HKDF composition, both
+//! wire codecs (`PreKeyBundle`, `InitialMessage`), and XEdDSA
+//! (`xeddsa.sign`/`xeddsa.verify` — the one genuinely novel piece of
+//! cryptography here, a Montgomery->Edwards point conversion std does not
+//! expose in the direction XEdDSA needs, `xeddsa.edwardsFromMontgomery`)
+//! are all real and tested, including the fail-closed `x3dh.initiate` and
+//! `x3dh.generateSignedPreKey`. The Double Ratchet (`ratchet.State` with
+//! `initAlice`/`initBob`/`encrypt`/`decrypt`, `KDF_RK`/`KDF_CK`, the DH +
+//! symmetric-key ratchets, `max_skip`-bounded out-of-order handling, and a
+//! transactional fail-closed `decrypt`) is real and tested end-to-end
+//! seeded from a live X3DH agreement. XEdDSA follows the SPEC's sign-0
 //! convention, which deployed libsignal deliberately deviates from — see
 //! `xeddsa.zig`'s module doc comment for the variant note and
 //! `src/kat_test.zig` for how the libsignal known-answer vector is used
 //! to validate both facts.
 //!
-//! Consumer: an end-to-end-encrypted messaging application's initial
-//! session setup — a client fetches a recipient's `PreKeyBundle` from a
-//! directory/coordination server, runs `x3dh.initiate` to get a shared
-//! `SK`, and hands `SK` to a Part-2 Double Ratchet to actually encrypt
-//! messages. Neither the server transport nor the ratchet itself is in
-//! scope for this module — see `README.md`.
+//! Consumer: an end-to-end-encrypted messaging application — a client
+//! fetches a recipient's `PreKeyBundle` from a directory/coordination
+//! server, runs `x3dh.initiate` to get a shared `SK`/`AD`, seeds a
+//! `ratchet.State` from it (`initAlice`/`initBob`), and then
+//! `encrypt`/`decrypt`s the actual message stream. The server transport
+//! itself is out of scope for this module — see `README.md`.
 //!
 //! Provenance: clean-room from the public X3DH and XEdDSA specifications
 //! (signal.org/docs/specifications/{x3dh,xeddsa} — Signal Foundation /
@@ -44,12 +48,13 @@ pub const meta = .{
     .platform = .any,
     .role = .util, // pure computation over caller-supplied keys/bytes — no owned socket/transport
     .concurrency = .reentrant, // no globals; every type here is a plain caller-owned value
-    .model_after = "Signal X3DH (signal.org/docs/specifications/x3dh) + XEdDSA (signal.org/docs/specifications/xeddsa); std.crypto.dh.X25519 supplies the DH, std.crypto.ecc.Edwards25519/std.crypto.hash.sha2.Sha512 supply XEdDSA's building blocks, std.crypto.kdf.hkdf.HkdfSha256 supplies the KDF",
+    .model_after = "Signal X3DH (signal.org/docs/specifications/x3dh) + XEdDSA (signal.org/docs/specifications/xeddsa) + Double Ratchet (signal.org/docs/specifications/doubleratchet); std.crypto.dh.X25519 supplies the DH (agreement + ratchet), std.crypto.ecc.Edwards25519/std.crypto.hash.sha2.Sha512 supply XEdDSA's building blocks, std.crypto.kdf.hkdf.HkdfSha256 supplies the KDFs (X3DH + KDF_RK), std.crypto.auth.hmac.sha2.HmacSha256 supplies KDF_CK, std.crypto.aead.chacha_poly.ChaCha20Poly1305 supplies the ratchet AEAD",
     .deps = .{}, // std only
 };
 
 pub const xeddsa = @import("xeddsa.zig");
 pub const x3dh = @import("x3dh.zig");
+pub const ratchet = @import("ratchet.zig");
 
 // Flat re-exports of the X3DH surface — the module most callers use.
 pub const IdentityKey = x3dh.IdentityKey;
@@ -64,6 +69,13 @@ pub const initiateUnverified = x3dh.initiateUnverified;
 pub const respond = x3dh.respond;
 pub const generateSignedPreKey = x3dh.generateSignedPreKey;
 
+// Flat re-exports of the Double Ratchet surface (Part 2).
+pub const RatchetState = ratchet.State;
+pub const RatchetHeader = ratchet.Header;
+pub const RatchetMessage = ratchet.Message;
+pub const initAlice = ratchet.State.initAlice;
+pub const initBob = ratchet.State.initBob;
+
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────
 //
 // A bare `pub const x = @import("x.zig")` re-export does NOT pull `x`'s
@@ -72,6 +84,7 @@ pub const generateSignedPreKey = x3dh.generateSignedPreKey;
 test {
     _ = xeddsa;
     _ = x3dh;
+    _ = ratchet;
     _ = @import("kat_test.zig");
 }
 

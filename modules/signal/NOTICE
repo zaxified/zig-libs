@@ -10,12 +10,13 @@ Provenance
 ----------
 
 signal — clean-room implementation of the Signal Protocol's X3DH
-(Extended Triple Diffie-Hellman) key-agreement and XEdDSA signature
-scheme, specified in two public documents published by the Signal
-Foundation / Trevor Perrin:
+(Extended Triple Diffie-Hellman) key-agreement, XEdDSA signature scheme,
+and Double Ratchet, specified in three public documents published by the
+Signal Foundation / Trevor Perrin (Double Ratchet also Moxie Marlinspike):
 
   - X3DH: "The X3DH Key Agreement Protocol", https://signal.org/docs/specifications/x3dh/
   - XEdDSA: "The XEdDSA and VXEdDSA Signature Schemes", https://signal.org/docs/specifications/xeddsa/
+  - Double Ratchet: "The Double Ratchet Algorithm", https://signal.org/docs/specifications/doubleratchet/
 
 Both are public specifications — a public spec's text is not copyrightable
 expression (merger doctrine, CONVENTIONS.md §5); implementing it, however
@@ -35,13 +36,15 @@ domain separation, the four-DH `F || DH1..DH4` framing, the HKDF
 salt/info shape) was drawn from the specification text itself.
 
 `std.crypto.dh.X25519` / `std.crypto.ecc.Edwards25519` / `std.crypto.hash.
-sha2.Sha512` / `std.crypto.kdf.hkdf.HkdfSha256` (all MIT, part of Zig
-itself) supply the DH, curve, hash, and KDF primitives via their public
-APIs; no new DH function, curve arithmetic, hash, or KDF primitive is
-implemented here — the specifications' OWN composition of them (the
-four-DH agreement, the Montgomery<->Edwards signature scheme) is this
-module's contribution, and the two Signal specifications are the sole
-references (no NOTICE-triggering third-party design reference exists for
+sha2.Sha512` / `std.crypto.kdf.hkdf.HkdfSha256` /
+`std.crypto.auth.hmac.sha2.HmacSha256` /
+`std.crypto.aead.chacha_poly.ChaCha20Poly1305` (all MIT, part of Zig
+itself) supply the DH, curve, hash, KDF, MAC, and AEAD primitives via
+their public APIs; no new DH function, curve arithmetic, hash, KDF, MAC,
+or AEAD primitive is implemented here — the specifications' OWN
+composition of them (the four-DH agreement, the Montgomery<->Edwards
+signature scheme, the root/chain KDF ratchets) is this module's
+contribution, and the three Signal specifications are the sole references (no NOTICE-triggering third-party design reference exists for
 this pass — CONVENTIONS.md §5's "pure clean-room from spec, no NOTICE
 entry strictly required" case; this file is kept anyway per this
 repository's established practice of a module-local NOTICE for
@@ -59,6 +62,23 @@ X3DH agreement is therefore covered by a SELF-CONSISTENCY harness in
 must land on the identical `SK`/`AD` from independently-derived DH
 computations — a property that would fail loudly on almost any
 construction bug, even without an external oracle).
+
+The Double Ratchet (`src/ratchet.zig`) is likewise covered by a
+SELF-CONSISTENCY harness: the specification publishes no numeric worked
+example, and no off-the-shelf byte-exact known-answer vector exists for a
+clean spec-adherent instantiation (the reference implementations that ship
+deterministic ratchet vectors — matrix's Olm/vodozemac, libsignal — use
+their own protocol-specific AEAD/KDF instantiations, so matching them
+byte-for-byte would mean re-implementing THEIR protocol, not the Double
+Ratchet spec's own composition). No third-party Double Ratchet / Olm /
+libsignal implementation was read, ported, or consulted as a design
+reference for `ratchet.zig`; it was written directly from the Double
+Ratchet specification text above, choosing ChaCha20-Poly1305 as the AEAD
+(the spec permits any AEAD; its own example is AES-256-CBC + HMAC-SHA256)
+and the spec's exact `KDF_RK` (HKDF) / `KDF_CK` (HMAC, 0x01/0x02) shapes.
+Verification is Alice-and-Bob independently-advanced-ratchets agreement
+across many DH ratchets, out-of-order delivery, `MAX_SKIP` DoS rejection,
+and a tamper battery — see `SPEC.md`'s "Test-vector honesty".
 
 For XEdDSA, `src/kat_test.zig` embeds the known-answer vector from
 libsignal's own test suite (`test_curve25519_signature` in
@@ -83,12 +103,16 @@ independent verifier (MIT, part of Zig).
 Status of this pass
 --------------------
 
-**Part 1 complete.** `x3dh.zig`'s four-DH + HKDF agreement
+**Part 1 + Part 2 complete.** `x3dh.zig`'s four-DH + HKDF agreement
 (`initiateUnverified`/`respond`), both wire codecs (`PreKeyBundle`,
 `InitialMessage`), the fail-closed `initiate`/`generateSignedPreKey`
-entry points, and `xeddsa.zig`'s `sign`/`verify` (including
+entry points, `xeddsa.zig`'s `sign`/`verify` (including
 `edwardsFromMontgomery`, the Montgomery->Edwards sign-0 point recovery
-std does not provide) are implemented and tested — 31/31 in Debug and
-ReleaseFast. Part 2 of this arc (the Double Ratchet,
-signal.org/docs/specifications/doubleratchet) remains out of scope —
-see `README.md`'s "Part 2 boundary" section.
+std does not provide), and `ratchet.zig`'s full Double Ratchet
+(`State` + `initAlice`/`initBob`/`encrypt`/`decrypt`, `KDF_RK`/`KDF_CK`,
+the DH + symmetric-key ratchets, `max_skip`-bounded out-of-order
+handling, and a transactional fail-closed `decrypt`) are implemented and
+tested — 39/39 in Debug and ReleaseFast. Together they form a usable
+Signal-style end-to-end-encrypted session. Header encryption (Double
+Ratchet spec §4), PQXDH seeding, and a stability-committed session-
+persistence format remain out of scope — see `README.md`/`SPEC.md`.

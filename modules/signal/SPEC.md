@@ -1,14 +1,18 @@
-# signal — SPEC (Part 1: X3DH + XEdDSA)
+# signal — SPEC (X3DH + XEdDSA + Double Ratchet)
 
 X3DH (signal.org/docs/specifications/x3dh) + XEdDSA
-(signal.org/docs/specifications/xeddsa); see [README.md](README.md) for
-purpose and API. Provenance: see [NOTICE](NOTICE).
+(signal.org/docs/specifications/xeddsa) + Double Ratchet
+(signal.org/docs/specifications/doubleratchet); see [README.md](README.md)
+for purpose and API. Provenance: see [NOTICE](NOTICE).
 
-**Status: Part 1 complete.** `x3dh.zig`'s DH+HKDF agreement, both wire
-codecs, and `xeddsa.zig`'s `sign`/`verify` (with the Montgomery->Edwards
-sign-0 recovery, `edwardsFromMontgomery`) are implemented and tested —
-31/31 in Debug and ReleaseFast, including a libsignal known-answer
-vector; see "Verification" below.
+**Status: Part 1 + Part 2 complete.** `x3dh.zig`'s DH+HKDF agreement, both
+wire codecs, and `xeddsa.zig`'s `sign`/`verify` (with the
+Montgomery->Edwards sign-0 recovery, `edwardsFromMontgomery`), plus
+`ratchet.zig`'s full Double Ratchet (`State` + `initAlice`/`initBob`/
+`encrypt`/`decrypt`, `KDF_RK`/`KDF_CK`, the DH + symmetric-key ratchets,
+`max_skip`-bounded out-of-order handling, transactional fail-closed
+`decrypt`) are implemented and tested — 39/39 in Debug and ReleaseFast,
+including a libsignal known-answer vector; see "Verification" below.
 
 ## Design
 
@@ -155,14 +159,104 @@ cross-checked against `std.crypto.sign.Ed25519`'s independent verifier
 (an XEdDSA challenge hash is byte-identical to Ed25519's, so a spec-pure
 XEdDSA signature must verify as Ed25519 under the recovered sign-0 `A`).
 
+## Double Ratchet (Part 2, `ratchet.zig`)
+
+- **Seeding from X3DH.** `SK` becomes the initial root key `RK`; `AD` is
+  stored in the `State` and mixed into every message's AEAD associated
+  data. Bob's INITIAL ratchet keypair is his signed-prekey keypair (the
+  standard Signal binding — the DH key Alice already mixed into X3DH), so
+  `initAlice(sk, ad, bob_spk_pub, io)` and
+  `initBob(sk, ad, bob_spk_keypair)` land on the same first chain purely by
+  X25519 DH commutativity, exactly as X3DH's own two sides do.
+- **KDF instantiation** (spec §5.2 leaves these application-defined):
+  - `KDF_RK(RK, dh_out)` = HKDF-SHA256, `salt = RK`, `ikm = dh_out`,
+    `info = ratchet.kdf_rk_info`, 64-byte output split `RK' ‖ CK`.
+  - `KDF_CK(CK)` = HMAC-SHA256 keyed by `CK`, `HMAC(CK, 0x01) -> MK`,
+    `HMAC(CK, 0x02) -> CK'` (the spec's exact recommended constants).
+- **AEAD = ChaCha20-Poly1305**, NOT the spec's own AES-256-CBC+HMAC-SHA256
+  example. The spec explicitly permits "an AEAD encryption scheme"; a real
+  AEAD is simpler and less error-prone than hand-rolled encrypt-then-MAC,
+  and ChaCha20-Poly1305's 32-byte key lines up with `MK`. The per-message
+  key+nonce are `HKDF-Expand(MK, ratchet.aead_info)` (44 bytes → 32-byte
+  key + 12-byte nonce), so `MK` is never a raw cipher key. Nonce reuse is
+  structurally impossible: each `MK` is derived once and used for exactly
+  one message. AEAD associated data = `AD ‖ header.toBytes()` (spec §3.4),
+  binding the ciphertext to the sender's ratchet key + `PN`/`N` counters.
+- **Transactional `decrypt` (fail-closed).** Unlike the spec's reference
+  pseudocode, which mutates state as it goes, `decrypt` computes the whole
+  ratchet advance (skip-then-DH-ratchet-then-skip, generating any new DH
+  keypair) on a WORKING COPY plus a pending list of skipped keys, and
+  commits to the real `State` ONLY after the AEAD tag verifies. A
+  tampered/forged message therefore never advances, corrupts, or DoS-grows
+  the session — it returns `error.MessageAuthenticationFailed` (or a parse/
+  skip error) with `State` byte-for-byte unchanged.
+- **`MAX_SKIP` / store bound (DoS, spec §6).** `max_skip` (1000) caps keys
+  skipped in one chain per `decrypt`; a header claiming a message number
+  further ahead is rejected (`error.TooManySkippedMessages`) BEFORE any
+  `KDF_CK` or allocation, so a forged giant `N` cannot burn CPU or OOM.
+  `max_skip_store` (2000) bounds total retained skipped keys; growth past
+  it is refused rather than silently evicted.
+- **Forward secrecy + post-compromise security.** Chain keys advance
+  one-way via `KDF_CK`; each message key is single-use and `secureZero`'d
+  immediately after the AEAD call (forward secrecy). Every DH ratchet
+  folds fresh X25519 entropy into `RK` via `KDF_RK`, so a session heals
+  one full round-trip after a state compromise (post-compromise security).
+- **Const-time / zeroization.** All secret-material operations use std's
+  constant-time-on-secrets primitives (`X25519.scalarmult`, HMAC/HKDF over
+  SHA-256, ChaCha20-Poly1305). `State.deinit` `secureZero`s the root key,
+  both chain keys, the local DH secret key, and every stored message key;
+  the transactional working copy is `secureZero`'d on every exit; consumed
+  skipped keys are zeroed on removal. Known limitation: std's `HashMap`
+  does not expose slot-zeroing, so a removed entry's backing bytes persist
+  in the map's buffer until it is reused or freed (the whole buffer's live
+  values are zeroed at `deinit`).
+- **`decrypt` errors** are a tight set — `MessageAuthenticationFailed`
+  (tamper/truncation), `TooManySkippedMessages` (DoS cap),
+  `MessageKeyNotAvailable` (replay of a consumed in-order message, or a
+  message before its chain exists), `KeyAgreementFailed` (pathological
+  low-order ratchet key), plus `Allocator.Error`.
+- **Out of scope**: header encryption (spec §4 — headers here are
+  cleartext, so the ratchet public key + counters are observable), PQXDH
+  seeding, and a stability-committed session-persistence byte format
+  (`State` is an in-memory value only).
+
 ## Verification
 
-- `zig build test-signal`: **31/31 PASS**, Debug AND
+- `zig build test-signal`: **39/39 PASS**, Debug AND
   `-Doptimize=ReleaseFast`, zero panics. `zig fmt --check
   modules/signal/` clean.
 - Disk-vs-running test count (CONVENTIONS.md §6 step 3):
-  `grep -c '^\s*test ' modules/signal/src/*.zig` summed across files (31)
-  equals `zig build test-signal --summary all`'s reported total (31).
+  `grep -c '^\s*test ' modules/signal/src/*.zig` summed across files (39)
+  equals `zig build test-signal --summary all`'s reported total (39).
+- Double Ratchet coverage: full interleaved Alice<->Bob session seeded
+  from a live `x3dh.initiateUnverified`/`respond`, forcing repeated DH
+  ratchets, every message round-tripping; out-of-order delivery within a
+  chain AND across a DH-ratchet boundary (skipped-key store drains back to
+  empty); `MAX_SKIP` giant-`N` rejection with state untouched and no OOM;
+  tamper battery (flipped ciphertext / wrong `AD` / truncated buffer all
+  fail closed, genuine message still decrypts afterward); replay of a
+  consumed in-order message rejected; header codec round-trip + wrong-
+  length rejection; `KDF_CK` 0x01/0x02 constant distinctness. No numeric
+  reference vector exists (see below), so this is self-consistency +
+  spec-adherence — the same footing as Part 1's X3DH agreement.
+
+### Test-vector honesty (Double Ratchet)
+
+The Double Ratchet specification, like X3DH and XEdDSA, publishes **no
+numeric worked example**. Nor is there an off-the-shelf byte-exact KAT for
+a clean spec-adherent instantiation: the reference implementations that DO
+ship deterministic ratchet vectors (matrix's Olm/vodozemac; libsignal) use
+their OWN protocol-specific instantiations — different AEAD (AES-CBC+HMAC),
+different KDF `info` strings, Olm-specific chain/root derivations — so a
+byte-exact cross-check would require re-implementing THEIR protocol, not
+the Signal Double Ratchet spec's own composition. This module therefore
+verifies by self-consistency (Alice's and Bob's independently-advanced
+ratchets must agree on every message key across many DH ratchets — a
+property that fails loudly on almost any construction bug) plus direct
+adherence to the spec's stated KDF constants and algorithm, exactly as
+Part 1's agreement is verified. The AEAD/KDF choice is documented above so
+a caller who needs libsignal/Olm wire-compatibility knows it is NOT
+provided.
 - Coverage highlights: sign->verify round-trip; tampered message /
   tampered signature / malformed-key-and-signature fail-closed battery;
   sign-0 convention agreement (`verify`'s recovered `A` == `sign`'s
