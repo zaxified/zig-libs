@@ -470,7 +470,10 @@ pub const Sim = struct {
             },
             .timer => |t| {
                 if (self.nodes.items[t.node].crashed) return;
-                self.append(.{ .tag = .timer, .a = t.node, .b = @intCast(t.timer_id) });
+                // @bitCast, not @intCast: timer ids are arbitrary u64s (the API
+                // contract of `setTimer`), including sentinels near maxInt(u64),
+                // and the log field only needs a lossless, deterministic image.
+                self.append(.{ .tag = .timer, .a = t.node, .b = @bitCast(t.timer_id) });
                 if (self.protocol.onTimerFn) |f| try f(self.protocol.ctx, self, t.node, t.timer_id);
             },
             .fault => |fk| try self.applyFault(fk),
