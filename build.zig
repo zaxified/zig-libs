@@ -130,6 +130,7 @@ const module_list = [_]Module{
     .{ .name = "otp" },
     .{ .name = "ctap2pin" },
     .{ .name = "bls12_381" },
+    .{ .name = "ed448" },
     .{ .name = "paillier" },
     .{ .name = "threshold_ecdsa", .deps = &.{"paillier"} },
     .{ .name = "signal" },

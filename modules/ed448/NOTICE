@@ -1,0 +1,128 @@
+ed448 — provenance note
+========================
+
+Kept as a module-local NOTICE (same placement as the sibling `bip340`/
+`bls12_381`/`adaptor`/`frost` modules — self-contained crypto modules not
+folded into the root `NOTICE`).
+
+Provenance
+----------
+
+ed448 — clean-room implementation of Ed448/Ed448ph (RFC 8032 §5.2,
+EdDSA over edwards448) and X448 (RFC 7748 §4.2/§5, the curve448
+Montgomery Diffie-Hellman function). Both are IETF standards-track RFCs
+with official test vectors (RFC 7748 §5.2/§6.2; RFC 8032 §7.4/§7.5) — a
+public spec/RFC is not a copyrightable work (CONVENTIONS.md's merger-
+doctrine note), so implementing one, however closely, needs no
+attribution entry here; this section exists for the DESIGN-REFERENCE
+citations below (consulted for construction/algorithm shape, not
+copied source):
+
+1. **RFC 7748** (S. Josefsson, I. Liusvaara, "Elliptic Curves for
+   Security", IETF, January 2016, https://www.rfc-editor.org/rfc/
+   rfc7748.txt) — the field prime `p = 2^448 - 2^224 - 1`, the curve448
+   Montgomery-curve parameters (`A = 156326`, base point `u = 5`,
+   `a24 = 39081`), the `decodeScalar448` clamping operation, the
+   Montgomery-ladder algorithm (§5), and all X448 test vectors (§5.2's
+   two `scalarmult` vectors + the 1/1000/1000000-iteration vectors, and
+   §6.2's Alice/Bob Diffie-Hellman example) — fetched and transcribed
+   directly from the RFC text 2026-07-15, cross-checked against an
+   independent `p = 2**448 - 2**224 - 1` recomputation (see
+   "Verification performed" below).
+2. **RFC 8032** (S. Josefsson, I. Liusvaara, "Edwards-Curve Digital
+   Signature Algorithm (EdDSA)", IETF, January 2017,
+   https://www.rfc-editor.org/rfc/rfc8032.txt) — the edwards448 curve
+   parameters (§5.2 Table 2: `d = -39081`, base point `B`, order `L`,
+   cofactor 2^2), the `dom4(x,y)` domain-separation prefix (§5.1), the
+   point encoding/decoding (§5.2.2/§5.2.3), the complete addition/
+   doubling formulas (§5.2.4), key generation (§5.2.5), sign (§5.2.6),
+   verify (§5.2.7), and all Ed448/Ed448ph test vectors (§7.4: the
+   "Blank"/"1 octet"/"1 octet (with context)"/"11 octets" vectors used
+   here; §7.5: the "TEST abc" Ed448ph vector used here) — fetched and
+   transcribed directly from the RFC text 2026-07-15.
+3. **Mike Hamburg, "Ed448-Goldilocks, a new elliptic curve"** (the
+   original paper introducing the "Goldilocks" name and the 56-bit-limb
+   Solinas-reduction technique for primes of the shape `2^448 - 2^224 -
+   1`) and **`libdecaf`** (Mike Hamburg's reference C implementation,
+   its 64-bit `p448` backend specifically) — DESIGN REFERENCES for
+   `field.zig`'s LIMB-REPRESENTATION CHOICE (8×56-bit limbs, documented
+   in that file's own module doc comment) only; no source was ported.
+   The crypto-core pass (2026-07-15) that implemented `field.zig`'s
+   arithmetic derived the reduction independently from the modular
+   identities `2^448 ≡ 2^224 + 1` and `2^672 ≡ 2*2^224 + 1 (mod p)`
+   (see `Fe.mul`'s inline comments and `reduceAfterFold`'s bounds
+   argument) — neither reference's code sequence was consulted or
+   reproduced during implementation; this entry remains a
+   design-reference citation for the representation choice only.
+4. **`std.crypto.ecc.Edwards25519`/`Curve25519`/`std.crypto.sign.
+   Ed25519`/`std.crypto.dh.X25519`** (Zig standard library, MIT, part of
+   Zig itself) — the SHAPE/idiom reference this module's API mirrors one
+   curve family up (constant-time `ctSelect`/`cMov`-style helpers,
+   `KeyPair.generateDeterministic`/`generate`, the `Signature`/
+   `PublicKey`/`SecretKey` split) — cited per CONVENTIONS.md §5 as a
+   design reference; no source lines copied (different field width,
+   different curve shape — untwisted `a=1` vs Edwards25519's twisted
+   `a=-1` — different hash function).
+
+No GPL/LGPL/AGPL source was consulted or copied anywhere in this module.
+`std.crypto.hash.sha3.Shake256` (MIT, part of Zig itself) is used via its
+public API for the hash primitive RFC 8032 (Ed448/Ed448ph) specifies.
+X448 (RFC 7748) uses no hash function at all — it is pure field/curve
+arithmetic — so `x448.zig` has no `std.crypto.hash` dependency.
+
+Verification performed
+-----------------------
+
+At scaffold time (2026-07-15), the following independent checks were run
+(Python 3, standard library only — no third-party crypto library) before
+embedding any RFC-derived constant or vector into this module's Zig
+source:
+
+- `p = 2**448 - 2**224 - 1` recomputed directly and confirmed to match
+  RFC 7748 §4.2's stated hex value byte-for-byte (both big- and
+  little-endian serializations cross-checked).
+- `p mod 4 == 3` confirmed directly (used by `field.zig`'s `Fe.sqrt`
+  doc comment to justify the simple `p ≡ 3 (mod 4)` square-root
+  construction, no Tonelli-Shanks needed).
+- `d = -39081 mod p` (edwards448) computed directly from RFC 8032 §5.2
+  Table 2's stated `d = -39081`.
+- `a24 = (156326 - 2) / 4 = 39081` (curve448, X448's ladder constant)
+  recomputed directly from RFC 7748 §5's stated formula and confirmed
+  against the RFC's own stated value.
+- The edwards448 base point `B = (X(P), Y(P))`, transcribed from RFC
+  8032 §5.2 Table 2's decimal representation, was VERIFIED to satisfy
+  the untwisted curve equation `x^2 + y^2 = 1 + d*x^2*y^2 (mod p)`
+  directly in Python before being embedded as `ed448.zig`'s
+  `Point.basePoint` hex constants.
+- `L` (the edwards448/curve448 subgroup order), stated independently in
+  BOTH RFC 7748 §4.2 (curve448's Montgomery `order` field, given as a
+  hex-subtracted form) and RFC 8032 §5.2 Table 2 (`L`, given as a
+  decimal-subtracted form), was computed BOTH ways and confirmed to
+  produce the IDENTICAL integer before being embedded as `scalar.zig`'s
+  `l_bytes` constant.
+- Every hex vector embedded in `kat_vectors.zig` (X448: RFC 7748 §5.2's
+  two `scalarmult` vectors, the 1-iteration vector, and §6.2's
+  Alice/Bob Diffie-Hellman example; Ed448: RFC 8032 §7.4's "Blank"/
+  "1 octet"/"1 octet (with context)"/"11 octets" vectors; Ed448ph: RFC
+  8032 §7.5's "TEST abc" vector) was extracted from the RFCs' own
+  published text via TWO INDEPENDENT methods — a manual transcription
+  read directly against the fetched RFC text, and a separate
+  regex-based structured extraction pass — and the two were
+  diffed byte-for-byte before either was trusted; every field-length
+  (57-byte keys, 114-byte signatures, 56-byte X448 scalars/u-coordinates)
+  was additionally sanity-checked against the RFCs' own stated widths.
+  Both RFC texts were fetched directly from `rfc-editor.org` (the IETF's
+  own canonical RFC repository).
+
+Status
+------
+
+**Implemented** (crypto core landed 2026-07-15, on the 2026-07-15
+scaffold). Wire codecs, RFC-mandated clamping, the `dom4`
+domain-separation framing, sign/verify/DH orchestration, `field.zig`'s
+`Fp448` arithmetic (Goldilocks/Solinas reduction), `x448.zig`'s
+Montgomery ladder, `ed448.zig`'s `Point` curve operations, and
+`scalar.zig`'s mod-`L` arithmetic are all real and constant-time on the
+secret-input paths; `kat_vectors.zig`/`kat_test.zig` validate the whole
+stack byte-exact against RFC 7748 §5.2/§6.2 and RFC 8032 §7.4/§7.5 in
+both Debug and ReleaseFast.
