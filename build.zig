@@ -54,6 +54,7 @@ const module_list = [_]Module{
     .{ .name = "blobmsg" },
     .{ .name = "tar" },
     .{ .name = "latency-stats" },
+    .{ .name = "pping" },
     .{ .name = "spf-ect" },
     .{ .name = "ethfrag" },
     .{ .name = "netsim" },
