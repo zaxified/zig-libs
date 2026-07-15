@@ -142,6 +142,7 @@ const module_list = [_]Module{
     .{ .name = "paillier" },
     .{ .name = "threshold_ecdsa", .deps = &.{"paillier"} },
     .{ .name = "signal" },
+    .{ .name = "mls", .deps = &.{"hpke"} },
     .{ .name = "ebpf", .deps = &.{"netlink"} },
     .{ .name = "xdp-classifier", .deps = &.{"ebpf"} },
     // Scaffold more here (copy modules/_template) — see CONVENTIONS.md

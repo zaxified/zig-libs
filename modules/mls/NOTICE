@@ -1,0 +1,74 @@
+mls — provenance note
+======================
+
+Kept as a module-local NOTICE (same placement as the sibling `bn254`/
+`bls12_381`/`bip340`/`adaptor` modules — self-contained crypto/protocol
+modules not folded into the root `NOTICE`).
+
+Provenance
+----------
+
+1. **RFC 9420** (Messaging Layer Security,
+   https://www.rfc-editor.org/rfc/rfc9420) — the source of truth for
+   every algorithm in this module: §2.1/§2.1.2 (`codec.zig`'s
+   presentation-language + QUIC-style variable-length-integer vector
+   encoding), §5.1/§17.1 (`suite.zig`'s cipher-suite bundle and suite
+   `0x0001`'s algorithm assignment), §5.1.2/§5.1.3/§5.2/§8/§9.1
+   (`crypto.zig`'s `SignWithLabel`/`VerifyWithLabel`/`EncryptWithLabel`/
+   `DecryptWithLabel`/`RefHash`/`ExpandWithLabel`/`DeriveSecret`/
+   `DeriveTreeSecret`). A public IETF specification — not copyrightable
+   expression (merger doctrine, `CONVENTIONS.md` §5) — so no attribution
+   entry is strictly required for the spec citation alone; listed here
+   for completeness alongside item 2's stronger case.
+
+2. **RFC 9420 Appendix C** ("Array-Based Trees") specifically —
+   `treemath.zig`'s `log2`/`level`/`node_width`/`root`/`left`/`right`/
+   `parent`/`sibling`/`direct_path`/`copath` are a DIRECT PORT of the
+   Python reference algorithm the RFC itself publishes in this appendix
+   (not merely a description implemented independently — the RFC's own
+   text frames this as runnable reference code, and this module
+   translates it line-for-line into Zig, preserving the same variable
+   names/structure where Zig syntax allows). Still public-specification
+   text under the same merger-doctrine reasoning as item 1 (an RFC's
+   own algorithm listing is part of the specification, not a separate
+   third-party implementation), but called out explicitly here because
+   the relationship is "port", not "clean-room from prose" — matching
+   the standard this repo's `CONVENTIONS.md` §5 sets for when a design
+   reference (even a public-spec one) is worth naming precisely.
+
+3. **`mlswg/mls-implementations`** (the IETF MLS working group's
+   interop test-vector repository, no explicit OSS license file present
+   — GitHub reports no detected license,
+   https://github.com/mlswg/mls-implementations) — `kat_test.zig`'s KAT
+   source: `test-vectors/tree-math.json` and
+   `test-vectors/crypto-basics.json`, fetched directly (not
+   hand-transcribed) on 2026-07-15 from the repository's `main` branch
+   (HEAD `cfd450286d1bfd9cd2519b95c80f9771f94a5b1a`, commit date
+   2026-04-22; the two vector files themselves were last modified by
+   commit `e4d3b074f3452a6fa3a7681ede6c963c410aafd9`, "Rename test vector
+   files", 2023-02-03 — unchanged since) and embedded verbatim as
+   `src/data/tree-math.json` / `src/data/crypto-basics.json`
+   (`@embedFile`d by `kat_test.zig`, the same `src/data/` convention
+   `bls12_381/src/data/kzg_test_vectors/` already uses for embedded KAT
+   assets). These are public NUMERIC INTEROP CONFORMANCE DATA — tree-node
+   index relationships and HKDF/Ed25519/HPKE input-output tuples, the
+   deterministic output of running RFC 9420's own algorithms — the same
+   "public conformance data, not copyrightable expression" category this
+   repo's `bn254` NOTICE documents for its own `darkforest-v0.3` vectors
+   (also fetched from a repository with no explicit license file; merger
+   doctrine, `CONVENTIONS.md` §5); listed here out of the same caution
+   that entry applies, not because the JSON files are source code or
+   creative expression. Only the two JSON DATA files were fetched — no
+   implementation source from any of the repository's per-language
+   interop targets (`build/`, `interop/`, `docker/`) was read or ported.
+
+No third-party MLS IMPLEMENTATION (mls-rs, OpenMLS, mlspp, or any other
+language's MLS library) was read, consulted as a design reference, or
+ported from for this module. Every algorithm was implemented directly
+from RFC 9420's own text/pseudocode (item 1/2) and verified against the
+public interop vectors (item 3) — the same "spec + KAT, no third-party
+source" posture this repo's `hpke`/`signal` NOTICE-free modules document
+in their own SPEC.md "no NOTICE entry" reasoning; this file exists only
+because item 3's vector-fetch and item 2's direct-port relationship
+warrant the same explicit-citation caution `bn254`/`bls12_381` apply to
+their own KAT sources.
