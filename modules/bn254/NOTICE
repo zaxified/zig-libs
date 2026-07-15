@@ -102,3 +102,24 @@ constructions above (item 4), then verified byte-exact against `py_ecc`'s
 computed pairing outputs via the KAT harness this NOTICE documents (see
 `SPEC.md`'s "Part 4 — pairing", "Part 4 — KAT generation", and
 "Backlog").
+
+5. **`ethereum/go-ethereum`** (LGPL-3.0 license,
+   https://github.com/ethereum/go-ethereum) — Part 5's KAT source:
+   `core/vm/testdata/precompiles/bn256Add.json` /
+   `bn256ScalarMul.json` / `bn256Pairing.json`, fetched directly (not
+   hand-transcribed) on 2026-07-15 and embedded in `precompiles.zig`'s
+   tests verbatim. These are input/output NUMERIC VECTORS of a public
+   standard (EIP-196/197) — the same "public spec conformance data, not
+   copyrightable expression" category as items 1/2's constants (merger
+   doctrine, `CONVENTIONS.md` §5), not copied source code; no
+   go-ethereum SOURCE (Go implementation code) was read or ported —
+   `precompiles.zig`'s own `ecAdd`/`ecMul`/`ecPairing` implementations
+   and the `padTo` calldata-padding helper were derived directly from
+   EIP-196's own padding-rule prose plus this module's own reading of
+   `getData`'s documented BEHAVIOR (right-pad-short /
+   truncate-long), not by transcribing go-ethereum's Go source. Listed
+   here anyway, out of caution, since (unlike items 1/2's raw field/
+   curve constants) these vectors are literal file contents fetched
+   from a third-party repository, even though vector DATA itself is
+   almost certainly outside copyright's subject matter for the same
+   merger-doctrine reason.

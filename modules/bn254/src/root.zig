@@ -2,27 +2,33 @@
 //! bn254 — BN254 (alt-bn128), the pairing-friendly elliptic curve
 //! behind Ethereum's EIP-196/197 precompiles (`ecAdd`/`ecMul`/
 //! `ecPairing`, addresses `0x06`/`0x07`/`0x08`) and Groth16 zk-SNARK
-//! verification. **This module is Parts 1-4 of a multi-part arc**: the
+//! verification. **This module is Parts 1-5 of a multi-part arc**: the
 //! base field `Fp`, its extension tower `Fp2`/`Fp6`/`Fp12`, the scalar
-//! field `Fr` (Parts 1-2), the pairing groups `G1`/`G2` (Part 3), and
-//! now the optimal-ate pairing itself (Part 4, `pairing.zig`) — the
-//! foundation for the EIP-196/197 precompile semantics and a Groth16
-//! verifier (later parts; see `README.md` for the full planned arc).
+//! field `Fr` (Parts 1-2), the pairing groups `G1`/`G2` (Part 3), the
+//! optimal-ate pairing itself (Part 4, `pairing.zig`), and now the
+//! EIP-196/197 EVM precompile entry points themselves (Part 5,
+//! `precompiles.zig`) — the foundation for a future Groth16 verifier
+//! (Part 6; see `README.md` for the full planned arc).
 //!
-//! **Status: Parts 1-4 complete.** Every field-tower operation, `G1`/`G2`
+//! **Status: Parts 1-5 complete.** Every field-tower operation, `G1`/`G2`
 //! Jacobian group arithmetic, scalar multiplication, on-curve/subgroup-
-//! membership checks, and EIP-196/197 (de)serialization (Parts 1-3), plus
-//! the optimal-ate pairing itself (Part 4, `pairing.zig`) — `Gt`/
+//! membership checks, and EIP-196/197 (de)serialization (Parts 1-3), the
+//! optimal-ate pairing itself (Part 4, `pairing.zig`) — `Gt`/
 //! `PairingPair`, the comptime-derived-and-KAT-pinned `6x+2` loop
 //! parameter, the `millerLoop` core (its `6x+2` walk with the BN-specific
 //! Frobenius tail) and the `finalExponentiation` core (curve-generic easy
 //! part + the BN-specific exact-`d` hard-part addition chain), and
-//! `multiMillerLoop`/`pairing`/`pairingCheck` wiring — are implemented and
+//! `multiMillerLoop`/`pairing`/`pairingCheck` wiring — implemented and
 //! tested, byte-exact against `ethereum/py_ecc` (`gate
 //! .pairing_core_implemented` is now `true`, so the full pairing test tier
 //! — bilinearity, non-degeneracy, `e^r==1`, `pairingCheck`, and the three
-//! py_ecc KAT vectors — runs). NO precompile wiring yet (Part 5+). This
-//! module was built by careful, verified ADAPTATION of
+//! py_ecc KAT vectors — runs); and now `ecAdd`/`ecMul`/`ecPairing`
+//! themselves (Part 5, `precompiles.zig`) — pure composition over Parts
+//! 1-4 (calldata padding/truncation, point decode, group op, re-encode),
+//! byte-exact against the OFFICIAL `ethereum/go-ethereum`
+//! `core/vm/testdata/precompiles/*.json` conformance vectors (49 vectors
+//! across all three precompiles, both the `ecPairing` true AND false
+//! paths). This module was built by careful, verified ADAPTATION of
 //! the sibling `bls12_381` module (same `std.crypto.ff`-backed `Fp`/`Fr`
 //! construction, same tower-arithmetic formula shapes from Devegili et
 //! al. and Adj & Rodriguez-Henriquez, same Jacobian point-arithmetic
@@ -48,6 +54,7 @@ pub const g1 = @import("g1.zig");
 pub const g2 = @import("g2.zig");
 pub const gate = @import("gate.zig");
 pub const pairing = @import("pairing.zig");
+pub const precompiles = @import("precompiles.zig");
 
 pub const Fp = fp.Fp;
 pub const Fp2 = fp2.Fp2;
@@ -57,6 +64,14 @@ pub const Fr = scalar.Fr;
 pub const G1 = g1;
 pub const G2 = g2;
 pub const Gt = pairing.Gt;
+
+// Part 5 — EVM precompile entry points (EIP-196/197), re-exported at the
+// top level for convenience (see precompiles.zig's module doc comment):
+pub const ecAdd = precompiles.ecAdd;
+pub const ecMul = precompiles.ecMul;
+pub const ecPairing = precompiles.ecPairing;
+pub const ecPairingCheck = precompiles.ecPairingCheck;
+pub const PrecompileError = precompiles.PrecompileError;
 
 pub const meta = .{
     .platform = .any,
@@ -81,6 +96,7 @@ test {
     _ = g2;
     _ = gate;
     _ = pairing;
+    _ = precompiles;
 }
 
 test "meta.model_after names BN254/alt-bn128" {

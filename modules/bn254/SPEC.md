@@ -345,6 +345,136 @@ module — same "kept for reproducibility" policy as this file's §4 field
 requires `pip install py_ecc` plus the tower-arithmetic functions
 already listed in this file's §4.
 
+## Part 5 — EVM precompiles (`precompiles.zig`)
+
+`precompiles.zig` implements the three EIP-196/197 EVM precompiles —
+`ecAdd` (`0x06`), `ecMul` (`0x07`), `ecPairing` (`0x08`) — as PURE
+composition over Parts 1-4: decode calldata with `g1.zig`/`g2.zig`'s
+existing codecs, call an existing `G1`/`G2` group operation or
+`pairing.pairingCheck`, re-encode the result. No new field/curve/pairing
+arithmetic exists in this file.
+
+**Tier: Sonnet, not Fable — see "Tier assessment" above for the Parts
+1-4 precedent this continues.** The one property that could plausibly
+look like a "judgment call" — MUST `ecPairing` reject an on-curve-but-
+outside-subgroup `G2` operand — is not actually a judgment call: it is
+EIP-197's own specified precondition (an unchecked small-subgroup point
+makes the pairing forgeable, the standard pairing-cryptography pitfall
+`g2.zig`'s own module doc comment already documents), and the check
+itself (`g2.Jacobian.subgroupCheck`) already existed, already tested,
+from Part 3. This file's only obligation was to remember to CALL it on
+every decoded `G2` operand and to prove, with a test, that it actually
+fires in the precompile path (see "Verification performed" below) — not
+to derive why the check is needed or how to build it.
+
+**Calldata padding.** EIP-196's own spec text ("Note about the change in
+the way points and outputs are represented") and go-ethereum's
+`core/vm/contracts.go` `getData(input, start, size)` helper (the de
+facto interoperable behavior every mainnet client matches, confirmed
+directly by several of the official `bn256Add.json` vectors below, e.g.
+`cdetrio3`/`cdetrio5`) together specify: calldata shorter than a
+precompile's fixed input width is RIGHT-PADDED with zero bytes; calldata
+longer is TRUNCATED (only the needed prefix is read, any trailing bytes
+ignored). `padTo` (`precompiles.zig`) reproduces this with a single
+zero-fill-then-copy over the WHOLE fixed-width buffer rather than one
+`getData` call per field; proven equivalent to independent per-field
+`getData` calls for every length regime (empty / shorter-than-one-field
+/ between-fields / exactly-enough / longer-than-needed) in that
+function's own doc comment. `ecPairing` has NO such tolerance: its
+calldata length MUST be an exact multiple of 192 (one `(G1,G2)` pair),
+else the call fails outright (`error.BadLength`) — a different,
+stricter rule EIP-197 states explicitly, not an oversight in `ecAdd`/
+`ecMul`'s padding tolerance.
+
+**`ecMul`'s scalar is not a validated `Fr`.** EIP-196's scalar operand
+is used as a raw 256-bit big-endian integer, not rejected if `>= r`
+(unlike `Fr.fromBytes`, which does reject non-canonical values — that
+function exists for contexts needing a canonical scalar-field element,
+e.g. a future Groth16 witness, which this operand is not). `ecMul`
+therefore calls `g1.Jacobian.scalarMulBytes` (the arbitrary-width
+big-endian-scalar engine `g1.zig`/`g2.zig` already use internally for
+their own `[r]P == O` subgroup-check KATs) directly on the raw 32-byte
+operand — computing `[scalar]P` for the LITERAL integer value. Because
+`G1`'s cofactor is 1 (`P`'s order is exactly `r`), this is automatically
+equal to `[scalar mod r]P` — no separate reduction step exists or is
+needed, and none was added.
+
+**Failure semantics.** Every error `PrecompileError`
+(`g1.G1Error || g2.G2Error || error{BadLength, NotInSubgroup}`)
+corresponds to a real EVM's revert-and-burn-all-gas condition on a
+malformed/invalid precompile call. This module carries no gas/EVM model
+of its own — mapping `error.*` to "revert" is a future EVM-interpreter
+caller's job.
+
+## Part 5 — KAT sourcing
+
+Unlike Part 4 (no numeric worked example exists in EIP-196/197's spec
+text itself, forcing a `py_ecc`-computed oracle), Part 5's KAT vectors
+did not need to be generated at all: `ethereum/go-ethereum`'s own
+`core/vm/testdata/precompiles/bn256Add.json` / `bn256ScalarMul.json` /
+`bn256Pairing.json` (fetched directly from `raw.githubusercontent.com`,
+2026-07-15 — NOT hand-transcribed) are the authoritative, widely-shared
+precompile conformance vectors most mainnet clients (go-ethereum,
+besu, erigon, reth, nethermind) test against — a STRONGER provenance
+than Part 4's `py_ecc` oracle, since these are the actual EVM
+ecosystem's shared ground truth, not merely one independent
+implementation's output. All 49 vectors across the three files
+(16 `ecAdd`, 19 `ecMul`, 14 `ecPairing`) are embedded verbatim in
+`precompiles.zig`'s tests and checked byte-exact — see `NOTICE`'s item 5
+for the provenance/licensing accounting.
+
+**Coverage the vector set provides "for free"**, without any
+self-constructed input needed:
+- `ecAdd`'s short-input zero-padding (`cdetrio2`/`cdetrio3`/`cdetrio4`
+  [empty input] /`cdetrio8`) and long-input truncation
+  (`cdetrio5`/`cdetrio7`/`cdetrio10`/`cdetrio12`/`cdetrio14`) regimes,
+  with REAL calldata exercising `padTo`'s equivalence argument above,
+  not just the trivial `padTo`-of-empty-input case.
+- `ecMul`'s scalar handling across small (`9`, `1`), maximal
+  (`0xffff...ff`, wider than `r`), and exactly-`r`-ish (`cdetrio2`,
+  scalar `= r-1`) magnitudes, plus `zeroScalar` (`[0]P = O`).
+- `ecPairing`'s BOTH branches from OFFICIAL vectors, satisfying the task
+  brief's "true AND false" requirement without any self-constructed
+  pairing input: `jeff1`-`jeff5`, `empty_data` (`k=0`), `two_point_match
+  _2/3/4`, `ten_point_match_1/2/3` are official TRUE vectors;
+  `jeff6` and `one_point` (`e(G1,G2) != 1`, a single non-trivial pair)
+  are official FALSE vectors. `empty_data` independently confirms the
+  `k=0 -> true` empty-product rule this file's `ecPairingCheck` doc
+  comment states.
+
+**What the official vector set does NOT cover, and how this module
+covers it instead** (both self-constructed, both clearly labeled as
+such — self-consistency checks against this module's OWN prior test
+constructions, not independent oracles):
+- **The mandatory `G2` subgroup-check firing inside the precompile
+  path.** No go-ethereum vector exercises an on-curve-but-outside-
+  subgroup `G2` operand (real-world calldata from a functioning client
+  never produces one; the official test suite is a conformance suite,
+  not an adversarial-input fuzz corpus). `precompiles.zig`'s own test
+  ("ecPairingCheck: on-twist-but-not-in-subgroup G2 operand is
+  rejected") reuses the EXACT non-subgroup point `g2.zig`'s Part 3 test
+  already constructed and independently verified in Python (`x = u`,
+  `c0=0,c1=1`; that point's `y` and its "on-curve but `[r]P != O`"
+  status were confirmed outside this module during Part 3 — see this
+  file's Part 3 "Verification performed" entries), packages it as the
+  `G2` half of a `192`-byte `ecPairing` calldata pair, and confirms
+  `ecPairingCheck` returns `error.NotInSubgroup` rather than silently
+  calling `pairing.pairingCheck` on an invalid input. This is the
+  security-critical assertion Part 5's whole tier-assessment argument
+  rests on (see above) — it is exercised, not merely asserted in a
+  comment.
+- **`ecPairing`'s `error.BadLength` precondition** (length not a
+  multiple of 192) — no official vector is malformed this way (all 14
+  `bn256Pairing.json` inputs are exact multiples of 192: `0, 192, 384,
+  576, 1920`), so `precompiles.zig` adds a direct self-constructed test
+  (lengths `100` and `191`) confirming the rejection.
+- **`ecAdd`/`ecPairing` coordinate `>= p` and off-curve-point rejection**
+  — covered by adapting `g1.zig`'s own already-independently-verified
+  "off-curve `(1,3)`" and "coordinate `== p`" test inputs into
+  `precompiles.zig`'s calling convention (calldata bytes, not a direct
+  `Fp`/`Affine` construction) — a self-consistency check against Part
+  1/3's own prior verification, not a new independent claim.
+
 ## Verification performed
 
 Every embedded constant was independently re-derived/cross-checked
