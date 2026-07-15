@@ -424,7 +424,18 @@ project git history).
                the published definitions: Java BigDecimal.RoundingMode javadoc,
                the IBM General Decimal Arithmetic specification, and the Python
                `decimal` docs — definitions/truth-tables only, no source code
-               consulted or copied.
+               consulted or copied. `BigDecimal` (big.zig, arbitrary-precision,
+               built on std.math.big.int) is likewise the authors'
+               own work modeled after Java BigDecimal / IBM GDA design, EXCEPT
+               its test vectors: a subset of the actual IBM/Mike Cowlishaw
+               "General Decimal Arithmetic Testcases" v2.62 (add.decTest,
+               multiply.decTest, quantize.decTest, divide.decTest,
+               rounding.decTest — https://speleotrove.com/decimal/dectest.html,
+               "Reproduced with permission ... Copyright 1997, 2009 by
+               International Business Machines Corporation") is transcribed
+               into big.zig's test blocks, test IDs kept for traceability.
+               This is required attribution for reproduced third-party
+               testcase text, not source code.
 
   jwt        — clean-room from the JOSE/OAuth2 RFCs: RFC 7515 (JWS), RFC 7519
                (JWT), RFC 7517 (JWK/JWKS), RFC 7518 (JWA), RFC 8037 (EdDSA in
