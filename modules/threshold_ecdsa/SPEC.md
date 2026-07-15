@@ -26,10 +26,13 @@ complaint/justification sub-protocol, no single party ever learns `x`) is
 explicitly OUT OF SCOPE — a distinct follow-up module, not merely a
 different `splitSecretKey` signature.
 
-**What's implemented (all REAL, `zig build test-threshold_ecdsa`: 39/39
-pass, 0 panics, in both Debug and ReleaseFast — Phase 2c's prove/verify
-number theory AND Phase 2d's online signing are now implemented and
-tested, see the dedicated sections below):**
+**What's implemented (all REAL, 0 panics — Phase 2c's prove/verify number
+theory AND Phase 2d's online signing are now implemented and tested, see the
+dedicated sections below). `zig build test-threshold_ecdsa`: 43/43 pass in
+ReleaseFast; in Debug the 14 checked-path tests that need 2048-bit keys (the
+audit-F2 floor) are `SkipZigTest`-gated to keep the Debug run fast, so Debug
+reports 29 pass + 14 skip. The audit-F1/F2 received-parameter validation and
+its own reject tests run in BOTH modes:**
 
 - **Keygen core** — `Element` (SEC1-compressed secp256k1 point codec),
   `scalarFromIndex`/`evalPolynomialAt` (Shamir, Horner's method over Zq),
@@ -218,6 +221,15 @@ and structurally cross-checked against bnb-chain/tss-lib's `crypto/mta`
     blind `β'` — closing the unbounded-`β'` degree of freedom that the
     Alpha-Rays failure class abuses. This module's checked-MtA wiring samples
     `β' ∈ Z_q` (well inside tss-lib's `q⁵`), so honest proofs pass with slack.
+    **This "closing" is SIZE-CONDITIONAL (audit F2): the `t1 <= q⁷` bound only
+    bites when the Paillier `N` (and ring-Pedersen `Ñ`) it lives over EXCEED
+    `q⁷ ≈ 2^1792`. Below ~2048 bits the check is VACUOUS — a `<= q⁷` modulus
+    can never make it fire — so the "unbounded-`β'` freedom" would remain
+    open. This is now ENFORCED: every RECEIVED Paillier `N` and aux `Ñ` on the
+    checked-MtA / zkproofs path must clear `N > q⁷` (`root.paillierNMeetsFloor`
+    / `root.nTildeMeetsFloor`), fail-closed at both the prove and verify
+    entry points. The module no longer accepts 1024-bit keys on the checked
+    path; all checked-path tests were bumped to 2048-bit accordingly.**
   - `tau` widens from the paper's `Z_{q·Ñ}` to `Z_{q³·Ñ}` accordingly, so
     `t2 = e·sigma + tau` stays statistically hiding.
 - MtAwc (paper A.2): the A.3 proof plus `u1 = alpha·G` reusing the SAME
@@ -295,6 +307,43 @@ pass every "honest accept" test trivially while leaving the vulnerability
 wide open. These reject tests are REAL and passing; they must NOT be
 weakened.
 
+**Received-parameter validation — the honesty note (audit F1/F2).** Two
+facts this SPEC previously UNDERSTATED as tidy deferred niceties, corrected
+here:
+
+- **(F1) Without validation of RECEIVED ring-Pedersen aux params, the
+  zero-knowledge (hiding) property COLLAPSES against a malicious verifier,
+  and the prover's secret witness LEAKS.** The prover commits to its witness
+  as `z = h1^m · h2^ρ mod Ñ` under the counterparty-supplied `(Ñ, h1, h2)`. A
+  malicious verifier who broadcasts an `Ñ` with a small factor (or a prime
+  `Ñ`, or `h1`/`h2` outside the square subgroup) makes those commitments leak
+  bits of `m` (Alice's nonce `k_i` in `runCheckedMtA`, Bob's Lagrange-weighted
+  share `w_j` in MtAwc) — the TSSHOCK / Alpha-Rays class, breaking HIDING (not
+  soundness). This is now MITIGATED: `root.AuxParams.validate` runs
+  fail-closed at every prove entry point (`zkproofs.proveAliceRange`/
+  `proveBobMta`/`proveBobMtaWc`) and rejects a received tuple unless `Ñ` is
+  odd + composite (Miller-Rabin) + `> q⁷`, `1 < h1,h2 < Ñ`, `gcd(h1,Ñ) =
+  gcd(h2,Ñ) = 1`, and `h1,h2` pass the Jacobi-symbol square-subgroup test
+  `(h/Ñ) = +1`. **The Jacobi check is NECESSARY but not SUFFICIENT for
+  quadratic residuosity** (a non-residue mod BOTH prime factors of `Ñ` also
+  has symbol +1) — it is the strongest guarantee available WITHOUT `Ñ`'s
+  factorization. The full fix — a GG20/CMP `Πprm`/`Πmod` zero-knowledge
+  proof-of-correct-generation broadcast alongside the tuple — remains
+  DEFERRED (see below); the structural validation is the always-enforced
+  floor beneath it, not a replacement, and does NOT by itself make the aux
+  layer safe to call "malicious-secure" for an arbitrary per-party-aux
+  deployment.
+- **(F2) The "closed the unbounded-`β'` freedom" claim is size-conditional**
+  and only holds at `N > q⁷` — now enforced (see the Bob's-proof bounds
+  section above).
+
+**Signing-safety was never in question.** Neither F1 nor F2 lets this module
+emit an INVALID signature: `signing.signWithShares`'s step-6 std-ECDSA
+self-check aborts (`error.SigningAborted`) on any arithmetic consequence of a
+cheat. F1 is a HIDING (witness-secrecy) property and F2 a range-bound-vacuity
+property; both concern what an adversary can LEARN, not what a bad signature
+it can force.
+
 **Still deferred within Phase 2c / at the 2c-2d boundary:**
 
 - Independent cryptographic review of the implemented constructions against
@@ -305,7 +354,12 @@ weakened.
   wiring belongs to Phase 2d (the signing protocol itself), not this file;
   `zkproofs.zig`/`mta.zig` only provide the primitives.
 - `generateAuxParams`'s own correctness proof (Πprm/Πmod, `h2 = h1^lambda`)
-  remains a SEPARATE deferred item from Phase 2a — see below.
+  remains a SEPARATE deferred item from Phase 2a. The CHEAP structural
+  validation of received aux tuples (audit F1 — composite `Ñ`, in-range
+  square-subgroup `h1`/`h2`, coprimality) is now IN and enforced fail-closed
+  at the prove entry points (`root.AuxParams.validate`); the full
+  zero-knowledge proof-of-correct-generation is the larger deferred item — see
+  below.
 
 ## Phase 2d — online signing (`signing.zig`, REAL end to end)
 
@@ -473,9 +527,22 @@ scope; flagged here since it was surfaced by this pass.
   see the function's doc comment `TODO(2c)`. Distinct from `zkproofs.zig`'s
   MtA range proofs — this one is about proving the AUX PARAMS themselves
   were generated correctly, not about proving a Paillier plaintext's range.
+  **Partially addressed (audit F1): `root.AuxParams.validate` now enforces the
+  cheap structural preconditions (composite `Ñ`, `1 < h1,h2 < Ñ`, coprimality,
+  Jacobi `(h/Ñ)=+1`) fail-closed on every received tuple. Only the full
+  zero-knowledge `Πprm`/`Πmod` — the part the Jacobi check is NECESSARY-but-
+  not-SUFFICIENT for — remains deferred.**
 - Full Pedersen-style DKG (no single dealer) — a distinct follow-up module,
   not a `splitSecretKey` signature change.
-- Minimum-key-size floor enforcement on `AuxParams`/`PublicKeys`/`KeyShare`
-  `fromBytes*` paths (mirrors `paillier`'s own deferred "minimum-key-size
-  floor" backlog item — no floor is enforced on parsed `n_tilde`/Paillier
-  `n` today beyond `std.crypto.ff`'s own overflow/non-canonical rejection).
+- Minimum-key-size floor: NOW ENFORCED where it matters for security — every
+  RECEIVED Paillier `N` and aux `Ñ` on the checked-MtA / zkproofs path must
+  clear `N > q⁷ ≈ 2^1792` (`root.paillierNMeetsFloor` / `nTildeMeetsFloor`),
+  fail-closed at both prove and verify entry points (audit F2). The generic
+  `AuxParams`/`PublicKeys`/`KeyShare`/`paillier` `fromBytes*` CODEC paths
+  deliberately do NOT floor (they parse generic wire values, including the
+  small toy moduli the serialization tests round-trip); the floor is a
+  checked-path security precondition, applied where the params are actually
+  consumed by a range proof, not a byte-codec concern. `paillier`'s own
+  "minimum-key-size floor on `fromBytes`" backlog item is unaffected —
+  `paillier` stays a general-purpose module and does not impose this
+  threshold-ECDSA-specific `q⁷` floor.

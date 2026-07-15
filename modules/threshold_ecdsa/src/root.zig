@@ -522,6 +522,74 @@ pub const AuxParams = struct {
 
         return .{ .n_tilde = n_tilde, .h1 = h1, .h2 = h2 };
     }
+
+    pub const ValidateError = error{InvalidAuxParams};
+
+    /// **Audit F1 + F2 — validate a RECEIVED counterparty aux tuple
+    /// `(Ñ, h1, h2)` before using it as a range proof's Pedersen commitment
+    /// base.** `fromBytesAlloc` only PARSES the tuple; nothing there checks
+    /// it. Outside the trusted-dealer scope (i.e. the general checked-MtA
+    /// API), a MALICIOUS verifier can broadcast a crafted `Ñ`/`h1`/`h2` whose
+    /// group structure leaks the PROVER's secret witness through the Pedersen
+    /// commitment `z = h1^m · h2^ρ mod Ñ` — the TSSHOCK / Alpha-Rays class.
+    /// The checked-MtA / zkproofs PROVE entry points (`zkproofs
+    /// .proveAliceRange`/`proveBobMta`/`proveBobMtaWc`) call this on the
+    /// `verifier_aux` they are about to commit under, fail-closed.
+    ///
+    /// Checks enforced (`random` MUST be a real CSPRNG; the MR witnesses it
+    /// draws are public):
+    ///
+    ///   - **F1 — Ñ composite.** A PRIME `Ñ` is rejected (its cyclic
+    ///     known-order group would defeat the commitment's hiding). Reuses
+    ///     this module's own Miller-Rabin (`isProbablePrime`); no new
+    ///     primality impl. `Ñ` is ODD by construction (`std.crypto.ff
+    ///     .Modulus` rejects even moduli). An honest two-prime `Ñ` fails MR on
+    ///     the first witness — only a malicious prime pays the full round
+    ///     count.
+    ///   - **F1 — 1 < h1 < Ñ, 1 < h2 < Ñ.** The upper bound is guaranteed by
+    ///     `AuxFe` canonicality; the degenerate `0`/`1` are rejected.
+    ///   - **F1 — h1, h2 in the subgroup of squares mod Ñ.** The strongest
+    ///     check cheaply available WITHOUT `Ñ`'s factorization is the Jacobi
+    ///     symbol `(h/Ñ) == +1`. **Exact guarantee:** `+1` is a NECESSARY
+    ///     condition for a quadratic residue and simultaneously proves
+    ///     `gcd(h, Ñ) == 1` (the symbol is `0` iff `h` shares a factor with
+    ///     `Ñ`, so the gcd check is subsumed). It is NOT sufficient — a value
+    ///     that is a non-residue mod BOTH prime factors of `Ñ` also has
+    ///     symbol `+1`. Closing that gap needs the party to PROVE correct
+    ///     generation.
+    ///   - **F2 — key-size floor, Ñ > q⁷.** Below this the GG18 `t1 <= q⁷`
+    ///     range bound is vacuous (audit F2); see `nTildeMeetsFloor`.
+    ///
+    /// **TODO(Πprm/Πmod):** the full fix is a GG20/CMP zero-knowledge
+    /// proof-of-correct-generation broadcast alongside the tuple (that `Ñ` is
+    /// a product of two safe primes and `h2 = h1^λ` for a known `λ`) — the
+    /// larger, deliberately-deferred item (`generateAuxParamsInternal`
+    /// already returns the `λ` such a prover would need). This structural
+    /// validation is the cheap, always-enforced floor beneath it, not a
+    /// replacement.
+    pub fn validate(self: AuxParams, random: std.Random) ValidateError!void {
+        const nt = self.n_tilde;
+        const one = nt.one();
+
+        // F1: Ñ composite (reject a PRIME Ñ).
+        if (isProbablePrime(nt, random)) return error.InvalidAuxParams;
+
+        // F1: 1 < h1 < Ñ and 1 < h2 < Ñ.
+        if (self.h1.isZero() or self.h1.eql(one)) return error.InvalidAuxParams;
+        if (self.h2.isZero() or self.h2.eql(one)) return error.InvalidAuxParams;
+
+        // F1: h1, h2 in the subgroup of squares mod Ñ (Jacobi == +1, which
+        // also proves coprimality — see the doc comment's exact guarantee).
+        var scratch: [aux_scratch_bytes]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&scratch);
+        const gpa = fba.allocator();
+        if (!auxFeJacobiIsOne(gpa, nt, self.h1)) return error.InvalidAuxParams;
+        if (!auxFeJacobiIsOne(gpa, nt, self.h2)) return error.InvalidAuxParams;
+
+        // F2: key-size floor Ñ > q⁷ (checked last — cheap structural checks
+        // above catch most malformed tuples first).
+        if (!nTildeMeetsFloor(nt)) return error.InvalidAuxParams;
+    }
 };
 
 /// Recommended production floor for `generateAuxParams`'s `bits` — mirrors
@@ -894,6 +962,118 @@ pub fn generateAuxParams(random: std.Random, bits: usize) AuxParams {
     // byte-level source buffer is already secureZero'd inside the internal
     // routine. See the λ-retention decision above.
     return gen.params;
+}
+
+// ── received-aux-param validation (audit F1) + key-size floor (audit F2) ──
+//
+// The number theory `AuxParams.validate` (above) leans on: the audit-F2
+// key-size floor `q⁷` and a factorization-free Jacobi-symbol quadratic-
+// residue test. `q_int`/`comptimeIntBytes` mirror `zkproofs.zig`'s own
+// comptime `q`-power constants; the Jacobi routine reuses this file's
+// `std.math.big.int` scratch helpers (`newBig`/`bigFromBytes`).
+
+const q_int = Secp256k1.scalar.field_order;
+
+/// Big-endian fixed-width encoding of a comptime integer (mirrors
+/// `zkproofs.zig`'s identically-named private helper).
+fn comptimeIntBytes(comptime len: usize, comptime value: comptime_int) [len]u8 {
+    var out: [len]u8 = undefined;
+    var v = value;
+    var i: usize = len;
+    while (i > 0) {
+        i -= 1;
+        out[i] = @intCast(v & 0xff);
+        v >>= 8;
+    }
+    if (v != 0) @compileError("comptimeIntBytes: value does not fit in len bytes");
+    return out;
+}
+
+/// `q⁷` (224 big-endian bytes) — the audit-F2 key-size floor. Every RECEIVED
+/// Paillier `N` and ring-Pedersen `Ñ` on the checked-MtA / zkproofs path must
+/// STRICTLY EXCEED this, or the GG18 `t1 <= q⁷` range bound is vacuous (a
+/// modulus `<= q⁷` can never make that check bite, so the range proof stops
+/// constraining Bob's additive blind `β'` at all). `q⁷ ≈ 2^1792`, so a
+/// modulus clears the floor iff it is (a hair over) 1792 bits — any real
+/// ≥2048-bit key clears it with room to spare, a 1024-bit key never does.
+pub const key_size_floor_bytes = comptimeIntBytes(224, q_int * q_int * q_int * q_int * q_int * q_int * q_int);
+
+/// Unsigned big-endian comparison (leading zeros ignored).
+fn intCompareBytes(a_in: []const u8, b_in: []const u8) std.math.Order {
+    const a = stripLeadingZeros(a_in);
+    const b = stripLeadingZeros(b_in);
+    if (a.len != b.len) return if (a.len < b.len) .lt else .gt;
+    return std.mem.order(u8, a, b);
+}
+
+/// Audit-F2 floor test for a ring-Pedersen `Ñ`: `Ñ > q⁷`.
+pub fn nTildeMeetsFloor(nt: AuxModulus) bool {
+    var buf: [aux_modulus_bytes]u8 = undefined;
+    nt.toBytes(&buf, .big) catch return false;
+    return intCompareBytes(&buf, &key_size_floor_bytes) == .gt;
+}
+
+/// Audit-F2 floor test for a RECEIVED Paillier modulus `N`: `N > q⁷`. Used by
+/// the checked-MtA / zkproofs prove+verify entry points so the `s1 <= q³` /
+/// `t1 <= q⁷` range bounds are never vacuous.
+pub fn paillierNMeetsFloor(pk: paillier.PublicKey) bool {
+    var buf: [paillier.modulus_bytes]u8 = undefined;
+    const n_len = pk.nByteLen();
+    pk.nToBytes(buf[0..n_len]) catch return false;
+    return intCompareBytes(buf[0..n_len], &key_size_floor_bytes) == .gt;
+}
+
+/// Jacobi symbol `(a / n)` for odd `n > 0` (standard reciprocity algorithm
+/// over `std.math.big.int`). Returns `-1`, `0`, or `+1`; `0` exactly when
+/// `gcd(a, n) > 1`. Variable-time — applied only to PUBLIC received aux
+/// params during `AuxParams.validate`.
+fn jacobiSymbol(gpa: std.mem.Allocator, a_in: *const BigInt, n_in: *const BigInt) !i8 {
+    var a = try newBig(gpa);
+    var n = try newBig(gpa);
+    var quot = try newBig(gpa);
+    var rem = try newBig(gpa);
+    var tmp = try newBig(gpa);
+    try a.copy(a_in.toConst());
+    try n.copy(n_in.toConst());
+
+    // a := a mod n
+    try quot.divFloor(&rem, &a, &n);
+    a.swap(&rem);
+
+    var result: i8 = 1;
+    while (!a.eqlZero()) {
+        // Strip factors of two, flipping per (2/n) = (-1)^((n²-1)/8) — i.e.
+        // flip whenever n ≡ 3 or 5 (mod 8). `a` is nonzero here (outer
+        // guard), so its odd part is ≥ 1 and limbs[0] is always in range.
+        while ((a.toConst().limbs[0] & 1) == 0) {
+            try tmp.shiftRight(&a, 1);
+            a.swap(&tmp);
+            const n8 = n.toConst().limbs[0] & 7;
+            if (n8 == 3 or n8 == 5) result = -result;
+        }
+        // Quadratic reciprocity: swap, flipping when a ≡ n ≡ 3 (mod 4).
+        a.swap(&n);
+        if ((a.toConst().limbs[0] & 3) == 3 and (n.toConst().limbs[0] & 3) == 3) result = -result;
+        try quot.divFloor(&rem, &a, &n);
+        a.swap(&rem);
+    }
+    if (n.toConst().orderAgainstScalar(1) == .eq) return result;
+    return 0; // gcd(a, n) > 1
+}
+
+/// True iff `(h / Ñ) == +1`: the cheapest sound check (no factorization of
+/// `Ñ`) that `h` lies in the subgroup of squares mod `Ñ`. Fail-closed on any
+/// encoding/allocation error (returns false). See `AuxParams.validate` for
+/// the exact guarantee.
+fn auxFeJacobiIsOne(gpa: std.mem.Allocator, nt: AuxModulus, h: AuxFe) bool {
+    var h_buf: [aux_modulus_bytes]u8 = undefined;
+    h.toBytes(&h_buf, .big) catch return false;
+    var nt_buf: [aux_modulus_bytes]u8 = undefined;
+    nt.toBytes(&nt_buf, .big) catch return false;
+    var ha = bigFromBytes(gpa, stripLeadingZeros(&h_buf)) catch return false;
+    var na = bigFromBytes(gpa, stripLeadingZeros(&nt_buf)) catch return false;
+    const j = jacobiSymbol(gpa, &ha, &na) catch return false;
+    return j == 1;
 }
 
 // ── per-party public material (REAL) ─────────────────────────────────────
@@ -1495,6 +1675,97 @@ test "generateAuxParams: ring-Pedersen tuple is well-formed (N_tilde composite/o
     try testing.expect(pub_aux.n_tilde.v.eql(back.n_tilde.v));
     try testing.expect(pub_aux.h1.eql(back.h1));
     try testing.expect(pub_aux.h2.eql(back.h2));
+}
+
+test "jacobiSymbol matches known small values" {
+    var scratch: [aux_scratch_bytes]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&scratch);
+    const gpa = fba.allocator();
+
+    const Case = struct { a: u64, n: u64, want: i8 };
+    const cases = [_]Case{
+        .{ .a = 1, .n = 3, .want = 1 },
+        .{ .a = 2, .n = 7, .want = 1 }, // 2 is a QR mod 7
+        .{ .a = 3, .n = 7, .want = -1 }, // 3 is a non-residue mod 7
+        .{ .a = 2, .n = 15, .want = 1 }, // 15 ≡ -1 (mod 8)
+        .{ .a = 7, .n = 15, .want = -1 },
+        .{ .a = 3, .n = 15, .want = 0 }, // gcd(3,15) = 3
+        .{ .a = 4, .n = 187, .want = 1 }, // a perfect square: coprime + QR
+        .{ .a = 5, .n = 187, .want = -1 },
+        .{ .a = 16, .n = 187, .want = 1 },
+    };
+    for (cases) |c| {
+        var a = try newBig(gpa);
+        try a.set(c.a);
+        var n = try newBig(gpa);
+        try n.set(c.n);
+        try testing.expectEqual(c.want, try jacobiSymbol(gpa, &a, &n));
+    }
+}
+
+test "AuxParams.validate accepts a well-formed tuple and rejects malformed / sub-floor ones (audit F1/F2)" {
+    var prng = std.Random.DefaultPrng.init(0x76616c6964617465); // "validate"
+    const random = prng.random();
+
+    // A genuine ~2000-bit ODD COMPOSITE (product of two odd ~1000-bit values,
+    // computed at comptime) with h1 = 4 = 2², h2 = 16 = 4² — both perfect
+    // squares (hence Jacobi +1 and coprime to the odd Ñ). This tuple PASSES:
+    // composite, in-range square-subgroup generators, Ñ > q⁷.
+    const big_composite = comptime comptimeIntBytes(256, ((1 << 1000) + 9) * ((1 << 1000) + 15));
+    const nt_ok = AuxModulus.fromBytes(stripLeadingZeros(&big_composite), .big) catch unreachable;
+    const good: AuxParams = .{
+        .n_tilde = nt_ok,
+        .h1 = AuxFe.fromBytes(nt_ok, &[_]u8{4}, .big) catch unreachable,
+        .h2 = AuxFe.fromBytes(nt_ok, &[_]u8{16}, .big) catch unreachable,
+    };
+    try good.validate(random); // accepts
+
+    // F1 — Ñ PRIME (251): the Miller-Rabin composite check rejects.
+    {
+        const nt = AuxModulus.fromBytes(&[_]u8{251}, .big) catch unreachable;
+        const bad: AuxParams = .{
+            .n_tilde = nt,
+            .h1 = AuxFe.fromBytes(nt, &[_]u8{2}, .big) catch unreachable,
+            .h2 = AuxFe.fromBytes(nt, &[_]u8{4}, .big) catch unreachable,
+        };
+        try testing.expectError(error.InvalidAuxParams, bad.validate(random));
+    }
+    // F1 — h1 out of range (h1 = 1) on the otherwise-valid large Ñ.
+    {
+        const bad: AuxParams = .{ .n_tilde = nt_ok, .h1 = nt_ok.one(), .h2 = good.h2 };
+        try testing.expectError(error.InvalidAuxParams, bad.validate(random));
+    }
+    // F1 — h2 out of range (h2 = 0).
+    {
+        const bad: AuxParams = .{ .n_tilde = nt_ok, .h1 = good.h1, .h2 = nt_ok.zero };
+        try testing.expectError(error.InvalidAuxParams, bad.validate(random));
+    }
+    // F1 — h1 not in the square subgroup: (5/187) = -1 (also would catch a
+    // shared small factor, which yields Jacobi 0).
+    {
+        const nt = AuxModulus.fromBytes(&[_]u8{187}, .big) catch unreachable;
+        const bad: AuxParams = .{
+            .n_tilde = nt,
+            .h1 = AuxFe.fromBytes(nt, &[_]u8{5}, .big) catch unreachable,
+            .h2 = AuxFe.fromBytes(nt, &[_]u8{4}, .big) catch unreachable,
+        };
+        try testing.expectError(error.InvalidAuxParams, bad.validate(random));
+    }
+    // F2 — sub-floor Ñ (187 ≪ q⁷) with structurally-valid QR generators
+    // (h1 = 4, h2 = 16): the key-size floor is the check that fires.
+    {
+        const nt = AuxModulus.fromBytes(&[_]u8{187}, .big) catch unreachable;
+        const bad: AuxParams = .{
+            .n_tilde = nt,
+            .h1 = AuxFe.fromBytes(nt, &[_]u8{4}, .big) catch unreachable,
+            .h2 = AuxFe.fromBytes(nt, &[_]u8{16}, .big) catch unreachable,
+        };
+        try testing.expectError(error.InvalidAuxParams, bad.validate(random));
+    }
+
+    // The F2 floor predicates in isolation.
+    try testing.expect(nTildeMeetsFloor(nt_ok));
+    try testing.expect(!nTildeMeetsFloor(AuxModulus.fromBytes(&[_]u8{187}, .big) catch unreachable));
 }
 
 // Pull the `zkproofs` submodule's tests into this module's test binary —

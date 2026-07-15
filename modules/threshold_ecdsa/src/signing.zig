@@ -106,6 +106,7 @@
 //! beyond the sibling `root`/`mta`/`zkproofs` modules.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const paillier = @import("paillier");
 const root = @import("root.zig");
 const mta = @import("mta.zig");
@@ -363,6 +364,10 @@ pub const SignError = std.mem.Allocator.Error || mta.MtaError || error{
     InvalidKnowledgeProof,
     IdentityPoint,
     SigningAborted,
+    // Audit F1/F2: a RECEIVED aux tuple / Paillier key failed the fail-closed
+    // `zkproofs` prove-side validation (`root.AuxParams.validate` /
+    // `root.paillierNMeetsFloor`) — surfaced from `runCheckedMtA(wc)`.
+    InvalidAuxParams,
 };
 
 /// One instance of the Phase-2c CHECKED MtA (`mta.zig`'s
@@ -643,7 +648,10 @@ fn sampleFeBelow(m: root.AuxModulus, random: std.Random) root.AuxFe {
 }
 
 fn testAuxParams(random: std.Random) !root.AuxParams {
-    const nt_kp = try paillier.generate(random, 512);
+    // 2048-bit Ñ (was 512): the audit-F2 floor now requires every checked-path
+    // aux Ñ to exceed q⁷ ≈ 2^1792. h2 = h1² (lambda = 2) keeps a known DL for
+    // the completeness-only fixture — a square, hence Jacobi +1 like validate wants.
+    const nt_kp = try paillier.generate(random, 2048);
     var nt_buf: [paillier.modulus_bytes]u8 = undefined;
     const nt_len = nt_kp.public.nByteLen();
     try nt_kp.public.nToBytes(nt_buf[0..nt_len]);
@@ -675,7 +683,8 @@ fn testKeygen(allocator: std.mem.Allocator, random: std.Random, t: u32, n: u32) 
     const aux_params = try allocator.alloc(root.AuxParams, n);
     defer allocator.free(aux_params);
     for (0..n) |i| {
-        paillier_keys[i] = try paillier.generate(random, 1024);
+        // 2048-bit (was 1024): audit-F2 floor requires checked-path Paillier N > q⁷.
+        paillier_keys[i] = try paillier.generate(random, 2048);
         aux_params[i] = try testAuxParams(random);
     }
 
@@ -694,6 +703,7 @@ fn expectVerifies(shares: []const root.KeyShare, message: []const u8, sig: Signa
 }
 
 test "signWithShares: decisive test — keygen(2,3) -> sign over 2 shares -> verifies under std EcdsaSecp256k1Sha256" {
+    if (builtin.mode == .Debug) return error.SkipZigTest; // 2048-bit keygen + full signing: ReleaseFast only
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x736967_6e696e67); // "signing"
     const random = prng.random();
@@ -709,6 +719,7 @@ test "signWithShares: decisive test — keygen(2,3) -> sign over 2 shares -> ver
 }
 
 test "signWithShares: different t-subsets of n all produce signatures that verify under X" {
+    if (builtin.mode == .Debug) return error.SkipZigTest; // 2048-bit keygen + full signing: ReleaseFast only
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x7375627365747300); // "subsets"
     const random = prng.random();
@@ -726,6 +737,7 @@ test "signWithShares: different t-subsets of n all produce signatures that verif
 }
 
 test "signWithShares: tampered signature share does not verify" {
+    if (builtin.mode == .Debug) return error.SkipZigTest; // 2048-bit keygen + full signing: ReleaseFast only
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x74616d706572); // "tamper"
     const random = prng.random();
@@ -745,6 +757,7 @@ test "signWithShares: tampered signature share does not verify" {
 }
 
 test "signWithShares: signature over one message does not verify against a different message" {
+    if (builtin.mode == .Debug) return error.SkipZigTest; // 2048-bit keygen + full signing: ReleaseFast only
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x6d69736d61746368); // "mismatch"
     const random = prng.random();
@@ -760,6 +773,7 @@ test "signWithShares: signature over one message does not verify against a diffe
 }
 
 test "signWithShares: rejects a subset with fewer than 2 shares or mismatched group_public_key" {
+    if (builtin.mode == .Debug) return error.SkipZigTest; // 2048-bit keygen: ReleaseFast only
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x76616c6964617465); // "validate"
     const random = prng.random();
@@ -812,6 +826,7 @@ test "round-message codecs round-trip" {
 }
 
 test "lagrangeCoefficient: Σ λ_i · x_i over a subset reconstructs the group secret (self-consistency)" {
+    if (builtin.mode == .Debug) return error.SkipZigTest; // 2048-bit keygen: ReleaseFast only
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x6c6167_72616e6765); // "lagrange"
     const random = prng.random();

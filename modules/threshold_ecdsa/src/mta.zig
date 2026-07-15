@@ -93,6 +93,7 @@
 //! `paillier`'s SPEC timing note); that is inherited, not introduced here.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const paillier = @import("paillier");
 const root = @import("root.zig");
 const zkproofs = @import("zkproofs.zig");
@@ -594,9 +595,13 @@ test "Phase 2c end-to-end: mtaAliceInitChecked -> verifyAliceRange -> mtaBobResp
     // real-composite ring-Pedersen aux params — every arrow in the title
     // is the real production call. This is the wiring counterpart of
     // zkproofs.zig's own proof-level accept/reject tests.
+    // 2048-bit keys throughout: this test drives the checked prove entry
+    // points, which now enforce the audit-F2 floor (Paillier N and aux Ñ
+    // both > q⁷ ≈ 2^1792). Slow in Debug -> ReleaseFast only.
+    if (builtin.mode == .Debug) return error.SkipZigTest;
     var kprng = std.Random.DefaultPrng.init(0x66696e616c697a65); // "finalize"
     const krandom = kprng.random();
-    const kp = try paillier.generate(krandom, 1024);
+    const kp = try paillier.generate(krandom, 2048);
     var prng = std.Random.DefaultPrng.init(0x66696e5f72616e64); // "fin_rand"
     const random = prng.random();
 
@@ -607,7 +612,7 @@ test "Phase 2c end-to-end: mtaAliceInitChecked -> verifyAliceRange -> mtaBobResp
     // Shared by both verification directions in this test; in a real
     // deployment each VERIFIER uses its own tuple (see zkproofs.zig's
     // ownership note).
-    const nt_kp = try paillier.generate(krandom, 512);
+    const nt_kp = try paillier.generate(krandom, 2048);
     var nt_buf: [paillier.modulus_bytes]u8 = undefined;
     const nt_len = nt_kp.public.nByteLen();
     nt_kp.public.nToBytes(nt_buf[0..nt_len]) catch unreachable;

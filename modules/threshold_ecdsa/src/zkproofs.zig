@@ -153,6 +153,7 @@
 //! same posture as `mta.zig`/`root.zig`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const paillier = @import("paillier");
 const root = @import("root.zig");
 
@@ -778,7 +779,26 @@ pub const RangeProof = struct {
     }
 };
 
-pub const ProveError = std.mem.Allocator.Error;
+/// `InvalidAuxParams` surfaces the audit-F1/F2 fail-closed rejection of a
+/// RECEIVED counterparty aux tuple or sub-floor Paillier key at the prove
+/// entry points (see `root.AuxParams.validate` / `root.paillierNMeetsFloor`).
+pub const ProveError = std.mem.Allocator.Error || root.AuxParams.ValidateError;
+
+/// **Audit F1 + F2 — validate the RECEIVED parameters a prover is about to
+/// commit its secret witness under.** `verifier_aux` is the counterparty's
+/// broadcast ring-Pedersen tuple (a malicious one leaks the witness through
+/// the Pedersen commitment — audit F1); `alice_pk` is the Paillier key the
+/// range bounds are taken relative to (a sub-`q⁷` one makes them vacuous —
+/// audit F2). Called fail-closed at the top of every public prove entry
+/// point before any secret-touching arithmetic runs.
+fn validateReceivedParams(
+    verifier_aux: root.AuxParams,
+    alice_pk: paillier.PublicKey,
+    random: std.Random,
+) ProveError!void {
+    try verifier_aux.validate(random);
+    if (!root.paillierNMeetsFloor(alice_pk)) return error.InvalidAuxParams;
+}
 
 /// **GG18 Appendix A.1 "Range Proof", prover side — REAL, verified against
 /// the paper.**
@@ -830,6 +850,7 @@ pub fn proveAliceRange(
     verifier_aux: root.AuxParams,
     random: std.Random,
 ) ProveError!RangeProof {
+    try validateReceivedParams(verifier_aux, alice_pk, random); // audit F1/F2, fail-closed
     var a_bytes = a.toBytes(.big);
     defer std.crypto.secureZero(u8, &a_bytes);
     return proveAliceRangeInner(allocator, &a_bytes, r_a, alice_pk, verifier_aux, random);
@@ -960,6 +981,11 @@ pub fn verifyAliceRange(
 ) bool {
     const nt = verifier_aux.n_tilde;
     const nsq = alice_pk.n_sq;
+
+    // Audit F2 — key-size floor (fail closed): a range proof over a sub-q⁷
+    // Paillier `N` / ring-Pedersen `Ñ` has a vacuous `s1 <= q³` bound, so
+    // reject it outright rather than "verify" a proof that proves nothing.
+    if (!root.paillierNMeetsFloor(alice_pk) or !root.nTildeMeetsFloor(nt)) return false;
 
     // Degenerate-value hardening (fail closed before any arithmetic).
     if (proof.z.isZero() or proof.w.isZero() or proof.s.isZero() or proof.u.c.isZero()) return false;
@@ -1200,6 +1226,7 @@ pub fn proveBobMta(
     verifier_aux: root.AuxParams,
     random: std.Random,
 ) ProveError!MtaProof {
+    try validateReceivedParams(verifier_aux, alice_pk, random); // audit F1/F2, fail-closed
     var x_bytes = b.toBytes(.big);
     defer std.crypto.secureZero(u8, &x_bytes);
     var y_bytes = beta_prime.toBytes(.big);
@@ -1379,6 +1406,10 @@ fn verifyBobInner(
     const nt = verifier_aux.n_tilde;
     const nsq = alice_pk.n_sq;
 
+    // Audit F2 — key-size floor (fail closed): sub-q⁷ moduli make the
+    // `s1 <= q³` / `t1 <= q⁷` bounds vacuous, so reject before verifying.
+    if (!root.paillierNMeetsFloor(alice_pk) or !root.nTildeMeetsFloor(nt)) return false;
+
     // Degenerate-value hardening (fail closed before any arithmetic).
     if (proof.z.isZero() or proof.z1.isZero() or proof.t.isZero() or
         proof.w.isZero() or proof.s.isZero() or proof.v.c.isZero()) return false;
@@ -1519,6 +1550,7 @@ pub fn proveBobMtaWc(
     b_point: root.Element,
     random: std.Random,
 ) ProveError!MtaProofWc {
+    try validateReceivedParams(verifier_aux, alice_pk, random); // audit F1/F2, fail-closed
     var x_bytes = b.toBytes(.big);
     defer std.crypto.secureZero(u8, &x_bytes);
     var y_bytes = beta_prime.toBytes(.big);
@@ -1776,18 +1808,20 @@ test "MtaProofWc: toBytesAlloc/fromBytesAlloc round-trip on hand-built values" {
 
 // -- honest accept / reject: the real Phase-2c security net --
 
-/// A REAL test fixture: a 1024-bit Alice Paillier key (large enough that
-/// q³ < N and q⁷ < N², the completeness preconditions — see the prover doc
-/// comments) plus ring-Pedersen params over a genuine 512-bit two-prime
-/// composite `N_tilde` with `h1` a square and `h2 = h1^lambda` (the same
-/// shape `root.generateAuxParams` produces, minus the safe-prime search —
-/// completeness/reject behavior doesn't depend on safe primes, and this
-/// keeps the tests seconds not minutes).
+/// A REAL test fixture: a **2048-bit** Alice Paillier key plus ring-Pedersen
+/// params over a genuine **2048-bit** two-prime composite `N_tilde` with `h1`
+/// a square and `h2 = h1^lambda` (the same shape `root.generateAuxParams`
+/// produces, minus the safe-prime search — completeness/reject behavior
+/// doesn't depend on safe primes). **Sized at 2048 bits (not the old 1024 /
+/// 512) because the audit-F2 floor now REQUIRES every checked-path Paillier
+/// `N` and aux `Ñ` to exceed `q⁷ ≈ 2^1792`** — below that the `t1 <= q⁷`
+/// range bound is vacuous. Callers of this fixture are consequently gated to
+/// ReleaseFast (the 2048-bit safe-prime-free keygen is slow in Debug).
 fn realAuxAndKey(seed: u64) !struct { kp: paillier.KeyPair, aux: root.AuxParams } {
     var prng = std.Random.DefaultPrng.init(seed);
     const random = prng.random();
-    const kp = try paillier.generate(random, 1024);
-    const nt_kp = try paillier.generate(random, 512);
+    const kp = try paillier.generate(random, 2048);
+    const nt_kp = try paillier.generate(random, 2048);
 
     var nt_buf: [paillier.modulus_bytes]u8 = undefined;
     const nt_len = nt_kp.public.nByteLen();
@@ -1836,6 +1870,7 @@ fn buildCb(pk: paillier.PublicKey, c_a: paillier.Ciphertext, x_bytes: []const u8
 }
 
 test "GG18 A.1 honest accept: Alice's range proof verifies, and re-verifies after a codec round-trip" {
+    if (builtin.mode == .Debug) return error.SkipZigTest; // 2048-bit keygen: ReleaseFast only
     const allocator = testing.allocator;
     const setup = try realAuxAndKey(0xa11ce_0001);
     const pk = setup.kp.public;
@@ -1867,6 +1902,7 @@ test "GG18 A.1 reject (SECURITY-CRITICAL): out-of-range a fails the range check 
     // real protocol on the real witness) must be rejected by equation 1
     // alone. Driven through the byte-level inner prover because the
     // Scalar-typed public API cannot even express m > q.
+    if (builtin.mode == .Debug) return error.SkipZigTest; // 2048-bit keygen: ReleaseFast only
     const allocator = testing.allocator;
     const setup = try realAuxAndKey(0xa11ce_0002);
     const pk = setup.kp.public;
@@ -1894,6 +1930,7 @@ test "GG18 A.1 reject (SECURITY-CRITICAL): out-of-range a fails the range check 
 }
 
 test "GG18 A.1 reject (SECURITY-CRITICAL): tampered c_a and every mangled proof field" {
+    if (builtin.mode == .Debug) return error.SkipZigTest; // 2048-bit keygen: ReleaseFast only
     const allocator = testing.allocator;
     const setup = try realAuxAndKey(0xa11ce_0003);
     const pk = setup.kp.public;
@@ -1945,6 +1982,7 @@ test "GG18 A.1 reject (SECURITY-CRITICAL): tampered c_a and every mangled proof 
 }
 
 test "GG18 A.3 honest accept: Bob's MtA proof over checked-MtA-shaped ciphertexts, and after a codec round-trip" {
+    if (builtin.mode == .Debug) return error.SkipZigTest; // 2048-bit keygen: ReleaseFast only
     const allocator = testing.allocator;
     const setup = try realAuxAndKey(0xb0b_0001);
     const pk = setup.kp.public;
@@ -1979,6 +2017,7 @@ test "GG18 A.3 reject (SECURITY-CRITICAL): out-of-range b (s1 > q³) and out-of-
     // degree of freedom Alpha-Rays-class attacks exploit. The t1 case is
     // specifically the tss-lib/GG20 hardening the GG18 paper does not
     // have (see the module doc comment) — this test is what pins it.
+    if (builtin.mode == .Debug) return error.SkipZigTest; // 2048-bit keygen: ReleaseFast only
     const allocator = testing.allocator;
     const setup = try realAuxAndKey(0xb0b_0002);
     const pk = setup.kp.public;
@@ -2019,6 +2058,7 @@ test "GG18 A.3 reject (SECURITY-CRITICAL): out-of-range b (s1 > q³) and out-of-
 }
 
 test "GG18 A.3 reject (SECURITY-CRITICAL): tampered c_b, wrong beta' witness, and every mangled proof field" {
+    if (builtin.mode == .Debug) return error.SkipZigTest; // 2048-bit keygen: ReleaseFast only
     const allocator = testing.allocator;
     const setup = try realAuxAndKey(0xb0b_0003);
     const pk = setup.kp.public;
@@ -2090,6 +2130,7 @@ test "GG18 A.3 reject (SECURITY-CRITICAL): tampered c_b, wrong beta' witness, an
 }
 
 test "GG18 A.2 MtAwc: honest accept; wrong B, tampered u1, and cross-protocol proof reuse all reject" {
+    if (builtin.mode == .Debug) return error.SkipZigTest; // 2048-bit keygen: ReleaseFast only
     const allocator = testing.allocator;
     const setup = try realAuxAndKey(0xb0b_0004);
     const pk = setup.kp.public;
@@ -2136,4 +2177,99 @@ test "GG18 A.2 MtAwc: honest accept; wrong B, tampered u1, and cross-protocol pr
     // plain MtA proof (different Fiat-Shamir domain + transcript — this
     // is what the domain-separation tags buy).
     try testing.expect(!verifyBobMta(proof.base, c_a, c_b, pk, setup.aux));
+}
+
+// -- audit F1/F2: checked-path received-parameter validation (NEW) --
+//
+// A malicious counterparty supplies the `verifier_aux` a prover commits its
+// secret witness under (F1) and/or a sub-q⁷ Paillier key (F2). These assert
+// the prove entry points refuse both, fail-closed, with error.InvalidAuxParams.
+// They are FAST — validation rejects before any sampling/modexp — so unlike
+// the honest-accept/reject fixtures above they run in BOTH Debug and
+// ReleaseFast (no 2048-bit keygen on the reject path).
+
+fn toyPaillierPk() paillier.PublicKey {
+    return (paillier.fromPrimes(&[_]u8{11}, &[_]u8{17}) catch unreachable).public; // N = 187 ≪ q⁷
+}
+
+fn auxFromBytes(nt_byte: u8, h1_byte: u8, h2_byte: u8) root.AuxParams {
+    const nt = root.AuxModulus.fromBytes(&[_]u8{nt_byte}, .big) catch unreachable;
+    return .{
+        .n_tilde = nt,
+        .h1 = root.AuxFe.fromBytes(nt, &[_]u8{h1_byte}, .big) catch unreachable,
+        .h2 = root.AuxFe.fromBytes(nt, &[_]u8{h2_byte}, .big) catch unreachable,
+    };
+}
+
+test "audit F1: proveAliceRange/proveBobMta fail-close on a crafted bad received aux (prime Ñ / out-of-range h / non-QR h)" {
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x66315f61757800); // "f1_aux"
+    const random = prng.random();
+
+    const pk = toyPaillierPk(); // aux validation runs before any pk use
+    const a = scalarFromU64(5);
+    const r_a = paillier.Fe.fromPrimitive(u32, pk.n_sq, 3) catch unreachable;
+
+    // Ñ = 251 is PRIME -> Miller-Rabin composite check rejects.
+    try testing.expectError(error.InvalidAuxParams, proveAliceRange(allocator, a, r_a, pk, auxFromBytes(251, 2, 4), random));
+    // h1 = 1 (out of range) on a composite Ñ.
+    try testing.expectError(error.InvalidAuxParams, proveAliceRange(allocator, a, r_a, pk, auxFromBytes(187, 1, 16), random));
+    // h1 = 5 is a quadratic NON-residue mod 187 (Jacobi -1).
+    try testing.expectError(error.InvalidAuxParams, proveAliceRange(allocator, a, r_a, pk, auxFromBytes(187, 5, 4), random));
+
+    // Same fail-closed gate on Bob's prover (shares validateReceivedParams).
+    const b = scalarFromU64(6);
+    const bp = scalarFromU64(7);
+    const r_b = paillier.Fe.fromPrimitive(u32, pk.n_sq, 5) catch unreachable;
+    const one_fe = paillier.Fe.fromPrimitive(u32, pk.n_sq, 1) catch unreachable;
+    const two_fe = paillier.Fe.fromPrimitive(u32, pk.n_sq, 2) catch unreachable;
+    const c_dummy = paillier.encrypt(pk, one_fe, two_fe) catch unreachable;
+    try testing.expectError(error.InvalidAuxParams, proveBobMta(allocator, b, bp, r_b, c_dummy, c_dummy, pk, auxFromBytes(251, 2, 4), random));
+}
+
+test "audit F2: prove entry points fail-close on a sub-q⁷ modulus on the checked path" {
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x66325f666c6f6f72); // "f2_floor"
+    const random = prng.random();
+    const a = scalarFromU64(7);
+
+    // (a) sub-floor aux Ñ = 187 with structurally-valid square-subgroup
+    // generators (h1 = 4, h2 = 16): the AUX key-size floor rejects it.
+    {
+        const pk = toyPaillierPk();
+        const r_a = paillier.Fe.fromPrimitive(u32, pk.n_sq, 3) catch unreachable;
+        try testing.expectError(error.InvalidAuxParams, proveAliceRange(allocator, a, r_a, pk, auxFromBytes(187, 4, 16), random));
+    }
+
+    // (b) VALID > q⁷ aux (a genuine ~2000-bit composite with perfect-square
+    // generators, built at comptime — no keygen, so this stays fast) BUT a
+    // sub-floor toy Paillier key (N = 187): the PAILLIER key-size floor is
+    // what rejects it, proving the F2 check covers the received Paillier N too.
+    {
+        const big_composite = comptime comptimeIntBytes(256, ((1 << 1000) + 9) * ((1 << 1000) + 15));
+        const nt = root.AuxModulus.fromBytes(stripLeadingZeros(&big_composite), .big) catch unreachable;
+        const good_aux: root.AuxParams = .{
+            .n_tilde = nt,
+            .h1 = root.AuxFe.fromBytes(nt, &[_]u8{4}, .big) catch unreachable,
+            .h2 = root.AuxFe.fromBytes(nt, &[_]u8{16}, .big) catch unreachable,
+        };
+        const pk = toyPaillierPk();
+        const r_a = paillier.Fe.fromPrimitive(u32, pk.n_sq, 3) catch unreachable;
+        try testing.expectError(error.InvalidAuxParams, proveAliceRange(allocator, a, r_a, pk, good_aux, random));
+
+        // And the verify-side F2 floor (defense-in-depth): a proof "verified"
+        // against a sub-floor Paillier key is rejected outright. Build a
+        // syntactically-valid RangeProof over the toy pk and assert reject.
+        const dummy: RangeProof = .{
+            .z = good_aux.h1,
+            .u = paillier.encrypt(pk, paillier.Fe.fromPrimitive(u32, pk.n_sq, 1) catch unreachable, paillier.Fe.fromPrimitive(u32, pk.n_sq, 2) catch unreachable) catch unreachable,
+            .w = good_aux.h2,
+            .s = paillier.Fe.fromPrimitive(u32, pk.n_sq, 3) catch unreachable,
+            .s1 = try allocator.dupe(u8, &[_]u8{1}),
+            .s2 = try allocator.dupe(u8, &[_]u8{1}),
+        };
+        defer dummy.deinit(allocator);
+        const c_dummy = paillier.encrypt(pk, paillier.Fe.fromPrimitive(u32, pk.n_sq, 4) catch unreachable, paillier.Fe.fromPrimitive(u32, pk.n_sq, 5) catch unreachable) catch unreachable;
+        try testing.expect(!verifyAliceRange(dummy, c_dummy, pk, good_aux));
+    }
 }
