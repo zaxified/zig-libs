@@ -18,13 +18,19 @@ n = 1024). A single degree-generic implementation (`poly.Ring(logn)` /
 `codec.Codec(Ring)`) serves both sets; the Falcon-512 flat API is retained
 unchanged and Falcon-1024 gets `_1024`-suffixed entry points.
 
-**Key generation and signing are NOT implemented** (reserved): keygen needs
-the NTRUSolve big-integer tower and signing needs the ffSampling trapdoor
-Gaussian sampler, where a subtly wrong sampler still produces signatures
-that *verify* while leaking the private key — that half only ships when it
-can ship KAT-exact. Also out of scope: the padded/CT signature formats (the
-compressed format the KATs use is implemented) and constant-time hardening
-(verification handles public data only).
+**Key generation and signing are a SCAFFOLD, not a working implementation**:
+the API shape (`generateKeyPair`/`signRandomized`/`signDeterministic`, both
+degrees), key/tree types, and a KAT harness (`kat_vectors.zig`'s vectors now
+carry each `seed`) are real and compile; the four genuinely hard pieces —
+NTRUGen/NTRUSolve (keygen's big-integer tower), the floating-point FFT, the
+ffSampling trapdoor recursion, and SamplerZ (the discrete Gaussian sampler
+— side-channel-critical: a subtly wrong sampler still produces signatures
+that *verify* while leaking the private key) — are `@panic("TODO(fable/
+core): ...")` stubs. See `SPEC.md`'s "Keygen + sign scaffold" section for
+the file-by-file breakdown. Also out of scope even once filled in: the
+padded/CT signature format (the compressed format the KATs use is
+implemented) and constant-time hardening beyond `gaussian.samplerZ` itself
+(verification handles public data only and needs none).
 
 The KAT oracle is the official **NIST Round-3** `falcon512-KAT.rsp` and
 `falcon1024-KAT.rsp` (FIPS 206 / FN-DSA is still a draft standard; Round-3
@@ -34,6 +40,7 @@ implement).
 ## Use
 
 ```zig
+const std = @import("std");
 const falcon = @import("falcon");
 
 // Falcon-512: decode a public key (897 bytes, 0x09 header).
@@ -55,6 +62,14 @@ const pk2 = try sk.publicKey(); // h = g * f^-1 mod q
 const pk10 = try falcon.PublicKey1024.fromBytes(pk_bytes[0..1793]); // 0x0a header
 try pk10.verify(message, nonce, sig_field); // 0x2a header byte on sig_field
 const msg10 = try falcon.openNistSignedMessage1024(&pk10, sm);
+
+// Keygen + sign: API shape is real, but PANICS today (see the SCAFFOLD
+// note above — the hard math is stubbed).
+const kp = try falcon.generateKeyPair(std.crypto.random);
+var nonce_buf: [falcon.nonce_length]u8 = undefined;
+var sig_buf: [falcon.max_sig_field_length]u8 = undefined;
+const len = try falcon.signRandomized(&kp.signing_key, message, std.crypto.random, &nonce_buf, &sig_buf);
+try kp.public_key.verify(message, &nonce_buf, sig_buf[0..len]);
 ```
 
 ## Verify
@@ -67,7 +82,11 @@ zig build test-falcon -Doptimize=ReleaseFast
 Runs the NIST Round-3 KATs for both Falcon-512 and Falcon-1024 (every
 embedded vector must open + verify, the compressed signature and public key
 must re-encode byte-exactly, sk must reproduce pk) plus tamper-rejection,
-NTT-vs-schoolbook, and codec canonicality tests.
+NTT-vs-schoolbook, and codec canonicality tests. `keygen_sign_test.zig`'s
+4 keygen/sign KAT-harness tests currently report SKIPPED (not failed) —
+each stops with `error.SkipZigTest` right before the call that would reach
+a stub; see that file's module doc comment for exactly what they check
+once keygen/sign are implemented.
 
 Provenance: clean-room from the Falcon Round-3 specification; the reference
 implementation is a wire-format design reference + KAT oracle only — see

@@ -597,7 +597,14 @@ project git history).
                canonicality rules, the l2bound norm table) — no source ported
                or copied. The submission package's falcon512-KAT.rsp and
                falcon1024-KAT.rsp vectors are used purely as the test oracle
-               (SHA-256 of each .rsp file recorded in the module's SPEC.md).
+               (SHA-256 of each .rsp file recorded in the module's SPEC.md);
+               each embedded vector's `seed` field (the NIST-KAT DRBG input)
+               was added the same way, re-extracted from the same
+               SHA-256-verified .rsp mirror. Keygen/sign are a SCAFFOLD only
+               (structure + KAT harness; the hard math — NTRUGen/NTRUSolve,
+               the FFT, ffSampling, SamplerZ — is `@panic` stubs, no source
+               consulted for those beyond citing Falcon spec algorithm/table
+               numbers by name).
 
   paillier   — clean-room from the public Paillier 1999 paper (P. Paillier,
                "Public-Key Cryptosystems Based on Composite Degree

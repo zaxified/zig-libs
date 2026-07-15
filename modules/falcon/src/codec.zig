@@ -105,6 +105,40 @@ pub fn Codec(comptime Ring: type) type {
             if ((acc & ((@as(u32, 1) << acc_len) - 1)) != 0) return error.InvalidEncoding;
         }
 
+        /// Encode fixed-width (`bits`-bit) signed coefficients — the
+        /// inverse of `trimI8Decode`. Every value in `in` must already be
+        /// in the valid range `trimI8Decode` accepts (i.e. NOT the
+        /// forbidden minimum -2^(bits-1)); this is an encoder for
+        /// coefficients this module itself produced (keygen's sampled
+        /// f/g/F), not a decoder for untrusted bytes, so it asserts
+        /// rather than errors. `out.len` must be exactly n*bits/8.
+        pub fn trimI8Encode(comptime bits: u4, out: *[Ring.n * bits / 8]u8, in: *const [Ring.n]i8) void {
+            const mask1: u32 = (@as(u32, 1) << bits) - 1;
+            var acc: u32 = 0;
+            var acc_len: u5 = 0;
+            var v: usize = 0;
+            for (in) |x| {
+                // Two's-complement `bits`-bit field: sign-extending `x`
+                // to i32 and masking the low `bits` bits reproduces
+                // exactly what trimI8Decode's sign-extension logic
+                // expects back.
+                const xi: i32 = x;
+                const w: u32 = @as(u32, @bitCast(xi)) & mask1;
+                acc = (acc << bits) | w;
+                acc_len += bits;
+                while (acc_len >= 8) {
+                    acc_len -= 8;
+                    out[v] = @truncate(acc >> acc_len);
+                    v += 1;
+                }
+            }
+            if (acc_len > 0) {
+                out[v] = @truncate(acc << (8 - acc_len));
+                v += 1;
+            }
+            std.debug.assert(v == Ring.n * bits / 8);
+        }
+
         /// Decode a compressed signature value s2. Consumes bytes from
         /// `in`; succeeds only if the encoding is canonical AND uses
         /// exactly `in.len` bytes (the reference enforces the same via its
@@ -214,6 +248,7 @@ pub const modq_encoded_len = Codec512.modq_encoded_len;
 pub const modqDecode = Codec512.modqDecode;
 pub const modqEncode = Codec512.modqEncode;
 pub const trimI8Decode = Codec512.trimI8Decode;
+pub const trimI8Encode = Codec512.trimI8Encode;
 pub const compDecode = Codec512.compDecode;
 pub const compEncode = Codec512.compEncode;
 pub const hashToPoint = Codec512.hashToPoint;
@@ -258,6 +293,33 @@ test "trimI8 decode: values, forbidden minimum, padding" {
     var bad = std.mem.zeroes([384]u8);
     bad[0] = 0b10000000;
     try std.testing.expectError(error.InvalidEncoding, trimI8Decode(&out, 6, &bad));
+}
+
+test "trimI8 encode: inverse of decode, byte-exact against the known layout" {
+    // Same four values as the decode test above (0, 1, -1, 31), rest 0 —
+    // trimI8Encode must reproduce that exact byte layout.
+    var in = std.mem.zeroes([n]i8);
+    in[0] = 0;
+    in[1] = 1;
+    in[2] = -1;
+    in[3] = 31;
+    var buf: [384]u8 = undefined;
+    trimI8Encode(6, &buf, &in);
+    try std.testing.expectEqual(@as(u8, 0b00000000), buf[0]);
+    try std.testing.expectEqual(@as(u8, 0b00011111), buf[1]);
+    try std.testing.expectEqual(@as(u8, 0b11011111), buf[2]);
+
+    // Round-trip against decode over random in-range values (forbidden
+    // minimum -32 excluded).
+    var prng = std.Random.DefaultPrng.init(0x7212);
+    const random = prng.random();
+    var vals: [n]i8 = undefined;
+    for (&vals) |*x| x.* = @intCast(random.intRangeAtMost(i16, -31, 31));
+    var buf2: [384]u8 = undefined;
+    trimI8Encode(6, &buf2, &vals);
+    var back: [n]i8 = undefined;
+    try trimI8Decode(&back, 6, &buf2);
+    try std.testing.expectEqualSlices(i8, &vals, &back);
 }
 
 test "comp encode/decode round-trip; minus-zero and junk padding rejected" {
@@ -343,6 +405,18 @@ test "Falcon-1024 codec: trimI8 decode at 5 bits (the n=1024 f/g width)" {
     var bad = std.mem.zeroes([Ring1024FgBytes]u8);
     bad[0] = 0b10000000;
     try std.testing.expectError(error.InvalidEncoding, Codec1024.trimI8Decode(&out, 5, &bad));
+}
+
+test "Falcon-1024 codec: trimI8 encode is the inverse of decode (5-bit width)" {
+    var prng = std.Random.DefaultPrng.init(0x72121024);
+    const random = prng.random();
+    var vals: [poly.Ring1024.n]i8 = undefined;
+    for (&vals) |*x| x.* = @intCast(random.intRangeAtMost(i16, -15, 15));
+    var buf: [Ring1024FgBytes]u8 = undefined;
+    Codec1024.trimI8Encode(5, &buf, &vals);
+    var back: [poly.Ring1024.n]i8 = undefined;
+    try Codec1024.trimI8Decode(&back, 5, &buf);
+    try std.testing.expectEqualSlices(i8, &vals, &back);
 }
 
 test "Falcon-1024 codec: comp encode/decode round-trip; minus-zero rejected" {

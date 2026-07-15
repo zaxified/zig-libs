@@ -5,9 +5,27 @@
 //! KAT/falcon1024-KAT.rsp; SHA-256 of both .rsp files recorded in SPEC.md).
 //! Fields per vector: msg, pk (897 B / 1793 B), sk (1281 B / 2305 B), sm
 //! (the NIST signed-message blob: 2-byte sig length || 40-byte nonce || msg
-//! || esig). The `seed` DRBG inputs are intentionally NOT carried:
-//! keygen/sign are not implemented, so only the deterministic verify/decode
-//! path is exercised.
+//! || esig), seed (48-byte NIST-KAT DRBG seed, hex).
+//!
+//! **`seed` provenance**: re-extracted directly from the same official
+//! `falcon-round3.zip` (falcon-sign.info) as the other fields — downloaded
+//! fresh and SHA-256-verified byte-for-byte against the hashes already
+//! recorded in SPEC.md before extraction, so this is the identical mirror
+//! the rest of this file's vectors were pulled from, not a second source.
+//! `seed` is the raw input to the NIST KAT generator's AES-256-CTR-DRBG
+//! (`KAT/generator/katrng.c`, `randombytes()`); it is NOT itself the
+//! Falcon-internal SHAKE256 signer PRNG seed — see `sign.zig`'s
+//! `ShakePrng` doc comment for that distinction. Every vector below (both
+//! parameter sets) had msg/pk/sk cross-checked to already match this
+//! file's pre-existing content byte-for-byte before its `seed` was added,
+//! confirming `seed` lines up with the same (count, msg, pk, sk, sm)
+//! tuple the rest of the vector was drawn from.
+//!
+//! `seed`/keygen/sign are wired here as a harness (this struct field, plus
+//! `keygen_sign_test.zig`) so a future filled-in keygen+signer is
+//! immediately KAT-checkable; they are not yet exercised for their
+//! intended purpose because keygen/sign are themselves `@panic`
+//! stubs — see `root.zig`'s module doc comment.
 
 pub const Vector = struct {
     count: usize,
@@ -15,11 +33,16 @@ pub const Vector = struct {
     pk: []const u8,
     sk: []const u8,
     sm: []const u8,
+    /// 48-byte (96 hex chars) NIST-KAT DRBG seed for this vector — see
+    /// this file's module doc comment for provenance and what it is (and
+    /// is not) the seed of.
+    seed: []const u8,
 };
 
 pub const falcon512: []const Vector = &.{
     .{
         .count = 0,
+        .seed = "061550234D158C5EC95595FE04EF7A25767F2E24CC2BC479D09D86DC9ABCFDE7056A8C266F9EF97ED08541DBD2E1FFA1",
         .msg = "d81c4d8d734fcbfbeade3d3f8a039faa2a2c9957e835ad55b22e75bf57bb556ac8",
         .pk = "096ba86cb658a8f445c9a5e4c28374bec879c8655f68526923240918074d0147c03162e4a49200648c652803c6fd7509" ++
             "ae9aa799d6310d0bd42724e0635920186207000767ca5a8546b1755308c304b84fc93b069e265985b398d6b834698287" ++
@@ -85,6 +108,7 @@ pub const falcon512: []const Vector = &.{
     },
     .{
         .count = 1,
+        .seed = "64335BF29E5DE62842C941766BA129B0643B5E7121CA26CFC190EC7DC3543830557FDD5C03CF123A456D48EFEA43C868",
         .msg = "225d5ce2ceac61930a07503fb59f7c2f936a3e075481da3ca299a80f8c5df9223a073e7b90e02ebf98ca2227eba38c1a" ++
             "b2568209e46dba961869c6f83983b17dcd49",
         .pk = "09baccc8d6c916c9ad12e3e49881f732b84870ce5976921d197a00d226ab8825430da78f19b0e7a12129ecb739d4a05c" ++
@@ -152,6 +176,7 @@ pub const falcon512: []const Vector = &.{
     },
     .{
         .count = 2,
+        .seed = "BFF58FDA9DB4C2D8BD02E4647868D4A2FA12500A65CA4C9F918B505707FA775951018D9149C97D443EA16B07DD68435B",
         .msg = "2b8c4b0f29363eaee469a7e33524538aa066ae98980eaa19d1f10593203da2143b9e9e1973f7ff0e6c6aaa3c0b900e50" ++
             "d003412efe96deece3046d8c46bc7709228789775abdf56aed6416c90033780cb7a4984815da1b14660dcf34aa34bf82" ++
             "cebbcf",
@@ -220,6 +245,7 @@ pub const falcon512: []const Vector = &.{
     },
     .{
         .count = 3,
+        .seed = "58C094D217BC13EDFDBEA57EDBF3A536F8F69FED1D54648CE3D0CCB4847A5C9917C2E2BC4D5F620E937F0D329FCF8A16",
         .msg = "2f7af5b52a046471efcd720c9384919be05a61cde8e8b01251c5ab885e820fd36ed9ff6fdf45783ec81a86728cbb74b4" ++
             "26adff96123c08fac2bc6c58a9c0dd71761292262c65f20df47751f0831770a6bb7b3760bb7f5efffb6e11ac35f353a6" ++
             "f24400b80b287834e92c9cf0d3c949d6dca31b0b94e0e3312e8bd02174b170c2ca9355fe",
@@ -289,6 +315,7 @@ pub const falcon512: []const Vector = &.{
     },
     .{
         .count = 57,
+        .seed = "4E94DD734A371A7C6AD4A567038CF93BAACE2B9D30F3862198DC55D2F21F8FDC9A7AE5DCA1541712179E3AB1FFA3F792",
         .msg = "f3ea695264936d537d86e545e132131442c2973d19b37f8c911e3ecef4a13a8b1edf5e5968a6198d26205ffe6b76cb14" ++
             "e353b5e2c9de1bd44ab9bd55862ba1a479833335725ef52601810c778da4a32c497ccfa43f91c72a1499e8d295ae7cdb" ++
             "43f1ca05f0d4a31b30d9a69cab8288640f3f9e081e2c98cc8351c7eb9954d428da4bb374b346a83eff5aa3f455f2bb3f" ++
@@ -439,6 +466,7 @@ pub const falcon512: []const Vector = &.{
 pub const falcon1024: []const Vector = &.{
     .{
         .count = 0,
+        .seed = "061550234D158C5EC95595FE04EF7A25767F2E24CC2BC479D09D86DC9ABCFDE7056A8C266F9EF97ED08541DBD2E1FFA1",
         .msg = "d81c4d8d734fcbfbeade3d3f8a039faa2a2c9957e835ad55b22e75bf57bb556ac8",
         .pk = "0a0441a9b73f494d16556680b12b0f446a652700e4304151bc310683c43f20ab28492ff580708068fa064275c1b0d08452f" ++
             "c7c324154929ca850d4e6f3425b0f149475a14468c740be9842d2c1bbb93e2001f4202068d060c1aa9f99a5f67e86800f2e" ++
@@ -554,6 +582,7 @@ pub const falcon1024: []const Vector = &.{
     },
     .{
         .count = 1,
+        .seed = "64335BF29E5DE62842C941766BA129B0643B5E7121CA26CFC190EC7DC3543830557FDD5C03CF123A456D48EFEA43C868",
         .msg = "225d5ce2ceac61930a07503fb59f7c2f936a3e075481da3ca299a80f8c5df9223a073e7b90e02ebf98ca2227eba38c1ab25" ++
             "68209e46dba961869c6f83983b17dcd49",
         .pk = "0a3d148e18fc1c313afead62e4ddaf6399f6ba5c46f18fed739552cc6145012b8347d5b74e5c1b1194d78ca6c981e782075" ++
@@ -671,6 +700,7 @@ pub const falcon1024: []const Vector = &.{
     },
     .{
         .count = 2,
+        .seed = "BFF58FDA9DB4C2D8BD02E4647868D4A2FA12500A65CA4C9F918B505707FA775951018D9149C97D443EA16B07DD68435B",
         .msg = "2b8c4b0f29363eaee469a7e33524538aa066ae98980eaa19d1f10593203da2143b9e9e1973f7ff0e6c6aaa3c0b900e50d00" ++
             "3412efe96deece3046d8c46bc7709228789775abdf56aed6416c90033780cb7a4984815da1b14660dcf34aa34bf82cebbcf",
         .pk = "0a4ce9a1c540e1c25a91397bf340a568661a355f96111398d3e9f7ee29a91acd04a2e0d24dfe29c0f6cbc060949317cf57f" ++
@@ -788,6 +818,7 @@ pub const falcon1024: []const Vector = &.{
     },
     .{
         .count = 3,
+        .seed = "58C094D217BC13EDFDBEA57EDBF3A536F8F69FED1D54648CE3D0CCB4847A5C9917C2E2BC4D5F620E937F0D329FCF8A16",
         .msg = "2f7af5b52a046471efcd720c9384919be05a61cde8e8b01251c5ab885e820fd36ed9ff6fdf45783ec81a86728cbb74b426a" ++
             "dff96123c08fac2bc6c58a9c0dd71761292262c65f20df47751f0831770a6bb7b3760bb7f5efffb6e11ac35f353a6f24400" ++
             "b80b287834e92c9cf0d3c949d6dca31b0b94e0e3312e8bd02174b170c2ca9355fe",
@@ -907,6 +938,7 @@ pub const falcon1024: []const Vector = &.{
     },
     .{
         .count = 57,
+        .seed = "4E94DD734A371A7C6AD4A567038CF93BAACE2B9D30F3862198DC55D2F21F8FDC9A7AE5DCA1541712179E3AB1FFA3F792",
         .msg = "f3ea695264936d537d86e545e132131442c2973d19b37f8c911e3ecef4a13a8b1edf5e5968a6198d26205ffe6b76cb14e35" ++
             "3b5e2c9de1bd44ab9bd55862ba1a479833335725ef52601810c778da4a32c497ccfa43f91c72a1499e8d295ae7cdb43f1ca" ++
             "05f0d4a31b30d9a69cab8288640f3f9e081e2c98cc8351c7eb9954d428da4bb374b346a83eff5aa3f455f2bb3fc922f901b" ++
