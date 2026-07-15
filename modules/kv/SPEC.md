@@ -34,10 +34,35 @@ Reliability, not adversarial security:
 Unit tests + the randomized deterministic **VOPR** (`vopr.zig`): PRNG-driven fuzz of recovery across
 torn/partial writes, short reads, garbage tails, and crash points ×4 modes (incl. non-contiguous /
 out-of-order durability, see below) over chained epochs; min-fault-count asserts + the sabotage
-self-test (≥10/12 runs catch a data-losing recovery). 36 tests. Run: `zig build test-kv`.
+self-test (≥10/12 runs catch a data-losing recovery). 59 tests. Run: `zig build test-kv`.
+
+- **Fault-scheduling policy is a seam** (`scheduler.zig`, 2026-07-15): the epoch-planning
+  decision (which fault, how soon) that used to be inline in `Vopr.runSeed` is a pluggable
+  `FaultScheduler` (`Config.scheduler`). `uniformScheduler` is behaviorally identical to the old
+  inline logic (same PRNG draw order — no VOPR determinism/stats change). A `Coverage` tally
+  (fault-class × early/late-timing cells) is threaded through and recorded on every draw.
+- **Coverage-guided fault scheduling — implemented** (`scheduler.zig`, 2026-07-15):
+  `coverageGuidedScheduler(&state)` biases the (class × timing) draw toward the least-exercised
+  cells via a bandit-style epsilon-greedy rule (exploit = coldest reachable cell w/ random
+  tie-break; explore = 1-in-`explore_den` uniform draw). Its `CoverageGuided.session` tally
+  PERSISTS across seeds (the piece that made the difference — a per-seed tally degenerates to
+  uniform), so a session converges on all 13 reachable cells in ~13 exploit draws instead of
+  waiting for uniform sampling to stumble onto the ~1-in-24 rare cells. Fully seeded/deterministic;
+  a test asserts it leaves strictly fewer (class × bucket) cells uncovered than `uniformScheduler`
+  over an identical draw budget.
+- **Failing-seed search + delta-debugging shrinker** (`shrink.zig` + `vopr.zig`, 2026-07-15):
+  `findFailingSeed` sweeps a seed range through the VOPR and returns the first captured failure;
+  `run` is the CLI-style driver (`--seed`/`--search`/`--shrink`). `shrink` minimizes a failing run
+  to a small reproducer. The blocker — kv's VOPR derives its whole workload+fault schedule live
+  from the seed's `Prng`, so the captured `Event` trace is an observation, not a re-runnable
+  program — is resolved by a **trace-replay mode** in `vopr.zig`: `generateTrace` re-captures a
+  seed as a `RecordedTrace` (concrete op list with actual value bytes, crash mode/timing/reorder
+  seed, garbage bytes, sabotage), and `replayTrace` executes any subset deterministically without
+  a live `Prng`. `shrink` runs ddmin over that trace (drop ops → drop epochs → neutralize faults),
+  re-replaying after each cut and keeping the reduction only when the SAME invariant violation
+  still reproduces; a test shows it cuts a failing sabotage trace to a strictly smaller reproducer.
 
 ## Backlog / deferred
-
 - **On-disk/MVCC/txn/ordered-scans → DON'T-BUILD-YET** (ecosystem-scanned): multi-week+
   build (B-tree + WAL + MVCC + crash-proof + VOPR sweep) with zero current consumers demanding
   scans/txn. When greenlit: steal-patterns from `xitdb` (HAMT/B-tree + immutable-snapshot-as-MVCC

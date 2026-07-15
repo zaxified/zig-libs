@@ -60,6 +60,13 @@ const CrashMode = kv.CrashMode;
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
 
+const scheduler_mod = @import("scheduler.zig");
+/// Re-exported so `shrink.zig` (and any external consumer) can name the
+/// scheduling seam via `vopr.FaultScheduler` without importing
+/// `scheduler.zig` directly.
+pub const FaultScheduler = scheduler_mod.FaultScheduler;
+pub const Coverage = scheduler_mod.Coverage;
+
 const db_name = "vopr.kv";
 /// Reserved for the post-recovery liveness probe; outside the model space.
 const probe_key = "!vopr-probe";
@@ -71,45 +78,10 @@ const max_val_len = 6000;
 const seed_count = 2000;
 
 // ── seeded PRNG (splitmix64) ─────────────────────────────────────────────────
+//
+// Shared with `scheduler.zig` and `shrink.zig` — see `prng.zig`.
 
-const Prng = struct {
-    state: u64,
-
-    fn init(seed: u64) Prng {
-        var p = Prng{ .state = seed };
-        _ = p.next(); // decorrelate low-entropy seeds (0, 1, 2, …)
-        return p;
-    }
-
-    fn next(p: *Prng) u64 {
-        p.state +%= 0x9e3779b97f4a7c15;
-        var z = p.state;
-        z = (z ^ (z >> 30)) *% 0xbf58476d1ce4e5b9;
-        z = (z ^ (z >> 27)) *% 0x94d049bb133111eb;
-        return z ^ (z >> 31);
-    }
-
-    /// Uniform-ish integer in [0, n). Modulo bias is irrelevant here.
-    fn below(p: *Prng, n: usize) usize {
-        std.debug.assert(n > 0);
-        return @intCast(p.next() % @as(u64, n));
-    }
-
-    /// True with probability num/den.
-    fn chance(p: *Prng, num: usize, den: usize) bool {
-        return p.below(den) < num;
-    }
-
-    fn fill(p: *Prng, buf: []u8) void {
-        var i: usize = 0;
-        while (i < buf.len) : (i += 8) {
-            var tmp: [8]u8 = undefined;
-            std.mem.writeInt(u64, &tmp, p.next(), .little);
-            const n = @min(@as(usize, 8), buf.len - i);
-            @memcpy(buf[i..][0..n], tmp[0..n]);
-        }
-    }
-};
+const Prng = @import("prng.zig").Prng;
 
 // ── FaultStorage: seed-driven error/short-read injection over SimStorage ────
 //
@@ -238,16 +210,26 @@ const FaultStorage = struct {
 
 // ── the runner ───────────────────────────────────────────────────────────────
 
-const Config = struct {
+pub const Config = struct {
     /// Self-test mode: at recovery time, "lose" the committed media content
     /// (a deliberately broken recovery). The model checker MUST catch it.
     sabotage: bool = false,
     /// Suppress the failure report (for the self-test's expected failures).
     quiet: bool = false,
+    /// Decides WHEN each epoch faults and WHICH fault fires — the mechanical
+    /// fault *types* (crash modes, transient I/O errors) live in `sim.zig`
+    /// and `FaultStorage` above; this seam only owns the timing/selection
+    /// policy. Defaults to the module's original uniform-random policy
+    /// (byte-identical to the pre-`scheduler.zig` inline logic — see
+    /// `scheduler.uniformScheduler`'s doc comment). Swap in
+    /// `scheduler.coverageGuidedScheduler(&state)` (bandit-style, cross-seed
+    /// coverage feedback — see scheduler.zig) to bias fault selection toward
+    /// under-exercised (class × timing) cells.
+    scheduler: FaultScheduler = scheduler_mod.uniformScheduler(),
 };
 
 /// Aggregated across seeds by the caller; also the determinism witness.
-const Stats = struct {
+pub const Stats = struct {
     epochs: usize = 0,
     acked_ops: usize = 0,
     crashes: usize = 0,
@@ -274,13 +256,13 @@ const Inflight = union(enum) {
     del: usize,
 };
 
-const Event = struct {
+pub const Event = struct {
     epoch: u16,
     code: Code,
     key: i32,
     len: u32,
 
-    const Code = enum {
+    pub const Code = enum {
         open_ok,
         open_fault,
         put_ok,
@@ -369,23 +351,7 @@ const Vopr = struct {
     /// get means a torn/rotten record was surfaced into the keydir — that is
     /// a mismatch by definition (invariant 3).
     fn matches(v: *Vopr, db: *Db, model: *const [key_count]?[]const u8) !bool {
-        var live: usize = 0;
-        var idx: usize = 0;
-        while (idx < key_count) : (idx += 1) {
-            var kb: [3]u8 = undefined;
-            const key = keyName(&kb, idx);
-            const got = db.get(v.gpa, key) catch |e| switch (e) {
-                error.Corrupt => return false,
-                else => |other| return other,
-            };
-            defer if (got) |g| v.gpa.free(g);
-            if (model[idx]) |want| {
-                live += 1;
-                if (got == null or !std.mem.eql(u8, got.?, want)) return false;
-            } else if (got != null) return false;
-            if (db.exists(key) != (model[idx] != null)) return false;
-        }
-        return db.count() == live;
+        return modelMatches(v.gpa, db, model);
     }
 
     /// One epoch: open the store and run random ops until the scheduled
@@ -543,16 +509,331 @@ const Vopr = struct {
     }
 };
 
+/// Does the store's state equal `model` exactly? Shared by the live `Vopr`
+/// (`Vopr.matches`) and the trace `Replayer` so both check invariants 1–4
+/// identically. `error.Corrupt` from a get = a torn record surfaced into the
+/// keydir = a mismatch by definition (invariant 3).
+fn modelMatches(gpa: Allocator, db: *Db, model: *const [key_count]?[]const u8) !bool {
+    var live: usize = 0;
+    var idx: usize = 0;
+    while (idx < key_count) : (idx += 1) {
+        var kb: [3]u8 = undefined;
+        const key = keyName(&kb, idx);
+        const got = db.get(gpa, key) catch |e| switch (e) {
+            error.Corrupt => return false,
+            else => |other| return other,
+        };
+        defer if (got) |g| gpa.free(g);
+        if (model[idx]) |want| {
+            live += 1;
+            if (got == null or !std.mem.eql(u8, got.?, want)) return false;
+        } else if (got != null) return false;
+        if (db.exists(key) != (model[idx] != null)) return false;
+    }
+    return db.count() == live;
+}
+
+// ── recorded trace: a replayable capture of one seed's program ──────────────
+//
+// The live VOPR (`runSeedTraced`) derives its whole workload+fault schedule
+// live from `Prng`, so its `Event` trace is an OBSERVATION, not a re-runnable
+// program (deleting one event shifts every later PRNG draw — see shrink.zig).
+// A `RecordedTrace` fixes that: it captures every structural decision as
+// CONCRETE data (op list with actual value bytes, crash mode/timing/reorder
+// seed, garbage-tail bytes, sabotage), so `replayTrace` can execute it — and a
+// shrunk subset of it — without regenerating anything from a seed. This is the
+// "trace-driven replay mode" the delta-debugging shrinker (`shrink.zig`) needs.
+
+pub const RecordedOp = union(enum) {
+    put: struct { key: usize, val: []const u8 },
+    del: struct { key: usize },
+    get: struct { key: usize },
+    compact,
+    census,
+};
+
+pub const RecordedFault = union(enum) {
+    clean,
+    crash: struct { mode: CrashMode, reorder_seed: u64, ops_until_crash: usize },
+    io_error: struct { kind: Storage.Error, ops_until_crash: usize },
+};
+
+pub const RecordedEpoch = struct {
+    fault: RecordedFault,
+    short_reads: bool,
+    ops: []const RecordedOp,
+    /// Garbage bytes appended to the media tail at recovery (empty = none).
+    garbage: []const u8 = &.{},
+    sabotage: bool = false,
+};
+
+/// A captured, independently-replayable program. Owns everything (ops, value
+/// bytes, garbage) in `arena`.
+pub const RecordedTrace = struct {
+    arena: std.heap.ArenaAllocator,
+    seed: u64,
+    cfg: Config,
+    epochs: []RecordedEpoch,
+
+    pub fn deinit(self: *RecordedTrace) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+/// Total concrete ops across all epochs — the shrinker's size metric.
+pub fn opCount(epochs: []const RecordedEpoch) usize {
+    var n: usize = 0;
+    for (epochs) |e| n += e.ops.len;
+    return n;
+}
+
+/// Capture `seed`'s run as a concrete `RecordedTrace`. Draws the SAME kinds of
+/// workload + fault decisions the live `runEpoch`/`recoverAndVerify` draw (so a
+/// sabotage run reliably reaches ≥2 live keys and trips the checker), but
+/// stores them — with actual value/garbage bytes — instead of executing, so the
+/// result replays byte-faithfully via `replayTrace`.
+pub fn generateTrace(gpa: Allocator, seed: u64, cfg: Config) !RecordedTrace {
+    var arena_owner = std.heap.ArenaAllocator.init(gpa);
+    errdefer arena_owner.deinit();
+    const a = arena_owner.allocator();
+
+    var prng = Prng.init(seed);
+    var coverage: Coverage = .{};
+
+    const epochs_n = 2 + prng.below(4);
+    const epochs = try a.alloc(RecordedEpoch, epochs_n);
+    for (epochs) |*ep| {
+        const short_reads = prng.chance(1, 2);
+        const fault: RecordedFault = switch (cfg.scheduler.plan(&prng, &coverage)) {
+            .clean => .clean,
+            .crash => |c| .{ .crash = .{ .mode = c.mode, .reorder_seed = c.reorder_seed, .ops_until_crash = c.ops_until_crash } },
+            .io_error => |e| .{ .io_error = .{ .kind = e.kind, .ops_until_crash = e.ops_until_crash } },
+        };
+
+        const op_total = 4 + prng.below(40);
+        const ops = try a.alloc(RecordedOp, op_total);
+        for (ops) |*op| {
+            const roll = prng.below(100);
+            if (roll < 55) {
+                const k = prng.below(key_count);
+                const vlen = if (prng.chance(1, 12)) prng.below(max_val_len + 1) else prng.below(80);
+                const val = try a.alloc(u8, vlen);
+                prng.fill(val);
+                op.* = .{ .put = .{ .key = k, .val = val } };
+            } else if (roll < 75) {
+                op.* = .{ .del = .{ .key = prng.below(key_count) } };
+            } else if (roll < 92) {
+                op.* = .{ .get = .{ .key = prng.below(key_count) } };
+            } else if (roll < 97) {
+                op.* = .compact;
+            } else {
+                op.* = .census;
+            }
+        }
+
+        // Recovery perturbation: a garbage tail (mirrors recoverAndVerify's
+        // 1-in-4 draw). Recorded bytes make replay byte-faithful; replay
+        // applies them only when the media is >= 8 bytes, as the live path does.
+        var garbage: []const u8 = &.{};
+        if (prng.chance(1, 4)) {
+            const n = 1 + prng.below(24);
+            const g = try a.alloc(u8, n);
+            prng.fill(g);
+            garbage = g;
+        }
+
+        ep.* = .{ .fault = fault, .short_reads = short_reads, .ops = ops, .garbage = garbage, .sabotage = cfg.sabotage };
+    }
+
+    return .{ .arena = arena_owner, .seed = seed, .cfg = cfg, .epochs = epochs };
+}
+
+/// Trace-driven replay: execute a captured op/fault program against a fresh
+/// `SimStorage` and re-check the SAME invariants the live VOPR checks — WITHOUT
+/// drawing the workload/faults from a live `Prng`, so a shrunk candidate trace
+/// is directly re-runnable. Returns `error.InvariantViolation` iff recovery
+/// mis-behaves — the delta-debugging shrinker's oracle.
+///
+/// Every structural decision is fixed by the trace (op list + concrete value
+/// bytes, crash mode/timing/reorder seed, garbage bytes, sabotage). The only
+/// randomness left is `FaultStorage`'s internal draws (short-read split points
+/// and the torn-prefix length of an injected write error), which never change
+/// written media; they are re-derived from a dedicated `Prng(seed)` so replay
+/// stays deterministic.
+pub fn replayTrace(gpa: Allocator, seed: u64, epochs: []const RecordedEpoch) !void {
+    var prng = Prng.init(seed);
+    var sim = SimStorage.init(gpa);
+    defer sim.deinit();
+    var faults = FaultStorage{ .inner = sim.storage(), .prng = &prng };
+
+    var r = Replayer{ .gpa = gpa, .sim = &sim, .faults = &faults, .st = faults.storage() };
+    for (epochs, 0..) |ep, i| {
+        r.epoch = i;
+        faults.fired = false;
+        faults.short_reads = ep.short_reads;
+        switch (ep.fault) {
+            .clean => {},
+            .crash => |c| {
+                sim.crash_mode = c.mode;
+                sim.reorder_seed = c.reorder_seed;
+                sim.ops_until_crash = c.ops_until_crash;
+            },
+            .io_error => |e| {
+                faults.error_countdown = e.ops_until_crash;
+                faults.error_kind = e.kind;
+            },
+        }
+        const inflight = try r.runEpochOps(ep.ops);
+        try r.recoverAndVerify(ep.garbage, ep.sabotage, inflight);
+    }
+}
+
+/// The trace-consuming twin of `Vopr`: same store, same fault machinery, same
+/// invariant checks (`modelMatches`), but its ops + faults come from a
+/// `RecordedEpoch` list rather than from `Prng`. Any invariant breach is a
+/// bare `error.InvariantViolation` (no per-event report — replay is a silent
+/// oracle called in a tight ddmin loop).
+const Replayer = struct {
+    gpa: Allocator,
+    epoch: usize = 0,
+    sim: *SimStorage,
+    faults: *FaultStorage,
+    st: Storage,
+    model: [key_count]?[]const u8 = @splat(null),
+
+    fn liveCount(r: *const Replayer) usize {
+        var n: usize = 0;
+        for (r.model) |m| {
+            if (m != null) n += 1;
+        }
+        return n;
+    }
+
+    fn expectFault(r: *Replayer, e: anyerror) !void {
+        if (e == error.Crashed) return;
+        if (r.faults.fired and e == r.faults.error_kind) return;
+        return error.InvariantViolation;
+    }
+
+    fn runEpochOps(r: *Replayer, ops: []const RecordedOp) !Inflight {
+        var db = Db.open(r.gpa, r.st, db_name, .{}) catch |e| {
+            if (e == error.Crashed or r.faults.fired) return .none;
+            return error.InvariantViolation;
+        };
+        defer db.close();
+
+        for (ops) |op| {
+            switch (op) {
+                .put => |p| {
+                    var kb: [3]u8 = undefined;
+                    db.put(keyName(&kb, p.key), p.val) catch |e| {
+                        try r.expectFault(e);
+                        return .{ .put = .{ .key = p.key, .val = p.val } };
+                    };
+                    r.model[p.key] = p.val;
+                },
+                .del => |d| {
+                    var kb: [3]u8 = undefined;
+                    db.delete(keyName(&kb, d.key)) catch |e| {
+                        try r.expectFault(e);
+                        return .{ .del = d.key };
+                    };
+                    r.model[d.key] = null;
+                },
+                .get => |g| {
+                    var kb: [3]u8 = undefined;
+                    const got = db.get(r.gpa, keyName(&kb, g.key)) catch return error.InvariantViolation;
+                    defer if (got) |x| r.gpa.free(x);
+                    const ok = if (r.model[g.key]) |want|
+                        got != null and std.mem.eql(u8, got.?, want)
+                    else
+                        got == null;
+                    if (!ok) return error.InvariantViolation;
+                },
+                .compact => {
+                    db.compact() catch |e| {
+                        try r.expectFault(e);
+                        return .none;
+                    };
+                },
+                .census => {
+                    if (db.count() != r.liveCount()) return error.InvariantViolation;
+                },
+            }
+        }
+        return .none;
+    }
+
+    fn recoverAndVerify(r: *Replayer, garbage: []const u8, sabotage: bool, inflight: Inflight) !void {
+        r.faults.error_countdown = null;
+        r.sim.reboot();
+
+        if (garbage.len > 0) {
+            if (r.sim.fileContent(db_name)) |c| {
+                if (c.len >= 8) try r.sim.appendDurable(db_name, garbage);
+            }
+        }
+
+        if (sabotage and r.liveCount() >= 2) {
+            if (r.sim.fileContent(db_name)) |c| {
+                if (c.len >= 8) {
+                    var hdr: [8]u8 = undefined;
+                    @memcpy(&hdr, c[0..8]);
+                    try r.sim.installFile(db_name, &hdr);
+                }
+            }
+        }
+
+        var db = Db.open(r.gpa, r.st, db_name, .{}) catch return error.InvariantViolation;
+        defer db.close();
+
+        if (try modelMatches(r.gpa, &db, &r.model)) {
+            // recovered state == acknowledged model (candidate A)
+        } else {
+            var alt = r.model;
+            var has_alt = true;
+            switch (inflight) {
+                .none => has_alt = false,
+                .put => |p| alt[p.key] = p.val,
+                .del => |k| alt[k] = null,
+            }
+            if (has_alt and try modelMatches(r.gpa, &db, &alt)) {
+                r.model = alt;
+            } else {
+                return error.InvariantViolation;
+            }
+        }
+
+        db.put(probe_key, "alive") catch return error.InvariantViolation;
+        const got = db.get(r.gpa, probe_key) catch return error.InvariantViolation;
+        defer if (got) |g| r.gpa.free(g);
+        if (got == null or !std.mem.eql(u8, got.?, "alive")) return error.InvariantViolation;
+        db.delete(probe_key) catch return error.InvariantViolation;
+    }
+};
+
 /// Run one full simulation for `seed`: several epochs of
 /// open → random ops → scheduled fault → crash → recover → verify.
 /// `stats` is updated incrementally (usable even when an error returns).
-fn runSeed(gpa: Allocator, seed: u64, cfg: Config, stats: *Stats) !void {
+/// Thin wrapper over `runSeedTraced` for callers that don't need the trace.
+pub fn runSeed(gpa: Allocator, seed: u64, cfg: Config, stats: *Stats) !void {
+    return runSeedTraced(gpa, seed, cfg, stats, null);
+}
+
+/// Same as `runSeed`, but when `trace_out` is non-null the full op/fault
+/// trace is cloned into it before returning — on success AND on failure
+/// (captured via `defer`, so an early `try`-propagated `InvariantViolation`
+/// still fills it in). This is what lets `shrink.zig`'s failing-seed search
+/// hand back a real reproducer log instead of just an error code.
+pub fn runSeedTraced(gpa: Allocator, seed: u64, cfg: Config, stats: *Stats, trace_out: ?*std.ArrayList(Event)) !void {
     var prng = Prng.init(seed);
     var sim = SimStorage.init(gpa);
     defer sim.deinit();
     var faults = FaultStorage{ .inner = sim.storage(), .prng = &prng };
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+    var coverage: Coverage = .{};
 
     var v = Vopr{
         .gpa = gpa,
@@ -565,7 +846,15 @@ fn runSeed(gpa: Allocator, seed: u64, cfg: Config, stats: *Stats) !void {
         .st = faults.storage(),
         .stats = stats,
     };
-    defer v.trace.deinit(gpa);
+    defer {
+        if (trace_out) |out| {
+            out.clearRetainingCapacity();
+            // Best-effort: an OOM here must not shadow the real result
+            // (a caught InvariantViolation, or success) with a spurious one.
+            out.appendSlice(gpa, v.trace.items) catch {};
+        }
+        v.trace.deinit(gpa);
+    }
     defer {
         stats.io_errors += faults.injected_errors;
         stats.short_reads += faults.injected_short_reads;
@@ -575,22 +864,23 @@ fn runSeed(gpa: Allocator, seed: u64, cfg: Config, stats: *Stats) !void {
     while (v.epoch < epochs) : (v.epoch += 1) {
         stats.epochs += 1;
 
-        // Plan this epoch's single scheduled fault — all from the seed.
+        // Plan this epoch's single scheduled fault — all from the seed, via
+        // the pluggable scheduling policy (`cfg.scheduler`, default
+        // `scheduler.uniformScheduler()`; see scheduler.zig).
         faults.fired = false;
         faults.short_reads = prng.chance(1, 2);
-        const plan = prng.below(10);
-        if (plan < 6) { // crash the machine at a random side effect
-            const modes = [_]CrashMode{ .lose_unsynced, .keep_unsynced, .torn_tail, .reorder_unsynced };
-            sim.crash_mode = modes[prng.below(modes.len)];
-            // Seed the non-contiguous keep/drop choice (consumed only by
-            // `.reorder_unsynced`; drawn unconditionally to keep the stream
-            // aligned across modes).
-            sim.reorder_seed = prng.next();
-            sim.ops_until_crash = if (prng.chance(1, 3)) prng.below(8) else prng.below(120);
-        } else if (plan < 8) { // transient I/O error (with torn prefix write)
-            faults.error_countdown = if (prng.chance(1, 3)) prng.below(8) else prng.below(100);
-            faults.error_kind = if (prng.chance(1, 2)) error.NoSpaceLeft else error.InputOutput;
-        } // else: clean epoch (fault-free close + reopen must be exact)
+        switch (cfg.scheduler.plan(&prng, &coverage)) {
+            .clean => {}, // fault-free epoch: close + reopen must be exact
+            .crash => |c| {
+                sim.crash_mode = c.mode;
+                sim.reorder_seed = c.reorder_seed;
+                sim.ops_until_crash = c.ops_until_crash;
+            },
+            .io_error => |e| {
+                faults.error_countdown = e.ops_until_crash;
+                faults.error_kind = e.kind;
+            },
+        }
 
         const inflight = try v.runEpoch();
         try v.recoverAndVerify(inflight);
@@ -652,4 +942,50 @@ test "VOPR self-test: a recovery that loses committed data is caught" {
     }
     // The checker must have caught essentially all sabotaged runs.
     try testing.expect(caught >= 10);
+}
+
+test "record→replay: a generated trace replays deterministically and passes (no sabotage)" {
+    var tr = try generateTrace(testing.allocator, 0xFEED_1234, .{});
+    defer tr.deinit();
+    try testing.expect(opCount(tr.epochs) > 0);
+    // A correct store: replay of a faithfully-captured run raises no invariant
+    // violation, and does so identically every time (determinism witness).
+    try replayTrace(testing.allocator, tr.seed, tr.epochs);
+    try replayTrace(testing.allocator, tr.seed, tr.epochs);
+}
+
+test "record→replay: a sabotage trace with >=2 live keys is caught on replay" {
+    // Sabotage wipes committed media at recovery whenever >=2 keys are live —
+    // most seeds reach that, so a failing recorded trace is easy to find, and
+    // replaying it reproduces the SAME InvariantViolation with no live PRNG.
+    var seed: u64 = 1;
+    var found = false;
+    while (seed <= 64) : (seed += 1) {
+        var tr = try generateTrace(testing.allocator, seed, .{ .sabotage = true });
+        defer tr.deinit();
+        if (replayTrace(testing.allocator, tr.seed, tr.epochs)) |_| {
+            continue;
+        } else |e| {
+            try testing.expectEqual(error.InvariantViolation, e);
+            found = true;
+            break;
+        }
+    }
+    try testing.expect(found);
+}
+
+test "VOPR coverage-guided scheduler drives a full seed sweep without regressions" {
+    // The coverage-guided policy is a drop-in `Config.scheduler`: thread ONE
+    // CoverageGuided across the seed loop and it must run the same model-checked
+    // recovery clean, while converging its cross-seed tally to full coverage.
+    var cg: scheduler_mod.CoverageGuided = .{};
+    var stats: Stats = .{};
+    var seed: u64 = 1;
+    while (seed <= 200) : (seed += 1) {
+        try runSeed(testing.allocator, seed, .{ .scheduler = cg.scheduler() }, &stats);
+    }
+    // Only the uncoverable (.clean, .late) cell may remain after 200 seeds.
+    try testing.expectEqual(@as(usize, 1), cg.session.uncoveredCount());
+    try testing.expect(stats.crashes > 0);
+    try testing.expect(stats.io_errors > 0);
 }

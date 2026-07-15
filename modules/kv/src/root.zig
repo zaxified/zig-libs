@@ -748,9 +748,12 @@ pub const Db = struct {
 const testing = std.testing;
 
 test {
+    _ = @import("prng.zig");
     _ = @import("sim.zig");
     _ = @import("fault_test.zig");
+    _ = @import("scheduler.zig");
     _ = @import("vopr.zig");
+    _ = @import("shrink.zig");
 }
 
 fn expectGet(db: *Db, key: []const u8, want: ?[]const u8) !void {

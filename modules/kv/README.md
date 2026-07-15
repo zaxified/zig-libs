@@ -112,6 +112,28 @@ durable writes. In-process, no randomness, no real process kill.
 `SimStorage` is exported (`kv.SimStorage`) so consumers can crash-test their
 own recovery logic.
 
+## VOPR extras: pluggable fault scheduling + failing-seed search
+
+Beyond the fixed sweep, `vopr.zig` runs thousands of *randomized* fault
+schedules per `zig build test-kv` (see its module doc). Two auditor-facing
+extras sit on top of it:
+
+- **`FaultScheduler`** (`scheduler.zig`) — the epoch-planning decision (which
+  fault, how soon) is a pluggable seam (`vopr.Config.scheduler`), not inline
+  logic. `uniformScheduler()` (the default) reproduces the harness's original
+  flat-random distribution exactly; `coverageGuidedScheduler(&state)` biases
+  the (fault-class × timing) draw toward the least-exercised cells (bandit-style
+  epsilon-greedy over a cross-seed `Coverage` tally), covering all reachable
+  cells measurably faster than uniform sampling on the same budget.
+- **`shrink.zig`** — `findFailingSeed(gpa, start, end, cfg)` sweeps a seed
+  range and returns the first captured failure (seed + full op/fault trace);
+  `run(gpa, args, writer)` is a CLI-style driver (`--seed N`,
+  `--search START END`, `--shrink`, `--sabotage`, `--quiet`) for ad-hoc
+  exploration. `shrink(gpa, failing)` delta-debugs (ddmin) a failing run to a
+  strictly smaller reproducer, using `vopr.zig`'s trace-replay mode
+  (`generateTrace` captures a seed as a concrete, replayable `RecordedTrace`;
+  `replayTrace` re-runs any subset deterministically without a live `Prng`).
+
 ## Noted phases (deliberately not in v0)
 
 Full randomized VOPR at scale; immutable/MVCC on-disk structure
@@ -120,5 +142,6 @@ batches; secondary indexes; automatic compaction thresholds; in-memory value
 cache (compose with `ramcache`); cross-process lock file. The v0 keydir is
 an unordered hash map.
 
-Tests: `zig build test-kv` (29 tests — unit + sim-semantics + the sweep;
+Tests: `zig build test-kv` (59 tests — unit + sim-semantics + the fixed
+sweep + the randomized VOPR + the scheduler/shrink extras above;
 deterministic, tmp-dir round-trips on the real filesystem included).
