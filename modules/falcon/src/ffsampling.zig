@@ -1,90 +1,51 @@
 // SPDX-License-Identifier: MIT
-//! ffsampling — the Falcon/FN-DSA trapdoor sampler: builds the LDL*
-//! decomposition tree of the secret NTRU basis over the FFT embedding
-//! (`buildTree`, spec §3.8.3 Algorithm 9 `ffLDL`) and walks it via the
-//! fast-Fourier nearest-plane recursion (`sampleSignature`, spec §3.9.1
-//! Algorithm 11 `ffSampling`) to draw a short vector (s1, s2) close to
-//! the hashed target point `c` — the heart of Falcon signing.
+//! ffsampling — Falcon/FN-DSA fast-Fourier trapdoor sampler. Ported from
+//! the Round-3 reference `sign.c` (`do_sign_dyn` + `ffSampling_fft_dyntree`)
+//! so signatures are BYTE-EXACT against the reference KATs.
 //!
-//! Both functions below are stubs: together with `gaussian.samplerZ`
-//! (which every leaf of `sampleSignature`'s recursion calls), this is
-//! the hardest and most side-channel-sensitive part of the scheme. An
-//! incorrect-but-plausible implementation here has the specific,
-//! dangerous failure mode the spec and `root.zig`'s module doc comment
-//! both call out: it can still produce signatures that PASS
-//! `root.zig`'s verification while statistically leaking the secret
-//! basis over many signatures — "the signatures verify" is necessary but
-//! nowhere near sufficient evidence of correctness for this file.
+//! Design note (why `dyntree`, not the expanded-key tree): the NIST KAT
+//! generator signs via `crypto_sign` → `Zf(sign_dyn)`, which builds the
+//! ffLDL tree *dynamically* per signature (`ffSampling_fft_dyntree`) rather
+//! than from a precomputed `expand_privkey` tree. Both are the same
+//! algorithm and yield identical output, but to eliminate ALL byte-exact
+//! risk we mirror exactly what generated the vectors. Consequently
+//! `Tree(Ring)` just carries the small secret basis (f,g,F,G);
+//! `sampleSignature` does the whole Gram-matrix / LDL / nearest-plane walk
+//! on each call, exactly as `do_sign_dyn` does.
 //!
-//! `splitFft`/`mergeFft` (spec §3.8.3 Algorithms 7/8) live here rather
-//! than in `fft.zig`: unlike that file's `fft`/`ifft` (fixed at one
-//! comptime `Ring` degree), the LDL* recursion below calls them at every
-//! tree level with a SHRINKING degree, so they take a runtime `logn`
-//! parameter over slices instead of a comptime-fixed array size.
+//! `splitFft`/`mergeFft` here are thin wrappers over `fft.polySplitFft`/
+//! `fft.polyMergeFft` (the real work lives in fft.zig on flat buffers).
 
 const std = @import("std");
 const fft = @import("fft.zig");
+const fpr = @import("fpr.zig");
 const gaussian = @import("gaussian.zig");
 
-/// The LDL* tree over the FFT embedding: a complete binary tree of depth
-/// `Ring.logn`, the shape `buildTree`/Algorithm 9 constructs and
-/// `sampleSignature`/Algorithm 11 walks.
-///
-/// STRUCTURAL PLACEHOLDER: this field layout is a reasonable guess at
-/// the eventual shape (flat storage sized like the reference
-/// implementation's packed `[]fpr` tree encoding), not a verified
-/// layout — nothing outside `buildTree`/`sampleSignature` reads or
-/// writes real values through it yet, so whoever implements those two
-/// functions should feel free to redefine this type entirely rather than
-/// contort a real implementation to fit this guess.
+/// The secret NTRU basis, carried from keygen to signing. (Named `Tree`
+/// for API compatibility with the scaffold; it is the basis, not a
+/// precomputed tree — see the module doc comment.)
 pub fn Tree(comptime Ring: type) type {
-    const Complex = fft.Fft(Ring).Complex;
     return struct {
-        /// Flat storage for the tree's FFT-domain node data. The
-        /// reference implementation packs a depth-logn binary tree of
-        /// degree-shrinking FFT rows into (2*logn+1) * (n/2) scalar
-        /// slots; mirrored here as Complex slots (this module keeps
-        /// FFT-domain data as {re,im} pairs rather than the reference's
-        /// interleaved real array).
-        nodes: [(2 * Ring.logn + 1) * (Ring.n / 2)]Complex = undefined,
+        f: [Ring.n]i8 = undefined,
+        g: [Ring.n]i8 = undefined,
+        big_f: [Ring.n]i8 = undefined,
+        big_g: [Ring.n]i8 = undefined,
     };
 }
 
-/// Split one degree-`n` FFT-domain polynomial (`n = 1 << logn`) into two
-/// degree-`n/2` FFT-domain polynomials (spec §3.8.3 Algorithm 7
-/// `splitfft`) — one step of the LDL* tree recursion, and also needed
-/// on the way back up in `sampleSignature`'s reconstruction.
-/// `a.len == n/2`, `f0.len == f1.len == n/4`.
-pub fn splitFft(comptime Complex: type, logn: u5, a: []const Complex, f0: []Complex, f1: []Complex) void {
-    _ = logn;
-    _ = a;
-    _ = f0;
-    _ = f1;
-    @panic("TODO(fable/core): Falcon splitfft (spec §3.8.3 Algorithm 7) — one " ++
-        "recursion step of the LDL* tree build/walk. Needs fft.zig's fft/ifft " ++
-        "implemented first (this operates on their FFT-domain output).");
+/// splitfft (spec §3.8.3 Alg.7) over a flat FFT-domain buffer.
+pub fn splitFft(logn: u5, a: []const f64, f0: []f64, f1: []f64) void {
+    fft.polySplitFft(f0, f1, a, logn);
 }
 
-/// Merge two degree-`n/2` FFT-domain polynomials back into one degree-`n`
-/// FFT-domain polynomial (spec §3.8.3 Algorithm 8 `mergefft`) — the
-/// inverse of `splitFft`, needed by `sampleSignature`'s bottom-up
-/// reconstruction of the sampled short vector.
-pub fn mergeFft(comptime Complex: type, logn: u5, f0: []const Complex, f1: []const Complex, out: []Complex) void {
-    _ = logn;
-    _ = f0;
-    _ = f1;
-    _ = out;
-    @panic("TODO(fable/core): Falcon mergefft (spec §3.8.3 Algorithm 8) — " ++
-        "inverse of splitFft above.");
+/// mergefft (spec §3.8.3 Alg.8), inverse of `splitFft`.
+pub fn mergeFft(logn: u5, f0: []const f64, f1: []const f64, out: []f64) void {
+    fft.polyMergeFft(out, f0, f1, logn);
 }
 
-/// Build the LDL* tree (spec §3.8.3 Algorithm 9 `ffLDL`) from the secret
-/// NTRU basis B = [[g,-f],[G,-F]]: FFT-transform the four polynomials
-/// (`fft.Fft(Ring).fft`), form the Gram matrix Gr = B * B^T, and
-/// recursively LDL*-decompose it via `splitFft`/`mergeFft` above,
-/// bottoming out at degree 1. The result is what `sampleSignature` walks
-/// for every signature this key ever produces — `keygen.zig` builds it
-/// once per key, not once per signature.
+/// Build the signing "tree" — here, just capture the secret basis. The
+/// heavy ffLDL work happens per-signature in `sampleSignature`
+/// (`do_sign_dyn` semantics), so this is O(n) copying.
 pub fn buildTree(
     comptime Ring: type,
     f: *const [Ring.n]i8,
@@ -92,56 +53,202 @@ pub fn buildTree(
     big_f: *const [Ring.n]i8,
     big_g: *const [Ring.n]i8,
 ) Tree(Ring) {
-    _ = f;
-    _ = g;
-    _ = big_f;
-    _ = big_g;
-    @panic("TODO(fable/core): ffLDL — Falcon spec §3.8.3 Algorithm 9. Build the " ++
-        "LDL* decomposition of the Gram matrix of the secret basis " ++
-        "[[g,-f],[G,-F]] over the FFT embedding (fft.zig's fft/ifft to enter the " ++
-        "FFT domain, then splitFft/mergeFft above at each recursion level down " ++
-        "to degree 1), producing the Tree that sampleSignature below walks. " ++
-        "Depends on fft.zig being implemented first.");
+    return .{ .f = f.*, .g = g.*, .big_f = big_f.*, .big_g = big_g.* };
 }
 
-/// One drawn signature candidate: the short vector (s1, s2), BEFORE the
-/// caller's norm-bound check — `sign.zig`'s `signWithRng` does that and
-/// resamples (fresh nonce, fresh tree walk) on rejection, mirroring the
-/// spec's own outer retry loop.
+/// One drawn signature candidate (s1, s2) before the norm-bound check.
 pub fn SignatureCandidate(comptime Ring: type) type {
     return struct { s1: [Ring.n]i16, s2: [Ring.n]i16 };
 }
 
-/// The fast-Fourier nearest-plane recursion (spec §3.9.1 Algorithm 11
-/// `ffSampling`), specialized to Falcon signing: computes the FFT-domain
-/// target (t0, t1) from the hashed point `c` (`codec.hashToPoint`'s
-/// output — REUSED, not reimplemented here) and the public basis
-/// relation, samples down `tree` (every leaf draw is one call to
-/// `gaussian.samplerZ` — THE side-channel-critical primitive, see
-/// gaussian.zig), and reconstructs the short vector (s1, s2) bottom-up
-/// via `fft.zig`'s `ifft` / this file's `mergeFft`.
+fn smallToFpr(dst: []f64, src: []const i8) void {
+    for (dst, src) |*d, s| d.* = fpr.of(s);
+}
+
+/// The fast-Fourier nearest-plane recursion over a dynamically-decomposed
+/// Gram matrix (reference `ffSampling_fft_dyntree`). Modifies g00/g01/g11
+/// in place; writes the sampled lattice offset over (t0, t1). `tmp` is
+/// scratch (>= see S(logn) bound in ffsampling; 4*n suffices for logn<=10).
+fn ffSamplingDyntree(
+    comptime orig_logn: u5,
+    prng: *gaussian.Prng,
+    t0: []f64,
+    t1: []f64,
+    g00: []f64,
+    g01: []f64,
+    g11: []f64,
+    logn: u5,
+    tmp: []f64,
+) void {
+    if (logn == 0) {
+        var leaf = g00[0];
+        leaf = fpr.mul(fpr.sqrt(leaf), fpr.inv_sigma[orig_logn]);
+        t0[0] = fpr.of(gaussian.samplerZ(prng, t0[0], leaf, fpr.sigma_min[orig_logn]));
+        t1[0] = fpr.of(gaussian.samplerZ(prng, t1[0], leaf, fpr.sigma_min[orig_logn]));
+        return;
+    }
+    const n: usize = @as(usize, 1) << logn;
+    const hn = n >> 1;
+
+    // Decompose G = LDL; d00 stays in g00, d11 -> g11, l10 -> g01.
+    fft.polyLdlFft(g00, g01, g11, logn);
+
+    // Split d00 and d11 in place; stash l10 (g01) into tmp[0..n].
+    fft.polySplitFft(tmp[0..hn], tmp[hn..n], g00[0..n], logn);
+    @memcpy(g00[0..n], tmp[0..n]);
+    fft.polySplitFft(tmp[0..hn], tmp[hn..n], g11[0..n], logn);
+    @memcpy(g11[0..n], tmp[0..n]);
+    @memcpy(tmp[0..n], g01[0..n]); // l10
+    @memcpy(g01[0..hn], g00[0..hn]);
+    @memcpy(g01[hn..n], g11[0..hn]);
+
+    // Right sub-tree on split(t1); output merged into tmp[2n..3n].
+    fft.polySplitFft(tmp[n .. n + hn], tmp[n + hn .. 2 * n], t1[0..n], logn);
+    ffSamplingDyntree(orig_logn, prng, tmp[n .. n + hn], tmp[n + hn .. 2 * n], g11[0..hn], g11[hn..n], g01[hn..n], logn - 1, tmp[2 * n ..]);
+    fft.polyMergeFft(tmp[2 * n .. 3 * n], tmp[n .. n + hn], tmp[n + hn .. 2 * n], logn);
+
+    // tb0 = t0 + (t1 - z1) * l10 ; z1(final) written over t1.
+    @memcpy(tmp[n .. 2 * n], t1[0..n]);
+    fft.polySub(tmp[n .. 2 * n], tmp[2 * n .. 3 * n], logn);
+    @memcpy(t1[0..n], tmp[2 * n .. 3 * n]);
+    fft.polyMulFft(tmp[0..n], tmp[n .. 2 * n], logn);
+    fft.polyAdd(t0[0..n], tmp[0..n], logn);
+
+    // Left sub-tree on split(tb0); output merged over t0.
+    fft.polySplitFft(tmp[0..hn], tmp[hn..n], t0[0..n], logn);
+    ffSamplingDyntree(orig_logn, prng, tmp[0..hn], tmp[hn..n], g00[0..hn], g00[hn..n], g01[0..hn], logn - 1, tmp[n..]);
+    fft.polyMergeFft(t0[0..n], tmp[0..hn], tmp[hn..n], logn);
+}
+
+/// ffSampling (spec §3.9.1 Alg.11), specialized to Falcon signing: draw one
+/// candidate short vector (s1, s2) for hashed target `c`, using `rng` for
+/// all internal randomness. `rng` supplies the 48-byte per-signature seed
+/// (reference `crypto_sign`: `randombytes(seed,48)` after the nonce), from
+/// which the ChaCha20 signer PRNG is initialised via SHAKE256.
+///
+/// This performs ONE `do_sign_dyn` pass and always returns; the norm-bound
+/// accept/reject retry lives in `sign.signWithRng`. (The reference instead
+/// re-inits its PRNG from the same SHAKE context on reject; for Falcon-512/
+/// 1024 rejection is a ~2^-32 event and never occurs for the embedded KAT
+/// vectors, so the two are byte-identical on those. Flag for the owner
+/// gate: a rare reject would make `sign.zig`'s fresh-nonce retry diverge
+/// from the reference — harmless for correctness, but not KAT-faithful in
+/// that measure-zero case.)
 pub fn sampleSignature(
     comptime Ring: type,
     tree: *const Tree(Ring),
     c: *const Ring.Poly,
     rng: std.Random,
 ) SignatureCandidate(Ring) {
-    _ = tree;
-    _ = c;
-    _ = rng;
-    @panic("TODO(fable/core): ffSampling — Falcon spec §3.9.1 Algorithm 11. Walk " ++
-        "`tree` top-down computing FFT-domain targets, sampling each leaf via " ++
-        "gaussian.samplerZ, then reconstruct the short vector (s1, s2) " ++
-        "bottom-up via fft.zig's ifft + this file's mergeFft. Depends on " ++
-        "fft.zig, this file's buildTree, and gaussian.zig all being implemented " ++
-        "first. `sign.zig`'s signWithRng is the only caller and already handles " ++
-        "the accept/reject norm-bound retry loop around this.");
+    const n = Ring.n;
+    const logn = Ring.logn;
+
+    // Per-signature ChaCha PRNG: SHAKE256(seed48) -> 56-byte prng seed.
+    var seed48: [48]u8 = undefined;
+    rng.bytes(&seed48);
+    var sh = std.crypto.hash.sha3.Shake256.init(.{});
+    sh.update(&seed48);
+    var pseed: [56]u8 = undefined;
+    sh.squeeze(&pseed);
+    var prng = gaussian.Prng.init(&pseed);
+
+    var b00: [n]f64 = undefined;
+    var b01: [n]f64 = undefined;
+    var b10: [n]f64 = undefined;
+    var b11: [n]f64 = undefined;
+    var g00: [n]f64 = undefined;
+    var g01: [n]f64 = undefined;
+    var g11: [n]f64 = undefined;
+    var t0: [n]f64 = undefined;
+    var t1: [n]f64 = undefined;
+    var tx: [n]f64 = undefined;
+    var ty: [n]f64 = undefined;
+    var scratch: [4 * n]f64 = undefined;
+
+    // Basis B = [[g, -f], [G, -F]] in FFT domain.
+    smallToFpr(&b01, &tree.f);
+    smallToFpr(&b00, &tree.g);
+    smallToFpr(&b11, &tree.big_f);
+    smallToFpr(&b10, &tree.big_g);
+    fft.fftRaw(&b01, logn);
+    fft.fftRaw(&b00, logn);
+    fft.fftRaw(&b11, logn);
+    fft.fftRaw(&b10, logn);
+    fft.polyNeg(&b01, logn);
+    fft.polyNeg(&b11, logn);
+
+    // Gram matrix G = B*adj(B) (upper triangle g00,g01,g11).
+    @memcpy(&t0, &b01);
+    fft.polyMulselfadjFft(&t0, logn); // t0 = b01*adj(b01)
+    @memcpy(&t1, &b00);
+    fft.polyMulAdjFft(&t1, &b10, logn); // t1 = b00*adj(b10)
+    fft.polyMulselfadjFft(&b00, logn); // b00 = b00*adj(b00)
+    fft.polyAdd(&b00, &t0, logn); // b00 = g00
+    @memcpy(&t0, &b01); // save original b01 (= -FFT(f))
+    fft.polyMulAdjFft(&b01, &b11, logn); // b01 = b01*adj(b11)
+    fft.polyAdd(&b01, &t1, logn); // b01 = g01
+    fft.polyMulselfadjFft(&b10, logn); // b10 = b10*adj(b10)
+    @memcpy(&t1, &b11);
+    fft.polyMulselfadjFft(&t1, logn); // t1 = b11*adj(b11)
+    fft.polyAdd(&b10, &t1, logn); // b10 = g11
+
+    @memcpy(&g00, &b00);
+    @memcpy(&g01, &b01);
+    @memcpy(&g11, &b10);
+    // b01 (variable) is now the saved -FFT(f); b11 is still -FFT(F).
+    @memcpy(&b01, &t0);
+
+    // Target vector [hm, 0] transformed by the basis.
+    for (&t0, c) |*x, hv| x.* = fpr.of(hv);
+    fft.fftRaw(&t0, logn);
+    const ni = fpr.inverse_of_q;
+    @memcpy(&t1, &t0);
+    fft.polyMulFft(&t1, &b01, logn);
+    fft.polyMulconst(&t1, fpr.neg(ni), logn);
+    fft.polyMulFft(&t0, &b11, logn);
+    fft.polyMulconst(&t0, ni, logn);
+
+    // Sample; result over (t0, t1).
+    ffSamplingDyntree(logn, &prng, &t0, &t1, &g00, &g01, &g11, logn, &scratch);
+
+    // Rebuild the basis (destroyed above) and map the tiny vector back.
+    smallToFpr(&b01, &tree.f);
+    smallToFpr(&b00, &tree.g);
+    smallToFpr(&b11, &tree.big_f);
+    smallToFpr(&b10, &tree.big_g);
+    fft.fftRaw(&b01, logn);
+    fft.fftRaw(&b00, logn);
+    fft.fftRaw(&b11, logn);
+    fft.fftRaw(&b10, logn);
+    fft.polyNeg(&b01, logn);
+    fft.polyNeg(&b11, logn);
+
+    @memcpy(&tx, &t0);
+    @memcpy(&ty, &t1);
+    fft.polyMulFft(&tx, &b00, logn);
+    fft.polyMulFft(&ty, &b10, logn);
+    fft.polyAdd(&tx, &ty, logn);
+    @memcpy(&ty, &t0);
+    fft.polyMulFft(&ty, &b01, logn);
+    @memcpy(&t0, &tx);
+    fft.polyMulFft(&t1, &b11, logn);
+    fft.polyAdd(&t1, &ty, logn);
+    fft.ifftRaw(&t0, logn);
+    fft.ifftRaw(&t1, logn);
+
+    var out: SignatureCandidate(Ring) = undefined;
+    for (0..n) |u| {
+        const z: i32 = @as(i32, c[u]) - @as(i32, @intCast(fpr.rint(t0[u])));
+        out.s1[u] = @intCast(z);
+    }
+    for (0..n) |u| {
+        out.s2[u] = @intCast(-fpr.rint(t1[u]));
+    }
+    return out;
 }
 
-test "Tree(Ring) instantiates for both parameter sets without evaluating any stub" {
+test "Tree(Ring) instantiates for both parameter sets" {
     const poly = @import("poly.zig");
-    // Same instantiation-does-not-panic guarantee as fft.zig/ntru.zig's
-    // tests, for the composite type this file adds.
     var t512: Tree(poly.Ring512) = .{};
     var t1024: Tree(poly.Ring1024) = .{};
     _ = &t512;
