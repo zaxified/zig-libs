@@ -4,11 +4,15 @@ BN254 (alt-bn128): see [README.md](README.md) for purpose and API.
 
 ## Purpose
 
-Parts 1-3 of a multi-part arc (`README.md`): the base field `Fp`, the
+Parts 1-4 of a multi-part arc (`README.md`): the base field `Fp`, the
 extension tower `Fp2`/`Fp6`/`Fp12`, the scalar field `Fr` (Parts 1-2),
-and the pairing groups `G1`/`G2` (Part 3, `g1.zig`/`g2.zig`) —
-everything a future pairing/precompile/Groth16 layer needs as its
-foundation. NO pairing in this module yet (Part 4+).
+the pairing groups `G1`/`G2` (Part 3, `g1.zig`/`g2.zig`), and now the
+optimal-ate pairing itself (Part 4, `pairing.zig`) — everything a future
+precompile/Groth16 layer needs as its foundation. Part 4 is COMPLETE:
+the pairing structure and both irreducible cores (`millerLoop`,
+`finalExponentiation`) are implemented, byte-exact against `py_ecc` —
+see "Part 4 — pairing" below. NO precompile wiring in this module yet
+(Part 5+).
 
 ## Model-after + seed
 
@@ -166,12 +170,180 @@ adversarial audit. Every group-law identity (associativity,
 distributivity of `scalarMul`, `[r]G1 == O`, `[r]G2 == O`, the
 non-subgroup `G2` point failing `subgroupCheck`, every `[k]G`
 byte-exact KAT) passed on the first implementation attempt — again, no
-"genuinely subtle" failure surfaced. The Fable-hard work in this arc,
-if any, remains deferred to a LATER part: the optimal-ate Miller loop /
-final-exponentiation hard part (Part 4) is where BN254 diverges
-non-trivially from BLS12-381 (different embedding structure, different
-`6x+2` NAF loop, D-type vs. twist details worth a dedicated audit) —
-that is where a harder-tier pass would be worth spending, not here.
+"genuinely subtle" failure surfaced. The Fable-hard work in this arc is
+Part 4's pairing core (`millerLoop`/`finalExponentiation`) — this IS
+where BN254 diverges non-trivially from BLS12-381 (a different `6x+2`
+(not `|x|`) loop parameter, the BN-specific Frobenius-tail addition
+steps, and a different final-exponentiation hard-part addition chain —
+see "Part 4 — pairing" above). Part 4's SCAFFOLD (the type
+shapes, the KAT harness, the real infinity/composition wiring) was,
+like Parts 1-3, a careful, verified adaptation of `bls12_381/src
+/pairing.zig`'s structure — no design judgment call was needed for the
+scaffold itself. The two irreducible cores were the genuinely
+harder-tier work: a dedicated Fable crypto-core pass implemented them
+(and caught a real BN-vs-BLS untwist/line-slot subtlety only the
+byte-exact KAT surfaced — see "Part 4 — pairing" below).
+
+## Part 4 — pairing
+
+`pairing.zig` implements the optimal-ate pairing `e: G1 x G2 -> Gt`
+(`Gt` = the order-`r` cyclotomic subgroup of `Fp12*`) — COMPLETE: every
+structural piece plus both irreducible crypto-core functions
+(`millerLoop`, `finalExponentiation`) are implemented and tested,
+byte-exact against `py_ecc`. The type shapes / KAT harness / wiring
+were a careful adaptation of `bls12_381/src/pairing.zig`'s structure
+(scaffold pass); the two cores were a dedicated Fable crypto-core pass
+— see `NOTICE`'s "Verification performed" for the tier reasoning.
+
+**Structural pieces (adapted from `bls12_381`, scaffold pass):**
+- `Gt` (= `Fp12`, the "trust the constructor" convention already used by
+  `bls12_381.pairing.Gt`) and `PairingPair`.
+- `bn_x` (the BN seed, `4965661367192848881` — the SAME value
+  `fp.zig`/`scalar.zig`'s defining-polynomial-family constant already
+  cites) and `bn_ate_loop_param` (`= 6*bn_x+2`, comptime-derived, pinned
+  byte/decimal-exact against the independently-published
+  `py_ecc.bn128.bn128_pairing.ate_loop_count = 29793968203157093288` —
+  see this file's own test).
+- `multiMillerLoop`'s infinity-skip product wiring: a pair with either
+  input at infinity contributes the trivial factor `1` and is SKIPPED —
+  `millerLoop` is never invoked for it. An all-infinity `pairs` slice
+  therefore returns `Fp12.one` WITHOUT touching either stub, gate
+  irrelevant — the module's own `"multiMillerLoop never touches the
+  stub on an all-infinity input"` test exercises exactly this, ungated.
+- `pairing`/`pairingCheck`'s composition wiring (`finalExponentiation`
+  composed with `multiMillerLoop`).
+- `Fp12.cyclotomicSquare` — the ONE auxiliary primitive the final
+  exponentiation's hard part needs beyond plain `Fp12` ring arithmetic —
+  was ALREADY implemented and KAT-tested during the Part 3 field-tower
+  pass (`fp12.zig`, Granger-Scott construction, generic in the tower's
+  non-residues, so it required NO BN254-specific derivation beyond what
+  Part 3 already did). Part 4 imports it as-is; **no new implementation
+  decision was needed here** — this answers what would otherwise be an
+  open scaffold question ("implement `cyclotomicSquare` now, or stub it
+  for Fable too?"): it turned out already done.
+- Every pinned KAT hex vector's OWN byte-parse/round-trip (independent of
+  whether the pairing core exists yet to PRODUCE the values).
+
+**Cores (Fable crypto-core pass, gate `pairing_core_implemented` now
+`true`):**
+- `millerLoop(p, q) Fp12` — the per-pair `6x+2` Miller walk (plain
+  binary MSB→LSB over `6x+2`; NAF is a deferred optimization) with the
+  BN-specific "Frobenius tail" (`Q1 = π(Q)`, `Q2 = π²(Q)`, then
+  `f·line(T,Q1)`, `T+=Q1`, `f·line(T,−Q2)`). The KAT-caught subtlety
+  the pass had to resolve: BN254's twist constant is `b' = 3/ξ`, so the
+  untwisting map MULTIPLIES (`ψ(x',y') = (x'·w², y'·w³)`) and the sparse
+  line lands in tower slots `(1, w, w³)` — NOT `bls12_381`'s
+  `(1, w², w³)` shape (its twist is `b'=b·ξ`, whose untwist divides).
+  Transcribing the BLS slot layout verbatim passes the self-inverse
+  `pairingCheck` identities yet fails every byte-exact KAT — the
+  "plausible-but-wrong" mode the byte-exact oracle exists to catch.
+- `finalExponentiation(f) Gt` — the easy part (curve-generic,
+  transcribed from `bls12_381.pairing.finalExpEasyPart`: `conj(f)·f⁻¹`
+  then `·frob²`) composed with the BN-specific exact-`d` hard part
+  (Scott-Benger-Charlemagne-Perez-Kachisa ePrint 2008/490 §7 vectorial
+  addition chain, Devegili-Scott-Dahab 2007 §4 lineage — three `m^x`
+  seed exponentiations via `cyclotomicSquare` + Frobenius/conjugate/mul
+  combines; DIFFERENT from `bls12_381`'s Hayashida-Hayasaka-Teruya
+  chain). NOT the Fuentes-Castañeda variant, which computes a fixed
+  nontrivial POWER of `f^d` (bilinearity-equivalent, byte-different) and
+  would fail the KAT. The chain's exponent was re-verified with
+  independent big-integer arithmetic to equal `(p⁴−p²+1)/r` exactly
+  before being trusted; the byte-exact py_ecc KAT then confirmed it
+  end-to-end.
+
+Both cores' doc comments in `pairing.zig` carry the full construction,
+the sign/Frobenius-power-ordering footgun, and the numeric
+re-verification — byte-exact-checked against the pinned KAT vectors.
+
+## Part 4 — KAT generation
+
+No numeric worked example for BN254's pairing exists in EIP-196/197's
+spec text itself, so Part 4's KAT vectors were generated with
+`ethereum/py_ecc`'s `bn128` module (`pip install py_ecc`, version current
+as of 2026-07 — a mature, independently-authored reference
+implementation; this is the task's own suggested KAT source) — used
+strictly as a NUMERIC ORACLE for `pairing.zig`'s pinned test vectors, not
+read/ported for algorithm shape (this module's OWN `millerLoop`/
+`finalExponentiation` doc comments cite Devegili-Scott-Dahab/
+Fuentes-Castañeda et al. directly, not `py_ecc`'s source — see `NOTICE`).
+
+**The representation mismatch, and how it was bridged.** `py_ecc.bn128`
+represents `Fp12` as a FLAT single-generator basis, `Fp[w]/(w^12-18w^6
++82)` (its own `bn128_curve.py` comment: "Field isomorphism from
+Z[p]/x^2 to Z[p]/(x^2-18x+82)" — embedding its `Fp2`'s `i` as `w^6-9`).
+This module's tower (`Fp12 = Fp6[w]/(w^2-v)`, `Fp6 = Fp2[v]/(v^3-ξ)`,
+`ξ = 9+u`) gives `w^6 = v^3 = ξ = 9+u` — THE SAME defining relation
+(`9+i = 9+(w^6-9) = w^6` in `py_ecc`'s basis), confirmed identically:
+both towers' `w` satisfies `w^6 = 9+(the base Fp2 generator)`. Because
+of this shared relation, a tower coefficient `a_{i,j,k}` (`i` = the
+`Fp12`-level `w^i` index `0..1`, `j` = the `Fp6`-level `v^j` index
+`0..2`, `k` = the `Fp2`-level `u^k` index `0..1`) maps DIRECTLY into
+`py_ecc`'s flat 12-coefficient basis (index `f = 2j+i`, `0..11`) via:
+
+```python
+flat[f]   += a[i][j][0] - 9 * a[i][j][1]   # f = 2j+i, 0 <= f <= 5
+flat[f+6] += a[i][j][1]
+```
+
+(the inverse — recovering tower coefficients from a `py_ecc` `FQ12`
+value — is the direct algebraic inverse: `a[i][j][1] = flat[f+6]`,
+`a[i][j][0] = flat[f] + 9*flat[f+6]`). This is an EXACT, LOSSLESS
+Fp-linear bijection between the two 12-dimensional representations (both
+towers are 12-dimensional `Fp`-vector spaces built as extensions of the
+same base field `Fp`), not an approximation or a "close enough" numeric
+match.
+
+**Validated as a ring homomorphism before use** (the same discipline
+`bls12_381/src/pairing.zig`'s own KAT comment documents: "the conversion
+first validated as a ring isomorphism on random products") — NOT merely
+asserted:
+- On 20 random pairs of tower elements `A`, `B`: computed `A*B` with a
+  from-scratch Python re-implementation of THIS module's own tower
+  arithmetic (the same `fp2_mul`/`fp6_mul`/`fp12_mul` functions already
+  established by this file's "Verification performed" §4 KAT
+  generator), mapped both the product and the two factors into
+  `py_ecc`'s flat basis, and confirmed `map(A)*map(B) == map(A*B)` under
+  `py_ecc`'s own `FQ12.__mul__` — i.e. the map is a genuine ring
+  homomorphism, not merely coefficient-position-compatible on the
+  identity/generators alone.
+- Confirmed `map(w_tower) == py_ecc`'s own `w = FQ12([0,1,0,...])`
+  (both towers' generators coincide under the map, not just isomorphic
+  up to scaling), and `map(w_tower)^6 == map(ξ_tower)` (the defining
+  relation itself holds through the map).
+
+**Vectors generated** (`p` = the BN254 base field modulus, `r` = the
+group order; both `G1`/`G2` generators used are `py_ecc.bn128.G1`/`G2`,
+confirmed byte-identical to this module's own `g1.zig`/`g2.zig`
+generators before computing anything):
+- `e_g1_g2_hex` = `map(py_ecc.bn128.pairing(G2, G1))` — `py_ecc`'s
+  `pairing(Q, P)` argument order (Q first); its `miller_loop` already
+  applies the full `f^((p^12-1)/r)` final exponentiation internally, so
+  this is directly the fully-exponentiated `e(G1, G2)`, no extra step.
+- `e_2g1_g2_hex` = `map(pairing(G2, [2]G1))`, cross-checked EQUAL to
+  `map(pairing([2]G2, G1))` (both computed and compared inside Python
+  before pinning — `e([2]P,Q) == e(P,[2]Q)`, a bilinearity sanity check
+  on the ORACLE itself, independent of this module) and equal to
+  `e_g1_g2^2` (also checked in Python).
+- `e_3g1_g2_hex` = `map(pairing(G2, [3]G1))`, checked equal to
+  `e_g1_g2^3` in Python.
+- Sanity checks performed in Python before pinning (not merely assumed):
+  `py_ecc`'s BN `ate_loop_count = 29793968203157093288` equals
+  `6*4965661367192848881+2` exactly (this module's own
+  `bn_ate_loop_param` derivation); `e(G1,G2) != 1`; `e(G1,G2)^r == 1`.
+
+No sign-convention correction was needed (unlike `bls12_381`'s
+py_ecc-cross-check, which needed a documented conjugation for the
+negative BLS seed — `bls12_381/src/pairing.zig`'s own KAT comment):
+BN254's seed `x` is POSITIVE and `py_ecc`'s `ate_loop_count = 6x+2` is
+the same positive loop parameter this module's `bn_ate_loop_param`
+already derives, so `py_ecc`'s pairing convention lines up with this
+module's directly.
+
+The Python script (generator + validator, not shipped/imported by the
+module — same "kept for reproducibility" policy as this file's §4 field
+-tower KAT generator) lives in scratch history only; reproducing it
+requires `pip install py_ecc` plus the tower-arithmetic functions
+already listed in this file's §4.
 
 ## Verification performed
 
@@ -391,30 +563,42 @@ used to:
   imaginary-first 128-byte encoding of the `G2` generator and `[2]G2`
   byte-for-byte against `g2.zig`'s `toBytes` output.
 
-## NOTICE — why no entry
+## NOTICE
 
-Per `CONVENTIONS.md` §5's NOTICE policy: EIP-196/197 is a public
-specification (merger doctrine — not copyrightable), and the field/
-curve constants themselves are mathematical facts, not third-party
-expression. `py_ecc`'s published constant VALUES were cross-checked
-(not its source code ported or studied for algorithm/API shape — this
-module's algorithms come from `bls12_381`, an internal sibling module,
-not from `py_ecc`). This mirrors `bls12_381`'s own NOTICE-free
-precedent (its "Model-after" cites `draft-irtf-cfrg-pairing-friendly-
-curves`, a spec, and has no NOTICE entry either). No entry needed.
+Parts 1-3 needed no `NOTICE` entry: per `CONVENTIONS.md` §5's policy,
+EIP-196/197 is a public specification (merger doctrine — not
+copyrightable), and the field/curve constants themselves are
+mathematical facts, not third-party expression; `py_ecc`'s published
+constant VALUES were only cross-checked, never its source code ported
+or studied for algorithm/API shape. **Part 4 changes this**: its KAT
+harness uses `py_ecc.bn128`'s COMPUTED OUTPUT as a numeric oracle (not
+merely its published constants), the same posture `bls12_381/NOTICE`
+documents for its own `e(G1,G2)` cross-check — see
+`modules/bn254/NOTICE` for the full entry (the basis-conversion
+methodology, the ring-homomorphism validation, and what was/was not
+read from `py_ecc`'s source).
 
 ## Backlog
 
 - Part 3 (`G1`/`G2` group arithmetic — Jacobian/affine points,
   constant-time scalar multiplication, on-curve + subgroup checks):
   **done** (`g1.zig`/`g2.zig`).
-- Part 4: the optimal-ate pairing (`6x+2` NAF Miller loop, final
-  exponentiation) — the first place this arc may warrant a harder
-  verification tier (see "Tier assessment" above).
+- Part 4 (the optimal-ate pairing): **done** — `pairing.zig`'s
+  `Gt`/`PairingPair`/loop-parameter constants/`multiMillerLoop`/
+  `pairing`/`pairingCheck` wiring, the byte-exact KAT harness
+  (`e_g1_g2_hex`/`e_2g1_g2_hex`/`e_3g1_g2_hex`, sourced from
+  `ethereum/py_ecc`, see "Part 4 — KAT generation" above), AND both
+  crypto cores — `millerLoop` (`6x+2` Miller loop with the BN-specific
+  Frobenius-tail steps) and `finalExponentiation` (easy part + the
+  BN-specific exact-`d` hard-part addition chain) — are implemented and
+  tested, `gate.pairing_core_implemented` flipped to `true`; 123/123
+  pass in Debug AND ReleaseFast, byte-exact against py_ecc. See "Part 4
+  — pairing" above.
 - Part 5: EIP-196/197 precompile-exact semantics (point-at-infinity
   encoding, gas-irrelevant validation rules, the exact error/success
-  behavior the EVM expects).
-- Part 6: Groth16 verifier over the pairing.
+  behavior the EVM expects) — depends on Part 4's core landing first
+  (`pairingCheck` is the `ecPairing` precompile's actual primitive).
+- Part 6: Groth16 verifier over the pairing — depends on Part 4/5.
 - Persistent Montgomery storage / precomputed Frobenius-coefficient
   tables (performance-only; same deferred-optimization shape as
   `bls12_381`'s SPEC.md Backlog) — not needed until a later part's hot
