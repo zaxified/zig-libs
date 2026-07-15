@@ -137,6 +137,16 @@ pub const aead = @import("aead.zig");
 pub const engine = @import("engine.zig");
 pub const connection = @import("Connection.zig");
 
+/// TLS/DTLS 1.3 CertificateVerify signature construction (RFC 8446 §4.4.3,
+/// reused verbatim by DTLS 1.3 -- RFC 9147 does not redefine it). Purely
+/// additive and self-contained: it does not touch, call into, or get called
+/// by the PSK flight engine above (`connection`/`messages`/`keyschedule`/
+/// `engine`) or the handshake state machine -- see `certverify.zig`'s module
+/// doc comment for its scope. Standalone verify/sign only; wiring it into a
+/// full cert-mode handshake flow (which this module's PSK engine does not
+/// have) is future work.
+pub const certverify = @import("certverify.zig");
+
 pub const Connection = connection.Connection;
 pub const Config = connection.Config;
 pub const Role = connection.Role;
@@ -149,8 +159,11 @@ pub const meta = .{
     // epoch/sequence-number/key state; nothing shared/global (mirrors the
     // `ssh` module's Transport reasoning).
     .concurrency = .single_owner,
-    .model_after = "RFC 9147 (DTLS 1.3, PSK mode) + RFC 8446 (TLS 1.3 shared key schedule/handshake message shapes; RFC 9147 §5.8/§5.9 reuse these with the \"dtls13\" label prefix)",
-    .deps = .{},
+    .model_after = "RFC 9147 (DTLS 1.3, PSK mode) + RFC 8446 (TLS 1.3 shared key schedule/handshake message shapes; RFC 9147 §5.8/§5.9 reuse these with the \"dtls13\" label prefix); RFC 8446 §4.4.3 (CertificateVerify, in `certverify.zig`)",
+    // `rsa`: solely for `certverify.zig`'s RSASSA-PSS dispatch
+    // (rsa_pss_rsae_sha{256,384,512}) -- the PSK-only flight engine itself
+    // still needs no sibling modules, see the "meta.deps" test below.
+    .deps = .{"rsa"},
 };
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────
@@ -158,7 +171,9 @@ pub const meta = .{
 // A bare `pub const x = @import("x.zig")` re-export does NOT pull `x`'s
 // tests into the test binary on its own — every submodule must be named
 // here too. All submodules below now carry real `test` blocks
-// (`keyschedule`/`aead` included, with KATs).
+// (`keyschedule`/`aead` included, with KATs). `certverify` included -- its
+// `test` block carries buildSignedContent unit tests, dispatch reject-path
+// tests, and byte-exact sign/verify + tamper KATs, all passing.
 test {
     _ = record;
     _ = handshake;
@@ -168,10 +183,12 @@ test {
     _ = aead;
     _ = engine;
     _ = connection;
+    _ = certverify;
 }
 
-test "meta.deps is empty (PSK mode needs no sibling modules, no x509/rsa)" {
-    try std.testing.expectEqual(@as(usize, 0), meta.deps.len);
+test "meta.deps is {\"rsa\"} (only certverify.zig's RSASSA-PSS dispatch needs it; the PSK flight engine itself needs no sibling modules)" {
+    try std.testing.expectEqual(@as(usize, 1), meta.deps.len);
+    try std.testing.expectEqualStrings("rsa", meta.deps[0]);
 }
 
 test "keyschedule.hkdfExpandLabel: uses the DTLS \"dtls13\" prefix (RFC 9147 §5.9)" {

@@ -109,7 +109,7 @@ const module_list = [_]Module{
     .{ .name = "dnp3" },
     .{ .name = "slhdsa" },
     .{ .name = "falcon" },
-    .{ .name = "dtls" },
+    .{ .name = "dtls", .deps = &.{"rsa"} },
     .{ .name = "tlsresume" },
     .{ .name = "quic-crypto" },
     .{ .name = "sandbox" },
