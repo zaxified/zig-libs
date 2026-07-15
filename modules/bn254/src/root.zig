@@ -2,26 +2,29 @@
 //! bn254 — BN254 (alt-bn128), the pairing-friendly elliptic curve
 //! behind Ethereum's EIP-196/197 precompiles (`ecAdd`/`ecMul`/
 //! `ecPairing`, addresses `0x06`/`0x07`/`0x08`) and Groth16 zk-SNARK
-//! verification. **This module is Parts 1-2 of a multi-part arc**: the
-//! base field `Fp`, its extension tower `Fp2`/`Fp6`/`Fp12`, and the
-//! scalar field `Fr` — the foundation for the pairing groups `G1`/`G2`
-//! (a later part), the optimal-ate pairing itself, the EIP-196/197
-//! precompile semantics, and a Groth16 verifier (see `README.md` for
-//! the full planned arc).
+//! verification. **This module is Parts 1-3 of a multi-part arc**: the
+//! base field `Fp`, its extension tower `Fp2`/`Fp6`/`Fp12`, the scalar
+//! field `Fr` (Parts 1-2), and now the pairing groups `G1`/`G2` (Part 3)
+//! — the foundation for the optimal-ate pairing itself, the EIP-196/197
+//! precompile semantics, and a Groth16 verifier (later parts; see
+//! `README.md` for the full planned arc).
 //!
-//! **Status: Parts 1-2 complete.** Every field-tower operation is
-//! implemented and tested; NO group arithmetic, NO pairing, NO
-//! precompile wiring yet. This module was built by careful, verified
-//! ADAPTATION of the sibling `bls12_381` module (same `std.crypto.ff`-
-//! backed `Fp`/`Fr` construction, same tower-arithmetic formula shapes
-//! from Devegili et al. and Adj & Rodriguez-Henriquez) with BN254's own
-//! field/curve constants substituted in and independently verified —
-//! see `SPEC.md`'s "Model-after + seed" and "Verification performed"
+//! **Status: Parts 1-3 complete.** Every field-tower operation, plus
+//! `G1`/`G2` Jacobian group arithmetic, scalar multiplication, on-curve
+//! and subgroup-membership checks, and EIP-196/197 (de)serialization,
+//! are implemented and tested. NO pairing, NO precompile wiring yet
+//! (Part 4+). This module was built by careful, verified ADAPTATION of
+//! the sibling `bls12_381` module (same `std.crypto.ff`-backed `Fp`/`Fr`
+//! construction, same tower-arithmetic formula shapes from Devegili et
+//! al. and Adj & Rodriguez-Henriquez, same Jacobian point-arithmetic
+//! formulas from `g1.zig`/`g2.zig`) with BN254's own field/curve
+//! constants substituted in and independently verified — see
+//! `SPEC.md`'s "Model-after + seed" and "Verification performed"
 //! sections for the exact sources and cross-checks. Every constant is
 //! also pinned against byte-exact known-answer test vectors computed
 //! independently in Python (not transcribed from any third-party
-//! library) — see the KAT tests in `fp2.zig`/`fp6.zig`/`fp12.zig` and
-//! `SPEC.md`.
+//! library) — see the KAT tests in `fp2.zig`/`fp6.zig`/`fp12.zig`/
+//! `g1.zig`/`g2.zig` and `SPEC.md`.
 
 const std = @import("std");
 
@@ -30,12 +33,16 @@ pub const fp2 = @import("fp2.zig");
 pub const fp6 = @import("fp6.zig");
 pub const fp12 = @import("fp12.zig");
 pub const scalar = @import("scalar.zig");
+pub const g1 = @import("g1.zig");
+pub const g2 = @import("g2.zig");
 
 pub const Fp = fp.Fp;
 pub const Fp2 = fp2.Fp2;
 pub const Fp6 = fp6.Fp6;
 pub const Fp12 = fp12.Fp12;
 pub const Fr = scalar.Fr;
+pub const G1 = g1;
+pub const G2 = g2;
 
 pub const meta = .{
     .platform = .any,
@@ -56,6 +63,8 @@ test {
     _ = fp6;
     _ = fp12;
     _ = scalar;
+    _ = g1;
+    _ = g2;
 }
 
 test "meta.model_after names BN254/alt-bn128" {

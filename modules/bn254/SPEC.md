@@ -4,10 +4,11 @@ BN254 (alt-bn128): see [README.md](README.md) for purpose and API.
 
 ## Purpose
 
-Parts 1-2 of a multi-part arc (`README.md`): the base field `Fp`, the
-extension tower `Fp2`/`Fp6`/`Fp12`, and the scalar field `Fr` —
+Parts 1-3 of a multi-part arc (`README.md`): the base field `Fp`, the
+extension tower `Fp2`/`Fp6`/`Fp12`, the scalar field `Fr` (Parts 1-2),
+and the pairing groups `G1`/`G2` (Part 3, `g1.zig`/`g2.zig`) —
 everything a future pairing/precompile/Groth16 layer needs as its
-foundation. NO group arithmetic, NO pairing in this module yet.
+foundation. NO pairing in this module yet (Part 4+).
 
 ## Model-after + seed
 
@@ -46,6 +47,17 @@ foundation. NO group arithmetic, NO pairing in this module yet.
   `cyclotomicSquare`, "Faster Squaring in the Cyclotomic Subgroup of
   Sixth Degree Extensions", PKC 2010) is likewise generic in the
   tower's non-residues and copied unchanged from `bls12_381`.
+- **Part 3's `G1`/`G2` Jacobian point arithmetic (`add`/`double`,
+  add-2007-bl/dbl-2009-l, Bernstein–Lange EFD `shortw/jacobian-0`) is
+  ADAPTED unchanged from `bls12_381/src/g1.zig`/`g2.zig`** — both
+  formulas are GENERIC in the curve's `b` constant (only the `a = 0`
+  short-Weierstrass coefficient matters, which BN254's `G1`/twist `E'`
+  share with BLS12-381's), so only the curve constants (`b = 3` for
+  `G1`; `b' = 3*(9+u)^-1` for `G2`'s twist) and generator coordinates
+  differ. `G1`'s wire codec is a NEW, simpler design vs.
+  `bls12_381/src/g1.zig`'s (EIP-196/197 has no compressed format or
+  flag bits, unlike the ZCash/IETF format `bls12_381` uses) — see
+  `g1.zig`/`g2.zig`'s module doc comments for the exact reasoning.
 
 ## Design & invariants
 
@@ -86,8 +98,43 @@ foundation. NO group arithmetic, NO pairing in this module yet.
 - **Montgomery-storage / canonical-storage convention: identical to
   `bls12_381`** (`Fp`/`Fr` store canonically at rest; see `fp.zig`'s
   module doc comment).
+- **`G1`'s cofactor is 1 — a load-bearing fact, not a simplification.**
+  BN254's defining polynomial family gives `#E(Fp) = p + 1 - t = r`
+  EXACTLY (`t = 6x^2+1`, confirmed `p + 1 - t == r` symbolically — see
+  "Verification performed" below), i.e. `r` (prime) IS the full order
+  of `E(Fp)`, not merely a large prime factor. Since a group of prime
+  order has no nontrivial proper subgroups, `E(Fp)` and `G1` are THE
+  SAME SET — `isOnCurve() == subgroupCheck()` for every point,
+  unconditionally. This is a REAL difference from `bls12_381`'s `G1`
+  (cofactor `h1 = 0x396c8c...`, nontrivial), not a shortcut this module
+  took: `g1.zig`'s `subgroupCheck` returning `isOnCurve()` is the
+  mathematically exact answer, verified independently two ways (the
+  polynomial identity, and `[r]G1 == O` computed via full scalar-mul in
+  both this module's tests and the Python cross-check below).
+- **`G2`'s cofactor is NONTRIVIAL** (`#E'(Fp2) = r * h2`, `h2 > 1`) —
+  `subgroupCheck` for `G2` is a REAL `[r]P == O` scalar multiplication
+  (`g2.zig`), not a shortcut. This module does NOT compute or expose
+  `h2`/cofactor-clearing: BN254 has no standardized hash-to-`G2` used by
+  EIP-197 precompile semantics or Groth16 verification (both only ever
+  consume caller-supplied `G2` points, never hash an arbitrary message
+  onto the twist), so cofactor clearing has no consumer in this arc —
+  see `g2.zig`'s module doc comment. `subgroupCheck` alone (no
+  clearing) is sufficient and IS exercised: a constructed on-twist,
+  non-subgroup point (`x = u`) is verified to FAIL it (see `g2.zig`'s
+  tests and "Verification performed" below).
+- **`b' = 3/ξ = 3*(9+u)^-1` is DERIVED at runtime via real `Fp2`
+  arithmetic (`g2.zig`'s `twistB()`), never hand-transcribed as a
+  numeric literal.** Pinned byte-exact against an independent Python
+  computation (below).
+- **EIP-197's `G2` wire encoding is imaginary-component-FIRST**: an
+  `Fp2` element `a + b*i` serializes as `(b, a)`. Combined with `Fp2`'s
+  `c1` being the `u`-coefficient (`fp2.zig`'s convention), the 128-byte
+  `G2` encoding is `x.c1 || x.c0 || y.c1 || y.c0` — see `g2.zig`'s codec
+  section doc comment. Pinned against a KAT vector where `c0 != c1` on
+  every coordinate (the generator itself qualifies), so a swapped
+  ordering could not silently pass.
 
-## Tier assessment — Fable NOT required for Parts 1-2
+## Tier assessment — Fable NOT required for Parts 1-3
 
 This is a **careful, verified ADAPTATION**, not novel cryptographic
 design. Every algorithm (Montgomery field arithmetic via
@@ -103,13 +150,28 @@ resolving an ambiguous spec, or making an irreducible cryptographic
 design judgment call. **No stub was left; no test was weakened to
 pass; every identity (Fermat, Frobenius=pow(p), cyclotomic-square=
 square-on-subgroup, ring axioms) held on the first implementation
-attempt** — there was no "genuinely subtle" failure to isolate. The
-Fable-hard work in this arc, if any, is deferred to a LATER part: the
-optimal-ate Miller loop / final-exponentiation hard part (Part 4) is
-where BN254 diverges non-trivially from BLS12-381 (different embedding
-structure, different `6x+2` NAF loop, D-type vs. twist details worth a
-dedicated audit) — that is where a harder-tier pass would be worth
-spending, not here.
+attempt** — there was no "genuinely subtle" failure to isolate.
+
+**Part 3 (`G1`/`G2`) is the same story, one level up.** The Jacobian
+`add`/`double` formulas are UNCHANGED from `bls12_381` (generic in `b`);
+`scalarMul`'s constant-time double-and-add-always construction is
+UNCHANGED. The two genuinely BN254-specific pieces — `G1`'s cofactor
+being exactly 1 (not merely "small"), and deriving `b' = 3/(9+u)` in
+`Fp2` rather than transcribing it — are ARITHMETIC FACTS with a
+mechanical derivation and an independent Python cross-check each, not
+open design questions: there was no ambiguity about which of two
+candidate formulas to use, no judgment call about a threat model, no
+place a wrong choice could have been made and only discovered by an
+adversarial audit. Every group-law identity (associativity,
+distributivity of `scalarMul`, `[r]G1 == O`, `[r]G2 == O`, the
+non-subgroup `G2` point failing `subgroupCheck`, every `[k]G`
+byte-exact KAT) passed on the first implementation attempt — again, no
+"genuinely subtle" failure surfaced. The Fable-hard work in this arc,
+if any, remains deferred to a LATER part: the optimal-ate Miller loop /
+final-exponentiation hard part (Part 4) is where BN254 diverges
+non-trivially from BLS12-381 (different embedding structure, different
+`6x+2` NAF loop, D-type vs. twist details worth a dedicated audit) —
+that is where a harder-tier pass would be worth spending, not here.
 
 ## Verification performed
 
@@ -247,6 +309,88 @@ concatenate their components HIGH-to-LOW (`c1||c0`, `c2||c1||c0`,
 **5. `Fr.reduceWide` 64-byte KAT**: `int.from_bytes(b'\xff'*64, 'big')
 % r`, computed directly in Python.
 
+**6. Part 3 (`G1`/`G2`) — independent from-scratch Python EC
+implementation.** Plain textbook AFFINE-coordinate short-Weierstrass
+formulas over Python big integers (a DIFFERENT algorithm family than
+this module's Jacobian/`std.crypto.ff` Zig code) were used to:
+
+```python
+p = 21888242871839275222246405745257275088696311157297823662689037894645226208583
+r = 21888242871839275222246405745257275088548364400416034343698204186575808495617
+def fp_inv(a): return pow(a, p-2, p)
+def fp2_mul(a,b):
+    a0,a1=a; b0,b1=b
+    return ((a0*b0 - a1*b1) % p, (a0*b1 + a1*b0) % p)
+def fp2_sq(a): return fp2_mul(a,a)
+def fp2_inv(a):
+    a0,a1 = a
+    n = fp_inv((a0*a0 + a1*a1) % p)
+    return ((a0*n) % p, ((-a1)*n) % p)
+def fp2_add(a,b): return ((a[0]+b[0])%p, (a[1]+b[1])%p)
+def fp2_sub(a,b): return ((a[0]-b[0])%p, (a[1]-b[1])%p)
+
+xi = (9, 1)
+b2 = fp2_mul((3,0), fp2_inv(xi))  # G2's twist constant b'
+
+G1 = (1, 2)
+def g1_add(P, Q):  # standard affine EC addition/doubling over Fp
+    if P is None: return Q
+    if Q is None: return P
+    x1,y1 = P; x2,y2 = Q
+    if x1 == x2 and (y1 + y2) % p == 0: return None
+    if P == Q:
+        if y1 == 0: return None
+        m = (3*x1*x1) * fp_inv(2*y1) % p
+    else:
+        m = (y2-y1) * fp_inv((x2-x1) % p) % p
+    x3 = (m*m - x1 - x2) % p
+    y3 = (m*(x1-x3) - y1) % p
+    return (x3, y3)
+def g1_mul(P, k):
+    R, Q = None, P
+    while k > 0:
+        if k & 1: R = g1_add(R, Q)
+        Q = g1_add(Q, Q); k >>= 1
+    return R
+
+def g2_add(P, Q):  # same shape, over Fp2
+    if P is None: return Q
+    if Q is None: return P
+    x1,y1 = P; x2,y2 = Q
+    if x1 == x2 and fp2_add(y1,y2) == (0,0): return None
+    if P == Q:
+        if y1 == (0,0): return None
+        m = fp2_mul(fp2_mul((3,0), fp2_sq(x1)), fp2_inv(fp2_mul((2,0), y1)))
+    else:
+        m = fp2_mul(fp2_sub(y2,y1), fp2_inv(fp2_sub(x2,x1)))
+    x3 = fp2_sub(fp2_sub(fp2_sq(m), x1), x2)
+    y3 = fp2_sub(fp2_mul(m, fp2_sub(x1,x3)), y1)
+    return (x3, y3)
+def g2_mul(P, k):
+    R, Q = None, P
+    while k > 0:
+        if k & 1: R = g2_add(R, Q)
+        Q = g2_add(Q, Q); k >>= 1
+    return R
+```
+
+used to:
+- confirm `p + 1 - t == r` (`t = 6x^2+1`) — the polynomial identity
+  behind `G1`'s cofactor-1 claim;
+- confirm `r * G1 == O` and `r * G2 == O` (via `g1_mul`/`g2_mul`) —
+  independent of this module's own `[r]P == O` tests;
+- generate the `[k]G1`/`[k]G2` byte-exact KAT vectors pinned in
+  `g1.zig`/`g2.zig` for `k ∈ {2, 3, 5, 0x0123...cdef}`;
+- search small `x = (0, c1)` values on the `G2` twist (via `fp2_sqrt`,
+  the same complex-method construction as `fp2.zig`'s `Fp2.sqrt`) for
+  one where `g2_mul(P, r) is not None` — `x = u` (`c1 = 1`) was the
+  first hit, confirmed on-twist AND outside the subgroup, and is the
+  vector `g2.zig`'s negative `subgroupCheck` test uses;
+- confirm `twistB()`'s value (`b2` above) byte-for-byte against
+  `g2.zig`'s comptime/runtime-computed result, and the EIP-197
+  imaginary-first 128-byte encoding of the `G2` generator and `[2]G2`
+  byte-for-byte against `g2.zig`'s `toBytes` output.
+
 ## NOTICE — why no entry
 
 Per `CONVENTIONS.md` §5's NOTICE policy: EIP-196/197 is a public
@@ -261,8 +405,9 @@ curves`, a spec, and has no NOTICE entry either). No entry needed.
 
 ## Backlog
 
-- Part 3: `G1`/`G2` group arithmetic (Jacobian/affine points,
-  constant-time scalar multiplication, on-curve + subgroup checks).
+- Part 3 (`G1`/`G2` group arithmetic — Jacobian/affine points,
+  constant-time scalar multiplication, on-curve + subgroup checks):
+  **done** (`g1.zig`/`g2.zig`).
 - Part 4: the optimal-ate pairing (`6x+2` NAF Miller loop, final
   exponentiation) — the first place this arc may warrant a harder
   verification tier (see "Tier assessment" above).
@@ -274,3 +419,11 @@ curves`, a spec, and has no NOTICE entry either). No entry needed.
   tables (performance-only; same deferred-optimization shape as
   `bls12_381`'s SPEC.md Backlog) — not needed until a later part's hot
   path (Miller loop) makes it worth the complexity.
+- `G2`'s fast endomorphism-based subgroup check (untwist-Frobenius-twist
+  — same technique `bls12_381/src/g2.zig`'s Backlog defers) — the
+  simple `[r]P == O` form implemented here is correct and is what a
+  scaffolding-stage Part 3 needs; a faster check is a follow-up
+  optimization, not a correctness gap.
+- `G2` cofactor value/`clearCofactor` — deliberately out of scope for
+  this arc (see "Design & invariants" above); revisit only if a future
+  part adds hash-to-`G2`.
