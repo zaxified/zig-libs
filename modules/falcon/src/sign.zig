@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! sign — Falcon/FN-DSA signing glue: hashes (nonce, message) to a point
 //! via REUSED `codec.hashToPoint`, draws a candidate short vector via
-//! `ffsampling.sampleSignature` (STUB), rejects candidates over the
+//! `ffsampling.sampleSignature`, rejects candidates over the
 //! degree's norm bound and retries (mirroring the spec's own outer
 //! accept/reject loop — real code, not stubbed), and compresses the
 //! accepted s2 via REUSED `codec.compEncode`. Two entry points funnel
@@ -29,14 +29,14 @@ pub const nonce_length = 40;
 /// it is NOT the outer NIST-KAT AES-256-CTR-DRBG
 /// (`KAT/generator/katrng.c`) that produces the .rsp `seed` field in the
 /// first place; that harness-level DRBG is test tooling and has no
-/// business in this module's public signing API. Feeding this PRNG the
-/// KAT vector's `seed` bytes is the mechanism `signDeterministic` needs
-/// to reproduce a KAT signature bit-for-bit — whether it actually DOES
-/// reproduce one byte-exactly additionally depends on `ntru.zig`,
-/// `ffsampling.zig`, and `gaussian.zig` all consuming randomness from
-/// `rng` in the same order/quantity the reference implementation does,
-/// which is intertwined with their (currently stubbed) internals and so
-/// cannot be pinned down further until they're implemented.
+/// business in this module's public signing API. Because the reference
+/// draws the nonce and the signer seed as two SEPARATE DRBG calls,
+/// `signDeterministic`'s single SHAKE stream is this module's own
+/// deterministic mode, not the NIST-KAT derandomization — the KAT tests
+/// replay the DRBG explicitly instead (`kat_sign_test.zig`). This PRNG
+/// IS, however, exactly the reference's SHAKE256 keygen RNG: seed it
+/// with the DRBG's 48-byte keypair draw and `generateKeyPair`
+/// reproduces the KAT pk/sk byte-for-byte (`keygen_sign_test.zig`).
 pub const ShakePrng = struct {
     state: std.crypto.hash.sha3.Shake256,
 
@@ -95,7 +95,7 @@ pub fn Signer(comptime Ring: type) type {
                 var c: Ring.Poly = undefined;
                 Codec.hashToPoint(nonce_out, msg, &c); // REUSED
 
-                const samp = ffsampling.sampleSignature(Ring, tree, &c, rng); // STUB — panics until filled in
+                const samp = ffsampling.sampleSignature(Ring, tree, &c, rng);
 
                 var norm: u64 = 0;
                 for (samp.s1, samp.s2) |a, b| {

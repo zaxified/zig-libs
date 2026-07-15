@@ -1,9 +1,9 @@
 # falcon — SPEC
 
-Falcon-512 and Falcon-1024 verification + codecs (COMPLETE, KAT-verified);
-keygen + sign (SCAFFOLD — structure and API real, the hard math stubbed —
-see "Keygen + sign scaffold" below). See [README.md](README.md) for purpose
-and API.
+Falcon-512 and Falcon-1024, COMPLETE: verification + codecs, signing, and
+key generation, all NIST-KAT-verified byte-exactly (see "Keygen + sign"
+below for the signer/keygen internals and the constant-time caveat). See
+[README.md](README.md) for purpose and API.
 
 ## Design
 
@@ -49,15 +49,20 @@ and API.
 
 ## Threat model / limits
 
-- **No signer, deliberately.** ffSampling (LDL* tree over the FFT embedding
-  + the discrete Gaussian sampler) has the property that an incorrect
-  sampler still emits signatures that pass verification while statistically
-  leaking the trapdoor basis. It ships only when it can ship KAT-exact
-  against the deterministic (seeded-DRBG) sign vectors.
+- **Signer correctness is KAT-pinned** precisely because ffSampling + the
+  discrete Gaussian sampler have the property that an incorrect sampler
+  still emits signatures that pass verification while statistically leaking
+  the trapdoor basis; both are byte-exact against the seeded-DRBG sign
+  vectors. **Constant-time status**: `gaussian.samplerZ` reproduces the
+  reference's constant-time branch/table structure, but the underlying
+  arithmetic is native f64 and NO machine-checked side-channel verification
+  (dudect/ctgrind) has been run — audit before production signing. Keygen
+  (`ntru.zig`) likewise preserves the reference's structure; it runs once
+  per key, so its side-channel exposure is far smaller than the signer's.
 - Verification and public-key handling touch public data only, so no
-  constant-time claims are made or needed for the implemented surface.
-  Secret-key *decode* is not constant-time — treat `SecretKey.fromBytes` as
-  a tooling/inspection path, not a production signing path (there is none).
+  constant-time claims are made or needed for that surface. Secret-key
+  *decode* is not constant-time — treat `SecretKey.fromBytes` as a
+  tooling/inspection path.
 - `openNistSignedMessage` implements the NIST-API envelope used by the KATs;
   it returns a sub-slice of the caller's buffer (no copy). The detached
   `PublicKey.verify` is the intended production entry point.
@@ -79,7 +84,7 @@ and API.
   message). The 512 .rsp SHA-256 matches this module's original citation,
   confirming the mirror is bit-identical to the official package; both
   files were parsed from the same tree. `seed` (the NIST-KAT DRBG input,
-  added for the keygen/sign scaffold below) came from the same download —
+  added for the keygen/sign section below) came from the same download —
   see `kat_vectors.zig`'s module doc comment for the full chain.
 - Per vector: sm opens + verifies; opened message equals the vector's msg;
   compressed signature re-encodes byte-exactly; pk re-encodes byte-exactly;
@@ -91,52 +96,53 @@ and API.
 - Both `zig build test-falcon` (Debug) and `-Doptimize=ReleaseFast` green;
   every test block on disk is executed (dark-tests rule).
 
-## Keygen + sign scaffold
+## Keygen + sign
 
-Structure, key/tree types, KAT harness, and public API
-(`generateKeyPair`/`signRandomized`/`signDeterministic`, `_1024`-suffixed
-too, same `Params(logn)` factory as verify) are real and compile; the hard
-math is `@panic("TODO(fable/core): ...")` stubbed. Grep the module for that
-string, or see `root.zig`'s module doc comment, for the current list.
+Both implemented, byte-exact against the NIST Round-3 KATs at both degrees.
+The internals are ports of the MIT-licensed Round-3 reference
+implementation (see the repo-root `NOTICE`); byte-exactness is the point —
+it pins the trapdoor sampler and keygen sampling, whose failure mode is
+"verifies fine, leaks the key".
 
-- **Reused as-is** (no new code needed): `poly.Ring.computePublic` (h =
-  g·f⁻¹ mod q — keygen's public-key step is IDENTICAL to what
-  `SecretKey.publicKey()` already does for decode), `codec.hashToPoint`,
-  `codec.compEncode` (signature compression), the existing NTT. New but
-  NOT hard: `codec.trimI8Encode` (secret-key encode, the missing inverse of
-  the existing `trimI8Decode`), `keygen.zig` (glue: sample → solve → derive
-  h → build tree → pack), `sign.zig` (glue: hash → sample → norm-check
-  retry loop → compress; plus `ShakePrng`, a SHAKE256-seeded
-  `std.Random` for deterministic/KAT signing).
-- **Stubbed** (the four genuinely hard pieces, each its own file):
-  - `ntru.zig` `Ntru(Ring).generate` — NTRUGen (§3.8.1 Algorithm 5) +
-    NTRUSolve (§3.8.2 Algorithm 6): sample small (f,g), solve
-    f·G − g·F = q via the number-field tower + Babai reduction. Needs a
-    big-integer/exact-rational polynomial layer this module doesn't have.
-  - `fft.zig` `Fft(Ring).fft`/`ifft` — the floating-point FFT (§3.4
-    Algorithms 1/2) the sampler runs in; a DIFFERENT transform from
-    `poly.zig`'s exact integer NTT, net-new.
-  - `ffsampling.zig` `buildTree` (ffLDL, §3.8.3 Algorithm 9) +
-    `sampleSignature` (ffSampling, §3.9.1 Algorithm 11), plus their
-    `splitFft`/`mergeFft` helpers (§3.8.3 Algorithms 7/8) — the LDL* tree
-    over the FFT embedding and the fast-Fourier nearest-plane recursion.
-  - `gaussian.zig` `samplerZ` — SamplerZ (§3.9.2 Algorithms 12/13:
-    BaseSampler + ApproxExp + BerExp). **THE side-channel-critical
-    primitive**: an incorrect-but-plausible sampler here still produces
-    signatures that PASS `root.zig`'s verification while statistically
-    leaking the secret basis — functional correctness (even matching the
-    spec's own standalone SamplerZ test vectors) is necessary but NOT
-    sufficient; it needs a constant-time implementation and a dedicated
-    side-channel audit, gated separately from the rest of the signer.
-- **KAT harness**: `kat_vectors.zig`'s existing 5-per-degree vectors
-  (counts 0/1/2/3/57) now also carry `seed` (the 48-byte NIST-KAT DRBG
-  seed), re-extracted from the same SHA-256-verified `falcon-round3.zip`
-  mirror the rest of the vectors were pulled from — see that file's module
-  doc comment for the full provenance chain and the seed/PRNG-layer
-  distinction. `keygen_sign_test.zig` is written against the FINAL keygen/
-  sign API and `return error.SkipZigTest`s immediately before each call
-  that would reach a stub, so it documents exactly what becomes a real
-  byte-exact KAT check once the stubs are filled in, without failing
-  `zig build test-falcon` today.
-- FIPS 206 (FN-DSA) rebase once final — applies to verify+codecs too, not
-  just this scaffold.
+- **Reused as-is**: `poly.Ring.computePublic` (h = g·f⁻¹ mod q),
+  `codec.hashToPoint`, `codec.compEncode`/`trimI8Encode`, the existing NTT.
+  Glue: `keygen.zig` (sample → solve → derive h → pack), `sign.zig` (hash →
+  sample → norm-check retry loop → compress; plus `ShakePrng`, a
+  SHAKE256-seeded `std.Random`).
+- **The hard pieces** (each its own file):
+  - `fpr.zig` — strict-float (`@setFloatMode(.strict)`) f64 layer with the
+    reference's exact constant bit patterns and bit-ported
+    rint/floor/trunc/expm_p63; byte-exact vs the reference's integer FP
+    emulation on any target with true IEEE binary64 and no FMA contraction.
+  - `fft.zig` — the floating-point FFT (§3.4) in the reference's flat
+    layout, plus the `poly_*_fft` helpers (signer + keygen Babai).
+  - `gaussian.zig` — the ChaCha20 signer PRNG (reference `rng.c` layout)
+    and SamplerZ (§3.9.2: gaussian0 RCDT walk + BerExp). **THE
+    side-channel-critical primitive** — structure matches the reference's
+    constant-time discipline; no machine-checked side-channel audit yet
+    (see Threat model above).
+  - `ffsampling.zig` — `ffSampling_fft_dyntree`/`do_sign_dyn` semantics:
+    the Gram matrix + LDL* decomposition is built dynamically per
+    signature, exactly like the `crypto_sign` path that generated the KATs
+    (not the expanded-key variant).
+  - `ntru.zig` — NTRUGen (§3.8.1: `mkgauss` keygen Gaussian + full
+    acceptance loop) and NTRUSolve (§3.8.2: field-norm descent to degree 1,
+    extended binary GCD over 31-bit-limb big integers, RNS/CRT
+    reconstruction mod ~2³¹ primes, FP-FFT-guided Babai reduction with the
+    reference's exact scale schedule). The reference's 522-entry PRIMES
+    table is regenerated at runtime from its definition (largest primes
+    < 2³¹ ≡ 1 mod 2048, descending; CRT coefficient per definition; NTT
+    root choice is value-irrelevant) and cross-checked against the
+    reference table's own (p, s) values in a test.
+- **KAT coverage**: `kat_sign_test.zig` (sign-side: NIST AES-256-CTR-DRBG
+  replay → byte-exact nonce + compressed signature, sk decoded from the
+  vector) and `keygen_sign_test.zig` (keygen-side: DRBG draw 1 → SHAKE256
+  keygen RNG → byte-exact pk/sk; plus the full seed → keygen → sign → `sm`
+  pipeline and a fresh-key sign → verify round trip). `ntru.zig` also
+  KAT-pins NTRUSolve in isolation: solving from the vectors' own (f, g)
+  reproduces the sk's F byte-exactly at both degrees.
+- Deterministic-signing caveat: `signDeterministic` is this module's own
+  seeded mode (single SHAKE stream), NOT the NIST-KAT derandomization
+  (which draws nonce and signer seed as two separate DRBG calls) — the KAT
+  tests replay the DRBG explicitly instead.
+- FIPS 206 (FN-DSA) rebase once final — applies to the whole module.

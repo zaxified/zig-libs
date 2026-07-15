@@ -21,11 +21,10 @@
 //! confirming `seed` lines up with the same (count, msg, pk, sk, sm)
 //! tuple the rest of the vector was drawn from.
 //!
-//! `seed`/keygen/sign are wired here as a harness (this struct field, plus
-//! `keygen_sign_test.zig`) so a future filled-in keygen+signer is
-//! immediately KAT-checkable; they are not yet exercised for their
-//! intended purpose because keygen/sign are themselves `@panic`
-//! stubs — see `root.zig`'s module doc comment.
+//! The `seed` field drives the byte-exact keygen + sign KATs in
+//! `keygen_sign_test.zig`: seeding the DRBG with it reproduces each
+//! vector's `pk`/`sk` (keygen) and `sm` envelope (sign) bit-for-bit for
+//! both parameter sets — see that file's module doc comment.
 
 pub const Vector = struct {
     count: usize,

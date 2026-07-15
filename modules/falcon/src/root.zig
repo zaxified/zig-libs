@@ -16,33 +16,36 @@
 //! Falcon is the stable interop target) — `falcon512-KAT.rsp` and
 //! `falcon1024-KAT.rsp` — see src/kat_vectors.zig.
 //!
-//! **Key generation and signing are SCAFFOLDED, not implemented**: the
-//! public API (`generateKeyPair`, `signRandomized`, `signDeterministic` —
-//! and their `_1024` counterparts), key/tree types, and KAT-harness
-//! wiring (`kat_vectors.zig` now carries each vector's `seed`,
-//! `keygen_sign_test.zig` calls the real API against them) are all real
-//! and compile; the four genuinely hard pieces are `@panic("TODO(fable/
-//! core): ...")` stubs (grep the module for that string):
-//! `ntru.Ntru(Ring).generate` (NTRUGen/NTRUSolve — the tower-of-fields
-//! big-integer machinery), `fft.Fft(Ring).fft`/`ifft` (the floating-point
-//! FFT the sampler runs in), `ffsampling.buildTree`/`sampleSignature`
-//! (ffLDL + the fast-Fourier nearest-plane recursion), and
-//! `gaussian.samplerZ` (the discrete Gaussian sampler — see that file's
-//! module doc comment: THE side-channel-critical primitive in this
-//! module). A subtly wrong sampler still yields signatures that *verify*
-//! while silently leaking the private key, so this ships as a scaffold
-//! — structure and plumbing only — until the stubs can be filled in
-//! KAT-exact AND constant-time. Also out of scope even once the stubs
-//! are filled: the padded/CT signature format (the compressed format,
-//! which the KATs use, is implemented) and any hardening beyond
-//! `gaussian.samplerZ` itself (verification remains public-data-only and
-//! needs none).
+//! **Signing is implemented and NIST-KAT-verified byte-exactly** (both
+//! parameter sets): the strict-float `fpr` layer, the FFT, the ChaCha20
+//! signer PRNG + SamplerZ discrete Gaussian, and the dynamic-tree
+//! ffSampling nearest-plane recursion reproduce the reference
+//! implementation's KAT signatures bit-for-bit (`kat_sign_test.zig`).
+//! CONSTANT-TIME CAVEAT: `gaussian.samplerZ` mirrors the reference's
+//! constant-time *structure* but has had no machine-checked side-channel
+//! verification — see gaussian.zig's module doc before any production
+//! signing use.
+//!
+//! **Key generation is implemented and NIST-KAT-verified byte-exactly**
+//! (both parameter sets): NTRUGen (the keygen Gaussian for (f, g) plus
+//! the full acceptance loop) and NTRUSolve (tower-of-number-fields
+//! recursion with 31-bit-limb/RNS big integers and the FP-FFT-guided
+//! Babai reduction) in `ntru.zig`, ported from the reference `keygen.c`;
+//! seed -> pk/sk reproduces the KAT vectors (`keygen_sign_test.zig`).
+//!
+//! Out of scope: the padded/CT signature format (the compressed format,
+//! which the KATs use, is implemented) and side-channel hardening beyond
+//! the reference's own structure (verification remains public-data-only
+//! and needs none).
 //!
 //! Zig std GAP: yes — std.crypto ships ML-DSA and ML-KEM but no
-//! Falcon/FN-DSA. Clean-room from the Falcon Round-3 specification
-//! (public spec); the Round-3 reference implementation was consulted as a
-//! wire-format/behavior design reference and KAT oracle — no source
-//! ported — so it carries a design-reference NOTICE entry.
+//! Falcon/FN-DSA. Verification and codecs are clean-room from the Falcon
+//! Round-3 specification with the reference implementation as
+//! wire-format/behavior design reference and KAT oracle; the signer
+//! (`fpr`/`fft`/`gaussian`/`ffsampling`) and keygen (`ntru`) are ports
+//! of the corresponding MIT-licensed reference-implementation routines
+//! (falcon-sign.info, (c) 2017-2019 Falcon Project / Thomas Pornin) —
+//! NOTICE should credit that origin accordingly.
 
 const std = @import("std");
 
@@ -60,20 +63,21 @@ pub const poly = @import("poly.zig");
 /// Wire encodings (modq / trimmed-i8 / compressed) + hash-to-point.
 pub const codec = @import("codec.zig");
 
-/// Floating-point FFT over the ring (signer-only). STUB — see module doc.
+/// Floating-point FFT over the ring (signer + keygen), byte-exact vs the
+/// reference.
 pub const fft = @import("fft.zig");
-/// Discrete Gaussian sampler (SamplerZ, signer-only). STUB — see module
-/// doc; the side-channel-critical primitive.
+/// Discrete Gaussian sampler (SamplerZ, signer-only); the side-channel-
+/// critical primitive — see its module doc for the constant-time caveat.
 pub const gaussian = @import("gaussian.zig");
-/// NTRU basis generation (NTRUGen/NTRUSolve, keygen-only). STUB.
+/// NTRU basis generation (NTRUGen/NTRUSolve, keygen-only), byte-exact vs
+/// the NIST KATs.
 pub const ntru = @import("ntru.zig");
-/// LDL* tree + fast-Fourier nearest-plane sampling (ffSampling,
-/// signer-only). STUB.
+/// Fast-Fourier nearest-plane sampling (ffSampling, signer-only),
+/// byte-exact vs the NIST KATs.
 pub const ffsampling = @import("ffsampling.zig");
-/// Key generation glue (real; delegates the hard math to `ntru` and
-/// `ffsampling`).
+/// Key generation glue (delegates the hard math to `ntru`).
 pub const keygen = @import("keygen.zig");
-/// Signing glue (real; delegates the hard math to `ffsampling`).
+/// Signing glue (delegates the hard math to `ffsampling`).
 pub const sign = @import("sign.zig");
 
 /// Nonce ("salt") length in every Falcon signature (both parameter sets).
@@ -228,8 +232,8 @@ fn Params(comptime logn_: u5, comptime sig_bound_: u64) type {
             return msg;
         }
 
-        // ---- Keygen + sign: scaffold, delegates the hard math to ntru/
-        // ffsampling/gaussian (STUBS) — see module doc comment. ----
+        // ---- Keygen + sign: delegates the hard math to ntru/
+        // ffsampling/gaussian — see module doc comment. ----
 
         const Keygen = keygen.Keygen(Ring);
         const Signer = sign.Signer(Ring);
@@ -241,9 +245,10 @@ fn Params(comptime logn_: u5, comptime sig_bound_: u64) type {
         pub const KeygenError = error{NotInvertible};
 
         /// Generate a fresh Falcon key pair. `rng` is the entropy
-        /// source (`std.crypto.random` for production, `sign.ShakePrng`
-        /// seeded from a KAT `seed` for deterministic generation).
-        /// STUB, transitively: panics inside `ntru.Ntru(Ring).generate`.
+        /// source: a real CSPRNG for production, or `sign.ShakePrng`
+        /// seeded with the 48 bytes the NIST-KAT DRBG hands
+        /// `crypto_sign_keypair` for byte-exact KAT reproduction (see
+        /// `keygen_sign_test.zig`).
         pub fn generateKeyPair(rng: std.Random) Self.KeygenError!struct {
             signing_key: Self.SigningKey,
             public_key: Self.PublicKey,
@@ -258,8 +263,7 @@ fn Params(comptime logn_: u5, comptime sig_bound_: u64) type {
         /// and every internal sampling decision from `rng`, a real
         /// CSPRNG. Writes the nonce to `nonce_out` and the compressed
         /// signature field to `sig_out` (see `sign.Signer.signWithRng`
-        /// for the exact contract). STUB, transitively: panics inside
-        /// `ffsampling.sampleSignature`.
+        /// for the exact contract).
         pub fn signRandomized(
             sk: *const Self.SigningKey,
             msg: []const u8,
@@ -270,12 +274,13 @@ fn Params(comptime logn_: u5, comptime sig_bound_: u64) type {
             return Self.Signer.signWithRng(&sk.tree, msg, rng, nonce_out, sig_out, Self.sig_bound);
         }
 
-        /// Deterministic signing (KAT reproduction): seeds
-        /// `sign.ShakePrng` from `seed` (the NIST KAT .rsp `seed` field,
-        /// once byte-exact reproduction is possible — see
-        /// `sign.ShakePrng`'s doc comment for the caveats) instead of a
-        /// real CSPRNG. STUB, transitively: panics inside
-        /// `ffsampling.sampleSignature`.
+        /// Deterministic signing: seeds `sign.ShakePrng` from `seed`
+        /// instead of a real CSPRNG, so the same (key, msg, seed)
+        /// always yields the same signature. NOTE: this is NOT the
+        /// NIST-KAT derandomization scheme (the KATs draw the nonce and
+        /// the signer seed as two separate AES-CTR-DRBG calls — see
+        /// `kat_sign_test.zig`'s replay harness); it is this module's
+        /// own deterministic mode.
         pub fn signDeterministic(
             sk: *const Self.SigningKey,
             msg: []const u8,
@@ -319,7 +324,7 @@ pub const PublicKey = P512.PublicKey;
 pub const SecretKey = P512.SecretKey;
 pub const openNistSignedMessage = P512.openNistSignedMessage;
 
-/// A generated Falcon-512 signing key. STUB scaffold — see module doc.
+/// A generated Falcon-512 signing key (NTRU basis + signing state).
 pub const SigningKey = P512.SigningKey;
 pub const KeygenError = P512.KeygenError;
 pub const generateKeyPair = P512.generateKeyPair;
@@ -343,6 +348,13 @@ pub const max_sig_field_length_1024 = 1288;
 pub const PublicKey1024 = P1024.PublicKey;
 pub const SecretKey1024 = P1024.SecretKey;
 pub const openNistSignedMessage1024 = P1024.openNistSignedMessage;
+
+/// A generated Falcon-1024 signing key (NTRU basis + signing state).
+pub const SigningKey1024 = P1024.SigningKey;
+pub const KeygenError1024 = P1024.KeygenError;
+pub const generateKeyPair1024 = P1024.generateKeyPair;
+pub const signRandomized1024 = P1024.signRandomized;
+pub const signDeterministic1024 = P1024.signDeterministic;
 
 test "public API surface: sizes, headers, bound" {
     try std.testing.expectEqual(@as(usize, 897), PublicKey.encoded_length);

@@ -1,16 +1,13 @@
 // SPDX-License-Identifier: MIT
 //! keygen — Falcon/FN-DSA key generation glue. Draws the NTRU secret
-//! basis via `ntru.Ntru(Ring).generate` (STUB — see ntru.zig), derives
-//! the public key h = g*f^-1 mod q by REUSING `poly.Ring.computePublic`
-//! (already implemented and NIST-KAT-verified on the verify side —
-//! nothing about keygen changes that function), and precomputes the
-//! ffSampling trapdoor tree via `ffsampling.buildTree` (STUB — see
-//! ffsampling.zig) that `sign.zig` needs at signing time.
+//! basis via `ntru.Ntru(Ring).generate` (NTRUGen + NTRUSolve — see
+//! ntru.zig), derives the public key h = g*f^-1 mod q by REUSING
+//! `poly.Ring.computePublic` (NIST-KAT-verified on the verify side),
+//! and captures the secret basis via `ffsampling.buildTree` for
+//! `sign.zig` to use at signing time.
 //!
-//! Everything in this file is real, mechanical wiring; none of the hard
-//! math lives here. It compiles and its own tests pass (instantiation,
-//! wire-format round-tripping of the parts that don't need the stubs);
-//! only `generate` itself panics, transitively through `ntru.generate`.
+//! Everything in this file is mechanical wiring; the hard math lives in
+//! ntru.zig (keygen) and ffsampling.zig/gaussian.zig (signing).
 
 const std = @import("std");
 const codec = @import("codec.zig");
@@ -66,17 +63,16 @@ pub fn Keygen(comptime Ring: type) type {
         /// `sign.ShakePrng` seeded from a KAT `seed` for
         /// deterministic/reproducible generation (see `sign.zig`).
         /// Errors only if the generated `f` is non-invertible mod q —
-        /// `ntru.generate`'s own acceptance loop is supposed to rule
-        /// that out before returning, once implemented, so this is a
-        /// belt-and-suspenders check mirroring `root.zig`'s existing
-        /// `SecretKey.publicKey`.
+        /// `ntru.generate`'s own acceptance loop already rules that out
+        /// before returning, so this is a belt-and-suspenders check
+        /// mirroring `root.zig`'s existing `SecretKey.publicKey`.
         pub fn generate(rng: std.Random) error{NotInvertible}!struct {
             signing_key: SigningKey,
             public_key_h: Ring.Poly,
         } {
-            const basis = N.generate(rng); // STUB — panics until ntru.zig is filled in
+            const basis = N.generate(rng); // NTRUGen + NTRUSolve (ntru.zig)
             const h = try Ring.computePublic(&basis.f, &basis.g); // REUSED, already KAT-verified
-            const tree = ffsampling.buildTree(Ring, &basis.f, &basis.g, &basis.big_f, &basis.big_g); // STUB
+            const tree = ffsampling.buildTree(Ring, &basis.f, &basis.g, &basis.big_f, &basis.big_g);
             return .{
                 .signing_key = .{
                     .f = basis.f,

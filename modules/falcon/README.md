@@ -18,19 +18,20 @@ n = 1024). A single degree-generic implementation (`poly.Ring(logn)` /
 `codec.Codec(Ring)`) serves both sets; the Falcon-512 flat API is retained
 unchanged and Falcon-1024 gets `_1024`-suffixed entry points.
 
-**Key generation and signing are a SCAFFOLD, not a working implementation**:
-the API shape (`generateKeyPair`/`signRandomized`/`signDeterministic`, both
-degrees), key/tree types, and a KAT harness (`kat_vectors.zig`'s vectors now
-carry each `seed`) are real and compile; the four genuinely hard pieces —
-NTRUGen/NTRUSolve (keygen's big-integer tower), the floating-point FFT, the
-ffSampling trapdoor recursion, and SamplerZ (the discrete Gaussian sampler
-— side-channel-critical: a subtly wrong sampler still produces signatures
-that *verify* while leaking the private key) — are `@panic("TODO(fable/
-core): ...")` stubs. See `SPEC.md`'s "Keygen + sign scaffold" section for
-the file-by-file breakdown. Also out of scope even once filled in: the
-padded/CT signature format (the compressed format the KATs use is
-implemented) and constant-time hardening beyond `gaussian.samplerZ` itself
-(verification handles public data only and needs none).
+**Key generation and signing are implemented and NIST-KAT-verified
+byte-exactly too** (both parameter sets): NTRUGen/NTRUSolve (keygen's
+Gaussian sampling + acceptance loop, and the tower-of-number-fields
+big-integer solver with FP-FFT-guided Babai reduction, `ntru.zig`), the
+strict-float `fpr` layer + FFT, the dynamic-tree ffSampling trapdoor
+recursion, and SamplerZ (the ChaCha20-fed discrete Gaussian sampler).
+`keygen_sign_test.zig` reproduces seed → pk/sk and the full
+seed → keygen → sign → `sm` pipeline bit-for-bit against the NIST DRBG
+replay. **Constant-time caveat**: `gaussian.samplerZ` mirrors the
+reference's constant-time structure but has had NO machine-checked
+side-channel verification — a subtly leaky sampler still produces
+signatures that *verify*, so audit before production signing (see
+`gaussian.zig`'s module doc). Out of scope: the padded/CT signature format
+(the compressed format the KATs use is implemented).
 
 The KAT oracle is the official **NIST Round-3** `falcon512-KAT.rsp` and
 `falcon1024-KAT.rsp` (FIPS 206 / FN-DSA is still a draft standard; Round-3
@@ -63,13 +64,14 @@ const pk10 = try falcon.PublicKey1024.fromBytes(pk_bytes[0..1793]); // 0x0a head
 try pk10.verify(message, nonce, sig_field); // 0x2a header byte on sig_field
 const msg10 = try falcon.openNistSignedMessage1024(&pk10, sm);
 
-// Keygen + sign: API shape is real, but PANICS today (see the SCAFFOLD
-// note above — the hard math is stubbed).
-const kp = try falcon.generateKeyPair(std.crypto.random);
+// Keygen + sign (see the constant-time caveat above before production
+// signing). `rng` is any std.Random backed by a CSPRNG.
+const kp = try falcon.generateKeyPair(rng);
 var nonce_buf: [falcon.nonce_length]u8 = undefined;
 var sig_buf: [falcon.max_sig_field_length]u8 = undefined;
-const len = try falcon.signRandomized(&kp.signing_key, message, std.crypto.random, &nonce_buf, &sig_buf);
+const len = try falcon.signRandomized(&kp.signing_key, message, rng, &nonce_buf, &sig_buf);
 try kp.public_key.verify(message, &nonce_buf, sig_buf[0..len]);
+// Falcon-1024: falcon.generateKeyPair1024 / signRandomized1024, same shape.
 ```
 
 ## Verify
@@ -79,17 +81,21 @@ zig build test-falcon                          # Debug
 zig build test-falcon -Doptimize=ReleaseFast
 ```
 
-Runs the NIST Round-3 KATs for both Falcon-512 and Falcon-1024 (every
-embedded vector must open + verify, the compressed signature and public key
-must re-encode byte-exactly, sk must reproduce pk) plus tamper-rejection,
-NTT-vs-schoolbook, and codec canonicality tests. `keygen_sign_test.zig`'s
-4 keygen/sign KAT-harness tests currently report SKIPPED (not failed) —
-each stops with `error.SkipZigTest` right before the call that would reach
-a stub; see that file's module doc comment for exactly what they check
-once keygen/sign are implemented.
+Runs the NIST Round-3 KATs for both Falcon-512 and Falcon-1024 across the
+whole scheme: verify-side (every embedded vector must open + verify, the
+compressed signature and public key must re-encode byte-exactly, sk must
+reproduce pk, tamper-rejection, NTT-vs-schoolbook, codec canonicality),
+sign-side (`kat_sign_test.zig`: byte-exact nonce + compressed signature via
+NIST-DRBG replay), and keygen-side (`keygen_sign_test.zig`: byte-exact
+seed → pk/sk, the full seed → keygen → sign → `sm` pipeline, an NTRUSolve-
+only F reproduction from KAT (f, g), and a fresh-key sign → verify round
+trip).
 
-Provenance: clean-room from the Falcon Round-3 specification; the reference
-implementation is a wire-format design reference + KAT oracle only — see
-the `falcon` entry in the repo-root `NOTICE` and SPEC.md. The Falcon-1024
-squared-norm acceptance bound (⌊β²⌋ = 70265242) is sourced from the
-reference `common.c` `l2bound` table — see SPEC.md.
+Provenance: verification + codecs are clean-room from the Falcon Round-3
+specification (the reference implementation was a wire-format design
+reference + KAT oracle for those); the signer and keygen internals
+(`fpr`/`fft`/`gaussian`/`ffsampling`/`ntru`) are ports of the MIT-licensed
+Round-3 reference implementation, required for byte-exact KAT
+reproduction — see the `falcon` entry in the repo-root `NOTICE` and
+SPEC.md. The Falcon-1024 squared-norm acceptance bound (⌊β²⌋ = 70265242) is
+sourced from the reference `common.c` `l2bound` table — see SPEC.md.

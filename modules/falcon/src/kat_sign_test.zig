@@ -4,7 +4,8 @@
 //! signing flow for each embedded vector and asserts the produced nonce +
 //! compressed signature field match the vector's `sm` envelope exactly.
 //!
-//! This isolates the signer from keygen (which stays stubbed): the secret
+//! This isolates the signer from keygen (KAT-tested separately in
+//! keygen_sign_test.zig): the secret
 //! basis (f,g,F) is decoded straight from the vector's `sk`, G is recovered
 //! by the NTRU relation (G = g*F/f mod q, reusing poly.zig's NTT), and the
 //! per-signature randomness is replayed through a faithful port of the NIST
@@ -25,7 +26,9 @@ const v = @import("kat_vectors.zig");
 
 // ---- NIST KAT AES-256-CTR-DRBG (katrng.c), std AES-256 for the ECB core.
 
-const Drbg = struct {
+// pub: keygen_sign_test.zig replays the same NIST DRBG for its
+// keygen-side KATs (visibility only; nothing sign-side changes).
+pub const Drbg = struct {
     key: [32]u8,
     ctr: [16]u8,
 
@@ -63,13 +66,13 @@ const Drbg = struct {
         @memcpy(&self.ctr, tmp[32..48]);
     }
 
-    fn init(seed: *const [48]u8) Drbg {
+    pub fn init(seed: *const [48]u8) Drbg {
         var d: Drbg = .{ .key = [_]u8{0} ** 32, .ctr = [_]u8{0} ** 16 };
         d.update(seed);
         return d;
     }
 
-    fn bytes(self: *Drbg, out: []u8) void {
+    pub fn bytes(self: *Drbg, out: []u8) void {
         var i: usize = 0;
         var remaining = out.len;
         while (remaining > 0) {
@@ -87,7 +90,9 @@ const Drbg = struct {
 
 // ---- A std.Random that replays a fixed byte buffer (nonce ++ signseed).
 
-const FixedRng = struct {
+// pub: shared with keygen_sign_test.zig's full-pipeline KAT (visibility
+// only).
+pub const FixedRng = struct {
     buf: []const u8,
     pos: usize = 0,
 
@@ -97,7 +102,7 @@ const FixedRng = struct {
         self.pos += dst.len;
     }
 
-    fn random(self: *FixedRng) std.Random {
+    pub fn random(self: *FixedRng) std.Random {
         return std.Random.init(self, FixedRng.fill);
     }
 };

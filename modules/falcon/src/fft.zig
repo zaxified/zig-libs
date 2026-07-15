@@ -214,6 +214,88 @@ pub fn polyLdlmvFft(d11: []f64, l10: []f64, g00: []const f64, g01: []const f64, 
     }
 }
 
+// ---- Keygen-side helpers (reference fft.c; used by ntru.zig's NTRUSolve
+// Babai reduction and NTRUGen's Gram-Schmidt norm check). Same flat
+// FFT-domain layout and exact `fpr` op order as everything above. ----
+
+/// a = adj(a) in the FFT domain (negate the imaginary halves).
+pub fn polyAdjFft(a: []f64, logn: u5) void {
+    const n: usize = @as(usize, 1) << logn;
+    var u = n >> 1;
+    while (u < n) : (u += 1) a[u] = fpr.neg(a[u]);
+}
+
+/// d = 1 / (a*adj(a) + b*adj(b)) (auto-adjoint, so only hn real slots).
+pub fn polyInvnorm2Fft(d: []f64, a: []const f64, b: []const f64, logn: u5) void {
+    const n: usize = @as(usize, 1) << logn;
+    const hn = n >> 1;
+    var u: usize = 0;
+    while (u < hn) : (u += 1) {
+        const a_re = a[u];
+        const a_im = a[u + hn];
+        const b_re = b[u];
+        const b_im = b[u + hn];
+        d[u] = fpr.inv(fpr.add(
+            fpr.add(fpr.sqr(a_re), fpr.sqr(a_im)),
+            fpr.add(fpr.sqr(b_re), fpr.sqr(b_im)),
+        ));
+    }
+}
+
+/// d = F*adj(f) + G*adj(g).
+pub fn polyAddMuladjFft(
+    d: []f64,
+    big_f: []const f64,
+    big_g: []const f64,
+    f: []const f64,
+    g: []const f64,
+    logn: u5,
+) void {
+    const n: usize = @as(usize, 1) << logn;
+    const hn = n >> 1;
+    var u: usize = 0;
+    while (u < hn) : (u += 1) {
+        const f_re = big_f[u];
+        const f_im = big_f[u + hn];
+        const g_re = big_g[u];
+        const g_im = big_g[u + hn];
+        const sf_re = f[u];
+        const sf_im = fpr.neg(f[u + hn]);
+        const sg_re = g[u];
+        const sg_im = fpr.neg(g[u + hn]);
+        const a_re = fpr.sub(fpr.mul(f_re, sf_re), fpr.mul(f_im, sf_im));
+        const a_im = fpr.add(fpr.mul(f_re, sf_im), fpr.mul(f_im, sf_re));
+        const b_re = fpr.sub(fpr.mul(g_re, sg_re), fpr.mul(g_im, sg_im));
+        const b_im = fpr.add(fpr.mul(g_re, sg_im), fpr.mul(g_im, sg_re));
+        d[u] = fpr.add(a_re, b_re);
+        d[u + hn] = fpr.add(a_im, b_im);
+    }
+}
+
+/// a *= b where b is auto-adjoint (imaginary halves of b are zero and
+/// only its first hn slots are read).
+pub fn polyMulAutoadjFft(a: []f64, b: []const f64, logn: u5) void {
+    const n: usize = @as(usize, 1) << logn;
+    const hn = n >> 1;
+    var u: usize = 0;
+    while (u < hn) : (u += 1) {
+        a[u] = fpr.mul(a[u], b[u]);
+        a[u + hn] = fpr.mul(a[u + hn], b[u]);
+    }
+}
+
+/// a /= b where b is auto-adjoint (only its first hn slots are read).
+pub fn polyDivAutoadjFft(a: []f64, b: []const f64, logn: u5) void {
+    const n: usize = @as(usize, 1) << logn;
+    const hn = n >> 1;
+    var u: usize = 0;
+    while (u < hn) : (u += 1) {
+        const ib = fpr.inv(b[u]);
+        a[u] = fpr.mul(a[u], ib);
+        a[u + hn] = fpr.mul(a[u + hn], ib);
+    }
+}
+
 pub fn polySplitFft(f0: []f64, f1: []f64, f: []const f64, logn: u5) void {
     const n: usize = @as(usize, 1) << logn;
     const hn = n >> 1;
