@@ -123,3 +123,50 @@ computed pairing outputs via the KAT harness this NOTICE documents (see
    from a third-party repository, even though vector DATA itself is
    almost certainly outside copyright's subject matter for the same
    merger-doctrine reason.
+
+6. **`darkforest-eth/darkforest-v0.3`** (no explicit OSS license file;
+   GitHub reports the repository license as `NOASSERTION`,
+   https://github.com/darkforest-eth/darkforest-v0.3) — Part 6's
+   POSITIVE KAT source: `circuits/move/verification_key.json` /
+   `proof.json` / `public.json` (the "move" circuit's real Groth16
+   proof-of-visibility proof), fetched directly (not hand-transcribed)
+   from commit `1c83685e22e0463d5481c83e21616745b3204c9c` on 2026-07-15
+   and embedded in `groth16.zig`'s tests verbatim (`kat_alpha_g1`/
+   `kat_beta_g2`/`kat_gamma_g2`/`kat_delta_g2`/`kat_ic`/`kat_proof_*`/
+   `kat_public`). Dark Forest is a well-known, widely-cited production
+   zkSNARK dApp (an on-chain "dark forest" strategy game using
+   zero-knowledge proof-of-visibility). These three files are NUMERIC
+   PROOF/VERIFYING-KEY DATA — elliptic-curve point coordinates and field
+   elements, the deterministic output of running the Groth16 protocol
+   over a specific circuit and witness — the same "public numeric
+   conformance data, not copyrightable expression" category item 5's
+   go-ethereum vectors already fall into (merger doctrine,
+   `CONVENTIONS.md` §5); listed here out of the same caution, given the
+   ABSENCE of an explicit license (unlike item 5's LGPL-3.0), not
+   because a Groth16 proof is source code or creative expression. No
+   darkforest-v0.3 SOURCE (circuit `.circom`/application code) was read
+   or ported — only the three already-computed JSON data files were
+   fetched; `groth16.zig`'s `verify`/`msm` implementations were derived
+   directly from the standard Groth16 verification equation (this
+   file's item 4 citations' construction), not from darkforest-v0.3's
+   own (unread) verifier code.
+
+7. **`ethereum/py_ecc`** (MIT license, 2nd use — see item 2) — Part 6's
+   INDEPENDENT CROSS-CHECK: a standalone Python script (venv-installed
+   `py_ecc`, 2026-07-15) parsed item 6's three JSON files and confirmed,
+   using `py_ecc`'s own EC/pairing arithmetic (a THIRD implementation,
+   sharing no code with this module's Zig tower or with snarkjs/circom's
+   prover): every vk/proof point is on-curve, the `vk_x` multi-scalar
+   accumulation is on-curve, the real proof satisfies the single-product
+   pairing-check form with `A` NEGATED (confirming the sign convention
+   `groth16.zig`'s `verify` implements is the one that makes this
+   specific real proof verify TRUE, not assumed from the task brief's
+   suggested form alone), and every tamper case `groth16.zig`'s own
+   tests exercise (an off-curve coordinate, a negated `A`/`C`, a `+1`
+   public input, a swapped `c0`/`c1` `Fp2` reading) fails the equation.
+   See `SPEC.md`'s "Part 6 — KAT provenance" for the full script
+   description and every check performed. `py_ecc`'s SOURCE was not
+   read again for this use (only its already-cited flat-`Fp12`-basis/
+   `pairing(Q,P)`-convention facts, item 2, were relevant); this use is
+   purely as a numeric oracle, run against publicly-known point
+   coordinates, same posture as item 2's Part 4 use.

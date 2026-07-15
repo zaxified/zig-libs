@@ -3,29 +3,35 @@
 BN254 (alt-bn128): the pairing-friendly elliptic curve behind
 Ethereum's EIP-196/197 precompiles (`ecAdd`/`ecMul`/`ecPairing`,
 addresses `0x06`/`0x07`/`0x08`) and Groth16 zk-SNARK verification —
-this module is **Parts 1-5** of a planned multi-part arc: the base
+this module is the **complete 6-part arc**: the base
 field `Fp`, the extension tower `Fp2`/`Fp6`/`Fp12`, the scalar field
-`Fr`, the pairing groups `G1`/`G2`, the optimal-ate pairing itself, and
-the EVM precompile entry points themselves.
+`Fr`, the pairing groups `G1`/`G2`, the optimal-ate pairing itself, the
+EVM precompile entry points themselves, and a Groth16 zk-SNARK verifier.
 
-**Status: Parts 1-5 complete.** Full field-tower arithmetic (`add`/`sub`/
-`neg`/`mul`/`square`/`inv`/`pow`/`sqrt`/Frobenius at every tower level)
-plus `G1`/`G2` Jacobian group arithmetic (`add`/`double`/`negate`/
-constant-time `scalarMul`), on-curve and subgroup-membership checks,
-and EIP-196/197 (de)serialization (Parts 1-3), the optimal-ate
+**Status: all 6 parts complete.** Full field-tower arithmetic (`add`/
+`sub`/`neg`/`mul`/`square`/`inv`/`pow`/`sqrt`/Frobenius at every tower
+level) plus `G1`/`G2` Jacobian group arithmetic (`add`/`double`/
+`negate`/constant-time `scalarMul`), on-curve and subgroup-membership
+checks, and EIP-196/197 (de)serialization (Parts 1-3), the optimal-ate
 pairing itself (Part 4): `Gt`/`PairingPair`, the `6x+2` loop parameter,
 the `millerLoop` core (its `6x+2` walk with the BN-specific Frobenius
 tail) and `finalExponentiation` core (curve-generic easy part + the
 BN-specific exact-`d` hard-part addition chain), and `pairing`/
 `multiMillerLoop`/`pairingCheck` — all real and tested, byte-exact
-against `ethereum/py_ecc`; and now the EVM precompile entry points
+against `ethereum/py_ecc`; the EVM precompile entry points
 themselves (Part 5): `ecAdd`/`ecMul`/`ecPairing` (`0x06`/`0x07`/`0x08`)
 — pure ABI composition over Parts 1-4, byte-exact against the OFFICIAL
 `ethereum/go-ethereum` `core/vm/testdata/precompiles/*.json`
-conformance vectors. Every field/curve constant independently
-verified (see `SPEC.md`), byte-exact KAT coverage against
-independently-computed AND (Part 5) independently-SOURCED reference
-vectors, 143/143 tests pass in Debug AND ReleaseFast.
+conformance vectors; and now a Groth16 zk-SNARK proof VERIFIER (Part 6,
+`groth16.zig`): `VerifyingKey`/`Proof`/`verify` — pure composition over
+Parts 1-4 (a `G1` multi-scalar accumulation plus one `pairingCheck`),
+verified against a REAL, independently-sourced snarkjs-produced
+Groth16/BN254 proof (darkforest-v0.3's "move" circuit) — the real proof
+verifies TRUE, six independent tamper cases each verify FALSE. Every
+field/curve constant independently verified (see `SPEC.md`), byte-exact
+KAT coverage against independently-computed AND (Parts 5-6)
+independently-SOURCED reference vectors, 154/154 tests pass in Debug AND
+ReleaseFast.
 
 This module was built by careful, verified ADAPTATION of the sibling
 [`bls12_381`](../bls12_381) module: same `std.crypto.ff`-backed
@@ -36,9 +42,9 @@ and the same pairing STRUCTURE (`bls12_381/src/pairing.zig`),
 with BN254's own modulus/non-residue/generator constants — and, for
 Part 4, its own `6x+2` loop parameter and BN-specific final-exponentiation
 hard part — substituted in and independently re-verified from scratch —
-see `SPEC.md`. Part 5 (`precompiles.zig`) is pure composition on top —
-no new field/curve/pairing algorithm, see `SPEC.md`'s "Part 5" section
-for the tier accounting.
+see `SPEC.md`. Parts 5-6 (`precompiles.zig`, `groth16.zig`) are pure
+composition on top — no new field/curve/pairing algorithm, see
+`SPEC.md`'s "Part 5"/"Part 6" sections for the tier accounting.
 
 ## The multi-part arc
 
@@ -48,7 +54,7 @@ for the tier accounting.
 | 3 | Groups `G1`/`G2` | **done** |
 | 4 | The pairing itself: Miller loop + final exponentiation | **done** |
 | 5 | EIP-196/197 precompile semantics (`ecAdd`/`ecMul`/`ecPairing`) | **done** |
-| 6 | Groth16 zk-SNARK verifier | planned |
+| 6 | Groth16 zk-SNARK verifier | **done** |
 
 ## Import
 
@@ -94,6 +100,15 @@ try std.testing.expect(!e.eql(bn254.Fp12.one)); // non-degenerate
 const sum_bytes = try bn254.ecAdd(add_calldata);              // 0x06, 64 bytes out
 const prod_bytes = try bn254.ecMul(mul_calldata);              // 0x07, 64 bytes out
 const ok = try bn254.ecPairing(allocator, pairing_calldata);   // 0x08, 32-byte ABI bool
+
+// Groth16 verifier (Part 6 — e.g. from a snarkjs verification_key.json/
+// proof.json; public inputs are Fr, so an out-of-field value is rejected
+// at Fr.fromBytes, before it could ever reach verify):
+const vk: bn254.Groth16VerifyingKey = .{
+    .alpha_g1 = alpha, .beta_g2 = beta, .gamma_g2 = gamma, .delta_g2 = delta, .ic = &ic,
+};
+const proof: bn254.Groth16Proof = .{ .a = a, .b = b, .c = c };
+const valid = try bn254.groth16Verify(vk, proof, public_inputs); // bool
 ```
 
 Deliberately absent vs. `bls12_381`: `isLexicographicallyLargest` (a
@@ -119,13 +134,14 @@ comments.
 | `gate.zig` | Part 4 test gate — `pairing_core_implemented` (now `true`, the cores landed); documents the scaffold-era split between core-independent and core-driven tests |
 | `pairing.zig` | Part 4: `Gt`/`PairingPair`, the pairing (`pairing`/`multiMillerLoop`/`pairingCheck`), and the `millerLoop` (`6x+2` walk + BN Frobenius tail) / `finalExponentiation` (easy + BN hard-part) cores |
 | `precompiles.zig` | Part 5: EVM precompile entry points `ecAdd`/`ecMul`/`ecPairing` (EIP-196/197 calldata padding/truncation, point decode, group op, re-encode) — pure composition over Parts 1-4 |
+| `groth16.zig` | Part 6: Groth16 zk-SNARK verifier — `VerifyingKey`/`Proof`/`verify` (`G1` multi-scalar accumulation + one `pairingCheck`) — pure composition over Parts 1-4 |
 | `root.zig` | Module entry: `meta`, re-exports, dark-tests aggregator |
 
 ## Verify
 
 ```
-zig build test-bn254                        # Debug — 143/143 pass
-zig build test-bn254 -Doptimize=ReleaseFast # ReleaseFast — 143/143 pass
+zig build test-bn254                        # Debug — 154/154 pass
+zig build test-bn254 -Doptimize=ReleaseFast # ReleaseFast — 154/154 pass
 zig fmt --check modules/bn254/
 ```
 
@@ -140,4 +156,9 @@ vectors, not copyrightable expression under merger doctrine — the same
 category Parts 1-4's `py_ecc`-sourced constants already fall into),
 listed out of caution since the vectors are literal fetched file
 contents rather than independently-recomputed values; no go-ethereum
-SOURCE was read or ported.
+SOURCE was read or ported. Part 6 extends `NOTICE` with a 6th entry for
+`darkforest-eth/darkforest-v0.3`'s "move"-circuit Groth16 proof (the
+positive KAT vector) — same "public numeric conformance data" category,
+plus `py_ecc` again (2nd use) as an independent cross-check of the
+verification equation's sign convention; see `SPEC.md`'s "Part 6 — KAT
+provenance".

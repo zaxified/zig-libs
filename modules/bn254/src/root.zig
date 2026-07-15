@@ -2,15 +2,16 @@
 //! bn254 — BN254 (alt-bn128), the pairing-friendly elliptic curve
 //! behind Ethereum's EIP-196/197 precompiles (`ecAdd`/`ecMul`/
 //! `ecPairing`, addresses `0x06`/`0x07`/`0x08`) and Groth16 zk-SNARK
-//! verification. **This module is Parts 1-5 of a multi-part arc**: the
+//! verification. **This module is the COMPLETE Parts 1-6 arc**: the
 //! base field `Fp`, its extension tower `Fp2`/`Fp6`/`Fp12`, the scalar
 //! field `Fr` (Parts 1-2), the pairing groups `G1`/`G2` (Part 3), the
-//! optimal-ate pairing itself (Part 4, `pairing.zig`), and now the
-//! EIP-196/197 EVM precompile entry points themselves (Part 5,
-//! `precompiles.zig`) — the foundation for a future Groth16 verifier
-//! (Part 6; see `README.md` for the full planned arc).
+//! optimal-ate pairing itself (Part 4, `pairing.zig`), the EIP-196/197
+//! EVM precompile entry points (Part 5, `precompiles.zig`), and the
+//! Groth16 zk-SNARK verifier (Part 6, `groth16.zig`) — pure composition
+//! over Parts 1-5's pairing/group arithmetic (see `README.md` for the
+//! full arc).
 //!
-//! **Status: Parts 1-5 complete.** Every field-tower operation, `G1`/`G2`
+//! **Status: Parts 1-6 complete.** Every field-tower operation, `G1`/`G2`
 //! Jacobian group arithmetic, scalar multiplication, on-curve/subgroup-
 //! membership checks, and EIP-196/197 (de)serialization (Parts 1-3), the
 //! optimal-ate pairing itself (Part 4, `pairing.zig`) — `Gt`/
@@ -55,6 +56,7 @@ pub const g2 = @import("g2.zig");
 pub const gate = @import("gate.zig");
 pub const pairing = @import("pairing.zig");
 pub const precompiles = @import("precompiles.zig");
+pub const groth16 = @import("groth16.zig");
 
 pub const Fp = fp.Fp;
 pub const Fp2 = fp2.Fp2;
@@ -72,6 +74,13 @@ pub const ecMul = precompiles.ecMul;
 pub const ecPairing = precompiles.ecPairing;
 pub const ecPairingCheck = precompiles.ecPairingCheck;
 pub const PrecompileError = precompiles.PrecompileError;
+
+// Part 6 — Groth16 zkSNARK verifier, re-exported at the top level (see
+// groth16.zig's module doc comment):
+pub const Groth16VerifyingKey = groth16.VerifyingKey;
+pub const Groth16Proof = groth16.Proof;
+pub const groth16Verify = groth16.verify;
+pub const Groth16Error = groth16.Groth16Error;
 
 pub const meta = .{
     .platform = .any,
@@ -97,6 +106,7 @@ test {
     _ = gate;
     _ = pairing;
     _ = precompiles;
+    _ = groth16;
 }
 
 test "meta.model_after names BN254/alt-bn128" {
