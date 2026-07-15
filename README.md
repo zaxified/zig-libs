@@ -11,7 +11,7 @@ cross-project-reusable capability — a production-grade implementation of a pro
 or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
 authors' other projects depend on it, not the reverse.
 
-**Status:** 115 modules · 3407 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 122 modules · 3540 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ## Using a module
@@ -115,6 +115,13 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `sntp` | SNTP client (RFC 4330) — NTP packet codec + UDP query, clock offset / round-trip delay | any | — |
 | `syslog` | RFC 5424 syslog formatter + emitter, RFC 3164 legacy encoder, RFC 6587 TCP octet framing | any | — |
 | `ssh` | SSH-2.0 (RFC 4253) **client + server** transport — version exchange, KEXINIT, curve25519-sha256 (RFC 8731) + diffie-hellman-group + ML-KEM-768 hybrid KEX, Binary Packet Protocol, aes-gcm/chacha20-poly1305; live-validated against OpenSSH. userauth (RFC 4252) + channels (RFC 4254) reserved (→ ssh-exec) | any | rsa |
+| `ebpf` | eBPF program generation over `std.os.linux.bpf` — verifier-passing bytecode builders (kprobe counter / XDP bounds-checked filter / ring-buffer emitter, clang-cross-checked goldens); syscall attach + ringbuf consumer scaffolded. Real-kernel verifier acceptance unverified in unprivileged CI | **linux** | netlink |
+| `netsim` | Deterministic seeded discrete-event network simulator (VOPR-style: nodes/links/latency/loss/partition/clock-skew, failure-schedule fuzzer, byte-exact replay, ddmin counterexample minimizer) — the model-checking harness for fabric algorithms + fleet-sim | any | — |
+| `spf-ect` | Deterministic symmetric shortest-path (Dijkstra) with a reversal-invariant ECT tie-break (`path(A→B) == reverse(path(B→A))`, RFC 6329 idea generalized) + maximally-disjoint second tree (PRP mode). Pure graph algorithm | any | — |
+| `loopfree-reconv` | Loop-free reconvergence transitions — two-class ordered-FIB schedule (provably no transient forwarding loop, TTL backstop), netsim-verified across fuzzed reconvergence schedules incl. overlapping transitions | any | netsim, spf-ect |
+| `df-elect` | Partition-correct Designated-Forwarder election (static link-state total order, forced by a duplicate-freedom argument — RFC 7432 §8.5 analog) + split-horizon; bounded-badness model-checked in netsim under partition/heal fuzzing | any | netsim |
+| `liveness-hyst` | BFD-like link-liveness estimator with EWMA hysteresis — echo-probe timing + jitter/loss stats, Babel-style metric smoothing as an input filter: fast detection without flap-driven oscillation | any | netsim, latency-stats |
+| `ethfrag` | Hardened inner-frame fragmentation/reassembly codec — RFC 5722 whole-datagram overlap rejection, bounded per-datagram + concurrent-datagram memory, caller-clocked timeout, fuzz-tested never-panic | any | — |
 
 ### Data & storage
 
