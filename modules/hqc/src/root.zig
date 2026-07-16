@@ -42,6 +42,23 @@
 //! additive-FFT root-finding for RS, Hadamard-transform maximum-
 //! likelihood decoding for duplicated RM) — see SPEC.md's "Arc plan".
 //!
+//! **Part 2 (this update) adds the concatenated Reed-Muller/Reed-Solomon
+//! codec** (spec §3.4) — `gf256` (the GF(2^8) field), `reedsolomon` (the
+//! outer [n1,k,delta] code), `reedmuller` (the inner duplicated RM(1,7)
+//! code), and `code` (their concatenation: `encode`/`decode`). Every
+//! ENCODE path is real and byte-exact-KAT'd against the reference; both
+//! DECODE cores are now real implementations too (Fable pass):
+//! `reedsolomon.RS(p,g).decode` (syndromes -> constant-time
+//! Berlekamp-Massey -> Gao-Mateer additive-FFT root-finding -> Forney)
+//! and `reedmuller.RM(p).decodeSymbol` (expand-and-sum -> fast Hadamard
+//! transform -> find_peaks), exact ports of the v5.0.0 reference — see
+//! `gate.zig` (`decoder_core_implemented = true`) and those functions'
+//! doc comments. **This decoder pair is the genuinely Fable-hard core of
+//! the whole HQC arc** (see SPEC.md's "Arc plan"), pinned by the
+//! decode-correctness tests in `code_kat_test.zig` (zero-error round-trip,
+//! at-capacity correction, exhaustive RM decode — across all three
+//! parameter sets, including hqc-192/256's PARAM_FFT=5 radixBig path).
+//!
 //! Provenance: `NOTICE` for the reference-implementation design
 //! reference; SPEC.md for the exact spec version + KAT source + what's
 //! pinned vs. self-tested.
@@ -60,6 +77,17 @@ pub const params = @import("params.zig");
 pub const gf2x = @import("gf2x.zig");
 /// SHAKE256 PRNG/XOF/hash layer + fixed-weight vector samplers.
 pub const prng = @import("prng.zig");
+/// GF(2^8), the field Part 2's Reed-Solomon layer operates over.
+pub const gf256 = @import("gf256.zig");
+/// The outer [n1,k,delta] Reed-Solomon code (encode + decode both real).
+pub const reedsolomon = @import("reedsolomon.zig");
+/// The inner duplicated RM(1,7) code (encode + decode both real).
+pub const reedmuller = @import("reedmuller.zig");
+/// The concatenated code C = RM ∘ RS (encode + decode both real; decode
+/// composes the two real decoders above).
+pub const code = @import("code.zig");
+/// The Part-2 decoder-core gate (now `true`) — see gate.zig.
+pub const gate = @import("gate.zig");
 
 test {
     // Dark-tests rule (CONVENTIONS.md §6.3): every submodule's tests must
@@ -68,4 +96,10 @@ test {
     _ = gf2x;
     _ = prng;
     _ = @import("kat_test.zig");
+    _ = gf256;
+    _ = reedsolomon;
+    _ = reedmuller;
+    _ = code;
+    _ = gate;
+    _ = @import("code_kat_test.zig");
 }

@@ -26,20 +26,56 @@ exact algorithmic behavior the spec's prose leaves underspecified:
   (`prng.zig`'s `sampleFixedWeightRejection`/`sampleFixedWeightBiased`)
   — reference: `src/ref/vector.c`'s
   `vect_generate_random_support{1,2}`/`vect_write_support_to_vector`.
+- (Part 2) The GF(2^8) primitive polynomial and `exp`/`log` tables
+  (`gf256.zig`) — reference: `src/ref/gf.c`/`gf.h`.
+- (Part 2) The Reed-Solomon generator polynomial coefficients per
+  parameter set and the systematic LFSR encode structure
+  (`reedsolomon.zig`) — reference: `src/ref/hqc-{1,3,5}/parameters.h`'s
+  `RS_POLY_COEFS` and `src/ref/reed_solomon.c`'s `reed_solomon_encode`.
+  The decode algorithm implemented in `RS.decode` (constant-time
+  Berlekamp-Massey, Gao-Mateer additive-FFT root-finding, Forney) is
+  likewise behavior-referenced from `reed_solomon.c`'s
+  `reed_solomon_decode` and `src/common/fft.c` (note: the additive-FFT
+  root-finder lives under `src/common/`, not `src/ref/`, unlike the rest
+  of the reference-implementation variant this module otherwise follows).
+- (Part 2) The RM(1,7) generator-matrix encode structure and duplication
+  (`reedmuller.zig`) — reference: `src/ref/reed_muller.c`'s `encode` and
+  `reed_muller_encode`, `src/ref/data_structures.h`'s `rm_codeword_t`.
+  The decode algorithm implemented in `RM.decodeSymbol` (expand-and-sum,
+  fast Hadamard transform, find_peaks) is likewise behavior-referenced
+  from `reed_muller.c`'s `expand_and_sum`/`hadamard`/`find_peaks`/
+  `reed_muller_decode`.
+- (Part 2) The RS-then-RM encode / RM-then-RS decode concatenation order
+  (`code.zig`) — reference: `src/common/code.c`'s `code_encode`/
+  `code_decode`.
 
-Test-vector oracle (also design-reference, not ported source): the same
-tag's `kats/ref/hqc-1/intermediates_values` file — a byte-exact,
-independently-verified fixture embedded in `src/kat_vectors.zig` (fetched
-via `curl` directly from gitlab.com and cross-checked in Python's
-`hashlib` before transcription, specifically to avoid hex-transcription
-risk from any summarizing intermediary). See SPEC.md's Verification
-section for exactly which primitives are numeric-KAT-pinned against this
-fixture vs. transcribed-from-source-only.
+Test-vector oracles (also design-reference, not ported source):
+- Part 1: the same tag's `kats/ref/hqc-1/intermediates_values` file — a
+  byte-exact, independently-verified fixture embedded in
+  `src/kat_vectors.zig` (fetched via `curl` directly from gitlab.com and
+  cross-checked in Python's `hashlib` before transcription, specifically
+  to avoid hex-transcription risk from any summarizing intermediary).
+- Part 2: no equivalent official fixture exists for the RS/RM/code layer
+  in isolation in this tag (checked). Instead, the reference's own
+  UNMODIFIED encode-side C source (`gf.c`, `reed_solomon.c`,
+  `reed_muller.c`, `code.c`, `fft.c`, `crypto_memset.c`) was compiled
+  locally with `gcc -O0` (one build per parameter set's own
+  `parameters.h`, fetched via the GitLab raw-file and repository-tree
+  API endpoints, not through any summarizing tool) and run against fixed
+  test messages; the resulting stdout was mechanically converted to Zig
+  array literals by a small Python script and embedded in
+  `src/kat_vectors_code.zig`. No hex value in that file was hand-
+  transcribed or LLM-summarized from the reference.
+
+See SPEC.md's Verification section for exactly which primitives are
+numeric-KAT-pinned against these fixtures vs. transcribed-from-source-only.
 
 No other third-party source was ported or consulted. Uses only the Zig
 standard library (`std.crypto.hash.sha3`: SHAKE256, SHA3-256, SHA3-512).
 
-This is Part 1 of a multi-part arc (ring + PRNG foundation only — see
-SPEC.md's "Arc plan"); Parts 2 (Reed-Muller/Reed-Solomon decoder) and 3
-(PKE/KEM composition, byte-exact KAT) will consult the same reference tag
-and should extend this file rather than duplicate its header.
+This is Parts 1+2 of a multi-part arc (ring + PRNG foundation, plus the
+complete RS/RM concatenated codec — both ENCODE and the two DECODE cores,
+the latter implemented as exact ports of the reference's
+`reed_solomon_decode`/`reed_muller_decode`/`fft.c`, see SPEC.md's "Arc
+plan"); Part 3 (PKE/KEM composition, byte-exact KAT) will consult the same
+reference tag and should extend this file rather than duplicate its header.

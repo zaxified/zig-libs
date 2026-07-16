@@ -1,7 +1,10 @@
 # hqc — SPEC
 
-Part 1 (ring + PRNG foundation) of a multi-part HQC arc. See
-[README.md](README.md) for purpose and API.
+A multi-part HQC arc. Part 1 (ring + PRNG foundation) is done. Part 2
+(concatenated Reed-Muller/Reed-Solomon codec) is complete: encode is
+byte-exact-KAT'd and both decoders are implemented (exact ports of the
+v5.0.0 reference) with decode-correctness tests (see "Part 2" and "Arc
+plan" below). See [README.md](README.md) for purpose and API.
 
 ## Spec version + why this one
 
@@ -165,6 +168,12 @@ Part 1 (ring + PRNG foundation) of a multi-part HQC arc. See
 | `gf2x.mul`/`add`/`weight`/codecs | Algebraic self-test only | No official gf2x-level KAT is published (the reference ships no isolated multiply vectors — checked `tests/unit/test_vector.c`, it's property-based, no fixed multiply I/O); pinned instead via hand-verifiable monomial-wraparound cases (`X^i · X^j = X^{(i+j) mod n}`, including the mod-reduction wraparound) plus commutativity/distributivity/identity-element/weight-bound checks |
 | `hashH`, `hashJ` | Source-matched only | Transcribed from `symmetric.c`; not independently numeric-pinned (see Limits above) |
 | `sampleFixedWeightBiased` | Source-matched + property-tested | Transcribed from `vector.c`'s `vect_generate_random_support2`; self-tested for exact weight / no duplicates / in-range, not numeric-KAT-pinned |
+| `gf256.exp`/`log` tables | Numeric-KAT-pinned (self-derived) | `gf256.zig`: `generateTables` independently re-derives both tables from `poly` via the reference's own `gf_generate` recurrence; matches the transcribed `gf.h` tables byte-exact |
+| `gf256.mul`/`square`/`inverse` | Algebraic + provably-equivalent | Field-axiom tests (associativity, distributivity, multiplicative inverse) plus the argument that GF(2^8) multiplication is representation-unique (see "Part 2" section below) — not a different-algorithm-vs-reference numeric pin, since this module doesn't port the reference's carryless-multiply algorithm at all |
+| `reedsolomon.RS(p,g).encode` | Numeric-KAT-pinned | `code_kat_test.zig`: byte-exact vs. the reference's `reed_solomon_encode` for 4 message patterns × 3 parameter sets (`kat_vectors_code.zig`) |
+| `reedmuller.RM(p).encodeBlock`/`encodeSymbol` | Numeric-KAT-pinned | `code_kat_test.zig`: byte-exact vs. the reference's `encode`+duplication for 8 byte values × 3 parameter sets |
+| `code.Code(p,g).encode` | Numeric-KAT-pinned (hqc-128 full; hqc-192/256 zero-message only) | `code_kat_test.zig`: byte-exact vs. the reference's `code_encode`; full-codeword vectors for 3 message patterns on hqc-128, zero-message only on hqc-192/256 (see `kat_vectors_code.zig`'s coverage note) |
+| `reedsolomon.RS(p,g).decode`, `reedmuller.RM(p).decodeSymbol` | Decode-correctness tested (all 3 sets) | `code_kat_test.zig` (gated by `gate.decoder_core_implemented = true`): zero-error round-trip `decode(encode(m)) == m`, at-capacity (exactly δ symbol errors) correction at both the concatenated-code and bare-RS layers, and exhaustive 256-value RM `decodeSymbol` — covering hqc-128 (PARAM_FFT=4 unrolled radix) and hqc-192/256 (PARAM_FFT=5 `radixBig`). Exact ports of the reference; not a fresh numeric intermediate-value pin (no such fixture ships for this layer) |
 
 **How the numeric pins were obtained** (for future auditing): the
 reference's `kats/ref/hqc-1/intermediates_values` file (shipped in the
@@ -186,30 +195,116 @@ seed started the chain.
 shared-secret reproduction, since that requires the full PKE (`gf2x.mul`
 composed with the Part-2 decoder) — deferred to Part 3.
 
+## Part 2 (RS/RM concatenated codec) — status
+
+Part 2 adds `gf256.zig` (GF(2^8)), `reedsolomon.zig` (the outer [n1,k,delta]
+code), `reedmuller.zig` (the inner duplicated RM(1,7) code), and `code.zig`
+(their concatenation). **Encode is fully real and byte-exact-KAT'd; both
+decode cores are now real implementations too** (Fable pass, exact ports of
+the v5.0.0 reference), with `gate.decoder_core_implemented = true`
+(`gate.zig`) — see `reedsolomon.zig`'s `RS(p,g).decode` and
+`reedmuller.zig`'s `RM(p).decodeSymbol` doc comments for the full
+step-by-step algorithm each satisfies (syndromes → constant-time
+Berlekamp-Massey → Gao-Mateer additive-FFT root-finding → Forney, for RS;
+expand-and-sum → fast Hadamard transform → find_peaks, for RM). The decode
+cores are pinned by `code_kat_test.zig`'s correctness tests: zero-error
+round-trip and at-capacity (exactly δ symbol errors) correction at both the
+concatenated-code and bare-RS layers, plus exhaustive RM `decodeSymbol`,
+across all three parameter sets — including hqc-192/256's PARAM_FFT=5
+`radixBig` additive-FFT path.
+
+**Reference source consulted**: same tag as Part 1, `v5.0.0`
+(`gitlab.com/pqc-hqc/hqc`) — specifically `src/ref/gf.c`/`gf.h`,
+`src/ref/reed_solomon.c`/`reed_solomon.h`, `src/ref/reed_muller.c`,
+`src/common/reed_muller.h`, `src/common/fft.c`/`fft.h` (the additive-FFT
+root-finder — note this file lives under `src/common/`, not `src/ref/`,
+unlike its caller `reed_solomon.c`), `src/common/code.c`/`code.h`, and
+`src/ref/data_structures.h` (`rm_codeword_t`). Fetched via the GitLab
+raw-file endpoint and the repository-tree API (`per_page`/`recursive`),
+not through any summarizing/paraphrasing tool, same care as Part 1's
+`intermediates_values` fetch.
+
+**Corrects an earlier (pre-fetch) note**: an earlier draft of this
+document's "Arc plan" claimed the RS/RM composition needed "shortened-RS
+index offsets (RS-S1/S2/S3 subtract 209/199/165 from the standard RS-1/2/3
+tables)". Having now actually fetched and read the v5.0.0 reference
+source, this does not match what's there — v5.0.0's `alpha_ij_pow` syndrome
+tables and additive-FFT root-finder have no such offset constants; that
+note appears to describe an older/different HQC draft and should be
+treated as superseded by `reedsolomon.zig`'s `decode` doc comment (which
+documents the six real decode steps as read directly from this tag's
+source), not as additional truth to reconcile.
+
+**KAT strategy for Part 2's real (encode) code**: no `.rsp`-style official
+fixture covers the RS/RM/code layer in isolation (checked: this tag's
+`kats/ref/hqc-*/intermediates_values` files only cover the PKE/KEM layer's
+PRNG-derived values). Byte-exact vectors were instead obtained by
+compiling and running the reference's own unmodified encode-side C files
+locally (`gf.c`+`reed_solomon.c`+`reed_muller.c`+`code.c`+`fft.c`+
+`crypto_memset.c`, `gcc -O0`, one build per parameter set's own
+`parameters.h`) and transcribing stdout mechanically via a small Python
+script (no hand transcription, no LLM-summarized hex) — see
+`kat_vectors_code.zig`'s module doc for the full provenance and exactly
+which vectors are pinned at full depth (hqc-128) vs. lighter depth
+(hqc-192/256).
+
+**GF(2^8) note**: this module's `mul` uses a discrete-log table lookup,
+NOT the reference's carryless-multiply-then-reduce (`gf_carryless_mul` +
+`gf_reduce`, a `pclmulqdq`-emulation for the reference's target hardware).
+Both compute the same field product (GF(2^8) multiplication is uniquely
+determined by the primitive polynomial + generator, not by the algorithm)
+— confirmed in `gf256.zig`'s tests by independently re-deriving the
+`exp`/`log` tables from the primitive polynomial via the reference's own
+`gf_generate` recurrence and checking byte-exact agreement with the
+transcribed tables, plus the standard field-axiom tests. This is the same
+tradeoff Part 1's `gf2x.zig` made for its ring `mul` (schoolbook vs.
+Toom-Cook/Karatsuba) — see that section above.
+
+**Constant-time posture of the decoders**: the two decode cores
+(`RS(p,g).decode`, `RM(p).decodeSymbol`) add **no new secret-dependent
+branches or memory indices** — they port the reference's constant-time
+structure directly: masked branch-free selects in Berlekamp-Massey
+(`compute_elp`), a data-independent additive-FFT access pattern,
+constant-access-pattern Forney bookkeeping (`compute_error_values`), and a
+branch-free `find_peaks`. The **one** pre-existing, module-wide caveat is
+that `gf256.mul`/`inverse` do their work through the `exp`/`log` tables,
+i.e. **secret-indexed table loads** (a cache-timing side channel on the
+field elements the decoder handles), whereas the reference's
+`gf_carryless_mul`+`gf_reduce` is a table-free carryless multiply. This is
+the Part-1 field-arithmetic tradeoff noted above, inherited unchanged by
+Part 2; a follow-up could switch `gf256` to a constant-time carryless
+multiply if machine-checked side-channel resistance is required (flagged as
+follow-up, not blocking Part 2/3 correctness). As with Part 1, no
+dudect/ctgrind machine verification has been run — the structural match to
+the reference is by construction, not instrument-verified.
+
 ## Arc plan
 
-- **Part 1 (this module)** — ring + PRNG foundation. Tier: Sonnet
-  (mechanical constant-structure bit arithmetic + exact PRNG-construction
-  matching). **No part of Part 1 is genuinely Fable-hard** — the closest
-  candidate, `gf2x.mul`'s constant-time structure, is a known, mechanical
+- **Part 1** — ring + PRNG foundation. Tier: Sonnet (mechanical
+  constant-structure bit arithmetic + exact PRNG-construction matching).
+  **No part of Part 1 is genuinely Fable-hard** — the closest candidate,
+  `gf2x.mul`'s constant-time structure, is a known, mechanical
   transformation (branch → mask) of an already-fully-specified reference
   algorithm, not an open algorithmic problem.
-- **Part 2 — concatenated Reed-Muller/Reed-Solomon codec** (spec §3.4):
-  the [n1n2, k] code C, built by concatenating a dimension-32 Reed-Solomon
-  code over F256 (external) with a duplicated first-order Reed-Muller
-  code RM(1,7) = [128,8,64] (internal, replicated 3× for hqc-128 or 5×
-  for hqc-192/256 — `params.rm_multiplicity`). **This is the genuinely
-  Fable-hard core of the HQC arc**: RM decoding via the fast Hadamard
-  transform (maximum-likelihood over the duplicated code, "Green
-  machine" per spec §3.4.3) composed with RS decoding via Berlekamp's
-  algorithm for the error-locator polynomial plus an *additive* FFT
-  (spec cites [17]) for root-finding over GF(2⁸) — additive FFTs are a
-  meaningfully harder primitive than the multiplicative NTTs this repo
-  already has (falcon, bls12_381), and getting the RS/RM composition's
-  error-position bookkeeping exactly right (shortened-RS index offsets:
-  RS-S1/S2/S3 subtract 209/199/165 from the standard RS-1/2/3 tables) is
-  exactly the kind of fiddly, easy-to-get-subtly-wrong composition this
-  repo reserves for Fable. Tier: **Fable**.
+- **Part 2 (this module) — concatenated Reed-Muller/Reed-Solomon codec**
+  (spec §3.4): the [n1n2, k] code C, built by concatenating an
+  [n1,k,delta] Reed-Solomon code over GF(2^8) (outer) with a duplicated
+  first-order Reed-Muller code RM(1,7) = [128,8,64] (inner, replicated 3×
+  for hqc-128 or 5× for hqc-192/256 — `params.rm_multiplicity`). Encode
+  (both halves + the concatenation) is Sonnet-tier and DONE. **The two
+  decoders are the genuinely Fable-hard core of the HQC arc and are now
+  implemented** (Fable pass): RM decoding via the fast Hadamard transform
+  (maximum-likelihood over the duplicated code, "Green machine" per spec
+  §3.4.3) and RS decoding via a constant-time Berlekamp-Massey
+  error-locator polynomial plus an *additive* FFT (Gao-Mateer, with
+  Bernstein/Chou/Schwabe's radix optimizations, including the `radix_big`
+  recursion for hqc-192/256's PARAM_FFT=5) for root-finding over GF(2⁸) —
+  additive FFTs are a meaningfully harder primitive than the
+  multiplicative NTTs this repo already has (falcon, bls12_381). Both are
+  exact ports of the v5.0.0 reference (`reedsolomon.zig`/`reedmuller.zig`),
+  with `gate.decoder_core_implemented = true` and decode-correctness KATs
+  driving them across all three parameter sets. Tier: **Fable** (decode
+  only; encode already shipped as Sonnet work, see "Part 2 status" above).
 - **Part 3 — HQC-PKE + HQC-KEM, byte-exact vs NIST KAT**: compose Part 1
   (ring `mul`, samplers) with Part 2 (`C.Encode`/`C.Decode`) into
   `HQC-PKE.{Keygen,Encrypt,Decrypt}` and the salted-FO-transform
