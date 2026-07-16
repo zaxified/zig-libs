@@ -1,0 +1,70 @@
+bulletproofs — provenance note
+===============================
+
+Kept as a module-local NOTICE (same placement as the sibling `frost`/
+`voprf`/`adaptor`/`bn254` modules — self-contained crypto modules not
+folded into the root `NOTICE`).
+
+Provenance
+----------
+
+bulletproofs — the protocol design follows Bünz, Bootle, Boneh, Poelstra,
+Wuille, Maxwell, "Bulletproofs: Short Proofs for Confidential
+Transactions and More", IEEE S&P 2018 (eprint.iacr.org/2017/1066), §3
+(the Inner-Product Argument, `ipa.zig`) and §4.1/§4.2 (the single-value
+range proof, `rangeproof.zig`). This is a public academic paper; the
+paper's TEXT (the protocol description/equations being followed) is not
+itself a copyrightable implementation, and no source code accompanying
+the paper was consulted or ported — see CONVENTIONS.md §5's merger-
+doctrine note (the same posture this repo's other spec-derived modules,
+e.g. `frost`/`voprf`/`threshold_ecdsa`, take for their own IETF/academic
+sources).
+
+dalek-cryptography/bulletproofs (Rust, MIT/Apache-2.0 dual-licensed,
+github.com/dalek-cryptography/bulletproofs) was consulted as a DESIGN
+REFERENCE for the overall SHAPE of the construction (which scalars/points
+get committed in which order; the per-round fold direction in the IPA;
+the range proof's polynomial-construction layout) — no source was ported.
+Two deliberate, explicit divergences from dalek's implementation:
+
+1. **Transcript**: dalek uses Merlin (a STROBE-based transcript protocol,
+   itself a separate specification/primitive — github.com/dalek-
+   cryptography/merlin). This module uses its own self-contained
+   SHA-512-based hash-chain transcript (`transcript.zig`) instead — see
+   that file's module doc comment and `SPEC.md`'s "Transcript" section
+   for the full rationale (no Merlin/STROBE implementation exists
+   elsewhere in this repo to build on; the Bulletproofs paper itself does
+   not mandate a specific transcript construction). Consequence: this
+   module's proofs are NOT wire-compatible with dalek's (or any other
+   implementation's) proofs — internally self-consistent only.
+2. **Generator derivation**: dalek's `GeneratorsChain` runs a SHAKE256
+   XOF read incrementally through `RistrettoPoint::from_uniform_bytes`.
+   This module instead derives each generator independently via
+   `SHA-512(domain || label || suffix) -> Ristretto255.fromUniform`
+   (`generators.zig`) — simpler, and moot given point (1) already rules
+   out cross-implementation byte-exactness as a goal.
+
+`std.crypto.ecc.Ristretto255` (group operations, `fromUniform`'s
+Elligator2-based one-way map per RFC 9496 §4.3.4) and
+`std.crypto.ecc.Ristretto255.scalar`/`.scalar.Scalar` (the shared
+Edwards25519 scalar field: `add`/`sub`/`mul`/`mulAdd`/`neg`/`reduce64`/
+`rejectNonCanonical`, and `Scalar.fromBytes(..).invert().toBytes()` for
+constant-time inversion) and `std.crypto.hash.sha2.Sha512` (MIT, part of
+Zig itself) are used via their public APIs; no new curve, field, or hash
+primitive is implemented here. The sibling `frost`/`voprf` modules'
+`root.zig` doc comments were consulted for this repo's existing
+Ristretto255-usage conventions (scalars-as-raw-`[32]u8`, `meta` tag
+shape) — no code from those modules was copied (this module has no
+sibling-module dependency, `meta.deps = .{}`).
+
+No GPL/LGPL/AGPL source was consulted or copied anywhere in this module.
+
+**Status: scaffold.** Generators (`generators.zig`), the Fiat-Shamir
+transcript (`transcript.zig`), scalar/vector + multi-scalar-mult helpers
+(`scalarvec.zig`), and both proof structs' byte codecs
+(`ipa.InnerProductProof`, `rangeproof.RangeProof`) are implemented and
+tested for real. The two irreducible zero-knowledge cores —
+`ipa.proveIpa`/`.verifyIpa` and `rangeproof.prove`/`.verify` — are
+`@panic("TODO(fable/core): ...")` stubs with fixed final signatures and
+complete per-step doc-comment contracts, awaiting a follow-up crypto
+pass. See `SPEC.md`'s "TODO(fable) — remaining" section.

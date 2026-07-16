@@ -133,6 +133,7 @@ const module_list = [_]Module{
     .{ .name = "spake2plus" },
     .{ .name = "voprf" },
     .{ .name = "opaque", .deps = &.{"voprf"} },
+    .{ .name = "bulletproofs" },
     .{ .name = "xmss" },
     .{ .name = "otp" },
     .{ .name = "ctap2pin" },
