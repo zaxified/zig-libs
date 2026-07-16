@@ -5,12 +5,14 @@
 //! This is pure, allocator-explicit, I/O-free code: it turns page-sized byte
 //! buffers into typed views (`Meta`, `Leaf`, `Branch`) and back, does the
 //! in-node binary search, and performs the classic B-tree node mutations —
-//! insert, delete, split and merge. None of it is the Fable core: node
-//! split/merge/rebalance is textbook, deterministic, and unit-tested here
-//! directly (see the tests at the bottom). The correctness-critical parts —
+//! insert, delete and split. None of it is the Fable core: node split is
+//! textbook, deterministic, and unit-tested here directly (see the tests at
+//! the bottom). (Deletes remove the key in place; there is no merge/rebalance
+//! yet — underflowed and empty leaves simply persist, a documented backlog
+//! item, never a correctness issue.) The correctness-critical parts —
 //! *when* a commit's dirty pages become durable and *which* meta page a crash
 //! recovery adopts, and *when* a freed page may be recycled without a live
-//! reader still seeing it — live in `core.zig` and are gated.
+//! reader still seeing it — live in `core.zig`.
 //!
 //! Layout (LMDB/BoltDB lineage, single 4 KiB page unit):
 //!
@@ -229,6 +231,27 @@ pub const Branch = struct {
         return self.childAtIndex(self.childIndexFor(key));
     }
 };
+
+/// Crash-recovery helper: a bounds-checked `Branch` view over a POSSIBLY
+/// GARBAGE page (a stale meta candidate may reference torn/recycled pages).
+/// Returns `null` unless the header, slot directory and every cell lie fully
+/// inside the page — after which the normal `Branch` accessors are safe. The
+/// regular views assert well-formedness instead (their pages come from a
+/// validated committed tree); recovery must reject, never crash.
+pub fn branchViewSafe(page: *const [page_size]u8) ?Branch {
+    if (page[0] != @intFromEnum(NodeKind.branch)) return null;
+    const count: usize = nodeCount(page);
+    const dir_end = hdr_len + count * slot_len;
+    if (dir_end > page_size) return null;
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const o = slotOffset(page, i);
+        if (o < dir_end or o + 6 > page_size) return null;
+        const klen = std.mem.readInt(u16, page[o .. o + 2][0..2], .little);
+        if (o + 6 + @as(usize, klen) > page_size) return null;
+    }
+    return Branch.init(page);
+}
 
 /// Generic ascending binary search over a leaf's/branch's key directory.
 fn binarySearch(comptime V: type, view: V, key: []const u8) Search {
@@ -606,6 +629,29 @@ test "branch split promotes the middle separator out of both halves" {
     try testing.expectEqual(total_children_before, total_children_after);
     for (b.cells.items) |c| try testing.expect(std.mem.lessThan(u8, c.sep, sp.sep));
     for (sp.right.cells.items) |c| try testing.expect(std.mem.lessThan(u8, sp.sep, c.sep));
+}
+
+test "branchViewSafe accepts a real branch, rejects garbage geometry" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var b = BranchBuilder.init(arena_state.allocator(), 10);
+    try b.insert("m", 20);
+    var page: [page_size]u8 = undefined;
+    b.encode(&page);
+    try testing.expect(branchViewSafe(&page) != null);
+
+    var bad = page;
+    bad[0] = 0; // a leaf is not a branch
+    try testing.expect(branchViewSafe(&bad) == null);
+    bad = page;
+    bad[0] = 7; // not a node kind at all
+    try testing.expect(branchViewSafe(&bad) == null);
+    bad = page;
+    std.mem.writeInt(u16, bad[2..4], 3000, .little); // count overruns the page
+    try testing.expect(branchViewSafe(&bad) == null);
+    bad = page;
+    std.mem.writeInt(u16, bad[8..10], page_size - 2, .little); // cell off the end
+    try testing.expect(branchViewSafe(&bad) == null);
 }
 
 test "oversize entry is rejected" {

@@ -18,15 +18,20 @@
 //!     the checkers have teeth INDEPENDENT of whether the real B-tree core is
 //!     filled in — exactly `df-elect`'s `BrokenAlwaysDf` role.
 //!
-//! The real `kvtree.Db` plugs into the SAME checkers via the gated
-//! `dbPropertyRun` (bottom of file); because `Db.commit`/recovery route into
-//! `core.zig`'s `@panic` stubs, those tests are gated behind
-//! `gate.fable_core_implemented` and report SKIP until it flips.
+//! The real `kvtree.Db` plugs into the SAME checkers via the two gated tests
+//! at the bottom of this file. While `core.zig` was `@panic` stubs they were
+//! gated behind `gate.fable_core_implemented` and reported SKIP; the core is
+//! now implemented, the gate is flipped, and they run for real: a
+//! snapshot-isolation + serializability schedule (including a multi-level
+//! tree phase), and a crash-point sweep over every storage side effect of a
+//! commit across all four `kv.SimStorage` crash modes, with an explicit
+//! destroy-the-in-flight-meta probe for the double-buffer invariant.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Prng = @import("prng.zig").Prng;
 const core = @import("core.zig");
+const format = @import("format.zig");
 const gate = @import("gate.zig");
 const kv = @import("kv");
 const kvtree = @import("root.zig");
@@ -397,13 +402,13 @@ test "teeth: the BrokenRefStore trips the snapshot-isolation checker across a sw
     try testing.expect(caught >= 150);
 }
 
-// ── gated: the real Db through the same checkers (SKIP until core lands) ──────
+// ── gated: the real Db through the same checkers (LIVE — the core landed) ────
 //
-// These reference the real transactional API (autocommit `put`/`del`,
-// `snapshot`, crash+reopen on `kv.SimStorage`) and the same checkers above.
-// They compile today — the signatures are type-checked — but every path
-// transitively calls a `core.zig` `@panic` stub, so they are gated to SKIP
-// until `gate.fable_core_implemented` flips. The pattern mirrors df-elect.
+// These drive the real transactional API (txn commit, autocommit `put`/`del`,
+// `snapshot`, crash+reopen on `kv.SimStorage`) through the same checkers
+// above. They were gated to SKIP while `core.zig` was `@panic` stubs; with
+// `gate.fable_core_implemented` flipped they run for real. The pattern
+// mirrors df-elect.
 
 test "real Db: snapshot isolation + serializability under a commit schedule (gated)" {
     if (!gate.fable_core_implemented) return error.SkipZigTest;
@@ -411,6 +416,9 @@ test "real Db: snapshot isolation + serializability under a commit schedule (gat
     var prng = Prng.init(1);
     var sim = kv.SimStorage.init(gpa);
     defer sim.deinit();
+    // A COW page store overwrites in place (meta double-buffer, page reuse);
+    // kv's append-only tripwire does not apply to this consumer.
+    sim.allow_overwrite = true;
     var db = try kvtree.Db.open(gpa, sim.storage(), "prop.kvt", .{});
     defer db.close();
 
@@ -441,40 +449,164 @@ test "real Db: snapshot isolation + serializability under a commit schedule (gat
     const live_obs = try drainCursor(&cur, scratch.allocator());
     try checkSerializable(ref.entries(), live_obs);
     snap.release();
+
+    // ── phase 2: a MULTI-LEVEL tree under a pinned snapshot ─────────────────
+    // 700 big-value keys force hundreds of leaf splits, a branch root, branch
+    // splits and a second root growth — commit's parent-insert / recursive-
+    // split threading, with reclaim gating live (freed pages are reused the
+    // very next commit once the snapshot allows it). Then a put/del mix
+    // (overwrite-shrink and delete-to-empty leaves included).
+    var snap2 = try db.snapshot();
+    var pin2_owner = std.heap.ArenaAllocator.init(gpa);
+    defer pin2_owner.deinit();
+    const pinned2 = try ref.clone(pin2_owner.allocator());
+
+    var big: [1800]u8 = undefined;
+    @memset(&big, 'x');
+    var j: usize = 0;
+    while (j < 700) : (j += 1) {
+        var kb: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&kb, "big{d:0>4}", .{j});
+        try db.put(key, &big);
+        try ref.put(key, &big);
+    }
+    var t: usize = 0;
+    while (t < 150) : (t += 1) {
+        var kb: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&kb, "big{d:0>4}", .{prng.below(700)});
+        if (prng.chance(1, 2)) {
+            try db.put(key, "shrunk");
+            try ref.put(key, "shrunk");
+        } else {
+            try db.del(key);
+            ref.del(key);
+        }
+    }
+
+    // The mid-pinned snapshot still reads its exact pinned state after ~850
+    // intervening commits; the live multi-level tree is sorted + serializable.
+    var scratch2 = std.heap.ArenaAllocator.init(gpa);
+    defer scratch2.deinit();
+    const snap2_obs = try scanCursor(&snap2, scratch2.allocator());
+    try checkSnapshotIsolation(pinned2.entries(), snap2_obs);
+    var cur2 = try db.cursor();
+    defer cur2.deinit();
+    const live2_obs = try drainCursor(&cur2, scratch2.allocator());
+    try checkSerializable(ref.entries(), live2_obs);
+    snap2.release();
 }
 
 test "real Db: crash at a commit recovers to a committed prefix (gated)" {
     if (!gate.fable_core_implemented) return error.SkipZigTest;
     const gpa = testing.allocator;
-    var sim = kv.SimStorage.init(gpa);
-    defer sim.deinit();
-    var v0: std.ArrayList(Obs) = .empty; // committed version snapshots
-    defer v0.deinit(gpa);
 
-    {
-        var db = try kvtree.Db.open(gpa, sim.storage(), "rec.kvt", .{});
-        defer db.close();
-        try db.put("committed", "1");
+    // Sweep the crash point across EVERY storage side effect of an
+    // open + multi-key commit (per crash mode), and require recovery to a
+    // committed version after each one: either the pre-crash state, or —
+    // when the new meta happened to reach media — the ENTIRE in-flight
+    // transaction. A partial transaction (some of its keys) is a torn tree
+    // and must never be observable.
+    const modes = [_]kv.CrashMode{ .lose_unsynced, .torn_tail, .reorder_unsynced, .keep_unsynced };
+    for (modes) |mode| {
+        var sim = kv.SimStorage.init(gpa);
+        defer sim.deinit();
+        sim.allow_overwrite = true; // COW page store: meta slots + page reuse
+        sim.crash_mode = mode;
+
+        var model_owner = std.heap.ArenaAllocator.init(gpa);
+        defer model_owner.deinit();
+        var model = Model.init(model_owner.allocator()); // committed truth
+
+        { // committed baseline, no crash scheduled
+            var db = try kvtree.Db.open(gpa, sim.storage(), "rec.kvt", .{});
+            defer db.close();
+            try db.put("committed", "1");
+            try model.put("committed", "1");
+        }
+
+        var val: [700]u8 = undefined;
+        @memset(&val, 'y');
+        // `.reorder_unsynced` is the only mode that can persist a LATER write
+        // (the meta) while losing an EARLIER one (a data page) — the exact
+        // failure a missing data-before-meta fsync causes. One keep/drop
+        // pattern per run would be a systematic blind spot, so sweep every
+        // crash point under several reorder seeds.
+        const rounds: usize = if (mode == .reorder_unsynced) 8 else 1;
+        var round: usize = 0;
+        while (round < rounds) : (round += 1) {
+            var crash_at: usize = 0;
+            var progressed = false;
+            while (!progressed) : (crash_at += 1) {
+                // An open+commit is a short bounded op sequence; the sweep
+                // must terminate by outrunning it.
+                try testing.expect(crash_at < 64);
+                var keybufs: [3][12]u8 = undefined;
+                var keys: [3][]const u8 = undefined;
+                for (&keybufs, &keys, 0..) |*kb, *key, k|
+                    key.* = try std.fmt.bufPrint(kb, "r{d}i{d:0>2}-{d}", .{ round, crash_at, k });
+
+                sim.reorder_seed = 0xfab1e +% (round *% 64 + crash_at) *% 0x9e3779b97f4a7c15;
+                sim.ops_until_crash = crash_at;
+                var inflight_txn: ?u64 = null;
+                attempt: {
+                    var db = kvtree.Db.open(gpa, sim.storage(), "rec.kvt", .{}) catch break :attempt;
+                    defer db.close();
+                    inflight_txn = db.meta_rec.txn_id + 1;
+                    var txn = db.begin() catch break :attempt;
+                    for (keys) |key| try txn.put(key, &val);
+                    txn.commit() catch break :attempt; // consumes txn either way
+                    progressed = true; // the whole schedule ran past the crash point
+                }
+                sim.reboot(); // also disarms the injector when nothing crashed
+
+                // The double-buffer invariant needs explicit teeth: this sim's
+                // torn write keeps the FIRST half of the in-flight write, and
+                // the whole 48-byte meta record sits inside it — so a "torn"
+                // meta write is never torn where it matters. On alternate
+                // epochs, if the in-flight commit's meta reached media at all,
+                // corrupt it: recovery MUST fall back to the previous
+                // committed state (the slot the commit was forbidden to touch).
+                var inflight_meta_destroyed = false;
+                if (inflight_txn != null and crash_at % 2 == 0) {
+                    if (sim.fileContent("rec.kvt")) |bytes| {
+                        for ([_]usize{ format.meta_page_a, format.meta_page_b }) |si| {
+                            const off = si * kvtree.page_size;
+                            if (bytes.len < off + kvtree.page_size) continue;
+                            const mp = bytes[off..][0..kvtree.page_size];
+                            const m = format.Meta.decode(mp) orelse continue;
+                            if (m.txn_id == inflight_txn.?) {
+                                sim.flipByte("rec.kvt", off + 12); // breaks the CRC
+                                inflight_meta_destroyed = true;
+                            }
+                        }
+                    }
+                }
+
+                // Recover and check: exactly the committed model, or exactly
+                // model + ALL three in-flight keys — nothing in between (and
+                // with the in-flight meta destroyed, ONLY the former).
+                var db = try kvtree.Db.open(gpa, sim.storage(), "rec.kvt", .{});
+                defer db.close();
+                var scratch = std.heap.ArenaAllocator.init(gpa);
+                defer scratch.deinit();
+                var cur = try db.cursor();
+                defer cur.deinit();
+                const recovered = try drainCursor(&cur, scratch.allocator());
+                var with_inflight = try model.clone(scratch.allocator());
+                for (keys) |key| try with_inflight.put(key, &val);
+                const candidates: []const []const Obs = if (inflight_meta_destroyed)
+                    &.{model.entries()}
+                else
+                    &.{ model.entries(), with_inflight.entries() };
+                try checkRecoveredPrefix(candidates, recovered);
+
+                // Whatever recovery adopted is the new committed truth.
+                if (entriesEqual(with_inflight.entries(), recovered)) {
+                    for (keys) |key| try model.put(key, &val);
+                }
+            }
+        }
     }
-    // Crash the next commit mid-fsync, then reopen and require a committed prefix.
-    sim.ops_until_crash = 0;
-    {
-        var db = kvtree.Db.open(gpa, sim.storage(), "rec.kvt", .{}) catch return;
-        defer db.close();
-        _ = db.put("inflight", "2") catch {};
-    }
-    sim.reboot();
-    var db = try kvtree.Db.open(gpa, sim.storage(), "rec.kvt", .{});
-    defer db.close();
-    var scratch = std.heap.ArenaAllocator.init(gpa);
-    defer scratch.deinit();
-    var cur = try db.cursor();
-    defer cur.deinit();
-    const recovered = try drainCursor(&cur, scratch.allocator());
-    const committed_only = [_]Obs{.{ .key = "committed", .val = "1" }};
-    const with_inflight = [_]Obs{ .{ .key = "committed", .val = "1" }, .{ .key = "inflight", .val = "2" } };
-    const candidates = [_][]const Obs{ &committed_only, &with_inflight };
-    try checkRecoveredPrefix(&candidates, recovered);
 }
 
 /// Drain a `kvtree.Cursor` (from `first`) into an arena as `[]Obs`.

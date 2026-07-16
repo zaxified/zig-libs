@@ -22,16 +22,15 @@
 //! serialization — both fine for the embedded, low-contention workloads this
 //! serves; see SPEC.md for the full A-vs-B decision.
 //!
-//! **Status: scaffold — the transactional core is a Fable stub.** The page/node
-//! codecs and B-tree split/merge (`format.zig`), the `Pager` + freelist
-//! container (`pager.zig`), the read path (descend / `get` / ordered `Cursor`),
-//! fresh-store initialization, and the whole property harness with its
-//! in-memory oracle + deliberately-broken positive control (`harness.zig`) are
-//! all real and pass today. The irreducible correctness core — `commit`'s
+//! **Status: core implemented.** The irreducible correctness core — `commit`'s
 //! durability-ordered COW meta swap, `recover`'s crash meta-selection, and the
-//! MVCC page-reuse gate — lives in `core.zig` as `@panic` stubs, and the
-//! property tests that would drive it are gated behind `gate.fable_core_implemented`
-//! (they report SKIP, not PASS, until the flag flips).
+//! MVCC page-reuse gate — is implemented in `core.zig` and
+//! `gate.fable_core_implemented` is flipped, so the property tests drive the
+//! real `Db` through commit/snapshot schedules and a crash-point sweep on
+//! `kv.SimStorage` (see `harness.zig`). Remaining scaffold simplifications are
+//! documented in SPEC.md's backlog (overflow pages, freelist chaining — the
+//! single freelist page LEAKS excess freed ids when full, never corrupts —
+//! and rebalance-by-borrow).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -59,7 +58,7 @@ pub const PageId = format.PageId;
 pub const Pager = pager_mod.Pager;
 pub const Freelist = pager_mod.Freelist;
 pub const Change = core.Change;
-/// Flip once `core.zig`'s three functions are real — see `gate.zig`.
+/// True since the core landed — see `gate.zig`.
 pub const fable_core_implemented = gate.fable_core_implemented;
 
 /// Re-export `kv`'s storage seam so consumers wire a backend without importing
@@ -110,7 +109,7 @@ pub const Db = struct {
             meta_rec = try initFresh(&pager);
         } else {
             pager.high_water = size / page_size;
-            meta_rec = core.recover(&pager) catch |e| switch (e) {
+            meta_rec = core.recover(gpa, &pager) catch |e| switch (e) {
                 error.Unrecoverable => return error.Corrupt,
                 error.Storage => return error.Corrupt,
                 error.OutOfMemory => return error.OutOfMemory,
@@ -189,16 +188,21 @@ pub const Db = struct {
     /// Convenience autocommit put (a one-op transaction).
     pub fn put(self: *Db, key: []const u8, val: []const u8) (CommitError || Allocator.Error)!void {
         var txn = try self.begin();
-        errdefer txn.rollback();
-        try txn.put(key, val);
+        txn.put(key, val) catch |e| {
+            txn.rollback();
+            return e;
+        };
+        // commit() consumes the txn on both outcomes — no rollback after it.
         try txn.commit();
     }
 
     /// Convenience autocommit delete.
     pub fn del(self: *Db, key: []const u8) (CommitError || Allocator.Error)!void {
         var txn = try self.begin();
-        errdefer txn.rollback();
-        try txn.del(key);
+        txn.del(key) catch |e| {
+            txn.rollback();
+            return e;
+        };
         try txn.commit();
     }
 
@@ -268,12 +272,18 @@ pub const Txn = struct {
         return lookup(&self.db.pager, self.base.root, gpa, key);
     }
 
-    /// Commit atomically. FABLE-GATED: routes into `core.commit`, which is a
-    /// `@panic` stub until the core is implemented.
+    /// Commit atomically (via `core.commit`). CONSUMES the transaction on
+    /// BOTH outcomes: after a failed commit the txn is already torn down —
+    /// do not call `rollback` on it (the store itself is left on the last
+    /// committed version either way; that is `core.commit`'s guarantee).
     pub fn commit(self: *Txn) CommitError!void {
-        defer self.arena.deinit();
-        defer self.changes.deinit(self.db.gpa);
+        defer {
+            self.arena.deinit();
+            self.changes.deinit(self.db.gpa);
+            self.* = undefined;
+        }
         const new_meta = try core.commit(
+            self.db.gpa,
             &self.db.pager,
             self.base,
             self.changes.items,
@@ -281,7 +291,6 @@ pub const Txn = struct {
         );
         self.db.meta_rec = new_meta;
         self.db.next_txn = new_meta.txn_id + 1;
-        self.* = undefined;
     }
 
     pub fn rollback(self: *Txn) void {

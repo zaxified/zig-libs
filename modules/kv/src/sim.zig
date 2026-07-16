@@ -97,6 +97,18 @@ pub const SimStorage = struct {
     /// one survived). The teeth witness for the new mode — a sweep that never
     /// punches a hole has not exercised out-of-order durability.
     holes_punched: usize = 0,
+    /// Permit `writeAll` below the durable watermark. `kv` itself is
+    /// append-only over the durable prefix (the tripwire assert in
+    /// `vWriteAll` stays armed by default), but page-store consumers of this
+    /// seam (kvtree) MUST overwrite in place — the double-buffered meta slots
+    /// and reused freed pages — and set this to `true`. Modeling caveat for
+    /// such consumers: an un-synced in-place overwrite below `durable_len`
+    /// survives a crash in every mode except when the crash lands on that
+    /// very write (torn/lost) or `.reorder_unsynced` drops its range — i.e.
+    /// overwrite durability is modeled optimistically. Overwriting consumers
+    /// must also write any byte range at most once per sync window (the
+    /// `unsynced_writes` ranges are assumed disjoint by `crashReorder`).
+    allow_overwrite: bool = false,
 
     /// A byte-range written to a file since its last durability barrier.
     const Range = struct { off: usize, len: usize };
@@ -373,9 +385,10 @@ pub const SimStorage = struct {
         const self = cast(ctx);
         if (self.crashed) return error.Crashed;
         const f = self.fileOf(h);
-        // The store never overwrites already-durable bytes (append-only +
-        // truncate-first discipline) — a violation is a store bug.
-        std.debug.assert(off >= f.durable_len or self.crash_mode == .keep_unsynced);
+        // The kv store never overwrites already-durable bytes (append-only +
+        // truncate-first discipline) — a violation is a store bug. Consumers
+        // with an overwriting page model opt out via `allow_overwrite`.
+        std.debug.assert(self.allow_overwrite or off >= f.durable_len or self.crash_mode == .keep_unsynced);
         self.ops_seen += 1;
         if (self.ops_until_crash) |*n| {
             if (n.* == 0) {

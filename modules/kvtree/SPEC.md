@@ -6,13 +6,17 @@ VOPR-checked crash-safety. Usage: see ./README.md. Provenance (clean-room from
 the LMDB/BoltDB design + the TigerBeetle VOPR method — design references, no
 source ported): see /NOTICE.
 
-## Status: SCAFFOLD — the transactional core is a Fable stub
+## Status: core IMPLEMENTED (gate flipped)
 
-Everything mechanical is real and green today (Debug + ReleaseFast, `zig fmt`
-clean, no leaks); the three irreducible correctness functions are `@panic`
-stubs in `core.zig`, and the property tests that would drive them are gated
-behind `gate.fable_core_implemented` (they report SKIP, not PASS, until it
-flips). See "The Fable core" below for exactly what is stubbed and why.
+The three irreducible correctness functions in `core.zig` are implemented and
+`gate.fable_core_implemented` is `true`: the formerly-gated property tests now
+drive the real `Db` — a snapshot-isolation + serializability schedule with a
+multi-level-tree phase (~850 commits under pinned snapshots), and a
+crash-point sweep over every storage side effect of an open+commit across all
+four `kv.SimStorage` crash modes, including a destroy-the-in-flight-meta
+probe for the double-buffer invariant. Everything is green in Debug and
+ReleaseFast, `zig fmt` clean, no leaks. The section below is kept as the
+specification the implementation was written against.
 
 ## The architecture decision: (A) copy-on-write B-tree, not (B) B-tree + WAL
 
@@ -78,9 +82,9 @@ cell is `(sep_len, right_child, sep)`, with `count` separators routing between
 sequence), `root`, the freelist head + count, `high_water` (next never-used
 page id), and a CRC32 over its fields.
 
-## The Fable core (`core.zig`) — exactly what is stubbed, and why it is irreducible
+## The Fable core (`core.zig`) — exactly what it is, and why it is irreducible
 
-Two correctness kernels, three stubbed functions. Each is the kind of bug a
+Two correctness kernels, three functions (now implemented). Each is the kind of bug a
 human review rubber-stamps and only a model-checker catches — which is why the
 harness, not a diff read, is the acceptance gate.
 
@@ -125,7 +129,8 @@ smallest of the three and its substance really lives inside `commit`'s freelist
 accounting; it is named separately because the MVCC-safety property is
 genuinely distinct from crash-atomicity (LMDB implements them in separate
 places), not to pad the tier. Everything else — page/node codecs, in-node
-binary search, B-tree **split/merge** (textbook, unit-tested directly), the
+binary search, B-tree node **split** (textbook, unit-tested directly; deletes
+are in-place with no merge/rebalance yet — see backlog), the
 `Pager`, the freelist container, the read/descend/cursor path, and fresh-store
 init — is mechanical scaffold, written and green today. If a future reviewer
 finds `reclaimGate` collapses cleanly into `commit`, folding it in is fair; the
@@ -152,13 +157,25 @@ Mirrors `kv`'s VOPR + `df-elect`'s positive-control pattern:
   checker with no teeth would catch zero). This proves the harness works
   independent of whether the B-tree core is filled in.
 
-Gated (SKIP until `gate.fable_core_implemented`): the real `Db` driven through
-the same checkers — a snapshot-isolation + serializability commit schedule, and
-a crash-at-commit-recovers-to-a-committed-prefix test — both on `kv.SimStorage`.
-When the core lands, these will grow into a full randomized VOPR (fuzzed
-op/crash schedules chained across epochs) the way `kv/vopr.zig` is, plus a
-sabotage self-test (a recovery that silently loses committed data must be
-caught) and a delta-debugging shrinker.
+Formerly gated, now LIVE (`gate.fable_core_implemented` is `true`): the real
+`Db` driven through the same checkers — a snapshot-isolation +
+serializability commit schedule (including a multi-level-tree phase that
+forces leaf splits, branch splits and recursive root growth under pinned
+snapshots), and a crash-recovery sweep that crashes at EVERY storage side
+effect of an open+commit, across all four `kv.SimStorage` crash modes, with
+`.reorder_unsynced` swept under multiple seeds (one keep/drop pattern would
+be a systematic blind spot for a missing data-before-meta fsync) and an
+explicit destroy-the-in-flight-meta probe (this sim's torn write keeps the
+first half of a write, which always covers the whole 48-byte meta record, so
+meta corruption has to be injected to give the double-buffer invariant
+teeth). Still future work: a full randomized VOPR (fuzzed op/crash schedules
+chained across epochs) the way `kv/vopr.zig` is, plus a sabotage self-test
+and a delta-debugging shrinker. Known sim modeling caveat, inherited and
+documented at `kv.SimStorage.allow_overwrite`: an un-synced in-place
+OVERWRITE below the durable watermark survives most crash modes
+(optimistic), so a missing FINAL meta fsync is not currently provable by
+this harness — recovery-to-a-committed-prefix accepts both outcomes anyway,
+and fixing it needs overwrite-durability modeling in `kv`'s sim.
 
 ## Threat model / out of scope
 
@@ -175,8 +192,10 @@ library). Cross-*process* exclusion is not provided (one `Db` per store).
   with `error.EntryTooLarge`), mirroring `kv`'s large-value handling.
 - **Freelist page chaining** when one freelist page fills (today: a single
   bounded freelist page; the reuse-safety invariant is unchanged by chaining).
-- **Node rebalance-by-borrow** on underflow (today: merge only; borrowing from a
-  fuller sibling is a mechanical addition).
+- **Node merge / rebalance-by-borrow** on underflow (today: deletes remove the
+  key in place — underflowed and empty leaves persist until overwritten, which
+  wastes space but never corrupts; merging and borrowing from a fuller sibling
+  are mechanical additions).
 - **Automatic freelist/space reclamation thresholds** and an in-memory page
   cache (compose with `ramcache`).
 

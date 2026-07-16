@@ -16,23 +16,25 @@ that see a consistent snapshot without blocking the writer.
 - **Deps:** `kv` (reuses its `Storage` seam and its deterministic crash/fault
   `SimStorage`).
 
-> **Status: SCAFFOLD — the transactional core is a Fable stub.** The page/node
-> codecs and B-tree split/merge, the pager + freelist, the read/descend/cursor
-> path, fresh-store init, and the whole property harness (with an in-memory
-> oracle and a deliberately-broken positive control) are real and green today.
-> The irreducible core — `commit`'s durability-ordered COW meta swap,
-> `recover`'s crash meta-selection, and the MVCC page-reuse gate — is a `@panic`
-> stub in `core.zig`; the property tests that drive it are gated behind
-> `gate.fable_core_implemented` and report SKIP until it flips. Do not deploy
-> until the gate is `true`. See `SPEC.md` for the A-vs-B design decision and
-> exactly what the Fable core is.
+> **Status: core implemented.** The irreducible core — `commit`'s
+> durability-ordered COW meta swap, `recover`'s crash meta-selection, and the
+> MVCC page-reuse gate — is implemented in `core.zig` and
+> `gate.fable_core_implemented` is `true`: the property tests drive the real
+> `Db` through commit/snapshot schedules (including a multi-level-tree phase)
+> and a crash-point sweep over every storage side effect of a commit, across
+> all four `kv.SimStorage` crash modes. Remaining scaffold simplifications
+> (documented in `SPEC.md`'s backlog): no overflow pages for entries larger
+> than a page, a single bounded freelist page (overflow leaks ids — space,
+> never correctness), merge-less deletes (empty leaves persist until
+> overwritten). See `SPEC.md` for the A-vs-B design decision and the
+> verification argument.
 
 Provenance: clean-room. Design references only — LMDB/BoltDB (COW B-tree +
 meta-page double-buffer) and TigerBeetle's VOPR (deterministic fault-injection
 *approach*). Behavior/approach only; no third-party source consulted or copied.
 See `NOTICE`.
 
-## API (intended shape — read path works today; write path is gated)
+## API
 
 ```zig
 const kvtree = @import("kvtree");
@@ -40,14 +42,15 @@ const kvtree = @import("kvtree");
 var db = try kvtree.Db.open(gpa, store, "app.kvt", .{}); // store: kvtree.Storage
 defer db.close();
 
-// Point ops (autocommit == a one-op transaction) — gated on the core.
+// Point ops (autocommit == a one-op transaction).
 try db.put("key", "value");
 const v = try db.get(gpa, "key");   // ?[]u8, caller frees
 try db.del("key");
 
-// Multi-key ACID transaction.
+// Multi-key ACID transaction. NOTE: commit() CONSUMES the txn on both
+// outcomes — after a failed commit do NOT rollback (the store is already on
+// the last committed version); rollback only a txn you never commit.
 var txn = try db.begin();
-errdefer txn.rollback();
 try txn.put("a", "1");
 try txn.put("b", "2");
 try txn.commit();                   // atomic: both or neither
@@ -70,11 +73,12 @@ Production wires `kvtree.FsStorage` over a real directory; tests use
 ## Verify
 
 ```
-zig build test-kvtree                          # Debug (2 core tests SKIP)
+zig build test-kvtree                          # Debug
 zig build test-kvtree -Doptimize=ReleaseFast   # ReleaseFast
 ```
 
-Green today with the two core-dependent property tests skipped; the mechanical
-codecs, B-tree node ops, read path, and the property harness (correct oracle +
-broken positive control that MUST trip the checkers) all run for real. See
-`SPEC.md` for the verification argument and the Fable-core boundary.
+All tests run for real (no skips): the mechanical codecs, B-tree node ops,
+read path, the property harness (correct oracle + broken positive control
+that MUST trip the checkers), and the two core property tests — the
+snapshot-isolation/serializability schedule and the crash-point sweep. See
+`SPEC.md` for the verification argument.
