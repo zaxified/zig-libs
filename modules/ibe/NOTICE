@@ -1,0 +1,48 @@
+ibe — provenance note
+======================
+
+Kept as a module-local NOTICE (same placement as the sibling
+`tlock`/`bls12_381`/`bbs`/`bulletproofs` modules — self-contained
+crypto modules not folded into the root `NOTICE`).
+
+Provenance
+----------
+
+**Academic reference**: Boneh, D. and Franklin, M., "Identity-Based
+Encryption from the Weil Pairing", CRYPTO 2001 (the "FullIdent"
+construction, §4.2) — a public academic paper, not a copyrightable
+implementation (merger doctrine, `CONVENTIONS.md` §5). This module
+implements that construction directly, generalized to an arbitrary
+caller-run Private Key Generator rather than any specific deployment.
+
+**Internal design reference**: this module's `encrypt`/`decrypt`
+assembly (the FO-transform structure, the `fp12Pow` constant-time `Gt`
+exponentiation helper, and the `Ciphertext` `(U, V, W)` shape) is
+adapted directly from this repository's own `modules/tlock` (Boneh-
+Franklin IBE specialized to a drand randomness beacon PKG, itself
+transcribed from `drand/tlock`/`drand/kyber`'s Go source — see
+`tlock/NOTICE` for that chain's full third-party provenance). No new
+attribution obligation arises from this internal reuse: `tlock`'s own
+NOTICE already covers the third-party design references its shape was
+originally drawn from, and this module's OWN hash/DST layer
+(`ciphersuite.zig`) and Gt-representation handling (no drand-style
+cube — see `SPEC.md`'s "No drand-style cube") are original to this
+module, not copied from `tlock` or any external source.
+
+`bls12_381` (this repo — `modules/bls12_381`) supplies every field/
+group/pairing/hash-to-curve primitive this module builds on (`g1`/`g2`
+point arithmetic and wire codecs, `hash_to_curve.hashToCurveG1`,
+`pairing.pairing`, `Fr` including `Fr.random`/`Fr.reduceWide`); no new
+field, group, or hash-to-curve primitive is implemented here.
+
+No third-party source code (beyond this repository's own `tlock`
+module, covered above) was consulted or copied anywhere in this
+module.
+
+**Status: REAL.** `ciphersuite.zig`, `ibe.Ciphertext`'s byte codec,
+`ibe.setup`/`ibe.extract`, and `ibe.encrypt`/`ibe.decrypt` (the BF-IBE
+FullIdent core) are all implemented and tested — see `SPEC.md`'s "KAT
+plan" for the self-consistency verification chain (round-trip, direct
+pairing-consistency, and soundness/CCA-rejection tests) and its
+"Honest tier note" for why no external test vector exists for this
+standalone scheme.

@@ -141,6 +141,7 @@ const module_list = [_]Module{
     .{ .name = "bls12_381" },
     .{ .name = "bbs", .deps = &.{"bls12_381"} },
     .{ .name = "tlock", .deps = &.{"bls12_381"} },
+    .{ .name = "ibe", .deps = &.{"bls12_381"} },
     .{ .name = "bn254" },
     .{ .name = "ed448" },
     .{ .name = "decaf448", .deps = &.{"ed448"} },
