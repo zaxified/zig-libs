@@ -61,6 +61,7 @@ const module_list = [_]Module{
     .{ .name = "netsim" },
     .{ .name = "loopfree-reconv", .deps = &.{ "netsim", "spf-ect" } },
     .{ .name = "df-elect", .deps = &.{"netsim"} },
+    .{ .name = "raft", .deps = &.{"netsim"} },
     .{ .name = "liveness-hyst", .deps = &.{ "netsim", "latency-stats" } },
     .{ .name = "hashdigest" },
     .{ .name = "sealedbox" },

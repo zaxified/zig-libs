@@ -1,0 +1,112 @@
+// SPDX-License-Identifier: MIT
+
+//! raft — the Raft consensus algorithm (leader election + log replication),
+//! model-checked in `netsim` against Raft's five formal safety properties under
+//! fuzzed crash / partition / message-reorder / clock-skew schedules.
+//!
+//! Modeled after Ongaro & Ousterhout, "In Search of an Understandable Consensus
+//! Algorithm" (extended version) — Figure 2 (state + RPCs), Figure 3 (safety
+//! properties), §5.2–§5.4 (election, replication, the election restriction and
+//! the Figure-8 commit rule). It runs INSIDE `netsim` exactly like the S1b
+//! fabric jewels: a `netsim.Protocol` consumer, a live invariant checker, a
+//! deliberately-broken positive control, and a property/shrink/teeth harness.
+//!
+//! **Status: scaffold complete, consensus-safety core is a Fable stub.** Real
+//! and passing TODAY: the wire codecs + persistent-state serialization
+//! (`types.zig`), the log container (`log.zig`), all five safety checkers with
+//! synthetic teeth tests (`checks.zig`), the mechanical protocol plumbing and
+//! the `BrokenRaft` positive control with its property/shrink/teeth tests
+//! (`server.zig`). Behind the gate: the irreducible consensus-safety kernel
+//! (`safety.zig`) — the up-to-date election restriction, the RequestVote grant,
+//! the AppendEntries conflict rule, and the Figure-8 leader-commit rule — each a
+//! `@panic("TODO(fable/core): …")` stub. Tests that would drive the real
+//! `RaftServer` (and so call those stubs) are gated behind
+//! `gate.fable_core_implemented` and report SKIP, not PASS, until it flips.
+
+const std = @import("std");
+const netsim = @import("netsim");
+
+pub const meta = .{
+    .platform = .any, // pure simulation-verified logic, no OS/network I/O
+    .role = .util,
+    .concurrency = .single_owner,
+    .model_after = "Raft (Ongaro & Ousterhout, extended paper) — leader election + log replication",
+    .deps = .{"netsim"},
+};
+
+// ── public API ──────────────────────────────────────────────────────────────
+
+const types = @import("types.zig");
+pub const Term = types.Term;
+pub const LogIndex = types.LogIndex;
+pub const NodeId = types.NodeId;
+pub const Command = types.Command;
+pub const no_vote = types.no_vote;
+pub const EntryKind = types.EntryKind;
+pub const LogEntry = types.LogEntry;
+pub const RpcTag = types.RpcTag;
+pub const RequestVoteReq = types.RequestVoteReq;
+pub const RequestVoteResp = types.RequestVoteResp;
+pub const AppendEntriesReq = types.AppendEntriesReq;
+pub const AppendEntriesResp = types.AppendEntriesResp;
+pub const PersistentState = types.PersistentState;
+
+const log_mod = @import("log.zig");
+pub const Log = log_mod.Log;
+pub const LogInfo = log_mod.LogInfo;
+
+/// FABLE tier — see `safety.zig`. These are the irreducible consensus-safety
+/// decisions; everything else in this module is mechanical scaffold.
+const safety = @import("safety.zig");
+pub const VoteDecision = safety.VoteDecision;
+pub const AppendOutcome = safety.AppendOutcome;
+pub const TermObservation = safety.TermObservation;
+pub const logIsAtLeastAsUpToDate = safety.logIsAtLeastAsUpToDate;
+pub const handleRequestVote = safety.handleRequestVote;
+pub const handleAppendEntries = safety.handleAppendEntries;
+pub const leaderCommitIndex = safety.leaderCommitIndex;
+pub const jointMajority = safety.jointMajority;
+pub const observeTerm = safety.observeTerm;
+
+const checks = @import("checks.zig");
+pub const SafetyChecker = checks.SafetyChecker;
+pub const CommitRec = checks.CommitRec;
+pub const logMatchingViolation = checks.logMatchingViolation;
+pub const appendOnlyHolds = checks.appendOnlyHolds;
+pub const leaderCompletenessHolds = checks.leaderCompletenessHolds;
+
+const server = @import("server.zig");
+pub const RaftServer = server.RaftServer;
+pub const RaftConfig = server.RaftConfig;
+pub const CLUSTER_N = server.CLUSTER_N;
+pub const scenario = server.scenario;
+/// Positive control — proves `SafetyChecker` has teeth (see `server.zig`).
+pub const BrokenRaft = server.BrokenRaft;
+
+const gate = @import("gate.zig");
+/// Flip once `safety.zig`'s decision functions are real — see `gate.zig`.
+pub const fable_core_implemented = gate.fable_core_implemented;
+
+// ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────────
+//
+// refAllDecls walks every pub declaration reachable from this file (including
+// the sub-module re-exports above), which is what pulls types.zig / log.zig /
+// safety.zig / checks.zig / server.zig / gate.zig's own `test` blocks into
+// `zig build test-raft` — a bare `pub const x = @import("x.zig")` re-export
+// alone does NOT do this (the dark-tests rule).
+
+test {
+    std.testing.refAllDecls(@This());
+    _ = @import("types.zig");
+    _ = @import("log.zig");
+    _ = @import("safety.zig");
+    _ = @import("checks.zig");
+    _ = @import("server.zig");
+    _ = @import("gate.zig");
+}
+
+test "smoke: module imports and re-exports resolve" {
+    _ = netsim;
+    _ = fable_core_implemented; // resolved regardless of its value
+    try std.testing.expectEqual(@as(usize, 5), CLUSTER_N);
+}
