@@ -1,0 +1,77 @@
+vdf — provenance note
+======================
+
+Kept as a module-local NOTICE (same placement as the sibling `bulletproofs`/
+`frost`/`voprf`/`adaptor`/`bn254` modules — self-contained crypto modules
+not folded into the root `NOTICE`).
+
+Provenance
+----------
+
+vdf — the construction follows Wesolowski, "Efficient Verifiable Delay
+Functions", IACR ePrint 2018/623 (eprint.iacr.org/2018/623), §3 (the
+RSA-group VDF: `eval`, `hashToPrime`'s Fiat-Shamir role, and the
+`prove`/`verify` relation `vdf.zig`'s doc comments specify), and Boneh,
+Bünz, Fisch, "A Survey of Two Verifiable Delay Functions", IACR ePrint
+2018/712 (eprint.iacr.org/2018/712), §2.3-2.4 (the low-order-assumption
+soundness argument and the efficient/streaming-prover technique). These
+are public academic papers; the papers' TEXT (the protocol description
+being followed) is not itself a copyrightable implementation, and no
+source code accompanying either paper was consulted or ported — see
+CONVENTIONS.md §5's merger-doctrine note (the same posture this repo's
+other spec-derived modules, e.g. `bulletproofs`/`frost`/`threshold_ecdsa`,
+take for their own IETF/academic sources).
+
+No third-party VDF IMPLEMENTATION (source code) was consulted or ported.
+Several open-source Wesolowski-VDF implementations were located during a
+search for byte-exact reference test vectors (Chia-Network's
+`vdf-competition`/`oldvdf-competition`, `iotaledger/vdf`,
+`poanetwork/vdf`) but all three implement the construction over a CLASS
+group, not the RSA `Z_N*` group this module uses, and none publishes
+fixtures at a level suitable for cross-language embedding regardless of
+group choice — none was used as a design reference or source of test
+vectors; see SPEC.md's "Verification" section for what this module uses
+instead (independent Python cross-checks computed fresh for this module).
+
+`std.crypto.ff` (`Modulus`/`Fe` — constant-time finite-field arithmetic;
+`group.zig`), `std.crypto.hash.sha3.Shake256` (`hashToPrime`'s candidate
+derivation), and `std.crypto.hash.sha2.Sha256` (the deterministic
+Miller-Rabin witness seed) are used via their public APIs; no new
+big-integer or hash primitive is implemented here. The `rsa` module's
+`root.zig` (specifically its private `isProbablePrime`/`generatePrime`
+helpers, and its `Uint`/`Modulus`/`Fe` alias pattern) was consulted as a
+DESIGN REFERENCE for this module's own private Miller-Rabin test and
+`group.zig`'s `Modulus` alias shape — no source was copied (neither
+`rsa`'s nor `paillier`'s nor `threshold_ecdsa`'s own per-module
+Miller-Rabin helper is `pub`, so there was nothing importable regardless;
+`vdf.zig`'s version additionally differs in a load-bearing way — see that
+file's `deterministicWitnessRandom` doc comment — so it is not a
+line-for-line port even in shape).
+
+**RSA-2048 Factoring Challenge modulus** (`group.zig`'s
+`rsa2048ChallengeModulus`): a public number from the RSA Factoring
+Challenge (RSA Laboratories, 1991-2007), not a copyrightable work (a
+specific integer is a fact, not an expression). Sourced from Wikipedia's
+"RSA numbers" article (en.wikipedia.org/wiki/RSA_numbers), fetched via its
+raw wikitext (`action=raw`) rather than a rendered/AI-summarized page —
+two independently-fetched renderings of the SAME article disagreed with
+each other in a run of digits during development (an OCR/transcription
+artifact on one of the two, not traced further since the raw wikitext
+route made it moot), which is exactly the failure mode a 617-digit
+constant invites; the raw wikitext was treated as authoritative to break
+the tie. The embedded value is additionally cross-checked indirectly: all
+three `eval` KAT vectors and the `hashToPrime` KAT vector in
+`kat_test.zig` were computed independently in Python FROM the same decimal
+digit string and match this module's Zig computation byte-for-byte (a
+transcription error in the modulus itself would make every one of those
+four vectors fail simultaneously, not just look "slightly off").
+
+No GPL/LGPL/AGPL source was consulted or copied anywhere in this module.
+
+**Status: complete.** `group.zig` (Z_N* wrapper + RSA-2048 challenge
+modulus + element validation), and `vdf.zig`'s `eval`, `hashToPrime`,
+`pow2Mod`, and `Proof`'s byte codec are implemented and tested for real —
+as are the two irreducible cores, `vdf.zig`'s `prove` (streaming-quotient
+prover) and `verify` (the `π^l·x^r == y` soundness check), verified by the
+completeness/soundness KATs and a naive-vs-streaming quotient cross-check.
+See `SPEC.md`.
