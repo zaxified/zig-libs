@@ -1,0 +1,132 @@
+tlock — provenance note
+========================
+
+Kept as a module-local NOTICE (same placement as the sibling
+`bls12_381`/`bbs`/`vdf`/`bulletproofs`/`bn254` modules — self-contained
+crypto modules not folded into the root `NOTICE`).
+
+Provenance
+----------
+
+**Design reference (source read, not ported)**: this module's
+ciphersuite (`src/ciphersuite.zig`) and `Ciphertext` wire format
+(`src/tlock.zig`) are transcribed from drand's own production Go
+source, fetched 2026-07-16:
+
+- `github.com/drand/drand` (Apache-2.0), `crypto/schemes.go`,
+  `NewPedersenBLSUnchainedG1` (the `SigsOnG1ID` /
+  `"bls-unchained-g1-rfc9380"` scheme — quicknet's actual scheme,
+  confirmed live against `https://api.drand.sh/v2/beacons/quicknet/info`).
+  Supplies: `dst_g1`/`dst_g2` (RFC 9380 DSTs), `beaconId`'s
+  `SHA-256(BigEndian(round))` digest construction.
+- `github.com/drand/kyber` (Apache-2.0/MIT dual), `encrypt/ibe/ibe.go`.
+  Supplies: the `H1`/`H2`/`H3`/`H4` constructions
+  (`h2_tag`/`h3_tag`/`h4_tag` = `"IBE-H2"`/`"IBE-H3"`/`"IBE-H4"`
+  verbatim), `EncryptCCAonG2`/`DecryptCCAonG2`'s exact 6-step
+  encrypt / 4-step decrypt BF-IBE FullIdent construction (`tlock.zig`'s
+  module doc comment transcribes this construction into the doc
+  contracts the `encrypt`/`decrypt` Fable cores implement — no source
+  code copied, the ALGORITHM SHAPE was read and re-expressed).
+- `github.com/drand/tlock` (Apache-2.0/MIT dual), `tlock.go`.
+  Supplies: the `Ciphertext.toBytes`/`fromBytes` wire format (`U (96B
+  G2 compressed) || V (16B) || W (16B)`, `cipherVLen`/`cipherWLen =
+  16` — this module's `ciphersuite.block_bytes`), and the
+  `TimeLock`/`TimeUnlock` scheme-dispatch confirming quicknet routes
+  through `EncryptCCAonG2`/`DecryptCCAonG2` despite the `SigsOnG1ID`
+  scheme name (see `ciphersuite.zig`'s module doc comment, "Variant
+  confirmation" section).
+- `github.com/drand/kyber-bls12381` (Apache-2.0/MIT dual),
+  `kyber_g1.go`/`kyber_g2.go`/`kyber_gt.go`/`kyber_scalar.go`. Read to
+  confirm: point serialization is compressed (matches
+  `bls12_381.g1`/`g2`'s own `toBytesCompressed` convention); the `Gt`
+  (`Fp12`) serialization is `kilic/bls12-381`'s `GT.ToBytes`, itself
+  confirmed (via `github.com/kilic/bls12-381` `fp12.go`) to use the
+  SAME high-to-low `c1 || c0` (576-byte) tower convention
+  `bls12_381.Fp12.toBytes` already documents (byte NESTING now fully
+  vector-verified — see the interop-vector section below; kilic's
+  pairing VALUE, however, is the canonical value's CUBE, see
+  `SPEC.md`'s "Gt serialization" section); the scalar
+  field modulus (`curveOrder` in `kyber_scalar.go`) is confirmed
+  byte-identical to `bls12_381.scalar.r_bytes`.
+
+No source code from any of the above was copied into this module —
+every construction was independently re-expressed in Zig from reading
+the reference Go source, per `CONVENTIONS.md`'s "design reference"
+category (prime directive 1: "model after a proven implementation in
+another language"). All four repositories are Apache-2.0 or dual
+Apache-2.0/MIT licensed; no GPL/LGPL/AGPL source was consulted or
+copied anywhere in this module.
+
+**Academic reference**: Boneh, D. and Franklin, M., "Identity-Based
+Encryption from the Weil Pairing", CRYPTO 2001 (the "FullIdent"
+construction, §4.2) — a public academic paper, not a copyrightable
+implementation (merger doctrine, `CONVENTIONS.md` §5).
+
+Live production data (fetched 2026-07-16, used in `kat_test.zig`'s
+ungated pairing-sanity KAT and the gated round-trip tests)
+--------------------------------------------------------------------
+
+- Chain info: `GET https://api.drand.sh/v2/beacons/quicknet/info` ->
+  `chain_hash = 52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971`,
+  `scheme = "bls-unchained-g1-rfc9380"`,
+  `public_key = 83cf0f2896adee7eb8b5f01fcad3912212c437e0073e911fb90022d3e760183c8c4b450b6a0a6c3ac6a5776a2d1064510d1fec758c921cc22b0e17e63aaf4bcb5ed66304de9cf809bd274ca73bab4af5a6e9c76a4bc09e76eae8991ef5ece45a`
+  (96-byte `G2` compressed).
+- Round 1000: `GET https://api.drand.sh/52db9ba7.../public/1000` ->
+  `signature = b44679b9a59af2ec876b1a6b1ad52ea9b1615fc3982b19576350f93447cb1125e342b73a8dd2bacbe47e4b6b63ed5e39`
+  (48-byte `G1` compressed).
+
+This is the League of Entropy's real, public, production quicknet
+beacon — the same network `drand/tlock`'s own `README.md` targets. No
+private key material of any kind is involved (drand round signatures
+are, by design, public the instant a round is reached).
+
+`bls12_381` (this repo — `modules/bls12_381`) supplies every field/
+group/pairing/hash-to-curve primitive this module builds on
+(`g1`/`g2` point arithmetic and wire codecs, `hash_to_curve.
+hashToCurveG1`, `pairing.pairing`/`pairingCheck`, `Fr`); no new field,
+group, or hash-to-curve primitive is implemented here.
+
+drand interop decrypt vector (fetched + verified 2026-07-16, used in
+`kat_test.zig`'s gated section-3 interop tests)
+--------------------------------------------------------------------
+
+- Ciphertext fixture: `github.com/drand/tlock` (Apache-2.0/MIT dual),
+  commit `7ceb44a598293f10c43d2291df9e669c4251fe24`,
+  `testdata/lorem-tle-testnet-quicknet-t-2024-01-17-15-28.tle` — a
+  committed, Go-`tle`-produced armored age file encrypted to the
+  quicknet-t testnet beacon (chain hash
+  `cc9c398442737cbd141526600919edd69f1d6f9b4adb67e4d912fbc64341a9a5`,
+  scheme `"bls-unchained-g1-rfc9380"` — identical to mainnet
+  quicknet's), round 5423142. The age header's `tlock` stanza body is
+  the raw 128-byte BF-IBE `(U,V,W)` embedded in `kat_test.zig`.
+- Chain info: `GET https://pl-us.testnet.drand.sh/cc9c3984.../info`
+  -> `public_key = b15b65b46fb29104f6a4b5d1e11a8da6344463973d423661bb0804846a0ecd1ef93c25057f1c0baab2ac53e56c662b66072f6d84ee791a3382bfb055afab1e6a375538d8ffc451104ac971d2dc9b168e2d3246b0be2015969cbaac298f6502da`
+  (matches the copy in `drand/tlock`'s own `tlock_test.go`).
+- Round signature: `GET https://pl-us.testnet.drand.sh/cc9c3984...
+  /public/5423142` ->
+  `signature = 96fce8e2f70e2784577c8f2d8bd36af7a4b0dfd73dd91469d8556b36d2973a4f84681a45b1af2ce0511e5a32dd72508f`.
+- Expected plaintext (the fixture's 16-byte age file key,
+  `2088b21b7778175ecb9349dd98737373`) and the Go encryptor's `sigma`
+  pad (`7f4a8bfc5ae6e845ee01773a45dd92ae`): recovered via this
+  module's `decrypt`, then INDEPENDENTLY verified outside Zig — the
+  file key authenticates the fixture's age v1 header byte-exactly
+  (HKDF-SHA256(ikm=filekey, info="header") -> HMAC-SHA256, Python
+  stdlib) and decrypts the fixture's ChaCha20-Poly1305 STREAM payload
+  to a byte-identical copy of the same commit's `testdata/lorem.txt`.
+- Gt-representation ground truth used while root-causing the interop
+  divergence: `github.com/paulmillr/noble-curves` (MIT),
+  `test/vectors/bls12-381/go_pairing_vectors/pairing.json` +
+  `t.go` (vectors generated directly by `github.com/kilic/bls12-381`,
+  Apache-2.0), cross-checked against `ethereum/py_ecc` (MIT)
+  pairing output. Finding: kilic's `GT` values are the canonical
+  optimal-ate pairing's CUBE (FCKRH `f^(3d)` final exponentiation);
+  byte nesting is identical to `bls12_381.Fp12.toBytes`. See
+  `SPEC.md`'s "Gt serialization" section and `tlock.zig`'s
+  `gtToDrandRepr`.
+
+**Status: REAL.** `ciphersuite.zig`, `tlock.Ciphertext`'s byte codec,
+and the `tlock.encrypt`/`tlock.decrypt` BF-IBE FullIdent cores are all
+implemented and tested (`gate.core_implemented = true`), byte-exact
+against the drand-produced interop vector above in BOTH directions
+(decrypt the Go ciphertext; re-encrypt its recovered `(filekey,
+sigma)` back to the identical 128 bytes).
