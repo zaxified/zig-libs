@@ -1,0 +1,45 @@
+hqc — provenance note
+======================
+
+Kept as a module-local NOTICE (same placement as the sibling
+`bip340`/`xmss`/`bls12_381` modules — self-contained crypto modules
+not folded into the root NOTICE).
+
+Provenance
+----------
+
+hqc — clean-room implementation from the official HQC specification
+("Hamming Quasi-Cyclic (HQC)", 22/08/2025, pqc-hqc.org — the spec
+accompanying NIST's March-2025 selection of HQC as a code-based KEM
+backup to ML-KEM). A public specification, not a copyrightable work; no
+third-party source was ported.
+
+Design reference (behavior/byte-layout only, no source copied): the
+reference implementation, https://gitlab.com/pqc-hqc/hqc, tag `v5.0.0`
+(public-domain license — see that repo's own LICENSE), consulted for
+exact algorithmic behavior the spec's prose leaves underspecified:
+
+- The `Xof.getBytes` 8-byte stream-consumption rounding quirk
+  (`prng.zig`) — reference: `xof_get_bytes` in `src/common/symmetric.c`.
+- The Barrett-reduction / 24-bit-rejection-threshold / duplicate-scan
+  constant-access-pattern shapes of both fixed-weight samplers
+  (`prng.zig`'s `sampleFixedWeightRejection`/`sampleFixedWeightBiased`)
+  — reference: `src/ref/vector.c`'s
+  `vect_generate_random_support{1,2}`/`vect_write_support_to_vector`.
+
+Test-vector oracle (also design-reference, not ported source): the same
+tag's `kats/ref/hqc-1/intermediates_values` file — a byte-exact,
+independently-verified fixture embedded in `src/kat_vectors.zig` (fetched
+via `curl` directly from gitlab.com and cross-checked in Python's
+`hashlib` before transcription, specifically to avoid hex-transcription
+risk from any summarizing intermediary). See SPEC.md's Verification
+section for exactly which primitives are numeric-KAT-pinned against this
+fixture vs. transcribed-from-source-only.
+
+No other third-party source was ported or consulted. Uses only the Zig
+standard library (`std.crypto.hash.sha3`: SHAKE256, SHA3-256, SHA3-512).
+
+This is Part 1 of a multi-part arc (ring + PRNG foundation only — see
+SPEC.md's "Arc plan"); Parts 2 (Reed-Muller/Reed-Solomon decoder) and 3
+(PKE/KEM composition, byte-exact KAT) will consult the same reference tag
+and should extend this file rather than duplicate its header.
