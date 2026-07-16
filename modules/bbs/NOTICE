@@ -1,0 +1,67 @@
+bbs — provenance note
+======================
+
+Kept as a module-local NOTICE (same placement as the sibling `bls12_381`/
+`frost`/`voprf`/`bulletproofs`/`bn254` modules — self-contained crypto
+modules not folded into the root `NOTICE`).
+
+Provenance
+----------
+
+bbs — the protocol design follows **draft-irtf-cfrg-bbs-signatures-04**
+(fetched 2026-07-16 from `https://www.ietf.org/archive/id/
+draft-irtf-cfrg-bbs-signatures-04.txt`), the BLS12-381-SHA-256
+ciphersuite (§6.2.2). This is a public IETF Internet-Draft; the draft's
+TEXT (the protocol description/equations being followed) is not itself
+a copyrightable implementation, and no source code accompanying the
+draft was consulted or ported — see CONVENTIONS.md §5's merger-doctrine
+note (the same posture this repo's other spec-derived modules take for
+their own IETF sources).
+
+**Why draft-04, not the current draft (`-10` as of this writing)**: the
+BBS Signatures draft's CoreSign/ProofGen wire format changed across
+revisions (confirmed at drafts `-06` and `-05` respectively — see
+`SPEC.md`'s version-pinning section for the byte-level evidence), and
+this module's KAT vectors are drawn from a reference implementation
+whose fixtures happen to match draft-04, not the current draft. See
+`SPEC.md` for the full determination methodology.
+
+Test vectors
+------------
+
+`mattrglobal/pairing_crypto` (Rust, Apache-2.0,
+`github.com/mattrglobal/pairing_crypto`), commit
+`b91a807d6a2d1d3bb039f2d67a53e21b686b7395`, path
+`tests/fixtures/bbs/bls12_381_sha_256/` — `keypair.json`,
+`generators.json`, `h2s.json`, `MapMessageToScalarAsHash.json`,
+`mockedRng.json`, `signature/signature{001,002,004}.json`,
+`proof/proof{001,003,004}.json` — transcribed verbatim (hex case
+preserved as published) into `src/kat_vectors.zig`. These are published
+test-vector JSON files (data, not source code subject to a nontrivial
+license obligation beyond attribution); the repository itself is
+Apache-2.0 licensed. The mocked-RNG seed/DST-reuse convention
+(`SPEC.md`'s "Mocked-RNG seed provenance" section) was additionally
+confirmed from that project's `tools/bbs-fixtures-generator/src/
+mock_rng.rs` and `tools/bbs-fixtures-generator/src/generators/proof.rs`
+— consulted as a DESIGN REFERENCE for how the fixture generator wires
+`SEED`/`count` together (no source ported; this module's own
+`ciphersuite.mockedRandomScalars` is a from-scratch Zig implementation
+of the draft's own §7.1 `seeded_random_scalars` pseudocode).
+
+`bls12_381` (this repo — `modules/bls12_381`) supplies every field/
+group/pairing/hash-to-curve primitive this module builds on
+(`G1`/`G2` point arithmetic and wire codecs, `hash_to_curve.
+expandMessageXmd`/`hashToCurveG1`, `Fr.reduceWide`, `pairing.
+pairingCheck`); no new field, group, or hash-to-curve primitive is
+implemented here.
+
+No GPL/LGPL/AGPL source was consulted or copied anywhere in this
+module.
+
+**Status: COMPLETE.** Ciphersuite machinery (`ciphersuite.zig`), key
+generation (`keys.zig`), both wire structs' byte codecs
+(`bbs.Signature`, `bbs.Proof`), and the four irreducible cryptographic
+cores — `bbs.sign`/`.verify`/`.proofGen`/`.proofVerify` — are all
+implemented and tested for real, byte-exact against the fixtures above.
+`gate.core_implemented = true`; the full suite passes byte-exact in
+Debug and ReleaseFast. See `SPEC.md`'s "Cores (implemented)" section.
