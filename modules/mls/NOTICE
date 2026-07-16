@@ -62,13 +62,41 @@ Provenance
    implementation source from any of the repository's per-language
    interop targets (`build/`, `interop/`, `docker/`) was read or ported.
 
+4. **`mlswg/mls-implementations`, Part 2 (TreeKEM) vectors** —
+   `kat_treekem_test.zig`'s KAT source: `test-vectors/tree-validation.json`,
+   `test-vectors/tree-operations.json`, `test-vectors/treekem.json`,
+   fetched directly on 2026-07-16 from the same repository's `main`
+   branch (HEAD `cfd450286d1bfd9cd2519b95c80f9771f94a5b1a` — unchanged
+   from item 3's 2026-07-15 fetch, the repo hadn't moved). Per-file
+   last-modified commits: `tree-validation.json` →
+   `9ea691fee9464aaeee9eadf9757963f1be88f5dd` (2023-02-20, "Update after
+   fixing serialization bug"), `tree-operations.json` →
+   `89134d5de0222bd99598ba5849003d2e85e63116` (2025-11-30, "Change the
+   leafnode in the update proposal to source=update"), `treekem.json` →
+   `112c2d3960a558663280a1bbb18258766fea9d0d` (2023-03-01, "Update
+   TreeKEM test vector"). Same public-conformance-data posture as item 3
+   — no explicit OSS license on the source repository, but public
+   NUMERIC interop data (encoded ratchet trees, tree hashes, UpdatePath
+   ciphertexts, path secrets), not copyrightable expression.
+   **UNLIKE item 3, filtered to cipher suite `0x0001` BEFORE embedding**
+   (`jq -c '[.[] | select(.cipher_suite==1)]'`, entry order preserved) —
+   the unfiltered upstream files are 1.3 MB / 51 KB / 1.97 MB across 7
+   cipher suites; this module only wires suite `0x0001` (`suite.zig`), so
+   embedding the other 6 suites' data verbatim (unlike Part 1's small
+   `crypto-basics.json`, filtered at test-time instead) would have meant
+   a 3.4 MB `@embedFile` + `std.json` parse of mostly-irrelevant data on
+   every test run for no conformance benefit. Filtered files embedded as
+   `src/data/tree-validation.json` (115 KB, 14 entries) /
+   `src/data/tree-operations.json` (49 KB, 5 entries) /
+   `src/data/treekem.json` (164 KB, 11 entries).
+
 No third-party MLS IMPLEMENTATION (mls-rs, OpenMLS, mlspp, or any other
 language's MLS library) was read, consulted as a design reference, or
 ported from for this module. Every algorithm was implemented directly
 from RFC 9420's own text/pseudocode (item 1/2) and verified against the
-public interop vectors (item 3) — the same "spec + KAT, no third-party
+public interop vectors (items 3/4) — the same "spec + KAT, no third-party
 source" posture this repo's `hpke`/`signal` NOTICE-free modules document
 in their own SPEC.md "no NOTICE entry" reasoning; this file exists only
-because item 3's vector-fetch and item 2's direct-port relationship
+because items 3/4's vector-fetch and item 2's direct-port relationship
 warrant the same explicit-citation caution `bn254`/`bls12_381` apply to
 their own KAT sources.

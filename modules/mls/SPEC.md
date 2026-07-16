@@ -113,7 +113,7 @@ parent-hash validation logic does (see Part 2 below).
 | Part | Scope | Tier | RFC-vector components |
 |---|---|---|---|
 | **1 (this part)** | Cipher suite, labeled crypto, tree math, codec | **Sonnet** | `tree-math.json`, `crypto-basics.json` |
-| **2 — TreeKEM core** | `UpdatePath`/`UpdatePathNode`, parent-node content, tree-hash (§7.1/§7.8), resolution (§4.1's "resolved node set" computation), the actual path-secret-derivation-and-encryption-to-a-copath walk (§7.6) | **Fable** — the genuinely hard piece the task brief flags. Parent-hash chaining (§7.9) and resolution are subtle recursive tree-validation logic with real security consequences if wrong (a forged parent-hash or a wrong resolution set can let a malicious member inject an unauthorized key into another member's derived path) — the "hardest TIER, not crypto-only" bar this repo's Fable pool applies | `tree-operations.json`, `tree-validation.json`, `treekem.json` (mlswg vector names — not yet fetched/audited by this Part) |
+| **2 — TreeKEM** | `LeafNode`/`ParentNode`/`Node`/`RatchetTree` + wire codec + tree-shape edits (§7.1/§7.2/§7.7/§12.1.1-3) + tree-hash (§7.8) — Sonnet, DONE. `resolution` (§4.1), `parentHash`+chain validation (§7.9), path-secret-derivation-and-UpdatePath (§7.4-§7.6) — **IMPLEMENTED + KAT-pinned 2026-07-16, Fable**. Whole part **COMPLETE**. | Split tier: the data/codec/tree-hash/tree-editing is mechanical (Sonnet, KAT'd byte-exact); the five cores are the genuinely hard piece the task brief flags — subtle recursive tree-validation logic with real security consequences if wrong (a forged parent-hash or a wrong resolution set can let a malicious member inject an unauthorized key into another member's derived path) — the "hardest TIER, not crypto-only" bar this repo's Fable pool applies, now pinned byte-exact | `tree-operations.json` (real), `tree-validation.json` (tree-hash/leaf-signature + resolution + parent-hash accept/tamper), `treekem.json` (`processUpdatePath` + `applyUpdatePath`) — all byte-exact, gate now `true`; see "Part 2 — TreeKEM" below |
 | **3 — LeafNode / KeyPackage / Credential** | §5.3 credentials, §7.2/§7.3 `LeafNode` content + validation (`leaf_node_validation.json`), `KeyPackage` (§10) wire format + validation | **Sonnet** — mostly `codec.zig`-shaped serialization plus signature verification (`SignWithLabel`/`VerifyWithLabel` from THIS part) over well-specified structs; the validation RULES (§7.3's numbered list) are mechanical checks, not novel crypto | `key-package-validation.json`, `leaf-node-validation.json` |
 | **4 — Key Schedule** | §8's full `init_secret_[n-1] → ... → init_secret_[n]` chain, §8.1 `GroupContext`, §9 Secret Tree (`DeriveTreeSecret` from THIS part slots in directly) | **Sonnet** — pure composition of `ExpandWithLabel`/`DeriveSecret` (already built) over a well-specified derivation graph; the only subtlety is getting the derivation ORDER exactly right, which the RFC's own diagram (Figure 22) pins unambiguously | `key-schedule.json`, `secret-tree.json`, `message-protection.json` |
 | **5 — Proposal / Commit / framing** | §11-§12 Proposal types, Commit processing, `PublicMessage`/`PrivateMessage` framing + the membership/confirmation MACs | **Sonnet** — mechanical message-type composition over Parts 1-4's primitives, EXCEPT the Commit-processing state machine's interaction with TreeKEM (applying a Commit's proposals correctly against the ratchet tree) which leans on Part 2's resolution logic being right | `messages.json`, `commit-processing` vectors |
@@ -128,6 +128,123 @@ ALGORITHM binding them together correctly under adversarial tree state
 (a malicious member's LeafNode, a stale/forked view of the tree, a
 resolution set computed over unmerged leaves). This matches the task
 brief's own expectation exactly.
+
+## Part 2 — TreeKEM (2026-07-16)
+
+**Files:** `tree.zig` (`LeafNode`/`ParentNode`/`Node`/`RatchetTree`, wire
+codec, leaf-signature verification, `addLeaf`/`updateLeaf`/`removeLeaf`),
+`treehash.zig` (`treeHash`/`rootHash`), `treekem.zig` (`HPKECiphertext`/
+`UpdatePathNode`/`UpdatePath` wire structs, plus the five now-implemented
+cores `resolution`/`parentHash`/`validateParentHashes`/
+`processUpdatePath`/`applyUpdatePath`), `gate.zig`
+(`treekem_core_implemented = true`), `wire_lists.zig`
+(shared variable-length-vector encode/decode helpers, factored out of
+`tree.zig` so `treekem.zig`'s `UpdatePathNode`/`UpdatePath` reuse the
+same shape), `kat_treekem_test.zig` (the KAT harness).
+
+**Design choice: allocator-owned, unlike Part 1.** `codec.zig`'s
+`Writer`/`Reader` are zero-allocation (Part 1's primitives are fixed-size
+or caller-bounded). A `RatchetTree` is inherently a dynamic collection —
+member count varies at runtime — so `tree.zig`'s `decode` functions take
+an allocator and own their sub-slices, the same convention the sibling
+`ssh` module's `messages.readString`/`readNameList(gpa, r)` already
+established for this repo. `encodedLen()`/`encode()` pairs (mirroring
+`codec.varint.encodedLen`/`.encode`) let every struct size its own
+destination buffer by pure arithmetic — no scratch buffer, no growable
+writer — since every field bottoms out in an already-in-memory byte slice
+or fixed-width int (`wire_lists.zig`'s module doc comment).
+
+**`treeHash` (§7.8) implemented for real, not stubbed** — the task brief
+explicitly left this as a judgment call ("prefer implementing it, it's not
+the hard part"), and it is indeed mechanical recursive hashing over
+already-real `LeafNode`/`ParentNode` encodings, with no adversarial-tree-
+state judgment call the way VALIDATING a tree (`treekem.zig`'s stubs)
+needs. Byte-exact against all 14 suite-`0x0001` entries of
+`tree-validation.json`'s `tree_hashes` field, every node index (300+
+checks), ungated.
+
+**Tree-shape editing (`addLeaf`/`updateLeaf`/`removeLeaf`, §7.7/
+§12.1.1-§12.1.3) implemented for real, not stubbed** — also a deliberate
+judgment call: applying an Add/Update/Remove PROPOSAL to a tree (find-or-
+extend a blank leaf; blank a direct path; truncate a now-empty right
+subtree) is mechanical index bookkeeping built on `treemath.zig`'s
+already-real `direct_path`, with no resolution/parent-hash ALGORITHM
+involved — distinct from the four Fable cores (which are specifically
+about which KEYS a path secret gets encrypted to and how a key's
+provenance is cryptographically proven, not about which array slots move
+where). Byte-exact against all 5 suite-`0x0001` entries of
+`tree-operations.json` (`tree_hash_before`/`tree_after` bytes/
+`tree_hash_after`, all three fields checked, ungated).
+
+One real bug this KAT caught during scaffolding: `removeLeaf`'s
+truncation loop originally sliced the tree's right subtree at
+`nodes[left_idx+1..]`, confusing the LEFT CHILD's array index
+(`treemath.left(root)` — the root of the left subtree, sitting in the
+MIDDLE of that subtree's own index span) with the left subtree's
+BOUNDARY (`2*left_idx+1` — see `tree.zig`'s `removeLeaf` doc comment for
+the derivation). `tree-operations.json`'s one `remove` vector whose
+truncation crosses more than one tree-size halving (16 leaves → 8 leaves)
+caught this immediately (`tree_hash_after` mismatched even though the
+byte-trimmed `tree_after` output happened to still match, since Part 1's
+`encode`'s OWN trailing-blank-trim independently arrived at the same
+final byte count) — exactly the kind of bug a byte-exact KAT is supposed
+to catch that a "does it look right" review would not.
+
+**KAT sourcing.** `mlswg/mls-implementations`, same repo/license posture
+as Part 1's `NOTICE` entry documents (no explicit OSS license, public
+interop conformance DATA not copyrightable expression). Fetched
+2026-07-16 from `main` (repo HEAD `cfd450286d1bfd9cd2519b95c80f9771f94a5b1a`,
+same commit Part 1 cites — the repo hadn't moved). Per-file last-modified
+commits: `tree-validation.json` → `9ea691fee9464aaeee9eadf9757963f1be88f5dd`
+(2023-02-20), `tree-operations.json` → `89134d5de0222bd99598ba5849003d2e85e63116`
+(2025-11-30), `treekem.json` → `112c2d3960a558663280a1bbb18258766fea9d0d`
+(2023-03-01). **Filtered to cipher suite `0x0001` BEFORE embedding**
+(unlike Part 1's `crypto-basics.json`, embedded verbatim and filtered at
+test-time) — the unfiltered files are 1.3 MB/51 KB/1.97 MB (7 cipher
+suites); filtering to suite `0x0001` alone (this module's only wired
+suite) shrinks them to 115 KB/49 KB/164 KB (14/5/11 entries respectively)
+before `@embedFile`, avoiding a 3.4 MB `@embedFile` + `std.json` parse of
+mostly-irrelevant-suite data on every test run. Filtered with `jq -c
+'[.[] | select(.cipher_suite==1)]'`, entry ORDER within each file
+preserved from upstream.
+
+**What's gated vs. real, and why:**
+
+- `tree-validation.json`: tree-hash (all node indices) and leaf-signature
+  verification (all 161 suite-`0x0001` leaves across the 14 trees) —
+  REAL, ungated, byte-exact/verify-exact. `resolution`/
+  `validateParentHashes` checks — GATED (need the Fable cores).
+- `tree-operations.json`: the WHOLE vector (Add/Update/Remove application
+  + resulting tree bytes + both tree hashes) — REAL, ungated (see above).
+  Uses a MINIMAL test-local `Proposal`/`KeyPackage` parser
+  (`kat_treekem_test.zig`'s `applyProposal`/`LocalProposalType`) rather
+  than a public `tree.zig` API — full `KeyPackage`/`Proposal` types are
+  Part 3/5's job per the Arc breakdown table above; this Part only needs
+  to pull a `LeafNode`/leaf-index out of the wire bytes to drive
+  `RatchetTree.addLeaf`/`updateLeaf`/`removeLeaf`.
+- `treekem.json`: driven in full behind the (now-`true`) gate — THE vector
+  that proves the path-secret+resolution+UpdatePath logic. `processUpdatePath`
+  reproduces each update path's `commit_secret` + first path secret across
+  all 62 update paths / 328 receiver views (under the provisional
+  GroupContext, `tree_hash = tree_hash_after`), and `applyUpdatePath`
+  merges each of the 62 to reproduce `tree_hash_after` — all byte-exact.
+  The gated tests followed this repo's `bn254`/`df-elect`/`pping` gate-flag
+  precedent while stubbed; the gate is now flipped and they run.
+
+**The five cores** (`treekem.zig`), each with its own rich doc-contract
+citing exact RFC §-refs and wire facts — see that file directly rather
+than duplicating the contracts here (SPEC.md's non-overlap rule,
+`CONVENTIONS.md` §5):
+
+- `resolution(allocator, tree, index) Error![]usize` — §4.1.
+- `parentHash(comptime S, allocator, tree, index) Error![S.Hash.digest_length]u8` — §7.9.
+- `validateParentHashes(comptime S, allocator, tree) Error!void` — §7.9.2.
+- `processUpdatePath(comptime S, allocator, tree, receiver: PrivateLeafState, sender_leaf_index, update_path, group_context) Error!ProcessedUpdatePath` — §7.4/§7.5/§7.6 (receiver side; yields `commit_secret`).
+- `applyUpdatePath(allocator, tree, sender_leaf_index, update_path) Error!void` — §7.5 (public-side merge).
+
+`group_context` is accepted as ALREADY-ENCODED bytes rather than a typed
+`GroupContext` — that type is Part 4's (Key Schedule) job per the Arc
+breakdown table; Part 2 doesn't build it just to pass a parameter through.
 
 ## Threat model
 
@@ -184,16 +301,31 @@ brief's own expectation exactly.
   Options when that part lands: widen `label_scratch_len`, or add a
   caller-supplied-scratch-slice overload alongside the current
   fixed-buffer convenience functions.
-- **Part 2 (TreeKEM) vector fetch/audit not yet done** — `tree-
-  operations.json`/`tree-validation.json`/`treekem.json` from
-  `mlswg/mls-implementations` need the same fetch-and-embed treatment
-  `kat_test.zig` gives `tree-math.json`/`crypto-basics.json` here, plus a
-  read of RFC 9420 §7 end-to-end before implementation starts (this Part
-  deliberately did not do that reading — out of scope per the task
-  brief).
+- **Part 2 (TreeKEM) vector fetch/audit — DONE 2026-07-16**, see "Part 2 —
+  TreeKEM" above (was previously listed here as not-yet-done).
 - **`treemath.zig`'s `common_ancestor_semantic`/`common_ancestor_direct`**
   (RFC 9420 Appendix C also publishes these) are NOT implemented here —
   not required by `tree-math.json`'s published fields (`root`/`left`/
   `right`/`parent`/`sibling` only) and not needed until a later part's
   actual TreeKEM resolution logic wants them; add then, following the
   same direct-port approach.
+- **Part 2's five Fable cores are DONE 2026-07-16** —
+  `resolution`/`parentHash`/`validateParentHashes`/`processUpdatePath`/
+  `applyUpdatePath` (`treekem.zig`) are implemented and the gate
+  (`gate.treekem_core_implemented`) is `true`. `tree-validation.json`'s
+  resolution/parent-hash-chain checks and the whole `treekem.json` vector
+  (`kat_treekem_test.zig`) now run byte-exact. NB: the in-repo harness had
+  two owner-fixed defects the Fable pass correctly refused to hack around
+  (it proved correctness via a scratch driver instead) — the gated
+  `processUpdatePath` test seeded `group_context = ""`/empty path secrets
+  (every decrypt fails `AuthenticationFailed` regardless of correctness),
+  and the parent-hash negative control indexed `tampered[0]` on the root's
+  zero-length hash (an OOB panic); both were rewritten to the official
+  `test-vectors.md` procedure (provisional GroupContext with
+  `tree_hash = tree_hash_after`; tamper only non-empty hashes) with every
+  assertion kept byte-exact.
+- **`ParentNode.unmerged_leaves` sorted-increasing invariant (RFC 9420
+  §7.1) is not decode-time validated** — `tree.zig`'s `ParentNode.decode`
+  accepts any order; a later part (or the Fable pass's
+  `validateParentHashes`) may want to check this explicitly if a vector
+  ever exercises a violation (none of Part 2's KATs do).
