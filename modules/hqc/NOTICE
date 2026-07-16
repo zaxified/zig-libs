@@ -48,6 +48,15 @@ exact algorithmic behavior the spec's prose leaves underspecified:
 - (Part 2) The RS-then-RM encode / RM-then-RS decode concatenation order
   (`code.zig`) — reference: `src/common/code.c`'s `code_encode`/
   `code_decode`.
+- (Part 3) The HQC-PKE keygen/encrypt/decrypt byte layout and sampling
+  order (`pke.zig`) — reference: `src/ref/hqc.c`'s `hqc_pke_keygen`/
+  `hqc_pke_encrypt`/`hqc_pke_decrypt` and `src/ref/parsing.c`'s
+  `hqc_ek_pke_from_string`/`hqc_dk_pke_from_string`.
+- (Part 3) The Fujisaki-Okamoto implicit-rejection KEM transform's exact
+  hash wiring and constant-time-selection mask arithmetic (`kem.zig`) —
+  reference: `src/common/kem.c`'s `crypto_kem_keypair`/`crypto_kem_enc`/
+  `crypto_kem_dec`, `src/ref/vector.c`'s `vect_compare`, and
+  `src/ref/parsing.c`'s `hqc_c_kem_to_string`/`hqc_c_kem_from_string`.
 
 Test-vector oracles (also design-reference, not ported source):
 - Part 1: the same tag's `kats/ref/hqc-1/intermediates_values` file — a
@@ -66,6 +75,11 @@ Test-vector oracles (also design-reference, not ported source):
   array literals by a small Python script and embedded in
   `src/kat_vectors_code.zig`. No hex value in that file was hand-
   transcribed or LLM-summarized from the reference.
+- Part 3: the official NIST-format KAT files,
+  `kats/ref/hqc-{1,3,5}/PQCkemKAT_{2321,4602,7333}.rsp` (same tag),
+  fetched via `curl` and parsed by a small Python script (no hand
+  transcription, no LLM-summarized hex); the first 3 `count`s per
+  parameter set are embedded in `src/kat_vectors_kem.zig`.
 
 See SPEC.md's Verification section for exactly which primitives are
 numeric-KAT-pinned against these fixtures vs. transcribed-from-source-only.
@@ -73,9 +87,9 @@ numeric-KAT-pinned against these fixtures vs. transcribed-from-source-only.
 No other third-party source was ported or consulted. Uses only the Zig
 standard library (`std.crypto.hash.sha3`: SHAKE256, SHA3-256, SHA3-512).
 
-This is Parts 1+2 of a multi-part arc (ring + PRNG foundation, plus the
-complete RS/RM concatenated codec — both ENCODE and the two DECODE cores,
+This is the complete arc (Parts 1-3): ring + PRNG foundation, the
+complete RS/RM concatenated codec (both ENCODE and the two DECODE cores,
 the latter implemented as exact ports of the reference's
-`reed_solomon_decode`/`reed_muller_decode`/`fft.c`, see SPEC.md's "Arc
-plan"); Part 3 (PKE/KEM composition, byte-exact KAT) will consult the same
-reference tag and should extend this file rather than duplicate its header.
+`reed_solomon_decode`/`reed_muller_decode`/`fft.c`), and the PKE + FO-KEM
+composition (`pke.zig`/`kem.zig`, byte-exact against the official NIST
+KAT) — see SPEC.md's "Arc plan".

@@ -4,8 +4,11 @@
 //! ships ML-KEM/ML-DSA, both lattice-based; HQC is code-based — a
 //! genuine, previously-unfilled gap in this repo's PQ coverage).
 //!
-//! **This is Part 1 of a multi-part arc — the ring/PRNG foundation, not a
-//! usable KEM yet.** No `keygen`/`encapsulate`/`decapsulate` exist here.
+//! **Part 3 (this update) completes the arc: a usable KEM.** `Hqc128`/
+//! `Hqc192`/`Hqc256` (thin `kem.Kem(params, generator)` instantiations)
+//! expose `keypair`/`encaps`/`decaps` — see "Part 3" below. What follows
+//! documents Part 1 (ring/PRNG foundation) for context.
+//!
 //! What Part 1 delivers:
 //!
 //! - `params` — the three NIST parameter sets (hqc-128/192/256) as
@@ -59,6 +62,23 @@
 //! at-capacity correction, exhaustive RM decode — across all three
 //! parameter sets, including hqc-192/256's PARAM_FFT=5 radixBig path).
 //!
+//! **Part 3 adds `pke` (the HQC public-key encryption scheme) and `kem`
+//! (the Fujisaki-Okamoto implicit-rejection KEM transform over `pke`)** —
+//! spec §3.5/§4.2, reference `src/ref/hqc.c` + `src/common/kem.c`. This is
+//! **pure Sonnet composition, confirmed no Fable-hard core**: every step
+//! is direct wiring over Parts 1-2's already-real primitives (`gf2x.Ring`
+//! for the ring arithmetic, `prng`'s samplers/I/G/H/J hashes, `code.Code`
+//! for the error-correcting encode/decode) — no new algorithm is
+//! introduced, same posture this repo's bn254 precompiles/Groth16
+//! composition carried. Byte-exact against the official NIST KAT
+//! (`kem_kat_test.zig` / `kat_vectors_kem.zig`: first 3 `count`s per
+//! parameter set, pk/sk/ct/ss all verified, plus `decaps` on the genuine
+//! ciphertext recovering the same `ss` — reproducing the reference's own
+//! `main_kat.c` self-check). See `pke.zig`/`kem.zig`'s module docs for the
+//! exact byte-layout and FO-transform details matched against the
+//! reference (sampling order, hash domain wiring, the `vect_compare`
+//! constant-time mask trick for implicit rejection).
+//!
 //! Provenance: `NOTICE` for the reference-implementation design
 //! reference; SPEC.md for the exact spec version + KAT source + what's
 //! pinned vs. self-tested.
@@ -88,6 +108,21 @@ pub const reedmuller = @import("reedmuller.zig");
 pub const code = @import("code.zig");
 /// The Part-2 decoder-core gate (now `true`) — see gate.zig.
 pub const gate = @import("gate.zig");
+/// Part 3: the HQC public-key encryption scheme (pure composition over
+/// gf2x/prng/code — no new algorithm, see pke.zig's module doc).
+pub const pke = @import("pke.zig");
+/// Part 3: the HQC-KEM Fujisaki-Okamoto (implicit-rejection) transform
+/// over `pke` — the arc's top-level deliverable.
+pub const kem = @import("kem.zig");
+
+/// HQC-128 (NIST category 1) KEM — `keypair`/`encaps`/`decaps` plus every
+/// byte size (`ek_bytes`/`dk_bytes`/`ct_bytes`/`ss_bytes`/`coins_bytes`).
+/// Byte-exact against the official NIST KAT (`kem_kat_test.zig`).
+pub const Hqc128 = kem.Kem(params.hqc128, reedsolomon.generator_hqc128);
+/// HQC-192 (NIST category 3) KEM — see `Hqc128`.
+pub const Hqc192 = kem.Kem(params.hqc192, reedsolomon.generator_hqc192);
+/// HQC-256 (NIST category 5) KEM — see `Hqc128`.
+pub const Hqc256 = kem.Kem(params.hqc256, reedsolomon.generator_hqc256);
 
 test {
     // Dark-tests rule (CONVENTIONS.md §6.3): every submodule's tests must
@@ -102,4 +137,7 @@ test {
     _ = code;
     _ = gate;
     _ = @import("code_kat_test.zig");
+    _ = pke;
+    _ = kem;
+    _ = @import("kem_kat_test.zig");
 }

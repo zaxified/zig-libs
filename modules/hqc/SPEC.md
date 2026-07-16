@@ -1,10 +1,12 @@
 # hqc — SPEC
 
-A multi-part HQC arc. Part 1 (ring + PRNG foundation) is done. Part 2
-(concatenated Reed-Muller/Reed-Solomon codec) is complete: encode is
-byte-exact-KAT'd and both decoders are implemented (exact ports of the
-v5.0.0 reference) with decode-correctness tests (see "Part 2" and "Arc
-plan" below). See [README.md](README.md) for purpose and API.
+A multi-part HQC arc, now **complete**. Part 1 (ring + PRNG foundation) is
+done. Part 2 (concatenated Reed-Muller/Reed-Solomon codec) is complete:
+encode is byte-exact-KAT'd and both decoders are implemented (exact ports
+of the v5.0.0 reference) with decode-correctness tests. Part 3 (PKE + FO
+KEM composition) is complete: `Hqc128`/`Hqc192`/`Hqc256` are a usable KEM,
+byte-exact against the official NIST KAT (see "Part 3" and "Arc plan"
+below). See [README.md](README.md) for purpose and API.
 
 ## Spec version + why this one
 
@@ -33,19 +35,26 @@ plan" below). See [README.md](README.md) for purpose and API.
   changes) — Part 3's KAT reproduction targets `v5.0.0` and should be
   revisited if/when a FIPS draft KAT appears.
 - **KAT source for Part 3**: `kats/ref/hqc-{1,3,5}/PQCkemKAT_*.rsp`
-  (fetched via `curl`, not a paraphrasing tool — see kat_vectors.zig) —
-  count=0..99 keypair/ciphertext/shared-secret vectors, standard NIST
-  `.rsp` format (`seed`/`pk`/`sk`/`ct`/`ss`). The 48-byte `seed` field
-  feeds HQC's own `Prng` (see "PRNG" below) directly — **no AES-256-CTR-
-  DRBG is needed**, confirmed by reading
-  `packaging/utils/helpers/main_kat.c` (the actual `PQCgenKAT_kem.c`
-  harness shipped in this release): it calls
-  `prng_init(entropy_input, NULL, 48, 0)` then `prng_get_bytes(seed, 48)`
-  per vector, and re-derives the same per-vector `seed` via a second
-  `prng_init(seed, NULL, 48, 0)` before `crypto_kem_keypair`/`_enc`. This
-  is a deliberate departure from the classic NIST harness (which normally
-  wraps AES-256-CTR-DRBG) — HQC's own release replaces it with SHAKE256,
-  which `std.crypto` already has.
+  (fetched via `curl`, not a paraphrasing tool — see
+  `kat_vectors_kem.zig`) — the `.rsp` files ship count=0..99
+  keypair/ciphertext/shared-secret vectors each (standard NIST `.rsp`
+  format: `seed`/`pk`/`sk`/`ct`/`ss`); this module pins the first 3
+  (`count`=0,1,2) per parameter set, enough for byte-exact confidence
+  without embedding the full 100-vector/1.8-5.8 MB-per-set files (see
+  `kat_vectors_kem.zig`'s module doc). The 48-byte `seed` field feeds
+  HQC's own `Prng` (see "PRNG" below) directly — **no AES-256-CTR-DRBG is
+  needed**, confirmed by reading `packaging/utils/helpers/main_kat.c`
+  (the actual `PQCgenKAT_kem.c` harness shipped in this release): it
+  calls `prng_init(entropy_input, NULL, 48, 0)` then
+  `prng_get_bytes(seed, 48)` per vector, and re-derives the same
+  per-vector `seed` via a second `prng_init(seed, NULL, 48, 0)` before
+  `crypto_kem_keypair`/`_enc`. This is a deliberate departure from the
+  classic NIST harness (which normally wraps AES-256-CTR-DRBG) — HQC's
+  own release replaces it with SHAKE256, which `std.crypto` already has.
+  `kem_kat_test.zig` reproduces this exactly: one continuing `Prng`
+  stream feeds `seed_kem` (32 B, for `keypair`) then `coins` (m || salt,
+  for `encaps`), matching `crypto_kem_keypair` then `crypto_kem_enc`
+  drawing off the same DRBG in sequence.
 
 ## Design
 
@@ -174,6 +183,8 @@ plan" below). See [README.md](README.md) for purpose and API.
 | `reedmuller.RM(p).encodeBlock`/`encodeSymbol` | Numeric-KAT-pinned | `code_kat_test.zig`: byte-exact vs. the reference's `encode`+duplication for 8 byte values × 3 parameter sets |
 | `code.Code(p,g).encode` | Numeric-KAT-pinned (hqc-128 full; hqc-192/256 zero-message only) | `code_kat_test.zig`: byte-exact vs. the reference's `code_encode`; full-codeword vectors for 3 message patterns on hqc-128, zero-message only on hqc-192/256 (see `kat_vectors_code.zig`'s coverage note) |
 | `reedsolomon.RS(p,g).decode`, `reedmuller.RM(p).decodeSymbol` | Decode-correctness tested (all 3 sets) | `code_kat_test.zig` (gated by `gate.decoder_core_implemented = true`): zero-error round-trip `decode(encode(m)) == m`, at-capacity (exactly δ symbol errors) correction at both the concatenated-code and bare-RS layers, and exhaustive 256-value RM `decodeSymbol` — covering hqc-128 (PARAM_FFT=4 unrolled radix) and hqc-192/256 (PARAM_FFT=5 `radixBig`). Exact ports of the reference; not a fresh numeric intermediate-value pin (no such fixture ships for this layer) |
+| `Pke(p,g).keygen`/`.encrypt`/`.decrypt` | Numeric-KAT-pinned (via `Kem`) | `kem_kat_test.zig`: `Kem.keypair`/`encaps`/`decaps` — which call these directly, unwrapped — reproduce the official NIST `.rsp` pk/sk/ct/ss byte-exact for all 3 parameter sets (first 3 `count`s each) |
+| `Kem(p,g).keypair`/`.encaps`/`.decaps` | Numeric-KAT-pinned | `kem_kat_test.zig`: byte-exact pk/sk/ct/ss vs. `kat_vectors_kem.zig` (official NIST `.rsp`, first 3 `count`s × 3 parameter sets), plus `decaps` on the genuine ciphertext recovering the same `ss` — reproducing `main_kat.c`'s own internal self-check. Additionally: random-coins round-trip property tests and a decaps-failure/implicit-reject test (corrupted ciphertext → deterministic `J`-derived rejection value, ≠ real `ss`, no crash) |
 
 **How the numeric pins were obtained** (for future auditing): the
 reference's `kats/ref/hqc-1/intermediates_values` file (shipped in the
@@ -191,9 +202,10 @@ recorded output for *some* seed, and reproducing it byte-exact proves
 this module's primitives match the reference's, independent of which
 seed started the chain.
 
-**What Part 1 could NOT pin**: end-to-end `.rsp` keypair/ciphertext/
-shared-secret reproduction, since that requires the full PKE (`gf2x.mul`
-composed with the Part-2 decoder) — deferred to Part 3.
+**What Part 1 could NOT pin** (now closed by Part 3): end-to-end `.rsp`
+keypair/ciphertext/shared-secret reproduction, since that requires the
+full PKE (`gf2x.mul` composed with the Part-2 decoder) — see "Part 3"
+section below for how `kem_kat_test.zig` closes this.
 
 ## Part 2 (RS/RM concatenated codec) — status
 
@@ -278,6 +290,88 @@ follow-up, not blocking Part 2/3 correctness). As with Part 1, no
 dudect/ctgrind machine verification has been run — the structural match to
 the reference is by construction, not instrument-verified.
 
+## Part 3 (PKE + FO KEM composition) — status
+
+Part 3 adds `pke.zig` (the HQC public-key encryption scheme: `Pke(p,g).
+keygen`/`.encrypt`/`.decrypt`) and `kem.zig` (the Fujisaki-Okamoto
+implicit-rejection KEM transform over it: `Kem(p,g).keypair`/`.encaps`/
+`.decaps`), plus `root.zig`'s `Hqc128`/`Hqc192`/`Hqc256` convenience
+instantiations. **This is pure composition, confirmed not Fable-hard**:
+every operation is direct wiring over Parts 1-2's already-real
+primitives — `gf2x.Ring(n).{add,mul,truncate,fromBytes,toBytes}` for all
+ring arithmetic, `prng`'s `Xof`/`Prng`/samplers/I·G·H·J hashes for every
+randomness-derivation and hash step, `code.Code(p,g).{encode,decode}` for
+the error-correcting layer. No new algorithm is introduced anywhere in
+Part 3 — the same posture this repo's bn254 precompiles/Groth16
+composition work carried (see zig_libs project memory). The only design
+decisions Part 3 makes are (a) taking `seed`/`coins` as explicit caller-
+supplied byte arrays rather than owning a stateful global PRNG (keeps the
+module free of hidden state; the reference's `main_kat.c` harness still
+gets reproduced exactly by driving `prng.Prng` manually in the KAT test —
+see `kem_kat_test.zig`) and (b) reproducing the reference's
+`vect_compare`-based constant-time mask trick for implicit rejection
+bit-for-bit (`kem.zig`'s `vectCompare`) rather than a higher-level
+`std.crypto.timing_safe` helper, to stay byte-and-structure-faithful to
+the reference the same way every other primitive in this arc is.
+
+**Byte layout, matched against the reference exactly** (`src/ref/hqc.c`,
+`src/common/kem.c`, `src/ref/parsing.c`, `src/common/symmetric.c`, all
+read directly):
+
+- `ek_pke = seed_ek(32) ‖ s(⌈n/8⌉)`; `dk_pke = seed_dk(32)` **only** — `x`
+  is generated during keygen but never serialized (decrypt only ever
+  needs `y`, which is re-derived from `seed_dk` on every call, matching
+  the reference's `hqc_dk_pke_from_string`). `ek_kem = ek_pke` verbatim;
+  `dk_kem = ek_kem ‖ dk_pke ‖ sigma ‖ seed_kem`.
+- Keygen's `(y, x)` are sampled off **one** `Xof(seed_dk)` context, y then
+  x, chained (same load-bearing `Xof.getBytes` ordering dependency Part 1
+  flagged for the ring-vector samplers). Encrypt's `(r2, e, r1)` — note
+  this order, not `(r1, r2, e)` — are sampled off one `Xof(theta)`
+  context, all three biased-sampler draws chained.
+  `s = y·h + x`; `u = r2·h + r1`; `v = C.encode(m) ⊕ Truncate(s·r2 + e)`;
+  decrypt recovers `m = C.decode(v ⊕ Truncate(u·y))` (XOR, since
+  subtraction is addition over F2).
+- KEM keygen: `(seed_pke, sigma) = Xof(seed_kem).getBytes(32) then
+  .getBytes(securityBytes)`, chained on one Xof context.
+- Encaps: `H_ek = H(ek)`; `(K, theta) = G(H_ek, m, salt)` (one SHA3-512
+  call, first half `K`, second half `theta`); `ct = u ‖ v ‖ salt`;
+  `ss = K`.
+- Decaps: `m' = Pke.decrypt(dk_pke, c)`; `(K', theta') = G(H(ek), m',
+  salt)`; re-encrypt to get `ct'`; the implicit-rejection value is
+  `K_bar = J(H(ek), sigma, ct)` — **the ORIGINAL ciphertext bytes**, not
+  the re-encrypted `ct'` — computed unconditionally (not just on
+  mismatch, so its cost doesn't leak the outcome); final
+  `ss = (ct' == ct) ? K' : K_bar`, selected via the reference's
+  `vect_compare`+mask-subtraction trick (0/1 compare result, `-% 1` wraps
+  0→0xFF/1→0x00, then `(K'[i] & mask) ^ (K_bar[i] & ~mask)` per byte) —
+  not a source-level `if`.
+
+**Reference source consulted** (same tag, `v5.0.0`): `src/ref/hqc.c`
+(`hqc_pke_keygen`/`_encrypt`/`_decrypt`), `src/ref/parsing.c`
+(`hqc_ek_pke_from_string`/`hqc_dk_pke_from_string`/
+`hqc_c_kem_to_string`/`_from_string`), `src/common/kem.c`
+(`crypto_kem_keypair`/`_enc`/`_dec`), `src/common/symmetric.c` (hash/PRNG
+domain wiring, already Part 1 territory), `src/ref/vector.c`
+(`vect_compare`, `vect_truncate` — already Part 1 territory),
+`packaging/utils/helpers/main_kat.c` (the KAT harness's DRBG-seeding
+sequence). Fetched via the GitLab raw-file endpoint, same care as Parts
+1-2 (no summarizing/paraphrasing tool).
+
+**KAT strategy for Part 3**: the official `kats/ref/hqc-{1,3,5}/
+PQCkemKAT_{2321,4602,7333}.rsp` files (100 vectors each, standard NIST
+`seed`/`pk`/`sk`/`ct`/`ss` format) were fetched via `curl` and parsed by a
+small Python script (no hand transcription, no LLM-summarized hex); the
+first 3 `count`s per parameter set are embedded in `kat_vectors_kem.zig`.
+`kem_kat_test.zig` seeds `prng.Prng` from each vector's 48-byte `seed`
+exactly as `main_kat.c` does, draws `seed_kem` then `coins` off that one
+continuing stream, and asserts `keypair`'s `(ek, dk)`, `encaps`'s
+`(ct, ss)`, and `decaps(dk, ct)`'s recovered `ss` are all byte-exact
+against the vector — the definitive end-to-end check for the whole arc.
+Also present: a random-coins round-trip property test (all three
+parameter sets) and a decaps-failure/implicit-reject test (corrupted
+ciphertext → decaps returns the deterministic `J`-derived rejection
+value, not a crash, and different from the real shared secret).
+
 ## Arc plan
 
 - **Part 1** — ring + PRNG foundation. Tier: Sonnet (mechanical
@@ -305,16 +399,18 @@ the reference is by construction, not instrument-verified.
   with `gate.decoder_core_implemented = true` and decode-correctness KATs
   driving them across all three parameter sets. Tier: **Fable** (decode
   only; encode already shipped as Sonnet work, see "Part 2 status" above).
-- **Part 3 — HQC-PKE + HQC-KEM, byte-exact vs NIST KAT**: compose Part 1
-  (ring `mul`, samplers) with Part 2 (`C.Encode`/`C.Decode`) into
-  `HQC-PKE.{Keygen,Encrypt,Decrypt}` and the salted-FO-transform
-  `HQC-KEM.{Keygen,Encaps,Decaps}` (spec §3.5/§3.6 — note this is the
+- **Part 3 — HQC-PKE + HQC-KEM, byte-exact vs NIST KAT. DONE.** Composed
+  Part 1 (ring `mul`, samplers) with Part 2 (`C.Encode`/`C.Decode`) into
+  `Pke(p,g).{keygen,encrypt,decrypt}` and the salted-FO-transform
+  `Kem(p,g).{keypair,encaps,decaps}` (spec §3.5/§3.6 — this is the
   updated `SFO^L_m` transform with implicit rejection, not the older
   `FO^L`; see the spec's 2025/08/22 and 2023/04/30 changelog entries).
-  Verify byte-exact against `kats/ref/hqc-{1,3,5}/PQCkemKAT_*.rsp` (all
-  100 vectors per parameter set) using `Prng` as the KAT DRBG (see "Spec
-  version" above — no AES needed). Tier: **Sonnet** for the composition/
-  wire-format work, contingent on Part 2 already being correct; the
+  Verified byte-exact against `kats/ref/hqc-{1,3,5}/PQCkemKAT_*.rsp`
+  (first 3 counts per parameter set pinned; see "Part 3" section above)
+  using `Prng` as the KAT DRBG (see "Spec version" above — no AES
+  needed). Tier: **Sonnet**, confirmed — pure composition/wire-format
+  work over Parts 1-2's already-real primitives, no new algorithm; the
   wire-format parsing itself (`ekKEM`/`dkKEM`/`cKEM` byte layouts) is
   mechanical struct-packing per spec §3.5/§4.2 and this module's already-
-  verified byte sizes (params.zig).
+  verified byte sizes (params.zig). **The whole HQC arc is now complete
+  and usable as a KEM** (`root.zig`'s `Hqc128`/`Hqc192`/`Hqc256`).
