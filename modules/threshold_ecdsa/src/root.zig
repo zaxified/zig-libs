@@ -87,6 +87,22 @@ pub const zkproofs = @import("zkproofs.zig");
 /// module doc comment.
 pub const signing = @import("signing.zig");
 
+/// **Audit-F1 closure (IMPLEMENTED)** — the Πprm/Πmod zero-knowledge
+/// proofs-of-correct-generation for `AuxParams` (CGGMP21 ePrint 2021/060
+/// Fig.16/17): proves a ring-Pedersen tuple `(N_tilde, h1, h2)` is a
+/// genuine Blum-integer setup (not just the structural floor
+/// `AuxParams.validate` can check without the factorization). Struct/codec/
+/// Fiat-Shamir-transcript wiring AND the two proof cores
+/// (`Piprm.prove`/`.verify`, `Pimod.prove`/`.verify`) are all REAL;
+/// `gate.aux_proofs_core_implemented` is flipped `true`, so the F1-soundness
+/// KATs (a 3-prime `n_tilde` and an `h2 ∉ ⟨h1⟩` pair both REJECT while
+/// `validate` still accepts them), completeness, and tamper tests all run —
+/// see `aux_proofs.zig`'s module doc comment.
+pub const aux_proofs = @import("aux_proofs.zig");
+
+/// Module-local feature gate — see `gate.zig`'s own doc comment.
+pub const gate = @import("gate.zig");
+
 pub const meta = .{
     .platform = .any,
     .role = .util, // pure computation (no I/O of its own)
@@ -823,9 +839,20 @@ const AuxGen = struct {
     params: AuxParams,
     /// log_{h1} h2 ∈ [1, p'·q') — SECRET. Canonical mod `n_tilde`.
     lambda: AuxFe,
+    /// Non-null only when `generateAuxParamsInternal` was called with a
+    /// non-null `retain_allocator`: `p̃`/`q̃` (big-endian, owned by that
+    /// allocator) — the two safe-prime factors of `n_tilde`. SECRET. See
+    /// `generateAuxParamsWithTrapdoor`.
+    p: ?[]const u8 = null,
+    q: ?[]const u8 = null,
 };
 
-fn generateAuxParamsInternal(random: std.Random, bits: usize) AuxGen {
+/// `retain_allocator`: when non-null, `p̃`/`q̃` are duplicated into
+/// allocator-owned slices and returned via `AuxGen.p`/`.q` INSTEAD of being
+/// discarded — the trapdoor `aux_proofs.zig`'s Πprm/Πmod provers need. When
+/// null (the ordinary `generateAuxParams` path), behavior is unchanged: `p̃`/
+/// `q̃` live only in stack buffers that get `secureZero`'d before return.
+fn generateAuxParamsInternal(random: std.Random, bits: usize, retain_allocator: ?std.mem.Allocator) std.mem.Allocator.Error!AuxGen {
     std.debug.assert(bits % 2 == 0);
     std.debug.assert(bits >= min_aux_hard_bits);
 
@@ -842,6 +869,17 @@ fn generateAuxParamsInternal(random: std.Random, bits: usize) AuxGen {
     while (true) {
         generateSafePrime(random, prime_bits, q_buf[0..prime_len]);
         if (!std.mem.eql(u8, p_buf[0..prime_len], q_buf[0..prime_len])) break;
+    }
+
+    // Retain p̃/q̃ for the caller BEFORE any further processing — the trapdoor
+    // a Πprm/Πmod prover needs (see `generateAuxParamsWithTrapdoor`). The
+    // stack copies above are still `secureZero`'d on return regardless.
+    var ret_p: ?[]const u8 = null;
+    errdefer if (ret_p) |rp| retain_allocator.?.free(rp);
+    var ret_q: ?[]const u8 = null;
+    if (retain_allocator) |gpa2| {
+        ret_p = try gpa2.dupe(u8, p_buf[0..prime_len]);
+        ret_q = try gpa2.dupe(u8, q_buf[0..prime_len]);
     }
 
     // p' = (p̃-1)/2, q' = (q̃-1)/2 — the squares-subgroup order is p'·q'.
@@ -907,7 +945,54 @@ fn generateAuxParamsInternal(random: std.Random, bits: usize) AuxGen {
     // 5. h2 = h1^lambda mod N_tilde (constant-time modexp; lambda is secret).
     const h2 = n_tilde.pow(h1, lambda_fe) catch unreachable; // lambda != 0
 
-    return .{ .params = .{ .n_tilde = n_tilde, .h1 = h1, .h2 = h2 }, .lambda = lambda_fe };
+    return .{ .params = .{ .n_tilde = n_tilde, .h1 = h1, .h2 = h2 }, .lambda = lambda_fe, .p = ret_p, .q = ret_q };
+}
+
+/// The trapdoor behind a ring-Pedersen `AuxParams` tuple: the two safe-prime
+/// factors `p̃`, `q̃` of `n_tilde` and the secret exponent `lambda = log_{h1}
+/// h2`. SECRET — as sensitive as any other private-key material. Needed by
+/// `aux_proofs.Piprm.prove`/`aux_proofs.Pimod.prove` (the Πprm/Πmod
+/// proofs-of-correct-generation that close audit F1 for real, on top of the
+/// structural floor `AuxParams.validate` already enforces) to PROVE this
+/// tuple is well-formed — see `generateAuxParamsWithTrapdoor`.
+pub const AuxTrapdoor = struct {
+    /// `p̃` (big-endian, owned — free via `deinit`). SECRET.
+    p: []const u8,
+    /// `q̃` (big-endian, owned — free via `deinit`). SECRET.
+    q: []const u8,
+    /// `log_{h1} h2 mod p'·q'`, canonical mod `n_tilde`. SECRET.
+    lambda: AuxFe,
+
+    pub fn deinit(self: AuxTrapdoor, allocator: std.mem.Allocator) void {
+        allocator.free(self.p);
+        allocator.free(self.q);
+    }
+};
+
+pub const AuxParamsWithTrapdoor = struct {
+    params: AuxParams,
+    trapdoor: AuxTrapdoor,
+};
+
+/// Like `generateAuxParams`, but ALSO retains the trapdoor
+/// (`p̃`/`q̃`/`lambda`) a Πprm/Πmod prover needs — see `AuxTrapdoor`'s doc
+/// comment. `generateAuxParams` itself is UNCHANGED (still discards the
+/// trapdoor; most callers only ever act as a proof VERIFIER under their own
+/// tuple, per its own doc comment's "λ-retention decision"). A caller that
+/// intends to broadcast a proof-of-correct-generation alongside its
+/// `AuxParams` calls this variant instead.
+///
+/// Caller owns the returned `AuxTrapdoor` — free with
+/// `result.trapdoor.deinit(allocator)`, and handle it with the same care as
+/// any other private-key material (SECRET, zero/free promptly after use).
+/// `random` MUST be cryptographically secure for real parameters; `bits`
+/// constraints are identical to `generateAuxParams`.
+pub fn generateAuxParamsWithTrapdoor(allocator: std.mem.Allocator, random: std.Random, bits: usize) std.mem.Allocator.Error!AuxParamsWithTrapdoor {
+    const gen = try generateAuxParamsInternal(random, bits, allocator);
+    return .{
+        .params = gen.params,
+        .trapdoor = .{ .p = gen.p.?, .q = gen.q.?, .lambda = gen.lambda },
+    };
 }
 
 /// Generate ring-Pedersen auxiliary parameters `(N_tilde, h1, h2)` for ONE
@@ -957,7 +1042,7 @@ fn generateAuxParamsInternal(random: std.Random, bits: usize) AuxGen {
 /// `AuxModulus.pow`, mirroring `paillier.fromPrimes`'s `g^lambda mod n²`
 /// step. All secret buffers are `secureZero`'d.
 pub fn generateAuxParams(random: std.Random, bits: usize) AuxParams {
-    const gen = generateAuxParamsInternal(random, bits);
+    const gen = generateAuxParamsInternal(random, bits, null) catch unreachable; // retain_allocator == null never allocates
     // lambda (gen.lambda) is a stack AuxFe, discarded with this frame; its
     // byte-level source buffer is already secureZero'd inside the internal
     // routine. See the λ-retention decision above.
@@ -1643,7 +1728,7 @@ test "generateAuxParams: ring-Pedersen tuple is well-formed (N_tilde composite/o
     // (min_aux_generate_bits=2048-class is the production strength; the real
     // safe-prime number theory is exercised here at a fast size.)
     const bits: usize = 128;
-    const gen = generateAuxParamsInternal(random, bits);
+    const gen = generateAuxParamsInternal(random, bits, null) catch unreachable;
     const aux = gen.params;
 
     // N_tilde: right bit length (product of two `bits/2`-bit primes with top
@@ -1784,4 +1869,47 @@ test {
 // design) represents deferred work. See `signing.zig`'s module doc comment.
 test {
     _ = signing;
+}
+
+// Pull the `aux_proofs` submodule's tests into this module's test binary —
+// same dark-tests rule. `gate.aux_proofs_core_implemented` is now `true`, so
+// every test runs for real: the struct/codec/Fiat-Shamir-transcript tests
+// plus the proof-core-dependent tests (both F1-soundness rejections,
+// completeness, and the tamper suite). See `aux_proofs.zig`'s module doc
+// comment.
+test {
+    _ = aux_proofs;
+}
+
+test "generateAuxParamsWithTrapdoor: retains p̃/q̃/lambda; p̃*q̃ == n_tilde and h2 == h1^lambda" {
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x747261706400); // "trapd\0"
+    const random = prng.random();
+
+    const bits: usize = 128;
+    const gen = try generateAuxParamsWithTrapdoor(allocator, random, bits);
+    defer gen.trapdoor.deinit(allocator);
+
+    // p̃, q̃ nonzero and distinct.
+    try testing.expect(gen.trapdoor.p.len > 0 and gen.trapdoor.q.len > 0);
+    try testing.expect(!std.mem.eql(u8, gen.trapdoor.p, gen.trapdoor.q));
+
+    // p̃ * q̃ == n_tilde (big-int check, same scratch-arena idiom the rest of
+    // this file uses).
+    var scratch: [aux_scratch_bytes]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&scratch);
+    const gpa = fba.allocator();
+    var bp = bigFromBytes(gpa, gen.trapdoor.p) catch unreachable;
+    var bq = bigFromBytes(gpa, gen.trapdoor.q) catch unreachable;
+    var bn = newBig(gpa) catch unreachable;
+    bn.mul(&bp, &bq) catch unreachable;
+    var n_buf: [aux_modulus_bytes]u8 = undefined;
+    gen.params.n_tilde.toBytes(&n_buf, .big) catch unreachable;
+    const expected_n = bigFromBytes(gpa, stripLeadingZeros(&n_buf)) catch unreachable;
+    try testing.expect(bn.order(expected_n) == .eq);
+
+    // h2 == h1^lambda mod n_tilde — same load-bearing relation the ungated
+    // `generateAuxParams` test checks via the internal `lambda`.
+    const h2_check = try gen.params.n_tilde.pow(gen.params.h1, gen.trapdoor.lambda);
+    try testing.expect(h2_check.eql(gen.params.h2));
 }

@@ -576,6 +576,18 @@ pub const Transcript = struct {
     pub fn finalize(self: *Transcript) Scalar {
         return reduceToScalar(self.hasher.finalResult());
     }
+
+    /// Like `finalize`, but returns the raw 32-byte SHA-256 digest instead
+    /// of reducing it into `Zq` — for a challenge space OTHER than `Zq`
+    /// (e.g. `aux_proofs.zig`'s Πprm/Πmod challenges, which need `{0,1}^m`
+    /// bits or an `AuxFe` per proof iteration rather than a single `Scalar`
+    /// — `aux_proofs.zig` expands this digest into as many challenge values
+    /// as it needs via its own deterministic counter-mode expansion). Same
+    /// "consumes `self` by value, call exactly once" contract as
+    /// `finalize`.
+    pub fn finalizeDigest(self: *Transcript) [32]u8 {
+        return self.hasher.finalResult();
+    }
 };
 
 /// The concrete transcript `proveAliceRange`/`verifyAliceRange` commit to

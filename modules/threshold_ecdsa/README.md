@@ -158,9 +158,17 @@ round-message types, and the `identifyAbortCulprit` stub).
   independent check against the paper's exact parameterization.
 - Full Pedersen-style distributed key generation (no single dealer ever
   learns the group secret key) — this module is trusted-dealer only.
-- `generateAuxParams` aux-param-correctness ZK proof (Πprm/Πmod): if a later
-  variant broadcasts a proof that `h2 = h1^lambda`, retain `lambda` at setup
-  (`generateAuxParamsInternal` already returns it) instead of discarding.
+- `generateAuxParams` aux-param-correctness ZK proof (Πprm/Πmod,
+  `aux_proofs.zig`): **IMPLEMENTED** — struct/codec/Fiat-Shamir-transcript
+  wiring, the trapdoor-retaining `generateAuxParamsWithTrapdoor`, AND the
+  two proof cores (`Piprm`/`Pimod` `.prove`/`.verify`, CGGMP21 Fig.16/17)
+  are all real and tested (`gate.aux_proofs_core_implemented` is `true`).
+  **Closes audit F1's residual gap** (`AuxParams.validate`'s Jacobi check is
+  necessary but not sufficient for quadratic residuosity): a crafted 3-prime
+  `n_tilde` or an `h2 ∉ ⟨h1⟩` pair that both PASS `validate` are now REJECTED
+  by `verifyWellFormed` — see `SPEC.md`'s "Πprm / Πmod" section. (Independent
+  cryptographic review of the Fiat-Shamir instantiation before production
+  MPC-custody use is still warranted, per the standing review debt below.)
 - Independent cryptographic review of `zkproofs.zig`'s Phase-2c
   constructions against GG18 Appendix A before any production signing use
   (see `SPEC.md`'s verification-level section) — Phase 2d inherits this

@@ -53,7 +53,9 @@ its own reject tests run in BOTH modes:**
   quadratic residue `h1 = r²`, a secret exponent `lambda ← [1, p'·q')`, and
   `h2 = h1^lambda mod N_tilde`. `lambda` is DISCARDED (the tuple's owner is a
   proof *verifier*, not a prover under its own `N_tilde`; see the function's
-  doc comment for the retention decision + the Πprm `TODO(2c)`).
+  doc comment for the retention decision). A separate trapdoor-retaining
+  variant, `generateAuxParamsWithTrapdoor`, exists for a party that DOES
+  need to act as a Πprm/Πmod prover — see the "Πprm / Πmod" section below.
 - **MtA (`mta.zig`)** — the semi-honest multiplicative→additive share
   conversion (`mtaAliceInit`/`mtaBobResponse`/`mtaAliceFinalize`), literally
   `paillier.mulPlaintext`+`addPlaintext`+`decrypt` composed. Correctness net:
@@ -327,12 +329,16 @@ here:
   `(h/Ñ) = +1`. **The Jacobi check is NECESSARY but not SUFFICIENT for
   quadratic residuosity** (a non-residue mod BOTH prime factors of `Ñ` also
   has symbol +1) — it is the strongest guarantee available WITHOUT `Ñ`'s
-  factorization. The full fix — a GG20/CMP `Πprm`/`Πmod` zero-knowledge
-  proof-of-correct-generation broadcast alongside the tuple — remains
-  DEFERRED (see below); the structural validation is the always-enforced
-  floor beneath it, not a replacement, and does NOT by itself make the aux
-  layer safe to call "malicious-secure" for an arbitrary per-party-aux
-  deployment.
+  factorization. The full fix — a CGGMP21 `Πprm`/`Πmod` zero-knowledge
+  proof-of-correct-generation broadcast alongside the tuple — is now
+  **IMPLEMENTED** (`aux_proofs.zig` — see the dedicated section below): a
+  generator proves its tuple well-formed via `proveWellFormed` and a
+  validator rejects any tuple whose proof fails via `verifyWellFormed`,
+  closing exactly the residuosity gap the Jacobi floor cannot. The
+  structural validation (`AuxParams.validate`) remains the always-enforced
+  cheap floor beneath it, not a replacement; a malicious-secure per-party-aux
+  deployment now runs `verifyWellFormed` on every received tuple IN ADDITION
+  to `validate`.
 - **(F2) The "closed the unbounded-`β'` freedom" claim is size-conditional**
   and only holds at `N > q⁷` — now enforced (see the Bob's-proof bounds
   section above).
@@ -344,6 +350,76 @@ cheat. F1 is a HIDING (witness-secrecy) property and F2 a range-bound-vacuity
 property; both concern what an adversary can LEARN, not what a bad signature
 it can force.
 
+## Πprm / Πmod — aux-param proofs-of-correct-generation (`aux_proofs.zig`, IMPLEMENTED — closes audit F1)
+
+**Design.** CGGMP21 (R. Canetti, R. Gennaro, S. Goldfeder, N. Makriyannis, U.
+Peled, "UC Non-Interactive, Proactive, Threshold ECDSA with Identifiable
+Aborts", IACR ePrint 2021/060) Fig.16 ("Πmod", Paillier-Blum-modulus proof)
+and Fig.17 ("Πprm", ring-Pedersen-parameter proof) let the GENERATOR of an
+`AuxParams` tuple prove it is well-formed — Πmod proves `n_tilde` is a
+genuine product of two Blum primes `p̃, q̃ ≡ 3 (mod 4)` with `gcd(n_tilde,
+φ(n_tilde)) = 1`; Πprm proves `h1` (paper's `s`) and `h2` (paper's `t`)
+generate the same cyclic subgroup, i.e. `h2 = h1^lambda mod n_tilde` for a
+KNOWN `lambda` — and let the VALIDATOR verify those proofs, fully closing
+audit F1 (the Jacobi check above is necessary-but-not-sufficient; these
+proofs are the sufficient fix the F1 write-up always pointed at).
+
+**Status: IMPLEMENTED, `pi_mod_iterations`/`pi_prm_iterations` soundness
+parameter `m = 80` (≈2^-80 error) for both.** REAL: the `ModProof`/
+`PrmProof` struct shapes and byte codecs, the Fiat-Shamir transcript wiring
+(`deriveModChallenge`/`derivePrmChallengeBits`, built on
+`zkproofs.Transcript`'s new `finalizeDigest` — the same domain-separated
+SHA-256 binding discipline the Phase-2c proofs use, extended with a local
+deterministic counter-mode expansion since Πmod/Πprm need `m` independent
+per-round challenges rather than one `Zq` scalar), `root.AuxTrapdoor` /
+`root.generateAuxParamsWithTrapdoor` (the `p̃`/`q̃`/`lambda`-retaining
+variant of `generateAuxParams` a prover needs — ordinary `generateAuxParams`
+is UNCHANGED, still discarding the trapdoor), the
+`proveWellFormed`/`verifyWellFormed` public-API wiring, AND the two
+irreducible number-theory cores, `aux_proofs.Piprm.prove`/`.verify` and
+`aux_proofs.Pimod.prove`/`.verify` (the full CGGMP21 construction: Blum-QR
+witness search + CRT quadratic-residue classification + 4th roots +
+Paillier-shaped `z_i^N` response for Πmod; `phi(n_tilde)`-modular linear
+response `z_i = a_i + e_i·lambda` for Πprm). `gate.aux_proofs_core_implemented`
+is flipped `true` — the same scaffold-then-implement pattern `bn254`'s
+`pairing.zig` and `df-elect`'s `election.decide` followed to completion.
+
+**Soundness note (deterministic-MR is defense-in-depth only).** `Pimod.verify`
+has no CSPRNG, so its "n_tilde must be composite" Miller-Rabin step draws
+witnesses deterministically from `SHA256(n_tilde)`. That MR check is NOT
+load-bearing: it only fast-rejects a genuinely PRIME `n_tilde`. The soundness
+against a 3-prime or prime-power `n_tilde` (which MR correctly sees as
+composite) is carried entirely by the per-round `z_i^N ≡ y_i` and
+`x_i^4 ≡ (−1)^{a_i} w^{b_i} y_i` equations — verified empirically: for the
+crafted 3-prime KAT below, MR reports composite (does not reject), the prover
+finds a genuine `(w/n_tilde) = −1` witness (Jacobi step does not reject), yet
+all 80 rounds fail BOTH per-round equations. Πprm's soundness is likewise
+carried by the per-round `s^{z_i} ≡ A_i · t^{e_i}` check.
+
+**KAT harness — the F1-soundness scenarios are the deliverable.** No
+official byte-vectors exist for Πprm/Πmod (same posture as every other proof
+family in this module) — `aux_proofs.zig`'s tests are UNGATED struct/codec/
+transcript-determinism assertions PLUS two crafted-parameter scenarios that
+demonstrate the exact gap these proofs close:
+
+- **(a) a 3-prime `n_tilde`** (product of three ~671-bit comptime factors,
+  odd, composite, `> q⁷`, with `h1=4`/`h2=16` — both perfect squares, hence
+  trivially Jacobi `+1`): `AuxParams.validate` ACCEPTS it (documents the gap)
+  but `Pimod.verify` REJECTS it (documents the fix) — and, per the soundness
+  note above, rejects it via the per-round `z_i^N`/`x_i^4` equations, not the
+  MR check.
+- **(b) an `(h1, h2)` pair with `h2` outside `<h1>`** (`h1=4`, `h2=9` mod a
+  genuine ~2000-bit two-factor composite — both perfect squares, hence
+  trivially Jacobi `+1`, but nothing ties `9` to a power of `4`):
+  `AuxParams.validate` ACCEPTS it but `Piprm.verify` REJECTS it (no valid
+  proof CAN exist for `h2 ∉ ⟨h1⟩`, so any candidate fails the per-round
+  `s^{z_i} ≡ A_i · t^{e_i}` equation).
+
+Plus a tamper suite (flip a byte of `w`/`x_i`/`z_i`(Πmod)/`A_i`/`z_i`(Πprm)
+in an honest proof → `verifyWellFormed` rejects) and a completeness test
+(honest `generateAuxParamsWithTrapdoor` → `proveWellFormed` →
+`verifyWellFormed` accepts) — all now run for real (gate flipped `true`).
+
 **Still deferred within Phase 2c / at the 2c-2d boundary:**
 
 - Independent cryptographic review of the implemented constructions against
@@ -354,12 +430,16 @@ it can force.
   wiring belongs to Phase 2d (the signing protocol itself), not this file;
   `zkproofs.zig`/`mta.zig` only provide the primitives.
 - `generateAuxParams`'s own correctness proof (Πprm/Πmod, `h2 = h1^lambda`)
-  remains a SEPARATE deferred item from Phase 2a. The CHEAP structural
-  validation of received aux tuples (audit F1 — composite `Ñ`, in-range
-  square-subgroup `h1`/`h2`, coprimality) is now IN and enforced fail-closed
-  at the prove entry points (`root.AuxParams.validate`); the full
-  zero-knowledge proof-of-correct-generation is the larger deferred item — see
-  below.
+  is now DONE. The CHEAP structural validation of received aux tuples (audit
+  F1 — composite `Ñ`, in-range square-subgroup `h1`/`h2`, coprimality) is
+  enforced fail-closed at the prove entry points (`root.AuxParams.validate`);
+  the full zero-knowledge proof-of-correct-generation is IMPLEMENTED
+  (`aux_proofs.zig` — struct/codec/transcript AND the two proof cores real,
+  `gate.aux_proofs_core_implemented` flipped `true` — see the dedicated
+  "Πprm / Πmod" section above). The one residual item is an independent
+  cryptographic review of the Fiat-Shamir instantiation before production
+  MPC-custody use (there is no cross-implementation KAT for Πprm/Πmod, same
+  posture as the rest of this module's proofs).
 
 ## Phase 2d — online signing (`signing.zig`, REAL end to end)
 
@@ -521,17 +601,25 @@ scope; flagged here since it was surfaced by this pass.
   standard textbook Fiat-Shamir Schnorr NIZK, not verified byte-for-byte
   against GG20's own `Πzk` instantiation (this scaffold pass did not have
   that section of the paper open) — flagged for an independent check.
-- `generateAuxParams` aux-param-correctness ZK proof (Πprm/Πmod): if a later
-  variant broadcasts a proof that `h2 = h1^lambda`, retain `lambda` at setup
-  (`generateAuxParamsInternal` already returns it) instead of discarding —
-  see the function's doc comment `TODO(2c)`. Distinct from `zkproofs.zig`'s
-  MtA range proofs — this one is about proving the AUX PARAMS themselves
-  were generated correctly, not about proving a Paillier plaintext's range.
-  **Partially addressed (audit F1): `root.AuxParams.validate` now enforces the
-  cheap structural preconditions (composite `Ñ`, `1 < h1,h2 < Ñ`, coprimality,
-  Jacobi `(h/Ñ)=+1`) fail-closed on every received tuple. Only the full
-  zero-knowledge `Πprm`/`Πmod` — the part the Jacobi check is NECESSARY-but-
-  not-SUFFICIENT for — remains deferred.**
+- `generateAuxParams` aux-param-correctness ZK proof (Πprm/Πmod): a
+  trapdoor-retaining variant, `root.generateAuxParamsWithTrapdoor`, now
+  exists (ordinary `generateAuxParams` is unchanged — still discards
+  `lambda`, per its own doc comment's retention decision). Distinct from
+  `zkproofs.zig`'s MtA range proofs — this one is about proving the AUX
+  PARAMS themselves were generated correctly, not about proving a Paillier
+  plaintext's range. **Closed (audit F1): `root.AuxParams
+  .validate` enforces the cheap structural preconditions (composite `Ñ`,
+  `1 < h1,h2 < Ñ`, coprimality, Jacobi `(h/Ñ)=+1`) fail-closed on every
+  received tuple, and the full zero-knowledge `Πprm`/`Πmod` fix — the part
+  the Jacobi check is NECESSARY-but-not-SUFFICIENT for — is now IMPLEMENTED
+  in `aux_proofs.zig` (CGGMP21 Fig.16/17): struct/codec/Fiat-Shamir-transcript
+  wiring AND the two proof cores are real and KAT-tested (including the
+  crafted-parameter scenarios — a 3-prime `Ñ` and an `h2 ∉ ⟨h1⟩` pair — that
+  both pass `validate` yet are REJECTED by `verifyWellFormed`),
+  `gate.aux_proofs_core_implemented` flipped `true` — see the dedicated
+  "Πprm / Πmod" section above. The one residual item is an independent
+  cryptographic review of the Fiat-Shamir instantiation before production
+  MPC-custody use.**
 - Full Pedersen-style DKG (no single dealer) — a distinct follow-up module,
   not a `splitSecretKey` signature change.
 - Minimum-key-size floor: NOW ENFORCED where it matters for security — every
