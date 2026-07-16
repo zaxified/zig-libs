@@ -11,7 +11,7 @@ cross-project-reusable capability — a production-grade implementation of a pro
 or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
 authors' other projects depend on it, not the reverse.
 
-**Status:** 134 modules · 4128 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 135 modules · 4155 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ## Using a module
@@ -130,6 +130,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | Module | What it does | Platform | Deps |
 |---|---|---|---|
 | `kv` | Crash-consistent embedded KV store (Bitcask-style log + **randomized seeded VOPR**: model-checked crash recovery across fuzzed fault schedules) | any | — |
+| `kvtree` | Ordered **transactional** KV store — copy-on-write B-tree (LMDB/BoltDB lineage): MVCC snapshot isolation, multi-key ACID txns, ordered range scans, VOPR-checked crash-safety. **Scaffold: transactional core is a gated Fable stub** (mechanical B-tree + read path + property harness real today) | any | kv |
 | `ramcache` | Bounded in-memory cache — **W-TinyLFU** admission/eviction (window+SLRU+CMS sketch) + TTL + generation invalidation | any | — |
 | `decimal` | Exact i128 fixed-point decimal (money math), float-free — with IEEE/GDA rounding modes, rescale + rounded division | any | — |
 | `jobqueue` | Durable background-job queue over `kv` — lease/retry/DLQ, per-partition FIFO under priority, scheduled visibility | posix | kv |
@@ -223,9 +224,11 @@ module's `SPEC.md` (once built) or the git history for the full reasoning and th
 - **`Reconcilable(T)`** (generic desired-vs-actual reconciler) — no second consumer
   exists yet; extract a small `RollbackTimer` (arm/confirm/overdue) first, once one
   appears.
-- **`kv` on-disk MVCC / transactions / ordered scans** — a multi-week B-tree + WAL build
-  with zero current consumers demanding scans or transactions; the existing Bitcask-style
-  log is enough until one does.
+- **`kv` on-disk MVCC / transactions / ordered scans** — now **scaffolded** as the
+  separate `kvtree` module (copy-on-write B-tree; `kv` v0 stays for point-store consumers
+  like `jobqueue`). Mechanical B-tree + read path + property harness are real; the
+  transactional core (`commit`/`recover`/reclaim gate) is a gated Fable stub. Remaining
+  work = implement that core and grow the gated property tests into a full VOPR.
 
 ## Non-goals — deliberately not built here
 

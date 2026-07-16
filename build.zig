@@ -51,6 +51,7 @@ const module_list = [_]Module{
     .{ .name = "mcp-http", .deps = &.{ "router", "http", "mcp" } },
     .{ .name = "coap" },
     .{ .name = "kv" },
+    .{ .name = "kvtree", .deps = &.{"kv"} },
     .{ .name = "blobmsg" },
     .{ .name = "tar" },
     .{ .name = "latency-stats" },

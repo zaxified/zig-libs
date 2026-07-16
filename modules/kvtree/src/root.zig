@@ -1,0 +1,565 @@
+// SPDX-License-Identifier: MIT
+
+//! kvtree — an embedded, ordered, transactional key-value store: a
+//! copy-on-write B-tree (LMDB/BoltDB lineage) with MVCC snapshot isolation,
+//! multi-key ACID transactions, ordered range scans, and crash-safety proven
+//! the same VOPR way `kv` v0 is. It is the ordered/transactional sibling of the
+//! `kv` Bitcask point-store — `kv` stays for get/put-only workloads (e.g.
+//! `jobqueue`); reach for `kvtree` when you need `scan(a..b)` in key order,
+//! atomic multi-key commit/rollback, or readers that see a consistent snapshot
+//! without blocking the writer.
+//!
+//! **Architecture: copy-on-write B-tree, not B-tree + WAL.** A write
+//! transaction copies every tree node on its root-to-leaf path (never mutates
+//! in place), then flips a single durable pointer — the meta page — from the
+//! old root to the new one. From that one design choice, three properties fall
+//! out for free instead of needing a separate write-ahead-log state machine:
+//! *snapshot isolation* (a reader pins an old root and reads an immutable tree
+//! version), *atomic commit* (the tree becomes visible in one pointer swap, or
+//! not at all), and *crash-safety* (double-buffered meta pages mean a torn
+//! commit leaves the previous meta as the newest valid one). The price COW pays
+//! is write amplification (a whole path rewritten per commit) and single-writer
+//! serialization — both fine for the embedded, low-contention workloads this
+//! serves; see SPEC.md for the full A-vs-B decision.
+//!
+//! **Status: scaffold — the transactional core is a Fable stub.** The page/node
+//! codecs and B-tree split/merge (`format.zig`), the `Pager` + freelist
+//! container (`pager.zig`), the read path (descend / `get` / ordered `Cursor`),
+//! fresh-store initialization, and the whole property harness with its
+//! in-memory oracle + deliberately-broken positive control (`harness.zig`) are
+//! all real and pass today. The irreducible correctness core — `commit`'s
+//! durability-ordered COW meta swap, `recover`'s crash meta-selection, and the
+//! MVCC page-reuse gate — lives in `core.zig` as `@panic` stubs, and the
+//! property tests that would drive it are gated behind `gate.fable_core_implemented`
+//! (they report SKIP, not PASS, until the flag flips).
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const kv = @import("kv");
+
+pub const meta = .{
+    .platform = .any, // all I/O via kv's Storage seam (std.Io)
+    .role = .both, // embedded ordered read+write store
+    // Single writer; MVCC readers take lockless immutable snapshots (the COW
+    // design). Reader/writer coordination safety = the gated reclaim invariant.
+    .concurrency = .single_owner,
+    .model_after = "LMDB / BoltDB (COW B-tree, meta double-buffer); VOPR = TigerBeetle",
+    .deps = .{"kv"},
+};
+
+const format = @import("format.zig");
+const pager_mod = @import("pager.zig");
+const core = @import("core.zig");
+const gate = @import("gate.zig");
+
+// ── re-exports ────────────────────────────────────────────────────────────────
+
+pub const page_size = format.page_size;
+pub const PageId = format.PageId;
+pub const Pager = pager_mod.Pager;
+pub const Freelist = pager_mod.Freelist;
+pub const Change = core.Change;
+/// Flip once `core.zig`'s three functions are real — see `gate.zig`.
+pub const fable_core_implemented = gate.fable_core_implemented;
+
+/// Re-export `kv`'s storage seam so consumers wire a backend without importing
+/// `kv` directly: production `FsStorage`, deterministic `SimStorage`.
+pub const Storage = kv.Storage;
+pub const FsStorage = kv.FsStorage;
+pub const SimStorage = kv.SimStorage;
+
+pub const OpenError = kv.Storage.Error || core.RecoverError || error{ Corrupt, NotAKvtreeFile };
+pub const GetError = kv.Storage.Error || error{ Corrupt, OutOfMemory };
+pub const CommitError = core.CommitError;
+
+/// A borrowed key/value pair yielded by a `Cursor`. The slices point into the
+/// cursor's current leaf-page buffer and stay valid only until the next
+/// `next()`/`seek()` call — copy them if you need to keep them.
+pub const KV = struct { key: []const u8, val: []const u8 };
+
+// ── Db ─────────────────────────────────────────────────────────────────────
+
+pub const Db = struct {
+    gpa: Allocator,
+    pager: Pager,
+    /// The current committed meta (root of the newest durable tree version).
+    meta_rec: format.Meta,
+    path: []u8,
+    /// txn_id to stamp the next commit with (monotonic).
+    next_txn: u64,
+    /// Open read snapshots' pinned txn_ids — their minimum is the oldest reader
+    /// the reclaim gate must respect. Kept sorted-insert-free; min computed on
+    /// demand (open-snapshot counts are tiny in the embedded model).
+    open_snapshots: std.ArrayList(u64),
+
+    /// Open (or create) the store. A fresh/empty file is initialized
+    /// mechanically (two meta pages + an empty-leaf root); an existing file is
+    /// recovered via `core.recover` (the Fable crash-recovery core).
+    pub fn open(gpa: Allocator, store: kv.Storage, path: []const u8, options: Options) OpenError!Db {
+        _ = options;
+        const handle = try store.open(path, .open_or_create);
+        errdefer store.close(handle);
+        const size = try store.size(handle);
+
+        var pager = Pager.init(store, handle, 0);
+        var meta_rec: format.Meta = undefined;
+        if (size < 2 * page_size) {
+            // Fresh (or a torn creation): lay down the initial store. Mechanical
+            // — a crash mid-init leaves < 2 meta pages, so the next open just
+            // re-initializes; there is no prior committed state to protect yet.
+            meta_rec = try initFresh(&pager);
+        } else {
+            pager.high_water = size / page_size;
+            meta_rec = core.recover(&pager) catch |e| switch (e) {
+                error.Unrecoverable => return error.Corrupt,
+                error.Storage => return error.Corrupt,
+                error.OutOfMemory => return error.OutOfMemory,
+            };
+            pager.high_water = meta_rec.high_water;
+        }
+
+        return .{
+            .gpa = gpa,
+            .pager = pager,
+            .meta_rec = meta_rec,
+            .path = try gpa.dupe(u8, path),
+            .next_txn = meta_rec.txn_id + 1,
+            .open_snapshots = .empty,
+        };
+    }
+
+    pub fn close(self: *Db) void {
+        self.pager.store.close(self.pager.handle);
+        self.open_snapshots.deinit(self.gpa);
+        self.gpa.free(self.path);
+        self.* = undefined;
+    }
+
+    /// Mechanical fresh-store init: an empty-leaf root at page 2, both meta
+    /// slots pointing at it (txn_id 0), all durable. Not the Fable core — no
+    /// prior committed state exists to be atomic against.
+    fn initFresh(pager: *Pager) OpenError!format.Meta {
+        var page: [page_size]u8 = undefined;
+        const root_id = format.first_data_page; // page 2
+        format.encodeEmptyLeaf(&page);
+        try pager.writePage(root_id, &page);
+        const m = format.Meta{
+            .txn_id = 0,
+            .root = root_id,
+            .free_root = 0,
+            .free_count = 0,
+            .high_water = root_id + 1,
+        };
+        m.encode(&page);
+        try pager.writePage(format.meta_page_a, &page);
+        try pager.writePage(format.meta_page_b, &page);
+        try pager.sync();
+        try pager.syncDir();
+        pager.high_water = m.high_water;
+        return m;
+    }
+
+    // ── point reads (mechanical: descend the committed tree) ────────────────
+
+    /// Look up `key` in the newest committed version. Caller frees the result.
+    pub fn get(self: *Db, gpa: Allocator, key: []const u8) GetError!?[]u8 {
+        return lookup(&self.pager, self.meta_rec.root, gpa, key);
+    }
+
+    /// A cursor over the newest committed version (ordered iteration / scan).
+    /// Consistent for the cursor's lifetime only in the single-writer model;
+    /// for a stable view across concurrent commits, take a `snapshot`.
+    pub fn cursor(self: *Db) Allocator.Error!Cursor {
+        return Cursor.init(self.gpa, &self.pager, self.meta_rec.root);
+    }
+
+    // ── transactions ─────────────────────────────────────────────────────────
+
+    /// Begin a read-write transaction: buffer put/del, then `commit` (atomic,
+    /// via the Fable core) or `rollback`. Single-writer — one RW txn at a time.
+    pub fn begin(self: *Db) Allocator.Error!Txn {
+        return .{
+            .db = self,
+            .base = self.meta_rec,
+            .changes = .empty,
+            .arena = std.heap.ArenaAllocator.init(self.gpa),
+        };
+    }
+
+    /// Convenience autocommit put (a one-op transaction).
+    pub fn put(self: *Db, key: []const u8, val: []const u8) (CommitError || Allocator.Error)!void {
+        var txn = try self.begin();
+        errdefer txn.rollback();
+        try txn.put(key, val);
+        try txn.commit();
+    }
+
+    /// Convenience autocommit delete.
+    pub fn del(self: *Db, key: []const u8) (CommitError || Allocator.Error)!void {
+        var txn = try self.begin();
+        errdefer txn.rollback();
+        try txn.del(key);
+        try txn.commit();
+    }
+
+    // ── snapshots (MVCC readers) ─────────────────────────────────────────────
+
+    /// Pin the current committed version for repeatable reads. The pinned root
+    /// stays readable even as the writer commits newer versions — its pages are
+    /// protected from reuse by the reclaim gate until the snapshot is released.
+    pub fn snapshot(self: *Db) Allocator.Error!Snapshot {
+        try self.open_snapshots.append(self.gpa, self.meta_rec.txn_id);
+        return .{ .db = self, .root = self.meta_rec.root, .txn_id = self.meta_rec.txn_id };
+    }
+
+    /// Lowest txn any open snapshot is pinned to, or "one past current" when
+    /// none is open — the `oldest_reader_txn` the reclaim gate is fed.
+    fn oldestReader(self: *const Db) u64 {
+        var m: u64 = self.meta_rec.txn_id + 1;
+        for (self.open_snapshots.items) |t| m = @min(m, t);
+        return m;
+    }
+
+    fn releaseSnapshot(self: *Db, txn_id: u64) void {
+        for (self.open_snapshots.items, 0..) |t, i| {
+            if (t == txn_id) {
+                _ = self.open_snapshots.swapRemove(i);
+                return;
+            }
+        }
+    }
+};
+
+pub const Options = struct {};
+
+// ── Txn ──────────────────────────────────────────────────────────────────────
+
+pub const Txn = struct {
+    db: *Db,
+    base: format.Meta,
+    /// Buffered mutations (last-writer-wins per key is resolved at commit).
+    changes: std.ArrayList(core.Change),
+    /// Owns the buffered keys/values until commit or rollback.
+    arena: std.heap.ArenaAllocator,
+
+    pub fn put(self: *Txn, key: []const u8, val: []const u8) Allocator.Error!void {
+        const a = self.arena.allocator();
+        try self.changes.append(self.db.gpa, .{
+            .put = .{ .key = try a.dupe(u8, key), .val = try a.dupe(u8, val) },
+        });
+    }
+
+    pub fn del(self: *Txn, key: []const u8) Allocator.Error!void {
+        const a = self.arena.allocator();
+        try self.changes.append(self.db.gpa, .{ .del = try a.dupe(u8, key) });
+    }
+
+    /// Read within the transaction: buffered changes shadow the base tree.
+    pub fn get(self: *Txn, gpa: Allocator, key: []const u8) GetError!?[]u8 {
+        // Latest buffered change for this key wins.
+        var i: usize = self.changes.items.len;
+        while (i > 0) {
+            i -= 1;
+            switch (self.changes.items[i]) {
+                .put => |p| if (std.mem.eql(u8, p.key, key)) return try gpa.dupe(u8, p.val),
+                .del => |k| if (std.mem.eql(u8, k, key)) return null,
+            }
+        }
+        return lookup(&self.db.pager, self.base.root, gpa, key);
+    }
+
+    /// Commit atomically. FABLE-GATED: routes into `core.commit`, which is a
+    /// `@panic` stub until the core is implemented.
+    pub fn commit(self: *Txn) CommitError!void {
+        defer self.arena.deinit();
+        defer self.changes.deinit(self.db.gpa);
+        const new_meta = try core.commit(
+            &self.db.pager,
+            self.base,
+            self.changes.items,
+            self.db.oldestReader(),
+        );
+        self.db.meta_rec = new_meta;
+        self.db.next_txn = new_meta.txn_id + 1;
+        self.* = undefined;
+    }
+
+    pub fn rollback(self: *Txn) void {
+        self.arena.deinit();
+        self.changes.deinit(self.db.gpa);
+        self.* = undefined;
+    }
+};
+
+// ── Snapshot (read-only MVCC view) ───────────────────────────────────────────
+
+pub const Snapshot = struct {
+    db: *Db,
+    root: PageId,
+    txn_id: u64,
+
+    pub fn get(self: *Snapshot, gpa: Allocator, key: []const u8) GetError!?[]u8 {
+        return lookup(&self.db.pager, self.root, gpa, key);
+    }
+
+    pub fn cursor(self: *Snapshot) Allocator.Error!Cursor {
+        return Cursor.init(self.db.gpa, &self.db.pager, self.root);
+    }
+
+    pub fn release(self: *Snapshot) void {
+        self.db.releaseSnapshot(self.txn_id);
+        self.* = undefined;
+    }
+};
+
+// ── read path: descend + ordered cursor (all mechanical) ─────────────────────
+
+/// Descend from `root` to the leaf that would hold `key` and return a copy of
+/// its value, or null. No allocation beyond the returned value.
+fn lookup(pager: *Pager, root: PageId, gpa: Allocator, key: []const u8) GetError!?[]u8 {
+    var page: [page_size]u8 = undefined;
+    var id = root;
+    while (true) {
+        try pager.readPage(id, &page);
+        switch (format.kindOf(&page)) {
+            .branch => id = format.Branch.init(&page).childFor(key),
+            .leaf => {
+                const leaf = format.Leaf.init(&page);
+                const s = leaf.search(key);
+                if (!s.found) return null;
+                return try gpa.dupe(u8, leaf.valAt(s.index));
+            },
+        }
+    }
+}
+
+/// In-order cursor over a B-tree version. Holds a root-to-leaf stack of page
+/// copies so it can walk leaves left to right; yielded slices borrow the leaf
+/// frame and are valid until the next call.
+pub const Cursor = struct {
+    gpa: Allocator,
+    pager: *Pager,
+    root: PageId,
+    stack: std.ArrayList(Frame),
+
+    const Frame = struct {
+        page: [page_size]u8,
+        id: PageId,
+        /// For a branch: ordinal of the child we descended into. For a leaf:
+        /// index of the next entry to yield.
+        idx: u16,
+    };
+
+    fn init(gpa: Allocator, pager: *Pager, root: PageId) Allocator.Error!Cursor {
+        return .{ .gpa = gpa, .pager = pager, .root = root, .stack = .empty };
+    }
+
+    pub fn deinit(self: *Cursor) void {
+        self.stack.deinit(self.gpa);
+        self.* = undefined;
+    }
+
+    /// Position at the first (smallest) key.
+    pub fn first(self: *Cursor) (kv.Storage.Error || error{ Corrupt, OutOfMemory })!void {
+        self.stack.clearRetainingCapacity();
+        try self.descendLeftmost(self.root);
+    }
+
+    /// Position at the first key >= `key` (range-scan start).
+    pub fn seek(self: *Cursor, key: []const u8) (kv.Storage.Error || error{ Corrupt, OutOfMemory })!void {
+        self.stack.clearRetainingCapacity();
+        var id = self.root;
+        while (true) {
+            var frame = Frame{ .page = undefined, .id = id, .idx = 0 };
+            try self.pager.readPage(id, &frame.page);
+            switch (format.kindOf(&frame.page)) {
+                .branch => {
+                    const br = format.Branch.init(&frame.page);
+                    const ci = br.childIndexFor(key);
+                    frame.idx = @intCast(ci);
+                    try self.stack.append(self.gpa, frame);
+                    id = br.childAtIndex(ci);
+                },
+                .leaf => {
+                    const leaf = format.Leaf.init(&frame.page);
+                    frame.idx = leaf.search(key).index; // first entry >= key
+                    try self.stack.append(self.gpa, frame);
+                    return;
+                },
+            }
+        }
+    }
+
+    fn descendLeftmost(self: *Cursor, from: PageId) (kv.Storage.Error || error{ Corrupt, OutOfMemory })!void {
+        var id = from;
+        while (true) {
+            var frame = Frame{ .page = undefined, .id = id, .idx = 0 };
+            try self.pager.readPage(id, &frame.page);
+            const is_leaf = format.kindOf(&frame.page) == .leaf;
+            try self.stack.append(self.gpa, frame);
+            if (is_leaf) return;
+            id = format.Branch.init(&self.stack.items[self.stack.items.len - 1].page).childAtIndex(0);
+        }
+    }
+
+    /// Yield the next entry in key order, or null at the end. Returned slices
+    /// borrow the cursor's leaf buffer — valid until the next call.
+    pub fn next(self: *Cursor) (kv.Storage.Error || error{ Corrupt, OutOfMemory })!?KV {
+        while (self.stack.items.len > 0) {
+            const top = &self.stack.items[self.stack.items.len - 1];
+            const leaf = format.Leaf.init(&top.page);
+            if (top.idx < leaf.count()) {
+                const out = KV{ .key = leaf.keyAt(top.idx), .val = leaf.valAt(top.idx) };
+                top.idx += 1;
+                return out;
+            }
+            // Leaf exhausted → climb to the nearest ancestor with a next child.
+            _ = self.stack.pop();
+            while (self.stack.items.len > 0) {
+                const anc = &self.stack.items[self.stack.items.len - 1];
+                const br = format.Branch.init(&anc.page);
+                if (anc.idx < br.count()) { // children are 0..count
+                    anc.idx += 1;
+                    const child = br.childAtIndex(anc.idx);
+                    try self.descendLeftmost(child);
+                    break; // retry the outer loop against the new leaf
+                }
+                _ = self.stack.pop();
+            }
+        }
+        return null;
+    }
+};
+
+// ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ─────────────────────────
+
+test {
+    std.testing.refAllDecls(@This());
+    _ = @import("format.zig");
+    _ = @import("pager.zig");
+    _ = @import("core.zig");
+    _ = @import("prng.zig");
+    _ = @import("harness.zig");
+    _ = @import("gate.zig");
+}
+
+const testing = std.testing;
+
+test "smoke: fresh store opens, is empty, and closes cleanly (mechanical init)" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var db = try Db.open(testing.allocator, sim.storage(), "t.kvt", .{});
+    defer db.close();
+    try testing.expectEqual(@as(u64, 0), db.meta_rec.txn_id);
+    const got = try db.get(testing.allocator, "absent");
+    try testing.expect(got == null);
+    // empty cursor yields nothing
+    var cur = try db.cursor();
+    defer cur.deinit();
+    try cur.first();
+    try testing.expect((try cur.next()) == null);
+}
+
+test "read path over a hand-built two-level tree: get + ordered scan + seek" {
+    // Build a real branch→leaf tree by writing pages directly (the write path
+    // proper is the gated core; this exercises the MECHANICAL read path against
+    // a genuine multi-level tree). Layout: root branch(sep="m") → leafL, leafR.
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var db = try Db.open(testing.allocator, sim.storage(), "t.kvt", .{});
+    defer db.close();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var page: [page_size]u8 = undefined;
+
+    // leafL: apple, banana ; leafR: mango, zebra
+    var lb = format.LeafBuilder.init(a);
+    try lb.put("apple", "1");
+    try lb.put("banana", "2");
+    const leafL = db.pager.growOne();
+    lb.encode(&page);
+    try db.pager.writePage(leafL, &page);
+
+    var rb = format.LeafBuilder.init(a);
+    try rb.put("mango", "3");
+    try rb.put("zebra", "4");
+    const leafR = db.pager.growOne();
+    rb.encode(&page);
+    try db.pager.writePage(leafR, &page);
+
+    var branch = format.BranchBuilder.init(a, leafL);
+    try branch.insert("m", leafR); // keys < "m" → leafL, >= "m" → leafR
+    const root = db.pager.growOne();
+    branch.encode(&page);
+    try db.pager.writePage(root, &page);
+    try db.pager.sync();
+    db.meta_rec.root = root; // point the live view at our hand-built tree
+
+    // get across both leaves + the routing key boundary
+    try expectGet(&db, "apple", "1");
+    try expectGet(&db, "banana", "2");
+    try expectGet(&db, "mango", "3");
+    try expectGet(&db, "zebra", "4");
+    try expectGet(&db, "cherry", null); // < m, absent in leafL
+    try expectGet(&db, "yak", null); // >= m, absent in leafR
+
+    // full ordered scan
+    var cur = try db.cursor();
+    defer cur.deinit();
+    try cur.first();
+    const order = [_][]const u8{ "apple", "banana", "mango", "zebra" };
+    for (order) |want| {
+        const e = (try cur.next()).?;
+        try testing.expectEqualStrings(want, e.key);
+    }
+    try testing.expect((try cur.next()) == null);
+
+    // seek into the right leaf: first key >= "n" is "zebra"
+    var cur2 = try db.cursor();
+    defer cur2.deinit();
+    try cur2.seek("n");
+    try testing.expectEqualStrings("zebra", (try cur2.next()).?.key);
+    try testing.expect((try cur2.next()) == null);
+
+    // seek at the boundary: first key >= "m" is "mango"
+    var cur3 = try db.cursor();
+    defer cur3.deinit();
+    try cur3.seek("m");
+    try testing.expectEqualStrings("mango", (try cur3.next()).?.key);
+}
+
+test "transaction buffers reads (put/del shadow the base tree) without committing" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var db = try Db.open(testing.allocator, sim.storage(), "t.kvt", .{});
+    defer db.close();
+
+    var txn = try db.begin();
+    defer txn.rollback();
+    try txn.put("k", "v");
+    try txn.put("k", "v2"); // later write wins
+    const got = try txn.get(testing.allocator, "k");
+    defer if (got) |g| testing.allocator.free(g);
+    try testing.expectEqualStrings("v2", got.?);
+    try txn.del("k");
+    try testing.expect((try txn.get(testing.allocator, "k")) == null);
+}
+
+fn expectGet(db: *Db, key: []const u8, want: ?[]const u8) !void {
+    const got = try db.get(testing.allocator, key);
+    defer if (got) |g| testing.allocator.free(g);
+    if (want) |w| {
+        try testing.expect(got != null);
+        try testing.expectEqualStrings(w, got.?);
+    } else {
+        try testing.expect(got == null);
+    }
+}
+
+test "smoke: module re-exports resolve; gate is readable regardless of value" {
+    _ = fable_core_implemented;
+    _ = Change;
+    try testing.expectEqual(@as(usize, 4096), page_size);
+}

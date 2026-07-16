@@ -346,6 +346,13 @@ project git history).
                implementation. Clean-room: behavior/approach only, no
                source consulted or copied.
 
+  kvtree     — design ref: LMDB (OpenLDAP Public License) and BoltDB
+               (MIT) — the copy-on-write B-tree with double-buffered meta
+               pages (MVCC + atomic commit + crash-safety emergent from COW,
+               no separate WAL); TigerBeetle (Apache-2.0) — the VOPR
+               deterministic fault-injection *approach*. Clean-room:
+               behavior/approach only, no source consulted or copied.
+
   blobmsg    — an original Zig implementation. The blob/blobmsg TLV codec
                (the bulk of the module) implements the OpenWRT libubox wire
                format from its headers blob.h/blobmsg.h (ISC) as the format
