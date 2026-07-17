@@ -11,17 +11,18 @@
 //! fabric jewels: a `netsim.Protocol` consumer, a live invariant checker, a
 //! deliberately-broken positive control, and a property/shrink/teeth harness.
 //!
-//! **Status: scaffold complete, consensus-safety core is a Fable stub.** Real
-//! and passing TODAY: the wire codecs + persistent-state serialization
+//! **Status: consensus-safety core IMPLEMENTED; gate flipped; full suite runs.**
+//! The mechanical scaffold: wire codecs + persistent-state serialization
 //! (`types.zig`), the log container (`log.zig`), all five safety checkers with
-//! synthetic teeth tests (`checks.zig`), the mechanical protocol plumbing and
-//! the `BrokenRaft` positive control with its property/shrink/teeth tests
-//! (`server.zig`). Behind the gate: the irreducible consensus-safety kernel
-//! (`safety.zig`) — the up-to-date election restriction, the RequestVote grant,
-//! the AppendEntries conflict rule, and the Figure-8 leader-commit rule — each a
-//! `@panic("TODO(fable/core): …")` stub. Tests that would drive the real
-//! `RaftServer` (and so call those stubs) are gated behind
-//! `gate.fable_core_implemented` and report SKIP, not PASS, until it flips.
+//! synthetic teeth tests (`checks.zig`), the protocol plumbing and the
+//! `BrokenRaft` positive control with its property/shrink/teeth tests
+//! (`server.zig`). The irreducible consensus-safety kernel (`safety.zig`) — the
+//! up-to-date election restriction, the RequestVote grant, the AppendEntries
+//! conflict-only truncation rule, and the Figure-8 leader-commit rule — is real
+//! and unit-tested, and the formerly gated model-check tests now drive the real
+//! `RaftServer` through the fuzzed crash/partition/reorder/clock-skew sweep with
+//! all five safety invariants enforced live. Membership changes (§6) remain
+//! design-only (`jointMajority` implemented, not yet wired into the protocol).
 
 const std = @import("std");
 const netsim = @import("netsim");

@@ -11,7 +11,7 @@ cross-project-reusable capability — a production-grade implementation of a pro
 or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
 authors' other projects depend on it, not the reverse.
 
-**Status:** 136 modules · 4187 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 136 modules · 4198 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ## Using a module
@@ -122,7 +122,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `spf-ect` | Deterministic symmetric shortest-path (Dijkstra) with a reversal-invariant ECT tie-break (`path(A→B) == reverse(path(B→A))`, RFC 6329 idea generalized) + maximally-disjoint second tree (PRP mode). Pure graph algorithm | any | — |
 | `loopfree-reconv` | Loop-free reconvergence transitions — two-class ordered-FIB schedule (provably no transient forwarding loop, TTL backstop), netsim-verified across fuzzed reconvergence schedules incl. overlapping transitions | any | netsim, spf-ect |
 | `df-elect` | Partition-correct Designated-Forwarder election (static link-state total order, forced by a duplicate-freedom argument — RFC 7432 §8.5 analog) + split-horizon; bounded-badness model-checked in netsim under partition/heal fuzzing | any | netsim |
-| `raft` | **Raft consensus** (Ongaro & Ousterhout) — leader election + log replication, model-checked in netsim against all five formal safety properties (Election Safety / Leader Append-Only / Log Matching / Leader Completeness / State Machine Safety) under fuzzed crash/partition/reorder/clock-skew schedules. **Phase-1 scaffold**: wire codecs + log container + timers + protocol plumbing + the five checkers (with synthetic teeth) + a deliberately-broken positive control are real today; the irreducible safety core (up-to-date restriction, RequestVote grant, AppendEntries conflict rule, Figure-8 commit rule) is a gated Fable stub | any | netsim |
+| `raft` | **Raft consensus** (Ongaro & Ousterhout) — leader election + log replication, model-checked in netsim against all five formal safety properties (Election Safety / Leader Append-Only / Log Matching / Leader Completeness / State Machine Safety) under fuzzed crash/partition/reorder/clock-skew schedules. Wire codecs + log container + timers + protocol plumbing + the five checkers (with synthetic teeth) + a deliberately-broken positive control, plus the irreducible safety core (up-to-date restriction, RequestVote grant, AppendEntries conflict-only truncation, Figure-8 commit rule) — implemented and unit-tested, with the real `RaftServer` holding all five invariants live across the fuzzed seed sweep. Membership changes (§6) design-only (`jointMajority` implemented, not yet wired) | any | netsim |
 | `liveness-hyst` | BFD-like link-liveness estimator with EWMA hysteresis — echo-probe timing + jitter/loss stats, Babel-style metric smoothing as an input filter: fast detection without flap-driven oscillation | any | netsim, latency-stats |
 | `ethfrag` | Hardened inner-frame fragmentation/reassembly codec — RFC 5722 whole-datagram overlap rejection, bounded per-datagram + concurrent-datagram memory, caller-clocked timeout, fuzz-tested never-panic | any | — |
 

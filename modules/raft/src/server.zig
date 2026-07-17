@@ -4,11 +4,10 @@
 //!
 //!  - `RaftServer` is the real thing: election timers + heartbeats, RequestVote
 //!    and AppendEntries RPC exchange, the leader-commit loop — making every
-//!    safety-relevant decision through `safety.zig` (the Fable stub) and
-//!    MECHANICALLY executing the verdict (truncate/append the log, advance
-//!    commitIndex, apply). Its model-checking tests are gated behind
-//!    `gate.fable_core_implemented` — see that file — because every RPC it
-//!    handles calls a panicking stub today.
+//!    safety-relevant decision through `safety.zig` (the Fable core, now
+//!    implemented) and MECHANICALLY executing the verdict (truncate/append the
+//!    log, advance commitIndex, apply). Its model-checking tests run for real
+//!    now that `gate.fable_core_implemented` is `true`.
 //!  - `BrokenRaft` is the POSITIVE CONTROL: a deliberately-wrong election that
 //!    declares leadership WITHOUT collecting a majority and never calls
 //!    `safety.zig`, so it runs today. Its job is to prove `checks.SafetyChecker`
@@ -94,7 +93,11 @@ const NodeState = struct {
     commit_index: LogIndex = 0,
     last_applied: LogIndex = 0,
     election_epoch: u64 = 0,
-    votes: u32 = 0,
+    // Candidate vote tally, per GRANTING PEER (self included) — a set, not a
+    // counter: the network duplicates messages (dup faults), and counting the
+    // same voter's duplicated grant twice would manufacture a fake majority —
+    // two leaders in one term (Election Safety gone) from one dup_once fault.
+    votes_from: []bool,
     // volatile (leaders) — per-peer, indexed by NodeId; self slot tracks own log
     next_index: []LogIndex,
     match_index: []LogIndex,
@@ -102,15 +105,20 @@ const NodeState = struct {
     prev_log: std.ArrayList(LogEntry) = .empty,
 
     fn init(gpa: Allocator, node_count: usize) Allocator.Error!NodeState {
+        const vf = try gpa.alloc(bool, node_count);
+        errdefer gpa.free(vf);
+        @memset(vf, false);
         const ni = try gpa.alloc(LogIndex, node_count);
+        errdefer gpa.free(ni);
         @memset(ni, 0);
         const mi = try gpa.alloc(LogIndex, node_count);
         @memset(mi, 0);
-        return .{ .next_index = ni, .match_index = mi };
+        return .{ .votes_from = vf, .next_index = ni, .match_index = mi };
     }
 
     fn deinit(self: *NodeState, gpa: Allocator) void {
         self.log.deinit(gpa);
+        gpa.free(self.votes_from);
         gpa.free(self.next_index);
         gpa.free(self.match_index);
         self.prev_log.deinit(gpa);
@@ -124,10 +132,18 @@ const NodeState = struct {
         self.commit_index = 0;
         self.last_applied = 0;
         self.election_epoch = 0;
-        self.votes = 0;
+        @memset(self.votes_from, false);
         @memset(self.next_index, 0);
         @memset(self.match_index, 0);
         self.prev_log.clearRetainingCapacity();
+    }
+
+    fn voteCount(self: *const NodeState) u32 {
+        var n: u32 = 0;
+        for (self.votes_from) |g| {
+            if (g) n += 1;
+        }
+        return n;
     }
 };
 
@@ -137,6 +153,16 @@ pub const RaftServer = struct {
     cfg: RaftConfig,
     nodes: []NodeState,
     checker: checks.SafetyChecker = .{},
+    /// index → the term in which that index was FIRST committed (the committing
+    /// leader's term). Raft's Leader Completeness (Figure 3) constrains "the
+    /// leaders of all HIGHER-numbered terms" than the commit — a deposed leader
+    /// still holding `.leader` inside a minority partition legally misses
+    /// entries committed in LATER terms, so `check` must scope the predicate by
+    /// this term or it flags legal executions. The first `recordCommitted` for
+    /// an index is always by the committing leader itself (commitIndex advances
+    /// on the leader synchronously in `handleAppendResp`, before any follower
+    /// can observe the new leaderCommit), so first-record term == commit term.
+    commit_terms: std.AutoHashMapUnmanaged(LogIndex, Term) = .empty,
 
     pub fn init(gpa: Allocator, node_count: usize, cfg: RaftConfig) Allocator.Error!RaftServer {
         const nodes = try gpa.alloc(NodeState, node_count);
@@ -156,6 +182,7 @@ pub const RaftServer = struct {
         for (self.nodes) |*n| n.deinit(gpa);
         gpa.free(self.nodes);
         self.checker.deinit(gpa);
+        self.commit_terms.deinit(gpa);
         self.* = undefined;
     }
 
@@ -178,6 +205,7 @@ pub const RaftServer = struct {
         const self = cast(ctx);
         for (self.nodes) |*n| n.resetAll();
         self.checker.reset();
+        self.commit_terms.clearRetainingCapacity();
     }
 
     // ── timers ──────────────────────────────────────────────────────────────
@@ -217,7 +245,8 @@ pub const RaftServer = struct {
         ns.current_term += 1;
         ns.role = .candidate;
         ns.voted_for = node;
-        ns.votes = 1;
+        @memset(ns.votes_from, false);
+        ns.votes_from[node] = true; // votes for itself
         const info = ns.log.info();
         var buf: [types.RequestVoteReq.wire_len]u8 = undefined;
         (types.RequestVoteReq{
@@ -246,6 +275,17 @@ pub const RaftServer = struct {
         ns.match_index[node] = last;
         try self.broadcastAppendEntries(sim, node);
         try sim.setTimer(node, self.cfg.heartbeat_period, HEARTBEAT_TIMER);
+    }
+
+    /// Send `payload` to every other node. (The scaffold referenced this helper
+    /// from `startElection` but never defined it — scaffold defect, added
+    /// during the core pass.)
+    fn broadcast(self: *RaftServer, sim: *Sim, node: NodeId, payload: []const u8) anyerror!void {
+        var peer: NodeId = 0;
+        while (peer < self.node_count) : (peer += 1) {
+            if (peer == node) continue;
+            try sim.send(node, peer, payload);
+        }
     }
 
     // ── replication ────────────────────────────────────────────────────────────
@@ -283,7 +323,7 @@ pub const RaftServer = struct {
         const self = cast(ctx);
         switch (types.tagOf(payload)) {
             .request_vote_req => try self.handleVoteReq(sim, node, from, payload),
-            .request_vote_resp => try self.handleVoteResp(sim, node, payload),
+            .request_vote_resp => try self.handleVoteResp(sim, node, from, payload),
             .append_entries_req => try self.handleAppendReq(sim, node, from, payload),
             .append_entries_resp => try self.handleAppendResp(sim, node, from, payload),
         }
@@ -309,7 +349,7 @@ pub const RaftServer = struct {
         try sim.send(node, from, &buf);
     }
 
-    fn handleVoteResp(self: *RaftServer, sim: *Sim, node: NodeId, payload: []const u8) anyerror!void {
+    fn handleVoteResp(self: *RaftServer, sim: *Sim, node: NodeId, from: NodeId, payload: []const u8) anyerror!void {
         const ns = &self.nodes[node];
         const resp = types.RequestVoteResp.decode(payload);
         const obs = safety.observeTerm(ns.current_term, resp.term);
@@ -321,8 +361,10 @@ pub const RaftServer = struct {
         }
         if (ns.role != .candidate or resp.term != ns.current_term) return;
         if (resp.vote_granted) {
-            ns.votes += 1;
-            if (ns.votes >= majority(self.node_count)) try self.becomeLeader(sim, node);
+            // Set semantics — a duplicated grant from the same voter must not
+            // count twice (see `votes_from`).
+            ns.votes_from[from] = true;
+            if (ns.voteCount() >= majority(self.node_count)) try self.becomeLeader(sim, node);
         }
     }
 
@@ -351,7 +393,10 @@ pub const RaftServer = struct {
         (types.AppendEntriesResp{
             .term = ns.current_term,
             .success = out.success,
-            .match_index = ns.log.lastIndex(),
+            // The core's verdict (prev + entries.len — the VERIFIED region),
+            // never the raw last index: a stale unverified tail past the batch
+            // window must not be advertised as replicated (see AppendOutcome).
+            .match_index = if (out.success) out.match_index else 0,
         }).encode(&buf);
         try sim.send(node, from, &buf);
     }
@@ -390,6 +435,10 @@ pub const RaftServer = struct {
             const e = ns.log.get(ns.last_applied).?;
             try self.checker.recordApply(self.gpa, ns.last_applied, e.command);
             try self.checker.recordCommitted(self.gpa, .{ .index = ns.last_applied, .term = e.term, .command = e.command });
+            // First recorder == committing leader (see `commit_terms`); later
+            // (follower/indirect) records must not overwrite the commit term.
+            const gop = try self.commit_terms.getOrPut(self.gpa, ns.last_applied);
+            if (!gop.found_existing) gop.value_ptr.* = ns.current_term;
         }
     }
 
@@ -407,17 +456,30 @@ pub const RaftServer = struct {
         for (self.nodes, logs) |*n, *slot| slot.* = n.log.entries.items;
         if (checks.logMatchingViolation(logs) != null) return error.LogMatching;
 
-        // Committed set snapshot (for Leader Completeness).
+        // Committed-set workspace for Leader Completeness, re-filtered per leader.
         var committed: std.ArrayList(checks.CommitRec) = .empty;
         defer committed.deinit(self.gpa);
-        var it = self.checker.committed.iterator();
-        while (it.next()) |kv| try committed.append(self.gpa, kv.value_ptr.*);
 
         for (self.nodes) |*n| {
             if (n.role != .leader) continue;
             // Leader Append-Only — never shrinks/overwrites its own log.
             if (!checks.appendOnlyHolds(n.prev_log.items, n.log.entries.items)) return error.LeaderAppendOnly;
-            // Leader Completeness — holds every committed entry.
+            // Leader Completeness — Figure 3 scopes it to "the leaders of all
+            // HIGHER-numbered terms" than the commit, so a stale leader (deposed
+            // but unaware inside a minority partition) is only held to entries
+            // committed in terms ≤ its own; requiring more flags legal runs.
+            // (`<=` keeps the committing leader itself checked — strictly
+            // stronger, and it trivially holds its own commits.) The predicate
+            // in checks.zig is unchanged; only its input set is scoped. A real
+            // Figure-8 loss is still caught twice over: any FUTURE leader
+            // missing the entry trips this check, and an overwritten committed
+            // entry trips recordCommitted/recordApply (State Machine Safety).
+            committed.clearRetainingCapacity();
+            var it = self.checker.committed.iterator();
+            while (it.next()) |kv| {
+                const commit_term = self.commit_terms.get(kv.key_ptr.*) orelse 0;
+                if (commit_term <= n.current_term) try committed.append(self.gpa, kv.value_ptr.*);
+            }
             if (!checks.leaderCompletenessHolds(n.log.entries.items, committed.items)) return error.LeaderCompleteness;
         }
         // Refresh the append-only witnesses AFTER the check.
@@ -582,16 +644,13 @@ test "smoke: the cluster scenario builds the expected full mesh" {
     try testing.expectEqual(@as(usize, CLUSTER_N * (CLUSTER_N - 1)), topo.links.len);
 }
 
-// ── gated tests: the real RaftServer, behind the Fable stub ─────────────────
+// ── the real-RaftServer model-check tests (formerly gated) ──────────────────
 //
-// See `gate.zig`. Every RPC `RaftServer` handles calls a `safety.zig` decision
-// function, which `@panic`s while `gate.fable_core_implemented == false` — a
-// panic aborts the whole test binary (Zig's runner does not catch it), so these
-// must NOT run until the core is real. `error.SkipZigTest` keeps
-// `zig build test-raft` green today while documenting exactly what starts
-// running once the flag flips: the real cluster driven through netsim's
-// crash/partition/reorder/clock-skew fuzzer, enforcing all five safety
-// properties continuously.
+// See `gate.zig`. With the Fable core implemented and the gate flipped, these
+// drive the real cluster through netsim's crash/partition/reorder/clock-skew
+// fuzzer, enforcing all five safety properties continuously. (While the core
+// was a `@panic` stub they reported SKIP — a panic would have aborted the whole
+// test binary, so they could not run at all.)
 
 test "real: RaftServer upholds all five safety invariants across a fuzzed fault sweep" {
     if (!gate.fable_core_implemented) return error.SkipZigTest;

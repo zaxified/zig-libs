@@ -184,8 +184,14 @@ pub const AppendEntriesReq = struct {
 pub const AppendEntriesResp = struct {
     term: Term,
     success: bool,
-    /// On success, the follower's resulting last log index — the leader uses it
-    /// to advance `matchIndex`/`nextIndex` without re-deriving it.
+    /// On success, the highest index the follower VERIFIED against the leader —
+    /// `prevLogIndex + entries.len` of the request it is acking (the core's
+    /// `AppendOutcome.match_index` verdict), NOT its raw last log index. The
+    /// follower's log may extend past the verified region with a stale tail an
+    /// RPC neither checked nor truncated; advertising that tail would let the
+    /// leader count unverified entries toward a commit majority. The leader uses
+    /// this to advance `matchIndex`/`nextIndex` without pairing replies to
+    /// requests. 0 (meaningless) on failure.
     match_index: LogIndex,
 
     pub const wire_len = 1 + 8 + 1 + 8; // = 18

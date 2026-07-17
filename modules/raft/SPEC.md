@@ -25,13 +25,14 @@ after Ongaro & Ousterhout, *"In Search of an Understandable Consensus Algorithm"
 
 Each checker has an independent **teeth test** (`checks.zig`) that feeds it a
 hand-built violating state and asserts it is caught — so the harness is proven to
-have teeth without depending on the (still-stubbed) consensus core.
+have teeth independently of the consensus core.
 
 ## The Fable boundary — irreducible core vs mechanical scaffold
 
-The **Fable-irreducible core** (`safety.zig`, all `@panic`-gated) is the pure
+The **Fable-irreducible core** (`safety.zig`, implemented — the Fable pass
+landed and `gate.fable_core_implemented` is `true`) is the pure
 consensus-safety decision logic. Honest tiering — four genuinely-subtle functions
-plus one near-mechanical helper that is implemented in the clear:
+plus one near-mechanical helper:
 
 - **`logIsAtLeastAsUpToDate`** *(§5.4.1)* — the election restriction. The
   comparison order (term first, then index) is the whole game; getting it wrong
@@ -49,9 +50,22 @@ plus one near-mechanical helper that is implemented in the clear:
   older-term entries commit indirectly. This is the marquee subtlety the paper's
   formal proof exists for. **Genuinely Fable.**
 - **`observeTerm`** *(§5.1)* — adopt any strictly-higher term and step down. A
-  single comparison; **mechanical, implemented in the clear** (not stubbed) so
-  the module does not inflate its Fable surface. It sits in `safety.zig` for
-  cohesion (it is a term/role safety rule), not because it is hard.
+  single comparison; **mechanical, implemented in the clear** so the module does
+  not inflate its Fable surface. It sits in `safety.zig` for cohesion (it is a
+  term/role safety rule), not because it is hard.
+
+Two additional safety-relevant verdicts surfaced during the core pass and now
+live in the core's contract rather than the plumbing:
+
+- **`AppendOutcome.match_index`** — a success reply advertises the VERIFIED
+  region (`prevLogIndex + entries.len`), never the follower's raw last index:
+  the log may extend past the verified region with a stale tail an RPC neither
+  checked nor truncated, and advertising it would let the leader count
+  unverified (possibly divergent) entries toward a commit majority.
+- **Vote tallying is a set, not a counter** (`server.zig`'s `votes_from`): the
+  network duplicates messages, and counting one voter's duplicated grant twice
+  manufactures a fake majority — two leaders in one term from a single
+  `dup_once` fault.
 
 The **mechanical scaffold** (written in Phase 1, all real today): the RPC/wire
 codecs and persistent-state serialization (`types.zig`), the log container —
@@ -66,6 +80,22 @@ core returns — it never makes a safety decision itself.
 real irreducible safety core — the four functions above are exactly what the
 paper's formal proof (and its reputation for subtlety) is about. The scaffold is
 substantial but honestly mechanical.
+
+### Leader Completeness scoping (harness fidelity)
+
+Figure 3 states Leader Completeness for **the leaders of all higher-numbered
+terms** than the term an entry was committed in. A deposed leader that still
+holds `.leader` inside a minority partition legally misses entries committed in
+LATER terms — checking every current leader against the full committed set
+flags legal executions (observed live at seed 2 of the sweep). `RaftServer`
+therefore tracks each index's **commit term** (the first `recordCommitted` for
+an index is always by the committing leader itself: commitIndex advances on the
+leader synchronously, before any follower can observe the new leaderCommit) and
+scopes the per-leader check to entries with `commit_term <= leader.term`. The
+`leaderCompletenessHolds` predicate is unchanged; only its input set is scoped.
+A real committed-entry loss is still caught twice over: any future leader
+missing the entry trips this check, and an overwritten committed entry trips
+`recordCommitted`/`recordApply` (State Machine Safety).
 
 ## Durability / persistent-state model
 
@@ -87,18 +117,20 @@ Safety** checker (`error.ElectionSafety`) on a clean run with no injected faults
 It reuses the exact `SafetyChecker` the real `RaftServer` is held to, and its
 property/shrink/teeth tests (clean-replay, 100-seed sweep, ddmin minimization)
 run today. The other four properties are proven to have teeth by the synthetic
-predicate tests in `checks.zig`; the gated real-cluster tests exercise all five
-end-to-end once the core lands.
+predicate tests in `checks.zig`; the real-cluster model-check tests exercise all
+five end-to-end.
 
-## Membership changes (§6) — designed, stubbed
+## Membership changes (§6) — designed, predicate implemented, not yet wired
 
 Phase 1 scaffolds membership without implementing its safety logic:
 
 - Log entries carry an `EntryKind` (`noop` / `command` / `config`), so the log
   container is already membership-ready; `config` entries carry no payload yet.
-- `safety.jointMajority` is the stubbed joint-consensus predicate: during a
+- `safety.jointMajority` is the joint-consensus predicate: during a
   `C_old → C_old,new → C_new` transition an election/commit counts only if it
-  wins majorities in **both** configurations. Left `@panic`-gated.
+  wins majorities in **both** configurations. Implemented and unit-tested (the
+  gate flip must leave no reachable `@panic`), but not yet wired into the
+  protocol.
 
 Full membership change (joint consensus, the config-entry-takes-effect-when-
 appended-not-committed rule, the new-leader-commits-a-no-op-first precondition,
@@ -109,17 +141,34 @@ scope to keep the first safety kernel focused.
 ## Verification
 
 Pure-logic + model-checking (CONVENTIONS.md §7): unit tests for codecs / log /
-checkers, plus `netsim` property + shrink + seed-sweep teeth tests. `zig build
-test-raft` is green in Debug and ReleaseFast today: 28 pass, 2 skip (the gated
-real-`RaftServer` model-check tests, which unskip when
-`gate.fable_core_implemented` flips to `true`).
+checkers / the safety kernel (one test per documented wrong-but-plausible
+implementation, including the Figure-8 counterexample and the
+duplicated-AppendEntries rollback trap), plus `netsim` property + shrink +
+seed-sweep teeth tests. `zig build test-raft` is green in Debug and ReleaseFast:
+41 pass, 0 skip — including the two real-`RaftServer` model-check tests (a
+300-seed fuzzed fault sweep enforcing all five invariants live, and a
+quiet-network election-liveness run). During the core pass the suite was
+additionally validated against an extended 1500-seed default sweep and a
+500-seed heavy sweep (40 fault events, horizon 2500, until 3000) — both clean
+(ad-hoc runs, not part of the committed suite).
+
+Sim-vs-paper durability note: a netsim `crash_node` freezes a node (no
+deliveries, no timer fires) and `restart_node` re-enters via `onStart`, so ALL
+of `NodeState` survives a crash — a superset of Figure 2's durable triple. This
+is safe (never loses required durable state); `onStart` re-derives the volatile
+role as follower. The `PersistentState` codec keeps the exact durable-triple
+contract tested independently.
 
 ## Backlog
 
-1. Implement the four Fable-core decision functions; flip the gate; make the two
-   real-cluster model-check tests green across the seed sweep.
+1. ~~Implement the four Fable-core decision functions; flip the gate; make the
+   two real-cluster model-check tests green across the seed sweep.~~ **Done.**
 2. Add a bounded-liveness property (a leader is eventually elected and progress
    is made on a network that is quiet long enough) — a post-run analyzer akin to
    df-elect's bounded-DF-window, distinct from the safety invariants.
-3. Membership changes (§6) — joint consensus, config-entry semantics, fuzz churn.
-4. Log compaction / snapshotting (§7) — out of current scope.
+3. Membership changes (§6) — wire `jointMajority` in: joint consensus,
+   config-entry semantics, fuzz churn.
+4. Client command proposals in the harness (today only leader no-ops populate
+   the log — distinct terms already exercise conflict/commit shapes, but
+   distinct commands would sharpen `recordApply`'s teeth).
+5. Log compaction / snapshotting (§7) — out of current scope.

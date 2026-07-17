@@ -12,14 +12,14 @@ invariant checker asserts the safety properties after every event, and the
 deterministic seeded fuzzer + delta-debug shrinker (from `netsim`) search for and
 minimize any counterexample.
 
-> **Status — Phase 1 scaffold. The consensus-safety core is a gated Fable stub.**
-> Real and passing today: the wire codecs + persistent-state serialization, the
-> log container, all five safety checkers (with synthetic teeth tests), the
-> protocol plumbing, and the `BrokenRaft` positive control. Behind the gate
-> (`fable_core_implemented = false`): the irreducible safety kernel in
-> `safety.zig` — the up-to-date election restriction, the RequestVote grant, the
-> AppendEntries conflict rule, and the Figure-8 leader-commit rule — each a
-> `@panic("TODO(fable/core): …")` stub. See [`SPEC.md`](SPEC.md).
+> **Status — consensus-safety core IMPLEMENTED (Fable pass landed); the gate is
+> flipped and the full model-check suite runs.** The irreducible safety kernel
+> in `safety.zig` — the up-to-date election restriction, the RequestVote grant,
+> the AppendEntries conflict-only truncation rule, and the Figure-8
+> leader-commit rule — is real and unit-tested, and the `RaftServer` holds all
+> five safety properties across the fuzzed crash/partition/reorder/clock-skew
+> seed sweep. Membership changes (§6) remain design-only (the `jointMajority`
+> predicate is implemented but not yet wired). See [`SPEC.md`](SPEC.md).
 
 ## Use
 
@@ -28,7 +28,7 @@ const raft = @import("raft");
 const netsim = @import("netsim");
 
 // Drive a 5-node cluster through the fault fuzzer, checking all five safety
-// invariants continuously (works once the Fable core is implemented):
+// invariants continuously:
 var srv = try raft.RaftServer.init(gpa, raft.CLUSTER_N, .{});
 defer srv.deinit(gpa);
 const case = netsim.Case{ .seed = 0, .scenario = raft.scenario, .protocol = srv.protocol(), .until = 2000 };
@@ -45,14 +45,14 @@ reusable against any Raft-shaped state.
 ## Verify
 
 ```
-zig build test-raft                      # Debug   — 28 pass, 2 skip (gated core)
-zig build test-raft -Doptimize=ReleaseFast
+zig build test-raft                      # Debug        — 41 pass
+zig build test-raft -Doptimize=ReleaseFast   # ReleaseFast — 41 pass
 ```
 
-The two skipped tests drive the real `RaftServer` and unskip the moment
-`gate.fable_core_implemented` flips to `true`. The `BrokenRaft` positive-control
-tests run today and MUST trip the Election-Safety checker — proving the harness
-has teeth independent of the core.
+The two model-check tests drive the real `RaftServer` through a 300-seed fuzzed
+fault sweep (all five invariants live) and a quiet-network election-liveness
+run. The `BrokenRaft` positive-control tests MUST trip the Election-Safety
+checker — proving the harness has teeth independent of the core.
 
 Provenance: clean-room from the Raft paper (a public spec — no third-party source
 ported or studied). VOPR-style model-checking methodology via `netsim`. No
