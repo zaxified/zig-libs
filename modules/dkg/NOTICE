@@ -1,0 +1,46 @@
+dkg — provenance note
+=====================
+
+Kept as a module-local NOTICE (same placement as the sibling `frost`/
+`threshold_ecdsa`/`bls12_381` self-contained crypto modules, not folded into
+the root `NOTICE`).
+
+Provenance
+----------
+
+dkg — Phase 1 (secret-key distributed key generation) scaffold for a secure,
+dealer-free key generation feeding this repo's `threshold_ecdsa`. Clean-room
+from one public paper:
+
+  - R. Gennaro, S. Jarecki, H. Krawczyk, T. Rabin, "Secure Distributed Key
+    Generation for Discrete-Log Based Cryptosystems", Journal of Cryptology
+    20(1), 2007 (earlier EUROCRYPT '99) — "GJKR". The construction this module
+    targets: Pedersen-VSS Round 1, complaint/QUAL Round 2, and the
+    Pedersen-then-Feldman-after-QUAL bias-prevented public-key extraction.
+
+A public specification/paper, not a copyrightable work (merger doctrine — see
+`CONVENTIONS.md` §5); the entry is included for provenance clarity given the
+module's crypto-protocol nature. No third-party SOURCE was ported or consulted.
+
+The mechanical layer reuses this repo's OWN prior work: the Shamir/Feldman
+share arithmetic and `KeyShare`/`Element`/`Scalar` surface come from
+`threshold_ecdsa` (itself a field/group-swapped port of this repo's `frost`/
+`bls12_381.threshold` — same authorship). `paillier` is a build dependency,
+attached to DKG outputs by `assembleKeyShares` (thin, judgment-free
+composition). `std.crypto.ecc.Secp256k1` (curve group, `basePoint`, `add`/
+`mul`, `fromSec1`), `std.crypto.ecc.Secp256k1.scalar.Scalar` (Zq arithmetic),
+and `std.crypto.hash.sha2.Sha256` (for the nothing-up-my-sleeve Pedersen
+generator `h`) are used via their public APIs only — the same primitives
+`frost`/`threshold_ecdsa` already build on. No new curve, field, or hash
+primitive is implemented here.
+
+The FINAL end-to-end verification target,
+`std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256`, is Zig's own standard-library
+ECDSA, used via its public API.
+
+Status: SCAFFOLD. The five irreducible GJKR protocol-soundness functions in
+`core.zig` (`verifyPedersenShare`, `verifyFeldmanShare`, `computeQual`,
+`deriveGroupPublicKey`, `combineKeyShare`) are deliberately left `@panic`-stubbed
+behind `gate.fable_core_implemented` for a follow-up crypto pass — see each
+stub's doc comment and `SPEC.md` for the exact construction. No GPL/LGPL/AGPL
+source was consulted or copied anywhere in this module.
