@@ -13,7 +13,7 @@
 //!
 //! ## The Fable boundary (see gate.zig / SPEC.md)
 //!
-//! **Fable-irreducible core (GATED behind `gate.core_implemented`):**
+//! **Fable-irreducible core (IMPLEMENTED; `gate.core_implemented = true`):**
 //!   - `genWithSeeds` — the per-level correction-word derivation (seed CW +
 //!     two control-bit CWs maintaining the on-path-differ / off-path-equal
 //!     invariant) and the final output correction word.
@@ -31,7 +31,6 @@
 const std = @import("std");
 const prg_mod = @import("prg.zig");
 const group = @import("group.zig");
-const gate = @import("gate.zig");
 
 const Seed = prg_mod.Seed;
 const seed_len = prg_mod.seed_len;
@@ -128,31 +127,111 @@ pub fn Dpf(comptime n_bits: usize, comptime out_bytes: usize) type {
         /// pure `.any` computation — see README). Determinism given the seeds
         /// is what the byte-exact KAT vectors rely on.
         ///
-        /// **TODO(fable/core):** implement the BGI16 per-level correction-word
-        /// derivation + final output word (see this file's module doc + SPEC).
+        /// BGI16 Fig. 1. Root state: `(s_b^0, t_b^0) = (s_b, b)`. Invariant
+        /// maintained down the α-path: the two parties' `(seed, t)` states are
+        /// pseudorandom and DIFFER (with `t0⊕t1 == 1`) on the path node, and
+        /// are byte-EQUAL on every node off the path — so off-path leaves
+        /// convert to identical group elements that cancel, while the α leaf
+        /// differs and the final CW steers the difference to exactly `β`.
+        ///
+        /// Per level `i` (with `α_i` the MSB-first path bit, Keep the child
+        /// toward α, Lose the sibling):
+        ///   `s_cw    = s^0_Lose ⊕ s^1_Lose`   (equalizes the off-path child)
+        ///   `t_cw_l  = t^0_L ⊕ t^1_L ⊕ α_i ⊕ 1`
+        ///   `t_cw_r  = t^0_R ⊕ t^1_R ⊕ α_i`
+        ///   `s_b^i   = s^b_Keep ⊕ t_b^{i-1}·s_cw`
+        ///   `t_b^i   = t^b_Keep ⊕ t_b^{i-1}·t_cw_Keep`
+        /// Final word: `cw_final = (-1)^{t1^n}·(β − Convert(s0^n) + Convert(s1^n))`.
         pub fn genWithSeeds(alpha: Index, beta: Elem, s0: Seed, s1: Seed) [2]Key {
-            if (!gate.core_implemented) {
-                _ = .{ alpha, beta, s0, s1 };
-                @panic("TODO(fable/core): BGI16 correction-word Gen not yet implemented — see modules/fss/SPEC.md");
+            var cur0 = s0;
+            var cur1 = s1;
+            var t0: u1 = 0;
+            var t1: u1 = 1;
+            var cw: [n_bits]Cw = undefined;
+
+            var i: usize = 1;
+            while (i <= n_bits) : (i += 1) {
+                const e0 = prg_mod.prg(cur0);
+                const e1 = prg_mod.prg(cur1);
+                const a_i = bitOf(alpha, i);
+
+                // Keep = child toward α (α_i=0 → Left); Lose = the sibling.
+                const s_lose0 = if (a_i == 0) e0.s_r else e0.s_l;
+                const s_lose1 = if (a_i == 0) e1.s_r else e1.s_l;
+                var s_cw: Seed = undefined;
+                for (&s_cw, s_lose0, s_lose1) |*d, a, b| d.* = a ^ b;
+                const t_cw_l: u1 = e0.t_l ^ e1.t_l ^ a_i ^ 1;
+                const t_cw_r: u1 = e0.t_r ^ e1.t_r ^ a_i;
+                cw[i - 1] = .{ .s_cw = s_cw, .t_cw_l = t_cw_l, .t_cw_r = t_cw_r };
+
+                const s_keep0 = if (a_i == 0) e0.s_l else e0.s_r;
+                const s_keep1 = if (a_i == 0) e1.s_l else e1.s_r;
+                const t_keep0: u1 = if (a_i == 0) e0.t_l else e0.t_r;
+                const t_keep1: u1 = if (a_i == 0) e1.t_l else e1.t_r;
+                const t_cw_keep: u1 = if (a_i == 0) t_cw_l else t_cw_r;
+
+                // s_b^i = s^b_Keep ⊕ t_b^{i-1}·s_cw ; t_b^i = t^b_Keep ⊕ t_b^{i-1}·t_cw_Keep
+                cur0 = s_keep0;
+                if (t0 == 1) for (&cur0, s_cw) |*d, c| {
+                    d.* ^= c;
+                };
+                cur1 = s_keep1;
+                if (t1 == 1) for (&cur1, s_cw) |*d, c| {
+                    d.* ^= c;
+                };
+                const nt0 = t_keep0 ^ (t0 & t_cw_keep);
+                const nt1 = t_keep1 ^ (t1 & t_cw_keep);
+                t0 = nt0;
+                t1 = nt1;
             }
-            // Fable pass implements the real construction here (and removes the
-            // panic branch above). Signature + types are final.
-            @panic("unreachable once implemented");
+
+            // cw_final = (-1)^{t1^n} · (β − Convert(s0^n) + Convert(s1^n))
+            const c0 = prg_mod.convert(out_bytes, cur0);
+            const c1 = prg_mod.convert(out_bytes, cur1);
+            var cw_final: Elem = G.add(G.sub(beta, c0), c1);
+            if (t1 == 1) cw_final = G.neg(cw_final);
+
+            return .{
+                .{ .seed = s0, .cw = cw, .cw_final = cw_final },
+                .{ .seed = s1, .cw = cw, .cw_final = cw_final },
+            };
         }
 
         /// **Eval** — evaluate party `b`'s share of `f_{α,β}` at input `x`.
         /// Returns this party's additive share; `eval(0,k0,x) + eval(1,k1,x)`
         /// reconstructs `f_{α,β}(x)` in `Z_{2^{8L}}`.
         ///
-        /// **TODO(fable/core):** implement the root-to-leaf traversal applying
-        /// each level's CW gated by the running control bit, then the output
-        /// correction word.
+        /// The traversal matching `genWithSeeds`: start at `(key.seed, b)`,
+        /// then per level expand with the PRG, XOR in the level CW iff the
+        /// running control bit `t` is 1, and descend by `x_i` (MSB-first).
+        /// At the leaf: `share = (-1)^b · (Convert(s) + t·cw_final)`.
         pub fn eval(b: u1, key: Key, x: Index) Elem {
-            if (!gate.core_implemented) {
-                _ = .{ b, key, x };
-                @panic("TODO(fable/core): BGI16 Eval traversal not yet implemented — see modules/fss/SPEC.md");
+            var s = key.seed;
+            var t: u1 = b;
+            var i: usize = 1;
+            while (i <= n_bits) : (i += 1) {
+                const e = prg_mod.prg(s);
+                const c = key.cw[i - 1];
+                if (bitOf(x, i) == 0) {
+                    s = e.s_l;
+                    const nt = e.t_l ^ (t & c.t_cw_l);
+                    if (t == 1) for (&s, c.s_cw) |*d, q| {
+                        d.* ^= q;
+                    };
+                    t = nt;
+                } else {
+                    s = e.s_r;
+                    const nt = e.t_r ^ (t & c.t_cw_r);
+                    if (t == 1) for (&s, c.s_cw) |*d, q| {
+                        d.* ^= q;
+                    };
+                    t = nt;
+                }
             }
-            @panic("unreachable once implemented");
+            var out: Elem = prg_mod.convert(out_bytes, s);
+            if (t == 1) out = G.add(out, key.cw_final);
+            if (b == 1) out = G.neg(out);
+            return out;
         }
 
         // ── Mechanical scaffold (REAL) ────────────────────────────────────

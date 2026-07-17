@@ -9,12 +9,13 @@
 //! analytics (Prio/Poplar), metadata-private messaging (Riposte), and
 //! 2-server PIR.
 //!
-//! **Status: Phase-1 SCAFFOLD.** The PRG, output group, key types + codec,
+//! **Status: Phase-1 COMPLETE.** The PRG, output group, key types + codec,
 //! full-domain checker, and the entire verification harness are REAL and
-//! tested. The one Fable-irreducible core — the correction-word construction
-//! (`dpf.Dpf(...).genWithSeeds`) and its matching traversal (`.eval`) — is
-//! gated behind `gate.core_implemented` (`@panic` stub) for a later Fable
-//! pass. See `gate.zig`, `SPEC.md`, and `dpf.zig`'s module doc.
+//! tested — and the Fable-irreducible core (the correction-word construction
+//! `dpf.Dpf(...).genWithSeeds` + its matching traversal `.eval`) is
+//! implemented (`gate.core_implemented = true`): full-domain reconstruction
+//! and the byte-exact KAT vs the independent reference vectors all execute.
+//! See `gate.zig`, `SPEC.md`, and `dpf.zig`'s module doc.
 //!
 //! ## Entry points
 //!   - `Dpf(n, L)` — a DPF over domain `{0,1}^n`, output group `Z_{2^{8L}}`.

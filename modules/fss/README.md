@@ -10,24 +10,24 @@ output group `Z_{2^{8L}}` for every `x`, while **each key alone hides
 Prio/Poplar private analytics (Firefox telemetry, Apple–Google exposure
 notifications), Riposte metadata-private messaging, and 2-server PIR.
 
-**Status: Phase-1 SCAFFOLD.** The PRG, output group, key types + byte codec,
+**Status: Phase-1 COMPLETE.** The PRG, output group, key types + byte codec,
 the full-domain checker, and the entire verification harness are REAL and
-tested. The one Fable-irreducible core — the **correction-word construction**
-(`Dpf(n,L).genWithSeeds`) and its matching traversal (`.eval`) — is gated
-behind `gate.core_implemented` as `@panic("TODO(fable/core): …")` for a later
-Fable pass. While gated, core-dependent tests report **SKIP**; the mechanical
-layer and the broken-share positive controls PASS today (14 pass / 4 skip,
-Debug + ReleaseFast). See [SPEC.md](SPEC.md) for the construction, the
-output-group choice, the exact Fable boundary, and the external-reference
-anchoring plan.
+tested — and the Fable-irreducible core — the **correction-word construction**
+(`Dpf(n,L).genWithSeeds`, BGI16 Fig.1) and its matching traversal (`.eval`) —
+is implemented (`gate.core_implemented = true`). Every formerly-gated test now
+executes: full-domain exhaustive reconstruction, the byte-exact KAT vs the
+independent reference vectors, the security smell test, and the CW-perturbation
+positive control (18 pass / 0 skip, Debug + ReleaseFast). See [SPEC.md](SPEC.md)
+for the construction, the output-group choice, the exact Fable boundary, and the
+external-reference anchoring.
 
 | File | Contents |
 |---|---|
 | `root.zig` | Module doc, `meta`, re-exports (`Dpf`, `prg`, `group`, `kat_vectors`), dark-tests aggregator |
 | `prg.zig` | **REAL.** SHA-256 length-doubling PRG `G` + seed→group `convert` (exact byte definitions pinned in-file) |
 | `group.zig` | **REAL.** `Z2k(L)` — the `Z_{2^{8L}}` output group (add/sub/neg + byte codec) |
-| `dpf.zig` | `Dpf(n,L)`. **REAL:** `Cw`/`Key` types, `serializeCw`/`toBytes`/`fromBytes`, `evalAll`, `firstMismatch`. **FABLE CORE (gated):** `genWithSeeds`, `eval` |
-| `gate.zig` | The single switch (`core_implemented`) gating the correction-word core |
+| `dpf.zig` | `Dpf(n,L)`. **REAL:** `Cw`/`Key` types, `serializeCw`/`toBytes`/`fromBytes`, `evalAll`, `firstMismatch`. **FABLE CORE (implemented):** `genWithSeeds`, `eval` |
+| `gate.zig` | The single switch (`core_implemented = true`) marking the correction-word core done |
 | `kat_vectors.zig` | Recorded independent-reference KAT vectors (the anti-self-consistency anchor) |
 | `kat_test.zig` | The deterministic verification harness + positive controls |
 
@@ -68,9 +68,6 @@ const restored = D.Key.fromBytes(&buf);
 
 ## Caveats
 
-- **Phase-1 scaffold — `genWithSeeds`/`eval` `@panic` until the Fable core
-  lands** (`gate.core_implemented == false`). `evalAll` panics through `eval`.
-  Everything else is usable now.
 - **Seeds are caller-supplied and secret.** `genWithSeeds` takes the two root
   seeds as arguments rather than drawing entropy itself — that is what keeps
   the module pure `.any` computation (no OS/CSPRNG dependency). The caller MUST
@@ -92,17 +89,16 @@ fss → std.crypto.hash.sha2.Sha256   (std-only; meta.deps = .{})
 ## Verify
 
 ```
-zig build test-fss                          # Debug — 14 pass, 4 skip (gated)
-zig build test-fss -Doptimize=ReleaseFast   # 14 pass, 4 skip
+zig build test-fss                          # Debug — 18 pass, 0 skip
+zig build test-fss -Doptimize=ReleaseFast   # 18 pass, 0 skip
 zig fmt --check modules/fss/
 ```
 
-The 4 skips are the core-dependent tests (full-domain correctness, byte-exact
-KAT, security smell, CW-perturbation control); they become executed assertions
-once a Fable pass implements the core and flips `gate.core_implemented`. The
-deterministic positive controls (`brokenAllBeta`/`brokenAllZero` → the
-`firstMismatch` checker) PASS today, proving the harness has teeth before the
-core exists.
+All 18 tests execute (the gate is `true`): the four formerly-gated
+core-dependent tests (full-domain correctness, byte-exact KAT, security smell,
+CW-perturbation control) plus the deterministic positive controls
+(`brokenAllBeta`/`brokenAllZero` → the `firstMismatch` checker), which are
+core-independent and prove the harness has teeth on their own.
 
 Provenance: clean-room from the BGI16 paper (ACM CCS 2016); no third-party
 source ported or studied. Per `CONVENTIONS.md §5` this needs no `NOTICE` entry

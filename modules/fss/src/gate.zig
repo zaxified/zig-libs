@@ -10,15 +10,15 @@
 //! hard part (Boyle–Gilboa–Ishai, CCS 2016, Fig. 1), and it is the only
 //! thing behind this flag.
 //!
-//! While this is `false`, `genWithSeeds`/`eval` (and therefore `evalAll`,
-//! which is a mechanical loop over `eval`) `@panic("TODO(fable/core): ...")`,
-//! and every `kat_test.zig` test that calls them reports **SKIP**
-//! (`error.SkipZigTest`) — a skip is NOT a green light. A Fable pass then
-//! implements the two cores to reproduce the byte-exact vectors in
-//! `kat_vectors.zig` (derived from an INDEPENDENT Python re-derivation of the
-//! same construction, see SPEC.md) and flips this to `true`, converting every
-//! gated SKIP into a real, executed assertion. Same convention as
-//! `bulletproofs`/`bn254`/`decaf448`/`threshold_ecdsa`.
+//! **IMPLEMENTED (Fable pass):** `genWithSeeds`/`eval` are real; this flag is
+//! `true`, so every formerly-SKIPped test in `kat_test.zig` — full-domain
+//! exhaustive reconstruction, the byte-exact KAT vs the INDEPENDENT Python
+//! re-derivation in `kat_vectors.zig` (the anti-self-consistency anchor, see
+//! SPEC.md), the security smell test, and the CW-perturbation positive
+//! control — now runs as an executed assertion. While it was `false`, the
+//! cores `@panic`'d and those tests reported SKIP (a skip is NOT a green
+//! light). Same convention as `bulletproofs`/`bn254`/`decaf448`/
+//! `threshold_ecdsa`.
 //!
 //! Everything ELSE in this module is REAL and UNGATED today, proving the
 //! harness has teeth independent of the gated core:
@@ -30,4 +30,4 @@
 //!     pure `firstMismatch` full-domain checker they exercise — these run and
 //!     PASS today, proving the checker rejects non-DPF share pairs before the
 //!     real core even exists.
-pub const core_implemented = false;
+pub const core_implemented = true;

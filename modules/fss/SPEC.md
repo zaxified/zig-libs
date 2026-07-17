@@ -57,8 +57,8 @@ outputs, so it is only practical for small `n`; large-`n` DPFs use single-point
 
 ## The Fable-core vs mechanical split
 
-**Fable-irreducible core (gated behind `gate.core_implemented`, `@panic`
-stubs today) — exactly two functions in `dpf.zig`:**
+**Fable-irreducible core (implemented; `gate.core_implemented = true`) —
+exactly two functions in `dpf.zig`:**
 
 - `Dpf(n,L).genWithSeeds(α, β, s0, s1) -> [2]Key` — the per-level
   correction-word derivation loop (compute `s_cw`, `t_cw_l`, `t_cw_r` so the
@@ -135,29 +135,30 @@ self-consistency is **not** accepted as the sole correctness signal.
 Verification is **deterministic** (fixed seeds ⇒ Gen is a pure function;
 full-domain reconstruction is exhaustive), so every assertion is exact.
 
-1. **Full-domain correctness** (gated): for several `(α,β)` at `n=8`, Gen then
-   EvalAll on both keys, assert `firstMismatch == null` — i.e.
+1. **Full-domain correctness** (core-dependent): for several `(α,β)` at `n=8`,
+   Gen then EvalAll on both keys, assert `firstMismatch == null` — i.e.
    `Eval0(x)+Eval1(x) == f_{α,β}(x)` for **all** `2^8` points.
-2. **Byte-exact KAT** (gated): the anti-self-consistency anchor above.
-3. **Security smell test** (gated, **heuristic — not a proof**): one key's
+2. **Byte-exact KAT** (core-dependent): the anti-self-consistency anchor above.
+3. **Security smell test** (core-dependent, **heuristic — not a proof**): one key's
    EvalAll must not collapse to a constant and must have many distinct values
    (no `α`-spike). Documents that it is a defense-in-depth smell test, not a
    proof of the hiding property.
 4. **Positive controls (harness teeth):**
-   - *Runs today, no core:* `brokenAllBeta` (reconstructs `β` everywhere) and
+   - *Core-independent:* `brokenAllBeta` (reconstructs `β` everywhere) and
      `brokenAllZero` (reconstructs `0` everywhere) are fed to `firstMismatch`,
      which MUST reject each — proving the checker catches both a
-     spurious-nonzero-off-target and a missing-`β`-on-target sharing before
-     Gen/Eval exist.
-   - *Gated (stronger):* flip one control-bit CW in a real key and confirm the
+     spurious-nonzero-off-target and a missing-`β`-on-target sharing
+     independent of Gen/Eval.
+   - *Core-dependent (stronger):* flip one control-bit CW in a real key and confirm the
      **same** `firstMismatch` catches it — proving the CW anchor and the
      reconstruction check are both load-bearing. Deterministic, so it fails
      deterministically.
 
-While `gate.core_implemented == false`, every core-dependent test reports
-**SKIP** (`error.SkipZigTest`); a skip is not a pass. A Fable pass implements
-the two core functions to reproduce `kat_vectors.zig` byte-exact and flips the
-flag, turning every SKIP into an executed assertion.
+The Fable pass implemented the two core functions to reproduce
+`kat_vectors.zig` byte-exact and flipped `gate.core_implemented` to `true`, so
+every formerly-gated test now runs as an executed assertion (18 pass / 0 skip,
+Debug + ReleaseFast). While the flag was `false`, those tests reported **SKIP**
+(`error.SkipZigTest`) — a skip was never a pass.
 
 ## Scoped out (future increments, NOT Phase 1)
 
