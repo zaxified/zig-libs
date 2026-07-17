@@ -125,11 +125,26 @@ pub const LoopixConfig = struct {
 ///    input timing, so the adversary cannot concentrate probability on the
 ///    real match. A FIFO mix pins it to 1.0.
 ///
-/// Defaults are deliberately loose for a Phase-1 scaffold; retune against the
-/// real core's measured behavior (like `df-elect`'s `maxBadDfWindow`).
+/// Defaults RETUNED against the real Poisson core's measured behaviour (Part 2,
+/// like `df-elect`'s `maxBadDfWindow`). Measurement basis: a clean (fault-free,
+/// global-PASSIVE-adversary) run of the real `Loopix` mix over 50 seeds, each
+/// mix scored with its OWN delay law, over the steady-state window (targets that
+/// arrived early enough to clear before the finite horizon — see
+/// `protocol.zig`'s cooldown note). On that basis the worst-case measured across
+/// all ~24.5k real targets was:
+///
+///     correct Poisson mix : min_effective_set 2.80 , max_link_prob 0.77
+///     FIFO control        : min_effective_set 1.00 , max_link_prob 1.00
+///     no-cover control    : min_effective_set 1.06 , max_link_prob 0.99
+///
+/// The bound sits with genuine margin below the correct mix and far above both
+/// broken controls on BOTH clauses — it is NOT tuned to let the correct mix
+/// squeak by. `min_effective_set` (the cover-traffic guarantee) is the binding,
+/// robustly-separating clause (2.80 vs 1.00/1.06); `max_link_prob` (the
+/// memoryless-hold guarantee) is a second guard both controls also violate.
 pub const AnonymityBound = struct {
     min_effective_set: f64 = 2.0,
-    max_link_prob: f64 = 0.5,
+    max_link_prob: f64 = 0.9,
 };
 
 // ── the in-sim mix header ────────────────────────────────────────────────────

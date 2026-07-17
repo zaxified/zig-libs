@@ -12,18 +12,18 @@
 //! unlinkability against a **global passive adversary**. This module builds
 //! and model-checks that strategy inside `netsim`.
 //!
-//! **Status: harness complete, mixing core is a Fable stub.** Everything that
-//! DEFINES and MEASURES anonymity is real today: the stratified topology + route
-//! selection (`routing.zig`, incl. a real `sphinx` onion round-trip proving the
-//! packet substrate), the fixed-size header codec (`types.zig`), the entire
-//! global-passive-adversary anonymity measurement (`adversary.zig` — effective
-//! anonymity set + linking probability under the mix's own delay law), and a
-//! deliberately-broken **FIFO positive control** (`protocol.zig`) that the
-//! harness flags hard. The ONE thing NOT implemented is the irreducible mixing
-//! itself — `mixing.scheduleRelease` / `mixing.sampleExpDelay` /
-//! `mixing.nextCover`, all `@panic("TODO(fable/core): ...")`. The one test that
-//! drives the real Poisson mix (`protocol.zig`) is gated behind
-//! `gate.fable_core_implemented` and reports SKIP until the flag flips.
+//! **Status: complete.** Everything that DEFINES and MEASURES anonymity is real:
+//! the stratified topology + route selection (`routing.zig`, incl. a real
+//! `sphinx` onion round-trip proving the packet substrate), the fixed-size
+//! header codec (`types.zig`), the entire global-passive-adversary anonymity
+//! measurement (`adversary.zig` — effective anonymity set + linking probability
+//! under the mix's own delay law), and a deliberately-broken **FIFO positive
+//! control** (`protocol.zig`) that the harness flags hard. The mixing core —
+//! `mixing.sampleExpDelay` (discrete memoryless / geometric hold),
+//! `mixing.scheduleRelease`, `mixing.nextCover` — is now implemented
+//! (`gate.fable_core_implemented = true`): the real Poisson mix satisfies the
+//! retuned `AnonymityBound` across a clean-run seed sweep, while the FIFO and
+//! no-cover controls fail it under identical measurement (`protocol.zig`).
 //!
 //! Scoped OUT of Phase 1 (documented increments, see `SPEC.md`): full clients/
 //! providers/PKI, sender-chosen per-hop delays in the real onion (the sim uses

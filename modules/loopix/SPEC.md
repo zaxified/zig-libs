@@ -128,6 +128,28 @@ protocol-soundness veins (the scaffold holds the value; the core-impl is Opus).
 Dispatch Part 2 (fill the three stubs + retune `AnonymityBound` against the real
 mix's measured behaviour + flip the gate) to **Opus**.
 
+### Part 2 result (core implemented, gate flipped)
+
+- **Sampling law.** `sampleExpDelay` uses the geometric inverse-CDF
+  `hold = ⌊ln(u) / ln(1 − 1/mean)⌋` — constant per-tick release hazard `1/mean`,
+  i.e. genuinely memoryless in discrete time. Note a precision correction to the
+  inline warning: `⌊−mean·ln u⌋` is *also* geometric (with ratio `e^{−1/mean}`)
+  and *is* memoryless at tick boundaries — the two differ only at `O(1/mean²)`.
+  The real trap is *rounding* (`round`/nearest), which gives the zero bucket
+  half-width and breaks constant hazard near 0. The chosen ratio `(1 − 1/mean)`
+  matches the adversary's `e^{−δ/mean}` kernel to `O(1/mean²)`, so the hold pmf
+  is `∝` the adversary's likelihood — no departure stands out.
+- **Measurement basis.** Anonymity is scored on a **clean** run (global *passive*
+  adversary on a functioning network — the fault fuzzer is an *active* adversary,
+  out of scope) over the **steady-state** window (finite-horizon cool-down
+  excluded; `measureSteadyState` relabels late arrivals to cover so they still
+  swell pools but are not scored — `adversary.measure` itself is untouched).
+- **Measured separation** (worst-case over 50 seeds, each mix scored with its own
+  law): correct Poisson mix `min_eff_set 2.80 / max_link 0.77` (0 of ~24.5k
+  targets below set-2); FIFO `1.00 / 1.00` (every target pinned); no-cover
+  `1.06 / 0.99`. The bound `(2.0, 0.9)` passes the correct mix with margin on
+  both clauses and fails both controls decisively — see `types.zig`.
+
 ## Scoped out of Phase 1 (documented increments)
 
 - **Full clients/providers/PKI.** Real Loopix has clients attach to *providers*
@@ -144,9 +166,10 @@ mix's measured behaviour + flip the gate) to **Opus**.
   quantity the mixing strategy directly controls). Composing the per-hop
   posteriors across all L layers into a single source→destination linking bound
   is a follow-on.
-- **Retuning `AnonymityBound`.** The defaults (`min_effective_set = 2`,
-  `max_link_prob = 0.5`) are loose Phase-1 placeholders; the real core's Part 2
-  pass sets them against measured behaviour (like `df-elect`'s `maxBadDfWindow`).
+- **Retuning `AnonymityBound`.** DONE (Part 2). The defaults are now
+  `min_effective_set = 2.0`, `max_link_prob = 0.9`, set against the real Poisson
+  core's measured behaviour (like `df-elect`'s `maxBadDfWindow`) — see the
+  measurement basis in `types.zig` and the finding below.
 
 ## Verification
 

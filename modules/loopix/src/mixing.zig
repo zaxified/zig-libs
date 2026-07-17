@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: MIT
 
-//! mixing — THE GATED FABLE CORE. The three functions this module exists to
-//! prove are `@panic("TODO(fable/core): ...")` stubs today; everything that
+//! mixing — THE (formerly gated) CORE. The three functions this module exists
+//! to prove — `sampleExpDelay` / `scheduleRelease` / `nextCover` — are now
+//! IMPLEMENTED (`gate.fable_core_implemented = true`), and the real `Loopix`
+//! Poisson mix satisfies the retuned `AnonymityBound` across a seed sweep while
+//! the FIFO + no-cover controls fail it (see `protocol.zig`). Everything that
 //! measures whether they are CORRECT (the anonymity invariant + adversary in
-//! `adversary.zig`, the FIFO positive control in `protocol.zig`) is already
-//! real and has teeth. Flip `gate.fable_core_implemented` once these are
-//! filled in — see `gate.zig`.
+//! `adversary.zig`, the FIFO positive control in `protocol.zig`) is real and
+//! has teeth — see `gate.zig`.
 //!
 //! **What is irreducible here, and why it is the anonymity-load-bearing part.**
 //! A Loopix mix is a *continuous-time (stop-and-go) mix*: on each arrival it
@@ -91,9 +93,17 @@ pub const CoverEvent = struct {
 /// min_effective_set` — this is the function the `no-cover` failure mode
 /// disables.
 pub fn nextCover(prng: *Prng, cfg: LoopixConfig) CoverEvent {
-    _ = prng;
-    _ = cfg;
-    @panic("TODO(fable/core): Poisson cover-traffic process (exponential inter-arrival + loop/drop choice)");
+    // Inter-arrival of the Poisson cover process = the same memoryless integer
+    // draw the mix hold uses (a Poisson process has geometric gaps in discrete
+    // time). Clamp to >= 1: the caller re-arms a COVER_TIMER for exactly this
+    // delay and re-invokes, so a 0-tick gap would self-schedule another cover
+    // emission at the SAME tick forever (a within-tick livelock). The mix hold
+    // has no such clamp because its release timer is one-shot, not self-arming.
+    const gap: Time = @max(1, sampleExpDelay(prng, cfg.cover_mean_interval));
+    // Loop vs drop chaff — both bit-indistinguishable to the GPA, so an even
+    // split is fine; a fresh PRNG draw keeps the choice a pure function of seed.
+    const kind: MsgKind = if (prng.next() & 1 == 0) .loop_cover else .drop_cover;
+    return .{ .delay = gap, .kind = kind };
 }
 
 // ── the Poisson mix hold/release decision (GATED) ────────────────────────────
@@ -105,9 +115,22 @@ pub fn nextCover(prng: *Prng, cfg: LoopixConfig) CoverEvent {
 /// and the cover process (`nextCover`) are built on; getting its distribution
 /// right is what makes output timing independent of input timing.
 pub fn sampleExpDelay(prng: *Prng, mean: Time) Time {
-    _ = prng;
-    _ = mean;
-    @panic("TODO(fable/core): memoryless integer exponential (geometric) delay sample");
+    if (mean <= 1) return 0; // degenerate: a per-tick hazard of ~1 ⇒ release now
+    // Geometric inverse-CDF. With per-tick success (release) probability
+    // p = 1/mean, the survival is P(hold ≥ k) = (1−p)^k, so
+    //     hold = ⌊ ln(u) / ln(1 − p) ⌋ ,  u ~ U(0,1),
+    // yields P(hold = k) = (1−p)^k · p on support {0,1,2,…}. This is the
+    // DISCRETE-time memoryless law: the per-tick release hazard
+    // P(hold = k | hold ≥ k) = p is CONSTANT for every k, which is exactly the
+    // "output timing independent of input timing" property the anonymity
+    // argument rests on (a packet held for a while is no more/less likely to
+    // leave next tick than a fresh one). The survival ratio (1 − 1/mean) also
+    // matches the adversary's exp(−1/mean) kernel to O(1/mean²), so the mix's
+    // own hold pmf is ∝ the adversary's likelihood — no departure stands out.
+    const u = prng.unit(); // (0,1) open ⇒ ln(u) finite and < 0
+    const survive = 1.0 - 1.0 / @as(f64, @floatFromInt(mean)); // (0,1) ⇒ ln < 0
+    const k = @log(u) / @log(survive); // (neg)/(neg) ⇒ ≥ 0
+    return @intFromFloat(k); // ⌊·⌋ (k ≥ 0, so truncation == floor)
 }
 
 /// TODO(fable/core): the mix pool's hold/release decision for one arriving
@@ -121,10 +144,11 @@ pub fn sampleExpDelay(prng: *Prng, mean: Time) Time {
 /// arrival — a constant offset here reduces the mix to the `FifoMix` control
 /// the harness already flags.
 pub fn scheduleRelease(prng: *Prng, cfg: LoopixConfig, arrival: Time) Time {
-    _ = prng;
-    _ = cfg;
-    _ = arrival;
-    @panic("TODO(fable/core): Poisson mix hold/release (arrival + independent exponential hold)");
+    // One INDEPENDENT memoryless hold per arrival (Poisson mix, not a batch or
+    // threshold): the release time is this packet's own draw added to when it
+    // arrived. Independence across arrivals is what decorrelates the departure
+    // multiset from the arrival multiset.
+    return arrival + sampleExpDelay(prng, cfg.mean_delay);
 }
 
 // ── tests: the PRNG is real and seeded; the gated core is only type-checked ──

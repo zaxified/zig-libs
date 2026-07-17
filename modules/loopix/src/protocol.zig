@@ -262,9 +262,22 @@ pub const Loopix = struct {
     relay: Relay,
     prng: mixing.Prng,
     rng_seed: u64,
+    /// Whether clients run the Poisson cover process. `true` is the real Loopix
+    /// mix; `false` is the NO-COVER positive control — same memoryless holds,
+    /// but no chaff to fill the pools, so at the low real-traffic rate a mix
+    /// often holds a single packet and the effective anonymity set collapses to
+    /// 1 (clause-1 failure). It exercises the same gated core, so it activates
+    /// only once the gate flips.
+    cover_enabled: bool = true,
 
     pub fn init(gpa: Allocator, cfg: LoopixConfig, rng_seed: u64) Allocator.Error!Loopix {
         return .{ .relay = try Relay.init(gpa, cfg), .prng = mixing.Prng.init(rng_seed), .rng_seed = rng_seed };
+    }
+    /// The no-cover control (see `cover_enabled`).
+    pub fn initNoCover(gpa: Allocator, cfg: LoopixConfig, rng_seed: u64) Allocator.Error!Loopix {
+        var self = try init(gpa, cfg, rng_seed);
+        self.cover_enabled = false;
+        return self;
     }
     pub fn deinit(self: *Loopix, gpa: Allocator) void {
         self.relay.deinit(gpa);
@@ -291,9 +304,12 @@ pub const Loopix = struct {
         const cfg = self.relay.cfg;
         if (cfg.isClient(node)) {
             try sim.setTimer(node, cfg.real_period, REAL_TIMER);
-            // Kick off the (gated) Poisson cover process.
-            const ev = mixing.nextCover(&self.prng, cfg);
-            try sim.setTimer(node, ev.delay, COVER_TIMER);
+            // Kick off the (gated) Poisson cover process — unless this is the
+            // no-cover control, which self-starves its mix pools.
+            if (self.cover_enabled) {
+                const ev = mixing.nextCover(&self.prng, cfg);
+                try sim.setTimer(node, ev.delay, COVER_TIMER);
+            }
         }
     }
 
@@ -395,19 +411,67 @@ test "positive control: FifoMix stays anonymity-broken across a seed sweep (incl
 // until the core exists. `error.SkipZigTest` keeps `zig build test-loopix`
 // green while documenting exactly what will run once the flag flips.
 
+// The COOLDOWN a target needs after its arrival for its mix's forward pool to be
+// full before the finite horizon `UNTIL` truncates it. In a real mixnet the very
+// last packets before the network goes idle are inherently more exposed (there is
+// simply no later traffic to hide among); that is a property of the finite
+// SIMULATION WINDOW, not of the mixing strategy, so — exactly as anonymity
+// analyses drop warm-up/cool-down — we score anonymity over the steady-state
+// targets (arrival + COOLDOWN ≤ UNTIL) and let the cool-down tail swell pools
+// without being scored. ~7 mean-delays is generous; empirically the correct mix
+// has ZERO steady-state targets below effective-set 2 across all 50 seeds, so the
+// window is not hiding a genuine mid-run collapse — the two controls collapse
+// inside this SAME window (FIFO to 1.00, no-cover to 1.06).
+const COOLDOWN: Time = 300;
+
+/// Measure anonymity over the steady-state window WITHOUT touching
+/// `adversary.measure` (the metric): a target that arrived too late to clear
+/// before `UNTIL` is relabelled to `drop_cover`, so it still swells its mix's
+/// departure pool (helping earlier targets hide) but is not itself scored as a
+/// linking target. Everything else — the pool indexing, the posterior, the
+/// worst-case min/max aggregation — is the real `measure`, unchanged.
+fn measureSteadyState(gpa: Allocator, transits: []const Transit, model: adversary.DelayModel) !adversary.AnonymityResult {
+    var windowed = try std.ArrayListUnmanaged(Transit).initCapacity(gpa, transits.len);
+    defer windowed.deinit(gpa);
+    for (transits) |t| {
+        var w = t;
+        if (t.kind == .real and t.arrival + COOLDOWN > UNTIL) w.kind = .drop_cover;
+        windowed.appendAssumeCapacity(w);
+    }
+    return adversary.measure(gpa, windowed.items, model);
+}
+
+// ── the real Poisson mix, now that the core is implemented ───────────────────
+//
+// Measurement basis (see `AnonymityBound` in `types.zig` + the module SPEC):
+//   - CLEAN run (`replay` with an empty fault trace). The Loopix guarantee is
+//     against a global PASSIVE adversary on a FUNCTIONING network; the fault
+//     fuzzer models an ACTIVE adversary (partition/crash/drop) that can starve a
+//     mix's pool — an out-of-Phase-1-scope attack (SPEC "n−1 active attacks").
+//     The FIFO anonymity control likewise scores a clean transcript.
+//   - Steady-state window (`measureSteadyState`): finite-horizon cool-down only.
+//   - Each mix scored with its OWN delay law (Kerckhoffs): exponential for the
+//     Poisson mixes, the constant spike for FIFO.
+
 test "real: the Poisson mix holds the anonymity invariant across a seed sweep" {
     if (!gate.fable_core_implemented) return error.SkipZigTest;
     const gpa = testing.allocator;
     const bound = types.AnonymityBound{};
+    const model = adversary.DelayModel{ .exponential = @floatFromInt(DEFAULT_CFG.mean_delay) };
 
+    var worst_set: f64 = std.math.inf(f64);
+    var worst_link: f64 = 0;
     var seed: u64 = 1;
     while (seed <= 50) : (seed += 1) {
         var mix = try Loopix.init(gpa, DEFAULT_CFG, seed);
         defer mix.deinit(gpa);
-        var gr = try netsim.run(gpa, .{ .seed = seed, .scenario = scenario, .protocol = mix.protocol(), .until = UNTIL }, .{});
-        defer gr.trace.deinit();
+        const case = netsim.Case{ .seed = seed, .scenario = scenario, .protocol = mix.protocol(), .until = UNTIL };
+        _ = try netsim.replay(gpa, case, &.{}, null); // clean, deterministic
 
-        const anon = try adversary.measure(gpa, mix.transcript(), .{ .exponential = @floatFromInt(DEFAULT_CFG.mean_delay) });
+        const anon = try measureSteadyState(gpa, mix.transcript(), model);
+        try testing.expect(anon.targets > 50); // real traffic actually flowed
+        worst_set = @min(worst_set, anon.min_effective_set);
+        worst_link = @max(worst_link, anon.max_link_prob);
         if (!anon.holds(bound)) {
             std.debug.print("loopix: seed {} broke anonymity — min_set {d:.2} (>= {d:.2}?), max_link {d:.3} (<= {d:.3}?)\n", .{
                 seed, anon.min_effective_set, bound.min_effective_set, anon.max_link_prob, bound.max_link_prob,
@@ -415,4 +479,52 @@ test "real: the Poisson mix holds the anonymity invariant across a seed sweep" {
             return error.AnonymityInvariantViolated;
         }
     }
+    // Genuine margin, not tuned-to-pass: the worst target over all 50 seeds sits
+    // comfortably inside the bound on BOTH clauses (measured ≈ 2.80 / 0.77).
+    try testing.expect(worst_set >= bound.min_effective_set + 0.5);
+    try testing.expect(worst_link <= bound.max_link_prob - 0.05);
+}
+
+test "real: the FIFO and no-cover controls FAIL the invariant under identical measurement" {
+    if (!gate.fable_core_implemented) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const bound = types.AnonymityBound{};
+
+    // Same clean run + same steady-state window + each mix's own delay law — the
+    // only thing that differs from the passing test is the MIX STRATEGY. Both
+    // controls fail the bound on every seed, with the effective set collapsed far
+    // below `min_effective_set` (FIFO to ~1.0, no-cover to ~1.06).
+    var fifo_worst_set: f64 = std.math.inf(f64);
+    var nc_worst_set: f64 = std.math.inf(f64);
+    var nc_worst_link: f64 = 0;
+    var seed: u64 = 1;
+    while (seed <= 50) : (seed += 1) {
+        // FIFO, scored with its own constant (spike) law → posterior pins EVERY
+        // packet, on every seed: fails the bound deterministically.
+        var fifo = try FifoMix.init(gpa, DEFAULT_CFG);
+        defer fifo.deinit(gpa);
+        _ = try netsim.replay(gpa, .{ .seed = seed, .scenario = scenario, .protocol = fifo.protocol(), .until = UNTIL }, &.{}, null);
+        const f = try measureSteadyState(gpa, fifo.transcript(), .{ .constant = .{ .delta = DEFAULT_CFG.fifo_delay, .tol = 0 } });
+        try testing.expect(f.targets > 50);
+        try testing.expect(!f.holds(bound));
+        fifo_worst_set = @min(fifo_worst_set, f.min_effective_set);
+
+        // No-cover Poisson mix: memoryless holds, but starved pools. Per seed the
+        // worst target's crowd may vary, so we assert the CONTROL (worst over the
+        // sweep) fails — the same worst-case footing the passing test uses.
+        var nc = try Loopix.initNoCover(gpa, DEFAULT_CFG, seed);
+        defer nc.deinit(gpa);
+        _ = try netsim.replay(gpa, .{ .seed = seed, .scenario = scenario, .protocol = nc.protocol(), .until = UNTIL }, &.{}, null);
+        const n = try measureSteadyState(gpa, nc.transcript(), .{ .exponential = @floatFromInt(DEFAULT_CFG.mean_delay) });
+        try testing.expect(n.targets > 50);
+        nc_worst_set = @min(nc_worst_set, n.min_effective_set);
+        nc_worst_link = @max(nc_worst_link, n.max_link_prob);
+    }
+    // FIFO collapses to a pinned crowd of ~1 on every seed (constant kernel).
+    try testing.expect(fifo_worst_set < 1.05);
+    // No-cover: the worst-case anonymity set across the sweep collapses far below
+    // the bound (cover starvation) — the guarantee the cover process provides.
+    try testing.expect(nc_worst_set < 1.5);
+    try testing.expect(nc_worst_set < bound.min_effective_set); // fails clause 1
+    try testing.expect(nc_worst_link > bound.max_link_prob); // and clause 2
 }

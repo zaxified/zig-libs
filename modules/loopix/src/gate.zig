@@ -19,4 +19,4 @@
 //! `error.SkipZigTest`), not PASS — a skip is not a green light. The gated
 //! test still compiles (so the mix's call sites into `mixing.zig` are
 //! type-checked), it just never calls into the panicking bodies.
-pub const fable_core_implemented = false;
+pub const fable_core_implemented = true;
