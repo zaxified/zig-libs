@@ -11,13 +11,14 @@
 //! two 2-element ciphertexts into a 3-element one, rescales by `t/q`, and
 //! **relinearises** back to 2 elements with an evaluation (relin) key.
 //!
-//! ## Part-1 status — TYPES + CODECS + `add` are REAL; the scheme cores are
-//! ## gated (see `gate.zig`, SPEC.md "Fable boundary"):
-//!   - **REAL today:** the `SecretKey`/`PublicKey`/`RelinKey`/`Ciphertext`
+//! ## Status — Part 1 (backbone + types) + Part 2 (scheme core) are REAL:
+//!   - **REAL (Part 1):** the `SecretKey`/`PublicKey`/`RelinKey`/`Ciphertext`
 //!     types, their byte codecs, `Ciphertext.add`/`sub` (pure ring ops, not
 //!     noise-sensitive), and `numComponents`.
-//!   - **Gated `scheme_core_implemented` (Part 2, Opus):** `keyGen`,
-//!     `encrypt`, `decrypt` — textbook, SEAL-KAT-able.
+//!   - **REAL (Part 2, Opus — `scheme_core_implemented`):** `keyGen`,
+//!     `encrypt`, `decrypt` — textbook RLWE; the `Δ`-scale decrypt is anchored
+//!     by a deterministic noiseless-ciphertext KAT + the enc/dec round-trip and
+//!     homomorphic-add end-to-end tests.
 //!   - **Gated `fable_core_implemented` (Part 3, Fable):** `mul`,
 //!     `relinearize`, `noiseBudget` — the noise-management core.
 //!
@@ -29,6 +30,8 @@ const params = @import("params.zig");
 const ring = @import("ring.zig");
 const encode = @import("encode.zig");
 const gate = @import("gate.zig");
+const ma = @import("modarith.zig");
+const rns = @import("rns.zig");
 
 /// `Bfv(P)` — a BFV instance for the compile-time-fixed parameter set `P`.
 pub fn Bfv(comptime P: params.Params) type {
@@ -49,6 +52,16 @@ pub fn Bfv(comptime P: params.Params) type {
         pub const Ring = ring.RnsPoly(N, L);
         pub const Engine = ring.RnsPoly(N, L).Engine;
         pub const Plaintext = encode.Plaintext(N);
+
+        /// Full ciphertext modulus `q = ∏ q_i` as an integer (fits `u128` for
+        /// the KAT/toy parameter sets; production RNS never materialises it).
+        pub const q_product: u128 = blk: {
+            var m: u128 = 1;
+            for (primes) |p| m *= p;
+            break :blk m;
+        };
+        /// The BFV scaling factor `Δ = ⌊q/t⌋` (plaintext lives in the high bits).
+        pub const delta: u128 = q_product / P.t;
 
         /// The `L` per-prime NTT engines + the prime chain, built once.
         engines: [L]Engine,
@@ -107,34 +120,117 @@ pub fn Bfv(comptime P: params.Params) type {
             return out;
         }
 
-        // ── Gated: scheme core (Part 2, Opus — SEAL-KAT-able) ────────────────
+        // ── scheme core (Part 2, Opus — textbook RLWE) ───────────────────────
+        //
+        // Correctness anchor (SPEC.md "Anchors"): decrypt inverts the `Δ`-scale
+        // exactly on a hand-constructed noiseless ciphertext (deterministic KAT,
+        // independent of keyGen/encrypt); the fresh-encryption noise
+        // `E = −e·u + e0 + e1·s` is bounded ≪ `Δ/2`, so the enc/dec round-trip
+        // and homomorphic-add end-to-end anchors decrypt back byte-exact for
+        // EVERY seed (not a probabilistic property at this depth).
+
+        /// Sample a ternary polynomial (each coefficient uniform in `{−1,0,1}`)
+        /// as a coefficient-domain ring element. Used for the secret key, the
+        /// encryption randomness `u`, and the small errors `e,e0,e1` — a
+        /// consistent small integer per coefficient across all RNS limbs
+        /// (`−1 ↦ q_i−1`), which keeps the decrypt-noise a genuine small
+        /// integer. NOT constant-time (toy parameters; see SPEC.md).
+        fn sampleTernary(self: *const Self, random: std.Random) Ring {
+            var out = Ring.zero(.coeff);
+            for (0..N) |j| {
+                const r = random.uintLessThan(u8, 3); // 0,1,2 ↦ −1,0,1
+                for (0..L) |i| out.limbs[i][j] = switch (r) {
+                    0 => self.primes[i] - 1, // −1
+                    1 => 0,
+                    else => 1,
+                };
+            }
+            return out;
+        }
+
+        /// Sample a uniform ring element in `R_q` (each limb uniform in
+        /// `[0,q_i)` — by CRT this is uniform mod `q`). Used for the public-key
+        /// mask `a`.
+        fn sampleUniform(self: *const Self, random: std.Random) Ring {
+            var out = Ring.zero(.coeff);
+            for (0..L) |i| {
+                for (0..N) |j| out.limbs[i][j] = random.uintLessThan(u64, self.primes[i]);
+            }
+            return out;
+        }
+
+        /// `Δ·m` as a coefficient-domain ring element. `Δ·m_j < q`, so the
+        /// per-limb `(Δ mod q_i)·(m_j mod q_i) mod q_i` equals the residue of
+        /// the integer `Δ·m_j` (no wrap).
+        fn scaledPlaintext(self: *const Self, pt: *const Plaintext) Ring {
+            var out = Ring.zero(.coeff);
+            for (0..L) |i| {
+                const qi = self.primes[i];
+                const delta_i: u64 = @intCast(delta % qi);
+                for (0..N) |j| out.limbs[i][j] = ma.mulMod(delta_i, pt.coeffs[j] % qi, qi);
+            }
+            return out;
+        }
 
         /// Generate a BFV keypair. `random` supplies the secret (ternary) key,
-        /// public-key mask `a`, and error `e`.
+        /// the uniform public-key mask `a`, and the small error `e`.
+        /// `pk = (p0, p1) = (−(a·s + e), a)`.
         pub fn keyGen(self: *const Self, random: std.Random) KeyPair {
-            _ = self;
-            _ = random;
-            if (!gate.scheme_core_implemented)
-                @panic("TODO(opus/scheme): BFV keyGen — ternary s, pk=(-(a·s+e), a). Part 2. See gate.zig / SPEC.md.");
-            unreachable;
+            const s = self.sampleTernary(random);
+            const a = self.sampleUniform(random);
+            const e = self.sampleTernary(random);
+            var p0 = a.mul(&s, &self.engines, &self.primes); // a·s
+            p0.addAssign(&e, &self.primes); // a·s + e
+            p0.negate(&self.primes); // −(a·s + e)
+            return .{ .sk = .{ .s = s }, .pk = .{ .p0 = p0, .p1 = a } };
         }
 
         /// Encrypt `pt ∈ R_t`: `c0 = Δ·m + p0·u + e0`, `c1 = p1·u + e1`,
-        /// `Δ = ⌊q/t⌋`. `random` supplies `u,e0,e1`.
+        /// `Δ = ⌊q/t⌋`. `random` supplies the ternary `u,e0,e1`.
         pub fn encrypt(self: *const Self, pk: *const PublicKey, pt: *const Plaintext, random: std.Random) Ciphertext {
-            _ = .{ self, pk, pt, random };
-            if (!gate.scheme_core_implemented)
-                @panic("TODO(opus/scheme): BFV encrypt — Δ·m + pk·u + e, RNS. Part 2. See gate.zig / SPEC.md.");
-            unreachable;
+            const u = self.sampleTernary(random);
+            const e0 = self.sampleTernary(random);
+            const e1 = self.sampleTernary(random);
+            var c0 = self.scaledPlaintext(pt); // Δ·m
+            var p0u = pk.p0.mul(&u, &self.engines, &self.primes);
+            c0.addAssign(&p0u, &self.primes); // + p0·u
+            c0.addAssign(&e0, &self.primes); // + e0
+            var c1 = pk.p1.mul(&u, &self.engines, &self.primes);
+            c1.addAssign(&e1, &self.primes); // p1·u + e1
+            return .{ .components = .{ c0, c1, Ring.zero(.coeff) }, .len = 2 };
         }
 
-        /// Decrypt: `⌊t/q·(c0 + c1·s + …)⌉ mod t`. The rounding IS noise
-        /// management — but it has a byte-exact SEAL anchor, so Part 2/Opus.
+        /// Decrypt: `⌊t/q·(Σ_i c_i·s^i)⌉ mod t`, coefficient-wise. The phase
+        /// `Σ_i c_i·s^i = Δ·m + E` is reconstructed exactly per coefficient via
+        /// CRT, then rescaled with round-half-up
+        /// `⌊(2·t·v + q)/(2q)⌋ mod t`. Handles `len ∈ {2,3}` (a 3-component
+        /// ciphertext — post-multiply — needs the `c2·s²` term).
         pub fn decrypt(self: *const Self, sk: *const SecretKey, ct: *const Ciphertext) Plaintext {
-            _ = .{ self, sk, ct };
-            if (!gate.scheme_core_implemented)
-                @panic("TODO(opus/scheme): BFV decrypt — ⌊t/q·(c0+c1·s)⌉ mod t, RNS scale-and-round. Part 2. See gate.zig / SPEC.md.");
-            unreachable;
+            // phase = Σ_i c_i·s^i in R_q (c0 + c1·s [+ c2·s² …]).
+            var acc = ct.components[0];
+            if (ct.len >= 2) {
+                var spow = sk.s; // s^1
+                var term = ct.components[1].mul(&spow, &self.engines, &self.primes);
+                acc.addAssign(&term, &self.primes);
+                var i: usize = 2;
+                while (i < ct.len) : (i += 1) {
+                    spow = spow.mul(&sk.s, &self.engines, &self.primes); // s^i
+                    var t2 = ct.components[i].mul(&spow, &self.engines, &self.primes);
+                    acc.addAssign(&t2, &self.primes);
+                }
+            }
+            // ⌊t/q · phase⌉ mod t, coefficient-wise, via exact CRT reconstruction.
+            const basis = rns.Basis{ .primes = self.primes[0..] };
+            var out = Plaintext.zero(P.t);
+            for (0..N) |j| {
+                var res: [L]u64 = undefined;
+                for (0..L) |i| res[i] = acc.limbs[i][j];
+                const v = basis.reconstruct(&res); // in [0, q)
+                // round(t·v/q) = ⌊(2·t·v + q) / (2q)⌋ ; then reduce mod t.
+                const rounded = (2 * @as(u128, P.t) * v + q_product) / (2 * q_product);
+                out.coeffs[j] = @intCast(rounded % @as(u128, P.t));
+            }
+            return out;
         }
 
         // ── Gated: Fable core (Part 3 — noise management) ────────────────────
@@ -211,9 +307,9 @@ test "instance builds and exposes real ring add on ciphertext components" {
     try testing.expect(back.components[0].eql(&a.components[0]));
 }
 
-test "gated scheme cores are unreachable while flags are false (compile-only shape)" {
-    // We do NOT call the gated cores here (they @panic by design). This test
-    // documents the gate wiring and that the flags are OFF in Part 1.
-    try testing.expect(!gate.scheme_core_implemented);
+test "gate state after Part 2: scheme core ON, Fable core still OFF" {
+    // Part 2 turns on keyGen/encrypt/decrypt; the Fable mul/relin/noiseBudget
+    // core stays gated for Part 3 (its cores @panic until then).
+    try testing.expect(gate.scheme_core_implemented);
     try testing.expect(!gate.fable_core_implemented);
 }

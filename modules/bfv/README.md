@@ -1,4 +1,4 @@
-# bfv — leveled BFV homomorphic encryption (Part 1: arithmetic backbone + scheme scaffold)
+# bfv — leveled BFV homomorphic encryption (Parts 1–2: backbone + keyGen/encrypt/decrypt)
 
 **Fully Homomorphic Encryption.** FHE lets you compute directly on ciphertexts:
 `Dec(f(Enc(x))) = f(x)`, so an untrusted party can evaluate a function over data
@@ -11,9 +11,10 @@ capability: `std` ships lattice KEM/signatures (ML-KEM/ML-DSA) but no
 homomorphic-evaluation scheme, and the sibling `paillier` is only additively
 homomorphic — BFV adds the multiply.
 
-FHE is large, so it is built as a multi-part arc. **This is Part 1: the
-arithmetic backbone (real + byte-exact-KAT'd) plus the scaffolded scheme
-surface.** The genuinely hard, noise-sensitive scheme core is gated (see below).
+FHE is large, so it is built as a multi-part arc. **Parts 1–2 are real: the
+arithmetic backbone (byte-exact-KAT'd) and the BFV scheme core —
+`keyGen`/`encrypt`/`decrypt`.** Part 3 (the genuinely hard, noise-sensitive
+`mul`/`relinearize`/`noiseBudget`) stays gated (see below).
 
 ## What is real today (Part 1)
 
@@ -28,20 +29,21 @@ The whole computational backbone FHE stands on is implemented and tested:
 | Plaintext | `encode.zig` | `Plaintext(N)` — `R_t` coefficient + integer encodings, `addRef`/`mulRef` references |
 | Parameters | `params.zig` | `Params` + NTT-friendly-prime validation; `test_tiny`, `bfv_toy` sets |
 
-## What is scaffolded (gated cores)
+## The scheme core (Part 2) + the still-gated core (Part 3)
 
-`bfv.Bfv(P)` exposes the scheme. Its types, byte codecs, and the
-(non-noise-sensitive) homomorphic `add`/`sub` are **real**; the cores are gated
-in `gate.zig` behind two honestly-separated flags:
+`bfv.Bfv(P)` exposes the scheme, controlled by two honestly-separated flags in
+`gate.zig`:
 
-- `scheme_core_implemented` — **Part 2 (Opus):** `keyGen` / `encrypt` /
-  `decrypt`. Textbook leveled-BFV, byte-exact-KAT-able against SEAL.
-- `fable_core_implemented` — **Part 3 (Fable):** `mul` (tensor + `⌊t/q·…⌉`
-  rescale) / `relinearize` (relin-key key-switch) / `noiseBudget`. The
-  noise-management core (see `SPEC.md`).
-
-While a flag is `false` its cores `@panic` and the dependent end-to-end tests
-report SKIP (a skip is not a green light).
+- `scheme_core_implemented` = **`true`** — **Part 2 (Opus), REAL:** `keyGen`
+  (`pk=(−(a·s+e), a)`, ternary `s`) / `encrypt` (`c0=Δ·m+p0·u+e0`, `c1=p1·u+e1`,
+  `Δ=⌊q/t⌋`) / `decrypt` (`⌊t/q·(c0+c1·s)⌉ mod t`, exact CRT reconstruction +
+  round-half-up rescale). Anchored by a deterministic noiseless-ciphertext
+  decrypt KAT, the enc/dec round-trip (tiny + N=1024), and homomorphic-add
+  end-to-end.
+- `fable_core_implemented` = **`false`** — **Part 3 (Fable):** `mul` (tensor +
+  `⌊t/q·…⌉` rescale) / `relinearize` (relin-key key-switch) / `noiseBudget`. The
+  noise-management core (see `SPEC.md`). Its cores `@panic` and the dependent
+  mul/depth end-to-end tests report SKIP (a skip is not a green light).
 
 ## Usage
 
@@ -56,8 +58,11 @@ const product = engine.mulNegacyclic(a, b); // a·b mod (X^1024 + 1)
 // Scheme surface (cores land in Parts 2–3):
 const B = bfv.Bfv(bfv.params.bfv_toy);
 const inst = try B.init();
-// inst.keyGen / encrypt / decrypt  → Part 2
-// inst.mul / relinearize           → Part 3
+const kp = inst.keyGen(rand);              // Part 2 (real)
+const ct = inst.encrypt(&kp.pk, &pt, rand);
+const back = inst.decrypt(&kp.sk, &ct);    // Dec(Enc(m)) == m
+const sum = inst.add(&ct, &ct2);           // homomorphic add (real)
+// inst.mul / relinearize / noiseBudget    → Part 3 (gated)
 ```
 
 ## Verify
@@ -67,11 +72,12 @@ zig build test-bfv --summary all                    # Debug
 zig build test-bfv -Doptimize=ReleaseFast --summary all
 ```
 
-Part 1: 29 pass / 3 skip (the SKIPs are the homomorphic end-to-end anchors,
-which switch on with the scheme cores). The passing set includes the byte-exact
-NTT + RNS KATs and two deliberately-broken positive controls (a
-cyclic-vs-negacyclic discriminator and a wrong-scale "encryptor") that prove the
-harness bites before any scheme core exists.
+Parts 1–2: 32 pass / 2 skip (the 2 SKIPs are the mul+relin and multiply-depth
+anchors, which switch on with the Part-3 Fable core). The passing set includes
+the byte-exact NTT + RNS KATs, two deliberately-broken positive controls (a
+cyclic-vs-negacyclic discriminator and a wrong-scale "encryptor"), a
+deterministic noiseless-ciphertext decrypt KAT, and the enc/dec round-trip +
+homomorphic-add end-to-end anchors (tiny params + N=1024).
 
 Provenance: clean-room from the Fan–Vercauteren paper + public NTT/RNS/BFV
 design (SEAL); no third-party source ported — see `SPEC.md`. NTT/RNS KAT vectors

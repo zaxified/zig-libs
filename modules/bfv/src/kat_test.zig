@@ -174,6 +174,62 @@ test "positive control: wrong-scale encryptor is rejected, correct one accepted"
     try testing.expect(scaleCheck(&c0_wrong, &c1, &s, &target_one, &engines));
 }
 
+// ── 2c. Deterministic decrypt KAT: the Δ-rescale, independent of enc/keyGen ────
+// The strongest anti-self-consistency anchor for `decrypt` that does NOT route
+// through this module's own `encrypt`/`keyGen`. We hand-construct a NOISELESS
+// ciphertext with the REAL (independently-KAT'd) ring arithmetic so that
+// `c0 + c1·s == Δ·m` exactly, and require `decrypt((s),(c0,c1)) == m`. Then:
+//   • add a within-margin noise (|E| < Δ/2 = 206) → still decrypts to m;
+//   • add an over-margin noise (> Δ/2) at one coefficient → the rounding flips,
+//     so decrypt DIFFERS there (proves the margin/rounding boundary bites).
+// This pins the `⌊t/q·…⌉` rescale against an external re-derivation of `Δ·m`,
+// not against round-trip self-consistency.
+
+/// Integer `n` placed at coefficient 0 as a ring element (residues per limb).
+fn noiseAtCoeff0(n: u64) Ring8 {
+    var r = Ring8.zero(.coeff);
+    r.limbs[0][0] = n % primes8[0];
+    r.limbs[1][0] = n % primes8[1];
+    return r;
+}
+
+test "decrypt KAT: noiseless Δ-rescale round-trips; margin boundary bites (deterministic)" {
+    if (!gate.scheme_core_implemented) return error.SkipZigTest;
+    const B = bfv.Bfv(P);
+    const inst = try B.init();
+    const engines = try ring.makeEngines(P.n, P.primes.len, &primes8);
+    const Pt = encode.Plaintext(P.n);
+    const m = Pt.fromCoeffs(P.t, .{ 1, 2, 3, 0, 1, 2, 3, 0 });
+
+    // Fixed small secret s (ternary: 16≡−1 mod 17, 96≡−1 mod 97) and an
+    // arbitrary mask c1 — NO keyGen/encrypt involved.
+    const s = Ring8.fromCoeffs(&primes8, .{ [_]u64{ 1, 0, 16, 1, 0, 16, 1, 0 }, [_]u64{ 1, 0, 96, 1, 0, 96, 1, 0 } });
+    const c1 = Ring8.fromCoeffs(&primes8, .{ [_]u64{ 3, 5, 7, 9, 11, 13, 15, 2 }, [_]u64{ 30, 50, 70, 90, 11, 33, 55, 77 } });
+
+    // Noiseless: c0 = Δ·m − c1·s  ⇒  c0 + c1·s == Δ·m exactly.
+    const target = scaledPlaintext(&m, deltaLimbs()); // Δ·m
+    const c1s = c1.mul(&s, &engines, &primes8);
+    var c0 = target;
+    c0.subAssign(&c1s, &primes8);
+
+    const sk = B.SecretKey{ .s = s };
+    const ct = B.Ciphertext{ .components = .{ c0, c1, Ring8.zero(.coeff) }, .len = 2 };
+    const got = inst.decrypt(&sk, &ct);
+    try testing.expectEqualSlices(u64, &m.coeffs, &got.coeffs); // exact Δ-rescale
+
+    // Within-margin noise (+100 < Δ/2=206) at coeff 0 → still m.
+    var c0_ok = c0;
+    c0_ok.addAssign(&noiseAtCoeff0(100), &primes8);
+    const ct_ok = B.Ciphertext{ .components = .{ c0_ok, c1, Ring8.zero(.coeff) }, .len = 2 };
+    try testing.expectEqualSlices(u64, &m.coeffs, &inst.decrypt(&sk, &ct_ok).coeffs);
+
+    // Over-margin noise (+300 > Δ/2) at coeff 0 → rounding flips that coeff.
+    var c0_bad = c0;
+    c0_bad.addAssign(&noiseAtCoeff0(300), &primes8);
+    const ct_bad = B.Ciphertext{ .components = .{ c0_bad, c1, Ring8.zero(.coeff) }, .len = 2 };
+    try testing.expect(inst.decrypt(&sk, &ct_bad).coeffs[0] != m.coeffs[0]);
+}
+
 // ── 3. Homomorphic end-to-end anchors (SKIP-gated until scheme cores land) ────
 
 test "homomorphic ADD end-to-end: Dec(Enc(a) ⊕ Enc(b)) == a+b (mod t)" {
@@ -214,6 +270,34 @@ test "homomorphic MUL+RELIN end-to-end: Dec(relin(Enc(a) ⊗ Enc(b))) == a·b (m
     const got = inst.decrypt(&kp.sk, &prod2);
     const want = Pt.mulRef(&ma_pt, &mb_pt);
     try testing.expectEqualSlices(u64, &want.coeffs, &got.coeffs);
+}
+
+test "enc/dec round-trip at realistic dimension (bfv_toy N=1024, comfortable margin)" {
+    if (!gate.scheme_core_implemented) return error.SkipZigTest;
+    const B = bfv.Bfv(params.bfv_toy);
+    const inst = try B.init();
+    var prng = std.Random.DefaultPrng.init(0xB5F);
+    const rnd = prng.random();
+    const kp = inst.keyGen(rnd);
+    const Pt = B.Plaintext;
+    const t = params.bfv_toy.t;
+    // A few random plaintexts + a homomorphic add, all decrypt back exactly:
+    // fresh-noise |E| ≲ 2N+1 ≪ Δ/2 ≈ 2^49, so no seed can fail.
+    for (0..8) |_| {
+        var ca: [B.degree]u64 = undefined;
+        var cb: [B.degree]u64 = undefined;
+        for (&ca, &cb) |*x, *y| {
+            x.* = rnd.uintLessThan(u64, t);
+            y.* = rnd.uintLessThan(u64, t);
+        }
+        const a = Pt.fromCoeffs(t, ca);
+        const b = Pt.fromCoeffs(t, cb);
+        const ea = inst.encrypt(&kp.pk, &a, rnd);
+        const eb = inst.encrypt(&kp.pk, &b, rnd);
+        try testing.expectEqualSlices(u64, &a.coeffs, &inst.decrypt(&kp.sk, &ea).coeffs);
+        const sum = inst.decrypt(&kp.sk, &inst.add(&ea, &eb));
+        try testing.expectEqualSlices(u64, &Pt.addRef(&a, &b).coeffs, &sum.coeffs);
+    }
 }
 
 test "multiply DEPTH: Dec(a·b·c) == a·b·c (mod t) exercises the noise budget" {

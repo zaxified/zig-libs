@@ -31,7 +31,7 @@
 //! the harness has teeth before either scheme core exists.
 
 /// Part 2 (Opus): keyGen / encrypt / decrypt / add.
-pub const scheme_core_implemented = false;
+pub const scheme_core_implemented = true;
 
 /// Part 3 (Fable): mul / relinearize / noiseBudget.
 pub const fable_core_implemented = false;
