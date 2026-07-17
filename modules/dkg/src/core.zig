@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 //! core — the five Fable-irreducible GJKR protocol-soundness functions,
-//! left as `@panic("TODO(fable/core): …")` stubs in this scaffolding pass.
+//! now IMPLEMENTED (`gate.fable_core_implemented == true`).
 //! These are the part where a rushing / Byzantine adversary must be unable
 //! to bias the group public key `Q` or learn an honest party's share — the
 //! distributed-protocol correctness the module exists to establish. They
@@ -11,10 +11,18 @@
 //! `checks.zig`), not by a golden test — squarely the "no external anchor +
 //! nontrivial protocol design space" side of the Fable-tier heuristic.
 //!
-//! The signatures below are FINAL: the honest `Dkg` driver already calls
-//! them, so the type checker exercises them today even while the bodies
-//! panic. A follow-up crypto pass fills the five bodies and flips
-//! `gate.fable_core_implemented` to `true`.
+//! **The bias-prevention ordering, stated once.** `Q = g^{Σ_{i∈QUAL} a_i0}`;
+//! an adversary biases `Q` only by choosing whether its contribution is
+//! *included* as a function of the honest contributions. Round-1 Pedersen
+//! commitments `C_ik = g^{a_ik} h^{b_ik}` are perfectly HIDING, so at the
+//! moment `computeQual` freezes membership — from Round-2 complaints and
+//! defenses ONLY — the adversary knows nothing about the eventual `Q`.
+//! Only after that freeze are the Feldman `A_ik = g^{a_ik}` revealed, and
+//! Pedersen's BINDING property forces every QUAL dealer's `A_i0` to open
+//! the exact `a_i0` it already committed. Hence `computeQual` takes no
+//! Feldman input, and `deriveGroupPublicKey` sums over exactly the frozen
+//! set. Feeding any extraction-phase data into the QUAL decision would
+//! re-open the rushing-adversary bias even with every equation verifying.
 //!
 //! Reference: R. Gennaro, S. Jarecki, H. Krawczyk, T. Rabin, "Secure
 //! Distributed Key Generation for Discrete-Log Based Cryptosystems"
@@ -56,15 +64,12 @@ pub fn verifyPedersenShare(
     s_prime: Scalar,
     h: Element,
 ) bool {
-    _ = commitments;
-    _ = receiver;
-    _ = s;
-    _ = s_prime;
-    _ = h;
-    @panic("TODO(fable/core): GJKR Round-2 Pedersen share verification " ++
-        "(GJKR §2 Fig.2, step 2): return g^s·h^{s'} == Π_k C_k^{j^k} " ++
-        "(commit.pedersenEvalShare vs commit.evalCommitmentAt), constant-time " ++
-        "point-equality, false on any decode failure — never panic on bad input.");
+    // Reject-don't-panic on adversarial shapes: an empty commitment vector
+    // would trip evalCommitmentAt's precondition assert.
+    if (commitments.len == 0) return false;
+    const lhs = commit.pedersenEvalShare(s, s_prime, h) catch return false;
+    const rhs = commit.evalCommitmentAt(commitments, receiver) catch return false;
+    return std.crypto.timing_safe.eql([types.Ne]u8, lhs.toBytes(), rhs.toBytes());
 }
 
 /// **CORE 2 — the extraction-phase Feldman share-verification equation.**
@@ -86,12 +91,10 @@ pub fn verifyFeldmanShare(
     receiver: u32,
     s: Scalar,
 ) bool {
-    _ = commitments;
-    _ = receiver;
-    _ = s;
-    @panic("TODO(fable/core): GJKR extraction Feldman share verification " ++
-        "(GJKR §2 Fig.2, step 4): return g^s == Π_k A_k^{j^k} " ++
-        "(commit.feldmanEvalShare vs commit.evalCommitmentAt); false on decode failure.");
+    if (commitments.len == 0) return false;
+    const lhs = commit.feldmanEvalShare(s) catch return false;
+    const rhs = commit.evalCommitmentAt(commitments, receiver) catch return false;
+    return std.crypto.timing_safe.eql([types.Ne]u8, lhs.toBytes(), rhs.toBytes());
 }
 
 /// **CORE 3 — the complaint / disqualification / QUAL logic.** Writes into
@@ -118,15 +121,46 @@ pub fn computeQual(
     complaints: []const Complaint,
     defense_valid: []const bool,
 ) Error!void {
-    _ = qualified;
-    _ = cfg;
-    _ = complaints;
-    _ = defense_valid;
-    @panic("TODO(fable/core): GJKR QUAL determination (GJKR §2 Fig.2, step 3): " ++
-        "start all-qualified; disqualify dealer i if it has an undefended " ++
-        "complaint (defense_valid==false) OR >t complainers; error.EmptyQual if " ++
-        "none survive. THIS decision must depend ONLY on Round-2 data (never on " ++
-        "Feldman/extraction data) — that ordering is the bias-prevention crux.");
+    // NOTE deliberately absent from this signature/body: ANY extraction-phase
+    // (Feldman) input. QUAL is a pure function of Round-2 Pedersen-phase data
+    // — that is the bias-prevention ordering (see the module doc comment).
+    if (complaints.len != defense_valid.len) return error.LengthMismatch;
+    if (qualified.len != cfg.n) return error.LengthMismatch;
+
+    for (qualified) |*q| q.* = true;
+
+    // Rule (a): an undefended valid complaint disqualifies the accused —
+    // the dealer could not broadcast an opening matching its own C_i.
+    for (complaints, defense_valid) |c, defended| {
+        if (c.accused < 1 or c.accused > cfg.n) continue; // no such dealer to disqualify
+        if (!defended) qualified[c.accused - 1] = false;
+    }
+
+    // Rule (b): more than `t` DISTINCT complainants disqualify the accused
+    // even if each individual complaint was answered. Duplicate complaints
+    // from the same complainant count once (else t forged re-sends by one
+    // Byzantine party could evict an honest dealer).
+    for (qualified, 0..) |*q, d| {
+        const did: u32 = @intCast(d + 1);
+        var complainers: u32 = 0;
+        for (complaints, 0..) |c, k| {
+            if (c.accused != did) continue;
+            var seen = false;
+            for (complaints[0..k]) |prev| {
+                if (prev.accused == did and prev.complainant == c.complainant) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) complainers += 1;
+        }
+        if (complainers > cfg.t) q.* = false;
+    }
+
+    for (qualified) |q| {
+        if (q) return; // at least one dealer survives
+    }
+    return error.EmptyQual;
 }
 
 /// **CORE 4 — the bias-prevented group public key.** `Q = Σ_{i∈QUAL} A_i0`
@@ -141,11 +175,15 @@ pub fn deriveGroupPublicKey(
     qualified: []const bool,
     feldman_a0: []const Element,
 ) Error!Element {
-    _ = qualified;
-    _ = feldman_a0;
-    @panic("TODO(fable/core): GJKR public-key extraction (GJKR §2 Fig.2, step 4): " ++
-        "Q = Σ_{i: qualified[i]} feldman_a0[i] (elliptic-curve point sum over " ++
-        "QUAL ONLY); error.EmptyQual if no dealer qualifies.");
+    if (qualified.len != feldman_a0.len) return error.LengthMismatch;
+    var acc: ?commit.Secp256k1 = null;
+    for (qualified, feldman_a0) |q, a0| {
+        if (!q) continue; // sum over the FIXED QUAL set only — never all dealers
+        const p = try a0.point();
+        acc = if (acc) |cur| cur.add(p) else p;
+    }
+    const sum = acc orelse return error.EmptyQual;
+    return Element.fromPoint(sum);
 }
 
 /// **CORE 5 — this party's final secret share.** `x_j = Σ_{i∈QUAL} s_ij`,
@@ -160,17 +198,76 @@ pub fn combineKeyShare(
     qualified: []const bool,
     received: []const ?Scalar,
 ) Error!Scalar {
-    _ = qualified;
-    _ = received;
-    @panic("TODO(fable/core): GJKR share combination (GJKR §2 Fig.2, step 4): " ++
-        "x_j = Σ_{i: qualified[i]} received[i].? (scalar sum mod q over QUAL); " ++
-        "error.LengthMismatch if a qualified dealer has no accepted share.");
+    if (qualified.len != received.len) return error.LengthMismatch;
+    var acc = Scalar.zero;
+    var any = false;
+    for (qualified, received) |q, r| {
+        if (!q) continue; // a non-QUAL dealer's share NEVER enters x_j
+        const s = r orelse return error.LengthMismatch;
+        acc = acc.add(s);
+        any = true;
+    }
+    if (!any) return error.EmptyQual;
+    return acc;
 }
 
-// The stubs above intentionally have no runnable test here; the gated
-// tests that drive them live in `protocol.zig`/`root.zig` and SKIP while
-// `gate.fable_core_implemented == false`. A reference to `gate` keeps its
-// meaning tied to this file.
+// The protocol-level tests that drive these five live in `protocol.zig`/
+// `root.zig` (formerly gated; live now that the core is implemented). A
+// reference to `gate` keeps its meaning tied to this file.
 comptime {
     std.debug.assert(!@import("gate.zig").fable_core_implemented or true);
+}
+
+// One direct unit test on the QUAL rules themselves: the round-driver
+// harness only ever produces a single complaint, so rule (b) (>t distinct
+// complainants) and duplicate-complaint dedup would otherwise be untested.
+test "computeQual: undefended complaint, >t distinct complainers, dedup, EmptyQual" {
+    const testing = std.testing;
+    const cfg: Config = .{ .t = 2, .n = 4 };
+    var qual: [4]bool = undefined;
+
+    // No complaints: everyone qualifies.
+    try computeQual(&qual, cfg, &.{}, &.{});
+    for (qual) |q| try testing.expect(q);
+
+    // A defended complaint keeps the dealer in QUAL (rule a not triggered).
+    try computeQual(&qual, cfg, &.{.{ .complainant = 2, .accused = 1 }}, &.{true});
+    try testing.expect(qual[0]);
+
+    // An undefended complaint disqualifies (rule a).
+    try computeQual(&qual, cfg, &.{.{ .complainant = 2, .accused = 1 }}, &.{false});
+    try testing.expect(!qual[0]);
+    try testing.expect(qual[1] and qual[2] and qual[3]);
+
+    // Rule (b): 3 > t=2 DISTINCT complainants evict dealer 4 even though
+    // every single complaint was defended.
+    try computeQual(&qual, cfg, &.{
+        .{ .complainant = 1, .accused = 4 },
+        .{ .complainant = 2, .accused = 4 },
+        .{ .complainant = 3, .accused = 4 },
+    }, &.{ true, true, true });
+    try testing.expect(!qual[3]);
+    try testing.expect(qual[0] and qual[1] and qual[2]);
+
+    // Dedup: the SAME complainant re-sending 3 defended complaints must
+    // count once — dealer 4 stays qualified.
+    try computeQual(&qual, cfg, &.{
+        .{ .complainant = 1, .accused = 4 },
+        .{ .complainant = 1, .accused = 4 },
+        .{ .complainant = 1, .accused = 4 },
+    }, &.{ true, true, true });
+    try testing.expect(qual[3]);
+
+    // Mismatched parallel arrays / wrong qualified length are rejected.
+    try testing.expectError(error.LengthMismatch, computeQual(&qual, cfg, &.{.{ .complainant = 1, .accused = 2 }}, &.{}));
+    var short: [3]bool = undefined;
+    try testing.expectError(error.LengthMismatch, computeQual(&short, cfg, &.{}, &.{}));
+
+    // Everyone undefended-complained-about: EmptyQual, never a zero key.
+    try testing.expectError(error.EmptyQual, computeQual(&qual, cfg, &.{
+        .{ .complainant = 2, .accused = 1 },
+        .{ .complainant = 1, .accused = 2 },
+        .{ .complainant = 1, .accused = 3 },
+        .{ .complainant = 1, .accused = 4 },
+    }, &.{ false, false, false, false }));
 }

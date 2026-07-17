@@ -20,15 +20,14 @@
 //! identifiable-abort, proactive refresh, and aux-parameter DKG are LATER
 //! increments (SPEC "Out of scope").
 //!
-//! **Status — scaffold; bias-prevention core GATED.** The five irreducible
-//! GJKR functions in `core.zig` (`verifyPedersenShare`,
-//! `verifyFeldmanShare`, `computeQual`, `deriveGroupPublicKey`,
-//! `combineKeyShare`) are `@panic` stubs behind
-//! `gate.fable_core_implemented`. Everything else — commitment helpers,
-//! wire codecs, the synchronous round driver, the invariant checkers, the
-//! `BrokenDkg` positive control, and the end-to-end anchor wiring — is real
-//! today, and the positive control already gives the harness teeth with the
-//! core still stubbed.
+//! **Status — COMPLETE.** The five irreducible GJKR functions in
+//! `core.zig` (`verifyPedersenShare`, `verifyFeldmanShare`, `computeQual`,
+//! `deriveGroupPublicKey`, `combineKeyShare`) are implemented and
+//! `gate.fable_core_implemented` is `true`: the formerly-gated tests —
+//! including the decisive end-to-end anchor (DKG shares →
+//! `threshold_ecdsa.signWithShares` → std-ECDSA verify under `Q`) — run
+//! for real. The `BrokenDkg` positive control keeps proving the harness
+//! discriminates (it still catches the poisoned key).
 
 const std = @import("std");
 

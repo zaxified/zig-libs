@@ -38,9 +38,9 @@ The FINAL end-to-end verification target,
 `std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256`, is Zig's own standard-library
 ECDSA, used via its public API.
 
-Status: SCAFFOLD. The five irreducible GJKR protocol-soundness functions in
-`core.zig` (`verifyPedersenShare`, `verifyFeldmanShare`, `computeQual`,
-`deriveGroupPublicKey`, `combineKeyShare`) are deliberately left `@panic`-stubbed
-behind `gate.fable_core_implemented` for a follow-up crypto pass — see each
-stub's doc comment and `SPEC.md` for the exact construction. No GPL/LGPL/AGPL
-source was consulted or copied anywhere in this module.
+Status: COMPLETE (Phase 1). The five irreducible GJKR protocol-soundness
+functions in `core.zig` (`verifyPedersenShare`, `verifyFeldmanShare`,
+`computeQual`, `deriveGroupPublicKey`, `combineKeyShare`) are implemented and
+`gate.fable_core_implemented` is `true` — see each function's doc comment and
+`SPEC.md` for the exact construction. No GPL/LGPL/AGPL source was consulted or
+copied anywhere in this module.

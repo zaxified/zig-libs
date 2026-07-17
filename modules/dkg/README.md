@@ -14,16 +14,14 @@ commit to their sharings with **Pedersen** commitments and fix the qualified set
 **QUAL** from complaints alone; only *after* QUAL is frozen do they reveal
 **Feldman** commitments and extract the public key `Q = Σ_{i∈QUAL} g^{a_i0}`.
 
-> **Status — scaffold; bias-prevention core GATED.** This Phase-1 pass ships the
-> full mechanical layer (commitment helpers, wire codecs, the synchronous round
-> driver, the invariant checkers, a `BrokenDkg` positive control, and the
-> end-to-end anchor wiring) and leaves the five irreducible protocol-soundness
-> functions in `core.zig` as `@panic` stubs behind
-> `gate.fable_core_implemented`. The `BrokenDkg` positive control already gives
-> the harness teeth with the core still stubbed (it accepts a Byzantine bad
-> share, and the checker catches the resulting unusable key). Flip the gate once
-> `core.zig` is implemented; the gated tests then enforce every correctness
-> invariant and the decisive end-to-end anchor.
+> **Status — complete.** This Phase-1 pass ships the full mechanical layer
+> (commitment helpers, wire codecs, the synchronous round driver, the invariant
+> checkers, a `BrokenDkg` positive control, and the end-to-end anchor wiring)
+> **and** the five irreducible protocol-soundness functions in `core.zig`;
+> `gate.fable_core_implemented` is `true`, so the formerly-gated tests — every
+> correctness invariant and the decisive end-to-end anchor — run for real. The
+> `BrokenDkg` positive control still keeps the harness honest (it accepts a
+> Byzantine bad share, and the checker catches the resulting unusable key).
 
 ## The end-to-end anchor
 

@@ -73,7 +73,7 @@ with unknown `log_g h` (`commit.pedersenH`, try-and-increment hash-to-curve).
 
 ## Fable-vs-mechanical split
 
-**Fable-irreducible core — `core.zig`, five functions (gated `@panic`):**
+**Fable-irreducible core — `core.zig`, five functions (implemented):**
 
 1. `verifyPedersenShare` — the Round-2 share-vs-commitment equation
    `g^s h^{s'} == Π_k C_k^{j^k}` (the binding property; must catch an
@@ -109,14 +109,14 @@ end-to-end anchor (`root.zig`).
 - **End-to-end anchor (best teeth).** Run the DKG → `assembleKeyShares` (attach
   Paillier/aux) → `threshold_ecdsa.signWithShares` → verify with std ECDSA under
   `Q`. A DKG whose key yields a valid std-verifiable signature is correct and
-  usable; this needs no external vector. GATED on the core.
+  usable; this needs no external vector. Runs against the real core.
 - **Correctness invariants** (`checks.zig`): all honest parties output the same
   `Q` (`allSameQ`); any `t` shares Lagrange-reconstruct `x` with `x·G == Q`
   (`reconstructsToQ`); each `X_j == x_j·G` (`verifyingShareConsistent`).
 - **Adversarial (Byzantine) tests.** A dealer that sends a share inconsistent
   with its Pedersen commitment must be detected (complaint), and — if it cannot
   defend — disqualified from QUAL; a defended (transient) bad share is tolerated
-  and the receiver adopts the revealed opening. GATED on the core.
+  and the receiver adopts the revealed opening. Runs against the real core.
 - **Positive control (runs today, no gated code).** `BrokenDkg` skips the
   share-vs-commitment verification and naively sums every wire share. Fed a
   Byzantine bad share, it emits an unusable key, and `reconstructsToQ` catches

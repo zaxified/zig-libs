@@ -18,12 +18,12 @@
 //! would only obscure. `netsim` remains the right host for a future
 //! *asynchronous* DKG variant; it is deliberately not used here.
 //!
-//! `Dkg.run` is the honest driver; it calls the five gated `core`
-//! functions, so its correctness tests SKIP until the core lands.
+//! `Dkg.run` is the honest driver; it calls the five `core` functions
+//! (now implemented), so its correctness tests run for real.
 //! `BrokenDkg.run` is a complete but deliberately-wrong DKG that skips the
 //! share-vs-commitment verification (Core 1) and its QUAL logic (Core 3)
-//! entirely — it touches NO gated code, so it runs today and gives the
-//! harness teeth before the core exists.
+//! entirely — it touches NO core soundness code, so it stands as an
+//! independent positive control that keeps the harness honest.
 
 const std = @import("std");
 const commit = @import("commit.zig");
@@ -145,14 +145,13 @@ fn deal(arena: std.mem.Allocator, cfg: Config, corr: Corruption, random: std.Ran
     };
 }
 
-// ── the honest driver (calls the gated core) ─────────────────────────────
+// ── the honest driver (calls the core) ───────────────────────────────────
 
 pub const Dkg = struct {
     /// Run the full GJKR secret-key DKG to completion and return each
     /// party's `DkgShareOutput` (allocated with `allocator`, caller frees
-    /// the slice). Calls the five gated `core` functions — so this panics
-    /// until `gate.fable_core_implemented` is flipped; its correctness
-    /// tests are gated to SKIP until then.
+    /// the slice). Calls the five `core` soundness functions (implemented),
+    /// so its correctness tests run for real.
     pub fn run(
         allocator: std.mem.Allocator,
         cfg: Config,
@@ -269,8 +268,8 @@ fn acceptedShare(
 /// `Corruption` feeds a bad share to some receiver, that receiver's `x_j`
 /// is silently wrong, so the group key it emits is unusable. The harness's
 /// `checks.reconstructsToQ` (and, ultimately, the end-to-end signature)
-/// MUST catch this — that is the whole point of the positive control, and
-/// it proves the teeth work with the real core still stubbed.
+/// MUST catch this — that is the whole point of the positive control: it
+/// proves the teeth discriminate, independent of the real core's path.
 pub const BrokenDkg = struct {
     pub fn run(
         allocator: std.mem.Allocator,
