@@ -62,8 +62,12 @@ pub const Term = r1cs.Term;
 pub const ProvingKey = prover.ProvingKey;
 pub const VerifyingKey = prover.VerifyingKey;
 pub const Proof = prover.Proof;
+pub const ToxicWaste = prover.ToxicWaste;
+pub const KeyPair = prover.KeyPair;
+pub const Randomizers = prover.Randomizers;
 pub const setup = prover.setup;
 pub const prove = prover.prove;
+pub const freeKeyPair = prover.freeKeyPair;
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────
 //

@@ -63,9 +63,9 @@ vanishing poly), `fft` (radix-2 NTT/INTT + FFT multiply), `msm` (naive `G1`/
 `G2`), `r1cs` (constraint system + satisfaction), `qap` (interpolation + the
 `A·B−C` divisibility oracle). Plus the deliberately-broken positive control.
 
-**Gated (`gate.prover_core_implemented = false`):** the prover core —
+**Prover core (Part 2, now shipped — `gate.prover_core_implemented = true`):**
 `prover.setup` (toy trusted setup) and `prover.prove` (the proof assembly).
-Both `@panic`; the end-to-end `prove→verify` test SKIPs.
+The end-to-end `prove→verify` anchor runs green (see §6).
 
 ## 4. CRS approach — toy setup first, snarkjs `.zkey` deferred
 
@@ -141,12 +141,14 @@ tests):
   (generator points — not a real proof), proving the end-to-end anchor has
   teeth before `prove` exists.
 
-Gated to SKIP until `gate.prover_core_implemented`:
+End-to-end (now live — `gate.prover_core_implemented == true`, Part 2):
 
-- **End-to-end.** `prove(setup(…)) → bn254.groth16Verify == true`; tampered
-  proof / wrong public input → `false`.
+- **End-to-end.** `prove(setup(…)) → bn254.groth16Verify == true` on a
+  non-trivial circuit (4 constraints, 3 public inputs: `out1=x²`, `out2=y²`,
+  `out3=(x+y)²`); tampered proof (negated `πA`/`πC`) / wrong public input /
+  non-satisfying witness → `false`.
 
-Counts: 26 pass / 2 skip, Debug **and** ReleaseFast.
+Counts: 31 pass, Debug **and** ReleaseFast.
 
 ## 7. Deferred increments (out of Phase 1)
 

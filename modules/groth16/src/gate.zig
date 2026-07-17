@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: MIT
-//! gate — the single switch guarding the one part of this module that a
-//! Phase-1 SCAFFOLD deliberately does NOT ship: the **Groth16 prover core**
-//! (`prover.zig`'s `setup` toy-CRS generation + `prove` proof assembly). It
-//! is `false` today, so those functions `@panic` and every test that would
-//! call them reports SKIP (a skip is NOT a green light — same convention as
-//! `bn254`/`bulletproofs`/`fss`/`threshold_ecdsa`).
+//! gate — the switch that used to guard the one part a Phase-1 SCAFFOLD did
+//! NOT ship: the **Groth16 prover core** (`prover.zig`'s `setup` toy-CRS
+//! generation + `prove` proof assembly). **It is now `true` (Part 2 shipped):**
+//! `setup`/`prove` are implemented and the end-to-end anchor
+//! (`prove(setup(…)) → bn254.groth16Verify == true`, plus tamper/wrong-input/
+//! non-satisfying-witness → `false`) runs green. The flag is retained as a
+//! self-documenting marker of the scaffold→core boundary and the tier call.
 //!
 //! ## What IS real and ungated today (the harness has teeth without the core)
 //!
@@ -35,4 +36,4 @@
 //! soundness argument with no checking oracle). Published construction (Groth
 //! 2016) + a complete anchor ⇒ this is **Opus**, not Fable. See `SPEC.md`'s
 //! "Fable-vs-Opus tier call".
-pub const prover_core_implemented = false;
+pub const prover_core_implemented = true;
