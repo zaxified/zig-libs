@@ -29,16 +29,16 @@
 //! check + Lagrange-in-exponent teeth are demonstrated with NO gated code
 //! on the path.
 //!
-//! While this is `false` the four cores are `@panic("TODO(fable/core):
-//! ...")` stubs and the gated tests in `harness_test.zig` report **SKIP**
+//! While this was `false` the four cores were `@panic("TODO(fable/core):
+//! ...")` stubs and the gated tests in `harness_test.zig` reported **SKIP**
 //! via `error.SkipZigTest` — a skip is not a green light. The function
-//! signatures still type-check at every call site, so the cores' contracts
-//! are frozen before the bodies exist (CONVENTIONS.md's "gate-flag /
+//! signatures type-checked at every call site, so the cores' contracts
+//! were frozen before the bodies existed (CONVENTIONS.md's "gate-flag /
 //! dark-tests" convention, matching `bbs`/`dkg`/`bulletproofs`'
-//! scaffold-then-implement discipline). A Fable pass implements the four
-//! cores per their per-function doc-comment contracts in `credential.zig`
-//! and flips this to `true`, at which point the gated end-to-end anchor
-//! (threshold-issue → aggregate → re-randomize → selective-disclosure show
-//! → verify) and the NIZK-soundness rejection tests become executed
-//! assertions rather than skips.
-pub const fable_core_implemented = false;
+//! scaffold-then-implement discipline). The Fable pass has since
+//! implemented the four cores per their per-function doc-comment contracts
+//! in `credential.zig` and flipped this to `true`: the gated end-to-end
+//! anchor (threshold-issue → aggregate → re-randomize →
+//! selective-disclosure show → verify) and the NIZK-soundness rejection
+//! tests are now executed assertions rather than skips.
+pub const fable_core_implemented = true;

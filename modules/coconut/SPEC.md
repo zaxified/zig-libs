@@ -39,6 +39,40 @@ attributes, `t`-of-`n` authorities.
 - **VerifyCred (§4.2)** — recompute the challenge over the transcript, check the
   NIZK responses, enforce `σ₁' ≠ 1`, and verify `e(σ₁', κ) == e(σ₂' · ν, g2)`.
 
+### 1a. Fiat-Shamir transcript (`showChallenge`)
+
+There is **no external byte-exact vector** for the show proof (§3), so soundness
+rests entirely on the challenge binding every commitment. The challenge is
+`Fr.reduceWide(SHA-512(‖ transcript))` over these fields, in order; every field
+is fixed-width given `q`, so the encoding is injective (no concatenation
+ambiguity):
+
+1. `show_challenge_dst` — domain separation (scheme / curve / transcript version);
+2. `q` (u64 BE) — attribute count, frames every vector below;
+3. `hs[0..q]` (G1, 48 B each) — the attribute generators / parameter set;
+4. `vk.alpha` (G2, 96 B) then `vk.betas[0..q]` (G2, 96 B each) — the authority
+   key the statement is relative to (a proof must not transplant to another set);
+5. `σ₁'`, `σ₂'` (G1, 48 B each) — the re-randomised credential being shown;
+6. `κ` (G2, 96 B), `ν` (G1, 48 B) — the statement group elements;
+7. **`Aw` (G2, 96 B), `Bw` (G1, 48 B)** — the sigma-protocol commitments. These
+   are the strictly, **directly** load-bearing FS binding: omit either and the
+   challenge is straight-line forgeable (an attacker solves `Aw := [z_r]g2 +
+   Σ[zⱼ]βⱼ − c(κ−A)` for arbitrary responses and every naïve round-trip still
+   passes). Owner-verify confirmed this empirically: dropping `Aw` makes a
+   tampered-hidden-response forgery WRONGLY verify.
+8. `disclosed` mask (q bytes, 0/1) — which indices are claimed revealed;
+9. `n_disclosed` (u64 BE), then per disclosed index ascending: `index` (u64 BE) ‖
+   `value` (32 B) — the claimed revealed values.
+
+The recompute-commitment verifier (`Aw' = [z_r]g2 + Σ_hidden[zⱼ]βⱼ − [c](κ−A)`,
+`A = α·Π_disclosed βᵢ^{vᵢ}`; `Bw' = [z_r]σ₁' − [c]ν`) transitively binds `κ`, `ν`,
+`σ₁'`, the responses, the disclosure mask, and the disclosed values into the
+challenge, and the final pairing `e(σ₁',κ)==e(σ₂'·ν, g2)` binds `σ₂'` and the
+credential-to-attribute correspondence. So `Aw`/`Bw` are directly load-bearing in
+the hash; the other elements are additionally, transitively bound (owner-verify:
+dropping `σ₂'` from the hash does NOT let a σ₂'-swap through — the pairing rejects
+it).
+
 ## 2. Reuse map
 
 | Need | Source | How |
@@ -102,7 +136,8 @@ all wire codecs, and `credential.zig`'s `psSignWithSecret` (single-signer PS fro
 known scalars) + `psVerifyPlain` (the `e(h, α·Πβᵢ^{mᵢ}) == e(s, g2)` pairing
 verify with the `h ≠ 1` guard).
 
-**Gated Fable core (`gate.fable_core_implemented`):** the four functions of §3.
+**Fable core (`gate.fable_core_implemented`, now `true`):** the four functions of
+§3 — implemented, with the show-proof NIZK's full Fiat-Shamir transcript (§1a).
 
 ## 5. Verification harness (teeth)
 
@@ -118,12 +153,17 @@ verify with the `h ≠ 1` guard).
   determinism + attribute-sensitivity, scalar-field Shamir reconstruction,
   Lagrange-in-exponent `vk` round-trip, `psVerifyPlain` tamper/wrong-attribute/
   identity-`h` rejection, and codec round-trips (incl. a hand-built `ShowProof`).
-- **Gated end-to-end anchor (SKIP until core lands):** threshold-issue →
-  aggregate → re-randomise + selective-disclosure show → verify PASSES; and a
-  wrong disclosed value / mutated Fiat-Shamir challenge / too-few-partials all
-  FAIL. This is the anchor — there is no external byte-exact vector to pin
-  against (see §3), so it is the internal end-to-end property plus the soundness
-  rejections.
+- **End-to-end anchor + soundness controls (executed, `gate` now `true`):**
+  threshold-issue → aggregate → re-randomise + selective-disclosure show → verify
+  PASSES; and a wrong disclosed value / mutated Fiat-Shamir challenge /
+  too-few-partials / **forged undisclosed attribute** (a fully self-consistent
+  proof over a credential the prover holds but lying about a hidden attribute
+  value — caught by the PS pairing backstop) all FAIL. This is the anchor — there
+  is no external byte-exact vector to pin against (see §3), so it is the internal
+  end-to-end property plus the soundness rejections. Owner-verify additionally
+  reproduced tampered κ/ν/σ₁'/σ₂'/response/hidden-response, σ₁'=identity, wrong
+  vk, disclosure-count mismatch, and a same-cardinality mask-shuffle (all reject),
+  and confirmed `Aw`/`Bw` are directly load-bearing in the transcript (§1a).
 
 ## 6. Deferred increments (out of Phase-1 scope)
 

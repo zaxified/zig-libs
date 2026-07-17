@@ -10,7 +10,7 @@
 //! credential, then later SHOWS to a verifier while revealing only a
 //! chosen subset of attributes in zero knowledge.
 //!
-//! ## Status: Phase 1 — SCAFFOLD (Fable core gated).
+//! ## Status: Phase 1 — COMPLETE (Fable core implemented).
 //!
 //! The mechanical layer is REAL and tested: the pairing/curve plumbing
 //! over `bls12_381` (`params.zig`), the trusted-dealer Shamir threshold
@@ -19,13 +19,15 @@
 //! the wire codecs, and the two verification oracles
 //! `psSignWithSecret`/`psVerifyPlain` (`credential.zig`). The FOUR
 //! irreducible cores — `signPartial`, `aggregateCredential`,
-//! `proveCredential`, `verifyCredential` — are `@panic("TODO(fable/core):
-//! …")` stubs behind `gate.fable_core_implemented` (`false`). See
-//! `SPEC.md` for the construction, the Fable-vs-mechanical split, the
-//! tier finding (no external byte-exact vector exists → genuine Fable,
-//! weight concentrated in the selective-disclosure NIZK), and the
-//! deferred increments (blind issuance ElGamal + NIZK π_s;
-//! distributed-authority DKG wiring; SHAKE ciphersuite).
+//! `proveCredential`, `verifyCredential` — are now implemented and their
+//! end-to-end anchor + NIZK-soundness controls execute
+//! (`gate.fable_core_implemented = true`). See `SPEC.md` for the
+//! construction, the full Fiat-Shamir transcript element list, the
+//! Fable-vs-mechanical split, the tier finding (no external byte-exact
+//! vector exists → genuine Fable, weight concentrated in the
+//! selective-disclosure NIZK), and the deferred increments (blind
+//! issuance ElGamal + NIZK π_s; distributed-authority DKG wiring; SHAKE
+//! ciphersuite).
 //!
 //! ## Randomness
 //!
@@ -43,8 +45,9 @@
 //! - `lagrange.zig` — REAL. Lagrange coefficient at `x = 0` over `Fr`.
 //! - `credential.zig` — `Credential`/`PartialCredential`/`ShowProof` +
 //!   codecs + the `psSignWithSecret`/`psVerifyPlain` oracles (REAL); the
-//!   four **FABLE CORE** functions (gated `@panic` stubs).
-//! - `gate.zig` — the single `fable_core_implemented` switch.
+//!   four **FABLE CORE** functions (implemented; the show-proof NIZK's
+//!   full Fiat-Shamir transcript is documented on `showChallenge`).
+//! - `gate.zig` — the single `fable_core_implemented` switch (now `true`).
 //! - `harness_test.zig` — the `BrokenCoconut` positive control (REAL) and
 //!   the gated end-to-end anchor + NIZK-soundness controls.
 

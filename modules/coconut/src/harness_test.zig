@@ -190,6 +190,19 @@ test "SOUNDNESS (gated): tampered credential / wrong disclosed value / mutated c
 
     // 3. honest proof still verifies (control for the above)
     try std.testing.expect(try cred.verifyCredential(allocator, p, kk.master_vk, proof, &good_disclosed));
+
+    // 4. forged UNDISCLOSED attribute → reject. The prover builds a FULLY
+    // self-consistent show proof over a credential it holds (real m = [11,22])
+    // but lies about the HIDDEN attribute m₁ (claims 999, holds 22). The NIZK
+    // is internally consistent — κ commits to the forged [11,999], the
+    // responses are computed against it, so the Fiat-Shamir challenge recomputes
+    // and the response equations pass — yet σ₂' still comes from the credential
+    // on the REAL vector. The PS pairing equation e(σ₁',κ)==e(σ₂'·ν,g2) is the
+    // backstop that binds the credential to the claimed attributes and REJECTS.
+    const forged_attrs = [_]Fr{ frOf(11), frOf(999) };
+    const forged = try cred.proveCredential(allocator, prng.random(), p, kk.master_vk, credential, &forged_attrs, &disclosed);
+    defer forged.deinit(allocator);
+    try std.testing.expect(!try cred.verifyCredential(allocator, p, kk.master_vk, forged, &good_disclosed));
 }
 
 test "THRESHOLD (gated): fewer than t partials fails aggregation" {

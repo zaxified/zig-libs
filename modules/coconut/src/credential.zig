@@ -24,7 +24,7 @@
 //!   exists.
 //! - the wire codecs for `Credential`/`PartialCredential`/`ShowProof`.
 //!
-//! ## What is GATED (`gate.fable_core_implemented`, the Fable core)
+//! ## The FABLE CORE (`gate.fable_core_implemented` — now `true`)
 //!
 //! - `signPartial` — an authority's partial PS signature under its Shamir
 //!   SHARE of `(x, y_i)`.
@@ -274,18 +274,102 @@ pub fn psVerifyPlain(vk: VerificationKey, cred: Credential, attributes: []const 
 
 // ── GATED Fable cores ───────────────────────────────────────────────────────
 
+/// Domain-separation tag for the show-proof Fiat-Shamir challenge. Names
+/// the scheme, the curve, and the transcript version — bumping the wire
+/// or transcript layout MUST bump the version.
+const show_challenge_dst = "COCONUT-BLS12381_XMD:SHA-512_SHOW-V01_CHALLENGE_";
+
+/// The Fiat-Shamir challenge for the selective-disclosure show proof —
+/// SHA-512 over the FULL transcript, reduced into `Fr` (`Fr.reduceWide`,
+/// the RFC 9380 hash-to-field reduction shape). Shared verbatim by
+/// `proveCredential` (with the prover's fresh witnesses `Aw`/`Bw`) and
+/// `verifyCredential` (with the recomputed `Aw'`/`Bw'`), so any
+/// divergence in ANY hashed element makes the recomputed challenge
+/// mismatch and the proof reject.
+///
+/// Transcript, in order (every field fixed-width given `q`, so the
+/// encoding is injective — no length-extension/concatenation ambiguity):
+///
+///  1. `show_challenge_dst`             — domain separation (scheme/curve/version);
+///  2. `q` (u64 BE)                     — attribute count, frames all vectors;
+///  3. `hs[0..q]` (48 B each)           — the attribute generators: binds the
+///                                        parameter set the commitment/base
+///                                        derivation lives in;
+///  4. `vk.alpha` (96 B), `vk.betas[0..q]` (96 B each) — the verifier key the
+///                                        statement is relative to: a proof
+///                                        must not transplant to another
+///                                        authority set's key;
+///  5. `σ₁'`, `σ₂'` (48 B each)         — the re-randomised credential being
+///                                        shown (σ₁' is a NIZK base; σ₂' ties
+///                                        the proof to the exact credential
+///                                        half checked by the pairing);
+///  6. `κ` (96 B), `ν` (48 B)           — the statement group elements;
+///  7. `Aw` (96 B), `Bw` (48 B)         — the sigma-protocol commitments (the
+///                                        strictly load-bearing FS binding:
+///                                        omit either and the challenge is
+///                                        forgeable straight-line);
+///  8. `disclosed` mask (q bytes 0/1)   — WHICH attribute indices are claimed
+///                                        revealed;
+///  9. `n_disclosed` (u64 BE), then per disclosed index ascending:
+///     `index` (u64 BE) ‖ `value` (32 B) — the claimed revealed values
+///                                        themselves.
+fn showChallenge(
+    parameters: Parameters,
+    vk: VerificationKey,
+    sigma1: g1.Affine,
+    sigma2: g1.Affine,
+    kappa: g2.Affine,
+    nu: g1.Affine,
+    aw: g2.Affine,
+    bw: g1.Affine,
+    disclosed: []const bool,
+    disclosed_values: []const Fr,
+) Fr {
+    var hasher = std.crypto.hash.sha2.Sha512.init(.{});
+    hasher.update(show_challenge_dst);
+    var u64buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &u64buf, @as(u64, parameters.q), .big);
+    hasher.update(&u64buf);
+    for (parameters.hs) |h| hasher.update(&g1.toBytesCompressed(h));
+    hasher.update(&g2.toBytesCompressed(vk.alpha));
+    for (vk.betas) |b| hasher.update(&g2.toBytesCompressed(b));
+    hasher.update(&g1.toBytesCompressed(sigma1));
+    hasher.update(&g1.toBytesCompressed(sigma2));
+    hasher.update(&g2.toBytesCompressed(kappa));
+    hasher.update(&g1.toBytesCompressed(nu));
+    hasher.update(&g2.toBytesCompressed(aw));
+    hasher.update(&g1.toBytesCompressed(bw));
+    for (disclosed) |d| hasher.update(&[1]u8{if (d) 1 else 0});
+    std.mem.writeInt(u64, &u64buf, @as(u64, disclosed_values.len), .big);
+    hasher.update(&u64buf);
+    var k: usize = 0;
+    for (disclosed, 0..) |d, i| {
+        if (!d) continue;
+        std.mem.writeInt(u64, &u64buf, @as(u64, i), .big);
+        hasher.update(&u64buf);
+        hasher.update(&disclosed_values[k].toBytes());
+        k += 1;
+    }
+    var digest: [64]u8 = undefined;
+    hasher.final(&digest);
+    return Fr.reduceWide(&digest);
+}
+
 /// §4.2 `Sign` (threshold, per-authority): the authority holding Shamir
 /// share `(x(j), y_i(j))` produces `σⱼ = (h, [x(j) + Σ mᵢ yᵢ(j)] h)` over
 /// the caller-supplied common base `h` (`params.commonBase` — every
 /// authority MUST use the same `h` or the partials cannot be Lagrange-
 /// combined). GATED core.
 pub fn signPartial(share: SecretKeyShare, h: g1.Affine, attributes: []const Fr) CoconutError!PartialCredential {
-    _ = share;
-    _ = h;
-    _ = attributes;
-    if (!gate.fable_core_implemented)
-        @panic("TODO(fable/core): partial PS signature s_j = [x(j) + Σ m_i y_i(j)] h under this authority's Shamir share");
-    @panic("unreachable: gate.fable_core_implemented is true but signPartial has no body");
+    if (share.ys.len != attributes.len) return error.MismatchedAttributes;
+    // The share is a point-evaluation of the master key vector, so the
+    // partial signing exponent is the SAME `x + Σ mᵢ yᵢ` form over the
+    // share's scalars — Lagrange over these exponents reconstructs the
+    // group exponent by linearity.
+    const as_sk = SecretKey{ .x = share.x, .ys = share.ys };
+    const e = signingExponent(as_sk, attributes);
+    const s = g1.Jacobian.fromAffine(h).scalarMul(e).toAffine();
+    return .{ .index = share.index, .h = h, .s = s };
 }
 
 /// §4.4 `AggCred`: Lagrange-in-EXPONENT recombination of `t` (or more)
@@ -300,12 +384,26 @@ pub fn aggregateCredential(
     partials: []const PartialCredential,
     t: u64,
 ) CoconutError!Credential {
-    _ = allocator;
-    _ = partials;
-    _ = t;
-    if (!gate.fable_core_implemented)
-        @panic("TODO(fable/core): Lagrange-in-exponent aggregation σ = (h, Π s_j^{l_j}) over t partials sharing base h; reject mismatched h / <t partials / duplicate indices");
-    @panic("unreachable: gate.fable_core_implemented is true but aggregateCredential has no body");
+    if (t == 0 or partials.len < t) return error.NotEnoughPartials;
+    const h = partials[0].h;
+    for (partials[1..]) |p| {
+        if (!(p.h.x.eql(h.x) and p.h.y.eql(h.y) and p.h.infinity == h.infinity))
+            return error.InconsistentBase;
+    }
+    // Public authority indices for the Lagrange coefficients at x = 0.
+    // Duplicate / zero indices are rejected inside `coefficientAtZero`.
+    const indices = try allocator.alloc(u64, partials.len);
+    defer allocator.free(indices);
+    for (indices, partials) |*ix, p| ix.* = p.index;
+
+    // Lagrange-in-EXPONENT: s = Σ [lⱼ] sⱼ = [Σ lⱼ (x(j) + Σ mᵢ yᵢ(j))] h
+    // = [x + Σ mᵢ yᵢ] h — byte-equal to the single-signer oracle.
+    var acc = g1.Jacobian.identity;
+    for (partials) |p| {
+        const l = try lagrange.coefficientAtZero(indices, p.index);
+        acc = acc.add(g1.Jacobian.fromAffine(p.s).scalarMul(l));
+    }
+    return .{ .h = h, .s = acc.toAffine() };
 }
 
 /// §4.2 `ProveCred`: re-randomise `σ → σ' = (σ₁', σ₂') = ([r'] h, [r'] s)`,
@@ -326,16 +424,90 @@ pub fn proveCredential(
     attributes: []const Fr,
     disclosed: []const bool,
 ) CoconutError!ShowProof {
-    _ = allocator;
-    _ = random;
-    _ = parameters;
-    _ = vk;
-    _ = cred;
-    _ = attributes;
-    _ = disclosed;
-    if (!gate.fable_core_implemented)
-        @panic("TODO(fable/core): re-randomise σ, build κ/ν, and produce the Fiat-Shamir selective-disclosure NIZK over hidden attributes + blinding r");
-    @panic("unreachable: gate.fable_core_implemented is true but proveCredential has no body");
+    const q = parameters.q;
+    if (attributes.len != q or vk.betas.len != q) return error.MismatchedAttributes;
+    if (disclosed.len != q) return error.InvalidDisclosure;
+    var revealed: usize = 0;
+    for (disclosed) |d| revealed += @intFromBool(d);
+    const hidden = q - revealed;
+
+    // Re-randomise σ → σ' = ([r'] h, [r'] s). r' MUST be nonzero or σ₁'
+    // degenerates to the identity (which VerifyCred rejects — e(1, κ)
+    // is trivially satisfiable).
+    const r_prime = blk: {
+        while (true) {
+            const c = keys.randomScalar(random);
+            if (!c.isZero()) break :blk c;
+        }
+    };
+    const r = keys.randomScalar(random);
+    const sigma1_jac = g1.Jacobian.fromAffine(cred.h).scalarMul(r_prime);
+    const sigma1 = sigma1_jac.toAffine();
+    const sigma2 = g1.Jacobian.fromAffine(cred.s).scalarMul(r_prime).toAffine();
+
+    // Statement: κ = α · Π βᵢ^{mᵢ} (ALL attributes) · [r] g2, ν = [r] σ₁'.
+    const g2gen = g2.Jacobian.fromAffine(g2.Affine.generator);
+    const kappa = g2.Jacobian.fromAffine(kappaPlain(vk, attributes)).add(g2gen.scalarMul(r)).toAffine();
+    const nu = sigma1_jac.scalarMul(r).toAffine();
+
+    // Sigma-protocol commitments over fresh witnesses: one nonce for the
+    // blinding r, one per HIDDEN attribute:
+    //   Aw = [r̃] g2 + Σ_{hidden j} [m̃ⱼ] βⱼ   (the κ-side witness)
+    //   Bw = [r̃] σ₁'                          (the ν-side witness)
+    const r_tilde = keys.randomScalar(random);
+    const m_tilde = try allocator.alloc(Fr, hidden);
+    defer allocator.free(m_tilde);
+    for (m_tilde) |*m| m.* = keys.randomScalar(random);
+
+    var aw_acc = g2gen.scalarMul(r_tilde);
+    {
+        var k: usize = 0;
+        for (disclosed, vk.betas) |d, beta| {
+            if (d) continue;
+            aw_acc = aw_acc.add(g2.Jacobian.fromAffine(beta).scalarMul(m_tilde[k]));
+            k += 1;
+        }
+    }
+    const aw = aw_acc.toAffine();
+    const bw = sigma1_jac.scalarMul(r_tilde).toAffine();
+
+    // Fiat-Shamir challenge over the FULL transcript (see showChallenge).
+    const disclosed_values = try allocator.alloc(Fr, revealed);
+    defer allocator.free(disclosed_values);
+    {
+        var k: usize = 0;
+        for (disclosed, attributes) |d, m| {
+            if (!d) continue;
+            disclosed_values[k] = m;
+            k += 1;
+        }
+    }
+    const challenge = showChallenge(parameters, vk, sigma1, sigma2, kappa, nu, aw, bw, disclosed, disclosed_values);
+
+    // Responses: z = witness + c · secret (ascending attribute-index
+    // order for the hidden responses, matching the verifier's walk).
+    const response_r = r_tilde.add(challenge.mul(r));
+    const responses_m = try allocator.alloc(Fr, hidden);
+    errdefer allocator.free(responses_m);
+    {
+        var k: usize = 0;
+        for (disclosed, attributes) |d, m| {
+            if (d) continue;
+            responses_m[k] = m_tilde[k].add(challenge.mul(m));
+            k += 1;
+        }
+    }
+    const disclosed_copy = try allocator.dupe(bool, disclosed);
+    return .{
+        .sigma1 = sigma1,
+        .sigma2 = sigma2,
+        .kappa = kappa,
+        .nu = nu,
+        .challenge = challenge,
+        .response_r = response_r,
+        .responses_m = responses_m,
+        .disclosed = disclosed_copy,
+    };
 }
 
 /// §4.2 `VerifyCred`: recompute the Fiat-Shamir challenge from the proof's
@@ -351,14 +523,76 @@ pub fn verifyCredential(
     proof: ShowProof,
     disclosed_values: []const Fr,
 ) CoconutError!bool {
-    _ = allocator;
-    _ = parameters;
-    _ = vk;
-    _ = proof;
-    _ = disclosed_values;
-    if (!gate.fable_core_implemented)
-        @panic("TODO(fable/core): recompute the FS challenge over the full transcript, verify NIZK responses, σ₁'≠1, and the e(σ₁',κ)==e(σ₂'·ν,g2) pairing check");
-    @panic("unreachable: gate.fable_core_implemented is true but verifyCredential has no body");
+    _ = allocator; // recompute-commitment verification is allocation-free
+    const q = parameters.q;
+    if (vk.betas.len != q) return error.MismatchedAttributes;
+    if (proof.disclosed.len != q) return error.InvalidDisclosure;
+    var revealed: usize = 0;
+    for (proof.disclosed) |d| revealed += @intFromBool(d);
+    if (disclosed_values.len != revealed) return error.InvalidDisclosure;
+    if (proof.responses_m.len != q - revealed) return error.InvalidDisclosure;
+
+    // σ₁' ≠ 1 — mandatory: with σ₁' = 1 the pairing equation is trivially
+    // satisfiable by σ₂'·ν = 1 without any credential.
+    const sigma1_jac = g1.Jacobian.fromAffine(proof.sigma1);
+    if (sigma1_jac.isIdentity()) return false;
+
+    // Public offset A = α · Π_{disclosed i} βᵢ^{vᵢ} from the CLAIMED
+    // disclosed values — a wrong claim shifts A, hence Aw', hence the
+    // recomputed challenge.
+    var a_acc = g2.Jacobian.fromAffine(vk.alpha);
+    {
+        var k: usize = 0;
+        for (proof.disclosed, vk.betas) |d, beta| {
+            if (!d) continue;
+            a_acc = a_acc.add(g2.Jacobian.fromAffine(beta).scalarMul(disclosed_values[k]));
+            k += 1;
+        }
+    }
+
+    // Recompute the sigma commitments from the responses:
+    //   Aw' = [z_r] g2 + Σ_{hidden j} [zⱼ] βⱼ − [c](κ − A)
+    //   Bw' = [z_r] σ₁' − [c] ν
+    // For an honest proof both collapse to the prover's Aw/Bw; any
+    // tampering with κ, ν, σ₁', the responses, the challenge, or the
+    // claimed disclosure diverges here and fails the challenge equality.
+    const g2gen = g2.Jacobian.fromAffine(g2.Affine.generator);
+    var aw_acc = g2gen.scalarMul(proof.response_r);
+    {
+        var k: usize = 0;
+        for (proof.disclosed, vk.betas) |d, beta| {
+            if (d) continue;
+            aw_acc = aw_acc.add(g2.Jacobian.fromAffine(beta).scalarMul(proof.responses_m[k]));
+            k += 1;
+        }
+    }
+    const a_minus_kappa = a_acc.add(g2.Jacobian.fromAffine(proof.kappa).negate());
+    aw_acc = aw_acc.add(a_minus_kappa.scalarMul(proof.challenge));
+    const bw = sigma1_jac.scalarMul(proof.response_r)
+        .add(g1.Jacobian.fromAffine(proof.nu).scalarMul(proof.challenge).negate());
+
+    const expected = showChallenge(
+        parameters,
+        vk,
+        proof.sigma1,
+        proof.sigma2,
+        proof.kappa,
+        proof.nu,
+        aw_acc.toAffine(),
+        bw.toAffine(),
+        proof.disclosed,
+        disclosed_values,
+    );
+    if (!expected.eql(proof.challenge)) return false;
+
+    // PS pairing equation over the re-randomised credential:
+    //   e(σ₁', κ) == e(σ₂' · ν, g2)
+    // via the product form e(σ₁', κ) · e(−(σ₂'·ν), g2) == 1.
+    const s2nu = g1.Jacobian.fromAffine(proof.sigma2).add(g1.Jacobian.fromAffine(proof.nu));
+    return bls.pairing.pairingCheck(&.{
+        .{ .p = proof.sigma1, .q = proof.kappa },
+        .{ .p = s2nu.negate().toAffine(), .q = g2.Affine.generator },
+    });
 }
 
 // ── tests (real, ungated) ───────────────────────────────────────────────────
@@ -438,10 +672,12 @@ test "ShowProof codec round-trip (hand-constructed artifact, no gated core)" {
     try std.testing.expectEqualSlices(bool, disclosed, back.disclosed);
 }
 
-test "gated cores panic while gate is false (contract frozen, body absent)" {
-    // The four cores are @panic stubs today; assert the gate is off so the
-    // harness's gated end-to-end tests SKIP rather than silently pass.
-    try std.testing.expect(!gate.fable_core_implemented);
+test "gate is flipped: the gated end-to-end tests EXECUTE (no silent skip)" {
+    // Inversion of the scaffold-era assertion (which pinned the gate to
+    // false while the cores were @panic stubs): the cores are implemented,
+    // so the gate MUST be on — otherwise the harness's end-to-end anchor
+    // and soundness rejections would silently SKIP instead of asserting.
+    try std.testing.expect(gate.fable_core_implemented);
 }
 
 fn frOf(v: u64) Fr {

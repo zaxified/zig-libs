@@ -13,18 +13,20 @@ verifier while revealing only a chosen subset of attributes in zero knowledge
 (the credential itself and the undisclosed attributes stay hidden, and repeated
 shows are unlinkable).
 
-> **Status: Phase 1 — SCAFFOLD.** The mechanical layer (pairing/curve plumbing,
+> **Status: Phase 1 — COMPLETE.** The mechanical layer (pairing/curve plumbing,
 > threshold keygen, Lagrange-in-exponent verification-key aggregation, wire
 > codecs, and the `psSignWithSecret`/`psVerifyPlain` PS oracles) is real and
 > tested. The four irreducible cores — `signPartial`, `aggregateCredential`,
-> `proveCredential`, `verifyCredential` — are `@panic("TODO(fable/core): …")`
-> stubs behind `gate.fable_core_implemented` (`false`). The end-to-end anchor
-> (threshold-issue → aggregate → show → verify) and the NIZK-soundness controls
-> SKIP until that flag flips; the `BrokenCoconut` positive control and every
-> mechanical unit test PASS today. See `SPEC.md` for the construction, the
+> `proveCredential`, `verifyCredential` — are implemented behind
+> `gate.fable_core_implemented` (now `true`). The end-to-end anchor
+> (threshold-issue → aggregate → show → verify) PASSES and the NIZK-soundness
+> controls (tampered credential/κ/ν/σ', mutated challenge, wrong disclosed
+> value, forged undisclosed attribute) all REJECT; the `BrokenCoconut` positive
+> control and every mechanical unit test also pass. See `SPEC.md` for the
+> construction, the full Fiat-Shamir transcript element list, the
 > Fable-vs-mechanical split, the tier finding, and the deferred increments.
 
-## API (Phase 1)
+## API
 
 ```zig
 const coconut = @import("coconut");
@@ -42,11 +44,12 @@ defer vk.deinit(allocator);
 // The common signing base every authority derives from the public commitment.
 const h = p.commonBase(&attributes);
 
-// GATED cores (panic until the Fable pass lands):
-//   const partial = try coconut.signPartial(keys.sk_shares[j], h, &attributes);
-//   const cred    = try coconut.aggregateCredential(allocator, partials, t);
-//   const proof   = try coconut.proveCredential(allocator, prng.random(), p, vk, cred, &attributes, &disclosed);
-//   const ok      = try coconut.verifyCredential(allocator, p, vk, proof, &disclosed_values);
+// Fable cores (threshold-issue → aggregate → selective-disclosure show → verify):
+const partial = try coconut.signPartial(keys.sk_shares[j], h, &attributes);
+const cred    = try coconut.aggregateCredential(allocator, partials, t);
+const proof   = try coconut.proveCredential(allocator, prng.random(), p, vk, cred, &attributes, &disclosed);
+defer proof.deinit(allocator);
+const ok      = try coconut.verifyCredential(allocator, p, vk, proof, &disclosed_values);
 ```
 
 Randomness (keygen blinding, show nonces) is a caller-supplied `std.Random`, so
