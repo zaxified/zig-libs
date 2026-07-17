@@ -8,7 +8,9 @@
 //!      cyclic-vs-negacyclic discriminator, and a wrong-scale "encryptor"
 //!      whose structural scale-check is REJECTED.
 //!   3. The homomorphic end-to-end anchors (add / mul+relin / depth) — the
-//!      strong anchors — wired now but SKIP-gated until the scheme cores land.
+//!      strong anchors — LIVE since Parts 2–3 landed (the gate checks remain
+//!      so a future param/gate change degrades to SKIP, never to a false
+//!      green). Mul/depth run on `params.test_mul` (see the note there).
 
 const std = @import("std");
 const testing = std.testing;
@@ -250,26 +252,75 @@ test "homomorphic ADD end-to-end: Dec(Enc(a) ⊕ Enc(b)) == a+b (mod t)" {
     try testing.expectEqualSlices(u64, &want.coeffs, &got.coeffs);
 }
 
-test "homomorphic MUL+RELIN end-to-end: Dec(relin(Enc(a) ⊗ Enc(b))) == a·b (mod t)" {
+// The multiply/depth anchors run on `params.test_mul`, NOT `test_tiny`:
+// test_tiny's q=1649 (Δ/2 = 206) cannot hold even ONE multiply's noise (the
+// worst-case r–v cross term t·N·‖r‖·(B1+B2) ≈ 5.4e3 alone exceeds q), so a
+// mul anchor there would at best pass probabilistically — exactly the hazard
+// this harness must not have. test_mul is sized (worst-case ledger in
+// params.zig) so depth-2 correctness is guaranteed for EVERY seed and EVERY
+// plaintext, including the all-(t−1) boundary — which is why these tests can
+// demand exact equality over random AND boundary inputs.
+const PM = params.test_mul;
+const BM = bfv.Bfv(PM);
+
+test "homomorphic MUL+RELIN end-to-end: Dec(relin(Enc(a) ⊗ Enc(b))) == a·b (mod t), random + boundary" {
     if (!gate.scheme_core_implemented or !gate.fable_core_implemented) return error.SkipZigTest;
-    const B = bfv.Bfv(P);
-    const inst = try B.init();
+    const inst = try BM.init();
     var prng = std.Random.DefaultPrng.init(2);
     const rnd = prng.random();
     const kp = inst.keyGen(rnd);
     const rlk = inst.genRelinKey(&kp.sk, rnd);
-    const Pt = B.Plaintext;
-    const ma_pt = Pt.fromCoeffs(P.t, .{ 1, 1, 0, 0, 0, 0, 0, 0 });
-    const mb_pt = Pt.fromCoeffs(P.t, .{ 0, 1, 1, 0, 0, 0, 0, 0 });
-    const ca = inst.encrypt(&kp.pk, &ma_pt, rnd);
-    const cb = inst.encrypt(&kp.pk, &mb_pt, rnd);
-    const prod3 = inst.mul(&ca, &cb); // 3-component
-    try testing.expectEqual(@as(usize, 3), prod3.numComponents());
-    const prod2 = inst.relinearize(&prod3, &rlk); // back to 2
-    try testing.expectEqual(@as(usize, 2), prod2.numComponents());
+    const Pt = BM.Plaintext;
+    const t = PM.t;
+    for (0..8) |it| {
+        var ac: [BM.degree]u64 = undefined;
+        var bc: [BM.degree]u64 = undefined;
+        for (&ac, &bc) |*xx, *yy| {
+            // Iteration 0: boundary — every coefficient t−1 (worst-case
+            // message norm, catches range-dependent noise bugs); rest random.
+            xx.* = if (it == 0) t - 1 else rnd.uintLessThan(u64, t);
+            yy.* = if (it == 0) t - 1 else rnd.uintLessThan(u64, t);
+        }
+        const a = Pt.fromCoeffs(t, ac);
+        const b = Pt.fromCoeffs(t, bc);
+        const ca = inst.encrypt(&kp.pk, &a, rnd);
+        const cb = inst.encrypt(&kp.pk, &b, rnd);
+        const want = Pt.mulRef(&a, &b);
+        const prod3 = inst.mul(&ca, &cb); // 3-component
+        try testing.expectEqual(@as(usize, 3), prod3.numComponents());
+        // The tensor+rescale must already be correct BEFORE relin (decrypt
+        // handles the c2·s² term) — isolates `mul` from the key-switch.
+        try testing.expectEqualSlices(u64, &want.coeffs, &inst.decrypt(&kp.sk, &prod3).coeffs);
+        const prod2 = inst.relinearize(&prod3, &rlk); // back to 2
+        try testing.expectEqual(@as(usize, 2), prod2.numComponents());
+        try testing.expectEqualSlices(u64, &want.coeffs, &inst.decrypt(&kp.sk, &prod2).coeffs);
+    }
+}
+
+test "positive control: corrupted relin key is caught by the mul anchor (key-switch is load-bearing)" {
+    if (!gate.scheme_core_implemented or !gate.fable_core_implemented) return error.SkipZigTest;
+    const inst = try BM.init();
+    var prng = std.Random.DefaultPrng.init(4);
+    const rnd = prng.random();
+    const kp = inst.keyGen(rnd);
+    var rlk = inst.genRelinKey(&kp.sk, rnd);
+    // Corrupt the gadget rows' b-components: they no longer pseudo-encrypt
+    // w^i·s², so the key-switched phase is wrong and the product must NOT
+    // decrypt to a·b (deterministic seed ⇒ deterministic catch).
+    for (&rlk.b) |*b_i| {
+        for (0..BM.num_primes) |l| {
+            for (&b_i.limbs[l]) |*x| x.* = rnd.uintLessThan(u64, PM.primes[l]);
+        }
+    }
+    const Pt = BM.Plaintext;
+    const a = Pt.fromCoeffs(PM.t, [_]u64{3} ** BM.degree);
+    const b = Pt.fromCoeffs(PM.t, [_]u64{5} ** BM.degree);
+    const ca = inst.encrypt(&kp.pk, &a, rnd);
+    const cb = inst.encrypt(&kp.pk, &b, rnd);
+    const prod2 = inst.relinearize(&inst.mul(&ca, &cb), &rlk);
     const got = inst.decrypt(&kp.sk, &prod2);
-    const want = Pt.mulRef(&ma_pt, &mb_pt);
-    try testing.expectEqualSlices(u64, &want.coeffs, &got.coeffs);
+    const want = Pt.mulRef(&a, &b);
+    try testing.expect(!std.mem.eql(u64, &want.coeffs, &got.coeffs));
 }
 
 test "enc/dec round-trip at realistic dimension (bfv_toy N=1024, comfortable margin)" {
@@ -300,26 +351,43 @@ test "enc/dec round-trip at realistic dimension (bfv_toy N=1024, comfortable mar
     }
 }
 
-test "multiply DEPTH: Dec(a·b·c) == a·b·c (mod t) exercises the noise budget" {
+test "multiply DEPTH: Dec(a·b·c) == a·b·c (mod t) exercises the noise budget (random + boundary)" {
     if (!gate.scheme_core_implemented or !gate.fable_core_implemented) return error.SkipZigTest;
-    const B = bfv.Bfv(P);
-    const inst = try B.init();
+    const inst = try BM.init();
     var prng = std.Random.DefaultPrng.init(3);
     const rnd = prng.random();
     const kp = inst.keyGen(rnd);
     const rlk = inst.genRelinKey(&kp.sk, rnd);
-    const Pt = B.Plaintext;
-    const a = Pt.fromCoeffs(P.t, .{ 1, 1, 0, 0, 0, 0, 0, 0 });
-    const b = Pt.fromCoeffs(P.t, .{ 0, 1, 0, 0, 0, 0, 0, 0 });
-    const c = Pt.fromCoeffs(P.t, .{ 1, 0, 1, 0, 0, 0, 0, 0 });
-    const ea = inst.encrypt(&kp.pk, &a, rnd);
-    const eb = inst.encrypt(&kp.pk, &b, rnd);
-    const ec = inst.encrypt(&kp.pk, &c, rnd);
-    const ab = inst.relinearize(&inst.mul(&ea, &eb), &rlk);
-    // noise must still be positive after one multiply.
-    try testing.expect(inst.noiseBudget(&kp.sk, &ab) > 0);
-    const abc = inst.relinearize(&inst.mul(&ab, &ec), &rlk);
-    const got = inst.decrypt(&kp.sk, &abc);
-    const want = Pt.mulRef(&Pt.mulRef(&a, &b), &c);
-    try testing.expectEqualSlices(u64, &want.coeffs, &got.coeffs);
+    const Pt = BM.Plaintext;
+    const t = PM.t;
+    for (0..4) |it| {
+        var ac: [BM.degree]u64 = undefined;
+        var bc: [BM.degree]u64 = undefined;
+        var cc: [BM.degree]u64 = undefined;
+        for (&ac, &bc, &cc) |*xx, *yy, *zz| {
+            // Iteration 0: all-(t−1) boundary triple (worst-case norms).
+            xx.* = if (it == 0) t - 1 else rnd.uintLessThan(u64, t);
+            yy.* = if (it == 0) t - 1 else rnd.uintLessThan(u64, t);
+            zz.* = if (it == 0) t - 1 else rnd.uintLessThan(u64, t);
+        }
+        const a = Pt.fromCoeffs(t, ac);
+        const b = Pt.fromCoeffs(t, bc);
+        const c = Pt.fromCoeffs(t, cc);
+        const ea = inst.encrypt(&kp.pk, &a, rnd);
+        const eb = inst.encrypt(&kp.pk, &b, rnd);
+        const ec = inst.encrypt(&kp.pk, &c, rnd);
+        const ab = inst.relinearize(&inst.mul(&ea, &eb), &rlk);
+        // Budget must still be positive after one multiply…
+        const budget_fresh = inst.noiseBudget(&kp.sk, &ea);
+        const budget_ab = inst.noiseBudget(&kp.sk, &ab);
+        try testing.expect(budget_ab > 0);
+        const abc = inst.relinearize(&inst.mul(&ab, &ec), &rlk);
+        // …and each multiply must CONSUME budget (noiseBudget is honest).
+        const budget_abc = inst.noiseBudget(&kp.sk, &abc);
+        try testing.expect(budget_fresh > budget_ab);
+        try testing.expect(budget_ab > budget_abc);
+        const got = inst.decrypt(&kp.sk, &abc);
+        const want = Pt.mulRef(&Pt.mulRef(&a, &b), &c);
+        try testing.expectEqualSlices(u64, &want.coeffs, &got.coeffs);
+    }
 }

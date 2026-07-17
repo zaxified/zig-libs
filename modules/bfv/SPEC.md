@@ -38,8 +38,8 @@ cleanly** rather than everything half-built:
 
 - **Part 1 (this commit) — arithmetic backbone (REAL) + scheme scaffold.**
   `modarith` + `ntt` + `rns` + `ring` + `encode` + `params` are real and
-  byte-exact-KAT'd; `bfv.Bfv` ships real types/codecs/`add`/`sub` with the
-  scheme cores gated.
+  byte-exact-KAT'd; `bfv.Bfv` ships real types/`add`/`sub` with the
+  scheme cores gated (byte codecs deferred — see backlog below).
 - **Part 2 (Opus) — `keyGen` / `encrypt` / `decrypt` / (observe `add`).**
   Textbook leveled-BFV over the now-real RNS ring; KAT-able byte-exact against
   SEAL. Turns on `gate.scheme_core_implemented`.
@@ -101,8 +101,9 @@ Two anchor families, per the plan:
    == a+b (mod t)`, `Dec(relin(Enc(a)⊗Enc(b))) == a·b (mod t)`, and a
    multiply-DEPTH `a·b·c` that still decrypts (exercises the noise budget) — all
    decrypt against the `encode.mulRef`/`addRef` plaintext-space references.
-   These defeat self-consistent-but-wrong, and are wired now, SKIP-gated until
-   the scheme cores land.
+   These defeat self-consistent-but-wrong; LIVE since Parts 2–3 landed. The
+   mul/depth anchors run over random AND boundary (all-`t−1`) plaintexts on
+   `params.test_mul` — see "Part-3 multiply" below for why not `test_tiny`.
 
 **Teeth before the core (deliberately-broken positive controls, PASS today):**
 
@@ -117,6 +118,43 @@ Two anchor families, per the plan:
   `scaleCheck` ACCEPTS the correct one and REJECTS the wrong one. Proves the
   scaling/noise anchor bites before `encrypt`/`decrypt` exist — this is exactly
   the dropped-`Δ` bug class the Fable core must not commit.
+
+## Part-3 multiply (landed): exact-tensor path + worst-case noise ledger
+
+The Fable core (`mul`/`genRelinKey`/`relinearize`/`noiseBudget`) is REAL.
+Design decisions and the noise argument, for audit:
+
+- **Exact integer tensor (the correctness crux).** `mul` CRT-reconstructs the
+  four input components to centered integer polynomials, computes the tensor
+  `(c0d0, c0d1+c1d0, c1d1)` EXACTLY over `Z[X]/(X^N+1)` (i256 schoolbook), and
+  only then applies the per-component `⌊t/q·T_i⌉` rescale. This is forced: the
+  rescale does not commute with mod-`q` reduction (`⌊t/q·[T]_q⌉` differs from
+  `[⌊t/q·T⌉]_q` by `t·k ≢ 0 (mod q)`), so a "stay in RNS, multiply in the
+  ring, then rescale" shortcut decrypts to garbage. Verified by fault
+  injection: that exact variant, and a dropped-rescale (`Δ²`) variant, and a
+  wrong-gadget-base relin variant were each injected and each turns the two
+  mul anchors red deterministically. The security-grade fast path (BEHZ/HPS
+  RNS base extension to an auxiliary basis, never materialising the integer)
+  is the deferred increment; the exact path is O(reconstruct + N²) and fine
+  for the toy/test moduli (guarded by a comptime width check).
+- **Why the rescale keeps the scale at `Δ`.** With `ct_i(s) = Δm_i + v_i +
+  q·r_i` over the integers and `tΔ = q − r_t`: `(t/q)·ct1(s)ct2(s) ≡
+  Δ[m1m2]_t + (m1v2+m2v1) + t(r1v2+r2v1) − r_t(…small…) + ⌊·⌉-error (mod q)`
+  — one `Δ` is cancelled by `t/q`, the `q·[…]` cross terms collapse to
+  `t·(r_i·v_j)` (the dominant growth), and `q²r1r2` vanishes mod `q`.
+- **Relin correctness.** `rlk_i = (−(a_i·s+e_i) + w^i·s², a_i)`, `w = 2^8`;
+  `relinearize` digit-decomposes `c2 = Σ w^i d_i` exactly and adds
+  `Σ d_i·rlk_i`, so the phase gains `Σ d_i(w^i s² − e_i) + Σ d_i a_i s −
+  Σ d_i a_i s = c2·s² − Σ d_i e_i` — the `c2·s²` term is replaced by the same
+  value under `s`, up to key-switch noise `≤ relin_digits·N·(w−1)`.
+- **Depth-2 is a worst-case guarantee, not a probabilistic pass.** The mul
+  anchors run on `params.test_mul` (`N=16`, `t=16`, `q ≈ 2^35.6`) because
+  `test_tiny`'s `q = 1649` cannot hold even one multiply (worst-case cross
+  term alone exceeds `q`). On `test_mul` the full ledger (params.zig) bounds
+  depth-2 noise at `≈ 5.7e8 < Δ/2 ≈ 1.61e9` (≈2.8× margin) for ANY seed and
+  ANY plaintexts including all-`(t−1)` — which resolves the Part-1
+  "verifiability risk" flag below for these parameters: the depth anchor is
+  deterministic teeth, not a lucky seed.
 
 ## External-reference anchoring
 
@@ -156,11 +194,14 @@ paper/spec is not a copyrightable work; no third-party source was ported).
 - **Exact CRT reconstruction uses `u128`** — fine for KAT/toy moduli (product
   fits in 128 bits); production RNS never materialises the integer (stays in
   residues). Fast base conversion is the deferred increment.
-- **Verifiability risk (flagged):** BFV ciphertext noise is randomised, so the
-  Part-3 multiply's correctness at depth is a *probabilistic* property, not a
-  byte-exact KAT — the noise-budget accounting is exactly the piece with no
-  external deterministic anchor. This is why Part 3 is tiered Fable and why the
-  end-to-end depth test (not a vector) is its primary teeth.
+- **Verifiability risk (flagged in Part 1, addressed in Part 3):** BFV
+  ciphertext noise is randomised, so the Part-3 multiply's correctness at depth
+  has no byte-exact external KAT — the noise-budget accounting is exactly the
+  piece with no external deterministic anchor. This is why Part 3 was tiered
+  Fable. Part 3 answers it by SIZING the mul-anchor parameters so that the
+  worst-case noise ledger (params.zig `test_mul`) guarantees depth-2
+  correctness for every seed — turning the probabilistic property back into a
+  deterministic test (see "Part-3 multiply" above).
 
 ## Per-module backlog (mechanical, not Fable)
 

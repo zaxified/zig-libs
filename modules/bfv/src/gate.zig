@@ -34,4 +34,4 @@
 pub const scheme_core_implemented = true;
 
 /// Part 3 (Fable): mul / relinearize / noiseBudget.
-pub const fable_core_implemented = false;
+pub const fable_core_implemented = true;

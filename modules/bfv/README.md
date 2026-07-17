@@ -1,4 +1,4 @@
-# bfv — leveled BFV homomorphic encryption (Parts 1–2: backbone + keyGen/encrypt/decrypt)
+# bfv — leveled BFV homomorphic encryption (complete: add + multiply to depth)
 
 **Fully Homomorphic Encryption.** FHE lets you compute directly on ciphertexts:
 `Dec(f(Enc(x))) = f(x)`, so an untrusted party can evaluate a function over data
@@ -11,10 +11,11 @@ capability: `std` ships lattice KEM/signatures (ML-KEM/ML-DSA) but no
 homomorphic-evaluation scheme, and the sibling `paillier` is only additively
 homomorphic — BFV adds the multiply.
 
-FHE is large, so it is built as a multi-part arc. **Parts 1–2 are real: the
-arithmetic backbone (byte-exact-KAT'd) and the BFV scheme core —
-`keyGen`/`encrypt`/`decrypt`.** Part 3 (the genuinely hard, noise-sensitive
-`mul`/`relinearize`/`noiseBudget`) stays gated (see below).
+FHE is large, so it was built as a multi-part arc — **all three parts are now
+real:** the arithmetic backbone (byte-exact-KAT'd), the BFV scheme core
+(`keyGen`/`encrypt`/`decrypt`), and the noise-management core (`mul` /
+`genRelinKey`/`relinearize` / `noiseBudget`). Toy/test parameters only — no
+security level is claimed, and no bootstrapping (leveled depth only).
 
 ## What is real today (Part 1)
 
@@ -27,12 +28,11 @@ The whole computational backbone FHE stands on is implemented and tested:
 | RNS / CRT | `rns.zig` | `Basis` — residue representation of `q=∏qᵢ`, exact CRT reconstruct, exact base conversion |
 | RLWE ring | `ring.zig` | `RnsPoly(N,L)` — `R_q` add/negate/NTT/pointwise-multiply |
 | Plaintext | `encode.zig` | `Plaintext(N)` — `R_t` coefficient + integer encodings, `addRef`/`mulRef` references |
-| Parameters | `params.zig` | `Params` + NTT-friendly-prime validation; `test_tiny`, `bfv_toy` sets |
+| Parameters | `params.zig` | `Params` + NTT-friendly-prime validation; `test_tiny`, `bfv_toy`, `test_mul` sets |
 
-## The scheme core (Part 2) + the still-gated core (Part 3)
+## The scheme core (Part 2) + the Fable core (Part 3)
 
-`bfv.Bfv(P)` exposes the scheme, controlled by two honestly-separated flags in
-`gate.zig`:
+`bfv.Bfv(P)` exposes the scheme; both flags in `gate.zig` are now **`true`**:
 
 - `scheme_core_implemented` = **`true`** — **Part 2 (Opus), REAL:** `keyGen`
   (`pk=(−(a·s+e), a)`, ternary `s`) / `encrypt` (`c0=Δ·m+p0·u+e0`, `c1=p1·u+e1`,
@@ -40,10 +40,13 @@ The whole computational backbone FHE stands on is implemented and tested:
   round-half-up rescale). Anchored by a deterministic noiseless-ciphertext
   decrypt KAT, the enc/dec round-trip (tiny + N=1024), and homomorphic-add
   end-to-end.
-- `fable_core_implemented` = **`false`** — **Part 3 (Fable):** `mul` (tensor +
-  `⌊t/q·…⌉` rescale) / `relinearize` (relin-key key-switch) / `noiseBudget`. The
-  noise-management core (see `SPEC.md`). Its cores `@panic` and the dependent
-  mul/depth end-to-end tests report SKIP (a skip is not a green light).
+- `fable_core_implemented` = **`true`** — **Part 3 (Fable), REAL:** `mul`
+  (exact integer tensor + `⌊t/q·…⌉` rescale) / `genRelinKey`+`relinearize`
+  (base-`2^8` gadget key-switch for `s²`) / `noiseBudget`. Anchored by the
+  mul+relin and multiply-DEPTH (`a·b·c`) end-to-end tests over random AND
+  boundary plaintexts on `params.test_mul`, whose worst-case noise ledger
+  makes depth-2 correctness a guarantee for every seed — see `SPEC.md`
+  "Part-3 multiply" for the design and the noise argument.
 
 ## Usage
 
@@ -55,14 +58,16 @@ const T = bfv.Ntt(1024);
 const engine = try T.init(1073750017); // prime ≡ 1 mod 2048
 const product = engine.mulNegacyclic(a, b); // a·b mod (X^1024 + 1)
 
-// Scheme surface (cores land in Parts 2–3):
-const B = bfv.Bfv(bfv.params.bfv_toy);
+// Scheme surface (complete):
+const B = bfv.Bfv(bfv.params.test_mul);
 const inst = try B.init();
-const kp = inst.keyGen(rand);              // Part 2 (real)
-const ct = inst.encrypt(&kp.pk, &pt, rand);
-const back = inst.decrypt(&kp.sk, &ct);    // Dec(Enc(m)) == m
-const sum = inst.add(&ct, &ct2);           // homomorphic add (real)
-// inst.mul / relinearize / noiseBudget    → Part 3 (gated)
+const kp = inst.keyGen(rand);
+const rlk = inst.genRelinKey(&kp.sk, rand);
+const ca = inst.encrypt(&kp.pk, &pa, rand);
+const cb = inst.encrypt(&kp.pk, &pb, rand);
+const sum = inst.add(&ca, &cb);                   // Dec == a+b (mod t)
+const prod = inst.relinearize(&inst.mul(&ca, &cb), &rlk); // Dec == a·b (mod t)
+const bits_left = inst.noiseBudget(&kp.sk, &prod); // remaining headroom (bits)
 ```
 
 ## Verify
@@ -72,12 +77,13 @@ zig build test-bfv --summary all                    # Debug
 zig build test-bfv -Doptimize=ReleaseFast --summary all
 ```
 
-Parts 1–2: 32 pass / 2 skip (the 2 SKIPs are the mul+relin and multiply-depth
-anchors, which switch on with the Part-3 Fable core). The passing set includes
-the byte-exact NTT + RNS KATs, two deliberately-broken positive controls (a
-cyclic-vs-negacyclic discriminator and a wrong-scale "encryptor"), a
-deterministic noiseless-ciphertext decrypt KAT, and the enc/dec round-trip +
-homomorphic-add end-to-end anchors (tiny params + N=1024).
+Parts 1–3: 36 pass / 0 skip (Debug and ReleaseFast). The set includes the
+byte-exact NTT + RNS KATs, three deliberately-broken positive controls (a
+cyclic-vs-negacyclic discriminator, a wrong-scale "encryptor", and a
+corrupted-relin-key catch), a deterministic noiseless-ciphertext decrypt KAT
+with margin-boundary teeth, the enc/dec round-trip + homomorphic-add anchors
+(tiny params + N=1024), and the Part-3 mul+relin and multiply-DEPTH anchors
+over random + boundary plaintexts on `test_mul`.
 
 Provenance: clean-room from the Fan–Vercauteren paper + public NTT/RNS/BFV
 design (SEAL); no third-party source ported — see `SPEC.md`. NTT/RNS KAT vectors

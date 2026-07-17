@@ -59,6 +59,31 @@ pub const bfv_toy = Params{
     .primes = &.{ 1073750017, 1073754113 },
 };
 
+/// Multiply/depth-test parameters — `N=16`, `t=16`, primes `{65537, 786433}`
+/// (both `≡ 1 mod 32`), `q = 51,540,459,521 ≈ 2^35.6`, `Δ = ⌊q/t⌋ =
+/// 3,221,278,720`, `r_t = q mod t = 1`. NOT a security level.
+///
+/// The Part-3 multiply anchors run here instead of `test_tiny` because
+/// `test_tiny`'s `q = 1649` (`Δ/2 = 206`) cannot hold even ONE multiply: the
+/// worst-case key-carry cross term alone (`t·N·‖r‖·(B1+B2) = 4·8·5·34 ≈
+/// 5.4e3`) exceeds `q` itself. This set is sized so depth-2 correctness is a
+/// WORST-CASE guarantee (every seed, every plaintext incl. boundary), not a
+/// probabilistic pass. Ledger (ternary `s,u,e`; `ct(s) = Δm + v + q·r` over
+/// the integers, `B := ‖v‖_∞`):
+///   - fresh:   `B ≤ 2N+1 = 33`;  `‖r‖ ≤ (N+3)/2 < 10`;  `‖m‖ ≤ t−1 = 15`.
+///   - one tensor+rescale adds `t·N·‖r‖·(B1+B2)` [r–v cross] +
+///     `N·‖m‖·(B1+B2)` [m–v cross] + `r_t·(N·‖r‖·2‖m‖ + N‖m‖²/t)` +
+///     `(1+N+N²)/2` [rounding] ≈ 1.82e5 for two fresh inputs; the relin
+///     key-switch (`w = 2^8`, 5 digits, ternary `e_i`) adds
+///     `≤ 5·N·(w−1) ≈ 2.1e4`  ⇒  depth-1 noise `B_ab ≤ 2.1e5`.
+///   - depth 2 (`B1 = 2.1e5`, `B2 = 33`): `≤ (t·N·10 + N·15)·(B1+B2) + …`
+///     `≈ 5.7e8 < Δ/2 ≈ 1.61e9` — ≈2.8× worst-case margin.
+pub const test_mul = Params{
+    .n = 16,
+    .t = 16,
+    .primes = &.{ 65537, 786433 },
+};
+
 const testing = std.testing;
 
 test "test_tiny validates" {
@@ -68,6 +93,15 @@ test "test_tiny validates" {
 
 test "bfv_toy validates" {
     try bfv_toy.validate();
+}
+
+test "test_mul validates and has the documented shape" {
+    try test_mul.validate();
+    // The ledger above relies on r_t = q mod t == 1 (both primes ≡ 1 mod 16).
+    var q: u128 = 1;
+    for (test_mul.primes) |p| q *= p;
+    try testing.expectEqual(@as(u128, 51_540_459_521), q);
+    try testing.expectEqual(@as(u128, 1), q % test_mul.t);
 }
 
 test "validate rejects malformed sets" {

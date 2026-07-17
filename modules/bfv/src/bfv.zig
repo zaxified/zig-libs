@@ -11,16 +11,24 @@
 //! two 2-element ciphertexts into a 3-element one, rescales by `t/q`, and
 //! **relinearises** back to 2 elements with an evaluation (relin) key.
 //!
-//! ## Status — Part 1 (backbone + types) + Part 2 (scheme core) are REAL:
+//! ## Status — Parts 1–3 are REAL (the full leveled scheme):
 //!   - **REAL (Part 1):** the `SecretKey`/`PublicKey`/`RelinKey`/`Ciphertext`
-//!     types, their byte codecs, `Ciphertext.add`/`sub` (pure ring ops, not
-//!     noise-sensitive), and `numComponents`.
+//!     types, `Ciphertext.add`/`sub` (pure ring ops, not noise-sensitive),
+//!     and `numComponents`. (Byte codecs for these types are a deferred
+//!     backlog item — see `SPEC.md`.)
 //!   - **REAL (Part 2, Opus — `scheme_core_implemented`):** `keyGen`,
 //!     `encrypt`, `decrypt` — textbook RLWE; the `Δ`-scale decrypt is anchored
 //!     by a deterministic noiseless-ciphertext KAT + the enc/dec round-trip and
 //!     homomorphic-add end-to-end tests.
-//!   - **Gated `fable_core_implemented` (Part 3, Fable):** `mul`,
-//!     `relinearize`, `noiseBudget` — the noise-management core.
+//!   - **REAL (Part 3, Fable — `fable_core_implemented`):** `mul` (exact
+//!     integer tensor + `⌊t/q·…⌉` rescale), `genRelinKey`/`relinearize`
+//!     (base-`w` gadget key-switch for `s²`), `noiseBudget` — the
+//!     noise-management core. Anchored by the mul+relin and multiply-DEPTH
+//!     end-to-end tests on `params.test_mul`, whose worst-case noise ledger
+//!     (params.zig) makes depth-2 correctness a guarantee, not a
+//!     probabilistic pass. Exact-reconstruction tensor path only (toy
+//!     moduli); the fast BEHZ/HPS RNS base-conversion multiply is the
+//!     deferred security-grade increment.
 //!
 //! Randomness is caller-supplied (`std.Random`, frost/bbs-style) so the module
 //! stays `platform = .any` and KATs are reproducible.
@@ -63,6 +71,28 @@ pub fn Bfv(comptime P: params.Params) type {
         /// The BFV scaling factor `Δ = ⌊q/t⌋` (plaintext lives in the high bits).
         pub const delta: u128 = q_product / P.t;
 
+        /// Relinearisation gadget base `w = 2^relin_base_log2` (Part 3).
+        pub const relin_base_log2: u7 = 8;
+        pub const relin_base: u64 = 1 << relin_base_log2;
+        /// Number of base-`w` digits covering `q`: `w^relin_digits ≥ q` and
+        /// `w^(relin_digits−1) < q` (so every `w^i` used is a `[0,q)` scalar).
+        pub const relin_digits: usize = blk: {
+            var k: usize = 0;
+            var m: u128 = q_product;
+            while (m > 0) : (k += 1) m >>= relin_base_log2;
+            break :blk k;
+        };
+
+        comptime {
+            // Exact-tensor width guard for `mul`: the rounding numerator
+            // `|2·t·T + q|` with `|T| ≤ N·(q/2)²` must fit in i256.
+            const q_bits = 128 - @clz(q_product);
+            const n_bits = 64 - @clz(@as(u64, N));
+            const t_bits = 64 - @clz(P.t);
+            if (2 * q_bits + n_bits + t_bits + 2 > 255)
+                @compileError("bfv: parameter set too large for the exact-tensor multiply path");
+        }
+
         /// The `L` per-prime NTT engines + the prime chain, built once.
         engines: [L]Engine,
         primes: [L]u64,
@@ -71,13 +101,13 @@ pub fn Bfv(comptime P: params.Params) type {
         pub const PublicKey = struct { p0: Ring, p1: Ring };
         pub const KeyPair = struct { sk: SecretKey, pk: PublicKey };
 
-        /// Relinearisation / evaluation key: a key-switching key for `s^2`.
-        /// Layout (decomposition-base gadget) is finalised with the Part-3
-        /// Fable core; Part 1 fixes only the outer shape.
+        /// Relinearisation / evaluation key: a base-`w` gadget key-switching
+        /// key for `s²` (layout finalised in Part 3, as Part 1 announced).
+        /// Row `i` is a pseudo-encryption of `w^i·s²` under `s`:
+        /// `b[i] = −(a[i]·s + e_i) + w^i·s²`, so `b[i] + a[i]·s = w^i·s² − e_i`.
         pub const RelinKey = struct {
-            /// gadget rows; `[]` until Part 3 wires the base-decomposition.
-            b: []Ring = &.{},
-            a: []Ring = &.{},
+            b: [relin_digits]Ring,
+            a: [relin_digits]Ring,
         };
 
         /// A BFV ciphertext: 2 components when fresh or relinearised, 3 after
@@ -233,49 +263,218 @@ pub fn Bfv(comptime P: params.Params) type {
             return out;
         }
 
-        // ── Gated: Fable core (Part 3 — noise management) ────────────────────
+        // ── Fable core (Part 3 — noise management) ───────────────────────────
+        //
+        // Correctness story (SPEC.md "Part-3 noise budget"): write the exact
+        // integer identity `ct(s) = c0 + c1·s = Δ·m + v + q·r` (centered
+        // representatives, ‖r‖ ≤ (N+3)/2). Then
+        //   ct1(s)·ct2(s) = Δ²m1m2 + Δ(m1v2+m2v1) + v1v2
+        //                 + q·[r1(Δm2+v2) + r2(Δm1+v1)] + q²·r1r2 ,
+        // and multiplying by t/q (with tΔ = q − r_t, r_t = q mod t) gives
+        //   (t/q)·ct1(s)·ct2(s) ≡ Δ·[m1m2]_t + v_mult   (mod q),
+        //   v_mult = (m1v2+m2v1) + t·(r1v2+r2v1)  [dominant]
+        //          − r_t·(r1m2+r2m1 + m1m2-carries + …) + (t/q)·v1v2 ,
+        // i.e. the t/q rescale CANCELS one Δ so the product stays scaled by Δ
+        // (not Δ²), and the noise grows ≈ multiplicatively (·t·N·‖r‖), NOT to
+        // Δ²-scale garbage. The per-component rounding `⌊t/q·T_i⌉` adds
+        // ε0+ε1·s+ε2·s² ≤ (1+N+N²)/2. CRITICALLY the tensor `T_i` must be an
+        // EXACT integer product of fixed `[0,q)`-representative polynomials
+        // (centered here, to halve the noise constants): rescaling a mod-q
+        // ring product instead would drop `t·k_i ≢ 0 (mod q)` per component
+        // and decrypt to garbage — which is why `mul` reconstructs exactly
+        // instead of staying in RNS. The security-grade fast path (BEHZ/HPS
+        // RNS base extension, never materialising the integer) is the
+        // deferred increment (SPEC.md).
 
-        /// Generate a relinearisation key for `s^2` (key-switching key). Part 3.
+        /// Exact centered integer coefficients of a coeff-domain ring element:
+        /// CRT-reconstruct each coefficient to `[0,q)`, then center into
+        /// `(−q/2, q/2)`. i256 so tensor products below stay exact.
+        fn centeredCoeffs(self: *const Self, r: *const Ring) [N]i256 {
+            std.debug.assert(r.domain == .coeff);
+            const basis = rns.Basis{ .primes = self.primes[0..] };
+            const half = q_product / 2;
+            var out: [N]i256 = undefined;
+            for (0..N) |j| {
+                var res: [L]u64 = undefined;
+                for (0..L) |i| res[i] = r.limbs[i][j];
+                const v = basis.reconstruct(&res); // [0, q)
+                out[j] = if (v > half)
+                    -@as(i256, @intCast(q_product - v))
+                else
+                    @as(i256, @intCast(v));
+            }
+            return out;
+        }
+
+        /// `acc += a·b mod (X^N+1)` over the integers (exact schoolbook
+        /// negacyclic convolution; |terms| ≤ N·(q/2)², guarded comptime).
+        fn negaMulAcc(a: *const [N]i256, b: *const [N]i256, acc: *[N]i256) void {
+            for (0..N) |i| {
+                for (0..N) |j| {
+                    const p = a[i] * b[j];
+                    const k = i + j;
+                    if (k < N) acc[k] += p else acc[k - N] -= p; // X^N = −1
+                }
+            }
+        }
+
+        /// `⌊t/q · T⌉ mod q` per coefficient (round half up via floor
+        /// division, exact for negative T), decomposed back into RNS limbs.
+        fn rescaleTensor(self: *const Self, tc: *const [N]i256) Ring {
+            var out = Ring.zero(.coeff);
+            const qi: i256 = @intCast(q_product);
+            const ti: i256 = @intCast(P.t);
+            for (0..N) |j| {
+                const rounded = @divFloor(2 * ti * tc[j] + qi, 2 * qi);
+                const v: u128 = @intCast(@mod(rounded, qi)); // canonical [0, q)
+                for (0..L) |i| out.limbs[i][j] = @intCast(v % self.primes[i]);
+            }
+            return out;
+        }
+
+        /// `scalar·r` for a `[0,q)` scalar, per-limb (legal in either domain).
+        fn scalarMul(self: *const Self, r: *const Ring, scalar: u128) Ring {
+            var out = r.*;
+            for (0..L) |i| {
+                const c: u64 = @intCast(scalar % self.primes[i]);
+                for (&out.limbs[i]) |*x| x.* = ma.mulMod(x.*, c, self.primes[i]);
+            }
+            return out;
+        }
+
+        /// Generate the relinearisation key: a base-`w` gadget key-switching
+        /// key for `s²`. Row `i` pseudo-encrypts `w^i·s²` under `s` with a
+        /// fresh ternary error `e_i`: `(b_i, a_i) = (−(a_i·s + e_i) + w^i·s²,
+        /// a_i)`. `random` supplies the uniform `a_i` and ternary `e_i`.
         pub fn genRelinKey(self: *const Self, sk: *const SecretKey, random: std.Random) RelinKey {
-            _ = .{ self, sk, random };
-            if (!gate.fable_core_implemented)
-                @panic("TODO(fable/core): relin-key gen — gadget-decomposed key-switching key for s². Part 3. See gate.zig / SPEC.md.");
-            unreachable;
+            const s2 = sk.s.mul(&sk.s, &self.engines, &self.primes);
+            var rlk: RelinKey = undefined;
+            var w_pow: u128 = 1; // w^i < q for all rows used (see relin_digits)
+            for (0..relin_digits) |i| {
+                const a_i = self.sampleUniform(random);
+                const e_i = self.sampleTernary(random);
+                var b_i = self.scalarMul(&s2, w_pow); // w^i·s²
+                var mask = a_i.mul(&sk.s, &self.engines, &self.primes); // a_i·s
+                mask.addAssign(&e_i, &self.primes); // + e_i
+                b_i.subAssign(&mask, &self.primes); // w^i·s² − (a_i·s + e_i)
+                rlk.b[i] = b_i;
+                rlk.a[i] = a_i;
+                w_pow = @intCast((@as(u256, w_pow) << relin_base_log2) % q_product);
+            }
+            return rlk;
         }
 
-        /// Homomorphic multiply → a 3-component ciphertext. The genuine Fable
-        /// core: tensor `(c0,c1)⊗(d0,d1)` over `R`, then the `⌊t/q·…⌉` RNS
-        /// rescale (where noise is silently mismanageable). Part 3.
+        /// Homomorphic multiply → a 3-component ciphertext (degree 2 in `s`).
+        /// Tensor `(c0,c1)⊗(d0,d1) = (c0d0, c0d1+c1d0, c1d1)` computed EXACTLY
+        /// over the integers (centered representatives — see the correctness
+        /// note above for why a mod-q ring tensor would be silently wrong),
+        /// then the `⌊t/q·…⌉` rescale per component, which keeps the plaintext
+        /// scaled by `Δ` (not `Δ²`). Decrypts with `(1, s, s²)`;
+        /// `relinearize` reduces it back to 2 components.
         pub fn mul(self: *const Self, x: *const Ciphertext, y: *const Ciphertext) Ciphertext {
-            _ = .{ self, x, y };
-            if (!gate.fable_core_implemented)
-                @panic("TODO(fable/core): BFV mul — tensor + ⌊t/q·…⌉ rescale (noise budget). Part 3. See gate.zig / SPEC.md.");
-            unreachable;
+            std.debug.assert(x.len == 2 and y.len == 2);
+            const x0 = self.centeredCoeffs(&x.components[0]);
+            const x1 = self.centeredCoeffs(&x.components[1]);
+            const y0 = self.centeredCoeffs(&y.components[0]);
+            const y1 = self.centeredCoeffs(&y.components[1]);
+            var t0 = [_]i256{0} ** N;
+            var t1 = [_]i256{0} ** N;
+            var t2 = [_]i256{0} ** N;
+            negaMulAcc(&x0, &y0, &t0);
+            negaMulAcc(&x0, &y1, &t1);
+            negaMulAcc(&x1, &y0, &t1);
+            negaMulAcc(&x1, &y1, &t2);
+            return .{ .components = .{
+                self.rescaleTensor(&t0),
+                self.rescaleTensor(&t1),
+                self.rescaleTensor(&t2),
+            }, .len = 3 };
         }
 
-        /// Relinearise a 3-component ciphertext back to 2 components via the
-        /// relin key (key-switch on the `c2·s²` term). The genuine Fable core:
-        /// a wrong key-switch decrypts subtly wrong. Part 3.
+        /// Relinearise a 3-component ciphertext back to 2 via the relin key:
+        /// digit-decompose `c2 = Σ_i w^i·d_i` (exact, digits in `[0,w)`), then
+        /// `(c0', c1') = (c0 + Σ d_i·b_i, c1 + Σ d_i·a_i)`. Correctness:
+        ///   c0' + c1'·s = c0 + c1·s + Σ d_i·(b_i + a_i·s)
+        ///               = c0 + c1·s + Σ d_i·(w^i·s² − e_i)
+        ///               = c0 + c1·s + c2·s² − Σ d_i·e_i ,
+        /// i.e. the phase is PRESERVED up to the key-switch noise
+        /// `‖Σ d_i·e_i‖ ≤ relin_digits·N·(w−1)` — the `c2·s²` term is replaced
+        /// by an encryption of the same value under `s`.
         pub fn relinearize(self: *const Self, ct: *const Ciphertext, rlk: *const RelinKey) Ciphertext {
-            _ = .{ self, ct, rlk };
-            if (!gate.fable_core_implemented)
-                @panic("TODO(fable/core): BFV relinearize — key-switch c2·s² down. Part 3. See gate.zig / SPEC.md.");
-            unreachable;
+            std.debug.assert(ct.len == 3);
+            const basis = rns.Basis{ .primes = self.primes[0..] };
+            // Exact base-w digits of every coefficient of c2.
+            var digits: [relin_digits][N]u64 = undefined;
+            for (0..N) |j| {
+                var res: [L]u64 = undefined;
+                for (0..L) |i| res[i] = ct.components[2].limbs[i][j];
+                var v = basis.reconstruct(&res); // [0, q)
+                for (0..relin_digits) |i| {
+                    digits[i][j] = @intCast(v & (relin_base - 1));
+                    v >>= relin_base_log2;
+                }
+            }
+            var c0 = ct.components[0];
+            var c1 = ct.components[1];
+            for (0..relin_digits) |i| {
+                // d_i as a ring element: the same small integer digit per
+                // coefficient across all limbs (its residues), like the
+                // ternary sampler.
+                var d = Ring.zero(.coeff);
+                for (0..L) |l| {
+                    for (0..N) |j| d.limbs[l][j] = digits[i][j] % self.primes[l];
+                }
+                var tb = d.mul(&rlk.b[i], &self.engines, &self.primes);
+                c0.addAssign(&tb, &self.primes);
+                var ta = d.mul(&rlk.a[i], &self.engines, &self.primes);
+                c1.addAssign(&ta, &self.primes);
+            }
+            return .{ .components = .{ c0, c1, Ring.zero(.coeff) }, .len = 2 };
         }
 
-        /// Remaining noise budget (bits) of `ct` under `sk`; `0` == exhausted
-        /// (decryption failure). The invariant the Fable multiply must keep
-        /// honest. Part 3.
+        /// Remaining noise budget (bits) of `ct` under `sk`:
+        /// `⌊log2(q / (2·‖v‖_∞))⌋` where `v = centered(phase − Δ·m)` and `m`
+        /// is the decrypted plaintext; `0` == exhausted (decryption failure
+        /// territory). Decryption stays exact while `t·‖v‖ + r_t·‖m‖ < q/2`,
+        /// i.e. while the budget is comfortably above `log2 t`.
         pub fn noiseBudget(self: *const Self, sk: *const SecretKey, ct: *const Ciphertext) u32 {
-            _ = .{ self, sk, ct };
-            if (!gate.fable_core_implemented)
-                @panic("TODO(fable/core): noiseBudget — log2(q / (2·|noise|)). Part 3. See gate.zig / SPEC.md.");
-            unreachable;
+            // phase = Σ_i c_i·s^i in R_q (same accumulation as decrypt).
+            var acc = ct.components[0];
+            if (ct.len >= 2) {
+                var spow = sk.s;
+                var term = ct.components[1].mul(&spow, &self.engines, &self.primes);
+                acc.addAssign(&term, &self.primes);
+                var i: usize = 2;
+                while (i < ct.len) : (i += 1) {
+                    spow = spow.mul(&sk.s, &self.engines, &self.primes);
+                    var t2 = ct.components[i].mul(&spow, &self.engines, &self.primes);
+                    acc.addAssign(&t2, &self.primes);
+                }
+            }
+            const basis = rns.Basis{ .primes = self.primes[0..] };
+            const half = q_product / 2;
+            var vmax: u128 = 0;
+            for (0..N) |j| {
+                var res: [L]u64 = undefined;
+                for (0..L) |i| res[i] = acc.limbs[i][j];
+                const phase = basis.reconstruct(&res); // [0, q)
+                // m_j exactly as decrypt recovers it (round half up, mod t).
+                const rounded = (2 * @as(u128, P.t) * phase + q_product) / (2 * q_product);
+                const m_j = rounded % @as(u128, P.t);
+                const dm = delta * m_j; // < q (m_j ≤ t−1, Δ·(t−1) < q)
+                const d = (phase + q_product - dm) % q_product;
+                const v = if (d > half) q_product - d else d; // |centered|
+                vmax = @max(vmax, v);
+            }
+            if (vmax == 0) return @intCast(std.math.log2_int(u128, q_product / 2));
+            const ratio = q_product / (2 * vmax);
+            if (ratio <= 1) return 0;
+            return @intCast(std.math.log2_int(u128, ratio));
         }
     };
 }
 
-// ── tests: the REAL, ungated scheme surface (types + codecs + add) ────────────
+// ── tests: the REAL, ungated scheme surface (types + add) ─────────────────────
 
 const testing = std.testing;
 
@@ -307,9 +506,9 @@ test "instance builds and exposes real ring add on ciphertext components" {
     try testing.expect(back.components[0].eql(&a.components[0]));
 }
 
-test "gate state after Part 2: scheme core ON, Fable core still OFF" {
-    // Part 2 turns on keyGen/encrypt/decrypt; the Fable mul/relin/noiseBudget
-    // core stays gated for Part 3 (its cores @panic until then).
+test "gate state after Part 3: both scheme cores ON" {
+    // Part 2 turned on keyGen/encrypt/decrypt; Part 3 turned on the Fable
+    // mul/relinearize/noiseBudget noise-management core.
     try testing.expect(gate.scheme_core_implemented);
-    try testing.expect(!gate.fable_core_implemented);
+    try testing.expect(gate.fable_core_implemented);
 }

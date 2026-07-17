@@ -26,11 +26,13 @@
 //!     anchors decrypt against.
 //!   - `params` — parameter sets + NTT-friendly-prime validation.
 //!
-//! The **scheme layer (`bfv.Bfv`) is scaffolded**: types, byte codecs, and the
-//! (non-noise-sensitive) homomorphic `add`/`sub` are real; `keyGen`/`encrypt`/
-//! `decrypt` are gated `scheme_core_implemented` (Part 2, Opus — SEAL-KAT-able)
-//! and `mul`/`relinearize`/`noiseBudget` are gated `fable_core_implemented`
-//! (Part 3, the genuine-Fable noise-management core). See `gate.zig`, `SPEC.md`.
+//! The **scheme layer (`bfv.Bfv`) is complete**: the `SecretKey`/`PublicKey`/
+//! `RelinKey`/`Ciphertext` types and the (non-noise-sensitive) homomorphic
+//! `add`/`sub` are real; `keyGen`/`encrypt`/`decrypt` landed as
+//! `scheme_core_implemented` (Part 2, Opus — SEAL-KAT-able) and
+//! `mul`/`relinearize`/`noiseBudget` as `fable_core_implemented` (Part 3, the
+//! genuine-Fable noise-management core). See `gate.zig`, `SPEC.md`. (Byte
+//! codecs for the key/ciphertext types are a deferred backlog item.)
 //!
 //! Deferred increments: bootstrapping, CKKS (approximate), key rotation /
 //! Galois automorphisms (batching rotations), full CRT-slot SIMD encoding,
