@@ -14,13 +14,24 @@
 //! `Corrupted` — and/or (b) trip `verifyQuiescent`, which asserts every node
 //! sitting on the free list still holds intact poison.
 //!
-//! The pool is single-owner by design: EBR guarantees `acquire`/`release`
-//! happen only while the caller holds the domain quiescent for that node, so
-//! the pool itself needs no internal synchronization. (The harness drives it
-//! single-threaded for the deterministic canary test, and via EBR for the
-//! gated concurrent test.)
+//! Concurrency: the pool IS shared mutable state — producers `acquire`
+//! concurrently with each other and with reclaim-path `release`s, all racing
+//! on `free_head` and on the `all` list. EBR only guarantees that a given
+//! *node*'s handoff is quiescent; it says nothing about the pool's own
+//! bookkeeping. (The scaffold originally claimed the pool needed no internal
+//! synchronization — that was a latent data race; the gated stress test
+//! drives `acquire` from 8 producer threads at once.) A `SpinLock` therefore
+//! guards every entry point. Its release/acquire pair also carries the
+//! happens-before edge for node memory handoff between a freeing thread and
+//! the next acquiring thread, so the poison write, the poison check and the
+//! new owner's initialization never race.
+//!
+//! The lock makes `acquire`/`release` not lock-free; node allocation never
+//! was (it can hit the general-purpose allocator). The lock-free guarantees
+//! of the queue concern its head/tail/next CAS loops, not allocation.
 
 const std = @import("std");
+const atomic = @import("atomic.zig");
 
 /// The byte the free list is poisoned with. Chosen so a `u64` view reads as
 /// `0xA5A5A5A5A5A5A5A5`, whose top 16 bits (`0xA5A5`) exceed any realistic
@@ -55,12 +66,16 @@ pub fn NodePool(comptime T: type) type {
         free_head: ?*Slot,
         /// Every slot ever allocated, for teardown + `verifyQuiescent` sweep.
         all: std.ArrayListUnmanaged(*Slot),
+        /// Guards `free_head`/`all` and orders node-memory handoff across
+        /// threads (see the file doc comment).
+        lock: atomic.SpinLock,
 
         pub fn init(allocator: std.mem.Allocator) Self {
             return .{
                 .allocator = allocator,
                 .free_head = null,
                 .all = .empty,
+                .lock = .{},
             };
         }
 
@@ -79,6 +94,8 @@ pub fn NodePool(comptime T: type) type {
         /// so a UAF that corrupted a free-listed slot is caught at the next
         /// `acquire` even if `verifyQuiescent` is never called. Mechanical.
         pub fn acquire(self: *Self) (Error || std.mem.Allocator.Error)!*T {
+            self.lock.lock();
+            defer self.lock.unlock();
             if (self.free_head) |slot| {
                 try checkPoison(slot);
                 self.free_head = slot.next_free;
@@ -98,6 +115,8 @@ pub fn NodePool(comptime T: type) type {
         pub fn release(self: *Self, node: *T) void {
             const slot = slotOf(node);
             std.debug.assert(slot.live);
+            self.lock.lock();
+            defer self.lock.unlock();
             @memset(std.mem.asBytes(&slot.node), poison_byte);
             slot.live = false;
             slot.next_free = self.free_head;
@@ -109,6 +128,8 @@ pub fn NodePool(comptime T: type) type {
         /// byte and is caught here. Deterministic; the harness calls it after
         /// a stress run drains the queue. This is the pool's canary.
         pub fn verifyQuiescent(self: *Self) Error!void {
+            self.lock.lock();
+            defer self.lock.unlock();
             var cur = self.free_head;
             while (cur) |slot| : (cur = slot.next_free) {
                 try checkPoison(slot);

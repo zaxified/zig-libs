@@ -81,7 +81,7 @@ single shared verification story. Files:
 
 ## 4. The Fable-core boundary
 
-**Fable-irreducible core (6 functions, gated `@panic` stubs):**
+**Fable-irreducible core (6 functions, implemented — `gate.fable_core_implemented = true`):**
 
 1. `Domain.enterCritical` — pin: publish the global epoch into the participant
    with ordering such that a concurrent `tryAdvance` either sees the pin or is
@@ -117,6 +117,72 @@ functions (`tryAdvance`, `dequeue`), 2 hard-ordering functions (`enqueue`,
 it is a *small* kernel (matching the backlog's "malý-střední" sizing), not a
 crypto-scale one.
 
+## 4a. Memory-ordering discipline (the implemented core)
+
+**`seq_cst` everywhere it is reclamation-relevant.** Zig 0.16 removed the
+standalone fence (`@fence`), so the classic Fraser/crossbeam recipe — "store the
+pin, then a `seq_cst` fence, then read shared pointers" — is not expressible. The
+sound substitute is to make every reclamation-relevant atomic access *itself*
+`.seq_cst`: the pin store (`enterCritical`), every `global_epoch` load/CAS
+(`enterCritical`/`retire`/`tryAdvance`), the scan loads of each participant's
+`local_epoch` (`tryAdvance`), and — in `mpmc.zig` — every load/CAS of the
+queue's `head`/`tail`/`Node.next`. All then belong to the single total order **S**
+that C11/LLVM guarantees over `seq_cst` operations, and it is S that forbids the
+store-buffering interleaving ("a scan misses a pin *and* the pinned thread reads
+a pre-unlink pointer") that acquire/release alone would permit. The full theorem
+lives at `ebr.Domain.tryAdvance`; the Dekker interlock in it is exactly why the
+pin store, the scan loads, the epoch accesses **and** the queue pointer accesses
+must all be `seq_cst` — demote any one to acquire/release and the contradiction
+the theorem relies on evaporates.
+
+Two accesses are deliberately **not** `seq_cst`, each with a proof it is safe:
+the unpin store (`exitCritical`) is `.release` — it only needs to establish the
+happens-before edge that keeps the pool's poison memset from racing a reader's
+last node access; a missed unpin errs only toward *not* advancing (safe). And
+`register`'s `in_use` CAS is `.acquire` — which is *why* `tryAdvance` scans every
+slot's `local_epoch` (all `seq_cst`) rather than gating on `in_use`: an
+`in_use`-gated scan could miss a just-registered-and-pinned slot.
+
+**Portability caveat — x86_64-TSO only, by test coverage.** The module logic is
+portable (`meta.platform = .any`; `std.Thread` + `std.atomic` are cross-OS), and
+the `seq_cst` argument is an ISA-independent C11/LLVM guarantee. But the stress
+test only ever *ran* on x86_64 (a TSO memory model). On x86-TSO a `seq_cst` load
+is a plain `MOV` and a `seq_cst` store is an `XCHG`/`MOV+MFENCE`, so the one
+reordering the discipline must forbid (store→load) is the *only* one TSO allows —
+and the window is so narrow that stress cannot reliably hit it (see §5). On a
+weaker model (AArch64, POWER) the same `seq_cst` source is still correct by the
+theorem, but far more of the ordering is doing real work at runtime, so the
+empirical stress would exercise it harder. Bottom line: correctness is carried by
+the argument, not by the ISA; the "verified on" claim is x86_64-TSO only.
+
+**Self-draining `unregister`.** The Phase-1 scaffold's contract was "the caller
+must have drained its limbo bags before unregistering," asserted in Debug. That
+is **not deterministically satisfiable** by a caller: draining needs the global
+epoch to move ≥ 2 past the last retire, and any concurrently pinned thread (e.g.
+one the OS preempted mid-pin) stalls that arbitrarily — so a finite "drain then
+unregister" dance always has a losing schedule (observed as a rare
+unregister-assert abort, ~1-in-20, in the gated stress). `unregister` therefore
+now **self-drains**: it spins `tryAdvance` *unpinned* (with backoff) until its
+bags empty, then flips `in_use`. This terminates under the module's own liveness
+contract — no thread stays pinned forever (per-attempt pins in `mpmc`) — and
+cannot deadlock: the spinning thread is unpinned, so it never blocks the very
+advance it waits on; a lone/last participant self-drains deterministically. A
+**non-blocking alternative** — migrating leftover garbage to a domain-global
+limbo (crossbeam-style) so `unregister` returns immediately — is the documented
+next increment (§6); the self-draining version is accepted for the fixed, trusted
+DL4 roster where a brief bounded wait at teardown is a non-issue.
+
+**`dequeue`'s OOM `@panic` (API corner).** `dequeue` returns `?u64`, so it cannot
+surface the `Allocator.Error` that `retire` may raise when a limbo bag has to
+grow. Steady state never allocates — drained bags keep their capacity, so retire
+reuses it — but a *true* OOM at that point leaves only two options, both wrong
+(lose the node, or free it under live readers), so `dequeue` refuses both and
+`@panic`s. Accepted as documented rather than forced into a signature change:
+threading `error{OutOfMemory}` through `?u64` (→ `!?u64`) would push the corner
+onto every caller for a path that cannot occur in the bounded-pool consumer this
+module targets. A future consumer that must survive allocator failure at dequeue
+time would take the `!?u64` signature as a small, mechanical follow-up.
+
 ## 5. Verification strategy — the teeth
 
 Lock-free correctness is probabilistic under naive stress, so detection is
@@ -129,7 +195,7 @@ exists (the harness runs against controls, not the gated core):
 | CANARY TEETH | poison + `verifyQuiescent` catch a UAF write to a freed node | **deterministic** |
 | ORACLE IS CLEAN | driver returns `clean` over the correct spinlock queue | real threads, no-false-positive |
 | DRIVER TEETH | driver catches the racy `BrokenRing` | **probabilistic** (high) |
-| REAL CORE (gated) | driver over `MpmcQueue`+`Domain`, then pool canary | gated SKIP today |
+| REAL CORE | driver over `MpmcQueue`+`Domain` (8×8×50 000), then pool canary | **probabilistic** — runs now (core implemented); green is corroboration, not proof (see below) |
 
 **The multiset invariant.** Each of N producers enqueues a disjoint tagged range
 — value = `(pid << 48) | seq`. After the run the merged dequeued multiset must
@@ -152,16 +218,34 @@ independent of scheduling luck. `RefQueue` is a coarse-locked queue and thus
 trivially linearizable, so multiset-equality against it is a sound oracle for the
 lock-free queue.
 
-**Sanitizers — investigated, not wired in.** `-fsanitize-thread` (TSan) and
-`-fsanitize=address` exist in this toolchain, but:
+**What the stress can and cannot catch (sabotage self-check).** Owner-verify
+mutated the real core two ways and re-ran the ReleaseFast suite. A **gross**
+error — breaking the grace period (reclaim two-behind → zero-behind, freeing live
+nodes) — is caught **6/6 runs** (SIGSEGV at REAL CORE / canary trip), confirming
+the teeth bite the implemented core, not just the controls. A **subtle** ordering
+error — demoting the `enterCritical` pin store from `.seq_cst` to `.release`
+(exactly the Dekker-interlock break the theorem forbids) — is **not caught in 60
+runs** on x86_64-TSO, because on TSO the missed reordering window is vanishingly
+rare (§4a). This is the empirical proof of the module's central claim:
+**correctness of the ordering rests on the argument at `tryAdvance`, not on stress
+volume.** A green REAL CORE run is corroboration; the reasoning audit is the
+proof.
 
-1. Both **link libc** (a TSan build's `ldd` shows `libc.so.6`), which violates
+**Sanitizers — investigated, not wired in.** Of the two, only
+`-fsanitize-thread` (TSan) exists for pure-Zig code in this toolchain
+(0.16); there is **no** `-fsanitize=address` flag for Zig source (`zig test
+-fsanitize=address` fails with *"unrecognized parameter"* — only `-fsanitize-c`,
+for C UB, and `-fsanitize-thread` are accepted), so an ASan lane is not available
+at all. And TSan is unusable here for two reasons:
+
+1. It **links libc** (a TSan build's `ldd` shows `libc.so.6`), which violates
    the module set's zero-C/zero-libc hard invariant (CONVENTIONS §2) for any
    in-tree build lane.
-2. A TSan **smoke probe on this exact toolchain silently failed to report a
-   blatant data race** (a plainly-racing non-atomic `counter += 1` across two
-   threads produced a lost-update result but **no** ThreadSanitizer warning) —
-   so TSan here cannot be relied on as the UAF/race oracle.
+2. TSan **silently fails to report a blatant data race on this toolchain** —
+   re-confirmed during owner-verify: a TSan build of the suite runs the racy
+   `BrokenRing` DRIVER-TEETH test (non-atomic `head`/`tail` hammered by 12
+   threads) to completion with **zero** ThreadSanitizer diagnostics. So TSan here
+   cannot be relied on as the UAF/race oracle.
 
 Therefore no sanitizer lane is added. The in-tree substitute is the **poisoning
 node pool**: a broken reclamation that frees a still-referenced node makes a

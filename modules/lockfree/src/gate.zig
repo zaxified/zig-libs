@@ -22,9 +22,11 @@
 //! type-checked; it just never calls into the panicking body. The positive
 //! controls and the checker/canary teeth run for real regardless.
 //!
-//! Flip to `true` once a Fable agent has replaced the six core stubs with
-//! real, memory-ordering-correct implementations. The gated harness tests
-//! will then hammer the real MPMC queue + EBR domain under N producer / M
-//! consumer threads in ReleaseFast, enforcing the no-lost / no-duplicated /
-//! no-corrupted multiset invariant and the pool's no-use-after-free canary.
-pub const fable_core_implemented = false;
+//! Flipped to `true`: the six core stubs have been replaced with real,
+//! memory-ordering-correct implementations (each carries its ordering
+//! argument in its doc comment; the grace-period safety theorem lives at
+//! `Domain.tryAdvance`). The gated harness tests now hammer the real MPMC
+//! queue + EBR domain under N producer / M consumer threads in ReleaseFast,
+//! enforcing the no-lost / no-duplicated / no-corrupted multiset invariant
+//! and the pool's no-use-after-free canary.
+pub const fable_core_implemented = true;

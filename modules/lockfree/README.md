@@ -7,11 +7,17 @@ is the in-process worker pool (P2 DL4), which needs a multi-producer /
 multi-consumer work queue whose retired nodes are freed safely — the
 use-after-free/ABA-notorious kernel of any lock-free data structure.
 
-> **Phase-1 SCAFFOLD.** The mechanical layer + the verification harness are
-> complete and green today. The irreducible concurrency-correctness **core** —
-> EBR's `enterCritical`/`exitCritical`/`retire`/`tryAdvance` and the queue's
-> `enqueue`/`dequeue` CAS loops — is `@panic("TODO(fable/core)")` behind
-> `gate.fable_core_implemented` (`false`), left for a Fable agent. See `SPEC.md`.
+> **Core implemented.** The mechanical layer + the verification harness were
+> complete and green from Phase 1; the irreducible concurrency-correctness
+> **core** — EBR's `enterCritical`/`exitCritical`/`retire`/`tryAdvance` and the
+> queue's `enqueue`/`dequeue` CAS loops — is now implemented behind
+> `gate.fable_core_implemented` (`true`), each function carrying its
+> memory-ordering argument in place (the grace-period safety theorem lives at
+> `ebr.Domain.tryAdvance`). The whole kernel uses a **`seq_cst` discipline**:
+> Zig 0.16 removed `@fence`, so every reclamation-relevant atomic access (pin
+> store, epoch loads/CAS, the scan loads, and the queue head/tail/next
+> loads/CAS) is `.seq_cst`, placing them in one total order that forbids the
+> store-buffering interleaving a UAF would need. See `SPEC.md`.
 
 ```zig
 const lockfree = @import("lockfree");
@@ -27,8 +33,8 @@ defer q.deinit();
 // Each thread registers once, then enqueues/dequeues under its participant.
 const me = try domain.register();
 defer domain.unregister(me);
-try q.enqueue(me, 42);          // (Fable core — panics until implemented)
-const v = q.dequeue(me);         // ?u64
+try q.enqueue(me, 42);          // lock-free MS-queue producer
+const v = q.dequeue(me);         // ?u64 (null when empty)
 ```
 
 - `Domain` / `Participant` / `Guard` / `Retired` / `Config` — the **EBR**
@@ -68,18 +74,26 @@ required (see CONVENTIONS §5).
 ## Verification
 
 `zig build test-lockfree` — offline, green in Debug **and** ReleaseFast, no
-leaks. **1 skipped** today: the gated "REAL CORE" stress test runs only once
-`gate.fable_core_implemented` is flipped. Everything else runs now and proves
-the harness bites before the core exists:
+leaks. **17/17, 0 skipped:** with the core implemented, the gated "REAL CORE"
+stress test (8 producers × 8 consumers × 50 000 ops, then the pool canary) now
+runs for real. The harness proves it bites before *and* after the core exists:
 
 - **CHECKER TEETH (deterministic):** the multiset verifier rejects hand-built
   lost / duplicated / corrupted histories.
 - **CANARY TEETH (deterministic):** a use-after-free write to a freed pool node
-  trips `verifyQuiescent` and the next `acquire` (`pool.zig`).
+  trips `verifyQuiescent` and the next `acquire` (`pool.zig`). This is the
+  load-bearing UAF detector: a sabotage that breaks the grace period (reclaim
+  two-behind → zero-behind) is caught deterministically (verified: SIGSEGV /
+  canary trip, 6/6 runs).
 - **ORACLE IS CLEAN:** the driver returns `clean` over the correct spinlock
   queue under real thread contention — no false positives.
 - **DRIVER TEETH (high probability):** the driver catches the racy `BrokenRing`
   under N×M threads in ReleaseFast.
+- **REAL CORE (probabilistic):** the driver over the real `MpmcQueue`+`Domain`,
+  then the pool canary. A green run is *corroboration, not proof* — a stress run
+  on x86-TSO cannot distinguish a `seq_cst` pin store from a `.release` one
+  (verified: that demotion passes 60/60 runs here). Correctness therefore rests
+  on the memory-ordering argument in `ebr.zig`, not on seed volume.
 
 See `SPEC.md` for the EBR-vs-hazard decision, the Fable-core boundary, the
 honest deterministic-vs-probabilistic breakdown of each test, why sanitizers

@@ -5,18 +5,18 @@
 //! queue** (`mpmc`) built on it. The immediate consumer is the in-process
 //! worker pool (P2 DL4); this is the workspace's first lock-free structure.
 //!
-//! **Phase-1 SCAFFOLD status.** The mechanical layer is complete and tested:
+//! **Status: core implemented.** The mechanical layer (Phase-1 scaffold) —
 //! typed atomic helpers + backoff + an oracle spinlock (`atomic`), a
 //! poisoning node pool whose canary catches use-after-free (`pool`), the EBR
 //! domain/participant *storage* + registration (`ebr`), the queue node types
 //! + init/deinit (`mpmc`), and the entire concurrent-stress harness with its
 //! correct oracle, its deliberately-broken positive controls, and its
-//! deterministic invariant-checker teeth (`harness`). The irreducible
-//! concurrency-correctness CORE — EBR's pin/unpin/retire/advance and the
-//! queue's enqueue/dequeue CAS loops — is left as `@panic("TODO(fable/core)")`
-//! stubs behind `gate.fable_core_implemented` (currently `false`), for a
-//! later Fable agent. Core-dependent tests report SKIP; everything else,
-//! including the harness's proof-of-teeth, runs and passes today.
+//! deterministic invariant-checker teeth (`harness`) — is complete, and the
+//! irreducible concurrency-correctness CORE — EBR's pin/unpin/retire/advance
+//! and the queue's enqueue/dequeue CAS loops — is now implemented
+//! (`gate.fable_core_implemented = true`). Every core function documents its
+//! memory-ordering argument in place; the grace-period safety theorem lives
+//! at `ebr.Domain.tryAdvance`. The gated stress tests run for real.
 //!
 //! See `SPEC.md` for the EBR-vs-hazard decision, the verification strategy
 //! (and its honest probabilistic-vs-deterministic breakdown), the exact
@@ -81,5 +81,5 @@ test {
 
 test "meta is well-formed" {
     try std.testing.expect(meta.platform == .any);
-    try std.testing.expect(!gate.fable_core_implemented); // Phase-1 scaffold
+    try std.testing.expect(gate.fable_core_implemented); // core is live
 }
