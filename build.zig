@@ -144,6 +144,7 @@ const module_list = [_]Module{
     .{ .name = "ctap2pin" },
     .{ .name = "bls12_381" },
     .{ .name = "bbs", .deps = &.{"bls12_381"} },
+    .{ .name = "coconut", .deps = &.{"bls12_381"} },
     .{ .name = "tlock", .deps = &.{"bls12_381"} },
     .{ .name = "ibe", .deps = &.{"bls12_381"} },
     .{ .name = "bn254" },
