@@ -675,5 +675,21 @@ project git history).
                elsewhere in this repo (see policy §0) — recorded here anyway
                since a specific version and vector-generation method is a
                fact worth pinning for anyone re-deriving the vectors.
+  montint    — design ref: OpenSSL `crypto/bn/asm/x86_64-mont5.pl`
+               (Apache-2.0; the `MULX/ADCX/ADOX` dual-carry-chain amd64
+               Montgomery-multiply technique the gated asm core will mirror)
+               and Gueron & Krasnov, "Fast Prime Field Elliptic Curve
+               Cryptography with 256-Bit Primes" (the published description
+               of the same two-independent-carry-chain method). The portable
+               CIOS Montgomery multiply is clean-room from Koç, Acar &
+               Kaliski, "Analyzing and Comparing Montgomery Multiplication
+               Algorithms" (IEEE Micro 1996), Fig. 6; the API shape follows
+               `std.crypto.ff` (Zig std, MIT). Behavior/algorithm only, no
+               source copied. Test-vector cross-check only (not a design
+               reference): the modmul/modexp KATs at 256/512/2048/4096 bits
+               were independently recomputed with CPython's arbitrary-precision
+               integers (`(a*b)%m`, `pow(a,e,m)`) — the same black-box oracle
+               method the `vdf` module uses (see policy §0) — numerically
+               identical to OpenSSL `BN_mod_mul`/`BN_mod_exp`. No source ported.
 
 See each module's README "Provenance" note for its specific design references.
