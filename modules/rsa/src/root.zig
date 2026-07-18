@@ -286,13 +286,25 @@ fn montPowPublic(mp: *const MontParams, base_be: []const u8, e_be: []const u8, o
     unreachable;
 }
 
-/// Copy a montint big-endian result (slot-width, `res`) into an RFC-sized `out`
-/// buffer (`out.len` = modulus byte length `k`). `res` is ≥ `k` bytes and its
-/// leading `res.len − k` bytes are zero (the value is `< n`), so this narrows
-/// without loss.
+/// Copy a montint big-endian result (`res`, a Montgomery slot-width byte
+/// string) into an `out` buffer of caller-chosen width, big-endian-aligned.
+/// The value is always `< n`, so it fits in either direction:
+///   - `res.len >= out.len` (narrow): the leading `res.len − out.len` bytes of
+///     `res` are provably zero (the montint slot is ≥ the modulus byte length),
+///     so drop them and keep the low `out.len` bytes.
+///   - `out.len > res.len` (widen): the caller requested a fixed max-width
+///     output (e.g. blindrsa's `max_modulus_len` path) larger than this key's
+///     slot. Right-align `res` in `out` and zero the leading `out.len − res.len`
+///     high bytes — a smaller big-endian value in a wider fixed-width field is
+///     just left-zero-padded (most-significant zeros on the left).
 fn writeMontResult(out: []u8, res: []const u8) void {
-    std.debug.assert(res.len >= out.len);
-    @memcpy(out, res[res.len - out.len ..]);
+    if (res.len >= out.len) {
+        @memcpy(out, res[res.len - out.len ..]);
+    } else {
+        const pad = out.len - res.len;
+        @memset(out[0..pad], 0);
+        @memcpy(out[pad..], res);
+    }
 }
 
 /// RSA public key: modulus `n` and public exponent `e` (RFC 8017 §3.1).
@@ -2496,6 +2508,43 @@ test "rsadpCrt equals rsadp on the 2048-bit key" {
     const via_crt = try rsadpCrt(256, c, sk);
     try testing.expectEqualSlices(u8, &m, &via_plain);
     try testing.expectEqualSlices(u8, &via_plain, &via_crt);
+}
+
+// Regression for the montint-rewire CRIT: a sub-max key driven through the
+// max-width primitive path (`modulus_len == max_modulus_len`, the way blindrsa
+// calls rsavp1/rsasp1) must LEFT-ZERO-PAD the narrower montint result into the
+// wider output instead of asserting `res.len >= out.len`. Before the fix,
+// `writeMontResult` hit `reached unreachable` here for every key < 4096 bits.
+test "widening path: 2048-bit key through max_modulus_len primitives (writeMontResult zero-pad)" {
+    const sk = try kat2048.secretKey();
+    const pk = try kat2048.publicKey();
+    const k = 256; // 2048-bit modulus byte length
+    comptime std.debug.assert(max_modulus_len > k); // the widening case must be real
+
+    // A representative < n, presented left-zero-padded to the full max width
+    // (exactly what OS2IP of a sub-max value into a max-width buffer yields).
+    var m_wide = [_]u8{0} ** max_modulus_len;
+    for (m_wide[max_modulus_len - k ..], 0..) |*b, i| b.* = @truncate(i *% 37 +% 11);
+    m_wide[max_modulus_len - k] = 0; // keep the representative < n
+
+    // Sign at max width (rsasp1 -> CRT private op) then verify at max width
+    // (rsavp1 -> publicOp -> writeMontResult, the exact crash site): the
+    // round-trip m -> s^d -> s^e must recover the original representative.
+    const s_wide = try rsasp1(max_modulus_len, m_wide, sk);
+    // High bytes above the modulus width must be zero (big-endian left pad).
+    try testing.expect(std.mem.allEqual(u8, s_wide[0 .. max_modulus_len - k], 0));
+    const back = try rsavp1(max_modulus_len, s_wide, pk);
+    try testing.expect(std.mem.allEqual(u8, back[0 .. max_modulus_len - k], 0));
+    try testing.expectEqualSlices(u8, &m_wide, &back);
+
+    // Cross-check: signing at the key's NATURAL width yields the identical
+    // low-k bytes — the max-width path only prepends leading zeros.
+    const s_narrow = try rsasp1(k, m_wide[max_modulus_len - k ..].*, sk);
+    try testing.expectEqualSlices(u8, s_wide[max_modulus_len - k ..], &s_narrow);
+    // And rsaep at max width round-trips through rsadp (public/private widen).
+    const c_wide = try rsaep(max_modulus_len, m_wide, pk);
+    const dec = try rsadp(max_modulus_len, c_wide, sk);
+    try testing.expectEqualSlices(u8, &m_wide, &dec);
 }
 
 test "512-bit key: SHA-256 round-trips, SHA-512 encoding is too short" {
