@@ -151,7 +151,7 @@ const module_list = [_]Module{
     .{ .name = "ed448" },
     .{ .name = "decaf448", .deps = &.{"ed448"} },
     .{ .name = "paillier", .deps = &.{"montint"} },
-    .{ .name = "threshold_ecdsa", .deps = &.{"paillier"} },
+    .{ .name = "threshold_ecdsa", .deps = &.{ "paillier", "montint" } },
     .{ .name = "dkg", .deps = &.{ "threshold_ecdsa", "paillier" } },
     .{ .name = "vdf", .deps = &.{"montint"} },
     .{ .name = "signal" },

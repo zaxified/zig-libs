@@ -379,21 +379,151 @@ fn sampleNonzeroBelow(random: std.Random, bound: []const u8, out_buf: []u8) []u8
     }
 }
 
-// ── modular-exponentiation helpers over ff.Modulus ───────────────────────
+// ── montint modexp backend for the ZK-proof hot path ─────────────────────
+//
+// The GG18/GG20 range/MtA proofs' ring-Pedersen commitments (`h1^x·h2^ρ mod
+// Ñ`) and their Paillier-side terms (`c^α mod N²`, `r^e mod N`) were single
+// `std.crypto.ff` modexps — the ~7–8× hot spot the audit's N1 finding measured
+// (per-signature multi-second at production key sizes, `ff`'s schoolbook O(n²)
+// Montgomery). They now route through the sibling `montint` module (full-radix
+// 2⁶⁴ CIOS Montgomery), using the same runtime-limb-dispatch recipe the `rsa`
+// (`603a493`) / `paillier` (`6b587a5`) pilots validated — the montint modulus is
+// reconstructed per call via `Modint.fromElem` (the moduli reaching these
+// generic choke points are not carried on a precomputed key struct). Two
+// moduli flow through here at runtime — Ñ (`root.AuxModulus`, ~2048-bit) and
+// Paillier N²/N (`paillier.Modulus`, up to ~4096-bit) — so the backend is
+// generic over the `ff.Modulus`/`ff.Fe` pair and keys the comptime `Modint`
+// instantiation on the operand's live limb count. Only the modular
+// exponentiation primitive moved: every Fiat-Shamir transcript, sampling range,
+// verifier bound, and serialization is byte-identical (the montint result is
+// re-canonicalized into the SAME `ff.Fe` the old path returned), so the proofs
+// and their KAT-less self/reject tests are unchanged.
+//
+// CONSTANT-TIME: secret witness exponents (the prover's masks `m, alpha, rho,
+// gamma, sigma, tau`, secret Paillier randomness `r_a`, aux trapdoor `lambda`)
+// go through `powCt` → montint's CT windowed `powMont` (fixed 5-bit window, all
+// `L·64` exponent bits processed, branchless CT table gather) — the exact
+// guarantee the `paillier` decrypt path relies on. The slot is chosen from the
+// PUBLIC operand byte-lengths only (every secret exponent is a fixed-width
+// buffer — see `sampleBelow`'s value-independent-length contract), and the
+// result is sliced to the modulus' public byte width (never a value-dependent
+// `stripLeadingZeros` on a secret-derived result). Public verifier exponents
+// (challenge `e`, proof response fields) use the variable-time `powPub`.
 
-/// `base^e mod m` with a big-endian byte-string exponent, CONSTANT-TIME in
-/// the base and the exponent bits (`ff.powWithEncodedExponent`); the
-/// exponent's byte LENGTH is public (all call sites pass fixed-width
-/// buffers for secret exponents). `e = 0` (ff's `NullExponent`) is mapped
-/// to the mathematically-correct `base^0 = 1`.
+const montint = @import("montint");
+
+/// Widest big-endian buffer any modulus/base/result here needs — Paillier N²
+/// (`paillier.modulus_sq_bytes` = 512) ≥ Ñ (`root.aux_modulus_bytes` = 256).
+const mont_be_bytes: usize = paillier.modulus_sq_bytes;
+const mont_step: usize = 4;
+const mont_min_limbs: usize = 4;
+/// Ceiling limb count: covers Paillier N² (64 limbs) and every secret exponent
+/// (widest is `< q³·N_tilde` ≈ 2816 bits = 44 limbs).
+const mont_max_limbs: usize = (paillier.max_bits + 63) / 64;
+
+/// Round a runtime limb count up to the modeled `Modint` slot: the smallest
+/// multiple of `mont_step` that is ≥ `l` and ≥ `mont_min_limbs`.
+fn montSlot(l: usize) usize {
+    var s: usize = mont_min_limbs;
+    while (s < l) s += mont_step;
+    return s;
+}
+
+/// Load a big-endian byte string into a `slot`-limb little-endian value with NO
+/// value-dependent branch (the only branch is on the PUBLIC byte position vs the
+/// limb count) — safe on a secret base/exponent. The caller guarantees the
+/// value fits in `slot` limbs.
+fn montBeToLimbs(comptime slot: usize, be: []const u8) [slot]u64 {
+    var v = [_]u64{0} ** slot;
+    var idx: usize = 0;
+    var i: usize = be.len;
+    while (i > 0) : (idx += 8) {
+        i -= 1;
+        const limb = idx >> 6;
+        if (limb >= slot) break; // branch on public position, not on any value
+        v[limb] |= @as(u64, be[i]) << @intCast(idx & 63);
+    }
+    return v;
+}
+
+// ── modular-exponentiation helpers (montint modexp, ff.Fe in/out) ────────
+
+/// `base^e mod m`, CONSTANT-TIME in the base and the exponent VALUE (montint's
+/// windowed `powMont`). `m`/`base` are an `ff` `Modulus`/`Fe` pair of any width;
+/// `e` is a big-endian exponent byte string whose LENGTH is public (all secret-
+/// exponent call sites pass fixed-width buffers). Returns an `Fe` canonical mod
+/// `m`. `e = 0` maps to the mathematically-correct `base^0 = 1`.
 fn powCt(m: anytype, base: anytype, e: []const u8) @TypeOf(base) {
-    return m.powWithEncodedExponent(base, e, .big) catch m.one();
+    const Fe = @TypeOf(base);
+    var m_be: [mont_be_bytes]u8 = undefined;
+    m.toBytes(&m_be, .big) catch unreachable; // fits: modulus ≤ max_bits
+    var b_be: [mont_be_bytes]u8 = undefined;
+    base.toBytes(&b_be, .big) catch unreachable; // base < m
+    const mod_bytes = (m.bits() + 7) / 8;
+    // Slot must hold BOTH the modulus and the exponent — `powMont` takes the
+    // exponent as an `L`-limb value. Selection is on PUBLIC lengths only.
+    const slot = montSlot(@max((m.bits() + 63) / 64, (e.len * 8 + 63) / 64));
+    var out: [mont_be_bytes]u8 = undefined;
+    comptime var s: usize = mont_min_limbs;
+    inline while (s <= mont_max_limbs) : (s += mont_step) {
+        if (s == slot) {
+            const M = montint.Modint(s * 64);
+            const mont = M.fromElem(montBeToLimbs(s, &m_be)) catch unreachable; // odd, ≥3
+            const bl = montBeToLimbs(s, &b_be);
+            const el = montBeToLimbs(s, e);
+            const r = mont.powMont(&bl, &el);
+            mont.toBytesBE(&r, out[0..M.encoded_bytes]);
+            // Slice to the modulus' PUBLIC byte width — the high bytes are zero
+            // (result < m), so no value-dependent strip on a secret result.
+            return Fe.fromBytes(m, out[M.encoded_bytes - mod_bytes .. M.encoded_bytes], .big) catch unreachable;
+        }
+    }
+    unreachable;
 }
 
 /// `base^e mod m` for PUBLIC exponents (verifier side: every exponent is a
-/// proof field or the Fiat-Shamir challenge, all public by definition).
+/// proof field or the Fiat-Shamir challenge, all public by definition). Left-
+/// to-right square-and-multiply over `e`'s actual bit length (variable-time is
+/// fine — `e` is public), the base still through montint's Montgomery multiply.
 fn powPub(m: anytype, base: anytype, e: []const u8) @TypeOf(base) {
-    return m.powWithEncodedPublicExponent(base, e, .big) catch m.one();
+    const Fe = @TypeOf(base);
+    var m_be: [mont_be_bytes]u8 = undefined;
+    m.toBytes(&m_be, .big) catch unreachable;
+    var b_be: [mont_be_bytes]u8 = undefined;
+    base.toBytes(&b_be, .big) catch unreachable;
+    const mod_bytes = (m.bits() + 7) / 8;
+    const slot = montSlot((m.bits() + 63) / 64); // exp iterated as bytes ⇒ mod width suffices
+    var out: [mont_be_bytes]u8 = undefined;
+    comptime var s: usize = mont_min_limbs;
+    inline while (s <= mont_max_limbs) : (s += mont_step) {
+        if (s == slot) {
+            const M = montint.Modint(s * 64);
+            const mont = M.fromElem(montBeToLimbs(s, &m_be)) catch unreachable;
+            const bl = montBeToLimbs(s, &b_be);
+            const b_mont = mont.toMontgomery(&bl);
+            var acc: M.Elem = mont.one_mont;
+            var seen = false;
+            const eb = stripLeadingZeros(e);
+            for (eb) |byte| {
+                var mask: u8 = 0x80;
+                while (mask != 0) : (mask >>= 1) {
+                    if (seen) acc = mont.montSqr(&acc);
+                    if (byte & mask != 0) {
+                        if (seen) {
+                            acc = mont.montMul(&acc, &b_mont);
+                        } else {
+                            acc = b_mont; // first set bit: acc = base^1
+                            seen = true;
+                        }
+                    }
+                }
+            }
+            const r = mont.fromMontgomery(&acc); // e == 0 ⇒ acc == one_mont ⇒ 1
+            mont.toBytesBE(&r, out[0..M.encoded_bytes]);
+            return Fe.fromBytes(m, out[M.encoded_bytes - mod_bytes .. M.encoded_bytes], .big) catch unreachable;
+        }
+    }
+    unreachable;
 }
 
 /// Byte-exact `AuxFe` equality (comparing via canonical serialization
