@@ -29,8 +29,14 @@
 //! chains (`ADCX` for the add chain, `ADOX` for the mul-carry chain) fed by
 //! `MULX`, exactly the `x86_64-mont5.pl` technique. Its result type is the same
 //! `[]u64` the portable CIOS returns, so a wrong core cannot typecheck-and-pass:
-//! the differential harness compares limb-for-limb against the oracle. While
-//! this flag is `false` the asm entry `@panic`s and the differential test
-//! reports SKIP (a skip is NOT a green light — same convention as
-//! `bfv`/`groth16`); the module runs entirely on the portable oracle.
-pub const asm_core_implemented = false;
+//! the differential harness compares limb-for-limb against the oracle.
+//!
+//! ## Status: IMPLEMENTED (Fable core phase)
+//!
+//! The amd64 core is filled in (`asm_core.zig`): Zig CIOS outer loop mirroring
+//! the portable oracle word-for-word + inline-asm dual-carry-chain row
+//! primitives (4-limb-unrolled main loop, remainder loop, CF preserved across
+//! `dec`-driven loop control, OF folded into the pending-hi limb). With this
+//! flag `true` the dispatcher routes to the asm core on
+//! x86-64+ADX+BMI2 targets and the asm-vs-portable differential test is LIVE.
+pub const asm_core_implemented = true;

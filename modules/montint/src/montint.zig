@@ -34,6 +34,24 @@ pub const Error = error{ EvenModulus, ModulusTooSmall, NonCanonical, Overflow };
 /// `false` and every operation runs on the portable CIOS oracle.
 pub const asm_active = asm_core.supported and gate.asm_core_implemented;
 
+/// Small-L dispatch cutoff (limb count `L`, i.e. `bits/64`). The
+/// `MULX/ADCX/ADOX` asm core only pays off for LARGE moduli: the asm block runs
+/// runtime-`n` loops (trip-count setup, remainder handling, the cross-row
+/// register shuffle), whereas the portable CIOS is comptime-fully-unrolled with
+/// zero loop bookkeeping, so at small L the asm overhead dominates the handful
+/// of limb products. Measured on this repo's host (Kaby Lake, ReleaseFast; see
+/// `SPEC.md` "256-bit regression / small-L dispatch") the asm modmul is:
+///   L=4  (256b): ~2.4× SLOWER · L=8 (512b): ~1.06× slower · L=16 (1024b):
+///   ~1.07× slower · L=32 (2048b): ~1.43× FASTER · L=64 (4096b): ~1.75× faster.
+/// So breakeven is ~1.5–2k bit here (higher than the canonical ~512b, a
+/// mobile-CPU/turbo effect), and we route to the asm core only at `L >= 32`
+/// (≥2048-bit: RSA/Paillier/VDF), where the win is robust. Every smaller
+/// modulus uses the portable CIOS — critically our pairing fields
+/// (`bn254` Fp = 254b → L=4, `bls12_381` Fp = 381b → L=6), which MUST stay
+/// portable. The asm core is still correct at every L (the differential proves
+/// it) — this is purely a speed dispatch.
+pub const asm_min_limbs: usize = 32;
+
 /// A modulus + its Montgomery constants, parameterized by an upper bound on the
 /// modulus bit-width. `L = ceil(max_bits/64)` full 2^64 limbs; the modulus
 /// occupies exactly `L` limbs (leading zero limbs are allowed as long as the
@@ -193,12 +211,21 @@ pub fn Modint(comptime max_bits: comptime_int) type {
         /// (`z < m`).
         pub fn montMul(self: *const Self, a: *const Elem, b: *const Elem) Elem {
             var z: Elem = undefined;
-            if (comptime asm_active) {
+            // Small-L cutoff: asm only pays off for large moduli (see
+            // `asm_min_limbs`); pairing fields (L=4/6) stay portable.
+            if (comptime asm_active and L >= asm_min_limbs) {
                 asm_core.montMul(&z, a, b, &self.m, self.n0inv);
             } else {
                 z = self.montMulCios(a, b);
             }
             return z;
+        }
+
+        /// True iff `montMul` on this `Modint` routes to the amd64 asm core
+        /// (asm available+on AND the modulus is large enough to clear the
+        /// `asm_min_limbs` small-L cutoff). Used by the bench harness.
+        pub fn dispatchesToAsm() bool {
+            return asm_active and L >= asm_min_limbs;
         }
 
         /// Montgomery squaring `a²·R⁻¹ mod m`. Portable path reuses `montMul`;

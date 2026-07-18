@@ -17,14 +17,23 @@ portable CIOS fallback on every other architecture. Inline asm in Zig is still
 native Zig — no libc, no C dependency — so the collection's zero-C invariant
 holds.
 
-## Status: SCAFFOLD
+## Status: IMPLEMENTED (amd64 asm core live)
 
 The **portable path is real, constant-time, and byte-exact** against an
 independent CPython-bignum oracle at 256/512/2048/4096 bits — it is the
-correctness oracle. The irreducible amd64 asm core is a **gated stub**
-(`gate.asm_core_implemented = false`); dispatch runs entirely on the portable
-oracle until a Fable agent fills `asm_core.montMul` and flips the flag, at which
-point the asm-vs-portable differential harness lights up. See `SPEC.md`.
+correctness oracle. The irreducible amd64 asm core (`asm_core.montMul`, the
+`MULX/ADCX/ADOX` dual-carry-chain CIOS) is **implemented and switched on**
+(`gate.asm_core_implemented = true`): on x86-64+ADX+BMI2 the asm-vs-portable
+differential harness runs live (5000 random 2048-bit cases + an `n`-sweep across
+`{1,2,3,4,5,8,16,17,32,33,64}` limbs incl. leading-zero-limb moduli and squaring
+aliasing, all bit-exact), and `montMul` dispatches to it for large moduli.
+
+**Small-L dispatch:** the asm core is ~2.4× slower than the comptime-unrolled
+portable CIOS at 256-bit and only wins from ~2048-bit up (`SPEC.md`
+"256-bit regression"), so `montMul` routes to it only when
+`L >= asm_min_limbs` (= 32, ≥2048-bit). Every smaller modulus — **including the
+`bn254`/`bls12_381` pairing fields (L=4/6)** — stays on the faster portable path.
+See `SPEC.md` for the full zig-vs-OpenSSL table.
 
 ## Usage
 
@@ -60,14 +69,19 @@ zig build test-montint -Doptimize=ReleaseFast --summary all
 MONTINT_BENCH=1 zig build test-montint -Doptimize=ReleaseFast  # opt-in ns/op bench
 ```
 
-Scaffold: 15 pass / 2 skip (Debug and ReleaseFast). The skips are the gated
-asm-vs-portable differential (lights up with the core) and the opt-in bench. The
-suite includes the byte-exact modmul+modexp KATs at 256/512/2048/4096 bits, the
-BrokenMont positive control (a dropped conditional-subtract, flagged RED), the
-Karatsuba==schoolbook mutual anchor, and the CT-boundary checks. Portable
-baseline this host (ReleaseFast): modmul 2048 ≈ 4.4 µs, modexp 2048 ≈ 5.46 ms;
-OpenSSL `rsa2048` CRT sign ≈ 624 µs for reference (`SPEC.md` explains why the
-comparison is not apples-to-apples, and what the asm core targets).
+16 pass / 1 skip (Debug and ReleaseFast on amd64+ADX+BMI2). The one skip is the
+opt-in bench; the asm-vs-portable differential now runs. The suite includes the
+byte-exact modmul+modexp KATs at 256/512/2048/4096 bits, the live asm-vs-portable
+differential, the BrokenMont positive control (a dropped conditional-subtract,
+flagged RED), the Karatsuba==schoolbook mutual anchor, and the CT-boundary
+checks.
+
+Measured this host (Kaby Lake, ReleaseFast; full table in `SPEC.md`), shipped
+path vs OpenSSL 3.5.5 full-width: **2048-bit modmul 1.32× OpenSSL** (1.46 µs asm
+vs 1.11 µs), **2048-bit modexp 1.79× OpenSSL** (3.43 ms asm vs 1.91 ms), and
+montint *beats* OpenSSL at 256-bit — versus the 8–29× the `std.crypto.ff`-backed
+modules pay. The win is mostly the full-limb Montgomery-resident portable CIOS
+(ff→portable ~3.2× at 2048 modexp); the asm core adds ~1.5× on top.
 
 Provenance: clean-room from public algorithm descriptions (Montgomery CIOS; the
 OpenSSL `x86_64-mont5` `MULX/ADCX/ADOX` technique studied as a design reference;

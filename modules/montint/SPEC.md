@@ -74,9 +74,9 @@ a different regime (see its SPEC's reuse map).
   the modmul yet. The threshold (`karatsuba_threshold = 16`) is descriptive; the
   tuned crossover is a bench-time question.
 
-## The scaffold cut-line (what the Fable agent fills)
+## The asm core (implemented — was the scaffold cut-line)
 
-Exactly one function is gated (`gate.asm_core_implemented = false`):
+Exactly one function was gated (`gate.asm_core_implemented`, now `true`):
 
 ```
 asm_core.montMul(z: []u64, a, b, m: []const u64, n0inv: u64)   // z = a·b·R⁻¹ mod m
@@ -133,36 +133,102 @@ and the final subtract must stay a `CMOV`/masked select, not a `Jcc`.
    `0−1 == m−1`, `(m−1)² mod m == 1`) plus the reasoning-anchored no-secret-branch
    note.
 
-## Benchmarks (this host, ReleaseFast, PORTABLE path — pre-asm baseline)
+## Benchmarks — the zig-vs-OpenSSL table (this host, ReleaseFast)
 
-| op | 2048-bit | 4096-bit |
+Host: Intel i7-7920HQ (Kaby Lake, mobile). All four columns measured on the
+**same** host; numbers are noisy (turbo/thermal on a laptop) — read them as
+ratios. **`modmul` = one Montgomery multiply** `a·b·R⁻¹ mod m` with `a,b` already
+in the Montgomery domain, so it is directly comparable to OpenSSL
+`BN_mod_mul_montgomery`. **`modexp` = a full-width constant-time exponent**
+(`BN_mod_exp_mont_consttime`, *not* RSA-CRT) — no CRT normalization needed, this
+is a true full-width modexp on both sides. Columns: **portable-Zig** (`montMulCios`)
+· **asm-Zig** (the `MULX/ADX` core) · **OpenSSL 3.5.5** (libcrypto, same host) ·
+**`std.crypto.ff`** (the "before" the audit measured). The Zig columns come from
+`bench.zig` (`MONTINT_BENCH=1`); OpenSSL from a small libcrypto driver.
+
+**modmul** (ns/op — one Montgomery multiply):
+
+| bits | portable-Zig | asm-Zig | OpenSSL | std.crypto.ff |
+|---|---|---|---|---|
+| 256  | **30**  | 73   | 52    | 785    |
+| 512  | **147** | 156  | 99    | 2 032  |
+| 2048 | 2 094   | **1 463** | 1 106 | 24 591 |
+| 4096 | 9 610   | **5 467** | 3 857 | 98 194 |
+
+**modexp** (full-width, constant-time):
+
+| bits | portable-Zig | asm-Zig | OpenSSL | std.crypto.ff |
+|---|---|---|---|---|
+| 256  | **9.1 µs** | 22.1 µs | 18.8 µs | 61.3 µs |
+| 512  | **87 µs**  | 102 µs  | 38 µs   | 342 µs  |
+| 2048 | 5.15 ms | **3.43 ms** | 1.91 ms | 16.4 ms |
+| 4096 | 44.1 ms | **26.7 ms** | 14.9 ms | 125 ms  |
+
+(**bold** = the path `montMul`'s small-L dispatch actually selects at that size,
+see below.) Honest OpenSSL multiple of the **shipped** path:
+
+| size | modmul vs OpenSSL | modexp vs OpenSSL |
 |---|---|---|
-| modmul (a·b mod m) | 4.4 µs | 18.5 µs |
-| modexp (full-width exponent) | 5.46 ms | 44.1 ms |
+| 256  | 0.58× (montint **faster**) | 0.48× (montint **faster**) |
+| 512  | 1.48× | 2.3× |
+| 2048 | 1.32× | **1.79×** |
+| 4096 | 1.42× | **1.79×** |
 
-OpenSSL reference on the same host (`openssl speed`): rsa2048 CRT **sign** 624
-µs, rsa4096 sign 4.34 ms; rsa2048 **verify** 18 µs, rsa4096 verify 63 µs. Note
-the comparison is not apples-to-apples: OpenSSL's private op is **CRT** (two
-half-width modexps ≈ 4× less work than a full-width modexp), and its public op
-uses a tiny `e = 65537`. Even so, the portable path already improves markedly on
-the `std.crypto.ff` baseline the audit measured (rsa2048 CRT sign 19.33 ms via
-ff), i.e. the full-limb + 5-bit-window portable modmul/modexp is several× faster
-than ff **before any asm**. The `≤3× OpenSSL` target is the asm core's job; the
-owner-verify + Fable phases produce the real zig-vs-OpenSSL table.
+Everything is inside the ≤3× goal. **Bottom line:** the bulk of the win over the
+`ff` baseline is the Montgomery-resident portable CIOS on full 2^64 limbs
+(ff→portable ≈ **3.2×** at 2048-bit modexp, ≈ **12×** at 2048-bit modmul); the
+asm core adds ≈ **1.5×** on top at 2048-bit (portable 5.15 ms → asm 3.43 ms
+modexp; 2 094 ns → 1 463 ns modmul). Combined, the shipped path is **≈1.8×
+OpenSSL** full-width at 2048/4096-bit modexp and **1.3–1.4× OpenSSL** at modmul —
+and it *beats* OpenSSL outright at 256-bit — versus the **8–29×** the `ff`-backed
+modules pay today. (Prior CRT caveat retired: this table measures full-width
+`BN_mod_exp` directly, so there is no apples-to-oranges CRT normalization. For
+reference, OpenSSL rsa2048 **CRT sign** on this host is ≈ 624 µs ≈ ¼ of a
+full-width 2048 modexp, consistent with the 1.91 ms measured here.)
 
-## Threats / caveats (scaffold)
+## 256-bit regression / small-L dispatch
 
-- **Not yet the fast path.** amd64 asm core is a stub; today everything runs the
-  portable CIOS. No performance claim beyond the portable numbers above.
+The asm core is **not** universally faster. The `MULX/ADX` block runs
+runtime-`n` loops (trip-count setup, remainder handling, the mul→reduce register
+shuffle), whereas the portable CIOS is comptime-**fully unrolled** for the fixed
+`L` with zero loop bookkeeping. At small `L` that overhead dominates the handful
+of limb products, so the asm modmul is **~2.4× SLOWER at 256-bit** (73 vs 30 ns),
+~1.06× slower at 512-bit, ~1.07× slower at 1024-bit, and only pulls ahead at
+2048-bit (1.43× faster) and 4096-bit (1.75× faster). Measured breakeven on this
+host is **~1.5–2k bit** — higher than the canonical ~512-bit `mont5` breakeven, a
+mobile-CPU/turbo artifact.
+
+**This matters for the pairing fields.** `bn254` Fp (254-bit → L=4) and
+`bls12_381` Fp (381-bit → L=6) live exactly in the small-L regime where asm is
+2×+ slower, so they MUST NOT use it. `montMul` therefore applies a comptime
+cutoff — `asm_active AND L >= montint.asm_min_limbs` (**= 32**, i.e. ≥2048-bit) —
+routing every smaller modulus to the portable CIOS and reserving the asm core for
+the large RSA/Paillier/VDF moduli where it robustly wins. The asm core remains
+correct at every `L` (the differential exercises `n ∈ {1,2,3,4,5,8,16,17,32,33,64}`
+incl. leading-zero-limb moduli and squaring aliasing) — the cutoff is purely a
+speed dispatch, not a correctness bound.
+
+## Threats / caveats
+
+- **amd64-only fast path.** The `MULX/ADX` core lands only on x86-64 with the ADX
+  + BMI2 feature flags; every other target (aarch64/armv7/mips/…) runs the
+  portable CIOS forever, and even on amd64 the small-L dispatch (see above) keeps
+  moduli `< 2048-bit` — including the pairing fields — on the portable path.
 - **Best-effort CT, like `ff`.** The contract is structural; a sufficiently
-  clever optimizer could in principle reintroduce a branch. No timing audit has
-  been run. The masked selects follow the `ff` pattern.
+  clever optimizer could in principle reintroduce a branch. The ReleaseFast
+  `montMul` disassembly was checked: every conditional branch is on the PUBLIC
+  limb count `n` (asm loop trip counts, the outer limb loop, the `condSub` loop
+  counters + its unrolled-remainder `n`-parity test) and the final subtract is a
+  `setb`+mask masked select — no secret-dependent `Jcc`. No timing audit tool has
+  been run; the guarantee is best-effort, as with `ff`.
 - **No base blinding / fault countermeasures.** This is a modular-arithmetic
   primitive, not a signing scheme; blinding (rsa F2) and CRT fault-checks
   (rsa F3) are the consumer's responsibility, layered on top.
-- **Deferred:** the asm core (Fable), a dedicated asm squaring, the large-size
-  SOS+Karatsuba modmul path, and a possible dynamic-limb-count modulus (today
-  `L` is fixed by `max_bits`; a small modulus in a wide `Modint` wastes work).
+- **Deferred:** a dedicated asm **squaring** (today `montSqr` reuses `montMul`),
+  the large-size SOS+Karatsuba modmul path, tuning the small-L cutoff per-µarch
+  (it is a single host measurement), and a possible dynamic-limb-count modulus
+  (today `L` is fixed by `max_bits`; a small modulus in a wide `Modint` wastes
+  work).
 
 ## Provenance
 
