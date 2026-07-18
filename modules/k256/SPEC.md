@@ -168,6 +168,21 @@ bounded. The GLV decomposition and the endomorphism constants ARE k256's own.
 - **Gated differentials** (`oracle_test.zig`): SKIP until each gate flips, then
   pin the core bit-for-bit to the portable path.
 
+## Performance status — VERIFY optimized, SIGN pending the comb table
+
+Both gated cores are in and the **verify path is optimized**: the `MULX/ADX`
+field multiply and the GLV double-base multiply drive ECDSA/BIP340 verify to
+**~2–3.5× libsecp256k1** (measured this host: field mul ~2.9×, ECDSA verify ~2.5×
+libsecp / ~6.5× std) — inside the module's ~2–4× target and a large win over the
+~9–14× the `std`-backed consumers pay.
+
+**SIGN is deliberately NOT yet optimized.** BIP340/ECDSA sign still runs two naive
+constant-time `mul` base-point ladders (`s·G`), so it measures **~8–10×
+libsecp256k1** (~10× this host). The sign fix is backlog #3 — a comptime
+**fixed-base wNAF/precomputed-`G` comb table** giving a constant-time base-point
+multiply — which is a scoped follow-up, explicitly OUT of this phase. Sign remains
+correct (byte-exact to the 8 official BIP340 sign vectors), just not yet fast.
+
 ## Backlog (the Fable phase + beyond)
 
 1. `fast_core.fieldMul`/`fieldSq` — the `MULX/ADX` field mul + square with the

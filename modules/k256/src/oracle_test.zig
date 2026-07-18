@@ -10,9 +10,11 @@
 //!      every signature produced by `std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256`
 //!      and reject tampered ones — proving k256's verify path (double-base
 //!      multiply + scalar inverse + x-mod-n) agrees with std end-to-end.
-//!   2. **The GATED Fable-core differentials.** Both SKIP until their gate flips
-//!      (a skip is NOT a green light); when a Fable agent implements a core they
-//!      light up and pin it bit-for-bit to the proven portable path.
+//!   2. **The GATED Fable-core differentials** — LIVE now that both gates are
+//!      flipped: they pin the amd64 field core and the GLV scalarmuls
+//!      bit-for-bit to the proven portable paths (random + edge inputs). They
+//!      still SKIP on targets where a core cannot run (a skip is NOT a green
+//!      light there — dispatch is on the portable oracle).
 
 const std = @import("std");
 const gate = @import("gate.zig");
@@ -86,6 +88,39 @@ test "GATED differential: fast_core.fieldMul/fieldSq == portable Solinas" {
     }
 }
 
+test "GATED differential: fast_core edge cases (0, 1, p−1, fold-stressing patterns)" {
+    if (!gate.field_asm_implemented) return error.SkipZigTest; // core not filled
+    if (!fast_core.supported) return error.SkipZigTest; // non-amd64 target
+
+    const p = field.field_order;
+    const c: u256 = (1 << 32) + 977; // the Solinas fold constant
+    // Canonical edge values (< p): boundaries, single bits, fold-constant
+    // multiples, and max-limb patterns that stress the reduction carries.
+    const edges = [_]u256{
+        0,             1,           2,                                                                  c - 1,                                                              c,
+        c + 1,         p - 1,       p - 2,                                                              p - c,                                                              p - c - 1,
+        (1 << 64) - 1, 1 << 64,     (1 << 128) - 1,                                                     1 << 128,                                                           (1 << 192) - 1,
+        1 << 192,      1 << 255,    (1 << 255) + 1,                                                     p >> 1,                                                             (p >> 1) + 1,
+        p / c,         (p / c) * c, 0xFFFFFFFF00000000FFFFFFFF00000000FFFFFFFF00000000FFFFFFFF00000000, 0x00000000FFFFFFFF00000000FFFFFFFF00000000FFFFFFFF00000000FFFFFFFF,
+    };
+    for (edges) |av| {
+        if (av >= p) continue;
+        const a: [4]u64 = .{ @truncate(av), @truncate(av >> 64), @truncate(av >> 128), @truncate(av >> 192) };
+        const want_sq = field.sqPortable(a);
+        var got_sq: [4]u64 = undefined;
+        fast_core.fieldSq(&got_sq, &a);
+        try std.testing.expectEqualSlices(u64, &want_sq, &got_sq);
+        for (edges) |bv| {
+            if (bv >= p) continue;
+            const b: [4]u64 = .{ @truncate(bv), @truncate(bv >> 64), @truncate(bv >> 128), @truncate(bv >> 192) };
+            const want = field.mulPortable(a, b);
+            var got: [4]u64 = undefined;
+            fast_core.fieldMul(&got, &a, &b);
+            try std.testing.expectEqualSlices(u64, &want, &got);
+        }
+    }
+}
+
 test "GATED differential: group.mulPublicGlv == plain scalar multiply" {
     if (!gate.glv_scalarmul_implemented) return error.SkipZigTest; // core not filled
 
@@ -102,4 +137,90 @@ test "GATED differential: group.mulPublicGlv == plain scalar multiply" {
         const got = Secp256k1.mulPublicGlv(p, sb, .big) catch continue;
         try std.testing.expect(want.equivalent(got));
     }
+}
+
+fn beBytes(x: u256) [32]u8 {
+    var b: [32]u8 = undefined;
+    std.mem.writeInt(u256, &b, x, .big);
+    return b;
+}
+
+test "GATED GLV edge cases: s at 0/1/λ/n±1/2^256−1, base + random point, identity input" {
+    if (!gate.glv_scalarmul_implemented) return error.SkipZigTest; // core not filled
+
+    const scalarmod = @import("scalar.zig");
+    const n = scalarmod.field_order;
+
+    var prng = std.Random.DefaultPrng.init(0x61F_ED6E5);
+    const rand = prng.random();
+    var kb: [32]u8 = undefined;
+    rand.bytes(&kb);
+    const points = [_]Secp256k1{ Secp256k1.basePoint, try Secp256k1.basePoint.mul(kb, .big) };
+
+    for (points) |p| {
+        // s ≡ 0 (mod n): raw 0 and raw n both hit the identity reject.
+        try std.testing.expectError(error.IdentityElement, Secp256k1.mulPublicGlv(p, beBytes(0), .big));
+        try std.testing.expectError(error.IdentityElement, Secp256k1.mulPublicGlv(p, beBytes(n), .big));
+
+        // Exact-value pins against the portable vartime oracle — no
+        // catch-continue: every case MUST succeed on both paths and agree.
+        const scalars = [_]u256{
+            1, 2, 3, 15, 16, 17,
+            scalarmod.lambda, // split degenerates to (0, 1)
+            n - scalarmod.lambda, // negative-half exercise
+            (1 << 128) - 1,
+            1 << 128,
+            n - 1, // ≡ −1: both halves negative-capable
+            n + 1, // raw scalar above the order, reduces to 1
+            std.math.maxInt(u256), // raw 2^256−1
+        };
+        for (scalars) |s| {
+            const sb = beBytes(s);
+            const want = try p.mulPublicDoubleAdd(sb, .big);
+            const got = try Secp256k1.mulPublicGlv(p, sb, .big);
+            try std.testing.expect(want.equivalent(got));
+        }
+    }
+
+    // Identity input point must reject.
+    try std.testing.expectError(error.IdentityElement, Secp256k1.mulPublicGlv(Secp256k1.identityElement, beBytes(1), .big));
+}
+
+test "GATED differential: mulDoubleBasePublic (GLV 4-way) == portable double-add" {
+    if (!gate.glv_scalarmul_implemented) return error.SkipZigTest; // core not filled
+
+    var prng = std.Random.DefaultPrng.init(0xD0B1_BA5E);
+    const rand = prng.random();
+    var i: usize = 0;
+    while (i < 300) : (i += 1) {
+        var kb1: [32]u8 = undefined;
+        var kb2: [32]u8 = undefined;
+        var s1: [32]u8 = undefined;
+        var s2: [32]u8 = undefined;
+        rand.bytes(&kb1);
+        rand.bytes(&kb2);
+        rand.bytes(&s1);
+        rand.bytes(&s2);
+        const p1 = Secp256k1.basePoint.mul(kb1, .big) catch continue;
+        const p2 = Secp256k1.basePoint.mul(kb2, .big) catch continue;
+
+        // Errors must agree too (no silent skip of the GLV path).
+        if (Secp256k1.mulDoubleBasePublicDoubleAdd(p1, s1, p2, s2, .big)) |want| {
+            const got = try Secp256k1.mulDoubleBasePublic(p1, s1, p2, s2, .big);
+            try std.testing.expect(want.equivalent(got));
+        } else |e| {
+            try std.testing.expectError(e, Secp256k1.mulDoubleBasePublic(p1, s1, p2, s2, .big));
+        }
+    }
+
+    // Edge: zero scalars and an exact cancellation must reject as identity.
+    const g = Secp256k1.basePoint;
+    const g2 = try g.mul(beBytes(2), .big);
+    try std.testing.expectError(error.IdentityElement, Secp256k1.mulDoubleBasePublic(g, beBytes(0), g2, beBytes(0), .big));
+    // 2·G + 1·(−2G) = identity.
+    try std.testing.expectError(error.IdentityElement, Secp256k1.mulDoubleBasePublic(g, beBytes(2), g2.neg(), beBytes(1), .big));
+    // One zero scalar: s1·p1 alone.
+    const want_single = try g.mulPublicDoubleAdd(beBytes(7), .big);
+    const got_single = try Secp256k1.mulDoubleBasePublic(g, beBytes(7), g2, beBytes(0), .big);
+    try std.testing.expect(want_single.equivalent(got_single));
 }

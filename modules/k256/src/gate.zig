@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: MIT
 
-//! gate — the two switches that select the **irreducible Fable cores** this
-//! SCAFFOLD phase deliberately did NOT ship. Both default to `false`, so every
-//! operation runs on the portable oracle path (which is byte-exact against
-//! `std.crypto.ecc.Secp256k1` + the official BIP340 vectors) until a Fable agent
-//! fills the core and flips the flag, at which point the corresponding
-//! core-vs-portable differential harness lights up.
+//! gate — the two switches that select the **irreducible Fable cores**. The
+//! scaffold phase shipped both as `false` (portable oracle everywhere); the
+//! Fable core phase filled both cores and flipped both flags, so the
+//! core-vs-portable differential harness in `oracle_test.zig` is now LIVE
+//! (the portable path — byte-exact against `std.crypto.ecc.Secp256k1` + the
+//! official BIP340 vectors — remains the correctness oracle and the fallback
+//! for non-amd64 targets).
 //!
 //! ## What is REAL and ungated today (the oracle + the harness with teeth)
 //!
@@ -27,7 +28,7 @@
 //!     official BIP340 vectors, and a deliberately-broken positive control (a
 //!     wrong reduction constant) the harness flags RED.
 //!
-//! ## The two cut-lines (what the Fable agent fills)
+//! ## The two cut-lines (both FILLED by the Fable core phase)
 //!
 //! ### 1. `field_asm_implemented` → the amd64 MULX/ADX field mul + square
 //! (`fast_core.fieldMul` / `fast_core.fieldSq`). A `z = a·b mod p` over four
@@ -38,23 +39,26 @@
 //! typecheck-and-silently-pass: the differential compares limb-for-limb.
 //!
 //! ### 2. `glv_scalarmul_implemented` → the GLV variable-base scalarmul
-//! (`group.mulPublicGlv`). Split `k = k1 + k2·λ` via `scalar.splitScalar`
-//! (already REAL + tested here), map `P ↦ (β·x, y)` for the `λ`-multiple, and
-//! combine the two half-length multiplies with interleaved wNAF — ~40% fewer
-//! doublings for verification. Portable fallback: the plain double-and-add
-//! `mulPublic`, which the differential pins it to.
+//! (`group.mulPublicGlv`) plus the GLV 4-way double-base combine behind
+//! `group.mulDoubleBasePublic` (the verifier's `s·G − e·P`). Split
+//! `k = k1 + k2·λ` via `scalar.splitScalar`, map `P ↦ (β·x, y)` for the
+//! `λ`-multiple, and combine the half-length multiplies with interleaved
+//! width-5 wNAF — ~half the doublings. Portable fallback: the plain
+//! double-and-add paths, which the differentials pin the cores to.
 //!
-//! ## Status: SCAFFOLD — both cores GATED OFF.
+//! ## Status: both cores IMPLEMENTED and GATED ON.
 //!
-//! A skip in the differential harness is NOT a green light; it means the core is
-//! not yet implemented and dispatch is on the proven portable oracle.
+//! On non-amd64 targets (or with a flag flipped back to `false`) dispatch
+//! falls back to the proven portable oracle; a skip in the differential
+//! harness on such a target is NOT a green light for the asm core.
 
 /// Selects the amd64 `MULX/ADX` field multiply/square core
 /// (`fast_core.fieldMul` / `fast_core.fieldSq`). While `false`, the field runs
 /// the portable Solinas reduction on every target.
-pub const field_asm_implemented = false;
+pub const field_asm_implemented = true;
 
 /// Selects the GLV-decomposition variable-base scalarmul
-/// (`group.mulPublicGlv`). While `false`, `mulPublic` runs the plain
-/// double-and-add fallback.
-pub const glv_scalarmul_implemented = false;
+/// (`group.mulPublicGlv`, and the GLV double-base combine behind
+/// `group.mulDoubleBasePublic`). While `false`, the public multiplies run the
+/// plain double-and-add fallbacks.
+pub const glv_scalarmul_implemented = true;

@@ -4,14 +4,12 @@
 //!
 //!   K256_BENCH=1 zig build test-k256 -Doptimize=ReleaseFast
 //!
-//! Prints portable-k256 vs `std.crypto.ecc.Secp256k1` (the "before") for the
-//! field multiply/square, the constant-time base-point scalar multiply, and
-//! ECDSA verify — plus k256's own BIP340 sign/verify. These are the SCAFFOLD
-//! baseline: they show where the portable path starts. The ~2–4×-libsecp256k1
-//! target is reached only after the gated `MULX/ADX` field core + GLV land
-//! (`gate.field_asm_implemented` / `gate.glv_scalarmul_implemented`); the owner
-//! verify + Fable phases produce the real accelerated numbers. Numbers are noisy
-//! on mobile CPUs (turbo/thermal) — treat them as ratios, not absolutes.
+//! Prints k256 (asm field + GLV when gated on; the label says which) vs
+//! `std.crypto.ecc.Secp256k1` for the field multiply/square, the constant-time
+//! base-point scalar multiply, the variable-base public multiply (GLV vs the
+//! portable double-and-add vs std), and ECDSA verify — plus k256's own BIP340
+//! sign/verify. Target: ~2–4× libsecp256k1. Numbers are noisy on mobile CPUs
+//! (turbo/thermal) — treat them as ratios, not absolutes.
 
 const std = @import("std");
 const field = @import("field.zig");
@@ -28,11 +26,13 @@ fn nowNs() u64 {
     return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
 }
 
+const k256_label = if (field.field_asm_active) "k256-ASM " else "k256-PORT";
+
 test "bench (opt-in via K256_BENCH)" {
     if (std.testing.environ.getPosix("K256_BENCH") == null) return error.SkipZigTest;
     var prng = std.Random.DefaultPrng.init(0x2B15_C0DE);
     const rand = prng.random();
-    std.debug.print("\n=== k256 SCAFFOLD baseline (portable path, field_asm={}, glv={}) ===\n", .{
+    std.debug.print("\n=== k256 bench (field_asm={}, glv={}) ===\n", .{
         field.field_asm_active, @import("gate.zig").glv_scalarmul_implemented,
     });
 
@@ -66,7 +66,7 @@ test "bench (opt-in via K256_BENCH)" {
         while (i < fmul_iters) : (i += 1) kz = kz.mul(kb);
         var dt = nowNs() - t0;
         std.mem.doNotOptimizeAway(kz);
-        std.debug.print("k256-PORT field mul: {d:>6} ns/op   ", .{dt / fmul_iters});
+        std.debug.print("{s} field mul: {d:>6} ns/op   ", .{ k256_label, dt / fmul_iters });
 
         var sz = sa;
         t0 = nowNs();
@@ -83,7 +83,7 @@ test "bench (opt-in via K256_BENCH)" {
         while (i < fmul_iters) : (i += 1) kz = kz.sq().mul(kb);
         var dt = nowNs() - t0;
         std.mem.doNotOptimizeAway(kz);
-        std.debug.print("k256-PORT field sq : {d:>6} ns/op   ", .{dt / fmul_iters});
+        std.debug.print("{s} field sq : {d:>6} ns/op   ", .{ k256_label, dt / fmul_iters });
 
         var sz = sa;
         t0 = nowNs();
@@ -105,7 +105,7 @@ test "bench (opt-in via K256_BENCH)" {
         }
         var dt = nowNs() - t0;
         std.mem.doNotOptimizeAway(sink);
-        std.debug.print("k256-PORT scalarmul (CT G·s): {d:>8} ns/op\n", .{dt / smul_iters});
+        std.debug.print("{s} scalarmul (CT G·s): {d:>8} ns/op\n", .{ k256_label, dt / smul_iters });
 
         sink = 0;
         t0 = nowNs();
@@ -117,6 +117,47 @@ test "bench (opt-in via K256_BENCH)" {
         dt = nowNs() - t0;
         std.mem.doNotOptimizeAway(sink);
         std.debug.print("std       scalarmul (CT G·s): {d:>8} ns/op\n", .{dt / smul_iters});
+    }
+
+    // ── variable-base PUBLIC multiply: GLV vs portable vs std ──
+    {
+        const p = Secp256k1.basePoint.mul(sb, .big) catch unreachable;
+        const sp = Std.basePoint.mul(sb, .big) catch unreachable;
+        var s2: [32]u8 = undefined;
+        rand.bytes(&s2);
+
+        var sink: u64 = 0;
+        var t0 = nowNs();
+        var i: usize = 0;
+        while (i < smul_iters) : (i += 1) {
+            const r = p.mulPublic(s2, .big) catch continue;
+            sink ^= r.x.limbs[0];
+        }
+        var dt = nowNs() - t0;
+        std.mem.doNotOptimizeAway(sink);
+        std.debug.print("{s} mulPublic (GLV)   : {d:>8} ns/op\n", .{ k256_label, dt / smul_iters });
+
+        sink = 0;
+        t0 = nowNs();
+        i = 0;
+        while (i < smul_iters) : (i += 1) {
+            const r = p.mulPublicDoubleAdd(s2, .big) catch continue;
+            sink ^= r.x.limbs[0];
+        }
+        dt = nowNs() - t0;
+        std.mem.doNotOptimizeAway(sink);
+        std.debug.print("{s} mulPublic (D&A)   : {d:>8} ns/op\n", .{ k256_label, dt / smul_iters });
+
+        sink = 0;
+        t0 = nowNs();
+        i = 0;
+        while (i < smul_iters) : (i += 1) {
+            const r = sp.mulPublic(s2, .big) catch continue;
+            sink ^= r.x.toBytes(.little)[0];
+        }
+        dt = nowNs() - t0;
+        std.mem.doNotOptimizeAway(sink);
+        std.debug.print("std       mulPublic         : {d:>8} ns/op\n", .{dt / smul_iters});
     }
 
     // ── ECDSA verify (k256 vs std) on a real std signature ──
@@ -133,7 +174,7 @@ test "bench (opt-in via K256_BENCH)" {
         while (i < sig_iters) : (i += 1) sink ^= @intFromBool(sign.ecdsaVerify(&pk_sec1, msg, sig_rs));
         var dt = nowNs() - t0;
         std.mem.doNotOptimizeAway(sink);
-        std.debug.print("k256-PORT ecdsa verify      : {d:>8} ns/op\n", .{dt / sig_iters});
+        std.debug.print("{s} ecdsa verify      : {d:>8} ns/op\n", .{ k256_label, dt / sig_iters });
 
         sink = 0;
         t0 = nowNs();
@@ -146,6 +187,18 @@ test "bench (opt-in via K256_BENCH)" {
         std.mem.doNotOptimizeAway(sink);
         std.debug.print("std       ecdsa verify      : {d:>8} ns/op\n", .{dt / sig_iters});
 
+        // ── ECDSA sign (std, for the end-to-end sign story) ──
+        sink = 0;
+        t0 = nowNs();
+        i = 0;
+        while (i < sig_iters) : (i += 1) {
+            const s2 = kp.sign(msg, null) catch continue;
+            sink ^= s2.toBytes()[0];
+        }
+        dt = nowNs() - t0;
+        std.mem.doNotOptimizeAway(sink);
+        std.debug.print("std       ecdsa sign        : {d:>8} ns/op\n", .{dt / sig_iters});
+
         // k256 BIP340 sign/verify (no direct std analog; report standalone).
         const sk = [_]u8{3} ** 32;
         const bsig = sign.bip340Sign(sk, msg, [_]u8{0} ** 32) catch return;
@@ -153,10 +206,21 @@ test "bench (opt-in via K256_BENCH)" {
         sink = 0;
         t0 = nowNs();
         i = 0;
+        while (i < sig_iters) : (i += 1) {
+            const s2 = sign.bip340Sign(sk, msg, [_]u8{0} ** 32) catch continue;
+            sink ^= s2[0];
+        }
+        dt = nowNs() - t0;
+        std.mem.doNotOptimizeAway(sink);
+        std.debug.print("{s} bip340 sign       : {d:>8} ns/op\n", .{ k256_label, dt / sig_iters });
+
+        sink = 0;
+        t0 = nowNs();
+        i = 0;
         while (i < sig_iters) : (i += 1) sink ^= @intFromBool(sign.bip340Verify(pub_xonly, msg, bsig));
         dt = nowNs() - t0;
         std.mem.doNotOptimizeAway(sink);
-        std.debug.print("k256-PORT bip340 verify     : {d:>8} ns/op\n", .{dt / sig_iters});
+        std.debug.print("{s} bip340 verify     : {d:>8} ns/op\n", .{ k256_label, dt / sig_iters });
     }
-    std.debug.print("(target after gated MULX/ADX field + GLV: ~2–4× libsecp256k1)\n\n", .{});
+    std.debug.print("(reference: libsecp256k1 on comparable hw ≈ 50µs verify, ≈ 25-40µs sign)\n\n", .{});
 }

@@ -6,12 +6,13 @@
 //! The multiply/square hot path uses the curve-specific **Solinas reduction**:
 //! a 256×256→512-bit schoolbook product, then the fold `2^256 ≡ 2^32 + 977
 //! (mod p)` collapses the high half back into 256 bits (repeat until < 2^256),
-//! then one constant-time conditional subtract of `p`. This SCAFFOLD ships that
-//! reduction written straightforwardly on wide (`u256`/`u512`) integers — it is
-//! the correctness ORACLE, byte-exact against `std.crypto.ecc.Secp256k1.Fe`. The
-//! irreducible `MULX/ADX` limb-level version of the SAME fold is the gated Fable
-//! core (`fast_core.fieldMul`/`fieldSq`); until it lands, `mul`/`sq` dispatch to
-//! the portable reduction below.
+//! then one constant-time conditional subtract of `p`. The portable path ships
+//! that reduction written straightforwardly on wide (`u256`/`u512`) integers —
+//! it is the correctness ORACLE, byte-exact against
+//! `std.crypto.ecc.Secp256k1.Fe`. The irreducible `MULX/ADX` limb-level version
+//! of the SAME fold is the gated Fable core (`fast_core.fieldMul`/`fieldSq`),
+//! now implemented: on amd64 `mul`/`sq` dispatch to it, elsewhere to the
+//! portable reduction below.
 //!
 //! The API mirrors `std.crypto.ecc.Secp256k1.Fe` (same method names/semantics)
 //! so `group.zig` is a drop-in over this field and the oracle differential is a
@@ -32,7 +33,7 @@ pub const field_order: u256 = (1 << 256) - (1 << 32) - 977;
 const c_fold: u64 = (1 << 32) + 977;
 
 /// True iff `mul`/`sq` route to the gated amd64 asm core (`fast_core`) rather
-/// than the portable Solinas reduction. Always `false` in this scaffold.
+/// than the portable Solinas reduction.
 pub const field_asm_active = fast_core.supported and gate.field_asm_implemented;
 
 // ── wide-integer helpers (portable reduction substrate) ─────────────────────

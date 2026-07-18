@@ -17,14 +17,14 @@
 //!   * `mul` — CONSTANT-TIME fixed 256-bit double-and-add with a `cMov` bit
 //!     select (secret scalars: key derivation, signing nonce).
 //!   * `mulPublic` — VARIABLE-TIME single-base multiply for public scalars, the
-//!     dispatch point for the gated GLV core (`mulPublicGlv`); portable fallback
-//!     is a plain vartime double-and-add.
+//!     dispatch point for the gated GLV core (`mulPublicGlv`, IMPLEMENTED);
+//!     portable fallback is a plain vartime double-and-add.
 //!   * `mulDoubleBasePublic` — VARIABLE-TIME `s1·P1 + s2·P2`, the verifier's
-//!     `s·G − e·P` workhorse.
+//!     `s·G − e·P` workhorse; under the same gate it runs the GLV 4-way
+//!     interleaved combine.
 //!
-//! SPEC.md documents the fast-path design the Fable phase targets (fixed-base
-//! wNAF table for `G`, GLV for variable-base); this scaffold ships the simple
-//! double-and-add forms as the proven portable oracle those must match.
+//! The simple double-and-add forms remain as the proven portable oracle the
+//! GLV paths are differentially pinned to (and the non-gated fallback).
 
 const std = @import("std");
 const gate = @import("gate.zig");
@@ -280,8 +280,9 @@ pub const Secp256k1 = struct {
     }
 
     /// Portable variable-time single-base double-and-add (the GLV fallback +
-    /// differential oracle).
-    fn mulPublicDoubleAdd(p: Secp256k1, s_: [32]u8, endian: std.builtin.Endian) IdentityElementError!Secp256k1 {
+    /// differential oracle). `pub` so the harness/bench can pin the GLV core
+    /// against it directly.
+    pub fn mulPublicDoubleAdd(p: Secp256k1, s_: [32]u8, endian: std.builtin.Endian) IdentityElementError!Secp256k1 {
         try p.rejectIdentity();
         const s = scalarValue(s_, endian);
         var q = Secp256k1.identityElement;
@@ -295,25 +296,67 @@ pub const Secp256k1 = struct {
         return q;
     }
 
-    /// GATED Fable core #2 — the GLV-decomposition variable-base scalarmul.
+    /// GATED Fable core #2 — the GLV-decomposition variable-base scalarmul
+    /// (IMPLEMENTED). VARIABLE-TIME; PUBLIC scalars only.
     ///
-    /// SCAFFOLD STUB: never reached (the caller only routes here when
-    /// `gate.glv_scalarmul_implemented`, which is `false`). The Fable agent
-    /// replaces this with: `(r1, r2) = scalar.splitScalar(s)` (already REAL +
-    /// tested), `φ(p) = (β·p.x, p.y)` for the `λ`-multiple, then an interleaved
-    /// half-length wNAF combine of `r1·p + r2·φ(p)`. `oracle_test.zig`'s gated
-    /// differential pins it to `mulPublicDoubleAdd`.
+    /// `s` is first reduced mod the group order `n` (legal for any raw 256-bit
+    /// scalar because the curve has prime order `n`, so `s·P = (s mod n)·P` —
+    /// the portable double-and-add scans raw bits and agrees for the same
+    /// reason). Then `(r1, r2) = scalar.splitScalar(s)` (proven byte-exact vs
+    /// std), each half resolved to a signed magnitude `|r_i| ≈ √n`, and the
+    /// result computed as an interleaved width-5 wNAF combine of
+    /// `r1·p + r2·φ(p)` with `φ(p) = (β·x, y)` — ~half the doublings of a full
+    /// scalarmul. `oracle_test.zig`'s gated differential pins it to the proven
+    /// constant-time ladder.
     pub fn mulPublicGlv(p: Secp256k1, s_: [32]u8, endian: std.builtin.Endian) IdentityElementError!Secp256k1 {
-        _ = p;
-        _ = s_;
-        _ = endian;
-        @panic("TODO(fable/core): k256 GLV+wNAF variable-base scalarmul not implemented");
+        try p.rejectIdentity();
+        const halves = splitToSignedHalves(scalarValue(s_, endian)) orelse return error.IdentityElement;
+        const e1 = wnafDigits(halves[0]);
+        const e2 = wnafDigits(halves[1]);
+        var tabs: [2][glv_table_len]Secp256k1 = undefined;
+        tabs[0] = oddMultiples(p);
+        tabs[1] = phiTable(&tabs[0]);
+        return glvCombine(2, &tabs, &.{ e1, e2 });
+    }
+
+    /// GLV+wNAF double-base multiply — `mulDoubleBasePublic`'s dispatch target
+    /// under the same gate (SPEC: "extending GLV to the double-base
+    /// `s·G − e·P` path"). Both scalars are split, giving a 4-way interleaved
+    /// half-length combine `r11·p1 + r12·φ(p1) + r21·p2 + r22·φ(p2)`.
+    fn mulDoubleBaseGlv(p1: Secp256k1, s1_: [32]u8, p2: Secp256k1, s2_: [32]u8, endian: std.builtin.Endian) IdentityElementError!Secp256k1 {
+        try p1.rejectIdentity();
+        try p2.rejectIdentity();
+        // A zero scalar contributes nothing (all-zero digits), but s1 = s2 = 0
+        // must still reject — the final rejectIdentity in the combine does.
+        const zero_halves = [2]GlvHalf{ .{ .mag = 0, .negative = false }, .{ .mag = 0, .negative = false } };
+        const h1 = splitToSignedHalves(scalarValue(s1_, endian)) orelse zero_halves;
+        const h2 = splitToSignedHalves(scalarValue(s2_, endian)) orelse zero_halves;
+        var tabs: [4][glv_table_len]Secp256k1 = undefined;
+        tabs[0] = oddMultiples(p1);
+        tabs[1] = phiTable(&tabs[0]);
+        tabs[2] = oddMultiples(p2);
+        tabs[3] = phiTable(&tabs[2]);
+        return glvCombine(4, &tabs, &.{
+            wnafDigits(h1[0]), wnafDigits(h1[1]),
+            wnafDigits(h2[0]), wnafDigits(h2[1]),
+        });
     }
 
     /// VARIABLE-TIME double-base multiply `s1·p1 + s2·p2` for PUBLIC scalars —
     /// the verifier's `s·G − e·P` workhorse. `error.IdentityElement` if the
-    /// result is neutral (the BIP340 "sG − eP is infinite" reject).
+    /// result is neutral (the BIP340 "sG − eP is infinite" reject). Dispatches
+    /// to the GLV core when `gate.glv_scalarmul_implemented`, else the plain
+    /// interleaved double-and-add below.
     pub fn mulDoubleBasePublic(p1: Secp256k1, s1_: [32]u8, p2: Secp256k1, s2_: [32]u8, endian: std.builtin.Endian) IdentityElementError!Secp256k1 {
+        if (comptime gate.glv_scalarmul_implemented) {
+            return mulDoubleBaseGlv(p1, s1_, p2, s2_, endian);
+        }
+        return mulDoubleBasePublicDoubleAdd(p1, s1_, p2, s2_, endian);
+    }
+
+    /// Portable variable-time interleaved double-and-add for two bases (the
+    /// GLV fallback + differential oracle). `pub` for the harness/bench.
+    pub fn mulDoubleBasePublicDoubleAdd(p1: Secp256k1, s1_: [32]u8, p2: Secp256k1, s2_: [32]u8, endian: std.builtin.Endian) IdentityElementError!Secp256k1 {
         try p1.rejectIdentity();
         try p2.rejectIdentity();
         const s1 = scalarValue(s1_, endian);
@@ -330,6 +373,121 @@ pub const Secp256k1 = struct {
         return q;
     }
 };
+
+// ── GLV helpers (VARIABLE-TIME — public scalars only) ───────────────────────
+
+/// Odd-multiple table size for width-5 wNAF: {1,3,5,…,15}·P.
+const glv_table_len = 8;
+/// wNAF digit-string length: a 256-bit magnitude yields at most 257 digits.
+const glv_wnaf_len = 257;
+
+const GlvHalf = struct { mag: u256, negative: bool };
+
+/// Reduce a raw 256-bit scalar mod `n` and split it into the two signed GLV
+/// halves of `k ≡ r1 + r2·λ (mod n)`. Returns null when `k ≡ 0 (mod n)` (the
+/// multiple is the identity). Reducing first is legal for any raw scalar
+/// because the curve group has prime order `n` (`s·P = (s mod n)·P`) — the
+/// portable double-and-add scans raw bits and agrees for the same reason.
+fn splitToSignedHalves(s_raw: u256) ?[2]GlvHalf {
+    const n = scalarmod.field_order;
+    // 2^256 < 2n, so a single conditional subtract fully reduces.
+    const s = if (s_raw >= n) s_raw - n else s_raw;
+    if (s == 0) return null;
+    var sb: [32]u8 = undefined;
+    std.mem.writeInt(u256, &sb, s, .little);
+    // s < n is canonical and every intermediate of the split is in range.
+    const split = scalarmod.splitScalar(sb, .little) catch unreachable;
+    return .{ glvHalf(split.r1), glvHalf(split.r2) };
+}
+
+/// Resolve one split residue to a signed magnitude. A residue with any high
+/// bit set represents the negative `−(n − r)` (the balanced split guarantees
+/// |r| ≈ √n, so the two cases are cleanly separated by bit 128). Either
+/// interpretation is ≡ r (mod n), so correctness never depends on the
+/// threshold — only the ~128-bit magnitude (and hence the halved doubling
+/// count) does.
+fn glvHalf(r_le: [32]u8) GlvHalf {
+    const v = std.mem.readInt(u256, &r_le, .little);
+    if ((v >> 128) != 0) return .{ .mag = scalarmod.field_order - v, .negative = true };
+    return .{ .mag = v, .negative = false };
+}
+
+/// Width-5 wNAF digit string: nonzero digits are odd, in [−15, 15], at least
+/// 4 zeros apart. The half's sign is folded into the digits.
+fn wnafDigits(h: GlvHalf) [glv_wnaf_len]i8 {
+    var e = [_]i8{0} ** glv_wnaf_len;
+    var v = h.mag;
+    var i: usize = 0;
+    while (v != 0) : (i += 1) {
+        if (@as(u1, @truncate(v)) == 1) {
+            const w: i32 = @intCast(v & 31);
+            const d: i32 = if (w >= 16) w - 32 else w;
+            if (d >= 0) {
+                v -= @as(u256, @intCast(d));
+            } else {
+                v += @as(u256, @intCast(-d));
+            }
+            e[i] = @intCast(if (h.negative) -d else d);
+        }
+        v >>= 1;
+    }
+    return e;
+}
+
+/// The odd multiples {1,3,…,15}·p (projective).
+fn oddMultiples(p: Secp256k1) [glv_table_len]Secp256k1 {
+    var tab: [glv_table_len]Secp256k1 = undefined;
+    tab[0] = p;
+    const p2 = p.dbl();
+    var i: usize = 1;
+    while (i < glv_table_len) : (i += 1) tab[i] = tab[i - 1].add(p2);
+    return tab;
+}
+
+/// φ applied to a whole table: φ(X:Y:Z) = (β·X : Y : Z), and because φ is an
+/// endomorphism, φ((2i+1)·p) = (2i+1)·φ(p) — one field mul per entry instead
+/// of rebuilding the table from φ(p).
+fn phiTable(tab: *const [glv_table_len]Secp256k1) [glv_table_len]Secp256k1 {
+    const beta_fe = comptime (Fe.fromInt(scalarmod.beta) catch unreachable);
+    var out: [glv_table_len]Secp256k1 = undefined;
+    for (tab, &out) |t, *o| o.* = .{ .x = t.x.mul(beta_fe), .y = t.y, .z = t.z };
+    return out;
+}
+
+/// Interleaved (Straus/Shamir) wNAF combine of `k` digit strings over `k`
+/// odd-multiple tables: one shared doubling chain (its length = the highest
+/// nonzero digit position, ~128 for the balanced halves), one point add or
+/// sub per nonzero digit. `error.IdentityElement` if the result is neutral.
+fn glvCombine(comptime k: usize, tabs: *const [k][glv_table_len]Secp256k1, es: *const [k][glv_wnaf_len]i8) IdentityElementError!Secp256k1 {
+    // Number of digit positions up to the highest nonzero across all strings.
+    var top: usize = 0;
+    for (es) |e| {
+        var i: usize = glv_wnaf_len;
+        while (i > 0) {
+            i -= 1;
+            if (e[i] != 0) {
+                if (i + 1 > top) top = i + 1;
+                break;
+            }
+        }
+    }
+    var q = Secp256k1.identityElement;
+    var i = top;
+    while (i > 0) {
+        i -= 1;
+        q = q.dbl();
+        inline for (0..k) |j| {
+            const d: i32 = es[j][i];
+            if (d > 0) {
+                q = q.add(tabs[j][@intCast(@divExact(d - 1, 2))]);
+            } else if (d < 0) {
+                q = q.sub(tabs[j][@intCast(@divExact(-d - 1, 2))]);
+            }
+        }
+    }
+    try q.rejectIdentity();
+    return q;
+}
 
 /// A point in affine coordinates.
 pub const AffineCoordinates = struct {

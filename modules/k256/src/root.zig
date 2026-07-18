@@ -13,15 +13,16 @@
 //! ~2–4× libsecp256k1 (parity with decades-tuned asm-grade C isn't expected;
 //! going ~9–14×→~2–4× is the win). See `SPEC.md` for the dedup justification.
 //!
-//! ## Scaffold status (this phase)
+//! ## Status (core phase done)
 //!
 //! The PORTABLE path is **real, constant-time, and byte-exact vs
 //! `std.crypto.ecc.Secp256k1` + the official BIP340 vectors** — it is the
-//! correctness ORACLE. Two irreducible Fable cores are GATED off
-//! (`gate.field_asm_implemented` / `gate.glv_scalarmul_implemented`), with the
-//! portable path serving in their place, until a Fable agent fills them and the
-//! gated core-vs-portable differentials in `oracle_test.zig` light up. See
-//! `gate.zig`, `fast_core.zig`, `SPEC.md`.
+//! correctness ORACLE and the non-amd64 fallback. Both irreducible Fable cores
+//! are IMPLEMENTED and gated ON (`gate.field_asm_implemented` /
+//! `gate.glv_scalarmul_implemented`): the amd64 `MULX/ADX` field mul+square
+//! with the branch-free Solinas fold, and the GLV+wNAF variable-base +
+//! double-base public multiplies. The core-vs-portable differentials in
+//! `oracle_test.zig` are live. See `gate.zig`, `fast_core.zig`, `SPEC.md`.
 
 const std = @import("std");
 
@@ -42,8 +43,8 @@ pub const AffineCoordinates = group.AffineCoordinates;
 pub const Scalar = scalar.Scalar;
 
 /// True iff the field multiply/square hot path is running on the gated amd64
-/// `MULX/ADX` core rather than the portable Solinas reduction. `false` in this
-/// scaffold (the core is not yet implemented).
+/// `MULX/ADX` core rather than the portable Solinas reduction (true on any
+/// x86-64 build with the ADX + BMI2 target features).
 pub const field_asm_active = field.field_asm_active;
 
 pub const meta = .{
