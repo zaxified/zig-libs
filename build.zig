@@ -67,7 +67,7 @@ const module_list = [_]Module{
     .{ .name = "lockfree" },
     .{ .name = "hashdigest" },
     .{ .name = "sealedbox" },
-    .{ .name = "rsa" },
+    .{ .name = "rsa", .deps = &.{"montint"} },
     .{ .name = "blindrsa", .deps = &.{"rsa"} },
     .{ .name = "ssh", .deps = &.{"rsa"} },
     .{ .name = "nftables" },

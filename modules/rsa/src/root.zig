@@ -28,12 +28,29 @@
 //!   P5  — keypair generation (`generate`) — DONE.
 //!   P6  — self-signed certificate generation (`selfSignedCert`) — DONE.
 //!
-//! Modular exponentiation is not reimplemented: this module builds on
-//! `std.crypto.ff` (`Uint`/`Modulus`/`Fe`), the same constant-time finite-field
-//! primitive Zig std's own internal RSA verifier
+//! The `std.crypto.ff` (`Uint`/`Modulus`/`Fe`) types remain the canonical
+//! big-integer carrier for every RSA value (modulus components, exponents,
+//! message/signature representatives) and provide the constant-time finite-
+//! field shape Zig std's own internal RSA verifier
 //! (`std.crypto.Certificate.rsa`, not public) is built on. This module exposes
 //! a clean, PUBLIC, sign-capable superset of that shape (std's internal `rsa`
 //! only verifies; it has no `SecretKey`/CRT/signing support at all).
+//!
+//! Speed: the modular-exponentiation HOT PATH (the CRT private op mod p / mod q,
+//! the non-CRT private op mod n, and the public op mod n) is routed through the
+//! sibling `montint` module — a full-radix-2^64, Montgomery-resident,
+//! constant-time modexp that is ~3× faster than `std.crypto.ff` on the portable
+//! path (the deep audit measured `ff` at ~29× OpenSSL for the CRT sign; see
+//! `~/CML/audit/modules/rsa.md`). `ff` is retained for key derivation, the CRT
+//! recombination arithmetic (Garner), reductions, and all serialization; only
+//! the exponentiation primitive moved. The `montint` moduli + Montgomery
+//! constants are precomputed ONCE per key at construction and carried on the
+//! key (`MontParams`), so no per-operation setup cost is paid.
+//!
+//! SECURITY FOLLOW-UP (not done here — see `~/CML/audit/modules/rsa.md` F2/F3):
+//! the CRT private path still has no base blinding and no Bellcore fault-check.
+//! Those are a deliberately separate task; base blinding in particular changes
+//! the perf profile and would muddy this backend-swap benchmark.
 //!
 //! Provenance: clean-room implementation from RFC 8017 (PKCS#1 v2.2); design
 //! reference = Zig std's internal `std.crypto.Certificate.rsa` (MIT) for the
@@ -43,6 +60,10 @@
 //! `NOTICE` for the design-reference entry.
 
 const std = @import("std");
+
+/// Fast constant-time Montgomery modexp backend for the RSA hot path
+/// (private CRT op, non-CRT private op, public op). See `montint`'s SPEC.md.
+const montint = @import("montint");
 
 /// Blowfish + OpenBSD bcrypt_pbkdf (P4b support primitives), re-exported
 /// for callers that need the KDF stand-alone.
@@ -59,7 +80,7 @@ pub const meta = .{
     .role = .util, // pure computation (no I/O, no wire framing of its own) -> util, not .codec
     .concurrency = .reentrant, // no shared/global state; PublicKey/SecretKey are plain value types
     .model_after = "RFC 8017 (PKCS#1 v2.2); std.crypto internal RSA (Certificate/rsa)",
-    .deps = .{}, // std only (std.crypto.ff)
+    .deps = .{"montint"}, // std.crypto.ff carrier + montint modexp hot path
 };
 
 /// Largest RSA modulus this module supports, in bits. Matches the ceiling
@@ -101,10 +122,185 @@ fn stripLeadingZeros(bytes: []const u8) []const u8 {
     return bytes[i..];
 }
 
+// ── montint modexp backend (the hot-path arithmetic) ────────────────────────
+//
+// `montint.Modint(bits)` fixes its limb count `L` at comptime, whereas an RSA
+// key's size is only known at runtime (512…4096-bit moduli, and CRT operates on
+// the ~half-width primes). We bridge the two with a runtime-dispatched set of
+// comptime `Modint` instantiations, keyed on the operand's limb count rounded
+// up to a multiple of `mont_step`. Rounding keeps the number of monomorphized
+// modexp instantiations small (16) while the common RSA sizes (2048/3072/4096
+// moduli, their 1024/1536/2048-bit primes) land on an exact multiple-of-4 limb
+// count with ZERO padding — a 2048-bit CRT sign runs mod-p at L=16, exactly the
+// Montgomery-resident portable win the audit targeted (L=16 < montint's
+// `asm_min_limbs`=32, so it takes the portable CIOS path). Padding, when it
+// happens (a non-round modulus width), only adds leading zero limbs, which
+// `montint` handles and which stays correct — just slightly slower.
+
+const mont_step: usize = 4;
+const mont_min_limbs: usize = 4;
+const mont_max_limbs: usize = (max_modulus_bits + 63) / 64; // 64
+
+/// A modulus plus its precomputed Montgomery constants, stored in a max-width
+/// (`mont_max_limbs`) buffer with only the low `L` limbs live. Computed ONCE
+/// per key (at construction) so no per-operation Montgomery setup is paid — the
+/// `Modint` view is reconstructed field-by-field at op time, skipping the
+/// (relatively expensive) `computeConstants` doubling loop.
+const MontParams = struct {
+    /// Live limb count (a multiple of `mont_step`, in `[mont_min_limbs,
+    /// mont_max_limbs]`); selects the comptime `Modint` at op time.
+    L: usize = 0,
+    /// `-m[0]⁻¹ mod 2^64` (montint's CIOS reduction constant).
+    n0inv: u64 = 0,
+    /// The odd modulus, little-endian, low `L` limbs live.
+    m: [mont_max_limbs]u64 = [_]u64{0} ** mont_max_limbs,
+    /// `R² mod m` (montint's `toMontgomery` constant).
+    r2: [mont_max_limbs]u64 = [_]u64{0} ** mont_max_limbs,
+    /// `R mod m` — the value `1` in the Montgomery domain.
+    one: [mont_max_limbs]u64 = [_]u64{0} ** mont_max_limbs,
+};
+
+/// Round a runtime limb count up to the modeled `Modint` slot: the smallest
+/// multiple of `mont_step` that is ≥ `L` and ≥ `mont_min_limbs`. `L ≤
+/// mont_max_limbs` always (a value ≤ `max_modulus_bits` wide), so the result is
+/// in the instantiated set `{4, 8, …, 64}`.
+fn montSlot(l: usize) usize {
+    var s: usize = mont_min_limbs;
+    while (s < l) s += mont_step;
+    return s;
+}
+
+/// Load a big-endian byte string into an `L`-limb little-endian value with NO
+/// value-dependent branch (the only branch is on the PUBLIC bit position vs the
+/// limb count) — so it is safe to use on the secret exponent. The caller
+/// guarantees the value fits in `slot` limbs (RSA operands always do: a
+/// reduced base is `< m`, and every exponent here is `< m`).
+fn beToLimbs(comptime slot: usize, be: []const u8) [slot]u64 {
+    var v = [_]u64{0} ** slot;
+    var idx: usize = 0;
+    var i: usize = be.len;
+    while (i > 0) : (idx += 8) {
+        i -= 1;
+        const limb = idx >> 6;
+        if (limb >= slot) break; // branch on public position, not on any value
+        v[limb] |= @as(u64, be[i]) << @intCast(idx & 63);
+    }
+    return v;
+}
+
+/// Precompute the montint modulus + Montgomery constants for an `ff` modulus.
+/// One-time (key construction) — walks the doubling-based `computeConstants`.
+fn montParamsFromModulus(mod: Modulus) MontParams {
+    var be: [max_modulus_len]u8 = undefined;
+    mod.toBytes(&be, .big) catch unreachable; // 512-byte buffer never overflows
+    const slot = montSlot((mod.bits() + 63) / 64);
+    var mp: MontParams = .{ .L = slot };
+    comptime var s: usize = mont_min_limbs;
+    inline while (s <= mont_max_limbs) : (s += mont_step) {
+        if (s == slot) {
+            const M = montint.Modint(s * 64);
+            // NB: montint's `fromBytesBE`/`elementFromBytesBE` are currently
+            // broken (they reference `Self.Error`, which `Modint` does not
+            // expose — a latent bug, never instantiated by montint's own tests),
+            // so build via `fromElem` from a branchless-loaded limb array.
+            const mm = M.fromElem(beToLimbs(s, &be)) catch unreachable; // odd, ≥3, fits
+            mp.n0inv = mm.n0inv;
+            @memcpy(mp.m[0..s], &mm.m);
+            @memcpy(mp.r2[0..s], &mm.r2);
+            @memcpy(mp.one[0..s], &mm.one_mont);
+            return mp;
+        }
+    }
+    unreachable;
+}
+
+/// Reconstruct the comptime `Modint` view for slot `s` from precomputed params
+/// (no `computeConstants` — just copies the stored constants into the fields).
+fn montView(comptime s: usize, mp: *const MontParams) montint.Modint(s * 64) {
+    const M = montint.Modint(s * 64);
+    return M{
+        .m = mp.m[0..s].*,
+        .n0inv = mp.n0inv,
+        .r2 = mp.r2[0..s].*,
+        .one_mont = mp.one[0..s].*,
+    };
+}
+
+/// Constant-time (in the exponent VALUE) modexp `base^exp mod m` over the
+/// precomputed modulus `mp`. `base_be`/`exp_be` are big-endian, both `< m`.
+/// Writes the big-endian result (slot-width) into `out_buf` and returns that
+/// slice. This is the analogue of `ff.Modulus.pow` (secret path) — used for the
+/// private CRT halves (`c^dP mod p`, `c^dQ mod q`) and the non-CRT `c^d mod n`.
+fn montPowSecret(mp: *const MontParams, base_be: []const u8, exp_be: []const u8, out_buf: *[max_modulus_len]u8) []const u8 {
+    comptime var s: usize = mont_min_limbs;
+    inline while (s <= mont_max_limbs) : (s += mont_step) {
+        if (s == mp.L) {
+            const M = montint.Modint(s * 64);
+            const mod = montView(s, mp);
+            const b = beToLimbs(s, base_be);
+            const e = beToLimbs(s, exp_be);
+            const r = mod.powMont(&b, &e);
+            mod.toBytesBE(&r, out_buf[0..M.encoded_bytes]);
+            return out_buf[0..M.encoded_bytes];
+        }
+    }
+    unreachable;
+}
+
+/// Variable-time modexp `base^e mod m` for a PUBLIC exponent (RSA verify /
+/// encrypt) — a left-to-right square-and-multiply over `e`'s actual bit length,
+/// so the tiny public exponent (typically 65537) costs ~17 squarings + 2
+/// multiplies rather than the full-width `L·64` squarings a constant-time
+/// modexp would spend. Variable-time is fine: `e` is public. Uses montint's
+/// fast Montgomery multiply throughout. `base_be` is big-endian, `< m`.
+fn montPowPublic(mp: *const MontParams, base_be: []const u8, e_be: []const u8, out_buf: *[max_modulus_len]u8) []const u8 {
+    comptime var s: usize = mont_min_limbs;
+    inline while (s <= mont_max_limbs) : (s += mont_step) {
+        if (s == mp.L) {
+            const M = montint.Modint(s * 64);
+            const mod = montView(s, mp);
+            const b = beToLimbs(s, base_be);
+            const b_mont = mod.toMontgomery(&b);
+            var acc: M.Elem = mod.one_mont;
+            var seen = false;
+            const eb = stripLeadingZeros(e_be);
+            for (eb) |byte| {
+                var mask: u8 = 0x80;
+                while (mask != 0) : (mask >>= 1) {
+                    if (seen) acc = mod.montSqr(&acc);
+                    if (byte & mask != 0) {
+                        if (seen) {
+                            acc = mod.montMul(&acc, &b_mont);
+                        } else {
+                            acc = b_mont; // first set bit: acc = base^1
+                            seen = true;
+                        }
+                    }
+                }
+            }
+            const r = mod.fromMontgomery(&acc);
+            mod.toBytesBE(&r, out_buf[0..M.encoded_bytes]);
+            return out_buf[0..M.encoded_bytes];
+        }
+    }
+    unreachable;
+}
+
+/// Copy a montint big-endian result (slot-width, `res`) into an RFC-sized `out`
+/// buffer (`out.len` = modulus byte length `k`). `res` is ≥ `k` bytes and its
+/// leading `res.len − k` bytes are zero (the value is `< n`), so this narrows
+/// without loss.
+fn writeMontResult(out: []u8, res: []const u8) void {
+    std.debug.assert(res.len >= out.len);
+    @memcpy(out, res[res.len - out.len ..]);
+}
+
 /// RSA public key: modulus `n` and public exponent `e` (RFC 8017 §3.1).
 pub const PublicKey = struct {
     n: Modulus,
     e: Fe,
+    /// Precomputed montint modulus + Montgomery constants for `n` (public op).
+    n_mont: MontParams,
 
     pub const FromBytesError = error{InvalidPublicKey};
 
@@ -130,7 +326,7 @@ pub const PublicKey = struct {
         const e_v = e.toPrimitive(u32) catch return error.InvalidPublicKey;
         if (e_v < 3) return error.InvalidPublicKey;
 
-        return .{ .n = n, .e = e };
+        return .{ .n = n, .e = e, .n_mont = montParamsFromModulus(n) };
     }
 
     pub const FromDerError = error{InvalidDer};
@@ -177,6 +373,12 @@ pub const SecretKey = struct {
     dq: Fe,
     /// qInv = q⁻¹ mod p — CRT coefficient.
     qinv: Fe,
+    /// Precomputed montint constants for `n` (non-CRT private op `c^d mod n`).
+    n_mont: MontParams,
+    /// Precomputed montint constants for `p` (CRT half `c^dP mod p`).
+    p_mont: MontParams,
+    /// Precomputed montint constants for `q` (CRT half `c^dQ mod q`).
+    q_mont: MontParams,
 
     pub const FromPrimesError = error{InvalidPrivateKey};
 
@@ -389,6 +591,9 @@ fn fromPrimesImpl(p_bytes: []const u8, q_bytes: []const u8, e_bytes: []const u8)
         .dp = dp,
         .dq = dq,
         .qinv = qinv,
+        .n_mont = montParamsFromModulus(n),
+        .p_mont = montParamsFromModulus(p),
+        .q_mont = montParamsFromModulus(q),
     };
 }
 
@@ -424,26 +629,59 @@ fn reduceWide(m: Modulus, x: Uint) Fe {
 
 fn publicOp(pk: PublicKey, in: []const u8, out: []u8) PrimitiveError!void {
     const m = Fe.fromBytes(pk.n, in, .big) catch return error.MessageRepresentativeOutOfRange;
-    // Public exponent -> variable-time powPublic is fine; e is validated
-    // non-zero at key construction time.
-    const c = pk.n.powPublic(m, pk.e) catch unreachable;
-    c.toBytes(out, .big) catch unreachable; // c < n and out.len == byteLen(n)
+    // Public exponent -> variable-time square-and-multiply on montint's fast
+    // Montgomery multiply (e is public, small — see `montPowPublic`). `e` is
+    // validated non-zero, odd, >= 3 at key construction time.
+    var mb: [max_modulus_len]u8 = undefined;
+    m.toBytes(&mb, .big) catch unreachable;
+    var eb: [max_modulus_len]u8 = undefined;
+    pk.e.toBytes(&eb, .big) catch unreachable;
+    var ob: [max_modulus_len]u8 = undefined;
+    const res = montPowPublic(&pk.n_mont, &mb, &eb, &ob);
+    writeMontResult(out, res); // out.len == byteLen(n); res is < n
 }
 
 fn privateOp(sk: SecretKey, in: []const u8, out: []u8) PrimitiveError!void {
     const c = Fe.fromBytes(sk.n, in, .big) catch return error.MessageRepresentativeOutOfRange;
-    // Secret exponent -> constant-time pow; d is validated non-zero by
-    // `fromPrimes`.
-    const m = sk.n.pow(c, sk.d) catch unreachable;
-    m.toBytes(out, .big) catch unreachable;
+    // Secret exponent -> constant-time montint modexp; d is validated non-zero
+    // by `fromPrimes`. (Non-CRT form; `rsadpCrt` is the fast default path.)
+    var cb: [max_modulus_len]u8 = undefined;
+    c.toBytes(&cb, .big) catch unreachable;
+    var db: [max_modulus_len]u8 = undefined;
+    sk.d.toBytes(&db, .big) catch unreachable;
+    var ob: [max_modulus_len]u8 = undefined;
+    const res = montPowSecret(&sk.n_mont, &cb, &db, &ob);
+    writeMontResult(out, res);
 }
 
 fn privateOpCrt(sk: SecretKey, in: []const u8, out: []u8) PrimitiveError!void {
     const c = Fe.fromBytes(sk.n, in, .big) catch return error.MessageRepresentativeOutOfRange;
     // RFC 8017 §5.1.2 form (2), two-prime case:
     //   m1 = c^dP mod p, m2 = c^dQ mod q
-    const m1 = sk.p.pow(reduceWide(sk.p, c.v), sk.dp) catch unreachable;
-    const m2 = sk.q.pow(reduceWide(sk.q, c.v), sk.dq) catch unreachable;
+    // The two half-width modexps are the hot path — routed through montint
+    // (constant-time in the secret exponent). Reduction of `c` into the mod-p /
+    // mod-q domains stays in `ff` (constant-time), as does the Garner
+    // recombination below; only the exponentiation moved.
+    // SECURITY: no base blinding / CRT fault-check here — see the module doc
+    // comment and `~/CML/audit/modules/rsa.md` (F2/F3), a separate follow-up.
+    const cp = reduceWide(sk.p, c.v);
+    var cpb: [max_modulus_len]u8 = undefined;
+    cp.toBytes(&cpb, .big) catch unreachable;
+    var dpb: [max_modulus_len]u8 = undefined;
+    sk.dp.toBytes(&dpb, .big) catch unreachable;
+    var m1_buf: [max_modulus_len]u8 = undefined;
+    const m1_be = montPowSecret(&sk.p_mont, &cpb, &dpb, &m1_buf);
+    const m1 = Fe.fromBytes(sk.p, m1_be, .big) catch unreachable; // m1 < p
+
+    const cq = reduceWide(sk.q, c.v);
+    var cqb: [max_modulus_len]u8 = undefined;
+    cq.toBytes(&cqb, .big) catch unreachable;
+    var dqb: [max_modulus_len]u8 = undefined;
+    sk.dq.toBytes(&dqb, .big) catch unreachable;
+    var m2_buf: [max_modulus_len]u8 = undefined;
+    const m2_be = montPowSecret(&sk.q_mont, &cqb, &dqb, &m2_buf);
+    const m2 = Fe.fromBytes(sk.q, m2_be, .big) catch unreachable; // m2 < q
+
     //   h = (m1 - m2) * qInv mod p    (m2 reduced into mod-p domain first)
     const h = sk.p.mul(sk.qinv, sk.p.sub(m1, reduceWide(sk.p, m2.v)));
     //   m = m2 + q*h — the true integer value is < n (m2 < q, h <= p-1), so
@@ -2122,7 +2360,7 @@ test "fromPrimes rejects invalid inputs" {
 
 test "rsaep/rsadp/rsadpCrt textbook KAT and round-trip" {
     const sk = try SecretKey.fromPrimes(&.{61}, &.{53}, &.{17});
-    const pk = PublicKey{ .n = sk.n, .e = try Fe.fromPrimitive(u32, sk.n, 17) };
+    const pk = PublicKey{ .n = sk.n, .e = try Fe.fromPrimitive(u32, sk.n, 17), .n_mont = sk.n_mont };
 
     // 65^17 mod 3233 = 2790 (0x0ae6)
     const c = try rsaep(2, .{ 0x00, 0x41 }, pk);
@@ -2141,7 +2379,7 @@ test "rsaep/rsadp/rsadpCrt textbook KAT and round-trip" {
 
 test "primitives reject representative >= n" {
     const sk = try SecretKey.fromPrimes(&.{61}, &.{53}, &.{17});
-    const pk = PublicKey{ .n = sk.n, .e = try Fe.fromPrimitive(u32, sk.n, 17) };
+    const pk = PublicKey{ .n = sk.n, .e = try Fe.fromPrimitive(u32, sk.n, 17), .n_mont = sk.n_mont };
     // n = 3233 = 0x0ca1
     try testing.expectError(error.MessageRepresentativeOutOfRange, rsaep(2, .{ 0x0c, 0xa1 }, pk));
     try testing.expectError(error.MessageRepresentativeOutOfRange, rsadp(2, .{ 0xff, 0xff }, sk));
@@ -3398,7 +3636,7 @@ const openssh_fixture_cbc =
 
 test "fromOpenSSH: unencrypted key parses, signs and verifies (P1 round-trip)" {
     const sk = try fromOpenSSH(openssh_fixture_plain, "");
-    const pk = PublicKey{ .n = sk.n, .e = try Fe.fromPrimitive(u32, sk.n, 65537) };
+    const pk = PublicKey{ .n = sk.n, .e = try Fe.fromPrimitive(u32, sk.n, 65537), .n_mont = sk.n_mont };
     const msg = "zig-libs rsa: P4b openssh fixture";
     var sig_buf: [max_modulus_len]u8 = undefined;
     const sig = try signPkcs1v15(sk, std.crypto.hash.sha2.Sha256, msg, &sig_buf);
@@ -3531,4 +3769,120 @@ test "fromOpenSSH: rejects checkint mismatch and non-RSA key types" {
         _ = b.raw("openssh-key-v1\x00").str("none").str("none").str("").int(1).str("").str(priv.buf[0..priv.len]);
         try testing.expectError(error.UnsupportedKeyType, fromOpenSSH(b.pem(&pem_buf), ""));
     }
+}
+
+// ── opt-in micro-benchmark: montint vs the old std.crypto.ff modexp path ─────
+//
+// The pilot deliverable of the montint rewire (see the module doc comment).
+// Off by default; opt in with:
+//
+//   RSA_BENCH=1 zig build test-rsa -Doptimize=ReleaseFast
+//
+// For rsa-2048 and rsa-4096 it times, on the SAME freshly generated key and
+// host: CRT sign and public verify on BOTH the NEW montint path (the shipped
+// `rsasp1`/`rsavp1`) and the OLD `std.crypto.ff` path (the exact pre-rewire
+// arithmetic, replicated inline here from git history) — so the before/after is
+// a same-session, same-key A/B on nothing but the arithmetic backend. The
+// OpenSSL reference column is produced separately (`openssl speed rsaNNNN`).
+// Numbers are noisy on a mobile CPU (turbo/thermal); read them as ratios.
+
+fn benchNowNs() u64 {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
+
+// The OLD ff CRT private op (pre-rewire `privateOpCrt`), kept here verbatim as
+// the "before" reference. Constant-time via ff, identical math to the new path.
+fn ffPrivateOpCrt(sk: SecretKey, in: []const u8, out: []u8) void {
+    const c = Fe.fromBytes(sk.n, in, .big) catch unreachable;
+    const m1 = sk.p.pow(reduceWide(sk.p, c.v), sk.dp) catch unreachable;
+    const m2 = sk.q.pow(reduceWide(sk.q, c.v), sk.dq) catch unreachable;
+    const h = sk.p.mul(sk.qinv, sk.p.sub(m1, reduceWide(sk.p, m2.v)));
+    const m2_n = reduceWide(sk.n, m2.v);
+    const q_n = reduceWide(sk.n, sk.q.v);
+    const h_n = reduceWide(sk.n, h.v);
+    const m = sk.n.add(m2_n, sk.n.mul(q_n, h_n));
+    m.toBytes(out, .big) catch unreachable;
+}
+
+fn benchRsa(comptime bits: usize, random: std.Random) void {
+    const klen = bits / 8;
+    const kp = generate(random, bits, 65537) catch {
+        std.debug.print("rsa-{d}: keygen failed\n", .{bits});
+        return;
+    };
+    const sk = kp.secret_key;
+    const pk = kp.public_key;
+
+    // A message representative < n: top byte 0 guarantees it (generated n has
+    // its top bit set, so value < 2^(bits-8) < n).
+    var msg: [klen]u8 = undefined;
+    for (&msg) |*b| b.* = random.int(u8);
+    msg[0] = 0;
+
+    const sign_iters: usize = if (bits >= 4096) 40 else 200;
+    const verify_iters: usize = if (bits >= 4096) 1_000 else 3_000;
+    var sink: u64 = 0;
+
+    // sign — NEW (montint)
+    var sig: [klen]u8 = undefined;
+    {
+        const t0 = benchNowNs();
+        var i: usize = 0;
+        while (i < sign_iters) : (i += 1) {
+            sig = rsasp1(klen, msg, sk) catch unreachable;
+            sink ^= sig[klen - 1];
+        }
+        const dt = benchNowNs() - t0;
+        std.debug.print("rsa-{d} sign   montint : {d:>10} ns/op\n", .{ bits, dt / sign_iters });
+    }
+    // sign — OLD (ff)
+    {
+        var out: [klen]u8 = undefined;
+        const t0 = benchNowNs();
+        var i: usize = 0;
+        while (i < sign_iters) : (i += 1) {
+            ffPrivateOpCrt(sk, &msg, &out);
+            sink ^= out[klen - 1];
+        }
+        const dt = benchNowNs() - t0;
+        std.debug.print("rsa-{d} sign   ff      : {d:>10} ns/op\n", .{ bits, dt / sign_iters });
+    }
+    // verify — NEW (montint)
+    {
+        const t0 = benchNowNs();
+        var i: usize = 0;
+        while (i < verify_iters) : (i += 1) {
+            const v = rsavp1(klen, sig, pk) catch unreachable;
+            sink ^= v[klen - 1];
+        }
+        const dt = benchNowNs() - t0;
+        std.debug.print("rsa-{d} verify montint : {d:>10} ns/op\n", .{ bits, dt / verify_iters });
+    }
+    // verify — OLD (ff)
+    {
+        const t0 = benchNowNs();
+        var i: usize = 0;
+        while (i < verify_iters) : (i += 1) {
+            const m = Fe.fromBytes(pk.n, &sig, .big) catch unreachable;
+            const c = pk.n.powPublic(m, pk.e) catch unreachable;
+            var vb: [klen]u8 = undefined;
+            c.toBytes(&vb, .big) catch unreachable;
+            sink ^= vb[klen - 1];
+        }
+        const dt = benchNowNs() - t0;
+        std.debug.print("rsa-{d} verify ff      : {d:>10} ns/op\n", .{ bits, dt / verify_iters });
+    }
+    std.mem.doNotOptimizeAway(sink);
+    std.debug.print("\n", .{});
+}
+
+test "bench: montint vs ff (opt-in via RSA_BENCH)" {
+    if (std.testing.environ.getPosix("RSA_BENCH") == null) return error.SkipZigTest;
+    var prng = std.Random.DefaultPrng.init(0x5A17_C0DE_F00D);
+    const random = prng.random();
+    std.debug.print("\n=== rsa modexp bench: montint vs std.crypto.ff (same key/host) ===\n", .{});
+    benchRsa(2048, random);
+    benchRsa(4096, random);
 }
