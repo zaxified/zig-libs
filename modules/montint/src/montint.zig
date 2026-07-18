@@ -61,6 +61,14 @@ pub fn Modint(comptime max_bits: comptime_int) type {
     return struct {
         const Self = @This();
 
+        /// Error set surfaced by this type's byte-loader constructors
+        /// (`fromBytesBE`/`elementFromBytesBE`). Re-exported from the
+        /// module-level `Error` so `Modint(bits).Error` resolves — the free
+        /// `elemFromBytesBE` helper refers to it as `M.Error`, and without
+        /// this alias those public loaders do not compile when instantiated
+        /// (a latent bug: montint's own tests never exercised them).
+        pub const Error = @import("montint.zig").Error;
+
         /// Number of full 2^64 limbs.
         pub const L: usize = (max_bits + 63) / 64;
         /// Byte width of a serialized element.
@@ -81,13 +89,13 @@ pub fn Modint(comptime max_bits: comptime_int) type {
 
         /// Build a modulus from a big-endian byte string. Rejects even moduli,
         /// moduli < 3, and values that do not fit in `max_bits`.
-        pub fn fromBytesBE(bytes: []const u8) Error!Self {
+        pub fn fromBytesBE(bytes: []const u8) Self.Error!Self {
             const v = try elemFromBytesBE(Self, bytes);
             return fromElem(v);
         }
 
         /// Build a modulus from an `L`-limb little-endian value.
-        pub fn fromElem(v: Elem) Error!Self {
+        pub fn fromElem(v: Elem) Self.Error!Self {
             if (v[0] & 1 == 0) return error.EvenModulus;
             // reject < 3 (only limb 0, value 1) — 1 is not a valid modulus.
             var nonzero_high: u64 = 0;
@@ -143,7 +151,7 @@ pub fn Modint(comptime max_bits: comptime_int) type {
         // ── domain conversion ───────────────────────────────────────────────
 
         /// Reduce a big-endian byte string into a normal-domain element `< m`.
-        pub fn elementFromBytesBE(self: *const Self, bytes: []const u8) Error!Elem {
+        pub fn elementFromBytesBE(self: *const Self, bytes: []const u8) Self.Error!Elem {
             const v = try elemFromBytesBE(Self, bytes);
             if (limbs.cmp(&v, &self.m) != .lt) return error.NonCanonical;
             return v;
@@ -404,4 +412,31 @@ test "negInvMod2_64: m·(-m⁻¹) ≡ -1 mod 2^64" {
         const ni = negInvMod2_64(m);
         try std.testing.expectEqual(@as(u64, 0), m *% ni +% 1);
     }
+}
+
+test "public byte loaders instantiate and round-trip (regression: Modint.Error alias)" {
+    // Instantiating `fromBytesBE`/`elementFromBytesBE` forces `M.Error` to
+    // resolve; before the `Modint.Error` alias was added these did not compile
+    // at all (montint's other tests build moduli via `fromElem`, never the
+    // byte loaders, so the missing alias was latent). This test both pins the
+    // fix and checks the loaders' arithmetic against `elemFromBytesBE`.
+    const M = Modint(256);
+    // Odd 128-bit-ish modulus with a nonzero high limb (spans >1 limb).
+    const m_be = [_]u8{ 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 };
+    const mod: M.Error!M = M.fromBytesBE(&m_be);
+    const modulus = try mod;
+
+    // A reduced element loaded from bytes; must equal the branch-clean loader
+    // and survive a Montgomery round trip.
+    const a_be = [_]u8{ 0xde, 0xad, 0xbe, 0xef, 0x00, 0x11, 0x22, 0x33 };
+    const a: M.Error!M.Elem = modulus.elementFromBytesBE(&a_be);
+    const a_elem = try a;
+    const a_mont = modulus.toMontgomery(&a_elem);
+    const a_back = modulus.fromMontgomery(&a_mont);
+    try std.testing.expect(std.mem.eql(u64, &a_elem, &a_back));
+
+    // The byte loaders' error set must reject an even modulus.
+    try std.testing.expectError(error.EvenModulus, M.fromBytesBE(&[_]u8{0x02}));
+    // A value >= m is non-canonical.
+    try std.testing.expectError(error.NonCanonical, modulus.elementFromBytesBE(&m_be));
 }
