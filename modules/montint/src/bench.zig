@@ -69,6 +69,20 @@ fn benchSize(comptime bits: comptime_int, rand: std.Random) void {
         std.mem.doNotOptimizeAway(sink);
         std.debug.print("montint-PORT modmul {d:>5}-bit: {d:>8} ns/op\n", .{ bits, dt / mul_iters });
     }
+    // ── montint modsqr: portable dedicated square (montSqrCios) ──
+    {
+        var sink: u64 = 0;
+        var z = am;
+        const t0 = nowNs();
+        var i: usize = 0;
+        while (i < mul_iters) : (i += 1) {
+            z = m.montSqrCios(&z);
+            sink ^= z[0];
+        }
+        const dt = nowNs() - t0;
+        std.mem.doNotOptimizeAway(sink);
+        std.debug.print("montint-PORT modsqr {d:>5}-bit: {d:>8} ns/op\n", .{ bits, dt / mul_iters });
+    }
     // ── montint modmul: asm ──
     if (asm_core.supported) {
         var sink: u64 = 0;

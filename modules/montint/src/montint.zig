@@ -52,6 +52,20 @@ pub const asm_active = asm_core.supported and gate.asm_core_implemented;
 /// it) — this is purely a speed dispatch.
 pub const asm_min_limbs: usize = 32;
 
+/// Small-L cutoff for the *portable dedicated square* (`montSqrCios`). The
+/// square saves ~½L² limb products vs a general multiply, but the SOS structure
+/// (a full 2L-word product buffer swept once more for the Montgomery reduce)
+/// carries a fixed per-op overhead that, at very small L, cancels the product
+/// saving. Measured on this repo's host (Kaby Lake, ReleaseFast): the portable
+/// square is ~1.20× faster than the portable multiply at L=8, ~1.15× at L=16,
+/// ~1.23× at L=32/64 — but a hair SLOWER at L=4. So the dedicated square is used
+/// only at `L >= sqr_min_limbs`; smaller moduli (incl. the pairing-field sizes
+/// `bn254` L=4 / `bls12_381` L=6, and any other tiny modulus) keep squaring via
+/// the general `montMulCios`, guaranteeing no regression. Like `asm_min_limbs`
+/// this is a pure speed dispatch — `montSqrCios` is correct at every L (the
+/// squaring differential proves it against `montMulCios(a,a)`).
+pub const sqr_min_limbs: usize = 8;
+
 /// A modulus + its Montgomery constants, parameterized by an upper bound on the
 /// modulus bit-width. `L = ceil(max_bits/64)` full 2^64 limbs; the modulus
 /// occupies exactly `L` limbs (leading zero limbs are allowed as long as the
@@ -236,10 +250,122 @@ pub fn Modint(comptime max_bits: comptime_int) type {
             return asm_active and L >= asm_min_limbs;
         }
 
-        /// Montgomery squaring `a²·R⁻¹ mod m`. Portable path reuses `montMul`;
-        /// a dedicated asm squaring is an optional future core.
+        /// Montgomery squaring `z = a²·R⁻¹ mod m`. A dedicated square is ~1.5×
+        /// cheaper than a general multiply because the cross-product half
+        /// `a[i]·a[j]` (i<j) is computed once and doubled instead of twice.
+        ///
+        /// Dispatch mirrors `montMul` but with the extra rule that a *portable*
+        /// dedicated square only beats the **asm** general multiply below the
+        /// small-L cutoff — at `L >= asm_min_limbs` the asm `montMul` is faster
+        /// than a portable square, so we fall back to it there (a dedicated asm
+        /// square is a separate future core; see SPEC "Deferred"). Concretely:
+        ///   * `L >= asm_min_limbs` with the asm core active → asm `montMul(a,a)`
+        ///     (on amd64 the asm multiply still beats a *portable* square at
+        ///     these sizes; aliasing `a==b` is supported). Covers rsa-4096,
+        ///     paillier, vdf, threshold_ecdsa on amd64.
+        ///   * else `L >= sqr_min_limbs` → portable `montSqrCios`, the dedicated
+        ///     square (the guaranteed win: rsa-2048 CRT at L=16, and every
+        ///     `L >= asm_min_limbs` modulus on non-amd64 targets / OpenWRT).
+        ///   * else (tiny L, incl. the pairing-field sizes) → `montMulCios(a,a)`,
+        ///     where the general multiply is as fast or faster.
         pub fn montSqr(self: *const Self, a: *const Elem) Elem {
-            return self.montMul(a, a);
+            if (comptime asm_active and L >= asm_min_limbs) {
+                var z: Elem = undefined;
+                asm_core.montMul(&z, a, a, &self.m, self.n0inv);
+                return z;
+            }
+            if (comptime L >= sqr_min_limbs) return self.montSqrCios(a);
+            return self.montMulCios(a, a);
+        }
+
+        /// The PORTABLE constant-time dedicated Montgomery squaring — the
+        /// square-optimized analogue of `montMulCios`, and its differential
+        /// oracle is `montMulCios(a, a)` (proven correct there).
+        ///
+        /// Structure (SOS: separated square, then Montgomery-reduce):
+        ///   1. **Cross products** — `A = Σ_{i<j} a[i]·a[j]·B^(i+j)` (each
+        ///      off-diagonal product computed ONCE; this is the ~½L² saving).
+        ///   2. **Double** — `A ← 2·A` (a 1-bit left shift over all 2L words;
+        ///      `2·cross < B^(2L)` so no word overflows out the top).
+        ///   3. **Diagonal** — `A ← A + Σ_i a[i]²·B^(2i)`, giving `A = a²` in
+        ///      full 2L-word form.
+        ///   4. **Montgomery reduce** — `z = A·R⁻¹ mod m` via the word-serial
+        ///      REDC, with the per-word carry threaded through a single scalar
+        ///      `cc` (the carry out of column `i+L` at step `i` is exactly the
+        ///      carry *into* column `(i+1)+L` at step `i+1`, so it needs no
+        ///      variable-length ripple — keeping the reduction constant-time).
+        ///
+        /// Constant-time: every loop bound is the PUBLIC limb count `L`; the
+        /// symmetry (which products are halved) is structural, not
+        /// value-dependent; the final reduction is the same masked `condSubTop`.
+        /// No secret-dependent branch, index, or early exit.
+        pub fn montSqrCios(self: *const Self, a: *const Elem) Elem {
+            const m = &self.m;
+            // A holds the full 2L-word square across all four phases.
+            var A = [_]u64{0} ** (2 * L);
+
+            // ── 1. cross products: A = Σ_{i<j} a[i]·a[j]·B^(i+j) ──
+            var i: usize = 0;
+            while (i < L) : (i += 1) {
+                var carry: u64 = 0;
+                var j: usize = i + 1;
+                while (j < L) : (j += 1) {
+                    const p = @as(u128, a[i]) * @as(u128, a[j]) + A[i + j] + carry;
+                    A[i + j] = @truncate(p);
+                    carry = @truncate(p >> 64);
+                }
+                // A[i+L] is still 0 here (nothing has reached it); for i=L-1 the
+                // inner loop is empty and carry is 0.
+                A[i + L] = carry;
+            }
+
+            // ── 2. double: A ← 2·A ──
+            var top: u64 = 0;
+            for (&A) |*w| {
+                const nw = (w.* << 1) | top;
+                top = w.* >> 63;
+                w.* = nw;
+            }
+            // top == 0: 2·cross < B^(2L) because cross < B^(2L-1).
+
+            // ── 3. diagonal: A ← A + Σ_i a[i]²·B^(2i) ──
+            var dcarry: u64 = 0;
+            i = 0;
+            while (i < L) : (i += 1) {
+                const sq = @as(u128, a[i]) * @as(u128, a[i]);
+                const p1 = @as(u128, A[2 * i]) + @as(u64, @truncate(sq)) + dcarry;
+                A[2 * i] = @truncate(p1);
+                const p2 = @as(u128, A[2 * i + 1]) + @as(u64, @truncate(sq >> 64)) + @as(u64, @truncate(p1 >> 64));
+                A[2 * i + 1] = @truncate(p2);
+                dcarry = @truncate(p2 >> 64); // ≤ 1; flows to A[2(i+1)] next round
+            }
+            // dcarry == 0 here: a² < B^(2L) fits exactly in 2L words.
+
+            // ── 4. Montgomery reduce: z = A·R⁻¹ mod m ──
+            var cc: u64 = 0; // carry into column i+L, carried between steps
+            i = 0;
+            while (i < L) : (i += 1) {
+                const u = A[i] *% self.n0inv;
+                var carry: u64 = 0;
+                var j: usize = 0;
+                while (j < L) : (j += 1) {
+                    const p = @as(u128, u) * @as(u128, m[j]) + A[i + j] + carry;
+                    A[i + j] = @truncate(p);
+                    carry = @truncate(p >> 64);
+                }
+                // Column i+L collects the inner-loop carry plus the pending cc
+                // from step i-1 (which is precisely the carry out of column
+                // (i-1)+L = i+L-1). The carry out here (0/1) becomes the next
+                // step's cc, added at column (i+1)+L — no variable ripple.
+                const s = @as(u128, A[i + L]) + carry + cc;
+                A[i + L] = @truncate(s);
+                cc = @truncate(s >> 64);
+            }
+            // result = A[L..2L] with top word cc (0/1 since A = a² < R·m).
+            var z: Elem = undefined;
+            @memcpy(&z, A[L .. 2 * L]);
+            condSubTop(&z, cc, m);
+            return z;
         }
 
         /// The PORTABLE constant-time CIOS Montgomery multiply — the oracle.

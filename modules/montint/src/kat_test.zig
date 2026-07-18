@@ -115,6 +115,135 @@ fn randBelow(comptime M: type, rand: std.Random, m: *const M.Elem) M.Elem {
     return v;
 }
 
+// ── 2b. squaring differential: montSqrCios == montMulCios(a,a) (the anchor) ──
+//
+// The dedicated portable square is anchored to the already-proven general
+// multiply on the SAME operand: for thousands of random `a` across every limb
+// count it must equal `montMulCios(a, a)` bit-for-bit, in Debug AND ReleaseFast.
+// `montMulCios` is byte-exact vs the external CPython oracle (family 1), so this
+// transitively pins the square to the external oracle without a second KAT set.
+
+fn sqrDifferentialAtN(comptime bits: comptime_int, trials: usize, seed: u64) !void {
+    const M = Modint(bits);
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rand = prng.random();
+    var t: usize = 0;
+    while (t < trials) : (t += 1) {
+        // odd modulus, top bit set ⇒ any L-limb value is < 2m.
+        var mv: M.Elem = undefined;
+        for (&mv) |*w| w.* = rand.int(u64);
+        mv[0] |= 1;
+        mv[M.L - 1] |= 1 << 63;
+        const m = try M.fromElem(mv);
+
+        const a = randBelow(M, rand, &mv);
+        const want = m.montMulCios(&a, &a); // proven-vs-oracle general multiply
+        const got = m.montSqrCios(&a); // dedicated square under test
+        try std.testing.expectEqualSlices(u64, &want, &got);
+
+        // Also exercise the public `montSqr` dispatch: for L < asm_min_limbs it
+        // routes to `montSqrCios`; for L ≥ it routes to asm `montMul(a,a)`.
+        // Either way it must still equal the oracle square.
+        const gotpub = m.montSqr(&a);
+        try std.testing.expectEqualSlices(u64, &want, &gotpub);
+    }
+}
+
+test "squaring differential: montSqrCios == montMulCios(a,a) across ALL limb counts" {
+    // n ∈ {1,2,3,4,5,8,16,17,32,33,64} via bit widths; small n get more trials.
+    try sqrDifferentialAtN(64, 4000, 0x5A11_0001); // L=1
+    try sqrDifferentialAtN(128, 4000, 0x5A11_0002); // L=2
+    try sqrDifferentialAtN(192, 4000, 0x5A11_0003); // L=3
+    try sqrDifferentialAtN(256, 4000, 0x5A11_0004); // L=4
+    try sqrDifferentialAtN(320, 3000, 0x5A11_0005); // L=5
+    try sqrDifferentialAtN(512, 3000, 0x5A11_0008); // L=8
+    try sqrDifferentialAtN(1024, 1500, 0x5A11_0010); // L=16 (rsa-2048 CRT half)
+    try sqrDifferentialAtN(1088, 1500, 0x5A11_0011); // L=17 (odd, > karatsuba thr)
+    try sqrDifferentialAtN(2048, 800, 0x5A11_0020); // L=32 (asm-dispatch boundary)
+    try sqrDifferentialAtN(2112, 800, 0x5A11_0021); // L=33
+    try sqrDifferentialAtN(4096, 300, 0x5A11_0040); // L=64
+}
+
+// Positive control for the SQUARE: a deliberately-wrong square (drops the
+// diagonal `a[i]²` term) must DISAGREE with `montMulCios(a,a)`, proving the
+// differential above has teeth — a silently-passing square is caught here.
+fn brokenSqrNoDiagonal(comptime M: type, self: *const M, a: *const M.Elem) M.Elem {
+    const L = M.L;
+    const m = &self.m;
+    var A = [_]u64{0} ** (2 * L);
+    // cross products (correct)
+    var i: usize = 0;
+    while (i < L) : (i += 1) {
+        var carry: u64 = 0;
+        var j: usize = i + 1;
+        while (j < L) : (j += 1) {
+            const p = @as(u128, a[i]) * @as(u128, a[j]) + A[i + j] + carry;
+            A[i + j] = @truncate(p);
+            carry = @truncate(p >> 64);
+        }
+        A[i + L] = carry;
+    }
+    // double (correct)
+    var top: u64 = 0;
+    for (&A) |*w| {
+        const nw = (w.* << 1) | top;
+        top = w.* >> 63;
+        w.* = nw;
+    }
+    // DIAGONAL DELIBERATELY OMITTED (the bug).
+    // reduction (correct)
+    var cc: u64 = 0;
+    i = 0;
+    while (i < L) : (i += 1) {
+        const u = A[i] *% self.n0inv;
+        var carry: u64 = 0;
+        var j: usize = 0;
+        while (j < L) : (j += 1) {
+            const p = @as(u128, u) * @as(u128, m[j]) + A[i + j] + carry;
+            A[i + j] = @truncate(p);
+            carry = @truncate(p >> 64);
+        }
+        const s = @as(u128, A[i + L]) + carry + cc;
+        A[i + L] = @truncate(s);
+        cc = @truncate(s >> 64);
+    }
+    var z: M.Elem = undefined;
+    @memcpy(&z, A[L .. 2 * L]);
+    // reduce with the same masked helper the real path uses (via a full sub loop)
+    var borrow: u1 = 0;
+    var diff = z;
+    for (&diff, m) |*d, mi| {
+        const s = @subWithOverflow(d.*, mi);
+        const s2 = @subWithOverflow(s[0], borrow);
+        d.* = s2[0];
+        borrow = s[1] | s2[1];
+    }
+    const under = @subWithOverflow(cc, @as(u64, borrow))[1];
+    if (under == 0) z = diff;
+    return z;
+}
+
+test "positive control: a square missing the diagonal term is caught (teeth)" {
+    const M = Modint(512);
+    var prng = std.Random.DefaultPrng.init(0x5A11_DEAD);
+    const rand = prng.random();
+    var disagreements: usize = 0;
+    var trials: usize = 0;
+    while (trials < 400) : (trials += 1) {
+        var mv: M.Elem = undefined;
+        for (&mv) |*w| w.* = rand.int(u64);
+        mv[0] |= 1;
+        mv[M.L - 1] |= 1 << 63;
+        const m = try M.fromElem(mv);
+        const a = randBelow(M, rand, &mv);
+        const good = m.montSqrCios(&a);
+        const broken = brokenSqrNoDiagonal(M, &m, &a);
+        if (!std.mem.eql(u64, &good, &broken)) disagreements += 1;
+    }
+    // teeth: dropping the diagonal MUST be observable.
+    try std.testing.expect(disagreements > 0);
+}
+
 // ── 3. positive control: BrokenMont (drops the final conditional subtract) ───
 
 // A byte-for-byte copy of the portable CIOS with the reducing subtract removed.

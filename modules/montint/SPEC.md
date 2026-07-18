@@ -224,11 +224,35 @@ speed dispatch, not a correctness bound.
 - **No base blinding / fault countermeasures.** This is a modular-arithmetic
   primitive, not a signing scheme; blinding (rsa F2) and CRT fault-checks
   (rsa F3) are the consumer's responsibility, layered on top.
-- **Deferred:** a dedicated asm **squaring** (today `montSqr` reuses `montMul`),
-  the large-size SOS+Karatsuba modmul path, tuning the small-L cutoff per-µarch
-  (it is a single host measurement), and a possible dynamic-limb-count modulus
-  (today `L` is fixed by `max_bits`; a small modulus in a wide `Modint` wastes
-  work).
+- **Portable dedicated squaring — DONE; dedicated ASM squaring — deferred.** A
+  portable constant-time dedicated Montgomery square (`montSqrCios`, SOS: the
+  symmetric `a[i]·a[j]` off-diagonal products computed once and doubled, plus
+  the diagonal squares, then a Montgomery reduce) now backs `montSqr`/`powMont`
+  for `sqr_min_limbs ≤ L < asm_min_limbs` **and** all `L` on non-amd64 targets.
+  It is ~1.15–1.23× faster than the portable multiply (L=8…64 on this host) and
+  speeds up **rsa-2048 CRT sign** (L=16 primary amd64 case) and every
+  large-modulus op on non-amd64/OpenWRT. A dedicated **asm** square (MULX/ADCX/
+  ADOX with the doubling+diagonal structure) is still deferred: on amd64 at
+  `L ≥ asm_min_limbs` the existing asm `montMul(a,a)` still beats a *portable*
+  square, so those sizes (rsa-4096, paillier, vdf, threshold_ecdsa) route to it
+  unchanged. The remaining win there requires the asm square — the classic
+  pitfall is carry propagation through the `×2` and the diagonal add; it is NOT
+  shipped because it was not proven bit-exact within this change and a wrong CT
+  square in the RSA hot path is unacceptable. Follow-up scope: reuse the
+  `ciosIter` register plan for the reduction row + a new symmetric-product row
+  that doubles off-diagonal partials, oracle = `montSqrCios`.
+- **Deferred:** the dedicated asm squaring (above), the large-size SOS+Karatsuba
+  modmul path, tuning the small-L cutoffs per-µarch (`asm_min_limbs`/
+  `sqr_min_limbs` are single-host measurements), and a possible
+  dynamic-limb-count modulus (today `L` is fixed by `max_bits`; a small modulus
+  in a wide `Modint` wastes work). Consumer note: `rsa`/`paillier`/
+  `threshold_ecdsa` and vdf's Montgomery-resident `prove`/`verify` all call
+  `montint`'s `montSqr`/`powMont`, so they inherit this change automatically (no
+  consumer edit) — the win lands wherever the dispatch picks a portable square
+  (rsa-2048 CRT L=16 on amd64; all L on non-amd64). vdf's `eval` hot loop is the
+  exception: `group.square` there still calls `std.crypto.ff` directly, so it
+  does NOT benefit — migrating that loop to a `montint` Montgomery-resident
+  square is a separate small vdf-side follow-up.
 
 ## Provenance
 
