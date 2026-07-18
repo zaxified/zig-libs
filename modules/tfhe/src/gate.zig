@@ -34,4 +34,4 @@
 //! (a skip is NOT a green light) — the same convention as `bfv`/`fss`/`coconut`.
 
 /// The genuine Fable core: externalProduct / cmux / blindRotate / bootstrap.
-pub const fable_core_implemented = false;
+pub const fable_core_implemented = true;

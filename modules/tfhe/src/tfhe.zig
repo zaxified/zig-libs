@@ -365,44 +365,79 @@ pub fn Tfhe(comptime P: params.Params) type {
         /// GGSW ⊠ GLWE → GLWE. Decompose `ct` (`decomposeGlwe`), then
         /// `out = Σ_{r=0}^{2ℓ−1} decomp[r] · ggsw.rows[r]` (scalar-poly × GLWE,
         /// accumulated component-wise). Result encrypts `μ_ggsw · plaintext(ct)`
-        /// with controlled noise. **TODO(fable/core).**
+        /// with controlled noise.
+        ///
+        /// Why the plain positive accumulation is correct under THIS module's
+        /// conventions (`b = a·s + μ + e`; block A rows carry `+μ·w_i` in the
+        /// MASK, block B rows `+μ·w_i` in the BODY; `decomposeGlwe` returns mask
+        /// digits in `[0,ℓ)`, body digits in `[ℓ,2ℓ)`):
+        ///
+        ///   phase(out) = Σ_r d_r·phase(rows[r])
+        ///              = Σ_i d^a_i·(e_i − μ·w_i·s) + Σ_i d^b_i·(μ·w_i + e'_i)
+        ///              ≈ μ·(b − a·s) + Σ_r d_r·e_r  =  μ·phase(ct) + noise
+        ///
+        /// (block A's phase is `e − μ·w·s` because the gadget term sits in the
+        /// mask, so the `−μ·s·a` piece emerges from the rows themselves — no
+        /// extra negation anywhere). The signed digits are two's-complement
+        /// `u32` polynomials, and the wrapping schoolbook `mul` is exact mod
+        /// `2^32`, so signed×torus products need no special handling.
         pub fn externalProduct(ggsw: *const Ggsw, ct: *const Glwe) Glwe {
-            _ = ggsw;
-            _ = ct;
-            @panic("TODO(fable/core): TFHE external product");
+            const d = decomposeGlwe(ct);
+            var out: Glwe = .{ .a = Poly.zero(), .b = Poly.zero() };
+            for (0..2 * ell) |r| {
+                const pa = d[r].mul(&ggsw.rows[r].a);
+                const pb = d[r].mul(&ggsw.rows[r].b);
+                out.a.addAssign(&pa);
+                out.b.addAssign(&pb);
+            }
+            return out;
         }
 
         /// CMux: `out = d0 + C ⊠ (d1 − d0)` — selects `d1` if `C` encrypts 1,
-        /// else `d0`, homomorphically. **TODO(fable/core).**
+        /// else `d0`, homomorphically. With `C = GGSW(c)`, `c ∈ {0,1}`:
+        /// phase(out) ≈ phase(d0) + c·(phase(d1) − phase(d0)).
         pub fn cmux(ctrl: *const Ggsw, d0: *const Glwe, d1: *const Glwe) Glwe {
-            _ = ctrl;
-            _ = d0;
-            _ = d1;
-            @panic("TODO(fable/core): TFHE CMux");
+            const diff = glweSub(d1, d0);
+            const sel = externalProduct(ctrl, &diff);
+            return glweAdd(d0, &sel);
         }
 
         /// Blind rotation: `acc ← trivial(X^{−b̃}·lut)`; for each `i`,
         /// `acc ← CMux(bsk.ggsw[i], acc, X^{ã_i}·acc)`. Returns a GLWE encrypting
         /// `X^{−(b̃ − Σ ã_i s_i)}·lut`. `a_tilde` and `b_tilde` are mod-switched
-        /// into `[0, 2N)`. **TODO(fable/core).**
+        /// into `[0, 2N)`.
+        ///
+        /// Exponent algebra (matches `clearBootstrap` exactly): the initial
+        /// rotation is `X^{−b̃} = X^{2N − b̃}` (negacyclic period `2N`); each
+        /// CMux step multiplies by `X^{+ã_i}` iff `s_i = 1`, so the final
+        /// accumulated exponent is `−b̃ + Σ ã_i·s_i (mod 2N)`. The CMux runs
+        /// unconditionally for every `i` — when `ã_i = 0` the two branches are
+        /// identical (`d1 − d0 = 0` decomposes to all-zero digits, so the
+        /// external product is exactly zero and no branch on data is needed).
         pub fn blindRotate(bsk: *const BootstrapKey, lut: *const Poly, b_tilde: usize, a_tilde: *const [n]usize) Glwe {
-            _ = bsk;
-            _ = lut;
-            _ = b_tilde;
-            _ = a_tilde;
-            @panic("TODO(fable/core): TFHE blind rotation");
+            const neg_b = (two_n - (b_tilde % two_n)) % two_n; // X^{−b̃}
+            const rotated_lut = lut.mulMonomial(neg_b);
+            var acc = glweTrivial(&rotated_lut);
+            for (0..n) |i| {
+                const rot = glweMulMonomial(&acc, a_tilde[i] % two_n); // X^{+ã_i}·acc
+                acc = cmux(&bsk.ggsw[i], &acc, &rot);
+            }
+            return acc;
         }
 
         /// Programmable gate bootstrap: modulus-switch `ct` into `[0,2N)`,
         /// blind-rotate `lut`, sample-extract coefficient 0, and key-switch back
         /// to the small key — yielding a FRESH `LweN` encrypting the LUT of the
-        /// input bit with reset noise. **TODO(fable/core).**
+        /// input bit with reset noise. The blind rotation places
+        /// `(X^{−phasẽ}·lut)_0 = lut(phase(ct))` in coefficient 0, where
+        /// `phasẽ = b̃ − Σ ã_i·s_i` is the mod-switched phase.
         pub fn bootstrap(bsk: *const BootstrapKey, ksk: *const KeySwitchKey, lut: *const Poly, ct: *const LweN) LweN {
-            _ = bsk;
-            _ = ksk;
-            _ = lut;
-            _ = ct;
-            @panic("TODO(fable/core): TFHE gate bootstrap");
+            var a_tilde: [n]usize = undefined;
+            for (&a_tilde, ct.a) |*at, ai| at.* = modSwitchScalar(ai);
+            const b_tilde = modSwitchScalar(ct.b);
+            const acc = blindRotate(bsk, lut, b_tilde, &a_tilde);
+            const big = sampleExtract(&acc);
+            return keySwitch(ksk, &big);
         }
     };
 }
@@ -501,6 +536,6 @@ test "decomposeGlwe recomposes each component within the gadget error bound" {
     }
 }
 
-test "gate flag OFF: the four cores are gated" {
-    try testing.expect(!gate.fable_core_implemented);
+test "gate flag ON: the four cores are implemented" {
+    try testing.expect(gate.fable_core_implemented);
 }
