@@ -164,6 +164,7 @@ const module_list = [_]Module{
     .{ .name = "groth16", .deps = &.{"bn254"} },
     .{ .name = "tfhe" },
     .{ .name = "montint" },
+    .{ .name = "k256" },
     // Scaffold more here (copy modules/_template) — see CONVENTIONS.md
     // "How to add a module" and the README "Roadmap / Non-goals" sections.
 };

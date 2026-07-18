@@ -691,5 +691,24 @@ project git history).
                integers (`(a*b)%m`, `pow(a,e,m)`) — the same black-box oracle
                method the `vdf` module uses (see policy §0) — numerically
                identical to OpenSSL `BN_mod_mul`/`BN_mod_exp`. No source ported.
+  k256       — design ref: bitcoin-core/libsecp256k1 (MIT, Copyright (c) 2013
+               Pieter Wuille et al.) — studied for the technique shape only:
+               the special-prime (Solinas) field reduction for
+               p = 2^256 − 2^32 − 977 (fold the high half by 2^32+977), the GLV
+               endomorphism decomposition, and the amd64 `MULX/ADX` field
+               multiply the gated core mirrors. No source ported. The secp256k1
+               domain parameters (p, n, G, the curve constant b, and the GLV
+               λ/β + lattice basis) are public curve facts; the specific integer
+               constants match `std.crypto.ecc.Secp256k1` (Zig std, MIT), which
+               is ALSO used as the byte-exact correctness oracle (differential
+               tests), not as a design reference — the same black-box-oracle
+               relationship policy §0 describes, recorded here since the
+               provenance of the endomorphism constants is worth pinning. The
+               BIP340 verification/signing follows the public BIP340
+               specification; the module's `kat_vectors.zig` transcribes the
+               official `bip-0340/test-vectors.csv` (a public BIP spec artifact,
+               not copied from any implementation's test suite — a test oracle
+               under policy §0, needing no attribution, recorded here only
+               alongside this module's genuine libsecp256k1 design reference).
 
 See each module's README "Provenance" note for its specific design references.

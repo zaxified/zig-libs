@@ -1,0 +1,73 @@
+// SPDX-License-Identifier: MIT
+
+//! k256 — an asm-accelerated pure-Zig secp256k1, the fast alternative to
+//! `std.crypto.ecc.Secp256k1`.
+//!
+//! std's secp256k1 is portable pure-Zig (fiat-crypto Montgomery field, no asm),
+//! which makes it ~9–14× slower than libsecp256k1 (hand asm + GLV endomorphism +
+//! wNAF). The 8 Bitcoin/Lightning modules in this repo
+//! (bip340/taproot/musig2/adaptor/frost/sphinx/bolt3/bolt8) all ride it. k256 is
+//! our OWN secp256k1 built for speed while keeping the zero-C/no-libc invariant:
+//! the special-prime (Solinas) field reduction, the GLV endomorphism, and an
+//! amd64 `MULX/ADX` field multiply, with a portable fallback everywhere. Target:
+//! ~2–4× libsecp256k1 (parity with decades-tuned asm-grade C isn't expected;
+//! going ~9–14×→~2–4× is the win). See `SPEC.md` for the dedup justification.
+//!
+//! ## Scaffold status (this phase)
+//!
+//! The PORTABLE path is **real, constant-time, and byte-exact vs
+//! `std.crypto.ecc.Secp256k1` + the official BIP340 vectors** — it is the
+//! correctness ORACLE. Two irreducible Fable cores are GATED off
+//! (`gate.field_asm_implemented` / `gate.glv_scalarmul_implemented`), with the
+//! portable path serving in their place, until a Fable agent fills them and the
+//! gated core-vs-portable differentials in `oracle_test.zig` light up. See
+//! `gate.zig`, `fast_core.zig`, `SPEC.md`.
+
+const std = @import("std");
+
+pub const field = @import("field.zig");
+pub const group = @import("group.zig");
+pub const scalar = @import("scalar.zig");
+pub const sign = @import("sign.zig");
+pub const gate = @import("gate.zig");
+pub const fast_core = @import("fast_core.zig");
+
+/// The secp256k1 base field element (over `p = 2^256 − 2^32 − 977`).
+pub const Fe = field.Fe;
+/// A secp256k1 curve point.
+pub const Secp256k1 = group.Secp256k1;
+/// A point in affine coordinates.
+pub const AffineCoordinates = group.AffineCoordinates;
+/// A scalar-field element (mod the group order `n`).
+pub const Scalar = scalar.Scalar;
+
+/// True iff the field multiply/square hot path is running on the gated amd64
+/// `MULX/ADX` core rather than the portable Solinas reduction. `false` in this
+/// scaffold (the core is not yet implemented).
+pub const field_asm_active = field.field_asm_active;
+
+pub const meta = .{
+    .platform = .any, // portable Solinas everywhere; amd64 MULX/ADX is an accel path
+    .role = .util, // pure computation — no I/O
+    .concurrency = .reentrant, // no globals; all values are plain types
+    .model_after = "libsecp256k1 (special-prime reduction + GLV endomorphism + MULX/ADX field asm); std.crypto.ecc.Secp256k1 as the byte-exact correctness oracle",
+    .deps = .{}, // std only
+};
+
+// Pull every submodule's tests into the test binary (CONVENTIONS.md §6
+// dark-tests rule: a bare re-export does NOT pull a file's tests in).
+test {
+    _ = field;
+    _ = group;
+    _ = scalar;
+    _ = sign;
+    _ = @import("kat_vectors.zig");
+    _ = @import("kat_test.zig");
+    _ = @import("oracle_test.zig");
+    _ = @import("bench.zig");
+}
+
+test "meta.model_after names libsecp256k1 and the std oracle" {
+    try std.testing.expect(std.mem.indexOf(u8, meta.model_after, "libsecp256k1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, meta.model_after, "Secp256k1") != null);
+}
