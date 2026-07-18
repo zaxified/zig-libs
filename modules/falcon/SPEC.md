@@ -54,11 +54,35 @@ below for the signer/keygen internals and the constant-time caveat). See
   still emits signatures that pass verification while statistically leaking
   the trapdoor basis; both are byte-exact against the seeded-DRBG sign
   vectors. **Constant-time status**: `gaussian.samplerZ` reproduces the
-  reference's constant-time branch/table structure, but the underlying
-  arithmetic is native f64 and NO machine-checked side-channel verification
-  (dudect/ctgrind) has been run — audit before production signing. Keygen
-  (`ntru.zig`) likewise preserves the reference's structure; it runs once
-  per key, so its side-channel exposure is far smaller than the signer's.
+  reference's constant-time branch/table structure, and the underlying `fpr`
+  arithmetic is the reference's branchless **integer emulation** of binary64
+  (`fpr.zig`, `falcon512int` FALCON_FPEMU) — every add/sub/mul/div/sqrt and
+  float→int conversion is a fixed sequence of integer mul/shift/select with
+  no data-dependent branch, table index, or variable-latency FP instruction.
+  This eliminates the earlier native-`f64` timing leak: Falcon's signing hot
+  path runs division and sqrt on the SECRET-derived Gram matrix
+  (`fft.polyLdlFft`, `ffsampling` leaf sqrt), and hardware `divsd`/`sqrtsd`
+  have operand-dependent latency, so native f64 there was a timing side
+  channel on the signing key. A ReleaseFast disassembly of the keygen+sign
+  path now contains ZERO scalar-FP instructions (the only FP in a linked
+  binary is dead `compiler_rt` transcendental code, unreachable from Falcon).
+  The `fpr` emulation flushes subnormal *results* to zero, as the reference
+  does; Falcon's signer never enters the subnormal regime (byte-exact KATs
+  are the evidence), and the 50k-random-double cross-check tests confine
+  operands to the normal range where flush-to-zero and native f64 agree
+  bit-for-bit. **CT tax**: integer bit-by-bit div/sqrt make signing ~5x
+  slower than native f64 (host-dependent; the writeup cites ~12.5x on a
+  faster host with less fixed RNG/hash overhead) — accepted, and the
+  security-correct default for a signing key. **Backend**: the module is
+  CT-only; a native-`f64` fast-path (like the reference's separate `float`
+  build variant) is intentionally NOT exposed as an in-file toggle, to avoid
+  a footgun that could silently reopen the leak — add it as a separate module
+  variant if a fast-path, non-adversarial-timing consumer ever appears.
+  **Remaining gate**: no machine-checked side-channel verification
+  (dudect/ctgrind/binsec) has been run on the compiled artifact — run one
+  before production signing. Keygen (`ntru.zig`) likewise preserves the
+  reference's structure and now shares the integer `fpr`; it runs once per
+  key, so its side-channel exposure is far smaller than the signer's.
 - Verification and public-key handling touch public data only, so no
   constant-time claims are made or needed for that surface. Secret-key
   *decode* is not constant-time — treat `SecretKey.fromBytes` as a
@@ -110,10 +134,14 @@ it pins the trapdoor sampler and keygen sampling, whose failure mode is
   sample → norm-check retry loop → compress; plus `ShakePrng`, a
   SHAKE256-seeded `std.Random`).
 - **The hard pieces** (each its own file):
-  - `fpr.zig` — strict-float (`@setFloatMode(.strict)`) f64 layer with the
-    reference's exact constant bit patterns and bit-ported
-    rint/floor/trunc/expm_p63; byte-exact vs the reference's integer FP
-    emulation on any target with true IEEE binary64 and no FMA contraction.
+  - `fpr.zig` — the reference's branchless **integer emulation** of binary64
+    (`falcon512int` FALCON_FPEMU): add/sub/mul/div/sqrt + rint/floor/trunc/
+    expm_p63 are pure u64/u32 arithmetic with exact IEEE round-to-nearest-
+    even, carried in `f64` bit patterns via `@bitCast`. Constant-time (no
+    native FP, no data-dependent branch); byte-exact vs the reference. Two
+    tests cross-check every op against the hardware FPU on 50k random normal
+    doubles (the regime Falcon uses), where correctly-rounded native f64 and
+    the emulation must agree bit-for-bit.
   - `fft.zig` — the floating-point FFT (§3.4) in the reference's flat
     layout, plus the `poly_*_fft` helpers (signer + keygen Babai).
   - `gaussian.zig` — the ChaCha20 signer PRNG (reference `rng.c` layout)

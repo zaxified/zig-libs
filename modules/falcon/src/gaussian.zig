@@ -25,12 +25,13 @@
 //!     Bernoulli scaling decorrelating iteration count from mu/sigma, per
 //!     the reference's own analysis, NOT on a fixed iteration count.
 //!
-//! CONSTANT-TIME STATUS (must be audited before ANY production signing):
-//! this reproduces the reference's *branch/table structure*, but (a) the
-//! underlying `fpr` arithmetic here is native `f64`, whose HARDWARE timing
-//! (subnormals, divide) is not audited for data-independence, and (b) no
-//! machine-checked constant-time verification (dudect / ctgrind / binsec)
-//! has been run. Treat as KAT-correct, NOT yet side-channel-cleared.
+//! CONSTANT-TIME STATUS: this reproduces the reference's *branch/table
+//! structure*, and the underlying `fpr` arithmetic is the reference's
+//! branchless INTEGER emulation of binary64 (see `fpr.zig`) — no native
+//! FP instruction (in particular no variable-latency divide/sqrt) ever
+//! touches secret-derived data. Remaining gate before production signing:
+//! no machine-checked constant-time verification (dudect / ctgrind /
+//! binsec) has been run on the compiled artifact.
 
 const std = @import("std");
 const fpr = @import("fpr.zig");

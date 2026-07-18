@@ -1,27 +1,38 @@
 // SPDX-License-Identifier: MIT
 //! fpr — Falcon/FN-DSA floating-point layer for the signer (fft/ffsampling/
 //! gaussian). Mirrors the Falcon Round-3 reference `fpr.c`/`fpr.h`
-//! (falcon512int variant) closely enough to be BYTE-EXACT against its KAT
-//! signatures.
+//! (`falcon512int` FALCON_FPEMU variant) bit-for-bit, so signatures are
+//! BYTE-EXACT against its KAT signatures.
 //!
-//! Representation: IEEE-754 binary64. The reference uses an integer
-//! *emulation* of binary64 (`typedef uint64_t fpr`) purely for
-//! cross-platform determinism; on any target whose native `f64` is a true
-//! IEEE binary64 with round-to-nearest-even and NO fused-multiply-add
-//! contraction, native `+ - * / @sqrt` are correctly-rounded and therefore
-//! bit-identical to that emulation. We use native `f64` and force
-//! `@setFloatMode(.strict)` in every arithmetic function to forbid FMA
-//! fusing (which would change rounding). The three float→int conversions
-//! (rint / floor / trunc) and `expm_p63` are ported bit-for-bit from the
-//! reference's integer routines so their rounding matches exactly, and all
-//! constant tables (twiddles `gm_tab`, `p2_tab`, the sigma/log2/q
+//! Representation: IEEE-754 binary64 bit patterns carried in an `f64` (the
+//! reference's `typedef uint64_t fpr` IS the binary64 encoding, so the two
+//! storage types are interchangeable via `@bitCast` and all callers keep
+//! their `[]f64` buffers). Every arithmetic primitive here — add / sub /
+//! mul / div / sqrt / neg / half / double / sqr / inv / of / lt, plus the
+//! float→int conversions (rint / floor / trunc) and `expm_p63` — is the
+//! reference's *integer emulation*: pure branchless u64/u32 arithmetic
+//! with exact IEEE-754 round-to-nearest-even semantics (subnormal results
+//! flush to zero, as in the reference; no signing-path value is ever
+//! subnormal). NO native floating-point instruction is executed on any
+//! value.
+//!
+//! WHY integer emulation (constant-time): on real hardware, `divsd` /
+//! `sqrtsd` (and, on some cores, subnormal add/mul) have operand-dependent
+//! latency. Falcon's signing hot path runs division and sqrt on the
+//! SECRET-DERIVED Gram matrix (`fft.polyLdlFft`, `ffsampling` leaf sqrt),
+//! so native-f64 arithmetic is a timing side channel on the signing key.
+//! The integer emulation makes every op a fixed sequence of integer
+//! mul/shift/add with masked selects: no data-dependent branch, no
+//! data-dependent table index, no variable-latency instruction. This
+//! matches the reference's own constant-time assumptions (`fpr.h`):
+//! 32x32->64 unsigned multiply and barrel shifts are constant-time on the
+//! supported targets. It is slower than native f64 — that is the accepted
+//! CT tax, exactly as in the reference's portable build.
+//!
+//! All constant tables (twiddles `gm_tab`, `p2_tab`, the sigma/log2/q
 //! constants) are transcribed as the reference's exact `u64` bit patterns
 //! reinterpreted as `f64` — never recomputed via @cos/@sin, which would
 //! round differently.
-//!
-//! Determinism caveat: this assumes the build target has SSE2-class f64
-//! (x86-64, aarch64, …); it does NOT hold on x87-only or FMA-contracting
-//! builds. See the module's SIGN-KAT test for the empirical check.
 
 const std = @import("std");
 
@@ -31,66 +42,299 @@ inline fn fromBits(b: u64) f64 {
     return @bitCast(b);
 }
 
-// ---- Arithmetic (native f64, strict mode to forbid FMA contraction) ----
+// ---- Shift helpers (reference `fpr_ulsh`/`fpr_ursh`/`fpr_irsh`) ----
+// Shift counts may be secret-derived. The 32-bit-split form mirrors the
+// reference: on 64-bit targets it folds to a plain barrel shift; on 32-bit
+// targets it avoids a possibly-variable-time 64-bit software shift.
 
-pub inline fn add(x: f64, y: f64) f64 {
-    @setFloatMode(.strict);
-    return x + y;
+inline fn ulsh(x: u64, n: u32) u64 {
+    var v = x;
+    v ^= (v ^ (v << 32)) & (0 -% @as(u64, n >> 5));
+    return v << @intCast(n & 31);
 }
-pub inline fn sub(x: f64, y: f64) f64 {
-    @setFloatMode(.strict);
-    return x - y;
+inline fn ursh(x: u64, n: u32) u64 {
+    var v = x;
+    v ^= (v ^ (v >> 32)) & (0 -% @as(u64, n >> 5));
+    return v >> @intCast(n & 31);
 }
-pub inline fn mul(x: f64, y: f64) f64 {
-    @setFloatMode(.strict);
-    return x * y;
+inline fn irsh(x: i64, n: u32) i64 {
+    var v = x;
+    v ^= (v ^ (v >> 32)) & (0 -% @as(i64, @intCast(n >> 5)));
+    return v >> @intCast(n & 31);
 }
-pub inline fn div(x: f64, y: f64) f64 {
-    @setFloatMode(.strict);
-    return x / y;
+
+// ---- Integer-emulated binary64 core (reference fpr.c, FALCON_FPEMU) ----
+
+/// Normalize `m` to the 2^63..2^64-1 range by left-shifting, adjusting `e`
+/// accordingly; m = 0 stays 0 (reference `FPR_NORM64`). Branchless.
+inline fn norm64(m0: u64, e0: i32) struct { u64, i32 } {
+    var m = m0;
+    var e = e0 -% 63;
+    inline for ([_]comptime_int{ 32, 16, 8, 4, 2 }) |s| {
+        var nt: u32 = @truncate(m >> (64 - s));
+        nt = (nt | (0 -% nt)) >> 31;
+        m ^= (m ^ (m << s)) & (@as(u64, nt) -% 1);
+        e +%= @as(i32, @intCast(nt * s));
+    }
+    const nt: u32 = @truncate(m >> 63);
+    m ^= (m ^ (m << 1)) & (@as(u64, nt) -% 1);
+    e +%= @intCast(nt);
+    return .{ m, e };
 }
-pub inline fn neg(x: f64) f64 {
-    return -x;
+
+/// Pack sign / unbiased exponent / 55-bit mantissa (2^54..2^55-1, low bit
+/// sticky) into a binary64 bit pattern with round-to-nearest-even
+/// (reference `FPR()`). Exponents below the normal range clamp to zero.
+inline fn pack(s: u64, e0: i32, m0: u64) u64 {
+    var e = e0 +% 1076;
+    var m = m0;
+    const t: u32 = @as(u32, @bitCast(e)) >> 31;
+    m &= @as(u64, t) -% 1;
+    const t2: u32 = @truncate(m >> 54);
+    e &= 0 -% @as(i32, @intCast(t2));
+    var x: u64 = ((s << 63) | (m >> 2)) +% (@as(u64, @as(u32, @bitCast(e))) << 52);
+    x +%= (@as(u64, 0xC8) >> @intCast(m & 7)) & 1;
+    return x;
 }
-pub inline fn half(x: f64) f64 {
-    @setFloatMode(.strict);
-    return x * 0.5;
+
+const mask52: u64 = (@as(u64, 1) << 52) - 1;
+const bit52: u64 = @as(u64, 1) << 52;
+
+/// i * 2^sc as binary64 (reference `fpr_scaled`). Branchless.
+fn scaled(iv: i64, sc: i32) f64 {
+    var i = iv;
+    const s: u64 = @as(u64, @bitCast(i)) >> 63;
+    i ^= -%@as(i64, @bitCast(s));
+    i +%= @as(i64, @bitCast(s));
+    var m: u64 = @bitCast(i);
+    var e: i32 = 9 +% sc;
+    m, e = norm64(m, e);
+    m |= @as(u64, @as(u32, @truncate(m)) & 0x1FF) + 0x1FF;
+    m >>= 9;
+    const t: u32 = @truncate(@as(u64, @bitCast(i | -%i)) >> 63);
+    m &= 0 -% @as(u64, t);
+    e &= 0 -% @as(i32, @intCast(t));
+    return fromBits(pack(s, e, m));
 }
-pub inline fn double(x: f64) f64 {
-    @setFloatMode(.strict);
-    return x * 2.0;
+
+// ---- Arithmetic (branchless integer emulation, exact RNE rounding) ----
+
+pub fn add(xf: f64, yf: f64) f64 {
+    var x: u64 = @bitCast(xf);
+    var y: u64 = @bitCast(yf);
+
+    // Conditional swap so |x| >= |y| (and the +0 sign edge case is right).
+    var m: u64 = (@as(u64, 1) << 63) - 1;
+    const za: u64 = (x & m) -% (y & m);
+    const cs: u32 = @as(u32, @truncate(za >> 63)) |
+        ((1 -% @as(u32, @truncate((0 -% za) >> 63))) & @as(u32, @truncate(x >> 63)));
+    m = (x ^ y) & (0 -% @as(u64, cs));
+    x ^= m;
+    y ^= m;
+
+    // Unpack: mantissas scaled to 2^55..2^56-1, exponents unbiased.
+    var ex: i32 = @intCast(x >> 52);
+    const sx: i32 = ex >> 11;
+    ex &= 0x7FF;
+    m = @as(u64, @as(u32, @intCast((ex + 0x7FF) >> 11))) << 52;
+    var xu: u64 = ((x & mask52) | m) << 3;
+    ex -= 1078;
+    var ey: i32 = @intCast(y >> 52);
+    const sy: i32 = ey >> 11;
+    ey &= 0x7FF;
+    m = @as(u64, @as(u32, @intCast((ey + 0x7FF) >> 11))) << 52;
+    var yu: u64 = ((y & mask52) | m) << 3;
+    ey -= 1078;
+
+    // Align y (only right shifts needed); >= 60-bit shifts clamp to zero.
+    var cc: i32 = ex - ey;
+    yu &= 0 -% @as(u64, @as(u32, @bitCast(cc - 60)) >> 31);
+    cc &= 63;
+    m = ulsh(1, @intCast(cc)) -% 1;
+    yu |= (yu & m) +% m; // lowest kept bit becomes sticky
+    yu = ursh(yu, @intCast(cc));
+
+    // Same signs: add mantissas; opposite: subtract (masked).
+    xu +%= yu -% ((yu << 1) & (0 -% @as(u64, @intCast(sx ^ sy))));
+
+    // Normalize to 2^63..2^64-1, then scale down to 2^54..2^55-1 (sticky).
+    xu, ex = norm64(xu, ex);
+    xu |= @as(u64, @as(u32, @truncate(xu)) & 0x1FF) + 0x1FF;
+    xu >>= 9;
+    ex += 9;
+    return fromBits(pack(@intCast(sx), ex, xu));
 }
-pub inline fn sqr(x: f64) f64 {
-    @setFloatMode(.strict);
-    return x * x;
+
+pub fn sub(x: f64, y: f64) f64 {
+    return add(x, neg(y));
 }
-pub inline fn sqrt(x: f64) f64 {
-    @setFloatMode(.strict);
-    return @sqrt(x);
+
+pub fn mul(xf: f64, yf: f64) f64 {
+    const x: u64 = @bitCast(xf);
+    const y: u64 = @bitCast(yf);
+
+    // 53x53-bit product via 25/28-bit limbs (32x32->64 multiplies only).
+    const xu: u64 = (x & mask52) | bit52;
+    const yu: u64 = (y & mask52) | bit52;
+    const x0: u32 = @as(u32, @truncate(xu)) & 0x01FFFFFF;
+    const x1: u32 = @truncate(xu >> 25);
+    const y0: u32 = @as(u32, @truncate(yu)) & 0x01FFFFFF;
+    const y1: u32 = @truncate(yu >> 25);
+    var w: u64 = @as(u64, x0) * @as(u64, y0);
+    const z0: u32 = @as(u32, @truncate(w)) & 0x01FFFFFF;
+    var z1: u32 = @truncate(w >> 25);
+    w = @as(u64, x0) * @as(u64, y1);
+    z1 +%= @as(u32, @truncate(w)) & 0x01FFFFFF;
+    var z2: u32 = @truncate(w >> 25);
+    w = @as(u64, x1) * @as(u64, y0);
+    z1 +%= @as(u32, @truncate(w)) & 0x01FFFFFF;
+    z2 +%= @truncate(w >> 25);
+    var zu: u64 = @as(u64, x1) * @as(u64, y1);
+    z2 +%= z1 >> 25;
+    z1 &= 0x01FFFFFF;
+    zu +%= @as(u64, z2);
+
+    // Fold the low 50 bits into a sticky bit; product is 2^54..2^56-1.
+    zu |= @as(u64, ((z0 | z1) +% 0x01FFFFFF) >> 25);
+
+    // Conditional 1-bit normalization down to 2^54..2^55-1 (sticky-aware).
+    const zv: u64 = (zu >> 1) | (zu & 1);
+    w = zu >> 55;
+    zu ^= (zu ^ zv) & (0 -% w);
+
+    const ex: i32 = @intCast((x >> 52) & 0x7FF);
+    const ey: i32 = @intCast((y >> 52) & 0x7FF);
+    const e: i32 = ex + ey - 2100 + @as(i32, @intCast(w));
+    const s: u64 = (x ^ y) >> 63;
+
+    // Zero operand => zero result (masked).
+    const d: u32 = @intCast(((ex + 0x7FF) & (ey + 0x7FF)) >> 11);
+    zu &= 0 -% @as(u64, d);
+    return fromBits(pack(s, e, zu));
 }
-pub inline fn inv(x: f64) f64 {
-    @setFloatMode(.strict);
-    return 1.0 / x;
+
+pub fn div(xf: f64, yf: f64) f64 {
+    const x: u64 = @bitCast(xf);
+    const y: u64 = @bitCast(yf);
+
+    var xu: u64 = (x & mask52) | bit52;
+    const yu: u64 = (y & mask52) | bit52;
+
+    // Bit-by-bit restoring division, fixed 55 iterations, masked update.
+    var quo: u64 = 0;
+    var i: usize = 0;
+    while (i < 55) : (i += 1) {
+        const b: u64 = ((xu -% yu) >> 63) -% 1;
+        xu -%= b & yu;
+        quo |= b & 1;
+        xu <<= 1;
+        quo <<= 1;
+    }
+    // 56th bit is sticky: set iff a remainder survives.
+    quo |= (xu | (0 -% xu)) >> 63;
+
+    // Conditional 1-bit normalization to 2^54..2^55-1 (sticky-aware).
+    const q2: u64 = (quo >> 1) | (quo & 1);
+    const w: u64 = quo >> 55;
+    quo ^= (quo ^ q2) & (0 -% w);
+
+    const ex: i32 = @intCast((x >> 52) & 0x7FF);
+    const ey: i32 = @intCast((y >> 52) & 0x7FF);
+    var e: i32 = ex - ey - 55 + @as(i32, @intCast(w));
+    var s: u64 = (x ^ y) >> 63;
+
+    // x = 0 => +0 result (masked); y = 0 never happens by contract.
+    const d: u32 = @intCast((ex + 0x7FF) >> 11);
+    s &= d;
+    e &= 0 -% @as(i32, @intCast(d));
+    quo &= 0 -% @as(u64, d);
+    return fromBits(pack(s, e, quo));
 }
-pub inline fn of(i: i64) f64 {
-    return @floatFromInt(i);
+
+pub fn sqrt(xf: f64) f64 {
+    const x: u64 = @bitCast(xf);
+
+    var xu: u64 = (x & mask52) | bit52;
+    const ex: i32 = @intCast((x >> 52) & 0x7FF);
+    var e: i32 = ex - 1023;
+
+    // Odd exponent: double the mantissa; halve the exponent (arith shift).
+    xu +%= xu & (0 -% @as(u64, @intCast(e & 1)));
+    e >>= 1;
+    xu <<= 1;
+
+    // Bit-by-bit integer square root, fixed 54 iterations, masked update.
+    var quo: u64 = 0;
+    var s: u64 = 0;
+    var r: u64 = @as(u64, 1) << 53;
+    var i: usize = 0;
+    while (i < 54) : (i += 1) {
+        const t = s +% r;
+        const b = ((xu -% t) >> 63) -% 1;
+        s +%= (r << 1) & b;
+        xu -%= t & b;
+        quo +%= r & b;
+        xu <<= 1;
+        r >>= 1;
+    }
+    // Guard bit then sticky bit from the remainder.
+    quo <<= 1;
+    quo |= (xu | (0 -% xu)) >> 63;
+    e -= 54;
+
+    // x = 0 => 0 result (masked). Operand is nonnegative by contract.
+    quo &= 0 -% @as(u64, @as(u32, @intCast((ex + 0x7FF) >> 11)));
+    return fromBits(pack(0, e, quo));
 }
-pub inline fn lt(x: f64, y: f64) bool {
-    @setFloatMode(.strict);
-    return x < y;
+
+pub fn neg(xf: f64) f64 {
+    const x: u64 = @bitCast(xf);
+    return fromBits(x ^ (@as(u64, 1) << 63));
+}
+
+pub fn half(xf: f64) f64 {
+    // Divide by 2 = decrement the exponent field, clamping zero.
+    var x: u64 = @bitCast(xf);
+    x -%= @as(u64, 1) << 52;
+    const t: u32 = ((@as(u32, @truncate(x >> 52)) & 0x7FF) + 1) >> 11;
+    x &= @as(u64, t) -% 1;
+    return fromBits(x);
+}
+
+pub fn double(xf: f64) f64 {
+    // Multiply by 2 = increment the exponent field unless the value is 0.
+    var x: u64 = @bitCast(xf);
+    x +%= @as(u64, ((@as(u32, @truncate(x >> 52)) & 0x7FF) + 0x7FF) >> 11) << 52;
+    return fromBits(x);
+}
+
+pub fn sqr(x: f64) f64 {
+    return mul(x, x);
+}
+
+pub fn inv(x: f64) f64 {
+    return div(fromBits(4607182418800017408), x); // 1.0 / x
+}
+
+pub fn of(i: i64) f64 {
+    return scaled(i, 0);
+}
+
+pub fn lt(xf: f64, yf: f64) bool {
+    // Sign-aware branchless ordered-compare on the bit patterns
+    // (reference `fpr_lt`); valid because binary64 order matches signed-
+    // integer order for same-sign operands.
+    const x: u64 = @bitCast(xf);
+    const y: u64 = @bitCast(yf);
+    const sx: i64 = @bitCast(x);
+    var sy: i64 = @bitCast(y);
+    sy &= ~((sx ^ sy) >> 63); // sy = 0 if signs differ
+    const cc0: u32 = @as(u32, @truncate(@as(u64, @bitCast(sx -% sy)) >> 63)) & 1;
+    const cc1: u32 = @as(u32, @truncate(@as(u64, @bitCast(sy -% sx)) >> 63)) & 1;
+    return (cc0 ^ ((cc0 ^ cc1) & @as(u32, @truncate((x & y) >> 63)))) != 0;
 }
 
 // ---- float -> int conversions (ported bit-exact from reference fpr.h) ----
-
-inline fn ulsh(x: u64, n: u32) u64 {
-    return x << @intCast(n & 63);
-}
-inline fn ursh(x: u64, n: u32) u64 {
-    return x >> @intCast(n & 63);
-}
-inline fn irsh(x: i64, n: u32) i64 {
-    return x >> @intCast(n & 63);
-}
 
 /// Round to nearest integer, ties to even (reference `fpr_rint`).
 pub fn rint(x: f64) i64 {
@@ -490,3 +734,85 @@ pub const gm_tab_bits = [_]u64{
     4606507322377452870, 4600514338912178239, 13823886375766954047, 4606507322377452870, 4600616459743653188, 4606486172460753999, 13829858209315529807, 4600616459743653188,
     4604563781218984604, 4604524701268679793, 13827896738123455601, 4604563781218984604, 4569220649180767418, 4607182376410422530, 13830554413265198338, 4569220649180767418,
 };
+
+// ---- Tests: the emulation vs the hardware ----
+
+test "integer emulation matches native IEEE-754 RNE bit-for-bit on random normal doubles" {
+    // On this test host (x86-64 / aarch64) native f64 add/sub/mul/div/sqrt
+    // are correctly-rounded binary64 RNE, so wherever inputs and results
+    // stay normal (the only regime Falcon's signer uses), the branchless
+    // integer emulation must agree bit-for-bit with the hardware FPU.
+    // Exponent field is confined to [700, 1300] so no operation here can
+    // produce a subnormal, infinity, or NaN.
+    const native = struct {
+        fn addf(a: f64, b: f64) f64 {
+            @setFloatMode(.strict);
+            return a + b;
+        }
+        fn subf(a: f64, b: f64) f64 {
+            @setFloatMode(.strict);
+            return a - b;
+        }
+        fn mulf(a: f64, b: f64) f64 {
+            @setFloatMode(.strict);
+            return a * b;
+        }
+        fn divf(a: f64, b: f64) f64 {
+            @setFloatMode(.strict);
+            return a / b;
+        }
+        fn sqrtf(a: f64) f64 {
+            @setFloatMode(.strict);
+            return @sqrt(a);
+        }
+    };
+    var prng = std.Random.DefaultPrng.init(0x8b1ef0f5);
+    const random = prng.random();
+    var n: usize = 0;
+    while (n < 50_000) : (n += 1) {
+        const eb_x: u64 = 700 + random.uintLessThan(u64, 601);
+        const eb_y: u64 = 700 + random.uintLessThan(u64, 601);
+        const xb: u64 = (random.int(u64) & ((@as(u64, 1) << 63) - 1 - (0x7FF << 52))) | (eb_x << 52);
+        const yb: u64 = (random.int(u64) & ~(@as(u64, 0x7FF) << 52)) | (eb_y << 52);
+        const x: f64 = @bitCast(xb);
+        const y: f64 = @bitCast(yb);
+        try std.testing.expectEqual(@as(u64, @bitCast(native.addf(x, y))), @as(u64, @bitCast(add(x, y))));
+        try std.testing.expectEqual(@as(u64, @bitCast(native.subf(x, y))), @as(u64, @bitCast(sub(x, y))));
+        try std.testing.expectEqual(@as(u64, @bitCast(native.mulf(x, y))), @as(u64, @bitCast(mul(x, y))));
+        try std.testing.expectEqual(@as(u64, @bitCast(native.divf(x, y))), @as(u64, @bitCast(div(x, y))));
+        try std.testing.expectEqual(@as(u64, @bitCast(native.sqrtf(x))), @as(u64, @bitCast(sqrt(x))));
+        try std.testing.expectEqual(@as(u64, @bitCast(native.mulf(y, 0.5))), @as(u64, @bitCast(half(y))));
+        try std.testing.expectEqual(@as(u64, @bitCast(native.mulf(y, 2.0))), @as(u64, @bitCast(double(y))));
+        try std.testing.expectEqual(x < y, lt(x, y));
+        try std.testing.expectEqual(y < x, lt(y, x));
+        try std.testing.expectEqual(-x < y, lt(neg(x), y)); // covers both-negative
+        try std.testing.expectEqual(x < x, lt(x, x));
+    }
+}
+
+test "integer emulation: of/rint/floor/trunc agree with native conversions" {
+    var prng = std.Random.DefaultPrng.init(0x0f5ca1ed);
+    const random = prng.random();
+    var n: usize = 0;
+    while (n < 50_000) : (n += 1) {
+        // of(): any i54 converts exactly; wider i62 values exercise rounding.
+        const small: i64 = random.intRangeAtMost(i64, -(1 << 53), 1 << 53);
+        try std.testing.expectEqual(@as(f64, @floatFromInt(small)), of(small));
+        const wide: i64 = @divTrunc(random.int(i64), 4);
+        try std.testing.expectEqual(@as(f64, @floatFromInt(wide)), of(wide));
+        // Exact-integer round-trips through every float->int conversion.
+        try std.testing.expectEqual(small, rint(of(small)));
+        try std.testing.expectEqual(small, floor(of(small)));
+        try std.testing.expectEqual(small, trunc(of(small)));
+        // Halfway and fractional cases vs native semantics.
+        const frac = add(of(small), @as(f64, @bitCast(@as(u64, 4602678819172646912)))); // + 0.5
+        try std.testing.expectEqual(@as(i64, @intFromFloat(@floor(frac))), floor(frac));
+        try std.testing.expectEqual(@as(i64, @intFromFloat(@trunc(frac))), trunc(frac));
+    }
+    // rint ties-to-even at the .5 boundary (native @round rounds away, so
+    // check the emulation's RNE explicitly).
+    try std.testing.expectEqual(@as(i64, 2), rint(@as(f64, 2.5)));
+    try std.testing.expectEqual(@as(i64, 4), rint(@as(f64, 3.5)));
+    try std.testing.expectEqual(@as(i64, -2), rint(@as(f64, -2.5)));
+    try std.testing.expectEqual(@as(i64, 0), rint(@as(f64, 0.0)));
+}

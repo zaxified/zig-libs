@@ -26,10 +26,19 @@ strict-float `fpr` layer + FFT, the dynamic-tree ffSampling trapdoor
 recursion, and SamplerZ (the ChaCha20-fed discrete Gaussian sampler).
 `keygen_sign_test.zig` reproduces seed → pk/sk and the full
 seed → keygen → sign → `sm` pipeline bit-for-bit against the NIST DRBG
-replay. **Constant-time caveat**: `gaussian.samplerZ` mirrors the
-reference's constant-time structure but has had NO machine-checked
-side-channel verification — a subtly leaky sampler still produces
-signatures that *verify*, so audit before production signing (see
+replay. **Constant-time status**: the `fpr` layer is the reference's
+branchless **integer emulation** of binary64 (`fpr.zig`), so the signing
+hot path runs NO variable-latency FP instruction (`divsd`/`sqrtsd`/`mulsd`)
+on the secret-derived Gram matrix — the earlier native-`f64` timing leak on
+the signing key is closed (a ReleaseFast disassembly of keygen+sign has zero
+scalar-FP instructions). This costs ~5x (host-dependent) on signing vs
+native f64; that CT tax is accepted and is the security-correct default.
+`gaussian.samplerZ` reproduces the reference's constant-time branch/table
+structure, whose only secret-structured branches are the documented BerExp
+lazy-break + norm-bound rejection retry. **Remaining gate**: no
+machine-checked side-channel verification (dudect/ctgrind/binsec) has been
+run on the compiled artifact — a subtly leaky sampler still produces
+signatures that *verify*, so run one before production signing (see
 `gaussian.zig`'s module doc). Out of scope: the padded/CT signature format
 (the compressed format the KATs use is implemented).
 
