@@ -97,6 +97,39 @@ fn benchSize(comptime bits: comptime_int, rand: std.Random) void {
         std.mem.doNotOptimizeAway(sink);
         std.debug.print("montint-ASM  modmul {d:>5}-bit: {d:>8} ns/op\n", .{ bits, dt / mul_iters });
     }
+    // ── montint sqr-via-mul: asm montMul(a,a) (what the square replaced) ──
+    if (asm_core.supported) {
+        var sink: u64 = 0;
+        var z = am;
+        var t: M.Elem = undefined;
+        const t0 = nowNs();
+        var i: usize = 0;
+        while (i < mul_iters / 2) : (i += 1) {
+            asm_core.montMul(&t, &z, &z, &m.m, m.n0inv);
+            asm_core.montMul(&z, &t, &t, &m.m, m.n0inv);
+            sink ^= z[0];
+        }
+        const dt = nowNs() - t0;
+        std.mem.doNotOptimizeAway(sink);
+        std.debug.print("montint-ASM  sqr/mul{d:>5}-bit: {d:>8} ns/op\n", .{ bits, dt / (2 * (mul_iters / 2)) });
+    }
+    // ── montint modsqr: asm dedicated square ──
+    if (asm_core.supported) {
+        var sink: u64 = 0;
+        var z = am;
+        var t: M.Elem = undefined;
+        var scratch: [2 * M.L]u64 = undefined;
+        const t0 = nowNs();
+        var i: usize = 0;
+        while (i < mul_iters / 2) : (i += 1) {
+            asm_core.montSqr(&t, &z, &m.m, m.n0inv, &scratch);
+            asm_core.montSqr(&z, &t, &m.m, m.n0inv, &scratch);
+            sink ^= z[0];
+        }
+        const dt = nowNs() - t0;
+        std.mem.doNotOptimizeAway(sink);
+        std.debug.print("montint-ASM  modsqr {d:>5}-bit: {d:>8} ns/op\n", .{ bits, dt / (2 * (mul_iters / 2)) });
+    }
     // ── montint modexp: powMont (dispatch-dependent; tag) ──
     {
         var sink: u64 = 0;

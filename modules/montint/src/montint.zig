@@ -254,24 +254,24 @@ pub fn Modint(comptime max_bits: comptime_int) type {
         /// cheaper than a general multiply because the cross-product half
         /// `a[i]·a[j]` (i<j) is computed once and doubled instead of twice.
         ///
-        /// Dispatch mirrors `montMul` but with the extra rule that a *portable*
-        /// dedicated square only beats the **asm** general multiply below the
-        /// small-L cutoff — at `L >= asm_min_limbs` the asm `montMul` is faster
-        /// than a portable square, so we fall back to it there (a dedicated asm
-        /// square is a separate future core; see SPEC "Deferred"). Concretely:
-        ///   * `L >= asm_min_limbs` with the asm core active → asm `montMul(a,a)`
-        ///     (on amd64 the asm multiply still beats a *portable* square at
-        ///     these sizes; aliasing `a==b` is supported). Covers rsa-4096,
-        ///     paillier, vdf, threshold_ecdsa on amd64.
+        /// Dispatch mirrors `montMul`:
+        ///   * `L >= asm_min_limbs` with the asm core active → the DEDICATED
+        ///     asm square `asm_core.montSqr` (SOS with `MULX/ADCX/ADOX` rows —
+        ///     each off-diagonal product computed once and doubled; measured
+        ///     faster than the asm `montMul(a,a)` it replaced at L=32/64, see
+        ///     SPEC "Benchmarks"). Covers rsa-4096, paillier, vdf,
+        ///     threshold_ecdsa on amd64 — and modexp's square steps, which are
+        ///     ~5/6 of `powMont`'s multiplies.
         ///   * else `L >= sqr_min_limbs` → portable `montSqrCios`, the dedicated
-        ///     square (the guaranteed win: rsa-2048 CRT at L=16, and every
-        ///     `L >= asm_min_limbs` modulus on non-amd64 targets / OpenWRT).
+        ///     square (rsa-2048 CRT at L=16, and every `L >= asm_min_limbs`
+        ///     modulus on non-amd64 targets / OpenWRT).
         ///   * else (tiny L, incl. the pairing-field sizes) → `montMulCios(a,a)`,
         ///     where the general multiply is as fast or faster.
         pub fn montSqr(self: *const Self, a: *const Elem) Elem {
             if (comptime asm_active and L >= asm_min_limbs) {
                 var z: Elem = undefined;
-                asm_core.montMul(&z, a, a, &self.m, self.n0inv);
+                var scratch: [2 * L]u64 = undefined;
+                asm_core.montSqr(&z, a, &self.m, self.n0inv, &scratch);
                 return z;
             }
             if (comptime L >= sqr_min_limbs) return self.montSqrCios(a);

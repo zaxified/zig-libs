@@ -85,8 +85,10 @@ asm_core.montMul(z: []u64, a, b, m: []const u64, n0inv: u64)   // z = a·b·R⁻
 the hand-written x86-64 `MULX/ADCX/ADOX` CIOS Montgomery multiply over `n =
 m.len` full 2^64 limbs (the `x86_64-mont5` technique: `MULX` for the widening
 products, `ADCX` for the add carry chain, `ADOX` for the mul carry chain — two
-independent flag chains that keep both carries live without stalls). Optionally
-a dedicated squaring. The signature is final; only the body changes. Its result
+independent flag chains that keep both carries live without stalls). A
+dedicated squaring (`asm_core.montSqr`, SOS over the shared `mulRow` row
+primitive) was added on top — see "Dedicated squaring" under Threats/caveats.
+The signature is final; only the body changes. Its result
 is the same `[]u64` the portable CIOS returns, so a wrong core **cannot**
 typecheck-and-silently-pass: the differential harness compares it limb-for-limb
 against the proven-vs-CPython oracle.
@@ -224,32 +226,41 @@ speed dispatch, not a correctness bound.
 - **No base blinding / fault countermeasures.** This is a modular-arithmetic
   primitive, not a signing scheme; blinding (rsa F2) and CRT fault-checks
   (rsa F3) are the consumer's responsibility, layered on top.
-- **Portable dedicated squaring — DONE; dedicated ASM squaring — deferred.** A
-  portable constant-time dedicated Montgomery square (`montSqrCios`, SOS: the
-  symmetric `a[i]·a[j]` off-diagonal products computed once and doubled, plus
-  the diagonal squares, then a Montgomery reduce) now backs `montSqr`/`powMont`
-  for `sqr_min_limbs ≤ L < asm_min_limbs` **and** all `L` on non-amd64 targets.
-  It is ~1.15–1.23× faster than the portable multiply (L=8…64 on this host) and
-  speeds up **rsa-2048 CRT sign** (L=16 primary amd64 case) and every
-  large-modulus op on non-amd64/OpenWRT. A dedicated **asm** square (MULX/ADCX/
-  ADOX with the doubling+diagonal structure) is still deferred: on amd64 at
-  `L ≥ asm_min_limbs` the existing asm `montMul(a,a)` still beats a *portable*
-  square, so those sizes (rsa-4096, paillier, vdf, threshold_ecdsa) route to it
-  unchanged. The remaining win there requires the asm square — the classic
-  pitfall is carry propagation through the `×2` and the diagonal add; it is NOT
-  shipped because it was not proven bit-exact within this change and a wrong CT
-  square in the RSA hot path is unacceptable. Follow-up scope: reuse the
-  `ciosIter` register plan for the reduction row + a new symmetric-product row
-  that doubles off-diagonal partials, oracle = `montSqrCios`.
-- **Deferred:** the dedicated asm squaring (above), the large-size SOS+Karatsuba
+- **Dedicated squaring — DONE, portable AND asm.** The portable constant-time
+  dedicated Montgomery square (`montSqrCios`, SOS: the symmetric `a[i]·a[j]`
+  off-diagonal products computed once and doubled, plus the diagonal squares,
+  then a Montgomery reduce) backs `montSqr`/`powMont` for
+  `sqr_min_limbs ≤ L < asm_min_limbs` **and** all `L` on non-amd64 targets
+  (~1.15–1.23× vs the portable multiply at L=8…64 on this host; wins rsa-2048
+  CRT sign at L=16 and every large-modulus op on non-amd64/OpenWRT). The
+  dedicated **asm** square (`asm_core.montSqr`) now serves `L ≥ asm_min_limbs`
+  on amd64: same SOS phase order as the portable oracle, with both O(L²) inner
+  loops — the off-diagonal product rows and the word-serial REDC rows — run on
+  `asm_core.mulRow`, the `MULX/ADCX/ADOX` dual-carry-chain accumulate row
+  (verbatim the labels-1–4 half of `ciosIter`). The classic `×2`+diagonal carry
+  pitfall is structurally absent: the doubling is a separate funnel-shift pass
+  over the COMPLETED cross-product sum (outside any carry chain), and the
+  diagonal add + per-row tail carries are the same Zig `u128` arithmetic as the
+  oracle. Anchored by a three-way differential (asm sqr == `montSqrCios` ==
+  asm `montMul(a,a)`, thousands of random trials at L∈{1,2,3,4,5,8,16,17,32,
+  33,34,35,48,64} — every rem class of the reduction row — plus carry-saturation
+  edges, Debug AND ReleaseFast) and an asm-rows positive control (a square with
+  the doubling omitted goes RED). Measured (this host, ReleaseFast, same-run
+  A/B): asm sqr beats asm `montMul(a,a)` ~1.10–1.13× at L=32 and ~1.12–1.15× at
+  L=64 → modexp-2048 ≈ 3.23 ms (was ≈ 3.5), modexp-4096 ≈ 22.3–24.4 ms (was
+  ≈ 26.5) ⇒ ≈ **1.7×**/**1.5–1.6×** OpenSSL (from 1.8×/1.8×); rsa-4096 CRT sign
+  ≈ −10 % (CRT halves are L=32), rsa-2048 CRT sign unchanged (halves are L=16,
+  already on the portable square).
+- **Deferred:** the large-size SOS+Karatsuba
   modmul path, tuning the small-L cutoffs per-µarch (`asm_min_limbs`/
   `sqr_min_limbs` are single-host measurements), and a possible
   dynamic-limb-count modulus (today `L` is fixed by `max_bits`; a small modulus
   in a wide `Modint` wastes work). Consumer note: `rsa`/`paillier`/
   `threshold_ecdsa` and vdf's Montgomery-resident `prove`/`verify` all call
   `montint`'s `montSqr`/`powMont`, so they inherit this change automatically (no
-  consumer edit) — the win lands wherever the dispatch picks a portable square
-  (rsa-2048 CRT L=16 on amd64; all L on non-amd64). vdf's `eval` hot loop is the
+  consumer edit) — the win lands wherever the dispatch picks a dedicated square
+  (asm at L≥32 on amd64, portable at L=8..31 on amd64 and at all L on
+  non-amd64). vdf's `eval` hot loop is the
   exception: `group.square` there still calls `std.crypto.ff` directly, so it
   does NOT benefit — migrating that loop to a `montint` Montgomery-resident
   square is a separate small vdf-side follow-up.

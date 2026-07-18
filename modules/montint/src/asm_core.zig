@@ -3,10 +3,12 @@
 //! asm_core — the GATED irreducible x86-64 core (IMPLEMENTED).
 //!
 //! The hand-written `MULX/ADCX/ADOX` dual-carry-chain CIOS Montgomery multiply
-//! (the OpenSSL `x86_64-mont5` technique). Everything else in the module (the
-//! portable CIOS oracle, to/from Montgomery, add/sub, windowed modexp, and the
-//! whole verification + bench harness) lives outside this file. See `gate.zig`
-//! for the cut-line and `SPEC.md` for the algorithm + threat model.
+//! (the OpenSSL `x86_64-mont5` technique), plus the dedicated Montgomery
+//! SQUARING (`montSqr`: SOS driven by the `mulRow` row primitive — see its
+//! doc). Everything else in the module (the portable CIOS oracle, to/from
+//! Montgomery, add/sub, windowed modexp, and the whole verification + bench
+//! harness) lives outside this file. See `gate.zig` for the cut-line and
+//! `SPEC.md` for the algorithm + threat model.
 //!
 //! ## Structure
 //!
@@ -114,6 +116,104 @@ fn montMulAmd64(z: []u64, a: []const u64, b: []const u64, m: []const u64, n0inv:
     }
     // t < 2m here, so t[n] (top0) is 0 or 1; constant-time final reduce.
     condSub(z, top0, m);
+}
+
+/// `z = a²·R⁻¹ mod m` over `n = m.len` full 2^64 limbs — the dedicated
+/// Montgomery SQUARING (same contract as `montMul` with `b == a`, but ~½ the
+/// off-diagonal limb products). `scratch` must be `2·n` words and, like `z`,
+/// must not alias `a`/`m` (the dispatcher passes fresh stack buffers).
+/// Dispatched iff `supported and gate.asm_core_implemented` and the modulus
+/// clears the large-L cutoff (see `montint.montSqr`).
+pub fn montSqr(z: []u64, a: []const u64, m: []const u64, n0inv: u64, scratch: []u64) void {
+    if (comptime supported) {
+        montSqrAmd64(z, a, m, n0inv, scratch);
+    } else {
+        // Unreachable by construction: the dispatcher in `montint.zig` and the
+        // differential harness both comptime/runtime-guard on `supported`.
+        unreachable;
+    }
+}
+
+/// SOS Montgomery squaring, structurally IDENTICAL to the portable oracle
+/// `montSqrCios` (its four phases, in order), with the two O(n²) inner loops —
+/// the off-diagonal product rows and the REDC reduction rows — replaced by the
+/// `MULX/ADCX/ADOX` dual-carry-chain row primitive `mulRow`. The O(n) glue
+/// (doubling, diagonal, per-row tail carries) stays in Zig and is the SAME
+/// arithmetic as the portable oracle, so bit-exactness reduces to the row
+/// identity `t += x·v` (the row is the labels-1–4 half of `ciosIter`, already
+/// proven by the montMul differential).
+///
+///   1. cross products — row i: `A[2i+1 .. i+n-1] += a[i]·a[i+1..n]`, carry
+///      stored to `A[i+n]` (fresh: row i−1 topped out at `A[i+n−1]`). Each
+///      off-diagonal product `a[i]·a[j]` (i<j) is computed ONCE.
+///   2. double — `A ← 2·A` as the downward funnel shift
+///      `A[k] = (A[k]<<1) | (A[k−1]>>63)` (identical value to the oracle's
+///      carried upward shift; the dropped top bit is provably 0 because
+///      `cross < B^(2n−1)`). This is where the ×2 lives — OUTSIDE the carry
+///      chains, on the completed partial sum, so no interleaved-doubling carry
+///      subtlety exists by construction.
+///   3. diagonal — `A += Σ a[i]²·B^(2i)` with the 0/1 inter-pair carry
+///      (`dcarry`) threaded exactly like the oracle.
+///   4. word-serial REDC — row i: `u = A[i]·n0inv`; `A[i..i+n] += u·m` via
+///      `mulRow` (the in-place row zeroes `A[i]` by construction); the row
+///      carry + the pending `cc` fold into column `i+n` in Zig (u128), exactly
+///      the oracle's threading. Result = `A[n..2n]` topped by `cc ∈ {0,1}`,
+///      then the same masked `condSub`.
+///
+/// Constant-time: every trip count derives from the PUBLIC `n` and the loop
+/// index (`len = n−1−i`); which products are halved is structural; no
+/// secret-dependent branch, index, or store address; final reduce is masked.
+fn montSqrAmd64(z: []u64, a: []const u64, m: []const u64, n0inv: u64, scratch: []u64) void {
+    const n = m.len;
+    std.debug.assert(n >= 1);
+    std.debug.assert(z.len == n and a.len == n and scratch.len == 2 * n);
+    const A = scratch;
+    @memset(A, 0);
+
+    // ── 1. cross products: A = Σ_{i<j} a[i]·a[j]·B^(i+j) ──
+    var i: usize = 0;
+    while (i + 1 < n) : (i += 1) {
+        const len = n - 1 - i;
+        A[i + n] = mulRow(A.ptr + (2 * i + 1), a.ptr + (i + 1), len & 3, len >> 2, a[i]);
+    }
+    // A[2n−1] is still 0 here: cross < B^(2n−1) (row n−2 topped out at A[2n−2]).
+
+    // ── 2. double: A ← 2·A ──
+    var k: usize = 2 * n - 1;
+    while (k > 0) : (k -= 1) A[k] = (A[k] << 1) | (A[k - 1] >> 63);
+    A[0] <<= 1;
+
+    // ── 3. diagonal: A ← A + Σ_i a[i]²·B^(2i) ──
+    var dcarry: u64 = 0;
+    i = 0;
+    while (i < n) : (i += 1) {
+        const sq = @as(u128, a[i]) * @as(u128, a[i]);
+        const p1 = @as(u128, A[2 * i]) + @as(u64, @truncate(sq)) + dcarry;
+        A[2 * i] = @truncate(p1);
+        const p2 = @as(u128, A[2 * i + 1]) + @as(u64, @truncate(sq >> 64)) + @as(u64, @truncate(p1 >> 64));
+        A[2 * i + 1] = @truncate(p2);
+        dcarry = @truncate(p2 >> 64); // ≤ 1; flows to A[2(i+1)] next round
+    }
+    // dcarry == 0 here: a² < B^(2n) fits exactly in 2n words.
+
+    // ── 4. Montgomery reduce: z = A·R⁻¹ mod m ──
+    const rrem = n & 3;
+    const rgrp = n >> 2;
+    var cc: u64 = 0; // carry into column i+n, carried between steps
+    i = 0;
+    while (i < n) : (i += 1) {
+        const u = A[i] *% n0inv;
+        const carry = mulRow(A.ptr + i, m.ptr, rrem, rgrp, u);
+        // Column i+n collects the row carry plus the pending cc from step i−1
+        // (the carry out of column (i−1)+n = i+n−1); the 0/1 carry out becomes
+        // the next step's cc — no variable ripple (see montSqrCios phase 4).
+        const s = @as(u128, A[i + n]) + carry + cc;
+        A[i + n] = @truncate(s);
+        cc = @truncate(s >> 64);
+    }
+    // result = A[n..2n] with top word cc (0/1 since A = a² < R·m).
+    @memcpy(z, A[n .. 2 * n]);
+    condSub(z, cc, m);
 }
 
 const IterCarries = struct { c1: u64, c2: u64 };
@@ -279,6 +379,96 @@ inline fn ciosIter(tp: [*]u64, vp: [*]const u64, mp: [*]const u64, rem: usize, g
           [redpack] "{r14}" (redpack),
         : .{ .r8 = true, .r9 = true, .r10 = true, .cc = true, .memory = true });
     return .{ .c1 = c1, .c2 = c2 };
+}
+
+/// ONE `MULX/ADCX/ADOX` dual-carry-chain accumulate row:
+///
+///   `t[0..n) += x·v[0..n)`,  `n = rem + 4·grp`,  returns the carry-out word.
+///
+/// This is exactly the mul-row half of `ciosIter` (its labels 1–4), verbatim:
+/// same remainder-then-4-unrolled structure (low limbs first, so limb order is
+/// preserved), same flag discipline (MULX touches no flag; ADCX propagates the
+/// hi→lo product chain through CF; ADOX adds the t words through OF; OF folded
+/// into the pending-hi before every `dec`; CF folded with `adc` at loop
+/// boundaries — provably no wrap, the carry into any limb position of
+/// `t + x·v` fits 64 bits). `n == 0` is legal: touches nothing, returns 0.
+///
+/// The dedicated squaring (`montSqrAmd64`) drives this for both its
+/// off-diagonal product rows and its REDC reduction rows. `pub` so the test
+/// harness can build a deliberately-broken square from the SAME row primitive
+/// (the positive control proving the squaring differential has teeth).
+///
+/// Register plan (subset of `ciosIter`'s): rdx = multiplier x (implicit MULX
+/// operand, never written), rdi/rsi = advancing t/v cursors, rcx = trip
+/// counter, rax = pending-hi (becomes the carry out), r8 = current lo,
+/// r9/r11 = alternating hi (r11 doubles as the parked `grp` — the remainder
+/// loop does not touch it), r10 = zero. Every input pinned to an explicit
+/// register, modified ones tied to discarded outputs (see `ciosIter`'s note on
+/// the self-hosted backend).
+pub inline fn mulRow(tp: [*]u64, vp: [*]const u64, rem: usize, grp: usize, x: u64) u64 {
+    var carry: u64 = undefined;
+    var d0: usize = undefined;
+    var d1: usize = undefined;
+    var d2: usize = undefined;
+    var d3: usize = undefined;
+    asm volatile (
+        \\ xorl %%r10d, %%r10d
+        \\ xorl %%eax, %%eax
+        \\ testq %%rcx, %%rcx
+        \\ jz 2f
+        \\1:
+        \\ mulxq (%%rsi), %%r8, %%r9
+        \\ adcxq %%rax, %%r8
+        \\ adoxq (%%rdi), %%r8
+        \\ movq %%r8, (%%rdi)
+        \\ movq %%r9, %%rax
+        \\ adoxq %%r10, %%rax
+        \\ leaq 8(%%rsi), %%rsi
+        \\ leaq 8(%%rdi), %%rdi
+        \\ decq %%rcx
+        \\ jnz 1b
+        \\2:
+        \\ adcq %%r10, %%rax
+        \\ movq %%r11, %%rcx
+        \\ testq %%rcx, %%rcx
+        \\ jz 4f
+        \\3:
+        \\ mulxq (%%rsi), %%r8, %%r9
+        \\ adcxq %%rax, %%r8
+        \\ adoxq (%%rdi), %%r8
+        \\ movq %%r8, (%%rdi)
+        \\ mulxq 8(%%rsi), %%r8, %%r11
+        \\ adcxq %%r9, %%r8
+        \\ adoxq 8(%%rdi), %%r8
+        \\ movq %%r8, 8(%%rdi)
+        \\ mulxq 16(%%rsi), %%r8, %%r9
+        \\ adcxq %%r11, %%r8
+        \\ adoxq 16(%%rdi), %%r8
+        \\ movq %%r8, 16(%%rdi)
+        \\ mulxq 24(%%rsi), %%r8, %%r11
+        \\ adcxq %%r9, %%r8
+        \\ adoxq 24(%%rdi), %%r8
+        \\ movq %%r8, 24(%%rdi)
+        \\ movq %%r11, %%rax
+        \\ adoxq %%r10, %%rax
+        \\ leaq 32(%%rsi), %%rsi
+        \\ leaq 32(%%rdi), %%rdi
+        \\ decq %%rcx
+        \\ jnz 3b
+        \\4:
+        \\ adcq %%r10, %%rax
+        : [carry] "={rax}" (carry),
+          [d0] "={rdi}" (d0),
+          [d1] "={rsi}" (d1),
+          [d2] "={rcx}" (d2),
+          [d3] "={r11}" (d3),
+        : [tp] "{rdi}" (tp),
+          [vp] "{rsi}" (vp),
+          [rem] "{rcx}" (rem),
+          [grp] "{r11}" (grp),
+          [x] "{rdx}" (x),
+        : .{ .r8 = true, .r9 = true, .r10 = true, .cc = true, .memory = true });
+    return carry;
 }
 
 // Constant-time conditional subtract of `m` from the (n+1)-word value

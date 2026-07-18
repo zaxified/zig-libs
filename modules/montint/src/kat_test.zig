@@ -164,6 +164,157 @@ test "squaring differential: montSqrCios == montMulCios(a,a) across ALL limb cou
     try sqrDifferentialAtN(4096, 300, 0x5A11_0040); // L=64
 }
 
+// ── 2c. ASM squaring differential: asm montSqr == montSqrCios == montMul(a,a) ─
+//
+// The dedicated amd64 asm square is anchored THREE ways per trial: against the
+// portable dedicated square (`montSqrCios`, itself pinned to `montMulCios(a,a)`
+// in 2b and transitively to the external CPython oracle), against the asm
+// general multiply on the same operand (`asm_core.montMul(a,a)`, proven by the
+// montMul differential), and through the public `montSqr` dispatch. Runs in
+// Debug AND ReleaseFast. Limb counts cover every rem∈{0,1,2,3} class of the
+// reduction row (32,33,34,35) plus 48 and 64; the cross-product rows sweep
+// every length 1..n−1 within a single op, so all remainder paths of `mulRow`
+// are exercised at every n.
+
+fn asmSqrDifferentialAtN(comptime bits: comptime_int, trials: usize, seed: u64) !void {
+    const M = Modint(bits);
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rand = prng.random();
+    var t: usize = 0;
+    while (t < trials) : (t += 1) {
+        // odd modulus, top bit set ⇒ any L-limb value is < 2m.
+        var mv: M.Elem = undefined;
+        for (&mv) |*w| w.* = rand.int(u64);
+        mv[0] |= 1;
+        mv[M.L - 1] |= 1 << 63;
+        const m = try M.fromElem(mv);
+        const a = randBelow(M, rand, &mv);
+        try asmSqrCheckOne(M, &m, &a);
+    }
+    // Deterministic carry-saturation edges: m = 2^(64L)−1 (odd, all-ones), with
+    // a = m−1 (maximal limbs 0xFF…FE) and a small dense value; plus a = 0 and 1.
+    const m1 = try M.fromElem(@as(M.Elem, @splat(std.math.maxInt(u64))));
+    var edge: M.Elem = @splat(std.math.maxInt(u64));
+    edge[0] = std.math.maxInt(u64) - 1; // a = m−1
+    try asmSqrCheckOne(M, &m1, &edge);
+    edge = std.mem.zeroes(M.Elem);
+    try asmSqrCheckOne(M, &m1, &edge); // a = 0
+    edge[0] = 1;
+    try asmSqrCheckOne(M, &m1, &edge); // a = 1
+}
+
+fn asmSqrCheckOne(comptime M: type, m: *const M, a: *const M.Elem) !void {
+    const want = m.montSqrCios(a); // portable dedicated square (2b-anchored)
+    var got_sqr: M.Elem = undefined;
+    var scratch: [2 * M.L]u64 = undefined;
+    asm_core.montSqr(&got_sqr, a, &m.m, m.n0inv, &scratch);
+    try std.testing.expectEqualSlices(u64, &want, &got_sqr);
+    // asm general multiply on the same operand (independent asm path).
+    var got_mul: M.Elem = undefined;
+    asm_core.montMul(&got_mul, a, a, &m.m, m.n0inv);
+    try std.testing.expectEqualSlices(u64, &want, &got_mul);
+    // public dispatch (routes to the asm square at L ≥ asm_min_limbs).
+    const got_pub = m.montSqr(a);
+    try std.testing.expectEqualSlices(u64, &want, &got_pub);
+}
+
+test "ASM squaring differential: asm montSqr == montSqrCios == asm montMul(a,a)" {
+    if (!gate.asm_core_implemented) return error.SkipZigTest; // SKIP ≠ pass
+    if (!asm_core.supported) return error.SkipZigTest; // non-amd64 target
+
+    // Small L first (the asm square must be correct at EVERY n, like montMul —
+    // the L≥32 cutoff is a speed dispatch, not a correctness bound)…
+    try asmSqrDifferentialAtN(64, 2000, 0xA5B_0001); // L=1
+    try asmSqrDifferentialAtN(128, 2000, 0xA5B_0002); // L=2
+    try asmSqrDifferentialAtN(192, 2000, 0xA5B_0003); // L=3
+    try asmSqrDifferentialAtN(256, 2000, 0xA5B_0004); // L=4
+    try asmSqrDifferentialAtN(320, 1500, 0xA5B_0005); // L=5
+    try asmSqrDifferentialAtN(512, 1500, 0xA5B_0008); // L=8
+    try asmSqrDifferentialAtN(1024, 800, 0xA5B_0010); // L=16
+    try asmSqrDifferentialAtN(1088, 800, 0xA5B_0011); // L=17
+    // …then the sizes the asm square actually serves (all rem classes of the
+    // reduction row: 32≡0, 33≡1, 34≡2, 35≡3 mod 4) and the big RSA/Paillier Ls.
+    try asmSqrDifferentialAtN(2048, 1000, 0xA5B_0020); // L=32 (dispatch boundary)
+    try asmSqrDifferentialAtN(2112, 700, 0xA5B_0021); // L=33
+    try asmSqrDifferentialAtN(2176, 500, 0xA5B_0022); // L=34
+    try asmSqrDifferentialAtN(2240, 500, 0xA5B_0023); // L=35
+    try asmSqrDifferentialAtN(3072, 400, 0xA5B_0030); // L=48 (rsa-3072)
+    try asmSqrDifferentialAtN(4096, 300, 0xA5B_0040); // L=64
+}
+
+// Positive control for the ASM square: a deliberately-wrong asm-rows square —
+// built from the SAME `asm_core.mulRow` primitive but with the doubling pass
+// omitted (every off-diagonal product counted once instead of twice) — must
+// DISAGREE with the oracle square, proving the asm differential has teeth.
+fn brokenAsmSqrNoDouble(comptime M: type, self: *const M, a: *const M.Elem) M.Elem {
+    const L = M.L;
+    var A = [_]u64{0} ** (2 * L);
+    // cross-product rows via the real asm primitive (correct)
+    var i: usize = 0;
+    while (i + 1 < L) : (i += 1) {
+        const len = L - 1 - i;
+        A[i + L] = asm_core.mulRow(@as([*]u64, &A) + (2 * i + 1), @as([*]const u64, a) + (i + 1), len & 3, len >> 2, a[i]);
+    }
+    // DOUBLING DELIBERATELY OMITTED (the bug).
+    // diagonal (correct)
+    var dcarry: u64 = 0;
+    i = 0;
+    while (i < L) : (i += 1) {
+        const sq = @as(u128, a[i]) * @as(u128, a[i]);
+        const p1 = @as(u128, A[2 * i]) + @as(u64, @truncate(sq)) + dcarry;
+        A[2 * i] = @truncate(p1);
+        const p2 = @as(u128, A[2 * i + 1]) + @as(u64, @truncate(sq >> 64)) + @as(u64, @truncate(p1 >> 64));
+        A[2 * i + 1] = @truncate(p2);
+        dcarry = @truncate(p2 >> 64);
+    }
+    // reduction rows via the real asm primitive (correct)
+    var cc: u64 = 0;
+    i = 0;
+    while (i < L) : (i += 1) {
+        const u = A[i] *% self.n0inv;
+        const carry = asm_core.mulRow(@as([*]u64, &A) + i, &self.m, L & 3, L >> 2, u);
+        const s = @as(u128, A[i + L]) + carry + cc;
+        A[i + L] = @truncate(s);
+        cc = @truncate(s >> 64);
+    }
+    var z: M.Elem = undefined;
+    @memcpy(&z, A[L .. 2 * L]);
+    var borrow: u1 = 0;
+    var diff = z;
+    for (&diff, &self.m) |*d, mi| {
+        const s = @subWithOverflow(d.*, mi);
+        const s2 = @subWithOverflow(s[0], borrow);
+        d.* = s2[0];
+        borrow = s[1] | s2[1];
+    }
+    const under = @subWithOverflow(cc, @as(u64, borrow))[1];
+    if (under == 0) z = diff;
+    return z;
+}
+
+test "positive control: an asm square missing the off-diagonal double is caught (teeth)" {
+    if (!gate.asm_core_implemented) return error.SkipZigTest;
+    if (!asm_core.supported) return error.SkipZigTest;
+    const M = Modint(2048); // a size the asm square actually serves
+    var prng = std.Random.DefaultPrng.init(0xA5B_DEAD);
+    const rand = prng.random();
+    var disagreements: usize = 0;
+    var trials: usize = 0;
+    while (trials < 100) : (trials += 1) {
+        var mv: M.Elem = undefined;
+        for (&mv) |*w| w.* = rand.int(u64);
+        mv[0] |= 1;
+        mv[M.L - 1] |= 1 << 63;
+        const m = try M.fromElem(mv);
+        const a = randBelow(M, rand, &mv);
+        const good = m.montSqrCios(&a);
+        const broken = brokenAsmSqrNoDouble(M, &m, &a);
+        if (!std.mem.eql(u64, &good, &broken)) disagreements += 1;
+    }
+    // teeth: missing the ×2 MUST be observable.
+    try std.testing.expect(disagreements > 0);
+}
+
 // Positive control for the SQUARE: a deliberately-wrong square (drops the
 // diagonal `a[i]²` term) must DISAGREE with `montMulCios(a,a)`, proving the
 // differential above has teeth — a silently-passing square is caught here.
