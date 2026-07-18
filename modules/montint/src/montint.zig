@@ -447,12 +447,17 @@ pub fn Modint(comptime max_bits: comptime_int) type {
                 var s: usize = 0;
                 while (s < w) : (s += 1) acc = self.montSqr(&acc);
                 const digit = getBits(exp, win * w, w);
-                // constant-time gather of table[digit].
+                // Constant-time gather of table[digit]: a branchless masked
+                // linear scan over ALL `table_len` entries. The per-entry mask
+                // is laundered through `blackBox` so the optimizer cannot
+                // recover "pick the matching entry" and lower it to a
+                // secret-indexed jump table (see `blackBox`). Every entry is
+                // read and blended unconditionally, in constant work.
                 var g = std.mem.zeroes(Elem);
                 var idx: usize = 0;
                 while (idx < table_len) : (idx += 1) {
-                    const on: u1 = @intFromBool(idx == digit);
-                    for (&g, &table[idx]) |*gl, tl| gl.* = limbs.select(on, tl, gl.*);
+                    const mask = blackBox(0 -% @as(u64, @intFromBool(idx == digit)));
+                    for (&g, &table[idx]) |*gl, tl| gl.* = (tl & mask) | (gl.* & ~mask);
                 }
                 acc = self.montMul(&acc, &g);
             }
@@ -460,6 +465,22 @@ pub fn Modint(comptime max_bits: comptime_int) type {
         }
 
         // ── internal CT helpers ─────────────────────────────────────────────
+
+        // Optimization barrier: launder a value through an (empty) inline-asm
+        // so LLVM loses all range/equality knowledge about it. Used on the
+        // per-entry select mask in the `powMont` window gather: without it the
+        // optimizer recognises the "select the one entry where idx == digit"
+        // masked scan and lowers it to a secret-indexed jump table
+        // (`jmp *tbl(,digit,8)`), a real timing/BTB + memory-access-pattern
+        // leak of the secret exponent. Laundering the mask forces the branchless
+        // linear scan to survive — all 2^w entries are touched unconditionally
+        // (verified by disassembly). No-op at runtime (empty asm template).
+        inline fn blackBox(x: u64) u64 {
+            return asm volatile (""
+                : [ret] "=r" (-> u64),
+                : [x] "0" (x),
+            );
+        }
 
         // Constant-time conditional subtract of `m` from the (L+1)-word value
         // (`v` low L words, `top` the carry word 0/1). Subtracts m iff the full
