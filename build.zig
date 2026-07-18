@@ -162,6 +162,7 @@ const module_list = [_]Module{
     .{ .name = "fss" },
     .{ .name = "bfv" },
     .{ .name = "groth16", .deps = &.{"bn254"} },
+    .{ .name = "tfhe" },
     // Scaffold more here (copy modules/_template) — see CONVENTIONS.md
     // "How to add a module" and the README "Roadmap / Non-goals" sections.
 };
