@@ -153,7 +153,7 @@ const module_list = [_]Module{
     .{ .name = "paillier", .deps = &.{"montint"} },
     .{ .name = "threshold_ecdsa", .deps = &.{"paillier"} },
     .{ .name = "dkg", .deps = &.{ "threshold_ecdsa", "paillier" } },
-    .{ .name = "vdf" },
+    .{ .name = "vdf", .deps = &.{"montint"} },
     .{ .name = "signal" },
     .{ .name = "mls", .deps = &.{"hpke"} },
     .{ .name = "ebpf", .deps = &.{"netlink"} },

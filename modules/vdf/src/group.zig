@@ -57,6 +57,120 @@ pub fn mul(m: Modulus, x: Fe, y: Fe) Fe {
     return m.mul(x, y);
 }
 
+// ── montint fast-path backend (the hot modular arithmetic) ──────────────────
+//
+// `std.crypto.ff` is a portable scalar CONSTANT-TIME Montgomery implementation
+// (63-bit redundant limbs, 4-way half-limb `mulWide`) — it protects a secret
+// exponent at a ~4–8× throughput cost. A VDF has NO secret exponent: `eval`'s
+// `T` sequential squarings, `prove`'s streaming quotient, and `verify`'s
+// exponentiations all run on the PUBLIC Fiat-Shamir transcript (`N`, `x`, `y`,
+// `π`, `l`, `r`). Paying the constant-time tax here buys nothing — worse, it
+// slackens the delay calibration: an adversary with a fast (non-CT) squaring
+// finishes `~4–8×` sooner than this `eval` predicts, so any `T` calibrated
+// against the slow `eval` UNDERSHOOTS the real delay (see `audit/modules/vdf.md`
+// F2). We therefore route every squaring/multiply through the sibling `montint`
+// module's full-radix-2^64 Montgomery arithmetic — the SAME `MontParams`/limb-
+// dispatch pattern `rsa` (`603a493`) and `paillier` (`6b587a5`) already use.
+//
+// Unlike Paillier (whose `n²` and CRT `p²`/`q²` differ in width, forcing a
+// runtime slot dispatch), a VDF operates over a SINGLE modulus `N` of a fixed
+// `modulus_bits` (2048) ceiling — so one comptime `Modint(modulus_bits)`
+// instantiation covers every case. A caller-supplied `N` of fewer bits simply
+// occupies the low limbs with leading zero limbs (correct, marginally slower).
+// `montint` exposes a fast (non-CT) Montgomery multiply as its only mul, which
+// is exactly what we want here: no slower CT path is introduced on this public
+// data — a faster `eval` TIGHTENS the honesty of the delay calibration.
+const montint = @import("montint");
+
+/// The montint Montgomery context for `N`: `L = modulus_bits/64` (32) full
+/// 2^64 limbs, precomputed constants (`n0inv`, `R mod N`, `R² mod N`). Reused
+/// across all `T` squarings of an `eval`/`prove` so the one-time Montgomery
+/// setup (`fromBytesBE`'s constant doubling) is paid once, not per squaring.
+pub const MontN = montint.Modint(modulus_bits);
+
+/// A Montgomery-domain group element (`L` little-endian 2^64 limbs). Values
+/// stay in this domain across a whole squaring loop — convert in once
+/// (`toMont`), square/multiply `T` times, convert out once (`fromMont`).
+pub const MontFe = MontN.Elem;
+
+/// Precompute the montint Montgomery context for the group modulus `N`.
+/// Cheap (a `toBytes` + the `computeConstants` doubling loop, no per-squaring
+/// cost) but not free — call once per `eval`/`prove`/`verify`, not per tick.
+pub fn montModulus(m: Modulus) MontN {
+    var be: [modulus_bytes]u8 = undefined;
+    m.toBytes(&be, .big) catch unreachable; // buffer is exactly modulus_bytes
+    return MontN.fromBytesBE(&be) catch unreachable; // N is odd, ≥3, ≤ modulus_bits
+}
+
+/// Load a validated group element (an `Fe`, value `< N`) into the Montgomery
+/// domain: `a → a·R mod N`.
+pub fn toMont(mod: *const MontN, x: Fe) MontFe {
+    var be: [modulus_bytes]u8 = undefined;
+    x.toBytes(&be, .big) catch unreachable; // buffer is exactly modulus_bytes
+    const v = mod.elementFromBytesBE(&be) catch unreachable; // x < N (validated upstream)
+    return mod.toMontgomery(&v);
+}
+
+/// Convert a Montgomery-domain element back to a canonical group `Fe`:
+/// `a·R⁻¹ mod N`, re-canonicalized through `Fe`.
+pub fn fromMont(m: Modulus, mod: *const MontN, a_mont: MontFe) Fe {
+    const v = mod.fromMontgomery(&a_mont);
+    var be: [MontN.encoded_bytes]u8 = undefined; // encoded_bytes == modulus_bytes
+    mod.toBytesBE(&v, &be);
+    return Fe.fromBytes(m, &be, .big) catch unreachable; // v < N
+}
+
+/// `1` in the Montgomery domain (`R mod N`) — the accumulator seed for
+/// `prove`'s streaming quotient and `verify`'s square-and-multiply.
+pub fn montOne(mod: *const MontN) MontFe {
+    return mod.one_mont;
+}
+
+/// Montgomery-domain squaring — ONE `eval` "tick": `a² · R⁻¹ mod N`, staying
+/// resident in the Montgomery domain (no per-call conversion). This is the hot
+/// operation the whole rewire exists to speed up.
+pub inline fn montSquare(mod: *const MontN, a_mont: MontFe) MontFe {
+    return mod.montSqr(&a_mont);
+}
+
+/// Montgomery-domain multiply: `a · b · R⁻¹ mod N` (both operands Montgomery-
+/// resident). Used for `prove`'s Horner step and `verify`'s combine.
+pub inline fn montMulResident(mod: *const MontN, a_mont: MontFe, b_mont: MontFe) MontFe {
+    return mod.montMul(&a_mont, &b_mont);
+}
+
+/// `base^exp mod N` for a PUBLIC exponent (a Fiat-Shamir transcript value —
+/// `l` or `r`; NO secret), via left-to-right square-and-multiply over `exp`'s
+/// actual bit length, Montgomery-resident throughout. Variable-time in `exp`
+/// is fine (and faster) precisely because `exp` is public — the `montint`
+/// analogue of the `ff.powWithEncodedPublicExponent` calls it replaces.
+pub fn montPowPublic(m: Modulus, mod: *const MontN, base: Fe, exp_be: []const u8) Fe {
+    const base_mont = toMont(mod, base);
+    var acc = mod.one_mont;
+    var seen = false;
+    // Skip leading zero octets (public position — not a value-dependent
+    // side-channel concern here); always leave at least one byte.
+    var start: usize = 0;
+    while (start < exp_be.len - 1 and exp_be[start] == 0) start += 1;
+    for (exp_be[start..]) |byte| {
+        var mask: u8 = 0x80;
+        while (mask != 0) : (mask >>= 1) {
+            if (seen) acc = mod.montSqr(&acc);
+            if (byte & mask != 0) {
+                if (seen) {
+                    acc = mod.montMul(&acc, &base_mont);
+                } else {
+                    acc = base_mont; // first set bit: acc = base^1
+                    seen = true;
+                }
+            }
+        }
+    }
+    // exp == 0 (never happens for l/r, but correct anyway): acc stays R mod N,
+    // fromMont → 1 = base^0.
+    return fromMont(m, mod, acc);
+}
+
 /// Serializes a group element to canonical big-endian bytes
 /// (`out.len` must equal `modulus_bytes`; leading zeros included, no
 /// compression — this is what `hashToPrime`'s `(N, x, y, T)` binding and

@@ -19,10 +19,18 @@ const group = @import("group.zig");
 /// to `T`; entirely mechanical (no cryptographic design judgment beyond
 /// "call `group.square` in a loop"), unlike `prove`/`verify` below.
 pub fn eval(m: group.Modulus, x: group.Fe, t: u64) group.Fe {
-    var y = x;
+    // Montgomery-resident: convert `x` into the Montgomery domain ONCE, perform
+    // the `T` sequential squarings there (each a single `montint` Montgomery
+    // squaring — the fast, non-constant-time path, correct because every value
+    // is public: see `group.zig`'s montint-backend note), then convert out
+    // ONCE. Staying resident across the loop is the whole speed win — the two
+    // domain conversions are amortized over all `T` ticks. `T = 0` is the
+    // identity (0 squarings; the in/out round trip returns `x`).
+    const mod = group.montModulus(m);
+    var y = group.toMont(&mod, x);
     var i: u64 = 0;
-    while (i < t) : (i += 1) y = group.square(m, y);
-    return y;
+    while (i < t) : (i += 1) y = group.montSquare(&mod, y);
+    return group.fromMont(m, &mod, y);
 }
 
 // ── hashToPrime — the Fiat-Shamir challenge prime (REAL) ────────────────────
@@ -450,20 +458,27 @@ const RemUintWide = std.meta.Int(.unsigned, prime_bits + 1);
 /// `root.zig`'s "not constant-time" caveat).
 fn streamingQuotientPow(m: group.Modulus, x: group.Fe, l_bytes: *const [prime_bytes]u8, t: u64) group.Fe {
     const l = std.mem.readInt(RemUint, l_bytes, .big);
+    // The `group.Modulus`-sized squaring/multiply move onto montint's fast
+    // Montgomery arithmetic (public data — no CT tax; see `group.zig`); the
+    // streaming long-division of `2^t` by `l` (`r_acc` recurrence + quotient
+    // bit) is unchanged. `pi` stays Montgomery-resident across the `t` steps —
+    // `x` is converted in once, the accumulator seeds at Montgomery `1`.
+    const mod = group.montModulus(m);
+    const x_mont = group.toMont(&mod, x);
     var r_acc: RemUint = 1;
-    var pi = m.one();
+    var pi = group.montOne(&mod);
     var i: u64 = 0;
     while (i < t) : (i += 1) {
         const doubled = @as(RemUintWide, r_acc) << 1;
-        pi = group.square(m, pi);
+        pi = group.montSquare(&mod, pi);
         if (doubled >= l) {
             r_acc = @intCast(doubled - l); // quotient bit 1
-            pi = group.mul(m, pi, x);
+            pi = group.montMulResident(&mod, pi, x_mont);
         } else {
             r_acc = @intCast(doubled); // quotient bit 0
         }
     }
-    return pi;
+    return group.fromMont(m, &mod, pi);
 }
 
 /// TEST-ONLY reference for `streamingQuotientPow`: materialize
@@ -576,15 +591,23 @@ pub fn verify(m: group.Modulus, x_bytes: []const u8, y_bytes: []const u8, proof:
     r.toBytes(&r_bytes, .big) catch unreachable; // buffer is exactly prime_bytes
 
     // Step 4: accept iff pi^l * x^r == y (mod N). Both exponents are
-    // public (Fiat-Shamir transcript values), hence the Public variant;
-    // neither is ever zero: `l` has its top bit forced, and `r = 2^t mod
-    // l != 0` since `l` is an odd prime (no power of 2 divides it).
-    const pi_l = m.powWithEncodedPublicExponent(pi, &l_bytes, .big) catch unreachable;
-    const x_r = m.powWithEncodedPublicExponent(x, &r_bytes, .big) catch unreachable;
+    // public (Fiat-Shamir transcript values), so both exponentiations run on
+    // montint's fast (non-constant-time) Montgomery arithmetic via
+    // `group.montPowPublic` — no CT tax on public data (see `group.zig`).
+    // Neither exponent is ever zero: `l` has its top bit forced, and
+    // `r = 2^t mod l != 0` since `l` is an odd prime (no power of 2 divides it).
+    const mod = group.montModulus(m);
+    const pi_l = group.montPowPublic(m, &mod, pi, &l_bytes);
+    const x_r = group.montPowPublic(m, &mod, x, &r_bytes);
     return group.mul(m, pi_l, x_r).eql(y);
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
+//
+// TODO(audit F1, `audit/modules/vdf.md`): add the positive-control soundness
+// test — the adaptive false-`y` forgery probe must be REJECTED by `verify` and
+// FLIP to accepted if `y` is unbound from `hashToPrime`. Separate test-teeth
+// follow-up; intentionally NOT bundled with this montint rewire.
 
 const testing = std.testing;
 
