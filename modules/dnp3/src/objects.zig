@@ -74,9 +74,15 @@ pub const Range = union(enum) {
     /// `stop - start + 1`; `count`: the count value). `all_values` has no
     /// fixed instance count (the receiver already knows what "all" means
     /// for the group/variation) and returns `null`.
-    pub fn objectCount(self: Range) ?u32 {
+    ///
+    /// Returns `u64`, not `u32`: `start` and `stop` are each full `u32`
+    /// wire values, so `stop - start + 1` can reach `0x1_0000_0000` (e.g.
+    /// `start = 0, stop = 0xFFFFFFFF`), which overflows `u32` — widen the
+    /// arithmetic to `u64` before the subtraction so that case can't panic
+    /// or wrap.
+    pub fn objectCount(self: Range) ?u64 {
         return switch (self) {
-            .start_stop => |r| if (r.stop >= r.start) r.stop - r.start + 1 else null,
+            .start_stop => |r| if (r.stop >= r.start) @as(u64, r.stop) - r.start + 1 else null,
             .all_values => null,
             .count => |c| c,
         };
@@ -690,6 +696,20 @@ test "object header: 2-byte start-stop range" {
     try testing.expectEqual(@as(u32, 256), decoded.header.range.objectCount().?);
 }
 
+test "Range.objectCount: full-width start/stop does not overflow u32" {
+    // Regression for a crash: `stop - start + 1` was computed in u32 on
+    // wire-controlled values. `start = 0, stop = 0xFFFFFFFF` makes
+    // `stop - start + 1 == 0x1_0000_0000`, which overflows u32 (panic in
+    // Debug/ReleaseSafe, silent wrap to 0 in ReleaseFast). Wire bytes:
+    // group=1, variation=2, qualifier=0x02 (start_stop_4b, no prefix),
+    // start=0x00000000, stop=0xFFFFFFFF.
+    const bytes = [_]u8{ 1, 2, 0x02, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF };
+    const decoded = try decodeObjectHeader(&bytes);
+    try testing.expectEqual(@as(u32, 0), decoded.header.range.start_stop.start);
+    try testing.expectEqual(@as(u32, 0xFFFFFFFF), decoded.header.range.start_stop.stop);
+    try testing.expectEqual(@as(u64, 0x1_0000_0000), decoded.header.range.objectCount().?);
+}
+
 test "object header: all-values qualifier (class read)" {
     const h = g60.readClassHeader(.class0);
     var out: [8]u8 = undefined;
@@ -698,7 +718,7 @@ test "object header: all-values qualifier (class read)" {
     const decoded = try decodeObjectHeader(bytes);
     try testing.expectEqual(@as(usize, 3), decoded.consumed);
     try testing.expect(decoded.header.range == .all_values);
-    try testing.expectEqual(@as(?u32, null), decoded.header.range.objectCount());
+    try testing.expectEqual(@as(?u64, null), decoded.header.range.objectCount());
 }
 
 test "object header: count + 1-byte index prefix (0x17, CROB write)" {
