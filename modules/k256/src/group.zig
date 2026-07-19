@@ -31,8 +31,6 @@ const gate = @import("gate.zig");
 const field = @import("field.zig");
 const scalarmod = @import("scalar.zig");
 
-const Fe = field.Fe;
-
 const IdentityElementError = std.crypto.errors.IdentityElementError;
 const EncodingError = std.crypto.errors.EncodingError;
 const NonCanonicalError = std.crypto.errors.NonCanonicalError;
@@ -46,6 +44,17 @@ pub const Secp256k1 = struct {
 
     /// The curve constant `b` in `y² = x³ + b`.
     pub const B = Fe.fromInt(7) catch unreachable;
+
+    /// The base-field element type, exposed as `Secp256k1.Fe` to mirror
+    /// `std.crypto.ecc.Secp256k1.Fe` so the Bitcoin/LN consumers that alias
+    /// `const Fe = Secp256k1.Fe;` are drop-in on k256.
+    pub const Fe = field.Fe;
+    /// The scalar field (mod the group order `n`), exposed as
+    /// `Secp256k1.scalar` to mirror `std.crypto.ecc.Secp256k1.scalar`. This is
+    /// std's constant-time scalar field verbatim (see `scalar.zig`'s scope
+    /// note), so consumers aliasing `const scalar = Secp256k1.scalar;` are
+    /// drop-in.
+    pub const scalar = scalarmod.scalar;
 
     /// The standard base point `G`.
     pub const basePoint = Secp256k1{
@@ -517,7 +526,7 @@ fn oddMultiples(p: Secp256k1) [glv_table_len]Secp256k1 {
 /// endomorphism, φ((2i+1)·p) = (2i+1)·φ(p) — one field mul per entry instead
 /// of rebuilding the table from φ(p).
 fn phiTable(tab: *const [glv_table_len]Secp256k1) [glv_table_len]Secp256k1 {
-    const beta_fe = comptime (Fe.fromInt(scalarmod.beta) catch unreachable);
+    const beta_fe = comptime (field.Fe.fromInt(scalarmod.beta) catch unreachable);
     var out: [glv_table_len]Secp256k1 = undefined;
     for (tab, &out) |t, *o| o.* = .{ .x = t.x.mul(beta_fe), .y = t.y, .z = t.z };
     return out;
@@ -631,14 +640,14 @@ inline fn blackBox(x: u64) u64 {
 
 /// Masked limb blend: `dst = (dst & ~mask) | (src & mask)`. `mask` is 0 or all
 /// ones (laundered by `blackBox`).
-inline fn blendLimbs(dst: *Fe, src: Fe, mask: u64) void {
+inline fn blendLimbs(dst: *field.Fe, src: field.Fe, mask: u64) void {
     for (&dst.limbs, src.limbs) |*d, s| d.* = (s & mask) | (d.* & ~mask);
 }
 
 /// A point in affine coordinates.
 pub const AffineCoordinates = struct {
-    x: Fe,
-    y: Fe,
+    x: field.Fe,
+    y: field.Fe,
 
     pub const identityElement = AffineCoordinates{
         .x = Secp256k1.identityElement.x,
@@ -703,7 +712,7 @@ test "differential vs std: dbl/add/scalarmul on random scalars" {
 }
 
 test "GLV endomorphism: (β·x, y) == λ·P (validates β and λ against the curve)" {
-    const beta = Fe.fromInt(scalarmod.beta) catch unreachable;
+    const beta = field.Fe.fromInt(scalarmod.beta) catch unreachable;
     var lambda_le: [32]u8 = undefined;
     std.mem.writeInt(u256, &lambda_le, scalarmod.lambda, .little);
     var prng = std.Random.DefaultPrng.init(0xBE7A_1A3D);
@@ -729,7 +738,7 @@ test "recoverY / lift_x matches std" {
     while (i < 1500) : (i += 1) {
         var xb: [32]u8 = undefined;
         rand.bytes(&xb);
-        const kx = Fe.fromBytes(xb, .big) catch continue;
+        const kx = field.Fe.fromBytes(xb, .big) catch continue;
         const sx = Std.Fe.fromBytes(xb, .big) catch unreachable;
         if (Std.recoverY(sx, false)) |sy| {
             const ky = try Secp256k1.recoverY(kx, false);
