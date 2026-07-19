@@ -344,3 +344,12 @@ test "decode/encode: empty string" {
 test "encode: invalid UTF-8 passes through verbatim" {
     try expectEncode(.iso_8859_1, "ab\xffcd", "ab\xffcd");
 }
+
+test "encode: a valid multi-byte lead truncated at buffer end passes through, no OOB (audit F1)" {
+    // The invalid-leading-byte case above (0xFF) is caught by utf8ByteSequenceLength;
+    // the SEPARATE truncated-trailing-sequence bounds check (a valid lead byte with
+    // too few continuation bytes left in the buffer) was load-bearing but untested —
+    // disabling it OOB-read past the buffer. These exercise that path directly.
+    try expectEncode(.iso_8859_1, "ab\xc2", "ab\xc2"); // 2-byte lead (0xC2), 0 continuation
+    try expectEncode(.iso_8859_1, "ab\xe2\x82", "ab\xe2\x82"); // 3-byte lead (0xE2), only 1 continuation
+}
