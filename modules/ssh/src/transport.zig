@@ -884,6 +884,39 @@ fn hexBytes(comptime hex: []const u8) [hex.len / 2]u8 {
 const group14_prime = hexBytes(group14_prime_hex);
 const group16_prime = hexBytes(group16_prime_hex);
 
+/// Big-endian magnitude minus one, computed at comptime (used to derive
+/// `p-1` from each group's prime for the RFC 4253 §8 `1 < e,f < p-1` upper-
+/// bound check below — general subtract-with-borrow, not a "decrement the
+/// last byte" shortcut, so it stays correct even though these particular
+/// primes happen to end in a non-zero byte).
+fn decrementBigEndian(comptime n: usize, bytes: [n]u8) [n]u8 {
+    var out = bytes;
+    var i: usize = n;
+    while (i > 0) {
+        i -= 1;
+        if (out[i] != 0) {
+            out[i] -= 1;
+            break;
+        }
+        out[i] = 0xff;
+    }
+    return out;
+}
+
+const group14_prime_minus_1 = decrementBigEndian(group14_prime.len, group14_prime);
+const group16_prime_minus_1 = decrementBigEndian(group16_prime.len, group16_prime);
+
+/// `a >= b`, comparing two non-negative big-endian magnitudes. `b` is
+/// always a caller-supplied constant with no leading zero byte (e.g.
+/// `DhGroup.prime_minus_1`); `a` is expected to already be
+/// `stripLeadingZeros`'d. A longer magnitude (no leading zero) is always
+/// numerically larger; equal-length magnitudes compare lexicographically,
+/// which is order-preserving for big-endian byte strings.
+fn magnitudeGreaterOrEqual(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return a.len > b.len;
+    return std.mem.order(u8, a, b) != .lt;
+}
+
 /// RFC 3526 modulus large enough for both group14 (2048-bit) and group16
 /// (4096-bit) primes.
 const DhModulus = std.crypto.ff.Modulus(4096);
@@ -893,15 +926,29 @@ const DhModulus = std.crypto.ff.Modulus(4096);
 /// `dhGroupKexServer` (server.zig) can reuse the same primes + digest choice.
 pub const DhGroup = struct {
     prime: []const u8,
+    /// `prime - 1`, precomputed, for the RFC 4253 §8 `1 < e,f < p-1` upper-
+    /// bound peer-value check (`magnitudeGreaterOrEqual`).
+    prime_minus_1: []const u8,
     /// true → SHA-512 (group16), false → SHA-256 (group14).
     sha512: bool,
 
     pub fn forName(name: []const u8) ?DhGroup {
         if (std.mem.eql(u8, name, "diffie-hellman-group14-sha256"))
-            return .{ .prime = &group14_prime, .sha512 = false };
+            return .{ .prime = &group14_prime, .prime_minus_1 = &group14_prime_minus_1, .sha512 = false };
         if (std.mem.eql(u8, name, "diffie-hellman-group16-sha512"))
-            return .{ .prime = &group16_prime, .sha512 = true };
+            return .{ .prime = &group16_prime, .prime_minus_1 = &group16_prime_minus_1, .sha512 = true };
         return null;
+    }
+
+    /// RFC 4253 §8: `1 < v < p-1`. Rejects `v == 0`, `v == 1`, `v >= p-1`
+    /// (which includes `v == p` and `v == p-1` — the degenerate residues
+    /// that force a known `K` on these safe-prime groups) and `v > p`
+    /// (oversized). `v` must already be `stripLeadingZeros`'d.
+    pub fn rejectsDegeneratePeerValue(self: DhGroup, v: []const u8) bool {
+        if (v.len == 0 or (v.len == 1 and v[0] <= 1)) return true;
+        if (v.len > self.prime.len) return true;
+        if (magnitudeGreaterOrEqual(v, self.prime_minus_1)) return true;
+        return false;
     }
 };
 
@@ -998,10 +1045,10 @@ pub fn dhGroupKex(
     const f = try cur.string(); // mpint magnitude (leading sign-pad, if any)
     const sig = try cur.string();
 
-    // 1 < f < p-1 (reject degenerate peer values).
+    // 1 < f < p-1 (reject degenerate peer values — RFC 4253 §8. `f == p`
+    // or `f == p-1` would force a known K on these safe-prime groups).
     const f_mag = stripLeadingZeros(f);
-    if (f_mag.len == 0 or (f_mag.len == 1 and f_mag[0] <= 1)) return error.KexFailed;
-    if (f_mag.len > group.prime.len) return error.KexFailed;
+    if (group.rejectsDegeneratePeerValue(f_mag)) return error.KexFailed;
 
     // K = f^x mod p.
     var kbuf: [group16_prime.len]u8 = undefined;
@@ -1697,6 +1744,85 @@ test "RFC 3526 primes: exact bit lengths + canonical RFC bytes" {
     const w2 = [_]u8{ 0xC9, 0x0F, 0xDA, 0xA2, 0x21, 0x68, 0xC2, 0x34 };
     try t.expectEqualSlices(u8, &w2, group14_prime[8..16]);
     try t.expectEqualSlices(u8, &w2, group16_prime[8..16]);
+}
+
+test "DhGroup.rejectsDegeneratePeerValue: RFC 4253 §8 upper bound (F1 regression)" {
+    const t = std.testing;
+    inline for (.{ "diffie-hellman-group14-sha256", "diffie-hellman-group16-sha512" }) |name| {
+        const group = DhGroup.forName(name).?;
+        // Degenerate: v == p forces K = 0; v == p-1 forces K in {1, p-1}.
+        // Both MUST now be rejected — this is exactly the audit's F1 gap
+        // ("comment promises 1 < v < p-1 but only the lower bound was
+        // enforced").
+        try t.expect(group.rejectsDegeneratePeerValue(group.prime));
+        try t.expect(group.rejectsDegeneratePeerValue(group.prime_minus_1));
+        // Oversized (longer than p) is still rejected (pre-existing check,
+        // must not have regressed).
+        var oversized: [group16_prime.len + 1]u8 = undefined;
+        @memset(&oversized, 0xAB);
+        try t.expect(group.rejectsDegeneratePeerValue(oversized[0 .. group.prime.len + 1]));
+        // The classic 0/1 lower-bound rejects, unchanged.
+        try t.expect(group.rejectsDegeneratePeerValue(&.{}));
+        try t.expect(group.rejectsDegeneratePeerValue(&.{0}));
+        try t.expect(group.rejectsDegeneratePeerValue(&.{1}));
+        // A genuine, well-inside-the-range value (p-2) must still be
+        // ACCEPTED — the fix must not have overreached into rejecting
+        // legitimate peer values.
+        var p_minus_2_buf: [group16_prime.len]u8 = undefined;
+        const pm1_len = group.prime_minus_1.len;
+        @memcpy(p_minus_2_buf[0..pm1_len], group.prime_minus_1);
+        p_minus_2_buf[pm1_len - 1] -= 1;
+        try t.expect(!group.rejectsDegeneratePeerValue(p_minus_2_buf[0..pm1_len]));
+        // And a small, unambiguously-legitimate value (g = 2) is accepted.
+        try t.expect(!group.rejectsDegeneratePeerValue(&.{2}));
+    }
+}
+
+/// A `HostKeyVerifier` never actually reached by the KEX-level replay tests
+/// below (the degenerate-`f` check fails before host-key verification is
+/// ever consulted) — present only to satisfy `dhGroupKex`'s signature.
+fn unreachableHostKeyVerifier(key_type: []const u8, key_blob: []const u8) bool {
+    _ = key_type;
+    _ = key_blob;
+    unreachable;
+}
+
+/// Builds a raw (unencrypted, `.none` cipher) `SSH_MSG_KEXDH_REPLY` packet
+/// carrying `f_mag` as the peer's DH public value, written into `out`.
+/// `K_S`/`sig` are throwaway bytes — `dhGroupKex` must reject `f_mag`
+/// before it ever parses them as a real host key or signature.
+fn fakeKexdhReply(f_mag: []const u8, out: []u8) ![]const u8 {
+    var payload_buf: [group16_prime.len + 64]u8 = undefined;
+    var pw: std.Io.Writer = .fixed(&payload_buf);
+    try pw.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_KEXDH_REPLY));
+    try messages.writeString(&pw, "not-a-real-host-key-blob");
+    try messages.writeMpint(&pw, f_mag);
+    try messages.writeString(&pw, "not-a-real-signature");
+
+    var none: CipherState = .none;
+    var w: std.Io.Writer = .fixed(out);
+    try writePacket(&w, &none, pw.buffered());
+    return w.buffered();
+}
+
+test "dhGroupKex (client): rejects a KEXDH_REPLY carrying f == p or f == p-1" {
+    const kex_name = "diffie-hellman-group14-sha256";
+    const group = DhGroup.forName(kex_name).?;
+
+    for ([_][]const u8{ group.prime, group.prime_minus_1 }) |degenerate_f| {
+        var reply_buf: [1024]u8 = undefined;
+        const reply = try fakeKexdhReply(degenerate_f, &reply_buf);
+
+        var r: std.Io.Reader = .fixed(reply);
+        var out_scratch: [8192]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&out_scratch);
+        var none: CipherState = .none;
+
+        try std.testing.expectError(
+            error.KexFailed,
+            dhGroupKex(&r, &w, &none, "I_C", "I_S", "V_C", "V_S", unreachableHostKeyVerifier, kex_name),
+        );
+    }
 }
 
 test "packet codec round-trip: aes256-gcm@openssh (counter increments per packet)" {

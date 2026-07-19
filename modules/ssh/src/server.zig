@@ -558,9 +558,9 @@ pub fn dhGroupKexServer(
     if (msgType(pkt) != @intFromEnum(messages.MessageType.SSH_MSG_KEXDH_INIT)) return error.KexFailed;
     var cur = WireCursor{ .b = pkt.payload[1..] };
     const e = stripLeadingZeros(try cur.string());
-    // 1 < e < p-1.
-    if (e.len == 0 or (e.len == 1 and e[0] <= 1)) return error.KexFailed;
-    if (e.len > group.prime.len) return error.KexFailed;
+    // 1 < e < p-1 (reject degenerate peer values — RFC 4253 §8. `e == p`
+    // or `e == p-1` would force a known K on these safe-prime groups).
+    if (group.rejectsDegeneratePeerValue(e)) return error.KexFailed;
 
     // Secret exponent y (full prime-length random; constant-time modexp).
     var y: [transport.dh_max_prime_len]u8 = undefined;
@@ -1468,6 +1468,43 @@ test "self-consistency (direct KEX): diffie-hellman-group14-sha256" {
 
 test "self-consistency (direct KEX): diffie-hellman-group16-sha512" {
     try directDhConsistency("diffie-hellman-group16-sha512");
+}
+
+/// Builds a raw (unencrypted, `.none` cipher) `SSH_MSG_KEXDH_INIT` packet
+/// carrying `e_mag` as the peer's DH public value, written into `out` — the
+/// server-role mirror of `transport.zig`'s `fakeKexdhReply` test helper.
+fn fakeKexdhInit(e_mag: []const u8, out: []u8) ![]const u8 {
+    var payload_buf: [4096 + 64]u8 = undefined;
+    var pw: std.Io.Writer = .fixed(&payload_buf);
+    try pw.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_KEXDH_INIT));
+    try messages.writeMpint(&pw, e_mag);
+
+    var none: transport.CipherState = .none;
+    var w: std.Io.Writer = .fixed(out);
+    try transport.writePacket(&w, &none, pw.buffered());
+    return w.buffered();
+}
+
+test "dhGroupKexServer: rejects a KEXDH_INIT carrying e == p or e == p-1 (F1 regression)" {
+    const kex_name = "diffie-hellman-group14-sha256";
+    const group = transport.DhGroup.forName(kex_name).?;
+    const hk = try HostKey.fromOpenSSH(fixture_ed25519_key, null);
+    const gpa = std.testing.allocator;
+
+    for ([_][]const u8{ group.prime, group.prime_minus_1 }) |degenerate_e| {
+        var init_buf: [1024]u8 = undefined;
+        const init_pkt = try fakeKexdhInit(degenerate_e, &init_buf);
+
+        var r: std.Io.Reader = .fixed(init_pkt);
+        var out_scratch: [8192]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&out_scratch);
+        var none: transport.CipherState = .none;
+
+        try std.testing.expectError(
+            error.KexFailed,
+            dhGroupKexServer(&r, &w, &none, "I_C", "I_S", "V_C", "V_S", hk, gpa, kex_name),
+        );
+    }
 }
 
 // ── live interop: real OpenSSH `ssh` client → our server (gated) ────────────
