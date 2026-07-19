@@ -203,6 +203,15 @@ pub const ReplayWindow = struct {
     initialized: bool = false,
     window_size: u7 = default_replay_window_size,
 
+    /// Effective window size. The u64 `mask` can track at most 64 sequence
+    /// numbers below the high-water mark, so the window never exceeds 64 even if
+    /// a caller sets a larger `window_size` (a `u7`, up to 127) — without this
+    /// clamp a `diff`/`shift` of 64..126 would `@intCast` to `u6` and panic
+    /// (config-gated latent panic on a hostile `partial_iv`).
+    fn effWindow(rw: ReplayWindow) u7 {
+        return @min(rw.window_size, 64);
+    }
+
     /// Returns `true` if `seq` would be ACCEPTED right now (not an exact
     /// duplicate, not outside the window, not already recorded) —
     /// read-only, does not mutate `rw`. Callers MUST call `update` only
@@ -213,7 +222,7 @@ pub const ReplayWindow = struct {
         if (seq > rw.highest_seen) return true;
         const diff = rw.highest_seen - seq;
         if (diff == 0) return false; // exact duplicate of the highest seen sequence number
-        if (diff > rw.window_size) return false; // too old — fell off the trailing edge of the window
+        if (diff > rw.effWindow()) return false; // too old — fell off the trailing edge of the window
         const bit: u64 = @as(u64, 1) << @intCast(diff - 1);
         return (rw.mask & bit) == 0;
     }
@@ -236,7 +245,7 @@ pub const ReplayWindow = struct {
         }
         if (seq > rw.highest_seen) {
             const shift = seq - rw.highest_seen;
-            if (shift >= rw.window_size) {
+            if (shift >= rw.effWindow()) {
                 rw.mask = 0;
             } else {
                 const shift_amt: u6 = @intCast(shift);
@@ -248,7 +257,7 @@ pub const ReplayWindow = struct {
             rw.highest_seen = seq;
         } else if (seq < rw.highest_seen) {
             const diff = rw.highest_seen - seq;
-            if (diff <= rw.window_size) {
+            if (diff <= rw.effWindow()) {
                 rw.mask |= @as(u64, 1) << @intCast(diff - 1);
             }
         }
@@ -1136,4 +1145,16 @@ test "ReplayWindow: a jump at/beyond window_size clears the old mask entirely" {
     try std.testing.expect(rw.check(7)); // diff = 3, nothing recorded, so accepted
     try std.testing.expect(rw.check(6)); // diff = 4 == window_size -> still in range, not seen -> allowed
     try std.testing.expect(!rw.check(0)); // far outside the window now
+}
+
+test "ReplayWindow: oversized window_size (>64) + hostile diff/shift does not panic (audit F1)" {
+    // window_size is a u7 (up to 127) but the u64 mask caps the real window at
+    // 64; without the effWindow clamp a diff/shift of 64..126 @intCast'd to u6
+    // and panicked. A misconfigured window must stay safe on any input.
+    var rw = ReplayWindow{ .window_size = 100 };
+    rw.update(200); // initialize highest_seen
+    try std.testing.expect(!rw.check(130)); // diff = 70 > effWindow(64) -> out of window, no panic
+    rw.update(130); // diff 70 > effWindow -> skipped, must not panic
+    rw.update(270); // shift 70 >= effWindow(64) -> mask reset, must not panic
+    try std.testing.expectEqual(@as(u64, 270), rw.highest_seen);
 }
