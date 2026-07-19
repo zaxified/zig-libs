@@ -131,9 +131,11 @@ pub const LoopixConfig = struct {
 /// mix scored with its OWN delay law, over the steady-state window (targets that
 /// arrived early enough to clear before the finite horizon — see
 /// `protocol.zig`'s cooldown note). On that basis the worst-case measured across
-/// all ~24.5k real targets was:
+/// all ~24.5k real targets was (re-measured after the release-by-own-timer fix
+/// in `protocol.zig` — releasing the queue front on every timer had paired each
+/// arrival with its maximum-likelihood departure, inflating link_prob to 0.77):
 ///
-///     correct Poisson mix : min_effective_set 2.80 , max_link_prob 0.77
+///     correct Poisson mix : min_effective_set 3.88 , max_link_prob 0.63
 ///     FIFO control        : min_effective_set 1.00 , max_link_prob 1.00
 ///     no-cover control    : min_effective_set 1.06 , max_link_prob 0.99
 ///

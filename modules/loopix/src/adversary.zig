@@ -219,6 +219,60 @@ pub fn measure(
     return res;
 }
 
+// ── the memoryless-vs-order-preserving distinguisher ─────────────────────────
+
+/// Reordering statistic over a transit transcript: among every pair of packets
+/// that were held by the SAME mix at the same time (the second arrived while
+/// the first was still in the pool — "co-resident"), how often did the LATER
+/// arrival depart FIRST ("an inversion")?
+///
+/// This is the deterministic, checkable consequence of memorylessness:
+///  - **Correct memoryless (geometric/exponential) mix:** at the moment the
+///    second packet arrives, the first packet's REMAINING hold is distributed
+///    exactly like a fresh draw (that is what memoryless means), so the two
+///    race as i.i.d. holds and the later arrival wins just under 1/2 of the
+///    time (slightly under, because exact ties count as non-inversions).
+///    Expected fraction ≈ 0.5 − O(1/mean).
+///  - **Constant-hold mix:** departure = arrival + c, so a later arrival can
+///    NEVER depart first. Fraction = 0.
+///  - **FIFO release discipline (any hold law):** identities leave in arrival
+///    order by construction. Fraction = 0.
+/// The gap is 0.5 vs 0.0 — categorical, not statistical — so a mid threshold
+/// (e.g. ≥ 0.35 over hundreds of pairs) can never flake on the correct mix nor
+/// pass an order-preserving one.
+pub const ReorderStats = struct {
+    /// Co-resident pairs examined (same mix, overlapping hold intervals,
+    /// distinct arrival ticks).
+    pairs: usize = 0,
+    /// Pairs where the later arrival departed strictly first.
+    inversions: usize = 0,
+
+    pub fn fraction(self: ReorderStats) f64 {
+        if (self.pairs == 0) return 0;
+        return @as(f64, @floatFromInt(self.inversions)) / @as(f64, @floatFromInt(self.pairs));
+    }
+};
+
+/// Compute `ReorderStats` over a transcript. All kinds count (real and cover
+/// are held under the same law — the statistic is about the mix, not the
+/// traffic class). Pairs arriving on the same tick are skipped (no defined
+/// arrival order to invert). O(n²) over the transcript — fine at sim scale.
+pub fn reorderStats(transits: []const Transit) ReorderStats {
+    var st = ReorderStats{};
+    for (transits, 0..) |a, i| {
+        for (transits[i + 1 ..]) |b| {
+            if (a.mix != b.mix) continue;
+            if (a.arrival == b.arrival) continue; // simultaneous: order undefined
+            const first = if (a.arrival < b.arrival) a else b;
+            const second = if (a.arrival < b.arrival) b else a;
+            if (second.arrival >= first.departure) continue; // never co-resident
+            st.pairs += 1;
+            if (second.departure < first.departure) st.inversions += 1;
+        }
+    }
+    return st;
+}
+
 // ── tests: the harness has teeth on hand-built transcripts (no core needed) ──
 //
 // These are the anonymity analogue of df-elect's synthetic `worstBadDfWindow`
@@ -312,6 +366,46 @@ test "measure: cover transits enlarge a real target's crowd without being scored
     try testing.expectEqual(@as(usize, 1), r.targets); // cover is never a target
     try testing.expect(r.min_effective_set > 1.5); // real target now has a crowd
     try testing.expect(r.max_link_prob < 1.0); // …and is no longer pinned
+}
+
+test "reorderStats: order-preserving transcripts score exactly zero" {
+    const gpa = testing.allocator;
+    // Constant hold: 8 packets, arrivals 0,10,…, departures arrival+40 — the
+    // FifoMix picture. Later arrival can never depart first.
+    var list: std.ArrayListUnmanaged(Transit) = .empty;
+    defer list.deinit(gpa);
+    var i: u64 = 0;
+    while (i < 8) : (i += 1) try list.append(gpa, tr(0, i * 10, i * 10 + 40, i));
+    const st = reorderStats(list.items);
+    try testing.expect(st.pairs >= 10); // plenty of co-resident pairs examined
+    try testing.expectEqual(@as(usize, 0), st.inversions);
+
+    // FIFO discipline with SPREAD departure times (exponential timer multiset,
+    // identities released front-first): timing looks memoryless, identity order
+    // is still arrival order — the statistic must still score zero.
+    var fifo_ids: std.ArrayListUnmanaged(Transit) = .empty;
+    defer fifo_ids.deinit(gpa);
+    const deps_sorted = [_]Time{ 12, 25, 30, 38, 42, 48, 55, 61 }; // sorted = FIFO pairing
+    i = 0;
+    while (i < deps_sorted.len) : (i += 1) try fifo_ids.append(gpa, tr(0, i, deps_sorted[i], i));
+    const st2 = reorderStats(fifo_ids.items);
+    try testing.expect(st2.pairs >= 10);
+    try testing.expectEqual(@as(usize, 0), st2.inversions);
+}
+
+test "reorderStats: an interleaved (memoryless-looking) transcript scores near 1/2" {
+    const gpa = testing.allocator;
+    var list: std.ArrayListUnmanaged(Transit) = .empty;
+    defer list.deinit(gpa);
+    // The well-mixed synthetic from the `measure` test: clustered arrivals,
+    // departures genuinely re-ordered vs arrival.
+    const deps = [_]Time{ 55, 30, 80, 42, 12, 95, 61, 25, 70, 38, 105, 48 };
+    var i: u64 = 0;
+    while (i < deps.len) : (i += 1) try list.append(gpa, tr(0, i, deps[i], i));
+    const st = reorderStats(list.items);
+    try testing.expect(st.pairs >= 30);
+    const f = st.fraction();
+    try testing.expect(f > 0.3 and f < 0.7); // a real shuffle, not order-preserving
 }
 
 test "measure: no real traffic is vacuously anonymous" {

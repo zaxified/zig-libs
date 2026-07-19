@@ -89,7 +89,7 @@ pub fn scenario(sim: *Sim) anyerror!void {
 
 // ── Relay: the mechanics both protocols share ────────────────────────────────
 
-const Stashed = struct { arrival: Time, hdr: MixHeader };
+const Stashed = struct { arrival: Time, release_at: Time, hdr: MixHeader };
 
 /// The stash/release/forward/transcript machinery + traffic originators. The
 /// hold-delay decision is NOT here — each protocol supplies it (constant vs
@@ -97,9 +97,13 @@ const Stashed = struct { arrival: Time, hdr: MixHeader };
 const Relay = struct {
     gpa: Allocator,
     cfg: LoopixConfig,
-    /// Per-mix FIFO of packets currently being held. Constant/ordered holds
-    /// release front-first; the exponential mix reorders via its timers but the
-    /// stash is still keyed by release identity (see `release`).
+    /// Per-mix pool of packets currently being held, each stamped with its OWN
+    /// scheduled release time. `release` pops BY RELEASE TIME, not front-first:
+    /// releasing the front (oldest arrival) on every timer would forward
+    /// identities in strict arrival order regardless of the hold law — an
+    /// order-preserving mix a Kerckhoffs adversary unlinks with probability 1,
+    /// even though the departure TIMES look exponential. (This was a real,
+    /// caught defect — see the memoryless property test below.)
     queues: []std.ArrayListUnmanaged(Stashed),
     transcript: std.ArrayListUnmanaged(Transit) = .empty,
     next_id: u64 = 1,
@@ -160,20 +164,36 @@ const Relay = struct {
         try self.originate(sim, client, dest, kind, key);
     }
 
-    /// A mix received a packet: stash it and arm a release timer for `hold`
-    /// ticks. On release it is forwarded and a completed transit is logged.
+    /// A mix received a packet: stash it (stamped with its own absolute release
+    /// time) and arm a release timer for `hold` ticks. On release THAT packet
+    /// is forwarded and its completed transit is logged.
     fn stashAndArm(self: *Relay, sim: *Sim, node: NodeId, payload: []const u8, hold: Time) anyerror!void {
         const hdr = MixHeader.decode(payload);
-        try self.queues[node].append(self.gpa, .{ .arrival = sim.timeNow(), .hdr = hdr });
+        const now = sim.timeNow();
+        try self.queues[node].append(self.gpa, .{ .arrival = now, .release_at = now + hold, .hdr = hdr });
         try sim.setTimer(node, hold, RELEASE_TIMER);
     }
 
-    /// A release timer fired on a mix: forward the front-most held packet
-    /// (FIFO by release order) and log its completed transit.
+    /// A release timer fired on a mix: forward the held packet whose OWN drawn
+    /// release time is due, and log its completed transit.
+    ///
+    /// ANONYMITY-LOAD-BEARING: the packet released must be the one whose timer
+    /// this is (matched by its stamped `release_at`), NOT the front of the
+    /// queue. Timers fire in release-time order, so popping the front would
+    /// re-assign the drawn departure times to identities in arrival order —
+    /// the departure timeline would still look exponential, but the identity
+    /// permutation would be the identity map (in-order = out-order), which a
+    /// Kerckhoffs adversary inverts deterministically. Matching by release
+    /// time keeps each identity's departure its own independent memoryless
+    /// draw; packets sharing an exact release tick are exchangeable, so
+    /// front-first among exact ties leaks nothing.
     fn release(self: *Relay, sim: *Sim, node: NodeId) anyerror!void {
         const q = &self.queues[node];
-        if (q.items.len == 0) return; // a partition/crash may have voided it
-        const s = q.orderedRemove(0);
+        const now = sim.timeNow();
+        const idx = for (q.items, 0..) |s, i| {
+            if (s.release_at == now) break i;
+        } else return; // a partition/crash may have voided it
+        const s = q.orderedRemove(idx);
         var hdr = s.hdr;
         // Record the completed pass through THIS mix (the adversary's raw
         // material — timing only; id/kind are the harness's oracle labels).
@@ -480,7 +500,10 @@ test "real: the Poisson mix holds the anonymity invariant across a seed sweep" {
         }
     }
     // Genuine margin, not tuned-to-pass: the worst target over all 50 seeds sits
-    // comfortably inside the bound on BOTH clauses (measured ≈ 2.80 / 0.77).
+    // comfortably inside the bound on BOTH clauses (measured ≈ 3.88 / 0.63 with
+    // release-by-own-timer; the pre-fix FIFO-release pairing measured 2.80/0.77
+    // because it systematically paired each arrival with its maximum-likelihood
+    // departure).
     try testing.expect(worst_set >= bound.min_effective_set + 0.5);
     try testing.expect(worst_link <= bound.max_link_prob - 0.05);
 }
@@ -527,4 +550,55 @@ test "real: the FIFO and no-cover controls FAIL the invariant under identical me
     try testing.expect(nc_worst_set < 1.5);
     try testing.expect(nc_worst_set < bound.min_effective_set); // fails clause 1
     try testing.expect(nc_worst_link > bound.max_link_prob); // and clause 2
+}
+
+// ── the memoryless-mixing property test (audit F1 — the test with teeth) ─────
+//
+// The kernel-scored invariant above measures the anonymity SET, but it scores
+// with a fixed exponential kernel, so it cannot detect the mix's hold law
+// silently ceasing to be memoryless (audit F1: a constant-hold injection left
+// the whole suite green). This test checks the memoryless property DIRECTLY,
+// via its order-statistics consequence (see `adversary.reorderStats`):
+//
+//   Among co-resident pairs at a mix (the second arrived while the first was
+//   still held), a memoryless hold makes the residual of the earlier packet
+//   distributed like a fresh draw, so the later arrival departs first with
+//   probability ≈ 1/2. ANY order-preserving mix — constant hold, FIFO release
+//   discipline, threshold batching in arrival order — scores EXACTLY 0.
+//
+// The 0.5-vs-0 gap is categorical, so the [0.35, 0.65] band cannot flake on
+// the correct mix (thousands of pairs per seed ⇒ sampling error ≈ ±0.01) and
+// cannot pass an order-preserving one. Verified to bite: with
+// `mixing.sampleExpDelay` forced to `mean/2` (constant hold) this test goes
+// RED (fraction 0.00) while the kernel-scored invariant above stays green —
+// exactly the F1 regression, now caught. It also caught a REAL defect on first
+// run: `Relay.release` used to pop the queue FRONT on every timer (identities
+// left in arrival order — fraction 0.00 on every seed) — see `release`.
+
+test "real: the Poisson mix reorders co-resident packets (memoryless); order-preserving mixes score zero" {
+    if (!gate.fable_core_implemented) return error.SkipZigTest;
+    const gpa = testing.allocator;
+
+    var seed: u64 = 1;
+    while (seed <= 20) : (seed += 1) {
+        // The real mix: inversion fraction must sit in the memoryless band.
+        var mix = try Loopix.init(gpa, DEFAULT_CFG, seed);
+        defer mix.deinit(gpa);
+        _ = try netsim.replay(gpa, .{ .seed = seed, .scenario = scenario, .protocol = mix.protocol(), .until = UNTIL }, &.{}, null);
+        const st = adversary.reorderStats(mix.transcript());
+        try testing.expect(st.pairs > 500); // dense co-residency (cover keeps pools full)
+        const f = st.fraction();
+        if (f < 0.35 or f > 0.65) {
+            std.debug.print("loopix: seed {} broke memorylessness — inversion fraction {d:.3} over {} pairs (want ~0.5)\n", .{ seed, f, st.pairs });
+            return error.MixNotMemoryless;
+        }
+
+        // The order-preserving control under the SAME statistic: exactly zero.
+        var fifo = try FifoMix.init(gpa, DEFAULT_CFG);
+        defer fifo.deinit(gpa);
+        _ = try netsim.replay(gpa, .{ .seed = seed, .scenario = scenario, .protocol = fifo.protocol(), .until = UNTIL }, &.{}, null);
+        const fst = adversary.reorderStats(fifo.transcript());
+        try testing.expect(fst.pairs > 50);
+        try testing.expectEqual(@as(usize, 0), fst.inversions);
+    }
 }
