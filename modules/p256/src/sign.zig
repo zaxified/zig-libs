@@ -29,6 +29,24 @@ const P256 = group.P256;
 const Scalar = scalarmod.Scalar;
 const Fe = @import("field.zig").Fe;
 
+/// Std-compatible ECDSA-P256/SHA-256, instantiated over p256's fast curve.
+/// This is `std.crypto.sign.ecdsa.Ecdsa` driven by `group.P256`, so it reuses
+/// std's ECDSA scaffolding verbatim (`KeyPair`/`PublicKey`/`Signature`, DER +
+/// raw codecs, RFC 6979 deterministic nonces, `generateDeterministic`) while
+/// every field/point op runs on p256's asm-accelerated arithmetic. It is the
+/// drop-in for `std.crypto.sign.ecdsa.EcdsaP256Sha256` that the P2 HTTPS-API
+/// JWT ES256 hot path (and jwe ECDH-ES) rewires onto.
+///
+/// Constant-time split is exactly std's: signing/keygen commit `k·G` / `d·G`
+/// through `group.P256.basePoint.mul` (the CT windowed core), while `verify`
+/// runs the two public scalar mults through `group.P256.mulPublic` (vartime
+/// wNAF on PUBLIC inputs only). No secret scalar ever touches a vartime mul.
+///
+/// Byte-exact to `std.crypto.sign.ecdsa.EcdsaP256Sha256`: same construction,
+/// same curve math (p256's group is the byte-exact std oracle), so every RFC
+/// 6979 / Wycheproof vector that passes on std passes here unchanged.
+pub const EcdsaP256Sha256 = std.crypto.sign.ecdsa.Ecdsa(P256, Sha256);
+
 pub const SignError = error{ InvalidSecretKey, InvalidNonce };
 
 /// `int(bytes32) mod n` — reduce a 32-byte value into the scalar field (a
@@ -117,4 +135,32 @@ test "ecdsa sign→verify round-trip (fixed key + nonce)" {
     var bad = sig;
     bad[5] ^= 1;
     try std.testing.expect(!ecdsaVerify(&pk, msg, bad));
+}
+
+// The std-compatible `EcdsaP256Sha256` must interoperate byte-for-byte with
+// `std.crypto.sign.ecdsa.EcdsaP256Sha256`: same keypair from the same seed,
+// each side's signature verifies under the other. This pins the drop-in the
+// jwt/jwe rewire relies on.
+test "EcdsaP256Sha256 cross-verifies with std both directions" {
+    const Std = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+    const seed = [_]u8{0x37} ** Std.KeyPair.seed_length;
+    const kp = try EcdsaP256Sha256.KeyPair.generateDeterministic(seed);
+    const std_kp = try Std.KeyPair.generateDeterministic(seed);
+
+    // Same seed ⇒ byte-identical public key (SEC1).
+    try std.testing.expectEqualSlices(
+        u8,
+        &kp.public_key.toUncompressedSec1(),
+        &std_kp.public_key.toUncompressedSec1(),
+    );
+
+    const msg = "p256 ecdsa drop-in oracle";
+
+    // p256-signed ⇒ verifies under std.
+    const sig_ours = try kp.sign(msg, null);
+    try Std.Signature.fromBytes(sig_ours.toBytes()).verify(msg, std_kp.public_key);
+
+    // std-signed ⇒ verifies under p256.
+    const sig_std = try std_kp.sign(msg, null);
+    try EcdsaP256Sha256.Signature.fromBytes(sig_std.toBytes()).verify(msg, kp.public_key);
 }

@@ -47,6 +47,13 @@ pub const AffineCoordinates = group.AffineCoordinates;
 /// A scalar-field element (mod the group order `n`).
 pub const Scalar = scalar.Scalar;
 
+/// Std-compatible ECDSA-P256/SHA-256 over p256's fast curve — the drop-in for
+/// `std.crypto.sign.ecdsa.EcdsaP256Sha256` (byte-exact; same struct surface:
+/// `KeyPair`/`PublicKey`/`Signature`, `generateDeterministic`, DER + raw
+/// codecs). Sign commits `k·G` constant-time; `verify` is vartime on public
+/// inputs. Rewired onto by jwt (ES256) + jwe (ECDH-ES). See `sign.zig`.
+pub const EcdsaP256Sha256 = sign.EcdsaP256Sha256;
+
 /// True iff the field multiply/square hot path is running on the gated amd64
 /// `MULX/ADX` core rather than the portable Solinas reduction. In this scaffold
 /// (both gates `false`) it is `false` on every target.
