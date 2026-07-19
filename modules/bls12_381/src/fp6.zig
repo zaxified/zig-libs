@@ -198,16 +198,15 @@ pub const Fp6 = struct {
     /// `γ_2 = γ_1^2`. No hand-transcribed constant table exists to get
     /// wrong; a derivation bug breaks the "frobenius == pow(p)"
     /// definitional test below immediately. The coefficients are
-    /// recomputed per call (~2 fixed-exponent `Fp2.pow`s) — trivially
-    /// cheap for Part 1's callers; caching them is a Part-2 (pairing
-    /// hot path) optimization, noted in SPEC.md's Backlog.
+    /// PRECOMPUTED ONCE at comptime (see `frobenius_gamma_1`) — the
+    /// pairing's final exponentiation applies Frobenius a dozen-plus
+    /// times, so re-deriving a 381-bit `pow` per call was a large chunk
+    /// of the whole pairing cost; now `frobenius` is just two `Fp2.mul`s.
     pub fn frobenius(a: Fp6) Fp6 {
-        const gamma_1 = frobeniusGamma1();
-        const gamma_2 = gamma_1.square();
         return .{
             .c0 = a.c0.frobenius(),
-            .c1 = a.c1.frobenius().mul(gamma_1),
-            .c2 = a.c2.frobenius().mul(gamma_2),
+            .c1 = a.c1.frobenius().mul(frobenius_gamma_1),
+            .c2 = a.c2.frobenius().mul(frobenius_gamma_2),
         };
     }
 };
@@ -216,11 +215,27 @@ pub const Fp6 = struct {
 /// (comptime-derived; `p ≡ 1 (mod 3)`, so the division is exact).
 const p_minus_1_over_3_bytes: [48]u8 = fp.pExponentBytes(-1, 3);
 
-/// `γ_1 = ξ^((p-1)/3)` — the `v^p` reduction coefficient (see
-/// `Fp6.frobenius`). Exposed within the module for tests; computed at
-/// runtime (a fixed-public-exponent `Fp2.pow`), not transcribed.
+/// `γ_1 = ξ^((p-1)/3)` and `γ_2 = γ_1^2` — the `v^p`/`v^(2p)` reduction
+/// coefficients (see `Fp6.frobenius`). PRECOMPUTED ONCE at COMPTIME from
+/// the tower's own `ξ` and the comptime-derived exponent (the
+/// fixed-public `Fp2.pow` is evaluated by the compiler, not per call),
+/// so `Fp6.frobenius` costs only two `Fp2.mul`s at runtime instead of
+/// re-deriving a 381-bit `pow` on every call. Still derived, never
+/// hand-transcribed: the "frobenius == pow(p)" definitional test and the
+/// byte-exact `γ_1` KAT below remain the anchors, and the field ops ride
+/// `std.crypto.ff`, which is comptime-evaluable.
+const frobenius_gamma_1: Fp2 = blk: {
+    @setEvalBranchQuota(50_000_000);
+    break :blk nonresidue.pow(&p_minus_1_over_3_bytes);
+};
+const frobenius_gamma_2: Fp2 = blk: {
+    @setEvalBranchQuota(50_000_000);
+    break :blk frobenius_gamma_1.square();
+};
+
+/// Test/back-compat accessor for the comptime-precomputed `γ_1`.
 fn frobeniusGamma1() Fp2 {
-    return nonresidue.pow(&p_minus_1_over_3_bytes);
+    return frobenius_gamma_1;
 }
 
 // ── tests ────────────────────────────────────────────────────────────────

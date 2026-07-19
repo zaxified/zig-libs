@@ -304,6 +304,21 @@ const TwistPoint = struct {
 const p_minus_1_over_3_bytes: [32]u8 = fp.pExponentBytes(-1, 3);
 const p_minus_1_over_2_bytes: [32]u8 = fp.pExponentBytes(-1, 2);
 
+/// The twist-Frobenius γ coefficients `ξ^((p-1)/3)` (x) and `ξ^((p-1)/2)`
+/// (y), PRECOMPUTED ONCE at COMPTIME (the fixed-public `Fp2.pow`s are
+/// evaluated by the compiler) — `twistFrobenius` runs on the Miller
+/// loop's BN Frobenius tail, so recomputing these two 254-bit `pow`s per
+/// call was pure waste. Derived, never transcribed; the pairing KATs
+/// anchor them.
+const twist_gamma_x: Fp2 = blk: {
+    @setEvalBranchQuota(50_000_000);
+    break :blk fp6mod.nonresidue.pow(&p_minus_1_over_3_bytes);
+};
+const twist_gamma_y: Fp2 = blk: {
+    @setEvalBranchQuota(50_000_000);
+    break :blk fp6mod.nonresidue.pow(&p_minus_1_over_2_bytes);
+};
+
 /// The `p`-power Frobenius endomorphism `π` transported to the twist
 /// `E'(Fp2)`: `π_twist = ψ^-1 ∘ Frobenius ∘ ψ` for this tower's D-type
 /// untwisting map `ψ(x', y') = (x'·w^2, y'·w^3)` (the map under which
@@ -331,11 +346,9 @@ const p_minus_1_over_2_bytes: [32]u8 = fp.pExponentBytes(-1, 2);
 /// π²'s y-coefficient is exactly a sign flip, which is why `-Q2`
 /// famously has the SAME y as `Q` up to that one negation.
 fn twistFrobenius(pt: TwistPoint) TwistPoint {
-    const gamma_x = fp6mod.nonresidue.pow(&p_minus_1_over_3_bytes);
-    const gamma_y = fp6mod.nonresidue.pow(&p_minus_1_over_2_bytes);
     return .{
-        .x = pt.x.frobenius().mul(gamma_x),
-        .y = pt.y.frobenius().mul(gamma_y),
+        .x = pt.x.frobenius().mul(twist_gamma_x),
+        .y = pt.y.frobenius().mul(twist_gamma_y),
     };
 }
 

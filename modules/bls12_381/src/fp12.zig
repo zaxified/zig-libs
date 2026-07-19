@@ -170,13 +170,13 @@ pub const Fp12 = struct {
     /// = ξ^((p-1)/6)` — both readings agree, the `(p-1)/6` form just
     /// lands the coefficient in `Fp2` explicitly. Computed
     /// PROGRAMMATICALLY (same policy as `Fp6.frobenius` — no
-    /// transcribed table); validated by the definitional
-    /// "frobenius == pow(p)" test below.
+    /// transcribed table) and PRECOMPUTED ONCE at comptime (see
+    /// `frobenius_gamma`), so no runtime `pow` runs per call; validated
+    /// by the definitional "frobenius == pow(p)" test below.
     pub fn frobenius(a: Fp12) Fp12 {
-        const gamma = fp6mod.nonresidue.pow(&p_minus_1_over_6_bytes);
         return .{
             .c0 = a.c0.frobenius(),
-            .c1 = a.c1.frobenius().mulByFp2(gamma),
+            .c1 = a.c1.frobenius().mulByFp2(frobenius_gamma),
         };
     }
 
@@ -291,6 +291,17 @@ fn fp4Square(c0: Fp2, c1: Fp2) struct { c0: Fp2, c1: Fp2 } {
 /// (comptime-derived from `fp.zig`'s verified `p_bytes`; `p ≡ 1 (mod
 /// 6)`, so the division is exact — enforced at comptime).
 const p_minus_1_over_6_bytes: [48]u8 = fp.pExponentBytes(-1, 6);
+
+/// `γ = ξ^((p-1)/6)` — the `w^p` reduction coefficient scaling `c1^p`
+/// (see `Fp12.frobenius`). PRECOMPUTED ONCE at COMPTIME (the fixed-public
+/// `Fp2.pow` is evaluated by the compiler), so `frobenius` costs one
+/// `Fp6.mulByFp2` at runtime instead of re-deriving a 381-bit `pow` on
+/// every call. The byte-exact `γ` KAT and the definitional
+/// "frobenius == pow(p)" test below remain the anchors.
+const frobenius_gamma: Fp2 = blk: {
+    @setEvalBranchQuota(50_000_000);
+    break :blk fp6mod.nonresidue.pow(&p_minus_1_over_6_bytes);
+};
 
 // ── tests ────────────────────────────────────────────────────────────────
 
