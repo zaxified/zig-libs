@@ -888,6 +888,12 @@ pub const div_kat_vectors = [_]DivCase{
     .{ .id = "divx008", .a = "2", .b = "3", .scale = 9, .mode = .half_up, .want = "0.666666667" },
     .{ .id = "divx021", .a = "5", .b = "2", .scale = 1, .mode = .half_up, .want = "2.5" },
     .{ .id = "divx028", .a = "5", .b = "0.20", .scale = 0, .mode = .half_up, .want = "25" },
+    // Exact half-way ties (2r == d) under half_up — the audit-F1 gap: the vectors
+    // above are all terminating or non-tie, so the half_up bump-on-tie branch had
+    // no positive control (a mutation skipping the bump passed the suite clean).
+    .{ .id = "divTIE1", .a = "5", .b = "2", .scale = 0, .mode = .half_up, .want = "3" }, // 2.5 -> 3
+    .{ .id = "divTIE2", .a = "1", .b = "2", .scale = 0, .mode = .half_up, .want = "1" }, // 0.5 -> 1
+    .{ .id = "divTIE3", .a = "7", .b = "2", .scale = 0, .mode = .half_up, .want = "4" }, // 3.5 -> 4
 };
 
 const RescaleCase = struct { a: []const u8, exponent: i32, mode: RoundingMode, want: []const u8, id: []const u8 };
