@@ -154,7 +154,12 @@ pub const ExtensionIterator = struct {
         const after_oid = try parseElement(it.bytes, oid_elem.slice.end);
         var critical = false;
         const value_elem = if (after_oid.identifier.tag == .boolean) v: {
-            critical = it.bytes[after_oid.slice.start] != 0;
+            // Empty BOOLEAN content is malformed DER, but don't read OOB for
+            // it — treat as the ASN.1 default (false), same idiom as
+            // `parseKeyUsage`'s zero-length BIT STRING content check.
+            if (after_oid.slice.start < after_oid.slice.end) {
+                critical = it.bytes[after_oid.slice.start] != 0;
+            }
             break :v try parseElement(it.bytes, after_oid.slice.end);
         } else after_oid;
 
@@ -198,7 +203,12 @@ pub fn parseBasicConstraints(value: []const u8) ParseBasicConstraintsError!Basic
     var result: BasicConstraints = .{};
     var elem = try parseElement(value, seq.slice.start);
     if (elem.identifier.tag == .boolean) {
-        result.is_ca = value[elem.slice.start] != 0;
+        // Empty BOOLEAN content is malformed DER, but don't read OOB for
+        // it — treat as the ASN.1 default (false), same idiom as
+        // `parseKeyUsage`'s zero-length BIT STRING content check.
+        if (elem.slice.start < elem.slice.end) {
+            result.is_ca = value[elem.slice.start] != 0;
+        }
         if (elem.slice.end >= seq.slice.end) return result;
         elem = try parseElement(value, elem.slice.end);
     }
@@ -562,6 +572,35 @@ test "parseBasicConstraints: pathLenConstraint present" {
     const bc = try parseBasicConstraints(&value);
     try testing.expect(bc.is_ca);
     try testing.expectEqual(@as(?u32, 3), bc.path_len_constraint);
+}
+
+test "parseBasicConstraints: zero-length BOOLEAN content does not read OOB" {
+    // Regression for a crash: `SEQUENCE { BOOLEAN len 0 }` ending exactly at
+    // the buffer edge used to read `value[elem.slice.start]` with
+    // `elem.slice.start == value.len`, panicking instead of erroring or
+    // defaulting. Malformed DER (BOOLEAN must carry exactly one content
+    // octet), so the parser treats it as the ASN.1 default (cA = false)
+    // rather than rejecting it outright — matching `parseKeyUsage`'s
+    // zero-length-content idiom.
+    const value = [_]u8{ 0x30, 0x02, 0x01, 0x00 };
+    const bc = try parseBasicConstraints(&value);
+    try testing.expect(!bc.is_ca);
+    try testing.expectEqual(@as(?u32, null), bc.path_len_constraint);
+}
+
+test "ExtensionIterator.next: zero-length critical BOOLEAN content does not read OOB" {
+    // Regression for a crash: a `critical` BOOLEAN with zero-length content
+    // ending exactly at the buffer edge used to read
+    // `it.bytes[after_oid.slice.start]` with `after_oid.slice.start ==
+    // it.bytes.len`, panicking instead of defaulting `critical = false`.
+    // The zero-length BOOLEAN content leaves no extnValue TLV to follow, so
+    // this input is malformed past the point of the fixed read: after
+    // defaulting `critical = false` without panicking, the iterator still
+    // correctly errors trying to parse the (absent) extnValue element
+    // instead of crashing.
+    const bytes = [_]u8{ 0x30, 0x07, 0x06, 0x03, 0x55, 0x04, 0x03, 0x01, 0x00 };
+    var it: ExtensionIterator = .{ .bytes = &bytes, .pos = 0, .end = bytes.len };
+    try testing.expectError(error.CertificateFieldHasInvalidLength, it.next());
 }
 
 test "parseExtKeyUsage: serverAuth + clientAuth" {
