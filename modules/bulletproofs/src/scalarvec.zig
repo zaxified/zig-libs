@@ -119,6 +119,128 @@ pub fn multiScalarMul(scalars: []const [32]u8, points: []const Ristretto255) Mul
     return acc;
 }
 
+// ── Pippenger (vartime) multi-scalar multiplication ─────────────────────────
+//
+// `multiScalarMulVartime` computes the SAME group element as
+// `multiScalarMul` — `sum_i scalars_i * points_i` — but via the windowed
+// bucket ("Pippenger") method instead of one constant-time scalar-mult per
+// term, which is the standard Bulletproofs *verifier* speed-up (dalek's
+// `VartimeMultiscalarMul`). It is **not constant-time**: the bucket an
+// individual term lands in, and the skip-empty-bucket accumulation, both
+// depend on the scalar digits — so it MUST ONLY be used where the scalars
+// are PUBLIC (verifier data: the proof + statement + Fiat-Shamir challenges
+// replayed from them). The prover's MSMs run over SECRET witness/blinding
+// scalars and therefore stay on the constant-time `multiScalarMul` above —
+// converting them to this vartime path would leak the witness via
+// bucket-index timing (the same class of leak as a secret-indexed table
+// gather). See the callers in `ipa.zig`/`rangeproof.zig` for the
+// public-vs-secret split.
+//
+// Bit-exactness: group addition is associative/commutative, so a correct
+// bucket accumulation yields exactly the same point as the naive weighted
+// sum — proofs that verify under `multiScalarMul` verify identically here,
+// and soundness rejects still fire (asserted by the `pippenger == naive`
+// differential test below plus the module's property/soundness KATs).
+
+/// Terms below this count skip Pippenger (its fixed per-window bucket-sum
+/// overhead is not amortised) and fall back to a plain vartime add loop.
+const pippenger_min = 16;
+
+/// Largest supported window width in bits — bounds the fixed-size on-stack
+/// bucket array (`2^8 = 256` entries) so `multiScalarMulVartime` needs no
+/// allocator (matches `verifyIpa`'s allocation-free contract).
+const max_window_bits = 8;
+
+/// Window width (bits) for `n` terms. The per-window cost is dominated by
+/// the fixed `~2·(2^c)` bucket-sum additions, which are INDEPENDENT of `n`,
+/// so the optimum minimises `(256/c)·(n + 2^{c+1})` — for the term counts a
+/// range proof produces (verifier MSMs of a few dozen to a few hundred
+/// points) this lands on small windows. Values chosen from that model and
+/// confirmed by the ReleaseFast bench. Kept `<= max_window_bits`.
+fn pippengerWindow(n: usize) u6 {
+    if (n >= 384) return 6;
+    if (n >= 96) return 5;
+    if (n >= 32) return 4;
+    return 3; // n in [pippenger_min, 32)
+}
+
+/// Extract the `width`-bit digit of little-endian scalar `s` starting at
+/// bit index `bit_start` (bits past the 256-bit end read as 0). Digit
+/// extraction is cheap relative to the point ops, so this is written for
+/// obvious correctness (bit-by-bit) rather than speed.
+fn scalarWindow(s: [32]u8, bit_start: usize, width: u6) u64 {
+    var v: u64 = 0;
+    var i: u6 = 0;
+    while (i < width) : (i += 1) {
+        const bit = bit_start + i;
+        if (bit >= 256) break;
+        const b: u64 = (s[bit >> 3] >> @intCast(bit & 7)) & 1;
+        v |= b << i;
+    }
+    return v;
+}
+
+/// `sum_i scalars_i * points_i` via the vartime Pippenger bucket method —
+/// see the block comment above for the constant-time caveat (PUBLIC scalars
+/// only). Allocation-free. Returns the identity for an empty input and, for
+/// fewer than `pippenger_min` terms, falls back to a plain add loop.
+pub fn multiScalarMulVartime(scalars: []const [32]u8, points: []const Ristretto255) MultiScalarMulError!Ristretto255 {
+    if (scalars.len != points.len) return error.LengthMismatch;
+    const n = scalars.len;
+    if (n == 0) return identity_point;
+
+    if (n < pippenger_min) {
+        var acc = identity_point;
+        for (scalars, points) |s, p| acc = acc.add(p.mul(s) catch continue);
+        return acc;
+    }
+
+    const c: u6 = pippengerWindow(n);
+    const num_buckets: usize = (@as(usize, 1) << c) - 1;
+    const cw: usize = c;
+    const num_windows: usize = (256 + cw - 1) / cw; // ceil(256 / c)
+
+    // Buckets 1..num_buckets held 0-based: `buckets[d-1]` accumulates terms
+    // whose current-window digit is `d`.
+    var buckets: [(1 << max_window_bits) - 1]Ristretto255 = undefined;
+
+    var result = identity_point;
+    // Horner over windows, most-significant first.
+    var w: usize = num_windows;
+    while (w > 0) {
+        w -= 1;
+
+        // Shift the running result left by one window (c doublings). On the
+        // first (top) window `result` is the identity, so this is a no-op.
+        var d: u6 = 0;
+        while (d < c) : (d += 1) result = result.dbl();
+
+        for (buckets[0..num_buckets]) |*bkt| bkt.* = identity_point;
+
+        for (scalars, points) |s, p| {
+            const digit = scalarWindow(s, w * cw, c);
+            if (digit != 0) {
+                const bi = digit - 1;
+                buckets[bi] = buckets[bi].add(p);
+            }
+        }
+
+        // Weighted bucket sum `sum_{d>=1} d * buckets[d-1]` via the
+        // running-sum trick (high digit to low): each bucket ends weighted
+        // by its digit value.
+        var running = identity_point;
+        var acc = identity_point;
+        var m: usize = num_buckets;
+        while (m > 0) {
+            m -= 1;
+            running = running.add(buckets[m]);
+            acc = acc.add(running);
+        }
+        result = result.add(acc);
+    }
+    return result;
+}
+
 // ── tests ─────────────────────────────────────────────────────────────────
 
 test "innerProduct: hand-computed small vectors" {
@@ -234,4 +356,63 @@ test "multiScalarMul: length mismatch rejected" {
 test "identity_point is the group identity (adding it is a no-op)" {
     const g = Ristretto255.basePoint;
     try std.testing.expect(g.add(identity_point).equivalent(g));
+}
+
+test "multiScalarMulVartime: matches naive multiScalarMul for random inputs (differential)" {
+    // `multiScalarMul` is the proven oracle; a correct Pippenger MSM must
+    // produce the EXACT same group element. Sweep sizes that straddle the
+    // naive fallback threshold and every window-width boundary.
+    var prng = std.Random.DefaultPrng.init(0xB01_1E7);
+    const random = prng.random();
+
+    const sizes = [_]usize{ 1, 2, 7, 15, 16, 17, 31, 63, 64, 65, 100, 127, 128, 129, 200, 257 };
+    for (sizes) |n| {
+        const scalars = try std.testing.allocator.alloc([32]u8, n);
+        defer std.testing.allocator.free(scalars);
+        const points = try std.testing.allocator.alloc(Ristretto255, n);
+        defer std.testing.allocator.free(points);
+
+        for (scalars, points) |*s, *p| {
+            var wide: [64]u8 = undefined;
+            random.bytes(&wide);
+            s.* = scalar.reduce64(wide);
+            // A random group element: [k]·basePoint for a random k.
+            var kwide: [64]u8 = undefined;
+            random.bytes(&kwide);
+            p.* = Ristretto255.basePoint.mul(scalar.reduce64(kwide)) catch identity_point;
+        }
+
+        const want = try multiScalarMul(scalars, points);
+        const got = try multiScalarMulVartime(scalars, points);
+        try std.testing.expect(got.equivalent(want));
+    }
+}
+
+test "multiScalarMulVartime: edge cases (empty, all-zero, zero points)" {
+    // Empty -> identity.
+    try std.testing.expect((try multiScalarMulVartime(&.{}, &.{})).equivalent(identity_point));
+
+    // Enough terms to exercise the real Pippenger path, all-zero scalars.
+    const n = 20;
+    var scalars: [n][32]u8 = undefined;
+    var points: [n]Ristretto255 = undefined;
+    var g = Ristretto255.basePoint;
+    for (&scalars, &points) |*s, *p| {
+        s.* = zero;
+        p.* = g;
+        g = g.dbl();
+    }
+    try std.testing.expect((try multiScalarMulVartime(&scalars, &points)).equivalent(identity_point));
+
+    // One nonzero term amid zeros -> that single scaled point.
+    scalars[7] = [_]u8{5} ++ [_]u8{0} ** 31;
+    const want = try points[7].mul(scalars[7]);
+    try std.testing.expect((try multiScalarMulVartime(&scalars, &points)).equivalent(want));
+}
+
+test "multiScalarMulVartime: length mismatch rejected" {
+    const g = Ristretto255.basePoint;
+    const scalars = [_][32]u8{ one, one };
+    const points = [_]Ristretto255{g};
+    try std.testing.expectError(error.LengthMismatch, multiScalarMulVartime(&scalars, &points));
 }

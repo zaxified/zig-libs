@@ -362,20 +362,57 @@ pub fn verifyIpa(
     // bit) and check
     //   <a*s, G> + <b*s^{-1}, H> + (a*b)*Q
     //     == P + sum_j (u_j^2 * L_j + u_j^{-2} * R_j).
-    var lhs = scalarvec.identity_point;
-    for (0..n) |i| {
-        var s_i = scalarvec.one;
-        var s_i_inv = scalarvec.one;
-        for (0..rounds) |j| {
-            const bit = ((i >> @intCast(rounds - 1 - j)) & 1) == 1;
-            s_i = scalar.mul(s_i, if (bit) u[j] else u_inv[j]);
-            s_i_inv = scalar.mul(s_i_inv, if (bit) u_inv[j] else u[j]);
-        }
-        lhs = lhs.add(mulOrIdentity(g_vec[i], scalar.mul(proof.a, s_i)));
-        lhs = lhs.add(mulOrIdentity(h_vec[i], scalar.mul(proof.b, s_i_inv)));
-    }
-    lhs = lhs.add(mulOrIdentity(q, scalar.mul(proof.a, proof.b)));
+    // The per-index products s_i are computed the O(n) incremental way
+    // (dalek's trick) instead of an O(n·log n) per-index inner loop:
+    //   s_0 = prod_j u_j^{-1};  setting the highest bit of an index i
+    //   multiplies s by the corresponding u_j^2.
+    // The inverse product s_i^{-1} needs no per-index inversion: bit-
+    // complementing the index inverts every factor, so s_i^{-1} = s_{n-1-i}.
+    //
+    // This whole multi-exponentiation is over PUBLIC data (the proof, the
+    // public generators/Q/P, and the challenges replayed from the proof), so
+    // it uses the VARTIME Pippenger MSM (`multiScalarMulVartime`) — the
+    // standard verifier speed-up. (The prover's MSMs are over secret
+    // witness scalars and stay constant-time; see `proveIpa`.)
+    //
+    // The verifier has no allocator by signature, so this scratch comes from
+    // the page allocator and every failure — including OOM — returns false
+    // (fail-closed), never panics; all of it is public, so no constant-time
+    // concern applies (matching `rangeproof.verify`).
+    const alloc = std.heap.page_allocator;
 
+    var allinv = scalarvec.one;
+    for (0..rounds) |j| allinv = scalar.mul(allinv, u_inv[j]);
+
+    const s = alloc.alloc([32]u8, n) catch return false;
+    defer alloc.free(s);
+    s[0] = allinv;
+    for (1..n) |i| {
+        const lg = std.math.log2_int(usize, i); // floor(log2 i), i >= 1
+        const k = @as(usize, 1) << @intCast(lg);
+        const jj = rounds - 1 - lg;
+        const u_sq = scalar.mul(u[jj], u[jj]);
+        s[i] = scalar.mul(s[i - k], u_sq);
+    }
+
+    // lhs = <a*s, G> + <b*s^{-1}, H> + (a*b)*Q as one (2n+1)-term MSM.
+    const terms = 2 * n + 1;
+    const msm_scalars = alloc.alloc([32]u8, terms) catch return false;
+    defer alloc.free(msm_scalars);
+    const msm_points = alloc.alloc(Ristretto255, terms) catch return false;
+    defer alloc.free(msm_points);
+    for (0..n) |i| {
+        msm_scalars[i] = scalar.mul(proof.a, s[i]);
+        msm_points[i] = g_vec[i];
+        msm_scalars[n + i] = scalar.mul(proof.b, s[n - 1 - i]);
+        msm_points[n + i] = h_vec[i];
+    }
+    msm_scalars[2 * n] = scalar.mul(proof.a, proof.b);
+    msm_points[2 * n] = q;
+    const lhs = scalarvec.multiScalarMulVartime(msm_scalars, msm_points) catch return false;
+
+    // rhs = P + sum_j (u_j^2 * L_j + u_j^{-2} * R_j) — only 2*rounds terms
+    // (logarithmic in n), so a plain accumulation is already cheap.
     var rhs = p;
     for (0..rounds) |j| {
         rhs = rhs.add(mulOrIdentity(proof.l_vec[j], scalar.mul(u[j], u[j])));

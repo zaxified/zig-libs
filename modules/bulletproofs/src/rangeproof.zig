@@ -580,23 +580,30 @@ pub fn verify(
     const y_inv = invertScalar(y);
     const h_prime = scratch.alloc(Ristretto255, n) catch return false;
     defer scratch.free(h_prime);
+    // Per-index coefficients (z*y^i + z^2*2^i) of the h'_i term, collected so
+    // the sum can go through the vartime Pippenger MSM below.
+    const h_scalars = scratch.alloc([32]u8, n) catch return false;
+    defer scratch.free(h_scalars);
 
     var sum_g = scalarvec.identity_point;
-    var h_term = scalarvec.identity_point;
     {
         var y_inv_pow = scalarvec.one;
         var y_pow = scalarvec.one;
         var two_pow = scalarvec.one;
-        for (h_prime, gens.h_vec, gens.g_vec) |*o, hp, gp| {
+        for (h_prime, h_scalars, gens.h_vec, gens.g_vec) |*o, *c_out, hp, gp| {
             o.* = mulOrIdentity(hp, y_inv_pow);
-            const c = scalar.mulAdd(z2, two_pow, scalar.mul(z, y_pow));
-            h_term = h_term.add(mulOrIdentity(o.*, c));
+            c_out.* = scalar.mulAdd(z2, two_pow, scalar.mul(z, y_pow));
+            // sum_g accumulates the all-ones combination of the g generators
+            // (a plain point sum, not a weighted MSM), so it stays a fold.
             sum_g = sum_g.add(gp);
             y_inv_pow = scalar.mul(y_inv_pow, y_inv);
             y_pow = scalar.mul(y_pow, y);
             two_pow = scalar.add(two_pow, two_pow);
         }
     }
+    // h_term = sum_i (z*y^i + z^2*2^i) * h'_i — over PUBLIC verifier data
+    // (challenges + public generators), so the vartime Pippenger MSM applies.
+    const h_term = scalarvec.multiScalarMulVartime(h_scalars, h_prime) catch return false;
 
     const p = proof.a
         .add(mulOrIdentity(proof.s, x))
