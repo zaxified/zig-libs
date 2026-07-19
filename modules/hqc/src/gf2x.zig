@@ -12,21 +12,140 @@
 //!
 //! `mul` implements the ring product w = u*v with w_k = sum_{i+j=k mod n}
 //! u_i*v_j (spec §2.1 Definition), i.e. cyclic convolution reduced mod
-//! (X^n - 1). The reference implementation computes the identical
-//! mathematical product using word-aligned Toom-Cook/Karatsuba plus a
-//! `pclmul` elementary multiply (spec §3.3) for performance; this module
-//! instead uses a schoolbook shift-and-mask-xor multiply (see `mul`'s
-//! doc) — same result, same asymptotic *structure* (no data-dependent
-//! branch or memory-access pattern on the operands, matching the
-//! reference's "multiplications are performed without taking account of
-//! sparsity" constant-time requirement, spec §3.3), but O(n^2/64) instead
-//! of the reference's near-linear Toom-Cook/Karatsuba. That performance
-//! gap is a deliberate Part-1 simplification (this is the mechanical
-//! ring-arithmetic foundation, not the performance-critical path) — see
-//! SPEC.md for the follow-up note.
+//! (X^n - 1). Like the reference (spec §3.3) it computes the full
+//! carryless polynomial product with word-aligned **Karatsuba** recursion
+//! over a **`pclmulqdq`** (CLMUL) base multiply, then reduces mod
+//! (X^n - 1). This path is comptime-gated on `x86_64 + pclmul`
+//! (`clmul_supported`); every other target uses the portable schoolbook
+//! shift-and-mask-xor multiply (`mulPortable`), which is also the
+//! correctness oracle the differential test pins the CLMUL path against
+//! (they must agree bit-for-bit — the NIST KEM KAT stays byte-exact
+//! precisely because the CLMUL+Karatsuba product equals the schoolbook one
+//! on every input). Both paths are constant-time (see the CLMUL section's
+//! note): no data-dependent branch or memory-access pattern on the
+//! operands, matching the reference's "multiplications are performed
+//! without taking account of sparsity" requirement (spec §3.3).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const params = @import("params.zig");
+
+// ── CLMUL + Karatsuba carryless multiply (parameter-independent) ─────────
+//
+// The GF(2)[X] product w = u·v is a *carryless* polynomial multiply: no
+// carry chains, every combination step is an XOR. The performance path is
+// a recursive Karatsuba over the u64-limb arrays bottoming out at a
+// `pclmulqdq`-based 64×64→127-bit base multiply — reducing the CLMUL count
+// from schoolbook O(L²) to O(L^1.58). It is comptime-gated on
+// `x86_64 + pclmul`; every other target keeps the portable schoolbook
+// shift-XOR path (`Ring.mulPortable`), which also serves as the correctness
+// oracle the `gf2x.zig` differential test pins the CLMUL path against.
+//
+// Constant-time: `pclmulqdq` is a fixed-latency instruction with no
+// data-dependent path, and Karatsuba's control flow (recursion depth,
+// split points, loop trip counts) depends only on the PUBLIC limb count
+// `len` — never on operand values. So the secret-key `decaps` multiply is
+// as constant-time as the schoolbook it replaces (both iterate a fixed,
+// data-independent instruction schedule).
+
+/// True at comptime iff this target can host the `pclmulqdq` base multiply.
+/// On every other target the ring `mul` stays on the portable schoolbook
+/// path forever (and the CLMUL functions below are never analyzed).
+const clmul_supported = builtin.cpu.arch == .x86_64 and
+    std.Target.x86.featureSetHas(builtin.cpu.features, .pclmul);
+
+/// Carryless 64×64 → 127-bit product a·b over GF(2)[X] via one `pclmulqdq`
+/// (result low/high 64-bit halves; bit 127 is always 0). Zig has no CLMUL
+/// builtin, so inline asm is required. Fixed-latency ⇒ constant-time.
+inline fn clmul64(a: u64, b: u64) [2]u64 {
+    const av: @Vector(2, u64) = .{ a, 0 };
+    const bv: @Vector(2, u64) = .{ b, 0 };
+    // pclmulqdq imm8=0 selects the low qword of each operand; the
+    // destination operand is read-write, so `a` is tied to the output.
+    const rv: @Vector(2, u64) = asm (
+        \\ pclmulqdq $0, %[b], %[r]
+        : [r] "=x" (-> @Vector(2, u64)),
+        : [a] "0" (av),
+          [b] "x" (bv),
+    );
+    return .{ rv[0], rv[1] };
+}
+
+/// Karatsuba base-case threshold (in u64 limbs): below this the product is
+/// the direct O(L²)-CLMUL schoolbook, above it the recursion splits.
+const karatsuba_base = 8;
+
+/// Scratch words `clmulKar` needs for a length-`len` operand (comptime,
+/// mirrors the recursion: 4·half for sum_a/sum_b/z1 plus the child arena).
+fn karScratch(comptime len: usize) usize {
+    if (len <= karatsuba_base) return 0;
+    const half = (len + 1) / 2;
+    return 4 * half + karScratch(half);
+}
+
+/// GF(2)[X] schoolbook base multiply r[0..2L] = a[0..L] ⊗ b[0..L] with L²
+/// CLMULs, XOR-accumulating each 128-bit partial product into the two
+/// overlapping destination limbs. Fully overwrites `r`. L ≤ karatsuba_base.
+fn schoolbookClmul(r: []u64, a: []const u64, b: []const u64) void {
+    @memset(r, 0);
+    for (a, 0..) |ai, i| {
+        for (b, 0..) |bj, j| {
+            const p = clmul64(ai, bj);
+            r[i + j] ^= p[0];
+            r[i + j + 1] ^= p[1];
+        }
+    }
+}
+
+/// GF(2)[X] carryless product r[0..2·len] = a[0..len] ⊗ b[0..len] via
+/// recursive Karatsuba (z0 = a_lo·b_lo, z2 = a_hi·b_hi, z1 = (a_lo+a_hi)·
+/// (b_lo+b_hi); mid = z1+z0+z2, all "+"=XOR in GF(2)), bottoming out at
+/// `schoolbookClmul`. Fully overwrites `r`; `scratch` must hold ≥
+/// karScratch(len) words. Control flow depends only on the public `len`.
+fn clmulKar(r: []u64, a: []const u64, b: []const u64, scratch: []u64) void {
+    const len = a.len;
+    if (len <= karatsuba_base) {
+        schoolbookClmul(r, a, b);
+        return;
+    }
+    const half = (len + 1) / 2;
+    const hi_len = len - half;
+    const a_lo = a[0..half];
+    const a_hi = a[half..];
+    const b_lo = b[0..half];
+    const b_hi = b[half..];
+
+    const sum_a = scratch[0..half];
+    const sum_b = scratch[half .. 2 * half];
+    const z1 = scratch[2 * half .. 4 * half];
+    const child = scratch[4 * half ..];
+
+    // sum_a = a_lo XOR a_hi, sum_b = b_lo XOR b_hi (a_hi/b_hi zero-extended
+    // to `half`, since hi_len ≤ half). All XOR — no carry in GF(2).
+    for (0..half) |k| {
+        sum_a[k] = a_lo[k] ^ (if (k < hi_len) a_hi[k] else 0);
+        sum_b[k] = b_lo[k] ^ (if (k < hi_len) b_hi[k] else 0);
+    }
+
+    // z0 → r[0 .. 2·half], z2 → r[2·half .. 2·len] (adjacent, disjoint);
+    // z1 → the scratch buffer. Children reuse the same tail `child` arena
+    // (they run sequentially). z1's inputs (sum_a/sum_b) and output (z1)
+    // are disjoint from `child`, so its recursion never clobbers them.
+    clmulKar(r[0 .. 2 * half], a_lo, b_lo, child);
+    clmulKar(r[2 * half .. 2 * len], a_hi, b_hi, child);
+    clmulKar(z1, sum_a, sum_b, child);
+
+    // mid = z1 XOR z0 XOR z2, formed IN the z1 buffer while reading z0/z2
+    // out of `r` — a separate read-then-write phase so the subsequent fold
+    // into r[half..] cannot corrupt a z0/z2 limb still to be read.
+    for (0..2 * half) |k| {
+        z1[k] ^= r[k]; // z0
+        if (k < 2 * hi_len) z1[k] ^= r[2 * half + k]; // z2
+    }
+    // Fold mid into r at word offset `half` (each r[half+k] written once,
+    // no r read here — no overlap hazard with the phase above).
+    for (0..2 * half) |k| r[half + k] ^= z1[k];
+}
 
 /// The ring R = F2[X]/(X^n-1), specialized to one HQC parameter set's n.
 /// `Elem` is a fixed-size bit-packed vector: `words = ceil(n/64)` u64s,
@@ -147,22 +266,17 @@ pub fn Ring(comptime n: u32) type {
             }
         }
 
-        /// Ring product a*b in R = F2[X]/(X^n-1) (spec §2.1). Iterates
-        /// over every bit position of `a` (not just the set ones — see
-        /// module doc's constant-time note), accumulating a masked,
-        /// shifted copy of `b` into a double-width buffer, then folds
-        /// the double-width result mod (X^n - 1): bit position p >= n is
-        /// equivalent to bit (p - n) since X^n = 1 in this ring.
-        pub fn mul(a: Elem, b: Elem) Elem {
-            var acc: [ext_words]u64 = [_]u64{0} ** ext_words;
-            for (0..n) |i| {
-                const bit: u64 = (a[i / 64] >> @intCast(i % 64)) & 1;
-                const mask: u64 = 0 -% bit; // all-ones if bit=1, else 0
-                shiftMaskXorInto(&acc, b, @intCast(i), mask);
-            }
-            // Fold bits [n, 2n-2] onto [0, n-2] (X^{n+j} = X^j). Bit
-            // extraction + shift-back is branch-free (no `if` on the
-            // secret bit value).
+        /// Scratch words the Karatsuba multiply needs for this ring's
+        /// `words`-limb operands (comptime; ~4·words, small — e.g. 3596
+        /// u64 for hqc-256's words=901).
+        const scratch_words = karScratch(words);
+
+        /// Fold a full carryless product `acc` (bits [0, 2n-2]) mod
+        /// (X^n - 1) into a canonical Elem: bit position p >= n maps to bit
+        /// (p - n) since X^n = 1 in this ring. Branch-free (bit extraction
+        /// + shift-back, no `if` on any secret bit value). Shared by both
+        /// the portable and the CLMUL multiply.
+        fn reduceProduct(acc: *[ext_words]u64) Elem {
             var p: u32 = n;
             while (p <= 2 * n - 2) : (p += 1) {
                 const bit = (acc[p / 64] >> @intCast(p % 64)) & 1;
@@ -173,6 +287,41 @@ pub fn Ring(comptime n: u32) type {
             @memcpy(out[0..], acc[0..words]);
             maskTop(&out);
             return out;
+        }
+
+        /// Portable ring product a*b in R = F2[X]/(X^n-1) (spec §2.1).
+        /// Iterates over every bit position of `a` (not just the set ones
+        /// — see module doc's constant-time note), accumulating a masked,
+        /// shifted copy of `b` into a double-width buffer, then folds mod
+        /// (X^n - 1). This is the always-available fallback AND the oracle
+        /// the CLMUL path's differential test is pinned against.
+        pub fn mulPortable(a: Elem, b: Elem) Elem {
+            var acc: [ext_words]u64 = [_]u64{0} ** ext_words;
+            for (0..n) |i| {
+                const bit: u64 = (a[i / 64] >> @intCast(i % 64)) & 1;
+                const mask: u64 = 0 -% bit; // all-ones if bit=1, else 0
+                shiftMaskXorInto(&acc, b, @intCast(i), mask);
+            }
+            return reduceProduct(&acc);
+        }
+
+        /// Ring product a*b via the CLMUL + Karatsuba carryless multiply
+        /// (`clmulKar`) followed by the mod-(X^n-1) fold. Bit-for-bit equal
+        /// to `mulPortable`. Only referenced when `clmul_supported`, so its
+        /// `pclmulqdq` asm is never analyzed on a non-x86 target.
+        pub fn mulClmul(a: Elem, b: Elem) Elem {
+            var acc: [ext_words]u64 = undefined; // fully written by clmulKar
+            var scratch: [scratch_words]u64 = undefined;
+            clmulKar(acc[0..], a[0..], b[0..], scratch[0..]);
+            return reduceProduct(&acc);
+        }
+
+        /// Ring product a*b in R = F2[X]/(X^n-1) (spec §2.1). Dispatches to
+        /// the `pclmulqdq`+Karatsuba path where available, else the
+        /// portable schoolbook multiply — same result on every input.
+        pub fn mul(a: Elem, b: Elem) Elem {
+            if (comptime clmul_supported) return mulClmul(a, b);
+            return mulPortable(a, b);
         }
     };
 }
@@ -244,6 +393,40 @@ fn testDistributivity(comptime R: type, seed: u64) !void {
     const lhs = R.mul(a, R.add(b, c));
     const rhs = R.add(R.mul(a, b), R.mul(a, c));
     try t.expectEqualSlices(u64, &lhs, &rhs);
+}
+
+/// Differential: the CLMUL+Karatsuba product must equal the schoolbook
+/// oracle bit-for-bit on random inputs. When the CLMUL path is active on
+/// this host (it is, x86_64+pclmul) this exercises the `pclmulqdq` asm and
+/// the full Karatsuba recursion against the proven `mulPortable`; on a
+/// target without CLMUL it comptime-skips (the two are the same code, and
+/// `mulClmul`'s asm must not be analyzed).
+fn testClmulDifferential(comptime R: type, seed: u64) !void {
+    if (comptime !clmul_supported) return;
+    const t = std.testing;
+    var rng = std.Random.DefaultPrng.init(seed);
+    const random = rng.random();
+    for (0..64) |_| {
+        var a: R.Elem = undefined;
+        var b: R.Elem = undefined;
+        for (&a) |*w| w.* = random.int(u64);
+        for (&b) |*w| w.* = random.int(u64);
+        R.maskTop(&a);
+        R.maskTop(&b);
+        try t.expectEqualSlices(u64, &R.mulPortable(a, b), &R.mulClmul(a, b));
+    }
+    // Also pin edge operands (all-zero, single monomials, all-ones-canonical).
+    const zero = R.zero;
+    try t.expectEqualSlices(u64, &R.mulPortable(zero, zero), &R.mulClmul(zero, zero));
+    var full: R.Elem = [_]u64{~@as(u64, 0)} ** R.words;
+    R.maskTop(&full);
+    try t.expectEqualSlices(u64, &R.mulPortable(full, full), &R.mulClmul(full, full));
+}
+
+test "hqc ring: CLMUL+Karatsuba multiply == schoolbook oracle (differential)" {
+    try testClmulDifferential(R128, 101);
+    try testClmulDifferential(R192, 102);
+    try testClmulDifferential(R256, 103);
 }
 
 test "hqc-128 ring: monomial wraparound (hand-verified X^i*X^j)" {
