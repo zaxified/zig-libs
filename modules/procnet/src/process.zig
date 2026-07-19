@@ -57,7 +57,11 @@ pub fn parseProcStat(line: []const u8) ?ProcessEntry {
         .pid = pid,
         .state = state_s[0],
         .ppid = std.fmt.parseInt(u32, ppid_s, 10) catch 0,
-        .rss_kb = (std.fmt.parseInt(u64, rss_s, 10) catch 0) * 4, // 4 KB pages
+        // Saturating multiply: a crafted/corrupt `rss` field near
+        // maxInt(u64) must not panic (checked `*` overflows) or wrap
+        // (ReleaseFast UB) — it saturates to maxInt(u64) instead, matching
+        // this parser's "malformed input degrades gracefully" contract.
+        .rss_kb = (std.fmt.parseInt(u64, rss_s, 10) catch 0) *| 4, // 4 KB pages
     };
     e.name_len = procnet.copyClamped(&e.name_buf, name);
     return e;
@@ -140,4 +144,14 @@ test "parseProcStat: too few trailing fields still yields rss 0, not an error" {
     const e = parseProcStat(line).?;
     try testing.expectEqual(@as(u64, 0), e.rss_kb);
     try testing.expectEqual(@as(u32, 1), e.ppid);
+}
+
+test "parseProcStat: near-maxInt(u64) rss field saturates instead of panicking" {
+    // Reproduces the audit's finding: `(parseInt(...) catch 0) * 4` used to
+    // hit a checked-arithmetic overflow panic (Debug/ReleaseSafe) on a
+    // crafted rss field near maxInt(u64)/4. Must now saturate cleanly.
+    const line = "9 (evil) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 1 0 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0";
+    const e = parseProcStat(line).?;
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), e.rss_kb);
+    try testing.expectEqual(@as(u32, 9), e.pid);
 }

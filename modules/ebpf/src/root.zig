@@ -78,6 +78,7 @@ const programs = @import("programs.zig");
 pub const Program = programs.Program;
 pub const XdpFilterOptions = programs.XdpFilterOptions;
 pub const RingbufEmitOptions = programs.RingbufEmitOptions;
+pub const BuildError = programs.BuildError;
 
 /// FABLE tier — see `programs.zig`.
 pub const kprobeCounter = programs.kprobeCounter;

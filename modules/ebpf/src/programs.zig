@@ -41,6 +41,24 @@ pub const Program = struct {
     insns: []const Insn,
 };
 
+/// Returned by `xdpFilter`/`ringbufEmit` when a caller-supplied size would
+/// overflow the builder's fixed file-scope instruction buffer, or overflow
+/// the `i16`/`i32` byte-offset arithmetic used while emitting into it. These
+/// are cheap, mechanical input-validation failures — not verifier rejections
+/// (the verifier is never reached; the malformed program is never built).
+pub const BuildError = error{
+    /// `key_size` (and/or `key_offset`) is large enough that emitting the
+    /// per-byte key-copy loop would overflow `xdp_buf`.
+    KeyTooLarge,
+    /// `key_offset + key_size` would overflow the `i16` packet byte-offset
+    /// field used by the key-copy loads (`ldx`/`stx` `.off`).
+    KeyOffsetTooLarge,
+    /// `record_size` is large enough that emitting the zero-fill loop would
+    /// overflow `ringbuf_buf`, or would overflow the `i16`/`i32` size
+    /// arithmetic used to build the program.
+    RecordTooLarge,
+};
+
 // ── kprobe-counter ──────────────────────────────────────────────────────────
 
 /// Build the `kprobe-counter` program: on every kprobe hit, atomically
@@ -204,7 +222,23 @@ pub const XdpFilterOptions = struct {
 ///     verification. Document this explicitly: it LOOKS like a verifier
 ///     constraint but is actually an unenforced ABI convention, and testing
 ///     it needs a behavioral check, not a load-time one.
-pub fn xdpFilter(opts: XdpFilterOptions) []const Insn {
+pub fn xdpFilter(opts: XdpFilterOptions) BuildError![]const Insn {
+    // ── input validation (BEFORE any @intCast/arithmetic below can panic) ──
+    // Fixed instruction count around the key-copy loop: 5 before it (2 ctx
+    // loads + mov/add + the reserved jgt slot) + 6 after (mov/add/ld_map_fd
+    // x2/call/reserved jeq slot) + 2 (DROP path) + 2 (PASS path) = 15; the
+    // loop itself emits 2 instructions per key byte. Reject any `key_size`
+    // that would overflow `xdp_buf` instead of silently writing past it.
+    const xdp_fixed_insns = 15;
+    const needed = xdp_fixed_insns + @as(usize, opts.key_size) * 2;
+    if (needed > xdp_buf.len) return error.KeyTooLarge;
+    // `off` (below) and every `off + k` for `k in [0, key_size)` must fit in
+    // the `i16` `.off` field of the emitted `ldx`/`stx` instructions; a
+    // conservative single bound covers both without needing two checks.
+    if (@as(u32, opts.key_offset) + @as(u32, opts.key_size) > std.math.maxInt(i16)) {
+        return error.KeyOffsetTooLarge;
+    }
+
     const R = Insn.Reg;
     const XDP_DROP: i32 = 1;
     const XDP_PASS: i32 = 2;
@@ -341,7 +375,20 @@ pub const RingbufEmitOptions = struct {
 ///     implementation detail — this function commits to reserve/submit
 ///     (see the doc comment above) precisely because it's the harder,
 ///     more representative case for a Fable-tier pass to demonstrate.
-pub fn ringbufEmit(opts: RingbufEmitOptions) []const Insn {
+pub fn ringbufEmit(opts: RingbufEmitOptions) BuildError![]const Insn {
+    // ── input validation (BEFORE any @intCast/arithmetic below can panic) ──
+    // Fixed instruction count around the zero-fill loop: 6 before it
+    // (ld_map_fd x2/mov x2/call/reserved jeq slot) + 3 after (mov x2/call
+    // submit) + 2 (shared exit tail) = 11; the loop itself emits one
+    // `double_word` store per full 8-byte chunk plus up to 7 trailing `byte`
+    // stores. Reject any `record_size` that would overflow `ringbuf_buf`
+    // instead of silently writing past it. This bound also keeps
+    // `record_size` well within `i16`/`i32` range, so the `@intCast`s below
+    // (`size`, `rec_end`) cannot panic either.
+    const ringbuf_fixed_insns = 11;
+    const zero_fill_insns = @as(usize, opts.record_size) / 8 + @as(usize, opts.record_size) % 8;
+    if (ringbuf_fixed_insns + zero_fill_insns > ringbuf_buf.len) return error.RecordTooLarge;
+
     const R = Insn.Reg;
     const size: i32 = @intCast(opts.record_size);
 
@@ -415,6 +462,13 @@ const Buf = struct {
     n: usize = 0,
 
     fn emit(self: *Buf, insn: Insn) void {
+        // Defense in depth: callers (`xdpFilter`/`ringbufEmit`) validate
+        // caller-supplied sizes against buffer capacity BEFORE emitting, so
+        // this should never fire. If it does, that's an internal invariant
+        // violation (a builder's own instruction-count arithmetic is wrong),
+        // not attacker input — fail loudly (also in ReleaseFast) rather than
+        // silently corrupting the adjacent file-scope buffer.
+        if (self.n >= self.buf.len) @panic("ebpf.Buf.emit: instruction buffer capacity exceeded");
         self.buf[self.n] = insn;
         self.n += 1;
     }
@@ -422,6 +476,7 @@ const Buf = struct {
     /// Reserve one slot for a forward jump whose target isn't known yet; returns
     /// its index for a later `patchJumpTo`.
     fn reserve(self: *Buf) usize {
+        if (self.n >= self.buf.len) @panic("ebpf.Buf.reserve: instruction buffer capacity exceeded");
         const idx = self.n;
         self.buf[self.n] = Insn.ja(0); // placeholder, overwritten by patch
         self.n += 1;
@@ -528,7 +583,7 @@ const golden_xdp_filter = [_]Insn{
 };
 
 test "golden: xdpFilter matches the hand-derived, clang-cross-checked sequence" {
-    const insns = xdpFilter(.{ .block_map_fd = 3, .key_offset = 26, .key_size = 4 });
+    const insns = try xdpFilter(.{ .block_map_fd = 3, .key_offset = 26, .key_size = 4 });
     try testing.expectEqualSlices(Insn, &golden_xdp_filter, insns);
 }
 
@@ -549,12 +604,12 @@ const golden_ringbuf_emit = [_]Insn{
 };
 
 test "golden: ringbufEmit matches the hand-derived, clang-cross-checked sequence" {
-    const insns = ringbufEmit(.{ .ringbuf_map_fd = 5, .record_size = 16 });
+    const insns = try ringbufEmit(.{ .ringbuf_map_fd = 5, .record_size = 16 });
     try testing.expectEqualSlices(Insn, &golden_ringbuf_emit, insns);
 }
 
 test "xdpFilter: bounds-check dominates every packet read + forward jumps land on XDP_PASS" {
-    const insns = xdpFilter(.{ .block_map_fd = 7, .key_offset = 26, .key_size = 4 });
+    const insns = try xdpFilter(.{ .block_map_fd = 7, .key_offset = 26, .key_size = 4 });
     // Locate the jgt bounds check and every packet-byte load (ldx from r1).
     var jgt_i: ?usize = null;
     for (insns, 0..) |ins, i| {
@@ -578,7 +633,7 @@ test "xdpFilter: bounds-check dominates every packet read + forward jumps land o
 }
 
 test "ringbufEmit: reserve reference released on the success path; null path holds none" {
-    const insns = ringbufEmit(.{ .ringbuf_map_fd = 9, .record_size = 24 });
+    const insns = try ringbufEmit(.{ .ringbuf_map_fd = 9, .record_size = 24 });
     // Exactly one reserve and one submit/discard on the success path.
     var reserves: usize = 0;
     var releases: usize = 0;
@@ -607,7 +662,7 @@ test "ringbufEmit: reserve reference released on the success path; null path hol
 }
 
 test "ringbufEmit: record_size not a multiple of 8 uses a byte tail, all writes in-bounds" {
-    const insns = ringbufEmit(.{ .ringbuf_map_fd = 3, .record_size = 12 });
+    const insns = try ringbufEmit(.{ .ringbuf_map_fd = 3, .record_size = 12 });
     var max_off: i16 = -1;
     var dw_stores: usize = 0;
     var b_stores: usize = 0;
@@ -624,6 +679,45 @@ test "ringbufEmit: record_size not a multiple of 8 uses a byte tail, all writes 
     try testing.expectEqual(@as(usize, 1), dw_stores); // one 8-byte chunk
     try testing.expectEqual(@as(usize, 4), b_stores); // + 4-byte tail
     try testing.expectEqual(@as(i16, 12), max_off); // writes cover exactly [0,12)
+}
+
+test "ringbufEmit: over-capacity record_size is rejected, not an OOB write" {
+    // Reproduces the audit's finding: record_size = 1024 used to run the
+    // zero-fill loop straight past `ringbuf_buf`'s 128-slot capacity
+    // (`index out of bounds: index 128, len 128` in Debug/ReleaseSafe; a
+    // silent OOB write into adjacent globals under ReleaseFast). Must now
+    // fail closed with a typed error instead.
+    try testing.expectError(error.RecordTooLarge, ringbufEmit(.{ .ringbuf_map_fd = 5, .record_size = 1024 }));
+    // A comfortably in-range size still works (regression guard on the
+    // capacity check itself being too strict).
+    _ = try ringbufEmit(.{ .ringbuf_map_fd = 5, .record_size = 64 });
+}
+
+test "ringbufEmit: record_size large enough to overflow the i32/i16 @intCasts is rejected" {
+    // Separately from the buffer-capacity path: a record_size this large
+    // used to panic at `@intCast(opts.record_size)` (the `size`/`rec_end`
+    // locals) before the zero-fill loop was even reached.
+    try testing.expectError(error.RecordTooLarge, ringbufEmit(.{ .ringbuf_map_fd = 5, .record_size = std.math.maxInt(u32) }));
+}
+
+test "xdpFilter: over-capacity key_size is rejected, not an OOB write" {
+    // A key_size large enough that the 2-instructions-per-byte copy loop
+    // would overflow `xdp_buf`'s 64-slot capacity must fail closed.
+    try testing.expectError(
+        error.KeyTooLarge,
+        xdpFilter(.{ .block_map_fd = 3, .key_offset = 26, .key_size = 64 }),
+    );
+    // A comfortably in-range key_size still works.
+    _ = try xdpFilter(.{ .block_map_fd = 3, .key_offset = 26, .key_size = 4 });
+}
+
+test "xdpFilter: key_offset large enough to overflow the i16 @intCast is rejected" {
+    // key_offset > maxInt(i16) used to panic at `@intCast(opts.key_offset)`
+    // (the `off` local) regardless of key_size.
+    try testing.expectError(
+        error.KeyOffsetTooLarge,
+        xdpFilter(.{ .block_map_fd = 3, .key_offset = 65000, .key_size = 4 }),
+    );
 }
 
 /// Privileged, capability-gated real-load test: build each program and hand it
@@ -660,7 +754,7 @@ test "load: all three FABLE programs pass the in-kernel verifier (needs CAP_BPF/
         defer _ = linux.close(map_fd);
         const prog: Program = .{
             .prog_type = .xdp,
-            .insns = xdpFilter(.{ .block_map_fd = map_fd, .key_offset = 26, .key_size = 4 }),
+            .insns = try xdpFilter(.{ .block_map_fd = map_fd, .key_offset = 26, .key_size = 4 }),
         };
         const fd = try load(prog, "MIT");
         _ = linux.close(fd);
@@ -674,7 +768,7 @@ test "load: all three FABLE programs pass the in-kernel verifier (needs CAP_BPF/
         defer _ = linux.close(map_fd);
         const prog: Program = .{
             .prog_type = .kprobe,
-            .insns = ringbufEmit(.{ .ringbuf_map_fd = map_fd, .record_size = 16 }),
+            .insns = try ringbufEmit(.{ .ringbuf_map_fd = map_fd, .record_size = 16 }),
         };
         const fd = try load(prog, "MIT");
         _ = linux.close(fd);

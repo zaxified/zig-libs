@@ -83,6 +83,13 @@ pub const Timestamp = struct {
         return self.seconds == 0 and self.fraction == 0;
     }
 
+    /// Exact field equality — used to verify a server reply's `originate`
+    /// timestamp echoes the client's own request `transmit` timestamp
+    /// (RFC 4330 §5's origin-timestamp check; see `verifyOriginate`).
+    pub fn eql(self: Timestamp, other: Timestamp) bool {
+        return self.seconds == other.seconds and self.fraction == other.fraction;
+    }
+
     /// Read 8 big-endian bytes.
     pub fn fromBytes(bytes: *const [8]u8) Timestamp {
         return .{
@@ -247,6 +254,18 @@ pub fn decodeResponse(bytes: []const u8) DecodeError!Reply {
     return p;
 }
 
+/// Verify the RFC 4330 §5 origin-timestamp check: a genuine reply to *our*
+/// request must echo back, in `reply.originate`, exactly the `transmit`
+/// timestamp (`t1`) we sent. This is the standard anti-spoof/anti-replay
+/// defense for unauthenticated SNTP — a blind off-path attacker who can spoof
+/// the source address but never observed the 64-bit `t1` we chose cannot
+/// forge a reply that passes it. `query` calls this after `decodeResponse`
+/// and before trusting the reply; exposed separately so it's testable
+/// without a live network exchange.
+pub fn verifyOriginate(reply: Reply, t1: Timestamp) error{OriginateMismatch}!void {
+    if (!reply.originate.eql(t1)) return error.OriginateMismatch;
+}
+
 // ── offset / round-trip delay ───────────────────────────────────────────────
 
 /// The four NTP timestamps of one exchange, from which offset and delay are
@@ -327,6 +346,11 @@ pub const QueryError = error{
     Canceled,
     /// Any socket-level failure (bind/send/receive).
     NetworkFailed,
+    /// The reply's `originate` timestamp does not echo the `transmit`
+    /// timestamp (T1) this `query` sent — RFC 4330 §5's origin-timestamp
+    /// check failed. Either a spoofed/off-path reply or a badly broken
+    /// server; reject it either way (see `verifyOriginate`).
+    OriginateMismatch,
 } || DecodeError;
 
 /// Result of a successful `query`: the validated server reply, the four
@@ -379,6 +403,10 @@ pub fn query(io: std.Io, server: net.IpAddress, options: QueryOptions) QueryErro
         // T4: local receive instant.
         const t4 = nowTimestamp();
         const reply = try decodeResponse(incoming.data);
+        // RFC 4330 §5 origin-timestamp check: reject unless the reply echoes
+        // back the T1 we sent. Must happen before the reply is trusted for
+        // anything else (offset/delay computation below).
+        try verifyOriginate(reply, t1);
         const sample: Sample = .{
             .originate = reply.originate, // T1 as echoed by the server
             .receive = reply.receive, // T2
@@ -493,6 +521,47 @@ test "decodeResponse: stratum 0 is Kiss-o'-Death" {
     bytes[1] = 0; // stratum 0 → KoD
     @memcpy(bytes[12..16], "RATE");
     try testing.expectError(error.KissOfDeath, decodeResponse(&bytes));
+}
+
+test "verifyOriginate: rejects a reply whose originate != t1 (off-path spoof defense)" {
+    // Reproduces the audit's finding: `query` never checked this, so a
+    // blind off-path attacker who spoofed the source address (but never
+    // observed our T1) could get an arbitrary reply accepted.
+    const t1: Timestamp = .{ .seconds = 3_900_000_000, .fraction = 0x1234_5678 };
+    const forged: Reply = .{
+        .mode = .server,
+        .stratum = 2,
+        .originate = .{ .seconds = t1.seconds, .fraction = t1.fraction +% 1 }, // off by one
+    };
+    try testing.expectError(error.OriginateMismatch, verifyOriginate(forged, t1));
+
+    const wrong_seconds: Reply = .{
+        .mode = .server,
+        .stratum = 2,
+        .originate = .{ .seconds = t1.seconds +% 1, .fraction = t1.fraction },
+    };
+    try testing.expectError(error.OriginateMismatch, verifyOriginate(wrong_seconds, t1));
+
+    // All-zero originate (a well-formed-but-nonsensical reply, F3) is also
+    // rejected as long as t1 itself isn't the all-zero timestamp.
+    const zero_originate: Reply = .{ .mode = .server, .stratum = 2 };
+    try testing.expectError(error.OriginateMismatch, verifyOriginate(zero_originate, t1));
+}
+
+test "verifyOriginate: accepts a reply that correctly echoes t1" {
+    const t1: Timestamp = .{ .seconds = 3_900_000_000, .fraction = 0x1234_5678 };
+    const honest: Reply = .{ .mode = .server, .stratum = 2, .originate = t1 };
+    try verifyOriginate(honest, t1);
+}
+
+test "Timestamp.eql" {
+    const a: Timestamp = .{ .seconds = 1, .fraction = 2 };
+    const b: Timestamp = .{ .seconds = 1, .fraction = 2 };
+    const c: Timestamp = .{ .seconds = 1, .fraction = 3 };
+    const d: Timestamp = .{ .seconds = 2, .fraction = 2 };
+    try testing.expect(a.eql(b));
+    try testing.expect(!a.eql(c));
+    try testing.expect(!a.eql(d));
 }
 
 test "NTP↔Unix epoch conversion at a known instant" {
