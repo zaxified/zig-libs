@@ -43,10 +43,17 @@
 //! 0.16 removed std.crypto.random); there is no internal randomness, so all
 //! operations are deterministic and reproducible.
 //!
-//! Out of scope: XMSS^MT (§4.2 multi-tree), the SHA-512 and SHAKE
-//! ciphersuites (§5 OPTIONAL sets), and BDS/fractional tree traversal —
-//! signing recomputes the auth path from the seed (O(2^h) hashing per
-//! signature: fine for h = 10, slow for h = 20; keygen is O(2^h) always).
+//! Auth-path traversal: BDS (Buchmann–Dahmen–Schneider) log-space Merkle
+//! traversal is maintained in `SecretKey.bds`, ported from the reference
+//! `xmss_core_fast.c` with parameter k = 0. `sign` emits the current leaf's
+//! precomputed auth path and advances the state to the next leaf in ~O(h)
+//! hashing (≈ verify cost) rather than rebuilding it O(2^h). The BDS state
+//! advances in lockstep with `idx`; a caller that jumps `idx` out of band
+//! triggers an automatic O(2^h) resync so the emitted signature stays
+//! byte-exact. keyGen is still O(2^h) (it now also seeds the BDS state).
+//!
+//! Out of scope: XMSS^MT (§4.2 multi-tree) and the SHA-512 and SHAKE
+//! ciphersuites (§5 OPTIONAL sets).
 //! Not constant-time hardened (hash-based; no secret-dependent branching
 //! beyond the hash inputs themselves — verify is public-data only).
 //!
@@ -385,7 +392,10 @@ pub fn XmssSha2(comptime tree_height: u5, comptime wire_oid: u32) type {
         pub const public_key_length: usize = 4 + 2 * n;
 
         /// §4.1.3 private key. `idx` is the STATE: the next unused leaf.
-        /// Persist the whole struct after every sign; see module doc.
+        /// `bds` is the BDS tree-traversal state that lets `sign` update the
+        /// authentication path in ~O(h) instead of rebuilding it (O(2^h)).
+        /// Both advance together on every `sign`. Persist the WHOLE struct
+        /// after every sign; see module doc.
         pub const SecretKey = struct {
             /// Next unused WOTS+ leaf index — advanced by `sign`.
             idx: u32,
@@ -397,6 +407,8 @@ pub fn XmssSha2(comptime tree_height: u5, comptime wire_oid: u32) type {
             root: [n]u8,
             /// Public seed SEED for keys/bitmasks.
             pub_seed: [n]u8,
+            /// BDS auth-path traversal state; kept in lockstep with `idx`.
+            bds: BdsState,
         };
 
         pub const PublicKey = struct {
@@ -422,6 +434,226 @@ pub fn XmssSha2(comptime tree_height: u5, comptime wire_oid: u32) type {
             sk: SecretKey,
             pk: PublicKey,
         };
+
+        // ===== BDS tree-traversal state (§4.1 fast auth-path update) =====
+        // Buchmann–Dahmen–Schneider log-space Merkle traversal (RFC 8391
+        // App. C references it; "Post-Quantum Cryptography", Springer 2009).
+        // Ported from the official reference `xmss_core_fast.c` with the BDS
+        // parameter k = 0 (no `retain` array): k affects only internal state
+        // and per-signature work, never the emitted signature, which is a
+        // property of the tree and leaf index alone. Each `sign` emits the
+        // current leaf's precomputed auth path and then advances the state to
+        // the next leaf with ~(h/2) leaf generations instead of 2^h.
+
+        /// Number of `keep` slots (§ reference `tree_height >> 1`).
+        const keep_len = h >> 1;
+
+        /// One treehash instance: computes a future auth node at height
+        /// `target_h`, one leaf at a time, sharing `BdsState.stack`.
+        const TreehashInst = struct {
+            node: [n]u8 = @splat(0),
+            /// Next leaf this instance will consume.
+            next_idx: u32 = 0,
+            /// Height of the auth node this instance produces.
+            target_h: u5 = 0,
+            /// How many slots this instance currently owns on the shared stack.
+            stackusage: u32 = 0,
+            completed: bool = true,
+        };
+
+        /// BDS traversal state. Small, fixed-size, no allocation. Held inside
+        /// `SecretKey` and advanced atomically with `idx` on every `sign`.
+        pub const BdsState = struct {
+            /// Shared work stack for the treehash instances.
+            stack: [h + 1][n]u8 = @splat(@splat(0)),
+            stacklevels: [h + 1]u5 = @splat(0),
+            stackoffset: u32 = 0,
+            /// Authentication path for leaf `covered_idx`.
+            auth: [h][n]u8 = @splat(@splat(0)),
+            /// Left nodes retained for upcoming auth-path refreshes.
+            keep: [keep_len][n]u8 = @splat(@splat(0)),
+            treehash: [h]TreehashInst = @splat(.{}),
+            /// Leaf index that `auth` currently authenticates. Kept equal to
+            /// `SecretKey.idx`; a mismatch triggers a resync in `sign`.
+            covered_idx: u32 = 0,
+        };
+
+        /// Initialize the BDS state for leaf 0 and return the tree root. This
+        /// is the §4.1.6 treeHash pass instrumented to also capture leaf 0's
+        /// authentication path and seed the treehash instances that will
+        /// produce future auth nodes. O(2^h) hashing — same order as a plain
+        /// root computation, so `keyGen` cost is unchanged in big-O (it now
+        /// also records the initial traversal state).
+        fn bdsInit(state: *BdsState, sk_seed: *const [n]u8, pub_seed: *const [n]u8) [n]u8 {
+            for (&state.treehash, 0..) |*th, i| {
+                th.* = .{ .target_h = @intCast(i), .completed = true, .stackusage = 0 };
+            }
+            var stack: [h + 1][n]u8 = undefined;
+            var stacklevels: [h + 1]u5 = undefined;
+            var sp: u32 = 0;
+            var i: u32 = 0; // count of leaves consumed (reference `i`)
+            var leaf: u32 = 0;
+            while (leaf < max_signatures) : (leaf += 1) {
+                stack[sp] = genLeaf(sk_seed, pub_seed, leaf);
+                stacklevels[sp] = 0;
+                sp += 1;
+                while (sp > 1 and stacklevels[sp - 1] == stacklevels[sp - 2]) {
+                    const nodeh = stacklevels[sp - 1];
+                    const shifted = i >> nodeh;
+                    if (shifted == 1) {
+                        // Right sibling on leaf 0's path at this height.
+                        state.auth[nodeh] = stack[sp - 1];
+                    } else if (shifted == 3) {
+                        // First future auth node at this height.
+                        state.treehash[nodeh].node = stack[sp - 1];
+                    }
+                    var adrs = Adrs{};
+                    adrs.setType(Adrs.type_hashtree);
+                    adrs.setTreeHeight(nodeh);
+                    adrs.setTreeIndex(leaf >> (nodeh + 1));
+                    stack[sp - 2] = randHash(&stack[sp - 2], &stack[sp - 1], pub_seed, &adrs);
+                    stacklevels[sp - 2] += 1;
+                    sp -= 1;
+                }
+                i += 1;
+            }
+            state.stackoffset = 0;
+            state.covered_idx = 0;
+            return stack[0];
+        }
+
+        /// Lowest node height held on the shared stack by `th` (reference
+        /// `treehash_minheight_on_stack`).
+        fn treehashMinheight(state: *const BdsState, th: *const TreehashInst) u5 {
+            var r: u5 = h;
+            var k: u32 = 0;
+            while (k < th.stackusage) : (k += 1) {
+                const lvl = state.stacklevels[state.stackoffset - k - 1];
+                if (lvl < r) r = lvl;
+            }
+            return r;
+        }
+
+        /// One step of a treehash instance: consume its next leaf and fold it
+        /// into the shared stack (reference `treehash_update`).
+        fn treehashUpdate(state: *BdsState, th: *TreehashInst, sk_seed: *const [n]u8, pub_seed: *const [n]u8) void {
+            var node = genLeaf(sk_seed, pub_seed, th.next_idx);
+            var nodeheight: u5 = 0;
+            while (th.stackusage > 0 and state.stacklevels[state.stackoffset - 1] == nodeheight) {
+                const left = state.stack[state.stackoffset - 1];
+                var adrs = Adrs{};
+                adrs.setType(Adrs.type_hashtree);
+                adrs.setTreeHeight(nodeheight);
+                adrs.setTreeIndex(th.next_idx >> (nodeheight + 1));
+                node = randHash(&left, &node, pub_seed, &adrs);
+                nodeheight += 1;
+                th.stackusage -= 1;
+                state.stackoffset -= 1;
+            }
+            if (nodeheight == th.target_h) {
+                th.node = node;
+                th.completed = true;
+            } else {
+                state.stack[state.stackoffset] = node;
+                state.stacklevels[state.stackoffset] = nodeheight;
+                state.stackoffset += 1;
+                th.stackusage += 1;
+                th.next_idx += 1;
+            }
+        }
+
+        /// Perform up to `updates` treehash steps on the instance that needs
+        /// it most (reference `bds_treehash_update`, k = 0).
+        fn bdsTreehashUpdate(state: *BdsState, updates: u32, sk_seed: *const [n]u8, pub_seed: *const [n]u8) void {
+            var j: u32 = 0;
+            while (j < updates) : (j += 1) {
+                var l_min: u5 = h;
+                var level: u32 = h; // sentinel: nothing to do
+                var idx: u32 = 0;
+                while (idx < h) : (idx += 1) {
+                    const th = &state.treehash[idx];
+                    var low: u5 = undefined;
+                    if (th.completed) {
+                        low = h;
+                    } else if (th.stackusage == 0) {
+                        low = @intCast(idx);
+                    } else {
+                        low = treehashMinheight(state, th);
+                    }
+                    if (low < l_min) {
+                        level = idx;
+                        l_min = low;
+                    }
+                }
+                if (level == h) break;
+                treehashUpdate(state, &state.treehash[level], sk_seed, pub_seed);
+            }
+        }
+
+        /// Emit the auth path for `leaf_idx` (already in `state.auth`) and
+        /// compute the auth path for the NEXT leaf (reference `bds_round`,
+        /// k = 0). Must only be called for `leaf_idx < max_signatures - 1`.
+        fn bdsRound(state: *BdsState, leaf_idx: u32, sk_seed: *const [n]u8, pub_seed: *const [n]u8) void {
+            var tau: u5 = h;
+            {
+                var i: u5 = 0;
+                while (i < h) : (i += 1) {
+                    if ((leaf_idx >> i) & 1 == 0) {
+                        tau = i;
+                        break;
+                    }
+                }
+            }
+
+            var buf_left: [n]u8 = undefined;
+            var buf_right: [n]u8 = undefined;
+            if (tau > 0) {
+                buf_left = state.auth[tau - 1];
+                buf_right = state.keep[(tau - 1) >> 1];
+            }
+            if (((leaf_idx >> (tau + 1)) & 1) == 0 and tau < h - 1) {
+                state.keep[tau >> 1] = state.auth[tau];
+            }
+            if (tau == 0) {
+                state.auth[0] = genLeaf(sk_seed, pub_seed, leaf_idx);
+            } else {
+                var adrs = Adrs{};
+                adrs.setType(Adrs.type_hashtree);
+                adrs.setTreeHeight(tau - 1);
+                adrs.setTreeIndex(leaf_idx >> tau);
+                state.auth[tau] = randHash(&buf_left, &buf_right, pub_seed, &adrs);
+                var i: u5 = 0;
+                while (i < tau) : (i += 1) {
+                    state.auth[i] = state.treehash[i].node;
+                }
+                i = 0;
+                while (i < tau) : (i += 1) {
+                    const startidx = leaf_idx + 1 + 3 * (@as(u32, 1) << i);
+                    if (@as(u64, startidx) < max_signatures) {
+                        state.treehash[i].target_h = i;
+                        state.treehash[i].next_idx = startidx;
+                        state.treehash[i].completed = false;
+                        state.treehash[i].stackusage = 0;
+                    }
+                }
+            }
+        }
+
+        /// Reconstruct the BDS state so that `bds.auth` authenticates leaf
+        /// `target`, by replaying the traversal from leaf 0. Used only when
+        /// the caller advanced `idx` out of band (manual jump, restored/copied
+        /// key). O(target * h) leaf generations. The replay is exactly the
+        /// sequence `sign` would have produced, so the resulting auth path is
+        /// identical to a from-scratch (`buildAuth`) computation.
+        fn rebuildStateTo(sk: *SecretKey, target: u32) void {
+            _ = bdsInit(&sk.bds, &sk.sk_seed, &sk.pub_seed);
+            var leaf: u32 = 0;
+            while (leaf < target) : (leaf += 1) {
+                bdsRound(&sk.bds, leaf, &sk.sk_seed, &sk.pub_seed);
+                bdsTreehashUpdate(&sk.bds, h >> 1, &sk.sk_seed, &sk.pub_seed);
+            }
+            sk.bds.covered_idx = target;
+        }
 
         /// treeHash (§4.1.6, Algorithm 9): root of the height-`t` subtree
         /// whose leftmost leaf is `s` (s must be 2^t-aligned). O(2^t) WOTS+
@@ -459,17 +691,20 @@ pub fn XmssSha2(comptime tree_height: u5, comptime wire_oid: u32) type {
         /// (uniform random, n bytes each; sk_seed and sk_prf secret, SEED
         /// public). Deterministic; O(2^h) hashing.
         pub fn keyGen(sk_seed: [n]u8, sk_prf: [n]u8, pub_seed: [n]u8) KeyPair {
-            const root = treeHash(&sk_seed, &pub_seed, 0, h);
+            var bds: BdsState = .{};
+            const root = bdsInit(&bds, &sk_seed, &pub_seed);
             return .{
-                .sk = .{ .idx = 0, .sk_seed = sk_seed, .sk_prf = sk_prf, .root = root, .pub_seed = pub_seed },
+                .sk = .{ .idx = 0, .sk_seed = sk_seed, .sk_prf = sk_prf, .root = root, .pub_seed = pub_seed, .bds = bds },
                 .pk = .{ .root = root, .seed = pub_seed },
             };
         }
 
         /// buildAuth (§4.1.9): auth[j] = root of the height-j subtree that
         /// is the sibling of the path from leaf `idx` — naive recompute
-        /// (O(2^h) total), no state beyond the seeds.
-        fn buildAuth(sk_seed: *const [n]u8, pub_seed: *const [n]u8, idx: u32, auth: *[h][n]u8) void {
+        /// (O(2^h) total), no state beyond the seeds. Retained as the
+        /// from-scratch reference that the BDS traversal is differential-
+        /// tested against (both must yield the identical auth path).
+        pub fn buildAuth(sk_seed: *const [n]u8, pub_seed: *const [n]u8, idx: u32, auth: *[h][n]u8) void {
             for (auth, 0..) |*node, j| {
                 const jj: u5 = @intCast(j);
                 const k = (idx >> jj) ^ 1;
@@ -478,12 +713,26 @@ pub fn XmssSha2(comptime tree_height: u5, comptime wire_oid: u32) type {
         }
 
         /// XMSS_sign (§4.1.9, Algorithm 12): sign `msg`, writing the wire
-        /// signature to `out`. Advances sk.idx BEFORE producing output —
-        /// persist sk before releasing the signature (see module doc).
-        /// Errors with KeyExhausted once all 2^h one-time keys are used.
+        /// signature to `out`. Advances sk.idx AND the BDS state together
+        /// before producing output — persist sk before releasing the
+        /// signature (see module doc). The auth path is taken from the BDS
+        /// state (computed during the previous round / keyGen), then the
+        /// state is advanced to the next leaf in ~O(h) hashing instead of
+        /// recomputing it O(2^h). The emitted signature is byte-identical to
+        /// a from-scratch auth-path build. Errors with KeyExhausted once all
+        /// 2^h one-time keys are used.
         pub fn sign(sk: *SecretKey, out: *[signature_length]u8, msg: []const u8) error{KeyExhausted}!void {
             if (sk.idx >= max_signatures) return error.KeyExhausted;
             const idx = sk.idx;
+
+            // Resync if the caller advanced idx out of band (manual jump, or a
+            // restored/copied key): rebuild the traversal state for this leaf
+            // so the emitted auth path stays byte-exact. Normal sequential
+            // signing never triggers this (covered_idx tracks idx exactly).
+            if (sk.bds.covered_idx != idx) {
+                rebuildStateTo(sk, idx);
+            }
+
             sk.idx = idx + 1;
 
             const r = prf(&sk.sk_prf, &toByte32(idx));
@@ -501,11 +750,17 @@ pub fn XmssSha2(comptime tree_height: u5, comptime wire_oid: u32) type {
                 out[4 + n + i * n ..][0..n].* = node;
             }
 
-            var auth: [h][n]u8 = undefined;
-            buildAuth(&sk.sk_seed, &sk.pub_seed, idx, &auth);
-            for (auth, 0..) |node, j| {
+            // Auth path for leaf `idx`, held in the BDS state.
+            for (sk.bds.auth, 0..) |node, j| {
                 out[4 + n + wots_len * n + j * n ..][0..n].* = node;
             }
+
+            // Advance the traversal state to prepare leaf idx+1's auth path.
+            if (idx < max_signatures - 1) {
+                bdsRound(&sk.bds, idx, &sk.sk_seed, &sk.pub_seed);
+                bdsTreehashUpdate(&sk.bds, h >> 1, &sk.sk_seed, &sk.pub_seed);
+            }
+            sk.bds.covered_idx = idx + 1;
         }
 
         /// XMSS_rootFromSig (§4.1.10, Algorithm 13): the root value implied

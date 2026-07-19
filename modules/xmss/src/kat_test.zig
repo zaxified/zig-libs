@@ -19,6 +19,7 @@ fn decodeHex(comptime hex_str: []const u8) [hex_str.len / 2]u8 {
 /// Test-only reduced-height instantiations (no IANA OID; private-use range).
 const Xmss4 = xmss.XmssSha2(4, 0xF0000004);
 const Xmss2 = xmss.XmssSha2(2, 0xF0000002);
+const Xmss6 = xmss.XmssSha2(6, 0xF0000006);
 
 test "KAT: PRF primitive vs reference" {
     var key: [n]u8 = undefined;
@@ -183,6 +184,98 @@ test "KAT: verify external XMSS-SHA2_10_256 (pk, msg, sig) triples" {
     var pk_bad = pk;
     pk_bad.root[0] ^= 1;
     try std.testing.expect(!X.verify(pk_bad, interop_msg, &sig0));
+}
+
+const auth_off = 4 + n + xmss.wots_len * n;
+
+/// buildAuth is the O(2^h) from-scratch auth-path reference; assert the BDS
+/// path embedded in `sig` (at `idx`) matches it byte-for-byte.
+fn expectAuthMatchesFromScratch(comptime X: type, sk_seed: *const [n]u8, pub_seed: *const [n]u8, idx: u32, sig: []const u8) !void {
+    var expected: [X.h][n]u8 = undefined;
+    X.buildAuth(sk_seed, pub_seed, idx, &expected);
+    for (expected, 0..) |node, j| {
+        try std.testing.expectEqualSlices(u8, &node, sig[auth_off + j * n ..][0..n]);
+    }
+}
+
+test "BDS: h=4 exhaustive sequential signing + differential vs from-scratch auth" {
+    const X = Xmss4;
+    const seeds = refSeeds();
+    var kp = X.keyGen(seeds.sk_seed, seeds.sk_prf, seeds.pub_seed);
+
+    // Sign every leaf sequentially. Each signature must verify, carry the
+    // right index, and its BDS-produced auth path must byte-match a fully
+    // independent from-scratch computation (buildAuth) — the differential
+    // that proves the traversal is correct at every index of the whole tree.
+    var sig: [X.signature_length]u8 = undefined;
+    var idx: u32 = 0;
+    while (idx < X.max_signatures) : (idx += 1) {
+        try std.testing.expectEqual(idx, kp.sk.idx);
+        try std.testing.expectEqual(idx, kp.sk.bds.covered_idx);
+        try X.sign(&kp.sk, &sig, "bds sweep");
+        try std.testing.expectEqual(idx, std.mem.readInt(u32, sig[0..4], .big));
+        try std.testing.expect(X.verify(kp.pk, "bds sweep", &sig));
+        try expectAuthMatchesFromScratch(X, &seeds.sk_seed, &seeds.pub_seed, idx, &sig);
+    }
+    // Whole key consumed → permanently exhausted.
+    try std.testing.expectError(error.KeyExhausted, X.sign(&kp.sk, &sig, "one too many"));
+}
+
+test "BDS: h=6 sequential sweep verifies every leaf; differential across the 2^(h-1) transition" {
+    const X = Xmss6;
+    var sk_seed: [n]u8 = undefined;
+    var sk_prf: [n]u8 = undefined;
+    var pub_seed: [n]u8 = undefined;
+    for (&sk_seed, &sk_prf, &pub_seed, 0..) |*a, *b, *c, i| {
+        a.* = @truncate(41 * i + 7);
+        b.* = @truncate(53 * i + 11);
+        c.* = @truncate(67 * i + 13);
+    }
+    var kp = X.keyGen(sk_seed, sk_prf, pub_seed);
+
+    // Sign all 2^6 leaves (cheap: each sign is ~O(h)); verify each. Run the
+    // O(2^h) from-scratch differential only at boundary indices — in
+    // particular 31→32, the left/right-subtree transition at leaf 2^(h-1),
+    // which exercises the top-level auth-node refresh and treehash restart.
+    var sig: [X.signature_length]u8 = undefined;
+    var idx: u32 = 0;
+    while (idx < X.max_signatures) : (idx += 1) {
+        try X.sign(&kp.sk, &sig, "h6 sweep");
+        try std.testing.expectEqual(idx, std.mem.readInt(u32, sig[0..4], .big));
+        try std.testing.expect(X.verify(kp.pk, "h6 sweep", &sig));
+        switch (idx) {
+            0, 1, 2, 30, 31, 32, 33, 62, 63 => try expectAuthMatchesFromScratch(X, &sk_seed, &pub_seed, idx, &sig),
+            else => {},
+        }
+    }
+    try std.testing.expectError(error.KeyExhausted, X.sign(&kp.sk, &sig, "one too many"));
+}
+
+test "BDS: out-of-band index jump resynchronizes to a byte-exact auth path" {
+    // A caller that sets idx directly (e.g. index partitioning, or a restored
+    // key) must still emit the correct auth path. sign() detects the desync
+    // (covered_idx != idx) and rebuilds the traversal state; the result must
+    // byte-match the from-scratch auth path for that leaf.
+    const seeds = refSeeds();
+
+    // h=4 jumps (cheap, several targets incl. last leaf).
+    inline for (.{ 1, 5, 11, 15 }) |target| {
+        var kp = Xmss4.keyGen(seeds.sk_seed, seeds.sk_prf, seeds.pub_seed);
+        kp.sk.idx = target; // out-of-band jump (bds still at leaf 0)
+        var sig: [Xmss4.signature_length]u8 = undefined;
+        try Xmss4.sign(&kp.sk, &sig, "jump4");
+        try std.testing.expectEqual(@as(u32, target), std.mem.readInt(u32, sig[0..4], .big));
+        try std.testing.expect(Xmss4.verify(kp.pk, "jump4", &sig));
+        try expectAuthMatchesFromScratch(Xmss4, &seeds.sk_seed, &seeds.pub_seed, target, &sig);
+    }
+
+    // One h=6 jump landing exactly on the 2^(h-1) transition leaf.
+    var kp6 = Xmss6.keyGen(seeds.sk_seed, seeds.sk_prf, seeds.pub_seed);
+    kp6.sk.idx = 32;
+    var sig6: [Xmss6.signature_length]u8 = undefined;
+    try Xmss6.sign(&kp6.sk, &sig6, "jump6");
+    try std.testing.expect(Xmss6.verify(kp6.pk, "jump6", &sig6));
+    try expectAuthMatchesFromScratch(Xmss6, &seeds.sk_seed, &seeds.pub_seed, 32, &sig6);
 }
 
 test "round-trip h=2: stateful index walk and exhaustion" {
