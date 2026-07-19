@@ -41,7 +41,7 @@ pub const meta = .{
     // connection with its own handshake/cipher state; nothing shared.
     .concurrency = .single_owner,
     .model_after = "BOLT#8 (lightning/bolts, 'Encrypted and Authenticated Transport') — Noise_XK_secp256k1_ChaChaPoly_SHA256; builds on this repo's own `noise` module (generic Noise Protocol Framework primitives)",
-    .deps = .{"noise"},
+    .deps = .{ "noise", "k256" },
 };
 
 pub const Secp256k1DH = dh;

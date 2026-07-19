@@ -60,8 +60,8 @@ pub const meta = .{
     .platform = .any,
     .role = .codec, // pure wire framing + crypto core, no I/O of its own
     .concurrency = .reentrant, // no shared/global state; every type here is a plain value type
-    .model_after = "BOLT#4 (lightning/bolts) - Sphinx onion routing for Lightning HTLCs; std.crypto.ecc.Secp256k1/stream.chacha/auth.hmac supply the primitives",
-    .deps = .{}, // std only
+    .model_after = "BOLT#4 (lightning/bolts) - Sphinx onion routing for Lightning HTLCs; the k256 module supplies the curve group (byte-exact to std.crypto.ecc.Secp256k1); std.crypto.stream.chacha/auth.hmac supply the rest",
+    .deps = .{"k256"}, // k256 curve group (byte-exact to std); std for chacha/hmac
 };
 
 pub const bigsize = @import("bigsize.zig");
@@ -115,8 +115,9 @@ test "meta.model_after names BOLT#4" {
     try std.testing.expect(std.mem.indexOf(u8, meta.model_after, "BOLT#4") != null);
 }
 
-test "meta.deps is empty (std only)" {
-    try std.testing.expectEqual(@as(usize, 0), meta.deps.len);
+test "meta.deps is {\"k256\"} (curve group; byte-exact to std)" {
+    try std.testing.expectEqual(@as(usize, 1), meta.deps.len);
+    try std.testing.expectEqualStrings("k256", meta.deps[0]);
 }
 
 test "packet_len re-export matches the BOLT#4 fixed size (1366 bytes)" {

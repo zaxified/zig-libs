@@ -10,7 +10,7 @@
 //! `hop_payloads`) is `core.zig`'s job.
 
 const std = @import("std");
-const Secp256k1 = std.crypto.ecc.Secp256k1;
+const Secp256k1 = @import("k256").Secp256k1;
 
 /// BOLT#4 "Packet Structure": "For this specification (version 0),
 /// `version` has a constant value of `0x00`."

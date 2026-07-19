@@ -59,7 +59,7 @@
 
 const std = @import("std");
 const bip340 = @import("bip340");
-const Secp256k1 = std.crypto.ecc.Secp256k1;
+const Secp256k1 = @import("k256").Secp256k1;
 const Fe = Secp256k1.Fe;
 const scalar_mod = Secp256k1.scalar;
 const Scalar = scalar_mod.Scalar;
@@ -68,8 +68,8 @@ pub const meta = .{
     .platform = .any,
     .role = .util, // pure computation — no I/O, no wire framing of its own
     .concurrency = .reentrant, // no globals; contexts/keys are plain value types
-    .model_after = "BIP327 (bitcoin/bips) — MuSig2 for BIP340-compatible Multi-Signatures; std.crypto.ecc.Secp256k1 supplies the curve group, the sibling bip340 module supplies tagged hashing + x-only key handling",
-    .deps = .{"bip340"}, // sibling module (tagged hashing, XOnlyPublicKey, the BIP340 challenge tag)
+    .model_after = "BIP327 (bitcoin/bips) — MuSig2 for BIP340-compatible Multi-Signatures; the k256 module supplies the curve group (byte-exact to std.crypto.ecc.Secp256k1), the sibling bip340 module supplies tagged hashing + x-only key handling",
+    .deps = .{ "bip340", "k256" }, // bip340 sibling (tagged hashing, XOnlyPublicKey, challenge tag); k256 curve group
 };
 
 // ── domain tags (BIP327 §"Notation": hash_tag(x) = SHA256(SHA256(tag) ‖
@@ -383,8 +383,8 @@ pub fn nonceGen(
     }
     if (k[0].isZero() or k[1].isZero()) return error.InvalidNonce;
 
-    const r1 = Secp256k1.basePoint.mul(k[0].toBytes(.big), .big) catch return error.InvalidNonce;
-    const r2 = Secp256k1.basePoint.mul(k[1].toBytes(.big), .big) catch return error.InvalidNonce;
+    const r1 = Secp256k1.combMulBase(k[0].toBytes(.big), .big) catch return error.InvalidNonce;
+    const r2 = Secp256k1.combMulBase(k[1].toBytes(.big), .big) catch return error.InvalidNonce;
 
     var pubnonce_bytes: [66]u8 = undefined;
     pubnonce_bytes[0..33].* = cbytes(r1);
@@ -847,7 +847,7 @@ pub fn sign(secnonce: SecNonce, sk: bip340.SecretKey, ctx: SessionContext) SignE
     const k1_prime = try secnonce.k1Scalar();
     const k2_prime = try secnonce.k2Scalar();
 
-    const p_point = Secp256k1.basePoint.mul(sk.bytes, .big) catch return error.SecretKeyMismatch;
+    const p_point = Secp256k1.combMulBase(sk.bytes, .big) catch return error.SecretKeyMismatch;
     const pk_bytes = cbytes(p_point);
     if (!std.mem.eql(u8, &pk_bytes, &secnonce.pubkeyBytes())) return error.SecretKeyMismatch;
     if (findPubkeyIndex(ctx.pubkeys, pk_bytes) == null) return error.PubkeyNotInSession;
@@ -877,8 +877,8 @@ pub fn sign(secnonce: SecNonce, sk: bip340.SecretKey, ctx: SessionContext) SignE
 
     // Steps 6-7: rebuild the signer's own pubnonce from the UNNEGATED
     // k1'/k2' and run the mandatory self-verification.
-    const r1 = Secp256k1.basePoint.mul(k1_prime.toBytes(.big), .big) catch return error.InvalidSecNonce;
-    const r2 = Secp256k1.basePoint.mul(k2_prime.toBytes(.big), .big) catch return error.InvalidSecNonce;
+    const r1 = Secp256k1.combMulBase(k1_prime.toBytes(.big), .big) catch return error.InvalidSecNonce;
+    const r2 = Secp256k1.combMulBase(k2_prime.toBytes(.big), .big) catch return error.InvalidSecNonce;
     var pubnonce_bytes: [66]u8 = undefined;
     pubnonce_bytes[0..33].* = cbytes(r1);
     pubnonce_bytes[33..66].* = cbytes(r2);

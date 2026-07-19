@@ -36,7 +36,7 @@
 //!     mod-n scalar multiply, NOT a point operation.
 
 const std = @import("std");
-const Secp256k1 = std.crypto.ecc.Secp256k1;
+const Secp256k1 = @import("k256").Secp256k1;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const packet = @import("packet.zig");
@@ -114,7 +114,7 @@ pub fn deriveHopSecrets(session_key: [32]u8, hop_pubkeys: []const [pubkey_len]u8
     // instead of recomputing scalar_i * G from scratch — same value, one
     // point-multiply per hop instead of a fresh base-point multiply.
     var ephemeral_scalar = session_key;
-    var ephemeral_point = Secp256k1.basePoint.mul(ephemeral_scalar, .big) catch
+    var ephemeral_point = Secp256k1.combMulBase(ephemeral_scalar, .big) catch
         return error.IdentityElement;
 
     for (hop_pubkeys, out, 0..) |hop_pubkey, *hop_secret, i| {

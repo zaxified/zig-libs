@@ -146,7 +146,7 @@ const bip340 = @import("bip340");
 /// Re-exported for callers (and `kat_test.zig`) that need to construct a
 /// raw curve point directly (e.g. deriving a `VerifyingShare` from a
 /// `SigningShare` via `Secp256k1.basePoint.mul`).
-pub const Secp256k1 = std.crypto.ecc.Secp256k1;
+pub const Secp256k1 = @import("k256").Secp256k1;
 const scalar_mod = Secp256k1.scalar;
 
 /// Re-exported: the std scalar-field type this module's `SigningNonces`,
@@ -161,8 +161,8 @@ pub const meta = .{
     .platform = .any,
     .role = .util, // pure computation — no I/O, no wire framing of its own
     .concurrency = .reentrant, // no globals; all types are plain values
-    .model_after = "RFC 9591 (\"The Flexible Round-Optimized Schnorr Threshold (FROST) Protocol for Two-Round Schnorr Signatures\"), §6.5 secp256k1/SHA-256 ciphersuite; RFC 9380 (hash-to-curve) §5.3/§5.4.1 expand_message_xmd/hash_to_field for H1-H3; std.crypto.ecc.Secp256k1 supplies the curve group",
-    .deps = .{"bip340"}, // orchestrator-registered; NOT used by verify — see root.zig's BIP340-compatibility finding
+    .model_after = "RFC 9591 (\"The Flexible Round-Optimized Schnorr Threshold (FROST) Protocol for Two-Round Schnorr Signatures\"), §6.5 secp256k1/SHA-256 ciphersuite; RFC 9380 (hash-to-curve) §5.3/§5.4.1 expand_message_xmd/hash_to_field for H1-H3; the k256 module supplies the curve group (byte-exact to std.crypto.ecc.Secp256k1)",
+    .deps = .{ "bip340", "k256" }, // bip340 orchestrator-registered (NOT used by verify); k256 curve group
 };
 
 // ── ciphersuite constants (RFC 9591 §6.5) ───────────────────────────────
@@ -899,9 +899,9 @@ pub fn round1Commit(nonces: SigningNonces) Round1CommitError!NonceCommitmentPair
     // ScalarBaseMult on each SECRET nonce — Secp256k1.mul is
     // constant-time; it errors exactly when the nonce is zero (identity
     // result), the defensive case Round1CommitError documents.
-    const hiding_point = Secp256k1.basePoint.mul(nonces.hiding.toBytes(.big), .big) catch
+    const hiding_point = Secp256k1.combMulBase(nonces.hiding.toBytes(.big), .big) catch
         return error.InvalidNonce;
-    const binding_point = Secp256k1.basePoint.mul(nonces.binding.toBytes(.big), .big) catch
+    const binding_point = Secp256k1.combMulBase(nonces.binding.toBytes(.big), .big) catch
         return error.InvalidNonce;
     return .{
         .hiding = Element.fromPoint(hiding_point) catch return error.InvalidNonce,
@@ -1103,7 +1103,7 @@ pub fn verifySignatureShare(
     const comm_share = hiding.add(binding_scaled);
 
     // l = ScalarBaseMult(sig_share_i); r = comm_share + PK_i*(challenge*lambda_i)
-    const l = Secp256k1.basePoint.mul(sig_share_i.toBytes(), .big) catch return false;
+    const l = Secp256k1.combMulBase(sig_share_i.toBytes(), .big) catch return false;
     const pk_i = verifying_share.point() catch return false;
     const pk_scaled = pk_i.mul(challenge.mul(lambda_i).toBytes(.big), .big) catch return false;
     const r = comm_share.add(pk_scaled);
@@ -1148,7 +1148,7 @@ pub fn verify(msg: []const u8, sig: Signature, group_public_key: GroupPublicKey)
     const challenge = computeChallenge(sig.r, group_public_key, msg);
 
     // l = ScalarBaseMult(z); r = R + ScalarMult(PK, c)
-    const l = Secp256k1.basePoint.mul(sig.z, .big) catch return false;
+    const l = Secp256k1.combMulBase(sig.z, .big) catch return false;
     const pk_scaled = pk.mul(challenge.toBytes(.big), .big) catch return false;
     const r = r_point.add(pk_scaled);
     return l.equivalent(r);
@@ -1250,7 +1250,7 @@ pub fn trustedDealerKeygen(
     errdefer allocator.free(vss_commitment);
     for (vss_commitment, 0..) |*slot, k| {
         const coeff = if (k == 0) secret_key else coefficients[k - 1];
-        const point = Secp256k1.basePoint.mul(coeff.toBytes(.big), .big) catch
+        const point = Secp256k1.combMulBase(coeff.toBytes(.big), .big) catch
             return error.InvalidParameters;
         slot.* = Element.fromPoint(point) catch return error.InvalidParameters;
     }

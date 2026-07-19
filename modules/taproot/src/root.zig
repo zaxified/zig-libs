@@ -28,7 +28,7 @@
 
 const std = @import("std");
 const bip340 = @import("bip340");
-const Secp256k1 = std.crypto.ecc.Secp256k1;
+const Secp256k1 = @import("k256").Secp256k1;
 const scalar = Secp256k1.scalar;
 const Scalar = scalar.Scalar;
 
@@ -36,8 +36,8 @@ pub const meta = .{
     .platform = .any,
     .role = .util, // pure computation — no I/O, no wire framing of its own
     .concurrency = .reentrant, // no globals; keys are plain value types
-    .model_after = "BIP341 (bitcoin/bips) — Taproot: key-path spending's output-key tweak; builds on the sibling bip340 module + std.crypto.ecc.Secp256k1",
-    .deps = .{"bip340"},
+    .model_after = "BIP341 (bitcoin/bips) — Taproot: key-path spending's output-key tweak; builds on the sibling bip340 module + the k256 curve group (byte-exact to std.crypto.ecc.Secp256k1)",
+    .deps = .{ "bip340", "k256" },
 };
 
 // ── "TapTweak" tagged hash (BIP341 §"Constructing and Spending Taproot Outputs") ──
@@ -149,7 +149,7 @@ pub const TweakResult = struct {
 /// 3. `P = internal.lift()` (BIP340 `lift_x`, i.e. `bip340.XOnlyPublicKey.
 ///    lift` — always resolves to internal's even-y point; fail with
 ///    `error.InvalidInternalKey` on lift failure).
-/// 4. `Q = P + t*G` (`Secp256k1.basePoint.mul(t_bytes, .big)` then complete
+/// 4. `Q = P + t*G` (`Secp256k1.combMulBase(t_bytes, .big)` then complete
 ///    point addition with `P` — NOT a double-base multiply; this is a
 ///    single scalar-mult plus one point-add, since `P` is not itself a
 ///    public generator-relative term here). `mul` refuses a zero scalar
@@ -188,7 +188,7 @@ pub fn tweakPublicKey(internal: bip340.XOnlyPublicKey, merkle_root: ?[32]u8) Twe
 
     // Step 4: Q = P + t*G. `mul` errors only on a zero scalar (it refuses
     // to produce the identity); t == 0 means t*G is the identity, so Q = P.
-    const q = if (Secp256k1.basePoint.mul(t_bytes, .big)) |tg|
+    const q = if (Secp256k1.combMulBase(t_bytes, .big)) |tg|
         p.add(tg)
     else |_|
         p;

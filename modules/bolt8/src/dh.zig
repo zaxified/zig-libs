@@ -34,7 +34,7 @@
 //! happens and what gets mixed with its output).
 
 const std = @import("std");
-const Secp256k1 = std.crypto.ecc.Secp256k1;
+const Secp256k1 = @import("k256").Secp256k1;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 // ── noise.Suite(DH, ...) adapter surface ─────────────────────────────────
@@ -78,7 +78,7 @@ pub const KeyPair = struct {
         const d = Secp256k1.scalar.Scalar.fromBytes(seed, .big) catch
             return error.InvalidSecretKey;
         if (d.isZero()) return error.InvalidSecretKey;
-        const p = Secp256k1.basePoint.mul(seed, .big) catch return error.InvalidSecretKey;
+        const p = Secp256k1.combMulBase(seed, .big) catch return error.InvalidSecretKey;
         return .{ .secret_key = seed, .public_key = p.toCompressedSec1() };
     }
 

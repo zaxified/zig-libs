@@ -27,7 +27,7 @@
 //! test vectors below.
 
 const std = @import("std");
-const Secp256k1 = std.crypto.ecc.Secp256k1;
+const Secp256k1 = @import("k256").Secp256k1;
 const scalar = Secp256k1.scalar;
 const Scalar = scalar.Scalar;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -36,8 +36,8 @@ pub const meta = .{
     .name = "bolt3",
     .summary = "Lightning BOLT#3 key derivation (Appendix E): per-commitment + revocation public/secret keys over secp256k1",
     .status = "build",
-    .model_after = "Lightning BOLT#3 (lightning/bolts) — Bitcoin Transaction and Script Formats §Key Derivation; std.crypto.ecc.Secp256k1 supplies the curve group",
-    .deps = .{}, // std only (std.crypto.ecc.Secp256k1, std.crypto.hash.sha2.Sha256)
+    .model_after = "Lightning BOLT#3 (lightning/bolts) — Bitcoin Transaction and Script Formats §Key Derivation; the k256 module supplies the curve group (byte-exact to std.crypto.ecc.Secp256k1)",
+    .deps = .{"k256"}, // k256 supplies the curve group (byte-exact to std.crypto.ecc.Secp256k1); std.crypto.hash.sha2.Sha256
 };
 
 pub const Error = error{
@@ -71,7 +71,7 @@ pub fn derivePublicKey(basepoint: [33]u8, per_commitment_point: [33]u8) Error![3
     const base = Secp256k1.fromSec1(&basepoint) catch return error.InvalidPoint;
     _ = Secp256k1.fromSec1(&per_commitment_point) catch return error.InvalidPoint;
     const t = hashToScalar(sha2(per_commitment_point, basepoint));
-    const tg = Secp256k1.basePoint.mul(t.toBytes(.big), .big) catch return error.IdentityElement;
+    const tg = Secp256k1.combMulBase(t.toBytes(.big), .big) catch return error.IdentityElement;
     return base.add(tg).toCompressedSec1();
 }
 
@@ -111,7 +111,7 @@ pub fn deriveRevocationPrivateKey(revocation_basepoint_secret: [32]u8, per_commi
 }
 
 fn pointOf(secret: [32]u8) ![33]u8 {
-    const p = try Secp256k1.basePoint.mul(secret, .big);
+    const p = try Secp256k1.combMulBase(secret, .big);
     return p.toCompressedSec1();
 }
 
@@ -171,18 +171,18 @@ test "revocation pub derived from secrets matches pub-from-points" {
     // Cross-check: the revocation pubkey must be the public point of the
     // revocation privkey (the whole point of the split-secret construction).
     const revpriv = try deriveRevocationPrivateKey(tv_base_secret, tv_pcs);
-    const revpub_from_priv = (try Secp256k1.basePoint.mul(revpriv, .big)).toCompressedSec1();
-    const base_pub = (try Secp256k1.basePoint.mul(tv_base_secret, .big)).toCompressedSec1();
-    const pcp = (try Secp256k1.basePoint.mul(tv_pcs, .big)).toCompressedSec1();
+    const revpub_from_priv = (try Secp256k1.combMulBase(revpriv, .big)).toCompressedSec1();
+    const base_pub = (try Secp256k1.combMulBase(tv_base_secret, .big)).toCompressedSec1();
+    const pcp = (try Secp256k1.combMulBase(tv_pcs, .big)).toCompressedSec1();
     const revpub_from_points = try deriveRevocationPublicKey(base_pub, pcp);
     try std.testing.expectEqualSlices(u8, &revpub_from_points, &revpub_from_priv);
 }
 
 test "simple priv derived matches pub-from-points" {
     const priv = try derivePrivateKey(tv_base_secret, tv_pcs);
-    const pub_from_priv = (try Secp256k1.basePoint.mul(priv, .big)).toCompressedSec1();
-    const base_pub = (try Secp256k1.basePoint.mul(tv_base_secret, .big)).toCompressedSec1();
-    const pcp = (try Secp256k1.basePoint.mul(tv_pcs, .big)).toCompressedSec1();
+    const pub_from_priv = (try Secp256k1.combMulBase(priv, .big)).toCompressedSec1();
+    const base_pub = (try Secp256k1.combMulBase(tv_base_secret, .big)).toCompressedSec1();
+    const pcp = (try Secp256k1.combMulBase(tv_pcs, .big)).toCompressedSec1();
     const pub_from_points = try derivePublicKey(base_pub, pcp);
     try std.testing.expectEqualSlices(u8, &pub_from_points, &pub_from_priv);
 }
@@ -218,7 +218,7 @@ test "per-commitment secret feeds the revocation derivation end-to-end" {
     // revocation derivation (App E) consumes — chain the two halves together.
     const seed = hex32("0101010101010101010101010101010101010101010101010101010101010101");
     const pcs = perCommitmentSecret(seed, max_index);
-    const revpub = try deriveRevocationPublicKey(tv_base_point, (try Secp256k1.basePoint.mul(pcs, .big)).toCompressedSec1());
+    const revpub = try deriveRevocationPublicKey(tv_base_point, (try Secp256k1.combMulBase(pcs, .big)).toCompressedSec1());
     const revpriv = try deriveRevocationPrivateKey(tv_base_secret, pcs);
     // revpub must be revpriv·G (mirrors the App-E cross-check, but sourced from a real shachain secret).
     _ = revpub;

@@ -27,7 +27,7 @@
 //! copied from any third-party test suite) in `kat_vectors.zig`.
 
 const std = @import("std");
-const Secp256k1 = std.crypto.ecc.Secp256k1;
+const Secp256k1 = @import("k256").Secp256k1;
 const Fe = Secp256k1.Fe;
 const scalar = Secp256k1.scalar;
 const Scalar = scalar.Scalar;
@@ -39,8 +39,8 @@ pub const meta = .{
     .platform = .any,
     .role = .util, // pure computation — no I/O, no wire framing of its own
     .concurrency = .reentrant, // no globals; keys are plain value types
-    .model_after = "BIP340 (bitcoin/bips) — Schnorr Signatures for secp256k1; std.crypto.ecc.Secp256k1 supplies the curve group",
-    .deps = .{}, // std only (std.crypto.ecc.Secp256k1, std.crypto.hash.sha2.Sha256)
+    .model_after = "BIP340 (bitcoin/bips) — Schnorr Signatures for secp256k1; the k256 module supplies the curve group (byte-exact to std.crypto.ecc.Secp256k1)",
+    .deps = .{"k256"}, // k256 supplies the curve group (byte-exact to std.crypto.ecc.Secp256k1); std.crypto.hash.sha2.Sha256
 };
 
 // ── x-only public key (BIP340 §"Public Key Conversion" + lift_x) ───────────
@@ -130,7 +130,7 @@ pub const KeyPair = struct {
     pub fn fromSecretKey(sk: SecretKey) SecretKeyError!KeyPair {
         const d = Scalar.fromBytes(sk.bytes, .big) catch return error.InvalidSecretKey;
         if (d.isZero()) return error.InvalidSecretKey;
-        const p = Secp256k1.basePoint.mul(sk.bytes, .big) catch return error.InvalidSecretKey;
+        const p = Secp256k1.combMulBase(sk.bytes, .big) catch return error.InvalidSecretKey;
         const xy = p.affineCoordinates();
         const effective: [32]u8 = if (xy.y.isOdd())
             scalar.neg(sk.bytes, .big) catch unreachable // sk.bytes already canonical (validated above)
@@ -252,7 +252,7 @@ pub fn sign(secret_key: SecretKey, msg: []const u8, aux_rand: [32]u8, io: std.Io
 
     // Step 6: R = k' * G (constant-time base-point multiply). Identity is
     // impossible (k' != 0 mod n, just checked), but map it defensively.
-    const r_point = Secp256k1.basePoint.mul(k0.toBytes(.big), .big) catch return error.InvalidNonce;
+    const r_point = Secp256k1.combMulBase(k0.toBytes(.big), .big) catch return error.InvalidNonce;
     const r_xy = r_point.affineCoordinates();
     const rx = r_xy.x.toBytes(.big);
 
@@ -416,7 +416,7 @@ pub fn verifyBatch(items: []const BatchItem, io: std.Io) bool {
     // (sum a_i*s_i)*G vs the accumulated right-hand side. `mul` errors iff
     // the scalar sum is 0 mod n (left side = identity): then the equation
     // holds iff the right side is the identity too.
-    const lhs = Secp256k1.basePoint.mul(lhs_scalar.toBytes(.big), .big) catch {
+    const lhs = Secp256k1.combMulBase(lhs_scalar.toBytes(.big), .big) catch {
         rhs.rejectIdentity() catch return true;
         return false;
     };

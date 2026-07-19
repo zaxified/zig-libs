@@ -38,7 +38,7 @@
 
 const std = @import("std");
 const bip340 = @import("bip340");
-const Secp256k1 = std.crypto.ecc.Secp256k1;
+const Secp256k1 = @import("k256").Secp256k1;
 const Fe = Secp256k1.Fe;
 const scalar_mod = Secp256k1.scalar;
 const Scalar = scalar_mod.Scalar;
@@ -47,8 +47,8 @@ pub const meta = .{
     .platform = .any,
     .role = .util, // pure computation — no I/O, no wire framing of its own
     .concurrency = .reentrant, // no globals; keys/points are plain value types
-    .model_after = "Schnorr adaptor signatures / \"one-time verifiably encrypted signatures\" (the scriptless-scripts construction, as implemented by secp256kfun's schnorr_fun::adaptor module) layered on BIP340; std.crypto.ecc.Secp256k1 supplies the curve group, the sibling bip340 module supplies tagged hashing + x-only key/signature handling + the BIP340 challenge tag",
-    .deps = .{"bip340"},
+    .model_after = "Schnorr adaptor signatures / \"one-time verifiably encrypted signatures\" (the scriptless-scripts construction, as implemented by secp256kfun's schnorr_fun::adaptor module) layered on BIP340; the k256 module supplies the curve group (byte-exact to std.crypto.ecc.Secp256k1), the sibling bip340 module supplies tagged hashing + x-only key/signature handling + the BIP340 challenge tag",
+    .deps = .{ "bip340", "k256" },
 };
 
 // ── domain tags ─────────────────────────────────────────────────────────
@@ -116,7 +116,7 @@ pub const AdaptorPoint = struct {
     /// counterparty derives the public `AdaptorPoint` it hands to the
     /// presigner.
     pub fn fromSecret(adaptor_secret: [32]u8) AdaptorPointError!AdaptorPoint {
-        const p = Secp256k1.basePoint.mul(adaptor_secret, .big) catch return error.InvalidAdaptorPoint;
+        const p = Secp256k1.combMulBase(adaptor_secret, .big) catch return error.InvalidAdaptorPoint;
         return .{ .bytes = p.toCompressedSec1() };
     }
 
@@ -302,7 +302,7 @@ pub fn preSign(
 
     // Step 5: R = k0*G; R_hat = R + T (a REAL point addition — T is a
     // general point). Reject the identity (only possible if T == -R).
-    const r_local = Secp256k1.basePoint.mul(k0.toBytes(.big), .big) catch return error.InvalidNonce;
+    const r_local = Secp256k1.combMulBase(k0.toBytes(.big), .big) catch return error.InvalidNonce;
     const r_hat = r_local.add(t_point);
     r_hat.rejectIdentity() catch return error.InvalidNonce;
 
@@ -565,7 +565,7 @@ pub fn extract(presig: PreSignature, full_sig: bip340.Signature, adaptor_point: 
 
     // Step 4: the recovered scalar's public point must equal T. A zero
     // y_used makes basePoint.mul error (identity) — never a valid T.
-    const implied = Secp256k1.basePoint.mul(y_used.toBytes(.big), .big) catch return error.AdaptorSecretMismatch;
+    const implied = Secp256k1.combMulBase(y_used.toBytes(.big), .big) catch return error.AdaptorSecretMismatch;
     if (!implied.equivalent(t_point)) return error.AdaptorSecretMismatch;
 
     // Step 5.
@@ -616,6 +616,6 @@ test "AdaptorPoint.fromSecret round-trips through .point() to the same secp256k1
     const t_bytes = [_]u8{0x01} ** 31 ++ [_]u8{0x02}; // arbitrary small nonzero scalar
     const ap = try AdaptorPoint.fromSecret(t_bytes);
     const got = try ap.point();
-    const want = try Secp256k1.basePoint.mul(t_bytes, .big);
+    const want = try Secp256k1.combMulBase(t_bytes, .big);
     try std.testing.expect(got.equivalent(want));
 }
