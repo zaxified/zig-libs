@@ -1049,10 +1049,17 @@ fn writeRawJson(arena: std.mem.Allocator, jw: *std.json.Stringify, raw: []const 
 
 // ── line framing ────────────────────────────────────────────────────────────
 
+/// Upper bound on a single JSON-RPC line (16 MiB). Generous enough for a
+/// tools/call payload, but caps the reusable read buffer so a hostile peer that
+/// never sends a '\n' cannot drive unbounded memory growth. An over-long line
+/// ends the session like a read failure (see `readLine`).
+pub const max_line_len: usize = 16 * 1024 * 1024;
+
 /// Read one newline-terminated line into the reusable buffer (grows as
-/// needed, so a tools/call line carrying a large payload is handled). Returns
-/// the line slice (without '\n'), or null at EOF. A read failure counts as
-/// EOF.
+/// needed up to `max_line_len`, so a tools/call line carrying a large payload
+/// is handled). Returns the line slice (without '\n'), or null at EOF. A read
+/// failure — or a line that would exceed `max_line_len` — counts as EOF, so a
+/// peer that never terminates a line cannot exhaust memory.
 fn readLine(gpa: std.mem.Allocator, reader: *std.Io.Reader, buf: *std.ArrayList(u8)) Error!?[]u8 {
     buf.clearRetainingCapacity();
     while (true) {
@@ -1061,6 +1068,9 @@ fn readLine(gpa: std.mem.Allocator, reader: *std.Io.Reader, buf: *std.ArrayList(
             return buf.items;
         };
         if (byte == '\n') return buf.items;
+        // Cap the buffer: an unterminated/over-long line is treated as a
+        // read failure (session end), bounding memory to max_line_len.
+        if (buf.items.len >= max_line_len) return null;
         try buf.append(gpa, byte);
     }
 }
@@ -1935,4 +1945,25 @@ test "serve: blank lines and CRLF line endings are tolerated" {
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n",
         aw.written(),
     );
+}
+
+test "readLine: an over-long unterminated line is capped, not buffered unbounded (audit CRIT)" {
+    const alloc = testing.allocator;
+    // Batch-10 audit CRIT: readLine grew buf one byte per input byte with no cap,
+    // so a peer that never sends '\n' drove unbounded memory growth. Feed more than
+    // max_line_len bytes with no newline: readLine must stop (return null) with
+    // memory bounded to max_line_len rather than buffering the whole stream.
+    const big = try alloc.alloc(u8, max_line_len + 100);
+    defer alloc.free(big);
+    @memset(big, 'x');
+    var in: std.Io.Reader = .fixed(big);
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+    try testing.expect(try readLine(alloc, &in, &buf) == null);
+    try testing.expect(buf.items.len <= max_line_len);
+    // A normal short line still round-trips.
+    var in2: std.Io.Reader = .fixed("hello\n");
+    buf.clearRetainingCapacity();
+    const l2 = try readLine(alloc, &in2, &buf);
+    try testing.expectEqualStrings("hello", l2.?);
 }
