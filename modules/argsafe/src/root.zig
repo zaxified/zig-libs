@@ -553,3 +553,21 @@ test "Argv pushIf rejection poisons too" {
     try testing.expectError(Error.Rejected, argv.pushIf(gpa, "../../etc/shadow", isSafePath));
     try testing.expectError(Error.Rejected, argv.slice());
 }
+
+test "CharClass.check: reject_leading_dash is load-bearing in isolation (audit MED)" {
+    // Batch-10 audit MED: the flag-injection guard had no ISOLATING positive
+    // control — every adversarial sweep also tripped first_char/charset, so a
+    // regression neutralizing reject_leading_dash would pass unnoticed. Build a
+    // class where '-' is an allowed charset byte and there is no first_char
+    // constraint, so reject_leading_dash is the ONLY guard that can reject a
+    // flag-shaped arg.
+    const guarded: CharClass = .{ .extra = "-", .first_char = .any, .reject_leading_dash = true };
+    try testing.expect(!guarded.check("-rf"));
+    try testing.expect(!guarded.check("--help"));
+    try testing.expect(guarded.check("rf")); // non-flag still passes
+    // Same class with the guard off accepts them — proving nothing else rejects,
+    // so the assertions above bite iff the guard is intact.
+    const unguarded: CharClass = .{ .extra = "-", .first_char = .any, .reject_leading_dash = false };
+    try testing.expect(unguarded.check("-rf"));
+    try testing.expect(unguarded.check("--help"));
+}
