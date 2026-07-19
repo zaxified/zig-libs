@@ -40,6 +40,7 @@ pub const Error = error{
     UnsupportedCompressionMethod,
     ZipNameTooLong,
     ZipBadFileOffset,
+    ZipBadCentralDirectory,
 };
 
 /// One archive member. `name` is owned by the parent `Archive` (its name
@@ -87,6 +88,32 @@ pub const Archive = struct {
         const name_alloc = self.name_arena.allocator();
 
         var iter = try std.zip.Iterator.init(&self.file_reader);
+
+        // Pre-validate the central directory before walking it. `std.zip.Iterator.next`
+        // advances by `46 + filename_len + extra_len + comment_len` computed in u16
+        // (std/zip.zig), which overflows on a hostile CD header (filename_len >= 65490)
+        // and panics in ReleaseSafe / silently misparses in ReleaseFast — reachable
+        // straight through this init (batch-10 audit CRIT). Walk the directory here
+        // with u64 arithmetic and reject any header whose per-record advance would
+        // exceed std's u16, so the real `iter.next()` walk below can never overflow.
+        // `iter`'s own cursor state is untouched (we never call next() here and it
+        // re-seeks per record), so the loop that follows still starts at record 0.
+        {
+            var cd_off: u64 = 0;
+            var i: u64 = 0;
+            while (i < iter.cd_record_count) : (i += 1) {
+                try self.file_reader.seekTo(iter.cd_zip_offset + cd_off);
+                const h = self.file_reader.interface.takeStruct(std.zip.CentralDirectoryFileHeader, .little) catch
+                    return Error.ZipBadCentralDirectory;
+                if (!std.mem.eql(u8, &h.signature, &std.zip.central_file_header_sig))
+                    return Error.ZipBadCentralDirectory;
+                const advance = @as(u64, @sizeOf(std.zip.CentralDirectoryFileHeader)) +
+                    h.filename_len + h.extra_len + h.comment_len;
+                if (advance > std.math.maxInt(u16)) return Error.ZipBadCentralDirectory;
+                cd_off += advance;
+            }
+        }
+
         var name_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
         while (try iter.next()) |e| {
             switch (e.compression_method) {
@@ -328,6 +355,29 @@ test "Archive: enumerates members, skips dir entries, find + findSuffix" {
     try testing.expect(archive.find("missing") == null);
     try testing.expect(archive.findSuffix("b.csv") != null);
     try testing.expectEqualStrings("sub/b.csv", archive.findSuffix("b.csv").?.name);
+}
+
+test "Archive.init: hostile central-directory header (filename_len 0xFFFF) is rejected, not a panic (audit CRIT)" {
+    const a = testing.allocator;
+    const zip = try buildZip(a, &.{.{ .name = "a.csv", .data = "x" }});
+    defer a.free(zip);
+
+    // Batch-10 audit CRIT: std.zip.Iterator.next advances by
+    // (46 + filename_len + extra_len + comment_len) in u16, which overflows / panics
+    // on a hostile header. Corrupt the central-directory header's filename_len to
+    // 0xFFFF; our pre-validation must reject it as a bad directory, never overflow.
+    const cd_sig = std.zip.central_file_header_sig;
+    const cd_start = std.mem.indexOf(u8, zip, &cd_sig).?;
+    // filename_len sits at offset 28 within CentralDirectoryFileHeader.
+    std.mem.writeInt(u16, zip[cd_start + 28 ..][0..2], 0xFFFF, .little);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var f = try openZip(&tmp, zip);
+    defer f.close(testing.io);
+
+    var archive: Archive = undefined;
+    try testing.expectError(Error.ZipBadCentralDirectory, archive.init(testing.io, a, f));
 }
 
 test "EntryReader: streams a stored entry, then a second one (shared cursor)" {
