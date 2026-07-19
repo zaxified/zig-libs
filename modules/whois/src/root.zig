@@ -26,13 +26,14 @@
 //! consulted or copied.
 
 const std = @import("std");
+const netaddr = @import("netaddr");
 
 pub const meta = .{
     .platform = .any, // codec/logic; the optional TcpTransport helper is posix
     .role = .client,
     .concurrency = .reentrant, // no shared state anywhere
     .model_after = "RFC 3912 whois; IANA/registry referral chain",
-    .deps = .{}, // std only
+    .deps = .{"netaddr"}, // special-use address classification for the referral SSRF guard
 };
 
 // ── constants ───────────────────────────────────────────────────────────────
@@ -205,6 +206,43 @@ pub fn nextServer(response: []const u8) ?Referral {
     return null;
 }
 
+// ── referral destination policy (SSRF hardening) ────────────────────────────
+// WHOIS is unauthenticated plaintext (port 43, no TLS): a malicious or
+// MITM'd server can inject a referral line pointing anywhere. Without a
+// destination check, `lookup` would happily connect to internal
+// infrastructure named by that referral (SSRF / internal-port-connect
+// oracle). Default-deny special-use address space before ever calling
+// `Transport.exchange` on a referral host.
+
+/// True when `host` names special-use / non-routable address space: the
+/// conventional `localhost` name, or an IP literal in loopback
+/// (`127.0.0.0/8`, `::1`), RFC 1918 private (`10/8`, `172.16/12`,
+/// `192.168/16`), link-local (`169.254.0.0/16`, `fe80::/10`), IPv6
+/// unique-local (`fc00::/7`), unspecified (`0.0.0.0`, `::`) or multicast
+/// space. A referral host that is a *hostname* other than `localhost` is not
+/// classified here (this module never resolves DNS itself); a caller whose
+/// `Transport` does its own resolution should apply the same check to the
+/// resolved address before connecting.
+pub fn isSpecialUseHost(host: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(host, "localhost")) return true;
+    if (std.ascii.endsWithIgnoreCase(host, ".localhost")) return true;
+    const ip = netaddr.parseIp(host) orelse return false;
+    return isSpecialUseIp(ip);
+}
+
+fn isSpecialUseIp(ip: netaddr.Ip) bool {
+    if (ip.isUnspecified() or ip.isLoopback() or ip.isLinkLocalUnicast() or
+        ip.isMulticast() or ip.isUniqueLocal()) return true;
+    // netaddr has no RFC 1918 helper (out of scope for that module); the
+    // three private ranges are cheap enough to check directly here.
+    return switch (ip.unmap()) {
+        .v4 => |q| (q[0] == 10) or
+            (q[0] == 172 and q[1] >= 16 and q[1] <= 31) or
+            (q[0] == 192 and q[1] == 168),
+        .v6 => false,
+    };
+}
+
 // ── lookup: referral chasing ────────────────────────────────────────────────
 
 pub const LookupOptions = struct {
@@ -291,6 +329,8 @@ pub fn lookup(
         const ref = nextServer(response) orelse
             return .{ .response = response, .chain = chain, .truncated = false };
         if (chain.contains(ref.host)) // self-referral / cycle: this is terminal
+            return .{ .response = response, .chain = chain, .truncated = false };
+        if (isSpecialUseHost(ref.host)) // SSRF guard: never chase into special-use space
             return .{ .response = response, .chain = chain, .truncated = false };
         if (chain.count >= max_servers or !chain.append(ref.host))
             return .{ .response = response, .chain = chain, .truncated = true };
@@ -540,6 +580,61 @@ test "lookup: self-referral stops cleanly" {
     try testing.expectEqual(@as(usize, 1), result.chain.count);
     try testing.expect(!result.truncated);
     try testing.expectEqual(@as(usize, 1), scripted.call_count);
+}
+
+test "isSpecialUseHost: classifies loopback/private/link-local/localhost, passes public" {
+    try testing.expect(isSpecialUseHost("127.0.0.1"));
+    try testing.expect(isSpecialUseHost("10.0.0.5"));
+    try testing.expect(isSpecialUseHost("172.16.0.1"));
+    try testing.expect(isSpecialUseHost("172.31.255.255"));
+    try testing.expect(!isSpecialUseHost("172.32.0.1")); // just outside 172.16/12
+    try testing.expect(isSpecialUseHost("192.168.1.1"));
+    try testing.expect(isSpecialUseHost("169.254.169.254")); // cloud metadata
+    try testing.expect(isSpecialUseHost("::1"));
+    try testing.expect(isSpecialUseHost("fe80::1"));
+    try testing.expect(isSpecialUseHost("fc00::1"));
+    try testing.expect(isSpecialUseHost("0.0.0.0"));
+    try testing.expect(isSpecialUseHost("localhost"));
+    try testing.expect(isSpecialUseHost("LOCALHOST"));
+    try testing.expect(isSpecialUseHost("foo.localhost"));
+    try testing.expect(!isSpecialUseHost("whois.verisign-grs.com"));
+    try testing.expect(!isSpecialUseHost("192.0.2.1")); // TEST-NET-1, not special-cased here
+}
+
+test "lookup: refer: to a loopback host is refused, chase stops (no SSRF)" {
+    var scripted: ScriptedTransport = .{ .entries = &.{
+        .{ .server = "whois.iana.org", .response = "refer: 127.0.0.1\n" },
+    } };
+    var buf: [256]u8 = undefined;
+    const result = try lookup(scripted.transport(), "example.com", .{}, &buf);
+    try testing.expectEqual(@as(usize, 1), result.chain.count); // never appended the loopback hop
+    try testing.expect(!result.truncated);
+    try testing.expectEqual(@as(usize, 1), scripted.call_count); // 127.0.0.1 never dialed
+    try testing.expectEqualStrings("refer: 127.0.0.1\n", result.response);
+}
+
+test "lookup: refer: to an RFC 1918 host is refused, chase stops (no SSRF)" {
+    var scripted: ScriptedTransport = .{ .entries = &.{
+        .{ .server = "whois.iana.org", .response = "refer: 10.0.0.1:8080\n" },
+    } };
+    var buf: [256]u8 = undefined;
+    const result = try lookup(scripted.transport(), "example.com", .{}, &buf);
+    try testing.expectEqual(@as(usize, 1), result.chain.count);
+    try testing.expect(!result.truncated);
+    try testing.expectEqual(@as(usize, 1), scripted.call_count); // 10.0.0.1 never dialed
+}
+
+test "lookup: a normal public referral still proceeds" {
+    // Regression guard: the SSRF check must not over-reject legitimate chains.
+    var scripted: ScriptedTransport = .{ .entries = &.{
+        .{ .server = "whois.iana.org", .response = iana_reply },
+        .{ .server = "whois.verisign-grs.com", .response = terminal_reply },
+    } };
+    var buf: [1024]u8 = undefined;
+    const result = try lookup(scripted.transport(), "example.com", .{}, &buf);
+    try testing.expectEqual(@as(usize, 2), result.chain.count);
+    try testing.expect(!result.truncated);
+    try testing.expectEqualStrings(terminal_reply, result.response);
 }
 
 test "lookup: two-server cycle stops at the guard (case-insensitive)" {

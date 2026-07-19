@@ -771,6 +771,8 @@ pub const Client = struct {
         };
         const related = related_opt orelse return parsed;
         if (!isHttpUrl(related)) return parsed;
+        const related_url = http.Url.parse(related) catch return parsed;
+        if (isSpecialUseHost(related_url.host)) return parsed; // SSRF guard
         const followed = c.fetchAndParse(related, body_buf) catch return parsed;
         parsed.deinit();
         return followed;
@@ -796,6 +798,42 @@ pub const Client = struct {
 fn isHttpUrl(s: []const u8) bool {
     return std.ascii.startsWithIgnoreCase(s, "https://") or
         std.ascii.startsWithIgnoreCase(s, "http://");
+}
+
+// ── related-link destination policy (SSRF hardening) ────────────────────────
+// RDAP's whole point is cross-registry redirection, so a hostile or
+// compromised registry can name anything in a `rel:"related"` href. Without a
+// destination check, `follow_related` would fetch whatever host the response
+// names (SSRF). Default-deny special-use address space before ever fetching
+// a related link.
+
+/// True when `host` (as returned by `http.Url.parse`) names special-use /
+/// non-routable address space: the conventional `localhost` name, or an IP
+/// literal in loopback (`127.0.0.0/8`, `::1`), RFC 1918 private (`10/8`,
+/// `172.16/12`, `192.168/16`), link-local (`169.254.0.0/16`, `fe80::/10`),
+/// IPv6 unique-local (`fc00::/7`), unspecified (`0.0.0.0`, `::`) or multicast
+/// space. A host that is a hostname other than `localhost` is not classified
+/// here — it is left to the caller's `Fetcher`/`http.Client`'s own resolver;
+/// this check catches the literal-IP and `localhost` cases the audit found
+/// directly exploitable.
+fn isSpecialUseHost(host: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(host, "localhost")) return true;
+    if (std.ascii.endsWithIgnoreCase(host, ".localhost")) return true;
+    const ip = netaddr.parseIp(host) orelse return false;
+    return isSpecialUseIp(ip);
+}
+
+fn isSpecialUseIp(ip: netaddr.Ip) bool {
+    if (ip.isUnspecified() or ip.isLoopback() or ip.isLinkLocalUnicast() or
+        ip.isMulticast() or ip.isUniqueLocal()) return true;
+    // netaddr has no RFC 1918 helper (out of scope for that module); the
+    // three private ranges are cheap enough to check directly here.
+    return switch (ip.unmap()) {
+        .v4 => |q| (q[0] == 10) or
+            (q[0] == 172 and q[1] >= 16 and q[1] <= 31) or
+            (q[0] == 192 and q[1] == 168),
+        .v6 => false,
+    };
 }
 
 // ── default fetcher over our http client ────────────────────────────────────
@@ -1405,6 +1443,82 @@ test "client: failed related hop falls back to the first document" {
     const o = &parsed.document.object;
     try testing.expectEqualStrings("2336799_DOMAIN_COM-VRSN", o.handle.?);
     try testing.expectEqualStrings("1995-08-14T04:00:00Z", o.eventDate("registration").?);
+}
+
+test "isSpecialUseHost: classifies loopback/private/link-local/localhost, passes public" {
+    try testing.expect(isSpecialUseHost("127.0.0.1"));
+    try testing.expect(isSpecialUseHost("10.0.0.5"));
+    try testing.expect(isSpecialUseHost("172.16.0.1"));
+    try testing.expect(!isSpecialUseHost("172.32.0.1")); // just outside 172.16/12
+    try testing.expect(isSpecialUseHost("192.168.1.1"));
+    try testing.expect(isSpecialUseHost("169.254.169.254")); // cloud metadata
+    try testing.expect(isSpecialUseHost("::1"));
+    try testing.expect(isSpecialUseHost("fe80::1"));
+    try testing.expect(isSpecialUseHost("localhost"));
+    try testing.expect(!isSpecialUseHost("rdap.markmonitor.com"));
+}
+
+test "client: related link at a loopback host is refused, falls back to the first document" {
+    const ssrf_related_json =
+        \\{
+        \\  "objectClassName": "domain",
+        \\  "handle": "REG-1",
+        \\  "links": [
+        \\    {"rel": "related", "type": "application/rdap+json",
+        \\     "href": "http://127.0.0.1:6379/rdap/domain/example.com"}
+        \\  ]
+        \\}
+    ;
+    var stub: StubFetcher = .{ .entries = &.{
+        .{ .url = "https://rdap.verisign.com/com/v1/domain/example.com", .body = ssrf_related_json },
+        // If the guard failed, this would be reachable — it must never be dialed.
+        .{ .url = "http://127.0.0.1:6379/rdap/domain/example.com", .body = domain_json },
+    } };
+    var client: Client = .{ .fetcher = stub.fetcher(), .gpa = testing.allocator };
+    var buf: [8192]u8 = undefined;
+
+    var parsed = try client.query(
+        "https://rdap.verisign.com/com/v1",
+        .domain,
+        "example.com",
+        .{ .follow_related = true },
+        &buf,
+    );
+    defer parsed.deinit();
+
+    try testing.expectEqual(@as(usize, 1), stub.call_count); // the loopback hop was never fetched
+    try testing.expectEqualStrings("REG-1", parsed.document.object.handle.?);
+}
+
+test "client: related link at a private (RFC 1918) host is refused" {
+    const ssrf_related_json =
+        \\{
+        \\  "objectClassName": "domain",
+        \\  "handle": "REG-2",
+        \\  "links": [
+        \\    {"rel": "related", "type": "application/rdap+json",
+        \\     "href": "https://10.0.0.5/internal/domain/example.com"}
+        \\  ]
+        \\}
+    ;
+    var stub: StubFetcher = .{ .entries = &.{
+        .{ .url = "https://rdap.verisign.com/com/v1/domain/example.com", .body = ssrf_related_json },
+        .{ .url = "https://10.0.0.5/internal/domain/example.com", .body = domain_json },
+    } };
+    var client: Client = .{ .fetcher = stub.fetcher(), .gpa = testing.allocator };
+    var buf: [8192]u8 = undefined;
+
+    var parsed = try client.query(
+        "https://rdap.verisign.com/com/v1",
+        .domain,
+        "example.com",
+        .{ .follow_related = true },
+        &buf,
+    );
+    defer parsed.deinit();
+
+    try testing.expectEqual(@as(usize, 1), stub.call_count);
+    try testing.expectEqualStrings("REG-2", parsed.document.object.handle.?);
 }
 
 test "HttpFetcher compiles (never dialed in tests)" {

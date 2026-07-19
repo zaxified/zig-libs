@@ -30,19 +30,25 @@ TLS itself and validates no server identity beyond what the fetcher enforces. Th
 attack surface, and its guarantee is that **hostile/oversized/wrong-typed JSON from an untrusted
 server never panics** — arena-owned, tolerant parsing with a caller-bounded body buffer. The
 `related`-link follow is capped at **one hop** so a server cannot chain the client through an
-unbounded redirect graph. RDAP data is registrant-supplied and unauthenticated beyond the transport
+unbounded redirect graph, and the target host is checked with `isSpecialUseHost` before that hop is
+fetched — a `related` `href` naming loopback/RFC 1918/link-local/unique-local/unspecified/multicast
+space or `localhost` is refused (falls back to the first document) rather than fetched, since RDAP's
+whole point is cross-registry redirection and a hostile/compromised registry controls that URL
+(SSRF hardening; a hostname other than `localhost` is not classified here and relies on the
+`Fetcher`'s own resolver). RDAP data is registrant-supplied and unauthenticated beyond the transport
 — callers must not treat fields as verified. Out of scope: RDAP search queries, RDAP-over-HTTP
 conformance/authentication extensions, and JSON schema validation beyond the tolerant model.
 
 ## Verification
 
-19 offline tests (no test touches the network): `buildPath` KATs for all query types +
+22 offline tests (no test touches the network): `buildPath` KATs for all query types +
 percent-encoding, Accept-header check, base-join with/without trailing slash; response KATs for
 domain / ip-network / autnum shapes (RFC 9083 §5.3–5.5) and the typed error object (RFC 7480 §5.3),
 plus sparse, malformed/wrong-top-level, and wrong-typed-member (degrade-not-panic) cases; bootstrap
 KATs (RFC 9224 shape) with IPv4/IPv6 longest-prefix and ASN-range matching and malformed-input
-tolerance; end-to-end client tests over a canned fetcher (domain query, 404→NotFound, related-link
-follow and its fallback when the second hop fails). Run: `zig build test-rdap`.
+tolerance; `isSpecialUseHost` classification; end-to-end client tests over a canned fetcher (domain
+query, 404→NotFound, related-link follow and its fallback when the second hop fails or when the
+`related` href names a loopback/RFC 1918 host — never dialed). Run: `zig build test-rdap`.
 
 ## Backlog / deferred
 

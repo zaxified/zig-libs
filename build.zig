@@ -72,7 +72,7 @@ const module_list = [_]Module{
     .{ .name = "ssh", .deps = &.{"rsa"} },
     .{ .name = "nftables" },
     .{ .name = "modbus" },
-    .{ .name = "whois" },
+    .{ .name = "whois", .deps = &.{"netaddr"} },
     .{ .name = "uci" },
     .{ .name = "mqtt" },
     .{ .name = "snmp" },

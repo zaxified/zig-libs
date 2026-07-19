@@ -24,22 +24,30 @@ WHOIS is plaintext over TCP/43 with no authentication or encryption; transport s
 scope and largely unavailable for the protocol. The threats this module actually contains are (a)
 **CRLF injection** via the query — blocked at `formatQuery`; (b) a **malicious/looping referral
 graph** — bounded by the depth cap, cycle guard, and per-response byte cap so a hostile server cannot
-drive an unbounded chase or memory blowup; and (c) **untrusted reply text** — treated as opaque
-bytes, never parsed into structure, so there is no field-parsing attack surface. Callers must still
-treat WHOIS answers as unauthenticated.
+drive an unbounded chase or memory blowup; (c) **referral SSRF** — a MITM'd or hostile server in the
+chain naming a loopback/RFC 1918/link-local/unique-local/unspecified/multicast host (or `localhost`)
+in a `refer:`/`ReferralServer:`/`whois:` line; `isSpecialUseHost` default-denies before `lookup` ever
+dials that host, so it cannot be turned into an internal-port-connect oracle (a referral naming an
+*external* hostname that itself resolves to special-use space is out of scope here — this module
+never resolves DNS; a `Transport` that does its own resolution should re-check the resolved address);
+and (d) **untrusted reply text** — treated as opaque bytes, never parsed into structure, so there is
+no field-parsing attack surface. Callers must still treat WHOIS answers as unauthenticated.
 
 ## Verification
-17 offline tests (no test ever dials): `formatQuery` round-trip + CRLF-injection and length rejection;
+21 offline tests (no test ever dials): `formatQuery` round-trip + CRLF-injection and length rejection;
 the documented ARIN/Verisign query conveniences; `fieldValue` and `parseServerRef` (whois:// URL,
-ports, scheme/garbage rejection); a known-answer referral extraction; the full `lookup` behavior over
-a scripted transport — IANA→Verisign→registrar chain, self-referral and two-server-cycle termination,
-depth-cap `truncated` reporting, byte-cap `ResponseTooLarge`, referral port carried from a `whois://`
-URL, up-front rejection of bad root/oversized query, transport-failure propagation. Run: `zig build
-test-whois`.
+ports, scheme/garbage rejection); a known-answer referral extraction; `isSpecialUseHost` classification
+(loopback/RFC 1918/link-local/unique-local/`localhost`, and that a normal public host passes); the full
+`lookup` behavior over a scripted transport — IANA→Verisign→registrar chain, self-referral and
+two-server-cycle termination, depth-cap `truncated` reporting, byte-cap `ResponseTooLarge`, referral
+port carried from a `whois://` URL, up-front rejection of bad root/oversized query,
+transport-failure propagation, and the SSRF guard refusing a loopback/RFC 1918 referral while a normal
+public referral still proceeds. Run: `zig build test-whois`.
 
 ## Backlog / deferred
 None recorded.
 
 ## Status
 `gap · any (logic over a transport seam; optional TcpTransport is posix) · client · reentrant` +
-deps: none (std only) — canonical source is `pub const meta` in src/root.zig.
+deps: `netaddr` (special-use address classification for the referral SSRF guard) — canonical source is
+`pub const meta` in src/root.zig.
