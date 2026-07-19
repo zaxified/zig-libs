@@ -155,6 +155,13 @@ pub fn validate(
     if (!rrsigTimeValid(rrsig, opts.now)) return .bogus;
     if (rrsig.type_covered != @intFromEnum(rrset[0].ty)) return .bogus;
     if (!dnskey.isZoneKey()) return .bogus;
+    // The key is decoded per `dnskey.algorithm` but the signature is verified
+    // per `rrsig.algorithm`; `keys.verifySignature` then reads the field of the
+    // `DecodedKey` union tagged for `rrsig.algorithm`. If the two disagree that
+    // is an inactive-field access (union type confusion) — reject the algorithm
+    // mismatch here, before the dispatch (RFC 4035: the RRSIG and the DNSKEY
+    // that signed it necessarily share one algorithm).
+    if (rrsig.algorithm != dnskey.algorithm) return .bogus;
 
     // Reconstruct the raw DNSKEY RDATA (RFC 4034 §2.1) so the trust anchor
     // (which digests/compares raw bytes) can be checked against this key.
@@ -217,4 +224,55 @@ test "rrsigTimeValid: RFC 1982 wraparound near the u32 boundary" {
     try testing.expect(rrsigTimeValid(sig, 0xffffffff)); // just before wrap
     try testing.expect(rrsigTimeValid(sig, 50)); // just after wrap
     try testing.expect(!rrsigTimeValid(sig, 0x80000000)); // far outside either side
+}
+
+test "regression: algorithm-mismatched DNSKEY/RRSIG is rejected, not union-confused" {
+    // The DNSKEY is Ed25519 (algorithm 15) but the RRSIG claims RSA/SHA-256
+    // (algorithm 8). Previously `validate` decoded the key per `dnskey.algorithm`
+    // (yielding `DecodedKey.ed25519`) yet `verifySignature` dispatched on
+    // `rrsig.algorithm` (reading the inactive `key.rsa` field), an
+    // inactive-union-field access that panicked inside keys.zig. The guard must
+    // now reject the mismatch up front and return `.bogus`.
+    var seed: [32]u8 = undefined;
+    for (&seed, 0..) |*b, i| b.* = @intCast(31 - i);
+    const kp = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+    const pub_bytes = kp.public_key.toBytes();
+
+    const dnskey: rdata.Dnskey = .{
+        .flags = rdata.Dnskey.flag_zone_key,
+        .protocol = 3,
+        .algorithm = rdata.algorithm.ed25519, // Ed25519 key ...
+        .public_key = &pub_bytes,
+    };
+    // The raw RDATA `validate` reconstructs internally, for a pinned anchor
+    // that matches — so WITHOUT the guard execution reaches the crashing
+    // dispatch rather than failing the anchor check first.
+    var raw: [4 + 32]u8 = undefined;
+    std.mem.writeInt(u16, raw[0..2], dnskey.flags, .big);
+    raw[2] = dnskey.protocol;
+    raw[3] = dnskey.algorithm;
+    @memcpy(raw[4..], &pub_bytes);
+
+    const owner = "example.com";
+    const rrset = [_]dns.Record{.{
+        .name = owner,
+        .ty = @enumFromInt(rdata.rr_type.dnskey),
+        .class = .in,
+        .ttl = 3600,
+        .data = .{ .unknown = &raw },
+    }};
+    const rrsig: rdata.Rrsig = .{
+        .type_covered = rdata.rr_type.dnskey,
+        .algorithm = rdata.algorithm.rsasha256, // ... but RRSIG claims RSA/SHA-256
+        .labels = 2,
+        .original_ttl = 3600,
+        .expiration = 2000,
+        .inception = 0,
+        .key_tag = 0,
+        .signer_name = owner,
+        .signature = &[_]u8{0} ** 64,
+    };
+    const anchor: chain.TrustAnchor = .{ .dnskey_rdata = &raw };
+    const r = try validate(testing.allocator, &rrset, rrsig, owner, dnskey, anchor, .{ .now = 1000 });
+    try testing.expectEqual(ValidationResult.bogus, r);
 }

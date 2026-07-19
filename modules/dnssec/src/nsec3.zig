@@ -253,7 +253,13 @@ fn usableRecord(r: Nsec3Record, salt: []const u8, iterations: u16) bool {
 }
 
 fn decodeOwnerHash(label: []const u8, out: *[sha1_digest_len]u8) ?[]const u8 {
-    if (decodedLen(label.len) < sha1_digest_len) return null;
+    // An NSEC3 owner hash is always exactly one SHA-1 digest (RFC 5155 §5), so
+    // the label must decode to precisely `sha1_digest_len` bytes. Binding both
+    // bounds here (not just the lower one) is a memory-safety requirement, not
+    // just a validity check: `decode` writes `decodedLen(label.len)` bytes into
+    // `tmp` with no upper-bound check of its own, so an over-long
+    // attacker-controlled label would otherwise overflow the fixed buffer.
+    if (decodedLen(label.len) != sha1_digest_len) return null;
     var tmp: [64]u8 = undefined;
     const dec = decode(label, &tmp) catch return null;
     if (dec.len != sha1_digest_len) return null;
@@ -362,4 +368,34 @@ test "iteratedHash: empty salt behaves like no salt appended" {
     var expected: [sha1_digest_len]u8 = undefined;
     std.crypto.hash.Sha1.hash(name, &expected, .{});
     try testing.expectEqualSlices(u8, &expected, &iteratedHash(name, "", 0));
+}
+
+test "regression: over-long NSEC3 owner-hash label does not overflow (was OOB stack write)" {
+    // An attacker-controlled NSEC3 owner-hash label longer than one SHA-1
+    // digest worth of base32hex (>~32 chars) used to be `decode`d straight into
+    // a fixed [64]u8 stack buffer with only a lower-bound length check, so a
+    // 200-char label wrote 125 bytes past the guard and panicked at
+    // "index out of bounds: index 64, len 64" inside `decode`. This exercises
+    // the exact reachable path (proveDenial -> matchNsec3/coverNsec3 ->
+    // decodeOwnerHash): the malicious record must pass `usableRecord`
+    // (algo 1 / iterations 0 / empty salt) so the decode is actually reached.
+    const evil_label = "0" ** 200; // 200 valid base32hex chars => 125 decoded bytes
+    const empty_types: rdata.TypeBitMap = .{ .raw = "" };
+    const record: Nsec3Record = .{
+        .owner_hash_label = evil_label,
+        .rdata = .{
+            .hash_algorithm = hash_algorithm_sha1,
+            .flags = 0,
+            .iterations = 0,
+            .salt = "",
+            .next_hashed_owner_name = &[_]u8{0} ** sha1_digest_len,
+            .types = empty_types,
+        },
+    };
+    const set: Nsec3Set = .{ .records = &[_]Nsec3Record{record} };
+    // Must return a verdict (a failed proof is `.bogus`), never panic.
+    try testing.expectEqual(DenialResult.bogus, proveDenial("www.example", 1, set, "", 0));
+    // And the direct decode path rejects the over-long label instead of writing OOB.
+    var out: [sha1_digest_len]u8 = undefined;
+    try testing.expect(decodeOwnerHash(evil_label, &out) == null);
 }

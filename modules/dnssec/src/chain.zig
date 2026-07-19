@@ -102,6 +102,12 @@ pub fn validateDnskeySet(
         const raw = dnskey_rrset[i];
         const dnskey = rdata.parseDnskey(raw) catch continue;
         if (!dnskey.isZoneKey()) continue;
+        // The key is decoded per `dnskey.algorithm` but verified per
+        // `dnskey_rrsig.algorithm`; a mismatch makes `keys.verifySignature`
+        // read the inactive field of the `DecodedKey` union (type confusion).
+        // Skip any key whose algorithm differs from the RRSIG's before the
+        // dispatch (RFC 4035: signer and signature share one algorithm).
+        if (dnskey.algorithm != dnskey_rrsig.algorithm) continue;
         const key = keys.decodePublicKey(dnskey.algorithm, dnskey.public_key) catch continue;
         keys.verifySignature(dnskey_rrsig.algorithm, key, signed, dnskey_rrsig.signature) catch continue;
         return .secure;
@@ -124,4 +130,47 @@ pub fn anchorMatches(trust_anchor: TrustAnchor, zone_name: []const u8, dnskey_rd
             return ds_mod.matches(ds, zone_name, dnskey_rdata) catch false;
         },
     }
+}
+
+// ── tests ───────────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+test "regression: algorithm-mismatched DNSKEY/RRSIG is rejected, not union-confused" {
+    // The DNSKEY is Ed25519 (algorithm 15) but the RRSIG claims RSA/SHA-256
+    // (algorithm 8). Previously the key was decoded per the DNSKEY's algorithm
+    // (yielding `DecodedKey.ed25519`) yet `verifySignature` dispatched on the
+    // RRSIG's algorithm (reading the inactive `key.rsa` field), an
+    // inactive-union-field access that panicked inside keys.zig. The guard must
+    // now skip the mismatched key so the set fails closed to `.bogus`.
+    var seed: [32]u8 = undefined;
+    for (&seed, 0..) |*b, i| b.* = @intCast(i);
+    const kp = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+    const pub_bytes = kp.public_key.toBytes();
+
+    // Raw DNSKEY RDATA: flags=0x0100 (zone key), protocol=3, algorithm=15
+    // (Ed25519), then the 32-byte public key.
+    var raw: [4 + 32]u8 = undefined;
+    std.mem.writeInt(u16, raw[0..2], rdata.Dnskey.flag_zone_key, .big);
+    raw[2] = 3;
+    raw[3] = rdata.algorithm.ed25519;
+    @memcpy(raw[4..], &pub_bytes);
+
+    const zone = "example.com";
+    const rrset = [_][]const u8{&raw};
+    const rrsig: rdata.Rrsig = .{
+        .type_covered = rdata.rr_type.dnskey,
+        .algorithm = rdata.algorithm.rsasha256, // MISMATCH vs the Ed25519 key
+        .labels = 2,
+        .original_ttl = 3600,
+        .expiration = 2000,
+        .inception = 0,
+        .key_tag = 0,
+        .signer_name = zone,
+        .signature = &[_]u8{0} ** 64,
+    };
+    // A pinned trust anchor equal to the key's raw RDATA makes `anchorMatches`
+    // pass, so WITHOUT the guard execution would reach the crashing dispatch.
+    const anchor: TrustAnchor = .{ .dnskey_rdata = &raw };
+    try testing.expectEqual(ChainResult.bogus, try validateDnskeySet(testing.allocator, zone, &rrset, rrsig, anchor));
 }
