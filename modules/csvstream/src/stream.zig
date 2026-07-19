@@ -17,8 +17,11 @@ const line = @import("line.zig");
 pub const LineSlice = line.LineSlice;
 pub const LineIterator = line.LineIterator;
 
-/// Default target chunk size (10 MiB). The buffer may grow above this when a
-/// single record is longer than the target (no '\n' within the window).
+/// Default target chunk size (10 MiB), and the floor for a single record's
+/// size cap. The buffer may grow above the target for a long record, but never
+/// past `max_record_len` (see `ChunkReader.max_record_len`): a newline-free
+/// input is rejected with `error.RecordTooLong` rather than buffering the whole
+/// file.
 pub const default_chunk_size: usize = 10 * 1024 * 1024;
 
 /// Returns the index of the LAST '\n' in `bytes`, or null if there is none.
@@ -54,19 +57,27 @@ pub const ChunkReader = struct {
     /// `nextChunk`). Callers compute the absolute file offset of any returned
     /// byte as `byte_index_in_chunk + chunk_start_in_file`.
     chunk_start_in_file: u64,
+    /// Hard cap on a single record (bytes accumulated with no '\n'). A
+    /// newline-free input would otherwise grow `buffer` to the whole file size
+    /// (memory DoS); once the buffer reaches this without a record boundary, a
+    /// non-EOF read errors with `error.RecordTooLong`. Set to at least the
+    /// target chunk size (and never below the 10 MiB default).
+    max_record_len: usize,
 
     pub fn init(io: std.Io, alloc: std.mem.Allocator, file: std.Io.File, chunk_size: usize) !ChunkReader {
         const stat = try file.stat(io);
+        const resolved_chunk = if (chunk_size == 0) default_chunk_size else chunk_size;
         return .{
             .io = io,
             .file = file,
             .buffer = std.array_list.Managed(u8).init(alloc),
-            .chunk_size = if (chunk_size == 0) default_chunk_size else chunk_size,
+            .chunk_size = resolved_chunk,
             .last_emit_len = 0,
             .total_size = stat.size,
             .bytes_read = 0,
             .eof = false,
             .chunk_start_in_file = 0,
+            .max_record_len = @max(resolved_chunk, default_chunk_size),
         };
     }
 
@@ -115,6 +126,11 @@ pub const ChunkReader = struct {
                 self.eof = true;
                 continue;
             }
+            // Bound memory on a newline-free input: if we have already buffered a
+            // whole record's worth (max_record_len) with no boundary and there is
+            // still more file to read, the record is pathological — fail closed
+            // instead of growing the buffer to the entire file size.
+            if (self.buffer.items.len >= self.max_record_len) return error.RecordTooLong;
             const want_cap: usize = @intCast(@min(@as(u64, self.chunk_size), remaining));
             try self.buffer.ensureUnusedCapacity(want_cap);
             const dest = self.buffer.unusedCapacitySlice();
@@ -198,6 +214,21 @@ test "ChunkReader: residual + chunk_start_in_file bookkeeping" {
     try t.expectEqual(@as(u64, 0), cr.chunk_start_in_file);
     // Nothing left after the trailing newline.
     try t.expect((try cr.nextChunk()) == null);
+}
+
+test "ChunkReader: a newline-free record past max_record_len is rejected, not buffered unbounded (audit MED)" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    // 32 bytes with no '\n': the old ChunkReader grew its buffer to the whole
+    // file size (memory DoS). It must now fail closed once past max_record_len.
+    const body = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "in.csv", .data = body });
+    var f = try tmp.dir.openFile(t.io, "in.csv", .{});
+    defer f.close(t.io);
+    var cr = try ChunkReader.init(t.io, t.allocator, f, 4);
+    defer cr.deinit();
+    cr.max_record_len = 8; // shrink the cap for a cheap test (production floor is 10 MiB)
+    try t.expectError(error.RecordTooLong, cr.nextChunk());
 }
 
 test "ChunkReader: tiny chunk_size splits on record boundaries across many chunks" {
