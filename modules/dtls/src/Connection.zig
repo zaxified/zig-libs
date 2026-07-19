@@ -135,6 +135,12 @@ pub const SendError = error{
     RecordTooShort,
     DecryptionFailed,
     Malformed,
+    /// RFC 9147 §4.5.1: the record's sequence number is a duplicate of one
+    /// already accepted in this epoch's anti-replay window, or is older
+    /// than the window's floor. Raised only AFTER the record's AEAD tag
+    /// has verified — an attacker cannot use this to probe the window
+    /// without first producing a validly-authenticated record.
+    ReplayedRecord,
 };
 
 /// One direction's record-protection key material, derived from a traffic
@@ -150,12 +156,15 @@ const DirKeys = struct {
 
 /// Per-epoch record-layer sequence-number bookkeeping (send + receive-side
 /// reconstruction window state) — the handshake epochs' analogue of
-/// `Connection`'s own `send_seq`/`recv_max_seq`/`recv_seen_any` fields,
-/// which are reserved for the application epoch.
+/// `Connection`'s own `send_seq`/`recv_max_seq`/`recv_seen_any`/
+/// `recv_window` fields, which are reserved for the application epoch.
 const EpochSeqState = struct {
     send_seq: u48 = 0,
     recv_max_seq: u48 = 0,
     recv_seen_any: bool = false,
+    /// RFC 9147 §4.5.1 sliding anti-replay window bitmap for THIS epoch —
+    /// see `replayCheckAndUpdate`'s doc comment for the bit convention.
+    recv_window: u64 = 0,
 };
 
 /// The DTLS 1.3 `handshake` content type (RFC 8446 §5.2's inner-plaintext
@@ -180,9 +189,12 @@ pub const Connection = struct {
     /// Next record sequence number to send in the application epoch.
     send_seq: u48 = 0,
     /// Highest sequence number successfully deprotected (for §4.2.2/§4.3
-    /// reconstruction).
+    /// reconstruction, and as the anti-replay window's right edge).
     recv_max_seq: u48 = 0,
     recv_seen_any: bool = false,
+    /// RFC 9147 §4.5.1 sliding anti-replay window bitmap for the
+    /// application epoch — see `replayCheckAndUpdate`'s doc comment.
+    recv_window: u64 = 0,
 
     // ── handshake-in-progress state (RFC 9147 §5 flight engine) ─────────
     /// Running transcript hash (RFC 8446 §4.4.1, TLS-style 4-byte-header
@@ -336,6 +348,7 @@ pub const Connection = struct {
         self.send_seq = 0;
         self.recv_max_seq = 0;
         self.recv_seen_any = false;
+        self.recv_window = 0;
         self.state = .connected;
     }
 
@@ -437,16 +450,34 @@ pub const Connection = struct {
         const ctype = out[end - 1];
         if (ctype != content_type_application_data) return error.Malformed;
 
-        if (!self.recv_seen_any or full_seq > self.recv_max_seq) {
-            self.recv_max_seq = full_seq;
-            self.recv_seen_any = true;
-        }
+        // RFC 9147 §4.5.1 anti-replay window. This MUST run only after the
+        // AEAD tag above has already verified (it has, by this point) —
+        // gating on an unauthenticated sequence number would let an
+        // attacker poison the window with forged records.
+        if (!replayCheckAndUpdate(&self.recv_seen_any, &self.recv_max_seq, &self.recv_window, full_seq))
+            return error.ReplayedRecord;
+
         return out[0 .. end - 1];
     }
 
     pub fn deinit(self: *Connection) void {
-        self.write_keys = .{};
-        self.read_keys = .{};
+        // NOTE: do NOT follow this with `self.write_keys = .{}` (etc.) —
+        // `DirKeys`'s field defaults are `undefined`, so re-assigning the
+        // struct literal would silently re-introduce uninitialized memory
+        // over the just-zeroed secret bytes. Only the non-secret length
+        // bookkeeping is reset, after the secret bytes are wiped.
+        secureZeroDirKeys(&self.write_keys);
+        secureZeroDirKeys(&self.read_keys);
+        secureZeroDirKeys(&self.hs_write_keys);
+        secureZeroDirKeys(&self.hs_read_keys);
+        std.crypto.secureZero(u8, &self.hs_traffic_client);
+        std.crypto.secureZero(u8, &self.hs_traffic_server);
+        std.crypto.secureZero(u8, &self.pending_ap_client);
+        std.crypto.secureZero(u8, &self.pending_ap_server);
+        self.write_keys.key_len = 0;
+        self.write_keys.sn_len = 0;
+        self.read_keys.key_len = 0;
+        self.read_keys.sn_len = 0;
     }
 
     // ── handshake flight engine (RFC 9147 §5, PSK-only) ──────────────────
@@ -610,10 +641,12 @@ pub const Connection = struct {
         const ctype = out[end - 1];
         if (ctype != content_type_handshake) return error.UnexpectedMessage;
 
-        if (!self.hs2.recv_seen_any or full_seq > self.hs2.recv_max_seq) {
-            self.hs2.recv_max_seq = full_seq;
-            self.hs2.recv_seen_any = true;
-        }
+        // RFC 9147 §4.5.1 anti-replay window, epoch-2 (handshake-traffic)
+        // analogue of the check in `recv` above — same AEAD-authenticated-
+        // first ordering applies.
+        if (!replayCheckAndUpdate(&self.hs2.recv_seen_any, &self.hs2.recv_max_seq, &self.hs2.recv_window, full_seq))
+            return error.ReplayedRecord;
+
         return out[0 .. end - 1];
     }
 
@@ -949,6 +982,18 @@ fn suiteParams(suite: CipherSuite) ?SuiteParams {
     };
 }
 
+/// Zeroes (`std.crypto.secureZero`) the secret material of one direction's
+/// keys — `key` and `sn_key` are AEAD/sequence-number-mask keys, `iv` is
+/// the static IV combined with the sequence number into each record's
+/// nonce (RFC 9147 §4.2.2), so all three are secret-adjacent. `key_len`/
+/// `sn_len` are plaintext bookkeeping, not secrets, and are left as-is
+/// (the caller resets the whole `DirKeys` to `.{}` afterward anyway).
+fn secureZeroDirKeys(d: *DirKeys) void {
+    std.crypto.secureZero(u8, &d.key);
+    std.crypto.secureZero(u8, &d.iv);
+    std.crypto.secureZero(u8, &d.sn_key);
+}
+
 fn deriveDir(comptime Hkdf: type, params: SuiteParams, secret: [32]u8) DirKeys {
     var d = DirKeys{ .key_len = params.key_len, .sn_len = params.sn_len };
     // Derive each of key + sn at the negotiated width (HKDF-Expand-Label's
@@ -1006,6 +1051,45 @@ fn snMaskDispatch(suite: CipherSuite, keys: DirKeys, sample: []const u8, seq_byt
         .chacha20_poly1305_sha256 => aead.encryptSequenceNumberChaCha20(keys.sn_key[0..32], sample, seq_bytes),
         else => error.UnsupportedSuite,
     };
+}
+
+/// RFC 9147 §4.5.1 sliding anti-replay window check-and-update, shared by
+/// the application epoch (`recv`) and the epoch-2 handshake-traffic
+/// analogue (`unprotectHandshakeMessage`). `window` is a 64-bit bitmap
+/// where bit 0 represents `high.*` (the highest sequence number accepted
+/// so far in this epoch) and bit `i` (`i` in `1..64`) represents
+/// `high.* - i`; a set bit means "already accepted".
+///
+/// MUST be called only for a sequence number whose record has ALREADY
+/// passed AEAD authentication — never gate this on an unauthenticated
+/// sequence number (e.g. one merely parsed from the wire), since that
+/// would let an off-path attacker poison/desync the window with forged
+/// records without needing to forge a valid tag.
+///
+/// Returns `true` (and slides/sets the window) if `seq` is new — either
+/// ahead of the window (slides it forward) or an unset bit within it.
+/// Returns `false` (window left untouched) if `seq` is a duplicate of an
+/// already-accepted sequence number, or so far behind `high.*` that it
+/// falls outside the 64-wide window entirely.
+fn replayCheckAndUpdate(seen_any: *bool, high: *u48, window: *u64, seq: u48) bool {
+    if (!seen_any.*) {
+        seen_any.* = true;
+        high.* = seq;
+        window.* = 1;
+        return true;
+    }
+    if (seq > high.*) {
+        const diff = seq - high.*;
+        window.* = if (diff >= 64) 1 else (window.* << @intCast(diff)) | 1;
+        high.* = seq;
+        return true;
+    }
+    const diff = high.* - seq;
+    if (diff >= 64) return false; // older than the window floor
+    const bit: u64 = @as(u64, 1) << @intCast(diff);
+    if (window.* & bit != 0) return false; // duplicate: already seen
+    window.* |= bit;
+    return true;
 }
 
 // ── handshake flight engine: free (Connection-agnostic) helpers ─────────
@@ -1337,6 +1421,138 @@ test "handshake: full client<->server loopback interop — AES-128-GCM" {
 
 test "handshake: full client<->server loopback interop — ChaCha20-Poly1305" {
     try loopbackHandshake(.chacha20_poly1305_sha256);
+}
+
+// ── recv: RFC 9147 §4.5.1 anti-replay window (regression for F1) ────────
+//
+// Reproduces the exact scenario the audit drove by hand: a full loopback
+// handshake, one real `send`/`recv` round trip, then `server.recv` fed the
+// IDENTICAL captured wire bytes a second time. Before the fix this second
+// call re-decrypted successfully and returned the plaintext again; now it
+// must be rejected with `error.ReplayedRecord`.
+
+fn connectedPair(suite: CipherSuite, seed: u8, client: *Connection, server: *Connection) !void {
+    const psk_identity = "device-042";
+    const psk = "a-shared-pre-shared-key";
+    client.* = try Connection.clientInit(.{ .role = .client, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{suite} });
+    server.* = try Connection.serverInit(.{ .role = .server, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{suite} });
+    var csprng = std.Random.DefaultCsprng.init([_]u8{seed} ** 32);
+    var buf1: [1500]u8 = undefined;
+    var buf2: [1500]u8 = undefined;
+    try driveHandshake(client, server, testRandom(&csprng), &buf1, &buf2);
+}
+
+test "recv: a verbatim-replayed record is rejected, not delivered twice" {
+    var client: Connection = undefined;
+    var server: Connection = undefined;
+    try connectedPair(.aes_128_gcm_sha256, 0x30, &client, &server);
+
+    var wire: [256]u8 = undefined;
+    var plain: [256]u8 = undefined;
+    const rec = try client.send("replay-me", &wire);
+
+    // Capture the exact wire bytes an attacker (or a duplicated UDP
+    // datagram) would re-inject.
+    var captured: [256]u8 = undefined;
+    @memcpy(captured[0..rec.len], rec);
+
+    const got1 = try server.recv(captured[0..rec.len], &plain);
+    try testing.expectEqualSlices(u8, "replay-me", got1);
+
+    // Re-injecting the SAME bytes must now be rejected — not re-decrypted.
+    try testing.expectError(error.ReplayedRecord, server.recv(captured[0..rec.len], &plain));
+}
+
+test "recv: anti-replay window accepts in-order delivery and within-window reordering" {
+    var client: Connection = undefined;
+    var server: Connection = undefined;
+    try connectedPair(.chacha20_poly1305_sha256, 0x31, &client, &server);
+
+    var plain: [256]u8 = undefined;
+    var wires: [3][256]u8 = undefined;
+    var recs: [3][]const u8 = undefined;
+    const msgs = [_][]const u8{ "seq-0", "seq-1", "seq-2" };
+    for (msgs, 0..) |m, i| {
+        const r = try client.send(m, &wires[i]);
+        recs[i] = wires[i][0..r.len];
+    }
+
+    // In-order: seq 0 accepted normally.
+    try testing.expectEqualSlices(u8, msgs[0], try server.recv(recs[0], &plain));
+    // Mild reorder: seq 2 arrives before seq 1. Both are within the
+    // 64-record window relative to whichever is the current high watermark
+    // at delivery time, so both must still be accepted exactly once.
+    try testing.expectEqualSlices(u8, msgs[2], try server.recv(recs[2], &plain));
+    try testing.expectEqualSlices(u8, msgs[1], try server.recv(recs[1], &plain));
+
+    // Having been delivered once each, replaying any of the three now must
+    // be rejected.
+    try testing.expectError(error.ReplayedRecord, server.recv(recs[0], &plain));
+    try testing.expectError(error.ReplayedRecord, server.recv(recs[1], &plain));
+    try testing.expectError(error.ReplayedRecord, server.recv(recs[2], &plain));
+}
+
+test "recv: a forged (bad-tag) record cannot poison the anti-replay window" {
+    // Ordering check for F1: the replay window must update ONLY after AEAD
+    // authentication succeeds. A record with a valid header/sequence number
+    // but a corrupted tag must fail with `DecryptionFailed` (not
+    // `ReplayedRecord`, and without touching window state), and the
+    // genuine record at that same sequence number must still be accepted
+    // afterward.
+    var client: Connection = undefined;
+    var server: Connection = undefined;
+    try connectedPair(.aes_128_gcm_sha256, 0x32, &client, &server);
+
+    var wire: [256]u8 = undefined;
+    var plain: [256]u8 = undefined;
+    const rec = try client.send("legit", &wire);
+
+    var forged: [256]u8 = undefined;
+    @memcpy(forged[0..rec.len], rec);
+    forged[rec.len - 1] ^= 0x01; // corrupt the AEAD tag
+    try testing.expectError(error.DecryptionFailed, server.recv(forged[0..rec.len], &plain));
+
+    // The genuine record must still go through — the failed forgery did
+    // not advance/poison the window.
+    try testing.expectEqualSlices(u8, "legit", try server.recv(rec, &plain));
+}
+
+// ── deinit: secret zeroization (regression for F2) ───────────────────────
+
+test "deinit: zeroes all resident key/secret material" {
+    var client: Connection = undefined;
+    var server: Connection = undefined;
+    try connectedPair(.aes_128_gcm_sha256, 0x34, &client, &server);
+
+    // Sanity: post-handshake these fields are genuinely populated (not
+    // already all-zero), otherwise the zeroed-after-deinit assertions below
+    // would pass trivially.
+    try testing.expect(!std.mem.allEqual(u8, client.write_keys.key[0..client.write_keys.key_len], 0));
+    try testing.expect(!std.mem.allEqual(u8, &client.hs_traffic_client, 0));
+    try testing.expect(!std.mem.allEqual(u8, &client.hs_traffic_server, 0));
+    try testing.expect(!std.mem.allEqual(u8, &client.pending_ap_client, 0));
+    try testing.expect(!std.mem.allEqual(u8, &client.pending_ap_server, 0));
+
+    client.deinit();
+
+    try testing.expect(std.mem.allEqual(u8, &client.write_keys.key, 0));
+    try testing.expect(std.mem.allEqual(u8, &client.write_keys.iv, 0));
+    try testing.expect(std.mem.allEqual(u8, &client.write_keys.sn_key, 0));
+    try testing.expect(std.mem.allEqual(u8, &client.read_keys.key, 0));
+    try testing.expect(std.mem.allEqual(u8, &client.read_keys.iv, 0));
+    try testing.expect(std.mem.allEqual(u8, &client.read_keys.sn_key, 0));
+    try testing.expect(std.mem.allEqual(u8, &client.hs_write_keys.key, 0));
+    try testing.expect(std.mem.allEqual(u8, &client.hs_write_keys.iv, 0));
+    try testing.expect(std.mem.allEqual(u8, &client.hs_write_keys.sn_key, 0));
+    try testing.expect(std.mem.allEqual(u8, &client.hs_read_keys.key, 0));
+    try testing.expect(std.mem.allEqual(u8, &client.hs_read_keys.iv, 0));
+    try testing.expect(std.mem.allEqual(u8, &client.hs_read_keys.sn_key, 0));
+    try testing.expect(std.mem.allEqual(u8, &client.hs_traffic_client, 0));
+    try testing.expect(std.mem.allEqual(u8, &client.hs_traffic_server, 0));
+    try testing.expect(std.mem.allEqual(u8, &client.pending_ap_client, 0));
+    try testing.expect(std.mem.allEqual(u8, &client.pending_ap_server, 0));
+
+    server.deinit();
 }
 
 test "handshake: wrong PSK -> binder verify fails (typed error, not a panic)" {
