@@ -109,6 +109,11 @@ pub const WriteError = error{
     InvalidCookie,
     /// `same_site == .none` without `secure` — browsers would drop it.
     InsecureSameSiteNone,
+    /// The name uses a reserved prefix (RFC 6265bis §4.1.3) whose constraints
+    /// are not met: `__Secure-` requires `secure`; `__Host-` requires `secure`,
+    /// `Path=/`, and no `Domain`. Browsers silently reject such a cookie, so it
+    /// is refused here loudly rather than sent and dropped.
+    CookiePrefixViolation,
     /// The destination buffer is too small (`bufPrint`).
     BufferTooSmall,
 };
@@ -145,6 +150,15 @@ pub const SetCookie = struct {
         if (sc.domain) |d| for (d) |c| if (!isAttrOctet(c)) return error.InvalidCookie;
         if (sc.same_site) |ss| {
             if (ss == .none and !sc.secure) return error.InsecureSameSiteNone;
+        }
+        // RFC 6265bis §4.1.3 cookie name prefixes (case-sensitive). A browser
+        // silently drops a cookie that violates these; reject it here instead.
+        if (std.mem.startsWith(u8, sc.name, "__Secure-") and !sc.secure)
+            return error.CookiePrefixViolation;
+        if (std.mem.startsWith(u8, sc.name, "__Host-")) {
+            const path_is_root = sc.path != null and std.mem.eql(u8, sc.path.?, "/");
+            if (!sc.secure or sc.domain != null or !path_is_root)
+                return error.CookiePrefixViolation;
         }
 
         // 2. Write: name=value, then attributes in RFC 6265 §4.1 order.
@@ -323,6 +337,20 @@ test "SetCookie: full attribute set in RFC order" {
         "id=abc; Path=/; Max-Age=3600; Secure; HttpOnly; SameSite=Lax",
         try sc.bufPrint(&buf),
     );
+}
+
+test "SetCookie: __Host-/__Secure- prefix constraints enforced (audit MED)" {
+    var buf: [128]u8 = undefined;
+    // __Host- requires Secure + Path=/ + no Domain; a valid one serializes.
+    _ = try (SetCookie{ .name = "__Host-sid", .value = "x", .secure = true, .path = "/" }).bufPrint(&buf);
+    // ...and each missing/violated constraint is refused, not silently sent-then-dropped.
+    try testing.expectError(error.CookiePrefixViolation, (SetCookie{ .name = "__Host-sid", .value = "x", .path = "/" }).bufPrint(&buf));
+    try testing.expectError(error.CookiePrefixViolation, (SetCookie{ .name = "__Host-sid", .value = "x", .secure = true }).bufPrint(&buf));
+    try testing.expectError(error.CookiePrefixViolation, (SetCookie{ .name = "__Host-sid", .value = "x", .secure = true, .path = "/app" }).bufPrint(&buf));
+    try testing.expectError(error.CookiePrefixViolation, (SetCookie{ .name = "__Host-sid", .value = "x", .secure = true, .path = "/", .domain = "example.com" }).bufPrint(&buf));
+    // __Secure- requires Secure.
+    _ = try (SetCookie{ .name = "__Secure-sid", .value = "x", .secure = true }).bufPrint(&buf);
+    try testing.expectError(error.CookiePrefixViolation, (SetCookie{ .name = "__Secure-sid", .value = "x" }).bufPrint(&buf));
 }
 
 test "SetCookie: minimal name=value" {
