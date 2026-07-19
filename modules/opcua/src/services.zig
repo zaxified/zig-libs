@@ -242,9 +242,15 @@ fn decodeArray(d: *encoding.Decoder, comptime T: type, comptime decodeItem: fn (
     if (len == -1) return null;
     if (len < -1) return error.BadLength;
     const n: usize = @intCast(len);
-    var list = try std.ArrayList(T).initCapacity(d.allocator, n);
+    // Do NOT `initCapacity(n)` on the raw claimed count: `n` is any i32 up to
+    // 0x7FFFFFFF read straight off the wire, so a 5-byte message could force a
+    // multi-GiB allocation (OOM DoS). Grow the list element-by-element instead
+    // — every element consumes >=1 byte of input, so a hostile huge claim
+    // fails on `EndOfStream` reading the first missing element (exactly as
+    // `encoding.decodeString` fails on `take`) long before the list grows.
+    var list: std.ArrayList(T) = .empty;
     errdefer list.deinit(d.allocator);
-    for (0..n) |_| list.appendAssumeCapacity(try decodeItem(d));
+    for (0..n) |_| try list.append(d.allocator, try decodeItem(d));
     return try list.toOwnedSlice(d.allocator);
 }
 
@@ -268,8 +274,14 @@ fn freeStringArray(a: std.mem.Allocator, arr: ?[]const ?[]const u8) void {
 
 pub fn freeDiagnosticInfo(a: std.mem.Allocator, di: encoding.DiagnosticInfo) void {
     freeOptStr(a, di.additional_info);
-    if (di.inner_diagnostic_info) |p| {
-        freeDiagnosticInfo(a, p.*);
+    // Walk the inner-diagnostic chain iteratively rather than recursively:
+    // even though the decoder now caps nesting depth (see
+    // `encoding.max_diagnostic_depth`), an iterative free is stack-safe no
+    // matter how the tree was built, matching the decoder's DoS hardening.
+    var next = di.inner_diagnostic_info;
+    while (next) |p| {
+        freeOptStr(a, p.additional_info);
+        next = p.inner_diagnostic_info;
         a.destroy(p);
     }
 }

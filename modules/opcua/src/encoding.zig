@@ -41,8 +41,19 @@ pub const DecodeError = std.Io.Reader.Error || error{
     /// A Variant/ExtensionObject type-id names a built-in type this module
     /// doesn't (yet) decode.
     UnsupportedType,
+    /// A recursively-nested wire structure (today: `DiagnosticInfo`'s inner
+    /// chain, §5.2.2.12) exceeded the decoder's nesting-depth cap — a hostile
+    /// peer can otherwise drive unbounded recursion into a stack overflow.
+    NestingTooDeep,
     OutOfMemory,
 };
+
+/// Maximum `DiagnosticInfo` inner-nesting depth the decoder will follow before
+/// rejecting the input with `error.NestingTooDeep`. Each level costs one stack
+/// frame in `decodeDiagnosticInfo`, so an unbounded chain (one `0x40` mask byte
+/// per level) would overflow the stack (SIGSEGV). 100 is far above any
+/// legitimate diagnostic tree.
+pub const max_diagnostic_depth = 100;
 
 // ── built-in scalar aliases (OPC 10000-6 §5.2.2.1-2.3, §5.2.2.5) ───────────
 
@@ -312,9 +323,15 @@ fn decodeVariantArraySlice(d: *Decoder, comptime T: type, comptime decodeItem: f
     if (len == -1) return null;
     if (len < -1) return error.BadLength;
     const n: usize = @intCast(len);
-    var list = try std.ArrayList(T).initCapacity(d.allocator, n);
+    // Do NOT `initCapacity(n)` on the raw claimed count: `n` is any i32 up to
+    // 0x7FFFFFFF read straight off the wire, so a handful of bytes could force
+    // a multi-GiB allocation (OOM DoS). Grow the list element-by-element
+    // instead — every element consumes >=1 byte of input, so a hostile huge
+    // claim fails on `EndOfStream` reading the first missing element (exactly
+    // as `decodeString` fails on `take`) long before the list can grow large.
+    var list: std.ArrayList(T) = .empty;
     errdefer list.deinit(d.allocator);
-    for (0..n) |_| list.appendAssumeCapacity(try decodeItem(d));
+    for (0..n) |_| try list.append(d.allocator, try decodeItem(d));
     return try list.toOwnedSlice(d.allocator);
 }
 
@@ -915,6 +932,16 @@ pub const Decoder = struct {
     }
 
     pub fn decodeDiagnosticInfo(d: *Decoder) DecodeError!DiagnosticInfo {
+        return d.decodeDiagnosticInfoDepth(0);
+    }
+
+    /// Depth-carrying core of `decodeDiagnosticInfo`. The `0x40` mask bit means
+    /// "an inner `DiagnosticInfo` follows", so a hostile peer can chain
+    /// arbitrarily deep and overflow the stack; `depth` caps the recursion at
+    /// `max_diagnostic_depth` and rejects anything deeper with
+    /// `error.NestingTooDeep` before consuming another frame.
+    fn decodeDiagnosticInfoDepth(d: *Decoder, depth: usize) DecodeError!DiagnosticInfo {
+        if (depth > max_diagnostic_depth) return error.NestingTooDeep;
         const mask = try d.decodeByte();
         if (mask & 0x80 != 0) return error.BadEncodingByte;
         var result: DiagnosticInfo = .{};
@@ -927,7 +954,7 @@ pub const Decoder = struct {
         if (mask & 0x40 != 0) {
             const inner = try d.allocator.create(DiagnosticInfo);
             errdefer d.allocator.destroy(inner);
-            inner.* = try d.decodeDiagnosticInfo();
+            inner.* = try d.decodeDiagnosticInfoDepth(depth + 1);
             result.inner_diagnostic_info = inner;
         }
         return result;
@@ -1894,4 +1921,46 @@ test "negatives: truncated input surfaces EndOfStream, not a panic" {
     var r: std.Io.Reader = .fixed(&buf);
     var d = Decoder.init(&r, testing.allocator);
     try testing.expectError(error.EndOfStream, d.decodeUInt32());
+}
+
+// DoS regression (F1): a `DiagnosticInfo` whose inner-nesting mask bit (0x40)
+// is set on every level drives one recursion frame per input byte. Before the
+// depth guard, a long enough `0x40` run overflowed the stack (SIGSEGV,
+// reachable on every service response via `decodeResponseHeader`); now anything
+// past `max_diagnostic_depth` is rejected with `error.NestingTooDeep`. The
+// input is sized just past the cap so it exercises the guard without a real
+// stack overflow.
+test "DoS: over-deep DiagnosticInfo nesting is rejected, not a stack overflow" {
+    const testing = std.testing;
+    // One byte per level, each = 0x40 ("inner diagnostic follows"). More levels
+    // than the cap => the recursion must bail out with NestingTooDeep before
+    // it can smash the stack.
+    var buf: [max_diagnostic_depth + 50]u8 = undefined;
+    @memset(&buf, 0x40);
+    var r: std.Io.Reader = .fixed(&buf);
+    var d = Decoder.init(&r, testing.allocator);
+    // testing.allocator also proves the unwinding `errdefer`s free every inner
+    // node allocated on the way down (no leak on the rejection path).
+    try testing.expectError(error.NestingTooDeep, d.decodeDiagnosticInfo());
+}
+
+// DoS regression (F2): a Variant array whose Int32 length field claims
+// 0x7FFFFFFF elements but carries no element bytes. Before the fix,
+// `initCapacity(0x7FFFFFFF)` on the raw claimed count forced a multi-GiB
+// allocation (OutOfMemory on a small allocator = remote OOM DoS from 5 bytes).
+// Now the list grows element-by-element, so the first (missing) element read
+// fails with EndOfStream and no large allocation is ever attempted — proven
+// here with a deliberately tiny FixedBufferAllocator.
+test "DoS: huge Variant array length claim fails on EndOfStream, not OutOfMemory" {
+    const testing = std.testing;
+    // 0x89 = ValueIsArray(0x80) | type-id 9 (UInt64); then Int32 len 0x7FFFFFFF.
+    var buf = [_]u8{ 0x89, 0xff, 0xff, 0xff, 0x7f };
+    var r: std.Io.Reader = .fixed(&buf);
+    var backing: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&backing);
+    var d = Decoder.init(&r, fba.allocator());
+    // Asserting EndOfStream specifically also proves it is NOT OutOfMemory:
+    // the 4 KiB backing store would have been blown instantly by the old
+    // ~2 GiB preallocation on the raw 0x7FFFFFFF claim.
+    try testing.expectError(error.EndOfStream, d.decodeVariant());
 }
