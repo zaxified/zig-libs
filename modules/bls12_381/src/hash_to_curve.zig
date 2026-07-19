@@ -229,19 +229,14 @@ const l_bytes = 64;
 /// Reduces a wide (`l_bytes`-byte, i.e. 512-bit) big-endian integer mod
 /// `p` into an `Fp` element — the `OS2IP(tv) mod p` step of RFC 9380
 /// §5.2's `hash_to_field` (step 7), specialized to this module's `L`.
-/// Construction: widen into a `std.crypto.ff.Uint(512)` then
-/// `fp.modulus.reduce(..)` — the exact same shape `scalar.zig`'s
-/// `Fr.reduceWide` already uses for `Fr` (a 256-bit-container field
-/// reducing a 512-bit input); `std.crypto.ff.Modulus(bits).reduce` is
-/// generic in the input width (`x: anytype`), so the identical
-/// construction applies unchanged to `Fp`'s 384-bit container. `Fp` does
-/// NOT yet expose this as a public `reduceWide` (unlike `Fr` — see
-/// `scalar.zig`); it is kept file-local here rather than added to
-/// `fp.zig` speculatively, since `hash_to_field` is (so far) its only
-/// consumer — promote it to `fp.zig` if a second caller appears.
+/// Construction: `Fp.reduceWide` — the Montgomery-resident field's own
+/// wide-reduction entry point (Montgomery-reduce the padded `2L`-word
+/// value, then two `toMont` passes yield `(X mod p)·R`). `Fr` has the
+/// analogous `reduceWide` (`scalar.zig`), still on `std.crypto.ff`; this
+/// call moved off the removed direct `fp.modulus.reduce(..)` when `Fp`
+/// gained its Montgomery backend, with no change to the math.
 fn reduceWideToFp(bytes: [l_bytes]u8) Fp {
-    const wide = std.crypto.ff.Uint(512).fromBytes(&bytes, .big) catch unreachable;
-    return .{ .fe = fp.modulus.reduce(wide) };
+    return Fp.reduceWide(l_bytes, bytes);
 }
 
 /// `hash_to_field(msg, count)` (RFC 9380 §5.2) for the base field `Fp`
