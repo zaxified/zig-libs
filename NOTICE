@@ -675,6 +675,22 @@ project git history).
                elsewhere in this repo (see policy §0) — recorded here anyway
                since a specific version and vector-generation method is a
                fact worth pinning for anyone re-deriving the vectors.
+  chachapoly — clean-room from RFC 8439 (ChaCha20-Poly1305), a public IETF
+               spec — the construction itself needs no attribution (merger
+               doctrine, policy §0). Recorded here for two std relationships:
+               (1) design ref — Zig std `std/crypto/chacha20.zig` (MIT) was
+               studied for the `@Vector` quarter-round shape; this module uses
+               a different, block-parallel (transpose) SIMD layout, no source
+               ported. (2) component — the Poly1305 MAC is
+               `std.crypto.onetimeauth.Poly1305` (Zig std, MIT) reused verbatim,
+               not reimplemented. `std.crypto.aead.chacha_poly.ChaCha20Poly1305`
+               and `std.crypto.stream.chacha.ChaCha20IETF` (both Zig std, MIT)
+               are ALSO used as byte-exact black-box correctness oracles
+               (differential tests), not as design references — the
+               black-box-oracle relationship policy §0 describes. The RFC 8439
+               §2.3.2/§2.4.2/§2.5.2/§2.8.2 test vectors are public IETF spec
+               artifacts (a test oracle under policy §0, needing no attribution),
+               recorded here only alongside this module's std design reference.
   montint    — design ref: OpenSSL `crypto/bn/asm/x86_64-mont5.pl`
                (Apache-2.0; the `MULX/ADCX/ADOX` dual-carry-chain amd64
                Montgomery-multiply technique the gated asm core will mirror)
