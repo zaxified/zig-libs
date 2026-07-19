@@ -128,9 +128,28 @@ pub fn blockIterator(block: []const u8) HeaderIterator {
     return iterateHeaderBlock(block);
 }
 
+/// Strictly parse a Content-Length value per RFC 9110 §8.6 grammar
+/// (`Content-Length = 1*DIGIT`, ASCII `0`-`9` only). `std.fmt.parseInt`
+/// is deliberately not used here: it accepts a leading `+` sign, `_`
+/// digit-group separators, and `-0`, none of which are valid DIGIT
+/// sequences — e.g. `+5`, `1_0`, `-0` would silently parse to `5`, `10`,
+/// `0`. A fronting CDN/LB that forwards those raw bytes and disagrees
+/// with our lenient parse is a request-smuggling desync risk, so any
+/// non-digit byte (or an empty value) is rejected.
+fn parseContentLengthStrict(value: []const u8) HeadParseError!u64 {
+    if (value.len == 0) return error.MalformedHead;
+    var n: u64 = 0;
+    for (value) |c| {
+        if (c < '0' or c > '9') return error.MalformedHead;
+        n = std.math.mul(u64, n, 10) catch return error.MalformedHead;
+        n = std.math.add(u64, n, c - '0') catch return error.MalformedHead;
+    }
+    return n;
+}
+
 /// Latch a Content-Length value; duplicates must agree (RFC 7230 §3.3.2).
 fn latchContentLength(current: *?u64, value: []const u8) HeadParseError!void {
-    const n = std.fmt.parseInt(u64, value, 10) catch return error.MalformedHead;
+    const n = try parseContentLengthStrict(value);
     if (current.*) |prev| {
         if (prev != n) return error.MalformedHead; // conflicting lengths
     } else current.* = n;
@@ -316,7 +335,15 @@ pub const RequestHead = struct {
                 try latchContentLength(&head.content_length, entry.value);
             } else if (std.ascii.eqlIgnoreCase(entry.name, "transfer-encoding")) {
                 head.has_transfer_encoding = true;
-                if (tokenListContains(entry.value, "chunked")) head.chunked = true;
+                // RFC 9112 §6.1: when `chunked` is present it MUST be the
+                // final transfer-coding; this server supports no other
+                // coding, so the only accepted value is the single token
+                // "chunked". Merely *containing* chunked (e.g.
+                // "chunked, gzip", or the "chunked, chunked" double-chunk
+                // vector) is a TE.TE request-smuggling primitive — leaving
+                // `chunked` false here routes it through the
+                // `has_transfer_encoding and !chunked` → 400 gate below.
+                if (std.ascii.eqlIgnoreCase(entry.value, "chunked")) head.chunked = true;
             } else if (std.ascii.eqlIgnoreCase(entry.name, "connection")) {
                 if (tokenListContains(entry.value, "close")) head.connection_close = true;
                 if (tokenListContains(entry.value, "keep-alive")) head.connection_keep_alive = true;
@@ -673,6 +700,13 @@ test "ResponseHead.parse: malformed heads never panic" {
         "HTTP/1.1 200 OK\r\nA: 1\r\n folded\r\n",
         "HTTP/1.1 200 OK\r\nContent-Length: 12x\r\n",
         "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 6\r\n",
+        // Content-Length is `1*DIGIT` only (RFC 9110 §8.6) — std.fmt.parseInt
+        // would otherwise accept a leading `+`, `_` digit separators, and a
+        // signed `-0`.
+        "HTTP/1.1 200 OK\r\nContent-Length: +5\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Length: 1_0\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Length: -0\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Length: \r\n",
     };
     for (malformed) |m| try testing.expectError(error.MalformedHead, ResponseHead.parse(m));
 
@@ -760,6 +794,13 @@ test "RequestHead.parse: malformed heads never panic" {
         "GET / HTTP/1.1\r\nA: 1\r\n folded\r\n",
         "GET / HTTP/1.1\r\nContent-Length: 12x\r\n",
         "GET / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 6\r\n",
+        // Content-Length is `1*DIGIT` only (RFC 9110 §8.6) — std.fmt.parseInt
+        // would otherwise accept a leading `+`, `_` digit separators, and a
+        // signed `-0`.
+        "GET / HTTP/1.1\r\nContent-Length: +5\r\n",
+        "GET / HTTP/1.1\r\nContent-Length: 1_0\r\n",
+        "GET / HTTP/1.1\r\nContent-Length: -0\r\n",
+        "GET / HTTP/1.1\r\nContent-Length: \r\n",
         "GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n", // duplicate Host
         "GET / HTTP/1.1\nHost: h\r\n", // bare-LF after the request line
         "GET / HTTP/1.1\r\nHost: h\nAccept: x\r\n", // bare-LF between headers
@@ -770,6 +811,48 @@ test "RequestHead.parse: malformed heads never panic" {
     try testing.expectError(error.UnsupportedVersion, RequestHead.parse("GET / HTTP/2.0\r\n"));
     try testing.expectError(error.UnsupportedVersion, RequestHead.parse("GET / HTTP/1.9\r\n"));
     try testing.expectError(error.UnsupportedVersion, RequestHead.parse("PRI * HTTP/2.0\r\n"));
+}
+
+test "RequestHead.parse: Content-Length is strict 1*DIGIT (RFC 9110 §8.6)" {
+    // A plain digit string still works.
+    const plain = try RequestHead.parse("POST /u HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n");
+    try testing.expectEqual(@as(?u64, 5), plain.content_length);
+
+    // Leading `+`, `_` digit-group separators, and a signed `-0` are all
+    // rejected — std.fmt.parseInt would otherwise silently accept them
+    // (`+5`→5, `1_0`→10, `-0`→0), diverging from a fronting CDN/LB that
+    // forwards the raw bytes strictly.
+    try testing.expectError(error.MalformedHead, RequestHead.parse("POST /u HTTP/1.1\r\nHost: h\r\nContent-Length: +5\r\n"));
+    try testing.expectError(error.MalformedHead, RequestHead.parse("POST /u HTTP/1.1\r\nHost: h\r\nContent-Length: 1_0\r\n"));
+    try testing.expectError(error.MalformedHead, RequestHead.parse("POST /u HTTP/1.1\r\nHost: h\r\nContent-Length: -0\r\n"));
+    try testing.expectError(error.MalformedHead, RequestHead.parse("POST /u HTTP/1.1\r\nHost: h\r\nContent-Length: \r\n"));
+}
+
+test "RequestHead.parse: Transfer-Encoding must be exactly the single 'chunked' token (RFC 9112 §6.1, TE.TE smuggling)" {
+    // Chunked present but not the sole/final coding — "chunked, gzip"
+    // (chunked not final), the reversed "gzip, chunked", and the
+    // "chunked, chunked" double-chunk smuggling vector — must not be
+    // framed as chunked. `parse` stays purely syntactic (no error here);
+    // it leaves `chunked` false with `has_transfer_encoding` true, which
+    // routes the request through the server's existing
+    // `has_transfer_encoding and !chunked` → 400 gate (Server.zig).
+    const not_final = try RequestHead.parse("POST /u HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked, gzip\r\n");
+    try testing.expect(not_final.has_transfer_encoding);
+    try testing.expect(!not_final.chunked);
+
+    const double_chunk = try RequestHead.parse("POST /u HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked, chunked\r\n");
+    try testing.expect(double_chunk.has_transfer_encoding);
+    try testing.expect(!double_chunk.chunked);
+
+    const reversed = try RequestHead.parse("POST /u HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: gzip, chunked\r\n");
+    try testing.expect(reversed.has_transfer_encoding);
+    try testing.expect(!reversed.chunked);
+
+    // The sole token — case-insensitively — still works.
+    const sole = try RequestHead.parse("POST /u HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n");
+    try testing.expect(sole.chunked);
+    const sole_case = try RequestHead.parse("POST /u HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: CHUNKED\r\n");
+    try testing.expect(sole_case.chunked);
 }
 
 test "RequestHead.parse: bare-LF line endings are rejected (RFC 9112 §2.2)" {

@@ -2355,6 +2355,10 @@ test "serveStream: protocol rejections (505, 501, 400s, 431)" {
     try testing.expect(std.mem.startsWith(u8, runStream(null, "GET / HTTP/1.1\r\n\r\n", &out_buf), // missing Host
         "HTTP/1.1 400 Bad Request\r\n"));
     try testing.expect(std.mem.startsWith(u8, runStream(null, "POST / HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: gzip\r\n\r\n", &out_buf), "HTTP/1.1 400 Bad Request\r\n"));
+    // Chunked present but not the sole/final coding is a TE.TE
+    // request-smuggling primitive (RFC 9112 §6.1) — reject, don't frame.
+    try testing.expect(std.mem.startsWith(u8, runStream(null, "POST / HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked, gzip\r\n\r\n", &out_buf), "HTTP/1.1 400 Bad Request\r\n"));
+    try testing.expect(std.mem.startsWith(u8, runStream(null, "POST / HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked, chunked\r\n\r\n", &out_buf), "HTTP/1.1 400 Bad Request\r\n"));
     try testing.expect(std.mem.startsWith(u8, runStream(null, "GET http://x/ HTTP/1.1\r\nHost: t\r\n\r\n", &out_buf), // absolute-form
         "HTTP/1.1 400 Bad Request\r\n"));
     const long_head = "GET / HTTP/1.1\r\nHost: t\r\nX-Big: " ++ ("a" ** 2000) ++ "\r\n\r\n";
