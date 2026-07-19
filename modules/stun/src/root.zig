@@ -412,7 +412,7 @@ pub fn decode(bytes: []const u8) DecodeError!Message {
     if (std.mem.readInt(u32, bytes[4..8], .big) != magic_cookie) return error.BadCookie;
     if (@as(usize, header_len) + length > bytes.len) return error.Truncated;
     return .{
-        .bytes = bytes[0 .. header_len + length],
+        .bytes = bytes[0 .. @as(usize, header_len) + length],
         .class = decodeClass(t),
         .method = @enumFromInt(decodeMethod(t)),
         .length = length,
@@ -813,6 +813,27 @@ test "decode rejects non-STUN, bad cookie, and truncation" {
     var short = req_2_1;
     short[2] = 0x01; // length 0x0158 ≫ available bytes
     try testing.expectError(error.Truncated, decode(&short));
+}
+
+test "decode: length near u16 max does not overflow header_len + length" {
+    // Regression for a crash: `bytes[0 .. header_len + length]` computed
+    // `header_len + length` in u16 (header_len is untyped `20`, length is
+    // u16), overflowing for length >= 65516 even though the line 413 guard
+    // above it correctly widens to usize first. length = 65532 = 0xFFFC
+    // (still a multiple of 4, so it clears the `% 4 != 0` check) plus
+    // header_len (20) overflows a u16 by design here.
+    const length: u16 = 65532;
+    const total = @as(usize, header_len) + length;
+    const buf = try testing.allocator.alloc(u8, total);
+    defer testing.allocator.free(buf);
+    @memset(buf, 0);
+    std.mem.writeInt(u16, buf[0..2], 0x0101, .big); // Binding response
+    std.mem.writeInt(u16, buf[2..4], length, .big);
+    std.mem.writeInt(u32, buf[4..8], magic_cookie, .big);
+
+    const msg = try decode(buf);
+    try testing.expectEqual(total, msg.bytes.len);
+    try testing.expectEqual(length, msg.length);
 }
 
 test "query() type-checks (skipped — needs a live STUN server and Io)" {
