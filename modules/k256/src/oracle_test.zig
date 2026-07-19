@@ -59,6 +59,82 @@ test "ECDSA: k256 verifies every std-produced signature, rejects tampering" {
     }
 }
 
+// ── fixed-base comb (CONSTANT-TIME k·G) differential + positive control ──────
+
+const StdCurve = std.crypto.ecc.Secp256k1;
+
+fn eqAffineStd(k: Secp256k1, s: StdCurve) !void {
+    const ka = k.affineCoordinates();
+    const sa = s.affineCoordinates();
+    try std.testing.expectEqualSlices(u8, &sa.x.toBytes(.big), &ka.x.toBytes(.big));
+    try std.testing.expectEqualSlices(u8, &sa.y.toBytes(.big), &ka.y.toBytes(.big));
+}
+
+test "comb: combMulBase(k)·G == std.basePoint.mul(k), random + edges" {
+    var prng = std.Random.DefaultPrng.init(0xC0FB_0A5E_11);
+    const rand = prng.random();
+
+    // Thousands of random scalars: k256 comb must match std's base multiply
+    // bit-exact (both compute the raw integer multiple k·G), including the
+    // identity-reject agreement (k ≡ 0 mod n).
+    var i: usize = 0;
+    while (i < 4000) : (i += 1) {
+        var kb: [32]u8 = undefined;
+        rand.bytes(&kb);
+        if (Secp256k1.combMulBase(kb, .big)) |kp| {
+            const sp = try StdCurve.basePoint.mul(kb, .big);
+            try eqAffineStd(kp, sp);
+        } else |_| {
+            try std.testing.expectError(error.IdentityElement, StdCurve.basePoint.mul(kb, .big));
+        }
+    }
+
+    // Edge scalars: 0, 1, n−1, n (≡0), and values near 2^256 (raw-scalar range).
+    const n = @import("scalar.zig").field_order;
+    const edges = [_]u256{
+        0, 1, 2, 3, 15, 16, 17,
+        n - 1,                 n, // n ≡ 0 (mod n): identity reject, like k = 0
+        (1 << 128),            (1 << 128) - 1,
+        (1 << 255),            (1 << 255) + 1,
+        std.math.maxInt(u256), std.math.maxInt(u256) - 1,
+    };
+    for (edges) |kv_| {
+        var kb: [32]u8 = undefined;
+        std.mem.writeInt(u256, &kb, kv_, .big);
+        if (Secp256k1.combMulBase(kb, .big)) |kp| {
+            const sp = try StdCurve.basePoint.mul(kb, .big);
+            try eqAffineStd(kp, sp);
+        } else |_| {
+            try std.testing.expectError(error.IdentityElement, StdCurve.basePoint.mul(kb, .big));
+        }
+    }
+}
+
+test "comb positive control: a corrupted table DISAGREES with std (harness has teeth)" {
+    // Drop a whole window (window 10 → all teeth = identity), i.e. digit 10
+    // contributes nothing no matter its value. Any scalar with a nonzero
+    // digit-10 (~15/16 of them) then yields the wrong point — so this must
+    // diverge from std on the large majority of inputs. Proves the differential
+    // above would catch a dropped-digit / wrong-table comb.
+    var bad = group.comb_table;
+    for (&bad[10]) |*e| e.* = Secp256k1.identityElement;
+
+    var prng = std.Random.DefaultPrng.init(0xBADC_0FFE_10);
+    const rand = prng.random();
+    var disagreements: usize = 0;
+    var i: usize = 0;
+    while (i < 500) : (i += 1) {
+        var kb: [32]u8 = undefined;
+        rand.bytes(&kb);
+        const sp = StdCurve.basePoint.mul(kb, .big) catch continue;
+        const kp = Secp256k1.combMulBaseWithTable(&bad, kb, .big) catch continue;
+        const ka = kp.affineCoordinates();
+        const sa = sp.affineCoordinates();
+        if (!std.mem.eql(u8, &ka.x.toBytes(.big), &sa.x.toBytes(.big))) disagreements += 1;
+    }
+    try std.testing.expect(disagreements > 400);
+}
+
 // ── gated Fable-core differentials (SKIP ≠ pass) ─────────────────────────────
 
 test "GATED differential: fast_core.fieldMul/fieldSq == portable Solinas" {

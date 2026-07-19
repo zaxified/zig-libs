@@ -105,7 +105,20 @@ test "bench (opt-in via K256_BENCH)" {
         }
         var dt = nowNs() - t0;
         std.mem.doNotOptimizeAway(sink);
-        std.debug.print("{s} scalarmul (CT G·s): {d:>8} ns/op\n", .{ k256_label, dt / smul_iters });
+        std.debug.print("{s} scalarmul (CT G·s, ladder): {d:>8} ns/op\n", .{ k256_label, dt / smul_iters });
+
+        // The fixed-base comb: the fast CT base-point multiply the signing path
+        // now uses (no doublings; comb_t table-gathered adds).
+        sink = 0;
+        t0 = nowNs();
+        i = 0;
+        while (i < smul_iters) : (i += 1) {
+            const r = Secp256k1.combMulBase(sb, .big) catch continue;
+            sink ^= r.x.limbs[0];
+        }
+        dt = nowNs() - t0;
+        std.mem.doNotOptimizeAway(sink);
+        std.debug.print("{s} scalarmul (CT G·s, comb)  : {d:>8} ns/op\n", .{ k256_label, dt / smul_iters });
 
         sink = 0;
         t0 = nowNs();

@@ -57,8 +57,9 @@ pub fn bip340Sign(secret_key: [32]u8, msg: []const u8, aux_rand: [32]u8) SignErr
     const dp = Scalar.fromBytes(secret_key, .big) catch return error.InvalidSecretKey;
     if (dp.isZero()) return error.InvalidSecretKey;
 
-    // P = d'·G; even-y-normalize the effective scalar d.
-    const P = Secp256k1.basePoint.mul(secret_key, .big) catch return error.InvalidSecretKey;
+    // P = d'·G; even-y-normalize the effective scalar d. Constant-time
+    // fixed-base comb multiply (secret scalar `d'`).
+    const P = Secp256k1.combMulBase(secret_key, .big) catch return error.InvalidSecretKey;
     const Pa = P.affineCoordinates();
     const d = if (Pa.y.isOdd()) dp.neg() else dp;
     const d_bytes = d.toBytes(.big);
@@ -74,8 +75,9 @@ pub fn bip340Sign(secret_key: [32]u8, msg: []const u8, aux_rand: [32]u8) SignErr
     const k0 = reduceToScalar(rand);
     if (k0.isZero()) return error.InvalidNonce;
 
-    // R = k'·G; even-y-normalize k.
-    const R = Secp256k1.basePoint.mul(k0.toBytes(.big), .big) catch return error.InvalidNonce;
+    // R = k'·G; even-y-normalize k. Constant-time fixed-base comb multiply
+    // (SECRET nonce `k'` — the security-critical call).
+    const R = Secp256k1.combMulBase(k0.toBytes(.big), .big) catch return error.InvalidNonce;
     const Ra = R.affineCoordinates();
     const rx = Ra.x.toBytes(.big);
     const k = if (Ra.y.isOdd()) k0.neg() else k0;

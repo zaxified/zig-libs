@@ -36,6 +36,26 @@ const c_fold: u64 = (1 << 32) + 977;
 /// than the portable Solinas reduction.
 pub const field_asm_active = fast_core.supported and gate.field_asm_implemented;
 
+// ── constant-time barrier ───────────────────────────────────────────────────
+//
+// Launder a value through an empty inline-asm so LLVM loses all range/equality
+// knowledge about it (montint `b199192`). The portable `normalize`/`sub` select
+// on a 0/1 carry/borrow bit via `mask = 0 − bit`; without this barrier LLVM
+// recovers `bit ∈ {0,1}` and lowers the masked select to a data-dependent
+// branch (`test/jne`) — a secret-dependent branch on the constant-time k·G
+// signing path (`group.combMulBase`), confirmed by disassembly. Laundering the
+// bit before it becomes a mask forces the branch-free form to survive. The
+// `@inComptime()` guard keeps it out of the comptime interpreter (the comb
+// table is built at comptime, where inline asm cannot run); it is a no-op at
+// runtime otherwise.
+inline fn blackBox(x: u64) u64 {
+    if (@inComptime()) return x;
+    return asm volatile (""
+        : [ret] "=r" (-> u64),
+        : [x] "0" (x),
+    );
+}
+
 // ── wide-integer helpers (portable reduction substrate) ─────────────────────
 
 inline fn toU256(l: [4]u64) u256 {
@@ -55,14 +75,19 @@ inline fn fromU256(x: u256) [4]u64 {
 /// conditional subtract of `p` lands it in `[0, p)`.
 fn normalize(s0: u256, carry: u1) [4]u64 {
     const C: u256 = c_fold;
-    // Fold the 257th bit: v = s0 + carry·c. `carry·c ≤ c < 2^33`.
-    const f = @addWithOverflow(s0, C * @as(u256, carry));
+    // Fold the 257th bit: v = s0 + carry·c. `carry·c ≤ c < 2^33`. Expressed as a
+    // MASK (`C & (0 − carry)`, bit-identical to `C · carry`) with the bit
+    // laundered through `blackBox` so LLVM cannot recover carry ∈ {0,1} and emit
+    // a data-dependent branch — see the barrier note above.
+    const cmask: u256 = @as(u256, 0) -% @as(u256, blackBox(@as(u64, carry)));
+    const f = @addWithOverflow(s0, C & cmask);
     // A carry out here means the true sum reached 2^256, i.e. another `·c`;
     // the wrapped value is then `< c`, so `+c` cannot overflow again.
-    var v: u256 = f[0] +% (C & (@as(u256, 0) -% @as(u256, f[1])));
+    const fmask: u256 = @as(u256, 0) -% @as(u256, blackBox(@as(u64, f[1])));
+    var v: u256 = f[0] +% (C & fmask);
     // v < 2^256 ≤ p + c: one constant-time conditional subtract of p.
     const d = @subWithOverflow(v, field_order); // borrow ⇒ v < p (keep v)
-    const keep: u256 = @as(u256, 0) -% @as(u256, d[1]);
+    const keep: u256 = @as(u256, 0) -% @as(u256, blackBox(@as(u64, d[1])));
     v = (v & keep) | (d[0] & ~keep);
     return fromU256(v);
 }
@@ -189,8 +214,11 @@ pub const Fe = struct {
     /// `(a − b) mod p`, constant-time.
     pub fn sub(a: Fe, b: Fe) Fe {
         const d = @subWithOverflow(a.value(), b.value());
-        // On borrow, add p back once (a,b < p ⇒ result lands in [0, p)).
-        const v = d[0] +% (field_order & (@as(u256, 0) -% @as(u256, d[1])));
+        // On borrow, add p back once (a,b < p ⇒ result lands in [0, p)). The
+        // borrow bit is laundered through `blackBox` so the masked add does not
+        // become a data-dependent branch (see the barrier note above).
+        const mask: u256 = @as(u256, 0) -% @as(u256, blackBox(@as(u64, d[1])));
+        const v = d[0] +% (field_order & mask);
         return .{ .limbs = fromU256(v) };
     }
 
@@ -200,9 +228,13 @@ pub const Fe = struct {
     }
 
     /// `a·b mod p`. Dispatches to the gated amd64 core when active, else the
-    /// portable Solinas reduction.
+    /// portable Solinas reduction. The `@inComptime()` guard routes comptime
+    /// evaluation (e.g. the fixed-base comb-table build in `group.zig`) to the
+    /// portable path, because the asm core cannot execute in the comptime
+    /// interpreter; at runtime that branch is comptime-dead (`@inComptime()` is
+    /// then a comptime-false constant), so it costs nothing.
     pub fn mul(a: Fe, b: Fe) Fe {
-        if (comptime field_asm_active) {
+        if (field_asm_active and !@inComptime()) {
             var z: [4]u64 = undefined;
             fast_core.fieldMul(&z, &a.limbs, &b.limbs);
             return .{ .limbs = z };
@@ -210,9 +242,9 @@ pub const Fe = struct {
         return .{ .limbs = mulPortable(a.limbs, b.limbs) };
     }
 
-    /// `a² mod p`. Dispatches like `mul`.
+    /// `a² mod p`. Dispatches like `mul` (same comptime/asm split).
     pub fn sq(a: Fe) Fe {
-        if (comptime field_asm_active) {
+        if (field_asm_active and !@inComptime()) {
             var z: [4]u64 = undefined;
             fast_core.fieldSq(&z, &a.limbs);
             return .{ .limbs = z };

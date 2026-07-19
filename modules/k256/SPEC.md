@@ -168,20 +168,49 @@ bounded. The GLV decomposition and the endomorphism constants ARE k256's own.
 - **Gated differentials** (`oracle_test.zig`): SKIP until each gate flips, then
   pin the core bit-for-bit to the portable path.
 
-## Performance status — VERIFY optimized, SIGN pending the comb table
+## Performance status — VERIFY and SIGN both optimized
 
-Both gated cores are in and the **verify path is optimized**: the `MULX/ADX`
-field multiply and the GLV double-base multiply drive ECDSA/BIP340 verify to
-**~2–3.5× libsecp256k1** (measured this host: field mul ~2.9×, ECDSA verify ~2.5×
-libsecp / ~6.5× std) — inside the module's ~2–4× target and a large win over the
-~9–14× the `std`-backed consumers pay.
+All three accelerators are in and **both signature paths are optimized**.
 
-**SIGN is deliberately NOT yet optimized.** BIP340/ECDSA sign still runs two naive
-constant-time `mul` base-point ladders (`s·G`), so it measures **~8–10×
-libsecp256k1** (~10× this host). The sign fix is backlog #3 — a comptime
-**fixed-base wNAF/precomputed-`G` comb table** giving a constant-time base-point
-multiply — which is a scoped follow-up, explicitly OUT of this phase. Sign remains
-correct (byte-exact to the 8 official BIP340 sign vectors), just not yet fast.
+**Verify** rides the `MULX/ADX` field multiply + the GLV double-base multiply:
+ECDSA/BIP340 verify at **~2–3.5× libsecp256k1** (this host: field mul ~2.9×,
+ECDSA verify ~2.5× libsecp / ~6.5× std).
+
+**Sign** now rides the **fixed-base comb table** (`group.combMulBase`, backlog
+#3): a precomputed table of `G`-multiples turns each secret `k·G` into a
+constant-time table-gathered sum with NO online doublings. The base-point
+multiply drops from **~208 µs → ~33 µs (~6.2×)** and BIP340/ECDSA sign from
+**~395 µs → ~93 µs (~4.3×)** this host — i.e. from ~10× to **~2.3× libsecp256k1**
+(vs the ~40 µs reference), inside the module's ~2–4× target. Sign stays byte-exact
+to the 8 official BIP340 sign vectors, now through the comb path.
+
+### The comb (constant-time k·G) and its side-channel contract
+
+Window `w = 4`, `comb_t = 65` signed digits (a running-carry Booth recoding, so
+`Σ dᵢ·2^{w·i} = k` exactly, incl. the raw-scalar range to 2^256−1). Each window
+owns a table of `{1,…,2^{w−1}}·2^{w·i}·G`; the sign of a digit is a masked point
+negation, halving the table. The table is **comptime-generated** via the portable
+field path (an `@inComptime()` guard in `field.zig` keeps the runtime asm core out
+of the comptime interpreter) and stored **projective** (no comptime inversions).
+Memory: `65·8·(3×32 B) = 48.75 KiB` of `.rodata`.
+
+Constant-time contract (secret nonce — verified by disassembly of the ReleaseFast
+`k·G`):
+- **Table gather is a masked linear scan** over every entry of each window, at
+  FIXED table offsets, with the per-entry select mask laundered through a
+  `blackBox` inline-asm barrier — so LLVM cannot recover the equality and lower it
+  to a secret-indexed jump table (the powMont-gather leak class, montint
+  `b199192`). Disasm confirms: zero indirect jumps, zero secret-indexed loads
+  (the only base+index operand is the window extraction `k >> shift`, whose index
+  is the PUBLIC loop counter).
+- **The signed-digit recoding is branch-free** (`setcc`/`cmov`/masks, no Jcc on
+  the scalar), and the conditional point negation is a masked field-negate.
+- **The portable field `normalize`/`sub` selects are `blackBox`-laundered** too:
+  without the barrier LLVM turned the `mask = 0 − carry` field-carry select into a
+  data-dependent `test/jne` — a secret-dependent branch on the k·G path. After
+  laundering, the only branches left on the whole path are the public-trip-count
+  loop control and the standard final `rejectIdentity` endpoint check (reveals
+  only "result == O", always false for a valid nonce, as in std's `basePoint.mul`).
 
 ## Backlog (the Fable phase + beyond)
 
@@ -189,7 +218,9 @@ correct (byte-exact to the 8 official BIP340 sign vectors), just not yet fast.
    special-prime fold (watch the fold-carry propagation; see montint's asm notes).
 2. `group.mulPublicGlv` — GLV+wNAF variable-base multiply on the proven
    `splitScalar`; extend GLV to the double-base verify path.
-3. Fixed-base wNAF/precomp table for `G` (constant-time base-point mul).
+3. ~~Fixed-base wNAF/precomp table for `G` (constant-time base-point mul).~~
+   **DONE** — `group.combMulBase` (fixed-base comb, w=4, signed-digit,
+   blackBox-guarded CT gather). Sign ~4.3× faster (~2.3× libsecp256k1).
 4. Addition-chain field inverse (replace the Fermat square-and-multiply).
 5. Rewire the 8 Bitcoin/Lightning modules from `std.crypto.ecc.Secp256k1` to k256.
 6. Side-channel review of the CT paths (inverse, GLV sign handling).

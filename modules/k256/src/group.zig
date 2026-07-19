@@ -269,6 +269,75 @@ pub const Secp256k1 = struct {
         return q;
     }
 
+    /// CONSTANT-TIME fixed-base multiply `s·G` for a possibly-SECRET scalar,
+    /// via the precomputed comb table (`comb_table`) — the fast signing path
+    /// (BIP340/ECDSA nonce commitment + pubkey derivation). Bit-exact to
+    /// `basePoint.mul(s)` (the naive CT ladder) but ~4× faster: the online phase
+    /// is `comb_t` point additions with NO doublings, because each window's
+    /// table already carries the `2^(w·i)` factor. `error.IdentityElement` iff
+    /// `s ≡ 0 (mod n)`. See the comb section below for the CT-gather contract.
+    pub fn combMulBase(s_: [32]u8, endian: std.builtin.Endian) IdentityElementError!Secp256k1 {
+        return combMulBaseWithTable(&comb_table, s_, endian);
+    }
+
+    /// `combMulBase` parameterised on the table, so the positive-control test in
+    /// `oracle_test.zig` can pass a deliberately-corrupted table and prove the
+    /// differential has teeth. The table index `[i][j]` is driven only by the
+    /// PUBLIC loop counters — never by a secret — so this stays constant-time
+    /// for any table. `pub` for that harness (cf. `mulPublicDoubleAdd`).
+    pub fn combMulBaseWithTable(tab: *const CombTable, s_: [32]u8, endian: std.builtin.Endian) IdentityElementError!Secp256k1 {
+        const k = scalarValue(s_, endian);
+        const half: u64 = 1 << (comb_w - 1); // 2^(w−1)
+        const twow: u64 = 1 << comb_w; // 2^w
+        const wmask: u64 = twow - 1;
+
+        var acc = Secp256k1.identityElement;
+        // Signed-digit (Booth-style) recoding with a running carry, folded into
+        // the same loop that consumes the digits — fully branchless in `k`.
+        // Digit d_i ∈ [−2^(w−1), 2^(w−1)−1], so Σ d_i·2^(w·i) = k exactly and
+        // the magnitude |d_i| ∈ [0, 2^(w−1)] indexes the half-size table.
+        var carry: u64 = 0;
+        var i: usize = 0;
+        while (i < comb_t) : (i += 1) {
+            const shift: usize = i * comb_w; // PUBLIC (loop-derived) shift
+            const wv: u64 = if (shift < 256) (@as(u64, @truncate(k >> @intCast(shift))) & wmask) else 0;
+            const x = wv + carry; // 0 .. 2^w
+            // is_neg ⟺ x ≥ 2^(w−1): then d = x − 2^w (< 0) and carry propagates.
+            // A `>=` compare lowers to setcc (data-independent), not a branch.
+            const is_neg: u64 = @intFromBool(x >= half);
+            carry = is_neg;
+            const negmask: u64 = 0 -% is_neg;
+            // |d| = is_neg ? (2^w − x) : x  — masked, no branch.
+            const m = ((twow - x) & negmask) | (x & ~negmask); // 0 .. 2^(w−1)
+
+            // CONSTANT-TIME gather of the table entry for magnitude `m`: a
+            // masked linear scan touching EVERY entry of window `i`. The
+            // per-entry select mask is laundered through `blackBox` so LLVM
+            // cannot recover "pick the entry where j+1 == m" and lower it to a
+            // secret-indexed jump table (`jmp *tbl(,%reg,8)`) — the exact
+            // powMont-gather leak class (montint b199192). `m == 0` (digit 0)
+            // matches no entry, leaving `g` the neutral element (adds nothing).
+            var g = Secp256k1.identityElement;
+            var j: usize = 0;
+            while (j < comb_teeth) : (j += 1) {
+                const match: u64 = @intFromBool(@as(u64, j + 1) == m);
+                const mask = blackBox(0 -% match);
+                blendLimbs(&g.x, tab[i][j].x, mask);
+                blendLimbs(&g.y, tab[i][j].y, mask);
+                blendLimbs(&g.z, tab[i][j].z, mask);
+            }
+            // Signed digit ⇒ conditional point negation via masked field-negate
+            // (compute −y unconditionally, select with a branch-free cMov).
+            var gneg = g;
+            gneg.y = g.y.neg();
+            g.cMov(gneg, @intCast(is_neg));
+
+            acc = acc.add(g);
+        }
+        try acc.rejectIdentity();
+        return acc;
+    }
+
     /// VARIABLE-TIME scalar multiply for a PUBLIC scalar. Dispatches to the
     /// gated GLV core (`mulPublicGlv`) when `gate.glv_scalarmul_implemented`,
     /// else the plain double-and-add fallback below.
@@ -487,6 +556,83 @@ fn glvCombine(comptime k: usize, tabs: *const [k][glv_table_len]Secp256k1, es: *
     }
     try q.rejectIdentity();
     return q;
+}
+
+// ── fixed-base comb table (CONSTANT-TIME base-point multiply k·G) ────────────
+//
+// The signing path multiplies the FIXED base point G by a secret scalar twice
+// per signature (the nonce commitment R = k·G and the pubkey P = d·G). A naive
+// constant-time double-and-add pays 256 doublings + 256 conditional adds; the
+// fixed-base **windowed comb** replaces that with a precomputed table so the
+// online phase does NO doublings at all — just `comb_t` point additions, one
+// per signed digit, gathered constant-time from the table (the technique behind
+// libsecp256k1's `ecmult_gen`).
+//
+// Design (w = 4): the scalar is recoded into `comb_t` signed digits of `w`
+// bits, d_i ∈ [−2^(w−1), 2^(w−1)−1] (a running-carry Booth recoding, so
+// Σ d_i·2^(w·i) = k exactly, including the raw-scalar range up to 2^256−1 — the
+// extra window absorbs the final carry). Window `i` owns a table of the
+// magnitudes {1,2,…,2^(w−1)}·2^(w·i)·G; the sign of a digit is applied by a
+// masked point negation, which halves the table. Online cost = comb_t adds.
+//
+//   memory: comb_t · comb_teeth projective points
+//         = 65 · 8 · (3 × 32 B) = 48.75 KiB of .rodata (a comptime constant).
+//
+// The table is generated at COMPTIME (via the portable field path — the
+// `@inComptime()` guard in `field.zig` keeps the runtime asm core out of the
+// comptime interpreter), stored PROJECTIVE so no comptime field inversions are
+// needed (affine conversion would run a Fermat inverse per entry).
+
+/// Comb window width in bits. `256 % comb_w == 0` keeps the window layout exact.
+const comb_w: usize = 4;
+/// Table entries per window: magnitudes 1..2^(w−1) (the signed digit folds the
+/// sign out, halving the table).
+const comb_teeth: usize = 1 << (comb_w - 1); // 8
+/// Number of windows: 256/w low windows plus one to absorb the recoding carry.
+const comb_t: usize = (256 / comb_w) + 1; // 65
+
+/// The precomputed comb table type: `[window][magnitude−1]` projective points.
+pub const CombTable = [comb_t][comb_teeth]Secp256k1;
+
+/// Build the comb table at comptime. `tab[i][j] = (j+1)·2^(w·i)·G`, projective.
+fn buildCombTable() CombTable {
+    @setEvalBranchQuota(100_000_000);
+    var tab: CombTable = undefined;
+    var base = Secp256k1.basePoint; // 2^(w·i)·G, starting at G
+    var i: usize = 0;
+    while (i < comb_t) : (i += 1) {
+        var acc = base; // 1·base
+        tab[i][0] = acc;
+        var j: usize = 1;
+        while (j < comb_teeth) : (j += 1) {
+            acc = acc.add(base); // (j+1)·base
+            tab[i][j] = acc;
+        }
+        // base ← 2^w · base for the next window.
+        var d: usize = 0;
+        while (d < comb_w) : (d += 1) base = base.dbl();
+    }
+    return tab;
+}
+
+/// The fixed-base comb table for G (public constant; see `combMulBase`).
+pub const comb_table: CombTable = buildCombTable();
+
+/// Optimization barrier (montint `b199192`): launder a value through an empty
+/// inline-asm so LLVM loses all equality/range knowledge about it. Applied to
+/// the per-entry gather mask so the branchless masked scan cannot be recovered
+/// and lowered to a secret-indexed jump table. No-op at runtime.
+inline fn blackBox(x: u64) u64 {
+    return asm volatile (""
+        : [ret] "=r" (-> u64),
+        : [x] "0" (x),
+    );
+}
+
+/// Masked limb blend: `dst = (dst & ~mask) | (src & mask)`. `mask` is 0 or all
+/// ones (laundered by `blackBox`).
+inline fn blendLimbs(dst: *Fe, src: Fe, mask: u64) void {
+    for (&dst.limbs, src.limbs) |*d, s| d.* = (s & mask) | (d.* & ~mask);
 }
 
 /// A point in affine coordinates.
