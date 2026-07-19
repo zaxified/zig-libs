@@ -162,25 +162,39 @@ pub fn preprocess(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
                         // consumed entirely so parsing continues from the next comma or '}'.
                         var colon = j;
                         while (colon < input.len and input[colon] != ':') : (colon += 1) {}
-                        const raw_key = std.mem.trim(u8, input[key_start..colon], " \t\r\n");
-                        var vs = colon + 1;
-                        while (vs < input.len and (input[vs] == ' ' or input[vs] == '\t')) : (vs += 1) {}
-                        const val_end = skipValue(input, vs);
-                        const raw_val_full = std.mem.trim(u8, input[vs..val_end], " \t\r\n");
-                        // Truncate to 30 chars so the error message stays compact in the GUI.
-                        const raw_val = if (raw_val_full.len > 30) raw_val_full[0..30] else raw_val_full;
                         const err_line = lineOf(input, key_start);
-                        const msg = try std.fmt.allocPrint(alloc, "{s}: '{s}' --> malformed key at line {d}", .{
-                            raw_key, raw_val, err_line,
-                        });
-                        defer alloc.free(msg);
                         err_counter += 1;
                         const head = try std.fmt.allocPrint(alloc, "\"$err_trace_{d}\": ", .{err_counter});
                         defer alloc.free(head);
                         try out.appendSlice(alloc, head);
-                        try appendJsonStr(&out, alloc, msg);
+                        if (colon >= input.len) {
+                            // Malformed: unquoted key with no ':' before end-of-input
+                            // (e.g. "{a b"). Consume to the next delimiter so we never
+                            // slice past the buffer; mirrors preprocessAnnotated's has_colon guard.
+                            const skip_end = skipValue(input, j);
+                            const after = std.mem.trim(u8, input[key_start..skip_end], " \t\r\n");
+                            const msg = try std.fmt.allocPrint(alloc, "{s} --> missing colon after key at line {d}", .{
+                                after, err_line,
+                            });
+                            defer alloc.free(msg);
+                            try appendJsonStr(&out, alloc, msg);
+                            i = skip_end;
+                        } else {
+                            const raw_key = std.mem.trim(u8, input[key_start..colon], " \t\r\n");
+                            var vs = colon + 1;
+                            while (vs < input.len and (input[vs] == ' ' or input[vs] == '\t')) : (vs += 1) {}
+                            const val_end = skipValue(input, vs);
+                            const raw_val_full = std.mem.trim(u8, input[vs..val_end], " \t\r\n");
+                            // Truncate to 30 chars so the error message stays compact in the GUI.
+                            const raw_val = if (raw_val_full.len > 30) raw_val_full[0..30] else raw_val_full;
+                            const msg = try std.fmt.allocPrint(alloc, "{s}: '{s}' --> malformed key at line {d}", .{
+                                raw_key, raw_val, err_line,
+                            });
+                            defer alloc.free(msg);
+                            try appendJsonStr(&out, alloc, msg);
+                            i = val_end;
+                        }
                         key_pos = false;
-                        i = val_end;
                     }
                 } else {
                     try out.append(alloc, c);
@@ -954,4 +968,15 @@ test "annotated: true/false/null preserved as keywords" {
     while (it.next()) |kv| {
         try std.testing.expect(!std.mem.startsWith(u8, kv.key_ptr.*, "$err_"));
     }
+}
+
+test "preprocess: unquoted key with no colon before EOF does not slice OOB (audit F1 CRIT)" {
+    const alloc = std.testing.allocator;
+    // Batch-10 audit CRIT: preprocess("{a b") scanned for ':' to input.len, set
+    // vs = colon + 1 = input.len + 1, then sliced input[vs..] past the buffer ->
+    // index-out-of-bounds panic. The has_colon guard now consumes the malformed key
+    // safely (emitting an $err_trace entry) instead of crashing.
+    const out = try preprocess(alloc, "{a b");
+    defer alloc.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "$err_trace") != null);
 }
