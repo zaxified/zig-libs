@@ -710,5 +710,25 @@ project git history).
                not copied from any implementation's test suite — a test oracle
                under policy §0, needing no attribution, recorded here only
                alongside this module's genuine libsecp256k1 design reference).
+  p256       — design ref: OpenSSL nistz256 (Apache-2.0; the Gueron–Krasnov
+               "Fast prime field elliptic-curve cryptography with 256-bit
+               primes" technique) — studied for the technique shape only: the
+               NIST P-256 special-prime (Solinas) field reduction for
+               p = 2^256 − 2^224 + 2^192 + 2^96 − 1 (fold the high half by
+               M = 2^224 − 2^192 − 2^96 + 1 / the signed s1..s9 word-shuffle),
+               and the amd64 `MULX/ADX` field multiply the gated core will
+               mirror. No source ported. The NIST P-256 domain parameters
+               (p, n, G, the curve constant b, a = −3) are public curve facts;
+               the specific integer constants match `std.crypto.ecc.P256` (Zig
+               std, MIT), which is ALSO used as the byte-exact correctness
+               oracle (differential tests), not as a design reference — the
+               black-box-oracle relationship policy §0 describes. The
+               end-to-end ECDSA anchor transcribes the ECDSA-P256/SHA-256 test
+               vectors from RFC 6979 Appendix A.2.5 (a public IETF spec
+               artifact, not copied from any implementation's test suite — a
+               test oracle under policy §0, needing no attribution, recorded
+               here only alongside this module's nistz256 design reference).
+               P-256 has no efficiently-computable endomorphism, so — unlike
+               k256 — there is no GLV construction to attribute.
 
 See each module's README "Provenance" note for its specific design references.

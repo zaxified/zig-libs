@@ -165,6 +165,7 @@ const module_list = [_]Module{
     .{ .name = "tfhe" },
     .{ .name = "montint" },
     .{ .name = "k256" },
+    .{ .name = "p256" },
     // Scaffold more here (copy modules/_template) — see CONVENTIONS.md
     // "How to add a module" and the README "Roadmap / Non-goals" sections.
 };
