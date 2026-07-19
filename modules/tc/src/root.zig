@@ -216,7 +216,16 @@ pub fn percentToU32(pct: f64) error{InvalidPercent}!u32 {
 
 // ── request building (pure, offline-testable) ───────────────────────────────
 
-pub const BuildError = std.mem.Allocator.Error || error{InvalidPercent};
+pub const BuildError = std.mem.Allocator.Error || error{ InvalidPercent, InvalidDelay };
+
+/// Validate a `delay_ns`/`jitter_ns` value fits the wire's signed 64-bit
+/// nanosecond field (`TCA_NETEM_LATENCY64`/`JITTER64`). Mirrors
+/// `percentToU32`: reject before any allocation rather than let the later
+/// `@intCast(i64, …)` panic (ReleaseSafe) or silently wrap to a negative
+/// latency (ReleaseFast).
+fn checkDelayNs(ns: u64) error{InvalidDelay}!void {
+    if (ns > std.math.maxInt(i64)) return error.InvalidDelay;
+}
 
 fn appendTcmsg(
     gpa: std.mem.Allocator,
@@ -284,6 +293,8 @@ fn buildSetRequest(
     const reorder_corr = try percentToU32(netem.reorder_correlation_pct);
     const corrupt_prob = try percentToU32(netem.corrupt_pct);
     const corrupt_corr = try percentToU32(netem.corrupt_correlation_pct);
+    try checkDelayNs(netem.delay_ns);
+    try checkDelayNs(netem.jitter_ns);
 
     var list: std.ArrayList(u8) = .empty;
     errdefer list.deinit(gpa);
@@ -890,6 +901,35 @@ test "buildSetRequest rejects an out-of-range percent before allocating" {
         1,
         .{ .loss_pct = 150 },
     ));
+}
+
+test "buildSetRequest rejects out-of-range delay/jitter before allocating" {
+    // ns > maxInt(i64) must never reach the @intCast — would panic under
+    // ReleaseSafe / wrap to a negative LATENCY64 under ReleaseFast.
+    const too_big: u64 = @as(u64, std.math.maxInt(i64)) + 1;
+    try testing.expectError(error.InvalidDelay, buildSetRequest(
+        testing.allocator,
+        1,
+        codec.NLM_F_REQUEST,
+        1,
+        .{ .delay_ns = too_big },
+    ));
+    try testing.expectError(error.InvalidDelay, buildSetRequest(
+        testing.allocator,
+        1,
+        codec.NLM_F_REQUEST,
+        1,
+        .{ .jitter_ns = too_big },
+    ));
+    // A normal value must still build fine (max representable i64 is legal).
+    const req = try buildSetRequest(
+        testing.allocator,
+        1,
+        codec.NLM_F_REQUEST,
+        1,
+        .{ .delay_ns = @intCast(std.math.maxInt(i64)), .jitter_ns = 10_000_000 },
+    );
+    testing.allocator.free(req);
 }
 
 test "errnoToError maps NLMSG_ERROR errnos" {
