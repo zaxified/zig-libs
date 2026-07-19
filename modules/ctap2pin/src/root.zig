@@ -46,7 +46,9 @@
 
 const std = @import("std");
 const Aes256 = std.crypto.core.aes.Aes256;
-const P256 = std.crypto.ecc.P256;
+// P-256 curve group from the asm-accelerated `p256` module (byte-exact to
+// `std.crypto.ecc.P256`) — the COSE ECDH + ES256 primitives.
+const P256 = @import("p256").P256;
 const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -56,7 +58,7 @@ pub const meta = .{
     .role = .util, // pure computation — no I/O, no CBOR/CTAP wire framing
     .concurrency = .reentrant, // no globals; all state is caller-held values
     .model_after = "FIDO Alliance CTAP 2.1 spec 6.5.6-6.5.8 (pinUvAuthProtocol One/Two); std.crypto supplies AES block + P256 + HKDF + HMAC",
-    .deps = .{}, // std only
+    .deps = .{"p256"}, // p256 supplies the P-256 curve (byte-exact to std.crypto.ecc.P256); AES/HKDF/HMAC stay on std
 };
 
 // ── errors ──────────────────────────────────────────────────────────────────

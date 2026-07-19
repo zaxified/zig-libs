@@ -67,7 +67,7 @@ pub const meta = .{
     // only its parameters.
     .concurrency = .reentrant,
     .model_after = "RFC 9180 (Hybrid Public Key Encryption)",
-    .deps = .{},
+    .deps = .{"p256"}, // DHKEM(P-256) group from the asm-accelerated p256 (byte-exact to std.crypto.ecc.P256); X25519 KEM path stays on std
 };
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────
@@ -82,8 +82,9 @@ test {
     _ = @import("kat_rfc9180.zig");
 }
 
-test "meta.deps is empty (std only, no sibling-module dependencies)" {
-    try std.testing.expectEqual(@as(usize, 0), meta.deps.len);
+test "meta.deps is exactly {p256} (the DHKEM(P-256) curve group; else std only)" {
+    try std.testing.expectEqual(@as(usize, 1), meta.deps.len);
+    try std.testing.expectEqualStrings("p256", meta.deps[0]);
 }
 
 test "meta.role is .util (no owned transport/socket, unlike a .client/.server module)" {

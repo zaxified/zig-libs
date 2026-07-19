@@ -18,6 +18,10 @@
 
 const std = @import("std");
 const suite = @import("suite.zig");
+// P-256 curve group for the DHKEM(P-256, …) suite from the asm-accelerated
+// `p256` module (byte-exact to `std.crypto.ecc.P256`). The X25519 KEM path
+// stays on std (p256 covers only the P-256 curve).
+const P256 = @import("p256").P256;
 
 const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
 
@@ -268,12 +272,12 @@ pub const P256Kem = struct {
     };
 
     /// `sk = random scalar in [1, n-1]` via
-    /// `std.crypto.ecc.P256.scalar.random(io)` (rejection-sampled
+    /// `P256.scalar.random(io)` (rejection-sampled
     /// uniform, not a raw byte draw — std owns the modular-reduction
     /// correctness), `pk = (P256.basePoint.mul(sk, .big)).toUncompressedSec1()`.
     pub fn generateKeyPair(io: std.Io) KeyPair {
-        const sk = std.crypto.ecc.P256.scalar.random(io, .big);
-        const pk_point = std.crypto.ecc.P256.basePoint.mul(sk, .big) catch unreachable; // basePoint * nonzero scalar never hits the identity
+        const sk = P256.scalar.random(io, .big);
+        const pk_point = P256.basePoint.mul(sk, .big) catch unreachable; // basePoint * nonzero scalar never hits the identity
         return .{ .secret_key = sk, .public_key = pk_point.toUncompressedSec1() };
     }
 
@@ -302,10 +306,10 @@ pub const P256Kem = struct {
             var candidate: [Nsk]u8 = undefined;
             suite.labeledExpand(HkdfSha256, &kem_suite_id, dkp_prk, "candidate", &ctr, &candidate) catch unreachable;
             candidate[0] &= 0xff; // RFC 9180 §7.1.3 bitmask (0xFF for P-256)
-            std.crypto.ecc.P256.scalar.rejectNonCanonical(candidate, .big) catch continue; // sk >= n
+            P256.scalar.rejectNonCanonical(candidate, .big) catch continue; // sk >= n
             if (std.mem.allEqual(u8, &candidate, 0)) continue; // sk == 0
             // basePoint * nonzero canonical scalar never hits the identity.
-            const pk_point = std.crypto.ecc.P256.basePoint.mul(candidate, .big) catch unreachable;
+            const pk_point = P256.basePoint.mul(candidate, .big) catch unreachable;
             return .{ .secret_key = candidate, .public_key = pk_point.toUncompressedSec1() };
         }
         @panic("hpke: P-256 DeriveKeyPair exhausted 256 candidates (probability ~2^-8192; RFC 9180 7.1.3 DeriveKeyPairError)");
@@ -329,7 +333,7 @@ pub const P256Kem = struct {
     ///
     /// KAT: RFC 9180 A.3 `enc`/`shared_secret`, byte-exact.
     pub fn encapDeterministic(pkR: PublicKey, eph: KeyPair) EncapError!Encapped {
-        const pkR_point = std.crypto.ecc.P256.fromSec1(&pkR) catch return error.DeserializeError;
+        const pkR_point = P256.fromSec1(&pkR) catch return error.DeserializeError;
         const shared_point = pkR_point.mul(eph.secret_key, .big) catch return error.DhFailed;
         const dh = shared_point.affineCoordinates().x.toBytes(.big);
         var kem_context: [2 * Npk]u8 = undefined;
@@ -349,7 +353,7 @@ pub const P256Kem = struct {
     /// .big).affineCoordinates().x.toBytes(.big)`; `kem_context = enc ||
     /// skR.public_key`.
     pub fn decap(enc: EncappedKey, skR: KeyPair) DecapError![Nsecret]u8 {
-        const enc_point = std.crypto.ecc.P256.fromSec1(&enc) catch return error.DeserializeError;
+        const enc_point = P256.fromSec1(&enc) catch return error.DeserializeError;
         const shared_point = enc_point.mul(skR.secret_key, .big) catch return error.DhFailed;
         const dh = shared_point.affineCoordinates().x.toBytes(.big);
         var kem_context: [2 * Npk]u8 = undefined;
@@ -362,7 +366,7 @@ pub const P256Kem = struct {
     /// fold as `X25519Kem.authEncapDeterministic`, with each `dh`/`dh2`
     /// being the 32-byte X coordinate (not the raw scalarmult output).
     pub fn authEncapDeterministic(pkR: PublicKey, skS: KeyPair, eph: KeyPair) EncapError!Encapped {
-        const pkR_point = std.crypto.ecc.P256.fromSec1(&pkR) catch return error.DeserializeError;
+        const pkR_point = P256.fromSec1(&pkR) catch return error.DeserializeError;
         var dh: [64]u8 = undefined;
         const p1 = pkR_point.mul(eph.secret_key, .big) catch return error.DhFailed;
         dh[0..32].* = p1.affineCoordinates().x.toBytes(.big);
@@ -379,8 +383,8 @@ pub const P256Kem = struct {
     }
 
     pub fn authDecap(enc: EncappedKey, skR: KeyPair, pkS: PublicKey) DecapError![Nsecret]u8 {
-        const enc_point = std.crypto.ecc.P256.fromSec1(&enc) catch return error.DeserializeError;
-        const pkS_point = std.crypto.ecc.P256.fromSec1(&pkS) catch return error.DeserializeError;
+        const enc_point = P256.fromSec1(&enc) catch return error.DeserializeError;
+        const pkS_point = P256.fromSec1(&pkS) catch return error.DeserializeError;
         var dh: [64]u8 = undefined;
         const p1 = enc_point.mul(skR.secret_key, .big) catch return error.DhFailed;
         dh[0..32].* = p1.affineCoordinates().x.toBytes(.big);
@@ -419,11 +423,11 @@ test "P256Kem: basePoint.mul + toUncompressedSec1 wiring produces a well-formed 
     // event-loop instance this pure-math test doesn't stand up). scalar =
     // 1 -> pk == the curve's own basePoint, uncompressed-encoded.
     const one = [_]u8{0} ** 31 ++ [_]u8{1};
-    const pk_point = std.crypto.ecc.P256.basePoint.mul(one, .big) catch unreachable;
+    const pk_point = P256.basePoint.mul(one, .big) catch unreachable;
     const pk = pk_point.toUncompressedSec1();
     try testing.expectEqual(@as(u8, 0x04), pk[0]); // SEC1 uncompressed tag
     try testing.expectEqual(@as(usize, 65), pk.len);
-    try testing.expect(pk_point.equivalent(std.crypto.ecc.P256.basePoint));
+    try testing.expect(pk_point.equivalent(P256.basePoint));
 }
 
 test "DHKEM X25519 Encap/Decap: RFC 9180 A.1.1 enc/shared_secret, byte-exact" {

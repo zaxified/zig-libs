@@ -130,7 +130,7 @@ pub const meta = .{
     .role = .server, // P6 is a `router` middleware guarding routes with a Provider.
     .concurrency = .reentrant, // except Provider — one mutable cache, external sync (inject ResourceServer.lock under a threaded server)
     .model_after = "RFC 7515 (JWS) + RFC 7519 (JWT) + RFC 7518 (JWA) verify incl. RS256 (RSASSA-PKCS1-v1_5, RFC 8017) + RFC 7517 (JWK/JWKS key sets), RFC 8725 hardening + OpenID Connect Discovery 1.0 / RFC 8414 (issuer metadata -> jwks_uri) with cached, rotation-aware Provider; RFC 6750 Bearer resource-server middleware; OAuth2/OIDC resource server",
-    .deps = .{ "http", "router" },
+    .deps = .{ "http", "router", "p256" }, // p256 supplies the fast ES256 curve (byte-exact to std.crypto.sign.ecdsa.EcdsaP256Sha256)
 };
 
 // ── public API ──────────────────────────────────────────────────────────────
@@ -461,9 +461,18 @@ pub fn validateClaims(claims: Claims, opts: Options) ValidateError!void {
 
 // ── signature verification (RFC 7515 §5.2, RFC 7518, RFC 8037) ─────────────
 
+/// The asm-accelerated P-256 module — supplies the ES256 key/signature types
+/// and the fast vartime verify on the P2 HTTPS per-request hot path.
+const p256_mod = @import("p256");
+
 /// std signature schemes re-exported so callers (and P4's JWKS) can name the
-/// key types without spelling out the std.crypto paths.
-pub const EcdsaP256Sha256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+/// key types without spelling out the std.crypto paths. ES256 (the P2 HTTPS
+/// per-request hot path) runs on the asm-accelerated `p256` module: the key
+/// type is a byte-exact drop-in for `std.crypto.sign.ecdsa.EcdsaP256Sha256`,
+/// and verification routes through p256's combined 2-base vartime verify
+/// (`verifyEs256Fast` below), ~2.7× faster than std. P384 and Ed25519 stay on
+/// std (p256 covers only the P-256 curve).
+pub const EcdsaP256Sha256 = p256_mod.EcdsaP256Sha256;
 pub const EcdsaP384Sha384 = std.crypto.sign.ecdsa.EcdsaP384Sha384;
 pub const Ed25519 = std.crypto.sign.Ed25519;
 
@@ -602,7 +611,7 @@ pub fn verify(parsed: *const ParsedToken, key: Key) VerifyError!void {
         .RS384 => try verifyRsaPkcs1(sha2.Sha384, parsed, key),
         .RS512 => try verifyRsaPkcs1(sha2.Sha512, parsed, key),
         .ES256 => switch (key) {
-            .ecdsa_p256 => |pk| try verifyEcdsa(EcdsaP256Sha256, pk, parsed),
+            .ecdsa_p256 => |pk| try verifyEs256Fast(pk, parsed),
             else => return error.AlgKeyMismatch,
         },
         .ES384 => switch (key) {
@@ -670,6 +679,24 @@ fn verifyEcdsa(comptime Scheme: type, public_key: Scheme.PublicKey, parsed: *con
     if (parsed.signature.len != sig_len) return error.BadSignature;
     const sig: Scheme.Signature = .fromBytes(parsed.signature[0..sig_len].*);
     sig.verify(parsed.signing_input, public_key) catch return error.BadSignature;
+}
+
+/// ES256 fast path — the P2 HTTPS per-request hot path (RFC 7518 §3.4: JWS
+/// signature is the raw 64-byte fixed-width big-endian `R‖S`). Routes through
+/// p256's combined 2-base vartime verify (`mulDoubleBasePublic`: one
+/// multi-scalar `u1·G + u2·Q` instead of std's two separate `mulPublic` +
+/// add), ~2.7× faster than `std.crypto.sign.ecdsa.EcdsaP256Sha256.verify` on
+/// this host. Accept/reject is byte-identical to that struct's `verify`: same
+/// SHA-256 digest, same rejection of a zero or non-canonical (≥ n) `r`/`s`,
+/// same `x(u1·G + u2·Q) mod n == r` acceptance (validated in p256's
+/// `oracle_test`/`kat_test` against std + RFC 6979). All inputs are public, so
+/// the vartime path is the correct (and only) choice — no secret scalar.
+fn verifyEs256Fast(public_key: EcdsaP256Sha256.PublicKey, parsed: *const ParsedToken) VerifyError!void {
+    const sig_len = EcdsaP256Sha256.Signature.encoded_length; // 64 (R‖S)
+    if (parsed.signature.len != sig_len) return error.BadSignature;
+    const pk_sec1 = public_key.toUncompressedSec1();
+    if (!p256_mod.sign.ecdsaVerify(&pk_sec1, parsed.signing_input, parsed.signature[0..64].*))
+        return error.BadSignature;
 }
 
 /// RS256/384/512: RSASSA-PKCS1-v1_5 (RFC 8017 §8.2.2) via std —

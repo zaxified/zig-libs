@@ -100,7 +100,9 @@
 //! explicitly out of scope for this pass.
 
 const std = @import("std");
-const P256 = std.crypto.ecc.P256;
+// P-256 curve group from the asm-accelerated `p256` module (byte-exact to
+// `std.crypto.ecc.P256`) — the RFC 9383 P256-SHA256 ciphersuite group.
+const P256 = @import("p256").P256;
 const scalar_mod = P256.scalar;
 const Scalar = scalar_mod.Scalar;
 
@@ -108,8 +110,8 @@ pub const meta = .{
     .platform = .any,
     .role = .util, // pure computation — no I/O, no wire framing of its own
     .concurrency = .reentrant, // no globals; keys/points are plain value types
-    .model_after = "RFC 9383 (\"SPAKE2+, an Augmented Password-Authenticated Key Exchange (PAKE) Protocol\"), §4 P256-SHA256-HKDF-SHA256-HMAC-SHA256 ciphersuite; std.crypto.ecc.P256 supplies the curve group, std.crypto.hash.sha2.Sha256 / std.crypto.auth.hmac.sha2.HmacSha256 / std.crypto.kdf.hkdf.HkdfSha256 supply Hash/MAC/KDF",
-    .deps = .{}, // std only
+    .model_after = "RFC 9383 (\"SPAKE2+, an Augmented Password-Authenticated Key Exchange (PAKE) Protocol\"), §4 P256-SHA256-HKDF-SHA256-HMAC-SHA256 ciphersuite; the asm-accelerated `p256` module (byte-exact to std.crypto.ecc.P256) supplies the curve group, std.crypto.hash.sha2.Sha256 / std.crypto.auth.hmac.sha2.HmacSha256 / std.crypto.kdf.hkdf.HkdfSha256 supply Hash/MAC/KDF",
+    .deps = .{"p256"}, // p256 supplies the P-256 curve group (byte-exact to std.crypto.ecc.P256); Hash/MAC/KDF stay on std
 };
 
 // ── ciphersuite constants (RFC 9383 §3, §3.4, §4) ───────────────────────

@@ -86,7 +86,7 @@ pub const meta = .{
     .role = .codec, // pure wire codec + crypto dispatch, no I/O of its own
     .concurrency = .reentrant, // no shared/global state; every call is self-contained
     .model_after = "RFC 7516 (JWE) + RFC 7518 (JWA encryption algs) + RFC 3394 (AES Key Wrap); sibling of this repo's `jwt` (RFC 7515 JWS)",
-    .deps = .{"rsa"},
+    .deps = .{ "rsa", "p256" }, // p256 supplies the ECDH-ES P-256 curve (byte-exact to std.crypto.ecc.P256); X25519 stays on std
 };
 
 /// Key management algorithm (`alg` header parameter, RFC 7518 §4 names).

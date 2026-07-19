@@ -27,7 +27,9 @@
 //! cryptographically secure, same contract as `encryptCompact`'s `random`.
 
 const std = @import("std");
-const P256 = std.crypto.ecc.P256;
+// P-256 curve group from the asm-accelerated `p256` module (byte-exact to
+// `std.crypto.ecc.P256`); X25519 stays on std (p256 covers only P-256).
+const P256 = @import("p256").P256;
 const X25519 = std.crypto.dh.X25519;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
