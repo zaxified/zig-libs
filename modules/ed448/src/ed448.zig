@@ -15,10 +15,10 @@
 //! `dbl`/`mul`/`toBytes`/`fromBytes`, on `field.zig`'s implemented
 //! `Fp448` and `scalar.zig`'s implemented mod-`L` arithmetic) are real —
 //! validated byte-exact against RFC 8032 §7.4/§7.5's official vectors in
-//! `kat_test.zig`. `Point.mul` is a constant-time (fixed 448-iteration,
-//! branchless-select) double-and-add, used by both key generation and
-//! signing; `verify`'s point work is allowed to be variable-time (public
-//! inputs only).
+//! `kat_test.zig`. `Point.mul` is a constant-time 4-bit fixed-window
+//! scalar mult (16-entry table + masked table scan), used by both key
+//! generation and signing; `verify`'s point work uses a variable-time
+//! Straus double-scalar mult (public inputs only).
 //!
 //! Zig std GAP: yes — `std.crypto.sign.Ed25519` supplies the identical
 //! SHAPE of API for Ed25519 (`KeyPair`/`Signature`/sign/verify, SHA-512,
@@ -184,19 +184,124 @@ pub const Point = struct {
     /// return acc
     /// ```
     ///
-    /// A windowed/precomputed-table variant (mirroring
-    /// `std.crypto.ecc.Edwards25519.mul`'s 4-bit-window
-    /// `pcMul16`/`precompute`) is a documented performance follow-up, not
-    /// a correctness requirement — plain double-and-add is a legitimate
-    /// first implementation.
+    /// Constant-time. Uses a fixed 4-bit window (mirroring
+    /// `std.crypto.ecc.Edwards25519.mul`'s `pcMul16` precomputed-window
+    /// pattern): a 16-entry table `[0]p..[15]p` is built once, then the
+    /// 448-bit scalar is consumed four bits at a time (112 windows), each
+    /// window contributing four doublings and one table lookup. Cuts the
+    /// point ADDITIONS from 448 (one per bit) to ~112 + 15 (table build)
+    /// while keeping the doubling count identical, and the complete
+    /// Edwards addition formula makes the `nibble == 0` case (add the
+    /// identity table entry) exceptional-case-free.
+    ///
+    /// SECRET-SCALAR CONSTANT TIME: the window nibble indexes the table
+    /// via a MASKED SCAN (`ctSelectPoint` touches all 16 entries and
+    /// mask-selects — never a secret-dependent load or branch), and
+    /// `Fe.ctSelect` under it is a pure limb-mask merge. The table is
+    /// built from `p` (public: base point for sign/keygen; the input
+    /// element for decaf448) and only the SCALAR is secret, so building
+    /// the table is data-independent regardless.
     pub fn mul(p: Point, s: scalar.CompressedScalar) Point {
+        var table: [16]Point = undefined;
+        table[0] = identityElement;
+        table[1] = p;
+        inline for (2..16) |j| table[j] = table[j - 1].add(p);
+
         var acc = identityElement;
-        var t: usize = 448;
-        while (t > 0) {
-            t -= 1;
-            acc = acc.dbl();
-            const bit: u1 = @truncate(s[t / 8] >> @intCast(t % 8));
-            acc = ctSelect(bit == 1, acc.add(p), acc);
+        var w: usize = 112; // 112 nibbles = 448 bits (bit 447 downto 0)
+        while (w > 0) {
+            w -= 1;
+            acc = acc.dbl().dbl().dbl().dbl();
+            const shift = w * 4;
+            const nibble: u4 = @truncate(s[shift / 8] >> @intCast(shift % 8));
+            acc = acc.add(ctSelectPoint(&table, nibble));
+        }
+        return acc;
+    }
+
+    /// Constant-time lookup of `table[idx]` for a SECRET `idx`: scans all
+    /// 16 entries, mask-selecting the one whose (compile-time) position
+    /// equals `idx`. No secret-dependent memory index or branch — the only
+    /// data-dependent value is the boolean fed to the branch-free
+    /// `Fe.ctSelect` limb merge. `table[0]` is the identity, so an `idx`
+    /// of 0 correctly yields the neutral element.
+    fn ctSelectPoint(table: *const [16]Point, idx: u4) Point {
+        var r = identityElement;
+        inline for (0..16) |j| {
+            r = ctSelect(@as(u4, @intCast(j)) == idx, table[j], r);
+        }
+        return r;
+    }
+
+    /// Fixed-base comb table for the base point `B`:
+    /// `baseComb[w][d] = [d * 2^(4w)] * B` (`w` in `0..112`, `d` in
+    /// `0..15`), precomputed at COMPTIME. This is the "bigger win"
+    /// fixed-base variant of the windowed method: because every window's
+    /// multiples of `B` are already baked in, `mulBasePoint` needs ZERO
+    /// runtime doublings — just 112 masked table lookups + adds — where
+    /// the generic `mul` still pays 448 doublings. Sign and key generation
+    /// (both `[s]B`) get this; variable-base callers (decaf448, verify's
+    /// `[k]A'`) keep the generic `mul`/Straus path. `[w][0]` is the
+    /// identity so a zero nibble contributes nothing.
+    const baseComb: [112][16]Point = blk: {
+        @setEvalBranchQuota(50_000_000);
+        var tbl: [112][16]Point = undefined;
+        var base = basePoint;
+        for (0..112) |w| {
+            tbl[w][0] = identityElement;
+            tbl[w][1] = base;
+            for (2..16) |di| tbl[w][di] = tbl[w][di - 1].add(base);
+            // Advance the base by one 4-bit window: base *= 2^4.
+            base = base.dbl().dbl().dbl().dbl();
+        }
+        break :blk tbl;
+    };
+
+    /// Constant-time `[s]B` via the fixed-base comb (`baseComb`) — no
+    /// runtime doublings, 112 masked lookups + adds. Same CT discipline as
+    /// `mul`: the secret nibble drives a masked scan (`ctSelectPoint`),
+    /// never a secret-dependent load or branch. Used by `KeyPair.create`
+    /// and `signInternal` for their `[s]B` / `[r]B` base-point mults.
+    pub fn mulBasePoint(s: scalar.CompressedScalar) Point {
+        var acc = identityElement;
+        inline for (0..112) |w| {
+            const shift = w * 4;
+            const nibble: u4 = @truncate(s[shift / 8] >> @intCast(shift % 8));
+            acc = acc.add(ctSelectPoint(&baseComb[w], nibble));
+        }
+        return acc;
+    }
+
+    /// Variable-time `[s1]p1 + [s2]p2`, for PUBLIC inputs only (Ed448
+    /// `verify`). Straus/Shamir simultaneous double-scalar multiplication
+    /// with a shared 4-bit window: one interleaved 448-doubling pass over
+    /// both scalars, with a direct (data-dependent) table index and a
+    /// skipped add on a zero nibble — legitimate here because every input
+    /// to verification (`S`, `k`, `B`, `A'`) is public. Replaces the two
+    /// full constant-time `Point.mul`s the cofactored check used to run
+    /// (~half the doublings, plus no masked-scan overhead), the source of
+    /// verify's outsized gap vs C (audit F2).
+    fn mulDoubleVartime(s1: scalar.CompressedScalar, p1: Point, s2: scalar.CompressedScalar, p2: Point) Point {
+        var t1: [16]Point = undefined;
+        var t2: [16]Point = undefined;
+        t1[0] = identityElement;
+        t2[0] = identityElement;
+        t1[1] = p1;
+        t2[1] = p2;
+        inline for (2..16) |j| {
+            t1[j] = t1[j - 1].add(p1);
+            t2[j] = t2[j - 1].add(p2);
+        }
+        var acc = identityElement;
+        var w: usize = 112;
+        while (w > 0) {
+            w -= 1;
+            acc = acc.dbl().dbl().dbl().dbl();
+            const shift = w * 4;
+            const n1: u4 = @truncate(s1[shift / 8] >> @intCast(shift % 8));
+            const n2: u4 = @truncate(s2[shift / 8] >> @intCast(shift % 8));
+            if (n1 != 0) acc = acc.add(t1[n1]);
+            if (n2 != 0) acc = acc.add(t2[n2]);
         }
         return acc;
     }
@@ -409,7 +514,7 @@ pub const KeyPair = struct {
         Shake256.hash(&seed, &h, .{});
         var s = h[0..57].*;
         scalar.clamp(&s);
-        const a_point = Point.mul(Point.basePoint, s);
+        const a_point = Point.mulBasePoint(s);
         return .{
             .public_key = PublicKey.fromBytes(a_point.toBytes()),
             .secret_key = SecretKey.fromBytes(seed),
@@ -449,7 +554,7 @@ fn signInternal(kp: KeyPair, ph_message: []const u8, ctx: []const u8, phflag: u1
 
     const r_digest = try shake114(phflag, ctx, &.{ prefix, ph_message });
     const r_scalar = scalar.reduceWide(r_digest);
-    const r_point = Point.mul(Point.basePoint, r_scalar);
+    const r_point = Point.mulBasePoint(r_scalar);
     const r_bytes = r_point.toBytes();
 
     const k_digest = try shake114(phflag, ctx, &.{ &r_bytes, &kp.public_key.bytes, ph_message });
@@ -498,10 +603,13 @@ fn verifyInternal(sig: Signature, ph_message: []const u8, ctx: []const u8, pubke
     const k_digest = try shake114(phflag, ctx, &.{ &sig.r, &pubkey.bytes, ph_message });
     const k_scalar = scalar.reduceWide(k_digest);
 
-    const lhs = Point.mul(Point.basePoint, sig.s).clearCofactor();
-    const rhs = r_point.add(Point.mul(a_point, k_scalar)).clearCofactor();
+    // Cofactored check `[4][S]B == [4]R + [4][k]A'`, rearranged to
+    // `[4]([S]B + [k](-A')) == [4]R` so both scalar mults fold into ONE
+    // vartime Straus double-scalar pass (public inputs — see
+    // `mulDoubleVartime`).
+    const lhs = Point.mulDoubleVartime(sig.s, Point.basePoint, k_scalar, a_point.neg()).clearCofactor();
 
-    if (!lhs.equivalent(rhs)) return error.SignatureVerificationFailed;
+    if (!lhs.equivalent(r_point.clearCofactor())) return error.SignatureVerificationFailed;
 }
 
 /// Ed448 verify (`phflag = 0`).

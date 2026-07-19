@@ -109,20 +109,12 @@ pub fn clamp(s: *[scalar_length]u8) void {
 /// ```
 ///
 /// `bits - 1 = 447` for curve448 (RFC 7748 §5's generic `bits` parameter,
-/// 448 for curve448 vs 255 for curve25519). The `a24 * E` step is done as
-/// a full `Fe.mul` against a comptime-built `a24` field element —
-/// `field.zig` exposes no dedicated `mulSmall`/`mul32`-style primitive
-/// (unlike `std.crypto.ecc.Edwards25519.Fe.mul32`); adding one is a
-/// documented performance follow-up, not a correctness concern.
+/// 448 for curve448 vs 255 for curve25519). The `a24 * E` step uses
+/// `field.zig`'s dedicated `Fe.mulSmall` (a single 56×≤32-bit partial
+/// product per limb, mirroring `std.crypto.ecc.Edwards25519.Fe.mul32`)
+/// rather than a full 8×8 `Fe.mul` against a comptime-built `a24` field
+/// element.
 fn ladder(clamped_scalar: [scalar_length]u8, u: Fe) Fe {
-    // a24 as a field element (39081 = 0x98a9, little-endian bytes).
-    const a24_fe: Fe = comptime blk: {
-        var bytes = [_]u8{0} ** field.encoded_bytes;
-        bytes[0] = 0xa9;
-        bytes[1] = 0x98;
-        break :blk Fe.fromBytes(bytes) catch unreachable;
-    };
-
     const x_1 = u;
     var x_2 = Fe.one;
     var z_2 = Fe.zero;
@@ -151,7 +143,7 @@ fn ladder(clamped_scalar: [scalar_length]u8, u: Fe) Fe {
         x_3 = da.add(cb).square();
         z_3 = x_1.mul(da.sub(cb).square());
         x_2 = aa.mul(bb);
-        z_2 = e.mul(aa.add(a24_fe.mul(e)));
+        z_2 = e.mul(aa.add(e.mulSmall(a24)));
     }
     Fe.ctSwap(swap == 1, &x_2, &x_3);
     Fe.ctSwap(swap == 1, &z_2, &z_3);

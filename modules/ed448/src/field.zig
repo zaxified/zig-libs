@@ -367,10 +367,25 @@ pub const Fe = struct {
                 cols[i + j] += @as(u128, a.limbs[i]) * b.limbs[j];
             }
         }
-        // Carry-propagate the columns into 16 clean 56-bit limbs. The
-        // full product is < 2^896 = 2^(16*56), so the carry out of
-        // column 14 is the entire limb 15 (< 2^56) and nothing spills
-        // past it.
+        return reduceProduct(cols);
+    }
+
+    /// Shared carry-propagate + Goldilocks fold tail for `mul`/`square`:
+    /// takes the 15 double-width column accumulators of an 8×8 (or
+    /// symmetric-8×8) product (each `< 2^116`, the widest either caller
+    /// produces) and returns the fully-reduced canonical `Fe`.
+    ///
+    /// Carry-propagate the columns into 16 clean 56-bit limbs. The full
+    /// product is `< 2^896 = 2^(16*56)`, so the carry out of column 14 is
+    /// the entire limb 15 (`< 2^56`) and nothing spills past it. Then the
+    /// Goldilocks fold: writing the 896-bit product as four 224-bit
+    /// (4-limb) chunks `A + B*2^224 + C*2^448 + D*2^672` and using
+    /// `2^448 ≡ 2^224 + 1`, `2^672 ≡ 2*2^224 + 1 (mod p)`:
+    ///   `product ≡ (A + C + D) + (B + C + 2D) * 2^224`
+    /// — every term lands exactly on a limb boundary (the whole point of
+    /// the 56-bit layout; no cross-limb shifting), leaving 8 accumulators
+    /// each `< 4 * 2^56 = 2^58`, `reduceAfterFold`'s input contract.
+    fn reduceProduct(cols: [15]u128) Fe {
         var t: [16]u64 = undefined;
         var carry: u128 = 0;
         inline for (0..15) |i| {
@@ -379,14 +394,6 @@ pub const Fe = struct {
             carry = cur >> limb_bits;
         }
         t[15] = @intCast(carry);
-        // Goldilocks fold. Writing the 896-bit product as four 224-bit
-        // (4-limb) chunks A + B*2^224 + C*2^448 + D*2^672 and using
-        // 2^448 ≡ 2^224 + 1, 2^672 ≡ 2*2^224 + 1 (mod p):
-        //   product ≡ (A + C + D) + (B + C + 2D) * 2^224
-        // — every term lands exactly on a limb boundary (the whole point
-        // of the 56-bit layout; no cross-limb shifting), leaving 8
-        // accumulators each < 4 * 2^56 = 2^58, reduceAfterFold's input
-        // contract.
         var r: [num_limbs]u128 = undefined;
         inline for (0..4) |i| {
             r[i] = @as(u128, t[i]) + t[8 + i] + t[12 + i];
@@ -405,10 +412,47 @@ pub const Fe = struct {
     /// half-schoolbook version is a documented follow-up, not a
     /// correctness requirement.
     pub fn square(a: Fe) Fe {
-        // Correctness-first fallback the doc comment above sanctions; a
-        // dedicated halved-cross-terms squaring is a performance
-        // follow-up, not a correctness requirement.
-        return mul(a, a);
+        // Dedicated squaring: exploit `a[i]*a[j] == a[j]*a[i]` so each
+        // off-diagonal cross product is computed ONCE and doubled, halving
+        // the 8×8 schoolbook's multiplies (28 cross products + 8 diagonals
+        // vs 64). Structurally symmetric and data-independent ⇒ still
+        // constant-time in the base. Column bound: at most one diagonal
+        // (`a[k/2]^2 < 2^112`) plus ≤4 doubled cross products
+        // (`2*a[i]*a[j] < 2^113`) ⇒ each column `< 2^112 + 4*2^113 < 2^116`,
+        // inside `reduceProduct`'s input contract.
+        var cols = [_]u128{0} ** 15;
+        inline for (0..num_limbs) |i| {
+            cols[2 * i] += @as(u128, a.limbs[i]) * a.limbs[i];
+            inline for (i + 1..num_limbs) |j| {
+                cols[i + j] += 2 * (@as(u128, a.limbs[i]) * a.limbs[j]);
+            }
+        }
+        return reduceProduct(cols);
+    }
+
+    /// `a * s (mod p)` for a small (`< 2^32`) PUBLIC comptime scalar `s`.
+    /// Much cheaper than a full `mul` against a field element: a single
+    /// 56×≤32-bit partial product per limb (8 multiplies) instead of the
+    /// 8×8 schoolbook (64). Used by `x448.zig`'s ladder for the `a24 * E`
+    /// step (`a24 = 39081`), which was a full `Fe.mul` against a
+    /// comptime-built field element (audit F5). Constant-time: `s` is a
+    /// public compile-time constant and the per-limb schedule is fixed.
+    ///
+    /// Bound: each `a.limbs[i] * s < 2^56 * 2^32 = 2^88`; the running
+    /// carry stays `< 2^32`, so the final carry-out of limb 7 is `< 2^33`.
+    /// Folding it via `2^448 ≡ 2^224 + 1` into limbs 0 and 4 leaves those
+    /// `< 2^56 + 2^33 < 2^58`, `reduceAfterFold`'s input contract.
+    pub fn mulSmall(a: Fe, comptime s: u32) Fe {
+        var r: [num_limbs]u128 = undefined;
+        var carry: u128 = 0;
+        inline for (0..num_limbs) |i| {
+            const cur = @as(u128, a.limbs[i]) * s + carry;
+            r[i] = cur & limb_mask;
+            carry = cur >> limb_bits;
+        }
+        r[0] += carry;
+        r[4] += carry;
+        return reduceAfterFold(r);
     }
 
     /// Multiplicative inverse; `error.NotInvertible` if `a == 0`.
@@ -491,23 +535,23 @@ pub const Fe = struct {
         return (a.toBytes()[0] & 1) == 1;
     }
 
-    /// Constant-time select: returns `a` if `cond`, else `b` — REAL, same
-    /// byte-mask-merge technique `bls12_381.Fp.ctSelect` uses (no
-    /// data-dependent branch/index): the building block a constant-time
-    /// Montgomery ladder (`x448.zig`) or constant-time scalar
-    /// multiplication (`ed448.zig`) needs for its conditional swaps —
-    /// wired here as REAL so `x448.zig`'s ladder skeleton can call it
-    /// even before `add`/`mul`/etc. are filled in.
+    /// Constant-time select: returns `a` if `cond`, else `b` — the
+    /// building block a constant-time Montgomery ladder (`x448.zig`) or
+    /// constant-time windowed scalar multiplication (`ed448.zig`) needs
+    /// for its conditional swaps and masked table scans. Operates
+    /// LIMB-LEVEL (a single 64-bit mask merge per limb, no branch, no
+    /// secret-dependent index) — both inputs are canonical by the storage
+    /// convention (module doc comment), so limb-wise selection yields the
+    /// canonical representative of whichever operand was chosen. This
+    /// replaces an earlier `toBytes`/`fromBytes` round-trip merge: the
+    /// masked select sits on the hot path of every windowed scalarmul, so
+    /// the two serializations + reparse per select were a real cost
+    /// (audit F5).
     pub fn ctSelect(cond: bool, a: Fe, b: Fe) Fe {
-        const mask: u8 = @as(u8, 0) -% @intFromBool(cond);
-        const ab = a.toBytes();
-        const bb = b.toBytes();
-        var out: [encoded_bytes]u8 = undefined;
-        for (&out, ab, bb) |*o, x, y| o.* = (x & mask) | (y & ~mask);
-        // Both inputs are canonical by the storage convention, so the
-        // byte-merged result equals one of them exactly and is canonical
-        // too — fromBytes's canonical check cannot fail here.
-        return Fe.fromBytes(out) catch unreachable;
+        const mask: u64 = @as(u64, 0) -% @intFromBool(cond);
+        var out: [num_limbs]u64 = undefined;
+        inline for (0..num_limbs) |i| out[i] = (a.limbs[i] & mask) | (b.limbs[i] & ~mask);
+        return .{ .limbs = out };
     }
 
     /// Constant-time conditional swap of `a` and `b` — the Montgomery
