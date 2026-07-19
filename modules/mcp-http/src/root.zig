@@ -139,6 +139,10 @@ pub const Sessions = struct {
     /// Buffered events retained per session for resumable replay. Older events
     /// are evicted; a client reconnecting past this depth loses them.
     replay_depth: usize = 256,
+    /// Hard cap on live sessions. `create` refuses a new session past this,
+    /// so an unauthenticated peer spamming `initialize` cannot grow the
+    /// registry (and its per-session replay buffers) without bound.
+    max_sessions: usize = 10_000,
 
     const Session = struct {
         id: []const u8, // gpa-owned, stable for the session's life
@@ -170,9 +174,10 @@ pub const Sessions = struct {
 
     /// Create a session; returns its id (store-owned, stable). Caller echoes it
     /// in the response `Mcp-Session-Id` header.
-    fn create(self: *Sessions) error{OutOfMemory}![]const u8 {
+    fn create(self: *Sessions) error{ OutOfMemory, TooManySessions }![]const u8 {
         lockSpin(&self.lock);
         defer self.lock.unlock();
+        if (self.map.count() >= self.max_sessions) return error.TooManySessions;
         self.seq += 1;
         // Unique (seq, under lock) and hard to guess (monotonic clock + the
         // store address mixed in) — NOT a CSPRNG token, so it is a routing key,
@@ -426,7 +431,15 @@ fn handlePost(t: *const Transport, ctx: *router.Ctx) anyerror!void {
     // session id at `initialize` and must present it on every later request.
     if (t.sessions) |sessions| {
         if (isInitialize(t.gpa, body)) {
-            const sid = try sessions.create();
+            const sid = sessions.create() catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.TooManySessions => {
+                    ctx.res.setStatus(429);
+                    try ctx.res.setHeader("Content-Type", "text/plain");
+                    try ctx.res.writeAll("Too Many Sessions\n");
+                    return;
+                },
+            };
             try ctx.res.setHeader("Mcp-Session-Id", sid);
         } else {
             const sid = ctx.req.header("mcp-session-id") orelse return notFound(ctx);
@@ -997,4 +1010,16 @@ test "oversized POST body → 413" {
         \\{"jsonrpc":"2.0","id":9,"method":"tools/list","params":{"padding":"xxxxxxxxxxxx"}}
     ), &buf);
     try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 413"));
+}
+
+test "Sessions.create: refuses new sessions past max_sessions (audit MED)" {
+    // Batch-10 audit MED: create() had no cap, so an unauthenticated peer
+    // spamming `initialize` grew the registry (and per-session replay buffers)
+    // without bound. Past max_sessions, create() must fail closed.
+    var s = Sessions.init(testing.allocator);
+    defer s.deinit();
+    s.max_sessions = 2;
+    _ = try s.create();
+    _ = try s.create();
+    try testing.expectError(error.TooManySessions, s.create());
 }
