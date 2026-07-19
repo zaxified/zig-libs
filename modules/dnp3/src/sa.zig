@@ -707,6 +707,60 @@ pub const AggregateMac = struct {
 // pass the exact wire byte slices; both sides MUST agree on the same
 // definition of those slices (documented below). Validated for full-flow
 // self-consistency, not against a live opendnp3 MAC vector (see module header).
+//
+// ── TRANSCRIPT ADJUDICATION (adversarial-soundness review, 2026-07-19) ────────
+// Verdict: SOUND — no attacker-malleable field and no reachable splicing gap,
+// given the calling contract below. No code-logic change was required; this
+// note exists so the transcript is not re-audited from scratch.
+//
+// What the MAC input `challenge_message ‖ authenticated_asdu` binds, mapped to
+// what IEEE 1815-2012 §7 / IEC 62351-5 require for the challenge-response reply:
+//   • CSQ (challenge sequence number) — BOUND: it is the first field of the
+//     g120v1 Challenge body (`Challenge.encode`, sa.zig:458, offset 0..4), and
+//     `challenge_message` is the whole Challenge fragment.
+//   • USR (user number)              — BOUND: g120v1 body offset 4..6
+//     (sa.zig:459). A reply for user A cannot be replayed as user B: the copy
+//     of USR inside `challenge_message` differs, so the MAC differs.
+//   • MAC algorithm + reason         — BOUND: g120v1 bytes 6 and 7
+//     (sa.zig:460-461); an attacker cannot silently downgrade the algorithm id.
+//   • Challenge nonce (freshness)    — BOUND: g120v1 tail (sa.zig:462). A stale
+//     reply fails because the verifier's stored nonce differs.
+//   • Direction / role               — BOUND out-of-band by KEY SEPARATION, not
+//     by transcript bytes: the control-direction and monitoring-direction
+//     session keys are distinct (see `wrapSessionKeys`, sa.zig:752), so a reply
+//     MAC'd under one direction's key never verifies under the other's. This
+//     matches the spec, which does not put a direction octet in the MAC input.
+//   • KSQ (key-change sequence)      — NOT APPLICABLE to the reply MAC. KSQ
+//     belongs to the session-key-change path (g120v5/v6) and is bound there by
+//     `SessionKeyStatus.macCoveredLen` (sa.zig:608), which covers KSQ..nonce.
+//   • Full critical ASDU             — BOUND: `authenticated_asdu` is the entire
+//     application fragment. In AGGRESSIVE mode the g120v3 request object (its
+//     own CSQ+USR, sa.zig:517) is the leading bytes of `authenticated_asdu`, so
+//     the per-message aggressive CSQ is bound too — supply g120v3‖ASDU as the
+//     second operand.
+//
+// (a) Attacker-varied-yet-verifies field: NONE. Every field above is either in
+//     a MAC-covered operand or separated by key. Under a FIXED verifier
+//     challenge C, `verify(C ‖ A') == verify(C ‖ A)` forces A' == A (HMAC
+//     collision resistance); across challenges a fresh nonce in C breaks replay.
+//
+// (b) Concatenation / length-ambiguity splicing: the two operands are streamed
+//     with NO length prefix (`mac.computeTwo`, sa.zig:281), so as a pure
+//     function the boundary is ambiguous — HMAC(x‖y)=HMAC(x'‖y') whenever the
+//     flat bytes coincide. This is NOT reachable by an attacker because the
+//     VERIFIER supplies BOTH operands from its own authoritative state: the
+//     g120v2 Reply on the wire carries only CSQ+USR+MAC (sa.zig:481), never the
+//     challenge, so the outstation MUST reconstruct `challenge_message` from the
+//     challenge IT sent (a fixed, known length) and take `authenticated_asdu`
+//     from the received request framed by its own object headers. The boundary
+//     is therefore pinned out-of-band on the trusting side and cannot be shifted
+//     from the wire. CONTRACT (do not break): never derive the length of
+//     `challenge_message` from bytes carried in the reply/request — always from
+//     the verifier's stored challenge. If a future caller ever lets the wire
+//     move that boundary, add explicit length-prefix framing here first.
+//
+// (c) Omitted critical ASDU field: NONE — the whole application fragment is one
+//     opaque operand; nothing inside it is skipped.
 
 /// Computes the g120v2 Reply MAC. `session_key` is the direction's session
 /// key; `challenge_message` is the full application-layer bytes of the
@@ -1170,6 +1224,33 @@ test "full challenge-response flow: build v1 -> compute v2 -> verify = accept; t
     @memcpy(&tampered_asdu, &critical_asdu);
     tampered_asdu[8] ^= 0x01; // flip a control-code byte
     try testing.expect(!verifyReplyMac(alg, &session_key, challenge_message, &tampered_asdu, parsed_reply.mac_value));
+}
+
+test "transcript adjudication: verifier's authoritative boundary rejects a spliced ASDU" {
+    // The reply MAC streams `challenge_message ‖ authenticated_asdu` with no
+    // length prefix, so soundness rests on the verifier fixing the boundary
+    // from its OWN stored challenge (see the TRANSCRIPT ADJUDICATION note). This
+    // pins the security property: an attacker who tries to move the boundary —
+    // shrinking the challenge and growing the ASDU by the freed byte — produces
+    // a different concatenation against the verifier's fixed 6-byte challenge
+    // and is rejected. (A future length-prefix hardening keeps this green.)
+    const key = "session-key-control-direction!!!"; // 32 bytes
+    const alg: HmacAlgorithm = .hmac_sha256_trunc_16;
+
+    // The 6-byte challenge the outstation actually sent, and the 4-byte ASDU.
+    const challenge = [_]u8{ 0xC3, 0x83, 0xAA, 0xBB, 0xCC, 0xDD };
+    const asdu = [_]u8{ 0x01, 0x02, 0x03, 0x04 };
+
+    var m: [16]u8 = undefined;
+    const good = try computeReplyMac(alg, key, &challenge, &asdu, &m);
+    // Honest split verifies against the authoritative challenge.
+    try testing.expect(verifyReplyMac(alg, key, &challenge, &asdu, good));
+
+    // Attacker's alternate 5+5 split (last challenge byte moved into the ASDU).
+    const spliced_asdu = [_]u8{ challenge[5], asdu[0], asdu[1], asdu[2], asdu[3] };
+    // Against the verifier's FIXED 6-byte challenge this is a different message
+    // (6 ‖ 5 = 11 bytes, not the original 10) and must not verify.
+    try testing.expect(!verifyReplyMac(alg, key, &challenge, &spliced_asdu, good));
 }
 
 test "SeqCounter and KeyExpiry behave as pure counters (no wall clock)" {
