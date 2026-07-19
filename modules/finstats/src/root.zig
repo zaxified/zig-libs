@@ -204,12 +204,16 @@ pub fn twrDaily(a: std.mem.Allocator, d: Dataset, spec: TwrSpec) Error!Dataset {
 
 // ── quantile / histogram ────────────────────────────────────────────────────
 
-/// Linear-interpolation quantile of a pre-sorted slice (exact port).
+/// Linear-interpolation quantile of a pre-sorted slice (exact port). `q` is
+/// clamped into `[0, 1]` (and NaN maps to 0), so an out-of-range caller value
+/// cannot drive `pos` negative/NaN into `@intFromFloat` (a panic in ReleaseSafe,
+/// an out-of-bounds read in ReleaseFast).
 pub fn quantileSorted(sorted: []const f64, q: f64) f64 {
     const n = sorted.len;
     if (n == 0) return 0;
     if (n == 1) return sorted[0];
-    const pos = q * @as(f64, @floatFromInt(n - 1));
+    const qc = if (std.math.isNan(q)) 0.0 else std.math.clamp(q, 0.0, 1.0);
+    const pos = qc * @as(f64, @floatFromInt(n - 1));
     const lo: usize = @intFromFloat(@floor(pos));
     const hi: usize = @intFromFloat(@ceil(pos));
     const frac = pos - @floor(pos);
@@ -722,6 +726,16 @@ test "quantile linear interp + histogram" {
     for (0..h.rows.len) |i| total += h.cell(i, "count").?.int;
     try testing.expectEqual(@as(i64, 4), total);
     try testing.expectEqual(@as(i64, 1), h.cell(4, "count").?.int); // the 10 lands in last bin
+}
+
+test "quantileSorted: out-of-range q is clamped instead of panicking (audit F1)" {
+    // Batch: q was fed straight into @intFromFloat(@floor(q*(n-1))); a q < 0
+    // (e.g. a 0-100 vs 0-1 convention mixup) panicked in ReleaseSafe / OOB-read
+    // in ReleaseFast. It is now clamped into [0,1] (NaN -> 0).
+    const s = [_]f64{ 1, 2, 3, 4 };
+    try testing.expectEqual(@as(f64, 1), quantileSorted(&s, -0.5)); // was a panic
+    try testing.expectEqual(@as(f64, 4), quantileSorted(&s, 2.0));
+    try testing.expectEqual(@as(f64, 1), quantileSorted(&s, std.math.nan(f64)));
 }
 
 test "risk_metrics basic invariants" {
