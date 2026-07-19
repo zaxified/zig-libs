@@ -240,6 +240,11 @@ pub fn writeErrorsJson(errors: []const Error, w: *std.Io.Writer) std.Io.Writer.E
     return std.json.Stringify.value(.{ .errors = errors }, .{}, w);
 }
 
+/// Hard cap on aggregated errors per `Report`. Bounds worst-case aggregation
+/// work (see `dedupeFrom`) and keeps a maliciously huge failing body from
+/// growing the error list — and the 400 response body — without limit.
+const max_errors: usize = 1000;
+
 /// Error accumulator: one arena for paths/messages/the list itself;
 /// `finish` hands the arena to the Report, `abort` discards it.
 const Builder = struct {
@@ -254,14 +259,45 @@ const Builder = struct {
         return b.arena.allocator();
     }
 
+    /// Append one error. A single `checkValue` pass over one schema never
+    /// produces a duplicate (path, code) pair (each field/rule is visited
+    /// once), so this does *not* dedupe — a per-append linear scan over the
+    /// whole list made aggregation O(n^2) (reproduced: ~196ms ReleaseFast for
+    /// a 10,000-element failing array). The one place a real duplicate can
+    /// arise — the typed double-pass in `parseIntoLimited` (derived schema,
+    /// then `T.validate_rules`, over the same document) — dedupes itself via
+    /// `dedupeFrom` after the second pass, bounded by `max_errors` on both
+    /// sides rather than by attacker-controlled input size.
     fn append(b: *Builder, path: []const u8, code: []const u8, message: []const u8) Allocator.Error!void {
-        // Dedupe exact (path, code) repeats: the typed style runs the derived
-        // schema and then T.validate_rules over the same document, and a field
-        // failing the same way in both passes is one error, not two.
-        for (b.list.items) |e| {
-            if (std.mem.eql(u8, e.path, path) and std.mem.eql(u8, e.code, code)) return;
-        }
+        if (b.list.items.len >= max_errors) return;
         try b.list.append(b.a(), .{ .path = path, .code = code, .message = message });
+    }
+
+    /// Remove entries appended since `first_pass_len` that duplicate
+    /// (path, code) with an entry from before it. Used only by the
+    /// `parseIntoLimited` double-pass (derived schema + `T.validate_rules`)
+    /// to restore "one error, not two" for a field failing the same way in
+    /// both passes. Cost is O(first_pass_len * (list.items.len -
+    /// first_pass_len)), both bounded by `max_errors`, so it stays cheap
+    /// regardless of how large the failing input is.
+    fn dedupeFrom(b: *Builder, first_pass_len: usize) void {
+        if (first_pass_len == 0 or first_pass_len >= b.list.items.len) return;
+        const prior = b.list.items[0..first_pass_len];
+        var write = first_pass_len;
+        for (b.list.items[first_pass_len..]) |e| {
+            var dup = false;
+            for (prior) |p| {
+                if (std.mem.eql(u8, p.path, e.path) and std.mem.eql(u8, p.code, e.code)) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup) {
+                b.list.items[write] = e;
+                write += 1;
+            }
+        }
+        b.list.shrinkRetainingCapacity(write);
     }
 
     fn appendf(b: *Builder, path: []const u8, code: []const u8, comptime fmt: []const u8, args: anytype) Allocator.Error!void {
@@ -1213,8 +1249,11 @@ pub fn parseIntoLimited(comptime T: type, gpa: Allocator, body: []const u8, limi
     var b = Builder.init(gpa);
     errdefer b.abort();
     try checkValue(&b, "", parsed.value, schema);
-    if (@hasDecl(T, "validate_rules"))
+    if (@hasDecl(T, "validate_rules")) {
+        const first_pass_len = b.list.items.len;
         try checkValue(&b, "", parsed.value, T.validate_rules);
+        b.dedupeFrom(first_pass_len);
+    }
     if (b.list.items.len != 0) return .{ .invalid = b.finish() };
     b.abort();
 
@@ -2373,6 +2412,53 @@ test "parseInto: T.validate_rules constraints apply on top of the derived schema
     defer result.deinit();
     try testing.expect(result == .invalid);
     try expectError(&result.invalid, "name", "string_too_short");
+}
+
+fn nowNsMonotonic() u64 {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
+
+test "aggregation: a 10,000-element failing array completes fast and is capped at max_errors" {
+    // Reproduces the audit's O(n^2) scenario: a body that complies with the
+    // default structural limits (array elements <= Limits.max_array_elements
+    // == 10_000) but fails a per-element rule, so every element produces a
+    // distinct-path error. Before the fix, `Builder.append`'s per-append
+    // linear dedupe scan made aggregating N such errors O(n^2) (~196ms
+    // ReleaseFast at N=10,000). This locks in that the error list no longer
+    // grows unbounded (capped at `max_errors`) and that building the report
+    // completes without the quadratic blowup.
+    const schema = [_]Rule{
+        .{ .field = "items", .kind = .array, .items = &.{ .field = "", .kind = .string, .min_len = 1 } },
+    };
+
+    const n = 10_000;
+    var body: std.ArrayList(u8) = try .initCapacity(testing.allocator, n * 3 + 16);
+    defer body.deinit(testing.allocator);
+    try body.appendSlice(testing.allocator, "{\"items\":[");
+    for (0..n) |i| {
+        if (i != 0) try body.append(testing.allocator, ',');
+        try body.appendSlice(testing.allocator, "\"\"");
+    }
+    try body.appendSlice(testing.allocator, "]}");
+
+    const start_ns = nowNsMonotonic();
+    var r = try validateJson(testing.allocator, body.items, &schema);
+    defer r.deinit();
+    const elapsed_ns = nowNsMonotonic() -| start_ns;
+
+    // Every element is "" and fails min_len=1, so the pre-fix code would
+    // have produced 10,000 distinct errors via an O(n^2) dedupe scan; the
+    // fix caps aggregation at `max_errors` regardless of input size.
+    try testing.expectEqual(max_errors, r.errors.len);
+    try expectError(&r, "items[0]", "string_too_short");
+
+    // Generous linear-time bound: the reproduced quadratic path took
+    // ~196ms in ReleaseFast at this size (and much longer in Debug); a
+    // linear/capped pass is expected to be well under a second even in
+    // Debug. This is a loose regression trip-wire, not a tight benchmark.
+    try testing.expect(elapsed_ns < 5 * std.time.ns_per_s);
 }
 
 test "parseInto: malformed JSON → json_invalid, unknown fields ignored" {
