@@ -295,6 +295,12 @@ fn runChild(argv_ptrs: [:null]?[*:0]const u8) ProcResult {
     const pid: isize = @bitCast(forked);
     if (pid < 0) return spawn_failed;
     if (pid == 0) { // CHILD — async-signal-safe only until the image is replaced
+        // Close inherited fds (>= 3, keeping stdio) so the exec'd target cannot
+        // leak or act on the parent's listen/control sockets. Best-effort and
+        // async-signal-safe (a single syscall); on a pre-5.9 kernel without
+        // close_range this is a no-op ENOSYS and the caller's CLOEXEC-at-creation
+        // convention remains the backstop.
+        _ = linux.close_range(3, std.math.maxInt(i32), @bitCast(@as(u32, 0)));
         _ = linux.execve(path, argv_z, &empty_envp);
         linux.exit_group(127); // execve returned → target missing/not executable
     }
