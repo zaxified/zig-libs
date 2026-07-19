@@ -50,16 +50,39 @@ pub fn needsGuardSep(value: []const u8, decimal_sep: u8) bool {
     if (value.len == 0) return false;
     return switch (value[0]) {
         '=', '@', '\t', '\r' => true,
-        // A '+' / '-' lead is a formula lead ONLY when what follows is not a
-        // digit or the decimal separator; otherwise it is a signed number and
-        // must pass through unguarded.
-        '+', '-' => !nextIsNumeric(value, decimal_sep),
+        // A '+' / '-' lead is a signed *number* (safe, passes unguarded) ONLY
+        // when it is a signed number all the way through; otherwise it is a
+        // formula and must be guarded.
+        '+', '-' => !isSignedNumber(value, decimal_sep),
         else => false,
     };
 }
 
-fn nextIsNumeric(value: []const u8, decimal_sep: u8) bool {
-    return value.len > 1 and (std.ascii.isDigit(value[1]) or value[1] == decimal_sep);
+/// A leading '+'/'-' introduces a signed *number* — safe to pass unguarded —
+/// only when EVERY following byte is a digit, the decimal separator, or a space
+/// (digit grouping / phone numbers). A value that reaches a formula operator,
+/// letter, another sign or any other byte is an Excel/Sheets formula
+/// (e.g. "-1+cmd|'/c calc'!A1") and must be guarded — checking only the first
+/// byte after the sign let that whole injection class through (audit F1). Since
+/// a run of only digits/sep/space cannot contain a formula operator, function
+/// name or cell reference, it is provably not executable. A lone sign (len < 2)
+/// is not a number and stays guarded.
+fn isSignedNumber(value: []const u8, decimal_sep: u8) bool {
+    if (value.len < 2) return false;
+    // The byte right after the sign must be a digit or the locale decimal
+    // separator (preserves the original signed-number/locale semantics, e.g.
+    // "-.5" under a ',' locale is not a number).
+    if (!std.ascii.isDigit(value[1]) and value[1] != decimal_sep) return false;
+    // ...AND the ENTIRE remainder must be numeric punctuation only. A run of
+    // digits / separators / spaces cannot contain a formula operator, function
+    // name or cell reference, so it is provably not executable; anything else
+    // (e.g. the "+cmd|..." tail of "-1+cmd|'/c calc'!A1") forces a guard (F1).
+    for (value[1..]) |ch| {
+        const numeric = std.ascii.isDigit(ch) or ch == decimal_sep or
+            ch == '.' or ch == ',' or ch == ' ';
+        if (!numeric) return false;
+    }
+    return true;
 }
 
 /// Writes `value` to `writer`, prefixing the guard char first if `value` would
@@ -140,6 +163,19 @@ test "writeSafe: non-numeric +/- leads are still guarded" {
     try expectSafe("-- comment", "'-- comment");
     try expectSafe("+", "'+"); // lone sign: safe default
     try expectSafe("-", "'-");
+}
+
+test "writeSafe: a signed-number lead followed by a formula tail is guarded (audit F1 HIGH)" {
+    // Batch-10 audit HIGH: needsGuard inspected only the byte after the sign, so a
+    // number immediately followed by a formula ("-1+cmd|...") slipped through
+    // unguarded even though Excel/Sheets evaluate the whole cell as a formula. The
+    // signed-number exception now requires the entire tail to be numeric.
+    try expectSafe("-1+cmd|'/c calc'!A1", "'-1+cmd|'/c calc'!A1");
+    try expectSafe("+1+cmd|'/c calc'!A1", "'+1+cmd|'/c calc'!A1");
+    try expectSafe("-1e9", "'-1e9"); // scientific notation over-guarded (safe direction)
+    // Genuine signed numbers (incl. grouped/phone) still pass through unchanged:
+    try expectSafe("-12.34", "-12.34");
+    try expectSafe("+420 555 0101", "+420 555 0101");
 }
 
 // ── Added cases ────────────────────────────────────────────────────────────
