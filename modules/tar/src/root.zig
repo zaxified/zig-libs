@@ -158,6 +158,11 @@ pub const Reader = struct {
             try verifyChecksum(&block);
 
             const h = parseHeader(&block);
+            // Reject a size so large that `h.size + content_pad` (used below
+            // for pax/GNU-long skip-and-discard) could overflow u64. No real
+            // archive needs a size this close to maxInt(u64); a header that
+            // claims one is malformed/hostile, not a legitimately huge file.
+            if (h.size > std.math.maxInt(u64) - block_size) return error.BadHeader;
             const content_pad = padding(h.size);
             switch (h.typeflag) {
                 'L' => { // GNU long name: payload is the next entry's path
@@ -336,7 +341,12 @@ fn sizeField(field: []const u8) u64 {
 }
 
 pub fn padding(size: u64) u64 {
-    return std.mem.alignForward(u64, size, block_size) - size;
+    // Overflow-free by construction: `size % block_size` is always
+    // `< block_size`, so the subtraction never underflows and the outer
+    // `% block_size` folds the `size % block_size == 0` case to 0 without
+    // ever computing `size + block_size` (which could wrap for `size` near
+    // `maxInt(u64)`, unlike `std.mem.alignForward`).
+    return (block_size - (size % block_size)) % block_size;
 }
 
 // ── Writer ──────────────────────────────────────────────────────────────────
@@ -651,6 +661,16 @@ test "padding to 512" {
     try testing.expectEqual(@as(u64, 0), padding(512));
     try testing.expectEqual(@as(u64, 412), padding(100));
     try testing.expectEqual(@as(u64, 1), padding(1023));
+}
+
+test "padding never overflows near maxInt(u64)" {
+    // Regression for the reproduced CRIT: std.mem.alignForward's internal
+    // `size + (block_size - 1)` would wrap here; our formula must not.
+    // maxInt(u64) == 2^64 - 1, and 2^64 % 512 == 0, so maxInt(u64) % 512 ==
+    // 511, hence padding(maxInt(u64)) == 1.
+    try testing.expectEqual(@as(u64, 1), padding(std.math.maxInt(u64)));
+    try testing.expectEqual(@as(u64, 2), padding(std.math.maxInt(u64) - 1));
+    try testing.expectEqual(@as(u64, 0), padding(std.math.maxInt(u64) - 511));
 }
 
 test "size field base-256 round-trip (>8 GiB)" {
@@ -999,6 +1019,22 @@ test "hostile GNU 'L' size -> error.BadHeader" {
     var block: [block_size]u8 = undefined;
     // 'L' record claiming a 1 MiB name (over max_name_len)
     emitHeader(&block, gnu_longlink_name, "", 0, 0, 0, 1024 * 1024, 0, 'L');
+    try dst.writeAll(&block);
+    var src: std.Io.Reader = .fixed(dst.buffered());
+    var tr = Reader.init(testing.allocator, &src);
+    defer tr.deinit();
+    try testing.expectError(error.BadHeader, tr.next());
+}
+
+test "base-256 size near maxInt(u64) -> error.BadHeader, no panic" {
+    // Reproduces the audit's CRIT: a crafted GNU/star base-256 size field
+    // within 511 of maxInt(u64) used to overflow `padding()`'s internal
+    // alignment arithmetic and panic on the very first `next()` after the
+    // checksum check passed. Must now fail closed instead of crashing.
+    var buf: [2 * block_size]u8 = undefined;
+    var dst: std.Io.Writer = .fixed(&buf);
+    var block: [block_size]u8 = undefined;
+    emitHeader(&block, "evil.bin", "", 0o644, 0, 0, std.math.maxInt(u64) - 5, 0, '0');
     try dst.writeAll(&block);
     var src: std.Io.Reader = .fixed(dst.buffered());
     var tr = Reader.init(testing.allocator, &src);
