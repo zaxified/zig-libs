@@ -14,10 +14,10 @@
 //! underneath are tick-unit-agnostic.
 //!
 //! Every test here drives a `trace.Prober`, which owns an `Estimator`, which
-//! calls into the `core.decide` Fable stub on every probe outcome — so every
-//! test in this file panics at the stub until the Fable core lands. That is
-//! EXPECTED (see root.zig / core.zig doc); the harness itself is complete and
-//! correct today and needs no changes once the stub is filled in.
+//! calls into the implemented `core.decide` kernel on every probe outcome —
+//! these bounds are the executable teeth of the kernel's design contract (and
+//! of its adjudicated anti-flap/monotonicity trade-off; see `core.decide` and
+//! `property.zig`).
 
 const std = @import("std");
 const netsim = @import("netsim");

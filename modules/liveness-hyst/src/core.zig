@@ -3,11 +3,11 @@
 //! as an INPUT FILTER to an up/suspect/down verdict (see root.zig's module doc for
 //! the full problem statement).
 //!
-//! FABLE CORE — not implemented yet. `decide` panics until a Fable pass fills it
-//! in; every other file in this module (root.zig's `Estimator` shell, `trace.zig`'s
-//! corpus, `scoring.zig` / `property.zig`'s harness) is fully written around this
-//! one seam and compiles today — only CALLING this function crashes, which is
-//! expected (see root.zig doc + the module's scaffolding task).
+//! FABLE CORE — `decide` below is the implemented hysteresis kernel. Its design
+//! contract (including the adjudicated monotonicity trade-off) is documented on
+//! `decide` itself; `scoring.zig` (detection latency, failover budget) and
+//! `property.zig` (monotone path cost, up-boundary monotonicity, the pinned
+//! degraded-vs-clean state inversion) are the executable teeth.
 
 const std = @import("std");
 const root = @import("root.zig");
@@ -38,9 +38,37 @@ const root = @import("root.zig");
 ///     flapping link. Babel's metric-smoothing-as-input-filter idea (damp the
 ///     INPUT before it ever reaches a hard threshold, instead of just widening
 ///     the threshold) is the model to follow.
-///   - Monotonicity (`property.zig`): a strictly-worse probe stream (any reply
-///     delayed / lost, never improved) must never produce a strictly-more-`.up`
-///     verdict than the original at any corresponding point in time.
+///   - Monotonicity (`property.zig`) — ADJUDICATED TRADE-OFF: strict pointwise
+///     monotonicity of the 3-state verdict ("a pointwise-worse probe stream is
+///     never ranked more `.up` at any corresponding point in time") is PROVABLY
+///     INCOMPATIBLE with the two bounds above, for ANY estimator whose verdict
+///     is a function of its own probe stream: the detection bound forces a
+///     clean stream into `.down` within ~2 misses of a burst, while the
+///     failover budget forbids a 30%-degraded stream — whose ROUTINE bursts
+///     are locally indistinguishable from death inside the 1.5s window — from
+///     doing the same on every such burst (that would be thousands of
+///     failovers/week). So at a shared terminal burst the degraded,
+///     pointwise-worse stream necessarily sits at `.suspect` while the clean
+///     one is already `.down`. The contract is therefore split into what CAN
+///     be guaranteed, and each part is enforced by `property.zig`:
+///       (1) FORWARDING SAFETY (strict, monotone): path preference must order
+///           by `Estimator.pathCost()` — the smoothed metric — never by state
+///           rank. The metric is a fixed-weight EWMA of per-probe cost and is
+///           therefore pointwise monotone (even under f64 rounding, since each
+///           EWMA step is a composition of monotone rounded operations): a
+///           pointwise-worse stream never gets a LOWER cost, so a worse path
+///           is never strictly preferred for forwarding.
+///       (2) UP-BOUNDARY monotonicity of the state (strict): a pointwise-worse
+///           stream is never `.up` when the better stream is not. Guaranteed
+///           for every config by the UNIFORM recovery gate below (`.down` and
+///           `.suspect` climb through the identical quiet+metric test, so the
+///           better stream can never lag the worse one into `.up`).
+///       (3) Inside {`.suspect`, `.down`} the state is intentionally
+///           NON-monotone across loss regimes — that inversion IS the
+///           anti-flap damping. The state is a transition-TIMING signal for
+///           reconvergence, not an ordering key; `property.zig` pins the
+///           inversion as a permanent regression case so any "fix" that
+///           re-couples ranking to state must re-open this adjudication.
 ///   - Bounded memory: do not stash any state outside `est`'s existing
 ///     fixed-size fields (e.g. no static/global maps keyed by probe id) —
 ///     `est.verdict` is the ONLY place damping/smoothing state may persist
@@ -143,18 +171,29 @@ pub fn decide(est: *const root.Estimator, now: root.Time) root.Verdict {
     // ── state transition (asymmetric hysteresis) ────────────────────────────
     //
     // Down is entered by evidence alone (above). Climbing back is slow and
-    // single-step: `.down` → `.suspect` needs one reply; `.suspect` → `.up`
-    // needs a reply after `up_threshold` of timeout-free running AND the
-    // smoothed metric decayed under `theta_up`. A timeout never improves the
-    // state and immediately demotes `.up` to `.suspect`.
+    // UNIFORM: on a reply, `.down` and `.suspect` pass through the identical
+    // recovery gate — `up_threshold` of timeout-free running AND the smoothed
+    // metric decayed under `theta_up` — reaching `.up` if it holds, `.suspect`
+    // otherwise. A timeout never improves the state and immediately demotes
+    // `.up` to `.suspect`.
+    //
+    // The gate MUST be uniform (no mandatory `.down` → `.suspect` stopover):
+    // with a per-state stopover, a pointwise-worse stream parked at `.suspect`
+    // by the degraded damping could satisfy the gate one reply-step BEFORE the
+    // cleaner stream still exiting `.down` — reaching `.up` first and breaking
+    // up-boundary monotonicity (contract point (2) above; realizable at high
+    // `metric_smoothing` with sparse probing — see the property.zig regression
+    // "recovery is uniform"). With the uniform gate the implication is
+    // config-independent: the worse stream's metric is never lower and its
+    // last window-timeout is never older, so whenever the worse stream passes
+    // the gate, the better one does too.
     const state: root.LinkState = if (down_now)
         .down
     else if (is_timeout)
         (if (prev.state == .down) .down else .suspect)
     else switch (prev.state) {
         .up => .up,
-        .down => .suspect,
-        .suspect => blk: {
+        .down, .suspect => blk: {
             const quiet = if (last_timeout_at) |t| now - t >= cfg.up_threshold else true;
             break :blk if (quiet and metric <= theta_up) .up else .suspect;
         },
@@ -167,10 +206,9 @@ pub fn decide(est: *const root.Estimator, now: root.Time) root.Verdict {
     };
 }
 
-test "core: file is reachable from the build (does not itself invoke the stub)" {
+test "core: file is reachable from the build" {
     // Intentionally does NOT call `decide` — real calls belong to the
-    // scoring/property tests, which are expected to panic until the Fable core
-    // lands (see module doc above). This anchors the file + its doc comment in
+    // scoring/property tests. This anchors the file + its doc comment in
     // `zig build test-liveness-hyst`.
     try std.testing.expect(true);
 }

@@ -14,8 +14,9 @@
 //! The trace corpus lives in `trace.zig`; the scoring + property harness lives in
 //! `scoring.zig` and `property.zig`. The ONE irreducible piece — the hysteresis decision
 //! itself (combine probe timing + jitter/loss into an up/suspect/down verdict + a smoothed
-//! metric, with asymmetric thresholds/damping) — is `core.decide` (`src/core.zig`),
-//! stubbed with `@panic("TODO(fable/core): ...")` until a Fable pass fills it in.
+//! metric, with asymmetric thresholds/damping) — is `core.decide` (`src/core.zig`), which
+//! also documents the adjudicated monotonicity contract: order paths by `pathCost()`
+//! (monotone), treat `state()` as the damped transition-timing signal.
 
 const std = @import("std");
 const netsim = @import("netsim");
@@ -39,15 +40,19 @@ pub const meta = .{
 /// agnostic to what a tick means.
 pub const Time = netsim.Time;
 
-/// The liveness verdict. Total order for the monotonicity property test only
-/// (`up` > `suspect` > `down`, via `rank()`) — not meaningful otherwise.
+/// The liveness verdict. `rank()` gives the informal "up-ness" order
+/// (`up` > `suspect` > `down`) for tests and display, but it is NOT monotone in
+/// stream quality inside {`.suspect`, `.down`} (a degraded-but-usable link is
+/// deliberately harder to fail over than a clean one — see `core.decide`'s
+/// contract) and MUST NOT be used to order paths for forwarding preference —
+/// use `Estimator.pathCost()` for that.
 pub const LinkState = enum {
     up,
     suspect,
     down,
 
-    /// `up` = 2 (most "up"), `down` = 0 (least "up"). Used by the monotonicity
-    /// property test (`property.zig`) to compare two verdict sequences.
+    /// `up` = 2 (most "up"), `down` = 0 (least "up"). Display/test ordering
+    /// only — see the type doc for why this is not a forwarding-preference key.
     pub fn rank(self: LinkState) u8 {
         return switch (self) {
             .down => 0,
@@ -92,8 +97,9 @@ pub const Config = struct {
 /// A liveness verdict at a point in time.
 pub const Verdict = struct {
     state: LinkState = .up,
-    /// Smoothed link metric (Babel-style input-filter output). Lower is better
-    /// (akin to a smoothed RTT/cost); the Fable core defines its exact scale.
+    /// Smoothed link metric (Babel-style input-filter output): an EWMA of
+    /// per-probe loss cost in [0, 1], lower is better. Doubles as the monotone
+    /// failover-ordering key — see `Estimator.pathCost`.
     metric: f64 = 0,
     /// Caller-clock time of the most recent state transition (dwell-time /
     /// anti-flap accounting, if a caller wants it).
@@ -165,8 +171,24 @@ pub const Estimator = struct {
         return self.verdict.state;
     }
 
-    /// The current smoothed link metric (scale/semantics defined by the Fable core).
+    /// The current smoothed link metric (EWMA loss cost in [0, 1]; lower is
+    /// better — see `core.decide`).
     pub fn metric(self: *const Estimator) f64 {
+        return self.verdict.metric;
+    }
+
+    /// The MONOTONE failover-ordering key: when choosing which of several
+    /// paths to prefer for forwarding, order by ascending `pathCost()` (lower
+    /// = better), NOT by `state().rank()`. Contract (enforced by
+    /// `property.zig`): for two estimators fed paired probe streams where one
+    /// stream is pointwise worse-or-equal (every reply as slow or slower, or
+    /// degraded to a timeout; every timeout kept), the worse stream's
+    /// `pathCost()` is never lower — so a strictly-worse path is never
+    /// strictly preferred. `state()` deliberately does NOT have this property
+    /// inside {`.suspect`, `.down`} (anti-flap damping — see `core.decide`'s
+    /// adjudicated contract), which is exactly why forwarding preference must
+    /// key off this cost instead.
+    pub fn pathCost(self: *const Estimator) f64 {
         return self.verdict.metric;
     }
 
