@@ -12,11 +12,11 @@
 //!      every signature `sign.ecdsaSign` produces (random key + nonce) must be
 //!      accepted by BOTH p256 and std — proving sign+verify agree with std
 //!      end-to-end (the double-base multiply + scalar inverse + x-mod-n path).
-//!   2. **The GATED Fable-core differentials** — SKIP in this scaffold (both
-//!      gates are `false`). When a core lands and its gate flips, they pin the
-//!      amd64 field core / the fast scalar multiplies bit-for-bit to the proven
-//!      portable paths. A skip is NOT a green light for a core — it means the
-//!      core is not present on this build.
+//!   2. **The GATED Fable-core differentials** — LIVE (both gates are now
+//!      `true`). They pin the amd64 field core / the fast scalar multiplies
+//!      bit-for-bit to the proven portable paths + std. On a non-amd64 host the
+//!      field differential skips — a skip there means "core not present on this
+//!      build", NOT a green light.
 
 const std = @import("std");
 const gate = @import("gate.zig");
@@ -92,7 +92,7 @@ test "ECDSA: p256-produced signatures verify under BOTH p256 and std" {
     try std.testing.expect(produced > 150);
 }
 
-// ── gated Fable-core differentials (SKIP in the scaffold; SKIP ≠ pass) ────────
+// ── gated Fable-core differentials (LIVE: both gates on; SKIP ≠ pass) ─────────
 
 fn eqAffineStd(k: P256, s: StdCurve) !void {
     const ka = k.affineCoordinates();
@@ -146,6 +146,33 @@ test "GATED differential: group.combMulBaseFast(k)·G == portable ladder + std" 
             try std.testing.expectError(error.IdentityElement, P256.basePoint.mulDoubleAddCt(kb, .big));
         }
     }
+}
+
+test "comb positive control: a corrupted table DISAGREES with std (harness has teeth)" {
+    if (!gate.fast_scalarmul_implemented) return error.SkipZigTest; // core not filled
+
+    // Drop a whole window (window 10 → all teeth = identity), i.e. digit 10
+    // contributes nothing no matter its value. Any scalar with a nonzero
+    // digit-10 (~15/16 of them) then yields the wrong point — so this must
+    // diverge from std on the large majority of inputs. Proves the comb
+    // differential would catch a dropped-digit / wrong-table comb.
+    var bad = group.comb_table;
+    for (&bad[10]) |*e| e.* = P256.identityElement;
+
+    var prng = std.Random.DefaultPrng.init(0xBADC_0FFE_9256);
+    const rand = prng.random();
+    var disagreements: usize = 0;
+    var i: usize = 0;
+    while (i < 500) : (i += 1) {
+        var kb: [32]u8 = undefined;
+        rand.bytes(&kb);
+        const sp = StdCurve.basePoint.mul(kb, .big) catch continue;
+        const kp = P256.combMulBaseFastWithTable(&bad, kb, .big) catch continue;
+        const ka = kp.affineCoordinates();
+        const sa = sp.affineCoordinates();
+        if (!std.mem.eql(u8, &ka.x.toBytes(.big), &sa.x.toBytes(.big))) disagreements += 1;
+    }
+    try std.testing.expect(disagreements > 400);
 }
 
 test "GATED differential: group.mulCtWindowed == portable CT ladder" {

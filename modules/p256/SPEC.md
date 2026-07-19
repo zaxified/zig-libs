@@ -62,9 +62,10 @@ was written.
 
 **Carry propagation in this fold is the classic error-prone spot** and the reason
 this reduction is the Fable-hard core: the gated `MULX/ADX` version
-(`fast_core.fieldMul`/`fieldSq`, a panic stub in this scaffold) must reproduce the
-SAME reduction on explicit 64-bit limbs. Two equivalent limb-level shapes for the
-Fable author (documented in `fast_core.zig`):
+(`fast_core.fieldMul`/`fieldSq`, IMPLEMENTED in the core phase) must reproduce the
+SAME reduction (same canonical result) on explicit 64-bit limbs. Two equivalent
+limb-level shapes (documented in `fast_core.zig`; the implemented core uses the
+second):
 
 - **wide-fold** — mirror `reduceWide` limb-by-limb (`lo += M·hi`); simplest, but
   many folds and a wide `M`-multiply each time.
@@ -103,8 +104,11 @@ Scalar multiply variants (**NO GLV** — see below):
   nonce commitment `k·G` + pubkey `d·G`). Scaffold: falls back to the double-and-add
   ladder over `G`. Gated fast core: `combMulBaseFast` (fixed-base comb).
 - **`mulPublic` / `mulDoubleBasePublic`** — VARIABLE-TIME public-scalar multiplies
-  (verification's `u1·G + u2·Q`). Plain double-and-add in this scaffold; a wNAF
-  `slide` acceleration is owner-phase work (backlog).
+  (verification's `u1·G + u2·Q`). Accelerated with an **interleaved wNAF
+  (Straus–Shamir)** double-scalar mult: one shared doubling chain + a precomputed
+  odd-multiple table per base (width `w = 5` ⇒ 8 points), ~`l/(w+1)` additions per
+  scalar instead of ~`l/2`. Vartime (all inputs public); byte-exact vs the plain
+  double-and-add ladder + std.
 
 ### No GLV — the biggest structural difference from k256
 
@@ -181,13 +185,15 @@ are no GLV constants to own here.
 - **Broken positive control** (`kat_test.zig`): a Solinas fold with the wrong
   constant `M − 1` disagrees with std on >400/500 random inputs — proving the
   reduction constant is load-bearing and the equality checks have teeth.
-- **Gated differentials** (`oracle_test.zig`): SKIP in this scaffold (both gates
-  `false`); when a gate flips they pin the core bit-for-bit to the portable path.
+- **Gated differentials** (`oracle_test.zig`): LIVE (both gates on) — they pin
+  each core bit-for-bit to the portable path (and the comb also to std), plus a
+  corrupted-comb-table positive control. On non-amd64 the field one skips
+  (core not present there).
 
-## Performance status — SCAFFOLD baseline (portable oracle, the "before")
+## Performance status
 
-Both accelerators are gated OFF, so the numbers below are the **portable oracle**,
-which — unlike k256, whose tiny-constant Solinas beat std's field — is **slower
+**Scaffold baseline** (both gates off — the portable oracle, the "before"),
+which — unlike k256, whose tiny-constant Solinas beat std's field — was **slower
 than std** across the board (the 11-fold wide `M`-multiply reduction and the naive
 double-and-add ladder are correctness-first, not fast). This host, ReleaseFast:
 
@@ -199,24 +205,48 @@ double-and-add ladder are correctness-first, not fast). This host, ReleaseFast:
 | ECDSA verify | ~1262 µs | ~756 µs | double-and-add double-base |
 | ECDSA sign | ~1197 µs | ~405 µs | naive `k·G` + Fermat inverse |
 
-The entire speedup lives in the two gated cores: the `MULX/ADX` field mul+square
-(the dominant win — every point op is field-mul-bound) and the comb/windowed
-scalar multiplies. Reaching the **~2–3× nistz256** target
-(≈ 25 µs sign / ≈ 79 µs verify reference) is the Fable core phase + owner-verify
-work, exactly as `k256` went from a portable scaffold to ~2.5× libsecp256k1.
+**Fable-core phase results** (both gates ON — MULX/ADX word-shuffle field +
+comb/windowed scalarmul; same host, i7-7920HQ, ReleaseFast, `P256_BENCH=1`):
 
-## Backlog (the Fable phase + beyond)
+| op | p256-ASM | vs portable | vs std | note |
+|---|---|---|---|---|
+| field mul | ~34 ns | 4.1× | 1.7× | word-shuffle reduce (`fast_core.zig`) |
+| field sq (chained sq+mul) | ~74 ns | 3.7× | 1.3× | dedicated square + shared reduce |
+| CT `k·G` | ~43 µs | 26× | 7.5× | fixed-base comb, no doublings online |
+| ECDSA sign | ~90 µs | 13× | 4.3× | comb `k·G` + Fermat inverse |
+| ECDSA verify | ~241 µs | 5.2× | 2.7× | interleaved wNAF (Straus–Shamir) double-base |
 
-1. `fast_core.fieldMul`/`fieldSq` — the `MULX/ADX` field mul + square with the
-   P-256 Solinas fold (watch the wide-`M` fold-carry propagation / the signed
-   word-shuffle borrows; see `fast_core.zig` + the montint/k256 asm notes).
-2. `group.combMulBaseFast` — the fixed-base comb for `k·G` (comptime table,
-   signed-digit, `blackBox`-guarded CT gather) — the fast signing path.
-3. `group.mulCtWindowed` — the CT windowed variable-base multiply (secret scalars).
-4. wNAF `slide` acceleration for `mulPublic` / `mulDoubleBasePublic` (the verify
-   path; std uses a width-5 `slide`).
-5. Addition-chain field inverse + a dedicated `MULX/ADX` square (replace the
-   general-mul square) once the field core lands.
+vs OpenSSL nistz256 (≈ 25 µs sign / ≈ 79 µs verify reference): **sign ≈ 3.6×,
+verify ≈ 3.0×**. Both are in the 2–3× target band. The verify win came from the
+**owner-phase interleaved wNAF** (backlog #4, done): a shared doubling chain +
+width-5 odd-multiple table per base dropped the double-base multiply from ~256
+additions to ~86, taking verify from ~392 µs (5.0× nistz256) to ~241 µs. The
+remaining lever is the addition-chain field inverse (backlog #5) — the Fermat
+square-and-multiply inverse in `affineCoordinates` is now ~9 % of verify, so it
+buys only ~1–2 % more; deferred as low-value. Measured before/after on this host:
+`mulPublic` ~211 µs → ~167 µs, ECDSA verify ~341 µs → ~241 µs.
+
+## Backlog
+
+1. ~~`fast_core.fieldMul`/`fieldSq`~~ — **DONE (Fable core phase)**: `MULX/ADX`
+   product + the signed NIST word-shuffle reduction (HMV Alg. 2.29), validated
+   against a bignum `% p` oracle on 2M random products before the asm, then
+   pinned to the portable oracle by the live gated differential.
+2. ~~`group.combMulBaseFast`~~ — **DONE (Fable core phase)**: fixed-base comb
+   (comptime projective table, signed-digit, `blackBox`-guarded CT gather).
+3. ~~`group.mulCtWindowed`~~ — **DONE (Fable core phase)**: CT windowed
+   variable-base (w = 4 signed digits, runtime magnitude table, same CT gather).
+4. ~~wNAF `slide` acceleration for `mulPublic` / `mulDoubleBasePublic`~~ —
+   **DONE (owner-verify phase)**: interleaved width-5 wNAF (Straus–Shamir),
+   one shared doubling chain + an odd-multiple table per base. Vartime/public
+   only; byte-exact vs the plain ladder + std. Verify ~392 µs → ~241 µs
+   (~5.0× → ~3.0× nistz256).
+5. Addition-chain field inverse (the P-256 chain std's fiat-inverse encodes);
+   the Fermat square-and-multiply inverse is now a visible slice of sign time.
 6. Rewire the P-256 consumers (jwt ES256, ctap2pin, spake2plus, hpke/voprf/mls/jwe)
    from `std.crypto.ecc.P256` to p256.
-7. Side-channel review of the CT paths (inverse, comb/windowed gather).
+7. Side-channel review of the CT paths (inverse, comb/windowed gather). Note:
+   ReleaseFast disasm of both field asm blocks (branch-free, DIT-only) and both
+   scalarmul cores (masked gather at fixed offsets, public-index loops only) was
+   done in the core phase; the recoding/negation selects required `blackBox`
+   laundering — without it LLVM lowered them to a secret-dependent CMOV/branch.

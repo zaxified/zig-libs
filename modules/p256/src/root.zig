@@ -16,17 +16,18 @@
 //! nistz256 (the k256 secp256k1 arc hit ~2.5× libsecp256k1 with the same recipe).
 //! See `SPEC.md` for the dedup justification.
 //!
-//! ## Status: SCAFFOLD (portable oracle real; two Fable cores gated off)
+//! ## Status: cores IMPLEMENTED (both gates on; portable oracle remains)
 //!
 //! The PORTABLE path is **real, constant-time, and byte-exact vs
 //! `std.crypto.ecc.P256` + the RFC 6979 ECDSA-P256 vectors + std's ECDSA
-//! signer** — it is the correctness ORACLE and the non-amd64 fallback. Two
-//! irreducible Fable cores are gated OFF as `@panic` stubs
-//! (`gate.field_asm_implemented` / `gate.fast_scalarmul_implemented`): the amd64
-//! `MULX/ADX` field mul+square with the P-256 Solinas fold, and the fast
-//! constant-time scalar multiplies (fixed-base comb `k·G` + windowed
-//! variable-base). The core-vs-portable differentials in `oracle_test.zig` skip
-//! until a core lands. See `gate.zig`, `fast_core.zig`, `SPEC.md`.
+//! signer** — it is the correctness ORACLE and the non-amd64 fallback. Both
+//! irreducible Fable cores are live (`gate.field_asm_implemented` /
+//! `gate.fast_scalarmul_implemented`): the amd64 `MULX/ADX` field mul+square
+//! with the NIST word-shuffle reduction, and the fast constant-time scalar
+//! multiplies (fixed-base comb `k·G` + windowed variable-base, both with the
+//! `blackBox`-guarded masked table scan). The core-vs-portable differentials in
+//! `oracle_test.zig` are live and pin each core to the portable path + std.
+//! See `gate.zig`, `fast_core.zig`, `SPEC.md`.
 
 const std = @import("std");
 

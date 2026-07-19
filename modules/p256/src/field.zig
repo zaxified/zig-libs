@@ -12,10 +12,11 @@
 //! carry bit + one constant-time conditional subtract of `p`. The portable path
 //! ships that reduction written straightforwardly on wide (`u256`/`u512`)
 //! integers — it is the correctness ORACLE, byte-exact against
-//! `std.crypto.ecc.P256.Fe`. The irreducible `MULX/ADX` limb-level version of
-//! the SAME fold is the gated Fable core (`fast_core.fieldMul`/`fieldSq`), a
-//! panic stub in this scaffold; while the gate is off `mul`/`sq` dispatch to the
-//! portable reduction below on every target.
+//! `std.crypto.ecc.P256.Fe`. The irreducible `MULX/ADX` core
+//! (`fast_core.fieldMul`/`fieldSq`, IMPLEMENTED, gated by
+//! `gate.field_asm_implemented`) computes the same reduction via the NIST
+//! word-shuffle and is pinned to this oracle by the gated differential; on
+//! non-amd64 targets `mul`/`sq` dispatch to the portable reduction below.
 //!
 //! The API mirrors `std.crypto.ecc.P256.Fe` (same method names/semantics) so
 //! `group.zig` is a drop-in over this field and the oracle differential is a
@@ -40,8 +41,8 @@ pub const field_order: u256 = (1 << 256) - (1 << 224) + (1 << 192) + (1 << 96) -
 const m_fold: u256 = (1 << 224) - (1 << 192) - (1 << 96) + 1;
 
 /// True iff `mul`/`sq` route to the gated amd64 asm core (`fast_core`) rather
-/// than the portable Solinas reduction. In this scaffold the gate is off, so
-/// this is `false` on every target and dispatch always takes the portable path.
+/// than the portable Solinas reduction — i.e. on x86-64 with ADX+BMI2 now that
+/// the gate is on; portable everywhere else.
 pub const field_asm_active = fast_core.supported and gate.field_asm_implemented;
 
 // ── constant-time barrier ───────────────────────────────────────────────────
@@ -238,8 +239,7 @@ pub const Fe = struct {
     }
 
     /// `a·b mod p`. Dispatches to the gated amd64 core when active, else the
-    /// portable Solinas reduction. In this scaffold the gate is off, so the
-    /// portable path is always taken. The `@inComptime()` guard routes comptime
+    /// portable Solinas reduction. The `@inComptime()` guard routes comptime
     /// evaluation to the portable path (the asm core cannot execute in the
     /// comptime interpreter); at runtime that branch is comptime-dead.
     pub fn mul(a: Fe, b: Fe) Fe {

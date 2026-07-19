@@ -24,17 +24,23 @@ has P-256 — it is a *performance-specialized reimplementation* justified by th
 measured gap plus the collection's thesis that native Zig should be usable
 INSTEAD of linking a C crypto library. See `SPEC.md §Dedup`.
 
-## Status: SCAFFOLD (portable oracle real; two Fable cores gated off)
+## Status: cores IMPLEMENTED (both gates on) + vartime wNAF verify
 
 The **portable path is real, constant-time, and byte-exact against
 `std.crypto.ecc.P256` + the RFC 6979 ECDSA-P256 vectors + std's ECDSA signer** —
-it is the correctness oracle. Two irreducible cores are gated off as `@panic`
-stubs, the portable path standing in until a Fable agent fills them:
+it is the correctness oracle and the non-amd64 fallback. Both irreducible cores
+are now IMPLEMENTED and both gate flags are `true`, so the core-vs-portable
+differentials run for real (bit-exact vs the oracle + std); flipping a flag back
+to `false` restores the proven portable fallback:
 
-| Gate flag | Core | Portable fallback (the oracle it must match) |
+| Gate flag | Core (implemented) | Portable fallback (the oracle it matches bit-for-bit) |
 |---|---|---|
-| `gate.field_asm_implemented` | `fast_core.fieldMul` / `fast_core.fieldSq` — amd64 `MULX/ADX` field mul + square + P-256 Solinas fold | `field.mulPortable` / `field.sqPortable` (wide-int Solinas) |
-| `gate.fast_scalarmul_implemented` | `group.combMulBaseFast` (fixed-base comb `k·G`) + `group.mulCtWindowed` (CT windowed variable-base) | `group.mulDoubleAddCt` / `basePoint.mulDoubleAddCt` |
+| `gate.field_asm_implemented` | `fast_core.fieldMul` / `fast_core.fieldSq` — amd64 `MULX/ADX` product + the signed **NIST word-shuffle** Solinas reduction (HMV Alg. 2.29) | `field.mulPortable` / `field.sqPortable` (wide-int Solinas) |
+| `gate.fast_scalarmul_implemented` | `group.combMulBaseFast` (fixed-base comb `k·G`) + `group.mulCtWindowed` (CT windowed variable-base) — `blackBox`-guarded masked CT gather | `group.mulDoubleAddCt` / `basePoint.mulDoubleAddCt` |
+
+The PUBLIC verify path (`mulPublic` / `mulDoubleBasePublic`) additionally uses an
+**interleaved wNAF (Straus–Shamir)** double-scalar mult (vartime, public inputs
+only) — byte-exact vs the plain ladder + std, ~5.0× → ~3.0× nistz256 on verify.
 
 ## Usage
 
@@ -53,7 +59,7 @@ const inv = a.invert();
 // Curve group (a = −3).
 const P = p256.P256.basePoint;
 const Q = try P.mul(scalar_be, .big);       // constant-time (secret scalar)
-const R = try Q.mulPublic(scalar_be, .big); // variable-time (public scalar)
+const R = try Q.mulPublic(scalar_be, .big); // variable-time wNAF (public scalar)
 const xy = R.affineCoordinates();
 
 // ECDSA-P256/SHA-256 (the end-to-end anchor).
@@ -74,15 +80,17 @@ zig build test-p256 -Doptimize=ReleaseFast --summary all
 P256_BENCH=1 zig build test-p256 -Doptimize=ReleaseFast # opt-in ns/op baseline
 ```
 
-19 pass / 4 skip in both Debug and ReleaseFast (the skips are the 3 gated
-core-vs-portable differentials — they light up when a core lands, a skip is NOT a
-green light — plus the opt-in bench). The suite includes the field/group
-differentials vs `std.crypto.ecc.P256` (thousands of random inputs, bit-exact via
-`toBytes`), the reduction fold-boundary edge sweep, the RFC 6979 ECDSA-P256/SHA-256
-vectors (verified by both p256 and std), an ECDSA differential against std's
-signer (both directions: p256 verifies std's signatures, and std verifies
-p256-produced ones), and a broken-Solinas-constant positive control the harness
-flags RED.
+23 pass / 1 skip in both Debug and ReleaseFast (the single skip is the opt-in
+bench). On amd64+ADX+BMI2 the three gated core-vs-portable differentials run for
+real (field asm == portable, comb/windowed == CT ladder + std); on a non-amd64
+host the field differential skips — a skip there means "core not present on this
+build", never a green light. The suite includes the field/group differentials vs
+`std.crypto.ecc.P256` (thousands of random inputs, bit-exact via `toBytes`), the
+reduction fold-boundary edge sweep, the RFC 6979 ECDSA-P256/SHA-256 vectors
+(verified by both p256 and std), an ECDSA differential against std's signer (both
+directions: p256 verifies std's signatures, and std verifies p256-produced ones),
+and two positive controls — a broken-Solinas-constant reduction and a
+corrupted-comb-table gather — the harness flags RED.
 
 Provenance: clean-room from the NIST P-256 domain parameters; OpenSSL's nistz256
 studied as the technique reference (the P-256 Solinas reduction, `MULX/ADX`
