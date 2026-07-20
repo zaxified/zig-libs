@@ -1297,6 +1297,25 @@ test "NodeId: string/guid/byte_string forms round-trip" {
     }
 }
 
+test "NodeId: a hostile oversize string-identifier length is rejected, not OOM/panic (audit F3)" {
+    const testing = std.testing;
+    var buf: [64]u8 = undefined;
+    var w = testWriter(&buf);
+    var e = Encoder.init(&w);
+    try e.encodeNodeId(.{ .string = .{ .namespace = 1, .id = "hello" } });
+    const wire = w.buffered();
+    // Corrupt the string-identifier length (i32 at offset 3: 1-byte encoding
+    // form + 2-byte namespace) to i32-max. decodeString is bounded by
+    // reader.take, so a huge claim fails on EndOfStream rather than allocating
+    // ~2 GiB or hanging.
+    var mut: [64]u8 = undefined;
+    @memcpy(mut[0..wire.len], wire);
+    std.mem.writeInt(i32, mut[3..7], std.math.maxInt(i32), .little);
+    var r: std.Io.Reader = .fixed(mut[0..wire.len]);
+    var d = Decoder.init(&r, testing.allocator);
+    try testing.expectError(error.EndOfStream, d.decodeNodeId());
+}
+
 test "ExpandedNodeId: flags + round-trip" {
     const testing = std.testing;
     var buf: [64]u8 = undefined;
