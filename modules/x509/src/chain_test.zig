@@ -191,6 +191,35 @@ fn generalNamesWithDns(comptime name: []const u8) [4 + name.len]u8 {
     return buf;
 }
 
+/// Single-entry `GeneralSubtree`/`GeneralNames` wrapping one rfc822Name
+/// (`[1] IMPLICIT IA5String`, tag 0x81) — the coinciding shape both a subtree
+/// base and a SAN entry take for this type.
+fn rfc822Blob(comptime name: []const u8) [4 + name.len]u8 {
+    var buf: [4 + name.len]u8 = undefined;
+    buf[0] = 0x30;
+    buf[1] = 2 + name.len;
+    buf[2] = 0x81;
+    buf[3] = name.len;
+    for (name, 0..) |c, i| buf[4 + i] = c;
+    return buf;
+}
+
+test "checkNameConstraints: an excluded rfc822Name constraint fails closed (audit F3)" {
+    // rfc822Name/URI matching is not implemented; an EXCLUDED constraint of such
+    // a type must reject any SAN of that type rather than silently pass (the old
+    // fail-open let an excluded email/URI SAN through).
+    const excluded_tree = rfc822Blob("evil.example.com");
+    const excluded = [_][]const u8{&excluded_tree};
+    const permitted = [_][]const u8{};
+
+    const san = rfc822Blob("user@evil.example.com");
+    try testing.expectError(error.NameConstraintViolated, chain_mod.checkNameConstraints(&permitted, &excluded, "dn", &san));
+    // Even an rfc822 SAN not lexically under the excluded base is rejected — we
+    // cannot evaluate the match, so we fail closed.
+    const san2 = rfc822Blob("user@other.com");
+    try testing.expectError(error.NameConstraintViolated, chain_mod.checkNameConstraints(&permitted, &excluded, "dn", &san2));
+}
+
 test "checkNameConstraints: dNSName label-suffix match, default-deny once a permitted set exists" {
     const subtree = dnsSubtree("example.org");
     const permitted = [_][]const u8{&subtree};

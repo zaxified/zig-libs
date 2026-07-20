@@ -676,6 +676,11 @@ fn checkOneName(
     var it_ex: SubtreeSetIterator = .init(excluded);
     while (try it_ex.next()) |entry| {
         if (entry.tag != tag) continue;
+        // An excluded constraint whose type we cannot match (rfc822Name/URI/…)
+        // means we cannot prove `value` is OUTSIDE the excluded subtree — fail
+        // closed rather than let a possibly-excluded name through (RFC 5280
+        // §6.1.4). This mirrors the permitted side's default-deny for its types.
+        if (!constraintTypeSupported(tag)) return error.NameConstraintViolated;
         if (nameMatchesBase(tag, value, entry.value)) return error.NameConstraintViolated;
     }
 
@@ -719,6 +724,17 @@ fn nameMatchesBase(tag: Certificate.GeneralNameTag, name: []const u8, base: []co
         .dNSName => dnsNameMatches(name, base),
         .directoryName => dnMatchesPrefix(name, base),
         .iPAddress => ipMatchesSubnet(name, base),
+        else => false,
+    };
+}
+
+/// Whether `nameMatchesBase` can actually evaluate a constraint of this type.
+/// For any other type (rfc822Name, uniformResourceIdentifier, otherName, …) a
+/// match cannot be computed, so an *excluded* constraint of that type must fail
+/// closed rather than silently pass (see `checkOneName`).
+fn constraintTypeSupported(tag: Certificate.GeneralNameTag) bool {
+    return switch (tag) {
+        .dNSName, .directoryName, .iPAddress => true,
         else => false,
     };
 }
