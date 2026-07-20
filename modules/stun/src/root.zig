@@ -841,3 +841,25 @@ test "query() type-checks (skipped — needs a live STUN server and Io)" {
     _ = &query;
     return error.SkipZigTest;
 }
+
+test "fuzz: decode + every accessor never crash on arbitrary bytes" {
+    try testing.fuzz({}, fuzzDecode, .{});
+}
+
+fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
+    var packet: [1024]u8 = undefined;
+    smith.bytes(&packet);
+    const len: usize = smith.valueRangeAtMost(u16, 0, packet.len);
+    const msg = decode(packet[0..len]) catch return;
+    // A successfully-decoded (but otherwise arbitrary) message must survive every
+    // accessor + the full attribute walk + both verifiers with no panic/OOB —
+    // decode borrows the input (no allocation), so there is nothing to free.
+    _ = msg.xorMappedAddress() catch {};
+    _ = msg.plainMappedAddress() catch {};
+    _ = msg.mappedAddress() catch {};
+    _ = msg.errorCode() catch {};
+    _ = msg.verifyFingerprint();
+    _ = msg.verifyMessageIntegrity("key");
+    var it = msg.attributes();
+    while (it.next()) |_| {}
+}
