@@ -11,13 +11,12 @@
 //! This module is the general framework: any pattern, any of the spec's
 //! named DH/AEAD/hash choices.
 //!
-//! **Status: compiling scaffold only, no crypto implemented.** Every
-//! `CipherState`/`SymmetricState`/`HandshakeState` method (spec §5) is a
-//! `@panic("TODO(agent): ...")` stub — no DH exchange, no AEAD seal/open,
-//! no HKDF/HMAC ratchet is wired up yet. The handshake-pattern *data*
-//! (`NN`/`NK`/`XX`/`IK` token sequences, spec §7/§9) is real, since
-//! patterns are pure specification text, not crypto. See `SPEC.md` for the
-//! fill-in plan and where the official test vectors live.
+//! **Status: implemented.** The `CipherState`/`SymmetricState`/`HandshakeState`
+//! methods (spec §5) are wired up over the comptime-parameterized `Suite`: DH
+//! exchange, AEAD seal/open, and the HKDF/HMAC ratchet all run. The
+//! handshake-pattern *data* (`NN`/`NK`/`XX`/`IK` token sequences, spec §7/§9)
+//! is real as well (patterns are pure specification text, not crypto). See
+//! `SPEC.md` and the official test vectors it references.
 //!
 //! Provenance: clean-room from the Noise Protocol Framework spec rev 34
 //! (noiseprotocol.org) — a public spec, not copyrightable expression, so no

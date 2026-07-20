@@ -8,14 +8,12 @@
 //! (any BIP340 verifier, including `bip340.verify` itself, accepts it with
 //! no idea an adaptor scheme produced it).
 //!
-//! **Status: scaffold — wire codecs (`AdaptorPoint`, `PreSignature`) are
-//! REAL and implemented; the four crypto cores (`preSign`, `preVerify`,
-//! `adapt`, `extract`) are `@panic("TODO(fable): ...")` stubs with their
-//! FINAL signatures already fixed.** Every stub's doc comment spells out
-//! the exact construction (including the parity/`needs_negation` handling
-//! that is this scheme's single subtlest correctness property — see
-//! `SPEC.md`'s threat model) so a follow-up crypto pass has nothing left
-//! to design, only to transcribe. `kat_vectors.zig` carries six SELF-
+//! **Status: complete — the wire codecs (`AdaptorPoint`, `PreSignature`) and
+//! all four crypto cores (`preSign`, `preVerify`, `adapt`, `extract`) are
+//! implemented and KAT-validated.** Each core's doc comment spells out the
+//! exact construction, including the parity/`needs_negation` handling that is
+//! this scheme's single subtlest correctness property — see `SPEC.md`'s threat
+//! model. `kat_vectors.zig` carries six SELF-
 //! AUTHORED, byte-exact reference vectors (no official BIP/spec exists for
 //! Schnorr adaptor signatures — computed independently in Python from this
 //! exact construction, cross-checked against `bip340`'s own verify
@@ -180,7 +178,7 @@ pub const PreSignature = struct {
     }
 };
 
-// ── crypto cores (TODO(fable): stubbed — see each doc comment) ─────────
+// ── crypto cores (implemented + KAT-validated — see each doc comment) ──
 
 pub const PreSignError = error{
     InvalidSecretKey,
