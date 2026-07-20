@@ -812,6 +812,9 @@ pub fn wrapSessionKeys(
     if (control_key.len != monitoring_key.len) return error.KeyLength;
     if (control_key.len != 16 and control_key.len != 32) return error.KeyLength;
     var plain: [64]u8 = undefined;
+    // `plain` holds both session keys in cleartext; wipe the stack scratch on
+    // every exit so the secrets do not linger after wrapping.
+    defer std.crypto.secureZero(u8, &plain);
     const klen = control_key.len;
     @memcpy(plain[0..klen], control_key);
     @memcpy(plain[klen .. 2 * klen], monitoring_key);
@@ -828,7 +831,9 @@ pub const UnwrappedSessionKeys = struct {
 
 /// Unwraps g120v6 `wrapped_key_data` back into the two direction keys, writing
 /// them into `out` and returning slices into it. `key_len` is the per-direction
-/// key length used at wrap time (16 or 32).
+/// key length used at wrap time (16 or 32). The recovered keys live in the
+/// caller-owned `out`; the caller MUST `secureZero` it once the session keys are
+/// installed (this function cannot, as it hands those bytes back).
 pub fn unwrapSessionKeys(
     update_key: []const u8,
     wrapped: []const u8,
