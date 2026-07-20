@@ -392,6 +392,15 @@ pub const SecretKey = struct {
     /// Precomputed montint constants for `q` (CRT half `c^dQ mod q`).
     q_mont: MontParams,
 
+    /// Securely wipe all key material. Every field is fixed-size plain data
+    /// (ff `Fe`/`Modulus` limbs + `MontParams` arrays, no heap), so zeroing the
+    /// struct's bytes erases the secret exponents/primes (`d,p,q,dp,dq,qinv`
+    /// and the p/q Montgomery constants). Call when the key is no longer needed;
+    /// the struct is left zeroed and must not be reused.
+    pub fn deinit(sk: *SecretKey) void {
+        std.crypto.secureZero(u8, std.mem.asBytes(sk));
+    }
+
     pub const FromPrimesError = error{InvalidPrivateKey};
 
     /// Build a `SecretKey` (deriving `n`, `d`, and the CRT params) from the
@@ -2368,6 +2377,18 @@ test "fromPrimes rejects invalid inputs" {
     try testing.expectError(error.InvalidPrivateKey, SecretKey.fromPrimes(&.{61}, &.{53}, &.{13}));
     // even "prime"
     try testing.expectError(error.InvalidPrivateKey, SecretKey.fromPrimes(&.{62}, &.{53}, &.{17}));
+}
+
+test "SecretKey.deinit zeroes all key material (audit F4)" {
+    var sk = try SecretKey.fromPrimes(&.{61}, &.{53}, &.{17});
+    const bytes = std.mem.asBytes(&sk);
+    var any_nonzero = false;
+    for (bytes) |b| {
+        if (b != 0) any_nonzero = true;
+    }
+    try testing.expect(any_nonzero); // key material present before wipe
+    sk.deinit();
+    for (bytes) |b| try testing.expectEqual(@as(u8, 0), b); // fully zeroed after
 }
 
 test "rsaep/rsadp/rsadpCrt textbook KAT and round-trip" {
