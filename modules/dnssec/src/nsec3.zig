@@ -160,7 +160,16 @@ const cname_type: u16 = 5;
 /// (e.g. `sub.www.example`); `salt`/`iterations` are the zone's NSEC3
 /// parameters (from NSEC3PARAM). Only records whose own hash-algorithm/salt/
 /// iterations match those parameters are considered.
+/// RFC 9276 §3.2 upper bound on NSEC3 iterations: each candidate name costs
+/// `iterations` extra SHA-1s, so a hostile high-iteration zone is a CPU-
+/// amplification DoS lever. Above this, a validating resolver SHOULD treat the
+/// response as insecure rather than spend the work.
+pub const max_nsec3_iterations: u16 = 100;
+
 pub fn proveDenial(qname: []const u8, qtype: u16, nsec3_set: Nsec3Set, salt: []const u8, iterations: u16) DenialResult {
+    // RFC 9276 §3.2: refuse to do the amplified hashing work for an over-limit
+    // iteration count — downgrade to provably-insecure before any hashName call.
+    if (iterations > max_nsec3_iterations) return .insecure;
     const set = nsec3_set.records;
 
     // (1) Direct match on QNAME (§8.5): the name provably exists, so the only
@@ -398,4 +407,13 @@ test "regression: over-long NSEC3 owner-hash label does not overflow (was OOB st
     // And the direct decode path rejects the over-long label instead of writing OOB.
     var out: [sha1_digest_len]u8 = undefined;
     try testing.expect(decodeOwnerHash(evil_label, &out) == null);
+}
+
+test "proveDenial: over-limit NSEC3 iterations downgrade to insecure (RFC 9276, audit F3)" {
+    const empty: Nsec3Set = .{ .records = &[_]Nsec3Record{} };
+    // Above the cap: refuse the amplified hashing, return insecure before any work.
+    try testing.expectEqual(DenialResult.insecure, proveDenial("www.example", 1, empty, "", max_nsec3_iterations + 1));
+    // At the cap it still runs the proof (empty set can't prove denial -> bogus),
+    // confirming 100 is accepted and 101 is the first rejected value.
+    try testing.expectEqual(DenialResult.bogus, proveDenial("www.example", 1, empty, "", max_nsec3_iterations));
 }
