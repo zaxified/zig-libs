@@ -417,30 +417,41 @@ pub const Registry = struct {
     /// Prometheus does not require sorted input). Holds the registry lock
     /// for the duration (see module doc).
     pub fn writeText(r: *Registry, w: *std.Io.Writer) std.Io.Writer.Error!void {
-        lockSpin(&r.lock);
-        defer r.lock.unlock();
-        for (r.families.items) |fam| {
-            try w.print("# HELP {s} ", .{fam.name});
-            try writeEscaped(w, fam.help, .help);
-            try w.print("\n# TYPE {s} {t}\n", .{ fam.name, fam.kind });
-            for (fam.children.items) |c| {
-                switch (c.data) {
-                    .counter => |*ctr| {
-                        try w.writeAll(fam.name);
-                        try writeLabels(w, fam.label_names, c.label_values, null);
-                        try w.print(" {d}\n", .{ctr.value()});
-                    },
-                    .gauge => |*g| {
-                        try w.writeAll(fam.name);
-                        try writeLabels(w, fam.label_names, c.label_values, null);
-                        try w.writeByte(' ');
-                        try writeFloat(w, g.value());
-                        try w.writeByte('\n');
-                    },
-                    .histogram => |*h| try writeHistogram(w, fam, c, h),
+        // Format the whole exposition into memory while holding the lock (no
+        // socket I/O), then flush to the caller's writer OUTSIDE the lock, so a
+        // slow/stalling scraper cannot stall first-touch series registration on
+        // request threads (which contend for the same lock). An allocation
+        // failure surfaces through the Allocating writer as `WriteFailed`.
+        var buf: std.Io.Writer.Allocating = .init(r.arena.child_allocator);
+        defer buf.deinit();
+        const bw = &buf.writer;
+        {
+            lockSpin(&r.lock);
+            defer r.lock.unlock();
+            for (r.families.items) |fam| {
+                try bw.print("# HELP {s} ", .{fam.name});
+                try writeEscaped(bw, fam.help, .help);
+                try bw.print("\n# TYPE {s} {t}\n", .{ fam.name, fam.kind });
+                for (fam.children.items) |c| {
+                    switch (c.data) {
+                        .counter => |*ctr| {
+                            try bw.writeAll(fam.name);
+                            try writeLabels(bw, fam.label_names, c.label_values, null);
+                            try bw.print(" {d}\n", .{ctr.value()});
+                        },
+                        .gauge => |*g| {
+                            try bw.writeAll(fam.name);
+                            try writeLabels(bw, fam.label_names, c.label_values, null);
+                            try bw.writeByte(' ');
+                            try writeFloat(bw, g.value());
+                            try bw.writeByte('\n');
+                        },
+                        .histogram => |*h| try writeHistogram(bw, fam, c, h),
+                    }
                 }
             }
         }
+        try w.writeAll(buf.written());
     }
 
     /// Serve the exposition into a `ResponseWriter`: 200 + the Prometheus
