@@ -79,17 +79,16 @@ pub const PublicKey = struct {
         return G2.toBytesCompressed(self.point);
     }
 
-    /// REAL — delegates to `G2.fromBytesCompressed`. Does NOT
-    /// subgroup-check (same non-subgroup-checking contract every
-    /// `bls12_381` deserializer carries — see that module's `SPEC.md`);
-    /// a caller crossing a trust boundary MUST additionally verify
-    /// `!point.infinity` and subgroup membership before trusting the
-    /// decoded key, exactly as `bls12_381.bls_sig.keyValidate` does for
-    /// its own (differently-shaped) public keys. `sign`/`verify`/
-    /// `proofGen`/`proofVerify` (`bbs.zig`) inherit this obligation —
-    /// see their doc comments.
+    /// REAL — delegates to `G2.fromBytesCompressed`, then runs the draft's
+    /// `KeyValidate` (§3.4.2): rejects the identity and any point outside the
+    /// prime-order subgroup, so the pairing/challenge checks in `verify`/
+    /// `proofVerify` only ever operate on the domain their soundness proof
+    /// assumes (a cofactor-tainted key can otherwise sit outside that model).
     pub fn fromBytes(bytes: [encoded_bytes]u8) !PublicKey {
-        return .{ .point = try G2.fromBytesCompressed(bytes) };
+        const point = try G2.fromBytesCompressed(bytes);
+        if (point.infinity) return error.InvalidPublicKey;
+        if (!G2.Jacobian.fromAffine(point).subgroupCheck()) return error.InvalidPublicKey;
+        return .{ .point = point };
     }
 };
 

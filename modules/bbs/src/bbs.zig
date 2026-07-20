@@ -96,14 +96,13 @@ pub const Signature = struct {
     }
 
     /// `octets_to_signature` (draft §4.2.4.3): parses `A` (rejecting the
-    /// identity) and `e` (rejecting `0` or `>= r`). Does NOT
-    /// subgroup-check `A` — same non-subgroup-checking deserialization
-    /// contract every `bls12_381` point codec carries (see
-    /// `keys.PublicKey.fromBytes`'s doc comment); `verify`/`proofGen`
-    /// entry points inherit this obligation. REAL.
+    /// identity AND any non-prime-order-subgroup point) and `e` (rejecting
+    /// `0` or `>= r`), so `verify`/`proofGen` operate only on subgroup inputs.
+    /// REAL.
     pub fn fromBytes(bytes: [encoded_bytes]u8) BbsError!Signature {
         const a = G1.fromBytesCompressed(bytes[0..G1.compressed_bytes].*) catch return error.InvalidSignatureEncoding;
         if (a.infinity) return error.InvalidSignatureEncoding;
+        if (!G1.Jacobian.fromAffine(a).subgroupCheck()) return error.InvalidSignatureEncoding;
         const e = Fr.fromBytes(bytes[G1.compressed_bytes..].*) catch return error.InvalidSignatureEncoding;
         if (e.isZero()) return error.InvalidSignatureEncoding;
         return .{ .a = a, .e = e };
@@ -180,9 +179,11 @@ pub const Proof = struct {
         var off: usize = 0;
         const abar = G1.fromBytesCompressed(bytes[off..][0..G1.compressed_bytes].*) catch return error.InvalidProofEncoding;
         if (abar.infinity) return error.InvalidProofEncoding;
+        if (!G1.Jacobian.fromAffine(abar).subgroupCheck()) return error.InvalidProofEncoding;
         off += G1.compressed_bytes;
         const bbar = G1.fromBytesCompressed(bytes[off..][0..G1.compressed_bytes].*) catch return error.InvalidProofEncoding;
         if (bbar.infinity) return error.InvalidProofEncoding;
+        if (!G1.Jacobian.fromAffine(bbar).subgroupCheck()) return error.InvalidProofEncoding;
         off += G1.compressed_bytes;
 
         const r2_hat = try fromBytesNonzeroScalar(bytes[off..][0..Fr.encoded_bytes].*);
