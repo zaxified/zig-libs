@@ -8,12 +8,13 @@ WireGuard's fixed `Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s` instantiation and
 already implement its KDF. This module has **zero dependency** on
 `wireguard` (or any other sibling module).
 
-**Status: compiling scaffold, no crypto implemented.** Every method on
-`CipherState` / `SymmetricState` / `HandshakeState` (spec §5) is a
-`@panic("TODO(agent): ...")` stub reserving the API surface; the
-handshake-*pattern* data (§7/§9 token sequences for `NN`/`NK`/`XX`/`IK`) is
-real, since patterns are pure specification text, not crypto. See
-`SPEC.md` for the fill-in plan.
+**Status: implemented.** The `CipherState` / `SymmetricState` /
+`HandshakeState` methods (spec §5) run for real over the
+comptime-parameterized `Suite` — DH exchange, AEAD seal/open, and the
+HKDF/HMAC ratchet — and the handshake-pattern data (§7/§9 token sequences
+for `NN`/`NK`/`XX`/`IK`) is real as well. Exercised end-to-end by the
+sibling `bolt8` module, whose BOLT#8 appendix vectors are byte-exact over
+this framework. See `SPEC.md` for the verification detail.
 
 - **Model after:** Noise Protocol Framework rev 34 (noiseprotocol.org);
   design ref cacophony (Haskell) / noise-c / snow (Rust) — shape only, no
@@ -43,8 +44,9 @@ const S = noise.Suite(
 const S2 = noise.DefaultSuite;
 
 var hs: S.HandshakeState = .{};
-// hs.initialize(...) / hs.writeMessage(...) / hs.readMessage(...) all
-// @panic("TODO(agent): ...") for now — the crypto is not implemented yet.
+// hs.initialize(...) then hs.writeMessage(...) / hs.readMessage(...)
+// drive the handshake; SymmetricState.split() then yields the two
+// transport CipherStates.
 ```
 
 ## Verify

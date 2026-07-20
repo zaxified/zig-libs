@@ -201,4 +201,58 @@ pub fn build(b: *std.Build) void {
         const one = b.step(b.fmt("test-{s}", .{m.name}), b.fmt("Test the {s} module", .{m.name}));
         one.dependOn(&run.step);
     }
+
+    // Catalog consistency gate: `zig build check-catalog` (CI runs it).
+    // Verifies module_list ↔ modules/ ↔ the README catalog table agree, so a
+    // module can't ship without a catalog row (6 rows had drifted before this
+    // existed) and the README's module count can't go stale.
+    const check = b.step("check-catalog", "Verify module_list matches modules/ and the README catalog");
+    const check_inner = b.allocator.create(std.Build.Step) catch @panic("OOM");
+    check_inner.* = std.Build.Step.init(.{
+        .id = .custom,
+        .name = "check-catalog",
+        .owner = b,
+        .makeFn = checkCatalog,
+    });
+    check.dependOn(check_inner);
+}
+
+fn checkCatalog(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
+    _ = options;
+    const b = step.owner;
+    const io = b.graph.io;
+    const readme = try b.build_root.handle.readFileAlloc(io, "README.md", b.allocator, .limited(4 * 1024 * 1024));
+
+    var failed = false;
+    for (module_list) |m| {
+        b.build_root.handle.access(io, b.fmt("modules/{s}/src/root.zig", .{m.name}), .{}) catch {
+            std.log.err("module_list entry '{s}' has no modules/{s}/src/root.zig", .{ m.name, m.name });
+            failed = true;
+        };
+        if (std.mem.indexOf(u8, readme, b.fmt("| `{s}` |", .{m.name})) == null) {
+            std.log.err("module '{s}' has no README catalog row (`| \\`{s}\\` |`)", .{ m.name, m.name });
+            failed = true;
+        }
+    }
+
+    var dir = try b.build_root.handle.openDir(io, "modules", .{ .iterate = true });
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (try it.next(io)) |e| {
+        if (e.kind != .directory or std.mem.eql(u8, e.name, "_template")) continue;
+        const known = for (module_list) |m| {
+            if (std.mem.eql(u8, m.name, e.name)) break true;
+        } else false;
+        if (!known) {
+            std.log.err("modules/{s}/ exists but is not in build.zig's module_list", .{e.name});
+            failed = true;
+        }
+    }
+
+    if (std.mem.indexOf(u8, readme, b.fmt("{d} modules", .{module_list.len})) == null) {
+        std.log.err("README status line does not say \"{d} modules\"", .{module_list.len});
+        failed = true;
+    }
+
+    if (failed) return step.fail("catalog drift — see errors above", .{});
 }

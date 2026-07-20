@@ -22,7 +22,7 @@ pub const meta = .{
     .role = .client,
     .concurrency = .reentrant, // no shared state; Connection/Encoder/Decoder are caller-owned
     .model_after = "OPC 10000-6 (OPC UA Binary + opc.tcp); structure ref open62541 (MPL-2.0) / node-opcua (MIT) — behavioral only, no source copied",
-    .deps = .{},
+    .deps = .{"rsa"}, // Basic256Sha256 secure-channel crypto (security.zig)
 };
 
 /// The built-in type codec (OPC 10000-6 §5.2): `Encoder`/`Decoder` over a

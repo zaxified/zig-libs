@@ -18,6 +18,8 @@ jobs:
           version: 0.16.0
       - name: Format check
         run: zig fmt --check build.zig build.zig.zon modules
+      - name: Catalog consistency
+        run: zig build check-catalog
       - name: Build & test (Debug)
         run: zig build test
       - name: Build & test (ReleaseFast)

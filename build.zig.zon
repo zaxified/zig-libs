@@ -8,6 +8,7 @@
         "build.zig.zon",
         "modules",
         "README.md",
+        "CHANGELOG.md",
         "CONVENTIONS.md",
     },
     .dependencies = .{},

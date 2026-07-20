@@ -154,3 +154,37 @@ reference, not a re-explanation of everything the README already covers.
   server when the network is available, plus offline unit tests on parsing.
 - No shared `testkit` harness exists yet — it was scoped and **deferred** (see the Roadmap
   section of README.md); each module hand-rolls its own wire-test/fake-clock helpers for now.
+
+## 8. Versioning, releases & spin-offs
+
+- **One semver for the whole collection.** A release = a git tag (`vX.Y.Z`) on `main` with
+  CI green. Pre-1.0 semantics: a minor bump may break any module's API; a patch bump is
+  fixes-only. There are no per-module version numbers.
+- **CHANGELOG.md per release, grouped by module.** Every release tag gets a section listing
+  added modules and, per existing module, behavior/API changes — breaking changes flagged
+  **BREAKING**. Routine internal refactors need no entry.
+- **Maturity = explicit caveats, not tier labels.** Every module meets the same bar (§6/§7:
+  tests green in Debug + ReleaseFast, oracle/KAT verification where one exists). What varies
+  is *scope*: anything unfinished or unverified is stated as an explicit caveat in the
+  module's README-catalog row and SPEC (e.g. dnp3's "Secure Authentication scaffolded only",
+  ebpf's "real-kernel verifier acceptance unverified"). A per-module `stability` tier tag
+  (stable/beta/experimental) was considered and rejected: coarse tiers hide exactly the
+  detail the caveat lines carry, and would rot.
+- **Catalog consistency is enforced**: `zig build check-catalog` (run by CI) fails when
+  `build.zig`'s `module_list`, the `modules/` directory, and the README catalog table
+  disagree, or when the README's module count goes stale.
+- **Spin-off policy — when a module leaves the monorepo: by default, never.** The
+  collection's dense sibling-dependency graph is version-skew-free only because everything
+  builds from one tree (Zig pins dependencies by URL+hash; two repos pinning different
+  hashes of a shared dep hand consumers two type-incompatible copies of it). Extract a
+  module into its own repository only when at least one of:
+  1. it has real external traction — consumers/issues asking for standalone releases;
+  2. it needs a C dependency or a different build model (which would break §2 here); or
+  3. it needs a release cadence the collection cannot follow.
+  Extraction = `git filter-repo` preserving the module's history + a deprecation pointer
+  left in `modules/<name>/README.md` for one release cycle.
+- **Download-size escape valve (documented, deliberately not built).** If whole-repo fetch
+  size ever becomes a real consumer complaint, attach per-module tarballs (module +
+  transitive sibling deps + a minimal `build.zig`) to GitHub releases — `zig fetch`
+  accepts any tarball URL. That is the answer to "the repo is too big to fetch";
+  splitting the repository is not.

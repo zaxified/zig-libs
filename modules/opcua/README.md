@@ -1,16 +1,16 @@
 # opcua
 
 OPC-UA (IEC 62541 / OPC 10000) **binary client** — the industrial-automation
-data-access protocol. Scope: `opc.tcp` transport, `SecurityPolicy#None` only
-(no signing/encryption in this module — see "Non-goals" below).
+data-access protocol: the OPC UA Binary codec (`encoding`, OPC 10000-6 §5.2),
+the opc.tcp transport framing (`transport`, OPC 10000-6 §7), the secure
+channel at `SecurityPolicy#None` or `Basic256Sha256` Sign/SignAndEncrypt
+(`security`, layered on the sibling `rsa` module), sessions, and the
+Read/Write/Browse/Call + subscription services.
 
-This is F1 "core", currently a **pre-scaffold skeleton**: the built-in type
-codec (`encoding`, OPC 10000-6 §5.2) and the opc.tcp transport framing
-(`transport`, OPC 10000-6 §7) are real types with every codec/I-O body
-stubbed `@panic("TODO(agent): ...")`. The service layer on top —
-OpenSecureChannel/CloseSecureChannel, CreateSession/ActivateSession/
-CloseSession, and Read/Write/Browse/Call — is reserved in `root.zig` as
-one-line stubs for a later implementing agent to fill in.
+**Status: implemented** — codec, transport, secure channel (incl. the
+Basic256Sha256 policy), session lifecycle, attribute/method services and
+subscriptions (CreateSubscription / MonitoredItems / Publish) are real; each
+layer was live-validated against an open62541 server as it was built.
 
 ```zig
 const opcua = @import("opcua");
@@ -20,14 +20,15 @@ const opcua = @import("opcua");
 // over a byte buffer for offline tests.
 var w: std.Io.Writer = .fixed(&out_buf);
 var enc = opcua.encoding.Encoder.init(&w);
-// enc.encodeString("hello"); // currently @panics — not yet implemented
+try enc.encodeString("hello");
 
 var conn = opcua.transport.Connection.init(&reader, &writer);
-// conn.hello(.{ .protocol_version = 0, ..., .endpoint_url = "opc.tcp://host:4840" });
+try conn.hello(.{ .protocol_version = 0, .endpoint_url = "opc.tcp://host:4840" });
 ```
 
 - **Role:** client. **Platform:** any (pure codec + a caller-supplied stream;
-  no socket of its own). **Deps:** none (std only). **Concurrency:**
+  no socket of its own). **Deps:** `rsa` (Basic256Sha256 secure-channel
+  crypto in `security.zig`). **Concurrency:**
   reentrant — `Connection`/`Encoder`/`Decoder` are caller-owned, no shared
   state.
 
@@ -39,7 +40,7 @@ node-opcua (MIT) — behavioral/API-shape only, no source copied. See `NOTICE`.
 
 `Encoder`/`Decoder` wrap a `std.Io.Writer`/`std.Io.Reader` (§5.2.1 — every
 integer/float is little-endian, unlike this repo's `snmp`/`coap` modules).
-Real types, stubbed codec methods:
+Types + codec:
 
 - Scalars: Boolean, SByte/Byte, Int16/UInt16/Int32/UInt32/Int64/UInt64,
   Float/Double, `DateTime` (`i64`, 100ns ticks since 1601-01-01), `StatusCode`
@@ -53,8 +54,8 @@ Real types, stubbed codec methods:
   at different compact sizes. `ExpandedNodeId` adds the optional
   namespace-URI/server-index.
 - `QualifiedName`, `LocalizedText`, `ExtensionObject` (type-tagged opaque
-  body), `Variant` (a real tagged union over `VariantScalar`, no array
-  support yet — see the TODO in `encoding.zig`), `DataValue`,
+  body), `Variant` (a real tagged union — `VariantScalar` scalars plus
+  arrays of built-in types), `DataValue`,
   `DiagnosticInfo` (recursive via `?*DiagnosticInfo`).
 
 ## opc.tcp transport (`opcua.transport`)
@@ -71,28 +72,18 @@ Transport-agnostic: `Connection` takes an already-connected
 - `Connection.hello`/`.sendChunk`/`.recvChunk`, and the `connect(reader,
   writer, endpoint_url)` convenience wrapper.
 
-## Reserved for later parts (`root.zig`)
+## Service layer (`root.zig`)
 
-`SecureChannel` (OpenSecureChannel/CloseSecureChannel, F1-b),
-`Session` (CreateSession/ActivateSession/CloseSession, F1-c), and the service
-functions `read`/`write`/`browse`/`call` (F1-d) are declared with placeholder
-signatures and one-line `@panic` bodies — not yet implemented.
-
-## Non-goals
-
-**No crypto in this module.** `SecurityMode=None` is this module's entire
-scope; `SecurityPolicy#Basic256Sha256`-class signing/encryption for the
-secure channel is a separate later module (F9), layered on the `rsa` module
-already in this repo.
-
-## Scope
-
-Pre-scaffold only: module structure, the full built-in-type + transport API
-surface, and reserved later-part signatures. No decode/encode logic, no
-socket I/O, no secure channel, no session, no services — every body is
-`@panic("TODO(agent): ...")`.
+`SecureChannel` (OpenSecureChannel/CloseSecureChannel — at
+`SecurityPolicy#None` or `Basic256Sha256` via `security.zig`), `Session`
+(CreateSession/ActivateSession/CloseSession), the service functions
+`read`/`write`/`browse`/`call`, and `Subscription` (CreateSubscription /
+MonitoredItems / Publish with typed `Notification` decoding) — all
+implemented over the transport's chunk assembler.
 
 ## Verification
 
-`zig build test-opcua` — compiles and runs the placeholder/smoke tests only
-(no codec/transport logic exists yet to exercise).
+`zig build test-opcua` — the offline suite (codec round-trips, transport
+framing, secure-channel crypto vectors cross-checked against open62541's
+implementation, service-message goldens). During development every layer was
+additionally validated live against a local open62541 server.
