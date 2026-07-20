@@ -401,3 +401,18 @@ test "decode: user_data_out too small" {
     var tiny: [2]u8 = undefined;
     try testing.expectError(error.BufferTooSmall, decodeFrame(frame, &tiny));
 }
+
+test "fuzz: decodeFrame never crashes on arbitrary bytes" {
+    try testing.fuzz({}, fuzzDecodeFrame, .{});
+}
+
+fn fuzzDecodeFrame(_: void, smith: *std.testing.Smith) !void {
+    var frame: [512]u8 = undefined;
+    smith.bytes(&frame);
+    const len: usize = smith.valueRangeAtMost(u16, 0, frame.len);
+    // The link-layer decoder is the primary untrusted-wire surface (CRC block
+    // chunking — the classic "block runs past end" attack): it must never
+    // panic/OOB on arbitrary bytes, only return a typed error or a frame.
+    var out: [256]u8 = undefined;
+    _ = decodeFrame(frame[0..len], &out) catch {};
+}
