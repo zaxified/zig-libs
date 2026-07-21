@@ -47,10 +47,17 @@
 //! constants are precomputed ONCE per key at construction and carried on the
 //! key (`MontParams`), so no per-operation setup cost is paid.
 //!
-//! SECURITY FOLLOW-UP (not done here — see `~/CML/audit/modules/rsa.md` F2/F3):
-//! the CRT private path still has no base blinding and no Bellcore fault-check.
-//! Those are a deliberately separate task; base blinding in particular changes
-//! the perf profile and would muddy this backend-swap benchmark.
+//! SECURITY (audit F2/F3, see `~/CML/audit/modules/rsa.md`): the CRT private op
+//! (`privateOpCrt`) now carries both fault- and side-channel countermeasures.
+//! F3 (Bellcore/BDL): every CRT private op re-encrypts the recovered `m` and
+//! checks `m^e ≡ c (mod n)`, returning `error.FaultDetected` on mismatch rather
+//! than a faulty value an attacker could use to factor `n`. F2 (base blinding):
+//! when an rng is available (`signPss`, or a caller passing one through), the op
+//! runs on `c·r^e mod n` for a fresh random unit `r` and unblinds by `r⁻¹ mod n`,
+//! masking any residual (compiler-defeated) timing/power signal on the secret
+//! exponent. Deterministic APIs without an rng (`signPkcs1v15`, `decryptOaep`)
+//! run unblinded but keep the F3 check. Both add roughly one extra public-modexp
+//! (plus, when blinding, an inverse) per private op — the expected cost.
 //!
 //! Provenance: clean-room implementation from RFC 8017 (PKCS#1 v2.2); design
 //! reference = Zig std's internal `std.crypto.Certificate.rsa` (MIT) for the
@@ -385,6 +392,10 @@ pub const SecretKey = struct {
     dq: Fe,
     /// qInv = q⁻¹ mod p — CRT coefficient.
     qinv: Fe,
+    /// Public exponent e (kept so the private CRT op can re-encrypt `m^e mod n`
+    /// for the Bellcore/BDL fault check — audit F3). Public value, carried as
+    /// an `Fe` of `n` for symmetry with `PublicKey.e`.
+    e: Fe,
     /// Precomputed montint constants for `n` (non-CRT private op `c^d mod n`).
     n_mont: MontParams,
     /// Precomputed montint constants for `p` (CRT half `c^dP mod p`).
@@ -594,6 +605,10 @@ fn fromPrimesImpl(p_bytes: []const u8, q_bytes: []const u8, e_bytes: []const u8)
     // reject rather than trip `ff`'s NullExponent later on garbage input.
     if (d.isZero() or dp.isZero() or dq.isZero()) return error.InvalidPrivateKey;
 
+    // Public exponent as an `Fe` of `n` (used by the CRT fault check to
+    // re-encrypt `m^e mod n`). e < 2³² < n, so this never overflows.
+    const e_fe = Fe.fromBytes(n, eb, .big) catch return error.InvalidPrivateKey;
+
     // qInv = q⁻¹ mod p = (q mod p)^(p-2) mod p — Fermat inversion, valid for
     // prime p, constant-time via `ff` (the exponent p-2 is secret).
     const q_mod_p = reduceWide(p, q.v);
@@ -612,6 +627,7 @@ fn fromPrimesImpl(p_bytes: []const u8, q_bytes: []const u8, e_bytes: []const u8)
         .dp = dp,
         .dq = dq,
         .qinv = qinv,
+        .e = e_fe,
         .n_mont = montParamsFromModulus(n),
         .p_mont = montParamsFromModulus(p),
         .q_mont = montParamsFromModulus(q),
@@ -627,7 +643,14 @@ fn fromPrimesImpl(p_bytes: []const u8, q_bytes: []const u8, e_bytes: []const u8)
 // (private-key modexp) — mirrors how std's internal `rsa.encrypt` collapses
 // RSAEP/RSAVP1 into one function.
 
-pub const PrimitiveError = error{MessageRepresentativeOutOfRange};
+pub const PrimitiveError = error{
+    /// OS2IP of the input is >= n (RFC 8017 range check).
+    MessageRepresentativeOutOfRange,
+    /// The CRT private op's Bellcore/BDL fault check failed: the recomputed
+    /// `m^e mod n` did not equal the input `c`, so at least one CRT half was
+    /// faulted. The (potentially secret-leaking) result is withheld — audit F3.
+    FaultDetected,
+};
 
 // Runtime-length (slice) cores. The `out` buffer must be exactly the modulus
 // length in bytes (I2OSP target length, `k` in the RFC); each caller in this
@@ -675,17 +698,84 @@ fn privateOp(sk: SecretKey, in: []const u8, out: []u8) PrimitiveError!void {
     writeMontResult(out, res);
 }
 
-fn privateOpCrt(sk: SecretKey, in: []const u8, out: []u8) PrimitiveError!void {
+/// F2 base-blinding factors for one CRT private op: `c_blinded = c·r^e mod n`
+/// for a fresh random unit `r`, plus `r_inv = r⁻¹ mod n` to undo it afterwards
+/// (`m·r_inv = (c·r^e)^d·r⁻¹ = c^d·r·r⁻¹ = c^d mod n`).
+const Blinding = struct { c_blinded: Fe, r_inv: Fe };
+
+/// Draw a fresh blinding pair. All arithmetic here is on the PUBLIC modulus n
+/// and on `r` (a secret-independent random value), so the variable-time inverse
+/// and the `r^e` public modexp leak nothing about the private exponent. `rng`
+/// MUST be cryptographically secure — a predictable `r` voids the masking.
+fn makeBlinding(sk: SecretKey, c: Fe, rng: std.Random) Blinding {
+    const n_len = byteLen(sk.n.bits());
+    var n_be: [max_modulus_len]u8 = undefined;
+    sk.n.toBytes(n_be[0..n_len], .big) catch unreachable;
+    var e_be: [max_modulus_len]u8 = undefined;
+    sk.e.toBytes(&e_be, .big) catch unreachable;
+
+    while (true) {
+        // Uniform r in [1, n-1] by rejection sampling (>= n redraws).
+        var r_raw: [max_modulus_len]u8 = undefined;
+        rng.bytes(r_raw[0..n_len]);
+        const r = Fe.fromBytes(sk.n, r_raw[0..n_len], .big) catch continue;
+        if (r.isZero()) continue;
+        var r_be: [max_modulus_len]u8 = undefined;
+        r.toBytes(r_be[0..n_len], .big) catch unreachable; // canonical, < n
+
+        // r_inv = r⁻¹ mod n (fails only if gcd(r, n) != 1 — r shares p or q,
+        // astronomically unlikely; redraw if so).
+        var rinv_be: [max_modulus_len]u8 = undefined;
+        const rinv = invModN(n_be[0..n_len], r_be[0..n_len], &rinv_be) orelse continue;
+        const r_inv = Fe.fromBytes(sk.n, rinv, .big) catch continue;
+
+        // re = r^e mod n (public modexp), then c_blinded = c·re mod n.
+        var re_out: [max_modulus_len]u8 = undefined;
+        const re_be = montPowPublic(&sk.n_mont, r_be[0..n_len], &e_be, &re_out);
+        const re = Fe.fromBytes(sk.n, re_be, .big) catch continue;
+        return .{ .c_blinded = sk.n.mul(c, re), .r_inv = r_inv };
+    }
+}
+
+/// `r⁻¹ mod n` as big-endian bytes into `out` (returns the written slice), or
+/// `null` if `r` is not a unit mod n. Extended-Euclid via `std.math.big.int` on
+/// a stack arena — variable-time, but only ever on the public modulus and a
+/// random `r`, never on secret key material.
+fn invModN(n_be: []const u8, r_be: []const u8, out: *[max_modulus_len]u8) ?[]const u8 {
+    var scratch: [96 * 1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&scratch);
+    const gpa = fba.allocator();
+    var r_big = bigFromBytes(gpa, r_be) catch return null;
+    var n_big = bigFromBytes(gpa, n_be) catch return null;
+    var inv = bigModInverse(gpa, &r_big, &n_big) catch return null; // gcd != 1 -> null
+    if (inv.bitCountAbs() > max_modulus_bits) return null;
+    inv.toConst().writeTwosComplement(out, .big); // left-zero-padded to out.len
+    return out[0..];
+}
+
+fn privateOpCrt(sk: SecretKey, in: []const u8, out: []u8, rng: ?std.Random) PrimitiveError!void {
     const c = Fe.fromBytes(sk.n, in, .big) catch return error.MessageRepresentativeOutOfRange;
+
+    // F2 (base blinding): with an rng, run the CRT op on c' = c·r^e mod n and
+    // unblind the result by r⁻¹ mod n below. This randomizes every secret-
+    // dependent intermediate so any residual (compiler-defeated) timing/power
+    // signal is masked. With no rng (deterministic APIs, e.g. PKCS#1 v1.5
+    // signing) the op runs unblinded but the F3 fault check still applies.
+    var r_inv: ?Fe = null;
+    var c_eff = c;
+    if (rng) |g| {
+        const b = makeBlinding(sk, c, g);
+        c_eff = b.c_blinded;
+        r_inv = b.r_inv;
+    }
+
     // RFC 8017 §5.1.2 form (2), two-prime case:
-    //   m1 = c^dP mod p, m2 = c^dQ mod q
+    //   m1 = c^dP mod p, m2 = c^dQ mod q   (on the possibly-blinded c_eff)
     // The two half-width modexps are the hot path — routed through montint
-    // (constant-time in the secret exponent). Reduction of `c` into the mod-p /
-    // mod-q domains stays in `ff` (constant-time), as does the Garner
+    // (constant-time in the secret exponent). Reduction of `c_eff` into the
+    // mod-p / mod-q domains stays in `ff` (constant-time), as does the Garner
     // recombination below; only the exponentiation moved.
-    // SECURITY: no base blinding / CRT fault-check here — see the module doc
-    // comment and `~/CML/audit/modules/rsa.md` (F2/F3), a separate follow-up.
-    const cp = reduceWide(sk.p, c.v);
+    const cp = reduceWide(sk.p, c_eff.v);
     var cpb: [max_modulus_len]u8 = undefined;
     cp.toBytes(&cpb, .big) catch unreachable;
     var dpb: [max_modulus_len]u8 = undefined;
@@ -694,7 +784,7 @@ fn privateOpCrt(sk: SecretKey, in: []const u8, out: []u8) PrimitiveError!void {
     const m1_be = montPowSecret(&sk.p_mont, &cpb, &dpb, &m1_buf);
     const m1 = Fe.fromBytes(sk.p, m1_be, .big) catch unreachable; // m1 < p
 
-    const cq = reduceWide(sk.q, c.v);
+    const cq = reduceWide(sk.q, c_eff.v);
     var cqb: [max_modulus_len]u8 = undefined;
     cq.toBytes(&cqb, .big) catch unreachable;
     var dqb: [max_modulus_len]u8 = undefined;
@@ -710,7 +800,24 @@ fn privateOpCrt(sk: SecretKey, in: []const u8, out: []u8) PrimitiveError!void {
     const m2_n = reduceWide(sk.n, m2.v);
     const q_n = reduceWide(sk.n, sk.q.v);
     const h_n = reduceWide(sk.n, h.v);
-    const m = sk.n.add(m2_n, sk.n.mul(q_n, h_n));
+    var m = sk.n.add(m2_n, sk.n.mul(q_n, h_n));
+
+    // F2 unblind: m <- m·r⁻¹ mod n, recovering the true representative.
+    if (r_inv) |ri| m = sk.n.mul(m, ri);
+
+    // F3 (Bellcore / BDL fault check): re-encrypt the UNBLINDED m and compare
+    // to the ORIGINAL c. A fault in either CRT half makes m ≢ c^d, so m^e ≢ c
+    // and we refuse to emit m — denying the attacker the faulty value from
+    // which p = gcd(c − m^e mod n, n) would otherwise factor the modulus.
+    var m_be: [max_modulus_len]u8 = undefined;
+    m.toBytes(&m_be, .big) catch unreachable;
+    var e_be: [max_modulus_len]u8 = undefined;
+    sk.e.toBytes(&e_be, .big) catch unreachable;
+    var chk_buf: [max_modulus_len]u8 = undefined;
+    const chk_be = montPowPublic(&sk.n_mont, &m_be, &e_be, &chk_buf);
+    const chk = Fe.fromBytes(sk.n, chk_be, .big) catch unreachable;
+    if (!chk.eql(c)) return error.FaultDetected;
+
     m.toBytes(out, .big) catch unreachable;
 }
 
@@ -743,7 +850,7 @@ pub fn rsadp(comptime modulus_len: usize, c: [modulus_len]u8, sk: SecretKey) Pri
 pub fn rsadpCrt(comptime modulus_len: usize, c: [modulus_len]u8, sk: SecretKey) PrimitiveError![modulus_len]u8 {
     comptime std.debug.assert(modulus_len <= max_modulus_len);
     var out: [modulus_len]u8 = undefined;
-    try privateOpCrt(sk, &c, &out);
+    try privateOpCrt(sk, &c, &out, null);
     return out;
 }
 
@@ -811,7 +918,7 @@ fn emsaPkcs1v15Encode(comptime Hash: type, msg: []const u8, em: []u8) EmsaEncode
     Hash.hash(msg, em[em.len - Hash.digest_length ..][0..Hash.digest_length], .{});
 }
 
-pub const SignPkcs1v15Error = EmsaEncodeError || error{BufferTooSmall};
+pub const SignPkcs1v15Error = EmsaEncodeError || error{ BufferTooSmall, FaultDetected };
 
 /// Sign `msg` with EMSA-PKCS1-v1_5 encoding (RFC 8017 §9.2) + the RSASP1
 /// signature primitive (§8.2.1). `out` must be at least as long as the
@@ -823,8 +930,12 @@ pub fn signPkcs1v15(sk: SecretKey, comptime Hash: type, msg: []const u8, out: []
     const em = em_buf[0..k];
     try emsaPkcs1v15Encode(Hash, msg, em);
     // EM starts with 0x00 0x01, so its integer value is < n by construction;
-    // the range check inside the primitive cannot fail.
-    privateOpCrt(sk, em, out[0..k]) catch unreachable;
+    // the range check inside the primitive cannot fail. Deterministic API ->
+    // no blinding rng; a Bellcore fault (F3) is surfaced, never signed over.
+    privateOpCrt(sk, em, out[0..k], null) catch |err| switch (err) {
+        error.MessageRepresentativeOutOfRange => unreachable,
+        error.FaultDetected => return error.FaultDetected,
+    };
     return out[0..k];
 }
 
@@ -962,7 +1073,9 @@ pub fn decryptOaep(sk: SecretKey, comptime Hash: type, ct: []const u8, label: []
     var em_buf: [max_modulus_len]u8 = undefined;
     defer std.crypto.secureZero(u8, em_buf[0..k]);
     const em = em_buf[0..k];
-    privateOpCrt(sk, ct, em) catch return error.DecryptionError;
+    // No rng here (deterministic decrypt API) -> unblinded; the F3 fault check
+    // still runs. A fault maps to the same generic DecryptionError (no oracle).
+    privateOpCrt(sk, ct, em, null) catch return error.DecryptionError;
 
     // step 3: EME-OAEP decode, branch-free. EM = Y || maskedSeed || maskedDB.
     const seed = em[1..][0..h_len];
@@ -1053,15 +1166,18 @@ fn emsaPssEncode(comptime Hash: type, msg: []const u8, salt: []const u8, em_bits
     em[em_len - 1] = 0xbc; // step 12: trailer field.
 }
 
-pub const SignPssError = EmsaEncodeError || error{BufferTooSmall};
+pub const SignPssError = EmsaEncodeError || error{ BufferTooSmall, FaultDetected };
 
 /// Sign `msg` with RSASSA-PSS (RFC 8017 §8.1.1): EMSA-PSS-ENCODE (§9.1.1)
 /// over emBits = modBits - 1, then the RSASP1 signature primitive (CRT fast
 /// path). `salt_len` is the PSS salt length in bytes (`sLen`): `0` yields
-/// deterministic signatures (and `random` is never drawn from),
-/// `Hash.digest_length` is the conventional default (what OpenSSL calls
-/// `rsa_pss_saltlen:digest`). `random` supplies the fresh salt and MUST be
-/// cryptographically secure for `salt_len > 0`. `out` must be at least as
+/// deterministic signatures (the emitted signature is salt-free), while any
+/// `salt_len`, the conventional default `Hash.digest_length` included (what
+/// OpenSSL calls `rsa_pss_saltlen:digest`), draws that many salt octets.
+/// `random` supplies the fresh salt AND the F2 base-blinding factor for the
+/// CRT private op, so it is drawn from even when `salt_len == 0` (blinding is
+/// unblinded before output — the signature stays deterministic for
+/// `salt_len == 0`). `random` MUST be cryptographically secure. `out` must be at least as
 /// long as the modulus (`sk.n` byte length); returns the written
 /// (modulus-length) signature subslice.
 pub fn signPss(sk: SecretKey, comptime Hash: type, random: std.Random, msg: []const u8, salt_len: usize, out: []u8) SignPssError![]u8 {
@@ -1088,7 +1204,12 @@ pub fn signPss(sk: SecretKey, comptime Hash: type, random: std.Random, msg: []co
 
     // §8.1.1 step 2: RSASP1. EM < 2^emBits < n by construction (step 11
     // cleared the top bits), so the primitive's range check cannot fail.
-    privateOpCrt(sk, em_buf[0..k], out[0..k]) catch unreachable;
+    // `random` also drives F2 base blinding inside the CRT op; a Bellcore
+    // fault (F3) is surfaced, never signed over.
+    privateOpCrt(sk, em_buf[0..k], out[0..k], random) catch |err| switch (err) {
+        error.MessageRepresentativeOutOfRange => unreachable,
+        error.FaultDetected => return error.FaultDetected,
+    };
     return out[0..k];
 }
 
@@ -2529,6 +2650,77 @@ test "rsadpCrt equals rsadp on the 2048-bit key" {
     const via_crt = try rsadpCrt(256, c, sk);
     try testing.expectEqualSlices(u8, &m, &via_plain);
     try testing.expectEqualSlices(u8, &via_plain, &via_crt);
+}
+
+// audit F3 — Bellcore/BDL fault-injection countermeasure. A persistent fault
+// in one CRT exponent (`dP`) makes the recovered `m` fail the `m^e ≡ c` re-
+// encryption check, so the op must return `error.FaultDetected` instead of the
+// factoring-oracle value. RED if the F3 check is removed from `privateOpCrt`.
+test "privateOpCrt Bellcore check rejects a faulted CRT half (audit F3)" {
+    var sk = try SecretKey.fromPrimes(&kat512.p, &kat512.q, &kat512.e);
+    const k = byteLen(sk.n.bits());
+
+    // A representative safely < n (top byte zero).
+    var msg: [max_modulus_len]u8 = undefined;
+    @memset(msg[0..k], 0);
+    msg[k - 1] = 0x2a;
+
+    var out: [max_modulus_len]u8 = undefined;
+    // Baseline: the intact key produces a value and passes the check.
+    try privateOpCrt(sk, msg[0..k], out[0..k], null);
+
+    // Inject a persistent single-half fault: dP <- dP + 1 (mod p). Now
+    // m1 = c^(dP+1) mod p is wrong, so the recombined m ≢ c^d and m^e ≢ c.
+    sk.dp = sk.p.add(sk.dp, sk.p.one());
+    try testing.expectError(error.FaultDetected, privateOpCrt(sk, msg[0..k], out[0..k], null));
+
+    // Same rejection on the blinded path (blinding must not mask a real fault).
+    var prng = std.Random.DefaultPrng.init(0xfa17_1717_c0de_0003);
+    try testing.expectError(error.FaultDetected, privateOpCrt(sk, msg[0..k], out[0..k], prng.random()));
+}
+
+// A faulted key also fails at the public sign entry points (fault propagates as
+// error.FaultDetected, never a silent bad signature).
+test "signPkcs1v15 surfaces a CRT fault as error.FaultDetected (audit F3)" {
+    var sk = try kat2048.secretKey();
+    sk.dq = sk.q.add(sk.dq, sk.q.one()); // fault the other CRT half this time
+    var out: [max_modulus_len]u8 = undefined;
+    try testing.expectError(error.FaultDetected, signPkcs1v15(sk, std.crypto.hash.sha2.Sha256, "faulted", &out));
+}
+
+// audit F2 — CRT base blinding. The blinded op (rng supplied) must round-trip to
+// exactly the unblinded result across key sizes, and repeated blinded runs must
+// agree (masking is unblinded before output). Also cross-checks m^e ≡ c via the
+// public key. Uses the internal `privateOpCrt` since the public primitives are
+// deterministic (null rng).
+test "CRT base blinding round-trips and matches the unblinded result (audit F2)" {
+    var prng = std.Random.DefaultPrng.init(0xb11d_0000_5eed_0002);
+    const random = prng.random();
+
+    const sk512 = try SecretKey.fromPrimes(&kat512.p, &kat512.q, &kat512.e);
+    const sk2048 = try kat2048.secretKey();
+    for ([_]SecretKey{ sk512, sk2048 }) |sk| {
+        const k = byteLen(sk.n.bits());
+        var msg: [max_modulus_len]u8 = undefined;
+        random.bytes(msg[0..k]);
+        msg[0] = 0; // representative < n (n's top byte is nonzero)
+
+        var out_plain: [max_modulus_len]u8 = undefined;
+        var out_blind1: [max_modulus_len]u8 = undefined;
+        var out_blind2: [max_modulus_len]u8 = undefined;
+        try privateOpCrt(sk, msg[0..k], out_plain[0..k], null);
+        try privateOpCrt(sk, msg[0..k], out_blind1[0..k], random);
+        try privateOpCrt(sk, msg[0..k], out_blind2[0..k], random);
+        // Blinding with two independent random r's yields the same plaintext.
+        try testing.expectEqualSlices(u8, out_plain[0..k], out_blind1[0..k]);
+        try testing.expectEqualSlices(u8, out_plain[0..k], out_blind2[0..k]);
+
+        // Cross-check: re-encrypting the blinded output recovers the input.
+        const pk = PublicKey{ .n = sk.n, .e = sk.e, .n_mont = sk.n_mont };
+        var recovered: [max_modulus_len]u8 = undefined;
+        try publicOp(pk, out_blind1[0..k], recovered[0..k]);
+        try testing.expectEqualSlices(u8, msg[0..k], recovered[0..k]);
+    }
 }
 
 // Regression for the montint-rewire CRIT: a sub-max key driven through the
