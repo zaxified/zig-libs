@@ -437,11 +437,16 @@ const Index = struct {
     }
 
     /// Collect every `(conn, qos)` whose filter matches `topic_name` into
-    /// `out`. Duplicates (a connection matching via several overlapping
-    /// filters) are collapsed later by the caller.
-    fn collect(idx: *Index, alloc: std.mem.Allocator, topic_name: []const u8, out: *std.ArrayListUnmanaged(SubRef)) Error!void {
+    /// `out`, up to `max` matches. Duplicates (a connection matching via several
+    /// overlapping filters) are collapsed later by the caller. Returns `true`
+    /// when the walk was cut short at `max` — the per-PUBLISH fan-out envelope
+    /// (bounds the work one publish can trigger); once hit, no further trie work
+    /// is done.
+    fn collect(idx: *Index, alloc: std.mem.Allocator, topic_name: []const u8, out: *std.ArrayListUnmanaged(SubRef), max: usize) Error!bool {
         const dollar = topic_name.len > 0 and topic_name[0] == '$';
-        try collectRec(alloc, &idx.root, topic_name, true, dollar, out);
+        var capped = false;
+        try collectRec(alloc, &idx.root, topic_name, true, dollar, out, max, &capped);
+        return capped;
     }
 
     fn collectRec(
@@ -451,14 +456,22 @@ const Index = struct {
         is_root: bool,
         dollar: bool,
         out: *std.ArrayListUnmanaged(SubRef),
+        max: usize,
+        capped: *bool,
     ) Error!void {
+        // Envelope reached: stop all further match work (every recursive call
+        // early-returns from here, so the remaining walk is O(1) per node).
+        if (out.items.len >= max) {
+            capped.* = true;
+            return;
+        }
         // '#' at this node matches zero-or-more remaining levels — except a
         // leading wildcard against a '$'-topic.
-        if (!(is_root and dollar)) try appendAll(alloc, out, &node.hash_subs);
+        if (!(is_root and dollar)) try appendAll(alloc, out, &node.hash_subs, max, capped);
 
         const cur = rest orelse {
             // Topic fully consumed → exact terminal subs at this node match.
-            try appendAll(alloc, out, &node.subs);
+            try appendAll(alloc, out, &node.subs, max, capped);
             return;
         };
         const slash = std.mem.indexOfScalar(u8, cur, '/');
@@ -466,14 +479,20 @@ const Index = struct {
         const tail: ?[]const u8 = if (slash) |s| cur[s + 1 ..] else null;
 
         if (node.children.get(head)) |child|
-            try collectRec(alloc, child, tail, false, dollar, out);
+            try collectRec(alloc, child, tail, false, dollar, out, max, capped);
         if (!(is_root and dollar)) {
-            if (node.plus) |p| try collectRec(alloc, p, tail, false, dollar, out);
+            if (node.plus) |p| try collectRec(alloc, p, tail, false, dollar, out, max, capped);
         }
     }
 
-    fn appendAll(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(SubRef), list: *std.ArrayListUnmanaged(SubRef)) Error!void {
-        for (list.items) |r| try out.append(alloc, r);
+    fn appendAll(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(SubRef), list: *std.ArrayListUnmanaged(SubRef), max: usize, capped: *bool) Error!void {
+        for (list.items) |r| {
+            if (out.items.len >= max) {
+                capped.* = true;
+                return;
+            }
+            try out.append(alloc, r);
+        }
     }
 };
 
@@ -533,6 +552,15 @@ pub const Config = struct {
     /// Bounded idle window (ms) a connection is given to send its CONNECT
     /// before the accept loop drops it. Only consulted by `TcpServer`.
     connect_timeout_ms: u32 = 10_000,
+    /// Per-PUBLISH fan-out envelope: the maximum number of subscription matches
+    /// a single PUBLISH may gather from the index before the match walk is cut
+    /// short. Bounds the work (and the delivery burst) one PUBLISH can trigger
+    /// so a client with a pathological wildcard/overlap set can't amplify a
+    /// single publish into unbounded fan-out. The default equals
+    /// `max_subscriptions_total`, so ordinary pub/sub is never truncated; lower
+    /// it to tighten the envelope. A truncated fan-out bumps
+    /// `Broker.fanoutTruncations()`.
+    max_fanout_matches: usize = 65536,
 
     /// Optional authentication hook (FIX D). Null = allow every CONNECT.
     /// Invoked in `handleConnect` with the client id + credentials; a deny
@@ -570,6 +598,10 @@ pub const Broker = struct {
     subscriptions_total: usize = 0,
     retained: std.ArrayList(Retained) = .empty,
     next_auto_id: u64 = 0,
+    /// Count of PUBLISH fan-outs truncated at `Config.max_fanout_matches` — the
+    /// observable signal that the fan-out envelope was hit (an operator's cue to
+    /// investigate an amplifying client or raise the cap).
+    fanout_truncations: std.atomic.Value(u64) = .init(0),
 
     pub fn init(allocator: std.mem.Allocator, config: Config) Broker {
         return .{ .allocator = allocator, .config = config };
@@ -592,6 +624,12 @@ pub const Broker = struct {
     /// old registry exposed as `subscriptions.items.len`).
     pub fn subscriptionCount(b: *const Broker) usize {
         return b.subscriptions_total;
+    }
+
+    /// How many PUBLISH fan-outs have been truncated at the
+    /// `Config.max_fanout_matches` envelope so far.
+    pub fn fanoutTruncations(b: *const Broker) u64 {
+        return b.fanout_truncations.load(.monotonic);
     }
 
     /// Register a new connection over `transport`; returns an owned pointer
@@ -995,7 +1033,12 @@ pub const Broker = struct {
 
             var matches: std.ArrayListUnmanaged(SubRef) = .empty;
             defer matches.deinit(b.allocator);
-            try b.index.collect(b.allocator, pub_pkt.topic, &matches);
+            // Bounded per-PUBLISH match walk (fan-out envelope): a single
+            // publish can gather at most `max_fanout_matches` matches, so a
+            // pathological wildcard/overlap set can't amplify one publish into
+            // unbounded work. A truncated walk is surfaced via the counter.
+            const capped = try b.index.collect(b.allocator, pub_pkt.topic, &matches, b.config.max_fanout_matches);
+            if (capped) _ = b.fanout_truncations.fetchAdd(1, .monotonic);
 
             // Collapse to one target per connection at its highest granted QoS
             // (overlapping filters → a single copy, spec behavior).
@@ -1638,6 +1681,63 @@ fn expectDelivered(t: *TestTransport, expect_topic: []const u8) !void {
     const p = (try t.next()).?;
     try testing.expect(p == .publish);
     try testing.expectEqualStrings(expect_topic, p.publish.topic);
+}
+
+test "fan-out envelope: one PUBLISH is bounded at max_fanout_matches" {
+    // A tight envelope makes the amplification visible: many subscribers all
+    // match one topic, but a single PUBLISH may only gather `max_fanout_matches`
+    // of them — the rest are not visited (bounded work), and the truncation is
+    // recorded. With the default (65536) this never trips in normal pub/sub.
+    const cap = 3;
+    var b = Broker.init(testing.allocator, .{ .max_fanout_matches = cap });
+    defer b.deinit();
+
+    var tp = TestTransport{};
+    const p = try connectClient(&b, &tp, "P", 60, 0);
+
+    // Eight distinct subscribers, each subscribed to the same wildcard — a
+    // single publish would otherwise fan out to all eight.
+    const n_subs = 8;
+    var tts: [n_subs]TestTransport = undefined;
+    for (&tts, 0..) |*tt, i| {
+        tt.* = TestTransport{};
+        var idbuf: [8]u8 = undefined;
+        const id = try std.fmt.bufPrint(&idbuf, "S{d}", .{i});
+        const c = try connectClient(&b, tt, id, 60, 0);
+        try feedSubscribe(&b, c, 1, &.{.{ .filter = "hot/#", .qos = .at_most_once }});
+        _ = (try tt.next()).?; // SUBACK
+    }
+
+    // One publish to the hot topic: the fan-out is truncated at the envelope.
+    _ = try feedPublish(&b, p, .{ .topic = "hot/x", .payload = "boom" });
+
+    var delivered: usize = 0;
+    for (&tts) |*tt| {
+        if (try tt.next()) |pk| {
+            try testing.expect(pk == .publish);
+            delivered += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, cap), delivered); // bounded, not all 8
+    try testing.expectEqual(@as(u64, 1), b.fanoutTruncations()); // envelope hit, recorded
+
+    // A publish to a topic no one is (over-)subscribed on is not truncated.
+    _ = try feedPublish(&b, p, .{ .topic = "cold/x", .payload = "ok" });
+    try testing.expectEqual(@as(u64, 1), b.fanoutTruncations()); // unchanged
+}
+
+test "fan-out envelope: default cap never truncates ordinary pub/sub" {
+    var b = Broker.init(testing.allocator, .{}); // default max_fanout_matches
+    defer b.deinit();
+    var tp = TestTransport{};
+    var ts = TestTransport{};
+    const p = try connectClient(&b, &tp, "P", 60, 0);
+    const s = try connectClient(&b, &ts, "S", 60, 0);
+    try feedSubscribe(&b, s, 1, &.{.{ .filter = "a/#", .qos = .at_most_once }});
+    _ = (try ts.next()).?;
+    _ = try feedPublish(&b, p, .{ .topic = "a/b", .payload = "x" });
+    try expectDelivered(&ts, "a/b");
+    try testing.expectEqual(@as(u64, 0), b.fanoutTruncations());
 }
 
 test "FIX A: PUBLISH does not hold the global registry lock across writes" {
