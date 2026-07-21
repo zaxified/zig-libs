@@ -11,7 +11,7 @@ cross-project-reusable capability — a production-grade implementation of a pro
 or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
 authors' other projects depend on it, not the reverse.
 
-**Status:** 160 modules · 5263 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 161 modules · 5289 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ## Using a module
@@ -97,6 +97,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `jwt` | JWT/JWS + **OIDC resource-server** validator (RFC 7515/7519/7517/8725) — parse + claims + verify (HS/ES/EdDSA/RSA, alg-confusion-safe) + JWKS-by-`kid` + **OIDC discovery/fetch** (cache + key-rotation) + a **`router` Bearer middleware** (RFC 6750 challenge, scope check, identity on ctx) | any | http, router |
 | `rbac` | authorization decision engine — NIST RBAC (hierarchical + static SoD, cycle-checked) and a depth-bounded ABAC condition-tree evaluator (typed builder, 10 operators) with XACML-style `deny_overrides`/`permit_overrides` combining and structural default-deny | any | — |
 | `xml` | namespace-aware, security-hardened XML 1.0 parser → C14N-ready infoset tree (original prefixes/NS-scope/doc-order/comments/byte-spans preserved; DOCTYPE-reject default → XXE + billion-laughs + depth-bomb proof; duplicate-ID guard) — foundation for `xmldsig`/`saml` | any | — |
+| `xmldsig` | XML Canonicalization (exclusive/inclusive C14N ±comments, `InclusiveNamespaces` PrefixList) + XML-Signature **verification** (xmldsig-core 1.1) — enveloped-signature transform, RSA/ECDSA-P256-SHA256/384/512, algorithm allow-list (XSLT/XPath rejected), verify-against-configured-key (KeyInfo cert untrusted, exposed for pinning) | any | xml, rsa, p256 |
 | `jwe` | JSON Web Encryption (RFC 7516/7518) compact serialization — `dir`/RSA-OAEP/RSA-OAEP-256/AxxxKW (RFC 3394)/AxxxGCMKW/PBES2/**ECDH-ES** (+A128KW/A256KW; P-256 + X25519 ephemeral, Concat KDF, RFC 7518 App. C KAT) key management + A128GCM/A256GCM/A128CBC-HS256/A256CBC-HS512 content encryption, RFC-KAT-validated (incl. RFC 7516 A.3 byte-exact both directions); A192* unsupported (no AES-192 in std) | any | rsa |
 | `acme` | Let's Encrypt / ACME v2 (RFC 8555): HTTP-01 issuance + renewal, ES256 JWS, CSR | any | http, router |
 | `sessions` | Server-side web sessions + OWASP-hardened cookies + signed double-submit **CSRF** middleware | any | router, http, cookies, ramcache |

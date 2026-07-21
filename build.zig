@@ -85,6 +85,7 @@ const module_list = [_]Module{
     .{ .name = "jwt", .deps = &.{ "http", "router", "p256" } },
     .{ .name = "rbac" },
     .{ .name = "xml" },
+    .{ .name = "xmldsig", .deps = &.{ "xml", "rsa", "p256" } },
     .{ .name = "jwe", .deps = &.{ "rsa", "p256" } },
     .{ .name = "rdap", .deps = &.{ "http", "netaddr" } },
     .{ .name = "blobstore", .deps = &.{"hashdigest"} },
