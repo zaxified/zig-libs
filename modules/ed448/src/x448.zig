@@ -173,6 +173,7 @@ fn ladder(clamped_scalar: [scalar_length]u8, u: Fe) Fe {
 /// peer's intended input is a worse failure mode than a hard reject).
 pub fn scalarmult(k: [scalar_length]u8, u: [public_length]u8) field.FieldError![shared_length]u8 {
     var clamped = k;
+    defer std.crypto.secureZero(u8, &clamped);
     clamp(&clamped);
     const u_fe = try Fe.fromBytes(u);
     const result = ladder(clamped, u_fe);
@@ -212,6 +213,13 @@ pub const KeyPair = struct {
         // retry-on-error loop shape, simplified because X448's base
         // point can never itself trigger that error.
         return generateDeterministic(seed) catch unreachable;
+    }
+
+    /// Zeroize `secret_key` in place; `public_key` is left untouched (it
+    /// is not secret). Idempotent. Hygiene only — no effect on any DH
+    /// result computed before the call.
+    pub fn deinit(self: *KeyPair) void {
+        std.crypto.secureZero(u8, &self.secret_key);
     }
 };
 
@@ -258,4 +266,17 @@ test "RFC 7748 §5.2 X448 test vector 1: scalarmult, byte-exact" {
         "e14fbaadeb445fc66a01b0779d98223961111e21766282f73dd96b6f");
     const out = try scalarmult(scalar, u);
     try std.testing.expectEqualSlices(u8, &expected, &out);
+}
+
+test "KeyPair.deinit zeroizes secret_key in place (regression: fails if secureZero is removed)" {
+    var seed: [56]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&seed, "3d262fddf9ec8e88495266fea19a34d28882acef045104d0d1aae121" ++
+        "700a779c984c24f8cdd78fbff44943eba368f54b29259a4f1c600ad3");
+    var kp = try KeyPair.generateDeterministic(seed);
+    const zero_scalar = [_]u8{0} ** scalar_length;
+    try std.testing.expect(!std.mem.eql(u8, &kp.secret_key, &zero_scalar));
+    kp.deinit();
+    try std.testing.expectEqualSlices(u8, &zero_scalar, &kp.secret_key);
+    // public_key is NOT secret and must survive deinit untouched.
+    try std.testing.expect(!std.mem.eql(u8, &kp.public_key, &zero_scalar));
 }

@@ -138,6 +138,13 @@ pub const KeyPair = struct {
             sk.bytes;
         return .{ .secret = effective, .public = .{ .x = xy.x.toBytes(.big) } };
     }
+
+    /// Zeroize the effective signing scalar (`secret`) in place; `public`
+    /// is left untouched (it is not secret). Idempotent. Hygiene only —
+    /// no effect on any signature produced before the call.
+    pub fn deinit(self: *KeyPair) void {
+        std.crypto.secureZero(u8, &self.secret);
+    }
 };
 
 // ── signature codec ──────────────────────────────────────────────────────
@@ -230,8 +237,10 @@ pub fn sign(secret_key: SecretKey, msg: []const u8, aux_rand: [32]u8, io: std.Io
     _ = io; // deterministic once aux_rand is in hand (see doc comment)
 
     // Steps 1-2: even-y-normalized effective scalar d + x-only public key.
-    const kp = try KeyPair.fromSecretKey(secret_key);
-    const d_bytes = kp.secret;
+    var kp = try KeyPair.fromSecretKey(secret_key);
+    defer kp.deinit();
+    var d_bytes = kp.secret;
+    defer std.crypto.secureZero(u8, &d_bytes);
     const px = kp.public.x;
 
     // Step 3: t = bytes(d) xor taggedHash(aux, aux_rand).
@@ -442,4 +451,14 @@ test "meta.model_after names BIP340 and std's Secp256k1" {
 test "XOnlyPublicKey encoded_length and Signature encoded_length" {
     try std.testing.expectEqual(@as(usize, 32), XOnlyPublicKey.encoded_length);
     try std.testing.expectEqual(@as(usize, 64), Signature.encoded_length);
+}
+
+test "KeyPair.deinit zeroizes the effective signing scalar but leaves public untouched (regression: fails if secureZero is removed)" {
+    const sk = try SecretKey.fromBytes([_]u8{0x01} ** 32);
+    var kp = try KeyPair.fromSecretKey(sk);
+    const zero: [32]u8 = [_]u8{0} ** 32;
+    try std.testing.expect(!std.mem.eql(u8, &kp.secret, &zero));
+    kp.deinit();
+    try std.testing.expectEqualSlices(u8, &zero, &kp.secret);
+    try std.testing.expect(!std.mem.eql(u8, &kp.public.x, &zero));
 }

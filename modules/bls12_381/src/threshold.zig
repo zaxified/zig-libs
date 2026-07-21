@@ -152,6 +152,14 @@ pub const SecretKeyShare = struct {
         const scalar = try Fr.fromBytes(bytes[4..encoded_bytes].*);
         return .{ .index = index, .scalar = scalar };
     }
+
+    /// Zeroize the secret `scalar` field in place; `index` is a public
+    /// share identifier (not secret) and is left untouched. Idempotent.
+    /// Hygiene only — no effect on any public share/signature already
+    /// derived from it.
+    pub fn deinit(self: *SecretKeyShare) void {
+        std.crypto.secureZero(u8, std.mem.asBytes(&self.scalar));
+    }
 };
 
 /// Participant `index`'s PUBLIC verifying share `[share_i]G1` (a `G1`
@@ -602,6 +610,20 @@ test "SecretKeyShare/PublicKeyShare/PartialSignature byte codecs round-trip" {
     const partial_back = try PartialSignature.fromBytes(partial_bytes);
     try std.testing.expectEqual(partial.index, partial_back.index);
     try std.testing.expect(partial.point.x.c0.eql(partial_back.point.x.c0));
+}
+
+test "SecretKeyShare.deinit zeroizes scalar but leaves index untouched (regression: fails if secureZero is removed)" {
+    var sk_share: SecretKeyShare = .{ .index = 3, .scalar = try Fr.fromBytes([_]u8{0} ** 31 ++ [_]u8{7}) };
+    // `Fr`'s in-memory (Montgomery) size may exceed its 32-byte canonical
+    // encoding, so assert over the raw struct bytes, not a fixed-width buffer.
+    var any_nonzero = false;
+    for (std.mem.asBytes(&sk_share.scalar)) |b| {
+        if (b != 0) any_nonzero = true;
+    }
+    try std.testing.expect(any_nonzero);
+    sk_share.deinit();
+    for (std.mem.asBytes(&sk_share.scalar)) |b| try std.testing.expectEqual(@as(u8, 0), b);
+    try std.testing.expectEqual(@as(u32, 3), sk_share.index);
 }
 
 test "SecretKeyShare/PublicKeyShare/PartialSignature fromBytes rejects a zero index" {

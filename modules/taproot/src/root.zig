@@ -261,14 +261,21 @@ pub fn tweakSecretKey(internal_sk: bip340.SecretKey, merkle_root: ?[32]u8) Tweak
     // normalized d, kp.public.x = the even-y x-only encoding). fromSecretKey
     // fails only on a zero/non-canonical scalar — bip340.SecretKey.fromBytes
     // already rejects those, so this is a defensive re-check.
-    const kp = bip340.KeyPair.fromSecretKey(internal_sk) catch return error.InvalidInternalKey;
-    const d = Scalar.fromBytes(kp.secret, .big) catch unreachable; // canonical by construction
+    var kp = bip340.KeyPair.fromSecretKey(internal_sk) catch return error.InvalidInternalKey;
+    defer kp.deinit(); // zeroizes kp.secret (the normalized internal scalar d0/d source)
+    var d = Scalar.fromBytes(kp.secret, .big) catch unreachable; // canonical by construction
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&d));
 
     // Step 4: t over the even-y internal x; reject t >= n, never reduce.
+    // t is derived entirely from PUBLIC data (internal x-only key, Merkle
+    // root) — not secret, so it is not zeroized.
     const t_bytes = tapTweakHash(kp.public.x, merkle_root);
     const t = Scalar.fromBytes(t_bytes, .big) catch return error.TweakOutOfRange;
 
-    // Steps 5-6: q = (d + t) mod n, constant-time scalar add.
+    // Steps 5-6: q = (d + t) mod n, constant-time scalar add. `d`/`kp` are
+    // zeroized (defers above) AFTER this expression is evaluated but
+    // before the caller-visible return — the returned `q` itself is the
+    // useful output and is intentionally left intact.
     return d.add(t).toBytes(.big);
 }
 
@@ -293,3 +300,16 @@ test "TweakedPublicKey.encoded_length" {
 test "tap_tweak_tag is the BIP341 domain tag string" {
     try std.testing.expectEqualStrings("TapTweak", tap_tweak_tag);
 }
+
+test "tweakSecretKey's internal bip340.KeyPair.deinit zeroizes the normalized scalar (regression: fails if secureZero is removed)" {
+    // tweakSecretKey (above) defers kp.deinit() on exactly this type;
+    // this test exercises that same deinit path directly so a regression
+    // in bip340's secureZero call is caught from taproot's own test
+    // binary too, not only bip340's.
+    var kp = try bip340.KeyPair.fromSecretKey(try bip340.SecretKey.fromBytes([_]u8{0x02} ** 32));
+    const zero: [32]u8 = [_]u8{0} ** 32;
+    try std.testing.expect(!std.mem.eql(u8, &kp.secret, &zero));
+    kp.deinit();
+    try std.testing.expectEqualSlices(u8, &zero, &kp.secret);
+}
+

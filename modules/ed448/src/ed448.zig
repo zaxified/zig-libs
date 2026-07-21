@@ -442,6 +442,14 @@ pub const SecretKey = struct {
     pub fn toBytes(sk: SecretKey) [57]u8 {
         return sk.bytes;
     }
+
+    /// Zeroize the 57-byte seed in place. Idempotent (re-zeroing an
+    /// already-zero buffer is a no-op). Callers that hold a `SecretKey`
+    /// past its useful lifetime should call this before letting it go
+    /// out of scope — hygiene only, no effect on any crypto result.
+    pub fn deinit(self: *SecretKey) void {
+        std.crypto.secureZero(u8, &self.bytes);
+    }
 };
 
 pub const PublicKey = struct {
@@ -511,8 +519,10 @@ pub const KeyPair = struct {
     /// 4. Public key = `A.toBytes()`.
     pub fn create(seed: [57]u8) KeyPair {
         var h: [114]u8 = undefined;
+        defer std.crypto.secureZero(u8, &h);
         Shake256.hash(&seed, &h, .{});
         var s = h[0..57].*;
+        defer std.crypto.secureZero(u8, &s);
         scalar.clamp(&s);
         const a_point = Point.mulBasePoint(s);
         return .{
@@ -526,6 +536,13 @@ pub const KeyPair = struct {
         var seed: [57]u8 = undefined;
         io.random(&seed);
         return create(seed);
+    }
+
+    /// Zeroize `secret_key` in place; `public_key` is left untouched (it
+    /// is not secret). Idempotent. Hygiene only — no effect on any
+    /// signature produced before the call.
+    pub fn deinit(self: *KeyPair) void {
+        self.secret_key.deinit();
     }
 };
 
@@ -547,13 +564,17 @@ pub const SignError = ContextError;
 /// 6. `signature = r_bytes || bytes(S)`.
 fn signInternal(kp: KeyPair, ph_message: []const u8, ctx: []const u8, phflag: u1) SignError!Signature {
     var h: [114]u8 = undefined;
+    defer std.crypto.secureZero(u8, &h);
     Shake256.hash(&kp.secret_key.bytes, &h, .{});
     var s = h[0..57].*;
+    defer std.crypto.secureZero(u8, &s);
     scalar.clamp(&s);
     const prefix = h[57..114];
 
-    const r_digest = try shake114(phflag, ctx, &.{ prefix, ph_message });
-    const r_scalar = scalar.reduceWide(r_digest);
+    var r_digest = try shake114(phflag, ctx, &.{ prefix, ph_message });
+    defer std.crypto.secureZero(u8, &r_digest);
+    var r_scalar = scalar.reduceWide(r_digest);
+    defer std.crypto.secureZero(u8, &r_scalar);
     const r_point = Point.mulBasePoint(r_scalar);
     const r_bytes = r_point.toBytes();
 
@@ -743,4 +764,24 @@ test "RFC 8032 §7.4 Ed448 test vector (empty message): keygen public key, byte-
     try std.testing.expectEqualSlices(u8, &expected_pk, &kp.public_key.bytes);
     const sig = try sign(kp, "", "");
     try verify(sig, "", "", kp.public_key);
+}
+
+test "SecretKey.deinit zeroizes the 57-byte seed (regression: fails if secureZero is removed)" {
+    var sk = SecretKey.fromBytes([_]u8{0xab} ** 57);
+    sk.deinit();
+    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 57), &sk.bytes);
+}
+
+test "KeyPair.deinit zeroizes secret_key.bytes but leaves public_key untouched (regression)" {
+    var seed: [57]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&seed, "6c82a562cb808d10d632be89c8513ebf" ++
+        "6c929f34ddfa8c9f63c9960ef6e348a3" ++
+        "528c8a3fcc2f044e39a3fc5b94492f8f" ++
+        "032e7549a20098f95b");
+    var kp = KeyPair.create(seed);
+    const zero: [57]u8 = [_]u8{0} ** 57;
+    try std.testing.expect(!std.mem.eql(u8, &kp.secret_key.bytes, &zero));
+    kp.deinit();
+    try std.testing.expectEqualSlices(u8, &zero, &kp.secret_key.bytes);
+    try std.testing.expect(!std.mem.eql(u8, &kp.public_key.bytes, &zero));
 }

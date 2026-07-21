@@ -123,6 +123,14 @@ pub const SecretKey = struct {
     pub fn fromBytes(bytes: [encoded_bytes]u8) BlsError!SecretKey {
         return .{ .scalar = try Fr.fromBytes(bytes) };
     }
+
+    /// Zeroize the secret scalar in place. `SecretKey` is entirely
+    /// secret material (a single `Fr` field, no public parts), so this
+    /// zeroes the whole struct. Idempotent. Hygiene only — no effect on
+    /// any public key/signature already derived from it.
+    pub fn deinit(self: *SecretKey) void {
+        std.crypto.secureZero(u8, std.mem.asBytes(self));
+    }
 };
 
 /// A BLS public key: a `G1` point (min-pk variant). Wraps `g1.Affine`
@@ -605,6 +613,19 @@ fn hexBytes(comptime n: usize, comptime hex: *const [2 * n:0]u8) [n]u8 {
 }
 
 // ── tests: REAL, PASS today ──────────────────────────────────────────
+
+test "SecretKey.deinit zeroizes the secret scalar (regression: fails if secureZero is removed)" {
+    var sk_bytes = [_]u8{0} ** 32;
+    sk_bytes[31] = 7;
+    var sk = try SecretKey.fromBytes(sk_bytes);
+    const zero_bytes = [_]u8{0} ** 32;
+    try std.testing.expect(!std.mem.eql(u8, &sk.toBytes(), &zero_bytes));
+    sk.deinit();
+    // `Fr`'s in-memory (Montgomery) size may exceed its 32-byte canonical
+    // encoding, so assert every raw byte of the struct is zero rather than
+    // comparing against a fixed-width buffer.
+    for (std.mem.asBytes(&sk)) |b| try std.testing.expectEqual(@as(u8, 0), b);
+}
 
 test "SecretKey/PublicKey/Signature byte codecs round-trip through Part-1-3 machinery" {
     var sk_bytes = [_]u8{0} ** 32;
