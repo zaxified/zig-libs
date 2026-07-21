@@ -224,22 +224,28 @@ pub const Dataset = struct {
 // Compact self-describing encoding so a Dataset can be stored in a byte-based
 // cache (or shipped over a wire). Little-endian. Round-trips exactly.
 
-pub const SerializeError = error{OutOfMemory};
+pub const SerializeError = error{ OutOfMemory, TooLarge };
 pub const DeserializeError = error{ Corrupt, OutOfMemory };
 
 fn putU32(buf: *std.ArrayList(u8), a: std.mem.Allocator, v: u32) SerializeError!void {
     try buf.appendSlice(a, &std.mem.toBytes(v));
 }
 
+/// Narrow a `usize` length to the `u32` wire field, rejecting (rather than
+/// silently truncating via `@intCast`) anything that would not round-trip.
+fn lenU32(v: usize) SerializeError!u32 {
+    return std.math.cast(u32, v) orelse error.TooLarge;
+}
+
 pub fn serialize(a: std.mem.Allocator, d: Dataset) SerializeError![]u8 {
     var buf: std.ArrayList(u8) = .empty;
-    try putU32(&buf, a, @intCast(d.columns.len));
+    try putU32(&buf, a, try lenU32(d.columns.len));
     for (d.columns) |col| {
-        try putU32(&buf, a, @intCast(col.name.len));
+        try putU32(&buf, a, try lenU32(col.name.len));
         try buf.appendSlice(a, col.name);
         try buf.append(a, @intFromEnum(col.type));
     }
-    try putU32(&buf, a, @intCast(d.rows.len));
+    try putU32(&buf, a, try lenU32(d.rows.len));
     for (d.rows) |row| {
         for (row) |v| {
             switch (v) {
@@ -254,7 +260,7 @@ pub fn serialize(a: std.mem.Allocator, d: Dataset) SerializeError![]u8 {
                 },
                 .text => |t| {
                     try buf.append(a, 3);
-                    try putU32(&buf, a, @intCast(t.len));
+                    try putU32(&buf, a, try lenU32(t.len));
                     try buf.appendSlice(a, t);
                 },
                 .bool => |b| {
@@ -482,6 +488,27 @@ test "serialize / deserialize round-trip" {
     try testing.expect(out.cell(1, "sym").?.isNull());
     try testing.expectEqual(ColumnType.bool, out.columns[3].type);
     try testing.expectError(DeserializeError.Corrupt, deserialize(a, bytes[0 .. bytes.len - 3]));
+}
+
+test "serialize rejects a length that overflows the u32 wire field" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A slice whose *length* exceeds u32 max (its bytes are never touched: the
+    // guard fires before any iteration/copy). Crafting the fat pointer this way
+    // avoids allocating >4 GiB just to exercise the boundary. Previously this
+    // reached `@intCast`, which panics in safe builds instead of erroring.
+    var one = [_]Column{.{ .name = "x", .type = .int }};
+    const oversized: []const Column = @as([*]const Column, &one)[0..(@as(usize, 1) << 33)];
+    try testing.expectError(error.TooLarge, serialize(a, .{ .columns = oversized, .rows = &.{} }));
+
+    // Same guard on an over-long text cell value.
+    var byte = [_]u8{0};
+    const huge_text: []const u8 = @as([*]const u8, &byte)[0..(@as(usize, 1) << 33)];
+    const cols = [_]Column{.{ .name = "t", .type = .text }};
+    const rows = [_][]const Value{&.{.{ .text = huge_text }}};
+    try testing.expectError(error.TooLarge, serialize(a, .{ .columns = &cols, .rows = &rows }));
 }
 
 test "toJson emits the {columns,rows} shape" {
