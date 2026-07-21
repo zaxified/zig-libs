@@ -169,6 +169,7 @@ const module_list = [_]Module{
     .{ .name = "chachapoly" },
     .{ .name = "k256" },
     .{ .name = "p256" },
+    .{ .name = "ripemd160" },
     // Scaffold more here (copy modules/_template) — see CONVENTIONS.md
     // "How to add a module" and the README "Roadmap / Non-goals" sections.
 };

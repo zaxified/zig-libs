@@ -11,7 +11,7 @@ cross-project-reusable capability — a production-grade implementation of a pro
 or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
 authors' other projects depend on it, not the reverse.
 
-**Status:** 150 modules · 4856 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 151 modules · 4863 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ## Using a module
@@ -166,6 +166,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | Module | What it does | Platform | Deps |
 |---|---|---|---|
 | `hashdigest` | Streaming digests — one-shot / incremental / file (EOF-read, size-0 `/proc` safe); SHA-256 convenience + a multi-algorithm layer (SHA-2/SHA-3/BLAKE2b/BLAKE3) | any | — |
+| `ripemd160` | RIPEMD-160 (ISO/IEC 10118-3) — std-crypto-style `init`/`update`/`final` streaming hash (little-endian length padding, unlike SHA-2's BE) + `hash160` (`RIPEMD160(SHA256(x))`, the Bitcoin pubkey-hash primitive) | any | — |
 | `sealedbox` | NaCl `crypto_box_seal` — anonymous-sender X25519 public-key encryption (thin over `std.crypto`) + base64/hex key serialization | any | — |
 | `rsa` | Pure-Zig RSA (PKCS#1 v2.2, RFC 8017) over `std.crypto.ff` — public + CRT-private keys, PKCS1-v1_5 **and PSS** sign/verify, **OAEP** + PKCS1-v1_5 encrypt/decrypt, **keygen**, DER/PEM + **OpenSSH** (bcrypt-pbkdf) key parsing, X.509 self-signed certs; OpenSSL-KAT-validated | any | — |
 | `x509` | X.509 **certificate-chain / path validation** (RFC 5280 §6) — the multi-certificate trust verifier `std.crypto.Certificate` lacks: chain building against a trust store, the extension parsing std omits (basicConstraints / keyUsage / extKeyUsage / SKI-AKI), validity + signature + name checks along the whole path. Consumers: mutual-TLS client-certificate auth, OPC-UA trust lists | any | rsa |
