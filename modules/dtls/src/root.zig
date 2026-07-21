@@ -1,11 +1,22 @@
 // SPDX-License-Identifier: MIT
 
-//! dtls — DTLS 1.3 (RFC 9147). The key exchange is PSK-only (psk_ke — no
-//! (EC)DHE, see "Certificate mode" below for exactly why); an ADDITIVE
-//! certificate-mode AUTHENTICATION layer (RFC 8446 §4.4 Certificate/
-//! CertificateVerify/CertificateRequest) sits on top of that unchanged PSK
-//! key exchange — see `Connection.zig`'s "certificate mode" section for the
-//! full design + deferred-scope notes. Deliberately does NOT depend on this
+//! dtls — DTLS 1.3 (RFC 9147). TWO key-exchange modes (`Config.key_exchange`,
+//! see `Connection.KeyExchange`):
+//!   - `.psk` (default): PSK-only (`psk_ke`, no (EC)DHE), with an ADDITIVE
+//!     certificate-mode AUTHENTICATION layer (RFC 8446 §4.4 Certificate/
+//!     CertificateVerify/CertificateRequest) that can sit on top of the
+//!     unchanged PSK key exchange — see `Connection.zig`'s "certificate mode"
+//!     section for the full design + deferred-scope notes.
+//!   - `.cert_dhe`: a PSK-LESS certificate-only handshake with ephemeral
+//!     (EC)DHE (X25519, RFC 8446 §4.2.8 `key_share`) for forward secrecy —
+//!     the standard TLS-1.3 `certificate` handshake. The ECDHE shared secret
+//!     is fed into the SAME key schedule (`keyschedule.deriveHandshakeSecret`
+//!     with a zero-PSK early secret, RFC 8446 §7.1 — the schedule was already
+//!     DHE-capable; no forked crypto), and certificate auth reuses the same
+//!     `certverify`/`certauth` plumbing. Validated: the X25519 key_share +
+//!     key-schedule feed against RFC 8448 §3's external ECDHE vector; the
+//!     full flow by client↔server self-interop (server-only + mutual auth).
+//! Deliberately does NOT depend on this
 //! collection's separate `x509` certificate-chain-validator scaffold (own
 //! module, own SPEC.md) — certificate mode here reuses `std.crypto
 //! .Certificate` + this module's existing `rsa` dependency directly
@@ -98,9 +109,7 @@
 //! is detected — RFC 8446 §4.1.3's magic `random` — and rejected with a
 //! typed error rather than silently mishandled); 0-RTT/early data; session
 //! resumption (`res binder`/NewSessionTicket); key update (RFC 8446
-//! §4.6.3); a genuine (EC)DHE-based, PSK-less certificate-ONLY key exchange
-//! (certificate mode as implemented AUTHENTICATES on top of the existing
-//! PSK key exchange — see above — rather than replacing it); and the CCM
+//! §4.6.3); and the CCM
 //! suites (Zig 0.16 std ships only a 13-byte-nonce CCM; the TLS/DTLS
 //! profile needs 12 — see `aead.zig`'s CCM caveat).
 //!
@@ -187,6 +196,9 @@ pub const Connection = connection.Connection;
 pub const Config = connection.Config;
 pub const Role = connection.Role;
 pub const CipherSuite = connection.CipherSuite;
+/// PSK (`.psk`) vs. PSK-less ephemeral-X25519 certificate (`.cert_dhe`) mode
+/// selector for `Config.key_exchange` — see `Connection.KeyExchange`.
+pub const KeyExchange = connection.KeyExchange;
 
 pub const meta = .{
     .platform = .any,
@@ -195,7 +207,7 @@ pub const meta = .{
     // epoch/sequence-number/key state; nothing shared/global (mirrors the
     // `ssh` module's Transport reasoning).
     .concurrency = .single_owner,
-    .model_after = "RFC 9147 (DTLS 1.3, PSK mode) + RFC 8446 (TLS 1.3 shared key schedule/handshake message shapes; RFC 9147 §5.8/§5.9 reuse these with the \"dtls13\" label prefix); RFC 8446 §4.4.3 (CertificateVerify, in `certverify.zig`)",
+    .model_after = "RFC 9147 (DTLS 1.3, PSK mode + PSK-less cert-only ephemeral-X25519 mode) + RFC 8446 (TLS 1.3 shared key schedule/handshake message shapes; RFC 9147 §5.8/§5.9 reuse these with the \"dtls13\" label prefix); RFC 8446 §4.2.7/§4.2.8 (supported_groups/key_share) + RFC 7748 (X25519); RFC 8446 §4.4.3 (CertificateVerify, in `certverify.zig`)",
     // `rsa`: solely for `certverify.zig`'s RSASSA-PSS dispatch
     // (rsa_pss_rsae_sha{256,384,512}) -- the PSK-only flight engine itself
     // still needs no sibling modules, see the "meta.deps" test below.

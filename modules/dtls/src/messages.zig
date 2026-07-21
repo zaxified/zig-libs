@@ -44,10 +44,25 @@ pub const HandshakeType = enum(u8) {
 
 pub const ExtensionType = enum(u16) {
     server_name = 0,
+    supported_groups = 10,
+    signature_algorithms = 13,
     supported_versions = 43,
     cookie = 44,
     pre_shared_key = 41,
     psk_key_exchange_modes = 45,
+    key_share = 51,
+    _,
+};
+
+/// RFC 8446 §4.2.7 `NamedGroup` code points for the (EC)DHE groups this
+/// module's cert-only-DHE handshake mode can offer/select. Only `x25519` is
+/// wired end-to-end (its `KeyShareEntry.key_exchange` is the raw 32-byte
+/// X25519 public key, RFC 8446 §4.2.8.1 / RFC 7748); `secp256r1` is listed
+/// so `supported_groups` can advertise it, but the key-exchange machinery in
+/// `Connection.zig` only computes X25519 shares.
+pub const NamedGroup = enum(u16) {
+    secp256r1 = 0x0017,
+    x25519 = 0x001d,
     _,
 };
 
@@ -273,6 +288,136 @@ pub fn encodeSelectedIdentity(index: u16, out: *[2]u8) void {
 
 pub fn decodeSelectedIdentity(buf: *const [2]u8) u16 {
     return std.mem.readInt(u16, buf, .big);
+}
+
+// ── u16-list extensions: supported_groups (RFC 8446 §4.2.7) and
+// signature_algorithms (RFC 8446 §4.2.3) ────────────────────────────────
+//
+// Both are wire-identical: a 2-byte outer length prefix (byte count, not
+// element count) followed by a sequence of big-endian u16 values. The
+// module performs NO negotiation over these (see `Connection.zig`'s
+// "certificate mode" deferred notes) — they are advertised so a compliant
+// peer's parser accepts the ClientHello, and (server side) the offered
+// group list is scanned only to confirm the one group this module speaks
+// (x25519) is present.
+
+/// Encodes a `<2..2^16-1>`-framed list of big-endian u16 values (the shared
+/// shape of `supported_groups` and `signature_algorithms`).
+pub fn encodeU16ListExtension(values: []const u16, out: []u8) MessageError![]u8 {
+    const body = values.len * 2;
+    if (body > std.math.maxInt(u16)) return error.ListTooLong;
+    if (out.len < 2 + body) return error.BufferTooShort;
+    std.mem.writeInt(u16, out[0..2], @intCast(body), .big);
+    var i: usize = 2;
+    for (values) |v| {
+        std.mem.writeInt(u16, out[i..][0..2], v, .big);
+        i += 2;
+    }
+    return out[0..i];
+}
+
+/// Decodes a `<2..2^16-1>`-framed list of big-endian u16 values into
+/// caller-supplied `out`.
+pub fn decodeU16ListExtension(data: []const u8, out: []u16) MessageError![]u16 {
+    if (data.len < 2) return error.BufferTooShort;
+    const body: usize = std.mem.readInt(u16, data[0..2], .big);
+    if (data.len < 2 + body) return error.BufferTooShort;
+    if (body % 2 != 0) return error.Malformed;
+    const n = body / 2;
+    if (n > out.len) return error.TooManyExtensions;
+    var i: usize = 2;
+    for (0..n) |k| {
+        out[k] = std.mem.readInt(u16, data[i..][0..2], .big);
+        i += 2;
+    }
+    return out[0..n];
+}
+
+/// `supported_groups` (RFC 8446 §4.2.7) — alias of `encodeU16ListExtension`.
+pub fn encodeSupportedGroups(groups: []const u16, out: []u8) MessageError![]u8 {
+    return encodeU16ListExtension(groups, out);
+}
+/// `signature_algorithms` (RFC 8446 §4.2.3) — alias of `encodeU16ListExtension`.
+pub fn encodeSignatureAlgorithms(schemes: []const u16, out: []u8) MessageError![]u8 {
+    return encodeU16ListExtension(schemes, out);
+}
+
+// ── key_share extension (RFC 8446 §4.2.8) ────────────────────────────────
+//
+// struct {
+//     NamedGroup group;                 // u16
+//     opaque key_exchange<1..2^16-1>;   // the raw public share
+// } KeyShareEntry;
+//
+// ClientHello form is a `KeyShareEntry client_shares<0..2^16-1>` list; the
+// ServerHello form is a single bare `KeyShareEntry server_share` (no outer
+// list-length prefix). The `key_exchange` bytes are opaque here (for x25519,
+// the 32-byte public key) — this file frames them, `Connection.zig` computes
+// them (`std.crypto.dh.X25519`).
+
+pub const KeyShareEntry = struct {
+    group: u16,
+    key_exchange: []const u8,
+};
+
+/// ClientHello `key_share` (RFC 8446 §4.2.8.1): the `client_shares` list.
+pub fn encodeKeyShareClientHello(entries: []const KeyShareEntry, out: []u8) MessageError![]u8 {
+    var list_len: usize = 0;
+    for (entries) |e| list_len += 4 + e.key_exchange.len;
+    if (list_len > std.math.maxInt(u16)) return error.ListTooLong;
+    if (out.len < 2 + list_len) return error.BufferTooShort;
+    std.mem.writeInt(u16, out[0..2], @intCast(list_len), .big);
+    var i: usize = 2;
+    for (entries) |e| {
+        if (e.key_exchange.len > std.math.maxInt(u16)) return error.ListTooLong;
+        std.mem.writeInt(u16, out[i..][0..2], e.group, .big);
+        std.mem.writeInt(u16, out[i + 2 ..][0..2], @intCast(e.key_exchange.len), .big);
+        @memcpy(out[i + 4 ..][0..e.key_exchange.len], e.key_exchange);
+        i += 4 + e.key_exchange.len;
+    }
+    return out[0..i];
+}
+
+/// Decodes a ClientHello `key_share` list into caller-supplied `out`. Each
+/// returned `KeyShareEntry.key_exchange` aliases into `data` — no copy.
+pub fn decodeKeyShareClientHello(data: []const u8, entries_out: []KeyShareEntry) MessageError![]KeyShareEntry {
+    if (data.len < 2) return error.BufferTooShort;
+    const list_len: usize = std.mem.readInt(u16, data[0..2], .big);
+    if (data.len < 2 + list_len) return error.BufferTooShort;
+    var i: usize = 2;
+    const end = 2 + list_len;
+    var n: usize = 0;
+    while (i < end) {
+        if (i + 4 > end) return error.Malformed;
+        const group = std.mem.readInt(u16, data[i..][0..2], .big);
+        const klen: usize = std.mem.readInt(u16, data[i + 2 ..][0..2], .big);
+        i += 4;
+        if (i + klen > end) return error.Malformed;
+        if (n >= entries_out.len) return error.TooManyExtensions;
+        entries_out[n] = .{ .group = group, .key_exchange = data[i..][0..klen] };
+        n += 1;
+        i += klen;
+    }
+    return entries_out[0..n];
+}
+
+/// ServerHello `key_share` (RFC 8446 §4.2.8): a single bare `KeyShareEntry`
+/// (no outer list-length prefix).
+pub fn encodeKeyShareServerHello(entry: KeyShareEntry, out: []u8) MessageError![]u8 {
+    if (entry.key_exchange.len > std.math.maxInt(u16)) return error.ListTooLong;
+    if (out.len < 4 + entry.key_exchange.len) return error.BufferTooShort;
+    std.mem.writeInt(u16, out[0..2], entry.group, .big);
+    std.mem.writeInt(u16, out[2..4], @intCast(entry.key_exchange.len), .big);
+    @memcpy(out[4..][0..entry.key_exchange.len], entry.key_exchange);
+    return out[0 .. 4 + entry.key_exchange.len];
+}
+
+pub fn decodeKeyShareServerHello(data: []const u8) MessageError!KeyShareEntry {
+    if (data.len < 4) return error.BufferTooShort;
+    const group = std.mem.readInt(u16, data[0..2], .big);
+    const klen: usize = std.mem.readInt(u16, data[2..4], .big);
+    if (data.len < 4 + klen) return error.Malformed;
+    return .{ .group = group, .key_exchange = data[4..][0..klen] };
 }
 
 // ── ClientHello (RFC 8446 §4.1.2, reused by DTLS 1.3 — RFC 9147 §5.3) ────
@@ -932,6 +1077,79 @@ test "CertificateRequest round-trip: empty context and extensions" {
     const dec = try decodeCertificateRequest(enc, &ext_out);
     try testing.expectEqual(@as(usize, 0), dec.certificate_request_context.len);
     try testing.expectEqual(@as(usize, 0), dec.extensions.len);
+}
+
+// ── key_share / supported_groups / signature_algorithms (cert-DHE mode) ──
+
+test "supported_groups / signature_algorithms u16-list round-trip" {
+    const groups = [_]u16{ @intFromEnum(NamedGroup.x25519), @intFromEnum(NamedGroup.secp256r1) };
+    var buf: [16]u8 = undefined;
+    const enc = try encodeSupportedGroups(&groups, &buf);
+    // 2-byte outer length (4) + two u16s.
+    try testing.expectEqualSlices(u8, &.{ 0, 4, 0x00, 0x1d, 0x00, 0x17 }, enc);
+    var out: [4]u16 = undefined;
+    const dec = try decodeU16ListExtension(enc, &out);
+    try testing.expectEqualSlices(u16, &groups, dec);
+}
+
+test "signature_algorithms odd-length body is a typed error" {
+    const bad = [_]u8{ 0, 3, 0x08, 0x04, 0x08 }; // declares 3 body bytes (odd)
+    var out: [4]u16 = undefined;
+    try testing.expectError(error.Malformed, decodeU16ListExtension(&bad, &out));
+}
+
+test "key_share ClientHello round-trip (x25519 32-byte share)" {
+    const share = [_]u8{0xAB} ** 32;
+    const entries = [_]KeyShareEntry{.{ .group = @intFromEnum(NamedGroup.x25519), .key_exchange = &share }};
+    var buf: [64]u8 = undefined;
+    const enc = try encodeKeyShareClientHello(&entries, &buf);
+
+    var out: [4]KeyShareEntry = undefined;
+    const dec = try decodeKeyShareClientHello(enc, &out);
+    try testing.expectEqual(@as(usize, 1), dec.len);
+    try testing.expectEqual(@as(u16, 0x001d), dec[0].group);
+    try testing.expectEqualSlices(u8, &share, dec[0].key_exchange);
+}
+
+test "key_share ClientHello: multiple entries decode independently" {
+    const s1 = [_]u8{0x11} ** 32;
+    const s2 = [_]u8{0x22} ** 65; // secp256r1 uncompressed point size
+    const entries = [_]KeyShareEntry{
+        .{ .group = 0x001d, .key_exchange = &s1 },
+        .{ .group = 0x0017, .key_exchange = &s2 },
+    };
+    var buf: [160]u8 = undefined;
+    const enc = try encodeKeyShareClientHello(&entries, &buf);
+    var out: [4]KeyShareEntry = undefined;
+    const dec = try decodeKeyShareClientHello(enc, &out);
+    try testing.expectEqual(@as(usize, 2), dec.len);
+    try testing.expectEqualSlices(u8, &s1, dec[0].key_exchange);
+    try testing.expectEqualSlices(u8, &s2, dec[1].key_exchange);
+}
+
+test "key_share ServerHello round-trip (single bare entry, no list prefix)" {
+    const share = [_]u8{0xCD} ** 32;
+    var buf: [64]u8 = undefined;
+    const enc = try encodeKeyShareServerHello(.{ .group = 0x001d, .key_exchange = &share }, &buf);
+    // group(2) + len(2) + 32 = 36 bytes, no outer list length.
+    try testing.expectEqual(@as(usize, 36), enc.len);
+    const dec = try decodeKeyShareServerHello(enc);
+    try testing.expectEqual(@as(u16, 0x001d), dec.group);
+    try testing.expectEqualSlices(u8, &share, dec.key_exchange);
+}
+
+test "key_share ClientHello: inner length overrunning the list is a typed error, never a panic" {
+    const share = [_]u8{0xAB} ** 32;
+    const entries = [_]KeyShareEntry{.{ .group = 0x001d, .key_exchange = &share }};
+    var buf: [64]u8 = undefined;
+    const enc = try encodeKeyShareClientHello(&entries, &buf);
+    var corrupted: [64]u8 = undefined;
+    @memcpy(corrupted[0..enc.len], enc);
+    // Byte layout: [0..2)=list_len, [2..4)=group, [4..6)=key_len. Inflate the
+    // key length past the still-fully-present list.
+    corrupted[5] = 0xFF;
+    var out: [4]KeyShareEntry = undefined;
+    try testing.expectError(error.Malformed, decodeKeyShareClientHello(corrupted[0..enc.len], &out));
 }
 
 test "HandshakeType: RFC 8446 §4 wire code points for the cert-mode types" {

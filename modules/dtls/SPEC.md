@@ -131,11 +131,7 @@ left in place rather than silently deleted, corrected here):
   wrong-key rejection, untrusted-anchor rejection, required-but-absent-cert
   rejection) — same in-memory-oracle style as the PSK suite, no external
   peer.
-- **Still deferred (now explicit, not silently absent):** a genuine
-  (EC)DHE-based, PSK-LESS certificate-only key exchange (this engine has no
-  `key_share` extension/ECDH machinery at all — real new crypto, out of
-  this pass's "plumbing over certverify" scope; certificates here
-  AUTHENTICATE on top of the PSK exchange, they don't replace it);
+- **Still deferred (now explicit, not silently absent):**
   `signature_algorithms` extension negotiation; full RFC 5280 §6
   certification-path building (multi-hop chains, name constraints,
   `basicConstraints`/`keyUsage` policy checks, revocation) — `.trust_anchor`
@@ -158,6 +154,58 @@ left in place rather than silently deleted, corrected here):
   that file's own test suite (`test "parseLeafPublicKey: ..."` intentionally
   does NOT test adversarial input for exactly this reason — see its
   comment).
+
+## Cert-only (EC)DHE mode (RFC 8446 §4.2.8 key_share + X25519, LANDED)
+
+**STATUS UPDATE:** the "genuine (EC)DHE-based, PSK-LESS certificate-only key
+exchange" listed as deferred above is now IMPLEMENTED as a distinct handshake
+mode, selected by `Config.key_exchange = .cert_dhe` (default stays `.psk`, so
+every PSK / cert-over-PSK path and its RFC 8448 KATs are byte-for-byte
+unaffected — proven by the untouched existing suite). Summary:
+
+- **`messages.zig`:** `key_share` (RFC 8446 §4.2.8, ClientHello list +
+  ServerHello single-entry forms), `supported_groups` (§4.2.7),
+  `signature_algorithms` (§4.2.3) encode/decode, plus the `NamedGroup` enum.
+  Only **X25519** (group `0x001d`) is wired end-to-end; `secp256r1` is
+  advertised in `supported_groups` for parser-compatibility but no secp256r1
+  shares are computed.
+- **`Connection.zig`:** in `.cert_dhe` mode the ClientHello offers
+  `{supported_groups, signature_algorithms, key_share}` with a fresh
+  ephemeral X25519 keypair (`std.crypto.dh.X25519`, seeded from the
+  caller-supplied `std.Random`) and **no `pre_shared_key`, no binder**; the
+  ServerHello returns its own X25519 share. The ECDHE shared secret is fed
+  into the **existing, unmodified** `keyschedule.deriveHandshakeSecret` (the
+  early secret's IKM is the zero PSK, RFC 8446 §7.1 — the schedule was
+  already DHE-capable, this only supplies the secret; the function was NOT
+  forked). Server-only auth and mutual auth (`request_client_cert`) both work,
+  reusing the same `certverify`/`certauth`/cert-message plumbing as
+  cert-over-PSK mode. The ephemeral private key **and** the shared secret are
+  `std.crypto.secureZero`-wiped as soon as the handshake secret is derived
+  (forward-secrecy hygiene), and again in `deinit`.
+
+**Validation / honesty:**
+- **External-vector KAT (RFC 8448 §3):** the X25519 key_share computation
+  (`recoverPublicKey` + `scalarmult`, both directions) and its feed into the
+  key schedule reproduce RFC 8448 §3's published client/server X25519
+  private+public keys, the `8bd4054f…` shared secret, and the derived
+  early+handshake secrets byte-for-byte. §3 is a psk_dhe_ke trace, but its
+  ECDHE math is identical and its early secret is over an all-zero PSK —
+  exactly this mode's construction.
+- **Self-interop only (no external vector):** the full cert-only wire FLOW
+  (ClientHello→ServerHello→{EE,[CertReq],Cert,CertVerify,Finished}→…). **No
+  public DTLS 1.3 cert-only byte-trace exists**, so this is validated by
+  in-memory client↔server interop (server-only + mutual auth + reject-teeth:
+  tampered ServerHello key_share, wrong CertificateVerify key, untrusted
+  anchor, missing key_share) — NOT against a third-party peer. **Flagged for
+  the interop-vector audit backlog** alongside the PSK-mode self-interop
+  caveat in `root.zig`.
+
+**Untrusted-DER hazard (unchanged, inherited):** `.cert_dhe` mode parses the
+same PEER-supplied X.509 via the same `certauth` path, so it inherits the
+`std.crypto.Certificate.parse` non-panic-safety gap documented below /  in
+`certauth.zig` verbatim — this pass adds no new cert-parse call sites beyond
+that path and does not worsen it; hardened DER parsing remains the tracked
+follow-up.
 
 ## Threat model / out of scope
 

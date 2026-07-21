@@ -42,7 +42,28 @@ const engine = @import("engine.zig");
 const certverify = @import("certverify.zig");
 const certauth = @import("certauth.zig");
 
+const X25519 = std.crypto.dh.X25519;
+
 pub const Role = enum { client, server };
+
+/// Which key-exchange this connection runs (RFC 8446 §4.2.9 / §4.2.8):
+///
+/// - `.psk` (default): the original PSK-only exchange (`psk_ke`) — the PSK
+///   supplies all session-key material; `Config.cert` may still AUTHENTICATE
+///   on top (see the "certificate mode" section). Requires a non-empty
+///   `Config.psk`/`psk_identity`; every existing PSK/cert-over-PSK test uses
+///   this mode and is byte-for-byte unaffected.
+/// - `.cert_dhe`: a PSK-LESS certificate-only handshake with ephemeral
+///   (EC)DHE (X25519) for forward secrecy — the standard TLS-1.3
+///   `certificate` handshake. The ClientHello offers `key_share` +
+///   `supported_groups` + `signature_algorithms` (NO `pre_shared_key`, NO
+///   binder); the ECDHE shared secret is fed into the EXISTING key schedule
+///   (`keyschedule.deriveHandshakeSecret` with a zero/empty-PSK early
+///   secret, RFC 8446 §7.1) — the schedule was already DHE-capable, only the
+///   wiring is new. Authentication is by certificate (server always presents
+///   one; the client optionally, via `request_client_cert`), reusing the
+///   same `certverify`/`certauth` plumbing as certificate-over-PSK mode.
+pub const KeyExchange = enum { psk, cert_dhe };
 
 /// RFC 8446 §B.4 registry values. `aes_128_ccm_8_sha256` is RFC 7925 §4.2's
 /// default for the CoAP/constrained-IoT profile — the suite this module's
@@ -118,8 +139,14 @@ pub const PeerVerify = union(enum) {
 
 pub const Config = struct {
     role: Role,
-    psk_identity: []const u8,
-    psk: []const u8,
+    /// Which key-exchange to run. `.psk` (default) keeps the original
+    /// PSK-only behavior; `.cert_dhe` runs the PSK-less ephemeral-X25519
+    /// certificate handshake (see `KeyExchange`). The two `psk*` fields below
+    /// are IGNORED in `.cert_dhe` mode (they default to empty so a cert-DHE
+    /// caller need not supply them).
+    key_exchange: KeyExchange = .psk,
+    psk_identity: []const u8 = &.{},
+    psk: []const u8 = &.{},
     /// Preference order, most-preferred first.
     cipher_suites: []const CipherSuite = &.{.aes_128_ccm_8_sha256},
 
@@ -160,9 +187,18 @@ pub const Config = struct {
     /// 'mode' means here" note below) — a `Config` with `cert` set but an
     /// empty `psk` is still rejected.
     pub fn validate(self: Config) ConfigError!void {
-        if (self.psk.len == 0) return error.EmptyPsk;
-        if (self.psk_identity.len == 0) return error.EmptyPskIdentity;
         if (self.cipher_suites.len == 0) return error.NoCipherSuites;
+        switch (self.key_exchange) {
+            .psk => {
+                if (self.psk.len == 0) return error.EmptyPsk;
+                if (self.psk_identity.len == 0) return error.EmptyPskIdentity;
+            },
+            // `.cert_dhe`: PSK fields are unused, so they are NOT required.
+            // Authentication material (`cert`/`peer_verify`) is role-specific
+            // (a server presents a cert, a client trusts one) and validated
+            // at handshake time, not here.
+            .cert_dhe => {},
+        }
     }
 };
 
@@ -210,6 +246,16 @@ pub const HandshakeError = messages.MessageError || handshake.FrameError || hand
     /// A decoded handshake message had the wrong `msg_type`/content type
     /// for the state the connection is in.
     UnexpectedMessage,
+    /// `.cert_dhe` mode: the ClientHello (server side) or ServerHello
+    /// (client side) carried no usable `key_share` extension — either the
+    /// extension was absent, or it offered/selected no group this module
+    /// speaks (only x25519 is wired).
+    MissingKeyShare,
+    /// `.cert_dhe` mode: the peer's X25519 public share is malformed or a
+    /// low-order/identity point (`std.crypto.dh.X25519` rejected it), so no
+    /// usable shared secret could be computed. Rejected rather than used —
+    /// an identity shared secret would be catastrophic.
+    KeyExchangeFailed,
     /// A peer sent a handshake message across more than one DTLS fragment.
     /// This engine only ever SENDS single-fragment messages (they're all
     /// small enough), and only ever RECEIVES single-fragment messages from
@@ -310,6 +356,34 @@ const max_certreq_body: usize = 128;
 /// without needing to know the configured scheme at comptime.
 const max_sig_len: usize = certverify.maxSignatureLen(.rsa_pss_rsae_sha256);
 
+// ── cert-only-DHE (`.cert_dhe`) mode constants ────────────────────────────
+
+/// The single (EC)DHE group this module computes shares for (RFC 8446
+/// §4.2.8.1 / RFC 7748 X25519). `supported_groups` additionally advertises
+/// secp256r1 for parser-compatibility, but only x25519 shares are generated.
+const x25519_group: u16 = @intFromEnum(messages.NamedGroup.x25519);
+
+/// The `signature_algorithms` (RFC 8446 §4.2.3) this module's ClientHello
+/// advertises in `.cert_dhe` mode. This is INFORMATIONAL only — no scheme
+/// negotiation is performed (see the "certificate mode" deferred notes); a
+/// peer learns the scheme actually used from each CertificateVerify's own
+/// `algorithm` field. The list simply covers every scheme `certverify`
+/// supports so a compliant peer's ClientHello parser is satisfied.
+const advertised_sig_algs = [_]u16{
+    @intFromEnum(certverify.SignatureScheme.ecdsa_secp256r1_sha256),
+    @intFromEnum(certverify.SignatureScheme.ecdsa_secp384r1_sha384),
+    @intFromEnum(certverify.SignatureScheme.rsa_pss_rsae_sha256),
+    @intFromEnum(certverify.SignatureScheme.rsa_pss_rsae_sha384),
+    @intFromEnum(certverify.SignatureScheme.rsa_pss_rsae_sha512),
+    @intFromEnum(certverify.SignatureScheme.ed25519),
+};
+
+/// The `supported_groups` (RFC 8446 §4.2.7) advertised in `.cert_dhe` mode.
+const advertised_groups = [_]u16{
+    x25519_group,
+    @intFromEnum(messages.NamedGroup.secp256r1),
+};
+
 pub const Connection = struct {
     role: Role,
     config: Config,
@@ -362,6 +436,19 @@ pub const Connection = struct {
     /// epoch's `send_seq`/`recv_max_seq`/`recv_seen_any` above.
     hs0: EpochSeqState = .{},
     hs2: EpochSeqState = .{},
+    /// `.cert_dhe` mode only: this side's ephemeral X25519 key pair for the
+    /// handshake's (EC)DHE. The CLIENT generates these in `startHandshake`
+    /// and keeps `ecdhe_secret` resident until `handleFlight` computes the
+    /// shared secret (then zeroizes it immediately — forward secrecy); the
+    /// SERVER generates + consumes them entirely within
+    /// `serverProcessClientHello`. `ecdhe_public` is the wire `key_share`
+    /// value. Unused (left `undefined`) in `.psk` mode. Zeroized in `deinit`.
+    ecdhe_secret: [32]u8 = undefined,
+    ecdhe_public: [32]u8 = undefined,
+    /// Whether `ecdhe_secret` currently holds live private-key material (so
+    /// `deinit` only wipes real bytes, and a double-wipe after the in-handshake
+    /// zeroization is harmless).
+    ecdhe_secret_live: bool = false,
     /// RFC 9147 §5.7 retransmission: the last flight WE sent, cached
     /// verbatim so `poll` can resend it unchanged on timeout.
     last_flight: [1500]u8 = undefined,
@@ -415,7 +502,10 @@ pub const Connection = struct {
         if (self.state != .start) return error.WrongState;
 
         var ch_body_buf: [512]u8 = undefined;
-        const ch_body = try self.buildClientHello(random, &ch_body_buf);
+        const ch_body = switch (self.config.key_exchange) {
+            .psk => try self.buildClientHello(random, &ch_body_buf),
+            .cert_dhe => try self.buildClientHelloCertDhe(random, &ch_body_buf),
+        };
         self.transcript.append(@intFromEnum(messages.HandshakeType.client_hello), ch_body);
 
         var frag_buf: [512 + handshake.header_len]u8 = undefined;
@@ -618,6 +708,11 @@ pub const Connection = struct {
         std.crypto.secureZero(u8, &self.hs_traffic_server);
         std.crypto.secureZero(u8, &self.pending_ap_client);
         std.crypto.secureZero(u8, &self.pending_ap_server);
+        // `.cert_dhe` ephemeral X25519 private key — already wiped mid-handshake
+        // for forward secrecy, but wipe again defensively (idempotent; the
+        // handshake may have errored out before reaching that point).
+        std.crypto.secureZero(u8, &self.ecdhe_secret);
+        self.ecdhe_secret_live = false;
         self.write_keys.key_len = 0;
         self.write_keys.sn_len = 0;
         self.read_keys.key_len = 0;
@@ -683,6 +778,90 @@ pub const Connection = struct {
         @memcpy(ch_full[ch_full.len - 32 ..], &binder);
 
         return ch_full;
+    }
+
+    /// `.cert_dhe` mode ClientHello (RFC 8446 §4.1.2 / §4.2): generates this
+    /// client's ephemeral X25519 key pair (stored for `handleFlightClient`),
+    /// then builds `random || empty session id || cipher_suites ||
+    /// {supported_groups, signature_algorithms, key_share}` — NO
+    /// `pre_shared_key`, NO `psk_key_exchange_modes`, NO binder (this is the
+    /// PSK-less certificate handshake). The `key_share` offers a single
+    /// X25519 entry carrying `ecdhe_public`.
+    fn buildClientHelloCertDhe(self: *Connection, random: std.Random, body_buf: []u8) HandshakeError![]u8 {
+        var random_bytes: [32]u8 = undefined;
+        random.bytes(&random_bytes);
+
+        // Ephemeral X25519 key pair (RFC 7748). `generateDeterministic` takes
+        // the 32-byte secret scalar directly; we source it from the
+        // caller-supplied RNG (std 0.16 removed `std.crypto.random`), exactly
+        // as `X25519.KeyPair.generate` would from a system CSPRNG.
+        var seed: [32]u8 = undefined;
+        random.bytes(&seed);
+        const kp = X25519.KeyPair.generateDeterministic(seed) catch return error.KeyExchangeFailed;
+        std.crypto.secureZero(u8, &seed);
+        self.ecdhe_secret = kp.secret_key;
+        self.ecdhe_public = kp.public_key;
+        self.ecdhe_secret_live = true;
+
+        var cs_arr: [8]u16 = undefined;
+        if (self.config.cipher_suites.len > cs_arr.len) return error.BufferTooShort;
+        for (self.config.cipher_suites, 0..) |cs, i| cs_arr[i] = @intFromEnum(cs);
+        const cs_list = cs_arr[0..self.config.cipher_suites.len];
+
+        var groups_buf: [2 + 2 * advertised_groups.len]u8 = undefined;
+        const groups_ext = try messages.encodeSupportedGroups(&advertised_groups, &groups_buf);
+
+        var sigalgs_buf: [2 + 2 * advertised_sig_algs.len]u8 = undefined;
+        const sigalgs_ext = try messages.encodeSignatureAlgorithms(&advertised_sig_algs, &sigalgs_buf);
+
+        var ks_buf: [2 + 4 + 32]u8 = undefined;
+        const ks_entries = [_]messages.KeyShareEntry{.{ .group = x25519_group, .key_exchange = &self.ecdhe_public }};
+        const ks_ext = try messages.encodeKeyShareClientHello(&ks_entries, &ks_buf);
+
+        const exts = [_]messages.Extension{
+            .{ .ext_type = @intFromEnum(messages.ExtensionType.supported_groups), .data = groups_ext },
+            .{ .ext_type = @intFromEnum(messages.ExtensionType.signature_algorithms), .data = sigalgs_ext },
+            .{ .ext_type = @intFromEnum(messages.ExtensionType.key_share), .data = ks_ext },
+        };
+
+        return messages.encodeClientHello(.{
+            .random = random_bytes,
+            .legacy_session_id = &.{},
+            .cipher_suites = cs_list,
+            .extensions = &exts,
+        }, body_buf);
+    }
+
+    /// `.cert_dhe` server helper: finds a usable x25519 share in the
+    /// CLIENT's `key_share` extension (a `KeyShareEntry` LIST, RFC 8446
+    /// §4.2.8.1) among the ClientHello's decoded extensions and returns its
+    /// raw 32-byte public share, or a typed error if absent / no x25519
+    /// entry / wrong length (never a panic).
+    fn clientHelloX25519Share(exts: []const messages.Extension) HandshakeError![32]u8 {
+        for (exts) |e| {
+            if (e.ext_type != @intFromEnum(messages.ExtensionType.key_share)) continue;
+            var entries: [8]messages.KeyShareEntry = undefined;
+            const shares = messages.decodeKeyShareClientHello(e.data, &entries) catch return error.Malformed;
+            for (shares) |s| {
+                if (s.group == x25519_group and s.key_exchange.len == 32) return s.key_exchange[0..32].*;
+            }
+            return error.MissingKeyShare; // key_share present but no usable x25519 entry
+        }
+        return error.MissingKeyShare;
+    }
+
+    /// `.cert_dhe` client helper: extracts the SERVER's single-entry
+    /// `key_share` (RFC 8446 §4.2.8, no list prefix) from the ServerHello's
+    /// decoded extensions and returns its raw 32-byte x25519 public share, or
+    /// a typed error (never a panic).
+    fn serverHelloX25519Share(exts: []const messages.Extension) HandshakeError![32]u8 {
+        for (exts) |e| {
+            if (e.ext_type != @intFromEnum(messages.ExtensionType.key_share)) continue;
+            const share = messages.decodeKeyShareServerHello(e.data) catch return error.Malformed;
+            if (share.group != x25519_group or share.key_exchange.len != 32) return error.MissingKeyShare;
+            return share.key_exchange[0..32].*;
+        }
+        return error.MissingKeyShare;
     }
 
     /// Wraps `fragment_bytes` (a `handshake.zig` fragment: 12-byte header +
@@ -1108,38 +1287,71 @@ pub const Connection = struct {
         var ext_buf: [8]messages.Extension = undefined;
         const dec = messages.decodeClientHello(ch_body, &ext_buf) catch return error.Malformed;
 
-        var psk_ext: ?messages.Extension = null;
-        for (dec.extensions) |e| {
-            if (e.ext_type == @intFromEnum(messages.ExtensionType.pre_shared_key)) psk_ext = e;
-        }
-        const psk_data = (psk_ext orelse return error.NoMatchingPskIdentity).data;
-
-        var ids_buf: [4]messages.PskIdentity = undefined;
-        var binders_buf: [4][]const u8 = undefined;
-        const offered = messages.decodeOfferedPsks(psk_data, &ids_buf, &binders_buf) catch return error.Malformed;
-        if (offered.identities.len == 0 or offered.binders.len == 0) return error.NoMatchingPskIdentity;
-        if (!std.mem.eql(u8, offered.identities[0].identity, self.config.psk_identity)) return error.NoMatchingPskIdentity;
-        const binder0 = offered.binders[0];
-        if (binder0.len != 32) return error.Malformed;
-
-        // RFC 8446 §4.2.11.2 truncation point: right after the binders
-        // list's 2-byte length prefix, i.e. right before this (first, only)
-        // binder entry's own 1-byte length prefix. `binder0` aliases
-        // `ch_body` (no-copy decoding all the way down — see messages.zig),
-        // so its address gives the exact byte offset without assuming
-        // anything about extension count/order.
-        const truncate_at = (@intFromPtr(binder0.ptr) - 1) - @intFromPtr(ch_body.ptr);
-        if (truncate_at > ch_body.len) return error.Malformed;
-        const truncated = ch_body[0..truncate_at];
-
         const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
         const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
         const eh = emptySha256Hash();
-        const es = keyschedule.earlySecret(Hkdf, self.config.psk);
-        const bk = keyschedule.binderKey(Hkdf, es, &eh);
-        const binder_th = self.transcript.wouldBeHash(@intFromEnum(messages.HandshakeType.client_hello), ch_body.len, truncated);
-        const expected_binder = keyschedule.pskBinder(Hkdf, Hmac, bk, &binder_th);
-        if (!std.crypto.timing_safe.eql([32]u8, expected_binder, binder0[0..32].*)) return error.BinderVerifyFailed;
+
+        // The early secret (RFC 8446 §7.1) and, in `.cert_dhe` mode, the
+        // ephemeral (EC)DHE shared secret that feeds the handshake secret.
+        var es: [32]u8 = undefined;
+        var dhe_shared: ?[32]u8 = null;
+
+        switch (self.config.key_exchange) {
+            .psk => {
+                var psk_ext: ?messages.Extension = null;
+                for (dec.extensions) |e| {
+                    if (e.ext_type == @intFromEnum(messages.ExtensionType.pre_shared_key)) psk_ext = e;
+                }
+                const psk_data = (psk_ext orelse return error.NoMatchingPskIdentity).data;
+
+                var ids_buf: [4]messages.PskIdentity = undefined;
+                var binders_buf: [4][]const u8 = undefined;
+                const offered = messages.decodeOfferedPsks(psk_data, &ids_buf, &binders_buf) catch return error.Malformed;
+                if (offered.identities.len == 0 or offered.binders.len == 0) return error.NoMatchingPskIdentity;
+                if (!std.mem.eql(u8, offered.identities[0].identity, self.config.psk_identity)) return error.NoMatchingPskIdentity;
+                const binder0 = offered.binders[0];
+                if (binder0.len != 32) return error.Malformed;
+
+                // RFC 8446 §4.2.11.2 truncation point: right after the binders
+                // list's 2-byte length prefix, i.e. right before this (first,
+                // only) binder entry's own 1-byte length prefix. `binder0`
+                // aliases `ch_body` (no-copy decoding all the way down — see
+                // messages.zig), so its address gives the exact byte offset
+                // without assuming anything about extension count/order.
+                const truncate_at = (@intFromPtr(binder0.ptr) - 1) - @intFromPtr(ch_body.ptr);
+                if (truncate_at > ch_body.len) return error.Malformed;
+                const truncated = ch_body[0..truncate_at];
+
+                es = keyschedule.earlySecret(Hkdf, self.config.psk);
+                const bk = keyschedule.binderKey(Hkdf, es, &eh);
+                const binder_th = self.transcript.wouldBeHash(@intFromEnum(messages.HandshakeType.client_hello), ch_body.len, truncated);
+                const expected_binder = keyschedule.pskBinder(Hkdf, Hmac, bk, &binder_th);
+                if (!std.crypto.timing_safe.eql([32]u8, expected_binder, binder0[0..32].*)) return error.BinderVerifyFailed;
+            },
+            .cert_dhe => {
+                // PSK-less (EC)DHE: extract the client's x25519 share, make our
+                // own ephemeral key pair, and compute the shared secret. The
+                // early secret's IKM is the zero PSK (RFC 8446 §7.1: no PSK ⇒
+                // PSK = 0^Hash.length); the (EC)DHE secret is mixed in at the
+                // handshake secret below via the SAME `deriveHandshakeSecret`
+                // the PSK path uses — not a forked schedule.
+                const client_pub = try clientHelloX25519Share(dec.extensions);
+                var seed: [32]u8 = undefined;
+                random.bytes(&seed);
+                const kp = X25519.KeyPair.generateDeterministic(seed) catch return error.KeyExchangeFailed;
+                std.crypto.secureZero(u8, &seed);
+                var sk = kp.secret_key;
+                const shared = X25519.scalarmult(sk, client_pub) catch {
+                    std.crypto.secureZero(u8, &sk);
+                    return error.KeyExchangeFailed;
+                };
+                std.crypto.secureZero(u8, &sk); // forward secrecy: drop the ephemeral private key
+                self.ecdhe_public = kp.public_key; // goes into the ServerHello key_share
+                dhe_shared = shared;
+                const zero_psk = [_]u8{0} ** 32;
+                es = keyschedule.earlySecret(Hkdf, &zero_psk);
+            },
+        }
 
         var selected: ?CipherSuite = null;
         for (self.config.cipher_suites) |want| {
@@ -1154,17 +1366,28 @@ pub const Connection = struct {
         }
         const suite = selected orelse return error.NoCipherSuiteOverlap;
 
-        // Binder verified: commit the (now-authenticated) ClientHello.
+        // ClientHello accepted (PSK binder verified, or cert-DHE key_share
+        // extracted): commit it to the transcript.
         self.transcript.append(@intFromEnum(messages.HandshakeType.client_hello), ch_body);
         self.suite = suite;
 
         var random_bytes: [32]u8 = undefined;
         random.bytes(&random_bytes);
-        var sel_id_buf: [2]u8 = undefined;
-        messages.encodeSelectedIdentity(0, &sel_id_buf);
-        const sh_exts = [_]messages.Extension{
-            .{ .ext_type = @intFromEnum(messages.ExtensionType.pre_shared_key), .data = &sel_id_buf },
+        // The single ServerHello extension differs by mode: `pre_shared_key`
+        // (selected-identity index) for PSK, `key_share` (this server's
+        // ephemeral x25519 public share) for cert-DHE.
+        var sh_ext_data_buf: [40]u8 = undefined;
+        const sh_ext: messages.Extension = switch (self.config.key_exchange) {
+            .psk => blk: {
+                messages.encodeSelectedIdentity(0, sh_ext_data_buf[0..2]);
+                break :blk .{ .ext_type = @intFromEnum(messages.ExtensionType.pre_shared_key), .data = sh_ext_data_buf[0..2] };
+            },
+            .cert_dhe => blk: {
+                const ks = messages.encodeKeyShareServerHello(.{ .group = x25519_group, .key_exchange = &self.ecdhe_public }, &sh_ext_data_buf) catch return error.BufferTooShort;
+                break :blk .{ .ext_type = @intFromEnum(messages.ExtensionType.key_share), .data = ks };
+            },
         };
+        const sh_exts = [_]messages.Extension{sh_ext};
         var sh_body_buf: [128]u8 = undefined;
         const sh_body = messages.encodeServerHello(.{
             .random = random_bytes,
@@ -1187,7 +1410,9 @@ pub const Connection = struct {
         // RFC 8446 §7.1: handshake traffic secrets, over the transcript
         // through ServerHello.
         const th_through_sh = self.transcript.currentHash();
-        const hs_secret = keyschedule.deriveHandshakeSecret(Hkdf, es, &eh, null);
+        const dhe_ptr: ?[]const u8 = if (dhe_shared) |*s| s[0..] else null;
+        const hs_secret = keyschedule.deriveHandshakeSecret(Hkdf, es, &eh, dhe_ptr);
+        if (dhe_shared) |*s| std.crypto.secureZero(u8, s); // forward secrecy: drop the (EC)DHE shared secret
         const hst = keyschedule.deriveHandshakeTrafficSecrets(Hkdf, hs_secret, &th_through_sh);
         self.hs_traffic_client = hst.client;
         self.hs_traffic_server = hst.server;
@@ -1359,8 +1584,33 @@ pub const Connection = struct {
         const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
         const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
         const eh = emptySha256Hash();
-        const es = keyschedule.earlySecret(Hkdf, self.config.psk);
-        const hs_secret = keyschedule.deriveHandshakeSecret(Hkdf, es, &eh, null);
+
+        // Handshake secret: PSK path (`null` DHE) unchanged; cert-DHE path
+        // computes the X25519 shared secret from this client's stored
+        // ephemeral secret + the server's key_share, and mixes it in via the
+        // SAME `deriveHandshakeSecret` (RFC 8446 §7.1) — the early secret's
+        // IKM is the zero PSK in that case.
+        var hs_secret: [32]u8 = undefined;
+        switch (self.config.key_exchange) {
+            .psk => {
+                const es = keyschedule.earlySecret(Hkdf, self.config.psk);
+                hs_secret = keyschedule.deriveHandshakeSecret(Hkdf, es, &eh, null);
+            },
+            .cert_dhe => {
+                const server_pub = try serverHelloX25519Share(sh_dec.extensions);
+                var shared = X25519.scalarmult(self.ecdhe_secret, server_pub) catch {
+                    std.crypto.secureZero(u8, &self.ecdhe_secret);
+                    self.ecdhe_secret_live = false;
+                    return error.KeyExchangeFailed;
+                };
+                std.crypto.secureZero(u8, &self.ecdhe_secret); // forward secrecy: drop the ephemeral private key
+                self.ecdhe_secret_live = false;
+                const zero_psk = [_]u8{0} ** 32;
+                const es = keyschedule.earlySecret(Hkdf, &zero_psk);
+                hs_secret = keyschedule.deriveHandshakeSecret(Hkdf, es, &eh, shared[0..]);
+                std.crypto.secureZero(u8, &shared); // forward secrecy: drop the (EC)DHE shared secret
+            },
+        }
         const th_through_sh = self.transcript.currentHash();
         const hst = keyschedule.deriveHandshakeTrafficSecrets(Hkdf, hs_secret, &th_through_sh);
         self.hs_traffic_client = hst.client;
@@ -2540,4 +2790,257 @@ test "cert-mode: PSK-only Config fields (cert=null, peer_verify=.none) reproduce
     try driveHandshake(&client, &server, testRandom(&csprng), &buf1, &buf2);
     try testing.expectEqual(State.connected, client.state);
     try testing.expectEqual(State.connected, server.state);
+}
+
+// ── cert-only-DHE (`.cert_dhe`) mode: PSK-less ephemeral-X25519 handshake ──
+//
+// The ECDHE math + key_share wiring is locked against a REAL external vector
+// (RFC 8448 §3, "Example Handshake Traces for TLS 1.3"): §3 publishes the
+// client/server X25519 private+public keys and the resulting shared secret,
+// then the handshake secret derived from it. RFC 8448 §3 is a psk_dhe_ke
+// trace, but the ECDHE math is identical to the PSK-less path here, and its
+// early secret is over an all-zero PSK — exactly this mode's construction
+// (RFC 8446 §7.1: no PSK ⇒ IKM = 0^Hash.length). The full cert-only FLOW is
+// then proven by self-interop (two in-memory Connections) — no public DTLS
+// 1.3 cert-only byte-trace exists to KAT the wire flight against; that gap
+// is flagged for the interop-vector audit backlog (see SPEC.md).
+
+fn hx(comptime n: usize, comptime s: []const u8) [n]u8 {
+    var out: [n]u8 = undefined;
+    _ = std.fmt.hexToBytes(&out, s) catch unreachable;
+    return out;
+}
+
+test "cert-DHE KAT: X25519 key_share + key schedule reproduce RFC 8448 §3 byte-for-byte" {
+    // RFC 8448 §3 ephemeral X25519 key material and the shared secret.
+    const client_priv = hx(32, "49af42ba7f7994852d713ef2784bcbcaa7911de26adc5642cb634540e7ea5005");
+    const client_pub = hx(32, "99381de560e4bd43d23d8e435a7dbafeb3c06e51c13cae4d5413691e529aaf2c");
+    const server_priv = hx(32, "b1580eeadf6dd589b8ef4f2d5652578cc810e9980191ec8d058308cea216a21e");
+    const server_pub = hx(32, "c9828876112095fe66762bdbf7c672e156d6cc253b833df1dd69b1b04e751f0f");
+    const shared_expected = hx(32, "8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d");
+
+    // (1) Public keys recovered from the private scalars — proves the exact
+    // key_share bytes this module would put on the wire.
+    try testing.expectEqualSlices(u8, &client_pub, &(try X25519.recoverPublicKey(client_priv)));
+    try testing.expectEqualSlices(u8, &server_pub, &(try X25519.recoverPublicKey(server_priv)));
+
+    // (2) The DH shared secret, computed from BOTH sides — proves
+    // scalarmult(client_priv, server_pub) == scalarmult(server_priv,
+    // client_pub) == the RFC's published value.
+    const shared_c = try X25519.scalarmult(client_priv, server_pub);
+    const shared_s = try X25519.scalarmult(server_priv, client_pub);
+    try testing.expectEqualSlices(u8, &shared_expected, &shared_c);
+    try testing.expectEqualSlices(u8, &shared_expected, &shared_s);
+
+    // (3) That shared secret, fed into the key schedule EXACTLY as this
+    // module's `.cert_dhe` path does (early secret over an all-zero PSK, then
+    // the handshake secret with the ECDHE IKM), reproduces RFC 8448 §3's
+    // early + handshake secrets. RFC 8448 uses the TLS "tls13 " label prefix,
+    // so the "derived" salt is computed with that prefix here (the DTLS
+    // "dtls13" prefix is separately KAT'd in keyschedule.zig); the point
+    // proven is that the X25519 output is the correct HKDF-Extract IKM.
+    const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
+    const zero_psk = [_]u8{0} ** 32;
+    const es = keyschedule.earlySecret(Hkdf, &zero_psk);
+    try testing.expectEqualSlices(u8, &hx(32, "33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a"), &es);
+
+    var empty_hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("", &empty_hash, .{});
+    const salt = keyschedule.expandLabel(Hkdf, keyschedule.tls13_prefix, es, "derived", &empty_hash, 32);
+    const hs = Hkdf.extract(&salt, &shared_c);
+    try testing.expectEqualSlices(u8, &hx(32, "1dc826e93606aa6fdc0aadc12f741b01046aa6b99f691ed221a9f0ca043fbeac"), &hs);
+}
+
+fn certDheServerConfig() Config {
+    return .{
+        .role = .server,
+        .key_exchange = .cert_dhe,
+        .cipher_suites = &.{.aes_128_gcm_sha256},
+        .cert = .{
+            .chain = &.{&cert_kat.server_cert_der},
+            .private_key = serverEcdsaKeyPair(),
+            .signature_scheme = .ecdsa_secp256r1_sha256,
+        },
+    };
+}
+
+fn certDheClientConfig() Config {
+    return .{
+        .role = .client,
+        .key_exchange = .cert_dhe,
+        .cipher_suites = &.{.aes_128_gcm_sha256},
+        .peer_verify = .{ .trust_anchor = &cert_kat.anchor_cert_der },
+        .now_sec = cert_kat.valid_now_sec,
+        .require_peer_cert = true,
+    };
+}
+
+test "cert-DHE: server-only auth handshake completes, matching keys, app data round-trips" {
+    var client = try Connection.clientInit(certDheClientConfig());
+    var server = try Connection.serverInit(certDheServerConfig());
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x70} ** 32);
+    var buf1: [2048]u8 = undefined;
+    var buf2: [2048]u8 = undefined;
+
+    try driveHandshake(&client, &server, testRandom(&csprng), &buf1, &buf2);
+
+    // Both sides derived IDENTICAL directional application keys purely from
+    // the ephemeral X25519 exchange (there is NO PSK here) + the transcript.
+    try testing.expectEqualSlices(u8, client.write_keys.key[0..client.write_keys.key_len], server.read_keys.key[0..server.read_keys.key_len]);
+    try testing.expectEqualSlices(u8, &client.write_keys.iv, &server.read_keys.iv);
+    try testing.expectEqualSlices(u8, client.read_keys.key[0..client.read_keys.key_len], server.write_keys.key[0..server.write_keys.key_len]);
+
+    // Forward secrecy: the client's ephemeral private key was wiped once the
+    // shared secret was computed.
+    try testing.expect(!client.ecdhe_secret_live);
+    try testing.expectEqualSlices(u8, &([_]u8{0} ** 32), &client.ecdhe_secret);
+
+    var wire: [256]u8 = undefined;
+    var plain: [256]u8 = undefined;
+    const rec = try client.send("hello over PSK-less cert-DHE DTLS 1.3", &wire);
+    const got = try server.recv(rec, &plain);
+    try testing.expectEqualSlices(u8, "hello over PSK-less cert-DHE DTLS 1.3", got);
+
+    const rec2 = try server.send("and back from the server", &wire);
+    const got2 = try client.recv(rec2, &plain);
+    try testing.expectEqualSlices(u8, "and back from the server", got2);
+}
+
+test "cert-DHE: ChaCha20-Poly1305 suite also completes" {
+    var cfg_c = certDheClientConfig();
+    cfg_c.cipher_suites = &.{.chacha20_poly1305_sha256};
+    var cfg_s = certDheServerConfig();
+    cfg_s.cipher_suites = &.{.chacha20_poly1305_sha256};
+    var client = try Connection.clientInit(cfg_c);
+    var server = try Connection.serverInit(cfg_s);
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x71} ** 32);
+    var buf1: [2048]u8 = undefined;
+    var buf2: [2048]u8 = undefined;
+    try driveHandshake(&client, &server, testRandom(&csprng), &buf1, &buf2);
+    try testing.expectEqual(State.connected, client.state);
+    try testing.expectEqual(State.connected, server.state);
+}
+
+test "cert-DHE: mutual auth (CertificateRequest -> client cert) completes" {
+    var cfg_c = certDheClientConfig();
+    cfg_c.cert = .{
+        .chain = &.{&cert_kat.client_cert_der},
+        .private_key = clientEcdsaKeyPair(),
+        .signature_scheme = .ecdsa_secp256r1_sha256,
+    };
+    var cfg_s = certDheServerConfig();
+    cfg_s.request_client_cert = true;
+    cfg_s.require_peer_cert = true;
+    cfg_s.peer_verify = .{ .trust_anchor = &cert_kat.anchor_cert_der };
+    cfg_s.now_sec = cert_kat.valid_now_sec;
+
+    var client = try Connection.clientInit(cfg_c);
+    var server = try Connection.serverInit(cfg_s);
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x72} ** 32);
+    var buf1: [2048]u8 = undefined;
+    var buf2: [2048]u8 = undefined;
+
+    try driveHandshake(&client, &server, testRandom(&csprng), &buf1, &buf2);
+    try testing.expectEqual(State.connected, client.state);
+    try testing.expectEqual(State.connected, server.state);
+
+    // Both authenticated identities round-trip real app data.
+    var wire: [256]u8 = undefined;
+    var plain: [256]u8 = undefined;
+    const rec = try client.send("mutual-auth cert-DHE ok", &wire);
+    try testing.expectEqualSlices(u8, "mutual-auth cert-DHE ok", try server.recv(rec, &plain));
+}
+
+test "cert-DHE reject: a tampered ServerHello key_share breaks the handshake (typed error, not a panic)" {
+    var client = try Connection.clientInit(certDheClientConfig());
+    var server = try Connection.serverInit(certDheServerConfig());
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x73} ** 32);
+    const rnd = testRandom(&csprng);
+    var buf1: [2048]u8 = undefined;
+    var buf2: [2048]u8 = undefined;
+
+    const ch = try client.startHandshake(rnd, 0, &buf1);
+    const flight2 = try server.handleFlight(ch, rnd, 0, &buf2);
+
+    // The ServerHello is the first (epoch-0, plaintext) record; its
+    // key_share value is near its tail. Flip a byte well inside the
+    // ServerHello body so the client computes a DIFFERENT shared secret and
+    // can no longer decrypt the server's handshake-epoch records (or its
+    // Finished fails to verify). Either way: a typed error, never a panic.
+    var tampered: [2048]u8 = undefined;
+    @memcpy(tampered[0..flight2.out.len], flight2.out);
+    // Offset: plaintext header (13) + handshake header (12) + SH body: legacy
+    // version (2) + random (32) => land on the server random, which is part
+    // of the transcript AND precedes the key_share; flipping here desyncs the
+    // client's derived keys.
+    tampered[13 + 12 + 2 + 5] ^= 0x40;
+
+    if (client.handleFlight(tampered[0..flight2.out.len], rnd, 0, &buf1)) |_| {
+        return error.TestExpectedTamperToFail;
+    } else |_| {}
+}
+
+test "cert-DHE reject: CertificateVerify signed with the WRONG key is rejected" {
+    var cfg_s = certDheServerConfig();
+    cfg_s.cert = .{
+        // Presents the real server leaf but signs with the CLIENT's key.
+        .chain = &.{&cert_kat.server_cert_der},
+        .private_key = clientEcdsaKeyPair(),
+        .signature_scheme = .ecdsa_secp256r1_sha256,
+    };
+    var client = try Connection.clientInit(certDheClientConfig());
+    var server = try Connection.serverInit(cfg_s);
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x74} ** 32);
+    const rnd = testRandom(&csprng);
+    var buf1: [2048]u8 = undefined;
+    var buf2: [2048]u8 = undefined;
+
+    const ch = try client.startHandshake(rnd, 0, &buf1);
+    const flight2 = try server.handleFlight(ch, rnd, 0, &buf2);
+    try testing.expectError(error.CertVerifyFailed, client.handleFlight(flight2.out, rnd, 0, &buf1));
+}
+
+test "cert-DHE reject: untrusted anchor is rejected" {
+    var cfg_c = certDheClientConfig();
+    cfg_c.peer_verify = .{ .trust_anchor = &cert_kat.evil_anchor_cert_der };
+    var client = try Connection.clientInit(cfg_c);
+    var server = try Connection.serverInit(certDheServerConfig());
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x75} ** 32);
+    const rnd = testRandom(&csprng);
+    var buf1: [2048]u8 = undefined;
+    var buf2: [2048]u8 = undefined;
+
+    const ch = try client.startHandshake(rnd, 0, &buf1);
+    const flight2 = try server.handleFlight(ch, rnd, 0, &buf2);
+    try testing.expectError(error.CertificateRejected, client.handleFlight(flight2.out, rnd, 0, &buf1));
+}
+
+test "cert-DHE reject: a cert-DHE server rejects a ClientHello with no key_share" {
+    // A PSK-mode client (its ClientHello carries pre_shared_key, NO
+    // key_share) driven into a cert-DHE server: the server finds no usable
+    // x25519 share and returns a typed `MissingKeyShare`, never a panic.
+    var psk_client = try Connection.clientInit(.{
+        .role = .client,
+        .psk_identity = "device-042",
+        .psk = "a-shared-pre-shared-key",
+        .cipher_suites = &.{.aes_128_gcm_sha256},
+    });
+    var server = try Connection.serverInit(certDheServerConfig());
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x76} ** 32);
+    const rnd = testRandom(&csprng);
+    var buf1: [2048]u8 = undefined;
+    var buf2: [2048]u8 = undefined;
+
+    const ch = try psk_client.startHandshake(rnd, 0, &buf1);
+    try testing.expectError(error.MissingKeyShare, server.handleFlight(ch, rnd, 0, &buf2));
+}
+
+test "cert-DHE: Config.validate does not require PSK fields in cert-DHE mode" {
+    // A cert-DHE Config with empty psk/psk_identity must validate cleanly
+    // (the PSK fields are unused in this mode).
+    const cfg = Config{ .role = .server, .key_exchange = .cert_dhe, .cipher_suites = &.{.aes_128_gcm_sha256} };
+    try cfg.validate();
+    // ...but PSK mode still rejects an empty PSK (regression guard).
+    const psk_cfg = Config{ .role = .client, .cipher_suites = &.{.aes_128_gcm_sha256} };
+    try testing.expectError(error.EmptyPsk, psk_cfg.validate());
 }
