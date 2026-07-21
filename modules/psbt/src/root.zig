@@ -37,16 +37,19 @@
 //!
 //! ## Roles implemented
 //!
-//! `parse`/`serialize` (Creator/Updater's wire format) and `combine`
+//! `parse`/`serialize` (Creator/Updater's wire format), `combine`
 //! (Combiner: union of key-value pairs, BIP174-example lexicographic
-//! ordering, first-PSBT-wins on conflicting values). The **Signer**,
-//! **Input Finalizer**, and **Transaction Extractor** roles are
-//! deliberately NOT implemented: all three require interpreting Bitcoin
-//! Script (matching a scriptPubKey/redeemScript/witnessScript, assembling
-//! a final scriptSig/witness that satisfies it) — this repository has no
-//! Script interpreter yet (a future `bitcoinscript` module). Building a
-//! half-finalizer that can't actually validate a script would be worse
-//! than not having one; deferred, not half-built.
+//! ordering, first-PSBT-wins on conflicting values), and — now that a
+//! Script interpreter exists (`bitcoinscript`) — `finalize` (Input
+//! Finalizer) and `extract` (Transaction Extractor), both in
+//! `finalize.zig`: `finalize` assembles `FINAL_SCRIPTSIG`/
+//! `FINAL_SCRIPTWITNESS` for the standard spend types, verifying every
+//! candidate through `bitcoinscript.verifyScript` before accepting it and
+//! clearing the now-consumed fields per BIP174; `extract` splices finalized
+//! inputs into a network-ready `bitcointx.Transaction`. The **Signer** role
+//! is still NOT implemented — it needs private-key custody and signing
+//! policy this module has no opinion about; `PARTIAL_SIG`/`TAP_KEY_SIG`
+//! records are expected to already be present by the time `finalize` runs.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -57,7 +60,7 @@ pub const meta = .{
     .role = .codec,
     .concurrency = .reentrant, // no shared/global state; every call is over caller-owned values
     .model_after = "BIP174 (Partially Signed Bitcoin Transaction Format v0, bitcoin/bips)",
-    .deps = .{"bitcointx"},
+    .deps = .{ "bitcointx", "bitcoinscript" },
 };
 
 // ── magic ────────────────────────────────────────────────────────────────
@@ -84,6 +87,11 @@ pub const input_key = struct {
     pub const FINAL_SCRIPTSIG: u64 = 0x07;
     pub const FINAL_SCRIPTWITNESS: u64 = 0x08;
     pub const PROPRIETARY: u64 = 0xfc;
+    /// BIP371's taproot key-path signature (not part of BIP174 v0 proper —
+    /// added here so `finalize.zig` can assemble a P2TR key-path witness;
+    /// see its module doc comment). Value is the 64-byte BIP340 Schnorr
+    /// signature, or 65 bytes with an explicit trailing sighash-type byte.
+    pub const TAP_KEY_SIG: u64 = 0x13;
 };
 
 pub const output_key = struct {
@@ -221,6 +229,15 @@ pub fn globalXpubDerivation(m: Map, xpub: []const u8) ?Bip32Path {
 pub fn inputSighashType(m: Map) ?u32 {
     const r = m.find(input_key.SIGHASH_TYPE) orelse return null;
     return std.mem.readInt(u32, r.value[0..4], .little);
+}
+
+/// `PSBT_IN_TAP_KEY_SIG` (BIP371), or `null` if omitted. The raw 64/65-byte
+/// value, unvalidated here -- `finalize.zig` is the only caller, and shape/
+/// curve validity is `bitcoinscript.verifyScript`'s job to fail closed on,
+/// not this accessor's.
+pub fn inputTapKeySig(m: Map) ?[]const u8 {
+    const r = m.find(input_key.TAP_KEY_SIG) orelse return null;
+    return r.value;
 }
 
 /// `<64-bit LE int amount> <compact size scriptPubKeylen> <bytes scriptPubKey>`
@@ -580,6 +597,22 @@ pub fn combine(allocator: Allocator, a: Psbt, b: Psbt) CombineError!Psbt {
     };
 }
 
+// ── finalize / extract (Input Finalizer + Transaction Extractor) ───────
+//
+// Implementation lives in `finalize.zig` (its own module doc comment has
+// the full scope/allocator-contract/threat-model story); re-exported here
+// so callers only need `@import("psbt")`.
+
+const finalize_mod = @import("finalize.zig");
+pub const InputFinalizeError = finalize_mod.InputFinalizeError;
+pub const FinalizeSetupError = finalize_mod.FinalizeSetupError;
+pub const ExtractError = finalize_mod.ExtractError;
+pub const WitnessStackError = finalize_mod.WitnessStackError;
+pub const finalize = finalize_mod.finalize;
+pub const extract = finalize_mod.extract;
+pub const encodeWitnessStack = finalize_mod.encodeWitnessStack;
+pub const decodeWitnessStack = finalize_mod.decodeWitnessStack;
+
 // ── tests ────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -589,10 +622,14 @@ const testing = std.testing;
 test {
     _ = @import("kat_vectors.zig");
     _ = @import("kat_test.zig");
+    _ = finalize_mod;
+    _ = @import("finalize_test.zig");
 }
 
-test "meta.deps names bitcointx" {
+test "meta.deps names bitcointx and bitcoinscript" {
+    try testing.expectEqual(@as(usize, 2), meta.deps.len);
     try testing.expect(std.mem.eql(u8, meta.deps[0], "bitcointx"));
+    try testing.expect(std.mem.eql(u8, meta.deps[1], "bitcoinscript"));
 }
 
 test "rejects a buffer shorter than the magic" {
