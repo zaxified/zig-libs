@@ -37,12 +37,15 @@ pub const Message = struct {
     pub fn format(self: *const Message, w: *std.Io.Writer) std.Io.Writer.Error!void {
         try w.print("<{d}>", .{m.priority(self.facility, self.severity)});
 
+        // An unrepresentable (e.g. pre-1970/hostile) instant is omitted, like
+        // an absent timestamp — never a panic on the out-of-range decompose.
         if (self.timestamp) |ts| {
-            const c = m.decompose(ts);
-            try w.writeAll(month_abbr[c.month - 1]);
-            try w.writeByte(' ');
-            if (c.day < 10) try w.writeByte(' '); // space-pad the day to width 2
-            try w.print("{d} {d:0>2}:{d:0>2}:{d:0>2} ", .{ c.day, c.hour, c.minute, c.second });
+            if (m.decompose(ts)) |c| {
+                try w.writeAll(month_abbr[c.month - 1]);
+                try w.writeByte(' ');
+                if (c.day < 10) try w.writeByte(' '); // space-pad the day to width 2
+                try w.print("{d} {d:0>2}:{d:0>2}:{d:0>2} ", .{ c.day, c.hour, c.minute, c.second });
+            } else |_| {}
         }
 
         try w.writeAll(self.hostname);

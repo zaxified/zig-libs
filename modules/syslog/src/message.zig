@@ -80,12 +80,26 @@ pub const CalendarTime = struct {
     offset_minutes: ?i16,
 };
 
-/// Decompose a `Timestamp` into displayable calendar fields. Assumes a
-/// post-1970 instant (the shifted second count must be ≥ 0).
-pub fn decompose(ts: Timestamp) CalendarTime {
+/// Largest `total_secs` `decompose` accepts: 9999-12-31T23:59:59Z, the last
+/// instant RFC 3339's 4-digit year (`{d:0>4}`) can represent.
+const max_epoch_secs: i64 = 253402300799;
+
+pub const DecomposeError = error{
+    /// The shifted instant is before the Unix epoch, or past year 9999 —
+    /// not representable as an RFC 3339 calendar time. Guards against a
+    /// hostile/negative timestamp crashing the formatter.
+    TimestampOutOfRange,
+};
+
+/// Decompose a `Timestamp` into displayable calendar fields. Only a
+/// representable instant (Unix epoch ‥ year 9999, after the `offset_minutes`
+/// shift) succeeds; anything else returns `error.TimestampOutOfRange` rather
+/// than panicking on the out-of-range `@intCast`.
+pub fn decompose(ts: Timestamp) DecomposeError!CalendarTime {
     const off_ms: i64 = @as(i64, ts.offset_minutes orelse 0) * 60_000;
-    const adjusted = ts.unix_ms + off_ms;
+    const adjusted = ts.unix_ms +| off_ms;
     const total_secs = @divFloor(adjusted, 1000);
+    if (total_secs < 0 or total_secs > max_epoch_secs) return error.TimestampOutOfRange;
     const milli: u16 = @intCast(@mod(adjusted, 1000));
 
     const es = std.time.epoch.EpochSeconds{ .secs = @intCast(total_secs) };
@@ -107,9 +121,14 @@ pub fn decompose(ts: Timestamp) CalendarTime {
 }
 
 /// Write the RFC 3339 timestamp with millisecond precision
-/// (`2026-07-09T12:34:56.789Z` or `…+02:00`).
-pub fn writeRfc3339(w: *std.Io.Writer, ts: Timestamp) std.Io.Writer.Error!void {
-    const c = decompose(ts);
+/// (`2026-07-09T12:34:56.789Z` or `…+02:00`). Errors (without writing) on a
+/// timestamp `decompose` rejects; `Message.format` renders such a timestamp
+/// as the NILVALUE `-` instead.
+pub fn writeRfc3339(w: *std.Io.Writer, ts: Timestamp) (std.Io.Writer.Error || DecomposeError)!void {
+    try writeCalendar(w, try decompose(ts));
+}
+
+fn writeCalendar(w: *std.Io.Writer, c: CalendarTime) std.Io.Writer.Error!void {
     try w.print("{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}", .{
         c.year, c.month, c.day, c.hour, c.minute, c.second, c.milli,
     });
@@ -171,9 +190,13 @@ pub const Message = struct {
         // <PRI>VERSION SP
         try w.print("<{d}>1 ", .{priority(self.facility, self.severity)});
 
-        // TIMESTAMP SP
+        // TIMESTAMP SP — an unrepresentable (e.g. pre-1970/hostile) instant
+        // renders as the NILVALUE `-` rather than crashing the formatter.
         if (self.timestamp) |ts| {
-            try writeRfc3339(w, ts);
+            if (decompose(ts)) |c|
+                try writeCalendar(w, c)
+            else |_|
+                try w.writeByte('-');
         } else {
             try w.writeByte('-');
         }
@@ -368,6 +391,30 @@ test "non-printable bytes in a header field become '-'" {
     var buf: [64]u8 = undefined;
     const out = try bufPrint(&msg, &buf);
     try t.expect(std.mem.indexOf(u8, out, "a-b-c ") != null);
+}
+
+test "decompose rejects out-of-range timestamps instead of panicking" {
+    // Pre-1970 instants (negative unix_ms, or pushed negative by the offset
+    // shift) would panic the old `@intCast(total_secs)` — now a clean error.
+    try t.expectError(error.TimestampOutOfRange, decompose(.{ .unix_ms = -1 }));
+    try t.expectError(error.TimestampOutOfRange, decompose(.{ .unix_ms = -1_000_000_000 }));
+    try t.expectError(error.TimestampOutOfRange, decompose(.{ .unix_ms = 0, .offset_minutes = -1 }));
+    // Absurd far-future instant (would overflow the u16 year) is rejected too.
+    try t.expectError(error.TimestampOutOfRange, decompose(.{ .unix_ms = std.math.maxInt(i64) }));
+    // The epoch itself and a valid instant still decompose.
+    try t.expectEqual(@as(u16, 1970), (try decompose(.{ .unix_ms = 0 })).year);
+    try t.expectEqual(@as(u16, 2026), (try decompose(.{ .unix_ms = 1783600496789 })).year);
+}
+
+test "format renders NILVALUE '-' for a hostile out-of-range timestamp" {
+    const msg = Message{
+        .facility = .user,
+        .severity = .notice,
+        .timestamp = .{ .unix_ms = -1000 }, // pre-epoch
+    };
+    var buf: [64]u8 = undefined;
+    // No panic; the timestamp field is the NILVALUE, like an absent one.
+    try t.expectEqualStrings("<13>1 - - - - - -", try bufPrint(&msg, &buf));
 }
 
 test "bufPrint reports NoSpaceLeft when the buffer is too small" {
