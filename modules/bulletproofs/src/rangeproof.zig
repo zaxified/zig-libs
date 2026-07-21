@@ -773,3 +773,16 @@ test "prove: n=64 never rejects any u64 value at the construction-time guard" {
     const n: usize = 64;
     try std.testing.expect(n >= 64); // guard's `if (gens.n < 64)` branch is skipped for n=64
 }
+
+// ── fuzz: untrusted-input decoder never panics ──────────────────────────────
+
+fn fuzzFromBytesAlloc(_: void, smith: *std.testing.Smith) !void {
+    var buf: [1024]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const proof = RangeProof.fromBytesAlloc(std.testing.allocator, buf[0..len]) catch return;
+    proof.deinit(std.testing.allocator);
+}
+test "fuzz RangeProof.fromBytesAlloc never panics" {
+    try std.testing.fuzz({}, fuzzFromBytesAlloc, .{});
+}

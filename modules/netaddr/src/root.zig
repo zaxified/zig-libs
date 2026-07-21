@@ -1558,3 +1558,35 @@ test "mergePrefixes coalesces adjacent and overlapping prefixes" {
         try testing.expectEqual(@as(usize, 0), ps.len);
     }
 }
+
+// ── fuzz: untrusted-input string parsers never panic ────────────────────────
+
+fn fuzzParseIp(_: void, smith: *std.testing.Smith) !void {
+    var buf: [64]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    _ = parseIp(buf[0..len]);
+}
+test "fuzz parseIp never panics" {
+    try testing.fuzz({}, fuzzParseIp, .{});
+}
+
+fn fuzzParsePrefix(_: void, smith: *std.testing.Smith) !void {
+    var buf: [72]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    _ = parsePrefix(buf[0..len]);
+}
+test "fuzz parsePrefix never panics" {
+    try testing.fuzz({}, fuzzParsePrefix, .{});
+}
+
+fn fuzzParseHostPort(_: void, smith: *std.testing.Smith) !void {
+    var buf: [80]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    _ = parseHostPort(buf[0..len]);
+}
+test "fuzz parseHostPort never panics" {
+    try testing.fuzz({}, fuzzParseHostPort, .{});
+}

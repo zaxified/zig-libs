@@ -534,3 +534,16 @@ test "proveIpa: zero length rejected before reaching the stub" {
         proveIpa(std.testing.allocator, &t, &.{}, &.{}, Ristretto255.basePoint, &.{}, &.{}),
     );
 }
+
+// ── fuzz: untrusted-input decoder never panics ──────────────────────────────
+
+fn fuzzFromBytesAlloc(_: void, smith: *std.testing.Smith) !void {
+    var buf: [1024]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const proof = InnerProductProof.fromBytesAlloc(std.testing.allocator, buf[0..len]) catch return;
+    proof.deinit(std.testing.allocator);
+}
+test "fuzz InnerProductProof.fromBytesAlloc never panics" {
+    try std.testing.fuzz({}, fuzzFromBytesAlloc, .{});
+}

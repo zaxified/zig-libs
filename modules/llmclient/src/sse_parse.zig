@@ -230,3 +230,21 @@ test "Parser: clean close between groups returns null" {
     try testing.expectEqualStrings("one", e.data);
     try testing.expect((try p.next()) == null);
 }
+
+// ── fuzz: untrusted SSE bytes never panic ───────────────────────────────────
+
+fn fuzzParserNext(_: void, smith: *std.testing.Smith) !void {
+    var buf: [512]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    var reader: std.Io.Reader = .fixed(buf[0..len]);
+    var p = Parser.init(&reader, testing.allocator);
+    defer p.deinit();
+    while (true) {
+        const ev = p.next() catch break;
+        if (ev == null) break;
+    }
+}
+test "fuzz Parser.next never panics" {
+    try testing.fuzz({}, fuzzParserNext, .{});
+}

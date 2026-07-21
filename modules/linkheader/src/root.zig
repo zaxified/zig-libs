@@ -518,3 +518,16 @@ test "pagination: empty opts yields no links" {
     var slots: [4]Link = undefined;
     try testing.expectEqual(@as(usize, 0), pagination(&slots, .{}).len);
 }
+
+// ── fuzz: untrusted `Link` header parsing never panics ──────────────────────
+
+fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    var it = parse(buf[0..len]);
+    while (it.next()) |_| {}
+}
+test "fuzz parse never panics" {
+    try testing.fuzz({}, fuzzParse, .{});
+}

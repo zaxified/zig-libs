@@ -443,3 +443,29 @@ test "parseStreamEvent: tool_use content_block_start + input_json_delta + error 
     const ping_ev = try parseStreamEvent(a, "{\"type\":\"ping\"}");
     try testing.expect(ping_ev == .ping);
 }
+
+// ── fuzz: untrusted JSON bytes never panic ──────────────────────────────────
+
+fn fuzzParseMessage(_: void, smith: *std.testing.Smith) !void {
+    var buf: [512]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    _ = parseMessage(arena.allocator(), buf[0..len]) catch return;
+}
+test "fuzz parseMessage never panics" {
+    try testing.fuzz({}, fuzzParseMessage, .{});
+}
+
+fn fuzzParseStreamEvent(_: void, smith: *std.testing.Smith) !void {
+    var buf: [512]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    _ = parseStreamEvent(arena.allocator(), buf[0..len]) catch return;
+}
+test "fuzz parseStreamEvent never panics" {
+    try testing.fuzz({}, fuzzParseStreamEvent, .{});
+}

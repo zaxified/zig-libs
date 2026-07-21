@@ -1889,3 +1889,67 @@ test "integration: protected route over loopback — 401 / valid Bearer 200 with
     }
     try testing.expectEqual(@as(usize, 1), authed_muts);
 }
+
+// ── fuzz: untrusted header/query string parsers never panic ────────────────
+
+/// Build a socket-free `Request` with a caller-supplied raw header block and
+/// query string (mirrors `http`'s own `evalWith`-style test harness — see
+/// `http/src/conditional.zig`). Fields other than what the fuzzed decoders
+/// read are fixed dummies.
+fn fuzzRequest(header_block: []const u8, query: []const u8, body: *http.Server.RequestBody) http.Server.Request {
+    return .{
+        .method = .get,
+        .target = "/",
+        .path = "/",
+        .query = query,
+        .head = .{
+            .method = "GET",
+            .target = "/",
+            .http1_0 = false,
+            .header_block = header_block,
+        },
+        .body = body,
+        .context = null,
+    };
+}
+
+fn fuzzBearerToken(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    var body: http.Server.RequestBody = .{ .none = .fixed("") };
+    const req = fuzzRequest(buf[0..len], "", &body);
+    _ = bearerToken(&req);
+}
+test "fuzz bearerToken never panics" {
+    try testing.fuzz({}, fuzzBearerToken, .{});
+}
+
+fn fuzzApiKeyPresented(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const split: usize = smith.valueRangeAtMost(u16, 0, @as(u16, @intCast(len)));
+    var body: http.Server.RequestBody = .{ .none = .fixed("") };
+    const req = fuzzRequest(buf[0..split], buf[split..len], &body);
+
+    var g = try Gate.init(testing.allocator, .{
+        .auth_mode = .api_key,
+        .api_key_query_param = "api_key",
+    });
+    defer g.deinit();
+    _ = apiKeyPresented(&g, &req);
+}
+test "fuzz apiKeyPresented never panics" {
+    try testing.fuzz({}, fuzzApiKeyPresented, .{});
+}
+
+fn fuzzQueryValue(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    _ = queryValue(buf[0..len], "api_key");
+}
+test "fuzz queryValue never panics" {
+    try testing.fuzz({}, fuzzQueryValue, .{});
+}
