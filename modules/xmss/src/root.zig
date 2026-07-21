@@ -900,6 +900,45 @@ test "stateful discipline: sign advances idx, never repeats, fails closed when e
     try std.testing.expectEqual(@as(u32, X.max_signatures), kp.sk.idx);
 }
 
+test "fuzz: PublicKey.fromBytes never panics on arbitrary bytes" {
+    try std.testing.fuzz({}, fuzzPublicKeyFromBytes, .{});
+}
+
+fn fuzzPublicKeyFromBytes(_: void, smith: *std.testing.Smith) !void {
+    const X = XmssSha2_10_256;
+    var bytes: [X.public_key_length]u8 = undefined;
+    smith.bytes(&bytes);
+    _ = X.PublicKey.fromBytes(&bytes) catch return;
+}
+
+test "fuzz: verify (the wire signature parser) never panics on arbitrary pk/msg/sig bytes" {
+    try std.testing.fuzz({}, fuzzVerify, .{});
+}
+
+fn fuzzVerify(_: void, smith: *std.testing.Smith) !void {
+    // XmssSha2_10_256: the 2500-byte-signature, smallest/fastest variant —
+    // same `verify` code path as every other height, cheapest for fuzzing.
+    const X = XmssSha2_10_256;
+    var pk_bytes: [X.public_key_length]u8 = undefined;
+    smith.bytes(&pk_bytes);
+    // Force a valid OID so `PublicKey.fromBytes` succeeds most of the time
+    // and `verify`'s actual signature-parsing body (not just the early OID
+    // guard) gets exercised.
+    std.mem.writeInt(u32, pk_bytes[0..4], X.oid, .big);
+    const pk = X.PublicKey.fromBytes(&pk_bytes) catch return;
+
+    var msg: [64]u8 = undefined;
+    smith.bytes(&msg);
+
+    var sig_buf: [X.signature_length]u8 = undefined;
+    smith.bytes(&sig_buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, sig_buf.len);
+    // `verify` parses `idx`/`r`/`sig_ots`/`auth` straight out of `sig` with
+    // no bounds checks beyond the `sig.len != signature_length` guard — it
+    // must never panic/OOB regardless of length or content.
+    _ = X.verify(pk, &msg, sig_buf[0..len]);
+}
+
 test {
     _ = @import("kat_vectors.zig");
     _ = @import("kat_test.zig");

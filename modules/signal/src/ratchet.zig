@@ -882,3 +882,52 @@ test "replay of a consumed in-order message is not decryptable" {
         bob.decrypt(alloc, msg.header, msg.ciphertext, io),
     );
 }
+
+test "fuzz: Header.fromBytes never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzHeaderFromBytes, .{});
+}
+
+fn fuzzHeaderFromBytes(_: void, smith: *std.testing.Smith) !void {
+    var buf: [Header.encoded_length + 8]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const h = Header.fromBytes(buf[0..len]) catch return;
+    _ = h;
+}
+
+test "fuzz: decrypt (wire header+ciphertext) never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzDecrypt, .{});
+}
+
+fn fuzzDecrypt(_: void, smith: *std.testing.Smith) !void {
+    var threaded = testIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const alloc = testing.allocator;
+
+    // A live, X3DH-seeded receiver session — `decrypt`'s untrusted-wire
+    // surface is `header`/`ciphertext`, not the session setup itself.
+    const s = try seedSession(io);
+    var alice = s.alice;
+    var bob = s.bob;
+    defer alice.deinit(alloc);
+    defer bob.deinit(alloc);
+
+    // `Header.fromBytes` requires exactly `encoded_length` bytes, so build
+    // one from arbitrary content directly rather than round-tripping
+    // through `fromBytes` (that path is covered by the harness above).
+    var header_bytes: [Header.encoded_length]u8 = undefined;
+    smith.bytes(&header_bytes);
+    const header = Header.fromBytes(&header_bytes) catch return;
+
+    var ct_buf: [256]u8 = undefined;
+    smith.bytes(&ct_buf);
+    const ct_len: usize = smith.valueRangeAtMost(u16, 0, ct_buf.len);
+
+    // Arbitrary header.pn/header.n drive `skipMessageKeys`/`dhRatchet`;
+    // arbitrary ciphertext drives `aeadOpen`. Every failure mode here must
+    // be a typed `DecryptError`, never a panic/OOB — `self` (bob) is left
+    // untouched on any error per `decrypt`'s transactional-commit doc.
+    const pt = bob.decrypt(alloc, header, ct_buf[0..ct_len], io) catch return;
+    alloc.free(pt);
+}

@@ -406,3 +406,16 @@ test "parse maps unknown alg/enc names to .unknown, not an error" {
     try std.testing.expectEqual(Alg.unknown, parsed.alg);
     try std.testing.expectEqual(Enc.unknown, parsed.enc);
 }
+
+test "fuzz: parse never panics on arbitrary header JSON bytes" {
+    try std.testing.fuzz({}, fuzzParse, .{});
+}
+
+fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
+    var buf: [max_header_json_len]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    _ = parse(arena.allocator(), buf[0..len]) catch return;
+}

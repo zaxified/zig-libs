@@ -835,3 +835,20 @@ test "malformed compact tokens are rejected, never panic on arbitrary bytes" {
     try std.testing.expectError(error.MalformedToken, decryptCompact(std.testing.allocator, .{ .symmetric = &key }, "too.many.parts.here.for.sure", .{}));
     try std.testing.expectError(error.InvalidBase64, decryptCompact(std.testing.allocator, .{ .symmetric = &key }, "not!base64.a.b.c.d", .{}));
 }
+
+test "fuzz: decryptCompact never panics on arbitrary compact tokens" {
+    try std.testing.fuzz({}, fuzzDecryptCompact, .{});
+}
+
+fn fuzzDecryptCompact(_: void, smith: *std.testing.Smith) !void {
+    const key = [_]u8{0x2b} ** 16;
+    var raw: [512]u8 = undefined;
+    smith.bytes(&raw);
+    const len: usize = smith.valueRangeAtMost(u16, 0, raw.len);
+    // A symmetric key covers `dir`/`AxxxKW`/`AxxxGCMKW`/PBES2 alg-header
+    // paths; the point of this harness is the untrusted-wire framing
+    // (dot-splitting, base64url, JSON header) never panicking/OOB — not
+    // reaching a decrypted plaintext.
+    const pt = decryptCompact(std.testing.allocator, .{ .symmetric = &key }, raw[0..len], .{}) catch return;
+    std.testing.allocator.free(pt);
+}

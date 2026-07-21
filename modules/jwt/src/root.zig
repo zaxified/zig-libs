@@ -2348,6 +2348,18 @@ test "malformed: segment count, empty segments" {
     try testing.expectError(error.MalformedToken, parse(gpa, "."));
 }
 
+test "fuzz: parse never panics on arbitrary compact-JWT bytes" {
+    try testing.fuzz({}, fuzzParse, .{});
+}
+
+fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
+    var buf: [512]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    var parsed = parse(testing.allocator, buf[0..len]) catch return;
+    parsed.deinit();
+}
+
 test "malformed: bad base64url" {
     const gpa = testing.allocator;
     // '!' is outside the URL-safe alphabet.

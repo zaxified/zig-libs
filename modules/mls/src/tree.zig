@@ -699,3 +699,33 @@ pub const RatchetTree = struct {
         }
     }
 };
+
+// ── fuzz: the untrusted-wire tree decoders never panic/OOB ────────────────
+
+test "fuzz: RatchetTree.decode never panics on arbitrary bytes" {
+    try std.testing.fuzz({}, fuzzRatchetTreeDecode, .{});
+}
+
+fn fuzzRatchetTreeDecode(_: void, smith: *std.testing.Smith) !void {
+    var buf: [1024]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    var r = codec.Reader.init(buf[0..len]);
+    // Recursively exercises Node/LeafNode/ParentNode/Credential/
+    // Capabilities/Lifetime/Extension decode — the whole tree wire surface.
+    var rt = RatchetTree.decode(std.testing.allocator, &r) catch return;
+    rt.deinit();
+}
+
+test "fuzz: LeafNode.decode never panics on arbitrary bytes" {
+    try std.testing.fuzz({}, fuzzLeafNodeDecode, .{});
+}
+
+fn fuzzLeafNodeDecode(_: void, smith: *std.testing.Smith) !void {
+    var buf: [512]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    var r = codec.Reader.init(buf[0..len]);
+    const leaf = LeafNode.decode(std.testing.allocator, &r) catch return;
+    leaf.deinit(std.testing.allocator);
+}
