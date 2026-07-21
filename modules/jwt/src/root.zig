@@ -14,12 +14,26 @@
 //! select the key by the token header's `kid`, and verify via
 //! `verifyWithJwks` / `parseVerifyJwks` — plus the **networked layer** (P5):
 //! OpenID Connect Discovery 1.0 (`discover` resolves
-//! `<issuer>/.well-known/openid-configuration` to the issuer's `jwks_uri`),
+//! `<issuer>/.well-known/openid-configuration` to the issuer's `jwks_uri`,
+//! `authorization_endpoint` and `token_endpoint`),
 //! `fetchJwks`, and the cached `Provider` (TTL + key-rotation refresh with a
 //! `min_refresh_interval_s` rate limit) whose `Provider.verify` is the
 //! turnkey resource-server call. All I/O goes through the `Fetcher` seam
 //! ("GET this URL, give me status + body"), so everything stays
 //! offline-testable; `HttpFetcher` adapts our `http.Client` for real use.
+//!
+//! On top of the resource-server stack sits the **relying-party (RP) flow**
+//! (P7): this module is now BOTH a token *validator* and an OAuth2/OIDC
+//! *client*. PKCE (RFC 7636: `pkceGenerateS256`/`pkceGeneratePlain`/
+//! `pkceChallengeS256`), CSRF `state` + OIDC `nonce` generation
+//! (`generateState`/`generateNonce`), the authorization-request URL builder
+//! (`buildAuthorizationUrl`), the authorization-code token-exchange request
+//! builder (`buildTokenRequest` — returns method/url/headers/body, this
+//! module does no I/O) + response parser (`parseTokenResponse`), and
+//! ID-token RP-side acceptance (`acceptIdToken`/`acceptIdTokenJwks`/
+//! `acceptIdTokenProvider`, OIDC Core §3.1.3.7) layered on the SAME
+//! `verify`/`Provider` machinery P2-P5 already built — no duplicated crypto.
+//! DPoP (RFC 9449) is DEFERRED; see SPEC.md.
 //!
 //! ## SECURITY — `parse()` alone does NOT verify signatures
 //!
@@ -107,6 +121,45 @@
 //!     .issuer = .{ .required = "https://issuer.example" },
 //!     .audience = .{ .required = "api://my-service" },
 //! });
+//!
+//! // P7: the relying-party (RP) flow — starting an OIDC login.
+//! var csprng = std.Random.DefaultCsprng.init(seed); // caller's real CSPRNG
+//! const random = csprng.random();
+//! const pkce = jwt.pkceGenerateS256(random);
+//! const state = jwt.generateState(random);
+//! const nonce = jwt.generateNonce(random);
+//! // (persist pkce.verifier(), state and nonce server-side, e.g. in a
+//! // session, keyed however the app likes — they are checked back in below)
+//! const auth_url = try jwt.buildAuthorizationUrl(gpa, metadata.authorization_endpoint.?, .{
+//!     .client_id = "my-client-id",
+//!     .redirect_uri = "https://my-app.example/callback",
+//!     .scope = "openid profile email",
+//!     .state = &state,
+//!     .nonce = &nonce,
+//!     .code_challenge = pkce.challenge(),
+//!     .code_challenge_method = pkce.method,
+//! });
+//! defer gpa.free(auth_url);
+//! // redirect the user-agent to `auth_url` …
+//!
+//! // … the callback returns `code` (after checking `state` matches):
+//! var token_req = try jwt.buildTokenRequest(gpa, metadata.token_endpoint.?, .{
+//!     .code = code_from_callback,
+//!     .redirect_uri = "https://my-app.example/callback",
+//!     .client_id = "my-client-id",
+//!     .code_verifier = pkce.verifier(),
+//! });
+//! defer token_req.deinit(gpa);
+//! // send `token_req` (method/url/content_type/body) with your HTTP client …
+//! var token_resp = try jwt.parseTokenResponse(gpa, response_body_json);
+//! defer token_resp.deinit();
+//! var id_token = try jwt.acceptIdToken(gpa, token_resp.id_token.?, .{ .hmac = secret }, .{
+//!     .now_s = now_seconds,
+//!     .issuer = "https://issuer.example",
+//!     .client_id = "my-client-id",
+//!     .nonce = &nonce, // MUST match — replay/injection defense
+//! });
+//! defer id_token.deinit();
 //! ```
 //!
 //! Design notes:
@@ -127,9 +180,9 @@ const router = @import("router");
 
 pub const meta = .{
     .platform = .any, // pure logic over the Fetcher seam; HttpFetcher uses `http`
-    .role = .server, // P6 is a `router` middleware guarding routes with a Provider.
+    .role = .both, // P6 = a `router` middleware guarding routes (server); P7 = an OAuth2/OIDC client building auth/token requests and accepting ID Tokens (relying party).
     .concurrency = .reentrant, // except Provider — one mutable cache, external sync (inject ResourceServer.lock under a threaded server)
-    .model_after = "RFC 7515 (JWS) + RFC 7519 (JWT) + RFC 7518 (JWA) verify incl. RS256 (RSASSA-PKCS1-v1_5, RFC 8017) + RFC 7517 (JWK/JWKS key sets), RFC 8725 hardening + OpenID Connect Discovery 1.0 / RFC 8414 (issuer metadata -> jwks_uri) with cached, rotation-aware Provider; RFC 6750 Bearer resource-server middleware; OAuth2/OIDC resource server",
+    .model_after = "RFC 7515 (JWS) + RFC 7519 (JWT) + RFC 7518 (JWA) verify incl. RS256 (RSASSA-PKCS1-v1_5, RFC 8017) + RFC 7517 (JWK/JWKS key sets), RFC 8725 hardening + OpenID Connect Discovery 1.0 / RFC 8414 (issuer metadata -> jwks_uri/authorization_endpoint/token_endpoint) with cached, rotation-aware Provider; RFC 6750 Bearer resource-server middleware; RFC 7636 PKCE + OIDC Core 1.0 §3.1 authorization code flow + §3.1.3.7 ID Token validation; OAuth2/OIDC resource server AND relying party",
     .deps = .{ "http", "router", "p256" }, // p256 supplies the fast ES256 curve (byte-exact to std.crypto.sign.ecdsa.EcdsaP256Sha256)
 };
 
@@ -1203,6 +1256,15 @@ pub const Metadata = struct {
     issuer: []const u8,
     /// Where the issuer publishes its JWKS.
     jwks_uri: []const u8,
+    /// Where to send the user-agent to start the P7 authorization code flow
+    /// (OIDC Discovery §3 `authorization_endpoint` — REQUIRED by the spec for
+    /// an OP offering the code flow; optional here so a resource-server-only
+    /// discovery document, this struct's original P5 scope, keeps parsing
+    /// unchanged when it omits it).
+    authorization_endpoint: ?[]const u8 = null,
+    /// Where P7's `buildTokenRequest` exchanges a code for tokens (OIDC
+    /// Discovery §3 `token_endpoint`) — same optionality rationale.
+    token_endpoint: ?[]const u8 = null,
     /// Optional `id_token_signing_alg_values_supported`, verbatim.
     id_token_signing_alg_values_supported: ?[]const []const u8 = null,
 
@@ -1259,6 +1321,24 @@ pub fn discover(
     if (!std.mem.eql(u8, std.mem.trimEnd(u8, doc_issuer, "/"), want_issuer))
         return error.IssuerMismatch;
 
+    // Optional (P7): present in any OP that offers the authorization code
+    // flow, but this struct's original P5 (resource-server) scope never
+    // required them, so absence is not an error — only a wrong JSON type is.
+    const authorization_endpoint: ?[]const u8 = blk: {
+        const v = obj.get("authorization_endpoint") orelse break :blk null;
+        break :blk switch (v) {
+            .string => |s| s,
+            else => return error.DiscoveryFailed,
+        };
+    };
+    const token_endpoint: ?[]const u8 = blk: {
+        const v = obj.get("token_endpoint") orelse break :blk null;
+        break :blk switch (v) {
+            .string => |s| s,
+            else => return error.DiscoveryFailed,
+        };
+    };
+
     const algs: ?[]const []const u8 = blk: {
         const v = obj.get("id_token_signing_alg_values_supported") orelse break :blk null;
         if (v != .array) return error.DiscoveryFailed;
@@ -1273,6 +1353,8 @@ pub fn discover(
     return .{
         .issuer = doc_issuer,
         .jwks_uri = jwks_uri,
+        .authorization_endpoint = authorization_endpoint,
+        .token_endpoint = token_endpoint,
         .id_token_signing_alg_values_supported = algs,
         .arena = arena_state,
     };
@@ -1869,6 +1951,523 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
     ctx.data = &ident;
     defer ctx.data = saved;
     return next.run(ctx);
+}
+
+// ── Part 7: OAuth2/OIDC relying-party (RP) flow ─────────────────────────────
+// Clean-room from RFC 6749 (OAuth 2.0 Authorization Framework), RFC 7636
+// (PKCE) and OpenID Connect Core 1.0 §3.1 (Authorization Code Flow) + §3.1.3.7
+// (ID Token Validation). This is what turns the module from a resource-server
+// -only *validator* into a relying party too: build the authorization
+// request, build the code→token exchange request (the caller performs the
+// actual HTTP — see the module's I/O philosophy, same `Fetcher`-seam spirit
+// as P5), parse the token response, and accept the returned ID Token through
+// the SAME `verify`/`Provider` machinery Parts 2-5 already built — no
+// duplicated crypto, no new dependency (still std-only over what P1-P6
+// already import).
+//
+// DPoP (RFC 9449, proof-of-possession access tokens) is explicitly DEFERRED
+// — it needs client-held key management and a per-request proof JWT, a
+// materially bigger and separable feature; see SPEC.md.
+
+/// RFC 7636 §4.2: the `code_challenge_method`.
+pub const ChallengeMethod = enum {
+    /// `code_challenge = base64url(SHA-256(code_verifier))` — RECOMMENDED,
+    /// the only method OIDC Core requires every conformant OP to support.
+    S256,
+    /// `code_challenge = code_verifier`, verbatim (RFC 7636 §4.2) —
+    /// DISCOURAGED: it only protects against a *code* interception that does
+    /// not also observe the (identical) challenge on the wire, which is a
+    /// much weaker guarantee than S256's one-way hash. Use only against an
+    /// AS/OP known not to support S256.
+    plain,
+
+    /// The wire value sent as `code_challenge_method` (and compared against
+    /// an AS's advertised `code_challenge_methods_supported`).
+    pub fn wireName(m: ChallengeMethod) []const u8 {
+        return switch (m) {
+            .S256 => "S256",
+            .plain => "plain",
+        };
+    }
+};
+
+/// `code_verifier` length: `base64url(32 CSPRNG bytes)`, no padding = 43
+/// characters — within RFC 7636 §4.1's required 43-128 range, entirely
+/// unreserved-alphabet, and exactly how the RFC's own Appendix B example is
+/// constructed (`pkceChallengeS256` reproduces that vector byte-exact).
+pub const pkce_verifier_len: usize = 43;
+/// S256 challenge length: `base64url(SHA-256(verifier))`, no padding = 43.
+pub const pkce_challenge_len: usize = 43;
+
+/// A generated `code_verifier`/`code_challenge` pair (RFC 7636 §4.1/§4.2).
+/// Send `verifier()` in the token-exchange request
+/// (`TokenRequestParams.code_verifier`) and keep it only where the client
+/// that will redeem the code can read it (session, closure — never logged);
+/// send `challenge()` + `method` in the authorization request
+/// (`AuthorizationRequest.code_challenge`/`.code_challenge_method`).
+pub const Pkce = struct {
+    verifier_buf: [pkce_verifier_len]u8,
+    challenge_buf: [pkce_challenge_len]u8,
+    method: ChallengeMethod,
+
+    pub fn verifier(p: *const Pkce) []const u8 {
+        return &p.verifier_buf;
+    }
+
+    /// The `code_challenge` to send in the authorization request: the S256
+    /// digest for `.S256`, or the verifier itself (per `.plain`'s
+    /// definition) for `.plain`.
+    pub fn challenge(p: *const Pkce) []const u8 {
+        return switch (p.method) {
+            .S256 => &p.challenge_buf,
+            .plain => &p.verifier_buf,
+        };
+    }
+};
+
+/// Generate a PKCE pair with the RECOMMENDED `S256` method (RFC 7636 §4.2) —
+/// use this unless the authorization server is known not to support it (then
+/// see `pkceGeneratePlain`). `random` MUST be a cryptographically secure
+/// source: this module has no hidden RNG, the same caller-injected seam the
+/// `jwe` sibling uses (std 0.16 removed `std.crypto.random`) —
+/// `std.Random.DefaultCsprng` seeded from real OS entropy in production,
+/// deterministic in tests. See `pkceChallengeS256` to derive a challenge
+/// from an externally-supplied verifier instead of generating one.
+pub fn pkceGenerateS256(random: std.Random) Pkce {
+    var verifier_buf: [pkce_verifier_len]u8 = undefined;
+    var raw: [32]u8 = undefined;
+    random.bytes(&raw);
+    _ = std.base64.url_safe_no_pad.Encoder.encode(&verifier_buf, &raw);
+    var challenge_buf: [pkce_challenge_len]u8 = undefined;
+    pkceChallengeS256(&verifier_buf, &challenge_buf);
+    return .{ .verifier_buf = verifier_buf, .challenge_buf = challenge_buf, .method = .S256 };
+}
+
+/// Generate a PKCE pair with the `plain` fallback (RFC 7636 §4.2) —
+/// DISCOURAGED, see `ChallengeMethod.plain`'s doc. Only for an AS/OP that
+/// does not support `S256`.
+pub fn pkceGeneratePlain(random: std.Random) Pkce {
+    var verifier_buf: [pkce_verifier_len]u8 = undefined;
+    var raw: [32]u8 = undefined;
+    random.bytes(&raw);
+    _ = std.base64.url_safe_no_pad.Encoder.encode(&verifier_buf, &raw);
+    return .{ .verifier_buf = verifier_buf, .challenge_buf = verifier_buf, .method = .plain };
+}
+
+/// Compute the S256 `code_challenge` for an arbitrary `code_verifier` (RFC
+/// 7636 §4.2): `base64url(SHA-256(ASCII(verifier)))`, no padding. Exposed
+/// separately from generation so a challenge can be derived from an
+/// externally-supplied verifier — e.g. to reproduce the RFC's own KAT
+/// (Appendix B): verifier `dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk` →
+/// challenge `E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM`.
+pub fn pkceChallengeS256(verifier: []const u8, out: *[pkce_challenge_len]u8) void {
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(verifier, &digest, .{});
+    _ = std.base64.url_safe_no_pad.Encoder.encode(out, &digest);
+}
+
+/// Length of a generated `state`/`nonce`: `base64url(32 CSPRNG bytes)`, no
+/// padding — 43 characters, ~256 bits of entropy.
+pub const csrf_token_len: usize = 43;
+
+/// Generate the CSRF `state` parameter (RFC 6749 §10.12) — an opaque,
+/// unguessable value the RP stores (session / signed cookie) and compares
+/// byte-for-byte against the value the AS/OP echoes back on redirect. This is
+/// what stops an attacker from tricking a victim's browser into completing
+/// *the attacker's* authorization flow (login CSRF). `random` MUST be a real
+/// CSPRNG — see `pkceGenerateS256`'s note.
+pub fn generateState(random: std.Random) [csrf_token_len]u8 {
+    return generateCsrfToken(random);
+}
+
+/// Generate the OIDC `nonce` parameter (OIDC Core §3.1.2.1) — bound into the
+/// ID Token and checked by `acceptIdToken`/`acceptIdTokenJwks`/
+/// `acceptIdTokenProvider` to bind the token to THIS authorization attempt,
+/// preventing ID Token replay/injection across attempts. `random` MUST be a
+/// real CSPRNG.
+pub fn generateNonce(random: std.Random) [csrf_token_len]u8 {
+    return generateCsrfToken(random);
+}
+
+fn generateCsrfToken(random: std.Random) [csrf_token_len]u8 {
+    var raw: [32]u8 = undefined;
+    random.bytes(&raw);
+    var out: [csrf_token_len]u8 = undefined;
+    _ = std.base64.url_safe_no_pad.Encoder.encode(&out, &raw);
+    return out;
+}
+
+/// Inputs for `buildAuthorizationUrl` (OIDC Core §3.1.2.1 / RFC 6749 §4.1.1).
+/// Always emits `response_type=code` — this module builds the authorization
+/// *code* flow (with mandatory PKCE); implicit/hybrid response types are out
+/// of scope.
+pub const AuthorizationRequest = struct {
+    client_id: []const u8,
+    redirect_uri: []const u8,
+    /// Space-delimited scopes (RFC 6749 §3.3). OIDC requires at least
+    /// `"openid"` to get an ID Token back.
+    scope: []const u8 = "openid",
+    /// CSRF defense — from `generateState`; the caller verifies the callback
+    /// echoes it back before trusting anything else in the response.
+    state: []const u8,
+    /// ID-token replay defense — from `generateNonce`.
+    nonce: []const u8,
+    /// From `Pkce.challenge()`.
+    code_challenge: []const u8,
+    /// From the same `Pkce`'s `.method`.
+    code_challenge_method: ChallengeMethod,
+};
+
+pub const BuildRequestError = error{OutOfMemory};
+
+/// Build the full authorization-request URL against `authorization_endpoint`
+/// (from Discovery's `Metadata.authorization_endpoint`, or an endpoint
+/// configured directly) — redirect the user-agent here to start the flow.
+/// Every value is percent-encoded (RFC 3986 §2.1, unreserved-characters-only
+/// — conservative and always correct for a URI query component, and
+/// compatible with `http.body.urlencoded`'s decoder). gpa-owned; caller
+/// frees.
+pub fn buildAuthorizationUrl(
+    gpa: std.mem.Allocator,
+    authorization_endpoint: []const u8,
+    req: AuthorizationRequest,
+) BuildRequestError![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(gpa);
+    try buf.appendSlice(gpa, authorization_endpoint);
+    try buf.append(gpa, if (std.mem.indexOfScalar(u8, authorization_endpoint, '?') == null) '?' else '&');
+
+    var first = true;
+    try appendUrlEncodedField(gpa, &buf, &first, "response_type", "code");
+    try appendUrlEncodedField(gpa, &buf, &first, "client_id", req.client_id);
+    try appendUrlEncodedField(gpa, &buf, &first, "redirect_uri", req.redirect_uri);
+    try appendUrlEncodedField(gpa, &buf, &first, "scope", req.scope);
+    try appendUrlEncodedField(gpa, &buf, &first, "state", req.state);
+    try appendUrlEncodedField(gpa, &buf, &first, "nonce", req.nonce);
+    try appendUrlEncodedField(gpa, &buf, &first, "code_challenge", req.code_challenge);
+    try appendUrlEncodedField(gpa, &buf, &first, "code_challenge_method", req.code_challenge_method.wireName());
+    return buf.toOwnedSlice(gpa);
+}
+
+/// Client authentication for the token-endpoint request (RFC 6749 §2.3).
+pub const ClientAuth = union(enum) {
+    /// Public client — PKCE alone authenticates the code exchange (the
+    /// typical SPA/native-app flow; no client secret exists to leak).
+    none,
+    /// Confidential client, `client_secret_post` (RFC 6749 §2.3.1): the
+    /// secret travels in the request body. `client_secret_basic` (HTTP Basic
+    /// auth on the request itself) is a caller concern — set the
+    /// `Authorization` header on the returned `TokenRequest` yourself; this
+    /// builder only produces the body.
+    client_secret_post: []const u8,
+};
+
+/// Inputs to `buildTokenRequest` — the authorization-code grant (RFC 6749
+/// §4.1.3) plus the PKCE `code_verifier` (RFC 7636 §4.5).
+pub const TokenRequestParams = struct {
+    /// The `code` the AS/OP returned on the callback.
+    code: []const u8,
+    /// MUST be byte-identical to the `redirect_uri` sent in the
+    /// authorization request (RFC 6749 §4.1.3).
+    redirect_uri: []const u8,
+    client_id: []const u8,
+    /// From the `Pkce` generated for this flow — `Pkce.verifier()`.
+    code_verifier: []const u8,
+    client_auth: ClientAuth = .none,
+};
+
+/// A prepared token-endpoint request: method/url/content-type/body for the
+/// caller's HTTP client to send (this module does no I/O — see the
+/// module-level design notes, same seam philosophy as P5's `Fetcher`). `url`
+/// borrows `token_endpoint` (keep it alive until sent); `body` is gpa-owned —
+/// free it via `deinit`.
+pub const TokenRequest = struct {
+    method: http.Method = .post,
+    url: []const u8,
+    content_type: []const u8 = "application/x-www-form-urlencoded",
+    body: []u8,
+
+    pub fn deinit(self: *TokenRequest, gpa: std.mem.Allocator) void {
+        gpa.free(self.body);
+        self.* = undefined;
+    }
+};
+
+/// Build the authorization-code token-exchange request (RFC 6749 §4.1.3,
+/// PKCE §4.5) against `token_endpoint` (from Discovery's
+/// `Metadata.token_endpoint`, or an endpoint configured directly).
+pub fn buildTokenRequest(
+    gpa: std.mem.Allocator,
+    token_endpoint: []const u8,
+    params: TokenRequestParams,
+) BuildRequestError!TokenRequest {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(gpa);
+    var first = true;
+    try appendUrlEncodedField(gpa, &buf, &first, "grant_type", "authorization_code");
+    try appendUrlEncodedField(gpa, &buf, &first, "code", params.code);
+    try appendUrlEncodedField(gpa, &buf, &first, "redirect_uri", params.redirect_uri);
+    try appendUrlEncodedField(gpa, &buf, &first, "client_id", params.client_id);
+    try appendUrlEncodedField(gpa, &buf, &first, "code_verifier", params.code_verifier);
+    switch (params.client_auth) {
+        .none => {},
+        .client_secret_post => |secret| try appendUrlEncodedField(gpa, &buf, &first, "client_secret", secret),
+    }
+    return .{ .url = token_endpoint, .body = try buf.toOwnedSlice(gpa) };
+}
+
+/// Append one `name=value` field, percent-encoding `value` (RFC 3986 §2.1,
+/// unreserved-only). `first.*` tracks whether a `&` separator is needed —
+/// used for both the query string (after the endpoint + `?`) and the
+/// `application/x-www-form-urlencoded` body, which share the same encoding
+/// rule at this conservative (unreserved-only) encoding level.
+fn appendUrlEncodedField(
+    gpa: std.mem.Allocator,
+    buf: *std.ArrayList(u8),
+    first: *bool,
+    name: []const u8,
+    value: []const u8,
+) error{OutOfMemory}!void {
+    if (first.*) {
+        first.* = false;
+    } else {
+        try buf.append(gpa, '&');
+    }
+    try buf.appendSlice(gpa, name); // field names here are fixed ASCII tokens
+    try buf.append(gpa, '=');
+    try appendPercentEncoded(gpa, buf, value);
+}
+
+fn appendPercentEncoded(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), raw: []const u8) error{OutOfMemory}!void {
+    const hex = "0123456789ABCDEF";
+    for (raw) |c| {
+        if (isUnreservedByte(c)) {
+            try buf.append(gpa, c);
+        } else {
+            try buf.appendSlice(gpa, &[_]u8{ '%', hex[c >> 4], hex[c & 0xF] });
+        }
+    }
+}
+
+/// RFC 3986 §2.3 unreserved characters — the only bytes this module ever
+/// emits unescaped in a query/form value.
+fn isUnreservedByte(c: u8) bool {
+    return switch (c) {
+        'A'...'Z', 'a'...'z', '0'...'9', '-', '.', '_', '~' => true,
+        else => false,
+    };
+}
+
+/// A successful token-endpoint response (RFC 6749 §5.1 + OIDC Core §3.1.3.3
+/// `id_token`). Everything it references lives in its internal arena; call
+/// `deinit()` when done.
+pub const TokenResponse = struct {
+    /// REQUIRED (RFC 6749 §5.1).
+    access_token: []const u8,
+    /// REQUIRED (RFC 6749 §5.1), e.g. `"Bearer"`.
+    token_type: []const u8,
+    /// The ID Token (OIDC Core §3.1.3.3) — present for an `openid`-scoped
+    /// request; feed it to `acceptIdToken`/`acceptIdTokenJwks`/
+    /// `acceptIdTokenProvider`.
+    id_token: ?[]const u8 = null,
+    expires_in: ?i64 = null,
+    refresh_token: ?[]const u8 = null,
+    scope: ?[]const u8 = null,
+
+    arena: *std.heap.ArenaAllocator,
+
+    pub fn deinit(self: *TokenResponse) void {
+        const gpa = self.arena.child_allocator;
+        self.arena.deinit();
+        gpa.destroy(self.arena);
+        self.* = undefined;
+    }
+};
+
+/// Errors from `parseTokenResponse`. A non-200 / OAuth2 error response (RFC
+/// 6749 §5.2: `{"error": "...", "error_description": "..."}`) is a caller
+/// concern — check the HTTP status before calling this (it assumes a 200
+/// success body).
+pub const TokenResponseError = error{
+    InvalidJson,
+    NotAnObject,
+    /// `access_token` absent or not a string.
+    MissingAccessToken,
+    /// `token_type` absent or not a string.
+    MissingTokenType,
+    /// A present optional member has the wrong JSON type.
+    InvalidField,
+    OutOfMemory,
+};
+
+/// Parse a 200-status token-endpoint JSON body (RFC 6749 §5.1) into a typed
+/// `TokenResponse`.
+pub fn parseTokenResponse(gpa: std.mem.Allocator, json: []const u8) TokenResponseError!TokenResponse {
+    const arena_state = try gpa.create(std.heap.ArenaAllocator);
+    errdefer gpa.destroy(arena_state);
+    arena_state.* = .init(gpa);
+    errdefer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const val = std.json.parseFromSliceLeaky(std.json.Value, arena, json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidJson,
+    };
+    if (val != .object) return error.NotAnObject;
+    const obj = val.object;
+
+    const access_token = (try tokenStringMember(obj, "access_token")) orelse return error.MissingAccessToken;
+    const token_type = (try tokenStringMember(obj, "token_type")) orelse return error.MissingTokenType;
+    const id_token = try tokenStringMember(obj, "id_token");
+    const refresh_token = try tokenStringMember(obj, "refresh_token");
+    const scope = try tokenStringMember(obj, "scope");
+    const expires_in: ?i64 = blk: {
+        const v = obj.get("expires_in") orelse break :blk null;
+        break :blk switch (v) {
+            .integer => |i| i,
+            else => return error.InvalidField,
+        };
+    };
+
+    return .{
+        .access_token = access_token,
+        .token_type = token_type,
+        .id_token = id_token,
+        .expires_in = expires_in,
+        .refresh_token = refresh_token,
+        .scope = scope,
+        .arena = arena_state,
+    };
+}
+
+/// Optional string member of a token response; wrong JSON type is an error
+/// (never silently dropped), absence is `null`.
+fn tokenStringMember(obj: std.json.ObjectMap, name: []const u8) error{InvalidField}!?[]const u8 {
+    const v = obj.get(name) orelse return null;
+    return switch (v) {
+        .string => |s| s,
+        else => error.InvalidField,
+    };
+}
+
+/// Errors from `acceptIdToken`/`acceptIdTokenJwks`/`acceptIdTokenProvider` —
+/// the underlying parse/verify/claims errors (signature, `exp`/`nbf`,
+/// mandatory `iss`/`aud`) plus the ID-Token-specific RP checks (OIDC Core
+/// §3.1.3.7).
+pub const IdTokenError = ParseAndVerifyError || error{
+    /// `aud` has more than one value but `azp` is absent or does not equal
+    /// `client_id` (OIDC Core §3.1.3.7 steps 3-4 — a multi-audience ID Token
+    /// MUST name its authorized party explicitly).
+    AzpMismatch,
+    /// The ID Token has no `nonce` claim at all, though this RP's
+    /// authorization request always sends one — a conforming OP echoes it
+    /// back verbatim (OIDC Core §3.1.3.7 step 11).
+    MissingNonce,
+    /// `nonce` is present but does not equal the value generated for THIS
+    /// authorization request — replay/injection defense: rejects an
+    /// otherwise-validly-signed ID Token minted for a different login
+    /// attempt (fixation) or replayed from an earlier one.
+    NonceMismatch,
+};
+
+/// RP-side acceptance options for an ID Token (OIDC Core §3.1.3.7). Unlike
+/// `Options`/`ClaimOptions` elsewhere in this module, `issuer` and the
+/// audience check (via `client_id`) have no `.any` opt-out here: an OIDC
+/// relying party MUST perform both — there is no supported RP configuration
+/// that skips them.
+pub const IdTokenOptions = struct {
+    now_s: i64,
+    leeway_s: u32 = 60,
+    /// Expected `iss` — the OP's issuer identifier.
+    issuer: []const u8,
+    /// This RP's client_id — checked against `aud` (MUST be contained) and,
+    /// when `aud` has multiple values, against `azp` (MUST be present and
+    /// equal).
+    client_id: []const u8,
+    /// The nonce generated for this authorization request (`generateNonce`)
+    /// — MUST match the token's `nonce` claim exactly.
+    nonce: []const u8,
+};
+
+/// Accept an ID Token against a directly-supplied verification `key`
+/// (offline — mirrors `parseAndVerify`). Runs the EXISTING parse → verify →
+/// validateClaims pipeline (signature, iss/aud/exp/nbf, all P1-P2 machinery)
+/// and layers the OIDC-specific `azp`/`nonce` checks on top.
+pub fn acceptIdToken(
+    gpa: std.mem.Allocator,
+    id_token: []const u8,
+    key: Key,
+    opts: IdTokenOptions,
+) IdTokenError!ParsedToken {
+    var parsed = try parseAndVerify(gpa, id_token, key, .{
+        .now_s = opts.now_s,
+        .leeway_s = opts.leeway_s,
+        .issuer = .{ .required = opts.issuer },
+        .audience = .{ .required = opts.client_id },
+    });
+    errdefer parsed.deinit();
+    try enforceIdTokenRpChecks(&parsed, opts.client_id, opts.nonce);
+    return parsed;
+}
+
+/// Accept an ID Token against a `JwkSet` (mirrors `parseVerifyJwks`) — the
+/// OP's JWKS, resolved by the token's `kid`.
+pub fn acceptIdTokenJwks(
+    gpa: std.mem.Allocator,
+    id_token: []const u8,
+    jwks: JwkSet,
+    opts: IdTokenOptions,
+) IdTokenError!ParsedToken {
+    var parsed = try parseVerifyJwks(gpa, id_token, jwks, .{
+        .now_s = opts.now_s,
+        .leeway_s = opts.leeway_s,
+        .issuer = .{ .required = opts.issuer },
+        .audience = .{ .required = opts.client_id },
+    });
+    errdefer parsed.deinit();
+    try enforceIdTokenRpChecks(&parsed, opts.client_id, opts.nonce);
+    return parsed;
+}
+
+/// Options for `acceptIdTokenProvider` — same as `IdTokenOptions` minus
+/// `issuer`: the `Provider` already enforces its own discovered/configured
+/// issuer (`Provider.ClaimOptions.issuer` defaults to `.provider`), the same
+/// default the resource-server side (`Provider.verify`) uses.
+pub const IdTokenProviderOptions = struct {
+    leeway_s: u32 = 60,
+    client_id: []const u8,
+    nonce: []const u8,
+};
+
+/// Accept an ID Token through the turnkey `Provider` (mirrors
+/// `Provider.verify`) — lazy-load/TTL/rotation-aware JWKS resolution, the
+/// SAME cache Parts 5-6 already run for access tokens.
+pub fn acceptIdTokenProvider(
+    provider: *Provider,
+    gpa: std.mem.Allocator,
+    id_token: []const u8,
+    now_s: i64,
+    opts: IdTokenProviderOptions,
+) (Provider.Error || IdTokenError)!ParsedToken {
+    var parsed = try provider.verify(gpa, id_token, now_s, .{
+        .leeway_s = opts.leeway_s,
+        .audience = .{ .required = opts.client_id },
+    });
+    errdefer parsed.deinit();
+    try enforceIdTokenRpChecks(&parsed, opts.client_id, opts.nonce);
+    return parsed;
+}
+
+fn enforceIdTokenRpChecks(parsed: *const ParsedToken, client_id: []const u8, nonce: []const u8) IdTokenError!void {
+    // OIDC Core §3.1.3.7 steps 3-4: multiple audiences require an explicit
+    // authorized party naming THIS client.
+    if (parsed.claims.aud == .many and parsed.claims.aud.many.len > 1) {
+        const azp = parsed.claims.claimStr("azp") orelse return error.AzpMismatch;
+        if (!std.mem.eql(u8, azp, client_id)) return error.AzpMismatch;
+    }
+    // Step 11: the nonce this RP generated MUST come back unchanged.
+    const nonce_claim = parsed.claims.claimStr("nonce") orelse return error.MissingNonce;
+    if (!std.mem.eql(u8, nonce_claim, nonce)) return error.NonceMismatch;
 }
 
 // ── internals ───────────────────────────────────────────────────────────────
@@ -4557,4 +5156,471 @@ test "ResourceServer: ScopeIter splits on single/multiple spaces; InvalidRealm r
         .claim_opts = .{ .issuer = .any, .audience = .any },
         .realm = "bad\"realm",
     }));
+}
+
+// ── tests: OAuth2/OIDC relying-party flow (Part 7) ──────────────────────────
+
+fn isBase64UrlChar(c: u8) bool {
+    return switch (c) {
+        'A'...'Z', 'a'...'z', '0'...'9', '-', '_' => true,
+        else => false,
+    };
+}
+
+test "PKCE: RFC 7636 Appendix B known-answer vector (S256 challenge)" {
+    // The RFC's own worked example: a code_verifier and its S256 challenge,
+    // both transcribed verbatim.
+    const verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    try testing.expectEqual(@as(usize, pkce_verifier_len), verifier.len);
+    var challenge_buf: [pkce_challenge_len]u8 = undefined;
+    pkceChallengeS256(verifier, &challenge_buf);
+    try testing.expectEqualStrings("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM", &challenge_buf);
+}
+
+test "PKCE: pkceGenerateS256 — lengths, cross-checks pkceChallengeS256, distinct across calls" {
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x70} ** 32);
+    const random = csprng.random();
+
+    const p1 = pkceGenerateS256(random);
+    try testing.expectEqual(ChallengeMethod.S256, p1.method);
+    try testing.expectEqual(@as(usize, pkce_verifier_len), p1.verifier().len);
+    try testing.expectEqual(@as(usize, pkce_challenge_len), p1.challenge().len);
+    try testing.expectEqualStrings("S256", p1.method.wireName());
+
+    // The generated challenge must be exactly what pkceChallengeS256 computes
+    // from the generated verifier — no separate code path drifting from it.
+    var expect_challenge: [pkce_challenge_len]u8 = undefined;
+    pkceChallengeS256(p1.verifier(), &expect_challenge);
+    try testing.expectEqualStrings(&expect_challenge, p1.challenge());
+
+    // Every character is in the base64url alphabet (a strict subset of RFC
+    // 7636's allowed unreserved set) — safe unencoded in a query value.
+    for (p1.verifier()) |c| try testing.expect(isBase64UrlChar(c));
+    for (p1.challenge()) |c| try testing.expect(isBase64UrlChar(c));
+
+    // A second draw from the same CSPRNG stream must differ — this is a
+    // random generator, not a fixed constant.
+    const p2 = pkceGenerateS256(random);
+    try testing.expect(!std.mem.eql(u8, p1.verifier(), p2.verifier()));
+    try testing.expect(!std.mem.eql(u8, p1.challenge(), p2.challenge()));
+}
+
+test "PKCE: pkceGeneratePlain — challenge equals verifier verbatim (discouraged fallback)" {
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x71} ** 32);
+    const p = pkceGeneratePlain(csprng.random());
+    try testing.expectEqual(ChallengeMethod.plain, p.method);
+    try testing.expectEqualStrings("plain", p.method.wireName());
+    try testing.expectEqualStrings(p.verifier(), p.challenge());
+    try testing.expectEqual(@as(usize, pkce_verifier_len), p.verifier().len);
+}
+
+test "generateState / generateNonce: non-empty, correct length, high entropy, base64url alphabet" {
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x72} ** 32);
+    const random = csprng.random();
+
+    const s1 = generateState(random);
+    const s2 = generateState(random);
+    const n1 = generateNonce(random);
+
+    try testing.expectEqual(@as(usize, csrf_token_len), s1.len);
+    try testing.expectEqual(@as(usize, csrf_token_len), n1.len);
+    // Distinct draws from the CSPRNG stream — not a fixed/reused value.
+    try testing.expect(!std.mem.eql(u8, &s1, &s2));
+    try testing.expect(!std.mem.eql(u8, &s1, &n1));
+    for (s1) |c| try testing.expect(isBase64UrlChar(c));
+    for (n1) |c| try testing.expect(isBase64UrlChar(c));
+}
+
+test "buildAuthorizationUrl: builds the OIDC/RFC 6749 query, percent-encoded" {
+    const gpa = testing.allocator;
+    const url = try buildAuthorizationUrl(gpa, "https://issuer.example/authorize", .{
+        .client_id = "my client+id", // exercises space + '+' encoding
+        .redirect_uri = "https://app.example/callback?x=1",
+        .scope = "openid profile email",
+        .state = "state-abc123",
+        .nonce = "nonce-xyz789",
+        .code_challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+        .code_challenge_method = .S256,
+    });
+    defer gpa.free(url);
+    try testing.expectEqualStrings(
+        "https://issuer.example/authorize?response_type=code" ++
+            "&client_id=my%20client%2Bid" ++
+            "&redirect_uri=https%3A%2F%2Fapp.example%2Fcallback%3Fx%3D1" ++
+            "&scope=openid%20profile%20email" ++
+            "&state=state-abc123&nonce=nonce-xyz789" ++
+            "&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM" ++
+            "&code_challenge_method=S256",
+        url,
+    );
+}
+
+test "buildAuthorizationUrl: endpoint already carrying a query string joins with '&'; default scope" {
+    const gpa = testing.allocator;
+    const url = try buildAuthorizationUrl(gpa, "https://issuer.example/authorize?tenant=acme", .{
+        .client_id = "c1",
+        .redirect_uri = "https://app.example/cb",
+        .state = "s1",
+        .nonce = "n1",
+        .code_challenge = "chal",
+        .code_challenge_method = .plain,
+    });
+    defer gpa.free(url);
+    try testing.expect(std.mem.startsWith(u8, url, "https://issuer.example/authorize?tenant=acme&response_type=code"));
+    try testing.expect(std.mem.endsWith(u8, url, "code_challenge_method=plain"));
+    try testing.expect(std.mem.indexOf(u8, url, "scope=openid") != null); // default AuthorizationRequest.scope
+}
+
+test "buildTokenRequest: application/x-www-form-urlencoded body, public and confidential client" {
+    const gpa = testing.allocator;
+    var req = try buildTokenRequest(gpa, "https://issuer.example/token", .{
+        .code = "auth-code-1",
+        .redirect_uri = "https://app.example/callback",
+        .client_id = "my-client",
+        .code_verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
+    });
+    defer req.deinit(gpa);
+    try testing.expectEqual(http.Method.post, req.method);
+    try testing.expectEqualStrings("https://issuer.example/token", req.url);
+    try testing.expectEqualStrings("application/x-www-form-urlencoded", req.content_type);
+    try testing.expectEqualStrings(
+        "grant_type=authorization_code&code=auth-code-1" ++
+            "&redirect_uri=https%3A%2F%2Fapp.example%2Fcallback" ++
+            "&client_id=my-client" ++
+            "&code_verifier=dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
+        req.body,
+    );
+
+    // Confidential client: client_secret_post appends the secret.
+    var req2 = try buildTokenRequest(gpa, "https://issuer.example/token", .{
+        .code = "c2",
+        .redirect_uri = "https://app.example/cb",
+        .client_id = "conf-client",
+        .code_verifier = "v",
+        .client_auth = .{ .client_secret_post = "s3cr3t" },
+    });
+    defer req2.deinit(gpa);
+    try testing.expect(std.mem.endsWith(u8, req2.body, "&client_secret=s3cr3t"));
+}
+
+test "buildTokenRequest: body round-trips through http.body.urlencoded (compatible encoding)" {
+    const gpa = testing.allocator;
+    var req = try buildTokenRequest(gpa, "https://issuer.example/token", .{
+        .code = "a b&c=d", // exercises space + reserved chars needing encoding
+        .redirect_uri = "https://app.example/cb?x=1",
+        .client_id = "id",
+        .code_verifier = "v",
+    });
+    defer req.deinit(gpa);
+    const owned = try gpa.dupe(u8, req.body);
+    defer gpa.free(owned);
+
+    var it = http.body.urlencoded(owned);
+    const p1 = it.next().?;
+    try testing.expectEqualStrings("grant_type", p1.name);
+    try testing.expectEqualStrings("authorization_code", p1.value);
+    const p2 = it.next().?;
+    try testing.expectEqualStrings("code", p2.name);
+    try testing.expectEqualStrings("a b&c=d", p2.value);
+    const p3 = it.next().?;
+    try testing.expectEqualStrings("redirect_uri", p3.name);
+    try testing.expectEqualStrings("https://app.example/cb?x=1", p3.value);
+    const p4 = it.next().?;
+    try testing.expectEqualStrings("client_id", p4.name);
+    try testing.expectEqualStrings("id", p4.value);
+    const p5 = it.next().?;
+    try testing.expectEqualStrings("code_verifier", p5.name);
+    try testing.expectEqualStrings("v", p5.value);
+    try testing.expectEqual(@as(?http.body.FormPair, null), it.next());
+}
+
+test "parseTokenResponse: full response, missing-required and wrong-typed-optional errors" {
+    const gpa = testing.allocator;
+    var resp = try parseTokenResponse(gpa,
+        \\{"access_token":"at-1","token_type":"Bearer","id_token":"idt-1",
+        \\ "expires_in":3600,"refresh_token":"rt-1","scope":"openid profile"}
+    );
+    defer resp.deinit();
+    try testing.expectEqualStrings("at-1", resp.access_token);
+    try testing.expectEqualStrings("Bearer", resp.token_type);
+    try testing.expectEqualStrings("idt-1", resp.id_token.?);
+    try testing.expectEqual(@as(?i64, 3600), resp.expires_in);
+    try testing.expectEqualStrings("rt-1", resp.refresh_token.?);
+    try testing.expectEqualStrings("openid profile", resp.scope.?);
+
+    // Minimal REQUIRED-only response: optionals stay null.
+    var resp2 = try parseTokenResponse(gpa, "{\"access_token\":\"at-2\",\"token_type\":\"bearer\"}");
+    defer resp2.deinit();
+    try testing.expect(resp2.id_token == null);
+    try testing.expect(resp2.expires_in == null);
+    try testing.expect(resp2.refresh_token == null);
+    try testing.expect(resp2.scope == null);
+
+    try testing.expectError(error.MissingAccessToken, parseTokenResponse(gpa, "{\"token_type\":\"Bearer\"}"));
+    try testing.expectError(error.MissingTokenType, parseTokenResponse(gpa, "{\"access_token\":\"at\"}"));
+    try testing.expectError(error.InvalidField, parseTokenResponse(
+        gpa,
+        "{\"access_token\":\"at\",\"token_type\":\"Bearer\",\"expires_in\":\"not-a-number\"}",
+    ));
+    try testing.expectError(error.InvalidJson, parseTokenResponse(gpa, "]][not json"));
+    try testing.expectError(error.NotAnObject, parseTokenResponse(gpa, "[1,2,3]"));
+}
+
+const id_token_issuer = "https://issuer.example";
+const id_token_client_id = "my-client-id";
+const id_token_secret = "id-token-hmac-secret";
+const id_token_nonce = "nonce-1234567890abcdef";
+
+/// Build an HS256-signed ID Token from a payload template (test-only —
+/// exercises `acceptIdToken` through the EXISTING HS256 verify path used
+/// throughout Parts 1-2).
+fn buildIdToken(buf: []u8, payload_json: []const u8) []const u8 {
+    const si = signingInputInto(buf,
+        \\{"alg":"HS256","typ":"JWT"}
+    , payload_json);
+    var mac: [32]u8 = undefined;
+    hmac_sha2.HmacSha256.create(&mac, si, id_token_secret);
+    return finishToken(buf, si.len, &mac);
+}
+
+test "acceptIdToken: happy path — cryptographically valid, right iss/aud/nonce" {
+    var buf: [512]u8 = undefined;
+    const token = buildIdToken(
+        &buf,
+        "{\"iss\":\"" ++ id_token_issuer ++ "\",\"aud\":\"" ++ id_token_client_id ++ "\"," ++
+            "\"exp\":100000,\"sub\":\"user-42\",\"nonce\":\"" ++ id_token_nonce ++ "\"}",
+    );
+    var accepted = try acceptIdToken(testing.allocator, token, .{ .hmac = id_token_secret }, .{
+        .now_s = 1000,
+        .issuer = id_token_issuer,
+        .client_id = id_token_client_id,
+        .nonce = id_token_nonce,
+    });
+    defer accepted.deinit();
+    try testing.expectEqualStrings("user-42", accepted.claims.sub.?);
+}
+
+test "SECURITY: acceptIdToken rejects a cryptographically-VALID token carrying the WRONG nonce" {
+    // Positive control: the signature and every other claim are fine — only
+    // the nonce is wrong (as if an attacker replayed/injected an ID Token
+    // from a different login attempt). This MUST be rejected — nonce is the
+    // defense against exactly that.
+    var buf: [512]u8 = undefined;
+    const token = buildIdToken(
+        &buf,
+        "{\"iss\":\"" ++ id_token_issuer ++ "\",\"aud\":\"" ++ id_token_client_id ++ "\"," ++
+            "\"exp\":100000,\"nonce\":\"a-DIFFERENT-nonce-entirely\"}",
+    );
+    // Prove the token really does verify cryptographically on its own merits
+    // first (so the rejection below is provably about the nonce, not a
+    // broken signature).
+    var parsed = try parse(testing.allocator, token);
+    defer parsed.deinit();
+    try verify(&parsed, .{ .hmac = id_token_secret });
+
+    try testing.expectError(error.NonceMismatch, acceptIdToken(testing.allocator, token, .{ .hmac = id_token_secret }, .{
+        .now_s = 1000,
+        .issuer = id_token_issuer,
+        .client_id = id_token_client_id,
+        .nonce = id_token_nonce,
+    }));
+}
+
+test "acceptIdToken: missing nonce claim → MissingNonce" {
+    var buf: [512]u8 = undefined;
+    const token = buildIdToken(
+        &buf,
+        "{\"iss\":\"" ++ id_token_issuer ++ "\",\"aud\":\"" ++ id_token_client_id ++ "\",\"exp\":100000}",
+    );
+    try testing.expectError(error.MissingNonce, acceptIdToken(testing.allocator, token, .{ .hmac = id_token_secret }, .{
+        .now_s = 1000,
+        .issuer = id_token_issuer,
+        .client_id = id_token_client_id,
+        .nonce = id_token_nonce,
+    }));
+}
+
+test "acceptIdToken: iss / aud / exp failures are each rejected with the right typed error" {
+    const gpa = testing.allocator;
+    // Wrong issuer.
+    {
+        var buf: [512]u8 = undefined;
+        const token = buildIdToken(
+            &buf,
+            "{\"iss\":\"https://evil.example\",\"aud\":\"" ++ id_token_client_id ++ "\"," ++
+                "\"exp\":100000,\"nonce\":\"" ++ id_token_nonce ++ "\"}",
+        );
+        try testing.expectError(error.IssuerMismatch, acceptIdToken(gpa, token, .{ .hmac = id_token_secret }, .{
+            .now_s = 1000,
+            .issuer = id_token_issuer,
+            .client_id = id_token_client_id,
+            .nonce = id_token_nonce,
+        }));
+    }
+    // Wrong audience.
+    {
+        var buf: [512]u8 = undefined;
+        const token = buildIdToken(
+            &buf,
+            "{\"iss\":\"" ++ id_token_issuer ++ "\",\"aud\":\"someone-else\"," ++
+                "\"exp\":100000,\"nonce\":\"" ++ id_token_nonce ++ "\"}",
+        );
+        try testing.expectError(error.AudienceMismatch, acceptIdToken(gpa, token, .{ .hmac = id_token_secret }, .{
+            .now_s = 1000,
+            .issuer = id_token_issuer,
+            .client_id = id_token_client_id,
+            .nonce = id_token_nonce,
+        }));
+    }
+    // Expired.
+    {
+        var buf: [512]u8 = undefined;
+        const token = buildIdToken(
+            &buf,
+            "{\"iss\":\"" ++ id_token_issuer ++ "\",\"aud\":\"" ++ id_token_client_id ++ "\"," ++
+                "\"exp\":100,\"nonce\":\"" ++ id_token_nonce ++ "\"}",
+        );
+        try testing.expectError(error.Expired, acceptIdToken(gpa, token, .{ .hmac = id_token_secret }, .{
+            .now_s = 1000,
+            .issuer = id_token_issuer,
+            .client_id = id_token_client_id,
+            .nonce = id_token_nonce,
+        }));
+    }
+}
+
+test "acceptIdToken: multiple audiences require a matching azp (OIDC Core §3.1.3.7)" {
+    const gpa = testing.allocator;
+    // Multiple aud, no azp at all → AzpMismatch.
+    {
+        var buf: [512]u8 = undefined;
+        const token = buildIdToken(
+            &buf,
+            "{\"iss\":\"" ++ id_token_issuer ++ "\",\"aud\":[\"" ++ id_token_client_id ++ "\",\"other-svc\"]," ++
+                "\"exp\":100000,\"nonce\":\"" ++ id_token_nonce ++ "\"}",
+        );
+        try testing.expectError(error.AzpMismatch, acceptIdToken(gpa, token, .{ .hmac = id_token_secret }, .{
+            .now_s = 1000,
+            .issuer = id_token_issuer,
+            .client_id = id_token_client_id,
+            .nonce = id_token_nonce,
+        }));
+    }
+    // Multiple aud, azp names a DIFFERENT client → AzpMismatch.
+    {
+        var buf: [512]u8 = undefined;
+        const token = buildIdToken(
+            &buf,
+            "{\"iss\":\"" ++ id_token_issuer ++ "\",\"aud\":[\"" ++ id_token_client_id ++ "\",\"other-svc\"]," ++
+                "\"azp\":\"someone-else\",\"exp\":100000,\"nonce\":\"" ++ id_token_nonce ++ "\"}",
+        );
+        try testing.expectError(error.AzpMismatch, acceptIdToken(gpa, token, .{ .hmac = id_token_secret }, .{
+            .now_s = 1000,
+            .issuer = id_token_issuer,
+            .client_id = id_token_client_id,
+            .nonce = id_token_nonce,
+        }));
+    }
+    // Multiple aud, azp correctly names THIS client → accepted.
+    {
+        var buf: [512]u8 = undefined;
+        const token = buildIdToken(
+            &buf,
+            "{\"iss\":\"" ++ id_token_issuer ++ "\",\"aud\":[\"" ++ id_token_client_id ++ "\",\"other-svc\"]," ++
+                "\"azp\":\"" ++ id_token_client_id ++ "\",\"exp\":100000,\"nonce\":\"" ++ id_token_nonce ++ "\"}",
+        );
+        var accepted = try acceptIdToken(gpa, token, .{ .hmac = id_token_secret }, .{
+            .now_s = 1000,
+            .issuer = id_token_issuer,
+            .client_id = id_token_client_id,
+            .nonce = id_token_nonce,
+        });
+        accepted.deinit();
+    }
+}
+
+test "acceptIdTokenJwks: resolves by kid against a local JWKS, enforces nonce" {
+    const gpa = testing.allocator;
+    var k_b64: [64]u8 = undefined;
+    const k_s = std.base64.url_safe_no_pad.Encoder.encode(&k_b64, id_token_secret);
+    var set_buf: [256]u8 = undefined;
+    const set = try std.fmt.bufPrint(&set_buf,
+        \\{{"keys":[{{"kty":"oct","kid":"idp-1","k":"{s}"}}]}}
+    , .{k_s});
+    var jwks = try parseJwks(gpa, set);
+    defer jwks.deinit();
+
+    var buf: [512]u8 = undefined;
+    const si = signingInputInto(
+        buf[0..],
+        \\{"alg":"HS256","kid":"idp-1"}
+    ,
+        "{\"iss\":\"" ++ id_token_issuer ++ "\",\"aud\":\"" ++ id_token_client_id ++ "\"," ++
+            "\"exp\":100000,\"nonce\":\"" ++ id_token_nonce ++ "\"}",
+    );
+    var mac: [32]u8 = undefined;
+    hmac_sha2.HmacSha256.create(&mac, si, id_token_secret);
+    const token = finishToken(&buf, si.len, &mac);
+
+    var accepted = try acceptIdTokenJwks(gpa, token, jwks, .{
+        .now_s = 1000,
+        .issuer = id_token_issuer,
+        .client_id = id_token_client_id,
+        .nonce = id_token_nonce,
+    });
+    accepted.deinit();
+
+    try testing.expectError(error.NonceMismatch, acceptIdTokenJwks(gpa, token, jwks, .{
+        .now_s = 1000,
+        .issuer = id_token_issuer,
+        .client_id = id_token_client_id,
+        .nonce = "wrong-nonce",
+    }));
+}
+
+test "acceptIdTokenProvider: turnkey ID Token acceptance through the cached Provider" {
+    const gpa = testing.allocator;
+    const enc = std.base64.url_safe_no_pad.Encoder;
+    // A fetched JWKS may not carry symmetric `oct` keys, so the OP signs
+    // with EdDSA over a published public key — same rule Provider tests use.
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x53} ** 32);
+    const pub_bytes = kp.public_key.toBytes();
+    var x_b64: [43]u8 = undefined;
+    var set_buf: [256]u8 = undefined;
+    const set = try std.fmt.bufPrint(&set_buf,
+        \\{{"keys":[{{"kty":"OKP","kid":"op-key","crv":"Ed25519","x":"{s}"}}]}}
+    , .{enc.encode(&x_b64, &pub_bytes)});
+
+    var stub: ScriptFetcher = .{ .script = &.{
+        .{ .url = test_wellknown_url, .body = test_discovery_json },
+        .{ .url = test_jwks_url, .body = set },
+    } };
+    var provider = Provider.init(gpa, stub.fetcher(), .{ .issuer = "https://issuer.example" });
+    defer provider.deinit();
+
+    var buf: [512]u8 = undefined;
+    const si = signingInputInto(
+        &buf,
+        \\{"alg":"EdDSA","kid":"op-key"}
+    ,
+        "{\"iss\":\"https://issuer.example\",\"aud\":\"" ++ id_token_client_id ++ "\"," ++
+            "\"exp\":2000,\"nonce\":\"" ++ id_token_nonce ++ "\"}",
+    );
+    const sig = (try kp.sign(si, null)).toBytes();
+    const token = finishToken(&buf, si.len, &sig);
+
+    var accepted = try acceptIdTokenProvider(&provider, gpa, token, 1000, .{
+        .client_id = id_token_client_id,
+        .nonce = id_token_nonce,
+    });
+    defer accepted.deinit();
+    try testing.expectEqualStrings("https://issuer.example", accepted.claims.iss.?);
+
+    // Wrong nonce, same otherwise-valid token → NonceMismatch, cache reused
+    // (no extra fetch).
+    try testing.expectError(error.NonceMismatch, acceptIdTokenProvider(&provider, gpa, token, 1000, .{
+        .client_id = id_token_client_id,
+        .nonce = "not-the-right-nonce",
+    }));
+    try testing.expectEqual(@as(usize, 2), stub.calls);
 }
