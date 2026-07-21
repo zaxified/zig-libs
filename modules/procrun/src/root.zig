@@ -21,13 +21,14 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const argsafe = @import("argsafe");
 
 pub const meta = .{
     .platform = .any, // full behavior on POSIX; Windows compiles (reap-race is POSIX-only)
     .role = .util,
     .concurrency = .reentrant, // no shared module state (aside from the SIGCHLD-fixup guard)
     .model_after = "Python subprocess.run/Popen; Go os/exec",
-    .deps = .{},
+    .deps = .{"argsafe"}, // opt-in argv sanitization, see runValidated/buildValidatedArgv
 };
 
 // ── public types ──────────────────────────────────────────────────────────
@@ -91,6 +92,58 @@ pub const Spec = struct {
     max_output_bytes: usize = default_max_output_bytes,
     /// Backpressure permit count for `spawnStreaming` (stdout only).
     stream_permits: usize = default_stream_permits,
+    /// Spawn the child as the leader of its own process group
+    /// (`setpgid(0, 0)`, applied by the kernel between fork and exec)
+    /// instead of inheriting the parent's group. Needed for
+    /// `Handle.killGroup`/`cancelGroup`/`signalGroup` and for `runTimeout`'s
+    /// deadline kill to reach descendants the child forks on its own (e.g.
+    /// `sh -c 'long-runner &'`) — those grandchildren stay in the group the
+    /// kernel assigns them at fork (their parent's), so a signal to `-pgid`
+    /// reaches the whole tree, unlike a signal to the direct child alone.
+    /// Since `setpgid(0, 0)` makes the new group id equal the child's own
+    /// pid, no separate id needs to be tracked. POSIX-only; has no effect on
+    /// Windows (no process-group concept exposed here).
+    new_process_group: bool = false,
+    /// Optional rlimit sandbox applied to the child before it execs the
+    /// caller's program — see `RlimitSpec`. `null` (default) applies no
+    /// limits. POSIX-only; `error.OperationUnsupported` on Windows.
+    rlimit: ?RlimitSpec = null,
+};
+
+/// rlimit knobs applied to the child before it execs the real program (see
+/// `Spec.rlimit`). Each field is optional; an unset field leaves that
+/// resource at whatever the child would otherwise inherit. POSIX-only.
+///
+/// Implementation note: `std.process.spawn` (the `Io.Threaded` POSIX
+/// backend) has no post-fork/pre-exec hook to run arbitrary code in the
+/// child, so this is applied by inserting a small `/bin/sh -c '<ulimit
+/// ...>; exec "$@"'` wrapper in front of `Spec.argv` — the IMMEDIATE child
+/// (the shell) sets its own limits via the POSIX `ulimit` builtin (itself a
+/// thin wrapper over `setrlimit`), which POSIX guarantees are inherited
+/// across `exec`, then the shell replaces itself with the real program
+/// image. `Spec.argv`'s elements are passed to the shell as positional
+/// parameters (`"$@"`) — never re-parsed as shell syntax — so this
+/// introduces no shell-injection surface; only the numeric limit VALUES
+/// (formatted by this module, never caller-supplied text) are embedded in
+/// the generated script.
+pub const RlimitSpec = struct {
+    /// `RLIMIT_CPU`, seconds. The kernel delivers `SIGXCPU` once the
+    /// process's cumulative CPU time reaches the limit (default
+    /// disposition: terminate).
+    cpu_seconds: ?u64 = null,
+    /// `RLIMIT_AS`, bytes. Caps total virtual address space; further
+    /// allocation (mmap/brk) fails with `ENOMEM` once reached. Rounded UP
+    /// to the whole kilobytes `ulimit -v` takes, so the requested byte cap
+    /// is never silently loosened.
+    address_space_bytes: ?u64 = null,
+    /// `RLIMIT_NOFILE`, count. Caps simultaneously open file descriptors.
+    open_files: ?u64 = null,
+    /// `RLIMIT_FSIZE`, bytes. Caps the size of any file the process writes;
+    /// exceeding it delivers `SIGXFSZ` (default disposition: terminate) on
+    /// the write that would cross the limit. Rounded UP to the whole
+    /// 512-byte blocks `ulimit -f` takes, so the requested byte cap is
+    /// never silently loosened.
+    file_size_bytes: ?u64 = null,
 };
 
 /// Result of a blocking `run`/`runTimeout`. Caller owns `stdout`/`stderr`.
@@ -250,6 +303,31 @@ fn deliver(child: *std.process.Child, kind: SigKind, raw: u8) void {
     }
 }
 
+/// Like `deliver`, but signals the child's entire process GROUP
+/// (`kill(-pgid, sig)`) instead of just the direct child, reaching
+/// descendants the child forked into the same group (e.g. a shell's
+/// background jobs). Only takes effect if `grouped` is true (i.e.
+/// `Spec.new_process_group` was set at spawn time, so the group id is
+/// known to equal the child's own pid) — otherwise a documented no-op, so a
+/// caller can never accidentally signal ITS OWN process group (which the
+/// child would still belong to without `new_process_group`). Falls back to
+/// `deliver` on Windows, which has no POSIX process-group concept.
+fn deliverGroup(child: *std.process.Child, kind: SigKind, raw: u8, grouped: bool) void {
+    if (!grouped) return;
+    switch (builtin.os.tag) {
+        .windows => deliver(child, kind, raw),
+        else => {
+            const id = child.id orelse return;
+            const sig: std.posix.SIG = switch (kind) {
+                .term => .TERM,
+                .kill => .KILL,
+                .raw => @enumFromInt(raw),
+            };
+            std.posix.kill(-id, sig) catch {};
+        },
+    }
+}
+
 // ── spawn helper ────────────────────────────────────────────────────────────
 
 fn toStdIo(m: StdioMode) std.process.SpawnOptions.StdIo {
@@ -285,20 +363,85 @@ fn spawnChild(gpa: std.mem.Allocator, io: std.Io, spec: Spec) !std.process.Child
 
     const cwd: std.process.Child.Cwd = if (spec.cwd) |p| .{ .path = p } else .inherit;
 
+    // rlimit sandbox: wrap argv through a small ulimit-then-exec shell (see
+    // `RlimitSpec`). The wrapper's own storage only needs to stay alive for
+    // the duration of the spawn call below (fork+exec is synchronous), so it
+    // is freed via `defer` right here rather than escaping this function.
+    var rlimit_wrap: ?RlimitWrap = null;
+    defer if (rlimit_wrap) |*w| w.deinit(gpa);
+    const effective_argv: []const []const u8 = blk: {
+        const r = spec.rlimit orelse break :blk spec.argv;
+        if (builtin.os.tag == .windows) return error.OperationUnsupported;
+        rlimit_wrap = try buildRlimitWrap(gpa, spec.argv, r);
+        break :blk rlimit_wrap.?.argv;
+    };
+
     // fd-hygiene note: any parent fd NOT marked FD_CLOEXEC is inherited by
     // the child across this spawn — `Spec` only controls stdin/stdout/stderr
     // (`StdioMode`), it does not close arbitrary other open fds. Callers that
     // hold sensitive fds open (sockets, secret-bearing files, …) must set
     // FD_CLOEXEC on them themselves if the child must not inherit them.
     return std.process.spawn(io, .{
-        .argv = spec.argv,
+        .argv = effective_argv,
         .cwd = cwd,
         .environ_map = env_ptr,
         .stdin = toStdIo(spec.stdin),
         .stdout = toStdIo(spec.stdout),
         .stderr = toStdIo(spec.stderr),
         .create_no_window = true,
+        .pgid = if (spec.new_process_group) 0 else null,
     });
+}
+
+const RlimitWrap = struct {
+    /// `["/bin/sh", "-c", script, "sh", <spec.argv...>]`. `argv[2]` (the
+    /// script) borrows `script`'s storage; every other element borrows
+    /// either a literal or the caller's `spec.argv`.
+    argv: []const []const u8,
+    script: []u8,
+
+    fn deinit(w: *RlimitWrap, gpa: std.mem.Allocator) void {
+        gpa.free(w.argv);
+        gpa.free(w.script);
+    }
+};
+
+fn ceilDiv(numerator: u64, denominator: u64) u64 {
+    return (numerator + denominator - 1) / denominator;
+}
+
+/// Builds the `/bin/sh -c '<ulimit ...>; exec "$@"' sh <argv...>` wrapper
+/// documented on `RlimitSpec`. `sh`'s `ulimit` takes `-f` in 512-byte blocks
+/// and `-v` in kilobytes (POSIX/dash/bash agree on this); `-t` (seconds) and
+/// `-n` (fd count) are unit-for-unit. Each `ulimit` call is guarded with
+/// `|| exit 121` so a platform that rejects a particular limit fails the
+/// spawn loudly (surfacing as a non-.exited `Term`) instead of silently
+/// running unsandboxed.
+fn buildRlimitWrap(gpa: std.mem.Allocator, argv: []const []const u8, r: RlimitSpec) !RlimitWrap {
+    var script: std.ArrayList(u8) = .empty;
+    errdefer script.deinit(gpa);
+    if (r.cpu_seconds) |v| try script.print(gpa, "ulimit -t {d} || exit 121\n", .{v});
+    if (r.file_size_bytes) |v| try script.print(gpa, "ulimit -f {d} || exit 121\n", .{ceilDiv(v, 512)});
+    if (r.address_space_bytes) |v| try script.print(gpa, "ulimit -v {d} || exit 121\n", .{ceilDiv(v, 1024)});
+    if (r.open_files) |v| try script.print(gpa, "ulimit -n {d} || exit 121\n", .{v});
+    try script.print(gpa, "exec \"$@\"\n", .{});
+
+    // Finalize the script buffer BEFORE it is referenced from `wrapped`:
+    // `toOwnedSlice` is permitted to reallocate-and-copy (not just shrink
+    // in place) if the allocator's `remap` declines, which would leave a
+    // slice captured from `script.items` beforehand dangling.
+    const script_owned = try script.toOwnedSlice(gpa);
+    errdefer gpa.free(script_owned);
+
+    var wrapped: std.ArrayList([]const u8) = .empty;
+    errdefer wrapped.deinit(gpa);
+    try wrapped.append(gpa, "/bin/sh");
+    try wrapped.append(gpa, "-c");
+    try wrapped.append(gpa, script_owned);
+    try wrapped.append(gpa, "sh"); // becomes $0 inside the script; exec "$@" starts at spec.argv[0]
+    try wrapped.appendSlice(gpa, argv);
+
+    return .{ .argv = try wrapped.toOwnedSlice(gpa), .script = script_owned };
 }
 
 fn copyEnv(dst: *std.process.Environ.Map, src: *const std.process.Environ.Map) !void {
@@ -522,6 +665,7 @@ pub fn runTimeout(
         .child = &child,
         .timeout_ns = timeout_ns,
         .done = &done,
+        .grouped = spec.new_process_group,
     }});
 
     // Pumps finish when the child exits — naturally, or because the killer
@@ -553,6 +697,9 @@ const KillJob = struct {
     child: *std.process.Child,
     timeout_ns: u64,
     done: *std.atomic.Value(bool),
+    /// Kill the child's whole process group instead of just the child
+    /// itself — set from `Spec.new_process_group`; see `deliverGroup`.
+    grouped: bool = false,
 };
 
 fn killerLoop(j: KillJob) void {
@@ -565,7 +712,7 @@ fn killerLoop(j: KillJob) void {
         slept += chunk;
     }
     if (j.done.load(.acquire)) return;
-    deliver(j.child, .kill, 0);
+    if (j.grouped) deliverGroup(j.child, .kill, 0, true) else deliver(j.child, .kill, 0);
 }
 
 fn sleepNs(ns: u64) void {
@@ -593,6 +740,63 @@ fn sleepNs(ns: u64) void {
     }
 }
 
+// ── argsafe integration (opt-in) ────────────────────────────────────────────
+
+/// Opt-in `argsafe` integration (see module SPEC "Threat model"): ordinary
+/// `run`/`runTimeout`/`spawnStreaming` do NOT validate `Spec.argv` — it is
+/// trusted-by-construction per module convention, the caller's
+/// responsibility. `runValidated`/`buildValidatedArgv` are for callers
+/// assembling a child's argv from untrusted input (e.g. request parameters)
+/// who want the `argsafe` discipline (reject flag-injection / NUL / control
+/// bytes / `..`, per `program_ok`/`args_ok`) applied uniformly, with the
+/// rejection surfacing as `argsafe.Error.Rejected` BEFORE any process is
+/// spawned, rather than hand-rolling the check at every call site.
+///
+/// `program` (argv[0]) and `args` (argv[1..]) are validated against separate
+/// predicates because they typically have different shapes — `program` is
+/// often an absolute path (`argsafe.isSafePath`) while `args` are identifiers
+/// / values (`argsafe.isSafeIdentifier`, `argsafe.isSafeKvValue`, a
+/// `CharClass.predicate()`, …). Pass the same predicate for both if that
+/// distinction doesn't apply.
+pub fn buildValidatedArgv(
+    gpa: std.mem.Allocator,
+    program: []const u8,
+    program_ok: *const fn ([]const u8) bool,
+    args: []const []const u8,
+    args_ok: *const fn ([]const u8) bool,
+) (argsafe.Error || std.mem.Allocator.Error)![]const []const u8 {
+    if (!program_ok(program)) return argsafe.Error.Rejected;
+    for (args) |a| {
+        if (!args_ok(a)) return argsafe.Error.Rejected;
+    }
+
+    const full = try gpa.alloc([]const u8, args.len + 1);
+    errdefer gpa.free(full);
+    full[0] = program;
+    @memcpy(full[1..], args);
+    return full;
+}
+
+/// `run`, but `spec_rest.argv` is ignored and instead built from `program` +
+/// `args` via `buildValidatedArgv` — see its docs. Spawns nothing if
+/// validation rejects a token.
+pub fn runValidated(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    program: []const u8,
+    program_ok: *const fn ([]const u8) bool,
+    args: []const []const u8,
+    args_ok: *const fn ([]const u8) bool,
+    spec_rest: Spec,
+    stdin_body: []const u8,
+) !Output {
+    const argv = try buildValidatedArgv(gpa, program, program_ok, args, args_ok);
+    defer gpa.free(argv);
+    var spec = spec_rest;
+    spec.argv = argv;
+    return run(gpa, io, spec, stdin_body);
+}
+
 // ── streaming run ───────────────────────────────────────────────────────────
 
 /// Native (non-FFI) streaming callbacks. Each fires synchronously on a
@@ -613,9 +817,22 @@ const StreamCtx = struct {
     cb: Callbacks,
     permits: usize,
     sema: std.Io.Semaphore,
+    /// Mirrors `Spec.new_process_group` — gates `Handle.*Group` methods so
+    /// they can never signal a group the child wasn't actually made leader
+    /// of (see `deliverGroup`).
+    grouped: bool,
     t_out: ?std.Thread = null,
     t_err: ?std.Thread = null,
 };
+
+/// Returned by `Handle.writeStdin`/`closeStdin` when there is no writable
+/// stdin pipe left — either `Spec.stdin` was not `.pipe` at spawn time, or
+/// it was already closed by a prior `closeStdin` (or by `wait`). Any actual
+/// write failure against a still-open pipe (broken pipe because the child
+/// exited/closed its end, disk-adjacent errors, …) instead surfaces as its
+/// own typed error from the underlying `Io.File` write — most commonly
+/// `error.BrokenPipe`.
+pub const StdinError = error{StdinUnavailable};
 
 /// A running streaming child. The caller MUST eventually call `wait` exactly
 /// once — it joins the reader threads, reaps the child, fires `on_exit`, and
@@ -641,9 +858,77 @@ pub const Handle = struct {
         deliver(&h.ctx.child, .raw, sig);
     }
 
+    /// Ask the child's entire process GROUP to terminate (`SIGTERM` to
+    /// `-pgid`) rather than just the direct child, reaching descendants the
+    /// child forked on its own (e.g. a shell's background jobs). Only takes
+    /// effect if `Spec.new_process_group` was set at spawn time; otherwise a
+    /// documented no-op — see `grouped`.
+    pub fn cancelGroup(h: Handle) void {
+        deliverGroup(&h.ctx.child, .term, 0, h.ctx.grouped);
+        wake(h.ctx);
+    }
+
+    /// Force the child's entire process GROUP to terminate now (`SIGKILL`
+    /// to `-pgid`). Only takes effect if `Spec.new_process_group` was set at
+    /// spawn time; otherwise a documented no-op — see `grouped`.
+    pub fn killGroup(h: Handle) void {
+        deliverGroup(&h.ctx.child, .kill, 0, h.ctx.grouped);
+        wake(h.ctx);
+    }
+
+    /// Send an arbitrary POSIX signal number to the child's entire process
+    /// GROUP. Only takes effect if `Spec.new_process_group` was set at spawn
+    /// time; otherwise a documented no-op — see `grouped`.
+    pub fn signalGroup(h: Handle, sig: u8) void {
+        deliverGroup(&h.ctx.child, .raw, sig, h.ctx.grouped);
+    }
+
+    /// True iff this child was spawned with `Spec.new_process_group = true`,
+    /// i.e. `cancelGroup`/`killGroup`/`signalGroup` will actually reach the
+    /// group rather than being a no-op.
+    pub fn grouped(h: Handle) bool {
+        return h.ctx.grouped;
+    }
+
     /// Release one stdout backpressure permit (call after consuming a chunk).
     pub fn ack(h: Handle) void {
         h.ctx.sema.post(h.ctx.io);
+    }
+
+    /// Write to the child's stdin (requires `Spec.stdin = .pipe`). Safe to
+    /// call repeatedly over the child's lifetime — unlike `run`'s one-shot
+    /// `stdin_body`, this lets a caller stream a request/response protocol
+    /// (e.g. an MCP stdio transport) incrementally after spawn. Blocks the
+    /// calling thread (not a reader thread) until the whole of `data` is
+    /// written or an error occurs; internally loops over partial writes so a
+    /// short write never silently drops a suffix. If the child has exited or
+    /// closed its stdin, this surfaces as `error.BrokenPipe` (from the
+    /// underlying `Io.File` write) rather than blocking or panicking.
+    ///
+    /// MUST NOT be called concurrently with itself, with `closeStdin`, or
+    /// with `wait` (all three touch the same `Io.File` / `child.stdin`
+    /// field without a lock — serialize them, e.g. from the thread that owns
+    /// the `Handle`) — matches the module's documented `wait`-owns-cleanup
+    /// contract.
+    pub fn writeStdin(h: Handle, data: []const u8) !void {
+        const f = h.ctx.child.stdin orelse return error.StdinUnavailable;
+        try f.writeStreamingAll(h.ctx.io, data);
+    }
+
+    /// Close the child's stdin, signalling EOF to it (many programs — `cat`,
+    /// a line-based protocol — only respond/exit once stdin closes). Safe to
+    /// call at most once; a second call is rejected with
+    /// `error.StdinUnavailable` rather than double-closing the fd. `wait`
+    /// also closes stdin if still open, so calling this before `wait` is
+    /// optional — it exists for callers that need EOF delivered BEFORE they
+    /// start waiting (e.g. to make the child produce its final output).
+    ///
+    /// MUST NOT be called concurrently with `writeStdin` or `wait` — see
+    /// `writeStdin`.
+    pub fn closeStdin(h: Handle) StdinError!void {
+        const f = h.ctx.child.stdin orelse return error.StdinUnavailable;
+        f.close(h.ctx.io);
+        h.ctx.child.stdin = null;
     }
 
     /// Block until the child exits, then reap + fire `on_exit` + free state.
@@ -684,6 +969,7 @@ pub fn spawnStreaming(gpa: std.mem.Allocator, io: std.Io, spec: Spec, cb: Callba
         .cb = cb,
         .permits = spec.stream_permits,
         .sema = .{ .permits = spec.stream_permits },
+        .grouped = spec.new_process_group,
     };
     errdefer ctx.child.kill(io);
 
@@ -1008,4 +1294,365 @@ test "run: merge env overlays the child environment" {
 
     try testing.expect(out.term == .exited);
     try testing.expectEqualStrings("merged", out.stdout);
+}
+
+// ── process-group tree-kill tests ───────────────────────────────────────────
+
+/// Reads `/proc/<pid>/stat`'s state character (`R`/`S`/`D`/`Z`/…), or `null`
+/// if the pid no longer exists at all. Used to tell "really still running"
+/// (exists, not a zombie) apart from "gone" (doesn't exist OR zombie —
+/// `kill(pid, 0)` alone can't make this distinction: it succeeds against a
+/// not-yet-reaped zombie too, which would make a kill-then-check-liveness
+/// test flaky against reaper-thread timing).
+fn procStatState(pid: std.posix.pid_t) ?u8 {
+    var path_buf: [64:0]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/stat", .{pid}) catch return null;
+
+    // Deliberately raw syscalls with a manual `errno` switch (not
+    // `Io.Dir`/`Io.File`, and not even the higher-level `std.posix.openatZ`/
+    // `.read` wrappers): reading a THIRD process's `/proc/pid/stat` while it
+    // is mid-exit (as `procReallyRunning` does, right after a kill) can hit
+    // `ESRCH` between `openat` succeeding and `read` running, or other rare
+    // errno values a typed wrapper doesn't enumerate — a documented procfs
+    // race, not a bug. Zig's typed wrappers route anything they don't
+    // enumerate through `unexpectedErrno`, which unconditionally dumps a
+    // stack trace in Debug builds EVEN THOUGH the caller goes on to handle
+    // the resulting error — noisy but harmless on its own; a raw syscall +
+    // our own `errno` switch avoids that path entirely. Matches this
+    // module's established libc-free raw-syscall style (see
+    // `reapTolerantPosix`). `/proc/pid/stat` is always returned complete by
+    // a single `read(2)`, so one shot is enough — no retry loop needed.
+    const posix = std.posix;
+    const fd: posix.fd_t = fd: {
+        const rc = posix.system.openat(posix.AT.FDCWD, path, .{}, 0);
+        switch (posix.errno(rc)) {
+            .SUCCESS => break :fd @intCast(rc),
+            else => return null, // includes ENOENT: pid already fully gone
+        }
+    };
+    defer _ = posix.system.close(fd);
+
+    var buf: [256]u8 = undefined;
+    const n: usize = n: {
+        const rc = posix.system.read(fd, &buf, buf.len);
+        switch (posix.errno(rc)) {
+            .SUCCESS => break :n rc,
+            else => return null, // e.g. ESRCH: died between openat and read
+        }
+    };
+    if (n == 0) return null;
+
+    var it = std.mem.tokenizeScalar(u8, buf[0..n], ' ');
+    _ = it.next() orelse return null; // pid
+    _ = it.next() orelse return null; // (comm) — assumed space-free (true for "sleep")
+    const state = it.next() orelse return null;
+    return if (state.len > 0) state[0] else null;
+}
+
+fn procReallyRunning(pid: std.posix.pid_t) bool {
+    const s = procStatState(pid) orelse return false;
+    return s != 'Z';
+}
+
+test "Spec.new_process_group + Handle.killGroup: reaps a grandchild, not just the direct child" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest; // /proc-based liveness check
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const Sink = struct {
+        buf: std.ArrayList(u8) = .empty,
+        gpa: std.mem.Allocator,
+        fn onOut(cx: ?*anyopaque, chunk: []const u8) void {
+            const s: *@This() = @ptrCast(@alignCast(cx.?));
+            s.buf.appendSlice(s.gpa, chunk) catch {};
+        }
+    };
+    var sink = Sink{ .gpa = testing.allocator };
+    defer sink.buf.deinit(testing.allocator);
+
+    // The direct child (`sh`) backgrounds `sleep 100` — a GRANDCHILD from
+    // procrun's point of view — prints its pid, then blocks in `wait`.
+    // Without process-group tree-kill, killing only the direct child leaves
+    // `sleep` running (it's the classic "sh -c 'long-runner &'" orphan).
+    const h = try spawnStreaming(testing.allocator, io, .{
+        .argv = &.{ "sh", "-c", "sleep 100 & echo $!; wait" },
+        .new_process_group = true,
+    }, .{ .ctx = &sink, .on_stdout = Sink.onOut });
+
+    var grandchild_pid: std.posix.pid_t = 0;
+    var waited_ns: u64 = 0;
+    while (waited_ns < 2 * std.time.ns_per_s) : (waited_ns += 10 * std.time.ns_per_ms) {
+        if (std.mem.indexOfScalar(u8, sink.buf.items, '\n')) |nl| {
+            const digits = std.mem.trim(u8, sink.buf.items[0..nl], " \t\r\n");
+            if (digits.len > 0) {
+                if (std.fmt.parseInt(std.posix.pid_t, digits, 10) catch null) |p| {
+                    grandchild_pid = p;
+                    break;
+                }
+            }
+        }
+        sleepNs(10 * std.time.ns_per_ms);
+    }
+    try testing.expect(grandchild_pid != 0);
+
+    // Confirm the grandchild is genuinely running before we touch anything.
+    var confirmed_alive = false;
+    waited_ns = 0;
+    while (waited_ns < 1 * std.time.ns_per_s) : (waited_ns += 10 * std.time.ns_per_ms) {
+        if (procReallyRunning(grandchild_pid)) {
+            confirmed_alive = true;
+            break;
+        }
+        sleepNs(10 * std.time.ns_per_ms);
+    }
+    try testing.expect(confirmed_alive);
+
+    h.killGroup();
+    const term = h.wait();
+    try testing.expect(term == .signal);
+
+    // The grandchild must be gone (or a not-yet-reaped zombie) shortly
+    // after — proving the group signal, not just the direct child, reached
+    // it. Poll instead of a single check to tolerate scheduling jitter.
+    var confirmed_dead = false;
+    waited_ns = 0;
+    while (waited_ns < 2 * std.time.ns_per_s) : (waited_ns += 10 * std.time.ns_per_ms) {
+        if (!procReallyRunning(grandchild_pid)) {
+            confirmed_dead = true;
+            break;
+        }
+        sleepNs(10 * std.time.ns_per_ms);
+    }
+    try testing.expect(confirmed_dead);
+}
+
+test "Handle.killGroup is a documented no-op without Spec.new_process_group" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const h = try spawnStreaming(testing.allocator, io, .{
+        .argv = &.{ "sleep", "10" },
+    }, .{});
+    try testing.expect(!h.grouped());
+    h.killGroup(); // must not touch the test runner's own process group
+    // The direct child is still alive and must be cleaned up explicitly.
+    h.kill();
+    const term = h.wait();
+    try testing.expect(term == .signal);
+}
+
+// ── rlimit sandbox tests ────────────────────────────────────────────────────
+
+test "RlimitSpec.file_size_bytes: exceeding it kills the child with SIGXFSZ" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_abs_len = try tmp.dir.realPath(io, &path_buf);
+    const of_arg = try std.fmt.allocPrint(testing.allocator, "of={s}/fsize_target", .{path_buf[0..dir_abs_len]});
+    defer testing.allocator.free(of_arg);
+
+    // 200 blocks of 4096 bytes each, capped to 512 bytes (1 block): the
+    // very first write already overshoots, so this fails fast.
+    var out = try run(testing.allocator, io, .{
+        .argv = &.{ "dd", "if=/dev/zero", of_arg, "bs=4096", "count=200" },
+        .rlimit = .{ .file_size_bytes = 512 },
+    }, "");
+    defer out.deinit(testing.allocator);
+
+    try testing.expect(out.term == .signal);
+    try testing.expectEqual(std.posix.SIG.XFSZ, out.term.signal);
+
+    // The limit actually bit — the file must not have grown past the cap.
+    var f = try tmp.dir.openFile(io, "fsize_target", .{});
+    defer f.close(io);
+    const stat = try f.stat(io);
+    try testing.expect(stat.size <= 512);
+}
+
+test "RlimitSpec.cpu_seconds: a busy loop is terminated well inside a generous safety timeout" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const start = monoNowNs();
+    // `runTimeout`'s own deadline (8s) is only a safety net in case the
+    // rlimit somehow fails to fire; asserting the elapsed time is well
+    // under it is what proves the 1-second CPU cap — not the 8-second
+    // safety net — is what actually terminated the child.
+    var out = try runTimeout(testing.allocator, io, .{
+        .argv = &.{ "sh", "-c", "while :; do :; done" },
+        .rlimit = .{ .cpu_seconds = 1 },
+    }, "", 8 * std.time.ns_per_s);
+    defer out.deinit(testing.allocator);
+    const elapsed = monoNowNs() - start;
+
+    try testing.expect(out.term == .signal);
+    try testing.expect(elapsed < 5 * std.time.ns_per_s);
+}
+
+test "RlimitSpec: generous limits do not disturb an ordinary command" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var out = try run(testing.allocator, io, .{
+        .argv = &.{ "/bin/echo", "hello" },
+        .rlimit = .{ .cpu_seconds = 30, .open_files = 256, .file_size_bytes = 1 << 20, .address_space_bytes = 1 << 30 },
+    }, "");
+    defer out.deinit(testing.allocator);
+
+    try testing.expect(out.term == .exited);
+    try testing.expectEqual(@as(u8, 0), out.term.exited);
+    try testing.expectEqualStrings("hello\n", out.stdout);
+}
+
+// ── streaming stdin tests ───────────────────────────────────────────────────
+
+test "Handle.writeStdin/closeStdin: streams bytes to cat incrementally after spawn" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const Sink = struct {
+        buf: std.ArrayList(u8) = .empty,
+        gpa: std.mem.Allocator,
+        fn onOut(cx: ?*anyopaque, chunk: []const u8) void {
+            const s: *@This() = @ptrCast(@alignCast(cx.?));
+            s.buf.appendSlice(s.gpa, chunk) catch {};
+        }
+    };
+    var sink = Sink{ .gpa = testing.allocator };
+    defer sink.buf.deinit(testing.allocator);
+
+    const h = try spawnStreaming(testing.allocator, io, .{
+        .argv = &.{"cat"},
+        .stdin = .pipe,
+    }, .{ .ctx = &sink, .on_stdout = Sink.onOut });
+
+    // Written across multiple calls, well after spawn — the point of this
+    // gap: `run`'s `stdin_body` is one fixed buffer written before capture
+    // even starts, but a caller of `spawnStreaming` can drive stdin as its
+    // own protocol dictates.
+    try h.writeStdin("hello, ");
+    try h.writeStdin("streaming ");
+    try h.writeStdin("world");
+    try h.closeStdin();
+
+    const term = h.wait();
+    try testing.expect(term == .exited);
+    try testing.expectEqualStrings("hello, streaming world", sink.buf.items);
+}
+
+test "Handle.writeStdin: error.StdinUnavailable when Spec.stdin is not .pipe" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const h = try spawnStreaming(testing.allocator, io, .{
+        .argv = &.{ "sleep", "1" },
+    }, .{});
+    try testing.expectError(error.StdinUnavailable, h.writeStdin("x"));
+    try testing.expectError(error.StdinUnavailable, h.closeStdin());
+    h.kill();
+    _ = h.wait();
+}
+
+test "Handle.closeStdin: a second close is rejected, not a double-close" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const h = try spawnStreaming(testing.allocator, io, .{
+        .argv = &.{"cat"},
+        .stdin = .pipe,
+    }, .{});
+    try h.closeStdin();
+    try testing.expectError(error.StdinUnavailable, h.closeStdin());
+
+    const term = h.wait();
+    try testing.expect(term == .exited); // cat sees immediate EOF and exits 0
+}
+
+// ── argsafe integration tests ───────────────────────────────────────────────
+
+test "runValidated: rejects a known-bad (flag-injection) arg before spawning anything" {
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const result = runValidated(
+        testing.allocator,
+        io,
+        "/bin/echo",
+        argsafe.isSafePath,
+        &.{"-rf"}, // flag-injection shaped argument
+        argsafe.isSafeIdentifier,
+        .{ .argv = &.{} },
+        "",
+    );
+    try testing.expectError(argsafe.Error.Rejected, result);
+}
+
+test "runValidated: accepts sanitized argv and actually runs it" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var out = try runValidated(
+        testing.allocator,
+        io,
+        "/bin/echo",
+        argsafe.isSafePath,
+        &.{"hello"},
+        argsafe.isSafeIdentifier,
+        .{ .argv = &.{} },
+        "",
+    );
+    defer out.deinit(testing.allocator);
+
+    try testing.expect(out.term == .exited);
+    try testing.expectEqualStrings("hello\n", out.stdout);
+}
+
+test "runValidated: a bad program path is rejected independently of args" {
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const result = runValidated(
+        testing.allocator,
+        io,
+        "relative/not/absolute", // isSafePath requires a leading '/'
+        argsafe.isSafePath,
+        &.{"hello"},
+        argsafe.isSafeIdentifier,
+        .{ .argv = &.{} },
+        "",
+    );
+    try testing.expectError(argsafe.Error.Rejected, result);
 }

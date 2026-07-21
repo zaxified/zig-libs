@@ -87,7 +87,7 @@ const module_list = [_]Module{
     .{ .name = "rdap", .deps = &.{ "http", "netaddr" } },
     .{ .name = "blobstore", .deps = &.{"hashdigest"} },
     .{ .name = "procnet", .deps = &.{"netaddr"} },
-    .{ .name = "procrun" },
+    .{ .name = "procrun", .deps = &.{"argsafe"} },
     .{ .name = "dataset" },
     .{ .name = "tabular", .deps = &.{"dataset"} },
     .{ .name = "jsonshape", .deps = &.{"dataset"} },
