@@ -5,7 +5,8 @@
 //! reshape.
 //!
 //! T1 set: cumsum · cumreturn · drawdown · rolling · pct_change · rebase ·
-//! forward_fill · outlier_flag · merge_by_key · date_part · join.
+//! forward_fill · outlier_flag · merge_by_key · distinct · date_part · join
+//! (inner/left/right/full/semi/anti, single- or composite-key).
 
 const std = @import("std");
 const dsmod = @import("dataset");
@@ -321,58 +322,182 @@ fn intPart(s: []const u8, from: usize, to: usize) Value {
     return .{ .int = std.fmt.parseInt(i64, s[from..to], 10) catch return .null };
 }
 
-pub const JoinHow = enum { inner, left };
+pub const JoinHow = enum { inner, left, right, full, semi, anti };
 pub const JoinSpec = struct {
-    on: []const u8,
+    /// Single-column join key. Ignored when `keys` is non-empty (kept optional,
+    /// rather than required, purely so `keys`-only callers don't need to set it).
+    on: []const u8 = "",
+    /// Composite join key (same column names assumed on both sides). When
+    /// non-empty, overrides `on`.
+    keys: []const []const u8 = &.{},
     how: JoinHow = .inner,
 };
 
-/// Join `left` and `right` on a shared key column. Output columns = all of left,
-/// then right's columns except the join key. Right is indexed by key (last row
-/// wins on dup). Unmatched left rows: dropped (inner) or right-side null (left).
-pub fn join(a: std.mem.Allocator, left: Dataset, right: Dataset, spec: JoinSpec) Error!Dataset {
-    const lki = try mustIndex(left, spec.on);
-    const rki = try mustIndex(right, spec.on);
+fn joinKeyIdxs(a: std.mem.Allocator, d: Dataset, spec: JoinSpec) Error![]const usize {
+    if (spec.keys.len > 0) {
+        const idxs = try a.alloc(usize, spec.keys.len);
+        for (spec.keys, 0..) |name, i| idxs[i] = try mustIndex(d, name);
+        return idxs;
+    }
+    const idxs = try a.alloc(usize, 1);
+    idxs[0] = try mustIndex(d, spec.on);
+    return idxs;
+}
 
-    // right index: key → row
-    var idx: std.StringArrayHashMapUnmanaged(usize) = .empty;
-    for (right.rows, 0..) |r, i| {
-        var kbuf: std.ArrayList(u8) = .empty;
-        try appendKey(&kbuf, a, r[rki]);
-        try idx.put(a, try kbuf.toOwnedSlice(a), i);
+/// Composite-key bytes for a row across one or more column indices (unit-
+/// separator joined, mirroring `transforms.keyString`).
+fn multiKeyString(a: std.mem.Allocator, row: []const Value, idxs: []const usize) Error![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    for (idxs, 0..) |ci, n| {
+        if (n > 0) try buf.append(a, 0x1f);
+        try appendKey(&buf, a, row[ci]);
+    }
+    return buf.toOwnedSlice(a);
+}
+
+fn containsIdx(idxs: []const usize, i: usize) bool {
+    for (idxs) |x| if (x == i) return true;
+    return false;
+}
+
+const RowList = std.ArrayList(usize);
+
+/// key → all row indices sharing that key (fan-out, not last-wins).
+fn buildJoinIndex(a: std.mem.Allocator, d: Dataset, key_idxs: []const usize) Error!std.StringArrayHashMapUnmanaged(RowList) {
+    var idx: std.StringArrayHashMapUnmanaged(RowList) = .empty;
+    for (d.rows, 0..) |r, i| {
+        const key = try multiKeyString(a, r, key_idxs);
+        const gop = try idx.getOrPut(a, key);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        try gop.value_ptr.append(a, i);
+    }
+    return idx;
+}
+
+/// Build one output row: left cell block (real row or all-null) + right cell
+/// block minus the right-side join-key columns (real row or all-null).
+fn emitJoinRow(
+    a: std.mem.Allocator,
+    out_len: usize,
+    left: Dataset,
+    lr: ?[]const Value,
+    right: Dataset,
+    rr: ?[]const Value,
+    rkey_idxs: []const usize,
+) Error![]Value {
+    const nr = try a.alloc(Value, out_len);
+    if (lr) |row| {
+        @memcpy(nr[0..left.columns.len], row);
+    } else {
+        @memset(nr[0..left.columns.len], .null);
+    }
+    var w = left.columns.len;
+    for (right.columns, 0..) |_, ci| {
+        if (containsIdx(rkey_idxs, ci)) continue;
+        nr[w] = if (rr) |row| row[ci] else .null;
+        w += 1;
+    }
+    return nr;
+}
+
+/// Join `left` and `right` on shared key column(s) (`spec.on`, or `spec.keys`
+/// for a composite key). `inner`/`left`/`right`/`full`: output columns = all of
+/// left, then right's columns except the join key(s); the unmatched side is
+/// null-filled per `how`. Rows sharing a key fan out (every left×right pair is
+/// emitted), matching SQL join semantics rather than a last-wins dedup.
+/// `semi`/`anti`: output = left rows only (schema unchanged, one row per left
+/// row, never fanned) — kept iff a match exists (`semi`) or doesn't (`anti`).
+pub fn join(a: std.mem.Allocator, left: Dataset, right: Dataset, spec: JoinSpec) Error!Dataset {
+    const lk = try joinKeyIdxs(a, left, spec);
+    const rk = try joinKeyIdxs(a, right, spec);
+
+    if (spec.how == .semi or spec.how == .anti) {
+        const ridx = try buildJoinIndex(a, right, rk);
+        var rows: std.ArrayList([]const Value) = .empty;
+        for (left.rows) |lr| {
+            const key = try multiKeyString(a, lr, lk);
+            const has = ridx.contains(key);
+            if ((spec.how == .semi) == has) try rows.append(a, lr);
+        }
+        return .{ .columns = left.columns, .rows = try rows.toOwnedSlice(a) };
     }
 
-    // output columns: left + right (minus join key)
-    const rcount = right.columns.len - 1;
+    // output columns: left + right (minus join key(s))
+    const rcount = right.columns.len - rk.len;
     const cols = try a.alloc(Column, left.columns.len + rcount);
     @memcpy(cols[0..left.columns.len], left.columns);
     {
         var w = left.columns.len;
         for (right.columns, 0..) |c, ci| {
-            if (ci == rki) continue;
+            if (containsIdx(rk, ci)) continue;
             cols[w] = c;
             w += 1;
         }
     }
 
     var rows: std.ArrayList([]const Value) = .empty;
-    for (left.rows) |lr| {
-        var kbuf: std.ArrayList(u8) = .empty;
-        try appendKey(&kbuf, a, lr[lki]);
-        const key = try kbuf.toOwnedSlice(a);
-        const match = idx.get(key);
-        if (match == null and spec.how == .inner) continue;
-        const nr = try a.alloc(Value, cols.len);
-        @memcpy(nr[0..left.columns.len], lr);
-        var w = left.columns.len;
-        for (right.columns, 0..) |_, ci| {
-            if (ci == rki) continue;
-            nr[w] = if (match) |mi| right.rows[mi][ci] else .null;
-            w += 1;
+
+    if (spec.how == .inner or spec.how == .left or spec.how == .full) {
+        const ridx = try buildJoinIndex(a, right, rk);
+        for (left.rows) |lr| {
+            const key = try multiKeyString(a, lr, lk);
+            if (ridx.get(key)) |ms| {
+                for (ms.items) |mi| try rows.append(a, try emitJoinRow(a, cols.len, left, lr, right, right.rows[mi], rk));
+            } else if (spec.how != .inner) {
+                try rows.append(a, try emitJoinRow(a, cols.len, left, lr, right, null, rk));
+            }
         }
-        try rows.append(a, nr);
+        if (spec.how == .full) {
+            // right rows whose key never appears on the left at all (matched
+            // pairs are already covered by the loop above).
+            const lidx = try buildJoinIndex(a, left, lk);
+            for (right.rows) |rr| {
+                const key = try multiKeyString(a, rr, rk);
+                if (!lidx.contains(key)) try rows.append(a, try emitJoinRow(a, cols.len, left, null, right, rr, rk));
+            }
+        }
+    } else { // .right
+        const lidx = try buildJoinIndex(a, left, lk);
+        for (right.rows) |rr| {
+            const key = try multiKeyString(a, rr, rk);
+            if (lidx.get(key)) |ms| {
+                for (ms.items) |mi| try rows.append(a, try emitJoinRow(a, cols.len, left, left.rows[mi], right, rr, rk));
+            } else {
+                try rows.append(a, try emitJoinRow(a, cols.len, left, null, right, rr, rk));
+            }
+        }
     }
     return .{ .columns = cols, .rows = try rows.toOwnedSlice(a) };
+}
+
+pub const DistinctSpec = struct {
+    /// Columns forming the row-identity composite key.
+    keys: []const []const u8,
+    /// Which occurrence's *values* win on a duplicate key. Either way the
+    /// output keeps one row per key, in first-seen key order.
+    keep: enum { first, last } = .first,
+};
+
+/// Dataset-level dedup on a key set — unlike `mergeByKey`, non-key columns are
+/// NOT summed: the kept row's cells are simply the first- or last-seen row's,
+/// verbatim. One output row per distinct key, first-seen order.
+pub fn distinct(a: std.mem.Allocator, d: Dataset, spec: DistinctSpec) Error!Dataset {
+    const idxs = try a.alloc(usize, spec.keys.len);
+    for (spec.keys, 0..) |name, i| idxs[i] = try mustIndex(d, name);
+
+    var order: std.StringArrayHashMapUnmanaged(usize) = .empty; // key → slot in `rows`
+    var rows: std.ArrayList([]const Value) = .empty;
+    for (d.rows) |r| {
+        const key = try multiKeyString(a, r, idxs);
+        const gop = try order.getOrPut(a, key);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = rows.items.len;
+            try rows.append(a, r);
+        } else if (spec.keep == .last) {
+            rows.items[gop.value_ptr.*] = r;
+        }
+    }
+    return .{ .columns = d.columns, .rows = try rows.toOwnedSlice(a) };
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
@@ -519,4 +644,105 @@ test "join inner and left" {
     const lj = try join(f.a(), dsOf(&lcols, &lrows), dsOf(&rcols, &rrows), .{ .on = "sym", .how = .left });
     try testing.expectEqual(@as(usize, 2), lj.rows.len);
     try testing.expect(lj.cell(1, "sector").?.isNull()); // BBB unmatched
+}
+
+test "join right and full outer null-fill correctly" {
+    var f = Fix.init();
+    defer f.deinit();
+    const lcols = [_]Column{ .{ .name = "sym", .type = .text }, .{ .name = "mv", .type = .float } };
+    const lrows = [_][]const Value{
+        &.{ .{ .text = "AAA" }, .{ .float = 100 } },
+        &.{ .{ .text = "BBB" }, .{ .float = 50 } },
+    };
+    const rcols = [_]Column{ .{ .name = "sym", .type = .text }, .{ .name = "sector", .type = .text } };
+    const rrows = [_][]const Value{
+        &.{ .{ .text = "AAA" }, .{ .text = "Tech" } },
+        &.{ .{ .text = "DDD" }, .{ .text = "Health" } }, // no left match
+    };
+
+    const rj = try join(f.a(), dsOf(&lcols, &lrows), dsOf(&rcols, &rrows), .{ .on = "sym", .how = .right });
+    try testing.expectEqual(@as(usize, 2), rj.rows.len); // AAA (matched), DDD (left-null)
+    try testing.expectEqualStrings("AAA", rj.cell(0, "sym").?.text);
+    try testing.expectApproxEqAbs(@as(f64, 100), rj.cell(0, "mv").?.float, 1e-9);
+    try testing.expect(rj.cell(1, "mv").?.isNull()); // DDD: no left row
+    try testing.expect(rj.cell(1, "sym").?.isNull()); // left's own "sym" cell is also null-filled
+    try testing.expectEqualStrings("Health", rj.cell(1, "sector").?.text);
+
+    const fj = try join(f.a(), dsOf(&lcols, &lrows), dsOf(&rcols, &rrows), .{ .on = "sym", .how = .full });
+    try testing.expectEqual(@as(usize, 3), fj.rows.len); // AAA matched, BBB left-only, DDD right-only
+    try testing.expectEqualStrings("AAA", fj.cell(0, "sym").?.text);
+    try testing.expectEqualStrings("Tech", fj.cell(0, "sector").?.text);
+    try testing.expectEqualStrings("BBB", fj.cell(1, "sym").?.text);
+    try testing.expect(fj.cell(1, "sector").?.isNull()); // BBB: no right row
+    try testing.expect(fj.cell(2, "sym").?.isNull()); // DDD: no left row
+    try testing.expectEqualStrings("Health", fj.cell(2, "sector").?.text);
+}
+
+test "join semi and anti return the correct subset" {
+    var f = Fix.init();
+    defer f.deinit();
+    const lcols = [_]Column{ .{ .name = "sym", .type = .text }, .{ .name = "mv", .type = .float } };
+    const lrows = [_][]const Value{
+        &.{ .{ .text = "AAA" }, .{ .float = 100 } },
+        &.{ .{ .text = "BBB" }, .{ .float = 50 } },
+        &.{ .{ .text = "CCC" }, .{ .float = 30 } },
+    };
+    const rcols = [_]Column{.{ .name = "sym", .type = .text }};
+    const rrows = [_][]const Value{
+        &.{.{ .text = "AAA" }},
+    };
+
+    const sj = try join(f.a(), dsOf(&lcols, &lrows), dsOf(&rcols, &rrows), .{ .on = "sym", .how = .semi });
+    try testing.expectEqual(@as(usize, 1), sj.rows.len);
+    try testing.expectEqual(@as(usize, 2), sj.columns.len); // schema unchanged (left only)
+    try testing.expectEqualStrings("AAA", sj.cell(0, "sym").?.text);
+
+    const aj = try join(f.a(), dsOf(&lcols, &lrows), dsOf(&rcols, &rrows), .{ .on = "sym", .how = .anti });
+    try testing.expectEqual(@as(usize, 2), aj.rows.len);
+    try testing.expectEqualStrings("BBB", aj.cell(0, "sym").?.text);
+    try testing.expectEqualStrings("CCC", aj.cell(1, "sym").?.text);
+}
+
+test "join with composite key disambiguates rows a single key would wrongly fan out" {
+    var f = Fix.init();
+    defer f.deinit();
+    // Both regions reuse sym "AAA" — a sym-only join would match EVERY left row
+    // against BOTH right rows (4 result rows, wrong sectors); the composite
+    // (region, sym) key must pair each region with its own sector (2 rows).
+    const lcols = [_]Column{ .{ .name = "region", .type = .text }, .{ .name = "sym", .type = .text }, .{ .name = "mv", .type = .float } };
+    const lrows = [_][]const Value{
+        &.{ .{ .text = "US" }, .{ .text = "AAA" }, .{ .float = 100 } },
+        &.{ .{ .text = "EU" }, .{ .text = "AAA" }, .{ .float = 200 } },
+    };
+    const rcols = [_]Column{ .{ .name = "region", .type = .text }, .{ .name = "sym", .type = .text }, .{ .name = "sector", .type = .text } };
+    const rrows = [_][]const Value{
+        &.{ .{ .text = "US" }, .{ .text = "AAA" }, .{ .text = "Tech" } },
+        &.{ .{ .text = "EU" }, .{ .text = "AAA" }, .{ .text = "Bank" } },
+    };
+    const out = try join(f.a(), dsOf(&lcols, &lrows), dsOf(&rcols, &rrows), .{ .keys = &.{ "region", "sym" }, .how = .inner });
+    try testing.expectEqual(@as(usize, 2), out.rows.len); // NOT 4
+    try testing.expectEqual(@as(usize, 4), out.columns.len); // region, sym, mv, sector (key not duplicated)
+    try testing.expectEqualStrings("Tech", out.cell(0, "sector").?.text);
+    try testing.expectEqualStrings("Bank", out.cell(1, "sector").?.text);
+}
+
+test "distinct keeps first (or last) row without summing" {
+    var f = Fix.init();
+    defer f.deinit();
+    const cols = [_]Column{ .{ .name = "sym", .type = .text }, .{ .name = "v", .type = .float } };
+    const rows = [_][]const Value{
+        &.{ .{ .text = "AAA" }, .{ .float = 1 } },
+        &.{ .{ .text = "BBB" }, .{ .float = 2 } },
+        &.{ .{ .text = "AAA" }, .{ .float = 3 } },
+    };
+    const first = try distinct(f.a(), dsOf(&cols, &rows), .{ .keys = &.{"sym"} });
+    try testing.expectEqual(@as(usize, 2), first.rows.len); // right COUNT (not 3)
+    try testing.expectEqualStrings("AAA", first.cell(0, "sym").?.text);
+    try testing.expectApproxEqAbs(@as(f64, 1), first.cell(0, "v").?.float, 1e-9); // first-seen, NOT summed to 4
+    try testing.expectEqualStrings("BBB", first.cell(1, "sym").?.text);
+
+    const last = try distinct(f.a(), dsOf(&cols, &rows), .{ .keys = &.{"sym"}, .keep = .last });
+    try testing.expectEqual(@as(usize, 2), last.rows.len);
+    try testing.expectEqualStrings("AAA", last.cell(0, "sym").?.text); // position = first-seen
+    try testing.expectApproxEqAbs(@as(f64, 3), last.cell(0, "v").?.float, 1e-9); // value = last-seen
 }

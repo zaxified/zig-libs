@@ -21,13 +21,15 @@ pub const meta = .{
 // ── public API ──────────────────────────────────────────────────────────────
 
 /// Tier 0 — pure `dataset → dataset` primitives: map · aggregate(+fx) ·
-/// weightedGroupSum(+fx) · percentOfTotal · sort · topN · pivot · resample ·
-/// reduce · clampRange · format/formatColumn.
+/// weightedGroupSum(+fx) · percentOfTotal · sort(multi-key) · topN · page ·
+/// pivot(numeric-aware) · unpivot · resample · reduce · clampRange ·
+/// format/formatColumn.
 pub const transforms = @import("transforms.zig");
 
 /// Tier 1 — series math over a date-ordered dataset: cumsum · cumreturn ·
 /// drawdown · rolling · pctChange · rebase · forwardFill · outlierFlag ·
-/// mergeByKey · datePart · join · stdSample.
+/// mergeByKey · distinct · datePart · join(inner/left/right/full/semi/anti,
+/// single- or composite-key) · stdSample.
 pub const series = @import("series.zig");
 
 // Dark-tests aggregator: a bare `pub const` re-export does NOT pull a

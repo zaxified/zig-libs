@@ -7,11 +7,16 @@ Dataset algebra over `dataset`: pure `dataset → dataset` verbs. Nothing mutate
 transform takes an allocator (normally a caller-owned pipeline arena) and returns a new `Dataset`.
 Two tiers in two files, exposed as named namespaces (`tabular.transforms`, `tabular.series` — not
 flattened, since their spec type names collide): **Tier 0** (`transforms`) — `map` · `aggregate`(+fx)
-· `weightedGroupSum`(+fx) · `percentOfTotal` · `sort` · `topN`(+ tail fold) · `pivot` · `resample`
-(day/month/year; sum/mean/first/last/compound) · `reduce` · `clampRange` · `format`/`formatColumn`.
+· `weightedGroupSum`(+fx) · `percentOfTotal` · `sort` (multi-key tie-break via `SortSpec.then_by`) ·
+`topN`(+ tail fold) · `page` (limit/offset windowed slice) · `pivot` (numeric-aware column-key
+ordering — falls back to lexicographic unless every key parses as a number) · `unpivot`/melt ·
+`resample` (day/month/year; sum/mean/first/last/compound) · `reduce` · `clampRange` ·
+`format`/`formatColumn`.
 **Tier 1** (`series`) — math over an already date-ordered dataset: `cumsum` · `cumreturn` ·
 `drawdown` · `rolling` (mean/sum/std_sample/min/max) · `pctChange` · `rebase` · `forwardFill` ·
-`outlierFlag` (optional guard) · `mergeByKey` · `datePart` · `join` (inner/left) · `stdSample`.
+`outlierFlag` (optional guard) · `mergeByKey` · `distinct` (dedup by key set, no summing — keep
+first or last) · `datePart` · `join` (inner/left/right/full/semi/anti; single-column `on` or
+composite `keys`, fan-out on duplicate keys rather than last-wins) · `stdSample`.
 fx-convert-before-sum is first-class on `aggregate`/`weightedGroupSum`: each row's numeric value is
 multiplied by its per-row fx rate *before* accumulation, and a null/absent rate means `1.0` — a real
 multi-currency correctness fix (income rows store a null rate).
@@ -30,17 +35,19 @@ on join fan-out (a caller joining two large unfiltered datasets can produce a la
 caller's arena/allocator is the only bound).
 
 ## Verification
-`zig build test-tabular` (headless; green in Debug and `-Doptimize=ReleaseFast`), 21 tests across
+`zig build test-tabular` (headless; green in Debug and `-Doptimize=ReleaseFast`), 31 tests across
 `transforms`+`series`, using hand-computed golden values as the correctness oracle for the lift plus
-new cases for the fx-convert-before-sum path. Run: `zig build test-tabular`.
+new cases for the fx-convert-before-sum path, join fan-out/outer/anti-semi variants (incl. a
+composite-key positive control that fails under naive single-key matching), `distinct` vs.
+`mergeByKey` summing, multi-key sort tie-breaks, `page` windowing, numeric-aware pivot ordering, and
+an `unpivot`→`pivot` round-trip. Run: `zig build test-tabular`.
 
 ## Backlog / deferred
-Multi-column sort (`SortSpec.key` is single-column, no tie-break) and numeric-aware pivot column-key
-ordering (currently lexicographic — mis-sorts unpadded numeric keys like `2` vs `10`); grouped-series
-TA nodes (per-asset-group EMA/MACD/RSI); `unpivot`/`melt`; right/full-outer
-joins, multi-column join keys, anti/semi-join; dataset-level `distinct`/dedup without summing
-(`mergeByKey` sums numerics); `limit`/`offset` pagination beyond `topN`; optional strict-ordering
-guard for `rolling`/`outlierFlag` (from the module README, folded here).
+Grouped-series TA nodes (per-asset-group EMA/MACD/RSI) — a materially bigger feature (per-group
+windowed state machines), scoped as its own future arc rather than folded into this pass. Optional
+strict-ordering guard for `rolling`/`outlierFlag` (they still assume the caller pre-sorted by date —
+unchanged from the module README's threat-model note) — deferred as a v-next hardening pass, not
+required for the join/reshape/pagination gaps closed here.
 
 ## Status
 `extract · any · util · reentrant` + deps: `dataset` — canonical source is `pub const meta` in

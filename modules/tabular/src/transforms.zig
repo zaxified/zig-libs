@@ -5,8 +5,9 @@
 //! allocator is normally a caller-owned arena for the whole pipeline (see the
 //! memory model note in `dataset`).
 //!
-//! T0 set: map · aggregate(+fx) · weighted_group_sum(+fx) · sort ·
-//! top_n / top_n_with_tail · pivot · resample · reduce · clamp_range · format.
+//! T0 set: map · aggregate(+fx) · weighted_group_sum(+fx) · sort (multi-key) ·
+//! top_n / top_n_with_tail · page · pivot (numeric-aware col ordering) ·
+//! unpivot · resample · reduce · clamp_range · format.
 //!
 //! `fx-convert-before-sum` is first-class on aggregate/weighted_group_sum — the
 //! recurring multi-currency correctness fix (a null per-row rate means 1.0).
@@ -308,29 +309,44 @@ pub fn percentOfTotal(a: std.mem.Allocator, d: Dataset, spec: PercentSpec) Error
 // ── sort ────────────────────────────────────────────────────────────────────
 
 pub const SortDir = enum { asc, desc };
+pub const SortKey = struct { key: []const u8, dir: SortDir = .asc };
 pub const SortSpec = struct {
     key: []const u8,
     dir: SortDir = .asc,
+    /// Additional tie-break keys, applied in order after `key`/`dir`.
+    then_by: []const SortKey = &.{},
 };
 
 const SortCtx = struct {
-    key_idx: usize,
-    dir: SortDir,
+    idxs: []const usize,
+    dirs: []const SortDir,
     fn lessThan(self: SortCtx, lhs: []const Value, rhs: []const Value) bool {
-        const o = lhs[self.key_idx].order(rhs[self.key_idx]);
-        return switch (self.dir) {
-            .asc => o == .lt,
-            .desc => o == .gt,
-        };
+        for (self.idxs, self.dirs) |ki, dir| {
+            const o = lhs[ki].order(rhs[ki]);
+            if (o == .eq) continue;
+            return switch (dir) {
+                .asc => o == .lt,
+                .desc => o == .gt,
+            };
+        }
+        return false; // fully tied
     }
 };
 
-/// Stable sort rows by a single key column.
+/// Stable sort rows by `key`/`dir`, breaking ties with `then_by` (in order).
 pub fn sort(a: std.mem.Allocator, d: Dataset, spec: SortSpec) Error!Dataset {
-    const ki = try mustIndex(d, spec.key);
+    const n = 1 + spec.then_by.len;
+    const idxs = try a.alloc(usize, n);
+    const dirs = try a.alloc(SortDir, n);
+    idxs[0] = try mustIndex(d, spec.key);
+    dirs[0] = spec.dir;
+    for (spec.then_by, 0..) |tb, i| {
+        idxs[1 + i] = try mustIndex(d, tb.key);
+        dirs[1 + i] = tb.dir;
+    }
     const rows = try a.alloc([]const Value, d.rows.len);
     @memcpy(rows, d.rows);
-    std.mem.sort([]const Value, rows, SortCtx{ .key_idx = ki, .dir = spec.dir }, SortCtx.lessThan);
+    std.mem.sort([]const Value, rows, SortCtx{ .idxs = idxs, .dirs = dirs }, SortCtx.lessThan);
     return .{ .columns = d.columns, .rows = rows };
 }
 
@@ -373,6 +389,26 @@ pub fn topN(a: std.mem.Allocator, d: Dataset, spec: TopNSpec) Error!Dataset {
     return .{ .columns = d.columns, .rows = rows };
 }
 
+// ── page (limit/offset) ─────────────────────────────────────────────────────
+
+pub const PageSpec = struct {
+    offset: usize = 0,
+    /// Rows to keep after `offset`; null = to the end.
+    limit: ?usize = null,
+};
+
+/// Windowed row slice: skip `offset` rows, then keep at most `limit`.
+/// Complements `topN` (whose window always starts at row 0) for arbitrary
+/// pagination. Out-of-range `offset` yields an empty (not erroring) result.
+pub fn page(a: std.mem.Allocator, d: Dataset, spec: PageSpec) Error!Dataset {
+    const start = @min(spec.offset, d.rows.len);
+    const avail = d.rows.len - start;
+    const take = if (spec.limit) |l| @min(l, avail) else avail;
+    const rows = try a.alloc([]const Value, take);
+    @memcpy(rows, d.rows[start .. start + take]);
+    return .{ .columns = d.columns, .rows = rows };
+}
+
 // ── pivot ───────────────────────────────────────────────────────────────────
 
 pub const PivotSpec = struct {
@@ -405,10 +441,16 @@ pub fn pivot(a: std.mem.Allocator, d: Dataset, spec: PivotSpec) Error!Dataset {
         cop.value_ptr.observe(r[vi]);
     }
 
-    // sorted distinct column keys
+    // sorted distinct column keys — numeric-aware when EVERY key parses as a
+    // number (so "2" sorts before "10"); falls back to lexicographic
+    // otherwise (mixed/non-numeric keys), same as before.
     const col_list = try a.alloc([]const u8, col_keys.count());
     for (col_keys.keys(), 0..) |k, i| col_list[i] = k;
-    std.mem.sort([]const u8, col_list, {}, strLess);
+    if (allNumeric(col_list)) {
+        std.mem.sort([]const u8, col_list, {}, numLess);
+    } else {
+        std.mem.sort([]const u8, col_list, {}, strLess);
+    }
 
     const cols = try a.alloc(Column, 1 + col_list.len);
     cols[0] = .{ .name = spec.row_key, .type = d.columns[rki].type };
@@ -432,6 +474,74 @@ pub fn pivot(a: std.mem.Allocator, d: Dataset, spec: PivotSpec) Error!Dataset {
 
 fn strLess(_: void, l: []const u8, r: []const u8) bool {
     return std.mem.order(u8, l, r) == .lt;
+}
+
+/// True iff every key parses as an f64 (pivot col-key ordering guard: mixed or
+/// non-numeric keys fall back to lexicographic so the comparator stays a
+/// consistent total order).
+fn allNumeric(keys: []const []const u8) bool {
+    for (keys) |k| {
+        _ = std.fmt.parseFloat(f64, k) catch return false;
+    }
+    return true;
+}
+
+fn numLess(_: void, l: []const u8, r: []const u8) bool {
+    const lf = std.fmt.parseFloat(f64, l) catch unreachable; // allNumeric already verified
+    const rf = std.fmt.parseFloat(f64, r) catch unreachable;
+    return lf < rf;
+}
+
+// ── unpivot / melt ──────────────────────────────────────────────────────────
+
+pub const UnpivotSpec = struct {
+    /// Columns copied as-is (row identity) to every output row.
+    id_cols: []const []const u8,
+    /// Wide columns to melt into (key,value) row pairs. Empty (default) melts
+    /// every column NOT in `id_cols`.
+    value_cols: []const []const u8 = &.{},
+    out_key: []const u8 = "variable",
+    out_value: []const u8 = "value",
+};
+
+/// Wide → long reshape: one output row per (input row × melted column),
+/// carrying the id columns plus `{out_key: <melted column's name>, out_value:
+/// <that cell>}`. Loose inverse of `pivot` (round-trips when `pivot`'s `agg`
+/// doesn't collapse information, e.g. one row per row_key×col_key already).
+/// `out_value`'s declared type is the first melted column's type — melted
+/// columns of mixed types are still carried correctly (`Value` is
+/// self-describing), this only affects the type hint on the output column.
+pub fn unpivot(a: std.mem.Allocator, d: Dataset, spec: UnpivotSpec) Error!Dataset {
+    const id_idxs = try a.alloc(usize, spec.id_cols.len);
+    for (spec.id_cols, 0..) |name, i| id_idxs[i] = try mustIndex(d, name);
+
+    var val_idxs: std.ArrayList(usize) = .empty;
+    if (spec.value_cols.len > 0) {
+        for (spec.value_cols) |name| try val_idxs.append(a, try mustIndex(d, name));
+    } else {
+        col_loop: for (0..d.columns.len) |ci| {
+            for (id_idxs) |ii| if (ii == ci) continue :col_loop;
+            try val_idxs.append(a, ci);
+        }
+    }
+
+    const out_value_type: ColumnType = if (val_idxs.items.len > 0) d.columns[val_idxs.items[0]].type else .text;
+    const cols = try a.alloc(Column, id_idxs.len + 2);
+    for (id_idxs, 0..) |ii, i| cols[i] = d.columns[ii];
+    cols[id_idxs.len] = .{ .name = spec.out_key, .type = .text };
+    cols[id_idxs.len + 1] = .{ .name = spec.out_value, .type = out_value_type };
+
+    var rows: std.ArrayList([]const Value) = .empty;
+    for (d.rows) |r| {
+        for (val_idxs.items) |vi| {
+            const nr = try a.alloc(Value, cols.len);
+            for (id_idxs, 0..) |ii, ci| nr[ci] = r[ii];
+            nr[id_idxs.len] = .{ .text = d.columns[vi].name };
+            nr[id_idxs.len + 1] = r[vi];
+            try rows.append(a, nr);
+        }
+    }
+    return .{ .columns = cols, .rows = try rows.toOwnedSlice(a) };
 }
 
 // ── resample ────────────────────────────────────────────────────────────────
@@ -766,6 +876,46 @@ test "sort: desc by value" {
     try testing.expectEqualStrings("a", out.cell(2, "s").?.text);
 }
 
+test "sort: multi-column tie-break" {
+    var f = Fix.init();
+    defer f.deinit();
+    const cols = [_]Column{ .{ .name = "grp", .type = .text }, .{ .name = "v", .type = .float }, .{ .name = "s", .type = .text } };
+    const rows = [_][]const Value{
+        &.{ .{ .text = "b" }, .{ .float = 1 }, .{ .text = "b1" } },
+        &.{ .{ .text = "a" }, .{ .float = 2 }, .{ .text = "a2" } },
+        &.{ .{ .text = "a" }, .{ .float = 1 }, .{ .text = "a1" } },
+    };
+    // primary key `grp` alone would leave the two "a" rows in input order
+    // (a2 before a1) — the tie-break on `v` must reorder them to a1, a2.
+    const out = try sort(f.a(), .{ .columns = &cols, .rows = &rows }, .{
+        .key = "grp",
+        .then_by = &.{.{ .key = "v" }},
+    });
+    try testing.expectEqualStrings("a1", out.cell(0, "s").?.text);
+    try testing.expectEqualStrings("a2", out.cell(1, "s").?.text);
+    try testing.expectEqualStrings("b1", out.cell(2, "s").?.text);
+}
+
+test "page: limit/offset windows correctly" {
+    var f = Fix.init();
+    defer f.deinit();
+    const cols = [_]Column{.{ .name = "v", .type = .int }};
+    const rows = [_][]const Value{
+        &.{.{ .int = 0 }}, &.{.{ .int = 1 }}, &.{.{ .int = 2 }}, &.{.{ .int = 3 }}, &.{.{ .int = 4 }},
+    };
+    const mid = try page(f.a(), .{ .columns = &cols, .rows = &rows }, .{ .offset = 1, .limit = 2 });
+    try testing.expectEqual(@as(usize, 2), mid.rows.len);
+    try testing.expectEqual(@as(i64, 1), mid.cell(0, "v").?.int);
+    try testing.expectEqual(@as(i64, 2), mid.cell(1, "v").?.int);
+
+    const tail = try page(f.a(), .{ .columns = &cols, .rows = &rows }, .{ .offset = 3 }); // no limit → to the end
+    try testing.expectEqual(@as(usize, 2), tail.rows.len);
+    try testing.expectEqual(@as(i64, 3), tail.cell(0, "v").?.int);
+
+    const past_end = try page(f.a(), .{ .columns = &cols, .rows = &rows }, .{ .offset = 99, .limit = 5 });
+    try testing.expectEqual(@as(usize, 0), past_end.rows.len);
+}
+
 test "topN with tail fold" {
     var f = Fix.init();
     defer f.deinit();
@@ -809,6 +959,75 @@ test "pivot: month x year" {
     try testing.expectEqual(@as(f64, 2), out.cell(0, "02").?.float);
     try testing.expectEqual(@as(f64, 3), out.cell(1, "01").?.float);
     try testing.expect(out.cell(1, "02").?.isNull()); // 2024-02 missing
+}
+
+test "pivot: numeric-aware column ordering puts 10 after 2, not before" {
+    var f = Fix.init();
+    defer f.deinit();
+    const cols = [_]Column{
+        .{ .name = "row", .type = .text },
+        .{ .name = "week", .type = .text }, // unpadded numeric text: "2", "10"
+        .{ .name = "v", .type = .float },
+    };
+    const rows = [_][]const Value{
+        &.{ .{ .text = "r1" }, .{ .text = "10" }, .{ .float = 1 } },
+        &.{ .{ .text = "r1" }, .{ .text = "2" }, .{ .float = 2 } },
+        &.{ .{ .text = "r1" }, .{ .text = "9" }, .{ .float = 3 } },
+    };
+    const out = try pivot(f.a(), .{ .columns = &cols, .rows = &rows }, .{ .row_key = "row", .col_key = "week", .value_col = "v" });
+    // lexicographic would order "10" < "2" < "9"; numeric-aware must be 2, 9, 10.
+    try testing.expectEqualStrings("2", out.columns[1].name);
+    try testing.expectEqualStrings("9", out.columns[2].name);
+    try testing.expectEqualStrings("10", out.columns[3].name);
+}
+
+test "pivot: non-numeric column keys still sort lexicographically" {
+    var f = Fix.init();
+    defer f.deinit();
+    const cols = [_]Column{
+        .{ .name = "row", .type = .text },
+        .{ .name = "cat", .type = .text },
+        .{ .name = "v", .type = .float },
+    };
+    const rows = [_][]const Value{
+        &.{ .{ .text = "r1" }, .{ .text = "beta" }, .{ .float = 1 } },
+        &.{ .{ .text = "r1" }, .{ .text = "alpha" }, .{ .float = 2 } },
+    };
+    const out = try pivot(f.a(), .{ .columns = &cols, .rows = &rows }, .{ .row_key = "row", .col_key = "cat", .value_col = "v" });
+    try testing.expectEqualStrings("alpha", out.columns[1].name);
+    try testing.expectEqualStrings("beta", out.columns[2].name);
+}
+
+test "unpivot: wide -> long round-trips a known wide table" {
+    var f = Fix.init();
+    defer f.deinit();
+    const cols = [_]Column{
+        .{ .name = "id", .type = .text },
+        .{ .name = "jan", .type = .float },
+        .{ .name = "feb", .type = .float },
+    };
+    const rows = [_][]const Value{
+        &.{ .{ .text = "AAA" }, .{ .float = 10 }, .{ .float = 20 } },
+        &.{ .{ .text = "BBB" }, .{ .float = 30 }, .{ .float = 40 } },
+    };
+    const out = try unpivot(f.a(), .{ .columns = &cols, .rows = &rows }, .{ .id_cols = &.{"id"} });
+    try testing.expectEqual(@as(usize, 4), out.rows.len); // 2 rows x 2 melted cols
+    try testing.expectEqual(@as(usize, 3), out.columns.len); // id, variable, value
+    try testing.expectEqualStrings("AAA", out.cell(0, "id").?.text);
+    try testing.expectEqualStrings("jan", out.cell(0, "variable").?.text);
+    try testing.expectApproxEqAbs(@as(f64, 10), out.cell(0, "value").?.float, 1e-9);
+    try testing.expectEqualStrings("feb", out.cell(1, "variable").?.text);
+    try testing.expectApproxEqAbs(@as(f64, 20), out.cell(1, "value").?.float, 1e-9);
+    try testing.expectEqualStrings("BBB", out.cell(2, "id").?.text);
+    try testing.expectEqualStrings("jan", out.cell(2, "variable").?.text);
+    try testing.expectApproxEqAbs(@as(f64, 30), out.cell(2, "value").?.float, 1e-9);
+
+    // round-trip: pivot the melted table back and recover the original cells.
+    const back = try pivot(f.a(), out, .{ .row_key = "id", .col_key = "variable", .value_col = "value" });
+    try testing.expectApproxEqAbs(@as(f64, 10), back.cell(0, "jan").?.float, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 20), back.cell(0, "feb").?.float, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 30), back.cell(1, "jan").?.float, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 40), back.cell(1, "feb").?.float, 1e-9);
 }
 
 test "resample: monthly compound + sum" {
