@@ -193,8 +193,17 @@ pub const Fe = struct {
     }
 
     /// Constant-time conditional move: `fe = a` iff `c == 1`.
+    ///
+    /// The select bit `c` is laundered through `blackBox` before it becomes a
+    /// mask — exactly as `normalize`/`sub` do — so LLVM cannot recover
+    /// `c ∈ {0,1}` and lower the masked blend to a data-dependent branch
+    /// (`Jcc`). Without the barrier the "constant-time" scalar-mul paths leaked
+    /// the secret: `group.mul`'s per-bit select became `test cl,1; je` on each
+    /// scalar bit, and `combMulBase`'s per-window sign select became `cmp;jbe`
+    /// on the secret signed-digit sign — both reproduced by disassembly. See
+    /// the barrier note above.
     pub fn cMov(fe: *Fe, a: Fe, c: u1) void {
-        const mask: u64 = @as(u64, 0) -% @as(u64, c);
+        const mask: u64 = @as(u64, 0) -% @as(u64, blackBox(@as(u64, c)));
         for (&fe.limbs, a.limbs) |*w, aw| {
             w.* = (aw & mask) | (w.* & ~mask);
         }
