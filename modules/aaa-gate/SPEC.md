@@ -8,8 +8,9 @@ Auth + audit front for an API (Bearer/API-key gate). Usage: see ./README.md. Att
 - `protect` default = `.all` (every method gated) — secure-by-default; `.mutations` restores an
   R/W split (gate only mutations). Register `cors` before the gate under `.all` (preflights carry no
   `Authorization`).
-- **Open plane:** an empty token set (no `token`/`extra_tokens`) disables auth entirely
-  (`Identity.scheme == .open`) — kept as the dev/demo default; configuring any token closes it.
+- **Open plane:** an empty credential set fails **closed** (denies) by default; set
+  `allow_when_unconfigured = true` to disable auth entirely (`Identity.scheme == .open`, the old
+  dev/demo behavior). Configuring any token/key closes the plane regardless.
 - **Audit** is a synchronous hook (`on_audit(entry)`), never a logger: fires on every authenticated
   mutation and every denial; authenticated reads are not audited. Entry slices borrow request-scoped
   memory.

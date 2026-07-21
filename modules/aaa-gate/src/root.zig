@@ -45,10 +45,11 @@
 //!   Under `.all`, register `cors` *before* the gate so browser
 //!   preflights (which cannot carry Authorization) are intercepted
 //!   before they would 401.
-//! - **Open plane.** An empty token set means **no authentication** —
-//!   every request passes with `Identity.scheme == .open` (a deliberate
-//!   dev/demo default: turning auth on is providing a token). If you want
-//!   deny-by-default, always configure a token.
+//! - **Open plane.** An empty credential set fails **closed** (denies
+//!   everything) by default — a config mistake never silently exposes a
+//!   protected plane. To get the old dev/demo behavior where an
+//!   unconfigured gate passes every request with `Identity.scheme ==
+//!   .open`, set `Options.allow_when_unconfigured = true` explicitly.
 //! - **Audit.** `Options.on_audit` is a hook, not a logger: it fires
 //!   synchronously with an `AuditEntry` for every **authenticated
 //!   mutation** (after the handler, with the final status and the
@@ -207,7 +208,8 @@ pub const Identity = struct {
         /// A configured API key (from the `X-Api-Key` header or the
         /// optional query-param fallback), verified in constant time.
         api_key,
-        /// No credentials configured — open plane (dev default, documented).
+        /// No credentials configured and `allow_when_unconfigured` set — the
+        /// opt-in open plane (fails closed by default; see that option).
         open,
     };
 };
@@ -278,10 +280,18 @@ pub const Options = struct {
     /// behavior). See `AuthMode`; the `api_key*` options below apply when
     /// this is `.api_key` or `.either`.
     auth_mode: AuthMode = .bearer,
+    /// Whether a *fully unconfigured* scheme (no tokens / no API keys and no
+    /// verifier) is an **open plane** that admits every request, or fails
+    /// **closed** (denies). Defaults to `false` — a gate built with no
+    /// credentials denies everything, so a config mistake never silently
+    /// exposes a protected plane. Set `true` to opt into the documented
+    /// dev/open-plane behavior. A scheme that *does* have credentials is
+    /// unaffected either way.
+    allow_when_unconfigured: bool = false,
     /// The primary API key. Not retained — only its SHA-256 digest is
     /// stored. Must be non-empty when set. With an empty key set and no
-    /// `api_key_verify`, the API-key scheme is an open plane (like an
-    /// empty token set).
+    /// `api_key_verify`, the API-key scheme is an open plane only when
+    /// `allow_when_unconfigured` is set (else it denies).
     api_key: ?[]const u8 = null,
     /// Additional valid API keys (rotation set). Not retained.
     extra_api_keys: []const []const u8 = &.{},
@@ -329,6 +339,9 @@ pub const Gate = struct {
     gpa: Allocator,
     protect: Protect,
     auth_mode: AuthMode = .bearer,
+    /// See `Options.allow_when_unconfigured`. When false (default) an empty
+    /// credential set fails closed (denies) instead of opening the plane.
+    allow_when_unconfigured: bool = false,
     on_audit: ?AuditFn,
     on_audit_ctx: ?*anyopaque,
     window_ns: u64,
@@ -394,6 +407,7 @@ pub const Gate = struct {
             .gpa = gpa,
             .protect = options.protect,
             .auth_mode = options.auth_mode,
+            .allow_when_unconfigured = options.allow_when_unconfigured,
             .on_audit = options.on_audit,
             .on_audit_ctx = options.on_audit_ctx,
             .window_ns = options.throttle_window_ms *| std.time.ns_per_ms,
@@ -444,7 +458,8 @@ pub const Gate = struct {
         const fp: ?[Sha256.digest_length]u8 = if (presented) |p| fingerprint(p) else null;
         lockSpin(&g.lock);
         defer g.lock.unlock();
-        if (g.tokens.items.len == 0) return .ok_open;
+        if (g.tokens.items.len == 0)
+            return if (g.allow_when_unconfigured) .ok_open else .denied;
         const got = fp orelse return .denied;
         var ok = false;
         for (g.tokens.items) |want|
@@ -456,15 +471,17 @@ pub const Gate = struct {
     /// presented). Reuses the *same* constant-time digest compare as
     /// `verify` — never `std.mem.eql` on the secret. The static key set is
     /// scanned in full (no early exit); on a miss the `api_key_verify`
-    /// callback (if any) is consulted outside the lock. Returns `.ok_open`
-    /// when no key set and no callback are configured.
+    /// callback (if any) is consulted outside the lock. With no key set and
+    /// no callback, returns `.ok_open` only when `allow_when_unconfigured` is
+    /// set, else `.denied` (fail closed).
     pub fn verifyApiKey(g: *Gate, presented: ?[]const u8) Verdict {
         const has_verify = g.api_key_verify != null;
         const fp: ?[Sha256.digest_length]u8 = if (presented) |p| fingerprint(p) else null;
         {
             lockSpin(&g.lock);
             defer g.lock.unlock();
-            if (g.api_keys.items.len == 0 and !has_verify) return .ok_open;
+            if (g.api_keys.items.len == 0 and !has_verify)
+                return if (g.allow_when_unconfigured) .ok_open else .denied;
             if (fp) |got| {
                 if (containsFp(g.api_keys.items, got)) return .ok_api_key;
             }
@@ -919,12 +936,22 @@ test "verify: constant-time compare — both branches, plus length mismatch and 
     try testing.expectEqual(Gate.Verdict.denied, g.verify("")); // empty candidate
 }
 
-test "verify: open plane when no tokens are configured" {
-    var g = try Gate.init(testing.allocator, .{});
+test "verify: open plane when no tokens are configured AND explicitly opted in" {
+    var g = try Gate.init(testing.allocator, .{ .allow_when_unconfigured = true });
     defer g.deinit();
     try testing.expectEqual(@as(usize, 0), g.tokenCount());
     try testing.expectEqual(Gate.Verdict.ok_open, g.verify(null));
     try testing.expectEqual(Gate.Verdict.ok_open, g.verify("anything"));
+}
+
+test "verify: empty token set fails CLOSED by default (no fail-open)" {
+    // Regression: a gate built with no credentials must DENY, not admit
+    // everything. Only the explicit opt-in above reopens the plane.
+    var g = try Gate.init(testing.allocator, .{});
+    defer g.deinit();
+    try testing.expectEqual(@as(usize, 0), g.tokenCount());
+    try testing.expectEqual(Gate.Verdict.denied, g.verify(null));
+    try testing.expectEqual(Gate.Verdict.denied, g.verify("anything"));
 }
 
 test "rotation: extra tokens, addToken/removeToken, old works until removed" {
@@ -1078,12 +1105,20 @@ test "verifyApiKey: same constant-time compare — same-length wrong key rejecte
     try testing.expectEqual(Gate.Verdict.denied, g.verifyApiKey("")); // empty candidate
 }
 
-test "verifyApiKey: open plane when no keys and no verifier configured" {
-    var g = try Gate.init(testing.allocator, .{ .auth_mode = .api_key });
+test "verifyApiKey: open plane when no keys/verifier AND explicitly opted in" {
+    var g = try Gate.init(testing.allocator, .{ .auth_mode = .api_key, .allow_when_unconfigured = true });
     defer g.deinit();
     try testing.expectEqual(@as(usize, 0), g.apiKeyCount());
     try testing.expectEqual(Gate.Verdict.ok_open, g.verifyApiKey(null));
     try testing.expectEqual(Gate.Verdict.ok_open, g.verifyApiKey("anything"));
+}
+
+test "verifyApiKey: no keys/verifier fails CLOSED by default" {
+    var g = try Gate.init(testing.allocator, .{ .auth_mode = .api_key });
+    defer g.deinit();
+    try testing.expectEqual(@as(usize, 0), g.apiKeyCount());
+    try testing.expectEqual(Gate.Verdict.denied, g.verifyApiKey(null));
+    try testing.expectEqual(Gate.Verdict.denied, g.verifyApiKey("anything"));
 }
 
 test "secretEqual: constant-time helper matches only equal secrets (incl. same length)" {
@@ -1389,8 +1424,8 @@ test "middleware: protect=.mutations lets reads through unauthenticated (no iden
     try testing.expectEqual(@as(u32, 1), sink.hits);
 }
 
-test "middleware: open plane (no tokens) passes everything with the .open identity" {
-    var g = try Gate.init(testing.allocator, .{});
+test "middleware: open plane (no tokens, opted in) passes everything with the .open identity" {
+    var g = try Gate.init(testing.allocator, .{ .allow_when_unconfigured = true });
     defer g.deinit();
 
     var r = router.Router.init(testing.allocator);
@@ -1402,6 +1437,20 @@ test "middleware: open plane (no tokens) passes everything with the .open identi
     const got = runWire(&r, wire("GET", "/t", ""), &buf);
     try expectStatus(got, "200");
     try testing.expectEqualStrings("open-plane", bodyOf(got));
+}
+
+test "middleware: no tokens fails CLOSED by default (unconfigured gate denies)" {
+    var g = try Gate.init(testing.allocator, .{});
+    defer g.deinit();
+
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(g.middleware());
+    try r.get("/t", hOpenIdentity);
+    var buf: [1024]u8 = undefined;
+
+    // Default (fail-closed) gate with zero credentials must reject, not admit.
+    try expectStatus(runWire(&r, wire("GET", "/t", ""), &buf), "401");
 }
 
 test "middleware: realm appears in the challenge" {

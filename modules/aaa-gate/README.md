@@ -112,11 +112,11 @@ middleware's `state` points at it).
   open (out-of-scope requests get no identity and no audit). Under
   `.all`, register `cors` **before** the gate — browser preflights
   cannot carry `Authorization` and would otherwise 401.
-- **Open plane.** An empty token set (no `token`, no `extra_tokens`)
-  disables authentication: everything passes with
-  `Identity.scheme == .open`. A convenient dev/demo default
-  — configuring any token closes the plane; removing the last token
-  reopens it.
+- **Open plane.** An empty credential set fails **closed** (denies
+  everything) by default. To disable auth entirely so everything passes
+  with `Identity.scheme == .open` (the old dev/demo default), set
+  `allow_when_unconfigured = true` explicitly — configuring any token/key
+  closes the plane regardless.
 - **Audit** = a hook (`on_audit(entry)`), never a logger. Fires
   synchronously for every **authenticated mutation** (after the handler:
   final status + the `target`/`detail` the handler set on the Identity;
