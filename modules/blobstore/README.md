@@ -6,11 +6,13 @@ name-addressed raw layer and small opaque **named** records — all made
 crash-safe by temp-then-atomic-rename.
 
 - Spec-completed: single-pass `put`, `verify`,
-  segment validation, `Digest`, `named` generalization.
+  segment validation, `Digest`, `named` generalization, refcounted `gc`,
+  configurable fan-out, cross-process ingest locking.
 - **Model after:** git object store / restic (256-way hex fan-out, dedup).
-- **Platform:** posix (visibility relies on atomic `rename(2)`; filesystem via
-  `std.Io`). **Role:** util. **Concurrency:** reentrant — no shared state except
-  a process-local atomic counter for ingest temp names.
+- **Platform:** posix (visibility relies on atomic `rename(2)` + advisory
+  `flock`; filesystem via `std.Io`). **Role:** util. **Concurrency:**
+  reentrant — shared state (refcounts, gc) is coordinated via an advisory
+  cross-process flock, not in-process synchronization.
 - **Deps:** `hashdigest` (SHA-256; nothing cryptographic is reimplemented here).
 
 Provenance: original work of the zig-libs authors (MIT); modeled after the git
@@ -21,10 +23,13 @@ behavior only, no source consulted or copied). SHA-256 comes from the sibling
 ## Layout
 
 ```
-<base>/cas/<hh>/<hex>     content-addressed blobs (dedup); hh = hex[0..2]
+<base>/cas/<hh...>/<hex>  content-addressed blobs (dedup); hh... = Options.fanout
+                          levels of hex[0..2] (default 1 level, i.e. hex[0..2])
+<base>/cas/<hh...>/<hex>.rc  refcount sidecar for that blob
 <base>/raw/<ns>/<key>     name-addressed blobs (caller owns the key)
 <base>/named/<ns>/<key>   small opaque byte records (manifests, indexes)
-<base>/tmp/               scratch space + in-flight ingest temps
+<base>/tmp/               scratch space + in-flight ingest temps +
+                          tmp/.ingest.lock (cross-process advisory flock)
 ```
 
 ## API
@@ -33,16 +38,24 @@ behavior only, no source consulted or copied). SHA-256 comes from the sibling
 const blobstore = @import("blobstore");
 
 var store = try blobstore.Store.init(io, "/var/lib/mystore");
+// or, with a deeper CAS fan-out for a store expecting tens of millions of
+// objects (default fanout=1 matches every store created before this option
+// existed — pick fanout once, at creation time, it is not migrated later):
+var store2 = try blobstore.Store.initOptions(io, "/var/lib/bigstore", .{ .fanout = 2 });
 
 // content-addressed: stream in, get the digest back; dedup is automatic
 var reader: std.Io.Reader = ...;         // any *std.Io.Reader
-const d = try store.put(&reader);        // -> Digest (SHA-256 hex)
+const d = try store.put(&reader);        // -> Digest (SHA-256 hex); bumps refcount
 const d2 = try store.putBytes(slice);    // convenience for in-memory bytes
 
 _ = store.has(d);                        // bool
 var f = (try store.open(d)).?;           // ?std.Io.File (caller closes)
 _ = try store.verify(d);                 // re-hash on disk: true=intact, false=bit-rot
-_ = try store.delete(d);                 // bool (see refcount caveat below)
+_ = try store.delete(d);                 // bool; decrements refcount, does NOT unlink —
+                                          // see "Reference counting + GC" below
+
+// reclaim every zero-refcount blob not in `keep`, plus stale ingest temps
+const stats = try store.gc(arena, &.{}, .{}); // -> GcStats{blobs_removed,bytes_reclaimed,temps_removed}
 
 // digests round-trip through hex text
 const parsed = try blobstore.Digest.fromHex(hex64);
@@ -80,23 +93,41 @@ const keys = try store.listNamed(arena, "hostA");              // [][]const u8
   bit-rot; `Digest` and per-entry-point segment validation guard every path.
   The raw layer is `raw/<ns>/<key>` and opaque records are `named/<ns>/<key>`
   (any bytes, not just JSON) — no JSON/Outcome wrapping, this is pure storage.
-
-## Backlog (deferred, not implemented)
-
-- **Garbage collection** — `gc(keep: []Digest)` reachability sweep to reclaim
-  unreferenced CAS blobs (and stale `.part` temps from crashed ingests). Needs a
-  root set (typically the `named` manifests) to walk.
-- **Reference counting** — `delete`/`casDelete` remove a blob unconditionally;
-  with dedup, a blob may back several manifests, so a blind delete can dangle
-  references. A safe individual delete needs refcounts or GC-only reclamation.
-- **Configurable fan-out depth** — the CAS uses a fixed 2-char (256-way) fan-out.
-  Tens-of-millions-of-objects stores want deeper/tunable fan-out
-  (`<hh>/<hh>/<hex>`) to bound directory sizes.
-- **Cross-process locking / commit TOCTOU** — `casCommit` does a check-then-rename
-  (`casHas` then `rename`). Two processes committing the *same* content can race:
-  the later rename simply overwrites an identical blob, so the invariant
-  "a committed blob's bytes always match its name" holds and the race is
-  harmless. Ingest temp names are only unique *within* a process (an atomic
-  counter); cross-process ingest isolation and any advisory locking are left to
-  the caller.
+- **Reference counting + GC.** `put`/`casCommit` bump a `<hex>.rc` sidecar
+  every time a reference is established — including a dedup hit, which is a
+  real second reference to the same bytes. `delete`/`casDelete` only
+  decrement it (floored at 0); they never unlink the blob. `gc(keep)` is the
+  only function that actually reclaims disk space: it removes every CAS blob
+  whose refcount has reached zero and is not named in `keep`, plus abandoned
+  `cas/.ingest-*.part` temps older than `GcOptions.stale_after_ns` (default
+  10 min). Refcounting was chosen over pure mark-sweep because `put`/`delete`
+  already see every reference change as it happens, so `gc` doesn't need to
+  understand `named` manifests or any other caller-defined pointer format;
+  `keep` stays available as an explicit, additive allow-list for callers who
+  want to cross-check against their own root set instead of trusting
+  bookkeeping alone. A blob with no `.rc` sidecar at all (from a store
+  written before this feature, never `delete`d since) is left untouched by
+  `gc` — refcount tracking only starts once `put`/`delete` first touches that
+  digest.
+- **Configurable fan-out.** `Options.fanout` (`Store.initOptions`, `1..=32`,
+  default `1`) sets how many 2-hex-char CAS directory levels precede the
+  blob file — `cas/<hh>/<hex>` at the default, `cas/<hh>/<hh>/<hex>` at
+  `fanout = 2`, and so on, for stores with tens of millions of objects that
+  want to bound per-directory size. `Store.init` is unchanged and always
+  uses the default, so every store written before this option existed still
+  opens correctly; changing `fanout` does not migrate an existing store's
+  on-disk layout.
+- **Cross-process ingest locking.** An advisory `flock` on
+  `tmp/.ingest.lock` serializes the commit-and-refcount-mutate section of
+  `casCommit`/`casDelete`/`gc` across processes, so concurrent writers can't
+  corrupt a refcount sidecar or have `gc` race a live `delete`. It does not
+  cover `put`'s streaming/hashing phase — only the shared-state mutation at
+  the end needs mutual exclusion, so concurrent ingests still stream into
+  their own temps in parallel. Temp names additionally fold in the PID (not
+  only a process-local counter), closing the old same-name-clash-across-
+  processes risk for the pre-lock streaming phase too. `casCommit`'s
+  has-check+rename+refcount-bump happens as one lock-held unit, so two
+  processes committing the *same* content no longer race the refcount bump
+  itself (the earlier benign rename-only TOCTOU note still applies to the
+  rename call in isolation).
 ```

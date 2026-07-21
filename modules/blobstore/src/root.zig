@@ -5,12 +5,15 @@
 //! Layout under `base`:
 //!  - `cas/<hh>/<hex>`   content-addressed store; a blob's bytes live once,
 //!    keyed by their SHA-256 (`hh` = first two hex chars = 256-way fan-out so
-//!    no directory holds the whole corpus). Identical content dedups.
+//!    no directory holds the whole corpus, repeated per `Options.fanout`
+//!    level for deeper nesting). Identical content dedups. A `<hex>.rc`
+//!    sidecar next to each blob tracks its reference count.
 //!  - `raw/<ns>/<key>`   a plain namespaced blob layer (name-addressed, not
 //!    dedup'd) for when the caller owns the key.
 //!  - `named/<ns>/<key>` small opaque byte records (manifests, indexes) under
 //!    a `namespace/key` scheme.
-//!  - `tmp/`             scratch space + in-flight ingest temps.
+//!  - `tmp/`             scratch space + in-flight ingest temps + the
+//!    cross-process ingest lock file (`tmp/.ingest.lock`).
 //!
 //! **Crash safety.** Every write goes to a hidden `.part` temp and is made
 //! visible by a single `rename(2)` — atomic on POSIX. A crash mid-write leaves
@@ -21,20 +24,38 @@
 //! can never escape `base`. CAS hex keys are generated internally and always
 //! safe.
 //!
+//! **Reference counting + GC.** `put`/`casCommit` increment a per-blob
+//! refcount sidecar (even on a dedup hit); `delete`/`casDelete` only
+//! decrement it (floored at zero) — they never unlink the blob themselves.
+//! `gc(keep)` is the sole reclaim path: it sweeps every CAS blob whose
+//! refcount has reached zero and is not named in the caller-supplied `keep`
+//! list, plus stale abandoned ingest temps. A blob with no `.rc` sidecar at
+//! all (written before this feature, never `delete`d since) is treated as
+//! still-referenced and left alone — see `gc`'s doc comment for the full
+//! reachability contract and why refcounting (not pure mark-sweep) was
+//! chosen.
+//!
+//! **Cross-process ingest locking.** The commit-and-refcount-mutate section
+//! of `put`/`casDelete`/`gc` is serialized across processes with an advisory
+//! `flock` on `tmp/.ingest.lock` — see those functions' doc comments for the
+//! exact boundary.
+//!
 //! Provenance: original work of the zig-libs authors (MIT). Provides the
 //! raw/CAS/scratch/manifest layers and `segmentSafe`, `put` (single-pass
 //! hash-while-write), `verify` (bit-rot detection), the `Digest` type,
-//! segment validation on every entry point, and a `named` record scheme
-//! (arbitrary namespace/key). sha256 comes from the sibling `hashdigest`
+//! segment validation on every entry point, a `named` record scheme
+//! (arbitrary namespace/key), refcounted `gc`, configurable fan-out, and the
+//! cross-process ingest lock. sha256 comes from the sibling `hashdigest`
 //! module; nothing cryptographic is reimplemented here.
 
 const std = @import("std");
+const linux = std.os.linux;
 const hashdigest = @import("hashdigest");
 
 pub const meta = .{
-    .platform = .posix, // atomic rename-on-commit; std.Io filesystem API
+    .platform = .posix, // atomic rename-on-commit; advisory flock; std.Io filesystem API
     .role = .util,
-    .concurrency = .reentrant, // no shared state bar a process-local ingest counter
+    .concurrency = .reentrant, // shared state (refcounts, gc) is coordinated via advisory flock
     .model_after = "git object store / restic",
     .deps = .{"hashdigest"},
 };
@@ -45,6 +66,23 @@ pub const Error = error{
     InvalidName,
     /// `verify`/`open` on a digest whose CAS blob does not exist.
     NotFound,
+    /// `Options.fanout` is 0 or too large to leave room in a 64-char hex digest.
+    InvalidFanout,
+};
+
+/// Store construction options. Default matches the on-disk layout every
+/// store has always used, so opening a store written before this option
+/// existed needs no migration.
+pub const Options = struct {
+    /// Number of leading 2-hex-char directory levels the CAS fan-out uses
+    /// before the blob file itself, e.g. `fanout = 1` ⇒ `cas/<hh>/<hex>`
+    /// (the historical, default layout); `fanout = 2` ⇒
+    /// `cas/<hh>/<hh>/<hex>`. Deeper fan-out bounds directory size for
+    /// stores with tens of millions of objects. Must be `1..=32` (a 64-char
+    /// hex digest has 32 two-char groups). Changing `fanout` on a store that
+    /// already has blobs on disk does *not* migrate them — pick it once at
+    /// creation time.
+    fanout: u8 = 1,
 };
 
 /// A content address: the lowercase-hex SHA-256 of a blob's bytes.
@@ -77,34 +115,105 @@ pub const Temp = struct { file: std.Io.File, tmp: []const u8 };
 /// A raw-layer directory listing entry.
 pub const Entry = struct { key: []const u8, bytes: u64 };
 
-/// Process-local monotonically increasing counter for collision-free temp names
-/// within a process. Cross-process uniqueness is out of scope — see the README
-/// backlog (cross-process locking); `createFile(.truncate)` means a same-name
-/// clash across processes is a corrupted *ingest*, never a corrupted live blob.
+/// Process-local monotonically increasing counter for collision-free temp
+/// names within a process. Temp *names* additionally fold in the PID
+/// (`nextUniq`), so a same-name clash across processes racing the same
+/// counter value is astronomically unlikely; `createFile(.truncate)` means
+/// even a clash would only corrupt an in-flight *ingest*, never a live blob.
+/// The commit-and-refcount step that follows is further serialized
+/// cross-process by the advisory ingest lock (see `lockIngest`).
 var ingest_counter: std.atomic.Value(u64) = .init(0);
 
 pub const Store = struct {
     io: std.Io,
     base: []const u8,
+    /// CAS fan-out depth (2-hex-char directory levels); see `Options.fanout`.
+    fanout: u8,
 
-    /// Ensure `base` and its `cas/`, `raw/`, `named/`, `tmp/` subdirs exist.
+    /// Ensure `base` and its `cas/`, `raw/`, `named/`, `tmp/` subdirs exist,
+    /// with the default (historical) fan-out. Equivalent to
+    /// `initOptions(io, base, .{})`.
     pub fn init(io: std.Io, base: []const u8) !Store {
+        return initOptions(io, base, .{});
+    }
+
+    /// Like `init`, but with configurable CAS fan-out depth (see `Options`).
+    pub fn initOptions(io: std.Io, base: []const u8, options: Options) !Store {
+        if (options.fanout < 1 or options.fanout > 32) return error.InvalidFanout;
         try ensureDir(io, base);
         var buf: [512]u8 = undefined;
         try ensureDir(io, try std.fmt.bufPrint(&buf, "{s}/cas", .{base}));
         try ensureDir(io, try std.fmt.bufPrint(&buf, "{s}/raw", .{base}));
         try ensureDir(io, try std.fmt.bufPrint(&buf, "{s}/named", .{base}));
         try ensureDir(io, try std.fmt.bufPrint(&buf, "{s}/tmp", .{base}));
-        return .{ .io = io, .base = base };
+        return .{ .io = io, .base = base, .fanout = options.fanout };
     }
 
     // ── content-addressed store (dedup at the file level) ──────────────────────
     // A blob's content lives once at `<base>/cas/<hex[0:2]>/<hex>` (2-char
     // fan-out so a directory never holds the whole corpus).
 
-    /// `<base>/cas/<hh>/<hex>` written into `buf` (`hex` is a 64-char sha256).
+    /// The fan-out directory for `hex` (no trailing filename), e.g.
+    /// `<base>/cas/<hh>` at the default `fanout = 1`, `<base>/cas/<hh>/<hh>`
+    /// at `fanout = 2`.
+    fn casDir(self: Store, buf: []u8, hex: []const u8) ![]const u8 {
+        var n = (try std.fmt.bufPrint(buf, "{s}/cas", .{self.base})).len;
+        var i: u8 = 0;
+        while (i < self.fanout) : (i += 1) {
+            const seg = try std.fmt.bufPrint(buf[n..], "/{s}", .{hex[2 * i .. 2 * i + 2]});
+            n += seg.len;
+        }
+        return buf[0..n];
+    }
+
+    /// `<base>/cas/<hh...>/<hex>` written into `buf` (`hex` is a 64-char
+    /// sha256; the fan-out prefix repeats per `self.fanout`).
     pub fn casPath(self: Store, buf: []u8, hex: []const u8) ![]const u8 {
-        return std.fmt.bufPrint(buf, "{s}/cas/{s}/{s}", .{ self.base, hex[0..2], hex });
+        const dir = try self.casDir(buf, hex);
+        const rest = try std.fmt.bufPrint(buf[dir.len..], "/{s}", .{hex});
+        return buf[0 .. dir.len + rest.len];
+    }
+
+    /// `<base>/cas/<hh...>/<hex>.rc` — the refcount sidecar for a blob.
+    fn casRefPath(self: Store, buf: []u8, hex: []const u8) ![]const u8 {
+        const dir = try self.casDir(buf, hex);
+        const rest = try std.fmt.bufPrint(buf[dir.len..], "/{s}.rc", .{hex});
+        return buf[0 .. dir.len + rest.len];
+    }
+
+    /// Create every fan-out directory level for `hex` if missing.
+    fn ensureCasDir(self: Store, hex: []const u8) !void {
+        var buf: [640]u8 = undefined;
+        var n = (try std.fmt.bufPrint(&buf, "{s}/cas", .{self.base})).len;
+        var i: u8 = 0;
+        while (i < self.fanout) : (i += 1) {
+            const seg = try std.fmt.bufPrint(buf[n..], "/{s}", .{hex[2 * i .. 2 * i + 2]});
+            n += seg.len;
+            try ensureDir(self.io, buf[0..n]);
+        }
+    }
+
+    /// Read a refcount sidecar; `default_if_missing` on absence *or* on any
+    /// parse/read failure (a torn/corrupt sidecar is never allowed to wedge
+    /// `put`/`delete`/`gc` — it is treated the same as "not tracked").
+    fn casRefRead(self: Store, hex: []const u8, default_if_missing: u64) u64 {
+        var pbuf: [800]u8 = undefined;
+        const path = self.casRefPath(&pbuf, hex) catch return default_if_missing;
+        var vbuf: [24]u8 = undefined;
+        const data = std.Io.Dir.cwd().readFile(self.io, path, &vbuf) catch return default_if_missing;
+        return std.fmt.parseInt(u64, std.mem.trim(u8, data, " \t\r\n"), 10) catch default_if_missing;
+    }
+
+    /// Overwrite a refcount sidecar with `count`. Not itself crash-atomic
+    /// (no temp+rename) — a torn write just falls back to
+    /// `default_if_missing` on the next `casRefRead`, which is the safe
+    /// direction for bookkeeping metadata (never worse than "untracked").
+    fn casRefWrite(self: Store, hex: []const u8, count: u64) !void {
+        var pbuf: [800]u8 = undefined;
+        const path = try self.casRefPath(&pbuf, hex);
+        var vbuf: [24]u8 = undefined;
+        const s = try std.fmt.bufPrint(&vbuf, "{d}", .{count});
+        try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = s });
     }
 
     /// True if the content blob already exists (the dedup-hit check).
@@ -133,32 +242,49 @@ pub const Store = struct {
         return .{ .file = file, .tmp = tmp };
     }
 
-    /// Commit a hashed temp into the CAS as `<hex>`. Returns true if newly stored,
-    /// false if the content already existed (dedup — the temp is removed).
+    /// Commit a hashed temp into the CAS as `<hex>` and bump its refcount
+    /// (creating it at 1 if new, incrementing it if this is a dedup hit —
+    /// every `put` of the same content counts as a live reference). Returns
+    /// true if newly stored, false if the content already existed (dedup —
+    /// the temp is removed). Runs under the cross-process ingest lock (see
+    /// `lockIngest`) so the has-check, rename, and refcount bump are atomic
+    /// with respect to another process's `put`/`casDelete`/`gc`.
     pub fn casCommit(self: Store, hex: []const u8, tmp: []const u8) !bool {
+        const lockf = try self.lockIngest();
+        defer self.unlockIngest(lockf);
+
         if (self.casHas(hex)) {
             self.discardTemp(tmp);
+            try self.casRefWrite(hex, self.casRefRead(hex, 0) + 1);
             return false;
         }
-        var dbuf: [640]u8 = undefined;
-        try ensureDir(self.io, try std.fmt.bufPrint(&dbuf, "{s}/cas/{s}", .{ self.base, hex[0..2] }));
+        try self.ensureCasDir(hex);
         var pbuf: [768]u8 = undefined;
         const path = try self.casPath(&pbuf, hex);
         const cwd = std.Io.Dir.cwd();
         try cwd.rename(tmp, cwd, path, self.io);
+        try self.casRefWrite(hex, self.casRefRead(hex, 0) + 1);
         return true;
     }
 
-    /// Delete a content blob; returns false if it did not exist. NOTE: no
-    /// reference counting — deleting a blob still referenced by a manifest breaks
-    /// that manifest (see the README backlog).
+    /// Decrement a content blob's refcount; returns false if the blob does
+    /// not exist. **Does not unlink the blob** — a blob backing several
+    /// `put`s (dedup) or referenced by more than one manifest survives until
+    /// its refcount reaches zero, and even then physical reclaim only
+    /// happens via `gc`, never here. A blob with no refcount sidecar yet
+    /// (written before this feature existed) is assumed to carry exactly one
+    /// implicit reference, so a single `casDelete` brings a never-before-put
+    /// legacy blob to zero, matching the old unconditional-delete behavior
+    /// for the common single-owner case. Runs under the cross-process
+    /// ingest lock — see `casCommit`.
     pub fn casDelete(self: Store, hex: []const u8) !bool {
-        var buf: [768]u8 = undefined;
-        const path = try self.casPath(&buf, hex);
-        std.Io.Dir.cwd().deleteFile(self.io, path) catch |e| switch (e) {
-            error.FileNotFound => return false,
-            else => return e,
-        };
+        const lockf = try self.lockIngest();
+        defer self.unlockIngest(lockf);
+
+        if (!self.casHas(hex)) return false;
+        const cur = self.casRefRead(hex, 1);
+        const next = if (cur == 0) 0 else cur - 1;
+        try self.casRefWrite(hex, next);
         return true;
     }
 
@@ -384,6 +510,185 @@ pub const Store = struct {
         const file = try std.Io.Dir.cwd().createFile(self.io, path, .{ .truncate = true });
         return .{ .file = file, .tmp = path };
     }
+
+    // ── cross-process ingest lock ───────────────────────────────────────────────
+    // A single advisory flock on `<base>/tmp/.ingest.lock` serializes the
+    // commit-and-refcount-mutate section of `casCommit`/`casDelete`/`gc` across
+    // processes (and threads sharing them). It does NOT cover the streaming
+    // phase of `put` (hashing + writing the temp) — only the section that
+    // touches shared on-disk state (the CAS entry + its `.rc` sidecar) needs
+    // mutual exclusion; letting concurrent ingests stream into their own
+    // (PID+counter-uniquified) temps in parallel is the whole point of
+    // per-ingest temp files. The lock is released on every path (defer), so a
+    // panic/early-return inside the critical section still drops it rather
+    // than wedging every other process open on this store.
+
+    /// Open (creating if needed) and exclusively lock `tmp/.ingest.lock`,
+    /// blocking until any other process's/thread's lock on it is released.
+    fn lockIngest(self: Store) !std.Io.File {
+        var buf: [768]u8 = undefined;
+        const path = try std.fmt.bufPrint(&buf, "{s}/tmp/.ingest.lock", .{self.base});
+        return std.Io.Dir.cwd().createFile(self.io, path, .{ .truncate = false, .lock = .exclusive });
+    }
+
+    fn unlockIngest(self: Store, f: std.Io.File) void {
+        f.unlock(self.io);
+        f.close(self.io);
+    }
+
+    // ── garbage collection (refcounted reachability sweep) ─────────────────────
+
+    /// Result of a `gc` sweep.
+    pub const GcStats = struct {
+        /// CAS blobs actually unlinked (refcount was zero, not in `keep`).
+        blobs_removed: u64 = 0,
+        /// Sum of the removed blobs' sizes.
+        bytes_reclaimed: u64 = 0,
+        /// Abandoned `cas/.ingest-*.part` temps reaped (crash debris).
+        temps_removed: u64 = 0,
+    };
+
+    pub const GcOptions = struct {
+        /// Only reap an ingest temp whose mtime is at least this old, so `gc`
+        /// never races a slow-but-live `put` that is still streaming into its
+        /// temp on another process/thread. Default 10 minutes: generous for
+        /// any single blob ingest, tight enough to actually reclaim crash
+        /// debris in routine maintenance sweeps.
+        stale_after_ns: u64 = 10 * std.time.ns_per_min,
+    };
+
+    /// Reachability sweep and the *only* path that physically reclaims CAS
+    /// blobs. Design: **refcounting**, not mark-and-sweep over a full
+    /// manifest walk — `put`/`casCommit` already touch every blob's refcount
+    /// at the moment they establish a reference (including on a dedup hit),
+    /// and `delete`/`casDelete` at the moment they drop one, so the store
+    /// always has an accurate zero/nonzero signal without `gc` needing to
+    /// know how to parse `named` manifests or any other caller-defined
+    /// reference format. `keep` is *additive* on top of that: an explicit
+    /// allow-list of digests that must survive this sweep regardless of
+    /// their tracked refcount, for callers who want to double-check
+    /// reachability against their own root set (e.g. digests pulled live out
+    /// of `named` manifests) rather than trust bookkeeping alone — pass
+    /// `&.{}` to rely purely on refcounts.
+    ///
+    /// A CAS blob with **no** `.rc` sidecar at all is left untouched (treated
+    /// as still-referenced): sidecars only start existing once `put` or
+    /// `delete` touches that digest, so a blob written by a store predating
+    /// this feature — and never `delete`d since — has no zero/nonzero signal
+    /// to sweep on. It becomes collectible the moment `delete` is called on
+    /// it (see `casDelete`'s legacy-blob note).
+    ///
+    /// Also reaps abandoned `cas/.ingest-*.part` temps older than
+    /// `options.stale_after_ns`. Runs the whole sweep under the ingest lock
+    /// (see `lockIngest`) so it can't race a concurrent `put`/`casDelete`
+    /// refcount mutation on the same store.
+    ///
+    /// `allocator` is used only for a scratch lookup table built and freed
+    /// entirely within this call (to hold `keep`) — any allocator works,
+    /// not just an arena; `gc` never leaks or retains it.
+    pub fn gc(self: Store, allocator: std.mem.Allocator, keep: []const Digest, options: GcOptions) !GcStats {
+        const lockf = try self.lockIngest();
+        defer self.unlockIngest(lockf);
+
+        var keep_set: std.StringHashMapUnmanaged(void) = .empty;
+        defer keep_set.deinit(allocator);
+        try keep_set.ensureTotalCapacity(allocator, @intCast(keep.len));
+        for (keep) |*d| keep_set.putAssumeCapacity(d.slice(), {});
+
+        var stats: GcStats = .{};
+        stats.temps_removed = try self.reapStaleIngestTemps(options.stale_after_ns);
+
+        var dbuf: [768]u8 = undefined;
+        const casdir = try std.fmt.bufPrint(&dbuf, "{s}/cas", .{self.base});
+        try self.gcWalk(casdir, self.fanout, &keep_set, &stats);
+        return stats;
+    }
+
+    /// Recursively walk `self.fanout` levels of CAS fan-out directories,
+    /// then sweep zero-refcount, non-`keep`'d blobs at the leaf level.
+    fn gcWalk(
+        self: Store,
+        dir_path: []const u8,
+        depth_remaining: u8,
+        keep_set: *const std.StringHashMapUnmanaged(void),
+        stats: *GcStats,
+    ) !void {
+        var dir = std.Io.Dir.cwd().openDir(self.io, dir_path, .{ .iterate = true }) catch |e| switch (e) {
+            error.FileNotFound => return,
+            else => return e,
+        };
+        defer dir.close(self.io);
+
+        var it = dir.iterate();
+        while (try it.next(self.io)) |entry| {
+            if (depth_remaining > 0) {
+                if (entry.kind != .directory) continue;
+                var pbuf: [768]u8 = undefined;
+                const sub = try std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ dir_path, entry.name });
+                try self.gcWalk(sub, depth_remaining - 1, keep_set, stats);
+                continue;
+            }
+            // Leaf level: blob files. Skip `.rc` sidecars and any hidden
+            // (dot-prefixed) temp so a partially-ingested `.ingest-*.part`
+            // that happens to live at this depth is never treated as a blob.
+            if (entry.kind != .file) continue;
+            if (entry.name.len == 0 or entry.name[0] == '.') continue;
+            if (std.mem.endsWith(u8, entry.name, ".rc")) continue;
+            const hex = entry.name;
+            if (keep_set.contains(hex)) continue;
+
+            const rc = self.readRcInDir(dir, hex) orelse continue; // no sidecar ⇒ untracked, keep
+            if (rc != 0) continue; // still referenced
+
+            const size = if (dir.statFile(self.io, hex, .{}) catch null) |st| st.size else 0;
+            dir.deleteFile(self.io, hex) catch continue;
+            var rcbuf: [80]u8 = undefined;
+            if (std.fmt.bufPrint(&rcbuf, "{s}.rc", .{hex})) |rc_name| {
+                dir.deleteFile(self.io, rc_name) catch {};
+            } else |_| {}
+            stats.blobs_removed += 1;
+            stats.bytes_reclaimed += size;
+        }
+    }
+
+    /// Read a blob's `.rc` sidecar relative to its already-open fan-out
+    /// `dir`. Null means "no sidecar" (untracked/legacy), distinct from a
+    /// tracked refcount of zero.
+    fn readRcInDir(self: Store, dir: std.Io.Dir, hex: []const u8) ?u64 {
+        var rcbuf: [80]u8 = undefined;
+        const rc_name = std.fmt.bufPrint(&rcbuf, "{s}.rc", .{hex}) catch return null;
+        var vbuf: [24]u8 = undefined;
+        const data = dir.readFile(self.io, rc_name, &vbuf) catch return null;
+        return std.fmt.parseInt(u64, std.mem.trim(u8, data, " \t\r\n"), 10) catch null;
+    }
+
+    /// Reap `cas/.ingest-*.part` temps (abandoned mid-`put` streams) whose
+    /// mtime is at least `stale_after_ns` old. Ingest temps always live
+    /// directly under `cas/`, never inside a fan-out subdirectory, regardless
+    /// of `self.fanout` (see `casCreateTemp`), so this needs no recursion.
+    fn reapStaleIngestTemps(self: Store, stale_after_ns: u64) !u64 {
+        var dbuf: [768]u8 = undefined;
+        const casdir = try std.fmt.bufPrint(&dbuf, "{s}/cas", .{self.base});
+        var dir = std.Io.Dir.cwd().openDir(self.io, casdir, .{ .iterate = true }) catch |e| switch (e) {
+            error.FileNotFound => return 0,
+            else => return e,
+        };
+        defer dir.close(self.io);
+
+        const now = std.Io.Timestamp.now(self.io, .real);
+        var removed: u64 = 0;
+        var it = dir.iterate();
+        while (try it.next(self.io)) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.startsWith(u8, entry.name, ".ingest-")) continue;
+            const st = dir.statFile(self.io, entry.name, .{}) catch continue;
+            const age_ns = st.mtime.durationTo(now).nanoseconds;
+            if (age_ns < 0 or @as(u64, @intCast(age_ns)) < stale_after_ns) continue;
+            dir.deleteFile(self.io, entry.name) catch continue;
+            removed += 1;
+        }
+        return removed;
+    }
 };
 
 /// A path segment is safe if it is non-empty, ≤128 chars, not `.`/`..`, has no
@@ -408,7 +713,9 @@ fn ensureDir(io: std.Io, path: []const u8) !void {
 
 fn nextUniq(buf: []u8) []const u8 {
     const n = ingest_counter.fetchAdd(1, .monotonic);
-    return std.fmt.bufPrint(buf, "{d}", .{n}) catch unreachable; // u64 fits in 40
+    // PID + process-local counter: makes the temp name unique across
+    // processes too (not just within one), not only within a process.
+    return std.fmt.bufPrint(buf, "{d}-{d}", .{ linux.getpid(), n }) catch unreachable; // fits in 40
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────────
@@ -494,17 +801,22 @@ test "put: identical content dedups to one on-disk blob" {
     const d2 = try store.putBytes(data);
     try t.expectEqualStrings(d1.slice(), d2.slice());
 
-    // exactly one file in the fan-out dir cas/<hh>/
+    // exactly one blob file in the fan-out dir cas/<hh>/ (plus its `.rc`
+    // refcount sidecar, bumped to 2 by the second, deduped put).
     var fbuf: [300]u8 = undefined;
     const fan = try std.fmt.bufPrint(&fbuf, "{s}/cas/{s}", .{ store.base, d1.hex[0..2] });
     var dir = try std.Io.Dir.cwd().openDir(io, fan, .{ .iterate = true });
     defer dir.close(io);
     var count: usize = 0;
+    var rc_count: usize = 0;
     var it = dir.iterate();
     while (try it.next(io)) |e| {
-        if (e.kind == .file) count += 1;
+        if (e.kind != .file) continue;
+        if (std.mem.endsWith(u8, e.name, ".rc")) rc_count += 1 else count += 1;
     }
     try t.expectEqual(@as(usize, 1), count);
+    try t.expectEqual(@as(usize, 1), rc_count);
+    try t.expectEqual(@as(u64, 2), store.casRefRead(&d1.hex, 0));
 
     // no leftover ingest temps in cas/
     var cbuf: [300]u8 = undefined;
@@ -575,7 +887,9 @@ test "crash safety: an abandoned temp never becomes a live blob" {
     defer dir.close(io);
     var it = dir.iterate();
     while (try it.next(io)) |e| {
-        if (e.kind == .file) try t.expectEqualStrings(&live.hex, e.name);
+        if (e.kind != .file) continue;
+        if (std.mem.endsWith(u8, e.name, ".rc")) continue; // refcount sidecar, not a blob
+        try t.expectEqualStrings(&live.hex, e.name);
     }
 }
 
@@ -664,4 +978,168 @@ test "named records: put/read/list, namespaced, missing ⇒ null/empty" {
     const none = try store.listNamed(gpa, "nope");
     defer gpa.free(none);
     try t.expectEqual(@as(usize, 0), none.len);
+}
+
+test "gc: sweeps a zero-refcount orphan, keeps a live one AND an explicit keep" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buf: [256]u8 = undefined;
+    const store = try testStore(&tmp, &base_buf);
+    const gpa = std.testing.allocator;
+
+    // live: put, never deleted ⇒ refcount 1, must survive gc untouched.
+    const live = try store.putBytes("kept alive by a real reference");
+    // orphan: put then deleted to zero ⇒ must be swept.
+    const orphan = try store.putBytes("nobody references me anymore");
+    try t.expect(try store.delete(orphan));
+    // rescued: put then deleted to zero too, but named in `keep` ⇒ survives
+    // despite a zero refcount (the mark-sweep escape hatch on top of
+    // refcounting).
+    const rescued = try store.putBytes("zero refcount but explicitly kept");
+    try t.expect(try store.delete(rescued));
+
+    try t.expect(store.has(live));
+    try t.expect(store.has(orphan)); // not yet physically reclaimed
+    try t.expect(store.has(rescued));
+
+    const stats = try store.gc(gpa, &.{rescued}, .{});
+    try t.expectEqual(@as(u64, 1), stats.blobs_removed);
+    try t.expectEqual(@as(u64, "nobody references me anymore".len), stats.bytes_reclaimed);
+
+    // positive control: the kept blobs are still readable end-to-end.
+    try t.expect(store.has(live));
+    var f = (try store.open(live)).?;
+    const io = std.testing.io;
+    var rbuf: [64]u8 = undefined;
+    var fr = std.Io.File.Reader.initStreaming(f, io, &rbuf);
+    const got = try fr.interface.allocRemaining(gpa, .unlimited);
+    f.close(io);
+    defer gpa.free(got);
+    try t.expectEqualStrings("kept alive by a real reference", got);
+    try t.expect(store.has(rescued));
+
+    // the orphan is actually gone from disk, not just logically deleted.
+    try t.expect(!store.has(orphan));
+    var pbuf: [768]u8 = undefined;
+    const orphan_path = try store.casPath(&pbuf, &orphan.hex);
+    try t.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, orphan_path, .{}));
+
+    // running gc again is a no-op (idempotent — nothing left to sweep).
+    const stats2 = try store.gc(gpa, &.{rescued}, .{});
+    try t.expectEqual(@as(u64, 0), stats2.blobs_removed);
+}
+
+test "refcount: survives repeated puts of the same content, only collectible at zero" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buf: [256]u8 = undefined;
+    const store = try testStore(&tmp, &base_buf);
+    const gpa = std.testing.allocator;
+
+    const data = "deduped content, three live references";
+    const d1 = try store.putBytes(data); // refcount 1
+    const d2 = try store.putBytes(data); // dedup hit ⇒ refcount 2
+    const d3 = try store.putBytes(data); // dedup hit ⇒ refcount 3
+    try t.expectEqualStrings(d1.slice(), d2.slice());
+    try t.expectEqualStrings(d1.slice(), d3.slice());
+
+    // drop two of the three references; one remains ⇒ gc must NOT collect it.
+    try t.expect(try store.delete(d1));
+    try t.expect(try store.delete(d2));
+    var stats = try store.gc(gpa, &.{}, .{});
+    try t.expectEqual(@as(u64, 0), stats.blobs_removed);
+    try t.expect(store.has(d3));
+
+    // drop the last reference ⇒ now collectible.
+    try t.expect(try store.delete(d3));
+    stats = try store.gc(gpa, &.{}, .{});
+    try t.expectEqual(@as(u64, 1), stats.blobs_removed);
+    try t.expect(!store.has(d1));
+
+    // deleting an absent digest is a no-op false, not an error.
+    try t.expect(!try store.delete(d1));
+}
+
+test "configurable fan-out: round-trips at fanout=1 (default), 2, and 3" {
+    const gpa = std.testing.allocator;
+    inline for (.{ 1, 2, 3 }) |fanout| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var base_buf: [256]u8 = undefined;
+        const base = try std.fmt.bufPrint(&base_buf, ".zig-cache/tmp/{s}/store", .{&tmp.sub_path});
+        const store = try Store.initOptions(std.testing.io, base, .{ .fanout = fanout });
+        try t.expectEqual(@as(u8, fanout), store.fanout);
+
+        const payload = "fan-out round-trip payload";
+        const d = try store.putBytes(payload);
+
+        // the blob physically lives `fanout` directories deep.
+        var pbuf: [768]u8 = undefined;
+        const path = try store.casPath(&pbuf, &d.hex);
+        var want_buf: [768]u8 = undefined;
+        var w: usize = (try std.fmt.bufPrint(&want_buf, "{s}/cas", .{base})).len;
+        var i: u8 = 0;
+        while (i < fanout) : (i += 1) {
+            w += (try std.fmt.bufPrint(want_buf[w..], "/{s}", .{d.hex[2 * i .. 2 * i + 2]})).len;
+        }
+        w += (try std.fmt.bufPrint(want_buf[w..], "/{s}", .{&d.hex})).len;
+        try t.expectEqualStrings(want_buf[0..w], path);
+
+        // and reads back byte-identical regardless of nesting depth.
+        try t.expect(store.has(d));
+        var f = (try store.open(d)).?;
+        const io = std.testing.io;
+        var rbuf: [64]u8 = undefined;
+        var fr = std.Io.File.Reader.initStreaming(f, io, &rbuf);
+        const got = try fr.interface.allocRemaining(gpa, .unlimited);
+        f.close(io);
+        defer gpa.free(got);
+        try t.expectEqualStrings(payload, got);
+    }
+}
+
+test "Store.init still opens a store written at the default (fanout=1) layout" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buf: [256]u8 = undefined;
+    const base = try std.fmt.bufPrint(&base_buf, ".zig-cache/tmp/{s}/store", .{&tmp.sub_path});
+
+    // a store created the plain way (no Options) ...
+    const store = try Store.init(std.testing.io, base);
+    const d = try store.putBytes("back-compat payload");
+
+    // ... reopens fine via init() and finds the same blob at cas/<hh>/<hex>,
+    // proving the default fan-out is unchanged.
+    const reopened = try Store.init(std.testing.io, base);
+    try t.expectEqual(@as(u8, 1), reopened.fanout);
+    try t.expect(reopened.has(d));
+    var buf: [768]u8 = undefined;
+    const path = try reopened.casPath(&buf, &d.hex);
+    try t.expect(std.mem.indexOf(u8, path, d.hex[0..2]) != null);
+}
+
+test "cross-process ingest lock: repeated put/delete/gc from one writer never deadlocks" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buf: [256]u8 = undefined;
+    const store = try testStore(&tmp, &base_buf);
+    const gpa = std.testing.allocator;
+
+    // Each of put/delete/gc independently acquires-and-releases the ingest
+    // lock; a single writer doing this in a tight sequence (including two
+    // back-to-back lock acquisitions inside one gc call, and a gc that finds
+    // nothing to do) must never hang. If the lock leaked instead of being
+    // released, the second `putBytes` below would block forever and the test
+    // would time out.
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        const d = try store.putBytes("lock round-trip payload");
+        try t.expect(try store.delete(d));
+        _ = try store.gc(gpa, &.{}, .{});
+    }
+    // a second handle re-opened over the same base must also be able to
+    // acquire the (now-existing) lock file without issue.
+    const store2 = try Store.init(std.testing.io, store.base);
+    const d2 = try store2.putBytes("second handle, same base");
+    try t.expect(store2.has(d2));
 }
