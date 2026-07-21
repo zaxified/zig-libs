@@ -1,0 +1,264 @@
+// SPDX-License-Identifier: MIT
+//! BIP341 taproot **key-path** signature hashing — the `SigMsg`/sighash
+//! computation behind every taproot key-path spend (BIP341 "Common
+//! Signature Message" + "Default Sighash").
+//!
+//! Two structural differences from the legacy/BIP143 algorithms:
+//!
+//! - The commitment hashes (`sha_prevouts`/`sha_amounts`/
+//!   `sha_scriptpubkeys`/`sha_sequences`/`sha_outputs`/`sha_single_output`)
+//!   are a single SHA-256, NOT `sha256d` (`hash256.sha256`, not
+//!   `hash256.sha256d`) — see `hash256.zig`'s doc comment for why.
+//! - Because taproot has no separate "scriptCode", the sighash needs the
+//!   `scriptPubKey` AND `value` of every input's spent output (not just
+//!   the one being signed) to compute `sha_amounts`/`sha_scriptpubkeys` —
+//!   the caller supplies these as `spent_outputs`, one per `vin` entry, in
+//!   the same order (there is no UTXO set inside this module).
+//!
+//! The final sighash is `bip340.taggedHash("TapSighash", 0x00 || SigMsg)`
+//! — the leading `0x00` is BIP341's fixed "sighash epoch" byte. `sigMsg`
+//! below returns `0x00 || SigMsg` (epoch included), matching the official
+//! `bip-0341/wallet-test-vectors.json` `sigMsg` field byte-for-byte — that
+//! field's name is a bit of a false friend: despite being called `sigMsg`,
+//! its own first byte IS the epoch (confirmed by decoding it field-by-field
+//! against the vector's own `given`/`intermediary` values), i.e. it holds
+//! what BIP341's prose calls "Message" (`0x00 || SigMsg`), not `SigMsg`
+//! alone. This module follows the vector's actual content rather than the
+//! prose's field-naming, so `sighash` below is simply
+//! `bip340.taggedHash("TapSighash", sigMsg(...))` with no separate
+//! epoch-prepending step.
+//!
+//! ## Scope: key-path only — annex and BIP342 tapscript deferred
+//!
+//! `ext_flag` (part of `spend_type`) is always `0` (key-path spending) and
+//! an annex is never signaled (`spend_type` is always `0x00`). BIP341's
+//! script-path fields (`ext_flag = 1`, the leaf hash / `key_version` /
+//! `code_separator_position` a BIP342 tapscript signature additionally
+//! commits to) and annex support (`sha_annex`, needing the witness stack's
+//! last-item-starts-with-`0x50` detection rule) are real, self-contained
+//! extensions with their own committed fields — not a partial/half-built
+//! version of this function — and are out of scope for this pass: no
+//! published, official key-path-spending test vector exercises an annex
+//! (`bip341_kat_vectors.zig`'s source JSON has none), and tapscript
+//! (BIP342) is a distinct signature-hashing mode this module does not
+//! implement at all.
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const hash256 = @import("hash256.zig");
+const bip340 = @import("bip340");
+const tx = @import("tx.zig");
+
+pub const SIGHASH_DEFAULT: u8 = 0x00;
+pub const SIGHASH_ALL: u8 = 0x01;
+pub const SIGHASH_NONE: u8 = 0x02;
+pub const SIGHASH_SINGLE: u8 = 0x03;
+pub const SIGHASH_ANYONECANPAY: u8 = 0x80;
+
+pub const Bip341Error = error{
+    InputIndexOutOfRange,
+    /// `hash_type`'s base type is SINGLE but `input_index` has no
+    /// corresponding output. Unlike the legacy algorithm's historical
+    /// "SIGHASH_SINGLE bug" fallback, BIP341 makes this combination
+    /// outright invalid (BIP341 "Signature validation" step 2).
+    MissingCorrespondingOutput,
+    /// `spent_outputs.len` must equal `transaction.vin.len` (one prevout
+    /// per input — see module doc comment).
+    PrevoutsCountMismatch,
+    /// Not one of the 7 values BIP341 defines
+    /// (`{0x00,0x01,0x02,0x03,0x81,0x82,0x83}`).
+    InvalidHashType,
+} || Allocator.Error;
+
+pub fn validateHashType(hash_type: u8) Bip341Error!void {
+    switch (hash_type) {
+        0x00, 0x01, 0x02, 0x03, 0x81, 0x82, 0x83 => {},
+        else => return error.InvalidHashType,
+    }
+}
+
+fn appendCompactSize(buf: *std.ArrayList(u8), allocator: Allocator, value: u64) Allocator.Error!void {
+    var tmp: [9]u8 = undefined;
+    const w = tx.encodeCompactSize(value, &tmp) catch unreachable;
+    try buf.appendSlice(allocator, w);
+}
+
+fn appendU32LE(buf: *std.ArrayList(u8), allocator: Allocator, v: u32) Allocator.Error!void {
+    var tmp: [4]u8 = undefined;
+    std.mem.writeInt(u32, &tmp, v, .little);
+    try buf.appendSlice(allocator, &tmp);
+}
+
+fn appendI32LE(buf: *std.ArrayList(u8), allocator: Allocator, v: i32) Allocator.Error!void {
+    var tmp: [4]u8 = undefined;
+    std.mem.writeInt(i32, &tmp, v, .little);
+    try buf.appendSlice(allocator, &tmp);
+}
+
+fn appendI64LE(buf: *std.ArrayList(u8), allocator: Allocator, v: i64) Allocator.Error!void {
+    var tmp: [8]u8 = undefined;
+    std.mem.writeInt(i64, &tmp, v, .little);
+    try buf.appendSlice(allocator, &tmp);
+}
+
+fn shaOutput(allocator: Allocator, vout: tx.TxOut) Allocator.Error![32]u8 {
+    var tmp: std.ArrayList(u8) = .empty;
+    defer tmp.deinit(allocator);
+    try appendI64LE(&tmp, allocator, vout.value);
+    try appendCompactSize(&tmp, allocator, vout.script_pubkey.len);
+    try tmp.appendSlice(allocator, vout.script_pubkey);
+    return hash256.sha256(tmp.items);
+}
+
+/// `0x00 || SigMsg(hash_type, ext_flag=0)` (key-path spending; the leading
+/// byte is BIP341's fixed sighash epoch — see module doc comment for why
+/// it's included here). Caller owns the returned slice.
+pub fn sigMsg(
+    allocator: Allocator,
+    transaction: tx.Transaction,
+    input_index: usize,
+    hash_type: u8,
+    spent_outputs: []const tx.TxOut,
+) Bip341Error![]u8 {
+    try validateHashType(hash_type);
+    if (input_index >= transaction.vin.len) return error.InputIndexOutOfRange;
+    if (spent_outputs.len != transaction.vin.len) return error.PrevoutsCountMismatch;
+
+    const anyone_can_pay = (hash_type & SIGHASH_ANYONECANPAY) != 0;
+    const base = hash_type & 0x03;
+
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    try buf.append(allocator, 0x00); // sighash epoch (BIP341)
+    try buf.append(allocator, hash_type);
+    try appendI32LE(&buf, allocator, transaction.version);
+    try appendU32LE(&buf, allocator, transaction.locktime);
+
+    if (!anyone_can_pay) {
+        {
+            var tmp: std.ArrayList(u8) = .empty;
+            defer tmp.deinit(allocator);
+            for (transaction.vin) |vin| {
+                try tmp.appendSlice(allocator, &vin.prevout.txid);
+                try appendU32LE(&tmp, allocator, vin.prevout.vout);
+            }
+            try buf.appendSlice(allocator, &hash256.sha256(tmp.items));
+        }
+        {
+            var tmp: std.ArrayList(u8) = .empty;
+            defer tmp.deinit(allocator);
+            for (spent_outputs) |o| try appendI64LE(&tmp, allocator, o.value);
+            try buf.appendSlice(allocator, &hash256.sha256(tmp.items));
+        }
+        {
+            var tmp: std.ArrayList(u8) = .empty;
+            defer tmp.deinit(allocator);
+            for (spent_outputs) |o| {
+                try appendCompactSize(&tmp, allocator, o.script_pubkey.len);
+                try tmp.appendSlice(allocator, o.script_pubkey);
+            }
+            try buf.appendSlice(allocator, &hash256.sha256(tmp.items));
+        }
+        {
+            var tmp: std.ArrayList(u8) = .empty;
+            defer tmp.deinit(allocator);
+            for (transaction.vin) |vin| try appendU32LE(&tmp, allocator, vin.sequence);
+            try buf.appendSlice(allocator, &hash256.sha256(tmp.items));
+        }
+    }
+
+    if (base == SIGHASH_DEFAULT or base == SIGHASH_ALL) {
+        var tmp: std.ArrayList(u8) = .empty;
+        defer tmp.deinit(allocator);
+        for (transaction.vout) |vout| {
+            try appendI64LE(&tmp, allocator, vout.value);
+            try appendCompactSize(&tmp, allocator, vout.script_pubkey.len);
+            try tmp.appendSlice(allocator, vout.script_pubkey);
+        }
+        try buf.appendSlice(allocator, &hash256.sha256(tmp.items));
+    }
+
+    // spend_type = ext_flag*2 + annex_present; both always 0 here (key-path
+    // only, annex deferred -- module doc comment).
+    try buf.append(allocator, 0x00);
+
+    if (anyone_can_pay) {
+        const o = spent_outputs[input_index];
+        const vin = transaction.vin[input_index];
+        try buf.appendSlice(allocator, &vin.prevout.txid);
+        try appendU32LE(&buf, allocator, vin.prevout.vout);
+        try appendI64LE(&buf, allocator, o.value);
+        try appendCompactSize(&buf, allocator, o.script_pubkey.len);
+        try buf.appendSlice(allocator, o.script_pubkey);
+        try appendU32LE(&buf, allocator, vin.sequence);
+    } else {
+        try appendU32LE(&buf, allocator, @intCast(input_index));
+    }
+
+    // annex: deferred, never signaled/emitted (module doc comment).
+
+    if (base == SIGHASH_SINGLE) {
+        if (input_index >= transaction.vout.len) return error.MissingCorrespondingOutput;
+        try buf.appendSlice(allocator, &try shaOutput(allocator, transaction.vout[input_index]));
+    }
+
+    return buf.toOwnedSlice(allocator);
+}
+
+/// `bip340.taggedHash("TapSighash", sigMsg(...))` — `sigMsg` already
+/// includes the leading epoch byte (see its doc comment).
+pub fn sighash(
+    allocator: Allocator,
+    transaction: tx.Transaction,
+    input_index: usize,
+    hash_type: u8,
+    spent_outputs: []const tx.TxOut,
+) Bip341Error![32]u8 {
+    const msg = try sigMsg(allocator, transaction, input_index, hash_type, spent_outputs);
+    defer allocator.free(msg);
+    return bip340.taggedHash("TapSighash", msg);
+}
+
+// ── tests ────────────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+test "validateHashType accepts exactly the 7 BIP341 values, rejects everything else" {
+    const valid = [_]u8{ 0x00, 0x01, 0x02, 0x03, 0x81, 0x82, 0x83 };
+    for (valid) |h| try validateHashType(h);
+    const invalid = [_]u8{ 0x04, 0x05, 0x80, 0x84, 0xff, 0x7f };
+    for (invalid) |h| try testing.expectError(error.InvalidHashType, validateHashType(h));
+}
+
+test "input_index out of range and prevouts-count mismatch are typed errors" {
+    var t: tx.Transaction = .{
+        .version = 1,
+        .vin = @constCast(&[_]tx.TxIn{.{ .prevout = .{ .txid = [_]u8{0} ** 32, .vout = 0 }, .script_sig = &.{}, .sequence = 0 }}),
+        .vout = @constCast(&[_]tx.TxOut{.{ .value = 100, .script_pubkey = &.{} }}),
+        .witness = &.{},
+        .locktime = 0,
+        .has_witness = false,
+    };
+    const prevouts = [_]tx.TxOut{.{ .value = 100, .script_pubkey = &.{} }};
+    try testing.expectError(error.InputIndexOutOfRange, sigMsg(testing.allocator, t, 5, SIGHASH_DEFAULT, &prevouts));
+    try testing.expectError(error.PrevoutsCountMismatch, sigMsg(testing.allocator, t, 0, SIGHASH_DEFAULT, &.{}));
+    _ = &t;
+}
+
+test "SIGHASH_SINGLE with no corresponding output is rejected outright (no legacy-style bug fallback)" {
+    var t: tx.Transaction = .{
+        .version = 1,
+        .vin = @constCast(&[_]tx.TxIn{
+            .{ .prevout = .{ .txid = [_]u8{0} ** 32, .vout = 0 }, .script_sig = &.{}, .sequence = 0 },
+            .{ .prevout = .{ .txid = [_]u8{1} ** 32, .vout = 0 }, .script_sig = &.{}, .sequence = 0 },
+        }),
+        .vout = @constCast(&[_]tx.TxOut{.{ .value = 100, .script_pubkey = &.{} }}), // only 1 output, 2 inputs
+        .witness = &.{},
+        .locktime = 0,
+        .has_witness = false,
+    };
+    const prevouts = [_]tx.TxOut{ .{ .value = 100, .script_pubkey = &.{} }, .{ .value = 200, .script_pubkey = &.{} } };
+    try testing.expectError(error.MissingCorrespondingOutput, sigMsg(testing.allocator, t, 1, SIGHASH_SINGLE, &prevouts));
+    _ = &t;
+}

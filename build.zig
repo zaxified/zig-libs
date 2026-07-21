@@ -129,6 +129,7 @@ const module_list = [_]Module{
     .{ .name = "sandbox" },
     .{ .name = "bip340", .deps = &.{"k256"} },
     .{ .name = "taproot", .deps = &.{ "bip340", "k256" } },
+    .{ .name = "bitcointx", .deps = &.{"bip340"} },
     .{ .name = "musig2", .deps = &.{ "bip340", "k256" } },
     .{ .name = "sphinx", .deps = &.{"k256"} },
     .{ .name = "bolt8", .deps = &.{ "noise", "k256" } },
