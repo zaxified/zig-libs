@@ -78,7 +78,8 @@ pub fn derivePublicKey(basepoint: [33]u8, per_commitment_point: [33]u8) Error![3
 /// privkey = basepoint_secret + SHA256(per_commitment_point ‖ basepoint)   (mod n),
 /// where basepoint / per_commitment_point are the secrets' own public points.
 pub fn derivePrivateKey(basepoint_secret: [32]u8, per_commitment_secret: [32]u8) Error![32]u8 {
-    const b = Scalar.fromBytes(basepoint_secret, .big) catch return error.InvalidSecret;
+    var b = Scalar.fromBytes(basepoint_secret, .big) catch return error.InvalidSecret;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&b));
     const basepoint = pointOf(basepoint_secret) catch return error.InvalidSecret;
     const per_commitment_point = pointOf(per_commitment_secret) catch return error.InvalidSecret;
     const t = hashToScalar(sha2(per_commitment_point, basepoint));
@@ -101,8 +102,10 @@ pub fn deriveRevocationPublicKey(revocation_basepoint: [33]u8, per_commitment_po
 /// revocationprivkey = revocation_basepoint_secret·h1 + per_commitment_secret·h2  (mod n),
 /// with the same h1/h2 as above computed from the secrets' public points.
 pub fn deriveRevocationPrivateKey(revocation_basepoint_secret: [32]u8, per_commitment_secret: [32]u8) Error![32]u8 {
-    const rbs = Scalar.fromBytes(revocation_basepoint_secret, .big) catch return error.InvalidSecret;
-    const pcs = Scalar.fromBytes(per_commitment_secret, .big) catch return error.InvalidSecret;
+    var rbs = Scalar.fromBytes(revocation_basepoint_secret, .big) catch return error.InvalidSecret;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&rbs));
+    var pcs = Scalar.fromBytes(per_commitment_secret, .big) catch return error.InvalidSecret;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&pcs));
     const revocation_basepoint = pointOf(revocation_basepoint_secret) catch return error.InvalidSecret;
     const per_commitment_point = pointOf(per_commitment_secret) catch return error.InvalidSecret;
     const h1 = hashToScalar(sha2(revocation_basepoint, per_commitment_point));

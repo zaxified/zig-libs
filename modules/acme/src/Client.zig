@@ -149,6 +149,13 @@ pub fn deinit(c: *Client) void {
     if (c.kid) |k| c.gpa.free(k);
     if (c.nonce) |n| c.gpa.free(n);
     c.responder.deinit();
+    // `account_key` is the account's ES256 private key — it lives on this
+    // struct for the whole Client lifetime (every `postJws` call signs with
+    // it), so this is its one wipe point. Do this BEFORE `c.* = undefined`
+    // below: assigning `undefined` is not a zeroing guarantee (ReleaseFast
+    // may elide it entirely as a dead store), so the explicit secureZero
+    // must run first.
+    std.crypto.secureZero(u8, std.mem.asBytes(&c.account_key));
     c.* = undefined;
 }
 
@@ -277,8 +284,12 @@ pub fn obtain(c: *Client, domains: []const []const u8) Error!Certificate {
     }
 
     // Finalize with a CSR for a fresh certificate key (§7.4; the account
-    // key MUST NOT be reused as the certificate key — §11.1).
-    const cert_key = jws.KeyPair.generate(c.io);
+    // key MUST NOT be reused as the certificate key — §11.1). `cert_key`
+    // itself is transient scratch: the actual output is `key_pem` below
+    // (a separate PEM-encoded copy), so the raw in-memory KeyPair is wiped
+    // at scope exit rather than left resident for the rest of the request.
+    var cert_key = jws.KeyPair.generate(c.io);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&cert_key));
     const csr_der = x509.csrDer(a, cert_key, domains) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidDomain => return error.InvalidDomain,

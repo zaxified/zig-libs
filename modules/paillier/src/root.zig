@@ -572,6 +572,21 @@ pub const SecretKey = struct {
     pub fn muToBytes(self: SecretKey, out: []u8) ByteError!void {
         return self.mu.toBytes(out, .big);
     }
+
+    /// Zero this key's SECRET material: `lambda`/`mu`, and (when present)
+    /// the entire `crt` block. `crt.p_sq`/`crt.q_sq` are `p²`/`q²` — from
+    /// which the factorization `p`,`q` is directly recoverable (a square
+    /// root over the integers) — so every field derived from them
+    /// (`p_sq_mont`/`q_sq_mont`/`dp`/`dq`/`p_sq_fe`/`p_sq_inv`) is
+    /// factorization-equivalent secret material too (see `CrtParams`'s doc
+    /// comment). `n`/`n_sq`/`n_sq_mont` are PUBLIC — the same values the
+    /// `PublicKey` carries — and are left untouched. Idempotent; the key
+    /// must not be used again after calling this.
+    pub fn deinit(sk: *SecretKey) void {
+        std.crypto.secureZero(u8, std.mem.asBytes(&sk.lambda));
+        std.crypto.secureZero(u8, std.mem.asBytes(&sk.mu));
+        if (sk.crt) |*crt| std.crypto.secureZero(u8, std.mem.asBytes(crt));
+    }
 };
 
 // ── Ciphertext ────────────────────────────────────────────────────────────
@@ -1333,6 +1348,37 @@ test "SecretKey.fromBytes round-trips n/lambda/mu" {
     var mu_out: [1]u8 = undefined;
     try sk.muToBytes(&mu_out);
     try testing.expectEqualSlices(u8, &kat_mu, &mu_out);
+}
+
+test "SecretKey.deinit zeroes lambda/mu (no-crt key, e.g. loaded via fromBytes)" {
+    var sk = try SecretKey.fromBytes(&kat_n, &kat_lambda, &kat_mu);
+    try testing.expect(sk.crt == null);
+    try testing.expect(!std.mem.allEqual(u8, std.mem.asBytes(&sk.lambda), 0)); // present before wipe
+    try testing.expect(!std.mem.allEqual(u8, std.mem.asBytes(&sk.mu), 0));
+
+    sk.deinit();
+
+    try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&sk.lambda), 0)); // wiped after
+    try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&sk.mu), 0));
+    // Public fields untouched by deinit — still usable to build a PublicKey view.
+    try testing.expectEqual(@as(u32, 187), try sk.n.v.toPrimitive(u32));
+}
+
+test "SecretKey.deinit zeroes lambda/mu/crt (fromPrimes key, factorization-bearing block present)" {
+    var kp = try fromPrimes(&.{61}, &.{53});
+    try testing.expect(kp.secret.crt != null);
+    try testing.expect(!std.mem.allEqual(u8, std.mem.asBytes(&kp.secret.lambda), 0));
+    try testing.expect(!std.mem.allEqual(u8, std.mem.asBytes(&kp.secret.mu), 0));
+    try testing.expect(!std.mem.allEqual(u8, std.mem.asBytes(&kp.secret.crt.?), 0));
+
+    kp.secret.deinit();
+
+    try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&kp.secret.lambda), 0));
+    try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&kp.secret.mu), 0));
+    try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&kp.secret.crt.?), 0));
+    // Public fields (n/n_sq, and the PublicKey half) untouched.
+    try testing.expectEqual(@as(u32, 61 * 53), try kp.secret.n.v.toPrimitive(u32));
+    try testing.expectEqual(@as(u32, 61 * 53), try kp.public.n.v.toPrimitive(u32));
 }
 
 test "Ciphertext bytes round-trip" {

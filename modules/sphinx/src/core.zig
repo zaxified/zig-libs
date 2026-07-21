@@ -114,6 +114,7 @@ pub fn deriveHopSecrets(session_key: [32]u8, hop_pubkeys: []const [pubkey_len]u8
     // instead of recomputing scalar_i * G from scratch — same value, one
     // point-multiply per hop instead of a fresh base-point multiply.
     var ephemeral_scalar = session_key;
+    defer std.crypto.secureZero(u8, &ephemeral_scalar);
     var ephemeral_point = Secp256k1.combMulBase(ephemeral_scalar, .big) catch
         return error.IdentityElement;
 
@@ -137,6 +138,7 @@ pub fn deriveHopSecrets(session_key: [32]u8, hop_pubkeys: []const [pubkey_len]u8
         // Step 4: blinding_factor_i = SHA256(compressed(epk_i) ‖ ss_i) —
         // the EPHEMERAL pubkey first, then the shared secret.
         var blinding_factor: [32]u8 = undefined;
+        defer std.crypto.secureZero(u8, &blinding_factor);
         var hasher = Sha256.init(.{});
         hasher.update(&epk);
         hasher.update(&shared_secret);
@@ -242,6 +244,10 @@ pub fn construct(
 
     // Step 1: every hop's ss_i / epk_i up front (the FORWARD pass).
     var hop_secrets: [max_hops]HopSecret = undefined;
+    // `shared_secret` is per-packet secret scratch consumed entirely inside
+    // this function (the filler pass + the reverse wrap loop below);
+    // `ephemeral_pubkey` is public and stays untouched.
+    defer for (hop_secrets[0..n]) |*hs| std.crypto.secureZero(u8, &hs.shared_secret);
     try deriveHopSecrets(session_key, hop_pubkeys, hop_secrets[0..n]);
 
     // Step 4 (before the wrap loop needs it): BOLT#4 "Filler Generation" —
@@ -259,10 +265,12 @@ pub fn construct(
     var filler_len: usize = 0;
     {
         var stream: [2 * hopframe.hop_payloads_len]u8 = undefined;
+        defer std.crypto.secureZero(u8, &stream);
         for (hop_payloads[0 .. n - 1], hop_secrets[0 .. n - 1]) |payload, hop_secret| {
             const shift = hopframe.shiftSize(payload.len);
             @memset(filler[filler_len..][0..shift], 0);
-            const rho = keyderive.generateKey(.rho, hop_secret.shared_secret);
+            var rho = keyderive.generateKey(.rho, hop_secret.shared_secret);
+            defer std.crypto.secureZero(u8, &rho);
             keyderive.generateCipherStream(rho, stream[0 .. hopframe.hop_payloads_len + shift]);
             const forced = stream[hopframe.hop_payloads_len - filler_len ..][0 .. filler_len + shift];
             for (filler[0 .. filler_len + shift], forced) |*f, s| f.* ^= s;
@@ -284,8 +292,10 @@ pub fn construct(
         hopframe.rightShift(&buf, shift);
         _ = try hopframe.writeHopFrame(&buf, hop_payloads[i], next_hmac);
 
-        const rho = keyderive.generateKey(.rho, hop_secrets[i].shared_secret);
+        var rho = keyderive.generateKey(.rho, hop_secrets[i].shared_secret);
+        defer std.crypto.secureZero(u8, &rho);
         var stream: [hopframe.hop_payloads_len]u8 = undefined;
+        defer std.crypto.secureZero(u8, &stream);
         keyderive.generateCipherStream(rho, &stream);
         for (&buf, stream) |*b, s| b.* ^= s;
 
@@ -295,7 +305,8 @@ pub fn construct(
         // deobfuscation streams will force there.
         if (i == n - 1) @memcpy(buf[hopframe.hop_payloads_len - filler_len ..], filler[0..filler_len]);
 
-        const mu = keyderive.generateKey(.mu, hop_secrets[i].shared_secret);
+        var mu = keyderive.generateKey(.mu, hop_secrets[i].shared_secret);
+        defer std.crypto.secureZero(u8, &mu);
         var mac = HmacSha256.init(&mu);
         mac.update(&buf);
         mac.update(associated_data);
@@ -412,10 +423,12 @@ pub fn process(node_privkey: [32]u8, pkt: OnionPacket, associated_data: []const 
     const shared_compressed = shared_point.toCompressedSec1();
     var shared_secret: [32]u8 = undefined;
     Sha256.hash(&shared_compressed, &shared_secret, .{});
+    defer std.crypto.secureZero(u8, &shared_secret);
 
     // Steps 2-4: verify the packet HMAC in constant time, BEFORE touching
     // hop_payloads' content in any data-dependent way.
-    const mu = keyderive.generateKey(.mu, shared_secret);
+    var mu = keyderive.generateKey(.mu, shared_secret);
+    defer std.crypto.secureZero(u8, &mu);
     var expected_hmac: [hmac_len]u8 = undefined;
     var mac = HmacSha256.init(&mu);
     mac.update(&pkt.hop_payloads);
@@ -427,8 +440,10 @@ pub fn process(node_privkey: [32]u8, pkt: OnionPacket, associated_data: []const 
     // Steps 5-6: deobfuscate `hop_payloads ‖ 0^1300` with a full 2600-byte
     // rho stream — the zero-padded second half becomes raw keystream, i.e.
     // exactly the "revealed tail" the sender's filler generation predicted.
-    const rho = keyderive.generateKey(.rho, shared_secret);
+    var rho = keyderive.generateKey(.rho, shared_secret);
+    defer std.crypto.secureZero(u8, &rho);
     var stream: [2 * hop_payloads_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, &stream);
     keyderive.generateCipherStream(rho, &stream);
     var unwrapped: [2 * hop_payloads_len]u8 = undefined;
     for (unwrapped[0..hop_payloads_len], pkt.hop_payloads, stream[0..hop_payloads_len]) |*u, p, s|
@@ -459,6 +474,7 @@ pub fn process(node_privkey: [32]u8, pkt: OnionPacket, associated_data: []const 
     // Step 9a: blinding_factor = SHA256(compressed(epk) ‖ ss) — the same
     // formula deriveHopSecrets runs sender-side.
     var blinding_factor: [32]u8 = undefined;
+    defer std.crypto.secureZero(u8, &blinding_factor);
     var hasher = Sha256.init(.{});
     hasher.update(&pkt.public_key);
     hasher.update(&shared_secret);

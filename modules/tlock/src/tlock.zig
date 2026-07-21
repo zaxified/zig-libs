@@ -362,7 +362,10 @@ pub fn decrypt(round_signature: g1.Affine, ct: Ciphertext) DecryptError![block_b
 
     // Step 2: sigma = V XOR H2(gid_r) — hashed in drand's Gt
     // representation (the canonical value's cube; see gtToDrandRepr).
+    // `sigma` is pure per-decrypt scratch (BF-IBE's random pad — never part
+    // of the return value), so it is wiped unconditionally at scope exit.
     var sigma = ciphersuite.h2(block_bytes, gtToDrandRepr(gid_r));
+    defer std.crypto.secureZero(u8, &sigma);
     for (&sigma, ct.v) |*b, x| b.* ^= x;
 
     // Step 3: message = W XOR H4(sigma).
@@ -375,10 +378,17 @@ pub fn decrypt(round_signature: g1.Affine, ct: Ciphertext) DecryptError![block_b
     // infinity), matching drand/kyber's `rP.Equal(c.U)`. The check's
     // outcome (accept/reject) is public, so a non-constant-time byte
     // compare is fine here; what must NOT happen is returning a
-    // partially-decrypted message on mismatch.
-    const r_check = ciphersuite.h3(&sigma, &message);
+    // partially-decrypted message on mismatch. `r_check` is pure scratch
+    // (the FO-transform binding scalar, recomputed only to validate `ct.u`)
+    // and is wiped unconditionally; `message` is wiped ONLY on the reject
+    // path below — the success path returns it as the decrypted plaintext.
+    var r_check = ciphersuite.h3(&sigma, &message);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&r_check));
     const u_check = g2.Jacobian.fromAffine(g2.Affine.generator).scalarMul(r_check).toAffine();
     if (!std.mem.eql(u8, &g2.toBytesCompressed(u_check), &g2.toBytesCompressed(ct.u))) {
+        // CCA-reject: never leave a partially/wrongly-decrypted plaintext
+        // resident in memory once it is being discarded as invalid.
+        std.crypto.secureZero(u8, &message);
         return error.FoCheckFailed;
     }
 
