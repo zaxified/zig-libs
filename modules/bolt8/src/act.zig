@@ -168,3 +168,38 @@ test "Act3: 'transport-responder act3 bad version test' — leading 0x01 fails B
 test "Act3: 'transport-responder act3 short read test' — 65 bytes fails ShortRead" {
     try testing.expectError(error.ShortRead, Act3.fromBytes(act3_bytes[0 .. act3_len - 1]));
 }
+
+// ── fuzz: the untrusted-wire handshake framing never panics/OOB ────────────
+
+fn fuzzAct1Decode(_: void, smith: *std.testing.Smith) !void {
+    var buf: [act1_len + 32]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const a = Act1.fromBytes(buf[0..len]) catch return;
+    _ = a.toBytes();
+}
+test "fuzz Act1.fromBytes never panics" {
+    try testing.fuzz({}, fuzzAct1Decode, .{});
+}
+
+fn fuzzAct2Decode(_: void, smith: *std.testing.Smith) !void {
+    var buf: [act2_len + 32]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const a = Act2.fromBytes(buf[0..len]) catch return;
+    _ = a.toBytes();
+}
+test "fuzz Act2.fromBytes never panics" {
+    try testing.fuzz({}, fuzzAct2Decode, .{});
+}
+
+fn fuzzAct3Decode(_: void, smith: *std.testing.Smith) !void {
+    var buf: [act3_len + 32]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const a = Act3.fromBytes(buf[0..len]) catch return;
+    _ = a.toBytes();
+}
+test "fuzz Act3.fromBytes never panics" {
+    try testing.fuzz({}, fuzzAct3Decode, .{});
+}

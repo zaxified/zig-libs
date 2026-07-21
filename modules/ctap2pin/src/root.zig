@@ -328,3 +328,33 @@ test {
     _ = @import("kat_vectors.zig");
     _ = @import("kat_test.zig");
 }
+
+// ── fuzz: untrusted-wire decoders never panic/OOB on arbitrary bytes ──────
+
+fn fuzzPublicKeyToPoint(_: void, smith: *std.testing.Smith) !void {
+    var buf: [64]u8 = undefined;
+    smith.bytes(&buf);
+    const pk = PublicKey{ .x = buf[0..32].*, .y = buf[32..64].* };
+    _ = pk.toPoint() catch return;
+}
+test "fuzz PublicKey.toPoint never panics" {
+    try std.testing.fuzz({}, fuzzPublicKeyToPoint, .{});
+}
+
+fn fuzzTwoDecrypt(_: void, smith: *std.testing.Smith) !void {
+    var key_buf: [Two.shared_secret_length]u8 = undefined;
+    smith.bytes(&key_buf);
+    var cipher_buf: [256]u8 = undefined;
+    smith.bytes(&cipher_buf);
+    const cipher_len: usize = smith.valueRangeAtMost(u16, 0, cipher_buf.len);
+    const ciphertext = cipher_buf[0..cipher_len];
+    // Two.decrypt takes ciphertext.len from the wire; a malformed length
+    // (< iv_length, or not a whole number of blocks past the IV) must
+    // return a typed error, never panic/OOB, before any AES runs.
+    const plaintext_len = Two.decryptedLength(ciphertext.len) catch return;
+    var dst: [256]u8 = undefined;
+    Two.decrypt(key_buf, dst[0..plaintext_len], ciphertext) catch return;
+}
+test "fuzz Two.decrypt never panics" {
+    try std.testing.fuzz({}, fuzzTwoDecrypt, .{});
+}

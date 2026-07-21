@@ -695,3 +695,40 @@ fn frOf(v: u64) Fr {
 fn g1Eql(a: g1.Affine, b: g1.Affine) bool {
     return a.x.eql(b.x) and a.y.eql(b.y) and a.infinity == b.infinity;
 }
+
+// ── fuzz: untrusted-wire decoders never panic/OOB on arbitrary bytes ──────
+
+fn fuzzCredentialDecode(_: void, smith: *std.testing.Smith) !void {
+    var buf: [Credential.encoded_bytes]u8 = undefined;
+    smith.bytes(&buf);
+    const cred = Credential.fromBytes(buf) catch return;
+    _ = cred.toBytes();
+}
+test "fuzz Credential.fromBytes never panics" {
+    try std.testing.fuzz({}, fuzzCredentialDecode, .{});
+}
+
+fn fuzzPartialCredentialDecode(_: void, smith: *std.testing.Smith) !void {
+    var buf: [PartialCredential.encoded_bytes]u8 = undefined;
+    smith.bytes(&buf);
+    const part = PartialCredential.fromBytes(buf) catch return;
+    _ = part.toBytes();
+}
+test "fuzz PartialCredential.fromBytes never panics" {
+    try std.testing.fuzz({}, fuzzPartialCredentialDecode, .{});
+}
+
+fn fuzzShowProofDecode(_: void, smith: *std.testing.Smith) !void {
+    var buf: [1024]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // Self-describing (length-prefixed `q`, then a `disclosed` mask, then a
+    // count of remaining 32-byte scalars derived from the REST of the
+    // buffer) — the classic "attacker-controlled count vs. actual buffer
+    // length" surface. Must never panic/OOB, only return a typed error.
+    const proof = ShowProof.fromBytes(std.testing.allocator, buf[0..len]) catch return;
+    defer proof.deinit(std.testing.allocator);
+}
+test "fuzz ShowProof.fromBytes never panics" {
+    try std.testing.fuzz({}, fuzzShowProofDecode, .{});
+}

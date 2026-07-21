@@ -278,3 +278,40 @@ test "PedersenBroadcast / FeldmanBroadcast codecs round-trip" {
     defer fdec.deinit(allocator);
     try testing.expectEqual(fb.dealer, fdec.dealer);
 }
+
+// ── fuzz: untrusted inter-party wire decoders never panic/OOB ─────────────
+
+fn fuzzPedersenBroadcastDecode(_: void, smith: *std.testing.Smith) !void {
+    var buf: [512]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // The `t` count (bytes[4..8]) is attacker-controlled; the decoder must
+    // reject any length mismatch (`bytes.len != 8 + t*Ne`) BEFORE
+    // allocating — never panic/OOB regardless of the claimed `t`.
+    const pb = PedersenBroadcast.fromBytesAlloc(std.testing.allocator, buf[0..len]) catch return;
+    defer pb.deinit(std.testing.allocator);
+}
+test "fuzz PedersenBroadcast.fromBytesAlloc never panics" {
+    try std.testing.fuzz({}, fuzzPedersenBroadcastDecode, .{});
+}
+
+fn fuzzFeldmanBroadcastDecode(_: void, smith: *std.testing.Smith) !void {
+    var buf: [512]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const fb = FeldmanBroadcast.fromBytesAlloc(std.testing.allocator, buf[0..len]) catch return;
+    defer fb.deinit(std.testing.allocator);
+}
+test "fuzz FeldmanBroadcast.fromBytesAlloc never panics" {
+    try std.testing.fuzz({}, fuzzFeldmanBroadcastDecode, .{});
+}
+
+fn fuzzShareMsgDecode(_: void, smith: *std.testing.Smith) !void {
+    var buf: [ShareMsg.encoded_length]u8 = undefined;
+    smith.bytes(&buf);
+    const msg = ShareMsg.fromBytes(buf) catch return;
+    _ = msg.toBytes();
+}
+test "fuzz ShareMsg.fromBytes never panics" {
+    try std.testing.fuzz({}, fuzzShareMsgDecode, .{});
+}

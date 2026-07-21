@@ -1006,6 +1006,45 @@ test "expandMulti agrees with std HkdfSha512.expand" {
     }
 }
 
+// ── fuzz: untrusted-wire decoders never panic/OOB on arbitrary bytes ──────
+//
+// KE1/KE2/CredentialResponse.fromBytes take a compile-time-fixed-size
+// array (no length ambiguity — the caller/transport layer is responsible
+// for having exactly `encoded_length` bytes) and do plain field slicing
+// with no cryptographic validation of their own, so there is no "too
+// short" case to construct; fuzzing still exercises the full byte-value
+// space of that fixed layout end-to-end (round-trip through toBytes).
+
+fn fuzzKE1Decode(_: void, smith: *std.testing.Smith) !void {
+    var buf: [KE1.encoded_length]u8 = undefined;
+    smith.bytes(&buf);
+    const ke1 = KE1.fromBytes(buf);
+    _ = ke1.toBytes();
+}
+test "fuzz KE1.fromBytes never panics" {
+    try std.testing.fuzz({}, fuzzKE1Decode, .{});
+}
+
+fn fuzzKE2Decode(_: void, smith: *std.testing.Smith) !void {
+    var buf: [KE2.encoded_length]u8 = undefined;
+    smith.bytes(&buf);
+    const ke2 = KE2.fromBytes(buf);
+    _ = ke2.toBytes();
+}
+test "fuzz KE2.fromBytes never panics" {
+    try std.testing.fuzz({}, fuzzKE2Decode, .{});
+}
+
+fn fuzzCredentialResponseDecode(_: void, smith: *std.testing.Smith) !void {
+    var buf: [CredentialResponse.encoded_length]u8 = undefined;
+    smith.bytes(&buf);
+    const cr = CredentialResponse.fromBytes(buf);
+    _ = cr.toBytes();
+}
+test "fuzz CredentialResponse.fromBytes never panics" {
+    try std.testing.fuzz({}, fuzzCredentialResponseDecode, .{});
+}
+
 test "record and message serialization round-trips" {
     var bytes: [KE2.encoded_length]u8 = undefined;
     for (&bytes, 0..) |*b, i| b.* = @truncate(i *% 37 +% 11);

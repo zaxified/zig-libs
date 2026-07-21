@@ -568,3 +568,22 @@ test "HopSecret / ProcessResult field shapes" {
     @memcpy(pr.payload_buf[0..3], &[_]u8{ 1, 2, 3 });
     try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, pr.payload());
 }
+
+// ── fuzz: a hop's full untrusted-wire decode-then-unwrap pipeline ─────────
+
+fn fuzzProcess(_: void, smith: *std.testing.Smith) !void {
+    // The receiving hop's real attack surface: an arbitrary byte string off
+    // the wire, parsed by OnionPacket.fromSlice (public_key/version already
+    // checked there), then unwrapped by process — an attacker-controlled
+    // hop_payloads/hmac must never panic/OOB regardless of how malformed
+    // the resulting bigsize-framed content is.
+    var buf: [packet.packet_len]u8 = undefined;
+    smith.bytes(&buf);
+    const pkt = OnionPacket.fromBytes(buf) catch return;
+    const node_privkey = [_]u8{0x41} ** 32;
+    const result = process(node_privkey, pkt, "") catch return;
+    _ = result.payload();
+}
+test "fuzz process never panics on an arbitrary parsed packet" {
+    try std.testing.fuzz({}, fuzzProcess, .{});
+}

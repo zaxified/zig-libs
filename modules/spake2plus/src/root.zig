@@ -860,6 +860,26 @@ test "mPoint/nPoint parse the RFC 9383 §4 P-256 constants and land on-curve, no
     try std.testing.expect(!std.mem.eql(u8, &m_compressed_sec1, &n_compressed_sec1));
 }
 
+// ── fuzz: the share-decode boundary never panics/OOB on arbitrary bytes ───
+//
+// `proverFinish`/`verifierFinish` both feed a peer-supplied share
+// (`share_v`/`share_p`, arbitrary wire bytes in a live protocol) straight
+// into `P256.fromSec1` before any group-membership check runs — this is
+// the module's actual untrusted-wire decode boundary (RFC 9383 §6's
+// "MUST abort... upon receiving any value V such that..." starts with
+// "does this even parse as a point").
+
+fn fuzzShareDecode(_: void, smith: *std.testing.Smith) !void {
+    var buf: [96]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const point = P256.fromSec1(buf[0..len]) catch return;
+    point.rejectIdentity() catch {};
+}
+test "fuzz P256.fromSec1 (share-decode boundary) never panics" {
+    try std.testing.fuzz({}, fuzzShareDecode, .{});
+}
+
 test "hash/mac wrappers agree with std's own primitives directly (sanity, not a KAT)" {
     const msg = "spake2plus scaffold sanity";
     var want_hash: [32]u8 = undefined;

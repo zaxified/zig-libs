@@ -162,3 +162,16 @@ test "fromBytes rejects an invalid public_key encoding" {
 test "fromSlice rejects the wrong length" {
     try testing.expectError(error.WrongLength, OnionPacket.fromSlice(&.{ 1, 2, 3 }));
 }
+
+// ── fuzz: the untrusted-wire entry point never panics/OOB ──────────────────
+
+fn fuzzOnionPacketDecode(_: void, smith: *std.testing.Smith) !void {
+    var buf: [packet_len + 32]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const pkt = OnionPacket.fromSlice(buf[0..len]) catch return;
+    _ = pkt.toBytes();
+}
+test "fuzz OnionPacket.fromSlice never panics" {
+    try testing.fuzz({}, fuzzOnionPacketDecode, .{});
+}
