@@ -49,12 +49,15 @@
 //! ## What is and isn't handled
 //!
 //! Cached: completed responses (status + optional `Content-Type` + body) with
-//! a TTL and a bounded, W-TinyLFU-evicting store (`ramcache`). **Not** handled:
-//! concurrent first-flights of the same key (two requests that arrive before
-//! either records both execute — there is no in-progress "409 in flight" lock;
-//! the store remembers only *completed* responses), and request-fingerprint
-//! mismatch detection (a client reusing a key with a different body is the
-//! client's bug — the recorded response is returned regardless).
+//! a TTL and a bounded, W-TinyLFU-evicting store (`ramcache`). Concurrent
+//! first-flights of the same key are handled by an **in-flight reservation**:
+//! the first request reserves the key for the duration of its handler, and a
+//! second same-key request arriving before it completes is answered **409**
+//! (already in flight) rather than running the handler a second time — the
+//! client retries once the original finishes and then gets the replay. **Not**
+//! handled: request-fingerprint mismatch detection (a client reusing a key with
+//! a different body is the client's bug — the recorded response is returned
+//! regardless).
 //!
 //! ## Usage
 //!
@@ -62,6 +65,7 @@
 //! var cache = ramcache.Cache.init(gpa, .{ .max_bytes = 8 << 20, .max_entries = 4096 });
 //! defer cache.deinit();
 //! var store = idempotency.Store{ .cache = &cache };
+//! defer store.deinit();
 //! var idem = idempotency.Idempotency{ .store = &store };
 //! try r.use(idem.middleware()); // before the routes it guards
 //!
@@ -83,8 +87,10 @@
 //! cached bytes are copied out under the lock, then written to the socket
 //! lock-free). The scoped key travels middleware→handler in thread-local
 //! storage (the server is task-per-connection: one request at a time per
-//! thread), the same model `requestid` uses. The `Store` and `Idempotency`
-//! must outlive the `Router`, at stable addresses.
+//! thread), the same model `requestid` uses. The in-flight reservation set is
+//! guarded by the same lock; call `Store.deinit()` once when the store is
+//! retired to release it. The `Store` and `Idempotency` must outlive the
+//! `Router`, at stable addresses.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -187,6 +193,61 @@ pub const Store = struct {
     /// Time source for TTL accounting (injected in tests).
     clock: Clock = .monotonic,
     lock: std.atomic.Mutex = .unlocked,
+    /// Keys with a request currently *executing* the handler (reserved on a
+    /// miss, released when the handler returns). A second same-key request
+    /// that arrives while the first is still in flight sees the reservation
+    /// and is rejected (409) rather than running the handler a second time —
+    /// closing the concurrent first-flight double-execution window. Keys are
+    /// `cache.alloc`-owned copies; guarded by `lock`.
+    in_flight: std.StringHashMapUnmanaged(void) = .empty,
+
+    /// Release the in-flight reservation set. Call once when the store is no
+    /// longer used. In steady state the set is empty (every reservation is
+    /// released when its handler returns); this frees the map's backing.
+    pub fn deinit(store: *Store) void {
+        lockSpin(&store.lock);
+        var it = store.in_flight.keyIterator();
+        while (it.next()) |k| store.cache.alloc.free(k.*);
+        store.in_flight.deinit(store.cache.alloc);
+        store.lock.unlock();
+        store.* = undefined;
+    }
+
+    /// The outcome of `beginOrReplay`.
+    pub const Begin = union(enum) {
+        /// A completed response is already recorded — an owned copy of its
+        /// encoded blob (caller frees with the same allocator it passed).
+        replay: []u8,
+        /// Another request holds the reservation for this key: the caller
+        /// must answer 409 (in flight) without running the handler.
+        in_flight,
+        /// This request now owns the reservation and must run the handler,
+        /// then call `finish(key)` exactly once to release it.
+        reserved,
+    };
+
+    /// Atomically (under a single lock) either return a recorded response to
+    /// replay, reject a concurrent in-flight duplicate, or reserve `key` for
+    /// this request. Doing the cache-check and the reservation together is
+    /// what makes the second concurrent first-flight lose the race cleanly.
+    fn beginOrReplay(store: *Store, key: []const u8, gpa: std.mem.Allocator) std.mem.Allocator.Error!Begin {
+        const now = store.clock.now();
+        lockSpin(&store.lock);
+        defer store.lock.unlock();
+        if (store.cache.get(key, now, 0)) |v| return .{ .replay = try gpa.dupe(u8, v) };
+        if (store.in_flight.contains(key)) return .in_flight;
+        const owned = try store.cache.alloc.dupe(u8, key);
+        errdefer store.cache.alloc.free(owned);
+        try store.in_flight.put(store.cache.alloc, owned, {});
+        return .reserved;
+    }
+
+    /// Release the reservation taken by `beginOrReplay` for `key`.
+    fn finish(store: *Store, key: []const u8) void {
+        lockSpin(&store.lock);
+        defer store.lock.unlock();
+        if (store.in_flight.fetchRemove(key)) |kv| store.cache.alloc.free(kv.key);
+    }
 
     /// Write `body` to the response with `status` and optional `content_type`,
     /// **and** record it under the key the middleware exposed for this request
@@ -219,17 +280,6 @@ pub const Store = struct {
         lockSpin(&store.lock);
         defer store.lock.unlock();
         store.cache.put(key, blob, now, store.ttl_ns, 0);
-    }
-
-    /// If `key` has a fresh recorded response, return an owned copy of its
-    /// encoded blob (caller frees with `gpa`); else null. Copied under the lock
-    /// so the caller decodes and writes to the socket lock-free.
-    fn fetchCopy(store: *Store, key: []const u8, gpa: std.mem.Allocator) std.mem.Allocator.Error!?[]u8 {
-        const now = store.clock.now();
-        lockSpin(&store.lock);
-        defer store.lock.unlock();
-        const v = store.cache.get(key, now, 0) orelse return null;
-        return try gpa.dupe(u8, v);
     }
 };
 
@@ -325,27 +375,37 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
         // Too long to scope — degrade to running normally without dedup.
         return next.run(ctx);
 
-    // Replay: a hit writes the recorded response and short-circuits the chain,
-    // so the handler never runs.
-    if (try idem.store.fetchCopy(scoped, idem.store.cache.alloc)) |blob| {
-        defer idem.store.cache.alloc.free(blob);
-        const rec = decode(blob) orelse return next.run(ctx); // corrupt ⇒ re-run
-        ctx.res.setStatus(rec.status);
-        // Stage Content-Type into thread-local storage: setHeader keeps the
-        // slice, but `blob` is freed on return before the head is flushed.
-        if (rec.content_type.len != 0 and rec.content_type.len <= replay_ct_buf.len) {
-            @memcpy(replay_ct_buf[0..rec.content_type.len], rec.content_type);
-            try ctx.res.setHeader("Content-Type", replay_ct_buf[0..rec.content_type.len]);
-        }
-        if (idem.options.replay_header.len != 0)
-            try ctx.res.setHeader(idem.options.replay_header, "true");
-        try ctx.res.writeAll(rec.body); // writeAll copies, so freeing blob after is safe
-        return;
+    // One atomic step: replay a completed response, reject a concurrent
+    // in-flight duplicate (409), or reserve this key and run the handler.
+    switch (try idem.store.beginOrReplay(scoped, idem.store.cache.alloc)) {
+        .replay => |blob| {
+            // A hit writes the recorded response and short-circuits the chain,
+            // so the handler never runs.
+            defer idem.store.cache.alloc.free(blob);
+            const rec = decode(blob) orelse return next.run(ctx); // corrupt ⇒ re-run
+            ctx.res.setStatus(rec.status);
+            // Stage Content-Type into thread-local storage: setHeader keeps the
+            // slice, but `blob` is freed on return before the head is flushed.
+            if (rec.content_type.len != 0 and rec.content_type.len <= replay_ct_buf.len) {
+                @memcpy(replay_ct_buf[0..rec.content_type.len], rec.content_type);
+                try ctx.res.setHeader("Content-Type", replay_ct_buf[0..rec.content_type.len]);
+            }
+            if (idem.options.replay_header.len != 0)
+                try ctx.res.setHeader(idem.options.replay_header, "true");
+            try ctx.res.writeAll(rec.body); // writeAll copies, so freeing blob after is safe
+            return;
+        },
+        .in_flight => return conflict(ctx),
+        .reserved => {},
     }
 
-    // Miss: expose the scoped key for the handler's `respond`, run the chain.
+    // Miss (reserved): expose the scoped key for the handler's `respond`, run
+    // the chain, then release the reservation so a later retry can proceed.
     current_key = scoped;
-    defer current_key = &.{};
+    defer {
+        current_key = &.{};
+        idem.store.finish(scoped);
+    }
     return next.run(ctx);
 }
 
@@ -382,6 +442,15 @@ fn badRequest(ctx: *router.Ctx) anyerror!void {
     ctx.res.setStatus(400);
     try ctx.res.setHeader("Content-Type", "text/plain");
     try ctx.res.writeAll("Invalid Idempotency-Key\n");
+}
+
+/// A same-key request that arrives while the first is still executing the
+/// handler: the RFC/Stripe-recommended answer is 409 Conflict — the client
+/// should retry once the original completes (and then get the replay).
+fn conflict(ctx: *router.Ctx) anyerror!void {
+    ctx.res.setStatus(409);
+    try ctx.res.setHeader("Content-Type", "text/plain");
+    try ctx.res.writeAll("Idempotency-Key request already in flight\n");
 }
 
 fn lockSpin(m: *std.atomic.Mutex) void {
@@ -476,6 +545,7 @@ test "first key runs the handler once; replay returns the cached response withou
     var cache = newCache();
     defer cache.deinit();
     var store = Store{ .cache = &cache };
+    defer store.deinit();
     var app = App{ .store = &store };
     var idem = Idempotency{ .store = &store };
 
@@ -504,10 +574,65 @@ test "first key runs the handler once; replay returns the cached response withou
     try testing.expectEqual(@as(u32, 1), app.calls);
 }
 
+/// Test app for the concurrent first-flight case: while its handler is still
+/// running (still "in flight"), it fires a *second* request with the SAME key
+/// back through the router — standing in for a second connection thread racing
+/// the first. The reservation must make that second request a 409, never a
+/// second handler run.
+const ReentrantApp = struct {
+    store: *Store,
+    r: *router.Router,
+    calls: u32 = 0,
+    second_got_409: bool = false,
+    second_key: []const u8,
+};
+
+fn hReentrant(ctx: *router.Ctx) anyerror!void {
+    const app: *ReentrantApp = @ptrCast(@alignCast(ctx.state.?));
+    app.calls += 1;
+    if (app.calls == 1) {
+        var buf: [2048]u8 = undefined;
+        const resp = runWire(app.r, app.second_key, &buf);
+        app.second_got_409 = std.mem.startsWith(u8, resp, "HTTP/1.1 409");
+    }
+    try app.store.respond(ctx, 201, "application/json", "ok");
+}
+
+test "concurrent first-flight of the same key does not double-run (in-flight 409)" {
+    var cache = newCache();
+    defer cache.deinit();
+    var store = Store{ .cache = &cache };
+    defer store.deinit();
+
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    var app = ReentrantApp{
+        .store = &store,
+        .r = &r,
+        .second_key = reqKey("POST", "/orders", "dup-key"),
+    };
+    r.state = &app;
+    var idem = Idempotency{ .store = &store };
+    try r.use(idem.middleware());
+    try r.post("/orders", hReentrant);
+
+    var buf: [2048]u8 = undefined;
+    const first = runWire(&r, reqKey("POST", "/orders", "dup-key"), &buf);
+
+    // The outer request completes normally…
+    try testing.expect(std.mem.startsWith(u8, first, "HTTP/1.1 201"));
+    // …the handler ran EXACTLY once — the nested same-key request did not
+    // re-enter it (the bug would have made this 2)…
+    try testing.expectEqual(@as(u32, 1), app.calls);
+    // …because the concurrent duplicate was rejected with 409 in-flight.
+    try testing.expect(app.second_got_409);
+}
+
 test "a different key runs the handler again" {
     var cache = newCache();
     defer cache.deinit();
     var store = Store{ .cache = &cache };
+    defer store.deinit();
     var app = App{ .store = &store };
     var idem = Idempotency{ .store = &store };
 
@@ -528,6 +653,7 @@ test "non-idempotent method (GET) bypasses — no caching, handler runs every ti
     var cache = newCache();
     defer cache.deinit();
     var store = Store{ .cache = &cache };
+    defer store.deinit();
     var app = App{ .store = &store };
     var idem = Idempotency{ .store = &store };
 
@@ -552,6 +678,7 @@ test "POST without an Idempotency-Key bypasses — handler runs every time" {
     var cache = newCache();
     defer cache.deinit();
     var store = Store{ .cache = &cache };
+    defer store.deinit();
     var app = App{ .store = &store };
     var idem = Idempotency{ .store = &store };
 
@@ -572,6 +699,7 @@ test "an invalid key answers 400 and the handler never runs" {
     var cache = newCache();
     defer cache.deinit();
     var store = Store{ .cache = &cache };
+    defer store.deinit();
     var app = App{ .store = &store };
     var idem = Idempotency{ .store = &store };
 
@@ -592,6 +720,7 @@ test "target scope: the same key on a different path does not cross-replay" {
     var cache = newCache();
     defer cache.deinit();
     var store = Store{ .cache = &cache };
+    defer store.deinit();
     var app = App{ .store = &store };
     var idem = Idempotency{ .store = &store }; // default scope = .target
 
@@ -621,6 +750,7 @@ test "TTL expiry: after the recorded response expires, the handler re-runs" {
     var cache = newCache();
     defer cache.deinit();
     var store = Store{ .cache = &cache, .clock = clk.clock(), .ttl_ns = 100 };
+    defer store.deinit();
     var app = App{ .store = &store };
     var idem = Idempotency{ .store = &store };
 
