@@ -187,12 +187,36 @@ pub const MixHeader = struct {
         }
     }
 
-    pub fn decode(payload: []const u8) MixHeader {
+    pub const DecodeError = error{MalformedMixHeader};
+
+    /// Fail-closed decode: validate every length/field against the buffer
+    /// BEFORE indexing, so a hostile or truncated payload yields a clean error
+    /// instead of an out-of-bounds read / UB. In the sim `decode` only ever
+    /// sees self-encoded buffers, but a mixnet header is exactly the kind of
+    /// attacker-controlled input that must never be trusted blindly.
+    pub fn decode(payload: []const u8) DecodeError!MixHeader {
+        if (payload.len < wire_len) return error.MalformedMixHeader;
+        const kind: MsgKind = switch (payload[0]) {
+            @intFromEnum(MsgKind.real) => .real,
+            @intFromEnum(MsgKind.loop_cover) => .loop_cover,
+            @intFromEnum(MsgKind.drop_cover) => .drop_cover,
+            else => return error.MalformedMixHeader,
+        };
+        const hop = payload[9];
+        const n_hops = payload[10];
+        // `route[0..n_hops]` are the mixes and `route[n_hops]` is the
+        // destination client, so `n_hops` must leave room for the destination
+        // (`n_hops <= max_layers`, i.e. `< max_hops`) and `hop` must not run
+        // past the last mix — otherwise `currentMix`/`nextHop` would index the
+        // fixed route array out of range.
+        if (n_hops > max_layers) return error.MalformedMixHeader;
+        if (hop > n_hops) return error.MalformedMixHeader;
+
         var h = MixHeader{
-            .kind = @enumFromInt(payload[0]),
+            .kind = kind,
             .id = std.mem.readInt(u64, payload[1..9], .little),
-            .hop = payload[9],
-            .n_hops = payload[10],
+            .hop = hop,
+            .n_hops = n_hops,
             .route = undefined,
         };
         var off: usize = 11;
@@ -252,7 +276,7 @@ test "MixHeader round-trips through its fixed-size wire encoding" {
     h.route[3] = 11; // dest client
     var buf: [MixHeader.wire_len]u8 = undefined;
     h.encode(&buf);
-    const g = MixHeader.decode(&buf);
+    const g = try MixHeader.decode(&buf);
     try testing.expectEqual(MsgKind.loop_cover, g.kind);
     try testing.expectEqual(@as(u64, 0xDEADBEEFCAFE), g.id);
     try testing.expectEqual(@as(u8, 2), g.hop);
@@ -260,4 +284,46 @@ test "MixHeader round-trips through its fixed-size wire encoding" {
     try testing.expectEqual(@as(NodeId, 7), g.currentMix()); // route[2]
     try testing.expectEqual(@as(NodeId, 11), g.nextHop()); // route[3] = dest
     try testing.expect(g.atLastMix());
+}
+
+test "MixHeader.decode fails closed on truncated / malformed input, never OOB" {
+    // Every buffer shorter than the wire size is rejected cleanly — no
+    // out-of-bounds read / panic on hostile bytes (checked under ReleaseSafe).
+    var full: [MixHeader.wire_len]u8 = undefined;
+    @memset(&full, 0);
+    full[0] = @intFromEnum(MsgKind.real);
+    var i: usize = 0;
+    while (i < MixHeader.wire_len) : (i += 1) {
+        try testing.expectError(error.MalformedMixHeader, MixHeader.decode(full[0..i]));
+    }
+
+    // Full length but an invalid message-kind byte.
+    var bad_kind: [MixHeader.wire_len]u8 = undefined;
+    @memset(&bad_kind, 0);
+    bad_kind[0] = 0x7F; // not a valid MsgKind
+    try testing.expectError(error.MalformedMixHeader, MixHeader.decode(&bad_kind));
+
+    // n_hops past the route capacity would let currentMix/nextHop over-index.
+    var bad_nhops: [MixHeader.wire_len]u8 = undefined;
+    @memset(&bad_nhops, 0);
+    bad_nhops[0] = @intFromEnum(MsgKind.real);
+    bad_nhops[10] = max_layers + 1;
+    try testing.expectError(error.MalformedMixHeader, MixHeader.decode(&bad_nhops));
+
+    // hop running past n_hops is likewise rejected.
+    var bad_hop: [MixHeader.wire_len]u8 = undefined;
+    @memset(&bad_hop, 0);
+    bad_hop[0] = @intFromEnum(MsgKind.real);
+    bad_hop[10] = 3; // n_hops
+    bad_hop[9] = 4; // hop > n_hops
+    try testing.expectError(error.MalformedMixHeader, MixHeader.decode(&bad_hop));
+
+    // A well-formed header still decodes at the boundary (n_hops == max_layers).
+    var h = MixHeader{ .kind = .real, .id = 42, .hop = max_layers, .n_hops = max_layers, .route = undefined };
+    @memset(&h.route, 0);
+    var buf: [MixHeader.wire_len]u8 = undefined;
+    h.encode(&buf);
+    const g = try MixHeader.decode(&buf);
+    try testing.expectEqual(MsgKind.real, g.kind);
+    try testing.expectEqual(@as(u8, max_layers), g.n_hops);
 }

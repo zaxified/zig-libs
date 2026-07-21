@@ -168,7 +168,7 @@ const Relay = struct {
     /// time) and arm a release timer for `hold` ticks. On release THAT packet
     /// is forwarded and its completed transit is logged.
     fn stashAndArm(self: *Relay, sim: *Sim, node: NodeId, payload: []const u8, hold: Time) anyerror!void {
-        const hdr = MixHeader.decode(payload);
+        const hdr = try MixHeader.decode(payload);
         const now = sim.timeNow();
         try self.queues[node].append(self.gpa, .{ .arrival = now, .release_at = now + hold, .hdr = hdr });
         try sim.setTimer(node, hold, RELEASE_TIMER);
