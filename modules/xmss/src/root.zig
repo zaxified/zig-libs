@@ -862,6 +862,44 @@ test "base-w + checksum example (§2.6: 0x1234 -> 1,2,3,4)" {
     try std.testing.expectEqualSlices(u8, &.{ 3, 11, 6 }, digits[wots_len1..]);
 }
 
+test "stateful discipline: sign advances idx, never repeats, fails closed when exhausted" {
+    // Reduced height h = 4 (16 one-time keys) — full lifecycle in ~ms.
+    const X = XmssSha2(4, 0xDDDDDDDD);
+    var sk_seed: [n]u8 = undefined;
+    var sk_prf: [n]u8 = undefined;
+    var pub_seed: [n]u8 = undefined;
+    for (&sk_seed, 0..) |*b, i| b.* = @truncate(i + 1);
+    for (&sk_prf, 0..) |*b, i| b.* = @truncate(i + 101);
+    for (&pub_seed, 0..) |*b, i| b.* = @truncate(i + 201);
+    var kp = X.keyGen(sk_seed, sk_prf, pub_seed);
+
+    var sig: [X.signature_length]u8 = undefined;
+    var seen = [_]bool{false} ** X.max_signatures;
+    var k: u32 = 0;
+    while (k < X.max_signatures) : (k += 1) {
+        // `idx` is the NEXT unused leaf before signing.
+        try std.testing.expectEqual(k, kp.sk.idx);
+        try X.sign(&kp.sk, &sig, "message");
+        // The wire index equals the leaf that was just consumed …
+        const wire_idx = std.mem.readInt(u32, sig[0..4], .big);
+        try std.testing.expectEqual(k, wire_idx);
+        // … which must never have been used before (no silent reuse) …
+        try std.testing.expect(!seen[wire_idx]);
+        seen[wire_idx] = true;
+        // … and the state advanced by exactly one.
+        try std.testing.expectEqual(k + 1, kp.sk.idx);
+        // Every emitted signature verifies under the public key.
+        try std.testing.expect(X.verify(kp.pk, "message", &sig));
+    }
+
+    // All 2^h one-time keys consumed: further signing fails closed, and the
+    // index neither wraps nor rolls back to a reusable leaf.
+    try std.testing.expectError(error.KeyExhausted, X.sign(&kp.sk, &sig, "message"));
+    try std.testing.expectEqual(@as(u32, X.max_signatures), kp.sk.idx);
+    try std.testing.expectError(error.KeyExhausted, X.sign(&kp.sk, &sig, "message"));
+    try std.testing.expectEqual(@as(u32, X.max_signatures), kp.sk.idx);
+}
+
 test {
     _ = @import("kat_vectors.zig");
     _ = @import("kat_test.zig");
