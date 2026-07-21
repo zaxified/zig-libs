@@ -97,6 +97,7 @@ const module_list = [_]Module{
     .{ .name = "datefmt" },
     .{ .name = "diagnostics" },
     .{ .name = "json5" },
+    .{ .name = "cbor" },
     .{ .name = "zipstream" },
     .{ .name = "tz", .deps = &.{"datefmt"} },
     .{ .name = "pollworker" },

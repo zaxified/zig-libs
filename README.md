@@ -11,7 +11,7 @@ cross-project-reusable capability — a production-grade implementation of a pro
 or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
 authors' other projects depend on it, not the reverse.
 
-**Status:** 148 modules · 4538 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 149 modules · 4567 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ## Using a module
@@ -238,6 +238,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `csvstream` | Streaming RFC 4180 CSV reader that preserves byte offsets, bounded memory regardless of file size | any | — |
 | `csvsafe` | OWASP CSV formula-injection guard (`=`/`+`/`-`/`@` cell leads) | any | — |
 | `json5` | Single-pass JSON5→JSON preprocessor (comments, unquoted keys, trailing commas, single-quoted strings) | any | — |
+| `cbor` | **CBOR (RFC 8949) codec** — decode/encode all 8 major types, definite + indefinite length, a `canonical` deterministic-encoding option (§4.2.1 bytewise map-key sort); untrusted-input hardened (depth cap, no pre-alloc on a declared length). Plus a minimal **COSE (RFC 9052)** layer: `COSE_Key` (EC2/OKP) parse/build and `COSE_Sign1` parse/build + `Sig_structure` bytes — the keystone under WebAuthn/FIDO2 and general COSE | any | — |
 | `zipstream` | Streaming ZIP archive reader — walk the central directory once, stream decompressed member bytes on demand | any | — |
 | `encoding` | Legacy single-byte code page ↔ UTF-8 transcoding (5 European code pages: windows-125x, ISO-8859-1/2/15) | any | — |
 | `datefmt` | Civil calendar + token-based date/time parse/format + calendar arithmetic, correct before 1970 | any | — |
