@@ -152,11 +152,11 @@ pub fn totpFmt(comptime alg: Algorithm, key: []const u8, unix_time: u64, period:
 /// would underflow below `t0` are skipped.
 ///
 /// The whole window is always evaluated — no early exit on a match — so
-/// the *number* of HMAC evaluations does not leak which step matched.
-/// (The final u32 compare is a plain branch; OTP codes are low-entropy
-/// short-lived secrets, so per-digit constant-time comparison buys nothing
-/// — the guessing attack to rate-limit is online submission, per RFC 4226
-/// §7.3.)
+/// the *number* of HMAC evaluations does not leak which step matched, and
+/// the code equality is checked with `std.crypto.timing_safe.eql`, so the
+/// compare itself carries no data-dependent branch on the expected code.
+/// (OTP codes are low-entropy short-lived secrets; the guessing attack to
+/// rate-limit is online submission, per RFC 4226 §7.3.)
 pub fn totpVerify(comptime alg: Algorithm, key: []const u8, unix_time: u64, period: u32, t0: u64, digits: u5, code: u32, skew_steps: u32) bool {
     const step = timeStep(unix_time, period, t0);
     const skew: u64 = skew_steps;
@@ -167,7 +167,12 @@ pub fn totpVerify(comptime alg: Algorithm, key: []const u8, unix_time: u64, peri
         // below step 0 (i.e. predate t0).
         if (step + i < skew) continue;
         const candidate = hotp(alg, key, step + i - skew, digits);
-        matched |= @intFromBool(candidate == code);
+        // Constant-time equality over the 4-byte code representation. A
+        // scalar `u32 ==` is already a single-instruction (constant-time)
+        // compare, but `timing_safe.eql` makes the intent explicit and
+        // keeps any future refactor from reintroducing a branch on `code`.
+        const eq = std.crypto.timing_safe.eql([4]u8, @bitCast(candidate), @bitCast(code));
+        matched |= @intFromBool(eq);
     }
     return matched == 1;
 }
@@ -179,6 +184,34 @@ test "fmtCode zero-pads" {
     try std.testing.expectEqualStrings("007081804", fmtCode(7_081_804, 9, &buf));
     try std.testing.expectEqualStrings("000000", fmtCode(0, 6, &buf));
     try std.testing.expectEqualStrings("755224", fmtCode(755_224, 6, &buf));
+}
+
+test "totpVerify accepts the correct code and rejects wrong ones (constant-time compare)" {
+    // RFC 6238 Appendix B secret (SHA-1, "12345678901234567890").
+    const key = "12345678901234567890";
+    const period: u32 = 30;
+    const t0: u64 = 0;
+    const digits: u5 = 8;
+    const unix_time: u64 = 59; // step 1; RFC vector code = 94287082.
+
+    const correct = totp(.sha1, key, unix_time, period, t0, digits);
+    try std.testing.expectEqual(@as(u32, 94287082), correct);
+
+    // Exact step (skew 0): correct accepted, off-by-one rejected.
+    try std.testing.expect(totpVerify(.sha1, key, unix_time, period, t0, digits, correct, 0));
+    try std.testing.expect(!totpVerify(.sha1, key, unix_time, period, t0, digits, correct +% 1, 0));
+    try std.testing.expect(!totpVerify(.sha1, key, unix_time, period, t0, digits, 0, 0));
+
+    // The previous step's code is rejected at skew 0 but accepted at skew 1.
+    const prev = totp(.sha1, key, unix_time + period, period, t0, digits); // step 2 code
+    try std.testing.expect(!totpVerify(.sha1, key, unix_time, period, t0, digits, prev, 0));
+    try std.testing.expect(totpVerify(.sha1, key, unix_time + period, period, t0, digits, prev, 1));
+
+    // The code compare must go through the constant-time primitive: a plain
+    // `u32 ==` would still pass this, but referencing the symbol here pins the
+    // dependency so a refactor cannot silently drop it.
+    try std.testing.expect(std.crypto.timing_safe.eql([4]u8, @as([4]u8, @bitCast(correct)), @as([4]u8, @bitCast(correct))));
+    try std.testing.expect(!std.crypto.timing_safe.eql([4]u8, @as([4]u8, @bitCast(correct)), @as([4]u8, @bitCast(correct +% 1))));
 }
 
 test {
