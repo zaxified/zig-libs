@@ -39,21 +39,19 @@
 //!     TSval wraparound concerns that a subtraction/ordering-based
 //!     comparison would have to reason about.
 //!
-//! **Status: harness complete, core is a Fable stub.** The bounded
+//! **Status: complete — harness and core both implemented.** The bounded
 //! `TsTable` (`table.zig`, full test suite: insert/lookup/remove/aging/
 //! capacity-eviction-primitives/bounded-memory-under-a-long-stream), the TCP
 //! Timestamps option parser (`parse.zig`, KAT corpus + a fuzz-style hostile-
 //! input test proving it never reads out of bounds), and this file's
 //! `Estimator` shell (construction, reset, table-occupancy accessors) are
-//! all real and pass today. The ONE thing that is NOT implemented is the
-//! irreducible algorithm itself: **`match.matchEcho`** (`src/match.zig`), a
-//! `@panic("TODO(fable/core): ...")` stub — see that function's doc comment
-//! for the full, unambiguous contract a Fable pass must satisfy (first-echo
+//! all real and pass today. The irreducible algorithm itself,
+//! **`match.matchEcho`** (`src/match.zig`), is also implemented (no longer a
+//! stub) per the full contract documented on that function (first-echo
 //! consume, exact-value match, insert-if-first, aging-before-capacity-
-//! eviction). Tests that would call it transitively (via `Estimator.observe`
-//! — see `kat.zig` / `property.zig`) are gated behind
-//! `gate.fable_core_implemented` and report **SKIP**, not PASS, until that
-//! flag flips.
+//! eviction). `gate.fable_core_implemented` is `true`, so the tests that
+//! call it transitively (via `Estimator.observe` — see `kat.zig` /
+//! `property.zig`) run for real and report PASS, not SKIP.
 //!
 //! Provenance: models the Pollere pping technique (Kathleen Nichols,
 //! <https://github.com/pollere/pping>) and RFC 7323 (TCP Extensions for

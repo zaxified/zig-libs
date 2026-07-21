@@ -69,7 +69,14 @@ pub const EnvMode = enum {
     merge,
 };
 
-/// A process to run. `argv[0]` is resolved via `PATH` if it has no '/'.
+/// A process to run. `argv[0]` is resolved via `PATH` if it has no '/' —
+/// prefer an absolute `argv[0]` when the caller controls it, to avoid PATH-
+/// resolution ambiguity entirely. Note that this PATH lookup ALWAYS reads
+/// from the real parent process environment, regardless of `env_mode`: even
+/// under `.clear` (child gets only `Spec.env`) or `.merge`, the `PATH` used
+/// to resolve `argv[0]` is the parent's actual `PATH`, not whatever `PATH`
+/// ends up in the child's environment (`std.process.SpawnOptions.
+/// environ_map`'s `PATH` is never consulted for this resolution).
 pub const Spec = struct {
     argv: []const []const u8,
     /// Overriding / explicit environment. Interpreted per `env_mode`.
@@ -278,6 +285,11 @@ fn spawnChild(gpa: std.mem.Allocator, io: std.Io, spec: Spec) !std.process.Child
 
     const cwd: std.process.Child.Cwd = if (spec.cwd) |p| .{ .path = p } else .inherit;
 
+    // fd-hygiene note: any parent fd NOT marked FD_CLOEXEC is inherited by
+    // the child across this spawn — `Spec` only controls stdin/stdout/stderr
+    // (`StdioMode`), it does not close arbitrary other open fds. Callers that
+    // hold sensitive fds open (sockets, secret-bearing files, …) must set
+    // FD_CLOEXEC on them themselves if the child must not inherit them.
     return std.process.spawn(io, .{
         .argv = spec.argv,
         .cwd = cwd,

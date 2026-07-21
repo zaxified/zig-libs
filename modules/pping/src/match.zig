@@ -4,10 +4,9 @@
 //! FABLE CORE. Everything else in `pping` (the bounded `TsTable` in
 //! `table.zig`, the TCP Timestamps option parser in `parse.zig`, the
 //! `Estimator` shell in `root.zig`) is mechanical plumbing built and fully
-//! tested around this ONE seam. `matchEcho` is a `@panic("TODO(fable/core):
-//! ...")` stub until a Fable pass fills it in; every test that would reach
-//! it is gated behind `gate.fable_core_implemented` and reports SKIP, not
-//! PASS, until that flag flips (see `gate.zig`).
+//! tested around this ONE seam. **Status: implemented** — `matchEcho` is no
+//! longer a stub; `gate.fable_core_implemented` is `true` (see `gate.zig`),
+//! so every test that reaches it runs for real and reports PASS, not SKIP.
 //!
 //! **Why this is the hard part, and what a naive implementation gets
 //! wrong:** Pollere's pping observes RTT for free from a TCP flow's own

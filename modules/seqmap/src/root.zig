@@ -12,7 +12,14 @@
 //!
 //! One allocation at `init` (the slot table); `add`/`fetch`/`release` never
 //! allocate. Pure logic, portable — usable by any protocol that correlates
-//! replies via a 16-bit id (ICMP echo, DNS ids, …).
+//! replies via a 16-bit id handed out round-robin (e.g. ICMP echo sequence
+//! numbers).
+//!
+//! **Not for security-sensitive ids.** Allocation is sequential/predictable
+//! by design (that's what makes it O(1) and allocation-free) — it must NOT
+//! be used to generate ids that need to be unpredictable to an attacker
+//! (e.g. DNS transaction ids, where a guessable id enables cache-poisoning
+//! / response-spoofing). Use a CSPRNG-backed allocator for those.
 
 const std = @import("std");
 

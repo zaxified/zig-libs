@@ -9,16 +9,16 @@
 //! duplicate/loop injection). Model-checked in `netsim` under partition/heal schedules
 //! with explicit bounded-badness claims. Split-horizon prevents same-segment reflection.
 //!
-//! **Status: harness complete, core is a Fable stub.** The `netsim.Protocol`
-//! consumer (Hello + BUM flooding, `protocol.zig`), both zero-tolerance
-//! invariant checks and the bounded-DF-window post-run analyzer
-//! (`checks.zig`), the property/shrink/teeth test harness, and a
+//! **Status: complete — harness and core both implemented.** The
+//! `netsim.Protocol` consumer (Hello + BUM flooding, `protocol.zig`), both
+//! zero-tolerance invariant checks and the bounded-DF-window post-run
+//! analyzer (`checks.zig`), the property/shrink/teeth test harness, and a
 //! deliberately-broken positive control (`protocol.BrokenAlwaysDf`) are all
-//! real and pass today. The one thing that is NOT implemented is the
-//! irreducible algorithm itself — `election.decide` — a
-//! `@panic("TODO(fable/core): ...")` stub (see `election.zig`). Tests that
-//! would call it transitively are gated behind `gate.fable_core_implemented`
-//! and report SKIP, not PASS, until that flag flips.
+//! real and pass today. The irreducible algorithm itself — `election.decide`
+//! (see `election.zig`) — is also implemented (no longer a stub); `gate.
+//! fable_core_implemented` is `true`, so the tests that drive `DfElect`
+//! through netsim's partition/heal fuzzer run for real and report PASS, not
+//! SKIP.
 
 const std = @import("std");
 const netsim = @import("netsim");

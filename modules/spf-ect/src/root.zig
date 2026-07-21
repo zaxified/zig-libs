@@ -3,8 +3,10 @@
 //!
 //! Dijkstra shortest-path plus a totally-ordered, direction-independent tie-break
 //! (the SPB/802.1aq ECT idea, portable to IP/ECMP) so that path(A→B) is always the
-//! reverse of path(B→A), and a maximally-disjoint second-tree variant (PRP mode).
-//! Pure graph algorithm, zero I/O. Shared kernel of the SPB simulator (S1) and the
+//! reverse of path(B→A), and a disjointness-minimizing second-tree variant (PRP
+//! mode) — a greedy, equal-cost tie-break that steers onto unused links wherever
+//! the graph offers one, not a max-flow disjoint-path guarantee. Pure graph
+//! algorithm, zero I/O. Shared kernel of the SPB simulator (S1) and the
 //! encrypted SCADA L2VPN fabric (S1b). See ~/CML/S1B-scada-l2vpn-venture-plan.md §5/§9.
 //!
 //! **Status: complete — both tiers implemented and property-tested.**
@@ -21,7 +23,7 @@
 //!   edge multiset, and a forward-order totality backstop reachable only at
 //!   identical sequences. The first two keys are preserved by path reversal, which
 //!   is what makes `path(a, b) == reverse(path(b, a))`; `comparePathsDisjoint` adds
-//!   a leading primary-tree overlap key for the maximally-disjoint PRP second tree.
+//!   a leading primary-tree overlap key for the overlap-minimizing PRP second tree.
 //! - **Tests.** The property-test harness (symmetry, strict total order,
 //!   brute-force `<=7`-node cross-check, disjoint-tree validity + disjointness)
 //!   passes in full in both Debug and ReleaseFast.
@@ -397,11 +399,13 @@ fn orderItemMultisets(comptime kind: PathItem, a: Path, b: Path) Order {
 /// Secondary tie-break used to build `disjointTrees`' second ("backup"/PRP)
 /// tree. Same strict-total-order + reversal-invariance contract as
 /// `comparePaths` (see its doc comment), PLUS it should prefer candidates
-/// that reuse fewer of `primary`'s tree edges, so the resulting tree is
-/// maximally link-disjoint from `primary` — 802.1aq defines a second ECT
-/// algorithm for exactly this (its 16-way multi-tree scheme alternates
-/// "low path id" / "high path id" variants); PRP/HSR-style dual delivery
-/// just needs two, as disjoint as the topology allows.
+/// that reuse fewer of `primary`'s tree edges, so the resulting tree overlaps
+/// `primary` as little as tie-breaking among equal-cost paths allows —
+/// 802.1aq defines a second ECT algorithm for exactly this (its 16-way
+/// multi-tree scheme alternates "low path id" / "high path id" variants);
+/// PRP/HSR-style dual delivery just needs two, as disjoint as the topology
+/// and its equal-cost alternatives allow (this is a greedy heuristic, not a
+/// guarantee of graph-theoretic maximum edge-disjointness).
 ///
 /// `primary` is a FINISHED tree (`shortestPathTree` already returned) by
 /// the time this is called — inspect `primary.pred`/`primary.dist` freely,
@@ -577,8 +581,9 @@ pub fn shortestPath(gpa: Allocator, graph: *const Graph, a: NodeId, b: NodeId) (
 }
 
 /// Two shortest-path trees rooted at `root`: `[0]` is the primary tree
-/// (`comparePaths`), `[1]` is the maximally-disjoint secondary/backup tree
-/// (`comparePathsDisjoint`, PRP mode). Both are caller-owned — `deinit`
+/// (`comparePaths`), `[1]` is the overlap-minimizing secondary/backup tree
+/// (`comparePathsDisjoint`, PRP mode — see its doc comment for what
+/// guarantee this is and isn't). Both are caller-owned — `deinit`
 /// each independently.
 pub fn disjointTrees(gpa: Allocator, graph: *const Graph, root: NodeId) Allocator.Error![2]Tree {
     var primary = try shortestPathTree(gpa, graph, root);
