@@ -6,7 +6,8 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
 
 - **Layered, offline core first:** parse+claims (P1) → HS/ES/EdDSA verify (P2) → RS256/384/512
   (P3) → JWKS by-`kid` (P4) → networked `Provider` = OIDC discovery + JWKS fetch + cache (P5) →
-  `ResourceServer` `router` middleware (P6) → OAuth2/OIDC relying-party flow (P7). P1–P4 do no I/O
+  `ResourceServer` `router` middleware **+ framework-agnostic `Guard`** (P6) → OAuth2/OIDC
+  relying-party flow (P7). P1–P4 do no I/O
   and have no `http` dep in the hot path; only `Provider`/`HttpFetcher` reach the network, behind a
   `Fetcher` seam. P7 also does no I/O — it builds requests and parses responses; the caller's HTTP
   client sends the request (same seam philosophy as P5's `Fetcher`).
@@ -37,6 +38,21 @@ This is the security core; the defenses are the point:
 - **Claims:** `exp`/`nbf`/`iat` validated against an injected clock with configurable skew; scope
   enforced by P6 → 403 `insufficient_scope`, missing/invalid credential → 401 `invalid_token`
   (RFC 6750 challenge). HMAC compares are constant-time (`std.crypto`).
+- **Resource-server surface (P6):** two entry points over the *same* `Provider.verify` — no
+  crypto is duplicated. `ResourceServer` is the `router`-native middleware (attaches a borrowed
+  `Identity` to `ctx.data`). `Guard` is the framework-agnostic form: `authenticate(req)` returns an
+  owned `AuthContext` (principal = `sub`/`claims`/scopes) or a structured `AuthError`
+  (`MissingToken`/`InvalidToken` → 401, `InsufficientScope` → 403, `OutOfMemory` → 500 via
+  `authStatus`); `challengeFor` yields the precomputed `WWW-Authenticate` value. Both build their
+  challenge strings with the public `writeBearerChallenge` helper (RFC 6750 §3 formatting).
+- **Scope model:** granted scopes are read from BOTH the space-delimited `scope` string (RFC 6749
+  §3.3 / RFC 8693, the form RFC 9068 §2.2.3 uses) and the `scp` claim (JSON-array or space-string,
+  RFC 9068 examples / Microsoft-identity). Standalone helpers `scopeGranted` /
+  `requireScope` / `requireAllScopes` / `requireAnyScope` operate on a `Claims`; `Guard` /
+  `ResourceServer` enforce a conjunction via `required_scopes`.
+- **RFC 9068 `at+jwt` typ (optional):** `Guard.require_at_jwt_typ` enforces the access-token JOSE
+  header `typ` = `at+jwt` (or `application/at+jwt`, case-insensitive). Off by default — many issuers
+  still omit it — so it is a conscious opt-in, not a silent gate.
 - **Mandatory audience/issuer — confused deputy (RFC 8725 §3.9), FIXED 2026-07-09:** `iss` and
   `aud` validation are safe-by-default and cannot be skipped by omission. `Options.issuer`/
   `Options.audience` are typed unions (`IssuerPolicy`/`AudiencePolicy`) with **no default** —
@@ -88,8 +104,11 @@ RFC known-answer vectors transcribed from the RFCs: JWS 7515 A.1 (HS256) / A.2 (
 byte-exact); plus adversarial negatives (alg=none, alg-confusion downgrade, kid mismatch,
 embedded-jwk ignored, expired/nbf, tampered signature, mandatory-audience confused-deputy
 rejection, oct-from-network refusal, ID-token nonce-mismatch positive control, azp/iss/aud/exp
-rejection) and Provider cache/rotation/TTL tests behind a scripted fetcher. 78 tests. Run:
-`zig build test-jwt`.
+rejection) and Provider cache/rotation/TTL tests behind a scripted fetcher. The P6 resource-server
+guard adds self-constructed policy tests (own signer, not external interop KATs — the correct
+approach for policy logic): `Guard.authenticate` valid/missing/garbage/expired/insufficient/
+alg=none/RS→HS-confusion decisions, RFC 9068 `at+jwt` typ on/off, `scope`+`scp` scope helpers
+(single/all/any), and `writeBearerChallenge` header formatting. 82 tests. Run: `zig build test-jwt`.
 
 ## Backlog / deferred
 

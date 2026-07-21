@@ -1708,11 +1708,10 @@ pub const Identity = struct {
         return .{ .rest = id.token.claims.claimStr("scope") orelse "" };
     }
 
-    /// Whether the granted scopes include `want` (exact token match).
+    /// Whether the granted scopes include `want` (exact token match). Checks
+    /// both the `scope` string and the `scp` claim — see `scopeGranted`.
     pub fn hasScope(id: Identity, want: []const u8) bool {
-        var it = id.scopes();
-        while (it.next()) |s| if (std.mem.eql(u8, s, want)) return true;
-        return false;
+        return scopeGranted(id.token.claims, want);
     }
 };
 
@@ -1730,6 +1729,58 @@ pub const ScopeIter = struct {
         return tok;
     }
 };
+
+/// Whether `claims` grants the scope `want`. An access token may carry its
+/// authorized scopes two ways, and both are checked (case-sensitive, exact
+/// token match):
+///   * `scope` — the space-delimited string of RFC 6749 §3.3 / RFC 8693 §4.2,
+///     the representation RFC 9068 §2.2.3 prescribes for `at+jwt`; and
+///   * `scp`   — used by some issuers (notably Microsoft identity platform)
+///     and appearing in RFC 9068's own examples; either a JSON array of
+///     strings or a single space-delimited string.
+/// An empty `want` never matches.
+pub fn scopeGranted(claims: Claims, want: []const u8) bool {
+    if (want.len == 0) return false;
+    if (claims.claimStr("scope")) |s| {
+        var it: ScopeIter = .{ .rest = s };
+        while (it.next()) |tok| if (std.mem.eql(u8, tok, want)) return true;
+    }
+    if (claims.claim("scp")) |v| switch (v) {
+        .array => |arr| for (arr.items) |el| switch (el) {
+            .string => |es| if (std.mem.eql(u8, es, want)) return true,
+            else => {},
+        },
+        .string => |s| {
+            var it: ScopeIter = .{ .rest = s };
+            while (it.next()) |tok| if (std.mem.eql(u8, tok, want)) return true;
+        },
+        else => {},
+    };
+    return false;
+}
+
+/// Raised by the `require*Scope*` helpers when the granted scopes do not
+/// satisfy the policy. Maps to RFC 6750 §3.1 `insufficient_scope` (HTTP 403).
+pub const ScopeError = error{InsufficientScope};
+
+/// Require the single scope `want` (RFC 6750 §3.1).
+pub fn requireScope(claims: Claims, want: []const u8) ScopeError!void {
+    if (!scopeGranted(claims, want)) return error.InsufficientScope;
+}
+
+/// Require EVERY scope in `wants` (conjunction). An empty `wants` is a no-op
+/// (no scope constraint) — a granted scope set is unordered (RFC 6749 §3.3).
+pub fn requireAllScopes(claims: Claims, wants: []const []const u8) ScopeError!void {
+    for (wants) |w| if (!scopeGranted(claims, w)) return error.InsufficientScope;
+}
+
+/// Require AT LEAST ONE scope in `wants` (disjunction). An empty `wants` is a
+/// no-op (no scope constraint), matching `requireAllScopes`.
+pub fn requireAnyScope(claims: Claims, wants: []const []const u8) ScopeError!void {
+    if (wants.len == 0) return;
+    for (wants) |w| if (scopeGranted(claims, w)) return;
+    return error.InsufficientScope;
+}
 
 /// Retrieve the `Identity` a `ResourceServer` attached, or null (out-of-scope
 /// method, or no such middleware ran). Only valid inside the middleware's inner
@@ -1791,44 +1842,31 @@ pub const ResourceServer = struct {
     pub const InitError = error{ OutOfMemory, InvalidRealm };
 
     pub fn init(gpa: std.mem.Allocator, options: ResourceServer.Options) InitError!ResourceServer {
-        if (options.realm) |r| {
-            for (r) |c| if (c == '"' or c == '\r' or c == '\n' or c == 0) return error.InvalidRealm;
-        }
-        const realm_part: []const u8 = if (options.realm) |r|
-            try std.fmt.allocPrint(gpa, " realm=\"{s}\"", .{r})
-        else
-            "";
-        defer if (realm_part.len != 0) gpa.free(realm_part);
+        if (options.realm) |r| try validateRealm(r);
 
-        const challenge_missing = try std.fmt.allocPrint(gpa, "Bearer{s}", .{realm_part});
+        // Precompute the challenge strings (stable memory — `router`'s response
+        // writer stores header slices without copying) via the shared helpers.
+        const challenge_missing = try allocBearerChallenge(gpa, .{ .realm = options.realm });
         errdefer gpa.free(challenge_missing);
-        const challenge_invalid = try std.fmt.allocPrint(gpa, "Bearer{s} error=\"invalid_token\"", .{realm_part});
+        const challenge_invalid = try allocBearerChallenge(gpa, .{
+            .realm = options.realm,
+            .error_code = "invalid_token",
+        });
         errdefer gpa.free(challenge_invalid);
 
         // Own the required scopes (the config slice may be transient) and, if
         // any, precompute the space-joined insufficient-scope challenge.
-        var scopes = try gpa.alloc([]const u8, options.required_scopes.len);
-        errdefer gpa.free(scopes);
-        var owned: usize = 0;
-        errdefer for (scopes[0..owned]) |s| gpa.free(s);
-        for (options.required_scopes, 0..) |s, i| {
-            scopes[i] = try gpa.dupe(u8, s);
-            owned = i + 1;
-        }
+        const scopes = try dupeScopeList(gpa, options.required_scopes);
+        errdefer freeScopeList(gpa, scopes);
 
-        const challenge_scope: ?[]const u8 = if (options.required_scopes.len == 0) null else blk: {
-            var b: std.ArrayList(u8) = .empty;
-            defer b.deinit(gpa);
-            try b.appendSlice(gpa, "Bearer");
-            try b.appendSlice(gpa, realm_part);
-            try b.appendSlice(gpa, " error=\"insufficient_scope\", scope=\"");
-            for (options.required_scopes, 0..) |s, i| {
-                if (i != 0) try b.append(gpa, ' ');
-                try b.appendSlice(gpa, s);
-            }
-            try b.append(gpa, '"');
-            break :blk try b.toOwnedSlice(gpa);
-        };
+        const challenge_scope: ?[]const u8 = if (options.required_scopes.len == 0)
+            null
+        else
+            try allocBearerChallenge(gpa, .{
+                .realm = options.realm,
+                .error_code = "insufficient_scope",
+                .scopes = options.required_scopes,
+            });
 
         return .{
             .gpa = gpa,
@@ -1952,6 +1990,291 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
     defer ctx.data = saved;
     return next.run(ctx);
 }
+
+// ── Part 6b: framework-agnostic Bearer guard + WWW-Authenticate helper ───────
+//
+// `ResourceServer` above is the `router`-native middleware. `Guard` is the SAME
+// RFC 6750 + RFC 9068 policy without a web framework: `authenticate(req)`
+// returns a validated `AuthContext` or a structured `AuthError` the caller maps
+// to 401/403 with `challengeFor`. Both wrap the exact same `Provider.verify` and
+// scope/challenge helpers — no signature verification is duplicated.
+
+/// RFC 6750 §3 `WWW-Authenticate: Bearer` challenge parameters.
+pub const BearerChallengeParams = struct {
+    /// Optional protection-space label (`realm="…"`). Callers building the
+    /// header directly must ensure it contains no '"', CR, LF or NUL;
+    /// `Guard.init`/`ResourceServer.init` validate it (`error.InvalidRealm`).
+    realm: ?[]const u8 = null,
+    /// RFC 6750 §3.1 error code (`"invalid_token"`, `"insufficient_scope"`, …),
+    /// or null for the bare challenge returned when NO credential was supplied.
+    error_code: ?[]const u8 = null,
+    /// Scopes advertised as `scope="a b c"` — space-joined and emitted ONLY
+    /// when non-empty (i.e. alongside `insufficient_scope`, RFC 6750 §3.1).
+    scopes: []const []const u8 = &.{},
+};
+
+/// Write an RFC 6750 §3 `WWW-Authenticate: Bearer …` header *value* to `w` —
+/// the header-value helper a resource server uses for its 401/403 challenges.
+/// `Guard` and `ResourceServer` precompute their challenge strings with it.
+pub fn writeBearerChallenge(w: *Writer, p: BearerChallengeParams) Writer.Error!void {
+    try w.writeAll("Bearer");
+    if (p.realm) |r| {
+        try w.writeAll(" realm=\"");
+        try w.writeAll(r);
+        try w.writeByte('"');
+    }
+    if (p.error_code) |code| {
+        try w.writeAll(" error=\"");
+        try w.writeAll(code);
+        try w.writeByte('"');
+    }
+    if (p.scopes.len != 0) {
+        try w.writeAll(", scope=\"");
+        for (p.scopes, 0..) |s, i| {
+            if (i != 0) try w.writeByte(' ');
+            try w.writeAll(s);
+        }
+        try w.writeByte('"');
+    }
+}
+
+fn allocBearerChallenge(gpa: std.mem.Allocator, p: BearerChallengeParams) error{OutOfMemory}![]const u8 {
+    var aw: Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    writeBearerChallenge(&aw.writer, p) catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory, // Allocating writer: alloc failure
+    };
+    return aw.toOwnedSlice();
+}
+
+/// A realm string is embedded verbatim in a `"…"`-quoted header parameter, so
+/// it must not carry a character that would break out of the quoting.
+fn validateRealm(realm: []const u8) error{InvalidRealm}!void {
+    for (realm) |c| if (c == '"' or c == '\r' or c == '\n' or c == 0) return error.InvalidRealm;
+}
+
+/// Deep-copy a (possibly transient) scope list so a guard can outlive the
+/// caller's config slice. Frees partial work on OOM.
+fn dupeScopeList(gpa: std.mem.Allocator, scopes: []const []const u8) error{OutOfMemory}![][]const u8 {
+    const out = try gpa.alloc([]const u8, scopes.len);
+    errdefer gpa.free(out);
+    var owned: usize = 0;
+    errdefer for (out[0..owned]) |s| gpa.free(s);
+    for (scopes, 0..) |s, i| {
+        out[i] = try gpa.dupe(u8, s);
+        owned = i + 1;
+    }
+    return out;
+}
+
+fn freeScopeList(gpa: std.mem.Allocator, scopes: [][]const u8) void {
+    for (scopes) |s| gpa.free(s);
+    gpa.free(scopes);
+}
+
+/// The outcome of `Guard.authenticate` on failure. `authStatus` maps each to
+/// its RFC 6750 §3.1 HTTP status; `Guard.challengeFor` to its challenge string.
+pub const AuthError = error{
+    /// No Authorization header, a non-Bearer scheme, or an empty token —
+    /// RFC 6750 §3: answer 401 with the bare `Bearer` challenge (no `error=`).
+    MissingToken,
+    /// A Bearer token was present but failed signature/claim validation or the
+    /// `at+jwt` typ policy — RFC 6750 §3.1 `invalid_token` (401).
+    InvalidToken,
+    /// The token is valid but lacks a required scope — RFC 6750 §3.1
+    /// `insufficient_scope` (403).
+    InsufficientScope,
+    /// Server-side allocation failure — NOT an authentication decision. Map to
+    /// 500 and send no `WWW-Authenticate`.
+    OutOfMemory,
+};
+
+/// The RFC 6750 §3.1 HTTP status for an `AuthError` (`OutOfMemory` ⇒ 500, a
+/// server fault rather than an auth denial).
+pub fn authStatus(err: AuthError) u16 {
+    return switch (err) {
+        error.MissingToken, error.InvalidToken => 401,
+        error.InsufficientScope => 403,
+        error.OutOfMemory => 500,
+    };
+}
+
+/// The validated principal `Guard.authenticate` returns. It OWNS the verified
+/// token (unlike the middleware's borrowed `Identity`); call `deinit` when the
+/// request is done. Every claim it exposes is trustworthy: the signature was
+/// checked against the JWKS and `exp`/`nbf`/`iss`/`aud` validated.
+pub const AuthContext = struct {
+    token: ParsedToken,
+
+    pub fn deinit(self: *AuthContext) void {
+        self.token.deinit();
+    }
+
+    /// The `sub` (subject) claim, or null when absent.
+    pub fn subject(self: *const AuthContext) ?[]const u8 {
+        return self.token.claims.sub;
+    }
+
+    /// The full verified claim set.
+    pub fn claims(self: *const AuthContext) Claims {
+        return self.token.claims;
+    }
+
+    /// Whether the granted scopes include `want` (`scope` or `scp`).
+    pub fn hasScope(self: *const AuthContext, want: []const u8) bool {
+        return scopeGranted(self.token.claims, want);
+    }
+
+    /// Iterate the space-delimited `scope` claim (see `ScopeIter`).
+    pub fn scopes(self: *const AuthContext) ScopeIter {
+        return .{ .rest = self.token.claims.claimStr("scope") orelse "" };
+    }
+};
+
+/// RFC 9068 §2.1: the `at+jwt` (or media-type `application/at+jwt`) header
+/// `typ`, matched case-insensitively.
+fn isAtJwtTyp(typ: ?[]const u8) bool {
+    const t = typ orelse return false;
+    return std.ascii.eqlIgnoreCase(t, "at+jwt") or
+        std.ascii.eqlIgnoreCase(t, "application/at+jwt");
+}
+
+/// A framework-agnostic RFC 6750 Bearer + RFC 9068 access-token guard over a
+/// `Provider`. Configure it once (it precomputes its `WWW-Authenticate`
+/// challenge strings at `init` — stable memory the caller may hand to any
+/// response writer) and call `authenticate` per request. The `Guard` and its
+/// `Provider` must outlive every in-flight request, at stable addresses.
+pub const Guard = struct {
+    gpa: std.mem.Allocator,
+    provider: *Provider,
+    claim_opts: Provider.ClaimOptions,
+    /// Scopes every request must carry (conjunction — ALL required), gpa-owned.
+    required_scopes: [][]const u8,
+    /// Enforce RFC 9068 §2.1 `typ: at+jwt` on the JOSE header.
+    require_at_jwt_typ: bool,
+    clock: Clock,
+    lock: Lock,
+    challenge_missing: []const u8,
+    challenge_invalid: []const u8,
+    challenge_scope: ?[]const u8,
+
+    pub const Options = struct {
+        /// The verifier backing the guard. Must outlive every request.
+        provider: *Provider,
+        /// Claim policy handed to `Provider.verify`. REQUIRED — `audience`
+        /// has no default (`.required = "…"` to bind tokens to this resource
+        /// server per RFC 8725 §3.9, or a conscious `.any`).
+        claim_opts: Provider.ClaimOptions,
+        /// Scopes every request must carry (ALL required). Empty ⇒ authenticate
+        /// only, no scope check.
+        required_scopes: []const []const u8 = &.{},
+        /// Enforce RFC 9068 §2.1 `typ: at+jwt`. Off by default (many issuers
+        /// still omit it); turn on for RFC 9068 access tokens.
+        require_at_jwt_typ: bool = false,
+        /// Wall clock for `now_s`. Injected for tests; `.system` in production.
+        clock: Clock = .system,
+        /// Serialization for the Provider cache under a threaded server (see
+        /// `Lock`). Default `.none` = single-threaded / externally synced.
+        lock: Lock = .none,
+        /// Optional protection-space label placed in the challenge
+        /// (`Bearer realm="…"`). Must not contain '"', CR, LF or NUL.
+        realm: ?[]const u8 = null,
+    };
+
+    pub const InitError = error{ OutOfMemory, InvalidRealm };
+
+    pub fn init(gpa: std.mem.Allocator, options: Guard.Options) InitError!Guard {
+        if (options.realm) |r| try validateRealm(r);
+
+        const challenge_missing = try allocBearerChallenge(gpa, .{ .realm = options.realm });
+        errdefer gpa.free(challenge_missing);
+        const challenge_invalid = try allocBearerChallenge(gpa, .{
+            .realm = options.realm,
+            .error_code = "invalid_token",
+        });
+        errdefer gpa.free(challenge_invalid);
+
+        const scopes = try dupeScopeList(gpa, options.required_scopes);
+        errdefer freeScopeList(gpa, scopes);
+
+        const challenge_scope: ?[]const u8 = if (options.required_scopes.len == 0)
+            null
+        else
+            try allocBearerChallenge(gpa, .{
+                .realm = options.realm,
+                .error_code = "insufficient_scope",
+                .scopes = options.required_scopes,
+            });
+
+        return .{
+            .gpa = gpa,
+            .provider = options.provider,
+            .claim_opts = options.claim_opts,
+            .required_scopes = scopes,
+            .require_at_jwt_typ = options.require_at_jwt_typ,
+            .clock = options.clock,
+            .lock = options.lock,
+            .challenge_missing = challenge_missing,
+            .challenge_invalid = challenge_invalid,
+            .challenge_scope = challenge_scope,
+        };
+    }
+
+    pub fn deinit(g: *Guard) void {
+        freeScopeList(g.gpa, g.required_scopes);
+        g.gpa.free(g.challenge_missing);
+        g.gpa.free(g.challenge_invalid);
+        if (g.challenge_scope) |c| g.gpa.free(c);
+        g.* = undefined;
+    }
+
+    /// Validate the request's Bearer access token against the full policy and
+    /// return the principal, or a structured `AuthError`. The steps, in order:
+    /// extract the `Bearer` credential (RFC 6750 §2.1) → `Provider.verify`
+    /// (signature + `exp`/`nbf`/`iat`/`iss`/`aud`) → optional RFC 9068 `at+jwt`
+    /// typ → required scopes. `tok_gpa` allocates the returned `AuthContext`
+    /// (deinit it when done); `OutOfMemory` is a server fault, not a denial.
+    pub fn authenticate(
+        g: *Guard,
+        tok_gpa: std.mem.Allocator,
+        req: *const http.Server.Request,
+    ) AuthError!AuthContext {
+        const token = resourceBearerToken(req) orelse return error.MissingToken;
+
+        const now_s = g.clock.now();
+        g.lock.acquire();
+        const verify_result = g.provider.verify(tok_gpa, token, now_s, g.claim_opts);
+        g.lock.release();
+
+        var verified = verify_result catch |err| {
+            // verify frees its own partial token on failure and never leaks it.
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return error.InvalidToken;
+        };
+        errdefer verified.deinit();
+
+        if (g.require_at_jwt_typ and !isAtJwtTyp(verified.header.typ))
+            return error.InvalidToken;
+
+        for (g.required_scopes) |need| {
+            if (!scopeGranted(verified.claims, need)) return error.InsufficientScope;
+        }
+
+        return .{ .token = verified };
+    }
+
+    /// The precomputed `WWW-Authenticate` value for a denial (null for
+    /// `OutOfMemory`, which is a 500 and carries no challenge). Stable memory —
+    /// safe to hand to a response writer that stores the slice without copying.
+    pub fn challengeFor(g: *const Guard, err: AuthError) ?[]const u8 {
+        return switch (err) {
+            error.MissingToken => g.challenge_missing,
+            error.InvalidToken => g.challenge_invalid,
+            error.InsufficientScope => g.challenge_scope,
+            error.OutOfMemory => null,
+        };
+    }
+};
 
 // ── Part 7: OAuth2/OIDC relying-party (RP) flow ─────────────────────────────
 // Clean-room from RFC 6749 (OAuth 2.0 Authorization Framework), RFC 7636
@@ -5156,6 +5479,297 @@ test "ResourceServer: ScopeIter splits on single/multiple spaces; InvalidRealm r
         .claim_opts = .{ .issuer = .any, .audience = .any },
         .realm = "bad\"realm",
     }));
+}
+
+// ── tests: framework-agnostic Guard + scope/challenge helpers (Part 6b) ──────
+
+/// Mint an RS256 token (kid "rs") over `payload_json` with an EXPLICIT JOSE
+/// header `header_json`, signed with the RFC 7515 A.2 key. Lets a test set
+/// `typ` or a mismatched `alg` the plain `mintRs256` cannot.
+fn mintRs256WithHeader(buf: []u8, header_json: []const u8, payload_json: []const u8) []const u8 {
+    var n_buf: [256]u8 = undefined;
+    var d_buf: [256]u8 = undefined;
+    const n_bytes = b64uDecode(&n_buf, rfc7515_a2_n_b64);
+    const d_bytes = b64uDecode(&d_buf, rfc7515_a2_d_b64);
+    const si = signingInputInto(buf, header_json, payload_json);
+    const sig = rsaTestSign(sha2.Sha256, 256, si, n_bytes, d_bytes);
+    return finishToken(buf, si.len, &sig);
+}
+
+/// Mint an unsecured (`alg:"none"`, kid "rs") token with an empty signature.
+fn mintNoneToken(buf: []u8, payload_json: []const u8) []const u8 {
+    const si = signingInputInto(buf,
+        \\{"alg":"none","kid":"rs"}
+    , payload_json);
+    return finishToken(buf, si.len, "");
+}
+
+/// Parse a claims-only payload (unsecured; parse does not verify) so a test can
+/// exercise the scope helpers directly on a `Claims`.
+fn scopeClaimsOf(gpa: std.mem.Allocator, payload_json: []const u8) ParseError!ParsedToken {
+    var buf: [1024]u8 = undefined;
+    const si = signingInputInto(&buf, "{\"alg\":\"none\"}", payload_json);
+    const tok = finishToken(&buf, si.len, "");
+    return parse(gpa, tok);
+}
+
+var test_guard: ?*Guard = null;
+
+/// Route handler that runs `Guard.authenticate` on the real request and maps
+/// the outcome onto the RFC 6750 wire response (status + challenge).
+fn guardTestHandler(ctx: *router.Ctx) anyerror!void {
+    const g = test_guard.?;
+    var actx = g.authenticate(testing.allocator, ctx.req) catch |err| {
+        ctx.res.setStatus(authStatus(err));
+        if (g.challengeFor(err)) |ch| try ctx.res.setHeader("WWW-Authenticate", ch);
+        try ctx.res.setHeader("Content-Type", "text/plain");
+        try ctx.res.writeAll("denied");
+        return;
+    };
+    defer actx.deinit();
+    ctx.res.setStatus(200);
+    try ctx.res.writeAll(actx.subject() orelse "?");
+}
+
+test "scope helpers: scopeGranted + require single/all/any over `scope` string and `scp` array" {
+    const gpa = testing.allocator;
+
+    var t1 = try scopeClaimsOf(gpa,
+        \\{"scope":"read write openid"}
+    );
+    defer t1.deinit();
+    const c1 = t1.claims;
+    try testing.expect(scopeGranted(c1, "read"));
+    try testing.expect(scopeGranted(c1, "openid"));
+    try testing.expect(!scopeGranted(c1, "admin"));
+    try testing.expect(!scopeGranted(c1, "")); // empty never matches
+
+    try requireScope(c1, "read");
+    try testing.expectError(error.InsufficientScope, requireScope(c1, "admin"));
+    try requireAllScopes(c1, &.{ "read", "write" });
+    try testing.expectError(error.InsufficientScope, requireAllScopes(c1, &.{ "read", "admin" }));
+    try requireAnyScope(c1, &.{ "admin", "openid" });
+    try testing.expectError(error.InsufficientScope, requireAnyScope(c1, &.{ "admin", "delete" }));
+    // Empty requirement is a deliberate no-op (no scope constraint).
+    try requireAllScopes(c1, &.{});
+    try requireAnyScope(c1, &.{});
+
+    // `scp` as a JSON array of strings (RFC 9068 / Microsoft-identity style).
+    var t2 = try scopeClaimsOf(gpa,
+        \\{"scp":["user.read","mail.send"]}
+    );
+    defer t2.deinit();
+    try testing.expect(scopeGranted(t2.claims, "user.read"));
+    try testing.expect(scopeGranted(t2.claims, "mail.send"));
+    try testing.expect(!scopeGranted(t2.claims, "user.write"));
+
+    // `scp` as a single space-delimited string.
+    var t3 = try scopeClaimsOf(gpa,
+        \\{"scp":"a b c"}
+    );
+    defer t3.deinit();
+    try testing.expect(scopeGranted(t3.claims, "b"));
+    try testing.expect(!scopeGranted(t3.claims, "d"));
+}
+
+test "writeBearerChallenge: RFC 6750 §3 header-value formatting" {
+    var buf: [256]u8 = undefined;
+    {
+        var w: Writer = .fixed(&buf);
+        try writeBearerChallenge(&w, .{});
+        try testing.expectEqualStrings("Bearer", w.buffered());
+    }
+    {
+        var w: Writer = .fixed(&buf);
+        try writeBearerChallenge(&w, .{ .realm = "svc" });
+        try testing.expectEqualStrings("Bearer realm=\"svc\"", w.buffered());
+    }
+    {
+        var w: Writer = .fixed(&buf);
+        try writeBearerChallenge(&w, .{ .error_code = "invalid_token" });
+        try testing.expectEqualStrings("Bearer error=\"invalid_token\"", w.buffered());
+    }
+    {
+        var w: Writer = .fixed(&buf);
+        try writeBearerChallenge(&w, .{
+            .realm = "svc",
+            .error_code = "insufficient_scope",
+            .scopes = &.{ "read", "write" },
+        });
+        try testing.expectEqualStrings(
+            "Bearer realm=\"svc\" error=\"insufficient_scope\", scope=\"read write\"",
+            w.buffered(),
+        );
+    }
+}
+
+test "Guard.authenticate: valid → context; missing/garbage/expired/insufficient/none-alg/confusion denied" {
+    const gpa = testing.allocator;
+    var stub: ScriptFetcher = .{ .script = &.{
+        .{ .url = test_jwks_url, .body = rs_jwks_json },
+    } };
+    var provider = Provider.init(gpa, stub.fetcher(), .{ .jwks_uri = test_jwks_url, .ttl_s = 1000000 });
+    defer provider.deinit();
+
+    var fc: FixedClock = .{ .now_s = 1000 };
+    var guard = try Guard.init(gpa, .{
+        .provider = &provider,
+        .claim_opts = .{ .issuer = .{ .required = "https://issuer.example" }, .audience = .{ .required = "api://svc" } },
+        .required_scopes = &.{"read"},
+        .clock = fc.clock(),
+        .realm = "svc",
+    });
+    defer guard.deinit();
+    test_guard = &guard;
+    defer test_guard = null;
+
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.get("/data", guardTestHandler);
+
+    var tok_buf: [1024]u8 = undefined;
+    var bearer_buf: [1100]u8 = undefined;
+    var req_buf: [1400]u8 = undefined;
+    var out_buf: [1024]u8 = undefined;
+
+    // Valid, scoped token → 200 with the subject echoed in the body.
+    {
+        const good = mintRs256(&tok_buf,
+            \\{"iss":"https://issuer.example","aud":"api://svc","sub":"alice","exp":2000,"scope":"read write"}
+        );
+        const bearer = std.fmt.bufPrint(&bearer_buf, "Bearer {s}", .{good}) catch unreachable;
+        const got = resRunWire(&r, resWire(&req_buf, "GET", "/data", bearer), &out_buf);
+        try resExpectStatus(got, "200");
+        try testing.expect(std.mem.indexOf(u8, got, "alice") != null);
+    }
+    // No credential → 401, bare realm challenge (no error=).
+    {
+        const got = resRunWire(&r, resWire(&req_buf, "GET", "/data", null), &out_buf);
+        try resExpectStatus(got, "401");
+        try resExpectHeaderLine(got, "WWW-Authenticate: Bearer realm=\"svc\"");
+    }
+    // Garbage token → 401 invalid_token.
+    {
+        const got = resRunWire(&r, resWire(&req_buf, "GET", "/data", "Bearer not.a.jwt"), &out_buf);
+        try resExpectStatus(got, "401");
+        try resExpectHeaderLine(got, "WWW-Authenticate: Bearer realm=\"svc\" error=\"invalid_token\"");
+    }
+    // Valid signature but expired (exp 500 < now 1000) → 401 invalid_token.
+    {
+        const expired = mintRs256(&tok_buf,
+            \\{"iss":"https://issuer.example","aud":"api://svc","sub":"alice","exp":500,"scope":"read"}
+        );
+        const bearer = std.fmt.bufPrint(&bearer_buf, "Bearer {s}", .{expired}) catch unreachable;
+        const got = resRunWire(&r, resWire(&req_buf, "GET", "/data", bearer), &out_buf);
+        try resExpectStatus(got, "401");
+    }
+    // Valid + fresh but missing the required "read" scope → 403.
+    {
+        const narrow = mintRs256(&tok_buf,
+            \\{"iss":"https://issuer.example","aud":"api://svc","sub":"alice","exp":2000,"scope":"write"}
+        );
+        const bearer = std.fmt.bufPrint(&bearer_buf, "Bearer {s}", .{narrow}) catch unreachable;
+        const got = resRunWire(&r, resWire(&req_buf, "GET", "/data", bearer), &out_buf);
+        try resExpectStatus(got, "403");
+        try resExpectHeaderLine(got, "WWW-Authenticate: Bearer realm=\"svc\" error=\"insufficient_scope\", scope=\"read\"");
+    }
+    // Unsecured alg:none (kid rs) → 401 invalid_token — never trusted (RFC 8725 §2.1).
+    {
+        const none_tok = mintNoneToken(&tok_buf,
+            \\{"iss":"https://issuer.example","aud":"api://svc","sub":"mallory","exp":2000,"scope":"read"}
+        );
+        const bearer = std.fmt.bufPrint(&bearer_buf, "Bearer {s}", .{none_tok}) catch unreachable;
+        const got = resRunWire(&r, resWire(&req_buf, "GET", "/data", bearer), &out_buf);
+        try resExpectStatus(got, "401");
+        try resExpectHeaderLine(got, "WWW-Authenticate: Bearer realm=\"svc\" error=\"invalid_token\"");
+    }
+    // alg confusion: an HS256 header pointing at the RSA verification key
+    // (the classic RS→HS downgrade). The alg/key TYPE mismatch is caught
+    // before any MAC is computed → 401. RSA-signed bytes are irrelevant.
+    {
+        const confused = mintRs256WithHeader(&tok_buf,
+            \\{"alg":"HS256","kid":"rs"}
+        ,
+            \\{"iss":"https://issuer.example","aud":"api://svc","sub":"m","exp":2000,"scope":"read"}
+        );
+        const bearer = std.fmt.bufPrint(&bearer_buf, "Bearer {s}", .{confused}) catch unreachable;
+        const got = resRunWire(&r, resWire(&req_buf, "GET", "/data", bearer), &out_buf);
+        try resExpectStatus(got, "401");
+    }
+}
+
+test "Guard: RFC 9068 at+jwt typ enforcement (on/off) and end-to-end `scp` array scope" {
+    const gpa = testing.allocator;
+    var stub: ScriptFetcher = .{ .script = &.{
+        .{ .url = test_jwks_url, .body = rs_jwks_json },
+    } };
+    var provider = Provider.init(gpa, stub.fetcher(), .{ .jwks_uri = test_jwks_url, .ttl_s = 1000000 });
+    defer provider.deinit();
+    var fc: FixedClock = .{ .now_s = 1000 };
+
+    var tok_buf: [1024]u8 = undefined;
+    var bearer_buf: [1100]u8 = undefined;
+    var req_buf: [1400]u8 = undefined;
+    var out_buf: [1024]u8 = undefined;
+
+    // typ enforcement ON: a token lacking `typ` is rejected; `at+jwt` passes.
+    {
+        var guard = try Guard.init(gpa, .{
+            .provider = &provider,
+            .claim_opts = .{ .issuer = .any, .audience = .{ .required = "api://svc" } },
+            .require_at_jwt_typ = true,
+            .clock = fc.clock(),
+        });
+        defer guard.deinit();
+        test_guard = &guard;
+        defer test_guard = null;
+        var r = router.Router.init(gpa);
+        defer r.deinit();
+        try r.get("/d", guardTestHandler);
+
+        {
+            const tok = mintRs256(&tok_buf,
+                \\{"aud":"api://svc","sub":"a","exp":2000}
+            );
+            const bearer = std.fmt.bufPrint(&bearer_buf, "Bearer {s}", .{tok}) catch unreachable;
+            const got = resRunWire(&r, resWire(&req_buf, "GET", "/d", bearer), &out_buf);
+            try resExpectStatus(got, "401"); // no typ → invalid_token
+        }
+        {
+            const tok = mintRs256WithHeader(&tok_buf,
+                \\{"alg":"RS256","kid":"rs","typ":"at+jwt"}
+            ,
+                \\{"aud":"api://svc","sub":"a","exp":2000}
+            );
+            const bearer = std.fmt.bufPrint(&bearer_buf, "Bearer {s}", .{tok}) catch unreachable;
+            const got = resRunWire(&r, resWire(&req_buf, "GET", "/d", bearer), &out_buf);
+            try resExpectStatus(got, "200");
+        }
+    }
+
+    // typ enforcement OFF (default): a token WITHOUT `typ` passes, and a
+    // required scope carried in an `scp` array is honored end to end.
+    {
+        var guard = try Guard.init(gpa, .{
+            .provider = &provider,
+            .claim_opts = .{ .issuer = .any, .audience = .{ .required = "api://svc" } },
+            .required_scopes = &.{"read"},
+            .clock = fc.clock(),
+        });
+        defer guard.deinit();
+        test_guard = &guard;
+        defer test_guard = null;
+        var r = router.Router.init(gpa);
+        defer r.deinit();
+        try r.get("/d", guardTestHandler);
+
+        const tok = mintRs256(&tok_buf,
+            \\{"aud":"api://svc","sub":"a","exp":2000,"scp":["read","write"]}
+        );
+        const bearer = std.fmt.bufPrint(&bearer_buf, "Bearer {s}", .{tok}) catch unreachable;
+        const got = resRunWire(&r, resWire(&req_buf, "GET", "/d", bearer), &out_buf);
+        try resExpectStatus(got, "200");
+    }
 }
 
 // ── tests: OAuth2/OIDC relying-party flow (Part 7) ──────────────────────────
