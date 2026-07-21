@@ -57,11 +57,12 @@ pub const meta = .{
 /// ids; there is no separate "label" type.
 pub const NodeId = u32;
 
-/// Non-negative edge weight. `addEdge` accepts any `u32` including 0, but 0
-/// degrades the "predecessor chains are acyclic" invariant Dijkstra relies
-/// on for tie handling (a 0-weight edge can make `dist[u] == dist[v]` for
-/// adjacent `u`/`v`); the property-test harness below only ever generates
-/// weights `>= 1`, and callers who want PRP-style loop-free trees should too.
+/// Positive edge weight. `addEdge` REJECTS 0 (`error.ZeroWeight`): a 0-weight
+/// edge can make `dist[u] == dist[v]` for adjacent `u`/`v`, which the ECT
+/// tie-break can resolve into a `pred[u] == v, pred[v] == u` predecessor
+/// 2-cycle — and `Tree.pathTo` walks that chain unbounded (a DoS). Requiring
+/// `weight >= 1` keeps predecessor chains acyclic, exactly the invariant
+/// Dijkstra's tie handling and PRP-style loop-free trees rely on.
 pub const Weight = u32;
 
 /// Path cost accumulator — wide enough that summing `Weight` edges along any
@@ -125,14 +126,19 @@ pub const Graph = struct {
         /// This unordered pair already has an edge; call `addEdge` once per
         /// pair (there's no update-in-place — remove-then-readd if needed).
         DuplicateEdge,
+        /// `weight == 0` — shortest paths require strictly positive weights
+        /// (see `Weight`): a 0-weight edge can yield a predecessor 2-cycle
+        /// that makes `Tree.pathTo` loop unbounded.
+        ZeroWeight,
     } || Allocator.Error;
 
-    /// Add undirected edge `a <-> b` with `weight`. Both endpoints are
-    /// auto-created via `ensureNode`. Fails atomically: on `DuplicateEdge`
-    /// or OOM partway through, the graph is left exactly as it was before
-    /// the call (no half-added edge).
+    /// Add undirected edge `a <-> b` with `weight` (must be `>= 1`). Both
+    /// endpoints are auto-created via `ensureNode`. Fails atomically: on
+    /// `DuplicateEdge` or OOM partway through, the graph is left exactly as
+    /// it was before the call (no half-added edge).
     pub fn addEdge(self: *Graph, a: NodeId, b: NodeId, weight: Weight) AddEdgeError!void {
         if (a == b) return error.SelfLoop;
+        if (weight == 0) return error.ZeroWeight;
         try self.ensureNode(@max(a, b));
         try insertSorted(self.gpa, &self.adj.items[a], .{ .to = b, .weight = weight });
         errdefer removeSorted(&self.adj.items[a], b);
@@ -610,6 +616,19 @@ test "graph builder: neighbors sorted, isolated nodes, self-loop/duplicate rejec
     // Idempotent.
     try g.ensureNode(0);
     try testing.expectEqual(@as(u32, 6), g.nodeCount());
+}
+
+test "graph builder: addEdge rejects a 0-weight edge (predecessor-cycle DoS guard)" {
+    var g = Graph.init(testing.allocator);
+    defer g.deinit();
+    // A 0-weight edge is what could give Dijkstra's ECT tie-break a
+    // pred[u]==v / pred[v]==u 2-cycle, hanging Tree.pathTo forever.
+    try testing.expectError(error.ZeroWeight, g.addEdge(0, 1, 0));
+    // Rejected atomically: neither endpoint (nor any node) was created.
+    try testing.expectEqual(@as(u32, 0), g.nodeCount());
+    // A positive weight on the same pair still works.
+    try g.addEdge(0, 1, 1);
+    try testing.expectEqual(@as(u32, 2), g.nodeCount());
 }
 
 // ── tests: Dijkstra without ties (never touches the Fable stubs) ────────
