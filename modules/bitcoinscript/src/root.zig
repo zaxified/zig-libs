@@ -4,12 +4,11 @@
 //! sighash dispatch (`sigcheck.zig`, built on the sibling `bitcointx`/
 //! `k256` modules), and the top-level `verifyScript` orchestration
 //! (`verify.zig`) covering legacy, BIP16 P2SH, BIP141 segwit v0
-//! (P2WPKH/P2WSH), and BIP341 taproot key-path spends. Published
-//! consensus rules, verified against Bitcoin Core's own
-//! `script_tests.json` corpus — see SPEC.md for the full verification
-//! story and scope cuts (notably: BIP342 tapscript script-path spending is
-//! NOT implemented — every witness stack shaped like a script-path spend
-//! fails closed with a typed error, never silently accepted).
+//! (P2WPKH/P2WSH), BIP341 taproot key-path, and BIP341/342 taproot
+//! script-path (tapscript) spends. Published consensus rules, verified
+//! against Bitcoin Core's own `script_tests.json` corpus plus BIP341
+//! taproot-commitment KATs and end-to-end tapscript round-trips — see
+//! SPEC.md for the full verification story and scope cuts.
 //!
 //! `script`/`witness` bytes handed to this module are UNTRUSTED —
 //! `verifyScript` and everything it calls is fail-closed and DoS-bounded
@@ -27,10 +26,14 @@
 //! - `sigcheck.zig` — DER/pubkey encoding checks (BIP62/66/146) + the
 //!   actual ECDSA verification (sighash via `bitcointx`, curve check via
 //!   `k256`).
-//! - `interpreter.zig` — the stack machine (`eval`): opcode dispatch,
-//!   `IF`/`ELSE`/`ENDIF` structuring, `OP_CODESEPARATOR`-aware scriptCode.
+//! - `tapscript.zig` — BIP341/342 script-path primitives: taproot
+//!   control-block commitment, tapleaf hashing, the `ext_flag=1` sighash
+//!   extension, and BIP340 Schnorr signature checking.
+//! - `interpreter.zig` — the stack machine (`eval` / `evalTapscript`):
+//!   opcode dispatch, `IF`/`ELSE`/`ENDIF` structuring, `OP_CODESEPARATOR`-
+//!   aware scriptCode, and the BIP342 tapscript opcode semantics.
 //! - `verify.zig` — `verifyScript`: legacy/P2SH/segwit-v0/taproot
-//!   orchestration built on `interpreter.eval`.
+//!   (key-path + script-path) orchestration built on `interpreter.eval`.
 //! - `script_tests_vectors.zig` / `script_tests_test.zig` — a pinned
 //!   subset of Bitcoin Core's official `script_tests.json` corpus.
 //! - `e2e_test.zig` — real P2PKH/P2WPKH/P2TR spends verified end-to-end
@@ -44,7 +47,7 @@ pub const meta = .{
     .platform = .any,
     .role = .util,
     .concurrency = .reentrant, // no shared/global state; every call is over caller-owned values
-    .model_after = "Bitcoin Core script/interpreter.cpp (script_tests.json is Core's own conformance corpus); BIP16/62/65/66/112/141/142/143/144/146/340/341",
+    .model_after = "Bitcoin Core script/interpreter.cpp (script_tests.json is Core's own conformance corpus); BIP16/62/65/66/112/141/142/143/144/146/340/341/342",
     .deps = .{ "bitcointx", "k256", "bip340", "ripemd160" },
 };
 
@@ -54,6 +57,7 @@ pub const limits = @import("limits.zig");
 pub const flags = @import("flags.zig");
 pub const txctx = @import("txctx.zig");
 pub const sigcheck = @import("sigcheck.zig");
+pub const tapscript = @import("tapscript.zig");
 pub const interpreter = @import("interpreter.zig");
 pub const verify = @import("verify.zig");
 
@@ -78,6 +82,7 @@ test {
     _ = flags;
     _ = txctx;
     _ = sigcheck;
+    _ = tapscript;
     _ = interpreter;
     _ = verify;
     _ = @import("asmparser.zig");
@@ -85,6 +90,7 @@ test {
     _ = @import("script_tests_test.zig");
     _ = @import("e2e_test.zig");
     _ = @import("dos_test.zig");
+    _ = @import("tapscript_test.zig");
 }
 
 test "meta.deps names bitcointx, k256, bip340, ripemd160" {

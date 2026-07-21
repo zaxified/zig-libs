@@ -136,12 +136,11 @@ pub const Opcode = enum(u8) {
     OP_NOP9 = 0xb8,
     OP_NOP10 = 0xb9,
 
-    // Tapscript (BIP342) — enum value defined for completeness; the
-    // interpreter never special-cases it (tapscript execution is out of
-    // scope, module doc comment in root.zig / SPEC.md) so it always falls
-    // through to BadOpcode, matching Bitcoin Core's non-tapscript
-    // `EvalScript` (which also has no case for it outside tapscript
-    // execdata).
+    // Tapscript (BIP342): replaces the (disabled-in-tapscript)
+    // `OP_CHECKMULTISIG` family. `interpreter.zig` executes it only under
+    // `SigVersion.tapscript`; under `.base`/`.witness_v0` it falls through
+    // to `BadOpcode`, matching Bitcoin Core's `EvalScript` (which rejects it
+    // outside tapscript execution).
     OP_CHECKSIGADD = 0xba,
 
     OP_INVALIDOPCODE = 0xff,
@@ -185,6 +184,22 @@ pub fn isDisabled(op: u8) bool {
 /// conditional shape" must be caught even scanning through a skipped branch.
 pub fn isReservedConditional(op: u8) bool {
     return op == 0x65 or op == 0x66;
+}
+
+/// BIP342 `OP_SUCCESSx`: the opcode bytes that, when present ANYWHERE in a
+/// tapscript leaf (executed or not, even in an otherwise-undecodable tail),
+/// make the whole script succeed unconditionally (unless the
+/// `DISCOURAGE_OP_SUCCESS` policy flag is set). This is the EXACT set from
+/// BIP342 — "80, 98, 126-129, 131-134, 137-138, 141-142, 149-153, 187-254"
+/// — which is also precisely the union of Bitcoin Script's previously
+/// disabled/reserved opcodes plus the whole undefined 0xbb..0xfe tail, so a
+/// tapscript leaf never reaches the legacy `isDisabled`/`BadOpcode` paths
+/// for any of these. Only meaningful under `SigVersion.tapscript`.
+pub fn isOpSuccess(op: u8) bool {
+    return switch (op) {
+        80, 98, 126...129, 131...134, 137...138, 141...142, 149...153, 187...254 => true,
+        else => false,
+    };
 }
 
 const testing = std.testing;

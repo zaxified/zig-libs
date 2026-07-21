@@ -32,10 +32,17 @@ A stack machine executing UNTRUSTED, attacker-supplied bytes, layered bottom-up:
   with that extra hash removed — this was caught by the module's own signed-vs-verified
   round-trip test (`e2e_test.zig`), which is exactly the failure mode a "sign it myself, verify it
   myself" test is supposed to catch.
-- `interpreter.zig` — `eval`: the opcode-dispatch loop, `IF`/`NOTIF`/`ELSE`/`ENDIF` structuring,
-  `OP_CODESEPARATOR`-aware scriptCode. Owns every DoS bound.
+- `interpreter.zig` — `eval` (legacy/segwit-v0) + `evalTapscript` (BIP342): the opcode-dispatch
+  loop, `IF`/`NOTIF`/`ELSE`/`ENDIF` structuring, `OP_CODESEPARATOR`-aware scriptCode, and the
+  tapscript deltas (Schnorr `OP_CHECKSIG`/`OP_CHECKSIGADD`, the `OP_SUCCESSx` pre-scan, the
+  validation-weight budget, mandatory MINIMALIF, removed op-count/script-size limits). Owns every
+  DoS bound.
+- `tapscript.zig` — BIP341/342 script-path primitives: control-block/tapleaf/Merkle-root/tweak
+  commitment (`verifyCommitment`), the `ext_flag=1` sighash extension, and BIP340 Schnorr signature
+  checking (`checkSchnorrSig`).
 - `verify.zig` — `verifyScript`: legacy → BIP16 P2SH → BIP141 segwit-v0
-  (P2WPKH/P2WSH) → BIP341 taproot-key-path orchestration on top of `interpreter.eval`.
+  (P2WPKH/P2WSH) → BIP341 taproot-key-path → BIP341/342 taproot-script-path orchestration on top of
+  `interpreter.eval`/`evalTapscript`.
 
 Concurrency: `.reentrant` — no shared/global state; every call is over caller-owned values.
 Allocator contract: `interpreter.eval`/`verifyScript` assume an arena-like allocator (bulk-freed
@@ -65,21 +72,61 @@ path with no separate weight check yet) has no memory bound at all. A production
 embedding this module for **block-validated** spends (where the weight limit is already enforced
 upstream) will never observe this bound trigger on a real, weight-valid block.
 
-## Deferred: BIP342 tapscript
+## BIP342 tapscript
 
-Taproot **key-path** spending (a witness stack of exactly one element, optionally an annex) is
-fully implemented: `verifyTaprootKeyPath` verifies a BIP340 Schnorr signature directly against
-the witness-program bytes over the BIP341 sighash — no script execution at all, per spec. A
-witness stack shaped like **script-path** (tapscript, BIP342) spending — a control block, a leaf
-script, and optional stack arguments — is detected (`items.len != 1` after annex-stripping) and
-rejected with `error.TapscriptUnsupported`, a typed, explicit, fail-closed error, never a silent
-accept. This is a real, self-contained extension (its own opcode budget accounting, `OP_CHECKSIGADD`,
-leaf-version/merkle-path validation, a distinct tapscript sighash extension) — not a partially-built
-version of what's here — and was out of scope for this pass given the module's other priorities
-(the general opcode/template/flag surface, and getting BIP340/341 key-path correctness proven end
-to end). `opcodes.zig`'s `OP_CHECKSIGADD` enum value exists for completeness but is never
-special-cased by the interpreter — it always falls through to `BadOpcode`, matching Bitcoin Core's
-own non-tapscript `EvalScript` (which also has no case for it outside tapscript execdata).
+Taproot **key-path** spending (a witness stack of exactly one element, optionally an annex) is a
+BIP340 Schnorr signature verified directly against the witness-program bytes over the BIP341
+key-path sighash — no script execution at all, per spec.
+
+Taproot **script-path** spending (BIP341/342, a witness stack of ≥2 elements after annex-stripping)
+is now implemented end to end:
+
+- **Commitment (BIP341 "Script validation rules", `tapscript.verifyCommitment`)** — the last
+  witness item is the control block (`33 + 32m` bytes, `m ≤ 128`), the second-to-last is the leaf
+  `script`, and the rest seed the initial stack. The leaf version is `c[0] & 0xfe`; the internal
+  key is `c[1:33]`. We recompute the tapleaf hash (`hash_TapLeaf(v || compact_size(script) ||
+  script)`), fold the Merkle path (`hash_TapBranch`, lexicographically ordered), tweak the internal
+  key (`t = hash_TapTweak(p || merkle_root)`, failing if `t ≥ n`), and check that
+  `Q = lift_x(p) + t·G` matches the witness program's x-coordinate AND parity bit. Validated
+  byte-exactly against the BIP341 `wallet-test-vectors.json` single-leaf cases (`tapscript.zig`).
+  A leaf version other than `0xc0` is anyone-can-spend (upgrade hook) unless
+  `discourage_upgradable_taproot_version` is set.
+- **`OP_SUCCESSx` (BIP342)** — the exact set `{80, 98, 126-129, 131-134, 137-138, 141-142,
+  149-153, 187-254}` (which is precisely the legacy disabled/reserved set ∪ the undefined
+  `0xbb..0xfe` tail). A separate pre-scan (`interpreter.scanOpSuccess`, matching Core's
+  `ExecuteWitnessScript` first pass) walks the whole leaf before execution; any `OP_SUCCESSx`
+  anywhere (even in an unexecuted branch, even before an otherwise-undecodable tail) makes the
+  spend succeed unconditionally — unless `discourage_op_success` is set. A decode failure reached
+  *before* any `OP_SUCCESSx` is a real `BadOpcode`.
+- **`OP_CHECKSIG`/`OP_CHECKSIGVERIFY`/`OP_CHECKSIGADD` (BIP342, `interpreter.evalChecksigTapscript`
+  + `tapscript.checkSchnorrSig`)** — a 32-byte public key is BIP340; an empty signature makes
+  CHECKSIG push false / CHECKSIGADD leave `n` unchanged / CHECKSIGVERIFY fail; a **non-empty**
+  signature that fails to verify (or has an invalid 64/65-byte shape, or a 65-byte form carrying
+  `SIGHASH_DEFAULT`) is an immediate, hard script failure (no NULLFAIL leniency). An empty public
+  key fails immediately; an unknown (non-32-byte) public key is treated as an always-successful
+  upgrade hook unless `discourage_upgradable_pubkeytype` is set. `OP_CHECKMULTISIG(VERIFY)` are
+  disabled in tapscript and fail immediately when executed (ignored in an unexecuted branch).
+- **Validation-weight budget (BIP342)** — the per-input budget starts at
+  `50 + serialized_witness_size` and is decremented by `50` for each executed signature opcode with
+  a **non-empty** signature (both known and unknown pubkey types); dropping below zero fails the
+  script (`TapscriptValidationWeight`). This replaces the (removed-for-tapscript) 201-op and
+  10000-byte-script limits. The 520-byte-per-element and 1000-element stack limits remain, extended
+  to the initial stack.
+- **Sighash extension (BIP342, `tapscript.sigMsg`)** — the BIP341 Common Signature Message with
+  `spend_type = 2` (`ext_flag = 1`, `+1` with an annex), the `sha_annex` commitment when an annex
+  is present, and the appended `tapleaf_hash || key_version(0x00) || codesep_pos`. `codesep_pos` is
+  the opcode position of the last executed `OP_CODESEPARATOR` (or `0xffffffff`), counting every
+  parsed opcode (executed or not). Because `bitcointx.bip341.sigMsg` is key-path-only (hard-coded
+  `spend_type = 0x00`, no extension), this module rebuilds the common message; its `ext_flag = 0`
+  prefix is cross-checked byte-for-byte against that KAT-backed function (`tapscript.zig`). A future
+  DRY refactor lifting a shared `commonSigMsg` into `bitcointx` is left for the interop backlog.
+
+**Verification honesty**: the taproot *commitment* math and the SigMsg *common prefix* are backed by
+external BIP341 vectors / `bitcointx`'s KAT-backed key-path sigMsg respectively. The end-to-end
+tapscript *spends* (`tapscript_test.zig`) are **constructed round-trips** (build output → sign the
+tapscript sighash → verify, each with a positive control), not byte-exact against an external
+consensus transaction vector. A real `feature_taproot.py`-derived transaction vector is noted for
+the coordinator's interop-vector backlog.
 
 `FindAndDelete(vchSig)` (the historical per-signature literal-byte-removal quirk in `SignatureHash`,
 distinct from `FindAndDelete(OP_CODESEPARATOR)`, which IS implemented) is also out of scope — see
@@ -183,6 +230,8 @@ P2SH redeem script (bounded to `MAX_SCRIPT_ELEMENT_SIZE` as a *push*, independen
 ## Flags
 
 `ScriptFlags` mirrors Bitcoin Core's `SCRIPT_VERIFY_*` set field-for-field; every field's doc
-comment in `flags.zig` states exactly what it gates. Not implemented (no field exists): anything
-tapscript-specific (an upgradable-NOP-in-tapscript variant, `OP_SUCCESS`, the tapscript opcode
-budget) — out of scope alongside BIP342 generally (above).
+comment in `flags.zig` states exactly what it gates. This now includes the three tapscript
+standardness/policy flags — `discourage_op_success`, `discourage_upgradable_pubkeytype`,
+`discourage_upgradable_taproot_version` — which reject (as non-standard) the consensus-valid BIP342
+upgrade hooks (`OP_SUCCESSx`, unknown CHECKSIG pubkey types, unknown leaf versions). All three are
+`false` in `.none` and `true` in `.standard`.

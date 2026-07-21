@@ -279,6 +279,10 @@ pub fn checkEcdsaSig(
     const sighash: [32]u8 = switch (sig_version) {
         .base => try bitcointx.legacy.sighash(allocator, ctx.tx, ctx.input_index, script_code, hash_type),
         .witness_v0 => try bitcointx.bip143.sighash(allocator, ctx.tx, ctx.input_index, script_code, ctx.amountSats(), hash_type),
+        // Tapscript CHECKSIG uses BIP340 Schnorr over the BIP341/342 sighash
+        // (`tapscript.zig`), never this ECDSA path — `interpreter.zig`
+        // dispatches `.tapscript` away from `checkEcdsaSig` entirely.
+        .tapscript => unreachable,
     };
 
     var sig_rs: [64]u8 = undefined;

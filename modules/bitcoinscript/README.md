@@ -1,9 +1,9 @@
 # bitcoinscript
 
 Pure-Zig **Bitcoin Script interpreter / consensus VM**: a stack machine covering push/flow-control/
-stack/arithmetic/crypto opcodes, `OP_CHECKSIG`/`CHECKMULTISIG`/`CHECKLOCKTIMEVERIFY`/
+stack/arithmetic/crypto opcodes, `OP_CHECKSIG`/`CHECKMULTISIG`/`CHECKSIGADD`/`CHECKLOCKTIMEVERIFY`/
 `CHECKSEQUENCEVERIFY`, and a top-level `verifyScript` orchestrating legacy, BIP16 P2SH, BIP141
-segwit v0 (P2WPKH/P2WSH), and BIP341 taproot key-path spends.
+segwit v0 (P2WPKH/P2WSH), and BIP341/342 taproot **key-path and script-path (tapscript)** spends.
 
 - Published consensus rules with an official byte-exact test-vector corpus (Bitcoin Core's
   `script_tests.json`) and this repo's own `bitcointx`/`k256`/`bip340`/`ripemd160` siblings
@@ -14,7 +14,7 @@ segwit v0 (P2WPKH/P2WSH), and BIP341 taproot key-path spends.
   adversarial input is a typed error, never a panic. See `SPEC.md` "Threat model / DoS bounds".
 - **Platform:** any — pure computation over caller-owned bytes, no I/O.
 - **Model after:** Bitcoin Core `script/interpreter.cpp` (and `script_tests.json` as its own
-  conformance corpus); BIP16/62/65/66/112/141/142/143/144/146/340/341.
+  conformance corpus); BIP16/62/65/66/112/141/142/143/144/146/340/341/342.
 
 ## Scope
 
@@ -22,14 +22,19 @@ Implemented:
 
 - **Full opcode set** except the disabled splice/bitwise/wide-arithmetic opcodes (`CAT`/`SUBSTR`/
   `LEFT`/`RIGHT`/`INVERT`/`AND`/`OR`/`XOR`/`2MUL`/`2DIV`/`MUL`/`DIV`/`MOD`/`LSHIFT`/`RSHIFT`),
-  which Bitcoin Core itself disables — attempting one is `error.DisabledOpcode`, not a silent skip.
+  which Bitcoin Core itself disables — attempting one is `error.DisabledOpcode`, not a silent skip
+  (in a **tapscript** leaf these same bytes are `OP_SUCCESSx` instead — see below).
 - **Templates**: bare P2PK/P2PKH/multisig, BIP16 P2SH (including a P2SH-wrapped segwit v0
-  program), BIP141 P2WPKH/P2WSH, BIP341 P2TR **key-path only** (script-path/tapscript is
-  deferred — `SPEC.md` "Deferred: BIP342 tapscript").
+  program), BIP141 P2WPKH/P2WSH, BIP341 P2TR **key-path**, and BIP341/342 P2TR **script-path
+  (tapscript)** — control-block/tapleaf/Merkle-root/tweak commitment check + leaf execution with
+  BIP340-Schnorr `OP_CHECKSIG`/`OP_CHECKSIGADD`, the `OP_SUCCESSx` short-circuit, the
+  validation-weight budget, and mandatory MINIMALIF (`SPEC.md` "BIP342 tapscript").
 - **`ScriptFlags`** mirrors Bitcoin Core's `SCRIPT_VERIFY_*` set: `p2sh`, `dersig`, `low_s`,
   `strictenc`, `nulldummy`, `discourage_upgradable_nops`, `cleanstack`, `checklocktimeverify`,
   `checksequenceverify`, `witness`, `discourage_upgradable_witness_program`, `minimalif`,
-  `witness_pubkeytype`, `nullfail`, `minimaldata`, `taproot`, `sigpushonly`.
+  `witness_pubkeytype`, `nullfail`, `minimaldata`, `taproot`, `sigpushonly`,
+  `discourage_op_success`, `discourage_upgradable_pubkeytype`,
+  `discourage_upgradable_taproot_version`.
 
 ## Use
 
@@ -89,9 +94,11 @@ try bitcoinscript.interpreter.eval(allocator, &stack, script_bytes, ctx, .base, 
 zig build test-bitcoinscript --summary all
 ```
 
-296 pinned rows from Bitcoin Core's official `script_tests.json`, three real end-to-end spends
-(P2PKH/P2WPKH/P2TR, self-signed and verified through this module), and DoS-bound teeth — see
-`SPEC.md` "Verification" for what's pinned and why, including three real cross-cutting bugs the
+296 pinned rows from Bitcoin Core's official `script_tests.json`, real end-to-end spends
+(P2PKH/P2WPKH/P2TR key-path plus BIP342 tapscript script-path: `OP_CHECKSIG`, `OP_CHECKSIGADD`
+threshold, `OP_SUCCESSx`, empty-sig, and validation-weight exhaustion — `tapscript_test.zig`),
+BIP341 wallet-test-vector KATs for the taproot commitment (`tapscript.zig`), and DoS-bound teeth —
+see `SPEC.md` "Verification" for what's pinned and why, including three real cross-cutting bugs the
 official corpus caught that isolated unit tests did not.
 
 Provenance: `script_tests_vectors.zig`'s rows are machine-transcribed (not hand-typed) from

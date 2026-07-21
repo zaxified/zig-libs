@@ -9,8 +9,15 @@ const bitcointx = @import("bitcointx");
 /// Which sighash algorithm `OP_CHECKSIG`-family opcodes use, selected by
 /// which execution context the interpreter is currently running under
 /// (legacy scriptSig/scriptPubKey/P2SH-redeem vs. a segwit v0 witness
-/// script). Never chosen by the opcode itself.
-pub const SigVersion = enum { base, witness_v0 };
+/// script vs. a BIP342 tapscript leaf). Never chosen by the opcode itself.
+///
+/// - `.base` / `.witness_v0` — ECDSA over the legacy / BIP143 sighash
+///   (`sigcheck.zig`).
+/// - `.tapscript` — BIP340 Schnorr over the BIP341/342 sighash extension
+///   (`tapscript.zig`); `OP_CHECKSIG`/`OP_CHECKSIGADD` semantics, the
+///   `OP_SUCCESSx` set, the validation-weight budget, and mandatory
+///   MINIMALIF all differ from the other two versions (see BIP342).
+pub const SigVersion = enum { base, witness_v0, tapscript };
 
 /// The spending transaction plus the specific input being verified.
 /// `spent_outputs` holds the previous output every `tx.vin[i]` spends, in

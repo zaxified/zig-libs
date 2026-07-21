@@ -59,6 +59,20 @@ pub const ScriptFlags = struct {
     /// redeem-script-resume path's own (always-on, flag-independent)
     /// push-only requirement.
     sigpushonly: bool = false,
+    /// BIP342 policy: reject a tapscript leaf that contains an `OP_SUCCESSx`
+    /// opcode (which would otherwise make the script succeed
+    /// unconditionally). A standardness rule that keeps the `OP_SUCCESSx`
+    /// upgrade hooks unused on the network until a future soft-fork assigns
+    /// them meaning; consensus (this flag off) still accepts them.
+    discourage_op_success: bool = false,
+    /// BIP342 policy: reject a tapscript CHECKSIG-family opcode whose public
+    /// key is of an unknown (not 32-byte, not empty) type — which consensus
+    /// (this flag off) treats as an always-successful upgrade hook.
+    discourage_upgradable_pubkeytype: bool = false,
+    /// BIP341 policy: reject a taproot script-path spend whose leaf version
+    /// is not `0xc0` (the only assigned tapscript version) — which consensus
+    /// (this flag off) treats as anyone-can-spend for future upgradeability.
+    discourage_upgradable_taproot_version: bool = false,
 
     pub const none: ScriptFlags = .{};
 
@@ -84,6 +98,9 @@ pub const ScriptFlags = struct {
         .minimaldata = true,
         .taproot = true,
         .sigpushonly = true,
+        .discourage_op_success = true,
+        .discourage_upgradable_pubkeytype = true,
+        .discourage_upgradable_taproot_version = true,
     };
 };
 

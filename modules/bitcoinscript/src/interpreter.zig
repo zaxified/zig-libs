@@ -36,7 +36,10 @@ const limits = @import("limits.zig");
 const flags_mod = @import("flags.zig");
 const sigcheck = @import("sigcheck.zig");
 const txctx = @import("txctx.zig");
+const tapscript = @import("tapscript.zig");
 const ripemd160 = @import("ripemd160");
+
+pub const ExecData = tapscript.ExecData;
 
 pub const ScriptFlags = flags_mod.ScriptFlags;
 pub const SigVersion = txctx.SigVersion;
@@ -70,12 +73,24 @@ pub const EvalError = error{
     SigNullfail,
     /// BIP147: `OP_CHECKMULTISIG`'s dummy stack element was non-empty.
     SigNulldummy,
+    /// BIP342: a tapscript CHECKSIG-family opcode's public key was the empty
+    /// vector (an immediate, unconditional script failure).
+    Pubkeytype,
+    /// BIP342: the per-input validation-weight (sigops) budget went below
+    /// zero after an executed signature check.
+    TapscriptValidationWeight,
+    /// BIP342 policy (`discourage_upgradable_pubkeytype`): a tapscript
+    /// CHECKSIG-family opcode used an unknown (not 32-byte) public key type.
+    DiscourageUpgradablePubkeytype,
+    /// BIP342 policy (`discourage_op_success`): the tapscript leaf contains
+    /// an `OP_SUCCESSx` opcode.
+    DiscourageOpSuccess,
     /// Catch-all for conditions Bitcoin Core itself folds into
     /// `SCRIPT_ERR_UNKNOWN_ERROR` (a `CScriptNum` construction that
     /// overflows or is non-minimal — distinct from the dedicated
     /// `MinimalData` class, which is push-*opcode* minimality only).
     UnknownError,
-} || sigcheck.SigCheckError || bitcointx.legacy.LegacyError || bitcointx.bip143.Bip143Error;
+} || sigcheck.SigCheckError || bitcointx.legacy.LegacyError || bitcointx.bip143.Bip143Error || tapscript.SchnorrError;
 
 const Stack = std.ArrayList([]const u8);
 
@@ -165,9 +180,14 @@ const State = struct {
     script: []const u8,
     last_codesep: usize = 0,
     op_count: usize = 0,
+    /// BIP342 opcode position of the instruction currently executing (0 for
+    /// the first). Only meaningful under `.tapscript`; drives `codesep_pos`.
+    opcode_pos: u32 = 0,
     ctx: TxContext,
     sig_version: SigVersion,
     flags: ScriptFlags,
+    /// Tapscript per-leaf execution data (`null` for `.base`/`.witness_v0`).
+    exec_data: ?*ExecData = null,
 
     fn pushOwned(self: *State, data: []const u8) EvalError!void {
         const owned = try self.allocator.dupe(u8, data);
@@ -200,6 +220,57 @@ const State = struct {
 fn checkSigForState(state: *State, sig: []const u8, pubkey: []const u8) EvalError!bool {
     const script_code = try scriptCodeFor(state.allocator, state.script, state.last_codesep, state.sig_version);
     return sigcheck.checkEcdsaSig(state.allocator, sig, pubkey, script_code, state.ctx, state.sig_version, state.flags);
+}
+
+/// BIP342 `EvalChecksigTapscript`: the shared CHECKSIG/CHECKSIGVERIFY/
+/// CHECKSIGADD signature-checking core for tapscript. Returns whether the
+/// check succeeded (`fSuccess`); a hard `EvalError` for any condition BIP342
+/// makes an immediate, unconditional script failure (empty pubkey; budget
+/// exhaustion; a failing non-empty signature; a discouraged upgradeable
+/// pubkey type). Charges the validation-weight budget for any non-empty
+/// signature BEFORE the empty-pubkey check, exactly as Bitcoin Core does.
+fn evalChecksigTapscript(state: *State, sig: []const u8, pubkey: []const u8) EvalError!bool {
+    const exec = state.exec_data.?;
+    const success = sig.len != 0;
+    if (success) {
+        exec.validation_weight -= tapscript.validation_weight_per_sigop;
+        if (exec.validation_weight < 0) return error.TapscriptValidationWeight;
+    }
+    if (pubkey.len == 0) return error.Pubkeytype;
+    if (pubkey.len == 32) {
+        if (success) {
+            try tapscript.checkSchnorrSig(
+                state.allocator,
+                sig,
+                pubkey,
+                state.ctx.tx,
+                state.ctx.input_index,
+                state.ctx.spent_outputs,
+                exec,
+            );
+        }
+    } else {
+        // Unknown public key type: signature validation is considered
+        // successful (upgrade hook) unless policy discourages it.
+        if (state.flags.discourage_upgradable_pubkeytype) return error.DiscourageUpgradablePubkeytype;
+    }
+    return success;
+}
+
+/// BIP342 `OP_SUCCESSx` pre-scan (Bitcoin Core `ExecuteWitnessScript`'s
+/// first pass): walk the whole tapscript leaf opcode-by-opcode BEFORE any
+/// execution. Returns `true` if an `OP_SUCCESSx` opcode appears anywhere
+/// (even in an unexecuted branch, even before an otherwise-undecodable
+/// tail). A decode failure encountered before any `OP_SUCCESSx` is a real
+/// `error.BadOpcode` (matching Core, which would also fail to decode).
+pub fn scanOpSuccess(script: []const u8) EvalError!bool {
+    var i: usize = 0;
+    while (i < script.len) {
+        if (opcodes.isOpSuccess(script[i])) return true;
+        const instr = try readInstruction(script, i);
+        i = instr.next;
+    }
+    return false;
 }
 
 fn execOpcode(state: *State, opcode: u8, instr_next: usize) EvalError!void {
@@ -454,14 +525,22 @@ fn execOpcode(state: *State, opcode: u8, instr_next: usize) EvalError!void {
         },
         @intFromEnum(Opcode.OP_CODESEPARATOR) => {
             state.last_codesep = instr_next;
+            // BIP342: a tapscript signature commits to the opcode position of
+            // the last executed OP_CODESEPARATOR.
+            if (state.sig_version == .tapscript) state.exec_data.?.codesep_pos = state.opcode_pos;
         },
 
         @intFromEnum(Opcode.OP_CHECKSIG), @intFromEnum(Opcode.OP_CHECKSIGVERIFY) => {
             if (stack.items.len < 2) return error.InvalidStackOperation;
             const pubkey = stack.pop().?;
             const sig = stack.pop().?;
-            const ok = try checkSigForState(state, sig, pubkey);
-            if (!ok and state.flags.nullfail and sig.len != 0) return error.SigNullfail;
+            const ok = if (state.sig_version == .tapscript)
+                try evalChecksigTapscript(state, sig, pubkey)
+            else blk: {
+                const r = try checkSigForState(state, sig, pubkey);
+                if (!r and state.flags.nullfail and sig.len != 0) return error.SigNullfail;
+                break :blk r;
+            };
             if (opcode == @intFromEnum(Opcode.OP_CHECKSIGVERIFY)) {
                 if (!ok) return error.Checksigverify;
             } else {
@@ -469,7 +548,23 @@ fn execOpcode(state: *State, opcode: u8, instr_next: usize) EvalError!void {
             }
         },
 
+        @intFromEnum(Opcode.OP_CHECKSIGADD) => {
+            // BIP342: tapscript-only. Pops pubkey (top), a CScriptNum n
+            // (4-byte max), and a signature (third). Pushes n or n+1.
+            if (state.sig_version != .tapscript) return error.BadOpcode;
+            if (stack.items.len < 3) return error.InvalidStackOperation;
+            const pubkey = stack.pop().?;
+            const n = try state.popNum(); // reads/validates the CScriptNum n (4-byte bound) before the sig check
+            const sig = stack.pop().?;
+            const ok = try evalChecksigTapscript(state, sig, pubkey);
+            try state.pushNum(n + @as(i64, if (ok) 1 else 0));
+        },
+
         @intFromEnum(Opcode.OP_CHECKMULTISIG), @intFromEnum(Opcode.OP_CHECKMULTISIGVERIFY) => {
+            // BIP342: OP_CHECKMULTISIG(VERIFY) are disabled in tapscript and
+            // fail immediately when executed (ignored in an unexecuted branch
+            // — this arm only runs when the branch is executing).
+            if (state.sig_version == .tapscript) return error.DisabledOpcode;
             const n_keys_i = try state.popNum();
             if (n_keys_i < 0 or n_keys_i > limits.max_pubkeys_per_multisig) return error.PubkeyCount;
             const n_keys: usize = @intCast(n_keys_i);
@@ -613,7 +708,9 @@ fn execOpcode(state: *State, opcode: u8, instr_next: usize) EvalError!void {
 
 /// Executes `script` against `stack` (persists across calls, per Bitcoin
 /// Core's scriptSig→scriptPubKey→redeem/witness-script chaining — caller's
-/// job) with a fresh altstack (never persists — module doc comment).
+/// job) with a fresh altstack (never persists — module doc comment). This
+/// is the legacy / segwit-v0 entry point; for a BIP342 tapscript leaf use
+/// `evalTapscript`.
 pub fn eval(
     allocator: Allocator,
     stack: *Stack,
@@ -622,7 +719,42 @@ pub fn eval(
     sig_version: SigVersion,
     flags: ScriptFlags,
 ) EvalError!void {
-    if (script.len > limits.max_script_size) return error.ScriptSize;
+    std.debug.assert(sig_version != .tapscript); // use evalTapscript
+    return evalCore(allocator, stack, script, ctx, sig_version, flags, null);
+}
+
+/// BIP342 tapscript leaf execution. `exec_data` carries the per-leaf
+/// tapleaf hash + validation-weight budget + annex a tapscript signature
+/// commits to (and is mutated in place: `codesep_pos` and
+/// `validation_weight`). The caller (`verify.zig`) must run the
+/// `scanOpSuccess` pre-scan and the initial-stack element/size checks
+/// first, and enforce the "exactly one truthy element remains" postcondition
+/// after — this function is only the leaf's opcode-execution loop.
+pub fn evalTapscript(
+    allocator: Allocator,
+    stack: *Stack,
+    script: []const u8,
+    ctx: TxContext,
+    flags: ScriptFlags,
+    exec_data: *ExecData,
+) EvalError!void {
+    return evalCore(allocator, stack, script, ctx, .tapscript, flags, exec_data);
+}
+
+fn evalCore(
+    allocator: Allocator,
+    stack: *Stack,
+    script: []const u8,
+    ctx: TxContext,
+    sig_version: SigVersion,
+    flags: ScriptFlags,
+    exec_data: ?*ExecData,
+) EvalError!void {
+    const is_tapscript = sig_version == .tapscript;
+    // BIP342 removes the 10000-byte MAX_SCRIPT_SIZE limit for tapscript
+    // leaves (resource use is bounded by the validation-weight budget
+    // instead); it still applies to legacy/segwit-v0 scripts.
+    if (!is_tapscript and script.len > limits.max_script_size) return error.ScriptSize;
 
     var altstack: Stack = .empty;
     var cond_stack: std.ArrayList(bool) = .empty;
@@ -635,22 +767,32 @@ pub fn eval(
         .ctx = ctx,
         .sig_version = sig_version,
         .flags = flags,
+        .exec_data = exec_data,
     };
 
     var pc: usize = 0;
-    while (pc < script.len) {
+    var opcode_pos: u32 = 0;
+    while (pc < script.len) : (opcode_pos +|= 1) {
         const instr = try readInstruction(script, pc);
         pc = instr.next;
+        state.opcode_pos = opcode_pos;
 
-        if (opcodes.isDisabled(instr.opcode)) return error.DisabledOpcode;
+        // In tapscript the legacy disabled-opcode set is instead the
+        // OP_SUCCESSx set (already resolved to an unconditional success by
+        // `scanOpSuccess` before execution begins), so the disabled check is
+        // legacy/segwit-v0 only. OP_VERIF/OP_VERNOTIF stay unconditionally
+        // invalid in every version.
+        if (!is_tapscript and opcodes.isDisabled(instr.opcode)) return error.DisabledOpcode;
         if (opcodes.isReservedConditional(instr.opcode)) return error.BadOpcode;
 
         // Op-count is metered for every non-push opcode > OP_16 (this
         // includes IF/NOTIF/ELSE/ENDIF themselves), regardless of whether
         // the current branch is executing -- Bitcoin Core counts this
         // before ever consulting fExec, so a script can't hide unbounded
-        // opcodes inside a never-taken branch.
-        if (instr.data == null and instr.opcode > @intFromEnum(Opcode.OP_16)) {
+        // opcodes inside a never-taken branch. BIP342 removes this limit for
+        // tapscript (the validation-weight budget bounds signature work
+        // instead).
+        if (!is_tapscript and instr.data == null and instr.opcode > @intFromEnum(Opcode.OP_16)) {
             state.op_count += 1;
             if (state.op_count > limits.max_ops_per_script) return error.OpCount;
         }
@@ -669,12 +811,13 @@ pub fn eval(
                 if (stack.items.len < 1) return error.InvalidStackOperation;
                 const top = stack.items[stack.items.len - 1];
                 // Bitcoin Core gates MINIMALIF on `sigversion ==
-                // WITNESS_V0` in addition to the flag -- it is not checked
-                // for legacy/base-context IF/NOTIF at all, even with the
-                // flag on (script_tests.json has vectors that rely on
+                // WITNESS_V0` + the flag for segwit-v0, and makes it
+                // CONSENSUS (always on, flag-independent) for tapscript
+                // (BIP342). It is never checked for legacy/base-context
+                // IF/NOTIF (script_tests.json has vectors that rely on
                 // exactly this: MINIMALIF set, a non-minimal boolean, base
                 // context -- expected result is EVAL_FALSE, not MINIMALIF).
-                if (flags.minimalif and sig_version == .witness_v0) {
+                if (is_tapscript or (flags.minimalif and sig_version == .witness_v0)) {
                     if (top.len > 1 or (top.len == 1 and top[0] != 1)) return error.MinimalIf;
                 }
                 value = number.castToBool(top);

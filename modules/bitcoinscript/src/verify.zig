@@ -9,15 +9,19 @@
 //! P2SH-wrapped witness program's scriptSig must be exactly one push of
 //! the redeem script, byte for byte).
 //!
-//! ## Scope: taproot key-path only
+//! ## Taproot: key-path AND script-path (BIP341/342)
 //!
 //! `wp.version == 1` (taproot) with a witness stack of exactly one element
 //! (after optional annex-stripping) is verified directly as a BIP340
 //! Schnorr signature over the BIP341 key-path sighash — no script is
-//! executed at all, per BIP341. A witness stack with more elements is
-//! **script-path (tapscript, BIP342) spending, which this module does not
-//! implement** — `error.TapscriptUnsupported`, a explicit typed failure,
-//! not a silent accept (SPEC.md "Deferred: BIP342 tapscript").
+//! executed at all, per BIP341. A witness stack with more elements is a
+//! **script-path (tapscript, BIP342) spend**: the last item is the control
+//! block, the second-to-last is the leaf script, and the rest seed the
+//! stack. `verifyTaprootScriptPath` checks the BIP341 taproot commitment
+//! (control block → tapleaf hash → Merkle root → tweak → output-key match),
+//! then executes the leaf under `interpreter.evalTapscript` with BIP342
+//! semantics (`OP_SUCCESSx` pre-scan, Schnorr `OP_CHECKSIG`/`OP_CHECKSIGADD`,
+//! the validation-weight budget, mandatory MINIMALIF). See `tapscript.zig`.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -28,6 +32,7 @@ const number = @import("number.zig");
 const flags_mod = @import("flags.zig");
 const txctx = @import("txctx.zig");
 const limits = @import("limits.zig");
+const tapscript = @import("tapscript.zig");
 
 pub const ScriptFlags = flags_mod.ScriptFlags;
 pub const TxContext = txctx.TxContext;
@@ -43,11 +48,17 @@ pub const VerifyError = interpreter.EvalError || bitcointx.bip341.Bip341Error ||
     WitnessMalleatedP2SH,
     WitnessUnexpected,
     DiscourageUpgradableWitnessProgram,
-    /// BIP341 witness stack (after optional annex-stripping) has more than
-    /// one element -- script-path (tapscript/BIP342) spending, which this
-    /// module deliberately does not implement (module doc comment).
-    TapscriptUnsupported,
     InvalidTaprootSignature,
+    /// BIP341 script-path: the control block's length is not `33 + 32m`
+    /// (`0 <= m <= 128`).
+    TaprootWrongControlSize,
+    /// BIP341 script-path: the control block does not commit to the witness
+    /// program (the recomputed taproot output key's x-coordinate/parity does
+    /// not match).
+    TaprootCommitmentMismatch,
+    /// BIP341 policy (`discourage_upgradable_taproot_version`): the leaf
+    /// version is not the assigned tapscript version `0xc0`.
+    DiscourageUpgradableTaprootVersion,
 };
 
 // ── script templates (BIP16 / BIP141) ───────────────────────────────────
@@ -93,28 +104,108 @@ fn parseWitnessProgram(script_pubkey: []const u8) ?WitnessProgram {
 
 // ── BIP341 taproot key-path ─────────────────────────────────────────────
 
-fn verifyTaprootKeyPath(allocator: Allocator, program_x: []const u8, witness: []const []const u8, ctx: TxContext) VerifyError!void {
+/// Total serialized byte size of an input's witness stack (BIP342's
+/// validation-weight budget base): `compact_size(n) + Σ (compact_size(len_i)
+/// + len_i)`.
+fn witnessSerializedSize(witness: []const []const u8) usize {
+    var total: usize = bitcointx.compactSizeLen(witness.len);
+    for (witness) |item| {
+        total += bitcointx.compactSizeLen(item.len);
+        total += item.len;
+    }
+    return total;
+}
+
+/// BIP341 taproot spend dispatch: key-path (1 item after annex-stripping) or
+/// script-path (2+ items). `program_x` is the 32-byte witness program (the
+/// output key's x-coordinate). `witness` is the FULL, un-stripped stack (its
+/// serialized size seeds the BIP342 weight budget).
+fn verifyTaproot(allocator: Allocator, program_x: []const u8, witness: []const []const u8, flags: ScriptFlags, ctx: TxContext) VerifyError!void {
+    if (program_x.len != 32) return error.InvalidTaprootSignature;
+
     var items = witness;
+    var annex: ?[]const u8 = null;
     // BIP341 annex: present iff >=2 items remain and the last starts 0x50.
     if (items.len >= 2 and items[items.len - 1].len >= 1 and items[items.len - 1][0] == 0x50) {
+        annex = items[items.len - 1];
         items = items[0 .. items.len - 1];
     }
-    if (items.len != 1) return error.TapscriptUnsupported;
+    if (items.len == 0) return error.WitnessProgramWitnessEmpty;
+    if (items.len == 1) return verifyTaprootKeyPath(allocator, program_x, items[0], ctx);
+    return verifyTaprootScriptPath(allocator, program_x, items, annex, witness, flags, ctx);
+}
 
-    const sig_bytes = items[0];
+fn verifyTaprootKeyPath(allocator: Allocator, program_x: []const u8, sig_bytes: []const u8, ctx: TxContext) VerifyError!void {
     if (sig_bytes.len != 64 and sig_bytes.len != 65) return error.InvalidTaprootSignature;
     const hash_type: u8 = if (sig_bytes.len == 65) sig_bytes[64] else bitcointx.bip341.SIGHASH_DEFAULT;
+    if (sig_bytes.len == 65 and hash_type == bitcointx.bip341.SIGHASH_DEFAULT) return error.InvalidTaprootSignature;
     var sig64: [64]u8 = undefined;
     @memcpy(&sig64, sig_bytes[0..64]);
 
     const msg = try bitcointx.bip341.sighash(allocator, ctx.tx, ctx.input_index, hash_type, ctx.spent_outputs);
 
-    if (program_x.len != 32) return error.InvalidTaprootSignature;
     var xonly: [32]u8 = undefined;
     @memcpy(&xonly, program_x);
     const pk = bip340.XOnlyPublicKey.fromBytes(xonly) catch return error.InvalidTaprootSignature;
     const sig = bip340.Signature.fromBytes(sig64) catch return error.InvalidTaprootSignature;
     if (!bip340.verify(pk, &msg, sig)) return error.InvalidTaprootSignature;
+}
+
+/// BIP341/342 taproot **script-path** spend. `items` is the witness stack
+/// with the annex already stripped (>=2 items): `items[last]` is the control
+/// block, `items[last-1]` the leaf script, `items[0..last-1]` the initial
+/// stack. `full_witness` (annex included) is used only to size the weight
+/// budget.
+fn verifyTaprootScriptPath(
+    allocator: Allocator,
+    program_x: []const u8,
+    items: []const []const u8,
+    annex: ?[]const u8,
+    full_witness: []const []const u8,
+    flags: ScriptFlags,
+    ctx: TxContext,
+) VerifyError!void {
+    const control_block = items[items.len - 1];
+    const script = items[items.len - 2];
+    const initial_stack = items[0 .. items.len - 2];
+
+    if (!tapscript.controlBlockValid(control_block)) return error.TaprootWrongControlSize;
+    if (!tapscript.verifyCommitment(program_x, control_block, script)) return error.TaprootCommitmentMismatch;
+
+    const leaf_version = control_block[0] & 0xfe;
+    if (leaf_version != tapscript.TAPSCRIPT_LEAF_VERSION) {
+        // Unknown leaf version: anyone-can-spend for future upgradeability,
+        // unless policy discourages it (BIP341).
+        if (flags.discourage_upgradable_taproot_version) return error.DiscourageUpgradableTaprootVersion;
+        return;
+    }
+
+    // BIP342 OP_SUCCESSx pre-scan (before any execution or stack checks).
+    if (try interpreter.scanOpSuccess(script)) {
+        if (flags.discourage_op_success) return error.DiscourageOpSuccess;
+        return;
+    }
+
+    // BIP342: the 520-byte-per-element limit and the 1000-element stack
+    // limit are extended to the INITIAL stack.
+    if (initial_stack.len > limits.max_stack_size) return error.CleanStack;
+    for (initial_stack) |elem| {
+        if (elem.len > limits.max_script_element_size) return error.PushSize;
+    }
+
+    var exec_data: tapscript.ExecData = .{
+        .tapleaf_hash = tapscript.tapleafHash(leaf_version, script),
+        .validation_weight = tapscript.validation_weight_offset + @as(i64, @intCast(witnessSerializedSize(full_witness))),
+        .annex = annex,
+    };
+
+    var stack: std.ArrayList([]const u8) = .empty;
+    for (initial_stack) |elem| try stack.append(allocator, elem);
+
+    try interpreter.evalTapscript(allocator, &stack, script, ctx, flags, &exec_data);
+
+    if (stack.items.len != 1) return error.CleanStack;
+    if (!number.castToBool(stack.items[0])) return error.EvalFalse;
 }
 
 // ── BIP141 segwit v0 / taproot dispatch ─────────────────────────────────
@@ -183,7 +274,7 @@ fn verifyWitnessProgram(
 
     if (wp.version == 1 and wp.program.len == 32 and !is_p2sh) {
         if (!flags.taproot) return; // taproot rules not enforced by caller: anyone-can-spend
-        return verifyTaprootKeyPath(allocator, wp.program, witness, ctx);
+        return verifyTaproot(allocator, wp.program, witness, flags, ctx);
     }
 
     // Any other version/length combination is future-reserved:
@@ -327,12 +418,13 @@ test "witness program: scriptSig must be empty" {
     try testing.expectError(error.WitnessMalleated, verifyScript(arena.allocator(), &nonempty_sig, &script_pubkey, &.{ "sig", "pubkey" }, .{ .witness = true }, dummyCtx()));
 }
 
-test "taproot: witness stack with 2+ elements (script-path) is deferred, not silently accepted" {
+test "taproot script-path: a malformed control block fails closed (wrong control size)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const script_pubkey = [_]u8{ 0x51, 0x20 } ++ [_]u8{0xbb} ** 32; // P2TR program
+    // 13-byte control block is not 33 + 32m -> TaprootWrongControlSize.
     const w = [_][]const u8{ "leaf-script", "control-block" };
-    try testing.expectError(error.TapscriptUnsupported, verifyScript(arena.allocator(), &.{}, &script_pubkey, &w, .{ .witness = true, .taproot = true }, dummyCtx()));
+    try testing.expectError(error.TaprootWrongControlSize, verifyScript(arena.allocator(), &.{}, &script_pubkey, &w, .{ .witness = true, .taproot = true }, dummyCtx()));
 }
 
 test "DoS: oversized scriptPubKey rejected before any execution" {
