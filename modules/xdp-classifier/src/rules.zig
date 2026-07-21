@@ -148,10 +148,16 @@ pub fn lookupReference(rules_: []const ClassifierRule, addr: [4]u8, default_clas
 }
 
 fn prefixMatches(prefix: Ipv4Prefix, addr: [4]u8) bool {
-    if (prefix.prefix_len == 0) return true;
+    // Clamp to /32: an out-of-range prefix_len (> 32; `prefix_len` is u6 so a
+    // caller can pass up to 63) means "compare all 32 bits". Without the clamp
+    // `32 - prefix_len` underflows the u32 subtraction and panics — this is
+    // the userspace reference, callable on rules that never went through
+    // `RuleSet.validate` (which is the real gate that rejects prefix_len > 32).
+    const len = @min(@as(u32, prefix.prefix_len), 32);
+    if (len == 0) return true;
     const bits: u32 = std.mem.readInt(u32, &prefix.addr, .big);
     const a: u32 = std.mem.readInt(u32, &addr, .big);
-    const shift: u5 = @intCast(32 - @as(u32, prefix.prefix_len));
+    const shift: u5 = @intCast(32 - len);
     return (bits >> shift) == (a >> shift);
 }
 
@@ -268,6 +274,27 @@ test "hostile: RuleSet.validate never panics across a wide sweep of prefix_len/a
             const max_entries = rand.uintLessThan(usize, 16);
             _ = rs.validate(max_entries) catch {}; // any declared error is fine; a panic is not
         }
+    }
+}
+
+test "hostile: prefixMatches/lookupReference never panic on an out-of-range prefix_len" {
+    // prefix_len 33 pre-fix underflows `32 - prefix_len` (u32) → panic. It now
+    // clamps to /32 (compare all 32 bits): an exact match on the stored addr.
+    const rules = [_]ClassifierRule{
+        .{ .prefix = .{ .addr = .{ 255, 255, 255, 255 }, .prefix_len = 33 }, .class = 7 },
+    };
+    try testing.expectEqual(@as(u32, 7), lookupReference(&rules, .{ 255, 255, 255, 255 }, 0));
+    try testing.expectEqual(@as(u32, 0), lookupReference(&rules, .{ 1, 2, 3, 4 }, 0));
+
+    // Full out-of-spec sweep (33‥63) crossed with matching/non-matching
+    // addresses: no path panics.
+    var pl: u16 = 33;
+    while (pl <= 63) : (pl += 1) {
+        const rs = [_]ClassifierRule{
+            .{ .prefix = .{ .addr = .{ 10, 0, 0, 0 }, .prefix_len = @intCast(pl) }, .class = 1 },
+        };
+        _ = lookupReference(&rs, .{ 10, 0, 0, 0 }, 0);
+        _ = lookupReference(&rs, .{ 192, 168, 0, 1 }, 0);
     }
 }
 
