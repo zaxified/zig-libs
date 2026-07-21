@@ -483,12 +483,19 @@ const Parser = struct {
             const c = self.src[self.i];
             if (c == '<') {
                 try self.parseMarkup(prolog, epilog, root);
-            } else if (isWs(c)) {
-                self.i += 1; // inter-element whitespace at document level is ignored
             } else if (self.stack.items.len == 0) {
-                // character data outside any element is not allowed
-                return error.TrailingContent;
+                // Outside any element: only inter-element whitespace is allowed
+                // (and ignored — it is not part of any canonicalized subtree).
+                // Any other character data at the document level is an error.
+                if (isWs(c)) {
+                    self.i += 1;
+                } else {
+                    return error.TrailingContent;
+                }
             } else {
+                // Inside an element ALL character data — including leading /
+                // whitespace-only runs — is significant content and must be
+                // preserved verbatim (C14N is whitespace-sensitive here).
                 try self.parseText();
             }
         }
@@ -1077,6 +1084,18 @@ test "attribute value normalization: whitespace and refs" {
     // literal tab/newline → space; but a char-ref tab stays a tab
     try testing.expectEqualStrings("x y z", doc.root.attr("", "a").?);
     try testing.expectEqualStrings("\t", doc.root.attr("", "b").?);
+}
+
+test "content whitespace preserved: leading + whitespace-only runs (C14N-critical regression)" {
+    // Regression: leading/whitespace-only character data INSIDE an element is
+    // significant content and must survive verbatim — dropping it breaks XML-DSig
+    // canonicalization (the signer's whitespace is part of the signed octets).
+    // Document-level inter-element whitespace stays ignored.
+    var doc = try parse(testing.allocator, "  <e>\n   text\n</e>  ", .{});
+    defer doc.deinit();
+    const txt = try doc.root.textContent(testing.allocator);
+    defer testing.allocator.free(txt);
+    try testing.expectEqualStrings("\n   text\n", txt);
 }
 
 test "getElementById + findByAttr" {
