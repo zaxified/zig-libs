@@ -84,6 +84,7 @@ const module_list = [_]Module{
     .{ .name = "upstream", .deps = &.{ "resilience", "probe" } },
     .{ .name = "jwt", .deps = &.{ "http", "router", "p256" } },
     .{ .name = "rbac" },
+    .{ .name = "xml" },
     .{ .name = "jwe", .deps = &.{ "rsa", "p256" } },
     .{ .name = "rdap", .deps = &.{ "http", "netaddr" } },
     .{ .name = "blobstore", .deps = &.{"hashdigest"} },
