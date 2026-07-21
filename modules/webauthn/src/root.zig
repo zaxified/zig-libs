@@ -1,0 +1,600 @@
+// SPDX-License-Identifier: MIT
+//! webauthn — W3C Web Authentication (WebAuthn) Level 3 / FIDO2 RELYING-PARTY
+//! verifier: assertion (authentication) verification and attestation
+//! (registration) verification over untrusted, attacker-controlled wire
+//! bytes. This module is a spec-assembly layer, not a new crypto primitive —
+//! every signature check routes through an existing, independently-KAT'd
+//! primitive (`p256`'s ES256, `std.crypto.sign.Ed25519`'s EdDSA, `rsa`'s
+//! RS256 PKCS1-v1.5) and every CBOR/COSE parse routes through the sibling
+//! `cbor`/`cbor.cose` codec — this module never hand-rolls a bignum or a
+//! CBOR decoder.
+//!
+//! **Assertion (authentication) verify — `verifyAssertion`**: given the
+//! authenticator's raw `authenticatorData`, the raw `clientDataJSON`, the
+//! signature, and the stored credential's COSE public key, checks (WebAuthn
+//! §7.2, "Verifying an authentication assertion"):
+//!   - `clientDataJSON` parses as JSON, `type == "webauthn.get"`, the
+//!     decoded `challenge` matches the expected challenge bytes, `origin`
+//!     matches;
+//!   - `authenticatorData`'s leading 32 bytes (`rpIdHash`) equal
+//!     `SHA-256(rpId)`;
+//!   - the User Present flag is set (and User Verified, when the caller
+//!     requires it);
+//!   - the signature over `authenticatorData || SHA-256(clientDataJSON)`
+//!     verifies under the stored credential's COSE key + algorithm
+//!     (ES256/EdDSA/RS256).
+//! Returns the parsed `signCount` + flags on success, a typed error on any
+//! failure — see "Threat model" in SPEC.md for what each check defends
+//! against and the adversarial test suite (`assertion_test.zig`) that proves
+//! each one is load-bearing (tamper any one input, verification fails).
+//!
+//! **Attestation (registration) verify — `verifyAttestation`**: parses the
+//! CBOR `attestationObject` (`{fmt, attStmt, authData}`), extracts the
+//! attested credential's COSE public key from `authData`, and verifies the
+//! attestation statement for `fmt` in {`none`, `packed`, `fido-u2f`}
+//! (WebAuthn §8.2/§8.3/§8.6). `tpm` and `android-key` are DEFERRED —
+//! structurally recognized and rejected with `error.UnsupportedFormat`
+//! rather than half-implemented (see SPEC.md "Deferred" for the rationale:
+//! both require parsing/validating a manufacturer certificate-chain format
+//! — TPM's `TPMS_ATTEST`/`TPMT_SIGNATURE` wire structs, Android's key
+//! attestation X.509 extension — that is a project of its own, orthogonal
+//! to the WebAuthn verification procedure itself).
+//!
+//! **Out of scope, by design (not silently skipped):** account-recovery /
+//! backup codes are a product concern layered *above* WebAuthn, not part of
+//! the W3C verification procedure — see SPEC.md.
+//!
+//! Provenance: clean-room from W3C Web Authentication (WebAuthn) Level 3
+//! (https://www.w3.org/TR/webauthn-3/) §6 (authenticator data), §7.1/§7.2
+//! (registration/authentication ceremony verification), §8.2/§8.3/§8.6
+//! (packed / none / fido-u2f attestation statement formats); RFC 8152/9053
+//! (COSE, via the sibling `cbor.cose`); RFC 8230 (RFC 8152 RSA COSE key
+//! parameters, `kty=3`/`n=-1`/`e=-2` — not modeled by `cbor.cose`, so this
+//! module parses that key shape itself, see `parseCredentialKey`). See
+//! NOTICE for the citation entry.
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const cbor = @import("cbor");
+const rsa = @import("rsa");
+const p256 = @import("p256");
+const Sha256 = std.crypto.hash.sha2.Sha256;
+const Ed25519 = std.crypto.sign.Ed25519;
+
+pub const meta = .{
+    .platform = .any,
+    .role = .util, // pure verification logic — no I/O, no wire framing of its own
+    .concurrency = .reentrant, // no shared/global state; every function takes its inputs as parameters
+    .model_after = "W3C WebAuthn Level 3 (https://www.w3.org/TR/webauthn-3/) — clean-room from the spec",
+    .deps = .{ "cbor", "rsa", "p256" },
+};
+
+// RFC 8812 §2 COSE algorithm identifier for RS256 (RSASSA-PKCS1-v1_5 w/
+// SHA-256) — not in `cbor.cose` (that module only lists algs its own
+// EC2/OKP key types use); webauthn is the first consumer that needs RSA.
+const alg_rs256: i64 = -257;
+
+// ── COSE key extraction (extends cbor.cose with RFC 8230 RSA keys) ─────────
+
+/// An RSA `COSE_Key` (RFC 8230 §4, `kty=3`): the modulus `n` (label -1) and
+/// public exponent `e` (label -2), both big-endian byte strings — the same
+/// label *numbers* `cbor.cose` uses for EC2's `crv`/`x` (label reuse across
+/// key types is RFC 8152's design, not a collision).
+pub const RsaKey = struct {
+    alg: ?i64,
+    n: []const u8,
+    e: []const u8,
+};
+
+/// The credential public key, extended over `cbor.cose.Key` to add the RSA
+/// case (RS256) `cbor.cose` deliberately does not model (see that module's
+/// doc comment: "RSA and symmetric COSE key types are not modeled").
+pub const CoseKey = union(enum) {
+    ec2: cbor.cose.Ec2Key,
+    okp: cbor.cose.OkpKey,
+    rsa: RsaKey,
+
+    fn alg(self: CoseKey) ?i64 {
+        return switch (self) {
+            .ec2 => |k| k.alg,
+            .okp => |k| k.alg,
+            .rsa => |k| k.alg,
+        };
+    }
+};
+
+pub const KeyError = cbor.cose.KeyError;
+
+fn cborMapGetInt(entries: []const cbor.MapEntry, label: i64) ?cbor.Value {
+    for (entries) |e| {
+        switch (e.key) {
+            .uint, .negint => {
+                const k = e.key.toI64() orelse continue;
+                if (k == label) return e.value;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn cborMapGetStr(entries: []const cbor.MapEntry, key: []const u8) ?cbor.Value {
+    for (entries) |e| {
+        switch (e.key) {
+            .text => |t| if (std.mem.eql(u8, t, key)) return e.value,
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// Parse a `COSE_Key` map that may be EC2 (`cbor.cose`), OKP (`cbor.cose`),
+/// or RSA (RFC 8230, this module). This is `webauthn`'s key parser — it is
+/// the one to use for a credential public key pulled out of `authData`, in
+/// place of calling `cbor.cose.parseKey` directly (which returns
+/// `error.UnsupportedKty` for RSA).
+pub fn parseCredentialKey(value: cbor.Value) KeyError!CoseKey {
+    const entries = switch (value) {
+        .map => |m| m,
+        else => return error.NotAMap,
+    };
+    const kty_v = cborMapGetInt(entries, cbor.cose.label_kty) orelse return error.MissingField;
+    const kty = kty_v.toI64() orelse return error.WrongType;
+    if (kty == 3) { // RFC 8230 kty "RSA"
+        const alg_v = cborMapGetInt(entries, cbor.cose.label_alg);
+        const alg: ?i64 = if (alg_v) |v| (v.toI64() orelse return error.WrongType) else null;
+        const n_v = cborMapGetInt(entries, cbor.cose.label_crv) orelse return error.MissingField; // label -1
+        const e_v = cborMapGetInt(entries, cbor.cose.label_x) orelse return error.MissingField; // label -2
+        const n = switch (n_v) {
+            .bytes => |b| b,
+            else => return error.WrongType,
+        };
+        const e = switch (e_v) {
+            .bytes => |b| b,
+            else => return error.WrongType,
+        };
+        return .{ .rsa = .{ .alg = alg, .n = n, .e = e } };
+    }
+    return switch (try cbor.cose.parseKey(value)) {
+        .ec2 => |k| .{ .ec2 = k },
+        .okp => |k| .{ .okp = k },
+    };
+}
+
+// ── clientDataJSON (WebAuthn §5.8.1 CollectedClientData) ───────────────────
+
+pub const ClientDataError = error{ InvalidJson, Base64DecodeError, OutOfMemory };
+
+pub const ClientData = struct {
+    type: []const u8,
+    /// Decoded from the JSON's base64url `challenge` field — raw bytes, to
+    /// be compared against the RP's own raw challenge bytes (never compare
+    /// the base64url text directly: two different encodings of the same
+    /// bytes must still match).
+    challenge: []const u8,
+    origin: []const u8,
+    cross_origin: ?bool,
+};
+
+/// Parse `client_data_json` (WebAuthn §5.8.1). Allocates via `allocator`
+/// (an arena is the natural fit — nothing here needs individual freeing).
+pub fn parseClientData(allocator: Allocator, client_data_json: []const u8) ClientDataError!ClientData {
+    const Raw = struct {
+        type: []const u8,
+        challenge: []const u8,
+        origin: []const u8,
+        crossOrigin: ?bool = null,
+    };
+    const raw = std.json.parseFromSliceLeaky(Raw, allocator, client_data_json, .{
+        .ignore_unknown_fields = true,
+    }) catch return error.InvalidJson;
+
+    const decoder = std.base64.url_safe_no_pad.Decoder;
+    const chal_len = decoder.calcSizeForSlice(raw.challenge) catch return error.Base64DecodeError;
+    const chal = try allocator.alloc(u8, chal_len);
+    decoder.decode(chal, raw.challenge) catch return error.Base64DecodeError;
+
+    return .{
+        .type = raw.type,
+        .challenge = chal,
+        .origin = raw.origin,
+        .cross_origin = raw.crossOrigin,
+    };
+}
+
+// ── authenticatorData (WebAuthn §6.1) ───────────────────────────────────────
+
+pub const AuthDataError = error{ Truncated, ExtensionsNotSupported, OutOfMemory } || cbor.DecodeError || KeyError;
+
+pub const AttestedCredentialData = struct {
+    aaguid: [16]u8,
+    credential_id: []const u8,
+    credential_public_key: CoseKey,
+};
+
+pub const AuthenticatorData = struct {
+    rp_id_hash: [32]u8,
+    flags: Flags,
+    sign_count: u32,
+    attested_credential_data: ?AttestedCredentialData,
+
+    /// WebAuthn §6.1 flags byte, bit 0 (LSB) first.
+    pub const Flags = packed struct(u8) {
+        user_present: bool,
+        rfu1: bool,
+        user_verified: bool,
+        backup_eligible: bool,
+        backup_state: bool,
+        rfu2: bool,
+        attested_credential_data: bool,
+        extension_data: bool,
+    };
+};
+
+/// Parse `authenticatorData` (WebAuthn §6.1): `rpIdHash(32) || flags(1) ||
+/// signCount(4, BE) || [attestedCredentialData]`. Extension data (flags bit
+/// ED) is structurally detected and rejected with
+/// `error.ExtensionsNotSupported` — this module has no byte-accounting CBOR
+/// decoder to know where the (variable-length) credential public key ends
+/// and trailing extensions begin when both are present; see SPEC.md
+/// "Deferred". `allocator` is used only when `attestedCredentialData` is
+/// present (to decode its CBOR credential public key).
+pub fn parseAuthenticatorData(allocator: Allocator, raw: []const u8) AuthDataError!AuthenticatorData {
+    if (raw.len < 37) return error.Truncated;
+    var rp_id_hash: [32]u8 = undefined;
+    @memcpy(&rp_id_hash, raw[0..32]);
+    const flags: AuthenticatorData.Flags = @bitCast(raw[32]);
+    const sign_count = std.mem.readInt(u32, raw[33..37], .big);
+
+    var attested: ?AttestedCredentialData = null;
+    if (flags.attested_credential_data) {
+        if (raw.len < 37 + 16 + 2) return error.Truncated;
+        var aaguid: [16]u8 = undefined;
+        @memcpy(&aaguid, raw[37..53]);
+        const cred_id_len = std.mem.readInt(u16, raw[53..55], .big);
+        const cred_id_start: usize = 55;
+        const cred_id_end = cred_id_start + cred_id_len;
+        if (raw.len < cred_id_end) return error.Truncated;
+        const credential_id = raw[cred_id_start..cred_id_end];
+
+        if (flags.extension_data) return error.ExtensionsNotSupported;
+        const pubkey_bytes = raw[cred_id_end..];
+
+        const decoded = try cbor.decode(allocator, pubkey_bytes, .{});
+        const key = try parseCredentialKey(decoded);
+        attested = .{ .aaguid = aaguid, .credential_id = credential_id, .credential_public_key = key };
+    } else if (flags.extension_data) {
+        return error.ExtensionsNotSupported;
+    }
+
+    return .{ .rp_id_hash = rp_id_hash, .flags = flags, .sign_count = sign_count, .attested_credential_data = attested };
+}
+
+// ── signature verification dispatch (ES256 / EdDSA / RS256) ────────────────
+
+pub const SignatureError = error{ UnsupportedAlgorithm, InvalidKey, InvalidSignature, BadSignature };
+
+/// Verify `sig` over `msg` under `key`, per the COSE algorithm identifier
+/// `alg` — the alg is bound tightly to the key's own curve/type (an ES256
+/// `alg` against a P-384 key, or any `alg` that doesn't match the key's
+/// `kty`/`crv`, is `error.UnsupportedAlgorithm`, never silently coerced —
+/// this is the algorithm-confusion defense).
+pub fn verifySignature(key: CoseKey, alg: i64, msg: []const u8, sig: []const u8) SignatureError!void {
+    switch (key) {
+        .ec2 => |ec2| {
+            if (ec2.crv != cbor.cose.crv_p256 or alg != cbor.cose.alg_es256) return error.UnsupportedAlgorithm;
+            if (ec2.x.len != 32 or ec2.y.len != 32) return error.InvalidKey;
+            var sec1: [65]u8 = undefined;
+            sec1[0] = 0x04;
+            @memcpy(sec1[1..33], ec2.x);
+            @memcpy(sec1[33..65], ec2.y);
+            const parsed_sig = p256.EcdsaP256Sha256.Signature.fromDer(sig) catch return error.InvalidSignature;
+            if (!p256.sign.ecdsaVerify(&sec1, msg, parsed_sig.toBytes())) return error.BadSignature;
+        },
+        .okp => |okp| {
+            if (okp.crv != cbor.cose.crv_ed25519 or alg != cbor.cose.alg_eddsa) return error.UnsupportedAlgorithm;
+            if (okp.x.len != 32) return error.InvalidKey;
+            if (sig.len != Ed25519.Signature.encoded_length) return error.InvalidSignature;
+            const pk = Ed25519.PublicKey.fromBytes(okp.x[0..32].*) catch return error.InvalidKey;
+            const s = Ed25519.Signature.fromBytes(sig[0..Ed25519.Signature.encoded_length].*);
+            s.verify(msg, pk) catch return error.BadSignature;
+        },
+        .rsa => |rk| {
+            if (alg != alg_rs256) return error.UnsupportedAlgorithm;
+            const pk = rsa.PublicKey.fromBytes(rk.n, rk.e) catch return error.InvalidKey;
+            rsa.verifyPkcs1v15(pk, std.crypto.hash.sha2.Sha256, msg, sig) catch return error.BadSignature;
+        },
+    }
+}
+
+// ── assertion (authentication) verify — WebAuthn §7.2 ───────────────────────
+
+pub const AssertionError = ClientDataError || AuthDataError || SignatureError || error{
+    TypeMismatch,
+    ChallengeMismatch,
+    OriginMismatch,
+    RpIdMismatch,
+    UserNotPresent,
+    UserNotVerified,
+    MissingAlgorithm,
+};
+
+pub const AssertionOptions = struct {
+    /// The Relying Party ID (WebAuthn §4) — `authenticatorData`'s
+    /// `rpIdHash` must equal `SHA-256(rp_id)`.
+    rp_id: []const u8,
+    /// The exact raw challenge bytes the RP issued (not base64url text).
+    expected_challenge: []const u8,
+    /// The exact origin the RP expects (e.g. `"https://example.org"`).
+    expected_origin: []const u8,
+    require_user_verification: bool = false,
+};
+
+pub const AssertionResult = struct {
+    sign_count: u32,
+    user_present: bool,
+    user_verified: bool,
+};
+
+/// Verify a WebAuthn assertion (authentication ceremony, §7.2): clientData
+/// type/challenge/origin, `rpIdHash`, User Present (+ User Verified if
+/// required), and the signature over `authenticatorData ||
+/// SHA-256(clientDataJSON)` under `credential_public_key`'s own algorithm.
+/// `allocator` is used for JSON parsing and the signed-message concat (an
+/// arena is the natural fit).
+pub fn verifyAssertion(
+    allocator: Allocator,
+    authenticator_data: []const u8,
+    client_data_json: []const u8,
+    signature: []const u8,
+    credential_public_key: CoseKey,
+    options: AssertionOptions,
+) AssertionError!AssertionResult {
+    const client_data = try parseClientData(allocator, client_data_json);
+    if (!std.mem.eql(u8, client_data.type, "webauthn.get")) return error.TypeMismatch;
+    if (!std.mem.eql(u8, client_data.challenge, options.expected_challenge)) return error.ChallengeMismatch;
+    if (!std.mem.eql(u8, client_data.origin, options.expected_origin)) return error.OriginMismatch;
+
+    const auth_data = try parseAuthenticatorData(allocator, authenticator_data);
+
+    var expected_rp_id_hash: [32]u8 = undefined;
+    Sha256.hash(options.rp_id, &expected_rp_id_hash, .{});
+    if (!std.mem.eql(u8, &auth_data.rp_id_hash, &expected_rp_id_hash)) return error.RpIdMismatch;
+
+    if (!auth_data.flags.user_present) return error.UserNotPresent;
+    if (options.require_user_verification and !auth_data.flags.user_verified) return error.UserNotVerified;
+
+    var client_data_hash: [32]u8 = undefined;
+    Sha256.hash(client_data_json, &client_data_hash, .{});
+    const msg = try std.mem.concat(allocator, u8, &.{ authenticator_data, &client_data_hash });
+
+    const alg = credential_public_key.alg() orelse return error.MissingAlgorithm;
+    try verifySignature(credential_public_key, alg, msg, signature);
+
+    return .{
+        .sign_count = auth_data.sign_count,
+        .user_present = auth_data.flags.user_present,
+        .user_verified = auth_data.flags.user_verified,
+    };
+}
+
+// ── attestation (registration) verify — WebAuthn §7.1/§8 ───────────────────
+
+pub const AttestationObjectError = error{ NotAMap, MissingField, WrongType, OutOfMemory } || cbor.DecodeError;
+
+pub const AttestationError = AttestationObjectError || AuthDataError || SignatureError || error{
+    MissingAttestedCredentialData,
+    InvalidAttestationStatement,
+    InvalidCertificate,
+    UnsupportedFormat,
+};
+
+pub const AttestationType = enum { none, basic, self_attestation };
+
+pub const AttestationResult = struct {
+    attestation_type: AttestationType,
+    format: []const u8,
+    credential_id: []const u8,
+    credential_public_key: CoseKey,
+    aaguid: [16]u8,
+    sign_count: u32,
+};
+
+const AttestationObject = struct {
+    fmt: []const u8,
+    att_stmt: []const cbor.MapEntry,
+    auth_data_raw: []const u8,
+    auth_data: AuthenticatorData,
+};
+
+fn parseAttestationObject(allocator: Allocator, raw: []const u8) (AttestationObjectError || AuthDataError)!AttestationObject {
+    const decoded = try cbor.decode(allocator, raw, .{});
+    const entries = switch (decoded) {
+        .map => |m| m,
+        else => return error.NotAMap,
+    };
+    const fmt_v = cborMapGetStr(entries, "fmt") orelse return error.MissingField;
+    const fmt = switch (fmt_v) {
+        .text => |t| t,
+        else => return error.WrongType,
+    };
+    const att_stmt_v = cborMapGetStr(entries, "attStmt") orelse return error.MissingField;
+    const att_stmt = switch (att_stmt_v) {
+        .map => |m| m,
+        else => return error.WrongType,
+    };
+    const auth_data_v = cborMapGetStr(entries, "authData") orelse return error.MissingField;
+    const auth_data_raw = switch (auth_data_v) {
+        .bytes => |b| b,
+        else => return error.WrongType,
+    };
+    const auth_data = try parseAuthenticatorData(allocator, auth_data_raw);
+
+    return .{ .fmt = fmt, .att_stmt = att_stmt, .auth_data_raw = auth_data_raw, .auth_data = auth_data };
+}
+
+/// Verify a leaf X.509 certificate's signature over `msg`, dispatching on
+/// its own SubjectPublicKeyInfo algorithm (EC P-256, Ed25519, or RSA) and
+/// requiring it agree with the attestation statement's declared COSE `alg`
+/// — used by both `packed` (x5c/basic) and `fido-u2f`. Certificate PARSING
+/// (not chain validation — no trust-store lookup, no expiry/policy check;
+/// see SPEC.md "Deferred") is `std.crypto.Certificate.parse`, the same
+/// primitive the sibling `x509` module builds its chain validator on.
+fn verifyLeafCertSignature(leaf_der: []const u8, alg: i64, msg: []const u8, sig: []const u8) AttestationError!void {
+    const cert: std.crypto.Certificate = .{ .buffer = leaf_der, .index = 0 };
+    const parsed = cert.parse() catch return error.InvalidCertificate;
+    switch (parsed.pub_key_algo) {
+        .X9_62_id_ecPublicKey => |named_curve| {
+            if (named_curve != .X9_62_prime256v1) return error.UnsupportedAlgorithm;
+            if (alg != cbor.cose.alg_es256) return error.UnsupportedAlgorithm;
+            const sec1_pub_key = parsed.pubKey();
+            const parsed_sig = p256.EcdsaP256Sha256.Signature.fromDer(sig) catch return error.InvalidSignature;
+            if (!p256.sign.ecdsaVerify(sec1_pub_key, msg, parsed_sig.toBytes())) return error.BadSignature;
+        },
+        .curveEd25519 => {
+            if (alg != cbor.cose.alg_eddsa) return error.UnsupportedAlgorithm;
+            const raw_pk = parsed.pubKey();
+            if (raw_pk.len != 32) return error.InvalidCertificate;
+            if (sig.len != Ed25519.Signature.encoded_length) return error.InvalidSignature;
+            const pk = Ed25519.PublicKey.fromBytes(raw_pk[0..32].*) catch return error.InvalidKey;
+            const s = Ed25519.Signature.fromBytes(sig[0..Ed25519.Signature.encoded_length].*);
+            s.verify(msg, pk) catch return error.BadSignature;
+        },
+        .rsaEncryption => {
+            if (alg != alg_rs256) return error.UnsupportedAlgorithm;
+            const components = std.crypto.Certificate.rsa.PublicKey.parseDer(parsed.pubKey()) catch return error.InvalidCertificate;
+            const pk = rsa.PublicKey.fromBytes(components.modulus, components.exponent) catch return error.InvalidKey;
+            rsa.verifyPkcs1v15(pk, std.crypto.hash.sha2.Sha256, msg, sig) catch return error.BadSignature;
+        },
+        .rsassa_pss => return error.UnsupportedAlgorithm,
+    }
+}
+
+fn firstX5cDer(att_stmt: []const cbor.MapEntry) AttestationError!?[]const u8 {
+    const x5c_v = cborMapGetStr(att_stmt, "x5c") orelse return null;
+    const arr = switch (x5c_v) {
+        .array => |a| a,
+        else => return error.WrongType,
+    };
+    if (arr.len == 0) return error.MissingField;
+    return switch (arr[0]) {
+        .bytes => |b| b,
+        else => error.WrongType,
+    };
+}
+
+/// `packed` attestation statement (WebAuthn §8.2): x5c present -> basic
+/// attestation, verify `sig` over `authData || clientDataHash` with the
+/// leaf certificate's key; x5c absent -> self attestation, verify with the
+/// credential's own public key (the `alg` in `attStmt` and the algorithm
+/// bound to `credential_key` must agree — enforced inside `verifySignature`
+/// itself, which rejects any alg/key-family mismatch).
+fn verifyPacked(att_stmt: []const cbor.MapEntry, msg: []const u8, credential_key: CoseKey) AttestationError!AttestationType {
+    const alg_v = cborMapGetStr(att_stmt, "alg") orelse return error.MissingField;
+    const alg = alg_v.toI64() orelse return error.WrongType;
+    const sig_v = cborMapGetStr(att_stmt, "sig") orelse return error.MissingField;
+    const sig = switch (sig_v) {
+        .bytes => |b| b,
+        else => return error.WrongType,
+    };
+
+    if (try firstX5cDer(att_stmt)) |leaf_der| {
+        try verifyLeafCertSignature(leaf_der, alg, msg, sig);
+        return .basic;
+    }
+    try verifySignature(credential_key, alg, msg, sig);
+    return .self_attestation;
+}
+
+/// `fido-u2f` attestation statement (WebAuthn §8.6, U2F-era authenticators):
+/// ES256/P-256 only. The signed blob is NOT `authData || clientDataHash` —
+/// it is U2F's own `0x00 || rpIdHash || clientDataHash || credentialId ||
+/// publicKeyU2F` (`publicKeyU2F` = the credential's EC point re-encoded as a
+/// raw 65-byte SEC1-uncompressed point, `0x04 || x || y`).
+fn verifyFidoU2f(
+    allocator: Allocator,
+    att_stmt: []const cbor.MapEntry,
+    auth_data: AuthenticatorData,
+    client_data_hash: [32]u8,
+) AttestationError!AttestationType {
+    const sig_v = cborMapGetStr(att_stmt, "sig") orelse return error.MissingField;
+    const sig = switch (sig_v) {
+        .bytes => |b| b,
+        else => return error.WrongType,
+    };
+    const leaf_der = (try firstX5cDer(att_stmt)) orelse return error.MissingField;
+
+    const att = auth_data.attested_credential_data orelse return error.MissingAttestedCredentialData;
+    const ec2 = switch (att.credential_public_key) {
+        .ec2 => |k| k,
+        else => return error.UnsupportedAlgorithm, // fido-u2f credentials are always EC2/P-256
+    };
+    if (ec2.crv != cbor.cose.crv_p256 or ec2.x.len != 32 or ec2.y.len != 32) return error.InvalidKey;
+
+    var public_key_u2f: [65]u8 = undefined;
+    public_key_u2f[0] = 0x04;
+    @memcpy(public_key_u2f[1..33], ec2.x);
+    @memcpy(public_key_u2f[33..65], ec2.y);
+
+    const verification_data = try std.mem.concat(allocator, u8, &.{
+        &[_]u8{0x00},
+        &auth_data.rp_id_hash,
+        &client_data_hash,
+        att.credential_id,
+        &public_key_u2f,
+    });
+
+    try verifyLeafCertSignature(leaf_der, cbor.cose.alg_es256, verification_data, sig);
+    return .basic;
+}
+
+/// Verify a WebAuthn attestation (registration ceremony, §7.1): parses
+/// `attestation_object_raw` and dispatches on `fmt` to `none`/`packed`/
+/// `fido-u2f`. `tpm`/`android-key` (and any other fmt) return
+/// `error.UnsupportedFormat` — structurally recognized, not silently
+/// accepted, not half-verified. `client_data_hash` is
+/// `SHA-256(clientDataJSON)` (compute it via `parseClientData` +
+/// `std.crypto.hash.sha2.Sha256.hash` on the raw bytes, same as for
+/// assertions — the caller is expected to also run the clientData
+/// type/challenge/origin checks via `parseClientData`, since `fmt=="none"`
+/// has no attStmt-level signature to anchor a full ceremony check).
+pub fn verifyAttestation(
+    allocator: Allocator,
+    attestation_object_raw: []const u8,
+    client_data_hash: [32]u8,
+) AttestationError!AttestationResult {
+    const obj = try parseAttestationObject(allocator, attestation_object_raw);
+    const att = obj.auth_data.attested_credential_data orelse return error.MissingAttestedCredentialData;
+
+    const attestation_type: AttestationType = if (std.mem.eql(u8, obj.fmt, "none")) blk: {
+        if (obj.att_stmt.len != 0) return error.InvalidAttestationStatement;
+        break :blk .none;
+    } else if (std.mem.eql(u8, obj.fmt, "packed")) blk: {
+        const msg = try std.mem.concat(allocator, u8, &.{ obj.auth_data_raw, &client_data_hash });
+        break :blk try verifyPacked(obj.att_stmt, msg, att.credential_public_key);
+    } else if (std.mem.eql(u8, obj.fmt, "fido-u2f")) blk: {
+        break :blk try verifyFidoU2f(allocator, obj.att_stmt, obj.auth_data, client_data_hash);
+    } else return error.UnsupportedFormat; // covers "tpm", "android-key", and anything unrecognized
+
+    return .{
+        .attestation_type = attestation_type,
+        .format = obj.fmt,
+        .credential_id = att.credential_id,
+        .credential_public_key = att.credential_public_key,
+        .aaguid = att.aaguid,
+        .sign_count = obj.auth_data.sign_count,
+    };
+}
+
+// ── tests ───────────────────────────────────────────────────────────────────
+
+test {
+    _ = @import("clientdata_test.zig");
+    _ = @import("assertion_test.zig");
+    _ = @import("attestation_test.zig");
+}
+
+test "smoke: module compiles and CoseKey.alg dispatch works" {
+    const key: CoseKey = .{ .ec2 = .{ .alg = cbor.cose.alg_es256, .crv = cbor.cose.crv_p256, .x = &[_]u8{0} ** 32, .y = &[_]u8{0} ** 32 } };
+    try std.testing.expectEqual(@as(?i64, cbor.cose.alg_es256), key.alg());
+}
