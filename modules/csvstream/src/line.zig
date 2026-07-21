@@ -397,3 +397,45 @@ test "LineIterator: base_offset propagates correctly across records" {
     try t.expectEqual(@as(u64, 50), it.next().?.byte_offset);
     try t.expectEqual(@as(u64, 53), it.next().?.byte_offset);
 }
+
+// ── fuzz: LineIterator and splitFields are the untrusted-input decode
+// surface (arbitrary CSV bytes) — must never panic, loop forever, or read
+// out of bounds, only yield records/fields or drop silently.
+
+test "fuzz: LineIterator never panics or loops on arbitrary bytes" {
+    try t.fuzz({}, fuzzLineIterator, .{});
+}
+
+fn fuzzLineIterator(_: void, smith: *std.testing.Smith) !void {
+    var buf: [512]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const quote: u8 = smith.value(u8);
+
+    var it = LineIterator.init(buf[0..len], quote, 0);
+    // Every record consumes at least one byte plus its terminator, so the
+    // number of records is bounded by the input length.
+    var steps: usize = 0;
+    while (it.next()) |_| {
+        steps += 1;
+        try t.expect(steps <= len + 1);
+    }
+}
+
+test "fuzz: splitFields never panics on arbitrary bytes" {
+    try t.fuzz({}, fuzzSplitFields, .{});
+}
+
+fn fuzzSplitFields(_: void, smith: *std.testing.Smith) !void {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+
+    var line_buf: [256]u8 = undefined;
+    smith.bytes(&line_buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, line_buf.len);
+    const delimiter: u8 = smith.value(u8);
+    const quote: u8 = smith.value(u8);
+
+    var fields_buf: [64][]const u8 = undefined;
+    _ = splitFields(line_buf[0..len], &fields_buf, delimiter, quote, arena.allocator()) catch return;
+}

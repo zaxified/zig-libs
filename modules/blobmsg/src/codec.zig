@@ -988,3 +988,25 @@ fn fuzzCodec(_: void, smith: *std.testing.Smith) !void {
     defer aw.deinit();
     decodeToJson(buf, &aw.writer) catch {};
 }
+
+// ── fuzz: the JSON -> blobmsg encode path (`encodeArgs`) is the other
+// untrusted-input surface — arbitrary text arriving as a ubus method-call's
+// JSON args must never panic/OOB while being parsed and re-encoded onto the
+// wire, only yield bytes or a typed `std.json`/`EncodeError`.
+
+test "fuzz: encodeArgs never crashes on arbitrary JSON-shaped text" {
+    try testing.fuzz({}, fuzzEncodeArgs, .{});
+}
+
+fn fuzzEncodeArgs(_: void, smith: *std.testing.Smith) !void {
+    const gpa = testing.allocator;
+    var raw: [512]u8 = undefined;
+    smith.bytes(&raw);
+    const len = smith.valueRangeAtMost(u16, 0, raw.len);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, gpa, raw[0..len], .{}) catch return;
+    defer parsed.deinit();
+
+    const buf = encodeArgs(gpa, parsed.value) catch return;
+    defer gpa.free(buf);
+}

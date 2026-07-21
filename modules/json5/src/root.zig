@@ -980,3 +980,33 @@ test "preprocess: unquoted key with no colon before EOF does not slice OOB (audi
     defer alloc.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "$err_trace") != null);
 }
+
+// ── fuzz: both preprocessors are the untrusted-input decode surface ─────────
+// (arbitrary UTF-8/bytes, not necessarily well-formed JSON5) — must never
+// panic or read/write out of bounds, only return a slice or a typed error.
+
+test "fuzz: preprocess never panics on arbitrary bytes" {
+    try std.testing.fuzz({}, fuzzPreprocess, .{});
+}
+
+fn fuzzPreprocess(_: void, smith: *std.testing.Smith) !void {
+    const alloc = std.testing.allocator;
+    var buf: [512]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const out = preprocess(alloc, buf[0..len]) catch return;
+    alloc.free(out);
+}
+
+test "fuzz: preprocessAnnotated never panics on arbitrary bytes" {
+    try std.testing.fuzz({}, fuzzPreprocessAnnotated, .{});
+}
+
+fn fuzzPreprocessAnnotated(_: void, smith: *std.testing.Smith) !void {
+    const alloc = std.testing.allocator;
+    var buf: [512]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const r = preprocessAnnotated(alloc, buf[0..len]) catch return;
+    alloc.free(r.out);
+}

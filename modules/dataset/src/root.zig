@@ -579,3 +579,26 @@ test "Dataset.concat appends rows of a same-schema dataset" {
     const d4 = Dataset{ .columns = cols[0..1], .rows = &rows2 };
     try testing.expectError(error.SchemaMismatch, d1.concat(a, d4));
 }
+
+// ── fuzz: deserialize is the untrusted-input decode surface (an arbitrary
+// wire buffer, e.g. from a cache file or network peer) — must never panic
+// or read/write out of bounds, only return the typed dataset or
+// `DeserializeError.Corrupt`/`OutOfMemory`. Uses an arena (the module's
+// documented ownership model — `Dataset` has no per-field free) so a
+// successful decode is cleaned up in one shot regardless of how many
+// strings it allocated.
+
+test "fuzz: deserialize never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzDeserialize, .{});
+}
+
+fn fuzzDeserialize(_: void, smith: *std.testing.Smith) !void {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var buf: [256]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const d = deserialize(arena.allocator(), buf[0..len]) catch return;
+    _ = d;
+}

@@ -545,3 +545,40 @@ test "reclaimGate: equal-txn reader is safe, strictly-older reader blocks" {
     try testing.expect(!reclaimGate(5, 4)); // a version-4 reader still needs it
     try testing.expect(!reclaimGate(5, 0)); // ancient pinned snapshot blocks all
 }
+
+// ── fuzz: recover is the crash-recovery decode surface — it must validate
+// two arbitrary/torn meta pages (`format.Meta.decode`) plus the tree/
+// freelist pages they may point at, entirely from bytes on "disk" that a
+// crash could have left in any state. It must never panic/OOB, only
+// return a valid `Meta` or a typed `RecoverError`.
+
+const kv = @import("kv");
+
+test "fuzz: recover never panics on arbitrary on-disk page bytes" {
+    try testing.fuzz({}, fuzzRecover, .{});
+}
+
+fn fuzzRecover(_: void, smith: *std.testing.Smith) !void {
+    const gpa = testing.allocator;
+
+    var sim = kv.SimStorage.init(gpa);
+    defer sim.deinit();
+    const handle = try sim.storage().open("fuzz.kvt", .create_truncate);
+    var p = Pager.init(sim.storage(), handle, 0);
+
+    // Lay down a handful of arbitrary pages: slots 0/1 are the meta pages
+    // `recover` chooses between; the rest are candidate tree/freelist pages
+    // a torn/hostile meta might point at.
+    const num_pages = 6;
+    var raw: [num_pages * page_size]u8 = undefined;
+    smith.bytes(&raw);
+    var id: PageId = 0;
+    while (id < num_pages) : (id += 1) {
+        var page: [page_size]u8 = undefined;
+        @memcpy(&page, raw[id * page_size .. (id + 1) * page_size]);
+        try p.writePage(id, &page);
+    }
+    p.high_water = num_pages;
+
+    _ = recover(gpa, &p) catch return;
+}
