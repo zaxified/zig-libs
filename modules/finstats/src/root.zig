@@ -609,6 +609,487 @@ pub fn drawdownEpisodes(a: std.mem.Allocator, d: Dataset, spec: DdEpisodesSpec) 
     return .{ .columns = cols, .rows = rows };
 }
 
+// ── xirrPrecise (Newton-Raphson + bisection fallback — backlog item) ────────
+// `xirr` above stays untouched (pure bisection at 1e-2, pinned by its own
+// tests); this is an additive, faster/more-precise sibling that tries Newton
+// first and automatically falls back to the same bisection bracket whenever
+// Newton fails to converge.
+
+pub const XirrPreciseSpec = struct {
+    date_col: []const u8,
+    flow_col: []const u8,
+    value_col: []const u8,
+    /// |NPV| convergence threshold for both the Newton and bisection phases.
+    tol: f64 = 1e-8,
+    /// Newton iteration budget before falling back to bisection.
+    max_newton_iter: usize = 50,
+    initial_guess: f64 = 0.1,
+};
+
+/// Dated-flow IRR via Newton-Raphson (fast, high precision) with an automatic
+/// bisection fallback (same [-0.99, 10] bracket as `xirr`, 200 iterations)
+/// whenever Newton fails to converge: derivative underflow, a step landing
+/// outside the bracket, a NaN, or exhausting `max_newton_iter` without
+/// meeting `tol`.
+pub fn xirrPrecise(a: std.mem.Allocator, d: Dataset, spec: XirrPreciseSpec) Error!f64 {
+    if (d.rows.len == 0) return 0;
+    const di = try mustIndex(d, spec.date_col);
+    const fi = try mustIndex(d, spec.flow_col);
+    const vi = try mustIndex(d, spec.value_col);
+
+    var cfs: std.ArrayList(Cashflow) = .empty;
+    for (d.rows) |r| {
+        const fl = r[fi].asFloat() orelse 0;
+        if (@abs(fl) > 1e-6) {
+            try cfs.append(a, .{ .t = isoDays(r[di].asText() orelse ""), .cf = -fl });
+        }
+    }
+    const last = d.rows[d.rows.len - 1];
+    try cfs.append(a, .{ .t = isoDays(last[di].asText() orelse ""), .cf = last[vi].asFloat() orelse 0 });
+    const base = cfs.items[0].t;
+
+    newton: {
+        var r: f64 = spec.initial_guess;
+        var i: usize = 0;
+        while (i < spec.max_newton_iter) : (i += 1) {
+            const f = npv(cfs.items, base, r);
+            if (@abs(f) < spec.tol) return r;
+            const df = dnpv(cfs.items, base, r);
+            if (std.math.isNan(df) or @abs(df) < 1e-14) break :newton; // derivative underflow
+            const r_new = r - f / df;
+            if (std.math.isNan(r_new) or r_new <= -0.99 or r_new >= 10.0) break :newton; // stepped outside the bracket
+            r = r_new;
+        }
+        // ran out of iterations without meeting tol — fall through to bisection
+    }
+
+    var lo: f64 = -0.99;
+    var hi: f64 = 10.0;
+    var mid: f64 = 0;
+    var i: usize = 0;
+    while (i < 200) : (i += 1) {
+        mid = (lo + hi) / 2.0;
+        const nv_mid = npv(cfs.items, base, mid);
+        if (@abs(nv_mid) < spec.tol) return mid;
+        const nv_lo = npv(cfs.items, base, lo);
+        if ((nv_lo < 0) == (nv_mid < 0)) lo = mid else hi = mid;
+    }
+    return mid;
+}
+
+/// d(NPV)/dr for the Newton step above.
+fn dnpv(items: []const Cashflow, base: i64, r: f64) f64 {
+    var sum: f64 = 0;
+    for (items) |it| {
+        const dt: f64 = @floatFromInt(it.t - base);
+        const yrs = dt / 365.25;
+        sum += -it.cf * yrs / std.math.pow(f64, 1.0 + r, yrs + 1.0);
+    }
+    return sum;
+}
+
+// ── parametric VaR/CVaR (Gaussian + Cornish-Fisher — backlog item) ──────────
+// Historical (empirical) VaR/CVaR already live in `riskMetrics`; these are
+// the parametric siblings: Gaussian fits mean/stdev to a normal and reads the
+// loss quantile off it; Cornish-Fisher additionally skew/kurtosis-corrects
+// the z-score before reading it off the same normal machinery. Confidence is
+// a free parameter here (riskMetrics' historical var95/cvar95 stay hardcoded
+// at 95% for behavioral pinning).
+
+/// Standard normal PDF.
+pub fn normalPdf(z: f64) f64 {
+    return @exp(-z * z / 2.0) / @sqrt(2.0 * std.math.pi);
+}
+
+/// Inverse standard normal CDF (quantile function) — Peter Acklam's rational
+/// approximation (|relative error| < 1.15e-9 on (0,1); std has no erf/erfinv
+/// to refine further with a Halley step, and this is already ample precision
+/// for risk-metric z-scores).
+pub fn invNormCdf(p: f64) f64 {
+    if (p <= 0) return -std.math.inf(f64);
+    if (p >= 1) return std.math.inf(f64);
+    const a = [_]f64{ -3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02, 1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00 };
+    const b = [_]f64{ -5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02, 6.680131188771972e+01, -1.328068155288572e+01 };
+    const c = [_]f64{ -7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00, -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00 };
+    const d = [_]f64{ 7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00, 3.754408661907416e+00 };
+    const p_low = 0.02425;
+    const p_high = 1.0 - p_low;
+    if (p < p_low) {
+        const q = @sqrt(-2.0 * @log(p));
+        return (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) /
+            ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0);
+    } else if (p <= p_high) {
+        const q = p - 0.5;
+        const r = q * q;
+        return (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q /
+            (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1.0);
+    } else {
+        const q = @sqrt(-2.0 * @log(1.0 - p));
+        return -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) /
+            ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0);
+    }
+}
+
+/// Gaussian (parametric) VaR: loss magnitude at `confidence` under a normal
+/// fit to `mean_`/`std_dev`. `VaR = -(mean + z·std_dev)`, z = Φ⁻¹(1−confidence).
+pub fn gaussianVaR(mean_: f64, std_dev: f64, confidence: f64) f64 {
+    const z = invNormCdf(1.0 - confidence);
+    return -(mean_ + z * std_dev);
+}
+
+/// Gaussian (parametric) CVaR / expected shortfall: mean loss beyond the
+/// Gaussian VaR threshold. `CVaR = -mean + std_dev·φ(z)/α`, α = 1−confidence,
+/// z = Φ⁻¹(α). Always ≥ VaR (the tail mean is at least as extreme as the
+/// tail boundary).
+pub fn gaussianCVaR(mean_: f64, std_dev: f64, confidence: f64) f64 {
+    const alpha = 1.0 - confidence;
+    if (alpha <= 0) return gaussianVaR(mean_, std_dev, confidence);
+    const z = invNormCdf(alpha);
+    return -mean_ + std_dev * normalPdf(z) / alpha;
+}
+
+/// Cornish-Fisher skew/kurtosis-adjusted z-score (the standard 3-term
+/// expansion). `excess_kurt` is kurtosis − 3 (0 for a normal). Collapses to
+/// `z` exactly when skew = excess_kurt = 0.
+pub fn cornishFisherZ(z: f64, skew: f64, excess_kurt: f64) f64 {
+    const z2 = z * z;
+    const z3 = z2 * z;
+    return z + (z2 - 1.0) * skew / 6.0 + (z3 - 3.0 * z) * excess_kurt / 24.0 - (2.0 * z3 - 5.0 * z) * skew * skew / 36.0;
+}
+
+/// Cornish-Fisher (modified) VaR: Gaussian VaR with the CF-adjusted z-score
+/// in place of the raw normal one.
+pub fn cornishFisherVaR(mean_: f64, std_dev: f64, skew: f64, excess_kurt: f64, confidence: f64) f64 {
+    const z = invNormCdf(1.0 - confidence);
+    const zcf = cornishFisherZ(z, skew, excess_kurt);
+    return -(mean_ + zcf * std_dev);
+}
+
+fn cfQuantileReturn(mean_: f64, std_dev: f64, skew: f64, excess_kurt: f64, p: f64) f64 {
+    const z = invNormCdf(p);
+    const zcf = cornishFisherZ(z, skew, excess_kurt);
+    return mean_ + std_dev * zcf;
+}
+
+/// Cornish-Fisher (modified) CVaR: −(1/α)·∫₀^α Q_CF(p) dp — the tail mean of
+/// the CF-implied quantile function, via fixed-step trapezoidal quadrature
+/// (deterministic, no allocation). This is the mathematically faithful
+/// tail-expectation of the CF quantile. A naive shortcut — plugging the
+/// CF z-score into the closed-form Gaussian ES ratio (`φ(z_cf)/α`) the way
+/// `cornishFisherVaR` plugs it into the VaR formula — is deliberately NOT
+/// used here: for negative-skew/fat-tailed inputs that shortcut can invert
+/// and report CVaR < VaR, violating the CVaR ≥ VaR invariant (verified while
+/// developing this function; the quadrature form does not have that
+/// failure mode for the skew/kurtosis ranges real return series produce).
+/// Collapses to `gaussianCVaR` (within quadrature error) when skew =
+/// excess_kurt = 0.
+pub fn cornishFisherCVaR(mean_: f64, std_dev: f64, skew: f64, excess_kurt: f64, confidence: f64) f64 {
+    const alpha = 1.0 - confidence;
+    if (alpha <= 0) return cornishFisherVaR(mean_, std_dev, skew, excess_kurt, confidence);
+    const steps: usize = 2000;
+    const eps = 1e-9;
+    const h = (alpha - eps) / @as(f64, @floatFromInt(steps));
+    var total: f64 = 0;
+    var i: usize = 0;
+    while (i <= steps) : (i += 1) {
+        const p = eps + @as(f64, @floatFromInt(i)) * h;
+        const w: f64 = if (i == 0 or i == steps) 0.5 else 1.0;
+        total += w * cfQuantileReturn(mean_, std_dev, skew, excess_kurt, p);
+    }
+    const integral = total * h;
+    const mean_tail = integral / alpha;
+    return -mean_tail;
+}
+
+/// Sample skewness (moment coefficient g1, population-normalized: divides by
+/// n not n−1 — the conventional definition for CF/parametric-risk use).
+pub fn skewness(xs: []const f64) f64 {
+    const n = xs.len;
+    if (n < 2) return 0;
+    const m = mean(xs);
+    var m2: f64 = 0;
+    var m3: f64 = 0;
+    for (xs) |x| {
+        const dx = x - m;
+        m2 += dx * dx;
+        m3 += dx * dx * dx;
+    }
+    const nf: f64 = @floatFromInt(n);
+    m2 /= nf;
+    m3 /= nf;
+    if (m2 <= 0) return 0;
+    return m3 / std.math.pow(f64, m2, 1.5);
+}
+
+/// Sample excess kurtosis (g2 = kurtosis − 3; 0 for a normal).
+pub fn excessKurtosis(xs: []const f64) f64 {
+    const n = xs.len;
+    if (n < 2) return 0;
+    const m = mean(xs);
+    var m2: f64 = 0;
+    var m4: f64 = 0;
+    for (xs) |x| {
+        const dx = x - m;
+        const dx2 = dx * dx;
+        m2 += dx2;
+        m4 += dx2 * dx2;
+    }
+    const nf: f64 = @floatFromInt(n);
+    m2 /= nf;
+    m4 /= nf;
+    if (m2 <= 0) return 0;
+    return m4 / (m2 * m2) - 3.0;
+}
+
+pub const ParametricRiskSpec = struct {
+    ret_col: []const u8,
+    confidence: f64 = 0.95,
+};
+
+/// One-row Dataset of parametric risk stats over `ret_col`: {mean, std,
+/// skew, kurt, var_gaussian, cvar_gaussian, var_cf, cvar_cf} — the
+/// sample mean/stdev + population skew/excess-kurtosis fit, and both VaR/
+/// CVaR variants at `confidence` (default 0.95). Complements `riskMetrics`'
+/// historical var95/cvar95.
+pub fn parametricRisk(a: std.mem.Allocator, d: Dataset, spec: ParametricRiskSpec) Error!Dataset {
+    const ri = try mustIndex(d, spec.ret_col);
+    const rvals = try a.alloc(f64, d.rows.len);
+    for (d.rows, 0..) |r, i| rvals[i] = r[ri].asFloat() orelse 0;
+
+    const m = mean(rvals);
+    const sd = stdSample(rvals);
+    const sk = skewness(rvals);
+    const ek = excessKurtosis(rvals);
+    const conf = spec.confidence;
+
+    return oneRow(a, &.{
+        .{ "mean", m },
+        .{ "std", sd },
+        .{ "skew", sk },
+        .{ "kurt", ek },
+        .{ "var_gaussian", gaussianVaR(m, sd, conf) },
+        .{ "cvar_gaussian", gaussianCVaR(m, sd, conf) },
+        .{ "var_cf", cornishFisherVaR(m, sd, sk, ek, conf) },
+        .{ "cvar_cf", cornishFisherCVaR(m, sd, sk, ek, conf) },
+    });
+}
+
+// ── tracking error / information ratio (backlog item) ───────────────────────
+
+pub const TrackingSpec = struct {
+    port_ret_col: []const u8,
+    bench_ret_col: []const u8,
+    /// Aligned rows only (same convention as betaAlpha — join on date first).
+    periods_per_year: f64 = 252,
+};
+
+/// One-row Dataset: {tracking_error, information_ratio}. active_i = port_i −
+/// bench_i; tracking_error = stdev(active)·√ppy (annualized volatility of
+/// the active return stream); information_ratio = mean(active)·ppy /
+/// tracking_error (0 when tracking_error is 0 — flat active stream, same
+/// zero-denominator convention as riskMetrics' sharpe/sortino/calmar).
+pub fn trackingRisk(a: std.mem.Allocator, d: Dataset, spec: TrackingSpec) Error!Dataset {
+    const pi = try mustIndex(d, spec.port_ret_col);
+    const bi = try mustIndex(d, spec.bench_ret_col);
+    const n = d.rows.len;
+    const active = try a.alloc(f64, n);
+    for (d.rows, 0..) |r, i| {
+        const p = r[pi].asFloat() orelse 0;
+        const b = r[bi].asFloat() orelse 0;
+        active[i] = p - b;
+    }
+    const sq = @sqrt(spec.periods_per_year);
+    const te = stdSample(active) * sq;
+    const ann_active = mean(active) * spec.periods_per_year;
+    const ir = if (te != 0) ann_active / te else 0;
+    return oneRow(a, &.{ .{ "tracking_error", te }, .{ "information_ratio", ir } });
+}
+
+// ── Omega ratio (backlog item) ───────────────────────────────────────────────
+
+/// Omega ratio at `threshold`: Σ gains-above-threshold / Σ losses-below-
+/// threshold (both accumulated as positive magnitudes). > 1 ⇒ more upside
+/// mass than downside mass around the threshold. No losses in the series
+/// (denominator 0) ⇒ +∞ when there is any gain, 1.0 when the whole series
+/// sits exactly at the threshold (both sums 0).
+pub fn omegaRatio(xs: []const f64, threshold: f64) f64 {
+    var gains: f64 = 0;
+    var losses: f64 = 0;
+    for (xs) |x| {
+        const diff = x - threshold;
+        if (diff > 0) gains += diff else losses += -diff;
+    }
+    if (losses == 0) return if (gains == 0) 1.0 else std.math.inf(f64);
+    return gains / losses;
+}
+
+pub const OmegaSpec = struct {
+    ret_col: []const u8,
+    threshold: f64 = 0,
+    out: []const u8 = "omega",
+};
+
+/// `omegaRatio` node: reduce `ret_col` to `{out: omega}`.
+pub fn omegaRatioNode(a: std.mem.Allocator, d: Dataset, spec: OmegaSpec) Error!Dataset {
+    const ri = try mustIndex(d, spec.ret_col);
+    const xs = try a.alloc(f64, d.rows.len);
+    for (d.rows, 0..) |r, i| xs[i] = r[ri].asFloat() orelse 0;
+    return oneRow(a, &.{.{ spec.out, omegaRatio(xs, spec.threshold) }});
+}
+
+// ── rolling-window helper (backlog item) ─────────────────────────────────────
+// Generic over the per-window reducer (a comptime fn, same idiom as the
+// `std.mem.sort` comparators already used in this file) so any scalar
+// statistic — mean/stdev/sharpe/a caller's own — can run over a sliding
+// window without a bespoke `rolling*` per metric. Three concrete wrappers
+// for the key metrics (mean/vol/sharpe) are provided on top.
+
+pub const RollingSpec = struct {
+    value_col: []const u8,
+    /// Optional date column to carry through as the row label (the window's
+    /// LAST date). Empty = no date column in the output.
+    date_col: []const u8 = "",
+    window: usize,
+    out: []const u8 = "value",
+};
+
+/// Rolling window over `value_col`: for each trailing window of `window`
+/// values, applies `reducer` and emits one row (windows before the first
+/// full one are skipped — `n − window + 1` rows total, 0 if `n < window`).
+pub fn rollingApply(a: std.mem.Allocator, d: Dataset, spec: RollingSpec, comptime reducer: fn ([]const f64) f64) Error!Dataset {
+    const vi = try mustIndex(d, spec.value_col);
+    var di: ?usize = null;
+    if (spec.date_col.len > 0) di = try mustIndex(d, spec.date_col);
+    const n = d.rows.len;
+    const vals = try a.alloc(f64, n);
+    for (d.rows, 0..) |r, i| vals[i] = r[vi].asFloat() orelse 0;
+
+    var cols: []Column = undefined;
+    if (di != null) {
+        cols = try a.alloc(Column, 2);
+        cols[0] = .{ .name = spec.date_col, .type = .date };
+        cols[1] = .{ .name = spec.out, .type = .float };
+    } else {
+        cols = try a.alloc(Column, 1);
+        cols[0] = .{ .name = spec.out, .type = .float };
+    }
+
+    if (spec.window == 0 or n < spec.window) return .{ .columns = cols, .rows = &.{} };
+    const out_n = n - spec.window + 1;
+    const rows = try a.alloc([]const Value, out_n);
+    for (0..out_n) |k| {
+        const win = vals[k .. k + spec.window];
+        const v = reducer(win);
+        if (di) |dci| {
+            const nr = try a.alloc(Value, 2);
+            nr[0] = d.rows[k + spec.window - 1][dci];
+            nr[1] = .{ .float = v };
+            rows[k] = nr;
+        } else {
+            const nr = try a.alloc(Value, 1);
+            nr[0] = .{ .float = v };
+            rows[k] = nr;
+        }
+    }
+    return .{ .columns = cols, .rows = rows };
+}
+
+pub fn rollingMeanReducer(xs: []const f64) f64 {
+    return mean(xs);
+}
+pub fn rollingVolReducer(xs: []const f64) f64 {
+    return stdSample(xs);
+}
+pub fn rollingSharpeReducer(xs: []const f64) f64 {
+    const s = stdSample(xs);
+    return if (s != 0) mean(xs) / s else 0;
+}
+
+/// Rolling mean over `value_col` (concrete wrapper over `rollingApply`).
+pub fn rollingMean(a: std.mem.Allocator, d: Dataset, spec: RollingSpec) Error!Dataset {
+    return rollingApply(a, d, spec, rollingMeanReducer);
+}
+/// Rolling (sample) stdev over `value_col` — unannualized; multiply by
+/// √periods_per_year at the call site to annualize.
+pub fn rollingVolatility(a: std.mem.Allocator, d: Dataset, spec: RollingSpec) Error!Dataset {
+    return rollingApply(a, d, spec, rollingVolReducer);
+}
+/// Rolling (unannualized, rf=0) Sharpe-like ratio mean/stdev over `value_col`.
+pub fn rollingSharpe(a: std.mem.Allocator, d: Dataset, spec: RollingSpec) Error!Dataset {
+    return rollingApply(a, d, spec, rollingSharpeReducer);
+}
+
+// ── Brinson (factor) attribution (backlog item) ──────────────────────────────
+
+pub const BrinsonSpec = struct {
+    segment_col: []const u8,
+    port_weight_col: []const u8,
+    bench_weight_col: []const u8,
+    port_return_col: []const u8,
+    bench_return_col: []const u8,
+};
+
+/// Brinson-Fachler attribution → Dataset {segment, allocation, selection,
+/// interaction, total} per segment, plus a trailing "TOTAL" row. Per
+/// segment i: `allocation = (wp_i − wb_i)·(rb_i − Rb)`, `selection = wb_i·
+/// (rp_i − rb_i)`, `interaction = (wp_i − wb_i)·(rp_i − rb_i)` (Rb = Σ wb_i·
+/// rb_i, the total benchmark return — the Brinson-Fachler refinement over
+/// the original 1986 BHB model, benchmark-relative regardless of segment
+/// weighting). The three effects summed over all segments equal exactly the
+/// portfolio's active return `Rp − Rb` (Σ wp_i·rp_i − Σ wb_i·rb_i) — an
+/// algebraic identity of the decomposition, pinned by test, assuming
+/// Σ wp_i = Σ wb_i = 1.
+pub fn brinsonAttribution(a: std.mem.Allocator, d: Dataset, spec: BrinsonSpec) Error!Dataset {
+    const si = try mustIndex(d, spec.segment_col);
+    const wpi = try mustIndex(d, spec.port_weight_col);
+    const wbi = try mustIndex(d, spec.bench_weight_col);
+    const rpi = try mustIndex(d, spec.port_return_col);
+    const rbi = try mustIndex(d, spec.bench_return_col);
+
+    var rb_total: f64 = 0;
+    for (d.rows) |r| rb_total += (r[wbi].asFloat() orelse 0) * (r[rbi].asFloat() orelse 0);
+
+    const cols = try a.alloc(Column, 5);
+    cols[0] = .{ .name = "segment", .type = .text };
+    cols[1] = .{ .name = "allocation", .type = .float };
+    cols[2] = .{ .name = "selection", .type = .float };
+    cols[3] = .{ .name = "interaction", .type = .float };
+    cols[4] = .{ .name = "total", .type = .float };
+
+    const rows = try a.alloc([]const Value, d.rows.len + 1);
+    var sum_alloc: f64 = 0;
+    var sum_sel: f64 = 0;
+    var sum_inter: f64 = 0;
+    for (d.rows, 0..) |r, i| {
+        const wp = r[wpi].asFloat() orelse 0;
+        const wb = r[wbi].asFloat() orelse 0;
+        const rp = r[rpi].asFloat() orelse 0;
+        const rb = r[rbi].asFloat() orelse 0;
+        const alloc = (wp - wb) * (rb - rb_total);
+        const sel = wb * (rp - rb);
+        const inter = (wp - wb) * (rp - rb);
+        sum_alloc += alloc;
+        sum_sel += sel;
+        sum_inter += inter;
+        const nr = try a.alloc(Value, 5);
+        nr[0] = r[si];
+        nr[1] = .{ .float = alloc };
+        nr[2] = .{ .float = sel };
+        nr[3] = .{ .float = inter };
+        nr[4] = .{ .float = alloc + sel + inter };
+        rows[i] = nr;
+    }
+    const tr = try a.alloc(Value, 5);
+    tr[0] = .{ .text = "TOTAL" };
+    tr[1] = .{ .float = sum_alloc };
+    tr[2] = .{ .float = sum_sel };
+    tr[3] = .{ .float = sum_inter };
+    tr[4] = .{ .float = sum_alloc + sum_sel + sum_inter };
+    rows[d.rows.len] = tr;
+
+    return .{ .columns = cols, .rows = rows };
+}
+
 // ── shared: build a 1-row Dataset from named floats ─────────────────────────
 
 fn oneRow(a: std.mem.Allocator, kv: []const struct { []const u8, f64 }) Error!Dataset {
@@ -822,4 +1303,215 @@ test "drawdown_episodes state machine" {
     try testing.expect(e.cell(0, "recovery").?.isNull()); // still underwater
     try testing.expectApproxEqAbs(@as(f64, -20), e.cell(1, "depth_pct").?.float, 1e-9);
     try testing.expectEqualStrings("2024-01-03", e.cell(1, "recovery").?.text);
+}
+
+test "xirrPrecise: known-IRR fixture (100 -> 121 over ~2y = ~10% IRR)" {
+    var f = Fix.init();
+    defer f.deinit();
+    const cols = [_]Column{
+        .{ .name = "d", .type = .date },
+        .{ .name = "flow", .type = .float },
+        .{ .name = "v", .type = .float },
+    };
+    // hand-computed: 731 calendar days / 365.25 = 2.001369y; (121/100)^(1/y)-1 = 0.0999283
+    const rows = [_][]const Value{
+        &.{ .{ .text = "2020-01-01" }, .{ .float = 100 }, .{ .float = 100 } },
+        &.{ .{ .text = "2022-01-01" }, .{ .float = 0 }, .{ .float = 121 } },
+    };
+    const spec = XirrPreciseSpec{ .date_col = "d", .flow_col = "flow", .value_col = "v" };
+    const r = try xirrPrecise(f.a(), .{ .columns = &cols, .rows = &rows }, spec);
+    try testing.expectApproxEqAbs(@as(f64, 0.0999283), r, 1e-3);
+
+    // fallback: max_newton_iter=1 forces Newton to bail before converging;
+    // the bisection fallback must still land on the same answer.
+    const fallback_spec = XirrPreciseSpec{ .date_col = "d", .flow_col = "flow", .value_col = "v", .max_newton_iter = 1, .tol = 1e-6 };
+    const r2 = try xirrPrecise(f.a(), .{ .columns = &cols, .rows = &rows }, fallback_spec);
+    try testing.expectApproxEqAbs(@as(f64, 0.0999283), r2, 1e-3);
+}
+
+test "gaussianVaR/CVaR: standard-normal known values at 95%" {
+    // textbook standard-normal 95% VaR/CVaR: z_0.05 ≈ -1.6449, ES ≈ 2.0627
+    const v = gaussianVaR(0, 1, 0.95);
+    const cv = gaussianCVaR(0, 1, 0.95);
+    try testing.expectApproxEqAbs(@as(f64, 1.6449), v, 1e-3);
+    try testing.expectApproxEqAbs(@as(f64, 2.0627), cv, 1e-3);
+    try testing.expect(cv >= v); // CVaR >= VaR invariant (positive control)
+}
+
+test "cornishFisherZ collapses to the raw z-score when skew=kurt=0" {
+    const z = invNormCdf(0.05);
+    try testing.expectApproxEqAbs(z, cornishFisherZ(z, 0, 0), 1e-12);
+}
+
+test "skewness/excessKurtosis: symmetric fixture has known moments" {
+    const xs = [_]f64{ -2, -1, 0, 1, 2 };
+    try testing.expectApproxEqAbs(@as(f64, 0), skewness(&xs), 1e-9); // symmetric -> 0
+    try testing.expectApproxEqAbs(@as(f64, -1.3), excessKurtosis(&xs), 1e-9); // platykurtic, hand-computed
+}
+
+test "cornishFisherVaR/CVaR: negative skew + fat tail widens the tail vs Gaussian" {
+    // hand-computed via the same Acklam approximation + CF expansion (see tool notes)
+    const mean_ = 0.001;
+    const std_dev = 0.02;
+    const skew = -1.0;
+    const kurt = 2.0;
+    const conf = 0.95;
+    const var_g = gaussianVaR(mean_, std_dev, conf);
+    const cvar_g = gaussianCVaR(mean_, std_dev, conf);
+    const var_cf = cornishFisherVaR(mean_, std_dev, skew, kurt, conf);
+    const cvar_cf = cornishFisherCVaR(mean_, std_dev, skew, kurt, conf);
+
+    try testing.expectApproxEqAbs(@as(f64, 0.036399), var_cf, 1e-3);
+    try testing.expectApproxEqAbs(@as(f64, 0.052410), cvar_cf, 2e-3); // quadrature, looser tol
+
+    // positive controls: negative skew + excess kurtosis must widen (not
+    // shrink) the tail relative to the Gaussian fit, and CVaR >= VaR must
+    // still hold for the CF variant (the naive phi(z_cf)/alpha shortcut
+    // FAILS this for these exact inputs -- see cornishFisherCVaR's doc comment).
+    try testing.expect(var_cf > var_g);
+    try testing.expect(cvar_cf >= var_cf);
+    try testing.expect(cvar_g >= var_g); // Gaussian side of the same invariant
+}
+
+test "parametricRisk: Dataset wiring matches direct scalar-fn calls" {
+    var f = Fix.init();
+    defer f.deinit();
+    const cols = [_]Column{.{ .name = "r", .type = .float }};
+    const rows = [_][]const Value{
+        &.{.{ .float = -2 }}, &.{.{ .float = -1 }}, &.{.{ .float = 0 }},
+        &.{.{ .float = 1 }},  &.{.{ .float = 2 }},
+    };
+    const pr = try parametricRisk(f.a(), .{ .columns = &cols, .rows = &rows }, .{ .ret_col = "r", .confidence = 0.95 });
+    const m = pr.cell(0, "mean").?.float;
+    const sd = pr.cell(0, "std").?.float;
+    const sk = pr.cell(0, "skew").?.float;
+    const kt = pr.cell(0, "kurt").?.float;
+    try testing.expectApproxEqAbs(@as(f64, 0), m, 1e-12);
+    try testing.expectApproxEqAbs(@as(f64, 0), sk, 1e-9);
+    try testing.expectApproxEqAbs(gaussianVaR(m, sd, 0.95), pr.cell(0, "var_gaussian").?.float, 1e-12);
+    try testing.expectApproxEqAbs(gaussianCVaR(m, sd, 0.95), pr.cell(0, "cvar_gaussian").?.float, 1e-12);
+    try testing.expectApproxEqAbs(cornishFisherVaR(m, sd, sk, kt, 0.95), pr.cell(0, "var_cf").?.float, 1e-12);
+    try testing.expect(pr.cell(0, "cvar_gaussian").?.float >= pr.cell(0, "var_gaussian").?.float);
+}
+
+test "trackingRisk: tracking error + information ratio, hand-computed" {
+    var f = Fix.init();
+    defer f.deinit();
+    const cols = [_]Column{ .{ .name = "p", .type = .float }, .{ .name = "b", .type = .float } };
+    // active = p - b = [0.01, -0.02, 0.03, 0.0, 0.02]; mean=0.008, sample-std=0.0192354
+    const rows = [_][]const Value{
+        &.{ .{ .float = 0.02 }, .{ .float = 0.01 } },
+        &.{ .{ .float = -0.01 }, .{ .float = 0.01 } },
+        &.{ .{ .float = 0.04 }, .{ .float = 0.01 } },
+        &.{ .{ .float = 0.01 }, .{ .float = 0.01 } },
+        &.{ .{ .float = 0.03 }, .{ .float = 0.01 } },
+    };
+    const tr = try trackingRisk(f.a(), .{ .columns = &cols, .rows = &rows }, .{ .port_ret_col = "p", .bench_ret_col = "b", .periods_per_year = 1 });
+    try testing.expectApproxEqAbs(@as(f64, 0.0192354), tr.cell(0, "tracking_error").?.float, 1e-6);
+    try testing.expectApproxEqAbs(@as(f64, 0.4159), tr.cell(0, "information_ratio").?.float, 1e-3);
+
+    // positive control: swap port/bench so active negates -> IR flips sign exactly.
+    const cols2 = [_]Column{ .{ .name = "p", .type = .float }, .{ .name = "b", .type = .float } };
+    const rows2 = [_][]const Value{
+        &.{ .{ .float = 0.01 }, .{ .float = 0.02 } },
+        &.{ .{ .float = 0.01 }, .{ .float = -0.01 } },
+        &.{ .{ .float = 0.01 }, .{ .float = 0.04 } },
+        &.{ .{ .float = 0.01 }, .{ .float = 0.01 } },
+        &.{ .{ .float = 0.01 }, .{ .float = 0.03 } },
+    };
+    const tr2 = try trackingRisk(f.a(), .{ .columns = &cols2, .rows = &rows2 }, .{ .port_ret_col = "p", .bench_ret_col = "b", .periods_per_year = 1 });
+    try testing.expectApproxEqAbs(-tr.cell(0, "information_ratio").?.float, tr2.cell(0, "information_ratio").?.float, 1e-9);
+    try testing.expectApproxEqAbs(tr.cell(0, "tracking_error").?.float, tr2.cell(0, "tracking_error").?.float, 1e-9);
+}
+
+test "omegaRatio: hand-computed threshold-0 ratio + infinite-when-no-losses control" {
+    const xs = [_]f64{ 0.01, -0.02, 0.03, -0.01, 0.02 };
+    // gains = 0.01+0.03+0.02 = 0.06; losses = 0.02+0.01 = 0.03 -> omega = 2.0
+    try testing.expectApproxEqAbs(@as(f64, 2.0), omegaRatio(&xs, 0), 1e-9);
+
+    const all_gains = [_]f64{ 0.01, 0.02, 0.03 };
+    try testing.expect(std.math.isPositiveInf(omegaRatio(&all_gains, 0))); // no losses -> +inf
+
+    const flat = [_]f64{ 0, 0, 0 };
+    try testing.expectApproxEqAbs(@as(f64, 1.0), omegaRatio(&flat, 0), 1e-9); // flat at threshold -> 1.0
+}
+
+test "rollingApply: sliding-window mean/vol/sharpe + a custom comptime reducer" {
+    var f = Fix.init();
+    defer f.deinit();
+    const cols = [_]Column{.{ .name = "v", .type = .float }};
+    const rows = [_][]const Value{
+        &.{.{ .float = 1 }}, &.{.{ .float = 2 }}, &.{.{ .float = 3 }},
+        &.{.{ .float = 4 }}, &.{.{ .float = 5 }},
+    };
+    const d: Dataset = .{ .columns = &cols, .rows = &rows };
+
+    const rm = try rollingMean(f.a(), d, .{ .value_col = "v", .window = 3 });
+    try testing.expectEqual(@as(usize, 3), rm.rows.len); // 5-3+1
+    try testing.expectApproxEqAbs(@as(f64, 2), rm.cell(0, "value").?.float, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 3), rm.cell(1, "value").?.float, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 4), rm.cell(2, "value").?.float, 1e-9);
+
+    // arithmetic-progression windows all have sample-stdev exactly 1
+    const rv = try rollingVolatility(f.a(), d, .{ .value_col = "v", .window = 3 });
+    for (0..rv.rows.len) |i| try testing.expectApproxEqAbs(@as(f64, 1), rv.cell(i, "value").?.float, 1e-9);
+
+    // sharpe = mean/std = mean/1 = mean here
+    const rs = try rollingSharpe(f.a(), d, .{ .value_col = "v", .window = 3 });
+    try testing.expectApproxEqAbs(@as(f64, 3), rs.cell(1, "value").?.float, 1e-9);
+
+    // generic: a caller-supplied comptime reducer (max) plugs straight in.
+    const R = struct {
+        fn maxReducer(xs: []const f64) f64 {
+            var m = xs[0];
+            for (xs[1..]) |x| {
+                if (x > m) m = x;
+            }
+            return m;
+        }
+    };
+    const rmax = try rollingApply(f.a(), d, .{ .value_col = "v", .window = 3, .out = "mx" }, R.maxReducer);
+    try testing.expectApproxEqAbs(@as(f64, 3), rmax.cell(0, "mx").?.float, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 5), rmax.cell(2, "mx").?.float, 1e-9);
+
+    // window > n -> 0 rows, not an error
+    const empty = try rollingMean(f.a(), d, .{ .value_col = "v", .window = 10 });
+    try testing.expectEqual(@as(usize, 0), empty.rows.len);
+}
+
+test "brinsonAttribution: effects sum exactly to the active return (identity)" {
+    var f = Fix.init();
+    defer f.deinit();
+    const cols = [_]Column{
+        .{ .name = "seg", .type = .text }, .{ .name = "wp", .type = .float },
+        .{ .name = "wb", .type = .float }, .{ .name = "rp", .type = .float },
+        .{ .name = "rb", .type = .float },
+    };
+    // Rp = 0.6*0.08 + 0.4*0.03 = 0.06; Rb = 0.5*0.05 + 0.5*0.04 = 0.045; active = 0.015
+    const rows = [_][]const Value{
+        &.{ .{ .text = "A" }, .{ .float = 0.6 }, .{ .float = 0.5 }, .{ .float = 0.08 }, .{ .float = 0.05 } },
+        &.{ .{ .text = "B" }, .{ .float = 0.4 }, .{ .float = 0.5 }, .{ .float = 0.03 }, .{ .float = 0.04 } },
+    };
+    const b = try brinsonAttribution(f.a(), .{ .columns = &cols, .rows = &rows }, .{
+        .segment_col = "seg",
+        .port_weight_col = "wp",
+        .bench_weight_col = "wb",
+        .port_return_col = "rp",
+        .bench_return_col = "rb",
+    });
+    try testing.expectEqual(@as(usize, 3), b.rows.len); // 2 segments + TOTAL
+
+    // hand-computed per-segment effects
+    try testing.expectApproxEqAbs(@as(f64, 0.0005), b.cell(0, "allocation").?.float, 1e-12);
+    try testing.expectApproxEqAbs(@as(f64, 0.015), b.cell(0, "selection").?.float, 1e-12);
+    try testing.expectApproxEqAbs(@as(f64, 0.003), b.cell(0, "interaction").?.float, 1e-12);
+    try testing.expectApproxEqAbs(@as(f64, 0.0005), b.cell(1, "allocation").?.float, 1e-12);
+    try testing.expectApproxEqAbs(@as(f64, -0.005), b.cell(1, "selection").?.float, 1e-12);
+    try testing.expectApproxEqAbs(@as(f64, 0.001), b.cell(1, "interaction").?.float, 1e-12);
+
+    // positive control: TOTAL.total must equal Rp - Rb exactly (an algebraic
+    // identity of the decomposition -- if any term's formula were wrong this
+    // would NOT hold in general).
+    try testing.expectEqualStrings("TOTAL", b.cell(2, "segment").?.text);
+    try testing.expectApproxEqAbs(@as(f64, 0.015), b.cell(2, "total").?.float, 1e-9);
 }

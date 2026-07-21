@@ -3,18 +3,33 @@
 Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
 
 ## Design & invariants
-Portfolio/financial statistics over `dataset`: dated-flow IRR (`xirr`), daily time-weighted return
+Portfolio/financial statistics over `dataset`: dated-flow IRR (`xirr`, plus a Newton-with-
+bisection-fallback sibling `xirrPrecise`), daily time-weighted return
 (`twrDaily`, Modified-Dietz), risk metrics (vol/VaR/CVaR/Sharpe/Sortino/Calmar/Ulcer/max-drawdown via
-`riskMetrics`), beta/alpha/R² (`betaAlpha`), a seeded Monte-Carlo net-worth projection
-(`monteCarlo`), a pairwise-Pearson correlation matrix (`correlationMatrix`), and a drawdown-episode
-state machine (`drawdownEpisodes`). Every function is a pure transform over a caller-owned allocator
-(normally an arena): `Dataset → Dataset` (table/series producers) or `Dataset → f64` (scalar
-reducers) — no hidden state, no I/O. Numeric conventions are exact and deliberate
-(decisions, not bugs): `xirr` is 200-iteration bisection over `[-0.99, 10]`, ACT/365.25 day-count,
-tolerance `1e-2`; `var95`/`cvar95` are historical (empirical), not a parametric fit; `monteCarlo`
+`riskMetrics`, historical/empirical), parametric VaR/CVaR at an arbitrary confidence (Gaussian via
+`gaussianVaR`/`gaussianCVaR`, skew/kurtosis-adjusted Cornish-Fisher via `cornishFisherVaR`/
+`cornishFisherCVaR`, bundled per-series as `parametricRisk`), beta/alpha/R² (`betaAlpha`), tracking
+error + information ratio (`trackingRisk`), the Omega ratio (`omegaRatio`), a generic rolling-window
+reducer (`rollingApply`, plus `rollingMean`/`rollingVolatility`/`rollingSharpe` wrappers), a seeded
+Monte-Carlo net-worth projection (`monteCarlo`), a pairwise-Pearson correlation matrix
+(`correlationMatrix`), a drawdown-episode state machine (`drawdownEpisodes`), and Brinson-Fachler
+performance attribution (`brinsonAttribution`). Every function is a pure transform over a
+caller-owned allocator (normally an arena): `Dataset → Dataset` (table/series producers) or
+`Dataset → f64` (scalar reducers) — no hidden state, no I/O. Numeric conventions are exact and
+deliberate (decisions, not bugs): `xirr` is 200-iteration bisection over `[-0.99, 10]`, ACT/365.25
+day-count, tolerance `1e-2` (kept exactly as-is; `xirrPrecise` is an additive Newton-first sibling
+that falls back to the same bracket/bisection on non-convergence); `riskMetrics`' `var95`/`cvar95`
+are historical (empirical), not a parametric fit — the parametric fit lives in `parametricRisk`
+instead, at a caller-chosen `confidence` (95%/99%/…), where `cornishFisherCVaR` integrates the
+CF-adjusted quantile function (fixed-step trapezoidal quadrature) rather than a naive `φ(z_cf)/α`
+plug-in, because that shortcut can report CVaR below VaR for negative-skew/fat-tailed inputs (see
+its doc comment); `monteCarlo`
 uses a fixed-seed deterministic PRNG (`std.Random.DefaultPrng`, seed `0x9E3779B97F4A7C15`) via
 Box-Muller so percentile outputs are reproducible/regression-testable; `correlationMatrix` gates
-pairs on `min_overlap` (default 30). f64 throughout — deliberately no `decimal` dependency: risk
+pairs on `min_overlap` (default 30); `brinsonAttribution` is the Brinson-Fachler variant
+(benchmark-relative allocation term `rb_i − Rb`), whose three effects sum exactly to the portfolio's
+active return `Rp − Rb`, an algebraic identity (assumes weights each sum to 1) pinned by test. f64
+throughout — deliberately no `decimal` dependency: risk
 statistics are inherently floating-point, `decimal` is for exact ledger arithmetic, not variance/
 quantile math. Platform: any (pure logic, no OS calls). Role: util. Concurrency: reentrant (no
 shared state). Depends on `dataset` only. Original work of the zig-libs authors, modeled after the
@@ -26,29 +41,35 @@ See NOTICE.
 Not security-sensitive; the contract is numerical fidelity to the documented conventions above, not
 defense against hostile input — a malformed `Dataset` (missing column) surfaces as a typed
 `error.NoSuchColumn`, never a panic; allocation failure surfaces as `error.OutOfMemory`. Out of
-scope / deferred (a faithful v1 lift, not a complete risk-analytics suite): parametric VaR/CVaR
-(Gaussian/Cornish-Fisher — only historical exists); tracking error/information ratio; Omega ratio;
-rolling-window variants of any scalar metric (everything here is whole-series); Brinson (factor)
-attribution; arbitrary VaR confidence level (95% is hardcoded) and annualization-frequency presets/
-bounds checking (`periods_per_year` is a free 252-defaulted knob); confidence intervals/standard
-errors on the statistics; an xirr Newton-with-bisection-fallback (current is pure bisection at a
-fixed tolerance).
+scope / deferred (a faithful v1 lift, not a complete risk-analytics suite): arbitrary
+annualization-frequency presets/bounds checking (`periods_per_year` is a free 252-defaulted knob,
+same as before); confidence intervals/standard errors on the statistics. (Parametric VaR/CVaR,
+tracking error/information ratio, Omega ratio, rolling-window variants, Brinson attribution, an
+arbitrary VaR confidence level, and an xirr Newton-with-bisection-fallback were all backlog items
+here — now implemented, see Design & invariants above.)
 
 ## Verification
-11 tests pinning the numeric conventions above: xirr against known cash-
+22 tests pinning the numeric conventions above: xirr against known cash-
 flow fixtures, twrDaily Modified-Dietz with warm-up trim, riskMetrics' 9-metric row incl. historical
 VaR/CVaR and Sharpe/Sortino/Calmar/Ulcer, betaAlpha's cov/var/r² derivation, monteCarlo's
-reproducible percentile output under the fixed seed, correlationMatrix's min_overlap gating, and
+reproducible percentile output under the fixed seed, correlationMatrix's min_overlap gating,
 drawdownEpisodes' peak→trough→recovery state machine incl. still-underwater-at-series-end (null
-recovery). Run: `zig build test-finstats` (also `-Doptimize=ReleaseFast`), `zig fmt --check
-modules/finstats`.
+recovery), xirrPrecise's Newton result plus a forced-fallback case landing on the same answer,
+gaussianVaR/CVaR against textbook standard-normal values (with the CVaR≥VaR invariant),
+cornishFisherZ collapsing to the raw z-score at zero skew/kurtosis, skewness/excessKurtosis on a
+known symmetric fixture, cornishFisherVaR/CVaR widening the tail vs the Gaussian fit for a
+negative-skew/fat-tail input (a case where the *rejected* naive CVaR shortcut would have violated
+CVaR≥VaR), parametricRisk's Dataset wiring against direct scalar-fn calls, trackingRisk's hand-
+computed tracking-error/information-ratio plus a sign-flip control, omegaRatio's hand-computed
+ratio plus a no-losses→+∞ control, rollingApply's mean/vol/sharpe wrappers plus a custom comptime
+reducer and an empty-window-count edge case, and brinsonAttribution's per-segment effects plus the
+TOTAL-sums-to-active-return identity. Run: `zig build test-finstats` (also
+`-Doptimize=ReleaseFast`), `zig fmt --check modules/finstats`.
 
 ## Backlog / deferred
-Per the module README's own Backlog: parametric VaR/CVaR (Gaussian/Cornish-Fisher);
-tracking error + information ratio; Omega ratio; rolling-window variants of the scalar metrics;
-Brinson (factor) attribution (needs a weights input shape — the one genuinely involved addition);
-arbitrary VaR confidence level + annualization-frequency presets/validation; confidence intervals/
-standard errors on the statistics; xirr Newton-with-bisection-fallback + configurable tolerance.
+Everything from the original backlog is now implemented (see Design & invariants + Verification
+above). Remaining, genuinely deferred: annualization-frequency presets/bounds checking beyond the
+free `periods_per_year` knob; confidence intervals/standard errors on the statistics.
 
 ## Status
 `extract · any · util · reentrant` · deps: `dataset` — canonical source is `pub const meta` in
