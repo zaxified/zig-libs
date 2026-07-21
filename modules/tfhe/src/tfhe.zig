@@ -67,7 +67,17 @@ pub fn Tfhe(comptime P: params.Params) type {
         }
         /// Binary LWE secret key of dimension `dim`.
         pub fn LweKey(comptime dim: usize) type {
-            return struct { s: [dim]T };
+            return struct {
+                s: [dim]T,
+
+                /// Securely wipe the secret key. Fixed-size, no heap — zeroing
+                /// the struct's bytes erases the secret bits `s`. Call when
+                /// the key is no longer needed; left zeroed, must not be
+                /// reused. Idempotent.
+                pub fn deinit(self: *@This()) void {
+                    std.crypto.secureZero(u8, std.mem.asBytes(self));
+                }
+            };
         }
         /// Input/output LWE (under the small key `s ∈ {0,1}^n`).
         pub const LweN = Lwe(n);
@@ -75,7 +85,17 @@ pub fn Tfhe(comptime P: params.Params) type {
         pub const LweBig = Lwe(N);
 
         /// GLWE (`k=1`) secret key: one binary polynomial.
-        pub const GlweKey = struct { s: Poly };
+        pub const GlweKey = struct {
+            s: Poly,
+
+            /// Securely wipe the secret key. Fixed-size, no heap — zeroing
+            /// the struct's bytes erases the secret polynomial `s`. Call
+            /// when the key is no longer needed; left zeroed, must not be
+            /// reused. Idempotent.
+            pub fn deinit(self: *GlweKey) void {
+                std.crypto.secureZero(u8, std.mem.asBytes(self));
+            }
+        };
         /// GLWE (`k=1`) ciphertext `(a, b)`, `b = a·s + μ + e`.
         pub const Glwe = struct { a: Poly, b: Poly };
 
@@ -88,11 +108,32 @@ pub fn Tfhe(comptime P: params.Params) type {
 
         /// Bootstrap key: a GGSW encryption of each LWE secret bit `s_i` under
         /// the GLWE key.
-        pub const BootstrapKey = struct { ggsw: [n]Ggsw };
+        pub const BootstrapKey = struct {
+            ggsw: [n]Ggsw,
+
+            /// Securely wipe the bootstrap key. Each row is an ENCRYPTION of
+            /// a secret bit (not the bit itself), so this is defense-in-depth
+            /// rather than a bare-secret erasure — still handled with the
+            /// same discipline as the raw `LweKey`/`GlweKey` it is built
+            /// from. Fixed-size, no heap. Idempotent.
+            pub fn deinit(self: *BootstrapKey) void {
+                std.crypto.secureZero(u8, std.mem.asBytes(self));
+            }
+        };
 
         /// Key-switch key: for each big-key coordinate `j` and gadget level `i`,
         /// an `LweN` encryption of `s_ext[j]·q/B_ks^{i+1}` under the small key.
-        pub const KeySwitchKey = struct { rows: [N][ell_ks]LweN };
+        pub const KeySwitchKey = struct {
+            rows: [N][ell_ks]LweN,
+
+            /// Securely wipe the key-switch key. Each row is an ENCRYPTION of
+            /// a big-key coordinate (not the coordinate itself), so this is
+            /// defense-in-depth rather than a bare-secret erasure. Fixed-size,
+            /// no heap. Idempotent.
+            pub fn deinit(self: *KeySwitchKey) void {
+                std.crypto.secureZero(u8, std.mem.asBytes(self));
+            }
+        };
 
         pub fn init() !Self {
             try P.validate();
@@ -538,4 +579,31 @@ test "decomposeGlwe recomposes each component within the gadget error bound" {
 
 test "gate flag ON: the four cores are implemented" {
     try testing.expect(gate.fable_core_implemented);
+}
+
+test "deinit zeroes LWE/GLWE secret keys, bootstrap key, and key-switch key" {
+    var prng = std.Random.DefaultPrng.init(6);
+    const rnd = prng.random();
+
+    var lwe_key = Toy.lweKeyGen(64, rnd);
+    try testing.expect(!std.mem.allEqual(u8, std.mem.asBytes(&lwe_key), 0));
+    lwe_key.deinit();
+    try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&lwe_key), 0));
+
+    var glwe_key = Toy.glweKeyGen(rnd);
+    try testing.expect(!std.mem.allEqual(u8, std.mem.asBytes(&glwe_key), 0));
+    glwe_key.deinit();
+    try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&glwe_key), 0));
+
+    const gk2 = Toy.glweKeyGen(rnd);
+    const small_key = Toy.lweKeyGen(64, rnd);
+    var bsk = Toy.bootstrapKeyGen(&small_key, &gk2, rnd);
+    try testing.expect(!std.mem.allEqual(u8, std.mem.asBytes(&bsk), 0));
+    bsk.deinit();
+    try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&bsk), 0));
+
+    var ksk = Toy.keySwitchKeyGen(&gk2, &small_key, rnd);
+    try testing.expect(!std.mem.allEqual(u8, std.mem.asBytes(&ksk), 0));
+    ksk.deinit();
+    try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&ksk), 0));
 }

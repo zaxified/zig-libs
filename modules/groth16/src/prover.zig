@@ -88,7 +88,22 @@ pub const Randomizers = struct { r: Fr, s: Fr };
 /// the H-query degenerates). `setup` returns `error.DegenerateToxicWaste` for
 /// a zero `gamma`/`delta`; a domain-point `tau` is a caller error the toy
 /// setup does not defensively check (any small integer is safe).
-pub const ToxicWaste = struct { tau: Fr, alpha: Fr, beta: Fr, gamma: Fr, delta: Fr };
+pub const ToxicWaste = struct {
+    tau: Fr,
+    alpha: Fr,
+    beta: Fr,
+    gamma: Fr,
+    delta: Fr,
+
+    /// Securely wipe the toxic waste. Every field is secret (see this
+    /// struct's doc comment — a real ceremony never materialises any of
+    /// them together), fixed-size, no heap, so zeroing the struct's bytes
+    /// erases all five. Call once `setup` has consumed `tw` to build the
+    /// CRS. Idempotent — safe to call more than once.
+    pub fn deinit(self: *ToxicWaste) void {
+        std.crypto.secureZero(u8, std.mem.asBytes(self));
+    }
+};
 
 /// A matched `(ProvingKey, VerifyingKey)` pair — the output of `setup`. The
 /// key slices are heap-allocated with the allocator passed to `setup`; release
@@ -179,8 +194,16 @@ pub fn setup(
     std.debug.assert(sys.constraints.len <= n);
     std.debug.assert(num_public + 1 <= sys.num_vars);
 
-    const gamma_inv = tw.gamma.inv() catch return error.DegenerateToxicWaste;
-    const delta_inv = tw.delta.inv() catch return error.DegenerateToxicWaste;
+    // `tw` arrives by value (a local copy already, independent of the
+    // caller's own copy) and is never returned — only the `[scalar]·G`
+    // group elements derived from it are. Wipe this local copy on every
+    // exit once it's been fully consumed, on top of the caller's own
+    // responsibility to `deinit()` theirs.
+    var tw_local = tw;
+    defer tw_local.deinit();
+
+    const gamma_inv = tw_local.gamma.inv() catch return error.DegenerateToxicWaste;
+    const delta_inv = tw_local.delta.inv() catch return error.DegenerateToxicWaste;
 
     const m = sys.num_vars; // wire count, including the constant wire 0
     const num_priv = m - num_public - 1;
@@ -199,14 +222,14 @@ pub fn setup(
     errdefer allocator.free(ic);
 
     for (0..m) |i| {
-        const ui = columnEvalAtTau(n, sys, .a, i, tw.tau);
-        const vi = columnEvalAtTau(n, sys, .b, i, tw.tau);
-        const wi = columnEvalAtTau(n, sys, .c, i, tw.tau);
+        const ui = columnEvalAtTau(n, sys, .a, i, tw_local.tau);
+        const vi = columnEvalAtTau(n, sys, .b, i, tw_local.tau);
+        const wi = columnEvalAtTau(n, sys, .c, i, tw_local.tau);
         a_query[i] = g1Mul(ui);
         b_g1_query[i] = g1Mul(vi);
         b_g2_query[i] = g2Mul(vi);
         // β·uᵢ(τ) + α·vᵢ(τ) + wᵢ(τ) — the combined public/private base.
-        const combined = tw.beta.mul(ui).add(tw.alpha.mul(vi)).add(wi);
+        const combined = tw_local.beta.mul(ui).add(tw_local.alpha.mul(vi)).add(wi);
         if (i <= num_public) {
             ic[i] = g1Mul(combined.mul(gamma_inv));
         } else {
@@ -215,22 +238,22 @@ pub fn setup(
     }
 
     // H-query bases (τʲ·Z(τ)/δ)·G1 for j = 0..n−2, where Z(τ) = τⁿ − 1.
-    const z_tau = domain.Domain(n).vanishingEval(tw.tau);
+    const z_tau = domain.Domain(n).vanishingEval(tw_local.tau);
     {
         var tau_pow = Fr.one;
         for (0..n - 1) |j| {
             h_query[j] = g1Mul(tau_pow.mul(z_tau).mul(delta_inv));
-            tau_pow = tau_pow.mul(tw.tau);
+            tau_pow = tau_pow.mul(tw_local.tau);
         }
     }
 
     return .{
         .pk = .{
-            .alpha_g1 = g1Mul(tw.alpha),
-            .beta_g1 = g1Mul(tw.beta),
-            .delta_g1 = g1Mul(tw.delta),
-            .beta_g2 = g2Mul(tw.beta),
-            .delta_g2 = g2Mul(tw.delta),
+            .alpha_g1 = g1Mul(tw_local.alpha),
+            .beta_g1 = g1Mul(tw_local.beta),
+            .delta_g1 = g1Mul(tw_local.delta),
+            .beta_g2 = g2Mul(tw_local.beta),
+            .delta_g2 = g2Mul(tw_local.delta),
             .a_query = a_query,
             .b_g1_query = b_g1_query,
             .b_g2_query = b_g2_query,
@@ -239,10 +262,10 @@ pub fn setup(
             .domain_size = n,
         },
         .vk = .{
-            .alpha_g1 = g1Mul(tw.alpha),
-            .beta_g2 = g2Mul(tw.beta),
-            .gamma_g2 = g2Mul(tw.gamma),
-            .delta_g2 = g2Mul(tw.delta),
+            .alpha_g1 = g1Mul(tw_local.alpha),
+            .beta_g2 = g2Mul(tw_local.beta),
+            .gamma_g2 = g2Mul(tw_local.gamma),
+            .delta_g2 = g2Mul(tw_local.delta),
             .ic = ic,
         },
     };
@@ -279,9 +302,17 @@ pub fn prove(
     // witness, interpolate (inverse NTT), multiply A·B via FFT, subtract C,
     // and divide by the vanishing polynomial — the same anchored stack the
     // `qap` divisibility oracle uses, but keeping the quotient coefficients.
+    //
+    // These evaluations/quotient coefficients are witness-derived scratch,
+    // fully owned by this call (never aliased into the returned `Proof`, which
+    // is built purely from the `pi_a`/`pi_b`/`pi_c` group elements below) — so
+    // every one of them is wiped on exit, success or otherwise.
     var a_ev = [_]Fr{Fr.zero} ** n;
     var b_ev = [_]Fr{Fr.zero} ** n;
     var c_ev = [_]Fr{Fr.zero} ** n;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&a_ev));
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&b_ev));
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&c_ev));
     for (0..n) |j| {
         if (j < sys.constraints.len) {
             const e = sys.evalConstraint(j, witness);
@@ -295,10 +326,13 @@ pub fn prove(
     fft.intt(n, &c_ev);
 
     var ab = [_]Fr{Fr.zero} ** (2 * n - 1);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&ab));
     fft.mulViaFFT(2 * n, &ab, &a_ev, &b_ev);
     var p = [_]Fr{Fr.zero} ** (2 * n - 1);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&p));
     poly.sub(&p, &ab, &c_ev);
     var h = [_]Fr{Fr.zero} ** (n - 1);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&h));
     // Exact for a satisfying witness (the boolean is the satisfaction oracle);
     // for a non-satisfying one the quotient is bogus and the proof won't verify.
     _ = poly.divByVanishing(&h, &p, n);
@@ -421,4 +455,17 @@ test "setup rejects degenerate toxic waste (gamma or delta zero)" {
     var zero_delta = base;
     zero_delta.delta = Fr.zero;
     try std.testing.expectError(error.DegenerateToxicWaste, setup(2, std.testing.allocator, sys, 1, zero_delta));
+}
+
+test "ToxicWaste.deinit zeroes all five secret scalars" {
+    var tw = ToxicWaste{
+        .tau = field.frFromU64(7),
+        .alpha = field.frFromU64(11),
+        .beta = field.frFromU64(13),
+        .gamma = field.frFromU64(17),
+        .delta = field.frFromU64(19),
+    };
+    try std.testing.expect(!std.mem.allEqual(u8, std.mem.asBytes(&tw), 0));
+    tw.deinit();
+    try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&tw), 0));
 }

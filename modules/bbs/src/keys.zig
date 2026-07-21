@@ -65,6 +65,14 @@ pub const SecretKey = struct {
     pub fn fromBytes(bytes: [encoded_bytes]u8) !SecretKey {
         return .{ .scalar = try Fr.fromBytes(bytes) };
     }
+
+    /// Securely wipe the key material. `SecretKey` is a single fixed-size
+    /// `Fr` scalar (no heap), so zeroing the struct's bytes erases it.
+    /// Call when the key is no longer needed; the struct is left zeroed
+    /// and must not be reused. Idempotent — safe to call more than once.
+    pub fn deinit(self: *SecretKey) void {
+        std.crypto.secureZero(u8, std.mem.asBytes(self));
+    }
 };
 
 /// A BBS public key: a `G2` point (draft §3.3.1's "public keys in G2"
@@ -166,4 +174,12 @@ test "SecretKey / PublicKey byte round-trips" {
     const pk_bytes = pk.toBytes();
     const pk2 = try PublicKey.fromBytes(pk_bytes);
     try testing.expectEqualSlices(u8, &pk_bytes, &pk2.toBytes());
+}
+
+test "SecretKey.deinit zeroes the scalar" {
+    var sk_bytes = [_]u8{0} ** 32;
+    sk_bytes[31] = 99;
+    var sk = try SecretKey.fromBytes(sk_bytes);
+    sk.deinit();
+    try testing.expectEqualSlices(u8, &([_]u8{0} ** 32), &sk.toBytes());
 }

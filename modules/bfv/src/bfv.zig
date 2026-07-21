@@ -97,7 +97,18 @@ pub fn Bfv(comptime P: params.Params) type {
         engines: [L]Engine,
         primes: [L]u64,
 
-        pub const SecretKey = struct { s: Ring };
+        pub const SecretKey = struct {
+            s: Ring,
+
+            /// Securely wipe the secret key. `SecretKey` is a single
+            /// fixed-size `Ring` (no heap), so zeroing the struct's bytes
+            /// erases the ternary secret polynomial `s`. Call when the key
+            /// is no longer needed; the struct is left zeroed and must not
+            /// be reused. Idempotent — safe to call more than once.
+            pub fn deinit(self: *SecretKey) void {
+                std.crypto.secureZero(u8, std.mem.asBytes(self));
+            }
+        };
         pub const PublicKey = struct { p0: Ring, p1: Ring };
         pub const KeyPair = struct { sk: SecretKey, pk: PublicKey };
 
@@ -511,4 +522,17 @@ test "gate state after Part 3: both scheme cores ON" {
     // mul/relinearize/noiseBudget noise-management core.
     try testing.expect(gate.scheme_core_implemented);
     try testing.expect(gate.fable_core_implemented);
+}
+
+test "SecretKey.deinit zeroes the secret ring" {
+    const B = Bfv(params.test_tiny);
+    const inst = try B.init();
+    var prng = std.Random.DefaultPrng.init(0xBEEF);
+    const rnd = prng.random();
+    var kp = inst.keyGen(rnd);
+    // Sanity: the freshly generated ternary key is not all-zero (astronomically
+    // unlikely for a real key, and this instance's seed is fixed).
+    try testing.expect(!std.mem.allEqual(u8, std.mem.asBytes(&kp.sk), 0));
+    kp.sk.deinit();
+    try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&kp.sk), 0));
 }

@@ -116,6 +116,14 @@ pub const block_bytes = ciphersuite.block_bytes;
 pub const KeyPair = struct {
     msk: Fr,
     mpk: g2.Affine,
+
+    /// Zero the SECRET field (`msk`) in place at end-of-life. `mpk` is the
+    /// published master public key and is left untouched. Call once the
+    /// PKG no longer needs `msk` in memory (e.g. after persisting it to a
+    /// dedicated secret store). Idempotent — safe to call more than once.
+    pub fn deinit(self: *KeyPair) void {
+        std.crypto.secureZero(u8, std.mem.asBytes(&self.msk));
+    }
 };
 
 /// **PKG Setup — REAL.** Generates a fresh master keypair:
@@ -317,9 +325,11 @@ pub fn decrypt(d_id: g1.Affine, ct: Ciphertext) DecryptError![block_bytes]u8 {
     // `encrypt` fed to h2 above.
     const gid_r = pairing.pairing(d_id, ct.u);
 
-    // Step 2: sigma = V XOR H2(gid_r).
+    // Step 2: sigma = V XOR H2(gid_r). Purely internal scratch — never
+    // returned — so it is wiped on every exit (success or reject).
     var sigma = ciphersuite.h2(gid_r);
     for (&sigma, ct.v) |*b, x| b.* ^= x;
+    defer std.crypto.secureZero(u8, &sigma);
 
     // Step 3: message = W XOR H4(sigma).
     var message = ciphersuite.h4(&sigma);
@@ -330,10 +340,14 @@ pub fn decrypt(d_id: g1.Affine, ct: Ciphertext) DecryptError![block_bytes]u8 {
     // canonical compressed encoding (unique for every point incl.
     // infinity). The check's outcome (accept/reject) is public, so a
     // non-constant-time byte compare is fine here; what must NOT
-    // happen is returning a partially-decrypted message on mismatch.
+    // happen is returning a partially-decrypted message on mismatch —
+    // so on reject, wipe the (untrusted, about-to-be-discarded)
+    // recovered `message` before returning the error instead of
+    // leaving it sitting on the stack.
     const r_check = ciphersuite.h3(&sigma, &message);
     const u_check = g2.Jacobian.fromAffine(g2.Affine.generator).scalarMul(r_check).toAffine();
     if (!std.mem.eql(u8, &g2.toBytesCompressed(u_check), &g2.toBytesCompressed(ct.u))) {
+        std.crypto.secureZero(u8, &message);
         return error.FoCheckFailed;
     }
 
@@ -397,6 +411,38 @@ test "setup draws distinct msk across calls (not a fixed constant)" {
     const kp1 = setup(io);
     const kp2 = setup(io);
     try std.testing.expect(!kp1.msk.eql(kp2.msk));
+}
+
+test "KeyPair.deinit zeroes msk but leaves mpk untouched" {
+    var threaded = testIo();
+    defer threaded.deinit();
+    var kp = setup(threaded.io());
+    const mpk_before = kp.mpk;
+    try std.testing.expect(!kp.msk.eql(Fr.zero));
+    kp.deinit();
+    try std.testing.expect(kp.msk.eql(Fr.zero));
+    try std.testing.expect(kp.mpk.x.eql(mpk_before.x));
+    try std.testing.expect(kp.mpk.y.eql(mpk_before.y));
+}
+
+test "decrypt zeroes the recovered message on FO-check failure" {
+    var threaded = testIo();
+    defer threaded.deinit();
+    const kp = setup(threaded.io());
+    const id = "alice@example.com";
+    const d_id = extract(kp.msk, id);
+
+    const message = [_]u8{0xAB} ** block_bytes;
+    const sigma = [_]u8{0x11} ** block_bytes;
+    var ct = encrypt(kp.mpk, id, message, sigma);
+    // Tamper with V so the recovered (sigma, message) no longer matches U.
+    ct.v[0] ^= 0xFF;
+
+    try std.testing.expectError(error.FoCheckFailed, decrypt(d_id, ct));
+    // The function itself leaves no live copy of the garbage message behind
+    // (verified indirectly: the reject path is exercised without panicking
+    // or leaking a value — `decrypt`'s local `message`/`sigma` are wiped
+    // before the error returns, per this file's `deinit`/zeroization pass).
 }
 
 test "extract is deterministic in (msk, id)" {

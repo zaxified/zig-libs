@@ -8,11 +8,12 @@ counterpart to the sibling [`bn254`](../bn254/) module's Groth16 *verifier*
 accepts. Construction: Groth 2016, *"On the Size of Pairing-based
 Non-interactive Arguments."*
 
-**Status: Phase-1 scaffold.** The entire mechanical + math layer is
-implemented and heavily anchored; the *prover core* (`setup` + `prove`) is
-gated behind `gate.prover_core_implemented` (`false`) and `@panic`s until
-implemented — an **Opus** task, because the `bn254` verifier is a complete
-deterministic anchor (see [SPEC.md](SPEC.md)).
+**Status: implemented.** The entire mechanical + math layer AND the prover
+core (`setup` + `prove`) are implemented and anchored. `gate.
+prover_core_implemented` is `true`; the flag is retained as a self-documenting
+marker of the scaffold→core boundary, not a live switch — `setup`/`prove` no
+longer `@panic`. The core was an **Opus** task, not a Fable one, because the
+`bn254` verifier is a complete deterministic anchor (see [SPEC.md](SPEC.md)).
 
 ## What is real today
 
@@ -25,14 +26,15 @@ deterministic anchor (see [SPEC.md](SPEC.md)).
 | `msm.zig` | naive multi-scalar multiplication in `G1`/`G2` |
 | `r1cs.zig` | rank-1 constraint system + witness satisfaction |
 | `qap.zig` | R1CS→QAP interpolation + the `A·B−C` divisibility oracle |
-| `prover.zig` | **gated** `setup`/`prove`; **real** `brokenProof` positive control |
+| `prover.zig` | **real** `setup`/`prove` (the toy CRS + proof assembly) + `brokenProof` positive control |
 
 ## The anchor
 
 Correctness is anchored by the sibling `bn254` module's Groth16 verifier:
 `prove(setup(…)) → bn254.groth16Verify == true`, and any tampered proof/public
-input → `false`. That end-to-end test is gated (needs the core). Today's teeth
-come from the sub-anchors that run without the core:
+input → `false`. That end-to-end test now runs (the core is implemented).
+Today's teeth come from the sub-anchors that run independently, plus the
+end-to-end test itself:
 
 - **NTT round-trip:** `intt(ntt(v)) == v`.
 - **FFT vs schoolbook:** `fft.mulViaFFT == poly.mulSchoolbook`.
@@ -41,8 +43,11 @@ come from the sub-anchors that run without the core:
   `r1cs.System.isSatisfied` must agree on every witness — this proves the
   interpolation/vanishing-division stack.
 - **Positive control:** `bn254.groth16Verify` *rejects* `prover.brokenProof()`
-  (a deliberately-wrong "proof"), proving the anchor has teeth before `prove`
-  exists.
+  (a deliberately-wrong "proof"), proving the anchor has teeth independent of
+  a real `prove` call.
+- **End-to-end:** `prove(setup(…)) → bn254.groth16Verify == true`, plus
+  tamper/wrong-public-input/non-satisfying-witness cases → `false`
+  (`harness_test.zig`).
 
 ## Using it
 
@@ -57,16 +62,25 @@ const witness = groth16.r1cs.example.goodWitness(); // [1, 5, 25]
 // The QAP divisibility oracle (real today): true iff witness satisfies R1CS.
 _ = groth16.qap.checkDivisible(2, sys, &witness); // true
 
-// Proving (gated until the Opus core lands):
-//   const kp = groth16.setup(2, sys, toxic_tau);
-//   const pf = groth16.prove(2, kp.pk, sys, &witness, .{ .r = r, .s = s });
-//   try std.testing.expect(try @import("bn254").groth16Verify(kp.vk, pf, witness[1..2]));
+// Proving:
+const toxic_waste = groth16.ToxicWaste{ .tau = tau, .alpha = alpha, .beta = beta, .gamma = gamma, .delta = delta };
+const kp = try groth16.setup(2, allocator, sys, 1, toxic_waste);
+defer groth16.freeKeyPair(allocator, kp);
+const pf = groth16.prove(2, kp.pk, sys, 1, &witness, .{ .r = r, .s = s });
+try std.testing.expect(try @import("bn254").groth16Verify(kp.vk, pf, witness[1..2]));
 ```
+
+**Toxic waste:** `setup`'s `ToxicWaste{tau, alpha, beta, gamma, delta}` is the
+INSECURE, test-only trusted-setup material — see `ToxicWaste`'s doc comment
+in `prover.zig`. A real deployment sources the CRS from a distributed MPC
+ceremony instead of materialising these five scalars directly. `ToxicWaste`
+carries a `deinit()` that zeroes all five fields; `setup` also wipes its own
+internal copy on every exit.
 
 ## Verify
 
 ```
-zig build test-groth16                       # Debug: 26 pass, 2 skip (gated core)
+zig build test-groth16                       # Debug: all tests pass, none gated
 zig build test-groth16 -Doptimize=ReleaseFast
 zig fmt --check modules/groth16
 ```
