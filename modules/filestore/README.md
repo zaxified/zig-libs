@@ -2,10 +2,13 @@
 
 DB-less durable keyed document store: one flat file per record under
 `<base>/<kind>/<key>`, written atomically (temp-then-rename), with a thin
-typed-JSON convenience layer over the same raw-bytes files.
+typed-JSON convenience layer over the same raw-bytes files. TTL/expiry,
+ETag/version CAS and cross-process advisory locking sit alongside as
+opt-in sidecar layers — see "TTL, CAS and locking" below.
 
-- Spec-completed: atomic writes, path validation,
-  listTyped skip-count.
+- Spec-completed: atomic writes, path validation, listTyped skip-count,
+  TTL/expiry (`putWithTTL`/`sweep`), ETag/version CAS (`casPutBytes`),
+  cross-process advisory locking (`lockKey`).
 - **Model after:** flat-file document store.
 - **Platform:** posix (visibility relies on atomic `rename(2)`; filesystem via
   `std.Io`). **Role:** util. **Concurrency:** reentrant — no shared state
@@ -47,6 +50,22 @@ const keys = try store.list(arena, "devices");               // [][]const u8
 try store.put(gpa, MyRecord, "devices", "dev-1", value);
 const rec = try store.get(MyRecord, arena, "devices", "dev-1");         // ?MyRecord
 const all = try store.listTyped(MyRecord, arena, "devices");            // struct{ items: []MyRecord, skipped: usize }
+
+// TTL / expiry — wall-clock via store.clock (injectable in tests)
+try store.putWithTTL("sessions", "s1", bytes, 3600 * std.time.ns_per_s); // 1h
+_ = try store.getBytes(arena, "sessions", "s1");   // null once expired (read-only check)
+const swept = try store.sweep(arena, "sessions");  // actually deletes expired records
+
+// ETag / version CAS — Version is a content fingerprint, no sidecar needed
+const v1 = try store.casPutBytes(arena, "accounts", "a1", "v1", null); // null = must not exist
+const v2 = try store.casPutBytes(arena, "accounts", "a1", "v2", v1);   // must match current version
+// store.casPutBytes(arena, "accounts", "a1", "v3", v1) now => error.VersionMismatch (stale)
+const cur = try store.getBytesVersioned(arena, "accounts", "a1"); // ?struct{ bytes, version }
+
+// cross-process advisory locking — used internally by casPutBytes/putWithTTL/
+// sweep; expose it for your own multi-step read-modify-write sequences too
+var kl = try store.lockKey("accounts", "a1");
+defer kl.unlock();
 ```
 
 ## Design notes
@@ -76,16 +95,43 @@ const all = try store.listTyped(MyRecord, arena, "devices");            // struc
   `base`). Per-resource one-liner wrappers and domain-specific queries are
   consumer glue, not part of this generic module.
 
+## TTL, CAS and locking
+
+- **TTL / expiry.** `putWithTTL(kind, key, bytes, ttl_ns)` records a deadline
+  in a hidden sidecar `.<key>.expiry` next to the record (decimal
+  ns-since-epoch, wall-clock via `Store.clock` — injectable for tests, real
+  `clock_gettime(REALTIME)` by default). `getBytes`/`get`/`listTyped` treat an
+  expired record as absent — a read-only check, they never delete. `sweep(kind)`
+  is what actually reaps expired records, returning the count removed. `list`
+  is a raw directory scan and does *not* filter by TTL, so an
+  expired-but-unswept key still shows up there — that split is intentional
+  (`list` is cheap-by-design, one syscall per entry; TTL-filtering it would
+  mean a stat/read per key). Plain `putBytes`/`casPutBytes` do not clear a
+  prior `.expiry` sidecar (mixing them with `putWithTTL` on the same key
+  inherits the old deadline) — `delete` does clear it.
+- **ETag / version CAS.** `Version` is a `Wyhash` fingerprint of the record's
+  own bytes (fixed seed, so it is stable across process restarts) — computed
+  on read, not stored anywhere, so there is no sidecar to keep in sync.
+  `getBytesVersioned`/`putBytesVersioned` report it; `casPutBytes(kind, key,
+  bytes, expected)` writes only if the current version matches `expected`
+  (`null` = must not exist, a value = must exist with exactly that version) —
+  otherwise `error.VersionMismatch`, and the caller should re-`get` and retry
+  rather than blindly overwrite.
+- **Cross-process advisory locking.** `lockKey(kind, key)` takes an exclusive
+  `flock` on a hidden sidecar `.<key>.lock`, released via `KeyLock.unlock()`.
+  `casPutBytes` and `putWithTTL`/`sweep` acquire it internally around their
+  own read-check-write, which is what makes CAS actually trustworthy across
+  processes — the atomic `rename(2)` in `putBytes` alone only prevents a torn
+  *read* of one write, it does nothing to stop two processes' multi-step
+  CAS/TTL sequences from interleaving. A caller doing its own multi-step
+  read-modify-write across processes can wrap it with `lockKey` too. Plain
+  `putBytes`/`getBytes`/`delete` stay lock-free and unchanged — no locking
+  cost unless you touch TTL/CAS, and last-write-wins on the bare `rename(2)`
+  (never a torn file) remains the documented behavior for them.
+
 ## Backlog (deferred, not implemented)
 
-- **TTL / expiry** — `putWithTTL(kind, key, bytes, ttl)` to tag a record with
-  an expiry, plus `sweep(now)` to reap expired records. Needs a place to store
-  the expiry (sidecar file or a small header) and a decision on whether
-  expired-but-unswept records should still be visible to `get`/`list`.
-- **Cross-process ingest locking** — like `blobstore`, the ingest counter only
-  guarantees temp-name uniqueness *within* a process; cross-process writers to
-  the same `kind`/`key` can race on the final rename (last write wins, which
-  is at least never a torn file, just a benign overwrite race).
-- **Reference/version metadata** — no ETag/version field on records, so
-  optimistic-concurrency writes (compare-and-swap on a stored version) are not
-  supported; every `put` is an unconditional overwrite.
+None from the original v1 backlog — TTL/expiry, ETag/version CAS and
+cross-process locking (above) close it out. Not currently planned: a
+`sweep`-all-kinds convenience (today one `kind` at a time, like `list`);
+mandatory (non-advisory) locking; encryption at rest.
