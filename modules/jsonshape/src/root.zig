@@ -51,14 +51,23 @@ pub const ShapeSpec = struct {
     y: []const u8 = "",
 };
 
-/// Parse `bytes`, descend `spec.path` to an array, project each item to a row.
+/// Parse `bytes`, resolve `spec.path` to array item(s), project each item to a row.
+///
+/// `spec.path` accepts two dialects:
+///   * **legacy dot-path** (back-compat, unchanged semantics): a plain
+///     dot-separated chain of object-key lookups to exactly one array node
+///     (e.g. `"data.prices"`). A single non-array match → empty dataset.
+///   * **JSONPath subset** (triggered by any of `[`, `*`, `?`, `..`, or a
+///     leading `$`): array **indices** (`a.b[2]`), **wildcards** (`a.b[*]`,
+///     `a.*`), **recursive descent** (`..name`), and **filter expressions**
+///     (`a.b[?(@.field == "x")]`, ops `== != < <= > >=` against a number/
+///     string/bool/null literal). May yield multiple matched nodes (e.g.
+///     paginated arrays under a wildcard); each match contributes rows: an
+///     `.array` match is flattened (its elements become items), any other
+///     match becomes a single item itself.
 pub fn shape(a: std.mem.Allocator, bytes: []const u8, spec: ShapeSpec) Error!Dataset {
     const root = std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}) catch return Error.BadJson;
-    const node = descend(root, spec.path);
-    const items: []const std.json.Value = switch (node) {
-        .array => |arr| arr.items,
-        else => &.{}, // not an array → empty dataset with the declared columns
-    };
+    const items = try resolveItems(a, root, spec.path);
 
     if (spec.columns.len == 0) return shapeXY(a, items, spec);
 
@@ -115,6 +124,336 @@ fn descend(root: std.json.Value, path: []const u8) std.json.Value {
         };
     }
     return node;
+}
+
+// ── JSONPath subset (indices, wildcards, recursive descent, filters) ──────────
+//
+// `descend` above stays untouched and is the sole code path for legacy plain
+// dot-paths, guaranteeing byte-identical back-compat. Any path using `[`,
+// `*`, `?`, `..`, or a leading `$` routes through this richer engine instead.
+
+/// Bounds recursive-descent (`..name`) and general segment-eval recursion so
+/// a crafted path can't blow the stack on a deeply-nested document — a
+/// document-shaped DoS is the only real "unbounded recursion" risk here
+/// (filter predicates are single-level, no recursion of their own).
+const MAX_PATH_DEPTH: u32 = 64;
+
+const CmpOp = enum { eq, ne, lt, le, gt, ge };
+
+const FilterLit = union(enum) {
+    number: f64,
+    string: []const u8,
+    boolean: bool,
+    is_null,
+};
+
+const Filter = struct {
+    field: []const u8,
+    op: CmpOp,
+    lit: FilterLit,
+};
+
+const Seg = union(enum) {
+    key: []const u8,
+    index: usize,
+    wildcard,
+    recursive: []const u8,
+    filter: Filter,
+    /// A syntactically-invalid segment: matches nothing, but doesn't fail
+    /// the whole shape() call — same "degrade, don't error" philosophy as
+    /// the rest of this module (only malformed *JSON* raises Error.BadJson).
+    never,
+};
+
+fn isLegacyPath(path: []const u8) bool {
+    if (path.len > 0 and path[0] == '$') return false;
+    for (path) |c| {
+        if (c == '[' or c == '*' or c == '?') return false;
+    }
+    if (std.mem.indexOf(u8, path, "..") != null) return false;
+    return true;
+}
+
+/// Resolve `path` to the item list rows get projected from. Legacy dot-paths
+/// go through `descend` unchanged; anything else through the segment engine,
+/// flattening `.array` matches (their elements become items) and treating
+/// any other match as a single item itself.
+fn resolveItems(a: std.mem.Allocator, root: std.json.Value, path: []const u8) Error![]const std.json.Value {
+    if (isLegacyPath(path)) {
+        const node = descend(root, path);
+        return switch (node) {
+            .array => |arr| arr.items,
+            else => &.{}, // not an array → empty dataset with the declared columns
+        };
+    }
+
+    const segs = try parsePath(a, path);
+    var matches: std.ArrayList(std.json.Value) = .empty;
+    try evalSegs(a, root, segs, &matches, 0);
+
+    var items: std.ArrayList(std.json.Value) = .empty;
+    for (matches.items) |m| {
+        switch (m) {
+            .array => |arr| try items.appendSlice(a, arr.items),
+            else => try items.append(a, m),
+        }
+    }
+    return try items.toOwnedSlice(a);
+}
+
+/// Tokenize `path` into segments. Never fails on bad syntax — an
+/// unparseable index/filter/name becomes `.never` (matches nothing) so a
+/// malformed path degrades to an empty dataset like everything else here.
+fn parsePath(a: std.mem.Allocator, path: []const u8) Error![]Seg {
+    var segs: std.ArrayList(Seg) = .empty;
+    var i: usize = 0;
+    if (path.len > 0 and path[0] == '$') i = 1;
+
+    while (i < path.len) {
+        switch (path[i]) {
+            '.' => {
+                i += 1;
+                if (i < path.len and path[i] == '.') {
+                    i += 1;
+                    const start = i;
+                    while (i < path.len and path[i] != '.' and path[i] != '[') i += 1;
+                    const name = path[start..i];
+                    if (name.len == 0) {
+                        try segs.append(a, .never);
+                    } else {
+                        try segs.append(a, .{ .recursive = name });
+                    }
+                } else {
+                    const start = i;
+                    while (i < path.len and path[i] != '.' and path[i] != '[') i += 1;
+                    const name = path[start..i];
+                    if (name.len == 0) continue; // tolerate stray/doubled '.' like legacy descend
+                    if (std.mem.eql(u8, name, "*")) {
+                        try segs.append(a, .wildcard);
+                    } else {
+                        try segs.append(a, .{ .key = name });
+                    }
+                }
+            },
+            '[' => {
+                i += 1;
+                const start = i;
+                while (i < path.len and path[i] != ']') i += 1;
+                if (i >= path.len) {
+                    try segs.append(a, .never);
+                    break; // unterminated '[' — nothing sensible follows
+                }
+                const inner = path[start..i];
+                i += 1; // skip ']'
+                if (inner.len == 0) {
+                    try segs.append(a, .never);
+                } else if (std.mem.eql(u8, inner, "*")) {
+                    try segs.append(a, .wildcard);
+                } else if (inner[0] == '?') {
+                    if (parseFilter(inner[1..])) |f| {
+                        try segs.append(a, .{ .filter = f });
+                    } else {
+                        try segs.append(a, .never);
+                    }
+                } else {
+                    const idx: ?usize = std.fmt.parseInt(usize, inner, 10) catch null;
+                    if (idx) |v| {
+                        try segs.append(a, .{ .index = v });
+                    } else {
+                        try segs.append(a, .never);
+                    }
+                }
+            },
+            else => {
+                const start = i;
+                while (i < path.len and path[i] != '.' and path[i] != '[') i += 1;
+                const name = path[start..i];
+                if (name.len > 0) {
+                    if (std.mem.eql(u8, name, "*")) {
+                        try segs.append(a, .wildcard);
+                    } else {
+                        try segs.append(a, .{ .key = name });
+                    }
+                }
+            },
+        }
+    }
+    return try segs.toOwnedSlice(a);
+}
+
+fn evalSegs(a: std.mem.Allocator, node: std.json.Value, segs: []const Seg, out: *std.ArrayList(std.json.Value), depth: u32) Error!void {
+    if (depth > MAX_PATH_DEPTH) return;
+    if (segs.len == 0) {
+        try out.append(a, node);
+        return;
+    }
+    const seg = segs[0];
+    const rest = segs[1..];
+    switch (seg) {
+        .never => {},
+        .key => |k| switch (node) {
+            .object => |o| if (o.get(k)) |v| try evalSegs(a, v, rest, out, depth + 1),
+            else => {},
+        },
+        .index => |idx| switch (node) {
+            .array => |arr| if (idx < arr.items.len) try evalSegs(a, arr.items[idx], rest, out, depth + 1),
+            else => {},
+        },
+        .wildcard => switch (node) {
+            .array => |arr| for (arr.items) |it| try evalSegs(a, it, rest, out, depth + 1),
+            .object => |o| for (o.values()) |v| try evalSegs(a, v, rest, out, depth + 1),
+            else => {},
+        },
+        .recursive => |name| try recursiveFind(a, node, name, rest, out, depth),
+        .filter => |f| switch (node) {
+            .array => |arr| for (arr.items) |it| {
+                if (matchFilter(it, f)) try evalSegs(a, it, rest, out, depth + 1);
+            },
+            else => {},
+        },
+    }
+}
+
+/// Depth-first search for every object field named `name`, anywhere under
+/// `node` (any nesting) — the `..name` recursive-descent operator.
+fn recursiveFind(a: std.mem.Allocator, node: std.json.Value, name: []const u8, rest: []const Seg, out: *std.ArrayList(std.json.Value), depth: u32) Error!void {
+    if (depth > MAX_PATH_DEPTH) return;
+    switch (node) {
+        .object => |o| {
+            if (o.get(name)) |v| try evalSegs(a, v, rest, out, depth + 1);
+            for (o.values()) |v| try recursiveFind(a, v, name, rest, out, depth + 1);
+        },
+        .array => |arr| for (arr.items) |it| try recursiveFind(a, it, name, rest, out, depth + 1),
+        else => {},
+    }
+}
+
+/// Parse a bounded `[?( @.field OP literal )]` predicate body (the `?` is
+/// already stripped by the caller). One field, one comparison, one literal
+/// — no boolean composition, no nesting. `OP` is one of `== != < <= > >=`;
+/// `literal` is a quoted string, `true`/`false`, `null`, or a number.
+fn parseFilter(raw: []const u8) ?Filter {
+    var s = std.mem.trim(u8, raw, " \t");
+    if (s.len >= 2 and s[0] == '(' and s[s.len - 1] == ')') {
+        s = std.mem.trim(u8, s[1 .. s.len - 1], " \t");
+    }
+    if (!std.mem.startsWith(u8, s, "@.")) return null;
+    s = s[2..];
+
+    var fi: usize = 0;
+    while (fi < s.len and isFieldChar(s[fi])) fi += 1;
+    const field = s[0..fi];
+    if (field.len == 0) return null;
+    var rest = std.mem.trim(u8, s[fi..], " \t");
+
+    const Op = struct { txt: []const u8, op: CmpOp };
+    const ops = [_]Op{
+        .{ .txt = "==", .op = .eq },
+        .{ .txt = "!=", .op = .ne },
+        .{ .txt = "<=", .op = .le },
+        .{ .txt = ">=", .op = .ge },
+        .{ .txt = "<", .op = .lt },
+        .{ .txt = ">", .op = .gt },
+    };
+    var matched_op: ?CmpOp = null;
+    for (ops) |o| {
+        if (std.mem.startsWith(u8, rest, o.txt)) {
+            matched_op = o.op;
+            rest = std.mem.trim(u8, rest[o.txt.len..], " \t");
+            break;
+        }
+    }
+    const op = matched_op orelse return null;
+    if (rest.len == 0) return null;
+
+    const lit: FilterLit = blk: {
+        if (rest[0] == '"' or rest[0] == '\'') {
+            const quote = rest[0];
+            if (rest.len < 2 or rest[rest.len - 1] != quote) return null;
+            break :blk .{ .string = rest[1 .. rest.len - 1] };
+        } else if (std.mem.eql(u8, rest, "true")) {
+            break :blk .{ .boolean = true };
+        } else if (std.mem.eql(u8, rest, "false")) {
+            break :blk .{ .boolean = false };
+        } else if (std.mem.eql(u8, rest, "null")) {
+            break :blk .is_null;
+        } else {
+            const n = std.fmt.parseFloat(f64, rest) catch return null;
+            break :blk .{ .number = n };
+        }
+    };
+    return .{ .field = field, .op = op, .lit = lit };
+}
+
+fn isFieldChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_' or c == '-';
+}
+
+fn matchFilter(item: std.json.Value, f: Filter) bool {
+    const fv = itemField(item, f.field) orelse return false;
+    return switch (f.lit) {
+        .number => |n| cmpNumber(fv, f.op, n),
+        .string => |s| cmpString(fv, f.op, s),
+        .boolean => |b| cmpBool(fv, f.op, b),
+        .is_null => cmpNull(fv, f.op),
+    };
+}
+
+fn cmpNumber(fv: std.json.Value, op: CmpOp, n: f64) bool {
+    const v: f64 = switch (fv) {
+        .integer => |i| @floatFromInt(i),
+        .float => |fl| fl,
+        .number_string => |s| std.fmt.parseFloat(f64, s) catch return false,
+        else => return false,
+    };
+    return switch (op) {
+        .eq => v == n,
+        .ne => v != n,
+        .lt => v < n,
+        .le => v <= n,
+        .gt => v > n,
+        .ge => v >= n,
+    };
+}
+
+fn cmpString(fv: std.json.Value, op: CmpOp, s: []const u8) bool {
+    const v: []const u8 = switch (fv) {
+        .string => |vs| vs,
+        .number_string => |vs| vs,
+        else => return false,
+    };
+    const order = std.mem.order(u8, v, s);
+    return switch (op) {
+        .eq => order == .eq,
+        .ne => order != .eq,
+        .lt => order == .lt,
+        .le => order != .gt,
+        .gt => order == .gt,
+        .ge => order != .lt,
+    };
+}
+
+fn cmpBool(fv: std.json.Value, op: CmpOp, b: bool) bool {
+    return switch (fv) {
+        .bool => |vb| switch (op) {
+            .eq => vb == b,
+            .ne => vb != b,
+            else => false,
+        },
+        else => false,
+    };
+}
+
+fn cmpNull(fv: std.json.Value, op: CmpOp) bool {
+    const is_null = switch (fv) {
+        .null => true,
+        else => false,
+    };
+    return switch (op) {
+        .eq => is_null,
+        .ne => !is_null,
+        else => false,
+    };
 }
 
 fn itemField(item: std.json.Value, key: []const u8) ?std.json.Value {
@@ -231,4 +570,159 @@ test "shape: malformed JSON → BadJson" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     try testing.expectError(Error.BadJson, shape(arena.allocator(), "{not json", .{}));
+}
+
+test "shape: back-compat — existing legacy dot-path resolves identically" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const json =
+        \\{ "data": { "prices": [
+        \\   { "d": "2024-01-01", "close": 100.5, "vol": 10 },
+        \\   { "d": "2024-01-02", "close": 101, "vol": 20 }
+        \\ ] } }
+    ;
+    // Same spec as the "dotpath + generic columns" test above — the path
+    // contains none of `[ * ? ..` so it must route through the untouched
+    // legacy `descend`, with byte-identical results before and after the
+    // JSONPath-subset engine was added.
+    const d = try shape(a, json, .{
+        .path = "data.prices",
+        .columns = &.{
+            .{ .name = "date", .key = "d", .type = .date },
+            .{ .name = "close", .key = "close", .type = .float },
+            .{ .name = "vol", .key = "vol", .type = .int },
+        },
+    });
+    try testing.expectEqual(@as(usize, 2), d.rows.len);
+    try testing.expectEqualStrings("2024-01-01", d.cell(0, "date").?.text);
+    try testing.expectEqual(@as(f64, 100.5), d.cell(0, "close").?.float);
+    try testing.expectEqual(@as(i64, 20), d.cell(1, "vol").?.int);
+}
+
+test "shape: JSONPath array index — a.b[2]" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const d = try shape(a, "{\"a\":{\"b\":[10,20,30,40]}}", .{
+        .path = "a.b[2]",
+        .columns = &.{.{ .name = "v", .type = .int }},
+    });
+    try testing.expectEqual(@as(usize, 1), d.rows.len);
+    try testing.expectEqual(@as(i64, 30), d.cell(0, "v").?.int);
+}
+
+test "shape: JSONPath array wildcard — a.b[*]" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const json = "{\"a\":{\"b\":[{\"n\":1},{\"n\":2},{\"n\":3}]}}";
+    const d = try shape(a, json, .{
+        .path = "a.b[*]",
+        .columns = &.{.{ .name = "n", .key = "n", .type = .int }},
+    });
+    try testing.expectEqual(@as(usize, 3), d.rows.len);
+    try testing.expectEqual(@as(i64, 1), d.cell(0, "n").?.int);
+    try testing.expectEqual(@as(i64, 2), d.cell(1, "n").?.int);
+    try testing.expectEqual(@as(i64, 3), d.cell(2, "n").?.int);
+}
+
+test "shape: JSONPath object wildcard — a.*" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const d = try shape(a, "{\"a\":{\"x\":1,\"y\":2,\"z\":3}}", .{
+        .path = "a.*",
+        .columns = &.{.{ .name = "v", .type = .int }},
+    });
+    try testing.expectEqual(@as(usize, 3), d.rows.len);
+    try testing.expectEqual(@as(i64, 1), d.cell(0, "v").?.int);
+    try testing.expectEqual(@as(i64, 2), d.cell(1, "v").?.int);
+    try testing.expectEqual(@as(i64, 3), d.cell(2, "v").?.int);
+}
+
+test "shape: JSONPath recursive descent — ..name" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const json =
+        \\{ "a": { "name": "top", "b": { "name": "nested1", "c": [
+        \\   { "name": "deep1" }, { "other": 1 }
+        \\ ] } } }
+    ;
+    const d = try shape(a, json, .{
+        .path = "..name",
+        .columns = &.{.{ .name = "v", .type = .text }},
+    });
+    try testing.expectEqual(@as(usize, 3), d.rows.len);
+    try testing.expectEqualStrings("top", d.cell(0, "v").?.text);
+    try testing.expectEqualStrings("nested1", d.cell(1, "v").?.text);
+    try testing.expectEqualStrings("deep1", d.cell(2, "v").?.text);
+}
+
+test "shape: JSONPath multiple array nodes concatenate — pages[*].items" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const json = "{\"pages\":[{\"items\":[1,2]},{\"items\":[3,4,5]}]}";
+    const d = try shape(a, json, .{
+        .path = "pages[*].items",
+        .columns = &.{.{ .name = "v", .type = .int }},
+    });
+    try testing.expectEqual(@as(usize, 5), d.rows.len);
+    try testing.expectEqual(@as(i64, 1), d.cell(0, "v").?.int);
+    try testing.expectEqual(@as(i64, 5), d.cell(4, "v").?.int);
+}
+
+test "shape: filter expression selects exactly the matching elements" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const json =
+        \\{ "list": [
+        \\  { "id": 1, "status": "ok" },
+        \\  { "id": 2, "status": "bad" },
+        \\  { "id": 3, "status": "ok" }
+        \\ ] }
+    ;
+    const d = try shape(a, json, .{
+        .path = "list[?(@.status == \"ok\")]",
+        .columns = &.{
+            .{ .name = "id", .key = "id", .type = .int },
+            .{ .name = "status", .key = "status", .type = .text },
+        },
+    });
+    try testing.expectEqual(@as(usize, 2), d.rows.len);
+    try testing.expectEqual(@as(i64, 1), d.cell(0, "id").?.int);
+    try testing.expectEqual(@as(i64, 3), d.cell(1, "id").?.int);
+    // Positive control: id=2 ("bad") must be excluded, not merely
+    // deprioritized — assert it's gone from every row.
+    for (0..d.rows.len) |ri| {
+        try testing.expect(d.cell(ri, "id").?.int != 2);
+    }
+}
+
+test "shape: numeric filter operators (>, no spaces around op)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const d = try shape(a, "{\"arr\":[{\"n\":1},{\"n\":10},{\"n\":5}]}", .{
+        .path = "arr[?(@.n>5)]",
+        .columns = &.{.{ .name = "n", .key = "n", .type = .int }},
+    });
+    try testing.expectEqual(@as(usize, 1), d.rows.len);
+    try testing.expectEqual(@as(i64, 10), d.cell(0, "n").?.int);
+}
+
+test "shape: malformed JSONPath syntax → empty dataset, not a crash" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Unterminated '[' — invalid syntax degrades to "no match", same
+    // leniency contract as a missing key.
+    const d = try shape(a, "{\"a\":[1,2,3]}", .{
+        .path = "a[0",
+        .columns = &.{.{ .name = "v", .type = .int }},
+    });
+    try testing.expectEqual(@as(usize, 0), d.rows.len);
 }
