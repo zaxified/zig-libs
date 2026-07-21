@@ -308,3 +308,144 @@ test "gated: RS256.decode corrects exactly delta random symbol errors (param_fft
     if (!gate.decoder_core_implemented) return error.SkipZigTest;
     try rsCorrectsDeltaSymbolErrors(RS256, 8);
 }
+
+// ── RS corrector EXTERNAL anchor ───────────────────────────────────────
+// The gated round-trip tests above validate the decoder self-consistently
+// (encode -> corrupt -> decode -> compare). Because `encode` is itself
+// byte-exact KAT-pinned against the reference (kat_vectors_code.zig), those
+// tests are already strong, but they exercise ONLY the module's own
+// corrector against its own encoder, and compare the k-byte MESSAGE alone.
+// The tests below add an INDEPENDENT witness for the
+// syndrome -> error-locator -> error-value chain: a from-scratch syndrome
+// evaluator plus the closed-form SINGLE-error Peterson locator/value
+// formulas — a DIFFERENT construction from the shipped constant-time
+// Berlekamp-Massey + Gao-Mateer additive-FFT root-finding + Forney, computed
+// here over the same KAT-pinned GF(2^8). This is the "known small RS
+// instance" external anchor the corrector otherwise lacked: the syndromes
+// and the recovered (position, value) are pinned by textbook closed forms,
+// not by re-running the decoder under test.
+//
+// (Note on the NIST HQC KAT: `kem_kat_test.zig`'s `decaps`-agrees vectors DO
+// transitively drive this corrector on the real decryption-noise error
+// pattern — an external NIST anchor — but bury it inside full KEM
+// decapsulation and cannot isolate a corrector-only fault. These tests
+// isolate it.)
+
+/// S_i = XOR-sum_{j=0}^{n1-1} c_j * alpha^{(i+1)*j}, i in [0, 2*delta) — the
+/// standard RS syndrome definition (alpha = the GF(2^8) generator `gf.exp`
+/// tabulates), computed INDEPENDENTLY of `reedsolomon.zig`'s private
+/// `computeSyndromes`. Self-validated by the all-zero-on-a-valid-codeword
+/// test below (which cross-checks it against the byte-exact-pinned encoder).
+fn independentSyndromes(comptime RSt: type, cdw: *const RSt.Codeword) [2 * RSt.delta]u8 {
+    var s: [2 * RSt.delta]u8 = [_]u8{0} ** (2 * RSt.delta);
+    for (0..2 * RSt.delta) |i| {
+        var acc: u8 = 0;
+        for (0..RSt.n1) |j| {
+            const a: u8 = @intCast(gf.exp[((i + 1) * j) % 255]);
+            acc ^= gf.mul(cdw[j], a);
+        }
+        s[i] = acc;
+    }
+    return s;
+}
+
+test "RS corrector anchor: independent syndromes of every valid codeword are all zero (RS128/192/256)" {
+    inline for (.{ RS128, RS192, RS256 }, .{ 0x5311d0, 0x5311d1, 0x5311d2 }) |RSt, seed| {
+        var rng = std.Random.DefaultPrng.init(seed);
+        const random = rng.random();
+        for (0..8) |_| {
+            var msg: RSt.Message = undefined;
+            random.bytes(&msg);
+            const cdw = RSt.encode(msg);
+            const s = independentSyndromes(RSt, &cdw);
+            for (s) |si| try testing.expectEqual(@as(u8, 0), si);
+        }
+    }
+}
+
+test "RS corrector anchor: single injected error — closed-form Peterson locator/value match, and RS128.decode recovers the message" {
+    if (!gate.decoder_core_implemented) return error.SkipZigTest;
+
+    // Deterministic valid codeword.
+    var msg: RS128.Message = undefined;
+    for (&msg, 0..) |*b, i| b.* = @intCast(0x40 + i);
+    const cdw = RS128.encode(msg);
+
+    // Inject ONE known error in the message region [redundancy=30, n1=46),
+    // so the uncorrected message suffix visibly differs from `msg` — a no-op
+    // corrector would then fail the final recovery check.
+    const p: usize = 40; // message byte 40 - 30 = 10
+    const v: u8 = 0x9c;
+    var recv = cdw;
+    recv[p] ^= v;
+
+    // Independent syndromes; single-error closed forms (Peterson):
+    //   S_i = v * alpha^{(i+1)p}
+    //   => locator alpha^p = S_1 * S_0^{-1},  value v = S_0 * (alpha^p)^{-1}.
+    const s = independentSyndromes(RS128, &recv);
+    try testing.expect(s[0] != 0); // error is detectable
+    const locator = gf.mul(s[1], gf.inverse(s[0])); // = alpha^p
+    const p_rec: usize = gf.log[locator];
+    const v_rec = gf.mul(s[0], gf.inverse(locator));
+    try testing.expectEqual(p, p_rec); // syndrome -> error LOCATOR (external)
+    try testing.expectEqual(v, v_rec); // syndrome -> error VALUE  (external)
+
+    // The received (uncorrected) message differs from the original...
+    try testing.expect(!std.mem.eql(u8, &msg, recv[RS128.redundancy..]));
+    // ...but the module's decoder recovers it exactly (corrected codeword).
+    const got = RS128.decode(recv);
+    try testing.expectEqualSlices(u8, &msg, &got);
+}
+
+test "RS corrector anchor: exactly delta=15 injected errors at fixed positions are all corrected (RS128 at capacity)" {
+    if (!gate.decoder_core_implemented) return error.SkipZigTest;
+
+    var msg: RS128.Message = undefined;
+    for (&msg, 0..) |*b, i| b.* = @intCast(i * 7 + 1);
+    const cdw = RS128.encode(msg);
+
+    var recv = cdw;
+    // delta distinct positions spanning both parity [0,30) and message
+    // [30,46) regions; several land in the message suffix so a no-op / mis-
+    // located corrector is caught by the final compare.
+    const positions = [_]usize{ 0, 2, 5, 9, 13, 18, 22, 25, 29, 31, 34, 37, 40, 43, 45 };
+    const values = [_]u8{ 0x01, 0x9c, 0x3f, 0xaa, 0x55, 0x80, 0x11, 0xf0, 0x7e, 0x22, 0xcd, 0x63, 0x9a, 0x04, 0xe1 };
+    comptime std.debug.assert(positions.len == RS128.delta);
+    for (positions, values) |pos, val| recv[pos] ^= val;
+
+    // Positive-control preconditions: uncorrected suffix differs, and the
+    // error is detectable at the syndrome layer (independent oracle).
+    try testing.expect(!std.mem.eql(u8, &msg, recv[RS128.redundancy..]));
+    const s = independentSyndromes(RS128, &recv);
+    var any_nonzero = false;
+    for (s) |si| {
+        if (si != 0) any_nonzero = true;
+    }
+    try testing.expect(any_nonzero);
+
+    // Decoder corrects all delta errors and recovers the message exactly.
+    const got = RS128.decode(recv);
+    try testing.expectEqualSlices(u8, &msg, &got);
+}
+
+test "RS corrector anchor: beyond-capacity (delta+1 errors) is deterministic and does not trap" {
+    if (!gate.decoder_core_implemented) return error.SkipZigTest;
+
+    // HONEST NOTE: a bounded-distance RS decoder has NO reliable failure
+    // signal past delta errors — like the reference `reed_solomon_decode`,
+    // this decoder may SILENTLY return a wrong message (HQC's FO transform
+    // catches that one layer up via re-encryption, not here). So this is NOT
+    // a "clean reject" negative control; it only pins that a > delta pattern
+    // is handled without UB/panic and deterministically (two calls agree).
+    var msg: RS128.Message = undefined;
+    for (&msg, 0..) |*b, i| b.* = @intCast(i * 3 + 5);
+    const cdw = RS128.encode(msg);
+    var recv = cdw;
+    const positions = [_]usize{ 0, 2, 5, 9, 13, 18, 22, 25, 29, 31, 34, 37, 40, 43, 45, 12 };
+    comptime std.debug.assert(positions.len == RS128.delta + 1);
+    for (positions, 0..) |pos, i| recv[pos] ^= @as(u8, @intCast(0x80 | (i + 1)));
+
+    const got1 = RS128.decode(recv);
+    const got2 = RS128.decode(recv);
+    try testing.expectEqualSlices(u8, &got1, &got2); // deterministic, no trap
+}
