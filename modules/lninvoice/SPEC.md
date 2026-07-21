@@ -1,7 +1,8 @@
 # lninvoice — spec
 
 Lightning payment requests: BOLT#11 invoices (full decode+verify / encode+sign) and BOLT#12
-offers (decode only). Usage: see ./README.md.
+offers (decode) + signed `invoice_request`/`invoice` (parse/verify/build/sign via the BOLT#12
+Merkle-tree BIP-340 signature). Usage: see ./README.md.
 
 ## Design & invariants
 
@@ -85,26 +86,44 @@ offers (decode only). Usage: see ./README.md.
   cltv_expiry_delta }` (the exact 51-byte-per-hop BOLT#11 defines). This keeps the module from
   growing a second copy of address-format logic `bech32`/sibling modules already own.
 
-## BOLT#12 — offer decode only, `invoice_request`/`invoice` deferred
+## BOLT#12 — offer decode + signed `invoice_request`/`invoice`
 
-Implemented: `decodeOffer` — checksum-less bech32-style decode (`lno1...`, `+`-continuation
+**Offer (`lno1...`):** `decodeOffer` — checksum-less bech32-style decode (`+`-continuation
 stripping per BOLT#12 "Requirements"), the `offer` TLV stream via `lnwire.parseTlvStream` (reusing
 its generic strictly-increasing-type / minimal-BigSize / even-unknown-type-fails rules), and every
 scalar `offer_*` field (chains, metadata, currency, amount, description, features,
-absolute_expiry, issuer, quantity_max, issuer_id). `offer_paths` (`blinded_path` entries) are
-handed back as raw undecoded bytes — decoding the blinded-path structure is BOLT#4 route-blinding,
-a distinct spec.
+absolute_expiry, issuer, quantity_max, issuer_id). Offers are an *unsigned* TLV stream.
 
-**Deferred: `invoice_request`/`invoice` parsing and signing.** Offers are an *unsigned* TLV stream
-(every top-level type is even/informational) — a clean, self-contained parse this pass completed.
-`invoice_request`/`invoice` are signed with a BIP-340 Schnorr signature over a **Merkle root of the
-TLV stream** (BOLT#12 "Signature Calculation": a BIP-341-style tree, each leaf paired with a nonce
-leaf, tags `H("LnLeaf", tlv)` / `H("LnNonce"||first-tlv, tlv-type)` / `H("LnBranch",
-lesser-hash||greater-hash)`) — a self-contained sub-algorithm comparable in scope to this module's
-own BOLT#11 recoverable-ECDSA core, on top of the same `offer_paths` blinded-path gap. Bundling
-either into this pass would have traded BOLT#11 depth (its official test vectors, the
-recovery-security core) for breadth without finishing either well; the TLV plumbing below (`lnwire`
-integration, `bitpack`) is already shared and reusable for a follow-on module addition.
+**Signature Calculation (`merkleRoot` + `signMerkle`/`verifyMerkle`):** the BOLT#12 Merkle tree over
+a TLV stream — leaf `H("LnLeaf", tlv)` (full `type||length||value`), nonce leaf
+`H("LnNonce"||first-tlv, tlv-type)` where the *tag* is `"LnNonce"` concatenated with the whole first
+TLV record and the *message* is the current record's BigSize type field, branch
+`H("LnBranch", lesser||greater)` (lexicographic order), tree built bottom-up with the split at the
+largest power of two strictly below the level's node count. Signature TLVs (types 240–1000) are
+excluded from the tree. The signed message is `H("lightning"||messagename||fieldname, root)`, fed to
+BIP-340 (`bip340` dep). `merkleRoot` is a self-contained, reusable primitive (it re-walks the raw
+stream to recover per-record byte ranges, which `lnwire.parseStream` does not expose).
+
+**`invoice_request` (`lnr1...`):** `decodeInvoiceRequest` → `InvoiceRequest` (typed
+`invreq_metadata`/`invreq_amount`/`invreq_chain`/`invreq_quantity`/`invreq_payer_id`/
+`invreq_payer_note` + copied `offer_currency`/`offer_amount`/`offer_description`/`offer_issuer_id` +
+`signature`; `raw` owns the stream, slice fields borrow). `InvoiceRequest.verify` checks the
+`signature` (type 240) by `invreq_payer_id` (type 88, verified x-only). `encodeSignedInvoiceRequest`
+builds+signs+encodes from caller-supplied ascending signature-free records.
+
+**`invoice` (`lni1...`):** `decodeInvoice` → `Invoice` (typed `invoice_created_at`/
+`invoice_relative_expiry`/`invoice_payment_hash`/`invoice_amount`/`invoice_node_id`/`signature`).
+`Invoice.verify` checks the signature by `invoice_node_id` (type 176).
+`encodeSignedInvoice` builds+signs+encodes.
+
+**Raw (not typed) fields:** `offer_paths`/`invreq_paths`/`invoice_paths` (`blinded_path` entries,
+BOLT#4 route-blinding — a distinct spec), and `invoice`'s optional `invoice_blindedpay`/
+`invoice_fallbacks` sub-structures. These stay in the record stream / `raw` buffer and are not
+decoded; the signed-blob correctness (Merkle root + BIP-340 signature) and mandatory scalar fields
+are modelled fully. **Interop-vector caveat:** the `invoice` (`lni1`) sign/verify path is validated
+by sign→verify round-trip ONLY — the official `bolt12/signature-test.json` ships an `invoice_request`
+worked example but no `invoice` one, so `invoice` shares the (KAT-backed) Merkle+signature core but
+has no standalone external `invoice` signature vector.
 
 ## Verification
 
@@ -123,15 +142,32 @@ signing the donation vector's own hash with its own documented private key repro
 exact `(r, s, recid)` byte-for-byte, and recovering from that freshly-signed signature reproduces
 the spec's node ID — signer and verifier agree end-to-end.
 
-**BOLT#12**: a hand-built minimal offer round-tripped through `lnwire.tlv.appendStream` →
+**BOLT#12 offer**: a hand-built minimal offer round-tripped through `lnwire.tlv.appendStream` →
 `bitpack.bytesToQuintets` → `bech32_raw.encodeNoChecksum` → `decodeOffer` (independently
 constructed, not hand-typed hex), `+`-continuation stripping, wrong-prefix rejection, and the
 generic TLV even/odd-unknown-type rules (reusing `lnwire`'s own machinery, not re-tested from
 scratch).
 
+**BOLT#12 signature calculation**, byte-exact against the spec's own vectors
+(`lightning/bolts` `bolt12/signature-test.json`, "Signature Calculation"):
+- **`n1` Merkle roots** (1/2/3 leaves) — `merkleRoot` reproduces `b013756c…`, `c3774abb…`,
+  `ab2e79b1…` exactly.
+- **`invoice_request` worked example** (Alice offer / Bob payer, privkey `0x4242…42`) — the full
+  6-leaf Merkle root `608407c1…`, signature *verify* of the published `b8f83ea3…`, AND byte-exact
+  signature *reproduction* by signing with Bob's key + BIP-340 `aux_rand=0` (matches `b8f83ea3…`
+  to the byte). Also decoded end-to-end from the KAT `lnr1…` string through the
+  bech32/bitpack/TLV path.
+- **Reject-teeth**: flipped signature bit → verify `false`; corrupted stream byte → verify `false`;
+  swapped signer pubkey → verify `false`; length-overrun TLV → `error.Truncated`; empty /
+  signature-only stream → `error.EmptyMerkleStream`; signature-TLV-exclusion invariant (a type-240
+  record does not change the root).
+- **Round-trip**: `encodeSignedInvoiceRequest`/`encodeSignedInvoice` → decode → `verify` for both
+  `lnr1`/`lni1`. The `invoice` (`lni1`) path is **round-trip-only** (no external `invoice`
+  signature vector exists — see the BOLT#12 section's interop caveat).
+
 Run: `zig build test-lninvoice` (Debug and `-Doptimize=ReleaseFast`).
 
 ## Status
 
-`any (pure codec, no I/O) · codec · reentrant` + deps: `bech32`, `k256`, `lnwire` — canonical
-source is `pub const meta` in `src/root.zig`.
+`any (pure codec, no I/O) · codec · reentrant` + deps: `bech32`, `k256`, `lnwire`, `bip340` —
+canonical source is `pub const meta` in `src/root.zig`.

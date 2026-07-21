@@ -1,38 +1,58 @@
 // SPDX-License-Identifier: MIT
-//! BOLT#12 offers — the `lno1...` bech32-*style* (no checksum) TLV-encoded
-//! payment offer, precursor to an `invoice_request`/`invoice` exchange.
-//! **Scope: offer PARSE only** (see the module-level rationale below for
-//! why `invoice_request`/`invoice` are deferred rather than implemented
-//! here — also documented in `../SPEC.md`).
+//! BOLT#12 — the `lno1...`/`lnr1...`/`lni1...` bech32-*style* (no checksum)
+//! TLV-encoded offer/invoice_request/invoice exchange: `offer` decode, and
+//! the signed `invoice_request`/`invoice` forms (parse + verify + build +
+//! sign) built on BOLT#12's Merkle-tree BIP-340 Schnorr signature.
 //!
-//! Encoding (BOLT#12 "Encoding"): human-readable prefix `lno`, `1`
-//! separator, then the raw `offer` TLV stream's bytes bit-packed 5 bits at
-//! a time (`bitpack.bytesToQuintets`/`quintetsToBytesStrict` — the same
+//! Encoding (BOLT#12 "Encoding"): human-readable prefix (`lno`/`lnr`/`lni`),
+//! `1` separator, then the raw TLV stream's bytes bit-packed 5 bits at a
+//! time (`bitpack.bytesToQuintets`/`quintetsToBytesStrict` — the same
 //! MSB-first packing BOLT#11 uses, just over a whole TLV blob instead of
 //! per-field values) — **no checksum** ("There is no checksum, unlike
 //! bech32m"), and a `+` (optionally followed by whitespace) may split the
 //! string across limited-length text fields; both are handled by
 //! `bech32_raw.decodeNoChecksum`/`stripContinuation`.
 //!
-//! ## Why `invoice_request`/`invoice` are deferred
+//! ## Signature Calculation (BOLT#12) — the Merkle root
 //!
-//! Offers themselves are an *unsigned* TLV stream (every top-level `offer`
-//! type is even/informational, no signature field) — a clean, self-
-//! contained parse. `invoice_request`/`invoice`, by contrast, are signed
-//! with a BIP-340 Schnorr signature over a **Merkle root of the TLV
-//! stream** (BOLT#12 "Signature Calculation": a BIP-341-style tree with a
-//! nonce leaf paired to every data leaf, tag `H("LnLeaf", tlv)` /
-//! `H("LnNonce"||first-tlv, tlv-type)` / `H("LnBranch", lesser||greater)`)
-//! — a self-contained sub-algorithm as substantial as this module's own
-//! BOLT#11 ECDSA-recovery core, plus `offer_paths`' `blinded_path` TLV
-//! sub-structure (BOLT#4 route blinding, a distinct spec). Bundling either
-//! into this pass would trade BOLT#11 depth (its official test vectors,
-//! the recoverable-ECDSA core) for breadth; both remain a clean follow-on
-//! module addition (the TLV plumbing below is already shared/reusable).
+//! `invoice_request`/`invoice` are signed with a BIP-340 Schnorr signature
+//! over a **Merkle root of the TLV stream** (`merkleRoot`), a BIP-341-style
+//! tree where every data leaf is paired with a nonce leaf:
+//!   - leaf   = `H("LnLeaf", tlv)` — `tlv` = the record's full
+//!     `type||length||value` serialization;
+//!   - nonce  = `H("LnNonce"||first-tlv, tlv-type)` — the tag itself is the
+//!     literal `"LnNonce"` concatenated with the *complete first TLV record*
+//!     of the stream, and the message is the current record's **type field**
+//!     (its 1–9-byte BigSize encoding);
+//!   - branch = `H("LnBranch", lesser-SHA256 || greater-SHA256)` — the two
+//!     child hashes ordered lexicographically (compact-proof convention).
+//! The tree is built bottom-up; when a level's node count is not a power of
+//! two the split point is the largest power of two strictly below the count
+//! ("the deepest tree on the lowest-order leaves"). *Signature* TLV elements
+//! (types 240–1000 inclusive) are EXCLUDED from the tree. The message signed
+//! is then `H("lightning"||messagename||fieldname, merkle-root)` per BOLT#12
+//! "Signature Calculation" (e.g. tag `"lightninginvoice_requestsignature"`),
+//! fed to BIP-340 `sign`/`verify` (which applies its own `BIP0340/challenge`
+//! tag on top). `invoice_request` is signed by `invreq_payer_id` (type 88);
+//! `invoice` by `invoice_node_id` (type 176) — both stored as 33-byte
+//! compressed points but verified x-only (BIP-340 forces even-y via
+//! `lift_x`, so the parity prefix byte is not consulted).
+//!
+//! ## Deferred / pragmatic field coverage
+//!
+//! `offer_paths`/`invreq_paths`/`invoice_paths` (`blinded_path` entries) are
+//! handed back as raw undecoded bytes — decoding the blinded-path structure
+//! is BOLT#4 route-blinding, a distinct spec. `invoice`'s optional
+//! `invoice_blindedpay`/`invoice_fallbacks` sub-structures are likewise kept
+//! raw. The signed-blob correctness (the Merkle root + the BIP-340
+//! signature) and the mandatory scalar fields are modelled fully; see
+//! `../SPEC.md` for the exact list of typed vs. raw fields.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const Sha256 = std.crypto.hash.sha2.Sha256;
 const lnwire = @import("lnwire");
+const bip340 = @import("bip340");
 const bech32raw = @import("bech32_raw.zig");
 const bitpack = @import("bitpack.zig");
 
@@ -202,6 +222,452 @@ pub fn decodeOffer(allocator: Allocator, offer_str: []const u8) DecodeError!Offe
     };
 }
 
+// ── BOLT#12 signature calculation: the Merkle root ───────────────────────
+
+/// BOLT#12 "signature TLV elements": types 240–1000 inclusive are excluded
+/// from the Merkle tree (they carry the signature(s) over that tree).
+fn isSignatureType(t: u64) bool {
+    return t >= 240 and t <= 1000;
+}
+
+/// `H("LnBranch", lesser || greater)` — the two 32-byte child hashes ordered
+/// lexicographically before hashing (BOLT#12: "this ordering means proofs
+/// are more compact since left/right is inherently determined").
+fn branchHash(a: [32]u8, b: [32]u8) [32]u8 {
+    var buf: [64]u8 = undefined;
+    if (std.mem.lessThan(u8, &a, &b)) {
+        buf[0..32].* = a;
+        buf[32..64].* = b;
+    } else {
+        buf[0..32].* = b;
+        buf[32..64].* = a;
+    }
+    return bip340.taggedHash("LnBranch", &buf);
+}
+
+/// `H("LnNonce"||first_tlv, tlv_type)` — the *tag* is the literal string
+/// `"LnNonce"` concatenated with the whole first TLV record of the stream
+/// (so it varies per stream and cannot use the comptime-midstate helper),
+/// and the message is the current record's type-field bytes. Implements the
+/// tagged-hash definition `SHA256(SHA256(tag) || SHA256(tag) || msg)`
+/// directly.
+fn nonceLeaf(first_tlv: []const u8, type_bytes: []const u8) [32]u8 {
+    var td = Sha256.init(.{});
+    td.update("LnNonce");
+    td.update(first_tlv);
+    const tag_digest = td.finalResult();
+    var h = Sha256.init(.{});
+    h.update(&tag_digest);
+    h.update(&tag_digest);
+    h.update(type_bytes);
+    return h.finalResult();
+}
+
+/// Recursively combine an ascending list of (already leaf+nonce-paired) node
+/// hashes into a single root. When `nodes.len` is not a power of two, the
+/// split is the largest power of two strictly less than the length — BOLT#12:
+/// "the deepest tree on the lowest-order leaves".
+fn merkleRecurse(nodes: []const [32]u8) [32]u8 {
+    if (nodes.len == 1) return nodes[0];
+    var split: usize = 1;
+    while (split * 2 < nodes.len) split *= 2;
+    return branchHash(merkleRecurse(nodes[0..split]), merkleRecurse(nodes[split..]));
+}
+
+pub const MerkleError = lnwire.tlv.BigSizeError || Allocator.Error || error{
+    /// A record's declared length ran past the end of the stream.
+    Truncated,
+    /// The stream contained no non-signature TLV records — a signable
+    /// message always has at least one field to sign over.
+    EmptyMerkleStream,
+};
+
+/// The BOLT#12 Merkle root over a raw TLV stream (`type||length||value`
+/// records, ascending order — as produced by `lnwire.tlv.appendStream` or
+/// carried in a decoded `invoice_request`/`invoice`). *Signature* TLV
+/// elements (types 240–1000) are skipped, per spec. The walk is
+/// self-contained (it re-derives each record's raw byte range, which the
+/// generic `parseStream` does not expose) and re-checks BigSize
+/// minimality/truncation so it is safe on untrusted input.
+pub fn merkleRoot(allocator: Allocator, tlv_stream: []const u8) MerkleError![32]u8 {
+    var nodes: std.ArrayList([32]u8) = .empty;
+    defer nodes.deinit(allocator);
+
+    var first_tlv: ?[]const u8 = null;
+    var offset: usize = 0;
+    while (offset < tlv_stream.len) {
+        const type_start = offset;
+        const t = try lnwire.decodeBigSize(tlv_stream[offset..]);
+        offset += t.consumed;
+        const type_bytes = tlv_stream[type_start..offset];
+        const l = try lnwire.decodeBigSize(tlv_stream[offset..]);
+        offset += l.consumed;
+        const remaining: u64 = tlv_stream.len - offset;
+        if (l.value > remaining) return error.Truncated;
+        const len: usize = @intCast(l.value);
+        const rec_bytes = tlv_stream[type_start .. offset + len];
+        offset += len;
+
+        if (isSignatureType(t.value)) continue;
+        if (first_tlv == null) first_tlv = rec_bytes;
+        const leaf = bip340.taggedHash("LnLeaf", rec_bytes);
+        const nonce = nonceLeaf(first_tlv.?, type_bytes);
+        try nodes.append(allocator, branchHash(leaf, nonce));
+    }
+    if (nodes.items.len == 0) return error.EmptyMerkleStream;
+    return merkleRecurse(nodes.items);
+}
+
+// ── generic BIP-340 sign/verify over a Merkle root ───────────────────────
+
+/// The signature-TLV `messagename||fieldname` tags BOLT#12 defines, already
+/// prefixed with the literal 9-byte `"lightning"`.
+pub const invoice_request_sig_tag = "lightninginvoice_requestsignature";
+pub const invoice_sig_tag = "lightninginvoicesignature";
+
+pub const SignError = MerkleError || bip340.SignError;
+
+/// `SIG(tag, merkle-root, key)` (BOLT#12): compute the Merkle root over
+/// `tlv_stream` (which must NOT yet contain the signature record — sign over
+/// the fields being committed to), tag-hash it, and BIP-340-sign that digest.
+/// `comptime tag` is one of `invoice_request_sig_tag`/`invoice_sig_tag`.
+pub fn signMerkle(
+    allocator: Allocator,
+    tlv_stream: []const u8,
+    comptime tag: []const u8,
+    secret_key: bip340.SecretKey,
+    aux_rand: [32]u8,
+    io: std.Io,
+) SignError![64]u8 {
+    const root = try merkleRoot(allocator, tlv_stream);
+    const digest = bip340.taggedHash(tag, &root);
+    return bip340.sign(secret_key, &digest, aux_rand, io);
+}
+
+pub const VerifyError = MerkleError || error{InvalidPublicKey};
+
+/// Verify a BOLT#12 signature: recompute the Merkle root over `tlv_stream`
+/// (signature TLVs excluded automatically), tag-hash it, and BIP-340-verify
+/// `sig` against the x-only view of `signer` (a 32-byte x-only OR the
+/// x-coordinate of a 33-byte compressed key — BIP-340 is x-only). Returns
+/// `false` (never errors) on any signature/key mismatch; errors only on a
+/// malformed stream or a non-curve public key.
+pub fn verifyMerkle(
+    allocator: Allocator,
+    tlv_stream: []const u8,
+    comptime tag: []const u8,
+    signer_xonly: [32]u8,
+    sig_bytes: [64]u8,
+) VerifyError!bool {
+    const root = try merkleRoot(allocator, tlv_stream);
+    const digest = bip340.taggedHash(tag, &root);
+    const pk = bip340.XOnlyPublicKey.fromBytes(signer_xonly) catch return error.InvalidPublicKey;
+    const sig = bip340.Signature.fromBytes(sig_bytes) catch return false;
+    return bip340.verify(pk, &digest, sig);
+}
+
+/// The x-only (32-byte) view of a BOLT#12 point field: a 33-byte compressed
+/// key drops its parity prefix (BIP-340 forces even-y via `lift_x`), a
+/// 32-byte value is already x-only. Any other length is rejected.
+fn xonlyOf(point: []const u8) error{BadPointLength}![32]u8 {
+    return switch (point.len) {
+        33 => point[1..33].*,
+        32 => point[0..32].*,
+        else => error.BadPointLength,
+    };
+}
+
+// ── invoice_request (`lnr1...`) TLV field types ──────────────────────────
+
+const IREQ_METADATA: u64 = 0;
+// offer_* fields (types 2..22) are copied verbatim from the offer; the
+// constants above (TYPE_CHAINS..TYPE_ISSUER_ID) are reused.
+const INVREQ_CHAIN: u64 = 80;
+const INVREQ_AMOUNT: u64 = 82;
+const INVREQ_FEATURES: u64 = 84;
+const INVREQ_QUANTITY: u64 = 86;
+const INVREQ_PAYER_ID: u64 = 88;
+const INVREQ_PAYER_NOTE: u64 = 89;
+const INVREQ_PATHS: u64 = 90;
+const SIGNATURE: u64 = 240;
+
+const known_invreq_types = known_offer_types ++ [_]u64{
+    IREQ_METADATA,   INVREQ_CHAIN,    INVREQ_AMOUNT,     INVREQ_FEATURES,
+    INVREQ_QUANTITY, INVREQ_PAYER_ID, INVREQ_PAYER_NOTE, INVREQ_PATHS,
+    SIGNATURE,
+};
+
+/// A decoded BOLT#12 `invoice_request`. Scalar/opaque fields are typed;
+/// `raw` owns the full decoded TLV stream and every `[]const u8` field
+/// borrows from it (so `deinit` frees only `raw`). Point/signature fields
+/// are copied by value. Fields not listed here (paths, features detail) are
+/// left in `raw`; see the module doc comment for the deferred set.
+pub const InvoiceRequest = struct {
+    raw: []u8,
+    invreq_metadata: ?[]const u8,
+    offer_currency: ?[]const u8,
+    offer_amount: ?u64,
+    offer_description: ?[]const u8,
+    offer_issuer_id: ?[33]u8,
+    invreq_chain: ?[32]u8,
+    invreq_amount: ?u64,
+    invreq_quantity: ?u64,
+    invreq_payer_id: ?[33]u8,
+    invreq_payer_note: ?[]const u8,
+    signature: ?[64]u8,
+
+    pub fn deinit(self: *InvoiceRequest, allocator: Allocator) void {
+        allocator.free(self.raw);
+        self.* = undefined;
+    }
+
+    /// Verify the `signature` (type 240) as a BOLT#12 BIP-340 signature by
+    /// `invreq_payer_id` (type 88) over the Merkle root of the request.
+    /// Fails closed if either field is absent.
+    pub fn verify(self: InvoiceRequest, allocator: Allocator) (VerifyError || error{ MissingSignature, MissingPayerId })!bool {
+        const sig = self.signature orelse return error.MissingSignature;
+        const payer = self.invreq_payer_id orelse return error.MissingPayerId;
+        const xonly = xonlyOf(&payer) catch unreachable; // fixed 33 bytes
+        return verifyMerkle(allocator, self.raw, invoice_request_sig_tag, xonly, sig);
+    }
+};
+
+pub const IReqDecodeError = bech32raw.SplitError || error{InvalidDataChar} ||
+    bitpack.PaddingError || lnwire.tlv.StreamError || Allocator.Error || error{
+    UnknownPrefix,
+    BadChainsLength,
+    BadAmount,
+    BadIssuerIdLength,
+    BadPayerIdLength,
+    BadChainLength,
+    BadSignatureLength,
+};
+
+/// Decode (and TLV-validate) a BOLT#12 `invoice_request` string (`lnr1...`).
+/// Does NOT verify the signature — call `InvoiceRequest.verify` for that.
+pub fn decodeInvoiceRequest(allocator: Allocator, str: []const u8) IReqDecodeError!InvoiceRequest {
+    const stripped = try bech32raw.stripContinuation(allocator, str);
+    defer allocator.free(stripped);
+    var raw_dec = try bech32raw.decodeNoChecksum(allocator, stripped);
+    defer raw_dec.deinit(allocator);
+    if (!std.mem.eql(u8, raw_dec.hrp, "lnr")) return error.UnknownPrefix;
+
+    const bytes = try bitpack.quintetsToBytesStrict(allocator, raw_dec.data);
+    errdefer allocator.free(bytes);
+
+    var parsed = try lnwire.parseTlvStream(allocator, bytes, &known_invreq_types);
+    defer parsed.deinit(allocator);
+
+    var ir: InvoiceRequest = .{
+        .raw = bytes,
+        .invreq_metadata = null,
+        .offer_currency = null,
+        .offer_amount = null,
+        .offer_description = null,
+        .offer_issuer_id = null,
+        .invreq_chain = null,
+        .invreq_amount = null,
+        .invreq_quantity = null,
+        .invreq_payer_id = null,
+        .invreq_payer_note = null,
+        .signature = null,
+    };
+    for (parsed.records) |rec| {
+        switch (rec.type) {
+            IREQ_METADATA => if (ir.invreq_metadata == null) {
+                ir.invreq_metadata = rec.value;
+            },
+            TYPE_CURRENCY => if (ir.offer_currency == null) {
+                ir.offer_currency = rec.value;
+            },
+            TYPE_AMOUNT => if (ir.offer_amount == null) {
+                ir.offer_amount = lnwire.tlv.decodeTruncated(u64, rec.value) catch return error.BadAmount;
+            },
+            TYPE_DESCRIPTION => if (ir.offer_description == null) {
+                ir.offer_description = rec.value;
+            },
+            TYPE_ISSUER_ID => if (ir.offer_issuer_id == null) {
+                if (rec.value.len != 33) return error.BadIssuerIdLength;
+                ir.offer_issuer_id = rec.value[0..33].*;
+            },
+            INVREQ_CHAIN => if (ir.invreq_chain == null) {
+                if (rec.value.len != 32) return error.BadChainLength;
+                ir.invreq_chain = rec.value[0..32].*;
+            },
+            INVREQ_AMOUNT => if (ir.invreq_amount == null) {
+                ir.invreq_amount = lnwire.tlv.decodeTruncated(u64, rec.value) catch return error.BadAmount;
+            },
+            INVREQ_QUANTITY => if (ir.invreq_quantity == null) {
+                ir.invreq_quantity = lnwire.tlv.decodeTruncated(u64, rec.value) catch return error.BadAmount;
+            },
+            INVREQ_PAYER_ID => if (ir.invreq_payer_id == null) {
+                if (rec.value.len != 33) return error.BadPayerIdLength;
+                ir.invreq_payer_id = rec.value[0..33].*;
+            },
+            INVREQ_PAYER_NOTE => if (ir.invreq_payer_note == null) {
+                ir.invreq_payer_note = rec.value;
+            },
+            SIGNATURE => if (ir.signature == null) {
+                if (rec.value.len != 64) return error.BadSignatureLength;
+                ir.signature = rec.value[0..64].*;
+            },
+            else => {},
+        }
+    }
+    return ir;
+}
+
+/// Sign a set of `invoice_request` fields (given as ascending, signature-free
+/// TLV records — the caller must include `invreq_payer_id` matching
+/// `secret_key`) and encode the result as an `lnr1...` string. Appends the
+/// `signature` record (type 240) after signing over the Merkle root.
+pub fn encodeSignedInvoiceRequest(
+    allocator: Allocator,
+    unsigned_records: []const lnwire.RawRecord,
+    secret_key: bip340.SecretKey,
+    aux_rand: [32]u8,
+    io: std.Io,
+) (SignError || bech32raw.EncodeError)![]u8 {
+    var stream: std.ArrayList(u8) = .empty;
+    defer stream.deinit(allocator);
+    try lnwire.tlv.appendStream(&stream, allocator, unsigned_records);
+    const sig = try signMerkle(allocator, stream.items, invoice_request_sig_tag, secret_key, aux_rand, io);
+    try lnwire.tlv.appendStream(&stream, allocator, &.{.{ .type = SIGNATURE, .value = &sig }});
+
+    const quintets = try bitpack.bytesToQuintets(allocator, stream.items);
+    defer allocator.free(quintets);
+    return bech32raw.encodeNoChecksum(allocator, "lnr", quintets);
+}
+
+// ── invoice (`lni1...`) TLV field types ──────────────────────────────────
+
+const INVOICE_PATHS: u64 = 160;
+const INVOICE_BLINDEDPAY: u64 = 162;
+const INVOICE_CREATED_AT: u64 = 164;
+const INVOICE_RELATIVE_EXPIRY: u64 = 166;
+const INVOICE_PAYMENT_HASH: u64 = 168;
+const INVOICE_AMOUNT: u64 = 170;
+const INVOICE_FALLBACKS: u64 = 172;
+const INVOICE_FEATURES: u64 = 174;
+const INVOICE_NODE_ID: u64 = 176;
+
+const known_invoice_types = known_invreq_types ++ [_]u64{
+    INVOICE_PATHS,           INVOICE_BLINDEDPAY,   INVOICE_CREATED_AT,
+    INVOICE_RELATIVE_EXPIRY, INVOICE_PAYMENT_HASH, INVOICE_AMOUNT,
+    INVOICE_FALLBACKS,       INVOICE_FEATURES,     INVOICE_NODE_ID,
+};
+
+/// A decoded BOLT#12 `invoice`. Same ownership model as `InvoiceRequest`
+/// (`raw` owns the stream; slice fields borrow). Optional sub-structures
+/// (`invoice_paths`/`invoice_blindedpay`/`invoice_fallbacks`) stay in `raw` —
+/// see the module doc comment.
+pub const Invoice = struct {
+    raw: []u8,
+    invoice_created_at: ?u64,
+    invoice_relative_expiry: ?u64,
+    invoice_payment_hash: ?[32]u8,
+    invoice_amount: ?u64,
+    invoice_node_id: ?[33]u8,
+    signature: ?[64]u8,
+
+    pub fn deinit(self: *Invoice, allocator: Allocator) void {
+        allocator.free(self.raw);
+        self.* = undefined;
+    }
+
+    /// Verify the `signature` (type 240) as a BOLT#12 BIP-340 signature by
+    /// `invoice_node_id` (type 176) over the Merkle root of the invoice.
+    pub fn verify(self: Invoice, allocator: Allocator) (VerifyError || error{ MissingSignature, MissingNodeId })!bool {
+        const sig = self.signature orelse return error.MissingSignature;
+        const node = self.invoice_node_id orelse return error.MissingNodeId;
+        const xonly = xonlyOf(&node) catch unreachable; // fixed 33 bytes
+        return verifyMerkle(allocator, self.raw, invoice_sig_tag, xonly, sig);
+    }
+};
+
+pub const InvoiceDecodeError = bech32raw.SplitError || error{InvalidDataChar} ||
+    bitpack.PaddingError || lnwire.tlv.StreamError || Allocator.Error || error{
+    UnknownPrefix,
+    BadAmount,
+    BadPaymentHashLength,
+    BadNodeIdLength,
+    BadSignatureLength,
+};
+
+/// Decode (and TLV-validate) a BOLT#12 `invoice` string (`lni1...`). Does
+/// NOT verify the signature — call `Invoice.verify` for that.
+pub fn decodeInvoice(allocator: Allocator, str: []const u8) InvoiceDecodeError!Invoice {
+    const stripped = try bech32raw.stripContinuation(allocator, str);
+    defer allocator.free(stripped);
+    var raw_dec = try bech32raw.decodeNoChecksum(allocator, stripped);
+    defer raw_dec.deinit(allocator);
+    if (!std.mem.eql(u8, raw_dec.hrp, "lni")) return error.UnknownPrefix;
+
+    const bytes = try bitpack.quintetsToBytesStrict(allocator, raw_dec.data);
+    errdefer allocator.free(bytes);
+
+    var parsed = try lnwire.parseTlvStream(allocator, bytes, &known_invoice_types);
+    defer parsed.deinit(allocator);
+
+    var inv: Invoice = .{
+        .raw = bytes,
+        .invoice_created_at = null,
+        .invoice_relative_expiry = null,
+        .invoice_payment_hash = null,
+        .invoice_amount = null,
+        .invoice_node_id = null,
+        .signature = null,
+    };
+    for (parsed.records) |rec| {
+        switch (rec.type) {
+            INVOICE_CREATED_AT => if (inv.invoice_created_at == null) {
+                inv.invoice_created_at = lnwire.tlv.decodeTruncated(u64, rec.value) catch return error.BadAmount;
+            },
+            INVOICE_RELATIVE_EXPIRY => if (inv.invoice_relative_expiry == null) {
+                inv.invoice_relative_expiry = lnwire.tlv.decodeTruncated(u64, rec.value) catch return error.BadAmount;
+            },
+            INVOICE_PAYMENT_HASH => if (inv.invoice_payment_hash == null) {
+                if (rec.value.len != 32) return error.BadPaymentHashLength;
+                inv.invoice_payment_hash = rec.value[0..32].*;
+            },
+            INVOICE_AMOUNT => if (inv.invoice_amount == null) {
+                inv.invoice_amount = lnwire.tlv.decodeTruncated(u64, rec.value) catch return error.BadAmount;
+            },
+            INVOICE_NODE_ID => if (inv.invoice_node_id == null) {
+                if (rec.value.len != 33) return error.BadNodeIdLength;
+                inv.invoice_node_id = rec.value[0..33].*;
+            },
+            SIGNATURE => if (inv.signature == null) {
+                if (rec.value.len != 64) return error.BadSignatureLength;
+                inv.signature = rec.value[0..64].*;
+            },
+            else => {},
+        }
+    }
+    return inv;
+}
+
+/// Sign a set of `invoice` fields (ascending, signature-free TLV records —
+/// the caller must include `invoice_node_id` matching `secret_key`) and
+/// encode as an `lni1...` string. Appends the `signature` record (type 240).
+pub fn encodeSignedInvoice(
+    allocator: Allocator,
+    unsigned_records: []const lnwire.RawRecord,
+    secret_key: bip340.SecretKey,
+    aux_rand: [32]u8,
+    io: std.Io,
+) (SignError || bech32raw.EncodeError)![]u8 {
+    var stream: std.ArrayList(u8) = .empty;
+    defer stream.deinit(allocator);
+    try lnwire.tlv.appendStream(&stream, allocator, unsigned_records);
+    const sig = try signMerkle(allocator, stream.items, invoice_sig_tag, secret_key, aux_rand, io);
+    try lnwire.tlv.appendStream(&stream, allocator, &.{.{ .type = SIGNATURE, .value = &sig }});
+
+    const quintets = try bitpack.bytesToQuintets(allocator, stream.items);
+    defer allocator.free(quintets);
+    return bech32raw.encodeNoChecksum(allocator, "lni", quintets);
+}
+
 // ── tests ────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -304,4 +770,229 @@ test "hostile: an unknown ODD top-level TLV type is silently discarded, decode s
     var offer = try decodeOffer(allocator, offer_str);
     defer offer.deinit(allocator);
     try testing.expectEqualStrings("still parses", offer.description.?);
+}
+
+// ── BOLT#12 Merkle / signature tests ─────────────────────────────────────
+
+/// Decode a hex string (no separators, even length) into freshly-allocated
+/// bytes — lets the spec's own `signature-test.json` record/merkle hex be
+/// pasted verbatim rather than hand-transcribed into byte-array literals.
+fn hexAlloc(allocator: Allocator, hex: []const u8) ![]u8 {
+    const out = try allocator.alloc(u8, hex.len / 2);
+    errdefer allocator.free(out);
+    _ = try std.fmt.hexToBytes(out, hex);
+    return out;
+}
+
+// Byte-exact KAT. Source: lightning/bolts `bolt12/signature-test.json`
+// (github.com/lightning/bolts, "Signature Calculation" test vectors) — the
+// `n1` namespace merkle-root rows (1, 2 and 3 TLVs). Each `tlv` string below
+// is the concatenation of the spec's raw `type||length||value` records.
+test "BOLT#12 KAT: n1 Merkle roots (1/2/3 leaves) — signature-test.json" {
+    const allocator = testing.allocator;
+    const tlv1 = "010203e8";
+    const tlv2 = "02080000010000020003";
+    const tlv3 = "03310266e4598d1d3c415f572a8488830b60f7e744ed9235eb0b1ba93283b315c0351800000000000000010000000000000002";
+    const Case = struct { stream: []const u8, merkle: []const u8 };
+    const cases = [_]Case{
+        .{ .stream = tlv1, .merkle = "b013756c8fee86503a0b4abdab4cddeb1af5d344ca6fc2fa8b6c08938caa6f93" },
+        .{ .stream = tlv1 ++ tlv2, .merkle = "c3774abbf4815aa54ccaa026bff6581f01f3be5fe814c620a252534f434bc0d1" },
+        .{ .stream = tlv1 ++ tlv2 ++ tlv3, .merkle = "ab2e79b1283b0b31e0b035258de23782df6b89a38cfa7237bde69aed1a658c5d" },
+    };
+    for (cases) |c| {
+        const stream = try hexAlloc(allocator, c.stream);
+        defer allocator.free(stream);
+        const want = try hexAlloc(allocator, c.merkle);
+        defer allocator.free(want);
+        const got = try merkleRoot(allocator, stream);
+        try testing.expectEqualSlices(u8, want, &got);
+    }
+}
+
+// The invoice_request KAT from `signature-test.json`: offer_issuer_id = Alice,
+// offer_description = "A Mathematical Treatise", offer_amount = 100,
+// offer_currency = "USD", invreq_payer_id = Bob (privkey 0x4242..42),
+// invreq_metadata = 0x00..00. Exercises the full 6-leaf tree PLUS the
+// signature tag and the BIP-340 signature — all byte-exact.
+const ireq_kat_records = [_][]const u8{
+    "00080000000000000000", // invreq_metadata (type 0)
+    "0603555344", // offer_currency "USD" (type 6)
+    "080164", // offer_amount 100 (type 8)
+    "0a1741204d617468656d61746963616c205472656174697365", // offer_description (type 10)
+    "162102eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619", // offer_issuer_id (type 22)
+    "58210324653eac434488002cc06bbfb7f10fe18991e35f9fe4302dbea6d2353dc0ab1c", // invreq_payer_id (type 88)
+};
+const ireq_kat_merkle = "608407c18ad9a94d9ea2bcdbe170b6c20c462a7833a197621c916f78cf18e624";
+const ireq_kat_signature = "b8f83ea3288cfd6ea510cdb481472575141e8d8744157f98562d162cc1c472526fdb24befefbdebab4dbb726bbd1b7d8aec057f8fa805187e5950d2bbe0e5642";
+// Bob's x-only public key = x-coordinate of invreq_payer_id (strip 0x03 prefix).
+const bob_xonly = "24653eac434488002cc06bbfb7f10fe18991e35f9fe4302dbea6d2353dc0ab1c";
+
+test "BOLT#12 KAT: invoice_request Merkle root + signature verify — signature-test.json" {
+    const allocator = testing.allocator;
+    var stream: std.ArrayList(u8) = .empty;
+    defer stream.deinit(allocator);
+    for (ireq_kat_records) |rec_hex| {
+        const rec = try hexAlloc(allocator, rec_hex);
+        defer allocator.free(rec);
+        try stream.appendSlice(allocator, rec);
+    }
+
+    // Merkle root byte-exact.
+    const want_root = try hexAlloc(allocator, ireq_kat_merkle);
+    defer allocator.free(want_root);
+    const root = try merkleRoot(allocator, stream.items);
+    try testing.expectEqualSlices(u8, want_root, &root);
+
+    // Signature verifies against Bob's x-only key over H(sig_tag, root).
+    const xonly_buf = try hexAlloc(allocator, bob_xonly);
+    defer allocator.free(xonly_buf);
+    const xonly = xonly_buf[0..32].*;
+    const sig_buf = try hexAlloc(allocator, ireq_kat_signature);
+    defer allocator.free(sig_buf);
+    const sig = sig_buf[0..64].*;
+    try testing.expect(try verifyMerkle(allocator, stream.items, invoice_request_sig_tag, xonly, sig));
+
+    // Reject-teeth: flip one signature bit → verify fails (not errors).
+    var bad_sig = sig;
+    bad_sig[10] ^= 0x01;
+    try testing.expect(!try verifyMerkle(allocator, stream.items, invoice_request_sig_tag, xonly, bad_sig));
+
+    // Byte-exact SIGN KAT: signing with Bob's key (privkey 0x4242..42) and
+    // BIP-340 aux_rand = 0 reproduces the published 64-byte signature exactly
+    // (the vector's own signing convention — verified against signature-test.json).
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const bob_sk = try bip340.SecretKey.fromBytes([_]u8{0x42} ** 32);
+    const signed = try signMerkle(allocator, stream.items, invoice_request_sig_tag, bob_sk, [_]u8{0} ** 32, io);
+    try testing.expectEqualSlices(u8, sig_buf, &signed);
+}
+
+// End-to-end decode of the KAT `lnr1...` string through the bech32/bitpack/TLV
+// path, then verify via the typed API. Same vector, exercising the decoder.
+test "BOLT#12 KAT: decode lnr1 invoice_request string end-to-end + verify" {
+    const allocator = testing.allocator;
+    const lnr = "lnr1qqyqqqqqqqqqqqqqqcp4256ypqqkgzshgysy6ct5dpjk6ct5d93kzmpq23ex2ct5d9ek293pqthvwfzadd7jejes8q9lhc4rvjxd022zv5l44g6qah82ru5rdpnpjkppqvjx204vgdzgsqpvcp4mldl3plscny0rt707gvpdh6ndydfacz43euzqhrurageg3n7kafgsek6gz3e9w52parv8gs2hlxzk95tzeswywffxlkeyhml0hh46kndmwf4m6xma3tkq2lu04qz3slje2rfthc89vss";
+
+    var ir = try decodeInvoiceRequest(allocator, lnr);
+    defer ir.deinit(allocator);
+    try testing.expectEqual(@as(?u64, 100), ir.offer_amount);
+    try testing.expectEqualStrings("USD", ir.offer_currency.?);
+    try testing.expectEqualStrings("A Mathematical Treatise", ir.offer_description.?);
+    try testing.expectEqual(@as(usize, 8), ir.invreq_metadata.?.len);
+    try testing.expect(ir.invreq_payer_id != null);
+    try testing.expect(ir.signature != null);
+    // Its embedded signature verifies against its own payer_id.
+    try testing.expect(try ir.verify(allocator));
+
+    // Reject-tooth: corrupt a value byte in the stream → verify fails.
+    ir.raw[3] ^= 0x01;
+    try testing.expect(!try ir.verify(allocator));
+}
+
+test "BOLT#12 round-trip: build+sign+decode+verify an invoice_request" {
+    const allocator = testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const sk = try bip340.SecretKey.fromBytes([_]u8{0x11} ** 32);
+    const kp = try bip340.KeyPair.fromSecretKey(sk);
+    var payer_id: [33]u8 = undefined;
+    payer_id[0] = 0x02; // BIP-340 pubkey is always even-y
+    payer_id[1..33].* = kp.public.x;
+
+    const metadata = [_]u8{0xab} ** 8;
+    const records = [_]lnwire.RawRecord{
+        .{ .type = IREQ_METADATA, .value = &metadata },
+        .{ .type = TYPE_CURRENCY, .value = "EUR" },
+        .{ .type = TYPE_AMOUNT, .value = &.{0x64} }, // 100
+        .{ .type = INVREQ_PAYER_ID, .value = &payer_id },
+    };
+    const lnr = try encodeSignedInvoiceRequest(allocator, &records, sk, [_]u8{0} ** 32, io);
+    defer allocator.free(lnr);
+    try testing.expect(std.mem.startsWith(u8, lnr, "lnr1"));
+
+    var ir = try decodeInvoiceRequest(allocator, lnr);
+    defer ir.deinit(allocator);
+    try testing.expectEqualStrings("EUR", ir.offer_currency.?);
+    try testing.expect(try ir.verify(allocator));
+
+    // Wrong signer: swap in a different valid pubkey → verify fails.
+    const sk2 = try bip340.SecretKey.fromBytes([_]u8{0x22} ** 32);
+    const kp2 = try bip340.KeyPair.fromSecretKey(sk2);
+    var other = payer_id;
+    other[1..33].* = kp2.public.x;
+    ir.invreq_payer_id = other;
+    try testing.expect(!try ir.verify(allocator));
+}
+
+test "BOLT#12 round-trip: build+sign+decode+verify an invoice" {
+    const allocator = testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const sk = try bip340.SecretKey.fromBytes([_]u8{0x33} ** 32);
+    const kp = try bip340.KeyPair.fromSecretKey(sk);
+    var node_id: [33]u8 = undefined;
+    node_id[0] = 0x02;
+    node_id[1..33].* = kp.public.x;
+
+    const payment_hash = [_]u8{0xcd} ** 32;
+    const records = [_]lnwire.RawRecord{
+        .{ .type = INVOICE_CREATED_AT, .value = &.{ 0x66, 0x00, 0x00, 0x00 } },
+        .{ .type = INVOICE_PAYMENT_HASH, .value = &payment_hash },
+        .{ .type = INVOICE_AMOUNT, .value = &.{ 0x27, 0x10 } }, // 10000
+        .{ .type = INVOICE_NODE_ID, .value = &node_id },
+    };
+    const lni = try encodeSignedInvoice(allocator, &records, sk, [_]u8{0} ** 32, io);
+    defer allocator.free(lni);
+    try testing.expect(std.mem.startsWith(u8, lni, "lni1"));
+
+    var inv = try decodeInvoice(allocator, lni);
+    defer inv.deinit(allocator);
+    try testing.expectEqual(@as(?u64, 10000), inv.invoice_amount);
+    try testing.expectEqualSlices(u8, &payment_hash, &inv.invoice_payment_hash.?);
+    try testing.expect(try inv.verify(allocator));
+
+    // Reject-tooth: tamper a value byte → verify fails.
+    inv.raw[2] ^= 0x01;
+    try testing.expect(!try inv.verify(allocator));
+}
+
+test "BOLT#12 Merkle: signature TLVs (240-1000) are excluded from the tree" {
+    const allocator = testing.allocator;
+    // Two data records + a fake type-240 record; the root must equal the
+    // root over the two data records alone.
+    const data = "010203e802080000010000020003";
+    var with_sig: std.ArrayList(u8) = .empty;
+    defer with_sig.deinit(allocator);
+    const data_bytes = try hexAlloc(allocator, data);
+    defer allocator.free(data_bytes);
+    try with_sig.appendSlice(allocator, data_bytes);
+    // type=240 (0xf0), len=2, value=0xdead — must be ignored by merkleRoot.
+    try with_sig.appendSlice(allocator, &.{ 0xf0, 0x02, 0xde, 0xad });
+
+    const r_with = try merkleRoot(allocator, with_sig.items);
+    const r_data = try merkleRoot(allocator, data_bytes);
+    try testing.expectEqualSlices(u8, &r_data, &r_with);
+}
+
+test "BOLT#12 Merkle: hostile inputs fail closed" {
+    const allocator = testing.allocator;
+    // Declared length overruns the buffer.
+    const trunc = try hexAlloc(allocator, "0105aabb");
+    defer allocator.free(trunc);
+    try testing.expectError(error.Truncated, merkleRoot(allocator, trunc));
+    // Empty (signable-message) stream.
+    try testing.expectError(error.EmptyMerkleStream, merkleRoot(allocator, ""));
+    // A stream of ONLY a signature TLV → no leaves.
+    try testing.expectError(error.EmptyMerkleStream, merkleRoot(allocator, &.{ 0xf0, 0x01, 0x00 }));
+}
+
+test "BOLT#12: wrong prefix rejected for lnr / lni decoders" {
+    const allocator = testing.allocator;
+    try testing.expectError(error.UnknownPrefix, decodeInvoiceRequest(allocator, "lno1qqqq"));
+    try testing.expectError(error.UnknownPrefix, decodeInvoice(allocator, "lnr1qqqq"));
 }

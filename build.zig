@@ -133,7 +133,7 @@ const module_list = [_]Module{
     .{ .name = "psbt", .deps = &.{ "bitcointx", "bitcoinscript" } },
     .{ .name = "bitcoinscript", .deps = &.{ "bitcointx", "k256", "bip340", "ripemd160" } },
     .{ .name = "lnwire" },
-    .{ .name = "lninvoice", .deps = &.{ "bech32", "k256", "lnwire" } },
+    .{ .name = "lninvoice", .deps = &.{ "bech32", "k256", "lnwire", "bip340" } },
     .{ .name = "musig2", .deps = &.{ "bip340", "k256" } },
     .{ .name = "sphinx", .deps = &.{"k256"} },
     .{ .name = "bolt8", .deps = &.{ "noise", "k256" } },
