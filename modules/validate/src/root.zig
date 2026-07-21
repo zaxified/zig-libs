@@ -172,7 +172,8 @@ pub const Rule = struct {
     /// as f64 — exact for integers up to 2^53.
     min: ?f64 = null,
     max: ?f64 = null,
-    /// String length in bytes / array length in items.
+    /// String length in Unicode code points (pydantic contract) / array
+    /// length in items. Invalid UTF-8 fails closed (`string_unicode`).
     min_len: ?usize = null,
     max_len: ?usize = null,
     /// One-of allow-list for strings (the JSON Schema `enum` keyword; named
@@ -591,18 +592,34 @@ fn checkRule(b: *Builder, path: []const u8, v: Value, rule: *const Rule) Allocat
 
     switch (rule.kind) {
         .int, .float => {
-            const n = numValue(v);
-            if (rule.min) |m| if (n < m)
-                try b.appendf(path, "greater_than_equal", "Input should be greater than or equal to {d}", .{m});
-            if (rule.max) |m| if (n > m)
-                try b.appendf(path, "less_than_equal", "Input should be less than or equal to {d}", .{m});
+            if (numValue(v)) |n| {
+                if (rule.min) |m| if (n < m)
+                    try b.appendf(path, "greater_than_equal", "Input should be greater than or equal to {d}", .{m});
+                if (rule.max) |m| if (n > m)
+                    try b.appendf(path, "less_than_equal", "Input should be less than or equal to {d}", .{m});
+            } else {
+                // A value that survived the type gate but whose numeric text
+                // cannot be parsed fails CLOSED — never silently treated as 0.
+                try appendTypeError(b, path, rule.kind);
+            }
         },
         .string => {
             const s = v.string;
-            if (rule.min_len) |m| if (s.len < m)
-                try b.appendf(path, "string_too_short", "String should have at least {d} characters", .{m});
-            if (rule.max_len) |m| if (s.len > m)
-                try b.appendf(path, "string_too_long", "String should have at most {d} characters", .{m});
+            // Length constraints count Unicode code points, not bytes — the
+            // pydantic contract (Python `len(str)` is code points, and the
+            // module doc advertises "string chars"). Invalid/truncated UTF-8
+            // fails closed with `string_unicode` rather than being silently
+            // measured in bytes.
+            if (rule.min_len != null or rule.max_len != null) {
+                if (std.unicode.utf8CountCodepoints(s)) |count| {
+                    if (rule.min_len) |m| if (count < m)
+                        try b.appendf(path, "string_too_short", "String should have at least {d} characters", .{m});
+                    if (rule.max_len) |m| if (count > m)
+                        try b.appendf(path, "string_too_long", "String should have at most {d} characters", .{m});
+                } else |_| {
+                    try b.append(path, "string_unicode", "Input should be a valid string, unable to parse as unicode");
+                }
+            }
             if (rule.one_of) |allowed| {
                 if (!containsString(allowed, s)) {
                     const joined = try std.mem.join(b.a(), ", ", allowed);
@@ -671,15 +688,17 @@ fn appendTypeError(b: *Builder, path: []const u8, kind: Kind) Allocator.Error!vo
     try b.append(path, ce[0], ce[1]);
 }
 
-/// Numeric value for bounds checks; caller guarantees the type gate passed.
-fn numValue(v: Value) f64 {
+/// Numeric value for bounds checks. Returns `null` when the value has no
+/// parseable numeric meaning — an unparseable `.number_string` — so the caller
+/// can fail closed instead of silently substituting 0. Well-formed but
+/// out-of-range number strings still saturate to ±inf, which orders correctly
+/// against finite bounds.
+fn numValue(v: Value) ?f64 {
     return switch (v) {
         .integer => |i| @floatFromInt(i),
         .float => |f| f,
-        // Guaranteed valid JSON number grammar; overflow saturates to ±inf,
-        // which still orders correctly against finite bounds.
-        .number_string => |s| std.fmt.parseFloat(f64, s) catch 0,
-        else => unreachable,
+        .number_string => |s| std.fmt.parseFloat(f64, s) catch null,
+        else => null,
     };
 }
 
@@ -1642,6 +1661,61 @@ test "length: string codes differ from array codes (pydantic)" {
     defer long.deinit();
     try expectError(&long, "s", "string_too_long");
     try expectError(&long, "a", "too_long");
+}
+
+test "length: string constraints count code points, not bytes (pydantic)" {
+    const schema = [_]Rule{
+        .{ .field = "s", .kind = .string, .min_len = 4, .max_len = 4 },
+    };
+    // "café" = 4 code points but 5 UTF-8 bytes (é = 0xC3 0xA9). Byte counting
+    // would flag string_too_long; code-point counting accepts it.
+    var ok_cp = try validateJson(testing.allocator, "{\"s\":\"café\"}", &schema);
+    defer ok_cp.deinit();
+    try testing.expect(ok_cp.ok());
+
+    // A 3-code-point multibyte string is below min_len = 4 → string_too_short,
+    // even though its byte length (>4) would sneak past a byte comparison.
+    var short = try validateJson(testing.allocator, "{\"s\":\"háj\"}", &schema);
+    defer short.deinit();
+    try expectError(&short, "s", "string_too_short");
+}
+
+test "length: invalid UTF-8 under a length rule fails closed (string_unicode)" {
+    const schema = [_]Rule{
+        .{ .field = "s", .kind = .string, .max_len = 100 },
+    };
+    // Build a Value with an invalid UTF-8 string directly (JSON parsing would
+    // reject such bytes). Fail-closed: no silent byte-length pass.
+    var obj: std.json.ObjectMap = .empty;
+    defer obj.deinit(testing.allocator);
+    try obj.put(testing.allocator, "s", .{ .string = "\xff\xfe\xff" });
+    var rep = try validateValue(testing.allocator, .{ .object = obj }, &schema);
+    defer rep.deinit();
+    try expectError(&rep, "s", "string_unicode");
+}
+
+test "numeric: unparseable number_string fails closed, never silently 0" {
+    const schema = [_]Rule{
+        .{ .field = "x", .kind = .float, .min = -1000, .max = 1000 },
+    };
+    // A garbage number_string that passes the float type gate but cannot be
+    // parsed used to fall back to 0.0 (inside [-1000, 1000]) and pass. It must
+    // now produce a validation error instead.
+    var obj: std.json.ObjectMap = .empty;
+    defer obj.deinit(testing.allocator);
+    try obj.put(testing.allocator, "x", .{ .number_string = "not-a-number" });
+    var bad = try validateValue(testing.allocator, .{ .object = obj }, &schema);
+    defer bad.deinit();
+    try testing.expect(!bad.ok());
+    try expectError(&bad, "x", "float_type");
+
+    // A well-formed number_string still validates normally (regression guard).
+    var obj2: std.json.ObjectMap = .empty;
+    defer obj2.deinit(testing.allocator);
+    try obj2.put(testing.allocator, "x", .{ .number_string = "42.5" });
+    var good = try validateValue(testing.allocator, .{ .object = obj2 }, &schema);
+    defer good.deinit();
+    try testing.expect(good.ok());
 }
 
 test "one_of → enum code with the allowed list in the message" {
