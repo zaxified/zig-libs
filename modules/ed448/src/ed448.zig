@@ -785,3 +785,28 @@ test "KeyPair.deinit zeroizes secret_key.bytes but leaves public_key untouched (
     try std.testing.expectEqualSlices(u8, &zero, &kp.secret_key.bytes);
     try std.testing.expect(!std.mem.eql(u8, &kp.public_key.bytes, &zero));
 }
+
+// ── fuzz harnesses (untrusted-wire decoders) ────────────────────────────
+
+test "fuzz: Point.fromBytes never crashes on arbitrary bytes" {
+    try std.testing.fuzz({}, fuzzPointFromBytes, .{});
+}
+
+fn fuzzPointFromBytes(_: void, smith: *std.testing.Smith) !void {
+    var buf: [57]u8 = undefined;
+    smith.bytes(&buf);
+    const p = Point.fromBytes(buf) catch return;
+    _ = p.toBytes();
+    _ = p.clearCofactor();
+}
+
+test "fuzz: Signature.fromBytes never crashes on arbitrary bytes" {
+    try std.testing.fuzz({}, fuzzSignatureFromBytes, .{});
+}
+
+fn fuzzSignatureFromBytes(_: void, smith: *std.testing.Smith) !void {
+    var buf: [Signature.encoded_length]u8 = undefined;
+    smith.bytes(&buf);
+    const sig = Signature.fromBytes(buf) catch return;
+    _ = sig.toBytes();
+}

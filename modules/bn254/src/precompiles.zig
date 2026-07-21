@@ -505,3 +505,39 @@ test "ecPairing: raw 32-byte ABI encoding matches the official Expected hex dire
         try std.testing.expectEqualSlices(u8, &expected, &out);
     }
 }
+
+// ── fuzz harnesses (untrusted calldata decoders) ────────────────────────
+
+test "fuzz: ecAdd never crashes on arbitrary calldata" {
+    try std.testing.fuzz({}, fuzzEcAdd, .{});
+}
+
+fn fuzzEcAdd(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u32, 0, @intCast(buf.len));
+    _ = ecAdd(buf[0..len]) catch return;
+}
+
+test "fuzz: ecMul never crashes on arbitrary calldata" {
+    try std.testing.fuzz({}, fuzzEcMul, .{});
+}
+
+fn fuzzEcMul(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u32, 0, @intCast(buf.len));
+    _ = ecMul(buf[0..len]) catch return;
+}
+
+test "fuzz: ecPairing never crashes on arbitrary calldata" {
+    try std.testing.fuzz({}, fuzzEcPairing, .{});
+}
+
+fn fuzzEcPairing(_: void, smith: *std.testing.Smith) !void {
+    // Cover 0, 1, and 2 pairs (192 bytes each) plus off-multiple lengths.
+    var buf: [2 * pair_encoded_bytes + 32]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u32, 0, @intCast(buf.len));
+    _ = ecPairing(std.testing.allocator, buf[0..len]) catch return;
+}

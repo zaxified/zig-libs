@@ -914,3 +914,40 @@ test "aggregateVerify with more signers than one Miller chunk (exercises the chu
     std.mem.swap([]const u8, &msgs[n - 2], &msgs[n - 1]);
     try std.testing.expect(!(try aggregateVerify(&pks, &msgs, agg_sig)));
 }
+
+// ── fuzz harnesses (untrusted-wire decoders) ────────────────────────────
+
+test "fuzz: SecretKey.fromBytes never crashes on arbitrary bytes" {
+    try std.testing.fuzz({}, fuzzSecretKeyFromBytes, .{});
+}
+
+fn fuzzSecretKeyFromBytes(_: void, smith: *std.testing.Smith) !void {
+    var buf: [SecretKey.encoded_bytes]u8 = undefined;
+    smith.bytes(&buf);
+    var sk = SecretKey.fromBytes(buf) catch return;
+    defer sk.deinit();
+    _ = sk.toBytes();
+}
+
+test "fuzz: PublicKey.fromBytes never crashes on arbitrary bytes" {
+    try std.testing.fuzz({}, fuzzPublicKeyFromBytes, .{});
+}
+
+fn fuzzPublicKeyFromBytes(_: void, smith: *std.testing.Smith) !void {
+    var buf: [PublicKey.encoded_bytes]u8 = undefined;
+    smith.bytes(&buf);
+    const pk = PublicKey.fromBytes(buf) catch return;
+    _ = pk.toBytes();
+    _ = keyValidate(pk);
+}
+
+test "fuzz: Signature.fromBytes never crashes on arbitrary bytes" {
+    try std.testing.fuzz({}, fuzzSignatureFromBytes, .{});
+}
+
+fn fuzzSignatureFromBytes(_: void, smith: *std.testing.Smith) !void {
+    var buf: [Signature.encoded_bytes]u8 = undefined;
+    smith.bytes(&buf);
+    const sig = Signature.fromBytes(buf) catch return;
+    _ = sig.toBytes();
+}

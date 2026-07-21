@@ -788,3 +788,44 @@ test "proofVerify validates disclosed_messages/disclosed_indexes count before to
         &.{ 0, 1 },
     ));
 }
+
+// ── fuzz harnesses (untrusted-wire decoders) ────────────────────────────
+
+test "fuzz: Signature.fromBytes never crashes on arbitrary bytes" {
+    try testing.fuzz({}, fuzzSignatureFromBytes, .{});
+}
+
+fn fuzzSignatureFromBytes(_: void, smith: *std.testing.Smith) !void {
+    var buf: [Signature.encoded_bytes]u8 = undefined;
+    smith.bytes(&buf);
+    const sig = Signature.fromBytes(buf) catch return;
+    _ = sig.toBytes();
+}
+
+test "fuzz: PublicKey.fromBytes never crashes on arbitrary bytes" {
+    try testing.fuzz({}, fuzzPublicKeyFromBytes, .{});
+}
+
+fn fuzzPublicKeyFromBytes(_: void, smith: *std.testing.Smith) !void {
+    var buf: [PublicKey.encoded_bytes]u8 = undefined;
+    smith.bytes(&buf);
+    const pk = PublicKey.fromBytes(buf) catch return;
+    _ = pk.toBytes();
+}
+
+test "fuzz: Proof.fromBytes never crashes on arbitrary bytes" {
+    try testing.fuzz({}, fuzzProofFromBytes, .{});
+}
+
+fn fuzzProofFromBytes(_: void, smith: *std.testing.Smith) !void {
+    // Cover both a "floor-only" length (U=0) and a length with a few
+    // undisclosed scalars, plus arbitrary (possibly misaligned) lengths —
+    // exercises both the remainder-rejection path and the point/scalar
+    // structural checks.
+    var buf: [2 * G1.compressed_bytes + 8 * Fr.encoded_bytes]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u32, 0, @intCast(buf.len));
+    const proof = Proof.fromBytes(testing.allocator, buf[0..len]) catch return;
+    defer proof.deinit(testing.allocator);
+    if (proof.toBytes(testing.allocator)) |out| testing.allocator.free(out) else |_| {}
+}

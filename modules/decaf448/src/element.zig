@@ -588,3 +588,17 @@ test "scalarMul: [0]G == identity, [1]G == G" {
     one[0] = 1;
     try testing.expect(Element.scalarMul(Element.generator, one).equals(Element.generator));
 }
+
+// ── fuzz harness (untrusted-wire decoder) ───────────────────────────────
+
+test "fuzz: Element.decode never crashes on arbitrary 56-byte input" {
+    try testing.fuzz({}, fuzzElementDecode, .{});
+}
+
+fn fuzzElementDecode(_: void, smith: *std.testing.Smith) !void {
+    var buf: Element.EncodedBytes = undefined;
+    smith.bytes(&buf);
+    const e = Element.decode(buf) catch return;
+    _ = e.encode();
+    _ = e.equals(Element.identity);
+}

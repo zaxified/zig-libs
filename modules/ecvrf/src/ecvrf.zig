@@ -425,3 +425,28 @@ test "prove -> verify round-trips and recovers the same beta as proofToHash" {
         try std.testing.expectError(error.InvalidProof, verify(pk, &wrong_alpha, pi));
     }
 }
+
+// ── fuzz harnesses (untrusted-wire decoders) ────────────────────────────
+
+test "fuzz: decodeProof never crashes on arbitrary bytes" {
+    try std.testing.fuzz({}, fuzzDecodeProof, .{});
+}
+
+fn fuzzDecodeProof(_: void, smith: *std.testing.Smith) !void {
+    var pi: Proof = undefined;
+    smith.bytes(&pi);
+    _ = decodeProof(pi) catch return;
+}
+
+test "fuzz: verify never crashes on arbitrary pk/proof bytes" {
+    try std.testing.fuzz({}, fuzzVerify, .{});
+}
+
+fn fuzzVerify(_: void, smith: *std.testing.Smith) !void {
+    var pk: PublicKey = undefined;
+    smith.bytes(&pk);
+    var pi: Proof = undefined;
+    smith.bytes(&pi);
+    const alpha = "fuzz";
+    _ = verify(pk, alpha, pi) catch return;
+}

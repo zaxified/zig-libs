@@ -756,3 +756,19 @@ test "key serialization round-trips" {
     const kp2 = TestScheme.keyGen(testSeed(1) ++ testSeed(2) ++ testSeed(3));
     try std.testing.expectEqualSlices(u8, &kp.sk.toBytes(), &kp2.sk.toBytes());
 }
+
+// ── fuzz harness (untrusted-wire decoder) ───────────────────────────────
+
+test "fuzz: verify never crashes on an arbitrary-length signature" {
+    const kp = TestScheme.keyGenFromSeed(testSeed(1), testSeed(2), testSeed(3));
+    try std.testing.fuzz(kp.pk, fuzzVerify, .{});
+}
+
+fn fuzzVerify(pk: TestScheme.PublicKey, smith: *std.testing.Smith) !void {
+    // A bit past signature_length so both "wrong length -> false" and the
+    // full structural-parse path get exercised.
+    var buf: [TestScheme.signature_length + 32]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u32, 0, @intCast(buf.len));
+    _ = TestScheme.verify(buf[0..len], "fuzz msg", pk, "");
+}
