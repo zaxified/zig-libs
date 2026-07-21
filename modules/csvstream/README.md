@@ -55,6 +55,65 @@ every chunk ends on a `\n`, no record spans a chunk boundary, so offsets compose
 cleanly. `ChunkReader` is exposed too, for callers who want the raw record-
 aligned chunks (e.g. to hand each block to a parallel worker).
 
+`StreamReader.Options.delimiter` (new) is threaded through to
+`StreamReader.nextFields(buf, alloc)` — a convenience that does `next()` +
+`splitFields` in one call, using the reader's own configured
+delimiter/quote, so callers who want split fields don't repeat the delimiter
+at every call site. `next()` itself stays delimiter-agnostic (whole-record
+bytes only), unchanged.
+
+A leading UTF-8 BOM is detected and stripped automatically on the first
+chunk of `StreamReader.next()`; the standalone `stripBom(bytes)` covers
+in-memory callers driving `LineIterator` directly.
+
+## Writing (RFC 4180 quoting-on-output)
+
+```zig
+var buf: [256]u8 = undefined;
+var w = std.Io.Writer.fixed(&buf);
+try csv.writeRecord(&w, &.{ "alice", "hello, world", "30" }, .{});
+// -> "alice,\"hello, world\",30\r\n" (comma-bearing field auto-quoted)
+```
+
+`writeField`/`writeRecord` quote a field only when it actually contains the
+configured delimiter, quote char, CR, or LF, doubling any embedded quote char
+(RFC 4180 §2 rule 7). `WriteOptions` configures `delimiter`, `quote` (`0`
+disables quoting, mirroring the reader's convention), and `line_terminator`
+(`.crlf` — the RFC 4180 default — or `.lf`). Stateless and streaming to any
+`*std.Io.Writer`, same style as the sibling `csvsafe` module's `writeSafe`.
+
+Note: a writer-emitted field with an embedded `\n`/`\r` is valid RFC 4180, but
+this module's own reader cannot re-parse it back into one record (see
+"Quoting semantics" above) — that's a permanent, documented asymmetry, not a
+bug.
+
+## Header-row handling (opt-in)
+
+```zig
+var fbuf: [16][]const u8 = undefined;
+const header_fields = try csv.splitFields(header_rec.bytes, &fbuf, ',', '"', alloc);
+var header = try csv.Header.init(alloc, header_fields);
+defer header.deinit();
+
+const row_fields = try csv.splitFields(row_rec.bytes, &fbuf, ',', '"', alloc);
+const name = header.get(row_fields, "name"); // ?[]const u8
+try header.validateArity(row_fields); // error.FieldCountMismatch if ragged
+```
+
+Not wired into `StreamReader` automatically — capturing (or skipping) the
+header row stays app policy; `Header` just holds the name→index bookkeeping.
+
+## Typed field coercion (opt-in)
+
+```zig
+const age = try csv.parseInt(u32, row_fields[1]);
+const price = try csv.parseFloat(f64, row_fields[2]);
+const active = try csv.parseBool(row_fields[3]); // "true"/"false"/"1"/"0"
+```
+
+Thin wrappers, no trimming (fields stay verbatim — see "spaces are preserved"
+in the tests); trim first if your source pads fields.
+
 ## Quoting semantics (RFC 4180 + "lazy quotes")
 
 RFC 4180 quoting: a field wrapped in `quote` may contain the delimiter; a
@@ -68,34 +127,30 @@ bounded-memory streaming. Quoting still protects the *delimiter* within a line.
 ## Tests
 
 `zig build test-csvstream` (headless; green in Debug and
-`-Doptimize=ReleaseFast`). 29 tests: `line.zig` carries the 22 verbatim oracle
-tests, `stream.zig` the 6 file/streaming + integration tests (offsets index the
-exact source bytes across a multi-chunk file; a positional re-read proves
-seek-back), and `root.zig` carries a dark-tests aggregator
-(`test { _ = line; _ = stream; }`) so both submodules' tests run — a bare
-re-export would not pull them in.
+`-Doptimize=ReleaseFast`). 67 tests across `line.zig` (22 verbatim oracle tests
++ `stripBom`), `stream.zig` (file/streaming + integration, incl. BOM-strip and
+`nextFields`/delimiter), `writer.zig` (RFC 4180 quoting incl. two positive
+controls + a file round-trip through `StreamReader`), `header.zig` (`Header`
+capture/lookup/arity), and `coerce.zig` (typed parsing). `root.zig` carries a
+dark-tests aggregator (`test { _ = line; _ = stream; _ = writer; _ = header; _ =
+coerce; }`) so all submodules' tests run — a bare re-export would not pull them
+in.
 
-## Deferred (not implemented in v1)
+## Deferred (not implemented)
 
-A spec-complete CSV toolkit would still add, as discrete backlog items:
+Two items remain deliberately out of scope:
 
-- **Configurable delimiter/quote per stream.** `splitFields` takes a delimiter,
-  and `LineIterator`/`StreamReader` take a quote char, but the delimiter is not
-  yet a `StreamReader` option (records are split lazily by the caller); expose a
-  reader-level `delimiter`. Also: distinct quote vs escape char (RFC 4180 uses
-  the same char; some dialects use `\`).
-- **Header-row handling.** No built-in header capture / name→index map /
-  name-based field access. Callers wire their own (a `parseCsvHeader` was left
-  out deliberately — it is app policy, not codec).
-- **Typed field coercion.** Fields are `[]const u8`; no int/float/bool/date
-  parsing or per-column schema.
-- **CSV writing.** Read-only. No RFC 4180 quoting-on-output (that concern lives
-  in the sibling `csvsafe` module for injection-guarding, but not general
-  record writing).
-- **BOM handling.** A leading UTF-8/UTF-16 BOM is not detected or stripped.
-- **Strict RFC 4180 mode.** Optional opt-in to (a) multi-line quoted fields
-  (spanning `\n`) and (b) a trailing-delimiter emitting a final empty field —
-  both currently deviate by design (see the `splitFields` trailing-delimiter
-  test and the lazy-quotes note above).
-- **Field-count validation.** No per-record arity check against the header/first
-  row.
+- **Distinct quote-vs-escape char.** RFC 4180 reuses the same char for both
+  quoting and escaping; some dialects (`\`-escaped) use a different one. Would
+  touch `splitFields`/`LineIterator` and the writer's escaping together, and no
+  concrete consumer needs a non-RFC dialect yet.
+- **Strict RFC 4180 opt-in mode:** (a) multi-line quoted fields spanning `\n`
+  and (b) a trailing-delimiter emitting a final empty field — both currently
+  deviate by design (see the `splitFields` trailing-delimiter test and the
+  lazy-quotes note above). (a) in particular would force a real parser
+  rewrite: the bounded-memory chunking design leans on "every `\n` is a safe
+  record boundary," so it stays deferred rather than bolted on.
+
+Everything else previously listed here (configurable delimiter, header-row
+handling, typed field coercion, CSV writing, BOM handling, field-count
+validation) is now implemented — see the sections above.

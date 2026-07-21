@@ -14,10 +14,32 @@ Attribution/provenance: see /NOTICE.
   physical lines (à la Go `encoding/csv` LazyQuotes). This turns a stray/unbalanced quote into a
   one-line problem (`LineSlice.unbalanced_quote`) instead of swallowing the rest of the file, and is
   exactly what makes every `\n` a safe chunk boundary for bounded-memory streaming. Quoting still
-  protects the delimiter within a line.
+  protects the delimiter within a line. **Consequence for the writer:** `writeRecord` can correctly
+  emit a valid RFC 4180 multi-line quoted field (embedded `\n`/`\r`), but this module's OWN reader
+  cannot re-parse it back into one record — that asymmetry is permanent unless the strict-mode item
+  below is ever built.
 - **Borrow contract:** `StreamReader.next()`'s returned `rec.bytes` is valid only until the next
   `next()` call that advances into a new chunk — callers must copy out anything retained past that.
-- Reentrant, no shared state, std-only (no C/libc).
+- **Writing is a separate, independent concern from reading:** `writeField`/`writeRecord`
+  (writer.zig) are stateless, streaming to any `*std.Io.Writer`, and quote a field only when it
+  actually contains the delimiter/quote/CR/LF. `csvsafe` was evaluated as a potential source for the
+  quoting primitive; its own SPEC explicitly defers RFC 4180 quoting to "the CSV writer or
+  csvstream" (see modules/csvsafe/SPEC.md "Threat model / out of scope"), so there was nothing to
+  reuse — the quoting logic here is original, std-only, no new module dependency.
+- **`StreamReader.nextFields`** composes `next()` + `splitFields` using the reader's own configured
+  `delimiter`/`quote` (`Options.delimiter`, new), so a caller that wants split fields (not just raw
+  record bytes) no longer repeats the delimiter at every call site. `next()` itself is unchanged and
+  still delimiter-agnostic.
+- **BOM handling:** `StreamReader.next()` detects and strips a leading UTF-8 BOM (`utf8_bom`) on the
+  very first chunk only; the first record's `byte_offset` starts right after the BOM, not at 0. The
+  standalone `stripBom` helper covers in-memory callers driving `LineIterator` directly.
+- **Header/coercion/arity are opt-in helpers, not reader integration:** `Header.init` captures an
+  already-split row's fields into owned name→index bookkeeping; `parseInt`/`parseFloat`/`parseBool`
+  (coerce.zig) are thin explicit wrappers with no trimming (fields stay verbatim, per the existing
+  "spaces are preserved" splitFields test); `Header.validateArity`/`validateArity` are a plain
+  length check. None of this is wired automatically into `StreamReader` — reading/skipping a header
+  row, coercing a column, and enforcing arity all remain app policy, same rationale as before.
+- Reentrant, no shared state, std-only (no C/libc, no new module deps).
 
 ## Threat model / out of scope
 Not a security boundary — a codec for cooperative/trusted input. Resource bound: bounded memory via
@@ -27,21 +49,34 @@ independently bounded beyond the chunk buffer sizing the caller picks. Failure m
 quoting is a flagged field (`unbalanced_quote`), never a hang or OOB read.
 
 ## Verification
-`zig build test-csvstream` (headless; Debug + ReleaseFast). 29 tests: `line.zig` carries 22 verbatim
-oracle tests; `stream.zig` has 6 file/streaming + integration tests
+`zig build test-csvstream` (headless; Debug + ReleaseFast). 67 tests: `line.zig` carries the 22
+verbatim oracle tests + `stripBom` tests; `stream.zig` has file/streaming + integration tests
 (offsets index the exact source bytes across a multi-chunk file; a positional re-read proves
-seek-back); `root.zig` is a dark-tests aggregator (`test { _ = line; _ = stream; }`) so both
+seek-back) + BOM-strip and `nextFields`/delimiter tests; `writer.zig` covers RFC 4180 quoting
+(delimiter/quote/CR/LF triggers, quote-doubling, custom delimiter/quote, `quote == 0` passthrough,
+two positive controls that would fail if quoting/escaping were wrong) plus a file round-trip through
+`StreamReader`; `header.zig` covers `Header` capture/lookup/arity (incl. a ragged short-row case);
+`coerce.zig` covers `parseInt`/`parseFloat`/`parseBool` valid + invalid inputs. `root.zig` is a
+dark-tests aggregator (`test { _ = line; _ = stream; _ = writer; _ = header; _ = coerce; }`) so all
 submodules' tests run under a bare re-export.
 
 ## Backlog / deferred
-From README "Deferred (not implemented in v1)": configurable delimiter at the `StreamReader` level
-(currently only the quote char is a stream option; delimiter is caller-split) and a distinct
-quote-vs-escape char (RFC 4180 reuses the same char; some dialects use `\`); header-row handling (no
-built-in capture/name→index map — left to callers as app policy); typed field coercion (fields stay `[]const u8`, no schema); CSV writing (read-only; RFC
-4180 quoting-on-output lives with the sibling `csvsafe` injection guard, not general writing); BOM
-handling (not detected/stripped); strict RFC 4180 opt-in mode (multi-line quoted fields spanning
-`\n`, trailing-delimiter → final empty field — both currently deviate by design); field-count
-validation (no per-record arity check against a header/first row).
+From README "Deferred (not implemented in v1)", now trimmed to what's still actually deferred:
+
+- **Distinct quote-vs-escape char.** RFC 4180 reuses the same char for both; some dialects (e.g.
+  `\`-escaped) use a different one. Not implemented — would touch both `splitFields`/`LineIterator`
+  and the new writer's escaping, and no concrete consumer has asked for a non-RFC dialect yet.
+- **Strict RFC 4180 opt-in mode:** (a) multi-line quoted fields spanning `\n` and (b) a
+  trailing-delimiter emitting a final empty field. Both still deviate by design (see the
+  `splitFields` trailing-delimiter test and the lazy-quotes note above) — (a) in particular would
+  force a real parser rewrite (the whole bounded-memory chunking design leans on "every `\n` is a
+  safe record boundary"), so it stays deferred rather than being bolted on.
+
+Implemented this round (previously listed here as deferred): configurable delimiter at the
+`StreamReader` level (`Options.delimiter` + `nextFields`), BOM detection/stripping (`stripBom`,
+automatic in `StreamReader.next`), header-row capture (`Header`), typed field coercion
+(`parseInt`/`parseFloat`/`parseBool`), CSV writing (`writeField`/`writeRecord`, RFC 4180 quoting-on-
+output), and field-count/arity validation (`Header.validateArity`/`validateArity`).
 
 ## Status
 `extract · any · codec · reentrant` + deps: none (std only) — canonical source is `pub const meta`

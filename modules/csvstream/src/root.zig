@@ -28,6 +28,9 @@ pub const meta = .{
 
 const line = @import("line.zig");
 const stream = @import("stream.zig");
+const writer = @import("writer.zig");
+const header = @import("header.zig");
+const coerce = @import("coerce.zig");
 
 // ── In-memory layer (usable standalone) ──────────────────────────────────────
 
@@ -56,9 +59,59 @@ pub const ChunkReader = stream.ChunkReader;
 /// Default target chunk size (10 MiB) for `StreamReader`/`ChunkReader`.
 pub const default_chunk_size = stream.default_chunk_size;
 
+/// Leading UTF-8 BOM (3 bytes) some tools prepend to a CSV file.
+pub const utf8_bom = line.utf8_bom;
+
+/// Strips a leading UTF-8 BOM from `bytes`, if present. `StreamReader.next`
+/// applies this automatically to the first chunk of a file; this standalone
+/// form is for in-memory callers driving `LineIterator` directly.
+pub const stripBom = line.stripBom;
+
+// ── Writing (RFC 4180 quoting-on-output) ─────────────────────────────────────
+
+/// Record terminator for `writeRecord` (`.crlf` = RFC 4180 default, `.lf` for
+/// Unix-style output).
+pub const LineTerminator = writer.LineTerminator;
+
+/// Options for `writeField`/`writeRecord`.
+pub const WriteOptions = writer.WriteOptions;
+
+/// Writes one field, RFC 4180-quoting it (doubling any embedded quote char)
+/// only if it contains the delimiter, the quote char, a CR, or a LF.
+pub const writeField = writer.writeField;
+
+/// Writes one full record: fields joined by the delimiter, each quoted per
+/// `writeField`, terminated per `opts.line_terminator`.
+pub const writeRecord = writer.writeRecord;
+
+// ── Header-row handling (opt-in) ──────────────────────────────────────────────
+
+/// Captures a record's fields as column names and builds a name→index map.
+/// Not wired into `StreamReader` automatically — capturing (or skipping) the
+/// header row is app policy; this is just the bookkeeping helper.
+pub const Header = header.Header;
+
+/// Field-count/arity check against an explicit expected count (see also
+/// `Header.validateArity` for checking against a captured header).
+pub const validateArity = header.validateArity;
+
+// ── Typed field coercion (opt-in) ─────────────────────────────────────────────
+
+/// Parses a field as a base-10 integer. No trimming — see coerce.zig doc.
+pub const parseInt = coerce.parseInt;
+
+/// Parses a field as a float.
+pub const parseFloat = coerce.parseFloat;
+
+/// Parses a field as a bool (`true`/`false`/`1`/`0`, case-insensitive).
+pub const parseBool = coerce.parseBool;
+
 // Dark-tests aggregator: a bare `pub const` re-export does NOT pull a
 // submodule's tests into the test binary — this reference does.
 test {
     _ = line;
     _ = stream;
+    _ = writer;
+    _ = header;
+    _ = coerce;
 }

@@ -160,11 +160,22 @@ pub const ChunkReader = struct {
 pub const StreamReader = struct {
     chunks: ChunkReader,
     quote: u8,
+    /// Field delimiter, threaded through to `nextFields`'s `splitFields` call.
+    /// `next()` itself is delimiter-agnostic (it only returns whole-record
+    /// bytes), so storing this here is purely for `nextFields` convenience —
+    /// callers who split fields themselves may still pass any delimiter they
+    /// like to `splitFields` directly.
+    delimiter: u8,
     lines: LineIterator,
+    /// Set once the first chunk has been inspected for a leading UTF-8 BOM
+    /// (only the very first bytes of the whole stream can carry one).
+    checked_bom: bool = false,
 
     pub const Options = struct {
         /// Quoting char (0 disables quoting; '"' = RFC 4180).
         quote: u8 = '"',
+        /// Field delimiter, used by `nextFields` (see field doc).
+        delimiter: u8 = ',',
         /// Target chunk size in bytes (0 = `default_chunk_size`).
         chunk_size: usize = default_chunk_size,
     };
@@ -173,6 +184,7 @@ pub const StreamReader = struct {
         return .{
             .chunks = try ChunkReader.init(io, alloc, file, opts.chunk_size),
             .quote = opts.quote,
+            .delimiter = opts.delimiter,
             .lines = LineIterator.init("", opts.quote, 0),
         };
     }
@@ -182,13 +194,38 @@ pub const StreamReader = struct {
     }
 
     /// Returns the next CSV record with its absolute file byte offset, or null
-    /// at EOF.
+    /// at EOF. A leading UTF-8 BOM on the very first chunk is detected and
+    /// stripped before records are split out of it; the byte offset of the
+    /// first record therefore starts right after the BOM, not at 0.
     pub fn next(self: *StreamReader) !?LineSlice {
         while (true) {
             if (self.lines.next()) |rec| return rec;
             const chunk = (try self.chunks.nextChunk()) orelse return null;
-            self.lines = LineIterator.init(chunk, self.quote, self.chunks.chunk_start_in_file);
+            var bytes = chunk;
+            var base_offset = self.chunks.chunk_start_in_file;
+            if (!self.checked_bom) {
+                self.checked_bom = true;
+                if (base_offset == 0) {
+                    const without_bom = line.stripBom(chunk);
+                    if (without_bom.len != chunk.len) {
+                        bytes = without_bom;
+                        base_offset += chunk.len - without_bom.len;
+                    }
+                }
+            }
+            self.lines = LineIterator.init(bytes, self.quote, base_offset);
         }
+    }
+
+    /// Convenience: `next()` followed by `splitFields` using the reader's
+    /// configured `delimiter`/`quote`. Returns null at EOF. See `splitFields`
+    /// for the `buf`/allocator contract (fields borrow the record's bytes
+    /// except for escaped-quote fields, which are allocated from `alloc`) —
+    /// the same borrow contract as `next()`'s `LineSlice.bytes` therefore
+    /// applies transitively to the returned field slices.
+    pub fn nextFields(self: *StreamReader, buf: [][]const u8, alloc: std.mem.Allocator) !?[][]const u8 {
+        const rec = (try self.next()) orelse return null;
+        return try line.splitFields(rec.bytes, buf, self.delimiter, self.quote, alloc);
     }
 };
 
@@ -353,4 +390,77 @@ test "StreamReader: last record without trailing newline is still emitted" {
     try t.expectEqualStrings("c,3", r3.bytes);
     try t.expectEqual(@as(u64, 8), r3.byte_offset);
     try t.expect((try sr.next()) == null);
+}
+
+test "StreamReader: leading UTF-8 BOM is detected and stripped, offsets shift past it" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const body = "\xEF\xBB\xBFname,age\nalice,30\n";
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "bom.csv", .data = body });
+    var f = try tmp.dir.openFile(t.io, "bom.csv", .{});
+    defer f.close(t.io);
+    var sr = try StreamReader.init(t.io, t.allocator, f, .{});
+    defer sr.deinit();
+
+    const r1 = (try sr.next()).?;
+    try t.expectEqualStrings("name,age", r1.bytes); // no BOM bytes leaked in
+    try t.expectEqual(@as(u64, 3), r1.byte_offset); // offset starts right after the 3-byte BOM
+    const r2 = (try sr.next()).?;
+    try t.expectEqualStrings("alice,30", r2.bytes);
+    try t.expect((try sr.next()) == null);
+}
+
+test "StreamReader: no BOM present leaves the first record and offset untouched" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const body = "a,1\nb,2\n";
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "in.csv", .data = body });
+    var f = try tmp.dir.openFile(t.io, "in.csv", .{});
+    defer f.close(t.io);
+    var sr = try StreamReader.init(t.io, t.allocator, f, .{});
+    defer sr.deinit();
+    const r1 = (try sr.next()).?;
+    try t.expectEqualStrings("a,1", r1.bytes);
+    try t.expectEqual(@as(u64, 0), r1.byte_offset);
+}
+
+test "StreamReader.nextFields: configured delimiter splits fields without the caller repeating it" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const body = "name;age\nalice;30\nbob;25\n";
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "semi.csv", .data = body });
+    var f = try tmp.dir.openFile(t.io, "semi.csv", .{});
+    defer f.close(t.io);
+    var sr = try StreamReader.init(t.io, t.allocator, f, .{ .delimiter = ';' });
+    defer sr.deinit();
+
+    var buf: [8][]const u8 = undefined;
+    const r1 = (try sr.nextFields(&buf, t.allocator)).?;
+    try t.expectEqual(@as(usize, 2), r1.len);
+    try t.expectEqualStrings("name", r1[0]);
+    try t.expectEqualStrings("age", r1[1]);
+    const r2 = (try sr.nextFields(&buf, t.allocator)).?;
+    try t.expectEqualStrings("alice", r2[0]);
+    try t.expectEqualStrings("30", r2[1]);
+    const r3 = (try sr.nextFields(&buf, t.allocator)).?;
+    try t.expectEqualStrings("bob", r3[0]);
+    try t.expectEqualStrings("25", r3[1]);
+    try t.expect((try sr.nextFields(&buf, t.allocator)) == null);
+}
+
+test "StreamReader.nextFields: default delimiter still splits on comma (non-breaking default)" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const body = "a,b,c\n";
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "in.csv", .data = body });
+    var f = try tmp.dir.openFile(t.io, "in.csv", .{});
+    defer f.close(t.io);
+    var sr = try StreamReader.init(t.io, t.allocator, f, .{});
+    defer sr.deinit();
+    var buf: [8][]const u8 = undefined;
+    const fields = (try sr.nextFields(&buf, t.allocator)).?;
+    try t.expectEqual(@as(usize, 3), fields.len);
+    try t.expectEqualStrings("a", fields[0]);
+    try t.expectEqualStrings("b", fields[1]);
+    try t.expectEqualStrings("c", fields[2]);
 }

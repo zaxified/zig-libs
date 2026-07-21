@@ -160,6 +160,18 @@ pub const LineIterator = struct {
     }
 };
 
+/// The 3-byte UTF-8 byte-order-mark some tools (notably Excel on Windows)
+/// prepend to a CSV file so it opens as UTF-8 instead of the system codepage.
+pub const utf8_bom = "\xEF\xBB\xBF";
+
+/// Returns `bytes` with a leading UTF-8 BOM stripped, or `bytes` unchanged if
+/// none is present. A BOM is only meaningful at the very start of a buffer/
+/// file — callers apply this once, to the first chunk, not per-record.
+pub fn stripBom(bytes: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, bytes, utf8_bom)) return bytes[utf8_bom.len..];
+    return bytes;
+}
+
 /// Returns a copy of `s` with every doubled quote char replaced by a single one.
 /// The returned slice is allocated with `alloc`.
 fn unescapeQuotes(s: []const u8, quote: u8, alloc: std.mem.Allocator) ![]u8 {
@@ -396,6 +408,41 @@ test "LineIterator: base_offset propagates correctly across records" {
     var it = LineIterator.init("xx\nyy\n", '"', 50);
     try t.expectEqual(@as(u64, 50), it.next().?.byte_offset);
     try t.expectEqual(@as(u64, 53), it.next().?.byte_offset);
+}
+
+// ============================================================
+// stripBom tests
+// ============================================================
+
+test "stripBom: strips a leading UTF-8 BOM" {
+    const with_bom = "\xEF\xBB\xBFa,b\n";
+    const stripped = stripBom(with_bom);
+    try t.expectEqualStrings("a,b\n", stripped);
+}
+
+test "stripBom: leaves input unchanged when no BOM present" {
+    const plain = "a,b\n";
+    try t.expectEqualStrings(plain, stripBom(plain));
+}
+
+test "stripBom: does not strip a BOM-like sequence mid-buffer" {
+    // Only a LEADING BOM is stripped; the same 3 bytes elsewhere are data.
+    const mid = "a\xEF\xBB\xBFb";
+    try t.expectEqualStrings(mid, stripBom(mid));
+}
+
+test "stripBom: empty and too-short inputs are unaffected" {
+    try t.expectEqualStrings("", stripBom(""));
+    try t.expectEqualStrings("\xEF\xBB", stripBom("\xEF\xBB")); // partial BOM, not a match
+}
+
+test "stripBom composes with LineIterator: BOM-prefixed buffer yields a clean first record" {
+    const raw = "\xEF\xBB\xBFname,age\nalice,30\n";
+    var it = LineIterator.init(stripBom(raw), '"', 0);
+    const r1 = it.next().?;
+    try t.expectEqualStrings("name,age", r1.bytes);
+    const r2 = it.next().?;
+    try t.expectEqualStrings("alice,30", r2.bytes);
 }
 
 // ── fuzz: LineIterator and splitFields are the untrusted-input decode
