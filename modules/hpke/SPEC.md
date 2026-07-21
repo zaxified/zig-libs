@@ -229,7 +229,7 @@ implemented and KAT-verified (order preserved):
 
 ## Verification status
 
-1. **KAT (Debug + ReleaseFast):** `zig build test-hpke` — 41/41 tests
+1. **KAT (Debug + ReleaseFast):** `zig build test-hpke` — 42/42 tests
    pass, zero skip guards. RFC 9180 Appendix A.1's full vector drives
    DHKEM Encap/Decap/DeriveKeyPair, KeySchedule, all 6 Seal/Open tuples,
    all 3 exports, and single-shot sealBase/openBase end-to-end through
@@ -238,8 +238,11 @@ implemented and KAT-verified (order preserved):
 2. **Negative-path:** low-order X25519 pkR (`error.DhFailed`), malformed
    P-256 SEC1 (`error.DeserializeError`), AEAD tamper/wrong-aad/
    truncated-ct (`error.DecryptionFailed`, `seq` not advanced),
-   `seq`-ceiling fail-closed (`error.MessageLimitReached` before any
-   AEAD call), and all `VerifyPSKInputs` inconsistencies
-   (`error.InconsistentPsk`).
+   wrong-length `out` buffer on `seal`/`open` (`error.InvalidLength`,
+   a real runtime check in every build mode, not a `std.debug.assert`
+   ReleaseFast/ReleaseSmall would compile out — found in the 2026-07-21
+   `zig-hpke` diff audit, `seq` confirmed not advanced), `seq`-ceiling
+   fail-closed (`error.MessageLimitReached` before any AEAD call), and
+   all `VerifyPSKInputs` inconsistencies (`error.InconsistentPsk`).
 3. **Open:** PSK-mode byte-exact KAT (done-record item 10) — the only
    RFC 9180 surface without an embedded official vector.

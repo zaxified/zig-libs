@@ -22,10 +22,21 @@ const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
 pub const SeqError = error{MessageLimitReached};
 
 /// RFC 9180 §5.2 `Context.Seal`/`Open` errors: authentication failure on
-/// `Open`, and `SeqError` shared with the nonce-increment guard both
-/// directions.
-pub const SealError = SeqError;
-pub const OpenError = SeqError || error{DecryptionFailed};
+/// `Open`, `SeqError` shared with the nonce-increment guard both
+/// directions, and `InvalidLength` — the caller-supplied `out` buffer
+/// isn't exactly `pt.len + Aead.tag_length` (`seal`) / `ct.len -
+/// Aead.tag_length` (`open`). This used to be a `std.debug.assert`
+/// (compiled out under `-Doptimize=ReleaseFast`/`ReleaseSmall`, where a
+/// wrong-length caller buffer would fall straight through to
+/// `Aead.encrypt`/`.decrypt` with a mismatched slice instead of failing
+/// closed — RFC 9180 doesn't itself define a `SerializeError`-style code
+/// for this, but every input-length precondition this module CAN check at
+/// runtime should fail with a typed error in every build mode, not only in
+/// Debug/ReleaseSafe; `zig-hpke`'s `SenderContext.seal`/
+/// `RecipientContext.open` make the equivalent check unconditionally via
+/// `error.InvalidEncoding`, never an assert).
+pub const SealError = SeqError || error{InvalidLength};
+pub const OpenError = SeqError || error{ DecryptionFailed, InvalidLength };
 
 /// RFC 9180 §5.1: `KeySchedule`'s own precondition failures — an
 /// auth/auth_psk call missing the PSK the mode requires, or vice versa
@@ -99,7 +110,13 @@ pub fn Context(comptime Aead: type, comptime Nh: usize) type {
         /// nonce reuse breaks AES-GCM/ChaCha20-Poly1305 confidentiality
         /// outright — see SPEC.md's threat model).
         pub fn seal(self: *Self, aad: []const u8, pt: []const u8, out: []u8) SealError!void {
-            std.debug.assert(out.len == pt.len + Aead.tag_length);
+            // A wrong-length `out` is a caller/API-contract bug, not
+            // attacker-controlled input — still a real runtime check (not
+            // `std.debug.assert`, which ReleaseFast/ReleaseSmall compile
+            // out) so a mismatched buffer fails closed with a typed error
+            // in every build mode instead of `Aead.encrypt` below slicing
+            // `out` on a wrong length.
+            if (out.len != pt.len + Aead.tag_length) return error.InvalidLength;
             // Fail closed BEFORE producing any ciphertext: if `seq` could
             // not be advanced past this message, returning a ciphertext
             // alongside the error would leave a context whose next `seal`
@@ -128,7 +145,10 @@ pub fn Context(comptime Aead: type, comptime Nh: usize) type {
             // attacker-controlled input, never a panic (the slicing below
             // would otherwise assert) — treat it as an auth failure.
             if (ct.len < Aead.tag_length) return error.DecryptionFailed;
-            std.debug.assert(out.len == ct.len - Aead.tag_length);
+            // Caller/API-contract length check, real (not
+            // `std.debug.assert`) for the same reason as `seal`'s — see
+            // that function's comment.
+            if (out.len != ct.len - Aead.tag_length) return error.InvalidLength;
             // Mirror of seal's fail-closed pre-check (see seal).
             if (self.seq == std.math.maxInt(u64)) return error.MessageLimitReached;
             const nonce = computeNonce(Nn, self.base_nonce, self.seq);
@@ -373,6 +393,45 @@ test "Context.seal/.open: round trip, seq advances, tampered ct rejected WITHOUT
     // The genuine message still opens at the un-advanced seq.
     try receiver.open("aad", &ct, &out);
     try testing.expectEqualSlices(u8, pt, &out);
+    try testing.expectEqual(@as(u64, 1), receiver.seq);
+}
+
+test "Context.seal/.open: wrong-length out buffer fails closed with error.InvalidLength (not a debug-only assert), seq unchanged" {
+    // I5 hpke<->zig-hpke diff finding: `out.len` used to be a
+    // `std.debug.assert`, which ReleaseFast/ReleaseSmall compile out —
+    // this test runs under both `zig build test-hpke` (Debug) and
+    // `-Doptimize=ReleaseFast`, so it only proves the fix if it passes in
+    // BOTH (an assert-based version would pass in Debug and silently
+    // misbehave in ReleaseFast).
+    const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
+    const suite_id = suite.suiteId(0x0020, 0x0001, 0x0001);
+    const ss = [_]u8{0x42} ** 32;
+    var sender = try keySchedule(Aes128Gcm, 32, .base, &suite_id, &ss, "", "", "");
+    var receiver = sender;
+
+    const pt = "wrong length out";
+    var ct_ok: [pt.len + Aes128Gcm.tag_length]u8 = undefined;
+    var ct_short: [pt.len + Aes128Gcm.tag_length - 1]u8 = undefined; // one byte too few
+    var ct_long: [pt.len + Aes128Gcm.tag_length + 1]u8 = undefined; // one byte too many
+
+    try testing.expectError(error.InvalidLength, sender.seal("aad", pt, &ct_short));
+    try testing.expectError(error.InvalidLength, sender.seal("aad", pt, &ct_long));
+    try testing.expectEqual(@as(u64, 0), sender.seq); // neither rejected call advanced seq
+
+    // A genuine call with the correct length still works after the two
+    // rejections (the guard doesn't wedge the context).
+    try sender.seal("aad", pt, &ct_ok);
+    try testing.expectEqual(@as(u64, 1), sender.seq);
+
+    var out_short: [pt.len - 1]u8 = undefined;
+    var out_long: [pt.len + 1]u8 = undefined;
+    try testing.expectError(error.InvalidLength, receiver.open("aad", &ct_ok, &out_short));
+    try testing.expectError(error.InvalidLength, receiver.open("aad", &ct_ok, &out_long));
+    try testing.expectEqual(@as(u64, 0), receiver.seq); // neither rejected call advanced seq
+
+    var out_ok: [pt.len]u8 = undefined;
+    try receiver.open("aad", &ct_ok, &out_ok);
+    try testing.expectEqualSlices(u8, pt, &out_ok);
     try testing.expectEqual(@as(u64, 1), receiver.seq);
 }
 
