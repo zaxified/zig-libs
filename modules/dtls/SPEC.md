@@ -106,13 +106,67 @@ mistake here doesn't just misapply correct crypto, it silently produces
 DIFFERENT (still "successfully" computed) keys/nonces with no compile-time
 or obvious-runtime signal, only an interop failure or, worse, a nonce reuse.
 
+## Certificate mode (RFC 8446 §4.4, ADDITIVE — landed after the PSK core)
+
+**STATUS UPDATE:** `Connection.zig` now also implements certificate-mode
+Certificate/CertificateVerify/CertificateRequest (`messages.zig` framing +
+`certverify.zig` sign/verify, reused unchanged, + the new `certauth.zig`
+DER/std-Certificate bridge), layered on top of the unchanged PSK key
+exchange — see `root.zig`'s module doc "Certificate mode" section and
+`Connection.zig`'s own "certificate mode" section (right before
+`handleFlightServer`) for the full design rationale. Summary of what
+changed vs. the "Out of scope" list below (now stale on this one point —
+left in place rather than silently deleted, corrected here):
+
+- **Implemented:** Certificate/CertificateVerify/CertificateRequest wire
+  framing; server always presents its cert when `Config.cert` is set;
+  optional mutual auth via `Config.request_client_cert` +
+  `Config.require_peer_cert`; peer-chain trust via `Config.peer_verify`
+  (`.none` / `.trust_anchor` — a real one-hop `std.crypto.Certificate
+  .Parsed.verify` check via `certauth.verifyLeafAgainstAnchor` — /
+  `.verify_fn` escape hatch); real ECDSA-P256/P384, RSA-PSS, Ed25519
+  signatures over the LIVE running transcript (not a fixed KAT string) via
+  `certverify.sign`/`.verify`, unmodified. Proven by a real client↔server
+  self-interop suite in `Connection.zig` (server-cert-only, mutual auth,
+  wrong-key rejection, untrusted-anchor rejection, required-but-absent-cert
+  rejection) — same in-memory-oracle style as the PSK suite, no external
+  peer.
+- **Still deferred (now explicit, not silently absent):** a genuine
+  (EC)DHE-based, PSK-LESS certificate-only key exchange (this engine has no
+  `key_share` extension/ECDH machinery at all — real new crypto, out of
+  this pass's "plumbing over certverify" scope; certificates here
+  AUTHENTICATE on top of the PSK exchange, they don't replace it);
+  `signature_algorithms` extension negotiation; full RFC 5280 §6
+  certification-path building (multi-hop chains, name constraints,
+  `basicConstraints`/`keyUsage` policy checks, revocation) — `.trust_anchor`
+  is a minimal one-hop check only; `CertificateEntry` extensions (OCSP
+  stapling/SCT) — framed empty on send, length-validated-but-discarded on
+  receive.
+- **KNOWN GAP, not this module's to fix:** `std.crypto.Certificate.parse`
+  (Zig 0.16) is confirmed (by fuzzing, during this work) NOT panic-safe
+  against malformed/adversarial DER — even trivial few-byte or random
+  ~30-60-byte inputs reliably crash the process via an unguarded array
+  index deep in std's ASN.1 walker, rather than returning a typed error.
+  `certauth.zig`'s own error handling cannot intercept a panic (Zig has no
+  exception mechanism). A live deployment that feeds a PEER-supplied
+  Certificate message's bytes into `certauth.parseLeafPublicKey`/
+  `.verifyLeafAgainstAnchor` is exposed to a process-crash DoS from a
+  malformed certificate until std fixes this (or a from-scratch hardened
+  DER parser replaces this bridge — a real, substantial undertaking, out of
+  a "no new crypto" Sonnet-tier pass). See `certauth.zig`'s module doc
+  "KNOWN GAP" section for the full writeup + the fuzz evidence retained in
+  that file's own test suite (`test "parseLeafPublicKey: ..."` intentionally
+  does NOT test adversarial input for exactly this reason — see its
+  comment).
+
 ## Threat model / out of scope
 
-- **Out of scope, by design (not silently skipped):** X.509/certificate
-  auth, session resumption / `NewSessionTicket` (no `"res binder"`/
-  resumption-PSK path — only `"ext binder"`/externally-configured PSK),
-  0-RTT/early data, connection migration beyond the connection-ID field
-  already framed in `record.zig`.
+- **Out of scope, by design (not silently skipped):** session resumption /
+  `NewSessionTicket` (no `"res binder"`/resumption-PSK path — only `"ext
+  binder"`/externally-configured PSK), 0-RTT/early data, connection
+  migration beyond the connection-ID field already framed in `record.zig`.
+  (X.509/certificate auth was in this list originally — see "Certificate
+  mode" above for what landed and what of it is still genuinely deferred.)
 - Once `keyschedule.pskBinder` is implemented, it MUST be checked (server
   side) before trusting the offered PSK identity — a missing check is the
   single highest-impact bug this module could ship with.

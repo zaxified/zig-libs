@@ -21,16 +21,23 @@ pub const MessageError = error{
     Malformed,
     TooManyExtensions,
     ListTooLong,
+    /// `decodeCertificate`'s `entries_out` is smaller than the number of
+    /// `CertificateEntry` values the wire message declares.
+    TooManyCertificateEntries,
 };
 
-/// RFC 8446 §4 handshake message types this PSK-only scaffold needs.
-/// (`certificate`/`certificate_verify`/`certificate_request` are
-/// intentionally omitted — out of scope, see the module doc comment in
-/// `root.zig`.)
+/// RFC 8446 §4 handshake message types. `certificate`/`certificate_request`/
+/// `certificate_verify` (RFC 8446 §4.4.2/§4.3.2/§4.4.3) back the certificate-
+/// mode handshake extension (see `Connection.zig`'s "certificate mode"
+/// section and `root.zig`'s module doc) — layered ADDITIVELY onto the
+/// PSK-only message set below; PSK-mode framing is unchanged.
 pub const HandshakeType = enum(u8) {
     client_hello = 1,
     server_hello = 2,
     encrypted_extensions = 8,
+    certificate = 11,
+    certificate_request = 13,
+    certificate_verify = 15,
     finished = 20,
     _,
 };
@@ -472,6 +479,191 @@ pub fn decodeFinished(buf: []const u8) Finished {
     return .{ .verify_data = buf };
 }
 
+// ── u24 helpers (same wire shape as `handshake.zig`'s private ones — kept
+// local here rather than exported from there, since the two files' u24
+// fields mean different things: handshake.zig's are fragment offsets/
+// lengths, these are certificate/list byte lengths) ──────────────────────
+
+fn writeU24(out: *[3]u8, v: u24) void {
+    out[0] = @truncate(v >> 16);
+    out[1] = @truncate(v >> 8);
+    out[2] = @truncate(v);
+}
+
+fn readU24(buf: *const [3]u8) u24 {
+    return (@as(u24, buf[0]) << 16) | (@as(u24, buf[1]) << 8) | buf[2];
+}
+
+// ── Certificate (RFC 8446 §4.4.2, reused by DTLS 1.3 — RFC 9147 does not
+// redefine it) ────────────────────────────────────────────────────────────
+//
+// struct {
+//     opaque cert_data<1..2^24-1>;
+//     Extension extensions<0..2^16-1>;
+// } CertificateEntry;
+// struct {
+//     opaque certificate_request_context<0..2^8-1>;
+//     CertificateEntry certificate_list<0..2^24-1>;
+// } Certificate;
+//
+// Each `CertificateEntry`'s own extensions (OCSP stapling, SCT, ...) are OUT
+// OF SCOPE: `encodeCertificate` always emits an empty extensions list per
+// entry, and `decodeCertificate` validates their framing (length-prefix
+// bounds-checked, never trusted blindly) but does not parse or surface their
+// contents — this module has no use for them (see root.zig's "deferred"
+// list).
+
+pub const CertificateEntry = struct {
+    cert_data: []const u8,
+};
+
+/// Encodes a `Certificate` message body: `context` (<= 255 bytes) followed
+/// by `certs` (each a raw DER-encoded X.509 certificate, leaf first per RFC
+/// 8446 §4.4.2), each wrapped as a `CertificateEntry` with an empty
+/// extensions list.
+pub fn encodeCertificate(context: []const u8, certs: []const []const u8, out: []u8) MessageError![]u8 {
+    if (context.len > 255) return error.Malformed;
+    if (out.len < 1 + context.len + 3) return error.BufferTooShort;
+    var i: usize = 0;
+    out[i] = @intCast(context.len);
+    i += 1;
+    @memcpy(out[i..][0..context.len], context);
+    i += context.len;
+
+    const list_len_pos = i;
+    i += 3; // certificate_list<0..2^24-1> length, patched below
+    const list_start = i;
+    for (certs) |cert_data| {
+        if (cert_data.len == 0 or cert_data.len > 0xFFFFFF) return error.Malformed;
+        if (out.len < i + 3 + cert_data.len + 2) return error.BufferTooShort;
+        writeU24(out[i..][0..3], @intCast(cert_data.len));
+        i += 3;
+        @memcpy(out[i..][0..cert_data.len], cert_data);
+        i += cert_data.len;
+        // Per-entry extensions<0..2^16-1>: always empty (see doc comment above).
+        std.mem.writeInt(u16, out[i..][0..2], 0, .big);
+        i += 2;
+    }
+    const list_len = i - list_start;
+    if (list_len > 0xFFFFFF) return error.ListTooLong;
+    writeU24(out[list_len_pos..][0..3], @intCast(list_len));
+    return out[0..i];
+}
+
+pub const DecodedCertificate = struct {
+    certificate_request_context: []const u8,
+    entries: []CertificateEntry,
+};
+
+pub fn decodeCertificate(buf: []const u8, entries_out: []CertificateEntry) MessageError!DecodedCertificate {
+    if (buf.len < 1) return error.BufferTooShort;
+    const ctx_len = buf[0];
+    if (buf.len < 1 + @as(usize, ctx_len) + 3) return error.BufferTooShort;
+    const context = buf[1..][0..ctx_len];
+    var i: usize = 1 + ctx_len;
+
+    const list_len: usize = readU24(buf[i..][0..3]);
+    i += 3;
+    if (buf.len < i + list_len) return error.BufferTooShort;
+    const list_end = i + list_len;
+
+    var n: usize = 0;
+    while (i < list_end) {
+        if (i + 3 > list_end) return error.Malformed;
+        const cert_len: usize = readU24(buf[i..][0..3]);
+        i += 3;
+        if (cert_len == 0 or i + cert_len + 2 > list_end) return error.Malformed;
+        const cert_data = buf[i..][0..cert_len];
+        i += cert_len;
+        const ext_len: usize = std.mem.readInt(u16, buf[i..][0..2], .big);
+        i += 2;
+        if (i + ext_len > list_end) return error.Malformed;
+        i += ext_len; // entry extensions: length-validated, contents discarded (see doc comment above)
+
+        if (n >= entries_out.len) return error.TooManyCertificateEntries;
+        entries_out[n] = .{ .cert_data = cert_data };
+        n += 1;
+    }
+    if (i != list_end) return error.Malformed;
+
+    return .{ .certificate_request_context = context, .entries = entries_out[0..n] };
+}
+
+// ── CertificateVerify (RFC 8446 §4.4.3) ──────────────────────────────────
+//
+// struct {
+//     SignatureScheme algorithm;
+//     opaque signature<0..2^16-1>;
+// } CertificateVerify;
+//
+// `algorithm` is an opaque `u16` here (not `certverify.SignatureScheme`) —
+// this file has no dependency on `certverify.zig`; the handshake state
+// machine (`Connection.zig`) is what interprets the wire value against that
+// enum. The signature bytes themselves are likewise opaque — this file only
+// frames whatever `certverify.sign` produced.
+
+pub const CertificateVerifyMsg = struct {
+    algorithm: u16,
+    signature: []const u8,
+};
+
+pub fn encodeCertificateVerify(msg: CertificateVerifyMsg, out: []u8) MessageError![]u8 {
+    if (msg.signature.len > std.math.maxInt(u16)) return error.ListTooLong;
+    if (out.len < 4 + msg.signature.len) return error.BufferTooShort;
+    std.mem.writeInt(u16, out[0..2], msg.algorithm, .big);
+    std.mem.writeInt(u16, out[2..4], @intCast(msg.signature.len), .big);
+    @memcpy(out[4..][0..msg.signature.len], msg.signature);
+    return out[0 .. 4 + msg.signature.len];
+}
+
+pub fn decodeCertificateVerify(buf: []const u8) MessageError!CertificateVerifyMsg {
+    if (buf.len < 4) return error.BufferTooShort;
+    const algorithm = std.mem.readInt(u16, buf[0..2], .big);
+    const sig_len: usize = std.mem.readInt(u16, buf[2..4], .big);
+    if (buf.len < 4 + sig_len) return error.Malformed;
+    return .{ .algorithm = algorithm, .signature = buf[4..][0..sig_len] };
+}
+
+// ── CertificateRequest (RFC 8446 §4.3.2) ─────────────────────────────────
+//
+// struct {
+//     opaque certificate_request_context<0..2^8-1>;
+//     Extension extensions<2..2^16-1>;
+// } CertificateRequest;
+//
+// RFC 8446 mandates a non-empty `extensions` list (MUST include
+// `signature_algorithms`) for real interop; this module performs no
+// signature_algorithms NEGOTIATION (see `Connection.zig`'s "deferred" list),
+// so `encodeCertificateRequest` permits an empty list (matching this
+// module's established "self-interop only" scope, not third-party interop).
+
+pub const CertificateRequestMsg = struct {
+    certificate_request_context: []const u8,
+    extensions: []const Extension,
+};
+
+pub fn encodeCertificateRequest(msg: CertificateRequestMsg, out: []u8) MessageError![]u8 {
+    if (msg.certificate_request_context.len > 255) return error.Malformed;
+    if (out.len < 1 + msg.certificate_request_context.len) return error.BufferTooShort;
+    var i: usize = 0;
+    out[i] = @intCast(msg.certificate_request_context.len);
+    i += 1;
+    @memcpy(out[i..][0..msg.certificate_request_context.len], msg.certificate_request_context);
+    i += msg.certificate_request_context.len;
+    const ext_slice = try encodeExtensions(msg.extensions, out[i..]);
+    i += ext_slice.len;
+    return out[0..i];
+}
+
+pub fn decodeCertificateRequest(buf: []const u8, extensions_out: []Extension) MessageError!CertificateRequestMsg {
+    if (buf.len < 1) return error.BufferTooShort;
+    const ctx_len = buf[0];
+    if (buf.len < 1 + @as(usize, ctx_len)) return error.BufferTooShort;
+    const context = buf[1..][0..ctx_len];
+    const extensions = try decodeExtensions(buf[1 + @as(usize, ctx_len) ..], extensions_out);
+    return .{ .certificate_request_context = context, .extensions = extensions };
+}
+
 // ── tests ────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -631,4 +823,119 @@ test "Finished round-trip (opaque verify_data)" {
     const enc = try encodeFinished(.{ .verify_data = &verify_data }, &buf);
     const dec = decodeFinished(enc);
     try testing.expectEqualSlices(u8, &verify_data, dec.verify_data);
+}
+
+// ── Certificate / CertificateVerify / CertificateRequest (cert-mode) ────
+
+test "Certificate round-trip: single entry, empty context" {
+    const cert_a = "fake-DER-bytes-of-a-certificate-not-really-x509";
+    var buf: [128]u8 = undefined;
+    const enc = try encodeCertificate(&.{}, &.{cert_a}, &buf);
+
+    var entries_out: [4]CertificateEntry = undefined;
+    const dec = try decodeCertificate(enc, &entries_out);
+    try testing.expectEqual(@as(usize, 0), dec.certificate_request_context.len);
+    try testing.expectEqual(@as(usize, 1), dec.entries.len);
+    try testing.expectEqualSlices(u8, cert_a, dec.entries[0].cert_data);
+}
+
+test "Certificate round-trip: multiple entries, non-empty context" {
+    const leaf = "leaf-cert-bytes";
+    const intermediate = "intermediate-cert-bytes-a-bit-longer";
+    var buf: [256]u8 = undefined;
+    const enc = try encodeCertificate("req-ctx", &.{ leaf, intermediate }, &buf);
+
+    var entries_out: [4]CertificateEntry = undefined;
+    const dec = try decodeCertificate(enc, &entries_out);
+    try testing.expectEqualSlices(u8, "req-ctx", dec.certificate_request_context);
+    try testing.expectEqual(@as(usize, 2), dec.entries.len);
+    try testing.expectEqualSlices(u8, leaf, dec.entries[0].cert_data);
+    try testing.expectEqualSlices(u8, intermediate, dec.entries[1].cert_data);
+}
+
+test "Certificate round-trip: empty certificate_list (RFC 8446 §4.4.2 'no certificate' answer)" {
+    var buf: [16]u8 = undefined;
+    const enc = try encodeCertificate("ctx", &.{}, &buf);
+    var entries_out: [4]CertificateEntry = undefined;
+    const dec = try decodeCertificate(enc, &entries_out);
+    try testing.expectEqualSlices(u8, "ctx", dec.certificate_request_context);
+    try testing.expectEqual(@as(usize, 0), dec.entries.len);
+}
+
+test "Certificate decode: too many entries for caller's buffer is a typed error" {
+    var buf: [64]u8 = undefined;
+    const enc = try encodeCertificate(&.{}, &.{ "a", "b", "c" }, &buf);
+    var entries_out: [2]CertificateEntry = undefined;
+    try testing.expectError(error.TooManyCertificateEntries, decodeCertificate(enc, &entries_out));
+}
+
+test "Certificate decode: buffer shorter than the declared certificate_list is a typed error" {
+    var buf: [64]u8 = undefined;
+    const enc = try encodeCertificate(&.{}, &.{"hello-cert"}, &buf);
+    var truncated = enc;
+    truncated.len -= 3; // chop off the tail (part of cert_data + extensions length)
+    var entries_out: [4]CertificateEntry = undefined;
+    try testing.expectError(error.BufferTooShort, decodeCertificate(truncated, &entries_out));
+}
+
+test "Certificate decode: internally inconsistent cert_data length is a typed error, never a panic" {
+    // A cert_data length that overruns the (still-fully-present) declared
+    // certificate_list -- the "peer is lying about an inner length, not
+    // just handing us a short buffer" case, distinct from the BufferTooShort
+    // test above.
+    var buf: [64]u8 = undefined;
+    const enc = try encodeCertificate(&.{}, &.{"hello-cert"}, &buf);
+    var corrupted: [64]u8 = undefined;
+    @memcpy(corrupted[0..enc.len], enc);
+    // Byte layout: [0]=ctx_len(0), [1..4)=list_len(u24), [4..7)=cert_len(u24),
+    // [7..]=cert_data. Inflate cert_len far beyond what's actually present.
+    corrupted[6] = 0xFF;
+    var entries_out: [4]CertificateEntry = undefined;
+    try testing.expectError(error.Malformed, decodeCertificate(corrupted[0..enc.len], &entries_out));
+}
+
+test "CertificateVerify round-trip (opaque algorithm + signature)" {
+    const sig = [_]u8{0x77} ** 64; // opaque; real value is certverify.sign's output
+    var buf: [128]u8 = undefined;
+    const enc = try encodeCertificateVerify(.{ .algorithm = 0x0403, .signature = &sig }, &buf);
+    const dec = try decodeCertificateVerify(enc);
+    try testing.expectEqual(@as(u16, 0x0403), dec.algorithm);
+    try testing.expectEqualSlices(u8, &sig, dec.signature);
+}
+
+test "CertificateVerify decode: buffer too short is a typed error" {
+    const buf = [_]u8{ 0x04, 0x03, 0x00 }; // declares a 2-byte header but only 1 more byte
+    try testing.expectError(error.BufferTooShort, decodeCertificateVerify(&buf));
+}
+
+test "CertificateVerify decode: declared signature length exceeds buffer is a typed error" {
+    const buf = [_]u8{ 0x04, 0x03, 0x00, 0x10 }; // claims a 16-byte signature, has 0
+    try testing.expectError(error.Malformed, decodeCertificateVerify(&buf));
+}
+
+test "CertificateRequest round-trip" {
+    const exts = [_]Extension{.{ .ext_type = 13, .data = &.{ 0, 4, 0x04, 0x03, 0x08, 0x04 } }}; // signature_algorithms
+    var buf: [64]u8 = undefined;
+    const enc = try encodeCertificateRequest(.{ .certificate_request_context = "ctx-bytes", .extensions = &exts }, &buf);
+
+    var ext_out: [4]Extension = undefined;
+    const dec = try decodeCertificateRequest(enc, &ext_out);
+    try testing.expectEqualSlices(u8, "ctx-bytes", dec.certificate_request_context);
+    try testing.expectEqual(@as(usize, 1), dec.extensions.len);
+    try testing.expectEqual(@as(u16, 13), dec.extensions[0].ext_type);
+}
+
+test "CertificateRequest round-trip: empty context and extensions" {
+    var buf: [16]u8 = undefined;
+    const enc = try encodeCertificateRequest(.{ .certificate_request_context = &.{}, .extensions = &.{} }, &buf);
+    var ext_out: [4]Extension = undefined;
+    const dec = try decodeCertificateRequest(enc, &ext_out);
+    try testing.expectEqual(@as(usize, 0), dec.certificate_request_context.len);
+    try testing.expectEqual(@as(usize, 0), dec.extensions.len);
+}
+
+test "HandshakeType: RFC 8446 §4 wire code points for the cert-mode types" {
+    try testing.expectEqual(@as(u8, 11), @intFromEnum(HandshakeType.certificate));
+    try testing.expectEqual(@as(u8, 13), @intFromEnum(HandshakeType.certificate_request));
+    try testing.expectEqual(@as(u8, 15), @intFromEnum(HandshakeType.certificate_verify));
 }

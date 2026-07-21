@@ -39,6 +39,8 @@ const record = @import("record.zig");
 const handshake = @import("handshake.zig");
 const flight = @import("flight.zig");
 const engine = @import("engine.zig");
+const certverify = @import("certverify.zig");
+const certauth = @import("certauth.zig");
 
 pub const Role = enum { client, server };
 
@@ -58,6 +60,62 @@ pub const ConfigError = error{
     NoCipherSuites,
 };
 
+/// This side's certificate identity for certificate-mode authentication
+/// (RFC 8446 §4.4, layered on top of the psk_ke key exchange above — see
+/// this file's "certificate mode" section further down for exactly what
+/// that means and why). Optional/additive on `Config`: leaving `Config.cert
+/// == null` reproduces the PSK-only behavior this module has always had.
+pub const CertConfig = struct {
+    /// DER-encoded X.509 certificate chain this side presents, LEAF FIRST
+    /// (RFC 8446 §4.4.2's `CertificateEntry` order) — e.g. `&.{leaf}` for a
+    /// leaf signed directly by a peer-trusted anchor, or `&.{ leaf,
+    /// intermediate }` for a one-hop chain. Each entry is raw DER, not PEM.
+    chain: []const []const u8,
+    /// This side's private key for `certverify.sign`'s CertificateVerify —
+    /// its key family MUST match `signature_scheme` (a mismatch is a typed
+    /// `error.KeyMismatch` at sign time, not a panic).
+    private_key: certverify.SecretKey,
+    /// The `SignatureScheme` this side signs CertificateVerify with (RFC
+    /// 8446 §4.2.3). No `signature_algorithms` extension negotiation is
+    /// performed (see the "certificate mode: deferred" notes below) — both
+    /// peers must be independently configured for a scheme they both
+    /// support; the peer learns which scheme was actually used from the
+    /// CertificateVerify message itself.
+    signature_scheme: certverify.SignatureScheme,
+};
+
+/// Trust policy for a peer's presented certificate chain (RFC 8446 §4.4.2).
+/// Applies independently on each side: a client checks the server's chain
+/// under `Config.peer_verify`, and (only if `request_client_cert` is set) a
+/// server checks the client's chain under ITS OWN `Config.peer_verify`.
+///
+/// In every case the CertificateVerify SIGNATURE itself (proof of
+/// possession of the leaf's private key, bound to the handshake transcript)
+/// is checked unconditionally by the flight engine whenever a
+/// CertificateVerify message is present — `PeerVerify` only controls
+/// whether the leaf's KEY is additionally trusted.
+pub const PeerVerify = union(enum) {
+    /// No chain-to-anchor trust decision is made — NOT recommended for
+    /// production use (equivalent to TOFU/opportunistic certificates); the
+    /// CertificateVerify signature is still checked (see above).
+    none,
+    /// A single trust-anchor certificate (DER, not PEM): the peer's LEAF
+    /// certificate must be directly issued by this anchor's key —
+    /// `certauth.verifyLeafAgainstAnchor`'s one-hop RFC 5280 §6-style check
+    /// (issuer-name match, validity-period check against `Config.now_sec`,
+    /// and the actual signature). Multi-hop path building through an
+    /// intermediate is NOT performed — see the "certificate mode: deferred"
+    /// notes below.
+    trust_anchor: []const u8,
+    /// Caller-supplied hook: given the peer's raw leaf certificate DER,
+    /// return successfully to accept the chain or any error to reject it.
+    /// Use this for full X.509 path building / revocation / pinning — out
+    /// of scope for this module itself. The underlying error is NOT
+    /// propagated (it becomes `error.CertificateRejected`) — log inside the
+    /// hook if the caller needs the specific reason.
+    verify_fn: *const fn (leaf_cert_der: []const u8) anyerror!void,
+};
+
 pub const Config = struct {
     role: Role,
     psk_identity: []const u8,
@@ -65,8 +123,42 @@ pub const Config = struct {
     /// Preference order, most-preferred first.
     cipher_suites: []const CipherSuite = &.{.aes_128_ccm_8_sha256},
 
+    // ── certificate mode (RFC 8446 §4.4), all ADDITIVE / optional — see
+    // this file's "certificate mode" section further down. Leaving every
+    // field below at its default reproduces the original PSK-only engine
+    // exactly (every existing PSK test is unaffected by these fields).
+
+    /// This side's own certificate identity — if set, this side PRESENTS a
+    /// Certificate + CertificateVerify (server: always, once its ServerHello
+    /// flight is sent; client: only if the server sent a
+    /// CertificateRequest).
+    cert: ?CertConfig = null,
+    /// Trust policy this side applies to a PEER-presented chain. Only
+    /// consulted when the peer actually presents a non-empty chain and its
+    /// CertificateVerify signature has already checked out.
+    peer_verify: PeerVerify = .none,
+    /// Server only: send a CertificateRequest (RFC 8446 §4.3.2), asking the
+    /// client to also authenticate with a certificate.
+    request_client_cert: bool = false,
+    /// If true, a handshake where the peer was expected to present a
+    /// certificate (client: always, once `peer_verify != .none` OR this
+    /// flag is set; server: only when `request_client_cert` is also set)
+    /// but presented none (or an empty `certificate_list`) fails with
+    /// `error.PeerCertificateRequired` instead of silently completing.
+    require_peer_cert: bool = false,
+    /// Caller-supplied wall-clock time (Unix epoch seconds), used ONLY by
+    /// `PeerVerify.trust_anchor`'s validity-period check
+    /// (`certauth.verifyLeafAgainstAnchor`). This module makes no
+    /// wall-clock syscalls itself anywhere (mirrors `flight.zig`'s
+    /// caller-clocked retransmission timer) — irrelevant for
+    /// `PeerVerify.none`/`.verify_fn` or PSK-only connections.
+    now_sec: i64 = 0,
+
     /// Real, non-crypto validation — catches obviously-broken configs
-    /// before anything touches a keyschedule stub.
+    /// before anything touches a keyschedule stub. PSK fields stay
+    /// mandatory even in certificate mode (see the "certificate mode: what
+    /// 'mode' means here" note below) — a `Config` with `cert` set but an
+    /// empty `psk` is still rejected.
     pub fn validate(self: Config) ConfigError!void {
         if (self.psk.len == 0) return error.EmptyPsk;
         if (self.psk_identity.len == 0) return error.EmptyPskIdentity;
@@ -126,6 +218,29 @@ pub const HandshakeError = messages.MessageError || handshake.FrameError || hand
     /// `Reassembler` is still exercised — see `reassembleFragment` below —
     /// just not carried across calls).
     FragmentedMessageUnsupported,
+} || CertModeError;
+
+/// Certificate-mode-specific errors (RFC 8446 §4.4) — see this file's
+/// "certificate mode" section. Folded into `HandshakeError` so callers
+/// still see one error union from `startHandshake`/`handleFlight` either
+/// way.
+pub const CertModeError = certverify.SignError || error{
+    /// A CertificateVerify signature failed to check out against the
+    /// transcript + the peer's presented leaf public key — either a
+    /// tampered/replayed transcript, a wrong key, or a malformed
+    /// signature/scheme. Folds every `certverify.VerifyError` case (never
+    /// leaks which — see `verifyPeerCert`'s doc comment for why).
+    CertVerifyFailed,
+    /// The peer's certificate chain failed the configured `Config
+    /// .peer_verify` trust policy (`trust_anchor` chain-to-anchor check, or
+    /// `verify_fn` rejection) — OR the presented certificate DER itself
+    /// was malformed / used an unsupported public-key algorithm
+    /// (`certauth.Error`, folded here rather than leaked raw).
+    CertificateRejected,
+    /// `Config.require_peer_cert` is set but the peer presented no
+    /// certificate (or an empty `certificate_list`, RFC 8446 §4.4.2's "no
+    /// certificate available" answer).
+    PeerCertificateRequired,
 };
 
 pub const SendError = error{
@@ -171,6 +286,29 @@ const EpochSeqState = struct {
 /// content-type byte for handshake messages, as opposed to
 /// `content_type_application_data` above).
 const content_type_handshake: u8 = 22;
+
+// ── certificate-mode sizing constants ────────────────────────────────────
+//
+// `protectHandshakeMessage`'s own `inner_buf` is a fixed 1500 bytes (this
+// engine's established "single DTLS record, single fragment" simplification
+// — see `root.zig`'s SCOPE CAVEAT), so every certificate-mode message this
+// engine SENDS must fit that ceiling too; these constants stay comfortably
+// under it while covering realistic single/short chains (proven by the
+// ECDSA P-256 chains in `Connection.zig`'s own cert-mode tests, and the
+// RSA-2048 leaf in `certauth.zig`'s standalone bridge tests). A longer
+// chain (multiple intermediates, or several KB of RSA-4096 certificates) is
+// out of scope here for the same reason real multi-fragment messages are
+// (see `FragmentedMessageUnsupported`'s doc comment) — a caller with larger
+// chains needs actual DTLS fragmentation across `handleFlight` calls, which
+// this module does not implement.
+const max_cert_message_body: usize = 1200;
+const max_certverify_body: usize = 600;
+const max_certreq_body: usize = 128;
+/// Upper bound on a CertificateVerify signature across every scheme
+/// `certverify.zig` supports (the RSA-PSS family's `rsa.max_modulus_len`
+/// dominates every ECDSA/Ed25519 case) — sizes `sig_buf` in `signCertVerify`
+/// without needing to know the configured scheme at comptime.
+const max_sig_len: usize = certverify.maxSignatureLen(.rsa_pss_rsae_sha256);
 
 pub const Connection = struct {
     role: Role,
@@ -236,7 +374,11 @@ pub const Connection = struct {
     /// ACKs as needed only when a peer would otherwise have no way to
     /// infer receipt — not required on this engine's synchronous
     /// request/immediate-response happy path.
-    pending_flight_buf: [4]flight.RecordNumber = undefined,
+    /// Sized for the largest flight this engine ever sends: PSK-only is 3
+    /// (ServerHello, EncryptedExtensions, Finished) or 1 (client Finished);
+    /// certificate mode adds up to 3 more (CertificateRequest, Certificate,
+    /// CertificateVerify) — 8 covers the server's worst case with headroom.
+    pending_flight_buf: [8]flight.RecordNumber = undefined,
     pending_flight_count: usize = 0,
 
     pub const InitError = ConfigError;
@@ -292,14 +434,16 @@ pub const Connection = struct {
     /// Both roles: feeds an incoming (possibly multi-record-coalesced)
     /// datagram to the handshake engine and returns whatever this side
     /// needs to send in response (`HandshakeResult.out`, possibly empty).
-    /// `random` is only consulted on the server's `.start` step (the
-    /// ServerHello `random`); harmless to pass on the client path too.
-    /// Errors are always typed (a wrong PSK, a tampered record, an
-    /// out-of-order message, ...) — never a panic.
+    /// `random` is consulted on the server's `.start` step (the ServerHello
+    /// `random`) and, in certificate mode, whenever THIS side signs a
+    /// CertificateVerify (`certverify.sign`'s PSS salt / ECDSA-Ed25519
+    /// noise) — harmless to pass through unconditionally otherwise. Errors
+    /// are always typed (a wrong PSK, a tampered record, an out-of-order
+    /// message, ...) — never a panic.
     pub fn handleFlight(self: *Connection, datagram: []const u8, random: std.Random, now_ms: u64, out: []u8) HandshakeError!HandshakeResult {
         return switch (self.role) {
             .server => self.handleFlightServer(datagram, random, now_ms, out),
-            .client => self.handleFlightClient(datagram, now_ms, out),
+            .client => self.handleFlightClient(datagram, random, now_ms, out),
         };
     }
 
@@ -678,6 +822,263 @@ pub const Connection = struct {
         self.retransmit_timer.arm(now_ms);
     }
 
+    // ── certificate mode (RFC 8446 §4.4, layered on the psk_ke exchange) ──
+    //
+    // WHAT "certificate mode" MEANS HERE: this engine has no (EC)DHE
+    // key-share machinery (its ClientHello only ever offers
+    // `psk_key_exchange_modes = [psk_ke]` — see `buildClientHello`), and
+    // adding one is real new crypto (out of this task's "plumbing over
+    // certverify, no new crypto" scope). A certificate-authenticated
+    // handshake with NO PSK at all therefore cannot derive confidential
+    // session keys here — RFC 8446's own certificate-only mode gets its
+    // key material from (EC)DHE, which this module doesn't have.
+    //
+    // So: the PSK continues to supply ALL session-key material exactly as
+    // before (unchanged key schedule, unchanged Finished computation).
+    // Certificate mode ADDS Certificate + CertificateVerify (+ optionally
+    // CertificateRequest) messages that authenticate the two ends' identity
+    // via a real signature over the running handshake transcript — useful
+    // e.g. for a device provisioned with both a shared secret (for the
+    // channel) and a per-device X.509 identity (for strong peer
+    // authentication), which is exactly this module's stated CoAP/IoT
+    // fleet-management target consumer (see `root.zig`). This is NOT a
+    // standard named RFC 8446 mode; it is this engine's own, honestly-
+    // documented extension of it, built entirely from already-implemented
+    // pieces (`certverify.zig`'s sign/verify, `certauth.zig`'s DER bridge).
+    //
+    // DEFERRED (not silently skipped):
+    //   - A genuine PSK-less, (EC)DHE-based certificate-only key exchange
+    //     (would need a `key_share` extension + ECDH — new crypto).
+    //   - `signature_algorithms` extension negotiation (CertificateRequest/
+    //     ClientHello never advertise or negotiate a scheme list — each
+    //     side is configured with the one scheme it will use; the peer
+    //     always learns which scheme was actually used from the
+    //     CertificateVerify message's own `algorithm` field, so a mismatch
+    //     just fails cleanly at verify time rather than being negotiated
+    //     away in advance).
+    //   - Full RFC 5280 §6 certification-path building (multi-hop chains,
+    //     name constraints, key usage / basicConstraints policy checks,
+    //     revocation) — `PeerVerify.trust_anchor` is a minimal one-hop
+    //     check; `PeerVerify.verify_fn` is the escape hatch for anything
+    //     more (see that type's doc comment).
+    //   - `CertificateEntry` extensions (OCSP stapling, SCT, ...) — framed
+    //     as always-empty on send, length-validated-but-discarded on
+    //     receive (see `messages.zig`'s `CertificateEntry` doc comment).
+
+    /// The record bytes + hs2 sequence number one `sendEpoch2Message`/
+    /// `signAndSendCertificateVerify` call produced — a named type (NOT two
+    /// separately-declared anonymous structs, which Zig treats as distinct
+    /// types even with identical fields) so both functions' results can be
+    /// handled uniformly by their callers.
+    const SentRecord = struct { bytes: []const u8, seq: u48 };
+
+    /// Encodes `body` as handshake type `msg_type`, appends it to the
+    /// running transcript, frames + AEAD-protects it under the epoch-2
+    /// handshake traffic keys (mirrors what `serverProcessClientHello`'s
+    /// EncryptedExtensions/Finished sends already did inline — this is that
+    /// same "append, frame, protect" sequence factored out for the
+    /// certificate-mode messages below, which need it up to 3 more times
+    /// per side). `frag_buf` must be `>= handshake.header_len + body.len`
+    /// (sized per call site — Certificate/CertificateVerify/
+    /// CertificateRequest bodies are very differently sized).
+    fn sendEpoch2Message(
+        self: *Connection,
+        msg_type: messages.HandshakeType,
+        body: []const u8,
+        frag_buf: []u8,
+        out: []u8,
+    ) HandshakeError!SentRecord {
+        self.transcript.append(@intFromEnum(msg_type), body);
+        const fragment = try frameHandshakeMessage(@intFromEnum(msg_type), self.message_seq, body, frag_buf);
+        self.message_seq +%= 1;
+        const seq = self.hs2.send_seq;
+        const record_bytes = try self.protectHandshakeMessage(fragment, out);
+        return .{ .bytes = record_bytes, .seq = seq };
+    }
+
+    /// Signs the CURRENT transcript hash (i.e. through whatever was last
+    /// `sendEpoch2Message`-ed — the caller must call this immediately after
+    /// sending this side's own Certificate message, per RFC 8446 §4.4.3)
+    /// under `cc.signature_scheme`/`cc.private_key`, encodes a
+    /// CertificateVerify message body, and sends it via `sendEpoch2Message`.
+    fn signAndSendCertificateVerify(
+        self: *Connection,
+        cc: CertConfig,
+        side: certverify.Side,
+        random: std.Random,
+        out: []u8,
+    ) HandshakeError!SentRecord {
+        const th = self.transcript.currentHash();
+        var sig_buf: [max_sig_len]u8 = undefined;
+        const sig = try certverify.sign(cc.signature_scheme, cc.private_key, side, &th, random, &sig_buf);
+
+        var cv_body_buf: [max_certverify_body]u8 = undefined;
+        const cv_body = messages.encodeCertificateVerify(.{ .algorithm = @intFromEnum(cc.signature_scheme), .signature = sig }, &cv_body_buf) catch return error.BufferTooShort;
+
+        var frag_buf: [max_certverify_body + handshake.header_len]u8 = undefined;
+        return self.sendEpoch2Message(.certificate_verify, cv_body, &frag_buf, out);
+    }
+
+    /// Verifies an incoming CertificateVerify: the signature itself (real
+    /// crypto, `certverify.verify` — proves possession of `leaf_der`'s
+    /// private key over `transcript_hash`) is checked UNCONDITIONALLY;
+    /// every `certverify.VerifyError` case collapses to
+    /// `error.CertVerifyFailed` (matching this module's existing style of
+    /// one typed error per "verify failed" event — see `BinderVerifyFailed`/
+    /// `FinishedVerifyFailed` — rather than leaking which of six internal
+    /// sub-reasons applied). THEN, only if that passed, `self.config
+    /// .peer_verify`'s chain-to-anchor trust decision is applied (also
+    /// collapsed, to `error.CertificateRejected`).
+    ///
+    /// `scheme_raw` is the wire `SignatureScheme` value from the peer's
+    /// CertificateVerify message — `certverify.SignatureScheme` is a
+    /// non-exhaustive enum specifically so this cast can never panic on an
+    /// unrecognized value (`certverify.verify` itself rejects it with
+    /// `error.UnsupportedScheme`, folded into `CertVerifyFailed` here).
+    fn verifyPeerCert(
+        self: *Connection,
+        leaf_der: []const u8,
+        scheme_raw: u16,
+        signature: []const u8,
+        transcript_hash: []const u8,
+        signer_side: certverify.Side,
+    ) HandshakeError!void {
+        const scheme: certverify.SignatureScheme = @enumFromInt(scheme_raw);
+        const pubkey = certauth.parseLeafPublicKey(leaf_der) catch return error.CertificateRejected;
+        certverify.verify(scheme, pubkey, signer_side, transcript_hash, signature) catch return error.CertVerifyFailed;
+        switch (self.config.peer_verify) {
+            .none => {},
+            .trust_anchor => |anchor_der| certauth.verifyLeafAgainstAnchor(leaf_der, anchor_der, self.config.now_sec) catch return error.CertificateRejected,
+            .verify_fn => |f| f(leaf_der) catch return error.CertificateRejected,
+        }
+    }
+
+    /// Result of `consumeOptionalCertMessages` — everything the caller
+    /// needs to finish processing a flight that may have carried
+    /// certificate-mode messages before its mandatory closing `Finished`.
+    const PeerCertResult = struct {
+        /// A `CertificateRequest` was seen (only legal — see
+        /// `consumeOptionalCertMessages`'s `allow_certificate_request` — when
+        /// parsing what a SERVER sent).
+        requested_client_cert: bool = false,
+        creq_context: [255]u8 = undefined,
+        creq_context_len: usize = 0,
+        /// A `Certificate` message was seen at all — set even for an empty
+        /// `certificate_list` (RFC 8446 §4.4.2's "no certificate" answer),
+        /// which is why `leaf_len == 0` (not `!saw_cert`) is the "peer
+        /// declined" check callers should use.
+        saw_cert: bool = false,
+        leaf_buf: [max_cert_message_body]u8 = undefined,
+        leaf_len: usize = 0,
+        saw_cv: bool = false,
+        /// The closing `Finished` message's body (its `verify_data`),
+        /// consumed by this same function — see the doc comment below for
+        /// why `unprotectHandshakeMessage` cannot be safely called a second
+        /// time on the same wire bytes to re-parse it (it advances the
+        /// epoch-2 anti-replay window, RFC 9147 §4.5.1; a second call on
+        /// the identical sequence number would spuriously fail with
+        /// `error.ReplayedRecord`).
+        fin_buf: [64]u8 = undefined,
+        fin_len: usize = 0,
+
+        fn finishedVerifyData(self: *const PeerCertResult) []const u8 {
+            return self.fin_buf[0..self.fin_len];
+        }
+    };
+
+    /// Consumes zero-or-more optional certificate-mode messages
+    /// (`CertificateRequest?`, `Certificate?`, `CertificateVerify?`, in that
+    /// RFC 8446 §4.4/§4.3.2 order) starting at `datagram[pos.*..]`, THEN
+    /// the mandatory closing `finished` message that always ends a flight
+    /// — returned via `PeerCertResult.finishedVerifyData()` rather than
+    /// left for the caller to unprotect separately, because
+    /// `unprotectHandshakeMessage` is NOT idempotent (RFC 9147 §4.5.1's
+    /// anti-replay window advances on every successful call — a second
+    /// call on the same wire bytes would see its own already-accepted
+    /// sequence number and spuriously fail with `error.ReplayedRecord`).
+    /// Every message consumed is reassembled (single-fragment only, like
+    /// the rest of this engine), appended to the transcript, and (for
+    /// Certificate/CertificateVerify) cryptographically verified via
+    /// `verifyPeerCert` — so a caller that gets a successful return already
+    /// has a fully-verified peer chain (if one was presented) AND the
+    /// Finished body, ready for `computeFinishedVerifyData` comparison.
+    ///
+    /// In the pure-PSK case (no certificate-mode messages sent), the very
+    /// first message found is `finished` and this behaves exactly like the
+    /// original inline `unprotectHandshakeMessage` + `reassembleFragment`
+    /// call it replaces — byte-for-byte the same wire behavior.
+    ///
+    /// `signer_side`: whose CertificateVerify this is, if one appears
+    /// (`.server` when parsing what a DTLS SERVER sent — i.e. the client
+    /// calls this with `.server` — and vice versa) — selects the RFC 8446
+    /// §4.4.3 context string `certverify.verify` checks against.
+    /// `allow_certificate_request`: a client legitimately sends
+    /// CertificateRequest to nobody — `false` when parsing a CLIENT's
+    /// flight rejects one outright as a protocol violation.
+    fn consumeOptionalCertMessages(
+        self: *Connection,
+        datagram: []const u8,
+        pos: *usize,
+        signer_side: certverify.Side,
+        allow_certificate_request: bool,
+    ) HandshakeError!PeerCertResult {
+        var result = PeerCertResult{};
+        var iterations: usize = 0;
+        while (true) : (iterations += 1) {
+            if (iterations >= 4) return error.Malformed; // CertReq?, Cert?, CertVerify?, Finished — never more
+            if (pos.* >= datagram.len) return error.Malformed;
+
+            var plain_buf: [max_cert_message_body + 64]u8 = undefined;
+            const fragment = try self.unprotectHandshakeMessage(datagram[pos.*..], &plain_buf);
+            pos.* += try recordWireLen(datagram[pos.*..]);
+            var msg_buf: [max_cert_message_body]u8 = undefined;
+            var received_buf: [max_cert_message_body]bool = undefined;
+            const parsed = try reassembleFragment(fragment, &msg_buf, &received_buf);
+
+            if (parsed.msg_type == @intFromEnum(messages.HandshakeType.finished)) {
+                if (parsed.body.len > result.fin_buf.len) return error.Malformed;
+                @memcpy(result.fin_buf[0..parsed.body.len], parsed.body);
+                result.fin_len = parsed.body.len;
+                return result;
+            }
+
+            if (parsed.msg_type == @intFromEnum(messages.HandshakeType.certificate_request)) {
+                if (!allow_certificate_request or result.saw_cert or result.requested_client_cert) return error.UnexpectedMessage;
+                var ext_buf: [4]messages.Extension = undefined;
+                const creq = messages.decodeCertificateRequest(parsed.body, &ext_buf) catch return error.Malformed;
+                if (creq.certificate_request_context.len > result.creq_context.len) return error.Malformed;
+                @memcpy(result.creq_context[0..creq.certificate_request_context.len], creq.certificate_request_context);
+                result.creq_context_len = creq.certificate_request_context.len;
+                result.requested_client_cert = true;
+                self.transcript.append(parsed.msg_type, parsed.body);
+            } else if (parsed.msg_type == @intFromEnum(messages.HandshakeType.certificate)) {
+                if (result.saw_cert) return error.UnexpectedMessage;
+                var entries_buf: [4]messages.CertificateEntry = undefined;
+                const dec = messages.decodeCertificate(parsed.body, &entries_buf) catch return error.Malformed;
+                self.transcript.append(parsed.msg_type, parsed.body);
+                result.saw_cert = true;
+                if (dec.entries.len > 0) {
+                    const leaf = dec.entries[0].cert_data;
+                    if (leaf.len > result.leaf_buf.len) return error.Malformed;
+                    @memcpy(result.leaf_buf[0..leaf.len], leaf);
+                    result.leaf_len = leaf.len;
+                }
+            } else if (parsed.msg_type == @intFromEnum(messages.HandshakeType.certificate_verify)) {
+                if (!result.saw_cert or result.leaf_len == 0 or result.saw_cv) return error.UnexpectedMessage;
+                // Transcript hash "through Certificate" — everything
+                // appended so far, NOT including this CertificateVerify
+                // message itself (RFC 8446 §4.4.3).
+                const th_through_cert = self.transcript.currentHash();
+                const cv = messages.decodeCertificateVerify(parsed.body) catch return error.Malformed;
+                try self.verifyPeerCert(result.leaf_buf[0..result.leaf_len], cv.algorithm, cv.signature, &th_through_cert, signer_side);
+                self.transcript.append(parsed.msg_type, parsed.body);
+                result.saw_cv = true;
+            } else {
+                return error.UnexpectedMessage;
+            }
+        }
+    }
+
     fn handleFlightServer(self: *Connection, datagram: []const u8, random: std.Random, now_ms: u64, out: []u8) HandshakeError!HandshakeResult {
         return switch (self.state) {
             .start => self.serverProcessClientHello(datagram, random, now_ms, out),
@@ -806,6 +1207,39 @@ pub const Connection = struct {
             cursor += ee_record.len;
         }
 
+        // ── certificate mode: CertificateRequest?, Certificate?,
+        // CertificateVerify? — additive, see the "certificate mode" section
+        // above `handleFlightServer`. Zero records emitted when neither
+        // `config.request_client_cert` nor `config.cert` is set, reproducing
+        // the original PSK-only flight 2 exactly.
+        var extra_records: [3]flight.RecordNumber = undefined;
+        var extra_n: usize = 0;
+
+        if (self.config.request_client_cert) {
+            var creq_body_buf: [max_certreq_body]u8 = undefined;
+            const creq_body = messages.encodeCertificateRequest(.{ .certificate_request_context = &.{}, .extensions = &.{} }, &creq_body_buf) catch return error.BufferTooShort;
+            var frag_buf: [max_certreq_body + handshake.header_len]u8 = undefined;
+            const r = try self.sendEpoch2Message(.certificate_request, creq_body, &frag_buf, out[cursor..]);
+            cursor += r.bytes.len;
+            extra_records[extra_n] = .{ .epoch = 2, .sequence_number = r.seq };
+            extra_n += 1;
+        }
+
+        if (self.config.cert) |cc| {
+            var cert_body_buf: [max_cert_message_body]u8 = undefined;
+            const cert_body = messages.encodeCertificate(&.{}, cc.chain, &cert_body_buf) catch return error.BufferTooShort;
+            var frag_buf: [max_cert_message_body + handshake.header_len]u8 = undefined;
+            const cert_r = try self.sendEpoch2Message(.certificate, cert_body, &frag_buf, out[cursor..]);
+            cursor += cert_r.bytes.len;
+            extra_records[extra_n] = .{ .epoch = 2, .sequence_number = cert_r.seq };
+            extra_n += 1;
+
+            const cv_r = try self.signAndSendCertificateVerify(cc, .server, random, out[cursor..]);
+            cursor += cv_r.bytes.len;
+            extra_records[extra_n] = .{ .epoch = 2, .sequence_number = cv_r.seq };
+            extra_n += 1;
+        }
+
         const finished_key = keyschedule.deriveFinishedKey(Hkdf, 32, hst.server);
         const th_before_finished = self.transcript.currentHash();
         const verify_data = keyschedule.computeFinishedVerifyData(Hmac, finished_key, &th_before_finished);
@@ -825,28 +1259,47 @@ pub const Connection = struct {
         self.pending_ap_client = ap.client;
         self.pending_ap_server = ap.server;
 
-        self.markFlightSent(&.{
-            .{ .epoch = 0, .sequence_number = sh_seq },
-            .{ .epoch = 2, .sequence_number = ee_seq },
-            .{ .epoch = 2, .sequence_number = fin_seq },
-        });
+        var all_records: [6]flight.RecordNumber = undefined;
+        var n: usize = 0;
+        all_records[n] = .{ .epoch = 0, .sequence_number = sh_seq };
+        n += 1;
+        all_records[n] = .{ .epoch = 2, .sequence_number = ee_seq };
+        n += 1;
+        for (extra_records[0..extra_n]) |r| {
+            all_records[n] = r;
+            n += 1;
+        }
+        all_records[n] = .{ .epoch = 2, .sequence_number = fin_seq };
+        n += 1;
+        self.markFlightSent(all_records[0..n]);
         try self.cacheFlight(out[0..cursor], now_ms);
         self.state = .wait_finished;
         return .{ .out = out[0..cursor], .done = false };
     }
 
-    /// Server flight 3 (implicit): consumes the client's Finished, verifies
-    /// its `verify_data`, and installs the application traffic secrets
-    /// derived earlier. Transitions `.wait_finished` -> `.connected`.
+    /// Server flight 3 (implicit): optionally consumes the client's own
+    /// Certificate/CertificateVerify (RFC 8446 §4.4, only legal if THIS
+    /// server sent a CertificateRequest — see `Config.request_client_cert`
+    /// — a client that sends one unprompted is rejected), then consumes the
+    /// client's Finished, verifies its `verify_data`, and installs the
+    /// application traffic secrets derived earlier. Transitions
+    /// `.wait_finished` -> `.connected`.
     fn serverProcessClientFinished(self: *Connection, datagram: []const u8) HandshakeError!HandshakeResult {
-        var plain_buf: [128]u8 = undefined;
-        const fragment = try self.unprotectHandshakeMessage(datagram, &plain_buf);
+        var pos: usize = 0;
+        const cert_result = try self.consumeOptionalCertMessages(datagram, &pos, .client, false);
+        if (cert_result.saw_cert and cert_result.leaf_len > 0 and !cert_result.saw_cv) return error.Malformed;
+        if (self.config.request_client_cert) {
+            // A client that was asked for a certificate MUST answer with a
+            // Certificate message (possibly an empty one, RFC 8446 §4.4.2's
+            // "no certificate available" — a genuine protocol answer, not a
+            // missing message).
+            if (!cert_result.saw_cert) return error.Malformed;
+            if (cert_result.leaf_len == 0 and self.config.require_peer_cert) return error.PeerCertificateRequired;
+        } else if (cert_result.saw_cert) {
+            return error.UnexpectedMessage; // the client sent a cert we never requested
+        }
 
-        var msg_buf: [64]u8 = undefined;
-        var received_buf: [64]bool = undefined;
-        const parsed = try reassembleFragment(fragment, &msg_buf, &received_buf);
-        if (parsed.msg_type != @intFromEnum(messages.HandshakeType.finished)) return error.UnexpectedMessage;
-        const fin = messages.decodeFinished(parsed.body);
+        const fin = messages.decodeFinished(cert_result.finishedVerifyData());
         if (fin.verify_data.len != 32) return error.Malformed;
 
         const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
@@ -872,7 +1325,7 @@ pub const Connection = struct {
     /// keys immediately (the client needs no further confirmation once it
     /// has verified the server). Transitions `.wait_server_hello` ->
     /// `.connected`.
-    fn handleFlightClient(self: *Connection, datagram: []const u8, now_ms: u64, out: []u8) HandshakeError!HandshakeResult {
+    fn handleFlightClient(self: *Connection, datagram: []const u8, random: std.Random, now_ms: u64, out: []u8) HandshakeError!HandshakeResult {
         if (self.state != .wait_server_hello) return error.WrongState;
 
         const sh_rec = record.decodePlaintext(datagram) catch return error.Malformed;
@@ -926,14 +1379,17 @@ pub const Connection = struct {
         if (ee_parsed.msg_type != @intFromEnum(messages.HandshakeType.encrypted_extensions)) return error.UnexpectedMessage;
         self.transcript.append(@intFromEnum(messages.HandshakeType.encrypted_extensions), ee_parsed.body);
 
-        if (pos >= datagram.len) return error.Malformed;
-        var fin_plain_buf: [128]u8 = undefined;
-        const fin_fragment = try self.unprotectHandshakeMessage(datagram[pos..], &fin_plain_buf);
-        var fin_msg_buf: [64]u8 = undefined;
-        var fin_received_buf: [64]bool = undefined;
-        const fin_parsed = try reassembleFragment(fin_fragment, &fin_msg_buf, &fin_received_buf);
-        if (fin_parsed.msg_type != @intFromEnum(messages.HandshakeType.finished)) return error.UnexpectedMessage;
-        const server_fin = messages.decodeFinished(fin_parsed.body);
+        // ── certificate mode: optional CertificateRequest?, Certificate?,
+        // CertificateVerify? from the server, then the server's Finished —
+        // additive, see the "certificate mode" section above
+        // `handleFlightServer`. In pure PSK mode the first message found is
+        // `finished` and this behaves exactly like the original inline
+        // unprotect+reassemble call it replaces.
+        const cert_result = try self.consumeOptionalCertMessages(datagram, &pos, .server, true);
+        if (cert_result.saw_cert and cert_result.leaf_len > 0 and !cert_result.saw_cv) return error.Malformed;
+        if (self.config.require_peer_cert and cert_result.leaf_len == 0) return error.PeerCertificateRequired;
+
+        const server_fin = messages.decodeFinished(cert_result.finishedVerifyData());
         if (server_fin.verify_data.len != 32) return error.Malformed;
 
         const server_finished_key = keyschedule.deriveFinishedKey(Hkdf, 32, hst.server);
@@ -942,25 +1398,75 @@ pub const Connection = struct {
         if (!std.crypto.timing_safe.eql([32]u8, expected_server_vd, server_fin.verify_data[0..32].*)) return error.FinishedVerifyFailed;
         self.transcript.append(@intFromEnum(messages.HandshakeType.finished), server_fin.verify_data);
 
+        // Application traffic secrets are fixed at "through the SERVER's
+        // Finished" (RFC 8446 §7.1) regardless of whatever the client sends
+        // next below — computed here, BEFORE any client-side certificate
+        // messages are appended to the transcript.
         const ms = keyschedule.deriveMasterSecret(Hkdf, hs_secret, &eh);
         const th_through_server_finished = self.transcript.currentHash();
         const ap = keyschedule.deriveApplicationTrafficSecrets(Hkdf, ms, &th_through_server_finished);
 
+        // ── certificate mode: this client's own Certificate/CertificateVerify,
+        // ONLY if the server asked (`cert_result.requested_client_cert`).
+        // Must be sent — and appended to the transcript — BEFORE the
+        // client's Finished, whose verify_data covers them.
+        var cursor: usize = 0;
+        var extra_records: [2]flight.RecordNumber = undefined;
+        var extra_n: usize = 0;
+
+        if (cert_result.requested_client_cert) {
+            const ctx = cert_result.creq_context[0..cert_result.creq_context_len];
+            var cert_body_buf: [max_cert_message_body]u8 = undefined;
+            var frag_buf: [max_cert_message_body + handshake.header_len]u8 = undefined;
+
+            if (self.config.cert) |cc| {
+                const body = messages.encodeCertificate(ctx, cc.chain, &cert_body_buf) catch return error.BufferTooShort;
+                const r = try self.sendEpoch2Message(.certificate, body, &frag_buf, out[cursor..]);
+                cursor += r.bytes.len;
+                extra_records[extra_n] = .{ .epoch = 2, .sequence_number = r.seq };
+                extra_n += 1;
+
+                const cv_r = try self.signAndSendCertificateVerify(cc, .client, random, out[cursor..]);
+                cursor += cv_r.bytes.len;
+                extra_records[extra_n] = .{ .epoch = 2, .sequence_number = cv_r.seq };
+                extra_n += 1;
+            } else {
+                // RFC 8446 §4.4.2: no suitable certificate -> an EMPTY
+                // Certificate message, no CertificateVerify.
+                const body = messages.encodeCertificate(ctx, &.{}, &cert_body_buf) catch return error.BufferTooShort;
+                const r = try self.sendEpoch2Message(.certificate, body, &frag_buf, out[cursor..]);
+                cursor += r.bytes.len;
+                extra_records[extra_n] = .{ .epoch = 2, .sequence_number = r.seq };
+                extra_n += 1;
+            }
+        }
+
         const client_finished_key = keyschedule.deriveFinishedKey(Hkdf, 32, hst.client);
-        const client_vd = keyschedule.computeFinishedVerifyData(Hmac, client_finished_key, &th_through_server_finished);
+        const th_for_client_finished = self.transcript.currentHash();
+        const client_vd = keyschedule.computeFinishedVerifyData(Hmac, client_finished_key, &th_for_client_finished);
         self.transcript.append(@intFromEnum(messages.HandshakeType.finished), &client_vd);
 
         var fin_frag_buf: [32 + handshake.header_len]u8 = undefined;
         const client_fin_fragment = try frameHandshakeMessage(@intFromEnum(messages.HandshakeType.finished), self.message_seq, &client_vd, &fin_frag_buf);
         self.message_seq +%= 1;
         const client_fin_seq = self.hs2.send_seq;
-        const client_fin_record = try self.protectHandshakeMessage(client_fin_fragment, out);
-        self.markFlightSent(&.{.{ .epoch = 2, .sequence_number = client_fin_seq }});
+        const client_fin_record = try self.protectHandshakeMessage(client_fin_fragment, out[cursor..]);
+        cursor += client_fin_record.len;
+
+        var all_records: [3]flight.RecordNumber = undefined;
+        var n: usize = 0;
+        for (extra_records[0..extra_n]) |r| {
+            all_records[n] = r;
+            n += 1;
+        }
+        all_records[n] = .{ .epoch = 2, .sequence_number = client_fin_seq };
+        n += 1;
+        self.markFlightSent(all_records[0..n]);
 
         try self.installApplicationKeys(suite, ap.client, ap.server);
         _ = now_ms; // the client needs no further retransmission once connected
 
-        return .{ .out = client_fin_record, .done = true };
+        return .{ .out = out[0..cursor], .done = true };
     }
 };
 
@@ -1526,12 +2032,21 @@ test "deinit: zeroes all resident key/secret material" {
 
     // Sanity: post-handshake these fields are genuinely populated (not
     // already all-zero), otherwise the zeroed-after-deinit assertions below
-    // would pass trivially.
+    // would pass trivially. `pending_ap_client`/`pending_ap_server` are
+    // documented as SERVER-side-only bookkeeping (`Connection`'s own field
+    // doc comment: "the client confirms immediately ... and installs right
+    // away; the server stashes these here until the client's Finished
+    // verifies") — the CLIENT never writes them, so they are checked on
+    // `server` here, not `client` (checking them on `client` was a latent
+    // bug: `undefined`-initialized memory happens to be non-zero under
+    // Debug's poison-fill but is NOT guaranteed to be, and genuinely reads
+    // as zero under ReleaseFast — this would have silently made that half
+    // of the "genuinely populated" sanity check meaningless).
     try testing.expect(!std.mem.allEqual(u8, client.write_keys.key[0..client.write_keys.key_len], 0));
     try testing.expect(!std.mem.allEqual(u8, &client.hs_traffic_client, 0));
     try testing.expect(!std.mem.allEqual(u8, &client.hs_traffic_server, 0));
-    try testing.expect(!std.mem.allEqual(u8, &client.pending_ap_client, 0));
-    try testing.expect(!std.mem.allEqual(u8, &client.pending_ap_server, 0));
+    try testing.expect(!std.mem.allEqual(u8, &server.pending_ap_client, 0));
+    try testing.expect(!std.mem.allEqual(u8, &server.pending_ap_server, 0));
 
     client.deinit();
 
@@ -1549,10 +2064,10 @@ test "deinit: zeroes all resident key/secret material" {
     try testing.expect(std.mem.allEqual(u8, &client.hs_read_keys.sn_key, 0));
     try testing.expect(std.mem.allEqual(u8, &client.hs_traffic_client, 0));
     try testing.expect(std.mem.allEqual(u8, &client.hs_traffic_server, 0));
-    try testing.expect(std.mem.allEqual(u8, &client.pending_ap_client, 0));
-    try testing.expect(std.mem.allEqual(u8, &client.pending_ap_server, 0));
 
     server.deinit();
+    try testing.expect(std.mem.allEqual(u8, &server.pending_ap_client, 0));
+    try testing.expect(std.mem.allEqual(u8, &server.pending_ap_server, 0));
 }
 
 test "handshake: wrong PSK -> binder verify fails (typed error, not a panic)" {
@@ -1692,6 +2207,337 @@ test "handshake: dropped ClientHello retransmits via poll (fake clock), then com
     const server_done = try server.handleFlight(client_fin.out, rnd, 1000, &buf1);
     try testing.expect(server_done.done);
 
+    try testing.expectEqual(State.connected, client.state);
+    try testing.expectEqual(State.connected, server.state);
+}
+
+// ── certificate mode: the mandatory oracle ───────────────────────────────
+//
+// Same proof shape as the PSK loopback tests above (two in-memory
+// `Connection`s driving each other, no external peer) but now with real
+// ECDSA P-256 certificates generated by OpenSSL (`certauth_kat_vectors.zig`
+// — see that file's provenance comment): a genuine trust anchor, a leaf
+// signed by it, real `certverify.sign`/`.verify` signatures over the live
+// running transcript (not a fixed KAT string), and real
+// `certauth.verifyLeafAgainstAnchor` chain checks. These are the teeth:
+// server-cert-only handshake completes with matching derived keys; a wrong
+// signing key is rejected; an untrusted anchor is rejected; mutual
+// (CertificateRequest -> client cert) auth completes; a required-but-absent
+// peer cert is rejected. The existing PSK-only tests above are untouched
+// and still pass — proving certificate mode is genuinely additive.
+
+const cert_kat = @import("certauth_kat_vectors.zig");
+
+fn serverEcdsaKeyPair() certverify.SecretKey {
+    return .{ .ecdsa_p256 = std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey.fromBytes(cert_kat.server_secret_key_bytes) catch unreachable };
+}
+fn clientEcdsaKeyPair() certverify.SecretKey {
+    return .{ .ecdsa_p256 = std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey.fromBytes(cert_kat.client_secret_key_bytes) catch unreachable };
+}
+
+test "cert-mode: server-cert-only handshake completes, derives matching keys, app data round-trips" {
+    const psk_identity = "device-042";
+    const psk = "a-shared-pre-shared-key";
+    const cfg_client = Config{
+        .role = .client,
+        .psk_identity = psk_identity,
+        .psk = psk,
+        .cipher_suites = &.{.aes_128_gcm_sha256},
+        .peer_verify = .{ .trust_anchor = &cert_kat.anchor_cert_der },
+        .now_sec = cert_kat.valid_now_sec,
+    };
+    const cfg_server = Config{
+        .role = .server,
+        .psk_identity = psk_identity,
+        .psk = psk,
+        .cipher_suites = &.{.aes_128_gcm_sha256},
+        .cert = .{
+            .chain = &.{&cert_kat.server_cert_der},
+            .private_key = serverEcdsaKeyPair(),
+            .signature_scheme = .ecdsa_secp256r1_sha256,
+        },
+    };
+    var client = try Connection.clientInit(cfg_client);
+    var server = try Connection.serverInit(cfg_server);
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x60} ** 32);
+    var buf1: [2048]u8 = undefined;
+    var buf2: [2048]u8 = undefined;
+
+    try driveHandshake(&client, &server, testRandom(&csprng), &buf1, &buf2);
+
+    // Identical derived application keys on both sides — proves the
+    // certificate-mode messages fed the SAME bytes into both sides'
+    // transcript hash (any divergence would desync the key schedule).
+    try testing.expectEqualSlices(u8, client.write_keys.key[0..client.write_keys.key_len], server.read_keys.key[0..server.read_keys.key_len]);
+    try testing.expectEqualSlices(u8, &client.write_keys.iv, &server.read_keys.iv);
+
+    var wire: [256]u8 = undefined;
+    var plain: [256]u8 = undefined;
+    const rec = try client.send("hello over cert-mode DTLS 1.3", &wire);
+    const got = try server.recv(rec, &plain);
+    try testing.expectEqualSlices(u8, "hello over cert-mode DTLS 1.3", got);
+}
+
+test "cert-mode: CertificateVerify signed with the WRONG key is rejected (typed error, not a panic)" {
+    const psk_identity = "device-042";
+    const psk = "a-shared-pre-shared-key";
+    const cfg_client = Config{
+        .role = .client,
+        .psk_identity = psk_identity,
+        .psk = psk,
+        .cipher_suites = &.{.aes_128_gcm_sha256},
+        .peer_verify = .{ .trust_anchor = &cert_kat.anchor_cert_der },
+        .now_sec = cert_kat.valid_now_sec,
+    };
+    const cfg_server = Config{
+        .role = .server,
+        .psk_identity = psk_identity,
+        .psk = psk,
+        .cipher_suites = &.{.aes_128_gcm_sha256},
+        .cert = .{
+            // Presents the real server leaf, but signs with the CLIENT's
+            // key — the leaf's public key and the CertificateVerify
+            // signature no longer match. This is the "tampered transcript
+            // / wrong key" case: certverify.verify recomputes the RFC 8446
+            // §4.4.3 signed content over the (correct, live) transcript
+            // hash and finds it doesn't verify under the leaf's real key.
+            .chain = &.{&cert_kat.server_cert_der},
+            .private_key = clientEcdsaKeyPair(),
+            .signature_scheme = .ecdsa_secp256r1_sha256,
+        },
+    };
+    var client = try Connection.clientInit(cfg_client);
+    var server = try Connection.serverInit(cfg_server);
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x61} ** 32);
+    const rnd = testRandom(&csprng);
+    var buf1: [2048]u8 = undefined;
+    var buf2: [2048]u8 = undefined;
+
+    const ch = try client.startHandshake(rnd, 0, &buf1);
+    const flight2 = try server.handleFlight(ch, rnd, 0, &buf2);
+    try testing.expectError(error.CertVerifyFailed, client.handleFlight(flight2.out, rnd, 0, &buf1));
+}
+
+test "cert-mode: a directly-tampered CertificateVerify signature byte is rejected" {
+    const psk_identity = "device-042";
+    const psk = "a-shared-pre-shared-key";
+    const cfg_client = Config{
+        .role = .client,
+        .psk_identity = psk_identity,
+        .psk = psk,
+        .cipher_suites = &.{.aes_128_gcm_sha256},
+        .peer_verify = .none,
+    };
+    const cfg_server = Config{
+        .role = .server,
+        .psk_identity = psk_identity,
+        .psk = psk,
+        .cipher_suites = &.{.aes_128_gcm_sha256},
+        .cert = .{
+            .chain = &.{&cert_kat.server_cert_der},
+            .private_key = serverEcdsaKeyPair(),
+            .signature_scheme = .ecdsa_secp256r1_sha256,
+        },
+    };
+    var client = try Connection.clientInit(cfg_client);
+    var server = try Connection.serverInit(cfg_server);
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x62} ** 32);
+    const rnd = testRandom(&csprng);
+    var buf1: [2048]u8 = undefined;
+    var buf2: [2048]u8 = undefined;
+
+    const ch = try client.startHandshake(rnd, 0, &buf1);
+    const flight2 = try server.handleFlight(ch, rnd, 0, &buf2);
+
+    var tampered: [2048]u8 = undefined;
+    @memcpy(tampered[0..flight2.out.len], flight2.out);
+    // Flip the LAST byte of the flight — inside the Finished record's AEAD
+    // tag/ciphertext for a PSK-only flight, but here (cert mode) the flight
+    // is Certificate+CertificateVerify+Finished; the last byte still lands
+    // inside the Finished record's tag, so corrupt a byte further back,
+    // inside the CertificateVerify record instead. The exact offset is
+    // derived, not hand-counted: locate the CertificateVerify's signature
+    // bytes are AEAD-protected, so ANY byte flip inside that whole record
+    // must fail AEAD authentication before certverify.verify ever runs —
+    // proving this module's OWN typed-error path (not just certverify's)
+    // rejects a tampered wire message.
+    const mid = flight2.out.len / 2; // lands inside the coalesced flight's cert-mode records
+    tampered[mid] ^= 0x40;
+    // Lands inside an AEAD-protected epoch-2 record (Certificate/
+    // CertificateVerify/Finished are all sealed) -- authentication fails
+    // before certverify.verify is ever reached, proving the flight-level
+    // AEAD tamper defense covers certificate-mode records exactly like it
+    // already covers EncryptedExtensions/Finished.
+    try testing.expectError(error.DecryptionFailed, client.handleFlight(tampered[0..flight2.out.len], rnd, 0, &buf1));
+}
+
+test "cert-mode: peer chain signed by an UNTRUSTED anchor is rejected" {
+    const psk_identity = "device-042";
+    const psk = "a-shared-pre-shared-key";
+    const cfg_client = Config{
+        .role = .client,
+        .psk_identity = psk_identity,
+        .psk = psk,
+        .cipher_suites = &.{.aes_128_gcm_sha256},
+        // The client trusts a DIFFERENT anchor than the one that actually
+        // signed the server's leaf (cert_kat.anchor_cert_der) — the real
+        // "wrong/untrusted peer chain" case.
+        .peer_verify = .{ .trust_anchor = &cert_kat.evil_anchor_cert_der },
+        .now_sec = cert_kat.valid_now_sec,
+    };
+    const cfg_server = Config{
+        .role = .server,
+        .psk_identity = psk_identity,
+        .psk = psk,
+        .cipher_suites = &.{.aes_128_gcm_sha256},
+        .cert = .{
+            .chain = &.{&cert_kat.server_cert_der},
+            .private_key = serverEcdsaKeyPair(),
+            .signature_scheme = .ecdsa_secp256r1_sha256,
+        },
+    };
+    var client = try Connection.clientInit(cfg_client);
+    var server = try Connection.serverInit(cfg_server);
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x63} ** 32);
+    const rnd = testRandom(&csprng);
+    var buf1: [2048]u8 = undefined;
+    var buf2: [2048]u8 = undefined;
+
+    const ch = try client.startHandshake(rnd, 0, &buf1);
+    const flight2 = try server.handleFlight(ch, rnd, 0, &buf2);
+    try testing.expectError(error.CertificateRejected, client.handleFlight(flight2.out, rnd, 0, &buf1));
+}
+
+test "cert-mode: require_peer_cert rejects a server that presents no certificate at all" {
+    const psk_identity = "device-042";
+    const psk = "a-shared-pre-shared-key";
+    const cfg_client = Config{
+        .role = .client,
+        .psk_identity = psk_identity,
+        .psk = psk,
+        .cipher_suites = &.{.aes_128_gcm_sha256},
+        .peer_verify = .{ .trust_anchor = &cert_kat.anchor_cert_der },
+        .now_sec = cert_kat.valid_now_sec,
+        .require_peer_cert = true,
+    };
+    // Server has NO `cert` configured — plain PSK response, as if it were a
+    // PSK-only server the client mistakenly expected certificate auth from.
+    const cfg_server = Config{ .role = .server, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} };
+    var client = try Connection.clientInit(cfg_client);
+    var server = try Connection.serverInit(cfg_server);
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x64} ** 32);
+    const rnd = testRandom(&csprng);
+    var buf1: [2048]u8 = undefined;
+    var buf2: [2048]u8 = undefined;
+
+    const ch = try client.startHandshake(rnd, 0, &buf1);
+    const flight2 = try server.handleFlight(ch, rnd, 0, &buf2);
+    try testing.expectError(error.PeerCertificateRequired, client.handleFlight(flight2.out, rnd, 0, &buf1));
+}
+
+test "cert-mode: CertificateRequest -> client presents its own cert -> mutual auth completes" {
+    const psk_identity = "device-042";
+    const psk = "a-shared-pre-shared-key";
+    const cfg_client = Config{
+        .role = .client,
+        .psk_identity = psk_identity,
+        .psk = psk,
+        .cipher_suites = &.{.aes_128_gcm_sha256},
+        .peer_verify = .{ .trust_anchor = &cert_kat.anchor_cert_der },
+        .now_sec = cert_kat.valid_now_sec,
+        .cert = .{
+            .chain = &.{&cert_kat.client_cert_der},
+            .private_key = clientEcdsaKeyPair(),
+            .signature_scheme = .ecdsa_secp256r1_sha256,
+        },
+    };
+    const cfg_server = Config{
+        .role = .server,
+        .psk_identity = psk_identity,
+        .psk = psk,
+        .cipher_suites = &.{.aes_128_gcm_sha256},
+        .cert = .{
+            .chain = &.{&cert_kat.server_cert_der},
+            .private_key = serverEcdsaKeyPair(),
+            .signature_scheme = .ecdsa_secp256r1_sha256,
+        },
+        .peer_verify = .{ .trust_anchor = &cert_kat.anchor_cert_der },
+        .now_sec = cert_kat.valid_now_sec,
+        .request_client_cert = true,
+        .require_peer_cert = true,
+    };
+    var client = try Connection.clientInit(cfg_client);
+    var server = try Connection.serverInit(cfg_server);
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x65} ** 32);
+    var buf1: [2048]u8 = undefined;
+    var buf2: [2048]u8 = undefined;
+
+    try driveHandshake(&client, &server, testRandom(&csprng), &buf1, &buf2);
+
+    try testing.expectEqualSlices(u8, client.write_keys.key[0..client.write_keys.key_len], server.read_keys.key[0..server.read_keys.key_len]);
+
+    var wire: [256]u8 = undefined;
+    var plain: [256]u8 = undefined;
+    const rec = try server.send("ack from mutually-authenticated server", &wire);
+    const got = try client.recv(rec, &plain);
+    try testing.expectEqualSlices(u8, "ack from mutually-authenticated server", got);
+}
+
+test "cert-mode: server requires a client cert but client has none configured -> rejected" {
+    const psk_identity = "device-042";
+    const psk = "a-shared-pre-shared-key";
+    const cfg_client = Config{
+        .role = .client,
+        .psk_identity = psk_identity,
+        .psk = psk,
+        .cipher_suites = &.{.aes_128_gcm_sha256},
+        // No `cert` -> the client will answer CertificateRequest with an
+        // empty Certificate (RFC 8446 §4.4.2's "no certificate available").
+    };
+    const cfg_server = Config{
+        .role = .server,
+        .psk_identity = psk_identity,
+        .psk = psk,
+        .cipher_suites = &.{.aes_128_gcm_sha256},
+        .cert = .{
+            .chain = &.{&cert_kat.server_cert_der},
+            .private_key = serverEcdsaKeyPair(),
+            .signature_scheme = .ecdsa_secp256r1_sha256,
+        },
+        .request_client_cert = true,
+        .require_peer_cert = true,
+    };
+    var client = try Connection.clientInit(cfg_client);
+    var server = try Connection.serverInit(cfg_server);
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x66} ** 32);
+    const rnd = testRandom(&csprng);
+    var buf1: [2048]u8 = undefined;
+    var buf2: [2048]u8 = undefined;
+
+    const ch = try client.startHandshake(rnd, 0, &buf1);
+    const flight2 = try server.handleFlight(ch, rnd, 0, &buf2);
+    const client_fin = try client.handleFlight(flight2.out, rnd, 0, &buf1);
+    try testing.expect(client_fin.done); // the client itself completes fine (it made a valid RFC 8446 "no cert" reply)
+
+    try testing.expectError(error.PeerCertificateRequired, server.handleFlight(client_fin.out, rnd, 0, &buf2));
+}
+
+test "cert-mode: PSK-only Config fields (cert=null, peer_verify=.none) reproduce plain PSK behavior byte-for-byte" {
+    // Regression proof that certificate mode is genuinely additive: a
+    // Config with every cert-mode field at its default drives an IDENTICAL
+    // wire flight to the original PSK-only engine (same suite/psk/identity
+    // as `loopbackHandshake`'s own AES-128-GCM case).
+    const psk_identity = "device-042";
+    const psk = "a-shared-pre-shared-key";
+    const cfg_client = Config{ .role = .client, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} };
+    const cfg_server = Config{ .role = .server, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} };
+    var client = try Connection.clientInit(cfg_client);
+    var server = try Connection.serverInit(cfg_server);
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x10} ** 32);
+    var buf1: [1500]u8 = undefined;
+    var buf2: [1500]u8 = undefined;
+
+    try driveHandshake(&client, &server, testRandom(&csprng), &buf1, &buf2);
     try testing.expectEqual(State.connected, client.state);
     try testing.expectEqual(State.connected, server.state);
 }

@@ -1,12 +1,19 @@
 // SPDX-License-Identifier: MIT
 
-//! dtls — DTLS 1.3 (RFC 9147), PRE-SHARED-KEY (PSK) mode only. No X.509/
-//! certificate path (this collection's certificate-chain validator, the
-//! `x509` module, is itself a scaffold — see its SPEC.md — and PSK mode
-//! needs no certificates at all, which is exactly why this module targets
-//! it first). Intended transport for the `coap` module's secure-UDP needs
-//! (IoT/SCADA fleet management: CoAP-over-DTLS is RFC 7925's constrained-
-//! device profile).
+//! dtls — DTLS 1.3 (RFC 9147). The key exchange is PSK-only (psk_ke — no
+//! (EC)DHE, see "Certificate mode" below for exactly why); an ADDITIVE
+//! certificate-mode AUTHENTICATION layer (RFC 8446 §4.4 Certificate/
+//! CertificateVerify/CertificateRequest) sits on top of that unchanged PSK
+//! key exchange — see `Connection.zig`'s "certificate mode" section for the
+//! full design + deferred-scope notes. Deliberately does NOT depend on this
+//! collection's separate `x509` certificate-chain-validator scaffold (own
+//! module, own SPEC.md) — certificate mode here reuses `std.crypto
+//! .Certificate` + this module's existing `rsa` dependency directly
+//! (`certauth.zig`). Intended transport for the `coap` module's secure-UDP
+//! needs (IoT/SCADA fleet management: CoAP-over-DTLS is RFC 7925's
+//! constrained-device profile) — the PSK+certificate combination in
+//! particular targets devices provisioned with both a shared secret AND a
+//! per-device X.509 identity.
 //!
 //! **What is implemented and validated (crypto core, real — no stubs):**
 //! - The full TLS-1.3/DTLS-1.3 PSK key schedule (`keyschedule.zig`):
@@ -53,25 +60,49 @@
 //!   real peer expects for version negotiation. Closing these (plus
 //!   cross-`handleFlight` fragment reassembly, currently single-fragment
 //!   only) is the remaining work before an OpenSSL `s_server -dtls1_3 -psk`
-//!   live-interop test.
+//!   live-interop test. Certificate mode inherits the same self-interop-only
+//!   caveat, plus its own — see `Connection.zig`'s "certificate mode"
+//!   section.
+//!
+//! **Certificate mode (RFC 8446 §4.4, ADDITIVE):** `Connection.Config` gains
+//! optional `cert`/`peer_verify`/`request_client_cert`/`require_peer_cert`/
+//! `now_sec` fields (all default to the original PSK-only behavior). When
+//! set, the flight engine sends/verifies real Certificate +
+//! CertificateVerify (+ optionally CertificateRequest for mutual auth)
+//! messages, reusing `certverify.sign`/`.verify` for the signature and
+//! `certauth.zig` (a `std.crypto.Certificate` + this module's `rsa`
+//! dependency bridge — no new module dependency) for DER parsing and a
+//! minimal one-hop chain-to-trust-anchor check. The PSK still supplies ALL
+//! session-key material unchanged (this engine has no (EC)DHE key-share
+//! machinery — real new crypto, out of scope); certificates add a real
+//! signature-based identity check ON TOP, not a replacement key exchange.
+//! See `Connection.zig`'s "certificate mode" section for the full design
+//! rationale and every deferred piece (signature_algorithms negotiation,
+//! full RFC 5280 path building, CertificateEntry extensions), and
+//! `certauth.zig`'s module doc "KNOWN GAP" note — `std.crypto.Certificate
+//! .parse` is confirmed (by fuzzing) NOT panic-safe against adversarial DER
+//! in Zig 0.16, which this module inherits and cannot fix without a
+//! from-scratch hardened parser.
 //!
 //! **What is real framing (used directly by the flight engine, not just
 //! unit-tested in isolation):** the unified + legacy record headers
 //! (`record.zig`), handshake message framing + fragmentation/reassembly
 //! (`handshake.zig`), the RFC 9147 §7 ACK message + caller-clocked
 //! retransmission timer + flight bookkeeping (`flight.zig`), and
-//! ClientHello/ServerHello/EncryptedExtensions/Finished/HRR message bodies
-//! incl. the PSK extensions (`messages.zig`).
+//! ClientHello/ServerHello/EncryptedExtensions/Finished/HRR/Certificate/
+//! CertificateVerify/CertificateRequest message bodies incl. the PSK
+//! extensions (`messages.zig`).
 //!
 //! **Out of scope (deliberate, not deferred-as-a-stub):** HelloRetryRequest
 //! / the stateless-cookie retry round trip (a HelloRetryRequest ServerHello
 //! is detected — RFC 8446 §4.1.3's magic `random` — and rejected with a
 //! typed error rather than silently mishandled); 0-RTT/early data; session
-//! resumption (`res binder`/NewSessionTicket); key update
-//! (RFC 8446 §4.6.3); X.509/certificate auth (this module is PSK-only by
-//! design, see above); and the CCM suites (Zig 0.16 std ships only a
-//! 13-byte-nonce CCM; the TLS/DTLS profile needs 12 — see `aead.zig`'s CCM
-//! caveat).
+//! resumption (`res binder`/NewSessionTicket); key update (RFC 8446
+//! §4.6.3); a genuine (EC)DHE-based, PSK-less certificate-ONLY key exchange
+//! (certificate mode as implemented AUTHENTICATES on top of the existing
+//! PSK key exchange — see above — rather than replacing it); and the CCM
+//! suites (Zig 0.16 std ships only a 13-byte-nonce CCM; the TLS/DTLS
+//! profile needs 12 — see `aead.zig`'s CCM caveat).
 //!
 //! **AEAD/CCM recon correction:** the scaffold claimed "AES-CCM is NOT a std
 //! gap." That is true for a 13-byte nonce but WRONG for the TLS/DTLS 1.3
@@ -138,14 +169,19 @@ pub const engine = @import("engine.zig");
 pub const connection = @import("Connection.zig");
 
 /// TLS/DTLS 1.3 CertificateVerify signature construction (RFC 8446 §4.4.3,
-/// reused verbatim by DTLS 1.3 -- RFC 9147 does not redefine it). Purely
-/// additive and self-contained: it does not touch, call into, or get called
-/// by the PSK flight engine above (`connection`/`messages`/`keyschedule`/
-/// `engine`) or the handshake state machine -- see `certverify.zig`'s module
-/// doc comment for its scope. Standalone verify/sign only; wiring it into a
-/// full cert-mode handshake flow (which this module's PSK engine does not
-/// have) is future work.
+/// reused verbatim by DTLS 1.3 -- RFC 9147 does not redefine it). Standalone
+/// sign/verify over a caller-supplied transcript hash + typed key -- no
+/// wire framing, no X.509 DER handling. Wired into the actual handshake by
+/// `connection`/`certauth` (see the "Certificate mode" section below).
 pub const certverify = @import("certverify.zig");
+
+/// The bridge between raw X.509 DER bytes (as carried in a `Certificate`
+/// wire message) and `certverify`'s typed `PublicKey`, plus a minimal
+/// chain-to-trust-anchor check -- see `certauth.zig`'s module doc comment,
+/// including its "KNOWN GAP" note (std's own DER parser is not panic-safe
+/// against adversarial input in Zig 0.16 -- read before feeding
+/// PEER-supplied certificate bytes through this in a live deployment).
+pub const certauth = @import("certauth.zig");
 
 pub const Connection = connection.Connection;
 pub const Config = connection.Config;
@@ -184,6 +220,7 @@ test {
     _ = engine;
     _ = connection;
     _ = certverify;
+    _ = certauth;
 }
 
 test "meta.deps is {\"rsa\"} (only certverify.zig's RSASSA-PSS dispatch needs it; the PSK flight engine itself needs no sibling modules)" {
