@@ -304,6 +304,12 @@ pub const SignError = BuildContentError || error{
     RandomRequired,
     /// `out` is shorter than the scheme's exact signature length.
     BufferTooSmall,
+    /// The RSA-CRT private operation's Bellcore fault-check (`rsa` re-encrypts
+    /// `m^e ≡ c` before releasing the signature, RFC-8017-adjacent hardening)
+    /// detected a corrupted computation. The signature is NOT produced — a
+    /// hardware fault or fault-injection attack was caught. Security event,
+    /// never a benign size/config error.
+    FaultDetected,
 };
 
 /// Produces a CertificateVerify signature over the RFC 8446 §4.4.3 signed
@@ -422,6 +428,10 @@ fn signRsaPss(scheme: SignatureScheme, sk: rsa.SecretKey, content: []const u8, r
         // -- impossible for any TLS-realistic key size, and a size problem
         // either way, so it maps to the same size error.
         error.EncodedMessageTooShort => error.BufferTooSmall,
+        // Bellcore fault-check tripped inside the RSA-CRT private op: the
+        // signature is withheld. Propagate as a distinct security signal, not
+        // a size error.
+        error.FaultDetected => error.FaultDetected,
     };
 }
 
