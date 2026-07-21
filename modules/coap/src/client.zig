@@ -242,8 +242,8 @@ test "buildRequest: URI + content-format + accept → a parseable request" {
     try testing.expectEqualStrings("42", msg.payload);
 
     try testing.expectEqualStrings("sensor.local", findOption(msg, opt.number.uri_host).?);
-    try testing.expectEqual(@as(?u16, opt.content_format.text_plain), opt.contentFormat(msg));
-    try testing.expectEqual(@as(?u16, opt.content_format.json), opt.accept(msg));
+    try testing.expectEqual(@as(?u16, opt.content_format.text_plain), try opt.contentFormat(msg));
+    try testing.expectEqual(@as(?u16, opt.content_format.json), try opt.accept(msg));
     var path = opt.uriPath(msg);
     try testing.expectEqualStrings("a", path.next().?);
     try testing.expectEqualStrings("b", path.next().?);
