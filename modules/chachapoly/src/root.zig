@@ -140,6 +140,12 @@ pub const ChaCha20 = struct {
     /// writing to `out`. `out.len == in.len`. NOT authenticated on its own.
     pub fn xor(out: []u8, in: []const u8, counter: u32, key: [key_length]u8, nonce: [nonce_length]u8) void {
         std.debug.assert(out.len == in.len);
+        // RFC 8439 §2.3: the 32-bit block counter must not wrap. A wrap restarts
+        // the keystream and reuses it (two-time-pad), silently destroying
+        // confidentiality. Reject in safe builds — matches the assert in
+        // std.crypto.stream.chacha; a caller streaming past the counter space
+        // must re-key or advance the nonce.
+        std.debug.assert(@as(u64, (in.len + 63) / 64) + counter <= (@as(u64, 1) << 32));
         const k = keyToWords(key);
         const n = nonceToWords(nonce);
         var ctr = counter;
@@ -162,6 +168,8 @@ pub const ChaCha20 = struct {
 
     /// Write the raw ChaCha20 keystream (starting at block `counter`) into `out`.
     pub fn stream(out: []u8, counter: u32, key: [key_length]u8, nonce: [nonce_length]u8) void {
+        // See `xor`: the 32-bit block counter must not wrap (keystream reuse).
+        std.debug.assert(@as(u64, (out.len + 63) / 64) + counter <= (@as(u64, 1) << 32));
         const k = keyToWords(key);
         const n = nonceToWords(nonce);
         var ctr = counter;
@@ -233,7 +241,12 @@ pub const ChaCha20Poly1305 = struct {
 
         if (!std.crypto.timing_safe.eql([tag_length]u8, computed_tag, tag)) {
             std.crypto.secureZero(u8, &computed_tag);
-            @memset(m, undefined);
+            // Honour the doc contract: actually zero `m` on auth failure. std uses
+            // `@memset(m, undefined)` (a no-op hint elided in ReleaseFast); a
+            // `secureZero` makes the "m is zeroed" promise true in every build and
+            // clears any caller-preloaded bytes without leaking plaintext (which
+            // this path never wrote — the keystream xor below is post-check).
+            std.crypto.secureZero(u8, m);
             return error.AuthenticationFailed;
         }
         ChaCha20.xor(m[0..c.len], c, 1, k, npub);
@@ -456,5 +469,36 @@ test "counter increment across the wide/tail boundary (>8 blocks)" {
     var theirs: [20 * 64]u8 = undefined;
     ChaCha20.stream(&ours, 12345, key, nonce);
     StdChaCha.stream(&theirs, 12345, key, nonce);
+    try testing.expectEqualSlices(u8, &theirs, &ours);
+}
+
+test "decrypt zeroes the output buffer on authentication failure (audit F3)" {
+    // The doc promises `m` is zeroed on failure; make it observable. Pre-load `m`
+    // with a sentinel, feed a tampered tag, and assert every byte is zero after
+    // the rejection (goes RED if the secureZero is dropped back to memset-undefined).
+    const key = [_]u8{3} ** 32;
+    const nonce = [_]u8{5} ** 12;
+    const msg = "sensitive plaintext bytes";
+    var c: [msg.len]u8 = undefined;
+    var tag: [16]u8 = undefined;
+    ChaCha20Poly1305.encrypt(&c, &tag, msg, "", nonce, key);
+
+    var m = [_]u8{0xAA} ** msg.len; // caller sentinel
+    var bad_tag = tag;
+    bad_tag[0] +%= 1;
+    try testing.expectError(error.AuthenticationFailed, ChaCha20Poly1305.decrypt(&m, &c, bad_tag, "", nonce, key));
+    for (m) |b| try testing.expectEqual(@as(u8, 0), b);
+}
+
+test "counter space boundary: the last non-wrapping block is accepted (audit F1)" {
+    // A request that exactly consumes the remaining 32-bit counter space must
+    // succeed; one more block would trip the anti-wrap assert (see `xor`). Here
+    // counter = 2^32 - 1 with a single 64-byte block uses the last valid counter.
+    const key = [_]u8{1} ** 32;
+    const nonce = [_]u8{2} ** 12;
+    var ours: [64]u8 = undefined;
+    var theirs: [64]u8 = undefined;
+    ChaCha20.stream(&ours, 0xFFFF_FFFF, key, nonce);
+    StdChaCha.stream(&theirs, 0xFFFF_FFFF, key, nonce);
     try testing.expectEqualSlices(u8, &theirs, &ours);
 }
