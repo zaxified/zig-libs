@@ -1,9 +1,11 @@
 # zipstream
 
-Streaming **ZIP** archive reader: walk the central directory once, then
-stream each member's *decompressed* bytes on demand. No whole-archive or
-whole-entry buffering — memory use is O(one decompression window) regardless
-of archive or entry size.
+Streaming **ZIP** archive reader and writer. The reader walks the central
+directory once, then streams each member's *decompressed* bytes on demand. No
+whole-archive or whole-entry buffering — memory use is O(one decompression
+window) regardless of archive or entry size. The writer (`ArchiveWriter`)
+appends one member at a time (`addEntry` then `finish()`), streaming
+local-header+data straight to the caller's output as each entry is added.
 
 - A streaming ZIP reader; an .xlsx is a ZIP of XML
   parts, and it streams zipped `.csv` members without exposing ZIP internals
@@ -11,11 +13,12 @@ of archive or entry size.
 - **Model after:** the ZIP central-directory layout in APPNOTE.TXT (the
   public PKWARE ZIP spec) — behavior only, no third-party source.
 - **Platform:** `any` (pure `std.Io`/`std.zip`/`std.compress.flate`, no OS-
-  specific code). **Role:** codec (reader only — no ZIP writing).
+  specific code). **Role:** codec (reader + writer).
   **Concurrency:** reentrant — one `Archive` owns one file cursor; no
   globals, no shared state between instances.
 - **Deps:** none (std only — `std.zip` for the wire structs/central-directory
-  walk, `std.compress.flate` for Deflate).
+  walk, `std.compress.flate` for Deflate, `std.hash.Crc32` for the writer's
+  per-entry checksum).
 
 Provenance: original work of the zig-libs authors (MIT). The wire
 format is the public PKWARE ZIP spec (APPNOTE.TXT) — no third-party source
@@ -59,6 +62,27 @@ while (true) {
 `interface`, the inflate stream's input handle) — initialize both in place
 via a `*Self` and never move them after `init`.
 
+### Writing
+
+```zig
+var aw: std.Io.Writer.Allocating = .init(gpa); // or a file's buffered writer
+defer aw.deinit();
+
+var zw = zipstream.ArchiveWriter.init(gpa, &aw.writer);
+defer zw.deinit();
+
+try zw.addEntry("hello.txt", "hello, world\n", .{ .method = .store });
+try zw.addEntry("data/report.csv", csv_bytes, .{ .method = .deflate });
+try zw.finish();
+// aw.writer.buffered() now holds a complete, valid ZIP archive.
+```
+
+`ArchiveWriter` is not self-referential (unlike `Archive`/`EntryReader`) — it
+may be moved freely. Entry names are gated through `isSafeEntryName` on the
+way in, so a zip-slip name (`../..`, absolute, drive-relative) is rejected at
+`addEntry` rather than written. Classic (non-zip64) format only — see
+"Ceiling" below.
+
 ## Design notes
 
 - **Local header, not central.** Data offsets are resolved by reading the
@@ -74,22 +98,26 @@ via a `*Self` and never move them after `init`.
 
 ## Ceiling (documented, not a bug)
 
-- **No zip64** — archives or entries over 4 GiB (32-bit central-directory
-  fields only). `std.zip.Iterator` itself won't reject a zip64 archive at
-  this layer's call sites; treat totals near 4 GiB as unsupported.
-- **No encrypted entries** — `std.zip.Iterator` already rejects these
-  (`error.ZipEncryptionUnsupported`).
+- **zip64 reading is supported** (archives/entries over 4 GiB, or archives
+  with more than 65535 central-directory records) — `std.zip.Iterator`
+  itself resolves the zip64 EOCD/locator and each entry's zip64 extra field
+  before `Archive`/`EntryReader` ever see the (already 64-bit) sizes/offsets.
+  **zip64 *writing* is not implemented** — `ArchiveWriter` emits classic
+  (non-zip64) archives only, and returns `Error.ZipWriteTooLarge` rather than
+  silently truncating a field that would overflow the 32/16-bit format.
+- **No encrypted entries** — `std.zip.Iterator` already rejects these on
+  read (`error.ZipEncryptionUnsupported`); `ArchiveWriter` doesn't offer
+  encryption either.
 - **Store + Deflate only** — the two methods ordinary zip tools and Excel
-  emit. Any other method (bzip2, LZMA, ...) is
-  `error.UnsupportedCompressionMethod`.
-- **Read-only** — no ZIP writing.
+  emit, for both reading and writing. Any other read method (bzip2, LZMA,
+  ...) is `error.UnsupportedCompressionMethod`.
 
 ## Deferred (not built)
 
-- zip64 (archives/entries > 4 GiB)
-- Encrypted entries
+- zip64 **writing** (reading is fully supported — see "Ceiling" above)
+- Encrypted entries (no consumer needs them; legacy ZipCrypto is
+  cryptographically broken and not worth adding even read-only)
 - Compression methods beyond Store/Deflate (bzip2, LZMA, ...)
-- ZIP writing
 
 ## Testing
 
@@ -110,3 +138,12 @@ covering:
 - a central-directory size that lies beyond the physical file (simulated
   truncation/corruption of just one entry's bookkeeping) — reading it out
   hits `error.EndOfStream` cleanly instead of looping or over-reading
+- `buildZip64` hand-builds a zip64-escaped archive (0xFFFFFFFF placeholders +
+  real sizes/offset in a zip64 extra field, plus a zip64 EOCD + locator ahead
+  of the classic EOCD) for both Store and Deflate members — exercises
+  `std.zip.Iterator`'s zip64 path without a multi-gigabyte fixture
+- `ArchiveWriter`: a Store + Deflate archive written by this module round-trips
+  byte-for-byte back through its own `Archive`/`EntryReader`, with the written
+  CRC-32/sizes cross-checked independently via `std.zip.Iterator` directly (so
+  a wrong field can't hide behind a lenient reader); `addEntry` rejects
+  zip-slip names
