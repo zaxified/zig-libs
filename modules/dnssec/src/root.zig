@@ -15,7 +15,9 @@
 //! original-TTL handling (`canonical.buildSignedData`), the DS-to-DNSKEY
 //! delegation link (`chain.validateDnskeySet`), the NSEC3 closest-encloser /
 //! next-closer denial-of-existence proof incl. Opt-Out (`nsec3.proveDenial`),
-//! and the top-level per-RRset verdict (`validate`).
+//! the plain-NSEC (non-NSEC3) denial proof — canonical-order gap coverage,
+//! NODATA, wildcard, and insecure-delegation (`nsec.proveDenial`) — and the
+//! top-level per-RRset verdict (`validate`).
 //!
 //! Oracle: the signature/denial cores are validated against real zones signed
 //! by `ldns-signzone` across algorithms 8/13/14/15 (RSA-SHA256, ECDSA-P256,
@@ -24,8 +26,9 @@
 //! `ldns-verify-zone`. A valid RRSIG only verifies over byte-exact canonical
 //! data, so signature verification is itself the byte-exactness oracle; the
 //! matching tampered cases yield `.bogus`. See `oracle_test.zig` +
-//! `oracle_vectors.zig`. Not yet covered: plain-NSEC (non-NSEC3) denial-proof
-//! logic (only NSEC *signatures* are validated), RFC 8624 algorithm-downgrade
+//! `oracle_vectors.zig`. The plain-NSEC denial proof (`nsec.proveDenial`) is
+//! unit-tested (RFC 4034 §6.1 ordering + positive/adversarial cases), not yet
+//! `ldns`-oracle-verified. Not yet covered: RFC 8624 algorithm-downgrade
 //! policy, and RFC 9276 NSEC3 iteration caps — see SPEC.md.
 //!
 //! Consumer: a secure-resolver module in the net family (not yet built),
@@ -56,6 +59,11 @@ pub const rdata = @import("rdata.zig");
 /// denial-of-existence proof (`proveDenial`) — real, oracle-verified.
 pub const nsec3 = @import("nsec3.zig");
 
+/// Plain NSEC (non-NSEC3) denial-of-existence proof (`proveDenial`):
+/// canonical-order gap coverage, NODATA, wildcard, and insecure-delegation
+/// (RFC 4035 §5.4, RFC 4034 §6.1) — real, tested.
+pub const nsec = @import("nsec.zig");
+
 /// Per-algorithm DNSKEY decode + signature verification — real, tested.
 pub const keys = @import("keys.zig");
 
@@ -73,6 +81,7 @@ test {
     _ = wire;
     _ = rdata;
     _ = nsec3;
+    _ = nsec;
     _ = keys;
     _ = ds;
     _ = canonical;

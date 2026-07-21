@@ -19,11 +19,14 @@ validated against an `ldns`-signed, `ldns-verify-zone`-cross-checked oracle
 (algorithms 8/13/14/15; NSEC + NSEC3 + Opt-Out; wildcard; NODATA + NXDOMAIN)
 — see README.md "Validation core" + `src/oracle_test.zig`.
 
-Out of scope in this module (see "Threat model" below): plain-NSEC
-denial-of-existence *proof* logic (NSEC *signatures* are validated, but the
-NSEC-based NXDOMAIN/NODATA reasoning analogous to `nsec3.proveDenial` is not
-built), RFC 8624 algorithm-downgrade policy, RFC 9276 NSEC3 iteration caps,
-and the multi-zone-cut resolver orchestration.
+The plain-NSEC (non-NSEC3) denial proof analogous to `nsec3.proveDenial` IS now
+built (`nsec.proveDenial`: RFC 4035 §5.4 gap coverage over the RFC 4034 §6.1
+canonical name order, NODATA, wildcard, and insecure-delegation), unit-tested
+but not yet `ldns`-oracle-verified the way the NSEC3 proof is.
+
+Out of scope in this module (see "Threat model" below): RFC 8624
+algorithm-downgrade policy, RFC 9276 NSEC3 iteration caps, and the
+multi-zone-cut resolver orchestration.
 
 - **Bounds-checked, no panics on attacker input.** `rdata.zig`/`wire.zig`
   follow the same discipline as `dns.message`: malformed RDATA is a typed
@@ -75,9 +78,12 @@ The `.secure`/`.bogus` verdict IS attackable now, so:
     `iteratedHash` honour whatever iteration count the record carries; there
     is no cap, so a malicious high count is an amplification vector. A
     consumer must reject/limit per RFC 9276 (recommended: 0).
-  - **Plain-NSEC denial proof.** Only NSEC *signatures* are validated; the
-    NSEC-based NXDOMAIN/NODATA proof (the analogue of `nsec3.proveDenial`) is
-    not implemented.
+  - **Plain-NSEC denial proof.** `nsec.proveDenial` implements the NSEC-based
+    NXDOMAIN/NODATA/wildcard/insecure-delegation reasoning (the analogue of
+    `nsec3.proveDenial`) over the RFC 4034 §6.1 canonical name order. Like the
+    NSEC3 proof it assumes the NSEC RRs were already signature-validated
+    (`validate`); it verifies the *logic* of the denial, not the RRs' own
+    authenticity. Unit-tested, not yet `ldns`-oracle-verified.
   - **Opt-Out** is handled (`proveDenial` downgrades an opt-out NXDOMAIN to
     `.insecure` rather than asserting secure non-existence), but the wider
     "opt-out cannot hide an otherwise-signed delegation" property is the

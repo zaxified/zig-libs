@@ -13,7 +13,9 @@ module — no crypto primitive is reimplemented here), the RFC 4034 §3.1.8.1
 canonical signed-data construction (`canonical.buildSignedData`, incl.
 wildcard-name + original-TTL handling), the DS→DNSKEY delegation link
 (`chain.validateDnskeySet`), the NSEC3 denial-of-existence proof incl.
-Opt-Out (`nsec3.proveDenial`), and the top-level per-RRset `validate` verdict.
+Opt-Out (`nsec3.proveDenial`), the plain-NSEC (non-NSEC3) denial-of-existence
+proof — canonical-order gap coverage, NODATA, wildcard, and insecure-delegation
+(`nsec.proveDenial`) — and the top-level per-RRset `validate` verdict.
 
 Verified against real zones signed by `ldns-signzone` across algorithms
 **8/13/14/15** (RSA-SHA256, ECDSA-P256, ECDSA-P384, Ed25519) with both **NSEC
@@ -23,10 +25,12 @@ over byte-exact canonical data, so a `.secure` verdict on those vectors is
 itself the byte-exactness proof; the matching tampered cases return `.bogus`.
 See `src/oracle_test.zig` + `src/oracle_vectors.zig`.
 
-**Not (yet) implemented:** plain-NSEC (non-NSEC3) denial-of-existence *proof*
-logic — only NSEC *signatures* are validated, not NSEC-based NXDOMAIN/NODATA
-reasoning; RFC 8624 algorithm-downgrade policy; and RFC 9276 NSEC3
-iteration-count caps. See SPEC.md "Threat model / out of scope". The
+**Not (yet) implemented:** RFC 8624 algorithm-downgrade policy; and RFC 9276
+NSEC3 iteration-count caps. The plain-NSEC (non-NSEC3) denial proof
+(`nsec.proveDenial`) is implemented and unit-tested against the RFC 4034 §6.1
+canonical ordering plus positive/adversarial cases, but is not yet
+`ldns`-oracle-verified the way the NSEC3 proof is. See SPEC.md "Threat model /
+out of scope". The
 multi-zone-cut resolver that walks the chain root→TLD→… is also out of scope
 (this module is one cut — see `chain.zig`).
 
@@ -46,6 +50,7 @@ multi-zone-cut resolver that walks the chain root→TLD→… is also out of sco
 | `src/wire.zig` | Uncompressed name decode (RRSIG signer name / NSEC next name) + canonical name encoding (RFC 4034 §6.2) | real, tested |
 | `src/rdata.zig` | DNSKEY/RRSIG/DS/NSEC/NSEC3/NSEC3PARAM RDATA parsing, Type Bit Maps, key tag | real, tested |
 | `src/nsec3.zig` | base32hex (RFC 4648 §7) + NSEC3 iterated-SHA-1 hash (RFC 5155 §5); closest-encloser / next-closer denial proof incl. Opt-Out (RFC 5155 §8) | real, oracle-verified |
+| `src/nsec.zig` | plain-NSEC (non-NSEC3) denial proof (RFC 4035 §5.4): canonical-order gap coverage (RFC 4034 §6.1), NODATA, wildcard, insecure-delegation | real, tested |
 | `src/keys.zig` | DNSKEY public-key wire decode (RFC 3110/6605/8080) + per-algorithm signature verify dispatch | real, tested |
 | `src/ds.zig` | DS digest computation (RFC 4034 §5.1.4) + DNSKEY matching | real, tested |
 | `src/canonical.zig` | RFC 4034 §3.1.8.1 canonical RRset signed-data construction (wildcard + original-TTL + embedded-name lowering) | real, oracle-verified |
