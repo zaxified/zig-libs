@@ -1262,3 +1262,21 @@ test "HandshakeState: reading a truncated message fails cleanly" {
     // First NN message needs at least DHLEN bytes for the `e` token.
     try testing.expectError(error.MessageTooShort, rsp.readMessage(&[_]u8{1} ** 16, &plain));
 }
+
+fn fuzzReadMessage(_: void, smith: *std.testing.Smith) !void {
+    var msg: [256]u8 = undefined;
+    smith.bytes(&msg);
+    const len: usize = smith.valueRangeAtMost(u16, 0, msg.len);
+    const S = TestSuite;
+    var rsp: S.HandshakeState = .{};
+    rsp.initialize(patterns.NN, false, "", null, null, null, null, &.{});
+    var out: [256]u8 = undefined;
+    // The wire-facing decoder for an in-progress handshake: arbitrary bytes
+    // must only ever yield a typed error (short message / bad auth tag /
+    // handshake already complete), never a panic or OOB write into `out`.
+    _ = rsp.readMessage(msg[0..len], &out) catch return;
+}
+
+test "fuzz: HandshakeState.readMessage never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzReadMessage, .{});
+}

@@ -873,6 +873,36 @@ test "order/authz JSON parsing tolerates unknown fields, rejects junk" {
     try testing.expectError(error.MalformedResponse, parseAuthz(a, "<html>oops</html>"));
 }
 
+fn fuzzParseOrder(_: void, smith: *std.testing.Smith) !void {
+    var buf: [512]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // The CA's order-response JSON decoder: arbitrary bytes must only ever
+    // yield a typed error, never a panic/OOB.
+    _ = parseOrder(arena.allocator(), buf[0..len]) catch return;
+}
+
+test "fuzz: parseOrder never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzParseOrder, .{});
+}
+
+fn fuzzParseAuthz(_: void, smith: *std.testing.Smith) !void {
+    var buf: [512]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // The CA's authorization-response JSON decoder: same contract as
+    // parseOrder above.
+    _ = parseAuthz(arena.allocator(), buf[0..len]) catch return;
+}
+
+test "fuzz: parseAuthz never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzParseAuthz, .{});
+}
+
 test "Responder: set/lookup/remove semantics under copies" {
     var r = Responder.init(testing.allocator);
     defer r.deinit();

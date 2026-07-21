@@ -4148,3 +4148,77 @@ test "bench: montint vs ff (opt-in via RSA_BENCH)" {
     benchRsa(2048, random);
     benchRsa(4096, random);
 }
+
+// ── fuzz: every untrusted-wire key parser must reject, never panic ─────────
+
+fn fuzzPublicKeyFromDer(_: void, smith: *std.testing.Smith) !void {
+    var buf: [1024]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const pk = PublicKey.fromDer(buf[0..len]) catch return;
+    _ = pk;
+}
+
+test "fuzz: PublicKey.fromDer never panics" {
+    try testing.fuzz({}, fuzzPublicKeyFromDer, .{});
+}
+
+fn fuzzSecretKeyFromDer(_: void, smith: *std.testing.Smith) !void {
+    var buf: [1024]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const sk = SecretKey.fromDer(buf[0..len]) catch return;
+    _ = sk;
+}
+
+test "fuzz: SecretKey.fromDer never panics" {
+    try testing.fuzz({}, fuzzSecretKeyFromDer, .{});
+}
+
+fn fuzzFromPkcs8(_: void, smith: *std.testing.Smith) !void {
+    var buf: [1024]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const sk = fromPkcs8(buf[0..len]) catch return;
+    _ = sk;
+}
+
+test "fuzz: fromPkcs8 never panics" {
+    try testing.fuzz({}, fuzzFromPkcs8, .{});
+}
+
+fn fuzzPublicKeyFromPem(_: void, smith: *std.testing.Smith) !void {
+    var buf: [1024]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const pk = PublicKey.fromPem(buf[0..len]) catch return;
+    _ = pk;
+}
+
+test "fuzz: PublicKey.fromPem never panics" {
+    try testing.fuzz({}, fuzzPublicKeyFromPem, .{});
+}
+
+fn fuzzSecretKeyFromPem(_: void, smith: *std.testing.Smith) !void {
+    var buf: [1024]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const sk = SecretKey.fromPem(buf[0..len]) catch return;
+    _ = sk;
+}
+
+test "fuzz: SecretKey.fromPem never panics" {
+    try testing.fuzz({}, fuzzSecretKeyFromPem, .{});
+}
+
+fn fuzzFromOpenSSH(_: void, smith: *std.testing.Smith) !void {
+    var buf: [1024]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const sk = fromOpenSSH(buf[0..len], "") catch return;
+    _ = sk;
+}
+
+test "fuzz: fromOpenSSH never panics" {
+    try testing.fuzz({}, fuzzFromOpenSSH, .{});
+}

@@ -720,3 +720,18 @@ test "certNotAfter: openssl fixture parses to the known epoch" {
     defer testing.allocator.free(cut);
     try testing.expectError(error.MalformedCertificate, certNotAfter(testing.allocator, cut));
 }
+
+fn fuzzParseCsr(_: void, smith: *std.testing.Smith) !void {
+    var buf: [512]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // The CSR DER decoder (parse-back oracle side of csrDer/the mock CA's
+    // finalize path): arbitrary bytes must only ever yield a typed error,
+    // never a panic/OOB — and any success must be freed.
+    var parsed = parseCsr(testing.allocator, buf[0..len]) catch return;
+    parsed.deinit();
+}
+
+test "fuzz: parseCsr never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzParseCsr, .{});
+}

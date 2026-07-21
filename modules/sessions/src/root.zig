@@ -1240,3 +1240,44 @@ test "middleware: small response buffer forces an early flush — no cookie-buff
     // Head already sent before save() → cookie can't be issued this response (documented).
     try testing.expectEqual(@as(?[]const u8, null), headerValue(got, "Set-Cookie"));
 }
+
+fn fuzzSessionRecordDecode(_: void, smith: *std.testing.Smith) !void {
+    var env = Env.init();
+    env.wire();
+    defer env.deinit();
+    var m = env.manager(.{ .idle = 10_000, .absolute = 100_000 });
+
+    var record: [record_header_len + max_session_bytes]u8 = undefined;
+    smith.bytes(&record);
+    const len: usize = smith.valueRangeAtMost(u16, 0, record.len);
+    // Bypass `seed`'s structured layout: put a fully arbitrary byte string
+    // straight into the store under a fixed id, then decode it exactly like
+    // a corrupted/attacker-controlled record would be decoded on `load`.
+    // `Manager.lookup` is the wire-facing decoder (record header + payload
+    // length checks) — arbitrary bytes must only ever yield `.absent`/
+    // `.expired`, never a panic or OOB write into `out`'s fixed buffers.
+    const id = "fuzz-session-id";
+    _ = env.store.store().put(id, record[0..len], 0);
+    var out: Session = .{};
+    _ = m.lookup(id, &out);
+}
+
+test "fuzz: Manager.lookup's session-record decode never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzSessionRecordDecode, .{});
+}
+
+fn fuzzCookieParse(_: void, smith: *std.testing.Smith) !void {
+    var header: [128]u8 = undefined;
+    smith.bytes(&header);
+    const len: usize = smith.valueRangeAtMost(u16, 0, header.len);
+    // The Cookie request-header decoder this module relies on to find the
+    // session id (`Manager.load` → `cookies.get` → `cookies.find`/`parse`):
+    // arbitrary bytes must only ever yield null/a borrowed slice, never a
+    // panic or OOB.
+    const v = cookies.find(header[0..len], default_cookie_name);
+    _ = v;
+}
+
+test "fuzz: cookie header parse (as used by Manager.load) never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzCookieParse, .{});
+}

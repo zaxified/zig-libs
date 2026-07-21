@@ -1147,6 +1147,21 @@ test "ReplayWindow: a jump at/beyond window_size clears the old mask entirely" {
     try std.testing.expect(!rw.check(0)); // far outside the window now
 }
 
+fn fuzzOscoreOptionDecode(_: void, smith: *std.testing.Smith) !void {
+    var buf: [64]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // §6.1's wire-facing decoder: arbitrary bytes must only ever produce a
+    // typed error (reserved bits/length, truncation) or a borrowed-slice
+    // struct — never a panic or OOB read.
+    const opt = OscoreOption.decode(buf[0..len]) catch return;
+    _ = opt;
+}
+
+test "fuzz: OscoreOption.decode never panics on arbitrary bytes" {
+    try std.testing.fuzz({}, fuzzOscoreOptionDecode, .{});
+}
+
 test "ReplayWindow: oversized window_size (>64) + hostile diff/shift does not panic (audit F1)" {
     // window_size is a u7 (up to 127) but the u64 mask caps the real window at
     // 64; without the effWindow clamp a diff/shift of 64..126 @intCast'd to u6
