@@ -111,17 +111,26 @@ fn firstOption(options: []const Option, n: u16) ?[]const u8 {
     return null;
 }
 
-/// The request/response `Content-Format` (option 12) as its identifier, or null
-/// when absent.
-pub fn contentFormat(msg: coap.Message) ?u16 {
+/// Error returned when a Content-Format / Accept option carries more than the
+/// 2 bytes its uint value may occupy (RFC 7252 §5.10 / §12.3: 0..2 bytes,
+/// identifier range 0..65535). Rejecting is safer than silently `@truncate`-ing
+/// an attacker-supplied over-long value to a plausible-looking identifier.
+pub const FormatError = error{OptionValueTooLong};
+
+/// The request/response `Content-Format` (option 12) as its identifier, null
+/// when absent, or `error.OptionValueTooLong` when the value exceeds 2 bytes.
+pub fn contentFormat(msg: coap.Message) FormatError!?u16 {
     const v = firstOption(msg.options, number.content_format) orelse return null;
-    return @truncate(decodeUint(v));
+    if (v.len > 2) return error.OptionValueTooLong;
+    return @intCast(decodeUint(v));
 }
 
-/// The `Accept` (option 17) content-format the client prefers, or null.
-pub fn accept(msg: coap.Message) ?u16 {
+/// The `Accept` (option 17) content-format the client prefers, null when
+/// absent, or `error.OptionValueTooLong` when the value exceeds 2 bytes.
+pub fn accept(msg: coap.Message) FormatError!?u16 {
     const v = firstOption(msg.options, number.accept) orelse return null;
-    return @truncate(decodeUint(v));
+    if (v.len > 2) return error.OptionValueTooLong;
+    return @intCast(decodeUint(v));
 }
 
 /// The `Max-Age` (option 14) in seconds, or the §5.10.5 default (60) when
@@ -457,8 +466,8 @@ test "typed accessors over a hand-built message" {
         .options = &opts,
     };
 
-    try testing.expectEqual(@as(?u16, content_format.json), contentFormat(msg));
-    try testing.expectEqual(@as(?u16, content_format.text_plain), accept(msg));
+    try testing.expectEqual(@as(?u16, content_format.json), try contentFormat(msg));
+    try testing.expectEqual(@as(?u16, content_format.text_plain), try accept(msg));
     try testing.expectEqual(@as(u64, 300), maxAge(msg));
 
     var path = uriPath(msg);
@@ -474,13 +483,31 @@ test "typed accessors over a hand-built message" {
 
 test "typed accessors absent options" {
     const msg = coap.Message{ .type = .confirmable, .code = .get, .message_id = 1 };
-    try testing.expectEqual(@as(?u16, null), contentFormat(msg));
-    try testing.expectEqual(@as(?u16, null), accept(msg));
+    try testing.expectEqual(@as(?u16, null), try contentFormat(msg));
+    try testing.expectEqual(@as(?u16, null), try accept(msg));
     try testing.expectEqual(default_max_age, maxAge(msg));
     var path = uriPath(msg);
     try testing.expectEqual(@as(?[]const u8, null), path.next());
     var query = uriQuery(msg);
     try testing.expectEqual(@as(?[]const u8, null), query.next());
+}
+
+test "content-format / accept reject an over-long option value" {
+    // A 3-byte Content-Format value cannot be a valid u16 identifier; the old
+    // code `@truncate`-d it to 0x0203 (a plausible id), silently accepting
+    // malformed input. It must now be rejected.
+    const over = [_]Option{
+        .{ .number = number.content_format, .value = &.{ 0x01, 0x02, 0x03 } },
+        .{ .number = number.accept, .value = &.{ 0xaa, 0xbb, 0xcc, 0xdd } },
+    };
+    const msg = coap.Message{ .type = .confirmable, .code = .get, .message_id = 7, .options = &over };
+    try testing.expectError(error.OptionValueTooLong, contentFormat(msg));
+    try testing.expectError(error.OptionValueTooLong, accept(msg));
+
+    // The 2-byte boundary is still accepted and decoded exactly (0xFFFF).
+    const edge = [_]Option{.{ .number = number.content_format, .value = &.{ 0xff, 0xff } }};
+    const edge_msg = coap.Message{ .type = .confirmable, .code = .get, .message_id = 8, .options = &edge };
+    try testing.expectEqual(@as(?u16, 0xffff), try contentFormat(edge_msg));
 }
 
 test "optionsFromUri: host, default port, path and query" {
