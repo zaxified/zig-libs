@@ -271,3 +271,140 @@ not baked into `build.zig`.
   against a coarse-locked queue (sound for the "no lost/dup/corrupt" properties).
   A full per-op timestamped history + sequential-witness search would additionally
   verify FIFO ordering under concurrency; tractable but deferred.
+
+## 7. Weak-memory codegen certification (aarch64 + riscv64)
+
+**Result: no too-weak barrier found.** Every load-bearing atomic in the
+reclamation core and the MPMC queue lowers to an architecturally correct
+instruction sequence on both weak-memory targets. `0` too-weak sites, `0`
+gratuitously-too-strong sites.
+
+### Why this audit exists
+
+The whole memory-ordering discipline (§4a) is invisible on x86_64: TSO masks
+store→load reordering, so the pin/scan Dekker interlock at `enterCritical` ⇄
+`tryAdvance` cannot be violated there regardless of what the compiler emits. The
+open question is whether the compiler emits the barriers the ARM/RISC-V models
+*require*. A missing barrier is a latent use-after-free that only manifests as
+reordering on weak hardware. We have no ARM/RISC-V hardware, and QEMU-TCG honors
+barriers but does not *expose* a missing one (it does not model speculative
+reordering), so QEMU cannot certify ordering. This section therefore certifies
+**statically, from the generated machine code**, and treats the QEMU run below as
+functional sanity only.
+
+### Toolchain / method
+
+- Compiler: Zig 0.16.0 (bundled LLVM), targets `aarch64-linux` and
+  `riscv64-linux`, both `-O ReleaseFast` and `-O ReleaseSafe`.
+- Disassembly: the bundled `zig objdump` is a stub and system `objdump`
+  (binutils 2.46) is a single-arch build that cannot decode either target, so the
+  audit reads Zig's own `-femit-asm` target assembly directly — this is the
+  compiler's final instruction selection, one step *before* object emission, and
+  is the authoritative record of what each `@atomic*` site lowers to.
+- A throwaway driver referenced `enterCritical`/`exitCritical`/`retire`/
+  `tryAdvance`/`register`/`unregister`/`enqueue`/`dequeue` through `export`ed
+  wrappers so no site was dead-code-eliminated; the driver was deleted after the
+  audit (nothing added to the module source).
+
+### Correct-lowering key
+
+| Zig ordering | aarch64 | riscv64 |
+|---|---|---|
+| `.acquire` load | `ldar` | `ld` + `fence r,rw` |
+| `.seq_cst` load | `ldar` | **`fence rw,rw`** + `ld` + `fence r,rw` |
+| `.release` store | `stlr`/`stlrb` | `fence rw,w` + `sd`/`sb` |
+| `.seq_cst` store | `stlr` | `fence rw,w` + `sd` |
+| `.acquire` CAS | `ldaxr`/`ldaxrb` + `stxr`/`stxrb` | `lr` + `sc` (acq form) |
+| `.seq_cst` CAS | `ldaxr` + `stlxr` | **`lr.d.aqrl`** + `sc.d.rl` |
+| `.monotonic` load/store | plain `ldr`/`str` | plain `ld`/`sd` |
+
+The two load-bearing observations:
+
+1. **aarch64 needs no `dmb`.** Across both opt levels the entire module emits
+   `dmb` **zero** times: seq_cst is carried purely by the RCsc `ldar`/`stlr`/
+   `ldaxr`/`stlxr` instructions. This is correct, not a missing barrier — ARMv8's
+   `ldar`/`stlr` are *sequentially-consistent* acquire/release: a `stlr` is
+   architecturally forbidden from being reordered past a later `ldar`, which is
+   exactly the store→load edge the Dekker interlock (pin-store then scan/pointer
+   load) depends on. Plain acquire/release (which *does* permit store→load
+   reordering) would be too weak here; the compiler does not use it for the
+   seq_cst sites.
+2. **riscv64 distinguishes seq_cst from acquire by a leading fence.** An
+   `.acquire` load emits only the trailing `fence r,rw`; a `.seq_cst` load emits
+   an additional **leading `fence rw,rw`**. That leading full fence is the RISC-V
+   analog of ARM's RCsc `ldar` — it is precisely the store→load barrier that
+   orders a thread's prior seq_cst pin-store before its subsequent seq_cst
+   pointer/scan loads. It was observed present on every seq_cst load
+   (`global_epoch`, `local_epoch` scan, queue `head`/`tail`/`next`) and absent
+   from the lone `.acquire` load (`Domain.epoch`), confirming the compiler is not
+   silently collapsing seq_cst to acquire. seq_cst RMW lowers to `lr.d.aqrl` +
+   `sc.d.rl`, the ISA-sanctioned sequentially-consistent LR/SC pair.
+
+### Per-site verdict
+
+All sites **CORRECT** on both arches, both opt levels. Grouped by role:
+
+| Site (source) | Zig ordering | Sync role | aarch64 | riscv64 |
+|---|---|---|---|---|
+| `enterCritical` `global_epoch` load | `.seq_cst` | pin: read epoch | `ldar` | `fence rw,rw`+`ld`+`fence r,rw` |
+| `enterCritical` `local_epoch` store | `.seq_cst` | pin announce (Dekker store) | `stlr` | `fence rw,w`+`sd` |
+| `exitCritical` `local_epoch` store | `.release` | unpin publish | `stlr` | `fence rw,w`+`sd` |
+| `retire` `global_epoch` load | `.seq_cst` | retire-tag read (after unlink) | `ldar` | `fence rw,rw`+`ld`+`fence r,rw` |
+| `tryAdvance` `global_epoch` load | `.seq_cst` | observed epoch | `ldar` | `fence rw,rw`+`ld`+`fence r,rw` |
+| `tryAdvance` `local_epoch` scan load | `.seq_cst` | straggler scan (Dekker load) | `ldar` | `fence rw,rw`+`ld`+`fence r,rw` |
+| `tryAdvance` `global_epoch` CAS | `.seq_cst`/`.seq_cst` | advance E→E+1 | `ldaxr`+`stlxr` | `lr.d.aqrl`+`sc.d.rl` |
+| `Domain.epoch` `global_epoch` load | `.acquire` | mechanical read | `ldar` | `ld`+`fence r,rw` |
+| `register` `in_use` CAS | `.acquire`/`.monotonic` | claim slot | `ldaxrb`+`stxrb` | `lr`/`sc` (acq) |
+| `register` `local_epoch` store | `.release` | init slot epoch | `stlr` | `fence rw,w`+`sd` |
+| `unregister` `in_use` store | `.release` | free slot | `stlrb` | `fence rw,w`+`sb` |
+| `enqueue` `tail` load | `.seq_cst` | MS pointer read | `ldar` | `fence rw,rw`+`ld`+`fence r,rw` |
+| `enqueue` `t.next` load | `.seq_cst` | MS pointer read | `ldar` | `fence rw,rw`+`ld`+`fence r,rw` |
+| `enqueue` `t.next` CAS (link) | `.seq_cst`/`.seq_cst` | linearization | `ldaxr`+`stlxr` | `lr.d.aqrl`+`sc.d.rl` |
+| `enqueue` `tail` CAS (help/swing) | `.seq_cst`/`.seq_cst` | tail helping | `ldaxr`+`stlxr` | `lr.d.aqrl`+`sc.d.rl` |
+| `dequeue` `head`/`tail`/`h.next` loads | `.seq_cst` | MS pointer reads | `ldar` | `fence rw,rw`+`ld`+`fence r,rw` |
+| `dequeue` `tail` CAS (help) | `.seq_cst`/`.seq_cst` | tail helping | `ldaxr`+`stlxr` | `lr.d.aqrl`+`sc.d.rl` |
+| `dequeue` `head` CAS (unlink) | `.seq_cst`/`.seq_cst` | linearization + retire gate | `ldaxr`+`stlxr` | `lr.d.aqrl`+`sc.d.rl` |
+| `SpinLock.lock` `state` CAS (pool) | `.acquire`/`.monotonic` | pool mutual-exclusion | `ldaxr`+`stxr` | `lr`/`sc` (acq) |
+| `SpinLock.unlock` `state` store | `.release` | pool release + node handoff | `stlr` | `fence rw,w`+`sd` |
+| `SpinLock.lock` TTAS spin load | `.monotonic` | non-locking spin read | plain `ldr` | plain `ld` |
+| single-owner assert loads (`enter`/`exit`/`retire`/`unregister`) | `.monotonic` | debug assert, no cross-thread role | plain `ldr` | plain `ld` |
+| `deinit` chain-walk loads | `.monotonic` | teardown (quiescent) | plain `ldr` | plain `ld` |
+
+Note on the seq_cst queue-pointer ops: they are stronger than the queue's own
+linearizability needs (acquire/release would linearize the queue alone), but that
+strength is **required, not gratuitous** — it is the EBR grace-period proof (§4a,
+theorem at `tryAdvance`) that pulls the pointer loads/unlink-CAS into the seq_cst
+total order S. So they are classified CORRECT, not too-strong: demoting them would
+keep the queue correct while silently breaking reclamation. The `.monotonic` sites
+(TTAS spin, debug asserts, quiescent teardown) are intentionally plain and safe at
+their site — none carries a cross-thread happens-before obligation.
+
+### QEMU functional run (sanity only — does NOT certify weak-memory ordering)
+
+Cross-built `zig test` binaries (`-O ReleaseSafe`, asserts + the poison canary
+live) were run under qemu-user:
+
+- `qemu-aarch64`: **17/17 tests pass, exit 0** — including the `REAL CORE: MPMC +
+  EBR survive N×M stress` test and the `DRIVER TEETH` positive control (which
+  still catches the deliberately-racy `BrokenRing`).
+- `qemu-riscv64`: **17/17 tests pass, exit 0** — same suite.
+
+This confirms functional correctness under a non-x86 ABI/instruction set and that
+the cross-compiled core is not obviously broken. It is **explicitly
+non-certifying for weak memory**: QEMU-TCG serializes and honors barriers but does
+not model the speculative store→load reordering that a missing barrier would need
+in order to fail, so a passing QEMU run cannot distinguish correct ordering from
+absent ordering. The static codegen audit above is what certifies ordering; QEMU
+is corroborating sanity only.
+
+### Honest scope — what is and is not certified
+
+- **Certified now:** the compiler emits architecturally-correct barriers for every
+  atomic site on aarch64 and riscv64 (static codegen), and the core is
+  functionally correct under both non-x86 ISAs (QEMU-user).
+- **Not yet done (next tier):** (a) dynamic weak-memory stress on *real* ARM/
+  RISC-V hardware (or a reordering-faithful simulator), which is the only way to
+  observe a reordering bug rather than infer its absence from the codegen; (b) a
+  formal litmus/herd7 model-check of the pin/scan interlock and the grace-period
+  argument against the C11/ARMv8/RVWMO axiomatic models. Both remain open; this
+  section does not claim to replace them.
