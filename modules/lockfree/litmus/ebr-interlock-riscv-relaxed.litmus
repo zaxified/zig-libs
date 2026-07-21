@@ -1,0 +1,16 @@
+RISCV ebr-interlock-riscv-relaxed
+(* EBR pin/scan Dekker interlock — POSITIVE CONTROL (ordering DELIBERATELY
+ * WEAKENED to plain ld/sd, all fences removed). Proves the seq_cst fences are
+ * load-bearing: strip the store->load barrier and the SB non-SC outcome
+ * (reclaimer misses pin AND reader misses unlink = use-after-free) becomes
+ * reachable. Under riscv.cat this MUST be Sometimes/Allowed. *)
+{
+0:x5=pin; 0:x6=ptr;
+1:x5=ptr; 1:x6=pin;
+}
+ P0               | P1               ;
+ ori x1,x0,1      | ori x1,x0,1      ;
+ sd x1,0(x5)      | sd x1,0(x5)      ;
+ ld x2,0(x6)      | ld x2,0(x6)      ;
+exists
+(0:x2=0 /\ 1:x2=0)

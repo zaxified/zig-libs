@@ -1,0 +1,20 @@
+AArch64 ebr-interlock-aarch64-sc
+(* EBR pin/scan Dekker interlock — SAFE variant (the ordering the code uses).
+ * Shape: store-buffering (SB).
+ *   P0 = reader (enterCritical): STORE local_epoch (pin) then LOAD shared ptr.
+ *   P1 = reclaimer (tryAdvance): STORE unlink/advance then LOAD local_epoch (scan).
+ * seq_cst lowering per SPEC.md 7: seq_cst store -> STLR, seq_cst load -> LDAR
+ * (ARMv8 RCsc pair, no DMB). The bug outcome is the SB non-SC result where the
+ * reader misses the unlink (r=0) AND the reclaimer misses the pin (r=0):
+ * reclaimer frees a node the reader still holds -> use-after-free.
+ * Under aarch64.cat this MUST be Never. *)
+{
+0:X1=pin; 0:X3=ptr;
+1:X1=ptr; 1:X3=pin;
+}
+ P0              | P1              ;
+ MOV W0,#1       | MOV W0,#1       ;
+ STLR W0,[X1]    | STLR W0,[X1]    ;
+ LDAR W2,[X3]    | LDAR W2,[X3]    ;
+exists
+(0:X2=0 /\ 1:X2=0)

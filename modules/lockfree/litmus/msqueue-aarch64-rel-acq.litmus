@@ -1,0 +1,22 @@
+AArch64 msqueue-aarch64-rel-acq
+(* Michael-Scott queue publish/consume — SAFE variant (the ordering the code
+ * uses). Shape: message-passing (MP).
+ *   P0 = enqueue producer: write node.value (plain), then publish the next
+ *        link with a release-ordered store (code uses a seq_cst CAS, which is
+ *        >= release; SPEC.md 7 lowering of a release store -> STLR).
+ *   P1 = dequeue consumer: read the next link (acquire; LDAR), then read
+ *        node.value (plain).
+ * data = node.value, flag = next link. The forbidden MP outcome is "consumer
+ * observes the published pointer (flag=1) but reads a stale/uninitialized
+ * payload (data=0)". Under aarch64.cat this MUST be Never. *)
+{
+0:X2=data; 0:X1=flag;
+1:X1=flag; 1:X3=data;
+}
+ P0              | P1              ;
+ MOV W0,#1       | LDAR W0,[X1]    ;
+ STR W0,[X2]     | LDR W2,[X3]     ;
+ MOV W3,#1       |                 ;
+ STLR W3,[X1]    |                 ;
+exists
+(1:X0=1 /\ 1:X2=0)

@@ -1,0 +1,19 @@
+AArch64 ebr-interlock-aarch64-relaxed
+(* EBR pin/scan Dekker interlock — POSITIVE CONTROL (ordering DELIBERATELY
+ * WEAKENED to plain/monotonic: STR/LDR instead of STLR/LDAR). This is the
+ * exact Dekker-interlock break the SPEC theorem forbids (pin store demoted
+ * below seq_cst). It proves the encoding actually exercises the store->load
+ * reorder and that the STLR/LDAR barrier is load-bearing: with plain accesses
+ * the SB non-SC outcome (reclaimer misses pin AND reader misses unlink =
+ * use-after-free) becomes reachable. Under aarch64.cat this MUST be
+ * Sometimes/Allowed. *)
+{
+0:X1=pin; 0:X3=ptr;
+1:X1=ptr; 1:X3=pin;
+}
+ P0              | P1              ;
+ MOV W0,#1       | MOV W0,#1       ;
+ STR W0,[X1]     | STR W0,[X1]     ;
+ LDR W2,[X3]     | LDR W2,[X3]     ;
+exists
+(0:X2=0 /\ 1:X2=0)

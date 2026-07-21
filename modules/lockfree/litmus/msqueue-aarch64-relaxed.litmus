@@ -1,0 +1,18 @@
+AArch64 msqueue-aarch64-relaxed
+(* Michael-Scott queue publish/consume — POSITIVE CONTROL (publish/consume
+ * ordering DELIBERATELY WEAKENED to plain STR/LDR: the release on the next-link
+ * store and the acquire on its load are removed). Proves the release/acquire
+ * pair is load-bearing: without it the MP outcome "flag observed but payload
+ * stale" becomes reachable -> dequeue returns a node whose value bytes are not
+ * yet visible. Under aarch64.cat this MUST be Sometimes/Allowed. *)
+{
+0:X2=data; 0:X1=flag;
+1:X1=flag; 1:X3=data;
+}
+ P0              | P1              ;
+ MOV W0,#1       | LDR W0,[X1]     ;
+ STR W0,[X2]     | LDR W2,[X3]     ;
+ MOV W3,#1       |                 ;
+ STR W3,[X1]     |                 ;
+exists
+(1:X0=1 /\ 1:X2=0)

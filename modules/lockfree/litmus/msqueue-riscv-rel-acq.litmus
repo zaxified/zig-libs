@@ -1,0 +1,22 @@
+RISCV msqueue-riscv-rel-acq
+(* Michael-Scott queue publish/consume — SAFE variant (the ordering the code
+ * uses). Shape: message-passing (MP).
+ *   P0 = enqueue producer: write node.value (plain sd), then publish the next
+ *        link with a release store. SPEC.md 7 lowering: release store ->
+ *        fence rw,w ; sd.
+ *   P1 = dequeue consumer: read the next link (acquire load -> ld ; fence r,rw)
+ *        then read node.value (plain ld).
+ * data = node.value, flag = next link. The forbidden MP outcome "flag observed
+ * (=1) but payload stale (=0)" MUST be Never under riscv.cat. *)
+{
+0:x5=data; 0:x6=flag;
+1:x6=flag; 1:x7=data;
+}
+ P0               | P1               ;
+ ori x1,x0,1      | ld x1,0(x6)      ;
+ sd x1,0(x5)      | fence r,rw       ;
+ ori x2,x0,1      | ld x2,0(x7)      ;
+ fence rw,w       |                  ;
+ sd x2,0(x6)      |                  ;
+exists
+(1:x1=1 /\ 1:x2=0)

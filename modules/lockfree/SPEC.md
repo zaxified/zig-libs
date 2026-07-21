@@ -406,5 +406,78 @@ is corroborating sanity only.
   RISC-V hardware (or a reordering-faithful simulator), which is the only way to
   observe a reordering bug rather than infer its absence from the codegen; (b) a
   formal litmus/herd7 model-check of the pin/scan interlock and the grace-period
-  argument against the C11/ARMv8/RVWMO axiomatic models. Both remain open; this
-  section does not claim to replace them.
+  argument against the C11/ARMv8/RVWMO axiomatic models — **now DONE, see §7.1.**
+  Item (a) remains open; this section does not claim to replace it.
+
+## 7.1 Formal litmus certification (herd7)
+
+**Result: every load-bearing ordering forbids its bug outcome under the formal
+models, and every positive control confirms the barrier is load-bearing.** The
+static audit above proves the compiler *emits* the right barriers; this
+subsection proves — against the AArch64 and RISC-V axiomatic memory models —
+that those barriers actually *forbid* the use-after-free / stale-read, and that
+weakening them lets the bug back in. Files live in `litmus/` (`run.sh` +
+`README.md` + the eight `.litmus` sources).
+
+### Toolchain / models
+
+- `herd7` **7.58** (herdtools7, via opam; `run.sh` sources `opam env`).
+- Models: the herd7-shipped **`aarch64.cat`** and **`riscv.cat`** (RVWMO),
+  selected by name (`-model aarch64.cat` / `-model riscv.cat`).
+
+### Method — matched pairs with teeth
+
+The full grace-period theorem (§4a, `tryAdvance`) reduces the module's
+reclamation safety to two sync shapes over the seq_cst total order S. Each shape
+is encoded as an `exists` on the **bug** outcome, in a matched pair per arch:
+
+- **safe** — the ordering the code uses, written with the exact SPEC §7
+  lowerings (seq_cst = `STLR`/`LDAR` on aarch64, `fence rw,w;sd` /
+  `fence rw,rw;ld;fence r,rw` on riscv; release/acquire for the MP publish).
+  herd7 must report the bug as **Never**.
+- **positive control** — the same test with the ordering demoted to
+  plain/monotonic. herd7 must report the bug as **Sometimes**. This is the
+  evidence the encoding is not vacuously safe *and* that the barrier is
+  load-bearing (the `-relaxed` EBR control is exactly the Dekker-interlock break
+  the §4a theorem forbids: pin store demoted below seq_cst).
+
+**Shape 1 — EBR pin/scan Dekker interlock**, encoded as store-buffering (SB):
+P0 = reader (pin store then shared-pointer load), P1 = reclaimer (advance/unlink
+store then epoch-scan load). Bug = the SB non-SC outcome `0:X2=0 /\ 1:X2=0`
+(reclaimer misses the pin **and** reader misses the unlink → frees a live node).
+
+**Shape 2 — MS-queue publish/consume**, encoded as message-passing (MP): P0 =
+enqueue (write `Node.value` plain, then release-publish the `next` link), P1 =
+dequeue (acquire-load `next`, then read `value`). Bug = `flag observed but
+payload stale` (`1:X0=1 /\ 1:X2=0`, riscv `1:x1=1 /\ 1:x2=0`).
+
+### Verdict table
+
+| Test | Shape | Arch | Ordering | herd7 Observation | Verdict |
+|---|---|---|---|---|---|
+| `ebr-interlock-aarch64-sc` | SB | aarch64 | seq_cst (STLR/LDAR) | `Never 0 3` | ✅ bug forbidden |
+| `ebr-interlock-aarch64-relaxed` | SB | aarch64 | plain (STR/LDR) | `Sometimes 1 3` | ✅ control fires |
+| `ebr-interlock-riscv-sc` | SB | riscv | seq_cst (fence rw,rw+ld / fence rw,w+sd) | `Never 0 3` | ✅ bug forbidden |
+| `ebr-interlock-riscv-relaxed` | SB | riscv | plain (ld/sd) | `Sometimes 1 3` | ✅ control fires |
+| `msqueue-aarch64-rel-acq` | MP | aarch64 | release/acquire (STLR/LDAR) | `Never 0 3` | ✅ bug forbidden |
+| `msqueue-aarch64-relaxed` | MP | aarch64 | plain (STR/LDR) | `Sometimes 1 3` | ✅ control fires |
+| `msqueue-riscv-rel-acq` | MP | riscv | release/acquire (fence rw,w+sd / ld+fence r,rw) | `Never 0 3` | ✅ bug forbidden |
+| `msqueue-riscv-relaxed` | MP | riscv | plain (ld/sd) | `Sometimes 1 3` | ✅ control fires |
+
+Safe/positive-control pairing, read as pairs: on **both** arches, both shapes
+forbid the bug under the code's real ordering and **permit** it the instant the
+ordering is weakened. The `Never 0 3` / `Sometimes 1 3` split (0 vs 1 witnessing
+executions out of 3 final states) is the quantitative signature that the barrier,
+not the litmus encoding, is what excludes the bug.
+
+### Honest scope
+
+This certifies the two **extracted** sync shapes — the pin/scan interlock and
+the MS-queue publish/consume — under the AArch64 and RVWMO axiomatic models. It
+is **not** a whole-program proof: the reduction from full reclamation safety to
+these two shapes plus the seq_cst total order S is the reviewed §4a argument
+(theorem at `tryAdvance`), not a machine-checked model of the entire algorithm.
+What remains beyond this layer is dynamic weak-memory stress on *real* ARM/RISC-V
+hardware (§7 item (a)); with the static codegen cert (§7) and this formal cert
+(§7.1) both green, that hardware run is now belt-and-suspenders corroboration
+rather than the only line of evidence.

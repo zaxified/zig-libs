@@ -1,0 +1,17 @@
+RISCV msqueue-riscv-relaxed
+(* Michael-Scott queue publish/consume — POSITIVE CONTROL (publish/consume
+ * ordering DELIBERATELY WEAKENED to plain ld/sd, fences removed). Proves the
+ * release (fence rw,w) / acquire (fence r,rw) pair is load-bearing: without it
+ * the MP outcome "flag observed but payload stale" becomes reachable. Under
+ * riscv.cat this MUST be Sometimes/Allowed. *)
+{
+0:x5=data; 0:x6=flag;
+1:x6=flag; 1:x7=data;
+}
+ P0               | P1               ;
+ ori x1,x0,1      | ld x1,0(x6)      ;
+ sd x1,0(x5)      | ld x2,0(x7)      ;
+ ori x2,x0,1      |                  ;
+ sd x2,0(x6)      |                  ;
+exists
+(1:x1=1 /\ 1:x2=0)
