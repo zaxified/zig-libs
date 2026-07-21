@@ -131,6 +131,8 @@ const module_list = [_]Module{
     .{ .name = "taproot", .deps = &.{ "bip340", "k256" } },
     .{ .name = "bitcointx", .deps = &.{"bip340"} },
     .{ .name = "psbt", .deps = &.{"bitcointx"} },
+    .{ .name = "bitcoinscript", .deps = &.{ "bitcointx", "k256", "bip340", "ripemd160" } },
+    .{ .name = "lnwire" },
     .{ .name = "musig2", .deps = &.{ "bip340", "k256" } },
     .{ .name = "sphinx", .deps = &.{"k256"} },
     .{ .name = "bolt8", .deps = &.{ "noise", "k256" } },
