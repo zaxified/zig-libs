@@ -26,19 +26,35 @@ form falls back to the last explicit transition's offset rather than erroring (a
 approximation, not a crash).
 
 ## Verification
-`zig build test-tz` (Debug and `-Doptimize=ReleaseFast`), 6 tests: zone lookup by name, offset lookup
+`zig build test-tz` (Debug and `-Doptimize=ReleaseFast`), 9 tests: zone lookup by name, offset lookup
 before/between/at-or-after the last explicit transition, POSIX-footer-rule evaluation for a
-present-day instant, DST flag correctness across a transition. Correctness oracle is this module's own
-test values plus the generated tzdata table (produced by `tz-gen` from the real IANA release, not
-hand-authored, so wrong-by-construction errors are ruled out by the generator rather than by these
-tests alone).
+present-day instant, DST flag correctness across a transition, and POSIX footer `Jn`/plain-`n`
+Julian-day rule evaluation (including a leap-year positive control — see Backlog). Correctness oracle
+is this module's own test values plus the generated tzdata table (produced by `tz-gen` from the real
+IANA release, not hand-authored, so wrong-by-construction errors are ruled out by the generator rather
+than by these tests alone).
 
 ## Backlog / deferred
-The POSIX footer parser only supports the common `Mm.w.d` rule form (nth/last weekday of a month —
-what every zone in the current tzdata release actually uses); the rare `Jn`/`n` Julian-day rule forms
-are not implemented — `offsetAt` falls back to the last explicit transition's offset for a zone whose
-footer uses one of those (none currently do). Regenerating `tz_data.zig` from a newer IANA tzdata
-release requires the `tz-gen` generator, a separate tool not included here (README "Defer").
+- **Done (this session):** the POSIX footer parser now also evaluates the `Jn` (1<=n<=365, Julian day,
+  Feb 29 never counted — day 60 is always March 1) and plain `n` (0<=n<=365, zero-based day of year,
+  Feb 29 counted) rule forms, alongside the pre-existing `Mm.w.d` form, all through the same
+  `ruleDateUnix`/`posixOffset` evaluation path (`src/root.zig`). No current tzdata-2026a zone's footer
+  actually uses `Jn`/`n` (all 600 use `Mm.w.d`), so this is forward cover for zones/releases that do,
+  exercised by synthetic-zone tests (`Test/Jn`, `Test/n`) rather than a real IANA entry. A leap-year
+  positive control (`J59` vs plain `59`) proves the two forms are not accidentally aliased: `J59` is
+  Feb 28 in both a leap (2024) and non-leap (2023) year, while plain `59` is Feb 29 in the leap year
+  and March 1 in the non-leap year — different UTC instants for the same digit, in the year that makes
+  Feb 29 exist. (Note: the *POSIX day-number* that lands on Feb 29 is 59, not 60 — Jn is 1-based so
+  `J60`≡March 1 always, and the zero-based `n` only reaches Feb 29 at index 59; `n=60` is March 1 in a
+  leap year too, so `59` is the number that actually demonstrates the divergence.)
+- **Deferred — tzdata refresh cadence tooling:** out of scope for this extraction. Regenerating
+  `tz_data.zig` from a newer IANA tzdata release requires the `tz-gen` generator, a separate tool not
+  ported into this module (see README "Defer"); this module has no loader to redirect and no version
+  accessor to add — `tz_data.zig`'s header comment already states the pinned release (tzdata 2026a) and
+  the regeneration path (`tz-gen`, `zig build run`). A "point the loader at a fresh tzdata dir" helper
+  doesn't apply here (there is no runtime loader — the table is compile-time-embedded, by design, per
+  the module's no-filesystem/no-syscalls threat model above). Refreshing the pinned release is a
+  `tz-gen`-tool concern, not a `tz` (this module)-API concern.
 
 ## Status
 `extract · any · util · reentrant` + deps: `datefmt` — canonical source is `pub const meta` in

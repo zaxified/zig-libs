@@ -76,8 +76,9 @@ pub fn offsetAt(zone: *const tz_data.Zone, unix: i64) Offset {
 // ---------------------------------------------------------------------------
 // POSIX-TZ footer evaluation (RFC 9636 §3.3 / the tzfile(5) footer)
 //   stdoffset[dst[offset][,start[/time],end[/time]]]
-// Only the `Mm.w.d` rule form is evaluated; a `Jn`/`n` rule (rare) returns null
-// so the caller falls back to the last explicit transition.
+// All three rule forms are evaluated: `Mm.w.d` (nth/last weekday of a month),
+// `Jn` (1<=n<=365, Julian day not counting Feb 29 — day 60 is always March 1),
+// and plain `n` (0<=n<=365, day of year counting Feb 29).
 // ---------------------------------------------------------------------------
 
 const DEFAULT_DST_TIME: i32 = 2 * 3600; // 02:00 local, POSIX default
@@ -124,7 +125,11 @@ fn posixOffset(posix: []const u8, unix: i64) ?Offset {
     return if (in_dst) .{ .off = utc_dst, .dst = true } else .{ .off = utc_std, .dst = false };
 }
 
-const Rule = struct { month: i32, week: i32, day: i32 }; // Mm.w.d
+const Rule = union(enum) {
+    mwd: struct { month: i32, week: i32, day: i32 }, // Mm.w.d
+    julian: i32, // Jn — 1..365, Feb 29 never counted (day 60 == March 1 always)
+    yday: i32, // n — 0..365, Feb 29 counted in leap years
+};
 
 fn skipAbbrev(s: []const u8, i: *usize) void {
     if (i.* < s.len and s[i.*] == '<') {
@@ -165,16 +170,30 @@ fn parseOffsetSeconds(s: []const u8, i: *usize) ?i32 {
 }
 
 fn parseRule(s: []const u8, i: *usize) ?Rule {
-    if (i.* >= s.len or s[i.*] != 'M') return null; // only Mm.w.d supported
-    i.* += 1;
-    const m = readInt(s, i) orelse return null;
-    if (i.* >= s.len or s[i.*] != '.') return null;
-    i.* += 1;
-    const w = readInt(s, i) orelse return null;
-    if (i.* >= s.len or s[i.*] != '.') return null;
-    i.* += 1;
-    const d = readInt(s, i) orelse return null;
-    return .{ .month = m, .week = w, .day = d };
+    if (i.* >= s.len) return null;
+    if (s[i.*] == 'M') {
+        i.* += 1;
+        const m = readInt(s, i) orelse return null;
+        if (i.* >= s.len or s[i.*] != '.') return null;
+        i.* += 1;
+        const w = readInt(s, i) orelse return null;
+        if (i.* >= s.len or s[i.*] != '.') return null;
+        i.* += 1;
+        const d = readInt(s, i) orelse return null;
+        return .{ .mwd = .{ .month = m, .week = w, .day = d } };
+    }
+    if (s[i.*] == 'J') {
+        i.* += 1;
+        const n = readInt(s, i) orelse return null;
+        if (n < 1 or n > 365) return null;
+        return .{ .julian = n };
+    }
+    if (s[i.*] >= '0' and s[i.*] <= '9') {
+        const n = readInt(s, i) orelse return null;
+        if (n < 0 or n > 365) return null;
+        return .{ .yday = n };
+    }
+    return null;
 }
 
 /// Optional `/time` after a rule; POSIX default is 02:00:00 local.
@@ -186,13 +205,33 @@ fn parseRuleTime(s: []const u8, i: *usize) i32 {
     return DEFAULT_DST_TIME;
 }
 
-/// Local pseudo-Unix (as if the wall-clock were UTC) for an Mm.w.d rule in
-/// `year` at `time_secs` past midnight. Null if the weekday doesn't exist.
+/// Local pseudo-Unix (as if the wall-clock were UTC) for a POSIX rule in
+/// `year` at `time_secs` past midnight. Null if the date doesn't exist
+/// (e.g. an `Mm.w.d` weekday that isn't present that month).
 fn ruleDateUnix(year: i32, r: Rule, time_secs: i32) ?i64 {
-    const iso_dow: i32 = if (r.day == 0) 7 else r.day; // POSIX 0=Sun → ISO 7
-    const nth: i32 = if (r.week >= 5) -1 else r.week; // week 5 = last
-    const parts = datefmt.nthWeekdayOfMonth(year, r.month, iso_dow, nth) orelse return null;
-    return datefmt.partsToUnix(parts) + time_secs;
+    switch (r) {
+        .mwd => |mwd| {
+            const iso_dow: i32 = if (mwd.day == 0) 7 else mwd.day; // POSIX 0=Sun → ISO 7
+            const nth: i32 = if (mwd.week >= 5) -1 else mwd.week; // week 5 = last
+            const parts = datefmt.nthWeekdayOfMonth(year, mwd.month, iso_dow, nth) orelse return null;
+            return datefmt.partsToUnix(parts) + time_secs;
+        },
+        .julian => |n| {
+            // Jn: 1==Jan 1, 60==March 1 in every year (Feb 29 is never
+            // counted) — shift the zero-based day index by one once past
+            // Feb 28 in a leap year so day 60 still lands on March 1.
+            var idx: i64 = n - 1;
+            if (datefmt.isLeapYear(year) and n >= 60) idx += 1;
+            const epoch_day = datefmt.ymdToEpochDay(year, 1, 1) + idx;
+            return epoch_day * 86400 + time_secs;
+        },
+        .yday => |n| {
+            // n: 0==Jan 1 .. 365, zero-based day of year; Feb 29 counts
+            // toward the index in leap years (no shift needed).
+            const epoch_day = datefmt.ymdToEpochDay(year, 1, 1) + n;
+            return epoch_day * 86400 + time_secs;
+        },
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -245,4 +284,86 @@ test "offsetAt: POSIX footer applies far in the future (Prague 2040 summer)" {
 test "offsetAt: fixed UTC" {
     const z = find("UTC").?;
     try testing.expectEqual(@as(i32, 0), offsetAt(z, 1721044800).off);
+}
+
+// ---------------------------------------------------------------------------
+// POSIX footer: Jn / n Julian-day rule forms
+// ---------------------------------------------------------------------------
+//
+// These use synthetic zones (empty `trans`, so offsetAt always falls through
+// to posixOffset) with a footer of the form `XST0XDT,<rule>/0,<rule2>/0` —
+// standard offset UTC+0, DST +1h, transitions at 00:00:00 local so the rule's
+// calendar date maps 1:1 onto a UTC instant.
+
+test "posix footer: Jn Julian-day rule — day 59 is Feb 28 regardless of leap year" {
+    // Jn (1<=n<=365) never counts Feb 29: day 59 is Feb 28 in every year,
+    // leap or not.
+    const z = Zone{
+        .name = "Test/Jn",
+        .init_off = 0,
+        .init_dst = false,
+        .trans = &[_]Transition{},
+        .posix = "XST0XDT,J59/0,J300/0",
+    };
+    // 2023 (non-leap): Feb 28 2023 00:00:00Z == 1677542400.
+    try testing.expectEqual(@as(i32, 0), offsetAt(&z, 1677542400 - 1).off);
+    try testing.expect(!offsetAt(&z, 1677542400 - 1).dst);
+    try testing.expectEqual(@as(i32, 3600), offsetAt(&z, 1677542400).off);
+    try testing.expect(offsetAt(&z, 1677542400).dst);
+    // 2024 (leap): day 59 is *still* Feb 28 2024 00:00:00Z == 1709078400 —
+    // same calendar date as the non-leap year above.
+    try testing.expectEqual(@as(i32, 0), offsetAt(&z, 1709078400 - 1).off);
+    try testing.expectEqual(@as(i32, 3600), offsetAt(&z, 1709078400).off);
+    try testing.expect(offsetAt(&z, 1709078400).dst);
+}
+
+test "posix footer: n zero-based day-of-year rule — counts Feb 29 in leap years" {
+    // Plain n (0<=n<=365) counts Feb 29: index 59 is March 1 in a non-leap
+    // year but Feb 29 in a leap year (the index shifts once Feb 29 exists).
+    const z = Zone{
+        .name = "Test/n",
+        .init_off = 0,
+        .init_dst = false,
+        .trans = &[_]Transition{},
+        .posix = "YST0YDT,59/0,300/0",
+    };
+    // 2023 (non-leap): index 59 == March 1 2023 00:00:00Z == 1677628800.
+    try testing.expectEqual(@as(i32, 0), offsetAt(&z, 1677628800 - 1).off);
+    try testing.expectEqual(@as(i32, 3600), offsetAt(&z, 1677628800).off);
+    // 2024 (leap): index 59 == Feb 29 2024 00:00:00Z == 1709164800.
+    try testing.expectEqual(@as(i32, 0), offsetAt(&z, 1709164800 - 1).off);
+    try testing.expectEqual(@as(i32, 3600), offsetAt(&z, 1709164800).off);
+}
+
+test "posix footer: leap-year positive control — Jn and n resolve to different calendar days" {
+    // Same nominal day-number (59) parsed via the two rule forms must NOT
+    // land on the same instant in a leap year: J59 is Feb 29-blind (always
+    // Feb 28), plain 59 is Feb 29-aware (lands on Feb 29 itself in 2024).
+    // This is the whole point of having two separate rule forms rather than
+    // aliasing one onto the other.
+    const jn = Zone{
+        .name = "Test/Jn2",
+        .init_off = 0,
+        .init_dst = false,
+        .trans = &[_]Transition{},
+        .posix = "XST0XDT,J59/0,J300/0",
+    };
+    const yd = Zone{
+        .name = "Test/n2",
+        .init_off = 0,
+        .init_dst = false,
+        .trans = &[_]Transition{},
+        .posix = "YST0YDT,59/0,300/0",
+    };
+    const feb28_2024 = 1709078400; // 2024-02-28T00:00:00Z
+    const feb29_2024 = 1709164800; // 2024-02-29T00:00:00Z
+    try testing.expect(feb28_2024 != feb29_2024);
+    // Jn already flipped to DST a full day before Feb 29 (it transitioned on
+    // Feb 28, the last day it recognizes before March).
+    try testing.expect(offsetAt(&jn, feb28_2024).dst);
+    try testing.expect(offsetAt(&jn, feb29_2024).dst);
+    // The zero-based form is still in STD at the start of Feb 28 and only
+    // flips to DST exactly at Feb 29 00:00Z — a different UTC instant than Jn.
+    try testing.expect(!offsetAt(&yd, feb28_2024).dst);
+    try testing.expect(offsetAt(&yd, feb29_2024).dst);
 }

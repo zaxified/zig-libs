@@ -53,14 +53,19 @@ spelling exactly). `offsetAt`:
 
 ## Defer (not in this extraction)
 
-- The POSIX footer parser only supports the common `Mm.w.d` rule form
-  (nth/last weekday of a month — what every zone in the current tzdata
-  release actually uses). The rare `Jn`/`n` Julian-day rule forms are not
-  implemented; `offsetAt` falls back to the last explicit transition's
-  offset for a zone whose footer uses one of those (none currently do).
+- The POSIX footer parser evaluates all three POSIX rule forms: `Mm.w.d`
+  (nth/last weekday of a month), `Jn` (1<=n<=365, Julian day, Feb 29 never
+  counted), and plain `n` (0<=n<=365, zero-based day of year, Feb 29
+  counted). No zone in the current tzdata release actually uses `Jn`/`n` —
+  every zone uses `Mm.w.d` — so this is forward cover, exercised by
+  synthetic-zone tests rather than a real IANA entry.
 - Regenerating `tz_data.zig` from a newer IANA tzdata release: the generator
   (`tz-gen`) is a separate tool, not ported into this module — it is not
-  included here, only referenced.
+  included here, only referenced. There is no runtime loader to redirect
+  (the table is compile-time-embedded, by design — see the module's
+  no-filesystem/no-syscalls model) and no version accessor to add; the
+  pinned release and regeneration path are documented in `tz_data.zig`'s
+  header comment.
 
 Provenance: `src/root.zig` is original work of the zig-libs authors (MIT);
 `src/tz_data.zig` is generated data — the UTC-offset transition tables and
