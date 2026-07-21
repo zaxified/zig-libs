@@ -62,8 +62,9 @@
 //!   kill them — pair with the server's read/write timeouts).
 //! - Known server edge: if `http.Server` drops an *admitted* connection
 //!   before serving begins (its per-connection buffer allocation failed —
-//!   OOM only), `.closed` never fires and that IP's slot leaks by one until
-//!   process restart. The guard's own memory stays bounded regardless.
+//!   OOM only), `.closed` never fires and that IP's slot leaks by one. Call
+//!   `reconcile(ip, live)` with the true live count to drop the phantom
+//!   slot; the guard's own memory stays bounded regardless.
 
 const std = @import("std");
 const http = @import("http");
@@ -308,6 +309,27 @@ pub const Guard = struct {
         if (e.active_conns == 0) return;
         e.active_conns -= 1;
         g.total_conns -|= 1;
+    }
+
+    /// Force `ip`'s live-connection count to `live`, adjusting the global
+    /// counter by the delta (invariant `total_conns == Σ active_conns` is
+    /// preserved; neither counter can go negative). This is the recovery
+    /// path for the one leak `admit`/`connClosed` cannot close on their own:
+    /// the documented server edge where an *admitted* connection is dropped
+    /// before `.closed` fires (its per-IP slot would otherwise leak upward
+    /// until restart). A supervisor that knows the true live count for `ip`
+    /// — e.g. from `http.Server`'s own per-connection state — calls this to
+    /// drop the phantom slots. No-op for an untracked IP. Thread-safe.
+    pub fn reconcile(g: *Guard, ip: netaddr.Ip, live: u32) void {
+        lockSpin(&g.lock);
+        defer g.lock.unlock();
+        const e = g.map.get(ip.as16()) orelse return;
+        if (live < e.active_conns) {
+            g.total_conns -|= e.active_conns - live;
+        } else {
+            g.total_conns +|= live - e.active_conns;
+        }
+        e.active_conns = live;
     }
 
     // ── reputation ──────────────────────────────────────────────────────
@@ -866,6 +888,43 @@ test "global cap: total_cap rejections, release re-admits, no entry churn" {
     g.connClosed(mkIp("10.1.0.1"));
     g.connClosed(mkIp("10.1.0.1"));
     g.connClosed(mkIp("10.1.0.3"));
+    try testing.expectEqual(@as(usize, 0), g.totalConns());
+}
+
+test "reconcile: releases leaked per-IP slots and corrects the global counter" {
+    var tc: TestClock = .{};
+    var g = Guard.init(testing.allocator, .{ .max_conns_per_ip = 5, .clock = tc.clock() });
+    defer g.deinit();
+    const ip = mkIp("192.0.2.50");
+
+    // Admit three; imagine two were dropped by the server before `.closed`
+    // fired (the documented leak) — only one is really live.
+    try testing.expectEqual(AdmitVerdict.admitted, g.admit(ip));
+    try testing.expectEqual(AdmitVerdict.admitted, g.admit(ip));
+    try testing.expectEqual(AdmitVerdict.admitted, g.admit(ip));
+    try testing.expectEqual(@as(u32, 3), g.connCount(ip));
+    try testing.expectEqual(@as(usize, 3), g.totalConns());
+
+    // Reconcile down to the true live count: both counters follow.
+    g.reconcile(ip, 1);
+    try testing.expectEqual(@as(u32, 1), g.connCount(ip));
+    try testing.expectEqual(@as(usize, 1), g.totalConns());
+
+    // The one genuinely-live connection still closes cleanly to zero.
+    g.connClosed(ip);
+    try testing.expectEqual(@as(u32, 0), g.connCount(ip));
+    try testing.expectEqual(@as(usize, 0), g.totalConns());
+
+    // Reconciling an untracked IP is a no-op — no negative/overflowed counters.
+    g.reconcile(mkIp("192.0.2.51"), 0);
+    try testing.expectEqual(@as(usize, 0), g.totalConns());
+
+    // Reconcile also corrects upward (keeps total == Σ active) without underflow.
+    try testing.expectEqual(AdmitVerdict.admitted, g.admit(ip));
+    g.reconcile(ip, 3);
+    try testing.expectEqual(@as(u32, 3), g.connCount(ip));
+    try testing.expectEqual(@as(usize, 3), g.totalConns());
+    g.reconcile(ip, 0);
     try testing.expectEqual(@as(usize, 0), g.totalConns());
 }
 
