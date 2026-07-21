@@ -21,6 +21,15 @@
 //! Ceiling (documented, not a bug): no zip64 (archives/entries > 4 GiB), no
 //! encrypted entries, no compression methods beyond Store/Deflate, read-only
 //! (no ZIP writing). See README.md.
+//!
+//! Untrusted-archive extraction contract: like `tar`, this reader surfaces each
+//! member's stored `name` verbatim and never writes to disk itself — it does
+//! NOT sanitise paths. A caller that extracts entries to the filesystem MUST
+//! reject unsafe names with `isSafeEntryName` (or otherwise confine the write to
+//! a target directory), else a hostile archive escapes the extraction root via
+//! `../` traversal / absolute / drive paths (the classic "zip slip"). Reading an
+//! entry's bytes is separately bounded by `EntryReader.initMax`'s output cap so a
+//! decompression bomb cannot expand unboundedly.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -36,16 +45,27 @@ pub const meta = .{
 /// Buffer the file reader uses for compressed bytes pulled from disk.
 const READER_BUF_SIZE = 64 * 1024;
 
+/// Default hard cap on a single entry's decompressed size (`EntryReader.init`),
+/// guarding against a decompression bomb — a tiny deflate stream that expands to
+/// gigabytes. A caller that legitimately needs larger entries raises it via
+/// `EntryReader.initMax`.
+pub const default_max_output: u64 = 1 << 30; // 1 GiB
+
 pub const Error = error{
     UnsupportedCompressionMethod,
     ZipNameTooLong,
     ZipBadFileOffset,
     ZipBadCentralDirectory,
+    /// An entry's declared uncompressed size exceeds the caller's output cap
+    /// (`EntryReader.initMax`) — refused up front, no unbounded decompression.
+    ZipEntryTooLarge,
 };
 
 /// One archive member. `name` is owned by the parent `Archive` (its name
 /// arena) and stays valid until `Archive.deinit`. Backslashes in the stored
-/// path are normalised to '/'.
+/// path are normalised to '/'. The name is otherwise UNSANITISED — a consumer
+/// that extracts to disk must gate it through `isSafeEntryName` (see the
+/// module's extraction contract).
 pub const Entry = struct {
     name: []const u8,
     compression: std.zip.CompressionMethod,
@@ -165,6 +185,32 @@ pub const Archive = struct {
     }
 };
 
+/// Zip-slip guard for an extraction contract. `zipstream` is a streaming
+/// *reader*: it surfaces each member's stored `name` verbatim (backslashes
+/// already normalised to '/') and never itself writes to disk. A caller that
+/// extracts entries to the filesystem MUST reject any name for which this
+/// returns `false` (or otherwise confine the write to a target directory),
+/// else a hostile archive paths an entry to `../../etc/...`, an absolute path
+/// or a Windows drive/UNC location and escapes the extraction root ("zip
+/// slip"). Mirrors `tar`'s contract (its reader likewise returns raw paths for
+/// the caller to sanitise), offered here as a ready predicate.
+///
+/// Rejects: empty names; absolute paths (`/x`, `\x`); a Windows drive or
+/// drive-relative prefix (`C:...`); and any `..` path segment on either
+/// separator (`../x`, `a/../b`, `dir\..\x`). Accepts ordinary relative member
+/// paths (`a.csv`, `sub/b.csv`), including names that merely contain dots
+/// (`a..b`, `...`).
+pub fn isSafeEntryName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    if (name[0] == '/' or name[0] == '\\') return false; // absolute
+    if (name.len >= 2 and name[1] == ':') return false; // "C:" drive / drive-relative
+    var it = std.mem.splitAny(u8, name, "/\\");
+    while (it.next()) |seg| {
+        if (std.mem.eql(u8, seg, "..")) return false; // traversal segment
+    }
+    return true;
+}
+
 /// A streaming reader over one entry's decompressed bytes. Initialise in place
 /// against an `Archive` and a caller-provided decompression `window` buffer
 /// (≥ `std.compress.flate.max_window_len` for deflate). The window must outlive
@@ -173,9 +219,21 @@ pub const Archive = struct {
 pub const EntryReader = struct {
     decompress: std.compress.flate.Decompress,
     limited: std.Io.Reader.Limited,
-    is_deflate: bool,
 
+    /// Open an entry with the default decompression-bomb cap
+    /// (`default_max_output`). See `initMax` to choose the cap.
     pub fn init(self: *EntryReader, archive: *Archive, entry: *const Entry, window: []u8) !void {
+        return self.initMax(archive, entry, window, default_max_output);
+    }
+
+    /// Open an entry, bounding its decompressed output at `max_output`. An entry
+    /// whose declared uncompressed size already exceeds the cap is refused with
+    /// `error.ZipEntryTooLarge` up front (no decompression happens). For deflate
+    /// the *running* output is additionally clamped to the declared size, so a
+    /// crafted stream that would expand past its own central-directory bound is
+    /// truncated at that bound rather than read unbounded — a decompression bomb
+    /// can never force an unbounded read/allocation on the consumer.
+    pub fn initMax(self: *EntryReader, archive: *Archive, entry: *const Entry, window: []u8, max_output: u64) !void {
         const fr = &archive.file_reader;
 
         // Locate the compressed data: the local header carries its own
@@ -189,23 +247,30 @@ pub const EntryReader = struct {
             @as(u64, local.filename_len) + @as(u64, local.extra_len);
         try fr.seekTo(data_off);
 
+        // Decompression-bomb guard: refuse an entry that declares more output
+        // than the caller allows before any bytes are read.
+        if (entry.uncompressed_size > max_output) return Error.ZipEntryTooLarge;
+
         switch (entry.compression) {
             .deflate => {
-                self.is_deflate = true;
                 self.decompress = .init(&fr.interface, .raw, window);
+                // Clamp the decompressed stream to the declared size. `window`
+                // is already owned by `decompress`, so the Limited reads
+                // straight through with no buffer of its own.
+                self.limited = self.decompress.reader.limited(.limited64(entry.uncompressed_size), &.{});
             },
             .store => {
-                self.is_deflate = false;
                 self.limited = fr.interface.limited(.limited64(entry.uncompressed_size), window);
             },
             else => return Error.UnsupportedCompressionMethod,
         }
     }
 
-    /// The decompressed-byte reader. Valid until the next `EntryReader.init`
-    /// against the same archive (which reseeks the file cursor).
+    /// The decompressed-byte reader, bounded by the output cap. Valid until the
+    /// next `EntryReader.init` against the same archive (which reseeks the file
+    /// cursor).
     pub fn reader(self: *EntryReader) *std.Io.Reader {
-        return if (self.is_deflate) &self.decompress.reader else &self.limited.interface;
+        return &self.limited.interface;
     }
 };
 
@@ -568,4 +633,65 @@ test "EntryReader: a size lie beyond physical EOF errors cleanly, not UB" {
     // EndOfStream error, cleanly, instead of looping forever or reading
     // past the allocation.
     try testing.expectError(error.EndOfStream, er.reader().readSliceAll(buf));
+}
+
+test "isSafeEntryName flags zip-slip names, accepts ordinary member paths" {
+    // Traversal, absolute and Windows drive/backslash tricks are rejected.
+    try testing.expect(!isSafeEntryName("../x"));
+    try testing.expect(!isSafeEntryName("a/../../b"));
+    try testing.expect(!isSafeEntryName("a/.."));
+    try testing.expect(!isSafeEntryName(".."));
+    try testing.expect(!isSafeEntryName("/abs"));
+    try testing.expect(!isSafeEntryName("\\abs"));
+    try testing.expect(!isSafeEntryName("C:/Windows/x"));
+    try testing.expect(!isSafeEntryName("C:\\Windows\\x"));
+    try testing.expect(!isSafeEntryName("dir\\..\\..\\x"));
+    try testing.expect(!isSafeEntryName(""));
+    // Ordinary relative member paths, and names that merely contain dots,
+    // are accepted (only a whole '..' segment is traversal).
+    try testing.expect(isSafeEntryName("a.csv"));
+    try testing.expect(isSafeEntryName("sub/b.csv"));
+    try testing.expect(isSafeEntryName("a..b/c"));
+    try testing.expect(isSafeEntryName("..."));
+    try testing.expect(isSafeEntryName("deep/nested/dir/file.txt"));
+}
+
+test "EntryReader: a decompression bomb (declared size over the cap) is refused, not read unbounded" {
+    const a = testing.allocator;
+
+    // A highly compressible entry: 256 KiB of zeros deflates to a handful of
+    // bytes — the shape of a decompression bomb (tiny on disk, huge expanded).
+    const big = try a.alloc(u8, 256 * 1024);
+    defer a.free(big);
+    @memset(big, 0);
+    const zip = try buildZip(a, &.{.{ .name = "bomb.bin", .data = big, .method = .deflate }});
+    defer a.free(zip);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var f = try openZip(&tmp, zip);
+    defer f.close(testing.io);
+
+    var archive: Archive = undefined;
+    try archive.init(testing.io, a, f);
+    defer archive.deinit();
+
+    const e = archive.find("bomb.bin").?;
+    try testing.expectEqual(@as(u64, 256 * 1024), e.uncompressed_size);
+
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+
+    // A cap below the declared size refuses the entry up front — no unbounded
+    // decompression, a clean typed error.
+    var er_capped: EntryReader = undefined;
+    try testing.expectError(Error.ZipEntryTooLarge, er_capped.initMax(&archive, e, &window, 64 * 1024));
+
+    // A generous cap decompresses the same entry correctly, bounded to exactly
+    // its declared size.
+    var er_ok: EntryReader = undefined;
+    try er_ok.initMax(&archive, e, &window, 1 << 20);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try er_ok.reader().appendRemaining(a, &out, .unlimited);
+    try testing.expectEqual(@as(usize, 256 * 1024), out.items.len);
 }
