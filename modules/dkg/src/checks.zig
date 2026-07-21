@@ -49,7 +49,10 @@ pub fn verifyingShareConsistent(o: DkgShareOutput) bool {
 pub fn reconstructsToQ(allocator: std.mem.Allocator, shares: []const DkgShareOutput) !bool {
     if (shares.len == 0) return false;
     const ss = try allocator.alloc(tecdsa.ShamirShare, shares.len);
-    defer allocator.free(ss);
+    defer {
+        std.crypto.secureZero(u8, std.mem.sliceAsBytes(ss));
+        allocator.free(ss);
+    }
     for (ss, shares) |*dst, src| dst.* = .{ .index = src.index, .scalar = src.secret_share };
 
     const x = tecdsa.reconstructSecret(ss) catch return false;

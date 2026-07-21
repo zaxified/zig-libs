@@ -490,7 +490,15 @@ pub fn signWithShares(
 
     // ── Phase 1/2: local secrets + Γ commit-reveal + knowledge proofs ───
     const eph = try allocator.alloc(Ephemeral, t);
-    defer allocator.free(eph);
+    // `k`/`gamma`/`w`/`delta`/`sigma` are all secret per-party scalars
+    // (the ephemeral nonce, blinding, weighted key share, and their MtA
+    // accumulators); `big_gamma` is the public Γ commitment. Zero the
+    // whole scratch array before freeing — nothing here is retained past
+    // this function, and it's simplest/safest to wipe it all.
+    defer {
+        std.crypto.secureZero(u8, std.mem.sliceAsBytes(eph));
+        allocator.free(eph);
+    }
 
     for (shares, 0..) |s, idx| {
         const k_i = randomScalar(random);
@@ -845,4 +853,30 @@ test "lagrangeCoefficient: Σ λ_i · x_i over a subset reconstructs the group s
     const expected_x = try Secp256k1.basePoint.mul(acc.toBytes(.big), .big);
     const actual_x = try kg.key_shares[0].group_public_key.point();
     try testing.expect(expected_x.equivalent(actual_x));
+}
+
+test "Ephemeral scratch: secureZero wipes the secret per-party k/gamma/w/delta/sigma scalars" {
+    // Regression test for signWithShares' `defer secureZero(...); allocator.free(eph)`
+    // (this file's Ephemeral[] scratch). Builds a small Ephemeral array with
+    // recognizably-nonzero secret fields, applies the SAME secureZero the
+    // driver's defer uses, and checks every byte went to zero — cheap
+    // (no keygen), so it runs in Debug too, unlike the heavy end-to-end tests.
+    const allocator = testing.allocator;
+    const nonzero = Scalar.fromBytes([_]u8{0} ** 31 ++ [_]u8{0x42}, .big) catch unreachable;
+    const g = Element.fromPoint(Secp256k1.basePoint) catch unreachable;
+
+    const eph = try allocator.alloc(Ephemeral, 2);
+    defer allocator.free(eph);
+    for (eph) |*e| e.* = .{ .k = nonzero, .gamma = nonzero, .w = nonzero, .big_gamma = g, .delta = nonzero, .sigma = nonzero };
+
+    std.crypto.secureZero(u8, std.mem.sliceAsBytes(eph));
+
+    const zero_scalar_bytes = [_]u8{0} ** Ns;
+    for (eph) |e| {
+        try testing.expectEqualSlices(u8, &zero_scalar_bytes, &e.k.toBytes(.big));
+        try testing.expectEqualSlices(u8, &zero_scalar_bytes, &e.gamma.toBytes(.big));
+        try testing.expectEqualSlices(u8, &zero_scalar_bytes, &e.w.toBytes(.big));
+        try testing.expectEqualSlices(u8, &zero_scalar_bytes, &e.delta.toBytes(.big));
+        try testing.expectEqualSlices(u8, &zero_scalar_bytes, &e.sigma.toBytes(.big));
+    }
 }

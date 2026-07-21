@@ -434,13 +434,15 @@ pub fn proveCredential(
     // Re-randomise σ → σ' = ([r'] h, [r'] s). r' MUST be nonzero or σ₁'
     // degenerates to the identity (which VerifyCred rejects — e(1, κ)
     // is trivially satisfiable).
-    const r_prime = blk: {
+    var r_prime = blk: {
         while (true) {
             const c = keys.randomScalar(random);
             if (!c.isZero()) break :blk c;
         }
     };
-    const r = keys.randomScalar(random);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&r_prime));
+    var r = keys.randomScalar(random);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&r));
     const sigma1_jac = g1.Jacobian.fromAffine(cred.h).scalarMul(r_prime);
     const sigma1 = sigma1_jac.toAffine();
     const sigma2 = g1.Jacobian.fromAffine(cred.s).scalarMul(r_prime).toAffine();
@@ -454,9 +456,13 @@ pub fn proveCredential(
     // blinding r, one per HIDDEN attribute:
     //   Aw = [r̃] g2 + Σ_{hidden j} [m̃ⱼ] βⱼ   (the κ-side witness)
     //   Bw = [r̃] σ₁'                          (the ν-side witness)
-    const r_tilde = keys.randomScalar(random);
+    var r_tilde = keys.randomScalar(random);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&r_tilde));
     const m_tilde = try allocator.alloc(Fr, hidden);
-    defer allocator.free(m_tilde);
+    defer {
+        std.crypto.secureZero(u8, std.mem.sliceAsBytes(m_tilde));
+        allocator.free(m_tilde);
+    }
     for (m_tilde) |*m| m.* = keys.randomScalar(random);
 
     var aw_acc = g2gen.scalarMul(r_tilde);
@@ -602,7 +608,7 @@ test "psSignWithSecret / psVerifyPlain: valid credential accepted, tamper reject
     const p = try Parameters.generate(allocator, 3);
     defer p.deinit(allocator);
     var prng = std.Random.DefaultPrng.init(0x5151);
-    const kk = try keys.keygen(allocator, prng.random(), 3, 2, 3);
+    var kk = try keys.keygen(allocator, prng.random(), 3, 2, 3);
     defer kk.deinit(allocator);
 
     const attrs = [_]Fr{ frOf(10), frOf(20), frOf(30) };
@@ -630,7 +636,7 @@ test "Credential / PartialCredential codec round-trips" {
     const p = try Parameters.generate(allocator, 2);
     defer p.deinit(allocator);
     var prng = std.Random.DefaultPrng.init(7);
-    const kk = try keys.keygen(allocator, prng.random(), 2, 2, 3);
+    var kk = try keys.keygen(allocator, prng.random(), 2, 2, 3);
     defer kk.deinit(allocator);
     const attrs = [_]Fr{ frOf(3), frOf(4) };
     const h = p.commonBase(&attrs);

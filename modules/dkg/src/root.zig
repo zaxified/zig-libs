@@ -173,7 +173,10 @@ test "END-TO-END ANCHOR: DKG shares -> threshold sign -> std ECDSA verify under 
 
     // 1. Run the real DKG (no dealer) to completion.
     const outs = try Dkg.run(allocator, cfg, .{}, random);
-    defer allocator.free(outs);
+    defer {
+        for (outs) |*o| o.deinit();
+        allocator.free(outs);
+    }
     try testing.expect(checks.allSameQ(outs));
 
     // 2. Attach per-party Paillier + aux material.

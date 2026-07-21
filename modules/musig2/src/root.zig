@@ -273,10 +273,12 @@ pub const SecNonceError = error{InvalidSecNonce};
 /// SECURITY: a `SecNonce` MUST be used as input to `sign` at most once —
 /// reusing it (with a different message/signer-set) is exactly the
 /// classic Schnorr nonce-reuse key-leak, same failure mode `bip340`'s
-/// `SPEC.md` documents for its own nonce. This module cannot enforce
-/// "used at most once" (that requires caller-side bookkeeping, e.g.
-/// zeroizing/erasing the value right after `sign` — a future consumer-side
-/// concern, not this struct's).
+/// `SPEC.md` documents for its own nonce. `sign` zeroes its OWN local copy
+/// via `deinit` right after use (defense-in-depth — reduces the value's
+/// on-stack lifetime), but that cannot reach the caller's copy: the
+/// caller remains responsible for erasing/dropping its own `SecNonce`
+/// after the single `sign` call, e.g. `defer secnonce.deinit();` placed
+/// immediately after drawing it (see `nonceGen`).
 pub const SecNonce = struct {
     bytes: [97]u8,
 
@@ -287,6 +289,13 @@ pub const SecNonce = struct {
     /// `k1Scalar`/`k2Scalar`).
     pub fn fromBytes(bytes: [97]u8) SecNonce {
         return .{ .bytes = bytes };
+    }
+
+    /// Zero the 97 secret bytes in place. Idempotent. Call this as soon
+    /// as a `SecNonce` has served its single `sign` use (or will never be
+    /// used at all) — see the struct doc comment.
+    pub fn deinit(self: *SecNonce) void {
+        std.crypto.secureZero(u8, &self.bytes);
     }
 
     fn scalarAt(sn: SecNonce, comptime start: usize) SecNonceError!Scalar {
@@ -844,12 +853,17 @@ pub const SignError = SessionError || SecNonceError || error{
 ///      `error.SignatureVerificationFailed` otherwise, never the
 ///      unverified `s`.
 pub fn sign(secnonce: SecNonce, sk: bip340.SecretKey, ctx: SessionContext) SignError!PartialSignature {
-    const k1_prime = try secnonce.k1Scalar();
-    const k2_prime = try secnonce.k2Scalar();
+    // Local copy zeroed on every exit path (defense-in-depth — see
+    // `SecNonce`'s doc comment; the caller's own copy is its own to erase).
+    var sn = secnonce;
+    defer sn.deinit();
+
+    const k1_prime = try sn.k1Scalar();
+    const k2_prime = try sn.k2Scalar();
 
     const p_point = Secp256k1.combMulBase(sk.bytes, .big) catch return error.SecretKeyMismatch;
     const pk_bytes = cbytes(p_point);
-    if (!std.mem.eql(u8, &pk_bytes, &secnonce.pubkeyBytes())) return error.SecretKeyMismatch;
+    if (!std.mem.eql(u8, &pk_bytes, &sn.pubkeyBytes())) return error.SecretKeyMismatch;
     if (findPubkeyIndex(ctx.pubkeys, pk_bytes) == null) return error.PubkeyNotInSession;
 
     const sv = try getSessionValues(ctx);
@@ -1028,4 +1042,13 @@ test "encoded_length constants match BIP327's wire sizes" {
     try std.testing.expectEqual(@as(usize, 66), AggNonce.encoded_length);
     try std.testing.expectEqual(@as(usize, 97), SecNonce.encoded_length);
     try std.testing.expectEqual(@as(usize, 32), PartialSignature.encoded_length);
+}
+
+test "SecNonce.deinit zeroes all 97 secret bytes" {
+    var sn = SecNonce.fromBytes([_]u8{0xAB} ** 97);
+    sn.deinit();
+    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 97), &sn.bytes);
+    // Idempotent.
+    sn.deinit();
+    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 97), &sn.bytes);
 }

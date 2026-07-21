@@ -55,8 +55,13 @@ pub const SecretKey = struct {
     x: Fr,
     ys: []Fr,
 
-    pub fn deinit(self: SecretKey, allocator: std.mem.Allocator) void {
+    /// Zero the secret material (`x` and every `ys[i]`), then free `ys`.
+    /// `self` must be `var` (addressable) so `x` is zeroed in the caller's
+    /// own storage, not just this by-pointer view of it.
+    pub fn deinit(self: *SecretKey, allocator: std.mem.Allocator) void {
+        std.crypto.secureZero(u8, std.mem.sliceAsBytes(self.ys));
         allocator.free(self.ys);
+        std.crypto.secureZero(u8, std.mem.asBytes(&self.x));
     }
 };
 
@@ -86,8 +91,13 @@ pub const SecretKeyShare = struct {
     x: Fr,
     ys: []Fr,
 
-    pub fn deinit(self: SecretKeyShare, allocator: std.mem.Allocator) void {
+    /// Zero the SECRET fields (`x`, every `ys[i]`), then free `ys`.
+    /// `index` is the (public) Shamir evaluation point — left untouched.
+    /// `self` must be `var` (addressable) so `x` is zeroed in place.
+    pub fn deinit(self: *SecretKeyShare, allocator: std.mem.Allocator) void {
+        std.crypto.secureZero(u8, std.mem.sliceAsBytes(self.ys));
         allocator.free(self.ys);
+        std.crypto.secureZero(u8, std.mem.asBytes(&self.x));
     }
 };
 
@@ -123,10 +133,12 @@ pub const ThresholdKeys = struct {
     sk_shares: []SecretKeyShare,
     vk_shares: []VerificationKeyShare,
 
-    pub fn deinit(self: ThresholdKeys, allocator: std.mem.Allocator) void {
+    /// `self` must be `var` (addressable) — `master_sk`/`sk_shares` zero
+    /// their secret fields in place before freeing (see their `deinit`s).
+    pub fn deinit(self: *ThresholdKeys, allocator: std.mem.Allocator) void {
         self.master_sk.deinit(allocator);
         self.master_vk.deinit(allocator);
-        for (self.sk_shares) |s| s.deinit(allocator);
+        for (self.sk_shares) |*s| s.deinit(allocator);
         allocator.free(self.sk_shares);
         for (self.vk_shares) |s| s.deinit(allocator);
         allocator.free(self.vk_shares);
@@ -152,6 +164,9 @@ pub fn keygen(
     const ncoef: usize = @intCast(t);
     var polys = try allocator.alloc([]Fr, q + 1);
     defer {
+        // The polynomial coefficients ARE the secret key components
+        // (poly[c][0]) plus their blinding — zero before free.
+        for (polys) |p| std.crypto.secureZero(u8, std.mem.sliceAsBytes(p));
         for (polys) |p| allocator.free(p);
         allocator.free(polys);
     }
@@ -163,7 +178,7 @@ pub fn keygen(
         for (p.*) |*c| c.* = randomScalar(random);
     }
 
-    const master_sk = SecretKey{
+    var master_sk = SecretKey{
         .x = polys[0][0],
         .ys = blk: {
             const ys = try allocator.alloc(Fr, q);
@@ -178,7 +193,7 @@ pub fn keygen(
     const sk_shares = try allocator.alloc(SecretKeyShare, @intCast(n));
     var sk_done: usize = 0;
     errdefer {
-        for (sk_shares[0..sk_done]) |s| s.deinit(allocator);
+        for (sk_shares[0..sk_done]) |*s| s.deinit(allocator);
         allocator.free(sk_shares);
     }
     for (sk_shares, 1..) |*share, idx| {
@@ -264,7 +279,7 @@ pub fn aggregateVerificationKeys(
 test "keygen: any t shares Lagrange-reconstruct the master secret key vector" {
     const allocator = std.testing.allocator;
     var prng = std.Random.DefaultPrng.init(0xC0C0);
-    const keys = try keygen(allocator, prng.random(), 3, 2, 4);
+    var keys = try keygen(allocator, prng.random(), 3, 2, 4);
     defer keys.deinit(allocator);
 
     // Reconstruct x and each y_j in the SCALAR field from shares {2,3}.
@@ -285,7 +300,7 @@ test "keygen: any t shares Lagrange-reconstruct the master secret key vector" {
 test "aggregateVerificationKeys: Lagrange-in-exponent recovers the master vk" {
     const allocator = std.testing.allocator;
     var prng = std.Random.DefaultPrng.init(0xBEEF);
-    const keys = try keygen(allocator, prng.random(), 2, 3, 5);
+    var keys = try keygen(allocator, prng.random(), 2, 3, 5);
     defer keys.deinit(allocator);
 
     // Aggregate a t=3 subset of vk shares (indices 1,3,5).
@@ -301,6 +316,28 @@ test "aggregateVerificationKeys: Lagrange-in-exponent recovers the master vk" {
     const agg2 = try aggregateVerificationKeys(allocator, &subset2);
     defer agg2.deinit(allocator);
     try std.testing.expect(g2Eql(agg2.alpha, keys.master_vk.alpha));
+}
+
+test "SecretKey/SecretKeyShare.deinit zeroes the secret Fr material" {
+    const allocator = std.testing.allocator;
+
+    var sk = SecretKey{ .x = commitFr(11), .ys = try allocator.dupe(Fr, &[_]Fr{ commitFr(22), commitFr(33) }) };
+    // Snapshot the heap pointer before deinit frees it: secureZero writes
+    // through it first, so the bytes at that address must be zero right
+    // up to (and logically including) the free.
+    sk.deinit(allocator);
+    try std.testing.expect(sk.x.eql(Fr.zero));
+
+    var share = SecretKeyShare{ .index = 7, .x = commitFr(44), .ys = try allocator.dupe(Fr, &[_]Fr{commitFr(55)}) };
+    share.deinit(allocator);
+    try std.testing.expect(share.x.eql(Fr.zero));
+    try std.testing.expectEqual(@as(u64, 7), share.index); // public field untouched
+}
+
+fn commitFr(v: u32) Fr {
+    var buf: [32]u8 = [_]u8{0} ** 32;
+    std.mem.writeInt(u32, buf[28..32], v, .big);
+    return Fr.fromBytes(buf) catch unreachable;
 }
 
 test "keygen: rejects invalid thresholds" {

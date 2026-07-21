@@ -318,7 +318,10 @@ test "positive control: BrokenDkg with NO corruption reconstructs to Q (teeth qu
     const cfg: Config = .{ .t = 2, .n = 3 };
 
     const outs = try BrokenDkg.run(allocator, cfg, .{}, prng.random());
-    defer allocator.free(outs);
+    defer {
+        for (outs) |*o| o.deinit();
+        allocator.free(outs);
+    }
 
     try testing.expect(checks.allSameQ(outs));
     try testing.expect(checks.verifyingShareConsistent(outs[0]));
@@ -338,7 +341,10 @@ test "positive control: BrokenDkg that accepts a Byzantine bad share yields an u
     // BrokenDkg skips the check and accepts it.
     const corr: Corruption = .{ .bad_dealer = 1, .bad_receiver = 2 };
     const outs = try BrokenDkg.run(allocator, cfg, corr, prng.random());
-    defer allocator.free(outs);
+    defer {
+        for (outs) |*o| o.deinit();
+        allocator.free(outs);
+    }
 
     // Party 2's share is corrupted, so any reconstruction subset that
     // includes it fails to reproduce Q — the teeth fire.
@@ -362,7 +368,10 @@ test "honest Dkg round trip (all correctness invariants) — GATED on core" {
     const cfg: Config = .{ .t = 2, .n = 3 };
 
     const outs = try Dkg.run(allocator, cfg, .{}, prng.random());
-    defer allocator.free(outs);
+    defer {
+        for (outs) |*o| o.deinit();
+        allocator.free(outs);
+    }
 
     try testing.expect(checks.allSameQ(outs));
     for (outs) |o| try testing.expect(checks.verifyingShareConsistent(o));
@@ -380,7 +389,10 @@ test "honest Dkg detects + disqualifies a Byzantine dealer that cannot defend �
     // Dealer 3 sends a bad share to receiver 1 AND fails its defense.
     const corr: Corruption = .{ .bad_dealer = 3, .bad_receiver = 1, .defend_honestly = false };
     const outs = try Dkg.run(allocator, cfg, corr, prng.random());
-    defer allocator.free(outs);
+    defer {
+        for (outs) |*o| o.deinit();
+        allocator.free(outs);
+    }
 
     // Even with dealer 3 disqualified, the surviving QUAL set yields a
     // consistent, reconstructible key.
@@ -399,7 +411,10 @@ test "honest Dkg tolerates a defended complaint (transient bad share) — GATED 
     // complaint → stays in QUAL, receiver adopts the revealed good share.
     const corr: Corruption = .{ .bad_dealer = 1, .bad_receiver = 2, .defend_honestly = true };
     const outs = try Dkg.run(allocator, cfg, corr, prng.random());
-    defer allocator.free(outs);
+    defer {
+        for (outs) |*o| o.deinit();
+        allocator.free(outs);
+    }
 
     try testing.expect(checks.allSameQ(outs));
     try testing.expect(try checks.reconstructsToQ(allocator, outs[0..2]));

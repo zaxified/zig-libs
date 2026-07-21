@@ -219,7 +219,10 @@ test "trustedDealerKeygen(group secret, [coefficient_1], 3, 2) reproduces all 3 
     const coefficients = [_]frost.Scalar{scalarFromHex(v.group.coefficient_1)};
 
     const result = try frost.trustedDealerKeygen(gpa, secret_key, &coefficients, v.config.max_participants, v.config.min_participants);
-    defer gpa.free(result.shares);
+    defer {
+        for (result.shares) |*s| s.deinit();
+        gpa.free(result.shares);
+    }
     defer gpa.free(result.vss_commitment);
 
     try std.testing.expectEqualSlices(u8, &hexN(33, v.group.public_key), &result.group_public_key.toBytes());
@@ -428,7 +431,10 @@ test "end-to-end (2,3) round trip: keygen -> commit -> sign -> aggregate -> veri
     }, .big)};
 
     const keygen = try frost.trustedDealerKeygen(gpa, secret_key, &coefficients, 3, 2);
-    defer gpa.free(keygen.shares);
+    defer {
+        for (keygen.shares) |*s| s.deinit();
+        gpa.free(keygen.shares);
+    }
     defer gpa.free(keygen.vss_commitment);
 
     // Sign with participants 1 and 2 (any 2-of-3 subset works).

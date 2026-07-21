@@ -516,6 +516,14 @@ fn ScalarWire(comptime tag: []const u8) type {
         pub fn toBytes(self: @This()) [Ns]u8 {
             return self.bytes;
         }
+
+        /// Zero the 32 wrapped bytes in place. Idempotent. Meaningful for
+        /// `SigningShare` (SECRET `sk_i` — zero it once it has served its
+        /// signing use); a harmless no-op-in-spirit for `SignatureShare`
+        /// (a round-2 OUTPUT that is meant to be transmitted, not secret).
+        pub fn deinit(self: *@This()) void {
+            std.crypto.secureZero(u8, &self.bytes);
+        }
     };
 }
 
@@ -540,6 +548,13 @@ pub const SignatureShare = ScalarWire("SignatureShare");
 pub const SigningNonces = struct {
     hiding: Scalar,
     binding: Scalar,
+
+    /// Zero both secret scalars in place. Idempotent. Call once a
+    /// `SigningNonces` has served its single `round1Commit`/`round2Sign`
+    /// use (RFC 9591 §5.1: a nonce pair MUST NOT be reused).
+    pub fn deinit(self: *SigningNonces) void {
+        std.crypto.secureZero(u8, std.mem.asBytes(self));
+    }
 };
 
 /// The PUBLIC half of round 1: one participant's pair of nonce
@@ -896,12 +911,17 @@ pub const Round1CommitError = error{
 /// E.5's `P1`/`P3` `hiding_nonce_commitment`/`binding_nonce_commitment`
 /// (`kat_test.zig`).
 pub fn round1Commit(nonces: SigningNonces) Round1CommitError!NonceCommitmentPair {
+    // Local copy zeroed on every exit path (RFC 9591 §5.1: a nonce pair
+    // MUST NOT be reused; the caller's own copy is its own to erase).
+    var n = nonces;
+    defer n.deinit();
+
     // ScalarBaseMult on each SECRET nonce — Secp256k1.mul is
     // constant-time; it errors exactly when the nonce is zero (identity
     // result), the defensive case Round1CommitError documents.
-    const hiding_point = Secp256k1.combMulBase(nonces.hiding.toBytes(.big), .big) catch
+    const hiding_point = Secp256k1.combMulBase(n.hiding.toBytes(.big), .big) catch
         return error.InvalidNonce;
-    const binding_point = Secp256k1.combMulBase(nonces.binding.toBytes(.big), .big) catch
+    const binding_point = Secp256k1.combMulBase(n.binding.toBytes(.big), .big) catch
         return error.InvalidNonce;
     return .{
         .hiding = Element.fromPoint(hiding_point) catch return error.InvalidNonce,
@@ -961,6 +981,14 @@ pub fn round2Sign(
     msg: []const u8,
     commitment_list: []const SigningCommitments,
 ) Round2SignError!SignatureShare {
+    // Local copies zeroed on every exit path — see `SigningNonces`/
+    // `SigningShare`'s doc comments; the caller's own copies are its own
+    // to erase.
+    var n = nonces;
+    defer n.deinit();
+    var sk_i = signing_share;
+    defer sk_i.deinit();
+
     const binding_factor_list = try computeBindingFactors(allocator, group_public_key, commitment_list, msg);
     defer allocator.free(binding_factor_list);
     const binding_factor = bindingFactorForParticipant(binding_factor_list, identifier) catch
@@ -979,9 +1007,9 @@ pub fn round2Sign(
     //           + lambda_i*sk_i*challenge — every operand touching a
     // SECRET (both nonces, sk_i) goes through Secp256k1.scalar's
     // constant-time field ops; no secret-dependent branching.
-    const sig_share = nonces.hiding
-        .add(nonces.binding.mul(binding_factor))
-        .add(lambda_i.mul(signing_share.scalar()).mul(challenge));
+    const sig_share = n.hiding
+        .add(n.binding.mul(binding_factor))
+        .add(lambda_i.mul(sk_i.scalar()).mul(challenge));
     return SignatureShare.fromScalar(sig_share);
 }
 
@@ -1162,6 +1190,12 @@ pub fn verify(msg: []const u8, sig: Signature, group_public_key: GroupPublicKey)
 pub const ParticipantShare = struct {
     identifier: Identifier,
     signing_share: SigningShare,
+
+    /// Zero the SECRET `signing_share` in place. `identifier` is public
+    /// (the Shamir evaluation point) and left untouched. Idempotent.
+    pub fn deinit(self: *ParticipantShare) void {
+        self.signing_share.deinit();
+    }
 };
 
 pub const TrustedDealerKeygenResult = struct {
@@ -1358,6 +1392,30 @@ test "encoded_length constants match RFC 9591 §6.5's Ne=33/Ns=32" {
     try std.testing.expectEqual(@as(usize, 32), SigningShare.encoded_length);
     try std.testing.expectEqual(@as(usize, 32), SignatureShare.encoded_length);
     try std.testing.expectEqual(@as(usize, 65), Signature.encoded_length);
+}
+
+fn testScalarOf(v: u32) Scalar {
+    var buf: [Ns]u8 = [_]u8{0} ** Ns;
+    std.mem.writeInt(u32, buf[Ns - 4 .. Ns], v, .big);
+    return Scalar.fromBytes(buf, .big) catch unreachable;
+}
+
+test "SigningNonces/SigningShare/ParticipantShare.deinit zero their secret scalars" {
+    var nonces = SigningNonces{ .hiding = testScalarOf(11), .binding = testScalarOf(22) };
+    nonces.deinit();
+    try std.testing.expect(nonces.hiding.isZero());
+    try std.testing.expect(nonces.binding.isZero());
+    nonces.deinit(); // idempotent
+
+    var share = SigningShare.fromScalar(testScalarOf(33));
+    share.deinit();
+    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** Ns), &share.bytes);
+
+    const id = try Identifier.fromU16(7);
+    var pshare = ParticipantShare{ .identifier = id, .signing_share = SigningShare.fromScalar(testScalarOf(44)) };
+    pshare.deinit();
+    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** Ns), &pshare.signing_share.bytes);
+    try std.testing.expectEqual(id, pshare.identifier); // public field untouched
 }
 
 test "Identifier.fromU16 rejects zero" {
