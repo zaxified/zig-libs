@@ -40,6 +40,11 @@ pub const ColumnType = enum {
     /// ISO "YYYY-MM-DD" text, tagged so temporal transforms (resample/pivot/
     /// clamp_range) know to parse it. The cell value is still `Value.text`.
     date,
+    /// Exact fixed-point money/quantity type. The cell value is `Value.decimal`
+    /// (a raw `i128` at the sibling `decimal` module's scale — see there for
+    /// the convention). Appended last so its ordinal (4→5 shift point) never
+    /// collides with an already-serialized `.date` byte; do not reorder.
+    decimal,
 };
 
 pub const Column = struct {
@@ -47,30 +52,46 @@ pub const Column = struct {
     type: ColumnType,
 };
 
+/// Fixed-point scale for `Value.decimal`'s raw `i128`, matching the sibling
+/// `decimal` module's `Decimal.scale_factor` (12 fractional digits). `dataset`
+/// intentionally does NOT depend on the `decimal` module (stays a leaf
+/// container) — it only stores/moves the raw integer. Consumers that need
+/// arithmetic or display formatting wrap it themselves:
+/// `decimal.Decimal{ .raw = value.decimal }`.
+pub const decimal_scale: i128 = 1_000_000_000_000;
+
 /// A single cell. `date` values live in `.text` (ISO); the column's
-/// `ColumnType` carries the temporal intent.
+/// `ColumnType` carries the temporal intent. `decimal` is a raw fixed-point
+/// `i128` at `decimal_scale` — see that constant's doc comment.
 pub const Value = union(enum) {
     null,
     int: i64,
     float: f64,
     text: []const u8,
     bool: bool,
+    decimal: i128,
 
-    /// Coerce a numeric cell to f64 (int→float, float→float). `null`/text/bool → null.
+    /// Coerce a numeric cell to f64 (int→float, float→float, decimal→float by
+    /// dividing out the scale — lossy for values needing exact precision, use
+    /// the raw `i128` directly for that). `null`/text/bool → null.
     pub fn asFloat(self: Value) ?f64 {
         return switch (self) {
             .int => |i| @floatFromInt(i),
             .float => |f| f,
+            .decimal => |r| @as(f64, @floatFromInt(r)) / @as(f64, @floatFromInt(decimal_scale)),
             else => null,
         };
     }
 
     /// Coerce a numeric cell to i64. `int` passes through; `float` truncates
-    /// toward zero. `null`/text/bool → null.
+    /// toward zero; `decimal` truncates toward zero after dividing out the
+    /// scale (null if the whole-unit part doesn't fit i64). `null`/text/bool
+    /// → null.
     pub fn asInt(self: Value) ?i64 {
         return switch (self) {
             .int => |i| i,
             .float => |f| @intFromFloat(f),
+            .decimal => |r| std.math.cast(i64, @divTrunc(r, decimal_scale)),
             else => null,
         };
     }
@@ -86,8 +107,12 @@ pub const Value = union(enum) {
         return self == .null;
     }
 
-    /// Value equality for group keys / dedup. Numeric int/float compare by f64.
+    /// Value equality for group keys / dedup. Numeric int/float compare by
+    /// f64; two `decimal`s compare exactly on the raw `i128` (not through the
+    /// lossy f64 path) so equal-money values never spuriously mismatch or
+    /// collide.
     pub fn eql(a: Value, b: Value) bool {
+        if (a == .decimal and b == .decimal) return a.decimal == b.decimal;
         if (a.asFloat()) |af| {
             if (b.asFloat()) |bf| return af == bf;
             return false;
@@ -100,9 +125,11 @@ pub const Value = union(enum) {
         };
     }
 
-    /// Ordering for sort. null sorts first; numerics by value; text lexicographic;
-    /// bool false<true. Mixed types order by a stable type rank.
+    /// Ordering for sort. null sorts first; numerics (int/float/decimal) by
+    /// value — two `decimal`s compare exactly on the raw `i128`; text
+    /// lexicographic; bool false<true. Mixed types order by a stable type rank.
     pub fn order(a: Value, b: Value) std.math.Order {
+        if (a == .decimal and b == .decimal) return std.math.order(a.decimal, b.decimal);
         if (a.asFloat()) |af| {
             if (b.asFloat()) |bf| return std.math.order(af, bf);
         }
@@ -120,7 +147,7 @@ pub const Value = union(enum) {
         return switch (v) {
             .null => 0,
             .bool => 1,
-            .int, .float => 2,
+            .int, .float, .decimal => 2,
             .text => 3,
         };
     }
@@ -133,6 +160,11 @@ pub const Value = union(enum) {
     /// single sane string-to-bool convention to bake in here. `date` uses the
     /// same representation as `text` (the column tag carries the intent), so
     /// coercing to `.date` just re-tags a `.text` cell; anything else → null.
+    /// `.decimal` accepts `decimal` passthrough, `int` (widen ×scale) and
+    /// `float` (multiply by scale, truncate toward zero; null on non-finite
+    /// input) — text→decimal is intentionally NOT attempted here (parsing a
+    /// decimal literal is the sibling `decimal` module's job; adding it here
+    /// would require depending on it, which this module avoids).
     pub fn cast(self: Value, to: ColumnType) ?Value {
         return switch (to) {
             .int => if (self.asInt()) |i| .{ .int = i } else null,
@@ -142,6 +174,15 @@ pub const Value = union(enum) {
                 .bool => self,
                 .int => |i| .{ .bool = i != 0 },
                 .float => |f| .{ .bool = f != 0 },
+                else => null,
+            },
+            .decimal => switch (self) {
+                .decimal => self,
+                .int => |i| .{ .decimal = @as(i128, i) * decimal_scale },
+                .float => |f| if (std.math.isFinite(f))
+                    .{ .decimal = @intFromFloat(f * @as(f64, @floatFromInt(decimal_scale))) }
+                else
+                    null,
                 else => null,
             },
         };
@@ -220,6 +261,44 @@ pub const Dataset = struct {
     }
 };
 
+/// Incremental row-at-a-time construction, for building a `Dataset` from a
+/// source that doesn't know its row count up front (a streamed query result,
+/// an iterator-shaped parse, …) without pre-sizing an array. Follows the same
+/// memory model as the rest of the module: `init` takes the allocator (and
+/// the already-known column schema — schema is fixed for the life of the
+/// builder, only rows stream in), `appendRow` copies the row's `Value` slice
+/// (structural array, per the module's borrow rule — the `Value`s themselves,
+/// e.g. `.text` payloads, may still point at caller-owned/borrowed memory),
+/// and `toOwned` hands back a normal immutable `Dataset` backed by the same
+/// allocator. Not thread-safe (a builder is a single-writer accumulator).
+pub const Builder = struct {
+    a: std.mem.Allocator,
+    columns: []const Column,
+    rows: std.ArrayList([]const Value) = .empty,
+
+    pub fn init(a: std.mem.Allocator, columns: []const Column) Builder {
+        return .{ .a = a, .columns = columns };
+    }
+
+    /// Append one row. `cells.len` must equal `columns.len` (asserted — a
+    /// column-count mismatch is a caller bug, not a runtime data condition).
+    /// The `cells` slice itself is copied (duped) into the builder's
+    /// allocator; individual `Value`s (e.g. borrowed `.text` slices) are not
+    /// deep-copied, matching the module's general borrow model.
+    pub fn appendRow(self: *Builder, cells: []const Value) std.mem.Allocator.Error!void {
+        std.debug.assert(cells.len == self.columns.len);
+        const owned = try self.a.dupe(Value, cells);
+        try self.rows.append(self.a, owned);
+    }
+
+    /// Finalize into an immutable `Dataset`. The builder's row list becomes
+    /// the `Dataset`'s `rows` backing array (no extra copy); the builder must
+    /// not be reused afterward (its `rows` list has been handed off).
+    pub fn toOwned(self: *Builder) std.mem.Allocator.Error!Dataset {
+        return .{ .columns = self.columns, .rows = try self.rows.toOwnedSlice(self.a) };
+    }
+};
+
 // ── binary (de)serialization ────────────────────────────────────────────────
 // Compact self-describing encoding so a Dataset can be stored in a byte-based
 // cache (or shipped over a wire). Little-endian. Round-trips exactly.
@@ -266,6 +345,12 @@ pub fn serialize(a: std.mem.Allocator, d: Dataset) SerializeError![]u8 {
                 .bool => |b| {
                     try buf.append(a, 4);
                     try buf.append(a, if (b) 1 else 0);
+                },
+                // Tag 5 — appended, not inserted: existing 0..4 tags (and
+                // whatever already-serialized bytes use them) never renumber.
+                .decimal => |r| {
+                    try buf.append(a, 5);
+                    try buf.appendSlice(a, &std.mem.toBytes(r));
                 },
             }
         }
@@ -314,6 +399,7 @@ pub fn deserialize(a: std.mem.Allocator, bytes: []const u8) DeserializeError!Dat
                     break :blk .{ .text = try a.dupe(u8, try cur.take(tlen)) };
                 },
                 4 => .{ .bool = (try cur.byte()) != 0 },
+                5 => .{ .decimal = std.mem.bytesToValue(i128, try cur.take(16)) },
                 else => return DeserializeError.Corrupt,
             };
         }
@@ -359,6 +445,40 @@ fn appendJsonValue(a: std.mem.Allocator, buf: *std.ArrayList(u8), v: Value) Seri
         .int => |i| try buf.print(a, "{d}", .{i}),
         .float => |f| if (std.math.isFinite(f)) try buf.print(a, "{d}", .{f}) else try buf.appendSlice(a, "null"),
         .text => |t| try appendJsonString(a, buf, t),
+        .decimal => |r| try appendJsonDecimal(a, buf, r),
+    }
+}
+
+/// Emit a `decimal` raw `i128` as an EXACT JSON number literal (not the lossy
+/// f64 path `appendJsonValue` uses for `.float`): place the decimal point by
+/// `decimal_scale` directly on the integer, so e.g. raw `1_500_000_000_000`
+/// (scale 1e12) becomes the literal `1.5`, never a binary-float
+/// approximation. Trailing fractional zeros are trimmed; a whole-unit value
+/// (zero fraction) is emitted with no decimal point at all.
+fn appendJsonDecimal(a: std.mem.Allocator, buf: *std.ArrayList(u8), raw: i128) SerializeError!void {
+    if (raw < 0) try buf.append(a, '-');
+    const mag: u128 = @intCast(@abs(raw));
+    const scale: u128 = @intCast(decimal_scale);
+    const int_part = mag / scale;
+    const frac = mag % scale;
+    try buf.print(a, "{d}", .{int_part});
+    if (frac != 0) {
+        // Zero-pad the fraction to the scale's digit width, then trim
+        // trailing zeros (e.g. 500_000_000_000 / 1e12 -> "5", not
+        // "500000000000").
+        var digits: [12]u8 = undefined;
+        comptime std.debug.assert(digits.len == std.math.log10_int(@as(u128, @intCast(decimal_scale))));
+        var tmp = frac;
+        var i: usize = digits.len;
+        while (i > 0) {
+            i -= 1;
+            digits[i] = '0' + @as(u8, @intCast(tmp % 10));
+            tmp /= 10;
+        }
+        var end: usize = digits.len;
+        while (end > 0 and digits[end - 1] == '0') end -= 1;
+        try buf.append(a, '.');
+        try buf.appendSlice(a, digits[0..end]);
     }
 }
 
@@ -578,6 +698,143 @@ test "Dataset.concat appends rows of a same-schema dataset" {
     // Mismatched column count -> error.
     const d4 = Dataset{ .columns = cols[0..1], .rows = &rows2 };
     try testing.expectError(error.SchemaMismatch, d1.concat(a, d4));
+}
+
+// ── decimal ──────────────────────────────────────────────────────────────────
+
+test "Value.decimal: asFloat/asInt coercion" {
+    const v = Value{ .decimal = 1_500_000_000_000 }; // 1.5 at scale 1e12
+    try testing.expectEqual(@as(f64, 1.5), v.asFloat().?);
+    try testing.expectEqual(@as(?i64, 1), v.asInt().?); // truncates toward zero
+
+    const neg = Value{ .decimal = -2_250_000_000_000 }; // -2.25
+    try testing.expectEqual(@as(f64, -2.25), neg.asFloat().?);
+    try testing.expectEqual(@as(?i64, -2), neg.asInt().?);
+
+    try testing.expectEqual(@as(?[]const u8, null), v.asText());
+}
+
+test "Value.decimal: eql/order compare exactly on the raw i128, not lossy f64" {
+    const a = Value{ .decimal = 1_000_000_000_001 }; // 1.000000000001
+    const b = Value{ .decimal = 1_000_000_000_002 }; // 1.000000000002 — 1 ULP apart at scale 1e12
+    try testing.expect(!Value.eql(a, b));
+    try testing.expectEqual(std.math.Order.lt, Value.order(a, b));
+    try testing.expect(Value.eql(a, .{ .decimal = 1_000_000_000_001 }));
+
+    // Cross-type: decimal vs int/float still compares numerically via the
+    // asFloat path (documented lossy fallback for mixed-type comparison).
+    try testing.expect(Value.eql(.{ .decimal = 3_000_000_000_000 }, .{ .int = 3 }));
+    try testing.expectEqual(std.math.Order.lt, Value.order(.{ .decimal = 1_000_000_000_000 }, .{ .int = 2 }));
+
+    // null < bool < numeric(int/float/decimal) < text — decimal shares the
+    // numeric rank.
+    try testing.expectEqual(std.math.Order.lt, Value.order(.null, .{ .decimal = 0 }));
+    try testing.expectEqual(std.math.Order.lt, Value.order(.{ .decimal = 0 }, .{ .text = "x" }));
+}
+
+test "Value.cast: float<->decimal and int<->decimal coercion" {
+    const from_int = (Value{ .int = 7 }).cast(.decimal).?;
+    try testing.expectEqual(@as(i128, 7_000_000_000_000), from_int.decimal);
+
+    const from_float = (Value{ .float = 2.5 }).cast(.decimal).?;
+    try testing.expectEqual(@as(i128, 2_500_000_000_000), from_float.decimal);
+
+    // -0.5 is exact in binary floating point, so this exercises the negative
+    // path with no rounding ambiguity.
+    const from_neg_float = (Value{ .float = -0.5 }).cast(.decimal).?;
+    try testing.expectEqual(@as(i128, -500_000_000_000), from_neg_float.decimal);
+
+    // non-finite float -> null, not a crash/UB.
+    try testing.expectEqual(@as(?Value, null), (Value{ .float = std.math.inf(f64) }).cast(.decimal));
+    try testing.expectEqual(@as(?Value, null), (Value{ .float = std.math.nan(f64) }).cast(.decimal));
+
+    // decimal -> float / int round-trips through the general asFloat/asInt path.
+    const d = Value{ .decimal = 4_250_000_000_000 };
+    try testing.expectEqual(@as(f64, 4.25), d.cast(.float).?.float);
+    try testing.expectEqual(@as(i64, 4), d.cast(.int).?.int);
+
+    // decimal passthrough.
+    try testing.expectEqual(@as(i128, 4_250_000_000_000), d.cast(.decimal).?.decimal);
+
+    // text -> decimal intentionally not attempted (documented: would need the
+    // `decimal` module's parser).
+    try testing.expectEqual(@as(?Value, null), (Value{ .text = "1.5" }).cast(.decimal));
+}
+
+test "decimal serialize/deserialize round-trips exactly (positive control: exact money sum)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cols = [_]Column{
+        .{ .name = "sym", .type = .text },
+        .{ .name = "price", .type = .decimal },
+    };
+    // 0.1 + 0.2 in f64 famously != 0.3; exact decimal cents must not drift.
+    const rows = [_][]const Value{
+        &.{ .{ .text = "A" }, .{ .decimal = 100_000_000_000 } }, // 0.1
+        &.{ .{ .text = "B" }, .{ .decimal = 200_000_000_000 } }, // 0.2
+    };
+    const src = Dataset{ .columns = &cols, .rows = &rows };
+    const bytes = try serialize(a, src);
+    const out = try deserialize(a, bytes);
+
+    try testing.expectEqual(ColumnType.decimal, out.columns[1].type);
+    const sum = out.cell(0, "price").?.decimal + out.cell(1, "price").?.decimal;
+    try testing.expectEqual(@as(i128, 300_000_000_000), sum); // exact 0.3, no f64 rounding noise
+    try testing.expect(Value.eql(.{ .decimal = 300_000_000_000 }, .{ .decimal = sum }));
+
+    // A well-formed header (1 int column, 1 row) whose sole cell tag byte is
+    // 99 (not one of the valid 0..5 tags) must error, not panic.
+    const bad_tag = [_]u8{
+        1, 0, 0, 0, // ncol = 1
+        0, 0, 0, 0, // column-name length = 0
+        0, // column type = int (0)
+        1, 0, 0, 0, // nrow = 1
+        99, // cell tag — invalid
+    };
+    try testing.expectError(DeserializeError.Corrupt, deserialize(a, &bad_tag));
+}
+
+test "toJson emits decimal as an exact placed-point number, not lossy f64" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cols = [_]Column{.{ .name = "amt", .type = .decimal }};
+    const rows = [_][]const Value{
+        &.{.{ .decimal = 1_500_000_000_000 }}, // 1.5
+        &.{.{ .decimal = -2_000_000_000_000 }}, // -2 (whole unit, no fraction)
+        &.{.{ .decimal = 1 }}, // 0.000000000001 (smallest sub-unit)
+        &.{.{ .decimal = 0 }}, // 0
+    };
+    const json = try toJson(a, .{ .columns = &cols, .rows = &rows });
+    try testing.expectEqualStrings(
+        "{\"columns\":[{\"name\":\"amt\",\"type\":\"decimal\"}]," ++
+            "\"rows\":[[1.5],[-2],[0.000000000001],[0]]}",
+        json,
+    );
+}
+
+test "Builder: incremental row-at-a-time construction" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cols = [_]Column{
+        .{ .name = "sym", .type = .text },
+        .{ .name = "qty", .type = .decimal },
+    };
+    var b = Builder.init(a, &cols);
+    try b.appendRow(&.{ .{ .text = "A" }, .{ .decimal = 1_000_000_000_000 } });
+    try b.appendRow(&.{ .{ .text = "B" }, .{ .decimal = 2_500_000_000_000 } });
+    const ds = try b.toOwned();
+
+    try testing.expectEqual(@as(usize, 2), ds.rowCount());
+    try testing.expectEqualStrings("B", ds.cell(1, "sym").?.text);
+    try testing.expectEqual(@as(i128, 2_500_000_000_000), ds.cell(1, "qty").?.decimal);
+
+    // Round-trips through the normal Dataset machinery (serialize included).
+    const bytes = try serialize(a, ds);
+    const back = try deserialize(a, bytes);
+    try testing.expectEqual(@as(i128, 1_000_000_000_000), back.cell(0, "qty").?.decimal);
 }
 
 // ── fuzz: deserialize is the untrusted-input decode surface (an arbitrary

@@ -41,6 +41,7 @@ fn appendValueKey(a: std.mem.Allocator, buf: *std.ArrayList(u8), v: Value) Error
         .int => |i| try buf.print(a, "{d}", .{i}),
         .float => |f| try buf.print(a, "{d}", .{f}),
         .text => |t| try buf.appendSlice(a, t),
+        .decimal => |r| try buf.print(a, "d{d}", .{r}), // raw i128, exact key
     }
 }
 

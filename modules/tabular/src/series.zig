@@ -257,6 +257,7 @@ fn appendKey(buf: *std.ArrayList(u8), a: std.mem.Allocator, v: Value) Error!void
         .float => |f| try buf.print(a, "f{d}", .{f}),
         .bool => |b| try buf.append(a, if (b) 'T' else 'F'),
         .null => try buf.append(a, 0),
+        .decimal => |r| try buf.print(a, "d{d}", .{r}), // raw i128, exact key
     }
 }
 

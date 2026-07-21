@@ -480,6 +480,14 @@ fn jsonToValue(a: std.mem.Allocator, jv: std.json.Value, want: ColumnType) Error
             .bool => |b| .{ .text = if (b) "true" else "false" },
             else => .null,
         },
+        // JSON has no fixed-point type; go through the same numeric parse as
+        // .float, then widen via Value.cast (float*scale, truncated — see
+        // dataset's Value.cast doc comment). No dependency on the `decimal`
+        // module for text parsing here (same limitation `Value.cast` documents).
+        .decimal => blk: {
+            const f = jsonToFloat(jv) orelse break :blk .null;
+            break :blk (Value{ .float = f }).cast(.decimal) orelse .null;
+        },
     };
 }
 

@@ -30,19 +30,20 @@ piecemeal.
 ```zig
 const dataset = @import("dataset");
 
-const ColumnType = dataset.ColumnType; // int, float, text, bool, date
+const ColumnType = dataset.ColumnType; // int, float, text, bool, date, decimal
 const Column = dataset.Column;         // { name, type }
-const Value = dataset.Value;           // tagged union: null/int/float/text/bool
+const Value = dataset.Value;           // tagged union: null/int/float/text/bool/decimal
 const Dataset = dataset.Dataset;       // { columns, rows }
 const Date = dataset.Date;             // { y, m, d }
+const Builder = dataset.Builder;       // incremental row-at-a-time construction
 
 // Value
-fn asFloat(self: Value) ?f64;          // int/float -> f64; else null
-fn asInt(self: Value) ?i64;            // int passthrough; float truncates; else null
+fn asFloat(self: Value) ?f64;          // int/float/decimal -> f64; else null
+fn asInt(self: Value) ?i64;            // int passthrough; float/decimal truncates; else null
 fn asText(self: Value) ?[]const u8;
 fn isNull(self: Value) bool;
-fn eql(a, b: Value) bool;              // int/float compare numerically
-fn order(a, b: Value) std.math.Order;  // null < bool < numeric < text
+fn eql(a, b: Value) bool;              // int/float/decimal compare numerically; decimal-vs-decimal exact
+fn order(a, b: Value) std.math.Order;  // null < bool < numeric(int/float/decimal) < text
 fn cast(self: Value, to: ColumnType) ?Value; // best-effort coercion
 
 // Dataset
@@ -54,6 +55,11 @@ fn floatColumn(self: Dataset, a: Allocator, name: []const u8) ![]f64;
 fn seriesXY(self: Dataset, a: Allocator, x: []const u8, y: []const u8) ![]const [2]f64;
 fn concat(self: Dataset, a: Allocator, other: Dataset) !Dataset; // same-schema row append
 
+// Builder — incremental construction (no pre-sizing needed)
+fn Builder.init(a: Allocator, columns: []const Column) Builder;
+fn Builder.appendRow(self: *Builder, cells: []const Value) !void;
+fn Builder.toOwned(self: *Builder) !Dataset;
+
 // binary (compact, exact round-trip) + JSON
 fn serialize(a: Allocator, d: Dataset) ![]u8;
 fn deserialize(a: Allocator, bytes: []const u8) !Dataset; // error.Corrupt on truncation/bad tag
@@ -63,6 +69,29 @@ fn toJson(a: Allocator, d: Dataset) ![]u8; // {"columns":[...],"rows":[...]}; no
 fn parseIsoDate(s: []const u8) ?Date;  // "YYYY-MM-DD", trailing time ignored
 fn Date.ordinal(self: Date) i64;       // see caveat below
 ```
+
+### `.decimal` — exact fixed-point money/quantity
+
+`Value.decimal: i128` is a RAW fixed-point integer at `decimal_scale =
+1_000_000_000_000` (12 fractional digits) — the exact convention of the
+sibling `decimal` module's `Decimal{ .raw }`. `dataset` does **not** depend on
+`decimal` (it stays a leaf container); to get arithmetic or display
+formatting, a consumer wraps the raw value itself:
+`decimal.Decimal{ .raw = value.decimal }`.
+
+- `asFloat`/`asInt`/`cast(.float)`/`cast(.int)` go through the (lossy)
+  divide-by-scale path, same as everywhere else `Value` coerces to a scalar.
+- `eql`/`order` compare two `.decimal`s **exactly** on the raw `i128` — not
+  through the lossy `asFloat` fallback used for cross-type numeric
+  comparison — so equal money values never spuriously mismatch.
+- `cast(.decimal)` widens `int`/`float` (float → `null` on non-finite input);
+  `text` → `.decimal` is intentionally not attempted (that needs the
+  `decimal` module's parser, which would pull in the dependency this module
+  avoids).
+- `toJson` emits an **exact** placed-point number literal (integer math, no
+  binary-float rounding) — e.g. raw `1_500_000_000_000` → `1.5`.
+- The binary wire format gained tag `5` for `.decimal`, **appended** after
+  the existing `0..4` tags, so already-serialized data never renumbers.
 
 ### `Date.ordinal` — monotonic, not asserted calendar-exact
 
@@ -83,22 +112,18 @@ shape you'd want for a multi-million-row analytical engine.
 
 ## Deferred (backlog, not implemented here)
 
-Follow-on work, intentionally out of scope for v1:
-
-- **`.decimal` `ColumnType`/`Value` variant** composing the `decimal`
-  module — exact money representation; deferred because it is a
-  cross-module integration decision (does `dataset` depend on `decimal`,
-  or does a consumer layer bridge the two?) rather than a self-contained
-  addition.
 - **True columnar storage** (typed per-column arrays / SIMD-friendly
   layout) — see "Known ceiling" above; a different representation entirely.
-- **Streaming / chunked bounded-memory construction** for very large result
-  sets — the current model materializes the whole `Dataset` up front; a
-  streaming builder is a separate API shape.
-- **`distinct`/dedup at the dataset level** — `Value.eql` already gives a
-  transform the building block, but the dataset-level operation itself
-  (which rows are compared, does the caller pick key columns) needs its own
-  design pass.
+  Deferred per the library's perf-investment policy: no current
+  high-throughput product needs it (dashboard-sized result sets are the
+  actual workload) — revisit if/when one does.
+- **`distinct`/dedup at the dataset level** — NOT duplicated here: covered
+  by `tabular.distinct` (group-key + keep-first-or-last), which already owns
+  that design.
+
+Resolved this cycle: `.decimal` `ColumnType`/`Value` (raw `i128`, no
+`decimal`-module dependency — see above) and `Builder` (streaming/incremental
+construction).
 
 ## Design notes
 
