@@ -604,10 +604,11 @@ pub fn verify(m: group.Modulus, x_bytes: []const u8, y_bytes: []const u8, proof:
 
 // ── tests ────────────────────────────────────────────────────────────────────
 //
-// TODO(audit F1, `audit/modules/vdf.md`): add the positive-control soundness
-// test — the adaptive false-`y` forgery probe must be REJECTED by `verify` and
-// FLIP to accepted if `y` is unbound from `hashToPrime`. Separate test-teeth
-// follow-up; intentionally NOT bundled with this montint rewire.
+// (audit F1, `audit/modules/vdf.md`) The positive-control y-binding soundness
+// test now lives in `kat_test.zig` section 2c: the adaptive false-`y` forgery
+// is REJECTED by `verify` yet ACCEPTED by that file's `brokenVerifyUnboundY`
+// control, so deleting `y` from `hashToPrime` flips the final assertion to
+// failing (goes RED).
 
 const testing = std.testing;
 

@@ -340,3 +340,114 @@ test "soundness: x/y/pi outside Z_N* (0, N, >= N) are rejected, not UB" {
     bad_proof.pi = n_bytes;
     try testing.expect(!(try vdf.verify(m, &x_bytes, &y_bytes, bad_proof, t)));
 }
+
+// -- 2c. y-BINDING teeth: the adaptive false-y forgery --------------------
+//
+// The soundness tests above reject a tampered y/pi/T, but none of them goes
+// RED *specifically* if `hashToPrime` stopped binding `y`: rejecting a
+// wrong-y-with-honest-pi only needs the ALGEBRAIC check `pi^l*x^r == y` to
+// fail, which it does whether or not `l` depends on `y`. The test below is
+// the missing y-binding witness. It forges a `(y', pi')` that a verifier
+// binding only `(N, x, T)` — NOT `y` — would ACCEPT for a GENUINELY WRONG
+// `y'`, then asserts the real `verify` REJECTS it. The forgery: fix `l` from
+// a y-independent binding, pick an arbitrary `pi'`, and DEFINE
+// `y' := pi'^l * x^r`. Removing `y` from `hashToPrime` would make `verify`
+// identical to the `brokenVerifyUnboundY` control below and ACCEPT this
+// forgery — so the final assertion flips to failing. That is the tooth.
+
+/// A deliberately BROKEN verifier that binds the challenge prime to
+/// `(N, x, T)` only — `y` is replaced by a fixed placeholder, modelling the
+/// exact soundness bug `hashToPrime`'s y-binding exists to prevent. Used as a
+/// positive control: it must ACCEPT the forgery the real `verify` rejects,
+/// which is what proves the forgery is well-formed (the y-binding test is not
+/// passing vacuously) and that the y-binding is the sole thing catching it.
+fn brokenVerifyUnboundY(m: group.Modulus, x_bytes: []const u8, y_bytes: []const u8, proof: vdf.Proof, t: u64) bool {
+    const x = group.elementFromBytes(m, x_bytes) catch return false;
+    const y = group.elementFromBytes(m, y_bytes) catch return false;
+    const pi = group.elementFromBytes(m, &proof.pi) catch return false;
+    var x_canon: [group.modulus_bytes]u8 = undefined;
+    group.toBytes(x, &x_canon) catch unreachable;
+    var n_canon: [group.modulus_bytes]u8 = undefined;
+    m.toBytes(&n_canon, .big) catch unreachable;
+    // y EXCLUDED from the Fiat-Shamir binding (the injected soundness bug):
+    const y_placeholder = [_]u8{0} ** group.modulus_bytes;
+    const l_bytes = vdf.hashToPrime(&n_canon, &x_canon, &y_placeholder, t);
+    const lm = vdf.PrimeModulus.fromBytes(&l_bytes, .big) catch unreachable;
+    const r = vdf.pow2Mod(lm, t);
+    var r_bytes: [vdf.prime_bytes]u8 = undefined;
+    r.toBytes(&r_bytes, .big) catch unreachable;
+    const mod = group.montModulus(m);
+    const pi_l = group.montPowPublic(m, &mod, pi, &l_bytes);
+    const x_r = group.montPowPublic(m, &mod, x, &r_bytes);
+    return group.mul(m, pi_l, x_r).eql(y);
+}
+
+test "soundness (y-binding): an adaptive false-y forgery is rejected by verify but accepted by a y-unbound verifier" {
+    if (!gate.core_implemented) return error.SkipZigTest;
+
+    const m = group.rsa2048ChallengeModulus();
+    const t: u64 = 1000;
+    const x_bytes = fiveElement();
+    const x = try group.elementFromBytes(m, &x_bytes);
+    const y_true = vdf.eval(m, x, t);
+
+    // Build the y-INDEPENDENT challenge l (the same placeholder the broken
+    // control uses), then forge y' = pi'^l * x^r for an arbitrary pi'.
+    var x_canon: [group.modulus_bytes]u8 = undefined;
+    try group.toBytes(x, &x_canon);
+    var n_canon: [group.modulus_bytes]u8 = undefined;
+    try m.toBytes(&n_canon, .big);
+    const y_placeholder = [_]u8{0} ** group.modulus_bytes;
+    const l_bytes = vdf.hashToPrime(&n_canon, &x_canon, &y_placeholder, t);
+    const lm = try vdf.PrimeModulus.fromBytes(&l_bytes, .big);
+    const r = vdf.pow2Mod(lm, t);
+    var r_bytes: [vdf.prime_bytes]u8 = undefined;
+    try r.toBytes(&r_bytes, .big);
+
+    // Attacker's arbitrary proof element pi' = 7 (any valid group element).
+    var pi_bytes: [group.modulus_bytes]u8 = [_]u8{0} ** group.modulus_bytes;
+    pi_bytes[group.modulus_bytes - 1] = 7;
+    const pi = try group.elementFromBytes(m, &pi_bytes);
+
+    const mod = group.montModulus(m);
+    const pi_l = group.montPowPublic(m, &mod, pi, &l_bytes);
+    const x_r = group.montPowPublic(m, &mod, x, &r_bytes);
+    const y_forged = group.mul(m, pi_l, x_r);
+    var y_forged_bytes: [group.modulus_bytes]u8 = undefined;
+    try group.toBytes(y_forged, &y_forged_bytes);
+
+    const proof = vdf.Proof{ .pi = pi_bytes };
+
+    // (i) The forged y' is a GENUINELY wrong VDF output (not the real one) —
+    // so accepting it would be a true soundness break, not a relabelling.
+    try testing.expect(!y_forged.eql(y_true));
+    // (ii) POSITIVE CONTROL: a y-unbound verifier ACCEPTS the forgery, so the
+    // forgery is well-formed and the attack is real (this test is not vacuous).
+    try testing.expect(brokenVerifyUnboundY(m, &x_canon, &y_forged_bytes, proof, t));
+    // (iii) TEETH: the real verifier folds y into l, so it REJECTS. Any
+    // y-independent binding (the mutation `brokenVerifyUnboundY` models) makes
+    // this forgery verify — so (iii) flips to accept and goes RED. Confirmed
+    // by a mutation check: stripping y from `verify`'s `hashToPrime` call
+    // turns this exact assertion red.
+    try testing.expect(!(try vdf.verify(m, &x_canon, &y_forged_bytes, proof, t)));
+}
+
+test "soundness (y-binding): flipping a single bit of y with the honest pi is rejected" {
+    if (!gate.core_implemented) return error.SkipZigTest;
+
+    const m = group.rsa2048ChallengeModulus();
+    const x_bytes = fiveElement();
+    const x = try group.elementFromBytes(m, &x_bytes);
+    const t: u64 = 500;
+    const y = vdf.eval(m, x, t);
+    var y_bytes: [group.modulus_bytes]u8 = undefined;
+    try group.toBytes(y, &y_bytes);
+    const proof = try vdf.prove(m, &x_bytes, &y_bytes, t);
+
+    // Honest proof, but y has its low bit flipped (still a canonical in-range
+    // nonzero element) with the SAME pi. Must be rejected.
+    var y_tampered = y_bytes;
+    y_tampered[group.modulus_bytes - 1] ^= 1;
+    try testing.expect(!std.mem.eql(u8, &y_bytes, &y_tampered)); // genuinely different
+    try testing.expect(!(try vdf.verify(m, &x_bytes, &y_tampered, proof, t)));
+}
