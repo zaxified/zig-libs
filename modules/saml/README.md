@@ -17,7 +17,14 @@ malformed/adversarial input yields typed errors, never a panic. Encrypted
 assertions (`<saml:EncryptedAssertion>`, the eIDAS encrypt profile) are decrypted
 transparently **when the SP configures `sp_decrypt_key`** — decrypt-then-verify,
 via the `xmlenc` module — and refused (`error.EncryptedAssertionUnsupported`)
-otherwise.
+otherwise. The same key also unwraps an encrypted `<saml:EncryptedID>` (Subject
+NameID) and `<saml:EncryptedAttribute>`s, decrypted only **after** the enclosing
+assertion is signature-verified. **Holder-of-Key** subject confirmation is
+supported via `Config.subject_confirmation` (`.bearer` | `.holder_of_key` |
+`.either`): the caller supplies the presenter's transport certificate
+(`presented_holder_cert_der`), matched by X.509-DER byte-equality against the HoK
+`<ds:KeyInfo>`. See `SPEC.md` for the encrypted-ID/attribute error model and the
+HoK match approach and its limitation.
 
 ## Worked example — verify a POST-binding Response
 

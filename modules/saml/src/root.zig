@@ -65,9 +65,19 @@
 //! assertion is the root of its own standalone document; the XSW pointer-pin
 //! holds within that inner document (see `verifyCoveringDecrypted`).
 //!
+//! ## `<saml:EncryptedID>` / `<saml:EncryptedAttribute>` + Holder-of-Key
+//! With `Config.sp_decrypt_key` set, an encrypted `<saml:EncryptedID>` in the
+//! Subject and any `<saml:EncryptedAttribute>` in the AttributeStatement are
+//! decrypted (via `xmlenc.decryptData`) on the ALREADY-signature-verified
+//! assertion — the recovered `<NameID>` / `<Attribute>` splice into the normal
+//! extraction path, and decryption failures collapse to generic
+//! `error.IdDecryptionFailed` / `error.AttributeDecryptionFailed`. Holder-of-Key
+//! subject confirmation is supported via `Config.subject_confirmation`
+//! (`.bearer` | `.holder_of_key` | `.either`): the presenter's transport key
+//! (`Config.presented_holder_cert_der`) is matched, by X.509-DER byte-equality,
+//! against the HoK `<ds:KeyInfo>`.
+//!
 //! ## Out of scope (see SPEC.md)
-//!   - Encrypted `<saml:EncryptedID>` / `<saml:EncryptedAttribute>` (only the
-//!     whole-assertion form is decrypted); Holder-of-Key confirmation.
 //!   - Single Logout, artifact binding, the IdP side.
 //!
 //! Never reads the system clock. Never panics on malformed / adversarial input:
@@ -95,6 +105,7 @@ pub const md_ns = "urn:oasis:names:tc:SAML:2.0:metadata";
 
 const status_success = "urn:oasis:names:tc:SAML:2.0:status:Success";
 const cm_bearer = "urn:oasis:names:tc:SAML:2.0:cm:bearer";
+const cm_holder_of_key = "urn:oasis:names:tc:SAML:2.0:cm:holder-of-key";
 
 /// A decompression-bomb cap for the HTTP-Redirect (DEFLATE) binding.
 pub const max_redirect_inflated = 1 << 20;
@@ -105,6 +116,17 @@ pub const max_redirect_inflated = 1 << 20;
 /// default) accepts a signed Assertion OR a signed enclosing Response; both are
 /// pinned to the consumed assertion by the XSW defense regardless.
 pub const SignaturePolicy = enum { assertion, response, either };
+
+/// Which `<saml:SubjectConfirmation>` method(s) the SP will accept.
+///   - `.bearer` (the default) — the Web-SSO default; only Bearer confirmations
+///     are considered, matching all prior behavior.
+///   - `.holder_of_key` — only Holder-of-Key confirmations are considered; the
+///     caller MUST supply `presented_holder_cert_der` (the key the presenter
+///     authenticated the transport with).
+///   - `.either` — a Bearer OR a Holder-of-Key confirmation may satisfy the
+///     subject; HoK still requires the presented key when a HoK confirmation is
+///     the one being validated.
+pub const SubjectConfirmationPolicy = enum { bearer, holder_of_key, either };
 
 /// Everything the SP is configured with out-of-band. `now_unix` is supplied by
 /// the caller — the module never reads the system clock (testability + no
@@ -140,6 +162,18 @@ pub const Config = struct {
     allow_weak_sha1: bool = false,
     /// Which element the signature must be on. Default `.either`.
     signature_policy: SignaturePolicy = .either,
+
+    /// Which `<SubjectConfirmation>` method(s) are acceptable. Default `.bearer`
+    /// (the Web-SSO default; unchanged for existing callers).
+    subject_confirmation: SubjectConfirmationPolicy = .bearer,
+    /// For Holder-of-Key confirmation: the DER of the certificate the presenter
+    /// authenticated the transport with (e.g. the TLS client certificate). The
+    /// HoK `<ds:KeyInfo>` in `<SubjectConfirmationData>` must carry an
+    /// `<ds:X509Certificate>` whose DER is byte-identical to this. Null (the
+    /// default) ⇒ a HoK confirmation cannot be satisfied
+    /// (`error.PresentedKeyMissing`); irrelevant to the Bearer path. See SPEC.md
+    /// "Holder-of-Key" for the byte-equality match rationale and its limitation.
+    presented_holder_cert_der: ?[]const u8 = null,
 
     /// The unqualified attribute name that carries assertion / response IDs.
     /// SAML uses `ID`; both this module and `xmldsig` resolve references through
@@ -274,9 +308,36 @@ pub const ConsumeError = error{
     AudienceMismatch,
     /// The assertion has no `<Subject>`/`<NameID>` to authenticate.
     SubjectMissing,
-    /// No acceptable Bearer `<SubjectConfirmation>` (see the more specific
-    /// Recipient / InResponseTo / expiry errors first).
+    /// No acceptable `<SubjectConfirmation>` (see the more specific Recipient /
+    /// InResponseTo / expiry / HoK errors first).
     SubjectConfirmationFailed,
+    /// The only `<SubjectConfirmation>` methods present are not permitted by
+    /// `Config.subject_confirmation` (e.g. a Holder-of-Key confirmation under the
+    /// default `.bearer` policy, or a Bearer confirmation under `.holder_of_key`).
+    SubjectConfirmationMethodNotAllowed,
+    /// A Holder-of-Key `<SubjectConfirmation>` is being validated but
+    /// `Config.presented_holder_cert_der` is null — the SP cannot prove the
+    /// presenter holds the key.
+    PresentedKeyMissing,
+    /// A Holder-of-Key `<SubjectConfirmation>`'s `<ds:KeyInfo>` did not carry an
+    /// `<ds:X509Certificate>` whose DER is byte-identical to the caller's
+    /// `presented_holder_cert_der`.
+    HolderOfKeyMismatch,
+    /// A `<saml:EncryptedID>` was present in the Subject but no
+    /// `Config.sp_decrypt_key` was configured — the SP did not opt in to
+    /// decryption. (With a key configured it is decrypted transparently.)
+    EncryptedIdUnsupported,
+    /// A `<saml:EncryptedAttribute>` was present but no `Config.sp_decrypt_key`
+    /// was configured — opt-in decryption is required to consume it.
+    EncryptedAttributeUnsupported,
+    /// A `<saml:EncryptedID>` could not be decrypted or did not recover a
+    /// `<saml:NameID>`. GENERIC (mirrors `AssertionDecryptionFailed`): every
+    /// crypto/structure failure collapses here, so no oracle signal leaks. Safe
+    /// because the enclosing assertion is already signature-verified.
+    IdDecryptionFailed,
+    /// A `<saml:EncryptedAttribute>` could not be decrypted or did not recover a
+    /// `<saml:Attribute>`. GENERIC, same rationale as `IdDecryptionFailed`.
+    AttributeDecryptionFailed,
     /// Bearer `Recipient` did not equal `Config.acs_url`.
     RecipientMismatch,
     /// Bearer `InResponseTo` did not match `Config.expected_in_response_to`
@@ -572,6 +633,51 @@ fn moveCert(alloc: std.mem.Allocator, res: *xmldsig.Result, cert_out: *?[]u8) vo
     _ = alloc;
 }
 
+/// A decrypted-and-parsed wrapper element. `xml.parse` BORROWS its element/attr
+/// slices from the source octets, so the plaintext buffer must live exactly as
+/// long as `doc`; this struct owns both and frees them together.
+const Decrypted = struct {
+    doc: xml.Document,
+    src: []u8,
+    fn deinit(self: *Decrypted, alloc: std.mem.Allocator) void {
+        self.doc.deinit();
+        alloc.free(self.src);
+        self.* = undefined;
+    }
+};
+
+/// Decrypt a `<saml:EncryptedID>` / `<saml:EncryptedAttribute>` wrapper (each
+/// carries a single `<xenc:EncryptedData>` exactly like `<EncryptedAssertion>`)
+/// and re-parse the recovered octets into their own standalone document (caller
+/// `deinit`s the returned `Decrypted`). `config.sp_decrypt_key` MUST be non-null
+/// (the caller checks and raises the wrapper-specific `…Unsupported` error
+/// otherwise). Every crypto/structure failure collapses to `fail_err` — a single
+/// generic outcome, no oracle signal (`xmlenc`'s own posture). This runs ONLY on
+/// the already-signature-verified assertion, so the ciphertext is authenticated
+/// by enclosure before the private key ever touches it.
+fn decryptWrappedElement(
+    alloc: std.mem.Allocator,
+    wrapper: *const xml.Element,
+    config: Config,
+    fail_err: ConsumeError,
+) ConsumeError!Decrypted {
+    const sk = config.sp_decrypt_key orelse return error.EncryptedIdUnsupported; // unreachable in practice
+    const ed = childEl(wrapper, xmlenc.xenc_ns, "EncryptedData") orelse return fail_err;
+    const plaintext = xmlenc.decryptData(alloc, ed, sk, .{
+        .allow_weak_rsa15 = config.allow_weak_rsa15,
+        .kek = config.decrypt_kek,
+    }) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return fail_err,
+    };
+    errdefer alloc.free(plaintext);
+    const doc = xml.parse(alloc, plaintext, .{ .id_attr_names = &.{"ID"} }) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return fail_err,
+    };
+    return .{ .doc = doc, .src = plaintext };
+}
+
 /// The XSW pointer-pin. A verified signature covers `target` iff it has exactly
 /// one same-document `#id` Reference whose id resolves (through the SAML ID
 /// index) to `target` by pointer identity. Empty / external / multi-reference
@@ -622,11 +728,33 @@ fn buildResult(alloc: std.mem.Allocator, asrt: *const xml.Element, config: Confi
     }
     if (!audience_ok) return error.AudienceMismatch; // fail closed: require the SP be named
 
-    // ── Subject + Bearer SubjectConfirmation ─────────────────────────────────
+    // ── Subject + SubjectConfirmation ────────────────────────────────────────
     const subject = childEl(asrt, saml_ns, "Subject") orelse return error.SubjectMissing;
-    const name_id = childEl(subject, saml_ns, "NameID") orelse return error.SubjectMissing;
 
-    try validateBearerConfirmation(alloc, subject, config, now, skew);
+    // The NameID may be cleartext (`<saml:NameID>`) or, in the eIDAS encrypt
+    // profile, a `<saml:EncryptedID>` wrapping a `<xenc:EncryptedData>`. Decrypt
+    // the latter (opt-in) into its own standalone document, which must outlive
+    // extraction below — a function-scoped defer frees it. The enclosing
+    // assertion is already signature-verified, so this ciphertext is
+    // authenticated by enclosure.
+    var enc_id_dec: ?Decrypted = null;
+    defer if (enc_id_dec) |*d| d.deinit(alloc);
+    const name_id = nid: {
+        if (childEl(subject, saml_ns, "NameID")) |nid| break :nid nid;
+        if (childEl(subject, saml_ns, "EncryptedID")) |enc_id| {
+            if (config.sp_decrypt_key == null) return error.EncryptedIdUnsupported;
+            var dec = try decryptWrappedElement(alloc, enc_id, config, error.IdDecryptionFailed);
+            if (!isEl(dec.doc.root, saml_ns, "NameID")) {
+                dec.deinit(alloc);
+                return error.IdDecryptionFailed;
+            }
+            enc_id_dec = dec;
+            break :nid enc_id_dec.?.doc.root;
+        }
+        return error.SubjectMissing;
+    };
+
+    try validateSubjectConfirmation(alloc, subject, config, now, skew);
 
     // ── extraction (into the result arena) ───────────────────────────────────
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -649,7 +777,7 @@ fn buildResult(alloc: std.mem.Allocator, asrt: *const xml.Element, config: Confi
         }
     }
 
-    const attrs = try extractAttributes(a, asrt);
+    const attrs = try extractAttributes(a, alloc, asrt, config);
 
     // Move the (owned, caller-alloc) cert DER into the arena and release it.
     var cert_der_owned: ?[]const u8 = null;
@@ -674,58 +802,133 @@ fn buildResult(alloc: std.mem.Allocator, asrt: *const xml.Element, config: Confi
     };
 }
 
-fn validateBearerConfirmation(alloc: std.mem.Allocator, subject: *const xml.Element, config: Config, now: i64, skew: i64) ConsumeError!void {
+/// Confirm the subject via one acceptable `<SubjectConfirmation>`, honoring
+/// `Config.subject_confirmation`. Returns on the FIRST fully-valid confirmation
+/// of a permitted method; otherwise the first recorded rejection reason (each
+/// method's own validator picks the most specific one). A method disallowed by
+/// policy is remembered as `SubjectConfirmationMethodNotAllowed` but never masks
+/// a more specific failure of a permitted method.
+fn validateSubjectConfirmation(alloc: std.mem.Allocator, subject: *const xml.Element, config: Config, now: i64, skew: i64) ConsumeError!void {
+    const policy = config.subject_confirmation;
     var best_err: ?ConsumeError = null;
-    var saw_bearer = false;
     for (subject.children) |c| switch (c.content) {
         .element => |sc| {
             if (!isEl(sc, saml_ns, "SubjectConfirmation")) continue;
             const method = sc.attr("", "Method") orelse continue;
-            if (!std.mem.eql(u8, method, cm_bearer)) continue;
-            saw_bearer = true;
-            const scd = childEl(sc, saml_ns, "SubjectConfirmationData") orelse {
-                best_err = best_err orelse error.SubjectConfirmationFailed;
-                continue;
-            };
-            // Recipient must equal the ACS URL.
-            const recip = scd.attr("", "Recipient") orelse {
-                best_err = error.RecipientMismatch;
-                continue;
-            };
-            if (!std.mem.eql(u8, recip, config.acs_url)) {
-                best_err = error.RecipientMismatch;
-                continue;
-            }
-            // NotOnOrAfter is required for a Bearer confirmation.
-            const noa = scd.attr("", "NotOnOrAfter") orelse {
-                best_err = best_err orelse error.SubjectConfirmationFailed;
-                continue;
-            };
-            const t = try parseDateTime(noa);
-            if (now - skew >= t) {
-                best_err = best_err orelse error.AssertionExpired;
-                continue;
-            }
-            // InResponseTo correlation.
-            if (scd.attr("", "InResponseTo")) |irt| {
-                const expected = config.expected_in_response_to orelse {
-                    best_err = error.InResponseToMismatch;
-                    continue;
-                };
-                if (!std.mem.eql(u8, irt, expected)) {
-                    best_err = error.InResponseToMismatch;
+            if (std.mem.eql(u8, method, cm_bearer)) {
+                if (policy == .holder_of_key) {
+                    best_err = best_err orelse error.SubjectConfirmationMethodNotAllowed;
                     continue;
                 }
-            } else if (!config.allow_idp_initiated) {
-                best_err = error.InResponseToMismatch;
-                continue;
+                validateBearerData(sc, config, now, skew) catch |e| {
+                    best_err = best_err orelse e;
+                    continue;
+                };
+                return; // a fully-valid Bearer confirmation
+            } else if (std.mem.eql(u8, method, cm_holder_of_key)) {
+                if (policy == .bearer) {
+                    best_err = best_err orelse error.SubjectConfirmationMethodNotAllowed;
+                    continue;
+                }
+                validateHolderOfKeyData(alloc, sc, config, now, skew) catch |e| {
+                    best_err = best_err orelse e;
+                    continue;
+                };
+                return; // a fully-valid Holder-of-Key confirmation
             }
-            return; // a fully-valid Bearer confirmation
+            // Unknown method (e.g. sender-vouches): not supported, skip.
         },
         else => {},
     };
-    _ = alloc;
     return best_err orelse error.SubjectConfirmationFailed;
+}
+
+/// Validate a single Bearer `<SubjectConfirmationData>` (Web-SSO default):
+/// `Recipient` == ACS, `NotOnOrAfter` present and in the future, `InResponseTo`
+/// correlates (or absent only when `allow_idp_initiated`). Returns the most
+/// specific rejection; void on success.
+fn validateBearerData(sc: *const xml.Element, config: Config, now: i64, skew: i64) ConsumeError!void {
+    const scd = childEl(sc, saml_ns, "SubjectConfirmationData") orelse return error.SubjectConfirmationFailed;
+    // Recipient must equal the ACS URL.
+    const recip = scd.attr("", "Recipient") orelse return error.RecipientMismatch;
+    if (!std.mem.eql(u8, recip, config.acs_url)) return error.RecipientMismatch;
+    // NotOnOrAfter is required for a Bearer confirmation.
+    const noa = scd.attr("", "NotOnOrAfter") orelse return error.SubjectConfirmationFailed;
+    const t = try parseDateTime(noa);
+    if (now - skew >= t) return error.AssertionExpired;
+    // InResponseTo correlation.
+    if (scd.attr("", "InResponseTo")) |irt| {
+        const expected = config.expected_in_response_to orelse return error.InResponseToMismatch;
+        if (!std.mem.eql(u8, irt, expected)) return error.InResponseToMismatch;
+    } else if (!config.allow_idp_initiated) {
+        return error.InResponseToMismatch;
+    }
+}
+
+/// Validate a single Holder-of-Key `<SubjectConfirmationData>` (SAML V2.0 HoK
+/// Web-SSO profile). The HoK KEY check replaces the Bearer `Recipient` check:
+/// the presenter must actually hold the key named in `<ds:KeyInfo>`, which the
+/// caller proves by supplying `presented_holder_cert_der` (the transport client
+/// certificate). `Recipient` / `InResponseTo` MAY be omitted for HoK; when
+/// present they are still honored. `NotBefore` / `NotOnOrAfter`, when present,
+/// are enforced.
+///
+/// Match: byte-equality of an `<ds:X509Certificate>`'s decoded DER against the
+/// presented DER. This deliberately does NOT parse the certificate (Zig 0.16's
+/// `std.crypto.Certificate.parse` is not panic-safe on hostile DER); its
+/// limitation is that a re-encoded but cryptographically-equivalent certificate
+/// (or a bare `<ds:KeyValue>`) will not match. See SPEC.md.
+fn validateHolderOfKeyData(alloc: std.mem.Allocator, sc: *const xml.Element, config: Config, now: i64, skew: i64) ConsumeError!void {
+    const scd = childEl(sc, saml_ns, "SubjectConfirmationData") orelse return error.SubjectConfirmationFailed;
+    // NotBefore / NotOnOrAfter are optional for HoK; enforce them if present.
+    if (scd.attr("", "NotBefore")) |nb| {
+        const t = try parseDateTime(nb);
+        if (now + skew < t) return error.AssertionNotYetValid;
+    }
+    if (scd.attr("", "NotOnOrAfter")) |noa| {
+        const t = try parseDateTime(noa);
+        if (now - skew >= t) return error.AssertionExpired;
+    }
+    // Recipient is optional for HoK; when present it must still match the ACS.
+    if (scd.attr("", "Recipient")) |recip| {
+        if (!std.mem.eql(u8, recip, config.acs_url)) return error.RecipientMismatch;
+    }
+    // InResponseTo is optional for HoK; when present and a request is pending it
+    // must correlate.
+    if (scd.attr("", "InResponseTo")) |irt| {
+        if (config.expected_in_response_to) |expected| {
+            if (!std.mem.eql(u8, irt, expected)) return error.InResponseToMismatch;
+        }
+    }
+    // The HoK key check: the presenter must hold the confirmation key.
+    const presented = config.presented_holder_cert_der orelse return error.PresentedKeyMissing;
+    if (!anyX509Matches(alloc, scd, presented)) return error.HolderOfKeyMismatch;
+}
+
+/// True iff any `<ds:X509Certificate>` anywhere under `el` decodes to DER that is
+/// byte-identical to `presented`. Walks the whole subtree so a `<ds:KeyInfo>`
+/// nested under `<SubjectConfirmationData>` (or a chain of certificates) is
+/// covered. Never parses the DER (panic-safe on hostile input).
+fn anyX509Matches(alloc: std.mem.Allocator, el: *const xml.Element, presented: []const u8) bool {
+    for (el.children) |c| switch (c.content) {
+        .element => |child| {
+            if (isEl(child, xmldsig.ds_ns, "X509Certificate")) {
+                if (x509CertMatches(alloc, child, presented)) return true;
+            } else if (anyX509Matches(alloc, child, presented)) {
+                return true;
+            }
+        },
+        else => {},
+    };
+    return false;
+}
+
+fn x509CertMatches(alloc: std.mem.Allocator, cert_el: *const xml.Element, presented: []const u8) bool {
+    const txt = textAlloc(alloc, cert_el) catch return false;
+    defer alloc.free(txt);
+    const der = decodeBase64(alloc, trim(txt)) catch return false;
+    defer alloc.free(der);
+    return std.mem.eql(u8, der, presented);
 }
 
 fn audienceContains(restriction: *const xml.Element, sp: []const u8, alloc: std.mem.Allocator) bool {
@@ -740,30 +943,49 @@ fn audienceContains(restriction: *const xml.Element, sp: []const u8, alloc: std.
     return false;
 }
 
-fn extractAttributes(a: std.mem.Allocator, asrt: *const xml.Element) ConsumeError![]const Attribute {
+/// Extract every `<saml:Attribute>` from the (trusted) assertion's
+/// `<AttributeStatement>` into the result arena `a`. A `<saml:EncryptedAttribute>`
+/// is decrypted (opt-in, using the caller allocator `alloc` for scratch) to a
+/// `<saml:Attribute>` and merged alongside the cleartext ones. Decryption runs on
+/// the already-signature-verified assertion, so the ciphertext is authenticated
+/// by enclosure.
+fn extractAttributes(a: std.mem.Allocator, alloc: std.mem.Allocator, asrt: *const xml.Element, config: Config) ConsumeError![]const Attribute {
     var out: std.ArrayList(Attribute) = .empty;
     const stmt = childEl(asrt, saml_ns, "AttributeStatement") orelse return out.toOwnedSlice(a);
     for (stmt.children) |c| switch (c.content) {
         .element => |attr_el| {
-            if (!isEl(attr_el, saml_ns, "Attribute")) continue;
-            const name = if (attr_el.attr("", "Name")) |n| try a.dupe(u8, n) else continue;
-            const friendly = try dupAttr(a, attr_el, "FriendlyName");
-            var vals: std.ArrayList([]const u8) = .empty;
-            for (attr_el.children) |vc| switch (vc.content) {
-                .element => |ve| if (isEl(ve, saml_ns, "AttributeValue")) {
-                    try vals.append(a, try dupTrimmedText(a, ve));
-                },
-                else => {},
-            };
-            try out.append(a, .{
-                .name = name,
-                .friendly_name = friendly,
-                .values = try vals.toOwnedSlice(a),
-            });
+            if (isEl(attr_el, saml_ns, "Attribute")) {
+                try appendAttribute(a, &out, attr_el);
+            } else if (isEl(attr_el, saml_ns, "EncryptedAttribute")) {
+                if (config.sp_decrypt_key == null) return error.EncryptedAttributeUnsupported;
+                var dec = try decryptWrappedElement(alloc, attr_el, config, error.AttributeDecryptionFailed);
+                defer dec.deinit(alloc);
+                if (!isEl(dec.doc.root, saml_ns, "Attribute")) return error.AttributeDecryptionFailed;
+                try appendAttribute(a, &out, dec.doc.root);
+            }
         },
         else => {},
     };
     return out.toOwnedSlice(a);
+}
+
+/// Append one `<saml:Attribute>` element to `out`, duping into arena `a`. A
+/// nameless Attribute is skipped (no append), matching the cleartext behavior.
+fn appendAttribute(a: std.mem.Allocator, out: *std.ArrayList(Attribute), attr_el: *const xml.Element) ConsumeError!void {
+    const name = if (attr_el.attr("", "Name")) |n| try a.dupe(u8, n) else return;
+    const friendly = try dupAttr(a, attr_el, "FriendlyName");
+    var vals: std.ArrayList([]const u8) = .empty;
+    for (attr_el.children) |vc| switch (vc.content) {
+        .element => |ve| if (isEl(ve, saml_ns, "AttributeValue")) {
+            try vals.append(a, try dupTrimmedText(a, ve));
+        },
+        else => {},
+    };
+    try out.append(a, .{
+        .name = name,
+        .friendly_name = friendly,
+        .values = try vals.toOwnedSlice(a),
+    });
 }
 
 // ── AuthnRequest generation (SP-initiated SSO) ───────────────────────────────
@@ -1073,6 +1295,9 @@ test {
     _ = @import("test_xsw.zig");
     _ = @import("test_fixture.zig");
     _ = @import("test_encrypted.zig");
+    _ = @import("test_sign.zig");
+    _ = @import("test_encrypted_id_attr.zig");
+    _ = @import("test_hok.zig");
 }
 
 const testing = std.testing;

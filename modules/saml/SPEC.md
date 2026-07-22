@@ -120,17 +120,72 @@ cleartext assertion does.
   against the outer document and pinned to the outer Response, with the
   EncryptedAssertion required to be its direct child.
 
+## Encrypted `<saml:EncryptedID>` / `<saml:EncryptedAttribute>`
+
+Both wrap a `<xenc:EncryptedData>` exactly like `<EncryptedAssertion>`, but sit
+INSIDE the (signed) assertion, so they are decrypted **after** the enclosing
+assertion is signature-verified — the ciphertext is authenticated by enclosure
+before the SP private key ever runs. Opt-in via the same `Config.sp_decrypt_key`
+as EncryptedAssertion; the pass-throughs (`allow_weak_rsa15`, `decrypt_kek`)
+apply.
+
+- **`<saml:EncryptedID>`** (Subject): when the Subject carries an `<EncryptedID>`
+  instead of a `<NameID>`, it is decrypted (via `xmlenc.decryptData`) to a
+  `<saml:NameID>`, which drives NameID extraction as the cleartext form would.
+  No key configured ⇒ `error.EncryptedIdUnsupported` (mirrors the EncryptedAssertion
+  null-key discipline). A crypto/structure failure, or a plaintext that is not a
+  `<saml:NameID>`, collapses to the generic `error.IdDecryptionFailed`.
+- **`<saml:EncryptedAttribute>`** (AttributeStatement): each decrypts to a
+  `<saml:Attribute>` and is merged into the attribute set alongside any cleartext
+  `<Attribute>`s. No key ⇒ `error.EncryptedAttributeUnsupported`; failure ⇒
+  generic `error.AttributeDecryptionFailed`.
+
+Both generic decrypt errors mirror `xmlenc`'s oracle-safe collapse (no padding /
+key-validity signal leaks); the safe composition is verify-enclosure-then-decrypt.
+
+## Holder-of-Key subject confirmation
+
+`Config.subject_confirmation` (`.bearer` default | `.holder_of_key` | `.either`)
+selects which `<SubjectConfirmation Method>` may confirm the subject. For HoK
+(`urn:oasis:names:tc:SAML:2.0:cm:holder-of-key`) the presenter must actually hold
+the key named in the confirmation's `<ds:KeyInfo>`, which the relying party proves
+by supplying the transport key it authenticated the client with
+(`Config.presented_holder_cert_der`, e.g. the TLS client certificate DER).
+
+- **Key match — X.509-DER byte-equality.** The confirmation's
+  `<ds:KeyInfo><ds:X509Data><ds:X509Certificate>` DER is base64-decoded and
+  compared **byte-for-byte** to `presented_holder_cert_der`. The certificate is
+  **never parsed** (Zig 0.16 `std.crypto.Certificate.parse` is not panic-safe on
+  hostile DER — the same policy as `parseIdpMetadata`). **Limitation:** a
+  re-encoded but cryptographically-equivalent certificate, or a bare
+  `<ds:KeyValue>` public key (no X509Certificate), will NOT match — the SP and its
+  transport must present the identical certificate DER. This is a deliberate
+  safety/simplicity trade; SubjectPublicKeyInfo-level matching would require DER
+  parsing.
+- **HoK vs Bearer checks.** The HoK key check **replaces** the Bearer `Recipient`
+  check. Per the SAML HoK Web-SSO profile, `Recipient` / `InResponseTo` MAY be
+  omitted for HoK; when present they are still honored (`RecipientMismatch` /
+  `InResponseToMismatch`). `NotBefore` / `NotOnOrAfter`, when present, are enforced.
+- **Errors.** A method disallowed by policy (a HoK confirmation under `.bearer`,
+  or a Bearer confirmation under `.holder_of_key`) →
+  `error.SubjectConfirmationMethodNotAllowed`. HoK required but no presented key →
+  `error.PresentedKeyMissing`. KeyInfo present but no matching X509Certificate →
+  `error.HolderOfKeyMismatch`. Defaults keep the Bearer path byte-for-byte
+  unchanged.
+
 ## Validation performed on the trusted assertion
 
 - **`<Conditions>`**: `NotBefore` / `NotOnOrAfter` (xsd:dateTime) vs `now ± skew`
   → `AssertionNotYetValid` / `AssertionExpired`. `<AudienceRestriction>` must
   name `sp_entity_id` (multiple restrictions are ANDed; fail-closed if none) →
   `AudienceMismatch`. `<OneTimeUse>` presence is flagged (`AuthnResult.one_time_use`).
-- **Bearer `<SubjectConfirmationData>`** (Web SSO default): `Recipient` must equal
-  `acs_url` (`RecipientMismatch`); `NotOnOrAfter` enforced; `InResponseTo` must
-  equal `expected_in_response_to` (or be absent only when `allow_idp_initiated`)
-  → `InResponseToMismatch`. The subject is confirmed if at least one Bearer
-  confirmation fully validates; otherwise the most specific reason is returned.
+- **`<SubjectConfirmation>`** (see the two sections above for the method policy):
+  Bearer (Web SSO default) requires `Recipient` == `acs_url` (`RecipientMismatch`),
+  `NotOnOrAfter` enforced, and `InResponseTo` == `expected_in_response_to` (or
+  absent only when `allow_idp_initiated`) → `InResponseToMismatch`. Holder-of-Key
+  requires the presented-key match instead of `Recipient`. The subject is confirmed
+  if at least one permitted-method confirmation fully validates; otherwise the most
+  specific reason is returned.
 - **Response level**: `<Status><StatusCode>` must be `…:status:Success`
   (`StatusNotSuccess`); `<Issuer>`, when present, must equal `idp_entity_id`
   (`IssuerMismatch`); `Destination`, when present, must equal `acs_url`
@@ -155,12 +210,15 @@ cleartext assertion does.
 
 ## Deferred / out of scope
 
-- **Encrypted `<saml:EncryptedID>` / `<saml:EncryptedAttribute>`** — only the
-  whole-assertion `<saml:EncryptedAssertion>` form is decrypted (see above); an
-  encrypted NameID or individual encrypted attribute inside an otherwise
-  cleartext assertion is not yet unwrapped (eIDAS follow-up).
+- **Sender-vouches** subject confirmation
+  (`urn:oasis:names:tc:SAML:2.0:cm:sender-vouches`) — only Bearer and
+  Holder-of-Key are validated; a sender-vouches confirmation is ignored (never
+  satisfies the subject).
+- **Holder-of-Key `<ds:KeyValue>` matching** — HoK confirmation is matched by
+  X.509-DER byte-equality only; a bare `<ds:KeyValue>` (RSA/EC public key without
+  an X509Certificate) is not matched (would require DER parsing). See
+  "Holder-of-Key subject confirmation".
 - **Single Logout (SLO)**, artifact binding, and the IdP side — not implemented.
-- Holder-of-Key / sender-vouches subject confirmation (only Bearer is validated).
 
 ## Fixture provenance (be honest about interop)
 
@@ -178,6 +236,24 @@ Note on the common public fixtures: the widely-circulated `python3-saml`
 `<KeyInfo>` certificate is a placeholder, not the signer (those suites re-sign
 dynamically at test time). It is unsuitable as a static end-to-end signature
 fixture, which is precisely why the independent-toolchain fixture above is used.
+
+### EncryptedID / EncryptedAttribute / Holder-of-Key fixtures (constructed)
+
+These features put new content **inside** the signed assertion (an encrypted
+NameID in the Subject, an encrypted Attribute in the AttributeStatement, a HoK
+`<SubjectConfirmation>`), which no string edit of the openssl/lxml fixture can
+produce without breaking its digest. So `test_sign.zig` **mints a fresh signed
+assertion** under a locally-generated RSA key — `xmldsig.c14n` for Exclusive-C14N
++ `rsa.signPkcs1v15` for RSA-SHA256, exactly as `xmldsig`'s own round-trip tests
+do (no signing API is exposed by the modules). This is a **CONSTRUCTED** fixture
+(our canonicalizer feeds our verifier), **not** cross-implementation interop: the
+byte-exact interop anchors remain the openssl/lxml fixture (`test_fixture.zig`)
+and the NIST/RFC KATs in `xmlenc`. The minted-fixture suites prove the
+EncryptedID / EncryptedAttribute / HoK **logic** on top of those anchors. Each is
+paired with a positive control (cleartext-equivalent NameID; matching HoK cert).
+The HoK "certificate DER" in the tests is an opaque byte blob — the match is a
+byte comparison that never parses it, so a blob exercises the exact code path a
+real cert would. All RSA keys in these tests are test material only.
 
 ## DRY / hazard follow-ups
 
