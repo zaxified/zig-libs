@@ -1,9 +1,10 @@
 # acme
 
-ACME v2 (RFC 8555) client: automated certificate issuance + renewal over
-HTTP with the **HTTP-01** challenge (Let's Encrypt et al.) — directory
-discovery, nonce management, ES256 account (JWS), order → authorization →
-challenge → CSR finalize → PEM chain download, plus the renewal predicate.
+ACME v2 (RFC 8555) client: automated certificate issuance + renewal with the
+**HTTP-01** and **TLS-ALPN-01** (RFC 8737) challenges (Let's Encrypt et al.) —
+directory discovery, nonce management, ES256 account (JWS), order →
+authorization → challenge → CSR finalize → PEM chain download, plus the
+renewal predicate.
 
 - No ACME client exists in Zig std or as a maintained
   pure-Zig library worth adopting.
@@ -34,9 +35,9 @@ domain out of production quotas. Going live is a deliberate opt-in:
 
 | File | Role |
 |------|------|
-| `src/Client.zig` | The RFC 8555 protocol client (`register`, `obtain`) + `Responder`, the HTTP-01 challenge middleware. Robust nonce handling (`Replay-Nonce` harvested from every response, transparent `badNonce` retry), status polling with `Retry-After`, problem-document diagnostics via `lastProblem()`. |
-| `src/jws.zig` | JOSE layer: base64url (no pad), canonical P-256 JWK, RFC 7638 thumbprint, RFC 8555 §8.1 key authorization, ES256 flattened-JSON JWS sign **and verify** (the verify half powers the mock CA). |
-| `src/x509.zig` | Minimal DER encoder + PKCS#10 CSR (empty subject, SAN dNSNames — the modern Let's Encrypt shape), bounds-checked CSR parse-back, PEM, RFC 5915 `EC PRIVATE KEY` read/write, certificate `notAfter` via `std.crypto.Certificate`. |
+| `src/Client.zig` | The RFC 8555 protocol client (`register`, `obtain`) + `Responder` (HTTP-01 middleware) + `TlsAlpnResponder` (TLS-ALPN-01 validation-cert store). Robust nonce handling (`Replay-Nonce` harvested from every response, transparent `badNonce` retry), status polling with `Retry-After`, problem-document diagnostics via `lastProblem()`. Challenge type is `Options.challenge_type`. |
+| `src/jws.zig` | JOSE layer: base64url (no pad), canonical P-256 JWK, RFC 7638 thumbprint, RFC 8555 §8.1 key authorization, RFC 8737 §3 `acmeIdentifier` (`SHA-256(keyAuthorization)`), ES256 flattened-JSON JWS sign **and verify** (the verify half powers the mock CA). |
+| `src/x509.zig` | Minimal DER encoder + PKCS#10 CSR (empty subject, SAN dNSNames — the modern Let's Encrypt shape), bounds-checked CSR parse-back, **RFC 8737 TLS-ALPN-01 self-signed validation cert** (`tlsAlpnCertDer` / `tlsAlpnCert`: dNSName SAN + critical `id-pe-acmeIdentifier` extension), PEM, RFC 5915 `EC PRIVATE KEY` read/write, certificate `notAfter` via `std.crypto.Certificate`. |
 | `src/root.zig` | Re-exports + `needsRenewal(cert_pem, now, within_days)`. |
 
 ## Usage
@@ -71,9 +72,42 @@ if (acme.needsRenewal(cert.chain_pem, now_unix, 30)) {
 }
 ```
 
-Scope notes: HTTP-01 only (dns-01/tls-alpn-01 out of scope), therefore no
+Scope notes: HTTP-01 and TLS-ALPN-01 (dns-01 out of scope), therefore no
 wildcard certificates; P-256/ES256 keys only (account and certificate);
 key/cert PEM I/O covers RFC 5915 `EC PRIVATE KEY` (no PKCS#8).
+
+## TLS-ALPN-01 (RFC 8737)
+
+When port 80 is unavailable (or you terminate TLS on 443), select the
+TLS-ALPN-01 challenge. The library computes
+`acmeIdentifier = SHA-256(keyAuthorization)`, builds the self-signed
+validation certificate (dNSName SAN + the critical `id-pe-acmeIdentifier`
+extension), and stores it in `TlsAlpnResponder` keyed by domain. **Your TLS
+listener** must, on a ClientHello that offers ALPN `acme-tls/1`, look the SNI
+up and serve that certificate under that ALPN protocol — running that
+listener is app-side (out of scope for this module):
+
+```zig
+var client = acme.Client.init(io, gpa, &transport, account_key, .{
+    .challenge_type = .tls_alpn_01,
+});
+defer client.deinit();
+
+// Wire the store into your acme-tls/1 TLS listener BEFORE calling obtain:
+const store = client.tlsAlpnResponder();
+// … in the TLS handshake, when ClientHello ALPN offers acme.TlsAlpnResponder.alpn_protocol:
+//   var mat = (try store.getMaterial(gpa, server_name)) orelse fall through;
+//   defer mat.deinit(gpa);   // serve mat.cert_der + mat.key_pem, negotiate "acme-tls/1"
+
+var cert = try client.obtain(&.{"example.org"});
+defer cert.deinit(gpa);
+```
+
+The standalone cert builder is also exposed for out-of-band setups:
+`acme.x509.tlsAlpnCert(gpa, domain, acme_identifier, random)` →
+`{ cert_der, key_pem }` (keygen takes a `std.Random`, no `std.crypto.random`),
+or the deterministic `acme.x509.tlsAlpnCertDer(...)` with an explicit key,
+serial and validity.
 
 ## Verification
 

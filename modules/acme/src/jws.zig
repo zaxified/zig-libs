@@ -134,6 +134,31 @@ pub fn keyAuthorization(
     return std.fmt.bufPrint(buf, "{s}.{s}", .{ token, tp }) catch unreachable; // bounded by max_token_len
 }
 
+// ── RFC 8737 §3 TLS-ALPN-01 acmeIdentifier ──────────────────────────────────
+
+/// SHA-256 of an already-computed key authorization string (RFC 8737 §3) —
+/// the raw 32 bytes that go inside the certificate's `id-pe-acmeIdentifier`
+/// extension. Same key authorization the HTTP-01 challenge serves; TLS-ALPN-01
+/// instead hashes it and presents it over TLS.
+pub fn acmeIdentifierFromKeyAuthorization(key_auth: []const u8) [Sha256.digest_length]u8 {
+    var out: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(key_auth, &out, .{});
+    return out;
+}
+
+/// The RFC 8737 §3 acmeIdentifier for `token` under `public_key`: computes the
+/// RFC 8555 §8.1 key authorization, then returns `SHA-256(keyAuthorization)`
+/// (32 bytes). This is the value embedded in the TLS-ALPN-01 validation
+/// certificate's critical `id-pe-acmeIdentifier` extension.
+pub fn acmeIdentifier(
+    token: []const u8,
+    public_key: Es256.PublicKey,
+) KeyAuthorizationError![Sha256.digest_length]u8 {
+    var buf: [max_key_authorization_len]u8 = undefined;
+    const ka = try keyAuthorization(&buf, token, public_key);
+    return acmeIdentifierFromKeyAuthorization(ka);
+}
+
 // ── flattened-JSON JWS signing ──────────────────────────────────────────────
 
 /// The ACME protected header (RFC 8555 §6.2): `alg` is always ES256; `kid`
@@ -459,6 +484,27 @@ test "key authorization: token.thumbprint, bad tokens rejected" {
     try testing.expectError(error.InvalidToken, keyAuthorization(&buf, "a.b", kp.public_key));
     try testing.expectError(error.InvalidToken, keyAuthorization(&buf, "tok en", kp.public_key));
     try testing.expectError(error.InvalidToken, keyAuthorization(&buf, "x" ** 257, kp.public_key));
+}
+
+test "acmeIdentifier (RFC 8737 §3): SHA-256 of the key authorization" {
+    const kp = try rfc7515KeyPair();
+    // The key authorization for this (token, key) pair is checked byte-exact
+    // in the test above; here we hash it. Oracle: `printf '%s' '<key-auth>'
+    // | sha256sum` over that exact string.
+    const id = try acmeIdentifier("DGyRejmCefe7v4NfDGDKfA", kp.public_key);
+    const expected = [_]u8{
+        0x54, 0x88, 0x65, 0x39, 0xb5, 0x35, 0xe1, 0x2b, 0x33, 0xb8, 0x68, 0x89, 0x8d, 0x81, 0x24, 0x48,
+        0x25, 0xb3, 0x6b, 0xdf, 0x97, 0xf9, 0x41, 0x54, 0xbb, 0x31, 0xa1, 0xd5, 0x0b, 0x22, 0x61, 0xc5,
+    };
+    try testing.expectEqualSlices(u8, &expected, &id);
+
+    // The convenience path equals hashing the key-authorization string directly.
+    var ka_buf: [max_key_authorization_len]u8 = undefined;
+    const ka = try keyAuthorization(&ka_buf, "DGyRejmCefe7v4NfDGDKfA", kp.public_key);
+    try testing.expectEqualSlices(u8, &id, &acmeIdentifierFromKeyAuthorization(ka));
+
+    // A non-token is rejected the same way keyAuthorization rejects it.
+    try testing.expectError(error.InvalidToken, acmeIdentifier("a/b", kp.public_key));
 }
 
 test "ES256 known-answer: the RFC 7515 A.3 signature verifies (and tampering fails)" {

@@ -56,15 +56,28 @@ kid: ?[]u8,
 nonce: ?[]u8,
 nonce_lock: std.atomic.Mutex,
 responder: Responder,
+tls_alpn: TlsAlpnResponder,
 /// Last ACME problem document, for diagnostics (see `lastProblem`).
 problem_buf: [256]u8,
 problem_len: usize,
+
+/// Which RFC 8555 challenge the order flow solves for each authorization.
+/// `http_01` serves the key authorization over port 80 (via
+/// `challengeResponder`); `tls_alpn_01` (RFC 8737) serves a validation
+/// certificate over TLS under ALPN `acme-tls/1` (via `tlsAlpnResponder`, whose
+/// store the caller's TLS listener must consult). Both use the same account,
+/// order, notify and poll machinery — only the proof differs.
+pub const ChallengeType = enum { http_01, tls_alpn_01 };
 
 pub const Options = struct {
     /// ACME directory URL. **Defaults to Let's Encrypt STAGING** (untrusted
     /// test certificates!) so accidental runs cannot burn production rate
     /// limits — set `letsencrypt_production` explicitly to go live.
     directory_url: []const u8 = letsencrypt_staging,
+    /// Challenge type the order flow uses (default HTTP-01). Selecting
+    /// `tls_alpn_01` requires the caller to have wired `tlsAlpnResponder()`
+    /// into a TLS listener serving ALPN `acme-tls/1` for the ordered domains.
+    challenge_type: ChallengeType = .http_01,
     /// Optional account contact URLs, e.g. "mailto:admin@example.org".
     contact: []const []const u8 = &.{},
     /// RFC 8555 §7.3: account creation asserts agreement with the CA's
@@ -139,6 +152,7 @@ pub fn init(
         .nonce = null,
         .nonce_lock = .unlocked,
         .responder = Responder.init(gpa),
+        .tls_alpn = TlsAlpnResponder.init(gpa),
         .problem_buf = undefined,
         .problem_len = 0,
     };
@@ -149,6 +163,7 @@ pub fn deinit(c: *Client) void {
     if (c.kid) |k| c.gpa.free(k);
     if (c.nonce) |n| c.gpa.free(n);
     c.responder.deinit();
+    c.tls_alpn.deinit();
     // `account_key` is the account's ES256 private key — it lives on this
     // struct for the whole Client lifetime (every `postJws` call signs with
     // it), so this is its one wipe point. Do this BEFORE `c.* = undefined`
@@ -178,6 +193,17 @@ pub fn lastProblem(c: *const Client) ?[]const u8 {
 /// routes). The order flow populates and cleans its token map.
 pub fn challengeResponder(c: *Client) *Responder {
     return &c.responder;
+}
+
+/// The TLS-ALPN-01 validation-cert store (RFC 8737) to wire into the caller's
+/// TLS listener: on a ClientHello for one of the ordered domains that offers
+/// ALPN `acme-tls/1`, the listener looks up the SNI via
+/// `tlsAlpnResponder().getMaterial()` and serves the returned certificate +
+/// key, completing the handshake under that ALPN protocol. The order flow
+/// (with `Options.challenge_type == .tls_alpn_01`) populates and cleans the
+/// store; running the TLS listener itself is app-side (out of scope here).
+pub fn tlsAlpnResponder(c: *Client) *TlsAlpnResponder {
+    return &c.tls_alpn;
 }
 
 // ── account ─────────────────────────────────────────────────────────────────
@@ -350,8 +376,9 @@ fn writeFinalizePayload(js: *std.json.Stringify, csr_b64: []const u8) !void {
     try js.endObject();
 }
 
-/// One authorization: fetch it, serve + trigger its HTTP-01 challenge,
-/// poll to `valid`. Already-valid authorizations are accepted as-is.
+/// One authorization: fetch it, publish the proof for the configured
+/// challenge type, trigger it, and poll to `valid`. Already-valid
+/// authorizations are accepted as-is.
 fn solveAuthorization(c: *Client, a: Allocator, authz_url: []const u8) Error!void {
     const pr = try c.postJws(a, authz_url, "", .kid);
     if (pr.status != 200) {
@@ -364,25 +391,74 @@ fn solveAuthorization(c: *Client, a: Allocator, authz_url: []const u8) Error!voi
         .pending => {},
         else => return error.AuthorizationFailed,
     }
-    const challenge = authz.http01 orelse {
-        c.note("authorization offers no http-01 challenge");
-        return error.AuthorizationFailed;
-    };
 
-    // Publish the key authorization, then tell the CA to validate (§7.5.1).
-    var ka_buf: [jws.max_key_authorization_len]u8 = undefined;
-    const key_auth = jws.keyAuthorization(&ka_buf, challenge.token, c.account_key.public_key) catch
+    switch (c.options.challenge_type) {
+        .http_01 => {
+            const challenge = authz.http01 orelse {
+                c.note("authorization offers no http-01 challenge");
+                return error.AuthorizationFailed;
+            };
+            // Publish the key authorization (§8.3), then trigger + poll.
+            var ka_buf: [jws.max_key_authorization_len]u8 = undefined;
+            const key_auth = jws.keyAuthorization(&ka_buf, challenge.token, c.account_key.public_key) catch
+                return error.MalformedResponse; // CA sent a non-token
+            try c.responder.set(challenge.token, key_auth);
+            defer c.responder.remove(challenge.token);
+            try c.notifyAndPoll(a, challenge.url, authz_url);
+        },
+        .tls_alpn_01 => {
+            const challenge = authz.tls_alpn01 orelse {
+                c.note("authorization offers no tls-alpn-01 challenge");
+                return error.AuthorizationFailed;
+            };
+            if (!x509.isValidDomain(authz.identifier)) return error.MalformedResponse;
+            try c.publishTlsAlpn01(a, authz.identifier, challenge.token);
+            defer c.tls_alpn.remove(authz.identifier);
+            try c.notifyAndPoll(a, challenge.url, authz_url);
+        },
+    }
+}
+
+/// Build the RFC 8737 validation certificate for `domain` and publish it in
+/// the TLS-ALPN store keyed by the domain (the caller's TLS listener serves
+/// it under ALPN `acme-tls/1`). The fresh leaf key is transient scratch —
+/// only its PEM copy is stored, so the raw KeyPair is wiped at scope exit.
+fn publishTlsAlpn01(c: *Client, a: Allocator, domain: []const u8, token: []const u8) Error!void {
+    const acme_id = jws.acmeIdentifier(token, c.account_key.public_key) catch
         return error.MalformedResponse; // CA sent a non-token
-    try c.responder.set(challenge.token, key_auth);
-    defer c.responder.remove(challenge.token);
+    var cert_key = jws.KeyPair.generate(c.io);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&cert_key));
 
-    const tpr = try c.postJws(a, challenge.url, "{}", .kid);
+    // Deterministic positive, minimal serial derived from the identifier.
+    var serial: [16]u8 = acme_id[0..16].*;
+    serial[0] = (serial[0] & 0x7f) | 0x01;
+
+    const cert_der = x509.tlsAlpnCertDer(
+        a,
+        cert_key,
+        domain,
+        acme_id,
+        &serial,
+        x509.tls_alpn_not_before,
+        x509.tls_alpn_not_after,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidDomain => return error.InvalidDomain,
+        error.SigningFailed, error.ValueTooLarge => return error.SigningFailed,
+    };
+    const key_pem = x509.ecPrivateKeyToPem(a, cert_key) catch return error.OutOfMemory;
+    try c.tls_alpn.set(domain, cert_der, key_pem);
+}
+
+/// Trigger the challenge (POST `{}` to `challenge_url`, §7.5.1) and poll the
+/// authorization to `valid` — shared by HTTP-01 and TLS-ALPN-01.
+fn notifyAndPoll(c: *Client, a: Allocator, challenge_url: []const u8, authz_url: []const u8) Error!void {
+    const tpr = try c.postJws(a, challenge_url, "{}", .kid);
     if (tpr.status != 200) {
         c.noteProblem(tpr.body);
         return error.AcmeProblem;
     }
 
-    // Poll the authorization until the CA verdict (§7.5.1).
     var polls: u32 = 0;
     var wait_ms: ?u64 = null; // no wait before the first re-check
     while (polls < c.options.max_polls) : (polls += 1) {
@@ -470,7 +546,11 @@ fn parseOrder(a: Allocator, body: []const u8) Error!OrderInfo {
 
 const AuthzInfo = struct {
     status: Status,
+    /// The authorization's dNS identifier value (the domain) — the SAN and
+    /// SNI key for the TLS-ALPN-01 validation certificate.
+    identifier: []const u8,
     http01: ?ChallengeInfo,
+    tls_alpn01: ?ChallengeInfo,
 };
 
 const ChallengeInfo = struct {
@@ -481,8 +561,13 @@ const ChallengeInfo = struct {
 fn parseAuthz(a: Allocator, body: []const u8) Error!AuthzInfo {
     const AuthzJson = struct {
         status: []const u8 = "",
+        identifier: IdentifierJson = .{},
         challenges: []const ChallengeJson = &.{},
 
+        const IdentifierJson = struct {
+            type: []const u8 = "",
+            value: []const u8 = "",
+        };
         const ChallengeJson = struct {
             type: []const u8 = "",
             url: []const u8 = "",
@@ -497,13 +582,20 @@ fn parseAuthz(a: Allocator, body: []const u8) Error!AuthzInfo {
         else => return error.MalformedResponse,
     };
     var http01: ?ChallengeInfo = null;
+    var tls_alpn01: ?ChallengeInfo = null;
     for (parsed.challenges) |ch| {
-        if (std.mem.eql(u8, ch.type, "http-01")) {
+        if (http01 == null and std.mem.eql(u8, ch.type, "http-01")) {
             http01 = .{ .url = ch.url, .token = ch.token };
-            break;
+        } else if (tls_alpn01 == null and std.mem.eql(u8, ch.type, "tls-alpn-01")) {
+            tls_alpn01 = .{ .url = ch.url, .token = ch.token };
         }
     }
-    return .{ .status = statusFromString(parsed.status), .http01 = http01 };
+    return .{
+        .status = statusFromString(parsed.status),
+        .identifier = parsed.identifier.value,
+        .http01 = http01,
+        .tls_alpn01 = tls_alpn01,
+    };
 }
 
 const Problem = struct {
@@ -809,6 +901,109 @@ pub const Responder = struct {
     }
 };
 
+// ── the TLS-ALPN-01 validation-cert store (RFC 8737) ────────────────────────
+
+/// A thread-safe store of TLS-ALPN-01 validation certificates keyed by domain
+/// (SNI). The order flow builds an entry per authorization
+/// (`SHA-256(keyAuthorization)` → self-signed cert with the critical
+/// `id-pe-acmeIdentifier` extension) and removes it when the authorization
+/// settles. The caller's TLS listener, on a ClientHello that offers ALPN
+/// `acme-tls/1`, looks the SNI up with `getMaterial` and serves the returned
+/// certificate + key, completing the handshake under that protocol. Running
+/// the TLS listener is app-side (out of scope); this store is the seam.
+pub const TlsAlpnResponder = struct {
+    gpa: Allocator,
+    lock: std.atomic.Mutex = .unlocked,
+    map: std.StringHashMapUnmanaged(Entry) = .empty,
+
+    /// The ALPN protocol the validation certificate must be served under.
+    pub const alpn_protocol = x509.tls_alpn_protocol; // "acme-tls/1"
+
+    const Entry = struct { cert_der: []u8, key_pem: []u8 };
+
+    /// A caller-owned copy of a validation cert + its leaf key (free with
+    /// `deinit`). `key_pem` is an `EC PRIVATE KEY` PEM (RFC 5915).
+    pub const Material = struct {
+        cert_der: []u8,
+        key_pem: []u8,
+
+        pub fn deinit(self: *Material, gpa: Allocator) void {
+            gpa.free(self.cert_der);
+            gpa.free(self.key_pem);
+            self.* = undefined;
+        }
+    };
+
+    pub fn init(gpa: Allocator) TlsAlpnResponder {
+        return .{ .gpa = gpa };
+    }
+
+    pub fn deinit(r: *TlsAlpnResponder) void {
+        var it = r.map.iterator();
+        while (it.next()) |e| {
+            r.gpa.free(e.key_ptr.*);
+            r.gpa.free(e.value_ptr.cert_der);
+            r.gpa.free(e.value_ptr.key_pem);
+        }
+        r.map.deinit(r.gpa);
+        r.* = undefined;
+    }
+
+    /// Publish (`domain` → `cert_der` + `key_pem`); all three are copied,
+    /// replacing any existing entry. The order flow calls this.
+    pub fn set(r: *TlsAlpnResponder, domain: []const u8, cert_der: []const u8, key_pem: []const u8) error{OutOfMemory}!void {
+        const cert_copy = try r.gpa.dupe(u8, cert_der);
+        errdefer r.gpa.free(cert_copy);
+        const key_copy = try r.gpa.dupe(u8, key_pem);
+        errdefer r.gpa.free(key_copy);
+        lockSpin(&r.lock);
+        defer r.lock.unlock();
+        const gop = try r.map.getOrPut(r.gpa, domain);
+        if (gop.found_existing) {
+            r.gpa.free(gop.value_ptr.cert_der);
+            r.gpa.free(gop.value_ptr.key_pem);
+        } else {
+            gop.key_ptr.* = r.gpa.dupe(u8, domain) catch |err| {
+                _ = r.map.remove(domain);
+                return err;
+            };
+        }
+        gop.value_ptr.* = .{ .cert_der = cert_copy, .key_pem = key_copy };
+    }
+
+    pub fn remove(r: *TlsAlpnResponder, domain: []const u8) void {
+        lockSpin(&r.lock);
+        const kv = r.map.fetchRemove(domain);
+        r.lock.unlock();
+        if (kv) |e| {
+            r.gpa.free(e.key);
+            r.gpa.free(e.value.cert_der);
+            r.gpa.free(e.value.key_pem);
+        }
+    }
+
+    /// A caller-owned copy of the validation material for `sni`, or null when
+    /// no challenge is in flight for it (entries can be removed concurrently,
+    /// so returning a borrowed slice would race). The TLS listener serves the
+    /// result and frees it after the handshake.
+    pub fn getMaterial(r: *TlsAlpnResponder, gpa: Allocator, sni: []const u8) error{OutOfMemory}!?Material {
+        lockSpin(&r.lock);
+        defer r.lock.unlock();
+        const e = r.map.get(sni) orelse return null;
+        const cert_copy = try gpa.dupe(u8, e.cert_der);
+        errdefer gpa.free(cert_copy);
+        const key_copy = try gpa.dupe(u8, e.key_pem);
+        return .{ .cert_der = cert_copy, .key_pem = key_copy };
+    }
+
+    /// Number of validation certs currently published.
+    pub fn count(r: *TlsAlpnResponder) usize {
+        lockSpin(&r.lock);
+        defer r.lock.unlock();
+        return r.map.count();
+    }
+};
+
 // ── tests (offline units) ───────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -933,6 +1128,69 @@ test "Responder: set/lookup/remove semantics under copies" {
     r.remove("tok-1"); // idempotent
     try testing.expect(r.lookup("tok-1", &buf) == null);
     try testing.expectEqual(@as(usize, 0), r.count());
+}
+
+test "TlsAlpnResponder: set/getMaterial/remove keyed by domain (copies)" {
+    var r = TlsAlpnResponder.init(testing.allocator);
+    defer r.deinit();
+
+    try testing.expectEqualStrings("acme-tls/1", TlsAlpnResponder.alpn_protocol);
+    try testing.expectEqual(@as(usize, 0), r.count());
+
+    {
+        // Domain, cert and key are all copied — caller memory may die.
+        var dom_buf: [16]u8 = undefined;
+        var cert_buf: [8]u8 = undefined;
+        var key_buf: [8]u8 = undefined;
+        @memcpy(dom_buf[0..11], "example.org");
+        @memcpy(cert_buf[0..6], "CERTde");
+        @memcpy(key_buf[0..5], "KEYpm");
+        try r.set(dom_buf[0..11], cert_buf[0..6], key_buf[0..5]);
+        dom_buf = @splat(0xAA);
+        cert_buf = @splat(0xAA);
+        key_buf = @splat(0xAA);
+    }
+    try testing.expectEqual(@as(usize, 1), r.count());
+
+    var mat = (try r.getMaterial(testing.allocator, "example.org")).?;
+    try testing.expectEqualStrings("CERTde", mat.cert_der);
+    try testing.expectEqualStrings("KEYpm", mat.key_pem);
+    mat.deinit(testing.allocator);
+
+    try testing.expect((try r.getMaterial(testing.allocator, "other.example")) == null);
+
+    try r.set("example.org", "CERT2", "KEY2"); // replace
+    var mat2 = (try r.getMaterial(testing.allocator, "example.org")).?;
+    try testing.expectEqualStrings("CERT2", mat2.cert_der);
+    mat2.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), r.count());
+
+    r.remove("example.org");
+    r.remove("example.org"); // idempotent
+    try testing.expect((try r.getMaterial(testing.allocator, "example.org")) == null);
+    try testing.expectEqual(@as(usize, 0), r.count());
+}
+
+test "parseAuthz: selects tls-alpn-01 and captures the identifier" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const authz = try parseAuthz(a,
+        \\{"status":"pending","identifier":{"type":"dns","value":"x.example"},
+        \\ "challenges":[
+        \\   {"type":"http-01","url":"https://ca/ch/8","token":"ttt"},
+        \\   {"type":"tls-alpn-01","url":"https://ca/ch/9","token":"aaa","status":"pending"}]}
+    );
+    try testing.expectEqualStrings("x.example", authz.identifier);
+    try testing.expectEqualStrings("https://ca/ch/8", authz.http01.?.url);
+    try testing.expectEqualStrings("https://ca/ch/9", authz.tls_alpn01.?.url);
+    try testing.expectEqualStrings("aaa", authz.tls_alpn01.?.token);
+
+    const no_alpn = try parseAuthz(a, "{\"status\":\"pending\",\"challenges\":[]}");
+    try testing.expect(no_alpn.tls_alpn01 == null);
+    try testing.expect(no_alpn.http01 == null);
+    try testing.expectEqualStrings("", no_alpn.identifier);
 }
 
 /// Drive a router through the socket-free server codec (router's runWire).

@@ -81,6 +81,7 @@ const oid_p256 = "\x2a\x86\x48\xce\x3d\x03\x01\x07"; // 1.2.840.10045.3.1.7
 const oid_ecdsa_sha256 = "\x2a\x86\x48\xce\x3d\x04\x03\x02"; // 1.2.840.10045.4.3.2
 const oid_extension_request = "\x2a\x86\x48\x86\xf7\x0d\x01\x09\x0e"; // 1.2.840.113549.1.9.14
 const oid_subject_alt_name = "\x55\x1d\x11"; // 2.5.29.17
+const oid_acme_identifier = "\x2b\x06\x01\x05\x05\x07\x01\x1f"; // 1.3.6.1.5.5.7.1.31 (id-pe-acmeIdentifier)
 
 // ── domain validation ───────────────────────────────────────────────────────
 
@@ -162,6 +163,168 @@ pub fn csrDer(gpa: Allocator, key_pair: Es256.KeyPair, domains: []const []const 
         try d.bitString(sig_der),
     });
     return gpa.dupe(u8, csr);
+}
+
+// ── RFC 8737 TLS-ALPN-01 validation certificate ─────────────────────────────
+
+pub const TlsAlpnError = error{ OutOfMemory, ValueTooLarge, InvalidDomain, SigningFailed };
+
+/// A fixed, wide validity window for the ephemeral validation certificate.
+/// The CA connects over TLS immediately to read the `acmeIdentifier`
+/// extension and does not path-validate a self-signed leaf, so a constant
+/// window avoids needing a system clock. ASN.1 UTCTime (`YYMMDDHHMMSSZ`,
+/// `YY` 00–49 ⇒ 20YY): 2000-01-01 … 2049-12-31.
+pub const tls_alpn_not_before = "000101000000Z";
+pub const tls_alpn_not_after = "491231235959Z";
+
+/// The ALPN protocol the validation certificate is served under (RFC 8737 §3).
+pub const tls_alpn_protocol = "acme-tls/1";
+
+/// The self-signed TLS-ALPN-01 validation certificate (RFC 8737): a freshly
+/// generated leaf key plus the DER certificate carrying the critical
+/// `id-pe-acmeIdentifier` extension and a dNSName SAN for the domain. The
+/// caller serves `cert_der` + `key_pem` from a TLS listener under ALPN
+/// `acme-tls/1`; running that listener is app-side (out of scope here).
+pub const TlsAlpnCert = struct {
+    /// The validation certificate, DER.
+    cert_der: []u8,
+    /// The matching leaf key as an `EC PRIVATE KEY` PEM (RFC 5915).
+    key_pem: []u8,
+
+    pub fn deinit(self: *TlsAlpnCert, gpa: Allocator) void {
+        gpa.free(self.cert_der);
+        gpa.free(self.key_pem);
+        self.* = undefined;
+    }
+};
+
+/// Build the DER of the RFC 8737 self-signed validation certificate for
+/// `domain`. Deterministic (same inputs → same bytes) — the keyed core the
+/// tests pin. Structure (X.509 v3, `ecdsa-with-SHA256`, empty issuer/subject):
+///
+///   - `subjectAltName` (critical — empty subject, RFC 5280 §4.2.1.6) with a
+///     single dNSName = `domain`.
+///   - `id-pe-acmeIdentifier` (1.3.6.1.5.5.7.1.31), **critical**, whose
+///     extnValue is `OCTET STRING( OCTET STRING(acme_identifier) )` — the
+///     double wrap: extnValue is itself an OCTET STRING wrapping the DER of
+///     `Authorization ::= OCTET STRING (SIZE (32))` (RFC 8737 §3).
+///
+/// `acme_identifier` is `SHA-256(keyAuthorization)` (see `jws.acmeIdentifier`).
+/// `serial` is the (positive, minimal, ≤20-byte) INTEGER content. `not_before`
+/// / `not_after` are ASN.1 UTCTime strings. Caller owns the returned bytes.
+pub fn tlsAlpnCertDer(
+    gpa: Allocator,
+    key_pair: Es256.KeyPair,
+    domain: []const u8,
+    acme_identifier: [32]u8,
+    serial: []const u8,
+    not_before: []const u8,
+    not_after: []const u8,
+) TlsAlpnError![]u8 {
+    if (!isValidDomain(domain)) return error.InvalidDomain;
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const d: Der = .{ .a = arena.allocator() };
+
+    // SubjectPublicKeyInfo — identical shape to the CSR's.
+    const pub_sec1 = key_pair.public_key.toUncompressedSec1();
+    const spki = try d.seq(&.{
+        try d.seq(&.{ try d.oid(oid_ec_public_key), try d.oid(oid_p256) }),
+        try d.bitString(&pub_sec1),
+    });
+
+    // AlgorithmIdentifier ecdsa-with-SHA256 (params absent) — shared by the
+    // inner `signature` field and the outer `signatureAlgorithm`.
+    const alg_id = try d.seq(&.{try d.oid(oid_ecdsa_sha256)});
+
+    // Validity ::= SEQUENCE { notBefore UTCTime, notAfter UTCTime }.
+    const validity = try d.seq(&.{
+        try d.tlv(0x17, not_before),
+        try d.tlv(0x17, not_after),
+    });
+
+    // subjectAltName: GeneralNames { [2] dNSName }, marked critical because
+    // the subject is empty (RFC 5280 §4.2.1.6).
+    const san_names = try d.seq(&.{try d.tlv(0x82, domain)});
+    const san_ext = try d.seq(&.{
+        try d.oid(oid_subject_alt_name),
+        try d.tlv(0x01, "\xff"), // critical TRUE
+        try d.tlv(0x04, san_names), // extnValue OCTET STRING
+    });
+
+    // id-pe-acmeIdentifier: critical, extnValue = OCTET STRING wrapping the
+    // DER OCTET STRING of the 32-byte identifier (RFC 8737 §3 double wrap).
+    const inner_octet = try d.tlv(0x04, &acme_identifier); // Authorization
+    const acme_ext = try d.seq(&.{
+        try d.oid(oid_acme_identifier),
+        try d.tlv(0x01, "\xff"), // critical TRUE (RFC 8737 MUST)
+        try d.tlv(0x04, inner_octet), // extnValue OCTET STRING( OCTET STRING(hash) )
+    });
+
+    const extensions = try d.tlv(0xa3, try d.seq(&.{ san_ext, acme_ext })); // [3] EXPLICIT
+
+    const name = try d.seq(&.{}); // empty Name — reused for issuer and subject
+    const tbs = try d.seq(&.{
+        try d.tlv(0xa0, try d.tlv(0x02, "\x02")), // version [0] EXPLICIT INTEGER 2 (v3)
+        try d.tlv(0x02, serial), // serialNumber
+        alg_id, // signature (must match signatureAlgorithm)
+        name, // issuer
+        validity,
+        name, // subject
+        spki,
+        extensions,
+    });
+
+    // Self-sign the TBSCertificate.
+    const sig = key_pair.sign(tbs, null) catch return error.SigningFailed;
+    var sig_buf: [Es256.Signature.der_encoded_length_max]u8 = undefined;
+    const sig_der = sig.toDer(&sig_buf);
+
+    const cert = try d.seq(&.{
+        tbs,
+        alg_id,
+        try d.bitString(sig_der),
+    });
+    return gpa.dupe(u8, cert);
+}
+
+/// Convenience: generate a fresh P-256 leaf key and build the RFC 8737
+/// validation certificate for `domain`. `random` supplies the key seed and
+/// the serial number (no `std.crypto.random` dependency — pass a CSPRNG such
+/// as `std.crypto.random` shims or a seeded PRNG in tests). Uses the fixed
+/// `tls_alpn_not_before`/`tls_alpn_not_after` window. Caller owns the result
+/// (`TlsAlpnCert.deinit`).
+pub fn tlsAlpnCert(
+    gpa: Allocator,
+    domain: []const u8,
+    acme_identifier: [32]u8,
+    random: std.Random,
+) TlsAlpnError!TlsAlpnCert {
+    var seed: [32]u8 = undefined;
+    random.bytes(&seed);
+    var key_pair = Es256.KeyPair.generateDeterministic(seed) catch return error.SigningFailed;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&key_pair));
+    std.crypto.secureZero(u8, &seed);
+
+    // 16-byte positive, minimal serial: force the top byte to 0x01..0x7f so
+    // it is nonzero and has no leading-zero / high-bit ambiguity.
+    var serial: [16]u8 = undefined;
+    random.bytes(&serial);
+    serial[0] = (serial[0] & 0x7f) | 0x01;
+
+    const cert_der = try tlsAlpnCertDer(
+        gpa,
+        key_pair,
+        domain,
+        acme_identifier,
+        &serial,
+        tls_alpn_not_before,
+        tls_alpn_not_after,
+    );
+    errdefer gpa.free(cert_der);
+    const key_pem = try ecPrivateKeyToPem(gpa, key_pair);
+    return .{ .cert_der = cert_der, .key_pem = key_pem };
 }
 
 // ── bounds-checked DER reading (the decode half) ────────────────────────────
@@ -584,6 +747,112 @@ test "CSR: domain validation" {
     try testing.expect(isValidDomain("a.example"));
     try testing.expect(isValidDomain("xn--hkyrky-ptac70bc.example"));
     try testing.expect(isValidDomain("127.0.0.1")); // IP-shaped names pass the LDH check (mock/test use)
+}
+
+/// Navigate a self-signed cert and verify its ECDSA signature over the exact
+/// TBSCertificate bytes with the embedded public key (test oracle, reusing
+/// the file's bounds-checked DER reader).
+fn verifySelfSigned(bytes: []const u8) !void {
+    const cert = try expectElem(bytes, 0, 0x30);
+    const tbs = try expectElem(bytes, cert.start, 0x30);
+    const tbs_full = bytes[tbs.hdr..tbs.end];
+
+    const version = try expectElem(bytes, tbs.start, 0xa0);
+    const serial = try expectElem(bytes, version.end, 0x02);
+    const sig_alg_in = try expectElem(bytes, serial.end, 0x30);
+    const issuer = try expectElem(bytes, sig_alg_in.end, 0x30);
+    const validity = try expectElem(bytes, issuer.end, 0x30);
+    const subject = try expectElem(bytes, validity.end, 0x30);
+    const spki = try expectElem(bytes, subject.end, 0x30);
+    const spki_alg = try expectElem(bytes, spki.start, 0x30);
+    const key_bits = try expectElem(bytes, spki_alg.end, 0x03);
+    const key_content = key_bits.content(bytes);
+    if (key_content.len != 66 or key_content[0] != 0) return error.Malformed;
+    const public_key = try Es256.PublicKey.fromSec1(key_content[1..]);
+
+    const sig_alg = try expectElem(bytes, tbs.end, 0x30);
+    const sig_bits = try expectElem(bytes, sig_alg.end, 0x03);
+    const sig_content = sig_bits.content(bytes);
+    const sig = try Es256.Signature.fromDer(sig_content[1..]);
+    try sig.verify(tbs_full, public_key);
+}
+
+test "TLS-ALPN-01 cert: RFC 8737 extension encoding + SAN + self-signature" {
+    const kp = testKeyPair(70);
+    // Oracle acmeIdentifier (cross-referenced in jws.zig's acmeIdentifier test).
+    const acme_id = [_]u8{
+        0x54, 0x88, 0x65, 0x39, 0xb5, 0x35, 0xe1, 0x2b, 0x33, 0xb8, 0x68, 0x89, 0x8d, 0x81, 0x24, 0x48,
+        0x25, 0xb3, 0x6b, 0xdf, 0x97, 0xf9, 0x41, 0x54, 0xbb, 0x31, 0xa1, 0xd5, 0x0b, 0x22, 0x61, 0xc5,
+    };
+    const der_bytes = try tlsAlpnCertDer(
+        testing.allocator,
+        kp,
+        "example.org",
+        acme_id,
+        "\x01",
+        tls_alpn_not_before,
+        tls_alpn_not_after,
+    );
+    defer testing.allocator.free(der_bytes);
+
+    // RFC 8737 §3, byte-exact: SEQUENCE { OID 1.3.6.1.5.5.7.1.31, critical
+    // TRUE, extnValue OCTET STRING( OCTET STRING(32-byte identifier) ) }.
+    const acme_ext =
+        "\x30\x31" ++ // SEQUENCE, len 0x31 = 49
+        "\x06\x08\x2b\x06\x01\x05\x05\x07\x01\x1f" ++ // OID id-pe-acmeIdentifier
+        "\x01\x01\xff" ++ // critical BOOLEAN TRUE
+        "\x04\x22\x04\x20" ++ // OCTET STRING(len 34) { OCTET STRING(len 32) ... }
+        acme_id;
+    try testing.expect(std.mem.indexOf(u8, der_bytes, acme_ext) != null);
+
+    // subjectAltName dNSName = the domain ([2] IMPLICIT IA5String).
+    try testing.expect(std.mem.indexOf(u8, der_bytes, "\x82\x0b" ++ "example.org") != null);
+    // The SAN extension is marked critical (empty subject).
+    try testing.expect(std.mem.indexOf(u8, der_bytes, "\x06\x03\x55\x1d\x11\x01\x01\xff") != null);
+
+    // Self-signed: the signature verifies over the TBSCertificate.
+    try verifySelfSigned(der_bytes);
+
+    // Deterministic: identical inputs rebuild byte-for-byte.
+    const again = try tlsAlpnCertDer(
+        testing.allocator,
+        kp,
+        "example.org",
+        acme_id,
+        "\x01",
+        tls_alpn_not_before,
+        tls_alpn_not_after,
+    );
+    defer testing.allocator.free(again);
+    try testing.expectEqualSlices(u8, der_bytes, again);
+
+    // Wildcards / bad domains are rejected (dNSName must be a real host).
+    try testing.expectError(error.InvalidDomain, tlsAlpnCertDer(
+        testing.allocator,
+        kp,
+        "*.example.org",
+        acme_id,
+        "\x01",
+        tls_alpn_not_before,
+        tls_alpn_not_after,
+    ));
+}
+
+test "TLS-ALPN-01 cert: tlsAlpnCert convenience generates a usable key + cert" {
+    var prng = std.Random.DefaultPrng.init(0x8737);
+    const acme_id: [32]u8 = @splat(0xAB);
+    var cert = try tlsAlpnCert(testing.allocator, "example.com", acme_id, prng.random());
+    defer cert.deinit(testing.allocator);
+
+    // The certificate self-verifies and carries the identifier + SAN.
+    try verifySelfSigned(cert.cert_der);
+    try testing.expect(std.mem.indexOf(u8, cert.cert_der, "\x04\x22\x04\x20" ++ &acme_id) != null);
+    try testing.expect(std.mem.indexOf(u8, cert.cert_der, "\x82\x0b" ++ "example.com") != null);
+
+    // The emitted key PEM parses back and matches the cert's SPKI point.
+    const kp = try ecPrivateKeyFromPem(testing.allocator, cert.key_pem);
+    const point = kp.public_key.toUncompressedSec1();
+    try testing.expect(std.mem.indexOf(u8, cert.cert_der, &point) != null);
 }
 
 test "PEM: encode/decode round-trip, wrapping, labels, garbage" {

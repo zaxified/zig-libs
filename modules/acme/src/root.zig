@@ -1,14 +1,19 @@
 // SPDX-License-Identifier: MIT
 
 //! acme — ACME v2 (RFC 8555) client: automated certificate issuance +
-//! renewal over HTTP with the HTTP-01 challenge (Let's Encrypt et al.).
+//! renewal with the HTTP-01 and TLS-ALPN-01 (RFC 8737) challenges (Let's
+//! Encrypt et al.).
 //!
 //! The pieces: `Client` drives the protocol (directory → nonce → account →
-//! order → HTTP-01 → CSR finalize → PEM chain download) over the sibling
+//! order → challenge → CSR finalize → PEM chain download) over the sibling
 //! `http.Client`; `Client.Responder` is the `router` middleware that serves
-//! `/.well-known/acme-challenge/<token>`; `jws` is the ES256/JWK/thumbprint
-//! layer; `x509` covers the PKCS#10 CSR (minimal DER), PEM and key/cert
-//! (de)serialization; `needsRenewal` is the renewal-loop predicate.
+//! the HTTP-01 `/.well-known/acme-challenge/<token>`; `Client.TlsAlpnResponder`
+//! is the TLS-ALPN-01 validation-cert store the caller's `acme-tls/1` TLS
+//! listener consults (`Options.challenge_type` selects which); `jws` is the
+//! ES256/JWK/thumbprint layer (+ the RFC 8737 `acmeIdentifier`); `x509` covers
+//! the PKCS#10 CSR and the TLS-ALPN-01 validation certificate (minimal DER),
+//! PEM and key/cert (de)serialization; `needsRenewal` is the renewal-loop
+//! predicate.
 //!
 //! **Defaults to the Let's Encrypt STAGING directory** — staging issues
 //! untrusted test certificates but has friendly rate limits. Production is
@@ -39,7 +44,7 @@ pub const meta = .{
     // order flow writes); client-internal caches are synchronized, but
     // drive register/obtain from one thread at a time.
     .concurrency = .threadsafe,
-    .model_after = "golang.org/x/crypto/acme + certbot flow semantics; RFC 8555/7515/7638 wire",
+    .model_after = "golang.org/x/crypto/acme + certbot flow semantics; RFC 8555/7515/7638/8737 wire",
     .deps = .{ "http", "router", "std.crypto (ecdsa P-256, Certificate)", "std.json" },
 };
 
@@ -49,6 +54,14 @@ pub const Client = @import("Client.zig");
 /// HTTP-01 challenge responder (`router` middleware) — usually reached via
 /// `Client.challengeResponder`.
 pub const Responder = Client.Responder;
+
+/// TLS-ALPN-01 (RFC 8737) validation-cert store — reached via
+/// `Client.tlsAlpnResponder`; the caller's TLS listener serves its entries
+/// under ALPN `acme-tls/1`.
+pub const TlsAlpnResponder = Client.TlsAlpnResponder;
+
+/// The challenge type the order flow solves (`Options.challenge_type`).
+pub const ChallengeType = Client.ChallengeType;
 
 /// An issued certificate (PEM chain + leaf key PEM + notAfter).
 pub const Certificate = Client.Certificate;
