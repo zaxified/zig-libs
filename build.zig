@@ -65,6 +65,8 @@ const module_list = [_]Module{
     .{ .name = "liveness-hyst", .deps = &.{ "netsim", "latency-stats" } },
     .{ .name = "loopix", .deps = &.{ "netsim", "sphinx" } },
     .{ .name = "lockfree" },
+    .{ .name = "workerpool", .deps = &.{"lockfree"} },
+    .{ .name = "shardstore", .deps = &.{"kvtree"} },
     .{ .name = "hashdigest" },
     .{ .name = "sealedbox" },
     .{ .name = "rsa", .deps = &.{"montint"} },
