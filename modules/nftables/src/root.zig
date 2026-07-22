@@ -1,203 +1,121 @@
 // SPDX-License-Identifier: MIT
 
-//! nftables — typed builder for the libnftables JSON ruleset format.
+//! nftables — manage the Linux firewall from Zig, two ways.
 //!
-//! Construct tables/chains/rules/sets with a typed Zig API and serialize them
-//! to the documented JSON representation accepted by `nft -j -f -` (check
-//! first with `nft -c -j -f -`). This lets a program manage the Linux
-//! firewall natively instead of assembling `nft` command strings by hand.
+//! **1. The JSON builder (this file, portable).** Construct tables/chains/
+//! rules/sets with a typed Zig API and serialize them to the documented JSON
+//! representation accepted by `nft -j -f -` (check first with `nft -c -j -f -`).
+//! No privileges, no Linux, no kernel: the output is portable data a test can
+//! diff and a config generator can ship. *Applying* it needs the `nft` binary.
 //!
-//! Scope: the ruleset-building subset of the schema — `add`/`create`/
-//! `delete`/`flush` commands over table/chain/rule/set (+ `flush ruleset`),
-//! and the common expression/statement vocabulary (payload & meta & ct
-//! matches, prefixes, ranges, anonymous and named sets, verdicts, NAT,
-//! counter/log/limit). The JSON produced here is portable data; *applying*
-//! it requires the Linux `nft` binary.
+//! **2. The native nfnetlink backend (`wire.zig`/`expr.zig`/`socket.zig`,
+//! Linux + `CAP_NET_ADMIN`).** Talk `NETLINK_NETFILTER` /
+//! `NFNL_SUBSYS_NFTABLES` straight to the kernel: transactional batches,
+//! `NFT_MSG_*` object messages, the full rule-expression vocabulary, and dumps
+//! decoded back into typed structs. No `nft` binary anywhere in the loop, and
+//! failures name *which* command of a batch the kernel refused.
 //!
-//! Provenance: clean-room from the documented libnftables JSON schema
-//! (libnftables-json(5) man page / nftables wiki "JSON representation");
-//! no libnftables source consulted or copied — we emit the documented
-//! `nft -j` interchange format only.
+//! Which one to use:
+//!
+//! | | JSON builder | native backend |
+//! |---|---|---|
+//! | needs `nft` installed | yes | no |
+//! | needs Linux + CAP_NET_ADMIN | only to apply | yes |
+//! | testable without privileges | fully | build + decode only |
+//! | error reporting | `nft`'s stderr | per-command, with the kernel's ext-ACK |
+//! | atomicity | `nft -f` is one batch | one `sendmsg`, all-or-nothing |
+//!
+//! Both speak the **same vocabulary enums** (`types.zig`, re-exported here), so
+//! a ruleset can be described once and emitted either way — which is exactly
+//! what the JSON↔native consistency test does.
+//!
+//! Scope of the JSON path: the ruleset-building subset of the schema —
+//! `add`/`create`/`delete`/`flush` over table/chain/rule/set (+ `flush
+//! ruleset`) and the common expression/statement vocabulary. Scope of the
+//! native path: table/chain/rule/set/set-element objects, batch commit with
+//! error attribution, dumps, and the `payload`/`cmp`/`meta`/`ct`/`bitwise`/
+//! `lookup`/`counter`/`immediate`/`limit`/`log`/`nat`/`masq` expressions.
+//!
+//! Provenance: the JSON path is clean-room from the documented libnftables
+//! JSON schema (libnftables-json(5) / the nftables wiki "JSON representation").
+//! The native path is clean-room from the kernel UAPI headers
+//! (`linux/netfilter/nfnetlink.h`, `linux/netfilter/nf_tables.h`,
+//! `linux/netfilter.h`) plus byte-exact captures of a stock `nft` binary's
+//! netlink traffic (`goldens.zig`). No libnftables, libnftnl, libmnl or
+//! nftables source was consulted or copied. See `/NOTICE`.
 
 const std = @import("std");
 const builtin = @import("builtin");
 
 pub const meta = .{
-    .platform = .any, // the JSON is portable; applying it is Linux/nft
+    // The JSON builder and the whole wire layer are portable; only `Socket`
+    // is Linux-gated (behind `builtin.os.tag`, so this module still builds
+    // everywhere).
+    .platform = .any,
     .role = .codec,
-    .concurrency = .reentrant,
-    .model_after = "libnftables JSON (nft -j) schema",
+    .concurrency = .reentrant, // Socket itself is single_owner
+    .model_after = "libnftables JSON (nft -j) schema + kernel UAPI nf_tables.h",
     .deps = .{}, // std only
 };
 
-const JsonError = error{WriteFailed};
+// ── shared vocabulary ───────────────────────────────────────────────────────
+// The enums both backends speak live in `types.zig`; they are re-exported here
+// unchanged so the JSON builder's public surface is exactly what it was.
 
-// ── vocabulary enums ────────────────────────────────────────────────────────
-// For every enum below whose tag names equal the schema tokens verbatim, the
-// default std.json enum serialization (`@tagName`) is exactly right; the few
-// whose tokens are not Zig identifiers ("==", "fully-random", "tcp reset")
-// carry a custom `jsonStringify`.
+pub const types = @import("types.zig");
 
-/// Address family of a table.
-pub const Family = enum { ip, ip6, inet, arp, bridge, netdev };
+const JsonError = types.JsonError;
 
-/// Base chain type.
-pub const ChainType = enum { filter, nat, route };
+pub const Family = types.Family;
+pub const ChainType = types.ChainType;
+pub const Hook = types.Hook;
+pub const Policy = types.Policy;
+pub const Op = types.Op;
+pub const MetaKey = types.MetaKey;
+pub const PayloadProto = types.PayloadProto;
+pub const PayloadBase = types.PayloadBase;
+pub const CtDir = types.CtDir;
+pub const NatFlag = types.NatFlag;
+pub const RejectType = types.RejectType;
+pub const LogLevel = types.LogLevel;
+pub const LimitPer = types.LimitPer;
+pub const LimitUnit = types.LimitUnit;
+pub const SetFlag = types.SetFlag;
+pub const SetDataType = types.SetDataType;
 
-/// Base chain hook point.
-pub const Hook = enum { prerouting, input, forward, output, postrouting, ingress, egress };
+// ── native nfnetlink backend ────────────────────────────────────────────────
 
-/// Base chain default policy.
-pub const Policy = enum { accept, drop };
+/// Netlink message/attribute primitives (with the big-endian accessors
+/// nftables needs).
+pub const nl = @import("nl.zig");
+/// nfnetlink framing, `NFT_MSG_*` objects, the transactional `Batch`, decoders.
+pub const wire = @import("wire.zig");
+/// Rule expressions and the register model.
+pub const expr = @import("expr.zig");
 
-/// Comparison operator of a `match` statement. `in` performs a lookup
-/// (bits-contained / set membership).
-pub const Op = enum {
-    eq,
-    ne,
-    lt,
-    gt,
-    le,
-    ge,
-    in,
+pub const Batch = wire.Batch;
+pub const BatchOptions = wire.BatchOptions;
+pub const Stage = wire.Stage;
+pub const TableSpec = wire.TableSpec;
+pub const ChainSpec = wire.ChainSpec;
+pub const RuleSpec = wire.RuleSpec;
+pub const SetSpec = wire.SetSpec;
+pub const SetElem = wire.SetElem;
+pub const TableInfo = wire.TableInfo;
+pub const ChainInfo = wire.ChainInfo;
+pub const RuleInfo = wire.RuleInfo;
+pub const SetInfo = wire.SetInfo;
+pub const SetElemInfo = wire.SetElemInfo;
+pub const Program = expr.Program;
+pub const Verdict = expr.Verdict;
+pub const Reg = expr.Reg;
 
-    pub fn token(self: Op) []const u8 {
-        return switch (self) {
-            .eq => "==",
-            .ne => "!=",
-            .lt => "<",
-            .gt => ">",
-            .le => "<=",
-            .ge => ">=",
-            .in => "in",
-        };
-    }
+/// The privileged `NETLINK_NETFILTER` transport. Linux only — on other
+/// platforms this namespace is empty and everything above still builds.
+pub const native = if (builtin.os.tag == .linux) @import("socket.zig") else struct {};
 
-    pub fn jsonStringify(self: Op, jw: anytype) JsonError!void {
-        try jw.write(self.token());
-    }
-};
-
-/// Packet metadata keys (`meta` expression).
-pub const MetaKey = enum {
-    length,
-    protocol,
-    priority,
-    random,
-    mark,
-    iif,
-    iifname,
-    iiftype,
-    oif,
-    oifname,
-    oiftype,
-    skuid,
-    skgid,
-    nftrace,
-    rtclassid,
-    ibriport,
-    obriport,
-    ibridgename,
-    obridgename,
-    pkttype,
-    cpu,
-    iifgroup,
-    oifgroup,
-    cgroup,
-    nfproto,
-    l4proto,
-    secpath,
-};
-
-/// Named packet headers usable in a `payload` expression.
-pub const PayloadProto = enum {
-    ether,
-    vlan,
-    arp,
-    ip,
-    icmp,
-    igmp,
-    ip6,
-    icmpv6,
-    tcp,
-    udp,
-    udplite,
-    sctp,
-    dccp,
-    ah,
-    esp,
-    comp,
-    th,
-};
-
-/// Reference point of a raw `payload` expression.
-pub const PayloadBase = enum { ll, nh, th };
-
-/// Conntrack direction for `ct` expressions.
-pub const CtDir = enum { original, reply };
-
-/// NAT statement flags.
-pub const NatFlag = enum {
-    random,
-    fully_random,
-    persistent,
-
-    pub fn token(self: NatFlag) []const u8 {
-        return switch (self) {
-            .random => "random",
-            .fully_random => "fully-random",
-            .persistent => "persistent",
-        };
-    }
-
-    pub fn jsonStringify(self: NatFlag, jw: anytype) JsonError!void {
-        try jw.write(self.token());
-    }
-};
-
-/// Reject statement variants.
-pub const RejectType = enum {
-    tcp_reset,
-    icmpx,
-    icmp,
-    icmpv6,
-
-    pub fn token(self: RejectType) []const u8 {
-        return switch (self) {
-            .tcp_reset => "tcp reset",
-            .icmpx => "icmpx",
-            .icmp => "icmp",
-            .icmpv6 => "icmpv6",
-        };
-    }
-
-    pub fn jsonStringify(self: RejectType, jw: anytype) JsonError!void {
-        try jw.write(self.token());
-    }
-};
-
-/// Log statement severity.
-pub const LogLevel = enum { emerg, alert, crit, err, warn, notice, info, debug, audit };
-
-/// Denominator of a limit rate.
-pub const LimitPer = enum { second, minute, hour, day, week };
-
-/// Unit of a limit rate.
-pub const LimitUnit = enum { packets, bytes, kbytes, mbytes };
-
-/// Named set flags.
-pub const SetFlag = enum { constant, interval, timeout };
-
-/// Named set element datatype.
-pub const SetDataType = enum {
-    ipv4_addr,
-    ipv6_addr,
-    ether_addr,
-    inet_proto,
-    inet_service,
-    mark,
-    ifname,
-};
+/// `nftables.Socket` — commit batches and dump the ruleset. Linux only.
+pub const Socket = native.Socket;
 
 // ── expressions ─────────────────────────────────────────────────────────────
 
@@ -1057,6 +975,19 @@ pub const RuleBuilder = struct {
 // ── tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test {
+    // Pull every file of the module into the test binary.
+    _ = types;
+    _ = nl;
+    _ = wire;
+    _ = expr;
+    _ = @import("goldens.zig");
+    if (builtin.os.tag == .linux) {
+        _ = native;
+        _ = @import("consistency.zig");
+    }
+}
 
 /// Assert `v` serializes to exactly `expected` (minified std.json).
 fn expectJson(expected: []const u8, v: anytype) !void {
