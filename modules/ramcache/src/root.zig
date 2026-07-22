@@ -49,6 +49,18 @@
 //!   * `put` silently no-ops on OOM — a cache miss is never fatal. If the
 //!     frequency sketch itself cannot be allocated, the cache degrades to
 //!     plain LRU eviction (admission gate always passes).
+//!   * **Write-behind seam (opt-in, for a caller-driven persistence layer):**
+//!     every entry carries a *dirty* bit (`put` sets it; `markClean` clears
+//!     it) and `Options.on_evict` is an optional hook fired just before an
+//!     entry's value is freed — on eviction (W-TinyLFU victim or lazy
+//!     TTL/generation drop), replacement (`put` over an existing key), and
+//!     clear (once per entry). A write-behind coordinator marks nothing
+//!     itself (every `put` is already dirty-by-definition); it periodically
+//!     `drainDirty`s to flush proactively and calls `markClean` once
+//!     persisted, with `on_evict`'s `dirty` flag as the safety net so a
+//!     write is never silently dropped by an eviction that races the
+//!     flusher. Unused (no callback, dirty bit never inspected), this costs
+//!     one extra `bool` per entry and changes nothing else.
 
 const std = @import("std");
 
@@ -80,6 +92,39 @@ pub const Stats = struct {
     bytes: usize = 0,
 };
 
+/// Why an entry left the cache — passed to `on_evict` alongside the outgoing
+/// key/value so a write-behind coordinator can tell an ordinary
+/// capacity/staleness-driven removal from an explicit overwrite from a bulk
+/// flush.
+pub const EvictReason = enum {
+    /// W-TinyLFU capacity pressure (frequency-contest victim, or a
+    /// degenerate LRU fallback) **or** a lazy TTL/generation-stale drop
+    /// (both `get`'s lazy drop and `evictStep`'s expired-first check route
+    /// through the same removal — a dirty-but-stale entry fires this too,
+    /// not a different reason, since either way it left uninvited).
+    evicted,
+    /// `put` overwrote an existing key with a new value; `value`/`dirty`
+    /// describe the value that was just replaced.
+    replaced,
+    /// `clear()` dropped every entry — fired once per entry, in map
+    /// iteration order (not LRU order).
+    cleared,
+};
+
+/// Caller hook fired just before an entry's backing memory is freed, for
+/// every way an entry can leave the cache — see `EvictReason`. Never fired
+/// on a plain `get` hit or miss. `dirty` is the entry's dirty bit at the
+/// moment of removal (see the dirty-set / write-behind seam on `Cache`) so
+/// the hook doubles as a last-chance flush point before the memory goes
+/// away. `ctx` is `Options.on_evict_ctx` verbatim. Called synchronously from
+/// inside `get`/`put`/`clear` — keep it cheap (or hand off) and do not call
+/// back into this `Cache` from it (reentrant mutation mid-removal, e.g.
+/// during `clear`'s iteration, is unsupported).
+pub const OnEvictFn = *const fn (ctx: ?*anyopaque, key: []const u8, value: []const u8, dirty: bool, reason: EvictReason) void;
+
+/// `drainDirty` sweep callback — see `Cache.drainDirty`.
+pub const DirtyFn = *const fn (ctx: ?*anyopaque, key: []const u8, value: []const u8) void;
+
 /// Tunables, fixed at `init`.
 pub const Options = struct {
     /// Cap on the sum of stored value bytes. An item larger than this is
@@ -89,6 +134,11 @@ pub const Options = struct {
     max_entries: usize,
     /// TTL applied by `putDefault`. `<= 0` = never expire by time.
     default_ttl_ns: i64 = 0,
+    /// Optional write-behind hook; see `OnEvictFn`. Null (default) = no-op —
+    /// behavior and performance are unchanged from before this existed.
+    on_evict: ?OnEvictFn = null,
+    /// Opaque pointer handed to every `on_evict` call.
+    on_evict_ctx: ?*anyopaque = null,
 };
 
 /// 4-bit Count-Min Sketch + doorkeeper with periodic aging, per the TinyLFU
@@ -214,6 +264,11 @@ pub const Cache = struct {
         gen: u64, // 0 → not generation-tied (TTL only)
         last_tick: u64, // logical access clock, drives LRU ordering
         region: Region,
+        /// Write-behind dirty bit: `put` sets it (a write not yet known to
+        /// be persisted); the coordinator clears it via `markClean` once it
+        /// has durably persisted `value`. Unused by the cache itself —
+        /// purely a passenger bit for the caller.
+        dirty: bool = false,
     };
 
     alloc: std.mem.Allocator,
@@ -286,6 +341,7 @@ pub const Cache = struct {
         self.noteAccess(key);
         if (self.map.getPtr(key)) |e| { // replace value in place, keep the stored key
             const vdup = self.alloc.dupe(u8, value) catch return;
+            self.fireOnEvict(key, e.value, e.dirty, .replaced);
             self.bytes -= e.value.len;
             self.alloc.free(e.value);
             self.tick += 1;
@@ -296,6 +352,7 @@ pub const Cache = struct {
                 .gen = gen,
                 .last_tick = self.tick,
                 .region = e.region,
+                .dirty = true, // a fresh write, not yet known to be persisted
             };
             self.bytes += vdup.len;
             self.syncStats();
@@ -315,6 +372,7 @@ pub const Cache = struct {
             .gen = gen,
             .last_tick = self.tick,
             .region = .window,
+            .dirty = true, // a fresh write, not yet known to be persisted
         }) catch {
             self.alloc.free(kdup);
             self.alloc.free(vdup);
@@ -337,6 +395,7 @@ pub const Cache = struct {
     pub fn clear(self: *Cache) void {
         var it = self.map.iterator();
         while (it.next()) |kv| {
+            self.fireOnEvict(kv.key_ptr.*, kv.value_ptr.value, kv.value_ptr.dirty, .cleared);
             self.alloc.free(kv.value_ptr.value);
             self.alloc.free(kv.key_ptr.*);
         }
@@ -346,6 +405,45 @@ pub const Cache = struct {
         self.probation_count = 0;
         self.protected_count = 0;
         self.syncStats();
+    }
+
+    // ── write-behind seam: dirty-set ────────────────────────────────────────
+
+    /// True if `key` is present and its dirty bit is set. Side-effect-free:
+    /// unlike `get`, does not touch stats, SLRU promotion, the frequency
+    /// sketch, or TTL/generation freshness — a diagnostic for a write-behind
+    /// coordinator, not a substitute for `get`. `false` for an absent key
+    /// (indistinguishable here from "clean"; use `get` if that distinction
+    /// matters).
+    pub fn isDirty(self: *Cache, key: []const u8) bool {
+        const e = self.map.getPtr(key) orelse return false;
+        return e.dirty;
+    }
+
+    /// Clear the dirty bit for `key` — the write-behind coordinator's ack
+    /// after it has durably persisted the current value. Returns `false`
+    /// (no-op) if `key` is absent, e.g. it was evicted/replaced/cleared
+    /// before the flush landed; `on_evict`'s `dirty` flag is what catches
+    /// that race. Side-effect-free otherwise (no stats/promotion/sketch
+    /// touch).
+    pub fn markClean(self: *Cache, key: []const u8) bool {
+        const e = self.map.getPtr(key) orelse return false;
+        e.dirty = false;
+        return true;
+    }
+
+    /// Visit every currently-dirty entry exactly once via `cb(ctx, key,
+    /// value)` — for a periodic flusher that persists dirty entries
+    /// proactively rather than waiting for `on_evict` to catch them on the
+    /// way out. No removal, no ordering guarantee, allocation-free. `cb` may
+    /// call `markClean` on the cache (that only flips a bit, it does not
+    /// touch map structure) but must not call `put`/`clear`/`get` — those
+    /// can insert, evict, or resize mid-iteration, which is unsupported.
+    pub fn drainDirty(self: *Cache, cb: DirtyFn, ctx: ?*anyopaque) void {
+        var it = self.map.iterator();
+        while (it.next()) |kv| {
+            if (kv.value_ptr.dirty) cb(ctx, kv.key_ptr.*, kv.value_ptr.value);
+        }
     }
 
     // ── internals ───────────────────────────────────────────────────────────
@@ -386,11 +484,18 @@ pub const Cache = struct {
                 .probation => self.probation_count -= 1,
                 .protected => self.protected_count -= 1,
             }
+            self.fireOnEvict(kv.key, kv.value.value, kv.value.dirty, .evicted);
             self.bytes -= kv.value.value.len;
             self.alloc.free(kv.value.value);
             self.alloc.free(kv.key);
         }
         self.syncStats();
+    }
+
+    /// Fire `Options.on_evict` if one is set. Called just before the
+    /// caller-visible value memory for `key` is freed.
+    fn fireOnEvict(self: *Cache, key: []const u8, value: []const u8, dirty: bool, reason: EvictReason) void {
+        if (self.options.on_evict) |cb| cb(self.options.on_evict_ctx, key, value, dirty, reason);
     }
 
     /// Key of the least-recently-used entry within `region`, or null.
@@ -685,6 +790,209 @@ test "ttl <= 0 never expires by time" {
     defer c.deinit();
     c.put("k", "v", 0, 0, 0);
     try testing.expect(c.get("k", std.math.maxInt(i64), 0) != null);
+}
+
+// ── write-behind seam: on-evict callback + dirty-set ────────────────────────
+// The hook fires the instant before the value's memory is freed, so its
+// key/value must be copied out (fixed buffers, same pattern as other
+// modules' test sinks — see aaa-gate's `Sink`) rather than held as a slice.
+
+const EvictSink = struct {
+    const Rec = struct {
+        key_buf: [24]u8 = undefined,
+        key_len: usize = 0,
+        val_buf: [24]u8 = undefined,
+        val_len: usize = 0,
+        dirty: bool = false,
+        reason: EvictReason = .evicted,
+
+        fn key(r: *const Rec) []const u8 {
+            return r.key_buf[0..r.key_len];
+        }
+        fn val(r: *const Rec) []const u8 {
+            return r.val_buf[0..r.val_len];
+        }
+    };
+    recs: [16]Rec = undefined,
+    len: usize = 0,
+
+    fn hook(ctx: ?*anyopaque, key: []const u8, value: []const u8, dirty: bool, reason: EvictReason) void {
+        const self: *EvictSink = @ptrCast(@alignCast(ctx.?));
+        var r: Rec = .{ .dirty = dirty, .reason = reason };
+        @memcpy(r.key_buf[0..key.len], key);
+        r.key_len = key.len;
+        @memcpy(r.val_buf[0..value.len], value);
+        r.val_len = value.len;
+        self.recs[self.len] = r;
+        self.len += 1;
+    }
+};
+
+test "on-evict fires on W-TinyLFU eviction with correct key/value/dirty, and NOT on a plain hit/miss" {
+    var sink: EvictSink = .{};
+    var c = Cache.init(testing.allocator, .{
+        .max_bytes = 1 << 20,
+        .max_entries = 2,
+        .on_evict = EvictSink.hook,
+        .on_evict_ctx = &sink,
+    });
+    defer c.deinit();
+    c.put("a", "1", 0, 0, 0);
+    c.put("b", "2", 0, 0, 0);
+    _ = c.get("a", 10, 0); // touch a → b becomes LRU
+    _ = c.get("missing", 10, 0); // positive control: a miss must not fire the hook
+    try testing.expectEqual(@as(usize, 0), sink.len); // nothing fired yet — just hits/misses
+    c.put("cc", "3", 20, 0, 0); // over cap → evicts b (see "entry-count eviction is LRU")
+    try testing.expectEqual(@as(usize, 1), sink.len);
+    const r = &sink.recs[0];
+    try testing.expectEqualStrings("b", r.key());
+    try testing.expectEqualStrings("2", r.val());
+    try testing.expect(r.dirty); // put'd, never persisted
+    try testing.expectEqual(EvictReason.evicted, r.reason);
+}
+
+test "on-evict fires on replacement with the outgoing (old) key/value/dirty" {
+    var sink: EvictSink = .{};
+    var c = Cache.init(testing.allocator, .{
+        .max_bytes = 1 << 20,
+        .max_entries = 16,
+        .on_evict = EvictSink.hook,
+        .on_evict_ctx = &sink,
+    });
+    defer c.deinit();
+    c.put("k", "aaaa", 0, 0, 0);
+    try testing.expect(c.markClean("k")); // simulate: already persisted
+    c.put("k", "bb", 1, 0, 0); // overwrite
+    try testing.expectEqual(@as(usize, 1), sink.len);
+    const r = &sink.recs[0];
+    try testing.expectEqualStrings("k", r.key());
+    try testing.expectEqualStrings("aaaa", r.val()); // the value that just got overwritten
+    try testing.expect(!r.dirty); // it had been marked clean before the overwrite
+    try testing.expectEqual(EvictReason.replaced, r.reason);
+    try testing.expectEqualStrings("bb", c.get("k", 2, 0).?); // new value unaffected
+}
+
+test "on-evict fires once per entry on clear, and not at all when unset" {
+    var sink: EvictSink = .{};
+    var c = Cache.init(testing.allocator, .{
+        .max_bytes = 1 << 20,
+        .max_entries = 16,
+        .on_evict = EvictSink.hook,
+        .on_evict_ctx = &sink,
+    });
+    defer c.deinit();
+    c.put("a", "1", 0, 0, 0);
+    c.put("b", "22", 0, 0, 0);
+    c.clear();
+    try testing.expectEqual(@as(usize, 2), sink.len);
+    var saw_a = false;
+    var saw_b = false;
+    for (sink.recs[0..sink.len]) |*r| {
+        try testing.expectEqual(EvictReason.cleared, r.reason);
+        try testing.expect(r.dirty); // neither was ever marked clean
+        if (std.mem.eql(u8, r.key(), "a")) {
+            try testing.expectEqualStrings("1", r.val());
+            saw_a = true;
+        }
+        if (std.mem.eql(u8, r.key(), "b")) {
+            try testing.expectEqualStrings("22", r.val());
+            saw_b = true;
+        }
+    }
+    try testing.expect(saw_a and saw_b);
+}
+
+test "dirty bit: set on put, cleared by markClean; markClean on an absent key is a harmless no-op" {
+    var c = testCache(1 << 20, 16);
+    defer c.deinit();
+    try testing.expect(!c.isDirty("k")); // absent → false, not a crash
+    c.put("k", "v", 0, 0, 0);
+    try testing.expect(c.isDirty("k")); // a fresh write is dirty
+    try testing.expect(c.markClean("k")); // found → true
+    try testing.expect(!c.isDirty("k")); // cleared
+    try testing.expect(!c.markClean("nope")); // absent → false
+    c.put("k", "v2", 1, 0, 0); // an update re-dirties the entry
+    try testing.expect(c.isDirty("k"));
+}
+
+test "drainDirty visits exactly the dirty entries, skipping clean ones" {
+    var c = testCache(1 << 20, 16);
+    defer c.deinit();
+    c.put("a", "1", 0, 0, 0);
+    c.put("b", "2", 0, 0, 0);
+    c.put("c", "3", 0, 0, 0);
+    try testing.expect(c.markClean("b")); // only a and c stay dirty
+
+    const Collector = struct {
+        seen: [8][]const u8 = undefined,
+        len: usize = 0,
+        fn hook(ctx: ?*anyopaque, key: []const u8, value: []const u8) void {
+            _ = value;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.seen[self.len] = key;
+            self.len += 1;
+        }
+    };
+    var collector: Collector = .{};
+    c.drainDirty(Collector.hook, &collector);
+    try testing.expectEqual(@as(usize, 2), collector.len);
+    var saw_a = false;
+    var saw_c = false;
+    for (collector.seen[0..collector.len]) |k| {
+        try testing.expect(!std.mem.eql(u8, k, "b")); // the clean entry must not appear
+        if (std.mem.eql(u8, k, "a")) saw_a = true;
+        if (std.mem.eql(u8, k, "c")) saw_c = true;
+    }
+    try testing.expect(saw_a and saw_c);
+}
+
+test "an evicted dirty entry is reported dirty to on_evict — the write-behind safety net" {
+    var sink: EvictSink = .{};
+    var c = Cache.init(testing.allocator, .{
+        .max_bytes = 1 << 20,
+        .max_entries = 2,
+        .on_evict = EvictSink.hook,
+        .on_evict_ctx = &sink,
+    });
+    defer c.deinit();
+    c.put("a", "1", 0, 0, 0);
+    c.put("b", "2", 0, 0, 0); // never markClean'd — still dirty
+    _ = c.get("a", 10, 0); // touch a → b becomes LRU
+    c.put("cc", "3", 20, 0, 0); // over cap → evicts b
+    try testing.expectEqual(@as(usize, 1), sink.len);
+    try testing.expectEqualStrings("b", sink.recs[0].key());
+    try testing.expect(sink.recs[0].dirty); // coordinator must still persist it
+}
+
+test "a clean (already-persisted) entry is reported non-dirty to on_evict on the same eviction path" {
+    var sink: EvictSink = .{};
+    var c = Cache.init(testing.allocator, .{
+        .max_bytes = 1 << 20,
+        .max_entries = 2,
+        .on_evict = EvictSink.hook,
+        .on_evict_ctx = &sink,
+    });
+    defer c.deinit();
+    c.put("a", "1", 0, 0, 0);
+    c.put("b", "2", 0, 0, 0);
+    try testing.expect(c.markClean("b")); // already persisted before eviction
+    _ = c.get("a", 10, 0); // touch a → b stays LRU
+    c.put("cc", "3", 20, 0, 0); // over cap → evicts b
+    try testing.expectEqual(@as(usize, 1), sink.len);
+    try testing.expect(!sink.recs[0].dirty);
+}
+
+test "with on_evict unset, eviction/replace/clear behave exactly as before (no crash, no-op hook)" {
+    var c = testCache(1 << 20, 2);
+    defer c.deinit();
+    c.put("a", "1", 0, 0, 0);
+    c.put("b", "2", 0, 0, 0);
+    c.put("cc", "3", 20, 0, 0); // triggers an eviction path with on_evict == null
+    c.put("cc", "33", 21, 0, 0); // triggers the replace path with on_evict == null
+    try testing.expect(c.isDirty("cc"));
+    try testing.expect(c.markClean("cc"));
+    c.clear(); // triggers the clear path with on_evict == null
+    try testing.expectEqual(@as(usize, 0), c.stats.entries);
 }
 
 // ── W-TinyLFU: frequency sketch ─────────────────────────────────────────────

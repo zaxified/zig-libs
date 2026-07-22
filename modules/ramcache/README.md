@@ -50,5 +50,30 @@ caller's `cur_gen != G` — the idiom is "DB-derived entries die the instant a d
 refresh bumps the generation", with external TTL-only entries (`gen == 0`)
 unaffected. An item larger than `max_bytes` is never stored.
 
+**Write-behind seam (opt-in):** every entry has a dirty bit (`put` sets it;
+`markClean(key)` clears it; `isDirty(key)` reads it), and `Options.on_evict` fires
+just before a value is freed on eviction, replacement, or clear — see SPEC.md for
+the full contract. A periodic flusher drains proactively; `on_evict` is the safety
+net so an unpersisted write is never silently dropped:
+
+```zig
+fn onEvict(ctx: ?*anyopaque, key: []const u8, value: []const u8, dirty: bool, reason: ramcache.EvictReason) void {
+    if (dirty) persistNow(key, value); // last-chance flush before the memory goes away
+}
+
+var c = ramcache.Cache.init(gpa, .{
+    .max_bytes = 32 << 20,
+    .max_entries = 4096,
+    .on_evict = onEvict,
+});
+
+const Flusher = struct {
+    fn drain(ctx: ?*anyopaque, key: []const u8, value: []const u8) void {
+        persist(key, value); // caller calls c.markClean(key) once durable
+    }
+};
+c.drainDirty(Flusher.drain, null); // call periodically
+```
+
 Tests: `zig build test-ramcache` (deterministic — injected `now_ns`/generation,
 no real clock).
