@@ -5,15 +5,19 @@ Consumes an IdP's `<samlp:Response>`, defends against XML-Signature-Wrapping
 (XSW), validates conditions / subject confirmation against a caller-supplied
 clock, and returns a trusted `AuthnResult`.
 
-Top of the SAML cluster: `xml` → `xmldsig` → **`saml`**. See `SPEC.md` for the
-full profile, the XSW defense model, and fixture provenance.
+Top of the SAML cluster: `xml` → `xmldsig` → **`saml`** (plus `xmlenc` + `rsa`
+for the optional encrypted-assertion path). See `SPEC.md` for the full profile,
+the XSW defense model, and fixture provenance.
 
 Security posture in one breath: the IdP key is configured out-of-band and is the
 only thing signatures are checked against (**never** `<KeyInfo>`); a valid
 signature must be *pinned by pointer identity* to the exact assertion consumed;
 no signature ⇒ rejected (no downgrade); the system clock is never read;
 malformed/adversarial input yields typed errors, never a panic. Encrypted
-assertions are refused (`error.EncryptedAssertionUnsupported`).
+assertions (`<saml:EncryptedAssertion>`, the eIDAS encrypt profile) are decrypted
+transparently **when the SP configures `sp_decrypt_key`** — decrypt-then-verify,
+via the `xmlenc` module — and refused (`error.EncryptedAssertionUnsupported`)
+otherwise.
 
 ## Worked example — verify a POST-binding Response
 

@@ -52,9 +52,22 @@
 //! is never trusted to supply it; the certificate seen there is surfaced
 //! (`AuthnResult.x509_cert_der`, UNTRUSTED) only so the caller may pin it.
 //!
+//! ## `<saml:EncryptedAssertion>` — the eIDAS encrypt profile
+//! When the SP configures its RSA decryption key (`Config.sp_decrypt_key`), an
+//! `<saml:EncryptedAssertion>` is transparently decrypted via the sibling
+//! `xmlenc` module and the recovered `<saml:Assertion>` runs through the SAME
+//! signature-verify + XSW + validation path a cleartext assertion does. The
+//! order is **decrypt → then signature-verify**: the IdP signs the assertion
+//! before encrypting it, so verification happens on the plaintext, and a
+//! padding/oracle probe that yields a well-formed-but-wrong plaintext still
+//! fails the signature check. With no key configured the old refuse-behavior
+//! (`error.EncryptedAssertionUnsupported`) is preserved. The decrypted
+//! assertion is the root of its own standalone document; the XSW pointer-pin
+//! holds within that inner document (see `verifyCoveringDecrypted`).
+//!
 //! ## Out of scope (see SPEC.md)
-//!   - `<saml:EncryptedAssertion>` / XML-Encryption — detected and refused with
-//!     `error.EncryptedAssertionUnsupported` (top follow-up: eIDAS needs it).
+//!   - Encrypted `<saml:EncryptedID>` / `<saml:EncryptedAttribute>` (only the
+//!     whole-assertion form is decrypted); Holder-of-Key confirmation.
 //!   - Single Logout, artifact binding, the IdP side.
 //!
 //! Never reads the system clock. Never panics on malformed / adversarial input:
@@ -63,13 +76,15 @@
 const std = @import("std");
 const xml = @import("xml");
 const xmldsig = @import("xmldsig");
+const xmlenc = @import("xmlenc");
+const rsa = @import("rsa");
 
 pub const meta = .{
     .platform = .any,
     .role = .codec, // consumes an untrusted wire document into a trusted result
     .concurrency = .reentrant,
     .model_after = "OASIS SAML 2.0 (SAMLCore / SAMLProf) Web Browser SSO, SP side; XSW-hardened per 'On Breaking SAML'",
-    .deps = .{ "xmldsig", "xml" },
+    .deps = .{ "xmldsig", "xml", "xmlenc", "rsa" },
 };
 
 // ── namespaces ───────────────────────────────────────────────────────────────
@@ -130,6 +145,25 @@ pub const Config = struct {
     /// SAML uses `ID`; both this module and `xmldsig` resolve references through
     /// it, which is what makes the XSW pointer-pin sound.
     id_attr: []const u8 = "ID",
+
+    // ── EncryptedAssertion (eIDAS encrypt profile) ───────────────────────────
+    // All optional: when `sp_decrypt_key` is null the module behaves exactly as
+    // before and refuses any `<saml:EncryptedAssertion>` with
+    // `error.EncryptedAssertionUnsupported`.
+
+    /// This SP's RSA private key, used ONLY to decrypt a
+    /// `<saml:EncryptedAssertion>` (RSA-OAEP / — gated — RSA-1_5 key transport)
+    /// via the `xmlenc` module. Null (the default) ⇒ encrypted assertions are
+    /// refused (`error.EncryptedAssertionUnsupported`), i.e. opt-in.
+    sp_decrypt_key: ?rsa.SecretKey = null,
+    /// Permit RSAES-PKCS#1 v1.5 key transport when decrypting (Bleichenbacher /
+    /// Jager–Somorovsky). OFF by default; only enable for an IdP that offers
+    /// nothing else. Passed straight through to `xmlenc`.
+    allow_weak_rsa15: bool = false,
+    /// Optional symmetric key-encryption key for `kw-aes128` / `kw-aes256` key
+    /// wrap inside the EncryptedKey (16 or 32 bytes). Null ⇒ none available.
+    /// Passed straight through to `xmlenc`.
+    decrypt_kek: ?[]const u8 = null,
 };
 
 // ── result ───────────────────────────────────────────────────────────────────
@@ -214,8 +248,15 @@ pub const ConsumeError = error{
     NoAssertion,
     /// More than one `<Assertion>` — refused (XSW hardening: exactly one).
     MultipleAssertions,
-    /// A `<saml:EncryptedAssertion>` was present. XML-Encryption is unsupported.
+    /// A `<saml:EncryptedAssertion>` was present but no `Config.sp_decrypt_key`
+    /// was configured — the SP did not opt in to decryption, so it cannot be
+    /// consumed. (With a key configured it is decrypted transparently.)
     EncryptedAssertionUnsupported,
+    /// A `<saml:EncryptedAssertion>` could not be decrypted: wrong SP key, an
+    /// unsupported/disallowed algorithm, malformed ciphertext, or a GCM/CBC/RSA
+    /// failure. Deliberately GENERIC (mirrors `xmlenc`'s oracle-safe error
+    /// collapse); the safe composition is decrypt-then-signature-verify.
+    AssertionDecryptionFailed,
     /// No valid signature covers the consumed assertion.
     SignatureMissing,
     /// A signature was present but did not cryptographically verify against the
@@ -324,21 +365,31 @@ fn processResponse(alloc: std.mem.Allocator, doc: *const xml.Document, config: C
         if (!std.mem.eql(u8, dest, config.acs_url)) return error.DestinationMismatch;
     }
 
-    // Encrypted assertions are unsupported (detect before anything else fails).
-    if (childEl(root, saml_ns, "EncryptedAssertion") != null) return error.EncryptedAssertionUnsupported;
-
-    // Exactly one Assertion, as a DIRECT child of Response (XSW hardening).
+    // Locate the single assertion, cleartext or encrypted, as a DIRECT child of
+    // Response (XSW hardening: the exactly-one discipline spans BOTH kinds — a
+    // cleartext + an encrypted assertion, or two encrypted ones, are refused).
     var assertion: ?*const xml.Element = null;
+    var enc_assertion: ?*const xml.Element = null;
     var count: usize = 0;
     for (root.children) |c| switch (c.content) {
-        .element => |el| if (isEl(el, saml_ns, "Assertion")) {
-            count += 1;
-            assertion = el;
+        .element => |el| {
+            if (isEl(el, saml_ns, "Assertion")) {
+                count += 1;
+                assertion = el;
+            } else if (isEl(el, saml_ns, "EncryptedAssertion")) {
+                count += 1;
+                enc_assertion = el;
+            }
         },
         else => {},
     };
     if (count == 0) return error.NoAssertion;
     if (count > 1) return error.MultipleAssertions;
+
+    // The encrypted profile: decrypt, then run the recovered assertion through
+    // the identical verify + validate path (decrypt-then-verify).
+    if (enc_assertion) |enc| return processEncryptedAssertion(alloc, doc, root, enc, config);
+
     const asrt = assertion.?;
 
     // ── signature + XSW defense ──────────────────────────────────────────────
@@ -364,11 +415,7 @@ fn verifyCovering(
     config: Config,
     cert_out: *?[]u8,
 ) ConsumeError!bool {
-    const opts: xmldsig.Options = .{
-        .key = config.idp_key,
-        .allow_weak_sha1 = config.allow_weak_sha1,
-        .id_attr = config.id_attr,
-    };
+    const opts = sigOpts(config);
 
     // 1. A signature that is a direct child of the Assertion (assertion-signed).
     if (config.signature_policy != .response) {
@@ -391,6 +438,123 @@ fn verifyCovering(
             if (!res.valid) return error.SignatureInvalid;
             if (!signedTargetMatches(doc, &res, root, config.id_attr)) return error.SignatureWrappingDetected;
             if (asrt.parent != root) return error.SignatureWrappingDetected;
+            moveCert(alloc, &res, cert_out);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+fn sigOpts(config: Config) xmldsig.Options {
+    return .{
+        .key = config.idp_key,
+        .allow_weak_sha1 = config.allow_weak_sha1,
+        .id_attr = config.id_attr,
+    };
+}
+
+/// The eIDAS encrypt profile. `enc` is the `<saml:EncryptedAssertion>` (a direct
+/// child of `outer_root`, already confirmed the *only* assertion). We decrypt it
+/// with the SP's key, re-parse the plaintext into its OWN standalone document,
+/// then run the recovered assertion through the same signature-verify + XSW +
+/// validation path a cleartext assertion uses. Decrypt happens BEFORE verify:
+/// the IdP signs the assertion prior to encryption, so a manipulated ciphertext
+/// yields a plaintext that fails the signature check (padding-oracle safe).
+fn processEncryptedAssertion(
+    alloc: std.mem.Allocator,
+    outer_doc: *const xml.Document,
+    outer_root: *const xml.Element,
+    enc: *const xml.Element,
+    config: Config,
+) ConsumeError!AuthnResult {
+    // No key configured ⇒ the SP did not opt in: preserve the old refusal.
+    const sk = config.sp_decrypt_key orelse return error.EncryptedAssertionUnsupported;
+
+    const plaintext = xmlenc.decryptAssertion(alloc, enc, sk, .{
+        .allow_weak_rsa15 = config.allow_weak_rsa15,
+        .kek = config.decrypt_kek,
+    }) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        // Everything else (DecryptionError, UnsupportedAlgorithm,
+        // MalformedStructure, WeakRsa15NotAllowed, CipherReferenceUnsupported,
+        // KekNotProvided, CiphertextTooLarge) collapses to one generic error —
+        // no oracle signal, mirroring xmlenc's own posture.
+        else => return error.AssertionDecryptionFailed,
+    };
+    defer alloc.free(plaintext);
+
+    // Parse the recovered octets with the SAME id-attribute options `saml` uses
+    // for the Response, so the XSW pointer-pin (which resolves the signature's
+    // #id Reference through the SAML `ID` index) is sound inside the inner doc.
+    var inner = xml.parse(alloc, plaintext, .{
+        .id_attr_names = &.{"ID"},
+    }) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.MalformedResponse,
+    };
+    defer inner.deinit();
+
+    const asrt = inner.root;
+    if (!isEl(asrt, saml_ns, "Assertion")) return error.NoAssertion;
+
+    // ── signature + XSW defense on the DECRYPTED assertion ────────────────────
+    var cert_der: ?[]u8 = null;
+    errdefer if (cert_der) |d| alloc.free(d);
+    const signed = try verifyCoveringDecrypted(alloc, &inner, outer_doc, outer_root, enc, config, &cert_der);
+    if (!signed) return error.SignatureMissing;
+
+    // buildResult dupes everything it keeps into its OWN arena (backed by
+    // `alloc`), so the returned AuthnResult never borrows from `inner`, which we
+    // deinit on return.
+    return buildResult(alloc, asrt, config, &cert_der);
+}
+
+/// Establish that the decrypted assertion is covered by a valid signature,
+/// honoring `signature_policy`. The decrypted assertion is the ROOT of its own
+/// standalone `inner_doc` (NOT a direct child of the Response), so:
+///   - `.assertion` / `.either`: the assertion-level signature lives inside the
+///     decrypted assertion; it is pinned by pointer identity to `inner_doc.root`
+///     within that inner document — the "assertion must be a direct child of
+///     Response" structural rule does not (and cannot) apply here.
+///   - `.response`: the enclosing (outer) Response may itself be signed over the
+///     `<EncryptedAssertion>` ciphertext; that signature is verified against the
+///     OUTER document and pinned to the outer Response, plus `enc` must be a
+///     direct child of it. This does NOT weaken the wrapping defense — each
+///     branch resolves its single `#id` Reference to a pointer it controls.
+fn verifyCoveringDecrypted(
+    alloc: std.mem.Allocator,
+    inner_doc: *const xml.Document,
+    outer_doc: *const xml.Document,
+    outer_root: *const xml.Element,
+    enc: *const xml.Element,
+    config: Config,
+    cert_out: *?[]u8,
+) ConsumeError!bool {
+    const opts = sigOpts(config);
+    const inner_root = inner_doc.root;
+
+    // 1. Assertion-level signature, INSIDE the decrypted assertion.
+    if (config.signature_policy != .response) {
+        if (childEl(inner_root, xmldsig.ds_ns, "Signature")) |sig| {
+            var res = xmldsig.verify(alloc, inner_doc, sig, opts) catch return error.SignatureInvalid;
+            defer res.deinit(alloc);
+            if (!res.valid) return error.SignatureInvalid;
+            if (!signedTargetMatches(inner_doc, &res, inner_root, config.id_attr)) return error.SignatureWrappingDetected;
+            moveCert(alloc, &res, cert_out);
+            return true;
+        }
+    }
+
+    // 2. Response-level signature, in the OUTER document, over the Response that
+    //    directly contains the EncryptedAssertion ciphertext.
+    if (config.signature_policy != .assertion) {
+        if (childEl(outer_root, xmldsig.ds_ns, "Signature")) |sig| {
+            var res = xmldsig.verify(alloc, outer_doc, sig, opts) catch return error.SignatureInvalid;
+            defer res.deinit(alloc);
+            if (!res.valid) return error.SignatureInvalid;
+            if (!signedTargetMatches(outer_doc, &res, outer_root, config.id_attr)) return error.SignatureWrappingDetected;
+            if (enc.parent != outer_root) return error.SignatureWrappingDetected;
             moveCert(alloc, &res, cert_out);
             return true;
         }
@@ -908,6 +1072,7 @@ fn daysFromCivil(y_in: i64, m: u32, d: u32) i64 {
 test {
     _ = @import("test_xsw.zig");
     _ = @import("test_fixture.zig");
+    _ = @import("test_encrypted.zig");
 }
 
 const testing = std.testing;

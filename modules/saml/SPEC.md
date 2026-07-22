@@ -83,6 +83,43 @@ key and can only wrap/inject/move the existing valid signature:
 | Reference repointed to a non-existent decoy id | `SignatureInvalid` |
 | `.response` policy vs an assertion-only signature | `SignatureMissing` |
 
+## Encrypted assertions — the eIDAS encrypt profile
+
+`<saml:EncryptedAssertion>` (XML-Encryption) is supported **when the SP opts in**
+by configuring its RSA decryption key. It is decrypted via the sibling `xmlenc`
+module (AES-128/256 GCM or CBC content, RSA-OAEP / — gated — RSA-1_5 key
+transport, or `kw-aes*` key wrap), then the recovered `<saml:Assertion>` runs
+through the **same** signature-verify + XSW + conditions/subject/audience path a
+cleartext assertion does.
+
+- **Key config** (`Config`, all optional; null ⇒ old refuse-behavior):
+  - `sp_decrypt_key: ?rsa.SecretKey` — the SP's private key. **Null (default) ⇒
+    an EncryptedAssertion is refused with `error.EncryptedAssertionUnsupported`**
+    (unchanged for callers who did not opt in).
+  - `allow_weak_rsa15: bool = false` — pass-through gate for RSA-1_5 key
+    transport (Bleichenbacher / Jager–Somorovsky; off by default).
+  - `decrypt_kek: ?[]const u8` — pass-through symmetric KEK for `kw-aes*`.
+- **Decrypt-then-verify.** The IdP signs the assertion *before* encrypting it, so
+  the signature lives inside the ciphertext and is verified only after
+  decryption. This ordering is what makes the CBC/RSA-1_5 padding-oracle surface
+  safe: a manipulated ciphertext yields a well-formed-but-wrong plaintext that
+  then **fails the signature check** (`error.SignatureInvalid`). Decryption
+  failures collapse to one generic `error.AssertionDecryptionFailed` (no oracle
+  signal), mirroring `xmlenc`'s posture.
+- **Exactly-one discipline spans both kinds.** A cleartext + an encrypted
+  assertion, or two encrypted assertions, as direct children of the Response are
+  refused (`error.MultipleAssertions`) — the XSW hardening is not weakened.
+- **XSW within the decrypted document.** The decrypted assertion is the **root of
+  its own standalone document**, not a direct child of the Response, so the
+  "assertion must be a direct child of Response" rule does not (and cannot) apply
+  to it. The pointer-pin still holds *inside* that inner document: the
+  assertion-level signature's single `#id` `<Reference>` must resolve — through
+  the same SAML `ID` index — to the inner document's root by pointer identity
+  (`.assertion` / `.either`). Under `.response` policy the enclosing (outer)
+  Response signature over the `<EncryptedAssertion>` ciphertext is verified
+  against the outer document and pinned to the outer Response, with the
+  EncryptedAssertion required to be its direct child.
+
 ## Validation performed on the trusted assertion
 
 - **`<Conditions>`**: `NotBefore` / `NotOnOrAfter` (xsd:dateTime) vs `now ± skew`
@@ -118,10 +155,10 @@ key and can only wrap/inject/move the existing valid signature:
 
 ## Deferred / out of scope
 
-- **`<saml:EncryptedAssertion>` / XML-Encryption** — detected and refused with
-  `error.EncryptedAssertionUnsupported`. **Top follow-up** (eIDAS deployments
-  frequently mandate encrypted assertions): a `xmlenc` module (AES-GCM/CBC +
-  RSA-OAEP/ECDH key transport) would slot in below `saml`.
+- **Encrypted `<saml:EncryptedID>` / `<saml:EncryptedAttribute>`** — only the
+  whole-assertion `<saml:EncryptedAssertion>` form is decrypted (see above); an
+  encrypted NameID or individual encrypted attribute inside an otherwise
+  cleartext assertion is not yet unwrapped (eIDAS follow-up).
 - **Single Logout (SLO)**, artifact binding, and the IdP side — not implemented.
 - Holder-of-Key / sender-vouches subject confirmation (only Bearer is validated).
 

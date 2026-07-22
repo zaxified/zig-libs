@@ -11,7 +11,7 @@ cross-project-reusable capability — a production-grade implementation of a pro
 or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
 authors' other projects depend on it, not the reverse.
 
-**Status:** 163 modules · 5345 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 163 modules · 5354 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ## Using a module
@@ -98,7 +98,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `rbac` | authorization decision engine — NIST RBAC (hierarchical + static SoD, cycle-checked) and a depth-bounded ABAC condition-tree evaluator (typed builder, 10 operators) with XACML-style `deny_overrides`/`permit_overrides` combining and structural default-deny | any | — |
 | `xml` | namespace-aware, security-hardened XML 1.0 parser → C14N-ready infoset tree (original prefixes/NS-scope/doc-order/comments/byte-spans preserved; DOCTYPE-reject default → XXE + billion-laughs + depth-bomb proof; duplicate-ID guard) — foundation for `xmldsig`/`saml` | any | — |
 | `xmldsig` | XML Canonicalization (exclusive/inclusive C14N ±comments, `InclusiveNamespaces` PrefixList) + XML-Signature **verification** (xmldsig-core 1.1) — enveloped-signature transform, RSA/ECDSA-P256-SHA256/384/512, algorithm allow-list (XSLT/XPath rejected), verify-against-configured-key (KeyInfo cert untrusted, exposed for pinning) | any | xml, rsa, p256 |
-| `saml` | SAML 2.0 Web Browser SSO **service-provider**: XSW-hardened Response consumption (signed assertion/response verified against a configured IdP key via `xmldsig`, consumed assertion pinned to the signed element by pointer identity), conditions/subject/audience/recipient/InResponseTo validation on a caller-supplied clock, AuthnRequest builder + IdP-metadata parser; EncryptedAssertion refused (deferred) | any | xmldsig, xml |
+| `saml` | SAML 2.0 Web Browser SSO **service-provider**: XSW-hardened Response consumption (signed assertion/response verified against a configured IdP key via `xmldsig`, consumed assertion pinned to the signed element by pointer identity), conditions/subject/audience/recipient/InResponseTo validation on a caller-supplied clock, AuthnRequest builder + IdP-metadata parser; **`EncryptedAssertion` decrypted via `xmlenc`** (decrypt-then-verify, XSW held within the decrypted doc) when an SP key is configured | any | xmldsig, xml, xmlenc, rsa |
 | `xmlenc` | XML-Encryption (xmlenc-core-1) **decryption** — recover SAML `EncryptedAssertion` plaintext: RSA-OAEP (SHA-1/256) / rsa-1_5 (Bleichenbacher-gated) / AES-KW key transport + AES-128/256-GCM/CBC content (CBC core vs NIST SP800-38A, AES-KW vs RFC 3394); decrypt-then-verify, strict algorithm allow-list, CEK zeroized | any | xml, rsa |
 | `jwe` | JSON Web Encryption (RFC 7516/7518) compact serialization — `dir`/RSA-OAEP/RSA-OAEP-256/AxxxKW (RFC 3394)/AxxxGCMKW/PBES2/**ECDH-ES** (+A128KW/A256KW; P-256 + X25519 ephemeral, Concat KDF, RFC 7518 App. C KAT) key management + A128GCM/A256GCM/A128CBC-HS256/A256CBC-HS512 content encryption, RFC-KAT-validated (incl. RFC 7516 A.3 byte-exact both directions); A192* unsupported (no AES-192 in std) | any | rsa |
 | `acme` | Let's Encrypt / ACME v2 (RFC 8555): HTTP-01 issuance + renewal, ES256 JWS, CSR | any | http, router |
