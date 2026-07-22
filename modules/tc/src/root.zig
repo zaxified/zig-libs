@@ -1,30 +1,51 @@
 // SPDX-License-Identifier: MIT
-//! tc — pure-Zig Linux traffic control over rtnetlink, v1 scoped to the
-//! **netem** qdisc (network emulation: delay/jitter/loss/duplicate/reorder/
-//! corrupt/rate). This is the write side the `netlink` module deliberately
-//! omits ("read/dump only") — `RTM_NEWQDISC`/`RTM_DELQDISC` construction +
-//! `NLMSG_ERROR` ACK parsing, plus a read-back via `RTM_GETQDISC` for
-//! verification. No `tc` shell-out, no libc.
+//! tc — pure-Zig Linux traffic control over rtnetlink: **qdiscs, classes and
+//! filters**, with no `tc` shell-out and no libc.
+//!
+//! * **qdiscs** — `netem` (delay/jitter/loss/duplicate/reorder/corrupt/rate),
+//!   `htb`, `tbf`, `fq_codel`, plus a `raw` escape hatch for any other kind.
+//! * **classes** — `RTM_NEWTCLASS`/`DELTCLASS`/`GETTCLASS` with the htb
+//!   rate/ceil token buckets, including the psched rate tables and the 64-bit
+//!   `TCA_HTB_RATE64`/`CEIL64` attributes for rates above 4.29 GB/s.
+//! * **filters** — `RTM_NEWTFILTER`/`DELTFILTER`/`GETTFILTER` with `u32`
+//!   (masked 32-bit matches at fixed offsets) and `flower` (structured
+//!   L2–L4 keys).
 //!
 //! ```zig
 //! var sock = try tc.Socket.open(gpa);
 //! defer sock.close();
-//! try sock.add(ifindex, .{ .delay_ns = 100 * std.time.ns_per_ms, .loss_pct = 1.0 });
-//! const q = (try sock.show(ifindex)).?;
-//! try sock.del(ifindex);
+//! const root: tc.Handle = .root;
+//! const one: tc.Handle = .init(1, 0);
+//!
+//! try sock.qdiscAdd(.{ .ifindex = ifi, .handle = one, .parent = root },
+//!                   .{ .htb = .{ .defcls = 0x10 } });
+//! try sock.classAdd(.{ .ifindex = ifi, .handle = .init(1, 0x10), .parent = one },
+//!                   .{ .htb = .{ .rate = 125_000, .ceil = 250_000 } });
+//! try sock.filterAdd(.{ .ifindex = ifi, .parent = one, .prio = 1,
+//!                       .eth_type = tc.ETH_P.IP },
+//!                    .{ .u32 = .{ .classid = .init(1, 0x10),
+//!                                 .keys = &.{ .ipv4Dst(.{ 10, 0, 0, 1 }, 32) } } });
+//! const classes = try sock.classes(ifi, one);
+//! defer gpa.free(classes);
+//! try sock.qdiscDel(.{ .ifindex = ifi, .parent = root });
 //! ```
 //!
-//! Both write ops need **CAP_NET_ADMIN**; `show` (RTM_GETQDISC dump) does not.
+//! The v1 netem shortcuts (`add`/`change`/`del`/`show`) are unchanged and
+//! still attach netem as the interface's root qdisc.
 //!
-//! Scope: v1 is the netem qdisc only — attach it as the **root** qdisc of an
-//! interface (`tcm_parent = TC_H_ROOT`, `tcm_handle = 1:0`). Classful qdiscs
-//! (htb/hfsc), filters (u32/bpf/flower), and other leaf qdiscs (tbf/fq_codel/
-//! sfq/…) are out of scope — see SPEC.md.
+//! Every write op needs **CAP_NET_ADMIN**; the `RTM_GET*` dumps do not.
 //!
-//! The wire codec (nlmsghdr framing + rtattr/nlattr TLV walking) is reused
-//! from the sibling `netlink` module (`codec.Message`/`Attr`/`AttrIterator`);
-//! this module adds its own `NETLINK_ROUTE` socket and the write+ACK path
-//! (`netlink.Socket` is read/dump-only by design).
+//! **Transport is shared with the sibling `netlink` module.** This module no
+//! longer runs its own `NETLINK_ROUTE` socket, sequence counter, errno table
+//! or extended-ACK handling: it drives `netlink.Socket` through the public
+//! `nextSeq`/`requestAck`/`lastErrorMessage` seam and builds its own tc
+//! messages on top of `netlink.codec`. Only the multi-part **dump** receive
+//! loop is still local — see the `DRY candidate` note on `Socket.dump`.
+//!
+//! Verification: `goldens.zig` asserts the encoders reproduce, byte for byte,
+//! requests captured from a real `iproute2` `tc` under `strace`; the tests at
+//! the bottom of this file exercise the whole stack against a live kernel in
+//! a network namespace (and skip cleanly without privileges).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -32,613 +53,398 @@ const linux = std.os.linux;
 const native_endian = builtin.cpu.arch.endian();
 
 const netlink = @import("netlink");
-const codec = netlink.codec;
+pub const codec = netlink.codec;
 
 pub const meta = .{
     .platform = .linux, // AF_NETLINK raw syscalls — conscious ceiling
     .role = .client,
     .concurrency = .reentrant, // no globals; one Socket per thread/loop
-    .model_after = "iproute2 `tc` (attribute-shape/behavior only; wire layout is clean-room from the kernel UAPI linux/pkt_sched.h + linux/rtnetlink.h — see NOTICE)",
+    .model_after = "iproute2 `tc` (attribute-shape/behavior + rate-table arithmetic; wire layout is clean-room from the kernel UAPI linux/pkt_sched.h + linux/pkt_cls.h + linux/rtnetlink.h — see NOTICE)",
     .deps = .{"netlink"},
 };
 
-// ── kernel UAPI constants ───────────────────────────────────────────────────
-// linux/rtnetlink.h (struct tcmsg, TCA_*) + linux/pkt_sched.h (struct
-// tc_netem_qopt and friends, TCA_NETEM_*). std.os.linux only defines the bare
-// RTM_NEWQDISC/RTM_DELQDISC/RTM_GETQDISC message-type numbers — everything
-// else here is this module's own gap-fill.
+// ── submodules + re-exports ─────────────────────────────────────────────────
 
-/// rtnetlink message types (std.os.linux.NetlinkMessageType values).
-pub const RTM_NEWQDISC: u16 = @intFromEnum(linux.NetlinkMessageType.RTM_NEWQDISC);
-pub const RTM_DELQDISC: u16 = @intFromEnum(linux.NetlinkMessageType.RTM_DELQDISC);
-pub const RTM_GETQDISC: u16 = @intFromEnum(linux.NetlinkMessageType.RTM_GETQDISC);
+pub const handle = @import("handle.zig");
+pub const ratespec = @import("ratespec.zig");
+pub const qdisc = @import("qdisc.zig");
+pub const filter = @import("filter.zig");
+pub const message = @import("message.zig");
 
-/// sizeof(struct tcmsg), linux/rtnetlink.h: u8 family, u8 pad1, u16 pad2,
-/// i32 ifindex, u32 handle, u32 parent, u32 info.
-pub const tcmsg_len = 20;
+/// `major:minor` handle arithmetic (hexadecimal, like `tc`).
+pub const Handle = handle.Handle;
+pub const TC_H_UNSPEC = handle.TC_H_UNSPEC;
+pub const TC_H_ROOT = handle.TC_H_ROOT;
+pub const TC_H_INGRESS = handle.TC_H_INGRESS;
+pub const TC_H_CLSACT = handle.TC_H_CLSACT;
 
-/// sizeof(struct tc_netem_qopt), linux/pkt_sched.h: u32 latency, limit, loss,
-/// gap, duplicate, jitter.
-pub const tc_netem_qopt_len = 24;
+/// psched clock calibration + rate tables.
+pub const Psched = ratespec.Psched;
+pub const RateSpec = ratespec.RateSpec;
+pub const LinkLayer = ratespec.LinkLayer;
 
-/// TC_H_ROOT (linux/rtnetlink.h) — "no parent, this is the root qdisc".
-pub const TC_H_ROOT: u32 = 0xFFFFFFFF;
-/// The handle this module always assigns a netem root qdisc: major 1, minor
-/// 0 ("1:0"), matching what `tc qdisc add … root` picks by convention.
+/// Qdisc/class specs and their wire readbacks.
+pub const QdiscSpec = qdisc.QdiscSpec;
+pub const ClassSpec = qdisc.ClassSpec;
+pub const Netem = qdisc.Netem;
+pub const NetemWire = qdisc.NetemWire;
+pub const Htb = qdisc.Htb;
+pub const HtbWire = qdisc.HtbWire;
+pub const HtbClass = qdisc.HtbClass;
+pub const HtbClassWire = qdisc.HtbClassWire;
+pub const Tbf = qdisc.Tbf;
+pub const TbfWire = qdisc.TbfWire;
+pub const FqCodel = qdisc.FqCodel;
+pub const FqCodelWire = qdisc.FqCodelWire;
+pub const Qdisc = qdisc.Qdisc;
+pub const Class = qdisc.Class;
+pub const TCA = qdisc.TCA;
+pub const TCA_NETEM = qdisc.TCA_NETEM;
+pub const TCA_HTB = qdisc.TCA_HTB;
+pub const TCA_TBF = qdisc.TCA_TBF;
+pub const TCA_FQ_CODEL = qdisc.TCA_FQ_CODEL;
+pub const percentToU32 = qdisc.percentToU32;
+pub const parseQdisc = qdisc.parseQdisc;
+pub const parseClass = qdisc.parseClass;
+pub const tcmsg_len = qdisc.tcmsg_len;
+pub const tc_netem_qopt_len = qdisc.tc_netem_qopt_len;
+pub const kind_netem = qdisc.kind_netem;
+
+/// Filter specs and their wire readbacks.
+pub const FilterSpec = filter.FilterSpec;
+pub const U32 = filter.U32;
+pub const U32Key = filter.U32Key;
+pub const U32Wire = filter.U32Wire;
+pub const Flower = filter.Flower;
+pub const FlowerWire = filter.FlowerWire;
+pub const Prefix4 = filter.Prefix4;
+pub const Prefix6 = filter.Prefix6;
+pub const Filter = filter.Filter;
+pub const ETH_P = filter.ETH_P;
+pub const IPPROTO = filter.IPPROTO;
+pub const TCA_U32 = filter.TCA_U32;
+pub const TCA_FLOWER = filter.TCA_FLOWER;
+pub const parseFilter = filter.parseFilter;
+
+/// Request construction (message types, targets, builders).
+pub const Create = message.Create;
+pub const QdiscTarget = message.QdiscTarget;
+pub const ClassTarget = message.ClassTarget;
+pub const FilterTarget = message.FilterTarget;
+pub const RTM_NEWQDISC = message.RTM_NEWQDISC;
+pub const RTM_DELQDISC = message.RTM_DELQDISC;
+pub const RTM_GETQDISC = message.RTM_GETQDISC;
+pub const RTM_NEWTCLASS = message.RTM_NEWTCLASS;
+pub const RTM_DELTCLASS = message.RTM_DELTCLASS;
+pub const RTM_GETTCLASS = message.RTM_GETTCLASS;
+pub const RTM_NEWTFILTER = message.RTM_NEWTFILTER;
+pub const RTM_DELTFILTER = message.RTM_DELTFILTER;
+pub const RTM_GETTFILTER = message.RTM_GETTFILTER;
+
+/// The handle the v1 netem shortcuts assign a root qdisc: `1:0`.
 pub const netem_handle: u32 = 0x00010000;
 
-/// Write-path NLM_F_* flags (linux/netlink.h). Not in `netlink.codec` because
-/// that module's scope is read/dump only (REQUEST/DUMP/ACK/MULTI cover it);
-/// these three are only meaningful for RTM_NEW*/RTM_DEL* writes, which live
-/// here.
-const NLM_F_REPLACE: u16 = 0x100;
-const NLM_F_EXCL: u16 = 0x200;
-const NLM_F_CREATE: u16 = 0x400;
+// ── errors ──────────────────────────────────────────────────────────────────
 
-/// Qdisc attribute types (linux/rtnetlink.h enum, TCA_*) — attributes on the
-/// tcmsg fixed header.
-pub const TCA = struct {
-    pub const UNSPEC: u16 = 0;
-    pub const KIND: u16 = 1;
-    pub const OPTIONS: u16 = 2;
-    pub const STATS: u16 = 3;
-};
+/// Transport + kernel-errno failures, shared with `netlink` (this module maps
+/// no errnos of its own any more — `netlink.writeErrorFromCode` does it).
+pub const RequestError = netlink.RequestError;
+/// Everything a write op can fail with: message construction + transport.
+pub const WriteError = RequestError || message.BuildError;
+/// A dump can additionally give up on a table that keeps changing under it.
+pub const DumpError = RequestError || error{InconsistentDump};
 
-/// netem-specific extended attribute types (linux/pkt_sched.h enum,
-/// TCA_NETEM_*) — nested inside `TCA.OPTIONS`, after the fixed
-/// `tc_netem_qopt` bytes. v1 only builds/parses CORR, REORDER, CORRUPT,
-/// RATE, LATENCY64, JITTER64 (DELAY_DIST/ECN/RATE64/SLOT* are out of scope).
-pub const TCA_NETEM = struct {
-    pub const UNSPEC: u16 = 0;
-    pub const CORR: u16 = 1;
-    pub const DELAY_DIST: u16 = 2;
-    pub const REORDER: u16 = 3;
-    pub const CORRUPT: u16 = 4;
-    pub const LOSS: u16 = 5;
-    pub const RATE: u16 = 6;
-    pub const ECN: u16 = 7;
-    pub const RATE64: u16 = 8;
-    pub const PAD: u16 = 9;
-    pub const LATENCY64: u16 = 10;
-    pub const JITTER64: u16 = 11;
-};
+pub const OpenError = netlink.OpenError;
+pub const BuildError = message.BuildError;
+pub const SetError = WriteError; // v1 alias
+pub const DelError = WriteError; // v1 alias
+pub const GetError = DumpError; // v1 alias
 
-/// The `TCA_KIND` string identifying a netem qdisc.
-pub const kind_netem = "netem";
-
-// ── typed netem options (public API input) ──────────────────────────────────
-
-/// A netem configuration, in ergonomic units (nanoseconds, percent 0..100).
-/// The module encodes this into the kernel wire form (see SPEC.md for the
-/// exact `tc_netem_qopt` + extended-attribute layout and the psched-tick
-/// decision).
-///
-/// All `*_pct` fields are percentages in `[0, 100]`; `Socket.add`/`.change`
-/// return `error.InvalidPercent` for anything outside that range (including
-/// NaN).
-pub const Netem = struct {
-    /// FIFO packet limit ("tc … limit N"); the kernel/tc default is 1000.
-    limit: u32 = 1000,
-    /// Base one-way added delay ("delay Xms"), nanoseconds. 0 = no delay.
-    /// Encoded via `TCA_NETEM_LATENCY64` (see SPEC.md), never the legacy
-    /// psched-tick `tc_netem_qopt.latency` field.
-    delay_ns: u64 = 0,
-    /// Delay jitter ("delay Xms Yms"), nanoseconds. 0 = none. Encoded via
-    /// `TCA_NETEM_JITTER64`.
-    jitter_ns: u64 = 0,
-    /// Delay correlation percent ("delay Xms Yms Z%").
-    delay_correlation_pct: f64 = 0,
-    /// Random packet loss probability percent ("loss Z%").
-    loss_pct: f64 = 0,
-    /// Loss correlation percent ("loss Z% W%").
-    loss_correlation_pct: f64 = 0,
-    /// Random packet duplication probability percent ("duplicate Z%").
-    duplicate_pct: f64 = 0,
-    /// Duplicate correlation percent.
-    duplicate_correlation_pct: f64 = 0,
-    /// Random reordering probability percent ("reorder Z%").
-    reorder_pct: f64 = 0,
-    /// Reorder correlation percent.
-    reorder_correlation_pct: f64 = 0,
-    /// Deterministic reorder gap ("reorder … gap N"): every Nth packet
-    /// bypasses the delay queue, overtaking earlier delayed packets. 0 =
-    /// off (probabilistic reorder only). Only meaningful alongside a
-    /// nonzero `delay_ns` — mirrors `tc`.
-    reorder_gap: u32 = 0,
-    /// Random packet corruption probability percent ("corrupt Z%").
-    corrupt_pct: f64 = 0,
-    /// Corrupt correlation percent.
-    corrupt_correlation_pct: f64 = 0,
-    /// Rate limit in bytes/s ("rate Rbit/Rbps" — convert to bytes/s before
-    /// setting this). 0 = unlimited. v1 only emits `TCA_NETEM_RATE` (u32);
-    /// rates needing `TCA_NETEM_RATE64` are out of scope.
-    rate_bytes_per_sec: u32 = 0,
-};
-
-/// The wire-level readback of a netem qdisc's options (from `Socket.show`).
-/// Deliberately separate from `Netem`: these are the raw scaled/kernel
-/// values (no percent reconstruction — avoids float round-trip ambiguity),
-/// so a caller that built a `Netem` can assert exact equality against the
-/// same `percentToU32`-scaled values it used to build the request.
-pub const NetemWire = struct {
-    limit: u32 = 0,
-    /// Raw scaled probability (`percent/100 * UINT32_MAX`), 0 = none.
-    loss: u32 = 0,
-    duplicate: u32 = 0,
-    /// `tc_netem_qopt.gap` — the deterministic reorder gap.
-    gap: u32 = 0,
-    /// Legacy `tc_netem_qopt.latency`/`.jitter` fields (psched ticks or a
-    /// kernel-derived legacy value on dump — see SPEC.md). This module
-    /// always writes 0 here; a dumping kernel may report a nonzero legacy
-    /// value derived from the 64-bit ns fields below for old-tool
-    /// compatibility. Informational only — prefer `delay_ns`/`jitter_ns`.
-    legacy_latency: u32 = 0,
-    legacy_jitter: u32 = 0,
-    /// `TCA_NETEM_LATENCY64` / `TCA_NETEM_JITTER64`, nanoseconds; 0 if the
-    /// attribute was absent.
-    delay_ns: i64 = 0,
-    jitter_ns: i64 = 0,
-    delay_correlation: u32 = 0,
-    loss_correlation: u32 = 0,
-    duplicate_correlation: u32 = 0,
-    reorder_probability: u32 = 0,
-    reorder_correlation: u32 = 0,
-    corrupt_probability: u32 = 0,
-    corrupt_correlation: u32 = 0,
-    /// `TCA_NETEM_RATE.rate` (bytes/s); 0 if absent.
-    rate_bytes_per_sec: u32 = 0,
-};
-
-/// One qdisc, as read back by `Socket.show` (RTM_GETQDISC).
-pub const Qdisc = struct {
-    ifindex: u32,
-    handle: u32,
-    parent: u32,
-    kind_buf: [16]u8 = @splat(0),
-    kind_len: u8 = 0,
-    /// Decoded netem options, present only when `kind() == "netem"`.
-    netem: ?NetemWire = null,
-
-    /// The qdisc kind string ("netem", "noqueue", "fq_codel", …).
-    pub fn kind(q: *const Qdisc) []const u8 {
-        return q.kind_buf[0..q.kind_len];
-    }
-};
-
-/// Scale a `[0, 100]` percent to the kernel's `u32` probability scale
-/// (`percent/100 * UINT32_MAX`, rounded — matches `tc`'s own scaling).
-/// NaN and anything outside `[0, 100]` is rejected.
-pub fn percentToU32(pct: f64) error{InvalidPercent}!u32 {
-    if (!(pct >= 0.0 and pct <= 100.0)) return error.InvalidPercent;
-    const scaled = @round(pct / 100.0 * @as(f64, @floatFromInt(std.math.maxInt(u32))));
-    return @intFromFloat(scaled);
-}
-
-// ── request building (pure, offline-testable) ───────────────────────────────
-
-pub const BuildError = std.mem.Allocator.Error || error{ InvalidPercent, InvalidDelay };
-
-/// Validate a `delay_ns`/`jitter_ns` value fits the wire's signed 64-bit
-/// nanosecond field (`TCA_NETEM_LATENCY64`/`JITTER64`). Mirrors
-/// `percentToU32`: reject before any allocation rather than let the later
-/// `@intCast(i64, …)` panic (ReleaseSafe) or silently wrap to a negative
-/// latency (ReleaseFast).
-fn checkDelayNs(ns: u64) error{InvalidDelay}!void {
-    if (ns > std.math.maxInt(i64)) return error.InvalidDelay;
-}
-
-fn appendTcmsg(
-    gpa: std.mem.Allocator,
-    list: *std.ArrayList(u8),
-    ifindex: u32,
-    handle: u32,
-    parent: u32,
-) std.mem.Allocator.Error!void {
-    var buf: [tcmsg_len]u8 = @splat(0); // family/pad1/pad2/info all 0
-    std.mem.writeInt(i32, buf[4..8], @bitCast(ifindex), native_endian);
-    std.mem.writeInt(u32, buf[8..12], handle, native_endian);
-    std.mem.writeInt(u32, buf[12..16], parent, native_endian);
-    try codec.appendPadded(gpa, list, &buf);
-}
-
-/// Open a nested attribute (NLA_F_NESTED set, length patched by `nestEnd`).
-fn nestBegin(
-    gpa: std.mem.Allocator,
-    list: *std.ArrayList(u8),
-    attr_type: u16,
-) std.mem.Allocator.Error!usize {
-    const off = list.items.len;
-    var hdr: [codec.attr_header_len]u8 = undefined;
-    std.mem.writeInt(u16, hdr[0..2], 0, native_endian); // patched by nestEnd
-    std.mem.writeInt(u16, hdr[2..4], attr_type | codec.NLA_F_NESTED, native_endian);
-    try list.appendSlice(gpa, &hdr);
-    return off;
-}
-
-fn nestEnd(list: *std.ArrayList(u8), off: usize) void {
-    const total: u16 = @intCast(list.items.len - off);
-    std.mem.writeInt(u16, list.items[off..][0..2], total, native_endian);
-}
-
-fn appendAttrRaw(
-    gpa: std.mem.Allocator,
-    list: *std.ArrayList(u8),
-    attr_type: u16,
-    data: []const u8,
-) std.mem.Allocator.Error!void {
-    codec.appendAttr(gpa, list, attr_type, data) catch |err| switch (err) {
-        error.AttrTooLong => unreachable, // all our payloads are <= 16 bytes
-        error.OutOfMemory => return error.OutOfMemory,
-    };
-}
-
-/// Build one `RTM_NEWQDISC` request: nlmsghdr + tcmsg (root, handle 1:0) +
-/// `TCA_KIND` "netem" + `TCA_OPTIONS` (qopt + extended attrs). `flags` picks
-/// add (`NLM_F_CREATE|NLM_F_EXCL`) vs change/replace (`NLM_F_CREATE|
-/// NLM_F_REPLACE`) semantics; both always include `NLM_F_REQUEST|NLM_F_ACK`.
-fn buildSetRequest(
-    gpa: std.mem.Allocator,
-    seq: u32,
-    flags: u16,
-    ifindex: u32,
-    netem: Netem,
-) BuildError![]u8 {
-    // Validate + pre-scale every percent field before allocating anything.
-    const loss = try percentToU32(netem.loss_pct);
-    const loss_corr = try percentToU32(netem.loss_correlation_pct);
-    const dup = try percentToU32(netem.duplicate_pct);
-    const dup_corr = try percentToU32(netem.duplicate_correlation_pct);
-    const delay_corr = try percentToU32(netem.delay_correlation_pct);
-    const reorder_prob = try percentToU32(netem.reorder_pct);
-    const reorder_corr = try percentToU32(netem.reorder_correlation_pct);
-    const corrupt_prob = try percentToU32(netem.corrupt_pct);
-    const corrupt_corr = try percentToU32(netem.corrupt_correlation_pct);
-    try checkDelayNs(netem.delay_ns);
-    try checkDelayNs(netem.jitter_ns);
-
-    var list: std.ArrayList(u8) = .empty;
-    errdefer list.deinit(gpa);
-    const hdr = try codec.appendHeader(gpa, &list, RTM_NEWQDISC, flags, seq, 0);
-    try appendTcmsg(gpa, &list, ifindex, netem_handle, TC_H_ROOT);
-    codec.appendAttrString(gpa, &list, TCA.KIND, kind_netem) catch |err| switch (err) {
-        error.AttrTooLong => unreachable, // "netem" is 5 bytes
-        error.OutOfMemory => return error.OutOfMemory,
-    };
-
-    const opt_off = try nestBegin(gpa, &list, TCA.OPTIONS);
-    {
-        // struct tc_netem_qopt: latency(0, real value goes via LATENCY64),
-        // limit, loss, gap, duplicate, jitter(0, real value via JITTER64).
-        var qopt: [tc_netem_qopt_len]u8 = @splat(0);
-        std.mem.writeInt(u32, qopt[4..8], netem.limit, native_endian);
-        std.mem.writeInt(u32, qopt[8..12], loss, native_endian);
-        std.mem.writeInt(u32, qopt[12..16], netem.reorder_gap, native_endian);
-        std.mem.writeInt(u32, qopt[16..20], dup, native_endian);
-        try codec.appendPadded(gpa, &list, &qopt); // already 4-aligned (24 B)
-    }
-    if (delay_corr != 0 or loss_corr != 0 or dup_corr != 0) {
-        var corr: [12]u8 = undefined;
-        std.mem.writeInt(u32, corr[0..4], delay_corr, native_endian);
-        std.mem.writeInt(u32, corr[4..8], loss_corr, native_endian);
-        std.mem.writeInt(u32, corr[8..12], dup_corr, native_endian);
-        try appendAttrRaw(gpa, &list, TCA_NETEM.CORR, &corr);
-    }
-    if (reorder_prob != 0 or netem.reorder_gap != 0) {
-        var reo: [8]u8 = undefined;
-        std.mem.writeInt(u32, reo[0..4], reorder_prob, native_endian);
-        std.mem.writeInt(u32, reo[4..8], reorder_corr, native_endian);
-        try appendAttrRaw(gpa, &list, TCA_NETEM.REORDER, &reo);
-    }
-    if (corrupt_prob != 0) {
-        var cor: [8]u8 = undefined;
-        std.mem.writeInt(u32, cor[0..4], corrupt_prob, native_endian);
-        std.mem.writeInt(u32, cor[4..8], corrupt_corr, native_endian);
-        try appendAttrRaw(gpa, &list, TCA_NETEM.CORRUPT, &cor);
-    }
-    if (netem.rate_bytes_per_sec != 0) {
-        // struct tc_netem_rate: rate, packet_overhead(0), cell_size(0),
-        // cell_overhead(0) — the overhead/cell knobs are out of scope.
-        var rate: [16]u8 = @splat(0);
-        std.mem.writeInt(u32, rate[0..4], netem.rate_bytes_per_sec, native_endian);
-        try appendAttrRaw(gpa, &list, TCA_NETEM.RATE, &rate);
-    }
-    if (netem.delay_ns != 0) {
-        var raw: [8]u8 = undefined;
-        std.mem.writeInt(i64, &raw, @intCast(netem.delay_ns), native_endian);
-        try appendAttrRaw(gpa, &list, TCA_NETEM.LATENCY64, &raw);
-    }
-    if (netem.jitter_ns != 0) {
-        var raw: [8]u8 = undefined;
-        std.mem.writeInt(i64, &raw, @intCast(netem.jitter_ns), native_endian);
-        try appendAttrRaw(gpa, &list, TCA_NETEM.JITTER64, &raw);
-    }
-    nestEnd(&list, opt_off);
-
-    codec.finishHeader(&list, hdr);
-    return list.toOwnedSlice(gpa);
-}
-
-/// Build one `RTM_DELQDISC` request targeting the root netem qdisc.
-fn buildDelRequest(gpa: std.mem.Allocator, seq: u32, ifindex: u32) std.mem.Allocator.Error![]u8 {
-    var list: std.ArrayList(u8) = .empty;
-    errdefer list.deinit(gpa);
-    const hdr = try codec.appendHeader(gpa, &list, RTM_DELQDISC, codec.NLM_F_REQUEST | codec.NLM_F_ACK, seq, 0);
-    try appendTcmsg(gpa, &list, ifindex, netem_handle, TC_H_ROOT);
-    codec.finishHeader(&list, hdr);
-    return list.toOwnedSlice(gpa);
-}
-
-/// Build one `RTM_GETQDISC` dump request. `ifindex` is passed in the fixed
-/// header as a courtesy to kernels that honor it, and is always re-checked
-/// client-side in `Socket.show` (same belt-and-braces approach `netlink`
-/// takes for its own filters).
-fn buildDumpRequest(gpa: std.mem.Allocator, seq: u32, ifindex: u32) std.mem.Allocator.Error![]u8 {
-    var list: std.ArrayList(u8) = .empty;
-    errdefer list.deinit(gpa);
-    const hdr = try codec.appendHeader(gpa, &list, RTM_GETQDISC, codec.NLM_F_REQUEST | codec.NLM_F_DUMP, seq, 0);
-    try appendTcmsg(gpa, &list, ifindex, 0, 0); // handle/parent unspecific
-    codec.finishHeader(&list, hdr);
-    return list.toOwnedSlice(gpa);
-}
-
-// ── reply parsing (pure, offline-testable, fuzzed) ──────────────────────────
-
-/// Parse an `RTM_NEWQDISC` payload (struct tcmsg + TCA_* attributes) into a
-/// typed `Qdisc`. Unlike `netlink`'s `parse*` functions (which return `null`
-/// for a degenerate entry worth skipping, e.g. an address with no usable
-/// IP), every qdisc dump entry is inherently usable, so this returns `Qdisc`
-/// directly rather than `?Qdisc`.
-pub fn parseQdisc(payload: []const u8) codec.Error!Qdisc {
-    if (payload.len < tcmsg_len) return error.Truncated;
-    var q: Qdisc = .{
-        .ifindex = @bitCast(std.mem.readInt(i32, payload[4..8], native_endian)),
-        .handle = std.mem.readInt(u32, payload[8..12], native_endian),
-        .parent = std.mem.readInt(u32, payload[12..16], native_endian),
-    };
-    var options_data: ?[]const u8 = null;
-    var it: codec.AttrIterator = .{ .buf = payload[tcmsg_len..] };
-    while (try it.next()) |a| switch (a.type) {
-        TCA.KIND => {
-            const s = a.asString();
-            if (s.len > q.kind_buf.len) return error.BadLength;
-            @memcpy(q.kind_buf[0..s.len], s);
-            q.kind_len = @intCast(s.len);
-        },
-        TCA.OPTIONS => options_data = a.data,
-        else => {},
-    };
-    if (options_data) |opt| {
-        if (std.mem.eql(u8, q.kind(), kind_netem)) {
-            q.netem = try parseNetemOptions(opt);
-        }
-    }
-    return q;
-}
-
-/// Parse a `TCA_OPTIONS` payload for a netem qdisc: fixed `tc_netem_qopt`
-/// (24 B) followed by extended `TCA_NETEM_*` TLVs. Sub-attributes with an
-/// unexpected length are ignored rather than rejected (defensive, like
-/// `netlink`'s `ipLen` check) — one odd attribute shouldn't fail the whole
-/// parse.
-fn parseNetemOptions(data: []const u8) codec.Error!NetemWire {
-    if (data.len < tc_netem_qopt_len) return error.Truncated;
-    var nw: NetemWire = .{
-        .legacy_latency = std.mem.readInt(u32, data[0..4], native_endian),
-        .limit = std.mem.readInt(u32, data[4..8], native_endian),
-        .loss = std.mem.readInt(u32, data[8..12], native_endian),
-        .gap = std.mem.readInt(u32, data[12..16], native_endian),
-        .duplicate = std.mem.readInt(u32, data[16..20], native_endian),
-        .legacy_jitter = std.mem.readInt(u32, data[20..24], native_endian),
-    };
-    var it: codec.AttrIterator = .{ .buf = data[tc_netem_qopt_len..] };
-    while (try it.next()) |a| switch (a.type) {
-        TCA_NETEM.CORR => if (a.data.len == 12) {
-            nw.delay_correlation = std.mem.readInt(u32, a.data[0..4], native_endian);
-            nw.loss_correlation = std.mem.readInt(u32, a.data[4..8], native_endian);
-            nw.duplicate_correlation = std.mem.readInt(u32, a.data[8..12], native_endian);
-        },
-        TCA_NETEM.REORDER => if (a.data.len == 8) {
-            nw.reorder_probability = std.mem.readInt(u32, a.data[0..4], native_endian);
-            nw.reorder_correlation = std.mem.readInt(u32, a.data[4..8], native_endian);
-        },
-        TCA_NETEM.CORRUPT => if (a.data.len == 8) {
-            nw.corrupt_probability = std.mem.readInt(u32, a.data[0..4], native_endian);
-            nw.corrupt_correlation = std.mem.readInt(u32, a.data[4..8], native_endian);
-        },
-        TCA_NETEM.RATE => if (a.data.len >= 4) {
-            nw.rate_bytes_per_sec = std.mem.readInt(u32, a.data[0..4], native_endian);
-        },
-        TCA_NETEM.LATENCY64 => if (a.data.len == 8) {
-            nw.delay_ns = std.mem.readInt(i64, a.data[0..8], native_endian);
-        },
-        TCA_NETEM.JITTER64 => if (a.data.len == 8) {
-            nw.jitter_ns = std.mem.readInt(i64, a.data[0..8], native_endian);
-        },
-        else => {},
-    };
-    return nw;
-}
-
-// ── errno mapping ───────────────────────────────────────────────────────────
-
-pub const RequestError = error{
-    OutOfMemory,
-    SendFailed,
-    RecvFailed,
-    /// A reply failed wire-format validation (bounds/length checks).
-    MalformedReply,
-    /// Missing CAP_NET_ADMIN — add/change/del all need it.
-    AccessDenied,
-    /// `add` with an existing root qdisc (NLM_F_EXCL).
-    Exists,
-    /// `del` on an interface with no matching qdisc.
-    NotFound,
-    /// No such interface (bad ifindex).
-    NoSuchDevice,
-    InvalidRequest,
-    NotSupported,
-    SystemResources,
-    Unexpected,
-};
-
-pub const SetError = RequestError || BuildError;
-pub const DelError = RequestError;
-pub const GetError = RequestError;
-
-fn errnoToError(code: i32) RequestError {
-    if (code >= 0 or code == std.math.minInt(i32)) return error.Unexpected;
-    return switch (@as(u32, @intCast(-code))) {
-        @intFromEnum(linux.E.PERM), @intFromEnum(linux.E.ACCES) => error.AccessDenied,
-        @intFromEnum(linux.E.EXIST) => error.Exists,
-        @intFromEnum(linux.E.NOENT) => error.NotFound,
-        @intFromEnum(linux.E.NODEV) => error.NoSuchDevice,
-        @intFromEnum(linux.E.INVAL) => error.InvalidRequest,
-        @intFromEnum(linux.E.OPNOTSUPP) => error.NotSupported,
-        @intFromEnum(linux.E.NOBUFS), @intFromEnum(linux.E.NOMEM) => error.SystemResources,
-        else => error.Unexpected,
-    };
-}
-
-// ── socket transport ────────────────────────────────────────────────────────
-// A small, independent NETLINK_ROUTE socket (mirrors netlink.Socket.open's
-// raw-syscall shape) — `netlink.Socket` is read/dump-only by design, so the
-// write+ACK path lives here rather than reaching into its internals.
-
-pub const OpenError = error{
-    OutOfMemory,
-    AccessDenied,
-    ProtocolNotSupported,
-    ProcessFdQuotaExceeded,
-    SystemFdQuotaExceeded,
-    SystemResources,
-    Unexpected,
-};
+// ── socket ──────────────────────────────────────────────────────────────────
 
 const initial_recv_buf_len = 8192;
 const max_recv_buf_len = 1 << 24;
 const max_dump_attempts = 4; // NLM_F_DUMP_INTR restarts before giving up
 
-/// A blocking `NETLINK_ROUTE` socket for netem qdisc writes + read-back. One
-/// instance per thread/loop; no shared state.
+/// A blocking tc client over one `NETLINK_ROUTE` socket. One instance per
+/// thread/loop; no shared state.
 pub const Socket = struct {
     gpa: std.mem.Allocator,
-    fd: i32,
-    portid: u32,
-    seq: u32,
+    /// The shared rtnetlink transport: sequence numbers, the write+ACK
+    /// engine, typed errno mapping and the kernel's extended-ACK strings all
+    /// come from here.
+    nl: netlink.Socket,
+    /// psched calibration used for every rate/burst computation. Read from
+    /// `/proc/net/psched` at open time; override with `openWithPsched` to
+    /// build requests for a host other than this one.
+    psched: Psched,
+    /// Receive buffer for dumps; grown on demand.
     buf: []u8,
 
     pub fn open(gpa: std.mem.Allocator) OpenError!Socket {
+        return openWithPsched(gpa, Psched.read());
+    }
+
+    /// Open with an explicit psched calibration (testing, or building
+    /// requests destined for a different kernel).
+    pub fn openWithPsched(gpa: std.mem.Allocator, ps: Psched) OpenError!Socket {
         if (comptime builtin.os.tag != .linux)
             @compileError("tc.Socket is Linux-only (AF_NETLINK raw syscalls)");
-
-        const rc = linux.socket(
-            linux.AF.NETLINK,
-            linux.SOCK.RAW | linux.SOCK.CLOEXEC,
-            linux.NETLINK.ROUTE,
-        );
-        switch (linux.errno(rc)) {
-            .SUCCESS => {},
-            .ACCES, .PERM => return error.AccessDenied,
-            .AFNOSUPPORT, .PROTONOSUPPORT => return error.ProtocolNotSupported,
-            .MFILE => return error.ProcessFdQuotaExceeded,
-            .NFILE => return error.SystemFdQuotaExceeded,
-            .NOBUFS, .NOMEM => return error.SystemResources,
-            else => return error.Unexpected,
-        }
-        const fd: i32 = @intCast(rc);
-        errdefer _ = linux.close(fd);
-
-        const sa: linux.sockaddr.nl = .{ .pid = 0, .groups = 0 };
-        switch (linux.errno(linux.bind(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.nl)))) {
-            .SUCCESS => {},
-            .NOBUFS, .NOMEM => return error.SystemResources,
-            else => return error.Unexpected,
-        }
-        var bound: linux.sockaddr.nl = .{ .pid = 0, .groups = 0 };
-        var blen: linux.socklen_t = @sizeOf(linux.sockaddr.nl);
-        switch (linux.errno(linux.getsockname(fd, @ptrCast(&bound), &blen))) {
-            .SUCCESS => {},
-            else => return error.Unexpected,
-        }
-
+        var nl = try netlink.Socket.open(gpa);
+        errdefer nl.close();
         const buf = try gpa.alloc(u8, initial_recv_buf_len);
-        return .{ .gpa = gpa, .fd = fd, .portid = bound.pid, .seq = 0, .buf = buf };
+        return .{ .gpa = gpa, .nl = nl, .psched = ps, .buf = buf };
     }
 
     pub fn close(self: *Socket) void {
         self.gpa.free(self.buf);
-        _ = linux.close(self.fd);
+        self.nl.close();
         self.* = undefined;
     }
 
-    /// Attach a netem root qdisc (`NLM_F_CREATE|NLM_F_EXCL` — fails
-    /// `error.Exists` if one is already attached). Needs CAP_NET_ADMIN.
-    pub fn add(self: *Socket, ifindex: u32, netem: Netem) SetError!void {
-        try self.setNetem(ifindex, netem, NLM_F_CREATE | NLM_F_EXCL);
+    /// The kernel's reason for the last failed write, from the extended ACK
+    /// (`NLMSGERR_ATTR_MSG`) — e.g. "Specified qdisc kind is unknown". Empty
+    /// when the kernel attached none. Valid until the next request.
+    pub fn lastErrorMessage(self: *const Socket) []const u8 {
+        return self.nl.lastErrorMessage();
     }
 
-    /// Create-or-replace the root qdisc with a new netem config
-    /// (`NLM_F_CREATE|NLM_F_REPLACE` — idempotent, unlike `add`). Needs
-    /// CAP_NET_ADMIN.
-    pub fn change(self: *Socket, ifindex: u32, netem: Netem) SetError!void {
-        try self.setNetem(ifindex, netem, NLM_F_CREATE | NLM_F_REPLACE);
+    // ── qdisc ops ──────────────────────────────────────────────────────────
+
+    /// Attach a qdisc (`NLM_F_CREATE|NLM_F_EXCL` — `error.Exists` if one is
+    /// already at that attach point).
+    pub fn qdiscAdd(self: *Socket, target: QdiscTarget, spec: QdiscSpec) WriteError!void {
+        return self.qdiscSet(.add, target, spec);
     }
 
-    fn setNetem(self: *Socket, ifindex: u32, netem: Netem, extra_flags: u16) SetError!void {
-        const seq = self.nextSeq();
-        const req = try buildSetRequest(self.gpa, seq, codec.NLM_F_REQUEST | codec.NLM_F_ACK | extra_flags, ifindex, netem);
+    /// Create-or-replace a qdisc (`NLM_F_CREATE|NLM_F_REPLACE` — idempotent).
+    pub fn qdiscReplace(self: *Socket, target: QdiscTarget, spec: QdiscSpec) WriteError!void {
+        return self.qdiscSet(.replace, target, spec);
+    }
+
+    /// Modify an existing qdisc in place (no create bits).
+    pub fn qdiscChange(self: *Socket, target: QdiscTarget, spec: QdiscSpec) WriteError!void {
+        return self.qdiscSet(.change, target, spec);
+    }
+
+    fn qdiscSet(self: *Socket, op: Create, target: QdiscTarget, spec: QdiscSpec) WriteError!void {
+        const seq = self.nl.nextSeq();
+        const req = try message.buildQdiscSet(self.gpa, seq, op, target, spec, self.psched);
         defer self.gpa.free(req);
-        try self.send(req);
-        try self.awaitAck(seq);
+        return self.nl.requestAck(req, seq);
     }
 
-    /// Remove the root qdisc (reverting the interface to its default).
-    /// Needs CAP_NET_ADMIN.
-    pub fn del(self: *Socket, ifindex: u32) DelError!void {
-        const seq = self.nextSeq();
-        const req = try buildDelRequest(self.gpa, seq, ifindex);
+    /// Remove a qdisc, reverting the attach point to its default.
+    pub fn qdiscDel(self: *Socket, target: QdiscTarget) WriteError!void {
+        const seq = self.nl.nextSeq();
+        const req = try message.buildQdiscDel(self.gpa, seq, target);
         defer self.gpa.free(req);
-        try self.send(req);
-        try self.awaitAck(seq);
+        return self.nl.requestAck(req, seq);
     }
 
-    /// Read back the qdisc attached to `ifindex` via a filtered
-    /// `RTM_GETQDISC` dump — every interface always has *some* root qdisc
-    /// (`noqueue`/`pfifo_fast`/… by default), so this returns `null` only
-    /// when the interface itself doesn't exist / reports nothing. Does not
-    /// need CAP_NET_ADMIN.
-    pub fn show(self: *Socket, ifindex: u32) GetError!?Qdisc {
+    /// Dump every qdisc on an interface (root plus any leaves). Caller owns
+    /// the slice (`gpa.free`).
+    pub fn qdiscs(self: *Socket, ifindex: u32) DumpError![]Qdisc {
+        return self.dump(Qdisc, qdisc.parseQdisc, RTM_GETQDISC, RTM_NEWQDISC, ifindex, null, .exact);
+    }
+
+    // ── class ops ──────────────────────────────────────────────────────────
+
+    pub fn classAdd(self: *Socket, target: ClassTarget, spec: ClassSpec) WriteError!void {
+        return self.classSet(.add, target, spec);
+    }
+
+    pub fn classReplace(self: *Socket, target: ClassTarget, spec: ClassSpec) WriteError!void {
+        return self.classSet(.replace, target, spec);
+    }
+
+    pub fn classChange(self: *Socket, target: ClassTarget, spec: ClassSpec) WriteError!void {
+        return self.classSet(.change, target, spec);
+    }
+
+    fn classSet(self: *Socket, op: Create, target: ClassTarget, spec: ClassSpec) WriteError!void {
+        const seq = self.nl.nextSeq();
+        const req = try message.buildClassSet(self.gpa, seq, op, target, spec, self.psched);
+        defer self.gpa.free(req);
+        return self.nl.requestAck(req, seq);
+    }
+
+    /// Delete a class. `target.parent` may stay `unspec` — the kernel finds
+    /// the parent from the class id, which is what `tc class del` sends.
+    pub fn classDel(self: *Socket, target: ClassTarget) WriteError!void {
+        const seq = self.nl.nextSeq();
+        const req = try message.buildClassDel(self.gpa, seq, target);
+        defer self.gpa.free(req);
+        return self.nl.requestAck(req, seq);
+    }
+
+    /// Dump classes on an interface. The kernel dumps **every** class of the
+    /// ifindex regardless of what the request asked for, so `parent` filters
+    /// client-side:
+    ///
+    /// * a **qdisc** handle (`1:`) keeps every class of that qdisc, matched
+    ///   on the class id's major — which is how `tc class show … parent 1:`
+    ///   does it, and the only workable rule: a classful qdisc reports
+    ///   `tcm_parent = TC_H_ROOT` for its top-level classes, not the qdisc
+    ///   handle;
+    /// * a **class** handle (`1:10`) keeps that class's direct children,
+    ///   matched on `tcm_parent`;
+    /// * null keeps everything.
+    pub fn classes(self: *Socket, ifindex: u32, parent: ?Handle) DumpError![]Class {
+        return self.dump(Class, qdisc.parseClass, RTM_GETTCLASS, RTM_NEWTCLASS, ifindex, parent, .class_scope);
+    }
+
+    // ── filter ops ─────────────────────────────────────────────────────────
+
+    pub fn filterAdd(self: *Socket, target: FilterTarget, spec: FilterSpec) WriteError!void {
+        return self.filterSet(.add, target, spec);
+    }
+
+    pub fn filterReplace(self: *Socket, target: FilterTarget, spec: FilterSpec) WriteError!void {
+        return self.filterSet(.replace, target, spec);
+    }
+
+    pub fn filterChange(self: *Socket, target: FilterTarget, spec: FilterSpec) WriteError!void {
+        return self.filterSet(.change, target, spec);
+    }
+
+    fn filterSet(self: *Socket, op: Create, target: FilterTarget, spec: FilterSpec) WriteError!void {
+        const seq = self.nl.nextSeq();
+        const req = try message.buildFilterSet(self.gpa, seq, op, target, spec);
+        defer self.gpa.free(req);
+        return self.nl.requestAck(req, seq);
+    }
+
+    /// Delete a filter, matched on (parent, prio, protocol, handle).
+    /// `kind` is optional and usually null — `tc filter del` omits it too.
+    pub fn filterDel(self: *Socket, target: FilterTarget, kind: ?[]const u8) WriteError!void {
+        const seq = self.nl.nextSeq();
+        const req = try message.buildFilterDel(self.gpa, seq, target, kind);
+        defer self.gpa.free(req);
+        return self.nl.requestAck(req, seq);
+    }
+
+    /// Dump filters on an interface, optionally scoped to one attach point.
+    /// Filters *do* report the attach point they were installed on, so
+    /// `parent` is matched exactly (same rule `tc filter show … parent 1:`
+    /// applies).
+    pub fn filters(self: *Socket, ifindex: u32, parent: ?Handle) DumpError![]Filter {
+        return self.dump(Filter, filter.parseFilter, RTM_GETTFILTER, RTM_NEWTFILTER, ifindex, parent, .exact);
+    }
+
+    // ── v1 netem shortcuts (source-compatible) ─────────────────────────────
+
+    /// Attach a netem root qdisc with handle `1:0` (`NLM_F_CREATE|NLM_F_EXCL`).
+    pub fn add(self: *Socket, ifindex: u32, netem: Netem) WriteError!void {
+        return self.qdiscAdd(netemTarget(ifindex), .{ .netem = netem });
+    }
+
+    /// Create-or-replace the root qdisc with a new netem config.
+    pub fn change(self: *Socket, ifindex: u32, netem: Netem) WriteError!void {
+        return self.qdiscReplace(netemTarget(ifindex), .{ .netem = netem });
+    }
+
+    /// Remove the root qdisc.
+    pub fn del(self: *Socket, ifindex: u32) WriteError!void {
+        return self.qdiscDel(netemTarget(ifindex));
+    }
+
+    /// The root qdisc of `ifindex` (every interface always has one), or null
+    /// when the interface reports nothing.
+    pub fn show(self: *Socket, ifindex: u32) DumpError!?Qdisc {
+        const list = try self.qdiscs(ifindex);
+        defer self.gpa.free(list);
+        var found: ?Qdisc = null;
+        for (list) |q| {
+            if (q.parent.isRoot() or q.handle.raw == netem_handle) return q;
+            found = q;
+        }
+        return found;
+    }
+
+    fn netemTarget(ifindex: u32) QdiscTarget {
+        return .{
+            .ifindex = ifindex,
+            .handle = Handle.fromRaw(netem_handle),
+            .parent = Handle.root,
+        };
+    }
+
+    // ── the dump engine ────────────────────────────────────────────────────
+
+    /// DRY candidate: `netlink.Socket` publishes `nextSeq`/`requestAck`/
+    /// `lastErrorMessage` for the **write** path, but its multi-part dump
+    /// engine is private and generic over its own parse/match callbacks, and
+    /// it exposes no raw `send`/`recvDatagram` pair (the sibling
+    /// `genetlink.Socket` does). Until it grows one, tc drives the shared
+    /// socket's fd directly here. Everything else — sequence numbers, errno
+    /// mapping, ext-ACK — stays in `netlink`.
+    /// How a dump's `parent` filter is applied client-side (see `classes`).
+    const ParentMatch = enum { exact, class_scope };
+
+    fn parentMatches(comptime mode: ParentMatch, want: Handle, item_parent: Handle, item_handle: Handle) bool {
+        return switch (mode) {
+            .exact => item_parent.raw == want.raw,
+            .class_scope => if (want.minor() == 0 and !want.isRoot() and !want.isIngress())
+                item_handle.major() == want.major()
+            else
+                item_parent.raw == want.raw,
+        };
+    }
+
+    fn dump(
+        self: *Socket,
+        comptime T: type,
+        comptime parseFn: fn ([]const u8) codec.Error!T,
+        msg_type: u16,
+        reply_type: u16,
+        ifindex: u32,
+        parent: ?Handle,
+        comptime mode: ParentMatch,
+    ) DumpError![]T {
         var attempt: usize = 0;
         retry: while (true) {
             attempt += 1;
-            const seq = self.nextSeq();
-            const req = try buildDumpRequest(self.gpa, seq, ifindex);
+            const seq = self.nl.nextSeq();
+            const req = try message.buildDump(
+                self.gpa,
+                seq,
+                msg_type,
+                ifindex,
+                parent orelse Handle.unspec,
+            );
             defer self.gpa.free(req);
             try self.send(req);
 
-            var found: ?Qdisc = null;
+            var out: std.ArrayList(T) = .empty;
+            errdefer out.deinit(self.gpa);
             while (true) {
                 const dgram = try self.recvDatagram();
                 var it: codec.MessageIterator = .{ .buf = dgram };
                 while (it.next() catch return error.MalformedReply) |m| {
-                    if (m.pid != self.portid or m.seq != seq) continue;
+                    if (m.pid != self.nl.portid or m.seq != seq) continue;
                     if (m.flags & codec.NLM_F_DUMP_INTR != 0) {
+                        out.deinit(self.gpa);
                         if (attempt < max_dump_attempts) continue :retry;
-                        return error.Unexpected;
+                        return error.InconsistentDump;
                     }
                     switch (m.type) {
-                        codec.NLMSG_DONE => return found,
+                        codec.NLMSG_DONE => return out.toOwnedSlice(self.gpa),
                         codec.NLMSG_ERROR => {
                             const code = m.errorCode() catch return error.MalformedReply;
-                            if (code == 0) continue; // stray ACK
-                            return errnoToError(code);
+                            if (code == 0) return out.toOwnedSlice(self.gpa); // ACK
+                            return netlink.writeErrorFromCode(code);
                         },
                         codec.NLMSG_NOOP => {},
                         codec.NLMSG_OVERRUN => return error.SystemResources,
                         else => {
-                            if (m.type != RTM_NEWQDISC) continue;
-                            const q = parseQdisc(m.payload) catch return error.MalformedReply;
-                            if (q.ifindex == ifindex) found = q;
+                            if (m.type != reply_type) continue;
+                            const item = parseFn(m.payload) catch return error.MalformedReply;
+                            if (item.ifindex != ifindex) continue;
+                            if (parent) |p| {
+                                if (!parentMatches(mode, p, item.parent, item.handle)) continue;
+                            }
+                            try out.append(self.gpa, item);
                         },
                     }
                 }
@@ -646,16 +452,17 @@ pub const Socket = struct {
         }
     }
 
-    fn nextSeq(self: *Socket) u32 {
-        self.seq +%= 1;
-        if (self.seq == 0) self.seq = 1;
-        return self.seq;
-    }
-
-    fn send(self: *Socket, msg: []const u8) RequestError!void {
+    fn send(self: *Socket, msg: []const u8) DumpError!void {
         const dst: linux.sockaddr.nl = .{ .pid = 0, .groups = 0 };
         while (true) {
-            const rc = linux.sendto(self.fd, msg.ptr, msg.len, 0, @ptrCast(&dst), @sizeOf(linux.sockaddr.nl));
+            const rc = linux.sendto(
+                self.nl.fd,
+                msg.ptr,
+                msg.len,
+                0,
+                @ptrCast(&dst),
+                @sizeOf(linux.sockaddr.nl),
+            );
             switch (linux.errno(rc)) {
                 .SUCCESS => return,
                 .INTR => continue,
@@ -666,9 +473,18 @@ pub const Socket = struct {
         }
     }
 
-    fn recvDatagram(self: *Socket) RequestError![]const u8 {
+    fn recvDatagram(self: *Socket) DumpError![]const u8 {
         while (true) {
-            const prc = linux.recvfrom(self.fd, self.buf.ptr, self.buf.len, linux.MSG.PEEK | linux.MSG.TRUNC, null, null);
+            // MSG_PEEK|MSG_TRUNC reports the true datagram size without
+            // consuming it, so nothing is ever lost to truncation.
+            const prc = linux.recvfrom(
+                self.nl.fd,
+                self.buf.ptr,
+                self.buf.len,
+                linux.MSG.PEEK | linux.MSG.TRUNC,
+                null,
+                null,
+            );
             switch (linux.errno(prc)) {
                 .SUCCESS => {},
                 .INTR => continue,
@@ -684,159 +500,60 @@ pub const Socket = struct {
 
             var src: linux.sockaddr.nl = .{ .pid = 0, .groups = 0 };
             var slen: linux.socklen_t = @sizeOf(linux.sockaddr.nl);
-            const rc = linux.recvfrom(self.fd, self.buf.ptr, self.buf.len, 0, @ptrCast(&src), &slen);
+            const rc = linux.recvfrom(self.nl.fd, self.buf.ptr, self.buf.len, 0, @ptrCast(&src), &slen);
             switch (linux.errno(rc)) {
                 .SUCCESS => {},
                 .INTR => continue,
                 .NOBUFS, .NOMEM => return error.SystemResources,
                 else => return error.RecvFailed,
             }
-            if (slen >= @sizeOf(linux.sockaddr.nl) and src.pid != 0) continue; // not the kernel
+            // rtnetlink answers only ever come from the kernel, and any user
+            // process may address our port id.
+            if (slen >= @sizeOf(linux.sockaddr.nl) and src.pid != 0) continue;
             return self.buf[0..rc];
-        }
-    }
-
-    fn awaitAck(self: *Socket, seq: u32) RequestError!void {
-        while (true) {
-            const dgram = try self.recvDatagram();
-            var it: codec.MessageIterator = .{ .buf = dgram };
-            while (it.next() catch return error.MalformedReply) |m| {
-                if (m.pid != self.portid or m.seq != seq) continue;
-                if (m.type != codec.NLMSG_ERROR) continue;
-                const code = m.errorCode() catch return error.MalformedReply;
-                if (code == 0) return; // ACK
-                return errnoToError(code);
-            }
         }
     }
 };
 
-// ── offline tests: golden bytes + encode/decode round-trip + fuzz ──────────
+// ── tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
 
-test "percentToU32: range + rounding" {
-    try testing.expectEqual(@as(u32, 0), try percentToU32(0));
-    try testing.expectEqual(std.math.maxInt(u32), try percentToU32(100));
-    try testing.expectEqual(@as(u32, 42949673), try percentToU32(1.0));
-    try testing.expectEqual(@as(u32, 2147483648), try percentToU32(50.0)); // 0.5 * 2^32, exact
-    try testing.expectError(error.InvalidPercent, percentToU32(-0.1));
-    try testing.expectError(error.InvalidPercent, percentToU32(100.1));
-    try testing.expectError(error.InvalidPercent, percentToU32(std.math.nan(f64)));
-}
-
-test "wire constants agree with the kernel UAPI" {
+test "re-exports keep the v1 surface addressable" {
+    try testing.expectEqual(@as(u32, 0x00010000), netem_handle);
+    try testing.expectEqual(@as(u32, 0xFFFFFFFF), TC_H_ROOT);
     try testing.expectEqual(@as(u16, 36), RTM_NEWQDISC);
     try testing.expectEqual(@as(u16, 37), RTM_DELQDISC);
     try testing.expectEqual(@as(u16, 38), RTM_GETQDISC);
-    try testing.expectEqual(@as(u16, 1), TCA.KIND);
-    try testing.expectEqual(@as(u16, 2), TCA.OPTIONS);
-    try testing.expectEqual(@as(u16, 1), TCA_NETEM.CORR);
-    try testing.expectEqual(@as(u16, 3), TCA_NETEM.REORDER);
-    try testing.expectEqual(@as(u16, 4), TCA_NETEM.CORRUPT);
-    try testing.expectEqual(@as(u16, 6), TCA_NETEM.RATE);
-    try testing.expectEqual(@as(u16, 10), TCA_NETEM.LATENCY64);
-    try testing.expectEqual(@as(u16, 11), TCA_NETEM.JITTER64);
+    try testing.expectEqual(@as(usize, 20), tcmsg_len);
+    try testing.expectEqual(@as(usize, 24), tc_netem_qopt_len);
+    try testing.expectEqualStrings("netem", kind_netem);
+    try testing.expectEqual(@as(u32, 42949673), try percentToU32(1.0));
 }
 
-// Hand-verified golden bytes for `add(ifindex=5, delay 100ms/jitter 10ms/
-// loss 1%)`. Computed independently (byte-by-byte, see SPEC.md "Verification"
-// for the derivation) — this is the module's primary regression guard
-// against any drift in the tcmsg/qopt/attr encoding.
-test "golden: RTM_NEWQDISC add request bytes (delay + jitter + loss)" {
-    if (native_endian != .little) return error.SkipZigTest; // golden bytes are LE
-
-    const req = try buildSetRequest(
+test "netem v1 request shape is unchanged (root qdisc, handle 1:0)" {
+    const req = try message.buildQdiscSet(
         testing.allocator,
         1,
-        codec.NLM_F_REQUEST | codec.NLM_F_ACK | NLM_F_EXCL | NLM_F_CREATE,
-        5,
-        .{
-            .delay_ns = 100_000_000,
-            .jitter_ns = 10_000_000,
-            .loss_pct = 1.0,
-        },
+        .add,
+        .{ .ifindex = 5, .handle = Handle.fromRaw(netem_handle), .parent = Handle.root },
+        .{ .netem = .{ .delay_ns = 100 * std.time.ns_per_ms, .loss_pct = 1.0 } },
+        Psched.fallback,
     );
     defer testing.allocator.free(req);
-
-    const expected = [_]u8{
-        // nlmsghdr (16 B)
-        0x64, 0x00, 0x00, 0x00, // len = 100
-        0x24, 0x00, // type = RTM_NEWQDISC (36)
-        0x05, 0x06, // flags = REQUEST|ACK|EXCL|CREATE (0x0605)
-        0x01, 0x00, 0x00, 0x00, // seq = 1
-        0x00, 0x00, 0x00, 0x00, // pid = 0
-        // tcmsg (20 B)
-        0x00, 0x00, 0x00, 0x00, // family/pad1/pad2
-        0x05, 0x00, 0x00, 0x00, // ifindex = 5
-        0x00, 0x00, 0x01, 0x00, // handle = 1:0
-        0xff, 0xff, 0xff, 0xff, // parent = TC_H_ROOT
-        0x00, 0x00, 0x00, 0x00, // info
-        // TCA_KIND = "netem\0" + 2 pad (12 B)
-        0x0a, 0x00, 0x01, 0x00,
-        'n',  'e',  't',  'e',
-        'm',  0x00, 0x00, 0x00,
-        // TCA_OPTIONS, nested, len = 52 (4 + 48) (4 B header)
-        0x34, 0x00, 0x02, 0x80,
-        // tc_netem_qopt (24 B): latency=0, limit=1000, loss=42949673,
-        // gap=0, duplicate=0, jitter=0
-        0x00, 0x00, 0x00, 0x00,
-        0xe8, 0x03, 0x00, 0x00,
-        0x29, 0x5c, 0x8f, 0x02,
-        0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00,
-        // TCA_NETEM_LATENCY64 = 100_000_000 ns (12 B)
-        0x0c, 0x00, 0x0a, 0x00,
-        0x00, 0xe1, 0xf5, 0x05,
-        0x00, 0x00, 0x00, 0x00,
-        // TCA_NETEM_JITTER64 = 10_000_000 ns (12 B)
-        0x0c, 0x00, 0x0b, 0x00,
-        0x80, 0x96, 0x98, 0x00,
-        0x00, 0x00, 0x00, 0x00,
-    };
-    try testing.expectEqualSlices(u8, &expected, req);
+    var it: codec.MessageIterator = .{ .buf = req };
+    const m = (try it.next()).?;
+    try testing.expectEqual(RTM_NEWQDISC, m.type);
+    const q = try parseQdisc(m.payload);
+    try testing.expectEqual(@as(u32, 5), q.ifindex);
+    try testing.expectEqual(netem_handle, q.handle.raw);
+    try testing.expect(q.parent.isRoot());
+    try testing.expectEqualStrings("netem", q.kind());
+    try testing.expectEqual(@as(i64, 100 * std.time.ns_per_ms), q.netem.?.delay_ns);
+    try testing.expectEqual(try percentToU32(1.0), q.netem.?.loss);
 }
 
-test "golden: RTM_DELQDISC request bytes" {
-    if (native_endian != .little) return error.SkipZigTest;
-    const req = try buildDelRequest(testing.allocator, 7, 3);
-    defer testing.allocator.free(req);
-    const expected = [_]u8{
-        0x24, 0x00, 0x00, 0x00, // len = 36
-        0x25, 0x00, // type = RTM_DELQDISC (37)
-        0x05, 0x00, // flags = REQUEST|ACK
-        0x07, 0x00, 0x00, 0x00, // seq = 7
-        0x00, 0x00, 0x00, 0x00, // pid
-        0x00, 0x00, 0x00, 0x00, // family/pad1/pad2
-        0x03, 0x00, 0x00, 0x00, // ifindex = 3
-        0x00, 0x00, 0x01, 0x00, // handle = 1:0
-        0xff, 0xff, 0xff, 0xff, // parent = TC_H_ROOT
-        0x00, 0x00, 0x00, 0x00, // info
-    };
-    try testing.expectEqualSlices(u8, &expected, req);
-}
-
-test "golden: RTM_GETQDISC dump request bytes" {
-    if (native_endian != .little) return error.SkipZigTest;
-    const req = try buildDumpRequest(testing.allocator, 2, 9);
-    defer testing.allocator.free(req);
-    const expected = [_]u8{
-        0x24, 0x00, 0x00, 0x00, // len = 36
-        0x26, 0x00, // type = RTM_GETQDISC (38)
-        0x01, 0x03, // flags = REQUEST|DUMP (ROOT|MATCH)
-        0x02, 0x00, 0x00, 0x00, // seq = 2
-        0x00, 0x00, 0x00, 0x00, // pid
-        0x00, 0x00, 0x00, 0x00, // family/pad1/pad2
-        0x09, 0x00, 0x00, 0x00, // ifindex = 9 (courtesy filter)
-        0x00, 0x00, 0x00, 0x00, // handle = unspecific
-        0x00, 0x00, 0x00, 0x00, // parent = unspecific
-        0x00, 0x00, 0x00, 0x00, // info
-    };
-    try testing.expectEqualSlices(u8, &expected, req);
-}
-
-test "encode/decode round-trip: build an add request, parse it back like a kernel dump reply" {
+test "netem encode/decode round-trip through the full option set" {
     const netem: Netem = .{
         .limit = 500,
         .delay_ns = 50_000_000,
@@ -849,20 +566,19 @@ test "encode/decode round-trip: build an add request, parse it back like a kerne
         .reorder_correlation_pct = 50.0,
         .reorder_gap = 5,
         .corrupt_pct = 0.1,
-        .rate_bytes_per_sec = 125_000, // 1 Mbit/s
+        .rate_bytes_per_sec = 125_000,
     };
-    const req = try buildSetRequest(testing.allocator, 1, codec.NLM_F_REQUEST | codec.NLM_F_ACK, 42, netem);
+    const req = try message.buildQdiscSet(
+        testing.allocator,
+        1,
+        .add,
+        .{ .ifindex = 42, .handle = Handle.fromRaw(netem_handle) },
+        .{ .netem = netem },
+        Psched.fallback,
+    );
     defer testing.allocator.free(req);
 
-    // Skip the nlmsghdr; parseQdisc expects a message *payload* (tcmsg +
-    // attrs), matching what Socket.show hands to it from a real dump.
-    const payload = req[codec.header_len..];
-    const q = try parseQdisc(payload);
-    try testing.expectEqual(@as(u32, 42), q.ifindex);
-    try testing.expectEqual(netem_handle, q.handle);
-    try testing.expectEqual(TC_H_ROOT, q.parent);
-    try testing.expectEqualStrings("netem", q.kind());
-
+    const q = try parseQdisc(req[codec.header_len..]);
     const nw = q.netem.?;
     try testing.expectEqual(@as(u32, 500), nw.limit);
     try testing.expectEqual(@as(u32, 5), nw.gap);
@@ -878,71 +594,75 @@ test "encode/decode round-trip: build an add request, parse it back like a kerne
     try testing.expectEqual(@as(u32, 125_000), nw.rate_bytes_per_sec);
 }
 
-test "encode: zero-config netem omits every optional attribute" {
-    const req = try buildSetRequest(testing.allocator, 1, codec.NLM_F_REQUEST | codec.NLM_F_ACK, 1, .{});
+test "zero-config netem omits every optional attribute" {
+    const req = try message.buildQdiscSet(
+        testing.allocator,
+        1,
+        .add,
+        .{ .ifindex = 1, .handle = Handle.fromRaw(netem_handle) },
+        .{ .netem = .{} },
+        Psched.fallback,
+    );
     defer testing.allocator.free(req);
     // header(16) + tcmsg(20) + TCA_KIND(12) + TCA_OPTIONS hdr(4) + qopt(24)
     try testing.expectEqual(@as(usize, 16 + 20 + 12 + 4 + 24), req.len);
-
     const q = try parseQdisc(req[codec.header_len..]);
-    try testing.expectEqualStrings("netem", q.kind());
-    const nw = q.netem.?;
-    try testing.expectEqual(@as(u32, 1000), nw.limit); // Netem{} default
-    try testing.expectEqual(@as(u32, 0), nw.loss);
-    try testing.expectEqual(@as(i64, 0), nw.delay_ns);
-    try testing.expectEqual(@as(u32, 0), nw.rate_bytes_per_sec);
+    try testing.expectEqual(@as(u32, 1000), q.netem.?.limit); // Netem{} default
 }
 
-test "buildSetRequest rejects an out-of-range percent before allocating" {
-    try testing.expectError(error.InvalidPercent, buildSetRequest(
-        testing.allocator,
+test "netem input validation happens before any allocation" {
+    const gpa = testing.allocator;
+    const target: QdiscTarget = .{ .ifindex = 1 };
+    try testing.expectError(error.InvalidPercent, message.buildQdiscSet(
+        gpa,
         1,
-        codec.NLM_F_REQUEST,
-        1,
-        .{ .loss_pct = 150 },
+        .add,
+        target,
+        .{ .netem = .{ .loss_pct = 150 } },
+        Psched.fallback,
     ));
-}
-
-test "buildSetRequest rejects out-of-range delay/jitter before allocating" {
-    // ns > maxInt(i64) must never reach the @intCast — would panic under
-    // ReleaseSafe / wrap to a negative LATENCY64 under ReleaseFast.
     const too_big: u64 = @as(u64, std.math.maxInt(i64)) + 1;
-    try testing.expectError(error.InvalidDelay, buildSetRequest(
-        testing.allocator,
+    try testing.expectError(error.InvalidDelay, message.buildQdiscSet(
+        gpa,
         1,
-        codec.NLM_F_REQUEST,
-        1,
-        .{ .delay_ns = too_big },
+        .add,
+        target,
+        .{ .netem = .{ .delay_ns = too_big } },
+        Psched.fallback,
     ));
-    try testing.expectError(error.InvalidDelay, buildSetRequest(
-        testing.allocator,
+    try testing.expectError(error.InvalidDelay, message.buildQdiscSet(
+        gpa,
         1,
-        codec.NLM_F_REQUEST,
-        1,
-        .{ .jitter_ns = too_big },
+        .add,
+        target,
+        .{ .netem = .{ .jitter_ns = too_big } },
+        Psched.fallback,
     ));
-    // A normal value must still build fine (max representable i64 is legal).
-    const req = try buildSetRequest(
-        testing.allocator,
+    // maxInt(i64) is still legal.
+    const ok = try message.buildQdiscSet(
+        gpa,
         1,
-        codec.NLM_F_REQUEST,
-        1,
-        .{ .delay_ns = @intCast(std.math.maxInt(i64)), .jitter_ns = 10_000_000 },
+        .add,
+        target,
+        .{ .netem = .{ .delay_ns = std.math.maxInt(i64), .jitter_ns = 10_000_000 } },
+        Psched.fallback,
     );
-    testing.allocator.free(req);
+    gpa.free(ok);
 }
 
-test "errnoToError maps NLMSG_ERROR errnos" {
-    try testing.expectEqual(error.AccessDenied, errnoToError(-@as(i32, @intFromEnum(linux.E.PERM))));
-    try testing.expectEqual(error.Exists, errnoToError(-@as(i32, @intFromEnum(linux.E.EXIST))));
-    try testing.expectEqual(error.NotFound, errnoToError(-@as(i32, @intFromEnum(linux.E.NOENT))));
-    try testing.expectEqual(error.NoSuchDevice, errnoToError(-@as(i32, @intFromEnum(linux.E.NODEV))));
-    try testing.expectEqual(error.InvalidRequest, errnoToError(-@as(i32, @intFromEnum(linux.E.INVAL))));
-    try testing.expectEqual(error.NotSupported, errnoToError(-@as(i32, @intFromEnum(linux.E.OPNOTSUPP))));
-    try testing.expectEqual(error.SystemResources, errnoToError(-@as(i32, @intFromEnum(linux.E.NOBUFS))));
-    try testing.expectEqual(error.Unexpected, errnoToError(-9999));
-    try testing.expectEqual(error.Unexpected, errnoToError(0));
-    try testing.expectEqual(error.Unexpected, errnoToError(std.math.minInt(i32)));
+test "errno mapping is netlink's (the tc-local copy is gone)" {
+    // The v1 module carried its own errnoToError; the shared one must keep
+    // the exact same mappings for every code tc can provoke.
+    try testing.expectEqual(error.AccessDenied, netlink.writeErrorFromCode(-@as(i32, @intFromEnum(linux.E.PERM))));
+    try testing.expectEqual(error.Exists, netlink.writeErrorFromCode(-@as(i32, @intFromEnum(linux.E.EXIST))));
+    try testing.expectEqual(error.NotFound, netlink.writeErrorFromCode(-@as(i32, @intFromEnum(linux.E.NOENT))));
+    try testing.expectEqual(error.NoSuchDevice, netlink.writeErrorFromCode(-@as(i32, @intFromEnum(linux.E.NODEV))));
+    try testing.expectEqual(error.InvalidRequest, netlink.writeErrorFromCode(-@as(i32, @intFromEnum(linux.E.INVAL))));
+    try testing.expectEqual(error.NotSupported, netlink.writeErrorFromCode(-@as(i32, @intFromEnum(linux.E.OPNOTSUPP))));
+    try testing.expectEqual(error.SystemResources, netlink.writeErrorFromCode(-@as(i32, @intFromEnum(linux.E.NOBUFS))));
+    try testing.expectEqual(error.Unexpected, netlink.writeErrorFromCode(-9999));
+    try testing.expectEqual(error.Unexpected, netlink.writeErrorFromCode(0));
+    try testing.expectEqual(error.Unexpected, netlink.writeErrorFromCode(std.math.minInt(i32)));
 }
 
 test "fuzz: parseQdisc never crashes on arbitrary payloads" {
@@ -958,52 +678,66 @@ fn fuzzParseQdisc(_: void, smith: *std.testing.Smith) !void {
 
 // ── integration tests (real kernel, live netns round-trip) ──────────────────
 //
-// Both write ops (add/change/del) need CAP_NET_ADMIN; `show` does not. Run
-// unprivileged under a network namespace to touch no host state:
+// Every write op needs CAP_NET_ADMIN; the dumps do not. Run unprivileged
+// under a network namespace to touch no host state:
 //
 //     unshare -rn zig build test-tc
 //
-// Without the capability, `Socket.add`/`.change`/`.del` return
-// error.AccessDenied and the test returns error.SkipZigTest — the repo's
-// env-gated pattern (see `netlink`/`wireguard`/`rawsock`).
+// Without the capability the write ops return error.AccessDenied and each
+// test prints `SKIPPED: …` and passes — the repo's env-gated pattern (see
+// `netlink`/`wireguard`/`rawsock`).
+
+fn skip(comptime what: []const u8) error{SkipZigTest} {
+    std.debug.print("SKIPPED: {s} (needs CAP_NET_ADMIN in a netns: `unshare -rn zig build test-tc`)\n", .{what});
+    return error.SkipZigTest;
+}
 
 fn openOrSkip() !Socket {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
-    return Socket.open(testing.allocator) catch return error.SkipZigTest;
+    return Socket.open(testing.allocator) catch return skip("tc.Socket.open");
 }
 
-test "integration: show() on lo needs no privilege and reports a qdisc" {
+/// The ifindex of `lo`, via the sibling netlink module — brought admin-up on
+/// the way, because a fresh `unshare -rn` namespace starts with `lo` DOWN and
+/// the kernel reports **no qdisc at all** for a down interface. On a host
+/// where `lo` is already up (and we have no privileges) the admin-up fails
+/// harmlessly.
+fn loIndex(sock: *Socket) !u32 {
+    const links = sock.nl.links() catch return skip("RTM_GETLINK dump");
+    defer testing.allocator.free(links);
+    for (links) |l| {
+        if (!std.mem.eql(u8, l.name(), "lo")) continue;
+        sock.nl.linkUp(l.index) catch {};
+        return l.index;
+    }
+    return skip("no `lo` interface");
+}
+
+test "integration: qdiscs() on lo needs no privilege and reports a root qdisc" {
     var sock = try openOrSkip();
     defer sock.close();
-    var nl = netlink.Socket.open(testing.allocator) catch return error.SkipZigTest;
-    defer nl.close();
-    const links = nl.links() catch return error.SkipZigTest;
-    defer testing.allocator.free(links);
-    const lo = for (links) |l| {
-        if (std.mem.eql(u8, l.name(), "lo")) break l.index;
-    } else return error.SkipZigTest;
+    const lo = try loIndex(&sock);
 
-    const q = (sock.show(lo) catch |e| switch (e) {
-        error.AccessDenied => return error.SkipZigTest,
+    const list = sock.qdiscs(lo) catch |e| switch (e) {
+        error.AccessDenied => return skip("RTM_GETQDISC dump"),
         else => return e,
-    }) orelse return error.SkipZigTest;
-    try testing.expectEqual(lo, q.ifindex);
-    try testing.expect(q.kind().len > 0); // "noqueue" by default on lo
+    };
+    defer testing.allocator.free(list);
+    // A down interface has no qdisc at all; `loIndex` brings `lo` up when it
+    // can, so an empty list here means we are unprivileged in a fresh netns.
+    if (list.len == 0) return skip("lo has no qdisc (interface is down)");
+    for (list) |q| {
+        try testing.expectEqual(lo, q.ifindex);
+        try testing.expect(q.kind().len > 0); // "noqueue" by default on lo
+    }
 }
 
-test "integration (netns/root): add + show + change + show + del + show round-trip on lo" {
+test "integration (netns/root): netem v1 add + show + change + del round-trip" {
     var sock = try openOrSkip();
     defer sock.close();
-    var nl = netlink.Socket.open(testing.allocator) catch return error.SkipZigTest;
-    defer nl.close();
-    const links = nl.links() catch return error.SkipZigTest;
-    defer testing.allocator.free(links);
-    const lo = for (links) |l| {
-        if (std.mem.eql(u8, l.name(), "lo")) break l.index;
-    } else return error.SkipZigTest;
+    const lo = try loIndex(&sock);
 
-    // Best-effort cleanup in case a previous aborted run left a qdisc
-    // attached (harmless if there is none: del maps ENOENT to NotFound).
+    // Best-effort cleanup after an aborted earlier run.
     sock.del(lo) catch {};
 
     const netem1: Netem = .{
@@ -1012,7 +746,7 @@ test "integration (netns/root): add + show + change + show + del + show round-tr
         .loss_pct = 1.0,
     };
     sock.add(lo, netem1) catch |e| switch (e) {
-        error.AccessDenied => return error.SkipZigTest, // no CAP_NET_ADMIN
+        error.AccessDenied => return skip("netem qdisc add"),
         else => return e,
     };
     defer sock.del(lo) catch {};
@@ -1026,20 +760,17 @@ test "integration (netns/root): add + show + change + show + del + show round-tr
         try testing.expectEqual(try percentToU32(1.0), nw.loss);
     }
 
-    // change(): replace with a different config, still root, still netem.
-    const netem2: Netem = .{ .delay_ns = 20 * std.time.ns_per_ms, .duplicate_pct = 5.0 };
-    try sock.change(lo, netem2);
+    try sock.change(lo, .{ .delay_ns = 20 * std.time.ns_per_ms, .duplicate_pct = 5.0 });
     {
         const q = (try sock.show(lo)).?;
         try testing.expectEqualStrings("netem", q.kind());
         const nw = q.netem.?;
         try testing.expectEqual(@as(i64, 20 * std.time.ns_per_ms), nw.delay_ns);
-        try testing.expectEqual(@as(i64, 0), nw.jitter_ns); // netem2 has none
+        try testing.expectEqual(@as(i64, 0), nw.jitter_ns);
         try testing.expectEqual(try percentToU32(5.0), nw.duplicate);
-        try testing.expectEqual(@as(u32, 0), nw.loss); // netem2 has none
+        try testing.expectEqual(@as(u32, 0), nw.loss);
     }
 
-    // del(): back to whatever default qdisc the kernel assigns lo.
     try sock.del(lo);
     {
         const q = (try sock.show(lo)).?;
@@ -1047,7 +778,228 @@ test "integration (netns/root): add + show + change + show + del + show round-tr
     }
 }
 
+test "integration (netns/root): htb qdisc + classes + u32/flower filters + dumps" {
+    var sock = try openOrSkip();
+    defer sock.close();
+    const lo = try loIndex(&sock);
+
+    const one: Handle = .init(1, 0);
+    const leaf: Handle = .init(1, 0x10);
+    const leaf2: Handle = .init(1, 0x20);
+
+    sock.qdiscDel(.{ .ifindex = lo, .parent = Handle.root }) catch {};
+
+    sock.qdiscAdd(
+        .{ .ifindex = lo, .handle = one, .parent = Handle.root },
+        .{ .htb = .{ .defcls = 0x10 } },
+    ) catch |e| switch (e) {
+        error.AccessDenied => return skip("htb qdisc add"),
+        else => return e,
+    };
+    defer sock.qdiscDel(.{ .ifindex = lo, .parent = Handle.root }) catch {};
+
+    // The qdisc came back with the kind and handle we asked for.
+    {
+        const list = try sock.qdiscs(lo);
+        defer testing.allocator.free(list);
+        var seen = false;
+        for (list) |q| {
+            if (q.handle.raw != one.raw) continue;
+            seen = true;
+            try testing.expectEqualStrings("htb", q.kind());
+            const h = q.htb.?;
+            // The kernel dumps its full `HTB_VER` (0x30011); only the high
+            // half is the protocol version tc sends (3).
+            try testing.expectEqual(@as(u32, 3), h.version >> 16);
+            try testing.expectEqual(@as(u32, 0x10), h.defcls);
+        }
+        try testing.expect(seen);
+    }
+
+    // Two classes: a 32-bit rate and one that needs TCA_HTB_RATE64.
+    try sock.classAdd(
+        .{ .ifindex = lo, .handle = leaf, .parent = one },
+        .{ .htb = .{ .rate = 125_000, .ceil = 250_000 } },
+    );
+    try sock.classAdd(
+        .{ .ifindex = lo, .handle = leaf2, .parent = one },
+        .{ .htb = .{ .rate = 5_000_000_000, .ceil = 10_000_000_000 } },
+    );
+
+    {
+        const list = try sock.classes(lo, one);
+        defer testing.allocator.free(list);
+        try testing.expectEqual(@as(usize, 2), list.len);
+        for (list) |c| {
+            try testing.expectEqualStrings("htb", c.kind());
+            // htb (like every classful qdisc) reports TC_H_ROOT as the parent
+            // of a top-level class, not the qdisc handle — which is exactly
+            // why `classes()` scopes by the class id's major instead.
+            try testing.expect(c.parent.isRoot());
+            try testing.expectEqual(one.major(), c.handle.major());
+            const h = c.htb.?;
+            if (c.handle.raw == leaf.raw) {
+                try testing.expectEqual(@as(u64, 125_000), h.rate64);
+                try testing.expectEqual(@as(u64, 250_000), h.ceil64);
+            } else {
+                try testing.expectEqual(leaf2.raw, c.handle.raw);
+                // The kernel echoes the 64-bit rate back through RATE64.
+                try testing.expectEqual(@as(u64, 5_000_000_000), h.rate64);
+                try testing.expectEqual(@as(u64, 10_000_000_000), h.ceil64);
+            }
+        }
+    }
+
+    // A leaf qdisc under a class (parent = the class handle).
+    try sock.qdiscAdd(
+        .{ .ifindex = lo, .handle = .init(0x20, 0), .parent = leaf },
+        .{ .fq_codel = .{ .limit = 1200, .target_us = 5_000 } },
+    );
+    {
+        const list = try sock.qdiscs(lo);
+        defer testing.allocator.free(list);
+        var seen = false;
+        for (list) |q| {
+            if (!std.mem.eql(u8, q.kind(), "fq_codel")) continue;
+            seen = true;
+            try testing.expectEqual(leaf.raw, q.parent.raw);
+            try testing.expectEqual(@as(?u32, 1200), q.fq_codel.?.limit);
+        }
+        try testing.expect(seen);
+    }
+
+    // u32 + flower filters at two priorities.
+    const keys = [_]U32Key{U32Key.ipv4Dst(.{ 10, 0, 0, 1 }, 32)};
+    try sock.filterAdd(
+        .{ .ifindex = lo, .parent = one, .prio = 1, .eth_type = ETH_P.IP },
+        .{ .u32 = .{ .classid = leaf, .keys = &keys } },
+    );
+    try sock.filterAdd(
+        .{ .ifindex = lo, .parent = one, .prio = 2, .eth_type = ETH_P.IP },
+        .{ .flower = .{
+            .eth_type = ETH_P.IP,
+            .ip_proto = IPPROTO.TCP,
+            .ipv4_dst = .{ .addr = .{ 10, 0, 0, 0 }, .prefix_len = 24 },
+            .dst_port = 80,
+            .classid = leaf2,
+        } },
+    );
+
+    {
+        const list = try sock.filters(lo, one);
+        defer testing.allocator.free(list);
+        var saw_u32 = false;
+        var saw_flower = false;
+        for (list) |f| {
+            try testing.expectEqual(one.raw, f.parent.raw);
+            // A dump also carries bookkeeping entries with no classid: a bare
+            // per-(chain, protocol, prio) header for every classifier, plus
+            // u32's auto-created hash table. Only the real filters carry the
+            // class they select.
+            if (f.classid() == null) continue;
+            if (std.mem.eql(u8, f.kind(), "u32")) {
+                saw_u32 = true;
+                try testing.expectEqual(@as(u16, 1), f.prio);
+                try testing.expectEqual(ETH_P.IP, f.eth_type);
+                try testing.expectEqual(leaf.raw, f.classid().?.raw);
+                const u = f.u32_sel.?;
+                try testing.expectEqual(@as(u8, 1), u.nkeys);
+                try testing.expectEqual(@as(i32, 16), u.keys[0].off);
+                try testing.expectEqualSlices(u8, &.{ 10, 0, 0, 1 }, &u.keys[0].val);
+            } else if (std.mem.eql(u8, f.kind(), "flower")) {
+                saw_flower = true;
+                try testing.expectEqual(@as(u16, 2), f.prio);
+                try testing.expectEqual(ETH_P.IP, f.eth_type);
+                try testing.expectEqual(leaf2.raw, f.classid().?.raw);
+                const fl = f.flower.?;
+                try testing.expectEqual(IPPROTO.TCP, fl.ip_proto.?);
+                try testing.expectEqual(@as(u16, 80), fl.dst_port.?);
+                try testing.expectEqualSlices(u8, &.{ 255, 255, 255, 0 }, &fl.ipv4_dst_mask.?);
+            }
+        }
+        try testing.expect(saw_u32);
+        try testing.expect(saw_flower);
+    }
+
+    // Delete the flower filter, then a class, and watch both disappear.
+    try sock.filterDel(
+        .{ .ifindex = lo, .parent = one, .prio = 2, .eth_type = ETH_P.IP },
+        null,
+    );
+    {
+        const list = try sock.filters(lo, one);
+        defer testing.allocator.free(list);
+        for (list) |f| try testing.expect(!std.mem.eql(u8, f.kind(), "flower"));
+    }
+
+    try sock.classDel(.{ .ifindex = lo, .handle = leaf2, .parent = Handle.unspec });
+    {
+        const list = try sock.classes(lo, one);
+        defer testing.allocator.free(list);
+        for (list) |c| try testing.expect(c.handle.raw != leaf2.raw);
+    }
+}
+
+test "integration (netns/root): tbf shaping qdisc round-trip" {
+    var sock = try openOrSkip();
+    defer sock.close();
+    const lo = try loIndex(&sock);
+
+    sock.qdiscDel(.{ .ifindex = lo, .parent = Handle.root }) catch {};
+    sock.qdiscAdd(
+        .{ .ifindex = lo, .handle = .init(5, 0), .parent = Handle.root },
+        .{ .tbf = .{ .rate = 125_000, .burst = 4096, .latency_us = 400_000 } },
+    ) catch |e| switch (e) {
+        error.AccessDenied => return skip("tbf qdisc add"),
+        else => return e,
+    };
+    defer sock.qdiscDel(.{ .ifindex = lo, .parent = Handle.root }) catch {};
+
+    const list = try sock.qdiscs(lo);
+    defer testing.allocator.free(list);
+    var seen = false;
+    for (list) |q| {
+        if (!std.mem.eql(u8, q.kind(), "tbf")) continue;
+        seen = true;
+        const t = q.tbf.?;
+        try testing.expectEqual(@as(u32, 125_000), t.rate.rate);
+        try testing.expectEqual(@as(u32, 54_096), t.limit); // rate*latency + burst
+    }
+    try testing.expect(seen);
+}
+
+test "integration (netns/root): the kernel's extended ACK reaches lastErrorMessage" {
+    var sock = try openOrSkip();
+    defer sock.close();
+    const lo = try loIndex(&sock);
+
+    sock.qdiscDel(.{ .ifindex = lo, .parent = Handle.root }) catch {};
+    // A qdisc kind no kernel has.
+    const err = sock.qdiscAdd(
+        .{ .ifindex = lo, .handle = .init(9, 0), .parent = Handle.root },
+        .{ .raw = .{ .kind = "definitely_not_a_qdisc" } },
+    );
+    if (err) |_| {
+        sock.qdiscDel(.{ .ifindex = lo, .parent = Handle.root }) catch {};
+        return error.TestUnexpectedResult;
+    } else |e| switch (e) {
+        error.AccessDenied => return skip("qdisc add (ext-ACK probe)"),
+        // ENOENT is what the kernel answers for an unknown qdisc kind.
+        error.NotFound, error.InvalidRequest, error.NotSupported => {},
+        else => return e,
+    }
+    // Kernels since 4.12 attach a reason string; older ones legitimately do
+    // not, so only its shape is asserted.
+    try testing.expect(sock.lastErrorMessage().len < 256);
+}
+
 test {
-    // dark-tests aggregator: this file is the whole module (single
-    // src/root.zig), so nothing else to pull in.
+    // dark-tests aggregator: a bare `pub const x = @import(…)` re-export does
+    // not pull x's tests into the test binary.
+    _ = handle;
+    _ = ratespec;
+    _ = qdisc;
+    _ = filter;
+    _ = message;
+    _ = @import("goldens.zig");
 }

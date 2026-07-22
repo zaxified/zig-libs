@@ -311,12 +311,21 @@ project git history).
                by `netlink`/`wireguard`: it explicitly permits userspace of
                ANY license to use these headers to interface with the
                kernel, which is why this module is cleanly MIT despite
-               citing GPL-2.0 headers. No third-party implementation
-               (iproute2 or otherwise) was consulted as a design
-               reference — the kernel headers were sufficient, and
-               rtnetlink attribute parsing is order-independent by
-               construction, so this module's own attribute-emission
-               order carries no external compatibility requirement.
+               citing GPL-2.0 headers. The v1 (netem-only) client needed
+               no third-party design reference; the v2 classful/filter
+               work does. design ref: iproute2 (GPL-2.0-or-later) —
+               tc/tc_core.c (tc_calc_xmittime, tc_calc_rtable,
+               tc_core_init), tc/q_htb.c, tc/q_tbf.c, tc/q_fq_codel.c,
+               tc/f_u32.c, tc/tc_class.c, tc/tc_filter.c and
+               lib/utils.c (__get_hz) were consulted as a BEHAVIOUR
+               reference for the psched rate-table arithmetic, the
+               default burst/buffer formulas, attribute emission order
+               and the client-side dump-filter rules. No source was
+               copied: the algorithms are re-derived and re-expressed
+               (the rate tables are evaluated exactly in u128 rather
+               than iproute2's platform-dependent double), and the
+               byte-exact goldens captured from a real tc binary are
+               the independent check that the behaviour matches.
 
   traceroute — clean-room from the classic traceroute(8)/mtr ICMP method
                (Van Jacobson's TTL-stepping, a public technique) + RFC 792
