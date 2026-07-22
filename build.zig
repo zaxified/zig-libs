@@ -102,6 +102,7 @@ const module_list = [_]Module{
     .{ .name = "rdap", .deps = &.{ "http", "netaddr" } },
     .{ .name = "blobstore", .deps = &.{"hashdigest"} },
     .{ .name = "procnet", .deps = &.{"netaddr"} },
+    .{ .name = "conntrack", .deps = &.{ "netlink", "netaddr" } },
     .{ .name = "procrun", .deps = &.{"argsafe"} },
     .{ .name = "dataset" },
     .{ .name = "tabular", .deps = &.{"dataset"} },
