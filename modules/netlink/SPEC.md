@@ -70,6 +70,60 @@ yields an empty message, never an over-read. Requests are validated *before* any
 The write+ACK engine is public (`Socket.nextSeq` + `Socket.requestAck`) so sibling modules can send
 their own hand-built rtnetlink messages through the same socket discipline.
 
+## Bridges (AF_BRIDGE) — `src/bridge.zig`
+Bridge support is a pure builder/parser layer on the existing engine: nothing about sending, ACK
+handling, extended ACKs or dump assembly is duplicated. Three message shapes, each with its own
+family discipline — the usual source of `EINVAL` when hand-rolled:
+
+**Device lifecycle.** `bridgeAdd` sends `RTM_NEWLINK` with
+`IFLA_LINKINFO{ IFLA_INFO_KIND = "bridge", IFLA_INFO_DATA{ IFLA_BR_* } }`; the encoded options are
+`FORWARD_DELAY`(u32), `AGEING_TIME`(u32), `STP_STATE`(u32), `PRIORITY`(u16), `VLAN_FILTERING`(u8)
+and `VLAN_PROTOCOL`(**big-endian** u16), emitted in ascending attribute order — the order
+`ip link add … type bridge` produces when its arguments are given in that order. With no option set
+at all, `IFLA_INFO_DATA` is omitted entirely. Deletion is the existing `linkDel`. Enslaving is
+`IFLA_MASTER` on the ordinary (AF_UNSPEC) `RTM_NEWLINK` link-set path — `LinkChange.master`, exposed
+as `portEnslave`/`portRelease`; `master = 0` is `nomaster` and deliberately does *not* trip the
+`NothingToChange` guard.
+
+**FDB.** `RTM_NEWNEIGH`/`RTM_DELNEIGH`/`RTM_GETNEIGH` with `ndm_family = AF_BRIDGE`.
+`FdbSpec` carries `NDA_LLADDR`, `NDA_DST`, `NDA_VLAN`, `NDA_PORT` (big-endian, VXLAN UDP),
+`NDA_VNI` and `NDA_MASTER`, emitted in iproute2's `fdb_modify` order; `ndm_state` (NUD_\*) and
+`ndm_flags` (`NTF_SELF` = the device's own FDB vs `NTF_MASTER` = the bridge's, `| NTF_EXT_LEARNED`
+for controller-installed entries) are explicit. The defaults reproduce
+`bridge fdb add <mac> dev <port> master` (`NUD_PERMANENT|NUD_NOARP`, `NTF_MASTER`); iproute2's
+`static` keyword is `NUD_REACHABLE|NUD_NOARP`. The dump is a plain 12-byte `ndmsg` with the family
+byte set — *not* the legacy `ifinfomsg` form (the kernel's `rtnl_fdb_dump` accepts both; modern
+iproute2 sends `ndmsg`, and so does this module). Both `ndm_ifindex` and `NDA_MASTER` filter
+kernel-side. `parseFdb` returns `null` for a non-AF_BRIDGE entry, so an ordinary ARP/NDP neighbour
+in the same buffer is never mistaken for an FDB entry.
+
+**VLAN filtering.** `RTM_SETLINK` (add) / `RTM_DELLINK` (remove) with `ifi_family = AF_BRIDGE` and a
+nested `IFLA_AF_SPEC` containing an optional `IFLA_BRIDGE_FLAGS` (u16 `SELF`/`MASTER`) plus one or
+two `IFLA_BRIDGE_VLAN_INFO` = `struct bridge_vlan_info { u16 flags; u16 vid; }`. Neither `self` nor
+`master` set ⇒ **no** `IFLA_BRIDGE_FLAGS` attribute at all, which is the kernel default and exactly
+what `bridge vlan add dev <port>` sends. A VID **range** is two entries flagged
+`RANGE_BEGIN`/`RANGE_END`; the decoder collapses the pair back into a single `VlanEntry`
+(`vid..vid_end`) with the range bookkeeping bits stripped. Specs are validated before any syscall:
+VID ∈ 1..4094 (`InvalidVlanId`), ascending range and never a PVID range, `self`+`master` mutually
+exclusive (`InvalidVlanRange`). The dump is `RTM_GETLINK` + `ifinfomsg{AF_BRIDGE}` +
+`IFLA_EXT_MASK = RTEXT_FILTER_BRVLAN`; `Filter.ifindex` scopes it client-side.
+
+**Bridge-port options.** `RTM_SETLINK` with `ifi_family = AF_BRIDGE` and `IFLA_PROTINFO` — the one
+rtnetlink nest iproute2 *does* set `NLA_F_NESTED` on, and the encoder matches it byte-for-byte.
+`BrportChange` covers `STATE`, `LEARNING`, `UNICAST_FLOOD`, `ISOLATED` plus `GUARD`, `FAST_LEAVE`,
+`PROTECT`, `MODE` (hairpin), `PRIORITY`, `COST`, `MCAST_FLOOD`, `BCAST_FLOOD` and
+`NEIGH_SUPPRESS`; attributes are emitted in iproute2's `bridge link set` order (flood → learning →
+state → isolated for the golden-covered subset), and an empty change is `NothingToChange`. Reading
+port state back needs `RTM_GETLINK` with `ifi_family = AF_BRIDGE`: a plain AF_UNSPEC link dump
+(`ip link show`) carries no `IFLA_PROTINFO`, which was verified on a live kernel.
+
+**Error mapping** is unchanged and shared — the bridge ops add only `InvalidVlanId`/
+`InvalidVlanRange` to the *build* side, in a separate `bridge.BuildError`/`bridge.WriteError` so the
+existing `BuildError`/`WriteError` sets stay byte-for-byte compatible for sibling modules. One
+kernel errno is deliberately left unmapped: `ENETDOWN` (moving a carrier-down port to
+`BR_STATE_FORWARDING`) surfaces as `error.Unexpected`, because widening the shared
+`writeErrorFromCode` table would change a public error set other modules compose with.
+
 ## Provenance / licensing
 The kernel UAPI headers this module cites are GPL-2.0, but that does not make the module a GPL
 derivative: only uncopyrightable ABI facts are taken from them (numeric constants, struct layouts),
@@ -77,17 +131,30 @@ and separately, those headers carry the **Linux-syscall-note** exception, which 
 userspace of any license to use them to interface with the kernel. No kernel or libmnl (LGPL-2.1)
 source was consulted or copied; the codec is an original pure-Zig implementation. Full attribution
 in /NOTICE. The golden request bytes in the tests were captured from iproute2's own traffic with
-`strace` (observed wire bytes = ABI facts, no iproute2 code involved).
+`strace` and with an `nlmon` + `tcpdump` netlink tap (observed wire bytes = ABI facts, no iproute2
+code involved).
 
 ## Threat model / out of scope
 The untrusted input is the kernel's reply bytes; the codec treats them as hostile and is fuzzed
 accordingly. Unprivileged: RTM_GET\* dumps need no root; writes need CAP_NET_ADMIN. Out of scope
 (deliberate, additive extension points): multicast event monitoring (RTNLGRP_\* subscription —
 still unbuilt), qdiscs/classes/filters (the sibling `tc` module; classful qdiscs = a separate
-task), conntrack (`NETLINK_NETFILTER`, separate module), bridge/FDB and VLAN filtering
-(`RTM_*NEIGH` with `NTF_SELF`/`AF_BRIDGE`, `RTM_*VLAN`), policy routing (`RTM_*RULE`, `RTA_SRC`,
-tos), `IFLA_INFO_DATA` payloads for kind-specific link parameters (veth peers, VLAN ids, bridge
-options) and multipath routes (`RTA_MULTIPATH`).
+task), conntrack (`NETLINK_NETFILTER`, separate module), policy routing (`RTM_*RULE`, `RTA_SRC`,
+tos), `IFLA_INFO_DATA` payloads for kind-specific link parameters *other than* bridge (veth peers,
+VLAN ids, VXLAN) and multipath routes (`RTA_MULTIPATH`).
+
+**Deferred inside the bridge surface** (honest list — all reachable through the public codec +
+`nextSeq`/`requestAck` if needed before they are built): MDB / IGMP-MLD multicast snooping
+(`RTM_NEWMDB`/`DELMDB`/`GETMDB`, `MDBA_*`) and the bridge's own multicast options
+(`IFLA_BR_MCAST_*`); VXLAN link creation and its `IFLA_VXLAN_*` `IFLA_INFO_DATA` (FDB entries
+*pointing at* a VXLAN remote are supported — `NDA_DST`/`NDA_VNI`/`NDA_PORT` — but creating the
+device is not); VLAN tunnel mapping (`IFLA_BRIDGE_VLAN_TUNNEL_INFO`); per-VLAN options and stats
+(`BRIDGE_VLANDB_*`, `IFLA_BR_VLAN_STATS_ENABLED`, `RTEXT_FILTER_BRVLAN_COMPRESSED` — the dump
+decoder *handles* compressed ranges, but the request always asks for the uncompressed form);
+MRP, CFM and MST (`IFLA_BRIDGE_MRP`/`_CFM`/`_MST`); bridge-port backup port
+(`IFLA_BRPORT_BACKUP_PORT`), `IFLA_BRPORT_FLUSH` and the read-only STP timers/ids; and reading the
+bridge device's own `IFLA_BR_*` options back out of a link dump (only the port-side
+`IFLA_PROTINFO` block is decoded). `ENETDOWN` is unmapped, see above.
 
 ## Verification
 Offline unit tests over canned payloads built by the codec's own encoders: per-type parse
@@ -102,7 +169,35 @@ against the UAPI structs: `ip addr add 10.11.12.1/24 dev lo` (40 B), `ip route a
 lo scope link` (44 B), `ip route add 10.98.0.0/24 via 10.11.12.9 dev lo` (52 B), `ip link set lo up`
 (32 B, `ifi_change = IFF_UP`), `ip link add name zdum0 type dummy` (60 B, nested LINKINFO), `ip link
 del zdum0` (32 B), `ip neigh add 10.11.12.55 lladdr de:ad:be:ef:00:01 dev lo nud permanent` (48 B),
-plus the delete forms and the `ifi_change`-mask cases. Linux integration tests (skipped only if the
+plus the delete forms and the `ifi_change`-mask cases.
+
+**Bridge goldens** were captured the more direct way — an `nlmon` tap inside the namespace
+(`unshare -rn bash -c 'ip link add nlmon0 type nlmon; ip link set nlmon0 up; tcpdump -i nlmon0
+-Z root -w cap.pcap -U -s0 & …'`), which records the raw datagrams rather than strace's decoded
+rendering (`DLT_NETLINK`: a 16-byte Linux cooked header, then the `nlmsghdr`); the
+`strace -f -e trace=sendmsg -xx -s 400` form yields the same fields. Every builder's output was
+diffed byte-for-byte (nlmsg_seq masked) against the capture — **23/23 identical**. Commands
+covered, each cited in its test: `ip link add name br0 type bridge forward_delay 100 ageing_time
+20000 stp_state 1 priority 4096 vlan_filtering 1` (100 B) and its minimal `vlan_filtering 1` form
+(68 B) and bare form (56 B, no `IFLA_INFO_DATA`); `ip link set dev veth0 master br0` (40 B) and
+`… nomaster`; `bridge fdb add 02:00:00:00:00:01 dev veth0 master static vlan 10` (48 B),
+`bridge fdb del …` (48 B, `NUD_PERMANENT|NUD_NOARP`), `bridge fdb add … self static` (40 B),
+`… master extern_learn` (40 B, `NTF_MASTER|NTF_EXT_LEARNED`), `bridge fdb append …` (40 B,
+`NLM_F_CREATE|NLM_F_APPEND`); `bridge fdb show` (28 B), `bridge fdb show dev veth0` (28 B,
+`ndm_ifindex`), `bridge fdb show br br0` (36 B, `NDA_MASTER`); `bridge vlan add dev veth0 vid 10
+pvid untagged` (44 B), `… vid 30 untagged` (44 B), `… vid 100-200` (52 B, RANGE_BEGIN/END),
+`bridge vlan add dev br0 vid 20 self` (52 B, `IFLA_BRIDGE_FLAGS`) and the three matching
+`bridge vlan del` forms; `bridge vlan show` (40 B, `IFLA_EXT_MASK`); `bridge link show` (32 B,
+`ifi_family = AF_BRIDGE`); `bridge link set dev veth0 state 3 learning off flood off isolated on`
+(68 B, `IFLA_PROTINFO|NLA_F_NESTED`) and the two-attribute subset (52 B). Bridge **decoder** tests
+run over real captured reply payloads (an FDB entry with `NDA_MASTER`/`NDA_VLAN`/`NDA_CACHEINFO`/
+`NDA_FLAGS_EXT`, an `NTF_SELF` entry, a VXLAN-style entry, a `bridge vlan show` reply, a link-dump
+`IFLA_PROTINFO` block) plus hostile nested streams: dangling `RANGE_BEGIN`, an inverted
+`RANGE_END`, a bad-length `bridge_vlan_info`, an `IFLA_AF_SPEC` overrunning the buffer and a
+zero-length nest — each yields a typed error or a defensively degraded entry, never a panic,
+inversion or over-read. Both bridge builders and parsers are fuzzed.
+
+Linux integration tests (skipped only if the
 socket won't open, no root): `lo` present, a loopback address on `lo`, family/ifindex scoping,
 routes & neighbors structurally valid, sequential dumps in sync, a write to a nonexistent ifindex
 surfacing a mapped typed error, spec validation firing before any syscall. **Live write→read
@@ -111,15 +206,27 @@ programmatic `unshare -rn`, no privilege needed on a stock kernel; falls back to
 unshare when already root), creates a `dummy` device (falling back to `lo` if the driver is
 missing), brings it up, sets the MTU, adds an address, a route and a neighbour, reads each one back
 through this module's *own* dump path, checks EXCL/ENODEV/EOPNOTSUPP/EADDRNOTAVAIL error mapping,
-then deletes everything and verifies the removals. Nothing touches the host: the namespace dies
-with the child. Where namespaces are unavailable the child reports a skip code and the test prints
+then deletes everything and verifies the removals. A **second live round-trip** covers the bridge
+surface in its own namespace: create a VLAN-filtering bridge and a veth pair, bring both ends up
+(a carrier-down port cannot be moved to `FORWARDING`), enslave and verify `IFLA_MASTER` through
+`brportInfo`, set state/learning/flood/isolated and read every one back from `IFLA_PROTINFO`, add a
+PVID+untagged VLAN and a 101-VID range and verify both through the `RTEXT_FILTER_BRVLAN` dump
+(including that the decoded range covers exactly 101 VIDs and no entry is inverted), add an FDB
+entry and find it through both the per-port and the per-bridge kernel-side filter, check
+`NLM_F_EXCL` → `Exists` and that build-time VLAN validation fires before any syscall, then delete
+the entry, the VLANs, release the port and delete both devices (checking the veth peer disappears
+with its partner). Nothing touches the host: the namespace dies with the child. Where namespaces or
+the bridge/veth drivers are unavailable the child reports a skip code and the test prints
 `SKIPPED` and passes — the suite never fails for lack of privilege. Run: `zig build test-netlink`
-(and `-Doptimize=ReleaseFast`).
+(and `--release=fast`): **81/81 pass, 0 skipped** on a stock Linux 7.0 with user namespaces
+enabled, i.e. both live round-trips really execute there.
 
 ## Backlog / deferred
 Multicast event monitoring (RTNLGRP subscription) is the remaining deliberate extension point on
 the transport. Write-path gaps listed under "Threat model / out of scope" above:
-`IFLA_INFO_DATA`/veth peers, multipath routes, policy rules, bridge/FDB. Linux-only platform
+`IFLA_INFO_DATA` for non-bridge kinds / veth peers, multipath routes, policy rules, and the bridge
+sub-list (MDB/multicast snooping, VXLAN device creation, VLAN tunnels, per-VLAN options, MRP/CFM/
+MST, backup port). Linux-only platform
 ceiling is an accepted design choice (raw-syscall nature, no portable fallback), grouped with
 icmp/rawsock/wireguard/l2disco/procnet.
 

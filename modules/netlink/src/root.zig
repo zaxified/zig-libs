@@ -28,10 +28,25 @@
 //!                    .scope = netlink.RT_SCOPE.LINK }, .{});
 //! ```
 //!
+//! Linux **bridges** are covered too (`bridge.zig`, re-exported as
+//! `netlink.bridge`): create/configure a bridge device, enslave ports, manage
+//! the forwarding database, VLAN filtering (incl. VID ranges) and bridge-port
+//! options — everything `ip link … type bridge`, `bridge fdb`, `bridge vlan`
+//! and `bridge link set` do.
+//!
+//! ```zig
+//! try nl.bridgeAdd(.{ .name = "br0", .vlan_filtering = true, .up = true }, .{});
+//! try nl.portEnslave(veth_index, br_index);
+//! try nl.bridgeVlanAdd(veth_index, .{ .vid = 10, .pvid = true, .untagged = true });
+//! try nl.fdbAdd(.{ .ifindex = veth_index, .lladdr = &mac, .vlan = 10 }, .{});
+//! ```
+//!
 //! Still out of scope: multicast event monitoring (RTNLGRP_* subscription),
-//! tc/qdisc (the sibling `tc` module) and conntrack. The transport is generic
-//! enough for them — `nextSeq` + `requestAck` are public so sibling modules
-//! can reuse the write+ACK engine with their own message builders.
+//! tc/qdisc (the sibling `tc` module), conntrack, and — within the bridge
+//! surface — MDB/multicast snooping, VXLAN device creation, VLAN tunnels and
+//! MRP/CFM/MST (see SPEC.md for the full deferred list). The transport is
+//! generic enough for them — `nextSeq` + `requestAck` are public so sibling
+//! modules can reuse the write+ACK engine with their own message builders.
 //!
 //! The wire codec (message framing + rtattr TLV walking) lives in
 //! `codec.zig`, is platform-independent, golden-tested and fuzzed; every
@@ -48,6 +63,27 @@ pub const Message = codec.Message;
 pub const MessageIterator = codec.MessageIterator;
 pub const Attr = codec.Attr;
 pub const AttrIterator = codec.AttrIterator;
+
+/// `AF_BRIDGE` extensions: bridge devices, FDB entries, VLAN filtering and
+/// bridge-port options. The builders/parsers live there; the `Socket` methods
+/// that drive them are further down this file.
+pub const bridge = @import("bridge.zig");
+pub const BridgeSpec = bridge.BridgeSpec;
+pub const FdbSpec = bridge.FdbSpec;
+pub const FdbFilter = bridge.FdbFilter;
+pub const FdbEntry = bridge.FdbEntry;
+pub const VlanSpec = bridge.VlanSpec;
+pub const VlanEntry = bridge.VlanEntry;
+pub const BrportChange = bridge.BrportChange;
+pub const BrportInfo = bridge.BrportInfo;
+pub const BridgeWriteError = bridge.WriteError;
+pub const BRIDGE_VLAN_INFO = bridge.BRIDGE_VLAN_INFO;
+pub const BRIDGE_FLAGS = bridge.BRIDGE_FLAGS;
+pub const BR_STATE = bridge.BR_STATE;
+pub const IFLA_BR = bridge.IFLA_BR;
+pub const IFLA_BRPORT = bridge.IFLA_BRPORT;
+pub const IFLA_BRIDGE = bridge.IFLA_BRIDGE;
+pub const RTEXT_FILTER = bridge.RTEXT_FILTER;
 
 pub const meta = .{
     .platform = .linux, // AF_NETLINK raw syscalls — conscious ceiling
@@ -75,6 +111,9 @@ pub const RTM_DELLINK: u16 = @intFromEnum(linux.NetlinkMessageType.RTM_DELLINK);
 pub const RTM_DELADDR: u16 = @intFromEnum(linux.NetlinkMessageType.RTM_DELADDR);
 pub const RTM_DELROUTE: u16 = @intFromEnum(linux.NetlinkMessageType.RTM_DELROUTE);
 pub const RTM_DELNEIGH: u16 = @intFromEnum(linux.NetlinkMessageType.RTM_DELNEIGH);
+/// `RTM_SETLINK` — the AF_BRIDGE "change link state" message (`bridge vlan`,
+/// `bridge link set`). Re-exported from `bridge` for symmetry with the rest.
+pub const RTM_SETLINK: u16 = bridge.RTM_SETLINK;
 
 /// `NETLINK_EXT_ACK` (linux/netlink.h, Linux >= 4.12) — socket option asking
 /// the kernel to attach a reason string to `NLMSG_ERROR` replies.
@@ -98,6 +137,8 @@ pub const AF = struct {
     pub const UNSPEC: u8 = 0;
     pub const INET: u8 = 2;
     pub const INET6: u8 = 10;
+    /// `AF_BRIDGE` — the family of FDB entries and bridge VLAN/port requests.
+    pub const BRIDGE: u8 = 7;
 };
 
 /// Link flags for `Link.flags` (linux/if.h IFF_*; extended bits >= 0x10000
@@ -156,6 +197,12 @@ pub const NDA = struct {
     pub const VNI: u16 = 7;
     pub const IFINDEX: u16 = 8;
     pub const MASTER: u16 = 9;
+    pub const LINK_NETNSID: u16 = 10;
+    pub const SRC_VNI: u16 = 11;
+    pub const PROTOCOL: u16 = 12;
+    pub const NH_ID: u16 = 13;
+    pub const FDB_EXT_ATTRS: u16 = 14;
+    pub const FLAGS_EXT: u16 = 15;
 };
 
 /// Neighbor cache entry states for `Neighbor.state` (linux/neighbour.h
@@ -259,12 +306,21 @@ pub const IFLA_INFO = struct {
     pub const SLAVE_DATA: u16 = 5;
 };
 
-// Attribute types taken from std.os.linux enums.
-const ifla_address: u16 = @intFromEnum(linux.IFLA.ADDRESS);
-const ifla_ifname: u16 = @intFromEnum(linux.IFLA.IFNAME);
-const ifla_mtu: u16 = @intFromEnum(linux.IFLA.MTU);
-const ifla_txqlen: u16 = @intFromEnum(linux.IFLA.TXQLEN);
-const ifla_linkinfo: u16 = @intFromEnum(linux.IFLA.LINKINFO);
+// Attribute types taken from std.os.linux enums. Public so the bridge
+// builders (and sibling modules) encode the same attribute numbers.
+pub const IFLA_ADDRESS: u16 = @intFromEnum(linux.IFLA.ADDRESS);
+pub const IFLA_IFNAME: u16 = @intFromEnum(linux.IFLA.IFNAME);
+pub const IFLA_MTU: u16 = @intFromEnum(linux.IFLA.MTU);
+pub const IFLA_TXQLEN: u16 = @intFromEnum(linux.IFLA.TXQLEN);
+pub const IFLA_LINKINFO: u16 = @intFromEnum(linux.IFLA.LINKINFO);
+/// `IFLA_MASTER` — the bridge/bond an interface is enslaved to (0 = release).
+pub const IFLA_MASTER: u16 = bridge.IFLA_MASTER;
+
+const ifla_address = IFLA_ADDRESS;
+const ifla_ifname = IFLA_IFNAME;
+const ifla_mtu = IFLA_MTU;
+const ifla_txqlen = IFLA_TXQLEN;
+const ifla_linkinfo = IFLA_LINKINFO;
 const ifa_address: u16 = @intFromEnum(linux.IFA.ADDRESS);
 const ifa_local: u16 = @intFromEnum(linux.IFA.LOCAL);
 const ifa_label: u16 = @intFromEnum(linux.IFA.LABEL);
@@ -680,6 +736,9 @@ pub const LinkChange = struct {
     mac: ?[]const u8 = null,
     /// `IFLA_TXQLEN`.
     txqlen: ?u32 = null,
+    /// `IFLA_MASTER` — enslave the device to this bridge/bond ifindex; 0
+    /// releases it (`ip link set … nomaster`). See `Socket.portEnslave`.
+    master: ?u32 = null,
     /// Raw IFF_* values to apply, gated by `flags_mask`.
     flags: u32 = 0,
     /// Raw `ifi_change` bits — which IFF_* bits `flags` may change.
@@ -900,7 +959,7 @@ fn buildLinkSetRequest(
         value = (value & ~IFF.UP) | (if (up) IFF.UP else 0);
     }
     const has_attrs = change.mtu != null or change.name != null or
-        change.mac != null or change.txqlen != null;
+        change.mac != null or change.txqlen != null or change.master != null;
     if (mask == 0 and !has_attrs) return error.NothingToChange;
 
     var list: std.ArrayList(u8) = .empty;
@@ -919,6 +978,9 @@ fn buildLinkSetRequest(
     if (change.txqlen) |t| try codec.appendAttrU32(gpa, &list, ifla_txqlen, t);
     if (change.mac) |m| try appendAttrChecked(gpa, &list, ifla_address, m);
     if (change.name) |n| try appendAttrStringChecked(gpa, &list, ifla_ifname, n);
+    // IFLA_MASTER last: with nothing else set this reproduces `ip link set dev
+    // X master Y` / `… nomaster` byte-for-byte.
+    if (change.master) |m| try codec.appendAttrU32(gpa, &list, IFLA_MASTER, m);
 
     codec.finishHeader(&list, hdr);
     return list.toOwnedSlice(gpa);
@@ -1356,6 +1418,137 @@ pub const Socket = struct {
         ));
     }
 
+    // ── AF_BRIDGE ops (see bridge.zig for the wire encoding) ────────────────
+
+    /// Create a bridge device (`RTM_NEWLINK` + `IFLA_INFO_KIND = "bridge"`),
+    /// optionally setting the `IFLA_BR_*` options in the same request. Delete
+    /// it again with `linkDel`.
+    pub fn bridgeAdd(self: *Socket, spec: BridgeSpec, opts: Create) BridgeWriteError!void {
+        return self.writeOpBridge(try bridge.buildBridgeAddRequest(
+            self.gpa,
+            self.nextSeq(),
+            opts.flags(),
+            spec,
+        ));
+    }
+
+    /// Enslave an interface to a bridge (or bond) — `IFLA_MASTER`.
+    pub fn portEnslave(self: *Socket, ifindex: u32, master: u32) WriteError!void {
+        return self.linkSet(ifindex, .{ .master = master });
+    }
+
+    /// Detach an interface from its bridge (`ip link set … nomaster`).
+    pub fn portRelease(self: *Socket, ifindex: u32) WriteError!void {
+        return self.linkSet(ifindex, .{ .master = 0 });
+    }
+
+    /// Add a forwarding-database entry (`RTM_NEWNEIGH`, `ndm_family =
+    /// AF_BRIDGE`) — the `bridge fdb add` operation.
+    pub fn fdbAdd(self: *Socket, spec: FdbSpec, opts: Create) BridgeWriteError!void {
+        return self.writeOpBridge(try bridge.buildFdbRequest(
+            self.gpa,
+            self.nextSeq(),
+            RTM_NEWNEIGH,
+            opts.flags(),
+            spec,
+        ));
+    }
+
+    /// Remove a forwarding-database entry (`RTM_DELNEIGH`). The kernel matches
+    /// on ifindex + MAC + VLAN; the rest of the spec is ignored.
+    pub fn fdbDel(self: *Socket, spec: FdbSpec) BridgeWriteError!void {
+        return self.writeOpBridge(try bridge.buildFdbRequest(
+            self.gpa,
+            self.nextSeq(),
+            RTM_DELNEIGH,
+            codec.NLM_F_REQUEST | codec.NLM_F_ACK,
+            spec,
+        ));
+    }
+
+    /// Dump the bridge forwarding database (`bridge fdb show`). Both filters
+    /// are applied kernel-side. Free the result with `gpa.free(entries)`.
+    pub fn fdbEntries(self: *Socket, filter: FdbFilter) DumpError![]FdbEntry {
+        const req = bridge.buildFdbDumpRequest(self.gpa, self.nextSeq(), filter) catch
+            return error.OutOfMemory;
+        defer self.gpa.free(req);
+        return self.dumpCollect(FdbEntry, collectFdb, req, RTM_NEWNEIGH);
+    }
+
+    /// Add a VLAN — or an inclusive VID range — to a bridge port
+    /// (`bridge vlan add`). Requires `vlan_filtering` on the bridge.
+    pub fn bridgeVlanAdd(self: *Socket, ifindex: u32, spec: VlanSpec) BridgeWriteError!void {
+        return self.writeOpBridge(try bridge.buildVlanRequest(
+            self.gpa,
+            self.nextSeq(),
+            RTM_SETLINK,
+            ifindex,
+            spec,
+        ));
+    }
+
+    /// Remove a VLAN (or VID range) from a bridge port (`bridge vlan del`).
+    pub fn bridgeVlanDel(self: *Socket, ifindex: u32, spec: VlanSpec) BridgeWriteError!void {
+        return self.writeOpBridge(try bridge.buildVlanRequest(
+            self.gpa,
+            self.nextSeq(),
+            RTM_DELLINK,
+            ifindex,
+            spec,
+        ));
+    }
+
+    /// Dump per-port VLAN configuration (`bridge vlan show`) — `RTM_GETLINK`
+    /// with `IFLA_EXT_MASK = RTEXT_FILTER_BRVLAN`, decoding `IFLA_AF_SPEC`.
+    /// `Filter.ifindex` scopes the result client-side; `Filter.family` is
+    /// ignored (the dump is AF_BRIDGE by construction).
+    pub fn bridgeVlans(self: *Socket, filter: Filter) DumpError![]VlanEntry {
+        const req = bridge.buildVlanDumpRequest(
+            self.gpa,
+            self.nextSeq(),
+            bridge.RTEXT_FILTER.BRVLAN,
+        ) catch return error.OutOfMemory;
+        defer self.gpa.free(req);
+        const all = try self.dumpCollect(VlanEntry, collectVlans, req, RTM_NEWLINK);
+        const want = filter.ifindex orelse return all;
+        defer self.gpa.free(all);
+        var kept: std.ArrayList(VlanEntry) = .empty;
+        errdefer kept.deinit(self.gpa);
+        for (all) |v| if (v.ifindex == want) try kept.append(self.gpa, v);
+        return kept.toOwnedSlice(self.gpa);
+    }
+
+    /// Change bridge-port options (`bridge link set`) — STP state, learning,
+    /// flooding, isolation… `RTM_SETLINK` with a nested `IFLA_PROTINFO`.
+    pub fn brportSet(self: *Socket, ifindex: u32, change: BrportChange) BridgeWriteError!void {
+        return self.writeOpBridge(try bridge.buildBrportRequest(
+            self.gpa,
+            self.nextSeq(),
+            ifindex,
+            change,
+        ));
+    }
+
+    /// Read one interface's bridge-port state (`IFLA_MASTER` + the
+    /// `IFLA_BRPORT_*` block). Null when the interface is not a bridge port
+    /// or does not exist. Implemented over the plain link dump, so it needs
+    /// no privilege.
+    pub fn brportInfo(self: *Socket, ifindex: u32) DumpError!?BrportInfo {
+        const ports = try self.brportInfos();
+        defer self.gpa.free(ports);
+        for (ports) |p| if (p.ifindex == ifindex) return p;
+        return null;
+    }
+
+    /// Every bridge port on the system with its `IFLA_BRPORT_*` state — the
+    /// `bridge link show` dump. Free with `gpa.free(ports)`.
+    pub fn brportInfos(self: *Socket) DumpError![]BrportInfo {
+        const req = bridge.buildBrportDumpRequest(self.gpa, self.nextSeq()) catch
+            return error.OutOfMemory;
+        defer self.gpa.free(req);
+        return self.dumpCollect(BrportInfo, collectBrport, req, RTM_NEWLINK);
+    }
+
     /// The kernel's reason for the last failed write, from the extended ACK
     /// (`NLMSGERR_ATTR_MSG`) — e.g. "Unknown device type". Empty when the
     /// kernel attached none (pre-4.12 kernel, or an errno with no message).
@@ -1384,6 +1577,12 @@ pub const Socket = struct {
         defer self.gpa.free(request);
         // The seq was taken from `nextSeq` when the request was built, and no
         // other request can have been sent in between (one Socket per thread).
+        return self.requestAck(request, self.seq);
+    }
+
+    /// `writeOp` for the bridge ops — same engine, wider build-error set.
+    fn writeOpBridge(self: *Socket, request: []u8) BridgeWriteError!void {
+        defer self.gpa.free(request);
         return self.requestAck(request, self.seq);
     }
 
@@ -1477,6 +1676,62 @@ pub const Socket = struct {
         }
     }
 
+    /// The dump engine for pre-built requests, used by the AF_BRIDGE dumps
+    /// whose request carries attributes (`NDA_MASTER`, `IFLA_EXT_MASK`) that
+    /// `sendDumpRequest`'s bare fixed header cannot express. Same reply
+    /// discipline as `dump`: match on (portid, seq), assemble multi-part
+    /// replies until NLMSG_DONE, restart on NLM_F_DUMP_INTR with a fresh
+    /// sequence number — patched into the caller's buffer, which is why
+    /// `request` is mutable.
+    ///
+    /// Unlike `dump`, `collectFn` may append any number of items per message,
+    /// which is what a VLAN dump needs (one message lists a whole port).
+    fn dumpCollect(
+        self: *Socket,
+        comptime T: type,
+        comptime collectFn: fn (std.mem.Allocator, *std.ArrayList(T), []const u8) DumpError!void,
+        request: []u8,
+        reply_type: u16,
+    ) DumpError![]T {
+        if (request.len < codec.header_len) return error.InvalidRequest;
+        var seq = std.mem.readInt(u32, request[8..12], native_endian);
+        var attempt: usize = 0;
+        retry: while (true) {
+            attempt += 1;
+            try self.sendRaw(request);
+            var out: std.ArrayList(T) = .empty;
+            errdefer out.deinit(self.gpa);
+            while (true) {
+                const dgram = try self.recvDatagram();
+                var it: codec.MessageIterator = .{ .buf = dgram };
+                while (it.next() catch return error.MalformedReply) |m| {
+                    if (m.pid != self.portid or m.seq != seq) continue;
+                    if (m.flags & codec.NLM_F_DUMP_INTR != 0) {
+                        out.deinit(self.gpa);
+                        if (attempt >= max_dump_attempts) return error.InconsistentDump;
+                        seq = self.nextSeq();
+                        std.mem.writeInt(u32, request[8..12], seq, native_endian);
+                        continue :retry;
+                    }
+                    switch (m.type) {
+                        codec.NLMSG_DONE => return out.toOwnedSlice(self.gpa),
+                        codec.NLMSG_ERROR => {
+                            const code = m.errorCode() catch return error.MalformedReply;
+                            if (code == 0) return out.toOwnedSlice(self.gpa); // ACK
+                            return errorFromCode(code);
+                        },
+                        codec.NLMSG_NOOP => {},
+                        codec.NLMSG_OVERRUN => return error.SystemResources,
+                        else => {
+                            if (m.type != reply_type) continue;
+                            try collectFn(self.gpa, &out, m.payload);
+                        },
+                    }
+                }
+            }
+        }
+    }
+
     /// Emit one dump request: nlmsghdr + a zeroed fixed family header with
     /// only the family byte set (offset 0 in ifinfomsg/ifaddrmsg/rtmsg/ndmsg
     /// alike). Sending the full fixed header — not the 1-byte rtgenmsg some
@@ -1557,6 +1812,37 @@ pub const Socket = struct {
         }
     }
 };
+
+// ── AF_BRIDGE dump collectors (glue between `dumpCollect` and `bridge`) ─────
+
+fn collectFdb(
+    gpa: std.mem.Allocator,
+    out: *std.ArrayList(FdbEntry),
+    payload: []const u8,
+) DumpError!void {
+    const e = bridge.parseFdb(payload) catch return error.MalformedReply;
+    if (e) |entry| try out.append(gpa, entry);
+}
+
+fn collectVlans(
+    gpa: std.mem.Allocator,
+    out: *std.ArrayList(VlanEntry),
+    payload: []const u8,
+) DumpError!void {
+    bridge.parseVlans(gpa, out, payload) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.MalformedReply,
+    };
+}
+
+fn collectBrport(
+    gpa: std.mem.Allocator,
+    out: *std.ArrayList(BrportInfo),
+    payload: []const u8,
+) DumpError!void {
+    const p = bridge.parseBrport(payload) catch return error.MalformedReply;
+    if (p) |info| try out.append(gpa, info);
+}
 
 // ── offline tests: parsers over canned buffers ──────────────────────────────
 
@@ -2068,6 +2354,31 @@ test "build: RTM_DELLINK == `ip link del zdum0`" {
     });
 }
 
+test "build: IFLA_MASTER == `ip link set dev veth0 master br0` / `… nomaster`" {
+    if (native_endian != .little) return error.SkipZigTest;
+    const enslave = try buildLinkSetRequest(testing.allocator, 1, 4, .{ .master = 6 });
+    defer testing.allocator.free(enslave);
+    try expectRequestBytes(enslave, &.{
+        0x28, 0x00, 0x00, 0x00, // nlmsg_len = 40
+        0x10, 0x00, // RTM_NEWLINK (16)
+        0x05, 0x00, // REQUEST|ACK
+        0x01, 0x00, 0x00, 0x00, // nlmsg_seq
+        0x00, 0x00, 0x00, 0x00, // nlmsg_pid
+        0x00, 0x00, 0x00, 0x00, // ifinfomsg: AF_UNSPEC (not AF_BRIDGE here)
+        0x04, 0x00, 0x00, 0x00, // ifi_index = 4
+        0x00, 0x00, 0x00, 0x00, // ifi_flags = 0
+        0x00, 0x00, 0x00, 0x00, // ifi_change = 0 — no IFF_* bit is touched
+        0x08, 0x00, 0x0a, 0x00, 0x06, 0x00, 0x00, 0x00, // IFLA_MASTER = 6
+    });
+
+    // `nomaster` is the same message with IFLA_MASTER = 0 — and it must not
+    // trip the "nothing to change" guard.
+    const release = try buildLinkSetRequest(testing.allocator, 1, 4, .{ .master = 0 });
+    defer testing.allocator.free(release);
+    try testing.expectEqual(@as(usize, 40), release.len);
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, release[36..40], native_endian));
+}
+
 test "build: RTM_NEWNEIGH == `ip neigh add … lladdr … dev lo nud permanent`" {
     if (native_endian != .little) return error.SkipZigTest;
     const req = try buildNeighborRequest(testing.allocator, 1, RTM_NEWNEIGH, (Create{}).flags(), .{
@@ -2273,6 +2584,16 @@ test "integration: address dump has a loopback address on lo" {
         }
         // Structural validity for every entry.
         try testing.expect(a.addr_len == 4 or a.addr_len == 16);
+    }
+    if (!found and addrs.len == 0) {
+        // A fresh network namespace (`unshare -rn zig build test-netlink`)
+        // starts with `lo` down and unaddressed — the kernel really does
+        // report nothing, which is not a failure of this module.
+        std.debug.print(
+            "SKIPPED (loopback address): the namespace has no addresses at all\n",
+            .{},
+        );
+        return error.SkipZigTest;
     }
     try testing.expect(found);
 }
@@ -2604,6 +2925,247 @@ fn netnsRoundTrip() !void {
     }
 }
 
+// ── live AF_BRIDGE round-trip inside a private network namespace ────────────
+//
+// Same harness as above: a forked child isolates itself with
+// `unshare(CLONE_NEWUSER|CLONE_NEWNET)`, builds a bridge + veth pair there and
+// exercises the whole bridge surface against the real kernel. It SKIPS (never
+// fails) when namespaces or the veth/bridge drivers are unavailable.
+
+const netns_bridge = "nlbr0";
+const netns_veth_a = "nlveth0";
+
+test "integration (netns): bridge/FDB/VLAN/brport write→read round-trip" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const rc = linux.fork();
+    switch (linux.errno(rc)) {
+        .SUCCESS => {},
+        else => {
+            std.debug.print("SKIPPED (netns bridge round-trip): fork() not permitted\n", .{});
+            return error.SkipZigTest;
+        },
+    }
+    if (rc == 0) {
+        var code: u8 = netns_skip;
+        if (enterNetns()) {
+            if (netnsBridgeRoundTrip()) |ok| {
+                code = if (ok) 0 else netns_skip;
+            } else |err| {
+                std.debug.print("netns bridge round-trip failed: {s}\n", .{@errorName(err)});
+                code = netns_fail;
+            }
+        }
+        linux.exit_group(code);
+    }
+
+    const pid: i32 = @intCast(rc);
+    var status: u32 = 0;
+    while (true) {
+        const wrc = linux.waitpid(pid, &status, 0);
+        switch (linux.errno(wrc)) {
+            .SUCCESS => break,
+            .INTR => continue,
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    if (status & 0x7f != 0) return error.TestChildKilledBySignal;
+    switch (@as(u8, @truncate(status >> 8))) {
+        0 => {},
+        netns_skip => {
+            std.debug.print(
+                "SKIPPED (netns bridge round-trip): no CLONE_NEWUSER/CLONE_NEWNET or no " ++
+                    "bridge/veth driver here — re-run as root or under `unshare -rn` " ++
+                    "for live bridge coverage\n",
+                .{},
+            );
+            return error.SkipZigTest;
+        },
+        else => return error.TestNetnsBridgeRoundTripFailed,
+    }
+}
+
+/// Admin-up every non-loopback device in the namespace and return the index of
+/// the veth peer — the one device that is neither the bridge nor the port. Its
+/// name is chosen by the kernel, so it can only be identified positionally.
+fn upAllButLoopback(nl: *Socket, br_index: u32, port_index: u32) !?u32 {
+    const ls = try nl.links();
+    defer std.heap.page_allocator.free(ls);
+    var peer: ?u32 = null;
+    for (ls) |l| {
+        if (l.flags & IFF.LOOPBACK != 0) continue;
+        try nl.linkUp(l.index);
+        if (l.index != br_index and l.index != port_index) peer = l.index;
+    }
+    return peer;
+}
+
+/// Returns false (→ SKIP) when the kernel has no bridge or veth driver;
+/// an error means a real failure of this module.
+fn netnsBridgeRoundTrip() !bool {
+    const gpa = std.heap.page_allocator;
+    var nl = try Socket.open(gpa);
+    defer nl.close();
+
+    // 1. Bridge with VLAN filtering on, plus a veth pair to enslave.
+    nl.bridgeAdd(.{
+        .name = netns_bridge,
+        .vlan_filtering = true,
+        .forward_delay = 0,
+        .stp_state = 0,
+        .up = true,
+    }, .{}) catch |err| switch (err) {
+        error.NotSupported, error.InvalidRequest, error.NotFound => return false,
+        else => return err,
+    };
+    const br = (try findLink(&nl, netns_bridge)) orelse return error.TestBridgeNotFound;
+    nl.linkAdd(.{ .name = netns_veth_a, .kind = "veth" }, .{}) catch |err| switch (err) {
+        error.NotSupported, error.InvalidRequest, error.NotFound => return false,
+        else => return err,
+    };
+    const port = (try findLink(&nl, netns_veth_a)) orelse return error.TestVethNotFound;
+    // Both ends of the pair must be up, or the port has no carrier and the
+    // kernel answers ENETDOWN to a FORWARDING state change. The peer's name is
+    // kernel-generated, so bring every non-loopback device up.
+    const peer = try upAllButLoopback(&nl, br.index, port.index);
+
+    // 2. Enslave, verified through IFLA_MASTER in a link dump.
+    try nl.portEnslave(port.index, br.index);
+    {
+        const info = (try nl.brportInfo(port.index)) orelse return error.TestPortNotEnslaved;
+        if (info.master != br.index) return error.TestWrongMaster;
+    }
+
+    // 3. Bridge-port options, verified through IFLA_PROTINFO.
+    try nl.brportSet(port.index, .{
+        .state = BR_STATE.FORWARDING,
+        .learning = false,
+        .unicast_flood = false,
+        .isolated = true,
+    });
+    {
+        const info = (try nl.brportInfo(port.index)).?;
+        if (info.state != BR_STATE.FORWARDING) return error.TestBrportStateNotApplied;
+        if (info.learning != false) return error.TestBrportLearningNotApplied;
+        if (info.unicast_flood != false) return error.TestBrportFloodNotApplied;
+        if (info.isolated != true) return error.TestBrportIsolatedNotApplied;
+    }
+    try expectBridgeError(error.NothingToChange, nl.brportSet(port.index, .{}));
+
+    // 4. VLANs: a single PVID/untagged VLAN plus a range, read back through
+    //    the RTEXT_FILTER_BRVLAN dump.
+    try nl.bridgeVlanAdd(port.index, .{ .vid = 10, .pvid = true, .untagged = true });
+    try nl.bridgeVlanAdd(port.index, .{ .vid = 100, .vid_end = 200 });
+    {
+        const vlans = try nl.bridgeVlans(.{ .ifindex = port.index });
+        defer gpa.free(vlans);
+        var saw_pvid = false;
+        var covered: u32 = 0;
+        for (vlans) |v| {
+            if (v.ifindex != port.index) return error.TestVlanWrongPort;
+            if (v.vid_end < v.vid) return error.TestVlanInvertedRange;
+            if (v.contains(10) and v.isPvid() and v.isUntagged()) saw_pvid = true;
+            if (v.vid >= 100 and v.vid_end <= 200) covered += v.count();
+        }
+        if (!saw_pvid) return error.TestPvidNotFound;
+        if (covered != 101) return error.TestVlanRangeNotFound;
+    }
+    // Building a bad VLAN spec never reaches the kernel.
+    try expectBridgeError(error.InvalidVlanId, nl.bridgeVlanAdd(port.index, .{ .vid = 4095 }));
+    try expectBridgeError(
+        error.InvalidVlanRange,
+        nl.bridgeVlanAdd(port.index, .{ .vid = 200, .vid_end = 100 }),
+    );
+
+    // 5. FDB: add a static entry in the master's database, read it back, then
+    //    a self entry, then delete both.
+    const mac: [6]u8 = .{ 0x02, 0x00, 0x00, 0x00, 0x00, 0x01 };
+    try nl.fdbAdd(.{
+        .ifindex = port.index,
+        .lladdr = &mac,
+        .vlan = 10,
+        .state = NUD.REACHABLE | NUD.NOARP,
+    }, .{});
+    {
+        const fdb = try nl.fdbEntries(.{ .ifindex = port.index });
+        defer gpa.free(fdb);
+        var found = false;
+        for (fdb) |e| {
+            if (std.mem.eql(u8, e.lladdrBytes(), &mac) and e.vlan == @as(?u16, 10)) {
+                if (e.master != br.index) return error.TestFdbWrongMaster;
+                found = true;
+            }
+        }
+        if (!found) return error.TestFdbEntryNotFound;
+    }
+    // Kernel-side `bridge fdb show br <bridge>` scoping returns the same entry.
+    {
+        const fdb = try nl.fdbEntries(.{ .master = br.index });
+        defer gpa.free(fdb);
+        var found = false;
+        for (fdb) |e| {
+            if (std.mem.eql(u8, e.lladdrBytes(), &mac)) found = true;
+        }
+        if (!found) return error.TestFdbMasterFilterFailed;
+    }
+    // Re-adding the same entry exclusively must hit NLM_F_EXCL.
+    try expectBridgeError(error.Exists, nl.fdbAdd(.{
+        .ifindex = port.index,
+        .lladdr = &mac,
+        .vlan = 10,
+        .state = NUD.REACHABLE | NUD.NOARP,
+    }, .{}));
+
+    try nl.fdbDel(.{ .ifindex = port.index, .lladdr = &mac, .vlan = 10 });
+    {
+        const fdb = try nl.fdbEntries(.{ .ifindex = port.index });
+        defer gpa.free(fdb);
+        for (fdb) |e| {
+            if (std.mem.eql(u8, e.lladdrBytes(), &mac) and e.vlan == @as(?u16, 10))
+                return error.TestFdbEntryNotRemoved;
+        }
+    }
+
+    // 6. Tear the VLANs down and verify they are gone.
+    try nl.bridgeVlanDel(port.index, .{ .vid = 100, .vid_end = 200 });
+    try nl.bridgeVlanDel(port.index, .{ .vid = 10 });
+    {
+        const vlans = try nl.bridgeVlans(.{ .ifindex = port.index });
+        defer gpa.free(vlans);
+        for (vlans) |v| {
+            if (v.contains(10) or v.contains(150)) return error.TestVlanNotRemoved;
+        }
+    }
+
+    // 7. Release the port and delete both devices.
+    try nl.portRelease(port.index);
+    {
+        const info = try nl.brportInfo(port.index);
+        if (info != null and info.?.master != null) return error.TestPortStillEnslaved;
+    }
+    try nl.linkDel(port.index);
+    if (try findLink(&nl, netns_veth_a) != null) return error.TestVethNotDeleted;
+    // Deleting one end of a veth pair takes the peer with it.
+    if (peer) |p| {
+        const ls = try nl.links();
+        defer gpa.free(ls);
+        for (ls) |l| if (l.index == p) return error.TestVethPeerNotDeleted;
+    }
+    try nl.linkDel(br.index);
+    if (try findLink(&nl, netns_bridge) != null) return error.TestBridgeNotDeleted;
+    return true;
+}
+
+fn expectBridgeError(expected: anyerror, actual: BridgeWriteError!void) !void {
+    if (actual) |_| {
+        return error.TestExpectedWriteToFail;
+    } else |err| {
+        if (err != expected) {
+            std.debug.print("expected {s}, got {s}\n", .{ @errorName(expected), @errorName(err) });
+            return error.TestWrongWriteError;
+        }
+    }
+}
+
 fn expectWriteError(expected: anyerror, actual: WriteError!void) !void {
     if (actual) |_| {
         return error.TestExpectedWriteToFail;
@@ -2617,4 +3179,5 @@ fn expectWriteError(expected: anyerror, actual: WriteError!void) !void {
 
 test {
     _ = codec;
+    _ = bridge;
 }

@@ -330,6 +330,36 @@ pub fn appendAttrU32(
     };
 }
 
+/// Append a u16-valued rtattr (host byte order, like the kernel). The TLV is
+/// 6 bytes long and padded to 8 — `nla_len` excludes the padding.
+pub fn appendAttrU16(
+    gpa: std.mem.Allocator,
+    list: *std.ArrayList(u8),
+    attr_type: u16,
+    value: u16,
+) std.mem.Allocator.Error!void {
+    var raw: [2]u8 = undefined;
+    std.mem.writeInt(u16, &raw, value, native_endian);
+    appendAttr(gpa, list, attr_type, &raw) catch |err| switch (err) {
+        error.AttrTooLong => unreachable, // 6 bytes total
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+}
+
+/// Append a u8-valued rtattr (`nla_len` 5, padded to 8) — the shape the
+/// kernel's boolean/enum link options use.
+pub fn appendAttrU8(
+    gpa: std.mem.Allocator,
+    list: *std.ArrayList(u8),
+    attr_type: u16,
+    value: u8,
+) std.mem.Allocator.Error!void {
+    appendAttr(gpa, list, attr_type, &.{value}) catch |err| switch (err) {
+        error.AttrTooLong => unreachable, // 5 bytes total
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+}
+
 /// Open a nested attribute: appends a TLV header with a placeholder length
 /// and returns its offset for the closing `nestEnd`. `attr_type` is written
 /// verbatim — rtnetlink nests (`IFLA_LINKINFO`, `TCA_OPTIONS`, …) are

@@ -1,8 +1,9 @@
 # netlink
 
 Pure-Zig **rtnetlink** transport + control API over `NETLINK_ROUTE`: enumerate
-*and* configure links, addresses, routes and neighbors straight from the kernel
-control plane — no `ip`/`ss` shell-outs, no `/proc/net` parsing, no libc.
+*and* configure links, addresses, routes, neighbors and Linux **bridges**
+(FDB + VLAN filtering + port options) straight from the kernel control plane —
+no `ip`/`bridge` shell-outs, no `/proc/net` parsing, no libc.
 
 - No maintained pure-Zig netlink library exists.
 - **Model after:** libmnl (minimal framing + validation discipline) and
@@ -18,7 +19,8 @@ control plane — no `ip`/`ss` shell-outs, no `/proc/net` parsing, no libc.
 
 Provenance: clean-room from the kernel UAPI headers (`linux/netlink.h`,
 `linux/rtnetlink.h`, `linux/if_link.h`, `linux/if_addr.h`,
-`linux/neighbour.h`, `linux/if.h`) and RFC 3549; design references libmnl
+`linux/neighbour.h`, `linux/if_bridge.h`, `linux/if.h`) and RFC 3549; design
+references libmnl
 (LGPL-2.1) and vishvananda/netlink (Apache-2.0) — behavior/wire semantics
 only, no source consulted or copied. See `NOTICE`.
 
@@ -63,6 +65,50 @@ nl.routeAdd(bad_spec, .{}) catch |err| switch (err) {
 };
 ```
 
+### Bridges (AF_BRIDGE)
+
+Everything `ip link … type bridge`, `bridge fdb`, `bridge vlan` and
+`bridge link set` do — same socket, same ACK/ext-ACK discipline:
+
+```zig
+// 1. The bridge device itself (IFLA_LINKINFO/IFLA_INFO_DATA → IFLA_BR_*).
+try nl.bridgeAdd(.{ .name = "br0", .vlan_filtering = true,
+                    .stp_state = 1, .forward_delay = 100,
+                    .ageing_time = 20000, .priority = 4096, .up = true }, .{});
+try nl.portEnslave(veth_index, br_index);  // IFLA_MASTER
+try nl.portRelease(veth_index);            // …nomaster
+
+// 2. FDB — `bridge fdb add/del/show`, ndm_family = AF_BRIDGE.
+try nl.fdbAdd(.{ .ifindex = veth_index, .lladdr = &mac, .vlan = 10,
+                 .state = netlink.NUD.REACHABLE | netlink.NUD.NOARP,
+                 .flags = netlink.NTF.MASTER }, .{});
+const fdb = try nl.fdbEntries(.{ .master = br_index }); // []FdbEntry, kernel-filtered
+for (fdb) |e| _ = .{ e.lladdrBytes(), e.vlan, e.master, e.isSelf(), e.isPermanent() };
+try nl.fdbDel(.{ .ifindex = veth_index, .lladdr = &mac, .vlan = 10 });
+
+// 3. VLAN filtering — IFLA_AF_SPEC/IFLA_BRIDGE_VLAN_INFO, ranges included.
+try nl.bridgeVlanAdd(veth_index, .{ .vid = 10, .pvid = true, .untagged = true });
+try nl.bridgeVlanAdd(veth_index, .{ .vid = 100, .vid_end = 200 });  // RANGE_BEGIN/END
+try nl.bridgeVlanAdd(br_index,   .{ .vid = 20, .self = true });     // on the bridge itself
+const vlans = try nl.bridgeVlans(.{ .ifindex = veth_index });       // []VlanEntry
+for (vlans) |v| _ = .{ v.vid, v.vid_end, v.isPvid(), v.isUntagged(), v.count() };
+try nl.bridgeVlanDel(veth_index, .{ .vid = 100, .vid_end = 200 });
+
+// 4. Bridge-port options — IFLA_PROTINFO/IFLA_BRPORT_*.
+try nl.brportSet(veth_index, .{ .state = netlink.BR_STATE.FORWARDING,
+                                .learning = false, .unicast_flood = false,
+                                .isolated = true });
+const port = try nl.brportInfo(veth_index); // ?BrportInfo (state/learning/flood/…)
+```
+
+The builders and parsers behind these live in `netlink.bridge`
+(`buildBridgeAddRequest`, `buildFdbRequest`, `buildFdbDumpRequest`,
+`buildVlanRequest`, `buildVlanDumpRequest`, `buildBrportRequest`,
+`buildBrportDumpRequest`, `parseFdb`, `parseVlans`, `parseBrport`) together
+with the UAPI tables `IFLA_BR`, `IFLA_BRPORT`, `IFLA_BRIDGE`,
+`BRIDGE_VLAN_INFO`, `BRIDGE_FLAGS`, `BR_STATE`, `RTEXT_FILTER` — all usable
+standalone, without a socket.
+
 Low-level, for custom queries and hand-built requests (all `pub`):
 `netlink.codec` — bounds-checked `MessageIterator`/`AttrIterator`,
 `Message.errorCode()` (NLMSG_ERROR → errno), `Message.errorMessage()`
@@ -71,7 +117,7 @@ encoders — plus `Socket.nextSeq()`/`Socket.requestAck()` (the write+ACK engine
 sibling modules reuse), the typed payload parsers (`parseLink`,
 `parseAddress`, `parseRoute`, `parseNeighbor`) and the UAPI constant tables
 (`AF`, `IFF`, `RTA`, `NDA`, `NUD`, `RTN`, `RTPROT`, `NTF`, `IFA_F`,
-`IFLA_INFO`, `RT_TABLE`, `RT_SCOPE`).
+`IFLA_INFO`, `RT_TABLE`, `RT_SCOPE`) and the `netlink.bridge` namespace.
 
 ## Design notes
 
@@ -110,6 +156,29 @@ sibling modules reuse), the typed payload parsers (`parseLink`,
   *only* `IFF_UP` in the mask, attribute-only changes (MTU/name/MAC) send
   `ifi_change = 0`, and `flags`/`flags_mask` is the explicit escape hatch. An
   empty change is rejected (`error.NothingToChange`) rather than sent.
+- **AF_BRIDGE has three different message shapes**, and getting them wrong is
+  the usual source of `EINVAL`. FDB entries are `RTM_*NEIGH` with
+  `ndm_family = AF_BRIDGE` (`NDA_LLADDR`/`NDA_VLAN`/`NDA_MASTER`, and
+  `NTF_SELF` vs `NTF_MASTER` picking the device's own FDB or the bridge's).
+  VLANs are `RTM_SETLINK`/`RTM_DELLINK` with `ifi_family = AF_BRIDGE` and a
+  nested `IFLA_AF_SPEC`; a range is *two* `IFLA_BRIDGE_VLAN_INFO` attributes
+  flagged `RANGE_BEGIN`/`RANGE_END`, which `VlanEntry` collapses back into one
+  `vid..vid_end` on decode. Port options are `RTM_SETLINK` with
+  `IFLA_PROTINFO` — the one rtnetlink nest iproute2 *does* mark
+  `NLA_F_NESTED`, and this encoder matches it. The dumps differ too: FDB uses
+  `RTM_GETNEIGH` + `ndmsg{AF_BRIDGE}` (with `ndm_ifindex`/`NDA_MASTER` filtered
+  kernel-side), VLANs use `RTM_GETLINK` + `IFLA_EXT_MASK = RTEXT_FILTER_BRVLAN`,
+  and port state needs `RTM_GETLINK` with `ifi_family = AF_BRIDGE` — a plain
+  `ip link show`-style dump carries no `IFLA_PROTINFO` at all.
+- **VLAN specs are validated before the syscall:** VID must be 1..4094
+  (`error.InvalidVlanId`), a range must be ascending and can never be a PVID
+  (`error.InvalidVlanRange`), and `self`+`master` together is rejected.
+- **Known unmapped errno:** setting a port to `FORWARDING` while its carrier is
+  down answers `ENETDOWN`, which `writeErrorFromCode` reports as
+  `error.Unexpected` (the mapping table is shared with the other write ops and
+  was left untouched). Bring both ends of a veth pair up first.
 - **Out of scope (deliberate extension points):** multicast event monitoring,
-  qdiscs/filters (sibling `tc` module), conntrack, bridge/FDB, policy rules,
-  `IFLA_INFO_DATA` link parameters and multipath routes — see SPEC.md.
+  qdiscs/filters (sibling `tc` module), conntrack, policy rules, multipath
+  routes, and — within the bridge surface — MDB/multicast snooping
+  (`RTM_*MDB`), VXLAN link creation, VLAN tunnel mapping, MRP/CFM/MST and
+  per-VLAN options. See SPEC.md.
