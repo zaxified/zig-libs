@@ -134,6 +134,7 @@ const module_list = [_]Module{
     .{ .name = "noise" },
     .{ .name = "x509", .deps = &.{"rsa"} },
     .{ .name = "ocsp", .deps = &.{ "x509", "rsa", "p256" } },
+    .{ .name = "ocspcache", .deps = &.{ "ocsp", "http", "x509" } },
     .{ .name = "dnssec", .deps = &.{ "dns", "rsa" } },
     .{ .name = "dnp3", .deps = &.{"aeskw"} },
     .{ .name = "slhdsa" },
