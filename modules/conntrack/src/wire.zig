@@ -22,9 +22,9 @@
 //! `08 00 03 00 | 00 00 00 0a`, type word `0x0003` with no flag bits, payload
 //! `0x0000000a` = `IPS_SEEN_REPLY|IPS_CONFIRMED`). Only the raw address bytes
 //! (`CTA_IP_V4_*`/`CTA_IP_V6_*`) and the u8 fields are endian-free. Every
-//! integer accessor in this file therefore reads/writes `.big` explicitly, and
-//! `netlink.codec`'s host-endian `asU16`/`asU32` are deliberately **not** used
-//! for payload values.
+//! integer here therefore goes through `netlink.codec`'s big-endian accessors
+//! (`Attr.asBe16/32/64`, `codec.appendAttrBe16/32/64`); the host-endian
+//! `asU16`/`asU32` twins are deliberately **not** used for payload values.
 //!
 //! Provenance: clean-room from the kernel UAPI headers
 //! (`nfnetlink.h`, `nfnetlink_conntrack.h`, `nf_conntrack_common.h`,
@@ -261,75 +261,12 @@ pub const BuildError = std.mem.Allocator.Error || error{
     AttrTooLong,
 };
 
-// ── big-endian attribute accessors ──────────────────────────────────────────
-//
-// DRY candidate: `netlink.codec.Attr` has host-endian `asU8/asU16/asU32` only.
-// The four readers and four writers below are net-byte-order twins of those
-// and belong next to them in `netlink/src/codec.zig` (netfilter, nfqueue,
-// nflog and cttimeout all need exactly these); they live here because
-// `modules/netlink` is owned elsewhere this wave.
-
-fn asBe16(a: codec.Attr) DecodeError!u16 {
-    if (a.data.len != 2) return error.BadLength;
-    return std.mem.readInt(u16, a.data[0..2], .big);
-}
-
-fn asBe32(a: codec.Attr) DecodeError!u32 {
-    if (a.data.len != 4) return error.BadLength;
-    return std.mem.readInt(u32, a.data[0..4], .big);
-}
-
-fn asBe64(a: codec.Attr) DecodeError!u64 {
-    if (a.data.len != 8) return error.BadLength;
-    return std.mem.readInt(u64, a.data[0..8], .big);
-}
-
-fn asU8(a: codec.Attr) DecodeError!u8 {
-    if (a.data.len != 1) return error.BadLength;
-    return a.data[0];
-}
-
-fn appendAttrU8(
-    gpa: std.mem.Allocator,
-    list: *std.ArrayList(u8),
-    attr_type: u16,
-    value: u8,
-) BuildError!void {
-    try codec.appendAttr(gpa, list, attr_type, &[_]u8{value});
-}
-
-fn appendAttrBe16(
-    gpa: std.mem.Allocator,
-    list: *std.ArrayList(u8),
-    attr_type: u16,
-    value: u16,
-) BuildError!void {
-    var raw: [2]u8 = undefined;
-    std.mem.writeInt(u16, &raw, value, .big);
-    try codec.appendAttr(gpa, list, attr_type, &raw);
-}
-
-fn appendAttrBe32(
-    gpa: std.mem.Allocator,
-    list: *std.ArrayList(u8),
-    attr_type: u16,
-    value: u32,
-) BuildError!void {
-    var raw: [4]u8 = undefined;
-    std.mem.writeInt(u32, &raw, value, .big);
-    try codec.appendAttr(gpa, list, attr_type, &raw);
-}
-
-fn appendAttrBe64(
-    gpa: std.mem.Allocator,
-    list: *std.ArrayList(u8),
-    attr_type: u16,
-    value: u64,
-) BuildError!void {
-    var raw: [8]u8 = undefined;
-    std.mem.writeInt(u64, &raw, value, .big);
-    try codec.appendAttr(gpa, list, attr_type, &raw);
-}
+// The net-byte-order attribute accessors this module needs — `asBe16/32/64`
+// and `appendAttrBe16/32/64` — now live in `netlink.codec`, next to their
+// host-order twins, and are used from there (`a.asBe32()`,
+// `codec.appendAttrBe32(…)`). They were duplicated here and in
+// `modules/nftables` before; every netfilter family (ctnetlink, nftables,
+// nfqueue, nflog, cttimeout) needs exactly them.
 
 // ── nfgenmsg ────────────────────────────────────────────────────────────────
 
@@ -511,16 +448,16 @@ pub fn decodeTuple(nest: []const u8) DecodeError!Tuple {
         CTA_TUPLE.PROTO => {
             var ps = a.nested();
             while (try ps.next()) |pa| switch (pa.type) {
-                CTA_PROTO.NUM => out.proto = try asU8(pa),
-                CTA_PROTO.SRC_PORT => out.src_port = try asBe16(pa),
-                CTA_PROTO.DST_PORT => out.dst_port = try asBe16(pa),
-                CTA_PROTO.ICMP_ID, CTA_PROTO.ICMPV6_ID => out.icmp_id = try asBe16(pa),
-                CTA_PROTO.ICMP_TYPE, CTA_PROTO.ICMPV6_TYPE => out.icmp_type = try asU8(pa),
-                CTA_PROTO.ICMP_CODE, CTA_PROTO.ICMPV6_CODE => out.icmp_code = try asU8(pa),
+                CTA_PROTO.NUM => out.proto = try pa.asU8(),
+                CTA_PROTO.SRC_PORT => out.src_port = try pa.asBe16(),
+                CTA_PROTO.DST_PORT => out.dst_port = try pa.asBe16(),
+                CTA_PROTO.ICMP_ID, CTA_PROTO.ICMPV6_ID => out.icmp_id = try pa.asBe16(),
+                CTA_PROTO.ICMP_TYPE, CTA_PROTO.ICMPV6_TYPE => out.icmp_type = try pa.asU8(),
+                CTA_PROTO.ICMP_CODE, CTA_PROTO.ICMPV6_CODE => out.icmp_code = try pa.asU8(),
                 else => {},
             };
         },
-        CTA_TUPLE.ZONE => out.zone = try asBe16(a),
+        CTA_TUPLE.ZONE => out.zone = try a.asBe16(),
         else => {},
     };
     return out;
@@ -535,12 +472,12 @@ fn decodeCounters(nest: []const u8) DecodeError!Counters {
     var out: Counters = .{};
     var it: codec.AttrIterator = .{ .buf = nest };
     while (try it.next()) |a| switch (a.type) {
-        CTA_COUNTERS.PACKETS => out.packets = try asBe64(a),
-        CTA_COUNTERS.BYTES => out.bytes = try asBe64(a),
+        CTA_COUNTERS.PACKETS => out.packets = try a.asBe64(),
+        CTA_COUNTERS.BYTES => out.bytes = try a.asBe64(),
         // The 32-bit forms are dead in every kernel that speaks the 64-bit
         // ones, but decode them rather than ignoring a real counter.
-        CTA_COUNTERS.PACKETS32 => out.packets = try asBe32(a),
-        CTA_COUNTERS.BYTES32 => out.bytes = try asBe32(a),
+        CTA_COUNTERS.PACKETS32 => out.packets = try a.asBe32(),
+        CTA_COUNTERS.BYTES32 => out.bytes = try a.asBe32(),
         else => {},
     };
     return out;
@@ -559,19 +496,19 @@ pub fn decodeFlow(payload: []const u8) DecodeError!Flow {
     while (try it.next()) |a| switch (a.type) {
         CTA.TUPLE_ORIG => out.orig = try decodeTuple(a.data),
         CTA.TUPLE_REPLY => out.reply = try decodeTuple(a.data),
-        CTA.STATUS => out.status = try asBe32(a),
-        CTA.TIMEOUT => out.timeout = try asBe32(a),
-        CTA.MARK => out.mark = try asBe32(a),
-        CTA.ID => out.id = try asBe32(a),
-        CTA.USE => out.use = try asBe32(a),
-        CTA.ZONE => out.zone = try asBe16(a),
+        CTA.STATUS => out.status = try a.asBe32(),
+        CTA.TIMEOUT => out.timeout = try a.asBe32(),
+        CTA.MARK => out.mark = try a.asBe32(),
+        CTA.ID => out.id = try a.asBe32(),
+        CTA.USE => out.use = try a.asBe32(),
+        CTA.ZONE => out.zone = try a.asBe16(),
         CTA.COUNTERS_ORIG => out.counters_orig = try decodeCounters(a.data),
         CTA.COUNTERS_REPLY => out.counters_reply = try decodeCounters(a.data),
         CTA.TIMESTAMP => {
             var ts = a.nested();
             while (try ts.next()) |ta| switch (ta.type) {
-                CTA_TIMESTAMP.START => out.timestamp_start = try asBe64(ta),
-                CTA_TIMESTAMP.STOP => out.timestamp_stop = try asBe64(ta),
+                CTA_TIMESTAMP.START => out.timestamp_start = try ta.asBe64(),
+                CTA_TIMESTAMP.STOP => out.timestamp_stop = try ta.asBe64(),
                 else => {},
             };
         },
@@ -581,9 +518,9 @@ pub fn decodeFlow(payload: []const u8) DecodeError!Flow {
                 if (pa.type != CTA_PROTOINFO.TCP) continue; // DCCP/SCTP: deferred
                 var tcp = pa.nested();
                 while (try tcp.next()) |ta| switch (ta.type) {
-                    CTA_PROTOINFO_TCP.STATE => out.tcp_state = @enumFromInt(try asU8(ta)),
-                    CTA_PROTOINFO_TCP.WSCALE_ORIGINAL => out.tcp_wscale_orig = try asU8(ta),
-                    CTA_PROTOINFO_TCP.WSCALE_REPLY => out.tcp_wscale_reply = try asU8(ta),
+                    CTA_PROTOINFO_TCP.STATE => out.tcp_state = @enumFromInt(try ta.asU8()),
+                    CTA_PROTOINFO_TCP.WSCALE_ORIGINAL => out.tcp_wscale_orig = try ta.asU8(),
+                    CTA_PROTOINFO_TCP.WSCALE_REPLY => out.tcp_wscale_reply = try ta.asU8(),
                     CTA_PROTOINFO_TCP.FLAGS_ORIGINAL => out.tcp_flags_orig = try tcpFlags(ta),
                     CTA_PROTOINFO_TCP.FLAGS_REPLY => out.tcp_flags_reply = try tcpFlags(ta),
                     else => {},
@@ -636,18 +573,18 @@ pub fn appendTuple(
         const proto = t.proto.?;
         const icmpv6 = proto == IPPROTO.ICMPV6;
         const p_off = try codec.nestBegin(gpa, list, codec.NLA_F_NESTED | CTA_TUPLE.PROTO);
-        try appendAttrU8(gpa, list, CTA_PROTO.NUM, proto);
-        if (t.src_port) |p| try appendAttrBe16(gpa, list, CTA_PROTO.SRC_PORT, p);
-        if (t.dst_port) |p| try appendAttrBe16(gpa, list, CTA_PROTO.DST_PORT, p);
+        try codec.appendAttrU8(gpa, list, CTA_PROTO.NUM, proto);
+        if (t.src_port) |p| try codec.appendAttrBe16(gpa, list, CTA_PROTO.SRC_PORT, p);
+        if (t.dst_port) |p| try codec.appendAttrBe16(gpa, list, CTA_PROTO.DST_PORT, p);
         if (t.icmp_code) |c|
-            try appendAttrU8(gpa, list, if (icmpv6) CTA_PROTO.ICMPV6_CODE else CTA_PROTO.ICMP_CODE, c);
+            try codec.appendAttrU8(gpa, list, if (icmpv6) CTA_PROTO.ICMPV6_CODE else CTA_PROTO.ICMP_CODE, c);
         if (t.icmp_type) |ty|
-            try appendAttrU8(gpa, list, if (icmpv6) CTA_PROTO.ICMPV6_TYPE else CTA_PROTO.ICMP_TYPE, ty);
+            try codec.appendAttrU8(gpa, list, if (icmpv6) CTA_PROTO.ICMPV6_TYPE else CTA_PROTO.ICMP_TYPE, ty);
         if (t.icmp_id) |id|
-            try appendAttrBe16(gpa, list, if (icmpv6) CTA_PROTO.ICMPV6_ID else CTA_PROTO.ICMP_ID, id);
+            try codec.appendAttrBe16(gpa, list, if (icmpv6) CTA_PROTO.ICMPV6_ID else CTA_PROTO.ICMP_ID, id);
         codec.nestEnd(list, p_off);
     }
-    if (t.zone) |z| try appendAttrBe16(gpa, list, CTA_TUPLE.ZONE, z);
+    if (t.zone) |z| try codec.appendAttrBe16(gpa, list, CTA_TUPLE.ZONE, z);
     codec.nestEnd(list, tuple_off);
 }
 
@@ -725,7 +662,7 @@ pub fn buildDeleteRequest(
         .orig => CTA.TUPLE_ORIG,
         .reply => CTA.TUPLE_REPLY,
     }, tuple);
-    if (expect_id) |id| try appendAttrBe32(gpa, &list, CTA.ID, id);
+    if (expect_id) |id| try codec.appendAttrBe32(gpa, &list, CTA.ID, id);
     codec.finishHeader(&list, hdr);
     return list.toOwnedSlice(gpa);
 }
@@ -801,14 +738,14 @@ pub fn buildNewRequest(
     try appendNfgenmsg(gpa, &list, family, 0);
     try appendTuple(gpa, &list, CTA.TUPLE_ORIG, spec.orig);
     try appendTuple(gpa, &list, CTA.TUPLE_REPLY, spec.reply);
-    if (spec.status) |s| try appendAttrBe32(gpa, &list, CTA.STATUS, s);
-    if (spec.timeout) |t| try appendAttrBe32(gpa, &list, CTA.TIMEOUT, t);
-    if (spec.mark) |m| try appendAttrBe32(gpa, &list, CTA.MARK, m);
+    if (spec.status) |s| try codec.appendAttrBe32(gpa, &list, CTA.STATUS, s);
+    if (spec.timeout) |t| try codec.appendAttrBe32(gpa, &list, CTA.TIMEOUT, t);
+    if (spec.mark) |m| try codec.appendAttrBe32(gpa, &list, CTA.MARK, m);
     if (spec.tcp_state != null or spec.tcp_flags_orig != null or spec.tcp_flags_reply != null) {
         const pi_off = try codec.nestBegin(gpa, &list, codec.NLA_F_NESTED | CTA.PROTOINFO);
         const tcp_off = try codec.nestBegin(gpa, &list, codec.NLA_F_NESTED | CTA_PROTOINFO.TCP);
         if (spec.tcp_state) |s|
-            try appendAttrU8(gpa, &list, CTA_PROTOINFO_TCP.STATE, @intFromEnum(s));
+            try codec.appendAttrU8(gpa, &list, CTA_PROTOINFO_TCP.STATE, @intFromEnum(s));
         if (spec.tcp_flags_orig) |f| try codec.appendAttr(
             gpa,
             &list,
@@ -824,7 +761,7 @@ pub fn buildNewRequest(
         codec.nestEnd(&list, tcp_off);
         codec.nestEnd(&list, pi_off);
     }
-    if (spec.zone) |z| try appendAttrBe16(gpa, &list, CTA.ZONE, z);
+    if (spec.zone) |z| try codec.appendAttrBe16(gpa, &list, CTA.ZONE, z);
     codec.finishHeader(&list, hdr);
     return list.toOwnedSlice(gpa);
 }
@@ -996,7 +933,7 @@ test "delete with expect_id appends CTA_ID and a flush carries no tuple" {
     while (try it.next()) |a| switch (a.type) {
         CTA.TUPLE_REPLY => saw_reply_tuple = true,
         CTA.TUPLE_ORIG => return error.TestUnexpectedResult,
-        CTA.ID => saw_id = try asBe32(a),
+        CTA.ID => saw_id = try a.asBe32(),
         else => {},
     };
     try testing.expect(saw_reply_tuple);
@@ -1162,7 +1099,7 @@ test "big-endian discipline: a host-endian read of CTA_TIMEOUT would be wrong" {
     const raw = [_]u8{ 0x08, 0x00, 0x07, 0x00, 0x00, 0x06, 0x97, 0x75 };
     var it: codec.AttrIterator = .{ .buf = &raw };
     const a = (try it.next()).?;
-    try testing.expectEqual(@as(u32, 431989), try asBe32(a));
+    try testing.expectEqual(@as(u32, 431989), try a.asBe32());
     // …and the trap this module exists to avoid:
     if (native_endian == .little)
         try testing.expectEqual(@as(u32, 0x75970600), try a.asU32());
@@ -1257,7 +1194,7 @@ test "decoder rejects wrong-sized scalars, not unknown attributes" {
         defer list.deinit(gpa);
         try appendNfgenmsg(gpa, &list, .ipv4, 0);
         try codec.appendAttr(gpa, &list, 4095, &.{ 0xde, 0xad, 0xbe, 0xef });
-        try appendAttrBe32(gpa, &list, CTA.MARK, 5);
+        try codec.appendAttrBe32(gpa, &list, CTA.MARK, 5);
         const f = try decodeFlow(list.items);
         try testing.expectEqual(@as(u32, 5), f.mark.?);
     }
@@ -1296,7 +1233,7 @@ test "decoder survives misaligned and adversarially nested attribute streams" {
     try appendNfgenmsg(gpa, &list, .ipv4, 0);
     var offs: [64]usize = undefined;
     for (&offs) |*o| o.* = try codec.nestBegin(gpa, &list, codec.NLA_F_NESTED | CTA.TUPLE_ORIG);
-    try appendAttrBe32(gpa, &list, CTA.MARK, 1);
+    try codec.appendAttrBe32(gpa, &list, CTA.MARK, 1);
     var i: usize = offs.len;
     while (i > 0) : (i -= 1) codec.nestEnd(&list, offs[i - 1]);
     _ = decodeFlow(list.items) catch {}; // must not crash or hang

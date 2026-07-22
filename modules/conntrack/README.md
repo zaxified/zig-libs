@@ -12,7 +12,8 @@ interface and carries what the text file cannot: 64-bit counters, connmark, zone
 TCP state, timestamps — and it is writable and event-driven.
 
 Wire framing and TLV walking are reused from the `netlink` module's codec (`nlmsghdr`, the
-`nlattr` walkers, `nestBegin`/`nestEnd`, the typed errno mapping and extended-ACK strings);
+`nlattr` walkers, `nestBegin`/`nestEnd`, the big-endian attribute accessors every netfilter
+family needs, the multi-part dump triage, the typed errno mapping and extended-ACK strings);
 this module adds the `nfgenmsg` header, the CTA_* attribute tree and a `NETLINK_NETFILTER`
 socket. Addresses are `netaddr.Ip`.
 

@@ -160,18 +160,22 @@ const ext_ack_msg_max = 256; // kernel reason strings are short sentences
 /// A blocking `NETLINK_NETFILTER` socket. One instance per thread/loop; no
 /// shared state.
 ///
-/// DRY candidate: everything from `open` down through `recvDatagram`,
-/// `awaitAck` and the `NLM_F_DUMP_INTR` retry is the same transport discipline
-/// as `netlink.Socket` and `genetlink.Socket` — bind, portid capture,
+/// The multi-part reply triage of `dump` is `netlink.classifyDumpMessage` —
+/// the (portid, seq) match, the `NLM_F_DUMP_INTR` restart and the control
+/// message dispatch are shared with `netlink` and `nftables`; only the policy
+/// above it (which request, which reply type, which parser, which errno
+/// mapping) is per-family and stays here.
+///
+/// DRY candidate (remaining): everything from `open` down through
+/// `recvDatagram` and `awaitAck` is still the same *transport* discipline as
+/// `netlink.Socket` and `genetlink.Socket` — bind, portid capture,
 /// `NETLINK_EXT_ACK`, the `MSG_PEEK|MSG_TRUNC` buffer-growth loop, the
-/// (portid, seq) reply match, the extended-ACK capture. It is re-implemented
-/// here only because `netlink.Socket.open` hardcodes `linux.NETLINK.ROUTE` and
-/// keeps its transport fields private. The shared shape wants to move into
-/// `netlink` as a protocol-parameterised `netlink.Transport`
-/// (`open(protocol, groups)`, `send`, `recvDatagram`, `awaitAck`, `dump`) that
-/// `netlink`, `genetlink`, `tc` and this module would all sit on; only the
-/// policy above it — which message types, which fixed header, which parser —
-/// is genuinely per-family.
+/// extended-ACK capture. It is re-implemented here only because
+/// `netlink.Socket.open` hardcodes `linux.NETLINK.ROUTE`. The shared shape
+/// wants to move into `netlink` as a protocol-parameterised
+/// `netlink.Transport` (`open(protocol, groups)`, `send`, `recvDatagram`,
+/// `awaitAck`) that `netlink`, `genetlink`, `tc` and this module would all sit
+/// on.
 pub const Socket = struct {
     gpa: std.mem.Allocator,
     fd: i32,
@@ -318,29 +322,28 @@ pub const Socket = struct {
                 const dgram = try self.recvDatagram();
                 var it: codec.MessageIterator = .{ .buf = dgram };
                 while (it.next() catch return error.MalformedReply) |m| {
-                    if (m.pid != self.portid or m.seq != seq) continue;
-                    if (m.flags & codec.NLM_F_DUMP_INTR != 0) {
-                        // The table changed under the dump: what we have may be
-                        // inconsistent, so start over with a fresh sequence.
-                        out.deinit(self.gpa);
-                        if (attempt < max_dump_attempts) continue :retry;
-                        return error.InconsistentDump;
-                    }
-                    switch (m.type) {
-                        codec.NLMSG_DONE => return out.toOwnedSlice(self.gpa),
-                        codec.NLMSG_ERROR => {
-                            const code = m.errorCode() catch return error.MalformedReply;
-                            if (code == 0) return out.toOwnedSlice(self.gpa); // ACK
+                    switch (netlink.classifyDumpMessage(m, self.portid, seq)) {
+                        .skip => {},
+                        .restart => {
+                            // The table changed under the dump: what we have
+                            // may be inconsistent, so start over with a fresh
+                            // sequence.
+                            out.deinit(self.gpa);
+                            if (attempt < max_dump_attempts) continue :retry;
+                            return error.InconsistentDump;
+                        },
+                        .done => return out.toOwnedSlice(self.gpa),
+                        .failed => |code| {
                             self.captureExtAck(m);
                             return netlink.errorFromCode(code);
                         },
-                        codec.NLMSG_NOOP => {},
-                        codec.NLMSG_OVERRUN => return error.Overrun,
-                        wire.msg_ct_new => {
-                            const f = wire.decodeFlow(m.payload) catch return error.MalformedReply;
+                        .overrun => return error.Overrun,
+                        .malformed => return error.MalformedReply,
+                        .record => |rec| {
+                            if (rec.type != wire.msg_ct_new) continue;
+                            const f = wire.decodeFlow(rec.payload) catch return error.MalformedReply;
                             try out.append(self.gpa, f);
                         },
-                        else => {},
                     }
                 }
             }

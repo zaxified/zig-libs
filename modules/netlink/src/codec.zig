@@ -155,6 +155,17 @@ pub const Message = struct {
         }
         return null;
     }
+
+    /// The `nlmsg_seq` of the request the kernel is complaining about, taken
+    /// from the echoed `nlmsghdr` inside `struct nlmsgerr`, or null when the
+    /// payload is too short to carry one. **This is what turns a batch failure
+    /// into "message #N failed"** — the `NLMSG_ERROR` message's own seq
+    /// normally carries it too, but the echoed copy proves it (and some
+    /// kernels report a commit failure with seq 0).
+    pub fn errorRequestSeq(m: Message) Error!?u32 {
+        if (m.payload.len < 4 + header_len) return null;
+        return std.mem.readInt(u32, m.payload[4 + 8 ..][0..4], native_endian);
+    }
 };
 
 /// Walk a buffer of concatenated netlink messages (one recv datagram, or a
@@ -225,6 +236,31 @@ pub const Attr = struct {
     /// NUL-terminated on the wire; a missing terminator is tolerated).
     pub fn asString(a: Attr) []const u8 {
         return std.mem.trimEnd(u8, a.data, "\x00");
+    }
+
+    // ── big-endian accessors ────────────────────────────────────────────────
+    //
+    // rtnetlink puts its integers on the wire in **host** byte order, which is
+    // what `asU16`/`asU32` above decode. Every netfilter family (ctnetlink,
+    // nftables, nfqueue, nflog, cttimeout) does the opposite: its integer
+    // attributes are **network** byte order and the kernel does *not* set
+    // `NLA_F_NET_BYTEORDER` on them, so nothing on the wire distinguishes the
+    // two — the reader has to know its family. These are the net-order twins
+    // of the host-order accessors, with the same exact-width guards.
+
+    pub fn asBe16(a: Attr) Error!u16 {
+        if (a.data.len != 2) return error.BadLength;
+        return std.mem.readInt(u16, a.data[0..2], .big);
+    }
+
+    pub fn asBe32(a: Attr) Error!u32 {
+        if (a.data.len != 4) return error.BadLength;
+        return std.mem.readInt(u32, a.data[0..4], .big);
+    }
+
+    pub fn asBe64(a: Attr) Error!u64 {
+        if (a.data.len != 8) return error.BadLength;
+        return std.mem.readInt(u64, a.data[0..8], .big);
     }
 };
 
@@ -360,6 +396,60 @@ pub fn appendAttrU8(
     };
 }
 
+// ── big-endian writers ──────────────────────────────────────────────────────
+//
+// The net-order twins of `appendAttrU16`/`appendAttrU32` above, for the
+// netfilter families whose integer attributes are network byte order (see the
+// note on `Attr.asBe16`). Like their host-order twins they cannot overflow the
+// u16 length field — the payload is a fixed 2/4/8 bytes — so `AttrTooLong` is
+// asserted away rather than propagated.
+
+/// Append a u16-valued attribute in network byte order.
+pub fn appendAttrBe16(
+    gpa: std.mem.Allocator,
+    list: *std.ArrayList(u8),
+    attr_type: u16,
+    value: u16,
+) std.mem.Allocator.Error!void {
+    var raw: [2]u8 = undefined;
+    std.mem.writeInt(u16, &raw, value, .big);
+    appendAttr(gpa, list, attr_type, &raw) catch |err| switch (err) {
+        error.AttrTooLong => unreachable, // 6 bytes total
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+}
+
+/// Append a u32-valued attribute in network byte order.
+pub fn appendAttrBe32(
+    gpa: std.mem.Allocator,
+    list: *std.ArrayList(u8),
+    attr_type: u16,
+    value: u32,
+) std.mem.Allocator.Error!void {
+    var raw: [4]u8 = undefined;
+    std.mem.writeInt(u32, &raw, value, .big);
+    appendAttr(gpa, list, attr_type, &raw) catch |err| switch (err) {
+        error.AttrTooLong => unreachable, // 8 bytes total
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+}
+
+/// Append a u64-valued attribute in network byte order (ctnetlink counters,
+/// nftables handles).
+pub fn appendAttrBe64(
+    gpa: std.mem.Allocator,
+    list: *std.ArrayList(u8),
+    attr_type: u16,
+    value: u64,
+) std.mem.Allocator.Error!void {
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, value, .big);
+    appendAttr(gpa, list, attr_type, &raw) catch |err| switch (err) {
+        error.AttrTooLong => unreachable, // 12 bytes total
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+}
+
 /// Open a nested attribute: appends a TLV header with a placeholder length
 /// and returns its offset for the closing `nestEnd`. `attr_type` is written
 /// verbatim — rtnetlink nests (`IFLA_LINKINFO`, `TCA_OPTIONS`, …) are
@@ -402,6 +492,64 @@ pub fn appendAttrString(
     try list.appendSlice(gpa, s);
     // One zero run covers both the terminating NUL and the alignment pad.
     try list.appendNTimes(gpa, 0, alignUp(total) - total + 1);
+}
+
+// ── multi-part dump triage ──────────────────────────────────────────────────
+
+/// What a caller's dump loop should do with one message of a multi-part reply.
+/// See `classifyDumpMessage`.
+pub const DumpStep = union(enum) {
+    /// Not ours (stale/foreign portid or seq) or an explicit no-op — drop it
+    /// and read on.
+    skip,
+    /// `NLM_F_DUMP_INTR`: the kernel's tables changed mid-dump, so everything
+    /// collected so far may be inconsistent. Discard it and re-send the
+    /// request (with a fresh sequence number).
+    restart,
+    /// `NLMSG_DONE`, or an `NLMSG_ERROR` carrying code 0 (a bare ACK, which is
+    /// how an empty dump ends). The collected items are complete.
+    done,
+    /// `NLMSG_ERROR` with a non-zero negative errno. The caller maps it onto
+    /// its own error set (`errorFromCode`, `writeErrorFromCode`, …) and may
+    /// first pull the extended-ACK reason out of `msg`.
+    failed: i32,
+    /// `NLMSG_OVERRUN`: the kernel dropped messages; the dump is incomplete
+    /// and the caller must resynchronise.
+    overrun,
+    /// The `NLMSG_ERROR` payload is too short to hold an errno — the reply
+    /// failed wire validation.
+    malformed,
+    /// A payload message for the caller's parser. The caller still decides
+    /// whether `msg.type` is a reply type it wants.
+    record: Message,
+};
+
+/// Classify one message of a multi-part reply against the socket's identity.
+///
+/// This is the triage every netlink dump loop performs, in the order the
+/// kernel's framing requires: match on (portid, seq) first — anything stale or
+/// foreign is skipped, which also self-heals the queue after an aborted
+/// earlier dump — then honour `NLM_F_DUMP_INTR`, then dispatch on the control
+/// message types. Everything *above* it (which request, which reply type,
+/// which parser, which error mapping, how items are allocated) is per-family
+/// policy and stays with the caller, which is why this returns a verdict
+/// instead of driving the loop.
+///
+/// Pure: no I/O, no allocation. Callers on other netlink protocols
+/// (`NETLINK_NETFILTER`, `NETLINK_GENERIC`) use it with their own sockets.
+pub fn classifyDumpMessage(m: Message, portid: u32, seq: u32) DumpStep {
+    if (m.pid != portid or m.seq != seq) return .skip;
+    if (m.flags & NLM_F_DUMP_INTR != 0) return .restart;
+    return switch (m.type) {
+        NLMSG_DONE => .done,
+        NLMSG_ERROR => blk: {
+            const code = m.errorCode() catch break :blk .malformed;
+            break :blk if (code == 0) .done else .{ .failed = code };
+        },
+        NLMSG_NOOP => .skip,
+        NLMSG_OVERRUN => .overrun,
+        else => .{ .record = m },
+    };
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────
@@ -688,6 +836,124 @@ test "extended ACK: hostile offsets are rejected, never over-read" {
     std.mem.writeInt(u32, over[4..8], 4096, native_endian);
     const overm: Message = .{ .type = NLMSG_ERROR, .flags = NLM_F_ACK_TLVS, .seq = 0, .pid = 0, .payload = &over };
     try testing.expectError(error.Truncated, overm.errorAttrs());
+}
+
+test "big-endian accessors read network order and reject wrong widths" {
+    const a16: Attr = .{ .type = 1, .raw_type = 1, .data = &.{ 0x00, 0x16 } };
+    try testing.expectEqual(@as(u16, 22), try a16.asBe16());
+    try testing.expectError(error.BadLength, a16.asBe32());
+    try testing.expectError(error.BadLength, a16.asBe64());
+
+    const a32: Attr = .{ .type = 1, .raw_type = 1, .data = &.{ 0x00, 0x00, 0x00, 0x0a } };
+    try testing.expectEqual(@as(u32, 10), try a32.asBe32());
+    try testing.expectError(error.BadLength, a32.asBe16());
+
+    const a64: Attr = .{ .type = 1, .raw_type = 1, .data = &(([_]u8{0} ** 7) ++ [_]u8{0x2a}) };
+    try testing.expectEqual(@as(u64, 42), try a64.asBe64());
+    try testing.expectError(error.BadLength, a64.asBe16());
+
+    // The host-order twin of the same bytes must disagree on little-endian —
+    // proof the two families really do need separate accessors.
+    if (native_endian == .little)
+        try testing.expectEqual(@as(u32, 0x0a000000), try a32.asU32());
+}
+
+test "golden: big-endian writers emit network order" {
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(testing.allocator);
+
+    try appendAttrBe16(testing.allocator, &list, 3, 22);
+    try testing.expectEqualSlices(u8, &.{ 0x06, 0x00, 0x03, 0x00, 0x00, 0x16, 0x00, 0x00 }, list.items);
+
+    list.clearRetainingCapacity();
+    try appendAttrBe32(testing.allocator, &list, 3, 10);
+    try testing.expectEqualSlices(u8, &.{ 0x08, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x0a }, list.items);
+
+    list.clearRetainingCapacity();
+    try appendAttrBe64(testing.allocator, &list, 1, 10);
+    try testing.expectEqualSlices(
+        u8,
+        &.{ 0x0c, 0x00, 0x01, 0x00, 0, 0, 0, 0, 0, 0, 0, 0x0a },
+        list.items,
+    );
+
+    // Round-trip through the matching readers.
+    list.clearRetainingCapacity();
+    try appendAttrBe16(testing.allocator, &list, 1, 0xbeef);
+    try appendAttrBe32(testing.allocator, &list, 2, 0xdeadbeef);
+    try appendAttrBe64(testing.allocator, &list, 3, 0x0123456789abcdef);
+    var it: AttrIterator = .{ .buf = list.items };
+    try testing.expectEqual(@as(u16, 0xbeef), try (try it.next()).?.asBe16());
+    try testing.expectEqual(@as(u32, 0xdeadbeef), try (try it.next()).?.asBe32());
+    try testing.expectEqual(@as(u64, 0x0123456789abcdef), try (try it.next()).?.asBe64());
+}
+
+test "errorRequestSeq recovers the offending request's sequence number" {
+    const gpa = testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    const h = try appendHeader(gpa, &list, NLMSG_ERROR, 0, 7, 42);
+    var code: [4]u8 = undefined;
+    std.mem.writeInt(i32, &code, -22, native_endian);
+    try appendPadded(gpa, &list, &code);
+    // The echoed request header: seq 7 sits at offset 8 of the nlmsghdr.
+    var echoed: [header_len]u8 = @splat(0);
+    std.mem.writeInt(u32, echoed[0..4], header_len, native_endian);
+    std.mem.writeInt(u32, echoed[8..12], 7, native_endian);
+    try appendPadded(gpa, &list, &echoed);
+    finishHeader(&list, h);
+
+    var it: MessageIterator = .{ .buf = list.items };
+    const m = (try it.next()).?;
+    try testing.expectEqual(@as(i32, -22), try m.errorCode());
+    try testing.expectEqual(@as(?u32, 7), try m.errorRequestSeq());
+
+    // Too short to carry an echoed header: null, never an over-read.
+    const cut: Message = .{ .type = NLMSG_ERROR, .flags = 0, .seq = 0, .pid = 0, .payload = &.{ 0, 0, 0, 0 } };
+    try testing.expectEqual(@as(?u32, null), try cut.errorRequestSeq());
+}
+
+test "classifyDumpMessage triages a multi-part reply" {
+    const me: u32 = 42;
+    const seq: u32 = 7;
+    const mk = struct {
+        fn f(t: u16, flags: u16, pid: u32, s: u32, payload: []const u8) Message {
+            return .{ .type = t, .flags = flags, .seq = s, .pid = pid, .payload = payload };
+        }
+    }.f;
+
+    // Foreign portid / stale sequence are dropped before anything else — even
+    // when they look like a control message.
+    try testing.expectEqual(DumpStep.skip, classifyDumpMessage(mk(NLMSG_DONE, 0, 99, seq, &.{}), me, seq));
+    try testing.expectEqual(DumpStep.skip, classifyDumpMessage(mk(NLMSG_DONE, 0, me, seq + 1, &.{}), me, seq));
+    // NLM_F_DUMP_INTR outranks the message type.
+    try testing.expectEqual(
+        DumpStep.restart,
+        classifyDumpMessage(mk(NLMSG_DONE, NLM_F_DUMP_INTR, me, seq, &.{}), me, seq),
+    );
+    try testing.expectEqual(DumpStep.done, classifyDumpMessage(mk(NLMSG_DONE, 0, me, seq, &.{}), me, seq));
+    try testing.expectEqual(DumpStep.skip, classifyDumpMessage(mk(NLMSG_NOOP, 0, me, seq, &.{}), me, seq));
+    try testing.expectEqual(DumpStep.overrun, classifyDumpMessage(mk(NLMSG_OVERRUN, 0, me, seq, &.{}), me, seq));
+
+    // NLMSG_ERROR: code 0 is a bare ACK (an empty dump), non-zero is a failure.
+    var zero: [4]u8 = @splat(0);
+    try testing.expectEqual(DumpStep.done, classifyDumpMessage(mk(NLMSG_ERROR, 0, me, seq, &zero), me, seq));
+    var einval: [4]u8 = undefined;
+    std.mem.writeInt(i32, &einval, -22, native_endian);
+    try testing.expectEqual(
+        DumpStep{ .failed = -22 },
+        classifyDumpMessage(mk(NLMSG_ERROR, 0, me, seq, &einval), me, seq),
+    );
+    // A truncated errno is a wire-format failure, not an errno of 0.
+    try testing.expectEqual(
+        DumpStep.malformed,
+        classifyDumpMessage(mk(NLMSG_ERROR, 0, me, seq, &.{ 0, 0 }), me, seq),
+    );
+
+    // Anything else is a record for the caller's parser, type included.
+    const rec = classifyDumpMessage(mk(16, NLM_F_MULTI, me, seq, &.{0xaa}), me, seq);
+    try testing.expectEqual(@as(u16, 16), rec.record.type);
+    try testing.expectEqualSlices(u8, &.{0xaa}, rec.record.payload);
 }
 
 test "fuzz: message + attribute walkers never crash, loop, or read OOB" {

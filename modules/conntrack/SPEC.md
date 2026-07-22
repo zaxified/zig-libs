@@ -97,20 +97,32 @@ The event API is deliberately a seam rather than a callback: `Socket.nextEvents(
 exactly one blocking `recv` and hands back an `EventIterator` over that datagram. The iterator
 is pure — it can also be fed a replayed capture, which is how the offline event tests work.
 
-### DRY candidates (tracked, not done here)
+### DRY candidates
 
-`modules/netlink` was owned by another workstream while this module was written, so two pieces
-of duplication are deliberate and commented in place:
+Two were filed when this module was written (`modules/netlink` was owned by another workstream
+at the time); both are now **paid off**, and one remains:
 
-1. **`asBe16/32/64` + `appendAttrBe16/32/64`** (`wire.zig`) are net-byte-order twins of
-   `netlink.codec.Attr.asU16/asU32` / `appendAttrU32` and belong beside them — nfqueue, nflog,
-   cttimeout and nf_acct all need exactly these.
-2. **The socket transport** (`root.zig`) repeats `netlink.Socket`/`genetlink.Socket` almost
-   line for line, because `netlink.Socket.open` hardcodes `linux.NETLINK.ROUTE` and keeps its
-   fields private. The shared shape wants to become a protocol-parameterised
-   `netlink.Transport` (`open(protocol, groups)`, `send`, `recvDatagram`, `awaitAck`, `dump`)
-   that `netlink`, `genetlink`, `tc` and `conntrack` all sit on; only the policy above it —
-   message types, fixed header, parser — is genuinely per-family.
+1. ~~**`asBe16/32/64` + `appendAttrBe16/32/64`** (`wire.zig`)~~ — **done.** They live in
+   `netlink.codec` beside their host-order twins (`Attr.asBe16/32/64`,
+   `codec.appendAttrBe16/32/64`) and this module uses them from there; `nftables` had written
+   the same eight independently, and nfqueue, nflog, cttimeout and nf_acct will want them too.
+   Only the *writers'* error set changed on the way: this module's copies propagated
+   `AttrTooLong` from `appendAttr`, `nftables`' asserted it away. The shared ones assert
+   (`unreachable`) — the payload is a fixed 2/4/8 bytes, so the error is unreachable by
+   construction, and it matches the existing `appendAttrU16/U32/U8`. `BuildError` still lists
+   `AttrTooLong` because the string/raw builders here can still raise it.
+2. ~~**The dump loop**~~ — **done.** `Socket.dump`'s multi-part triage (the (portid, seq)
+   match, the `NLM_F_DUMP_INTR` restart, the `NLMSG_DONE`/`NLMSG_ERROR`/`NLMSG_NOOP`/
+   `NLMSG_OVERRUN` dispatch) is `netlink.classifyDumpMessage`, shared with `netlink`'s own
+   dumps and with `nftables`. It is a pure verdict function, not a driver: the policy above it
+   — which request, which reply type, which parser, which errno mapping, how items are
+   allocated — stays here, which is what lets three different netlink protocols share it.
+3. **The socket transport** (`root.zig`) still repeats `netlink.Socket`/`genetlink.Socket`
+   almost line for line, because `netlink.Socket.open` hardcodes `linux.NETLINK.ROUTE`. The
+   shared shape wants to become a protocol-parameterised `netlink.Transport`
+   (`open(protocol, groups)`, `send`, `recvDatagram`, `awaitAck`) that `netlink`, `genetlink`,
+   `tc` and `conntrack` all sit on. `netlink.Socket` now publishes `send`/`recvDatagram`, so
+   the *seam* exists; what is missing is the protocol parameter on `open`.
 
 ## Verification
 

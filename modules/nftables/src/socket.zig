@@ -23,14 +23,21 @@
 //! Everything the kernel is told travels through `wire.Batch`, so the atomicity
 //! guarantee is structural: one `sendmsg`, all-or-nothing.
 //!
-//! DRY candidate: `open`/`close`/`send`/`recvDatagram`/`setRecvTimeout` and the
-//! `MSG_PEEK|MSG_TRUNC` buffer-growth loop are the same transport discipline
-//! `netlink.Socket`, `genetlink.Socket` and `conntrack.Socket` each
-//! re-implement. `modules/conntrack/src/root.zig` already files this: the
-//! shared shape wants to move into `netlink` as a protocol-parameterised
-//! `netlink.Transport` (`open(protocol, groups)`, `send`, `recvDatagram`,
-//! `awaitAck`, `dump`). This module adds a fourth copy because it declares no
-//! dependencies in the root `build.zig` (see `nl.zig`'s header).
+//! The multi-part reply triage of `dumpInto` is `netlink.classifyDumpMessage`
+//! (re-exported as `nl.classifyDumpMessage`) — the (portid, seq) match, the
+//! `NLM_F_DUMP_INTR` restart and the control-message dispatch are shared with
+//! `netlink` and `conntrack`; only the policy above it (which request, which
+//! reply type, which decoder, which errno mapping) is per-family.
+//!
+//! DRY candidate (remaining): `open`/`close`/`send`/`recvDatagram`/
+//! `setRecvTimeout` and the `MSG_PEEK|MSG_TRUNC` buffer-growth loop are still
+//! the same transport discipline `netlink.Socket`, `genetlink.Socket` and
+//! `conntrack.Socket` each re-implement. `modules/conntrack/src/root.zig`
+//! files this too: the shared shape wants to move into `netlink` as a
+//! protocol-parameterised `netlink.Transport` (`open(protocol, groups)`,
+//! `send`, `recvDatagram`, `awaitAck`). `netlink.Socket` now publishes
+//! `send`/`recvDatagram`, so what is missing is the protocol parameter on
+//! `open`.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -493,24 +500,23 @@ pub const Socket = struct {
                 const dgram = try self.recvDatagram();
                 var it: nl.MessageIterator = .{ .buf = dgram };
                 while (it.next() catch return error.MalformedReply) |m| {
-                    if (m.pid != self.portid or m.seq != seq) continue;
-                    if (m.flags & nl.NLM_F_DUMP_INTR != 0) {
-                        if (attempt < max_dump_attempts) continue :retry;
-                        return error.InconsistentDump;
-                    }
-                    switch (m.type) {
-                        nl.NLMSG_DONE => return,
-                        nl.NLMSG_ERROR => {
-                            const code = m.errorCode() catch return error.MalformedReply;
-                            if (code == 0) return; // bare ACK, empty dump
+                    switch (nl.classifyDumpMessage(m, self.portid, seq)) {
+                        .skip => {},
+                        .restart => {
+                            if (attempt < max_dump_attempts) continue :retry;
+                            return error.InconsistentDump;
+                        },
+                        // NLMSG_DONE, or a bare ACK = an empty dump.
+                        .done => return,
+                        .failed => |code| {
                             self.captureExtAck(m);
                             return errorFromErrno(code);
                         },
-                        nl.NLMSG_NOOP => {},
-                        nl.NLMSG_OVERRUN => return error.Overrun,
-                        else => {
-                            if (m.type == wire.nftMsg(want_type))
-                                append(arena, items, m.payload) catch |err| switch (err) {
+                        .overrun => return error.Overrun,
+                        .malformed => return error.MalformedReply,
+                        .record => |rec| {
+                            if (rec.type == wire.nftMsg(want_type))
+                                append(arena, items, rec.payload) catch |err| switch (err) {
                                     error.OutOfMemory => return error.OutOfMemory,
                                     else => return error.MalformedReply,
                                 };

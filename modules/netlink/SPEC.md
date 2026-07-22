@@ -25,6 +25,46 @@ headers (`linux/netlink.h`, `linux/rtnetlink.h`, `linux/if_link.h`, `linux/if_ad
 references only (framing/validation discipline, typed-query shape) — constants/struct layouts are
 the OS ABI, see NOTICE.
 
+## Shared codec surface (what other netlink families reuse)
+`codec.zig` is not just this module's private wire layer — it is the codec every netlink-family
+module in the tree sits on (`genetlink`, `nl80211`, `ethtool`, `tc`, `wireguard`, `ebpf`,
+`conntrack`, `nftables`). Three parts of it exist specifically to be shared:
+
+**Big-endian attribute accessors.** rtnetlink puts its integers on the wire in *host* order
+(`Attr.asU16`/`asU32`, `appendAttrU16`/`appendAttrU32`). Every **netfilter** family — ctnetlink,
+nftables, nfqueue, nflog, cttimeout, nf_acct — does the opposite: network order, and the kernel
+does **not** set `NLA_F_NET_BYTEORDER`, so nothing on the wire distinguishes the two and the
+reader has to know its family. `Attr.asBe16/asBe32/asBe64` and
+`appendAttrBe16/appendAttrBe32/appendAttrBe64` are the net-order twins, with the same exact-width
+guards (`error.BadLength` on any other length — never a truncating read). The writers take a
+fixed 2/4/8-byte payload, so like their host-order twins they assert `AttrTooLong` away
+(`unreachable`) instead of propagating it. `conntrack` and `nftables` had each written these
+eight independently before they landed here.
+
+**Multi-part dump triage — `DumpStep` + `classifyDumpMessage(m, portid, seq)`.** The per-message
+verdict every dump loop needs, in the order the kernel's framing requires: match on
+(portid, seq) first — anything stale or foreign is skipped, self-healing the queue after an
+aborted earlier dump — then honour `NLM_F_DUMP_INTR` (`.restart`), then dispatch the control
+types (`.done` for `NLMSG_DONE` *and* for an `NLMSG_ERROR` carrying code 0, i.e. the bare ACK
+that ends an empty dump; `.failed = errno`; `.overrun`; `.malformed` for an errno payload too
+short to read; `.skip` for `NLMSG_NOOP`), and hand everything else back as `.record`.
+
+It is a **verdict function, not a driver** — deliberately. A driver would have to own the
+allocation strategy, the error set and the recv call, and those are exactly what differs between
+families: `netlink` collects into an `ArrayList(T)` and maps errno through `errorFromCode`,
+`conntrack` adds `error.Overrun` and captures the extended ACK first, `nftables` collects into a
+caller-supplied arena and maps through its own `errorFromErrno`. Keeping the verdict pure means
+sockets on *other netlink protocols* (`NETLINK_NETFILTER`, `NETLINK_GENERIC`) can share it
+without this module having to model their transports. `Socket.dump` and `Socket.dumpCollect`
+here are themselves written on it, so it cannot drift from the behaviour it describes.
+
+**Raw transport seam — `Socket.send` + `Socket.recvDatagram` (public).** For callers that need a
+message this module does not model. `tc` drives `RTM_GET*` dumps this way (today it goes through
+`handle()` and re-implements the syscall loops — it can now collapse onto this pair plus
+`classifyDumpMessage`; that rewire is a later wave, `tc` was read-only when this seam landed).
+The returned datagram borrows the socket's receive buffer and is valid until the next call on
+the socket. Sequence numbers come from `nextSeq`.
+
 ## Write ops (RTM_NEW\*/RTM_DEL\*)
 Supported, and **not** "read/dump only" any more (that scope statement was retired when the write
 path landed). Implemented: **addresses** (`addressAdd`/`addressDel` — `IFA_LOCAL`+`IFA_ADDRESS`,
@@ -223,7 +263,12 @@ enabled, i.e. both live round-trips really execute there.
 
 ## Backlog / deferred
 Multicast event monitoring (RTNLGRP subscription) is the remaining deliberate extension point on
-the transport. Write-path gaps listed under "Threat model / out of scope" above:
+the transport. **Protocol-parameterised transport:** `Socket.open` hardcodes
+`linux.NETLINK.ROUTE`, which is why `genetlink`, `conntrack` and `nftables` each carry their own
+copy of bind + portid capture + `NETLINK_EXT_ACK` + the `MSG_PEEK|MSG_TRUNC` growth loop. The
+codec and the dump triage are now shared; lifting the socket itself into a
+`netlink.Transport(open(protocol, groups), send, recvDatagram, awaitAck)` is the remaining piece,
+and is tracked in `conntrack`'s and `nftables`' specs as well. Write-path gaps listed under "Threat model / out of scope" above:
 `IFLA_INFO_DATA` for non-bridge kinds / veth peers, multipath routes, policy rules, and the bridge
 sub-list (MDB/multicast snooping, VXLAN device creation, VLAN tunnels, per-VLAN options, MRP/CFM/
 MST, backup port). Linux-only platform

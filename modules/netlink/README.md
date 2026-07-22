@@ -112,12 +112,29 @@ standalone, without a socket.
 Low-level, for custom queries and hand-built requests (all `pub`):
 `netlink.codec` — bounds-checked `MessageIterator`/`AttrIterator`,
 `Message.errorCode()` (NLMSG_ERROR → errno), `Message.errorMessage()`
-(extended-ACK string), `appendHeader`/`appendAttr*`/`nestBegin`/`nestEnd`
+(extended-ACK string), `Message.errorRequestSeq()` (which request of a batch
+the kernel rejected), `appendHeader`/`appendAttr*`/`nestBegin`/`nestEnd`
 encoders — plus `Socket.nextSeq()`/`Socket.requestAck()` (the write+ACK engine
 sibling modules reuse), the typed payload parsers (`parseLink`,
 `parseAddress`, `parseRoute`, `parseNeighbor`) and the UAPI constant tables
 (`AF`, `IFF`, `RTA`, `NDA`, `NUD`, `RTN`, `RTPROT`, `NTF`, `IFA_F`,
 `IFLA_INFO`, `RT_TABLE`, `RT_SCOPE`) and the `netlink.bridge` namespace.
+
+Shared with the other netlink families (see SPEC.md § "Shared codec surface"):
+
+- **Big-endian attribute accessors** — `Attr.asBe16/asBe32/asBe64` and
+  `appendAttrBe16/appendAttrBe32/appendAttrBe64`, the network-byte-order twins
+  of the host-order `asU16`/`asU32`/`appendAttrU*`. Every netfilter family
+  (ctnetlink, nftables, nfqueue, nflog, cttimeout) needs them, because its
+  integer attributes are network order *and* the kernel does not set
+  `NLA_F_NET_BYTEORDER` on them.
+- **`classifyDumpMessage(msg, portid, seq) DumpStep`** — the multi-part dump
+  triage (stale/foreign reply, `NLM_F_DUMP_INTR` restart, `NLMSG_DONE`/`ERROR`/
+  `NOOP`/`OVERRUN`, record). Pure and I/O-free, so a socket on another netlink
+  protocol can share it; this module's own dumps are written on it.
+- **`Socket.send` / `Socket.recvDatagram`** — the raw transport seam, for
+  driving a message type this module does not model over the same bound
+  socket. The received slice borrows the socket's buffer until the next call.
 
 ## Design notes
 

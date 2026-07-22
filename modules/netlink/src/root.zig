@@ -63,6 +63,11 @@ pub const Message = codec.Message;
 pub const MessageIterator = codec.MessageIterator;
 pub const Attr = codec.Attr;
 pub const AttrIterator = codec.AttrIterator;
+/// The shared multi-part dump triage — see `codec.classifyDumpMessage`. Other
+/// netlink protocols (`NETLINK_NETFILTER`, `NETLINK_GENERIC`) drive their own
+/// sockets through it.
+pub const DumpStep = codec.DumpStep;
+pub const classifyDumpMessage = codec.classifyDumpMessage;
 
 /// `AF_BRIDGE` extensions: bridge devices, FDB entries, VLAN filtering and
 /// bridge-port options. The builders/parsers live there; the `Socket` methods
@@ -1200,7 +1205,7 @@ const ext_ack_msg_max = 256;
 /// The subset of `RequestError` the receive path can raise; both `DumpError`
 /// and `RequestError` are supersets, so the shared helpers below work for the
 /// dump and the write path alike.
-const RecvError = error{
+pub const RecvError = error{
     OutOfMemory,
     RecvFailed,
     SystemResources,
@@ -1208,7 +1213,7 @@ const RecvError = error{
 };
 
 /// The subset of `RequestError` the send path can raise.
-const SendError = error{
+pub const SendError = error{
     SendFailed,
     SystemResources,
     AccessDenied,
@@ -1568,7 +1573,7 @@ pub const Socket = struct {
     /// Send a fully-built request (which must carry `seq` and `NLM_F_ACK`) and
     /// wait for its ACK. The generic write+ACK engine behind every op above.
     pub fn requestAck(self: *Socket, request: []const u8, seq: u32) RequestError!void {
-        try self.sendRaw(request);
+        try self.send(request);
         return self.awaitAck(seq);
     }
 
@@ -1649,24 +1654,20 @@ pub const Socket = struct {
                 const dgram = try self.recvDatagram();
                 var it: codec.MessageIterator = .{ .buf = dgram };
                 while (it.next() catch return error.MalformedReply) |m| {
-                    if (m.pid != self.portid or m.seq != seq) continue;
-                    if (m.flags & codec.NLM_F_DUMP_INTR != 0) {
-                        out.deinit(self.gpa);
-                        if (attempt < max_dump_attempts) continue :retry;
-                        return error.InconsistentDump;
-                    }
-                    switch (m.type) {
-                        codec.NLMSG_DONE => return out.toOwnedSlice(self.gpa),
-                        codec.NLMSG_ERROR => {
-                            const code = m.errorCode() catch return error.MalformedReply;
-                            if (code == 0) return out.toOwnedSlice(self.gpa); // ACK
-                            return errorFromCode(code);
+                    switch (codec.classifyDumpMessage(m, self.portid, seq)) {
+                        .skip => {},
+                        .restart => {
+                            out.deinit(self.gpa);
+                            if (attempt < max_dump_attempts) continue :retry;
+                            return error.InconsistentDump;
                         },
-                        codec.NLMSG_NOOP => {},
-                        codec.NLMSG_OVERRUN => return error.SystemResources,
-                        else => {
-                            if (m.type != reply_type) continue;
-                            const parsed = parseFn(m.payload) catch return error.MalformedReply;
+                        .done => return out.toOwnedSlice(self.gpa),
+                        .failed => |code| return errorFromCode(code),
+                        .overrun => return error.SystemResources,
+                        .malformed => return error.MalformedReply,
+                        .record => |rec| {
+                            if (rec.type != reply_type) continue;
+                            const parsed = parseFn(rec.payload) catch return error.MalformedReply;
                             if (parsed) |item| if (matchFn(item, filter))
                                 try out.append(self.gpa, item);
                         },
@@ -1698,33 +1699,29 @@ pub const Socket = struct {
         var attempt: usize = 0;
         retry: while (true) {
             attempt += 1;
-            try self.sendRaw(request);
+            try self.send(request);
             var out: std.ArrayList(T) = .empty;
             errdefer out.deinit(self.gpa);
             while (true) {
                 const dgram = try self.recvDatagram();
                 var it: codec.MessageIterator = .{ .buf = dgram };
                 while (it.next() catch return error.MalformedReply) |m| {
-                    if (m.pid != self.portid or m.seq != seq) continue;
-                    if (m.flags & codec.NLM_F_DUMP_INTR != 0) {
-                        out.deinit(self.gpa);
-                        if (attempt >= max_dump_attempts) return error.InconsistentDump;
-                        seq = self.nextSeq();
-                        std.mem.writeInt(u32, request[8..12], seq, native_endian);
-                        continue :retry;
-                    }
-                    switch (m.type) {
-                        codec.NLMSG_DONE => return out.toOwnedSlice(self.gpa),
-                        codec.NLMSG_ERROR => {
-                            const code = m.errorCode() catch return error.MalformedReply;
-                            if (code == 0) return out.toOwnedSlice(self.gpa); // ACK
-                            return errorFromCode(code);
+                    switch (codec.classifyDumpMessage(m, self.portid, seq)) {
+                        .skip => {},
+                        .restart => {
+                            out.deinit(self.gpa);
+                            if (attempt >= max_dump_attempts) return error.InconsistentDump;
+                            seq = self.nextSeq();
+                            std.mem.writeInt(u32, request[8..12], seq, native_endian);
+                            continue :retry;
                         },
-                        codec.NLMSG_NOOP => {},
-                        codec.NLMSG_OVERRUN => return error.SystemResources,
-                        else => {
-                            if (m.type != reply_type) continue;
-                            try collectFn(self.gpa, &out, m.payload);
+                        .done => return out.toOwnedSlice(self.gpa),
+                        .failed => |code| return errorFromCode(code),
+                        .overrun => return error.SystemResources,
+                        .malformed => return error.MalformedReply,
+                        .record => |rec| {
+                            if (rec.type != reply_type) continue;
+                            try collectFn(self.gpa, &out, rec.payload);
                         },
                     }
                 }
@@ -1750,12 +1747,20 @@ pub const Socket = struct {
         // the reply pid with our bound portid (libmnl requests do the same).
         req[codec.header_len] = family;
 
-        try self.sendRaw(req[0..total]);
+        try self.send(req[0..total]);
         return seq;
     }
 
-    /// Send one datagram to the kernel (pid 0), retrying on EINTR.
-    fn sendRaw(self: *Socket, msg: []const u8) SendError!void {
+    /// Send one complete, pre-built netlink message to the kernel (pid 0),
+    /// retrying on EINTR.
+    ///
+    /// Together with `recvDatagram` this is the module's **raw transport
+    /// seam**: it lets a caller drive a message type this module does not
+    /// model (`tc`'s `RTM_GET*` dumps, a custom `RTM_*` request) over the same
+    /// bound socket, instead of reaching for `handle()` and re-implementing
+    /// the syscall loops. Sequence numbers come from `nextSeq`; the reply
+    /// triage is `codec.classifyDumpMessage`.
+    pub fn send(self: *Socket, msg: []const u8) SendError!void {
         const dst: linux.sockaddr.nl = .{ .pid = 0, .groups = 0 };
         while (true) {
             const rc = linux.sendto(self.fd, msg.ptr, msg.len, 0, @ptrCast(&dst), @sizeOf(linux.sockaddr.nl));
@@ -1775,7 +1780,11 @@ pub const Socket = struct {
     /// sent by the kernel (sender pid != 0) are dropped — rtnetlink answers
     /// only ever come from the kernel, and any user process may address our
     /// port id.
-    fn recvDatagram(self: *Socket) RecvError![]const u8 {
+    ///
+    /// The returned slice borrows this socket's receive buffer and stays valid
+    /// only until the next call on the socket. The other half of the raw
+    /// transport seam — see `send`.
+    pub fn recvDatagram(self: *Socket) RecvError![]const u8 {
         while (true) {
             const prc = linux.recvfrom(
                 self.fd,

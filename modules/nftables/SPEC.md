@@ -7,7 +7,7 @@ The module has two backends over one shared vocabulary: the portable **JSON buil
 `Hook`, `Policy`, `Op`, `MetaKey`, `PayloadBase`, `LimitPer`/`LimitUnit`, `SetFlag`,
 `SetDataType`, …); `src/root.zig` re-exports them unchanged, so the JSON builder's public surface
 is exactly what it always was. Files: `types.zig` (vocabulary + kernel mappings), `nl.zig`
-(netlink primitives), `wire.zig` (nfnetlink framing/objects/batch/decoders), `expr.zig` (rule
+(thin alias layer over `netlink.codec`), `wire.zig` (nfnetlink framing/objects/batch/decoders), `expr.zig` (rule
 expressions + register model), `socket.zig` (transport, Linux-only), `goldens.zig` (captured
 `nft` traffic), `consistency.zig` (JSON↔native proof), `root.zig` (JSON builder + facade).
 
@@ -31,8 +31,9 @@ reports it from `apply()`. Reentrant; no globals.
 
 **Byte order.** netlink itself is host-endian, but every nftables *integer* attribute — and
 `nfgenmsg.res_id` — is big-endian on the wire and the kernel does **not** set
-`NLA_F_NET_BYTEORDER`. `nl.zig` therefore adds `asBe16/32/64` + `appendAttrBe16/32/64` and the
-host-endian `netlink.codec` accessors are deliberately unused for payload values. The exception is
+`NLA_F_NET_BYTEORDER`. The backend therefore uses `netlink.codec`'s big-endian accessors
+(`Attr.asBe16/32/64`, `appendAttrBe16/32/64`) and the host-endian twins are deliberately unused
+for payload values. The exception is
 the contents of a **register**: `NFTA_DATA_VALUE` is raw bytes, so a port is network order because
 that is how it sits in the packet, while `ct state`/`meta mark` are host order because that is how
 the kernel put them in the register (`expr.regU32` vs `expr.portBytes`).
@@ -186,13 +187,14 @@ step bound so no input can loop.
 Run: `zig build test-nftables` (and `--release=fast`), `unshare -rn zig build test-nftables`.
 
 ## Backlog / deferred
-- **Dependency inversion (one line in the root `build.zig`).** `nl.zig` is a re-typed subset of
-  `modules/netlink/src/codec.zig`, and `socket.zig`'s transport is a fourth copy of the discipline
-  `netlink`/`genetlink`/`conntrack` each carry. This module declares no deps, so it could not
-  import them. Adding `.deps = &.{"netlink"}` to the `nftables` entry lets `nl.zig` collapse to
-  `pub const codec = @import("netlink").codec;`. Both `DRY candidate:` notes name exactly what
-  moves — including the eight big-endian accessors that `conntrack` and this module have now
-  written independently and that belong in `netlink.codec`.
+- ~~**Dependency inversion (one line in the root `build.zig`).**~~ **Done.** The `nftables` entry
+  declares `.deps = &.{"netlink"}`, and `nl.zig` is now a thin alias layer over `netlink.codec`
+  with no codec code of its own — including the eight big-endian accessors, which moved into
+  `netlink.codec` (`conntrack` had written them independently too). `socket.zig`'s dump loop is
+  `netlink.classifyDumpMessage`. What is still a fourth copy is `socket.zig`'s **transport**
+  (`open`/`close`/`send`/`recvDatagram`/`setRecvTimeout` + the `MSG_PEEK|MSG_TRUNC` growth
+  loop): `netlink.Socket.open` hardcodes `linux.NETLINK.ROUTE`, so lifting that needs a
+  protocol-parameterised `netlink.Transport`, which is the remaining item.
 - **Objects, maps, flowtables.** `NFT_MSG_NEWOBJ`/`GETOBJ`/`DELOBJ` (named counters, quotas,
   ct helpers/timeouts), verdict/data maps (`NFT_SET_MAP` + `NFTA_SET_ELEM_DATA` semantics beyond
   the raw byte pass-through that already exists), and flowtables are not modelled.
