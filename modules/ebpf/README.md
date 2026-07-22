@@ -1,10 +1,12 @@
 # ebpf
 
-Pure-Zig **eBPF program generation, loading, attaching, and ring-buffer
-consumption** for a fixed, named set of small programs
-(`kprobe-counter`, `xdp-filter`, `ringbuf-emit`) — built on
-`std.os.linux.BPF`'s instruction encoders and `bpf()` syscall wrapper, plus
-the sibling `netlink` module for the XDP attach path.
+Pure-Zig **eBPF program generation, object-file loading, attaching, and
+ring-buffer consumption** — built on `std.os.linux.BPF`'s instruction
+encoders and `bpf()` syscall wrapper, plus the sibling `netlink` module for
+the XDP attach path. Two ways in: hand-built programs for a fixed, named set
+(`kprobe-counter`, `xdp-filter`, `ringbuf-emit`), or a real
+`clang -target bpf` `.o` opened, relocated (including CO-RE) and loaded by
+`src/object.zig`.
 
 - No maintained pure-Zig eBPF program-authoring library exists (`std` gives
   you the instruction-encoding primitives and the raw `bpf()` syscall, not a
@@ -44,7 +46,8 @@ discipline.
 | `src/btf.zig` | **OPUS** | BTF parser: header/strings/type section, every `BTF_KIND_*`, `KFLAG` bitfield offsets, cycle-safe resolution, kernel BTF (`/sys/kernel/btf/vmlinux`), **split** module BTF, `BPF_BTF_LOAD`, a minimal blob `Builder` |
 | `src/btfext.zig` | **OPUS** | `.BTF.ext` (`func_info`/`line_info`/`core_relos`) + **partial CO-RE**: field-offset relocation against kernel BTF (see "How much of CO-RE is real" below) |
 | `src/tracing.zig` | **OPUS** | attach-by-name for `fentry`/`fexit`/`fmod_ret`/`tp_btf`/LSM, plus the extended `BPF_PROG_LOAD` (`expected_attach_type`, `attach_btf_id`, `prog_btf_fd`, `func_info`, `line_info`) |
-| `src/elfsym.zig` | **OPUS** | minimal ELF64 `.symtab`/`.dynsym` reader + the vaddr -> **file offset** conversion a uprobe needs |
+| `src/elfsym.zig` | **OPUS** | minimal ELF64 `.symtab`/`.dynsym` reader + the vaddr -> **file offset** conversion a uprobe needs; plus an in-memory `Image` that enumerates sections **by name** (`e_shstrndx`), reads symbols and `SHT_REL` relocations |
+| `src/object.zig` | **OPUS** | **BPF object-file loader**: `clang -target bpf` `.o` -> section classification, BTF-defined **and** legacy map specs, map/global-data relocations, **CO-RE instruction patching**, `BPF_MAP_CREATE`/`BPF_MAP_FREEZE`/`BPF_BTF_LOAD`/`BPF_PROG_LOAD` |
 | `src/ringbuf.zig` | **OPUS** | mmap + acquire/release `BPF_MAP_TYPE_RINGBUF` consumer with `epoll` polling |
 | `src/perfbuf.zig` | **OPUS** | per-CPU `BPF_MAP_TYPE_PERF_EVENT_ARRAY` consumer: `data_head`/`data_tail` barriers, wrap reassembly, explicit `PERF_RECORD_LOST` |
 
@@ -297,12 +300,76 @@ matching with `___flavor` suffixes stripped and anonymous-member descent,
 and all six `BPF_CORE_FIELD_*` values including the bitfield load-widening
 that makes `LSHIFT_U64`/`RSHIFT_U64` correct.
 
-**Not** covered, and not pretended: rewriting the instruction stream (the
-value is returned, nothing is patched), multi-candidate matching and
-ambiguity detection, and the non-field relocation kinds (`TYPE_ID_*`,
-`TYPE_EXISTS`, `TYPE_SIZE`, `TYPE_MATCHES`, `ENUMVAL_*`) — those are parsed
-and refused with `error.UnsupportedReloKind`, never computed wrong. See
-`src/btfext.zig`'s header and `SPEC.md`'s backlog.
+**Instruction patching is now real too** (`src/object.zig`): the value is no
+longer merely returned, it is written back into the instruction — the `off`
+field of an `LDX`/`ST`/`STX`, the `imm` of an `ALU`/`ALU64`, both halves of
+an `LD_IMM64` pair, and for `FIELD_BYTE_SIZE` the **size bits of the
+opcode** itself.
+
+```zig
+var obj = try ebpf.openObjectFile(gpa, "probe.bpf.o", .{});
+defer obj.deinit();
+var vmlinux = try ebpf.loadKernelBtf(gpa);
+defer vmlinux.deinit();
+const p = obj.findProgram("trace_pid").?;
+_ = try ebpf.applyCoreRelos(p, &obj.btf.?, &vmlinux);
+// p.insns now reference THIS kernel's field offsets.
+```
+
+**Still** not covered, and not pretended: multi-candidate matching and
+ambiguity detection (the first name match wins), and the non-field
+relocation kinds (`TYPE_ID_*`, `TYPE_EXISTS`, `TYPE_SIZE`, `TYPE_MATCHES`,
+`ENUMVAL_*`) — those are parsed and refused with
+`error.UnsupportedReloKind`, never computed wrong. See `src/btfext.zig`'s
+header and `SPEC.md`'s backlog.
+
+### Loading a real `clang -target bpf` object
+
+```zig
+var obj = try ebpf.openObjectFile(gpa, "probe.bpf.o", .{});
+defer obj.deinit();          // closes every fd it created
+
+// Inspect before touching the kernel — this whole layer is unprivileged.
+for (obj.programs) |p|
+    std.debug.print("{s} in {s}: {d} insns, {d} relos\n",
+        .{ p.name, p.sec_name, p.insns.len, p.relos.len });
+for (obj.maps) |m|
+    std.debug.print("{s}: {t} {d}x{d}\n",
+        .{ m.name, m.map_type, m.key_size, m.value_size });
+
+// Create maps (seeding + freezing .rodata), BPF_BTF_LOAD the object's BTF,
+// relocate, and BPF_PROG_LOAD everything.
+ebpf.loadObject(&obj, .{}) catch |e| {
+    std.debug.print("{s} rejected: {s}\n", .{ obj.failed_program, obj.verifier_log });
+    return e;
+};
+
+// Attaching stays the existing surface.
+const fd = obj.programFd("count_open").?;
+var kp = try ebpf.attachKprobe(gpa, "do_sys_openat2", fd);
+defer kp.detach();
+
+const map_fd = obj.mapFd("counts").?;
+```
+
+What it handles: program sections named by attach type (the full
+section-name -> `prog_type`/`expected_attach_type` table, longest-prefix
+match, so `xdp/devmap` does not degrade to `xdp`), `.maps` BTF-defined map
+definitions (`__uint`/`__type`, whose values come out of the **BTF type
+graph** — `__uint(max_entries, 1024)` is a pointer to an array of 1024
+ints), the legacy `maps` section (which libbpf 1.0 dropped entirely),
+`license`, `version`, `.BTF`/`.BTF.ext`, `.rodata`/`.data`/`.bss` as
+internal single-entry `ARRAY` maps, `.rel<section>` map-fd and
+global-data relocations, per-program `func_info`/`line_info` slicing with
+`insn_off` rebased from ELF byte offsets to instruction indices, the
+`DATASEC` size/offset fixup `BPF_BTF_LOAD` requires, and a verifier log
+grown from `log_true_size` so it is never truncated.
+
+What it refuses with a typed error naming the symbol, rather than emitting a
+silently broken program: `error.SubprogramCallsUnsupported` (a
+`R_BPF_64_32` call into `.text`), `error.ExternSymbolUnsupported` (kfuncs,
+extern kconfig/ksym), `error.MapInMapUnsupported` (a `values` member),
+`error.PinningUnsupported`.
 
 Low-level, for building custom programs (all `pub`): `ebpf.Insn` (re-export
 of `std.os.linux.BPF.Insn` — every opcode builder needed lives there
@@ -403,13 +470,13 @@ KERNEL-SIDE eBPF program logic AS ZIG SOURCE, cross-compiled with
 helpers as ordinary Zig function calls resolved to fixed helper-id function
 pointers. This module deliberately does NOT use that route: it would need a
 second compilation unit (a different target triple than the rest of this
-repo), an ELF object parser to pull the resulting `.text`/maps sections back
-out (BPF program ELF objects use section-based map/prog discovery — this is
-most of what `libbpf`'s "skeleton" loader does), and BTF handling for modern
-map definitions — meaningfully MORE machinery than hand-building `Insn`
-arrays for three fixed, small programs and loading them directly via
-`BPF_PROG_LOAD`. Worth revisiting if this module ever needs to generate
-large or many programs; not worth it for three.
+repo) and a per-object build step. The other half of that objection —
+"an ELF object parser to pull the resulting `.text`/maps sections back out,
+plus BTF handling for modern map definitions" — **no longer applies**:
+`src/object.zig` is exactly that loader, so a Zig-source BPF program would
+now only need the second compilation unit, not the loading machinery. Still
+not worth a second target triple for three fixed programs; worth revisiting
+if this module ever needs to generate large or many programs.
 
 ## Design notes
 
@@ -442,9 +509,22 @@ large or many programs; not worth it for three.
   wrong lifetime model, and a test that cannot force a branch never covers
   it. A `bpf_cookie` (link-only) plus a fallback is a typed refusal rather
   than a dropped cookie.
-- **`elfsym` is a uprobe helper, not an ELF library.** It reads what a
-  probe needs (`.symtab`/`.dynsym` + `PT_LOAD`) and refuses everything else
-  (32-bit, foreign-endian) rather than guessing.
+- **`elfsym` is a uprobe helper plus a BPF-object reader, not an ELF
+  library.** It reads what a probe needs (`.symtab`/`.dynsym` + `PT_LOAD`),
+  and — since the object loader landed — what a relocatable `.o` needs
+  (section names via `e_shstrndx`, symbols, `SHT_REL` entries). It still
+  refuses everything else (32-bit, foreign-endian) rather than guessing.
+  There is **one** ELF decoder shared by both, not two: the section-header
+  decode and the field-offset constants are the same code.
+- **`object.zig` classifies before it creates.** Parsing, map-spec
+  extraction, relocation classification, `.BTF.ext` slicing and instruction
+  patching all happen with no syscall at all, so the exact bytes handed to
+  `bpf()` are asserted in unprivileged tests against real clang objects. The
+  syscalls are the only untested surface on a box without `CAP_BPF`.
+- **A `.rodata` map is created, seeded, and then FROZEN.** That order is not
+  cosmetic: `BPF_F_RDONLY_PROG` plus `BPF_MAP_FREEZE` is what lets the
+  verifier treat the array's contents as known constants, which is the whole
+  mechanism behind `const volatile` configuration globals.
 - **BTF is untrusted input, and treated as such.** `/sys/kernel/btf/vmlinux`
   is trustworthy; a `.BTF` section out of somebody's object file is not.
   `btf.parse` walks the whole type section once, sizing every record, so no
@@ -459,17 +539,16 @@ large or many programs; not worth it for three.
   error message and for reporting*, and `loadTracing` is the call that
   actually targets the program. Anything else would look like it worked and
   attach nowhere.
-- **Out of scope (deliberate)**: full CO-RE — instruction patching,
-  multi-candidate/ambiguity matching, and the non-field relocation kinds
-  (see "How much of CO-RE is real" above) — plus
-  `kprobe_multi`/`uprobe_multi` mass-attach, USDT `.note.stapsdt`
-  discovery, `tcx`/`netkit` attach entry points, `BPF_PROG_QUERY`,
-  cpumap/devmap attach, perf AUX/ITRACE areas, DWARF/line and symbol
-  demangling, tc/classifier programs, BTF-typed map definitions,
-  BPF-object ELF loading (`.BTF`/`.BTF.ext`/map/prog section discovery),
-  and the `bpftool`-style ELF-skeleton loading route noted above. The three
-  named programs and the attach mechanisms listed here are the whole
-  surface this module commits to; extending to a new program or attach kind
-  is additive (a new function following the same doc-comment discipline),
-  not a redesign. `SPEC.md`'s backlog section says what each deferred item
-  would actually take.
+- **Out of scope (deliberate)**: the rest of CO-RE —
+  multi-candidate/ambiguity matching and the non-field relocation kinds (see
+  "How much of CO-RE is real" above; **instruction patching moved OUT of
+  this list**) — plus, inside the object loader, sub-program (`.text`) call
+  linking, kfunc/extern/ksym resolution, `struct_ops` map value population,
+  map-in-map (`values`) initialization, bpffs pinning, and `mmap`-able
+  global-data maps with a generated skeleton struct. Outside it:
+  `kprobe_multi`/`uprobe_multi` mass-attach, USDT `.note.stapsdt` discovery,
+  `tcx`/`netkit` attach entry points, `BPF_PROG_QUERY`, cpumap/devmap
+  attach, perf AUX/ITRACE areas, DWARF/line and symbol demangling, and
+  tc/classifier program builders. Every one of the loader's gaps is a typed
+  error naming the symbol, not a silent mis-load. `SPEC.md`'s backlog
+  section says what each deferred item would actually take.

@@ -34,6 +34,16 @@ criteria are:
    return-value note in `programs.zig` — an unenforced ABI convention, not
    a verifier check).
 
+Since `object.zig` landed there is also a **conventional** untrusted-input
+surface: a `.o` handed to `openFile`/`open` is arbitrary bytes. Every count
+read out of it (`e_shnum`, `sh_size`, `sh_entsize`, a symbol index, a
+relocation's `r_offset`, a `DATASEC`'s `vlen`) is bounded before use, a
+section whose extent runs past the buffer fails when its data is asked for
+rather than at open time (so one bad section cannot make the object
+unreadable), and a bogus `e_shstrndx` costs the section *names* — every
+section then reads as `""` — instead of the object. The tests walk every
+97-byte prefix of a real fixture asserting a typed error and no crash.
+
 Secondary, more conventional risk: everything past `programs.zig` runs with
 elevated privilege (`CAP_BPF` minimum, `CAP_NET_ADMIN` for XDP/cgroup
 attach) — the usual discipline applies (attach/load handles are
@@ -531,11 +541,30 @@ Implemented and tested against genuine `clang -target bpf -O2 -g` output
   (1 -> 2 -> 4 -> 8 bytes until the bits fit an aligned load) that makes
   `LSHIFT_U64`/`RSHIFT_U64` correct.
 
+**Instruction patching is implemented too**, in `object.zig`
+(`patchCoreInsn` / `applyCoreRelos`). Which field the relocated value lands
+in depends on the instruction class, and getting that mapping wrong is
+silent — the program loads and reads the wrong bytes:
+
+| class (`code & 7`) | field patched | why |
+|---|---|---|
+| `BPF_LDX` / `BPF_ST` / `BPF_STX` (1/2/3) | `off` (`i16`) | a member access `*(u32 *)(r1 + OFF)` |
+| `BPF_ALU` / `BPF_ALU64` (4/7), `BPF_K` only | `imm` | `r1 += OFF`, and the bitfield shift amounts |
+| `BPF_LD` with `code == 0x18` (`LD_IMM64`) | `imm` of BOTH halves | a 64-bit constant |
+
+`FIELD_BYTE_SIZE` on a `LDX`/`ST`/`STX` additionally rewrites the **size
+bits of the opcode** (`B`/`H`/`W`/`DW`) rather than an operand, because what
+changed is the width of the load. A value that does not fit (`> i16` for an
+`LDX` offset, a byte size that is not 1/2/4/8) is
+`error.CoreValueTooLarge`; an instruction class that cannot carry the value
+is `error.UnsupportedCoreInsn`; a field absent from the target for a kind
+other than `FIELD_EXISTS` is `error.CoreFieldNotFound`. None of those is a
+silent no-op, which is the failure mode that matters: a CO-RE relocation
+that quietly did nothing produces a program that reads a *different kernel's*
+field offsets.
+
 **Not** implemented, and not claimed:
 
-- **instruction patching** — `computeFieldRelo` returns the value; nothing
-  rewrites a `[]Insn`. That needs a BPF-object loader (section-to-program
-  mapping, map relocation, `fd_array`) this module does not have;
 - **multi-candidate matching / ambiguity detection** — libbpf collects every
   target with a matching name, relocates against each, and errors when they
   disagree. This takes the first match;
@@ -543,8 +572,101 @@ Implemented and tested against genuine `clang -target bpf -O2 -g` output
   `TYPE_EXISTS`, `TYPE_SIZE`, `TYPE_MATCHES`, `ENUMVAL_EXISTS`,
   `ENUMVAL_VALUE`) — parsed, then refused with
   `error.UnsupportedReloKind`;
-- `.rel.BTF.ext` relocation of the section-name offsets, and BPF-object ELF
-  loading generally.
+- `.rel.BTF`/`.rel.BTF.ext` are **ignored by design**. libbpf does the same:
+  the `DATASEC` variable offsets those relocations would supply are instead
+  recomputed from the ELF symbol table (`fixupDatasecs`), which is
+  authoritative and also supplies the `DATASEC` *size* that no relocation
+  carries.
+
+## BPF object loading
+
+`object.zig`. A `clang -target bpf` object is a relocatable ELF64
+(`ET_REL`, `EM_BPF`, no program headers) whose meaning is entirely in
+**section names** — which is why `elfsym.zig` grew `e_shstrndx` handling and
+an in-memory `Image`; the uprobe path it was originally written for walks
+section *types* and never needed a name.
+
+| section | handled as |
+|---|---|
+| `xdp`, `kprobe/…`, `tracepoint/<cat>/<name>`, `fentry/…`, … | one or more programs; the name selects `prog_type` **and** `expected_attach_type` |
+| `.maps` | BTF-defined maps: one `VAR` per map inside the `DATASEC` |
+| `maps` | the pre-BTF `struct bpf_map_def` array (libbpf 1.0 dropped this; kept here) |
+| `license` / `version` | the license string / `kern_version` |
+| `.BTF` / `.BTF.ext` | the type graph; per-section `func_info`/`line_info`/`core_relo` |
+| `.rodata*`, `.data*`, `.bss*` | one internal single-entry `ARRAY` map each |
+| `.rel<section>` | `SHT_REL` relocations (note: **no dot** between `.rel` and the section name — `kprobe/x`'s live in `.relkprobe/x`) |
+| `.text` | sub-programs — `error.SubprogramCallsUnsupported` if referenced |
+
+### The two indirections that are easy to get wrong
+
+1. **A BTF-defined map's numbers live in the type graph, not in the
+   section's bytes.** `__uint(max_entries, 1024)` expands to
+   `int (*max_entries)[1024]` — a *pointer to an array of 1024 ints* — and
+   the value is the array's **element count**. `__type(key, u32)` expands to
+   `u32 *key`, where the value is the pointee's *size* and its type id
+   (which is what `btf_key_type_id` wants). The `.maps` section itself is
+   all zeros; a test asserts exactly that, so a loader reading numbers out
+   of the section bytes would fail immediately. A member whose shape is not
+   `PTR -> ARRAY` is `error.MalformedMapDefinition`, **not** the value 0 —
+   the difference between a diagnosed typo and a map created with the wrong
+   size. (`__uint(x, 0)` legitimately encodes as a zero-element array, so
+   the value 0 itself is accepted; `max_entries == 0` becomes
+   `error.ZeroMaxEntries` at create time, per map type.)
+
+2. **A map reference is a two-instruction `LD_IMM64` with a pseudo
+   `src_reg`.** `BPF_PSEUDO_MAP_FD (1)`: `imm` is a map fd. `BPF_PSEUDO_MAP_VALUE
+   (2)`: `imm` is a map fd **and the next instruction's `imm` is a byte
+   offset into that map's single value** — which is how a global variable in
+   `.rodata`/`.data`/`.bss` is addressed. BPF objects use `SHT_REL`, not
+   `RELA`, so the addend is inside the instruction: the final offset is
+   `sym.st_value + insn[0].imm`. Both halves matter — clang emits the offset
+   in `st_value` for a named global (`tag` at byte 8 of `.rodata`) and in
+   `insn.imm` for an `STT_SECTION` symbol.
+
+### Order of operations in `load`
+
+1. CO-RE relocations **first**, before anything is created — a relocation
+   failure must not leave maps behind.
+2. `BPF_MAP_CREATE` every map. An internal `.rodata*` map is then seeded
+   with the section contents and `BPF_MAP_FREEZE`d; `BPF_F_RDONLY_PROG` plus
+   the freeze is what makes the verifier treat its contents as constants
+   (the mechanism behind `const volatile` config globals). `.bss` is
+   `SHT_NOBITS` — no file bytes, and the map is already zeroed.
+3. `fixupDatasecs` + `BPF_BTF_LOAD`. **Mandatory**: clang emits every
+   `DATASEC` with `size == 0`, and the kernel's BTF verifier rejects that
+   outright, so loading an unfixed clang blob always fails. The real size is
+   the ELF section's `sh_size` and each variable's offset is its symbol's
+   `st_value`; the records are then sorted ascending, which the kernel also
+   requires.
+4. `relocateProgram` per program, then `BPF_PROG_LOAD` with `prog_btf_fd`,
+   `func_info` and `line_info`.
+
+`.BTF.ext` groups its records **per ELF section** with `insn_off` a **byte**
+offset; the kernel wants them **per program** with `insn_off` an
+**instruction index**. Both conversions happen at parse time. A section
+holding two `SEC("xdp")` functions (which clang does emit) is split at its
+`STT_FUNC` symbols and the section's relocations and `.BTF.ext` records are
+partitioned between them — a fixture covers exactly that case.
+
+### Verifier log
+
+A truncated verifier log is worse than none: it hides the real error behind
+`ENOSPC`. `load` therefore tries with no log at all, retries with 64 KiB on
+`EACCES`, and on `ENOSPC` grows to `max(log_true_size, 2 * len)` and retries
+again — `log_true_size` being the kernel's output field (6.4+) saying how
+big the log would have been. `Object.verifier_log` and
+`Object.failed_program` hold the result.
+
+### Refused, not half-done
+
+Every one is a typed error naming the symbol or section:
+`error.SubprogramCallsUnsupported` (an `R_BPF_64_32` call relocation, or a
+`LD_IMM64` against `.text`), `error.ExternSymbolUnsupported` (any
+`SHN_UNDEF` symbol: kfunc, extern kconfig, weak extern),
+`error.MapInMapUnsupported` (a `values` member),
+`error.PinningUnsupported`, `error.UnknownMapMember`,
+`error.UnknownProgramSection` (an executable section matching no prefix —
+`load` refuses unless `ignore_unknown_sections`).
 
 ## Validation layering (privilege-aware)
 
@@ -576,6 +698,37 @@ something real:
      a **real `libc.so.6`** cross-checked against an *independent*
      derivation — the section headers (`sh_addr`/`sh_offset`) rather than
      the program headers the module uses. Two tables that must agree;
+   - `object`: the section-name table (longest-prefix match, so
+     `xdp/devmap` cannot degrade to `xdp`; the `.s` sleepable variants; the
+     cgroup hooks that share a `prog_type` and differ only in
+     `expected_attach_type`), the CO-RE instruction patchers driven with
+     hand-written instructions, and then **seven real
+     `clang -target bpf -O2 -g` objects embedded byte for byte as
+     fixtures** (their `.c` sources are committed beside them, with the
+     exact command, so they are regenerable). Against those: map specs
+     extracted from the BTF type graph and checked against the numbers in
+     the C source, `.rodata` seed bytes, `DATASEC` fixup offsets,
+     relocations classified and then **applied with synthetic map fds** and
+     the resulting instruction stream asserted word for word, a section
+     holding two functions split correctly, and CO-RE relocated (a) against
+     the object's own BTF, which must be a fixed point, (b) against a
+     synthetic target BTF whose fields moved, where the instructions must
+     change, and (c) against the running kernel's `/sys/kernel/btf/vmlinux`
+     — readable with **no capability**, so that one really runs: this box
+     reports `task_struct.pid` at byte 2800 where the fixture's local view
+     has it at 0. Hostile: every 97-byte prefix of a real object, a bogus
+     `e_shstrndx` (which must cost the *names*, not the object), `e_shoff`
+     past the end, an absurd `e_shnum`, an undersized `e_shentsize`, an
+     unaligned relocation offset patched into a real `.rel` section, an
+     unaligned instruction section, a `.maps` `VAR` whose type was rewritten
+     from `STRUCT` to `INT`, a `__uint` member that is not a
+     pointer-to-array, and an object whose `.symtab` was blanked. The parse
+     was additionally **cross-checked against libbpf**: `bpftool gen
+     skeleton` on each fixture names the same maps and programs (and its
+     `.rodata` struct has `threshold` at 0 and `tag` at 8, matching the
+     `DATASEC` fixup test). `bpftool` refuses `legacy_map.bpf.o` outright —
+     libbpf 1.0 dropped legacy `maps` sections — which this loader still
+     handles;
    - the `BPF_BTF_LOAD` attr as golden bytes (including the zero tail past
      what an older kernel knows) and the **extended `bpf_attr.prog_load`**
      field-for-field against the UAPI offsets — `attach_btf_id` at 108,
@@ -625,7 +778,13 @@ something real:
      record types skipped-but-counted, a head that moves mid-iteration,
      `max_records`/stop bounds, and ten hostile-header cases including the
      zero-size spin and an over-large wrapping record).
-2. **Privileged, gracefully skipped.** Real attach/detach round trips and
+2. **Privileged, gracefully skipped.** For `object.zig` specifically, the
+   **only** untested surface on an unprivileged box is the four syscalls
+   themselves (`BPF_MAP_CREATE`, `BPF_MAP_UPDATE_ELEM`, `BPF_MAP_FREEZE`,
+   `BPF_BTF_LOAD`/`BPF_PROG_LOAD`); everything that decides *what those
+   syscalls are handed* — parse, map-spec extraction, `DATASEC` fixup,
+   relocation patching and the final instruction stream — is asserted
+   offline against the clang fixtures. Real attach/detach round trips and
    real mmap+consume: a `ringbufEmit` program on a kprobe, read back through
    the ring buffer; a **uprobe** on a symbol in the test binary itself
    (exported only in test builds), triggered and counted; a **tracepoint** on
@@ -668,24 +827,49 @@ BTF, `attach_btf_id` resolution, attach-by-name for
 plus the extended `BPF_PROG_LOAD` carrying `prog_btf_fd`/`func_info`/
 `line_info`, and the field-offset slice of CO-RE (`btfext.zig`).
 
+Implemented since then (also moved out of this list): **BPF-object ELF
+loading** (`object.zig` + `elfsym.Image`), **BTF-typed map definitions**,
+and **CO-RE instruction patching**.
+
 Still deferred, honestly:
 
-- **The rest of CO-RE** — instruction patching, multi-candidate matching and
-  ambiguity detection, and the non-field relocation kinds. See the "CO-RE:
-  what is implemented, and what is not" section above for the exact line;
-  the container and field-offset relocation ARE done, the rest is not, and
-  `error.UnsupportedReloKind` is how a caller finds out rather than getting
-  a wrong number.
-- **BPF-object ELF loading.** `elfsym.zig` reads section headers but not
-  section *names*, so nothing here lifts `.BTF`/`.BTF.ext`/`maps`/program
-  sections out of a `clang -target bpf` object. That is the missing piece
-  between "this module can relocate a `.BTF.ext` record" and "this module
-  can load a CO-RE object" — it also needs map creation from BTF-typed map
-  definitions and `fd_array` relocation.
-- **BTF-typed map definitions** (`struct { __uint(type, …); }` in a
-  `.maps` DATASEC) — the parser can read the DATASEC and the VARs; nothing
-  turns them into `BPF_MAP_CREATE` calls with
-  `btf_key_type_id`/`btf_value_type_id`.
+- **The rest of CO-RE** — multi-candidate matching and ambiguity detection,
+  and the non-field relocation kinds. See the "CO-RE: what is implemented,
+  and what is not" section above for the exact line; the container, the
+  field-offset relocation and the instruction patching ARE done, the rest is
+  not, and `error.UnsupportedReloKind` is how a caller finds out rather than
+  getting a wrong number.
+- **Sub-program (`.text`) call linking.** A program calling a non-inlined
+  helper function of its own compiles to an `R_BPF_64_32` call relocation
+  into `.text`; loading it means concatenating the callee's instructions
+  onto the caller's, fixing the call's relative offset, merging
+  `func_info`/`line_info` and re-running the callee's own relocations.
+  Refused with `error.SubprogramCallsUnsupported` — never emitted broken.
+- **kfuncs / externs / ksyms.** An `SHN_UNDEF` symbol is
+  `error.ExternSymbolUnsupported`. Real support needs `BPF_PSEUDO_KFUNC_CALL`
+  with the kfunc's BTF id resolved out of vmlinux (and out of module BTF,
+  which the split-BTF parser can already read) plus an `fd_array` of module
+  BTF fds, and — for extern variables — a synthesized `.kconfig` map.
+- **Map-in-map and `prog_array` population** (a `values` member in a `.maps`
+  struct): `error.MapInMapUnsupported`. Needs a two-phase create (inner map
+  first, `inner_map_fd` on the outer) and a post-load
+  `BPF_MAP_UPDATE_ELEM` pass filling the array with fds.
+- **bpffs pinning** (`__uint(pinning, LIBBPF_PIN_BY_NAME)`): parsed and
+  reported, then `error.PinningUnsupported`. Needs `BPF_OBJ_PIN`/`_GET` and
+  a pin-path policy.
+- **`mmap`-able global-data maps and a generated skeleton.** libbpf sets
+  `BPF_F_MMAPABLE` on internal maps and hands userspace a struct pointer
+  into them; here they are ordinary arrays seeded through
+  `BPF_MAP_UPDATE_ELEM`, so a caller sets `const volatile` config by
+  editing `MapSpec.initial_data` before `load`, not by writing through a
+  mapped struct.
+- **`struct_ops` maps** — the section is classified, but populating a
+  `struct_ops` value (function pointers resolved to program fds) is not
+  implemented.
+- **`.BTF` sanitization for older kernels.** libbpf downgrades `FLOAT`,
+  `DECL_TAG`, `TYPE_TAG`, `ENUM64` etc. when the running kernel's BTF
+  verifier predates them. Here `BPF_BTF_LOAD` simply fails and
+  `LoadOptions.load_btf = false` is the escape hatch.
 - **`BPF_BTF_GET_FD_BY_ID` / `BPF_BTF_GET_NEXT_ID`** — reading back the BTF
   a loaded program or map carries (what `bpftool btf dump id N` does).
   `BPF_BTF_LOAD` is implemented; the retrieval side is not.

@@ -289,6 +289,57 @@ pub const resolveFuncSymbol = elfsym.resolveFunc;
 pub const resolveFuncOffset = elfsym.resolveFuncOffset;
 pub const ElfSymbol = elfsym.Symbol;
 pub const ElfResolveError = elfsym.ResolveError;
+/// A whole ELF64 image with its section NAMES resolved — what a BPF object
+/// loader needs and a uprobe attach never did.
+pub const ElfImage = elfsym.Image;
+pub const ElfSectionHeader = elfsym.SectionHeader;
+pub const ElfRawSymbol = elfsym.RawSymbol;
+pub const ElfRelocation = elfsym.Relocation;
+pub const ElfImageError = elfsym.ImageError;
+pub const ElfImageOpenError = elfsym.ImageOpenError;
+/// Parse an ELF64 image already in memory.
+pub const openElfImage = elfsym.openImage;
+/// Read a `.o`/`.so` from disk and parse it.
+pub const openElfImageFile = elfsym.openImageFile;
+
+pub const object = @import("object.zig");
+/// A parsed BPF object file — see `object.zig`.
+pub const Object = object.Object;
+pub const ObjectOpenOptions = object.OpenOptions;
+pub const ObjectLoadOptions = object.LoadOptions;
+pub const ObjectParseError = object.ParseError;
+pub const ObjectOpenError = object.OpenError;
+pub const ObjectLoadError = object.LoadError;
+pub const ObjectRelocateError = object.RelocateError;
+pub const ObjectCoreApplyError = object.CoreApplyError;
+pub const MapSpec = object.MapSpec;
+pub const MapOrigin = object.MapOrigin;
+pub const ProgramSpec = object.ProgramSpec;
+pub const ObjectRelo = object.Relo;
+pub const ObjectReloKind = object.ReloKind;
+pub const SectionDef = object.SectionDef;
+pub const SectionKindInfo = object.SectionKindInfo;
+/// The section-name -> `prog_type`/`expected_attach_type` table.
+pub const sectionDefs = object.section_defs;
+/// Resolve an ELF section name (`"kprobe/do_sys_openat2"`) to a program type.
+pub const classifySection = object.classifySection;
+/// Parse a BPF object already in memory (the bytes are copied).
+pub const openObject = object.open;
+/// Read and parse a `clang -target bpf` object from disk.
+pub const openObjectFile = object.openFile;
+/// Create the object's maps, relocate every program, and load them.
+pub const loadObject = object.load;
+/// Patch one program's instruction stream from created map fds — pure, so it
+/// is testable without `CAP_BPF`.
+pub const relocateProgram = object.relocateProgram;
+/// **CO-RE instruction patching** — rewrite an instruction with a relocated
+/// value (the half `btfext.computeFieldRelo` deliberately stopped short of).
+pub const patchCoreInsn = object.patchCoreInsn;
+/// Apply every CO-RE field relocation of a program against a target BTF.
+pub const applyCoreRelos = object.applyCoreRelos;
+/// Rewrite a clang blob's `DATASEC` sizes/offsets from the ELF symbol table —
+/// mandatory before `BPF_BTF_LOAD`, which rejects a zero-size `DATASEC`.
+pub const fixupBtfDatasecs = object.fixupDatasecs;
 
 pub const perfbuf = @import("perfbuf.zig");
 /// `BPF_MAP_TYPE_PERF_EVENT_ARRAY` consumer — see `perfbuf.zig`.

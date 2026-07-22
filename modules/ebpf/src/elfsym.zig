@@ -62,6 +62,7 @@ const native_endian = builtin.cpu.arch.endian();
 
 const EHDR_SIZE: usize = 64;
 const ehdr_type = 16;
+const ehdr_machine = 18;
 const ehdr_phoff = 32;
 const ehdr_shoff = 40;
 const ehdr_ehsize = 52;
@@ -69,6 +70,7 @@ const ehdr_phentsize = 54;
 const ehdr_phnum = 56;
 const ehdr_shentsize = 58;
 const ehdr_shnum = 60;
+const ehdr_shstrndx = 62;
 
 const PHDR_SIZE: usize = 56;
 const phdr_type = 0;
@@ -78,18 +80,30 @@ const phdr_filesz = 32;
 const phdr_memsz = 40;
 
 const SHDR_SIZE: usize = 64;
+const shdr_name = 0;
 const shdr_type = 4;
+const shdr_flags = 8;
+const shdr_addr = 16;
 const shdr_offset = 24;
 const shdr_size = 32;
 const shdr_link = 40;
+const shdr_info = 44;
+const shdr_addralign = 48;
 const shdr_entsize = 56;
 
 const SYM_SIZE: usize = 24;
 const sym_name = 0;
 const sym_info = 4;
+const sym_other = 5;
 const sym_shndx = 6;
 const sym_value = 8;
 const sym_size = 16;
+
+/// `Elf64_Rel` — a `SHT_REL` entry. BPF objects use REL, not RELA: the
+/// addend lives inside the instruction stream, not in the relocation record.
+const REL_SIZE: usize = 16;
+const rel_offset = 0;
+const rel_info = 8;
 
 /// `PT_LOAD`, `SHT_SYMTAB`, `SHT_DYNSYM`, `STT_FUNC`, `STT_GNU_IFUNC`,
 /// `SHN_UNDEF` — taken from std rather than re-declared.
@@ -269,14 +283,28 @@ fn rd(comptime T: type, buf: []const u8, off: usize) T {
     return std.mem.readInt(T, buf[off..][0..@divExact(@typeInfo(T).int.bits, 8)], native_endian);
 }
 
-/// A section header, decoded into the four fields this file uses.
-const Section = struct {
+/// One decoded `Elf64_Shdr`. Every field is kept (rather than only the five
+/// the uprobe path needs) because the BPF-object loader in `object.zig`
+/// keys off `sh_flags`/`sh_addralign`/`sh_info` as well — one decoder, two
+/// consumers, rather than a second ELF parser.
+pub const SectionHeader = struct {
+    /// Index of this header in the section header table.
+    index: u16,
+    /// Offset into the **section-header string table**, not into `.strtab`.
+    sh_name: u32,
     sh_type: u32,
+    sh_flags: u64,
+    sh_addr: u64,
     sh_offset: u64,
     sh_size: u64,
     sh_link: u32,
+    sh_info: u32,
+    sh_addralign: u64,
     sh_entsize: u64,
 };
+
+/// Kept as the old private name so the uprobe path below reads unchanged.
+const Section = SectionHeader;
 
 fn readSegments(gpa: std.mem.Allocator, file: *File, ehdr: *const [EHDR_SIZE]u8) ResolveError![]Segment {
     const phoff = rd(u64, ehdr, ehdr_phoff);
@@ -326,15 +354,25 @@ fn readSections(gpa: std.mem.Allocator, file: *File, ehdr: *const [EHDR_SIZE]u8)
     var i: u64 = 0;
     while (i < shnum) : (i += 1) {
         try file.readExact(shoff + i * shentsize, &buf);
-        out[@intCast(i)] = .{
-            .sh_type = rd(u32, &buf, shdr_type),
-            .sh_offset = rd(u64, &buf, shdr_offset),
-            .sh_size = rd(u64, &buf, shdr_size),
-            .sh_link = rd(u32, &buf, shdr_link),
-            .sh_entsize = rd(u64, &buf, shdr_entsize),
-        };
+        out[@intCast(i)] = decodeShdr(&buf, @intCast(i));
     }
     return out;
+}
+
+fn decodeShdr(buf: *const [SHDR_SIZE]u8, index: u16) SectionHeader {
+    return .{
+        .index = index,
+        .sh_name = rd(u32, buf, shdr_name),
+        .sh_type = rd(u32, buf, shdr_type),
+        .sh_flags = rd(u64, buf, shdr_flags),
+        .sh_addr = rd(u64, buf, shdr_addr),
+        .sh_offset = rd(u64, buf, shdr_offset),
+        .sh_size = rd(u64, buf, shdr_size),
+        .sh_link = rd(u32, buf, shdr_link),
+        .sh_info = rd(u32, buf, shdr_info),
+        .sh_addralign = rd(u64, buf, shdr_addralign),
+        .sh_entsize = rd(u64, buf, shdr_entsize),
+    };
 }
 
 fn findSection(sections: []const Section, sh_type: u32) ?usize {
@@ -409,6 +447,324 @@ fn nameMatches(s: []const u8, want: []const u8) bool {
     if (std.mem.eql(u8, full, want)) return true;
     const at = std.mem.indexOfScalar(u8, full, '@') orelse return false;
     return std.mem.eql(u8, full[0..at], want);
+}
+
+// ── whole-image reader: sections BY NAME ────────────────────────────────────
+//
+// The uprobe path above never needs a section's NAME — it walks section
+// *types* (`SHT_SYMTAB`/`SHT_DYNSYM`). A BPF object loader needs the exact
+// opposite: every interesting section (`xdp`, `kprobe/…`, `.maps`, `license`,
+// `.BTF`, `.rodata`, `.rel<section>`) is identified purely by name, which
+// lives in the section-header string table named by `e_shstrndx`.
+//
+// This reader is deliberately whole-image rather than `pread`-per-record: a
+// relocatable `.o` is kilobytes, is read many times over (headers, names,
+// symbols, relocations, instruction streams), and the loader must hand out
+// slices of the instruction stream anyway.
+
+pub const ImageError = error{
+    NotAnElf,
+    UnsupportedElf,
+    MalformedElf,
+    OutOfMemory,
+};
+
+pub const ImageOpenError = ImageError || error{ FileOpenFailed, FileReadFailed, FileTooLarge };
+
+/// `SHN_XINDEX` — "the real value is elsewhere" escape for the 16-bit
+/// `e_shstrndx`/`st_shndx` fields.
+pub const SHN_XINDEX: u16 = 0xffff;
+/// `SHN_LORESERVE` — `st_shndx` values at or above this are not section
+/// indices (`SHN_ABS`, `SHN_COMMON`, `SHN_XINDEX`).
+pub const SHN_LORESERVE: u16 = 0xff00;
+/// `EM_BPF`.
+pub const EM_BPF: u16 = 247;
+
+/// One decoded `Elf64_Sym`.
+pub const RawSymbol = struct {
+    /// Index in the symbol table it came from — what a relocation names.
+    index: u32,
+    /// Offset into the string table `sh_link` of the symbol table points at.
+    st_name: u32,
+    st_info: u8,
+    st_other: u8,
+    st_shndx: u16,
+    st_value: u64,
+    st_size: u64,
+
+    /// `ELF64_ST_TYPE`.
+    pub fn kind(self: RawSymbol) u4 {
+        return @truncate(self.st_info);
+    }
+    /// `ELF64_ST_BIND`.
+    pub fn bind(self: RawSymbol) u4 {
+        return @truncate(self.st_info >> 4);
+    }
+    /// True when `st_shndx` names a real section (not `SHN_UNDEF`/`SHN_ABS`/…).
+    pub fn hasSection(self: RawSymbol) bool {
+        return self.st_shndx != SHN_UNDEF and self.st_shndx < SHN_LORESERVE;
+    }
+};
+
+/// One decoded `Elf64_Rel`.
+pub const Relocation = struct {
+    r_offset: u64,
+    /// `ELF64_R_SYM(r_info)` — an index into the relocation section's
+    /// `sh_link` symbol table.
+    sym: u32,
+    /// `ELF64_R_TYPE(r_info)` — `R_BPF_64_*` for a BPF object.
+    type: u32,
+};
+
+/// A whole ELF64 image held in memory, with its section names resolved.
+///
+/// Borrows or owns `bytes` (see `openImage`); every slice it hands back
+/// points into that buffer, so the `Image` must outlive them.
+pub const Image = struct {
+    gpa: std.mem.Allocator,
+    bytes: []const u8,
+    owns_bytes: bool,
+    e_type: u16,
+    e_machine: u16,
+    /// Section headers, in file order (`sections[i].index == i`).
+    sections: []const SectionHeader,
+    /// The section-header string table's bytes. Empty when the object has
+    /// none (`e_shstrndx == SHN_UNDEF`), in which case every name is `""`.
+    shstrtab: []const u8,
+
+    pub fn deinit(self: *Image) void {
+        self.gpa.free(self.sections);
+        if (self.owns_bytes) self.gpa.free(self.bytes);
+        self.* = undefined;
+    }
+
+    /// Name of section `i`, or `""` when the object carries no section-header
+    /// string table or the offset is out of range. Never fails: a bogus name
+    /// offset must not make the whole object unreadable, it must make that
+    /// one section anonymous.
+    pub fn sectionName(self: *const Image, i: usize) []const u8 {
+        if (i >= self.sections.len) return "";
+        return cstr(self.shstrtab, self.sections[i].sh_name);
+    }
+
+    /// The section's file bytes. `SHT_NOBITS` (`.bss`) occupies no file space
+    /// and yields an empty slice rather than an error — its *size* is still
+    /// `sh_size`, which is what an internal `.bss` map is sized from.
+    pub fn sectionData(self: *const Image, i: usize) ImageError![]const u8 {
+        if (i >= self.sections.len) return error.MalformedElf;
+        const s = self.sections[i];
+        if (s.sh_type == SHT_NOBITS) return self.bytes[0..0];
+        if (s.sh_offset > self.bytes.len) return error.MalformedElf;
+        if (s.sh_size > self.bytes.len - s.sh_offset) return error.MalformedElf;
+        return self.bytes[@intCast(s.sh_offset)..][0..@intCast(s.sh_size)];
+    }
+
+    /// Index of the first section named `name`, or `null`.
+    pub fn findSection(self: *const Image, name: []const u8) ?usize {
+        for (0..self.sections.len) |i| {
+            if (std.mem.eql(u8, self.sectionName(i), name)) return i;
+        }
+        return null;
+    }
+
+    /// Index of the first `SHT_SYMTAB` section, or `null` (a fully stripped
+    /// relocatable object — which cannot be relocated at all).
+    pub fn symtabIndex(self: *const Image) ?usize {
+        for (self.sections, 0..) |s, i| {
+            if (s.sh_type == SHT_SYMTAB and s.sh_size != 0) return i;
+        }
+        return null;
+    }
+
+    /// How many `Elf64_Sym` entries section `i` holds.
+    pub fn symbolCount(self: *const Image, i: usize) ImageError!u32 {
+        const data = try self.sectionData(i);
+        const ent = self.entSize(i, SYM_SIZE);
+        if (ent < SYM_SIZE) return error.MalformedElf;
+        return @intCast(data.len / ent);
+    }
+
+    /// Decode symbol `n` of symbol-table section `i`.
+    pub fn symbol(self: *const Image, i: usize, n: u32) ImageError!RawSymbol {
+        const data = try self.sectionData(i);
+        const ent = self.entSize(i, SYM_SIZE);
+        if (ent < SYM_SIZE) return error.MalformedElf;
+        const at = @as(u64, n) * ent;
+        if (at + SYM_SIZE > data.len) return error.MalformedElf;
+        const r = data[@intCast(at)..][0..SYM_SIZE];
+        return .{
+            .index = n,
+            .st_name = rd(u32, r, sym_name),
+            .st_info = r[sym_info],
+            .st_other = r[sym_other],
+            .st_shndx = rd(u16, r, sym_shndx),
+            .st_value = rd(u64, r, sym_value),
+            .st_size = rd(u64, r, sym_size),
+        };
+    }
+
+    /// The name of a symbol from table `i`, resolved through that table's
+    /// `sh_link` string section.
+    pub fn symbolName(self: *const Image, i: usize, sym: RawSymbol) []const u8 {
+        if (i >= self.sections.len) return "";
+        const link = self.sections[i].sh_link;
+        if (link >= self.sections.len) return "";
+        const strings = self.sectionData(link) catch return "";
+        return cstr(strings, sym.st_name);
+    }
+
+    /// How many `Elf64_Rel` entries relocation section `i` holds.
+    pub fn relocationCount(self: *const Image, i: usize) ImageError!u32 {
+        const data = try self.sectionData(i);
+        const ent = self.entSize(i, REL_SIZE);
+        if (ent < REL_SIZE) return error.MalformedElf;
+        return @intCast(data.len / ent);
+    }
+
+    /// Decode relocation `n` of `SHT_REL` section `i`.
+    pub fn relocation(self: *const Image, i: usize, n: u32) ImageError!Relocation {
+        const data = try self.sectionData(i);
+        const ent = self.entSize(i, REL_SIZE);
+        if (ent < REL_SIZE) return error.MalformedElf;
+        const at = @as(u64, n) * ent;
+        if (at + REL_SIZE > data.len) return error.MalformedElf;
+        const r = data[@intCast(at)..][0..REL_SIZE];
+        const info = rd(u64, r, rel_info);
+        return .{
+            .r_offset = rd(u64, r, rel_offset),
+            .sym = @intCast(info >> 32),
+            .type = @truncate(info),
+        };
+    }
+
+    fn entSize(self: *const Image, i: usize, dflt: usize) u64 {
+        const e = self.sections[i].sh_entsize;
+        return if (e == 0) dflt else e;
+    }
+};
+
+/// `SHT_NOBITS` / `SHT_REL` / `SHT_STRTAB`, from std.
+const SHT_NOBITS: u32 = @intFromEnum(elf.SHT.NOBITS);
+pub const SHT_REL: u32 = @intFromEnum(elf.SHT.REL);
+const SHT_STRTAB: u32 = @intFromEnum(elf.SHT.STRTAB);
+/// `SHT_PROGBITS`.
+pub const SHT_PROGBITS: u32 = @intFromEnum(elf.SHT.PROGBITS);
+
+/// `SHF_ALLOC` / `SHF_EXECINSTR` — how a *program* section is told apart from
+/// a data section without knowing its name.
+pub const SHF_ALLOC: u64 = 0x2;
+pub const SHF_EXECINSTR: u64 = 0x4;
+
+fn cstr(strings: []const u8, off: u32) []const u8 {
+    if (off >= strings.len) return "";
+    const s = strings[off..];
+    const end = std.mem.indexOfScalar(u8, s, 0) orelse s.len;
+    return s[0..end];
+}
+
+/// Parse an ELF64 image already in memory. With `own_bytes`, the returned
+/// `Image` frees `bytes` in `deinit`.
+///
+/// Only the header and the section-header table are validated eagerly; a
+/// section whose `sh_offset`/`sh_size` runs past the end of the buffer is
+/// caught when its data is asked for, so one bad section cannot make the
+/// object unopenable.
+pub fn openImage(gpa: std.mem.Allocator, bytes: []const u8, own_bytes: bool) ImageError!Image {
+    errdefer if (own_bytes) gpa.free(@constCast(bytes));
+
+    if (bytes.len < EHDR_SIZE) return error.NotAnElf;
+    if (!std.mem.eql(u8, bytes[0..4], elf.MAGIC)) return error.NotAnElf;
+    if (bytes[elf.EI.CLASS] != @intFromEnum(elf.CLASS.@"64")) return error.UnsupportedElf;
+    const want_data: u8 = switch (native_endian) {
+        .little => @intFromEnum(elf.DATA.@"2LSB"),
+        .big => @intFromEnum(elf.DATA.@"2MSB"),
+    };
+    if (bytes[elf.EI.DATA] != want_data) return error.UnsupportedElf;
+    const ehdr = bytes[0..EHDR_SIZE];
+    if (rd(u16, ehdr, ehdr_ehsize) < EHDR_SIZE) return error.MalformedElf;
+
+    const shoff = rd(u64, ehdr, ehdr_shoff);
+    const shentsize = rd(u16, ehdr, ehdr_shentsize);
+    var shnum: u64 = rd(u16, ehdr, ehdr_shnum);
+    var shstrndx: u32 = rd(u16, ehdr, ehdr_shstrndx);
+
+    var sections: []SectionHeader = &.{};
+    if (shoff != 0) {
+        if (shentsize < SHDR_SIZE) return error.MalformedElf;
+        if (shoff >= bytes.len) return error.MalformedElf;
+        // The ">= 0xff00 sections" escape: the real count is in section 0's
+        // `sh_size`, and the real `e_shstrndx` in its `sh_link`.
+        if (shnum == 0 or shstrndx == SHN_XINDEX) {
+            if (shoff + SHDR_SIZE > bytes.len) return error.MalformedElf;
+            const zero = decodeShdr(bytes[@intCast(shoff)..][0..SHDR_SIZE], 0);
+            if (shnum == 0) shnum = zero.sh_size;
+            if (shstrndx == SHN_XINDEX) shstrndx = zero.sh_link;
+        }
+        if (shnum > max_sections) return error.MalformedElf;
+        // The whole table must be inside the file — this is the one bound
+        // that has to be eager, since every later lookup indexes it.
+        const table_bytes = shnum * @as(u64, shentsize);
+        if (table_bytes > bytes.len or shoff > bytes.len - table_bytes) return error.MalformedElf;
+
+        sections = gpa.alloc(SectionHeader, @intCast(shnum)) catch return error.OutOfMemory;
+        for (0..@as(usize, @intCast(shnum))) |i| {
+            const at: usize = @intCast(shoff + @as(u64, i) * shentsize);
+            sections[i] = decodeShdr(bytes[at..][0..SHDR_SIZE], @intCast(i));
+        }
+    }
+    errdefer gpa.free(sections);
+
+    // A bogus `e_shstrndx` (past the table, or naming a non-STRTAB section)
+    // costs the NAMES, not the object: every section then reads as "".
+    var shstrtab: []const u8 = bytes[0..0];
+    if (shstrndx != 0 and shstrndx < sections.len) {
+        const s = sections[shstrndx];
+        if (s.sh_type == SHT_STRTAB and
+            s.sh_offset <= bytes.len and s.sh_size <= bytes.len - s.sh_offset)
+        {
+            shstrtab = bytes[@intCast(s.sh_offset)..][0..@intCast(s.sh_size)];
+        }
+    }
+
+    return .{
+        .gpa = gpa,
+        .bytes = bytes,
+        .owns_bytes = own_bytes,
+        .e_type = rd(u16, ehdr, ehdr_type),
+        .e_machine = rd(u16, ehdr, ehdr_machine),
+        .sections = sections,
+        .shstrtab = shstrtab,
+    };
+}
+
+/// Read a whole file into memory (raw syscalls; this repo forbids libc).
+/// Caller frees.
+pub fn readFileAlloc(gpa: std.mem.Allocator, path: []const u8, max_bytes: usize) ImageOpenError![]u8 {
+    if (comptime builtin.os.tag != .linux)
+        @compileError("ebpf.elfsym is Linux-only (raw open/pread syscalls)");
+
+    const path_z = gpa.dupeZ(u8, path) catch return error.OutOfMemory;
+    defer gpa.free(path_z);
+
+    var file = File.open(path_z.ptr) catch return error.FileOpenFailed;
+    defer file.close();
+
+    const len = file.size() catch return error.FileReadFailed;
+    if (len > max_bytes) return error.FileTooLarge;
+    const buf = gpa.alloc(u8, @intCast(len)) catch return error.OutOfMemory;
+    errdefer gpa.free(buf);
+    if (len != 0) file.readExact(0, buf) catch return error.FileReadFailed;
+    return buf;
+}
+
+/// Default ceiling for `openImageFile` — a relocatable BPF object is tens of
+/// kilobytes; 256 MB is "something is wrong", not a real object.
+pub const max_image_bytes: usize = 256 << 20;
+
+/// `readFileAlloc` + `openImage`, with the resulting `Image` owning the bytes.
+pub fn openImageFile(gpa: std.mem.Allocator, path: []const u8) ImageOpenError!Image {
+    const bytes = try readFileAlloc(gpa, path, max_image_bytes);
+    return openImage(gpa, bytes, true);
 }
 
 /// A read-only file, raw syscalls only (this repo forbids libc).
