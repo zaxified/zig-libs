@@ -41,6 +41,9 @@ discipline.
 | `src/load.zig` | — | thin wrapper (std already implements `BPF_PROG_LOAD`) |
 | `src/attach.zig` | **OPUS** | kprobe/kretprobe, uprobe/uretprobe, tracepoint, raw tracepoint, XDP (netlink `IFLA_XDP`), cgroup (`BPF_PROG_ATTACH`) — one uniform `Link` handle, link-preferring where the kernel allows it |
 | `src/bpflink.zig` | **OPUS** | `BPF_LINK_CREATE`/`_UPDATE`/`_DETACH`/`_GET_FD_BY_ID`/`_GET_NEXT_ID`, the extended `bpf_attr.link_create`, a libbpf-style feature probe |
+| `src/btf.zig` | **OPUS** | BTF parser: header/strings/type section, every `BTF_KIND_*`, `KFLAG` bitfield offsets, cycle-safe resolution, kernel BTF (`/sys/kernel/btf/vmlinux`), **split** module BTF, `BPF_BTF_LOAD`, a minimal blob `Builder` |
+| `src/btfext.zig` | **OPUS** | `.BTF.ext` (`func_info`/`line_info`/`core_relos`) + **partial CO-RE**: field-offset relocation against kernel BTF (see "How much of CO-RE is real" below) |
+| `src/tracing.zig` | **OPUS** | attach-by-name for `fentry`/`fexit`/`fmod_ret`/`tp_btf`/LSM, plus the extended `BPF_PROG_LOAD` (`expected_attach_type`, `attach_btf_id`, `prog_btf_fd`, `func_info`, `line_info`) |
 | `src/elfsym.zig` | **OPUS** | minimal ELF64 `.symtab`/`.dynsym` reader + the vaddr -> **file offset** conversion a uprobe needs |
 | `src/ringbuf.zig` | **OPUS** | mmap + acquire/release `BPF_MAP_TYPE_RINGBUF` consumer with `epoll` polling |
 | `src/perfbuf.zig` | **OPUS** | per-CPU `BPF_MAP_TYPE_PERF_EVENT_ARRAY` consumer: `data_head`/`data_tail` barriers, wrap reassembly, explicit `PERF_RECORD_LOST` |
@@ -201,6 +204,106 @@ handle converts to the uniform `ebpf.Link` via `.link()`.
 what `ip link show` / `bpftool net` display and what `ip link set dev X xdp
 off` can remove; `attachXdpAuto` is the opt-in link-preferring variant.
 
+### BTF: `fentry` / `fexit` / `tp_btf` / LSM attach **by name**
+
+The kernel matches these hooks by BTF type id, not by string. Parsing
+`/sys/kernel/btf/vmlinux` is what turns a name into that id — and reading it
+needs **no privilege at all** (it is mode 0444); only the attach does.
+
+```zig
+// Parse the kernel's own type graph once and keep it: it is ~7 MiB and
+// ~170 000 types, so re-reading it per attach is real cost.
+var vmlinux = try ebpf.loadKernelBtf(gpa);
+defer vmlinux.deinit();
+
+// The id every tracing attach is matched by.
+const id = try ebpf.resolveAttachId(&vmlinux, .fentry, "vfs_read");
+
+// Load a program ALREADY TARGETED at it — this is the step that matters:
+// the kernel reads `attach_btf_id` at BPF_PROG_LOAD time, not at attach
+// time (see src/tracing.zig's header for the exact kernel check).
+var log: [8192]u8 = undefined;
+var loaded = try ebpf.loadTracing(gpa, .fentry, "vfs_read", &insns, .{
+    .attach_btf_id = id,
+    .log = &log,
+});
+defer loaded.close();
+
+// Then attach. The name is re-resolved here only so a typo is a typed
+// error instead of a bare EINVAL; the returned id is reported.
+var out = try ebpf.attachFentryOpts(gpa, loaded.fd, "vfs_read", .{ .btf = &vmlinux });
+defer out.detach();
+```
+
+`attachFexit`, `attachModifyReturn`, `attachTpBtf` and `attachLsm` are the
+same shape. Pass **bare** names: the `btf_trace_` (for `tp_btf`) and
+`bpf_lsm_` (for LSM) prefixes are added for you — and `tp_btf` looks the
+result up as a **`BTF_KIND_TYPEDEF`**, not a `FUNC`, which is the one place
+a hand-rolled lookup usually goes wrong.
+
+Type-graph queries are available directly:
+
+```zig
+const task = vmlinux.findByNameKind("task_struct", .@"struct").?;
+const f = (try vmlinux.findMember(task, "pid")).?;   // descends anonymous members
+const size = try vmlinux.sizeOf(task);
+```
+
+Module (split) BTF needs its base, and says so rather than mis-resolving:
+
+```zig
+var mod = try ebpf.loadModuleBtf(gpa, "nf_tables", &vmlinux);
+defer mod.deinit();   // ids continue from vmlinux's; base names still resolve
+```
+
+Program-side BTF, end to end:
+
+```zig
+var b = ebpf.BtfBuilder.init(gpa);
+defer b.deinit();
+const int_id = try b.addInt("int", 4, 32, 0b001);
+const proto  = try b.addFuncProto(int_id, &.{});
+_ = try b.addFunc("my_prog", proto, .global);
+const blob = try b.finish();
+defer gpa.free(blob);
+
+const btf_fd = try ebpf.loadBtfIntoKernel(blob, null);   // BPF_BTF_LOAD
+const prog_fd = try ebpf.loadProgram(.tracing, &insns, .{
+    .prog_btf_fd = btf_fd,
+    .func_info = &.{.{ .insn_off = 0, .type_id = 3 }},
+});
+```
+
+### How much of CO-RE is real
+
+`.BTF.ext` parsing and **field-offset relocation against kernel BTF** are
+implemented and tested against genuine `clang -target bpf -O2 -g` output:
+
+```zig
+const ext = try ebpf.parseBtfExt(btf_ext_bytes);
+var it = ext.coreRelos();
+const sec = it.next().?;
+const res = try ebpf.computeCoreFieldRelo(&local_btf, &vmlinux, sec.coreRelo(0));
+// res.value = the byte offset THIS kernel puts the field at
+// res.field.?.{byte_size, lshift_u64, rshift_u64, signed} for bitfields
+
+// …or with no .BTF.ext at all:
+const f = (try ebpf.btfFieldByName(&vmlinux, "task_struct", &.{"pid"})).?;
+```
+
+Covered: the container format (including the optional `core_relo` header
+tail), access-spec parsing, the local spec walk, name-based candidate
+matching with `___flavor` suffixes stripped and anonymous-member descent,
+and all six `BPF_CORE_FIELD_*` values including the bitfield load-widening
+that makes `LSHIFT_U64`/`RSHIFT_U64` correct.
+
+**Not** covered, and not pretended: rewriting the instruction stream (the
+value is returned, nothing is patched), multi-candidate matching and
+ambiguity detection, and the non-field relocation kinds (`TYPE_ID_*`,
+`TYPE_EXISTS`, `TYPE_SIZE`, `TYPE_MATCHES`, `ENUMVAL_*`) — those are parsed
+and refused with `error.UnsupportedReloKind`, never computed wrong. See
+`src/btfext.zig`'s header and `SPEC.md`'s backlog.
+
 Low-level, for building custom programs (all `pub`): `ebpf.Insn` (re-export
 of `std.os.linux.BPF.Insn` — every opcode builder needed lives there
 already, see "std inventory" below), `ebpf.Program` (the
@@ -227,8 +330,14 @@ already ships, and this module does **not** duplicate:
   all fully implemented and exercised by std's own tests against a real
   kernel.
 - **Type enums**: `MapType` (incl. `.ringbuf`), `ProgType` (incl. `.kprobe`,
-  `.xdp`), `AttachType` (incl. `.cgroup_inet_egress`, `.xdp`), `Helper` (the
-  full `bpf_*` in-program helper-function id list).
+  `.xdp`), `AttachType` (incl. `.cgroup_inet_egress`, `.xdp`, `.trace_fentry`,
+  `.trace_raw_tp`, `.lsm_mac`), `Helper` (the full `bpf_*` in-program
+  helper-function id list).
+- **The BTF *wire structs***: `std.os.linux.BPF.btf` declares `Header`,
+  `Type`, `Kind`, `Member`, `Array`, `Enum`, `Enum64`, `Param`, `Var`,
+  `VarSecInfo`, `DeclTag` (and `btf.ext` declares the short `.BTF.ext`
+  header + `InfoSec`). `btf.zig` reuses `Kind` directly and asserts the rest
+  against std's layout instead of restating them.
 
 What `std` does **not** ship (the actual gap this module fills):
 - Any pre-built program (the encoders are free, the SEQUENCES are not).
@@ -250,6 +359,22 @@ What `std` does **not** ship (the actual gap this module fills):
   `link_update`, `link_detach`, `link_get_fd_by_id` or `link_get_next_id`
   (the `Cmd` values and `LinkUpdateAttr`/`GetIdAttr` types exist; the
   functions do not), nor `raw_tracepoint_open`.
+- Any BTF **parser**. std has the structs (above) and nothing that walks
+  them: no type-id index, no string-section lookup, no
+  `/sys/kernel/btf/vmlinux` reader, no split-BTF handling, no bounds
+  checking — and its `btf.Type.info.kind` / `btf.IntInfo.encoding` are
+  `enum`s too narrow to hold real kernel BTF (`encoding == 0`, a plain
+  `unsigned int`, is not one of `IntInfo.encoding`'s three values), so a
+  `@ptrCast` onto them is not a safe parse. See `btf.zig`.
+- `.BTF.ext` beyond the pre-5.16 header: std's `btf.ext.Header` has no
+  `core_relo_off`/`_len`, no `bpf_func_info`/`bpf_line_info`/`bpf_core_relo`
+  record structs, and no framing walk. See `btfext.zig`.
+- The **extended** `bpf_attr.prog_load`: std's `ProgLoadAttr` stops at
+  `attach_prog_id`, so `core_relo*`, `fd_array`, `log_true_size` and
+  `prog_token_fd` are missing and there is no way to send them. See
+  `tracing.zig`.
+- A wrapper for `Cmd.btf_load` (`BtfLoadAttr` exists and stops at
+  `btf_log_level`; the function does not exist at all).
 - ELF symbol resolution to a **file offset**. `std.elf` supplies the types
   and constants (used here for exactly that), but nothing that walks
   `.symtab`/`.dynsym` for a name and converts `st_value` through the
@@ -320,15 +445,31 @@ large or many programs; not worth it for three.
 - **`elfsym` is a uprobe helper, not an ELF library.** It reads what a
   probe needs (`.symtab`/`.dynsym` + `PT_LOAD`) and refuses everything else
   (32-bit, foreign-endian) rather than guessing.
-- **Out of scope (deliberate)**: BTF parsing — and therefore
-  fentry/fexit/`tp_btf`/LSM attach by name, `kprobe_multi`/`uprobe_multi`
-  mass-attach, and CO-RE (Compile Once – Run Everywhere) relocation —
-  plus USDT `.note.stapsdt` discovery, `tcx`/`netkit` attach entry points,
-  `BPF_PROG_QUERY`, cpumap/devmap attach, perf AUX/ITRACE areas, DWARF/line
-  and symbol demangling, tc/classifier programs, BTF-typed maps, and the
-  `bpftool`-style ELF-skeleton loading route noted above. The three named
-  programs and the six attach mechanisms are the whole surface this module
-  commits to; extending to a new program or attach kind is additive (a new
-  function following the same doc-comment discipline), not a redesign.
-  `SPEC.md`'s backlog section says what each deferred item would actually
-  take.
+- **BTF is untrusted input, and treated as such.** `/sys/kernel/btf/vmlinux`
+  is trustworthy; a `.BTF` section out of somebody's object file is not.
+  `btf.parse` walks the whole type section once, sizing every record, so no
+  later accessor can read out of bounds; every resolving walk is bounded by
+  `max_resolve_depth` so a cyclic typedef terminates; and split BTF is
+  *detected* (a base blob's string section starts with `"\0"`, a split one's
+  does not) rather than silently mis-resolved. `SPEC.md` has the full list.
+- **A BTF id that matters is set at LOAD time, not attach time.** For
+  fentry/fexit the kernel reads `attach_btf_id` from `BPF_PROG_LOAD` and
+  rejects a link that also carries one (`!!tgt_prog_fd != !!btf_id` ->
+  `EINVAL`). `tracing.zig` therefore resolves the name at attach *for the
+  error message and for reporting*, and `loadTracing` is the call that
+  actually targets the program. Anything else would look like it worked and
+  attach nowhere.
+- **Out of scope (deliberate)**: full CO-RE — instruction patching,
+  multi-candidate/ambiguity matching, and the non-field relocation kinds
+  (see "How much of CO-RE is real" above) — plus
+  `kprobe_multi`/`uprobe_multi` mass-attach, USDT `.note.stapsdt`
+  discovery, `tcx`/`netkit` attach entry points, `BPF_PROG_QUERY`,
+  cpumap/devmap attach, perf AUX/ITRACE areas, DWARF/line and symbol
+  demangling, tc/classifier programs, BTF-typed map definitions,
+  BPF-object ELF loading (`.BTF`/`.BTF.ext`/map/prog section discovery),
+  and the `bpftool`-style ELF-skeleton loading route noted above. The three
+  named programs and the attach mechanisms listed here are the whole
+  surface this module commits to; extending to a new program or attach kind
+  is additive (a new function following the same doc-comment discipline),
+  not a redesign. `SPEC.md`'s backlog section says what each deferred item
+  would actually take.

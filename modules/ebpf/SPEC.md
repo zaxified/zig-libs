@@ -404,6 +404,148 @@ length runs past its own record; a `PERF_RECORD_LOST` too short for its two
 typed `ConsumeError`, never a panic and never an out-of-bounds read. (A
 zero size is the one that would otherwise spin the walk forever.)
 
+## BTF: the parser, and why bounds safety is the whole design
+
+`btf.zig` exists because `std.os.linux.BPF.btf` ships the **wire structs**
+and nothing that walks them. Three properties drive its shape.
+
+### 1. A BTF blob is untrusted input
+
+`/sys/kernel/btf/vmlinux` is trustworthy; a `.BTF` section lifted out of an
+arbitrary object file, or read off a wire, is not. Every one of these is a
+typed error rather than a crash or a wrong answer:
+
+| malformation | result |
+|---|---|
+| bad magic / byte-swapped magic / `version != 1` | `NotBtf` / `UnsupportedBtf` |
+| `hdr_len` below `sizeof(btf_header)` or past the blob | `MalformedBtf` |
+| `type_off+type_len` or `str_off+str_len` past the blob | `MalformedBtf` (added in `u64`, so it cannot wrap) |
+| `type_off` not 4-byte aligned | `MalformedBtf` |
+| a `vlen` the type section cannot hold | `MalformedBtf` |
+| a truncated record (12-byte header, or an `INT`'s trailing word) | `MalformedBtf` |
+| an unknown `BTF_KIND_*` (or `KIND_UNKN`) | `MalformedBtf` |
+| a string section not NUL-framed | `MalformedBtf` |
+| a type id past the end | `TypeIdOutOfRange` |
+| a `name_off` past the string section | `str()` -> `null` |
+| a typedef cycle / self-referential array | `TypeChainTooDeep` |
+| a `DATASEC` naming a nonexistent VAR | `validateReferences` -> `TypeIdOutOfRange` |
+
+The structural guarantee: **`parse` walks the entire type section once,
+sizing every record**, and records each type's byte offset. A `vlen` that
+does not fit is rejected there, so every kind-specific accessor afterwards
+indexes an already-validated slice and cannot read out of bounds. Type-id
+*references* are checked when followed (`byId`), or exhaustively up front by
+the optional `validateReferences` pass.
+
+### 2. Cycles must terminate
+
+`typedef A -> const A` is not expressible in C but is trivially expressible
+in a BTF blob. `skipModifiers`, `sizeOf` and `findMember` are all bounded by
+`max_resolve_depth` (32, the same ceiling libbpf uses); an array's element
+size recursion carries the same budget, so `array[1] of array[1] of …`
+cannot exhaust the stack.
+
+### 3. std's enums are too narrow to parse into
+
+Fields are read with `std.mem.readInt` at asserted offsets, never by
+`@ptrCast`ing the blob onto `std.os.linux.BPF.btf.Type`. Two concrete
+reasons, beyond `elfsym.zig`'s general one:
+
+- `btf.Type.info.kind` is `enum(u5)` with 20 values — kinds 20..31 are
+  representable in the wire field and would be an invalid enum value in a
+  safety-checked build.
+- `btf.IntInfo.encoding` is `enum(u4)` with exactly three values
+  (`signed`/`char`/`boolean`). A plain `unsigned int` — of which
+  `/sys/kernel/btf/vmlinux` has many — encodes as **0**, which is not one of
+  them. A `@ptrCast` parse would trip on the first one it met.
+
+### `FUNC`'s `vlen` is a linkage, not a count
+
+The single most dangerous field in the format for a parser: `BTF_KIND_FUNC`
+stores its `btf_func_linkage` in `vlen`, and has **no trailing data**. Sizing
+a `FUNC` record as `8 * vlen` (the `FUNC_PROTO` rule) desynchronizes the
+entire remainder of the type section — and `/sys/kernel/btf/vmlinux` is ~40%
+`FUNC` records, so the damage is total rather than local.
+
+### `KFLAG` bitfield offsets
+
+When a `STRUCT`/`UNION` has `BTF_INFO_KFLAG` set, each member's 32-bit
+`offset` word is `(bitfield_size << 24) | bit_offset`. Reading it as a plain
+bit offset gives `struct sk_buff`'s `fclone` an offset of ~50 million
+instead of 1010. `Btf.member` applies the split; the non-KFLAG case reports
+`bitfield_size == 0`.
+
+### Split BTF
+
+`/sys/kernel/btf/<module>` continues the base blob: its first type id is
+`base.endId()`, and a `name_off` below `base.str_len` addresses the *base's*
+string section. Parsing one alone would resolve every id and every name to
+something wrong but plausible, so `parse` **detects** it — a base blob's
+string section starts with `"\0"` (that is what makes `name_off == 0` the
+empty name); a split blob's does not — and refuses with
+`SplitBtfNeedsBase` unless a base was supplied.
+
+## BTF-typed attach: where the id has to go
+
+For a plain kernel-function `fentry`/`fexit`, the kernel matches on
+`bpf_attr.prog_load.attach_btf_id`, set at **load** time. At link time
+`bpf_tracing_prog_attach` enforces `!!tgt_prog_fd != !!btf_id -> -EINVAL`, so
+passing a `target_btf_id` with `target_fd == 0` is an error, not a second
+chance to name the target. `tracing.zig` therefore:
+
+- resolves the name at attach purely to convert a typo into
+  `error.AttachTargetNotFound` instead of a bare `EINVAL`, and to *report*
+  the id it resolved (`TracingLink.attach_btf_id`);
+- issues the link with the zero pair;
+- offers `loadTracing`, which resolves the id and loads the program already
+  targeted at it — the call that makes attach-by-name real end to end;
+- exposes the non-zero pair only through `attachExt`, the
+  `BPF_PROG_TYPE_EXT` case where it is meaningful.
+
+Name-to-BTF-kind mapping (verified against this machine's vmlinux BTF, which
+has 1060 `btf_trace_*` **typedefs** and zero `btf_trace_*` funcs):
+
+| hook | kind | name |
+|---|---|---|
+| `fentry` / `fexit` / `fmod_ret` | `FUNC` | the function |
+| `tp_btf` | **`TYPEDEF`** | `btf_trace_<name>` |
+| LSM | `FUNC` | `bpf_lsm_<hook>` |
+| iter | `FUNC` | `bpf_iter_<name>` |
+
+## CO-RE: what is implemented, and what is not
+
+Implemented and tested against genuine `clang -target bpf -O2 -g` output
+(embedded as a byte fixture) and against `/sys/kernel/btf/vmlinux`:
+
+- the `.BTF.ext` container — header including the *optional* `core_relo`
+  tail older producers omit, per-sub-section `rec_size`, the
+  `{sec_name_off, num_info, records…}` framing, and forward-compatible
+  over-long records (the known prefix is read, the tail ignored);
+- access-spec parsing (`"0:2:0"`) and the local spec walk, which records
+  each step's member **name** — the thing CO-RE exists to depend on instead
+  of an index;
+- target matching: the root type by flavor-stripped name + kind, then every
+  named step re-resolved by name in the target (descending anonymous
+  members, which `struct sk_buff` requires);
+- all six `BPF_CORE_FIELD_*` values, including the bitfield load-widening
+  (1 -> 2 -> 4 -> 8 bytes until the bits fit an aligned load) that makes
+  `LSHIFT_U64`/`RSHIFT_U64` correct.
+
+**Not** implemented, and not claimed:
+
+- **instruction patching** — `computeFieldRelo` returns the value; nothing
+  rewrites a `[]Insn`. That needs a BPF-object loader (section-to-program
+  mapping, map relocation, `fd_array`) this module does not have;
+- **multi-candidate matching / ambiguity detection** — libbpf collects every
+  target with a matching name, relocates against each, and errors when they
+  disagree. This takes the first match;
+- the **non-field** relocation kinds (`TYPE_ID_LOCAL`/`_TARGET`,
+  `TYPE_EXISTS`, `TYPE_SIZE`, `TYPE_MATCHES`, `ENUMVAL_EXISTS`,
+  `ENUMVAL_VALUE`) — parsed, then refused with
+  `error.UnsupportedReloKind`;
+- `.rel.BTF.ext` relocation of the section-name offsets, and BPF-object ELF
+  loading generally.
+
 ## Validation layering (privilege-aware)
 
 Two layers, deliberately split so a CI run without `CAP_BPF` still asserts
@@ -434,6 +576,42 @@ something real:
      a **real `libc.so.6`** cross-checked against an *independent*
      derivation — the section headers (`sh_addr`/`sh_offset`) rather than
      the program headers the module uses. Two tables that must agree;
+   - the `BPF_BTF_LOAD` attr as golden bytes (including the zero tail past
+     what an older kernel knows) and the **extended `bpf_attr.prog_load`**
+     field-for-field against the UAPI offsets — `attach_btf_id` at 108,
+     `prog_btf_fd` at 72, `func_info` at 80, `line_info` at 96 — plus
+     against std's shorter declaration for every field it does have. Getting
+     `attach_btf_id` wrong by four bytes would attach an fentry program to
+     whatever type id sits next door;
+   - `btf`: a **synthetic blob exercising every `BTF_KIND_*`** with exact
+     expected offsets (including the `KFLAG` bitfield split, an anonymous
+     nested struct, and an `INT` with `encoding == 0`), a battery of hostile
+     blobs (see the table in the BTF section above — each asserted as a
+     typed error), a hand-built **split** blob proving ids continue and
+     names resolve out of the second string section, and the **real
+     `/sys/kernel/btf/vmlinux`** asserted structurally (a member exists, a
+     kind is what it must be) rather than numerically. That last one was
+     additionally cross-checked by hand against `bpftool btf dump file
+     /sys/kernel/btf/vmlinux format raw`: the per-kind type histogram
+     matched across all ~170 000 types, as did `task_struct` (size 9920,
+     272 members), `sk_buff` (size 232, 28 members), `task_struct.pid`
+     (bits_offset 22400) and `sk_buff.fclone` (bits_offset 1010,
+     bitfield_size 2). None of those numbers are asserted in the tests —
+     they change with every kernel build;
+   - `btfext`: synthetic `.BTF.ext` blobs (well-formed, hostile, and the
+     pre-5.16 short header), plus a **real `clang -target bpf -O2 -g`
+     object's `.BTF` + `.BTF.ext` embedded as a byte fixture** whose four
+     `core_relo` records are genuine compiler output. Those records are
+     relocated (a) against the fixture itself, where the expected offsets
+     and shifts are exact constants, and (b) against the running kernel's
+     vmlinux BTF — the local `task_struct.pid` is at byte 0 and the
+     kernel's is thousands of bytes in, so a relocation that quietly did
+     nothing fails immediately;
+   - `tracing`: the prefix/BTF-kind table, name validation (a libbpf-style
+     `"fentry/vfs_read"` is refused rather than looked up literally), and
+     `attach_btf_id` resolution against real kernel BTF for `fentry`,
+     `tp_btf` (asserting the result is a **TYPEDEF**, which is what a
+     `FUNC` lookup would have missed) and LSM;
    - and — the backbone — both consumers driven over **hand-built in-memory
      fake rings**. `ringbuf`'s reproduces the kernel's three regions, its
      data-area aliasing and its release-store publication order (multi-record
@@ -455,7 +633,13 @@ something real:
    legacy path; a **raw tracepoint** on `sys_enter`; a **perf buffer** across
    every online CPU fed by a tracepoint program; and cgroup attach via both
    `BPF_PROG_ATTACH` and `BPF_LINK_CREATE`, including `BPF_LINK_UPDATE`
-   (plain and `BPF_F_REPLACE`) and `BPF_LINK_GET_FD_BY_ID`. Each prints a
+   (plain and `BPF_F_REPLACE`) and `BPF_LINK_GET_FD_BY_ID`. Since BTF
+   landed, also: `BPF_BTF_LOAD` of a blob this module's `Builder` produced
+   (plus a deliberately invalid one the kernel must reject), an **`fentry`
+   program loaded with a resolved `attach_btf_id` and attached by name**
+   (asserting the link reports `LinkType.tracing` and that the id the attach
+   resolved equals the one the load used), and the same for a **`tp_btf`**
+   program. Each prints a
    `SKIPPED:` line and **passes** when the capability is missing, mirroring
    the `opcua` module's podman-gated live tests — a sandboxed run can never
    be mistaken for "verified", but it also never fails for lack of
@@ -466,23 +650,49 @@ something real:
    failing.
 
 Privileges required, per operation: `CAP_BPF` (or root) for map creation,
-program load and cgroup attach; additionally `CAP_PERFMON`/`CAP_SYS_ADMIN`
-for the kprobe PMU; `CAP_NET_ADMIN` for XDP.
+program load, `BPF_BTF_LOAD` and cgroup attach; additionally
+`CAP_PERFMON`/`CAP_SYS_ADMIN` for the kprobe PMU; `CAP_NET_ADMIN` for XDP.
+**Reading** BTF is the exception: `/sys/kernel/btf/*` is mode 0444, so
+parsing vmlinux and resolving an `attach_btf_id` need no capability at all —
+which is why the BTF tests are in the unprivileged layer and only the
+attach that follows them is gated.
 
 ## Backlog / deliberately out of scope
 
 Implemented since the first cut (moved out of this list): the perf-buffer
-consumer, uprobe/uretprobe, tracepoint, raw tracepoint, and
-`BPF_LINK_CREATE`/`_UPDATE`/`_DETACH`/`_GET_FD_BY_ID`/`_GET_NEXT_ID`.
+consumer, uprobe/uretprobe, tracepoint, raw tracepoint,
+`BPF_LINK_CREATE`/`_UPDATE`/`_DETACH`/`_GET_FD_BY_ID`/`_GET_NEXT_ID`, and —
+most recently — **BTF**: the parser (`btf.zig`), kernel and split module
+BTF, `attach_btf_id` resolution, attach-by-name for
+`fentry`/`fexit`/`fmod_ret`/`tp_btf`/LSM (`tracing.zig`), `BPF_BTF_LOAD`
+plus the extended `BPF_PROG_LOAD` carrying `prog_btf_fd`/`func_info`/
+`line_info`, and the field-offset slice of CO-RE (`btfext.zig`).
 
 Still deferred, honestly:
 
-- **BTF, and therefore `fentry`/`fexit`/`tp_btf`/LSM programs.** The kernel
-  matches these by `attach_btf_id`, which is set at `BPF_PROG_LOAD` time and
-  requires parsing `/sys/kernel/btf/vmlinux` to turn a function name into an
-  id. `bpflink.linkCreateTracing` exists and works, but only for a program
-  whose `attach_btf_id` the caller already set — the BTF parser itself is a
-  separate, substantial piece of work (it is also the gateway to CO-RE).
+- **The rest of CO-RE** — instruction patching, multi-candidate matching and
+  ambiguity detection, and the non-field relocation kinds. See the "CO-RE:
+  what is implemented, and what is not" section above for the exact line;
+  the container and field-offset relocation ARE done, the rest is not, and
+  `error.UnsupportedReloKind` is how a caller finds out rather than getting
+  a wrong number.
+- **BPF-object ELF loading.** `elfsym.zig` reads section headers but not
+  section *names*, so nothing here lifts `.BTF`/`.BTF.ext`/`maps`/program
+  sections out of a `clang -target bpf` object. That is the missing piece
+  between "this module can relocate a `.BTF.ext` record" and "this module
+  can load a CO-RE object" — it also needs map creation from BTF-typed map
+  definitions and `fd_array` relocation.
+- **BTF-typed map definitions** (`struct { __uint(type, …); }` in a
+  `.maps` DATASEC) — the parser can read the DATASEC and the VARs; nothing
+  turns them into `BPF_MAP_CREATE` calls with
+  `btf_key_type_id`/`btf_value_type_id`.
+- **`BPF_BTF_GET_FD_BY_ID` / `BPF_BTF_GET_NEXT_ID`** — reading back the BTF
+  a loaded program or map carries (what `bpftool btf dump id N` does).
+  `BPF_BTF_LOAD` is implemented; the retrieval side is not.
+- **A name index over kernel BTF.** `findByNameKind` is a linear scan of
+  ~170 000 types. One lookup is microseconds; thousands would want a hash
+  built once. Deliberately not built (it would allocate proportional to the
+  blob for every caller, including those doing a single attach).
 - **`kprobe_multi` / `uprobe_multi`** (`bpf(BPF_LINK_CREATE)` with the
   `kprobe_multi`/`uprobe_multi` union arms) — attaching one program to
   thousands of symbols in a single call, the mechanism behind `retsnoop`'s

@@ -195,6 +195,92 @@ pub const linkInfo = bpflink.linkInfo;
 /// Feature probe: does this kernel implement perf-event links (>= 5.15)?
 pub const perfLinkSupport = bpflink.perfLinkSupport;
 
+pub const btf = @import("btf.zig");
+/// A parsed BTF blob (kernel or program-side) — see `btf.zig`.
+pub const Btf = btf.Btf;
+pub const BtfKind = btf.Kind;
+pub const BtfType = btf.Type;
+pub const BtfMember = btf.Member;
+pub const BtfField = btf.Field;
+pub const BtfIntInfo = btf.IntInfo;
+pub const BtfArrayInfo = btf.ArrayInfo;
+pub const BtfEnumValue = btf.EnumValue;
+pub const BtfParam = btf.Param;
+pub const BtfVarSecInfo = btf.VarSecInfo;
+pub const BtfBuilder = btf.Builder;
+pub const BtfParseError = btf.ParseError;
+pub const BtfLoadError = btf.LoadError;
+pub const BtfTypeError = btf.TypeError;
+pub const BtfKernelLoadError = btf.KernelLoadError;
+/// Parse a BTF blob (pass `.base` for a module's **split** BTF).
+pub const parseBtf = btf.parse;
+/// Parse `/sys/kernel/btf/vmlinux` — the source of every `attach_btf_id`.
+pub const loadKernelBtf = btf.loadKernel;
+/// Parse `/sys/kernel/btf/<module>` against a vmlinux base (split BTF).
+pub const loadModuleBtf = btf.loadModule;
+/// `bpf(BPF_BTF_LOAD)` — hand a blob to the kernel, get an fd back.
+pub const loadBtfIntoKernel = btf.loadIntoKernel;
+
+pub const btfext = @import("btfext.zig");
+/// A parsed `.BTF.ext` (func_info / line_info / core_relos) — see
+/// `btfext.zig`, including exactly how much of CO-RE is real.
+pub const BtfExt = btfext.Ext;
+pub const BtfFuncInfo = btfext.FuncInfo;
+pub const BtfLineInfo = btfext.LineInfo;
+pub const CoreRelo = btfext.CoreRelo;
+pub const CoreReloKind = btfext.ReloKind;
+pub const CoreFieldInfo = btfext.FieldInfo;
+pub const CoreFieldSpec = btfext.FieldSpec;
+pub const CoreReloResult = btfext.ReloResult;
+pub const CoreError = btfext.CoreError;
+pub const BtfExtParseError = btfext.ExtParseError;
+/// Parse a `.BTF.ext` blob.
+pub const parseBtfExt = btfext.parseExt;
+/// Resolve a struct member by name and return its load geometry in the given
+/// BTF — CO-RE field-offset resolution with no `.BTF.ext` involved.
+pub const btfFieldByName = btfext.fieldByName;
+/// Apply one `bpf_core_relo` from a program's BTF against a target BTF.
+pub const computeCoreFieldRelo = btfext.computeFieldRelo;
+
+pub const tracing = @import("tracing.zig");
+/// Which BTF-typed hook a name refers to (`fentry`, `tp_btf`, `lsm`, …).
+pub const TracingTargetKind = tracing.TargetKind;
+pub const TracingLink = tracing.TracingLink;
+pub const TracingAttachOptions = tracing.AttachOptions;
+pub const TracingAttachError = tracing.AttachError;
+pub const TracingResolveError = tracing.ResolveError;
+pub const ProgLoadOptions = tracing.LoadOptions;
+pub const ProgLoadError = tracing.LoadProgError;
+pub const LoadedTracing = tracing.LoadedTracing;
+/// Resolve a name to the `attach_btf_id` the kernel matches a tracing
+/// program by — the missing input `linkCreateTracing` was written against.
+pub const resolveAttachId = tracing.resolveAttachId;
+/// `resolveAttachId` loading `/sys/kernel/btf/vmlinux` itself.
+pub const resolveKernelAttachId = tracing.resolveKernelAttachId;
+/// Attach to a kernel function's entry, by name (`fentry`).
+pub const attachFentry = tracing.attachFentry;
+pub const attachFentryOpts = tracing.attachFentryOpts;
+/// Attach to a kernel function's return, by name (`fexit`).
+pub const attachFexit = tracing.attachFexit;
+pub const attachFexitOpts = tracing.attachFexitOpts;
+/// Attach a return-value-overriding program (`fmod_ret`).
+pub const attachModifyReturn = tracing.attachModifyReturn;
+/// Attach to a BTF-typed raw tracepoint, by bare name (`tp_btf`).
+pub const attachTpBtf = tracing.attachTpBtf;
+pub const attachTpBtfOpts = tracing.attachTpBtfOpts;
+/// Attach to an LSM hook, by bare name (`lsm`).
+pub const attachLsm = tracing.attachLsm;
+pub const attachLsmOpts = tracing.attachLsmOpts;
+/// `BPF_PROG_TYPE_EXT` — the one case where the link-time
+/// `(target_fd, target_btf_id)` pair is meaningful.
+pub const attachExt = tracing.attachExt;
+/// `BPF_PROG_LOAD` with the BTF fields std's wrapper cannot express
+/// (`expected_attach_type`, `attach_btf_id`, `prog_btf_fd`, `func_info`,
+/// `line_info`).
+pub const loadProgram = tracing.loadProgram;
+/// Resolve a name, then load a program already targeted at it.
+pub const loadTracing = tracing.loadTracing;
+
 pub const elfsym = @import("elfsym.zig");
 /// Resolve an ELF symbol to the FILE OFFSET a uprobe needs — see
 /// `elfsym.zig` for why that is not simply `st_value`.
