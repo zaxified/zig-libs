@@ -89,7 +89,8 @@ const insns = xdp_classifier.buildClassifierProgram(.{
 const prog: ebpf.Program = .{ .prog_type = .xdp, .insns = insns };
 const prog_fd = try ebpf.load(prog, "MIT");
 defer std.os.linux.close(prog_fd);
-try ebpf.attachXdp(gpa, ifindex, prog_fd, .{ .drv_mode = true });
+var xdp = try ebpf.attachXdp(gpa, ifindex, prog_fd, .{ .drv_mode = true });
+defer xdp.detach() catch {};
 
 // 5. Read back a classification (e.g. from a control-plane poller).
 const class = try xdp_classifier.readScratchClass(scratch_fd);
