@@ -18,6 +18,7 @@ const Module = struct {
 const module_list = [_]Module{
     .{ .name = "netaddr" },
     .{ .name = "http", .deps = &.{"netaddr"} },
+    .{ .name = "websocket", .deps = &.{"http"} },
     .{ .name = "dns", .deps = &.{ "netaddr", "http" } },
     .{ .name = "ramcache" },
     .{ .name = "router", .deps = &.{"http"} },
@@ -127,6 +128,7 @@ const module_list = [_]Module{
     .{ .name = "opcua", .deps = &.{"rsa"} },
     .{ .name = "noise" },
     .{ .name = "x509", .deps = &.{"rsa"} },
+    .{ .name = "ocsp", .deps = &.{ "x509", "rsa", "p256" } },
     .{ .name = "dnssec", .deps = &.{ "dns", "rsa" } },
     .{ .name = "dnp3", .deps = &.{"aeskw"} },
     .{ .name = "slhdsa" },

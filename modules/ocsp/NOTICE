@@ -1,0 +1,35 @@
+ocsp — provenance note
+======================
+
+Kept as a module-local NOTICE (same placement as the sibling `bip340`/
+`dtls`/`falcon` crypto modules). The closest sibling, `x509`, is likewise a
+clean-room RFC implementation.
+
+Provenance
+----------
+
+ocsp — clean-room implementation from RFC 6960 ("X.509 Internet Public Key
+Infrastructure Online Certificate Status Protocol - OCSP"), covering the
+OCSPRequest / OCSPResponse / BasicOCSPResponse / ResponseData / SingleResponse /
+CertID ASN.1 structures (Appendix B), the response-verification model
+(§4.2.2.2 authorized responders, id-kp-OCSPSigning EKU, CertID binding,
+producedAt/thisUpdate/nextUpdate freshness) and the id-pkix-ocsp-nonce
+extension. RFC 6960 is a public IETF specification — not a copyrightable work
+(merger doctrine; see CONVENTIONS.md §5) — so no third-party-source NOTICE
+entry is required for the spec citation alone. No reference implementation's
+source (OpenSSL, BoringSSL, or any other) was ported or consulted.
+
+Built on the public APIs of sibling modules and Zig std only:
+
+- `x509` (this repo) — `extensions.parseElement` (bounds-safe DER element
+  reader) and the `id-kp-OCSPSigning` extended-key-usage check
+  (`findExtensions`/`iterate`/`hasPurpose` + `Purpose.ocsp_signing`).
+- `rsa` (this repo) — RSASSA-PKCS1-v1_5 verification (RFC 8017 §8.2).
+- `p256` (this repo) — ECDSA-P256 verification.
+- `std.crypto.hash.Sha1` / `sha2.Sha256`/`Sha384`/`Sha512` and
+  `std.crypto.Certificate.der` types (MIT, part of Zig itself).
+
+Test fixtures are constructed (signed with the sibling `rsa`/`p256` modules),
+not captured from any third party; see SPEC.md "Fixture provenance".
+
+No GPL/LGPL/AGPL source was consulted or copied anywhere in this module.
