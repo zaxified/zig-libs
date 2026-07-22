@@ -2,11 +2,14 @@
 
 Linux traffic control (`RTM_NEWQDISC`/`RTM_DELQDISC`/`RTM_GETQDISC` over rtnetlink) — v1
 scoped to the **netem** qdisc: delay/jitter, loss, duplication, reordering, corruption and
-rate limiting, attached as an interface's root qdisc. This is the write side the sibling
-`netlink` module deliberately omits ("read/dump only") — `tc` builds its own
-`NETLINK_ROUTE` socket and adds the `NLM_F_CREATE`/`NLM_F_EXCL`/`NLM_F_REPLACE` request
-construction plus `NLMSG_ERROR` ACK parsing on top of `netlink`'s wire codec. No `tc`
-binary shell-out, no libc — pure Zig raw syscalls.
+rate limiting, attached as an interface's root qdisc. `tc` predates `netlink`'s write
+support and therefore builds its own `NETLINK_ROUTE` socket plus `NLM_F_CREATE`/`_EXCL`/
+`_REPLACE` request construction and `NLMSG_ERROR` ACK parsing on top of `netlink`'s wire
+codec. Since `netlink` gained `RTM_NEW*`/`RTM_DEL*` writes (its `nextSeq`/`requestAck`
+engine, `nestBegin`/`nestEnd`, typed errno mapping and extended-ACK strings), that
+duplication is a **tracked DRY candidate** — `tc` can drop its private socket/nest/errno
+code and sit on `netlink`'s write engine. No `tc` binary shell-out, no libc — pure Zig
+raw syscalls.
 
 The primary consumer is fleet-simulation network impairment (inject realistic
 delay/loss/reorder per simulated link) and general-purpose traffic shaping for testing;
