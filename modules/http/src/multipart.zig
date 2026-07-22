@@ -372,3 +372,26 @@ test "malformed bodies → MalformedBody" {
     var it5 = parse(bad_line, test_boundary, .{});
     try testing.expectError(error.MalformedBody, it5.next());
 }
+
+// ── fuzz: multipart body parse, never panic on arbitrary bytes ─────────────
+//
+// `source` is a `multipart/form-data` request body already read into
+// memory — fully attacker-controlled bytes, bounded only by the caller's
+// upstream body-size limit. `it.rest` strictly shrinks on every successful
+// `next()` (each branch reslices past what it just consumed), so a
+// malformed/adversarial body always terminates in a typed error rather
+// than looping — this harness exercises that termination directly, not
+// just via an iteration cap.
+
+test "fuzz: multipart parse never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzMultipartParse, .{});
+}
+
+fn fuzzMultipartParse(_: void, smith: *std.testing.Smith) !void {
+    var buf: [512]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+
+    var it = parse(buf[0..len], test_boundary, .{});
+    while (it.next() catch return) |_| {}
+}

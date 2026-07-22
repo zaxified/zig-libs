@@ -1475,3 +1475,25 @@ test "decoder: setMaxTableSize shrinks the live table" {
     dec.setMaxTableSize(0);
     try testing.expectEqual(@as(usize, 0), dec.dynamicTableCount());
 }
+
+// ── fuzz: HPACK header-block decode, never panic on arbitrary bytes ────────
+//
+// `decodeBlock` is the one function in this file that ever sees fully
+// attacker-controlled bytes (an HTTP/2 peer's HEADERS/CONTINUATION payload,
+// reassembled by `h2.zig` before being handed here) — every integer, string
+// length, Huffman code, and dynamic-table index in it is hostile input.
+
+test "fuzz: Decoder.decodeBlock never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzDecodeBlock, .{});
+}
+
+fn fuzzDecodeBlock(_: void, smith: *std.testing.Smith) !void {
+    var buf: [512]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+
+    var dec: Decoder = .init(testing.allocator, .{});
+    defer dec.deinit();
+    var hl = dec.decodeBlock(buf[0..len]) catch return;
+    hl.deinit(testing.allocator);
+}

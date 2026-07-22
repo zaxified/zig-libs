@@ -277,3 +277,38 @@ test "urlencoded: empty buffer yields nothing" {
     var it = urlencoded(&buf);
     try testing.expectEqual(@as(?FormPair, null), it.next());
 }
+
+// ── fuzz: Content-Type and urlencoded body parse, never panic ──────────────
+//
+// `ContentType.parse`/`params` reads the request's `Content-Type` header
+// directly (and, via `multipart.zig`, each part's `Content-Disposition` —
+// both attacker-controlled); `urlencoded` decodes an
+// `application/x-www-form-urlencoded` body in place. Both are untrusted-
+// wire parsers with no existing fuzz coverage.
+
+test "fuzz: ContentType.parse never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzContentType, .{});
+}
+
+fn fuzzContentType(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+
+    const ct = ContentType.parse(buf[0..len]) orelse return;
+    var it = ct.params();
+    while (it.next()) |_| {}
+}
+
+test "fuzz: urlencoded never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzUrlencoded, .{});
+}
+
+fn fuzzUrlencoded(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+
+    var it = urlencoded(buf[0..len]);
+    while (it.next()) |_| {}
+}

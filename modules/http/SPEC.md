@@ -58,7 +58,43 @@ neg; smuggling/timeout/size negatives; a BYO-TLS in-memory dogfood (connectH2Ove
 h2 upstreaming: loopback h1-proxy → h2c-backend end-to-end (forwarding headers + hop-by-hop strip +
 large-body flow control + concurrent clients over one shared upstream connection + 502 on dead
 backend); pool-level multiplex (two streams in flight on one connection), sequential-reuse and
-buffer-pool reuse/bounded proofs. 331 tests. Run: `zig build test-http`.
+buffer-pool reuse/bounded proofs. 340 tests. Run: `zig build test-http`.
+
+**Fuzz harnesses (HD1):** every untrusted-wire parser has a `std.testing.fuzz` harness asserting
+"typed error or valid result, never a panic" — `h1.RequestHead.parse`/`ResponseHead.parse`/
+`ChunkedReader` (request/status line, header block, chunked framing), `body.ContentType.parse`/
+`urlencoded` (Content-Type + form body), `multipart.parse` (form-data boundary/part parse),
+`range.parse` (Range header), `hpack.Decoder.decodeBlock` (HPACK header-block decode), and
+`h2.parseFrame`/`h2.Connection.recv` (HTTP/2 frame decode, both pre- and post-handshake). They run
+as a deterministic empty-input smoke test under plain `zig build test` and as real continuous fuzzing
+under `zig build test-http --fuzz`; verified green in both Debug and `-Doptimize=ReleaseFast`. The
+same pattern covers `jwt.parse`/`jwt.parseJwks` (compact-token + JWKS parse, `modules/jwt`) and
+`x509.extensions.findExtensions`/the extension-value parsers + `x509.chain.parsePssParams`
+(`modules/x509`) — see those modules' own test files. **Deferred, not fuzzed:** any path that calls
+into `std`'s own parser on attacker bytes without this collection's bounds-safety wrapper around it —
+namely `std.crypto.Certificate.parse` (used by `x509.chain`'s per-link verify once a certificate is
+accepted for path building; `x509`'s own `extensions`/`parsePssParams` DER walks are fuzzed instead,
+see `x509/root.zig`'s doc comment) and `std.compress.flate.Decompress` (`gzip.zig`'s inbound
+request-body decompression, size-capped by `max_decompressed_request_bytes` but not itself
+fuzz-verified here). These are std's parsers, not ours, to fix or fuzz-harness directly; ReleaseSafe
+(below) is exactly the mitigation for that residual, un-fuzzed surface.
+
+## Hardening: ReleaseSafe vs ReleaseFast for the exposed binary (HD7)
+This module's entire job is turning fully attacker-controlled bytes (request line, headers, chunked
+framing, multipart bodies, Range headers, HPACK blocks, HTTP/2 frames) into typed values before any
+handler sees them. **Recommendation: build the internet-facing binary `ReleaseSafe`, not
+`ReleaseFast`.** ReleaseSafe keeps bounds/overflow/UB checks live, so a parser bug that would
+otherwise be silent, exploitable undefined behavior in `ReleaseFast` instead becomes a controlled
+panic — a crash-and-restart under a process supervisor, not a memory-safety break. The fuzz harnesses
+above (this module, `jwt`, `x509`) are the safety net that makes this a defense-in-depth choice rather
+than a crutch: they already prove "no panic on arbitrary input" for every *fuzzed* code path in both
+Debug and ReleaseFast, so ReleaseSafe's checks are there for what fuzzing has NOT reached yet
+(untested branches, and the explicitly deferred `std`-parser call sites above) — not a substitute for
+fuzzing, and not the other way around. If a deployment genuinely needs `ReleaseFast`'s throughput for
+this binary, treat a `-Doptimize=ReleaseSafe` fuzz/CI lane (`zig build test-http --fuzz`, ditto
+`test-jwt`/`test-x509`) as a *mandatory*, continuously-running gate on that decision, not an optional
+extra — the perf gap being traded away is small next to what a missed bounds check costs on a
+directly-exposed parser.
 
 ## Backlog / deferred
 Response-trailer *writing* remains explicitly deferred (read side only) as disproportionately

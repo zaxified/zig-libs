@@ -974,6 +974,29 @@ pub fn verifyPssLink(subject_der: CertDer, issuer_pub_key: rsa.PublicKey, now_se
     }
 }
 
+// ── fuzz: parsePssParams, this file's own bounded RFC 4055 walk ────────────
+//
+// `parsePssParams` walks `params` (the certificate's signatureAlgorithm
+// `parameters` field — attacker-controlled DER) entirely through
+// `extensions.parseElement`, the same bounds-safe wrapper `extensions.zig`
+// fuzzes directly; no call to `std.crypto.Certificate.parse` sits in front
+// of it. `parseShape` (the other raw-DER walk in this file, used by
+// `verifyPssLink`) is private and not independently reachable without a
+// live `rsa.PublicKey`/hash comparison, so it is exercised only indirectly
+// through the higher-level chain tests in `chain_test.zig`, not fuzzed here.
+const testing = std.testing;
+
+test "fuzz: parsePssParams never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzPssParams, .{});
+}
+
+fn fuzzPssParams(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    _ = parsePssParams(buf[0..len]) catch {};
+}
+
 test {
     _ = @import("chain_test.zig");
 }

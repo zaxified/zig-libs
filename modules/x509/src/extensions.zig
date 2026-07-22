@@ -660,3 +660,74 @@ test "nameConstraints: permitted dNSName subtree" {
     try testing.expectEqualStrings(dns_name, entry.value);
     try testing.expect((try it.next()) == null);
 }
+
+// ── fuzz: this file's own bounded DER walk, never std's ─────────────────────
+//
+// Every function here is the library's OWN bounded parser (built on
+// `parseElement`, which pre/post-validates offsets — see its doc comment),
+// as opposed to `std.crypto.Certificate.parse` (a single-certificate parse
+// std itself does not bounds-check safely against untrusted DER; see
+// SPEC.md's ReleaseSafe policy note and root.zig / chain.zig doc comments
+// for that tracked-but-not-fuzzed hazard). `findExtensions` below is called
+// directly on a raw buffer WITHOUT going through `Certificate.parse` first —
+// exactly what makes it a self-contained, fuzz-safe target: no std parser
+// sits in front of it.
+
+test "fuzz: findExtensions + all extension-value parsers never panic on arbitrary bytes" {
+    try testing.fuzz({}, fuzzExtensions, .{});
+}
+
+fn fuzzExtensions(_: void, smith: *std.testing.Smith) !void {
+    var buf: [768]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const bytes = buf[0..len];
+
+    // Shape 1: the whole buffer as a "certificate" — exercises
+    // `findExtensions`'s structural walk (version → serialNumber →
+    // signature → issuer → validity → subject → subjectPublicKeyInfo →
+    // extensions) directly against hostile bytes, with NO prior
+    // `Certificate.parse()` call (this function does not require one to
+    // avoid panicking, only to be meaningful — see its doc comment).
+    const cert: Certificate = .{ .buffer = bytes, .index = 0 };
+    if (findExtensions(cert) catch null) |ext_slice| {
+        var it = iterate(ext_slice, cert);
+        while (it.next() catch null) |entry| {
+            _ = parseBasicConstraints(entry.value) catch {};
+            _ = parseKeyUsage(entry.value) catch {};
+            _ = hasPurpose(entry.value, .server_auth) catch {};
+            _ = parseSubjectKeyIdentifier(entry.value) catch {};
+            _ = parseAuthorityKeyIdentifier(entry.value) catch {};
+            if (parseNameConstraints(entry.value) catch null) |nc| {
+                if (nc.permitted) |p| {
+                    var sit = subtreeIterator(p);
+                    while (sit.next() catch null) |_| {}
+                }
+                if (nc.excluded) |e| {
+                    var sit = subtreeIterator(e);
+                    while (sit.next() catch null) |_| {}
+                }
+            }
+        }
+    }
+
+    // Shape 2: the buffer as a bare `extnValue` OCTET STRING content — the
+    // actual shape each of these functions receives in production (an
+    // already-unwrapped `ExtensionEntry.value`), independent of whether
+    // `findExtensions`/`iterate` above happened to walk that far.
+    _ = parseBasicConstraints(bytes) catch {};
+    _ = parseKeyUsage(bytes) catch {};
+    _ = hasPurpose(bytes, .client_auth) catch {};
+    _ = parseSubjectKeyIdentifier(bytes) catch {};
+    _ = parseAuthorityKeyIdentifier(bytes) catch {};
+    if (parseNameConstraints(bytes) catch null) |nc| {
+        if (nc.permitted) |p| {
+            var sit = subtreeIterator(p);
+            while (sit.next() catch null) |_| {}
+        }
+        if (nc.excluded) |e| {
+            var sit = subtreeIterator(e);
+            while (sit.next() catch null) |_| {}
+        }
+    }
+}

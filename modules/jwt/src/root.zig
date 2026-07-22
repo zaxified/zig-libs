@@ -4658,6 +4658,25 @@ test "JWKS: garbage documents → typed errors; empty set resolves nothing" {
     try testing.expectError(error.NoMatchingKey, verifyWithJwks(&parsed, empty));
 }
 
+test "fuzz: parseJwks never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzParseJwks, .{});
+}
+
+fn fuzzParseJwks(_: void, smith: *std.testing.Smith) !void {
+    var buf: [1024]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // Individual malformed JWKs are skipped (never a set-wide error), and
+    // per parseJwks's own doc comment "Arbitrary bytes never panic" — this
+    // is the fuzz harness proving that claim for both `.local` and
+    // `.network` trust sources (the latter has an extra oct-key rejection
+    // branch `.local` never takes).
+    var local = parseJwksSource(testing.allocator, buf[0..len], .local) catch return;
+    local.deinit();
+    var network = parseJwksSource(testing.allocator, buf[0..len], .network) catch return;
+    network.deinit();
+}
+
 test "parseVerifyJwks: end-to-end against a multi-key set" {
     const gpa = testing.allocator;
     var jwks_buf: [2048]u8 = undefined;

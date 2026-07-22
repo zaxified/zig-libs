@@ -2615,3 +2615,75 @@ test "connection: SETTINGS and empty-DATA floods → ENHANCE_YOUR_CALM" {
         try expectViolation(&conn, wire.items, error.EnhanceYourCalm, .connection);
     }
 }
+
+// ── fuzz: HTTP/2 frame parse + connection recv, never panic ────────────────
+//
+// `parseFrame` is the pure §6 frame-payload decoder; `Connection.recv` is
+// the actual wire-facing entry point (buffers partial frames, enforces
+// `max_frame_size` BEFORE slicing a payload out of the receive buffer, then
+// calls `parseFrame` with a payload whose `.len` is `h.length` by
+// construction — see `recv`'s body). Both see fully attacker-controlled
+// bytes: `parseFrame` fuzzed directly for the decode logic itself, `recv`
+// fuzzed both cold (still expecting the client preface) and warm (past a
+// completed handshake, so frame-type/stream-state dispatch gets exercised
+// too) for the end-to-end path.
+
+test "fuzz: parseFrame never panics on arbitrary header+payload" {
+    try testing.fuzz({}, fuzzParseFrame, .{});
+}
+
+fn fuzzParseFrame(_: void, smith: *std.testing.Smith) !void {
+    var hdr_bytes: [frame_header_len]u8 = undefined;
+    smith.bytes(&hdr_bytes);
+    var payload_buf: [256]u8 = undefined;
+    smith.bytes(&payload_buf);
+    const payload_len: usize = smith.valueRangeAtMost(u16, 0, payload_buf.len);
+    const payload = payload_buf[0..payload_len];
+
+    var h = FrameHeader.decode(&hdr_bytes);
+    // `parseFrame` asserts `payload.len == h.length` (its documented
+    // precondition, upheld in production by `Connection.recv` slicing
+    // exactly `h.length` bytes before calling this) — uphold it here too so
+    // the harness targets `parseFrame`'s own decode logic, not a
+    // self-inflicted precondition violation.
+    h.length = @intCast(payload.len);
+    _ = parseFrame(h, payload) catch {};
+}
+
+test "fuzz: Connection.recv never panics on arbitrary bytes (pre-handshake)" {
+    try testing.fuzz({}, fuzzConnRecvColdStart, .{});
+}
+
+fn fuzzConnRecvColdStart(_: void, smith: *std.testing.Smith) !void {
+    var buf: [512]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+
+    const gpa = testing.allocator;
+    var conn: Connection = .init(gpa, .server, .{});
+    defer conn.deinit();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var events: std.ArrayList(Event) = .empty;
+    defer freeEvents(&events);
+    _ = conn.recv(buf[0..len], &out, &events) catch {};
+}
+
+test "fuzz: Connection.recv never panics on arbitrary bytes (post-handshake)" {
+    try testing.fuzz({}, fuzzConnRecvWarm, .{});
+}
+
+fn fuzzConnRecvWarm(_: void, smith: *std.testing.Smith) !void {
+    var buf: [512]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+
+    var conn = testServer() catch return;
+    defer conn.deinit();
+    const gpa = testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var events: std.ArrayList(Event) = .empty;
+    defer freeEvents(&events);
+    _ = conn.recv(buf[0..len], &out, &events) catch {};
+}

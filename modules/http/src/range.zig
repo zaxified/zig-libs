@@ -630,6 +630,27 @@ test "TooManyRanges via a small out buffer" {
     try testing.expectEqual(@as(usize, 2), specs.len);
 }
 
+// ── fuzz: Range header parse, never panic on arbitrary bytes ───────────────
+//
+// `parse` is the untrusted-wire entry point (§2.1's `byte-ranges-specifier`
+// straight off the `Range` request header); `Iterator.next` strictly
+// shrinks `rest` on every call (see `iterator`'s doc comment), so a
+// pathological header always terminates in a typed error rather than
+// looping.
+
+test "fuzz: Range header parse never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzRangeParse, .{});
+}
+
+fn fuzzRangeParse(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+
+    var out: [default_max_ranges]ByteRangeSpec = undefined;
+    _ = parse(buf[0..len], &out) catch return;
+}
+
 test "iterator streams specs and terminates" {
     var it = try iterator("bytes=0-1, -2, 3-");
     const a = (try it.next()).?;

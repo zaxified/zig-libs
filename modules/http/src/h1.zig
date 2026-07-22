@@ -1043,3 +1043,55 @@ test "ChunkedWriter: single small write is one exact chunk" {
     try cw.finish();
     try testing.expectEqualStrings("3\r\nabc\r\n0\r\n\r\n", sink.buffered());
 }
+
+// ── fuzz: wire-facing parsers, never panic on arbitrary bytes ──────────────
+//
+// `RequestHead.parse`/`ResponseHead.parse` and `ChunkedReader` are the three
+// HTTP/1.x parsers that see raw, attacker-controlled bytes directly off the
+// wire (the request/status line + header block, and the chunked
+// transfer-coding framing of a body) before any higher layer gets to look
+// at them — exactly the "never panic on any input" contract HD1 exists for.
+
+test "fuzz: RequestHead.parse never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzRequestHeadParse, .{});
+}
+
+fn fuzzRequestHeadParse(_: void, smith: *std.testing.Smith) !void {
+    var buf: [512]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    _ = RequestHead.parse(buf[0..len]) catch return;
+}
+
+test "fuzz: ResponseHead.parse never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzResponseHeadParse, .{});
+}
+
+fn fuzzResponseHeadParse(_: void, smith: *std.testing.Smith) !void {
+    var buf: [512]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    _ = ResponseHead.parse(buf[0..len]) catch return;
+}
+
+test "fuzz: ChunkedReader never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzChunkedReader, .{});
+}
+
+fn fuzzChunkedReader(_: void, smith: *std.testing.Smith) !void {
+    var buf: [512]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+
+    var src: Reader = .fixed(buf[0..len]);
+    var cbuf: [64]u8 = undefined;
+    var trailer_buf: [64]u8 = undefined;
+    var cr: ChunkedReader = .initCapturingTrailers(&src, &cbuf, &trailer_buf);
+    var out: [512]u8 = undefined;
+    var w: Writer = .fixed(&out);
+    // A malformed/truncated chunked stream surfaces as `error.ReadFailed`
+    // (see `ChunkedReader.fail_reason`), never a panic or an infinite loop
+    // (the fixed output buffer bounds `streamRemaining`'s work even if it
+    // did loop).
+    _ = cr.reader.streamRemaining(&w) catch {};
+}
