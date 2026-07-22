@@ -145,33 +145,84 @@ key-validity signal leaks); the safe composition is verify-enclosure-then-decryp
 
 ## Holder-of-Key subject confirmation
 
-`Config.subject_confirmation` (`.bearer` default | `.holder_of_key` | `.either`)
-selects which `<SubjectConfirmation Method>` may confirm the subject. For HoK
-(`urn:oasis:names:tc:SAML:2.0:cm:holder-of-key`) the presenter must actually hold
-the key named in the confirmation's `<ds:KeyInfo>`, which the relying party proves
-by supplying the transport key it authenticated the client with
-(`Config.presented_holder_cert_der`, e.g. the TLS client certificate DER).
+`Config.subject_confirmation` (`.bearer` default | `.holder_of_key` |
+`.sender_vouches` | `.either`) selects which `<SubjectConfirmation Method>` may
+confirm the subject. For HoK (`urn:oasis:names:tc:SAML:2.0:cm:holder-of-key`) the
+presenter must actually hold the key named in the confirmation's `<ds:KeyInfo>`,
+which the relying party proves by supplying the transport key it authenticated the
+client with — as a certificate DER (`Config.presented_holder_cert_der`, e.g. the
+TLS client certificate) and/or as a bare public key
+(`Config.presented_holder_key`, a `PresentedKey` union mirroring
+`xmldsig.VerifyKey`).
 
-- **Key match — X.509-DER byte-equality.** The confirmation's
-  `<ds:KeyInfo><ds:X509Data><ds:X509Certificate>` DER is base64-decoded and
-  compared **byte-for-byte** to `presented_holder_cert_der`. The certificate is
-  **never parsed** (Zig 0.16 `std.crypto.Certificate.parse` is not panic-safe on
-  hostile DER — the same policy as `parseIdpMetadata`). **Limitation:** a
-  re-encoded but cryptographically-equivalent certificate, or a bare
-  `<ds:KeyValue>` public key (no X509Certificate), will NOT match — the SP and its
-  transport must present the identical certificate DER. This is a deliberate
-  safety/simplicity trade; SubjectPublicKeyInfo-level matching would require DER
-  parsing.
+- **Key match — three SAME-FORM structural comparisons, no DER parsing.**
+  - `<ds:X509Data><ds:X509Certificate>`: the DER is base64-decoded and compared
+    **byte-for-byte** to `presented_holder_cert_der`. The certificate is **never
+    parsed** (Zig 0.16 `std.crypto.Certificate.parse` is not panic-safe on hostile
+    DER — the same policy as `parseIdpMetadata`).
+  - `<ds:KeyValue><ds:RSAKeyValue>`: `<Modulus>` + `<Exponent>` are base64-decoded
+    and compared as big-endian integers (leading-zero tolerant) to the presented
+    `PresentedKey.rsa` (`rsa.PublicKey`) `n` / `e`. No signature op.
+  - `<ds:KeyValue><ds:ECKeyValue>` (or the older `<dsig11:ECKeyValue>`):
+    `<NamedCurve URI=…>` must identify P-256 (`urn:oid:1.2.840.10045.3.1.7`; the
+    only EC curve `xmldsig.VerifyKey` supports) and the base64 `<PublicKey>` point
+    is compared **byte-for-byte** to the presented `PresentedKey.ec_sec1`
+    (SEC1-encoded point).
+- **Limitations.** A re-encoded but equivalent certificate, or a differently
+  encoded EC point (compressed vs uncompressed), will not match — the same
+  deliberate safety/simplicity trade throughout. **Cross-form is deferred:** if the
+  confirmation names the key ONLY as an `<X509Certificate>` while the caller
+  configured only `presented_holder_key` (or the confirmation carries only a bare
+  `<ds:KeyValue>` while the caller configured only `presented_holder_cert_der`),
+  matching would require extracting the SubjectPublicKeyInfo from the certificate
+  DER — i.e. parsing untrusted DER via `std.crypto.Certificate`, a Zig 0.16 panic
+  hazard the module avoids. That case is `error.HolderOfKeyCrossFormUnsupported`;
+  supply the matching form. (A defensive DER→SPKI extractor would lift this.)
 - **HoK vs Bearer checks.** The HoK key check **replaces** the Bearer `Recipient`
   check. Per the SAML HoK Web-SSO profile, `Recipient` / `InResponseTo` MAY be
   omitted for HoK; when present they are still honored (`RecipientMismatch` /
   `InResponseToMismatch`). `NotBefore` / `NotOnOrAfter`, when present, are enforced.
 - **Errors.** A method disallowed by policy (a HoK confirmation under `.bearer`,
-  or a Bearer confirmation under `.holder_of_key`) →
-  `error.SubjectConfirmationMethodNotAllowed`. HoK required but no presented key →
-  `error.PresentedKeyMissing`. KeyInfo present but no matching X509Certificate →
-  `error.HolderOfKeyMismatch`. Defaults keep the Bearer path byte-for-byte
-  unchanged.
+  etc.) → `error.SubjectConfirmationMethodNotAllowed`. HoK required but neither
+  presented cert nor presented key configured → `error.PresentedKeyMissing`. A
+  same-form comparison was possible but nothing matched →
+  `error.HolderOfKeyMismatch`. Only a cross-form pairing was possible →
+  `error.HolderOfKeyCrossFormUnsupported`. Defaults keep the Bearer path
+  byte-for-byte unchanged.
+
+## Sender-vouches subject confirmation
+
+`urn:oasis:names:tc:SAML:2.0:cm:sender-vouches` is accepted only under the
+`.sender_vouches` or `.either` policy. Sender-vouches imposes **no** key or
+recipient binding on the subject: the assertion's trust derives **entirely** from
+its already-verified signature (which `saml` enforces against the configured
+`idp_key`) plus the normal `<Conditions>` (`NotBefore` / `NotOnOrAfter` /
+`AudienceRestriction`, all enforced before the subject-confirmation step). The
+Bearer `Recipient` / `InResponseTo` correlation and the HoK key check are
+therefore **not** applied.
+
+**Trust assumption (caller-critical):** because nothing binds the presenter to a
+key or channel, the caller MUST ensure the configured `idp_key` **is** the trusted
+attesting authority for the subject — the signature is the *only* thing vouching.
+Sender-vouches is gated behind the policy so it is never silently accepted when the
+caller expects Bearer / HoK (`error.SubjectConfirmationMethodNotAllowed`
+otherwise).
+
+## Level of Assurance (eIDAS)
+
+`Config.required_loa: ?[]const u8` (default null ⇒ no check) imposes a minimum on
+the returned `<AuthnStatement><AuthnContext><AuthnContextClassRef>`. When set:
+
+- For the eIDAS URIs (`http://eidas.europa.eu/LoA/{low,substantial,high}`) the
+  natural ordering **low < substantial < high** is used; the returned level must be
+  ≥ the required one.
+- For any **non-eIDAS** class ref, an **exact string match** is required (there is
+  no cross-family ordering: an eIDAS requirement against a non-eIDAS returned class
+  ref, or vice-versa, does not meet).
+- An **absent** `<AuthnContextClassRef>` never meets a requirement.
+
+Failing the check is `error.LevelOfAssuranceInsufficient`. The returned level is
+also surfaced verbatim in `AuthnResult.authn_context_class_ref`.
 
 ## Validation performed on the trusted assertion
 
@@ -210,14 +261,12 @@ by supplying the transport key it authenticated the client with
 
 ## Deferred / out of scope
 
-- **Sender-vouches** subject confirmation
-  (`urn:oasis:names:tc:SAML:2.0:cm:sender-vouches`) — only Bearer and
-  Holder-of-Key are validated; a sender-vouches confirmation is ignored (never
-  satisfies the subject).
-- **Holder-of-Key `<ds:KeyValue>` matching** — HoK confirmation is matched by
-  X.509-DER byte-equality only; a bare `<ds:KeyValue>` (RSA/EC public key without
-  an X509Certificate) is not matched (would require DER parsing). See
-  "Holder-of-Key subject confirmation".
+- **Holder-of-Key cross-form match (cert ↔ `<ds:KeyValue>`)** — same-form matches
+  (cert-DER ↔ `presented_holder_cert_der`, `<KeyValue>` ↔ `presented_holder_key`)
+  are supported; matching an `<X509Certificate>` confirmation against a bare
+  presented key (or vice-versa) is `error.HolderOfKeyCrossFormUnsupported`, pending
+  a defensive DER→SubjectPublicKeyInfo extractor (parsing untrusted DER via
+  `std.crypto.Certificate` is a Zig 0.16 panic hazard). See "Holder-of-Key".
 - **Single Logout (SLO)**, artifact binding, and the IdP side — not implemented.
 
 ## Fixture provenance (be honest about interop)
@@ -237,23 +286,26 @@ Note on the common public fixtures: the widely-circulated `python3-saml`
 dynamically at test time). It is unsuitable as a static end-to-end signature
 fixture, which is precisely why the independent-toolchain fixture above is used.
 
-### EncryptedID / EncryptedAttribute / Holder-of-Key fixtures (constructed)
+### EncryptedID / EncryptedAttribute / Holder-of-Key / sender-vouches / LoA fixtures (constructed)
 
 These features put new content **inside** the signed assertion (an encrypted
-NameID in the Subject, an encrypted Attribute in the AttributeStatement, a HoK
-`<SubjectConfirmation>`), which no string edit of the openssl/lxml fixture can
-produce without breaking its digest. So `test_sign.zig` **mints a fresh signed
-assertion** under a locally-generated RSA key — `xmldsig.c14n` for Exclusive-C14N
-+ `rsa.signPkcs1v15` for RSA-SHA256, exactly as `xmldsig`'s own round-trip tests
-do (no signing API is exposed by the modules). This is a **CONSTRUCTED** fixture
-(our canonicalizer feeds our verifier), **not** cross-implementation interop: the
-byte-exact interop anchors remain the openssl/lxml fixture (`test_fixture.zig`)
-and the NIST/RFC KATs in `xmlenc`. The minted-fixture suites prove the
-EncryptedID / EncryptedAttribute / HoK **logic** on top of those anchors. Each is
-paired with a positive control (cleartext-equivalent NameID; matching HoK cert).
-The HoK "certificate DER" in the tests is an opaque byte blob — the match is a
-byte comparison that never parses it, so a blob exercises the exact code path a
-real cert would. All RSA keys in these tests are test material only.
+NameID in the Subject, an encrypted Attribute in the AttributeStatement, a HoK /
+sender-vouches `<SubjectConfirmation>`, an `<AuthnContextClassRef>`), which no
+string edit of the openssl/lxml fixture can produce without breaking its digest.
+So `test_sign.zig` **mints a fresh signed assertion** under a locally-generated
+RSA key — `xmldsig.c14n` for Exclusive-C14N + `rsa.signPkcs1v15` for RSA-SHA256,
+exactly as `xmldsig`'s own round-trip tests do (no signing API is exposed by the
+modules). This is a **CONSTRUCTED** fixture (our canonicalizer feeds our
+verifier), **not** cross-implementation interop: the byte-exact interop anchors
+remain the openssl/lxml fixture (`test_fixture.zig`) and the NIST/RFC KATs in
+`xmlenc`. The minted-fixture suites prove the EncryptedID / EncryptedAttribute /
+HoK / sender-vouches / LoA **logic** on top of those anchors. Each is paired with
+a positive control. The HoK "certificate DER" and the EC SEC1 point in the tests
+are opaque byte blobs — the match is a byte/integer comparison that never parses
+them, so a blob exercises the exact code path a real key would; the HoK
+`<RSAKeyValue>` case, by contrast, embeds the signing key's real modulus/exponent
+and matches them against the same `rsa.PublicKey`, exercising the genuine
+integer-equality path. All RSA keys in these tests are test material only.
 
 ## DRY / hazard follow-ups
 
