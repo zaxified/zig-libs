@@ -166,9 +166,12 @@ pub fn appendLinkModesSet(
     list: *std.ArrayList(u8),
     set: LinkModesSet,
 ) bitset.Error!void {
-    if (set.autoneg) |v| try codec.appendAttrU8(gpa, list, uapi.LINKMODES.AUTONEG, @intFromBool(v));
+    // Attribute order carries no meaning to the kernel, but this one matches
+    // what `ethtool -s <dev> speed … duplex … autoneg …` emits, so the golden
+    // comparison is a plain byte compare instead of a set comparison.
     if (set.speed_mbps) |s| try codec.appendAttrU32(gpa, list, uapi.LINKMODES.SPEED, s);
     if (set.duplex) |d| try codec.appendAttrU8(gpa, list, uapi.LINKMODES.DUPLEX, @intFromEnum(d));
+    if (set.autoneg) |v| try codec.appendAttrU8(gpa, list, uapi.LINKMODES.AUTONEG, @intFromBool(v));
     if (set.master_slave_cfg) |m|
         try codec.appendAttrU8(gpa, list, uapi.LINKMODES.MASTER_SLAVE_CFG, @intFromEnum(m));
     if (set.lanes) |l| try codec.appendAttrU32(gpa, list, uapi.LINKMODES.LANES, l);
@@ -313,9 +316,9 @@ test "LINKMODES_SET encodes only what was asked for" {
     defer list.deinit(gpa);
     try appendLinkModesSet(gpa, &list, .{ .autoneg = false, .speed_mbps = 100, .duplex = .full });
     var it: codec.AttrIterator = .{ .buf = list.items };
+    try testing.expectEqual(@as(u32, 100), try (try it.next()).?.asU32()); // speed
+    try testing.expectEqual(@as(u8, 1), try (try it.next()).?.asU8()); // duplex full
     try testing.expectEqual(@as(u8, 0), try (try it.next()).?.asU8()); // autoneg off
-    try testing.expectEqual(@as(u32, 100), try (try it.next()).?.asU32());
-    try testing.expectEqual(@as(u8, 1), try (try it.next()).?.asU8());
     try testing.expect((try it.next()) == null);
 
     // Advertisement-only form (autoneg stays whatever it was).

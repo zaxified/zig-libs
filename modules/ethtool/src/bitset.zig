@@ -39,6 +39,21 @@
 //! applicable / unsupported" — not "off". `Bitset.inMask` is the accessor that
 //! keeps those apart; `isSet` alone would silently conflate them.
 //!
+//! ### The trap: `NOMASK` changes what a verbose entry *means*
+//!
+//! `ETHTOOL_A_BITSET_BIT_VALUE` is a flag, and the kernel only emits it for a
+//! **masked** verbose bitset. In a `NOMASK` verbose bitset it emits *only the
+//! set bits*, each with an index and a name and **no `VALUE` flag at all** —
+//! presence is the value. Reading `bit.value` directly there gives `false` for
+//! every bit in a list that is, by construction, entirely made of set bits.
+//!
+//! Both shapes are pinned by real replies from the same kernel seconds apart
+//! (`goldens.zig`, `reply_features_verbose`): its `hw` bitset is masked and
+//! lists all 64 bits with `VALUE` on the capable ones, while its `active`
+//! bitset is `NOMASK` and lists only the nine that are on, none of them
+//! carrying `VALUE`. `isSet` / `isSetByName` apply the rule; `Bit.value` is
+//! the raw wire flag and is deliberately left raw.
+//!
 //! ## Sizes
 //!
 //! The compact form's word count is `ceil(size / 32)`, which this decoder
@@ -105,11 +120,14 @@ pub const Bitset = struct {
     /// For a masked set this answers only half the question — a clear bit that
     /// is also outside the mask means "unsupported", not "off". Pair it with
     /// `inMask`.
+    ///
+    /// In a `NOMASK` verbose set, being listed *is* being set (see the file
+    /// header): the kernel omits the `VALUE` flag there entirely.
     pub fn isSet(bs: Bitset, index: u32) bool {
         if (bs.bits) |list| {
             for (list) |b| {
                 if (b.index) |i| {
-                    if (i == index) return b.value;
+                    if (i == index) return bs.nomask or b.value;
                 }
             }
             return false;
@@ -117,11 +135,33 @@ pub const Bitset = struct {
         return wordBit(bs.value_words, index);
     }
 
+    /// Is the bit the kernel calls `name` set? Verbose sets only — a compact
+    /// set carries no names and answers null.
+    ///
+    /// Null also means "this masked set does not mention that bit", which is
+    /// not the same as "off": in a `FEATURES_GET` reply's `hw` bitset it means
+    /// the kernel does not know the feature at all. A `NOMASK` list *does*
+    /// know its whole universe, so an absent name there is a definite `false`.
+    pub fn isSetByName(bs: Bitset, name: []const u8) ?bool {
+        const list = bs.bits orelse return null;
+        for (list) |b| {
+            if (b.name) |n| {
+                if (std.mem.eql(u8, n, name)) return bs.nomask or b.value;
+            }
+        }
+        return if (bs.nomask) false else null;
+    }
+
     /// Is bit `index` part of the set at all — i.e. inside the mask (masked
     /// form), present in the list (verbose), or below `size` (a `NOMASK`
     /// compact set, where every bit is meaningful)?
     pub fn inMask(bs: Bitset, index: u32) bool {
         if (bs.bits) |list| {
+            // A verbose list knows its whole universe from SIZE; a verbose
+            // masked set knows it from which bits it bothered to send.
+            if (bs.nomask) {
+                if (bs.size) |n| return index < n;
+            }
             for (list) |b| {
                 if (b.index) |i| {
                     if (i == index) return true;
@@ -162,6 +202,7 @@ pub const Bitset = struct {
     /// Number of set bits.
     pub fn count(bs: Bitset) u32 {
         if (bs.bits) |list| {
+            if (bs.nomask) return @intCast(list.len); // listed = set
             var n: u32 = 0;
             for (list) |b| n += @intFromBool(b.value);
             return n;
@@ -170,6 +211,26 @@ pub const Bitset = struct {
         var n: u32 = 0;
         for (words) |w| n += @popCount(w);
         return n;
+    }
+
+    /// How many bits this set actually says something about — the size of its
+    /// mask. For a masked set that is the mask's population count; for a
+    /// `NOMASK` list every bit it carries is in scope. Distinct from `count`,
+    /// which counts *set* bits: a mask entry whose value is 0 means "this bit
+    /// was mentioned and it is off", which `count` cannot express.
+    pub fn maskCount(bs: Bitset) u32 {
+        if (bs.bits) |list| {
+            if (bs.nomask) return @intCast(list.len);
+            var n: u32 = 0;
+            for (list) |b| n += @intFromBool(b.index != null);
+            return n;
+        }
+        if (bs.mask_words) |words| {
+            var n: u32 = 0;
+            for (words) |w| n += @popCount(w);
+            return n;
+        }
+        return bs.size orelse bs.count();
     }
 
     fn wordBit(words: ?[]const u32, index: u32) bool {
@@ -436,7 +497,11 @@ test "compact round-trip: value + mask" {
     try testing.expect(bs.isSet(3));
     try testing.expect(bs.isSet(63)); // bit 31 of word 1
     try testing.expect(bs.isSet(32));
-    try testing.expectEqual(@as(u32, 6), bs.count());
+    // 3 bits in word 0 (0b1011) + 2 in word 1 (0x8000_0001).
+    try testing.expectEqual(@as(u32, 5), bs.count());
+    // The mask (0xffff_ffff, 0x8000_000f) says something about 37 bits,
+    // of which 5 are on.
+    try testing.expectEqual(@as(u32, 37), bs.maskCount());
     // Mask semantics: bit 5 is clear *and* supported; bit 40 is neither.
     try testing.expect(bs.inMask(5));
     try testing.expect(!bs.isSet(5));
@@ -494,9 +559,15 @@ test "verbose round-trip: name-keyed list (the --groups shape)" {
     try testing.expectEqualStrings("rmon", bs.bits.?[1].name.?);
     // A name list carries no indices, so index lookups find nothing.
     try testing.expect(!bs.isSet(0));
-    try testing.expect(!bs.inMask(0));
     try testing.expect(bs.byName("rmon") != null);
     try testing.expect(bs.byName("eth-phy") == null);
+    // …but by name, presence is the value — and the list knows its own
+    // universe, so an absent name is a definite "off", not "unknown".
+    try testing.expectEqual(@as(?bool, true), bs.isSetByName("rmon"));
+    try testing.expectEqual(@as(?bool, false), bs.isSetByName("eth-phy"));
+    // The raw wire flag is left raw: no BIT_VALUE was sent for either.
+    try testing.expect(!bs.byName("rmon").?.value);
+    try testing.expectEqual(@as(u32, 2), bs.count());
 }
 
 test "verbose round-trip: name-keyed values (the -K shape)" {
@@ -515,6 +586,12 @@ test "verbose round-trip: name-keyed values (the -K shape)" {
     try testing.expectEqual(@as(usize, 2), bs.bits.?.len);
     try testing.expect(!bs.byName("tx-tcp-segmentation").?.value);
     try testing.expect(bs.byName("rx-checksum").?.value);
+    // Masked: the VALUE flag decides, and a name that was never mentioned is
+    // "unknown", not "off".
+    try testing.expectEqual(@as(?bool, false), bs.isSetByName("tx-tcp-segmentation"));
+    try testing.expectEqual(@as(?bool, true), bs.isSetByName("rx-checksum"));
+    try testing.expectEqual(@as(?bool, null), bs.isSetByName("highdma"));
+    try testing.expectEqual(@as(u32, 1), bs.count());
 }
 
 test "verbose round-trip: index-keyed values" {
@@ -634,4 +711,5 @@ fn fuzzBitset(_: void, smith: *std.testing.Smith) !void {
     std.mem.doNotOptimizeAway(bs.count());
     _ = bs.nameOf(probe);
     _ = bs.byName("x");
+    _ = bs.isSetByName("x");
 }

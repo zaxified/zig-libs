@@ -136,6 +136,24 @@ pub fn parse(nest_bytes: []const u8) codec.Error!Device {
     return d;
 }
 
+/// Decode the header of a message whose *command* is not known in advance —
+/// a notification off the `monitor` group, where the header nest's attribute
+/// type depends on which `*_NTF` it is.
+///
+/// Every ethtool message puts its header nest first, so this reads the leading
+/// attribute and interprets it as one. It returns null when that attribute
+/// yields neither a device index nor a name, which is how a message that is
+/// *not* shaped like an ethtool reply fails safely instead of producing a
+/// plausible-looking wrong device.
+pub fn parseLeading(attr_bytes: []const u8) codec.Error!?Device {
+    var it: codec.AttrIterator = .{ .buf = attr_bytes };
+    const first = (try it.next()) orelse return null;
+    // A leading attribute that does not even walk as a nest is not a header.
+    const d = parse(first.data) catch return null;
+    if (d.index == null and d.name_len == 0) return null;
+    return d;
+}
+
 /// Find and decode the header nest inside a message's attribute bytes.
 /// Returns null when the message carries none (which a well-formed ethtool
 /// message never does).
@@ -163,7 +181,7 @@ test "header by name, no flags — the shape ethtool sends for a plain GET" {
         0x0e, 0x00, 0x02, 0x00, // len 14, DEV_NAME
         'e',  'n',  'p',  '0',
         's',  '3',  '1',  'f',
-        '6',  0x00, 0x00, 0x00, // NUL + pad
+        '6', 0x00, 0x00, 0x00, // NUL + pad
     }, list.items);
 }
 

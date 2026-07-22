@@ -20,14 +20,27 @@
 //!
 //! `FEATURES_SET` **always ACKs**, whether or not the requested bits took
 //! effect. The truth is in the `FEATURES_SET_REPLY` message, which carries two
-//! *diff* bitsets, both masked by the request's own mask:
+//! *diff* bitsets. Both are (value, mask) pairs and the **mask is the
+//! interesting half**:
 //!
-//! * `wanted` — bits that were requested **on** but are not active afterwards;
-//! * `active` — bits that are active afterwards despite being requested **off**.
+//! | reply attribute | mask means | value means |
+//! |---|---|---|
+//! | `ETHTOOL_A_FEATURES_WANTED` | this bit's result differs from what was requested | what was requested |
+//! | `ETHTOOL_A_FEATURES_ACTIVE` | this bit's active state actually changed | its new state |
 //!
-//! A bit set in either one is a change the kernel did not honour — the same
-//! thing `ethtool -K` prints under "Actual changes:". `SetResult.fullyHonoured`
-//! is that test; `SetResult` keeps both diffs so a caller can say *which* bits.
+//! So a non-empty `WANTED` mask is the "you did not get what you asked for"
+//! signal, and the `ACTIVE` mask is "here is what really moved". That mapping
+//! is not guesswork: `goldens.zig` carries two real `FEATURES_SET_REPLY`
+//! messages captured with CAP_NET_ADMIN inside `unshare -rn` — one fully
+//! honoured (empty `WANTED` mask) and one where four of five requested bits
+//! were refused (`WANTED` mask = exactly those four, `ACTIVE` mask = the one
+//! that did move).
+//!
+//! Counting *set value bits* would be the wrong test — a feature requested
+//! **off** and refused has a clear value bit and a set mask bit — which is why
+//! `SetResult` uses `Bitset.maskCount`, not `Bitset.count`.
+//!
+//! `ethtool -K` prints exactly this under "Actual changes:".
 //!
 //! Note the interaction with `ETHTOOL_FLAG_OMIT_REPLY`: setting it suppresses
 //! the reply entirely, and with it any chance of knowing what stuck. This
@@ -63,8 +76,7 @@ pub const Features = struct {
     /// `isActiveAt`.
     pub fn isActive(f: Features, name: []const u8) ?bool {
         const a = f.active orelse return null;
-        const b = a.byName(name) orelse return null;
-        return b.value;
+        return a.isSetByName(name);
     }
 
     pub fn isActiveAt(f: Features, index: u32) bool {
@@ -134,48 +146,64 @@ pub fn appendSetByIndex(
     try bitset.appendIndexedValues(gpa, list, uapi.FEATURES.WANTED, entries);
 }
 
-/// The decoded `FEATURES_SET_REPLY`. Both bitsets are *diffs* — see the file
-/// header. Owns its allocations.
+/// The decoded `FEATURES_SET_REPLY`. Both bitsets are *diffs* whose mask half
+/// carries the meaning — see the file header. Owns its allocations.
 pub const SetResult = struct {
     device: header.Device = .{},
-    /// Requested **on**, not active afterwards.
-    wanted_diff: ?bitset.Bitset = null,
-    /// Active afterwards despite being requested **off**.
-    active_diff: ?bitset.Bitset = null,
+    /// Requested changes the kernel did **not** honour. `inMask(i)` = bit `i`'s
+    /// resulting state differs from what was requested; `isSet(i)` = what was
+    /// requested for it.
+    unhonoured: ?bitset.Bitset = null,
+    /// Features whose active state actually **changed**. `inMask(i)` = it
+    /// changed; `isSet(i)` = its new state.
+    changed: ?bitset.Bitset = null,
 
     pub fn deinit(r: *SetResult, gpa: std.mem.Allocator) void {
-        if (r.wanted_diff) |*b| b.deinit(gpa);
-        if (r.active_diff) |*b| b.deinit(gpa);
+        if (r.unhonoured) |*b| b.deinit(gpa);
+        if (r.changed) |*b| b.deinit(gpa);
         r.* = .{};
     }
 
     /// True when the kernel did exactly what was asked. A `FEATURES_SET` that
     /// ACKs but returns false here changed less than the caller requested.
     pub fn fullyHonoured(r: SetResult) bool {
-        const w = if (r.wanted_diff) |b| b.count() else 0;
-        const a = if (r.active_diff) |b| b.count() else 0;
-        return w == 0 and a == 0;
+        return r.unhonouredCount() == 0;
     }
 
-    /// How many requested bits were not honoured (both directions summed).
+    /// How many requested bits were not honoured.
     pub fn unhonouredCount(r: SetResult) u32 {
-        const w = if (r.wanted_diff) |b| b.count() else 0;
-        const a = if (r.active_diff) |b| b.count() else 0;
-        return w + a;
+        const b = r.unhonoured orelse return 0;
+        return b.maskCount();
     }
 
-    /// Was this specific feature honoured? Only answerable by name when the
-    /// reply used verbose bitsets (the default — do not set
-    /// `compact_bitsets` on a SET if you want names back).
+    /// How many features actually changed state.
+    pub fn changedCount(r: SetResult) u32 {
+        const b = r.changed orelse return 0;
+        return b.maskCount();
+    }
+
+    /// Was this specific feature bit honoured?
+    pub fn honouredAt(r: SetResult, index: u32) bool {
+        const b = r.unhonoured orelse return true;
+        return !b.inMask(index);
+    }
+
+    /// The feature's new active state, or null when it did not change.
+    pub fn newStateAt(r: SetResult, index: u32) ?bool {
+        const b = r.changed orelse return null;
+        if (!b.inMask(index)) return null;
+        return b.isSet(index);
+    }
+
+    /// Same as `honouredAt`, by name. Only answerable when the reply used
+    /// verbose bitsets — `ethtool` itself asks for compact ones here, so a
+    /// caller that wants names must not set `compact_bitsets` on the SET.
     pub fn honouredByName(r: SetResult, name: []const u8) bool {
-        if (r.wanted_diff) |b| {
-            if (b.byName(name)) |bit| {
-                if (bit.value) return false;
-            }
-        }
-        if (r.active_diff) |b| {
-            if (b.byName(name)) |bit| {
-                if (bit.value) return false;
+        const b = r.unhonoured orelse return true;
+        const bits = b.bits orelse return true;
+        for (bits) |bit| {
+            if (bit.name) |n| {
+                if (std.mem.eql(u8, n, name)) return false;
             }
         }
         return true;
@@ -192,12 +220,12 @@ pub fn parseSetResult(gpa: std.mem.Allocator, attr_bytes: []const u8) Error!SetR
     while (try it.next()) |a| switch (a.type) {
         uapi.FEATURES.HEADER => out.device = try header.parse(a.data),
         uapi.FEATURES.WANTED => {
-            if (out.wanted_diff != null) return error.BadLength;
-            out.wanted_diff = try bitset.parse(gpa, a.data);
+            if (out.unhonoured != null) return error.BadLength;
+            out.unhonoured = try bitset.parse(gpa, a.data);
         },
         uapi.FEATURES.ACTIVE => {
-            if (out.active_diff != null) return error.BadLength;
-            out.active_diff = try bitset.parse(gpa, a.data);
+            if (out.changed != null) return error.BadLength;
+            out.changed = try bitset.parse(gpa, a.data);
         },
         else => {},
     };
@@ -248,40 +276,73 @@ test "GET reply: verbose bitsets answer by name" {
     try testing.expect(f.isActive("no-such-feature") == null);
 }
 
-test "SET reply: an empty diff means fully honoured" {
+test "SET reply: an empty unhonoured mask means fully honoured" {
     const gpa = testing.allocator;
     var list: std.ArrayList(u8) = .empty;
     defer list.deinit(gpa);
     try header.append(gpa, &list, uapi.FEATURES.HEADER, .{ .target = .byIndex(2) });
-    try bitset.appendCompact(gpa, &list, uapi.FEATURES.WANTED, 32, &.{0}, &.{0b1000});
+    // Nothing refused; one bit (3) changed, to off.
+    try bitset.appendCompact(gpa, &list, uapi.FEATURES.WANTED, 32, &.{0}, &.{0});
     try bitset.appendCompact(gpa, &list, uapi.FEATURES.ACTIVE, 32, &.{0}, &.{0b1000});
 
     var r = try parseSetResult(gpa, list.items);
     defer r.deinit(gpa);
     try testing.expect(r.fullyHonoured());
     try testing.expectEqual(@as(u32, 0), r.unhonouredCount());
+    try testing.expectEqual(@as(u32, 1), r.changedCount());
+    try testing.expectEqual(@as(?bool, false), r.newStateAt(3));
+    try testing.expect(r.newStateAt(4) == null); // untouched
+    try testing.expect(r.honouredAt(3));
+}
+
+test "SET reply: a refused change is reported even though its value bit is 0" {
+    // The trap `Bitset.count` would fall into: a feature requested **off** and
+    // refused has a clear *value* bit and a set *mask* bit. Counting set values
+    // would call that a success.
+    const gpa = testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    try bitset.appendCompact(gpa, &list, uapi.FEATURES.WANTED, 32, &.{0}, &.{0b0100});
+    try bitset.appendCompact(gpa, &list, uapi.FEATURES.ACTIVE, 32, &.{0}, &.{0});
+
+    var r = try parseSetResult(gpa, list.items);
+    defer r.deinit(gpa);
+    try testing.expect(!r.fullyHonoured());
+    try testing.expectEqual(@as(u32, 1), r.unhonouredCount());
+    try testing.expectEqual(@as(u32, 0), r.changedCount());
+    try testing.expect(!r.honouredAt(2));
+    try testing.expect(r.honouredAt(3));
 }
 
 test "SET reply: a partially honoured change is reported, not swallowed" {
     const gpa = testing.allocator;
     var list: std.ArrayList(u8) = .empty;
     defer list.deinit(gpa);
-    // The caller asked for tso on and rx-checksum off; the kernel kept tso off
-    // (it appears in the `wanted` diff) and rx-checksum on (`active` diff).
-    try bitset.appendNamedValues(gpa, &list, uapi.FEATURES.WANTED, &.{
-        .{ .name = "tx-tcp-segmentation", .on = true },
-    });
-    try bitset.appendNamedValues(gpa, &list, uapi.FEATURES.ACTIVE, &.{
-        .{ .name = "rx-checksum", .on = true },
-    });
+    // Requested bits 1 and 2 on; only 2 took effect.
+    try bitset.appendCompact(gpa, &list, uapi.FEATURES.WANTED, 32, &.{0b0010}, &.{0b0010});
+    try bitset.appendCompact(gpa, &list, uapi.FEATURES.ACTIVE, 32, &.{0b0100}, &.{0b0100});
 
     var r = try parseSetResult(gpa, list.items);
     defer r.deinit(gpa);
     try testing.expect(!r.fullyHonoured());
-    try testing.expectEqual(@as(u32, 2), r.unhonouredCount());
+    try testing.expectEqual(@as(u32, 1), r.unhonouredCount());
+    try testing.expect(!r.honouredAt(1));
+    try testing.expect(r.honouredAt(2));
+    try testing.expectEqual(@as(?bool, true), r.newStateAt(2));
+    try testing.expect(r.newStateAt(1) == null); // asked for, never moved
+}
+
+test "SET reply: a verbose reply answers by name" {
+    const gpa = testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    try bitset.appendNamedValues(gpa, &list, uapi.FEATURES.WANTED, &.{
+        .{ .name = "tx-tcp-segmentation", .on = true },
+    });
+    var r = try parseSetResult(gpa, list.items);
+    defer r.deinit(gpa);
     try testing.expect(!r.honouredByName("tx-tcp-segmentation"));
-    try testing.expect(!r.honouredByName("rx-checksum"));
-    try testing.expect(r.honouredByName("tx-scatter-gather")); // never mentioned
+    try testing.expect(r.honouredByName("rx-gro")); // never mentioned
 }
 
 test "SET request encodes the -K shape: named bits, no NOMASK" {

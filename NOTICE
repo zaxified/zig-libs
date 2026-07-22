@@ -265,6 +265,18 @@ project git history).
                genetlink-family modules can depend on it directly; no new
                third-party design reference beyond the kernel header.
 
+  ethtool    — original pure-Zig ethtool-netlink client, clean-room from
+               linux/ethtool_netlink_generated.h and linux/ethtool.h
+               (GPL-2.0 WITH Linux-syscall-note). No GPL header source is
+               copied — only the uncopyrightable ABI facts they document
+               are used (message/attribute/flag constants, bitset and nest
+               layouts), relying on the same Linux-syscall-note exception
+               as `netlink`/`genetlink`/`nl80211`/`wireguard`. The
+               `ethtool` binary (GPL-2.0) was run ONLY as a black-box test
+               oracle under `strace`, its request bytes diffed against
+               this module's — no `ethtool` source consulted, studied or
+               ported.
+
   nl80211    — original pure-Zig nl80211 (Wi-Fi) client, clean-room from
                linux/nl80211.h (GPL-2.0 WITH Linux-syscall-note) and the
                IEEE 802.11 information-element formats. No GPL header
