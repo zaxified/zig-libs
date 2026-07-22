@@ -26,8 +26,14 @@ const ratespec = @import("ratespec.zig");
 const Psched = ratespec.Psched;
 const qdisc = @import("qdisc.zig");
 const filter = @import("filter.zig");
+const action = @import("action.zig");
 
 pub const tcmsg_len = qdisc.tcmsg_len;
+/// `sizeof(struct tcamsg)` — the fixed header of the **standalone** action
+/// family. It is only 4 bytes (family + two pads), not the 20-byte `tcmsg`;
+/// sending a `tcmsg` on an `RTM_*ACTION` shifts every attribute by 16 bytes
+/// and the kernel rejects the message.
+pub const tcamsg_len = action.tcamsg_len;
 
 // ── rtnetlink message types ─────────────────────────────────────────────────
 
@@ -40,6 +46,9 @@ pub const RTM_GETTCLASS: u16 = @intFromEnum(linux.NetlinkMessageType.RTM_GETTCLA
 pub const RTM_NEWTFILTER: u16 = @intFromEnum(linux.NetlinkMessageType.RTM_NEWTFILTER);
 pub const RTM_DELTFILTER: u16 = @intFromEnum(linux.NetlinkMessageType.RTM_DELTFILTER);
 pub const RTM_GETTFILTER: u16 = @intFromEnum(linux.NetlinkMessageType.RTM_GETTFILTER);
+pub const RTM_NEWACTION: u16 = @intFromEnum(linux.NetlinkMessageType.RTM_NEWACTION);
+pub const RTM_DELACTION: u16 = @intFromEnum(linux.NetlinkMessageType.RTM_DELACTION);
+pub const RTM_GETACTION: u16 = @intFromEnum(linux.NetlinkMessageType.RTM_GETACTION);
 
 /// How a create-style request behaves when the object already exists.
 /// Mirrors `netlink.Create` for the tc families.
@@ -224,12 +233,29 @@ pub fn buildClassDel(
 // ── filter ──────────────────────────────────────────────────────────────────
 
 /// Build an `RTM_NEWTFILTER` request (`tc filter add|replace|change`).
+///
+/// Kept at its v2 signature for source compatibility; it pins
+/// `Psched.fallback`, which only matters for a `police` action's burst
+/// ticks. Use `buildFilterSetWith` (or `Socket.filterAdd`, which passes the
+/// socket's own calibration) when the spec carries actions.
 pub fn buildFilterSet(
     gpa: std.mem.Allocator,
     seq: u32,
     op: Create,
     target: FilterTarget,
     spec: filter.FilterSpec,
+) BuildError![]u8 {
+    return buildFilterSetWith(gpa, seq, op, target, spec, Psched.fallback);
+}
+
+/// `buildFilterSet` with an explicit psched calibration.
+pub fn buildFilterSetWith(
+    gpa: std.mem.Allocator,
+    seq: u32,
+    op: Create,
+    target: FilterTarget,
+    spec: filter.FilterSpec,
+    ps: Psched,
 ) BuildError![]u8 {
     var list: std.ArrayList(u8) = .empty;
     errdefer list.deinit(gpa);
@@ -238,7 +264,7 @@ pub fn buildFilterSet(
     try appendTcmsg(gpa, &list, target.ifindex, target.handle, target.parent, info);
     try appendKind(gpa, &list, spec.kind());
     const nest = try codec.nestBegin(gpa, &list, qdisc.TCA.OPTIONS);
-    try spec.appendOptions(gpa, &list);
+    try spec.appendOptionsWith(gpa, &list, ps);
     codec.nestEnd(&list, nest);
     codec.finishHeader(&list, hdr);
     return list.toOwnedSlice(gpa);
@@ -266,6 +292,106 @@ pub fn buildFilterDel(
     const info = filter.makeInfo(target.prio, target.eth_type);
     try appendTcmsg(gpa, &list, target.ifindex, target.handle, target.parent, info);
     if (kind) |k| try appendKind(gpa, &list, k);
+    codec.finishHeader(&list, hdr);
+    return list.toOwnedSlice(gpa);
+}
+
+// ── standalone actions (the shared action table) ────────────────────────────
+
+/// Append a `struct tcamsg`: u8 family, u8 pad1, u16 pad2 — all zero, exactly
+/// what `tc actions …` sends.
+pub fn appendTcamsg(
+    gpa: std.mem.Allocator,
+    list: *std.ArrayList(u8),
+) std.mem.Allocator.Error!void {
+    const buf: [tcamsg_len]u8 = @splat(0);
+    try codec.appendPadded(gpa, list, &buf);
+}
+
+/// Build an `RTM_NEWACTION` request (`tc actions add|replace|change`) that
+/// installs one or more actions in the shared table. Each spec's `index`
+/// picks its table slot; 0 lets the kernel allocate one.
+pub fn buildActionSet(
+    gpa: std.mem.Allocator,
+    seq: u32,
+    op: Create,
+    actions: []const action.ActionSpec,
+    ps: Psched,
+) BuildError![]u8 {
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(gpa);
+    const hdr = try codec.appendHeader(gpa, &list, RTM_NEWACTION, op.flags(), seq, 0);
+    try appendTcamsg(gpa, &list);
+    try action.appendActionList(gpa, &list, action.TCA_ACT_TAB, actions, ps);
+    codec.finishHeader(&list, hdr);
+    return list.toOwnedSlice(gpa);
+}
+
+/// Build an `RTM_DELACTION` request (`tc actions del action KIND index N`).
+/// Actions are addressed by `(kind, index)`, not by any attach point.
+pub fn buildActionDel(
+    gpa: std.mem.Allocator,
+    seq: u32,
+    refs: []const action.ActionRef,
+) BuildError![]u8 {
+    return buildActionRefMsg(gpa, seq, RTM_DELACTION, codec.NLM_F_REQUEST | codec.NLM_F_ACK, refs);
+}
+
+/// Build an `RTM_GETACTION` request for one specific action
+/// (`tc actions get action KIND index N`). Unlike the dump form this carries
+/// no `NLM_F_DUMP` and no `NLM_F_ACK`: the kernel answers with a single
+/// `RTM_NEWACTION` message.
+pub fn buildActionGet(
+    gpa: std.mem.Allocator,
+    seq: u32,
+    refs: []const action.ActionRef,
+) BuildError![]u8 {
+    return buildActionRefMsg(gpa, seq, RTM_GETACTION, codec.NLM_F_REQUEST, refs);
+}
+
+fn buildActionRefMsg(
+    gpa: std.mem.Allocator,
+    seq: u32,
+    msg_type: u16,
+    flags: u16,
+    refs: []const action.ActionRef,
+) BuildError![]u8 {
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(gpa);
+    const hdr = try codec.appendHeader(gpa, &list, msg_type, flags, seq, 0);
+    try appendTcamsg(gpa, &list);
+    try action.appendActionRefs(gpa, &list, action.TCA_ACT_TAB, refs);
+    codec.finishHeader(&list, hdr);
+    return list.toOwnedSlice(gpa);
+}
+
+/// Build the `RTM_GETACTION` **dump** request (`tc actions ls action KIND`):
+/// a one-entry table naming the kind, plus the `TCA_ROOT_FLAGS` bitfield with
+/// `TCA_ACT_FLAG_LARGE_DUMP_ON` — which `tc` always sets, and without which
+/// the kernel truncates the table at one message.
+pub fn buildActionDump(
+    gpa: std.mem.Allocator,
+    seq: u32,
+    kind: []const u8,
+) BuildError![]u8 {
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(gpa);
+    const hdr = try codec.appendHeader(
+        gpa,
+        &list,
+        RTM_GETACTION,
+        codec.NLM_F_REQUEST | codec.NLM_F_DUMP,
+        seq,
+        0,
+    );
+    try appendTcamsg(gpa, &list);
+    try action.appendActionRefs(gpa, &list, action.TCA_ACT_TAB, &.{.{ .kind = kind }});
+    try action.appendRootFlags(
+        gpa,
+        &list,
+        action.TCA_ACT_FLAG.LARGE_DUMP_ON,
+        action.TCA_ACT_FLAG.LARGE_DUMP_ON,
+    );
     codec.finishHeader(&list, hdr);
     return list.toOwnedSlice(gpa);
 }
@@ -312,6 +438,70 @@ test "message types agree with the kernel UAPI" {
     try testing.expectEqual(@as(u16, 44), RTM_NEWTFILTER);
     try testing.expectEqual(@as(u16, 45), RTM_DELTFILTER);
     try testing.expectEqual(@as(u16, 46), RTM_GETTFILTER);
+    try testing.expectEqual(@as(u16, 48), RTM_NEWACTION);
+    try testing.expectEqual(@as(u16, 49), RTM_DELACTION);
+    try testing.expectEqual(@as(u16, 50), RTM_GETACTION);
+    // The action family's fixed header is 4 bytes, not tcmsg's 20.
+    try testing.expectEqual(@as(usize, 4), tcamsg_len);
+    try testing.expectEqual(@as(usize, 20), tcmsg_len);
+}
+
+test "standalone action messages carry tcamsg, not tcmsg" {
+    const gpa = testing.allocator;
+    const req = try buildActionSet(gpa, 9, .add, &.{
+        .{ .gact = .{ .action = .shot, .index = 1 } },
+    }, ratespec.golden_psched);
+    defer gpa.free(req);
+
+    var it: codec.MessageIterator = .{ .buf = req };
+    const m = (try it.next()).?;
+    try testing.expectEqual(RTM_NEWACTION, m.type);
+    try testing.expectEqual(Create.add.flags(), m.flags);
+    // Four zero bytes of tcamsg, then straight into TCA_ACT_TAB.
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, m.payload[0..4]);
+    var at: codec.AttrIterator = .{ .buf = m.payload[tcamsg_len..] };
+    const tab = (try at.next()).?;
+    try testing.expectEqual(action.TCA_ACT_TAB, tab.type);
+
+    var ait: action.ActionIterator = .init(tab.data);
+    const a = (ait.next() catch unreachable).?;
+    try testing.expectEqualStrings("gact", a.kind());
+    try testing.expectEqual(@as(u16, 1), a.order);
+    try testing.expectEqual(@as(u32, 1), a.gen.index);
+}
+
+test "the action dump request sets LARGE_DUMP_ON like tc does" {
+    const gpa = testing.allocator;
+    const req = try buildActionDump(gpa, 3, "gact");
+    defer gpa.free(req);
+    var it: codec.MessageIterator = .{ .buf = req };
+    const m = (try it.next()).?;
+    try testing.expectEqual(RTM_GETACTION, m.type);
+    try testing.expectEqual(codec.NLM_F_REQUEST | codec.NLM_F_DUMP, m.flags);
+    var at: codec.AttrIterator = .{ .buf = m.payload[tcamsg_len..] };
+    _ = (try at.next()).?; // TCA_ACT_TAB
+    const flags = (try at.next()).?;
+    try testing.expectEqual(action.TCA_ROOT.FLAGS, flags.type);
+    try testing.expectEqual(@as(usize, 8), flags.data.len);
+    try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, flags.data[0..4], native_endian));
+    try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, flags.data[4..8], native_endian));
+}
+
+test "action get is a bare request; action del asks for an ACK" {
+    const gpa = testing.allocator;
+    const get = try buildActionGet(gpa, 1, &.{.{ .kind = "gact", .index = 1 }});
+    defer gpa.free(get);
+    const del = try buildActionDel(gpa, 1, &.{.{ .kind = "gact", .index = 1 }});
+    defer gpa.free(del);
+
+    var it1: codec.MessageIterator = .{ .buf = get };
+    try testing.expectEqual(codec.NLM_F_REQUEST, (try it1.next()).?.flags);
+    var it2: codec.MessageIterator = .{ .buf = del };
+    const m = (try it2.next()).?;
+    try testing.expectEqual(RTM_DELACTION, m.type);
+    try testing.expectEqual(codec.NLM_F_REQUEST | codec.NLM_F_ACK, m.flags);
+    // Same body either way: kind + index, no options nest.
+    try testing.expectEqualSlices(u8, get[codec.header_len..], del[codec.header_len..]);
 }
 
 test "Create.flags matches tc's add/replace/change semantics" {

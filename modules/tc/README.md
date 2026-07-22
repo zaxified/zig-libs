@@ -1,7 +1,7 @@
 # tc
 
-Linux traffic control over rtnetlink — **qdiscs, classes and filters**, in pure Zig with
-no `tc` binary shell-out and no libc.
+Linux traffic control over rtnetlink — **qdiscs, classes, filters and actions**, in pure
+Zig with no `tc` binary shell-out and no libc.
 
 - **qdiscs** (`RTM_NEWQDISC`/`DELQDISC`/`GETQDISC`) — `netem` (delay/jitter, loss,
   duplication, reordering, corruption, rate), `htb`, `tbf`, `fq_codel`, plus a `raw`
@@ -12,6 +12,12 @@ no `tc` binary shell-out and no libc.
 - **filters** (`RTM_NEWTFILTER`/`DELTFILTER`/`GETTFILTER`) — `u32` (masked 32-bit matches
   at fixed offsets) and `flower` (structured L2–L4 keys: ethertype, ip_proto, IPv4/IPv6
   prefixes, TCP/UDP/SCTP ports, classid).
+- **actions** (`TCA_U32_ACT`/`TCA_FLOWER_ACT`, and the standalone
+  `RTM_NEWACTION`/`DELACTION`/`GETACTION` table) — `gact` (pass/drop/continue/reclassify/
+  trap, incl. the probabilistic `tc_gact_p`), `mirred` (egress/ingress × redirect/mirror),
+  `police` (rate/burst/mtu/peakrate on the same psched rate tables, incl. `RATE64`),
+  `skbedit` (priority/mark/queue_mapping/ptype), `vlan` (push/pop/modify), plus a `raw`
+  escape hatch. Multi-action lists chain through the `TC_ACT_PIPE` verdict.
 - **handles** — a typed `Handle` for `major:minor` with `TC_H_ROOT`/`TC_H_INGRESS`/
   `TC_H_UNSPEC`, hexadecimal `parse`/`format` (`"1:10"` is minor **16**, exactly as `tc`
   reads and prints it).
@@ -25,7 +31,7 @@ its own parsers (a `DRY candidate:` note marks the spot).
 
 Consumers: fleet-simulation network impairment (per-link delay/loss/reorder), bandwidth
 partitioning for test rigs and multi-tenant hosts, and anywhere you would otherwise shell
-out to `tc qdisc|class|filter …`.
+out to `tc qdisc|class|filter|actions …`.
 
 ## Import
 
@@ -50,6 +56,23 @@ try sock.classAdd(.{ .ifindex = ifi, .handle = leaf, .parent = one },
 try sock.filterAdd(.{ .ifindex = ifi, .parent = one, .prio = 1, .eth_type = tc.ETH_P.IP },
                    .{ .u32 = .{ .classid = leaf,
                                 .keys = &.{ .ipv4Dst(.{ 10, 0, 0, 1 }, 32) } } });
+
+// Or run an action list on a match: mark the packet, then police it. The list is
+// walked in order for as long as each action returns TC_ACT_PIPE.
+try sock.filterAdd(.{ .ifindex = ifi, .parent = one, .prio = 2, .eth_type = tc.ETH_P.IP },
+                   .{ .u32 = .{ .keys = &.{ .ipv4Src(.{ 10, 0, 0, 2 }, 32) },
+                                .actions = &.{
+                                    .{ .skbedit = .{ .mark = 7 } },      // verdict: pipe
+                                    .{ .police = .{ .rate = 125_000,     // bytes/s
+                                                    .burst = 10 * 1024,  // bytes
+                                                    .exceed = .shot } },
+                                } } });
+
+// Read the actions back off a dumped filter.
+const fs = try sock.filters(ifi, one);
+defer gpa.free(fs);
+for (fs) |f| for (f.actions()) |a|
+    std.debug.print("{d}: {s} verdict={d}\n", .{ a.order, a.kind(), a.gen.action.raw() });
 
 // Read back (no privilege needed).
 const cs = try sock.classes(ifi, one);
@@ -88,6 +111,10 @@ try sock.del(ifi);
 | `.filterAdd/.filterReplace/.filterChange(FilterTarget, FilterSpec)` | `tc filter add` / `replace` / `change` |
 | `.filterDel(FilterTarget, ?kind)` | `tc filter del`; `kind` is normally `null` |
 | `.filters(ifindex, ?Handle) ![]Filter` | `RTM_GETTFILTER` dump, optionally scoped |
+| `.actionAdd/.actionReplace/.actionChange([]const ActionSpec)` | `tc actions add` / `replace` / `change` — the shared action table |
+| `.actionDel([]const ActionRef)` | `tc actions del action KIND index N` |
+| `.actions(kind) ![]Action` | `tc actions ls action KIND` — an `RTM_GETACTION` dump |
+| `.actionGet(ActionRef) !?Action` | `tc actions get action KIND index N` (single reply, not a dump) |
 | `.lastErrorMessage()` | the kernel's extended-ACK reason for the last failed write |
 | `.add/.change/.del/.show(ifindex, …)` | the v1 netem shortcuts (root qdisc, handle `1:0`) |
 
@@ -103,7 +130,20 @@ class's direct children, and `filters(ifi, parent)` matches the attach point exa
   `minor()`, `qdisc()`, `isClass()`, `parse("1:10")`, `{f}` formatting. **Hexadecimal**,
   like `tc`.
 - `QdiscSpec` = `.netem` | `.htb` | `.tbf` | `.fq_codel` | `.raw`;
-  `ClassSpec` = `.htb` | `.raw`; `FilterSpec` = `.u32` | `.flower` | `.raw`.
+  `ClassSpec` = `.htb` | `.raw`; `FilterSpec` = `.u32` | `.flower` | `.raw`;
+  `ActionSpec` = `.gact` | `.mirred` | `.police` | `.skbedit` | `.vlan` | `.raw`.
+- `Verdict` — the `TC_ACT_*` return codes (`.ok`, `.shot`, `.pipe`, `.stolen`,
+  `.reclassify`, `.trap`, `.unspec` = `tc`'s `continue`). `.pipe` is the one that
+  **chains** into the next action of the list; everything else ends it. Non-exhaustive,
+  so a verdict this module predates (or a `TC_ACT_GOTO_CHAIN` composite) still decodes —
+  use `.raw()` rather than `@tagName` on a decoded one.
+- `Gen` — the shared `tc_gen` prologue (`index`, `capab`, `action`, `refcnt`, `bindcnt`)
+  every action kind's options struct starts with, and which `Action.gen` always exposes
+  (police's differently-shaped `tc_police` is reassembled into it).
+- `Action` — one decoded action: `order` (its 1-based place in the list), `kind()`,
+  `gen`, `cookie()`, an optional per-kind wire struct (`a.gact`/`a.mirred`/`a.police`/
+  `a.skbedit`/`a.vlan`), plus `stats` and `tm` when the kernel sent them.
+  `Filter.actions()` returns the list attached to a dumped filter.
 - `Netem`, `Htb`, `HtbClass`, `Tbf`, `FqCodel`, `U32` + `U32Key`, `Flower` + `Prefix4`/
   `Prefix6` — the ergonomic input structs; every field is doc-commented in
   `src/qdisc.zig` / `src/filter.zig`. Rates are **bytes per second** (`1mbit` = 125000).
@@ -128,8 +168,15 @@ unshare -rn zig build test-tc     # + the live netns round-trip (qdisc→class�
 
 Every write op needs `CAP_NET_ADMIN`; the `RTM_GET*` dumps do not. The encoders are
 checked against **byte-exact requests captured from a real `iproute2` `tc`** under
-`strace` (19 goldens, each with the exact command in a comment) — see SPEC.md for the
+`strace` (43 goldens, each with the exact command in a comment) — see SPEC.md for the
 full verification story and the deferred list.
+
+One asymmetry worth knowing: qdiscs, classes and filters are namespaced, so
+`unshare -rn` is enough to exercise them; the **shared action table** is guarded by
+`CAP_NET_ADMIN` in the *initial* user namespace (the kernel uses `netlink_capable`, not
+`netlink_net_capable`, in `act_api.c`), so `tc actions add/del` needs real root. The
+`RTM_GETACTION` dump needs no privilege at all, and the live test for the write half
+prints `SKIPPED: …` and passes without it.
 
 Provenance: kernel UAPI headers (`linux/rtnetlink.h`, `linux/pkt_sched.h`,
 `linux/pkt_cls.h`) plus iproute2 consulted as a *behaviour* reference for the rate-table

@@ -27,6 +27,13 @@ const Handle = handle_mod.Handle;
 const qdisc = @import("qdisc.zig");
 const TCA = qdisc.TCA;
 
+const ratespec = @import("ratespec.zig");
+const Psched = ratespec.Psched;
+
+const action = @import("action.zig");
+const ActionSpec = action.ActionSpec;
+const ActionList = action.ActionList;
+
 // ── ethertypes / IP protocols (the handful filters need) ────────────────────
 
 /// `ETH_P_*` (linux/if_ether.h), host byte order.
@@ -179,6 +186,9 @@ pub const U32 = struct {
     offoff: i16 = 0,
     hoff: i16 = 0,
     hmask: u32 = 0,
+    /// `action …` — the action list run on a match, emitted as the nested
+    /// `TCA_U32_ACT`. Empty means "select a class and stop", the v2 behaviour.
+    actions: []const ActionSpec = &.{},
 };
 
 /// Wire readback of a u32 filter's options.
@@ -196,11 +206,14 @@ fn appendU32Options(
     u: U32,
     gpa: std.mem.Allocator,
     list: *std.ArrayList(u8),
+    ps: Psched,
 ) EncodeError!void {
     if (u.keys.len > u32_max_keys) return error.TooManyKeys;
     // Emission order mirrors iproute2's f_u32.c: everything parsed from the
-    // command line first (here just the classid), then the selector.
+    // command line first (the classid, then the action list), then the
+    // selector — which is why `flowid X:Y action …` puts CLASSID before ACT.
     if (u.classid) |c| try codec.appendAttrU32(gpa, list, TCA_U32.CLASSID, c.raw);
+    try action.appendActionList(gpa, list, TCA_U32.ACT, u.actions, ps);
 
     const sel_len = tc_u32_sel_len + u.keys.len * tc_u32_key_len;
     var hdr: [codec.attr_header_len]u8 = undefined;
@@ -311,6 +324,9 @@ pub const Flower = struct {
     /// `TCA_FLOWER_FLAGS` (skip_hw / skip_sw); `tc` always emits it, so this
     /// module does too.
     flags: u32 = 0,
+    /// `action …` — the action list run on a match, emitted as the nested
+    /// `TCA_FLOWER_ACT` (after `classid`, before `FLAGS`/`KEY_ETH_TYPE`).
+    actions: []const ActionSpec = &.{},
 };
 
 /// Wire readback of a flower filter's options (the parts this module models).
@@ -382,6 +398,7 @@ fn appendFlowerOptions(
     f: Flower,
     gpa: std.mem.Allocator,
     list: *std.ArrayList(u8),
+    ps: Psched,
 ) EncodeError!void {
     if ((f.src_port != null or f.dst_port != null)) {
         const proto = f.ip_proto orelse return error.PortWithoutProto;
@@ -424,6 +441,7 @@ fn appendFlowerOptions(
     if (f.src_port) |p| try appendBe16(gpa, list, portAttrs(f.ip_proto.?).?.src, p);
     if (f.dst_port) |p| try appendBe16(gpa, list, portAttrs(f.ip_proto.?).?.dst, p);
     if (f.classid) |c| try codec.appendAttrU32(gpa, list, TCA_FLOWER.CLASSID, c.raw);
+    try action.appendActionList(gpa, list, TCA_FLOWER.ACT, f.actions, ps);
     try codec.appendAttrU32(gpa, list, TCA_FLOWER.FLAGS, f.flags);
     try appendBe16(gpa, list, TCA_FLOWER.KEY_ETH_TYPE, f.eth_type);
 }
@@ -475,7 +493,7 @@ pub fn parseFlowerOptions(data: []const u8) codec.Error!FlowerWire {
 
 // ── the filter spec ─────────────────────────────────────────────────────────
 
-pub const EncodeError = std.mem.Allocator.Error || error{
+pub const EncodeError = std.mem.Allocator.Error || action.EncodeError || error{
     /// More `U32Key`s than `sel.nkeys` (a u8) can carry.
     TooManyKeys,
     /// A flower port match without a `ip_proto` that has ports.
@@ -498,14 +516,31 @@ pub const FilterSpec = union(enum) {
         };
     }
 
+    /// Append the kind-specific `TCA_OPTIONS` body.
+    ///
+    /// Kept for source compatibility with v2, when no filter option needed a
+    /// psched calibration: it pins `Psched.fallback`. The only thing that
+    /// reads the calibration is a `police` **action**, whose burst would then
+    /// be timed at 1 tick/µs — so anything carrying actions should go through
+    /// `appendOptionsWith` (or simply through `Socket`, which passes its own).
     pub fn appendOptions(
         self: FilterSpec,
         gpa: std.mem.Allocator,
         list: *std.ArrayList(u8),
     ) EncodeError!void {
+        return self.appendOptionsWith(gpa, list, Psched.fallback);
+    }
+
+    /// `appendOptions` with an explicit psched calibration.
+    pub fn appendOptionsWith(
+        self: FilterSpec,
+        gpa: std.mem.Allocator,
+        list: *std.ArrayList(u8),
+        ps: Psched,
+    ) EncodeError!void {
         switch (self) {
-            .u32 => |u| try appendU32Options(u, gpa, list),
-            .flower => |f| try appendFlowerOptions(f, gpa, list),
+            .u32 => |u| try appendU32Options(u, gpa, list, ps),
+            .flower => |f| try appendFlowerOptions(f, gpa, list, ps),
             .raw => |r| {
                 if (r.options.len > std.math.maxInt(u16)) return error.OptionsTooLong;
                 try list.appendSlice(gpa, r.options);
@@ -545,9 +580,18 @@ pub const Filter = struct {
     u32_sel: ?U32Wire = null,
     /// Decoded flower keys, when `kind() == "flower"`.
     flower: ?FlowerWire = null,
+    /// The decoded action list, capped at `action.max_actions_decoded`
+    /// entries (`act_list.total` reports the true count). Reach it through
+    /// `actions()`.
+    act_list: ActionList = .{},
 
     pub fn kind(f: *const Filter) []const u8 {
         return f.kind_buf[0..f.kind_len];
+    }
+
+    /// The actions attached to this filter, in list order.
+    pub fn actions(f: *const Filter) []const action.Action {
+        return f.act_list.slice();
     }
 
     /// The class this filter selects, whatever classifier it uses.
@@ -589,13 +633,34 @@ pub fn parseFilter(payload: []const u8) codec.Error!Filter {
         } else if (std.mem.eql(u8, k, "flower")) {
             f.flower = try parseFlowerOptions(opt);
         }
+        if (actionAttrId(k)) |act_id| {
+            var ait: codec.AttrIterator = .{ .buf = opt };
+            while (try ait.next()) |a| {
+                if (a.type != act_id) continue;
+                f.act_list = try action.parseActionList(a.data);
+                break;
+            }
+        }
     }
     return f;
+}
+
+/// Which attribute inside a classifier's `TCA_OPTIONS` carries its action
+/// list. Both are `TCA_ACT_*`-shaped; only the id differs per classifier.
+fn actionAttrId(kind: []const u8) ?u16 {
+    if (std.mem.eql(u8, kind, "u32")) return TCA_U32.ACT;
+    if (std.mem.eql(u8, kind, "flower")) return TCA_FLOWER.ACT;
+    // matchall/basic/bpf/fw all place their action list at attribute 1..3 of
+    // their own enum; not modelled, so no guessing here.
+    return null;
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+/// The capture host's calibration; only `police` actions read it.
+const test_ps = ratespec.golden_psched;
 
 test "filter attribute constants agree with the kernel UAPI" {
     try testing.expectEqual(@as(u16, 1), TCA_U32.CLASSID);
@@ -659,7 +724,7 @@ test "encode/decode round-trip: u32 selector with two keys" {
         U32Key.ipv4Src(.{ 192, 168, 1, 0 }, 24),
         U32Key.ipv4Dst(.{ 10, 0, 0, 1 }, 32),
     };
-    try appendU32Options(.{ .classid = Handle.init(1, 0x10), .keys = &keys }, gpa, &list);
+    try appendU32Options(.{ .classid = Handle.init(1, 0x10), .keys = &keys }, gpa, &list, test_ps);
     const uw = try parseU32Options(list.items);
     try testing.expectEqual(Handle.init(1, 0x10).raw, uw.classid.?.raw);
     try testing.expectEqual(@as(u8, TC_U32.TERMINAL), uw.flags);
@@ -681,7 +746,7 @@ test "encode/decode round-trip: flower over IPv6" {
         .ipv6_src = .{ .addr = v6, .prefix_len = 32 },
         .dst_port = 53,
         .classid = Handle.init(1, 0x30),
-    }, gpa, &list);
+    }, gpa, &list, test_ps);
     const fw = try parseFlowerOptions(list.items);
     try testing.expectEqual(ETH_P.IPV6, fw.eth_type.?);
     try testing.expectEqual(IPPROTO.UDP, fw.ip_proto.?);
@@ -699,11 +764,13 @@ test "flower rejects a port match the protocol cannot carry" {
         .{ .eth_type = ETH_P.IP, .dst_port = 80 },
         gpa,
         &list,
+        test_ps,
     ));
     try testing.expectError(error.PortWithoutProto, appendFlowerOptions(
         .{ .eth_type = ETH_P.IP, .ip_proto = IPPROTO.ICMP, .src_port = 1 },
         gpa,
         &list,
+        test_ps,
     ));
     try testing.expectEqual(@as(usize, 0), list.items.len);
 }
@@ -715,7 +782,7 @@ test "u32 rejects an oversized key list" {
     const many = try gpa.alloc(U32Key, u32_max_keys + 1);
     defer gpa.free(many);
     @memset(many, U32Key.word(0, 0, 0));
-    try testing.expectError(error.TooManyKeys, appendU32Options(.{ .keys = many }, gpa, &list));
+    try testing.expectError(error.TooManyKeys, appendU32Options(.{ .keys = many }, gpa, &list, test_ps));
 }
 
 test "fuzz: filter parsers never crash on arbitrary payloads" {
@@ -731,4 +798,22 @@ fn fuzzParseFilter(_: void, smith: *std.testing.Smith) !void {
     if (parseFlowerOptions(buf)) |_| {} else |_| {}
     if (parseFilter(buf)) |_| {} else |_| {}
     _ = parseInfo(smith.value(u32));
+}
+
+test "the v2 entry points keep working unchanged (source compatibility)" {
+    const gpa = testing.allocator;
+    var a: std.ArrayList(u8) = .empty;
+    defer a.deinit(gpa);
+    var b: std.ArrayList(u8) = .empty;
+    defer b.deinit(gpa);
+    const spec: FilterSpec = .{ .u32 = .{
+        .classid = Handle.init(1, 0x10),
+        .keys = &.{U32Key.ipv4Dst(.{ 10, 0, 0, 1 }, 32)},
+    } };
+    // The three-argument form (no psched) still exists and, for any spec
+    // without a `police` action, produces exactly what the psched-aware one
+    // does — the calibration is only ever read by police.
+    try spec.appendOptions(gpa, &a);
+    try spec.appendOptionsWith(gpa, &b, test_ps);
+    try testing.expectEqualSlices(u8, a.items, b.items);
 }

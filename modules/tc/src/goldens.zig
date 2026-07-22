@@ -36,6 +36,10 @@ const filter = @import("filter.zig");
 const U32Key = filter.U32Key;
 const ETH_P = filter.ETH_P;
 const IPPROTO = filter.IPPROTO;
+const action = @import("action.zig");
+const ActionSpec = action.ActionSpec;
+const GactWire = action.GactWire;
+const PACKET = action.PACKET;
 const message = @import("message.zig");
 
 const testing = std.testing;
@@ -370,6 +374,330 @@ const g_netem_qdisc_add =
     "3400020000000000e8030000295c8f020000000000000000000000000c000a0000e1f505000000000c000b0080969800" ++
     "00000000";
 const seq_netem_qdisc_add: u32 = 1784724314;
+
+// ── captured action requests ────────────────────────────────────────────────
+//
+// Same host, same netns, same `tc`, captured with `strace`'s raw buffer dump
+// so no re-encoding step sits between the syscall and the constant:
+//
+// ```sh
+// unshare -rn strace -f -e trace=sendmsg -e write=all -xx -s 8192 \
+//     -e abbrev=none ./commands.sh
+// ```
+//
+// `-e write=all` prints the exact bytes handed to `sendmsg`, which are then
+// checked against the message's own `nlmsg_len` before being pasted here.
+// The filter commands all name a `parent 1:` that does not exist, so the
+// kernel rejected every one of them — irrelevant, because the request bytes
+// are what a golden pins.
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1784727264 len=140
+// tc filter add dev lo parent 1: protocol ip prio 1 u32 match ip src 10.0.0.1/32 flowid 1:10 action drop
+const g_u32_gact_drop =
+    "8c0000002c000506e0c6606a000000000000000001000000000000000000010008000100080001007533320060000200" ++
+    "0800010010000100300007002c0001000900010067616374000000001c00028018000200000000000000000002000000" ++
+    "00000000000000002400050001000100000000000000000000000000ffffffff0a0000010c00000000000000";
+const seq_u32_gact_drop: u32 = 1784727264;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1784727264 len=140
+// tc filter add dev lo parent 1: protocol ip prio 2 u32 match ip src 10.0.0.2/32 flowid 1:10 action pass index 7
+const g_u32_gact_pass_index =
+    "8c0000002c000506e0c6606a000000000000000001000000000000000000010008000200080001007533320060000200" ++
+    "0800010010000100300007002c0001000900010067616374000000001c00028018000200070000000000000000000000" ++
+    "00000000000000002400050001000100000000000000000000000000ffffffff0a0000020c00000000000000";
+const seq_u32_gact_pass_index: u32 = 1784727264;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1784727487 len=140
+// tc filter add dev lo parent 1: protocol ip prio 34 u32 match ip src 10.0.1.4/32 flowid 1:10 action continue
+const g_u32_gact_continue =
+    "8c0000002c000506bfc7606a000000000000000001000000000000000000010008002200080001007533320060000200" ++
+    "0800010010000100300007002c0001000900010067616374000000001c000280180002000000000000000000ffffffff" ++
+    "00000000000000002400050001000100000000000000000000000000ffffffff0a0001040c00000000000000";
+const seq_u32_gact_continue: u32 = 1784727487;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1784727264 len=152
+// tc filter add dev lo parent 1: protocol ip prio 13 u32 match ip src 10.0.0.13/32 flowid 1:10 action gact drop random determ pass 2
+const g_u32_gact_prob =
+    "980000002c000506e0c6606a000000000000000001000000000000000000010008000d0008000100753332006c000200" ++
+    "08000100100001003c000700380001000900010067616374000000002800028018000200000000000000000002000000" ++
+    "00000000000000000c00030002000200000000002400050001000100000000000000000000000000ffffffff0a00000d" ++
+    "0c00000000000000";
+const seq_u32_gact_prob: u32 = 1784727264;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1784727264 len=148
+// tc filter add dev lo parent 1: protocol ip prio 14 u32 match ip src 10.0.0.14/32 flowid 1:10 action drop cookie a1b2c3d4
+const g_u32_gact_cookie =
+    "940000002c000506e0c6606a000000000000000001000000000000000000010008000e00080001007533320068000200" ++
+    "080001001000010038000700340001000900010067616374000000001c00028018000200000000000000000002000000" ++
+    "000000000000000008000600a1b2c3d42400050001000100000000000000000000000000ffffffff0a00000e0c000000" ++
+    "00000000";
+const seq_u32_gact_cookie: u32 = 1784727264;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1784727264 len=148
+// tc filter add dev lo parent 1: protocol ip prio 3 u32 match ip src 10.0.0.3/32 flowid 1:10 action mirred egress redirect dev lo
+const g_u32_mirred_egress_redirect =
+    "940000002c000506e0c6606a000000000000000001000000000000000000010008000300080001007533320068000200" ++
+    "080001001000010038000700340001000b0001006d697272656400002400028020000200000000000000000004000000" ++
+    "000000000000000001000000010000002400050001000100000000000000000000000000ffffffff0a0000030c000000" ++
+    "00000000";
+const seq_u32_mirred_egress_redirect: u32 = 1784727264;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1784727264 len=148
+// tc filter add dev lo parent 1: protocol ip prio 4 u32 match ip src 10.0.0.4/32 flowid 1:10 action mirred ingress mirror dev lo
+const g_u32_mirred_ingress_mirror =
+    "940000002c000506e0c6606a000000000000000001000000000000000000010008000400080001007533320068000200" ++
+    "080001001000010038000700340001000b0001006d697272656400002400028020000200000000000000000003000000" ++
+    "000000000000000004000000010000002400050001000100000000000000000000000000ffffffff0a0000040c000000" ++
+    "00000000";
+const seq_u32_mirred_ingress_mirror: u32 = 1784727264;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1784727264 len=1204
+// tc filter add dev lo parent 1: protocol ip prio 5 u32 match ip src 10.0.0.5/32 flowid 1:10 action police rate 1mbit burst 10k conform-exceed drop
+const g_u32_police =
+    "b40400002c000506e0c6606a000000000000000001000000000000000000010008000500080001007533320088040200" ++
+    "080001001000010058040700540401000b000100706f6c6963650000440402803c000100000000000200000000000000" ++
+    "008813000000000003010000ffff000048e8010000000000000000000000000000000000000000000000000004040200" ++
+    "e8030000d0070000b80b0000a00f00008813000070170000581b0000401f00002823000010270000f82a0000e02e0000" ++
+    "c8320000b0360000983a0000803e00006842000050460000384a0000204e000008520000f0550000d8590000c05d0000" ++
+    "a86100009065000078690000606d0000487100003075000018790000007d0000e8800000d0840000b8880000a08c0000" ++
+    "889000007094000058980000409c000028a0000010a40000f8a70000e0ab0000c8af0000b0b3000098b7000080bb0000" ++
+    "68bf000050c3000038c7000020cb000008cf0000f0d20000d8d60000c0da0000a8de000090e2000078e6000060ea0000" ++
+    "48ee000030f2000018f6000000fa0000e8fd0000d0010100b8050100a0090100880d0100701101005815010040190100" ++
+    "281d010010210100f8240100e0280100c82c0100b03001009834010080380100683c0100504001003844010020480100" ++
+    "084c0100f04f0100d8530100c0570100a85b0100905f01007863010060670100486b0100306f01001873010000770100" ++
+    "e87a0100d07e0100b8820100a0860100888a0100708e01005892010040960100289a0100109e0100f8a10100e0a50100" ++
+    "c8a90100b0ad010098b1010080b5010068b9010050bd010038c1010020c5010008c90100f0cc0100d8d00100c0d40100" ++
+    "a8d8010090dc010078e0010060e4010048e8010030ec010018f0010000f40100e8f70100d0fb0100b8ff0100a0030200" ++
+    "88070200700b0200580f02004013020028170200101b0200f81e0200e0220200c8260200b02a0200982e020080320200" ++
+    "68360200503a0200383e02002042020008460200f0490200d84d0200c0510200a855020090590200785d020060610200" ++
+    "4865020030690200186d020000710200e8740200d0780200b87c0200a08002008884020070880200588c020040900200" ++
+    "2894020010980200f89b0200e09f0200c8a30200b0a7020098ab020080af020068b3020050b7020038bb020020bf0200" ++
+    "08c30200f0c60200d8ca0200c0ce0200a8d2020090d6020078da020060de020048e2020030e6020018ea020000ee0200" ++
+    "e8f10200d0f50200b8f90200a0fd0200880103007005030058090300400d03002811030010150300f8180300e01c0300" ++
+    "c8200300b024030098280300802c0300683003005034030038380300203c030008400300f0430300d8470300c04b0300" ++
+    "a84f03009053030078570300605b0300485f03003063030018670300006b0300e86e0300d0720300b8760300a07a0300" ++
+    "887e03007082030058860300408a0300288e030010920300f8950300e0990300c89d0300b0a1030098a5030080a90300" ++
+    "68ad030050b1030038b5030020b9030008bd0300f0c00300d8c40300c0c80300a8cc030090d0030078d4030060d80300" ++
+    "48dc030030e0030018e4030000e803002400050001000100000000000000000000000000ffffffff0a0000050c000000" ++
+    "00000000";
+const seq_u32_police: u32 = 1784727264;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1784727264 len=2240
+// tc filter add dev lo parent 1: protocol ip prio 6 u32 match ip src 10.0.0.6/32 flowid 1:10 action police rate 1mbit burst 10k mtu 1500 peakrate 2mbit conform-exceed pipe/drop
+const g_u32_police_peak =
+    "c00800002c000506e0c6606a000000000000000001000000000000000000010008000600080001007533320094080200" ++
+    "080001001000010064080700600801000b000100706f6c6963650000500802803c000100000000000300000000000000" ++
+    "00881300dc05000003010000ffff000048e8010003010000ffff000090d0030000000000000000000000000004040200" ++
+    "e8030000d0070000b80b0000a00f00008813000070170000581b0000401f00002823000010270000f82a0000e02e0000" ++
+    "c8320000b0360000983a0000803e00006842000050460000384a0000204e000008520000f0550000d8590000c05d0000" ++
+    "a86100009065000078690000606d0000487100003075000018790000007d0000e8800000d0840000b8880000a08c0000" ++
+    "889000007094000058980000409c000028a0000010a40000f8a70000e0ab0000c8af0000b0b3000098b7000080bb0000" ++
+    "68bf000050c3000038c7000020cb000008cf0000f0d20000d8d60000c0da0000a8de000090e2000078e6000060ea0000" ++
+    "48ee000030f2000018f6000000fa0000e8fd0000d0010100b8050100a0090100880d0100701101005815010040190100" ++
+    "281d010010210100f8240100e0280100c82c0100b03001009834010080380100683c0100504001003844010020480100" ++
+    "084c0100f04f0100d8530100c0570100a85b0100905f01007863010060670100486b0100306f01001873010000770100" ++
+    "e87a0100d07e0100b8820100a0860100888a0100708e01005892010040960100289a0100109e0100f8a10100e0a50100" ++
+    "c8a90100b0ad010098b1010080b5010068b9010050bd010038c1010020c5010008c90100f0cc0100d8d00100c0d40100" ++
+    "a8d8010090dc010078e0010060e4010048e8010030ec010018f0010000f40100e8f70100d0fb0100b8ff0100a0030200" ++
+    "88070200700b0200580f02004013020028170200101b0200f81e0200e0220200c8260200b02a0200982e020080320200" ++
+    "68360200503a0200383e02002042020008460200f0490200d84d0200c0510200a855020090590200785d020060610200" ++
+    "4865020030690200186d020000710200e8740200d0780200b87c0200a08002008884020070880200588c020040900200" ++
+    "2894020010980200f89b0200e09f0200c8a30200b0a7020098ab020080af020068b3020050b7020038bb020020bf0200" ++
+    "08c30200f0c60200d8ca0200c0ce0200a8d2020090d6020078da020060de020048e2020030e6020018ea020000ee0200" ++
+    "e8f10200d0f50200b8f90200a0fd0200880103007005030058090300400d03002811030010150300f8180300e01c0300" ++
+    "c8200300b024030098280300802c0300683003005034030038380300203c030008400300f0430300d8470300c04b0300" ++
+    "a84f03009053030078570300605b0300485f03003063030018670300006b0300e86e0300d0720300b8760300a07a0300" ++
+    "887e03007082030058860300408a0300288e030010920300f8950300e0990300c89d0300b0a1030098a5030080a90300" ++
+    "68ad030050b1030038b5030020b9030008bd0300f0c00300d8c40300c0c80300a8cc030090d0030078d4030060d80300" ++
+    "48dc030030e0030018e4030000e8030004040300f4010000e8030000dc050000d0070000c4090000b80b0000ac0d0000" ++
+    "a00f000094110000881300007c1500007017000064190000581b00004c1d0000401f000034210000282300001c250000" ++
+    "1027000004290000f82a0000ec2c0000e02e0000d4300000c8320000bc340000b0360000a4380000983a00008c3c0000" ++
+    "803e000074400000684200005c4400005046000044480000384a00002c4c0000204e00001450000008520000fc530000" ++
+    "f0550000e4570000d8590000cc5b0000c05d0000b45f0000a86100009c6300009065000084670000786900006c6b0000" ++
+    "606d0000546f0000487100003c7300003075000024770000187900000c7b0000007d0000f47e0000e8800000dc820000" ++
+    "d0840000c4860000b8880000ac8a0000a08c0000948e0000889000007c9200007094000064960000589800004c9a0000" ++
+    "409c0000349e000028a000001ca2000010a4000004a60000f8a70000eca90000e0ab0000d4ad0000c8af0000bcb10000" ++
+    "b0b30000a4b5000098b700008cb9000080bb000074bd000068bf00005cc1000050c3000044c5000038c700002cc90000" ++
+    "20cb000014cd000008cf0000fcd00000f0d20000e4d40000d8d60000ccd80000c0da0000b4dc0000a8de00009ce00000" ++
+    "90e2000084e4000078e600006ce8000060ea000054ec000048ee00003cf0000030f2000024f4000018f600000cf80000" ++
+    "00fa0000f4fb0000e8fd0000dcff0000d0010100c4030100b8050100ac070100a0090100940b0100880d01007c0f0100" ++
+    "7011010064130100581501004c17010040190100341b0100281d01001c1f01001021010004230100f8240100ec260100" ++
+    "e0280100d42a0100c82c0100bc2e0100b0300100a4320100983401008c36010080380100743a0100683c01005c3e0100" ++
+    "5040010044420100384401002c46010020480100144a0100084c0100fc4d0100f04f0100e4510100d8530100cc550100" ++
+    "c0570100b4590100a85b01009c5d0100905f010084610100786301006c6501006067010054690100486b01003c6d0100" ++
+    "306f010024710100187301000c75010000770100f4780100e87a0100dc7c0100d07e0100c4800100b8820100ac840100" ++
+    "a086010094880100888a01007c8c0100708e010064900100589201004c9401004096010034980100289a01001c9c0100" ++
+    "109e010004a00100f8a10100eca30100e0a50100d4a70100c8a90100bcab0100b0ad0100a4af010098b101008cb30100" ++
+    "80b5010074b7010068b901005cbb010050bd010044bf010038c101002cc3010020c5010014c7010008c90100fcca0100" ++
+    "f0cc0100e4ce0100d8d00100ccd20100c0d40100b4d60100a8d801009cda010090dc010084de010078e001006ce20100" ++
+    "60e4010054e6010048e801003cea010030ec010024ee010018f001000cf2010000f40100080005000200000024000500" ++
+    "01000100000000000000000000000000ffffffff0a0000060c00000000000000";
+const seq_u32_police_peak: u32 = 1784727264;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1784727487 len=2264
+// tc filter add dev lo parent 1: protocol ip prio 30 u32 match ip src 10.0.1.1/32 flowid 1:10 action police rate 40gbit burst 10k mtu 1500 peakrate 80gbit conform-exceed pipe/drop
+const g_u32_police_rate64 =
+    "d80800002c000506bfc7606a000000000000000001000000000000000000010008001e000800010075333200ac080200" ++
+    "08000100100001007c080700780801000b000100706f6c6963650000680802803c000100000000000300000000000000" ++
+    "20000000dc05000003010000ffff0000ffffffff03010000ffff0000ffffffff00000000000000000000000004040200" ++
+    "010000000100000001000000010000000100000001000000010000000100000001000000010000000100000001000000" ++
+    "010000000100000001000000010000000100000001000000010000000100000001000000010000000100000001000000" ++
+    "010000000100000001000000010000000100000001000000010000000100000001000000010000000100000001000000" ++
+    "010000000100000001000000010000000200000002000000020000000200000002000000020000000200000002000000" ++
+    "020000000200000002000000020000000200000002000000020000000200000002000000020000000200000002000000" ++
+    "020000000200000002000000020000000200000002000000020000000200000002000000020000000200000002000000" ++
+    "020000000200000002000000020000000200000002000000020000000200000003000000030000000300000003000000" ++
+    "030000000300000003000000030000000300000003000000030000000300000003000000030000000300000003000000" ++
+    "030000000300000003000000030000000300000003000000030000000300000003000000030000000300000003000000" ++
+    "030000000300000003000000030000000300000003000000030000000300000003000000030000000300000003000000" ++
+    "040000000400000004000000040000000400000004000000040000000400000004000000040000000400000004000000" ++
+    "040000000400000004000000040000000400000004000000040000000400000004000000040000000400000004000000" ++
+    "040000000400000004000000040000000400000004000000040000000400000004000000040000000400000004000000" ++
+    "040000000400000004000000040000000500000005000000050000000500000005000000050000000500000005000000" ++
+    "050000000500000005000000050000000500000005000000050000000500000005000000050000000500000005000000" ++
+    "050000000500000005000000050000000500000005000000050000000500000005000000050000000500000005000000" ++
+    "050000000500000005000000050000000500000005000000050000000500000006000000060000000600000006000000" ++
+    "060000000600000006000000060000000600000006000000060000000600000006000000060000000600000006000000" ++
+    "060000000600000006000000060000000600000006000000060000000600000006000000060000000600000006000000" ++
+    "060000000600000006000000060000000600000006000000060000000600000006000000060000000600000006000000" ++
+    "070000000700000007000000070000000700000007000000070000000700000007000000070000000700000007000000" ++
+    "070000000700000007000000070000000c00080000f2052a010000000404030001000000010000000100000001000000" ++
+    "010000000100000001000000010000000100000001000000010000000100000001000000010000000100000001000000" ++
+    "010000000100000001000000010000000100000001000000010000000100000001000000010000000100000001000000" ++
+    "010000000100000001000000010000000100000001000000010000000100000001000000010000000100000001000000" ++
+    "010000000100000001000000010000000100000001000000010000000100000001000000010000000100000001000000" ++
+    "010000000100000001000000010000000100000001000000010000000100000001000000010000000100000001000000" ++
+    "010000000100000001000000010000000100000001000000010000000100000001000000010000000100000001000000" ++
+    "010000000100000001000000010000000200000002000000020000000200000002000000020000000200000002000000" ++
+    "020000000200000002000000020000000200000002000000020000000200000002000000020000000200000002000000" ++
+    "020000000200000002000000020000000200000002000000020000000200000002000000020000000200000002000000" ++
+    "020000000200000002000000020000000200000002000000020000000200000002000000020000000200000002000000" ++
+    "020000000200000002000000020000000200000002000000020000000200000002000000020000000200000002000000" ++
+    "020000000200000002000000020000000200000002000000020000000200000002000000020000000200000002000000" ++
+    "020000000200000002000000020000000200000002000000020000000200000002000000020000000200000002000000" ++
+    "030000000300000003000000030000000300000003000000030000000300000003000000030000000300000003000000" ++
+    "030000000300000003000000030000000300000003000000030000000300000003000000030000000300000003000000" ++
+    "030000000300000003000000030000000300000003000000030000000300000003000000030000000300000003000000" ++
+    "030000000300000003000000030000000300000003000000030000000300000003000000030000000300000003000000" ++
+    "030000000300000003000000030000000300000003000000030000000300000003000000030000000300000003000000" ++
+    "030000000300000003000000030000000300000003000000030000000300000003000000030000000300000003000000" ++
+    "030000000300000003000000030000000300000003000000030000000300000004000000040000000400000004000000" ++
+    "040000000400000004000000040000000400000004000000040000000400000004000000040000000400000004000000" ++
+    "0c00090000e40b540200000008000500020000002400050001000100000000000000000000000000ffffffff0a000101" ++
+    "0c00000000000000";
+const seq_u32_police_rate64: u32 = 1784727487;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1784727264 len=172
+// tc filter add dev lo parent 1: protocol ip prio 8 u32 match ip src 10.0.0.8/32 flowid 1:10 action skbedit priority 1:10 mark 5 queue_mapping 2 ptype host
+const g_u32_skbedit =
+    "ac0000002c000506e0c6606a000000000000000001000000000000000000010008000800080001007533320080000200" ++
+    "0800010010000100500007004c0001000c000100736b6265646974003c00028018000200000000000000000003000000" ++
+    "000000000000000006000400020000000800030010000100080005000500000006000700000000002400050001000100" ++
+    "000000000000000000000000ffffffff0a0000080c00000000000000";
+const seq_u32_skbedit: u32 = 1784727264;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1784727264 len=168
+// tc filter add dev lo parent 1: protocol ip prio 9 u32 match ip src 10.0.0.9/32 flowid 1:10 action vlan push id 100 protocol 802.1Q priority 3
+const g_u32_vlan_push =
+    "a80000002c000506e0c6606a00000000000000000100000000000000000001000800090008000100753332007c000200" ++
+    "08000100100001004c0007004800010009000100766c616e00000000380002801c000200000000000000000003000000" ++
+    "000000000000000002000000060003006400000006000400810000000500060003000000240005000100010000000000" ++
+    "0000000000000000ffffffff0a0000090c00000000000000";
+const seq_u32_vlan_push: u32 = 1784727264;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1784727264 len=144
+// tc filter add dev lo parent 1: protocol ip prio 10 u32 match ip src 10.0.0.10/32 flowid 1:10 action vlan pop
+const g_u32_vlan_pop =
+    "900000002c000506e0c6606a000000000000000001000000000000000000010008000a00080001007533320064000200" ++
+    "0800010010000100340007003000010009000100766c616e00000000200002801c000200000000000000000003000000" ++
+    "0000000000000000010000002400050001000100000000000000000000000000ffffffff0a00000a0c00000000000000";
+const seq_u32_vlan_pop: u32 = 1784727264;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1784727264 len=152
+// tc filter add dev lo parent 1: protocol ip prio 11 u32 match ip src 10.0.0.11/32 flowid 1:10 action vlan modify id 200
+const g_u32_vlan_modify =
+    "980000002c000506e0c6606a000000000000000001000000000000000000010008000b0008000100753332006c000200" ++
+    "08000100100001003c0007003800010009000100766c616e00000000280002801c000200000000000000000003000000" ++
+    "00000000000000000300000006000300c80000002400050001000100000000000000000000000000ffffffff0a00000b" ++
+    "0c00000000000000";
+const seq_u32_vlan_modify: u32 = 1784727264;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1784727264 len=200
+// tc filter add dev lo parent 1: protocol ip prio 12 u32 match ip src 10.0.0.12/32 flowid 1:10 action skbedit mark 7 pipe action mirred egress redirect dev lo
+const g_u32_pipe_chain =
+    "c80000002c000506e0c6606a000000000000000001000000000000000000010008000c0008000100753332009c000200" ++
+    "08000100100001006c000700340001000c000100736b6265646974002400028018000200000000000000000003000000" ++
+    "00000000000000000800050007000000340002000b0001006d6972726564000024000280200002000000000000000000" ++
+    "04000000000000000000000001000000010000002400050001000100000000000000000000000000ffffffff0a00000c" ++
+    "0c00000000000000";
+const seq_u32_pipe_chain: u32 = 1784727264;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1784727488 len=216
+// tc filter add dev lo parent 1: protocol ip prio 37 u32 match ip src 10.0.1.7/32 flowid 1:10 action vlan push id 100 protocol 802.1ad priority 7 pipe action vlan pop
+const g_u32_vlan_chain =
+    "d80000002c000506c0c7606a0000000000000000010000000000000000000100080025000800010075333200ac000200" ++
+    "08000100100001007c0007004800010009000100766c616e00000000380002801c000200000000000000000003000000" ++
+    "00000000000000000200000006000300640000000600040088a8000005000600070000003000020009000100766c616e" ++
+    "00000000200002801c000200000000000000000003000000000000000000000001000000240005000100010000000000" ++
+    "0000000000000000ffffffff0a0001070c00000000000000";
+const seq_u32_vlan_chain: u32 = 1784727488;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1784727264 len=132
+// tc filter add dev lo parent 1: protocol ip prio 20 flower ip_proto tcp dst_port 80 action drop
+const g_flower_gact_drop =
+    "840000002c000506e0c6606a0000000000000000010000000000000000000100080014000b000100666c6f7765720000" ++
+    "5400020005000900060000000600130000500000300003002c0001000900010067616374000000001c00028018000200" ++
+    "000000000000000002000000000000000000000008001600000000000600080008000000";
+const seq_flower_gact_drop: u32 = 1784727264;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1784727487 len=140
+// tc filter add dev lo parent 1: protocol ip prio 31 flower ip_proto tcp dst_port 80 classid 1:10 action drop
+const g_flower_classid_gact =
+    "8c0000002c000506bfc7606a000000000000000001000000000000000000010008001f000b000100666c6f7765720000" ++
+    "5c000200050009000600000006001300005000000800010010000100300003002c000100090001006761637400000000" ++
+    "1c00028018000200000000000000000002000000000000000000000008001600000000000600080008000000";
+const seq_flower_classid_gact: u32 = 1784727487;
+
+// ### RTM_NEWACTION type=48 flags=0x605 seq=1784727263 len=68
+// tc actions add action drop index 1
+const g_action_add_gact =
+    "4400000030000506dfc6606a0000000000000000300001002c0001000900010067616374000000001c00028018000200" ++
+    "0100000000000000020000000000000000000000";
+const seq_action_add_gact: u32 = 1784727263;
+
+// ### RTM_NEWACTION type=48 flags=0x605 seq=1784727521 len=112
+// tc actions add action drop index 1 action pass index 2
+const g_action_add_two =
+    "7000000030000506e1c7606a00000000000000005c0001002c0001000900010067616374000000001c00028018000200" ++
+    "01000000000000000200000000000000000000002c0002000900010067616374000000001c0002801800020002000000" ++
+    "00000000000000000000000000000000";
+const seq_action_add_two: u32 = 1784727521;
+
+// ### RTM_NEWACTION type=48 flags=0x605 seq=1784727264 len=76
+// tc actions add action mirred egress redirect dev lo index 3
+const g_action_add_mirred =
+    "4c00000030000506e0c6606a000000000000000038000100340001000b0001006d697272656400002400028020000200" ++
+    "03000000000000000400000000000000000000000100000001000000";
+const seq_action_add_mirred: u32 = 1784727264;
+
+// ### RTM_GETACTION type=50 flags=0x301 seq=1784727263 len=52
+// tc actions ls action gact
+const g_action_ls_gact =
+    "3400000032000103dfc6606a000000000000000014000100100001000900010067616374000000000c00020001000000" ++
+    "01000000";
+const seq_action_ls_gact: u32 = 1784727263;
+
+// ### RTM_DELACTION type=49 flags=0x5 seq=1784727264 len=48
+// tc actions del action gact index 1
+const g_action_del_gact =
+    "3000000031000500e0c6606a00000000000000001c000100180001000900010067616374000000000800030001000000";
+const seq_action_del_gact: u32 = 1784727264;
+
+// ### RTM_GETACTION type=50 flags=0x1 seq=1784727487 len=48
+// tc actions get action gact index 1
+const g_action_get_gact =
+    "3000000032000100bfc7606a00000000000000001c000100180001000900010067616374000000000800030001000000";
+const seq_action_get_gact: u32 = 1784727487;
 
 // ── qdisc goldens ───────────────────────────────────────────────────────────
 
@@ -781,5 +1109,466 @@ test "goldens re-parse: tbf and fq_codel qdiscs" {
         try testing.expectEqual(@as(u32, 3), h.version);
         try testing.expectEqual(@as(u32, 10), h.rate2quantum);
         try testing.expectEqual(@as(u32, 0x10), h.defcls);
+    }
+}
+
+// ── action goldens: gact ────────────────────────────────────────────────────
+
+/// The u32 selector every action golden below hangs off: one `match ip src`
+/// key plus `flowid 1:10`, so the goldens differ only in their action list.
+fn u32ActionReq(
+    seq: u32,
+    prio: u16,
+    src: [4]u8,
+    acts: []const ActionSpec,
+) ![]u8 {
+    const keys = [_]U32Key{U32Key.ipv4Src(src, 32)};
+    return message.buildFilterSetWith(
+        gpa,
+        seq,
+        .add,
+        .{ .ifindex = lo, .parent = Handle.init(1, 0), .prio = prio, .eth_type = ETH_P.IP },
+        .{ .u32 = .{ .classid = Handle.init(1, 0x10), .keys = &keys, .actions = acts } },
+        ps,
+    );
+}
+
+test "golden: u32 + gact drop" {
+    // tc filter add dev lo parent 1: protocol ip prio 1 u32 \
+    //     match ip src 10.0.0.1/32 flowid 1:10 action drop
+    const req = try u32ActionReq(seq_u32_gact_drop, 1, .{ 10, 0, 0, 1 }, &.{
+        .{ .gact = .{ .action = .shot } },
+    });
+    defer gpa.free(req);
+    try expectGolden(g_u32_gact_drop, req);
+}
+
+test "golden: u32 + gact pass with an explicit table index" {
+    // tc filter add dev lo parent 1: protocol ip prio 2 u32 \
+    //     match ip src 10.0.0.2/32 flowid 1:10 action pass index 7
+    const req = try u32ActionReq(seq_u32_gact_pass_index, 2, .{ 10, 0, 0, 2 }, &.{
+        .{ .gact = .{ .action = .ok, .index = 7 } },
+    });
+    defer gpa.free(req);
+    try expectGolden(g_u32_gact_pass_index, req);
+}
+
+test "golden: u32 + gact continue (TC_ACT_UNSPEC is -1 on the wire)" {
+    // tc filter add dev lo parent 1: protocol ip prio 34 u32 \
+    //     match ip src 10.0.1.4/32 flowid 1:10 action continue
+    const req = try u32ActionReq(seq_u32_gact_continue, 34, .{ 10, 0, 1, 4 }, &.{
+        .{ .gact = .{ .action = .unspec } },
+    });
+    defer gpa.free(req);
+    try expectGolden(g_u32_gact_continue, req);
+}
+
+test "golden: u32 + probabilistic gact (tc_gact_p)" {
+    // tc filter add dev lo parent 1: protocol ip prio 13 u32 \
+    //     match ip src 10.0.0.13/32 flowid 1:10 action gact drop random determ pass 2
+    const req = try u32ActionReq(seq_u32_gact_prob, 13, .{ 10, 0, 0, 13 }, &.{
+        .{ .gact = .{
+            .action = .shot,
+            .random = .{ .ptype = .determ, .pval = 2, .paction = .ok },
+        } },
+    });
+    defer gpa.free(req);
+    try expectGolden(g_u32_gact_prob, req);
+}
+
+test "golden: u32 + gact with a TCA_ACT_COOKIE" {
+    // tc filter add dev lo parent 1: protocol ip prio 14 u32 \
+    //     match ip src 10.0.0.14/32 flowid 1:10 action drop cookie a1b2c3d4
+    const req = try u32ActionReq(seq_u32_gact_cookie, 14, .{ 10, 0, 0, 14 }, &.{
+        .{ .gact = .{ .action = .shot, .cookie = &.{ 0xa1, 0xb2, 0xc3, 0xd4 } } },
+    });
+    defer gpa.free(req);
+    try expectGolden(g_u32_gact_cookie, req);
+}
+
+// ── action goldens: mirred ──────────────────────────────────────────────────
+
+test "golden: u32 + mirred egress redirect (verdict TC_ACT_STOLEN)" {
+    // tc filter add dev lo parent 1: protocol ip prio 3 u32 \
+    //     match ip src 10.0.0.3/32 flowid 1:10 action mirred egress redirect dev lo
+    const req = try u32ActionReq(seq_u32_mirred_egress_redirect, 3, .{ 10, 0, 0, 3 }, &.{
+        .{ .mirred = .{ .eaction = .egress_redir, .ifindex = lo } },
+    });
+    defer gpa.free(req);
+    try expectGolden(g_u32_mirred_egress_redirect, req);
+}
+
+test "golden: u32 + mirred ingress mirror (verdict TC_ACT_PIPE)" {
+    // tc filter add dev lo parent 1: protocol ip prio 4 u32 \
+    //     match ip src 10.0.0.4/32 flowid 1:10 action mirred ingress mirror dev lo
+    const req = try u32ActionReq(seq_u32_mirred_ingress_mirror, 4, .{ 10, 0, 0, 4 }, &.{
+        .{ .mirred = .{ .eaction = .ingress_mirror, .ifindex = lo } },
+    });
+    defer gpa.free(req);
+    try expectGolden(g_u32_mirred_ingress_mirror, req);
+}
+
+// ── action goldens: police (the ratespec reuse) ─────────────────────────────
+
+test "golden: u32 + police (tc_police + a full rate table)" {
+    // tc filter add dev lo parent 1: protocol ip prio 5 u32 \
+    //     match ip src 10.0.0.5/32 flowid 1:10 \
+    //     action police rate 1mbit burst 10k conform-exceed drop
+    // (`10k` is 10 * 1024 bytes; 1mbit is 125000 B/s.)
+    const req = try u32ActionReq(seq_u32_police, 5, .{ 10, 0, 0, 5 }, &.{
+        .{ .police = .{ .rate = 125_000, .burst = 10 * 1024, .exceed = .shot } },
+    });
+    defer gpa.free(req);
+    try expectGolden(g_u32_police, req);
+}
+
+test "golden: u32 + police with a peak bucket and a notexceed result" {
+    // tc filter add dev lo parent 1: protocol ip prio 6 u32 \
+    //     match ip src 10.0.0.6/32 flowid 1:10 \
+    //     action police rate 1mbit burst 10k mtu 1500 peakrate 2mbit \
+    //     conform-exceed pipe/drop
+    // `conform-exceed A/B` puts A in tc_police.action and B in
+    // TCA_POLICE_RESULT — the exceed verdict first.
+    const req = try u32ActionReq(seq_u32_police_peak, 6, .{ 10, 0, 0, 6 }, &.{
+        .{ .police = .{
+            .rate = 125_000,
+            .burst = 10 * 1024,
+            .mtu = 1500,
+            .peakrate = 250_000,
+            .exceed = .pipe,
+            .notexceed = .shot,
+        } },
+    });
+    defer gpa.free(req);
+    try expectGolden(g_u32_police_peak, req);
+}
+
+test "golden: u32 + police with >32-bit rates (RATE64 + PEAKRATE64)" {
+    // tc filter add dev lo parent 1: protocol ip prio 30 u32 \
+    //     match ip src 10.0.1.1/32 flowid 1:10 \
+    //     action police rate 40gbit burst 10k mtu 1500 peakrate 80gbit \
+    //     conform-exceed pipe/drop
+    // Both ratespecs pin to ~0U (so both tables are computed from the clamp)
+    // while the burst is still timed with the true 5 GB/s rate → 32 ticks.
+    const req = try u32ActionReq(seq_u32_police_rate64, 30, .{ 10, 0, 1, 1 }, &.{
+        .{ .police = .{
+            .rate = 5_000_000_000,
+            .burst = 10 * 1024,
+            .mtu = 1500,
+            .peakrate = 10_000_000_000,
+            .exceed = .pipe,
+            .notexceed = .shot,
+        } },
+    });
+    defer gpa.free(req);
+    try expectGolden(g_u32_police_rate64, req);
+}
+
+// ── action goldens: skbedit + vlan ──────────────────────────────────────────
+
+test "golden: u32 + skbedit (priority/mark/queue_mapping/ptype)" {
+    // tc filter add dev lo parent 1: protocol ip prio 8 u32 \
+    //     match ip src 10.0.0.8/32 flowid 1:10 \
+    //     action skbedit priority 1:10 mark 5 queue_mapping 2 ptype host
+    const req = try u32ActionReq(seq_u32_skbedit, 8, .{ 10, 0, 0, 8 }, &.{
+        .{ .skbedit = .{
+            .priority = Handle.init(1, 0x10),
+            .mark = 5,
+            .queue_mapping = 2,
+            .ptype = PACKET.HOST,
+        } },
+    });
+    defer gpa.free(req);
+    try expectGolden(g_u32_skbedit, req);
+}
+
+test "golden: u32 + vlan push" {
+    // tc filter add dev lo parent 1: protocol ip prio 9 u32 \
+    //     match ip src 10.0.0.9/32 flowid 1:10 \
+    //     action vlan push id 100 protocol 802.1Q priority 3
+    const req = try u32ActionReq(seq_u32_vlan_push, 9, .{ 10, 0, 0, 9 }, &.{
+        .{ .vlan = .{
+            .v_action = .push,
+            .id = 100,
+            .proto = ETH_P.@"802_1Q",
+            .prio = 3,
+        } },
+    });
+    defer gpa.free(req);
+    try expectGolden(g_u32_vlan_push, req);
+}
+
+test "golden: u32 + vlan pop" {
+    // tc filter add dev lo parent 1: protocol ip prio 10 u32 \
+    //     match ip src 10.0.0.10/32 flowid 1:10 action vlan pop
+    const req = try u32ActionReq(seq_u32_vlan_pop, 10, .{ 10, 0, 0, 10 }, &.{
+        .{ .vlan = .{ .v_action = .pop } },
+    });
+    defer gpa.free(req);
+    try expectGolden(g_u32_vlan_pop, req);
+}
+
+test "golden: u32 + vlan modify" {
+    // tc filter add dev lo parent 1: protocol ip prio 11 u32 \
+    //     match ip src 10.0.0.11/32 flowid 1:10 action vlan modify id 200
+    // No `protocol` on the command line ⇒ tc emits no PUSH_VLAN_PROTOCOL.
+    const req = try u32ActionReq(seq_u32_vlan_modify, 11, .{ 10, 0, 0, 11 }, &.{
+        .{ .vlan = .{ .v_action = .modify, .id = 200 } },
+    });
+    defer gpa.free(req);
+    try expectGolden(g_u32_vlan_modify, req);
+}
+
+// ── action goldens: multi-action lists (the 1-based ordinals) ───────────────
+
+test "golden: u32 + a two-action PIPE chain (ordinals 1 and 2)" {
+    // tc filter add dev lo parent 1: protocol ip prio 12 u32 \
+    //     match ip src 10.0.0.12/32 flowid 1:10 \
+    //     action skbedit mark 7 pipe action mirred egress redirect dev lo
+    // skbedit returns TC_ACT_PIPE, which is what lets the list continue into
+    // the mirred; the mirred returns TC_ACT_STOLEN and ends it.
+    const req = try u32ActionReq(seq_u32_pipe_chain, 12, .{ 10, 0, 0, 12 }, &.{
+        .{ .skbedit = .{ .mark = 7, .action = .pipe } },
+        .{ .mirred = .{ .eaction = .egress_redir, .ifindex = lo } },
+    });
+    defer gpa.free(req);
+    try expectGolden(g_u32_pipe_chain, req);
+}
+
+test "golden: u32 + a two-action vlan chain (802.1ad push then pop)" {
+    // tc filter add dev lo parent 1: protocol ip prio 37 u32 \
+    //     match ip src 10.0.1.7/32 flowid 1:10 \
+    //     action vlan push id 100 protocol 802.1ad priority 7 pipe \
+    //     action vlan pop
+    const req = try u32ActionReq(seq_u32_vlan_chain, 37, .{ 10, 0, 1, 7 }, &.{
+        .{ .vlan = .{ .v_action = .push, .id = 100, .proto = 0x88A8, .prio = 7 } },
+        .{ .vlan = .{ .v_action = .pop } },
+    });
+    defer gpa.free(req);
+    try expectGolden(g_u32_vlan_chain, req);
+}
+
+// ── action goldens: flower ──────────────────────────────────────────────────
+
+test "golden: flower + gact drop" {
+    // tc filter add dev lo parent 1: protocol ip prio 20 flower \
+    //     ip_proto tcp dst_port 80 action drop
+    const req = try message.buildFilterSetWith(
+        gpa,
+        seq_flower_gact_drop,
+        .add,
+        .{ .ifindex = lo, .parent = Handle.init(1, 0), .prio = 20, .eth_type = ETH_P.IP },
+        .{ .flower = .{
+            .eth_type = ETH_P.IP,
+            .ip_proto = IPPROTO.TCP,
+            .dst_port = 80,
+            .actions = &.{.{ .gact = .{ .action = .shot } }},
+        } },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_flower_gact_drop, req);
+}
+
+test "golden: flower + classid + gact drop (CLASSID before ACT)" {
+    // tc filter add dev lo parent 1: protocol ip prio 31 flower \
+    //     ip_proto tcp dst_port 80 classid 1:10 action drop
+    const req = try message.buildFilterSetWith(
+        gpa,
+        seq_flower_classid_gact,
+        .add,
+        .{ .ifindex = lo, .parent = Handle.init(1, 0), .prio = 31, .eth_type = ETH_P.IP },
+        .{ .flower = .{
+            .eth_type = ETH_P.IP,
+            .ip_proto = IPPROTO.TCP,
+            .dst_port = 80,
+            .classid = Handle.init(1, 0x10),
+            .actions = &.{.{ .gact = .{ .action = .shot } }},
+        } },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_flower_classid_gact, req);
+}
+
+// ── action goldens: the standalone family (tcamsg, not tcmsg) ───────────────
+
+test "golden: tc actions add (RTM_NEWACTION)" {
+    // tc actions add action drop index 1
+    const req = try message.buildActionSet(gpa, seq_action_add_gact, .add, &.{
+        .{ .gact = .{ .action = .shot, .index = 1 } },
+    }, ps);
+    defer gpa.free(req);
+    try expectGolden(g_action_add_gact, req);
+}
+
+test "golden: tc actions add with two entries (ordinals 1 and 2)" {
+    // tc actions add action drop index 1 action pass index 2
+    const req = try message.buildActionSet(gpa, seq_action_add_two, .add, &.{
+        .{ .gact = .{ .action = .shot, .index = 1 } },
+        .{ .gact = .{ .action = .ok, .index = 2 } },
+    }, ps);
+    defer gpa.free(req);
+    try expectGolden(g_action_add_two, req);
+}
+
+test "golden: tc actions add mirred" {
+    // tc actions add action mirred egress redirect dev lo index 3
+    const req = try message.buildActionSet(gpa, seq_action_add_mirred, .add, &.{
+        .{ .mirred = .{ .eaction = .egress_redir, .ifindex = lo, .index = 3 } },
+    }, ps);
+    defer gpa.free(req);
+    try expectGolden(g_action_add_mirred, req);
+}
+
+test "golden: tc actions ls (RTM_GETACTION dump + LARGE_DUMP_ON)" {
+    // tc actions ls action gact
+    const req = try message.buildActionDump(gpa, seq_action_ls_gact, "gact");
+    defer gpa.free(req);
+    try expectGolden(g_action_ls_gact, req);
+}
+
+test "golden: tc actions del (kind + index, no options)" {
+    // tc actions del action gact index 1
+    const req = try message.buildActionDel(gpa, seq_action_del_gact, &.{
+        .{ .kind = "gact", .index = 1 },
+    });
+    defer gpa.free(req);
+    try expectGolden(g_action_del_gact, req);
+}
+
+test "golden: tc actions get (same body, no ACK, no DUMP)" {
+    // tc actions get action gact index 1
+    const req = try message.buildActionGet(gpa, seq_action_get_gact, &.{
+        .{ .kind = "gact", .index = 1 },
+    });
+    defer gpa.free(req);
+    try expectGolden(g_action_get_gact, req);
+}
+
+// ── action goldens re-parse ─────────────────────────────────────────────────
+
+test "action goldens re-parse: the pipe chain decodes back into two actions" {
+    const codec = @import("netlink").codec;
+    var buf: [4096]u8 = undefined;
+    const bytes = try std.fmt.hexToBytes(buf[0 .. g_u32_pipe_chain.len / 2], g_u32_pipe_chain);
+    var it: codec.MessageIterator = .{ .buf = bytes };
+    const m = (try it.next()).?;
+    const f = try filter.parseFilter(m.payload);
+    try testing.expectEqualStrings("u32", f.kind());
+    try testing.expectEqual(@as(u16, 12), f.prio);
+
+    const acts = f.actions();
+    try testing.expectEqual(@as(usize, 2), acts.len);
+    try testing.expectEqual(@as(u8, 2), f.act_list.total);
+
+    try testing.expectEqual(@as(u16, 1), acts[0].order);
+    try testing.expectEqualStrings("skbedit", acts[0].kind());
+    try testing.expectEqual(action.Verdict.pipe, acts[0].gen.action);
+    try testing.expectEqual(@as(u32, 7), acts[0].skbedit.?.mark.?);
+
+    try testing.expectEqual(@as(u16, 2), acts[1].order);
+    try testing.expectEqualStrings("mirred", acts[1].kind());
+    try testing.expectEqual(action.Verdict.stolen, acts[1].gen.action);
+    try testing.expectEqual(action.MirredAction.egress_redir, acts[1].mirred.?.eaction);
+    try testing.expectEqual(@as(u32, 1), acts[1].mirred.?.ifindex);
+}
+
+test "action goldens re-parse: police keeps its 64-bit rates and verdicts" {
+    const codec = @import("netlink").codec;
+    var buf: [4096]u8 = undefined;
+    const bytes = try std.fmt.hexToBytes(
+        buf[0 .. g_u32_police_rate64.len / 2],
+        g_u32_police_rate64,
+    );
+    var it: codec.MessageIterator = .{ .buf = bytes };
+    const m = (try it.next()).?;
+    const f = try filter.parseFilter(m.payload);
+    const acts = f.actions();
+    try testing.expectEqual(@as(usize, 1), acts.len);
+    try testing.expectEqualStrings("police", acts[0].kind());
+    const p = acts[0].police.?;
+    try testing.expectEqual(@as(u64, 5_000_000_000), p.rate64);
+    try testing.expectEqual(@as(u64, 10_000_000_000), p.peakrate64);
+    try testing.expectEqual(std.math.maxInt(u32), p.rate.rate);
+    try testing.expectEqual(@as(u32, 1500), p.mtu);
+    try testing.expectEqual(@as(u32, 32), p.burst); // ticks
+    try testing.expectEqual(action.Verdict.pipe, p.exceed);
+    try testing.expectEqual(action.Verdict.shot, p.notexceed.?);
+    // 10 KiB back out of the tick count at the true rate.
+    try testing.expectEqual(@as(u64, 10 * 1024), ps.calcXmitSize(5_000_000_000, p.burst));
+}
+
+test "action goldens re-parse: the flower golden's action and the vlan chain" {
+    const codec = @import("netlink").codec;
+    var buf: [4096]u8 = undefined;
+    {
+        const bytes = try std.fmt.hexToBytes(
+            buf[0 .. g_flower_classid_gact.len / 2],
+            g_flower_classid_gact,
+        );
+        var it: codec.MessageIterator = .{ .buf = bytes };
+        const m = (try it.next()).?;
+        const f = try filter.parseFilter(m.payload);
+        try testing.expectEqualStrings("flower", f.kind());
+        try testing.expectEqual(Handle.init(1, 0x10).raw, f.classid().?.raw);
+        const acts = f.actions();
+        try testing.expectEqual(@as(usize, 1), acts.len);
+        try testing.expectEqualStrings("gact", acts[0].kind());
+        try testing.expectEqual(action.Verdict.shot, acts[0].gen.action);
+    }
+    {
+        const bytes = try std.fmt.hexToBytes(
+            buf[0 .. g_u32_vlan_chain.len / 2],
+            g_u32_vlan_chain,
+        );
+        var it: codec.MessageIterator = .{ .buf = bytes };
+        const m = (try it.next()).?;
+        const f = try filter.parseFilter(m.payload);
+        const acts = f.actions();
+        try testing.expectEqual(@as(usize, 2), acts.len);
+        try testing.expectEqual(action.VlanAction.push, acts[0].vlan.?.v_action);
+        try testing.expectEqual(@as(u16, 0x88A8), acts[0].vlan.?.proto.?);
+        try testing.expectEqual(@as(u8, 7), acts[0].vlan.?.prio.?);
+        try testing.expectEqual(action.VlanAction.pop, acts[1].vlan.?.v_action);
+        try testing.expectEqual(@as(?u16, null), acts[1].vlan.?.id);
+    }
+}
+
+test "action goldens re-parse: the standalone table messages" {
+    const codec = @import("netlink").codec;
+    var buf: [512]u8 = undefined;
+    {
+        const bytes = try std.fmt.hexToBytes(
+            buf[0 .. g_action_add_two.len / 2],
+            g_action_add_two,
+        );
+        var it: codec.MessageIterator = .{ .buf = bytes };
+        const m = (try it.next()).?;
+        try testing.expectEqual(message.RTM_NEWACTION, m.type);
+        var acts = (try action.actionsOf(m.payload)).?;
+        const a = (try acts.next()).?;
+        try testing.expectEqual(@as(u16, 1), a.order);
+        try testing.expectEqual(@as(u32, 1), a.gen.index);
+        try testing.expectEqual(action.Verdict.shot, a.gen.action);
+        const b = (try acts.next()).?;
+        try testing.expectEqual(@as(u16, 2), b.order);
+        try testing.expectEqual(@as(u32, 2), b.gen.index);
+        try testing.expectEqual(action.Verdict.ok, b.gen.action);
+        try testing.expectEqual(@as(?action.Action, null), try acts.next());
+    }
+    {
+        const bytes = try std.fmt.hexToBytes(
+            buf[0 .. g_action_del_gact.len / 2],
+            g_action_del_gact,
+        );
+        var it: codec.MessageIterator = .{ .buf = bytes };
+        const m = (try it.next()).?;
+        try testing.expectEqual(message.RTM_DELACTION, m.type);
+        var acts = (try action.actionsOf(m.payload)).?;
+        const a = (try acts.next()).?;
+        try testing.expectEqualStrings("gact", a.kind());
+        try testing.expectEqual(@as(u32, 1), a.index_attr.?);
+        try testing.expectEqual(@as(?GactWire, null), a.gact); // no options nest
     }
 }

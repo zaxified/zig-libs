@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
-//! tc — pure-Zig Linux traffic control over rtnetlink: **qdiscs, classes and
-//! filters**, with no `tc` shell-out and no libc.
+//! tc — pure-Zig Linux traffic control over rtnetlink: **qdiscs, classes,
+//! filters and actions**, with no `tc` shell-out and no libc.
 //!
 //! * **qdiscs** — `netem` (delay/jitter/loss/duplicate/reorder/corrupt/rate),
 //!   `htb`, `tbf`, `fq_codel`, plus a `raw` escape hatch for any other kind.
@@ -10,6 +10,10 @@
 //! * **filters** — `RTM_NEWTFILTER`/`DELTFILTER`/`GETTFILTER` with `u32`
 //!   (masked 32-bit matches at fixed offsets) and `flower` (structured
 //!   L2–L4 keys).
+//! * **actions** — the `TCA_*_ACT` list a filter runs on a match (`gact`,
+//!   `mirred`, `police`, `skbedit`, `vlan`, `raw`), chained by `TC_ACT_PIPE`,
+//!   plus the standalone shared table (`RTM_NEWACTION`/`DELACTION`/
+//!   `GETACTION`).
 //!
 //! ```zig
 //! var sock = try tc.Socket.open(gpa);
@@ -25,6 +29,17 @@
 //!                       .eth_type = tc.ETH_P.IP },
 //!                    .{ .u32 = .{ .classid = .init(1, 0x10),
 //!                                 .keys = &.{ .ipv4Dst(.{ 10, 0, 0, 1 }, 32) } } });
+//! // A filter that runs an action list instead of just picking a class:
+//! // mark the packet, then rate-limit it.
+//! try sock.filterAdd(.{ .ifindex = ifi, .parent = one, .prio = 2,
+//!                       .eth_type = tc.ETH_P.IP },
+//!                    .{ .u32 = .{ .keys = &.{ .ipv4Src(.{ 10, 0, 0, 2 }, 32) },
+//!                                 .actions = &.{
+//!                                     .{ .skbedit = .{ .mark = 7 } }, // ⇒ PIPE
+//!                                     .{ .police = .{ .rate = 125_000,
+//!                                                     .burst = 10 * 1024,
+//!                                                     .exceed = .shot } },
+//!                                 } } });
 //! const classes = try sock.classes(ifi, one);
 //! defer gpa.free(classes);
 //! try sock.qdiscDel(.{ .ifindex = ifi, .parent = root });
@@ -69,6 +84,7 @@ pub const handle = @import("handle.zig");
 pub const ratespec = @import("ratespec.zig");
 pub const qdisc = @import("qdisc.zig");
 pub const filter = @import("filter.zig");
+pub const action = @import("action.zig");
 pub const message = @import("message.zig");
 
 /// `major:minor` handle arithmetic (hexadecimal, like `tc`).
@@ -126,6 +142,41 @@ pub const TCA_U32 = filter.TCA_U32;
 pub const TCA_FLOWER = filter.TCA_FLOWER;
 pub const parseFilter = filter.parseFilter;
 
+/// Action specs, their wire readbacks and the `TC_ACT_*` verdicts.
+pub const ActionSpec = action.ActionSpec;
+pub const ActionRef = action.ActionRef;
+pub const Action = action.Action;
+pub const ActionList = action.ActionList;
+pub const ActionIterator = action.ActionIterator;
+pub const Verdict = action.Verdict;
+pub const Gen = action.Gen;
+pub const Gact = action.Gact;
+pub const GactProb = action.GactProb;
+pub const GactWire = action.GactWire;
+pub const ProbType = action.ProbType;
+pub const Mirred = action.Mirred;
+pub const MirredAction = action.MirredAction;
+pub const MirredWire = action.MirredWire;
+pub const Police = action.Police;
+pub const PoliceWire = action.PoliceWire;
+pub const Skbedit = action.Skbedit;
+pub const SkbeditWire = action.SkbeditWire;
+pub const Vlan = action.Vlan;
+pub const VlanAction = action.VlanAction;
+pub const VlanWire = action.VlanWire;
+pub const PACKET = action.PACKET;
+pub const TCA_ACT = action.TCA_ACT;
+pub const TCA_ACT_TAB = action.TCA_ACT_TAB;
+pub const TCA_ROOT = action.TCA_ROOT;
+pub const TCA_GACT = action.TCA_GACT;
+pub const TCA_MIRRED = action.TCA_MIRRED;
+pub const TCA_POLICE = action.TCA_POLICE;
+pub const TCA_SKBEDIT = action.TCA_SKBEDIT;
+pub const TCA_VLAN = action.TCA_VLAN;
+pub const TCA_STATS = action.TCA_STATS;
+pub const parseAction = action.parseAction;
+pub const parseActionList = action.parseActionList;
+
 /// Request construction (message types, targets, builders).
 pub const Create = message.Create;
 pub const QdiscTarget = message.QdiscTarget;
@@ -140,6 +191,9 @@ pub const RTM_GETTCLASS = message.RTM_GETTCLASS;
 pub const RTM_NEWTFILTER = message.RTM_NEWTFILTER;
 pub const RTM_DELTFILTER = message.RTM_DELTFILTER;
 pub const RTM_GETTFILTER = message.RTM_GETTFILTER;
+pub const RTM_NEWACTION = message.RTM_NEWACTION;
+pub const RTM_DELACTION = message.RTM_DELACTION;
+pub const RTM_GETACTION = message.RTM_GETACTION;
 
 /// The handle the v1 netem shortcuts assign a root qdisc: `1:0`.
 pub const netem_handle: u32 = 0x00010000;
@@ -153,6 +207,10 @@ pub const RequestError = netlink.RequestError;
 pub const WriteError = RequestError || message.BuildError;
 /// A dump can additionally give up on a table that keeps changing under it.
 pub const DumpError = RequestError || error{InconsistentDump};
+/// The action dumps additionally build a request *body* (a kind string, an
+/// index), so message construction can fail too — every other `RTM_GET*`
+/// request is fixed-shape.
+pub const ActionDumpError = DumpError || message.BuildError;
 
 pub const OpenError = netlink.OpenError;
 pub const BuildError = message.BuildError;
@@ -310,7 +368,7 @@ pub const Socket = struct {
 
     fn filterSet(self: *Socket, op: Create, target: FilterTarget, spec: FilterSpec) WriteError!void {
         const seq = self.nl.nextSeq();
-        const req = try message.buildFilterSet(self.gpa, seq, op, target, spec);
+        const req = try message.buildFilterSetWith(self.gpa, seq, op, target, spec, self.psched);
         defer self.gpa.free(req);
         return self.nl.requestAck(req, seq);
     }
@@ -330,6 +388,121 @@ pub const Socket = struct {
     /// applies).
     pub fn filters(self: *Socket, ifindex: u32, parent: ?Handle) DumpError![]Filter {
         return self.dump(Filter, filter.parseFilter, RTM_GETTFILTER, RTM_NEWTFILTER, ifindex, parent, .exact);
+    }
+
+    // ── standalone action ops (the shared action table) ────────────────────
+
+    /// Install one or more actions in the shared table
+    /// (`tc actions add action …`, `NLM_F_CREATE|NLM_F_EXCL`). Each spec's
+    /// `index` picks its slot; 0 lets the kernel allocate one.
+    pub fn actionAdd(self: *Socket, specs: []const ActionSpec) WriteError!void {
+        return self.actionSet(.add, specs);
+    }
+
+    /// Create-or-replace (`tc actions replace`).
+    pub fn actionReplace(self: *Socket, specs: []const ActionSpec) WriteError!void {
+        return self.actionSet(.replace, specs);
+    }
+
+    /// Modify existing table entries only (`tc actions change`).
+    pub fn actionChange(self: *Socket, specs: []const ActionSpec) WriteError!void {
+        return self.actionSet(.change, specs);
+    }
+
+    fn actionSet(self: *Socket, op: Create, specs: []const ActionSpec) WriteError!void {
+        const seq = self.nl.nextSeq();
+        const req = try message.buildActionSet(self.gpa, seq, op, specs, self.psched);
+        defer self.gpa.free(req);
+        return self.nl.requestAck(req, seq);
+    }
+
+    /// Delete shared-table actions by `(kind, index)`
+    /// (`tc actions del action gact index 1`).
+    pub fn actionDel(self: *Socket, refs: []const ActionRef) WriteError!void {
+        const seq = self.nl.nextSeq();
+        const req = try message.buildActionDel(self.gpa, seq, refs);
+        defer self.gpa.free(req);
+        return self.nl.requestAck(req, seq);
+    }
+
+    /// Dump every shared-table action of one kind (`tc actions ls action
+    /// gact`). Caller owns the slice (`gpa.free`). Needs no privilege.
+    pub fn actions(self: *Socket, kind: []const u8) ActionDumpError![]Action {
+        var attempt: usize = 0;
+        retry: while (true) {
+            attempt += 1;
+            const seq = self.nl.nextSeq();
+            const req = try message.buildActionDump(self.gpa, seq, kind);
+            defer self.gpa.free(req);
+            try self.send(req);
+
+            var out: std.ArrayList(Action) = .empty;
+            errdefer out.deinit(self.gpa);
+            while (true) {
+                const dgram = try self.recvDatagram();
+                var it: codec.MessageIterator = .{ .buf = dgram };
+                while (it.next() catch return error.MalformedReply) |m| {
+                    if (m.pid != self.nl.portid or m.seq != seq) continue;
+                    if (m.flags & codec.NLM_F_DUMP_INTR != 0) {
+                        out.deinit(self.gpa);
+                        if (attempt < max_dump_attempts) continue :retry;
+                        return error.InconsistentDump;
+                    }
+                    switch (m.type) {
+                        codec.NLMSG_DONE => return out.toOwnedSlice(self.gpa),
+                        codec.NLMSG_ERROR => {
+                            const code = m.errorCode() catch return error.MalformedReply;
+                            if (code == 0) return out.toOwnedSlice(self.gpa); // ACK
+                            return netlink.writeErrorFromCode(code);
+                        },
+                        codec.NLMSG_NOOP => {},
+                        codec.NLMSG_OVERRUN => return error.SystemResources,
+                        else => {
+                            if (m.type != RTM_NEWACTION) continue;
+                            // One RTM_NEWACTION carries the whole table slice,
+                            // so the messages are flattened into one list.
+                            var acts = (action.actionsOf(m.payload) catch
+                                return error.MalformedReply) orelse continue;
+                            while (acts.next() catch return error.MalformedReply) |a|
+                                try out.append(self.gpa, a);
+                        },
+                    }
+                }
+            }
+        }
+    }
+
+    /// Read back one shared-table action (`tc actions get action gact index
+    /// 1`). The reply is a single `RTM_NEWACTION`, not a dump; null means the
+    /// kernel answered with an empty table.
+    pub fn actionGet(self: *Socket, ref: ActionRef) ActionDumpError!?Action {
+        const seq = self.nl.nextSeq();
+        const req = try message.buildActionGet(self.gpa, seq, &.{ref});
+        defer self.gpa.free(req);
+        try self.send(req);
+        while (true) {
+            const dgram = try self.recvDatagram();
+            var it: codec.MessageIterator = .{ .buf = dgram };
+            while (it.next() catch return error.MalformedReply) |m| {
+                if (m.pid != self.nl.portid or m.seq != seq) continue;
+                switch (m.type) {
+                    codec.NLMSG_ERROR => {
+                        const code = m.errorCode() catch return error.MalformedReply;
+                        if (code != 0) return netlink.writeErrorFromCode(code);
+                        return null; // a bare ACK carries no action
+                    },
+                    codec.NLMSG_DONE => return null,
+                    codec.NLMSG_NOOP => {},
+                    codec.NLMSG_OVERRUN => return error.SystemResources,
+                    RTM_NEWACTION => {
+                        var acts = (action.actionsOf(m.payload) catch
+                            return error.MalformedReply) orelse return null;
+                        return acts.next() catch return error.MalformedReply;
+                    },
+                    else => {},
+                }
+            }
+        }
     }
 
     // ── v1 netem shortcuts (source-compatible) ─────────────────────────────
@@ -692,6 +865,18 @@ fn skip(comptime what: []const u8) error{SkipZigTest} {
     return error.SkipZigTest;
 }
 
+/// The stronger requirement of the standalone action family: the kernel
+/// checks `CAP_NET_ADMIN` against the **initial** user namespace there, so a
+/// `unshare -rn` namespace does not grant it.
+fn skipInitUserns(comptime what: []const u8) error{SkipZigTest} {
+    std.debug.print(
+        "SKIPPED: {s} (needs CAP_NET_ADMIN in the *initial* user namespace — " ++
+            "`unshare -rn` is not enough for RTM_NEWACTION; try `sudo unshare -n`)\n",
+        .{what},
+    );
+    return error.SkipZigTest;
+}
+
 fn openOrSkip() !Socket {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     return Socket.open(testing.allocator) catch return skip("tc.Socket.open");
@@ -940,6 +1125,178 @@ test "integration (netns/root): htb qdisc + classes + u32/flower filters + dumps
     }
 }
 
+test "integration (netns/root): filter action list add + dump-decode + del" {
+    var sock = try openOrSkip();
+    defer sock.close();
+    const lo = try loIndex(&sock);
+
+    const one: Handle = .init(1, 0);
+    const leaf: Handle = .init(1, 0x10);
+
+    sock.qdiscDel(.{ .ifindex = lo, .parent = Handle.root }) catch {};
+    sock.qdiscAdd(
+        .{ .ifindex = lo, .handle = one, .parent = Handle.root },
+        .{ .htb = .{ .defcls = 0x10 } },
+    ) catch |e| switch (e) {
+        error.AccessDenied => return skip("htb qdisc add (action round-trip)"),
+        else => return e,
+    };
+    defer sock.qdiscDel(.{ .ifindex = lo, .parent = Handle.root }) catch {};
+    try sock.classAdd(
+        .{ .ifindex = lo, .handle = leaf, .parent = one },
+        .{ .htb = .{ .rate = 125_000 } },
+    );
+
+    // prio 1: a two-action PIPE chain — skbedit hands over to a policer.
+    const keys = [_]U32Key{U32Key.ipv4Src(.{ 10, 0, 0, 1 }, 32)};
+    try sock.filterAdd(
+        .{ .ifindex = lo, .parent = one, .prio = 1, .eth_type = ETH_P.IP },
+        .{ .u32 = .{ .classid = leaf, .keys = &keys, .actions = &.{
+            .{ .skbedit = .{ .mark = 7, .action = .pipe } },
+            .{ .police = .{ .rate = 125_000, .burst = 10 * 1024, .exceed = .shot } },
+        } } },
+    );
+    // prio 2: flower + mirred, a single-action list on the other classifier.
+    try sock.filterAdd(
+        .{ .ifindex = lo, .parent = one, .prio = 2, .eth_type = ETH_P.IP },
+        .{ .flower = .{
+            .eth_type = ETH_P.IP,
+            .ip_proto = IPPROTO.TCP,
+            .dst_port = 80,
+            .classid = leaf,
+            .actions = &.{.{ .mirred = .{ .eaction = .egress_mirror, .ifindex = lo } }},
+        } },
+    );
+
+    {
+        const list = try sock.filters(lo, one);
+        defer testing.allocator.free(list);
+        var saw_chain = false;
+        var saw_mirred = false;
+        for (list) |f| {
+            const acts = f.actions();
+            if (acts.len == 0) continue;
+            if (std.mem.eql(u8, f.kind(), "u32")) {
+                saw_chain = true;
+                try testing.expectEqual(@as(usize, 2), acts.len);
+                // Ordinals survive the round-trip in order.
+                try testing.expectEqual(@as(u16, 1), acts[0].order);
+                try testing.expectEqual(@as(u16, 2), acts[1].order);
+                try testing.expectEqualStrings("skbedit", acts[0].kind());
+                try testing.expectEqual(Verdict.pipe, acts[0].gen.action);
+                try testing.expectEqual(@as(u32, 7), acts[0].skbedit.?.mark.?);
+                try testing.expectEqualStrings("police", acts[1].kind());
+                const p = acts[1].police.?;
+                try testing.expectEqual(@as(u64, 125_000), p.rate64);
+                try testing.expectEqual(Verdict.shot, p.exceed);
+                // The kernel echoes the burst back in psched ticks; converting
+                // it back must land on the 10 KiB we asked for.
+                try testing.expectEqual(
+                    @as(u64, 10 * 1024),
+                    sock.psched.calcXmitSize(125_000, p.burst),
+                );
+                // Every installed action is refcounted and carries counters.
+                try testing.expect(acts[0].gen.refcnt > 0);
+                try testing.expect(acts[0].stats != null);
+            } else if (std.mem.eql(u8, f.kind(), "flower")) {
+                saw_mirred = true;
+                try testing.expectEqual(@as(usize, 1), acts.len);
+                try testing.expectEqualStrings("mirred", acts[0].kind());
+                try testing.expectEqual(
+                    MirredAction.egress_mirror,
+                    acts[0].mirred.?.eaction,
+                );
+                try testing.expectEqual(lo, acts[0].mirred.?.ifindex);
+                try testing.expectEqual(Verdict.pipe, acts[0].gen.action);
+            }
+        }
+        try testing.expect(saw_chain);
+        try testing.expect(saw_mirred);
+    }
+
+    try sock.filterDel(
+        .{ .ifindex = lo, .parent = one, .prio = 1, .eth_type = ETH_P.IP },
+        null,
+    );
+    {
+        const list = try sock.filters(lo, one);
+        defer testing.allocator.free(list);
+        for (list) |f| try testing.expect(f.prio != 1);
+    }
+}
+
+test "integration: the RTM_GETACTION dump needs no privilege" {
+    var sock = try openOrSkip();
+    defer sock.close();
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    // Exercises the whole standalone path — tcamsg body, LARGE_DUMP_ON, the
+    // multi-part receive loop and the TCA_ACT_TAB decode — against a live
+    // kernel. An empty shared table answers ENOENT rather than an empty dump.
+    if (sock.actions("gact")) |list| {
+        defer testing.allocator.free(list);
+        for (list) |a| {
+            try testing.expectEqualStrings("gact", a.kind());
+            try testing.expect(a.order >= 1); // ordinals are 1-based
+        }
+    } else |e| switch (e) {
+        error.NotFound => {},
+        error.AccessDenied => return skip("RTM_GETACTION dump"),
+        else => return e,
+    }
+}
+
+test "integration (root, init userns): the shared action table (add, ls, get, del)" {
+    var sock = try openOrSkip();
+    defer sock.close();
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const slot: u32 = 77;
+    sock.actionDel(&.{.{ .kind = "gact", .index = slot }}) catch {};
+    sock.actionAdd(&.{
+        .{ .gact = .{ .action = .shot, .index = slot } },
+    }) catch |e| switch (e) {
+        // Unlike qdiscs/classes/filters, the kernel guards the shared action
+        // table with `netlink_capable` (act_api.c `tc_ctl_action`), not
+        // `netlink_net_capable`: the capability is checked against the
+        // **initial** user namespace, so `unshare -rn` is not enough. Real
+        // root is. The dump above is unrestricted and covers the decode.
+        error.AccessDenied => return skipInitUserns("tc actions add"),
+        else => return e,
+    };
+    defer sock.actionDel(&.{.{ .kind = "gact", .index = slot }}) catch {};
+
+    {
+        const list = try sock.actions("gact");
+        defer testing.allocator.free(list);
+        var seen = false;
+        for (list) |a| {
+            if (a.gen.index != slot) continue;
+            seen = true;
+            try testing.expectEqualStrings("gact", a.kind());
+            try testing.expectEqual(Verdict.shot, a.gen.action);
+            try testing.expect(a.stats != null);
+        }
+        try testing.expect(seen);
+    }
+
+    // The single-object GET form (tcamsg + kind + index, no NLM_F_DUMP).
+    const got = (try sock.actionGet(.{ .kind = "gact", .index = slot })).?;
+    try testing.expectEqualStrings("gact", got.kind());
+    try testing.expectEqual(slot, got.gen.index);
+    try testing.expectEqual(Verdict.shot, got.gen.action);
+
+    try sock.actionDel(&.{.{ .kind = "gact", .index = slot }});
+    if (sock.actions("gact")) |after| {
+        defer testing.allocator.free(after);
+        for (after) |a| try testing.expect(a.gen.index != slot);
+    } else |e| switch (e) {
+        // An empty action table is reported as ENOENT, not an empty dump.
+        error.NotFound => {},
+        else => return e,
+    }
+}
+
 test "integration (netns/root): tbf shaping qdisc round-trip" {
     var sock = try openOrSkip();
     defer sock.close();
@@ -1000,6 +1357,7 @@ test {
     _ = ratespec;
     _ = qdisc;
     _ = filter;
+    _ = action;
     _ = message;
     _ = @import("goldens.zig");
 }
