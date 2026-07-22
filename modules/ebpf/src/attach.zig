@@ -4,26 +4,46 @@
 //! every constraint below is "which syscalls, in which order, with which
 //! struct fields", unlike `programs.zig`'s bytecode generation.
 //!
-//! Three hooks are implemented, each with its own lifetime rule — the single
-//! most important thing to get right, because two of the three OUTLIVE this
+//! Six hooks are implemented, each with its own lifetime rule — the single
+//! most important thing to get right, because two of them OUTLIVE this
 //! process if not explicitly torn down:
 //!
 //! | hook | syscall path | detach | survives process exit? |
 //! |---|---|---|---|
-//! | kprobe / kretprobe | `perf_event_open` (kprobe PMU) + `ioctl(SET_BPF)` + `ioctl(ENABLE)` | close the perf fd | **no** — the kernel tears the probe down with the fd |
-//! | XDP | netlink `RTM_SETLINK` + nested `IFLA_XDP` | `RTM_SETLINK` with `IFLA_XDP_FD = -1` | **yes** — the link holds a program reference |
-//! | cgroup | `bpf(BPF_PROG_ATTACH)` | `bpf(BPF_PROG_DETACH)` | **yes** — the cgroup holds a program reference |
+//! | kprobe / kretprobe | `perf_event_open` (kprobe PMU) + link-or-`ioctl(SET_BPF)` + `ioctl(ENABLE)` | close the fd(s) | **no** — the kernel tears the probe down with the fd |
+//! | uprobe / uretprobe | `perf_event_open` (uprobe PMU, `config1` = a PATH, `config2` = a FILE OFFSET) + same binding step | close the fd(s) | **no** |
+//! | tracepoint | `/sys/kernel/tracing/events/<cat>/<name>/id` + `perf_event_open(PERF_TYPE_TRACEPOINT)` + same binding step | close the fd(s) | **no** |
+//! | raw tracepoint | `bpf(BPF_RAW_TRACEPOINT_OPEN)` — no perf event at all | close the fd | **no** |
+//! | XDP | netlink `RTM_SETLINK` + nested `IFLA_XDP`, **or** `bpf(BPF_LINK_CREATE)` | `IFLA_XDP_FD = -1` / close the link fd | **yes** for netlink, **no** for a link |
+//! | cgroup | `bpf(BPF_PROG_ATTACH)`, **or** `bpf(BPF_LINK_CREATE)` | `bpf(BPF_PROG_DETACH)` / close the link fd | **yes** for PROG_ATTACH, **no** for a link |
 //!
-//! So a `KprobeHandle` is a pure RAII fd wrapper, while `XdpHandle` and
-//! `CgroupHandle` describe attachments that persist in the kernel until
-//! someone asks for them to go away: dropping one without `detach()` leaks a
-//! live attachment (an XDP program on a NIC / a filter on a cgroup), not just
-//! a file descriptor. `Link` unifies the three behind one `detach()`.
+//! So `KprobeHandle`/`PerfEventHandle`/`RawTracepointHandle` are pure RAII fd
+//! wrappers, while `XdpHandle` and `CgroupHandle` describe attachments that
+//! persist in the kernel until someone asks for them to go away: dropping one
+//! without `detach()` leaks a live attachment (an XDP program on a NIC / a
+//! filter on a cgroup), not just a file descriptor. `Link` unifies all six
+//! behind one `detach()`.
+//!
+//! ## Legacy path vs. `BPF_LINK_CREATE`
+//!
+//! Four of the six hooks have a modern, fd-lifetimed alternative (see
+//! `bpflink.zig`). Where both exist this module **prefers the link** and
+//! falls back to the legacy path — but never silently: every such entry
+//! point reports an `AttachPath` (`.bpf_link` or `.legacy`), and
+//! `LinkPreference` lets a caller force either one so both branches are
+//! reachable from a test. The fallback matters because perf-event links need
+//! kernel >= 5.15 and answer plain `EINVAL` before that, which is
+//! indistinguishable from "bad arguments" (see `bpflink.zig`'s header).
+//!
+//! The one place the default is deliberately NOT the link is `attachXdp`:
+//! its netlink attachment is what `ip link show`/`bpftool net` display, and
+//! changing that default would change what an operator sees. `attachXdpAuto`
+//! is the opt-in link-preferring variant.
 //!
 //! Everything here needs privilege: `CAP_BPF` at minimum, plus
-//! `CAP_PERFMON`/`CAP_SYS_ADMIN` for the kprobe PMU and `CAP_NET_ADMIN` for
-//! XDP. Every gated test in this file SKIPS (printing why) rather than
-//! failing when the privilege is absent.
+//! `CAP_PERFMON`/`CAP_SYS_ADMIN` for the kprobe/uprobe PMUs and tracepoints,
+//! and `CAP_NET_ADMIN` for XDP. Every gated test in this file SKIPS
+//! (printing why) rather than failing when the privilege is absent.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -31,6 +51,8 @@ const linux = std.os.linux;
 const BPF = linux.BPF;
 const netlink = @import("netlink");
 const codec = netlink.codec;
+const bpflink = @import("bpflink.zig");
+const elfsym = @import("elfsym.zig");
 
 const native_endian = builtin.cpu.arch.endian();
 
@@ -64,6 +86,18 @@ pub const PERF_FLAG_FD_CLOEXEC: usize = 1 << 3;
 
 const kprobe_pmu_type_path = "/sys/bus/event_source/devices/kprobe/type";
 const kprobe_retprobe_fmt_path = "/sys/bus/event_source/devices/kprobe/format/retprobe";
+const uprobe_pmu_type_path = "/sys/bus/event_source/devices/uprobe/type";
+const uprobe_retprobe_fmt_path = "/sys/bus/event_source/devices/uprobe/format/retprobe";
+const uprobe_ref_ctr_fmt_path = "/sys/bus/event_source/devices/uprobe/format/ref_ctr_offset";
+
+/// Where the kernel exposes static tracepoints. The first is the modern
+/// mount (`tracefs`, since 4.1); the second is the historical location under
+/// `debugfs`, still what a kernel with only `CONFIG_DEBUG_FS` tracing offers
+/// and what plenty of older distros mount. Tried in this order.
+const tracefs_roots = [_][]const u8{
+    "/sys/kernel/tracing",
+    "/sys/kernel/debug/tracing",
+};
 
 /// `RTM_SETLINK` (`linux/rtnetlink.h`) — not re-exported by the sibling
 /// `netlink` module (which only needs the `RTM_GET*`/`RTM_NEW*` pairs).
@@ -98,8 +132,33 @@ pub const XDP_FLAGS = struct {
 // ── the uniform attachment handle ───────────────────────────────────────────
 
 /// Errors any `Link.detach()` can produce (the union of the per-hook detach
-/// error sets; a kprobe detach cannot fail).
+/// error sets; kprobe/perf-event/raw-tracepoint/BPF-link detaches are all
+/// just `close()` and cannot fail).
 pub const DetachError = XdpAttachError || CgroupAttachError;
+
+/// Which of the two attach mechanisms an entry point ended up using. Returned
+/// rather than inferred so a fallback is observable — a silent fallback is
+/// how a caller ends up with an attachment whose lifetime rules are not the
+/// ones it reasoned about.
+pub const AttachPath = enum {
+    /// `bpf(BPF_LINK_CREATE)` — fd-lifetimed, dies with this process.
+    bpf_link,
+    /// The pre-link syscall for this hook (`ioctl(SET_BPF)`, netlink
+    /// `IFLA_XDP`, `BPF_PROG_ATTACH`).
+    legacy,
+};
+
+/// How hard to try for a `BPF_LINK_CREATE` attachment.
+pub const LinkPreference = enum {
+    /// Try the link; fall back to the legacy path if the kernel says no.
+    auto,
+    /// Link or nothing (`error.LinkNotSupported` on an older kernel). Makes
+    /// the link branch testable in isolation.
+    link_only,
+    /// Never attempt a link. Makes the fallback branch testable in isolation
+    /// even on a kernel that does support links.
+    legacy_only,
+};
 
 /// A live attachment, whatever its kind. Always either `detach()`ed (which
 /// reports failures) or `deinit()`ed (best-effort, for `defer`) — see the
@@ -108,6 +167,13 @@ pub const Link = union(enum) {
     kprobe: KprobeHandle,
     xdp: XdpHandle,
     cgroup: CgroupHandle,
+    /// uprobe / uretprobe / tracepoint (and any other perf-event-backed
+    /// probe) — see `PerfEventHandle`.
+    perf_event: PerfEventHandle,
+    /// `BPF_RAW_TRACEPOINT_OPEN`.
+    raw_tracepoint: RawTracepointHandle,
+    /// A `bpf(BPF_LINK_CREATE)` link, whatever it points at.
+    bpf_link: bpflink.LinkHandle,
 
     /// Tear the attachment down, reporting failures. Idempotent: a second
     /// call on an already-detached link is a no-op.
@@ -116,6 +182,9 @@ pub const Link = union(enum) {
             .kprobe => |*h| h.detach(),
             .xdp => |*h| try h.detach(),
             .cgroup => |*h| try h.detach(),
+            .perf_event => |*h| h.detach(),
+            .raw_tracepoint => |*h| h.detach(),
+            .bpf_link => |*h| h.detach(),
         }
     }
 
@@ -123,6 +192,12 @@ pub const Link = union(enum) {
     /// `detach()` where the caller can act on a failure.
     pub fn deinit(self: *Link) void {
         self.detach() catch {};
+    }
+
+    /// Wrap a raw `bpflink.LinkHandle` (e.g. one obtained from
+    /// `bpflink.linkGetFdById`) in the uniform handle.
+    pub fn fromBpfLink(h: bpflink.LinkHandle) Link {
+        return .{ .bpf_link = h };
     }
 };
 
@@ -139,6 +214,10 @@ pub const KprobeAttachError = error{
     PermissionDenied,
     OutOfMemory,
     SystemResources,
+    /// `link_preference = .link_only` but this kernel has no perf-event
+    /// links (needs >= 5.15), or a non-zero `bpf_cookie` was requested and
+    /// the attach had to fall back to the cookie-less legacy path.
+    LinkNotSupported,
     Unexpected,
 };
 
@@ -167,17 +246,40 @@ pub const KprobeOptions = struct {
     /// cpu 0, one fd. Per-CPU fd fan-out is needed for perf *sampling*
     /// buffers, not for BPF kprobe attachment.)
     cpu: i32 = 0,
+    /// Prefer `BPF_LINK_CREATE` (kernel >= 5.15) over
+    /// `ioctl(PERF_EVENT_IOC_SET_BPF)`, falling back when unavailable. The
+    /// resulting `KprobeHandle.path` says which one happened.
+    link_preference: LinkPreference = .auto,
+    /// An opaque value the program reads back with `bpf_get_attach_cookie()`
+    /// — how one program tells N attachments apart. Only the link path can
+    /// carry it, so a non-zero cookie turns a fallback into
+    /// `error.LinkNotSupported` rather than silently dropping it.
+    bpf_cookie: u64 = 0,
 };
 
-/// An attached kprobe: the open perf-event fd. Detach = close it — the kernel
-/// tears down the dynamic probe AND the BPF attachment together, and does so
-/// automatically if the process dies, so this handle cannot leak a kernel-side
-/// attachment (only an fd).
+/// An attached kprobe: the open perf-event fd (plus, when the modern path
+/// was taken, the BPF link fd that binds the program to it). Detach = close
+/// them — the kernel tears down the dynamic probe AND the BPF attachment
+/// together, and does so automatically if the process dies, so this handle
+/// cannot leak a kernel-side attachment (only fds).
 pub const KprobeHandle = struct {
     perf_fd: linux.fd_t,
+    /// The `BPF_LINK_CREATE` fd binding the program to `perf_fd`, or `-1`
+    /// when the legacy `ioctl(PERF_EVENT_IOC_SET_BPF)` path was used.
+    /// Defaulted so pre-existing `.{ .perf_fd = … }` literals still compile.
+    link_fd: linux.fd_t = -1,
+    /// Which binding path this attachment actually took.
+    path: AttachPath = .legacy,
 
-    /// Disable and close the perf event. Idempotent.
+    /// Disable and close the perf event (and the link, if any). Idempotent.
     pub fn detach(self: *KprobeHandle) void {
+        // Close the link FIRST: it holds a reference to the perf event, and
+        // dropping the binding before the event is the order that leaves no
+        // window in which a half-torn-down attachment is observable.
+        if (self.link_fd >= 0) {
+            _ = linux.close(self.link_fd);
+            self.link_fd = -1;
+        }
         if (self.perf_fd < 0) return;
         _ = linux.ioctl(self.perf_fd, PERF_EVENT_IOC.DISABLE, 0);
         _ = linux.close(self.perf_fd);
@@ -272,18 +374,96 @@ pub fn attachKprobeOpts(
     var handle: KprobeHandle = .{ .perf_fd = perf_fd };
     errdefer handle.detach();
 
-    switch (linux.errno(linux.ioctl(perf_fd, PERF_EVENT_IOC.SET_BPF, @as(usize, @intCast(prog_fd))))) {
-        .SUCCESS => {},
-        .ACCES, .PERM => return error.PermissionDenied,
-        .NOMEM => return error.SystemResources,
-        else => return error.Unexpected,
+    const binding = try bindPerfEvent(perf_fd, prog_fd, opts.link_preference, opts.bpf_cookie);
+    handle.link_fd = binding.link_fd;
+    handle.path = binding.path;
+    return handle;
+}
+
+// ── binding a program to an already-open perf event ─────────────────────────
+
+/// The result of `bindPerfEvent`: which path was taken and, when it was the
+/// link path, the link fd the caller now owns.
+pub const PerfBinding = struct {
+    /// `-1` on the legacy path.
+    link_fd: linux.fd_t = -1,
+    path: AttachPath,
+};
+
+/// Errors the shared perf-event binding step can produce. A subset of every
+/// perf-backed hook's error set, so `attachKprobe`/`attachUprobe`/
+/// `attachTracepoint` can all funnel through one implementation.
+pub const PerfAttachError = error{
+    PermissionDenied,
+    SystemResources,
+    /// `.link_only` was requested on a kernel without perf-event links, or a
+    /// `bpf_cookie` was requested and the link path was unavailable.
+    LinkNotSupported,
+    Unexpected,
+};
+
+/// Attach `prog_fd` to an already-open perf event fd and arm the event.
+///
+/// This is the single place the "prefer link, fall back to ioctl" decision
+/// lives, shared by kprobe, uprobe and tracepoint — all three are perf
+/// events underneath, and libbpf likewise routes them through one
+/// `bpf_program__attach_perf_event_opts`. The order matters and matches
+/// libbpf's: bind first (link OR ioctl), then `PERF_EVENT_IOC_ENABLE` in
+/// BOTH cases — an event armed before it has a program attached would run
+/// the probe with nothing behind it.
+pub fn bindPerfEvent(
+    perf_fd: linux.fd_t,
+    prog_fd: linux.fd_t,
+    pref: LinkPreference,
+    bpf_cookie: u64,
+) PerfAttachError!PerfBinding {
+    var link_fd: linux.fd_t = -1;
+    var path: AttachPath = .legacy;
+
+    if (pref != .legacy_only) {
+        if (bpflink.linkCreatePerfEvent(prog_fd, perf_fd, bpf_cookie)) |h| {
+            link_fd = h.fd;
+            path = .bpf_link;
+        } else |err| switch (err) {
+            // The only genuinely retryable case: an old kernel (or one that
+            // rejects the attach type) — see bpflink.zig on why this is
+            // EINVAL and therefore ambiguous.
+            error.LinkNotSupported, error.InvalidTarget, error.AlreadyAttached, error.Unexpected => {
+                if (pref == .link_only) return error.LinkNotSupported;
+            },
+            error.PermissionDenied => return error.PermissionDenied,
+            error.SystemResources => return error.SystemResources,
+        }
     }
+
+    if (path == .legacy) {
+        // A cookie only exists in the link ABI; falling back would drop it
+        // without the caller ever knowing, so refuse instead.
+        if (bpf_cookie != 0) return error.LinkNotSupported;
+        // `@bitCast` rather than `@intCast`: the ioctl argument is a plain
+        // machine word, and a caller-supplied negative fd must reach the
+        // kernel as EBADF, not trip a safety panic on the way there.
+        const arg: usize = @bitCast(@as(isize, prog_fd));
+        switch (linux.errno(linux.ioctl(perf_fd, PERF_EVENT_IOC.SET_BPF, arg))) {
+            .SUCCESS => {},
+            .ACCES, .PERM => return error.PermissionDenied,
+            .NOMEM => return error.SystemResources,
+            else => return error.Unexpected,
+        }
+    }
+
     switch (linux.errno(linux.ioctl(perf_fd, PERF_EVENT_IOC.ENABLE, 0))) {
         .SUCCESS => {},
-        .ACCES, .PERM => return error.PermissionDenied,
-        else => return error.Unexpected,
+        .ACCES, .PERM => {
+            if (link_fd >= 0) _ = linux.close(link_fd);
+            return error.PermissionDenied;
+        },
+        else => {
+            if (link_fd >= 0) _ = linux.close(link_fd);
+            return error.Unexpected;
+        },
     }
-    return handle;
+    return .{ .link_fd = link_fd, .path = path };
 }
 
 /// The `perf_event_attr` a kprobe attach hands to `perf_event_open` — split
@@ -362,6 +542,499 @@ fn readSmallFile(path: [*:0]const u8, buf: []u8) ?[]u8 {
     return buf[0..n];
 }
 
+// ── the perf-event-backed probe handle (uprobe / tracepoint) ────────────────
+
+/// A perf-event-backed attachment that is not a kprobe: a uprobe,
+/// uretprobe or static tracepoint. Same lifetime rule as `KprobeHandle` —
+/// closing the fds detaches, and process exit does it for you — kept as its
+/// own type because `kprobe` is the wrong word for a userspace probe and a
+/// handle that lies about what it holds is a documentation bug waiting to
+/// happen.
+pub const PerfEventHandle = struct {
+    perf_fd: linux.fd_t,
+    /// The `BPF_LINK_CREATE` fd, or `-1` on the legacy ioctl path.
+    link_fd: linux.fd_t = -1,
+    path: AttachPath = .legacy,
+    kind: Kind,
+
+    pub const Kind = enum { uprobe, uretprobe, tracepoint, perf_event };
+
+    /// Disable and close the perf event (and the link, if any). Idempotent.
+    pub fn detach(self: *PerfEventHandle) void {
+        if (self.link_fd >= 0) {
+            _ = linux.close(self.link_fd);
+            self.link_fd = -1;
+        }
+        if (self.perf_fd < 0) return;
+        _ = linux.ioctl(self.perf_fd, PERF_EVENT_IOC.DISABLE, 0);
+        _ = linux.close(self.perf_fd);
+        self.perf_fd = -1;
+    }
+
+    pub fn deinit(self: *PerfEventHandle) void {
+        self.detach();
+    }
+
+    pub fn close(self: *PerfEventHandle) void {
+        self.detach();
+    }
+
+    pub fn link(self: PerfEventHandle) Link {
+        return .{ .perf_event = self };
+    }
+};
+
+// ── uprobe / uretprobe attach ───────────────────────────────────────────────
+
+pub const UprobeAttachError = error{
+    /// `/sys/bus/event_source/devices/uprobe/type` is missing (a kernel
+    /// without `CONFIG_UPROBE_EVENTS`) or unreadable.
+    UprobePmuUnavailable,
+    /// `binary_path` is empty or contains an interior NUL.
+    InvalidPath,
+    /// Neither a `symbol` nor an explicit `offset` was given.
+    NoProbeSite,
+    /// The kernel refused the (inode, offset) pair — typically an offset
+    /// that is not an instruction boundary, or a file it cannot probe.
+    ProbeSiteRejected,
+    PermissionDenied,
+    SystemResources,
+    LinkNotSupported,
+    OutOfMemory,
+    Unexpected,
+} || elfsym.ResolveError;
+
+pub const UprobeOptions = struct {
+    /// Probe the function's RETURN instead of its entry (uretprobe).
+    retprobe: bool = false,
+    /// Skip symbol resolution and probe this **file offset** directly. When
+    /// null, the `symbol` argument is resolved through `elfsym`. Exactly one
+    /// of the two must be present.
+    offset: ?u64 = null,
+    /// Extra bytes past the resolved symbol's start (ignored when `offset`
+    /// is given, which is already absolute).
+    symbol_offset: u64 = 0,
+    /// USDT "semaphore" address: the file offset of a `unsigned short` the
+    /// kernel increments while the probe is installed, so an instrumented
+    /// program can cheaply skip building arguments when nobody is listening.
+    /// 0 = none. Encoded into `perf_event_attr.config`'s high bits at the
+    /// position the uprobe PMU declares in `format/ref_ctr_offset`.
+    ref_ctr_offset: u64 = 0,
+    /// `-1` = every process that maps the file; a pid restricts it to one.
+    pid: i32 = -1,
+    /// CPU for the system-wide case — same reasoning as `KprobeOptions.cpu`.
+    cpu: i32 = 0,
+    link_preference: LinkPreference = .auto,
+    bpf_cookie: u64 = 0,
+};
+
+/// Attach `prog_fd` to the entry of `symbol` in the executable or shared
+/// library at `binary_path`. `prog_fd` must have been loaded with
+/// `prog_type = .kprobe` (uprobes reuse `BPF_PROG_TYPE_KPROBE`; there is no
+/// separate uprobe program type).
+///
+/// The one non-obvious step is that the kernel wants a **file offset**, not
+/// the symbol's virtual address — see `elfsym.zig`, which exists entirely
+/// for that conversion.
+pub fn attachUprobe(
+    gpa: std.mem.Allocator,
+    binary_path: []const u8,
+    symbol: []const u8,
+    prog_fd: linux.fd_t,
+) UprobeAttachError!PerfEventHandle {
+    return attachUprobeOpts(gpa, binary_path, symbol, prog_fd, .{});
+}
+
+/// `attachUprobe` with `retprobe = true`: fire on the probed function's
+/// return.
+pub fn attachUretprobe(
+    gpa: std.mem.Allocator,
+    binary_path: []const u8,
+    symbol: []const u8,
+    prog_fd: linux.fd_t,
+) UprobeAttachError!PerfEventHandle {
+    return attachUprobeOpts(gpa, binary_path, symbol, prog_fd, .{ .retprobe = true });
+}
+
+/// `attachUprobe` with every knob exposed. `symbol` may be empty when
+/// `opts.offset` is given.
+pub fn attachUprobeOpts(
+    gpa: std.mem.Allocator,
+    binary_path: []const u8,
+    symbol: []const u8,
+    prog_fd: linux.fd_t,
+    opts: UprobeOptions,
+) UprobeAttachError!PerfEventHandle {
+    if (comptime builtin.os.tag != .linux)
+        @compileError("ebpf.attachUprobe is Linux-only (perf_event_open + BPF)");
+
+    if (binary_path.len == 0) return error.InvalidPath;
+    if (std.mem.indexOfScalar(u8, binary_path, 0) != null) return error.InvalidPath;
+    if (opts.offset == null and symbol.len == 0) return error.NoProbeSite;
+
+    const offset: u64 = if (opts.offset) |o| o else blk: {
+        const sym = try elfsym.resolveFunc(gpa, binary_path, symbol);
+        break :blk sym.file_offset + opts.symbol_offset;
+    };
+
+    const pmu_type = try uprobePmuType();
+    const retprobe_bit = uprobeRetprobeBit();
+    const ref_ctr_shift = uprobeRefCtrShift();
+
+    const path_z = gpa.dupeZ(u8, binary_path) catch return error.OutOfMemory;
+    defer gpa.free(path_z);
+
+    var attr = buildUprobeAttr(
+        pmu_type,
+        retprobe_bit,
+        opts.retprobe,
+        path_z.ptr,
+        offset,
+        opts.ref_ctr_offset,
+        ref_ctr_shift,
+    );
+
+    const pid: linux.pid_t = if (opts.pid < 0) -1 else opts.pid;
+    const cpu: i32 = if (opts.pid < 0) opts.cpu else -1;
+
+    const rc = linux.perf_event_open(&attr, pid, cpu, -1, PERF_FLAG_FD_CLOEXEC);
+    switch (linux.errno(rc)) {
+        .SUCCESS => {},
+        .ACCES, .PERM => return error.PermissionDenied,
+        // A path the kernel cannot probe, or an offset it rejects.
+        .NOENT, .INVAL, .BADF, .ISDIR => return error.ProbeSiteRejected,
+        .OPNOTSUPP, .NODEV => return error.UprobePmuUnavailable,
+        .MFILE, .NFILE, .NOMEM, .NOSPC => return error.SystemResources,
+        else => return error.Unexpected,
+    }
+    const perf_fd: linux.fd_t = @intCast(rc);
+    var handle: PerfEventHandle = .{
+        .perf_fd = perf_fd,
+        .kind = if (opts.retprobe) .uretprobe else .uprobe,
+    };
+    errdefer handle.detach();
+
+    const binding = try bindPerfEvent(perf_fd, prog_fd, opts.link_preference, opts.bpf_cookie);
+    handle.link_fd = binding.link_fd;
+    handle.path = binding.path;
+    return handle;
+}
+
+/// The `perf_event_attr` a uprobe attach hands to `perf_event_open` — pure,
+/// so its layout is testable without any privilege.
+///
+/// The union aliasing differs from the kprobe case in WHAT the fields mean,
+/// not where they are: `config1` is `uprobe_path` (a C string pointer to the
+/// **binary**, not a symbol) and `config2` is `probe_offset` (a **file
+/// offset**, not a delta from a symbol). `config` carries the retprobe bit
+/// and, in its high half, the `ref_ctr_offset`.
+///
+/// `path_z` must stay alive across the `perf_event_open` call: the kernel
+/// copies the string in during the syscall.
+pub fn buildUprobeAttr(
+    pmu_type: u32,
+    retprobe_bit: u6,
+    retprobe: bool,
+    path_z: [*:0]const u8,
+    offset: u64,
+    ref_ctr_offset: u64,
+    ref_ctr_shift: u6,
+) linux.perf_event_attr {
+    var attr: linux.perf_event_attr = .{
+        .type = @enumFromInt(pmu_type),
+        .size = @sizeOf(linux.perf_event_attr),
+        .config = 0,
+    };
+    if (retprobe) attr.config |= @as(u64, 1) << retprobe_bit;
+    if (ref_ctr_offset != 0) attr.config |= ref_ctr_offset << ref_ctr_shift;
+    attr.config1 = @intFromPtr(path_z);
+    attr.config2 = offset;
+    return attr;
+}
+
+/// Read the uprobe PMU's kernel-assigned `type` id.
+fn uprobePmuType() UprobeAttachError!u32 {
+    var buf: [32]u8 = undefined;
+    const raw = readSmallFile(uprobe_pmu_type_path, &buf) orelse return error.UprobePmuUnavailable;
+    const text = std.mem.trim(u8, raw, " \t\r\n");
+    return std.fmt.parseInt(u32, text, 10) catch error.UprobePmuUnavailable;
+}
+
+/// Bit position of the retprobe flag inside `config` (`"config:N"`).
+fn uprobeRetprobeBit() u6 {
+    return configShift(uprobe_retprobe_fmt_path, 0);
+}
+
+/// Low bit of the `ref_ctr_offset` field inside `config`
+/// (`"config:32-63"` on every kernel that has the feature).
+fn uprobeRefCtrShift() u6 {
+    return configShift(uprobe_ref_ctr_fmt_path, 32);
+}
+
+/// Parse a PMU `format/*` file of the form `"config:N"` or `"config:N-M"`
+/// and return `N`. Falls back to `default` when the file is missing or
+/// unparseable — every kernel that has ever shipped these uses the same
+/// positions, but the kernel DECLARES them, so read rather than assume.
+fn configShift(path: [*:0]const u8, default: u6) u6 {
+    var buf: [64]u8 = undefined;
+    const raw = readSmallFile(path, &buf) orelse return default;
+    return parseConfigShift(raw, default);
+}
+
+/// The parsing half of `configShift`, split out so the `"config:N"` /
+/// `"config:N-M"` grammar is testable without sysfs.
+pub fn parseConfigShift(raw: []const u8, default: u6) u6 {
+    const text = std.mem.trim(u8, raw, " \t\r\n");
+    const prefix = "config:";
+    if (!std.mem.startsWith(u8, text, prefix)) return default;
+    const rest = text[prefix.len..];
+    const end = std.mem.indexOfScalar(u8, rest, '-') orelse rest.len;
+    return std.fmt.parseInt(u6, rest[0..end], 10) catch default;
+}
+
+// ── static tracepoint attach (PERF_TYPE_TRACEPOINT) ─────────────────────────
+
+pub const TracepointAttachError = error{
+    /// No tracefs is mounted (`/sys/kernel/tracing` and the legacy
+    /// `/sys/kernel/debug/tracing` are both absent or unreadable).
+    TracingUnavailable,
+    /// The `<category>/<name>` pair has no `id` file.
+    TracepointNotFound,
+    /// A category/name containing `/`, `..` or a NUL — refused before it can
+    /// be pasted into a path.
+    InvalidName,
+    PermissionDenied,
+    SystemResources,
+    LinkNotSupported,
+    Unexpected,
+};
+
+pub const TracepointOptions = struct {
+    pid: i32 = -1,
+    cpu: i32 = 0,
+    link_preference: LinkPreference = .auto,
+    bpf_cookie: u64 = 0,
+};
+
+/// Attach `prog_fd` to the static tracepoint `<category>/<name>` (e.g.
+/// `"syscalls"`, `"sys_enter_write"`). `prog_fd` must have been loaded with
+/// `prog_type = .tracepoint`.
+///
+/// Unlike a kprobe there is no dynamic probe to create: the tracepoint
+/// already exists and merely has to be named by its kernel-assigned numeric
+/// id, read from `<tracefs>/events/<category>/<name>/id`. That id goes in
+/// `config` of a `PERF_TYPE_TRACEPOINT` event — a STATIC perf type, so
+/// unlike the kprobe/uprobe PMUs nothing has to be looked up in
+/// `/sys/bus/event_source/`.
+pub fn attachTracepoint(
+    gpa: std.mem.Allocator,
+    category: []const u8,
+    name: []const u8,
+    prog_fd: linux.fd_t,
+) TracepointAttachError!PerfEventHandle {
+    return attachTracepointOpts(gpa, category, name, prog_fd, .{});
+}
+
+/// `attachTracepoint` with every knob exposed.
+pub fn attachTracepointOpts(
+    gpa: std.mem.Allocator,
+    category: []const u8,
+    name: []const u8,
+    prog_fd: linux.fd_t,
+    opts: TracepointOptions,
+) TracepointAttachError!PerfEventHandle {
+    if (comptime builtin.os.tag != .linux)
+        @compileError("ebpf.attachTracepoint is Linux-only (perf_event_open + BPF)");
+    _ = gpa; // no allocation needed: the id path fits a fixed buffer
+
+    const id = try tracepointId(category, name);
+    var attr = buildTracepointAttr(id);
+
+    const pid: linux.pid_t = if (opts.pid < 0) -1 else opts.pid;
+    const cpu: i32 = if (opts.pid < 0) opts.cpu else -1;
+
+    const rc = linux.perf_event_open(&attr, pid, cpu, -1, PERF_FLAG_FD_CLOEXEC);
+    switch (linux.errno(rc)) {
+        .SUCCESS => {},
+        .ACCES, .PERM => return error.PermissionDenied,
+        .NOENT, .INVAL => return error.TracepointNotFound,
+        .MFILE, .NFILE, .NOMEM, .NOSPC => return error.SystemResources,
+        else => return error.Unexpected,
+    }
+    const perf_fd: linux.fd_t = @intCast(rc);
+    var handle: PerfEventHandle = .{ .perf_fd = perf_fd, .kind = .tracepoint };
+    errdefer handle.detach();
+
+    const binding = try bindPerfEvent(perf_fd, prog_fd, opts.link_preference, opts.bpf_cookie);
+    handle.link_fd = binding.link_fd;
+    handle.path = binding.path;
+    return handle;
+}
+
+/// The `perf_event_attr` a tracepoint attach builds. `sample_period = 1` and
+/// `wakeup_events = 1` are what libbpf sends; they are irrelevant to a BPF
+/// attachment (no samples are read from THIS event — a program's output goes
+/// to a ringbuf/perfbuf map) but a period of 0 makes the kernel treat the
+/// event as a counter, which is not what a tracepoint attach wants.
+pub fn buildTracepointAttr(id: u64) linux.perf_event_attr {
+    var attr: linux.perf_event_attr = .{
+        .type = .TRACEPOINT,
+        .size = @sizeOf(linux.perf_event_attr),
+        .config = id,
+    };
+    attr.sample_period_or_freq = 1;
+    attr.wakeup_events_or_watermark = 1;
+    return attr;
+}
+
+/// Read a tracepoint's kernel-assigned numeric id from tracefs. Tries the
+/// modern mount first, then the legacy debugfs location.
+pub fn tracepointId(category: []const u8, name: []const u8) TracepointAttachError!u64 {
+    try validateTracepointComponent(category);
+    try validateTracepointComponent(name);
+
+    var saw_root = false;
+    for (tracefs_roots) |root| {
+        var path_buf: [512]u8 = undefined;
+        const path = std.fmt.bufPrintZ(
+            &path_buf,
+            "{s}/events/{s}/{s}/id",
+            .{ root, category, name },
+        ) catch return error.InvalidName;
+
+        var buf: [32]u8 = undefined;
+        const raw = readSmallFile(path.ptr, &buf) orelse continue;
+        saw_root = true;
+        const text = std.mem.trim(u8, raw, " \t\r\n");
+        return std.fmt.parseInt(u64, text, 10) catch error.TracepointNotFound;
+    }
+    // Distinguish "no tracefs at all" (which is a system configuration
+    // problem) from "that tracepoint does not exist" (a caller problem).
+    for (tracefs_roots) |root| {
+        var path_buf: [512]u8 = undefined;
+        const probe = std.fmt.bufPrintZ(&path_buf, "{s}/events", .{root}) catch continue;
+        const rc = linux.open(probe.ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
+        if (linux.errno(rc) == .SUCCESS) {
+            _ = linux.close(@intCast(rc));
+            return error.TracepointNotFound;
+        }
+    }
+    return error.TracingUnavailable;
+}
+
+/// A tracepoint category/name is pasted straight into a path, so anything
+/// that could escape the `events/` directory — or truncate the string — is
+/// refused rather than sanitized.
+fn validateTracepointComponent(s: []const u8) TracepointAttachError!void {
+    if (s.len == 0 or s.len > 128) return error.InvalidName;
+    if (std.mem.indexOfScalar(u8, s, 0) != null) return error.InvalidName;
+    if (std.mem.indexOfScalar(u8, s, '/') != null) return error.InvalidName;
+    if (std.mem.eql(u8, s, ".") or std.mem.eql(u8, s, "..")) return error.InvalidName;
+    for (s) |c| {
+        const ok = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+            (c >= '0' and c <= '9') or c == '_' or c == '-' or c == '.' or c == ':';
+        if (!ok) return error.InvalidName;
+    }
+}
+
+// ── raw tracepoint attach (BPF_RAW_TRACEPOINT_OPEN) ─────────────────────────
+
+pub const RawTracepointAttachError = error{
+    /// No tracepoint by that name, or the program's type/expected attach
+    /// target does not match it.
+    TracepointNotFound,
+    /// The name is empty, over-long, or contains an interior NUL.
+    InvalidName,
+    PermissionDenied,
+    AlreadyAttached,
+    SystemResources,
+    OutOfMemory,
+    Unexpected,
+};
+
+/// A raw-tracepoint attachment: one fd from `bpf(BPF_RAW_TRACEPOINT_OPEN)`.
+/// **No perf event is involved at all** — this is the one probe hook that is
+/// a plain `bpf()` command. Closing the fd detaches; process exit does it
+/// for you.
+pub const RawTracepointHandle = struct {
+    fd: linux.fd_t,
+
+    /// Close the fd. Idempotent.
+    pub fn detach(self: *RawTracepointHandle) void {
+        if (self.fd < 0) return;
+        _ = linux.close(self.fd);
+        self.fd = -1;
+    }
+
+    pub fn deinit(self: *RawTracepointHandle) void {
+        self.detach();
+    }
+
+    pub fn close(self: *RawTracepointHandle) void {
+        self.detach();
+    }
+
+    pub fn link(self: RawTracepointHandle) Link {
+        return .{ .raw_tracepoint = self };
+    }
+};
+
+/// Attach `prog_fd` to the raw tracepoint `name` (the bare tracepoint name,
+/// e.g. `"sys_enter"` — no category prefix, unlike `attachTracepoint`).
+///
+/// Raw tracepoints hand the program the tracepoint's ARGUMENTS as a
+/// `struct bpf_raw_tracepoint_args { __u64 args[0]; }` instead of the
+/// pre-formatted, ABI-frozen trace-event record a `PERF_TYPE_TRACEPOINT`
+/// program sees; they are therefore cheaper (no record formatting) and
+/// closer to the kernel's own types, at the cost of no stable field layout.
+///
+/// Program types this accepts:
+/// - `.raw_tracepoint` — read-only args.
+/// - `.raw_tracepoint_writable` (`raw_tp.w` in libbpf's section naming) —
+///   the last argument is a writable buffer, for tracepoints declared with
+///   `DECLARE_TRACE_WRITABLE`. Same syscall, same handle; only the program
+///   type at load time differs, which is why it costs nothing extra here.
+/// - `.tracing` with `expected_attach_type = trace_raw_tp` (BTF-typed
+///   `tp_btf`) — accepted by the kernel through this same command, but the
+///   program must already carry an `attach_btf_id` set at load time, which
+///   needs a BTF parser this module does not have (see `SPEC.md`).
+pub fn attachRawTracepoint(
+    gpa: std.mem.Allocator,
+    name: []const u8,
+    prog_fd: linux.fd_t,
+) RawTracepointAttachError!RawTracepointHandle {
+    if (comptime builtin.os.tag != .linux)
+        @compileError("ebpf.attachRawTracepoint is Linux-only (bpf() raw syscall)");
+
+    if (name.len == 0 or name.len > 128) return error.InvalidName;
+    if (std.mem.indexOfScalar(u8, name, 0) != null) return error.InvalidName;
+
+    const name_z = gpa.dupeZ(u8, name) catch return error.OutOfMemory;
+    defer gpa.free(name_z);
+
+    var attr = buildRawTracepointAttr(name_z.ptr, prog_fd);
+    const rc = linux.bpf(.raw_tracepoint_open, &attr, @sizeOf(BPF.RawTracepointAttr));
+    switch (linux.errno(rc)) {
+        .SUCCESS => return .{ .fd = @intCast(rc) },
+        .ACCES, .PERM => return error.PermissionDenied,
+        .EXIST, .BUSY => return error.AlreadyAttached,
+        .NOENT, .INVAL, .BADF => return error.TracepointNotFound,
+        .NOMEM, .MFILE, .NFILE => return error.SystemResources,
+        else => return error.Unexpected,
+    }
+}
+
+/// The `BPF_RAW_TRACEPOINT_OPEN` attr — pure, so the union member layout is
+/// testable without `CAP_BPF`. `name_z` must outlive the syscall.
+pub fn buildRawTracepointAttr(name_z: [*:0]const u8, prog_fd: linux.fd_t) BPF.Attr {
+    var attr: BPF.Attr = .{ .raw_tracepoint = std.mem.zeroes(BPF.RawTracepointAttr) };
+    attr.raw_tracepoint = .{
+        .name = @intFromPtr(name_z),
+        .prog_fd = prog_fd,
+    };
+    return attr;
+}
+
 // ── XDP attach (netlink RTM_SETLINK) ────────────────────────────────────────
 
 pub const XdpFlags = struct {
@@ -419,6 +1092,9 @@ pub const XdpAttachError = error{
     RecvFailed,
     MalformedReply,
     OutOfMemory,
+    /// `link_preference = .link_only` but this kernel has no XDP links
+    /// (needs >= 5.9).
+    LinkNotSupported,
     Unexpected,
 };
 
@@ -493,6 +1169,62 @@ pub fn attachXdp(
     try flags.validate();
     try setLinkXdp(gpa, ifindex, prog_fd, flags);
     return .{ .gpa = gpa, .ifindex = ifindex, .flags = flags };
+}
+
+/// One attachment plus the mechanism that produced it. Returned by the
+/// `*Auto` entry points so a caller can see — and assert on — which of the
+/// two lifetime models it actually got.
+pub const AttachOutcome = struct {
+    link: Link,
+    path: AttachPath,
+};
+
+/// `attachXdp`, but preferring `bpf(BPF_LINK_CREATE)` and falling back to
+/// the netlink path.
+///
+/// This is a SEPARATE entry point rather than a new default on `attachXdp`
+/// for one reason: the two produce attachments an operator sees differently.
+/// A netlink attach shows up in `ip link show` as a program id and can be
+/// removed with `ip link set dev X xdp off`; an XDP *link* cannot be removed
+/// by anyone but its owner, which is exactly what you want for a production
+/// data path and exactly what you do not want for an ad-hoc experiment.
+/// Changing `attachXdp`'s behaviour would silently change what operators
+/// see, so the choice is explicit.
+///
+/// `flags` mode bits are passed through to both paths; `replace_fd` /
+/// `update_if_noexist` are netlink-only and force the legacy path.
+pub fn attachXdpAuto(
+    gpa: std.mem.Allocator,
+    ifindex: u32,
+    prog_fd: linux.fd_t,
+    flags: XdpFlags,
+    pref: LinkPreference,
+) XdpAttachError!AttachOutcome {
+    try flags.validate();
+
+    // XDP links take only the mode bits; the netlink-only semantics
+    // (EXPECTED_FD / UPDATE_IF_NOEXIST) have no link equivalent, so asking
+    // for them means the legacy path.
+    const link_capable = flags.replace_fd == null and !flags.update_if_noexist;
+
+    if (pref != .legacy_only and link_capable) {
+        if (bpflink.linkCreateXdp(prog_fd, ifindex, flags.modeBits())) |h| {
+            return .{ .link = .{ .bpf_link = h }, .path = .bpf_link };
+        } else |err| switch (err) {
+            error.LinkNotSupported, error.Unexpected => {
+                if (pref == .link_only) return error.LinkNotSupported;
+            },
+            error.PermissionDenied => return error.PermissionDenied,
+            error.AlreadyAttached => return error.AlreadyAttached,
+            error.InvalidTarget => return error.NoSuchInterface,
+            error.SystemResources => return error.OutOfMemory,
+        }
+    } else if (pref == .link_only) {
+        return error.LinkNotSupported;
+    }
+
+    const h = try attachXdp(gpa, ifindex, prog_fd, flags);
+    return .{ .link = .{ .xdp = h }, .path = .legacy };
 }
 
 /// Remove whatever XDP program is attached to `ifindex` in the mode named by
@@ -711,6 +1443,9 @@ pub const CgroupAttachError = error{
     /// the program's type does not match `attach_type`.
     InvalidTarget,
     SystemResources,
+    /// `link_preference = .link_only` but this kernel has no cgroup links
+    /// (needs >= 5.7).
+    LinkNotSupported,
     Unexpected,
 };
 
@@ -809,6 +1544,46 @@ pub fn attachCgroupOpts(
         else => return error.Unexpected,
     }
     return .{ .cgroup_fd = cgroup_fd, .prog_fd = prog_fd, .attach_type = attach_type };
+}
+
+/// `attachCgroup`, but preferring `bpf(BPF_LINK_CREATE)` and falling back to
+/// `BPF_PROG_ATTACH`.
+///
+/// The lifetime difference is the whole point: a cgroup LINK dies with this
+/// process, a `BPF_PROG_ATTACH` survives it and must be detached explicitly
+/// (or the cgroup removed). `AttachOutcome.path` says which one you got, so
+/// a caller can decide whether it still needs teardown-on-crash handling.
+///
+/// `BPF_F_ALLOW_MULTI`/`_OVERRIDE`/`_REPLACE` have no link equivalent (a
+/// link is always its own slot), so any non-zero `CgroupAttachFlags` forces
+/// the legacy path.
+pub fn attachCgroupAuto(
+    cgroup_fd: linux.fd_t,
+    prog_fd: linux.fd_t,
+    attach_type: BPF.AttachType,
+    flags: CgroupAttachFlags,
+    pref: LinkPreference,
+) CgroupAttachError!AttachOutcome {
+    const link_capable = flags.bits() == 0;
+
+    if (pref != .legacy_only and link_capable) {
+        if (bpflink.linkCreateCgroup(prog_fd, cgroup_fd, attach_type, 0)) |h| {
+            return .{ .link = .{ .bpf_link = h }, .path = .bpf_link };
+        } else |err| switch (err) {
+            error.LinkNotSupported, error.Unexpected => {
+                if (pref == .link_only) return error.LinkNotSupported;
+            },
+            error.PermissionDenied => return error.PermissionDenied,
+            error.AlreadyAttached => return error.AlreadyAttached,
+            error.InvalidTarget => return error.InvalidTarget,
+            error.SystemResources => return error.SystemResources,
+        }
+    } else if (pref == .link_only) {
+        return error.LinkNotSupported;
+    }
+
+    const h = try attachCgroupOpts(cgroup_fd, prog_fd, attach_type, flags);
+    return .{ .link = .{ .cgroup = h }, .path = .legacy };
 }
 
 /// `bpf(BPF_PROG_DETACH)` — the mirror of `attachCgroup`. Standalone
@@ -1186,6 +1961,442 @@ test "LIVE: kprobe attach + detach against a real kernel" {
     // Detaching twice must be safe.
     kp.detach();
     try testing.expectEqual(@as(linux.fd_t, -1), kp.perf_fd);
+}
+
+// ── uprobe / tracepoint / raw-tracepoint / link tests ───────────────────────
+
+test "perf_event_attr layout: the uprobe attr names a PATH and a FILE OFFSET" {
+    // Same union slots as the kprobe attr, different MEANING: config1 is the
+    // binary's path (not a symbol) and config2 is a file offset (not a delta
+    // from a symbol). A mix-up here is silent — the kernel happily probes
+    // whatever byte the offset names.
+    const path: [:0]const u8 = "/usr/lib/x86_64-linux-gnu/libc.so.6";
+
+    const entry = buildUprobeAttr(9, 0, false, path.ptr, 0xb5110, 0, 32);
+    try testing.expectEqual(@as(u32, 9), @intFromEnum(entry.type));
+    try testing.expectEqual(@as(u32, @sizeOf(linux.perf_event_attr)), entry.size);
+    try testing.expectEqual(@as(u64, 0), entry.config);
+    try testing.expectEqual(@intFromPtr(path.ptr), entry.config1);
+    try testing.expectEqual(@as(u64, 0xb5110), entry.config2);
+    try testing.expectEqual(@as(u64, 0), @as(u64, @bitCast(entry.flags)));
+    try testing.expectEqual(@as(u64, 0), entry.sample_type);
+
+    // uretprobe: exactly one bit, at the position the PMU declared.
+    const ret = buildUprobeAttr(9, 0, true, path.ptr, 0x40, 0, 32);
+    try testing.expectEqual(@as(u64, 1), ret.config);
+    const ret5 = buildUprobeAttr(9, 5, true, path.ptr, 0x40, 0, 32);
+    try testing.expectEqual(@as(u64, 32), ret5.config);
+
+    // A USDT semaphore goes in the HIGH half of config and must not disturb
+    // the retprobe bit.
+    const sema = buildUprobeAttr(9, 0, true, path.ptr, 0x40, 0xabcd, 32);
+    try testing.expectEqual(@as(u64, (0xabcd << 32) | 1), sema.config);
+    try testing.expectEqual(@as(u64, 0x40), sema.config2);
+    // Zero means "no semaphore" — not "a semaphore at offset 0".
+    const none = buildUprobeAttr(9, 0, false, path.ptr, 0x40, 0, 32);
+    try testing.expectEqual(@as(u64, 0), none.config);
+}
+
+test "PMU format files: the config:N / config:N-M grammar" {
+    try testing.expectEqual(@as(u6, 0), parseConfigShift("config:0\n", 63));
+    try testing.expectEqual(@as(u6, 3), parseConfigShift("config:3", 0));
+    try testing.expectEqual(@as(u6, 32), parseConfigShift("config:32-63\n", 0));
+    // Anything unparseable falls back to the caller's documented default
+    // rather than silently encoding at bit 0.
+    try testing.expectEqual(@as(u6, 32), parseConfigShift("garbage", 32));
+    try testing.expectEqual(@as(u6, 7), parseConfigShift("config1:4", 7));
+    try testing.expectEqual(@as(u6, 7), parseConfigShift("config:999", 7));
+    try testing.expectEqual(@as(u6, 7), parseConfigShift("", 7));
+}
+
+test "attachUprobe rejects inputs it can never encode" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    // All of these fail before any syscall, so they need no privilege.
+    try testing.expectError(error.InvalidPath, attachUprobe(testing.allocator, "", "malloc", 3));
+    try testing.expectError(error.InvalidPath, attachUprobe(testing.allocator, "/bin\x00/sh", "malloc", 3));
+    try testing.expectError(
+        error.NoProbeSite,
+        attachUprobeOpts(testing.allocator, "/bin/sh", "", 3, .{}),
+    );
+    // A path that does not exist surfaces as an ELF-resolution failure, not
+    // as a mysterious perf error.
+    try testing.expectError(
+        error.FileOpenFailed,
+        attachUprobe(testing.allocator, "/nonexistent/zig-libs-ebpf", "malloc", 3),
+    );
+}
+
+test "perf_event_attr layout: the tracepoint attr uses a STATIC perf type" {
+    const attr = buildTracepointAttr(742);
+    try testing.expectEqual(linux.PERF.TYPE.TRACEPOINT, attr.type);
+    try testing.expectEqual(@as(u32, 2), @intFromEnum(attr.type)); // PERF_TYPE_TRACEPOINT
+    try testing.expectEqual(@as(u64, 742), attr.config);
+    try testing.expectEqual(@as(u64, 1), attr.sample_period_or_freq);
+    try testing.expectEqual(@as(u32, 1), attr.wakeup_events_or_watermark);
+    // Unlike the probe PMUs, nothing travels in config1/config2.
+    try testing.expectEqual(@as(u64, 0), attr.config1);
+    try testing.expectEqual(@as(u64, 0), attr.config2);
+    try testing.expectEqual(@as(u64, 0), @as(u64, @bitCast(attr.flags)));
+}
+
+test "tracepoint names are validated before they reach a path" {
+    // The category/name are pasted into `<tracefs>/events/<cat>/<name>/id`,
+    // so a traversal attempt must be refused, not sanitized.
+    try testing.expectError(error.InvalidName, tracepointId("..", "x"));
+    try testing.expectError(error.InvalidName, tracepointId("sys/../..", "x"));
+    try testing.expectError(error.InvalidName, tracepointId("syscalls", "a/b"));
+    try testing.expectError(error.InvalidName, tracepointId("", "x"));
+    try testing.expectError(error.InvalidName, tracepointId("syscalls", ""));
+    try testing.expectError(error.InvalidName, tracepointId("syscalls", "sys\x00enter"));
+    try testing.expectError(error.InvalidName, tracepointId("sys calls", "x"));
+    try testing.expectError(error.InvalidName, tracepointId("syscalls", "a" ** 129));
+}
+
+test "tracepointId reads a real id, or explains why it cannot" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    // tracefs is root-only on most distros, so this is informational: it
+    // asserts the SUCCESS shape when readable and never fails otherwise.
+    const id = tracepointId("syscalls", "sys_enter_write") catch |e| {
+        std.debug.print(
+            "\nebpf tracepointId SKIPPED: {s} (tracefs is typically root-only; uid {d}).\n",
+            .{ @errorName(e), linux.geteuid() },
+        );
+        return;
+    };
+    try testing.expect(id > 0);
+    // A tracepoint that certainly does not exist must be a typed miss.
+    try testing.expectError(
+        error.TracepointNotFound,
+        tracepointId("syscalls", "sys_enter_definitely_not_a_syscall"),
+    );
+}
+
+test "BPF_RAW_TRACEPOINT_OPEN attr layout and validation" {
+    // UAPI layout of `struct { __u64 name; __u32 prog_fd; }`.
+    try testing.expectEqual(@as(usize, 0), @offsetOf(BPF.RawTracepointAttr, "name"));
+    try testing.expectEqual(@as(usize, 8), @offsetOf(BPF.RawTracepointAttr, "prog_fd"));
+
+    const name: [:0]const u8 = "sys_enter";
+    const attr = buildRawTracepointAttr(name.ptr, 12);
+    try testing.expectEqual(@intFromPtr(name.ptr), attr.raw_tracepoint.name);
+    try testing.expectEqual(@as(linux.fd_t, 12), attr.raw_tracepoint.prog_fd);
+
+    if (builtin.os.tag != .linux) return;
+    try testing.expectError(error.InvalidName, attachRawTracepoint(testing.allocator, "", 3));
+    try testing.expectError(error.InvalidName, attachRawTracepoint(testing.allocator, "a\x00b", 3));
+    try testing.expectError(error.InvalidName, attachRawTracepoint(testing.allocator, "n" ** 200, 3));
+}
+
+test "bindPerfEvent: a cookie cannot survive the legacy fallback" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    // `.legacy_only` + a non-zero cookie is refused BEFORE any syscall: the
+    // ioctl ABI has nowhere to put a cookie, and dropping it silently would
+    // make `bpf_get_attach_cookie()` return 0 with no indication why.
+    try testing.expectError(error.LinkNotSupported, bindPerfEvent(-1, -1, .legacy_only, 0x1234));
+    // Without a cookie the same call proceeds to the ioctl, which fails on a
+    // bogus fd — proving the cookie check is the thing that short-circuited.
+    try testing.expectError(error.Unexpected, bindPerfEvent(-1, -1, .legacy_only, 0));
+}
+
+test "the *Auto entry points refuse link-only where no link semantics exist" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    // XDP: EXPECTED_FD / UPDATE_IF_NOEXIST are netlink-only, so a link-only
+    // request naming them is a typed refusal, not a silent legacy attach.
+    try testing.expectError(error.LinkNotSupported, attachXdpAuto(
+        testing.allocator,
+        1,
+        3,
+        .{ .drv_mode = true, .replace_fd = 4 },
+        .link_only,
+    ));
+    try testing.expectError(error.LinkNotSupported, attachXdpAuto(
+        testing.allocator,
+        1,
+        3,
+        .{ .skb_mode = true, .update_if_noexist = true },
+        .link_only,
+    ));
+    // Flag validation still runs first.
+    try testing.expectError(error.InvalidFlags, attachXdpAuto(
+        testing.allocator,
+        1,
+        3,
+        .{ .skb_mode = true, .drv_mode = true },
+        .auto,
+    ));
+
+    // cgroup: BPF_F_ALLOW_MULTI has no link equivalent (a link is its own
+    // slot), so the same rule applies.
+    try testing.expectError(error.LinkNotSupported, attachCgroupAuto(
+        -1,
+        -1,
+        .cgroup_inet_egress,
+        .{ .allow_multi = true },
+        .link_only,
+    ));
+    try testing.expectError(error.LinkNotSupported, attachCgroupAuto(
+        -1,
+        -1,
+        .cgroup_inet_egress,
+        .{ .allow_override = true },
+        .link_only,
+    ));
+}
+
+test "Link: the uniform handle covers the new hooks and stays idempotent" {
+    var pe: Link = .{ .perf_event = .{ .perf_fd = -1, .kind = .uprobe } };
+    try pe.detach();
+    try pe.detach();
+    pe.deinit();
+    try testing.expectEqual(@as(linux.fd_t, -1), pe.perf_event.perf_fd);
+    try testing.expectEqual(@as(linux.fd_t, -1), pe.perf_event.link_fd);
+    try testing.expectEqual(AttachPath.legacy, pe.perf_event.path);
+
+    var rt: Link = .{ .raw_tracepoint = .{ .fd = -1 } };
+    try rt.detach();
+    rt.deinit();
+    try testing.expectEqual(@as(linux.fd_t, -1), rt.raw_tracepoint.fd);
+
+    var bl = Link.fromBpfLink(.{ .fd = -1, .attach_type = .perf_event });
+    try bl.detach();
+    bl.deinit();
+    try testing.expectEqual(@as(linux.fd_t, -1), bl.bpf_link.fd);
+
+    // The handle types' own `.link()` helpers agree with the union tags.
+    const h: PerfEventHandle = .{ .perf_fd = -1, .kind = .tracepoint };
+    try testing.expectEqual(std.meta.Tag(Link).perf_event, std.meta.activeTag(h.link()));
+    const r: RawTracepointHandle = .{ .fd = -1 };
+    try testing.expectEqual(std.meta.Tag(Link).raw_tracepoint, std.meta.activeTag(r.link()));
+
+    // A kprobe handle carrying a link fd still detaches idempotently.
+    var kp: KprobeHandle = .{ .perf_fd = -1, .link_fd = -1, .path = .bpf_link };
+    kp.detach();
+    kp.detach();
+    try testing.expectEqual(AttachPath.bpf_link, kp.path);
+}
+
+test "LIVE: uprobe on a real binary fires and can be detached" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!hasBpfCapability()) {
+        std.debug.print(
+            "\nLIVE ebpf uprobe test SKIPPED: needs CAP_BPF+CAP_PERFMON (running as uid {d}).\n",
+            .{linux.geteuid()},
+        );
+        return;
+    }
+
+    const programs = @import("programs.zig");
+    const load = @import("load.zig").load;
+
+    // Probe a symbol in THIS test binary: it is guaranteed to exist, is
+    // guaranteed to be called (the test calls it below), and needs no
+    // helper process.
+    var exe_buf: [256]u8 = undefined;
+    const exe_len = linux.readlink("/proc/self/exe", &exe_buf, exe_buf.len);
+    if (linux.errno(exe_len) != .SUCCESS) {
+        std.debug.print("\nLIVE ebpf uprobe test SKIPPED: cannot read /proc/self/exe.\n", .{});
+        return;
+    }
+    const exe = exe_buf[0..exe_len];
+
+    const sym = elfsym.resolveFunc(testing.allocator, exe, uprobe_target_symbol) catch |e| {
+        std.debug.print(
+            "\nLIVE ebpf uprobe test SKIPPED: '{s}' not resolvable in the test binary ({s}).\n",
+            .{ uprobe_target_symbol, @errorName(e) },
+        );
+        return;
+    };
+
+    const map_fd = BPF.map_create(.array, 4, 8, 1) catch {
+        std.debug.print("\nLIVE ebpf uprobe test SKIPPED: BPF_MAP_CREATE refused.\n", .{});
+        return;
+    };
+    defer _ = linux.close(map_fd);
+
+    // uprobes reuse BPF_PROG_TYPE_KPROBE — there is no uprobe program type.
+    const prog_fd = load(.{
+        .prog_type = .kprobe,
+        .insns = programs.kprobeCounter(map_fd),
+    }, "MIT") catch {
+        std.debug.print("\nLIVE ebpf uprobe test SKIPPED: BPF_PROG_LOAD refused.\n", .{});
+        return;
+    };
+    defer _ = linux.close(prog_fd);
+
+    var up = attachUprobeOpts(testing.allocator, exe, uprobe_target_symbol, prog_fd, .{
+        .offset = sym.file_offset,
+    }) catch |e| {
+        std.debug.print("\nLIVE ebpf uprobe test SKIPPED: uprobe attach failed ({s}).\n", .{@errorName(e)});
+        return;
+    };
+    defer up.detach();
+    std.debug.print("\nLIVE ebpf uprobe attached via the {s} path.\n", .{@tagName(up.path)});
+
+    // Fire the probe.
+    var acc: u64 = 0;
+    for (0..64) |i| acc +%= uprobeTarget(i);
+    try testing.expect(acc != std.math.maxInt(u64));
+
+    var key: [4]u8 = @splat(0);
+    var value: [8]u8 = @splat(0);
+    try BPF.map_lookup_elem(map_fd, &key, &value);
+    try testing.expect(std.mem.readInt(u64, &value, native_endian) > 0);
+
+    up.detach();
+    try testing.expectEqual(@as(linux.fd_t, -1), up.perf_fd);
+    up.detach(); // idempotent
+}
+
+/// The function the live uprobe test probes. `noinline` keeps it from being
+/// folded into its only caller (which would leave nothing to probe), and the
+/// symbol is exported **only in test builds** — a library module must not
+/// add names to a consumer's symbol table, but a uprobe needs a name in
+/// `.symtab`/`.dynsym` to resolve.
+const uprobe_target_symbol = "zig_libs_ebpf_uprobe_target";
+
+noinline fn uprobeTarget(x: u64) callconv(.c) u64 {
+    return x *% 2654435761;
+}
+
+comptime {
+    if (builtin.is_test) @export(&uprobeTarget, .{
+        .name = uprobe_target_symbol,
+        .linkage = .strong,
+    });
+}
+
+test "LIVE: tracepoint attach + detach against a real kernel" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!hasBpfCapability()) {
+        std.debug.print(
+            "\nLIVE ebpf tracepoint test SKIPPED: needs CAP_BPF+CAP_PERFMON (running as uid {d}).\n",
+            .{linux.geteuid()},
+        );
+        return;
+    }
+
+    // The smallest valid tracepoint program: r0 = 0; exit.
+    const insns = [_]BPF.Insn{ BPF.Insn.mov(.r0, 0), BPF.Insn.exit() };
+    const prog_fd = BPF.prog_load(.tracepoint, &insns, null, "MIT", 0, 0) catch {
+        std.debug.print("\nLIVE ebpf tracepoint test SKIPPED: tracepoint BPF_PROG_LOAD refused.\n", .{});
+        return;
+    };
+    defer _ = linux.close(prog_fd);
+
+    var tp = attachTracepoint(testing.allocator, "syscalls", "sys_enter_write", prog_fd) catch |e| {
+        std.debug.print("\nLIVE ebpf tracepoint test SKIPPED: attach failed ({s}).\n", .{@errorName(e)});
+        return;
+    };
+    defer tp.detach();
+    try testing.expect(tp.perf_fd >= 0);
+    try testing.expectEqual(PerfEventHandle.Kind.tracepoint, tp.kind);
+    std.debug.print("\nLIVE ebpf tracepoint attached via the {s} path.\n", .{@tagName(tp.path)});
+
+    // Force the legacy branch too, so BOTH paths are exercised wherever this
+    // test actually runs.
+    var legacy = attachTracepointOpts(
+        testing.allocator,
+        "syscalls",
+        "sys_enter_write",
+        prog_fd,
+        .{ .link_preference = .legacy_only },
+    ) catch |e| {
+        std.debug.print("\nLIVE ebpf tracepoint legacy-path attach failed ({s}).\n", .{@errorName(e)});
+        return;
+    };
+    defer legacy.detach();
+    try testing.expectEqual(AttachPath.legacy, legacy.path);
+    try testing.expectEqual(@as(linux.fd_t, -1), legacy.link_fd);
+
+    tp.detach();
+    try testing.expectEqual(@as(linux.fd_t, -1), tp.perf_fd);
+    tp.detach(); // idempotent
+}
+
+test "LIVE: raw tracepoint attach + detach" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!hasBpfCapability()) {
+        std.debug.print(
+            "\nLIVE ebpf raw-tracepoint test SKIPPED: needs CAP_BPF (running as uid {d}).\n",
+            .{linux.geteuid()},
+        );
+        return;
+    }
+
+    const insns = [_]BPF.Insn{ BPF.Insn.mov(.r0, 0), BPF.Insn.exit() };
+    const prog_fd = BPF.prog_load(.raw_tracepoint, &insns, null, "MIT", 0, 0) catch {
+        std.debug.print("\nLIVE ebpf raw-tracepoint test SKIPPED: raw_tracepoint BPF_PROG_LOAD refused.\n", .{});
+        return;
+    };
+    defer _ = linux.close(prog_fd);
+
+    var rt = attachRawTracepoint(testing.allocator, "sys_enter", prog_fd) catch |e| {
+        std.debug.print("\nLIVE ebpf raw-tracepoint test SKIPPED: attach failed ({s}).\n", .{@errorName(e)});
+        return;
+    };
+    defer rt.detach();
+    try testing.expect(rt.fd >= 0);
+
+    // A tracepoint that does not exist must be a typed miss, not a hang.
+    try testing.expectError(
+        error.TracepointNotFound,
+        attachRawTracepoint(testing.allocator, "definitely_not_a_tracepoint", prog_fd),
+    );
+
+    rt.detach();
+    try testing.expectEqual(@as(linux.fd_t, -1), rt.fd);
+    rt.detach(); // idempotent
+}
+
+test "LIVE: cgroup attach prefers a BPF link and reports which path it took" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!hasBpfCapability()) {
+        std.debug.print(
+            "\nLIVE ebpf cgroup-link test SKIPPED: needs CAP_BPF (running as uid {d}).\n",
+            .{linux.geteuid()},
+        );
+        return;
+    }
+
+    var path_buf: [64]u8 = undefined;
+    const dir = try std.fmt.bufPrintZ(&path_buf, "/sys/fs/cgroup/zig-libs-ebpf-auto-{d}", .{linux.getpid()});
+    switch (linux.errno(linux.mkdir(dir.ptr, 0o755))) {
+        .SUCCESS => {},
+        else => {
+            std.debug.print("\nLIVE ebpf cgroup-link test SKIPPED: cannot create {s}.\n", .{dir});
+            return;
+        },
+    }
+    defer _ = linux.rmdir(dir.ptr);
+
+    const dir_rc = linux.open(dir.ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
+    if (linux.errno(dir_rc) != .SUCCESS) {
+        std.debug.print("\nLIVE ebpf cgroup-link test SKIPPED: cannot open the cgroup directory.\n", .{});
+        return;
+    }
+    const cgroup_fd: linux.fd_t = @intCast(dir_rc);
+    defer _ = linux.close(cgroup_fd);
+
+    const insns = [_]BPF.Insn{ BPF.Insn.mov(.r0, 1), BPF.Insn.exit() };
+    const prog_fd = BPF.prog_load(.cgroup_skb, &insns, null, "MIT", 0, 0) catch {
+        std.debug.print("\nLIVE ebpf cgroup-link test SKIPPED: cgroup_skb BPF_PROG_LOAD refused.\n", .{});
+        return;
+    };
+    defer _ = linux.close(prog_fd);
+
+    // .auto: whichever the kernel supports, reported honestly.
+    var auto = attachCgroupAuto(cgroup_fd, prog_fd, .cgroup_inet_egress, .{}, .auto) catch |e| {
+        std.debug.print("\nLIVE ebpf cgroup-link test SKIPPED: attach failed ({s}).\n", .{@errorName(e)});
+        return;
+    };
+    std.debug.print("\nLIVE ebpf cgroup attach took the {s} path.\n", .{@tagName(auto.path)});
+    try auto.link.detach();
+
+    // .legacy_only must always work and must always report `.legacy`.
+    var legacy = try attachCgroupAuto(cgroup_fd, prog_fd, .cgroup_inet_egress, .{}, .legacy_only);
+    try testing.expectEqual(AttachPath.legacy, legacy.path);
+    try testing.expectEqual(std.meta.Tag(Link).cgroup, std.meta.activeTag(legacy.link));
+    try legacy.link.detach();
 }
 
 test "LIVE: cgroup attach + detach in a throwaway cgroup" {

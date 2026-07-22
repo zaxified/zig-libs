@@ -81,5 +81,16 @@ test "load: an unsafe program (no r0 set before exit) is rejected by the verifie
     };
     const prog: Program = .{ .prog_type = .socket_filter, .insns = &insns };
 
-    try testing.expectError(error.UnsafeProgram, load(prog, "MIT"));
+    if (load(prog, "MIT")) |fd| {
+        _ = linux.close(fd);
+        return error.TestUnexpectedResult; // the verifier must NOT accept this
+    } else |e| switch (e) {
+        error.UnsafeProgram => {},
+        // `geteuid() == 0` inside a user namespace (`unshare -r`) is not
+        // CAP_BPF in the INIT user namespace, so `bpf()` is refused before
+        // the verifier ever runs. Skip rather than fail: the point of this
+        // test is what the verifier does, not what the capability check does.
+        error.PermissionDenied => return error.SkipZigTest,
+        else => return e,
+    }
 }

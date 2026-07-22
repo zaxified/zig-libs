@@ -18,26 +18,32 @@ the sibling `netlink` module for the XDP attach path.
 - **Deps:** `netlink` — its nlmsghdr/nlattr codec is reused for the XDP
   attach path's `RTM_SETLINK` message.
 - **Privileges:** everything past program encoding needs `CAP_BPF` (or
-  root) at minimum; `attachKprobe` additionally needs
+  root) at minimum; the kprobe/uprobe/tracepoint attaches additionally need
   `CAP_PERFMON`/`CAP_SYS_ADMIN`, and `attachXdp` needs `CAP_NET_ADMIN`.
   Nothing that touches the kernel works unprivileged — every gated test
   either skips (`error.SkipZigTest`) or prints a `SKIPPED:` line and passes,
-  never fails, without it. The pure encoding/parsing layers (program
-  builders, the netlink message builder, the ring-buffer record walk) are
-  fully tested with no privilege at all.
+  never fails, without it. (`unshare -r` does **not** help: `geteuid() == 0`
+  in a user namespace is not `CAP_BPF` in the init user namespace.) The pure
+  encoding/parsing layers — program builders, the netlink message builder,
+  the ELF symbol reader, and both consumers' record walks — are fully tested
+  with no privilege at all.
 
 ## Status: complete
 
-All four parts are implemented — see `modules/ebpf/src/*.zig` doc comments
-for the authoritative, per-function constraint lists and `SPEC.md` for the
-attach lifetime rules and the ring-buffer barrier discipline.
+All parts are implemented — see `modules/ebpf/src/*.zig` doc comments for
+the authoritative, per-function constraint lists and `SPEC.md` for the
+attach lifetime rules, the uprobe offset trap, and both consumers' barrier
+discipline.
 
 | File | Tier | Status |
 |---|---|---|
 | `src/programs.zig` | **FABLE** | bytecode generation, golden-vector tested |
 | `src/load.zig` | — | thin wrapper (std already implements `BPF_PROG_LOAD`) |
-| `src/attach.zig` | **OPUS** | kprobe/kretprobe (perf PMU), XDP (netlink `IFLA_XDP`), cgroup (`BPF_PROG_ATTACH`), one uniform `Link` handle |
-| `src/ringbuf.zig` | **OPUS** | mmap + acquire/release ring-buffer consumer with `epoll` polling |
+| `src/attach.zig` | **OPUS** | kprobe/kretprobe, uprobe/uretprobe, tracepoint, raw tracepoint, XDP (netlink `IFLA_XDP`), cgroup (`BPF_PROG_ATTACH`) — one uniform `Link` handle, link-preferring where the kernel allows it |
+| `src/bpflink.zig` | **OPUS** | `BPF_LINK_CREATE`/`_UPDATE`/`_DETACH`/`_GET_FD_BY_ID`/`_GET_NEXT_ID`, the extended `bpf_attr.link_create`, a libbpf-style feature probe |
+| `src/elfsym.zig` | **OPUS** | minimal ELF64 `.symtab`/`.dynsym` reader + the vaddr -> **file offset** conversion a uprobe needs |
+| `src/ringbuf.zig` | **OPUS** | mmap + acquire/release `BPF_MAP_TYPE_RINGBUF` consumer with `epoll` polling |
+| `src/perfbuf.zig` | **OPUS** | per-CPU `BPF_MAP_TYPE_PERF_EVENT_ARRAY` consumer: `data_head`/`data_tail` barriers, wrap reassembly, explicit `PERF_RECORD_LOST` |
 
 ### Honest difficulty verdict
 
@@ -116,12 +122,84 @@ fn onSample(ctx: ?*anyopaque, data: []const u8) ebpf.RingbufAction {
 _ = try rb.pollAndConsume(1000, null, onSample, 64);
 ```
 
+### Userspace probes, tracepoints and raw tracepoints
+
+```zig
+// uprobe: the symbol is resolved to a FILE OFFSET (not its virtual
+// address) — see SPEC.md for why that distinction bites.
+var up = try ebpf.attachUprobe(gpa, "/lib/x86_64-linux-gnu/libc.so.6", "malloc", prog_fd);
+defer up.detach();
+// ...or a uretprobe, or an explicit offset / USDT semaphore:
+var ur = try ebpf.attachUprobeOpts(gpa, path, "malloc", prog_fd, .{
+    .retprobe = true,
+    .ref_ctr_offset = 0,          // USDT semaphore file offset, 0 = none
+    .bpf_cookie = 0x1234,         // readable in-program; needs a BPF link
+});
+defer ur.detach();
+
+// Just the offset, e.g. to feed some other tool:
+const off = try ebpf.resolveFuncOffset(gpa, path, "malloc");
+
+// static tracepoint (reads <tracefs>/events/syscalls/sys_enter_write/id):
+var tp = try ebpf.attachTracepoint(gpa, "syscalls", "sys_enter_write", tp_prog_fd);
+defer tp.detach();
+
+// raw tracepoint — a plain bpf() command, no perf event involved:
+var rt = try ebpf.attachRawTracepoint(gpa, "sys_enter", raw_prog_fd);
+defer rt.detach();
+```
+
+### Perf buffer (the per-CPU predecessor of the ring buffer)
+
+```zig
+// key = u32 cpu, value = u32 perf fd
+const map_fd = try std.os.linux.BPF.map_create(.perf_event_array, 4, 4, 8);
+var pb = try ebpf.PerfBuffer.open(gpa, map_fd, .{ .pages = 8 });
+defer pb.close();
+
+fn onSample(ctx: ?*anyopaque, cpu: u32, data: []const u8) ebpf.perfbuf.Action { ... }
+fn onLost(ctx: ?*anyopaque, cpu: u32, lost: u64) ebpf.perfbuf.Action { ... }
+
+_ = try pb.pollAndConsume(1000, null, onSample, onLost, 64);
+std.debug.print("dropped so far: {d}\n", .{pb.lostRecords()});
+```
+
+Losses are surfaced, never swallowed: `PERF_RECORD_LOST` reaches `onLost`
+*and* accumulates in `lostRecords()`.
+
+### `BPF_LINK_CREATE`, and seeing which path an attach took
+
+```zig
+// Prefer the modern fd-lifetimed link, fall back to the legacy syscall —
+// and report which one actually happened.
+var out = try ebpf.attachCgroupAuto(cgroup_fd, prog_fd, .cgroup_inet_egress, .{}, .auto);
+defer out.link.deinit();
+switch (out.path) {
+    .bpf_link => {},  // dies with this process
+    .legacy   => {},  // survives it: detach explicitly
+}
+
+// Force either branch (useful in tests, and on kernels you must not guess about):
+_ = ebpf.attachXdpAuto(gpa, ifindex, prog_fd, .{ .drv_mode = true }, .link_only);
+
+// The raw link API is available directly, including atomic program swap:
+var link = try ebpf.linkCreatePerfEvent(prog_fd, perf_fd, 0);
+defer link.detach();
+try link.update(new_prog_fd, prog_fd);   // BPF_F_REPLACE: conditional swap
+```
+
 Other attach entry points: `attachKretprobe` / `attachKprobeOpts`,
-`attachXdp` / `detachXdp` (with `XdpFlags` selecting SKB/DRV/HW mode plus
-`XDP_FLAGS_UPDATE_IF_NOEXIST` / `XDP_FLAGS_REPLACE`), and `attachCgroup` /
-`attachCgroupOpts` / `detachCgroup` (with `BPF_F_ALLOW_MULTI`/`_OVERRIDE`
-semantics). All three return a handle convertible to the uniform
-`ebpf.Link` via `.link()`.
+`attachXdp` / `attachXdpAuto` / `detachXdp` (with `XdpFlags` selecting
+SKB/DRV/HW mode plus `XDP_FLAGS_UPDATE_IF_NOEXIST` / `XDP_FLAGS_REPLACE`),
+and `attachCgroup` / `attachCgroupOpts` / `attachCgroupAuto` /
+`detachCgroup` (with `BPF_F_ALLOW_MULTI`/`_OVERRIDE` semantics). Every
+handle converts to the uniform `ebpf.Link` via `.link()`.
+
+**Which default does what**: kprobe/uprobe/tracepoint default to
+`LinkPreference.auto` (link if the kernel has it, `ioctl` otherwise).
+`attachXdp` deliberately keeps the netlink path as its default — that is
+what `ip link show` / `bpftool net` display and what `ip link set dev X xdp
+off` can remove; `attachXdpAuto` is the opt-in link-preferring variant.
 
 Low-level, for building custom programs (all `pub`): `ebpf.Insn` (re-export
 of `std.os.linux.BPF.Insn` — every opcode builder needed lives there
@@ -156,11 +234,31 @@ What `std` does **not** ship (the actual gap this module fills):
 - Any pre-built program (the encoders are free, the SEQUENCES are not).
 - A wrapper for `Cmd.prog_attach`/`prog_detach` (types exist, function
   doesn't — see `attach.zig`'s `attachCgroup`).
-- The `PERF_EVENT_IOC_*` ioctl request numbers, or any kprobe-PMU sysfs
-  handling (`perf_event_attr` and the `perf_event_open` syscall wrapper ARE
-  in std; the two ioctl numbers are hand-derived from `_IO`/`_IOW` in
-  `attach.zig`, and the PMU type id / retprobe bit are read from
-  `/sys/bus/event_source/devices/kprobe/`).
+- The `PERF_EVENT_IOC_*` ioctl request numbers, or any kprobe/uprobe-PMU
+  sysfs handling (`perf_event_attr`, `perf_event_mmap_page` and the
+  `perf_event_open` syscall wrapper ARE in std; the two ioctl numbers are
+  hand-derived from `_IO`/`_IOW` in `attach.zig`, and the PMU type ids /
+  retprobe bit / `ref_ctr_offset` shift are read from
+  `/sys/bus/event_source/devices/{kprobe,uprobe}/`).
+- Tracepoint id lookup (`<tracefs>/events/<cat>/<name>/id`, with the legacy
+  `debugfs` fallback) and the name validation that keeps a category/name
+  from escaping that directory.
+- The **extended** `bpf_attr.link_create`: std's `LinkCreateAttr` stops
+  after `flags` and has no per-attach-type union
+  (`perf_event.bpf_cookie`, `tracing.{target_btf_id,cookie}`, `tcx.*`,
+  `netfilter.*`) — see `bpflink.zig`. Nor does std wrap `link_create`,
+  `link_update`, `link_detach`, `link_get_fd_by_id` or `link_get_next_id`
+  (the `Cmd` values and `LinkUpdateAttr`/`GetIdAttr` types exist; the
+  functions do not), nor `raw_tracepoint_open`.
+- ELF symbol resolution to a **file offset**. `std.elf` supplies the types
+  and constants (used here for exactly that), but nothing that walks
+  `.symtab`/`.dynsym` for a name and converts `st_value` through the
+  containing `PT_LOAD` — see `elfsym.zig`, and `SPEC.md` for why that
+  conversion is not optional.
+- The perf-buffer (`PERF_EVENT_ARRAY`) consumer: the per-CPU fd fan-out,
+  `data_head`/`data_tail` barrier discipline, `PERF_RECORD_SAMPLE`/`_LOST`
+  parsing and wrap reassembly. (`perf_event_mmap_page` is in std; nothing
+  that uses it is.)
 - Netlink `IFLA_XDP` attribute handling (needed for XDP attach — see
   `attach.zig`'s `attachXdp`; the underlying nlmsghdr/nlattr codec itself IS
   covered, by the sibling `netlink` module, not by `std`).
@@ -212,13 +310,25 @@ large or many programs; not worth it for three.
   tests and a hand-built fake ring run everywhere; real attach and real
   `mmap`+consume tests print `SKIPPED:` and pass when `CAP_BPF` is absent,
   so a sandbox run is never mistaken for a verified one.
-- **Out of scope (deliberate)**: perfbuf
-  (`BPF_MAP_TYPE_PERF_EVENT_ARRAY`), tracepoints, uprobes,
-  `BPF_LINK_CREATE`-based attachment, cpumap/devmap attach, tc/classifier
-  programs, BTF-typed maps, CO-RE (Compile Once – Run Everywhere) relocation,
-  and the `bpftool`-style ELF-skeleton loading route noted above. The three
-  named programs and their three attach mechanisms are the whole surface
-  this module commits to; extending to a new program or attach kind is
-  additive (a new function following the same doc-comment discipline), not
-  a redesign. `SPEC.md`'s backlog section says what each deferred item
-  would actually take.
+- **A fallback is never silent.** Where both a `BPF_LINK_CREATE` and a
+  legacy path exist, the entry point returns which one it used
+  (`AttachPath`) and accepts a `LinkPreference` that can force either — a
+  caller that silently got the legacy path would be reasoning about the
+  wrong lifetime model, and a test that cannot force a branch never covers
+  it. A `bpf_cookie` (link-only) plus a fallback is a typed refusal rather
+  than a dropped cookie.
+- **`elfsym` is a uprobe helper, not an ELF library.** It reads what a
+  probe needs (`.symtab`/`.dynsym` + `PT_LOAD`) and refuses everything else
+  (32-bit, foreign-endian) rather than guessing.
+- **Out of scope (deliberate)**: BTF parsing — and therefore
+  fentry/fexit/`tp_btf`/LSM attach by name, `kprobe_multi`/`uprobe_multi`
+  mass-attach, and CO-RE (Compile Once – Run Everywhere) relocation —
+  plus USDT `.note.stapsdt` discovery, `tcx`/`netkit` attach entry points,
+  `BPF_PROG_QUERY`, cpumap/devmap attach, perf AUX/ITRACE areas, DWARF/line
+  and symbol demangling, tc/classifier programs, BTF-typed maps, and the
+  `bpftool`-style ELF-skeleton loading route noted above. The three named
+  programs and the six attach mechanisms are the whole surface this module
+  commits to; extending to a new program or attach kind is additive (a new
+  function following the same doc-comment discipline), not a redesign.
+  `SPEC.md`'s backlog section says what each deferred item would actually
+  take.

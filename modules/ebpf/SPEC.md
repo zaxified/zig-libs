@@ -107,23 +107,117 @@ in CI/sandboxes but still assert something real wherever they DO run).
 
 ## Attach mechanisms and their lifetime rules
 
-Three hooks are supported. The single thing to get right is that they do
-**not** share a lifetime model — two of the three outlive the attaching
-process:
+Six hooks are supported. The single thing to get right is that they do
+**not** share a lifetime model — two of them outlive the attaching process:
 
 | hook | syscall path | detach | survives process exit? |
 |---|---|---|---|
-| kprobe / kretprobe | `perf_event_open` on the kprobe PMU + `ioctl(PERF_EVENT_IOC_SET_BPF)` + `ioctl(PERF_EVENT_IOC_ENABLE)` | close the perf fd | **no** |
-| XDP | netlink `RTM_SETLINK` + nested `IFLA_XDP` | `RTM_SETLINK` with `IFLA_XDP_FD = -1` | **yes** |
-| cgroup | `bpf(BPF_PROG_ATTACH)` | `bpf(BPF_PROG_DETACH)` | **yes** |
+| kprobe / kretprobe | `perf_event_open` on the kprobe PMU + link-or-`ioctl(PERF_EVENT_IOC_SET_BPF)` + `ioctl(PERF_EVENT_IOC_ENABLE)` | close the fd(s) | **no** |
+| uprobe / uretprobe | `perf_event_open` on the uprobe PMU (`config1` = a **path**, `config2` = a **file offset**) + the same binding step | close the fd(s) | **no** |
+| tracepoint | `<tracefs>/events/<cat>/<name>/id` + `perf_event_open(PERF_TYPE_TRACEPOINT)` + the same binding step | close the fd(s) | **no** |
+| raw tracepoint | `bpf(BPF_RAW_TRACEPOINT_OPEN)` — no perf event at all | close the fd | **no** |
+| XDP | netlink `RTM_SETLINK` + nested `IFLA_XDP`, **or** `bpf(BPF_LINK_CREATE)` | `IFLA_XDP_FD = -1` / close the link fd | **yes** (netlink) / **no** (link) |
+| cgroup | `bpf(BPF_PROG_ATTACH)`, **or** `bpf(BPF_LINK_CREATE)` | `bpf(BPF_PROG_DETACH)` / close the link fd | **yes** (PROG_ATTACH) / **no** (link) |
 
-`Link` is the uniform handle over all three (`Link.detach()` reports
+`Link` is the uniform handle over all of them (`Link.detach()` reports
 failures, `Link.deinit()` is the `defer`-friendly best-effort form); the
-per-hook handles (`KprobeHandle`/`XdpHandle`/`CgroupHandle`) expose the same
-two methods and are idempotent. Every fd a handle does not itself create
-(`prog_fd`, a cgroup directory fd) is **borrowed**, matching `load.zig`'s
-rule that the caller closes what the caller created — the borrowed fds must
-outlive the handle, because `detach()` names them.
+per-hook handles (`KprobeHandle`/`PerfEventHandle`/`RawTracepointHandle`/
+`XdpHandle`/`CgroupHandle`/`bpflink.LinkHandle`) expose the same two methods
+and are idempotent. Every fd a handle does not itself create (`prog_fd`, a
+cgroup directory fd) is **borrowed**, matching `load.zig`'s rule that the
+caller closes what the caller created — the borrowed fds must outlive the
+handle, because `detach()` names them.
+
+### uprobes: the vaddr-vs-file-offset trap
+
+A uprobe is registered by **(inode, file offset)**, not by address: the
+kernel installs the breakpoint in the file so that every process mapping
+that inode is probed. The symbol table, however, stores a **virtual
+address** (`st_value`). For an object whose text is mapped 1:1 the two
+numbers coincide — which is exactly why treating them as interchangeable
+survives casual testing and then produces a probe on the wrong bytes for the
+first symbol in a skewed segment.
+
+`elfsym.zig` therefore does the conversion explicitly: find the `PT_LOAD`
+whose **file-backed** range covers the address
+(`p_vaddr <= v < p_vaddr + p_filesz`) and return `p_offset + (v - p_vaddr)`.
+Checking `p_filesz` rather than `p_memsz` is deliberate: the tail between the
+two is `.bss`, which has no bytes in the file at all, so a symbol there is
+`error.NoFileMapping` rather than an offset naming some unrelated later
+section.
+
+On the machine this was written on the skew is real and easy to reproduce:
+`libc.so.6`'s writable `PT_LOAD` maps file offset `0x20db98` at vaddr
+`0x20eb98`, so `stdout` (vaddr `0x213668`, per `readelf -sW`) has file offset
+`0x212668`, and `environ` (vaddr `0x219de8`) falls past `p_filesz` entirely.
+`malloc`, in the 1:1 text segment, has offset == vaddr — the case that hides
+the bug.
+
+The reader is ELF64-only, host byte order, `.symtab` first then `.dynsym`,
+with `name@VERSION` suffixes matched by their bare name. Every count read out
+of the file (`e_shnum`, `sh_size`, …) is bounded, so a corrupt object is a
+typed error rather than a multi-gigabyte allocation.
+
+### tracepoints vs. raw tracepoints
+
+A `PERF_TYPE_TRACEPOINT` attachment hands the program the **formatted trace
+event record** whose layout is described by
+`<tracefs>/events/<cat>/<name>/format`; a raw tracepoint
+(`BPF_RAW_TRACEPOINT_OPEN`) hands it the tracepoint's **raw arguments**
+(`struct bpf_raw_tracepoint_args`). The raw form is cheaper (no record
+formatting) and closer to the kernel's own types; the formatted form has a
+stable, self-describing field layout. Both are implemented; neither is a
+wrapper over the other, and only the first involves a perf event.
+
+Tracepoint category/name components are pasted into a path, so they are
+**validated, not sanitized**: `/`, `..`, NUL, over-long and non
+`[A-Za-z0-9_.:-]` components are refused up front.
+
+### `BPF_LINK_CREATE` and why the fallback is visible
+
+Links replace the per-hook ownership rules with one: the attachment lives
+exactly as long as its fd. That is what makes `BPF_LINK_UPDATE` possible —
+atomically swapping the program behind a live attachment, with no window in
+which nothing is attached — and it is why a link cannot be clobbered (or
+cleaned up) by anyone but its owner.
+
+The catch is availability: cgroup/raw-tracepoint links need 5.7, XDP 5.9,
+**perf-event links 5.15**, tcx/netkit 6.6/6.7. An older kernel answers plain
+`EINVAL`, because `attach_type` is validated before anything else is even
+looked at — indistinguishable from "you passed bad arguments". So:
+
+- `bpflink.errnoToLinkError` maps `EINVAL`/`EOPNOTSUPP`/`ENOSYS` alike to
+  `error.LinkNotSupported`, documented as "retry the legacy path".
+- Every entry point that can take either path reports an **`AttachPath`**
+  (`.bpf_link` or `.legacy`), and takes a **`LinkPreference`**
+  (`.auto` / `.link_only` / `.legacy_only`) so both branches are reachable
+  from a test on any kernel. A silent fallback would leave a caller
+  reasoning about the wrong lifetime model.
+- `bpflink.perfLinkSupport()` is the libbpf-style feature probe: attempt a
+  create with deliberately invalid fds; `EBADF` means the attach type exists
+  (validation got past it), `EINVAL` means it does not.
+
+Two defaults are deliberate rather than uniform:
+
+- kprobe/uprobe/tracepoint default to `.auto` — the link is strictly better
+  and invisible to operators either way.
+- `attachXdp` keeps the **netlink** path and gets a separate opt-in
+  `attachXdpAuto`. A netlink attach is what `ip link show` / `bpftool net`
+  display and what `ip link set dev X xdp off` can remove; an XDP link is
+  neither. Changing the default would silently change what an operator sees.
+
+A `bpf_cookie` (readable in-program via `bpf_get_attach_cookie()`) exists
+only in the link ABI. Requesting one while falling back would drop it
+silently, so `bindPerfEvent` refuses instead: cookie + no link =
+`error.LinkNotSupported`.
+
+`std.os.linux.BPF.LinkCreateAttr` stops after `flags` (16 bytes), predating
+every per-attach-type extension, so `bpflink.zig` declares the extended
+`bpf_attr.link_create` itself (the union carrying `perf_event.bpf_cookie`,
+`tracing.{target_btf_id,cookie}`, `tcx.*`, `netfilter.*`). Passing a
+**shorter** `size` than the kernel's own struct is ABI-safe in both
+directions — `bpf()` zero-fills the tail it did not receive — and the layout
+is pinned by golden byte tests.
 
 Consequences worth stating explicitly:
 
@@ -239,33 +333,137 @@ each produce a typed `ConsumeError` (`CorruptRecord` /
 of bounds on hostile bytes, and `consume()` takes a `max_records` bound so a
 producer faster than the consumer cannot starve the caller's loop.
 
+## Perf-buffer consumer: how it differs from the ring buffer
+
+`BPF_MAP_TYPE_PERF_EVENT_ARRAY` is the per-CPU predecessor of the ring
+buffer, still the only option before 5.8 and still the right one when
+per-CPU attribution matters. It is **not** a variation on `ringbuf.zig`;
+four things differ, and each is a place a naive port breaks:
+
+| | ring buffer | perf buffer |
+|---|---|---|
+| rings | ONE, shared by all CPUs (MPSC) | ONE PER CPU, each with its own perf fd |
+| wrap | the kernel **double-maps** the data pages, so a wrapping record is contiguous | **no** double mapping — a wrapping record must be reassembled |
+| commit | per-record `BUSY` bit in the record header | none: `data_head` alone publishes the record |
+| loss | impossible (a full ring fails the reservation in-program) | `PERF_RECORD_LOST` records, which must be surfaced |
+
+### mmap layout
+
+One mapping of `(1 + 2^n) * page_size` at offset 0, `PROT_READ|PROT_WRITE`
+(the write is for `data_tail`): page 0 is the `perf_event_mmap_page` control
+page, the rest is the data area. `data_head` sits at byte 1024 of the
+control page and `data_tail` at 1032 — the struct pads itself "to 1k"
+precisely so the two positions land on their own cache lines. Both offsets
+are asserted against `std.os.linux.perf_event_mmap_page` in the tests.
+
+### Barrier discipline
+
+Two atomics rather than the ring buffer's three, because there is no
+per-record commit flag:
+
+1. **`data_head`: acquire load** — pairs with the kernel's
+   `smp_store_release(&rb->user_page->data_head, head)` at the end of
+   `perf_output_end`. The release store happens *after* the whole record is
+   written, so ONE acquire load orders every byte below it. That is exactly
+   why no per-record acquire is needed here and one is mandatory in
+   `ringbuf.zig`.
+2. **`data_tail`: release store** — pairs with the kernel's
+   `smp_load_acquire(&rb->user_page->data_tail)` in `perf_output_begin`. It
+   must not become visible before this side has finished reading the record,
+   or the kernel may overwrite bytes a caller still holds a slice into.
+
+### Records and losses
+
+`PERF_RECORD_SAMPLE` with `sample_type = PERF_SAMPLE_RAW` is
+`{ header; u32 size; char data[size] }`. The kernel rounds `size` so that
+`4 + size` is a multiple of 8, so a payload may carry up to 4 bytes of
+trailing zero padding — surfaced as-is, matching what libbpf hands its
+`sample_cb`.
+
+`PERF_RECORD_LOST` (`{ header; u64 id; u64 lost }`) is surfaced as
+`Event.lost` **and** accumulated in `Reader.lost_records` /
+`PerfBuffer.lostRecords()`. It is never silently skipped: "my numbers are
+slightly wrong" is the failure mode a tracing tool most needs to know about
+and least often notices. Record types this consumer does not decode are
+skipped but counted in `unknown_records`.
+
+Because there is no double mapping, a record whose payload crosses the ring
+end is reassembled into a per-CPU scratch buffer sized to the ring (so
+`error.RecordTooLarge` is unreachable through `PerfBuffer`; a hand-built
+`Reader` with a smaller buffer gets the typed error). The 8-byte record
+header itself can never split — perf record sizes are multiples of 8 and
+positions stay 8-aligned — but everything after it can, so the header/length
+reads go through a wrapping `copyOut`.
+
+### Untrusted framing
+
+A record size that is zero, not a multiple of 8, larger than the ring or
+larger than what the producer published; a `PERF_RECORD_SAMPLE` whose raw
+length runs past its own record; a `PERF_RECORD_LOST` too short for its two
+`u64`s; a head behind the tail; a tail off the 8-byte granule — each is a
+typed `ConsumeError`, never a panic and never an out-of-bounds read. (A
+zero size is the one that would otherwise spin the walk forever.)
+
 ## Validation layering (privilege-aware)
 
 Two layers, deliberately split so a CI run without `CAP_BPF` still asserts
 something real:
 
 1. **Unprivileged, always run.** The exact bytes and struct fields each path
-   hands the kernel: the `perf_event_attr` a kprobe attach builds (including
-   the `config1`/`config2` union offsets and the retprobe bit position), the
-   `RTM_SETLINK`+`IFLA_XDP` message as golden bytes (attach, detach and
-   `XDP_FLAGS_REPLACE` variants, re-parsed through the sibling `netlink`
-   codec), the `BPF_PROG_ATTACH` attr union layout with the `BPF_F_ALLOW_*`
-   encodings, and — the backbone — the ring-buffer consumer driven over a
-   **hand-built in-memory fake ring** that reproduces the kernel's three
-   regions, its data-area aliasing, and its release-store publication order.
-   The fake-ring tests cover multi-record walks, wrap-around across the ring
-   end (asserting the returned slice really does start in the first copy and
-   end in the second), discard skipping, busy-record stalling and resumption
-   after commit, zero-length records, `max_records`/stop-action bounds, and
-   six hostile-header cases.
-2. **Privileged, gracefully skipped.** Real attach/detach round trips and a
-   real `BPF_MAP_TYPE_RINGBUF` mmap+consume: load `ringbufEmit`, attach it
-   to a kprobe, trigger it, and read the record back; attach/detach a
-   `cgroup_skb` program in a throwaway child cgroup. Each prints a
+   hands the kernel:
+   - the `perf_event_attr` a kprobe attach builds (the `config1`/`config2`
+     union offsets and the retprobe bit position) and the **uprobe** one
+     (path in `config1`, file offset in `config2`, the USDT `ref_ctr_offset`
+     in `config`'s high half, and the `"config:N"`/`"config:N-M"` PMU
+     `format/*` grammar);
+   - the tracepoint attr (static `PERF_TYPE_TRACEPOINT`, nothing in
+     `config1`/`config2`) and the tracepoint-name validation that keeps a
+     category/name from escaping the `events/` directory;
+   - the `BPF_RAW_TRACEPOINT_OPEN` attr union layout;
+   - the extended `bpf_attr.link_create` as **golden bytes** for the
+     perf-event / XDP / cgroup / tracing cases, plus the `bpf_link_info`
+     prefix and the errno mapping;
+   - the `RTM_SETLINK`+`IFLA_XDP` message as golden bytes (attach, detach and
+     `XDP_FLAGS_REPLACE` variants, re-parsed through the sibling `netlink`
+     codec) and the `BPF_PROG_ATTACH` attr union with its `BPF_F_ALLOW_*`
+     encodings;
+   - `elfsym`: the pure vaddr -> file-offset conversion over hand-written
+     segments (including the skewed and `.bss` cases), a **synthetic ELF64**
+     built byte-by-byte in the test and resolved from a temp file (exact
+     expected offsets, not host-dependent ones), malformed-input cases, and
+     a **real `libc.so.6`** cross-checked against an *independent*
+     derivation — the section headers (`sh_addr`/`sh_offset`) rather than
+     the program headers the module uses. Two tables that must agree;
+   - and — the backbone — both consumers driven over **hand-built in-memory
+     fake rings**. `ringbuf`'s reproduces the kernel's three regions, its
+     data-area aliasing and its release-store publication order (multi-record
+     walks, wrap-around asserting the slice starts in the first copy and ends
+     in the second, discard skipping, busy-record stalling and resumption,
+     zero-length records, `max_records`/stop bounds, six hostile headers).
+     `perfbuf`'s reproduces the control page and — deliberately — the
+     *absence* of a double mapping (multi-record walks, a record split across
+     the ring end asserting it came from the reassembly buffer, a wrapping
+     raw-length field, `PERF_RECORD_LOST` surfaced and accumulated, unknown
+     record types skipped-but-counted, a head that moves mid-iteration,
+     `max_records`/stop bounds, and ten hostile-header cases including the
+     zero-size spin and an over-large wrapping record).
+2. **Privileged, gracefully skipped.** Real attach/detach round trips and
+   real mmap+consume: a `ringbufEmit` program on a kprobe, read back through
+   the ring buffer; a **uprobe** on a symbol in the test binary itself
+   (exported only in test builds), triggered and counted; a **tracepoint** on
+   `syscalls/sys_enter_write` attached over BOTH the link and the forced
+   legacy path; a **raw tracepoint** on `sys_enter`; a **perf buffer** across
+   every online CPU fed by a tracepoint program; and cgroup attach via both
+   `BPF_PROG_ATTACH` and `BPF_LINK_CREATE`, including `BPF_LINK_UPDATE`
+   (plain and `BPF_F_REPLACE`) and `BPF_LINK_GET_FD_BY_ID`. Each prints a
    `SKIPPED:` line and **passes** when the capability is missing, mirroring
    the `opcua` module's podman-gated live tests — a sandboxed run can never
    be mistaken for "verified", but it also never fails for lack of
-   privilege.
+   privilege. Note that `unshare -r` is NOT sufficient: `geteuid() == 0`
+   inside a user namespace is not `CAP_BPF` in the init user namespace, so
+   `bpf()` still fails; the live tests fall through their inner
+   `catch { print SKIPPED; return; }` guards in that case rather than
+   failing.
 
 Privileges required, per operation: `CAP_BPF` (or root) for map creation,
 program load and cgroup attach; additionally `CAP_PERFMON`/`CAP_SYS_ADMIN`
@@ -273,25 +471,50 @@ for the kprobe PMU; `CAP_NET_ADMIN` for XDP.
 
 ## Backlog / deliberately out of scope
 
-- **`BPF_MAP_TYPE_PERF_EVENT_ARRAY` (perfbuf)** — the older, per-CPU
-  predecessor of the ring buffer, with a different mmap layout (a
-  `perf_event_mmap_page` control page per CPU), its own record types
-  (`PERF_RECORD_SAMPLE`/`_LOST`) and a per-CPU fd fan-out. Not a variation
-  on `ringbuf.zig`; a separate consumer.
-- **uprobe / tracepoint / raw-tracepoint attach** — uprobes reuse the same
-  `perf_event_open` shape as `attachKprobe` (a different PMU id, with
-  `config1` = a *path* rather than a symbol), tracepoints go through
-  `/sys/kernel/tracing/events/.../id` + `PERF_TYPE_TRACEPOINT`, and
-  raw-tracepoints use `bpf(BPF_RAW_TRACEPOINT_OPEN)`. Each is additive.
-- **`BPF_LINK_CREATE`-based attachment** (XDP links, `tcx`, `netkit`,
-  fentry/fexit) — the modern, fd-lifetimed alternative; see the XDP
-  rationale above for why the netlink path was chosen first.
+Implemented since the first cut (moved out of this list): the perf-buffer
+consumer, uprobe/uretprobe, tracepoint, raw tracepoint, and
+`BPF_LINK_CREATE`/`_UPDATE`/`_DETACH`/`_GET_FD_BY_ID`/`_GET_NEXT_ID`.
+
+Still deferred, honestly:
+
+- **BTF, and therefore `fentry`/`fexit`/`tp_btf`/LSM programs.** The kernel
+  matches these by `attach_btf_id`, which is set at `BPF_PROG_LOAD` time and
+  requires parsing `/sys/kernel/btf/vmlinux` to turn a function name into an
+  id. `bpflink.linkCreateTracing` exists and works, but only for a program
+  whose `attach_btf_id` the caller already set — the BTF parser itself is a
+  separate, substantial piece of work (it is also the gateway to CO-RE).
+- **`kprobe_multi` / `uprobe_multi`** (`bpf(BPF_LINK_CREATE)` with the
+  `kprobe_multi`/`uprobe_multi` union arms) — attaching one program to
+  thousands of symbols in a single call, the mechanism behind `retsnoop`'s
+  and `bpftrace`'s fast mass-attach. The attr arms are declared in
+  `bpflink.CreateExtra`; the symbol/address array marshalling and the
+  kallsyms-glob resolution are not.
+- **`tcx` / `netkit` attach** — declared in `CreateExtra` (including the
+  `relative_fd`/`expected_revision` ordering fields) but not driven by an
+  entry point; needs 6.6+/6.7+ and has no consumer here yet.
+- **USDT probe discovery.** `UprobeOptions.ref_ctr_offset` carries the
+  semaphore a USDT probe needs, but finding it means parsing the
+  `.note.stapsdt` ELF notes (provider/name/location/base/semaphore, plus the
+  argument descriptor string) — a separate parser on top of `elfsym`.
+- **32-bit and cross-endian ELF** in `elfsym` — refused with
+  `error.UnsupportedElf` rather than mis-parsed. A uprobe is registered
+  against a file the host can execute, so a foreign-class object is a caller
+  mistake.
+- **Symbol demangling and DWARF line lookup** — `elfsym` resolves names as
+  they appear in the symbol table; probing "file:line" or a C++ source name
+  needs debug info this module does not read.
+- **`bpf(BPF_PROG_QUERY)`** — enumerating what is already attached to a
+  cgroup or interface; useful for a "detach whatever is there" tool.
+  (`bpflink.linkNextId` covers the link half of that question.)
 - **cpumap/devmap attach** (`BPF_XDP_CPUMAP`/`BPF_XDP_DEVMAP` programs
   attached via map entries rather than to an interface).
-- **`bpf(BPF_PROG_QUERY)`** — enumerating what is already attached to a
-  cgroup or interface; useful for a "detach whatever is there" tool, not
-  needed by the attach/detach pairs here.
-- A fourth program kind was intentionally NOT added, to keep the surface to
-  exactly `kprobe-counter` / `xdp-filter` / `ringbuf-emit` — see README's
-  "Out of scope" list (BTF/CO-RE, ELF-skeleton loading, tc/classifier
-  programs), each additive rather than a redesign.
+- **AUX/ITRACE perf areas** — the perf-buffer consumer reads the data area
+  only; `aux_head`/`aux_tail` (Intel PT and friends) are a different
+  consumer entirely.
+- A fourth *program* kind was intentionally NOT added, to keep the builder
+  surface to exactly `kprobe-counter` / `xdp-filter` / `ringbuf-emit` — see
+  README's "Out of scope" list (BTF/CO-RE, ELF-skeleton loading,
+  tc/classifier programs), each additive rather than a redesign. The live
+  perf-buffer test's `bpf_perf_event_output` producer is deliberately
+  test-local for the same reason: a public builder would need its own
+  clang-derived golden vector.
