@@ -29,7 +29,7 @@ pub fn load(prog: Program, license: []const u8) !linux.fd_t {
 
 /// Same as `load`, but captures the verifier's human-readable log into
 /// `log_buf` (pass `linux.BPF.F_STRICT_ALIGNMENT`-style flags via `flags` if
-/// needed). Useful while iterating on a `TODO(fable/core)` builder above —
+/// needed). Useful while iterating on a `programs.zig` builder —
 /// `BPF_PROG_LOAD`'s verifier log is the primary offline-adjacent debugging
 /// tool short of a full golden-vector cross-check (see `../SPEC.md`).
 pub fn loadWithLog(prog: Program, license: []const u8, log_buf: []u8, flags: u32) !linux.fd_t {
@@ -54,8 +54,8 @@ test "load: a hand-written trivial socket_filter program loads (needs CAP_BPF/ro
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     if (!hasBpfCapability()) return error.SkipZigTest;
 
-    // Deliberately NOT one of programs.zig's TODO(fable/core) builders
-    // (those panic) — a minimal, hand-verified-safe program exercising only
+    // Deliberately NOT one of programs.zig's builders — a minimal,
+    // hand-verified-safe program exercising only
     // this file's real, non-stub code path: `r0 = 0; exit;` is the same
     // "good_prog" shape std's own bpf.zig test uses.
     const insns = [_]Insn{

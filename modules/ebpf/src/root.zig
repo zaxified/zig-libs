@@ -7,34 +7,30 @@
 //! ships) plus this repo's sibling `netlink` module for the XDP attach
 //! path — nothing here duplicates a std primitive.
 //!
-//! **Status: scaffold, split by difficulty tier so two different follow-up
-//! passes can pick it up independently.**
+//! **Status: complete** — the four parts (build / load / attach / consume)
+//! are all implemented; nothing in this module panics as a placeholder.
 //!
-//! - **`programs.zig` — FABLE tier.** The genuinely hard part: each of the
-//!   three program builders (`kprobeCounter`, `xdpFilter`, `ringbufEmit`) is
-//!   a `@panic("TODO(fable/core): ...")` stub with a doc comment spelling
-//!   out the SPECIFIC in-kernel verifier constraints that program's
-//!   instruction sequence must satisfy (stack-slot initialization before
-//!   `bpf_map_lookup_elem`, mandatory null-checks on
+//! - **`programs.zig`.** The genuinely hard part: three program builders
+//!   (`kprobeCounter`, `xdpFilter`, `ringbufEmit`) whose instruction
+//!   sequences satisfy the in-kernel verifier's constraints (stack-slot
+//!   initialization before `bpf_map_lookup_elem`, mandatory null-checks on
 //!   `PTR_TO_MAP_VALUE_OR_NULL`/`PTR_TO_ALLOC_MEM_OR_NULL`, XDP's
 //!   bounds-check-dominance rule for direct packet access, ringbuf's
-//!   whole-CFG "unreleased reference" tracking). This is a
-//!   constraint-satisfaction problem against the verifier's abstract
-//!   interpreter, not boilerplate — see each function's doc comment and the
-//!   module's difficulty verdict in `README.md`.
-//! - **`load.zig` — NOT a stub.** `std.os.linux.BPF.prog_load` already
-//!   implements `BPF_PROG_LOAD` end-to-end; this file is a real, working
-//!   thin wrapper (proven by its own tests against a real kernel, gated on
-//!   CAP_BPF/root).
-//! - **`attach.zig` / `ringbuf.zig` — OPUS tier.** Mechanical syscall
-//!   plumbing: `perf_event_open` + two ioctls for kprobe attach, a nested
-//!   netlink `RTM_SETLINK`/`IFLA_XDP` message for XDP attach, the one
-//!   missing `BPF_PROG_ATTACH` wrapper std never grew for cgroup attach,
-//!   and an mmap+epoll ring-buffer consumer. No verifier subtlety anywhere
-//!   in this tier — every stub's doc comment names the exact syscalls,
-//!   struct fields, and (where relevant) the ioctl request numbers std
-//!   doesn't define, in enough detail that filling the body is transcription
-//!   against the kernel UAPI headers, not design work.
+//!   whole-CFG "unreleased reference" tracking). Golden-vector tested.
+//! - **`load.zig`.** `std.os.linux.BPF.prog_load` already implements
+//!   `BPF_PROG_LOAD` end-to-end; this file is a thin wrapper over it
+//!   (proven by its own tests against a real kernel, gated on CAP_BPF/root).
+//! - **`attach.zig`.** Three hooks, one uniform `Link` handle:
+//!   `perf_event_open` + `ioctl(SET_BPF)`/`ioctl(ENABLE)` for
+//!   kprobe/kretprobe, a nested netlink `RTM_SETLINK`/`IFLA_XDP` message for
+//!   XDP, and the `BPF_PROG_ATTACH`/`_DETACH` wrapper std never grew for
+//!   cgroups. Lifetime rules differ per hook (a perf fd close detaches; XDP
+//!   and cgroup attachments persist until explicitly detached) — see that
+//!   file's header table.
+//! - **`ringbuf.zig`.** The `BPF_MAP_TYPE_RINGBUF` consumer: the kernel's
+//!   mmap layout (consumer page / producer page / kernel-double-mapped data
+//!   area), acquire/release-ordered position handling, bounds-checked record
+//!   framing, and `epoll`-based polling.
 //!
 //! ```zig
 //! const ebpf = @import("ebpf");
@@ -43,6 +39,7 @@
 //! const prog = ebpf.Program{ .prog_type = .kprobe, .insns = ebpf.kprobeCounter(map_fd) };
 //! const prog_fd = try ebpf.load(prog, "MIT");
 //! var kp = try ebpf.attachKprobe(gpa, "do_sys_openat2", prog_fd);
+//! defer kp.detach();
 //! ```
 //!
 //! Provenance: clean-room from the kernel UAPI (`linux/bpf.h`,
@@ -80,36 +77,62 @@ pub const XdpFilterOptions = programs.XdpFilterOptions;
 pub const RingbufEmitOptions = programs.RingbufEmitOptions;
 pub const BuildError = programs.BuildError;
 
-/// FABLE tier — see `programs.zig`.
+/// Build the `kprobe-counter` program — see `programs.zig`.
 pub const kprobeCounter = programs.kprobeCounter;
-/// FABLE tier — see `programs.zig`.
+/// Build the `xdp-filter` program — see `programs.zig`.
 pub const xdpFilter = programs.xdpFilter;
-/// FABLE tier — see `programs.zig`.
+/// Build the `ringbuf-emit` program — see `programs.zig`.
 pub const ringbufEmit = programs.ringbufEmit;
 
 const load_mod = @import("load.zig");
-/// Real, working — see `load.zig`.
+/// `BPF_PROG_LOAD` — see `load.zig`.
 pub const load = load_mod.load;
-/// Real, working — see `load.zig`.
+/// `BPF_PROG_LOAD` capturing the verifier log — see `load.zig`.
 pub const loadWithLog = load_mod.loadWithLog;
 
-const attach = @import("attach.zig");
+pub const attach = @import("attach.zig");
+
+/// The uniform attachment handle: one `detach()`/`deinit()` for all three
+/// hooks. See `attach.zig`'s header for the per-hook lifetime rules.
+pub const Link = attach.Link;
+pub const DetachError = attach.DetachError;
+
 pub const KprobeHandle = attach.KprobeHandle;
+pub const KprobeOptions = attach.KprobeOptions;
 pub const KprobeAttachError = attach.KprobeAttachError;
+pub const XdpHandle = attach.XdpHandle;
 pub const XdpFlags = attach.XdpFlags;
 pub const XdpAttachError = attach.XdpAttachError;
+pub const CgroupHandle = attach.CgroupHandle;
+pub const CgroupAttachFlags = attach.CgroupAttachFlags;
 pub const CgroupAttachError = attach.CgroupAttachError;
-/// OPUS tier — see `attach.zig`.
+
+/// Attach to a kernel function's entry (`perf_event_open` on the kprobe PMU).
 pub const attachKprobe = attach.attachKprobe;
-/// OPUS tier — see `attach.zig`.
+/// Attach to a kernel function's return.
+pub const attachKretprobe = attach.attachKretprobe;
+/// `attachKprobe` with every knob exposed (`KprobeOptions`).
+pub const attachKprobeOpts = attach.attachKprobeOpts;
+/// Attach as an interface's XDP program (netlink `RTM_SETLINK`+`IFLA_XDP`).
 pub const attachXdp = attach.attachXdp;
-/// OPUS tier — see `attach.zig`.
+/// Remove an interface's XDP program without holding its `XdpHandle`.
+pub const detachXdp = attach.detachXdp;
+/// Attach to a cgroup-v2 directory fd (`bpf(BPF_PROG_ATTACH)`).
 pub const attachCgroup = attach.attachCgroup;
+/// `attachCgroup` with explicit `BPF_F_ALLOW_*` semantics.
+pub const attachCgroupOpts = attach.attachCgroupOpts;
+/// `bpf(BPF_PROG_DETACH)` without holding the `CgroupHandle`.
+pub const detachCgroup = attach.detachCgroup;
 
 pub const ringbuf = @import("ringbuf.zig");
-/// OPUS tier — see `ringbuf.zig`.
+/// `BPF_MAP_TYPE_RINGBUF` consumer — see `ringbuf.zig`.
 pub const RingbufReader = ringbuf.Reader;
 pub const RingbufRecord = ringbuf.Record;
+pub const RingbufAction = ringbuf.Action;
+pub const RingbufSampleFn = ringbuf.SampleFn;
+pub const RingbufOpenError = ringbuf.OpenError;
+pub const RingbufPollError = ringbuf.PollError;
+pub const RingbufConsumeError = ringbuf.ConsumeError;
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────────
 //
