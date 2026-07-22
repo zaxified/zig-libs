@@ -20,6 +20,8 @@ const module_list = [_]Module{
     .{ .name = "http", .deps = &.{"netaddr"} },
     .{ .name = "websocket", .deps = &.{"http"} },
     .{ .name = "accesslog", .deps = &.{"http"} },
+    .{ .name = "staticfiles", .deps = &.{"http"} },
+    .{ .name = "brotli" },
     .{ .name = "dns", .deps = &.{ "netaddr", "http" } },
     .{ .name = "ramcache" },
     .{ .name = "router", .deps = &.{"http"} },

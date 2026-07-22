@@ -1,0 +1,26 @@
+brotli — provenance note
+========================
+
+Kept as a module-local NOTICE (same placement as the sibling clean-room crypto
+modules `ocsp`/`bip340`/`dtls`).
+
+Provenance
+----------
+
+brotli — clean-room pure-Zig implementation from RFC 7932 ("Brotli Compressed
+Data Format"). The decoder, encoder, bit reader, Huffman machinery and command
+decoding are original Zig; no reference implementation's source (google/brotli
+or any other) was ported. The google/brotli C library was used only as an
+oracle to generate byte-exact test vectors and to cross-check decoded output.
+
+Embedded normative constants
+----------------------------
+
+`src/dictionary.bin` (the 122,784-byte static dictionary word list), the context
+lookup table, the 121 transforms and the prefix/suffix pool are the **normative
+constants of RFC 7932** (Appendices A / B / C). They are, by construction,
+byte-identical to those distributed by the google/brotli project (MIT License),
+because both reproduce the same IETF-specified constants — RFC 7932 is a public
+IETF specification and these tables are functional data dictated by the format
+(merger doctrine; see CONVENTIONS.md §5). Credit to the google/brotli authors
+(MIT License) is recorded here for the reproduced normative tables.

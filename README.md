@@ -11,7 +11,7 @@ cross-project-reusable capability — a production-grade implementation of a pro
 or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
 authors' other projects depend on it, not the reverse.
 
-**Status:** 172 modules · 5546 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 174 modules · 5599 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ## Using a module
@@ -104,6 +104,8 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `xmlenc` | XML-Encryption (xmlenc-core-1) **decryption** — recover SAML `EncryptedAssertion` plaintext: RSA-OAEP (SHA-1/256) / rsa-1_5 (Bleichenbacher-gated) / AES-KW key transport + AES-128/256-GCM/CBC content (CBC core vs NIST SP800-38A, AES-KW vs RFC 3394); decrypt-then-verify, strict algorithm allow-list, CEK zeroized | any | xml, rsa |
 | `jwe` | JSON Web Encryption (RFC 7516/7518) compact serialization — `dir`/RSA-OAEP/RSA-OAEP-256/AxxxKW (RFC 3394)/AxxxGCMKW/PBES2/**ECDH-ES** (+A128KW/A256KW; P-256 + X25519 ephemeral, Concat KDF, RFC 7518 App. C KAT) key management + A128GCM/A256GCM/A128CBC-HS256/A256CBC-HS512 content encryption, RFC-KAT-validated (incl. RFC 7516 A.3 byte-exact both directions); A192* unsupported (no AES-192 in std) | any | rsa |
 | `acme` | Let's Encrypt / ACME v2 (RFC 8555): HTTP-01 issuance + renewal, ES256 JWS, CSR | any | http, router |
+| `staticfiles` | path-traversal-safe static file handler over `http` — MIME by extension, ETag / Last-Modified, conditional 304/412, byte-range 206/416; two-layer defense (percent-decode + reject `..`/NUL/backslash → openat-relative single-component `no_follow` resolution, provably contained), symlinks-not-followed + dotfiles-refused by default | any | http |
+| `brotli` | pure-Zig Brotli (RFC 7932) — byte-exact decompressor (full: simple+complex Huffman, context modes, distance ring buffer, static dictionary + 121 transforms; validated vs google/brotli vectors) + a minimal valid store-mode encoder; the `Content-Encoding: br` companion to std gzip | any | — |
 | `accesslog` | structured HTTP access-log formatter — JSON Lines / logfmt / Apache Combined with rigorous log-injection escaping (untrusted UA/path/referer can't forge a line or inject fields) + an http-request→Entry bridge; caller supplies the timestamp | any | http |
 | `websocket` | RFC 6455 WebSocket — opening handshake + frame layer (masking direction enforced, fragmentation, control frames, UTF-8 validation, close codes, per-frame + aggregate size caps), transport-agnostic server + client; permessage-deflate deferred | any | http |
 | `sessions` | Server-side web sessions + OWASP-hardened cookies + signed double-submit **CSRF** middleware | any | router, http, cookies, ramcache |
