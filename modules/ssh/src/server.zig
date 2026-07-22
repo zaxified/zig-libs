@@ -68,21 +68,9 @@ fn fillRandom(buf: []u8) void {
 // ── small wire/hash helpers (mirror transport.zig privates) ─────────────────
 
 /// A non-allocating cursor over an SSH wire blob (`uint32 len || bytes`).
-/// Mirrors transport.zig's private `SliceReader`.
-const WireCursor = struct {
-    b: []const u8,
-    i: usize = 0,
-
-    fn string(self: *WireCursor) transport.TransportError![]const u8 {
-        if (self.i + 4 > self.b.len) return error.ProtocolError;
-        const len = std.mem.readInt(u32, self.b[self.i..][0..4], .big);
-        self.i += 4;
-        if (@as(usize, len) + self.i > self.b.len) return error.ProtocolError;
-        const s = self.b[self.i .. self.i + len];
-        self.i += len;
-        return s;
-    }
-};
+/// Single shared definition in `messages.zig` (was a local mirror of
+/// `transport.zig`'s private `SliceReader`; both are now the same type).
+const WireCursor = messages.Cursor;
 
 /// `update` with a `string`-framed (uint32 length-prefixed) value — the RFC
 /// 4253 §8 exchange-hash convention. Mirrors transport.zig's `hashString`.

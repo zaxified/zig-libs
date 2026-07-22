@@ -686,20 +686,10 @@ pub const SessionId = struct {
 };
 
 /// A non-allocating cursor over an SSH wire blob (`uint32 len || bytes`).
-const SliceReader = struct {
-    b: []const u8,
-    i: usize = 0,
-
-    fn string(self: *SliceReader) TransportError![]const u8 {
-        if (self.i + 4 > self.b.len) return error.ProtocolError;
-        const len = std.mem.readInt(u32, self.b[self.i..][0..4], .big);
-        self.i += 4;
-        if (@as(usize, len) + self.i > self.b.len) return error.ProtocolError;
-        const s = self.b[self.i .. self.i + len];
-        self.i += len;
-        return s;
-    }
-};
+/// Single definition, shared with `server.zig`/`userauth.zig`/
+/// `connection.zig`: `messages.Cursor` (bounds-checked; a peer-controlled
+/// length can only ever yield `error.ProtocolError`).
+const SliceReader = messages.Cursor;
 
 fn hashString(sh: *Sha256, data: []const u8) void {
     var lb: [4]u8 = undefined;
@@ -726,9 +716,17 @@ fn msgType(p: Packet) u8 {
     return if (p.payload.len == 0) 0 else p.payload[0];
 }
 
-/// Verify the host-key signature `sig_blob` over the exchange hash `H`,
-/// dispatched by the key type in `k_s` and the algorithm string in `sig_blob`.
-fn verifySignature(key_type: []const u8, k_s: []const u8, sig_blob: []const u8, h: []const u8) TransportError!void {
+/// Verify an SSH public-key signature blob `sig_blob` (`string algorithm ||
+/// string raw-signature`) over `h`, dispatched by the key type in the key
+/// blob `k_s` and the algorithm string inside `sig_blob`.
+///
+/// Used twice, with the same wire formats (RFC 4253 §6.6 / RFC 8332 §3 / RFC
+/// 5656 §3.1.2) but two different signed messages: the host-key signature
+/// over the exchange hash `H` (client side of KEX, below) and the RFC 4252 §7
+/// `publickey` userauth signature over the session-id-bound request blob
+/// (server side, `userauth.zig`) — hence `pub`, so the userauth layer does
+/// not mirror this dispatch.
+pub fn verifySignature(key_type: []const u8, k_s: []const u8, sig_blob: []const u8, h: []const u8) TransportError!void {
     var sr = SliceReader{ .b = sig_blob };
     const sig_algo = try sr.string();
     const sig_bytes = try sr.string();
@@ -1517,6 +1515,30 @@ pub const Transport = struct {
     /// Receive one binary packet through `read_cipher` into `buf`.
     pub fn recvPacket(t: *Transport, buf: []u8) TransportError!Packet {
         return readPacket(t.reader, &t.read_cipher, buf);
+    }
+
+    /// Send SSH_MSG_DISCONNECT (RFC 4253 §11.1): `byte 1 || uint32 reason ||
+    /// string description || string language-tag`. The connection is dead
+    /// afterwards — the caller closes the underlying stream. Best-effort: a
+    /// write failure is the caller's to ignore (the peer is going away
+    /// anyway), which is why this returns the write error rather than
+    /// swallowing it.
+    pub fn sendDisconnect(
+        t: *Transport,
+        reason: messages.DisconnectReason,
+        description: []const u8,
+    ) TransportError!void {
+        var buf: [512]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        try w.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_DISCONNECT));
+        var rb: [4]u8 = undefined;
+        std.mem.writeInt(u32, &rb, @intFromEnum(reason), .big);
+        try w.writeAll(&rb);
+        // Truncate rather than fail: the description is diagnostic only.
+        const d = if (description.len > 256) description[0..256] else description;
+        try messages.writeString(&w, d);
+        try messages.writeString(&w, ""); // language tag
+        return t.sendPacket(w.buffered());
     }
 
     /// Send SSH_MSG_SERVICE_REQUEST for `service` and wait for the matching

@@ -1,79 +1,67 @@
 # ssh
 
-SSH-2.0 transport layer, **client and server**. **Part 1 (this pass): the RFC
-4253 transport layer** — version exchange, KEXINIT algorithm negotiation,
-curve25519-sha256 (RFC 8731) key exchange, the RFC 4253 §6 Binary Packet
-Protocol, and cipher/MAC state — is **fully implemented for both roles** and
-validated against live OpenSSH. Userauth (RFC 4252, part 2) and
-connection-protocol channels (RFC 4254, part 3) are reserved top-level
-placeholders — see `src/root.zig`.
+A complete pure-Zig **SSH-2.0 client and server**: transport (RFC 4253), user
+authentication (RFC 4252) and the connection protocol (RFC 4254) — i.e.
+everything needed to **run a remote command over SSH**, both as the client and
+as the server. No `@panic` stubs remain in this module.
 
-**Status: transport layer IMPLEMENTED (client + server).** `clientHandshake`
-(`transport.zig`) performs version exchange, KEXINIT negotiation,
-curve25519-sha256 KEX, the Binary Packet Protocol, `chacha20-poly1305@openssh.com`
-and `aes256-ctr`/`hmac-sha2-256` ciphers, and host-key *verification*
-(ssh-ed25519 / ecdsa-sha2-nistp256 / rsa-sha2-256/512 via the `rsa` module),
-establishing an encrypted, host-authenticated `Transport`. `serverHandshake`/
-`accept` (`server.zig`) is the responder-role mirror — host-key *signing*
-(`HostKey` loaded from an openssh-key-v1 file: ed25519 + rsa; `publicBlob`;
-`sign`) plus `curve25519KexServer` — reusing (not duplicating) the client's
-packet codec, `KexInit`, `deriveKeys`, and `Transport` struct. Validated with
-**live interop against real OpenSSH 10.2p1 both directions**: our client ↔
-real `sshd`, and real OpenSSH `ssh` ↔ our server (4 host-key×cipher
-combinations), plus KAT/self-consistency tests — 35 tests total, Debug and
-ReleaseFast, 0 skipped.
+**Status: parts 1-3 IMPLEMENTED (client + server).**
 
-Userauth (RFC 4252) and connection-protocol channels (RFC 4254 —
-`openSession`/`exec`) are **still genuine reserved stubs** (`@panic`) — not
-implemented yet; see the Backlog in `SPEC.md`.
+- **Part 1 — transport** (`transport.zig` client, `server.zig` server): version
+  exchange, KEXINIT negotiation, `mlkem768x25519-sha256` / `curve25519-sha256`
+  (RFC 8731) / `diffie-hellman-group14-sha256` / `-group16-sha512` key
+  exchange, the RFC 4253 §6 Binary Packet Protocol,
+  `chacha20-poly1305@openssh.com` / `aes256-ctr`+`hmac-sha2-256` /
+  `aes{128,256}-gcm@openssh.com` ciphers, and host-key *verification* (client)
+  / *signing* (server) for ssh-ed25519, rsa-sha2-256/512 (via the `rsa` module)
+  and ecdsa-sha2-nistp256.
+- **Part 2 — userauth** (`userauth.zig`): the `publickey` method (RFC 4252 §7)
+  including the two-phase query → `SSH_MSG_USERAUTH_PK_OK` → signed-request
+  flow, and the `password` method (§8), plus `_FAILURE`/`_SUCCESS`/`_BANNER` —
+  both roles. The signature is bound to the transport's session id (see
+  SPEC.md §2: that binding is the security property).
+- **Part 3 — connection protocol** (`connection.zig`): `"session"` channels
+  with real RFC 4254 §5.2 window/flow control, `CHANNEL_DATA` /
+  `_EXTENDED_DATA` (stderr) / `_EOF` / `_CLOSE`, and the `"exec"` /
+  `"subsystem"` requests plus §6.10 `exit-status` — both roles.
 
-- **Model after:** RFC 4253 (Transport Layer Protocol) / RFC 4251 (Protocol
-  Architecture — wire types) / RFC 4252 (Authentication Protocol, not yet
-  implemented) / RFC 4254 (Connection Protocol, not yet implemented) / RFC
-  8731 (curve25519-sha256 key exchange). Design reference:
-  ringtailsoftware/misshod (MIT) for architecture *shape* only — no source
-  copied.
+Validated with **live interop against real OpenSSH 10.2p1 in both
+directions, including authentication and command execution**: our client
+authenticates to a spawned real `sshd` with a public key and runs a command
+(asserting stdout, stderr and exit status), and a real `ssh` client
+authenticates to our server and runs one. 79 tests, Debug and ReleaseFast,
+0 skipped.
+
+- **Model after:** RFC 4253 (Transport) / RFC 4251 (Architecture — wire types)
+  / RFC 4252 (Authentication) / RFC 4254 (Connection) / RFC 8731
+  (curve25519-sha256) / RFC 8332, 8709, 5656 (host+user key algorithms).
+  Design reference: ringtailsoftware/misshod (MIT) for architecture *shape*
+  only — no source copied.
 - **Platform:** any. **Role:** both (client + server). **Concurrency:**
   single_owner — one `Transport` instance owns one connection's
   sequence-number/cipher state; no shared/global state.
-- **Deps:** `rsa` (this repo's own module) — for `rsa-sha2-256`/
-  `rsa-sha2-512` (RFC 8332) host-key signature verify (client) / sign
-  (server).
-- **Crypto:** Zig `std.crypto` — X25519 (KEX), Ed25519/P-256 (host-key
-  signature verify/sign), ChaCha20-Poly1305 / AES-256-CTR (ciphers), SHA-2 /
-  HMAC-SHA2-256 (hash/MAC).
+- **Deps:** `rsa` (this repo's own module) — for `rsa-sha2-256`/`rsa-sha2-512`
+  (RFC 8332) signature verify/sign, as host keys and as user keys.
+- **Crypto:** Zig `std.crypto` — X25519 + ML-KEM-768 (KEX), Ed25519/P-256
+  (signatures), ChaCha20-Poly1305 / AES-CTR / AES-GCM (ciphers), SHA-2 /
+  HMAC-SHA2-256.
 
 ## Provenance
 
-Clean-room implementation from RFC 4253/4251/4252/4254 + RFC 8731
-(curve25519-sha256). The `chacha20-poly1305@openssh.com` cipher framing
-follows the OpenSSH `PROTOCOL`/`PROTOCOL.chacha20poly1305` notes and RFC
-5647 — public documentation of OpenSSH's own wire-format extensions, not
-OpenSSH source. Design reference: ringtailsoftware/misshod (MIT) —
-architecture shape only (the version-exchange → KEXINIT → KEX → NEWKEYS →
-Binary-Packet-Protocol layering), no source consulted or copied. No
-GPL/LGPL dependency anywhere in this module. See `NOTICE` for the canonical
-design-reference entry.
+Clean-room implementation from RFC 4253/4251/4252/4254 + RFC 8731. The
+`chacha20-poly1305@openssh.com` cipher framing follows the OpenSSH
+`PROTOCOL`/`PROTOCOL.chacha20poly1305` notes and RFC 5647 — public
+documentation of OpenSSH's own wire-format extensions, not OpenSSH source.
+Design reference: ringtailsoftware/misshod (MIT) — architecture shape only,
+no source consulted or copied. No GPL/LGPL dependency anywhere in this
+module. See `NOTICE` for the canonical design-reference entry.
 
 ## API
 
 ```zig
 const ssh = @import("ssh");
 
-// Wire-format helpers (messages.zig):
-var w: std.Io.Writer = ...;
-try ssh.messages.writeString(&w, "hello");
-try ssh.messages.writeMpint(&w, big_endian_magnitude_bytes);
-try ssh.messages.writeNameList(&w, &.{ "curve25519-sha256", "curve25519-sha256@libssh.org" });
-
-var r: std.Io.Reader = ...;
-const s = try ssh.messages.readString(gpa, &r); // caller frees
-const m = try ssh.messages.readMpint(gpa, &r); // caller frees
-var list = try ssh.messages.readNameList(gpa, &r);
-defer list.deinit();
-
-// Client (transport.zig) — connect + handshake against an already-connected
-// reader/writer pair (this module never opens a socket itself):
+// ── client: connect → authenticate → run a command ────────────────────────
 fn verifyHostKey(key_type: []const u8, key_blob: []const u8) bool {
     // caller's own known_hosts/TOFU/pinning policy — return true to trust.
     _ = key_type;
@@ -82,61 +70,101 @@ fn verifyHostKey(key_type: []const u8, key_blob: []const u8) bool {
 }
 
 var t = try ssh.transport.connect(&reader, &writer, gpa, verifyHostKey);
-// ...or step-by-step:
-// var t = ssh.transport.Transport.init(&reader, &writer);
-// try t.clientHandshake(gpa, verifyHostKey);
 
-try t.sendPacket(payload);
-var buf: [35000]u8 = undefined;
-const pkt = try t.recvPacket(&buf);
-try t.requestService("ssh-userauth", &buf); // proves the encrypted channel end-to-end
+// RFC 4252 publickey (requests the ssh-userauth service, then authenticates;
+// the signature is bound to t.session_id).
+const key = try ssh.userauth.AuthKey.fromOpenSSH(id_ed25519_text, null);
+try ssh.authenticate(&t, gpa, "alice", key);
+// ...or step-by-step / other methods:
+// try t.requestService("ssh-userauth", &buf);
+// try ssh.userauth.authenticatePublickey(&t, gpa, "alice", key, .{});
+// try ssh.userauth.authenticatePassword(&t, gpa, "alice", secret);
 
-// Server (server.zig) — load a host key and accept a connection:
-const host_key = try ssh.server.HostKey.fromOpenSSH(openssh_key_v1_text, null); // ed25519 or rsa
+// RFC 4254 exec: one call, stdout + stderr + exit status.
+var r = try ssh.exec(&t, gpa, "uname -a", .{});
+defer r.deinit(gpa);
+std.debug.print("{s} (exit {?d})\n", .{ r.stdout, r.exit_status });
+
+// ...or drive the channel yourself (streaming; this is what a NETCONF /
+// RFC 6242 caller wants):
+var s = try ssh.openSession(&t, gpa, .{});
+defer s.deinit();
+try s.subsystem("netconf");
+try s.writeData(hello_xml);
+while (...) {
+    _ = try s.pumpOnce(); // fills s.stdout / s.stderr, keeps the window open
+}
+try s.close();
+
+// ── server: accept → authenticate → serve one session channel ─────────────
+fn authorizedKey(user: []const u8, algorithm: []const u8, key_blob: []const u8) bool {
+    // caller's own authorized_keys policy.
+    _ = algorithm;
+    return std.mem.eql(u8, user, "alice") and std.mem.eql(u8, key_blob, alice_blob);
+}
+
+fn runCommand(
+    a: std.mem.Allocator,
+    user: []const u8,
+    command: []const u8,
+    stdin: []const u8,
+    stdout: *std.ArrayList(u8),
+    stderr: *std.ArrayList(u8),
+) ssh.connection.CommandError!u32 {
+    _ = stdin;
+    try stdout.print(a, "hello {s}, you asked for {s}\n", .{ user, command });
+    _ = stderr;
+    return 0; // exit status
+}
+
+const host_key = try ssh.server.HostKey.fromOpenSSH(openssh_key_v1_text, null);
 var st = try ssh.server.accept(&reader, &writer, gpa, .{ .host_keys = &.{host_key} });
-// ...or step-by-step:
-// var st = ssh.transport.Transport.init(&reader, &writer);
-// try ssh.server.serverHandshake(&st, gpa, .{ .host_keys = &.{host_key} });
 
-// Reserved for later parts (still stubs):
-ssh.userauth(); // RFC 4252, part 2 — @panic
-ssh.openSession(); // RFC 4254, part 3 — @panic
-ssh.exec(); // RFC 4254, part 3 — @panic
+const auth = try ssh.userauth.serveUserauth(&st, gpa, .{ .authorized_key = authorizedKey });
+try ssh.connection.serveSession(&st, gpa, .{ .user = auth.user(), .exec = runCommand });
 ```
 
-See `src/transport.zig` for the full client API (algorithm name-list
-constants, `KexInit`, `IdentificationString`/`exchangeVersions`,
-`Packet`/`CipherState`/`readPacket`/`writePacket`, `HostKeyVerifier`,
-`curve25519Kex`/`deriveKeys`, `Transport`/`connect`) and `src/server.zig` for
-the server API (`HostKey`, `ServerConfig`, `curve25519KexServer`,
-`serverHandshake`/`accept`), and `SPEC.md` for the design/threat notes and
-the userauth/channels backlog.
+Top-level shortcuts: `ssh.authenticate` (client publickey auth),
+`ssh.openSession` (= `ssh.connection.Session.open`), `ssh.exec`
+(= `ssh.connection.exec`). Namespaces: `ssh.transport`, `ssh.server`,
+`ssh.userauth`, `ssh.connection`, `ssh.messages`.
 
-## Server side (`src/server.zig`) — implemented
+See `src/transport.zig` for the full client transport API (algorithm
+name-list constants, `KexInit`, `exchangeVersions`, `Packet`/`CipherState`/
+`readPacket`/`writePacket`, `HostKeyVerifier`, `Transport`/`connect`),
+`src/server.zig` for the server transport API (`HostKey`, `ServerConfig`,
+`serverHandshake`/`accept`), `src/userauth.zig` and `src/connection.zig` for
+parts 2 and 3, and `SPEC.md` for the design/threat notes and what is
+deferred.
 
-The SSH **server** (responder) role is implemented in `src/server.zig`:
-`HostKey` (host private-key load from openssh-key-v1 text — ed25519 and rsa
-— plus `publicBlob`/`sign`/`algorithmName`), `ServerConfig`, and
-`serverHandshake`/`accept` (the responder-role mirror of
-`Transport.clientHandshake`/`connect`). It reuses (does not duplicate)
-`transport.zig`'s packet codec, `KexInit`, `deriveKeys`, and the `Transport`
-struct itself; the responder-role KEX exchange (`curve25519KexServer`) and
-host-key *signing* (as opposed to the client's host-key signature
-*verification*) are the new, server-only pieces. Live-interop-verified
-against a real OpenSSH `ssh` client across ed25519/rsa-sha2-256/rsa-sha2-512
-host keys × chacha20-poly1305/aes256-ctr ciphers. See `src/server.zig`'s doc
-comments for the full reuse-vs-new breakdown.
+## What is deliberately not implemented
+
+`keyboard-interactive` and `hostbased` authentication, the password-*change*
+sub-protocol, agent forwarding, OpenSSH certificate key types; `pty-req` /
+`shell` / `env` / `signal` / `exit-signal` / `window-change` channel requests,
+X11 and TCP/IP port forwarding; more than one channel per connection;
+rekeying; compression. Requests for any of them are answered
+`SSH_MSG_CHANNEL_FAILURE` / `SSH_MSG_CHANNEL_OPEN_FAILURE` rather than
+mishandled. See SPEC.md → Backlog.
 
 ## Tests
 
-`zig build test-ssh` — 35 tests, all passing (Debug and ReleaseFast): the
-wire-format round-trip tests in `messages.zig` (string/mpint incl. the
-high-bit zero-pad rule/name-list, plus an oversize-length rejection test),
-KAT/self-consistency tests for KEXINIT encode/decode, curve25519 KEX, key
-derivation, and the Binary Packet Protocol ciphers, `HostKey.fromOpenSSH`
-fixture tests (ed25519 + rsa, `K_S` checked against `ssh-keygen`'s `.pub`
-blob), and **live interop tests against real OpenSSH 10.2p1** (gated:
-skipped if `sshd`/`ssh-keygen`/`ssh` aren't on `PATH`) — our client against a
-locally spawned real `sshd` (chacha20-poly1305 and aes256-ctr), and a real
-`ssh` client against our server (4 host-key×cipher combinations). No stub
-`@panic` body is ever invoked by the test suite.
+`zig build test-ssh` — **79 tests, Debug and ReleaseFast, 0 skipped** with
+OpenSSH installed:
+
+- wire-codec round-trips and `Cursor` bounds tests (oversize/off-by-one/
+  truncated lengths are typed errors, never panics);
+- transport KAT/self-consistency (KEXINIT, KDF, every cipher, tamper
+  detection, RFC 3526 primes, degenerate DH values);
+- `HostKey.fromOpenSSH` fixtures checked against `ssh-keygen`'s `.pub` blob;
+- userauth unit tests (`signedBlob` field order, session-id sensitivity, the
+  algorithm↔key-blob-type pairing, crafted-wire oversize rejection);
+- **full-stack loopback self-interop** — our client ↔ our server over a real
+  socket: KEX → publickey userauth → channel open → exec → stdout/stderr/
+  exit-status → close, incl. 100 KB of output through a 16 KB window so the
+  flow control really blocks;
+- **reject-teeth with positive controls** — wrong session id, unauthorized
+  key, channel-open before auth, request after close, window overrun, unknown
+  channel type;
+- **live interop against real OpenSSH 10.2p1 both directions, incl. publickey
+  auth and `exec`** (skipped if `sshd`/`ssh`/`ssh-keygen` are absent).

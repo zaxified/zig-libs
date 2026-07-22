@@ -1,19 +1,18 @@
 // SPDX-License-Identifier: MIT
 
-//! SSH-2.0 message numbers (RFC 4253 §12) and the RFC 4251 §5 wire-format
-//! primitives (byte string / mpint / name-list) all SSH messages are built
-//! from. The wire helpers below are pure data-format code (no crypto, no
-//! protocol state) so they are implemented for real, not stubbed — everything
-//! that touches KEX/cipher/protocol *logic* lives in `transport.zig` instead
-//! and stays `@panic("TODO(agent): ...")` until the crypto-implementation
-//! pass.
+//! SSH-2.0 message numbers (RFC 4253 §12, RFC 4252 §6, RFC 4254 §9) and the
+//! RFC 4251 §5 wire-format primitives (byte string / mpint / name-list) all
+//! SSH messages are built from, plus `Cursor`, the non-allocating bounded
+//! reader every message parser in this module decodes a received payload
+//! with. Pure data-format code (no crypto, no protocol state) — everything
+//! that touches KEX/cipher/protocol *logic* lives in `transport.zig`,
+//! `server.zig`, `userauth.zig` and `connection.zig` instead.
 
 const std = @import("std");
 
-/// SSH message numbers (RFC 4253 §12 "Message Numbers" + RFC 8731 naming).
-/// Transport-layer subset only — userauth (RFC 4252, numbers 50-79) and
-/// connection-protocol/channel (RFC 4254, numbers 90-100+) message numbers
-/// belong to the later parts of this module and are not listed here yet.
+/// SSH message numbers: the RFC 4253 §12 transport-layer set (+ RFC 8731
+/// naming), the RFC 4252 §6 userauth set (50-60), and the RFC 4254 §9
+/// connection-protocol set (80-100).
 pub const MessageType = enum(u8) {
     SSH_MSG_DISCONNECT = 1,
     SSH_MSG_IGNORE = 2,
@@ -29,7 +28,107 @@ pub const MessageType = enum(u8) {
     SSH_MSG_KEXDH_INIT = 30,
     /// aka SSH_MSG_KEX_ECDH_REPLY (RFC 8731) — see `SSH_MSG_KEXDH_INIT`.
     SSH_MSG_KEXDH_REPLY = 31,
+
+    // ── userauth (RFC 4252 §6) ──────────────────────────────────────────
+    SSH_MSG_USERAUTH_REQUEST = 50,
+    SSH_MSG_USERAUTH_FAILURE = 51,
+    SSH_MSG_USERAUTH_SUCCESS = 52,
+    SSH_MSG_USERAUTH_BANNER = 53,
+    /// 60 is method-specific (RFC 4252 §6: "in the range 60..79 ... only
+    /// valid during the authentication method they belong to"). For the
+    /// `publickey` method it is SSH_MSG_USERAUTH_PK_OK (RFC 4252 §7); for
+    /// `password` the same number is SSH_MSG_USERAUTH_PASSWD_CHANGEREQ
+    /// (§8), which this module never sends and rejects on receipt.
+    SSH_MSG_USERAUTH_PK_OK = 60,
+
+    // ── connection protocol (RFC 4254 §9) ───────────────────────────────
+    SSH_MSG_GLOBAL_REQUEST = 80,
+    SSH_MSG_REQUEST_SUCCESS = 81,
+    SSH_MSG_REQUEST_FAILURE = 82,
+    SSH_MSG_CHANNEL_OPEN = 90,
+    SSH_MSG_CHANNEL_OPEN_CONFIRMATION = 91,
+    SSH_MSG_CHANNEL_OPEN_FAILURE = 92,
+    SSH_MSG_CHANNEL_WINDOW_ADJUST = 93,
+    SSH_MSG_CHANNEL_DATA = 94,
+    SSH_MSG_CHANNEL_EXTENDED_DATA = 95,
+    SSH_MSG_CHANNEL_EOF = 96,
+    SSH_MSG_CHANNEL_CLOSE = 97,
+    SSH_MSG_CHANNEL_REQUEST = 98,
+    SSH_MSG_CHANNEL_SUCCESS = 99,
+    SSH_MSG_CHANNEL_FAILURE = 100,
     _,
+};
+
+/// RFC 4254 §5.2 `data_type_code` for SSH_MSG_CHANNEL_EXTENDED_DATA. Only
+/// stderr is defined by the RFC.
+pub const extended_data_stderr: u32 = 1;
+
+/// RFC 4254 §5.1 SSH_MSG_CHANNEL_OPEN_FAILURE `reason code`s.
+pub const ChannelOpenFailureReason = enum(u32) {
+    administratively_prohibited = 1,
+    connect_failed = 2,
+    unknown_channel_type = 3,
+    resource_shortage = 4,
+    _,
+};
+
+/// RFC 4253 §11.1 SSH_MSG_DISCONNECT `reason code`s (subset this module
+/// ever sends).
+pub const DisconnectReason = enum(u32) {
+    protocol_error = 2,
+    key_exchange_failed = 3,
+    mac_error = 5,
+    service_not_available = 7,
+    no_more_auth_methods_available = 14,
+    _,
+};
+
+// ── bounded cursor over a received payload ─────────────────────────────────
+
+pub const CursorError = error{ProtocolError};
+
+/// A non-allocating cursor over an SSH wire blob (a decrypted packet payload,
+/// a key blob, a signature blob …). Every accessor is bounds-checked against
+/// the slice it was built from, so a peer-controlled `uint32` length can only
+/// ever produce `error.ProtocolError` — never a panic, an out-of-bounds read,
+/// or an allocation the peer sized. This is the ONLY message-decoding
+/// primitive the userauth/connection layers use.
+pub const Cursor = struct {
+    b: []const u8,
+    i: usize = 0,
+
+    /// RFC 4251 §5 `string`: `uint32 len || bytes`. The returned slice
+    /// borrows from the underlying buffer (no copy, no allocation).
+    pub fn string(self: *Cursor) CursorError![]const u8 {
+        const len = try self.uint32();
+        if (@as(usize, len) > self.b.len - self.i) return error.ProtocolError;
+        const s = self.b[self.i .. self.i + len];
+        self.i += len;
+        return s;
+    }
+
+    pub fn byte(self: *Cursor) CursorError!u8 {
+        if (self.i >= self.b.len) return error.ProtocolError;
+        const v = self.b[self.i];
+        self.i += 1;
+        return v;
+    }
+
+    /// RFC 4251 §5 `boolean`: any non-zero byte is true.
+    pub fn boolean(self: *Cursor) CursorError!bool {
+        return (try self.byte()) != 0;
+    }
+
+    pub fn uint32(self: *Cursor) CursorError!u32 {
+        if (self.b.len - self.i < 4) return error.ProtocolError;
+        const v = std.mem.readInt(u32, self.b[self.i..][0..4], .big);
+        self.i += 4;
+        return v;
+    }
+
+    pub fn atEnd(self: *const Cursor) bool {
+        return self.i >= self.b.len;
+    }
 };
 
 // ── RFC 4251 §5 wire-format primitives ──────────────────────────────────────
@@ -241,6 +340,46 @@ test "writeNameList/readNameList round-trip" {
     try t.expectEqualStrings("curve25519-sha256", it.next().?);
     try t.expectEqualStrings("curve25519-sha256@libssh.org", it.next().?);
     try t.expectEqual(@as(?[]const u8, null), it.next());
+}
+
+test "Cursor: decodes byte/boolean/uint32/string in sequence" {
+    const t = std.testing;
+    var out: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&out);
+    try w.writeByte(50);
+    try writeString(&w, "alice");
+    try w.writeByte(1);
+    var nb: [4]u8 = undefined;
+    std.mem.writeInt(u32, &nb, 0xdeadbeef, .big);
+    try w.writeAll(&nb);
+
+    var c = Cursor{ .b = w.buffered() };
+    try t.expectEqual(@as(u8, 50), try c.byte());
+    try t.expectEqualStrings("alice", try c.string());
+    try t.expectEqual(true, try c.boolean());
+    try t.expectEqual(@as(u32, 0xdeadbeef), try c.uint32());
+    try t.expect(c.atEnd());
+    try t.expectError(error.ProtocolError, c.byte());
+}
+
+test "Cursor: an attacker-controlled oversize string length is a typed error" {
+    const t = std.testing;
+    // uint32 length 0xffff_ffff followed by 3 bytes of body: the announced
+    // length dwarfs the buffer. Must be error.ProtocolError, never a panic
+    // and never an out-of-bounds slice.
+    const evil = [_]u8{ 0xff, 0xff, 0xff, 0xff, 'a', 'b', 'c' };
+    var c = Cursor{ .b = &evil };
+    try t.expectError(error.ProtocolError, c.string());
+
+    // Off-by-one: length is one byte more than what remains.
+    const short = [_]u8{ 0x00, 0x00, 0x00, 0x04, 'a', 'b', 'c' };
+    var c2 = Cursor{ .b = &short };
+    try t.expectError(error.ProtocolError, c2.string());
+
+    // Truncated length prefix itself.
+    const trunc = [_]u8{ 0x00, 0x00 };
+    var c3 = Cursor{ .b = &trunc };
+    try t.expectError(error.ProtocolError, c3.uint32());
 }
 
 test "writeNameList/readNameList round-trip: empty list" {
