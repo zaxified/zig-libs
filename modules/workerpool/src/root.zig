@@ -701,6 +701,87 @@ test "STRESS: many concurrent producers via Submitter + pool consuming (MP)" {
     try testing.expectEqual(n_producers * per_producer, pool.completedCount());
 }
 
+test "STRESS: repeated idle→submit→wake hammers the park/wake boundary" {
+    // The "idle → wake" test above fires the park→submit→wake edge exactly
+    // once (after a 100 ms settle). A lost-wakeup regression that strands a job
+    // only intermittently would slip through that single shot. This loops the
+    // edge thousands of times against one long-lived pool: each iteration waits
+    // for its job to run — so the workers drain to empty and re-park — before
+    // the next submit races those parked (or just-about-to-park) workers. A
+    // single lost wakeup stalls the completion poll and the watchdog panics.
+    // (x86-TSO caveat: a green run here is necessary, not sufficient — the
+    // seq_cst ordering discipline is what makes it sound on weak memory.)
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 2 });
+    defer pool.deinit();
+
+    var wd = Watchdog{ .io = io, .timeout_ms = 30_000 };
+    try wd.start();
+    defer wd.finish();
+
+    var c = Counter{};
+    var poll = std.atomic.Value(u32).init(0);
+    const iters: u64 = 5000;
+    var i: u64 = 0;
+    while (i < iters) : (i += 1) {
+        try pool.submit(.{ .func = incr, .ctx = &c });
+        // Block until THIS job has run before submitting the next, so workers
+        // observe the queue empty and re-park between iterations — maximizing
+        // the number of genuine park→wake transitions exercised.
+        while (c.n.load(.seq_cst) < i + 1) {
+            io.futexWaitTimeout(u32, &poll.raw, 0, .{ .duration = .{
+                .raw = .fromMilliseconds(1),
+                .clock = .awake,
+            } }) catch {};
+        }
+    }
+    try testing.expectEqual(iters, c.n.load(.seq_cst));
+    pool.drain();
+    try testing.expectEqual(iters, pool.completedCount());
+}
+
+test "STRESS: submitter register/deinit churn (dynamic EBR slot reuse)" {
+    // Area 3: register/deinit a `Submitter` thousands of times so its EBR
+    // participant slot is reused over and over WHILE the workers consume and
+    // advance epochs. This hammers the dynamic-registration path — the `in_use`
+    // CAS + `local_epoch` reset on a recycled slot racing the workers'
+    // `tryAdvance` scans. A reclamation bug on slot reuse would surface as a
+    // poison-canary trip (propagated as an init/submit error) or a hang.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const pool = try WorkerPool.init(testing.allocator, .{
+        .io = io,
+        .n_workers = 4,
+        .max_submitters = 1,
+    });
+    defer pool.deinit();
+
+    var wd = Watchdog{ .io = io, .timeout_ms = 30_000 };
+    try wd.start();
+    defer wd.finish();
+
+    var c = Counter{};
+    const cycles: u64 = 4000;
+    const per_cycle: u64 = 8;
+    var i: u64 = 0;
+    while (i < cycles) : (i += 1) {
+        var sub = try pool.registerSubmitter();
+        var j: u64 = 0;
+        while (j < per_cycle) : (j += 1)
+            try sub.submit(.{ .func = incr, .ctx = &c });
+        sub.deinit(); // unregister → the single submitter slot is reused next cycle
+    }
+
+    pool.drain();
+    try testing.expectEqual(cycles * per_cycle, c.n.load(.seq_cst));
+    try testing.expectEqual(cycles * per_cycle, pool.completedCount());
+}
+
 test "default n_workers derives from cpu count and is ≥ 1" {
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
