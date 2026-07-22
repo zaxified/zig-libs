@@ -6,7 +6,10 @@
 //! `PublicKey.fromBytes`, `SecretKey.fromPrimes`, the RSASSA-PKCS1-v1_5
 //! scheme (`signPkcs1v15`/`verifyPkcs1v15`, SHA-1/224/256/384/512), the
 //! RSAES-OAEP scheme (`encryptOaep`/`decryptOaep`, MGF1, constant-time
-//! decode), the RSASSA-PSS scheme (`signPss`/`verifyPss`, branch-clean
+//! decode — plus `encryptOaepH`/`decryptOaepH`, a decoupled-hash variant whose
+//! label/digest hash and MGF1 hash may differ per RFC 8017 §7.1, e.g. XML-Enc
+//! `rsa-oaep` with digest=SHA-256, MGF1=SHA-1; the coupled forms delegate to it
+//! with both hashes equal), the RSASSA-PSS scheme (`signPss`/`verifyPss`, branch-clean
 //! verify), DER/PEM key parsing (`PublicKey.fromDer`/`fromPem`,
 //! `SecretKey.fromDer`/`fromPkcs8`/`fromPem`, cleartext PEM only), OpenSSH
 //! `PROTOCOL.key` private-key parsing (`fromOpenSSH`: unencrypted and
@@ -21,7 +24,8 @@
 //! independent oracles.
 //! Phase plan:
 //!   P1  — EMSA-PKCS1-v1_5 sign/verify (`signPkcs1v15`/`verifyPkcs1v15`) — DONE.
-//!   P2  — RSAES-OAEP encrypt/decrypt (`encryptOaep`/`decryptOaep`) — DONE.
+//!   P2  — RSAES-OAEP encrypt/decrypt (`encryptOaep`/`decryptOaep`; decoupled
+//!         label/MGF1 hash via `encryptOaepH`/`decryptOaepH`) — DONE.
 //!   P3  — RSASSA-PSS sign/verify (`signPss`/`verifyPss`) — DONE.
 //!   P4a — DER/PEM key parsing (PKCS#1/PKCS#8/SPKI, cleartext only) — DONE.
 //!   P4b — OpenSSH `PROTOCOL.key` parsing incl. bcrypt-pbkdf (`fromOpenSSH`) — DONE.
@@ -1009,12 +1013,28 @@ pub const EncryptOaepError = error{ MessageTooLong, BufferTooSmall };
 /// least as long as the modulus; returns the written (modulus-length)
 /// ciphertext subslice. `msg` is bounded by `k - 2*Hash.digest_length - 2`
 /// (§7.1.1 step 1.b).
+///
+/// Uses a single `Hash` for both the label digest (`lHash`) and MGF1; a thin
+/// wrapper over `encryptOaepH` with `LabelHash == MgfHash == Hash`.
 pub fn encryptOaep(pk: PublicKey, comptime Hash: type, random: std.Random, msg: []const u8, label: []const u8, out: []u8) EncryptOaepError![]u8 {
-    const h_len = Hash.digest_length;
+    return encryptOaepH(pk, Hash, Hash, random, msg, label, out);
+}
+
+/// Decoupled-hash RSAES-OAEP encrypt (RFC 8017 §7.1.1). `LabelHash` is the
+/// digest used for `lHash = LabelHash(label)` and fixes the structural sizes
+/// (seed length = `LabelHash.digest_length` = `hLen`, and the message bound
+/// `k - 2*hLen - 2`); `MgfHash` is the hash driving MGF1 (§B.2.1). RFC 8017
+/// permits the two to differ (the digest and the mask-generation hash are
+/// independent parameters); real-world XML-Encryption `rsa-oaep` configs use
+/// e.g. digest=SHA-256 with MGF1=SHA-1. See `encryptOaep` for the argument
+/// contract; identical apart from the split hash parameters.
+pub fn encryptOaepH(pk: PublicKey, comptime LabelHash: type, comptime MgfHash: type, random: std.Random, msg: []const u8, label: []const u8, out: []u8) EncryptOaepError![]u8 {
+    const h_len = LabelHash.digest_length;
     const k = byteLen(pk.n.bits());
     if (out.len < k) return error.BufferTooSmall;
     // §7.1.1 step 1.b: mLen <= k - 2 hLen - 2 (also covers k too small for
-    // the hash at all).
+    // the hash at all). hLen is the *label* hash's length (it sizes lHash and
+    // the seed); the MGF hash only affects mask generation, not the layout.
     if (k < 2 * h_len + 2 or msg.len > k - 2 * h_len - 2) return error.MessageTooLong;
 
     // EM = 0x00 || maskedSeed (hLen) || maskedDB (k - hLen - 1), built in
@@ -1027,17 +1047,17 @@ pub fn encryptOaep(pk: PublicKey, comptime Hash: type, random: std.Random, msg: 
     const db = em[1 + h_len .. k];
 
     // DB = lHash || PS (zeros) || 0x01 || M   (step 2.a-2.c)
-    Hash.hash(label, db[0..h_len], .{});
+    LabelHash.hash(label, db[0..h_len], .{});
     @memset(db[h_len .. db.len - msg.len - 1], 0x00);
     db[db.len - msg.len - 1] = 0x01;
     @memcpy(db[db.len - msg.len ..], msg);
 
     // step 2.d-2.h: random seed, then the two MGF1 maskings. Order matters
     // for the in-place XOR: DB is masked with the *raw* seed first, then the
-    // seed is masked with the already-masked DB.
+    // seed is masked with the already-masked DB. MGF1 uses `MgfHash`.
     random.bytes(seed);
-    mgf1Xor(Hash, seed, db); // maskedDB   = DB   ^ MGF1(seed)
-    mgf1Xor(Hash, db, seed); // maskedSeed = seed ^ MGF1(maskedDB)
+    mgf1Xor(MgfHash, seed, db); // maskedDB   = DB   ^ MGF1(seed)
+    mgf1Xor(MgfHash, db, seed); // maskedSeed = seed ^ MGF1(maskedDB)
 
     // step 3: RSAEP. EM starts with 0x00, so OS2IP(EM) < n by construction
     // (k = byteLen(n) and n's top byte is nonzero) — the range check cannot
@@ -1060,8 +1080,22 @@ pub const DecryptOaepError = error{ DecryptionError, BufferTooSmall };
 /// distinguish the different error conditions" (Manger's CCA2 attack). The
 /// only length checks that branch early (`ct.len != k`, undersized `out`,
 /// RSADP range) depend purely on public values.
+///
+/// Uses a single `Hash` for both the label digest (`lHash`) and MGF1; a thin
+/// wrapper over `decryptOaepH` with `LabelHash == MgfHash == Hash`.
 pub fn decryptOaep(sk: SecretKey, comptime Hash: type, ct: []const u8, label: []const u8, out: []u8) DecryptOaepError![]u8 {
-    const h_len = Hash.digest_length;
+    return decryptOaepH(sk, Hash, Hash, ct, label, out);
+}
+
+/// Decoupled-hash RSAES-OAEP decrypt (RFC 8017 §7.1.2). `LabelHash` is the
+/// digest used for `lHash = LabelHash(label)` and fixes `hLen` (seed length
+/// and the layout); `MgfHash` drives MGF1. Mirrors `encryptOaepH`; use it to
+/// decrypt ciphertext produced with a digest hash that differs from the MGF1
+/// hash (e.g. XML-Encryption `rsa-oaep` with digest=SHA-256, MGF1=SHA-1). The
+/// same constant-time / single-generic-error posture as `decryptOaep` applies
+/// (all padding-decode failures collapse to `error.DecryptionError`).
+pub fn decryptOaepH(sk: SecretKey, comptime LabelHash: type, comptime MgfHash: type, ct: []const u8, label: []const u8, out: []u8) DecryptOaepError![]u8 {
+    const h_len = LabelHash.digest_length;
     const k = byteLen(sk.n.bits());
     // §7.1.2 step 1: ciphertext must be exactly k octets and k >= 2 hLen + 2.
     if (ct.len != k or k < 2 * h_len + 2) return error.DecryptionError;
@@ -1078,13 +1112,14 @@ pub fn decryptOaep(sk: SecretKey, comptime Hash: type, ct: []const u8, label: []
     privateOpCrt(sk, ct, em, null) catch return error.DecryptionError;
 
     // step 3: EME-OAEP decode, branch-free. EM = Y || maskedSeed || maskedDB.
+    // hLen is the label hash length; MGF1 uses `MgfHash`.
     const seed = em[1..][0..h_len];
     const db = em[1 + h_len .. k];
-    mgf1Xor(Hash, db, seed); // seed = maskedSeed ^ MGF1(maskedDB)
-    mgf1Xor(Hash, seed, db); // DB   = maskedDB   ^ MGF1(seed)
+    mgf1Xor(MgfHash, db, seed); // seed = maskedSeed ^ MGF1(maskedDB)
+    mgf1Xor(MgfHash, seed, db); // DB   = maskedDB   ^ MGF1(seed)
 
     var lhash: [h_len]u8 = undefined;
-    Hash.hash(label, &lhash, .{});
+    LabelHash.hash(label, &lhash, .{});
     const y_ok = ctEqByte(em[0], 0x00);
     const lhash_ok: u8 = @intFromBool(std.crypto.timing_safe.eql([h_len]u8, lhash, db[0..h_len].*));
 
@@ -2855,6 +2890,61 @@ test "encryptOaep/decryptOaep round-trip (hashes x labels x message lengths)" {
     const c1 = try encryptOaep(pk, std.crypto.hash.sha2.Sha256, random, "same message", "", &ct);
     const c2 = try encryptOaep(pk, std.crypto.hash.sha2.Sha256, random, "same message", "", &ct2);
     try testing.expect(!std.mem.eql(u8, c1, c2));
+}
+
+test "encryptOaepH/decryptOaepH decoupled hash (LabelHash != MgfHash)" {
+    // CONSTRUCTED round-trip, NOT an external byte-exact KAT. Config: OAEP
+    // digest/label hash = SHA-256, MGF1 hash = SHA-1 — the digest≠MGF pairing
+    // that real-world XML-Encryption `rsa-oaep` sometimes specifies. RFC 8017
+    // §7.1 treats the label/digest hash and the MGF1 hash as independent
+    // parameters; `encryptOaepH`/`decryptOaepH` expose that split. The bundled
+    // OpenSSL OAEP KATs above are all equal-hash (rsa_oaep_md == rsa_mgf1_md),
+    // so no external mismatched-hash vector is shipped here; this proves the
+    // round-trip and that the resulting padding is genuinely distinct from the
+    // coupled (equal-hash) construction.
+    const sk = try kat2048.secretKey();
+    const pk = try kat2048.publicKey();
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+    const Sha1 = std.crypto.hash.Sha1;
+    var prng = std.Random.DefaultPrng.init(0x6f6165705f68); // deterministic: tests only
+    const random = prng.random();
+    var ct: [max_modulus_len]u8 = undefined;
+    var pt: [max_modulus_len]u8 = undefined;
+
+    inline for (.{ "", "xmlenc-label" }) |label| {
+        for ([_][]const u8{ "", "digest != mgf oaep", "x" }) |msg| {
+            const c = try encryptOaepH(pk, Sha256, Sha1, random, msg, label, &ct);
+            try testing.expectEqual(256, c.len);
+            const m = try decryptOaepH(sk, Sha256, Sha1, c, label, &pt);
+            try testing.expectEqualSlices(u8, msg, m);
+
+            // The mismatched-hash ciphertext is a genuinely different padding:
+            // the coupled (equal-hash) decrypt cannot decode it under either
+            // the digest hash or the MGF hash.
+            try testing.expectError(error.DecryptionError, decryptOaep(sk, Sha256, c, label, &pt));
+            try testing.expectError(error.DecryptionError, decryptOaep(sk, Sha1, c, label, &pt));
+        }
+    }
+
+    // Constant-time posture preserved: a wrong label or a corrupted ciphertext
+    // still collapses to the single generic error (never a distinct one).
+    const secret = try encryptOaepH(pk, Sha256, Sha1, random, "top secret", "right", &ct);
+    try testing.expectError(error.DecryptionError, decryptOaepH(sk, Sha256, Sha1, secret, "wrong", &pt));
+    var corrupt: [256]u8 = undefined;
+    @memcpy(&corrupt, secret);
+    corrupt[100] ^= 0x40;
+    try testing.expectError(error.DecryptionError, decryptOaepH(sk, Sha256, Sha1, &corrupt, "right", &pt));
+
+    // Wrapper equivalence: with LabelHash == MgfHash and the SAME seed,
+    // encryptOaepH is byte-identical to the coupled encryptOaep — the coupled
+    // path adds nothing over delegating to the decoupled form.
+    var pa = std.Random.DefaultPrng.init(7);
+    var pb = std.Random.DefaultPrng.init(7);
+    var ca: [max_modulus_len]u8 = undefined;
+    var cb: [max_modulus_len]u8 = undefined;
+    const c_coupled = try encryptOaep(pk, Sha256, pa.random(), "wrapper-equiv", "L", &ca);
+    const c_decoupled = try encryptOaepH(pk, Sha256, Sha256, pb.random(), "wrapper-equiv", "L", &cb);
+    try testing.expectEqualSlices(u8, c_coupled, c_decoupled);
 }
 
 test "decryptOaep rejects corruption, wrong label/hash, wrong length (one generic error)" {

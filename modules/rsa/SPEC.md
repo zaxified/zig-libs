@@ -43,7 +43,15 @@ test vectors" verification-harness convention (CONVENTIONS.md §7). Run: `zig bu
 ## Backlog / deferred
 
 - **P1** `signPkcs1v15`/`verifyPkcs1v15` (EMSA-PKCS1-v1_5, RFC 8017 §8.2/§9.2) — next up.
-- **P2** `encryptOaep`/`decryptOaep` (RSAES-OAEP, RFC 8017 §7.1).
+- **P2** `encryptOaep`/`decryptOaep` (RSAES-OAEP, RFC 8017 §7.1). Decoupled-hash
+  variant `encryptOaepH`/`decryptOaepH` takes a separate label/digest hash and MGF1
+  hash — RFC 8017 §7.1 treats them as independent parameters, and XML-Encryption
+  `rsa-oaep` configs sometimes specify digest≠MGF1 (e.g. digest=SHA-256, MGF1=SHA-1).
+  The coupled forms are thin wrappers over the decoupled ones with `LabelHash ==
+  MgfHash`, so the existing equal-hash OpenSSL KATs prove byte-identical behavior; the
+  constant-time single-generic-error decrypt posture is unchanged (shared code path).
+  The mismatched-hash case is covered by a constructed round-trip test (no external
+  byte-exact vector bundled — the shipped OAEP KATs are all equal-hash).
 - **P3** `signPss`/`verifyPss` (RSASSA-PSS, RFC 8017 §8.1).
 - **P4** `fromPkcs8`/`fromOpenSSH` (key parsing; OpenSSH `PROTOCOL.key` + `bcrypt_pbkdf` design refs
   will be added to README.md/NOTICE at that time).
