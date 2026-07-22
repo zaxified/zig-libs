@@ -1,8 +1,8 @@
 # netlink
 
-Pure-Zig **rtnetlink** transport + query API over `NETLINK_ROUTE`: enumerate
-links, addresses, routes and neighbors straight from the kernel control plane
-— no `ip`/`ss` shell-outs, no `/proc/net` parsing, no libc.
+Pure-Zig **rtnetlink** transport + control API over `NETLINK_ROUTE`: enumerate
+*and* configure links, addresses, routes and neighbors straight from the kernel
+control plane — no `ip`/`ss` shell-outs, no `/proc/net` parsing, no libc.
 
 - No maintained pure-Zig netlink library exists.
 - **Model after:** libmnl (minimal framing + validation discipline) and
@@ -13,7 +13,8 @@ links, addresses, routes and neighbors straight from the kernel control plane
   globals; one `Socket` per thread/loop).
 - **Deps:** none (std only) — a clean foundation for a future `wireguard`
   (genetlink) module and for retiring `/proc/net` parsers.
-- **Privileges:** none — RTM_GET* dumps are unprivileged.
+- **Privileges:** RTM_GET* dumps are unprivileged; the write ops
+  (`RTM_NEW*`/`RTM_DEL*`) need **CAP_NET_ADMIN**.
 
 Provenance: clean-room from the kernel UAPI headers (`linux/netlink.h`,
 `linux/rtnetlink.h`, `linux/if_link.h`, `linux/if_addr.h`,
@@ -39,14 +40,38 @@ for (ls) |l| _ = .{ l.index, l.name(), l.mtu, l.flags & netlink.IFF.UP, l.mac };
 for (as) |a| _ = .{ a.family, a.bytes(), a.prefixlen, a.ifindex, a.label() };
 for (rs) |r| _ = .{ r.table, r.dstBytes(), r.dst_prefixlen, r.gatewayBytes(), r.oif, r.priority };
 for (ns) |n| _ = .{ n.dstBytes(), n.lladdrBytes(), n.state & netlink.NUD.REACHABLE };
+
+// Write ops (RTM_NEW*/RTM_DEL*) — need CAP_NET_ADMIN. Every request carries
+// NLM_F_ACK; the NLMSG_ERROR reply becomes a typed error, so a write never
+// fails silently.
+try nl.linkAdd(.{ .name = "dummy0", .kind = "dummy" }, .{});   // RTM_NEWLINK + LINKINFO
+try nl.linkUp(ifindex);                                        // ifi_change = IFF_UP only
+try nl.linkSet(ifindex, .{ .mtu = 1400, .name = "lab0" });     // attrs, ifi_change = 0
+try nl.addressAdd(.{ .ifindex = ifindex, .local = &.{ 10, 11, 12, 1 },
+                     .prefixlen = 24 }, .{});                  // .{} = CREATE|EXCL
+try nl.routeAdd(.{ .dst = &.{ 10, 99, 0, 0 }, .dst_prefixlen = 24,
+                   .oif = ifindex, .scope = netlink.RT_SCOPE.LINK }, .{});
+try nl.neighborAdd(.{ .ifindex = ifindex, .dst = &.{ 10, 11, 12, 55 },
+                      .lladdr = &.{ 0xde, 0xad, 0xbe, 0xef, 0, 1 } }, .{});
+// …and the RTM_DEL* mirrors: addressDel / routeDel / neighborDel / linkDel.
+
+nl.routeAdd(bad_spec, .{}) catch |err| switch (err) {
+    error.Exists, error.NoSuchDevice, error.NetworkUnreachable => {
+        std.log.err("kernel said: {s}", .{nl.lastErrorMessage()}); // extended ACK
+    },
+    else => return err,
+};
 ```
 
-Low-level, for custom queries (all `pub`): `netlink.codec` — bounds-checked
-`MessageIterator`/`AttrIterator`, `Message.errorCode()` (NLMSG_ERROR → errno),
-`appendHeader`/`appendAttr*` encoders — plus the typed payload parsers
-(`parseLink`, `parseAddress`, `parseRoute`, `parseNeighbor`) and the UAPI
-constant tables (`AF`, `IFF`, `RTA`, `NDA`, `NUD`, `RTN`, `RT_TABLE`,
-`RT_SCOPE`).
+Low-level, for custom queries and hand-built requests (all `pub`):
+`netlink.codec` — bounds-checked `MessageIterator`/`AttrIterator`,
+`Message.errorCode()` (NLMSG_ERROR → errno), `Message.errorMessage()`
+(extended-ACK string), `appendHeader`/`appendAttr*`/`nestBegin`/`nestEnd`
+encoders — plus `Socket.nextSeq()`/`Socket.requestAck()` (the write+ACK engine
+sibling modules reuse), the typed payload parsers (`parseLink`,
+`parseAddress`, `parseRoute`, `parseNeighbor`) and the UAPI constant tables
+(`AF`, `IFF`, `RTA`, `NDA`, `NUD`, `RTN`, `RTPROT`, `NTF`, `IFA_F`,
+`IFLA_INFO`, `RT_TABLE`, `RT_SCOPE`).
 
 ## Design notes
 
@@ -71,6 +96,20 @@ constant tables (`AF`, `IFF`, `RTA`, `NDA`, `NUD`, `RTN`, `RT_TABLE`,
   rtgenmsg, for strict-check compatibility — same as modern iproute2.
 - **IPv4 addresses** prefer `IFA_LOCAL` over `IFA_ADDRESS` (the peer on
   point-to-point links), matching iproute2's display semantics.
-- **Out of scope (deliberate extension points):** write ops
-  (`RTM_NEW*`/`RTM_DEL*`) and multicast event monitoring. The transport
-  already speaks seq/ACK/errno and multi-part assembly, so both are additive.
+- **Writes are ACKed, never fire-and-forget.** Each `RTM_NEW*`/`RTM_DEL*`
+  carries `NLM_F_REQUEST|NLM_F_ACK` (+ `NLM_F_CREATE`/`EXCL`/`REPLACE`/
+  `APPEND` per the `Create` options) and blocks for the `NLMSG_ERROR` reply:
+  errno 0 = success, otherwise a typed error (`Exists`, `NotFound`,
+  `NoSuchDevice`, `AddressNotAvailable`, `NetworkUnreachable`, `AccessDenied`,
+  `InvalidRequest`, `NotSupported`, `Busy`…). `NETLINK_EXT_ACK` is enabled per
+  socket, so the kernel's reason string is available from
+  `lastErrorMessage()`. Specs are validated before any syscall
+  (`InvalidAddressLength`, `MixedFamilies`, `FamilyRequired`, `InvalidName`).
+- **`ifi_change` is never over-broad.** For link changes the kernel applies
+  `new = (old & ~change) | (flags & change)`; `LinkChange.up` therefore puts
+  *only* `IFF_UP` in the mask, attribute-only changes (MTU/name/MAC) send
+  `ifi_change = 0`, and `flags`/`flags_mask` is the explicit escape hatch. An
+  empty change is rejected (`error.NothingToChange`) rather than sent.
+- **Out of scope (deliberate extension points):** multicast event monitoring,
+  qdiscs/filters (sibling `tc` module), conntrack, bridge/FDB, policy rules,
+  `IFLA_INFO_DATA` link parameters and multipath routes — see SPEC.md.

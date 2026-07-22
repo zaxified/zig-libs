@@ -58,6 +58,35 @@ pub const NLM_F_ROOT: u16 = 0x100;
 pub const NLM_F_MATCH: u16 = 0x200;
 pub const NLM_F_DUMP: u16 = NLM_F_ROOT | NLM_F_MATCH;
 
+/// Write-path request modifiers (linux/netlink.h, "Modifiers to NEW/DELETE
+/// request"). These numerically overlap the dump flags above — they are only
+/// meaningful on `RTM_NEW*`/`RTM_DEL*` messages, never on a dump.
+pub const NLM_F_REPLACE: u16 = 0x100;
+pub const NLM_F_EXCL: u16 = 0x200;
+pub const NLM_F_CREATE: u16 = 0x400;
+pub const NLM_F_APPEND: u16 = 0x800;
+
+/// Flags the kernel sets on an `NLMSG_ERROR` reply (linux/netlink.h,
+/// "Flags for ACK message"). `NLM_F_CAPPED` = the offending request's payload
+/// was *not* echoed back (only its 16-byte header); `NLM_F_ACK_TLVS` =
+/// extended-ACK attributes follow the echoed request.
+pub const NLM_F_CAPPED: u16 = 0x100;
+pub const NLM_F_ACK_TLVS: u16 = 0x200;
+
+/// Extended-ACK attribute types (linux/netlink.h `NLMSGERR_ATTR_*`), carried
+/// after `struct nlmsgerr` when `NLM_F_ACK_TLVS` is set.
+pub const NLMSGERR_ATTR = struct {
+    pub const UNSPEC: u16 = 0;
+    /// NUL-terminated string: the kernel's reason for the rejection.
+    pub const MSG: u16 = 1;
+    /// u32 byte offset into the request that the kernel objected to.
+    pub const OFFS: u16 = 2;
+    pub const COOKIE: u16 = 3;
+    pub const POLICY: u16 = 4;
+    pub const MISS_TYPE: u16 = 5;
+    pub const MISS_NLATTR: u16 = 6;
+};
+
 /// Attribute-type flag bits (linux/netlink.h `NLA_F_*` / `NLA_TYPE_MASK`).
 pub const NLA_F_NESTED: u16 = 0x8000;
 pub const NLA_F_NET_BYTEORDER: u16 = 0x4000;
@@ -91,6 +120,40 @@ pub const Message = struct {
     pub fn attrs(m: Message, fixed_len: usize) Error!AttrIterator {
         if (m.payload.len < fixed_len) return error.Truncated;
         return .{ .buf = m.payload[fixed_len..] };
+    }
+
+    /// Extended-ACK attributes of an `NLMSG_ERROR` message, or null when the
+    /// kernel attached none (`NLM_F_ACK_TLVS` clear — old kernel, or the
+    /// socket never enabled `NETLINK_EXT_ACK`).
+    ///
+    /// Layout per the kernel's `netlink_ack()`: the payload starts with
+    /// `struct nlmsgerr { int error; struct nlmsghdr msg; }`; the echoed
+    /// request is the bare 16-byte header when `NLM_F_CAPPED` is set and the
+    /// *whole* original message (`msg.nlmsg_len` bytes) otherwise. The TLVs
+    /// begin right after that — every offset is bounds-checked here.
+    pub fn errorAttrs(m: Message) Error!?AttrIterator {
+        if (m.flags & NLM_F_ACK_TLVS == 0) return null;
+        if (m.payload.len < 4 + header_len) return error.Truncated;
+        var off: usize = 4 + header_len; // sizeof(struct nlmsgerr)
+        if (m.flags & NLM_F_CAPPED == 0) {
+            const echoed: usize = std.mem.readInt(u32, m.payload[4..8], native_endian);
+            if (echoed < header_len) return error.BadLength;
+            off = 4 + echoed;
+        }
+        off = alignUp(off);
+        if (off > m.payload.len) return error.Truncated;
+        return .{ .buf = m.payload[off..] };
+    }
+
+    /// The kernel's human-readable reason for an `NLMSG_ERROR`
+    /// (`NLMSGERR_ATTR_MSG`), or null when none was attached. The slice
+    /// borrows from the message payload.
+    pub fn errorMessage(m: Message) Error!?[]const u8 {
+        var it = (try m.errorAttrs()) orelse return null;
+        while (try it.next()) |a| {
+            if (a.type == NLMSGERR_ATTR.MSG) return a.asString();
+        }
+        return null;
     }
 };
 
@@ -265,6 +328,32 @@ pub fn appendAttrU32(
         error.AttrTooLong => unreachable, // 8 bytes total
         error.OutOfMemory => return error.OutOfMemory,
     };
+}
+
+/// Open a nested attribute: appends a TLV header with a placeholder length
+/// and returns its offset for the closing `nestEnd`. `attr_type` is written
+/// verbatim — rtnetlink nests (`IFLA_LINKINFO`, `TCA_OPTIONS`, …) are
+/// conventionally sent *without* `NLA_F_NESTED` by iproute2 and the kernel's
+/// validators ignore the bit, so OR it in only if you want it on the wire.
+pub fn nestBegin(
+    gpa: std.mem.Allocator,
+    list: *std.ArrayList(u8),
+    attr_type: u16,
+) std.mem.Allocator.Error!usize {
+    const off = list.items.len;
+    var hdr: [attr_header_len]u8 = undefined;
+    std.mem.writeInt(u16, hdr[0..2], 0, native_endian); // patched by nestEnd
+    std.mem.writeInt(u16, hdr[2..4], attr_type, native_endian);
+    try list.appendSlice(gpa, &hdr);
+    return off;
+}
+
+/// Close the nested attribute opened at `off`, patching its length to cover
+/// everything appended since — including each inner attribute's alignment
+/// padding, exactly like the kernel's `nla_nest_end`.
+pub fn nestEnd(list: *std.ArrayList(u8), off: usize) void {
+    const total: u16 = @intCast(list.items.len - off);
+    std.mem.writeInt(u16, list.items[off..][0..2], total, native_endian);
 }
 
 /// Append a NUL-terminated string rtattr (kernel string convention).
@@ -497,6 +586,80 @@ test "NLMSG_ERROR payload yields the errno (and ACK)" {
     try testing.expectError(error.Truncated, cut.errorCode());
 }
 
+test "nestBegin/nestEnd length covers inner padding (nla_nest_end)" {
+    const gpa = testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    // IFLA_LINKINFO(18) { IFLA_INFO_KIND(1) = "dummy" } — the exact shape
+    // `ip link add name X type dummy` puts on the wire (see SPEC.md).
+    const off = try nestBegin(gpa, &list, 18);
+    try appendAttrString(gpa, &list, 1, "dummy"); // len 10, padded to 12
+    nestEnd(&list, off);
+    try testing.expectEqual(@as(usize, 16), list.items.len);
+    var it: AttrIterator = .{ .buf = list.items };
+    const nest = (try it.next()).?;
+    try testing.expectEqual(@as(u16, 18), nest.type);
+    try testing.expectEqual(@as(u16, 0), nest.raw_type & NLA_F_NESTED); // iproute2 style
+    var inner = nest.nested();
+    try testing.expectEqualStrings("dummy", (try inner.next()).?.asString());
+}
+
+test "extended ACK: NLMSGERR_ATTR_MSG extracted for capped and echoed errors" {
+    const gpa = testing.allocator;
+    // Capped form: error code + bare 16-byte echoed header, then the TLVs.
+    var capped: std.ArrayList(u8) = .empty;
+    defer capped.deinit(gpa);
+    const h1 = try appendHeader(gpa, &capped, NLMSG_ERROR, NLM_F_ACK_TLVS | NLM_F_CAPPED, 3, 42);
+    var code: [4]u8 = undefined;
+    std.mem.writeInt(i32, &code, -22, native_endian); // -EINVAL
+    try appendPadded(gpa, &capped, &code);
+    try appendPadded(gpa, &capped, &([_]u8{0} ** header_len)); // echoed request hdr
+    try appendAttrString(gpa, &capped, NLMSGERR_ATTR.MSG, "Unknown device type");
+    finishHeader(&capped, h1);
+
+    var it: MessageIterator = .{ .buf = capped.items };
+    const m = (try it.next()).?;
+    try testing.expectEqual(@as(i32, -22), try m.errorCode());
+    try testing.expectEqualStrings("Unknown device type", (try m.errorMessage()).?);
+
+    // Uncapped form: the whole original request is echoed, so the TLVs start
+    // after `4 + original nlmsg_len` bytes.
+    var full: std.ArrayList(u8) = .empty;
+    defer full.deinit(gpa);
+    const h2 = try appendHeader(gpa, &full, NLMSG_ERROR, NLM_F_ACK_TLVS, 3, 42);
+    try appendPadded(gpa, &full, &code);
+    var echoed: [header_len + 8]u8 = @splat(0);
+    std.mem.writeInt(u32, echoed[0..4], echoed.len, native_endian);
+    try appendPadded(gpa, &full, &echoed);
+    try appendAttrString(gpa, &full, NLMSGERR_ATTR.MSG, "no such device");
+    finishHeader(&full, h2);
+
+    it = .{ .buf = full.items };
+    const m2 = (try it.next()).?;
+    try testing.expectEqualStrings("no such device", (try m2.errorMessage()).?);
+
+    // No NLM_F_ACK_TLVS → no attributes at all, not an error.
+    const plain: Message = .{ .type = NLMSG_ERROR, .flags = 0, .seq = 0, .pid = 0, .payload = &.{ 0, 0, 0, 0 } };
+    try testing.expectEqual(@as(?AttrIterator, null), try plain.errorAttrs());
+    try testing.expectEqual(@as(?[]const u8, null), try plain.errorMessage());
+}
+
+test "extended ACK: hostile offsets are rejected, never over-read" {
+    // NLM_F_ACK_TLVS set but the payload is shorter than struct nlmsgerr.
+    const short: Message = .{ .type = NLMSG_ERROR, .flags = NLM_F_ACK_TLVS, .seq = 0, .pid = 0, .payload = &.{ 0, 0, 0, 0 } };
+    try testing.expectError(error.Truncated, short.errorAttrs());
+    // Echoed nlmsg_len smaller than a header.
+    var bad: [4 + header_len]u8 = @splat(0);
+    std.mem.writeInt(u32, bad[4..8], 4, native_endian);
+    const badm: Message = .{ .type = NLMSG_ERROR, .flags = NLM_F_ACK_TLVS, .seq = 0, .pid = 0, .payload = &bad };
+    try testing.expectError(error.BadLength, badm.errorAttrs());
+    // Echoed nlmsg_len running past the reply.
+    var over: [4 + header_len]u8 = @splat(0);
+    std.mem.writeInt(u32, over[4..8], 4096, native_endian);
+    const overm: Message = .{ .type = NLMSG_ERROR, .flags = NLM_F_ACK_TLVS, .seq = 0, .pid = 0, .payload = &over };
+    try testing.expectError(error.Truncated, overm.errorAttrs());
+}
+
 test "fuzz: message + attribute walkers never crash, loop, or read OOB" {
     try testing.fuzz({}, fuzzWalkers, .{});
 }
@@ -514,6 +677,15 @@ fn fuzzWalkers(_: void, smith: *std.testing.Smith) !void {
         steps += 1;
         try testing.expect(steps <= buf.len / 4 + 1);
         _ = m.errorCode() catch {};
+        _ = m.errorMessage() catch {};
+        if (m.errorAttrs() catch null) |maybe| {
+            var eit = maybe;
+            var esteps: usize = 0;
+            while (eit.next() catch null) |_| {
+                esteps += 1;
+                try testing.expect(esteps <= m.payload.len / 4 + 1);
+            }
+        }
         // Walk the payload as attributes with a fuzzed fixed-header skip.
         const skip = smith.valueRangeAtMost(u16, 0, 32);
         var ait = m.attrs(skip) catch continue;
