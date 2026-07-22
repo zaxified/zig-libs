@@ -265,6 +265,17 @@ project git history).
                genetlink-family modules can depend on it directly; no new
                third-party design reference beyond the kernel header.
 
+  nl80211    — original pure-Zig nl80211 (Wi-Fi) client, clean-room from
+               linux/nl80211.h (GPL-2.0 WITH Linux-syscall-note) and the
+               IEEE 802.11 information-element formats. No GPL header
+               source is copied — only the uncopyrightable ABI facts it
+               documents are used (command/attribute/flag constants, struct
+               layouts), relying on the same Linux-syscall-note exception
+               as `netlink`/`genetlink`/`wireguard`/`tc`. `iw` (GPL-2.0)
+               was run ONLY as a black-box test oracle under `strace`, its
+               request bytes diffed against this module's — no `iw` or
+               `wpa_supplicant` source consulted, studied or ported.
+
   ebpf       — original pure-Zig eBPF loader / attach layer / BTF parser /
                event-ring consumers, clean-room from the kernel UAPI headers
                (linux/bpf.h, linux/btf.h, linux/perf_event.h,

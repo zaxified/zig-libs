@@ -11,7 +11,7 @@ cross-project-reusable capability — a production-grade implementation of a pro
 or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
 authors' other projects depend on it, not the reverse.
 
-**Status:** 177 modules · 5633 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 178 modules · 6043 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ## Using a module
@@ -120,6 +120,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `dnssec` | Resolver-side **DNSSEC validation** (RFC 4033/4034/4035 + NSEC3 RFC 5155; ECDSA RFC 6605, Ed25519 RFC 8080) — DNSKEY/RRSIG/DS/NSEC/NSEC3 RDATA parsing, key-tag + DS digest computation, canonical name/RRset encoding + ordering, per-algorithm signature verify (`std` ECDSA/Ed25519 + the `rsa` module — no crypto primitive reimplemented), NSEC/NSEC3 denial-of-existence | any | dns, rsa |
 | `netlink` | rtnetlink **read + write**: dumps (links / addresses / routes / neighbors) **and** `RTM_NEW*`/`RTM_DEL*` writes — address/route add+del, link up/down/MTU/rename/MAC, link create/delete, neighbour add+del; `NLM_F_ACK` with typed errno mapping + extended-ACK reason strings; byte-exact vs iproute2-captured goldens + a netns round-trip | **linux** | — |
 | `genetlink` | Generic-netlink (genl) transport: genlmsghdr framing + nlctrl family-id resolution — the shared foundation for genetlink-family clients (ethtool/devlink/nl80211/wireguard) | **linux** | netlink |
+| `nl80211` | Wi-Fi control over the nl80211 genetlink family — interface/wiphy enumeration, scan trigger + BSS results, connect/disconnect, station and link statistics, regulatory domain | **linux** | genetlink, netlink |
 | `wireguard` | Native WireGuard device config over genetlink — get/set device, peers, allowed-ips (retires `wg` shell-outs) | **linux** | netlink, genetlink |
 | `tc` | Traffic control over rtnetlink — attach/replace/remove the **netem** qdisc (delay/jitter/loss/duplicate/reorder/corrupt/rate) as an interface's root, read-back verify (retires `tc` shell-outs) | **linux** | netlink |
 | `nftables` | Typed firewall-ruleset builder → libnftables JSON for `nft -j -f -` (families/chains/rules/sets, match + verdict statements) | any (apply: linux) | — |

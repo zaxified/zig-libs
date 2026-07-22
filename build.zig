@@ -48,6 +48,7 @@ const module_list = [_]Module{
     .{ .name = "acme", .deps = &.{ "http", "router" } },
     .{ .name = "netlink" },
     .{ .name = "genetlink", .deps = &.{"netlink"} },
+    .{ .name = "nl80211", .deps = &.{ "genetlink", "netlink" } },
     .{ .name = "decimal" },
     .{ .name = "seqmap" },
     .{ .name = "icmp", .deps = &.{ "seqmap", "netaddr" } },
