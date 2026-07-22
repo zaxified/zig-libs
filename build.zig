@@ -87,6 +87,7 @@ const module_list = [_]Module{
     .{ .name = "xml" },
     .{ .name = "xmldsig", .deps = &.{ "xml", "rsa", "p256" } },
     .{ .name = "saml", .deps = &.{ "xmldsig", "xml" } },
+    .{ .name = "xmlenc", .deps = &.{ "xml", "rsa" } },
     .{ .name = "jwe", .deps = &.{ "rsa", "p256" } },
     .{ .name = "rdap", .deps = &.{ "http", "netaddr" } },
     .{ .name = "blobstore", .deps = &.{"hashdigest"} },
