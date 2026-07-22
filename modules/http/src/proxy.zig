@@ -48,13 +48,38 @@
 //! composes the same way — wrap the caller's forward-through-the-pool
 //! operation in `resilience.run` / `Pool.call` above this handler.
 //!
+//! ## HTTP/2 (h2/h2c) upstreaming
+//!
+//! The forward path is **protocol-selectable per backend**
+//! (`Backend.protocol`): `.http1` (the default) forwards over the h1
+//! `Client` exactly as before — byte-for-byte unchanged — while `.h2c`
+//! (cleartext prior-knowledge) and `.h2` (over TLS, via the BYO-TLS dial
+//! seam) forward over HTTP/2. h2 forwarding composes an `h2_upstream.Pool`
+//! (wired through `Config.h2_upstream`): the pool keeps ONE multiplexed h2
+//! connection per backend origin and runs each proxied request as a fresh
+//! stream on it, so many proxied requests share one upstream connection
+//! (the whole point of h2 upstreaming). This module still owns the
+//! translation — hop-by-hop stripping, `X-Forwarded-*` / `Via`, status +
+//! header + body relay are shared with the h1 path; the pool owns
+//! connection multiplexing, reuse and failure recovery. See `h2_upstream`
+//! for the concurrency bound (per-connection response collection is
+//! serialized) and the body-buffering caveat (the reused h2 client
+//! assembles bodies in memory, bounded by `Config.h2_max_body_bytes`,
+//! where the h1 path streams them). Trailers are not forwarded over h2
+//! (the h2 client does not surface them — consistent with the module's
+//! read-only-trailer posture).
+//!
 //! ## Known gaps (this pass)
 //!
-//! - **HTTP/1.1 backends only.** The forward path uses the h1 `Client`;
-//!   h2/h2c upstreaming is not wired here.
-//! - **No response buffer pool** — the `ResponseWriter`'s per-connection
-//!   buffer is reused across keep-alive requests but not shared across
-//!   connections.
+//! - **h2 upstream bodies are buffered** (bounded), not streamed like the
+//!   h1 path — a limitation of reusing the existing multiplexing h2 client
+//!   rather than forking a streaming one. Flow control is still exercised
+//!   (WINDOW_UPDATE on bodies past the initial window).
+//! - **No response buffer pool** for the *server*-side `ResponseWriter`
+//!   (its per-connection buffer is reused across keep-alive requests but
+//!   not shared across connections). The *client*-side shared buffer pool
+//!   for pooled connections now exists (`Client.Options.buffer_pool`,
+//!   backing h2 upstream dials).
 //!
 //! Backend connection pooling is **not** a gap: `Client` keeps a keyed idle
 //! `Pool` (on by default, `Client.Options.pool`) and every backend
@@ -78,7 +103,23 @@ const http = @import("root.zig");
 const h1 = @import("h1.zig");
 const Server = @import("Server.zig");
 const Client = @import("Client.zig");
+const h2_upstream = @import("h2_upstream.zig");
 const netaddr = @import("netaddr");
+
+/// Which protocol the proxy forwards to a backend over. `.http1` (the
+/// default) is the streaming h1 `Client` path, unchanged. `.h2c` and `.h2`
+/// forward over the multiplexing HTTP/2 client through `Config.h2_upstream`
+/// (which must be set when any backend selects them).
+pub const UpstreamProtocol = enum {
+    /// HTTP/1.1 over the h1 `Client` (the original path).
+    http1,
+    /// Cleartext HTTP/2 via prior knowledge (RFC 9113 §3.3) — `:scheme`
+    /// "http". Requires an `h2_upstream.Pool` on the built-in h2c dialer.
+    h2c,
+    /// HTTP/2 over TLS — `:scheme` "https". Requires an `h2_upstream.Pool`
+    /// configured with a custom TLS dialer (BYO-TLS + ALPN "h2").
+    h2,
+};
 
 /// One backend origin to forward to.
 pub const Backend = struct {
@@ -86,6 +127,9 @@ pub const Backend = struct {
     /// Hostname or IP literal (IPv6 without brackets — added on the wire).
     host: []const u8,
     port: u16,
+    /// Forward protocol (see `UpstreamProtocol`). Default `.http1` keeps the
+    /// original h1 forward path.
+    protocol: UpstreamProtocol = .http1,
 };
 
 /// Backend-selection seam. Return null to refuse the request with the
@@ -118,6 +162,18 @@ pub const Config = struct {
     /// Rewrite the forwarded `Host` to the backend authority (default). When
     /// false the client's original `Host` is forwarded unchanged.
     rewrite_host: bool = true,
+    /// HTTP/2 upstream pool — required when any backend's `protocol` is
+    /// `.h2c`/`.h2` (a request routed to such a backend with this null
+    /// answers 502). Keeps one multiplexed h2 connection per backend and
+    /// runs each proxied request as a stream on it (see `h2_upstream`). The
+    /// `.http1` path never touches it. Shared across the server's connection
+    /// threads, like `client`.
+    h2_upstream: ?*h2_upstream.Pool = null,
+    /// Upper bound (bytes) on a request/response body proxied over h2: the
+    /// reused multiplexing h2 client assembles bodies in memory (unlike the
+    /// streaming h1 path), so both directions are capped. A larger body
+    /// answers 502. Ignored by the `.http1` path (which streams).
+    h2_max_body_bytes: usize = 8 * 1024 * 1024,
 };
 
 /// The proxy handler. Construct one, then point a `Server` at it:
@@ -151,6 +207,11 @@ pub const ProxyHandler = struct {
     pub fn forward(self: *ProxyHandler, req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
         const backend = self.pickBackend(req) orelse
             return gatewayError(rw, 503, self.config.via_pseudonym);
+
+        // Protocol split: h2/h2c forward over the multiplexing HTTP/2 client
+        // (a shared upstream connection per backend); h1 takes the streaming
+        // path below, byte-for-byte unchanged.
+        if (backend.protocol != .http1) return self.forwardH2(backend, req, rw);
 
         // ── build the forwarded target URL ──────────────────────────────
         var url_buf: [max_url_len]u8 = undefined;
@@ -215,6 +276,96 @@ pub const ProxyHandler = struct {
         // `end()`. `end()` is idempotent, so the serving loop's own call is
         // then a no-op.
         try rw.end();
+    }
+
+    /// Forward `req` to an HTTP/2 (h2/h2c) backend through the shared
+    /// `h2_upstream.Pool`: translate the request into a stream on the
+    /// backend's one multiplexed connection, collect the response, relay it
+    /// back. Header translation (hop-by-hop, `X-Forwarded-*`, `Via`) is
+    /// shared with the h1 path; the h2 body is buffered (bounded — see
+    /// `Config.h2_max_body_bytes`).
+    fn forwardH2(self: *ProxyHandler, backend: Backend, req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+        const pool = self.config.h2_upstream orelse
+            return gatewayError(rw, 502, self.config.via_pseudonym);
+        const gpa = self.config.client.gpa;
+
+        // Forwarded request headers (shared with the h1 path). Host is not
+        // among them (dropped there) — `:authority` carries it below.
+        var hdr_store: [max_fwd_headers]http.Header = undefined;
+        var xff_buf: [max_xff_len]u8 = undefined;
+        var via_buf: [max_via_len]u8 = undefined;
+        const fwd = self.buildRequestHeaders(req, &hdr_store, &xff_buf, &via_buf) catch
+            return gatewayError(rw, 502, self.config.via_pseudonym);
+
+        // `:authority` — backend authority when rewriting Host (default),
+        // else the client's original Host.
+        var auth_buf: [max_authority_len]u8 = undefined;
+        const authority = blk: {
+            if (!self.config.rewrite_host) {
+                if (req.header("host")) |h| break :blk h;
+            }
+            break :blk buildAuthority(&auth_buf, backend) catch
+                return gatewayError(rw, 502, self.config.via_pseudonym);
+        };
+
+        // Read the request body into memory (bounded); the h2 client streams
+        // it out under §5.2 flow control (WINDOW_UPDATE past the window).
+        const has_body = req.head.chunked or (req.head.content_length orelse 0) != 0;
+        var body_buf: ?[]u8 = null;
+        defer if (body_buf) |b| gpa.free(b);
+        if (has_body) {
+            body_buf = req.reader().allocRemaining(gpa, .limited(self.config.h2_max_body_bytes)) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                // Over the cap or a read failure — nothing is on the wire yet.
+                else => return gatewayError(rw, 502, self.config.via_pseudonym),
+            };
+        }
+
+        const be: h2_upstream.Backend = .{
+            .host = backend.host,
+            .port = backend.port,
+            .secure = backend.protocol == .h2,
+        };
+        var res = pool.roundtrip(be, .{
+            .method = req.method,
+            .path = if (req.target.len == 0) "/" else req.target, // origin-form, query included
+            .authority = authority,
+            .scheme = if (backend.protocol == .h2) "https" else "http",
+            .headers = fwd,
+            .body = body_buf,
+        }) catch |err| return self.onH2Error(rw, err);
+        defer res.deinit(gpa);
+
+        // ── relay status + response headers ─────────────────────────────
+        rw.setStatus(res.status);
+        const resp_conn = res.header("connection");
+        for (res.headers.fields) |f| {
+            if (f.name.len != 0 and f.name[0] == ':') continue; // pseudo-headers (:status)
+            if (isHopByHop(f.name, resp_conn)) continue;
+            if (std.ascii.eqlIgnoreCase(f.name, "connection") or
+                std.ascii.eqlIgnoreCase(f.name, "via")) continue;
+            rw.setHeader(f.name, f.value) catch {};
+        }
+        const via = buildVia(&via_buf, res.header("via"), self.config.via_pseudonym) catch null;
+        if (via) |v| rw.setHeader("Via", v) catch {};
+
+        // ── relay the (buffered) response body ──────────────────────────
+        rw.writeAll(res.body) catch {
+            if (rw.headSent()) return error.ProxyBackendStreamAborted;
+            return gatewayError(rw, 502, self.config.via_pseudonym);
+        };
+        try rw.end();
+    }
+
+    /// Map an `h2_upstream` forward error to a gateway status (or surface a
+    /// genuine OOM as the server's 500).
+    fn onH2Error(self: *ProxyHandler, rw: *Server.ResponseWriter, err: anyerror) anyerror!void {
+        if (err == error.OutOfMemory) return err;
+        const status: u16 = switch (err) {
+            error.Timeout => 504, // Gateway Timeout
+            else => 502, // Bad Gateway (dial/protocol/reset/goaway/…)
+        };
+        return gatewayError(rw, status, self.config.via_pseudonym);
     }
 
     fn pickBackend(self: *ProxyHandler, req: *Server.Request) ?Backend {
@@ -353,6 +504,21 @@ fn buildVia(buf: []u8, existing: ?[]const u8, pseudonym: []const u8) error{Overf
     return w.buffered();
 }
 
+/// Build the `:authority` value (backend host + `:port` when non-default for
+/// the forward protocol) for an h2/h2c request into `buf`. IPv6 literals get
+/// brackets (RFC 9113 §8.3.1 / §3.3, same authority shape as h1's Host).
+fn buildAuthority(buf: []u8, backend: Backend) error{Overflow}![]const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    if (std.mem.indexOfScalar(u8, backend.host, ':') != null) {
+        w.print("[{s}]", .{backend.host}) catch return error.Overflow;
+    } else {
+        w.writeAll(backend.host) catch return error.Overflow;
+    }
+    const default_port: u16 = if (backend.protocol == .h2) 443 else 80;
+    if (backend.port != default_port) w.print(":{d}", .{backend.port}) catch return error.Overflow;
+    return w.buffered();
+}
+
 /// Build `scheme://authority{path}{?query}` for the backend into `buf`.
 fn buildUrl(buf: []u8, backend: Backend, path: []const u8, query: []const u8) error{Overflow}![]const u8 {
     var w: std.Io.Writer = .fixed(buf);
@@ -396,6 +562,7 @@ const max_url_len = 16 * 1024; // covers the server's 8 KiB request-line cap + a
 const max_fwd_headers = 96;
 const max_xff_len = 4 * 1024;
 const max_via_len = 512;
+const max_authority_len = 300; // host (≤253) + brackets + ":port"
 
 // ── tests ───────────────────────────────────────────────────────────────────
 
@@ -604,4 +771,155 @@ test "integration: reverse proxy forwards, injects headers, strips hop-by-hop, 5
         try testing.expectEqual(@as(u16, 502), res.status);
         try testing.expect(std.mem.indexOf(u8, res.header("via").?, "zig-libs") != null);
     }
+}
+
+// ── integration: h1 proxy forwarding over h2c to an HTTP/2 backend ──────────
+
+/// One concurrent client hitting the proxy — used to prove many clients
+/// share the ONE upstream h2 connection.
+const H2Worker = struct {
+    io: std.Io,
+    port: u16,
+    ok: bool = false,
+
+    fn run(w: *H2Worker) void {
+        var client = Client.init(w.io, testing.allocator, .{});
+        defer client.deinit();
+        var url_buf: [64]u8 = undefined;
+        const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/reflect", .{w.port}) catch return;
+        var res = client.request(.get, url, .{}) catch return;
+        defer res.deinit();
+        if (res.status != 200) return;
+        const body = res.readAllAlloc(testing.allocator, 64) catch return;
+        defer testing.allocator.free(body);
+        w.ok = std.mem.eql(u8, body, "reflected");
+    }
+};
+
+test "integration: reverse proxy forwards over h2c to an HTTP/2 backend (multiplex + reuse)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // h2c backend — the SAME `originHandler` serves h1 and h2 (proof the
+    // translation is protocol-agnostic).
+    var backend = Server.init(io, gpa, .{ .handler = originHandler, .enable_h2c = true });
+    defer backend.deinit();
+    backend.bind() catch |err| {
+        std.debug.print("h2 backend bind failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    const bt = try std.Thread.spawn(.{}, serveWrap, .{&backend});
+    defer bt.join();
+    defer backend.shutdown();
+    const backend_port = backend.boundAddress().getPort();
+
+    // h2 upstream pool + an h1 proxy that forwards to the backend over h2c.
+    var proxy_client = Client.init(io, gpa, .{});
+    defer proxy_client.deinit();
+    var up = http.h2_upstream.Pool.init(gpa, .{ .client = &proxy_client });
+    defer up.deinit();
+    var ph = ProxyHandler.init(.{
+        .client = &proxy_client,
+        .h2_upstream = &up,
+        .backend = .{ .host = "127.0.0.1", .port = backend_port, .protocol = .h2c },
+    });
+    var proxy = Server.init(io, gpa, .{ .handler = ProxyHandler.handler, .context = &ph });
+    defer proxy.deinit();
+    proxy.bind() catch |err| {
+        std.debug.print("proxy bind failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    const pt = try std.Thread.spawn(.{}, serveWrap, .{&proxy});
+    defer pt.join();
+    defer proxy.shutdown();
+    const proxy_port = proxy.boundAddress().getPort();
+
+    var client = Client.init(io, gpa, .{});
+    defer client.deinit();
+    var url_buf: [64]u8 = undefined;
+
+    { // GET /reflect: forwarding headers injected, hop-by-hop stripped — over h2.
+        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/reflect", .{proxy_port});
+        var res = try client.request(.get, url, .{
+            .headers = &.{
+                .{ .name = "X-Keep", .value = "kept" }, // end-to-end → forwarded
+                .{ .name = "Proxy-Authorization", .value = "secret" }, // Proxy-* → stripped
+            },
+        });
+        defer res.deinit();
+        try testing.expectEqual(@as(u16, 200), res.status);
+        const body = try res.readAllAlloc(gpa, 64);
+        defer gpa.free(body);
+        try testing.expectEqualStrings("reflected", body);
+        // Forwarding headers the h2 backend saw:
+        try testing.expectEqualStrings("127.0.0.1", res.header("x-saw-xff").?);
+        try testing.expectEqualStrings("http", res.header("x-saw-proto").?);
+        try testing.expect(std.mem.indexOf(u8, res.header("x-saw-via").?, "1.1 zig-libs") != null);
+        try testing.expectEqualStrings("kept", res.header("x-saw-keep").?);
+        // Hop-by-hop request header stripped before the backend.
+        try testing.expectEqualStrings("none", res.header("x-saw-proxyauth").?);
+        // Response-side Via injected; backend's hop-by-hop Keep-Alive stripped.
+        try testing.expect(std.mem.indexOf(u8, res.header("via").?, "1.1 zig-libs") != null);
+        try testing.expectEqual(@as(?[]const u8, null), res.header("keep-alive"));
+    }
+
+    { // POST /echo, large body → exercises h2 send-side flow control.
+        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/echo", .{proxy_port});
+        const payload = "H2PROXY" ** 20_000; // ~140 KB, past the 64 KiB window
+        var res = try client.request(.post, url, .{ .body = payload });
+        defer res.deinit();
+        try testing.expectEqual(@as(u16, 200), res.status);
+        const body = try res.readAllAlloc(gpa, payload.len + 16);
+        defer gpa.free(body);
+        try testing.expectEqualStrings(payload, body);
+    }
+
+    // Every request so far went over the ONE shared upstream connection.
+    try testing.expectEqual(@as(usize, 1), up.dialCount());
+
+    { // Concurrent clients → still one shared upstream connection.
+        var workers: [3]H2Worker = undefined;
+        var threads: [3]std.Thread = undefined;
+        for (&workers) |*w| w.* = .{ .io = io, .port = proxy_port };
+        for (&threads, &workers) |*t, *w| t.* = try std.Thread.spawn(.{}, H2Worker.run, .{w});
+        for (&threads) |t| t.join();
+        for (workers) |w| try testing.expect(w.ok);
+    }
+    try testing.expectEqual(@as(usize, 1), up.dialCount());
+}
+
+test "integration: h2c backend unreachable → 502 Bad Gateway" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var proxy_client = Client.init(io, gpa, .{});
+    defer proxy_client.deinit();
+    var up = http.h2_upstream.Pool.init(gpa, .{ .client = &proxy_client });
+    defer up.deinit();
+    var ph = ProxyHandler.init(.{
+        .client = &proxy_client,
+        .h2_upstream = &up,
+        // Port 1 is unbindable — the h2c dial refuses fast.
+        .backend = .{ .host = "127.0.0.1", .port = 1, .protocol = .h2c },
+    });
+    var proxy = Server.init(io, gpa, .{ .handler = ProxyHandler.handler, .context = &ph });
+    defer proxy.deinit();
+    proxy.bind() catch return error.SkipZigTest;
+    const pt = try std.Thread.spawn(.{}, serveWrap, .{&proxy});
+    defer pt.join();
+    defer proxy.shutdown();
+    const proxy_port = proxy.boundAddress().getPort();
+
+    var client = Client.init(io, gpa, .{});
+    defer client.deinit();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/x", .{proxy_port});
+    var res = try client.request(.get, url, .{});
+    defer res.deinit();
+    try testing.expectEqual(@as(u16, 502), res.status);
+    try testing.expect(std.mem.indexOf(u8, res.header("via").?, "zig-libs") != null);
 }

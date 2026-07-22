@@ -81,6 +81,20 @@ pub const h2_client = @import("h2_client.zig");
 /// (e.g. TLS) connection when ALPN selected `alpn_h2`.
 pub const h2_server = @import("h2_server.zig");
 
+/// HTTP/2 **upstream** connection pool (`h2_upstream.Pool`): keeps one
+/// multiplexed h2 connection per backend origin and runs each proxied
+/// request as a stream on it (reusing `h2_client.Session`). The back-side
+/// h2 capability the reverse proxy's forward seam uses to forward to an
+/// h2/h2c backend (`Backend.protocol`), the multiplexing counterpart of the
+/// h1 `Client`'s idle connection pool.
+pub const h2_upstream = @import("h2_upstream.zig");
+
+/// A shared, bounded slab pool for client connection read/write buffers
+/// (`bufpool.BufferPool`), wired to the h2 client via
+/// `Client.Options.buffer_pool` so pooled h2 upstream connections reuse a
+/// bounded set of slabs instead of allocating one per dial.
+pub const bufpool = @import("bufpool.zig");
+
 /// The HTTP/1.1 client (plus opt-in HTTP/2 h2c via `Client.connectH2c`).
 /// See `Client.init` / `Client.request`.
 pub const Client = @import("Client.zig");
@@ -429,6 +443,8 @@ test {
     _ = h2;
     _ = h2_client;
     _ = h2_server;
+    _ = h2_upstream;
+    _ = bufpool;
     _ = Client;
     _ = Server;
     _ = proxy;

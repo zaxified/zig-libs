@@ -60,8 +60,13 @@ const netaddr = @import("netaddr");
 const http = @import("root.zig");
 const h1 = @import("h1.zig");
 const h2_client = @import("h2_client.zig");
+const bufpool = @import("bufpool.zig");
 const net = std.Io.net;
 const tls = std.crypto.tls;
+
+/// Shared, bounded slab pool for client connection buffers (see
+/// `bufpool.BufferPool` and `Options.buffer_pool`).
+pub const BufferPool = bufpool.BufferPool;
 
 const Client = @This();
 
@@ -102,6 +107,20 @@ pub const Options = struct {
     /// set `.enabled = false` for the old one-connection-per-request
     /// behavior (every request explicitly sends `Connection: close`).
     pool: PoolOptions = .{},
+    /// Optional shared slab pool backing the **h2 client** read/write
+    /// buffers (`connectH2c`). Null (the default) = each h2c dial
+    /// `gpa.alloc`s its own `read_buffer_size + write_buffer_size` slab and
+    /// frees it on `H2Session.close`, exactly as before. When set, that slab
+    /// is checked out of / returned to the pool instead, so a gateway that
+    /// churns h2 upstream connections reuses a bounded set of slabs rather
+    /// than allocating one per dial. **The pool's `slab_size` MUST equal
+    /// `read_buffer_size + write_buffer_size`** (asserted in `connectH2c`) —
+    /// it serves exactly that one size class. The h1 path deliberately does
+    /// NOT use it: h1's idle `Pool` already recycles whole warm connections
+    /// (buffers included), so h1 never churns per-request buffers the way a
+    /// fresh h2c dial does. Shared across threads (the pool is internally
+    /// synchronized); the allocator behind it must be thread-safe.
+    buffer_pool: ?*BufferPool = null,
 };
 
 /// Tunables for the idle-connection pool (`Options.pool`).
@@ -506,6 +525,9 @@ pub const H2Session = struct {
         sr: net.Stream.Reader,
         sw: net.Stream.Writer,
         slab: []u8,
+        /// When set, `slab` was checked out of this pool and is returned to
+        /// it on `close` instead of freed (`Options.buffer_pool`).
+        buffer_pool: ?*BufferPool,
     };
 
     /// Start a request on its own stream (many may be in flight at once).
@@ -537,7 +559,7 @@ pub const H2Session = struct {
         const gpa = hs.gpa;
         if (hs.owned) |*o| {
             o.stream.close(o.client.io);
-            gpa.free(o.slab);
+            if (o.buffer_pool) |bp| bp.release(o.slab) else gpa.free(o.slab);
         }
         gpa.free(hs.authority);
         gpa.destroy(hs);
@@ -557,10 +579,14 @@ pub fn connectH2c(c: *Client, host: []const u8, port: u16, options: h2_client.Op
     var auth_w: std.Io.Writer = .fixed(&auth_buf);
     url.writeHostHeaderValue(&auth_w) catch return error.BadUrl;
 
+    const slab_len = c.options.read_buffer_size + c.options.write_buffer_size;
     const hs = try c.gpa.create(H2Session);
     errdefer c.gpa.destroy(hs);
-    const slab = try c.gpa.alloc(u8, c.options.read_buffer_size + c.options.write_buffer_size);
-    errdefer c.gpa.free(slab);
+    // Slab from the shared pool when one is configured (its size class must
+    // match this layout), else a fresh allocation freed on close.
+    if (c.options.buffer_pool) |bp| std.debug.assert(bp.slab_size == slab_len);
+    const slab = if (c.options.buffer_pool) |bp| try bp.acquire() else try c.gpa.alloc(u8, slab_len);
+    errdefer if (c.options.buffer_pool) |bp| bp.release(slab) else c.gpa.free(slab);
     const authority = try c.gpa.dupe(u8, auth_w.buffered());
     errdefer c.gpa.free(authority);
 
@@ -575,6 +601,7 @@ pub fn connectH2c(c: *Client, host: []const u8, port: u16, options: h2_client.Op
             .sr = undefined,
             .sw = undefined,
             .slab = slab,
+            .buffer_pool = c.options.buffer_pool,
         },
         .session = undefined,
         .authority = authority,
