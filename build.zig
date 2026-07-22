@@ -78,6 +78,7 @@ const module_list = [_]Module{
     .{ .name = "rsa", .deps = &.{"montint"} },
     .{ .name = "blindrsa", .deps = &.{"rsa"} },
     .{ .name = "ssh", .deps = &.{"rsa"} },
+    .{ .name = "netconf", .deps = &.{ "ssh", "xml" } },
     .{ .name = "nftables" },
     .{ .name = "modbus" },
     .{ .name = "whois", .deps = &.{"netaddr"} },
