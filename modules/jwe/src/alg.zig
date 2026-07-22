@@ -13,7 +13,7 @@
 //!     over `Alg || 0x00 || p2s`; the KEK it produces feeds `aeskw`.
 //!   - `aeskw` (re-export) — RFC 3394 AES Key Wrap: AxxxKW (§4.4) directly,
 //!     every PBES2-* variant indirectly. Byte-exact against RFC 3394 §4.1;
-//!     see `aeskw.zig` (A192KW stays a typed AES-192 std gap).
+//!     see the shared `aeskw` module (A192KW stays a typed AES-192 std gap).
 //!   - `ecdhes` (re-export) — ECDH-ES key agreement (§4.6): ephemeral-static
 //!     ECDH (P-256/X25519) + the Concat KDF. Direct mode derives the CEK
 //!     itself; `ECDH-ES+AxxxKW` derives a KEK that feeds `aeskw`. Byte-exact
@@ -23,7 +23,7 @@ const std = @import("std");
 const rsa = @import("rsa");
 const aead = std.crypto.aead.aes_gcm;
 
-pub const aeskw = @import("aeskw.zig");
+pub const aeskw = @import("aeskw");
 pub const ecdhes = @import("ecdhes.zig");
 
 pub const Error = error{

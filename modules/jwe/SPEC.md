@@ -9,9 +9,13 @@ placement).
 - **Layout:** `header.zig` (JOSE Protected Header build/parse, pure
   `std.json` + `std.base64.url_safe_no_pad`, no crypto) → `enc.zig` (content
   encryption, RFC 7518 §5) and `alg.zig` (key management, RFC 7518 §4), both
-  dispatched from `root.zig`'s `encryptCompact`/`decryptCompact` → `aeskw.zig`
-  (RFC 3394 AES Key Wrap, the careful core `alg.zig`'s AxxxKW/PBES2-* paths
-  feed into). `kat_rfc7516.zig` carries the two RFC 7516 Appendix A
+  dispatched from `root.zig`'s `encryptCompact`/`decryptCompact`. `enc.zig`'s
+  `cbc_hmac` builds on the shared `aescbc` module (raw AES-CBC + PKCS#7
+  padding — see `modules/aescbc/SPEC.md`) for its CBC half; `alg.zig`'s
+  AxxxKW/PBES2-* paths wrap/unwrap through the shared `aeskw` module (RFC
+  3394 AES Key Wrap — see `modules/aeskw/SPEC.md`). Both were extracted FROM
+  this module's own original implementations, so their KATs and error
+  shapes are unchanged. `kat_rfc7516.zig` carries the two RFC 7516 Appendix A
   full-token worked examples as tests.
 - **Compact serialization only** (RFC 7516 §3.1). The General/Flattened JSON
   serializations (§7.2) are explicitly out of scope for v1: they exist to
@@ -106,21 +110,31 @@ placement).
 
 ## `TODO(fable)` checklist — done-record (completed 2026-07-11)
 
-1. ✅ **`aeskw.zig`: `wrap`/`unwrap`** (RFC 3394 AES Key Wrap, AES-128/256
-   KEK). Mirrored from `modules/dnp3/src/sa.zig`'s `aeskw` namespace (not
-   imported — re-expressed against the RFC text). Byte-exact against RFC
-   3394 §4.1 both directions; extra tests cover AES-256 multi-block
-   round-trip, wrong-KEK/corrupted-input `Unauthentic` (with zeroed output),
-   and length/KEK validation. Integrity-IV compare is
+1. ✅ **`alg.aeskw` (the shared `aeskw` module): `wrap`/`unwrap`** (RFC 3394
+   AES Key Wrap, AES-128/256 KEK). Originally hand-rolled in this module as
+   `aeskw.zig` (itself mirrored from `modules/dnp3/src/sa.zig`'s `aeskw`
+   namespace, re-expressed against the RFC text, not imported); later
+   extracted verbatim into the standalone `aeskw` module — identical
+   signatures and `Error` set — so `dnp3`/`xmlenc`/`jwe` could all collapse
+   onto one core. `jwe` now imports it rather than shipping a local copy.
+   Byte-exact against RFC 3394 §4.1 both directions; extra tests cover
+   AES-256 multi-block round-trip, wrong-KEK/corrupted-input `Unauthentic`
+   (with zeroed output), and length/KEK validation. Integrity-IV compare is
    `std.crypto.timing_safe.eql`.
 2. ✅ **`enc.zig`: `cbc_hmac.encrypt`/`decrypt`** (RFC 7518 §5.2 AES-CBC +
-   HMAC-SHA-2, encrypt-then-MAC). Byte-exact against RFC 7518 Appendix B.1
-   and B.3, `E` and `T`, both directions; agrees with the std-only
-   sanity-oracle test. B.2 (A192CBC-HS384): the CBC half is typed-unsupported
-   (AES-192 std gap, see Design), but its HMAC-SHA-384 half is validated
-   byte-exact against the B.2 vector. Tag compare is
-   `std.crypto.timing_safe.eql`, verify-before-decrypt; padding and tag
-   failures return the identical `error.AuthenticationFailed`.
+   HMAC-SHA-2, encrypt-then-MAC). The CBC + PKCS#7 mechanics were similarly
+   extracted into the standalone `aescbc` module (shared with `xmlenc`);
+   `cbc_hmac` now calls `aescbc.encrypt`/`decrypt`/`padPkcs7`/`unpadPkcs7` and
+   keeps only the AEAD composition (AAD, the `AL` bit-length encoding, HMAC
+   computation, verify-before-decrypt ordering, and remapping
+   `aescbc`'s padding error onto the same `error.AuthenticationFailed` as a
+   tag mismatch) local. Byte-exact against RFC 7518 Appendix B.1 and B.3, `E`
+   and `T`, both directions; agrees with the std-only sanity-oracle test.
+   B.2 (A192CBC-HS384): the CBC half is typed-unsupported (AES-192 std gap,
+   see Design), but its HMAC-SHA-384 half is validated byte-exact against the
+   B.2 vector. Tag compare is `std.crypto.timing_safe.eql`,
+   verify-before-decrypt; padding and tag failures return the identical
+   `error.AuthenticationFailed`.
 3. ✅ **End-to-end:** `kat_rfc7516.zig`'s RFC 7516 A.3 test (A128KW +
    A128CBC-HS256) asserts byte-exact BOTH directions — decrypt recovers the
    exact plaintext, the raw key wrap reproduces §A.3.3's Encrypted Key, and
@@ -145,8 +159,8 @@ Run: `zig build test-jwe` (Debug + ReleaseFast both green).
 
 ## Status
 
-`gap · any · codec · reentrant` + deps `rsa` — canonical source is
-`pub const meta` in src/root.zig ("gap" = fills a genuine ecosystem gap,
-same category as `jwt`). Everything this module lists is real and
-KAT-validated; the only limitation is the typed AES-192 std gap (see
+`gap · any · codec · reentrant` + deps `rsa`, `p256`, `aescbc`, `aeskw` —
+canonical source is `pub const meta` in src/root.zig ("gap" = fills a genuine
+ecosystem gap, same category as `jwt`). Everything this module lists is real
+and KAT-validated; the only limitation is the typed AES-192 std gap (see
 Design).

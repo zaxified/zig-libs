@@ -227,6 +227,94 @@ test "round-trip: xenc11 rsa-oaep (SHA256) + AES-256-GCM" {
     try std.testing.expectEqualStrings(plaintext_assertion, out);
 }
 
+test "round-trip: xenc11 rsa-oaep, digest SHA-256 != MGF1-SHA1 (previously UnsupportedAlgorithm, now decoupled-OAEP)" {
+    // Before the `rsa` module gained `decryptOaepH` (decoupled label-hash /
+    // MGF1-hash), xmlenc rejected any OAEP config where DigestMethod != MGF
+    // with `error.UnsupportedAlgorithm` (the `rsa` module only exposed a
+    // single coupled `Hash`). This is a real-world xenc11 `rsa-oaep` shape
+    // (digest=SHA-256, MGF1=SHA-1) that must now decrypt successfully.
+    const a = std.testing.allocator;
+    const kp = try makeKey();
+    const cek = [_]u8{0x5E} ** 32;
+
+    // Wrap the CEK with the mismatched-hash OAEP encrypt side.
+    var prng = std.Random.DefaultPrng.init(0xFEEDFACE);
+    const k = (kp.public_key.n.bits() + 7) / 8;
+    var wrap_buf: [256]u8 = undefined;
+    const wrapped = try rsa.encryptOaepH(kp.public_key, Sha256, Sha1, prng.random(), &cek, "", wrap_buf[0..k]);
+
+    const content = try gcmEncrypt(a, Aes256Gcm, cek, plaintext_assertion);
+    defer a.free(content);
+
+    const key_alg = xenc11_ns ++ "rsa-oaep";
+    const cek_b64 = try b64(a, wrapped);
+    defer a.free(cek_b64);
+    const content_b64 = try b64(a, content);
+    defer a.free(content_b64);
+    const doc_src = try std.fmt.allocPrint(a,
+        \\<xenc:EncryptedData xmlns:xenc="{s}" xmlns:ds="{s}" xmlns:x11="{s}">
+        \\  <xenc:EncryptionMethod Algorithm="{s}aes256-gcm"/>
+        \\  <ds:KeyInfo>
+        \\    <xenc:EncryptedKey>
+        \\      <xenc:EncryptionMethod Algorithm="{s}">
+        \\        <ds:DigestMethod Algorithm="{s}sha256"/>
+        \\        <x11:MGF Algorithm="{s}mgf1sha1"/>
+        \\      </xenc:EncryptionMethod>
+        \\      <xenc:CipherData><xenc:CipherValue>{s}</xenc:CipherValue></xenc:CipherData>
+        \\    </xenc:EncryptedKey>
+        \\  </ds:KeyInfo>
+        \\  <xenc:CipherData><xenc:CipherValue>{s}</xenc:CipherValue></xenc:CipherData>
+        \\</xenc:EncryptedData>
+    , .{ xenc_ns, ds_ns, xenc11_ns, xenc11_ns, key_alg, xenc_ns, xenc11_ns, cek_b64, content_b64 });
+    defer a.free(doc_src);
+    var doc = try xml.parse(a, doc_src, .{});
+    defer doc.deinit();
+    const out = try xmlenc.decryptData(a, doc.root, kp.secret_key, .{});
+    defer a.free(out);
+    try std.testing.expectEqualStrings(plaintext_assertion, out);
+}
+
+test "teeth: xenc11 rsa-oaep with a genuinely unrecognized MGF algorithm -> UnsupportedAlgorithm (positive control for the digest!=MGF test above)" {
+    const a = std.testing.allocator;
+    const kp = try makeKey();
+    const cek = [_]u8{0x5E} ** 32;
+    var prng = std.Random.DefaultPrng.init(0xFEEDFACE);
+    const k = (kp.public_key.n.bits() + 7) / 8;
+    var wrap_buf: [256]u8 = undefined;
+    const wrapped = try rsa.encryptOaepH(kp.public_key, Sha256, Sha1, prng.random(), &cek, "", wrap_buf[0..k]);
+    const content = try gcmEncrypt(a, Aes256Gcm, cek, plaintext_assertion);
+    defer a.free(content);
+
+    const key_alg = xenc11_ns ++ "rsa-oaep";
+    const cek_b64 = try b64(a, wrapped);
+    defer a.free(cek_b64);
+    const content_b64 = try b64(a, content);
+    defer a.free(content_b64);
+    // A real xenc11 MGF Algorithm URI is required to be mgf1sha1/mgf1sha256/
+    // mgf1sha384/mgf1sha512; this module only implements mgf1sha1/mgf1sha256
+    // (sha384/512 would need new comptime hash arms), so an unrecognized MGF
+    // URI must still be refused, confirming the allow-list gate still works.
+    const doc_src = try std.fmt.allocPrint(a,
+        \\<xenc:EncryptedData xmlns:xenc="{s}" xmlns:ds="{s}" xmlns:x11="{s}">
+        \\  <xenc:EncryptionMethod Algorithm="{s}aes256-gcm"/>
+        \\  <ds:KeyInfo>
+        \\    <xenc:EncryptedKey>
+        \\      <xenc:EncryptionMethod Algorithm="{s}">
+        \\        <ds:DigestMethod Algorithm="{s}sha256"/>
+        \\        <x11:MGF Algorithm="{s}mgf1sha512"/>
+        \\      </xenc:EncryptionMethod>
+        \\      <xenc:CipherData><xenc:CipherValue>{s}</xenc:CipherValue></xenc:CipherData>
+        \\    </xenc:EncryptedKey>
+        \\  </ds:KeyInfo>
+        \\  <xenc:CipherData><xenc:CipherValue>{s}</xenc:CipherValue></xenc:CipherData>
+        \\</xenc:EncryptedData>
+    , .{ xenc_ns, ds_ns, xenc11_ns, xenc11_ns, key_alg, xenc_ns, xenc11_ns, cek_b64, content_b64 });
+    defer a.free(doc_src);
+    var doc = try xml.parse(a, doc_src, .{});
+    defer doc.deinit();
+    try std.testing.expectError(error.UnsupportedAlgorithm, xmlenc.decryptData(a, doc.root, kp.secret_key, .{}));
+}
+
 test "round-trip via EncryptedAssertion wrapper convenience" {
     const a = std.testing.allocator;
     const kp = try makeKey();

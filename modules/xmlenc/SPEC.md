@@ -34,15 +34,27 @@ Also out of scope, and actively rejected:
 | `…2001/04/xmlenc#kw-aes128` | RFC 3394 AES-128 key wrap | needs `Options.kek` (16 B) |
 | `…2001/04/xmlenc#kw-aes256` | RFC 3394 AES-256 key wrap | needs `Options.kek` (32 B) |
 
-**OAEP hash coupling.** The sibling `rsa` module's `decryptOaep` uses a single
-`Hash` type for both the OAEP label hash and MGF1. This module therefore
-supports only OAEP configurations where the DigestMethod hash equals the MGF1
-hash: `rsa-oaep-mgf1p` (SHA-1/SHA-1), and xenc11 `rsa-oaep` with SHA-1/SHA-1 or
-SHA-256/SHA-256. A digest/MGF mismatch (e.g. digest SHA-256 with MGF1-SHA1)
-returns `UnsupportedAlgorithm`. When xenc11 `rsa-oaep` omits the `MGF` element,
-the MGF is assumed to match the DigestMethod (the expressible case), not the
-literal spec default of MGF1-SHA1. OAEPparams (the OAEP label `L`) is honored
-when present, empty otherwise.
+The kw-aes* unwrap is delegated to the shared `aeskw` module (`aeskw.unwrap`,
+RFC 3394 §2.2.2) — xmlenc no longer carries its own key-unwrap core; any
+`aeskw` error (bad length, unsupported KEK length, integrity-check failure)
+collapses to this module's generic `DecryptionError`.
+
+**Decoupled OAEP digest / MGF1 hash (digest != MGF1 is supported).** The
+sibling `rsa` module exposes `decryptOaepH(sk, LabelHash, MgfHash, ...)`,
+which treats the OAEP label-digest hash and the MGF1 hash as independent
+parameters (RFC 8017 §7.1.2 does not couple them). This module resolves both
+independently from the EncryptedKey's `ds:DigestMethod` and xenc11 `MGF`
+elements and dispatches to `decryptOaepH` with whichever pair was requested —
+`rsa-oaep-mgf1p` is SHA-1/SHA-1 fixed; xenc11 `rsa-oaep` supports any of
+{SHA-1, SHA-256} for DigestMethod crossed with any of {MGF1-SHA1, MGF1-SHA256}
+for MGF, **including a mismatched pair** (e.g. DigestMethod=SHA-256 with
+MGF1=SHA-1 — a real-world interop shape some IdPs emit). Only a genuinely
+unrecognized digest or MGF algorithm URI (not SHA-1/SHA-256, or MGF1-SHA384/
+SHA512, which this module does not implement) returns `UnsupportedAlgorithm`.
+When xenc11 `rsa-oaep` omits the `MGF` element, the MGF defaults to the
+xenc11-spec default MGF1-SHA1 (not "assumed to match the digest" — that
+assumption is no longer needed now that the hashes are decoupled).
+OAEPparams (the OAEP label `L`) is honored when present, empty otherwise.
 
 ### Content (data) encryption (the EncryptedData EncryptionMethod)
 
@@ -57,6 +69,10 @@ when present, empty otherwise.
   AEAD-verified, fail-closed on tag mismatch.
 - **CBC**: ciphertext = `IV(16) ‖ ciphertext`; XML-Enc padding — the final byte
   `N` (1..16) is the pad length, the preceding `N-1` pad bytes are arbitrary.
+  The raw CBC core and the XML-Enc unpad are both delegated to the shared
+  `aescbc` module (`aescbc.decrypt` + `aescbc.unpadXmlEnc`) — xmlenc no longer
+  carries its own CBC loop or unpad logic; any `aescbc` error (misaligned
+  input, invalid pad) collapses to this module's generic `DecryptionError`.
 
 **AES-192 (`aes192-cbc`/`aes192-gcm`) is `UnsupportedAlgorithm`, not a stub:**
 std 0.16 ships only `Aes128`/`Aes256` block ciphers (same gap `jwe` documents
@@ -96,15 +112,21 @@ for A192*). The CEK length must match the content algorithm's key size, else
 ## Validation
 
 - **Byte-exact / KAT-anchored:**
-  - AES-CBC core cross-checked against **NIST SP800-38A** (F.2.5, AES-256-CBC),
-    byte-exact (`root.zig` test).
-  - AES key unwrap cross-checked against **RFC 3394 §4.1**, byte-exact.
-  - RSA OAEP/v1.5 primitives inherit the sibling `rsa` module's own
-    OpenSSL/RFC KATs.
+  - AES-CBC core cross-checked against **NIST SP800-38A** (F.2.5, AES-256-CBC
+    and F.2.1, AES-128-CBC), byte-exact — now anchored in the shared `aescbc`
+    module's own tests (single source of truth); this module's CBC coverage
+    comes from the round-trip tests exercising the full `aesCbcDecrypt` path.
+  - AES key unwrap cross-checked against **RFC 3394 §4.1, §4.3, §4.5, §4.6**,
+    byte-exact — anchored in the shared `aeskw` module's own tests, plus a
+    local §4.1 byte-exact test here exercising this module's `aesKwUnwrap`
+    wrapper.
+  - RSA OAEP/v1.5 primitives (including the decoupled-hash `decryptOaepH`
+    path) inherit the sibling `rsa` module's own OpenSSL/RFC KATs.
 - **Constructed round-trips** (`test_roundtrip.zig`): a locally generated
-  1024-bit RSA key encrypts a CEK (OAEP-SHA1, OAEP-SHA256, PKCS1-v1.5, or
-  kw-aes256) and a plaintext `<saml:Assertion>` (AES-128/256 GCM and CBC); the
-  public decrypt path recovers the exact plaintext. These are self-consistency /
+  1024-bit RSA key encrypts a CEK (OAEP-SHA1, OAEP-SHA256, OAEP with a
+  mismatched SHA-256-digest/MGF1-SHA1 pair, PKCS1-v1.5, or kw-aes256) and a
+  plaintext `<saml:Assertion>` (AES-128/256 GCM and CBC); the public decrypt
+  path recovers the exact plaintext. These are self-consistency /
   interop-shape tests, **not** external byte-exact vectors — **no real external
   SAML EncryptedAssertion fixture with its private key was available**; if one is
   obtained later it should be added and cited here.
@@ -113,11 +135,16 @@ for A192*). The CEK length must match the content algorithm's key size, else
   `UnsupportedAlgorithm`; AES-192 → `UnsupportedAlgorithm`; `rsa-1_5` without
   opt-in → `WeakRsa15NotAllowed`; wrong private key → `DecryptionError`;
   CipherReference → `CipherReferenceUnsupported`; non-base64 CipherValue →
-  `MalformedStructure`; kw-aes* without KEK → `KekNotProvided`.
+  `MalformedStructure`; kw-aes* without KEK → `KekNotProvided`; a genuinely
+  unrecognized xenc11 MGF algorithm URI → `UnsupportedAlgorithm` (the positive
+  control confirming the allow-list gate still holds now that digest != MGF
+  is otherwise accepted).
 
 ## Status
 
-`extract` — implemented and tested (22 tests, green in Debug and ReleaseFast).
-Decryption side only. Depends on `xml` (structure walk) and `rsa` (OAEP / v1.5 /
-RSADP); AES-GCM/CBC and base64 from std; RFC 3394 AES key unwrap mirrored
-locally (no `jwe` dependency).
+`extract` — implemented and tested (23 tests, green in Debug and ReleaseFast).
+Decryption side only. Depends on `xml` (structure walk), `rsa` (OAEP / v1.5 /
+RSADP, including decoupled-hash OAEP), `aescbc` (CBC core + XML-Enc unpad),
+and `aeskw` (RFC 3394 key unwrap) — this module no longer carries any local
+hand-rolled CBC or key-wrap implementation; those are single-sourced in their
+respective sibling modules. AES-GCM and base64 remain from std.

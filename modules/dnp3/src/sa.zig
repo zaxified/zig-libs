@@ -4,11 +4,11 @@
 //! §7 / IEC 62351-5), object group 120. Pure-Zig, zero-C.
 //!
 //! IMPLEMENTED (SAv2 symmetric authentication):
-//! - **AES Key Wrap (RFC 3394)** over `std.crypto.core.aes` (AES-128 and
-//!   AES-256 KEK) — `aeskw.wrap`/`aeskw.unwrap`, byte-exact against the RFC
-//!   3394 §4 published vectors. std ships no key-wrap; this is the new
-//!   primitive and is deliberately kept small + generic so it can be promoted
-//!   out of this module (it also unblocks JWE key management later).
+//! - **AES Key Wrap (RFC 3394)** via the shared `aeskw` module
+//!   (`modules/aeskw`) — `aeskw.wrap`/`aeskw.unwrap`, byte-exact against the
+//!   RFC 3394 §4 published vectors. std ships no key-wrap; this used to be a
+//!   local copy here but has been collapsed onto the canonical extracted
+//!   module (also used by `jwe` and `xmlenc`).
 //! - **MAC algorithms** (`mac`): the SA algorithm registry — HMAC-SHA-1
 //!   (truncated to 4/8/10 octets), HMAC-SHA-256 (truncated to 8/16 octets),
 //!   and AES-GMAC (12-octet tag), all via `std.crypto`. Truncation lengths
@@ -39,7 +39,9 @@
 //!   consulted as a behavioral/wire reference only, no source copied). The
 //!   scaffold's MAC-algorithm ids and key-status ordering were WRONG and are
 //!   corrected here (see the enum doc comments).
-//! - AES-KW is byte-exact against RFC 3394 §4 test vectors (see tests).
+//! - AES-KW (the shared `aeskw` module) is byte-exact against RFC 3394 §4
+//!   test vectors; this file's own tests exercise it as an integration path
+//!   (session-key wrap/unwrap through this module's call sites).
 //! - HMAC truncation is validated against RFC 2202 / RFC 4231 KATs; AES-GMAC
 //!   against the GCM spec (McGrew & Viega) test case 1.
 //! - The **MAC-input byte construction** (challenge message ‖ authenticated
@@ -54,117 +56,11 @@
 
 const std = @import("std");
 
-// ── AES Key Wrap (RFC 3394) ──────────────────────────────────────────────────
-//
-// A genuine std gap (std has no key-wrap). Generic over the AES-128 and
-// AES-256 key-encryption keys DNP3's `KeyWrapAlgorithm` selects. Kept
-// standalone + minimal so it can be promoted to its own module later.
-
-pub const aeskw = struct {
-    const aes = std.crypto.core.aes;
-
-    /// The RFC 3394 §2.2.3.1 default initial value (the integrity check
-    /// register's start / expected value after unwrap).
-    pub const default_iv = [8]u8{ 0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6 };
-
-    pub const Error = error{
-        /// KEK isn't 16 or 32 bytes, or the payload isn't a ≥16-byte multiple of 8.
-        InvalidLength,
-        BufferTooSmall,
-        /// Unwrap integrity check failed (wrong KEK or corrupted ciphertext).
-        Unauthentic,
-    };
-
-    /// AES key wrap. `plaintext.len` must be a multiple of 8 and ≥ 16.
-    /// `kek.len` selects AES-128 (16) or AES-256 (32). Writes `plaintext.len
-    /// + 8` ciphertext bytes into `out` and returns that slice.
-    pub fn wrap(kek: []const u8, plaintext: []const u8, out: []u8) Error![]u8 {
-        if (plaintext.len < 16 or plaintext.len % 8 != 0) return error.InvalidLength;
-        const n = plaintext.len / 8;
-        const total = plaintext.len + 8;
-        if (out.len < total) return error.BufferTooSmall;
-
-        // R[1..n] = plaintext blocks; A = IV.
-        var a: [8]u8 = default_iv;
-        // Registers laid out in `out` as A(8) || R1 || R2 ... so we operate in place.
-        @memcpy(out[8..total], plaintext);
-        const r = out[8..total];
-
-        var j: usize = 0;
-        while (j < 6) : (j += 1) {
-            var i: usize = 0;
-            while (i < n) : (i += 1) {
-                var block: [16]u8 = undefined;
-                @memcpy(block[0..8], &a);
-                @memcpy(block[8..16], r[i * 8 ..][0..8]);
-                encBlock(kek, &block) catch return error.InvalidLength;
-                // t = n*j + (i+1), XORed big-endian into the MSB half.
-                const t: u64 = @as(u64, n) * @as(u64, j) + @as(u64, i) + 1;
-                @memcpy(&a, block[0..8]);
-                xorCounter(&a, t);
-                @memcpy(r[i * 8 ..][0..8], block[8..16]);
-            }
-        }
-        @memcpy(out[0..8], &a);
-        return out[0..total];
-    }
-
-    /// AES key unwrap — the inverse of `wrap`. `ciphertext.len` must be a
-    /// multiple of 8 and ≥ 24. Returns the `ciphertext.len - 8` recovered
-    /// plaintext bytes, or `error.Unauthentic` if the integrity check fails.
-    pub fn unwrap(kek: []const u8, ciphertext: []const u8, out: []u8) Error![]u8 {
-        if (ciphertext.len < 24 or ciphertext.len % 8 != 0) return error.InvalidLength;
-        const n = ciphertext.len / 8 - 1;
-        if (out.len < n * 8) return error.BufferTooSmall;
-
-        var a: [8]u8 = undefined;
-        @memcpy(&a, ciphertext[0..8]);
-        const r = out[0 .. n * 8];
-        @memcpy(r, ciphertext[8..]);
-
-        var j: usize = 6;
-        while (j > 0) {
-            j -= 1;
-            var i: usize = n;
-            while (i > 0) {
-                i -= 1;
-                const t: u64 = @as(u64, n) * @as(u64, j) + @as(u64, i) + 1;
-                var block: [16]u8 = undefined;
-                @memcpy(block[0..8], &a);
-                xorCounter(block[0..8], t);
-                @memcpy(block[8..16], r[i * 8 ..][0..8]);
-                decBlock(kek, &block) catch return error.InvalidLength;
-                @memcpy(&a, block[0..8]);
-                @memcpy(r[i * 8 ..][0..8], block[8..16]);
-            }
-        }
-        // Constant-time integrity check against the default IV.
-        if (!ctEql(&a, &default_iv)) return error.Unauthentic;
-        return r;
-    }
-
-    fn encBlock(kek: []const u8, block: *[16]u8) error{InvalidLength}!void {
-        switch (kek.len) {
-            16 => aes.Aes128.initEnc(kek[0..16].*).encrypt(block, block),
-            32 => aes.Aes256.initEnc(kek[0..32].*).encrypt(block, block),
-            else => return error.InvalidLength,
-        }
-    }
-
-    fn decBlock(kek: []const u8, block: *[16]u8) error{InvalidLength}!void {
-        switch (kek.len) {
-            16 => aes.Aes128.initDec(kek[0..16].*).decrypt(block, block),
-            32 => aes.Aes256.initDec(kek[0..32].*).decrypt(block, block),
-            else => return error.InvalidLength,
-        }
-    }
-
-    fn xorCounter(a: *[8]u8, t: u64) void {
-        var tb: [8]u8 = undefined;
-        std.mem.writeInt(u64, &tb, t, .big);
-        for (a, tb) |*x, y| x.* ^= y;
-    }
-};
+/// RFC 3394 AES Key Wrap — the shared, canonical implementation (see
+/// `modules/aeskw/src/root.zig`; also used by `jwe` and `xmlenc`). Re-exported
+/// under this name so the rest of this file (and its tests) reads the same as
+/// before the extraction.
+const aeskw = @import("aeskw");
 
 // ── constant-time byte-slice compare ─────────────────────────────────────────
 
@@ -818,6 +714,12 @@ pub fn wrapSessionKeys(
     const klen = control_key.len;
     @memcpy(plain[0..klen], control_key);
     @memcpy(plain[klen .. 2 * klen], monitoring_key);
+    // `else` folds both `aeskw.Error.InvalidLength` (misshapen KEK/plaintext)
+    // and `aeskw.Error.UnsupportedKeyLength` (a KEK length with no std AES
+    // core, e.g. 192-bit) into `KeyLength` — this module's public error set
+    // has never distinguished those two failure modes for the update key, so
+    // adopting the shared `aeskw` module (which splits them) doesn't change
+    // what a `wrapSessionKeys` caller observes.
     return aeskw.wrap(update_key, plain[0 .. 2 * klen], out) catch |e| switch (e) {
         error.BufferTooSmall => error.BufferTooSmall,
         else => error.KeyLength,
@@ -842,6 +744,10 @@ pub fn unwrapSessionKeys(
 ) SessionKeyError!UnwrappedSessionKeys {
     if (key_len != 16 and key_len != 32) return error.KeyLength;
     if (out.len < 2 * key_len) return error.BufferTooSmall;
+    // Same `else` fold as `wrapSessionKeys`: `aeskw.Error.InvalidLength` and
+    // `aeskw.Error.UnsupportedKeyLength` both become `KeyLength` here, so
+    // adopting the shared module (which added the latter as a distinct
+    // variant) does not change this function's observable error surface.
     const recovered = aeskw.unwrap(update_key, wrapped, out) catch |e| switch (e) {
         error.Unauthentic => return error.Unauthentic,
         error.BufferTooSmall => return error.BufferTooSmall,
@@ -927,6 +833,14 @@ fn hexToBytes(comptime hex: []const u8) [hex.len / 2]u8 {
     _ = std.fmt.hexToBytes(&out, hex) catch unreachable;
     return out;
 }
+
+// The four tests below duplicate KATs also asserted in
+// `modules/aeskw/src/root.zig` (§4.1/§4.3/§4.6, wrong-KEK/corruption reject,
+// malformed lengths). Kept here deliberately as an INTEGRATION test through
+// dnp3's own `aeskw` re-export (sa.zig:63) — they prove the module import is
+// wired correctly and that `wrapSessionKeys`/`unwrapSessionKeys` sit on the
+// same primitive dnp3's tests have always exercised, not just that the
+// standalone `aeskw` module itself is correct (already covered there).
 
 test "AES-KW: RFC 3394 §4.1 (128-bit KEK, 128-bit key)" {
     const kek = hexToBytes("000102030405060708090A0B0C0D0E0F");

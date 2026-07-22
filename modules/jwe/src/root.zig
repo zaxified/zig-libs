@@ -26,7 +26,7 @@
 //!   - `dir` — REAL (trivial: the CEK is the shared key).
 //!   - `RSA-OAEP` / `RSA-OAEP-256` — REAL (wraps the `rsa` module's OAEP).
 //!   - `A128KW`/`A256KW` — REAL (RFC 3394 AES Key Wrap; byte-exact against
-//!     RFC 3394 §4.1 and RFC 7516 A.3). See `aeskw.zig`.
+//!     RFC 3394 §4.1 and RFC 7516 A.3). See the shared `aeskw` module.
 //!   - `A128GCMKW`/`A256GCMKW` — REAL; `A192GCMKW`/`A192KW` unsupported
 //!     (the same AES-192 std gap as content encryption).
 //!   - `PBES2-HS256+A128KW`/`PBES2-HS512+A256KW` — REAL (PBKDF2 KDF feeding
@@ -86,7 +86,7 @@ pub const meta = .{
     .role = .codec, // pure wire codec + crypto dispatch, no I/O of its own
     .concurrency = .reentrant, // no shared/global state; every call is self-contained
     .model_after = "RFC 7516 (JWE) + RFC 7518 (JWA encryption algs) + RFC 3394 (AES Key Wrap); sibling of this repo's `jwt` (RFC 7515 JWS)",
-    .deps = .{ "rsa", "p256" }, // p256 supplies the ECDH-ES P-256 curve (byte-exact to std.crypto.ecc.P256); X25519 stays on std
+    .deps = .{ "rsa", "p256", "aescbc", "aeskw" }, // p256 supplies the ECDH-ES P-256 curve (byte-exact to std.crypto.ecc.P256); X25519 stays on std; aescbc/aeskw supply the shared CBC + RFC 3394 key-wrap cores
 };
 
 /// Key management algorithm (`alg` header parameter, RFC 7518 §4 names).

@@ -14,7 +14,8 @@
 //! different kind of work than reviewing an already-written careful core.
 //!
 //! REAL (see the `cbc_hmac` namespace): `A128CBC-HS256`/`A256CBC-HS512`
-//! (RFC 7518 §5.2) — AES-CBC + HMAC-SHA-2 "encrypt-then-MAC" with the §5.2.2
+//! (RFC 7518 §5.2) — AES-CBC (raw block-chaining + PKCS#7 padding from the
+//! shared `aescbc` module) + HMAC-SHA-2 "encrypt-then-MAC" with the §5.2.2
 //! key split, AAD-bit-length encoding, and verify-before-decrypt ordering;
 //! byte-exact against RFC 7518 Appendix B. `A192CBC-HS384` hits the same
 //! AES-192 std gap as `A192GCM` (its HMAC-SHA-384 half is validated against
@@ -22,6 +23,7 @@
 
 const std = @import("std");
 const aead = std.crypto.aead.aes_gcm;
+const aescbc = @import("aescbc");
 
 const root = @import("root.zig");
 const Enc = root.Enc;
@@ -227,27 +229,15 @@ pub const cbc_hmac = struct {
         const mac_key = cek[0..half];
         const enc_key = cek[half..][0..half];
 
-        // AES-CBC over PKCS#7-padded plaintext (§5.2.2.1 step 2). std has no
-        // CBC mode helper — chain the block cipher by hand (same shape as the
-        // std-only sanity oracle test at the bottom of this file).
-        const ctx = Aes.initEnc(enc_key.*);
-        var prev: [block_len]u8 = iv[0..block_len].*;
-        var i: usize = 0;
-        while (i < padded_len) : (i += block_len) {
-            var block: [block_len]u8 = undefined;
-            if (i + block_len <= plaintext.len) {
-                block = plaintext[i..][0..block_len].*;
-            } else {
-                const rem = plaintext.len - i;
-                const pad: u8 = @intCast(block_len - rem);
-                @memcpy(block[0..rem], plaintext[i..][0..rem]);
-                @memset(block[rem..], pad);
-            }
-            for (&block, prev) |*b, p| b.* ^= p;
-            ctx.encrypt(&block, &block);
-            @memcpy(ciphertext_out[i..][0..block_len], &block);
-            prev = block;
-        }
+        // PKCS#7-pad, then raw AES-CBC-encrypt in place (§5.2.2.1 step 2),
+        // both via the shared `aescbc` module. Safe to pad and encrypt into
+        // the same buffer: `aescbc.encrypt` copies each input block into a
+        // local register before it overwrites that same span of `out`.
+        _ = aescbc.padPkcs7(plaintext, ciphertext_out[0..padded_len]) catch return error.BufferTooSmall;
+        _ = aescbc.encrypt(Aes, enc_key.*, iv[0..block_len].*, ciphertext_out[0..padded_len], ciphertext_out[0..padded_len]) catch |err| switch (err) {
+            error.NotBlockAligned => unreachable, // padded_len is always block_len-aligned
+            error.BufferTooSmall => return error.BufferTooSmall,
+        };
 
         // T = leftmost `half` bytes of HMAC(MAC_KEY, AAD ‖ IV ‖ E ‖ AL);
         // AL = AAD length in BITS, 64-bit big-endian (§5.2.2.1 steps 3-5).
@@ -284,37 +274,18 @@ pub const cbc_hmac = struct {
             return error.AuthenticationFailed;
         }
 
-        // AES-CBC decrypt (tag already verified).
-        const ctx = Aes.initDec(enc_key.*);
-        var prev: [block_len]u8 = iv[0..block_len].*;
-        var i: usize = 0;
-        while (i < ciphertext.len) : (i += block_len) {
-            const ct_block: [block_len]u8 = ciphertext[i..][0..block_len].*;
-            var block: [block_len]u8 = undefined;
-            ctx.decrypt(&block, &ct_block);
-            for (&block, prev) |*b, p| b.* ^= p;
-            @memcpy(plaintext_out[i..][0..block_len], &block);
-            prev = ct_block;
-        }
-
-        // Strip PKCS#7 padding without secret-dependent early exits, and
-        // surface any failure as the SAME error as a tag mismatch — a padding
-        // error must be indistinguishable from an authentication error (no
+        // AES-CBC decrypt (tag already verified) via the shared `aescbc`
+        // module, then strip PKCS#7 padding without secret-dependent early
+        // exits — `aescbc.unpadPkcs7` surfaces every malformed-padding shape
+        // as the single `error.InvalidPadding`, which is remapped to the SAME
+        // `error.AuthenticationFailed` as a tag mismatch here: a padding
+        // error must stay indistinguishable from an authentication error (no
         // padding oracle).
-        const n = ciphertext.len;
-        const pad = plaintext_out[n - 1];
-        var invalid: u1 = @intFromBool(pad == 0) | @intFromBool(pad > block_len);
-        // Clamp so the scan below stays in bounds even for an invalid `pad`
-        // (`invalid` is already latched in that case).
-        const pad_len: usize = @min(@as(usize, pad), block_len);
-        var k: usize = 0;
-        while (k < block_len) : (k += 1) {
-            const in_pad: u1 = @intFromBool(k < pad_len);
-            const mismatch: u1 = @intFromBool(plaintext_out[n - 1 - k] != pad);
-            invalid |= in_pad & mismatch;
-        }
-        if (invalid != 0) return error.AuthenticationFailed;
-        return n - pad_len;
+        _ = aescbc.decrypt(Aes, enc_key.*, iv[0..block_len].*, ciphertext, plaintext_out[0..ciphertext.len]) catch |err| switch (err) {
+            error.NotBlockAligned => unreachable, // checked above: ciphertext.len % block_len == 0
+            error.BufferTooSmall => return error.BufferTooSmall,
+        };
+        return aescbc.unpadPkcs7(plaintext_out[0..ciphertext.len]) catch return error.AuthenticationFailed;
     }
 
     fn computeTag(

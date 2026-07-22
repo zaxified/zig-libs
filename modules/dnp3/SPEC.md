@@ -73,9 +73,10 @@ I/O — this module hands the caller bytes to send/receive, nothing more.
 `sa.zig` implements the SAv2 symmetric authentication of IEEE 1815-2012 §7 / IEC 62351-5 over
 object group 120:
 
-- **AES Key Wrap (RFC 3394)** — `aeskw.wrap`/`aeskw.unwrap` over `std.crypto.core.aes` (AES-128 and
-  AES-256 KEK; std ships no key-wrap). Byte-exact against the RFC 3394 §4 published vectors; kept
-  standalone/promotable (also unblocks JWE key management later).
+- **AES Key Wrap (RFC 3394)** — via the shared `modules/aeskw` module (`aeskw.wrap`/`aeskw.unwrap`
+  over `std.crypto.core.aes`, AES-128 and AES-256 KEK; std ships no key-wrap). Byte-exact against
+  the RFC 3394 §4 published vectors. This used to be a local copy in `sa.zig`; it has been
+  collapsed onto the canonical extracted module, which `jwe` and `xmlenc` also use.
 - **MAC algorithms** (`mac`) — the SA algorithm registry: HMAC-SHA-1 (truncated to 4/8/10 octets),
   HMAC-SHA-256 (truncated to 8/16 octets), and AES-GMAC (12-octet tag), all via `std.crypto`, with
   constant-time verification (`std.crypto.timing_safe`-style byte compare).
@@ -120,7 +121,8 @@ round-trips for every implemented range shape (1/2/4-byte start-stop, all-values
 sweep, flags-byte round-trip, and an encode/decode round-trip for every core object
 (g1v1 packed bits, g1v2, g12v1 CROB, g20v1/v2, g30v1/v2/v5, g40v1, g41v1/v2/v3, g50v1) plus a
 short-record error sweep; `sa` (20) — AES-KW RFC 3394 §4.1/§4.3/§4.6 vectors + wrong-KEK/corruption
-reject + malformed-length errors, HMAC-SHA-256 (RFC 4231) and HMAC-SHA-1 (RFC 2202) truncation KATs,
+reject + malformed-length errors (integration tests through the shared `modules/aeskw` module, which
+carries its own byte-exact KAT suite), HMAC-SHA-256 (RFC 4231) and HMAC-SHA-1 (RFC 2202) truncation KATs,
 AES-GMAC (McGrew GCM test case 1) + compute/verify, constant-time verify accept/tamper/wrong-length,
 g120 object-header + v1/v3/v4/v5/v6/v7/v9 codec round-trips, short/garbage decode sweep, session-key
 wrap/unwrap (128- and 256-bit, wrong-update-key reject), the full challenge-response flow

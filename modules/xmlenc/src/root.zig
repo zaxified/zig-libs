@@ -28,10 +28,13 @@
 const std = @import("std");
 const xml = @import("xml");
 const rsa = @import("rsa");
+const aescbc = @import("aescbc");
+const aeskw = @import("aeskw");
 
-const aes = std.crypto.core.aes;
 const Sha1 = std.crypto.hash.Sha1;
 const Sha256 = std.crypto.hash.sha2.Sha256;
+const Aes128 = std.crypto.core.aes.Aes128;
+const Aes256 = std.crypto.core.aes.Aes256;
 const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
 const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
 
@@ -40,7 +43,7 @@ pub const meta = .{
     .role = .codec,
     .concurrency = .reentrant,
     .model_after = "W3C XML Encryption 1.1 (xmlenc-core-1), decryption side; RFC 8017 / RFC 3394 / NIST SP800-38A/D",
-    .deps = .{ "xml", "rsa" },
+    .deps = .{ "xml", "rsa", "aescbc", "aeskw" },
 };
 
 // ── namespace URIs ──────────────────────────────────────────────────────────
@@ -238,7 +241,7 @@ fn unwrapCek(
     defer alloc.free(wrapped);
 
     if (eq(alg, alg_rsa_oaep_mgf1p)) {
-        return try rsaOaepUnwrap(sk, .sha1, enc_key, wrapped, out);
+        return try rsaOaepUnwrap(sk, .{ .digest = .sha1, .mgf = .sha1 }, enc_key, wrapped, out);
     } else if (eq(alg, alg_rsa_oaep)) {
         const h = try oaepHashFromMethod(method);
         return try rsaOaepUnwrap(sk, h, enc_key, wrapped, out);
@@ -254,11 +257,16 @@ fn unwrapCek(
     return error.UnsupportedAlgorithm;
 }
 
-/// Resolve the OAEP digest for an xenc11 `rsa-oaep` EncryptionMethod. The `rsa`
-/// module couples the OAEP label-hash and the MGF1 hash (one `Hash` type), so
-/// we require MGF1's hash to equal the DigestMethod hash; a differing pair is
-/// reported as `UnsupportedAlgorithm` (see SPEC.md "OAEP hash coupling").
-fn oaepHashFromMethod(method: *const xml.Element) Error!OaepHash {
+/// Digest hash (DigestMethod) and MGF1 hash for an OAEP EncryptedKey. The two
+/// may differ — RFC 8017 treats them as independent parameters, and real-world
+/// xenc11 `rsa-oaep` configs use e.g. DigestMethod=SHA-256 with MGF1=SHA-1.
+/// `rsa.decryptOaepH` is decoupled-hash, so any of the four combinations below
+/// is expressible; see SPEC.md.
+const OaepHashes = struct { digest: OaepHash, mgf: OaepHash };
+
+/// Resolve the OAEP digest + MGF1 hash for an xenc11 `rsa-oaep`
+/// EncryptionMethod.
+fn oaepHashFromMethod(method: *const xml.Element) Error!OaepHashes {
     // DigestMethod defaults to SHA-256 for xenc11 rsa-oaep when absent.
     var digest: OaepHash = .sha256;
     if (childEl(method, ds_ns, "DigestMethod")) |dm| {
@@ -269,7 +277,7 @@ fn oaepHashFromMethod(method: *const xml.Element) Error!OaepHash {
             digest = .sha256;
         } else return error.UnsupportedAlgorithm;
     }
-    // MGF defaults to mgf1sha1; must match the digest given the rsa coupling.
+    // MGF defaults to mgf1sha1 (the xenc11 spec default) when absent.
     var mgf: OaepHash = .sha1;
     if (childEl(method, xenc11_ns, "MGF")) |mg| {
         const ma = mg.attr("", "Algorithm") orelse return error.MalformedStructure;
@@ -278,19 +286,13 @@ fn oaepHashFromMethod(method: *const xml.Element) Error!OaepHash {
         } else if (eq(ma, alg_mgf1sha256)) {
             mgf = .sha256;
         } else return error.UnsupportedAlgorithm;
-    } else {
-        // No explicit MGF: assume it matches the digest (the common, expressible
-        // case). A caller wanting the literal default-SHA1-with-SHA256-digest
-        // pairing is unsupported by the rsa module either way.
-        mgf = digest;
     }
-    if (digest != mgf) return error.UnsupportedAlgorithm;
-    return digest;
+    return .{ .digest = digest, .mgf = mgf };
 }
 
 fn rsaOaepUnwrap(
     sk: rsa.SecretKey,
-    hash: OaepHash,
+    hashes: OaepHashes,
     enc_key: *const xml.Element,
     wrapped: []const u8,
     out: *[64]u8,
@@ -302,13 +304,19 @@ fn rsaOaepUnwrap(
         label = try readBase64Text(op, &label_buf);
     }
     // The CEK is at most 32 bytes; the OAEP max-message bound depends on k and
-    // the hash, so give decryptOaep a generous buffer and copy the result out.
+    // the hash, so give decryptOaepH a generous buffer and copy the result out.
     var msg_buf: [rsa.max_modulus_len]u8 = undefined;
     defer std.crypto.secureZero(u8, &msg_buf);
-    const msg = switch (hash) {
-        .sha1 => rsa.decryptOaep(sk, Sha1, wrapped, label, &msg_buf) catch return error.DecryptionError,
-        .sha256 => rsa.decryptOaep(sk, Sha256, wrapped, label, &msg_buf) catch return error.DecryptionError,
-    };
+    const msg = switch (hashes.digest) {
+        .sha1 => switch (hashes.mgf) {
+            .sha1 => rsa.decryptOaepH(sk, Sha1, Sha1, wrapped, label, &msg_buf),
+            .sha256 => rsa.decryptOaepH(sk, Sha1, Sha256, wrapped, label, &msg_buf),
+        },
+        .sha256 => switch (hashes.mgf) {
+            .sha1 => rsa.decryptOaepH(sk, Sha256, Sha1, wrapped, label, &msg_buf),
+            .sha256 => rsa.decryptOaepH(sk, Sha256, Sha256, wrapped, label, &msg_buf),
+        },
+    } catch return error.DecryptionError;
     if (msg.len == 0 or msg.len > out.len) return error.DecryptionError;
     @memcpy(out[0..msg.len], msg);
     return out[0..msg.len];
@@ -372,11 +380,14 @@ fn rsaRawPrivate(sk: rsa.SecretKey, wrapped: []const u8, out: *[rsa.max_modulus_
 }
 
 fn aesKwUnwrap(kek: []const u8, wrapped: []const u8, out: *[64]u8) Error![]const u8 {
-    // RFC 3394 unwrap: recovered length = wrapped.len - 8.
-    if (wrapped.len < 24 or wrapped.len % 8 != 0) return error.DecryptionError;
+    // RFC 3394 unwrap (delegated to the shared `aeskw` module): recovered
+    // length = wrapped.len - 8. Any failure (bad length, unsupported KEK
+    // length, integrity-check mismatch) collapses to the generic
+    // `DecryptionError` — see the module doc comment on error posture.
+    if (wrapped.len < 24) return error.DecryptionError; // bound the out-slice below
     const plain_len = wrapped.len - 8;
     if (plain_len > out.len) return error.DecryptionError;
-    aesKwUnwrapCore(kek, wrapped, out[0..plain_len]) catch return error.DecryptionError;
+    _ = aeskw.unwrap(kek, wrapped, out[0..plain_len]) catch return error.DecryptionError;
     return out[0..plain_len];
 }
 
@@ -402,52 +413,36 @@ fn aesGcmDecrypt(alloc: std.mem.Allocator, key: []const u8, data: []const u8) Er
     return out;
 }
 
-/// AES-CBC (SP800-38A) with XML-Enc padding. Layout: IV(16) || ciphertext
-/// (16-byte multiple). Padding: the final byte N (1..16) is the pad length; the
-/// preceding N-1 pad bytes are arbitrary (only the length byte is meaningful).
-/// The unpadding validates the length bound and returns a generic error on any
-/// failure (padding-oracle hardening — the safe composition is still
-/// decrypt-then-signature-verify; see SPEC.md).
+/// AES-CBC (SP800-38A, via the shared `aescbc` module) with XML-Enc padding
+/// (`aescbc.unpadXmlEnc`). Layout: IV(16) || ciphertext (16-byte multiple).
+/// Padding: the final byte N (1..16) is the pad length; the preceding N-1 pad
+/// bytes are arbitrary (only the length byte is meaningful). Any failure
+/// (misaligned ciphertext, `aescbc`'s own `NotBlockAligned`/`BufferTooSmall`,
+/// or an invalid pad) collapses to the generic `DecryptionError` — padding-
+/// oracle hardening; the safe composition is still decrypt-then-signature-
+/// verify; see SPEC.md.
 fn aesCbcDecrypt(alloc: std.mem.Allocator, key: []const u8, data: []const u8) Error![]u8 {
-    const bs = 16;
+    const bs = aescbc.block_len;
     if (data.len < 2 * bs or (data.len - bs) % bs != 0) return error.DecryptionError;
     const iv = data[0..bs].*;
     const ct = data[bs..];
 
     const buf = try alloc.alloc(u8, ct.len);
     errdefer alloc.free(buf);
-    @memcpy(buf, ct);
 
-    switch (key.len) {
-        16 => cbcDecryptInPlace(aes.Aes128, key[0..16].*, iv, buf),
-        32 => cbcDecryptInPlace(aes.Aes256, key[0..32].*, iv, buf),
+    const n = switch (key.len) {
+        16 => aescbc.decrypt(Aes128, key[0..16].*, iv, ct, buf),
+        32 => aescbc.decrypt(Aes256, key[0..32].*, iv, ct, buf),
         else => return error.UnsupportedAlgorithm, // errdefer frees buf
-    }
+    } catch return error.DecryptionError;
 
-    // Strip padding. N = last byte, must be in 1..bs and <= buf.len.
-    const n = buf[buf.len - 1];
-    if (n == 0 or n > bs or @as(usize, n) > buf.len) return error.DecryptionError;
-    const plain_len = buf.len - n;
+    const plain_len = aescbc.unpadXmlEnc(buf[0..n]) catch return error.DecryptionError;
     // Shrink into a right-sized allocation (never hand back a slice whose
     // backing capacity leaks the pad); free the scratch buffer on success.
     const out = try alloc.alloc(u8, plain_len);
     @memcpy(out, buf[0..plain_len]);
     alloc.free(buf);
     return out;
-}
-
-fn cbcDecryptInPlace(comptime Aes: type, key: anytype, iv: [16]u8, buf: []u8) void {
-    const ctx = Aes.initDec(key);
-    var prev = iv;
-    var i: usize = 0;
-    while (i < buf.len) : (i += 16) {
-        const block: [16]u8 = buf[i..][0..16].*;
-        var pt: [16]u8 = undefined;
-        ctx.decrypt(&pt, &block);
-        for (0..16) |j| pt[j] ^= prev[j];
-        @memcpy(buf[i..][0..16], &pt);
-        prev = block;
-    }
 }
 
 // ── XML helpers ─────────────────────────────────────────────────────────────
@@ -537,65 +532,6 @@ fn ctSelectUsize(cond: u8, a: usize, b: usize) usize {
     return if (cond == 1) a else b;
 }
 
-// ── RFC 3394 AES key unwrap (mirrored locally — NO jwe dependency) ──────────
-//
-// Mirrored from `modules/jwe/src/aeskw.zig` (which itself mirrors dnp3's
-// already-validated implementation). Re-expressed here so xmlenc stays
-// dependency-free of jwe, per CONVENTIONS.md (sibling modules stay
-// independent). Only the unwrap side is needed (decryption module).
-
-const kw_default_iv = [8]u8{ 0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6 };
-
-const KwError = error{ InvalidLength, UnsupportedKeyLength, Unauthentic };
-
-fn aesKwUnwrapCore(kek: []const u8, ciphertext: []const u8, out: []u8) KwError!void {
-    if (ciphertext.len < 24 or ciphertext.len % 8 != 0) return error.InvalidLength;
-    const n = ciphertext.len / 8 - 1;
-    if (out.len < n * 8) return error.InvalidLength;
-
-    var a: [8]u8 = ciphertext[0..8].*;
-    const r = out[0 .. n * 8];
-    @memcpy(r, ciphertext[8..]);
-
-    var j: usize = 6;
-    while (j > 0) {
-        j -= 1;
-        var i: usize = n;
-        while (i > 0) {
-            i -= 1;
-            const t: u64 = @as(u64, n) * @as(u64, j) + @as(u64, i) + 1;
-            var block: [16]u8 = undefined;
-            @memcpy(block[0..8], &a);
-            kwXorCounter(block[0..8], t);
-            @memcpy(block[8..16], r[i * 8 ..][0..8]);
-            kwDecBlock(kek, &block) catch |err| {
-                std.crypto.secureZero(u8, r);
-                return err;
-            };
-            @memcpy(&a, block[0..8]);
-            @memcpy(r[i * 8 ..][0..8], block[8..16]);
-        }
-    }
-    if (!std.crypto.timing_safe.eql([8]u8, a, kw_default_iv)) {
-        std.crypto.secureZero(u8, r);
-        return error.Unauthentic;
-    }
-}
-
-fn kwDecBlock(kek: []const u8, block: *[16]u8) error{UnsupportedKeyLength}!void {
-    switch (kek.len) {
-        16 => aes.Aes128.initDec(kek[0..16].*).decrypt(block, block),
-        32 => aes.Aes256.initDec(kek[0..32].*).decrypt(block, block),
-        else => return error.UnsupportedKeyLength,
-    }
-}
-
-fn kwXorCounter(a: *[8]u8, t: u64) void {
-    var tb: [8]u8 = undefined;
-    std.mem.writeInt(u64, &tb, t, .big);
-    for (a, tb) |*x, y| x.* ^= y;
-}
-
 // ── tests ────────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -612,30 +548,12 @@ test "classifyContent allow-list" {
     try testing.expectError(error.UnsupportedAlgorithm, classifyContent("http://example.com/bogus"));
 }
 
-test "CBC core matches NIST SP800-38A (byte-exact, no padding)" {
-    // AES-256-CBC vector from NIST SP800-38A F.2.5 (also embedded in
-    // ctap2pin/kat_vectors.zig). We exercise the raw CBC core directly.
-    const key = try hexAlloc(testing.allocator, "603deb1015ca71be2b73aef0857d778" ++
-        "11f352c073b6108d72d9810a30914dff4");
-    defer testing.allocator.free(key);
-    const iv = try hexAlloc(testing.allocator, "000102030405060708090a0b0c0d0e0f");
-    defer testing.allocator.free(iv);
-    const ct = try hexAlloc(testing.allocator, "f58c4c04d6e5f1ba779eabfb5f7bfbd6" ++
-        "9cfc4e967edb808d679f777bc6702c7d" ++
-        "39f23369a9d9bacfa530e26304231461" ++
-        "b2eb05e2c39be9fcda6c19078c6a9d1b");
-    defer testing.allocator.free(ct);
-    const want = try hexAlloc(testing.allocator, "6bc1bee22e409f96e93d7e117393172a" ++
-        "ae2d8a571e03ac9c9eb76fac45af8e51" ++
-        "30c81c46a35ce411e5fbc1191a0a52ef" ++
-        "f69f2445df4f9b17ad2b417be66c3710");
-    defer testing.allocator.free(want);
-
-    const buf = try testing.allocator.dupe(u8, ct);
-    defer testing.allocator.free(buf);
-    cbcDecryptInPlace(aes.Aes256, key[0..32].*, iv[0..16].*, buf);
-    try testing.expectEqualSlices(u8, want, buf);
-}
+// NOTE: the byte-exact NIST SP800-38A F.2.5 (AES-256-CBC) core KAT this
+// module used to carry directly now lives in `aescbc`'s own tests (single
+// source of truth — `modules/aescbc/src/root.zig`). This module's own
+// `aesCbcDecrypt` (the full IV-prefixed layout + XML-Enc unpad) is exercised
+// byte-exact-on-recovered-plaintext by the CBC round-trip tests in
+// `test_roundtrip.zig` ("OAEP-mgf1p (SHA1) + AES-256-CBC" / "+ AES-128-CBC").
 
 test "RFC 3394 §4.1 AES key unwrap (byte-exact)" {
     const kek = [_]u8{ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f };
@@ -657,10 +575,4 @@ test "PKCS#1 v1.5 unpad rejects short PS / wrong prefix" {
     // suite. Here we only assert the gate: rsa-1_5 without opt-in is refused —
     // covered in test_roundtrip.zig. This placeholder keeps intent documented.
     try testing.expect(true);
-}
-
-fn hexAlloc(alloc: std.mem.Allocator, comptime hex: []const u8) ![]u8 {
-    const out = try alloc.alloc(u8, hex.len / 2);
-    _ = try std.fmt.hexToBytes(out, hex);
-    return out;
 }
