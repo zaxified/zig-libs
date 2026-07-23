@@ -50,12 +50,14 @@
 //!
 //! Every write op needs **CAP_NET_ADMIN**; the `RTM_GET*` dumps do not.
 //!
-//! **Transport is shared with the sibling `netlink` module.** This module no
-//! longer runs its own `NETLINK_ROUTE` socket, sequence counter, errno table
-//! or extended-ACK handling: it drives `netlink.Socket` through the public
-//! `nextSeq`/`requestAck`/`lastErrorMessage` seam and builds its own tc
-//! messages on top of `netlink.codec`. Only the multi-part **dump** receive
-//! loop is still local — see the `DRY candidate` note on `Socket.dump`.
+//! **Transport is shared with the sibling `netlink` module.** This module runs
+//! no socket, receive buffer, sequence counter, errno table or extended-ACK
+//! handling of its own: it drives `netlink.Socket` through the public
+//! `nextSeq`/`send`/`recvDatagram`/`requestAck`/`lastErrorMessage` seam and
+//! builds its own tc messages on top of `netlink.codec`. Even the multi-part
+//! dump loops triage their replies with the shared
+//! `netlink.classifyDumpMessage`; what stays here is only tc policy — which
+//! request, which reply type, which parser, which client-side filter.
 //!
 //! Verification: `goldens.zig` asserts the encoders reproduce, byte for byte,
 //! requests captured from a real `iproute2` `tc` under `strace`; the tests at
@@ -220,24 +222,20 @@ pub const GetError = DumpError; // v1 alias
 
 // ── socket ──────────────────────────────────────────────────────────────────
 
-const initial_recv_buf_len = 8192;
-const max_recv_buf_len = 1 << 24;
 const max_dump_attempts = 4; // NLM_F_DUMP_INTR restarts before giving up
 
 /// A blocking tc client over one `NETLINK_ROUTE` socket. One instance per
 /// thread/loop; no shared state.
 pub const Socket = struct {
     gpa: std.mem.Allocator,
-    /// The shared rtnetlink transport: sequence numbers, the write+ACK
-    /// engine, typed errno mapping and the kernel's extended-ACK strings all
-    /// come from here.
+    /// The shared rtnetlink transport: the socket itself, its receive buffer,
+    /// sequence numbers, the write+ACK engine, typed errno mapping and the
+    /// kernel's extended-ACK strings all come from here.
     nl: netlink.Socket,
     /// psched calibration used for every rate/burst computation. Read from
     /// `/proc/net/psched` at open time; override with `openWithPsched` to
     /// build requests for a host other than this one.
     psched: Psched,
-    /// Receive buffer for dumps; grown on demand.
-    buf: []u8,
 
     pub fn open(gpa: std.mem.Allocator) OpenError!Socket {
         return openWithPsched(gpa, Psched.read());
@@ -248,14 +246,11 @@ pub const Socket = struct {
     pub fn openWithPsched(gpa: std.mem.Allocator, ps: Psched) OpenError!Socket {
         if (comptime builtin.os.tag != .linux)
             @compileError("tc.Socket is Linux-only (AF_NETLINK raw syscalls)");
-        var nl = try netlink.Socket.open(gpa);
-        errdefer nl.close();
-        const buf = try gpa.alloc(u8, initial_recv_buf_len);
-        return .{ .gpa = gpa, .nl = nl, .psched = ps, .buf = buf };
+        const nl = try netlink.Socket.open(gpa);
+        return .{ .gpa = gpa, .nl = nl, .psched = ps };
     }
 
     pub fn close(self: *Socket) void {
-        self.gpa.free(self.buf);
         self.nl.close();
         self.* = undefined;
     }
@@ -434,34 +429,30 @@ pub const Socket = struct {
             const seq = self.nl.nextSeq();
             const req = try message.buildActionDump(self.gpa, seq, kind);
             defer self.gpa.free(req);
-            try self.send(req);
+            try self.nl.send(req);
 
             var out: std.ArrayList(Action) = .empty;
             errdefer out.deinit(self.gpa);
             while (true) {
-                const dgram = try self.recvDatagram();
+                const dgram = try self.nl.recvDatagram();
                 var it: codec.MessageIterator = .{ .buf = dgram };
                 while (it.next() catch return error.MalformedReply) |m| {
-                    if (m.pid != self.nl.portid or m.seq != seq) continue;
-                    if (m.flags & codec.NLM_F_DUMP_INTR != 0) {
-                        out.deinit(self.gpa);
-                        if (attempt < max_dump_attempts) continue :retry;
-                        return error.InconsistentDump;
-                    }
-                    switch (m.type) {
-                        codec.NLMSG_DONE => return out.toOwnedSlice(self.gpa),
-                        codec.NLMSG_ERROR => {
-                            const code = m.errorCode() catch return error.MalformedReply;
-                            if (code == 0) return out.toOwnedSlice(self.gpa); // ACK
-                            return netlink.writeErrorFromCode(code);
+                    switch (netlink.classifyDumpMessage(m, self.nl.portid, seq)) {
+                        .skip => {},
+                        .restart => {
+                            out.deinit(self.gpa);
+                            if (attempt < max_dump_attempts) continue :retry;
+                            return error.InconsistentDump;
                         },
-                        codec.NLMSG_NOOP => {},
-                        codec.NLMSG_OVERRUN => return error.SystemResources,
-                        else => {
-                            if (m.type != RTM_NEWACTION) continue;
+                        .done => return out.toOwnedSlice(self.gpa),
+                        .failed => |code| return netlink.writeErrorFromCode(code),
+                        .overrun => return error.SystemResources,
+                        .malformed => return error.MalformedReply,
+                        .record => |rec| {
+                            if (rec.type != RTM_NEWACTION) continue;
                             // One RTM_NEWACTION carries the whole table slice,
                             // so the messages are flattened into one list.
-                            var acts = (action.actionsOf(m.payload) catch
+                            var acts = (action.actionsOf(rec.payload) catch
                                 return error.MalformedReply) orelse continue;
                             while (acts.next() catch return error.MalformedReply) |a|
                                 try out.append(self.gpa, a);
@@ -479,9 +470,12 @@ pub const Socket = struct {
         const seq = self.nl.nextSeq();
         const req = try message.buildActionGet(self.gpa, seq, &.{ref});
         defer self.gpa.free(req);
-        try self.send(req);
+        try self.nl.send(req);
+        // Deliberately not `classifyDumpMessage`: this is a single-reply GET,
+        // not a multi-part dump, so `NLM_F_DUMP_INTR` carries no restart
+        // semantics here and must not be triaged as one.
         while (true) {
-            const dgram = try self.recvDatagram();
+            const dgram = try self.nl.recvDatagram();
             var it: codec.MessageIterator = .{ .buf = dgram };
             while (it.next() catch return error.MalformedReply) |m| {
                 if (m.pid != self.nl.portid or m.seq != seq) continue;
@@ -545,13 +539,6 @@ pub const Socket = struct {
 
     // ── the dump engine ────────────────────────────────────────────────────
 
-    /// DRY candidate: `netlink.Socket` publishes `nextSeq`/`requestAck`/
-    /// `lastErrorMessage` for the **write** path, but its multi-part dump
-    /// engine is private and generic over its own parse/match callbacks, and
-    /// it exposes no raw `send`/`recvDatagram` pair (the sibling
-    /// `genetlink.Socket` does). Until it grows one, tc drives the shared
-    /// socket's fd directly here. Everything else — sequence numbers, errno
-    /// mapping, ext-ACK — stays in `netlink`.
     /// How a dump's `parent` filter is applied client-side (see `classes`).
     const ParentMatch = enum { exact, class_scope };
 
@@ -587,32 +574,28 @@ pub const Socket = struct {
                 parent orelse Handle.unspec,
             );
             defer self.gpa.free(req);
-            try self.send(req);
+            try self.nl.send(req);
 
             var out: std.ArrayList(T) = .empty;
             errdefer out.deinit(self.gpa);
             while (true) {
-                const dgram = try self.recvDatagram();
+                const dgram = try self.nl.recvDatagram();
                 var it: codec.MessageIterator = .{ .buf = dgram };
                 while (it.next() catch return error.MalformedReply) |m| {
-                    if (m.pid != self.nl.portid or m.seq != seq) continue;
-                    if (m.flags & codec.NLM_F_DUMP_INTR != 0) {
-                        out.deinit(self.gpa);
-                        if (attempt < max_dump_attempts) continue :retry;
-                        return error.InconsistentDump;
-                    }
-                    switch (m.type) {
-                        codec.NLMSG_DONE => return out.toOwnedSlice(self.gpa),
-                        codec.NLMSG_ERROR => {
-                            const code = m.errorCode() catch return error.MalformedReply;
-                            if (code == 0) return out.toOwnedSlice(self.gpa); // ACK
-                            return netlink.writeErrorFromCode(code);
+                    switch (netlink.classifyDumpMessage(m, self.nl.portid, seq)) {
+                        .skip => {},
+                        .restart => {
+                            out.deinit(self.gpa);
+                            if (attempt < max_dump_attempts) continue :retry;
+                            return error.InconsistentDump;
                         },
-                        codec.NLMSG_NOOP => {},
-                        codec.NLMSG_OVERRUN => return error.SystemResources,
-                        else => {
-                            if (m.type != reply_type) continue;
-                            const item = parseFn(m.payload) catch return error.MalformedReply;
+                        .done => return out.toOwnedSlice(self.gpa),
+                        .failed => |code| return netlink.writeErrorFromCode(code),
+                        .overrun => return error.SystemResources,
+                        .malformed => return error.MalformedReply,
+                        .record => |rec| {
+                            if (rec.type != reply_type) continue;
+                            const item = parseFn(rec.payload) catch return error.MalformedReply;
                             if (item.ifindex != ifindex) continue;
                             if (parent) |p| {
                                 if (!parentMatches(mode, p, item.parent, item.handle)) continue;
@@ -622,68 +605,6 @@ pub const Socket = struct {
                     }
                 }
             }
-        }
-    }
-
-    fn send(self: *Socket, msg: []const u8) DumpError!void {
-        const dst: linux.sockaddr.nl = .{ .pid = 0, .groups = 0 };
-        while (true) {
-            const rc = linux.sendto(
-                self.nl.fd,
-                msg.ptr,
-                msg.len,
-                0,
-                @ptrCast(&dst),
-                @sizeOf(linux.sockaddr.nl),
-            );
-            switch (linux.errno(rc)) {
-                .SUCCESS => return,
-                .INTR => continue,
-                .NOBUFS, .NOMEM => return error.SystemResources,
-                .ACCES, .PERM => return error.AccessDenied,
-                else => return error.SendFailed,
-            }
-        }
-    }
-
-    fn recvDatagram(self: *Socket) DumpError![]const u8 {
-        while (true) {
-            // MSG_PEEK|MSG_TRUNC reports the true datagram size without
-            // consuming it, so nothing is ever lost to truncation.
-            const prc = linux.recvfrom(
-                self.nl.fd,
-                self.buf.ptr,
-                self.buf.len,
-                linux.MSG.PEEK | linux.MSG.TRUNC,
-                null,
-                null,
-            );
-            switch (linux.errno(prc)) {
-                .SUCCESS => {},
-                .INTR => continue,
-                .NOBUFS, .NOMEM => return error.SystemResources,
-                else => return error.RecvFailed,
-            }
-            if (prc > self.buf.len) {
-                if (prc > max_recv_buf_len) return error.MalformedReply;
-                const new_len = std.mem.alignForward(usize, prc, initial_recv_buf_len);
-                self.buf = self.gpa.realloc(self.buf, new_len) catch return error.OutOfMemory;
-                continue;
-            }
-
-            var src: linux.sockaddr.nl = .{ .pid = 0, .groups = 0 };
-            var slen: linux.socklen_t = @sizeOf(linux.sockaddr.nl);
-            const rc = linux.recvfrom(self.nl.fd, self.buf.ptr, self.buf.len, 0, @ptrCast(&src), &slen);
-            switch (linux.errno(rc)) {
-                .SUCCESS => {},
-                .INTR => continue,
-                .NOBUFS, .NOMEM => return error.SystemResources,
-                else => return error.RecvFailed,
-            }
-            // rtnetlink answers only ever come from the kernel, and any user
-            // process may address our port id.
-            if (slen >= @sizeOf(linux.sockaddr.nl) and src.pid != 0) continue;
-            return self.buf[0..rc];
         }
     }
 };

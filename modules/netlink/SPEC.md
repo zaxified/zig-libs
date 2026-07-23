@@ -59,11 +59,60 @@ without this module having to model their transports. `Socket.dump` and `Socket.
 here are themselves written on it, so it cannot drift from the behaviour it describes.
 
 **Raw transport seam — `Socket.send` + `Socket.recvDatagram` (public).** For callers that need a
-message this module does not model. `tc` drives `RTM_GET*` dumps this way (today it goes through
-`handle()` and re-implements the syscall loops — it can now collapse onto this pair plus
-`classifyDumpMessage`; that rewire is a later wave, `tc` was read-only when this seam landed).
-The returned datagram borrows the socket's receive buffer and is valid until the next call on
-the socket. Sequence numbers come from `nextSeq`.
+message this module does not model. `tc` drives its `RTM_GET*` dumps this way (it used to
+re-implement the syscall loops against the shared socket's fd; it now collapses onto this pair
+plus `classifyDumpMessage`). The returned datagram borrows the socket's receive buffer and is
+valid until the next call on the socket. Sequence numbers come from `nextSeq`.
+
+## The shared netlink transport (protocol-parameterised)
+`Socket` is not only the rtnetlink client; it **is** this repo's netlink transport, and the
+sibling netlink families sit on it instead of re-implementing it:
+
+| | |
+|---|---|
+| `Socket.open(gpa)` | `NETLINK_ROUTE` shorthand — signature and behaviour unchanged |
+| `Socket.openProtocol(gpa, protocol)` | any protocol: `NETLINK.NETFILTER`, `NETLINK.GENERIC`, … |
+| `Socket.openProtocolGroups(gpa, protocol, groups)` | plus a legacy 32-bit multicast bind mask (group *n* = bit *n-1*); needs `CAP_NET_ADMIN` |
+
+Carried once, for every protocol: socket creation, bind, `getsockname` port-id capture,
+`NETLINK_EXT_ACK` (best-effort — a pre-4.12 `ENOPROTOOPT` is *not* fatal, you just lose the reason
+string), the sequence counter (`nextSeq`, never 0), `send`, the `MSG_PEEK|MSG_TRUNC` receive-sizing
+loop with buffer growth to a 16 MiB cap and kernel-sender filtering (`recvDatagram`), the
+extended-ACK capture (`captureExtAck` / `lastErrorMessage`), the ACK/error engine (`requestAck`,
+`awaitAckStrict`), `handle()` and `setRecvTimeout`.
+
+**Two receive/ACK flavours, one implementation.** The rtnetlink path has never had a vocabulary
+for `ENOBUFS`/`EAGAIN`: it subscribes to no multicast group and sets no receive timeout, so it
+folds them onto `SystemResources`/`RecvFailed`. The nfnetlink families need them apart — a full
+receive queue on an event socket means *events were lost* and the consumer must re-dump. So the
+implementation is the strict one (`recvDatagramStrict` → `StrictRecvError`, `awaitAckStrict` →
+`StrictRequestError`, both reporting `Overrun` and `WouldBlock`), and `recvDatagram`/`awaitAck`
+are narrowing wrappers over it that reproduce the historical rtnetlink mapping exactly. Nothing
+on the `NETLINK_ROUTE` path changed.
+
+The typed rtnetlink helpers (`links`, `routes`, `addressAdd`, the bridge ops, …) are meaningful
+**only on a `NETLINK_ROUTE` socket**; on an `openProtocol` socket use the raw seam plus that
+family's own builders. That is the one wart of hosting the transport on the same struct, and it
+buys an unchanged public surface for the eight modules that already depend on this one.
+
+**Why the nfnetlink `nfgenmsg` header did *not* move here.** `conntrack` and `nftables` both
+carry `nfgenmsg_len`/`NFNETLINK_V0`/`msgType`/`Nfgenmsg`/`parseNfgenmsg`/`appendNfgenmsg` — ~45
+duplicated lines, and unlike the transport the copies really are near-identical (they differ only
+in `appendNfgenmsg` taking a typed `Family` vs a raw `u8 nfproto`). It is left with its families
+on a layering rule, not on a compat excuse:
+
+- `netlink` owns **netlink-generic mechanism** — `nlmsghdr`/`nlattr` framing, the transport, the
+  dump triage, the byte-order accessors. Those are the same bytes on every netlink protocol.
+- `struct nfgenmsg` is not that. It is a **per-protocol fixed payload header**, at exactly the
+  same layer as `ifinfomsg`/`rtmsg` (which live here, with rtnetlink), `tcmsg` (which lives in
+  `tc`) and `genlmsghdr` (which lives in `genetlink`). Putting nfnetlink's family header — but not
+  tc's or genl's — into `netlink` would make the module's remit incoherent.
+
+The DRY payoff is also small next to the risk: two copies of a 4-byte header vs. the ~120 lines of
+syscall discipline per family this wave actually removed. **Trigger to revisit:** when a *third*
+nfnetlink family lands (`nfqueue`, `nflog`, `ipset`), promote it to a sibling `nfnetlink` module
+(deps: `netlink`) and keep `conntrack.Nfgenmsg`/`nftables.wire.Nfgenmsg` as re-export aliases —
+source-compatible, and it does not widen `netlink`.
 
 ## Write ops (RTM_NEW\*/RTM_DEL\*)
 Supported, and **not** "read/dump only" any more (that scope statement was retired when the write
@@ -262,13 +311,19 @@ the bridge/veth drivers are unavailable the child reports a skip code and the te
 enabled, i.e. both live round-trips really execute there.
 
 ## Backlog / deferred
-Multicast event monitoring (RTNLGRP subscription) is the remaining deliberate extension point on
-the transport. **Protocol-parameterised transport:** `Socket.open` hardcodes
-`linux.NETLINK.ROUTE`, which is why `genetlink`, `conntrack` and `nftables` each carry their own
-copy of bind + portid capture + `NETLINK_EXT_ACK` + the `MSG_PEEK|MSG_TRUNC` growth loop. The
-codec and the dump triage are now shared; lifting the socket itself into a
-`netlink.Transport(open(protocol, groups), send, recvDatagram, awaitAck)` is the remaining piece,
-and is tracked in `conntrack`'s and `nftables`' specs as well. Write-path gaps listed under "Threat model / out of scope" above:
+Multicast event monitoring on the *rtnetlink* side (typed `RTNLGRP` subscription + a decoded event
+iterator) is the remaining deliberate extension point; the plumbing for it already exists —
+`openProtocolGroups(gpa, linux.NETLINK.ROUTE, mask)` binds the groups today, what is missing is
+the typed `RTNLGRP` vocabulary and the event decoder.
+
+**Protocol-parameterised transport: done.** `Socket.open` no longer hardcodes the protocol (see
+"The shared netlink transport" above); `conntrack`, `nftables` and `tc` have had their private
+copies of bind + portid capture + `NETLINK_EXT_ACK` + the `MSG_PEEK|MSG_TRUNC` growth loop
+deleted. **`genetlink` is the one remaining candidate** — it still carries its own copy and would
+collapse the same way (it also has the richest reverse-dependent set: `nl80211`, `ethtool`,
+`wireguard`), but it was owned by another work stream when this landed.
+
+Write-path gaps listed under "Threat model / out of scope" above:
 `IFLA_INFO_DATA` for non-bridge kinds / veth peers, multipath routes, policy rules, and the bridge
 sub-list (MDB/multicast snooping, VXLAN device creation, VLAN tunnels, per-VLAN options, MRP/CFM/
 MST, backup port). Linux-only platform

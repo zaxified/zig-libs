@@ -8,7 +8,7 @@ The module has two backends over one shared vocabulary: the portable **JSON buil
 `SetDataType`, …); `src/root.zig` re-exports them unchanged, so the JSON builder's public surface
 is exactly what it always was. Files: `types.zig` (vocabulary + kernel mappings), `nl.zig`
 (thin alias layer over `netlink.codec`), `wire.zig` (nfnetlink framing/objects/batch/decoders), `expr.zig` (rule
-expressions + register model), `socket.zig` (transport, Linux-only), `goldens.zig` (captured
+expressions + register model), `socket.zig` (nfnetlink policy over `netlink.Socket`'s transport, Linux-only), `goldens.zig` (captured
 `nft` traffic), `consistency.zig` (JSON↔native proof), `root.zig` (JSON builder + facade).
 
 ## Design & invariants — JSON builder
@@ -82,7 +82,13 @@ Errors in `Program` are latched and surface from `finish()`.
 **Socket.** Blocking `NETLINK_NETFILTER`, one instance per thread, `SOCK_CLOEXEC`, kernel-assigned
 port id matched on every reply, `NETLINK_EXT_ACK` requested best-effort, `MSG_PEEK|MSG_TRUNC`
 buffer-growth probe so no datagram is ever truncated, datagrams from a non-kernel sender dropped,
-`NLM_F_DUMP_INTR` restarts a dump up to 4 times before `error.InconsistentDump`.
+`NLM_F_DUMP_INTR` restarts a dump up to 4 times before `error.InconsistentDump`. **All of that is
+`netlink.Socket`'s**, opened here as `netlink.Socket.openProtocol(gpa, linux.NETLINK.NETFILTER)`;
+`Socket` is `struct { nl: netlink.Socket, failure: ?Failure }` and its transport methods forward.
+`ENOBUFS` → `error.Overrun` and `EAGAIN` → `error.WouldBlock` come from
+`netlink.Socket.recvDatagramStrict`; the latter is load-bearing here, because *no reply at all* is
+how a successful un-acked (`nft`-style) batch looks, so `commit` reads a receive-timeout expiry as
+success.
 
 ## Threat model / out of scope
 The JSON builder never touches netlink and never applies anything. The native backend does apply
@@ -191,10 +197,30 @@ Run: `zig build test-nftables` (and `--release=fast`), `unshare -rn zig build te
   declares `.deps = &.{"netlink"}`, and `nl.zig` is now a thin alias layer over `netlink.codec`
   with no codec code of its own — including the eight big-endian accessors, which moved into
   `netlink.codec` (`conntrack` had written them independently too). `socket.zig`'s dump loop is
-  `netlink.classifyDumpMessage`. What is still a fourth copy is `socket.zig`'s **transport**
-  (`open`/`close`/`send`/`recvDatagram`/`setRecvTimeout` + the `MSG_PEEK|MSG_TRUNC` growth
-  loop): `netlink.Socket.open` hardcodes `linux.NETLINK.ROUTE`, so lifting that needs a
-  protocol-parameterised `netlink.Transport`, which is the remaining item.
+  `netlink.classifyDumpMessage`.
+- ~~**The transport (the fourth copy).**~~ **Done.** `netlink.Socket.open` no longer hardcodes
+  `linux.NETLINK.ROUTE`: `openProtocol(gpa, protocol)` takes it, and `netlink.Socket` is now the
+  shared transport. `socket.zig`'s `Socket` is `struct { nl: netlink.Socket, failure: ?Failure }`;
+  its `open`/`close`/`send`/`recvDatagram`/`setRecvTimeout`/`handle`/`nextSeq`/`lastErrorMessage`
+  are one-line forwards, and the private `MSG_PEEK|MSG_TRUNC` growth loop, the bind + portid
+  capture, the `NETLINK_EXT_ACK` setsockopt and the `captureExtAck` copy are deleted. The
+  `Overrun`/`WouldBlock` distinction this module depends on — a `WouldBlock` *is* how a successful
+  un-acked batch looks — became the shared implementation
+  (`netlink.Socket.recvDatagramStrict`), with `netlink`'s coarser rtnetlink mapping narrowing over
+  it, so nothing on either side changed behaviour. What stays here is the batch ACK engine
+  (`awaitBatch`/`recordFailure`), which is genuinely nf_tables-specific: it counts one ACK per
+  staged command and attributes a failure to the offending command, rather than waiting for one
+  reply to one sequence number.
+- **Not folded in, deliberately: `nfgenmsg` framing.** `wire.zig` and `conntrack/src/wire.zig`
+  both define `nfgenmsg_len`/`NFNETLINK_V0`/`msgType`/`Nfgenmsg`/`parseNfgenmsg`/`appendNfgenmsg`
+  (~45 lines, near-identical — they differ only in `appendNfgenmsg` taking a raw `u8 nfproto` here
+  vs a typed `Family` there). `struct nfgenmsg` is a *per-protocol fixed payload header*, at the
+  same layer as `ifinfomsg` (which lives in `netlink`, with rtnetlink), `tcmsg` (in `tc`) and
+  `genlmsghdr` (in `genetlink`) — so it belongs with its family, while `netlink`'s remit is
+  netlink-**generic** mechanism (nlmsghdr/nlattr framing, the transport, the dump triage, the
+  byte-order accessors). The full argument is in `modules/netlink/SPEC.md`; the trigger to revisit
+  is a third nfnetlink family (nfqueue, nflog, ipset), which would justify a sibling `nfnetlink`
+  module (deps: `netlink`) with both current names kept as re-export aliases.
 - **Objects, maps, flowtables.** `NFT_MSG_NEWOBJ`/`GETOBJ`/`DELOBJ` (named counters, quotas,
   ct helpers/timeouts), verdict/data maps (`NFT_SET_MAP` + `NFTA_SET_ELEM_DATA` semantics beyond
   the raw byte pass-through that already exists), and flowtables are not modelled.

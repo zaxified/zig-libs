@@ -11,11 +11,13 @@ kernels no longer build at all (`CONFIG_NF_CONNTRACK_PROCFS=n`). ctnetlink is th
 interface and carries what the text file cannot: 64-bit counters, connmark, zone, entry id,
 TCP state, timestamps — and it is writable and event-driven.
 
-Wire framing and TLV walking are reused from the `netlink` module's codec (`nlmsghdr`, the
-`nlattr` walkers, `nestBegin`/`nestEnd`, the big-endian attribute accessors every netfilter
-family needs, the multi-part dump triage, the typed errno mapping and extended-ACK strings);
-this module adds the `nfgenmsg` header, the CTA_* attribute tree and a `NETLINK_NETFILTER`
-socket. Addresses are `netaddr.Ip`.
+Wire framing, TLV walking **and the socket transport** are the `netlink` module's: `nlmsghdr`,
+the `nlattr` walkers, `nestBegin`/`nestEnd`, the big-endian attribute accessors every netfilter
+family needs, the multi-part dump triage, the typed errno mapping and extended-ACK strings — plus
+the socket itself, opened with `netlink.Socket.openProtocolGroups(gpa, NETLINK.NETFILTER, groups)`,
+which carries bind, port-id capture, `NETLINK_EXT_ACK`, sequence allocation, the
+`MSG_PEEK|MSG_TRUNC` receive-sizing loop and the ACK engine. This module adds the `nfgenmsg`
+header, the CTA_* attribute tree and the ctnetlink policy on top. Addresses are `netaddr.Ip`.
 
 ## Import
 

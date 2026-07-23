@@ -23,25 +23,22 @@
 //! Everything the kernel is told travels through `wire.Batch`, so the atomicity
 //! guarantee is structural: one `sendmsg`, all-or-nothing.
 //!
-//! The multi-part reply triage of `dumpInto` is `netlink.classifyDumpMessage`
-//! (re-exported as `nl.classifyDumpMessage`) — the (portid, seq) match, the
-//! `NLM_F_DUMP_INTR` restart and the control-message dispatch are shared with
-//! `netlink` and `conntrack`; only the policy above it (which request, which
-//! reply type, which decoder, which errno mapping) is per-family.
-//!
-//! DRY candidate (remaining): `open`/`close`/`send`/`recvDatagram`/
-//! `setRecvTimeout` and the `MSG_PEEK|MSG_TRUNC` buffer-growth loop are still
-//! the same transport discipline `netlink.Socket`, `genetlink.Socket` and
-//! `conntrack.Socket` each re-implement. `modules/conntrack/src/root.zig`
-//! files this too: the shared shape wants to move into `netlink` as a
-//! protocol-parameterised `netlink.Transport` (`open(protocol, groups)`,
-//! `send`, `recvDatagram`, `awaitAck`). `netlink.Socket` now publishes
-//! `send`/`recvDatagram`, so what is missing is the protocol parameter on
-//! `open`.
+//! **Transport is the sibling `netlink` module's.** Socket creation and bind,
+//! port-id capture, `NETLINK_EXT_ACK`, the sequence counter, the
+//! `MSG_PEEK|MSG_TRUNC` buffer-growth loop, `SO_RCVTIMEO` and the extended-ACK
+//! capture all come from `netlink.Socket`, opened on `linux.NETLINK.NETFILTER`
+//! via `openProtocol`; the multi-part reply triage of `dumpInto` is
+//! `netlink.classifyDumpMessage` (re-exported as `nl.classifyDumpMessage`).
+//! Only the policy above them is per-family and lives here: which request,
+//! which reply type, which decoder, which errno mapping — plus the batch ACK
+//! engine, which is nf_tables-specific (it counts one ACK per staged command
+//! and attributes a failure to the offending command, rather than waiting for
+//! a single reply to a single sequence number).
 
 const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
+const netlink = @import("netlink");
 
 const nl = @import("nl.zig");
 const types = @import("types.zig");
@@ -137,110 +134,41 @@ pub const Failure = struct {
     message: []const u8,
 };
 
-const initial_recv_buf_len = 8192;
-const max_recv_buf_len = 1 << 24;
-const ext_ack_msg_max = 256;
 const max_dump_attempts = 4;
 
 // ── socket ──────────────────────────────────────────────────────────────────
 
 /// A blocking `NETLINK_NETFILTER` socket. One instance per thread/loop.
 pub const Socket = struct {
-    gpa: std.mem.Allocator,
-    fd: i32,
-    portid: u32,
-    seq: u32,
-    buf: []u8,
-    ext_ack_buf: [ext_ack_msg_max]u8 = @splat(0),
-    ext_ack_len: usize = 0,
+    /// The shared netlink transport, bound to `NETLINK_NETFILTER`.
+    nl: netlink.Socket,
     failure: ?Failure = null,
 
     pub fn open(gpa: std.mem.Allocator) OpenError!Socket {
         if (comptime builtin.os.tag != .linux)
             @compileError("nftables.Socket is Linux-only (AF_NETLINK raw syscalls)");
-
-        const rc = linux.socket(
-            linux.AF.NETLINK,
-            linux.SOCK.RAW | linux.SOCK.CLOEXEC,
-            linux.NETLINK.NETFILTER,
-        );
-        switch (linux.errno(rc)) {
-            .SUCCESS => {},
-            .ACCES, .PERM => return error.AccessDenied,
-            .AFNOSUPPORT, .PROTONOSUPPORT => return error.ProtocolNotSupported,
-            .MFILE => return error.ProcessFdQuotaExceeded,
-            .NFILE => return error.SystemFdQuotaExceeded,
-            .NOBUFS, .NOMEM => return error.SystemResources,
-            else => return error.Unexpected,
-        }
-        const fd: i32 = @intCast(rc);
-        errdefer _ = linux.close(fd);
-
-        const sa: linux.sockaddr.nl = .{ .pid = 0, .groups = 0 };
-        switch (linux.errno(linux.bind(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.nl)))) {
-            .SUCCESS => {},
-            .ACCES, .PERM => return error.AccessDenied,
-            .NOBUFS, .NOMEM => return error.SystemResources,
-            else => return error.Unexpected,
-        }
-        var bound: linux.sockaddr.nl = .{ .pid = 0, .groups = 0 };
-        var blen: linux.socklen_t = @sizeOf(linux.sockaddr.nl);
-        switch (linux.errno(linux.getsockname(fd, @ptrCast(&bound), &blen))) {
-            .SUCCESS => {},
-            else => return error.Unexpected,
-        }
-
-        // Extended ACKs turn "EINVAL" into "Could not process rule: …".
-        // Best-effort: pre-4.12 kernels answer ENOPROTOOPT and everything else
-        // keeps working, just without the reason string.
-        const on: u32 = 1;
-        _ = linux.setsockopt(
-            fd,
-            linux.SOL.NETLINK,
-            nl.NETLINK_EXT_ACK,
-            @ptrCast(&on),
-            @sizeOf(u32),
-        );
-
-        const buf = try gpa.alloc(u8, initial_recv_buf_len);
-        return .{ .gpa = gpa, .fd = fd, .portid = bound.pid, .seq = 0, .buf = buf };
+        return .{ .nl = try netlink.Socket.openProtocol(gpa, linux.NETLINK.NETFILTER) };
     }
 
     pub fn close(self: *Socket) void {
-        self.gpa.free(self.buf);
-        _ = linux.close(self.fd);
+        self.nl.close();
         self.* = undefined;
     }
 
     /// Next request sequence number (never 0).
     pub fn nextSeq(self: *Socket) u32 {
-        self.seq +%= 1;
-        if (self.seq == 0) self.seq = 1;
-        return self.seq;
+        return self.nl.nextSeq();
     }
 
     /// The raw file descriptor, for poll/epoll integration. Do not close it.
     pub fn handle(self: *const Socket) i32 {
-        return self.fd;
+        return self.nl.handle();
     }
 
     /// Bound how long a receive may block (`SO_RCVTIMEO`); 0 restores blocking
     /// forever. A timeout surfaces as `error.WouldBlock`.
     pub fn setRecvTimeout(self: *Socket, millis: u32) error{Unexpected}!void {
-        const tv: linux.timeval = .{
-            .sec = @intCast(millis / 1000),
-            .usec = @intCast((millis % 1000) * 1000),
-        };
-        return switch (linux.errno(linux.setsockopt(
-            self.fd,
-            linux.SOL.SOCKET,
-            linux.SO.RCVTIMEO,
-            @ptrCast(&tv),
-            @sizeOf(linux.timeval),
-        ))) {
-            .SUCCESS => {},
-            else => error.Unexpected,
-        };
+        return self.nl.setRecvTimeout(millis);
     }
 
     /// Details of the last rejected batch, or null. Valid until the next
@@ -251,14 +179,14 @@ pub const Socket = struct {
 
     /// The kernel's reason string for the last failure ("" when none).
     pub fn lastErrorMessage(self: *const Socket) []const u8 {
-        return self.ext_ack_buf[0..self.ext_ack_len];
+        return self.nl.lastErrorMessage();
     }
 
     // ── batches ────────────────────────────────────────────────────────────
 
     /// Start a batch whose sequence numbers come from this socket's counter.
     pub fn beginBatch(self: *Socket, opts: wire.BatchOptions) wire.BuildError!wire.Batch {
-        return wire.Batch.init(self.gpa, self.nextSeq(), opts);
+        return wire.Batch.init(self.nl.gpa, self.nextSeq(), opts);
     }
 
     /// Send the batch as one `sendmsg` and wait for the kernel's verdict.
@@ -274,9 +202,9 @@ pub const Socket = struct {
     pub fn commit(self: *Socket, batch: *wire.Batch) CommitError!void {
         const bytes = try batch.finish();
         // Keep the socket's counter past everything the batch consumed.
-        self.seq = batch.next_seq -% 1;
+        self.nl.seq = batch.next_seq -% 1;
         self.failure = null;
-        self.ext_ack_len = 0;
+        self.nl.ext_ack_len = 0;
         try self.send(bytes);
         return self.awaitBatch(batch);
     }
@@ -292,7 +220,7 @@ pub const Socket = struct {
             };
             var it: nl.MessageIterator = .{ .buf = dgram };
             while (it.next() catch return error.MalformedReply) |m| {
-                if (m.pid != self.portid) continue;
+                if (m.pid != self.nl.portid) continue;
                 switch (m.type) {
                     nl.NLMSG_ERROR => {
                         const code = m.errorCode() catch return error.MalformedReply;
@@ -313,7 +241,7 @@ pub const Socket = struct {
     }
 
     fn recordFailure(self: *Socket, batch: *const wire.Batch, m: nl.Message, code: i32) void {
-        self.captureExtAck(m);
+        self.nl.captureExtAck(m);
         // The reply's own seq is authoritative; the echoed request header
         // inside `struct nlmsgerr` must agree, and is used when the reply seq
         // is 0 (some kernels report the commit failure that way).
@@ -333,16 +261,8 @@ pub const Socket = struct {
             else
                 "?",
             .code = code,
-            .message = self.ext_ack_buf[0..self.ext_ack_len],
+            .message = self.nl.lastErrorMessage(),
         };
-    }
-
-    fn captureExtAck(self: *Socket, m: nl.Message) void {
-        self.ext_ack_len = 0;
-        const msg = (m.errorMessage() catch return) orelse return;
-        const n = @min(msg.len, self.ext_ack_buf.len);
-        @memcpy(self.ext_ack_buf[0..n], msg[0..n]);
-        self.ext_ack_len = n;
     }
 
     // ── dumps ──────────────────────────────────────────────────────────────
@@ -368,12 +288,12 @@ pub const Socket = struct {
     pub const SetElemList = List(wire.SetElemInfo);
 
     pub fn listTables(self: *Socket, family: Family) DumpError!TableList {
-        var out: TableList = .{ .arena = std.heap.ArenaAllocator.init(self.gpa), .items = &.{} };
+        var out: TableList = .{ .arena = std.heap.ArenaAllocator.init(self.nl.gpa), .items = &.{} };
         errdefer out.arena.deinit();
         var items: std.ArrayList(wire.TableInfo) = .empty;
         const a = out.arena.allocator();
         const req = wire.buildDumpRequest(self.nextSeq(), wire.NFT_MSG.GETTABLE, family);
-        try self.dumpInto(&req, wire.NFT_MSG.NEWTABLE, self.seq, struct {
+        try self.dumpInto(&req, wire.NFT_MSG.NEWTABLE, self.nl.seq, struct {
             fn f(al: std.mem.Allocator, list: *std.ArrayList(wire.TableInfo), payload: []const u8) !void {
                 var t = try wire.decodeTable(payload);
                 t.name = try al.dupe(u8, t.name);
@@ -385,12 +305,12 @@ pub const Socket = struct {
     }
 
     pub fn listChains(self: *Socket, family: Family) DumpError!ChainList {
-        var out: ChainList = .{ .arena = std.heap.ArenaAllocator.init(self.gpa), .items = &.{} };
+        var out: ChainList = .{ .arena = std.heap.ArenaAllocator.init(self.nl.gpa), .items = &.{} };
         errdefer out.arena.deinit();
         var items: std.ArrayList(wire.ChainInfo) = .empty;
         const a = out.arena.allocator();
         const req = wire.buildDumpRequest(self.nextSeq(), wire.NFT_MSG.GETCHAIN, family);
-        try self.dumpInto(&req, wire.NFT_MSG.NEWCHAIN, self.seq, struct {
+        try self.dumpInto(&req, wire.NFT_MSG.NEWCHAIN, self.nl.seq, struct {
             fn f(al: std.mem.Allocator, list: *std.ArrayList(wire.ChainInfo), payload: []const u8) !void {
                 var c = try wire.decodeChain(payload);
                 c.table = try al.dupe(u8, c.table);
@@ -405,12 +325,12 @@ pub const Socket = struct {
     }
 
     pub fn listSets(self: *Socket, family: Family) DumpError!SetList {
-        var out: SetList = .{ .arena = std.heap.ArenaAllocator.init(self.gpa), .items = &.{} };
+        var out: SetList = .{ .arena = std.heap.ArenaAllocator.init(self.nl.gpa), .items = &.{} };
         errdefer out.arena.deinit();
         var items: std.ArrayList(wire.SetInfo) = .empty;
         const a = out.arena.allocator();
         const req = wire.buildDumpRequest(self.nextSeq(), wire.NFT_MSG.GETSET, family);
-        try self.dumpInto(&req, wire.NFT_MSG.NEWSET, self.seq, struct {
+        try self.dumpInto(&req, wire.NFT_MSG.NEWSET, self.nl.seq, struct {
             fn f(al: std.mem.Allocator, list: *std.ArrayList(wire.SetInfo), payload: []const u8) !void {
                 var s = try wire.decodeSet(payload);
                 s.table = try al.dupe(u8, s.table);
@@ -430,13 +350,13 @@ pub const Socket = struct {
         table: ?[]const u8,
         chain: ?[]const u8,
     ) DumpError!RuleList {
-        var out: RuleList = .{ .arena = std.heap.ArenaAllocator.init(self.gpa), .items = &.{} };
+        var out: RuleList = .{ .arena = std.heap.ArenaAllocator.init(self.nl.gpa), .items = &.{} };
         errdefer out.arena.deinit();
         var items: std.ArrayList(wire.RuleInfo) = .empty;
         const a = out.arena.allocator();
         const seq = self.nextSeq();
-        const req = try wire.buildRuleDumpRequest(self.gpa, seq, family, table, chain);
-        defer self.gpa.free(req);
+        const req = try wire.buildRuleDumpRequest(self.nl.gpa, seq, family, table, chain);
+        defer self.nl.gpa.free(req);
         try self.dumpInto(req, wire.NFT_MSG.NEWRULE, seq, struct {
             fn f(al: std.mem.Allocator, list: *std.ArrayList(wire.RuleInfo), payload: []const u8) !void {
                 var r = try wire.decodeRule(payload);
@@ -457,13 +377,13 @@ pub const Socket = struct {
         table: []const u8,
         set: []const u8,
     ) DumpError!SetElemList {
-        var out: SetElemList = .{ .arena = std.heap.ArenaAllocator.init(self.gpa), .items = &.{} };
+        var out: SetElemList = .{ .arena = std.heap.ArenaAllocator.init(self.nl.gpa), .items = &.{} };
         errdefer out.arena.deinit();
         var items: std.ArrayList(wire.SetElemInfo) = .empty;
         const a = out.arena.allocator();
         const seq = self.nextSeq();
-        const req = try wire.buildSetElemDumpRequest(self.gpa, seq, family, table, set);
-        defer self.gpa.free(req);
+        const req = try wire.buildSetElemDumpRequest(self.nl.gpa, seq, family, table, set);
+        defer self.nl.gpa.free(req);
         try self.dumpInto(req, wire.NFT_MSG.NEWSETELEM, seq, struct {
             fn f(al: std.mem.Allocator, list: *std.ArrayList(wire.SetElemInfo), payload: []const u8) !void {
                 const reply = try wire.decodeSetElemReply(payload);
@@ -500,7 +420,7 @@ pub const Socket = struct {
                 const dgram = try self.recvDatagram();
                 var it: nl.MessageIterator = .{ .buf = dgram };
                 while (it.next() catch return error.MalformedReply) |m| {
-                    switch (nl.classifyDumpMessage(m, self.portid, seq)) {
+                    switch (nl.classifyDumpMessage(m, self.nl.portid, seq)) {
                         .skip => {},
                         .restart => {
                             if (attempt < max_dump_attempts) continue :retry;
@@ -509,7 +429,7 @@ pub const Socket = struct {
                         // NLMSG_DONE, or a bare ACK = an empty dump.
                         .done => return,
                         .failed => |code| {
-                            self.captureExtAck(m);
+                            self.nl.captureExtAck(m);
                             return errorFromErrno(code);
                         },
                         .overrun => return error.Overrun,
@@ -527,71 +447,20 @@ pub const Socket = struct {
         }
     }
 
-    // ── transport ──────────────────────────────────────────────────────────
+    // ── transport (all of it `netlink.Socket`'s) ───────────────────────────
 
     /// Send one complete netlink datagram to the kernel.
     pub fn send(self: *Socket, msg: []const u8) SendError!void {
-        const dst: linux.sockaddr.nl = .{ .pid = 0, .groups = 0 };
-        while (true) {
-            const rc = linux.sendto(
-                self.fd,
-                msg.ptr,
-                msg.len,
-                0,
-                @ptrCast(&dst),
-                @sizeOf(linux.sockaddr.nl),
-            );
-            switch (linux.errno(rc)) {
-                .SUCCESS => return,
-                .INTR => continue,
-                .NOBUFS, .NOMEM => return error.SystemResources,
-                .ACCES, .PERM => return error.AccessDenied,
-                else => return error.SendFailed,
-            }
-        }
+        return self.nl.send(msg);
     }
 
-    /// Receive one whole datagram, growing `self.buf` as needed via a
+    /// Receive one whole datagram, growing the socket's buffer as needed via a
     /// `MSG_PEEK|MSG_TRUNC` size probe so nothing is lost to truncation.
+    /// `Overrun` (the kernel dropped messages) and `WouldBlock` (nothing
+    /// queued, or `setRecvTimeout` expired — how a successful un-acked batch
+    /// looks) are reported as themselves.
     pub fn recvDatagram(self: *Socket) RecvError![]const u8 {
-        while (true) {
-            const prc = linux.recvfrom(
-                self.fd,
-                self.buf.ptr,
-                self.buf.len,
-                linux.MSG.PEEK | linux.MSG.TRUNC,
-                null,
-                null,
-            );
-            switch (linux.errno(prc)) {
-                .SUCCESS => {},
-                .INTR => continue,
-                .NOBUFS => return error.Overrun,
-                .AGAIN => return error.WouldBlock,
-                .NOMEM => return error.SystemResources,
-                else => return error.RecvFailed,
-            }
-            if (prc > self.buf.len) {
-                if (prc > max_recv_buf_len) return error.MalformedReply;
-                const new_len = std.mem.alignForward(usize, prc, initial_recv_buf_len);
-                self.buf = self.gpa.realloc(self.buf, new_len) catch return error.OutOfMemory;
-                continue; // re-probe; the datagram is still queued
-            }
-
-            var src: linux.sockaddr.nl = .{ .pid = 0, .groups = 0 };
-            var slen: linux.socklen_t = @sizeOf(linux.sockaddr.nl);
-            const rc = linux.recvfrom(self.fd, self.buf.ptr, self.buf.len, 0, @ptrCast(&src), &slen);
-            switch (linux.errno(rc)) {
-                .SUCCESS => {},
-                .INTR => continue,
-                .NOBUFS => return error.Overrun,
-                .AGAIN => return error.WouldBlock,
-                .NOMEM => return error.SystemResources,
-                else => return error.RecvFailed,
-            }
-            if (slen >= @sizeOf(linux.sockaddr.nl) and src.pid != 0) continue; // not the kernel
-            return self.buf[0..rc];
-        }
+        return self.nl.recvDatagramStrict();
     }
 };
 

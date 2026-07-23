@@ -112,6 +112,13 @@ for (rules.items) |rule| {
 }
 ```
 
+The socket itself is the sibling `netlink` module's: `Socket` wraps a
+`netlink.Socket` opened with `openProtocol(gpa, NETLINK.NETFILTER)`, so bind,
+port-id capture, `NETLINK_EXT_ACK`, sequence allocation, the
+`MSG_PEEK|MSG_TRUNC` receive-sizing loop and `SO_RCVTIMEO` are shared code, not
+a private copy. What is nftables-specific and stays here: the batch framing, the
+batch ACK/attribution engine and the decoders.
+
 ### Batching is the point
 
 nftables commits are transactions. `Batch` frames

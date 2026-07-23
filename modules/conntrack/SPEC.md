@@ -84,14 +84,24 @@ self-nested tuple, and a `std.testing.fuzz` target over `decodeFlow` + the messa
 
 ### Transport
 
-One blocking `NETLINK_NETFILTER` socket per thread/loop; kernel-assigned portid; replies
-matched on `(portid, seq)`; datagrams whose sender pid ≠ 0 dropped; receive buffer grown by a
-`MSG_PEEK|MSG_TRUNC` probe (capped at 16 MiB); `NETLINK_EXT_ACK` enabled best-effort so a
-rejected request carries the kernel's reason string; `NLM_F_DUMP_INTR` restarts the dump up to
-4 times before `error.InconsistentDump`. `ENOBUFS` is surfaced as `error.Overrun` rather than
-folded into `SystemResources`, because on an event socket it means events were **lost** and the
-caller must re-dump to resynchronise. `EAGAIN` is `error.WouldBlock`, so a caller can set
-`O_NONBLOCK` on `Socket.handle()` or a receive timeout and drive the socket from poll/epoll.
+**All of it is `netlink.Socket`'s** — `Socket` here is a one-field wrapper
+(`nl: netlink.Socket`) opened with `netlink.Socket.openProtocolGroups(gpa, linux.NETLINK.NETFILTER,
+groups)`. That gives: one blocking `NETLINK_NETFILTER` socket per thread/loop; kernel-assigned
+portid; datagrams whose sender pid ≠ 0 dropped; receive buffer grown by a `MSG_PEEK|MSG_TRUNC`
+probe (capped at 16 MiB); `NETLINK_EXT_ACK` enabled best-effort so a rejected request carries the
+kernel's reason string; the sequence counter; the write+ACK engine
+(`netlink.Socket.awaitAckStrict`). This module adds only ctnetlink policy on top: replies matched
+on `(portid, seq)` through `netlink.classifyDumpMessage`, `NLM_F_DUMP_INTR` restarting the dump up
+to 4 times before `error.InconsistentDump`, the reply-type/decoder choice, and the errno mapping.
+
+`ENOBUFS` is surfaced as `error.Overrun` rather than folded into `SystemResources`, because on an
+event socket it means events were **lost** and the caller must re-dump to resynchronise. `EAGAIN`
+is `error.WouldBlock`, so a caller can set `O_NONBLOCK` on `Socket.handle()` or a receive timeout
+and drive the socket from poll/epoll. Both come from `netlink.Socket.recvDatagramStrict` /
+`awaitAckStrict` — the *strict* half of the shared engine, which the rtnetlink path narrows away
+because it has no multicast groups and no receive timeout. `Socket.send`, `Socket.recvDatagram`,
+`Socket.handle`, `Socket.setRecvTimeout`, `Socket.nextSeq` and `Socket.lastErrorMessage` are
+unchanged in signature and behaviour; they are now one-line forwards.
 
 The event API is deliberately a seam rather than a callback: `Socket.nextEvents()` performs
 exactly one blocking `recv` and hands back an `EventIterator` over that datagram. The iterator
@@ -100,7 +110,8 @@ is pure — it can also be fed a replayed capture, which is how the offline even
 ### DRY candidates
 
 Two were filed when this module was written (`modules/netlink` was owned by another workstream
-at the time); both are now **paid off**, and one remains:
+at the time), and a third — the transport itself — was filed after them. **All three are now
+paid off:**
 
 1. ~~**`asBe16/32/64` + `appendAttrBe16/32/64`** (`wire.zig`)~~ — **done.** They live in
    `netlink.codec` beside their host-order twins (`Attr.asBe16/32/64`,
@@ -117,12 +128,24 @@ at the time); both are now **paid off**, and one remains:
    dumps and with `nftables`. It is a pure verdict function, not a driver: the policy above it
    — which request, which reply type, which parser, which errno mapping, how items are
    allocated — stays here, which is what lets three different netlink protocols share it.
-3. **The socket transport** (`root.zig`) still repeats `netlink.Socket`/`genetlink.Socket`
-   almost line for line, because `netlink.Socket.open` hardcodes `linux.NETLINK.ROUTE`. The
-   shared shape wants to become a protocol-parameterised `netlink.Transport`
-   (`open(protocol, groups)`, `send`, `recvDatagram`, `awaitAck`) that `netlink`, `genetlink`,
-   `tc` and `conntrack` all sit on. `netlink.Socket` now publishes `send`/`recvDatagram`, so
-   the *seam* exists; what is missing is the protocol parameter on `open`.
+3. ~~**The socket transport**~~ — **done.** `netlink.Socket.open` no longer hardcodes
+   `linux.NETLINK.ROUTE`: `openProtocol`/`openProtocolGroups` take the protocol (and a multicast
+   bind mask), and `netlink.Socket` now *is* the shared transport — bind, portid capture,
+   `NETLINK_EXT_ACK`, sequence allocation, `send`, the `MSG_PEEK|MSG_TRUNC` growth loop,
+   `SO_RCVTIMEO`, the extended-ACK capture and the ACK engine. This module's private copies of
+   all of it are gone; `Socket` is `struct { nl: netlink.Socket }` and its transport methods are
+   forwards. Behaviour is bit-for-bit what it was — the strict `Overrun`/`WouldBlock` mapping
+   this module needed became the shared implementation, and `netlink`'s coarser rtnetlink mapping
+   became a narrowing wrapper over it, so neither side moved. **`genetlink` is the remaining
+   candidate** (it still carries its own copy, and `nl80211`/`ethtool`/`wireguard` ride on it).
+
+**Not folded in, deliberately: `nfgenmsg` framing.** `nftables` and this module both define
+`nfgenmsg_len`/`NFNETLINK_V0`/`msgType`/`Nfgenmsg`/`parseNfgenmsg`/`appendNfgenmsg`. `struct
+nfgenmsg` is a *per-protocol fixed payload header*, the same layer as `ifinfomsg` (which lives in
+`netlink`, with rtnetlink), `tcmsg` (in `tc`) and `genlmsghdr` (in `genetlink`) — so it belongs
+with its family, not in `netlink`, whose remit is netlink-generic mechanism. The argument in full
+is in `modules/netlink/SPEC.md`; the trigger to revisit is a third nfnetlink family (nfqueue,
+nflog, ipset), at which point a sibling `nfnetlink` module is the right home.
 
 ## Verification
 

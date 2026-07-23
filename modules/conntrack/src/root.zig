@@ -150,45 +150,24 @@ pub const RequestError = netlink.RequestError || RecvError || SendError;
 /// the kernel's mapped errno.
 pub const WriteError = RequestError || BuildError;
 
-const initial_recv_buf_len = 8192; // libmnl's MNL_SOCKET_BUFFER_SIZE ceiling
-const max_recv_buf_len = 1 << 24; // hard cap on receive-buffer growth
 const max_dump_attempts = 4; // NLM_F_DUMP_INTR restarts before giving up
-const ext_ack_msg_max = 256; // kernel reason strings are short sentences
 
 // ── socket ──────────────────────────────────────────────────────────────────
 
 /// A blocking `NETLINK_NETFILTER` socket. One instance per thread/loop; no
 /// shared state.
 ///
-/// The multi-part reply triage of `dump` is `netlink.classifyDumpMessage` —
-/// the (portid, seq) match, the `NLM_F_DUMP_INTR` restart and the control
-/// message dispatch are shared with `netlink` and `nftables`; only the policy
-/// above it (which request, which reply type, which parser, which errno
-/// mapping) is per-family and stays here.
-///
-/// DRY candidate (remaining): everything from `open` down through
-/// `recvDatagram` and `awaitAck` is still the same *transport* discipline as
-/// `netlink.Socket` and `genetlink.Socket` — bind, portid capture,
-/// `NETLINK_EXT_ACK`, the `MSG_PEEK|MSG_TRUNC` buffer-growth loop, the
-/// extended-ACK capture. It is re-implemented here only because
-/// `netlink.Socket.open` hardcodes `linux.NETLINK.ROUTE`. The shared shape
-/// wants to move into `netlink` as a protocol-parameterised
-/// `netlink.Transport` (`open(protocol, groups)`, `send`, `recvDatagram`,
-/// `awaitAck`) that `netlink`, `genetlink`, `tc` and this module would all sit
-/// on.
+/// **Transport is the sibling `netlink` module's.** Socket creation and bind,
+/// port-id capture, `NETLINK_EXT_ACK`, the sequence counter, the
+/// `MSG_PEEK|MSG_TRUNC` buffer-growth loop, the extended-ACK capture and the
+/// ACK/error engine all come from `netlink.Socket`, opened on
+/// `linux.NETLINK.NETFILTER` via `openProtocolGroups`; the multi-part reply
+/// triage is `netlink.classifyDumpMessage`. What stays here is ctnetlink
+/// policy only: which request, which reply type, which decoder, which errno
+/// mapping, and the event seam.
 pub const Socket = struct {
-    gpa: std.mem.Allocator,
-    fd: i32,
-    /// Kernel-assigned netlink port id (from getsockname after bind); replies
-    /// are matched against it.
-    portid: u32,
-    seq: u32,
-    /// Receive buffer; grown on demand (MSG_PEEK|MSG_TRUNC size probe).
-    buf: []u8,
-    /// Last extended-ACK reason string from the kernel, copied out of the
-    /// receive buffer so it survives the next request.
-    ext_ack_buf: [ext_ack_msg_max]u8 = @splat(0),
-    ext_ack_len: usize = 0,
+    /// The shared netlink transport, bound to `NETLINK_NETFILTER`.
+    nl: netlink.Socket,
 
     /// Open a request/response socket (no multicast groups).
     pub fn open(gpa: std.mem.Allocator) OpenError!Socket {
@@ -207,99 +186,39 @@ pub const Socket = struct {
     fn openWithGroups(gpa: std.mem.Allocator, groups: u32) OpenError!Socket {
         if (comptime builtin.os.tag != .linux)
             @compileError("conntrack.Socket is Linux-only (AF_NETLINK raw syscalls)");
-
-        const rc = linux.socket(
-            linux.AF.NETLINK,
-            linux.SOCK.RAW | linux.SOCK.CLOEXEC,
-            linux.NETLINK.NETFILTER,
-        );
-        switch (linux.errno(rc)) {
-            .SUCCESS => {},
-            .ACCES, .PERM => return error.AccessDenied,
-            .AFNOSUPPORT, .PROTONOSUPPORT => return error.ProtocolNotSupported,
-            .MFILE => return error.ProcessFdQuotaExceeded,
-            .NFILE => return error.SystemFdQuotaExceeded,
-            .NOBUFS, .NOMEM => return error.SystemResources,
-            else => return error.Unexpected,
-        }
-        const fd: i32 = @intCast(rc);
-        errdefer _ = linux.close(fd);
-
-        // pid 0 = let the kernel assign a unique port id.
-        const sa: linux.sockaddr.nl = .{ .pid = 0, .groups = groups };
-        switch (linux.errno(linux.bind(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.nl)))) {
-            .SUCCESS => {},
-            .ACCES, .PERM => return error.AccessDenied, // group bind without CAP_NET_ADMIN
-            .NOBUFS, .NOMEM => return error.SystemResources,
-            else => return error.Unexpected,
-        }
-        var bound: linux.sockaddr.nl = .{ .pid = 0, .groups = 0 };
-        var blen: linux.socklen_t = @sizeOf(linux.sockaddr.nl);
-        switch (linux.errno(linux.getsockname(fd, @ptrCast(&bound), &blen))) {
-            .SUCCESS => {},
-            else => return error.Unexpected,
-        }
-
-        // Ask for extended ACKs so a rejected request carries the kernel's
-        // reason string. Best-effort: pre-4.12 kernels answer ENOPROTOOPT and
-        // everything else keeps working, just without the message.
-        const on: u32 = 1;
-        _ = linux.setsockopt(
-            fd,
-            linux.SOL.NETLINK,
-            netlink.NETLINK_EXT_ACK,
-            @ptrCast(&on),
-            @sizeOf(u32),
-        );
-
-        const buf = try gpa.alloc(u8, initial_recv_buf_len);
-        return .{ .gpa = gpa, .fd = fd, .portid = bound.pid, .seq = 0, .buf = buf };
+        return .{
+            .nl = try netlink.Socket.openProtocolGroups(gpa, linux.NETLINK.NETFILTER, groups),
+        };
     }
 
     pub fn close(self: *Socket) void {
-        self.gpa.free(self.buf);
-        _ = linux.close(self.fd);
+        self.nl.close();
         self.* = undefined;
     }
 
     /// Next request sequence number (never 0, so a stale reply from an
     /// unbootstrapped state cannot match).
     pub fn nextSeq(self: *Socket) u32 {
-        self.seq +%= 1;
-        if (self.seq == 0) self.seq = 1;
-        return self.seq;
+        return self.nl.nextSeq();
     }
 
     /// The kernel's reason for the last failed request, from the extended ACK
     /// (`NLMSGERR_ATTR_MSG`). Empty when the kernel attached none. Valid until
     /// the next request on this socket.
     pub fn lastErrorMessage(self: *const Socket) []const u8 {
-        return self.ext_ack_buf[0..self.ext_ack_len];
+        return self.nl.lastErrorMessage();
     }
 
     /// The raw file descriptor, for poll/epoll integration or `fcntl(O_NONBLOCK)`.
     /// Do not close it — that is `close`'s job.
     pub fn handle(self: *const Socket) i32 {
-        return self.fd;
+        return self.nl.handle();
     }
 
     /// Bound how long a receive may block (`SO_RCVTIMEO`); 0 restores the
     /// default of blocking forever. A timeout surfaces as `error.WouldBlock`.
     pub fn setRecvTimeout(self: *Socket, millis: u32) error{Unexpected}!void {
-        const tv: linux.timeval = .{
-            .sec = @intCast(millis / 1000),
-            .usec = @intCast((millis % 1000) * 1000),
-        };
-        return switch (linux.errno(linux.setsockopt(
-            self.fd,
-            linux.SOL.SOCKET,
-            linux.SO.RCVTIMEO,
-            @ptrCast(&tv),
-            @sizeOf(linux.timeval),
-        ))) {
-            .SUCCESS => {},
-            else => error.Unexpected,
-        };
+        return self.nl.setRecvTimeout(millis);
     }
 
     // ── high-level operations ──────────────────────────────────────────────
@@ -317,24 +236,24 @@ pub const Socket = struct {
             try self.send(&req);
 
             var out: std.ArrayList(Flow) = .empty;
-            errdefer out.deinit(self.gpa);
+            errdefer out.deinit(self.nl.gpa);
             while (true) {
                 const dgram = try self.recvDatagram();
                 var it: codec.MessageIterator = .{ .buf = dgram };
                 while (it.next() catch return error.MalformedReply) |m| {
-                    switch (netlink.classifyDumpMessage(m, self.portid, seq)) {
+                    switch (netlink.classifyDumpMessage(m, self.nl.portid, seq)) {
                         .skip => {},
                         .restart => {
                             // The table changed under the dump: what we have
                             // may be inconsistent, so start over with a fresh
                             // sequence.
-                            out.deinit(self.gpa);
+                            out.deinit(self.nl.gpa);
                             if (attempt < max_dump_attempts) continue :retry;
                             return error.InconsistentDump;
                         },
-                        .done => return out.toOwnedSlice(self.gpa),
+                        .done => return out.toOwnedSlice(self.nl.gpa),
                         .failed => |code| {
-                            self.captureExtAck(m);
+                            self.nl.captureExtAck(m);
                             return netlink.errorFromCode(code);
                         },
                         .overrun => return error.Overrun,
@@ -342,7 +261,7 @@ pub const Socket = struct {
                         .record => |rec| {
                             if (rec.type != wire.msg_ct_new) continue;
                             const f = wire.decodeFlow(rec.payload) catch return error.MalformedReply;
-                            try out.append(self.gpa, f);
+                            try out.append(self.nl.gpa, f);
                         },
                     }
                 }
@@ -354,8 +273,8 @@ pub const Socket = struct {
     /// when the kernel does not track it (`ENOENT`).
     pub fn get(self: *Socket, family: Family, dir: Direction, tuple: Tuple) WriteError!?Flow {
         const seq = self.nextSeq();
-        const req = try wire.buildGetRequest(self.gpa, seq, family, dir, tuple);
-        defer self.gpa.free(req);
+        const req = try wire.buildGetRequest(self.nl.gpa, seq, family, dir, tuple);
+        defer self.nl.gpa.free(req);
         try self.send(req);
         return self.awaitFlow(seq) catch |err| switch (err) {
             error.NotFound => null,
@@ -376,8 +295,8 @@ pub const Socket = struct {
         expect_id: ?u32,
     ) WriteError!void {
         const seq = self.nextSeq();
-        const req = try wire.buildDeleteRequest(self.gpa, seq, family, dir, tuple, expect_id);
-        defer self.gpa.free(req);
+        const req = try wire.buildDeleteRequest(self.nl.gpa, seq, family, dir, tuple, expect_id);
+        defer self.nl.gpa.free(req);
         try self.send(req);
         return self.awaitAck(seq);
     }
@@ -387,8 +306,8 @@ pub const Socket = struct {
     /// its own name here so that no caller can trigger it by accident.
     pub fn flush(self: *Socket, family: Family) WriteError!void {
         const seq = self.nextSeq();
-        const req = try wire.buildFlushRequest(self.gpa, seq, family);
-        defer self.gpa.free(req);
+        const req = try wire.buildFlushRequest(self.nl.gpa, seq, family);
+        defer self.nl.gpa.free(req);
         try self.send(req);
         return self.awaitAck(seq);
     }
@@ -411,8 +330,8 @@ pub const Socket = struct {
 
     fn newOp(self: *Socket, family: Family, spec: NewSpec, flags: u16) WriteError!void {
         const seq = self.nextSeq();
-        const req = try wire.buildNewRequest(self.gpa, seq, family, flags, spec);
-        defer self.gpa.free(req);
+        const req = try wire.buildNewRequest(self.nl.gpa, seq, family, flags, spec);
+        defer self.nl.gpa.free(req);
         try self.send(req);
         return self.awaitAck(seq);
     }
@@ -432,113 +351,44 @@ pub const Socket = struct {
         return .{ .msgs = .{ .buf = dgram } };
     }
 
-    // ── transport ──────────────────────────────────────────────────────────
+    // ── transport (all of it `netlink.Socket`'s) ───────────────────────────
 
     /// Send one complete netlink message to the kernel.
     pub fn send(self: *Socket, msg: []const u8) SendError!void {
-        const dst: linux.sockaddr.nl = .{ .pid = 0, .groups = 0 };
-        while (true) {
-            const rc = linux.sendto(
-                self.fd,
-                msg.ptr,
-                msg.len,
-                0,
-                @ptrCast(&dst),
-                @sizeOf(linux.sockaddr.nl),
-            );
-            switch (linux.errno(rc)) {
-                .SUCCESS => return,
-                .INTR => continue,
-                .NOBUFS, .NOMEM => return error.SystemResources,
-                .ACCES, .PERM => return error.AccessDenied,
-                else => return error.SendFailed,
-            }
-        }
+        return self.nl.send(msg);
     }
 
-    /// Receive one whole datagram, growing `self.buf` as needed via a
+    /// Receive one whole datagram, growing the socket's buffer as needed via a
     /// `MSG_PEEK|MSG_TRUNC` size probe so nothing is lost to truncation.
     /// Datagrams not sent by the kernel (sender pid != 0) are dropped — any
     /// user process may address our port id.
+    ///
+    /// `netlink.Socket.recvDatagramStrict` is the variant that keeps
+    /// `Overrun` (dropped events) and `WouldBlock` (receive timeout) apart,
+    /// which is exactly what an event consumer needs.
     pub fn recvDatagram(self: *Socket) RecvError![]const u8 {
-        while (true) {
-            const prc = linux.recvfrom(
-                self.fd,
-                self.buf.ptr,
-                self.buf.len,
-                linux.MSG.PEEK | linux.MSG.TRUNC,
-                null,
-                null,
-            );
-            switch (linux.errno(prc)) {
-                .SUCCESS => {},
-                .INTR => continue,
-                // ENOBUFS is the kernel reporting dropped messages; it is
-                // raised once and the socket keeps working afterwards.
-                .NOBUFS => return error.Overrun,
-                .AGAIN => return error.WouldBlock,
-                .NOMEM => return error.SystemResources,
-                else => return error.RecvFailed,
-            }
-            if (prc > self.buf.len) {
-                if (prc > max_recv_buf_len) return error.MalformedReply;
-                const new_len = std.mem.alignForward(usize, prc, initial_recv_buf_len);
-                self.buf = self.gpa.realloc(self.buf, new_len) catch return error.OutOfMemory;
-                continue; // re-probe; the datagram is still queued
-            }
-
-            var src: linux.sockaddr.nl = .{ .pid = 0, .groups = 0 };
-            var slen: linux.socklen_t = @sizeOf(linux.sockaddr.nl);
-            const rc = linux.recvfrom(self.fd, self.buf.ptr, self.buf.len, 0, @ptrCast(&src), &slen);
-            switch (linux.errno(rc)) {
-                .SUCCESS => {},
-                .INTR => continue,
-                .NOBUFS => return error.Overrun,
-                .AGAIN => return error.WouldBlock,
-                .NOMEM => return error.SystemResources,
-                else => return error.RecvFailed,
-            }
-            if (slen >= @sizeOf(linux.sockaddr.nl) and src.pid != 0) continue; // not the kernel
-            return self.buf[0..rc];
-        }
+        return self.nl.recvDatagramStrict();
     }
 
     /// Wait for the `NLMSG_ERROR` reply to `seq`: errno 0 = ACK (success),
     /// anything else = a mapped error. Replies for other ports/sequences are
     /// skipped, as are multicast events arriving meanwhile.
     fn awaitAck(self: *Socket, seq: u32) RequestError!void {
-        self.ext_ack_len = 0;
-        while (true) {
-            const dgram = try self.recvDatagram();
-            var it: codec.MessageIterator = .{ .buf = dgram };
-            while (it.next() catch return error.MalformedReply) |m| {
-                if (m.pid != self.portid or m.seq != seq) continue;
-                switch (m.type) {
-                    codec.NLMSG_ERROR => {
-                        const code = m.errorCode() catch return error.MalformedReply;
-                        self.captureExtAck(m);
-                        if (code == 0) return; // ACK
-                        return netlink.writeErrorFromCode(code);
-                    },
-                    codec.NLMSG_OVERRUN => return error.Overrun,
-                    else => {}, // NOOP / echo — keep waiting for the ACK
-                }
-            }
-        }
+        return self.nl.awaitAckStrict(seq);
     }
 
     /// Wait for the single `IPCTNL_MSG_CT_NEW` answer to a GET on `seq`.
     fn awaitFlow(self: *Socket, seq: u32) RequestError!Flow {
-        self.ext_ack_len = 0;
+        self.nl.ext_ack_len = 0;
         while (true) {
             const dgram = try self.recvDatagram();
             var it: codec.MessageIterator = .{ .buf = dgram };
             while (it.next() catch return error.MalformedReply) |m| {
-                if (m.pid != self.portid or m.seq != seq) continue;
+                if (m.pid != self.nl.portid or m.seq != seq) continue;
                 switch (m.type) {
                     codec.NLMSG_ERROR => {
                         const code = m.errorCode() catch return error.MalformedReply;
-                        self.captureExtAck(m);
+                        self.nl.captureExtAck(m);
                         // A bare ACK carries no entry — treat it like ENOENT.
                         if (code == 0) return error.NotFound;
                         return netlink.writeErrorFromCode(code);
@@ -550,17 +400,6 @@ pub const Socket = struct {
                 }
             }
         }
-    }
-
-    /// Copy the extended-ACK reason string (if any) out of the reply buffer,
-    /// truncating at `ext_ack_msg_max`. Never fails: a malformed ext-ack just
-    /// leaves the message empty — the errno mapping is what callers act on.
-    fn captureExtAck(self: *Socket, m: codec.Message) void {
-        self.ext_ack_len = 0;
-        const msg = (m.errorMessage() catch return) orelse return;
-        const n = @min(msg.len, self.ext_ack_buf.len);
-        @memcpy(self.ext_ack_buf[0..n], msg[0..n]);
-        self.ext_ack_len = n;
     }
 };
 

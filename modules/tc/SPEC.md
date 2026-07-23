@@ -6,22 +6,31 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
 ## Design & invariants
 
 `tc` builds the traffic-control message families (`RTM_*QDISC`, `RTM_*TCLASS`,
-`RTM_*TFILTER`, `RTM_*ACTION`) on top of the sibling `netlink` module. **Transport is not duplicated**:
-`netlink.Socket` owns the `NETLINK_ROUTE` fd, the sequence counter (`nextSeq`), the
-write+ACK engine (`requestAck`), the `NLMSG_ERROR` → typed-error mapping
-(`writeErrorFromCode`) and the extended-ACK reason string (`lastErrorMessage`); the wire
-codec (`appendHeader`/`appendAttr*`/`nestBegin`/`nestEnd`/`AttrIterator`, and the
-`NLM_F_CREATE`/`EXCL`/`REPLACE` constants) comes from `netlink.codec`. This module adds
-only what is tc-specific: the `tcmsg` fixed header, the kind-specific `TCA_OPTIONS`
-payloads, the psched rate arithmetic, and a multi-part dump loop.
+`RTM_*TFILTER`, `RTM_*ACTION`) on top of the sibling `netlink` module. **No transport is
+duplicated — not even the receive path**: `netlink.Socket` owns the `NETLINK_ROUTE` fd,
+its receive buffer, the sequence counter (`nextSeq`), the raw seam (`send`,
+`recvDatagram`), the write+ACK engine (`requestAck`), the `NLMSG_ERROR` → typed-error
+mapping (`writeErrorFromCode`) and the extended-ACK reason string (`lastErrorMessage`);
+the wire codec (`appendHeader`/`appendAttr*`/`nestBegin`/`nestEnd`/`AttrIterator`, and
+the `NLM_F_CREATE`/`EXCL`/`REPLACE` constants) comes from `netlink.codec`. This module
+adds only what is tc-specific: the `tcmsg` fixed header, the kind-specific `TCA_OPTIONS`
+payloads, the psched rate arithmetic, and the *policy* of a dump.
 
-The one piece that is still local is that dump loop (`Socket.dump`, marked
-`DRY candidate:` in the source). `netlink`'s dump engine is private and generic over its
-own parse/match callbacks, and — unlike the sibling `genetlink.Socket` — it publishes no
-raw `send`/`recvDatagram` pair, so tc drives the shared socket's fd directly for
-`RTM_GET*`. Everything else about a dump (seq allocation, error mapping) still goes
-through `netlink`. If `netlink` ever grows a public `sendRequest`/`recvDatagram` seam,
-this loop should collapse into it.
+`tc.Socket` is therefore `struct { gpa, nl: netlink.Socket, psched }` — it has no fd, no
+buffer and no sequence counter of its own. The multi-part dump loops (`Socket.dump`,
+`Socket.actions`) used to drive the shared socket's fd directly, with a hand-rolled
+`sendto`/`MSG_PEEK|MSG_TRUNC` pair and a hand-rolled reply triage, because that seam did
+not exist when they were written; they now sit on `netlink.Socket.send` +
+`recvDatagram` + `netlink.classifyDumpMessage`, which is byte-for-byte the same triage
+they open-coded (stale (portid, seq) → skip, `NLM_F_DUMP_INTR` → restart up to 4
+attempts, `NLMSG_DONE`/bare-ACK → done, `NLMSG_ERROR` → `writeErrorFromCode`,
+`NLMSG_NOOP` → skip, `NLMSG_OVERRUN` → `SystemResources`). What stays local is only the
+policy: which request, which reply type, which parser, and the client-side
+`ifindex`/`parent` filtering (`ParentMatch`).
+
+`Socket.actionGet` deliberately keeps an explicit triage rather than using
+`classifyDumpMessage`: it is a single-reply `RTM_GETACTION`, not a multi-part dump, so
+`NLM_F_DUMP_INTR` must not be read as a restart there.
 
 ### Module layout
 

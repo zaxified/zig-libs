@@ -135,6 +135,24 @@ Shared with the other netlink families (see SPEC.md § "Shared codec surface"):
 - **`Socket.send` / `Socket.recvDatagram`** — the raw transport seam, for
   driving a message type this module does not model over the same bound
   socket. The received slice borrows the socket's buffer until the next call.
+- **`Socket.openProtocol(gpa, protocol)` / `openProtocolGroups(gpa, protocol,
+  groups)`** — the same socket on **any** netlink protocol
+  (`NETLINK.NETFILTER`, `NETLINK.GENERIC`, …), optionally bound to multicast
+  groups (legacy 32-bit mask: kernel group *n* = bit *n-1*). `Socket.open` is
+  the unchanged `NETLINK_ROUTE` shorthand. This is what makes `Socket` the
+  repo's **shared netlink transport**: bind, port-id capture,
+  `NETLINK_EXT_ACK`, sequence allocation, the `MSG_PEEK|MSG_TRUNC`
+  receive-sizing loop, extended-ACK capture and the ACK/error engine exist
+  once, and `conntrack`, `nftables` and `tc` sit on them rather than keeping
+  private copies. The typed rtnetlink ops below apply only to a
+  `NETLINK_ROUTE` socket.
+- **`Socket.recvDatagramStrict` / `Socket.awaitAckStrict`** — the same engines
+  with `Overrun` (`ENOBUFS`: the kernel dropped messages, so an event stream
+  must resynchronise) and `WouldBlock` (`EAGAIN`/`setRecvTimeout`) reported as
+  themselves instead of folded into `SystemResources`/`RecvFailed`. The
+  nfnetlink families need the distinction; rtnetlink never did.
+- **`Socket.handle()` / `Socket.setRecvTimeout(ms)`** — poll/epoll integration
+  and a `SO_RCVTIMEO` bound on blocking receives.
 
 ## Design notes
 

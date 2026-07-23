@@ -22,12 +22,13 @@ Zig with no `tc` binary shell-out and no libc.
   `TC_H_UNSPEC`, hexadecimal `parse`/`format` (`"1:10"` is minor **16**, exactly as `tc`
   reads and prints it).
 
-Transport is shared with the sibling `netlink` module: `tc` no longer runs its own
-`NETLINK_ROUTE` socket, sequence counter, errno table or extended-ACK handling — it
-drives `netlink.Socket` through the public `nextSeq`/`requestAck`/`lastErrorMessage`
-seam and builds its own tc messages on `netlink.codec`. Only the multi-part **dump**
-receive loop is still local, because `netlink`'s dump engine is private and generic over
-its own parsers (a `DRY candidate:` note marks the spot).
+Transport is shared with the sibling `netlink` module: `tc` runs no socket, receive
+buffer, sequence counter, errno table or extended-ACK handling of its own — it drives
+`netlink.Socket` through the public
+`nextSeq`/`send`/`recvDatagram`/`requestAck`/`lastErrorMessage` seam and builds its own
+tc messages on `netlink.codec`. The multi-part **dump** loops triage their replies with
+the shared `netlink.classifyDumpMessage` too; what is local is only tc policy — which
+request, which reply type, which parser, and the client-side `ifindex`/`parent` filter.
 
 Consumers: fleet-simulation network impairment (per-link delay/loss/reorder), bandwidth
 partitioning for test rigs and multi-tenant hosts, and anywhere you would otherwise shell

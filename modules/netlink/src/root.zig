@@ -41,12 +41,26 @@
 //! try nl.fdbAdd(.{ .ifindex = veth_index, .lladdr = &mac, .vlan = 10 }, .{});
 //! ```
 //!
-//! Still out of scope: multicast event monitoring (RTNLGRP_* subscription),
-//! tc/qdisc (the sibling `tc` module), conntrack, and — within the bridge
+//! **This module is also the repo's shared netlink transport.**
+//! `Socket.openProtocol(gpa, protocol)` / `openProtocolGroups(gpa, protocol,
+//! groups)` bind the same socket on any netlink protocol
+//! (`NETLINK.NETFILTER`, `NETLINK.GENERIC`, …), optionally subscribing to
+//! multicast groups; `Socket.open` is the unchanged `NETLINK_ROUTE`
+//! shorthand. Bind, kernel port-id capture, `NETLINK_EXT_ACK`, sequence
+//! allocation (`nextSeq`), `send`, the `MSG_PEEK|MSG_TRUNC` receive-sizing
+//! loop (`recvDatagram`/`recvDatagramStrict`), the extended-ACK capture and
+//! the write+ACK engine (`requestAck`/`awaitAckStrict`) therefore exist once
+//! — the sibling `conntrack`, `nftables` and `tc` modules sit on them with
+//! their own message builders instead of re-implementing the syscall
+//! discipline. The typed rtnetlink ops below apply only to a `NETLINK_ROUTE`
+//! socket.
+//!
+//! Still out of scope: multicast event monitoring on the rtnetlink side
+//! (typed `RTNLGRP_*` vocabulary + an event decoder; the group *bind* already
+//! works via `openProtocolGroups`), tc/qdisc (the sibling `tc` module),
+//! conntrack (the sibling `conntrack` module), and — within the bridge
 //! surface — MDB/multicast snooping, VXLAN device creation, VLAN tunnels and
-//! MRP/CFM/MST (see SPEC.md for the full deferred list). The transport is
-//! generic enough for them — `nextSeq` + `requestAck` are public so sibling
-//! modules can reuse the write+ACK engine with their own message builders.
+//! MRP/CFM/MST (see SPEC.md for the full deferred list).
 //!
 //! The wire codec (message framing + rtattr TLV walking) lives in
 //! `codec.zig`, is platform-independent, golden-tested and fuzzed; every
@@ -1212,6 +1226,22 @@ pub const RecvError = error{
     MalformedReply,
 };
 
+/// `RecvError` with the two conditions the rtnetlink paths deliberately fold
+/// away kept apart — see `Socket.recvDatagramStrict`:
+///
+/// * `Overrun` — the kernel dropped messages because the socket's receive
+///   queue was full (`ENOBUFS`, or an `NLMSG_OVERRUN` control message). On an
+///   **event** socket that means events were lost and the caller must re-dump
+///   to resynchronise; `recvDatagram` cannot express that and reports
+///   `SystemResources`.
+/// * `WouldBlock` — nothing to read on a non-blocking socket, or
+///   `setRecvTimeout` expired (`EAGAIN`). `recvDatagram` reports `RecvFailed`.
+pub const StrictRecvError = RecvError || error{ Overrun, WouldBlock };
+
+/// `RequestError` with `Overrun`/`WouldBlock` kept apart — see
+/// `Socket.awaitAckStrict`.
+pub const StrictRequestError = RequestError || error{ Overrun, WouldBlock };
+
 /// The subset of `RequestError` the send path can raise.
 pub const SendError = error{
     SendFailed,
@@ -1219,9 +1249,22 @@ pub const SendError = error{
     AccessDenied,
 };
 
-/// A blocking `NETLINK_ROUTE` socket. One instance per thread/loop; no shared
-/// state. All slices returned by the query methods are allocated with the
-/// allocator passed to `open` and free with a single `gpa.free(slice)`.
+/// A blocking netlink socket — `NETLINK_ROUTE` by default (`open`), any other
+/// netlink protocol via `openProtocol`/`openProtocolGroups`. One instance per
+/// thread/loop; no shared state. All slices returned by the query methods are
+/// allocated with the allocator passed to `open` and free with a single
+/// `gpa.free(slice)`.
+///
+/// This struct is also **the module's shared netlink transport**: socket
+/// creation, bind, port-id capture, `NETLINK_EXT_ACK`, the sequence counter,
+/// the `MSG_PEEK|MSG_TRUNC` receive-sizing loop, the extended-ACK capture and
+/// the ACK/error engine live here once, and the sibling netlink families
+/// (`conntrack`, `nftables`, `tc`) sit on it instead of re-implementing them.
+/// The typed rtnetlink helpers below (`links`, `routes`, `addressAdd`, the
+/// bridge ops, …) are **only meaningful on a `NETLINK_ROUTE` socket**; on a
+/// socket opened with `openProtocol` use the raw seam — `nextSeq`, `send`,
+/// `recvDatagram`/`recvDatagramStrict`, `classifyDumpMessage`, `requestAck`/
+/// `awaitAckStrict` — plus that family's own message builders.
 pub const Socket = struct {
     gpa: std.mem.Allocator,
     fd: i32,
@@ -1237,14 +1280,35 @@ pub const Socket = struct {
     ext_ack_buf: [ext_ack_msg_max]u8 = @splat(0),
     ext_ack_len: usize = 0,
 
+    /// Open an `NETLINK_ROUTE` socket — the rtnetlink shorthand for
+    /// `openProtocol(gpa, linux.NETLINK.ROUTE)`, and the only form that makes
+    /// the typed helpers below usable.
     pub fn open(gpa: std.mem.Allocator) OpenError!Socket {
+        return openProtocolGroups(gpa, linux.NETLINK.ROUTE, 0);
+    }
+
+    /// Open a socket on any netlink protocol — `linux.NETLINK.NETFILTER`
+    /// (nfnetlink: conntrack, nf_tables), `linux.NETLINK.GENERIC`,
+    /// `linux.NETLINK.ROUTE`, … — with no multicast subscription. The typed
+    /// rtnetlink ops on this struct then do not apply; drive the family's own
+    /// messages over `nextSeq`/`send`/`recvDatagram`/`requestAck`.
+    pub fn openProtocol(gpa: std.mem.Allocator, protocol: u32) OpenError!Socket {
+        return openProtocolGroups(gpa, protocol, 0);
+    }
+
+    /// `openProtocol` plus a multicast subscription: `groups` is the legacy
+    /// 32-bit `sockaddr_nl.nl_groups` **bit set**, so a kernel group numbered
+    /// *n* is bit *n-1* (e.g. conntrack's `NFNLGRP_CONNTRACK_NEW` = 1 is
+    /// `1 << 0`). Binding to any group needs `CAP_NET_ADMIN` in the network
+    /// namespace and answers `error.AccessDenied` without it.
+    pub fn openProtocolGroups(gpa: std.mem.Allocator, protocol: u32, groups: u32) OpenError!Socket {
         if (comptime builtin.os.tag != .linux)
             @compileError("netlink.Socket is Linux-only (AF_NETLINK raw syscalls)");
 
         const rc = linux.socket(
             linux.AF.NETLINK,
             linux.SOCK.RAW | linux.SOCK.CLOEXEC,
-            linux.NETLINK.ROUTE,
+            protocol,
         );
         switch (linux.errno(rc)) {
             .SUCCESS => {},
@@ -1259,9 +1323,12 @@ pub const Socket = struct {
         errdefer _ = linux.close(fd);
 
         // pid 0 = let the kernel assign a unique port id.
-        const sa: linux.sockaddr.nl = .{ .pid = 0, .groups = 0 };
+        const sa: linux.sockaddr.nl = .{ .pid = 0, .groups = groups };
         switch (linux.errno(linux.bind(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.nl)))) {
             .SUCCESS => {},
+            // Only reachable with `groups != 0`: the kernel permission-checks
+            // the multicast subscription, not the port-id bind.
+            .ACCES, .PERM => return error.AccessDenied,
             .NOBUFS, .NOMEM => return error.SystemResources,
             else => return error.Unexpected,
         }
@@ -1292,6 +1359,33 @@ pub const Socket = struct {
         self.gpa.free(self.buf);
         _ = linux.close(self.fd);
         self.* = undefined;
+    }
+
+    /// The raw file descriptor, for poll/epoll integration or
+    /// `fcntl(O_NONBLOCK)`. Do not close it — that is `close`'s job.
+    pub fn handle(self: *const Socket) i32 {
+        return self.fd;
+    }
+
+    /// Bound how long a receive may block (`SO_RCVTIMEO`); 0 restores the
+    /// default of blocking forever. A timeout surfaces as
+    /// `StrictRecvError.WouldBlock` from `recvDatagramStrict`, and as
+    /// `RecvError.RecvFailed` from `recvDatagram`.
+    pub fn setRecvTimeout(self: *Socket, millis: u32) error{Unexpected}!void {
+        const tv: linux.timeval = .{
+            .sec = @intCast(millis / 1000),
+            .usec = @intCast((millis % 1000) * 1000),
+        };
+        return switch (linux.errno(linux.setsockopt(
+            self.fd,
+            linux.SOL.SOCKET,
+            linux.SO.RCVTIMEO,
+            @ptrCast(&tv),
+            @sizeOf(linux.timeval),
+        ))) {
+            .SUCCESS => {},
+            else => error.Unexpected,
+        };
     }
 
     /// Dump all network interfaces.
@@ -1597,9 +1691,30 @@ pub const Socket = struct {
     /// non-error messages carrying our seq (an `NLM_F_ECHO` copy) are ignored
     /// until the ACK itself arrives.
     fn awaitAck(self: *Socket, seq: u32) RequestError!void {
+        return self.awaitAckStrict(seq) catch |err| switch (err) {
+            // The rtnetlink path has no separate vocabulary for these two;
+            // they fold onto what this socket has always reported.
+            error.Overrun => error.SystemResources,
+            error.WouldBlock => error.RecvFailed,
+            else => |e| e,
+        };
+    }
+
+    /// `awaitAck` for callers that need `Overrun`/`WouldBlock` kept apart —
+    /// the nfnetlink families (`conntrack`, `nftables`), where a full receive
+    /// queue means *lost events* rather than a generic resource failure and a
+    /// `setRecvTimeout` expiry is a normal outcome.
+    ///
+    /// Waits for the `NLMSG_ERROR` reply to `seq`: errno 0 = ACK (success),
+    /// anything else = a mapped error (`writeErrorFromCode`), with the
+    /// kernel's reason string captured into `lastErrorMessage`. Replies for
+    /// other ports/sequences (a stale dump, a multicast event, another process
+    /// addressing our port id) are skipped; non-error messages carrying our
+    /// seq (an `NLM_F_ECHO` copy) are ignored until the ACK itself arrives.
+    pub fn awaitAckStrict(self: *Socket, seq: u32) StrictRequestError!void {
         self.ext_ack_len = 0;
         while (true) {
-            const dgram = try self.recvDatagram();
+            const dgram = try self.recvDatagramStrict();
             var it: codec.MessageIterator = .{ .buf = dgram };
             while (it.next() catch return error.MalformedReply) |m| {
                 if (m.pid != self.portid or m.seq != seq) continue;
@@ -1610,7 +1725,7 @@ pub const Socket = struct {
                         if (code == 0) return; // ACK
                         return writeErrorFromCode(code);
                     },
-                    codec.NLMSG_OVERRUN => return error.SystemResources,
+                    codec.NLMSG_OVERRUN => return error.Overrun,
                     else => {}, // NOOP / echo — keep waiting for the ACK
                 }
             }
@@ -1620,7 +1735,11 @@ pub const Socket = struct {
     /// Copy the extended-ACK reason string (if any) out of the reply buffer,
     /// truncating at `ext_ack_msg_max`. Never fails: a malformed ext-ack just
     /// leaves the message empty — the errno mapping is what callers act on.
-    fn captureExtAck(self: *Socket, m: codec.Message) void {
+    ///
+    /// Public because the families that drive their own reply loops over this
+    /// transport (`conntrack`, `nftables`) must be able to record the reason
+    /// string for the errors they map themselves.
+    pub fn captureExtAck(self: *Socket, m: codec.Message) void {
         self.ext_ack_len = 0;
         const msg = (m.errorMessage() catch return) orelse return;
         const n = @min(msg.len, self.ext_ack_buf.len);
@@ -1785,6 +1904,22 @@ pub const Socket = struct {
     /// only until the next call on the socket. The other half of the raw
     /// transport seam — see `send`.
     pub fn recvDatagram(self: *Socket) RecvError![]const u8 {
+        return self.recvDatagramStrict() catch |err| switch (err) {
+            // ENOBUFS and EAGAIN have always surfaced this way on the
+            // rtnetlink path, which subscribes to no multicast group and sets
+            // no receive timeout; `recvDatagramStrict` keeps them apart.
+            error.Overrun => error.SystemResources,
+            error.WouldBlock => error.RecvFailed,
+            else => |e| e,
+        };
+    }
+
+    /// `recvDatagram` for callers that need `Overrun` (`ENOBUFS` — the kernel
+    /// dropped messages, so an event stream must be resynchronised by
+    /// re-dumping) and `WouldBlock` (`EAGAIN` — nothing queued, or
+    /// `setRecvTimeout` expired) reported as themselves. Same buffer-growth
+    /// and kernel-sender discipline as `recvDatagram`.
+    pub fn recvDatagramStrict(self: *Socket) StrictRecvError![]const u8 {
         while (true) {
             const prc = linux.recvfrom(
                 self.fd,
@@ -1797,7 +1932,11 @@ pub const Socket = struct {
             switch (linux.errno(prc)) {
                 .SUCCESS => {},
                 .INTR => continue,
-                .NOBUFS, .NOMEM => return error.SystemResources,
+                // ENOBUFS is the kernel reporting dropped messages; it is
+                // raised once and the socket keeps working afterwards.
+                .NOBUFS => return error.Overrun,
+                .AGAIN => return error.WouldBlock,
+                .NOMEM => return error.SystemResources,
                 else => return error.RecvFailed,
             }
             if (prc > self.buf.len) {
@@ -1813,7 +1952,9 @@ pub const Socket = struct {
             switch (linux.errno(rc)) {
                 .SUCCESS => {},
                 .INTR => continue,
-                .NOBUFS, .NOMEM => return error.SystemResources,
+                .NOBUFS => return error.Overrun,
+                .AGAIN => return error.WouldBlock,
+                .NOMEM => return error.SystemResources,
                 else => return error.RecvFailed,
             }
             if (slen >= @sizeOf(linux.sockaddr.nl) and src.pid != 0) continue; // not the kernel
@@ -2656,6 +2797,36 @@ test "integration: sequential dumps on one socket stay in sync" {
     const l2 = try nl.links();
     defer testing.allocator.free(l2);
     try testing.expect(l2.len >= 1);
+}
+
+test "integration: openProtocol binds a non-rtnetlink protocol on the same transport" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    // The whole point of the protocol parameter: the sibling nfnetlink and
+    // generic families (`conntrack`, `nftables`, `genetlink`'s ground) get a
+    // bound socket with a kernel-assigned port id, EXT_ACK and a receive
+    // buffer without re-implementing any of it.
+    var nf = Socket.openProtocol(testing.allocator, linux.NETLINK.NETFILTER) catch
+        return error.SkipZigTest;
+    defer nf.close();
+    try testing.expect(nf.portid != 0);
+    try testing.expect(nf.handle() >= 0);
+    try testing.expectEqual(@as(u32, 1), nf.nextSeq());
+
+    // A ROUTE socket opened alongside it is independent (port ids are unique
+    // per protocol, not across protocols, so the two may well coincide) and
+    // the rtnetlink shorthand still behaves exactly as before.
+    var rt = try openOrSkip();
+    defer rt.close();
+    try testing.expect(rt.handle() != nf.handle());
+    const ls = try rt.links();
+    testing.allocator.free(ls);
+
+    // A receive timeout on the nfnetlink socket surfaces as WouldBlock through
+    // the strict seam (nothing will ever be sent to it here).
+    try nf.setRecvTimeout(50);
+    try testing.expectError(error.WouldBlock, nf.recvDatagramStrict());
+    // …and folds onto RecvFailed through the rtnetlink-shaped one.
+    try testing.expectError(error.RecvFailed, nf.recvDatagram());
 }
 
 test "integration: a write to a nonexistent interface surfaces a mapped error" {
