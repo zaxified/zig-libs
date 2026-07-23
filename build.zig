@@ -143,7 +143,7 @@ const module_list = [_]Module{
     .{ .name = "syslog" },
     .{ .name = "sntp" },
     .{ .name = "stun", .deps = &.{"netaddr"} },
-    .{ .name = "opcua", .deps = &.{"rsa"} },
+    .{ .name = "opcua", .deps = &.{ "rsa", "x509" } },
     .{ .name = "noise" },
     .{ .name = "x509", .deps = &.{"rsa"} },
     .{ .name = "ocsp", .deps = &.{ "x509", "rsa", "p256" } },
