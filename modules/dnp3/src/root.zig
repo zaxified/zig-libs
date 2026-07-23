@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 
-//! dnp3 — pure-Zig DNP3 (IEEE 1815-2012) base protocol: Data Link Layer,
-//! Transport Function, and Application Layer framing plus a core object
-//! library, for both master and outstation roles.
+//! dnp3 — pure-Zig DNP3 (IEEE 1815-2012): Data Link Layer, Transport
+//! Function and Application Layer framing plus the object library as pure
+//! codecs, and a complete **outstation** built on top of them.
 //!
 //! Implemented (this module):
 //! - **Data Link Layer** (`link`, §9): the 0x0564 fixed frame, the control
@@ -20,6 +20,21 @@
 //!   (g10/g12), binary counter (g20), analog input (g30), analog output
 //!   status/block (g40/g41), time-and-date (g50), and class-data read
 //!   markers (g60).
+//! - **Object records** (`records`): a table-driven codec for the ~40
+//!   group/variation pairs an outstation emits — binary (g1/g2), double-bit
+//!   binary (g3/g4), binary output status (g10/g11), counter (g20/g22),
+//!   frozen counter (g21/g23), analog input (g30/g32) and analog output
+//!   status (g40/g42), in the with-flags / without-flags / 16-bit / 32-bit /
+//!   float / absolute-time / relative-time shapes plus the packed forms.
+//! - **Outstation** (`outstation`): a stateful responder over a caller-owned
+//!   point database — READ (class polls and specific reads), WRITE,
+//!   SELECT/OPERATE/DIRECT_OPERATE with a select-before-operate timer,
+//!   restart, delay measure, unsolicited enable/disable, freeze, assign
+//!   class and CONFIRM; IIN bits; a bounded event buffer with a
+//!   confirm/retire cycle; and multi-fragment responses with correct
+//!   FIR/FIN/SEQ. `outstation.Session` wires it to the transport function
+//!   and the data-link layer. No threads, no owned timers, no allocation:
+//!   every deadline comes from an injected clock.
 //!
 //! - **Secure Authentication, SAv2 symmetric core** (`sa`, §7 / IEC 62351-5,
 //!   object group 120): AES Key Wrap (RFC 3394), the SA MAC-algorithm
@@ -58,10 +73,12 @@ const std = @import("std");
 
 pub const meta = .{
     .platform = .any,
-    // master (build request/parse response) + outstation (parse
-    // request/build response) via the same pure functions.
+    // master = the pure codecs (build request / parse response);
+    // outstation = a real stateful responder in `outstation.zig`.
     .role = .both,
-    .concurrency = .reentrant, // no shared state; every type is caller-owned
+    // The codecs are reentrant (no shared state, every type caller-owned);
+    // `Outstation`/`Session` hold session state and are single-owner.
+    .concurrency = .reentrant,
     .model_after = "IEEE 1815-2012 (DNP3); structure ref opendnp3 (Apache-2.0) -- behavioral only, no source copied",
     .deps = .{},
 };
@@ -76,6 +93,16 @@ pub const application = @import("application.zig");
 pub const objects = @import("objects.zig");
 /// SCAFFOLD ONLY -- Secure Authentication (g120) hook. See its doc comment.
 pub const sa = @import("sa.zig");
+/// Table-driven codec for every static and event object variation the
+/// outstation speaks (the object records that follow an object header).
+pub const records = @import("records.zig");
+/// The outstation (slave) role: a pure request-fragment-to-response-fragment
+/// responder over a caller-owned point database, plus a `Session` that wires
+/// it to the link and transport layers.
+pub const outstation = @import("outstation.zig");
+/// Byte-exact wire goldens for both roles, including frames captured from a
+/// live opendnp3 master driving `outstation.Outstation`.
+pub const goldens = @import("goldens.zig");
 
 // Pull the submodules' tests into this module's test binary -- a bare
 // re-export does NOT drag in the imported file's `test` blocks (the
@@ -86,6 +113,9 @@ test {
     _ = application;
     _ = objects;
     _ = sa;
+    _ = records;
+    _ = outstation;
+    _ = goldens;
 }
 
 // ── full-stack integration: link + transport together ───────────────────────

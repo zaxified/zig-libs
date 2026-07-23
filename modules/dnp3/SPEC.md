@@ -4,7 +4,7 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
 
 ## Design & invariants
 
-Four allocation-free layers, all offline-testable, mirroring IEEE 1815-2012's own layering:
+Six allocation-free layers, all offline-testable, mirroring IEEE 1815-2012's own layering:
 
 - `link` (§9): the fixed 0x0564 frame. `length` (octet 2) = `5 + user_data.len`, excluding every
   CRC octet. The header block (10 octets: start x2 + length + control + dest + src + CRC) is
@@ -26,9 +26,53 @@ Four allocation-free layers, all offline-testable, mirroring IEEE 1815-2012's ow
   REMOTE_FORCED/LOCAL_FORCED) versus group-specific (bit 5, bit 7) rather than pretending
   certainty on nomenclature this implementation isn't set up to test group-by-group.
 
-Concurrency: `.reentrant` — every type (`Segmenter`, `Reassembler`, `FrameReceiver`, etc.) is
-caller-owned with no shared/global state. Error policy: malformed/short/corrupt bytes never panic
-in `link`/`transport`/`application`/`objects` — every decode path returns a typed error.
+- `records`: a table-driven codec for the object *records* that follow an object header. A
+  group/variation is described by a `Layout` — `{ flags: bool, value: ValueShape, time: TimeShape }`
+  — and one `encode`/`decode` pair handles all of them. This is what makes the outstation's ~40
+  group/variation pairs tractable: adding a variation is one table row, not a new struct. The
+  binary and double-bit families carry their state *inside* the flags octet (bit 7, bits 6-7), and
+  `encode` merges the state into the flags for the caller so it cannot be forgotten. Packed
+  single-bit (g1v1, g10v1) and packed double-bit (g3v1) shapes are refused by the record codec and
+  handled by explicit `setPackedBit`/`setPackedDoubleBit` helpers, because their size depends on the
+  range rather than on the variation.
+- `outstation`: the responder. `Outstation.handle(request, now_ms, out) -> ?Reply` is a pure
+  function from one application fragment to one application fragment over a caller-owned
+  `Database` (seven slices of point structs) and a caller-owned `EventBuffer`. `Session` composes
+  it with `transport.Reassembler`/`Segmenter` and `link` so a caller can feed whole frames.
+  Everything time-dependent — the select-before-operate window, the confirm timeout — is driven by
+  an injected `now_ms` or by an explicit `confirmTimedOut()` call; the module owns no clock and
+  spawns no thread.
+
+Concurrency: `.reentrant` for the codecs — every type (`Segmenter`, `Reassembler`,
+`FrameReceiver`, `records`) is caller-owned with no shared/global state; `Outstation`/`Session` are
+`.single_owner` (they hold session state: IIN bits, event buffer, select arm, fragmentation
+cursor). Error policy: malformed/short/corrupt bytes never panic in `link`/`transport`/
+`application`/`objects`/`records` — every decode path returns a typed error — and the outstation
+never returns an error for anything a *peer* got wrong: a hostile request becomes a response with
+the appropriate IIN bits (`PARAMETER_ERROR`, `OBJECT_UNKNOWN`, `FUNC_NOT_SUPPORTED`) or a command
+echo with a non-success `CommandStatus`. The only error `handle` can return is `BufferTooSmall`,
+which is a local programming mistake.
+
+## Outstation behaviour worth pinning down
+
+- **Restart IIN.** Set at construction and after every honoured restart. Cleared *only* by an
+  explicit WRITE of g80v1 index 7 with the bit clear (§5.1.4.1) — a master that never clears it
+  keeps being told, which is the point.
+- **Events are retired on CONFIRM, not on send.** A response carrying events sets CON; the events
+  stay in the buffer, marked in-flight, until the master's CONFIRM arrives. `confirmTimedOut()`
+  un-marks them so the next poll offers the same ones again. Overflow drops the *oldest* and
+  latches IIN2.3 until the buffer drains completely.
+- **Fragmentation.** Each fragment of a multi-fragment response carries the *next* application
+  sequence number (§5.1.6.2) and clears FIR after the first. Reusing the request's sequence for
+  every fragment is a classic interop failure and is exactly what opendnp3 caught in this module's
+  first draft.
+- **Select-before-operate.** The SELECT is stored with its arm time and its object bytes verbatim.
+  An OPERATE must carry the SELECT's sequence + 1 and byte-identical objects; otherwise it is
+  `NO_SELECT`. Once the arm window closes the select is dropped and the *next* OPERATE is answered
+  `TIMEOUT` rather than `NO_SELECT`, so the master can tell the two apart.
+- **Link direction.** §9.2.4.1.2's DIR bit is 1 for master-originated frames and 0 for
+  outstation-originated ones. `Session` sends 0. Getting this backwards makes a real master drop
+  every reply as "master frame received for master".
 
 ## CRC verification
 
@@ -37,21 +81,19 @@ init=0x0000, refin=true, refout=true, xorout=0xFFFF, check("123456789")=0xEA82. 
 table-driven implementation (table built from the reflected polynomial 0xA6BC =
 `reflect(0x3D65, 16)`, matching the `refin`/`refout` convention).
 
-No independent DNP3 tooling (`tshark`, `pydnp3`, `opendnp3`) was available in this sandbox
-(checked: no `tshark` binary, no `pydnp3`/`dnp3` Python module, and PyPI package installation was
-not attempted beyond a reachability check — this was a scope/time call, not a blocked network).
-Instead, the CRC was cross-checked against a **from-scratch bit-serial reference implementation**
+The CRC was originally cross-checked against a **from-scratch bit-serial reference implementation**
 written directly from the (width, poly, init, refin, refout, xorout) parameters — an independent
 second implementation of the algorithm (not a port of the Zig table-driven code), which reproduces
 the catalogue check value and agrees with the table-driven implementation on every vector in
 `link.zig`'s test file (empty input, single bytes 0x00/0xFF, short ASCII strings, a 16-byte
 sequential block, a 16-byte repeated block, and two synthetic 8/13-byte link-header-shaped blocks).
-This is a legitimate independent cross-check of the *arithmetic*, but it is not a byte-for-byte
-comparison against a real DNP3 stack's captured wire traffic — that remains open (see Backlog).
+That gap is now closed. `src/goldens.zig` replays real link frames from live opendnp3 sessions
+(see Verification below); opendnp3 built and validated the CRC on every frame this module sent, and
+this module validated the CRC on every frame opendnp3 sent, in both roles. Wireshark's DNP3
+dissector also parsed all 43 captured frames without a single CRC or malformed indication.
 
-Full-frame and full-stack round-trip tests (`link.zig`, `root.zig`) are self-consistency tests
-(encode with this module, decode with this module, assert equality) rather than independent-oracle
-comparisons, and are documented as such.
+The remaining full-stack round-trip tests in `link.zig`/`root.zig` are still self-consistency tests
+(encode with this module, decode with this module, assert equality) and are documented as such.
 
 ## Threat model / out of scope
 
@@ -62,11 +104,21 @@ out-of-bounds reads, across every decode entry point (`link.decodeFrame`,
 `transport.Reassembler.feed`, `application.decodeRequestHeader`/`decodeResponseHeader`,
 `objects.decodeObjectHeader`, every `gNN.VN.decode`).
 
-Out of scope for this pass: event object variations (g2 binary-input-event, g11/g13
-binary-output-event, g22 counter-event, g32 analog-input-event, g42 analog-output-event, and
-relative-time g50v2), file-transfer objects (g70), data-set objects (g85-g88 and related), the
-unsolicited-response confirmation/retry timer state machine, and any actual transport (TCP/serial)
-I/O — this module hands the caller bytes to send/receive, nothing more.
+The outstation widens the attack surface, so its entry points get the same treatment: a request
+fragment that is not FIR+FIN, an object header whose range is inverted or empty, a range or count
+that runs past the database, a count that overruns the fragment, a variation the module does not
+implement, an unassigned function code, and a zero-length fragment all resolve to a response with
+the right IIN bits rather than an error or a crash. Two 20 000-iteration fuzz loops (random
+application fragments, random link frames through a `Session`) assert that whatever comes out is
+always a decodable response fragment.
+
+Out of scope: unsolicited *retry* policy (the fragment builder is here, the timer is the caller's),
+file-transfer objects (g70), data-set objects (g85-g88), device attributes (g0), octet strings
+(g110/g111), time-and-interval (g50v4), analog deadbands (g34), data-link *confirmed* user data on
+the send path (the outstation always sends unconfirmed user data; the FCB/FCV toggle is decoded but
+not enforced), Secure Authentication integration into the outstation (`sa.zig` is a standalone
+codec), a stateful master session type, and any actual transport (TCP/serial) I/O — this module
+hands the caller bytes to send/receive, nothing more.
 
 ## g120 Secure Authentication — SAv2 symmetric core
 
@@ -108,7 +160,7 @@ derivation (the GMAC primitive is provided and KAT-validated; the caller supplie
 
 ## Verification
 
-68 offline tests (`zig build test-dnp3`, green in Debug + ReleaseFast; `zig fmt --check` clean).
+126 offline tests (`zig build test-dnp3`, green in Debug + ReleaseFast; `zig fmt --check` clean).
 Breakdown: `link` (11) — CRC catalogue + KAT vectors, control-octet round-trip, frame round-trips
 (empty/short/multi-block/exact-16-byte-boundary user data), encode/decode error paths including a
 malformed-input sweep; `transport` (9) — transport-octet round-trip, empty-fragment/single-segment/
@@ -127,23 +179,89 @@ AES-GMAC (McGrew GCM test case 1) + compute/verify, constant-time verify accept/
 g120 object-header + v1/v3/v4/v5/v6/v7/v9 codec round-trips, short/garbage decode sweep, session-key
 wrap/unwrap (128- and 256-bit, wrong-update-key reject), the full challenge-response flow
 (build v1 → compute v2 → verify accept; tamper MAC or ASDU → reject), and the `SeqCounter`/
-`KeyExpiry`/`lookupUpdateKey` state helpers; `root` (4) — full link→transport→application
+`KeyExpiry`/`lookupUpdateKey` state helpers; `root` (3) — full link→transport→application
 stack round-trips (single-frame and forced multi-frame >250-byte fragments) and a
-master-builds-READ/outstation-parses + outstation-builds-RESPONSE/master-parses round trip.
+master-builds-READ/outstation-parses + outstation-builds-RESPONSE/master-parses round trip;
+`records` (10) — the layout table's wire lengths against the object library, state-in-flags
+encoding for binary and double-bit, absolute-time and float variations, narrow-variation range
+rejection, packed shapes, a short-record sweep, and the point-kind ↔ group mapping both ways;
+`outstation` (35) — IIN (restart set/cleared, need-time, class bits, overflow latch,
+func-not-supported, object-unknown), READ (class 0 walking all seven point types in order, every
+qualifier shape, variation 0 per-point selection, packed variations, mixed-variation header
+splitting, hostile ranges), events (oldest-first with the right group/variation/index prefix,
+confirm retires, timeout releases, per-class filtering, direct event-group reads with and without
+a count limit, ring overflow semantics), commands (SELECT+OPERATE, timeout, wrong sequence,
+different objects, different index, DIRECT_OPERATE and its no-ack form, all four CROB operations,
+nonexistent and command-less points, analog output bounds, hook veto), DELAY_MEASURE, restart
+(refused and allowed), ENABLE/DISABLE_UNSOLICITED, unsolicited responses, freeze and freeze-clear,
+ASSIGN_CLASS, fragmentation (FIR/FIN/SEQ across a series, and a new request abandoning one),
+`Session` (link-service replies, a request split across transport segments, out-of-order segments,
+bad CRC), hostile input, and two fuzz loops; `goldens` (5) — the captured-session replays.
+
+**Interop (2026-07-23).** The captures in `src/goldens.zig` were taken against **opendnp3**
+(Apache-2.0, `release` branch, built from source in this sandbox) used strictly as a black-box
+peer:
+
+1. *`master-demo` → this outstation*, over a real loopback TCP socket with a byte-moving proxy in
+   between. Startup tasks, integrity scan (class 3/2/1/0), an ad-hoc `ScanRange(g1v2, 0, 3)`,
+   DISABLE_UNSOLICITED, a CROB select+operate that opendnp3 reported as
+   `Received command result w/ summary: SUCCESS`, a class-1 exception scan across an injected
+   process-image change (which returned a g11v2 binary-output event and a g2v2 binary-input event
+   and was CONFIRMed), a COLD_RESTART reported as `Success, Time: 100`, and a second integrity
+   scan after the master cleared the restart IIN with a WRITE of g80v1. No protocol warnings.
+2. *The same master against a fragmented response*: 300 binary inputs and `max_tx_fragment = 400`,
+   so the class-0 scan spans multiple fragments. opendnp3 confirmed each non-final fragment and
+   reassembled the series with no "Response with bad sequence" warnings.
+3. *This module's master-side codecs → opendnp3's `outstation-demo`*, the reverse direction, which
+   cross-checks the pre-existing parsers against a third-party encoder: an unsolicited NULL
+   response, five g1v2 binary inputs, ten g20v1 counters and a g52v2 time delay, all decoded.
+
+Replaying sessions 1 and 2 **in order** reproduces every reply byte for byte, 48-bit event
+timestamps included, because the tests advance the same injected clock the harness did.
+
+Two real interop bugs were found this way and fixed:
+
+- The outstation set the link-layer **DIR bit** as if it were the master. opendnp3 logged
+  `Master frame received for master` / `Frame w/ unknown route, source: 10, dest 1` and dropped
+  every reply. §9.2.4.1.2: DIR is 1 for master-originated frames, 0 for outstation-originated ones.
+- **Continuation fragments reused the request's application sequence number** instead of
+  incrementing it (§5.1.6.2), so opendnp3 logged `Response with bad sequence` and stalled on every
+  multi-fragment response.
+
+**Independent dissection.** The captured session was written to a pcap (Ethernet/IPv4/TCP framing
+so the dissector sees port 20000) and dissected with Wireshark 4.6.4's DNP3 dissector via
+`rawshark` (`tshark` is not installed). All 43 frames dissected cleanly with **zero** malformed or
+expert-error indications, and every field matched this module's decoder: DIR/PRM (1/1 on the
+master's frames, 0/1 on ours), link addresses (10←1 and 1←10), application function codes (READ 1,
+WRITE 2, SELECT 3, OPERATE 4, CONFIRM 0, COLD_RESTART 13, DISABLE_UNSOLICITED 21, RESPONSE 129),
+FIR/FIN/CON/SEQ, `dnp3.al.iin.rst` set before the WRITE of g80v1 and clear after, `dnp3.al.iin.cls1d`
+set exactly on the responses that carried class-1 events, and the object identifiers in each
+class-0 response (0x0102 g1v2, 0x0302 g3v2, 0x0a02 g10v2, 0x1401 g20v1, 0x1501 g21v1, 0x1e01 g30v1,
+0x2801 g40v1) plus 0x0b02/0x0202 on the event response and 0x3402 (g52v2) on the restart reply.
 
 ## Backlog / deferred
 
-- Byte-for-byte cross-check against a real captured DNP3 trace (Wireshark sample capture or a live
-  opendnp3/pydnp3 session) — not done; see "CRC verification" above for what was and wasn't
-  possible in this environment.
-- Event object variations, file transfer, data sets — out of scope by design for this pass, not a
-  gap in what was attempted.
-- g120 Secure Authentication crypto (HMAC/AES-GMAC/key-wrap) — explicitly deferred to a future
-  Fable pass; see the "g120 Secure Authentication hook" section above.
-- A stateful `Master`/`Outstation` session type (confirm/retry timers, unsolicited-response state
-  machine) — not part of this base-protocol pass.
+- **Unsolicited retry policy.** `unsolicited()` builds the fragment and `confirmTimedOut()` puts
+  the events back; the retry timer, the back-off and the "unsolicited allowed after the first
+  integrity poll" convention are the caller's.
+- **File transfer (g70), data sets (g85–g88), device attributes (g0), octet strings (g110/g111),
+  time-and-interval (g50v4), analog deadbands (g34), time-sync with delay compensation
+  (g50v2/g51).**
+- **Secure Authentication integration.** `sa.zig` is a complete SAv2 symmetric codec, but nothing
+  in `outstation.zig` wraps or unwraps a fragment in g120 objects yet.
+- **Data-link confirmed user data on the send path.** The outstation answers RESET_LINK_STATES,
+  TEST_LINK_STATES and REQUEST_LINK_STATUS and accepts both confirmed and unconfirmed user data,
+  but always *sends* unconfirmed user data; the FCB/FCV toggle is decoded, not enforced.
+- **Relative-time event variations (g2v3, g4v3)** are encodable by `records` but the outstation
+  never selects them; it always emits absolute time.
+- **A stateful master session type** (poll scheduler, task queue, response-timeout state machine) —
+  the master role is still the pure codecs.
+- **pydnp3** could not be used as a second peer: its sdist needs a CMake build of a vendored
+  opendnp3 that fails on Python 3.14 in this environment. opendnp3's own C++ demos were built and
+  used instead.
 
 ## Status
 
-`gap · any (pure codec, no I/O) · both (master+outstation via the same pure functions) ·
-reentrant` + deps: none (std only) — canonical source is `pub const meta` in src/root.zig.
+`gap · any (pure codec + outstation, no I/O) · both (master codecs + a stateful outstation) ·
+reentrant codecs, single-owner Outstation/Session` + deps: none (std only) — canonical source is
+`pub const meta` in src/root.zig.

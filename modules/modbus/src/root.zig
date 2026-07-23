@@ -19,13 +19,18 @@
 //!   `Transport` seam (send request ADU, receive reply ADU), so it is fully
 //!   offline-testable. `TcpTransport` is an optional convenience adapter
 //!   over `std.Io.net` for real Modbus TCP connections.
+//! - **Server** (`server.Server`): the slave side, a pure
+//!   request-frame-to-reply-frame responder over a caller-owned point
+//!   database (`server.DataBank`) with explicit per-area address windows.
+//!   It answers every function code the client speaks plus Read Exception
+//!   Status (0x07), Diagnostics (0x08) and Report Slave ID (0x11), emits
+//!   spec-correct exception responses, and models both unit-id conventions:
+//!   an RTU broadcast (address 0) applies the write and stays silent, a TCP
+//!   unit 0/255 addresses the directly-connected device.
 //!
 //! Malformed, short, or corrupt reply bytes never panic — every decode path
 //! returns a typed error (short frame, bad CRC, transaction id / unit /
 //! function mismatch, malformed byte counts, exception codes).
-//!
-//! Broadcast (unit 0, no reply) and server-side (slave) processing are out
-//! of scope for now; the PDU codec is reusable for a future server.
 //!
 //! Provenance: clean-room from the public Modbus Application Protocol
 //! Specification V1.1b3 and Modbus over Serial Line Specification V1.02
@@ -37,12 +42,28 @@
 const std = @import("std");
 
 pub const meta = .{
-    .platform = .any, // codec + client are portable; TcpTransport uses std.Io.net
-    .role = .client, // master + reusable wire codec
-    .concurrency = .single_owner, // Client tracks the TCP transaction id
+    .platform = .any, // codec + client + server are portable; TcpTransport uses std.Io.net
+    .role = .both, // master (Client) + slave (server.Server) + shared wire codec
+    .concurrency = .single_owner, // Client tracks the TCP transaction id; Server owns its data bank
     .model_after = "Modbus Application Protocol V1.1b3 / libmodbus (behavior)",
     .deps = .{}, // std only
 };
+
+/// The slave (server) side: a pure request-to-reply responder over a
+/// caller-owned point database. See `server.zig`.
+pub const server = @import("server.zig");
+
+/// Byte-exact wire goldens for both roles, including frames captured from a
+/// live pymodbus master driving `server.Server`. See `goldens.zig`.
+pub const goldens = @import("goldens.zig");
+
+// Pull the submodules' tests into this module's test binary — a bare
+// re-export does NOT drag in the imported file's `test` blocks (the
+// dark-tests rule; see CONVENTIONS.md §6.3).
+test {
+    _ = server;
+    _ = goldens;
+}
 
 // ── wire constants ──────────────────────────────────────────────────────────
 
@@ -61,6 +82,11 @@ pub const limits = struct {
 };
 
 /// Public function codes implemented by this module.
+///
+/// The first nine are the data-access codes both the `Client` (master) and
+/// the `Server` (slave) speak. The last three are server-side only: the
+/// `Server` answers them, the `Client` has no encoder for them (a master that
+/// wants them can build the 1-3 byte PDU by hand and use `Client`'s framing).
 pub const FunctionCode = enum(u8) {
     read_coils = 0x01,
     read_discrete_inputs = 0x02,
@@ -68,6 +94,9 @@ pub const FunctionCode = enum(u8) {
     read_input_registers = 0x04,
     write_single_coil = 0x05,
     write_single_register = 0x06,
+    read_exception_status = 0x07,
+    diagnostics = 0x08,
+    report_slave_id = 0x11,
     write_multiple_coils = 0x0F,
     write_multiple_registers = 0x10,
     read_write_multiple_registers = 0x17,
@@ -1160,5 +1189,5 @@ test "garbage frames never panic" {
 
 test "meta is well-formed" {
     try testing.expectEqual(.any, meta.platform);
-    try testing.expectEqual(.client, meta.role);
+    try testing.expectEqual(.both, meta.role);
 }
