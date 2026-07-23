@@ -696,12 +696,18 @@ project git history).
   opcua      — clean-room from OPC 10000-6 (OPC UA Binary encoding + the
                opc.tcp transport) and OPC 10000-4 (Services); both are open,
                royalty-free specifications published by the OPC Foundation.
-               Design ref (behavioral/structural only, no source consulted or
-               copied): open62541 (MPL-2.0; module/layering shape) and
-               node-opcua (MIT; client API shape). SecurityMode=None only —
-               no crypto in this module; the secure-channel signing/encryption
-               layer is a separate later module (F9) depending on the `rsa`
-               module.
+               Design ref (behavioral/structural only, no source copied):
+               open62541 (MPL-2.0; module/layering shape) and node-opcua
+               (MIT; client API shape). For the server side, open62541's
+               EXAMPLE sources (examples/client.c) were read once to learn
+               which services each demo binary exercises and which NodeIds
+               it addresses — behaviour and API shape only, nothing copied,
+               and not used at build or run time; its stock binaries were
+               otherwise a black-box live peer. The OPC Foundation's
+               StatusCode.csv / NodeIds.csv / Opc.Ua.Types.bsd (MIT
+               License 1.00) supply constants and field order. Client-side
+               security is SecurityPolicy#None or Basic256Sha256 via the
+               `rsa` module; the SERVER side is SecurityPolicy#None only.
 
   dnssec     — clean-room from the DNSSEC RFCs (4033/4034/4035 core, 5155
                NSEC3, 6605 ECDSA, 8080 Ed25519, 1982 serial arithmetic) — all

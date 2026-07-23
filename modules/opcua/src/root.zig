@@ -19,10 +19,10 @@ const std = @import("std");
 
 pub const meta = .{
     .platform = .any, // pure codec + a caller-supplied stream; no socket of its own
-    .role = .client,
-    .concurrency = .reentrant, // no shared state; Connection/Encoder/Decoder are caller-owned
-    .model_after = "OPC 10000-6 (OPC UA Binary + opc.tcp); structure ref open62541 (MPL-2.0) / node-opcua (MIT) — behavioral only, no source copied",
-    .deps = .{"rsa"}, // Basic256Sha256 secure-channel crypto (security.zig)
+    .role = .both, // client (this file) + server/device (`server.zig` over `nodestore.zig`)
+    .concurrency = .single_owner, // caller-owned state, no locks: one loop owns a Server + its Connections
+    .model_after = "OPC 10000-6 (OPC UA Binary + opc.tcp) + OPC 10000-4 (Services); structure ref open62541 (MPL-2.0) / node-opcua (MIT) — behavioral only, no source copied",
+    .deps = .{"rsa"}, // Basic256Sha256 secure-channel crypto (security.zig, client-side)
 };
 
 /// The built-in type codec (OPC 10000-6 §5.2): `Encoder`/`Decoder` over a
@@ -51,6 +51,19 @@ pub const services = @import("services.zig");
 /// to `null`.
 pub const security = @import("security.zig");
 
+/// The server-side address space (OPC 10000-3): a caller-owned node store with
+/// the standard node classes, their attributes and references, plus a seeded
+/// namespace-0 skeleton (`addStandardNodes`) a real client can browse from
+/// `RootFolder` down to a user variable.
+pub const nodestore = @import("nodestore.zig");
+
+/// The server (device) side of the protocol: the opc.tcp connection state
+/// machine (HEL/ACK negotiation, OPN/CLO, chunking with explicit limits),
+/// sessions, the service handlers over `nodestore`, and the time-injected
+/// subscription/Publish state machine. Transport-agnostic and thread-free —
+/// the caller drives it with bytes and a clock.
+pub const server = @import("server.zig");
+
 // Pull the submodules' tests into this module's test binary — a bare
 // re-export does NOT drag in the imported file's `test` blocks (the
 // dark-tests rule; see CONVENTIONS.md §6.3).
@@ -59,6 +72,9 @@ test {
     _ = transport;
     _ = services;
     _ = security;
+    _ = nodestore;
+    _ = server;
+    _ = @import("server_interop.zig");
 }
 
 // ── F2: Secure Channel (SecurityPolicy#None) ────────────────────────────────
@@ -257,11 +273,13 @@ pub const Session = struct {
         session.server_endpoints = response.server_endpoints;
         session.server_nonce = response.server_nonce; // kept for `activate`'s clientSignature
         // response_header/session_id/authentication_token/
-        // server_certificate carry no owned memory we need past this point
-        // except server_endpoints + server_nonce (kept above) — free the
-        // rest now.
+        // server_certificate/server_software_certificates/server_signature
+        // carry no owned memory we need past this point except
+        // server_endpoints + server_nonce (kept above) — free the rest now.
         services.freeResponseHeader(allocator, response.response_header);
         if (response.server_certificate) |c| allocator.free(c);
+        services.freeSignedSoftwareCertificateArray(allocator, response.server_software_certificates);
+        services.freeSignatureData(allocator, response.server_signature);
         return session;
     }
 
@@ -369,9 +387,19 @@ pub const Session = struct {
         services.freeCloseSessionResponse(session.allocator, response);
     }
 
-    /// Free `server_endpoints` (owned since `create`). Safe to call even if
-    /// `create` failed partway (never populated) or was never called.
+    /// Free everything `create` kept out of the `CreateSessionResponse`:
+    /// `server_endpoints`, `server_nonce`, and the two NodeIds
+    /// (`session_id`/`authentication_token`) — the latter own memory whenever
+    /// the server issues a String/Opaque identifier rather than a numeric one
+    /// (this module's own `server.zig` issues a 32-byte opaque
+    /// AuthenticationToken, which is what caught the omission). Safe to call
+    /// even if `create` failed partway (never populated) or was never called:
+    /// the default `null_node_id` is numeric and owns nothing.
     pub fn deinit(session: *Session) void {
+        encoding.freeNodeId(session.allocator, session.session_id);
+        session.session_id = services.null_node_id;
+        encoding.freeNodeId(session.allocator, session.authentication_token);
+        session.authentication_token = services.null_node_id;
         if (session.server_endpoints) |endpoints| {
             for (endpoints) |ep| services.freeEndpointDescription(session.allocator, ep);
             session.allocator.free(endpoints);

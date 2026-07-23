@@ -151,6 +151,94 @@ pub const type_id = struct {
     pub const republish_response = n0(835);
     pub const delete_subscriptions_request = n0(847);
     pub const delete_subscriptions_response = n0(850);
+
+    // ── discovery + the services the server side answers that the client
+    // half never sends (same `Schema/NodeIds.csv` source as above).
+    pub const find_servers_request = n0(422);
+    pub const find_servers_response = n0(425);
+    pub const get_endpoints_request = n0(428);
+    pub const get_endpoints_response = n0(431);
+    pub const translate_browse_paths_to_node_ids_request = n0(554);
+    pub const translate_browse_paths_to_node_ids_response = n0(557);
+    pub const modify_monitored_items_request = n0(763);
+    pub const modify_monitored_items_response = n0(766);
+    pub const set_monitoring_mode_request = n0(769);
+    pub const set_monitoring_mode_response = n0(772);
+    /// The identity-token `ExtensionObject` TypeIds an `ActivateSessionRequest.
+    /// UserIdentityToken` can carry (§7.36).
+    pub const user_name_identity_token = n0(324);
+    pub const x509_identity_token = n0(327);
+    pub const issued_identity_token = n0(940);
+};
+
+/// The StatusCodes this module names (OPC Foundation UA-Nodeset
+/// `Schema/StatusCode.csv`, MIT License 1.00 — fetched directly, same
+/// provenance as `type_id`). Only the ones the client maps or the server
+/// answers with are listed; a code absent here is still a perfectly valid
+/// `encoding.StatusCode` on the wire.
+pub const status = struct {
+    pub const good: encoding.StatusCode = 0;
+    pub const bad_internal_error: encoding.StatusCode = 0x8002_0000;
+    pub const bad_out_of_memory: encoding.StatusCode = 0x8003_0000;
+    pub const bad_encoding_error: encoding.StatusCode = 0x8006_0000;
+    pub const bad_decoding_error: encoding.StatusCode = 0x8007_0000;
+    pub const bad_encoding_limits_exceeded: encoding.StatusCode = 0x8008_0000;
+    pub const bad_service_unsupported: encoding.StatusCode = 0x800B_0000;
+    pub const bad_nothing_to_do: encoding.StatusCode = 0x800F_0000;
+    pub const bad_too_many_operations: encoding.StatusCode = 0x8010_0000;
+    pub const bad_user_access_denied: encoding.StatusCode = 0x801F_0000;
+    pub const bad_identity_token_invalid: encoding.StatusCode = 0x8020_0000;
+    pub const bad_identity_token_rejected: encoding.StatusCode = 0x8021_0000;
+    pub const bad_secure_channel_id_invalid: encoding.StatusCode = 0x8022_0000;
+    pub const bad_session_id_invalid: encoding.StatusCode = 0x8025_0000;
+    pub const bad_session_closed: encoding.StatusCode = 0x8026_0000;
+    pub const bad_session_not_activated: encoding.StatusCode = 0x8027_0000;
+    pub const bad_subscription_id_invalid: encoding.StatusCode = 0x8028_0000;
+    pub const bad_request_header_invalid: encoding.StatusCode = 0x802A_0000;
+    pub const bad_timestamps_to_return_invalid: encoding.StatusCode = 0x802B_0000;
+    pub const bad_node_id_invalid: encoding.StatusCode = 0x8033_0000;
+    pub const bad_node_id_unknown: encoding.StatusCode = 0x8034_0000;
+    pub const bad_attribute_id_invalid: encoding.StatusCode = 0x8035_0000;
+    pub const bad_index_range_invalid: encoding.StatusCode = 0x8036_0000;
+    pub const bad_data_encoding_invalid: encoding.StatusCode = 0x8038_0000;
+    pub const bad_not_readable: encoding.StatusCode = 0x803A_0000;
+    pub const bad_not_writable: encoding.StatusCode = 0x803B_0000;
+    pub const bad_not_supported: encoding.StatusCode = 0x803D_0000;
+    pub const bad_not_implemented: encoding.StatusCode = 0x8040_0000;
+    pub const bad_monitoring_mode_invalid: encoding.StatusCode = 0x8041_0000;
+    pub const bad_monitored_item_id_invalid: encoding.StatusCode = 0x8042_0000;
+    pub const bad_monitored_item_filter_unsupported: encoding.StatusCode = 0x8044_0000;
+    pub const bad_continuation_point_invalid: encoding.StatusCode = 0x804A_0000;
+    pub const bad_no_continuation_points: encoding.StatusCode = 0x804B_0000;
+    pub const bad_reference_type_id_invalid: encoding.StatusCode = 0x804C_0000;
+    pub const bad_browse_direction_invalid: encoding.StatusCode = 0x804D_0000;
+    pub const bad_view_id_unknown: encoding.StatusCode = 0x806B_0000;
+    pub const bad_security_mode_rejected: encoding.StatusCode = 0x8054_0000;
+    pub const bad_security_policy_rejected: encoding.StatusCode = 0x8055_0000;
+    pub const bad_too_many_sessions: encoding.StatusCode = 0x8056_0000;
+    pub const bad_no_match: encoding.StatusCode = 0x806F_0000;
+    pub const bad_type_mismatch: encoding.StatusCode = 0x8074_0000;
+    pub const bad_method_invalid: encoding.StatusCode = 0x8075_0000;
+    pub const bad_arguments_missing: encoding.StatusCode = 0x8076_0000;
+    pub const bad_too_many_subscriptions: encoding.StatusCode = 0x8077_0000;
+    pub const bad_too_many_publish_requests: encoding.StatusCode = 0x8078_0000;
+    pub const bad_no_subscription: encoding.StatusCode = 0x8079_0000;
+    pub const bad_sequence_number_unknown: encoding.StatusCode = 0x807A_0000;
+    pub const bad_message_not_available: encoding.StatusCode = 0x807B_0000;
+    pub const bad_timeout: encoding.StatusCode = 0x800A_0000;
+    pub const bad_invalid_argument: encoding.StatusCode = 0x80AB_0000;
+    pub const bad_invalid_state: encoding.StatusCode = 0x80AF_0000;
+    pub const bad_not_executable: encoding.StatusCode = 0x8111_0000;
+    pub const bad_too_many_monitored_items: encoding.StatusCode = 0x80DB_0000;
+    pub const bad_too_many_arguments: encoding.StatusCode = 0x80E5_0000;
+    pub const bad_protocol_version_unsupported: encoding.StatusCode = 0x80BE_0000;
+    // opc.tcp transport-level codes (§7.1.4's `Error` message body).
+    pub const bad_tcp_message_type_invalid: encoding.StatusCode = 0x807E_0000;
+    pub const bad_tcp_secure_channel_unknown: encoding.StatusCode = 0x807F_0000;
+    pub const bad_tcp_message_too_large: encoding.StatusCode = 0x8080_0000;
+    pub const bad_tcp_not_enough_resources: encoding.StatusCode = 0x8081_0000;
+    pub const bad_tcp_internal_error: encoding.StatusCode = 0x8082_0000;
+    pub const bad_tcp_endpoint_url_invalid: encoding.StatusCode = 0x8083_0000;
 };
 
 /// `AttributeId` (OPC Foundation UA-Nodeset `Schema/AttributeIds.csv`, MIT
@@ -265,6 +353,17 @@ fn freeOptStr(a: std.mem.Allocator, s: ?[]const u8) void {
     if (s) |bytes| a.free(bytes);
 }
 
+/// Skip one Int32-length-prefixed String/ByteString without allocating,
+/// returning the bytes it covered (`null` for the wire's `-1` null form) —
+/// used by `Channel.recvService` to step over an
+/// `AsymmetricAlgorithmSecurityHeader`'s three fields per chunk.
+fn skipLengthPrefixed(r: *std.Io.Reader) encoding.DecodeError!?[]const u8 {
+    const len = try r.takeInt(i32, .little);
+    if (len == -1) return null;
+    if (len < -1) return error.BadLength;
+    return try r.take(@intCast(len));
+}
+
 fn freeStringArray(a: std.mem.Allocator, arr: ?[]const ?[]const u8) void {
     if (arr) |items| {
         for (items) |s| freeOptStr(a, s);
@@ -332,6 +431,13 @@ pub fn decodeRequestHeader(d: *encoding.Decoder) encoding.DecodeError!RequestHea
 }
 
 pub fn freeRequestHeader(a: std.mem.Allocator, v: RequestHeader) void {
+    // The AuthenticationToken owns memory whenever the server issued a
+    // String/Opaque identifier — which is the normal case (this module's own
+    // `server.zig` issues a 32-byte opaque token). Only a *decoded*
+    // RequestHeader should be handed here; the ones this module's client
+    // builds borrow their fields and are never freed.
+    encoding.freeNodeId(a, v.authentication_token);
+    encoding.freeNodeId(a, v.additional_header.type_id);
     freeOptStr(a, v.audit_entry_id);
     if (v.additional_header.body.len != 0) a.free(v.additional_header.body);
 }
@@ -453,6 +559,13 @@ pub fn encodeSignedSoftwareCertificate(e: *encoding.Encoder, v: SignedSoftwareCe
 
 pub fn decodeSignedSoftwareCertificate(d: *encoding.Decoder) encoding.DecodeError!SignedSoftwareCertificate {
     return .{ .certificate_data = try d.decodeByteString(), .signature = try d.decodeByteString() };
+}
+
+/// Public alias of the internal software-certificate array free — a caller
+/// that keeps part of a `CreateSessionResponse` (as `root.Session.create`
+/// does) needs to free the rest field by field.
+pub fn freeSignedSoftwareCertificateArray(a: std.mem.Allocator, arr: ?[]const SignedSoftwareCertificate) void {
+    freeSoftwareCertArray(a, arr);
 }
 
 fn freeSoftwareCertArray(a: std.mem.Allocator, arr: ?[]const SignedSoftwareCertificate) void {
@@ -742,14 +855,14 @@ pub fn freeCreateSessionRequest(a: std.mem.Allocator, v: CreateSessionRequest) v
     freeOptStr(a, v.client_certificate);
 }
 
-/// `ServerSoftwareCertificates`/`ServerSignature`/`MaxRequestMessageSize`
-/// (the fields after `ServerEndpoints`) are intentionally not modeled: F2
-/// never signs anything (SecurityMode=None) and nothing downstream needs
-/// them. `decodeCreateSessionResponse` simply stops reading after
-/// `server_endpoints` — harmless, since the reader is a `.fixed` view over
-/// an already fully-reassembled message (unread trailing bytes are not a
-/// framing bug, just ignored). `encodeCreateSessionResponse` mirrors that
-/// same subset for round-trip testing.
+/// The trailing three fields (`ServerSoftwareCertificates`,
+/// `ServerSignature`, `MaxRequestMessageSize`) carry nothing this module's
+/// SecurityMode=None client acts on — but they are *structurally mandatory*
+/// on the wire: a third-party client decoding a response that stops after
+/// `ServerEndpoints` hits end-of-buffer. They therefore have defaults (a
+/// client constructing this struct can keep ignoring them) and are always
+/// encoded/decoded (the server side must emit them; the client side must
+/// tolerate a real server's).
 pub const CreateSessionResponse = struct {
     response_header: ResponseHeader,
     session_id: encoding.NodeId,
@@ -758,6 +871,10 @@ pub const CreateSessionResponse = struct {
     server_nonce: ?[]const u8,
     server_certificate: ?[]const u8,
     server_endpoints: ?[]const EndpointDescription,
+    server_software_certificates: ?[]const SignedSoftwareCertificate = null,
+    server_signature: SignatureData = .{ .algorithm = null, .signature = null },
+    /// 0 = no limit (OPC 10000-4 §5.6.2.2).
+    max_request_message_size: u32 = 0,
 };
 
 pub fn encodeCreateSessionResponse(e: *encoding.Encoder, v: CreateSessionResponse) encoding.EncodeError!void {
@@ -768,6 +885,9 @@ pub fn encodeCreateSessionResponse(e: *encoding.Encoder, v: CreateSessionRespons
     try e.encodeByteString(v.server_nonce);
     try e.encodeByteString(v.server_certificate);
     try encodeArray(e, EndpointDescription, v.server_endpoints, encodeEndpointDescription);
+    try encodeArray(e, SignedSoftwareCertificate, v.server_software_certificates, encodeSignedSoftwareCertificate);
+    try encodeSignatureData(e, v.server_signature);
+    try e.encodeUInt32(v.max_request_message_size);
 }
 
 pub fn decodeCreateSessionResponse(d: *encoding.Decoder) encoding.DecodeError!CreateSessionResponse {
@@ -779,6 +899,9 @@ pub fn decodeCreateSessionResponse(d: *encoding.Decoder) encoding.DecodeError!Cr
         .server_nonce = try d.decodeByteString(),
         .server_certificate = try d.decodeByteString(),
         .server_endpoints = try decodeArray(d, EndpointDescription, decodeEndpointDescription),
+        .server_software_certificates = try decodeArray(d, SignedSoftwareCertificate, decodeSignedSoftwareCertificate),
+        .server_signature = try decodeSignatureData(d),
+        .max_request_message_size = try d.decodeUInt32(),
     };
 }
 
@@ -787,6 +910,8 @@ pub fn freeCreateSessionResponse(a: std.mem.Allocator, v: CreateSessionResponse)
     freeOptStr(a, v.server_nonce);
     freeOptStr(a, v.server_certificate);
     freeEndpointArray(a, v.server_endpoints);
+    freeSoftwareCertArray(a, v.server_software_certificates);
+    freeSignatureData(a, v.server_signature);
 }
 
 // ── ActivateSession (§5.6.3) ─────────────────────────────────────────────────
@@ -2266,6 +2391,431 @@ pub fn freeRepublishResponse(a: std.mem.Allocator, v: RepublishResponse) void {
     freeNotificationMessage(a, v.notification_message);
 }
 
+// ── Discovery: GetEndpoints (§5.4.4) / FindServers (§5.4.2) ─────────────────
+// Answered by the server side from its configured endpoint list, and callable
+// from the client side *before* a session exists (both services are explicitly
+// session-less — OPC 10000-4 §5.4).
+
+pub const GetEndpointsRequest = struct {
+    request_header: RequestHeader,
+    endpoint_url: ?[]const u8,
+    locale_ids: ?[]const ?[]const u8,
+    profile_uris: ?[]const ?[]const u8,
+};
+
+pub fn encodeGetEndpointsRequest(e: *encoding.Encoder, v: GetEndpointsRequest) encoding.EncodeError!void {
+    try encodeRequestHeader(e, v.request_header);
+    try e.encodeString(v.endpoint_url);
+    try encodeArray(e, ?[]const u8, v.locale_ids, encodeStringItem);
+    try encodeArray(e, ?[]const u8, v.profile_uris, encodeStringItem);
+}
+
+pub fn decodeGetEndpointsRequest(d: *encoding.Decoder) encoding.DecodeError!GetEndpointsRequest {
+    return .{
+        .request_header = try decodeRequestHeader(d),
+        .endpoint_url = try d.decodeString(),
+        .locale_ids = try decodeArray(d, ?[]const u8, decodeStringItem),
+        .profile_uris = try decodeArray(d, ?[]const u8, decodeStringItem),
+    };
+}
+
+pub fn freeGetEndpointsRequest(a: std.mem.Allocator, v: GetEndpointsRequest) void {
+    freeRequestHeader(a, v.request_header);
+    freeOptStr(a, v.endpoint_url);
+    freeStringArray(a, v.locale_ids);
+    freeStringArray(a, v.profile_uris);
+}
+
+pub const GetEndpointsResponse = struct {
+    response_header: ResponseHeader,
+    endpoints: ?[]const EndpointDescription,
+};
+
+pub fn encodeGetEndpointsResponse(e: *encoding.Encoder, v: GetEndpointsResponse) encoding.EncodeError!void {
+    try encodeResponseHeader(e, v.response_header);
+    try encodeArray(e, EndpointDescription, v.endpoints, encodeEndpointDescription);
+}
+
+pub fn decodeGetEndpointsResponse(d: *encoding.Decoder) encoding.DecodeError!GetEndpointsResponse {
+    return .{
+        .response_header = try decodeResponseHeader(d),
+        .endpoints = try decodeArray(d, EndpointDescription, decodeEndpointDescription),
+    };
+}
+
+pub fn freeGetEndpointsResponse(a: std.mem.Allocator, v: GetEndpointsResponse) void {
+    freeResponseHeader(a, v.response_header);
+    freeEndpointArray(a, v.endpoints);
+}
+
+pub const FindServersRequest = struct {
+    request_header: RequestHeader,
+    endpoint_url: ?[]const u8,
+    locale_ids: ?[]const ?[]const u8,
+    server_uris: ?[]const ?[]const u8,
+};
+
+pub fn encodeFindServersRequest(e: *encoding.Encoder, v: FindServersRequest) encoding.EncodeError!void {
+    try encodeRequestHeader(e, v.request_header);
+    try e.encodeString(v.endpoint_url);
+    try encodeArray(e, ?[]const u8, v.locale_ids, encodeStringItem);
+    try encodeArray(e, ?[]const u8, v.server_uris, encodeStringItem);
+}
+
+pub fn decodeFindServersRequest(d: *encoding.Decoder) encoding.DecodeError!FindServersRequest {
+    return .{
+        .request_header = try decodeRequestHeader(d),
+        .endpoint_url = try d.decodeString(),
+        .locale_ids = try decodeArray(d, ?[]const u8, decodeStringItem),
+        .server_uris = try decodeArray(d, ?[]const u8, decodeStringItem),
+    };
+}
+
+pub fn freeFindServersRequest(a: std.mem.Allocator, v: FindServersRequest) void {
+    freeRequestHeader(a, v.request_header);
+    freeOptStr(a, v.endpoint_url);
+    freeStringArray(a, v.locale_ids);
+    freeStringArray(a, v.server_uris);
+}
+
+pub const FindServersResponse = struct {
+    response_header: ResponseHeader,
+    servers: ?[]const ApplicationDescription,
+};
+
+pub fn encodeFindServersResponse(e: *encoding.Encoder, v: FindServersResponse) encoding.EncodeError!void {
+    try encodeResponseHeader(e, v.response_header);
+    try encodeArray(e, ApplicationDescription, v.servers, encodeApplicationDescription);
+}
+
+pub fn decodeFindServersResponse(d: *encoding.Decoder) encoding.DecodeError!FindServersResponse {
+    return .{
+        .response_header = try decodeResponseHeader(d),
+        .servers = try decodeArray(d, ApplicationDescription, decodeApplicationDescription),
+    };
+}
+
+pub fn freeFindServersResponse(a: std.mem.Allocator, v: FindServersResponse) void {
+    freeResponseHeader(a, v.response_header);
+    if (v.servers) |items| {
+        for (items) |ad| freeApplicationDescription(a, ad);
+        a.free(items);
+    }
+}
+
+// ── UserNameIdentityToken (§7.36.4) ─────────────────────────────────────────
+
+/// The user-name/password identity token an `ActivateSessionRequest` carries
+/// inside its `UserIdentityToken` ExtensionObject. `password` is a ByteString
+/// of UTF-8 bytes; at `SecurityPolicy#None` (`encryption_algorithm == null`)
+/// it travels **in the clear** — see this module's SPEC threat model.
+pub const UserNameIdentityToken = struct {
+    policy_id: ?[]const u8,
+    user_name: ?[]const u8,
+    password: ?[]const u8,
+    encryption_algorithm: ?[]const u8,
+};
+
+pub fn encodeUserNameIdentityToken(e: *encoding.Encoder, v: UserNameIdentityToken) encoding.EncodeError!void {
+    try e.encodeString(v.policy_id);
+    try e.encodeString(v.user_name);
+    try e.encodeByteString(v.password);
+    try e.encodeString(v.encryption_algorithm);
+}
+
+pub fn decodeUserNameIdentityToken(d: *encoding.Decoder) encoding.DecodeError!UserNameIdentityToken {
+    return .{
+        .policy_id = try d.decodeString(),
+        .user_name = try d.decodeString(),
+        .password = try d.decodeByteString(),
+        .encryption_algorithm = try d.decodeString(),
+    };
+}
+
+pub fn freeUserNameIdentityToken(a: std.mem.Allocator, v: UserNameIdentityToken) void {
+    freeOptStr(a, v.policy_id);
+    freeOptStr(a, v.user_name);
+    freeOptStr(a, v.password);
+    freeOptStr(a, v.encryption_algorithm);
+}
+
+// ── TranslateBrowsePathsToNodeIds (§5.8.4) ──────────────────────────────────
+
+pub const RelativePathElement = struct {
+    reference_type_id: encoding.NodeId,
+    is_inverse: bool,
+    include_subtypes: bool,
+    target_name: encoding.QualifiedName,
+};
+
+pub fn encodeRelativePathElement(e: *encoding.Encoder, v: RelativePathElement) encoding.EncodeError!void {
+    try e.encodeNodeId(v.reference_type_id);
+    try e.encodeBoolean(v.is_inverse);
+    try e.encodeBoolean(v.include_subtypes);
+    try e.encodeQualifiedName(v.target_name);
+}
+
+pub fn decodeRelativePathElement(d: *encoding.Decoder) encoding.DecodeError!RelativePathElement {
+    return .{
+        .reference_type_id = try d.decodeNodeId(),
+        .is_inverse = try d.decodeBoolean(),
+        .include_subtypes = try d.decodeBoolean(),
+        .target_name = try d.decodeQualifiedName(),
+    };
+}
+
+pub const RelativePath = struct {
+    elements: ?[]const RelativePathElement,
+};
+
+pub fn encodeRelativePath(e: *encoding.Encoder, v: RelativePath) encoding.EncodeError!void {
+    try encodeArray(e, RelativePathElement, v.elements, encodeRelativePathElement);
+}
+
+pub fn decodeRelativePath(d: *encoding.Decoder) encoding.DecodeError!RelativePath {
+    return .{ .elements = try decodeArray(d, RelativePathElement, decodeRelativePathElement) };
+}
+
+pub const BrowsePath = struct {
+    starting_node: encoding.NodeId,
+    relative_path: RelativePath,
+};
+
+pub fn encodeBrowsePath(e: *encoding.Encoder, v: BrowsePath) encoding.EncodeError!void {
+    try e.encodeNodeId(v.starting_node);
+    try encodeRelativePath(e, v.relative_path);
+}
+
+pub fn decodeBrowsePath(d: *encoding.Decoder) encoding.DecodeError!BrowsePath {
+    return .{ .starting_node = try d.decodeNodeId(), .relative_path = try decodeRelativePath(d) };
+}
+
+pub const BrowsePathTarget = struct {
+    target_id: encoding.ExpandedNodeId,
+    /// `0xFFFF_FFFF` = "the whole path was resolved" (OPC 10000-4 §7.7).
+    remaining_path_index: u32,
+};
+
+pub fn encodeBrowsePathTarget(e: *encoding.Encoder, v: BrowsePathTarget) encoding.EncodeError!void {
+    try e.encodeExpandedNodeId(v.target_id);
+    try e.encodeUInt32(v.remaining_path_index);
+}
+
+pub fn decodeBrowsePathTarget(d: *encoding.Decoder) encoding.DecodeError!BrowsePathTarget {
+    return .{ .target_id = try d.decodeExpandedNodeId(), .remaining_path_index = try d.decodeUInt32() };
+}
+
+pub const BrowsePathResult = struct {
+    status_code: encoding.StatusCode,
+    targets: ?[]const BrowsePathTarget,
+};
+
+pub fn encodeBrowsePathResult(e: *encoding.Encoder, v: BrowsePathResult) encoding.EncodeError!void {
+    try e.encodeStatusCode(v.status_code);
+    try encodeArray(e, BrowsePathTarget, v.targets, encodeBrowsePathTarget);
+}
+
+pub fn decodeBrowsePathResult(d: *encoding.Decoder) encoding.DecodeError!BrowsePathResult {
+    return .{
+        .status_code = try d.decodeStatusCode(),
+        .targets = try decodeArray(d, BrowsePathTarget, decodeBrowsePathTarget),
+    };
+}
+
+pub const TranslateBrowsePathsToNodeIdsRequest = struct {
+    request_header: RequestHeader,
+    browse_paths: ?[]const BrowsePath,
+};
+
+pub fn encodeTranslateBrowsePathsToNodeIdsRequest(e: *encoding.Encoder, v: TranslateBrowsePathsToNodeIdsRequest) encoding.EncodeError!void {
+    try encodeRequestHeader(e, v.request_header);
+    try encodeArray(e, BrowsePath, v.browse_paths, encodeBrowsePath);
+}
+
+pub fn decodeTranslateBrowsePathsToNodeIdsRequest(d: *encoding.Decoder) encoding.DecodeError!TranslateBrowsePathsToNodeIdsRequest {
+    return .{
+        .request_header = try decodeRequestHeader(d),
+        .browse_paths = try decodeArray(d, BrowsePath, decodeBrowsePath),
+    };
+}
+
+pub const TranslateBrowsePathsToNodeIdsResponse = struct {
+    response_header: ResponseHeader,
+    results: ?[]const BrowsePathResult,
+    diagnostic_infos: ?[]const encoding.DiagnosticInfo,
+};
+
+pub fn encodeTranslateBrowsePathsToNodeIdsResponse(e: *encoding.Encoder, v: TranslateBrowsePathsToNodeIdsResponse) encoding.EncodeError!void {
+    try encodeResponseHeader(e, v.response_header);
+    try encodeArray(e, BrowsePathResult, v.results, encodeBrowsePathResult);
+    try encodeArray(e, encoding.DiagnosticInfo, v.diagnostic_infos, encoding.Encoder.encodeDiagnosticInfo);
+}
+
+pub fn decodeTranslateBrowsePathsToNodeIdsResponse(d: *encoding.Decoder) encoding.DecodeError!TranslateBrowsePathsToNodeIdsResponse {
+    return .{
+        .response_header = try decodeResponseHeader(d),
+        .results = try decodeArray(d, BrowsePathResult, decodeBrowsePathResult),
+        .diagnostic_infos = try decodeArray(d, encoding.DiagnosticInfo, encoding.Decoder.decodeDiagnosticInfo),
+    };
+}
+
+pub fn freeTranslateBrowsePathsToNodeIdsResponse(a: std.mem.Allocator, v: TranslateBrowsePathsToNodeIdsResponse) void {
+    freeResponseHeader(a, v.response_header);
+    if (v.results) |results| {
+        for (results) |r| {
+            if (r.targets) |targets| {
+                for (targets) |t| encoding.freeExpandedNodeId(a, t.target_id);
+                a.free(targets);
+            }
+        }
+        a.free(results);
+    }
+    freeDiagnosticInfoArray(a, v.diagnostic_infos);
+}
+
+// ── ModifyMonitoredItems (§5.12.3) / SetMonitoringMode (§5.12.4) ────────────
+
+pub const MonitoredItemModifyRequest = struct {
+    monitored_item_id: u32,
+    requested_parameters: MonitoringParameters,
+};
+
+pub fn encodeMonitoredItemModifyRequest(e: *encoding.Encoder, v: MonitoredItemModifyRequest) encoding.EncodeError!void {
+    try e.encodeUInt32(v.monitored_item_id);
+    try encodeMonitoringParameters(e, v.requested_parameters);
+}
+
+pub fn decodeMonitoredItemModifyRequest(d: *encoding.Decoder) encoding.DecodeError!MonitoredItemModifyRequest {
+    return .{
+        .monitored_item_id = try d.decodeUInt32(),
+        .requested_parameters = try decodeMonitoringParameters(d),
+    };
+}
+
+pub const MonitoredItemModifyResult = struct {
+    status_code: encoding.StatusCode,
+    revised_sampling_interval: f64,
+    revised_queue_size: u32,
+    filter_result: encoding.ExtensionObject,
+};
+
+pub fn encodeMonitoredItemModifyResult(e: *encoding.Encoder, v: MonitoredItemModifyResult) encoding.EncodeError!void {
+    try e.encodeStatusCode(v.status_code);
+    try e.encodeDouble(v.revised_sampling_interval);
+    try e.encodeUInt32(v.revised_queue_size);
+    try e.encodeExtensionObject(v.filter_result);
+}
+
+pub fn decodeMonitoredItemModifyResult(d: *encoding.Decoder) encoding.DecodeError!MonitoredItemModifyResult {
+    return .{
+        .status_code = try d.decodeStatusCode(),
+        .revised_sampling_interval = try d.decodeDouble(),
+        .revised_queue_size = try d.decodeUInt32(),
+        .filter_result = try d.decodeExtensionObject(),
+    };
+}
+
+pub const ModifyMonitoredItemsRequest = struct {
+    request_header: RequestHeader,
+    subscription_id: u32,
+    timestamps_to_return: TimestampsToReturn,
+    items_to_modify: ?[]const MonitoredItemModifyRequest,
+};
+
+pub fn encodeModifyMonitoredItemsRequest(e: *encoding.Encoder, v: ModifyMonitoredItemsRequest) encoding.EncodeError!void {
+    try encodeRequestHeader(e, v.request_header);
+    try e.encodeUInt32(v.subscription_id);
+    try encodeEnum(e, TimestampsToReturn, v.timestamps_to_return);
+    try encodeArray(e, MonitoredItemModifyRequest, v.items_to_modify, encodeMonitoredItemModifyRequest);
+}
+
+pub fn decodeModifyMonitoredItemsRequest(d: *encoding.Decoder) encoding.DecodeError!ModifyMonitoredItemsRequest {
+    return .{
+        .request_header = try decodeRequestHeader(d),
+        .subscription_id = try d.decodeUInt32(),
+        .timestamps_to_return = try decodeEnum(d, TimestampsToReturn),
+        .items_to_modify = try decodeArray(d, MonitoredItemModifyRequest, decodeMonitoredItemModifyRequest),
+    };
+}
+
+pub const ModifyMonitoredItemsResponse = struct {
+    response_header: ResponseHeader,
+    results: ?[]const MonitoredItemModifyResult,
+    diagnostic_infos: ?[]const encoding.DiagnosticInfo,
+};
+
+pub fn encodeModifyMonitoredItemsResponse(e: *encoding.Encoder, v: ModifyMonitoredItemsResponse) encoding.EncodeError!void {
+    try encodeResponseHeader(e, v.response_header);
+    try encodeArray(e, MonitoredItemModifyResult, v.results, encodeMonitoredItemModifyResult);
+    try encodeArray(e, encoding.DiagnosticInfo, v.diagnostic_infos, encoding.Encoder.encodeDiagnosticInfo);
+}
+
+pub fn decodeModifyMonitoredItemsResponse(d: *encoding.Decoder) encoding.DecodeError!ModifyMonitoredItemsResponse {
+    return .{
+        .response_header = try decodeResponseHeader(d),
+        .results = try decodeArray(d, MonitoredItemModifyResult, decodeMonitoredItemModifyResult),
+        .diagnostic_infos = try decodeArray(d, encoding.DiagnosticInfo, encoding.Decoder.decodeDiagnosticInfo),
+    };
+}
+
+pub fn freeModifyMonitoredItemsResponse(a: std.mem.Allocator, v: ModifyMonitoredItemsResponse) void {
+    freeResponseHeader(a, v.response_header);
+    if (v.results) |results| {
+        for (results) |r| encoding.freeExtensionObject(a, r.filter_result);
+        a.free(results);
+    }
+    freeDiagnosticInfoArray(a, v.diagnostic_infos);
+}
+
+pub const SetMonitoringModeRequest = struct {
+    request_header: RequestHeader,
+    subscription_id: u32,
+    monitoring_mode: MonitoringMode,
+    monitored_item_ids: ?[]const u32,
+};
+
+pub fn encodeSetMonitoringModeRequest(e: *encoding.Encoder, v: SetMonitoringModeRequest) encoding.EncodeError!void {
+    try encodeRequestHeader(e, v.request_header);
+    try e.encodeUInt32(v.subscription_id);
+    try encodeEnum(e, MonitoringMode, v.monitoring_mode);
+    try encodeArray(e, u32, v.monitored_item_ids, encodeU32Item);
+}
+
+pub fn decodeSetMonitoringModeRequest(d: *encoding.Decoder) encoding.DecodeError!SetMonitoringModeRequest {
+    return .{
+        .request_header = try decodeRequestHeader(d),
+        .subscription_id = try d.decodeUInt32(),
+        .monitoring_mode = try decodeEnum(d, MonitoringMode),
+        .monitored_item_ids = try decodeArray(d, u32, decodeU32Item),
+    };
+}
+
+pub const SetMonitoringModeResponse = struct {
+    response_header: ResponseHeader,
+    results: ?[]const encoding.StatusCode,
+    diagnostic_infos: ?[]const encoding.DiagnosticInfo,
+};
+
+pub fn encodeSetMonitoringModeResponse(e: *encoding.Encoder, v: SetMonitoringModeResponse) encoding.EncodeError!void {
+    try encodeResponseHeader(e, v.response_header);
+    try encodeArray(e, encoding.StatusCode, v.results, encoding.Encoder.encodeStatusCode);
+    try encodeArray(e, encoding.DiagnosticInfo, v.diagnostic_infos, encoding.Encoder.encodeDiagnosticInfo);
+}
+
+pub fn decodeSetMonitoringModeResponse(d: *encoding.Decoder) encoding.DecodeError!SetMonitoringModeResponse {
+    return .{
+        .response_header = try decodeResponseHeader(d),
+        .results = try decodeArray(d, encoding.StatusCode, encoding.Decoder.decodeStatusCode),
+        .diagnostic_infos = try decodeArray(d, encoding.DiagnosticInfo, encoding.Decoder.decodeDiagnosticInfo),
+    };
+}
+
+pub fn freeSetMonitoringModeResponse(a: std.mem.Allocator, v: SetMonitoringModeResponse) void {
+    freeResponseHeader(a, v.response_header);
+    if (v.results) |r| a.free(r);
+    freeDiagnosticInfoArray(a, v.diagnostic_infos);
+}
+
 // ── Channel: chunked send/recv of one service call ──────────────────────────
 
 /// Per-chunk body buffer and reassembly-scratch sizes. Sized comfortably
@@ -2497,35 +3047,37 @@ pub const Channel = struct {
                 };
                 fed = opened.?;
             };
-            if (try assembler.feed(chunk.header.chunk_type, fed)) |msg| break msg;
+            // Strip this chunk's own Secure-Conversation + Sequence headers
+            // *before* reassembly. OPC 10000-6 §6.7.2: **every** chunk of a
+            // message carries them, not just the first — stripping them only
+            // once after reassembly (as this did before a chunked response
+            // from the sibling `server.zig` caught it) splices 16 bytes of
+            // header into the middle of the message body.
+            var hr: std.Io.Reader = .fixed(fed);
+            _ = try hr.takeInt(u32, .little); // SecureChannelId (echoed back)
+            switch (message_type) {
+                .open_secure_channel => {
+                    // AsymmetricAlgorithmSecurityHeader: SecurityPolicyUri,
+                    // SenderCertificate, ReceiverCertificateThumbprint. At
+                    // SecurityMode != None the chunk was already decrypted +
+                    // signature-verified above (against the *pinned* server
+                    // certificate), so these plaintext fields need no further
+                    // checks — skipped without allocating.
+                    for (0..3) |_| _ = try skipLengthPrefixed(&hr);
+                },
+                .message, .close_secure_channel => {
+                    _ = try hr.takeInt(u32, .little); // TokenId
+                },
+                else => unreachable,
+            }
+            _ = try hr.takeInt(u32, .little); // SequenceNumber — not independently validated
+            const chunk_request_id = try hr.takeInt(u32, .little);
+            if (chunk_request_id != ch.request_id) return error.UnexpectedResponseType;
+
+            if (try assembler.feed(chunk.header.chunk_type, hr.buffered())) |msg| break msg;
         };
 
         var r: std.Io.Reader = .fixed(full);
-        _ = try r.takeInt(u32, .little); // SecureChannelId (echoed back)
-        switch (message_type) {
-            .open_secure_channel => {
-                var hd = encoding.Decoder.init(&r, ch.allocator);
-                const uri = try hd.decodeString();
-                defer freeOptStr(ch.allocator, uri);
-                const cert = try hd.decodeByteString();
-                defer freeOptStr(ch.allocator, cert);
-                const thumb = try hd.decodeByteString();
-                defer freeOptStr(ch.allocator, thumb);
-                // At SecurityMode != None the OPN response was already
-                // decrypted + signature-verified per chunk above
-                // (`security.openAsymmetricMessage`, against the *pinned*
-                // server certificate) — the header fields decoded here are
-                // plaintext either way and need no further checks.
-            },
-            .message, .close_secure_channel => {
-                _ = try r.takeInt(u32, .little); // TokenId
-            },
-            else => unreachable,
-        }
-        _ = try r.takeInt(u32, .little); // SequenceNumber — not independently validated
-        const request_id = try r.takeInt(u32, .little);
-        if (request_id != ch.request_id) return error.UnexpectedResponseType;
-
         var d = encoding.Decoder.init(&r, ch.allocator);
         const resp_type = try d.decodeNodeId();
         if (nodeIdEql(resp_type, type_id.service_fault)) {
@@ -2615,6 +3167,15 @@ fn publishResult(r: PublishResponse) encoding.StatusCode {
 fn republishResult(r: RepublishResponse) encoding.StatusCode {
     return r.response_header.service_result;
 }
+fn getEndpointsResult(r: GetEndpointsResponse) encoding.StatusCode {
+    return r.response_header.service_result;
+}
+fn findServersResult(r: FindServersResponse) encoding.StatusCode {
+    return r.response_header.service_result;
+}
+fn translateBrowsePathsResult(r: TranslateBrowsePathsToNodeIdsResponse) encoding.StatusCode {
+    return r.response_header.service_result;
+}
 
 pub const result_fns = struct {
     pub const open_secure_channel = openSecureChannelResult;
@@ -2634,6 +3195,9 @@ pub const result_fns = struct {
     pub const delete_monitored_items = deleteMonitoredItemsResult;
     pub const publish = publishResult;
     pub const republish = republishResult;
+    pub const get_endpoints = getEndpointsResult;
+    pub const find_servers = findServersResult;
+    pub const translate_browse_paths_to_node_ids = translateBrowsePathsResult;
 };
 
 // ── tests ──
