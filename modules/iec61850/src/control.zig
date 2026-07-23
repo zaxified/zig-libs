@@ -986,6 +986,16 @@ pub const Point = struct {
         self.execution_deadline_ms = 0;
     }
 
+    /// The association holding this point went away. A select that outlives its
+    /// client locks the object out until `sboTimeout` — which is a very long
+    /// time to leave a breaker unoperable — so it is dropped here instead.
+    /// A point another client holds is untouched.
+    pub fn release(self: *Point, owner: u32) void {
+        if (self.state == .unselected) return;
+        if (self.owner != owner) return;
+        self.reset();
+    }
+
     /// Emits the MMS `TypeSpecification` of this control object — the answer to
     /// `GetVariableAccessAttributes` on `LN$CO$DO`. A real control client asks
     /// for it **before** it writes anything, and treats a failure as "the

@@ -59,6 +59,12 @@ pub const WriteOutcome = reporting.WriteOutcome;
 /// structure order. Confirmed member by member against a live third-party IED.
 pub const sgcb_attributes = [_][]const u8{ "NumOfSG", "ActSG", "EditSG", "CnfEdit", "LActTm" };
 
+/// The edition-2 form, with the edit reservation appended. Selected by
+/// `ControlBlock.include_resv_tms`; opt-in for the same reason the RCB's
+/// `Owner` is — a client reading a structure of the wrong shape mis-assigns
+/// every field after the change.
+pub const sgcb_attributes_resv = sgcb_attributes ++ [_][]const u8{"ResvTms"};
+
 // ── one setting ─────────────────────────────────────────────────────────────
 
 /// One functionally-constrained setting, held once per group plus once in the
@@ -130,14 +136,34 @@ pub const ControlBlock = struct {
     /// Ten is millisecond resolution; the default zero matches the reference
     /// IED, which is what a server whose clock the caller supplies should say.
     time_accuracy: ?u5 = 0,
+    /// `ResvTms` — how long, in **seconds**, an edit selection survives without
+    /// activity before the server takes it back. Zero (the default) means never,
+    /// which is the pre-timeout behaviour: the selection is released when the
+    /// association drops and not before.
+    ///
+    /// This is what stops a client that selects an edit group and then
+    /// disappears *without* dropping its association from locking every other
+    /// client out of the setting groups for good. It is an **inactivity**
+    /// timeout: every `SetEditSGValue` restarts it, so a slow but live edit is
+    /// never interrupted.
+    resv_tms: i16 = 0,
+    /// Whether `ResvTms` is part of the SGCB's MMS structure.
+    include_resv_tms: bool = false,
     /// The client holding the edit selection.
     editor: ?u32 = null,
     /// Whether anything has been written to the edit buffer since the
     /// selection. `ConfirmEditSGValues` without this is refused.
     edited: bool = false,
+    /// The caller's clock, in milliseconds — moved by `tick` and by every
+    /// write. Nothing here reads a real one.
+    now_ms: u64 = 0,
+    /// When the current edit selection lapses. Zero means no timer is running.
+    edit_deadline_ms: u64 = 0,
     // diagnostics
     activations: u64 = 0,
     confirmations: u64 = 0,
+    /// How many edit selections have been taken back by the timeout.
+    expirations: u64 = 0,
 
     /// Checks the caller's storage matches `groups`.
     pub fn validate(self: *const ControlBlock) Error!void {
@@ -179,9 +205,36 @@ pub const ControlBlock = struct {
         self.edit_sg = group;
         self.editor = peer;
         self.edited = false;
+        self.armEditTimeout();
         for (self.settings) |s| {
             try s.store(s.editIndex(), s.value(group - 1));
         }
+    }
+
+    /// Advances the clock and takes back an edit selection that has gone quiet
+    /// for `ResvTms` seconds. Returns true when it took one back.
+    ///
+    /// **This is the only place an abandoned edit ends.** A client that selects
+    /// a group and then stops talking — without dropping its association, so
+    /// `associationLost` never runs — would otherwise hold the setting groups
+    /// for ever.
+    pub fn tick(self: *ControlBlock, now_ms: u64) bool {
+        self.now_ms = now_ms;
+        if (self.edit_deadline_ms == 0) return false;
+        if (now_ms < self.edit_deadline_ms) return false;
+        self.edit_sg = 0;
+        self.editor = null;
+        self.edited = false;
+        self.edit_deadline_ms = 0;
+        self.expirations += 1;
+        return true;
+    }
+
+    fn armEditTimeout(self: *ControlBlock) void {
+        self.edit_deadline_ms = if (self.edit_sg != 0 and self.resv_tms > 0)
+            self.now_ms +| (@as(u64, @intCast(self.resv_tms)) * 1000)
+        else
+            0;
     }
 
     /// `SetEditSGValue` — a write to `LN$SE$…`.
@@ -194,6 +247,9 @@ pub const ControlBlock = struct {
         const s = self.settings[index];
         try s.store(s.editIndex(), value);
         self.edited = true;
+        // Activity restarts the reservation: a slow edit is not an abandoned
+        // one.
+        self.armEditTimeout();
     }
 
     /// `ConfirmEditSGValues`. This is the step that makes an edit real: until it
@@ -211,6 +267,8 @@ pub const ControlBlock = struct {
         }
         self.edited = false;
         self.confirmations += 1;
+        // The selection survives a confirm, so its reservation restarts too.
+        self.armEditTimeout();
     }
 
     /// `GetSGValues` — the active group's value of one setting.
@@ -239,6 +297,7 @@ pub const ControlBlock = struct {
         self.edit_sg = 0;
         self.editor = null;
         self.edited = false;
+        self.edit_deadline_ms = 0;
     }
 
     // ── name resolution ─────────────────────────────────────────────────────
@@ -267,16 +326,17 @@ pub const ControlBlock = struct {
 
     // ── the SGCB as an MMS variable ─────────────────────────────────────────
 
-    pub fn attributes(_: *const ControlBlock) []const []const u8 {
-        return &sgcb_attributes;
+    pub fn attributes(self: *const ControlBlock) []const []const u8 {
+        return if (self.include_resv_tms) &sgcb_attributes_resv else &sgcb_attributes;
     }
 
     pub fn emitStructure(self: *const ControlBlock, w: *ber.Writer) !void {
         const m = w.mark();
-        var i: usize = sgcb_attributes.len;
+        const names = self.attributes();
+        var i: usize = names.len;
         while (i > 0) {
             i -= 1;
-            try self.emitAttribute(sgcb_attributes[i], w);
+            try self.emitAttribute(names[i], w);
         }
         try mmsdata.Emit.structure(w, m);
     }
@@ -299,7 +359,7 @@ pub const ControlBlock = struct {
             // reference IED emits 0 for a timestamp it has never set.
             try mmsdata.Emit.utcTime(w, mmsdata.UtcTime.fromMillis(self.l_act_tm_ms, self.time_accuracy));
         } else if (eq(u8, name, "ResvTms")) {
-            try mmsdata.Emit.unsigned(w, 0);
+            try mmsdata.Emit.unsigned(w, @as(u32, @intCast(@max(self.resv_tms, 0))));
         } else return error.UnknownAttribute;
     }
 
@@ -312,6 +372,21 @@ pub const ControlBlock = struct {
         now_ms: u64,
     ) WriteOutcome {
         const eq = std.mem.eql;
+        // Every write moves the clock, so an edit that expired while the client
+        // was away is already gone by the time its next write lands — which is
+        // what makes `EditGroupBusy` mean "someone is really editing".
+        _ = self.tick(now_ms);
+        if (eq(u8, name, "ResvTms")) {
+            const v = d.unsigned(u32) catch return .invalid;
+            if (v > std.math.maxInt(i16)) return .invalid;
+            // Only the client holding the selection may change its lifetime.
+            if (self.editor) |o| {
+                if (o != peer) return .denied;
+            }
+            self.resv_tms = @intCast(v);
+            self.armEditTimeout();
+            return .ok;
+        }
         if (eq(u8, name, "ActSG")) {
             const v = d.unsigned(u32) catch return .invalid;
             if (v > 255) return .invalid;
@@ -609,4 +684,109 @@ fn fuzzSgcb(_: void, smith: *std.testing.Smith) !void {
     _ = cb.confirmEdit(1) catch {};
     _ = cb.activeValue(0) catch {};
     _ = cb.editValue(0) catch {};
+}
+
+// ── the edit reservation and its timeout ────────────────────────────────────
+
+test "an abandoned edit expires and the setting groups come back" {
+    var fx: Fixture = .{};
+    var sg = try fx.init();
+    sg.resv_tms = 60; // one minute
+
+    _ = sg.tick(10_000);
+    try sg.selectEditSG(2, 1);
+    try testing.expectEqual(@as(u8, 2), sg.edit_sg);
+    try testing.expectEqual(@as(u64, 70_000), sg.edit_deadline_ms);
+
+    // Another client cannot take it while it is live.
+    try testing.expectError(error.EditGroupBusy, sg.selectEditSG(3, 2));
+
+    // Activity restarts the clock: a slow edit is not an abandoned one.
+    _ = sg.tick(50_000);
+    try setEdit(&sg, 0, 1, 9.0);
+    try testing.expectEqual(@as(u64, 110_000), sg.edit_deadline_ms);
+    _ = sg.tick(100_000);
+    try testing.expectEqual(@as(u8, 2), sg.edit_sg);
+
+    // Then the client vanishes without dropping its association.
+    try testing.expect(sg.tick(110_000));
+    try testing.expectEqual(@as(u8, 0), sg.edit_sg);
+    try testing.expect(sg.editor == null);
+    try testing.expect(!sg.edited);
+    try testing.expectEqual(@as(u64, 1), sg.expirations);
+
+    // …and the group the abandoned edit touched is unchanged, because nothing
+    // was ever confirmed.
+    try testing.expectApproxEqAbs(@as(f64, 2.0), try floatOf(fx.settings[0].value(1)), 1e-6);
+
+    // The second client now gets in.
+    try sg.selectEditSG(3, 2);
+    try testing.expectEqual(@as(u32, 2), sg.editor.?);
+}
+
+test "an edit that expires mid-sequence refuses the confirm that follows it" {
+    var fx: Fixture = .{};
+    var sg = try fx.init();
+    sg.resv_tms = 5;
+    try sg.selectEditSG(1, 1);
+    try setEdit(&sg, 0, 1, 7.5);
+    _ = sg.tick(6_000);
+    try testing.expectError(error.NoEditGroup, sg.confirmEdit(1));
+    try testing.expectError(error.NoEditGroup, setEdit(&sg, 0, 1, 8.5));
+    try testing.expectError(error.NoEditGroup, sg.editValue(0));
+}
+
+test "ResvTms zero is the old behaviour: an edit never times out on its own" {
+    var fx: Fixture = .{};
+    var sg = try fx.init();
+    try sg.selectEditSG(1, 1);
+    try testing.expectEqual(@as(u64, 0), sg.edit_deadline_ms);
+    try testing.expect(!sg.tick(1_000_000_000));
+    try testing.expectEqual(@as(u8, 1), sg.edit_sg);
+}
+
+test "a client writes ResvTms over the wire and only the editor may change it" {
+    var fx: Fixture = .{};
+    var sg = try fx.init();
+    sg.include_resv_tms = true;
+    try testing.expectEqual(@as(usize, 6), sg.attributes().len);
+    try testing.expectEqualStrings("ResvTms", sg.attributes()[5]);
+
+    var buf: [16]u8 = undefined;
+    var w = ber.Writer.init(&buf);
+    try mmsdata.Emit.unsigned(&w, 45);
+    const forty_five = try mmsdata.Data.decode(w.done());
+    try testing.expectEqual(WriteOutcome.ok, sg.writeAttribute("ResvTms", forty_five, 1, 0));
+    try testing.expectEqual(@as(i16, 45), sg.resv_tms);
+
+    try sg.selectEditSG(1, 1);
+    var w2 = ber.Writer.init(&buf);
+    try mmsdata.Emit.unsigned(&w2, 5);
+    const five = try mmsdata.Data.decode(w2.done());
+    try testing.expectEqual(WriteOutcome.denied, sg.writeAttribute("ResvTms", five, 2, 0));
+    try testing.expectEqual(WriteOutcome.ok, sg.writeAttribute("ResvTms", five, 1, 0));
+    try testing.expectEqual(@as(u64, 5_000), sg.edit_deadline_ms);
+
+    // …and it reads back as what was written.
+    var out: [16]u8 = undefined;
+    var ow = ber.Writer.init(&out);
+    try sg.emitAttribute("ResvTms", &ow);
+    try testing.expectEqual(@as(u32, 5), try (try mmsdata.Data.decode(ow.done())).unsigned(u32));
+
+    // A write that lands after the deadline finds the selection already gone,
+    // so it is the *next* client's to take.
+    var w3 = ber.Writer.init(&buf);
+    try mmsdata.Emit.unsigned(&w3, 9);
+    const nine = try mmsdata.Data.decode(w3.done());
+    try testing.expectEqual(WriteOutcome.ok, sg.writeAttribute("ResvTms", nine, 2, 10_000));
+    try testing.expectEqual(@as(u8, 0), sg.edit_sg);
+}
+
+/// Writes one float into the edit buffer the way a client's `SetEditSGValue`
+/// does.
+fn setEdit(cb: *ControlBlock, index: usize, peer: u32, v: f32) !void {
+    var tmp: [16]u8 = undefined;
+    var w = ber.Writer.init(&tmp);
+    try mmsdata.Emit.float(&w, v);
+    try cb.setEditValue(index, peer, w.done());
 }

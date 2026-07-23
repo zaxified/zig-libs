@@ -411,6 +411,20 @@ pub const LogControl = struct {
     trg_ops: TrgOps = .{},
 };
 
+/// A `<Log>` — the log *itself*, as opposed to the `<LogControl>` that decides
+/// what goes into it. An IED may hold several, and a `LogControl` picks one by
+/// `logName`; a log with no name is the logical node's default log, which is
+/// what `LogControl/@logName=""` refers to.
+///
+/// It is a leaf element with nothing but a name and a description, and it
+/// exists in this parser for one reason: a model generator reading the same
+/// file emits a `Log` object per element, so a document that loses them
+/// describes a different IED.
+pub const Log = struct {
+    name: []const u8 = "",
+    desc: []const u8 = "",
+};
+
 /// A `<SettingControl>` — the setting-group control block. There is at most one
 /// per logical device and it is always called `SGCB`.
 pub const SettingControl = struct {
@@ -460,6 +474,10 @@ pub const Ln = struct {
     report_controls: []const ReportControl = &.{},
     gse_controls: []const GseControl = &.{},
     log_controls: []const LogControl = &.{},
+    /// The `<Log>` elements this node owns. Parsed and emitted; nothing here
+    /// interprets them beyond that — the runtime log lives in `logging.zig` and
+    /// is configured by the caller, not by SCL.
+    logs: []const Log = &.{},
     /// At most one per logical device, on `LN0`.
     setting_control: ?SettingControl = null,
 
@@ -958,6 +976,7 @@ const Parser = struct {
         var rcbs: std.ArrayList(ReportControl) = .empty;
         var gcbs: std.ArrayList(GseControl) = .empty;
         var lcbs: std.ArrayList(LogControl) = .empty;
+        var logs: std.ArrayList(Log) = .empty;
         var sgcb: ?SettingControl = null;
 
         var it = el.elementIterator();
@@ -989,6 +1008,11 @@ const Parser = struct {
                     };
                 }
                 try lcbs.append(self.a, lcb);
+            } else if (std.mem.eql(u8, c.local, "Log")) {
+                try logs.append(self.a, .{
+                    .name = attrOr(c, "name", ""),
+                    .desc = attrOr(c, "desc", ""),
+                });
             } else if (std.mem.eql(u8, c.local, "SettingControl")) {
                 sgcb = .{
                     .num_of_sgs = @intCast(@min(parseU32(attrOr(c, "numOfSGs", "1")) orelse 1, 255)),
@@ -1017,6 +1041,7 @@ const Parser = struct {
             .report_controls = try rcbs.toOwnedSlice(self.a),
             .gse_controls = try gcbs.toOwnedSlice(self.a),
             .log_controls = try lcbs.toOwnedSlice(self.a),
+            .logs = try logs.toOwnedSlice(self.a),
             .setting_control = sgcb,
         };
     }

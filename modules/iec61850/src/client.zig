@@ -508,12 +508,49 @@ pub const Client = struct {
         journal_reference: []const u8,
         range: logging.Range,
     ) Error!logging.ReadJournalResponse {
+        return self.readJournalFiltered(journal_reference, range, &.{});
+    }
+
+    /// `ReadJournal` narrowed to particular variables — `listOfVariables`. An
+    /// entry that carries none of them is not returned at all, and one that
+    /// carries some comes back with only those.
+    pub fn readJournalFiltered(
+        self: *Client,
+        journal_reference: []const u8,
+        range: logging.Range,
+        variables: []const []const u8,
+    ) Error!logging.ReadJournalResponse {
+        const name = try journalName(journal_reference);
+        const id = self.takeInvokeId();
+        var req: [1024]u8 = undefined;
+        const pdu = try logging.encodeReadJournalFiltered(id, name, range, variables, &req);
+        const resp = try self.exchange(pdu, id, logging.read_journal_service);
+        return logging.decodeReadJournalResponse(resp);
+    }
+
+    /// `InitializeJournal` — delete the log entries a limit covers. Returns how
+    /// many the server says went.
+    pub fn initializeJournal(
+        self: *Client,
+        journal_reference: []const u8,
+        limit: logging.Limit,
+    ) Error!u32 {
         const name = try journalName(journal_reference);
         const id = self.takeInvokeId();
         var req: [512]u8 = undefined;
-        const pdu = try logging.encodeReadJournal(id, name, range, &req);
-        const resp = try self.exchange(pdu, id, logging.read_journal_service);
-        return logging.decodeReadJournalResponse(resp);
+        const pdu = try logging.encodeInitializeJournal(id, name, limit, &req);
+        const resp = try self.exchange(pdu, id, logging.initialize_journal_service);
+        return logging.decodeInitializeJournalResponse(resp);
+    }
+
+    /// `DeleteJournal` — delete the journal object itself. A server with a
+    /// statically configured log refuses this, which is a `ServiceFailed`.
+    pub fn deleteJournal(self: *Client, journal_reference: []const u8) Error!void {
+        const name = try journalName(journal_reference);
+        const id = self.takeInvokeId();
+        var req: [256]u8 = undefined;
+        const pdu = try logging.encodeDeleteJournal(id, name, &req);
+        _ = try self.exchange(pdu, id, logging.delete_journal_service);
     }
 
     /// `GetJournalStatus` — how many entries the log holds.

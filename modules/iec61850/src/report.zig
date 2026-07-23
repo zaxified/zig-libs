@@ -43,6 +43,14 @@ pub const Error = mms.Error || error{
     TooManyEntries,
     /// A field carried the wrong `Data` alternative for its position.
     BadReportField,
+    /// A segment arrived with a `SubSeqNum` that is not the next one.
+    SegmentOutOfOrder,
+    /// A segment's header disagrees with the one that opened the report —
+    /// a different `SqNum`, `EntryID`, `RptID` or `DatSet`.
+    SegmentMismatch,
+    /// The reassembly arena the caller supplied is full. A peer cannot turn a
+    /// never-completing reassembly into memory growth: it turns into this.
+    ReassemblyBufferTooSmall,
 };
 
 /// The maximum data-set size this decoder tracks per report.
@@ -368,6 +376,195 @@ pub fn decodeInformationReport(body: []const u8) Error!Report {
 /// The conventional VMD-specific name an `InformationReport` carrying a report
 /// uses.
 pub const report_variable_name = "RPT";
+
+// ── reassembling a segmented report ─────────────────────────────────────────
+
+/// One member of a reassembled report. Everything in it points into the
+/// `Reassembler`'s own arena, so it stays valid after the segment it arrived in
+/// has been overwritten — which is the entire reason this type exists.
+pub const AssembledEntry = struct {
+    /// Index into the data set.
+    index: usize,
+    /// Empty unless `OptFlds.data_reference` was set.
+    reference: []const u8 = "",
+    /// The member's value as a complete `Data` TLV.
+    value: []const u8,
+    reason: ?Reason = null,
+};
+
+/// A finished report, put back together from its segments.
+pub const Assembled = struct {
+    rpt_id: []const u8,
+    dat_set: []const u8,
+    opt_flds: OptFlds,
+    sq_num: ?u32,
+    time_of_entry: ?mmsdata.BinaryTime,
+    buf_ovfl: ?bool,
+    entry_id: []const u8,
+    conf_rev: ?u32,
+    /// How many segments carried it. One means it was never segmented.
+    segments: u32,
+    entries: []const AssembledEntry,
+};
+
+/// Puts a segmented report back together on the client side.
+///
+/// A server that sets `OptFlds.segmentation` may split one report across
+/// several `InformationReport`s. Every segment repeats the same header
+/// (`RptID`, `SqNum`, `EntryID`, `TimeOfEntry`, `DatSet`, `ConfRev`) and carries
+/// `SubSeqNum` counting from zero plus `MoreSegmentsFollow`; each segment's
+/// **inclusion bit string is its own** — full data-set width, bits set for the
+/// members that segment carries. Reassembly is therefore: check the header
+/// still matches, check `SubSeqNum` is the one expected, and append.
+///
+/// Storage is caller-owned: `slots` bounds how many members a whole report may
+/// have and `arena` bounds how many octets they may occupy. A peer that starts
+/// a report and never finishes it costs exactly that and nothing more; the next
+/// `SubSeqNum == 0` starts a new one over the top of it.
+pub const Reassembler = struct {
+    slots: []AssembledEntry,
+    arena: []u8,
+
+    used: usize = 0,
+    count: usize = 0,
+    /// Non-null while a report is half-assembled: the `SubSeqNum` the next
+    /// segment must carry.
+    expect: ?u32 = null,
+    segments: u32 = 0,
+    // The header of the segment that opened the report, copied out.
+    rpt_id_len: usize = 0,
+    dat_set_len: usize = 0,
+    entry_id_len_: usize = 0,
+    hdr: [3 * 129]u8 = undefined,
+    opt_flds: OptFlds = .{},
+    sq_num: ?u32 = null,
+    time_of_entry: ?mmsdata.BinaryTime = null,
+    buf_ovfl: ?bool = null,
+    conf_rev: ?u32 = null,
+
+    pub fn init(slots: []AssembledEntry, arena: []u8) Reassembler {
+        return .{ .slots = slots, .arena = arena };
+    }
+
+    /// Whether a report is half-assembled.
+    pub fn pending(self: *const Reassembler) bool {
+        return self.expect != null;
+    }
+
+    /// Throws away a half-assembled report. A client calls this when the
+    /// association drops, or when it gives up waiting.
+    pub fn reset(self: *Reassembler) void {
+        self.used = 0;
+        self.count = 0;
+        self.expect = null;
+        self.segments = 0;
+        self.rpt_id_len = 0;
+        self.dat_set_len = 0;
+        self.entry_id_len_ = 0;
+    }
+
+    /// Feeds one decoded segment in. Returns the finished report when this was
+    /// the last segment, and null while more are expected.
+    ///
+    /// A report that is not segmented at all comes straight back out, so a
+    /// client can push **every** report through this and stop caring.
+    pub fn push(self: *Reassembler, r: Report) Error!?Assembled {
+        const sub = r.sub_seq_num orelse 0;
+        const more = r.more_segments_follow orelse false;
+
+        if (sub == 0) {
+            // A fresh report. Whatever was half-assembled is abandoned, which is
+            // what a server that gave up and restarted expects.
+            self.reset();
+            try self.takeHeader(r);
+        } else {
+            const want = self.expect orelse return error.SegmentOutOfOrder;
+            if (sub != want) return error.SegmentOutOfOrder;
+            try self.checkHeader(r);
+        }
+
+        for (r.included()) |e| {
+            if (self.count == self.slots.len) return error.ReassemblyBufferTooSmall;
+            const value = try self.stash(e.value.raw);
+            const reference = if (e.reference) |x| try self.stash(x) else "";
+            self.slots[self.count] = .{
+                .index = e.index,
+                .reference = reference,
+                .value = value,
+                .reason = e.reason,
+            };
+            self.count += 1;
+        }
+        self.segments += 1;
+
+        if (more) {
+            self.expect = sub + 1;
+            return null;
+        }
+        const out = Assembled{
+            .rpt_id = self.hdr[0..self.rpt_id_len],
+            .dat_set = self.hdr[self.rpt_id_len..][0..self.dat_set_len],
+            .opt_flds = self.opt_flds,
+            .sq_num = self.sq_num,
+            .time_of_entry = self.time_of_entry,
+            .buf_ovfl = self.buf_ovfl,
+            .entry_id = self.hdr[self.rpt_id_len + self.dat_set_len ..][0..self.entry_id_len_],
+            .conf_rev = self.conf_rev,
+            .segments = self.segments,
+            .entries = self.slots[0..self.count],
+        };
+        self.expect = null;
+        return out;
+    }
+
+    fn stash(self: *Reassembler, b: []const u8) Error![]const u8 {
+        if (self.used + b.len > self.arena.len) return error.ReassemblyBufferTooSmall;
+        @memcpy(self.arena[self.used..][0..b.len], b);
+        const out = self.arena[self.used..][0..b.len];
+        self.used += b.len;
+        return out;
+    }
+
+    fn takeHeader(self: *Reassembler, r: Report) Error!void {
+        const ds = r.dat_set orelse "";
+        const id = r.entry_id orelse "";
+        if (r.rpt_id.len + ds.len + id.len > self.hdr.len) return error.ReassemblyBufferTooSmall;
+        var n: usize = 0;
+        @memcpy(self.hdr[n..][0..r.rpt_id.len], r.rpt_id);
+        n += r.rpt_id.len;
+        @memcpy(self.hdr[n..][0..ds.len], ds);
+        n += ds.len;
+        @memcpy(self.hdr[n..][0..id.len], id);
+        self.rpt_id_len = r.rpt_id.len;
+        self.dat_set_len = ds.len;
+        self.entry_id_len_ = id.len;
+        self.opt_flds = r.opt_flds;
+        self.sq_num = r.sq_num;
+        self.time_of_entry = r.time_of_entry;
+        self.buf_ovfl = r.buf_ovfl;
+        self.conf_rev = r.conf_rev;
+    }
+
+    /// A later segment must be the same report. `SqNum` and `EntryID` are the
+    /// two that matter: a server that starts a *different* report mid-stream is
+    /// a bug, and silently splicing its members into this one would produce a
+    /// report that never existed.
+    fn checkHeader(self: *const Reassembler, r: Report) Error!void {
+        if (!std.mem.eql(u8, r.rpt_id, self.hdr[0..self.rpt_id_len])) return error.SegmentMismatch;
+        const ds = r.dat_set orelse "";
+        if (!std.mem.eql(u8, ds, self.hdr[self.rpt_id_len..][0..self.dat_set_len])) {
+            return error.SegmentMismatch;
+        }
+        const id = r.entry_id orelse "";
+        if (!std.mem.eql(u8, id, self.hdr[self.rpt_id_len + self.dat_set_len ..][0..self.entry_id_len_])) {
+            return error.SegmentMismatch;
+        }
+        if (r.sq_num) |x| {
+            if (self.sq_num == null or self.sq_num.? != x) return error.SegmentMismatch;
+        }
+        return;
+    }
+};
 
 // ── tests ───────────────────────────────────────────────────────────────────
 
@@ -738,4 +935,176 @@ fn fuzzReport(_: void, smith: *std.testing.Smith) !void {
     d.validate() catch return;
     _ = Rcb.decode(d, .unbuffered) catch {};
     _ = Rcb.decode(d, .buffered) catch {};
+}
+
+// ── reassembly ──────────────────────────────────────────────────────────────
+
+/// Builds one segment by hand, so the reassembler is driven by something other
+/// than the server that produces them.
+fn segmentFor(
+    out: []u8,
+    sub: u32,
+    more: bool,
+    sq: u32,
+    entry_id: []const u8,
+    indices: []const usize,
+    members: usize,
+) ![]const u8 {
+    var w = ber.Writer.init(out);
+    const m = w.mark();
+    var inclusion: u64 = 0;
+    for (indices) |i| inclusion |= @as(u64, 1) << @intCast(members - 1 - i);
+    // Backwards: reasons, values, inclusion, segmentation, header.
+    var k: usize = indices.len;
+    while (k > 0) {
+        k -= 1;
+        try (Reason{ .general_interrogation = true }).emit(&w);
+    }
+    k = indices.len;
+    while (k > 0) {
+        k -= 1;
+        try mmsdata.Emit.unsigned(&w, @intCast(indices[k]));
+    }
+    try w.bitString(mmsdata.Kind.bit_string.tag(), inclusion, @intCast(members));
+    try mmsdata.Emit.boolean(&w, more);
+    try mmsdata.Emit.unsigned(&w, sub);
+    try mmsdata.Emit.octetString(&w, entry_id);
+    try mmsdata.Emit.visibleString(&w, "LD/LLN0$Events");
+    try mmsdata.Emit.unsigned(&w, sq);
+    try (OptFlds{
+        .sequence_number = true,
+        .reason_for_inclusion = true,
+        .data_set_name = true,
+        .entry_id = true,
+        .segmentation = true,
+    }).emit(&w);
+    try mmsdata.Emit.visibleString(&w, "SEG");
+    try mms.closeInformationReport(&w, m, .{
+        .variable_list = .{ .vmd_specific = report_variable_name },
+    });
+    return w.done();
+}
+
+fn decodeSegment(bytes: []const u8) !Report {
+    const pdu = try mms.decode(bytes);
+    return decodeInformationReport(pdu.unconfirmed.body);
+}
+
+test "three segments reassemble into one report with every member in order" {
+    var slots: [8]AssembledEntry = undefined;
+    var arena: [512]u8 = undefined;
+    var re = Reassembler.init(&slots, &arena);
+    const id = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 9 };
+    var buf: [256]u8 = undefined;
+
+    try testing.expect(!re.pending());
+    var r = try decodeSegment(try segmentFor(&buf, 0, true, 4, &id, &.{ 0, 1 }, 6));
+    try testing.expect((try re.push(r)) == null);
+    try testing.expect(re.pending());
+    r = try decodeSegment(try segmentFor(&buf, 1, true, 4, &id, &.{ 2, 3 }, 6));
+    try testing.expect((try re.push(r)) == null);
+    r = try decodeSegment(try segmentFor(&buf, 2, false, 4, &id, &.{ 4, 5 }, 6));
+    const a = (try re.push(r)).?;
+
+    try testing.expectEqual(@as(u32, 3), a.segments);
+    try testing.expectEqual(@as(usize, 6), a.entries.len);
+    try testing.expectEqualStrings("SEG", a.rpt_id);
+    try testing.expectEqualStrings("LD/LLN0$Events", a.dat_set);
+    try testing.expectEqual(@as(u32, 4), a.sq_num.?);
+    try testing.expectEqualSlices(u8, &id, a.entry_id);
+    for (a.entries, 0..) |e, i| {
+        try testing.expectEqual(i, e.index);
+        try testing.expect(e.reason.?.general_interrogation);
+        // The value survives the buffer the segment arrived in being reused.
+        const d = try mmsdata.Data.decode(e.value);
+        try testing.expectEqual(@as(u32, @intCast(i)), try d.unsigned(u32));
+    }
+    try testing.expect(!re.pending());
+}
+
+test "a report that is not segmented at all comes straight back out" {
+    var slots: [8]AssembledEntry = undefined;
+    var arena: [512]u8 = undefined;
+    var re = Reassembler.init(&slots, &arena);
+    var buf: [256]u8 = undefined;
+    var w = ber.Writer.init(&buf);
+    const m = w.mark();
+    try (Reason{ .data_change = true }).emit(&w);
+    try mmsdata.Emit.boolean(&w, true);
+    try w.bitString(mmsdata.Kind.bit_string.tag(), @as(u64, 1) << 3, 4);
+    try (OptFlds{ .reason_for_inclusion = true }).emit(&w);
+    try mmsdata.Emit.visibleString(&w, "PLAIN");
+    try mms.closeInformationReport(&w, m, .{
+        .variable_list = .{ .vmd_specific = report_variable_name },
+    });
+    const a = (try re.push(try decodeSegment(w.done()))).?;
+    try testing.expectEqual(@as(u32, 1), a.segments);
+    try testing.expectEqual(@as(usize, 1), a.entries.len);
+    try testing.expectEqualStrings("PLAIN", a.rpt_id);
+    try testing.expect(!re.pending());
+}
+
+test "a SubSeqNum that skips is a typed error, not a spliced report" {
+    var slots: [8]AssembledEntry = undefined;
+    var arena: [512]u8 = undefined;
+    var re = Reassembler.init(&slots, &arena);
+    const id = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 1 };
+    var buf: [256]u8 = undefined;
+    _ = try re.push(try decodeSegment(try segmentFor(&buf, 0, true, 1, &id, &.{0}, 4)));
+    // 1 was expected.
+    try testing.expectError(
+        error.SegmentOutOfOrder,
+        re.push(try decodeSegment(try segmentFor(&buf, 2, false, 1, &id, &.{2}, 4))),
+    );
+    // A continuation with nothing open is the same error.
+    re.reset();
+    try testing.expectError(
+        error.SegmentOutOfOrder,
+        re.push(try decodeSegment(try segmentFor(&buf, 1, false, 1, &id, &.{1}, 4))),
+    );
+}
+
+test "a segment belonging to another report is refused rather than merged" {
+    var slots: [8]AssembledEntry = undefined;
+    var arena: [512]u8 = undefined;
+    var re = Reassembler.init(&slots, &arena);
+    const id = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 1 };
+    const other = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 2 };
+    var buf: [256]u8 = undefined;
+    _ = try re.push(try decodeSegment(try segmentFor(&buf, 0, true, 1, &id, &.{0}, 4)));
+    try testing.expectError(
+        error.SegmentMismatch,
+        re.push(try decodeSegment(try segmentFor(&buf, 1, false, 1, &other, &.{1}, 4))),
+    );
+    re.reset();
+    _ = try re.push(try decodeSegment(try segmentFor(&buf, 0, true, 1, &id, &.{0}, 4)));
+    try testing.expectError(
+        error.SegmentMismatch,
+        re.push(try decodeSegment(try segmentFor(&buf, 1, false, 9, &id, &.{1}, 4))),
+    );
+}
+
+test "a reassembly that never completes is bounded, and the next report reclaims it" {
+    var slots: [4]AssembledEntry = undefined;
+    var arena: [64]u8 = undefined;
+    var re = Reassembler.init(&slots, &arena);
+    const id = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 1 };
+    var buf: [256]u8 = undefined;
+
+    // Five members into four slots: the fifth is refused, not allocated.
+    _ = try re.push(try decodeSegment(try segmentFor(&buf, 0, true, 1, &id, &.{ 0, 1 }, 8)));
+    _ = try re.push(try decodeSegment(try segmentFor(&buf, 1, true, 1, &id, &.{ 2, 3 }, 8)));
+    try testing.expectError(
+        error.ReassemblyBufferTooSmall,
+        re.push(try decodeSegment(try segmentFor(&buf, 2, true, 1, &id, &.{ 4, 5 }, 8))),
+    );
+    // Still pending and still bounded, however long the peer stays quiet.
+    try testing.expect(re.pending());
+    try testing.expect(re.used <= arena.len);
+
+    // A fresh report (`SubSeqNum == 0`) takes the storage back.
+    const a = (try re.push(try decodeSegment(try segmentFor(&buf, 0, false, 2, &id, &.{0}, 8)))).?;
+    try testing.expectEqual(@as(usize, 1), a.entries.len);
+    try testing.expectEqual(@as(u32, 1), a.segments);
+    try testing.expect(!re.pending());
 }

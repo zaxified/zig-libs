@@ -125,6 +125,12 @@ pub const max_pending_notifications: usize = 4;
 /// `BufferTooSmall` rather than a silently truncated report.
 pub const max_report_len: usize = 8192;
 
+/// What `wrap` adds around an MMS PDU: the TPKT header, the COTP DT header, the
+/// session data-transfer prefix and the presentation user-data wrapper. Rounded
+/// generously up — it is subtracted from the negotiated TPDU size to get the
+/// budget a report segment has to fit.
+pub const envelope_overhead: usize = 64;
+
 const Pending = struct {
     len: usize = 0,
     bytes: [max_notification_len]u8 = undefined,
@@ -139,10 +145,24 @@ pub const Server = struct {
     /// The presentation context the association settled on, remembered so an
     /// **unsolicited** PDU can be wrapped without a request to copy it from.
     mms_context: u16 = presentation.context_mms,
-    /// Identifies the associated client for select ownership. One `Server`
-    /// serves one association, so a caller simulating several IEDs gives each
-    /// its own id and a select cannot be stolen across them.
+    /// Identifies the association a request arrived on. It is what a select,
+    /// a setting-group edit and an RCB reservation are owned *by*.
+    ///
+    /// One `Server` object drives one association at a time, but a caller that
+    /// multiplexes several connections onto one model sets this to the id of
+    /// the association the frame came from before calling `handle`, and calls
+    /// `releaseAssociationOf` when that connection drops. That is exactly how
+    /// two clients end up contending for one report control block, and it is
+    /// what `Resv` / `ResvTms` / `Owner` exist to arbitrate.
     peer: u32 = 1,
+    /// The MMS PDU size the association settled on — the client's
+    /// `localDetailCalling`, clamped to what this server can actually build.
+    /// Zero before an association.
+    negotiated_pdu_len: usize = 0,
+    /// The COTP TPDU size the transport connection settled on. Zero before a
+    /// `CR`. Together with `negotiated_pdu_len` this is what
+    /// `reportSegmentBudget` splits reports against.
+    negotiated_tpdu_len: usize = 0,
     /// The caller's clock, in milliseconds. `tick` moves it; nothing here reads
     /// a real one.
     now_ms: u64 = 0,
@@ -165,6 +185,7 @@ pub const Server = struct {
     control_rejections: u64 = 0,
     reports_sent: u64 = 0,
     journal_reads: u64 = 0,
+    journal_deletions: u64 = 0,
 
     pub fn init(config: Config, model: Model) Server {
         return .{ .config = config, .model = model };
@@ -177,12 +198,19 @@ pub const Server = struct {
         switch (try cotp.decode(pkt.payload)) {
             .cr => |cr| {
                 self.transport_up = true;
+                // The COTP TPDU size is the *other* negotiated ceiling, and it
+                // is the binding one: this module never splits a PDU across
+                // several DT TPDUs, so nothing it sends may exceed it. A peer
+                // that proposes 1024 gets 1024-octet TPDUs, and a report larger
+                // than that is what segmentation exists for.
+                const tpdu = cr.tpdu_size orelse .b8192;
+                self.negotiated_tpdu_len = tpdu.octets();
                 var body: [128]u8 = undefined;
                 const cc = try cotp.encodeConnect(
                     .cc,
                     cr.src_ref,
                     1,
-                    cr.tpdu_size orelse .b8192,
+                    tpdu,
                     cr.called_tsap orelse &[_]u8{ 0x00, 0x01 },
                     cr.calling_tsap orelse &[_]u8{ 0x00, 0x01 },
                     &body,
@@ -278,6 +306,14 @@ pub const Server = struct {
         const dt = try cotp.encodeData(accept, true, &dt_buf);
         self.associated = true;
         self.mms_context = mms_ctx;
+        // `localDetailCalling` is the largest MMS PDU the **client** can
+        // receive, so it — not our own `local_detail` — bounds what this server
+        // may send. A client that proposes nothing gets our own ceiling.
+        const proposed: usize = if (init_req.local_detail) |v|
+            (if (v > 0) @intCast(v) else max_report_len)
+        else
+            max_report_len;
+        self.negotiated_pdu_len = @min(proposed, max_report_len);
         return try tpkt.encode(dt, out);
     }
 
@@ -301,6 +337,8 @@ pub const Server = struct {
         // its status sibling are values, not cases.
         if (req.service == logging.read_journal_service) return self.readJournal(req, body);
         if (req.service == logging.get_journal_status_service) return self.journalStatus(req, body);
+        if (req.service == logging.initialize_journal_service) return self.initializeJournal(req, body);
+        if (req.service == logging.delete_journal_service) return self.deleteJournal(req, body);
         return switch (req.service) {
             .identify => mms.encodeIdentifyResponse(req.invoke_id, .{
                 .vendor = self.model.vendor,
@@ -671,22 +709,13 @@ pub const Server = struct {
 
     fn writeRcb(self: *Server, n: Named, d: mmsdata.Data) mms.WriteResult {
         if (n.attribute.len == 0) return .{ .failure = .object_access_denied };
+        const src = self.reportSource();
         const cb = &self.model.report_controls[n.index];
-        // `DatSet` and `RptID` name strings that live in the caller's model, not
-        // in the request buffer. A client writing back what it read is accepted;
-        // re-pointing a block at another data set at runtime is not something
-        // this server offers, and saying so beats aliasing a freed buffer.
-        if (std.mem.eql(u8, n.attribute, "DatSet") or std.mem.eql(u8, n.attribute, "RptID")) {
-            const s = d.visibleString() catch return .{ .failure = .type_inconsistent };
-            const current = if (std.mem.eql(u8, n.attribute, "DatSet"))
-                cb.dat_set
-            else if (cb.rpt_id.len > 0) cb.rpt_id else cb.item;
-            return if (std.mem.eql(u8, s, current))
-                .success
-            else
-                .{ .failure = .object_access_denied };
-        }
-        const outcome = cb.writeAttribute(n.attribute, d, self.peer, self.now_ms);
+        // `DatSet` and `RptID` are copied into the block's own storage, so a
+        // string that lives in the request buffer — which the caller reuses on
+        // the next exchange — is never aliased. A `DatSet` write additionally
+        // re-resolves against the model and bumps `ConfRev`.
+        const outcome = cb.writeAttributeFrom(n.attribute, d, src, self.peer, self.now_ms);
         if (outcome == .ok and std.mem.eql(u8, n.attribute, "GI") and cb.gi) {
             // The general interrogation happens now; `GI` self-clears once the
             // report has been generated, which is what the standard says and
@@ -716,7 +745,22 @@ pub const Server = struct {
         .count = sourceCount,
         .value = sourceValue,
         .reference = sourceReference,
+        .resolve = sourceResolve,
     };
+
+    /// `LD/LLN0$Events` → the index of that data set. This is what makes a
+    /// runtime `DatSet` re-bind possible: the block is handed a name off the
+    /// wire and the model is the only thing that can say what it means.
+    fn sourceResolve(ctx: *anyopaque, ds_reference: []const u8) ?usize {
+        const self: *Server = @ptrCast(@alignCast(ctx));
+        const slash = std.mem.indexOfScalar(u8, ds_reference, '/') orelse return null;
+        const ld = ds_reference[0..slash];
+        const item = ds_reference[slash + 1 ..];
+        for (self.model.data_sets, 0..) |ds, i| {
+            if (std.mem.eql(u8, ds.domain, ld) and std.mem.eql(u8, ds.item, item)) return i;
+        }
+        return null;
+    }
 
     fn sourceCount(ctx: *anyopaque, data_set: usize) usize {
         const self: *Server = @ptrCast(@alignCast(ctx));
@@ -799,6 +843,31 @@ pub const Server = struct {
         }, body);
     }
 
+    /// `InitializeJournal` — the MMS spelling of "delete log entries". The
+    /// entries a limit covers go and the count is returned; a limit reaching
+    /// past what the store already purged is not an error.
+    fn initializeJournal(self: *Server, req: mms.ConfirmedRequest, body: []u8) Error![]const u8 {
+        const q = logging.decodeInitializeJournal(req.body) catch
+            return mms.encodeConfirmedError(req.invoke_id, .service, 0, body);
+        const lg = self.findJournal(q.journal) orelse
+            return mms.encodeConfirmedError(req.invoke_id, .access, 0, body);
+        const deleted = logging.initializeJournal(lg, q.limit);
+        self.journal_deletions += deleted;
+        return logging.encodeInitializeJournalResponse(req.invoke_id, deleted, body);
+    }
+
+    /// `DeleteJournal` — deleting the journal *object*, not its entries. The
+    /// logs here are part of the caller's static model, exactly as a configured
+    /// IED's are, so this is refused rather than silently ignored.
+    fn deleteJournal(self: *Server, req: mms.ConfirmedRequest, body: []u8) Error![]const u8 {
+        const name = logging.decodeDeleteJournal(req.body) catch
+            return mms.encodeConfirmedError(req.invoke_id, .service, 0, body);
+        if (self.findJournal(name) == null) {
+            return mms.encodeConfirmedError(req.invoke_id, .access, 0, body);
+        }
+        return mms.encodeConfirmedError(req.invoke_id, .access, 3, body);
+    }
+
     fn findJournal(self: *Server, name: mms.ObjectName) ?*logging.ControlBlock {
         const d = switch (name) {
             .domain_specific => |x| x,
@@ -832,6 +901,9 @@ pub const Server = struct {
         const src = self.reportSource();
         for (self.model.report_controls) |*cb| _ = cb.tick(src, now_ms) catch {};
         for (self.model.logs) |*lg| _ = lg.tick(src, now_ms) catch {};
+        // …and an abandoned setting-group edit expires here rather than holding
+        // the groups until the association drops.
+        if (self.model.setting_groups) |sg| _ = sg.tick(now_ms);
     }
 
     /// The application finished (or failed) an execution the responder is
@@ -859,18 +931,48 @@ pub const Server = struct {
         // the buffer entry it already occupies.
         const blocks = self.model.report_controls;
         if (blocks.len == 0) return null;
+        // A block half-way through a segmented report is finished before any
+        // other block gets a turn: interleaving two reports' segments on one
+        // association would make them impossible to reassemble.
         var i: usize = 0;
         while (i < blocks.len) : (i += 1) {
             const idx = (self.report_cursor + i) % blocks.len;
-            var w = ber.Writer.init(&self.report_out);
-            const src = self.reportSource();
-            if (blocks[idx].emitNext(src, &w) catch continue) {
-                self.report_cursor = (idx + 1) % blocks.len;
-                self.reports_sent += 1;
-                return try self.wrap(w.done(), self.mms_context, out);
+            if (!blocks[idx].segmenting()) continue;
+            if (try self.emitFrom(idx, out)) |frame| return frame;
+        }
+        i = 0;
+        while (i < blocks.len) : (i += 1) {
+            const idx = (self.report_cursor + i) % blocks.len;
+            if (self.emitFrom(idx, out) catch continue) |frame| {
+                if (!blocks[idx].segmenting()) self.report_cursor = (idx + 1) % blocks.len;
+                return frame;
             }
         }
         return null;
+    }
+
+    /// How large one `InformationReport` may be on this association.
+    ///
+    /// Two ceilings, and the smaller wins. `localDetailCalling` is the largest
+    /// MMS PDU the client will accept; the COTP TPDU size is the largest single
+    /// TPDU this module can put on the wire, because it does not split a PDU
+    /// across several. `envelope_overhead` is the session/presentation wrapper
+    /// `wrap` puts around the MMS PDU inside that TPDU.
+    pub fn reportSegmentBudget(self: *const Server) usize {
+        var limit: usize = if (self.negotiated_pdu_len > 0) self.negotiated_pdu_len else max_report_len;
+        if (self.negotiated_tpdu_len > envelope_overhead) {
+            limit = @min(limit, self.negotiated_tpdu_len - envelope_overhead);
+        }
+        return limit;
+    }
+
+    fn emitFrom(self: *Server, idx: usize, out: []u8) Error!?[]const u8 {
+        var w = ber.Writer.init(&self.report_out);
+        const src = self.reportSource();
+        const limit = self.reportSegmentBudget();
+        if (!try self.model.report_controls[idx].emitNextWithin(src, &w, limit)) return null;
+        self.reports_sent += 1;
+        return try self.wrap(w.done(), self.mms_context, out);
     }
 
     /// The association ended. Report control blocks release their client — a
@@ -879,6 +981,18 @@ pub const Server = struct {
     pub fn releaseAssociation(self: *Server) void {
         for (self.model.report_controls) |*cb| cb.associationLost();
         if (self.model.setting_groups) |sg| sg.associationLost(self.peer);
+        self.associated = false;
+    }
+
+    /// One of several associations ended. Unlike `releaseAssociation` this
+    /// leaves alone everything another client holds, and it honours a BRCB's
+    /// `ResvTms`: a reservation with a lifetime outlives the connection that
+    /// took it, so a client that reconnects inside the window still owns its
+    /// buffer. `tick` is what eventually expires it.
+    pub fn releaseAssociationOf(self: *Server, peer: u32) void {
+        for (self.model.report_controls) |*cb| cb.associationLostBy(peer, self.now_ms);
+        if (self.model.setting_groups) |sg| sg.associationLost(peer);
+        for (self.model.controls) |*p| p.release(peer);
         self.associated = false;
     }
 
@@ -2249,4 +2363,364 @@ test "releasing the association purges a URCB and keeps a BRCB" {
     try testing.expectEqual(@as(usize, 0), srv.model.report_controls[0].buffer.count);
     try testing.expectEqual(@as(usize, 2), srv.model.report_controls[1].buffer.count);
     try testing.expect(!srv.associated);
+}
+
+// ── segmentation, re-binding and reservation, client against server ─────────
+
+/// A model wide enough that one report cannot fit a small PDU: twelve members
+/// of a hundred octets each, plus a second, narrow data set to re-bind to.
+const WideFixture = struct {
+    payload: [12][160]u8 = undefined,
+    vars: [12]Variable = undefined,
+    sets: [2]DataSet = undefined,
+    domains: [1][]const u8 = .{domain},
+    entries: [4]reporting.Entry = @splat(.{}),
+    arena: [4 * 4096]u8 = undefined,
+    rcbs: [1]ReportControl = undefined,
+    names: [12][32]u8 = undefined,
+
+    fn init(self: *WideFixture) !Model {
+        for (0..12) |i| {
+            var body: [100]u8 = undefined;
+            for (0..body.len) |k| body[k] = @intCast((i * 13 + k) & 0xFF);
+            var w = ber.Writer.init(&self.payload[i]);
+            try mmsdata.Emit.octetString(&w, &body);
+            const d = w.done();
+            std.mem.copyForwards(u8, self.payload[i][0..d.len], d);
+            const item = try std.fmt.bufPrint(&self.names[i], "GGIO1$ST$M{d:0>2}$stVal", .{i});
+            self.vars[i] = .{
+                .domain = domain,
+                .item = item,
+                .storage = &self.payload[i],
+                .len = d.len,
+                .writable = true,
+            };
+        }
+        self.sets[0] = .{
+            .domain = domain,
+            .item = "LLN0$Wide",
+            .members = &[_]usize{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 },
+        };
+        self.sets[1] = .{ .domain = domain, .item = "LLN0$Narrow", .members = &[_]usize{ 0, 1 } };
+        self.rcbs[0] = .{
+            .kind = .unbuffered,
+            .domain = domain,
+            .item = "LLN0$RP$WideRCB01",
+            .rpt_id = "Wide1",
+            .dat_set = domain ++ "/LLN0$Wide",
+            .data_set = 0,
+            .conf_rev = 1,
+            .opt_flds = .{
+                .sequence_number = true,
+                .report_time_stamp = true,
+                .reason_for_inclusion = true,
+                .data_set_name = true,
+                .entry_id = true,
+                .conf_revision = true,
+                .segmentation = true,
+            },
+            .trg_ops = .{ .data_change = true, .general_interrogation = true },
+            .include_owner = true,
+            .buffer = try reporting.Buffer.init(&self.entries, &self.arena),
+        };
+        return .{
+            .variables = &self.vars,
+            .data_sets = &self.sets,
+            .report_controls = &self.rcbs,
+            .domains = &self.domains,
+        };
+    }
+};
+
+var seg_slots: [32]report.AssembledEntry = undefined;
+var seg_arena: [8192]u8 = undefined;
+var seg_re: report.Reassembler = undefined;
+var seg_assembled: usize = 0;
+var seg_members: usize = 0;
+var seg_segments: u32 = 0;
+var seg_errors: usize = 0;
+
+fn onSegment(_: *anyopaque, r: report.Report) void {
+    const done = seg_re.push(r) catch {
+        seg_errors += 1;
+        seg_re.reset();
+        return;
+    };
+    if (done) |a| {
+        seg_assembled += 1;
+        seg_members = a.entries.len;
+        seg_segments = a.segments;
+    }
+}
+
+test "our client reassembles a segmented report our server split over the wire" {
+    var fx: WideFixture = .{};
+    const model = try fx.init();
+    var srv = Server.init(.{}, model);
+    var paired = Paired{ .server = &srv };
+    var buf: [65536]u8 = undefined;
+    // The client tells the server how big a PDU it can take, and the server
+    // segments against exactly that.
+    var c = try client.Client.init(paired.seam(), &buf, .{ .local_detail = 900 });
+    try c.connect();
+    try testing.expectEqual(@as(usize, 900), srv.negotiated_pdu_len);
+
+    seg_re = report.Reassembler.init(&seg_slots, &seg_arena);
+    seg_assembled = 0;
+    seg_errors = 0;
+    var dummy: u8 = 0;
+    c.setReportHandler(.{ .ctx = &dummy, .on_report = onSegment });
+
+    const rcb_ref = domain ++ "/LLN0.WideRCB01";
+    try c.enableReporting(rcb_ref, .unbuffered, .{
+        .data_change = true,
+        .general_interrogation = true,
+    }, null);
+    try c.generalInterrogation(rcb_ref, .unbuffered);
+    try drainReports(&paired, &c, 24);
+
+    // One report arrived, in several PDUs, carrying all twelve members.
+    try testing.expectEqual(@as(usize, 1), seg_assembled);
+    try testing.expectEqual(@as(usize, 12), seg_members);
+    try testing.expect(seg_segments > 1);
+    try testing.expectEqual(@as(usize, 0), seg_errors);
+    try testing.expectEqual(@as(u64, seg_segments), srv.reports_sent);
+    // …and the block is finished, not stuck half-way.
+    try testing.expect(!srv.model.report_controls[0].segmenting());
+    try testing.expectEqual(@as(u32, 1), srv.model.report_controls[0].sq_num);
+    c.disconnect();
+}
+
+test "a client re-points a running server's RCB at another data set over MMS" {
+    var fx: WideFixture = .{};
+    const model = try fx.init();
+    var srv = Server.init(.{}, model);
+    var paired = Paired{ .server = &srv };
+    var buf: [65536]u8 = undefined;
+    var c = try client.Client.init(paired.seam(), &buf, .{});
+    try c.connect();
+
+    const rcb = domain ++ "/LLN0.WideRCB01";
+    var vbuf: [64]u8 = undefined;
+
+    // While enabled, the write is refused and the binding does not move.
+    try c.enableReporting(rcb, .unbuffered, .{ .data_change = true }, null);
+    var w = ber.Writer.init(&vbuf);
+    try mmsdata.Emit.visibleString(&w, domain ++ "/LLN0$Narrow");
+    try testing.expectError(
+        error.AccessFailed,
+        c.writeObject(rcb ++ ".DatSet", .RP, w.done()),
+    );
+    try testing.expectEqualStrings(domain ++ "/LLN0$Wide", srv.model.report_controls[0].datSet());
+    try testing.expectEqual(@as(u32, 1), srv.model.report_controls[0].conf_rev);
+
+    // Disabled, it takes — and `ConfRev` moves, which is how every other client
+    // learns its cached configuration is stale.
+    try c.disableReporting(rcb, .unbuffered);
+    var w2 = ber.Writer.init(&vbuf);
+    try mmsdata.Emit.visibleString(&w2, domain ++ "/LLN0$Narrow");
+    try c.writeObject(rcb ++ ".DatSet", .RP, w2.done());
+    try testing.expectEqual(@as(usize, 1), srv.model.report_controls[0].data_set);
+    try testing.expectEqual(@as(u32, 2), srv.model.report_controls[0].conf_rev);
+
+    // The RCB now reads back the new binding.
+    const read = try c.readRcb(rcb, .unbuffered);
+    try testing.expectEqualStrings(domain ++ "/LLN0$Narrow", read.dat_set);
+    try testing.expectEqual(@as(u32, 2), read.conf_rev);
+
+    // A data set that does not resolve is refused and changes nothing.
+    var w3 = ber.Writer.init(&vbuf);
+    try mmsdata.Emit.visibleString(&w3, domain ++ "/LLN0$Imaginary");
+    try testing.expectError(
+        error.AccessFailed,
+        c.writeObject(rcb ++ ".DatSet", .RP, w3.done()),
+    );
+    try testing.expectEqual(@as(usize, 1), srv.model.report_controls[0].data_set);
+    try testing.expectEqual(@as(u32, 2), srv.model.report_controls[0].conf_rev);
+
+    // …and the re-bound block reports the *new* data set: two members, not
+    // twelve.
+    try c.enableReporting(rcb, .unbuffered, .{ .general_interrogation = true }, null);
+    seg_re = report.Reassembler.init(&seg_slots, &seg_arena);
+    seg_assembled = 0;
+    var dummy: u8 = 0;
+    c.setReportHandler(.{ .ctx = &dummy, .on_report = onSegment });
+    try c.generalInterrogation(rcb, .unbuffered);
+    try drainReports(&paired, &c, 12);
+    try testing.expectEqual(@as(usize, 1), seg_assembled);
+    try testing.expectEqual(@as(usize, 2), seg_members);
+    c.disconnect();
+}
+
+test "two associations contend for one RCB and the reservation decides" {
+    var fx: WideFixture = .{};
+    const model = try fx.init();
+    var srv = Server.init(.{}, model);
+    // Two clients on one model. `Server.peer` is the association a frame
+    // arrived on; the caller sets it before handing the frame over, which is
+    // exactly what a multiplexing front end does.
+    const alice: u32 = 0xC0A8_0102;
+    const bob: u32 = 0xC0A8_0103;
+
+    var paired = Paired{ .server = &srv };
+    var buf: [65536]u8 = undefined;
+    var c = try client.Client.init(paired.seam(), &buf, .{});
+    srv.peer = alice;
+    try c.connect();
+
+    const rcb = domain ++ "/LLN0.WideRCB01";
+    var vbuf: [16]u8 = undefined;
+    var w = ber.Writer.init(&vbuf);
+    try mmsdata.Emit.boolean(&w, true);
+    const yes = w.done();
+
+    // Alice reserves it.
+    try c.writeObject(rcb ++ ".Resv", .RP, yes);
+    try testing.expect(srv.model.report_controls[0].resv);
+    try testing.expectEqual(alice, srv.model.report_controls[0].owner.?);
+
+    // `Owner` names her, in the four octets of her address.
+    const owner = try c.readObject(rcb ++ ".Owner", .RP);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xC0, 0xA8, 0x01, 0x02 }, try owner.octetString());
+
+    // Bob's frames arrive on his own association and he can do nothing at all.
+    srv.peer = bob;
+    try testing.expectError(error.AccessFailed, c.writeObject(rcb ++ ".RptEna", .RP, yes));
+    try testing.expectError(error.AccessFailed, c.writeObject(rcb ++ ".Resv", .RP, yes));
+    try testing.expect(!srv.model.report_controls[0].rpt_ena);
+    // He may still *read* it — a reservation is not access control.
+    const resv = try c.readObject(rcb ++ ".Resv", .RP);
+    try testing.expectEqual(true, try resv.boolean());
+
+    // Alice enables it, and Bob still cannot take it.
+    srv.peer = alice;
+    try c.writeObject(rcb ++ ".RptEna", .RP, yes);
+    srv.peer = bob;
+    try testing.expectError(error.AccessFailed, c.writeObject(rcb ++ ".RptEna", .RP, yes));
+
+    // Alice's association drops. A URCB reservation does not survive it.
+    srv.releaseAssociationOf(alice);
+    try testing.expect(!srv.model.report_controls[0].resv);
+    try testing.expect(srv.model.report_controls[0].owner == null);
+
+    // Now Bob walks in, and `Owner` names him.
+    srv.peer = bob;
+    srv.associated = true;
+    try c.writeObject(rcb ++ ".RptEna", .RP, yes);
+    try testing.expectEqual(bob, srv.model.report_controls[0].owner.?);
+    const owner2 = try c.readObject(rcb ++ ".Owner", .RP);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xC0, 0xA8, 0x01, 0x03 }, try owner2.octetString());
+    c.disconnect();
+}
+
+test "a client deletes log entries over MMS and cannot delete the journal" {
+    var fx: ReportFixture = .{};
+    const model = try fx.init();
+    var srv = Server.init(.{}, model);
+    var paired = Paired{ .server = &srv };
+    var buf: [65536]u8 = undefined;
+    var c = try client.Client.init(paired.seam(), &buf, .{});
+    try c.connect();
+
+    srv.model.logs[0].log_ena = true;
+    srv.tick(1_700_000_000_000);
+    for ([_]usize{ 0, 1, 2, 3 }) |i| {
+        fx.vars[i].len = try emitBool(&fx.ind[i], true);
+        srv.signal(i, .data_change);
+    }
+    try testing.expectEqual(@as(usize, 4), srv.model.logs[0].store.count);
+
+    const journal = domain ++ "/LLN0$EventLog";
+    // Delete everything up to entry 2.
+    var id: [8]u8 = undefined;
+    std.mem.writeInt(u64, &id, 2, .big);
+    try testing.expectEqual(@as(u32, 2), try c.initializeJournal(journal, .{ .limiting_entry = &id }));
+    try testing.expectEqual(@as(usize, 2), srv.model.logs[0].store.count);
+    try testing.expectEqual(@as(u64, 2), srv.journal_deletions);
+
+    // A deletion reaching past the end deletes what is left, not an error.
+    std.mem.writeInt(u64, &id, 1000, .big);
+    try testing.expectEqual(@as(u32, 2), try c.initializeJournal(journal, .{ .limiting_entry = &id }));
+    try testing.expectEqual(@as(usize, 0), srv.model.logs[0].store.count);
+    try testing.expectEqual(@as(u32, 0), try c.initializeJournal(journal, .{}));
+
+    // A journal this server does not serve, and the journal object itself.
+    try testing.expectError(error.ServiceFailed, c.initializeJournal(domain ++ "/LLN0$NoSuchLog", .{}));
+    try testing.expectError(error.ServiceFailed, c.deleteJournal(journal));
+    try testing.expectError(error.ServiceFailed, c.deleteJournal(domain ++ "/LLN0$NoSuchLog"));
+    c.disconnect();
+}
+
+test "a client filters a journal query to one variable over MMS" {
+    var fx: ReportFixture = .{};
+    const model = try fx.init();
+    var srv = Server.init(.{}, model);
+    var paired = Paired{ .server = &srv };
+    var buf: [65536]u8 = undefined;
+    var c = try client.Client.init(paired.seam(), &buf, .{});
+    try c.connect();
+
+    srv.model.logs[0].log_ena = true;
+    srv.tick(1_700_000_000_000);
+    for ([_]usize{ 0, 1, 2 }) |i| {
+        fx.vars[i].len = try emitBool(&fx.ind[i], true);
+        srv.signal(i, .data_change);
+    }
+
+    const journal = domain ++ "/LLN0$EventLog";
+    const wanted = domain ++ "/GGIO1$ST$Ind2$stVal";
+    const resp = try c.readJournalFiltered(journal, .{}, &[_][]const u8{wanted});
+    var it = resp.entries;
+    var entries: usize = 0;
+    var vars: usize = 0;
+    var tag: []const u8 = "";
+    while (try it.next()) |e| : (entries += 1) {
+        var vi = e.iterate();
+        while (try vi.next()) |v| {
+            tag = v.tag;
+            vars += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), entries);
+    try testing.expectEqual(@as(usize, 1), vars);
+    try testing.expectEqualStrings(wanted, tag);
+    c.disconnect();
+}
+
+test "an abandoned setting-group edit expires on the server's own clock" {
+    var fx: SettingFixture = .{};
+    const model = try fx.init();
+    var srv = Server.init(.{}, model);
+    fx.sgcb.resv_tms = 30;
+    var paired = Paired{ .server = &srv };
+    var buf: [65536]u8 = undefined;
+    var c = try client.Client.init(paired.seam(), &buf, .{});
+    srv.peer = 1;
+    try c.connect();
+
+    var vbuf: [16]u8 = undefined;
+    var w = ber.Writer.init(&vbuf);
+    try mmsdata.Emit.unsigned(&w, 2);
+    try c.writeObject(domain ++ "/LLN0.SGCB.EditSG", .SP, w.done());
+    try testing.expectEqual(@as(u8, 2), fx.sgcb.edit_sg);
+
+    // A second client cannot take it while it is live…
+    srv.peer = 2;
+    var w2 = ber.Writer.init(&vbuf);
+    try mmsdata.Emit.unsigned(&w2, 3);
+    try testing.expectError(
+        error.AccessFailed,
+        c.writeObject(domain ++ "/LLN0.SGCB.EditSG", .SP, w2.done()),
+    );
+
+    // …but the first one goes quiet without dropping its association, and the
+    // server takes the selection back on its own clock.
+    srv.tick(31_000);
+    try testing.expectEqual(@as(u8, 0), fx.sgcb.edit_sg);
+    try testing.expectEqual(@as(u64, 1), fx.sgcb.expirations);
+    var w3 = ber.Writer.init(&vbuf);
+    try mmsdata.Emit.unsigned(&w3, 3);
+    try c.writeObject(domain ++ "/LLN0.SGCB.EditSG", .SP, w3.done());
+    try testing.expectEqual(@as(u32, 2), fx.sgcb.editor.?);
+    c.disconnect();
 }

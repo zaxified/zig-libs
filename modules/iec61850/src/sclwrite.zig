@@ -276,7 +276,7 @@ fn emitLn(w: *Writer, ln: scl.Ln) Error!void {
     try w.attr("lnType", ln.ln_type);
     const empty = ln.dois.len == 0 and ln.data_sets.len == 0 and
         ln.report_controls.len == 0 and ln.gse_controls.len == 0 and
-        ln.log_controls.len == 0 and ln.setting_control == null;
+        ln.log_controls.len == 0 and ln.logs.len == 0 and ln.setting_control == null;
     if (empty) return w.closeEmpty();
     try w.closeOpen();
 
@@ -343,6 +343,16 @@ fn emitLn(w: *Writer, ln: scl.Ln) Error!void {
     }
 
     for (ln.dois) |d| try emitDoi(w, d);
+
+    // `<Log>` sits after the `DOI`s in `tAnyLN`'s sequence, which is where the
+    // schema puts it and where every generator reading the file back expects
+    // it. A log with no name is legal — it is the node's default log.
+    for (ln.logs) |l| {
+        try w.open("Log");
+        try w.attrIf("name", l.name);
+        try w.attrIf("desc", l.desc);
+        try w.closeEmpty();
+    }
     try w.end(tag);
 }
 
@@ -906,4 +916,70 @@ test "the emitted namespace is the one the caller asked for" {
     var back = try xml.parse(testing.allocator, out, .{ .id_attr_names = &.{} });
     defer back.deinit();
     try testing.expectEqualStrings(scl.ns_2003, back.root.uri);
+}
+
+test "a Log element survives the round trip and is emitted after the DOIs" {
+    const src =
+        \\<?xml version="1.0" encoding="UTF-8"?>
+        \\<SCL xmlns="http://www.iec.ch/61850/2003/SCL">
+        \\  <IED name="LOGIED">
+        \\    <AccessPoint name="AP1">
+        \\      <Server>
+        \\        <LDevice inst="LD0">
+        \\          <LN0 lnClass="LLN0" inst="" lnType="LLN0type">
+        \\            <DataSet name="Events">
+        \\              <FCDA ldInst="LD0" lnClass="GGIO" lnInst="1" doName="Ind1" daName="stVal" fc="ST"/>
+        \\            </DataSet>
+        \\            <LogControl name="LogCB" datSet="Events" logName="GeneralLog" logEna="true"/>
+        \\            <Log name="GeneralLog"/>
+        \\            <Log name="SecondLog" desc="the other one"/>
+        \\            <Log/>
+        \\          </LN0>
+        \\          <LN lnClass="GGIO" inst="1" lnType="GGIOtype"/>
+        \\        </LDevice>
+        \\      </Server>
+        \\    </AccessPoint>
+        \\  </IED>
+        \\  <DataTypeTemplates>
+        \\    <LNodeType id="LLN0type" lnClass="LLN0">
+        \\      <DO name="Mod" type="INCtype"/>
+        \\    </LNodeType>
+        \\    <LNodeType id="GGIOtype" lnClass="GGIO">
+        \\      <DO name="Ind1" type="SPStype"/>
+        \\    </LNodeType>
+        \\    <DOType id="INCtype" cdc="INC">
+        \\      <DA name="stVal" bType="INT32" fc="ST"/>
+        \\    </DOType>
+        \\    <DOType id="SPStype" cdc="SPS">
+        \\      <DA name="stVal" bType="BOOLEAN" fc="ST"/>
+        \\    </DOType>
+        \\  </DataTypeTemplates>
+        \\</SCL>
+    ;
+    var a = try scl.parse(testing.allocator, src, .{});
+    defer a.deinit();
+    const ln0 = a.ieds[0].access_points[0].devices[0].lns[0];
+    try testing.expectEqual(@as(usize, 3), ln0.logs.len);
+    try testing.expectEqualStrings("GeneralLog", ln0.logs[0].name);
+    try testing.expectEqualStrings("the other one", ln0.logs[1].desc);
+    // A `<Log/>` with no name is the node's default log, not an error.
+    try testing.expectEqualStrings("", ln0.logs[2].name);
+
+    const out = try emitParsed(testing.allocator, &a, .{});
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "<Log name=\"GeneralLog\"/>") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "<Log name=\"SecondLog\" desc=\"the other one\"/>") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "<Log/>") != null);
+    // …after the DOIs, which is where `tAnyLN` sequences it.
+    const log_at = std.mem.indexOf(u8, out, "<Log ").?;
+    const lcb_at = std.mem.indexOf(u8, out, "<LogControl ").?;
+    try testing.expect(lcb_at < log_at);
+
+    var b = try scl.parse(testing.allocator, out, .{});
+    defer b.deinit();
+    const ln0b = b.ieds[0].access_points[0].devices[0].lns[0];
+    try testing.expectEqual(@as(usize, 3), ln0b.logs.len);
+    try testing.expectEqualStrings("SecondLog", ln0b.logs[1].name);
+
+    try roundTrip(src, "LOGIED");
 }

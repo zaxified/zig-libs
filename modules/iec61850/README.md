@@ -116,18 +116,31 @@ for the ride.
   `ReasonCode`; `BufTm` **coalesces** a burst into one report instead of a storm;
   and a BRCB **retains** what happened while no client was listening, resuming
   from the client's `EntryID` and raising `BufOvfl` when its bounded, caller-owned
-  buffer wraps over something undelivered. Pure and time-injected: `BufTm` and
-  `IntgPd` expire because the caller calls `tick`.
+  buffer wraps over something undelivered. A report larger than the negotiated
+  PDU is **segmented** — `SubSeqNum`, `MoreSegmentsFollow` and a per-segment
+  inclusion bit string, with one `SqNum` and one `EntryID` across the set —
+  and `report.Reassembler` is the client-side half that puts one back together.
+  A client may **re-bind `DatSet`** at runtime, which re-resolves the data set
+  and bumps `ConfRev`, and is refused while `RptEna` is set. `Resv` (URCB),
+  `ResvTms` (BRCB, including the timed reservation that outlives the
+  association) and `Owner` arbitrate **two clients contending for one block**.
+  Pure and time-injected: `BufTm`, `IntgPd` and a reservation lifetime expire
+  because the caller calls `tick`.
 - **`logging`** — IEC 61850-7-2 §18. The `LCB` (`LogEna`, `LogRef`, `DatSet`,
   `OldEntrTm`, `NewEntrTm`, `OldEntr`, `NewEntr`, `TrgOps`, `IntgPd`), a bounded
   circular log over caller-owned storage, and the MMS journal services
-  `ReadJournal` and `GetJournalStatus` in both directions.
+  `ReadJournal` (with `listOfVariables` filtering), `GetJournalStatus`,
+  `InitializeJournal` (deleting entries by time or `EntryID`) and
+  `DeleteJournal` in both directions.
 - **`settinggroups`** — IEC 61850-7-2 §19. `SelectActiveSG`, `SelectEditSG`,
   `SetEditSGValue`, `ConfirmEditSGValues` and `GetSGValues` over the `SGCB` and
   the `SE`/`SG` functional constraints. **An uncommitted edit is invisible**:
   writing `SE` changes the edit buffer, `SG` still reads the active group, and a
   confirm with no preceding edit is refused rather than committing an empty
-  buffer over a live relay setting.
+  buffer over a live relay setting. `ResvTms` bounds an **abandoned** edit: a
+  selection that goes quiet for that many seconds is taken back on `tick`, so a
+  client that vanishes without dropping its association cannot hold the setting
+  groups for ever.
 - **`server`** — a `Server`: the IED side as a pure function from one packet to
   one packet, backed by a caller-supplied table of named variables, data sets,
   **control objects, report control blocks, logs and setting groups**. It
@@ -360,7 +373,7 @@ zig build test-iec61850 -Doptimize=ReleaseFast
 zig fmt --check modules/iec61850
 ```
 
-349 tests, of which 341 are fully offline. The eight live tests skip gracefully
+395 tests, of which 385 are fully offline. The ten live tests skip gracefully
 (printing `SKIPPED:` and passing) when no peer is present:
 
 ```
@@ -386,6 +399,13 @@ IEC61850_TEST_LISTEN_CONTROL=127.0.0.1:102 zig build test-iec61850
 IEC61850_TEST_LISTEN_REPORT=127.0.0.1:10102 IEC61850_TEST_PEERS=3 \
   zig build test-iec61850
 
+# a real client reassembling a SEGMENTED report (a data set wider than one PDU)
+IEC61850_TEST_LISTEN_SEGMENT=127.0.0.1:102 zig build test-iec61850
+
+# TWO real clients contending for one RCB: Resv, Owner and the refusal
+IEC61850_TEST_LISTEN_RESV=127.0.0.1:102 IEC61850_TEST_PEERS=3 \
+  zig build test-iec61850
+
 # an SCL file through parse -> emit -> parse, name space compared
 IEC61850_TEST_SCL_FILE=./ied.icd IEC61850_TEST_SCL_OUT=/tmp/out.icd \
   zig build test-iec61850
@@ -403,7 +423,7 @@ association handshake rebuilt from scratch and the `TypeSpecification` of a
 select-before-operate control object rebuilt octet for octet from this module's
 own model. On top of that: full client↔server round trips over an in-memory wire
 covering all four control models, a publisher↔subscriber round trip with an
-injected clock and a deliberately dropped frame, and 20 `std.testing.fuzz`
+injected clock and a deliberately dropped frame, and 25 `std.testing.fuzz`
 sweeps. See SPEC.md for what is third-party-validated versus self-derived, and
 what is deferred.
 
@@ -417,10 +437,19 @@ its own tests: a reference stack's reporting and log example clients were
 pointed at this server and observed to receive data-change, integrity and
 general-interrogation reports with the right per-member reason codes, to read
 the URCB and the fourteen-member BRCB, and to read a log back over
-`ReadJournal`. The **SCL writer** was checked by emitting 44 real configuration
-files and re-resolving each emission to the identical name space, and by feeding
-every emission to a third-party SCL model generator — none rejected. See SPEC.md
-for exactly what ran in which direction.
+`ReadJournal`. **Segmentation and reservation are driven the same way**: a
+reference client subscribing to a data set wider than the negotiated PDU
+received a report split into two `InformationReport`s and printed every one of
+its twelve members with the right reference and reason; and **two** reference
+clients pointed at one report control block resolved as they should — the first
+took `Resv` and became `Owner`, the second's write came back
+`object-access-denied` and its own stack reported the failure, while a third
+association read the twelve-member URCB structure and saw `Resv = true` and
+`Owner = c0a80101`. The **SCL writer** was checked by emitting 44 real
+configuration files and re-resolving each emission to the identical name space,
+and by feeding every emission to a third-party SCL model generator — none
+rejected, and **36 of the 44 produce a byte-identical generated model**. See
+SPEC.md for exactly what ran in which direction.
 
 Provenance: clean-room from the published ISO 8073 / RFC 1006 / ISO 8327 / ISO
 8823 / ISO 8650 / ISO 9506 / IEC 61850-8-1 layouts. No third-party source was

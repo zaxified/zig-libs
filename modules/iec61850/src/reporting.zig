@@ -27,9 +27,29 @@
 //! A URCB's buffer is purged on disable, which is the other half of the
 //! definition.
 //!
-//! **There is no clock.** `BufTm` and `IntgPd` are deadlines the caller advances
-//! by calling `tick`, exactly like the control model's `sboTimeout`. Nothing
-//! here reads a real clock or owns a thread.
+//! **There is no clock.** `BufTm`, `IntgPd` and a `ResvTms` reservation are
+//! deadlines the caller advances by calling `tick`, exactly like the control
+//! model's `sboTimeout`. Nothing here reads a real clock or owns a thread.
+//!
+//! Three more things this block does, all of them about *other clients*:
+//!
+//! - **Segmentation.** A report larger than the negotiated MMS PDU is split.
+//!   Every segment repeats the header and carries `SubSeqNum` and
+//!   `MoreSegmentsFollow`; the whole set shares one `SqNum`, one `EntryID` and
+//!   one `TimeOfEntry`, and each segment's **inclusion bit string is its own** —
+//!   full data-set width, bits set only for the members it carries. That last
+//!   choice is what lets a receiver that does not reassemble still name every
+//!   member correctly, and it is what a third-party client was observed doing.
+//! - **Runtime `DatSet`.** A client may re-point a **disabled** block at another
+//!   data set; that re-resolves it, bumps `ConfRev` and throws the buffer away.
+//!   While `RptEna` is set the write is refused — the ordering rule is the whole
+//!   safety property, because otherwise one client silently changes what another
+//!   is subscribed to.
+//! - **Reservation.** `Resv` (URCB) and `ResvTms` (BRCB) name the client that
+//!   holds the block, `Owner` reports who that is, and every write from anyone
+//!   else is refused. A URCB reservation dies with its association; a BRCB's
+//!   outlives it by `ResvTms` seconds, which is what lets a client reconnect and
+//!   still own its buffer.
 //!
 //! Storage is caller-owned throughout: a `Buffer` is a slice of `Entry` plus a
 //! byte arena split into equal slots, one per entry. Nothing allocates.
@@ -59,7 +79,14 @@ pub const Error = report.Error || error{
     ReportEnabled,
     /// The `DatSet` this block names does not resolve to a data set.
     UnknownDataSet,
+    /// One data-set member on its own is larger than a whole report segment,
+    /// so segmentation cannot make progress. Never a truncated member.
+    SegmentTooSmall,
 };
+
+/// The longest `DatSet` / `RptID` a client may bind at runtime. It is
+/// `acsi.max_reference_len`, restated here so this file stays dependency-free.
+pub const max_reference_len: usize = 129;
 
 /// The largest data set a control block reports on. The inclusion bit string is
 /// carried in a `u64`, which is the bound — and 64 is comfortably above the
@@ -140,6 +167,11 @@ pub const Source = struct {
         count: *const fn (ctx: *anyopaque, data_set: usize) usize,
         value: *const fn (ctx: *anyopaque, data_set: usize, member: usize) ?[]const u8,
         reference: *const fn (ctx: *anyopaque, data_set: usize, member: usize, out: []u8) ?[]const u8,
+        /// Resolves a `DatSet` reference — `LD/LLN0$Events`, exactly as it goes
+        /// on the wire — to a data-set index. Optional: a vtable that leaves it
+        /// null simply refuses a runtime `DatSet` re-bind, which is what this
+        /// engine did before the seam existed.
+        resolve: ?*const fn (ctx: *anyopaque, ds_reference: []const u8) ?usize = null,
     };
 
     pub fn count(self: Source, data_set: usize) usize {
@@ -150,6 +182,12 @@ pub const Source = struct {
     }
     pub fn reference(self: Source, data_set: usize, member: usize, out: []u8) ?[]const u8 {
         return self.vtable.reference(self.ctx, data_set, member, out);
+    }
+    /// Null when this source cannot resolve names at all, which is a different
+    /// answer from "no such data set".
+    pub fn resolve(self: Source, ds_reference: []const u8) ??usize {
+        const f = self.vtable.resolve orelse return null;
+        return f(self.ctx, ds_reference);
     }
 };
 
@@ -318,15 +356,48 @@ pub const ControlBlock = struct {
     intg_pd_ms: u32 = 0,
     /// Storage for buffered entries. `Buffer.none` disables buffering entirely.
     buffer: Buffer = Buffer.none,
+    /// The largest `InformationReport` this block emits, in octets. Zero means
+    /// "no limit": a report that does not fit the caller's writer is a
+    /// `BufferTooSmall`, which is what this engine did before segmentation
+    /// existed. Set it to the **negotiated MMS PDU size** and set
+    /// `OptFlds.segmentation`, and a report larger than that is split instead.
+    max_pdu_len: usize = 0,
+    /// Whether `Owner` is part of this block's MMS structure. Edition 2 puts it
+    /// there; edition 1 does not, and a client that reads a structure it did
+    /// not expect gets the fields wrong — so this is opt-in and the attribute
+    /// stays readable by name either way.
+    include_owner: bool = false,
 
     // state
     rpt_ena: bool = false,
     /// URCB only: the reservation a client takes so a second client cannot
-    /// enable the block underneath it.
+    /// enable the block underneath it. Released when the owning association
+    /// drops.
     resv: bool = false,
-    /// URCB, edition 2: the reservation lifetime in seconds. Modelled as a
-    /// value, not as a timer — nothing here expires it.
+    /// BRCB only, edition 2: the reservation lifetime in **seconds**.
+    ///
+    /// - `0` — not reserved.
+    /// - `> 0` — reserved for the writing client, and the reservation outlives
+    ///   the association by that many seconds, which is the whole point: a
+    ///   client that reconnects inside the window still owns its buffer.
+    /// - `-1` — reserved until the owning client writes `0`.
     resv_tms: i16 = 0,
+    /// When a timed (`ResvTms > 0`) reservation lapses. Zero means no timer is
+    /// running. Advanced by `tick`, like every other deadline here.
+    resv_deadline_ms: u64 = 0,
+    /// Inline storage for a `DatSet` a client re-bound at runtime. Read it with
+    /// `datSet()`, never directly: the block stays **movable** because nothing
+    /// points into it.
+    dat_set_buf: [max_reference_len]u8 = undefined,
+    dat_set_len: u8 = 0,
+    /// The same for `RptID`.
+    rpt_id_buf: [max_reference_len]u8 = undefined,
+    rpt_id_len: u8 = 0,
+    /// Segmentation state: which included member the next segment starts at,
+    /// and the `SubSeqNum` it carries. `seg_member == 0 and sub_seq_num == 0`
+    /// is "no segmented report in flight".
+    seg_member: usize = 0,
+    sub_seq_num: u32 = 0,
     /// BRCB only.
     purge_buf: bool = false,
     gi: bool = false,
@@ -356,25 +427,135 @@ pub const ControlBlock = struct {
         if (self.rpt_ena) return;
         self.rpt_ena = true;
         self.owner = peer;
+        // Enabling clears a pending timed reservation: the client is back.
+        self.resv_deadline_ms = 0;
         if (self.kind == .unbuffered) {
             self.buffer.clear();
             self.send_cursor = self.next_entry_id;
         }
+        self.resetSegmentation();
         self.next_integrity_ms = now_ms +| self.intg_pd_ms;
     }
 
     pub fn disable(self: *ControlBlock) void {
         self.rpt_ena = false;
-        self.owner = null;
         self.gi = false;
+        // A block that is *reserved* keeps its owner across a disable —
+        // otherwise the reservation would name nobody and the next client
+        // would walk straight in.
+        if (self.reservedBy() == null) self.owner = null;
         if (self.kind == .unbuffered) self.buffer.clear();
+        self.resetSegmentation();
     }
 
     /// The association went away. A URCB loses everything including its
     /// reservation; a BRCB keeps its buffer — that is the guarantee.
+    ///
+    /// This is the single-association form and it releases the block
+    /// unconditionally. `associationLostBy` is the multi-client one.
     pub fn associationLost(self: *ControlBlock) void {
-        self.disable();
-        if (self.kind == .unbuffered) self.resv = false;
+        self.rpt_ena = false;
+        self.gi = false;
+        if (self.kind == .unbuffered) {
+            self.buffer.clear();
+            self.resv = false;
+        }
+        self.owner = null;
+        self.resv_deadline_ms = 0;
+        self.resetSegmentation();
+    }
+
+    /// One of several associations went away. A block another client holds is
+    /// left alone; the holder's own block is released **according to its
+    /// reservation**:
+    ///
+    /// - a URCB drops `Resv` — the reservation does not outlive the association
+    ///   that took it;
+    /// - a BRCB with `ResvTms > 0` keeps its owner for that many seconds, so a
+    ///   client that reconnects inside the window still owns its buffer;
+    /// - a BRCB with `ResvTms == -1` keeps it until the client releases it;
+    /// - anything else is released now.
+    pub fn associationLostBy(self: *ControlBlock, peer: u32, now_ms: u64) void {
+        const o = self.owner orelse return;
+        if (o != peer) return;
+        self.rpt_ena = false;
+        self.gi = false;
+        self.resetSegmentation();
+        if (self.kind == .unbuffered) {
+            self.buffer.clear();
+            self.resv = false;
+            self.owner = null;
+            return;
+        }
+        if (self.resv_tms > 0) {
+            self.resv_deadline_ms = now_ms +| (@as(u64, @intCast(self.resv_tms)) * 1000);
+            return;
+        }
+        if (self.resv_tms < 0) return;
+        self.owner = null;
+    }
+
+    /// Which client the *reservation* names, ignoring who merely enabled the
+    /// block. Null when the block is not reserved.
+    pub fn reservedBy(self: *const ControlBlock) ?u32 {
+        return switch (self.kind) {
+            .unbuffered => if (self.resv) self.owner else null,
+            .buffered => if (self.resv_tms != 0) self.owner else null,
+        };
+    }
+
+    /// Which client currently holds the block against every other one: the
+    /// reservation if there is one, otherwise whoever enabled it. This is the
+    /// predicate a second association is refused by.
+    pub fn heldBy(self: *const ControlBlock) ?u32 {
+        if (self.rpt_ena) return self.owner;
+        return self.reservedBy();
+    }
+
+    fn resetSegmentation(self: *ControlBlock) void {
+        self.seg_member = 0;
+        self.sub_seq_num = 0;
+    }
+
+    /// `DatSet` as it stands: the reference a client re-bound at runtime, or the
+    /// configured one. Never a pointer into the block, so the block may be
+    /// moved.
+    pub fn datSet(self: *const ControlBlock) []const u8 {
+        return if (self.dat_set_len > 0) self.dat_set_buf[0..self.dat_set_len] else self.dat_set;
+    }
+
+    /// `RptID` as it stands. An unconfigured `RptID` reads back as the block's
+    /// own reference, which is what the standard says.
+    pub fn rptId(self: *const ControlBlock) []const u8 {
+        if (self.rpt_id_len > 0) return self.rpt_id_buf[0..self.rpt_id_len];
+        return if (self.rpt_id.len > 0) self.rpt_id else self.item;
+    }
+
+    /// Re-points the block at another data set — the server side of a client
+    /// writing `DatSet`.
+    ///
+    /// Two rules make this safe and they are the whole of it: the block must be
+    /// **disabled** (otherwise a client silently changes what another client is
+    /// subscribed to), and `ConfRev` is **bumped**, which is how every other
+    /// client learns its cached configuration is stale. The buffer is thrown
+    /// away because its entries index members of the *old* data set.
+    pub fn rebind(self: *ControlBlock, src: Source, reference: []const u8) Error!void {
+        if (self.rpt_ena) return error.ReportEnabled;
+        if (reference.len > max_reference_len) return error.UnknownDataSet;
+        const answer = src.resolve(reference) orelse return error.UnknownDataSet;
+        const idx = answer orelse return error.UnknownDataSet;
+        // Writing back the value that was read is not a reconfiguration, and
+        // every client stack observed here does exactly that when it sets an
+        // RCB. Bumping `ConfRev` for it would tell every *other* client its
+        // cached configuration had changed when nothing had.
+        if (std.mem.eql(u8, reference, self.datSet())) return;
+        @memcpy(self.dat_set_buf[0..reference.len], reference);
+        self.dat_set_len = @intCast(reference.len);
+        self.data_set = idx;
+        self.conf_rev +%= 1;
+        self.buffer.clear();
+        self.send_cursor = self.next_entry_id;
+        self.resetSegmentation();
     }
 
     /// Resumes delivery after the `EntryID` a client last acknowledged.
@@ -448,6 +629,13 @@ pub const ControlBlock = struct {
     /// became sendable.
     pub fn tick(self: *ControlBlock, src: Source, now_ms: u64) Error!bool {
         var produced = false;
+        // A timed reservation lapses here, not on a thread — same rule as every
+        // other deadline in this module.
+        if (self.resv_deadline_ms != 0 and now_ms >= self.resv_deadline_ms) {
+            self.resv_deadline_ms = 0;
+            self.resv_tms = 0;
+            if (!self.rpt_ena) self.owner = null;
+        }
         if (self.buffer.openIndex()) |i| {
             const e = self.buffer.at(i);
             if (now_ms >= e.deadline_ms) {
@@ -531,12 +719,35 @@ pub const ControlBlock = struct {
         return null;
     }
 
+    /// Whether a segmented report is half-delivered. `emitNext` must be called
+    /// again — the entry is not released and `SqNum` does not advance until the
+    /// last segment is out.
+    pub fn segmenting(self: *const ControlBlock) bool {
+        return self.seg_member > 0;
+    }
+
     /// Encodes the next pending report as a complete `InformationReport` PDU and
     /// advances the block's state. Returns false when nothing is pending.
     ///
     /// `w` is a backwards writer over the caller's buffer; the PDU it leaves is
     /// `w.done()`.
+    ///
+    /// **Segmentation.** When `OptFlds.segmentation` is set and `max_pdu_len` is
+    /// non-zero, a report that does not fit is split: each call produces one
+    /// segment carrying `SubSeqNum` (0 upwards) and `MoreSegmentsFollow`, and
+    /// the whole set shares one `SqNum`, one `EntryID` and one `TimeOfEntry`.
+    /// Each segment's **inclusion bit string is that segment's own** — full
+    /// data-set width, bits set only for the members it carries — which is what
+    /// lets a receiver map values back to members without `data-reference`, and
+    /// what `report.Report.decode` already reads.
     pub fn emitNext(self: *ControlBlock, src: Source, w: *ber.Writer) Error!bool {
+        return self.emitNextWithin(src, w, 0);
+    }
+
+    /// `emitNext` with the caller's own PDU limit folded in — the negotiated MMS
+    /// PDU size, which the block itself has no way of knowing. The effective
+    /// budget is the smaller of the two; zero on both sides means no limit.
+    pub fn emitNextWithin(self: *ControlBlock, src: Source, w: *ber.Writer, limit: usize) Error!bool {
         const idx = self.pendingIndex() orelse return false;
         const e = self.buffer.at(idx);
         const slot = self.buffer.slotOf(idx);
@@ -572,16 +783,60 @@ pub const ControlBlock = struct {
         var id_bytes: [entry_id_len]u8 = undefined;
         std.mem.writeInt(u64, &id_bytes, e.entry_id, .big);
 
-        try encode(w, .{
-            .rpt_id = if (self.rpt_id.len > 0) self.rpt_id else self.item,
+        var fields = Fields{
+            .rpt_id = self.rptId(),
             .opt_flds = self.opt_flds,
             .sq_num = self.sq_num,
             .time_of_entry = binaryTimeFromMillis(e.time_ms),
-            .dat_set = self.dat_set,
+            .dat_set = self.datSet(),
             .buf_ovfl = self.buffer.overflow,
             .entry_id = &id_bytes,
             .conf_rev = self.conf_rev,
-        }, total, included[0..n]);
+        };
+
+        const pdu_budget = blk: {
+            if (self.max_pdu_len == 0) break :blk limit;
+            if (limit == 0) break :blk self.max_pdu_len;
+            break :blk @min(self.max_pdu_len, limit);
+        };
+        const segmented = self.opt_flds.segmentation and pdu_budget > 0;
+        if (!segmented) {
+            self.resetSegmentation();
+            try encode(w, fields, total, included[0..n]);
+        } else {
+            if (self.seg_member >= n) self.resetSegmentation();
+            const first = self.seg_member;
+            const budget = @min(pdu_budget, w.buf.len);
+            const start = w.start;
+            var take: usize = n - first;
+            fields.sub_seq_num = self.sub_seq_num;
+            while (true) {
+                w.start = start;
+                fields.more_segments_follow = first + take < n;
+                const attempt = encode(w, fields, total, included[first..][0..take]);
+                const overrun = if (attempt) |_| (start - w.start) > budget else |err| switch (err) {
+                    error.BufferTooSmall => true,
+                    else => return err,
+                };
+                if (!overrun) break;
+                // One member that does not fit a whole segment can never be
+                // sent; say so rather than emitting a truncated value.
+                if (take <= 1) {
+                    w.start = start;
+                    return error.SegmentTooSmall;
+                }
+                take -= 1;
+            }
+            if (fields.more_segments_follow) {
+                self.seg_member = first + take;
+                self.sub_seq_num +%= 1;
+                self.reports_emitted += 1;
+                // The entry stays put and `SqNum` stays still: the report is
+                // not finished.
+                return true;
+            }
+            self.resetSegmentation();
+        }
 
         self.sq_num = (self.sq_num +% 1) & 0xFFFF;
         self.send_cursor = e.entry_id + 1;
@@ -599,8 +854,8 @@ pub const ControlBlock = struct {
     /// fixes for the MMS structure — the order `report.Rcb.decode` reads.
     pub fn attributes(self: *const ControlBlock) []const []const u8 {
         return switch (self.kind) {
-            .unbuffered => &urcb_attributes,
-            .buffered => &brcb_attributes,
+            .unbuffered => if (self.include_owner) &urcb_attributes_owner else &urcb_attributes,
+            .buffered => if (self.include_owner) &brcb_attributes_owner else &brcb_attributes,
         };
     }
 
@@ -620,13 +875,13 @@ pub const ControlBlock = struct {
     pub fn emitAttribute(self: *const ControlBlock, name: []const u8, w: *ber.Writer) Error!void {
         const eq = std.mem.eql;
         if (eq(u8, name, "RptID")) {
-            try mmsdata.Emit.visibleString(w, if (self.rpt_id.len > 0) self.rpt_id else self.item);
+            try mmsdata.Emit.visibleString(w, self.rptId());
         } else if (eq(u8, name, "RptEna")) {
             try mmsdata.Emit.boolean(w, self.rpt_ena);
         } else if (eq(u8, name, "Resv")) {
             try mmsdata.Emit.boolean(w, self.resv);
         } else if (eq(u8, name, "DatSet")) {
-            try mmsdata.Emit.visibleString(w, self.dat_set);
+            try mmsdata.Emit.visibleString(w, self.datSet());
         } else if (eq(u8, name, "ConfRev")) {
             try mmsdata.Emit.unsigned(w, self.conf_rev);
         } else if (eq(u8, name, "OptFlds")) {
@@ -654,13 +909,25 @@ pub const ControlBlock = struct {
         } else if (eq(u8, name, "ResvTms")) {
             try w.integer(mmsdata.Kind.integer.tag(), self.resv_tms);
         } else if (eq(u8, name, "Owner")) {
-            var owner: [4]u8 = @splat(0);
-            if (self.owner) |o| std.mem.writeInt(u32, &owner, o, .big);
-            try mmsdata.Emit.octetString(w, &owner);
+            // IEC 61850-7-2 leaves `Owner` an OCTET STRING and says only that it
+            // identifies the client that owns the block; every stack observed
+            // here puts the client's IPv4 address in it, which is exactly the
+            // four big-endian octets of the caller's peer id. An **unowned**
+            // block emits a zero-length string rather than four zero octets:
+            // "nobody" and "0.0.0.0" are different answers.
+            if (self.owner) |o| {
+                var owner: [4]u8 = undefined;
+                std.mem.writeInt(u32, &owner, o, .big);
+                try mmsdata.Emit.octetString(w, &owner);
+            } else {
+                try mmsdata.Emit.octetString(w, &.{});
+            }
         } else return error.BadReportField;
     }
 
-    /// Applies a client write to one attribute.
+    /// Applies a client write to one attribute. This is the single-association
+    /// form: it cannot re-bind `DatSet`, because that needs a `Source` to
+    /// resolve the new name against. `writeAttributeFrom` is the full one.
     pub fn writeAttribute(
         self: *ControlBlock,
         name: []const u8,
@@ -668,15 +935,31 @@ pub const ControlBlock = struct {
         peer: u32,
         now_ms: u64,
     ) WriteOutcome {
+        return self.writeAttributeFrom(name, d, null, peer, now_ms);
+    }
+
+    /// Applies a client write to one attribute, with the model the block reports
+    /// on in hand so a `DatSet` write can be resolved.
+    pub fn writeAttributeFrom(
+        self: *ControlBlock,
+        name: []const u8,
+        d: mmsdata.Data,
+        src: ?Source,
+        peer: u32,
+        now_ms: u64,
+    ) WriteOutcome {
         const eq = std.mem.eql;
-        // Another client's reservation locks the block out entirely.
-        if (self.kind == .unbuffered and self.resv and self.owner != null and self.owner.? != peer) {
-            return .denied;
+        // Whoever holds the block — by reservation, or simply by having it
+        // enabled — locks every other association out of it entirely. This is
+        // what `Resv` / `ResvTms` are for and it is enforced on **every**
+        // attribute, not just the interesting ones.
+        if (self.heldBy()) |o| {
+            if (o != peer) return .denied;
         }
         if (eq(u8, name, "RptEna")) {
             const v = d.boolean() catch return .invalid;
             if (v) {
-                if (self.dat_set.len == 0) return .invalid;
+                if (self.datSet().len == 0) return .invalid;
                 self.enable(peer, now_ms);
             } else self.disable();
             return .ok;
@@ -689,14 +972,26 @@ pub const ControlBlock = struct {
         if (eq(u8, name, "Resv")) {
             if (self.kind != .unbuffered) return .unknown;
             const v = d.boolean() catch return .invalid;
-            if (v and self.resv and self.owner != null and self.owner.? != peer) return .denied;
+            // Taking or dropping the reservation out from under a live
+            // subscription is refused; the client disables first.
+            if (self.rpt_ena) return .denied;
             self.resv = v;
             self.owner = if (v) peer else null;
             return .ok;
         }
         if (eq(u8, name, "ResvTms")) {
-            if (self.kind != .unbuffered) return .unknown;
-            self.resv_tms = d.integer(i16) catch return .invalid;
+            // `ResvTms` is a **BRCB** attribute — it is what `brcb_attributes`
+            // carries and what `Resv` is to a URCB.
+            if (self.kind != .buffered) return .unknown;
+            const v = d.integer(i16) catch return .invalid;
+            if (v < -1) return .invalid;
+            self.resv_tms = v;
+            self.resv_deadline_ms = 0;
+            if (v == 0) {
+                if (!self.rpt_ena) self.owner = null;
+            } else {
+                self.owner = peer;
+            }
             return .ok;
         }
         if (eq(u8, name, "PurgeBuf")) {
@@ -728,15 +1023,24 @@ pub const ControlBlock = struct {
         if (!isReconfigurable(name)) return .unknown;
         if (self.rpt_ena) return .denied;
         if (eq(u8, name, "RptID")) {
-            _ = d.visibleString() catch return .invalid;
-            // The reference is borrowed from the request buffer, which the
-            // caller owns and will reuse — so the value is validated and
-            // dropped rather than aliased.
+            const s = d.visibleString() catch return .invalid;
+            if (s.len > max_reference_len) return .invalid;
+            // Copied, never aliased: the string lives in the request buffer,
+            // which the caller reuses on the next exchange.
+            @memcpy(self.rpt_id_buf[0..s.len], s);
+            self.rpt_id_len = @intCast(s.len);
             return .ok;
         }
         if (eq(u8, name, "DatSet")) {
-            _ = d.visibleString() catch return .invalid;
-            return .denied;
+            const s = d.visibleString() catch return .invalid;
+            const source = src orelse return .denied;
+            if (source.vtable.resolve == null) return .denied;
+            self.rebind(source, s) catch |e| return switch (e) {
+                // `rpt_ena` was already checked above, so this is the name.
+                error.ReportEnabled => .denied,
+                else => .invalid,
+            };
+            return .ok;
         }
         if (eq(u8, name, "OptFlds")) {
             const bs = d.bitString() catch return .invalid;
@@ -780,6 +1084,13 @@ pub const brcb_attributes = [_][]const u8{
     "RptID",  "RptEna", "DatSet", "ConfRev",  "OptFlds", "BufTm",       "SqNum",
     "TrgOps", "IntgPd", "GI",     "PurgeBuf", "EntryID", "TimeOfEntry", "ResvTms",
 };
+
+/// The edition-2 forms, with `Owner` appended. Selected by
+/// `ControlBlock.include_owner`; a client that reads a structure of the wrong
+/// shape mis-assigns every field after the change, which is why this is opt-in
+/// rather than the default.
+pub const urcb_attributes_owner = urcb_attributes ++ [_][]const u8{"Owner"};
+pub const brcb_attributes_owner = brcb_attributes ++ [_][]const u8{"Owner"};
 
 // ── the report encoder ──────────────────────────────────────────────────────
 
@@ -1514,4 +1825,733 @@ fn fuzzRcbWrite(_: void, smith: *std.testing.Smith) !void {
     _ = cb.tick(h.src.source(), 1000) catch {};
     var w = ber.Writer.init(&h.out);
     _ = cb.emitNext(h.src.source(), &w) catch {};
+}
+
+// ── report segmentation ─────────────────────────────────────────────────────
+
+/// A data set whose members are big enough that a whole report cannot fit one
+/// PDU. Each member is a distinct octet string, so a reassembled report can be
+/// checked member by member rather than just counted.
+const WideSource = struct {
+    members: usize = 6,
+    payload: usize = 40,
+    scratch: [64][256]u8 = undefined,
+    lens: [64]usize = @splat(0),
+    resolves: ?usize = null,
+
+    fn init(self: *WideSource) !void {
+        for (0..self.members) |i| {
+            var body: [256]u8 = undefined;
+            for (0..self.payload) |k| body[k] = @intCast((i * 7 + k) & 0xFF);
+            var w = ber.Writer.init(&self.scratch[i]);
+            try mmsdata.Emit.octetString(&w, body[0..self.payload]);
+            const d = w.done();
+            std.mem.copyForwards(u8, self.scratch[i][0..d.len], d);
+            self.lens[i] = d.len;
+        }
+    }
+
+    fn source(self: *WideSource) Source {
+        return .{ .ctx = self, .vtable = &.{
+            .count = countFn,
+            .value = valueFn,
+            .reference = referenceFn,
+            .resolve = resolveFn,
+        } };
+    }
+
+    fn countFn(ctx: *anyopaque, _: usize) usize {
+        const self: *WideSource = @ptrCast(@alignCast(ctx));
+        return self.members;
+    }
+    fn valueFn(ctx: *anyopaque, _: usize, member: usize) ?[]const u8 {
+        const self: *WideSource = @ptrCast(@alignCast(ctx));
+        if (member >= self.members) return null;
+        return self.scratch[member][0..self.lens[member]];
+    }
+    fn referenceFn(ctx: *anyopaque, _: usize, member: usize, out: []u8) ?[]const u8 {
+        const self: *WideSource = @ptrCast(@alignCast(ctx));
+        if (member >= self.members) return null;
+        return std.fmt.bufPrint(out, "TESTLD/GGIO1$ST$M{d}$stVal", .{member}) catch null;
+    }
+    fn resolveFn(ctx: *anyopaque, ds_reference: []const u8) ?usize {
+        const self: *WideSource = @ptrCast(@alignCast(ctx));
+        if (std.mem.eql(u8, ds_reference, "TESTLD/LLN0$Events")) return 0;
+        if (std.mem.eql(u8, ds_reference, "TESTLD/LLN0$Wide")) return self.resolves orelse 1;
+        return null;
+    }
+};
+
+const SegHarness = struct {
+    src: WideSource = .{},
+    entries: [4]Entry = @splat(.{}),
+    arena: [4 * 4096]u8 = undefined,
+    out: [4096]u8 = undefined,
+
+    fn block(self: *SegHarness, budget: usize) ControlBlock {
+        return .{
+            .kind = .unbuffered,
+            .domain = "TESTLD",
+            .item = "LLN0$RP$urcbSeg",
+            .rpt_id = "SEG1",
+            .dat_set = "TESTLD/LLN0$Wide",
+            .conf_rev = 3,
+            .opt_flds = .{
+                .sequence_number = true,
+                .report_time_stamp = true,
+                .reason_for_inclusion = true,
+                .data_set_name = true,
+                .entry_id = true,
+                .conf_revision = true,
+                .segmentation = true,
+            },
+            .trg_ops = .{ .data_change = true, .general_interrogation = true },
+            .max_pdu_len = budget,
+            .buffer = testBuffer(&self.entries, &self.arena),
+        };
+    }
+};
+
+test "a report larger than the PDU budget is split, and every segment decodes" {
+    var h: SegHarness = .{};
+    try h.src.init();
+    var cb = h.block(200);
+    cb.enable(1, 0);
+    try testing.expect(try cb.sweep(h.src.source(), .general_interrogation, 1000));
+
+    var slots: [16]report.AssembledEntry = undefined;
+    var arena: [4096]u8 = undefined;
+    var re = report.Reassembler.init(&slots, &arena);
+
+    var segments: usize = 0;
+    var assembled: ?report.Assembled = null;
+    while (segments < 16) {
+        var w = ber.Writer.init(&h.out);
+        if (!try cb.emitNext(h.src.source(), &w)) break;
+        segments += 1;
+        // Every segment on its own is a complete, decodable InformationReport
+        // that never exceeds the budget.
+        try testing.expect(w.done().len <= 200);
+        const pdu = try mms.decode(w.done());
+        const r = try report.decodeInformationReport(pdu.unconfirmed.body);
+        try testing.expectEqual(@as(u32, @intCast(segments - 1)), r.sub_seq_num.?);
+        // Every segment repeats the same header.
+        try testing.expectEqualStrings("SEG1", r.rpt_id);
+        try testing.expectEqual(@as(u32, 0), r.sq_num.?);
+        try testing.expectEqual(@as(u32, 3), r.conf_rev.?);
+        if (try re.push(r)) |done| {
+            assembled = done;
+            break;
+        }
+        try testing.expect(r.more_segments_follow.?);
+    }
+    try testing.expect(segments > 1);
+    const a = assembled orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u32, @intCast(segments)), a.segments);
+    try testing.expectEqual(@as(usize, 6), a.entries.len);
+    // The reassembled members are the source's, in order and byte for byte.
+    for (a.entries, 0..) |e, i| {
+        try testing.expectEqual(i, e.index);
+        try testing.expectEqualSlices(u8, h.src.scratch[i][0..h.src.lens[i]], e.value);
+        try testing.expect(e.reason.?.general_interrogation);
+    }
+    // The whole report counted as one: the entry is gone and `SqNum` moved once.
+    try testing.expect(!cb.segmenting());
+    try testing.expect(!cb.pending());
+    try testing.expectEqual(@as(u32, 1), cb.sq_num);
+}
+
+test "a segmented report keeps one SqNum and one EntryID across its segments" {
+    var h: SegHarness = .{};
+    try h.src.init();
+    var cb = h.block(160);
+    cb.enable(1, 0);
+    _ = try cb.sweep(h.src.source(), .general_interrogation, 1000);
+
+    var first_id: [8]u8 = undefined;
+    var n: usize = 0;
+    while (n < 16) : (n += 1) {
+        var w = ber.Writer.init(&h.out);
+        if (!try cb.emitNext(h.src.source(), &w)) break;
+        const pdu = try mms.decode(w.done());
+        const r = try report.decodeInformationReport(pdu.unconfirmed.body);
+        if (n == 0) {
+            @memcpy(&first_id, r.entry_id.?[0..8]);
+        } else {
+            try testing.expectEqualSlices(u8, &first_id, r.entry_id.?);
+            try testing.expectEqual(@as(u32, 0), r.sq_num.?);
+        }
+        if (!r.more_segments_follow.?) break;
+    }
+    // A second report starts a fresh SubSeqNum at zero.
+    try h.src.init();
+    _ = try cb.sweep(h.src.source(), .general_interrogation, 2000);
+    var w2 = ber.Writer.init(&h.out);
+    try testing.expect(try cb.emitNext(h.src.source(), &w2));
+    const pdu2 = try mms.decode(w2.done());
+    const r2 = try report.decodeInformationReport(pdu2.unconfirmed.body);
+    try testing.expectEqual(@as(u32, 0), r2.sub_seq_num.?);
+    try testing.expectEqual(@as(u32, 1), r2.sq_num.?);
+}
+
+test "segmentation is off unless both OptFlds and a budget say so" {
+    var h: SegHarness = .{};
+    try h.src.init();
+    // A budget with no `OptFlds.segmentation`: the report is emitted whole and
+    // simply fails if it does not fit, which is the pre-segmentation contract.
+    var cb = h.block(200);
+    cb.opt_flds.segmentation = false;
+    cb.enable(1, 0);
+    _ = try cb.sweep(h.src.source(), .general_interrogation, 1000);
+    var w = ber.Writer.init(&h.out);
+    try testing.expect(try cb.emitNext(h.src.source(), &w));
+    try testing.expect(w.done().len > 200);
+    try testing.expect(!cb.segmenting());
+
+    // …and `OptFlds.segmentation` with no budget is also whole.
+    var cb2 = h.block(0);
+    cb2.enable(1, 0);
+    _ = try cb2.sweep(h.src.source(), .general_interrogation, 1000);
+    var w2 = ber.Writer.init(&h.out);
+    try testing.expect(try cb2.emitNext(h.src.source(), &w2));
+    const pdu = try mms.decode(w2.done());
+    const r = try report.decodeInformationReport(pdu.unconfirmed.body);
+    try testing.expectEqual(@as(u16, 6), r.entry_count);
+    try testing.expectEqual(@as(u32, 0), r.sub_seq_num.?);
+    try testing.expect(!r.more_segments_follow.?);
+}
+
+test "a member that cannot fit a whole segment is a typed error, never truncated" {
+    var h: SegHarness = .{};
+    h.src.payload = 200;
+    try h.src.init();
+    var cb = h.block(80); // smaller than one member
+    cb.enable(1, 0);
+    _ = try cb.sweep(h.src.source(), .general_interrogation, 1000);
+    var w = ber.Writer.init(&h.out);
+    try testing.expectError(error.SegmentTooSmall, cb.emitNext(h.src.source(), &w));
+}
+
+test "emitNextWithin folds the caller's PDU limit into the block's own" {
+    var h: SegHarness = .{};
+    try h.src.init();
+    var cb = h.block(0); // the block itself has no limit
+    cb.enable(1, 0);
+    _ = try cb.sweep(h.src.source(), .general_interrogation, 1000);
+    var w = ber.Writer.init(&h.out);
+    try testing.expect(try cb.emitNextWithin(h.src.source(), &w, 200));
+    try testing.expect(w.done().len <= 200);
+    try testing.expect(cb.segmenting());
+}
+
+// ── runtime DatSet re-binding ───────────────────────────────────────────────
+
+test "a client re-points a disabled RCB at another data set and ConfRev moves" {
+    var h: SegHarness = .{};
+    try h.src.init();
+    var cb = h.block(0);
+    cb.data_set = 1;
+    try testing.expectEqualStrings("TESTLD/LLN0$Wide", cb.datSet());
+
+    var buf: [64]u8 = undefined;
+    var w = ber.Writer.init(&buf);
+    try mmsdata.Emit.visibleString(&w, "TESTLD/LLN0$Events");
+    const d = try mmsdata.Data.decode(w.done());
+    try testing.expectEqual(WriteOutcome.ok, cb.writeAttributeFrom("DatSet", d, h.src.source(), 1, 0));
+    try testing.expectEqualStrings("TESTLD/LLN0$Events", cb.datSet());
+    try testing.expectEqual(@as(usize, 0), cb.data_set);
+    try testing.expectEqual(@as(u32, 4), cb.conf_rev); // was 3
+
+    // The re-bound name survives a *move* of the block, because nothing points
+    // into it.
+    var moved = cb;
+    try testing.expectEqualStrings("TESTLD/LLN0$Events", moved.datSet());
+
+    // …and it is what the RCB reads back as.
+    var out: [128]u8 = undefined;
+    var ow = ber.Writer.init(&out);
+    try cb.emitAttribute("DatSet", &ow);
+    const back = try mmsdata.Data.decode(ow.done());
+    try testing.expectEqualStrings("TESTLD/LLN0$Events", try back.visibleString());
+}
+
+test "a DatSet write is refused while RptEna is set, and the binding does not move" {
+    var h: SegHarness = .{};
+    try h.src.init();
+    var cb = h.block(0);
+    cb.data_set = 1;
+    cb.enable(1, 0);
+
+    var buf: [64]u8 = undefined;
+    var w = ber.Writer.init(&buf);
+    try mmsdata.Emit.visibleString(&w, "TESTLD/LLN0$Events");
+    const d = try mmsdata.Data.decode(w.done());
+    try testing.expectEqual(WriteOutcome.denied, cb.writeAttributeFrom("DatSet", d, h.src.source(), 1, 0));
+    try testing.expectEqualStrings("TESTLD/LLN0$Wide", cb.datSet());
+    try testing.expectEqual(@as(u32, 3), cb.conf_rev);
+    try testing.expectError(error.ReportEnabled, cb.rebind(h.src.source(), "TESTLD/LLN0$Events"));
+}
+
+test "a DatSet naming something that does not resolve is refused and changes nothing" {
+    var h: SegHarness = .{};
+    try h.src.init();
+    var cb = h.block(0);
+    var buf: [64]u8 = undefined;
+    var w = ber.Writer.init(&buf);
+    try mmsdata.Emit.visibleString(&w, "TESTLD/LLN0$NoSuchSet");
+    const d = try mmsdata.Data.decode(w.done());
+    try testing.expectEqual(WriteOutcome.invalid, cb.writeAttributeFrom("DatSet", d, h.src.source(), 1, 0));
+    try testing.expectEqualStrings("TESTLD/LLN0$Wide", cb.datSet());
+    try testing.expectEqual(@as(u32, 3), cb.conf_rev);
+    try testing.expectError(error.UnknownDataSet, cb.rebind(h.src.source(), ""));
+
+    // A source with no resolver at all refuses rather than pretending.
+    var plain: TestSource = .{};
+    try plain.init();
+    try testing.expectEqual(
+        WriteOutcome.denied,
+        cb.writeAttributeFrom("DatSet", d, plain.source(), 1, 0),
+    );
+    // …and so does the single-association form, which has no source to ask.
+    try testing.expectEqual(WriteOutcome.denied, cb.writeAttribute("DatSet", d, 1, 0));
+}
+
+test "a re-bind throws away buffered entries that index the old data set" {
+    var h: SegHarness = .{};
+    try h.src.init();
+    var cb = h.block(0);
+    cb.kind = .buffered;
+    cb.data_set = 1;
+    _ = try cb.signal(h.src.source(), 1, 0, .data_change, 10);
+    _ = try cb.signal(h.src.source(), 1, 1, .data_change, 20);
+    try testing.expectEqual(@as(usize, 2), cb.buffer.count);
+    try cb.rebind(h.src.source(), "TESTLD/LLN0$Events");
+    try testing.expectEqual(@as(usize, 0), cb.buffer.count);
+}
+
+// ── multi-client reservation ────────────────────────────────────────────────
+
+test "a URCB reserved by one association locks every other one out" {
+    var h: Harness = .{};
+    try h.src.init();
+    var cb = h.block(.unbuffered);
+
+    var t: [8]u8 = undefined;
+    var tw = ber.Writer.init(&t);
+    try mmsdata.Emit.boolean(&tw, true);
+    const yes = try mmsdata.Data.decode(tw.done());
+
+    // Client 1 reserves.
+    try testing.expectEqual(WriteOutcome.ok, cb.writeAttribute("Resv", yes, 1, 0));
+    try testing.expectEqual(@as(u32, 1), cb.reservedBy().?);
+    try testing.expectEqual(@as(u32, 1), cb.heldBy().?);
+
+    // Client 2 can do nothing at all with it — not even enable it.
+    try testing.expectEqual(WriteOutcome.denied, cb.writeAttribute("RptEna", yes, 2, 0));
+    try testing.expectEqual(WriteOutcome.denied, cb.writeAttribute("Resv", yes, 2, 0));
+    try testing.expectEqual(WriteOutcome.denied, cb.writeAttribute("GI", yes, 2, 0));
+    try testing.expect(!cb.rpt_ena);
+
+    // Client 1 still can.
+    try testing.expectEqual(WriteOutcome.ok, cb.writeAttribute("RptEna", yes, 1, 0));
+    try testing.expect(cb.rpt_ena);
+    try testing.expectEqual(@as(u32, 1), cb.owner.?);
+
+    // Client 1's association drops: a URCB reservation does not survive it.
+    cb.associationLostBy(1, 5_000);
+    try testing.expect(!cb.resv);
+    try testing.expect(cb.owner == null);
+    try testing.expect(cb.heldBy() == null);
+    // …and now client 2 walks in.
+    try testing.expectEqual(WriteOutcome.ok, cb.writeAttribute("RptEna", yes, 2, 0));
+    try testing.expectEqual(@as(u32, 2), cb.owner.?);
+}
+
+test "an enabled URCB is held against a second association even without Resv" {
+    var h: Harness = .{};
+    try h.src.init();
+    var cb = h.block(.unbuffered);
+    var t: [8]u8 = undefined;
+    var tw = ber.Writer.init(&t);
+    try mmsdata.Emit.boolean(&tw, true);
+    const yes = try mmsdata.Data.decode(tw.done());
+    var f: [8]u8 = undefined;
+    var fw = ber.Writer.init(&f);
+    try mmsdata.Emit.boolean(&fw, false);
+    const no = try mmsdata.Data.decode(fw.done());
+
+    try testing.expectEqual(WriteOutcome.ok, cb.writeAttribute("RptEna", yes, 1, 0));
+    try testing.expectEqual(WriteOutcome.denied, cb.writeAttribute("RptEna", no, 2, 0));
+    try testing.expect(cb.rpt_ena);
+    // A second client cannot steal the block by disabling it either.
+    try testing.expectEqual(WriteOutcome.ok, cb.writeAttribute("RptEna", no, 1, 0));
+    try testing.expect(cb.heldBy() == null);
+}
+
+test "a BRCB ResvTms reservation outlives the association and then expires" {
+    var h: Harness = .{};
+    try h.src.init();
+    var cb = h.block(.buffered);
+
+    var b: [8]u8 = undefined;
+    var bw = ber.Writer.init(&b);
+    try mmsdata.Emit.integer(&bw, 30); // thirty seconds
+    const thirty = try mmsdata.Data.decode(bw.done());
+    try testing.expectEqual(WriteOutcome.ok, cb.writeAttribute("ResvTms", thirty, 7, 0));
+    try testing.expectEqual(@as(i16, 30), cb.resv_tms);
+    try testing.expectEqual(@as(u32, 7), cb.reservedBy().?);
+
+    // A second client is locked out.
+    var t: [8]u8 = undefined;
+    var tw = ber.Writer.init(&t);
+    try mmsdata.Emit.boolean(&tw, true);
+    const yes = try mmsdata.Data.decode(tw.done());
+    try testing.expectEqual(WriteOutcome.denied, cb.writeAttribute("RptEna", yes, 9, 0));
+
+    try testing.expectEqual(WriteOutcome.ok, cb.writeAttribute("RptEna", yes, 7, 0));
+    // Client 7 goes away. The BRCB keeps the buffer *and* the reservation.
+    try testing.expect(try cb.signal(h.src.source(), 0, 1, .data_change, 100));
+    cb.associationLostBy(7, 100_000);
+    try testing.expect(!cb.rpt_ena);
+    try testing.expectEqual(@as(u32, 7), cb.owner.?);
+    try testing.expectEqual(@as(usize, 1), cb.buffer.count);
+    try testing.expectEqual(WriteOutcome.denied, cb.writeAttribute("RptEna", yes, 9, 100_000));
+
+    // Twenty-nine seconds later it is still theirs…
+    _ = try cb.tick(h.src.source(), 129_000);
+    try testing.expectEqual(@as(u32, 7), cb.owner.?);
+    try testing.expectEqual(WriteOutcome.denied, cb.writeAttribute("RptEna", yes, 9, 129_000));
+    // …and at thirty it lapses.
+    _ = try cb.tick(h.src.source(), 130_000);
+    try testing.expect(cb.owner == null);
+    try testing.expectEqual(@as(i16, 0), cb.resv_tms);
+    try testing.expectEqual(WriteOutcome.ok, cb.writeAttribute("RptEna", yes, 9, 130_000));
+    // The buffered entry survived all of it — that is the BRCB guarantee.
+    try testing.expectEqual(@as(usize, 1), cb.buffer.count);
+}
+
+test "ResvTms -1 holds a BRCB until its client gives it back" {
+    var h: Harness = .{};
+    try h.src.init();
+    var cb = h.block(.buffered);
+    var b: [8]u8 = undefined;
+    var bw = ber.Writer.init(&b);
+    try mmsdata.Emit.integer(&bw, -1);
+    const forever = try mmsdata.Data.decode(bw.done());
+    try testing.expectEqual(WriteOutcome.ok, cb.writeAttribute("ResvTms", forever, 4, 0));
+    cb.associationLostBy(4, 1_000);
+    try testing.expectEqual(@as(u32, 4), cb.owner.?);
+    _ = try cb.tick(h.src.source(), 10_000_000);
+    try testing.expectEqual(@as(u32, 4), cb.owner.?);
+
+    var z: [8]u8 = undefined;
+    var zw = ber.Writer.init(&z);
+    try mmsdata.Emit.integer(&zw, 0);
+    const zero = try mmsdata.Data.decode(zw.done());
+    try testing.expectEqual(WriteOutcome.denied, cb.writeAttribute("ResvTms", zero, 5, 0));
+    try testing.expectEqual(WriteOutcome.ok, cb.writeAttribute("ResvTms", zero, 4, 0));
+    try testing.expect(cb.heldBy() == null);
+
+    // Below -1 is not a reservation lifetime at all.
+    var n: [8]u8 = undefined;
+    var nw = ber.Writer.init(&n);
+    try mmsdata.Emit.integer(&nw, -2);
+    const bad = try mmsdata.Data.decode(nw.done());
+    try testing.expectEqual(WriteOutcome.invalid, cb.writeAttribute("ResvTms", bad, 4, 0));
+}
+
+test "Resv belongs to a URCB and ResvTms to a BRCB, and neither answers for the other" {
+    var h: Harness = .{};
+    try h.src.init();
+    var urcb = h.block(.unbuffered);
+    var brcb = h.block(.buffered);
+    var b: [8]u8 = undefined;
+    var bw = ber.Writer.init(&b);
+    try mmsdata.Emit.integer(&bw, 10);
+    const ten = try mmsdata.Data.decode(bw.done());
+    var t: [8]u8 = undefined;
+    var tw = ber.Writer.init(&t);
+    try mmsdata.Emit.boolean(&tw, true);
+    const yes = try mmsdata.Data.decode(tw.done());
+
+    try testing.expectEqual(WriteOutcome.unknown, urcb.writeAttribute("ResvTms", ten, 1, 0));
+    try testing.expectEqual(WriteOutcome.unknown, brcb.writeAttribute("Resv", yes, 1, 0));
+    // …which is exactly what the two attribute lists say.
+    var seen_resv = false;
+    for (urcb.attributes()) |a| {
+        if (std.mem.eql(u8, a, "Resv")) seen_resv = true;
+    }
+    try testing.expect(seen_resv);
+    var seen_tms = false;
+    for (brcb.attributes()) |a| {
+        if (std.mem.eql(u8, a, "ResvTms")) seen_tms = true;
+    }
+    try testing.expect(seen_tms);
+}
+
+// ── Owner ───────────────────────────────────────────────────────────────────
+
+test "Owner names the holding client and is empty when nobody holds the block" {
+    var h: Harness = .{};
+    try h.src.init();
+    var cb = h.block(.unbuffered);
+    var out: [64]u8 = undefined;
+
+    var w = ber.Writer.init(&out);
+    try cb.emitAttribute("Owner", &w);
+    const empty = try mmsdata.Data.decode(w.done());
+    try testing.expectEqual(@as(usize, 0), (try empty.octetString()).len);
+
+    cb.enable(0xC0A8_0105, 0); // 192.168.1.5
+    var w2 = ber.Writer.init(&out);
+    try cb.emitAttribute("Owner", &w2);
+    const owned = try mmsdata.Data.decode(w2.done());
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xC0, 0xA8, 0x01, 0x05 }, try owned.octetString());
+
+    // A client may read it and never write it.
+    try testing.expectEqual(WriteOutcome.denied, cb.writeAttribute("Owner", owned, 0xC0A8_0105, 0));
+}
+
+test "include_owner appends Owner to the structure and the read decodes as an RCB" {
+    var h: Harness = .{};
+    try h.src.init();
+    var cb = h.block(.unbuffered);
+    try testing.expectEqual(@as(usize, 11), cb.attributes().len);
+    cb.include_owner = true;
+    try testing.expectEqual(@as(usize, 12), cb.attributes().len);
+    try testing.expectEqualStrings("Owner", cb.attributes()[11]);
+    cb.enable(0x0A00_0001, 0);
+
+    var out: [512]u8 = undefined;
+    var w = ber.Writer.init(&out);
+    try cb.emitStructure(&w);
+    // The eleven edition-1 members still decode as a URCB — `Rcb.decode` reads
+    // positionally and stops where it stops, which is what makes the extra
+    // member safe to append.
+    const d = try mmsdata.Data.decode(w.done());
+    const rcb = try report.Rcb.decode(d, .unbuffered);
+    try testing.expectEqualStrings("RPT1", rcb.rpt_id);
+    try testing.expectEqual(true, rcb.rpt_ena);
+
+    var brcb = h.block(.buffered);
+    brcb.include_owner = true;
+    try testing.expectEqual(@as(usize, 15), brcb.attributes().len);
+    try testing.expectEqualStrings("Owner", brcb.attributes()[14]);
+}
+
+// ── byte-exact goldens for the segmented shapes ─────────────────────────────
+
+/// **Self-derived golden**, not a third-party capture: no oracle model here is
+/// wide enough to make a real IED segment a report, so these are this module's
+/// own octets. What makes them worth pinning is that the *shape* comes from
+/// IEC 61850-8-1's report layout — `SubSeqNum` then `MoreSegmentsFollow`,
+/// immediately after `ConfRev` and before the inclusion bit string — and that
+/// both segments decode and **re-encode identically**, and that Wireshark's own
+/// MMS dissector reads them field by field (SPEC.md).
+///
+/// Four members of sixteen octets each, split at a 120-octet budget: members 0
+/// and 1 here…
+const segmented_report_first = [_]u8{
+    0xA3, 0x76, 0xA0, 0x74, 0xA1, 0x05, 0x80, 0x03,
+    0x52, 0x50, 0x54, 0xA0, 0x6B, 0x8A, 0x04, 0x53,
+    0x45, 0x47, 0x31, 0x84, 0x03, 0x06, 0x79, 0xC0,
+    0x86, 0x01, 0x00, 0x8C, 0x06, 0x04, 0xC4, 0xB4,
+    0x00, 0x38, 0xE1, 0x8A, 0x10, 0x54, 0x45, 0x53,
+    0x54, 0x4C, 0x44, 0x2F, 0x4C, 0x4C, 0x4E, 0x30,
+    0x24, 0x57, 0x69, 0x64, 0x65, 0x89, 0x08, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x86,
+    0x01, 0x03, 0x86, 0x01, 0x00, 0x83, 0x01, 0x01,
+    0x84, 0x02, 0x04, 0xC0, 0x89, 0x10, 0x00, 0x01,
+    0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09,
+    0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x89, 0x10,
+    0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+    0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16,
+    0x84, 0x02, 0x02, 0x04, 0x84, 0x02, 0x02, 0x04,
+};
+
+/// …and members 2 and 3 here. The header repeats verbatim — same `RptID`, same
+/// `SqNum` (0), same `TimeOfEntry`, same `EntryID`, same `ConfRev` — and only
+/// `SubSeqNum` (0 → 1), `MoreSegmentsFollow` (true → false), the inclusion bit
+/// string (`0xC0` → `0x30`) and the values differ.
+const segmented_report_last = [_]u8{
+    0xA3, 0x76, 0xA0, 0x74, 0xA1, 0x05, 0x80, 0x03,
+    0x52, 0x50, 0x54, 0xA0, 0x6B, 0x8A, 0x04, 0x53,
+    0x45, 0x47, 0x31, 0x84, 0x03, 0x06, 0x79, 0xC0,
+    0x86, 0x01, 0x00, 0x8C, 0x06, 0x04, 0xC4, 0xB4,
+    0x00, 0x38, 0xE1, 0x8A, 0x10, 0x54, 0x45, 0x53,
+    0x54, 0x4C, 0x44, 0x2F, 0x4C, 0x4C, 0x4E, 0x30,
+    0x24, 0x57, 0x69, 0x64, 0x65, 0x89, 0x08, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x86,
+    0x01, 0x03, 0x86, 0x01, 0x01, 0x83, 0x01, 0x00,
+    0x84, 0x02, 0x04, 0x30, 0x89, 0x10, 0x0E, 0x0F,
+    0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+    0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x89, 0x10,
+    0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C,
+    0x1D, 0x1E, 0x1F, 0x20, 0x21, 0x22, 0x23, 0x24,
+    0x84, 0x02, 0x02, 0x04, 0x84, 0x02, 0x02, 0x04,
+};
+
+fn segmentGoldenBlock(h: *SegHarness) !ControlBlock {
+    h.src.members = 4;
+    h.src.payload = 16;
+    try h.src.init();
+    var cb = h.block(120);
+    cb.enable(1, 0);
+    _ = try cb.sweep(h.src.source(), .general_interrogation, 1_700_000_000_000);
+    return cb;
+}
+
+test "golden: a two-segment report is emitted octet for octet" {
+    var h: SegHarness = .{};
+    var cb = try segmentGoldenBlock(&h);
+
+    var w = ber.Writer.init(&h.out);
+    try testing.expect(try cb.emitNext(h.src.source(), &w));
+    try testing.expectEqualSlices(u8, &segmented_report_first, w.done());
+
+    var w2 = ber.Writer.init(&h.out);
+    try testing.expect(try cb.emitNext(h.src.source(), &w2));
+    try testing.expectEqualSlices(u8, &segmented_report_last, w2.done());
+
+    // Two segments and no more: the report is complete.
+    try testing.expect(!try cb.emitNext(h.src.source(), &w2));
+}
+
+test "golden: both segments decode and re-encode to the identical octets" {
+    for ([_][]const u8{ &segmented_report_first, &segmented_report_last }) |golden| {
+        const pdu = try mms.decode(golden);
+        const r = try report.decodeInformationReport(pdu.unconfirmed.body);
+        try testing.expectEqualStrings("SEG1", r.rpt_id);
+        try testing.expectEqual(@as(u32, 0), r.sq_num.?);
+        try testing.expectEqual(@as(u32, 3), r.conf_rev.?);
+        try testing.expectEqual(@as(u16, 2), r.entry_count);
+
+        var included: [2]Included = undefined;
+        for (r.included(), 0..) |e, i| {
+            included[i] = .{
+                .index = e.index,
+                .value = e.value.raw,
+                .reason = e.reason.?,
+            };
+        }
+        var buf: [256]u8 = undefined;
+        var w = ber.Writer.init(&buf);
+        try encode(&w, .{
+            .rpt_id = r.rpt_id,
+            .opt_flds = r.opt_flds,
+            .sq_num = r.sq_num.?,
+            .time_of_entry = r.time_of_entry.?,
+            .dat_set = r.dat_set.?,
+            .entry_id = r.entry_id.?,
+            .conf_rev = r.conf_rev.?,
+            .sub_seq_num = r.sub_seq_num.?,
+            .more_segments_follow = r.more_segments_follow.?,
+        }, r.inclusion.bitCount(), &included);
+        try testing.expectEqualSlices(u8, golden, w.done());
+    }
+}
+
+/// Goldens for the reservation attributes, each the complete MMS `Data` TLV a
+/// client reads: `Resv` is `boolean [3]`, `ResvTms` is `integer [5]` and
+/// `Owner` is `octet-string [9]`.
+///
+/// `Resv` and `Owner` are **confirmed against a third party**: a live capture of
+/// a reference client reading this server's URCB carries `83 01 01` for the
+/// `Resv` it had just taken and `89 04 C0 A8 01 01` for `Owner`, and the
+/// client's own printout rendered the latter as `c0a80101`. Only the address
+/// octets differ from the ones pinned here. `ResvTms` is **self-derived**: it is
+/// a BRCB attribute and no reference client writes it.
+const golden_resv_true = [_]u8{ 0x83, 0x01, 0x01 };
+const golden_resv_tms_30 = [_]u8{ 0x85, 0x01, 0x1E };
+const golden_owner_ipv4 = [_]u8{ 0x89, 0x04, 0xC0, 0xA8, 0x01, 0x05 };
+
+test "golden: the reservation attributes are the octets a client reads" {
+    var h: Harness = .{};
+    try h.src.init();
+    var u = h.block(.unbuffered);
+    u.resv = true;
+    u.owner = 0xC0A8_0105;
+    var out: [64]u8 = undefined;
+
+    var w = ber.Writer.init(&out);
+    try u.emitAttribute("Resv", &w);
+    try testing.expectEqualSlices(u8, &golden_resv_true, w.done());
+    try testing.expectEqual(true, try (try mmsdata.Data.decode(&golden_resv_true)).boolean());
+
+    var w2 = ber.Writer.init(&out);
+    try u.emitAttribute("Owner", &w2);
+    try testing.expectEqualSlices(u8, &golden_owner_ipv4, w2.done());
+    try testing.expectEqualSlices(
+        u8,
+        &[_]u8{ 0xC0, 0xA8, 0x01, 0x05 },
+        try (try mmsdata.Data.decode(&golden_owner_ipv4)).octetString(),
+    );
+
+    var b = h.block(.buffered);
+    b.resv_tms = 30;
+    var w3 = ber.Writer.init(&out);
+    try b.emitAttribute("ResvTms", &w3);
+    try testing.expectEqualSlices(u8, &golden_resv_tms_30, w3.done());
+    try testing.expectEqual(
+        @as(i16, 30),
+        try (try mmsdata.Data.decode(&golden_resv_tms_30)).integer(i16),
+    );
+}
+
+test "fuzz: an arbitrary segment sequence never panics and never hangs" {
+    try std.testing.fuzz({}, fuzzReassemble, .{});
+}
+
+fn fuzzReassemble(_: void, smith: *std.testing.Smith) !void {
+    var h: SegHarness = .{};
+    h.src.members = smith.valueRangeAtMost(u8, 1, 8);
+    h.src.payload = smith.valueRangeAtMost(u8, 1, 64);
+    h.src.init() catch return;
+    var cb = h.block(smith.valueRangeAtMost(u16, 0, 400));
+    cb.enable(1, 0);
+    _ = cb.sweep(h.src.source(), .general_interrogation, 1000) catch return;
+
+    var slots: [16]report.AssembledEntry = undefined;
+    var arena: [512]u8 = undefined;
+    var re = report.Reassembler.init(&slots, &arena);
+    var rounds: usize = 0;
+    while (rounds < 32) : (rounds += 1) {
+        var w = ber.Writer.init(&h.out);
+        const more = cb.emitNext(h.src.source(), &w) catch break;
+        if (!more) break;
+        // Randomly drop segments, so the reassembler sees skips as well as
+        // ordered runs.
+        if (smith.valueRangeAtMost(u8, 0, 3) == 0) continue;
+        const pdu = mms.decode(w.done()) catch continue;
+        const r = report.decodeInformationReport(pdu.unconfirmed.body) catch continue;
+        _ = re.push(r) catch {
+            re.reset();
+            continue;
+        };
+    }
+}
+
+test "writing back the DatSet a client just read is a no-op, not a ConfRev bump" {
+    // Found by a live capture: every reference client writes the whole RCB back
+    // when it enables reporting, `DatSet` included. Treating that as a
+    // reconfiguration made `ConfRev` climb on every subscription.
+    var h: SegHarness = .{};
+    try h.src.init();
+    var cb = h.block(0);
+    cb.data_set = 1;
+    var buf: [64]u8 = undefined;
+    var w = ber.Writer.init(&buf);
+    try mmsdata.Emit.visibleString(&w, "TESTLD/LLN0$Wide");
+    const same = try mmsdata.Data.decode(w.done());
+    try testing.expectEqual(WriteOutcome.ok, cb.writeAttributeFrom("DatSet", same, h.src.source(), 1, 0));
+    try testing.expectEqual(@as(u32, 3), cb.conf_rev);
+    try testing.expectEqual(@as(usize, 1), cb.data_set);
+    try testing.expectEqual(@as(u8, 0), cb.dat_set_len);
+
+    // …and it is still a no-op once the block has been re-bound, which is when
+    // `datSet()` and `dat_set` disagree.
+    try cb.rebind(h.src.source(), "TESTLD/LLN0$Events");
+    try testing.expectEqual(@as(u32, 4), cb.conf_rev);
+    try cb.rebind(h.src.source(), "TESTLD/LLN0$Events");
+    try testing.expectEqual(@as(u32, 4), cb.conf_rev);
 }

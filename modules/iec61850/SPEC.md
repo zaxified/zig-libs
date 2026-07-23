@@ -546,6 +546,58 @@ proxy:
   reference with `ReasonCode`. An independent ASN.1 decoder agreeing field by field is what makes
   the journal layout more than a reading of the standard.
 
+**Report segmentation, driven and dissected.** A model whose `LLN0$Events` data set carries twelve
+660-octet members was served to the reference stack's own reporting client, with
+`OptFlds.segmentation` and `OptFlds.data_reference` set. The negotiated ceilings were
+`localDetailCalling` = 65000 clamped to this server's 8192-octet send buffer and a COTP TPDU size of
+**8192**, giving a segment budget of **8128**; `data_reference` is what makes the report larger than
+a plain read of the same data set (the read carries only the values), which is the gap segmentation
+has to live in, because a class-0 TPDU can never exceed 8192 and this module does not split one PDU
+across several TPDUs.
+
+- The reference client's report handler was called **twice** for the one report and printed all
+  twelve members, in order, with the right references and reason codes: eleven from the first
+  segment and the twelfth from the second. It does **not** itself reassemble — it delivers each
+  segment to the handler separately — and the fact that it nevertheless named every member correctly
+  is the strongest evidence available for the choice made here: **each segment carries its own
+  full-width inclusion bit string**. Had the whole report's bit string been repeated in every
+  segment, a client that does not track a running index would have mis-assigned every value in the
+  second segment.
+- `report.Reassembler` is the client half that *does* put them back together, and it is driven
+  against our own server over an in-memory wire as well.
+- The exchange was captured and dissected with **rawshark 4.6.4** (`-d proto:tpkt`, TCP streams
+  reassembled into TPKT frames first). The two segments came out as 7894 and 823 octets, and
+  Wireshark's own MMS dissector read them as: `mms.iec61850.rptid` = `Events1` on both,
+  `mms.iec61850.datset` = `simpleIOGenericIO/LLN0$Events` on both, `mms.iec61850.timeofentry` =
+  `Nov 13, 2023 22:13:20.060000000 UTC` on both, `mms.iec61850.confrev` = 1 on both,
+  `mms.listOfAccessResult` = **42** then **12** (nine header fields plus three per member: eleven
+  members, then one), and — for the two fields the dissector has no IEC 61850 name for and therefore
+  renders generically — `mms.unsigned` = **0 → 1** (`SubSeqNum`) and `mms.boolean` = **True → False**
+  (`MoreSegmentsFollow`). No frame in the capture raised `_ws.malformed`.
+- Hand-decoding the same frames confirms the rest: the inclusion bit string is `84 03 04 FF E0`
+  (twelve bits, members 0–10) on the first segment and `84 03 04 00 10` (member 11) on the second,
+  and `SqNum` is `86 01 00` on both while the *next* report carries `86 01 01`.
+- **A defect was found by this capture and fixed:** the reference client writes the whole RCB back
+  when it subscribes, `DatSet` included, and the new re-binding path was treating that as a
+  reconfiguration and bumping `ConfRev` on every subscription. Writing back the value that was read
+  is now a no-op. `mms.iec61850.confrev` reading 1 rather than 2 in the capture above is that fix.
+
+**Multi-client RCB reservation, driven.** Two instances of the reference stack's reporting client
+were pointed at one report control block at the same time, multiplexed onto one `Server` by
+round-robin with `Server.peer` set from the socket:
+
+- the first took `Resv` and became `Owner`;
+- the **second's** `setRCBValues` came back `object-access-denied` and its own stack printed
+  `setRCBValues service error!`; the server counted exactly one refused write;
+- a **third** association — the reference stack's generic MMS browser — read the whole URCB and
+  printed `{Events1,true,true,simpleIOGenericIO/LLN0$Events,1,0111100010,50,2,011001,0,false,`
+  `c0a80101}`: twelve members, `RptEna` and `Resv` both true, and `Owner` = the four octets of the
+  first client's association id. On the wire those two attributes are `83 01 01` and
+  `89 04 C0 A8 01 01`, which are the shapes pinned as goldens in `reporting.zig`;
+- rawshark read the same frame as `mms.boolean` = True, True, False (`RptEna`, `Resv`, `GI`) and
+  `mms.unsigned` = 1, 50, 2, 0 (`ConfRev`, `BufTm`, `SqNum`, `IntgPd`), with no malformed frames in
+  the 34-frame capture.
+
 **SCL emission.** 45 real configuration files (the reference stack's shipped `.icd`/`.cid`/`.scd`)
 were parsed, emitted and re-parsed:
 
@@ -553,10 +605,19 @@ were parsed, emitted and re-parsed:
   another IED and does not resolve in the first place, so there is nothing to compare);
 - every emission is well-formed per `xmllint`;
 - every emission was fed to the reference stack's own **SCL model generator**: **none was
-  rejected**, and **31 of 42** produce a byte-identical generated C model. The 11 that differ do so
-  for three reasons, all of them things `scl.zig` deliberately does not parse and all of them still
-  in the deferred list below: `<Services>` (the generator folds its `ReportSettings` into the RCB's
-  trigger word), `<Log>` element bodies, and `<SampledValueControl>`.
+  rejected**, and **36 of the 44** produce a byte-identical generated C model (it was 31 before
+  `<Log>` elements were parsed and emitted; the two numbers come from the same harness — generate
+  from the original and from the emission into the same output name, and compare both files
+  ignoring the "automatically generated from" banner line). The 8 that still differ do so for three
+  reasons:
+  - **`<SampledValueControl>`** (3 files) — the generator emits an `SVControlBlock` and its
+    `PhyComAddress` from the `SMV` binding in the `Communication` section; `scl.zig` parses neither.
+  - **`<Services>`** (2 files) — the generator folds its `ReportSettings` into the RCB's trigger
+    word (`88` where ours has `24`).
+  - **the original is rejected and ours is not** (2 files, both `sampleModel_errors.icd`) — the
+    generator produces nothing from the source and a full model from our emission, which is a
+    difference in our favour rather than a loss.
+  - one file (`sv.icd`) differs in a single generated constant, also SV-related.
 - Two defects were found *by* that generator and fixed: `LogControl/@logName` is mandatory and must
   be written even when empty, and **`OptFields/@bufOvfl` defaults to `true`** in the schema — this
   module's parser had been defaulting it to false, which silently produced a different RCB from
@@ -568,11 +629,12 @@ were parsed, emitted and re-parsed:
 ### What is self-derived
 
 - **Everything the oracle's example model does not contain.** The captured IED is
-  `libiec61850`'s shipped example (`simpleIOGenericIO`, `testComplexArray`), so: the
-  segmented-report path (`OptFlds.segmentation`, `SubSeqNum`, `MoreSegmentsFollow`) is unit-tested
-  only, and so is the `data_reference` option in `OptFlds` — the reference clients never ask for
-  either. Both are, however, cross-tested encoder-against-decoder over **all 512 combinations** of
-  the nine defined `OptFlds` bits.
+  `libiec61850`'s shipped example (`simpleIOGenericIO`, `testComplexArray`), so nothing a real IED
+  *sends* exercises the segmented-report path. The path is now driven the other way instead — our
+  server splitting a report to a third-party client, described under "Segmentation" below — but the
+  reference clients still never *ask* for `OptFlds.segmentation` or `data_reference`; this server's
+  own configuration turns them on. Both are cross-tested encoder-against-decoder over **all 512
+  combinations** of the nine defined `OptFlds` bits.
 - **`Data` alternatives the capture never carried**: `array`, `bcd`, `booleanArray`, `objId`,
   `mMSString`, `generalized-time`, and `real` (`[8]`, withdrawn). These are encode/decode round-trip
   tested against their documented tags and widths, not against third-party octets.
@@ -618,15 +680,29 @@ were parsed, emitted and re-parsed:
 - **The `BufOvfl` and `EntryID` resume paths of a BRCB** are driven end to end against this module's
   own client and unit-tested against a bounded buffer, but the reference clients never disable a
   BRCB long enough to overrun one, so the overflow flag was never observed arriving at a third party.
-- **`Owner` on an RCB** is emitted on request and never driven; multi-client reservation is modelled
-  as a value, not enforced across associations, because one `Server` serves one association.
+- **The `Owner` octet string's *meaning*.** IEC 61850-7-2 says only that `Owner` identifies the
+  client that owns the block; it does not fix the encoding. This module puts the four big-endian
+  octets of the caller's association id in it, which renders as an IPv4 address when the caller uses
+  one — and that is what every stack observed here does — but the convention is the caller's, not
+  the standard's. An **unowned** block emits a zero-length octet string rather than four zero
+  octets, which is this module's own choice: "nobody" and "0.0.0.0" are different answers.
+- **The multi-association `Server`.** `Server.peer` is the seam a front end sets per frame, and the
+  live two-client test drives it that way — but one `Server` object still holds **one**
+  presentation-context table and one negotiated PDU size for all of them. That works in the live
+  run only because both peers propose identical context ids. A production front end gives each
+  association its own view; this is a simulator.
+- **The `ResvTms` readings.** That a BRCB reservation with `ResvTms > 0` outlives the association by
+  that many seconds, that `-1` holds it until released, and that the SGCB's `ResvTms` is an
+  *inactivity* timeout are all readings of IEC 61850-7-2 that no peer confirmed: no reference client
+  writes either attribute. They are unit-tested against an injected clock and stated here as
+  readings.
 - **The SCL `Substation` section is skipped**, not parsed: `Scl.has_substation` records that it was
   there (which is what `kind()` uses) and nothing more. Single-line diagrams are a configuration-tool
   concern, not a client's.
 
 ### Fuzz + hostile input
 
-23 `std.testing.fuzz` sweeps, all asserting "typed error or valid result, never a panic and never a
+25 `std.testing.fuzz` sweeps, all asserting "typed error or valid result, never a panic and never a
 hang":
 
 - `ber.decode` over arbitrary bytes — anything that decodes with a definite length must **re-encode
@@ -689,7 +765,24 @@ non-GOOSE EtherType, a dangling VLAN tag, a PDU missing a mandatory field; SV fi
 the wrong width and a `noASDU` disagreeing with `seqASDU`; and roughly forty malformed object
 references in both syntaxes.
 
-For the new server-side halves specifically: a BRCB enabled with a `DatSet` that does not resolve
+For the new segmentation, re-binding, reservation and journal-deletion halves: a segment whose
+`SubSeqNum` **skips** (`error.SegmentOutOfOrder`, and so is a continuation with nothing open), a
+segment whose `EntryID`, `RptID`, `DatSet` or `SqNum` disagrees with the one that opened the report
+(`error.SegmentMismatch` rather than a spliced report that never existed), a reassembly that
+**never completes** (bounded by the caller's slot table and arena — `error.ReassemblyBufferTooSmall`,
+and the next `SubSeqNum == 0` reclaims the storage), a data-set member larger than a whole segment
+(`error.SegmentTooSmall`, never a truncated value), a `DatSet` write naming a data set that does not
+resolve (refused, and the binding does not move), a `DatSet` write while `RptEna` is set (refused,
+and `ConfRev` does not move), a `DatSet` write through a `Source` with no resolver at all (refused
+rather than pretending), a `ResvTms` below `-1`, a reservation held by an association that has
+**dropped** (kept for a BRCB, released for a URCB, expired by `tick`), an SGCB edit that **expires
+mid-sequence** (the confirm, the next edit and the `SE` read that follow it are all refused), and a
+log deletion **spanning the purge boundary** (deletes what survived and reports that count, never an
+error) or reaching past the far end. Two more fuzz sweeps cover them: an arbitrary sequence of
+segments fed to the reassembler with random drops, and arbitrary bytes through both deletion
+services' decoders followed by a real deletion.
+
+For the older server-side halves specifically: a BRCB enabled with a `DatSet` that does not resolve
 (reports nothing rather than faulting), an `OptFlds` combination the encoder does not support (there
 is none — all 512 are cross-tested against the decoder — but an inclusion index outside the data set
 and a data set wider than the inclusion bit string are both typed errors), an `EntryID` resume point
@@ -782,7 +875,10 @@ reads, the `SBO` read and the `SBOw` write, `Oper` under all four models, `Comma
 both directions, `LastApplError` received from a real IED, `GetVariableAccessAttributes` on a
 control object answered to a real client's satisfaction), and — new — the whole **server-side
 reporting engine** (a third-party client subscribing to our URCB and receiving data-change,
-integrity and general-interrogation reports with the right per-member reason codes), **logging**
+integrity and general-interrogation reports with the right per-member reason codes), **report
+segmentation** (a third-party client receiving a report split across two `InformationReport`s and
+printing all twelve of its members), **RCB reservation** (`Resv`, `Owner` and the refusal, with two
+third-party clients contending for one block), **logging**
 (`LogEna` written, the LCB read, `ReadJournal` answered with entries a third-party client decoded),
 and **setting groups and the BRCB** read back by a third-party MMS browser.
 
@@ -805,7 +901,7 @@ Partly implemented, with the boundary stated:
 - **Emitting SCL** now exists (`sclwrite.zig`) and is round-tripped through the resolver over 44
   real files, but it is a **model writer, not an editor for someone else's document**. It emits what
   `scl.zig` parses and nothing more, so a document with a `Substation` section, `Services`,
-  `SampledValueControl`, `Inputs`/`ExtRef`, `<Log>` bodies, `Private`/`Text` elements or a `desc` on
+  `SampledValueControl`, `Inputs`/`ExtRef`, `Private`/`Text` elements or a `desc` on
   an `LN`/`ReportControl` loses them — `emitParsed` refuses outright when `has_substation` is set
   unless the caller passes `allow_lossy`. An empty attribute and an absent one are indistinguishable
   once parsed, so the writer picks whichever form every consumer accepts. Attribute *order* and
@@ -813,28 +909,38 @@ Partly implemented, with the boundary stated:
   sequences it there.
 - **The server-side reporting engine** implements the trigger set, `BufTm` coalescing, the integrity
   period, general interrogation, the bounded buffered-report guarantee with `EntryID` resume and
-  `BufOvfl`, and the whole RCB attribute surface. It does **not** implement report segmentation
-  (`OptFlds.segmentation` is encoded and decoded but this server never splits a report), dynamic
-  `DatSet` re-binding at runtime (a client may write back the value it read, nothing else), or
-  multi-client reservation across associations — one `Server` serves one association, so `Resv` and
-  `Owner` are modelled per-server.
-- **Logging** implements the LCB, a bounded circular store and `ReadJournal`/`GetJournalStatus`. It
-  does not implement `listOfVariables` filtering in a query (the whole entry is returned),
-  per-entry `originatingApplication` (an empty `ApplicationReference` is emitted, which is what the
-  reference IED does), or log *deletion* services.
-- **Setting groups** implement all six services and the edit-then-confirm invariant. `ResvTms`
-  (edition 2's multi-client edit reservation) is read as zero and never enforced, and there is no
-  timer on an abandoned edit — the selection is released when the association drops, not on a
-  deadline.
+  `BufOvfl`, the whole RCB attribute surface, **report segmentation**, **runtime `DatSet`
+  re-binding** and **multi-client reservation** (`Resv`, `ResvTms`, `Owner`). What it does not do is
+  split one MMS PDU across several COTP TPDUs: a class-0 TPDU is at most 8192 octets, so a *read*
+  response larger than the negotiated TPDU size is a `BufferTooSmall` rather than a fragmented one.
+  That ceiling is also what makes the segmentation budget honest — `Server.reportSegmentBudget` is
+  the smaller of the client's `localDetailCalling` and the negotiated TPDU size, less the
+  session/presentation envelope. `Owner` is part of the RCB *structure* only when `include_owner`
+  is set, because a client reading a structure of the wrong shape mis-assigns every field after the
+  change; it is readable by name either way.
+- **Logging** implements the LCB, a bounded circular store, `ReadJournal` with `listOfVariables`
+  filtering, `GetJournalStatus`, and the deletion services `InitializeJournal` (delete the entries a
+  `limitingTime` / `limitingEntry` covers, answering with the count) and `DeleteJournal` (refused:
+  the journals are part of the caller's static model, exactly as a configured IED's are). A
+  deletion that reaches past what the store has already purged deletes what survives and reports
+  that count — spanning the purge boundary is not an error. It still does not implement per-entry
+  `originatingApplication`: an empty `ApplicationReference` is emitted, which is what the reference
+  IED does.
+- **Setting groups** implement all six services, the edit-then-confirm invariant and `ResvTms`.
+  `ResvTms` is read as an **inactivity** timeout: an edit selection that goes quiet for that many
+  seconds is taken back on `tick`, and every `SetEditSGValue` restarts it, so a slow edit is never
+  interrupted while an abandoned one cannot hold the setting groups for ever. `ResvTms = 0`, the
+  default, is the old behaviour: the selection is released when the association drops and not
+  before. The attribute is part of the SGCB structure only when `include_resv_tms` is set.
 
 Not implemented at all:
 
 - **The SCL `Substation` section** (single-line diagram, voltage levels, bays, conducting equipment,
   `LNode` bindings) and `Private`/`Text` elements. `Scl.has_substation` records that it was present
   and nothing else. Also unparsed, and therefore also not emitted: `Services` capabilities,
-  `SampledValueControl`, `Inputs`/`ExtRef` (the subscription bindings edition 2 uses), and `<Log>`
-  bodies. These three are exactly the reasons 11 of 42 emitted files produce a generated model that
-  differs from the original's.
+  `SampledValueControl` and `Inputs`/`ExtRef` (the subscription bindings edition 2 uses). Those are
+  what is left of the reason 8 of the 44 emitted files produce a generated model that differs from
+  the original's; `<Log>` elements used to be on this list and are now parsed and emitted.
 - **Validating an emitted document against the IEC 61850-6 XSD.** The schema is not redistributable
   and is not present here; validation is `xmllint` well-formedness plus acceptance by a third-party
   SCL model generator. That is a weaker claim than schema validity and is stated as such.
@@ -869,5 +975,5 @@ both (client + server, publisher + subscriber) · single_owner` + deps: `xml` (S
 round-trip check on emission; every other file is std-only and allocation-free) — canonical source
 is `pub const meta` in src/root.zig.
 
-349 tests, 341 offline, 8 live and env-gated (each printing `SKIPPED: …` and passing when no peer
+395 tests, 385 offline, 10 live and env-gated (each printing `SKIPPED: …` and passing when no peer
 is present).

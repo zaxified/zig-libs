@@ -170,6 +170,10 @@ pub const Rcb = report.Rcb;
 pub const Report = report.Report;
 pub const OptFlds = report.OptFlds;
 pub const TrgOps = report.TrgOps;
+/// Puts a segmented report back together on the client side.
+pub const ReportReassembler = report.Reassembler;
+pub const AssembledReport = report.Assembled;
+pub const JournalLimit = logging.Limit;
 
 pub const ControlMachine = control.Machine;
 pub const ControlPoint = control.Point;
@@ -1376,4 +1380,381 @@ test "live: an SCL file survives parse → emit → parse with an identical name
     );
     try testing.expectEqual(@as(usize, 0), mismatches);
     try testing.expect(model_a.nodes.len > 0);
+}
+
+// Set IEC61850_TEST_LISTEN_SEGMENT=host:port and point a real IEC 61850
+// **reporting** client at it.
+//
+// The model is deliberately *wide*: `simpleIOGenericIO/LLN0$Events` carries
+// twelve members of ~700 octets each, so one report is far larger than the
+// negotiated MMS PDU and the server has to split it. The RCB is the one the
+// reference stack's own reporting example is hard-wired to
+// (`simpleIOGenericIO/LLN0.RP.EventsRCB01`), so an off-the-shelf client drives
+// the segmented path without being told anything about it — and the proof is
+// that it prints **all twelve members of one report**, which it can only do by
+// reassembling.
+test "live: a real IEC 61850 client reassembling a segmented report from our server" {
+    const endpoint = envVar("IEC61850_TEST_LISTEN_SEGMENT") orelse {
+        std.debug.print("SKIPPED: live segmented reporting (set IEC61850_TEST_LISTEN_SEGMENT=host:port)\n", .{});
+        return error.SkipZigTest;
+    };
+    const ep = splitEndpoint(endpoint) orelse return error.SkipZigTest;
+
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const addr = std.Io.net.IpAddress.parse(ep.host, ep.port) catch return error.SkipZigTest;
+    var listener = addr.listen(io, .{ .reuse_address = true }) catch {
+        std.debug.print("SKIPPED: live segmented reporting (cannot bind {s})\n", .{endpoint});
+        return error.SkipZigTest;
+    };
+    defer listener.socket.close(io);
+    std.debug.print("live segmented reporting listening on {s}\n", .{endpoint});
+
+    const ld = "simpleIOGenericIO";
+    const members = 12;
+    const payload = 660;
+
+    var storage: [members][payload + 8]u8 = undefined;
+    var names: [members][32]u8 = undefined;
+    var vars: [members]Variable = undefined;
+    for (0..members) |i| {
+        var body: [payload]u8 = undefined;
+        for (0..payload) |k| body[k] = @intCast((i * 31 + k) & 0x7F | 0x20);
+        var w = ber.Writer.init(&storage[i]);
+        try Emit.visibleString(&w, &body);
+        const d = w.done();
+        std.mem.copyForwards(u8, storage[i][0..d.len], d);
+        vars[i] = .{
+            .domain = ld,
+            .item = try std.fmt.bufPrint(&names[i], "GGIO1$ST$Ind{d}$stVal", .{i + 1}),
+            .storage = &storage[i],
+            .len = d.len,
+            .writable = true,
+        };
+    }
+    var indices: [members]usize = undefined;
+    for (0..members) |i| indices[i] = i;
+    const sets = [_]DataSet{.{ .domain = ld, .item = "LLN0$Events", .members = &indices }};
+
+    var entries: [4]reporting.Entry = @splat(.{});
+    var arena: [4 * (members * (payload + 16))]u8 = undefined;
+    var rcbs = [_]server.ReportControl{.{
+        .kind = .unbuffered,
+        .domain = ld,
+        .item = "LLN0$RP$EventsRCB01",
+        .rpt_id = "Events1",
+        .dat_set = ld ++ "/LLN0$Events",
+        .data_set = 0,
+        .conf_rev = 1,
+        .opt_flds = .{
+            .sequence_number = true,
+            .report_time_stamp = true,
+            .reason_for_inclusion = true,
+            .data_set_name = true,
+            .conf_revision = true,
+            // `data_reference` is what makes the *report* larger than a plain
+            // read of the same data set: the read carries only the values, the
+            // report carries each member's object reference as well. A COTP
+            // class-0 TPDU can never exceed 8192 octets and this module does
+            // not split one PDU across several TPDUs, so that gap is exactly
+            // where a report has to segment and a read still fits.
+            .data_reference = true,
+            // The whole point of this run.
+            .segmentation = true,
+        },
+        .trg_ops = .{
+            .data_change = true,
+            .quality_change = true,
+            .integrity = true,
+            .general_interrogation = true,
+        },
+        .buf_tm_ms = 50,
+        .intg_pd_ms = 2000,
+        .buffer = try reporting.Buffer.init(&entries, &arena),
+    }};
+
+    const domains = [_][]const u8{ld};
+    var srv = Server.init(.{}, .{
+        .variables = &vars,
+        .data_sets = &sets,
+        .report_controls = &rcbs,
+        .domains = &domains,
+    });
+
+    var in: [16384]u8 = undefined;
+    var out: [32768]u8 = undefined;
+    var notify: [32768]u8 = undefined;
+    var now: u64 = 1_700_000_000_000;
+    var served: usize = 0;
+    const peers = std.fmt.parseInt(usize, envVar("IEC61850_TEST_PEERS") orelse "1", 10) catch 1;
+    var segments_sent: u64 = 0;
+    // How many PDUs went out that were *not* the last segment of their report:
+    // non-zero is the whole claim.
+    var split_reports: u64 = 0;
+    while (served < peers) : (served += 1) {
+        const stream = listener.accept(io) catch break;
+        var tt = TcpTransport.fromStream(io, stream);
+        tt.setReadTimeout(200);
+        const t = tt.transport();
+        var idle: usize = 0;
+        var rounds: usize = 0;
+        var toggles: usize = 0;
+        while (rounds < 20000 and idle < 100) : (rounds += 1) {
+            const n = t.read(&in) catch 0;
+            if (n == 0) {
+                idle += 1;
+                now += 200;
+                if (toggles < 4) {
+                    const which = toggles % members;
+                    var body: [payload]u8 = undefined;
+                    for (0..payload) |k| body[k] = @intCast((toggles * 7 + k) & 0x3F | 0x40);
+                    var w = ber.Writer.init(&storage[which]);
+                    Emit.visibleString(&w, &body) catch {};
+                    const d = w.done();
+                    std.mem.copyForwards(u8, storage[which][0..d.len], d);
+                    vars[which].len = d.len;
+                    srv.signal(which, .data_change);
+                    toggles += 1;
+                }
+                srv.tick(now);
+                while (srv.pendingNotification(&notify) catch null) |note| {
+                    segments_sent += 1;
+                    if (rcbs[0].segmenting()) split_reports += 1;
+                    t.write(note) catch break;
+                }
+                continue;
+            }
+            idle = 0;
+            now += 10;
+            srv.tick(now);
+            const reply = srv.handle(in[0..n], &out) catch continue;
+            const rep = reply orelse break;
+            t.write(rep) catch break;
+            while (srv.pendingNotification(&notify) catch null) |note| {
+                segments_sent += 1;
+                if (rcbs[0].segmenting()) split_reports += 1;
+                t.write(note) catch break;
+            }
+        }
+        srv.releaseAssociation();
+        tt.close();
+    }
+    if (served == 0) {
+        std.debug.print("SKIPPED: live segmented reporting (no peer connected)\n", .{});
+        return error.SkipZigTest;
+    }
+    std.debug.print(
+        "live segmented reporting: peers={d} negotiated_pdu={d} negotiated_tpdu={d} budget={d} " ++
+            "members={d} member_bytes={d} segments_sent={d} split_reports={d} sq_num={d}\n",
+        .{
+            served,                    srv.negotiated_pdu_len, srv.negotiated_tpdu_len,
+            srv.reportSegmentBudget(), members,                payload,
+            segments_sent,             split_reports,          rcbs[0].sq_num,
+        },
+    );
+    // At least one report went out in more than one PDU.
+    try testing.expect(split_reports > 0);
+    try testing.expect(srv.reads + srv.writes > 0);
+}
+
+// Set IEC61850_TEST_LISTEN_RESV=host:port and point **two** IEC 61850 reporting
+// clients at it at the same time.
+//
+// Both are hard-wired to `simpleIOGenericIO/LLN0.RP.EventsRCB01`, so they
+// contend for one report control block. The first to write `RptEna` owns it;
+// the second's write is refused with `object-access-denied` and its own stack
+// reports the failure. `Owner` names the winner in the four octets of its
+// association id.
+//
+// The two associations are multiplexed onto one `Server` by round-robin, with
+// `Server.peer` set to the socket's id before every frame — which is exactly
+// the seam a production front end uses. One caveat, stated rather than hidden:
+// the presentation-context table is shared, which works only because both
+// peers propose the same context ids. A real front end gives each association
+// its own.
+test "live: two real IEC 61850 clients contending for one report control block" {
+    const endpoint = envVar("IEC61850_TEST_LISTEN_RESV") orelse {
+        std.debug.print("SKIPPED: live RCB reservation (set IEC61850_TEST_LISTEN_RESV=host:port)\n", .{});
+        return error.SkipZigTest;
+    };
+    const ep = splitEndpoint(endpoint) orelse return error.SkipZigTest;
+
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const addr = std.Io.net.IpAddress.parse(ep.host, ep.port) catch return error.SkipZigTest;
+    var listener = addr.listen(io, .{ .reuse_address = true }) catch {
+        std.debug.print("SKIPPED: live RCB reservation (cannot bind {s})\n", .{endpoint});
+        return error.SkipZigTest;
+    };
+    defer listener.socket.close(io);
+    std.debug.print("live RCB reservation listening on {s}\n", .{endpoint});
+
+    const ld = "simpleIOGenericIO";
+    var storage: [4][8]u8 = undefined;
+    var vars: [4]Variable = undefined;
+    const items = [_][]const u8{
+        "GGIO1$ST$Ind1$stVal", "GGIO1$ST$Ind2$stVal",
+        "GGIO1$ST$Ind3$stVal", "GGIO1$ST$Ind4$stVal",
+    };
+    for (0..4) |i| {
+        vars[i] = .{
+            .domain = ld,
+            .item = items[i],
+            .storage = &storage[i],
+            .len = try emitInto(&storage[i], .{ .boolean = false }),
+            .writable = true,
+        };
+    }
+    const sets = [_]DataSet{.{ .domain = ld, .item = "LLN0$Events", .members = &[_]usize{ 0, 1, 2, 3 } }};
+    var entries: [16]reporting.Entry = @splat(.{});
+    var arena: [16 * 256]u8 = undefined;
+    var rcbs = [_]server.ReportControl{.{
+        .kind = .unbuffered,
+        .domain = ld,
+        .item = "LLN0$RP$EventsRCB01",
+        .rpt_id = "Events1",
+        .dat_set = ld ++ "/LLN0$Events",
+        .data_set = 0,
+        .conf_rev = 1,
+        .opt_flds = .{
+            .sequence_number = true,
+            .report_time_stamp = true,
+            .reason_for_inclusion = true,
+            .data_set_name = true,
+            .conf_revision = true,
+        },
+        .trg_ops = .{ .data_change = true, .general_interrogation = true },
+        .buf_tm_ms = 50,
+        // `Owner` is a member of the structure here, so a browsing client sees
+        // who holds the block without asking for the attribute by name.
+        .include_owner = true,
+        .buffer = try reporting.Buffer.init(&entries, &arena),
+    }};
+    const domains = [_][]const u8{ld};
+    var srv = Server.init(.{}, .{
+        .variables = &vars,
+        .data_sets = &sets,
+        .report_controls = &rcbs,
+        .domains = &domains,
+    });
+
+    // Two associations, accepted up front. `accept` blocks, so the second
+    // client has to be started within the driver's window; that is the
+    // script's job, not this loop's.
+    const max_links: usize = 4;
+    const want = @min(
+        max_links,
+        std.fmt.parseInt(usize, envVar("IEC61850_TEST_PEERS") orelse "2", 10) catch 2,
+    );
+    var links: [max_links]TcpTransport = undefined;
+    var live: [max_links]bool = @splat(false);
+    var accepted: usize = 0;
+    // The first peer is waited for; the rest are picked up **between passes**,
+    // so an early client is served while a later one is still connecting. A
+    // blocking accept would starve whoever got in first.
+    {
+        const stream = listener.accept(io) catch {
+            std.debug.print("SKIPPED: live RCB reservation (no peer connected)\n", .{});
+            return error.SkipZigTest;
+        };
+        links[0] = TcpTransport.fromStream(io, stream);
+        links[0].setReadTimeout(100);
+        live[0] = true;
+        accepted = 1;
+    }
+
+    var in: [16384]u8 = undefined;
+    var out: [32768]u8 = undefined;
+    var notify: [16384]u8 = undefined;
+    var now: u64 = 1_700_000_000_000;
+    var idle: usize = 0;
+    var rounds: usize = 0;
+    var refusals: usize = 0;
+    var first_owner: ?u32 = null;
+    var owner_changes: usize = 0;
+    while (rounds < 40000 and idle < 200) : (rounds += 1) {
+        // Pick up a peer that has arrived since the last pass.
+        if (accepted < want and listenerReadable(listener.socket.handle)) {
+            if (listener.accept(io)) |stream| {
+                links[accepted] = TcpTransport.fromStream(io, stream);
+                links[accepted].setReadTimeout(100);
+                live[accepted] = true;
+                accepted += 1;
+            } else |_| {}
+        }
+        var any = false;
+        for (0..accepted) |i| {
+            if (!live[i]) continue;
+            // The association a frame arrived on is what owns the block.
+            srv.peer = 0xC0A8_0100 + @as(u32, @intCast(i)) + 1;
+            const t = links[i].transport();
+            const n = t.read(&in) catch 0;
+            if (n == 0) continue;
+            any = true;
+            now += 10;
+            srv.tick(now);
+            const before = srv.writes;
+            const reply = srv.handle(in[0..n], &out) catch continue;
+            const rep = reply orelse {
+                srv.releaseAssociationOf(srv.peer);
+                links[i].close();
+                live[i] = false;
+                continue;
+            };
+            t.write(rep) catch {};
+            if (srv.writes > before and rcbs[0].owner != null and rcbs[0].owner.? != srv.peer) {
+                refusals += 1;
+            }
+            if (rcbs[0].owner) |o| {
+                if (first_owner == null) first_owner = o;
+                if (first_owner.? != o) owner_changes += 1;
+            }
+            while (srv.pendingNotification(&notify) catch null) |note| {
+                t.write(note) catch break;
+            }
+        }
+        if (!any) {
+            idle += 1;
+            now += 100;
+            srv.tick(now);
+            for (0..accepted) |i| {
+                if (!live[i]) continue;
+                srv.peer = 0xC0A8_0100 + @as(u32, @intCast(i)) + 1;
+                const t = links[i].transport();
+                while (srv.pendingNotification(&notify) catch null) |note| {
+                    t.write(note) catch break;
+                }
+            }
+            var all_gone = true;
+            for (0..accepted) |i| {
+                if (live[i]) all_gone = false;
+            }
+            if (all_gone) break;
+        } else idle = 0;
+    }
+    for (0..accepted) |i| {
+        if (live[i]) {
+            srv.releaseAssociationOf(0xC0A8_0100 + @as(u32, @intCast(i)) + 1);
+            links[i].close();
+        }
+    }
+    std.debug.print(
+        "live RCB reservation: peers={d} reads={d} writes={d} refused_writes={d} " ++
+            "first_owner=0x{X} owner_changes={d} reports={d}\n",
+        .{
+            accepted,             srv.reads,     srv.writes,              refusals,
+            first_owner orelse 0, owner_changes, rcbs[0].reports_emitted,
+        },
+    );
+    try testing.expect(srv.reads + srv.writes > 0);
+    try testing.expect(first_owner != null);
+}
+
+/// Whether a listening socket has a connection waiting, without blocking.
+fn listenerReadable(handle: std.posix.fd_t) bool {
+    var fds = [_]std.posix.pollfd{.{ .fd = handle, .events = std.posix.POLL.IN, .revents = 0 }};
+    const n = std.posix.poll(&fds, 0) catch return false;
+    return n != 0;
 }

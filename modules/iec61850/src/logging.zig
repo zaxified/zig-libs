@@ -159,6 +159,14 @@ pub const Store = struct {
         return e;
     }
 
+    /// Drops the oldest entry — what a journal deletion does, one entry at a
+    /// time. It does **not** count as a purge: the client asked for it.
+    pub fn dropOldest(self: *Store) void {
+        if (self.count == 0) return;
+        self.head = (self.head + 1) % self.entries.len;
+        self.count -= 1;
+    }
+
     pub fn oldest(self: *Store) ?*Entry {
         return if (self.count == 0) null else self.at(0);
     }
@@ -390,9 +398,40 @@ pub const Range = struct {
 /// decoder costs nothing.
 pub const entry_to_start_after_tag: u32 = 5;
 
+/// The most `listOfVariables` names one query may carry. A filter longer than
+/// this is a typed error, not a truncated filter that silently returns more
+/// than the client asked for.
+pub const max_filter_variables: usize = 16;
+
+/// `listOfVariables` — the tag of the `SEQUENCE OF VisibleString` that narrows a
+/// query to particular variables.
+///
+/// **Self-derived**, from the published ISO 9506-2 layout: no reference client
+/// offers the filter, so nothing was observed here. `entryToStartAfter` at `[4]`
+/// / `[5]` above *was* observed, and the two do not collide.
+pub const list_of_variables_tag: u32 = 3;
+
 pub const ReadJournalRequest = struct {
     journal: mms.ObjectName,
     range: Range = .{},
+    /// `listOfVariables`. Empty means "the whole entry", which is what every
+    /// client observed here asks for.
+    variables: [max_filter_variables][]const u8 = undefined,
+    variable_count: u8 = 0,
+
+    pub fn filter(self: *const ReadJournalRequest) []const []const u8 {
+        return self.variables[0..self.variable_count];
+    }
+
+    /// Whether a stored variable's tag is one the query asked for. An empty
+    /// filter matches everything.
+    pub fn wants(self: *const ReadJournalRequest, tag: []const u8) bool {
+        if (self.variable_count == 0) return true;
+        for (self.filter()) |v| {
+            if (std.mem.eql(u8, v, tag)) return true;
+        }
+        return false;
+    }
 };
 
 /// Encodes a `ReadJournal` request — the client half, so the decoder can be
@@ -403,6 +442,18 @@ pub fn encodeReadJournal(
     range: Range,
     out: []u8,
 ) Error![]const u8 {
+    return encodeReadJournalFiltered(invoke_id, journal, range, &.{}, out);
+}
+
+/// `ReadJournal` with a `listOfVariables` filter.
+pub fn encodeReadJournalFiltered(
+    invoke_id: u32,
+    journal: mms.ObjectName,
+    range: Range,
+    variables: []const []const u8,
+    out: []u8,
+) Error![]const u8 {
+    if (variables.len > max_filter_variables) return error.TooManyEntries;
     var w = ber.Writer.init(out);
     const m = w.mark();
     if (range.after_entry != null or range.after_time != null) {
@@ -410,6 +461,17 @@ pub fn encodeReadJournal(
         if (range.after_entry) |x| try w.primitive(ber.Tag.ctx(1), x);
         if (range.after_time) |t| try emitTime(&w, ber.Tag.ctx(0), t);
         try w.header(ber.Tag.ctxc(entry_to_start_after_tag), e);
+    }
+    // `listOfVariables [3]` sits between the stop specification and
+    // `entryToStartAfter`, so a backwards writer puts it here.
+    if (variables.len > 0) {
+        const v = w.mark();
+        var i: usize = variables.len;
+        while (i > 0) {
+            i -= 1;
+            try w.primitive(ber.Tag.uni(ber.Universal.visible_string), variables[i]);
+        }
+        try w.header(ber.Tag.ctxc(list_of_variables_tag), v);
     }
     if (range.ending_time != null or range.number_of_entries != null) {
         const e = w.mark();
@@ -459,6 +521,14 @@ pub fn decodeReadJournal(body: []const u8) Error!ReadJournalRequest {
                         1 => r.range.number_of_entries = try ber.decodeInt(i32, f.content),
                         else => {},
                     }
+                }
+            },
+            list_of_variables_tag => {
+                var s = ber.Iterator.init(e.content);
+                while (try s.next()) |f| {
+                    if (r.variable_count == max_filter_variables) return error.TooManyEntries;
+                    r.variables[r.variable_count] = f.content;
+                    r.variable_count += 1;
                 }
             },
             4, entry_to_start_after_tag => {
@@ -741,21 +811,168 @@ pub fn answerReadJournal(
         }
         const slot = lcb.store.slotOf(i);
         var k: usize = 0;
+        var kept: usize = 0;
         while (k < e.count) : (k += 1) {
-            vars[n][k] = .{
-                .tag = slot[e.tag_off[k]..][0..e.tag_len[k]],
+            const tag = slot[e.tag_off[k]..][0..e.tag_len[k]];
+            // `listOfVariables`: an entry is returned only if it carries at
+            // least one of the named variables, and only those are put in it.
+            // An empty filter keeps everything, which is the observed case.
+            if (!req.wants(tag)) continue;
+            vars[n][kept] = .{
+                .tag = tag,
                 .value = slot[e.val_off[k]..][0..e.val_len[k]],
             };
+            kept += 1;
         }
+        if (kept == 0) continue;
         std.mem.writeInt(u64, &ids[n], e.entry_id, .big);
         entries[n] = .{
             .entry_id = &ids[n],
             .occurrence_time = reporting.binaryTimeFromMillis(e.time_ms),
-            .variables = vars[n][0..e.count],
+            .variables = vars[n][0..kept],
         };
         n += 1;
     }
     return encodeReadJournalResponse(invoke_id, entries[0..n], more, out);
+}
+
+// ── the journal deletion services ───────────────────────────────────────────
+
+/// `InitializeJournal` is MMS confirmed service `[67]` and `DeleteJournal` is
+/// `[70]`. Both are **self-derived** from the published ISO 9506-2 layout: no
+/// reference client offers either, so neither was observed on a wire. They are
+/// round-tripped against this module's own decoders and dissected by Wireshark.
+pub const initialize_journal_service: mms.Service = @enumFromInt(67);
+pub const delete_journal_service: mms.Service = @enumFromInt(70);
+
+/// How far an `InitializeJournal` deletes. Absent halves mean "no bound", so a
+/// request with neither empties the journal.
+pub const Limit = struct {
+    /// `limitingTime` — entries at or before this time go.
+    limiting_time: ?mmsdata.BinaryTime = null,
+    /// `limitingEntry` — entries up to and including this `EntryID` go.
+    limiting_entry: ?[]const u8 = null,
+};
+
+pub const InitializeJournalRequest = struct {
+    journal: mms.ObjectName,
+    limit: Limit = .{},
+};
+
+pub fn encodeInitializeJournal(
+    invoke_id: u32,
+    journal: mms.ObjectName,
+    limit: Limit,
+    out: []u8,
+) Error![]const u8 {
+    var w = ber.Writer.init(out);
+    const m = w.mark();
+    if (limit.limiting_time != null or limit.limiting_entry != null) {
+        const e = w.mark();
+        if (limit.limiting_entry) |x| try w.primitive(ber.Tag.ctx(1), x);
+        if (limit.limiting_time) |t| try emitTime(&w, ber.Tag.ctx(0), t);
+        try w.header(ber.Tag.ctxc(1), e);
+    }
+    const jn = w.mark();
+    try journal.encode(&w);
+    try w.header(ber.Tag.ctxc(0), jn);
+    try mms.closeConfirmedRequest(&w, m, initialize_journal_service, invoke_id);
+    return w.done();
+}
+
+pub fn decodeInitializeJournal(body: []const u8) Error!InitializeJournalRequest {
+    var r = InitializeJournalRequest{ .journal = .{ .vmd_specific = "" } };
+    var seen = false;
+    var it = ber.Iterator.init(body);
+    while (try it.next()) |e| {
+        if (e.tag.class != .context) continue;
+        switch (e.tag.number) {
+            0 => {
+                r.journal = try mms.ObjectName.decode(e.content);
+                seen = true;
+            },
+            1 => {
+                var s = ber.Iterator.init(e.content);
+                while (try s.next()) |f| {
+                    switch (f.tag.number) {
+                        0 => r.limit.limiting_time = try mmsdata.BinaryTime.parse(f.content),
+                        1 => r.limit.limiting_entry = f.content,
+                        else => {},
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+    if (!seen) return error.MissingField;
+    return r;
+}
+
+pub fn encodeInitializeJournalResponse(invoke_id: u32, deleted: u32, out: []u8) Error![]const u8 {
+    var w = ber.Writer.init(out);
+    const m = w.mark();
+    try w.unsigned(ber.Tag.ctx(0), deleted);
+    try mms.closeConfirmedResponse(&w, m, initialize_journal_service, invoke_id);
+    return w.done();
+}
+
+pub fn decodeInitializeJournalResponse(body: []const u8) Error!u32 {
+    var it = ber.Iterator.init(body);
+    while (try it.next()) |e| {
+        if (e.tag.class == .context and e.tag.number == 0) return ber.decodeUint(u32, e.content);
+    }
+    return error.MissingField;
+}
+
+pub fn encodeDeleteJournal(invoke_id: u32, journal: mms.ObjectName, out: []u8) Error![]const u8 {
+    var w = ber.Writer.init(out);
+    const m = w.mark();
+    try journal.encode(&w);
+    try mms.closeConfirmedRequest(&w, m, delete_journal_service, invoke_id);
+    return w.done();
+}
+
+pub fn decodeDeleteJournal(body: []const u8) Error!mms.ObjectName {
+    return mms.ObjectName.decode(body);
+}
+
+/// `DeleteJournal-Response ::= NULL` — an empty body.
+pub fn encodeDeleteJournalResponse(invoke_id: u32, out: []u8) Error![]const u8 {
+    var w = ber.Writer.init(out);
+    const m = w.mark();
+    try mms.closeConfirmedResponse(&w, m, delete_journal_service, invoke_id);
+    return w.done();
+}
+
+/// Deletes the oldest entries a limit covers and returns how many went.
+///
+/// A journal deletes from the **oldest end**: that is what a bounded circular
+/// store can do without leaving holes, and what `limitingTime` /
+/// `limitingEntry` describe. A limit that reaches past entries the store has
+/// already purged deletes what survives and reports that count — spanning the
+/// purge boundary is not an error, because from the client's point of view the
+/// purged entries are already gone.
+pub fn initializeJournal(lcb: *ControlBlock, limit: Limit) u32 {
+    var until_id: ?u64 = null;
+    if (limit.limiting_entry) |raw| {
+        var id: u64 = 0;
+        for (raw) |b| id = (id << 8) | b;
+        until_id = id;
+    }
+    const until_ms: ?u64 = if (limit.limiting_time) |t| millisOf(t) else null;
+    const unbounded = until_id == null and until_ms == null;
+
+    var deleted: u32 = 0;
+    while (lcb.store.count > 0) {
+        const e = lcb.store.at(0);
+        const covered = unbounded or
+            (until_id != null and e.entry_id <= until_id.?) or
+            (until_ms != null and e.time_ms <= until_ms.?);
+        if (!covered) break;
+        lcb.store.dropOldest();
+        deleted += 1;
+    }
+    return deleted;
 }
 
 fn millisOf(t: mmsdata.BinaryTime) u64 {
@@ -1194,4 +1411,231 @@ fn fuzzJournal(_: void, smith: *std.testing.Smith) !void {
     } else |_| {}
     _ = decodeGetJournalStatus(buf[0..len]) catch {};
     _ = decodeGetJournalStatusResponse(buf[0..len]) catch {};
+}
+
+// ── listOfVariables filtering ───────────────────────────────────────────────
+
+/// Walks a `ReadJournal` response and counts entries and variable tags.
+fn journalShape(body: []const u8) !struct { entries: usize, variables: usize, first_tag: []const u8 } {
+    const resp = (try mms.decode(body)).confirmed_response;
+    const r = try decodeReadJournalResponse(resp.body);
+    var it = r.entries;
+    var entries: usize = 0;
+    var variables: usize = 0;
+    var first_tag: []const u8 = "";
+    while (try it.next()) |e| : (entries += 1) {
+        var vars = e.iterate();
+        while (try vars.next()) |v| {
+            if (first_tag.len == 0) first_tag = v.tag;
+            variables += 1;
+        }
+    }
+    return .{ .entries = entries, .variables = variables, .first_tag = first_tag };
+}
+
+test "listOfVariables narrows a query to the variables it names" {
+    var h: Harness = .{};
+    try h.src.init();
+    var lcb = h.lcb();
+    lcb.log_ena = true;
+    _ = try lcb.signal(h.src.source(), 0, 0, .data_change, 100);
+    _ = try lcb.signal(h.src.source(), 0, 1, .data_change, 200);
+
+    const query = ReadJournalRequest{
+        .journal = .{ .domain_specific = .{ .domain = "TESTLD", .item = "LLN0$EventLog" } },
+    };
+    // Unfiltered: two entries, each the member plus its ReasonCode.
+    const all = try journalShape(try answerReadJournal(&lcb, query, 1, &h.out));
+    try testing.expectEqual(@as(usize, 2), all.entries);
+    try testing.expectEqual(@as(usize, 4), all.variables);
+
+    // Filtered to one member's reference: one entry, one variable.
+    var one = query;
+    one.variables[0] = h.src.refs[1];
+    one.variable_count = 1;
+    const got = try journalShape(try answerReadJournal(&lcb, one, 2, &h.out));
+    try testing.expectEqual(@as(usize, 1), got.entries);
+    try testing.expectEqual(@as(usize, 1), got.variables);
+    try testing.expectEqualStrings(h.src.refs[1], got.first_tag);
+
+    // Filtered to `ReasonCode` alone: both entries, one variable each.
+    var reasons = query;
+    reasons.variables[0] = reason_code_tag;
+    reasons.variable_count = 1;
+    const only = try journalShape(try answerReadJournal(&lcb, reasons, 3, &h.out));
+    try testing.expectEqual(@as(usize, 2), only.entries);
+    try testing.expectEqual(@as(usize, 2), only.variables);
+    try testing.expectEqualStrings(reason_code_tag, only.first_tag);
+
+    // A filter naming nothing the log holds returns no entries at all — never
+    // an error, and never the whole log.
+    var none = query;
+    none.variables[0] = "TESTLD/GGIO9$ST$Nope$stVal";
+    none.variable_count = 1;
+    const empty = try journalShape(try answerReadJournal(&lcb, none, 4, &h.out));
+    try testing.expectEqual(@as(usize, 0), empty.entries);
+}
+
+test "a listOfVariables filter survives the request encoder and decoder" {
+    var buf: [512]u8 = undefined;
+    const names = [_][]const u8{ "TESTLD/GGIO1$ST$Ind1$stVal", reason_code_tag };
+    const pdu = try encodeReadJournalFiltered(
+        9,
+        .{ .domain_specific = .{ .domain = "TESTLD", .item = "LLN0$EventLog" } },
+        .{ .number_of_entries = 4 },
+        &names,
+        &buf,
+    );
+    const req = (try mms.decode(pdu)).confirmed_request;
+    const q = try decodeReadJournal(req.body);
+    try testing.expectEqual(@as(u8, 2), q.variable_count);
+    try testing.expectEqualStrings(names[0], q.filter()[0]);
+    try testing.expectEqualStrings(names[1], q.filter()[1]);
+    try testing.expectEqual(@as(i32, 4), q.range.number_of_entries.?);
+    try testing.expect(q.wants(names[0]));
+    try testing.expect(!q.wants("something else"));
+
+    // And it re-encodes to the identical octets.
+    var again: [512]u8 = undefined;
+    const round = try encodeReadJournalFiltered(9, q.journal, q.range, q.filter(), &again);
+    try testing.expectEqualSlices(u8, pdu, round);
+
+    // A filter longer than the fixed table is a typed error on both sides.
+    const many: [max_filter_variables + 1][]const u8 = @splat("x");
+    try testing.expectError(error.TooManyEntries, encodeReadJournalFiltered(
+        9,
+        q.journal,
+        .{},
+        &many,
+        &buf,
+    ));
+}
+
+// ── deleting log entries ────────────────────────────────────────────────────
+
+fn fillLog(h: *Harness, lcb: *ControlBlock, n: usize, base: u64) !void {
+    lcb.log_ena = true;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        try h.src.set(i % 3, i % 2 == 0);
+        _ = try lcb.signal(h.src.source(), 0, i % 3, .data_change, base + i * 1000);
+    }
+}
+
+test "InitializeJournal deletes up to a limiting EntryID and reports the count" {
+    var h: Harness = .{};
+    try h.src.init();
+    var lcb = h.lcb();
+    try fillLog(&h, &lcb, 4, 1_700_000_000_000);
+    try testing.expectEqual(@as(usize, 4), lcb.store.count);
+
+    var id: [entry_id_len]u8 = undefined;
+    std.mem.writeInt(u64, &id, 2, .big);
+    try testing.expectEqual(@as(u32, 2), initializeJournal(&lcb, .{ .limiting_entry = &id }));
+    try testing.expectEqual(@as(usize, 2), lcb.store.count);
+    try testing.expectEqual(@as(u64, 3), lcb.store.oldest().?.entry_id);
+    // Deleting is not purging: the client asked for it.
+    try testing.expectEqual(@as(u64, 0), lcb.store.purged);
+
+    // No limit at all empties the journal.
+    try testing.expectEqual(@as(u32, 2), initializeJournal(&lcb, .{}));
+    try testing.expectEqual(@as(usize, 0), lcb.store.count);
+    // …and doing it again deletes nothing rather than failing.
+    try testing.expectEqual(@as(u32, 0), initializeJournal(&lcb, .{}));
+}
+
+test "a deletion spanning the purge boundary deletes what survived" {
+    var h: Harness = .{};
+    try h.src.init();
+    var lcb = h.lcb();
+    // Ten entries into a four-entry store: 1..6 are already gone.
+    try fillLog(&h, &lcb, 10, 1_700_000_000_000);
+    try testing.expectEqual(@as(u64, 6), lcb.store.purged);
+    try testing.expectEqual(@as(u64, 7), lcb.store.oldest().?.entry_id);
+
+    // Delete "everything up to entry 8" — half of which the store never had.
+    var id: [entry_id_len]u8 = undefined;
+    std.mem.writeInt(u64, &id, 8, .big);
+    try testing.expectEqual(@as(u32, 2), initializeJournal(&lcb, .{ .limiting_entry = &id }));
+    try testing.expectEqual(@as(usize, 2), lcb.store.count);
+    try testing.expectEqual(@as(u64, 9), lcb.store.oldest().?.entry_id);
+
+    // …and one reaching past the far end deletes the rest, still without error.
+    std.mem.writeInt(u64, &id, 1000, .big);
+    try testing.expectEqual(@as(u32, 2), initializeJournal(&lcb, .{ .limiting_entry = &id }));
+    try testing.expectEqual(@as(usize, 0), lcb.store.count);
+}
+
+test "InitializeJournal deletes by time and leaves later entries alone" {
+    var h: Harness = .{};
+    try h.src.init();
+    var lcb = h.lcb();
+    const base: u64 = 1_700_000_000_000;
+    try fillLog(&h, &lcb, 4, base);
+    const cut = reporting.binaryTimeFromMillis(base + 1000);
+    try testing.expectEqual(@as(u32, 2), initializeJournal(&lcb, .{ .limiting_time = cut }));
+    try testing.expectEqual(@as(usize, 2), lcb.store.count);
+    try testing.expectEqual(@as(u64, 3), lcb.store.oldest().?.entry_id);
+    // A cut before everything deletes nothing.
+    const early = reporting.binaryTimeFromMillis(base - 10_000);
+    try testing.expectEqual(@as(u32, 0), initializeJournal(&lcb, .{ .limiting_time = early }));
+    try testing.expectEqual(@as(usize, 2), lcb.store.count);
+}
+
+test "the deletion services round trip through their own codecs" {
+    var buf: [256]u8 = undefined;
+    const name = mms.ObjectName{
+        .domain_specific = .{ .domain = "TESTLD", .item = "LLN0$EventLog" },
+    };
+    var id: [entry_id_len]u8 = undefined;
+    std.mem.writeInt(u64, &id, 42, .big);
+    const limit = Limit{
+        .limiting_time = reporting.binaryTimeFromMillis(1_700_000_000_000),
+        .limiting_entry = &id,
+    };
+    const pdu = try encodeInitializeJournal(7, name, limit, &buf);
+    const req = (try mms.decode(pdu)).confirmed_request;
+    try testing.expectEqual(initialize_journal_service, req.service);
+    const q = try decodeInitializeJournal(req.body);
+    try testing.expectEqualStrings("LLN0$EventLog", q.journal.domain_specific.item);
+    try testing.expectEqualSlices(u8, &id, q.limit.limiting_entry.?);
+    try testing.expectEqual(limit.limiting_time.?.ms_since_midnight, q.limit.limiting_time.?.ms_since_midnight);
+    var again: [256]u8 = undefined;
+    try testing.expectEqualSlices(u8, pdu, try encodeInitializeJournal(7, q.journal, q.limit, &again));
+
+    const resp = try encodeInitializeJournalResponse(7, 13, &buf);
+    const dec = (try mms.decode(resp)).confirmed_response;
+    try testing.expectEqual(@as(u32, 13), try decodeInitializeJournalResponse(dec.body));
+
+    const del = try encodeDeleteJournal(8, name, &buf);
+    const dreq = (try mms.decode(del)).confirmed_request;
+    try testing.expectEqual(delete_journal_service, dreq.service);
+    const dn = try decodeDeleteJournal(dreq.body);
+    try testing.expectEqualStrings("LLN0$EventLog", dn.domain_specific.item);
+    const dresp = try encodeDeleteJournalResponse(8, &buf);
+    const ddec = (try mms.decode(dresp)).confirmed_response;
+    try testing.expectEqual(@as(usize, 0), ddec.body.len);
+
+    // Hostile input: a request with no journal name at all.
+    try testing.expectError(error.MissingField, decodeInitializeJournal(&.{}));
+}
+
+test "fuzz: the deletion services never panic on arbitrary bytes" {
+    try std.testing.fuzz({}, fuzzDeletion, .{});
+}
+
+fn fuzzDeletion(_: void, smith: *std.testing.Smith) !void {
+    var input: [128]u8 = undefined;
+    smith.bytes(&input);
+    const len: usize = smith.valueRangeAtMost(u8, 0, input.len);
+    const body = input[0..len];
+    if (decodeInitializeJournal(body)) |q| {
+        var h: Harness = .{};
+        h.src.init() catch return;
+        var lcb = h.lcb();
+        fillLog(&h, &lcb, 4, 1_700_000_000_000) catch return;
+        _ = initializeJournal(&lcb, q.limit);
+    } else |_| {}
+    _ = decodeDeleteJournal(body) catch {};
+    _ = decodeInitializeJournalResponse(body) catch {};
 }
