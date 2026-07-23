@@ -85,6 +85,7 @@ const module_list = [_]Module{
     .{ .name = "nftables", .deps = &.{"netlink"} },
     .{ .name = "modbus" },
     .{ .name = "iec104" },
+    .{ .name = "iec61850" },
     .{ .name = "s7comm" },
     .{ .name = "enip", .deps = &.{"netaddr"} },
     .{ .name = "bacnet", .deps = &.{"netaddr"} },
