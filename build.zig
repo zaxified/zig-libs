@@ -91,7 +91,7 @@ const module_list = [_]Module{
     .{ .name = "iec62351", .deps = &.{ "x509", "rsa" } },
     .{ .name = "s7comm" },
     .{ .name = "enip", .deps = &.{"netaddr"} },
-    .{ .name = "bacnet", .deps = &.{"netaddr"} },
+    .{ .name = "bacnet", .deps = &.{ "netaddr", "websocket" } },
     .{ .name = "whois", .deps = &.{"netaddr"} },
     .{ .name = "uci" },
     .{ .name = "mqtt" },
