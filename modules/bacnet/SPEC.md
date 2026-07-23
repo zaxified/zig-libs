@@ -5,7 +5,8 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
 ## Design & invariants
 
 Four allocation-free wire layers mirroring the standard's own decomposition, plus a datagram
-seam and the two roles on top of it. Every wire struct uses explicit shifts and
+seam and the two roles on top of it — and, since the module now covers **two** data links, a
+second link layer (Annex AB, BACnet/SC) with its own node and hub. Every wire struct uses explicit shifts and
 `std.mem.readInt`/`writeInt` rather than a `packed struct`, so the octet layout never depends on
 Zig's bitfield-packing rules.
 
@@ -95,12 +96,82 @@ Zig's bitfield-packing rules.
   **A `Forwarded-NPDU` is attributed to the original sender**, not to the BBMD that relayed it.
   Replying to the relay sends the answer to the wrong device.
 
-Concurrency: `.single_owner` — one `Client`/`Device` owns its transaction table, subscription
-table and buffers; nothing is shared or global, and the clock and any threading are the caller's.
+- **`sc` (Annex AB) — the BVLC without a length field.** Annex J can check its `length` against
+  the UDP datagram it arrived in. A BACnet/SC message is delimited by a **WebSocket frame**, so
+  there is nothing to cross-check and the only way to find the payload is to walk the header. That
+  header is variable in four independent ways (originating VMAC, destination VMAC, destination
+  options, data options), and the option lists are **self-terminating**: every option marker has a
+  *more-options* bit, so a list that never says "no more" simply runs off the end of the frame.
+  `scanOptions` is bounded by the slice it was given and every iteration consumes at least one
+  octet, so a hostile list cannot stall; a fuzz test asserts exactly that.
+
+  Three details that are easy to get wrong and each have a test:
+  - the **must-understand** bit is what makes forward compatibility work, so an option we do not
+    know *and* must understand is a `BVLC-Result` NAK carrying `header_not_understood` and the
+    offending marker — never a skip. Both roles enforce it before looking at the function.
+  - an option with the *header-data* flag and a **zero-length** data block (`61 0000`) is a
+    different thing from an option with no data flag at all (`41`), and they decode differently.
+  - a `BVLC-Result` ACK is exactly two octets; trailing octets mean the peer thinks it sent an
+    error block, which is a disagreement worth reporting rather than ignoring. A result code that
+    is neither ACK nor NAK has no third meaning to guess at.
+
+  **Byte order is big-endian**, as everywhere else in BACnet. This is stated explicitly because
+  two third-party implementations disagree about it — see "The byte-order finding" below.
+
+- **`sc_node` / `sc_hub`: the same discipline as `client`/`device`.** No clock, no thread, no
+  socket; the caller supplies `now_ms`, owns the WebSocket, and drains a compile-time-sized outbox
+  (a caller that stops draining gets `error.OutboxFull`, never an allocation). That is what makes
+  a 300-second heartbeat timeout and a 300-second reconnect ceiling testable in microseconds, and
+  a 10 000-iteration reconnect storm a unit test.
+
+  - **Reconnect backoff doubles from `SC_Minimum_Reconnect_Time` (2 s) to
+    `SC_Maximum_Reconnect_Time` (300 s) and is jittered downward** by up to 25% from the caller's
+    `std.Random`. The jitter is the point: a hub reboot must not be answered by every node in a
+    building at the same instant.
+  - **Hub failover alternates.** After each failed attempt the node tries the *other* configured
+    URI rather than hammering the primary; with no failover configured it stays put.
+  - **A VMAC collision is a defined outcome, not an error.** The hub answers a Connect-Request
+    whose VMAC belongs to a different UUID with `node_duplicate_vmac`; the node draws a new VMAC
+    and retries at the floor delay rather than at the doubled backoff, because the collision is
+    its own to fix. That is the only reason a node holds a `std.Random`.
+  - **The negotiated maxima are enforced on send.** A Connect-Accept may propose *smaller* limits
+    than we asked for; from then on an oversized NPDU is `error.MessageTooLong` at the point of
+    queuing, not a frame the peer silently drops.
+  - **The hub attributes what a node omits.** A node talking to its hub may leave the originating
+    VMAC out — the hub knows who it is talking to — and the hub fills it in when forwarding,
+    because the receiving node has no other way to know. A node that fills in *somebody else's*
+    VMAC is spoofing and is refused. Connection-control messages (Connect, Heartbeat, Disconnect)
+    carry no VMACs at all: they travel between one node and its hub and go nowhere else.
+  - **Anything before Connect-Accept is refused.** A data message — including a heartbeat —
+    arriving while the connection is not established is `error.NotConnected` on the node side and a
+    `BVLC-Result` NAK on the hub side, so a stranger cannot drive state through a socket it has
+    not been admitted on.
+
+- **`sc_ws`: TLS is a seam, not a pretence.** This collection does not implement TLS. The caller
+  terminates it and passes a `TlsAssertion` saying so; it is recorded, reported, and **never
+  verified**, because a module that cannot see the certificate cannot verify anything. What it
+  *is* used for: a node that cannot assert mutual authentication is refused the `secure_path`
+  header option, so it cannot claim a protected path it does not have. Annex AB's actual
+  requirements — TLS 1.3, **mutual** authentication (a one-way `wss://` is not BACnet/SC), a
+  per-device operational certificate with its issuer certificates and CSR in the Network Port
+  object, and real expiry/revocation handling — are documented in `sc_ws.zig` and left to the
+  caller, with the matching `types.ErrorCode` values (`tls_client_certificate_expired`,
+  `..._revoked`, `tls_server_authentication_failed`, …) available to report them.
+
+  The framing is the sibling `websocket` module's, deliberately: a second RFC 6455 implementation
+  living inside a BACnet module is the kind of duplication that goes stale. `sc_ws` adds exactly
+  two rules on top — the registered subprotocol must be negotiated (RFC 6455 lets a server answer
+  with no subprotocol at all, which an ordinary client shrugs at and a BACnet/SC node must treat
+  as a failed connection), and a text frame is a protocol error rather than something handed to
+  the BVLC decoder.
+
+Concurrency: `.single_owner` — one `Client`/`Device`/`ScNode`/`ScHub` owns its transaction table,
+subscription table, connection table and buffers; nothing is shared or global, and the clock and any threading are the caller's.
 
 Error policy: every decode entry point (`bvll.decode`, `npdu.decode`, `apdu.decode`,
 `tag.decodeHeader`, `tag.Reader.*`, every `service.*.decode`, every iterator's `next`,
-`Client.poll`, `Device.poll`) returns a typed error on malformed input. Nothing panics, allocates
+`Client.poll`, `Device.poll`, `sc.decode`, `sc.scanOptions`, `sc.OptionIter.next`,
+`ScNode.onMessage`/`poll`, `ScHub.onMessage`/`poll`) returns a typed error on malformed input. Nothing panics, allocates
 or loops unboundedly — `Reader.skip` and `Reader.openedBlock` are bounded by the input buffer, and
 a fuzz test asserts `skip` always makes forward progress so a hostile buffer cannot stall it.
 `Client.poll` and `Device.poll` swallow *decode* errors into `.none` (a malformed datagram from a
@@ -108,7 +179,7 @@ stranger must not kill the loop) while still propagating transport failures.
 
 ## Verification
 
-### What is third-party-validated
+### BACnet/IP: what is third-party-validated
 
 **Oracle used:** Python **bacpypes3 0.0.106** (Joel Bender; MIT, per its PKG-INFO
 `License-Expression`) — the reference open-source BACnet stack, able to run both a client and a
@@ -200,6 +271,123 @@ source was read, and no design decision here was taken from it.
    it. Answering a unicast question with a unicast answer fixed it, and is now an offline test as
    well.
 
+
+### BACnet/SC: what is third-party-validated
+
+Annex AB was verified against **three** independent readings of the standard, which turned out to
+be necessary.
+
+6. **29 byte-exact BACnet/SC goldens** (`sc_goldens.zig`, table `wire`), emitted by
+   **bacpypes3 0.0.106**'s `bacpypes3.sc.bvll` encoders, driven as a black box (construct the
+   LPDU, set its header fields, call `encode()`, print the octets). The same three assertions run
+   over the whole table as for the Annex J goldens — every frame decodes, every frame re-encodes
+   to the identical octets from its *decoded* fields through this module's own writer, and a
+   representative subset is asserted field by field. A coverage test asserts the table contains
+   **all thirteen** BVLC functions, and a separate test rebuilds four bodies and one header-option
+   list **from scratch** and compares them to bacpypes3's, so the encoders are checked rather than
+   carried along as opaque bytes.
+
+   Coverage: all thirteen functions; every combination of the two VMAC control bits; connect
+   negotiation at 1400/1300 and at the 65535 maximum; all three `HubConnectionStatus` values; an
+   Address-Resolution-ACK both empty and with two URIs; a `BVLC-Result` ACK and both NAK spellings
+   (with and without a details string); a secure-path option on the destination list and on the
+   data list; a proprietary option with vendor data; a two-option list exercising the
+   *more-options* chain; and one frame carrying both VMACs and both option lists at once.
+
+7. **A second implementation, compiled and run as an oracle.** `bvlc-sc.c` from the
+   **bacnet-stack** project was compiled standalone (it has exactly one include) and driven
+   through its published prototypes for the same vectors. Nothing was copied — see the provenance
+   note below.
+
+8. **Wireshark 4.6.4's `bscvlc` dissector**, reached through `rawshark -d proto:bscvlc` (`tshark`
+   is unavailable here; `rawshark` reads raw frames from a pipe with a four-word pseudo-header and
+   dissects them as a named protocol). Our goldens were dissected field by field and agree:
+   `bscvlc.function` = `0x06`/`0x0a`, `bscvlc.control` = `0x00`, `bscvlc.msgid` = 65535 on the
+   both-VMACs frame (so it parsed the same header layout), `bscvlc.max_bvlc_length` = **1400** and
+   `bscvlc.max_npdu_length` = **1300** on the connect golden, `bscvlc.error_class` = **7** and
+   `bscvlc.error_code` = **151** on the NAK golden, `bscvlc.header_length` = **5** on the
+   proprietary-option golden, and `bscvlc.hub_conn_state` = `0x02` on the failover advertisement.
+
+#### The byte-order finding
+
+bacpypes3 and bacnet-stack agree on **every structural question**: field order, field widths,
+which control bit means what, the option marker's bit layout, that the option Header Length is two
+octets, that destination options precede data options which precede the payload, and that a
+`BVLC-Result` NAK is marker / class / code / details with no terminator on the details string.
+
+They disagree on exactly one thing. **bacnet-stack writes every 16-bit field little-endian**
+(message id, option header length, the connect maxima, the error class and code, the proprietary
+vendor id); **bacpypes3 writes them big-endian**. For example, a Heartbeat-Request with message id
+1 is `0a 00 00 01` from bacpypes3 and `0a 00 01 00` from bacnet-stack.
+
+Wireshark's dissector breaks the tie: it reads all of those fields with `ENC_BIG_ENDIAN`, and it
+returned 1400/1300/7/151/5 for our big-endian goldens. Big-endian is also BACnet's convention
+everywhere else — Annex J's BVLC length, the NPDU's DNET/SNET, every clause 20.2 multi-octet
+value. **This module is big-endian.** The disagreement is recorded as a live test
+(`bacnet_stack_divergence` in `sc_goldens.zig`) rather than a comment, so the decision stays
+visible and reviewable. One golden, `encapsulated_secure_path_data`
+(`01 01 01 01 41 01 00`), is byte-identical from both oracles because every 16-bit field in it is
+a palindrome — which isolates the disagreement to byte order and nothing else.
+
+#### A decoder defect found in the oracle
+
+While running the live tests, bacpypes3 0.0.106's `sc.bvll` **decoder** turned out to consume one
+octet too many whenever a VMAC is present and no header options are: it reads a header-option
+marker the control octet never announced. With no VMAC at all it is correct, and its **encoder**
+is correct in every case — which is why the goldens are taken from the encoder only. The visible
+symptoms during the live run were an echoed NPDU short by its first octet, and an
+`IndexError: bytearray index out of range` on a frame that carries a VMAC and no body. The live
+test asserts the truncated-by-one result explicitly and says why, rather than pretending. Our own
+decoder and Wireshark both parse those frames correctly.
+
+### BACnet/SC: what ran live, and exactly what the peer was
+
+Annex AB's *codec* has two independent third-party implementations. Its *connection state
+machine* effectively has none that was runnable here:
+
+- **bacpypes3 0.0.106** ships `bacpypes3.sc.bvll` (the codec) and `bacpypes3.sc.service`, but the
+  service layer hands every BVLC message straight up to the application and never answers a
+  Connect-Request. Its `SCNodeSwitch` also does not start under Python 3.14 without two
+  compatibility shims (`websockets` ≥ 12 dropped the handler's `path` argument; Python ≥ 3.12
+  forbids bare coroutines in `asyncio.wait`), and even with them it reaches "unbound server".
+- **bacnet-stack** implements a full BSC node and hub, but its data link needs **libwebsockets**,
+  which needs `libssl-dev` and root to install. Neither was available. Its *codec* was still
+  usable, which is where oracle 7 above comes from.
+
+So the live peer is a **hybrid, and is labelled as one** in `sc_interop.zig` and here: every
+BVLC-SC octet it sends is encoded by bacpypes3's encoders and every octet it receives is decoded
+by bacpypes3's decoders — genuinely third party, over a real TCP socket and a real RFC 6455
+handshake — but the *hub policy* on top (admit, answer, forward) is harness code. **These runs
+validate our wire format, our WebSocket binding and our framing. They are not an independent check
+of our state machine, and must not be read as a certified interop result.**
+
+9. **Live round trip, our node → the peer** (`sc_interop.zig`, gated on `BACNET_SC_TEST_HUB`).
+   Over a real TCP connection and a real WebSocket handshake with the `hub.bsc.bacnet.org`
+   subprotocol negotiated and the `Sec-WebSocket-Accept` value verified, the run observed:
+   - our `Connect-Request` decoded by bacpypes3 with the VMAC, the device UUID and both maxima
+     (1497/1497) read back correctly;
+   - a `Connect-Accept` encoded by bacpypes3, decoded by us: hub VMAC `fe:00:00:00:00:99`,
+     negotiated 1497/1497;
+   - a `Heartbeat-Request` from our node answered by a bacpypes3-encoded `Heartbeat-ACK` echoing
+     message id 2;
+   - an `Encapsulated-NPDU` (a Who-Is) sent to the broadcast VMAC and echoed back — short by one
+     octet, because of the bacpypes3 decoder defect above, which the test asserts explicitly;
+   - a graceful `Disconnect-Request` answered by a `Disconnect-ACK`, ending in `stopped`.
+
+10. **Live round trip, the peer → our hub** (`sc_interop.zig`, gated on `BACNET_SC_TEST_LISTEN`).
+    Our `ScHub` listened on loopback, completed the server-side WebSocket handshake and admitted a
+    bacpypes3-encoded node: `admitted vmac 0a:0a:0a:0a:0a:01`, a `Heartbeat-Request` answered with
+    a `Heartbeat-ACK` the peer decoded and accepted, a broadcast `Encapsulated-NPDU` correctly
+    distributed to nobody (it was the only node), and a `Disconnect-Request` answered with a
+    `Disconnect-ACK` that the peer decoded — `served 4 frames, admitted 1`, node left with
+    `peer_request`.
+
+    Both live tests passed in **Debug and ReleaseFast**.
+
+    The transport was plaintext `ws://` on loopback. That is the one thing about these runs that is
+    deliberately **not** conforming BACnet/SC: this collection does not implement TLS,
+    `sc_ws.TlsAssertion.none` says so, and the node consequently declines to claim a secure path.
+
 ### What is self-derived
 
 Labelled honestly, because it was **not** checked against another implementation:
@@ -221,6 +409,20 @@ Labelled honestly, because it was **not** checked against another implementation
   table labelled third-party.
 - **`ReadRange`'s `by_time` and `by_sequence` selectors** (the `by_position` and no-range forms
   came from bacpypes3), and the `BACnetDateTime` sequence inside `by_time`.
+- **The whole BACnet/SC connection state machine.** The timer values are Annex AB's documented
+  defaults (`BACnetSC_Connect_Wait_Timeout` 10 s, `BACnetSC_Disconnect_Wait_Timeout` 10 s,
+  `BACnetSC_Heartbeat_Timeout` 300 s, `SC_Minimum_Reconnect_Time` 2 s,
+  `SC_Maximum_Reconnect_Time` 300 s) and every transition is exercised offline against our own
+  hub, but no third-party peer implementing the state machine was obtainable (see above). The
+  heartbeat *interval* — half the timeout — is this module's choice, not a value the standard
+  fixes; it is configurable.
+- **The hub's admission policy.** Evicting a stale connection when the same device UUID reconnects,
+  refusing the hub's own VMAC and the two reserved VMACs, and refusing a node that claims another
+  node's source VMAC are all reasonable readings of Annex AB rather than quoted rules, and no
+  third-party hub was available to compare against.
+- **Address-Resolution-ACK's URI list splitting.** Annex AB gives no length prefix and no escaping,
+  so `uriIterator` splits on spaces; the golden with two URIs came from bacpypes3, the splitting
+  policy did not.
 - **`ReadPropertyMultiple` device-side against a third-party client**: bacpypes3 0.0.106's own
   `read_property_multiple` *client* helper raised `TypeError: objid` from inside its own code
   against **both** our device and its own device, so it could not drive that path. RPM is
@@ -234,8 +436,27 @@ Everything below is out of scope for this module as it stands, deliberately and 
 - **MS/TP (clause 9)** — the RS-485 master-slave/token-passing data link. Completely different
   framing (preamble, CRC, token rotation) with a real-time token timer; it belongs in its own
   module and needs a serial port to verify.
-- **BACnet/SC (Annex AB)** — the WebSocket + TLS secure-connect data link. Would ride on the
-  `websocket` sibling module, but needs a hub implementation and certificate handling.
+- **TLS itself, and certificate handling.** BACnet/SC is *implemented*; the TLS underneath it is a
+  seam (`sc_ws.TlsAssertion`), not an implementation. Nothing here terminates TLS, validates a
+  chain, checks expiry or revocation, reads the Network Port object's
+  `Operational_Certificate_File` / `Issuer_Certificate_Files` / `Certificate_Signing_Request_File`,
+  or performs enrolment. A deployment that does not supply mutual TLS is not conforming BACnet/SC,
+  and this module says so rather than pretending otherwise.
+- **BACnet/SC direct connections.** The `dc.bsc.bacnet.org` subprotocol, `Address-Resolution` and
+  `Address-Resolution-ACK` are all encoded, decoded and answered, and `sc_ws.Role.direct` builds
+  the right handshake — but the *policy* of deciding to open a direct connection to a peer whose
+  URIs you just resolved, and of running node-to-node connections in parallel with the hub
+  connection, is not implemented. `sc_node` manages exactly one hub connection.
+- **The BACnet/SC Network Port object.** The properties Annex AB adds (`SC_Hub_Function_Enable`,
+  `SC_Primary_Hub_URI`, `SC_Failover_Hub_URI`, `SC_Minimum_Reconnect_Time`,
+  `SC_Maximum_Reconnect_Time`, `SC_Hub_Connector_State`, the connection-status arrays, the
+  certificate files) are this module's *configuration*, not a servable object in `device`. A
+  device that must expose its own SC configuration over BACnet has to model it.
+- **A BACnet/SC ↔ BACnet/IP router.** Both link layers are present and both hand back NPDUs, but
+  nothing joins them: forwarding an NPDU between an `ScNode` and a `Client`/`Device` (with the
+  clause 6 network-layer rewriting that implies) is the caller's to write.
+- **Hub-to-hub / multi-hub topologies**, and the hub's own `Advertisement` beyond answering a
+  solicitation.
 - **BACnet/IPv6 (Annex U)** — a different virtual link layer with its own address format.
   `BipAddress.fromIp` deliberately returns null for an IPv6 address rather than pretending.
 - **Segmentation reassembly** (clause 5.4's segmentation state machine and the SegmentACK window
@@ -280,13 +501,51 @@ Everything below is out of scope for this module as it stands, deliberately and 
 
 ## What /NOTICE needs
 
-One entry, as a **design reference** under CONVENTIONS §5:
+The existing entry is unchanged and still correct:
 
 > **bacpypes3** (Joel Bender, MIT) — Python BACnet stack. Used as a black-box test oracle (wire
 > octets, live device peer, live client peer) throughout `modules/bacnet`, which needs no entry;
 > **but** its `primitivedata.Tag.encode` function was read while probing its API, which makes it a
 > consulted design reference for the clause 20.2 tag encoder in `modules/bacnet/src/tag.zig`.
 
-Nothing was ported. No other bacpypes3 source was read. ASHRAE 135 itself is a published
-specification and needs no entry (merger doctrine); its clause citations live in this file and in
-the module's doc comments.
+**The Annex AB work needs no new entry, and here is the honest accounting of what was consulted.**
+
+- **bacpypes3** was used the same way as before: black box. For BACnet/SC its class names,
+  constructor signatures and attribute names were discovered with `dir()` and
+  `inspect.signature()` — API probing, not source reading — and its encoders and decoders were
+  then run. **No bacpypes3 source function was read for the BACnet/SC work.** The one exception
+  already covered by the entry above (`primitivedata.Tag.encode`) is unrelated to Annex AB. The
+  harness that drives it lives outside the repository.
+- **bacnet-stack** (Steve Karg and contributors; GPL-2.0 with a linking exception) was cloned,
+  and `src/bacnet/datalink/bsc/bvlc-sc.c` was **compiled and executed** as a black-box oracle.
+  What was *read* is its public header `bvlc-sc.h` — function prototypes, struct field names and
+  enumerator names — which is API probing of the same kind, plus its `bsc/README.md` and
+  `bsc-conf.h` defines for the certificate-file instance numbers cited in `sc_ws.zig`. **No
+  implementation function was read, nothing was ported, and none of its code or output is
+  vendored: its octets were used only to *disagree* with, and the disagreement is recorded as a
+  test.** Because nothing was copied and nothing was read beyond declarations, this is not a
+  derivative work and needs no `/NOTICE` entry; if the collection's policy is to name every oracle
+  regardless, the entry would be:
+  > **bacnet-stack** (Steve Karg et al., GPL-2.0-with-linking-exception) — C BACnet stack. Its
+  > `bvlc-sc.c` was compiled and run as a black-box byte-order oracle for `modules/bacnet/src/sc.zig`;
+  > only its public header declarations were read. Nothing was ported.
+- **Wireshark** was used only as an installed tool (`rawshark -d proto:bscvlc`). Its dissector
+  source was consulted **once, remotely and read-only**, to answer the single question of whether
+  it dissects the BACnet/SC 16-bit fields as `ENC_BIG_ENDIAN` — a fact about the standard, not a
+  design. No Wireshark code was read for structure and none was ported.
+
+Nothing was ported from anything. ASHRAE 135 itself is a published specification and needs no
+entry (merger doctrine); its clause citations live in this file and in the module's doc comments.
+
+## What the coordinator should add
+
+- **`/NOTICE`**: nothing is strictly required (see above). If the collection prefers to name every
+  black-box oracle, add the two-line `bacnet-stack` entry quoted above.
+- **The root `README.md`** module table: the `bacnet` row's one-line summary now covers **two**
+  data links — suggested wording: *"BACnet/IP (Annex J) and BACnet/SC (Annex AB): codec, client,
+  device, SC node and SC hub"*.
+- **`check-catalog`**: `bacnet` is already catalogued; no new module was created. Six new source
+  files were added inside it (`sc.zig`, `sc_ws.zig`, `sc_node.zig`, `sc_hub.zig`, `sc_goldens.zig`,
+  `sc_interop.zig`) and all six are named in `root.zig`'s dark-tests aggregator.
+- **CI**: the two new gated variables (`BACNET_SC_TEST_HUB`, `BACNET_SC_TEST_LISTEN`) are unset in
+  CI and skip gracefully, like the existing two.

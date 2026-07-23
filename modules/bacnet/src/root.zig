@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
 
-//! bacnet — pure-Zig **BACnet/IP (ASHRAE 135)**: the building-automation
-//! protocol that HVAC, lighting, access control and fire panels speak to a
-//! building-management system.
+//! bacnet — pure-Zig **BACnet (ASHRAE 135)** over both of its IP-family data
+//! links: the building-automation protocol that HVAC, lighting, access control
+//! and fire panels speak to a building-management system.
 //!
-//! Four wire layers, each usable on its own, plus the two roles:
+//! Wire layers, each usable on its own, plus the roles on top of them:
 //!
 //! * **`bvll`** (Annex J) — the BACnet/IP virtual link layer: `81 | function |
 //!   length` in front of every datagram, with the length checked against what
@@ -35,15 +35,29 @@
 //!   a device (an object database that answers all of it), both over one
 //!   datagram seam, both **pure and time-injected**: no clock, no thread, no
 //!   socket inside.
+//! * **`sc`** (Annex AB) — **BACnet/SC**, which replaces the datagram link
+//!   with a mesh of WebSockets over TLS: a different BVLC with a message id,
+//!   6-octet **VMAC** addressing, a 16-octet device UUID, and two
+//!   self-terminating header-option lists whose *must-understand* bit decides
+//!   whether an unknown option is fatal. There is no length field — the
+//!   WebSocket frame is the boundary.
+//! * **`sc_node` / `sc_hub` / `sc_ws`** — a BACnet/SC node (connect,
+//!   negotiate, heartbeat, jittered reconnect, primary/failover hub, VMAC
+//!   collision recovery), the hub that makes it testable (admission, UUID and
+//!   VMAC collision handling, attribution, distribution), and the WebSocket
+//!   binding over the sibling `websocket` module — with **TLS as an explicit
+//!   seam** the caller fills in, never faked here.
 //!
-//! Verified against **byte-exact goldens from an independent implementation**
-//! and by **live round trips in both directions** against it; see
-//! `goldens.zig`, `interop.zig` and SPEC.md for exactly what came from where.
+//! Verified against **byte-exact goldens from independent implementations** and
+//! by **live round trips in both directions** on both data links; see
+//! `goldens.zig`, `sc_goldens.zig`, `interop.zig`, `sc_interop.zig` and
+//! SPEC.md for exactly what came from where — including which BACnet/SC peer
+//! was and was not obtainable, and a byte-order disagreement between two
+//! third-party stacks that Wireshark's dissector settled.
 //!
-//! Provenance: clean-room from ASHRAE 135's documented encodings. A
-//! third-party stack was used as a black-box oracle and a live peer; one
-//! function of its source was read while probing its API. See SPEC.md and
-//! `/NOTICE`.
+//! Provenance: clean-room from ASHRAE 135's documented encodings. Third-party
+//! stacks were used as black-box oracles and live peers; one function of one
+//! of them was read while probing its API. See SPEC.md and `/NOTICE`.
 
 const std = @import("std");
 
@@ -56,8 +70,8 @@ pub const meta = .{
     // buffers; nothing shared or global. Concurrency and the clock belong to
     // the caller.
     .concurrency = .single_owner,
-    .model_after = "ASHRAE 135 (BACnet) Annex J + clauses 6, 15, 16, 20; wire behaviour byte-compared against bacpypes3 and validated by live round trips in both directions (see SPEC.md)",
-    .deps = .{"netaddr"},
+    .model_after = "ASHRAE 135 (BACnet) Annex J + Annex AB + clauses 6, 15, 16, 20; wire behaviour byte-compared against bacpypes3, bacnet-stack and Wireshark's dissector, and validated by live round trips in both directions on both data links (see SPEC.md)",
+    .deps = .{ "netaddr", "websocket" },
 };
 
 // ── layers ──────────────────────────────────────────────────────────────────
@@ -81,10 +95,24 @@ pub const transport = @import("transport.zig");
 pub const client = @import("client.zig");
 /// A BACnet/IP device (responder).
 pub const device = @import("device.zig");
+/// Annex AB BACnet/SC virtual link layer (BVLC-SC) — the WebSocket-and-TLS
+/// data link, with its VMAC addressing and header options.
+pub const sc = @import("sc.zig");
+/// The BACnet/SC WebSocket binding and the TLS seam.
+pub const sc_ws = @import("sc_ws.zig");
+/// A BACnet/SC node: the connection state machine, pure and time-injected.
+pub const sc_node = @import("sc_node.zig");
+/// A BACnet/SC hub: admission, VMAC resolution and distribution.
+pub const sc_hub = @import("sc_hub.zig");
 /// Byte-exact goldens from an independent implementation.
 pub const goldens = @import("goldens.zig");
+/// Byte-exact BACnet/SC goldens from two independent implementations.
+pub const sc_goldens = @import("sc_goldens.zig");
 /// Live interop tests, gated on an environment variable.
 pub const interop = @import("interop.zig");
+/// Live BACnet/SC interop over a real WebSocket, gated on an environment
+/// variable.
+pub const sc_interop = @import("sc_interop.zig");
 
 // ── top-level names (the ones a consumer actually types) ────────────────────
 
@@ -105,6 +133,16 @@ pub const UdpTransport = transport.UdpTransport;
 /// In-memory network, for offline round trips.
 pub const LoopNetwork = transport.LoopNetwork;
 pub const LoopTransport = transport.LoopTransport;
+
+/// A BACnet/SC node (Annex AB): one WebSocket to a hub, time-injected.
+pub const ScNode = sc_node.Node;
+pub const ScNodeWith = sc_node.NodeWith;
+/// A BACnet/SC hub (Annex AB): admission, VMAC resolution and distribution.
+pub const ScHub = sc_hub.Hub;
+pub const ScHubWith = sc_hub.HubWith;
+/// A BACnet/SC virtual MAC address and device UUID.
+pub const Vmac = sc.Vmac;
+pub const Uuid = sc.Uuid;
 
 /// A BACnet/IP address: four octets of IPv4 plus a UDP port.
 pub const BipAddress = bvll.BipAddress;
@@ -148,17 +186,26 @@ test {
     _ = transport;
     _ = client;
     _ = device;
+    _ = sc;
+    _ = sc_ws;
+    _ = sc_node;
+    _ = sc_hub;
     _ = goldens;
+    _ = sc_goldens;
     _ = interop;
+    _ = sc_interop;
 }
 
 // ── tests: the stack end to end ────────────────────────────────────────────
 
 const testing = std.testing;
 
-test "meta names its one sibling dependency" {
-    try testing.expectEqual(@as(usize, 1), meta.deps.len);
+test "meta names its sibling dependencies" {
+    try testing.expectEqual(@as(usize, 2), meta.deps.len);
     try testing.expectEqualStrings("netaddr", meta.deps[0]);
+    // BACnet/SC rides on RFC 6455; the framing is the `websocket` module's,
+    // not a second copy living here.
+    try testing.expectEqualStrings("websocket", meta.deps[1]);
 }
 
 test "a whole datagram, built and torn down through every layer" {
@@ -245,4 +292,89 @@ test "the module's own client and device interoperate over a simulated network" 
     try testing.expectEqual(id, ev.complex_ack.invoke_id);
     const ack = try service.ReadPropertyAck.decode(ev.complex_ack.data);
     try testing.expectEqual(@as(f32, 19.5), (try ack.scalar()).real);
+}
+
+test "BACnet/SC end to end: two nodes and a hub, no sockets at all" {
+    // The BACnet/IP test above rides a simulated UDP network; this one rides
+    // nothing — the hub and both nodes are pure state machines, and the "wire"
+    // is the caller moving byte slices between them. That is the whole point
+    // of the time-injected design, and it is what makes the 300-second timers
+    // testable.
+    var prng = std.Random.DefaultPrng.init(0xBAC05C);
+    const rand = prng.random();
+
+    var hub = ScHub.init(.{
+        .vmac = .{ .octets = .{ 0xFE, 0, 0, 0, 0, 1 } },
+        .uuid = Uuid.random(rand),
+        .websocket_uris = "wss://192.0.2.1/",
+    }, rand);
+
+    var a = ScNode.init(.{
+        .vmac = .{ .octets = .{ 1, 1, 1, 1, 1, 1 } },
+        .uuid = Uuid.random(rand),
+        .primary_uri = "wss://192.0.2.1/",
+    }, rand);
+    var b = ScNode.init(.{
+        .vmac = .{ .octets = .{ 2, 2, 2, 2, 2, 2 } },
+        .uuid = Uuid.random(rand),
+        .primary_uri = "wss://192.0.2.1/",
+    }, rand);
+
+    // Both nodes dial in. The hub hands out connection ids; the caller is the
+    // one holding the sockets, so it is the one that pairs them up.
+    const conn_a = try hub.accept(0);
+    const conn_b = try hub.accept(0);
+    _ = a.start(0);
+    _ = b.start(0);
+    _ = try a.onWebSocketOpen(0);
+    _ = try b.onWebSocketOpen(0);
+
+    // Drive each Connect-Request into the hub and the Connect-Accept back.
+    for ([_]struct { node: *ScNode, conn: usize }{
+        .{ .node = &a, .conn = conn_a },
+        .{ .node = &b, .conn = conn_b },
+    }) |peer| {
+        const request = peer.node.nextOutgoing().?;
+        _ = try hub.onMessage(0, peer.conn, request);
+        const accept = hub.nextOutgoing().?;
+        try testing.expectEqual(peer.conn, accept.conn);
+        _ = try peer.node.onMessage(0, accept.bytes);
+        try testing.expectEqual(sc_node.State.connected, peer.node.state);
+    }
+    try testing.expectEqual(@as(usize, 2), hub.nodeCount());
+
+    // A broadcast Who-Is from A must reach B — with A's VMAC filled in by the
+    // hub, because A never sent one.
+    const who_is = [_]u8{ 0x01, 0x20, 0xFF, 0xFF, 0x00, 0xFF, 0x10, 0x08 };
+    try a.sendNpdu(Vmac.broadcast, &who_is);
+    _ = try hub.onMessage(1, conn_a, a.nextOutgoing().?);
+    const relayed = hub.nextOutgoing().?;
+    try testing.expectEqual(conn_b, relayed.conn);
+    const at_b = try b.onMessage(1, relayed.bytes);
+    try testing.expectEqualSlices(u8, &who_is, at_b.npdu.bytes);
+    try testing.expect(at_b.npdu.source.?.eql(a.config.vmac));
+
+    // ... and B's unicast answer must come back to A and to nobody else.
+    const i_am = [_]u8{ 0x01, 0x00, 0x10, 0x00, 0xC4, 0x02, 0x00, 0x02, 0x57 };
+    try b.sendNpdu(a.config.vmac, &i_am);
+    _ = try hub.onMessage(2, conn_b, b.nextOutgoing().?);
+    const answer = hub.nextOutgoing().?;
+    try testing.expectEqual(conn_a, answer.conn);
+    try testing.expectEqual(@as(?sc_hub.Outgoing, null), hub.nextOutgoing());
+    const at_a = try a.onMessage(2, answer.bytes);
+    try testing.expectEqualSlices(u8, &i_am, at_a.npdu.bytes);
+
+    // A heartbeat from A is answered by the hub and accepted by A.
+    _ = try a.poll(150_000);
+    _ = try hub.onMessage(150_000, conn_a, a.nextOutgoing().?);
+    _ = try a.onMessage(150_001, hub.nextOutgoing().?.bytes);
+    try testing.expectEqual(sc_node.State.connected, a.state);
+
+    // A leaves politely; the hub acknowledges and forgets it.
+    _ = try a.stop(200_000);
+    const ev = try hub.onMessage(200_000, conn_a, a.nextOutgoing().?);
+    try testing.expectEqual(sc_hub.DisconnectReason.peer_request, ev.node_disconnected.reason);
+    _ = try a.onMessage(200_001, hub.nextOutgoing().?.bytes);
+    try testing.expectEqual(sc_node.State.stopped, a.state);
+    try testing.expectEqual(@as(usize, 1), hub.nodeCount());
 }

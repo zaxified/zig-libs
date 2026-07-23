@@ -1,18 +1,21 @@
 # bacnet
 
-Pure-Zig **BACnet/IP (ASHRAE 135)**: the building-automation protocol that
-HVAC, lighting, access control and fire panels speak to a building-management
-system. A typed, allocation-free wire codec for all four layers, a
-transport-agnostic client, and a device (responder) that doubles as a
-fleet-simulation target.
+Pure-Zig **BACnet (ASHRAE 135)** over its two IP-family data links —
+**BACnet/IP** (Annex J, UDP) and **BACnet/SC** (Annex AB, WebSocket over TLS):
+the building-automation protocol that HVAC, lighting, access control and fire
+panels speak to a building-management system. A typed, allocation-free wire
+codec for every layer, a transport-agnostic client, a device (responder) that
+doubles as a fleet-simulation target, and a BACnet/SC **node and hub**.
 
 - No pure-Zig BACnet library exists; the field is C (`bacnet-stack`) and
   Python (`bacpypes3`).
-- **Platform:** any (every codec, the client and the device are pure
-  computation; only the optional `UdpTransport` adapter touches `std.Io.net`).
-- **Model after:** ASHRAE 135 (BACnet) Annex J + clauses 6, 15, 16, 20, with
-  wire behaviour byte-compared against `bacpypes3` and validated by live round
-  trips in **both** directions (see SPEC.md).
+- **Platform:** any (every codec, the client, the device, the SC node and the
+  SC hub are pure computation; only the optional `UdpTransport` adapter and the
+  gated live tests touch `std.Io.net`).
+- **Model after:** ASHRAE 135 (BACnet) Annex J + Annex AB + clauses 6, 15, 16,
+  20, with wire behaviour byte-compared against `bacpypes3`, `bacnet-stack` and
+  Wireshark's dissector, and validated by live round trips in **both**
+  directions on both data links (see SPEC.md).
 
 ## Scope
 
@@ -70,11 +73,46 @@ fleet-simulation target.
   and SubscribeCOV, emits COV notifications on change, expires subscriptions,
   and answers a unicast question with a unicast reply. Stand one up per
   simulated device.
+- **`sc`** (Annex AB) — the **BACnet/SC** virtual link layer, which replaces
+  the datagram link entirely: `function | control | message id` plus optional
+  originating and destination **VMACs** (6 octets) and two self-terminating
+  **header-option** lists, then the body. All thirteen functions
+  (`BVLC-Result`, `Encapsulated-NPDU`, `Address-Resolution`(+`-ACK`),
+  `Advertisement`(+`-Solicitation`), `Connect-Request`/`-Accept`,
+  `Disconnect-Request`/`-ACK`, `Heartbeat-Request`/`-ACK`,
+  `Proprietary-Message`), the secure-path and proprietary header options with
+  their *more-options* / *must-understand* / *header-data* bits, VMAC and
+  device-UUID types. There is **no length field** — the WebSocket frame is the
+  message boundary — so every "runs off the end" is a typed error rather than a
+  short read.
+- **`sc_node`** (Annex AB.5/AB.6) — a BACnet/SC node: connect with negotiated
+  maximum BVLC/NPDU lengths, heartbeats, graceful disconnect, **reconnect with
+  bounded jittered backoff**, and **primary/failover hub alternation**. A
+  `node_duplicate_vmac` NAK makes it draw a new VMAC and retry. **Pure and
+  time-injected** like `client`/`device`: the caller supplies `now_ms`, opens
+  and closes the WebSocket, and drains the fixed-size outbox.
+- **`sc_hub`** (Annex AB.5.2) — the hub side, so a fleet simulator has
+  something to connect to: admission with UUID/VMAC collision handling (same
+  UUID = the same device reconnecting, and its stale socket is evicted;
+  different UUID on a taken VMAC = `node_duplicate_vmac`), **source-VMAC
+  attribution** for nodes that omit their own address, spoofing refusal,
+  broadcast distribution to everyone but the sender, and per-connection
+  heartbeat timeouts.
+- **`sc_ws`** — the WebSocket binding over the sibling `websocket` module: the
+  registered subprotocols `hub.bsc.bacnet.org` / `dc.bsc.bacnet.org` (an
+  endpoint that does not negotiate one is a *failure*, not a plain WebSocket),
+  binary frames only, and the **TLS seam**. This collection does not implement
+  TLS: the caller terminates it and passes a `TlsAssertion`, which is recorded
+  and never verified — and a node that cannot assert mutual authentication is
+  refused the `secure_path` header option rather than allowed to claim it.
 - Hostile input never panics anywhere: a BVLC length that disagrees with the
   datagram, control bits promising fields the buffer lacks, a tag whose
   extended length runs past the end, an unclosed context tag, a reserved
   object type, an unknown character-string encoding, a BitString claiming more
-  unused bits than exist and a segmented ComplexACK are all typed errors.
+  unused bits than exist, a segmented ComplexACK, a BACnet/SC header-option
+  list that never terminates, an option length that overruns the frame, a
+  must-understand option we do not understand, a heartbeat while disconnected
+  and a reconnect storm are all typed errors.
 
 ## Use
 
@@ -153,6 +191,38 @@ while (true) : (now += 100) {
 }
 ```
 
+```zig
+// ── BACnet/SC node (Annex AB) ───────────────────────────────────────────────
+var node = bacnet.ScNode.init(.{
+    .vmac = bacnet.Vmac.random(rand),
+    .uuid = bacnet.Uuid.parse("00112233-4455-6677-8899-aabbccddeeff").?,
+    .primary_uri = "wss://hub.example/",
+    .failover_uri = "wss://hub2.example/",
+    // The caller terminates TLS and says so; this module never verifies it.
+    .tls = bacnet.sc_ws.TlsAssertion.mutual("CN=controller-17"),
+}, rand);
+
+var ev = node.start(now);                       // -> .open_websocket
+// ... the caller opens the WebSocket with sc_ws.clientRequest(.hub, ..) ...
+_ = try node.onWebSocketOpen(now);              // queues the Connect-Request
+while (node.nextOutgoing()) |frame| try sendBinaryFrame(frame);
+
+switch (try node.onMessage(now, inbound_frame)) {
+    .connected => |c| ready(c.max_npdu_length),
+    .npdu => |n| handleNpdu(n.source, n.bytes),  // hand to npdu.decode
+    .disconnected => |why| log(why),             // the node is already backing off
+    else => {},
+}
+_ = try node.poll(now);                          // heartbeats and timeouts
+try node.sendNpdu(bacnet.Vmac.broadcast, npdu_octets);
+
+// ── BACnet/SC hub ───────────────────────────────────────────────────────────
+var hub = bacnet.ScHub.init(.{ .vmac = my_vmac, .uuid = my_uuid }, rand);
+const conn = try hub.accept(now);                // one per accepted WebSocket
+_ = try hub.onMessage(now, conn, frame);
+while (hub.nextOutgoing()) |o| try sendBinaryFrameOn(o.conn, o.bytes);
+```
+
 The pure layers are usable on their own — `bvll.decode`/`encode` for a
 datagram, `npdu.decode`/`encode` for the network layer, `apdu.decode`/`encode`
 for a PDU, and `tag.Reader`/`tag.Writer` for anything tagged, including
@@ -166,24 +236,33 @@ zig build test-bacnet -Doptimize=ReleaseFast
 zig fmt --check modules/bacnet
 ```
 
-129 tests, of which 121 are fully offline. The eight live tests skip
-gracefully (printing `SKIPPED:` and passing) when no peer is present:
+239 tests, of which 229 are fully offline. The ten live tests skip gracefully
+(printing `SKIPPED:` and passing) when no peer is present:
 
 ```
-BACNET_TEST_DEVICE=host:port    # our client -> a real BACnet device
-BACNET_TEST_LISTEN=host:port    # a real BACnet client -> our device
+BACNET_TEST_DEVICE=host:port     # our client   -> a real BACnet/IP device
+BACNET_TEST_LISTEN=host:port     # a real BACnet/IP client -> our device
+BACNET_SC_TEST_HUB=host:port     # our SC node  -> a BACnet/SC hub
+BACNET_SC_TEST_LISTEN=host:port  # a BACnet/SC node -> our SC hub
 ```
 
-The offline suite includes **42 byte-exact datagram goldens plus 47 primitive
-tag goldens generated by `bacpypes3`**, an independent BACnet stack — every
-one of them decodes, re-encodes to the identical octets from its *decoded*
-fields, and is asserted field by field. On top of that: full client↔device
-round trips over an in-memory network, the APDU timeout and retry ladder under
-a fake clock, and `std.testing.fuzz` sweeps over the tag decoder, the BVLC
-decoder, the NPDU decoder, the APDU decoder, every service decoder and the
-device's request handler. See SPEC.md for what is third-party-validated versus
-self-derived, what ran live, and what is deferred.
+The offline suite includes **42 byte-exact BACnet/IP datagram goldens, 47
+primitive tag goldens and 29 byte-exact BACnet/SC goldens generated by
+`bacpypes3`**, an independent BACnet stack — every one of them decodes,
+re-encodes to the identical octets from its *decoded* fields, and is asserted
+field by field. The BACnet/SC goldens were additionally cross-checked against a
+**second** independent implementation (`bacnet-stack`'s `bvlc-sc.c`, compiled
+and driven as a black box) and dissected field by field by **Wireshark
+4.6.4**'s `bscvlc` dissector through `rawshark`. On top of that: full
+client↔device and SC-node↔SC-hub round trips with no sockets at all, the APDU
+timeout and retry ladder plus the SC connect/heartbeat/backoff timers under a
+fake clock, and `std.testing.fuzz` sweeps over the tag decoder, the BVLC
+decoders (both link layers), the NPDU decoder, the APDU decoder, every service
+decoder, the SC option walker, the SC node and the SC hub. See SPEC.md for what
+is third-party-validated versus self-derived, what ran live, and what is
+deferred.
 
-Provenance: clean-room from ASHRAE 135's documented encodings. `bacpypes3` was
-used as a black-box test oracle and as a live peer; one function of its source
-was read while probing its API — see SPEC.md and `/NOTICE`.
+Provenance: clean-room from ASHRAE 135's documented encodings. `bacpypes3` and
+`bacnet-stack` were used as black-box test oracles and `bacpypes3` as a live
+peer; one function of `bacpypes3`'s source was read while probing its API — see
+SPEC.md and `/NOTICE`.
