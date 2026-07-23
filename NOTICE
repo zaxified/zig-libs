@@ -447,6 +447,17 @@ project git history).
                interface — no libnftables (or other nftables) source was
                consulted or copied.
 
+  bacnet     — clean-room from ASHRAE 135 (BACnet), an openly published
+               standard: BVLL/Annex J, the clause 6 NPDU, the clause 20
+               APDU and tag encodings, and the clause 15/13 services.
+               design ref: bacpypes3 (Joel Bender, MIT) — used throughout
+               as a black-box oracle and live peer (which alone needs no
+               entry), BUT its `primitivedata.Tag.encode` was read while
+               probing the API, which makes it a consulted design
+               reference for `src/tag.zig` and is declared here per
+               CONVENTIONS §5. Nothing was ported and no other bacpypes3
+               source was read.
+
   modbus     — clean-room from the public Modbus specifications: Modbus
                Application Protocol Specification V1.1b3 + Modbus over Serial
                Line V1.02 (modbus.org, openly published and royalty-free).
