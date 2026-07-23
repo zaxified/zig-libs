@@ -705,9 +705,14 @@ project git history).
                and not used at build or run time; its stock binaries were
                otherwise a black-box live peer. The OPC Foundation's
                StatusCode.csv / NodeIds.csv / Opc.Ua.Types.bsd (MIT
-               License 1.00) supply constants and field order. Client-side
-               security is SecurityPolicy#None or Basic256Sha256 via the
-               `rsa` module; the SERVER side is SecurityPolicy#None only.
+               License 1.00) supply constants and field order. Security is
+               SecurityPolicy#None or Basic256Sha256 via the `rsa` module,
+               on BOTH the client and the server side. Additional black-box
+               oracles used to validate the server's security: Python
+               `asyncua` (LGPL-3.0) and open62541's stock binaries — both
+               driven as processes whose stdout is the assertion, with no
+               source read, built or linked — plus `openssl` as a CLI
+               staging a throwaway test key pair.
 
   dnssec     — clean-room from the DNSSEC RFCs (4033/4034/4035 core, 5155
                NSEC3, 6605 ECDSA, 8080 Ed25519, 1982 serial arithmetic) — all
