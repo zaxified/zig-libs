@@ -83,6 +83,14 @@ pub const server = @import("server.zig");
 /// Byte-exact frames captured from third-party traffic.
 pub const goldens = @import("goldens.zig");
 
+/// **S7CommPlus** (protocol id 0x72): the S7-1200 / S7-1500 dialect. A separate
+/// namespace over the *same* TPKT/COTP transport — the typed-value TLV codec,
+/// the object/session/integrity model, a symbolic path parser, and a
+/// codec-driven client + responder. See `s7plus.zig` and SPEC.md for what is
+/// third-party-anchored versus self-derived, and what is codec-only versus
+/// driven. Classic S7comm above is unaffected.
+pub const s7plus = @import("s7plus.zig");
+
 // ── top-level names (the ones a consumer actually types) ────────────────────
 
 /// An S7 client over any byte stream.
@@ -127,6 +135,15 @@ pub const SzlId = userdata.SzlId;
 pub const SzlResponse = userdata.SzlResponse;
 pub const CpuStatus = userdata.CpuStatus;
 
+// ── S7CommPlus top-level names (the 0x72 / S7-1200/1500 world) ──────────────
+pub const S7PlusClient = s7plus.client.Client;
+pub const S7PlusResponder = s7plus.client.Responder;
+pub const S7PlusFrame = s7plus.Frame;
+pub const S7PlusPduType = s7plus.PduType;
+pub const S7PlusDatatype = s7plus.value.Datatype;
+pub const S7PlusSession = s7plus.object.Session;
+pub const S7PlusFunction = s7plus.object.Function;
+
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ───────────────────────
 //
 // A bare `pub const x = @import("x.zig")` re-export does NOT pull `x`'s tests
@@ -143,6 +160,7 @@ test {
     _ = client;
     _ = server;
     _ = goldens;
+    _ = s7plus;
 }
 
 // ── tests: the whole stack, client against responder ───────────────────────

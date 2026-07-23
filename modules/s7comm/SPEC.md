@@ -234,6 +234,114 @@ length that runs past its block and a truncated item header; a **read reply whos
 code is an error while data is present** (the data must not be handed back), a mismatched PDU
 reference, and a PLC-level error class; plus roughly thirty malformed address strings.
 
+## S7CommPlus
+
+S7CommPlus (protocol id `0x72`) is the S7-1200 / S7-1500 dialect. It rides on the **same** TPKT +
+COTP class-0 transport as classic S7comm — the transport layers (`tpkt.zig`, `cotp.zig`,
+`transport.zig`) are reused unchanged — but everything above the COTP `DT` is a different protocol:
+a TLV object graph with a session, a per-PDU sequence number and a running integrity value, rather
+than the `0x32` header with area/offset reads. It lives in a separate namespace (`root.s7plus`) so
+the classic surface is entirely unaffected; the public API is purely additive.
+
+### Design & invariants
+
+- **`s7plus_value.zig` — the typed-value codec (the heart).** Every attribute is
+  `<flags><datatype><body>`. The load-bearing subtlety is the integer encoding: `UDInt`/`ULInt`/
+  `AID`/`DInt`/`LInt`/`Timespan` are a **base-128 big-endian VLQ**, most-significant group first,
+  `0x80` continuation. For the signed forms the value is two's-complement over the `7*N`-bit field,
+  so the sign is the top bit of the whole number — which, because the first group is most
+  significant, is exactly bit `0x40` of the **first** octet. Decoders accumulate in `u128` so a full
+  64-bit value (which needs ten groups) cannot overflow mid-decode, and an over-wide encoding is
+  `error.VarIntTooLong`, never a wrap. Structs/arrays/variants nest, so **every walk carries a depth
+  counter** (`max_depth = 32`) and array counts / blob lengths are capped (`max_elements`), turning a
+  hostile deeply-nested or count-overrun blob into a typed error rather than a stack overflow or a
+  multi-gigabyte loop.
+- **`s7plus.zig` — the frame.** `0x72`, a PDU-type octet (Connect / Data / Data-with-integrity /
+  Keep-alive), a 16-bit data length; then the data part; then, on a `data_fw3` PDU, the trailing
+  integrity part; then, on any Data PDU, a **trailer** — a second `0x72` header form with a zero
+  length that closes the PDU. `decode` requires the data length, the integrity region and the
+  trailer to account for **exactly** the octets present (there is no per-PDU checksum, so a length
+  disagreement is the only framing signal), and a Connect / Keep-alive with anything trailing its
+  data is refused.
+- **`s7plus_object.zig` — objects, session, integrity.** The Data-PDU inner header is
+  `opcode(1) reserved(2) function(2) reserved(2) seqnum(2)`; the reserved fields are checked, not
+  assumed. Objects are `0xa1 <relation-id><class-id> ( attribute | object )* 0xa2`, walked with an
+  independent, stricter depth bound (`max_object_depth = 16`). The **session** carries three running
+  values — the session id (assigned by the CPU at connect), the sequence number (client-incremented,
+  echoed by the reply), and the **integrity id** (a running anti-replay value newer firmware checks).
+  `Session.verifyIntegrity` enforces that a V3 PDU's id is **exactly** the expected next value and
+  advances it; a repeated or stale id is `error.IntegrityReplay`. A V1/V2 session leaves it disabled.
+- **`s7plus_path.zig` — symbolic addressing.** `"MotorData".Axis[2].Position` parses into a bounded
+  component list; a quoted root is required, and every malformed form (unterminated quote, empty
+  step, non-numeric / unterminated subscript, dangling dot, trailing garbage, overflow) is a typed
+  error. `resolve` maps the root name to the CPU's relative object id against a caller-supplied table.
+
+### What is validated — third-party-anchored vs self-derived
+
+The honest bar here is **lower** than the classic layers, and stated as such:
+
+- **No live peer.** snap7 — the reference the whole field checks against — implements classic
+  S7comm **only**, so it cannot act as an S7CommPlus oracle. No S7-1200/1500 and no obtainable open
+  S7CommPlus simulator were available. There is therefore **no interop test**, and none is faked.
+- **No `s7comm-plus` dissector.** This environment's Wireshark 4.6.4 ships the classic `s7comm`
+  dissector but **not** `s7comm-plus` — verified by inspecting `libwireshark.so.19` (it contains
+  `s7comm.header.*` field strings and zero `s7comm-plus` / `s7commp` strings). `rawshark` therefore
+  cannot field-decode a `0x72` body.
+- **What `rawshark` *did* confirm (the envelope).** `rawshark` (Wireshark 4.6.4) was run over
+  `s7plus_goldens.rawshark_envelope_frame`, a full `TPKT | COTP DT | 0x72 …` frame this module
+  builds. It independently confirmed: `tpkt.length` == `24` (our TPKT total), `cotp.type` == `0x0f`
+  (a class-0 DT), and `frame.protocols` == `tpkt:cotp:data` — i.e. the COTP payload boundary lands
+  exactly where our `0x72` header begins. So the framing *around* S7CommPlus is third-party-validated;
+  the `0x72` body is not.
+- **Third-party-anchored:** the value/datatype codec and the header field layout follow the
+  documented `s7comm-plus` wire structure directly, and the pinned value goldens (`udint_300`,
+  `dint_neg1`, `real_one`, `wstring_hi`, …) are the closest thing to an external anchor — any
+  re-implementation of the value codec must agree on those octets.
+- **Self-derived:** the exact placement of the integrity part relative to the trailer, the trailer's
+  own shape, the Data-PDU inner-header field order, the function codes, and the client/responder
+  request/response *choreography*. All are internally consistent and round-trip exactly, but are a
+  model, not a captured fact.
+- **Firmware coverage.** The integrity id's **sequence semantics** (a strictly-monotonic running
+  value the peer verifies) are modelled and enforced; the **keyed cryptographic derivation** of the
+  id and its digest that the newest S7-1500 firmware uses is **not** — the digest is an opaque
+  caller-supplied blob, not computed. This covers S7-1200 and S7-1500 up to the point where a signed
+  integrity digest (and the associated session-key exchange / optional encryption) becomes mandatory.
+
+### Codec-only vs driven
+
+- **Codec-only (complete, exercised):** the value/datatype TLV codec, the frame framing, the object
+  walker, the Data-PDU inner header, the symbolic path parser, and the session/sequence/integrity
+  model.
+- **Driven (over an in-memory wire, not a real PLC):** a client and responder exchange Connect,
+  SetVariable and GetVariable through the actual codecs, including the integrity anti-replay check —
+  a full round trip. This is a **self-consistent reference and a fleet-simulation target**, exactly
+  like the classic `Responder`, **not** a validated S7-1200 driver.
+
+### Fuzz + hostile input
+
+`std.testing.fuzz` sweeps, all asserting "typed error or valid result, never a panic and never a
+hang": the value walker over arbitrary bytes (bounded consumed length); the VLQ decoders (with a
+re-encode/re-decode fixed-point check); the `0x72` frame decoder; the object walker; and the path
+parser. Explicit hostile-input tests cover every case the task names: a `0x72` header whose length
+disagrees, a TLV value whose length runs past the buffer, a struct nested past the depth bound, an
+array count that overruns and one that is absurdly large, a datatype-flags octet with a reserved bit,
+an integrity id that does not progress, and a symbolic path that does not resolve.
+
+### Deferred (S7CommPlus)
+
+- **Encryption / the newest-firmware integrity cryptography.** The keyed digest and the TLS-style
+  session-key exchange the latest S7-1500 firmware layers on top are **out of scope**; only the
+  integrity id's progression is modelled. This is stated plainly rather than half-implemented.
+- **Cyclic subscriptions / notifications.** The `notification` opcode (`0x33`) is modelled in the
+  header; the subscription machinery (SetVarSubStreamed and the unsolicited push flow) is not.
+- **Symbolic sub-path resolution beyond the root.** `s7plus_path` resolves the root object id and
+  carries the member/index steps verbatim; mapping a member *name* to its numeric id needs the
+  object's browsed schema, which is not implemented (the client reads the root object).
+- **Block upload / download, program transfer, and the `Explore` browse walk.** Function codes are
+  named; the flows are not built.
+- **Multi-variable batching** (`GetMultiVariables` / `SetMultiVariables`), keep-alive timers, and
+  PDU-level retry / reconnection — as with the classic client, one request/reply per call, no timers.
+
 ## Threat model
 
 S7comm is an **unauthenticated, unencrypted** protocol by design: anyone with a path to TCP port
@@ -268,10 +376,10 @@ Honest list of what a full S7 implementation has and this one does not:
   `s7.Function` and nothing more. These are the genuinely dangerous ones (they replace the program a
   machine is running) and they need a block-format model (MC7 headers, block types OB/FB/FC/DB/SDB)
   that is a project of its own.
-- **Symbolic addressing** (syntax id `0xB2`, the S7-1200/1500 "optimised block access" mode). Only
-  `S7ANY` (`0x10`) is built and decoded; a `0xB2` item is `error.UnsupportedSyntaxId`. Reading an
-  optimised S7-1500 DB therefore needs the DB switched to non-optimised access, which is the same
-  constraint every third-party driver has.
+- **Symbolic addressing over *classic* S7comm** (syntax id `0xB2`). In the `0x32` protocol only
+  `S7ANY` (`0x10`) is built and decoded; a `0xB2` item is `error.UnsupportedSyntaxId`. The
+  S7-1200/1500 symbolic world is instead handled by the **S7CommPlus** (`0x72`) layer — see
+  "S7CommPlus" below — which is the protocol those CPUs actually speak for optimised-block access.
 - **Fragmented (multi-PDU) SZL responses.** `readSzl` returns the first PDU and reports
   `partial = true` when the CPU said more follow; the continuation exchange is not implemented,
   because no oracle here would produce one and guessing the sequencing would be worse than saying so.

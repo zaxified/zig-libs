@@ -63,6 +63,27 @@ fleet-simulation target.
 - **`server`** — a `Responder`: the PLC side as a pure function from one packet
   to one packet, backed by caller-owned byte slices. Stand up one per simulated
   CPU for fleet simulation. PLC control is **refused by default**.
+- **`s7plus`** — **S7CommPlus** (protocol id `0x72`), the dialect the S7-1200
+  and S7-1500 actually speak, on the *same* TPKT/COTP transport. A different
+  protocol, added as a separate namespace so classic S7comm is untouched:
+  - **`s7plus.value`** — the typed-value TLV codec that is the heart of the
+    protocol: a base-128 big-endian VLQ (signed and unsigned), every scalar
+    datatype (bool, U/SInt…U/LInt, Real/LReal, Timestamp, blob, WString), and
+    structs/arrays/variants with **bounded recursion** and a hostile
+    deeply-nested guard.
+  - **`s7plus`** — the `0x72` PDU frame: the header (protocol id, PDU type
+    Connect/Data/Data-with-integrity/Keep-alive, data length), the trailing
+    integrity part, and the trailer (a second `0x72` header form that closes a
+    Data PDU).
+  - **`s7plus.object`** — the object/attribute stream, the Data-PDU inner
+    header (opcode, function — CreateObject/Get/SetVariable/…, sequence
+    number), and the **session / sequence / integrity-id** model: the running
+    anti-replay value newer firmware verifies must strictly progress.
+  - **`s7plus.path`** — the S7-1200/1500 **symbolic** address parser
+    (`"MotorData".Axis[2].Position`), with every malformed form a typed error.
+  - **`s7plus.client`** — a codec-driven client and responder over the shared
+    `Transport` seam (Connect → Get/SetVariable). See "S7CommPlus is
+    codec-driven" below and SPEC.md for what that does and does not prove.
 - Hostile input never panics anywhere: a truncated TPKT, a TPKT length that
   disagrees with the payload, a COTP length indicator pointing past the buffer,
   an S7 header whose parameter and data lengths overflow the frame, an item
@@ -148,6 +169,35 @@ simulator both need them, but nothing in this module calls them implicitly, the
 responder refuses them unless `allow_plc_control` is set, and they must never
 be pointed at equipment you do not own. See SPEC.md, "Threat model".
 
+## S7CommPlus is codec-driven, not peer-validated
+
+The classic layers were validated against **real traffic between two
+independent third-party stacks** and by **live round trips**. S7CommPlus was
+not, and this matters:
+
+- **No live peer.** snap7 (the classic reference) does **not** implement
+  S7CommPlus, and no S7-1200/1500 or open S7CommPlus simulator was obtainable
+  here. So there is no interop test, and none is faked.
+- **No `s7comm-plus` dissector.** This environment's Wireshark 4.6.4 ships the
+  classic `s7comm` dissector but **not** `s7comm-plus` (confirmed by inspecting
+  `libwireshark`), so `rawshark` cannot field-decode a `0x72` body. It **can**
+  and does confirm the *envelope*: for a full frame this module builds,
+  `tpkt.length`, `cotp.type` (a class-0 DT) and the COTP→`0x72` payload boundary
+  all check out.
+- **What is validated:** the value/datatype codec and the header layout against
+  the documented `s7comm-plus` field structure; everything by exact round-trip
+  and byte-pinned goldens; hostile input and `std.testing.fuzz` over every
+  decoder; and a full client↔responder round trip (Connect, Set/GetVariable,
+  and the integrity anti-replay check) over an in-memory wire.
+- **Codec-only vs driven:** the codecs, framing, path parser and
+  session/integrity model are complete and exercised; the client/responder
+  *choreography* is a self-consistent model, **not** a validated S7-1200 driver.
+  Treat the responder as a fleet-simulation target, like the classic one.
+
+See SPEC.md, "S7CommPlus", for the field-by-field breakdown and the honest
+remaining list (encryption, the newest-firmware integrity cryptography,
+subscriptions, symbolic sub-path resolution, block up/download).
+
 ## Verify
 
 ```
@@ -156,8 +206,10 @@ zig build test-s7comm -Doptimize=ReleaseFast
 zig fmt --check modules/s7comm
 ```
 
-118 tests, of which 116 are fully offline. The two live tests skip gracefully
-(printing `SKIPPED:` and passing) when no peer is present:
+161 tests, of which 159 are fully offline (the classic suite plus the
+S7CommPlus codec, framing, path, session/integrity and client↔responder round
+trips). The two live tests — both classic S7comm — skip gracefully (printing
+`SKIPPED:` and passing) when no peer is present:
 
 ```
 # our client -> a real S7 server (e.g. a snap7 server on an unprivileged port)
@@ -175,10 +227,16 @@ rebuilt from its *decoded items* — plus full client↔responder round trips ov
 an in-memory wire and `std.testing.fuzz` sweeps over the TPKT decoder and
 framer, the COTP decoder, the S7 decoder, the item and data-block decoders, the
 request parameter decoder, the address parser and the responder's request
-handler. See SPEC.md for what is third-party-validated versus self-derived, and
-what is deferred.
+handler. For **S7CommPlus** it adds byte-pinned self-derived goldens, a
+`rawshark`-confirmed envelope frame, and `std.testing.fuzz` sweeps over the
+value walker, the VLQ decoders, the frame decoder, the object walker and the
+path parser. See SPEC.md for what is third-party-validated versus self-derived,
+and what is deferred.
 
 Provenance: clean-room from the published ISO 8073 / RFC 1006 / S7comm frame
-layouts. No third-party source was consulted as a design reference; a
-third-party stack was used as a black-box test oracle and as a live peer only.
-See SPEC.md and `/NOTICE`.
+layouts, and — for S7CommPlus — from the documented / reverse-engineered
+`s7comm-plus` wire layout (the Wireshark dissector's published field structure).
+No third-party *source* was consulted as a design reference; a third-party stack
+was used as a black-box test oracle and a live peer for classic S7comm, and
+`rawshark` as a black-box envelope check for S7CommPlus. See SPEC.md and
+`/NOTICE`.
