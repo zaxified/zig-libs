@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: MIT
 
-//! SNMPv3 message framing (RFC 3412) — **T-D**: the message envelope +
-//! ScopedPDU, at the `noAuthNoPriv` / plaintext level (no crypto).
+//! SNMPv3 message framing (RFC 3412): the message envelope + ScopedPDU, at the
+//! plaintext level. Crypto lives one layer up (`usm`, `priv`).
 //!
 //! Wire form (RFC 3412 §6):
 //! ```
 //! SNMPv3Message ::= SEQUENCE {
 //!     msgVersion            INTEGER (3),
 //!     msgGlobalData         HeaderData,
-//!     msgSecurityParameters OCTET STRING,   -- opaque; USM (RFC 3414) is T-E
+//!     msgSecurityParameters OCTET STRING,   -- opaque; parsed by `usm`
 //!     msgData               ScopedPduData
 //! }
 //! HeaderData ::= SEQUENCE {
@@ -20,11 +20,11 @@
 //!                          contextName OCTET STRING, data <PDU> }
 //! ```
 //!
-//! This layer captures `msgSecurityParameters` as an opaque slice (USM parse is
-//! T-E, auth is T-F, privacy is T-G) and decodes the ScopedPDU's inner PDU with
-//! the shared `message.decodePdu`. When the privacy flag is set the msgData is
-//! an encrypted OCTET STRING, surfaced verbatim as `.encrypted` for T-G to
-//! decrypt (then `decodeScopedPdu`). Encoding is the symmetric plaintext path.
+//! This layer captures `msgSecurityParameters` as an opaque slice (`usm` parses
+//! it, and authenticates) and decodes the ScopedPDU's inner PDU with the shared
+//! `message.decodePdu`. When the privacy flag is set the msgData is an encrypted
+//! OCTET STRING, surfaced verbatim as `.encrypted` for `priv` to decrypt (then
+//! `decodeScopedPdu`). Encoding is the symmetric plaintext path.
 
 const std = @import("std");
 const ber = @import("ber.zig");
@@ -80,14 +80,14 @@ pub const ScopedPdu = struct {
 };
 
 /// The msgData CHOICE: a plaintext ScopedPDU, or the still-encrypted ScopedPDU
-/// bytes (privacy flag set) awaiting decryption (T-G) then `decodeScopedPdu`.
+/// bytes (privacy flag set) awaiting decryption by `priv`, then `decodeScopedPdu`.
 pub const ScopedData = union(enum) {
     plaintext: ScopedPdu,
     encrypted: []const u8,
 };
 
 /// A decoded SNMPv3 message. `security_parameters` is the opaque USM blob
-/// (parse with the USM layer, T-E); all slices borrow the input datagram.
+/// (parse it with the `usm` layer); all slices borrow the input datagram.
 pub const V3Message = struct {
     header: HeaderData,
     security_parameters: []const u8,
@@ -99,7 +99,7 @@ pub const DecodeError = message.DecodeError || error{NotV3};
 /// Decode an SNMPv3 message envelope. A non-v3 `msgVersion` is `error.NotV3`.
 /// The ScopedPDU is fully parsed when plaintext (privacy clear); when the
 /// privacy flag / an encryptedPDU OCTET STRING is present, its bytes are
-/// returned as `.encrypted` (decrypt in T-G). Malformed bytes stay typed BER
+/// returned as `.encrypted` (decrypt with `priv`). Malformed bytes stay typed BER
 /// errors — never a panic.
 pub fn decode(bytes: []const u8) DecodeError!V3Message {
     var top = ber.Decoder.init(bytes);
@@ -140,7 +140,7 @@ fn decodeHeader(content: []const u8) DecodeError!HeaderData {
 }
 
 /// Decode a plaintext ScopedPDU (RFC 3412 §6.8): contextEngineID, contextName,
-/// and the inner PDU. Public so the T-G privacy layer can call it on a decrypted
+/// and the inner PDU. Public so the `priv` layer can call it on a decrypted
 /// buffer.
 pub fn decodeScopedPdu(content: []const u8) DecodeError!ScopedPdu {
     var d = ber.Decoder.init(content);
@@ -157,7 +157,7 @@ pub fn decodeScopedPdu(content: []const u8) DecodeError!ScopedPdu {
 
 /// Parameters for `encode` — the plaintext (noAuthNoPriv / authNoPriv) path.
 /// `security_parameters` is the caller-supplied opaque USM blob (build it with
-/// the USM layer, T-E/F); it may be empty for framing tests. For the privacy
+/// the `usm` layer); it may be empty for framing tests. For the privacy
 /// (authPriv) send path use `encodeScopedPdu` + the privacy layer's `encrypt` +
 /// `encodeEncrypted` instead.
 pub const EncodeParams = struct {
@@ -325,7 +325,7 @@ test "encode/decode round-trip: inner InformRequest, empty security params" {
     try testing.expectEqual(@as(i32, 4242), m.data.plaintext.pdu.inform_request.request_id);
 }
 
-test "decode: privacy flag / encryptedPDU is surfaced verbatim for T-G" {
+test "decode: privacy flag / encryptedPDU is surfaced verbatim for the priv layer" {
     // Hand-assemble a v3 message whose msgData is an encryptedPDU OCTET STRING.
     var buf: [128]u8 = undefined;
     var e = ber.Encoder.init(&buf);

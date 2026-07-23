@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! USM privacy — **T-G**: SNMPv3 scoped-PDU encryption (RFC 3414 §8 DES-CBC and
+//! USM privacy — SNMPv3 scoped-PDU encryption (RFC 3414 §8 DES-CBC and
 //! RFC 3826 AES-128-CFB128). Sits on top of `des.zig` (from-scratch DES) and
 //! `std.crypto.core.aes.Aes128` (single-block AES), and hands the decrypted
 //! ScopedPDU to `v3.decodeScopedPdu`.

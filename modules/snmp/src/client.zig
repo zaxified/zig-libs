@@ -277,7 +277,14 @@ const FakeAgent = struct {
         }
         const msg = message.decode(request) catch return error.TransportFailed;
         const rid = switch (msg.pdu) {
-            .get_request, .get_next_request, .response, .set_request, .inform_request, .trap_v2 => |p| blk: {
+            .get_request,
+            .get_next_request,
+            .response,
+            .set_request,
+            .inform_request,
+            .trap_v2,
+            .report,
+            => |p| blk: {
                 a.last_request_varbinds = p.varbinds.count() catch return error.TransportFailed;
                 break :blk p.request_id;
             },

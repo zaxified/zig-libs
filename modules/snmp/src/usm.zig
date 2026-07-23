@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 
-//! USM — User-based Security Model (RFC 3414) — **T-E: the
-//! `UsmSecurityParameters` (de)serializer**.
+//! USM — User-based Security Model (RFC 3414, extended by RFC 7860): the
+//! `UsmSecurityParameters` (de)serializer plus key derivation/localization and
+//! message authentication.
 //!
 //! An SNMPv3 message carries its security-model parameters in the opaque
 //! `msgSecurityParameters` OCTET STRING (see `v3.V3Message.security_parameters`).
@@ -18,12 +19,14 @@
 //! }
 //! ```
 //!
-//! This layer only (de)serializes that structure — it does NOT authenticate or
-//! decrypt. Verifying `msgAuthenticationParameters` (HMAC + key localization) is
-//! T-F; using `msgPrivacyParameters` to decrypt the scoped PDU is T-G; the
-//! engine-boots/time anti-replay window is T-H. `msgAuthenticationParameters` is
-//! the field T-F zero-fills before computing the HMAC over the whole message and
-//! then overwrites, so `encode` here writes it exactly as given.
+//! `parse`/`encode` handle that structure; `passwordToKey` / `localizeKey` /
+//! `computeDigestInto` / `sign` / `verify` handle authentication. Using
+//! `msgPrivacyParameters` to decrypt the scoped PDU is the `priv` layer, and
+//! the engine-boots/time anti-replay window is `timewin`.
+//! `msgAuthenticationParameters` is the field the digest zero-fills (to its
+//! **final, protocol-specific** length) before hashing the whole message and
+//! then overwrites, so `encode` here writes it exactly as given — callers must
+//! pass a placeholder of `proto.digestLen()` zero bytes on the send path.
 
 const std = @import("std");
 const ber = @import("ber.zig");
@@ -83,7 +86,8 @@ pub fn parse(bytes: []const u8) DecodeError!UsmSecurityParameters {
 /// returning the encoded slice (the BER encoder writes backwards, so the slice
 /// is aligned to the END of `buf`). The bytes are suitable to hand to
 /// `v3.EncodeParams.security_parameters`. `auth_params` is written verbatim —
-/// T-F supplies either a zero-filled placeholder (pre-HMAC) or the final digest.
+/// the send path supplies either a zero-filled placeholder (pre-HMAC) or the
+/// final digest.
 pub fn encode(buf: []u8, params: UsmSecurityParameters) ber.EncodeError![]const u8 {
     var e = ber.Encoder.init(buf);
     try e.prependTlv(ber.tag.octet_string, params.priv_params);
@@ -96,40 +100,96 @@ pub fn encode(buf: []u8, params: UsmSecurityParameters) ber.EncodeError![]const 
     return e.encoded();
 }
 
-// ── T-F: authentication — key localization + HMAC-*-96 (RFC 3414 §2.6/§6/§7) ──
+// ── authentication: key localization + HMAC (RFC 3414 §2.6/§6/§7, RFC 7860) ──
 
 const hash = std.crypto.hash;
 const hmac = std.crypto.auth.hmac;
 
-/// USM authentication protocols (RFC 3414). Classic HMAC-*-96 only; the RFC 7860
-/// SHA-2 variants are a later addition.
+/// USM authentication protocols: the classic HMAC-*-96 pair of RFC 3414 plus
+/// the SHA-2 family of RFC 7860. Every member shares the same password→key
+/// derivation (RFC 3414 §A.2 with the protocol's hash substituted, restated by
+/// RFC 7860 §11.2) and the same "HMAC over the whole message with
+/// msgAuthenticationParameters zero-filled" rule; they differ in the hash, the
+/// localized-key length (= digest length of that hash) and — crucially — the
+/// **truncation length** written into `msgAuthenticationParameters`.
 pub const AuthProtocol = enum {
-    /// usmHMACMD5AuthProtocol (RFC 3414 §6) — HMAC-MD5-96, 16-byte key.
+    /// usmHMACMD5AuthProtocol (RFC 3414 §6) — HMAC-MD5-96, 16-byte key,
+    /// 12-byte digest.
     hmac_md5,
-    /// usmHMACSHAAuthProtocol (RFC 3414 §7) — HMAC-SHA-1-96, 20-byte key.
+    /// usmHMACSHAAuthProtocol (RFC 3414 §7) — HMAC-SHA-1-96, 20-byte key,
+    /// 12-byte digest.
     hmac_sha1,
+    /// usmHMAC128SHA224AuthProtocol (RFC 7860 §4) — 28-byte key, 16-byte
+    /// (128-bit) digest.
+    hmac_sha224,
+    /// usmHMAC192SHA256AuthProtocol (RFC 7860 §4) — 32-byte key, 24-byte
+    /// (192-bit) digest.
+    hmac_sha256,
+    /// usmHMAC256SHA384AuthProtocol (RFC 7860 §4) — 48-byte key, 32-byte
+    /// (256-bit) digest.
+    hmac_sha384,
+    /// usmHMAC384SHA512AuthProtocol (RFC 7860 §4) — 64-byte key, 48-byte
+    /// (384-bit) digest.
+    hmac_sha512,
 
     /// The localized-key length in bytes (= the hash's digest length).
     pub fn keyLen(self: AuthProtocol) usize {
         return switch (self) {
             .hmac_md5 => 16,
             .hmac_sha1 => 20,
+            .hmac_sha224 => 28,
+            .hmac_sha256 => 32,
+            .hmac_sha384 => 48,
+            .hmac_sha512 => 64,
+        };
+    }
+
+    /// The length of `msgAuthenticationParameters` on the wire — the HMAC
+    /// truncation length. RFC 3414 §6.3.1/§7.3.1 fix 12 for MD5/SHA-1; RFC 7860
+    /// §4.2.1 gives 16/24/32/48 for SHA-224/256/384/512. Getting this wrong is
+    /// the classic RFC 7860 implementation bug (reusing 12 everywhere).
+    pub fn digestLen(self: AuthProtocol) usize {
+        return switch (self) {
+            .hmac_md5, .hmac_sha1 => 12,
+            .hmac_sha224 => 16,
+            .hmac_sha256 => 24,
+            .hmac_sha384 => 32,
+            .hmac_sha512 => 48,
+        };
+    }
+
+    /// The `usmHMAC*AuthProtocol` OID (RFC 3414 §6/§7 under snmpAuthProtocols
+    /// 1.3.6.1.6.3.10.1.1, RFC 7860 §8) — useful when writing a usmUserTable
+    /// row or matching an agent's advertised protocol.
+    pub fn oidArc(self: AuthProtocol) u32 {
+        return switch (self) {
+            .hmac_md5 => 2, // usmHMACMD5AuthProtocol
+            .hmac_sha1 => 3, // usmHMACSHAAuthProtocol
+            .hmac_sha224 => 4, // usmHMAC128SHA224AuthProtocol
+            .hmac_sha256 => 5, // usmHMAC192SHA256AuthProtocol
+            .hmac_sha384 => 6, // usmHMAC256SHA384AuthProtocol
+            .hmac_sha512 => 7, // usmHMAC384SHA512AuthProtocol
         };
     }
 };
 
-/// The truncated HMAC length carried in `msgAuthenticationParameters`
-/// (HMAC-*-96 → 12 bytes; RFC 3414 §6.3.1/§7.3.1).
+/// The truncated HMAC length of the two **HMAC-*-96** protocols (RFC 3414
+/// §6.3.1/§7.3.1). Kept for the original MD5/SHA-1 API surface; for anything
+/// protocol-generic use `AuthProtocol.digestLen()` — the RFC 7860 protocols do
+/// **not** truncate to 12.
 pub const digest_len = 12;
 
-/// Longest localized key across the protocols (SHA-1 = 20).
-pub const max_key_len = 20;
+/// Longest `msgAuthenticationParameters` across all protocols (SHA-512 → 48).
+pub const max_digest_len = 48;
+
+/// Longest localized key across all protocols (SHA-512 → 64).
+pub const max_key_len = 64;
 
 pub const AuthError = error{
     /// The computed digest did not match the message's (constant-time compared).
     AuthenticationFailed,
-    /// `msgAuthenticationParameters` was not the expected `digest_len`, or does
-    /// not lie within `message` (so its offset can't be located).
+    /// `msgAuthenticationParameters` was not the protocol's `digestLen()`, or
+    /// does not lie within `message` (so its offset can't be located).
     BadAuthParams,
 };
 
@@ -151,6 +211,10 @@ pub fn passwordToUserKey(proto: AuthProtocol, password: []const u8, out: []u8) K
     return switch (proto) {
         .hmac_md5 => pwToUk(hash.Md5, password, out),
         .hmac_sha1 => pwToUk(hash.Sha1, password, out),
+        .hmac_sha224 => pwToUk(hash.sha2.Sha224, password, out),
+        .hmac_sha256 => pwToUk(hash.sha2.Sha256, password, out),
+        .hmac_sha384 => pwToUk(hash.sha2.Sha384, password, out),
+        .hmac_sha512 => pwToUk(hash.sha2.Sha512, password, out),
     };
 }
 
@@ -182,6 +246,10 @@ pub fn localizeKey(proto: AuthProtocol, user_key: []const u8, engine_id: []const
     return switch (proto) {
         .hmac_md5 => localizeT(hash.Md5, user_key, engine_id, out),
         .hmac_sha1 => localizeT(hash.Sha1, user_key, engine_id, out),
+        .hmac_sha224 => localizeT(hash.sha2.Sha224, user_key, engine_id, out),
+        .hmac_sha256 => localizeT(hash.sha2.Sha256, user_key, engine_id, out),
+        .hmac_sha384 => localizeT(hash.sha2.Sha384, user_key, engine_id, out),
+        .hmac_sha512 => localizeT(hash.sha2.Sha512, user_key, engine_id, out),
     };
 }
 
@@ -207,10 +275,41 @@ pub fn passwordToKey(proto: AuthProtocol, password: []const u8, engine_id: []con
     return localizeKey(proto, uk, engine_id, out);
 }
 
-/// Compute the 12-byte HMAC-*-96 auth digest over `message`, treating the
-/// `digest_len` bytes at `auth_offset` as zero (RFC 3414 §6.3.1/§7.3.1: the
+/// Compute the auth digest over `message`, treating the `proto.digestLen()`
+/// bytes at `auth_offset` as zero (RFC 3414 §6.3.1/§7.3.1, RFC 7860 §4.2.1: the
 /// digest is computed over the whole message with `msgAuthenticationParameters`
-/// zero-filled). Streams the three regions — no copy, no mutation of `message`.
+/// zero-filled), and write the truncated result into `out`. Returns the
+/// `proto.digestLen()`-byte prefix of `out`; `out` must be at least that long
+/// (`max_digest_len` always suffices). Streams the three regions — no copy, no
+/// mutation of `message`.
+///
+/// This is the protocol-generic entry point. `computeDigest` is the fixed
+/// 12-byte HMAC-*-96 form kept for the original MD5/SHA-1 API.
+pub fn computeDigestInto(
+    proto: AuthProtocol,
+    localized_key: []const u8,
+    message: []const u8,
+    auth_offset: usize,
+    out: []u8,
+) []u8 {
+    const n = proto.digestLen();
+    std.debug.assert(out.len >= n);
+    switch (proto) {
+        .hmac_md5 => digestT(hmac.Hmac(hash.Md5), localized_key, message, auth_offset, n, out),
+        .hmac_sha1 => digestT(hmac.Hmac(hash.Sha1), localized_key, message, auth_offset, n, out),
+        .hmac_sha224 => digestT(hmac.Hmac(hash.sha2.Sha224), localized_key, message, auth_offset, n, out),
+        .hmac_sha256 => digestT(hmac.Hmac(hash.sha2.Sha256), localized_key, message, auth_offset, n, out),
+        .hmac_sha384 => digestT(hmac.Hmac(hash.sha2.Sha384), localized_key, message, auth_offset, n, out),
+        .hmac_sha512 => digestT(hmac.Hmac(hash.sha2.Sha512), localized_key, message, auth_offset, n, out),
+    }
+    return out[0..n];
+}
+
+/// Compute the 12-byte HMAC-*-96 auth digest over `message` — the RFC 3414
+/// MD5/SHA-1 form. Only valid for protocols whose `digestLen()` is 12
+/// (`hmac_md5`, `hmac_sha1`); passing an RFC 7860 protocol is a programming
+/// error (asserted), because silently truncating SHA-2 to 12 bytes would
+/// produce a wrong-but-plausible digest. Use `computeDigestInto` instead.
 pub fn computeDigest(
     proto: AuthProtocol,
     localized_key: []const u8,
@@ -218,10 +317,8 @@ pub fn computeDigest(
     auth_offset: usize,
     out: *[digest_len]u8,
 ) void {
-    switch (proto) {
-        .hmac_md5 => digestT(hmac.Hmac(hash.Md5), localized_key, message, auth_offset, out),
-        .hmac_sha1 => digestT(hmac.Hmac(hash.Sha1), localized_key, message, auth_offset, out),
-    }
+    std.debug.assert(proto.digestLen() == digest_len);
+    _ = computeDigestInto(proto, localized_key, message, auth_offset, out);
 }
 
 fn digestT(
@@ -229,37 +326,48 @@ fn digestT(
     key: []const u8,
     message: []const u8,
     auth_offset: usize,
-    out: *[digest_len]u8,
+    trunc: usize,
+    out: []u8,
 ) void {
-    // HMAC over message with [auth_offset..+digest_len] treated as zero,
-    // then truncate to the first digest_len bytes (HMAC-*-96).
+    // HMAC over message with [auth_offset..+trunc] treated as zero, then
+    // truncated to the protocol's first `trunc` bytes.
     var m = Hmac.init(key);
     m.update(message[0..auth_offset]);
-    m.update(&[_]u8{0} ** digest_len);
-    m.update(message[auth_offset + digest_len ..]);
+    const zeros = [_]u8{0} ** max_digest_len;
+    m.update(zeros[0..trunc]);
+    m.update(message[auth_offset + trunc ..]);
     var full: [Hmac.mac_length]u8 = undefined;
     m.final(&full);
-    @memcpy(out, full[0..digest_len]);
+    @memcpy(out[0..trunc], full[0..trunc]);
 }
 
-/// The byte offset of `params.auth_params` within `message` — valid only when
-/// `params` was parsed from `message` and `auth_params` is exactly `digest_len`
-/// bytes lying inside `message`. Null otherwise (so the caller reports
-/// `BadAuthParams`). Uses pointer identity; do not pass a `params` parsed from a
-/// different buffer.
-pub fn authOffset(message: []const u8, params: UsmSecurityParameters) ?usize {
-    if (params.auth_params.len != digest_len) return null;
+/// The byte offset of `params.auth_params` within `message` for `proto` — valid
+/// only when `params` was parsed from `message` and `auth_params` is exactly
+/// `proto.digestLen()` bytes lying inside `message`. Null otherwise (so the
+/// caller reports `BadAuthParams`). Uses pointer identity; do not pass a
+/// `params` parsed from a different buffer.
+pub fn authOffsetFor(proto: AuthProtocol, message: []const u8, params: UsmSecurityParameters) ?usize {
+    const n = proto.digestLen();
+    if (params.auth_params.len != n) return null;
     const base = @intFromPtr(message.ptr);
     const ap = @intFromPtr(params.auth_params.ptr);
-    if (ap < base or ap + digest_len > base + message.len) return null;
+    if (ap < base or ap + n > base + message.len) return null;
     return ap - base;
 }
 
-/// Verify a received authenticated v3 `message` (RFC 3414 §6.3.2/§7.3.2):
-/// recompute the digest over the message with the auth field zeroed and compare
-/// it to `params.auth_params` in **constant time**. `localized_key` is the
-/// engine-localized key for the message's user. `error.AuthenticationFailed` on
-/// mismatch, `error.BadAuthParams` when the digest field is malformed / not in
+/// `authOffsetFor` fixed to the 12-byte HMAC-*-96 field length (RFC 3414).
+/// Kept for the original MD5/SHA-1 API; use `authOffsetFor` when the protocol
+/// may be one of the RFC 7860 SHA-2 members.
+pub fn authOffset(message: []const u8, params: UsmSecurityParameters) ?usize {
+    return authOffsetFor(.hmac_md5, message, params);
+}
+
+/// Verify a received authenticated v3 `message` (RFC 3414 §6.3.2/§7.3.2, RFC
+/// 7860 §4.2.2): recompute the digest over the message with the auth field
+/// zeroed and compare it to `params.auth_params` in **constant time**.
+/// `localized_key` is the engine-localized key for the message's user.
+/// `error.AuthenticationFailed` on mismatch, `error.BadAuthParams` when the
+/// digest field is not exactly `proto.digestLen()` bytes or does not lie inside
 /// `message`.
 pub fn verify(
     proto: AuthProtocol,
@@ -267,57 +375,42 @@ pub fn verify(
     message: []const u8,
     params: UsmSecurityParameters,
 ) AuthError!void {
-    const off = authOffset(message, params) orelse return error.BadAuthParams;
-    var expected: [digest_len]u8 = undefined;
-    computeDigest(proto, localized_key, message, off, &expected);
-    // CONSTANT-TIME compare (never std.mem.eql on a MAC).
-    const got: [digest_len]u8 = params.auth_params[0..digest_len].*;
-    if (!std.crypto.timing_safe.eql([digest_len]u8, expected, got))
-        return error.AuthenticationFailed;
+    const off = authOffsetFor(proto, message, params) orelse return error.BadAuthParams;
+    var expected_buf: [max_digest_len]u8 = undefined;
+    const expected = computeDigestInto(proto, localized_key, message, off, &expected_buf);
+    // CONSTANT-TIME compare (never std.mem.eql on a MAC). timing_safe.eql wants
+    // a fixed-size array type, so dispatch on the protocol's truncation length.
+    const got = params.auth_params;
+    const ok = switch (proto.digestLen()) {
+        12 => std.crypto.timing_safe.eql([12]u8, expected[0..12].*, got[0..12].*),
+        16 => std.crypto.timing_safe.eql([16]u8, expected[0..16].*, got[0..16].*),
+        24 => std.crypto.timing_safe.eql([24]u8, expected[0..24].*, got[0..24].*),
+        32 => std.crypto.timing_safe.eql([32]u8, expected[0..32].*, got[0..32].*),
+        48 => std.crypto.timing_safe.eql([48]u8, expected[0..48].*, got[0..48].*),
+        else => unreachable, // digestLen() is closed over the enum
+    };
+    if (!ok) return error.AuthenticationFailed;
 }
 
-/// Sign an outgoing v3 `message` in place (RFC 3414 §6.3.1/§7.3.1): compute the
-/// digest over the message (with the auth field currently zero-filled) and write
-/// it into `message[auth_offset..][0..digest_len]`. The caller must have
-/// serialized the message with a `digest_len`-byte zero placeholder for
-/// `msgAuthenticationParameters` at `auth_offset`.
+/// Sign an outgoing v3 `message` in place (RFC 3414 §6.3.1/§7.3.1, RFC 7860
+/// §4.2.1): compute the digest over the message (with the auth field currently
+/// zero-filled) and write it into `message[auth_offset..][0..proto.digestLen()]`.
+/// The caller must have serialized the message with a `proto.digestLen()`-byte
+/// zero placeholder for `msgAuthenticationParameters` at `auth_offset`.
 pub fn sign(
     proto: AuthProtocol,
     localized_key: []const u8,
     message: []u8,
     auth_offset: usize,
 ) void {
-    var d: [digest_len]u8 = undefined;
-    computeDigest(proto, localized_key, message, auth_offset, &d);
-    @memcpy(message[auth_offset..][0..digest_len], &d);
+    var buf: [max_digest_len]u8 = undefined;
+    const d = computeDigestInto(proto, localized_key, message, auth_offset, &buf);
+    @memcpy(message[auth_offset..][0..d.len], d);
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
-
-// T-F test checklist (add these below the existing T-E tests):
-//  KEY DERIVATION — RFC 3414 Appendix A.3 known-answer vectors (password
-//  "maplesyrup", engineID = 12 bytes 00 00 00 00 00 00 00 00 00 00 00 02):
-//   - MD5 Ku  == 9f af 32 83 88 4e 92 83 4e bc 98 47 d8 ed d9 63
-//   - MD5 Kul == 52 6f 5e ed 9f cc e2 6f 89 64 c2 93 07 87 d8 2b
-//   - SHA-1 Ku == 66 95 fe bc 92 88 e3 62 82 23 5f c7 15 1f 12 84 97 b3 8f 3f
-//     (SHA-1 Kul: assert passwordToKey == localizeKey(passwordToUserKey(...)) —
-//      an internal-consistency check is fine; the MD5 KAT pins the algorithm.)
-//   engineID bytes: &[_]u8{0,0,0,0,0,0,0,0,0,0,0,2}.
-//  keyLen: hmac_md5 → 16, hmac_sha1 → 20.
-//  SIGN/VERIFY round-trip (both protocols): build a v3 message (use
-//  @import("v3.zig").encode) whose security_parameters is a usm.encode(...) blob
-//  carrying a 12-ZERO auth_params placeholder; decode it, parse the usm params
-//  (usm.parse over m.security_parameters), locate authOffset **within the whole
-//  datagram**, sign(...) into a MUTABLE copy of the datagram, then verify(...)
-//  succeeds; flip one message byte (or one key byte) → error.AuthenticationFailed.
-//   NOTE: authOffset needs params.auth_params to point INTO the same buffer you
-//   sign/verify — parse the usm params from a slice of the mutable datagram copy.
-//  authOffset / BadAuthParams: a params whose auth_params.len != 12 → verify
-//  returns error.BadAuthParams.
-//  computeDigest determinism: same inputs → same 12 bytes; different auth_offset
-//  region zeroing changes nothing if the zeroed bytes were already zero.
 
 fn expectRoundTrip(params: UsmSecurityParameters) !void {
     var buf: [128]u8 = undefined;
@@ -447,7 +540,7 @@ test "parse rejects trailing junk after the SEQUENCE -> TrailingData" {
     try testing.expectError(error.TrailingData, parse(padded[0 .. wire.len + 1]));
 }
 
-// ── T-F tests: key derivation + HMAC-*-96 sign/verify ───────────────────────
+// ── tests: key derivation + sign/verify ──────────────────────────────────────
 
 const v3 = @import("v3.zig");
 
@@ -457,6 +550,33 @@ const rfc3414_engine_id = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2 };
 test "keyLen: hmac_md5 -> 16, hmac_sha1 -> 20" {
     try testing.expectEqual(@as(usize, 16), AuthProtocol.hmac_md5.keyLen());
     try testing.expectEqual(@as(usize, 20), AuthProtocol.hmac_sha1.keyLen());
+}
+
+test "RFC 7860 §4.2.1: key and digest lengths per protocol" {
+    // {protocol, localized-key length, msgAuthenticationParameters length}.
+    const table = [_]struct { AuthProtocol, usize, usize }{
+        .{ .hmac_md5, 16, 12 }, // RFC 3414 §6
+        .{ .hmac_sha1, 20, 12 }, // RFC 3414 §7
+        .{ .hmac_sha224, 28, 16 }, // usmHMAC128SHA224AuthProtocol
+        .{ .hmac_sha256, 32, 24 }, // usmHMAC192SHA256AuthProtocol
+        .{ .hmac_sha384, 48, 32 }, // usmHMAC256SHA384AuthProtocol
+        .{ .hmac_sha512, 64, 48 }, // usmHMAC384SHA512AuthProtocol
+    };
+    for (table) |row| {
+        try testing.expectEqual(row[1], row[0].keyLen());
+        try testing.expectEqual(row[2], row[0].digestLen());
+        try testing.expect(row[1] <= max_key_len);
+        try testing.expect(row[2] <= max_digest_len);
+    }
+    // The snmpAuthProtocols arcs are distinct and match RFC 3414 §6/§7 + 7860 §8.
+    var seen = [_]bool{false} ** 8;
+    for (table) |row| {
+        const arc = row[0].oidArc();
+        try testing.expect(!seen[arc]);
+        seen[arc] = true;
+    }
+    try testing.expectEqual(@as(u32, 2), AuthProtocol.hmac_md5.oidArc());
+    try testing.expectEqual(@as(u32, 7), AuthProtocol.hmac_sha512.oidArc());
 }
 
 test "RFC 3414 A.3.1 KAT: MD5 Ku from password 'maplesyrup'" {
@@ -520,14 +640,17 @@ fn expectSignVerifyRoundTrip(proto: AuthProtocol) !void {
     var key_buf: [max_key_len]u8 = undefined;
     const key = try passwordToKey(proto, "maplesyrup", &rfc3414_engine_id, &key_buf);
 
-    // USM blob carrying a 12-zero msgAuthenticationParameters placeholder.
-    var usm_buf: [128]u8 = undefined;
+    // USM blob carrying a zero-filled msgAuthenticationParameters placeholder
+    // of exactly the protocol's truncation length.
+    const zeros = [_]u8{0} ** max_digest_len;
+    const dlen = proto.digestLen();
+    var usm_buf: [160]u8 = undefined;
     const usm_wire = try encode(&usm_buf, .{
         .engine_id = &rfc3414_engine_id,
         .engine_boots = 1,
         .engine_time = 42,
         .user_name = "bert",
-        .auth_params = &(.{0} ** digest_len),
+        .auth_params = zeros[0..dlen],
         .priv_params = "",
     });
 
@@ -547,8 +670,8 @@ fn expectSignVerifyRoundTrip(proto: AuthProtocol) !void {
 
     const m = try v3.decode(msg);
     const params = try parse(m.security_parameters);
-    const off = authOffset(msg, params) orelse return error.TestUnexpectedResult;
-    try testing.expectEqualSlices(u8, &(.{0} ** digest_len), params.auth_params);
+    const off = authOffsetFor(proto, msg, params) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualSlices(u8, zeros[0..dlen], params.auth_params);
 
     sign(proto, key, msg, off);
     try verify(proto, key, msg, params);
@@ -584,6 +707,109 @@ test "sign/verify round-trip over a real v3 datagram: HMAC-MD5-96" {
 
 test "sign/verify round-trip over a real v3 datagram: HMAC-SHA-1-96" {
     try expectSignVerifyRoundTrip(.hmac_sha1);
+}
+
+test "sign/verify round-trip over a real v3 datagram: all RFC 7860 SHA-2 protocols" {
+    for ([_]AuthProtocol{ .hmac_sha224, .hmac_sha256, .hmac_sha384, .hmac_sha512 }) |p| {
+        try expectSignVerifyRoundTrip(p);
+    }
+}
+
+/// The engine ID used by the local net-snmp `snmpd` the goldens were captured
+/// from: `80 00 1F 88 04` (RFC 3411 enterprise 8072, text format) + the literal
+/// text "rfc3414-example". Synthetic — nothing from a real device.
+pub const netsnmp_engine_id = [_]u8{ 0x80, 0x00, 0x1f, 0x88, 0x04 } ++ "rfc3414-example".*;
+
+test "cross-implementation KAT: localized keys match net-snmp for all six protocols" {
+    // Password "maplesyrup" (the RFC 3414 A.3 example password) localized to
+    // `netsnmp_engine_id`. Expected values read out of net-snmp 5.9.4's own
+    // persistent `usmUser` rows (`createUser <name> <proto> "maplesyrup"`), and
+    // independently recomputed from the RFC 3414 §A.2 formula. For MD5/SHA-1
+    // the RFC 3414 A.3 vectors above already pin the algorithm; these extend the
+    // same pinning to the RFC 7860 SHA-2 members, which the RFC itself
+    // publishes no vectors for.
+    const cases = [_]struct { AuthProtocol, []const u8 }{
+        .{ .hmac_md5, &[_]u8{
+            0x4b, 0x62, 0xb6, 0x04, 0xdb, 0x88, 0xd6, 0xf5,
+            0xbd, 0xe5, 0xdc, 0xab, 0xb3, 0xba, 0xd1, 0x36,
+        } },
+        .{ .hmac_sha1, &[_]u8{
+            0x87, 0x51, 0xd2, 0x57, 0x3e, 0xd7, 0x9b, 0xaa, 0x96, 0xcd,
+            0xc3, 0x5f, 0x59, 0x78, 0x4d, 0x41, 0xf3, 0x0b, 0xa4, 0xc0,
+        } },
+        .{ .hmac_sha224, &[_]u8{
+            0x16, 0xda, 0x9b, 0x15, 0xef, 0x71, 0x9b, 0xbf, 0xbc, 0x4a,
+            0xd0, 0x14, 0x6b, 0x5b, 0x86, 0x41, 0xa9, 0x1a, 0x47, 0xa4,
+            0x25, 0xbd, 0x83, 0xff, 0xb6, 0xa5, 0x00, 0x85,
+        } },
+        .{ .hmac_sha256, &[_]u8{
+            0xdb, 0x1d, 0xd5, 0x0d, 0xcc, 0xca, 0xf3, 0xd0, 0x2d, 0x36, 0xa0,
+            0x39, 0x18, 0xfd, 0x2d, 0x91, 0xa1, 0x02, 0x4a, 0x23, 0x42, 0x4d,
+            0x2e, 0x6f, 0x45, 0x25, 0x3a, 0x9d, 0x79, 0x61, 0x9a, 0x57,
+        } },
+        .{ .hmac_sha384, &[_]u8{
+            0x06, 0x85, 0xe6, 0x9d, 0x64, 0x75, 0xd6, 0x02, 0xa1, 0x47, 0xad, 0x05,
+            0xb3, 0xea, 0x94, 0x09, 0x89, 0xeb, 0xe4, 0xe0, 0x11, 0x4e, 0xe8, 0xd8,
+            0xc1, 0x34, 0x6e, 0xdd, 0x64, 0x5a, 0xce, 0x9e, 0xa0, 0xbc, 0x4e, 0x69,
+            0xac, 0x1a, 0x82, 0xba, 0xb9, 0xa9, 0x2c, 0x3f, 0xc6, 0xca, 0x53, 0xdb,
+        } },
+        .{ .hmac_sha512, &[_]u8{
+            0x8b, 0xda, 0x63, 0x80, 0x49, 0xec, 0x88, 0x2a, 0x5e, 0xf3, 0xe5, 0x87,
+            0x0f, 0x08, 0x84, 0xc8, 0x4f, 0x32, 0x3f, 0xde, 0x53, 0x4c, 0x50, 0xf5,
+            0xc7, 0x29, 0x2d, 0x3f, 0x73, 0xbc, 0x26, 0x24, 0x21, 0x8b, 0x27, 0x4f,
+            0x03, 0x9e, 0x05, 0xfb, 0x59, 0x40, 0xca, 0x63, 0xcc, 0xaf, 0xb1, 0xea,
+            0x6c, 0x3a, 0x53, 0xe0, 0x8b, 0x36, 0xec, 0xc6, 0x9c, 0x2d, 0x6d, 0x45,
+            0xfa, 0x28, 0x0a, 0x46,
+        } },
+    };
+    for (cases) |c| {
+        var buf: [max_key_len]u8 = undefined;
+        const kul = try passwordToKey(c[0], "maplesyrup", &netsnmp_engine_id, &buf);
+        try testing.expectEqual(c[0].keyLen(), kul.len);
+        try testing.expectEqualSlices(u8, c[1], kul);
+    }
+}
+
+test "verify: an auth field of the WRONG protocol length -> BadAuthParams" {
+    // A 12-byte HMAC-*-96 field presented to an RFC 7860 protocol (and vice
+    // versa) must be rejected, not silently truncated-compared.
+    const msg = [_]u8{0xab} ** 96;
+    const key = [_]u8{0x11} ** max_key_len;
+    inline for (.{
+        .{ AuthProtocol.hmac_sha256, 12 },
+        .{ AuthProtocol.hmac_sha256, 32 },
+        .{ AuthProtocol.hmac_sha512, 12 },
+        .{ AuthProtocol.hmac_md5, 24 },
+        .{ AuthProtocol.hmac_sha224, 0 },
+    }) |case| {
+        const params: UsmSecurityParameters = .{
+            .engine_id = "",
+            .engine_boots = 0,
+            .engine_time = 0,
+            .user_name = "",
+            .auth_params = msg[0..case[1]],
+            .priv_params = "",
+        };
+        try testing.expectError(error.BadAuthParams, verify(case[0], &key, &msg, params));
+    }
+}
+
+test "computeDigestInto: truncation length is the protocol's, and is a real prefix" {
+    // Zero-length auth region at offset 0 over a message that is all zeros in
+    // that region: the streamed digest must equal a plain HMAC of the message,
+    // truncated to digestLen().
+    const key = [_]u8{0x5a} ** 32;
+    var msg: [64]u8 = undefined;
+    for (&msg, 0..) |*b, i| b.* = @intCast(i);
+    @memset(msg[8..][0..24], 0); // sha256's 24-byte auth region, already zero
+
+    var out: [max_digest_len]u8 = undefined;
+    const d = computeDigestInto(.hmac_sha256, &key, &msg, 8, &out);
+    try testing.expectEqual(@as(usize, 24), d.len);
+
+    var full: [hmac.Hmac(hash.sha2.Sha256).mac_length]u8 = undefined;
+    hmac.Hmac(hash.sha2.Sha256).create(&full, &msg, &key);
+    try testing.expectEqualSlices(u8, full[0..24], d);
 }
 
 test "verify: non-12-byte auth_params -> BadAuthParams" {

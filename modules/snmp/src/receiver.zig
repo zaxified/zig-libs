@@ -19,7 +19,8 @@
 //! as `Client`: `parseTrap` works on an in-memory datagram, and `Dispatcher`
 //! pairs a decoded event with a caller handler. Binding UDP/162 and the source
 //! address are the caller's concern (capture the peer in the handler's context).
-//! SNMPv3 / USM notifications are a follow-up (T-D…T-H).
+//! v3 notifications (authenticated Trap/Inform) are still a follow-up — this
+//! receiver is v1/v2c only; the v3 request path lives in `v3client`.
 
 const std = @import("std");
 const ber = @import("ber.zig");

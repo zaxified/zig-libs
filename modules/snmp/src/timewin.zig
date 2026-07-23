@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! USM time-window anti-replay — **T-H** (RFC 3414 §3.2 / §2.2.3). Pure integer
+//! USM time-window anti-replay (RFC 3414 §3.2 / §2.2.3). Pure integer
 //! logic: given a received `msgAuthoritativeEngineBoots` / `...EngineTime` and
 //! the locally held notion of the authoritative engine's boots/time, decide
 //! whether the message falls inside the ±150-second replay window.

@@ -38,6 +38,11 @@ pub const PduType = enum(u8) {
     inform_request = 0xa6,
     /// v2c only.
     trap_v2 = 0xa7,
+    /// Report-PDU (RFC 3416 §3 / RFC 3412 §6.8) — the SNMPv3 engine-to-engine
+    /// error channel: the USM discovery reply and every `usmStats*` failure
+    /// report arrive as this PDU. Structurally a `BasicPdu`. Classify its
+    /// varbind OID with the `report` layer; never treat it as a Response.
+    report = 0xa8,
 };
 
 /// error-status values: 0-5 from RFC 1157, 6-18 added by RFC 3416.
@@ -169,6 +174,7 @@ pub const Pdu = union(PduType) {
     get_bulk_request: BulkPdu,
     inform_request: BasicPdu,
     trap_v2: BasicPdu,
+    report: BasicPdu,
 };
 
 pub const Message = struct {
@@ -214,6 +220,7 @@ pub fn decodePdu(pdu_tlv: ber.Tlv) DecodeError!Pdu {
         @intFromEnum(PduType.get_bulk_request) => .{ .get_bulk_request = try parseBulk(pdu_tlv.content) },
         @intFromEnum(PduType.inform_request) => .{ .inform_request = try parseBasic(pdu_tlv.content) },
         @intFromEnum(PduType.trap_v2) => .{ .trap_v2 = try parseBasic(pdu_tlv.content) },
+        @intFromEnum(PduType.report) => .{ .report = try parseBasic(pdu_tlv.content) },
         else => return error.UnknownPduType,
     };
 }
@@ -624,9 +631,9 @@ test "malformed messages are typed errors" {
     const v3 = [_]u8{ 0x30, 0x06, 0x02, 0x01, 0x03, 0x04, 0x01, 'x' };
     try testing.expectError(error.UnsupportedVersion, decode(&v3));
 
-    // Unknown PDU tag (context 8).
+    // Unknown PDU tag (context 9 — context 8 is Report-PDU, which decodes).
     const bad_pdu = [_]u8{
-        0x30, 0x0a, 0x02, 0x01, 0x01, 0x04, 0x03, 'p', 'u', 'b', 0xa8, 0x00,
+        0x30, 0x0a, 0x02, 0x01, 0x01, 0x04, 0x03, 'p', 'u', 'b', 0xa9, 0x00,
     };
     try testing.expectError(error.UnknownPduType, decode(&bad_pdu));
 
@@ -702,4 +709,28 @@ test "garbage and truncation sweep: decode never panics" {
             }
         } else |_| {}
     }
+}
+
+test "Report-PDU [8] encodes and decodes as a BasicPdu (RFC 3416 §3)" {
+    var buf: [128]u8 = undefined;
+    const vbs = [_]VarBind{
+        // usmStatsUnknownEngineIDs.0
+        .{ .name = try Oid.parse("1.3.6.1.6.3.15.1.1.4.0"), .value = .{ .counter32 = 1 } },
+    };
+    const wire = try encode(&buf, .v2c, "public", .{
+        .type = .report,
+        .request_id = 4242,
+        .varbinds = &vbs,
+    });
+    // Context-constructed tag [8] = 0xa8.
+    try testing.expect(std.mem.indexOfScalar(u8, wire, 0xa8) != null);
+
+    const msg = try decode(wire);
+    const pdu = msg.pdu.report;
+    try testing.expectEqual(@as(i32, 4242), pdu.request_id);
+    var it = pdu.varbinds.iterator();
+    const vb = (try it.next()).?;
+    try testing.expectEqual(@as(u32, 1), vb.value.counter32);
+    const want = try Oid.parse("1.3.6.1.6.3.15.1.1.4.0");
+    try testing.expect(vb.name.eql(&want));
 }
