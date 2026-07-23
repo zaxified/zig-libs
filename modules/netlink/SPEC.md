@@ -319,9 +319,9 @@ the typed `RTNLGRP` vocabulary and the event decoder.
 **Protocol-parameterised transport: done.** `Socket.open` no longer hardcodes the protocol (see
 "The shared netlink transport" above); `conntrack`, `nftables` and `tc` have had their private
 copies of bind + portid capture + `NETLINK_EXT_ACK` + the `MSG_PEEK|MSG_TRUNC` growth loop
-deleted. **`genetlink` is the one remaining candidate** — it still carries its own copy and would
-collapse the same way (it also has the richest reverse-dependent set: `nl80211`, `ethtool`,
-`wireguard`), but it was owned by another work stream when this landed.
+deleted, and `genetlink` followed in the next wave (it has the richest reverse-dependent set:
+`nl80211`, `ethtool`, `wireguard`). **The consolidation is complete**: no module in the repo
+keeps a private copy of socket/bind/portid/`NETLINK_EXT_ACK`/`MSG_PEEK|MSG_TRUNC`.
 
 Write-path gaps listed under "Threat model / out of scope" above:
 `IFLA_INFO_DATA` for non-bridge kinds / veth peers, multipath routes, policy rules, and the bridge

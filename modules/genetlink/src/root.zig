@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: MIT
 //! genetlink — pure-Zig generic-netlink (genl) transport: the 4-byte
 //! `genlmsghdr` that sits between the `nlmsghdr` and the attributes,
-//! family-id resolution via the nlctrl family (`CTRL_CMD_GETFAMILY`), and a
-//! blocking `NETLINK_GENERIC` socket. Wire framing and TLV walking are
-//! reused from the `netlink` module's codec; this module only adds what
-//! genetlink puts on top.
+//! family-id resolution via the nlctrl family (`CTRL_CMD_GETFAMILY`),
+//! multicast group-id resolution (`CTRL_ATTR_MCAST_GROUPS`), and a blocking
+//! `NETLINK_GENERIC` socket. Wire framing, TLV walking **and the socket
+//! transport itself** are reused from the `netlink` module; this module only
+//! adds what genetlink puts on top.
 //!
 //! `genetlink` is to generic-netlink families (ethtool, devlink, nl80211,
 //! the `wireguard` family, …) what `netlink` is to rtnetlink: a
@@ -26,10 +27,13 @@
 //! const family_id = try sock.resolveFamily("wireguard");
 //! ```
 //!
-//! The socket mirrors `netlink.Socket`'s transport discipline (kernel-assigned
-//! portid, MSG_PEEK|MSG_TRUNC receive-buffer growth, non-kernel datagrams
-//! dropped) but speaks `NETLINK_GENERIC` and leaves request building beyond
-//! family resolution to the caller — genetlink payloads are family-specific.
+//! The socket **is** `netlink.Socket` opened with `openProtocol(…,
+//! NETLINK_GENERIC)`: socket creation, bind, kernel-assigned portid,
+//! `NETLINK_EXT_ACK`, the sequence counter, the `MSG_PEEK|MSG_TRUNC`
+//! receive-sizing loop and the extended-ACK capture all live there once, for
+//! every netlink protocol. This module keeps only the genl-specific layer and
+//! leaves request building beyond family/group resolution to the caller —
+//! genetlink payloads are family-specific.
 //!
 //! Provenance: clean-room from the kernel UAPI (`linux/genetlink.h`,
 //! GPL-2.0 WITH Linux-syscall-note — the command/attribute constants and
@@ -48,8 +52,8 @@ pub const meta = .{
     .platform = .linux, // AF_NETLINK raw syscalls — conscious ceiling
     .role = .client,
     .concurrency = .reentrant, // no globals; one Socket per thread/loop
-    .model_after = "netlink module's transport discipline + kernel UAPI linux/genetlink.h (nlctrl protocol)",
-    .deps = .{"netlink"}, // wire codec (nlmsghdr + nlattr TLV) is reused
+    .model_after = "netlink module's shared transport + kernel UAPI linux/genetlink.h (nlctrl protocol)",
+    .deps = .{"netlink"}, // wire codec (nlmsghdr + nlattr TLV) + the socket transport are reused
 };
 
 // ── kernel UAPI constants (linux/genetlink.h) ───────────────────────────────
@@ -66,6 +70,13 @@ pub const CTRL_CMD_GETFAMILY: u8 = 3;
 /// nlctrl attributes (CTRL_ATTR_*).
 pub const CTRL_ATTR_FAMILY_ID: u16 = 1;
 pub const CTRL_ATTR_FAMILY_NAME: u16 = 2;
+/// Nest of one sub-nest per multicast group the family publishes.
+pub const CTRL_ATTR_MCAST_GROUPS: u16 = 7;
+
+/// Attributes inside one entry of `CTRL_ATTR_MCAST_GROUPS`
+/// (`CTRL_ATTR_MCAST_GRP_*`).
+pub const CTRL_ATTR_MCAST_GRP_NAME: u16 = 1;
+pub const CTRL_ATTR_MCAST_GRP_ID: u16 = 2;
 
 /// GENL_NAMSIZ — family names incl. NUL. A longer CTRL_ATTR_FAMILY_NAME is
 /// rejected by the kernel's policy with EINVAL, so it is caught client-side.
@@ -119,6 +130,39 @@ pub fn buildGetFamilyRequest(
     return list.toOwnedSlice(gpa);
 }
 
+// ── multicast group resolution (pure half) ─────────────────────────────────
+
+/// Find the id of the multicast group named `want` in the attribute bytes of a
+/// `CTRL_CMD_NEWFAMILY` reply (i.e. the nlctrl payload past its own
+/// `genlmsghdr`). `null` = the family publishes no such group.
+///
+/// Pure — byte slices in, an id out — so it is golden-tested offline against a
+/// captured reply. `Socket.resolveMcastGroup` is the round-trip on top.
+///
+/// A group entry that carries a matching name but no id is a wire-format
+/// failure (`error.BadLength`): the kernel always emits both.
+pub fn findMcastGroupId(attr_bytes: []const u8, want: []const u8) codec.Error!?u32 {
+    var it: codec.AttrIterator = .{ .buf = attr_bytes };
+    while (try it.next()) |a| {
+        if (a.type != CTRL_ATTR_MCAST_GROUPS) continue;
+        var groups: codec.AttrIterator = .{ .buf = a.data };
+        while (try groups.next()) |g| {
+            var id: ?u32 = null;
+            var name: ?[]const u8 = null;
+            var inner: codec.AttrIterator = .{ .buf = g.data };
+            while (try inner.next()) |x| switch (x.type) {
+                CTRL_ATTR_MCAST_GRP_ID => id = try x.asU32(),
+                CTRL_ATTR_MCAST_GRP_NAME => name = x.asString(),
+                else => {},
+            };
+            if (name) |n| {
+                if (std.mem.eql(u8, n, want)) return id orelse return error.BadLength;
+            }
+        }
+    }
+    return null;
+}
+
 // ── socket transport ────────────────────────────────────────────────────────
 
 pub const OpenError = error{
@@ -136,6 +180,12 @@ pub const SendError = error{ SendFailed, AccessDenied, SystemResources };
 
 pub const RecvError = error{ OutOfMemory, RecvFailed, MalformedReply, SystemResources };
 
+/// `RecvError` with the two conditions `recvDatagram` folds away kept apart —
+/// `Overrun` (`ENOBUFS`: the kernel dropped messages, so an event stream must
+/// be resynchronised) and `WouldBlock` (`EAGAIN`: nothing queued, or
+/// `setRecvTimeout` expired). See `recvDatagramStrict`.
+pub const StrictRecvError = netlink.StrictRecvError;
+
 pub const ResolveError = error{
     OutOfMemory,
     SendFailed,
@@ -151,11 +201,35 @@ pub const ResolveError = error{
     Unexpected,
 };
 
-const initial_recv_buf_len = 8192;
-const max_recv_buf_len = 1 << 24;
+/// `ResolveError` plus the one outcome that is specific to group resolution:
+/// the family exists but publishes no group under that name (a kernel too old
+/// for it, or a typo).
+pub const McastGroupError = ResolveError || error{GroupNotFound};
+
+/// Map an nlctrl `NLMSG_ERROR` errno onto `ResolveError`.
+fn resolveErrorFromCode(code: i32) ResolveError {
+    return switch (@as(u32, @bitCast(-%code))) {
+        @intFromEnum(linux.E.NOENT) => error.FamilyNotFound,
+        @intFromEnum(linux.E.PERM),
+        @intFromEnum(linux.E.ACCES),
+        => error.AccessDenied,
+        @intFromEnum(linux.E.NOBUFS),
+        @intFromEnum(linux.E.NOMEM),
+        => error.SystemResources,
+        else => error.Unexpected,
+    };
+}
 
 /// A blocking `NETLINK_GENERIC` socket. One instance per thread/loop; no
 /// shared state.
+///
+/// The transport underneath is `netlink.Socket` (opened with
+/// `openProtocol(gpa, NETLINK_GENERIC)`) — this module carries no syscall
+/// discipline of its own. The state stays in this struct's own fields because
+/// they are part of the public API (`fd` for poll/epoll and `setsockopt`,
+/// `portid`/`seq` for consumers that walk replies themselves, `gpa` as the
+/// client allocator), so each operation materialises a transport view over
+/// them with `transport()` and writes the mutated half back with `sync()`.
 pub const Socket = struct {
     gpa: std.mem.Allocator,
     fd: i32,
@@ -165,160 +239,189 @@ pub const Socket = struct {
     seq: u32,
     /// Receive buffer; grown on demand (MSG_PEEK|MSG_TRUNC size probe).
     buf: []u8,
+    /// Last extended-ACK reason string from the kernel — see
+    /// `lastErrorMessage`. Sized and shaped by the shared transport.
+    ext_ack_buf: @FieldType(netlink.Socket, "ext_ack_buf") = @splat(0),
+    ext_ack_len: usize = 0,
+
+    /// Borrow this socket's state as the shared `netlink` transport. Cheap
+    /// (a struct copy); the borrow is always scoped to one operation.
+    fn transport(self: *const Socket) netlink.Socket {
+        return .{
+            .gpa = self.gpa,
+            .fd = self.fd,
+            .portid = self.portid,
+            .seq = self.seq,
+            .buf = self.buf,
+            .ext_ack_buf = self.ext_ack_buf,
+            .ext_ack_len = self.ext_ack_len,
+        };
+    }
+
+    /// Write a borrowed transport's mutable state back: `nextSeq` advances
+    /// `seq`, the receive path may have grown (reallocated) `buf`, and an
+    /// extended ACK may have been captured. `gpa`/`fd`/`portid` are fixed for
+    /// the socket's lifetime and need no write-back.
+    fn sync(self: *Socket, t: netlink.Socket) void {
+        self.seq = t.seq;
+        self.buf = t.buf;
+        self.ext_ack_buf = t.ext_ack_buf;
+        self.ext_ack_len = t.ext_ack_len;
+    }
 
     pub fn open(gpa: std.mem.Allocator) OpenError!Socket {
         if (comptime builtin.os.tag != .linux)
             @compileError("genetlink.Socket is Linux-only (AF_NETLINK raw syscalls)");
 
-        const rc = linux.socket(
-            linux.AF.NETLINK,
-            linux.SOCK.RAW | linux.SOCK.CLOEXEC,
-            linux.NETLINK.GENERIC,
-        );
-        switch (linux.errno(rc)) {
-            .SUCCESS => {},
-            .ACCES, .PERM => return error.AccessDenied,
-            .AFNOSUPPORT, .PROTONOSUPPORT => return error.ProtocolNotSupported,
-            .MFILE => return error.ProcessFdQuotaExceeded,
-            .NFILE => return error.SystemFdQuotaExceeded,
-            .NOBUFS, .NOMEM => return error.SystemResources,
-            else => return error.Unexpected,
-        }
-        const fd: i32 = @intCast(rc);
-        errdefer _ = linux.close(fd);
-
-        // pid 0 = let the kernel assign a unique port id.
-        const sa: linux.sockaddr.nl = .{ .pid = 0, .groups = 0 };
-        switch (linux.errno(linux.bind(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.nl)))) {
-            .SUCCESS => {},
-            .NOBUFS, .NOMEM => return error.SystemResources,
-            else => return error.Unexpected,
-        }
-        var bound: linux.sockaddr.nl = .{ .pid = 0, .groups = 0 };
-        var blen: linux.socklen_t = @sizeOf(linux.sockaddr.nl);
-        switch (linux.errno(linux.getsockname(fd, @ptrCast(&bound), &blen))) {
-            .SUCCESS => {},
-            else => return error.Unexpected,
-        }
-
-        const buf = try gpa.alloc(u8, initial_recv_buf_len);
-        return .{ .gpa = gpa, .fd = fd, .portid = bound.pid, .seq = 0, .buf = buf };
+        const t = try netlink.Socket.openProtocol(gpa, linux.NETLINK.GENERIC);
+        return .{
+            .gpa = t.gpa,
+            .fd = t.fd,
+            .portid = t.portid,
+            .seq = t.seq,
+            .buf = t.buf,
+            .ext_ack_buf = t.ext_ack_buf,
+            .ext_ack_len = t.ext_ack_len,
+        };
     }
 
     pub fn close(self: *Socket) void {
-        self.gpa.free(self.buf);
-        _ = linux.close(self.fd);
+        var t = self.transport();
+        t.close();
         self.* = undefined;
+    }
+
+    /// The raw file descriptor, for poll/epoll integration, `setsockopt`
+    /// (multicast membership) or `fcntl(O_NONBLOCK)`. Do not close it — that
+    /// is `close`'s job. Equivalent to reading the `fd` field.
+    pub fn handle(self: *const Socket) i32 {
+        return self.fd;
+    }
+
+    /// Bound how long a receive may block (`SO_RCVTIMEO`); 0 restores the
+    /// default of blocking forever. A timeout surfaces as
+    /// `StrictRecvError.WouldBlock` from `recvDatagramStrict`, and as
+    /// `RecvError.RecvFailed` from `recvDatagram`.
+    pub fn setRecvTimeout(self: *Socket, millis: u32) error{Unexpected}!void {
+        var t = self.transport();
+        defer self.sync(t);
+        return t.setRecvTimeout(millis);
+    }
+
+    /// The kernel's reason for the last failed request, from the extended ACK
+    /// (`NLMSGERR_ATTR_MSG`). Empty when the kernel attached none (pre-4.12
+    /// kernel, or an errno with no message). Valid until the next request on
+    /// this socket.
+    pub fn lastErrorMessage(self: *const Socket) []const u8 {
+        return self.ext_ack_buf[0..self.ext_ack_len];
     }
 
     /// Next request sequence number (never 0, so stale replies from an
     /// unbootstrapped state can't match).
     pub fn nextSeq(self: *Socket) u32 {
-        self.seq +%= 1;
-        if (self.seq == 0) self.seq = 1;
-        return self.seq;
+        var t = self.transport();
+        defer self.sync(t);
+        return t.nextSeq();
     }
 
     /// Send one complete netlink message to the kernel.
     pub fn send(self: *Socket, msg: []const u8) SendError!void {
-        const dst: linux.sockaddr.nl = .{ .pid = 0, .groups = 0 };
-        while (true) {
-            const rc = linux.sendto(
-                self.fd,
-                msg.ptr,
-                msg.len,
-                0,
-                @ptrCast(&dst),
-                @sizeOf(linux.sockaddr.nl),
-            );
-            switch (linux.errno(rc)) {
-                .SUCCESS => return,
-                .INTR => continue,
-                .NOBUFS, .NOMEM => return error.SystemResources,
-                .ACCES, .PERM => return error.AccessDenied,
-                else => return error.SendFailed,
-            }
-        }
+        var t = self.transport();
+        defer self.sync(t);
+        return t.send(msg);
     }
 
     /// Receive one whole datagram, growing `self.buf` as needed via a
     /// MSG_PEEK|MSG_TRUNC size probe. Datagrams not sent by the kernel
-    /// (sender pid != 0) are dropped.
+    /// (sender pid != 0) are dropped. The returned slice borrows this
+    /// socket's receive buffer and is valid only until the next call on it.
     pub fn recvDatagram(self: *Socket) RecvError![]const u8 {
-        while (true) {
-            const prc = linux.recvfrom(
-                self.fd,
-                self.buf.ptr,
-                self.buf.len,
-                linux.MSG.PEEK | linux.MSG.TRUNC,
-                null,
-                null,
-            );
-            switch (linux.errno(prc)) {
-                .SUCCESS => {},
-                .INTR => continue,
-                .NOBUFS, .NOMEM => return error.SystemResources,
-                else => return error.RecvFailed,
-            }
-            if (prc > self.buf.len) {
-                if (prc > max_recv_buf_len) return error.MalformedReply;
-                const new_len = std.mem.alignForward(usize, prc, initial_recv_buf_len);
-                self.buf = self.gpa.realloc(self.buf, new_len) catch return error.OutOfMemory;
-                continue; // re-probe; the datagram is still queued
-            }
+        var t = self.transport();
+        defer self.sync(t);
+        return t.recvDatagram();
+    }
 
-            var src: linux.sockaddr.nl = .{ .pid = 0, .groups = 0 };
-            var slen: linux.socklen_t = @sizeOf(linux.sockaddr.nl);
-            const rc = linux.recvfrom(self.fd, self.buf.ptr, self.buf.len, 0, @ptrCast(&src), &slen);
-            switch (linux.errno(rc)) {
-                .SUCCESS => {},
-                .INTR => continue,
-                .NOBUFS, .NOMEM => return error.SystemResources,
-                else => return error.RecvFailed,
-            }
-            if (slen >= @sizeOf(linux.sockaddr.nl) and src.pid != 0) continue; // not the kernel
-            return self.buf[0..rc];
-        }
+    /// `recvDatagram` for callers that need `Overrun` (`ENOBUFS` — the kernel
+    /// dropped messages, so an event subscription must resynchronise) and
+    /// `WouldBlock` (`EAGAIN` — nothing queued, or `setRecvTimeout` expired)
+    /// reported as themselves instead of folded onto
+    /// `SystemResources`/`RecvFailed`. Same discipline otherwise.
+    pub fn recvDatagramStrict(self: *Socket) StrictRecvError![]const u8 {
+        var t = self.transport();
+        defer self.sync(t);
+        return t.recvDatagramStrict();
     }
 
     /// Resolve a genetlink family name (e.g. "wireguard") to its dynamic
     /// message-type id via `CTRL_CMD_GETFAMILY`. Unprivileged.
     pub fn resolveFamily(self: *Socket, name: []const u8) ResolveError!u16 {
-        const seq = self.nextSeq();
-        const req = try buildGetFamilyRequest(self.gpa, seq, name);
-        defer self.gpa.free(req);
-        try self.send(req);
+        const id = (try self.ctrlGetFamily(name, null)) orelse return error.MalformedReply;
+        return @truncate(id);
+    }
 
-        var family_id: ?u16 = null;
+    /// Resolve one of `family`'s multicast group names (e.g. nl80211's
+    /// "scan", ethtool's "monitor") to its dynamic group id, over the same
+    /// `CTRL_CMD_GETFAMILY` round trip. Unprivileged — *joining* the group
+    /// (`NETLINK_ADD_MEMBERSHIP` on `fd`) may not be.
+    ///
+    /// `error.GroupNotFound` = the family resolved but publishes no group
+    /// under that name; `error.FamilyNotFound` = no such family.
+    pub fn resolveMcastGroup(
+        self: *Socket,
+        family: []const u8,
+        group: []const u8,
+    ) McastGroupError!u32 {
+        return (try self.ctrlGetFamily(family, group)) orelse error.GroupNotFound;
+    }
+
+    /// The one nlctrl round trip both resolvers share: send
+    /// `CTRL_CMD_GETFAMILY(family)`, then walk the replies until the ACK.
+    /// With `group == null` the answer is `CTRL_ATTR_FAMILY_ID`, otherwise the
+    /// id of that multicast group; `null` = the reply never carried it.
+    fn ctrlGetFamily(self: *Socket, family: []const u8, group: ?[]const u8) ResolveError!?u32 {
+        var t = self.transport();
+        defer self.sync(t);
+
+        const seq = t.nextSeq();
+        const req = try buildGetFamilyRequest(t.gpa, seq, family);
+        defer t.gpa.free(req);
+        try t.send(req);
+
+        var found: ?u32 = null;
         while (true) {
-            const dgram = try self.recvDatagram();
+            const dgram = try t.recvDatagram();
             var it: codec.MessageIterator = .{ .buf = dgram };
             while (it.next() catch return error.MalformedReply) |m| {
-                if (m.pid != self.portid or m.seq != seq) continue;
-                switch (m.type) {
-                    codec.NLMSG_ERROR => {
-                        const code = m.errorCode() catch return error.MalformedReply;
-                        if (code == 0) return family_id orelse error.MalformedReply; // ACK
-                        return switch (@as(u32, @bitCast(-%code))) {
-                            @intFromEnum(linux.E.NOENT) => error.FamilyNotFound,
-                            @intFromEnum(linux.E.PERM),
-                            @intFromEnum(linux.E.ACCES),
-                            => error.AccessDenied,
-                            @intFromEnum(linux.E.NOBUFS),
-                            @intFromEnum(linux.E.NOMEM),
-                            => error.SystemResources,
-                            else => error.Unexpected,
-                        };
+                // The shared dump triage: (portid, seq) matching, NLMSG_DONE /
+                // bare-ACK termination, NLMSG_OVERRUN and a short NLMSG_ERROR
+                // payload. `.restart` (NLM_F_DUMP_INTR) cannot reach a
+                // GETFAMILY-by-name — that is the kernel's doit path, not a
+                // dump — and a flagged reply is dropped rather than trusted.
+                switch (codec.classifyDumpMessage(m, t.portid, seq)) {
+                    .skip, .restart => {},
+                    .done => return found,
+                    .failed => |code| {
+                        t.captureExtAck(m);
+                        return resolveErrorFromCode(code);
                     },
-                    GENL_ID_CTRL => {
-                        const p = splitPayload(m.payload) catch return error.MalformedReply;
-                        var attrs: codec.AttrIterator = .{ .buf = p.attrs };
-                        while (attrs.next() catch return error.MalformedReply) |a| {
-                            if (a.type == CTRL_ATTR_FAMILY_ID)
-                                family_id = a.asU16() catch return error.MalformedReply;
+                    .overrun => return error.SystemResources,
+                    .malformed => return error.MalformedReply,
+                    .record => |rec| {
+                        if (rec.type != GENL_ID_CTRL) continue;
+                        const p = splitPayload(rec.payload) catch return error.MalformedReply;
+                        if (group) |want| {
+                            // Sticky: a later reply message that carries no
+                            // group nest must not erase an id already found.
+                            found = (findMcastGroupId(p.attrs, want) catch
+                                return error.MalformedReply) orelse found;
+                        } else {
+                            var attrs: codec.AttrIterator = .{ .buf = p.attrs };
+                            while (attrs.next() catch return error.MalformedReply) |a| {
+                                if (a.type == CTRL_ATTR_FAMILY_ID)
+                                    found = a.asU16() catch return error.MalformedReply;
+                            }
                         }
                     },
-                    else => {},
                 }
             }
         }
@@ -370,6 +473,67 @@ test "appendHeader encodes cmd/version with a zeroed reserved field" {
     try testing.expectEqualSlices(u8, &.{ 3, 1, 0, 0 }, list.items);
 }
 
+/// Build the `CTRL_ATTR_MCAST_GROUPS` half of a `CTRL_CMD_NEWFAMILY` reply:
+/// a nest of one sub-nest per group, each carrying NAME + ID.
+fn buildMcastGroupsAttrs(
+    gpa: std.mem.Allocator,
+    list: *std.ArrayList(u8),
+    groups: []const struct { name: []const u8, id: u32 },
+) !void {
+    // A sibling attribute before the nest, to prove the walker skips it.
+    try codec.appendAttrU16(gpa, list, CTRL_ATTR_FAMILY_ID, 0x1c);
+    const outer = try codec.nestBegin(gpa, list, CTRL_ATTR_MCAST_GROUPS);
+    for (groups, 1..) |g, idx| {
+        const inner = try codec.nestBegin(gpa, list, @intCast(idx));
+        try codec.appendAttrU32(gpa, list, CTRL_ATTR_MCAST_GRP_ID, g.id);
+        try codec.appendAttrString(gpa, list, CTRL_ATTR_MCAST_GRP_NAME, g.name);
+        codec.nestEnd(list, inner);
+    }
+    codec.nestEnd(list, outer);
+}
+
+test "findMcastGroupId picks the named group out of CTRL_ATTR_MCAST_GROUPS" {
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(testing.allocator);
+    try buildMcastGroupsAttrs(testing.allocator, &list, &.{
+        .{ .name = "config", .id = 5 },
+        .{ .name = "scan", .id = 6 },
+        .{ .name = "mlme", .id = 8 },
+    });
+
+    try testing.expectEqual(@as(?u32, 5), try findMcastGroupId(list.items, "config"));
+    try testing.expectEqual(@as(?u32, 6), try findMcastGroupId(list.items, "scan"));
+    try testing.expectEqual(@as(?u32, 8), try findMcastGroupId(list.items, "mlme"));
+    // Absent group, and a prefix of a real one, are both "not published".
+    try testing.expectEqual(@as(?u32, null), try findMcastGroupId(list.items, "vendor"));
+    try testing.expectEqual(@as(?u32, null), try findMcastGroupId(list.items, "sca"));
+    // A reply with no group nest at all.
+    try testing.expectEqual(@as(?u32, null), try findMcastGroupId(&.{}, "scan"));
+}
+
+test "findMcastGroupId rejects a matching group with no id" {
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(testing.allocator);
+    const outer = try codec.nestBegin(testing.allocator, &list, CTRL_ATTR_MCAST_GROUPS);
+    const inner = try codec.nestBegin(testing.allocator, &list, 1);
+    try codec.appendAttrString(testing.allocator, &list, CTRL_ATTR_MCAST_GRP_NAME, "scan");
+    codec.nestEnd(&list, inner);
+    codec.nestEnd(&list, outer);
+
+    try testing.expectError(error.BadLength, findMcastGroupId(list.items, "scan"));
+}
+
+test "findMcastGroupId reports a truncated nest instead of reading past it" {
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(testing.allocator);
+    try buildMcastGroupsAttrs(testing.allocator, &list, &.{.{ .name = "scan", .id = 6 }});
+    // Chop the last byte: the outer nest now claims more than is there.
+    try testing.expectError(
+        error.Truncated,
+        findMcastGroupId(list.items[0 .. list.items.len - 1], "scan"),
+    );
+}
+
 // ── integration tests (real kernel; unprivileged) ───────────────────────────
 
 test "integration: nlctrl family resolve (unprivileged)" {
@@ -385,4 +549,43 @@ test "integration: nlctrl family resolve (unprivileged)" {
     // nlctrl always resolves to itself.
     const ctrl = try sock.resolveFamily("nlctrl");
     try testing.expectEqual(GENL_ID_CTRL, ctrl);
+}
+
+test "integration: nlctrl multicast group resolve (unprivileged)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var sock = Socket.open(testing.allocator) catch return error.SkipZigTest;
+    defer sock.close();
+
+    // nlctrl publishes exactly one group, "notify" — the family-registration
+    // notification channel. Its id is dynamic; only "nonzero" is guaranteed.
+    const id = try sock.resolveMcastGroup("nlctrl", "notify");
+    try testing.expect(id != 0);
+
+    // A family that resolves but has no such group, and a family that does
+    // not resolve at all, are distinct errors.
+    try testing.expectError(error.GroupNotFound, sock.resolveMcastGroup("nlctrl", "zig-libs-nope"));
+    try testing.expectError(error.FamilyNotFound, sock.resolveMcastGroup("zig-libs-nope", "notify"));
+}
+
+test "integration: the shared transport seam is reachable on a genl socket" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var sock = Socket.open(testing.allocator) catch return error.SkipZigTest;
+    defer sock.close();
+
+    try testing.expect(sock.handle() >= 0);
+    try testing.expectEqual(sock.fd, sock.handle());
+    try testing.expect(sock.portid != 0);
+
+    // A bounded receive on an idle socket must time out rather than hang, and
+    // the two receive flavours must name that outcome differently.
+    try sock.setRecvTimeout(50);
+    try testing.expectError(error.WouldBlock, sock.recvDatagramStrict());
+    try testing.expectError(error.RecvFailed, sock.recvDatagram());
+
+    // The socket still works afterwards, and `seq` keeps advancing across
+    // both the raw seam and the resolvers.
+    try sock.setRecvTimeout(0);
+    const before = sock.nextSeq();
+    _ = try sock.resolveFamily("nlctrl");
+    try testing.expect(sock.seq > before);
 }
