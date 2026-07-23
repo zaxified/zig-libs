@@ -50,6 +50,7 @@ const module_list = [_]Module{
     .{ .name = "genetlink", .deps = &.{"netlink"} },
     .{ .name = "nl80211", .deps = &.{ "genetlink", "netlink" } },
     .{ .name = "ethtool", .deps = &.{ "genetlink", "netlink" } },
+    .{ .name = "devlink", .deps = &.{ "genetlink", "netlink" } },
     .{ .name = "decimal" },
     .{ .name = "seqmap" },
     .{ .name = "icmp", .deps = &.{ "seqmap", "netaddr" } },
