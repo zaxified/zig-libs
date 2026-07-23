@@ -11,7 +11,7 @@ cross-project-reusable capability — a production-grade implementation of a pro
 or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
 authors' other projects depend on it, not the reverse.
 
-**Status:** 185 modules · 7230 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 187 modules · 7230 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ## Using a module
@@ -130,6 +130,8 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `s7comm` | Siemens S7 communication — ISO-on-TCP (RFC 1006 TPKT + COTP) plus the S7 protocol: connection setup, area read/write (DB/M/I/Q/T/C), PLC info and cyclic services | any | — |
 | `enip` | EtherNet/IP + CIP — encapsulation layer (register/unregister session, SendRRData/SendUnitData), CIP messaging (Get/Set Attribute, Multiple Service Packet), connection manager, and a tag/symbolic path client for Logix-class controllers | any | netaddr |
 | `iec61850` | IEC 61850 substation automation — MMS (ISO 9506) client over ISO-on-TCP with the ACSI object model, plus GOOSE publish/subscribe encoding and SV sampled values | any | — |
+| `fleetsim` | In-process simulated device fleet — hosts many protocol responders (Modbus, DNP3, IEC 104, S7comm, BACnet, EtherNet/IP, OPC UA) as addressable nodes on one deterministic, time-injected scheduler | any | modbus, dnp3, iec104, s7comm, bacnet, enip, opcua, netsim |
+| `smtp` | SMTP client (RFC 5321) — ESMTP EHLO capability negotiation, STARTTLS seam, AUTH PLAIN/LOGIN, pipelining, and MIME message composition (RFC 5322/2045) | any | netaddr |
 | `iec104` | IEC 60870-5-104 telecontrol — APCI/APDU framing, I/S/U formats with k/w flow control, ASDU codec for the common type IDs, and a transport-agnostic master (controlling station) | any | — |
 | `modbus` | Modbus TCP (MBAP) + RTU (CRC-16) codec, master client **and slave server** — core function codes, diagnostics, exceptions, broadcast/unit-id semantics, transport-agnostic seam | any | — |
 | `mqtt` | MQTT 3.1.1 client — all 14 control packets, QoS 0/1/2 state machine, topic-filter wildcards, transport-agnostic seam | any | — |
