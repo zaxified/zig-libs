@@ -11,7 +11,7 @@ cross-project-reusable capability — a production-grade implementation of a pro
 or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
 authors' other projects depend on it, not the reverse.
 
-**Status:** 182 modules · 6600 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 183 modules · 6600 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ## Using a module
@@ -127,6 +127,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `nftables` | Typed firewall-ruleset builder → libnftables JSON for `nft -j -f -` (families/chains/rules/sets, match + verdict statements) | any (apply: linux) | — |
 | `bacnet` | BACnet/IP building automation — BVLL/BVLC framing, NPDU routing header, APDU services (ReadProperty, ReadPropertyMultiple, WriteProperty, WhoIs/IAm, COV subscription), and the ASN.1-style primitive encoding | any | netaddr |
 | `s7comm` | Siemens S7 communication — ISO-on-TCP (RFC 1006 TPKT + COTP) plus the S7 protocol: connection setup, area read/write (DB/M/I/Q/T/C), PLC info and cyclic services | any | — |
+| `enip` | EtherNet/IP + CIP — encapsulation layer (register/unregister session, SendRRData/SendUnitData), CIP messaging (Get/Set Attribute, Multiple Service Packet), connection manager, and a tag/symbolic path client for Logix-class controllers | any | netaddr |
 | `iec104` | IEC 60870-5-104 telecontrol — APCI/APDU framing, I/S/U formats with k/w flow control, ASDU codec for the common type IDs, and a transport-agnostic master (controlling station) | any | — |
 | `modbus` | Modbus TCP (MBAP) + RTU (CRC-16) codec + master client — core function codes, exceptions, transport-agnostic seam | any | — |
 | `mqtt` | MQTT 3.1.1 client — all 14 control packets, QoS 0/1/2 state machine, topic-filter wildcards, transport-agnostic seam | any | — |
