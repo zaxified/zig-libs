@@ -54,7 +54,6 @@
 
 const std = @import("std");
 const x509 = @import("x509");
-const ber = @import("ber.zig");
 const rsa = @import("rsa");
 
 const Certificate = std.crypto.Certificate;
@@ -160,59 +159,14 @@ pub const CertificateFacts = struct {
     version: Certificate.Version = .v3,
 };
 
-/// Deepest DER nesting `structurallySafe` will walk. X.509 certificates in
-/// practice nest six or seven levels; anything deeper is either an attack or
-/// something this module has no business inspecting.
-const max_der_depth = 24;
-
-/// Recursively require every TLV in `bytes` to be readable and to tile its
-/// container exactly. `ber.read` bounds-checks each content slice, so a
-/// buffer that survives this cannot contain a length that overruns.
-fn derTilesExactly(bytes: []const u8, depth: usize) bool {
-    if (depth > max_der_depth) return false;
-    var it = ber.iterate(bytes);
-    while (it.next() catch return false) |e| {
-        if (e.isConstructed() and e.content.len != 0) {
-            if (!derTilesExactly(e.content, depth + 1)) return false;
-        }
-    }
-    return it.pos == bytes.len;
-}
-
-/// Pre-flight guard in front of `std.crypto.Certificate.parse`.
-///
-/// **This is not belt-and-braces, it is required.** `std.crypto.Certificate.der.Element.parse`
-/// reads its identifier octet without checking the index against the buffer
-/// length and derives a content slice purely from the encoded length, so a
-/// truncated or malformed certificate makes std's own parser index out of
-/// bounds and abort the process rather than return an error. The sibling
-/// `x509` module documents the same hazard and wraps every walk of its own
-/// for that reason. This function establishes the invariant std assumes:
-/// strict DER, every TLV in bounds and tiling its parent exactly, an outer
-/// `Certificate ::= SEQUENCE` filling the buffer with its three members
-/// present, and a `tbsCertificate` carrying at least the seven fields std
-/// walks unconditionally.
-///
-/// The cost is strictness: a certificate using a non-minimal length encoding
-/// or a high-tag-number identifier is rejected here even though it might
-/// parse elsewhere. Neither appears in DER-conformant X.509.
-fn structurallySafe(der_bytes: []const u8) bool {
-    const outer = ber.read(der_bytes) catch return false;
-    if (outer.tag != 0x30 or outer.encoded_len != der_bytes.len) return false;
-    if (!derTilesExactly(outer.content, 1)) return false;
-
-    var it = ber.iterate(outer.content);
-    const tbs = (it.next() catch return false) orelse return false;
-    if (tbs.tag != 0x30) return false;
-    _ = (it.next() catch return false) orelse return false; // signatureAlgorithm
-    _ = (it.next() catch return false) orelse return false; // signatureValue
-
-    var fields: usize = 0;
-    var tbs_it = ber.iterate(tbs.content);
-    while (tbs_it.next() catch return false) |_| fields += 1;
-    // version, serialNumber, signature, issuer, validity, subject, spki.
-    return fields >= 7;
-}
+// The pre-flight guard that used to live here (`structurallySafe` /
+// `derTilesExactly`, found necessary by fuzzing) has moved to the shared
+// `x509.safe` helper — `std.crypto.Certificate`'s DER reader is unchecked and
+// panics / reads out of bounds on a malformed, attacker-supplied certificate,
+// and three modules independently guarded against it. `inspectCertificate`
+// below now parses the certificate through `x509.safe.safeCertificate`, which
+// validates well-formedness and returns a zero-padded copy that is safe to
+// hand to std's parser. See `x509/src/safe.zig` and this module's `SPEC.md`.
 
 pub const InspectError = error{
     /// The DER did not parse as an X.509 certificate at all.
@@ -225,8 +179,11 @@ pub const InspectError = error{
 /// base fields and the sibling `x509` module for the extensions std does not
 /// expose (keyUsage, extKeyUsage, basicConstraints).
 pub fn inspectCertificate(der_bytes: []const u8, want: x509.extensions.Purpose) InspectError!CertificateFacts {
-    if (!structurallySafe(der_bytes)) return error.MalformedCertificate;
-    const cert: Certificate = .{ .buffer = der_bytes, .index = 0 };
+    // Guard `std.crypto.Certificate.parse` against its unchecked DER reader via
+    // the shared `x509.safe` helper: validate well-formedness and parse a
+    // zero-padded copy so a hostile certificate is a typed error, never a crash.
+    var scratch: [x509.safe.max_certificate_len + x509.safe.parse_slack]u8 = undefined;
+    const cert = x509.safe.safeCertificate(der_bytes, &scratch) catch return error.MalformedCertificate;
     const parsed = cert.parse() catch return error.MalformedCertificate;
 
     var facts: CertificateFacts = .{

@@ -122,6 +122,16 @@ const std = @import("std");
 pub const extensions = @import("extensions.zig");
 pub const chain = @import("chain.zig");
 
+/// Certificate-DER safety guard: a recursive-descent DER well-formedness
+/// validator (`safe.validate` / `safe.validateCertificate`) plus
+/// `safe.safeCertificate`, which returns a validated, zero-padded
+/// `std.crypto.Certificate` that is safe to hand to `std.crypto.Certificate.parse`
+/// without risk of the panic / out-of-bounds read std's unchecked DER reader
+/// exhibits on a malformed, attacker-supplied certificate. This is the shared
+/// home for the guard the `iec62351` and `opcua` modules route through — see
+/// `safe.zig`'s doc comment and `SPEC.md`.
+pub const safe = @import("safe.zig");
+
 /// Re-exported at the top level for ergonomic `x509.verifyChain(...)` — the
 /// module's single most important entry point once implemented.
 pub const verifyChain = chain.verifyChain;
@@ -145,4 +155,5 @@ pub const meta = .{
 test {
     _ = extensions;
     _ = chain;
+    _ = safe;
 }

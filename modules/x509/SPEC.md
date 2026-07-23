@@ -50,6 +50,63 @@ state machine — most TLS/mTLS/OPC-UA deployments don't rely on policy OIDs).
 A consumer needing either must add it explicitly; `verifyChain` must never
 be mistaken for covering them.
 
+## `safe.zig` — the shared certificate-DER safety guard
+
+`safe.zig` is the canonical home for guarding `std.crypto.Certificate.parse`
+against its own unchecked DER reader, consolidating three previously
+independent copies (`x509`'s per-element `extensions.parseElement`, which
+stays for the per-field walks that need it; `iec62351`'s
+`tlsprofile.structurallySafe`; and `opcua`'s `security.safeCertificate`).
+Both `iec62351` and `opcua` now route through it.
+
+**The hazard.** `std.crypto.Certificate.der.Element.parse` reads its
+identifier/length octets with plain `bytes[i]` indexing and computes an
+element's end as `start + declared_length` without clamping it to the buffer.
+`Certificate.parse` then walks the tbsCertificate field by field and at
+several points probes for an OPTIONAL sibling at a boundary without first
+checking a byte exists there. On a malformed, attacker-supplied certificate
+(a TLS/OPC-UA/GOOSE peer certificate is fully attacker-controlled) this
+indexes past the buffer. **Verified on Zig 0.16.0 out of band**: in **Debug**
+it panics (`index out of bounds`, aborting the process); in **ReleaseFast**
+the same inputs either read out of bounds *silently* — returning a `Parsed`
+built from whatever lay past the buffer — or segfault. Reproductions used for
+the regression test: `30 02 30 00` (`SEQUENCE { SEQUENCE {} }`) panics at
+`Certificate.zig:905` in Debug and reads OOB (returns a bogus "parsed OK") in
+ReleaseFast; `30 82` (truncated length) segfaults in ReleaseFast.
+
+**Public surface.**
+
+- `safe.validate(bytes)` / `safe.validateCertificate(bytes)` — a
+  recursive-descent DER well-formedness validator with its own bounds-checked
+  header decoder (it does *not* trust std's reader). Returns a typed
+  `safe.Error` for a length that overruns its container, a truncated tag or
+  length, a length-of-length that itself overruns, an indefinite-length
+  encoding (BER, illegal in DER), a high-tag-number identifier, a
+  length-of-length beyond four octets, or nesting past `safe.max_depth` (32).
+  `validateCertificate` additionally requires a single outer `SEQUENCE`
+  filling the buffer.
+- `safe.safeCertificate(der, scratch)` — validate, copy into caller scratch,
+  zero-pad by `safe.parse_slack` (64), and return a `std.crypto.Certificate`
+  safe to `parse`. `safe.max_certificate_len` (8192) bounds the input so a
+  caller can size `[max_certificate_len + parse_slack]u8` on the stack.
+
+**Why the zero-padded copy is kept, not dropped.** Well-formedness is
+necessary but **not sufficient** to make `std.crypto.Certificate.parse`
+total, so the scratch-copy convenience is required rather than optional. The
+well-formed input `30 02 30 00` passes `validateCertificate`, yet std, having
+consumed the empty inner element as the tbsCertificate, then parses the next
+field at the buffer boundary and indexes off the end (the Debug panic /
+ReleaseFast OOB read above). The `parse_slack` zero bytes behind a validated
+copy turn every such boundary probe into an empty `00 00` TLV read out of the
+padding; because every loop std runs is bounded by an element end the
+validator already proved in-bounds, a bounded number of probes cannot walk
+through 64 zero bytes. With the guard, `30 02 30 00` yields a clean
+`error.CertificateFieldHasWrongDataType` in **both** Debug and ReleaseFast
+(verified). `safe.zig`'s tests take the union of the three former guards'
+coverage — every-prefix and every-single-byte-mutation sweeps of a real
+fixture certificate, a `std.testing.fuzz` walk, explicit hostile shapes, and
+a regression test pinned to the reproduced std hazard.
+
 ## Threat model / out of scope
 
 Both `extensions.zig` and `chain.zig` parse attacker-controlled bytes (a
@@ -108,6 +165,10 @@ signature algorithm (RSA PKCS1v15, RSASSA-PSS, ECDSA P-256, ECDSA P-384,
 Ed25519) and dedicated rejection-case hierarchies (expired/not-yet-valid,
 name-constraint violation, non-CA issuer, pathLenConstraint exceeded,
 self-issued not counted, tampered signature, EKU mismatch, unknown anchor).
+
+`safe.zig`: **DONE** — `validate`/`validateCertificate`/`safeCertificate`
+plus the union test suite described under "the shared certificate-DER safety
+guard" above (`zig build test-x509`, green in Debug and ReleaseFast).
 
 Not implemented, and not silently skipped (see "Explicitly out of scope"
 above): CRL/OCSP revocation checking, certificate-policy processing

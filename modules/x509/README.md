@@ -102,6 +102,26 @@ goes through `extensions.parseElement`, a bounds-safe wrapper that turns a
 malformed length field into a typed error instead of an out-of-bounds panic
 (see `src/root.zig`'s doc comment).
 
+## `x509.safe` — certificate-DER safety guard
+
+The canonical guard in front of `std.crypto.Certificate.parse`, whose
+unchecked DER reader **panics in Debug and reads out of bounds / segfaults in
+ReleaseFast** on a malformed, attacker-supplied certificate (verified on Zig
+0.16.0). `safe.validate` / `safe.validateCertificate` are a recursive-descent
+DER well-formedness validator (its own bounds-checked decoder — it does not
+trust std's reader) returning a typed `safe.Error`. `safe.safeCertificate(der,
+scratch)` validates, then returns a zero-padded `std.crypto.Certificate` that
+is safe to `parse` in every optimisation mode — the padding is required
+because well-formedness alone does not make std's parse total (`SPEC.md`
+gives the proof). This is the shared helper the `iec62351` and `opcua`
+modules route through instead of each carrying its own copy.
+
+```zig
+var scratch: [x509.safe.max_certificate_len + x509.safe.parse_slack]u8 = undefined;
+const cert = try x509.safe.safeCertificate(peer_cert_der, &scratch);
+const parsed = try cert.parse(); // total: a hostile cert is a typed error, never a crash
+```
+
 ## Provenance
 
 Clean-room implementation from RFC 5280 (X.509 v3 / PKIX Certificate and CRL

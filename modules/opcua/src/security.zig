@@ -65,6 +65,7 @@
 
 const std = @import("std");
 const rsa = @import("rsa");
+const x509 = @import("x509");
 const encoding = @import("encoding.zig");
 const services = @import("services.zig");
 
@@ -300,79 +301,24 @@ pub const CertificatePublicKeyError = error{InvalidCertificate};
 /// Largest certificate the two parsing helpers below will look at. A 2048-bit
 /// OPC UA application certificate is ~900 bytes and a 4096-bit one ~1.6 kB, so
 /// this is generous; the point of a bound at all is that the parse runs in a
-/// fixed-size scratch buffer (see `safeCertificate`).
-pub const max_parsed_certificate_len: usize = 8192;
+/// fixed-size scratch buffer. Aliased to the shared `x509.safe` bound this
+/// module now routes through (kept public for source compatibility).
+pub const max_parsed_certificate_len: usize = x509.safe.max_certificate_len;
 
-/// Zero bytes appended behind the certificate in `safeCertificate`'s scratch
-/// buffer. See that function for why they exist and why this many is enough.
-const der_parse_slack: usize = 64;
-
-const DerWalkError = error{Malformed};
-
-/// Recursively check that `bytes[start..end)` is an exact tiling of
-/// well-formed DER TLVs, every length inside its parent, no indefinite
-/// lengths and no multi-byte tags (neither occurs in DER X.509).
-///
-/// **Why this exists.** `std.crypto.Certificate`'s `der.Element.parse` reads
-/// `bytes[i]`/`bytes[i+1]` *without a bounds check* and computes
-/// `end = start + declared_length` without clamping — feed it a truncated or
-/// hostile certificate and it panics (index out of bounds), which on a server
-/// is a remote crash triggered by an attacker-supplied `SenderCertificate`.
-/// This walk is the precondition that makes that parser safe: afterwards every
-/// element boundary std can reach is known to be inside the buffer.
-fn walkDer(bytes: []const u8, start: usize, end: usize, depth: u8) DerWalkError!void {
-    if (depth == 0) return error.Malformed;
-    var i = start;
-    while (i < end) {
-        if (i + 2 > end) return error.Malformed;
-        const tag = bytes[i];
-        if (tag & 0x1f == 0x1f) return error.Malformed; // multi-byte tag
-        const constructed = tag & 0x20 != 0;
-        var j = i + 1;
-        const size_byte = bytes[j];
-        j += 1;
-        var content_len: usize = undefined;
-        if (size_byte & 0x80 == 0) {
-            content_len = size_byte;
-        } else {
-            const n: usize = size_byte & 0x7f;
-            // 0 = indefinite length (BER only); > 4 is more than the
-            // `u32` std's parser computes lengths in.
-            if (n == 0 or n > 4) return error.Malformed;
-            if (j + n > end) return error.Malformed;
-            content_len = 0;
-            for (bytes[j..][0..n]) |b| content_len = (content_len << 8) | b;
-            j += n;
-        }
-        if (content_len > end - j) return error.Malformed;
-        const content_end = j + content_len;
-        if (constructed) try walkDer(bytes, j, content_end, depth - 1);
-        i = content_end;
-    }
-    return;
-}
+/// Zero bytes appended behind the certificate in the scratch buffer.
+const der_parse_slack: usize = x509.safe.parse_slack;
 
 /// Validate `certificate_der` and return a `std.crypto.Certificate` over a
 /// zero-padded copy of it in `scratch`, safe to hand to std's parser.
 ///
-/// Two guarantees together make the parse total:
-///  1. `walkDer` proves every element boundary *inside* the certificate is in
-///     bounds, so no declared length can send the parser off the end;
-///  2. the 64 zero bytes behind it absorb the parser's *sibling probes* —
-///     the places it parses at `some_element.slice.end` without first
-///     checking that a next sibling exists (a certificate with a 6-element
-///     `tbsCertificate`, an `AttributeTypeAndValue` with one child, an
-///     extension with no value…). Each such probe starts no further than one
-///     byte past a validated boundary and reads a `00 00` TLV out of the
-///     padding, i.e. an empty element two bytes further on; the parser makes
-///     at most a handful of these in a row and every loop it runs is bounded
-///     by a validated end, so 64 bytes cannot be walked through.
+/// The guard itself — a recursive DER well-formedness walk plus the zero
+/// padding that absorbs std's boundary probes — is the shared `x509.safe`
+/// helper now; `std.crypto.Certificate`'s unchecked DER reader panics / reads
+/// out of bounds on a hostile, attacker-supplied `SenderCertificate`, and this
+/// was one of three modules that grew its own guard against it. See
+/// `x509/src/safe.zig` and this module's `SPEC.md`.
 fn safeCertificate(certificate_der: []const u8, scratch: []u8) CertificatePublicKeyError!std.crypto.Certificate {
-    if (certificate_der.len == 0 or certificate_der.len > max_parsed_certificate_len) return error.InvalidCertificate;
-    walkDer(certificate_der, 0, certificate_der.len, 32) catch return error.InvalidCertificate;
-    @memcpy(scratch[0..certificate_der.len], certificate_der);
-    @memset(scratch[certificate_der.len..][0..der_parse_slack], 0);
-    return .{ .buffer = scratch[0 .. certificate_der.len + der_parse_slack], .index = 0 };
+    return x509.safe.safeCertificate(certificate_der, scratch) catch return error.InvalidCertificate;
 }
 
 /// Extract the RSA public key from a DER X.509 certificate — std's

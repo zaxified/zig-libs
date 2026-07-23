@@ -92,18 +92,19 @@ Being stricter than a general decoder is a feature here: one encoding maps to
 one length, so a re-encode is byte-exact and a length that overruns is a typed
 error.
 
-### `structurallySafe` in front of `std.crypto.Certificate.parse`
+### Guarding `std.crypto.Certificate.parse` (via the shared `x509.safe` helper)
 
 `std.crypto.Certificate.der.Element.parse` reads its identifier octet without
 checking the index against the buffer length, and derives a content slice from
 the encoded length without validating it. **The fuzz test found this the first
 time it ran**: `inspectCertificate(&.{})` aborted the process inside std rather
-than returning an error. `tlsprofile.structurallySafe` therefore establishes
-the invariant std assumes before std is called — outer `SEQUENCE` filling the
-buffer, three members present, `tbsCertificate` carrying at least the seven
-fields std walks unconditionally, and every TLV in the tree in bounds and
-tiling its parent exactly (depth-capped at 24). The sibling `x509` module
-documents the same std hazard and wraps its own walks for the same reason.
+than returning an error. The guard that used to live here
+(`tlsprofile.structurallySafe`) has moved to the shared **`x509.safe`** helper,
+which three modules independently needed; `inspectCertificate` now parses the
+certificate through `x509.safe.safeCertificate`, which validates DER
+well-formedness and hands std a validated, zero-padded copy so a hostile
+certificate is a typed `MalformedCertificate`, never a crash. See
+`modules/x509/src/safe.zig` and `modules/x509/SPEC.md`.
 
 ### The escape seams
 
