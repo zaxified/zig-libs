@@ -83,6 +83,7 @@ const module_list = [_]Module{
     .{ .name = "netconf", .deps = &.{ "ssh", "xml" } },
     .{ .name = "nftables", .deps = &.{"netlink"} },
     .{ .name = "modbus" },
+    .{ .name = "iec104" },
     .{ .name = "whois", .deps = &.{"netaddr"} },
     .{ .name = "uci" },
     .{ .name = "mqtt" },

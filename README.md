@@ -11,7 +11,7 @@ cross-project-reusable capability — a production-grade implementation of a pro
 or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
 authors' other projects depend on it, not the reverse.
 
-**Status:** 179 modules · 6043 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 180 modules · 6043 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ## Using a module
@@ -125,6 +125,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `wireguard` | Native WireGuard device config over genetlink — get/set device, peers, allowed-ips (retires `wg` shell-outs) | **linux** | netlink, genetlink |
 | `tc` | Traffic control over rtnetlink — attach/replace/remove the **netem** qdisc (delay/jitter/loss/duplicate/reorder/corrupt/rate) as an interface's root, read-back verify (retires `tc` shell-outs) | **linux** | netlink |
 | `nftables` | Typed firewall-ruleset builder → libnftables JSON for `nft -j -f -` (families/chains/rules/sets, match + verdict statements) | any (apply: linux) | — |
+| `iec104` | IEC 60870-5-104 telecontrol — APCI/APDU framing, I/S/U formats with k/w flow control, ASDU codec for the common type IDs, and a transport-agnostic master (controlling station) | any | — |
 | `modbus` | Modbus TCP (MBAP) + RTU (CRC-16) codec + master client — core function codes, exceptions, transport-agnostic seam | any | — |
 | `mqtt` | MQTT 3.1.1 client — all 14 control packets, QoS 0/1/2 state machine, topic-filter wildcards, transport-agnostic seam | any | — |
 | `coap` | CoAP (RFC 7252) — a full client/server stack: message codec (header/token/**delta-encoded options**/payload), `options` (registry, CoAP uint, **URI ↔ options** §6), `reliability` (CON **retransmission** §4.2 + message-ID **dedup** §4.5), `client` (URI→request + reply correlation), `server` (dispatch + piggyback/separate responses). Zero-alloc, transport-/clock-agnostic (block-wise + observe are follow-ups) | any | — |
