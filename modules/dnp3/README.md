@@ -179,7 +179,23 @@ var out: [4096]u8 = undefined;
 if (try session.feedFrame(frame_bytes, now_ms, &out)) |reply_frames| {
     // write `reply_frames` to the socket
 }
+
+// Outstation-initiated traffic, framed by the same session (so the transport
+// sequence number stays consistent with the solicited path):
+if (try session.nextFrames(now_ms, &out)) |more| { /* next response fragment */ }
+if (try session.unsolicitedFrames(now_ms, &out)) |uns| { /* unsolicited response */ }
 ```
+
+`Session` frames all three directions the outstation can speak: replies to a
+request (`feedFrame`), the continuation fragments of a multi-fragment response
+(`nextFrames`) and unsolicited responses (`unsolicitedFrames`). All three share
+`Session.tx_seq`, so a caller never has to reach past `Session` into
+`link`/`transport` — doing that means duplicating the sequence bookkeeping,
+which is exactly what confuses a master's reassembler. `unsolicitedFrames`
+returns `null` whenever `Outstation.unsolicited` has nothing to send (feature
+disabled, one already awaiting confirmation, no events in an enabled class, or
+an unacknowledged restart); the retry policy stays the caller's via
+`Outstation.confirmTimedOut`.
 
 Responses are built/parsed symmetrically with
 `application.encodeResponseHeader`/`decodeResponseHeader` plus the relevant
@@ -196,7 +212,7 @@ zig build test-dnp3 -Doptimize=ReleaseFast
 zig fmt --check modules/dnp3
 ```
 
-126 offline tests: DNP3 CRC-16 known-answer vectors (the reveng
+127 offline tests: DNP3 CRC-16 known-answer vectors (the reveng
 CRC-catalogue "CRC-16/DNP" check value plus additional vectors cross-checked
 against an independent from-scratch bit-serial CRC reference — see SPEC.md),
 data-link frame round-trips (empty/short/exact-block-boundary/multi-block user

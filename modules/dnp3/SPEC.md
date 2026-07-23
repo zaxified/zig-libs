@@ -39,6 +39,13 @@ Six allocation-free layers, all offline-testable, mirroring IEEE 1815-2012's own
   function from one application fragment to one application fragment over a caller-owned
   `Database` (seven slices of point structs) and a caller-owned `EventBuffer`. `Session` composes
   it with `transport.Reassembler`/`Segmenter` and `link` so a caller can feed whole frames.
+  `Session` frames all three outbound directions — `feedFrame` (a reply to a request),
+  `nextFrames` (the continuation of a multi-fragment response) and `unsolicitedFrames` (an
+  outstation-initiated unsolicited response) — because all three share `Session.tx_seq`, and a
+  caller that frames an outstation-initiated fragment itself has to duplicate that sequence
+  bookkeeping. `unsolicitedFrames` was added after `fleetsim`'s DNP3 adapter did exactly that
+  re-implementation over the public `link`/`transport` API; it is additive, and the fragment-level
+  `Outstation.unsolicited` is unchanged for callers that own their own framing.
   Everything time-dependent — the select-before-operate window, the confirm timeout — is driven by
   an injected `now_ms` or by an explicit `confirmTimedOut()` call; the module owns no clock and
   spawns no thread.
@@ -160,7 +167,7 @@ derivation (the GMAC primitive is provided and KAT-validated; the caller supplie
 
 ## Verification
 
-126 offline tests (`zig build test-dnp3`, green in Debug + ReleaseFast; `zig fmt --check` clean).
+127 offline tests (`zig build test-dnp3`, green in Debug + ReleaseFast; `zig fmt --check` clean).
 Breakdown: `link` (11) — CRC catalogue + KAT vectors, control-octet round-trip, frame round-trips
 (empty/short/multi-block/exact-16-byte-boundary user data), encode/decode error paths including a
 malformed-input sweep; `transport` (9) — transport-octet round-trip, empty-fragment/single-segment/
@@ -196,7 +203,8 @@ nonexistent and command-less points, analog output bounds, hook veto), DELAY_MEA
 (refused and allowed), ENABLE/DISABLE_UNSOLICITED, unsolicited responses, freeze and freeze-clear,
 ASSIGN_CLASS, fragmentation (FIR/FIN/SEQ across a series, and a new request abandoning one),
 `Session` (link-service replies, a request split across transport segments, out-of-order segments,
-bad CRC), hostile input, and two fuzz loops; `goldens` (5) — the captured-session replays.
+bad CRC, `unsolicitedFrames` framing an outstation-initiated response and advancing `tx_seq`),
+hostile input, and two fuzz loops; `goldens` (5) — the captured-session replays.
 
 **Interop (2026-07-23).** The captures in `src/goldens.zig` were taken against **opendnp3**
 (Apache-2.0, `release` branch, built from source in this sandbox) used strictly as a black-box

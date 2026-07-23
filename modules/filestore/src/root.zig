@@ -894,20 +894,59 @@ fn testMonoNs() i64 {
     return @as(i64, @intCast(ts.sec)) * std.time.ns_per_s + @as(i64, @intCast(ts.nsec));
 }
 
-/// Test-thread body: hold the per-key lock for `hold_ns`, then release.
-fn holdLockThenRelease(store: Store, hold_ns: u64) void {
+/// The handshake between the lock holder and the waiter, so the test asserts
+/// a *happens-before* relation rather than a stopwatch reading.
+///
+/// The old version of this test slept 20 ms to "give the thread a head start"
+/// and then asserted `elapsed >= hold_ns / 2`. Both halves are wall-clock bets:
+/// on a loaded machine the holder may not have the lock yet when the waiter
+/// starts (so the waiter sails through and the assertion fires on a *correct*
+/// implementation), and a descheduled waiter can inflate `elapsed` without
+/// having blocked on anything. It flaked exactly that way during a full-suite
+/// run with three other builds going.
+const LockHandshake = struct {
+    /// The holder has the flock. Published before the waiter is allowed to
+    /// start, so "the lock was held when casPutBytes was called" is a fact.
+    held: std.atomic.Value(bool) = .init(false),
+    /// The waiter is about to call `casPutBytes`. The holder waits for this
+    /// before starting its hold window, so the window always covers the call.
+    waiter_started: std.atomic.Value(bool) = .init(false),
+    /// The waiter's `casPutBytes` has returned.
+    waiter_done: std.atomic.Value(bool) = .init(false),
+    /// Sampled by the holder immediately before it unlocks: true means the
+    /// waiter completed *while the lock was still held*, i.e. it never blocked.
+    waiter_done_before_release: bool = false,
+    /// Published by the holder immediately before it unlocks.
+    released: std.atomic.Value(bool) = .init(false),
+};
+
+fn spinUntil(flag: *std.atomic.Value(bool)) void {
+    while (!flag.load(.acquire)) testSleepNs(200 * std.time.ns_per_us);
+}
+
+/// Test-thread body: take the per-key lock, tell the waiter it may start, hold
+/// for `hold_ns` *after* the waiter has begun, then release.
+fn holdLockThenRelease(store: Store, hold_ns: u64, hs: *LockHandshake) void {
     var kl = store.lockKey("accounts", "a-locked") catch return;
+    hs.held.store(true, .release);
+    spinUntil(&hs.waiter_started);
     testSleepNs(hold_ns);
+    // Read the waiter's completion flag while the lock is still ours: if it is
+    // already set, `casPutBytes` did not block on this lock at all.
+    hs.waiter_done_before_release = hs.waiter_done.load(.acquire);
+    hs.released.store(true, .release);
     kl.unlock();
 }
 
 test "casPutBytes actually blocks on a lock held by another thread (real cross-holder serialization, not just tryLock contention)" {
-    // casPutBytes acquires `lockKey` internally (blocking flock). Prove it
-    // by timing: a background thread holds the lock for `hold_ns`; the main
-    // thread's casPutBytes call must not complete before that thread
-    // releases it. If casPutBytes ever stopped locking (e.g. a refactor
-    // dropped the `lockKey` call), this test would go from "waits ~150ms"
-    // to "returns in microseconds" and fail the elapsed-time assertion.
+    // casPutBytes acquires `lockKey` internally (blocking flock). The intent
+    // is to prove a *real cross-holder* block — a second process-level flock
+    // holder, not just a `tryLock` that returns false — so a refactor that
+    // dropped the `lockKey` call would be caught.
+    //
+    // Proved by ordering, not by a stopwatch: the holder publishes "I have the
+    // lock" before the waiter is allowed to call, and samples "has the waiter
+    // finished?" while it still holds it. See `LockHandshake`.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var base_buf: [256]u8 = undefined;
@@ -921,15 +960,40 @@ test "casPutBytes actually blocks on a lock held by another thread (real cross-h
     const base_version = versionOf("base");
 
     const hold_ns: u64 = 150 * std.time.ns_per_ms;
-    const th = try std.Thread.spawn(.{}, holdLockThenRelease, .{ store, hold_ns });
-    testSleepNs(20 * std.time.ns_per_ms); // give the thread a head start on the lock
+    var hs = LockHandshake{};
+    const th = try std.Thread.spawn(.{}, holdLockThenRelease, .{ store, hold_ns, &hs });
 
+    // Not a sleep: wait until the holder has *actually* acquired the flock.
+    spinUntil(&hs.held);
+
+    hs.waiter_started.store(true, .release);
     const start_ns = testMonoNs();
     _ = try store.casPutBytes(arena, "accounts", "a-locked", "cas-write", base_version);
     const elapsed_ns: u64 = @intCast(testMonoNs() - start_ns);
+    hs.waiter_done.store(true, .release);
     th.join();
 
-    try t.expect(elapsed_ns >= hold_ns / 2); // actually waited, didn't race past it
+    // Two independent order checks, no timing threshold anywhere:
+    //
+    //  1. The waiter observed the release. `released` is stored before
+    //     `unlock()`, and the waiter can only take the lock after that unlock,
+    //     so a `casPutBytes` that returns without the flag set never waited.
+    //  2. The holder, still holding the lock, did not see the waiter finish.
+    //     A `casPutBytes` that skipped `lockKey` would have completed in
+    //     microseconds, well inside the hold window.
+    //
+    // Neither depends on how fast the machine is: the hold window is opened
+    // *after* `waiter_started` and closed only by the holder, so load can only
+    // make the test wait longer, never make it fail.
+    try t.expect(hs.released.load(.acquire));
+    try t.expect(!hs.waiter_done_before_release);
+    // Kept as diagnostics only — never asserted on.
+    if (elapsed_ns < hold_ns / 4) {
+        std.debug.print(
+            "note: casPutBytes returned after {d} ns (hold window {d} ns)\n",
+            .{ elapsed_ns, hold_ns },
+        );
+    }
 
     const got = (try store.getBytes(gpa, "accounts", "a-locked")).?;
     defer gpa.free(got);

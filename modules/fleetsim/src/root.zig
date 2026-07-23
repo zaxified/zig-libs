@@ -100,7 +100,16 @@ pub const OpcuaNode = adapters.Opcua;
 
 pub const serveTcp = tcp.serveTcp;
 pub const serveTcpOn = tcp.serveTcpOn;
+pub const serveTcpMulti = tcp.serveTcpMulti;
 pub const serveUdp = tcp.serveUdp;
+pub const Binding = tcp.Binding;
+pub const MultiOptions = tcp.MultiOptions;
+pub const MultiReport = tcp.MultiReport;
+
+pub const shim = @import("shim.zig");
+pub const Window = shim.Window;
+pub const StreamShim = shim.StreamShim;
+pub const DatagramShim = shim.DatagramShim;
 
 // ── tests ───────────────────────────────────────────────────────────────────
 
@@ -113,6 +122,7 @@ const iec104 = @import("iec104");
 const s7comm = @import("s7comm");
 const bacnet = @import("bacnet");
 const enip = @import("enip");
+const opcua = @import("opcua");
 const netsim = @import("netsim");
 
 /// A Modbus TCP request builder used all over the tests below.
@@ -846,6 +856,352 @@ fn splitEndpoint(s: []const u8) ?Endpoint {
     return .{ .host = s[0..colon], .port = port };
 }
 
+/// Every live test below follows the same shape: one binding through
+/// `serveTcpMulti` (one global clock across every session, unlike `serveTcp`,
+/// whose per-session clock restarts at each accept), a `trouble` fault
+/// scheduled at a fixed simulated instant, and the master on the other side
+/// polling across that instant so it observes the device degrade under it.
+const live_run_ms: u64 = 60_000;
+const live_trouble_at: Time = 15_000;
+
+fn liveBindings(node_id: NodeId, ep: Endpoint, out: *[1]Binding) ![]const Binding {
+    out[0] = .{
+        .node = node_id,
+        .address = try std.Io.net.IpAddress.parse(ep.host, ep.port),
+    };
+    return out;
+}
+
+fn liveSkip(name: []const u8, e: anyerror) anyerror {
+    switch (e) {
+        error.BindFailed, error.NoPeer => {
+            std.debug.print("SKIPPED: {s} (no listener/peer)\n", .{name});
+            return error.SkipZigTest;
+        },
+        else => return e,
+    }
+}
+
+test "live: a real DNP3 master drives a simulated outstation, and sees IIN1.6" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const endpoint = envVar("FLEETSIM_DNP3_LISTEN") orelse {
+        std.debug.print("SKIPPED: live fleetsim DNP3 (set FLEETSIM_DNP3_LISTEN=host:port)\n", .{});
+        return error.SkipZigTest;
+    };
+    const ep = splitEndpoint(endpoint) orelse return error.SkipZigTest;
+
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var f = try Fleet.init(testing.allocator, .{
+        .seed = 5,
+        .max_frame_len = 292, // one DNP3 link frame, at most
+        .outbox_bytes = 1 << 16,
+    });
+    defer f.deinit();
+
+    var binaries = [_]dnp3.outstation.BinaryInput{.{ .value = false, .class = .class1 }} ** 8;
+    var analogs = [_]dnp3.outstation.AnalogInput{.{ .value = 0, .class = .class2 }} ** 4;
+    var counters = [_]dnp3.outstation.Counter{.{ .value = 0, .class = .class3 }} ** 2;
+    var events: [64]dnp3.outstation.Event = undefined;
+    var rx_buf: [2048]u8 = undefined;
+    var scratch: [512]u8 = undefined;
+    var tx_fragment: [2048]u8 = undefined;
+    var station: Dnp3Node = undefined;
+    // opendnp3's `master-demo` uses LocalAddr 1 / RemoteAddr 10 and dials
+    // 127.0.0.1:20000; matching it is what makes the live oracle a two-line
+    // setup instead of a patched example.
+    station.init(
+        .{ .address = 10, .master_address = 1, .unsolicited_supported = true },
+        .{ .binary_inputs = &binaries, .analog_inputs = &analogs, .counters = &counters },
+        dnp3.outstation.EventBuffer.init(&events),
+        &rx_buf,
+        &scratch,
+        &tx_fragment,
+    );
+    const id = try f.addNode(.{ .node = station.node(), .tag = 1, .tick_period_ms = 500 });
+
+    // A ramp animates analog input 0 while the master polls it.
+    var ai0: f64 = 0;
+    var s_ai = Cell{ .cell = &ai0 };
+    const sinks = [_]Sink{s_ai.sink()};
+    var sig = Signal{
+        .driver = .{ .ramp = .{ .start = 0, .per_ms = 0.01, .min = 0, .max = 100, .wrap = true } },
+        .sinks = &sinks,
+        .period_ms = 500,
+    };
+    try f.addSignal(&sig);
+
+    try f.addFault(.{ .at_ms = live_trouble_at, .node = id, .kind = .{ .trouble = .{ .on = true } } });
+
+    var storage: [1]Binding = undefined;
+    const bindings = liveBindings(id, ep, &storage) catch return error.SkipZigTest;
+    std.debug.print("live fleetsim DNP3 outstation listening on {s} (trouble at t={d} ms)\n", .{ endpoint, live_trouble_at });
+    const report = serveTcpMulti(testing.allocator, io, &f, bindings, .{
+        .idle_ms = 100,
+        .run_ms = live_run_ms,
+        .max_peers = 4,
+    }) catch |e| return liveSkip("live fleetsim DNP3", e);
+
+    const st = f.stats(id);
+    std.debug.print(
+        "live fleetsim DNP3: peers={d} peak={d} frames_in={d} frames_out={d} bytes_in={d} bytes_out={d}" ++
+            " delivered={d} replied={d} device_trouble={} restart_iin={}\n",
+        .{
+            report.peers_accepted,                report.peak_concurrent, report.frames_in,
+            report.frames_out,                    report.bytes_in,        report.bytes_out,
+            st.delivered,                         st.replied,             station.station.device_trouble,
+            station.station.iin().device_restart,
+        },
+    );
+    try testing.expect(st.delivered > 0);
+    try testing.expect(st.replied > 0);
+    // The scheduled fault really landed on the outstation.
+    try testing.expect(station.station.device_trouble);
+}
+
+test "live: a real IEC 104 master drives a simulated outstation, and sees iv quality" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const endpoint = envVar("FLEETSIM_IEC104_LISTEN") orelse {
+        std.debug.print("SKIPPED: live fleetsim IEC 104 (set FLEETSIM_IEC104_LISTEN=host:port)\n", .{});
+        return error.SkipZigTest;
+    };
+    const ep = splitEndpoint(endpoint) orelse return error.SkipZigTest;
+
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var f = try Fleet.init(testing.allocator, .{ .seed = 6, .max_frame_len = 512, .outbox_bytes = 1 << 16 });
+    defer f.deinit();
+
+    var points = [_]iec104.Point{
+        .{ .ioa = 101, .type_id = .m_sp_na_1, .element = .{ .siq = .{ .on = true } } },
+        .{ .ioa = 102, .type_id = .m_sp_na_1, .element = .{ .siq = .{ .on = false } } },
+        .{ .ioa = 201, .type_id = .m_me_nc_1, .element = .{ .short_float = .{ .value = 21.5, .quality = .{} } } },
+    };
+    var frame_buf: [512]u8 = undefined;
+    var queue_buf: [8192]u8 = undefined;
+    var rtu: Iec104Node = undefined;
+    try rtu.init(.{ .common_address = 47 }, &points, &frame_buf, &queue_buf, .{});
+    const id = try f.addNode(.{ .node = rtu.node(), .tag = 2, .tick_period_ms = 500 });
+
+    try f.addFault(.{ .at_ms = live_trouble_at, .node = id, .kind = .{ .trouble = .{ .on = true } } });
+
+    var storage: [1]Binding = undefined;
+    const bindings = liveBindings(id, ep, &storage) catch return error.SkipZigTest;
+    std.debug.print("live fleetsim IEC 104 outstation listening on {s} (trouble at t={d} ms)\n", .{ endpoint, live_trouble_at });
+    const report = serveTcpMulti(testing.allocator, io, &f, bindings, .{
+        .idle_ms = 100,
+        .run_ms = live_run_ms,
+        .max_peers = 4,
+    }) catch |e| return liveSkip("live fleetsim IEC 104", e);
+
+    const st = f.stats(id);
+    std.debug.print(
+        "live fleetsim IEC 104: peers={d} frames_in={d} frames_out={d} delivered={d} replied={d}" ++
+            " started={} iv101={} iv201={}\n",
+        .{
+            report.peers_accepted,            report.frames_in,
+            report.frames_out,                st.delivered,
+            st.replied,                       rtu.server.isStarted(),
+            points[0].element.siq.quality.iv, points[2].element.short_float.quality.iv,
+        },
+    );
+    try testing.expect(st.delivered > 0);
+    try testing.expect(st.replied > 0);
+    try testing.expect(points[2].element.short_float.quality.iv);
+}
+
+test "live: a real S7 client drives a simulated CPU, and sees it go to STOP" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const endpoint = envVar("FLEETSIM_S7_LISTEN") orelse {
+        std.debug.print("SKIPPED: live fleetsim S7comm (set FLEETSIM_S7_LISTEN=host:port)\n", .{});
+        return error.SkipZigTest;
+    };
+    const ep = splitEndpoint(endpoint) orelse return error.SkipZigTest;
+
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var f = try Fleet.init(testing.allocator, .{ .seed = 7, .max_frame_len = 2048, .outbox_bytes = 1 << 16 });
+    defer f.deinit();
+
+    var db1 = [_]u8{0} ** 64;
+    for (&db1, 0..) |*b, i| b.* = @intCast(i);
+    var db2 = [_]u8{0} ** 32;
+    const areas = [_]s7comm.AreaBinding{
+        .{ .area = .db, .db_number = 1, .bytes = &db1 },
+        .{ .area = .db, .db_number = 2, .bytes = &db2 },
+    };
+    var plc = S7Node.init(.{}, &areas);
+    const id = try f.addNode(.{ .node = plc.node(), .tag = 3 });
+
+    // A sine drives DB1.DBD8 as a big-endian REAL, so a client watching that
+    // address sees the process image move while it polls.
+    var s_word = FloatBytes{ .bytes = db1[8..12], .offset = 0, .endian = .big };
+    const sinks = [_]Sink{s_word.sink()};
+    var sig = Signal{
+        .driver = .{ .sine = .{ .mean = 500, .amplitude = 400, .period_ms = 5000 } },
+        .sinks = &sinks,
+        .period_ms = 250,
+    };
+    try f.addSignal(&sig);
+
+    try f.addFault(.{ .at_ms = live_trouble_at, .node = id, .kind = .{ .trouble = .{ .on = true } } });
+
+    var storage: [1]Binding = undefined;
+    const bindings = liveBindings(id, ep, &storage) catch return error.SkipZigTest;
+    std.debug.print("live fleetsim S7 CPU listening on {s} (STOP at t={d} ms)\n", .{ endpoint, live_trouble_at });
+    const report = serveTcpMulti(testing.allocator, io, &f, bindings, .{
+        .idle_ms = 100,
+        .run_ms = live_run_ms,
+        .max_peers = 4,
+    }) catch |e| return liveSkip("live fleetsim S7comm", e);
+
+    const st = f.stats(id);
+    std.debug.print(
+        "live fleetsim S7comm: peers={d} frames_in={d} frames_out={d} delivered={d} replied={d}" ++
+            " connected={} pdu={d} cpu_status={s}\n",
+        .{
+            report.peers_accepted,    report.frames_in,
+            report.frames_out,        st.delivered,
+            st.replied,               plc.responder.connected,
+            plc.responder.pdu_length, @tagName(plc.responder.config.cpu_status),
+        },
+    );
+    try testing.expect(st.delivered > 0);
+    try testing.expect(st.replied > 0);
+    try testing.expectEqual(s7comm.CpuStatus.stop, plc.responder.config.cpu_status);
+}
+
+test "live: a real OPC UA client drives a simulated server, and sees BadDeviceFailure" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const endpoint = envVar("FLEETSIM_OPCUA_LISTEN") orelse {
+        std.debug.print("SKIPPED: live fleetsim OPC UA (set FLEETSIM_OPCUA_LISTEN=host:port)\n", .{});
+        return error.SkipZigTest;
+    };
+    const ep = splitEndpoint(endpoint) orelse return error.SkipZigTest;
+
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // The endpoint URL a client is told to reconnect to must be the one it
+    // dialled, or it will chase an address nothing is listening on.
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "opc.tcp://{s}:{d}", .{ ep.host, ep.port });
+
+    var fx: OpcuaFixture = undefined;
+    try fx.init(testing.allocator, url);
+    defer fx.deinit();
+
+    var f = try Fleet.init(testing.allocator, .{
+        .seed = 8,
+        .max_frame_len = 64 * 1024,
+        .inflight_capacity = 64,
+        .outbox_bytes = 1 << 20,
+    });
+    defer f.deinit();
+    const id = try f.addNode(.{ .node = fx.node.node(), .tag = 4 });
+
+    try f.addFault(.{ .at_ms = live_trouble_at, .node = id, .kind = .{ .trouble = .{ .on = true } } });
+
+    var storage: [1]Binding = undefined;
+    const bindings = liveBindings(id, ep, &storage) catch return error.SkipZigTest;
+    std.debug.print("live fleetsim OPC UA server listening on {s} ({s}, trouble at t={d} ms)\n", .{ endpoint, url, live_trouble_at });
+    const report = serveTcpMulti(testing.allocator, io, &f, bindings, .{
+        .idle_ms = 100,
+        .run_ms = live_run_ms,
+        .read_buf = 65536,
+        .max_peers = 4,
+    }) catch |e| return liveSkip("live fleetsim OPC UA", e);
+
+    const st = f.stats(id);
+    std.debug.print(
+        "live fleetsim OPC UA: peers={d} peak={d} frames_in={d} frames_out={d} bytes_in={d}" ++
+            " bytes_out={d} delivered={d} replied={d} sessions={d} measurement_status=0x{X:0>8}\n",
+        .{
+            report.peers_accepted, report.peak_concurrent,
+            report.frames_in,      report.frames_out,
+            report.bytes_in,       report.bytes_out,
+            st.delivered,          st.replied,
+            fx.srv.sessionCount(), fx.measurementStatus() orelse 0,
+        },
+    );
+    try testing.expect(st.delivered > 0);
+    try testing.expect(st.replied > 0);
+    try testing.expectEqual(
+        @as(?opcua.encoding.StatusCode, OpcuaNode.status_bad_device_failure),
+        fx.measurementStatus(),
+    );
+}
+
+test "live: two real masters, two nodes, one binding thread" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const endpoint = envVar("FLEETSIM_MULTI_LISTEN") orelse {
+        std.debug.print("SKIPPED: live fleetsim multi-peer (set FLEETSIM_MULTI_LISTEN=host:portA,portB)\n", .{});
+        return error.SkipZigTest;
+    };
+    const comma = std.mem.indexOfScalar(u8, endpoint, ',') orelse return error.SkipZigTest;
+    const ep_a = splitEndpoint(endpoint[0..comma]) orelse return error.SkipZigTest;
+    const port_b = std.fmt.parseInt(u16, endpoint[comma + 1 ..], 10) catch return error.SkipZigTest;
+
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var f = try Fleet.init(testing.allocator, .{ .seed = 9, .max_frame_len = 512, .outbox_bytes = 1 << 16 });
+    defer f.deinit();
+
+    // Node A: Modbus. Node B: IEC 104. Two protocols, two sockets, one thread.
+    var holdings = [_]u16{0} ** 16;
+    for (&holdings, 0..) |*h, i| h.* = @intCast(1000 + i);
+    var slave = ModbusNode.init(
+        .{ .unit_id = 1, .framing = .tcp, .accept_any_unit = true },
+        .{ .holding_registers = .{ .base = 0, .values = &holdings } },
+    );
+    const id_a = try f.addNode(.{ .node = slave.node(), .tag = 1 });
+
+    var points = [_]iec104.Point{
+        .{ .ioa = 101, .type_id = .m_sp_na_1, .element = .{ .siq = .{ .on = true } } },
+        .{ .ioa = 201, .type_id = .m_me_nc_1, .element = .{ .short_float = .{ .value = 3.25, .quality = .{} } } },
+    };
+    var frame_buf: [512]u8 = undefined;
+    var queue_buf: [8192]u8 = undefined;
+    var rtu: Iec104Node = undefined;
+    try rtu.init(.{ .common_address = 47 }, &points, &frame_buf, &queue_buf, .{});
+    const id_b = try f.addNode(.{ .node = rtu.node(), .tag = 2, .tick_period_ms = 500 });
+
+    const bindings = [_]Binding{
+        .{ .node = id_a, .address = std.Io.net.IpAddress.parse(ep_a.host, ep_a.port) catch return error.SkipZigTest },
+        .{ .node = id_b, .address = std.Io.net.IpAddress.parse(ep_a.host, port_b) catch return error.SkipZigTest },
+    };
+
+    std.debug.print("live fleetsim multi-peer listening on {s}:{d} (modbus) and {s}:{d} (iec104)\n", .{ ep_a.host, ep_a.port, ep_a.host, port_b });
+    const report = serveTcpMulti(testing.allocator, io, &f, &bindings, .{
+        .idle_ms = 100,
+        .run_ms = live_run_ms,
+        .max_peers = 8,
+    }) catch |e| return liveSkip("live fleetsim multi-peer", e);
+
+    std.debug.print(
+        "live fleetsim multi-peer: peers={d} peak_concurrent={d} refused={d} frames_in={d}" ++
+            " frames_out={d} modbus_replied={d} iec104_replied={d}\n",
+        .{
+            report.peers_accepted, report.peak_concurrent, report.peers_refused,
+            report.frames_in,      report.frames_out,      f.stats(id_a).replied,
+            f.stats(id_b).replied,
+        },
+    );
+    // The claim under test: both masters were connected at the same time.
+    try testing.expect(report.peak_concurrent >= 2);
+    try testing.expect(f.stats(id_a).replied > 0);
+    try testing.expect(f.stats(id_b).replied > 0);
+}
+
 test "live: a real Modbus master drives a simulated slave over the TCP binding" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const endpoint = envVar("FLEETSIM_TEST_LISTEN") orelse {
@@ -925,7 +1281,6 @@ test "live: a real EtherNet/IP master drives a simulated adapter" {
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    const addr = std.Io.net.IpAddress.parse(ep.host, ep.port) catch return error.SkipZigTest;
 
     var f = try Fleet.init(testing.allocator, .{ .seed = 2, .max_frame_len = 4096, .outbox_bytes = 1 << 16 });
     defer f.deinit();
@@ -949,24 +1304,35 @@ test "live: a real EtherNet/IP master drives a simulated adapter" {
     };
     try f.addSignal(&sig);
 
-    std.debug.print("live fleetsim EtherNet/IP adapter listening on {s}\n", .{endpoint});
-    const report = serveTcp(testing.allocator, io, &f, id, addr, .{
-        .idle_ms = 200,
-        .run_ms = 60_000,
-        .max_sessions = 8,
-    }) catch |e| switch (e) {
-        error.BindFailed, error.NoPeer => {
-            std.debug.print("SKIPPED: live fleetsim EtherNet/IP (no listener/peer)\n", .{});
-            return error.SkipZigTest;
-        },
-        else => return e,
-    };
+    try f.addFault(.{ .at_ms = live_trouble_at, .node = id, .kind = .{ .trouble = .{ .on = true } } });
+
+    var storage: [1]Binding = undefined;
+    const bindings = liveBindings(id, ep, &storage) catch return error.SkipZigTest;
+    std.debug.print("live fleetsim EtherNet/IP adapter listening on {s} (fault at t={d} ms)\n", .{ endpoint, live_trouble_at });
+    // `serveTcpMulti`, not `serveTcp`: pycomm3 opens a *separate* socket for
+    // `list_identity` and another for a connected read, and only the multi
+    // binding keeps one clock across all of them (so a scheduled fault lands
+    // where the master expects it).
+    const report = serveTcpMulti(testing.allocator, io, &f, bindings, .{
+        .idle_ms = 100,
+        .run_ms = live_run_ms,
+        .max_peers = 8,
+    }) catch |e| return liveSkip("live fleetsim EtherNet/IP", e);
 
     std.debug.print(
-        "live fleetsim EtherNet/IP: sessions={d} frames_in={d} frames_out={d} reads={d} writes={d} identity={d} speed={d}\n",
-        .{ report.sessions, report.frames_in, report.frames_out, dev.adapter.reads, dev.adapter.writes, dev.adapter.identity_requests, std.mem.readInt(i32, speed[0..4], .little) },
+        "live fleetsim EtherNet/IP: peers={d} peak={d} frames_in={d} frames_out={d} reads={d}" ++
+            " writes={d} identity={d} speed={d} identity_status=0x{X:0>4} state={s}\n",
+        .{
+            report.peers_accepted,           report.peak_concurrent,
+            report.frames_in,                report.frames_out,
+            dev.adapter.reads,               dev.adapter.writes,
+            dev.adapter.identity_requests,   std.mem.readInt(i32, speed[0..4], .little),
+            dev.adapter.cfg.identity_status, @tagName(dev.adapter.cfg.state),
+        },
     );
     try testing.expect(f.stats(id).replied > 0);
+    // The scheduled fault landed: the Identity status word says major fault.
+    try testing.expect(dev.adapter.cfg.identity_status != 0x0030);
 }
 
 test "live: a real BACnet client discovers a simulated device over UDP" {
@@ -985,10 +1351,16 @@ test "live: a real BACnet client discovers a simulated device over UDP" {
     var f = try Fleet.init(testing.allocator, .{ .seed = 4, .max_frame_len = 1500, .outbox_bytes = 1 << 16 });
     defer f.deinit();
 
+    // Clause 12's fault triple, so `trouble` has something real to move and a
+    // client has something real to read.
+    const healthy_flags = [_]u8{0x00};
     var ai_props = [_]bacnet.Property{
         .{ .id = .object_name, .value = .{ .string = "Zone-1-Temp" } },
         .{ .id = .present_value, .value = .{ .real = 21.5 }, .cov_reported = true },
         .{ .id = .units, .value = .{ .enumerated = 62 } },
+        .{ .id = .status_flags, .value = .{ .bit_string = .{ .unused_bits = 4, .bytes = &healthy_flags } }, .cov_reported = true },
+        .{ .id = .reliability, .value = .{ .enumerated = 0 } },
+        .{ .id = .out_of_service, .value = .{ .boolean = false }, .writable = true },
     };
     var dev_props = [_]bacnet.Property{
         .{ .id = .object_name, .value = .{ .string = "zig-fleetsim device" } },
@@ -1005,12 +1377,14 @@ test "live: a real BACnet client discovers a simulated device over UDP" {
         .{ .ip = .{ 0, 0, 0, 0 }, .port = 47808 },
         .{ .ip = .{ 0, 0, 0, 0 }, .port = 47808 },
     );
-    const id = try f.addNode(.{ .node = dev.node() });
+    const id = try f.addNode(.{ .node = dev.node(), .tick_period_ms = 500 });
 
-    std.debug.print("live fleetsim BACnet device listening on {s}\n", .{endpoint});
+    try f.addFault(.{ .at_ms = live_trouble_at, .node = id, .kind = .{ .trouble = .{ .on = true } } });
+
+    std.debug.print("live fleetsim BACnet device listening on {s} (fault at t={d} ms)\n", .{ endpoint, live_trouble_at });
     const report = serveUdp(testing.allocator, io, &f, id, addr, .{
-        .idle_ms = 200,
-        .run_ms = 60_000,
+        .idle_ms = 100,
+        .run_ms = live_run_ms,
     }) catch |e| switch (e) {
         error.BindFailed => {
             std.debug.print("SKIPPED: live fleetsim BACnet (cannot bind {s})\n", .{endpoint});
@@ -1018,11 +1392,193 @@ test "live: a real BACnet client discovers a simulated device over UDP" {
         },
         else => return e,
     };
+    const ai = &objects[0];
     std.debug.print(
-        "live fleetsim BACnet: datagrams_in={d} datagrams_out={d} delivered={d} replied={d}\n",
-        .{ report.frames_in, report.frames_out, f.stats(id).delivered, f.stats(id).replied },
+        "live fleetsim BACnet: datagrams_in={d} datagrams_out={d} delivered={d} replied={d}" ++
+            " reliability={d} status_flags=0x{X:0>2} out_of_service={}\n",
+        .{
+            report.frames_in,
+            report.frames_out,
+            f.stats(id).delivered,
+            f.stats(id).replied,
+            ai.find(.reliability).?.value.enumerated,
+            ai.find(.status_flags).?.value.bit_string.bytes[0],
+            ai.find(.out_of_service).?.value.boolean,
+        },
     );
     try testing.expect(report.frames_in > 0);
+    // The scheduled fault landed on the object model a client reads.
+    try testing.expectEqual(@as(u32, 7), ai.find(.reliability).?.value.enumerated);
+    try testing.expect(ai.find(.out_of_service).?.value.boolean);
+}
+
+// ── OPC UA: a whole simulated server, offline and live ──────────────────────
+
+/// Everything an `OpcuaNode` needs behind it: an address space, a server and
+/// the two buffers a connection negotiates against. Heavy by OPC UA's nature
+/// (see SPEC.md's memory note) — this is why an OPC UA fleet is measured in
+/// hundreds of nodes, not thousands.
+const OpcuaFixture = struct {
+    gpa: std.mem.Allocator,
+    store: opcua.nodestore.NodeStore,
+    srv: opcua.server.Server = undefined,
+    prng: std.Random.DefaultPrng,
+    recv_buf: []u8,
+    msg_buf: []u8,
+    node: OpcuaNode = undefined,
+    endpoints: [1]opcua.services.EndpointDescription = undefined,
+    start_time: opcua.encoding.DateTime,
+
+    /// `ns=1;s=the.measurement` — the process value a client reads and the one
+    /// `trouble` degrades.
+    const measurement: opcua.encoding.NodeId =
+        .{ .string = .{ .namespace = 1, .id = "the.measurement" } };
+    const ns_uri = "urn:zig-libs:fleetsim";
+
+    fn init(self: *OpcuaFixture, gpa: std.mem.Allocator, endpoint_url: []const u8) !void {
+        self.* = .{
+            .gpa = gpa,
+            .store = opcua.nodestore.NodeStore.init(gpa),
+            .prng = std.Random.DefaultPrng.init(0xC0FFEE),
+            .recv_buf = try gpa.alloc(u8, 64 * 1024),
+            .msg_buf = try gpa.alloc(u8, 256 * 1024),
+            .start_time = 0,
+        };
+        try self.store.addStandardNodes(.{ .start_time = self.start_time });
+        const ns = try self.store.addNamespace(ns_uri);
+        std.debug.assert(ns == 1);
+        try self.store.refreshNamespaceArray();
+        try self.store.addVariable(.{
+            .node_id = measurement,
+            .parent_id = opcua.nodestore.n0(opcua.nodestore.id.objects_folder),
+            .reference_type_id = opcua.nodestore.n0(opcua.nodestore.id.organizes),
+            .browse_name = .{ .namespace_index = 1, .name = "the.measurement" },
+            .display_name = .{ .locale = "en", .text = "the measurement" },
+            .value = .{ .scalar = .{ .int32 = 42 } },
+            .data_type = opcua.nodestore.n0(opcua.nodestore.id.int32),
+            .access_level = opcua.nodestore.access_level.read_write,
+            .timestamp = self.start_time,
+        });
+
+        self.endpoints = .{opcua.server.noneEndpoint(endpoint_url, .{
+            .application_uri = "urn:zig-libs:fleetsim:server",
+            .product_uri = "urn:zig-libs:fleetsim",
+            .application_name = .{ .locale = "en", .text = "zig-fleetsim opcua device" },
+            .application_type = .server,
+            .gateway_server_uri = null,
+            .discovery_profile_uri = null,
+            .discovery_urls = null,
+        })};
+        self.srv = opcua.server.Server.init(self.gpa, &self.store, .{
+            .application_uri = "urn:zig-libs:fleetsim:server",
+            .application_name = .{ .locale = "en", .text = "zig-fleetsim opcua device" },
+            .endpoints = &self.endpoints,
+        }, self.prng.random());
+        try self.node.init(&self.srv, self.recv_buf, self.msg_buf);
+        self.node.trouble_nodes = &.{measurement};
+    }
+
+    fn deinit(self: *OpcuaFixture) void {
+        self.srv.deinit();
+        self.store.deinit();
+        self.gpa.free(self.recv_buf);
+        self.gpa.free(self.msg_buf);
+    }
+
+    /// The DataValue a client would read back for the measurement, status and
+    /// all — the exact thing `trouble` is supposed to change.
+    fn measurementStatus(self: *OpcuaFixture) ?opcua.encoding.StatusCode {
+        const n = self.store.getNode(measurement) orelse return null;
+        return switch (n.attributes) {
+            .variable => |v| v.value.status,
+            else => null,
+        };
+    }
+};
+
+test "opcua adapter: a HEL/OPN/CreateSession sequence round-trips through the node" {
+    const gpa = testing.allocator;
+    var fx: OpcuaFixture = undefined;
+    try fx.init(gpa, "opc.tcp://127.0.0.1:4840");
+    defer fx.deinit();
+
+    var f = try Fleet.init(gpa, .{
+        .seed = 8,
+        .max_frame_len = 64 * 1024,
+        .inflight_capacity = 32,
+        .outbox_bytes = 256 * 1024,
+    });
+    defer f.deinit();
+    const id = try f.addNode(.{ .node = fx.node.node(), .tag = 9 });
+
+    // A real UA-TCP HELLO: "HELF", length, protocol version, four limits, then
+    // the endpoint URL as an Int32-prefixed string.
+    const url = "opc.tcp://127.0.0.1:4840";
+    var hel: [32 + url.len]u8 = undefined;
+    @memcpy(hel[0..4], "HELF");
+    std.mem.writeInt(u32, hel[4..8], hel.len, .little);
+    std.mem.writeInt(u32, hel[8..12], 0, .little); // protocol version
+    std.mem.writeInt(u32, hel[12..16], 65536, .little); // receive buffer
+    std.mem.writeInt(u32, hel[16..20], 65536, .little); // send buffer
+    std.mem.writeInt(u32, hel[20..24], 1 << 20, .little); // max message size
+    std.mem.writeInt(u32, hel[24..28], 0, .little); // max chunk count
+    std.mem.writeInt(u32, hel[28..32], url.len, .little);
+    @memcpy(hel[32..], url);
+
+    try f.submit(id, &hel, 0);
+    _ = try f.advance(10);
+
+    // An ACKF back, and the framing rule agrees with what came out.
+    try testing.expectEqual(@as(usize, 1), f.outbound().len);
+    const ack = f.frameBytes(f.outbound()[0]);
+    try testing.expectEqualSlices(u8, "ACKF", ack[0..4]);
+    try testing.expectEqual(@as(?usize, ack.len), try Framing.opcua_uatcp.frameLen(ack));
+
+    // Garbage on an open connection is refused, not fatal.
+    try f.submit(id, &.{ 'X', 'X', 'X', 'F', 8, 0, 0, 0 }, 20);
+    _ = try f.advance(30);
+
+    // Restart drops the channel: the next HEL is answered afresh.
+    try testing.expect(fx.node.node().control(.restart, 40));
+    try f.submit(id, &hel, 50);
+    _ = try f.advance(60);
+    try testing.expect(f.outbound().len > 0);
+    try testing.expectEqualSlices(u8, "ACKF", f.frameBytes(f.outbound()[0])[0..4]);
+}
+
+test "opcua adapter: trouble stamps BadDeviceFailure and moves ServerStatus.State" {
+    const gpa = testing.allocator;
+    var fx: OpcuaFixture = undefined;
+    try fx.init(gpa, "opc.tcp://127.0.0.1:4840");
+    defer fx.deinit();
+    const n = fx.node.node();
+
+    try testing.expectEqual(@as(?opcua.encoding.StatusCode, 0), fx.measurementStatus());
+    try testing.expect(n.control(.trouble_on, 0));
+    try testing.expectEqual(
+        @as(?opcua.encoding.StatusCode, OpcuaNode.status_bad_device_failure),
+        fx.measurementStatus(),
+    );
+
+    // ServerStatus.State (i=2259) really says Failed(1), which is what a
+    // client's Server-object view shows.
+    const state_id = opcua.encoding.NodeId{
+        .numeric = .{ .namespace = 0, .id = opcua.nodestore.id.server_status_state },
+    };
+    const state_node = fx.store.getNode(state_id).?;
+    try testing.expectEqual(@as(i32, 1), state_node.attributes.variable.value.value.?.scalar.int32);
+
+    try testing.expect(n.control(.trouble_off, 0));
+    try testing.expectEqual(@as(?opcua.encoding.StatusCode, 0), fx.measurementStatus());
+    try testing.expectEqual(@as(i32, 0), state_node.attributes.variable.value.value.?.scalar.int32);
+
+    // The same read path a client uses reports the status, not just the field.
+    try testing.expect(n.control(.trouble_on, 0));
+    const dv = fx.store.readAttribute(
+        OpcuaFixture.measurement,
+        opcua.services.attribute_id.value,
+    );
+    try testing.expectEqual(OpcuaNode.status_bad_device_failure, dv.status.?);
 }
 
 test {
@@ -1032,4 +1588,5 @@ test {
     _ = @import("fleet.zig");
     _ = @import("adapters.zig");
     _ = @import("tcp.zig");
+    _ = @import("shim.zig");
 }

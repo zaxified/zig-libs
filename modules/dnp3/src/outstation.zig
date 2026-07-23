@@ -1797,6 +1797,24 @@ pub const Session = struct {
         return try self.sendFragment(reply.fragment, out);
     }
 
+    /// Emits a pending **unsolicited** response as link frames, or `null` when
+    /// the outstation has nothing to report (see `Outstation.unsolicited` for
+    /// the exact conditions: unsolicited reporting off, one already awaiting
+    /// confirmation, no events in an enabled class, or a restart not yet
+    /// acknowledged).
+    ///
+    /// This is the unsolicited counterpart of `nextFrames`, and it exists so a
+    /// caller driving a session over a byte stream never has to reach past
+    /// `Session` into `link`/`transport` to frame an outstation-initiated
+    /// fragment. `Session` owns `tx_seq`; framing a fragment outside it would
+    /// mean duplicating the sequence bookkeeping, which is precisely how a
+    /// master's reassembler gets confused. The retry policy stays the caller's
+    /// (`Outstation.confirmTimedOut` puts the events back).
+    pub fn unsolicitedFrames(self: *Session, now_ms: u64, out: []u8) SessionError!?[]u8 {
+        const reply = (try self.outstation.unsolicited(now_ms, self.tx_fragment)) orelse return null;
+        return try self.sendFragment(reply.fragment, out);
+    }
+
     fn sendFragment(self: *Session, fragment: []const u8, out: []u8) SessionError![]u8 {
         const control = link.Control{
             // §9.2.4.1.2: DIR is 1 for frames sent *by the master*, 0 for
@@ -2921,6 +2939,58 @@ test "Session: link-layer service requests get link-layer answers" {
     const reply = (try session.feedFrame(status, 200, &out)).?;
     const d2 = try link.decodeFrame(reply, &scratch);
     try testing.expectEqual(link.SecondaryFunction.link_status, d2.control.secondaryFunction());
+}
+
+test "Session: unsolicitedFrames wraps an outstation-initiated fragment in link frames" {
+    var fix = Fixture{};
+    var station = fix.station(.{
+        .address = 10,
+        .master_address = 1,
+        .unsolicited_supported = true,
+        .unsolicited_enabled_at_start = true,
+    });
+    station.restart = false;
+    var rx: [512]u8 = undefined;
+    var scratch: [256]u8 = undefined;
+    var tx: [512]u8 = undefined;
+    var session = Session.init(&station, &rx, &scratch, &tx);
+    var out: [512]u8 = undefined;
+
+    // Nothing buffered: nothing on the wire, and the sequence has not moved.
+    try testing.expectEqual(@as(?[]u8, null), try session.unsolicitedFrames(100, &out));
+    try testing.expectEqual(@as(u6, 0), session.tx_seq);
+
+    station.update(.binary_input, 3, .{ .binary = false }, 200);
+    const frames = (try session.unsolicitedFrames(300, &out)).?;
+
+    // It really is a data-link frame from the outstation to the master, and it
+    // carries an unsolicited response that asks for a confirm.
+    const decoded = try link.decodeFrame(frames, &scratch);
+    try testing.expect(decoded.control.prm);
+    try testing.expect(!decoded.control.dir); // outstation -> master
+    try testing.expectEqual(
+        link.PrimaryFunction.unconfirmed_user_data,
+        decoded.control.primaryFunction(),
+    );
+    try testing.expectEqual(@as(u16, 1), decoded.dest);
+    try testing.expectEqual(@as(u16, 10), decoded.src);
+
+    var reasm_buf: [512]u8 = undefined;
+    var reasm = transport.Reassembler.init(&reasm_buf);
+    const fragment = (try reasm.feed(scratch[0..decoded.user_data_len])).?;
+    const app = try application.decodeResponseHeader(fragment);
+    try testing.expectEqual(FunctionCode.unsolicited_response, app.header.function);
+    try testing.expect(app.header.control.uns);
+    try testing.expect(app.header.control.con);
+
+    // The session advanced its own transport sequence, which is the whole
+    // reason this belongs on `Session` rather than in a caller.
+    try testing.expectEqual(@as(u6, 1), session.tx_seq);
+
+    // A second one is withheld until the first is confirmed, exactly as the
+    // fragment-level API does.
+    station.update(.binary_input, 4, .{ .binary = false }, 400);
+    try testing.expectEqual(@as(?[]u8, null), try session.unsolicitedFrames(500, &out));
 }
 
 test "Session: a fragment split across transport segments reassembles" {

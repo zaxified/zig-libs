@@ -25,8 +25,9 @@ connect.
   unsolicited traffic (DNP3 unsolicited responses, IEC 104 spontaneous ASDUs,
   BACnet COV, OPC UA publish), `nextDeadline(now)` so a 1000-node fleet does not
   poll every node every millisecond, and `control(op, now) -> bool` for restart
-  and device-trouble injection. `control` returns **false** when the protocol
-  has no word for the fault, and the fleet logs that rather than faking it.
+  and device-trouble injection. `control` returns **false** only when the
+  caller's device model gives the adapter nothing to degrade, and the fleet logs
+  that rather than faking it.
 - **`Framing`** — per-protocol frame-boundary rules (MBAP, DNP3 link, IEC 104
   APCI, TPKT, ENIP encapsulation, OPC UA UA-TCP, BACnet BVLC). Used to split a
   TCP read into frames, and to split a responder's multi-frame answer back into
@@ -34,7 +35,15 @@ connect.
 - **Adapters** — `ModbusNode`, `Dnp3Node`, `Iec104Node`, `S7Node`,
   `BacnetNode`, `EnipNode`, `OpcuaNode`. **No responder module was modified**;
   the two transport-driven ones (IEC 104, BACnet) get a small shim transport
-  instead.
+  from `shim.zig` instead. All seven implement `trouble` natively — Modbus
+  exception `0x04`, DNP3 `IIN1.6`, IEC 104 `iv` quality, S7 CPU `STOP`, BACnet
+  `Reliability`/`Status_Flags`/`Out_Of_Service`, the CIP Identity status word
+  plus general status `0x10 Device State Conflict`, and OPC UA
+  `BadDeviceFailure` plus `ServerStatus.State = Failed`.
+- **`shim.zig`** — `Window` (one input chunk in, one output buffer out, no
+  mailbox, no allocation) plus the two `Transport` bindings that IEC 104 and
+  BACnet need. Public, because a consumer holding one of those responders wants
+  exactly this and neither module can host it — see the file header.
 - **`Fleet`** — the deterministic scheduler. `submit` / `submitStream` in,
   `advance(to_ms)`, `outbound()` out. One event queue, total order
   `(time, insertion sequence)`, fixed memory pools, two seeded
@@ -50,8 +59,11 @@ connect.
   `Fleet.applyNetsimTrace` maps a `netsim`-fuzzed fault schedule straight onto
   the fleet, so that churn-and-recover fuzzer and its shrinker are reused rather
   than rewritten.
-- **Transport binding** — `serveTcp` / `serveUdp` in `tcp.zig`, the only file
-  that knows what a socket is. The core works with no I/O at all.
+- **Transport binding** — `serveTcp` / `serveUdp` / `serveTcpMulti` in
+  `tcp.zig`, the only file that knows what a socket is. `serveTcpMulti` binds
+  several listeners and services several peers **concurrently** from one thread
+  over a `poll(2)` readiness loop — no per-node thread, no clock read inside the
+  core. The core works with no I/O at all.
 
 ## Use
 
@@ -102,6 +114,23 @@ const report = try fleetsim.serveTcp(gpa, io, &f, id, address, .{
 });
 ```
 
+With several masters on several nodes at the same time (one thread, one clock —
+this is also the shape to use when a fault schedule matters, because
+`serveTcp`'s clock restarts at every accept while `serveTcpMulti`'s does not):
+
+```zig
+const bindings = [_]fleetsim.Binding{
+    .{ .node = modbus_id, .address = try std.Io.net.IpAddress.parse("127.0.0.1", 15020) },
+    .{ .node = iec104_id, .address = try std.Io.net.IpAddress.parse("127.0.0.1", 15021) },
+};
+const report = try fleetsim.serveTcpMulti(gpa, io, &f, &bindings, .{
+    .idle_ms = 100,
+    .run_ms = 60_000,
+    .max_peers = 8,
+});
+// report.peak_concurrent is how many masters were connected simultaneously.
+```
+
 ## Verify
 
 ```
@@ -109,14 +138,35 @@ zig build test-fleetsim                # Debug
 zig build test-fleetsim --release=fast
 ```
 
-The three live tests print `SKIPPED: …` and pass unless an endpoint is given:
+64 tests, green in Debug and ReleaseFast (8 of them are the live tests below,
+which skip without an endpoint). They cover the framing rules and the frame
+iterator, every adapter's round-trip plus its restart and its trouble path
+(including a real BACnet `ReadProperty` of `Reliability` and a real CIP
+`Get_Attributes_All` refused with `0x10`), an OPC UA HEL/ACK round-trip through
+a whole `NodeStore`+`Server`, the drivers, the scheduler, three determinism
+proofs plus a fourth over a toy node, hostile input, a `std.testing.fuzz` target
+over three-adapter dispatch, the 1000-node scale run, the shim's buffer
+discipline, and the multi-peer binding driven by two in-process clients at once.
+
+The eight live tests print `SKIPPED: …` and pass unless an endpoint is given.
+Each one binds, waits for its master, and schedules a `trouble` fault at
+t=15 s so the master watches the device degrade under it:
 
 ```
-FLEETSIM_TEST_LISTEN=127.0.0.1:15020   zig build test-fleetsim   # then point pymodbus at it
-FLEETSIM_ENIP_LISTEN=127.0.0.1:15021   zig build test-fleetsim   # then pycomm3
-FLEETSIM_BACNET_LISTEN=127.0.0.1:15022 zig build test-fleetsim   # then bacpypes3
+FLEETSIM_TEST_LISTEN=127.0.0.1:15020    zig build test-fleetsim   # pymodbus
+FLEETSIM_ENIP_LISTEN=127.0.0.1:15021    zig build test-fleetsim   # pycomm3
+FLEETSIM_BACNET_LISTEN=127.0.0.1:15022  zig build test-fleetsim   # bacpypes3 (UDP)
+FLEETSIM_DNP3_LISTEN=127.0.0.1:20000    zig build test-fleetsim   # opendnp3 master-demo
+FLEETSIM_IEC104_LISTEN=127.0.0.1:15023  zig build test-fleetsim   # c104 (lib60870)
+FLEETSIM_S7_LISTEN=127.0.0.1:15024      zig build test-fleetsim   # python-snap7
+FLEETSIM_OPCUA_LISTEN=127.0.0.1:15025   zig build test-fleetsim   # asyncua
+FLEETSIM_MULTI_LISTEN=127.0.0.1:15026,15027 zig build test-fleetsim  # two masters at once
 ```
 
-What was actually run against real third-party masters, the determinism proof,
-the measured scale numbers and the deferred list are in [SPEC.md](./SPEC.md).
+The DNP3 test matches opendnp3's `master-demo` defaults (outstation address 10,
+master 1, port 20000) so the oracle needs no patching.
+
+What was actually run against real third-party masters (all seven protocols,
+with the transcript of what each master did), the determinism proof, the
+measured scale numbers and the deferred list are in [SPEC.md](./SPEC.md).
 Provenance: see [/NOTICE](../../NOTICE).

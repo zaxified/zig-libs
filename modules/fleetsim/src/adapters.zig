@@ -15,11 +15,12 @@
 //!      session buffers.
 //!   3. *Transport-driven* — IEC 104 (`Server.poll`) and BACnet
 //!      (`Device.poll`) pull from a `Transport` vtable. For those the adapter
-//!      supplies a **shim transport**: one injected datagram/chunk in, an
-//!      output buffer out. Both modules ship a `LoopTransport` of their own,
-//!      but those are built for peer-to-peer offline tests (16-slot mailbox,
-//!      1.5 kB per slot) and would cost ~24 kB per simulated node; the shim is
-//!      the same idea sized for a 1000-node fleet.
+//!      supplies a **shim transport** from `shim.zig`: one injected
+//!      datagram/chunk in, an output buffer out. Both modules ship a
+//!      `LoopTransport` of their own, but those are built for peer-to-peer
+//!      offline tests (16-slot mailbox, 1.5 kB per slot) and would cost ~24 kB
+//!      per simulated node; the shim is the same idea sized for a 1000-node
+//!      fleet. See `shim.zig`'s header for why it lives in this module.
 //!
 //! **Restart** is uniform: every adapter snapshots its responder's value at
 //! construction and restores it on `Control.restart`. That is a genuine
@@ -27,10 +28,25 @@
 //! caller-owned storage), and it is what makes a master see DNP3's IIN1.7,
 //! S7's re-negotiated PDU size or OPC UA's closed channel.
 //!
-//! **Trouble** is native where the protocol has a word for it (Modbus
-//! exception 0x04, DNP3 IIN1.6, S7 CPU STOP, IEC 104 `iv` quality) and
-//! honestly refused where it does not (`control` returns false, the fleet logs
-//! `control_unsupported`).
+//! **Trouble** is native in all seven, each in the vocabulary its own protocol
+//! gives a degraded device:
+//!
+//! | protocol | what a master sees |
+//! |---|---|
+//! | Modbus | exception `0x04 SlaveDeviceFailure` on every request |
+//! | DNP3 | `IIN1.6 device_trouble` |
+//! | IEC 104 | the `iv` quality bit on every point that carries quality |
+//! | S7comm | SZL `0x0424` CPU status `STOP` |
+//! | BACnet | `Reliability = unreliable-other`, `StatusFlags{fault,in_alarm,out_of_service}`, `Out_Of_Service = true` |
+//! | EtherNet/IP | Identity status word major-fault bits; CIP data services answer `0x10 Device State Conflict` |
+//! | OPC UA | `ServerStatus.State = Failed`, and `BadDeviceFailure` on the variables the caller nominated |
+//!
+//! Where the state that expresses trouble belongs to the *caller* (BACnet
+//! object properties, an OPC UA `NodeStore`), the adapter reaches it through
+//! the responder module's own public API and reports honestly — `control`
+//! returns false, and the fleet records `control_unsupported`, when the caller
+//! gave it nothing to degrade (a BACnet device whose objects carry none of the
+//! three fault properties).
 
 const std = @import("std");
 
@@ -43,6 +59,10 @@ const enip = @import("enip");
 const opcua = @import("opcua");
 
 const node_mod = @import("node.zig");
+const shim_mod = @import("shim.zig");
+
+pub const StreamShim = shim_mod.StreamShim;
+pub const DatagramShim = shim_mod.DatagramShim;
 
 pub const Node = node_mod.Node;
 pub const NodeError = node_mod.NodeError;
@@ -131,11 +151,11 @@ pub const Modbus = struct {
 /// A simulated DNP3 outstation, framed at the data-link layer (which is what
 /// DNP3-over-TCP puts on the wire).
 ///
-/// DRY candidate: `dnp3.outstation.Session` can frame a *solicited* fragment
-/// (`feedFrame`, `nextFrames`) but exposes no way to frame an **unsolicited**
-/// one — `Session.sendFragment` is private. `emitUnsolicited` below re-does
-/// that eight-line job with the module's own public `link`/`transport` API.
-/// It belongs in `dnp3.outstation.Session` as `unsolicitedFrames(now, out)`.
+/// This adapter used to re-implement unsolicited framing over `dnp3`'s public
+/// `link`/`transport` API, because `Session.sendFragment` is private. It no
+/// longer does: `dnp3.outstation.Session.unsolicitedFrames` is the public
+/// counterpart of `nextFrames`, and it owns `tx_seq` — which is exactly why the
+/// duplicate was a bug waiting to happen.
 pub const Dnp3 = struct {
     station: dnp3.outstation.Outstation,
     saved: dnp3.outstation.Outstation,
@@ -199,39 +219,16 @@ pub const Dnp3 = struct {
     fn tickFn(ctx: *anyopaque, out: []u8, now_ms: Time) NodeError!?[]const u8 {
         const self = cast(ctx);
         self.station.tick(now_ms);
-        if (self.station.unsolicited(now_ms, self.tx_fragment) catch null) |reply| {
-            return self.emitUnsolicited(reply.fragment, out);
-        }
+        const unsolicited = self.session.unsolicitedFrames(now_ms, out) catch |err| switch (err) {
+            error.BufferTooSmall => return error.OutputTooSmall,
+            else => null,
+        };
+        if (unsolicited) |frames| return frames;
         const more = self.session.nextFrames(now_ms, out) catch |err| switch (err) {
             error.BufferTooSmall => return error.OutputTooSmall,
             else => return null,
         };
         return more;
-    }
-
-    /// See the DRY note on the type: this mirrors `Session.sendFragment`.
-    fn emitUnsolicited(self: *Dnp3, fragment: []const u8, out: []u8) NodeError!?[]const u8 {
-        const control = dnp3.link.Control{
-            .dir = false, // outstation -> master
-            .prm = true,
-            .function = @intFromEnum(dnp3.link.PrimaryFunction.unconfirmed_user_data),
-        };
-        var seg = dnp3.transport.Segmenter.init(fragment);
-        seg.seq = self.session.tx_seq;
-        var seg_buf: [1 + dnp3.transport.max_segment_payload]u8 = undefined;
-        var pos: usize = 0;
-        while (seg.next(&seg_buf)) |segment| {
-            const frame = dnp3.link.encodeFrame(
-                control,
-                self.station.config.master_address,
-                self.station.config.address,
-                segment,
-                out[pos..],
-            ) catch return error.OutputTooSmall;
-            pos += frame.len;
-        }
-        self.session.tx_seq = seg.seq;
-        return if (pos == 0) null else out[0..pos];
     }
 
     fn deadlineFn(ctx: *anyopaque, now_ms: Time) ?Time {
@@ -264,28 +261,6 @@ pub const Dnp3 = struct {
 
 // ── IEC 60870-5-104 ─────────────────────────────────────────────────────────
 
-/// A byte-stream shim so a `Transport`-driven responder can be fed one chunk
-/// and drained into one buffer, with no mailbox and no allocation.
-const StreamShim = struct {
-    input: []const u8 = &.{},
-    in_pos: usize = 0,
-    out: []u8 = &.{},
-    out_used: usize = 0,
-    overflow: bool = false,
-
-    fn reset(self: *StreamShim, input: []const u8, out: []u8) void {
-        self.input = input;
-        self.in_pos = 0;
-        self.out = out;
-        self.out_used = 0;
-        self.overflow = false;
-    }
-
-    fn written(self: *const StreamShim) []const u8 {
-        return self.out[0..self.out_used];
-    }
-};
-
 pub const Iec104 = struct {
     server: iec104.OutstationServer = undefined,
     saved: iec104.OutstationServer = undefined,
@@ -310,34 +285,13 @@ pub const Iec104 = struct {
         self.server = try iec104.OutstationServer.init(
             opts,
             points,
-            .{ .ctx = &self.shim, .vtable = &shim_vtable },
+            self.shim.transport(),
             frame_buf,
             queue_buf,
             config,
         );
         self.saved = self.server;
         self.server.onConnected(0);
-    }
-
-    const shim_vtable = iec104.Transport.VTable{ .read = readFn, .write = writeFn };
-
-    fn readFn(ctx: *anyopaque, buf: []u8) iec104.TransportError!usize {
-        const shim: *StreamShim = @ptrCast(@alignCast(ctx));
-        const n = @min(buf.len, shim.input.len - shim.in_pos);
-        if (n == 0) return 0;
-        @memcpy(buf[0..n], shim.input[shim.in_pos..][0..n]);
-        shim.in_pos += n;
-        return n;
-    }
-
-    fn writeFn(ctx: *anyopaque, bytes: []const u8) iec104.TransportError!void {
-        const shim: *StreamShim = @ptrCast(@alignCast(ctx));
-        if (shim.out_used + bytes.len > shim.out.len) {
-            shim.overflow = true;
-            return error.WriteFailed;
-        }
-        @memcpy(shim.out[shim.out_used..][0..bytes.len], bytes);
-        shim.out_used += bytes.len;
     }
 
     pub fn node(self: *Iec104) Node {
@@ -363,17 +317,17 @@ pub const Iec104 = struct {
         // The Transport vtable ctx was bound to `&self.shim` at init; a moved
         // adapter would dangle, so re-point it every call. Cheap, and it makes
         // the struct movable, which a 1000-node ArrayList wants.
-        self.server.transport = .{ .ctx = &self.shim, .vtable = &shim_vtable };
+        self.server.transport = self.shim.transport();
         var rounds: usize = 0;
         while (rounds < max_poll_rounds) : (rounds += 1) {
             const ev = self.server.poll(now_ms) catch |err| switch (err) {
                 error.WriteFailed => return error.OutputTooSmall,
                 else => break, // a protocol error closes the connection
             };
-            if (ev == .none and self.shim.in_pos >= self.shim.input.len) break;
+            if (ev == .none and self.shim.window.drained()) break;
             if (ev == .closed) break;
         }
-        if (self.shim.overflow) return error.OutputTooSmall;
+        if (self.shim.window.overflow) return error.OutputTooSmall;
         const w = self.shim.written();
         return if (w.len == 0) null else w;
     }
@@ -394,7 +348,7 @@ pub const Iec104 = struct {
     /// Queue a spontaneous report (cause 3) for one point — the "something
     /// changed in the field" path a simulation drives.
     pub fn reportSpontaneous(self: *Iec104, ioa: u32, now_ms: Time) !void {
-        self.server.transport = .{ .ctx = &self.shim, .vtable = &shim_vtable };
+        self.server.transport = self.shim.transport();
         try self.server.reportSpontaneous(ioa, now_ms);
     }
 
@@ -403,7 +357,7 @@ pub const Iec104 = struct {
         switch (op) {
             .restart => {
                 self.server = self.saved;
-                self.server.transport = .{ .ctx = &self.shim, .vtable = &shim_vtable };
+                self.server.transport = self.shim.transport();
                 self.server.onConnected(now_ms);
             },
             // §7.2.6.3: `iv` marks a value the acquisition function knows is
@@ -478,56 +432,22 @@ pub const S7comm = struct {
 
 // ── BACnet/IP ───────────────────────────────────────────────────────────────
 
-/// A datagram shim: one injected datagram in, every reply concatenated out.
-/// BVLC is self-delimiting, so the fleet can split the output back into
-/// individual datagrams.
-const DatagramShim = struct {
-    address: bacnet.BipAddress,
-    peer: bacnet.BipAddress,
-    input: ?[]const u8 = null,
-    out: []u8 = &.{},
-    out_used: usize = 0,
-    overflow: bool = false,
+/// `Reliability` (clause 21) as an enumerated property value. A simulated
+/// device that is "just broken" reports `unreliable-other`: every other member
+/// of the enumeration claims a specific failure mode (no-sensor, over-range,
+/// open-loop) that this adapter has no basis to assert.
+const reliability_no_fault: u32 = 0;
+const reliability_unreliable_other: u32 = 7;
 
-    fn transport(self: *DatagramShim) bacnet.Transport {
-        return .{ .ctx = self, .vtable = &vtable };
-    }
-
-    const vtable = bacnet.Transport.VTable{
-        .send = sendFn,
-        .broadcast = broadcastFn,
-        .recv = recvFn,
-    };
-
-    fn put(self: *DatagramShim, bytes: []const u8) bacnet.TransportError!void {
-        if (self.out_used + bytes.len > self.out.len) {
-            self.overflow = true;
-            return error.SendFailed;
-        }
-        @memcpy(self.out[self.out_used..][0..bytes.len], bytes);
-        self.out_used += bytes.len;
-    }
-
-    fn sendFn(ctx: *anyopaque, to: bacnet.BipAddress, bytes: []const u8) bacnet.TransportError!void {
-        _ = to;
-        const self: *DatagramShim = @ptrCast(@alignCast(ctx));
-        return self.put(bytes);
-    }
-
-    fn broadcastFn(ctx: *anyopaque, bytes: []const u8) bacnet.TransportError!void {
-        const self: *DatagramShim = @ptrCast(@alignCast(ctx));
-        return self.put(bytes);
-    }
-
-    fn recvFn(ctx: *anyopaque, buf: []u8) bacnet.TransportError!?bacnet.transport.Received {
-        const self: *DatagramShim = @ptrCast(@alignCast(ctx));
-        const dgram = self.input orelse return null;
-        self.input = null;
-        if (dgram.len > buf.len) return error.DatagramTooLarge;
-        @memcpy(buf[0..dgram.len], dgram);
-        return .{ .from = self.peer, .bytes = buf[0..dgram.len] };
-    }
-};
+/// The two `StatusFlags` octets a simulated point can be in. Both are comptime
+/// constants, so no per-object storage is needed: every degraded object in a
+/// simulated device is degraded the same way.
+const status_flags_healthy = [_]u8{(bacnet.StatusFlags{}).toOctet()};
+const status_flags_trouble = [_]u8{(bacnet.StatusFlags{
+    .in_alarm = true,
+    .fault = true,
+    .out_of_service = true,
+}).toOctet()};
 
 /// A simulated BACnet/IP device. `max_subscriptions` bounds the COV table.
 pub fn Bacnet(comptime max_subscriptions: usize) type {
@@ -539,6 +459,10 @@ pub fn Bacnet(comptime max_subscriptions: usize) type {
         saved: DeviceType = undefined,
         shim: DatagramShim,
         trouble: bool = false,
+        /// Set when trouble was applied and the COV subscribers have not been
+        /// told yet: `control` has no output buffer, so the notification goes
+        /// out on the next `tick`, which does.
+        cov_pending: bool = false,
 
         pub fn init(
             self: *Self,
@@ -570,10 +494,7 @@ pub fn Bacnet(comptime max_subscriptions: usize) type {
         }
 
         fn pump(self: *Self, dgram: ?[]const u8, out: []u8, now_ms: Time) NodeError!?[]const u8 {
-            self.shim.input = dgram;
-            self.shim.out = out;
-            self.shim.out_used = 0;
-            self.shim.overflow = false;
+            self.shim.reset(dgram orelse &.{}, out);
             self.device.tp = self.shim.transport();
             // One datagram in, then one drain round for anything the device
             // wants to say on its own (an expiring subscription).
@@ -585,8 +506,8 @@ pub fn Bacnet(comptime max_subscriptions: usize) type {
                 };
                 if (ev == .none) break;
             }
-            if (self.shim.overflow) return error.OutputTooSmall;
-            const w = self.shim.out[0..self.shim.out_used];
+            if (self.shim.window.overflow) return error.OutputTooSmall;
+            const w = self.shim.written();
             return if (w.len == 0) null else w;
         }
 
@@ -595,7 +516,30 @@ pub fn Bacnet(comptime max_subscriptions: usize) type {
         }
 
         fn tickFn(ctx: *anyopaque, out: []u8, now_ms: Time) NodeError!?[]const u8 {
-            return cast(ctx).pump(null, out, now_ms);
+            const self = cast(ctx);
+            if (self.cov_pending) {
+                self.cov_pending = false;
+                return self.notifyTrouble(out, now_ms);
+            }
+            return self.pump(null, out, now_ms);
+        }
+
+        /// Re-publish `status_flags` on every object that reports it by COV, so
+        /// a master with a live subscription learns about the fault instead of
+        /// having to poll for it. Re-writing the identical value is what drives
+        /// the notification — `Device.update` notifies on every write of a
+        /// `cov_reported` property.
+        fn notifyTrouble(self: *Self, out: []u8, now_ms: Time) NodeError!?[]const u8 {
+            self.shim.reset(&.{}, out);
+            self.device.tp = self.shim.transport();
+            for (self.device.objects) |*obj| {
+                const p = obj.find(.status_flags) orelse continue;
+                if (!p.cov_reported) continue;
+                self.device.update(obj.id, .status_flags, p.value, now_ms) catch break;
+            }
+            if (self.shim.window.overflow) return error.OutputTooSmall;
+            const w = self.shim.written();
+            return if (w.len == 0) null else w;
         }
 
         /// Change a property and notify every COV subscriber — the entry point
@@ -608,14 +552,40 @@ pub fn Bacnet(comptime max_subscriptions: usize) type {
             now_ms: Time,
             out: []u8,
         ) NodeError!?[]const u8 {
-            self.shim.input = null;
-            self.shim.out = out;
-            self.shim.out_used = 0;
-            self.shim.overflow = false;
+            self.shim.reset(&.{}, out);
             self.device.tp = self.shim.transport();
             self.device.update(id, prop, v, now_ms) catch return error.ResponderFailed;
-            const w = self.shim.out[0..self.shim.out_used];
+            const w = self.shim.written();
             return if (w.len == 0) null else w;
+        }
+
+        /// Clause 12: a BACnet object says it is broken through three
+        /// properties — `Reliability` (*why* it is untrustworthy),
+        /// `Status_Flags` (the summary bits every present-value-carrying object
+        /// exposes) and `Out_Of_Service` (the value is decoupled from the
+        /// physical input). Set all three that the caller's object model
+        /// actually declares, and report how many properties were touched so
+        /// `control` can refuse honestly when the model declares none.
+        fn applyTrouble(self: *Self, on: bool) usize {
+            var touched: usize = 0;
+            for (self.device.objects) |*obj| {
+                if (obj.find(.reliability)) |p| {
+                    p.value = .{ .enumerated = if (on) reliability_unreliable_other else reliability_no_fault };
+                    touched += 1;
+                }
+                if (obj.find(.status_flags)) |p| {
+                    p.value = .{ .bit_string = .{
+                        .unused_bits = 4,
+                        .bytes = if (on) &status_flags_trouble else &status_flags_healthy,
+                    } };
+                    touched += 1;
+                }
+                if (obj.find(.out_of_service)) |p| {
+                    p.value = .{ .boolean = on };
+                    touched += 1;
+                }
+            }
+            return touched;
         }
 
         fn controlFn(ctx: *anyopaque, op: Control, now_ms: Time) bool {
@@ -625,12 +595,21 @@ pub fn Bacnet(comptime max_subscriptions: usize) type {
                 .restart => {
                     self.device = self.saved;
                     self.device.tp = self.shim.transport();
+                    // Only undo trouble this adapter injected: the object
+                    // model may carry a fault the simulation put there for its
+                    // own reasons, and a power cycle does not invent facts.
+                    if (self.trouble) _ = self.applyTrouble(false);
+                    self.trouble = false;
+                    self.cov_pending = false;
                     return true;
                 },
-                // BACnet expresses device trouble through per-object
-                // StatusFlags/Reliability, which this device model does not
-                // own; saying so beats faking it.
-                .trouble_on, .trouble_off => return false,
+                .trouble_on, .trouble_off => {
+                    const on = op == .trouble_on;
+                    if (self.applyTrouble(on) == 0) return false;
+                    self.trouble = on;
+                    self.cov_pending = true;
+                    return true;
+                },
             }
         }
     };
@@ -640,9 +619,19 @@ pub const DefaultBacnet = Bacnet(8);
 
 // ── EtherNet/IP ─────────────────────────────────────────────────────────────
 
+/// CIP Vol 1 §5-2.2, the Identity object's Status word. Bits 4-7 are the
+/// *extended* device status (5 = "major fault"); bit 10 is "major recoverable
+/// fault". A device in trouble reports both, which is what a scanner reads out
+/// of `ListIdentity` and out of Identity attribute 5.
+const identity_status_major_fault: u16 = 0x0450;
+
 pub const Enip = struct {
     adapter: enip.Adapter,
     saved: enip.Adapter,
+    trouble: bool = false,
+
+    /// Room for the two CPF items of a rebuilt reply envelope.
+    const cpf_items = 4;
 
     pub fn init(cfg: enip.AdapterConfig, tags: []const enip.TagBinding) Enip {
         const a = enip.Adapter.init(cfg, tags);
@@ -665,10 +654,84 @@ pub const Enip = struct {
     fn deliverFn(ctx: *anyopaque, bytes: []const u8, out: []u8, now_ms: Time) NodeError!?[]const u8 {
         _ = now_ms;
         const self = cast(ctx);
+        if (self.trouble) {
+            if (try troubleReply(bytes, out)) |r| return r;
+        }
         return self.adapter.handle(bytes, out) catch |err| switch (err) {
             error.BufferTooSmall => error.OutputTooSmall,
             error.Malformed => null,
         };
+    }
+
+    /// A faulted device still answers *encapsulation* — session management and
+    /// `ListIdentity` keep working, and the Identity status word is where the
+    /// fault is reported (that is the whole point of a status word). What it
+    /// refuses is CIP *object* traffic: `SendRRData` / `SendUnitData` come back
+    /// as a CIP error reply with general status `0x10 Device State Conflict` —
+    /// Vol 1 §B-1.1, "the device's current mode/state prohibits the execution
+    /// of the requested service". Returning `null` here means "not my case,
+    /// let the responder answer normally".
+    ///
+    /// Synthesised by this adapter rather than by the responder, exactly like
+    /// the Modbus 0x04 path: `enip.Adapter` has no "be broken" switch, and
+    /// teaching it one would be a change to a module this file must not touch.
+    fn troubleReply(bytes: []const u8, out: []u8) NodeError!?[]const u8 {
+        const msg = enip.encap.decode(bytes) catch return null;
+        switch (msg.command) {
+            .send_rr_data, .send_unit_data => {},
+            else => return null,
+        }
+        var in_items: [cpf_items]enip.cpf.Item = undefined;
+        const env = enip.cpf.decodeEnvelope(msg.data, &in_items) catch return null;
+        const data_item = env.list.dataItem() orelse return null;
+
+        // A connected data item carries a 2-byte sequence count before the CIP
+        // message; an unconnected one does not.
+        const connected = data_item.type_id == .connected_data;
+        var seq: u16 = 0;
+        const cip_bytes = if (connected) blk: {
+            const cd = enip.cpf.ConnectedData.decode(data_item) catch return null;
+            seq = cd.sequence_count;
+            break :blk cd.payload;
+        } else data_item.data;
+
+        const req = enip.cip.Request.decode(cip_bytes) catch return null;
+        var reply_buf: [8]u8 = undefined;
+        const reply = (enip.cip.Reply{
+            .service = req.service,
+            .general_status = .device_state_conflict,
+            .additional_status = &.{},
+            .data = &.{},
+        }).encode(&reply_buf) catch return error.OutputTooSmall;
+
+        // Rebuild the envelope with the same address item, so a connected
+        // session stays addressable and only the payload says "no".
+        var body_buf: [64]u8 = undefined;
+        var out_items: [2]enip.cpf.Item = undefined;
+        const payload = if (connected)
+            enip.cpf.ConnectedData.encode(seq, reply, &body_buf) catch return error.OutputTooSmall
+        else
+            reply;
+        out_items[0] = env.list.addressItem() orelse return null;
+        out_items[1] = .{ .type_id = data_item.type_id, .data = payload };
+
+        var env_buf: [128]u8 = undefined;
+        const encoded = enip.cpf.encodeEnvelope(
+            env.interface_handle,
+            0,
+            &out_items,
+            &env_buf,
+        ) catch return error.OutputTooSmall;
+
+        return enip.encap.encode(.{
+            .command = msg.command,
+            .session_handle = msg.session_handle,
+            .status = .success,
+            .sender_context = msg.sender_context,
+            .options = 0,
+            .data = encoded,
+            .total_len = 0, // `encode` derives it from `data`
+        }, out) catch return error.OutputTooSmall;
     }
 
     fn controlFn(ctx: *anyopaque, op: Control, now_ms: Time) bool {
@@ -677,11 +740,21 @@ pub const Enip = struct {
         switch (op) {
             .restart => {
                 self.adapter = self.saved;
+                self.trouble = false;
                 return true;
             },
-            // The CIP Identity object's status word carries device faults, but
-            // this adapter treats it as configuration, not state.
-            .trouble_on, .trouble_off => return false,
+            .trouble_on => {
+                self.adapter.cfg.identity_status = identity_status_major_fault;
+                self.adapter.cfg.state = .major_unrecoverable_fault;
+                self.trouble = true;
+                return true;
+            },
+            .trouble_off => {
+                self.adapter.cfg.identity_status = self.saved.cfg.identity_status;
+                self.adapter.cfg.state = self.saved.cfg.state;
+                self.trouble = false;
+                return true;
+            },
         }
     }
 };
@@ -697,6 +770,32 @@ pub const Opcua = struct {
     conn: opcua.server.Connection,
     recv_buf: []u8,
     msg_buf: []u8,
+    /// The Variables this device's *process* values live in. `trouble_on`
+    /// stamps `trouble_status` on each of them; a client reading one gets a
+    /// Bad DataValue instead of a number, which is how OPC UA says "this
+    /// point is not to be trusted" (OPC 10000-4 §7.34). Empty is legal —
+    /// `ServerStatus.State` alone still moves.
+    trouble_nodes: []const opcua.encoding.NodeId = &.{},
+    /// `BadDeviceFailure` (0x808B0000) by default. `BadOutOfService`
+    /// (0x808D0000) is the other honest choice, for a point a technician has
+    /// deliberately taken off scan; `status.bad_out_of_service` below.
+    trouble_status: opcua.encoding.StatusCode = status_bad_device_failure,
+    /// Supplied when the caller wants the whole `ServerStatus` structure
+    /// (i=2256) re-encoded, not just the `State` variable (i=2259). A client
+    /// that reads the structure — which is what most browsers show — sees the
+    /// state only if it is re-encoded, because it is an ExtensionObject.
+    status_info: ?opcua.nodestore.NodeStore.ServerStatusInfo = null,
+    trouble: bool = false,
+
+    /// OPC 10000-4 Table B.1. Neither code is in `opcua.server.status`'s table
+    /// (that one lists the codes the *services* return), so they are named
+    /// here: these are the codes a *device* attaches to a value.
+    pub const status_bad_device_failure: opcua.encoding.StatusCode = 0x808B_0000;
+    pub const status_bad_out_of_service: opcua.encoding.StatusCode = 0x808D_0000;
+
+    /// `ServerState` (OPC 10000-5 §12.6).
+    const server_state_running: i32 = 0;
+    const server_state_failed: i32 = 1;
 
     pub fn init(
         self: *Opcua,
@@ -734,7 +833,9 @@ pub const Opcua = struct {
         const self = cast(ctx);
         var w: std.Io.Writer = .fixed(out);
         self.conn.feed(bytes, &w, @intCast(now_ms)) catch |err| switch (err) {
-            error.WriteFailed, error.NoSpaceLeft => return error.OutputTooSmall,
+            // The server's error set says "the answer did not fit"; the fleet
+            // has one word for that.
+            error.WriteFailed, error.ResponseTooLarge, error.ValueTooLarge => return error.OutputTooSmall,
             else => return error.ResponderFailed,
         };
         const written = w.buffered();
@@ -745,11 +846,41 @@ pub const Opcua = struct {
         const self = cast(ctx);
         var w: std.Io.Writer = .fixed(out);
         self.conn.tick(&w, @intCast(now_ms)) catch |err| switch (err) {
-            error.WriteFailed, error.NoSpaceLeft => return error.OutputTooSmall,
+            // The server's error set says "the answer did not fit"; the fleet
+            // has one word for that.
+            error.WriteFailed, error.ResponseTooLarge, error.ValueTooLarge => return error.OutputTooSmall,
             else => return error.ResponderFailed,
         };
         const written = w.buffered();
         return if (written.len == 0) null else written;
+    }
+
+    /// Stamp `code` on every nominated Variable's `DataValue` and move
+    /// `ServerStatus.State`. The `NodeStore` belongs to the caller, but it is
+    /// reached entirely through `opcua`'s own public API (`getNode`,
+    /// `setValue`, `refreshServerStatus`) — no `opcua` source changes.
+    fn applyTrouble(self: *Opcua, on: bool) bool {
+        const store = self.server.store;
+        const code: opcua.encoding.StatusCode = if (on) self.trouble_status else 0;
+        for (self.trouble_nodes) |id| {
+            const n = store.getNode(id) orelse continue;
+            switch (n.attributes) {
+                .variable => |*v| v.value.status = code,
+                else => {},
+            }
+        }
+
+        const state: i32 = if (on) server_state_failed else server_state_running;
+        const state_id = opcua.encoding.NodeId{
+            .numeric = .{ .namespace = 0, .id = opcua.nodestore.id.server_status_state },
+        };
+        _ = store.setValue(state_id, .{ .scalar = .{ .int32 = state } }, null) catch return false;
+        if (self.status_info) |info| {
+            var updated = info;
+            updated.state = state;
+            store.refreshServerStatus(updated) catch return false;
+        }
+        return true;
     }
 
     fn controlFn(ctx: *anyopaque, op: Control, now_ms: Time) bool {
@@ -762,11 +893,16 @@ pub const Opcua = struct {
                 // `Connection` is.
                 self.conn = opcua.server.Connection.init(self.server, self.recv_buf, self.msg_buf) catch
                     return false;
+                if (self.trouble) _ = self.applyTrouble(false);
+                self.trouble = false;
                 return true;
             },
-            // OPC UA carries device trouble in a variable's StatusCode, which
-            // belongs to the NodeStore, not the connection.
-            .trouble_on, .trouble_off => return false,
+            .trouble_on, .trouble_off => {
+                const on = op == .trouble_on;
+                if (!self.applyTrouble(on)) return false;
+                self.trouble = on;
+                return true;
+            },
         }
     }
 };
@@ -929,7 +1065,81 @@ test "enip adapter: RegisterSession round-trips and restart clears the handle" {
 
     try testing.expect(n.control(.restart, 0));
     try testing.expectEqual(@as(u32, 0), dev.adapter.session_handle);
-    try testing.expect(!n.control(.trouble_on, 0)); // honestly refused
+}
+
+test "enip adapter: trouble sets the Identity status word and refuses CIP with 0x10" {
+    var tag_bytes = [_]u8{0} ** 8;
+    const tags = [_]enip.TagBinding{.{ .name = "Speed", .type = .dint, .bytes = &tag_bytes }};
+    var dev = Enip.init(.{}, &tags);
+    const n = dev.node();
+    var out: [512]u8 = undefined;
+
+    // Register a session first, so the CIP path is reachable.
+    var reg: [28]u8 = @splat(0);
+    std.mem.writeInt(u16, reg[0..2], @intFromEnum(enip.Command.register_session), .little);
+    std.mem.writeInt(u16, reg[2..4], 4, .little);
+    std.mem.writeInt(u16, reg[24..26], 1, .little);
+    _ = (try n.deliver(&reg, &out, 0)).?;
+    const handle = dev.adapter.session_handle;
+
+    // An unconnected Get_Attributes_All on the Identity object, healthy.
+    var cip_buf: [32]u8 = undefined;
+    const cip_req = try enip.cip.getAttributesAll(
+        @intFromEnum(enip.cip.ClassCode.identity),
+        1,
+        &cip_buf,
+    );
+    var env_buf: [96]u8 = undefined;
+    const env = try enip.cpf.encodeEnvelope(0, 5, &enip.cpf.unconnectedItems(cip_req), &env_buf);
+    var rr_buf: [160]u8 = undefined;
+    const rr = try enip.encap.encode(.{
+        .command = .send_rr_data,
+        .session_handle = handle,
+        .status = .success,
+        .sender_context = @splat(0),
+        .options = 0,
+        .data = env,
+        .total_len = 0,
+    }, &rr_buf);
+
+    const healthy = (try n.deliver(rr, &out, 0)).?;
+    try testing.expectEqual(enip.cip.GeneralStatus.success, try cipStatusOf(healthy));
+
+    // Trouble: the Identity status word carries the major-fault bits …
+    try testing.expect(n.control(.trouble_on, 0));
+    try testing.expectEqual(identity_status_major_fault, dev.adapter.cfg.identity_status);
+    try testing.expectEqual(enip.encap.DeviceState.major_unrecoverable_fault, dev.adapter.cfg.state);
+
+    // … ListIdentity still answers, and reports the fault …
+    var li: [24]u8 = @splat(0);
+    std.mem.writeInt(u16, li[0..2], @intFromEnum(enip.Command.list_identity), .little);
+    const ident_reply = (try n.deliver(&li, &out, 0)).?;
+    try testing.expect(std.mem.indexOfScalar(
+        u8,
+        ident_reply,
+        @intCast(identity_status_major_fault & 0xFF),
+    ) != null);
+
+    // … and the CIP data path answers Device State Conflict instead.
+    const refused = (try n.deliver(rr, &out, 0)).?;
+    try testing.expectEqual(enip.cip.GeneralStatus.device_state_conflict, try cipStatusOf(refused));
+    try testing.expectEqual(@as(?usize, refused.len), try node_mod.Framing.enip_encap.frameLen(refused));
+
+    try testing.expect(n.control(.trouble_off, 0));
+    try testing.expectEqual(enip.cip.GeneralStatus.success, try cipStatusOf((try n.deliver(rr, &out, 0)).?));
+}
+
+/// Digs the CIP general status out of a `SendRRData`/`SendUnitData` reply.
+fn cipStatusOf(bytes: []const u8) !enip.cip.GeneralStatus {
+    const msg = try enip.encap.decode(bytes);
+    var items: [4]enip.cpf.Item = undefined;
+    const env = try enip.cpf.decodeEnvelope(msg.data, &items);
+    const item = env.list.dataItem() orelse return error.TestUnexpectedResult;
+    const payload = if (item.type_id == .connected_data)
+        (try enip.cpf.ConnectedData.decode(item)).payload
+    else
+        item.data;
+    return (try enip.cip.Reply.decode(payload)).general_status;
 }
 
 test "bacnet adapter: a broadcast Who-Is draws an I-Am out of the shim" {
@@ -957,6 +1167,81 @@ test "bacnet adapter: a broadcast Who-Is draws an I-Am out of the shim" {
     const reply = (try n.deliver(&who_is, &out, 0)) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(@as(u8, 0x81), reply[0]);
     try testing.expectEqual(@as(?usize, reply.len), try node_mod.Framing.bacnet_bvll.frameLen(reply));
-    try testing.expect(!n.control(.trouble_on, 0)); // honestly refused
+    // No object here declares Reliability / Status_Flags / Out_Of_Service, so
+    // there is nothing to degrade and the adapter says so.
+    try testing.expect(!n.control(.trouble_on, 0));
     try testing.expect(n.control(.restart, 0));
+}
+
+test "bacnet adapter: trouble moves Reliability, StatusFlags and Out_Of_Service" {
+    var props = [_]bacnet.Property{
+        .{ .id = .object_name, .value = .{ .string = "Zone-1-Temp" } },
+        .{ .id = .present_value, .value = .{ .real = 21.5 }, .cov_reported = true },
+        .{ .id = .status_flags, .value = .{ .bit_string = .{
+            .unused_bits = 4,
+            .bytes = &status_flags_healthy,
+        } }, .cov_reported = true },
+        .{ .id = .reliability, .value = .{ .enumerated = reliability_no_fault } },
+        .{ .id = .out_of_service, .value = .{ .boolean = false }, .writable = true },
+    };
+    var objects = [_]bacnet.Object{.{
+        .id = .{ .type = .analog_input, .instance = 1 },
+        .properties = &props,
+    }};
+
+    var dev: DefaultBacnet = undefined;
+    dev.init(
+        .{ .instance = 260_001, .vendor_id = 999 },
+        &objects,
+        .{ .ip = .{ 10, 0, 0, 2 }, .port = 47808 },
+        .{ .ip = .{ 10, 0, 0, 1 }, .port = 47808 },
+    );
+    const n = dev.node();
+
+    try testing.expect(n.control(.trouble_on, 0));
+    const obj = &objects[0];
+    try testing.expectEqual(
+        reliability_unreliable_other,
+        obj.find(.reliability).?.value.enumerated,
+    );
+    try testing.expectEqualSlices(
+        u8,
+        &status_flags_trouble,
+        obj.find(.status_flags).?.value.bit_string.bytes,
+    );
+    const flags = bacnet.StatusFlags.fromOctet(obj.find(.status_flags).?.value.bit_string.bytes[0]);
+    try testing.expect(flags.fault and flags.in_alarm and flags.out_of_service);
+    try testing.expect(obj.find(.out_of_service).?.value.boolean);
+
+    // A ReadProperty of Reliability now really returns the degraded value: the
+    // frame a master would see, not just the struct field.
+    var out: [512]u8 = undefined;
+    const read_reliability = [_]u8{
+        0x81, 0x0A, 0x00, 0x11, // BVLC original-unicast, 17 octets
+        0x01, 0x04, // NPDU, expecting reply
+        0x00, 0x05, 0x01, 0x0C, // confirmed-request, max APDU, invoke 1, ReadProperty
+        0x0C, 0x00, 0x00, 0x00, 0x01, // context 0: object = analog-input,1
+        0x19, 0x67, // context 1: property = reliability (103)
+    };
+    const rp = (try n.deliver(&read_reliability, &out, 0)) orelse return error.TestUnexpectedResult;
+    // A ComplexACK whose property value is application-tagged Enumerated(7):
+    // tag 9, length 1, value 7.
+    try testing.expectEqual(@as(u8, 0x81), rp[0]);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        rp,
+        &.{ 0x91, @as(u8, @intCast(reliability_unreliable_other)) },
+    ) != null);
+
+    // A COV notification is queued for the next tick rather than dropped:
+    // `control` has no output buffer to write one into. (Nothing is on the
+    // wire here because nobody has subscribed; the point is that the flag is
+    // consumed by the tick that *does* have a buffer.)
+    try testing.expect(dev.cov_pending);
+    _ = try n.tick(&out, 10);
+    try testing.expect(!dev.cov_pending);
+
+    try testing.expect(n.control(.trouble_off, 0));
+    try testing.expectEqual(reliability_no_fault, obj.find(.reliability).?.value.enumerated);
+    try testing.expect(!obj.find(.out_of_service).?.value.boolean);
 }

@@ -25,11 +25,23 @@ changed. Three shapes:
 2. *Framed session* — DNP3 (`Session.feedFrame`) and OPC UA (`Connection.feed`
    into a `std.Io.Writer.fixed(out)`). The adapter owns the session buffers.
 3. *Transport-driven* — IEC 104 (`Server.poll`) and BACnet (`Device.poll`) pull
-   from a `Transport` vtable. Each gets a **shim**: `StreamShim` (one injected
-   chunk in, one output buffer out) and `DatagramShim` (one datagram in, every
-   `send`/`broadcast` concatenated out). Both modules ship a `LoopTransport`,
-   but those are peer-to-peer test rigs with a 16-slot × 1.5 kB mailbox (~24 kB
-   per node) — unaffordable at fleet scale.
+   from a `Transport` vtable. Each gets a **shim** from `shim.zig`: `StreamShim`
+   (one injected chunk in, one output buffer out) and `DatagramShim` (one
+   datagram in, every `send`/`broadcast` concatenated out), both over the same
+   protocol-agnostic `Window`. Both modules ship a `LoopTransport`, but those
+   are peer-to-peer test rigs with a 16-slot × 1.5 kB mailbox (~24 kB per node)
+   — unaffordable at fleet scale.
+
+**Why `shim.zig` lives here.** The shim could not go in `iec104` or `bacnet`
+without that module depending on the other's `Transport` type: the two are
+structurally alike (bytes in, bytes out, one peer) but nominally different
+(`read`/`write` over a stream vs `send`/`broadcast`/`recv` over datagrams). A
+separate module for ~60 lines of logic would be a dependency both ways for no
+gain. `fleetsim` is the only place the two shapes meet and already depends on
+both. The reusable half — `Window`, which owns all the buffer discipline
+(all-or-nothing datagrams, a latching `overflow` that never writes half a frame)
+— is protocol-agnostic and public, so an eighth `Transport`-driven responder
+costs one ~15-line vtable binding, not another buffer discipline.
 
 **Restart** is uniform: each adapter snapshots its responder *by value* at
 construction and restores that snapshot on `Control.restart`. This is a genuine
@@ -39,17 +51,34 @@ does). A master therefore sees DNP3 IIN1.7 set again, an S7 CPU that must
 re-negotiate its PDU size, an ENIP session handle back to zero, an OPC UA
 channel it must re-`HEL`.
 
-**Trouble** is native where the protocol has a word for it and refused where it
-does not. Modbus → exception `0x04 SlaveDeviceFailure` (synthesised by the
-adapter, echoing the request's function code and MBAP header, since the
-responder itself has no "be broken" switch). DNP3 → `IIN1.6 device_trouble`.
-S7 → SZL 0x0424 CPU status `STOP`. IEC 104 → the `iv` quality bit on every point
-whose element carries a quality descriptor (§7.2.6.3). BACnet, ENIP and OPC UA →
-`control` returns **false**, the fleet records `control_unsupported`, and the
-caller can fall back to a transport-level `silent` fault. Their trouble concepts
-(BACnet `StatusFlags`/`Reliability`, the CIP Identity status word, an OPC UA
-variable `StatusCode`) live in state these adapters do not own; faking them
-would teach an operator the wrong lesson.
+**Trouble** is native in all seven, each in the vocabulary its own protocol
+gives a degraded device:
+
+| protocol | mechanism | what a real master saw |
+|---|---|---|
+| Modbus | exception `0x04 SlaveDeviceFailure`, synthesised by the adapter (the responder has no "be broken" switch), echoing the request's function code and MBAP header | offline test |
+| DNP3 | `IIN1.6 device_trouble` | opendnp3: `IIN: [0x10, 0x00]` → `[0x50, 0x00]` |
+| IEC 104 | the `iv` quality bit on every point whose element carries a quality descriptor (§7.2.6.3) | c104: `Quality set: {}` → `{ Invalid }` |
+| S7comm | SZL `0x0424` operating mode `STOP` | python-snap7: `bzu_id=0x08 (RUN)` → `0x04 (STOP)` |
+| BACnet | clause 12's fault triple: `Reliability = unreliable-other`, `Status_Flags = {in-alarm, fault, out-of-service}`, `Out_Of_Service = true` | bacpypes3: `no-fault-detected` → `unreliable-other` |
+| EtherNet/IP | Identity status word → `0x0450` (extended status 5 "major fault" + bit 10 "major recoverable fault"), state → `major_unrecoverable_fault`, and CIP data services answer general status `0x10 Device State Conflict` | pycomm3: `status=b'0\x00'`/Success → `b'P\x04'`/"Device state conflict" |
+| OPC UA | `BadDeviceFailure` on every Variable the caller nominated, plus `ServerStatus.State = Failed` | asyncua: `Good`/`State=0` → `BadDeviceFailure`/`State=1` |
+
+Three of these reach state that belongs to the **caller** — BACnet object
+properties, an OPC UA `NodeStore` — and they do it strictly through the
+responder module's own public API (`Object.find` + `Device.update`;
+`NodeStore.getNode` / `setValue` / `refreshServerStatus`). Not one line of any
+responder module changed. Where the caller's model declares nothing to degrade
+(a BACnet device whose objects carry none of the three fault properties),
+`control` still returns **false** and the fleet records `control_unsupported`:
+the honest answer is preserved for the case that actually deserves it.
+
+Two design notes worth pinning down. A faulted EtherNet/IP device still answers
+*encapsulation* — `ListIdentity`, `RegisterSession` — because the Identity
+status word is precisely where CIP puts a fault; what it refuses is CIP object
+traffic. And BACnet's COV notification for the fault is deferred to the next
+`tick`: `control` has no output buffer to write a datagram into, so the adapter
+sets `cov_pending` and the tick that *does* have a buffer emits it.
 
 **`fleet.zig` — the scheduler.** One binary min-heap of events ordered by
 `(time, insertion sequence)`; the sequence counter is bumped at push, and pushes
@@ -81,20 +110,45 @@ series, zero-order hold, optionally looping). `Sink` is a one-function vtable, s
 a driver never knows which protocol it feeds; `Signal` pairs one driver with many
 sinks and a period, and the fleet schedules it as an ordinary event.
 
-**`tcp.zig` — the only socket code.** `serveTcp` binds, accepts up to
-`max_sessions` peers one at a time, and pumps: `readVec` (one underlying read) →
-`submitStream` → `advance(elapsed)` → write `outbound()`. `poll(2)` bounds both
-the read and the accept so the `run_ms` budget means something and the fleet's
-timers still fire on a quiet link. `serveUdp` is the same for BACnet, replying to
-the last peer seen. Deliberately blocking and single-threaded: the moment this
-file grows an event loop, the "no I/O in the core" property stops being visible.
+**`tcp.zig` — the only socket code.** Three bindings, all single-threaded.
+
+`serveTcp` binds, accepts up to `max_sessions` peers one at a time, and pumps:
+`readVec` (one underlying read) → `submitStream` → `advance(elapsed)` → write
+`outbound()`. `poll(2)` bounds both the read and the accept so the `run_ms`
+budget means something and the fleet's timers still fire on a quiet link.
+`serveUdp` is the same for BACnet, replying to the last peer seen.
+
+`serveTcpMulti` binds **several** listeners and services **several peers at
+once**, still from one thread: build a readiness set (every listener that can
+still take a peer, plus every connected peer), `poll(2)` it, accept what is new,
+read what is ready, `advance` once, then write each node's `outbound()` back.
+Concurrency here is a *readiness set*, not a thread pool — which is the only way
+to add it without moving I/O into the core: there is still exactly one clock
+read per loop iteration, at the top, and the fleet still receives an injected
+`Time`. Everything is allocated before the loop (`max_peers` slots × three
+buffers), so the steady state never touches the allocator.
+
+Routing: a node's reply goes to the peer that most recently sent it something;
+when nothing was asked (unsolicited traffic) it goes to every peer on that
+node's listener, which is what a device with several connected masters does.
+Closing a peer clears any `last_peer` entry pointing at its slot, so a reply can
+never be routed to a slot a *different* master has since been given. A
+connection beyond `max_peers` is accepted and immediately closed rather than
+left in the backlog: an unserviceable connection that looks alive is a worse lie
+than a refusal.
+
+`serveTcpMulti` is also the right binding whenever a fault *schedule* matters:
+`serveTcp` restarts its clock at every accept (each `serveTcpOn` measures from
+its own accept), so a fault at t=15 s means something different to every
+session, while `serveTcpMulti` keeps one clock for the whole run.
 
 ## The determinism argument
 
 Everything that could differ between two runs is either injected or seeded:
 
 - **Time** enters only through `advance(to_ms)`. Nothing in the core reads a
-  clock (`tcp.nowMs` is in the binding, not the core).
+  clock (`tcp.nowMs` is in the binding, not the core — including in the
+  multi-peer loop, which reads it once per iteration and nowhere else).
 - **Randomness** comes from exactly two `std.Random.DefaultPrng` streams seeded
   from `Options.seed` — one for link mechanics, one for signal drivers, split so
   that adding a signal cannot perturb packet loss and vice versa. There is no
@@ -133,50 +187,119 @@ Proved, not asserted, by three tests:
 
 ## What was verified live, against real third-party masters
 
-All three ran on Linux against the module's own `tcp.zig` binding, Debug build.
+**All seven protocols now have third-party-master evidence through the adapter
+and the module's own binding**, on Linux, Debug build. Each run schedules a
+`trouble` fault at simulated t=15 s and the master polls across it, so the
+transcripts below are also the proof that device trouble is expressible in every
+one of the seven.
 
-- **`pymodbus` 3.14.0 → `ModbusNode`** (`FLEETSIM_TEST_LISTEN=127.0.0.1:15061`).
-  The master performed 12 × `read_holding_registers(0, count=8)`, a
-  `write_register(5, 0xBEEF)` with a read-back, a `write_coil(3, True)` with a
-  `read_coils` read-back, a `read_input_registers`, and an out-of-range read
-  which came back as an exception as it should. The sine `Signal` was visibly
-  animating holding register 0 across the reads
+- **`pymodbus` 3.14.0 → `ModbusNode`** (`FLEETSIM_TEST_LISTEN`, `serveTcp`).
+  12 × `read_holding_registers(0, count=8)`, a `write_register(5, 0xBEEF)` with
+  a read-back, a `write_coil(3, True)` with a `read_coils` read-back, a
+  `read_input_registers`, and an out-of-range read that came back as
+  `ExceptionResponse(function_code=131, exception_code=2)`. The sine `Signal`
+  was visibly animating holding register 0 across the reads
   (`500 → 623 → 735 → 823 → 880 → 900 → 880 → … → 500`, a 5 s period sampled at
-  250 ms). Our side printed:
+  250 ms). Our side:
   `live fleetsim Modbus: sessions=1 frames_in=18 frames_out=18 bytes_in=216 bytes_out=371 delivered=18 replied=18 signal_fires=13 hr0=264 hr5=0xBEEF coil3=true`
-- **`pycomm3` 1.2.x → `EnipNode`** (`FLEETSIM_ENIP_LISTEN=127.0.0.1:15063`).
-  `CIPDriver.list_identity` decoded our identity item completely
+  — byte-identical to the first pass, i.e. the multi-peer work changed nothing
+  for the single-peer path.
+
+- **`opendnp3` `master-demo` → `Dnp3Node`** (`FLEETSIM_DNP3_LISTEN`,
+  `serveTcpMulti`). opendnp3 built from source (`release` branch, Apache-2.0),
+  used unpatched: its demo dials 127.0.0.1:20000 with LocalAddr 1 / RemoteAddr
+  10, so the test's outstation is configured to match. It ran its startup tasks,
+  a 1-minute integrity poll, a 5-second Class-1 exception poll, three demanded
+  integrity scans, a demanded exception scan and an ad-hoc range scan
+  (`001,002 Binary Input - With Flags, 16-bit start stop [0, 3]`), decoding
+  `001,001 Binary Input - Packed Format` and `030,001 Analog Input - 32-bit With
+  Flag` on every response. **IIN over the run: `[0x90, 0x00]` (restart+need-time)
+  → `[0x10, 0x00]` → `[0x50, 0x00]`** — that 0x40 is IIN1.6 `device_trouble`,
+  set by the scheduled fault and seen by the master. Our side:
+  `live fleetsim DNP3: peers=1 peak=1 frames_in=17 frames_out=17 bytes_in=370 bytes_out=558 delivered=17 replied=17 device_trouble=true`
+
+- **`c104` 2.2.1 (lib60870-C) → `Iec104Node`** (`FLEETSIM_IEC104_LISTEN`,
+  `serveTcpMulti`). The client's state machine went
+  `CLOSED_AWAIT_OPEN → OPEN_MUTED → OPEN` (i.e. our `STARTDT con` was accepted),
+  then issued **14 station interrogations** and received **76 APDUs**, including
+  the byte-exact `680e0000020064010700ffff00000014` (C_IC_NA_1 activation
+  confirm) and the M_ME_NC_1 report `6812060002000d8114002f00c900000000ac4100`
+  carrying 21.5. **45 point updates**, quality
+  `Quality set: {}, is_good: True` → **`Quality set: { Invalid }, is_good: False`**
+  at t=15 s on all three points. Our side:
+  `live fleetsim IEC 104: peers=1 frames_in=17 frames_out=76 delivered=17 replied=16 started=true iv101=true iv201=true`
+
+- **`python-snap7` 3.1.0 → `S7Node`** (`FLEETSIM_S7_LISTEN`, `serveTcpMulti`).
+  COTP connect, `Setup communication` negotiating a **480-byte PDU**, then 14
+  rounds of `db_read(1, 0, 16)` + `read_szl(0x0424, 0)`. DB1.DBD8 was animated
+  by a sine and the client decoded it as a big-endian REAL
+  (`900.00 → 176.39 → 623.61 → …`); DB1[0:8] read back `0001020304050607` every
+  time. **SZL 0x0424 record `5144ff08` (bzu_id 0x08 = RUN) → `5144ff04`
+  (0x04 = STOP)** at t=15 s. Our side:
+  `live fleetsim S7comm: peers=1 frames_in=31 frames_out=30 delivered=31 replied=30 pdu=480 cpu_status=stop`
+
+  *Oracle defect worth recording:* python-snap7 3.1.0's own `get_cpu_state()`
+  does **not** issue an SZL read — `build_cpu_state_request` sends a one-byte
+  parameter `0x04` with the source comment "Use READ_AREA function for
+  simplicity", which is not a valid S7 job. No real CPU would answer it, and
+  this responder correctly does not either. `read_szl(0x0424, 0)` is the real
+  request and works.
+
+- **`asyncua` 2.0.1 → `OpcuaNode`** (`FLEETSIM_OPCUA_LISTEN`, `serveTcpMulti`).
+  Full session bring-up (HEL/ACK, OpenSecureChannel, GetEndpoints, a second
+  channel, CreateSession, ActivateSession — 78 messages in, 77 out, 10 365 bytes
+  in / 6 384 bytes out), `get_namespace_array()` →
+  `['http://opcfoundation.org/UA/', 'urn:zig-libs:fleetsim']`, a browse of the
+  Objects folder → `['i=2253', 'ns=1;s=the.measurement']`, and 14 reads of the
+  measurement. **`value=42 status=Good ServerState=0` → `value=42
+  status=BadDeviceFailure ServerState=1`** at t=15 s. Our side:
+  `live fleetsim OPC UA: peers=1 peak=1 frames_in=78 frames_out=77 delivered=78 replied=77 measurement_status=0x808B0000`
+
+- **`pycomm3` 1.2.16 → `EnipNode`** (`FLEETSIM_ENIP_LISTEN`, `serveTcpMulti`).
+  `CIPDriver.list_identity` decoded the identity item completely
   (`product_type='Programmable Logic Controller'`, `product_code=1`,
   `revision={major:1,minor:0}`, `serial='00c0ffee'`,
-  `product_name='zig-fleetsim adapter'`, `state=3`); then an **unconnected**
-  `Get_Attributes_All` on the Identity object, and — the interesting one — a
-  **connected** `Get_Attribute_Single` (attribute 7), which its driver
-  implements via `Forward_Open` + connected send + `Forward_Close`. Both
-  returned the product name. Our side printed:
-  `live fleetsim EtherNet/IP: sessions=3 frames_in=11 frames_out=8 reads=0 writes=0 identity=3 speed=1500`
-- **`bacpypes3` → `BacnetNode`** over UDP
-  (`FLEETSIM_BACNET_LISTEN=127.0.0.1:15064`). A directed `whois` drew an I-Am
-  identifying `260001 127.0.0.1:15064`; `ReadProperty analog-input,1
-  present-value` returned `21.5`; `ReadProperty analog-input,1 object-name`
-  returned `Zone-1-Temp`. Our side printed:
-  `live fleetsim BACnet: datagrams_in=4 datagrams_out=4 delivered=4 replied=4`
+  `product_name='zig-fleetsim adapter'`), and an unconnected
+  `Get_Attributes_All` on the Identity object was repeated across the fault.
+  **`identity.status b'0\x00'` (0x0030) → `b'P\x04'` (0x0450), `state 3` →
+  `state 5`, and `Get_Attributes_All` `ok=True error=None` → `ok=False
+  error='Device state conflict'`.** pycomm3 opens a fresh socket per call, so
+  this run also exercised the multi-peer binding hard:
+  `live fleetsim EtherNet/IP: peers=29 peak=2 frames_in=87 frames_out=58 identity=20 identity_status=0x0450 state=major_unrecoverable_fault`
 
-Finding from the live work, worth recording: the first version of the TCP
-binding used `std.Io.Reader.readSliceShort`, whose contract is "fill the whole
-destination buffer unless end-of-stream" — **not** "return what is available".
-On a request/response protocol that means blocking for 8 KiB a master will never
-send, and every master timed out. `readVec` (one underlying read) is the right
-call for a framed stream. Only a real master exposed this; every offline test
-passed throughout.
+- **`bacpypes3` 0.0.106 → `BacnetNode`** over UDP (`FLEETSIM_BACNET_LISTEN`,
+  `serveUdp`). A directed `who_is` drew an I-Am identifying `device,260001`;
+  `ReadProperty analog-input,1 object-name` returned `Zone-1-Temp`; then 14
+  rounds reading present-value, reliability, status-flags and out-of-service.
+  **`reliability=no-fault-detected status-flags= out-of-service=0` →
+  `reliability=unreliable-other status-flags=in-alarm;fault;out-of-service
+  out-of-service=1`** at t=15 s. Our side:
+  `live fleetsim BACnet: datagrams_in=58 datagrams_out=58 delivered=58 replied=58 reliability=7 status_flags=0xD0 out_of_service=true`
 
-The other four adapters (DNP3, IEC 104, S7comm, OPC UA) are exercised offline
-against real protocol frames — a DNP3 `RESET_LINK_STATES` answered with a
-link-layer ACK and a restart that re-arms IIN1.7, an IEC 104 `STARTDT act`
-answered `STARTDT con` byte-exactly, an S7 COTP connect answered with a CC, and
-the OPC UA connection wired through a fixed writer — but were **not** driven by a
-third-party master in this pass. Their own modules already carry that evidence
-(opendnp3, lib60870, snap7, open62541); what is untested here is the *adapter*,
-not the responder. See the deferred list.
+- **Two masters at once** (`FLEETSIM_MULTI_LISTEN`, `serveTcpMulti`).
+  `pymodbus` on the Modbus node and `c104` on the IEC 104 node, two sockets, two
+  protocols, one binding thread: 25 Modbus reads (`[1000, 1001, 1002, 1003]`
+  every time — the *other* node's registers never leaked in) and 22 IEC 104
+  point updates, with **28.8 s of overlapping traffic**. Our side:
+  `live fleetsim multi-peer: peers=2 peak_concurrent=2 refused=0 frames_in=38 frames_out=70 modbus_replied=25 iec104_replied=13`
+
+Findings from the live work, worth recording:
+
+1. The first version of the TCP binding used `std.Io.Reader.readSliceShort`,
+   whose contract is "fill the whole destination buffer unless end-of-stream" —
+   **not** "return what is available". On a request/response protocol that means
+   blocking for 8 KiB a master will never send, and every master timed out.
+   `readVec` (one underlying read) is the right call for a framed stream.
+2. `serveTcpMulti`'s first version had both an `errdefer` over the listeners
+   bound so far *and* a `defer` over the whole array. On the "no peer connected"
+   path that closes every bound listener **twice**, which aborts. Only a live
+   run with no master reached it; the offline `error.BindFailed` test passed by
+   luck, because it never bound anything. It is now one `defer` over
+   `listeners[0..bound]`, evaluated at scope exit.
+3. `OpcuaNode` did not compile once anything instantiated its vtable: the error
+   map named `error.NoSpaceLeft`, which is not in `server.ServerError`. The
+   adapter was exported and never called, so nothing had ever analysed
+   `deliverFn`. Standing up the offline round-trip test found it immediately.
 
 ## Scale — measured, not estimated
 
@@ -188,8 +311,15 @@ polls every node once per simulated second for **six simulated minutes** =
 
 | build | wall time | per poll | replies | events | RSS before → after setup → peak |
 |---|---|---|---|---|---|
-| Debug | 2.0–2.6 s | 5.5–7.2 µs | 352 822 / 360 000 | 732 900 | 5.8 → 8.9 → 9.1 MiB |
-| ReleaseFast | 171–188 ms | 0.48–0.52 µs | 352 822 / 360 000 | 732 900 | 2.9 → 3.6 → 4.1 MiB |
+| Debug | 2.5–2.6 s | 6.9–7.3 µs | 352 822 / 360 000 | 732 900 | 6.4 → 9.4 → 9.5 MiB |
+| ReleaseFast | 175–202 ms | 0.49–0.56 µs | 352 822 / 360 000 | 732 900 | 3.0 → 3.7 → 4.2 MiB |
+
+Re-measured after the trouble/multi-peer/shim work (three runs each, on a
+machine with three other agents building concurrently — the earlier pass
+recorded Debug 2.0–2.6 s / 5.5–7.2 µs and ReleaseFast 171–188 ms / 0.48–0.52 µs
+on an idle machine). **Reply count and event count are byte-identical to the
+first pass**, which is the number that matters: nothing in this work perturbed
+the scheduler's behaviour, only its surroundings.
 
 Reply count and event count are identical between builds and between runs — the
 same determinism property, at scale. Zero capacity losses. The RSS delta for the
@@ -247,6 +377,11 @@ address puts a fake PLC on the network: it will answer writes, report values a
 loopback or an isolated lab segment. The binding accepts one peer at a time and
 does no rate limiting; it is a test fixture, not a server.
 
+`serveTcpMulti` changes the exposure only in degree: it will hold `max_peers`
+connections at once and still authenticates nothing. It does no rate limiting
+and no per-peer accounting beyond the slot count; it is a test fixture, not a
+server.
+
 The fleet is a **star**: every device talks to the outside world, not to its
 peers. Peer-to-peer fabric behaviour is `netsim`'s job, which is why
 `applyNetsimTrace` maps `netsim`'s link-scoped kinds onto the device end of the
@@ -254,38 +389,31 @@ link, maps a `partition` cut onto "those devices are unreachable", and reports
 `clock_jump` as unmapped (a fleet has one clock by construction — per-node skew
 would break the total order that makes replay work).
 
-## DRY candidates found while building this
+## DRY candidates found while building this — both now resolved
 
-- `dnp3.outstation.Session` can frame a *solicited* fragment (`feedFrame`,
-  `nextFrames`) but has no public way to frame an **unsolicited** one —
-  `sendFragment` is private. `adapters.Dnp3.emitUnsolicited` re-does that
-  eight-line job with the module's own public `link`/`transport` API. It belongs
-  in `Session` as `unsolicitedFrames(now, out)`. Marked in the source.
-- `iec104.outstation.Server` and `bacnet.device.Device` both ship a
-  `LoopTransport` sized for peer-to-peer offline tests. A minimal
-  one-chunk-in / one-buffer-out shim is generally useful and could live beside
-  them, which would let the two shims here disappear.
+- **`dnp3.outstation.Session.unsolicitedFrames(now_ms, out)` — added.**
+  `Session` could frame a *solicited* fragment (`feedFrame`, `nextFrames`) but
+  had no public way to frame an **unsolicited** one, because `sendFragment` is
+  private; this adapter re-did that job over `dnp3`'s public `link`/`transport`
+  API. It belongs on `Session` because `Session` owns `tx_seq`: framing an
+  outstation-initiated fragment anywhere else means duplicating the transport
+  sequence bookkeeping, which is exactly what confuses a master's reassembler.
+  The addition is purely additive — `Outstation.unsolicited` is untouched for
+  callers that own their framing — and `adapters.Dnp3.tickFn` now calls it.
+- **`shim.zig` — added, in this module.** See "Why `shim.zig` lives here" above
+  for why it cannot live in `iec104` or `bacnet`, and why a module of its own
+  would be worse than either. It is public (`fleetsim.Window`,
+  `fleetsim.StreamShim`, `fleetsim.DatagramShim`), because a consumer holding
+  one of those two responders outside a fleet wants exactly this, and both
+  `LoopTransport`s are the wrong shape for it.
 
 ## Deferred (honest list)
 
-- **Four adapters have no third-party-master evidence in this pass** (DNP3,
-  IEC 104, S7comm, OPC UA). Their responders do; their adapters do not. The
-  hooks are in place — `Framing` handles all four and the live-test pattern is
-  three lines — so this is an hour of work with opendnp3 / lib60870 / snap7 /
-  open62541 installed, not a design gap.
-- **`OpcuaNode` has no offline round-trip test here.** It compiles, wires
-  `Connection.feed`/`tick` to a fixed writer, and its restart path re-`init`s
-  the connection, but there is no test in this module that drives it with a
-  HEL/OPN/MSG sequence — the `opcua` module's own `TestRig` does that far better,
-  and standing up a `NodeStore` + `Server` per node is a page of setup. It is
-  exported, and untested at this layer.
-- **`Control.trouble` is unimplemented for BACnet, ENIP and OPC UA** — refused
-  honestly (`control` returns false) rather than faked. Implementing them means
-  reaching into object properties / the Identity status word / a variable's
-  `StatusCode`, which those adapters do not own today.
-- **No multi-connection binding.** `serveTcp` serves one peer at a time. A
-  master that opens several sockets in parallel (some OPC UA and ENIP clients
-  do) will queue. Fixing this means an event loop, which belongs in a consumer.
+Four entries from the first pass have been **closed** and are recorded above
+rather than here: third-party-master evidence for DNP3 / IEC 104 / S7comm /
+OPC UA, `OpcuaNode`'s offline round-trip, `trouble` for BACnet / ENIP / OPC UA,
+and the multi-connection binding. What is still open:
+
 - **`applyNetsimTrace` drops `clock_jump`** and returns the count of unmapped
   events. Per-node clock skew would need a per-node clock offset, which the
   single total order does not currently model.
@@ -300,6 +428,27 @@ would break the total order that makes replay work).
 - **The scale test is Modbus-only.** A mixed 1000-node fleet would be a better
   number; the per-protocol memory story in the table above is reasoned, not
   measured, for the six non-Modbus adapters.
+- **`serveTcpMulti` fans a node's unsolicited traffic to every peer on that
+  node's listener.** For a device with several masters subscribed that is the
+  right behaviour; for one where the masters are meant to be isolated it is not,
+  and the binding has no way to tell the difference. A per-peer session identity
+  (which is what DNP3 and OPC UA actually have) would fix it, and belongs with
+  whoever needs it.
+- **The multi-peer binding is proved with two peers, not many.** The offline
+  test uses two, the live run reached `peak_concurrent=2` with two different
+  masters and 29 sequential peers from pycomm3. `max_peers` is honoured and
+  over-limit connections are counted, but nothing here has driven 100 masters at
+  one fleet.
+- **`OpcuaNode`'s `trouble` degrades the Variables the caller nominates**
+  (`trouble_nodes`), not "every process value the server has". There is no
+  notion in the `NodeStore` of which Variables are process values as opposed to
+  server diagnostics, and inventing one here would be a guess about the caller's
+  address space.
+- **BACnet's trouble sets one shared `StatusFlags` octet for every degraded
+  object**, so an object that was already `in-alarm` for its own reasons comes
+  back healthy on `trouble_off`. Per-object save/restore would need per-object
+  storage; the simulator's answer is that a healthy simulated point has clear
+  flags.
 
 ## Coordinator notes
 
@@ -308,6 +457,11 @@ would break the total order that makes replay work).
 - **No `/NOTICE` entry is required.** Nothing here ports third-party source and
   no third-party implementation was consulted as a design reference; the
   determinism methodology comes from the repo's own `netsim`, whose TigerBeetle
-  VOPR design-reference entry already exists. `pymodbus`, `pycomm3` and
-  `bacpypes3` were run as black-box compatibility oracles only, which
-  CONVENTIONS §5 explicitly says needs no entry.
+  VOPR design-reference entry already exists. `pymodbus`, `pycomm3`,
+  `bacpypes3`, `opendnp3`, `c104`/lib60870, `python-snap7` and `asyncua` were
+  run as black-box compatibility oracles only, which CONVENTIONS §5 explicitly
+  says needs no entry. (`opendnp3` already has a NOTICE entry from the `dnp3`
+  module's own interop work; nothing new is owed.)
+- **`modules/dnp3` gained one additive public function**
+  (`outstation.Session.unsolicitedFrames`) plus its test and doc updates. The
+  existing public API is unchanged and source-compatible.
