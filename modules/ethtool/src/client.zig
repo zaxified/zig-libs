@@ -20,11 +20,12 @@
 //!
 //! ## Extended ACKs
 //!
-//! The socket enables `NETLINK_EXT_ACK`, so a rejection carries the kernel's
-//! own sentence — "failed to retrieve link settings" is what a Wi-Fi interface
-//! answers a `LINKMODES_GET` with. `lastErrorMessage` returns it. Without the
-//! sockopt the same rejection is a bare `EOPNOTSUPP`, which is why it is on by
-//! default and not an option.
+//! The shared `netlink` transport enables `NETLINK_EXT_ACK` on every socket it
+//! opens, so a rejection carries the kernel's own sentence — "failed to
+//! retrieve link settings" is what a Wi-Fi interface answers a `LINKMODES_GET`
+//! with. `lastErrorMessage` returns it, out of the transport's own buffer;
+//! this module keeps no second copy. Without the sockopt the same rejection is
+//! a bare `EOPNOTSUPP`, which is why it is on by default and not an option.
 //!
 //! ## Every reply is a single message
 //!
@@ -50,10 +51,13 @@ const features_mod = @import("features.zig");
 const stats_mod = @import("stats.zig");
 const moduleinfo = @import("moduleinfo.zig");
 
-/// `NETLINK_ADD_MEMBERSHIP` / `NETLINK_DROP_MEMBERSHIP` / `NETLINK_EXT_ACK`
-/// (linux/netlink.h).
+/// `NETLINK_ADD_MEMBERSHIP` / `NETLINK_DROP_MEMBERSHIP` (linux/netlink.h) —
+/// used by `EventSocket` below.
 pub const NETLINK_ADD_MEMBERSHIP: u32 = 1;
 pub const NETLINK_DROP_MEMBERSHIP: u32 = 2;
+/// `NETLINK_EXT_ACK`. This module no longer sets it — the shared `netlink`
+/// transport does, on every socket — but the constant stays public because it
+/// always was.
 pub const NETLINK_EXT_ACK: u32 = 11;
 
 pub const RequestError = error{
@@ -117,38 +121,44 @@ pub const BitsetForm = enum {
 /// Find the id of the multicast group named `want` in the attribute bytes of a
 /// `CTRL_CMD_NEWFAMILY` reply. Pure — golden-tested offline against a captured
 /// nlctrl reply.
+///
+/// A thin wrapper over `genetlink.findMcastGroupId`. This walk was copied here
+/// from `nl80211`, which asked for exactly that to be promoted once a second
+/// family needed it; it has been, and the name is kept because it is part of
+/// this module's public API and `goldens.zig` drives it.
 pub fn findMcastGroupId(attr_bytes: []const u8, want: []const u8) codec.Error!?u32 {
-    var it: codec.AttrIterator = .{ .buf = attr_bytes };
-    while (try it.next()) |a| {
-        if (a.type != CTRL_ATTR_MCAST_GROUPS) continue;
-        var groups: codec.AttrIterator = .{ .buf = a.data };
-        while (try groups.next()) |g| {
-            var id: ?u32 = null;
-            var name: ?[]const u8 = null;
-            var inner: codec.AttrIterator = .{ .buf = g.data };
-            while (try inner.next()) |x| switch (x.type) {
-                CTRL_ATTR_MCAST_GRP_ID => id = try x.asU32(),
-                CTRL_ATTR_MCAST_GRP_NAME => name = x.asString(),
-                else => {},
-            };
-            if (name) |n| {
-                if (std.mem.eql(u8, n, want)) return id orelse return error.BadLength;
-            }
-        }
-    }
-    return null;
+    return genl.findMcastGroupId(attr_bytes, want);
 }
 
-/// nlctrl attributes this module needs beyond what `genetlink` exposes — the
-/// same extension point the sibling `nl80211` module documents.
-pub const CTRL_ATTR_MCAST_GROUPS: u16 = 7;
-pub const CTRL_ATTR_MCAST_GRP_NAME: u16 = 1;
-pub const CTRL_ATTR_MCAST_GRP_ID: u16 = 2;
+/// nlctrl attributes, re-exported from `genetlink` — this module used to
+/// declare its own copies.
+pub const CTRL_ATTR_MCAST_GROUPS = genl.CTRL_ATTR_MCAST_GROUPS;
+pub const CTRL_ATTR_MCAST_GRP_NAME = genl.CTRL_ATTR_MCAST_GRP_NAME;
+pub const CTRL_ATTR_MCAST_GRP_ID = genl.CTRL_ATTR_MCAST_GRP_ID;
 
-/// The longest kernel extended-ACK sentence worth keeping. The kernel's own
-/// messages are short strings; anything longer is truncated rather than
-/// allocated.
-pub const max_error_message = 160;
+/// The longest kernel extended-ACK sentence kept. Now the shared netlink
+/// transport's own cap rather than a second, smaller buffer here; anything
+/// longer is truncated rather than allocated.
+pub const max_error_message = @FieldType(genl.Socket, "ext_ack_buf").len;
+
+/// Fold the shared resolver's error set onto this module's. `FamilyNotFound`
+/// becomes `NoSuchDevice`, which is exactly what an `ENOENT` from nlctrl
+/// mapped to through `errnoToError` before the resolver was shared;
+/// `NameTooLong` cannot happen for a name this module hardcodes.
+fn mapResolve(e: genl.McastGroupError) SubscribeError {
+    return switch (e) {
+        error.GroupNotFound => error.GroupNotFound,
+        error.FamilyNotFound => error.NoSuchDevice,
+        error.NameTooLong => unreachable, // "ethtool" fits GENL_NAMSIZ
+        error.OutOfMemory => error.OutOfMemory,
+        error.SendFailed => error.SendFailed,
+        error.RecvFailed => error.RecvFailed,
+        error.MalformedReply => error.MalformedReply,
+        error.AccessDenied => error.AccessDenied,
+        error.SystemResources => error.SystemResources,
+        error.Unexpected => error.Unexpected,
+    };
+}
 
 // ── the command socket ─────────────────────────────────────────────────────
 
@@ -171,19 +181,15 @@ pub const Ethtool = struct {
     /// The dynamically resolved `ethtool` message-type id (23 on the
     /// development machine — never hardcode it).
     family_id: u16,
-    err_buf: [max_error_message]u8 = @splat(0),
-    err_len: usize = 0,
 
     /// Open a `NETLINK_GENERIC` socket and resolve the ethtool family.
     /// `error.FamilyNotFound` means a kernel without `CONFIG_ETHTOOL_NETLINK`
     /// (or none visible in this network namespace).
+    ///
+    /// `NETLINK_EXT_ACK` is set by the shared transport, not here.
     pub fn open(gpa: std.mem.Allocator) OpenError!Ethtool {
         var sock = try genl.Socket.open(gpa);
         errdefer sock.close();
-        // Best effort: a kernel without NETLINK_EXT_ACK simply answers with
-        // bare errnos, which every error path here already handles.
-        const on: u32 = 1;
-        _ = linux.setsockopt(sock.fd, linux.SOL.NETLINK, NETLINK_EXT_ACK, @ptrCast(&on), @sizeOf(u32));
         const family_id = try sock.resolveFamily(uapi.family_name);
         return .{ .sock = sock, .family_id = family_id };
     }
@@ -199,9 +205,11 @@ pub const Ethtool = struct {
 
     /// The kernel's own explanation of the most recent rejection
     /// (`NLMSGERR_ATTR_MSG`), or null when it attached none. Valid until the
-    /// next request on this client.
+    /// next request on this client. The buffer belongs to the shared netlink
+    /// transport; this module keeps no copy of its own.
     pub fn lastErrorMessage(cl: *const Ethtool) ?[]const u8 {
-        return if (cl.err_len == 0) null else cl.err_buf[0..cl.err_len];
+        const s = cl.sock.lastErrorMessage();
+        return if (s.len == 0) null else s;
     }
 
     // ── link ───────────────────────────────────────────────────────────────
@@ -543,36 +551,11 @@ pub const Ethtool = struct {
 
     /// Resolve the family's `monitor` multicast group to its dynamic id.
     /// Unprivileged.
+    ///
+    /// The nlctrl round trip is `genetlink.Socket.resolveMcastGroup`; this is
+    /// the error-set adapter over it.
     pub fn resolveMulticastGroup(cl: *Ethtool, name: []const u8) SubscribeError!u32 {
-        const gpa = cl.allocator();
-        const seq = cl.sock.nextSeq();
-        const req = genl.buildGetFamilyRequest(gpa, seq, uapi.family_name) catch |e| switch (e) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.NameTooLong => unreachable, // "ethtool" fits GENL_NAMSIZ
-        };
-        defer gpa.free(req);
-        try cl.send(req);
-
-        var found: ?u32 = null;
-        while (true) {
-            const dgram = cl.sock.recvDatagram() catch |e| return recvErr(e);
-            var it: codec.MessageIterator = .{ .buf = dgram };
-            while (it.next() catch return error.MalformedReply) |m| {
-                if (m.pid != cl.sock.portid or m.seq != seq) continue;
-                switch (m.type) {
-                    codec.NLMSG_ERROR => {
-                        const code = m.errorCode() catch return error.MalformedReply;
-                        if (code == 0) return found orelse error.GroupNotFound;
-                        return errnoToError(code);
-                    },
-                    genl.GENL_ID_CTRL => {
-                        const p = genl.splitPayload(m.payload) catch return error.MalformedReply;
-                        found = findMcastGroupId(p.attrs, name) catch return error.MalformedReply;
-                    },
-                    else => {},
-                }
-            }
-        }
+        return cl.sock.resolveMcastGroup(uapi.family_name, name) catch |e| return mapResolve(e);
     }
 
     // ── raw escape hatch ───────────────────────────────────────────────────
@@ -637,7 +620,7 @@ pub const Ethtool = struct {
         dump: bool,
     ) RequestError!usize {
         const gpa = cl.allocator();
-        cl.err_len = 0;
+        cl.sock.ext_ack_len = 0;
         var flags = codec.NLM_F_REQUEST | codec.NLM_F_ACK;
         if (dump) flags |= codec.NLM_F_DUMP;
         const h = try codec.appendHeader(gpa, msg, cl.family_id, flags, seq, 0);
@@ -695,13 +678,16 @@ pub const Ethtool = struct {
         };
     }
 
+    /// Keep the kernel's own sentence out of an `NLMSG_ERROR`, in the shared
+    /// transport's buffer. Mirrors `netlink.Socket.captureExtAck`, which is not
+    /// reachable through the `genetlink` facade.
     fn noteErrorMessage(cl: *Ethtool, m: codec.Message) void {
-        cl.err_len = 0;
+        cl.sock.ext_ack_len = 0;
         const maybe = m.errorMessage() catch return;
         const s = maybe orelse return;
-        const n = @min(s.len, cl.err_buf.len);
-        @memcpy(cl.err_buf[0..n], s[0..n]);
-        cl.err_len = n;
+        const n = @min(s.len, cl.sock.ext_ack_buf.len);
+        @memcpy(cl.sock.ext_ack_buf[0..n], s[0..n]);
+        cl.sock.ext_ack_len = n;
     }
 };
 

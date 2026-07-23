@@ -30,14 +30,15 @@
 //! Note the ordering hazard `scan.zig` documents: **subscribe before
 //! triggering**, or the completion event can fire in the gap and be lost.
 //!
-//! ## Multicast group resolution lives here, not in `genetlink`
+//! ## Multicast group resolution now lives in `genetlink`
 //!
-//! The `genetlink` module deliberately stops at family-id resolution (its
-//! README calls `CTRL_ATTR_MCAST_GROUPS` an explicit extension point). nl80211
-//! is the first family that needs group ids, so the nlctrl reply walk for them
-//! is implemented here, as a pure function over the reply bytes
-//! (`findMcastGroupId`) plus a thin socket wrapper. If a second family ever
-//! needs it, this is the code to promote into `genetlink`.
+//! It used to live here: nl80211 was the first family that needed group ids,
+//! so the nlctrl reply walk was written in this file with a note saying *"if a
+//! second family ever needs it, this is the code to promote into
+//! `genetlink`"*. Two more families needed it (`ethtool`, then `devlink`), so
+//! it was promoted — `genetlink.findMcastGroupId` is the pure function and
+//! `genetlink.Socket.resolveMcastGroup` the round trip on top. The names below
+//! are kept as thin wrappers so this module's public API is unchanged.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -110,26 +111,31 @@ pub fn errnoToError(code: i32) RequestError {
 /// Find the id of the multicast group named `want` in the attribute bytes of a
 /// `CTRL_CMD_NEWFAMILY` reply (i.e. the nlctrl payload past its own
 /// `genlmsghdr`). Pure — golden-tested offline against a captured reply.
+///
+/// A thin wrapper over `genetlink.findMcastGroupId`, which is where this walk
+/// now lives; kept under its old name because it is part of this module's
+/// public API and `goldens.zig` drives it.
 pub fn findMcastGroupId(attr_bytes: []const u8, want: []const u8) codec.Error!?u32 {
-    var it: codec.AttrIterator = .{ .buf = attr_bytes };
-    while (try it.next()) |a| {
-        if (a.type != uapi.CTRL_ATTR.MCAST_GROUPS) continue;
-        var groups: codec.AttrIterator = .{ .buf = a.data };
-        while (try groups.next()) |g| {
-            var id: ?u32 = null;
-            var name: ?[]const u8 = null;
-            var inner: codec.AttrIterator = .{ .buf = g.data };
-            while (try inner.next()) |x| switch (x.type) {
-                uapi.CTRL_ATTR_MCAST_GRP.ID => id = try x.asU32(),
-                uapi.CTRL_ATTR_MCAST_GRP.NAME => name = x.asString(),
-                else => {},
-            };
-            if (name) |n| {
-                if (std.mem.eql(u8, n, want)) return id orelse return error.BadLength;
-            }
-        }
-    }
-    return null;
+    return genl.findMcastGroupId(attr_bytes, want);
+}
+
+/// Fold the shared resolver's error set onto this module's. `FamilyNotFound`
+/// becomes `NoSuchDevice`, which is exactly what an `ENOENT` from nlctrl
+/// mapped to through `errnoToError` before the resolver was shared;
+/// `NameTooLong` cannot happen for a name this module hardcodes.
+fn mapResolve(e: genl.McastGroupError) SubscribeError {
+    return switch (e) {
+        error.GroupNotFound => error.GroupNotFound,
+        error.FamilyNotFound => error.NoSuchDevice,
+        error.NameTooLong => unreachable, // "nl80211" fits GENL_NAMSIZ
+        error.OutOfMemory => error.OutOfMemory,
+        error.SendFailed => error.SendFailed,
+        error.RecvFailed => error.RecvFailed,
+        error.MalformedReply => error.MalformedReply,
+        error.AccessDenied => error.AccessDenied,
+        error.SystemResources => error.SystemResources,
+        error.Unexpected => error.Unexpected,
+    };
 }
 
 // ── the command socket ─────────────────────────────────────────────────────
@@ -395,36 +401,11 @@ pub const Nl80211 = struct {
 
     /// Resolve one of nl80211's multicast group names ("scan", "mlme", …) to
     /// its dynamic id. Unprivileged.
+    ///
+    /// The nlctrl round trip is `genetlink.Socket.resolveMcastGroup`; this is
+    /// the error-set adapter over it.
     pub fn resolveMulticastGroup(cl: *Nl80211, name: []const u8) SubscribeError!u32 {
-        const gpa = cl.allocator();
-        const seq = cl.sock.nextSeq();
-        const req = genl.buildGetFamilyRequest(gpa, seq, uapi.family_name) catch |e| switch (e) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.NameTooLong => unreachable, // "nl80211" fits GENL_NAMSIZ
-        };
-        defer gpa.free(req);
-        try cl.send(req);
-
-        var found: ?u32 = null;
-        while (true) {
-            const dgram = cl.sock.recvDatagram() catch |e| return recvErr(e);
-            var it: codec.MessageIterator = .{ .buf = dgram };
-            while (it.next() catch return error.MalformedReply) |m| {
-                if (m.pid != cl.sock.portid or m.seq != seq) continue;
-                switch (m.type) {
-                    codec.NLMSG_ERROR => {
-                        const code = m.errorCode() catch return error.MalformedReply;
-                        if (code == 0) return found orelse error.GroupNotFound;
-                        return errnoToError(code);
-                    },
-                    genl.GENL_ID_CTRL => {
-                        const p = genl.splitPayload(m.payload) catch return error.MalformedReply;
-                        found = findMcastGroupId(p.attrs, name) catch return error.MalformedReply;
-                    },
-                    else => {},
-                }
-            }
-        }
+        return cl.sock.resolveMcastGroup(uapi.family_name, name) catch |e| return mapResolve(e);
     }
 
     // ── raw escape hatch ───────────────────────────────────────────────────

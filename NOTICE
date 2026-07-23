@@ -265,6 +265,17 @@ project git history).
                genetlink-family modules can depend on it directly; no new
                third-party design reference beyond the kernel header.
 
+  devlink    — original pure-Zig devlink client, clean-room from
+               linux/devlink.h (GPL-2.0+ WITH Linux-syscall-note). No GPL
+               header source is copied — only the uncopyrightable ABI facts
+               it documents are used (command/attribute/flag constants and
+               nest layouts), relying on the same Linux-syscall-note
+               exception as `netlink`/`genetlink`/`ethtool`/`nl80211`/
+               `wireguard`. iproute2's `devlink` (GPL-2.0) was run ONLY as a
+               black-box test oracle under `strace`, its request bytes
+               diffed against this module's — no iproute2 source consulted,
+               studied or ported.
+
   ethtool    — original pure-Zig ethtool-netlink client, clean-room from
                linux/ethtool_netlink_generated.h and linux/ethtool.h
                (GPL-2.0 WITH Linux-syscall-note). No GPL header source is
