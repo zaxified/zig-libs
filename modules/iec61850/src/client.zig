@@ -42,11 +42,12 @@ const mmsdata = @import("mmsdata.zig");
 const acsi = @import("acsi.zig");
 const report = @import("report.zig");
 const control = @import("control.zig");
+const logging = @import("logging.zig");
 const transport = @import("transport.zig");
 
 pub const Error = mms.Error || presentation.Error || acse.Error ||
     session.Error || cotp.Error || tpkt.Error || acsi.Error || report.Error ||
-    control.Error || transport.TransportError || error{
+    control.Error || logging.Error || transport.TransportError || error{
     NotConnected,
     AlreadyConnected,
     /// The peer refused the transport connection.
@@ -63,6 +64,8 @@ pub const Error = mms.Error || presentation.Error || acse.Error ||
     AccessFailed,
     /// The caller's buffer is too small for this exchange.
     BufferTooSmall,
+    /// A reference this client cannot parse into an object name.
+    BadReference,
 };
 
 pub const Config = struct {
@@ -490,6 +493,75 @@ pub const Client = struct {
         var wr = ber.Writer.init(&w);
         try mmsdata.Emit.boolean(&wr, false);
         try self.writeObject(try attribute(rcb_reference, "RptEna", &ref_buf), fc, wr.done());
+    }
+
+    // ── logs (IEC 61850-7-2 §18) ───────────────────────────────────────────
+
+    /// `QueryLogByTime` / `QueryLogAfter` — one MMS `ReadJournal`.
+    ///
+    /// `journal_reference` is the log's own reference, `LD/LLN0$EventLog`: no
+    /// functional constraint, because a journal is not a named variable. The
+    /// returned iterator points into the client's reassembly buffer and is
+    /// invalidated by the next request, exactly like a read result.
+    pub fn readJournal(
+        self: *Client,
+        journal_reference: []const u8,
+        range: logging.Range,
+    ) Error!logging.ReadJournalResponse {
+        const name = try journalName(journal_reference);
+        const id = self.takeInvokeId();
+        var req: [512]u8 = undefined;
+        const pdu = try logging.encodeReadJournal(id, name, range, &req);
+        const resp = try self.exchange(pdu, id, logging.read_journal_service);
+        return logging.decodeReadJournalResponse(resp);
+    }
+
+    /// `GetJournalStatus` — how many entries the log holds.
+    pub fn getJournalStatus(self: *Client, journal_reference: []const u8) Error!logging.JournalStatus {
+        const name = try journalName(journal_reference);
+        const id = self.takeInvokeId();
+        var req: [256]u8 = undefined;
+        const pdu = try logging.encodeGetJournalStatus(id, name, &req);
+        const resp = try self.exchange(pdu, id, logging.get_journal_status_service);
+        return logging.decodeGetJournalStatusResponse(resp);
+    }
+
+    fn journalName(reference: []const u8) Error!mms.ObjectName {
+        const slash = std.mem.indexOfScalar(u8, reference, '/') orelse return error.BadReference;
+        return .{ .domain_specific = .{
+            .domain = reference[0..slash],
+            .item = reference[slash + 1 ..],
+        } };
+    }
+
+    // ── setting groups (IEC 61850-7-2 §19) ─────────────────────────────────
+
+    /// `SelectActiveSG` — a write of `ActSG` on the SGCB.
+    pub fn selectActiveSG(self: *Client, sgcb_reference: []const u8, group: u8) Error!void {
+        try self.writeSgcb(sgcb_reference, "ActSG", group);
+    }
+
+    /// `SelectEditSG`. Group 0 releases the selection.
+    pub fn selectEditSG(self: *Client, sgcb_reference: []const u8, group: u8) Error!void {
+        try self.writeSgcb(sgcb_reference, "EditSG", group);
+    }
+
+    /// `ConfirmEditSGValues` — a write of `CnfEdit = true`. Until this lands,
+    /// nothing the client wrote under `SE` has any effect.
+    pub fn confirmEditSGValues(self: *Client, sgcb_reference: []const u8) Error!void {
+        var ref_buf: [acsi.max_reference_len]u8 = undefined;
+        var buf: [16]u8 = undefined;
+        var w = ber.Writer.init(&buf);
+        try mmsdata.Emit.boolean(&w, true);
+        try self.writeObject(try attribute(sgcb_reference, "CnfEdit", &ref_buf), .SP, w.done());
+    }
+
+    fn writeSgcb(self: *Client, sgcb_reference: []const u8, attr: []const u8, group: u8) Error!void {
+        var ref_buf: [acsi.max_reference_len]u8 = undefined;
+        var buf: [16]u8 = undefined;
+        var w = ber.Writer.init(&buf);
+        try mmsdata.Emit.unsigned(&w, group);
+        try self.writeObject(try attribute(sgcb_reference, attr, &ref_buf), .SP, w.done());
     }
 
     // ── the control model (IEC 61850-7-2 §20) ──────────────────────────────

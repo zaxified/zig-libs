@@ -6,7 +6,8 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
 
 Two stacks sharing one BER codec. Every wire struct uses explicit shifts in its encode/decode
 rather than a `packed struct`, so the octet layout never depends on Zig's bitfield-packing rules,
-and nothing anywhere allocates.
+and nothing anywhere allocates except `scl` and `sclwrite`, which handle a document of unbounded
+shape and say so.
 
 ### The BER codec, which everything else is only as correct as
 
@@ -147,6 +148,43 @@ and nothing anywhere allocates.
   the `TypeSpecification` from `ctlModel`, and its output for a
   select-before-operate object is **byte-identical** to the one a real IED sent.
 
+### Reporting, logging and setting groups
+
+- **`BufTm` coalesces, it does not delay.** A trigger opens an entry with a deadline `BufTm`
+  milliseconds out; every further trigger on the same data set inside that window merges into the
+  *same* entry, OR-ing the inclusion bit and the reason. One report leaves, not five. Getting this
+  wrong is the difference between a report and a storm, and `BufTm = 0` is the "every change is its
+  own report" case, not a special one.
+- **The B in BRCB is the retention, and retention needs a bound.** Events that happen while
+  `RptEna` is false — or while no client is associated at all — are kept, and a client that
+  re-enables with the `EntryID` it last saw resumes from there. The buffer is a ring of caller-owned
+  entries over a caller-owned arena split into equal slots: when it wraps over an entry the reader
+  has not seen, `BufOvfl` is raised on the next report and cleared once reported. A resume point
+  that has fallen out is `error.EntryIdNotFound`, not a silent restart. A URCB's buffer is purged on
+  disable, which is the whole of the other definition.
+- **`OptFlds` decides the report's shape, so the encoder and the decoder must agree bit for bit.**
+  Every one of the 512 combinations of the nine defined bits is encoded here and decoded by
+  `report.zig` — the same decoder that was validated against captured third-party reports — and
+  checked field by field. A positional format with nine optional prefixes has no room for "probably
+  right".
+- **There is no clock.** `BufTm` and `IntgPd` are deadlines the caller advances with `tick`, exactly
+  like the control model's `sboTimeout`. A report is *encoded* lazily, when the caller drains
+  `pendingNotification`, straight out of the buffer entry — so a report nobody collects costs
+  nothing beyond the entry it already occupies.
+- **A log is a report nobody was listening to**, and it reuses the same `TrgOps`, the same data set
+  and the same `Source` seam. What differs is the store: a bounded circular log whose oldest entry
+  falls out visibly, through `OldEntr`/`OldEntrTm` moving forward, rather than silently. A query
+  that spans the purge returns what survived.
+- **The log's `ReasonCode` is seven bits wide, a report's is six.** IEC 61850-7-2 adds
+  `application-trigger` for a log entry. A client that assumes six reads the wrong bit; the captured
+  third-party entries use the seven-bit form and so does this encoder.
+- **An uncommitted setting-group edit must be invisible.** Writing `LN$SE$…` changes the edit
+  buffer; reading `LN$SG$…` still returns the *active* group's value, even when the group being
+  edited **is** the active one. Only `CnfEdit = true` copies the buffer into the selected group, a
+  confirm with no preceding edit is refused rather than committing whatever was in the buffer, and
+  `SelectEditSG` pre-loads the group so that editing one attribute and confirming does not blank the
+  rest. A real IED refuses an `SE` read with no edit group selected; so does this one.
+
 ### SCL
 
 - **The functional constraint lives on the `DA`, not on the `DO`**, and it
@@ -192,7 +230,18 @@ and nothing anywhere allocates.
   `INT8U` that says `"400"`, a `VisString32` of forty characters and an `Enum`
   value that is not in its `EnumType` are configuration errors that would
   otherwise surface as a type mismatch on the wire long after commissioning.
-- **This is the only file here that allocates**, and it says so: an SCL document
+- **Writing SCL is a different problem from reading it**, and the trap is defaults. SCL is full of
+  optional attributes whose value a reader supplies when they are absent, so a writer that makes
+  every one of them explicit hands the next tool a document that means something slightly different
+  — one flag at a time. `sclwrite` therefore emits an attribute **only when it differs from the
+  schema default**, and keeps the *source document's namespace*, because that URI is how a reader
+  chooses which edition's defaults to apply. Both rules were forced by a third-party model generator
+  disagreeing with an earlier, more explicit emission; the same exercise found that
+  `OptFields/@bufOvfl` defaults to **true**, which this module's parser had been getting wrong.
+- **The round trip is checked through the resolver, not through the text.** Attribute order,
+  whitespace and the position of `LN0` are the writer's business; what must be preserved is the flat
+  list of MMS names, and that is what 44 real configuration files are compared on.
+- **`scl` and `sclwrite` are the only files here that allocate**, and they say so: an SCL document
   is a graph of unbounded shape and the `xml` sibling hands back an allocated
   tree. Everything is arena-backed and freed by one `deinit`. The parser
   underneath is XXE- and billion-laughs-proof and rejects `DOCTYPE` by default;
@@ -438,14 +487,92 @@ the same `-d proto:tpkt` dissection chain:
   True/False and `mms.unsigned` = 1, on the two frames a third-party client reported as
   `Received CommandTermination+.`
 
+### Reporting, logging, setting groups and SCL emission — what actually ran
+
+All of this was driven against the same third-party stack, built with `cmake` and run as a black
+box. Its **shipped `.icd`/`.cid` files were treated as configuration data**, its console output and
+build log were read, and **no source file of it was opened**; every layout below was derived from
+the published IEC/ISO specifications first and then confirmed against octets on the wire.
+
+**A third-party client subscribing to reports from our server** (env-gated test
+`IEC61850_TEST_LISTEN_REPORT`, model deliberately named the way the reference clients are
+hard-wired). Two different reference clients were pointed at it, through a TPKT-aware recording
+proxy:
+
+- Its *reporting* example: read the URCB, wrote `Resv`/`DatSet`/`TrgOps`/`RptEna`/`GI` in one
+  five-variable `Write` (all five answered `success`), then printed **46 reports** it had decoded —
+  8 member-inclusions with reason `general-interrogation` and 44 with reason `data-change`, each
+  labelled with the member's own reference (`simpleIOGenericIO/GGIO1.Ind2.stVal[ST]`), its value and
+  the `TimeOfEntry` our injected clock produced (`Mon Nov 13 23:13:20 2023`).
+- Its *first* example, which unlike the reporting one leaves `IntgPd` on: **integrity** reports
+  (its reason code 8) as well as general-interrogation ones, arriving on the server's own schedule
+  with no request in flight.
+- Its *log* example, hard-wired to `TestIEDGenericIO/LLN0$EventLog`: wrote `LogEna`, read our LCB
+  and printed all nine members in order, then issued a `ReadJournal` and printed **15 journal
+  entries** — `EntryID`, occurrence time, the member's reference, its value and the `ReasonCode`
+  pseudo-variable — out of our bounded store.
+- Its generic MMS browser read, and decoded correctly, our `LLN0$SP$SGCB`
+  (`{3,1,0,false,…}`), an `SG` setting value, and the **fourteen-member BRCB**
+  (`{Events2,false,…/LLN0$Events,1,0111101010,50,0,011011,1000,false,false,00000000000001fd,…,0}`).
+  The same browser **segfaults** on our 15-entry `ReadJournal` response; the same vendor's *library*
+  client parses that identical response without complaint and so does Wireshark, so the crash is in
+  that tool, not in our octets. Reported here because it happened, not because it means anything
+  about the encoding.
+
+**Byte-exact goldens, captured from that stack and re-encoded by us:**
+
+- The **BRCB structure** a real IED returns, member by member — which is how the member *order* in
+  `report.Rcb.decode` was corrected: a BRCB has **no `Resv`** and appends `PurgeBuf`, `EntryID`,
+  `TimeOfEntry` and `ResvTms` after `GI`. The previous layout read `PurgeBuf` out of `DatSet`.
+- The **LCB structure** (`LogEna`, `LogRef`, `DatSet`, `OldEntrTm`, `NewEntrTm`, `OldEntr`,
+  `NewEntr`, `TrgOps`, `IntgPd`).
+- The **SGCB structure**, which our emitter now reproduces **octet for octet**.
+- A **`ReadJournal` request** and its **response** — both rebuilt octet for octet by this module's
+  encoders from their decoded parts. That capture is also where `entryToStartAfter`'s context tag
+  (`[5]`) and the log `ReasonCode`'s **seven**-bit width came from; a six-bit reader gets the wrong
+  bit.
+- The **GI report** a real IED emits: our encoder reproduces those 100 octets exactly from a
+  `sweep(.general_interrogation)`.
+
+**Wireshark cross-check (`rawshark`, `-d proto:tpkt`, Wireshark 4.6.4), on our own output:**
+
+- our reports: `mms.vmd_specific` = `RPT` and `mms.unconfirmedService` = 0 on each, with
+  `mms.boolean` reading `False,False,False,False` on the GI report and `True,True,False,False` on a
+  later one — the same values the third-party client printed;
+- our RCB read response: `mms.unsigned` = 1, 50, 0, 1000 (`ConfRev`, `BufTm`, `SqNum`, `IntgPd`);
+- our `ReadJournal` **request and response**: `mms.journalName`, `mms.rangeStartSpecification`, and
+  on the response 15 × `mms.entryIdentifier`, `mms.entryForm` = 2 (data), `mms.occurenceTime`
+  decoded as `Nov 13, 2023 22:14:33.560000000 UTC`, and `mms.variableTag` alternating the member
+  reference with `ReasonCode`. An independent ASN.1 decoder agreeing field by field is what makes
+  the journal layout more than a reading of the standard.
+
+**SCL emission.** 45 real configuration files (the reference stack's shipped `.icd`/`.cid`/`.scd`)
+were parsed, emitted and re-parsed:
+
+- **44 round-trip to an identical name space** (the 45th is an `.scd` whose data sets reach into
+  another IED and does not resolve in the first place, so there is nothing to compare);
+- every emission is well-formed per `xmllint`;
+- every emission was fed to the reference stack's own **SCL model generator**: **none was
+  rejected**, and **31 of 42** produce a byte-identical generated C model. The 11 that differ do so
+  for three reasons, all of them things `scl.zig` deliberately does not parse and all of them still
+  in the deferred list below: `<Services>` (the generator folds its `ReportSettings` into the RCB's
+  trigger word), `<Log>` element bodies, and `<SampledValueControl>`.
+- Two defects were found *by* that generator and fixed: `LogControl/@logName` is mandatory and must
+  be written even when empty, and **`OptFields/@bufOvfl` defaults to `true`** in the schema — this
+  module's parser had been defaulting it to false, which silently produced a different RCB from
+  every other tool reading the same file.
+- The writer emits an optional attribute **only when it differs from the schema default**, and keeps
+  the **source document's namespace**, because a reader picks which edition's defaults to apply from
+  that URI. Both were learned from the generator disagreeing.
+
 ### What is self-derived
 
 - **Everything the oracle's example model does not contain.** The captured IED is
-  `libiec61850`'s shipped example (`simpleIOGenericIO`, `testComplexArray`), so: buffered report
-  control blocks (`BR`) were read as *names* but never enabled or driven, `EntryID`/`TimeOfEntry`
-  are decoded from the documented layout and unit-tested rather than captured; the segmented-report
-  path (`OptFlds.segmentation`, `SubSeqNum`, `MoreSegmentsFollow`) is unit-tested only; the
-  `data_reference` option in `OptFlds` is unit-tested only, because the captured IED never set it.
+  `libiec61850`'s shipped example (`simpleIOGenericIO`, `testComplexArray`), so: the
+  segmented-report path (`OptFlds.segmentation`, `SubSeqNum`, `MoreSegmentsFollow`) is unit-tested
+  only, and so is the `data_reference` option in `OptFlds` — the reference clients never ask for
+  either. Both are, however, cross-tested encoder-against-decoder over **all 512 combinations** of
+  the nine defined `OptFlds` bits.
 - **`Data` alternatives the capture never carried**: `array`, `bcd`, `booleanArray`, `objId`,
   `mMSString`, `generalized-time`, and `real` (`[8]`, withdrawn). These are encode/decode round-trip
   tested against their documented tags and widths, not against third-party octets.
@@ -482,18 +609,24 @@ the same `-d proto:tpkt` dissection chain:
   round-tripped, not observed from a third-party IED: no oracle model exposes an interlock, a
   synchrocheck or a health block. A `ctlVal` other than `BOOLEAN` (a DPC's `Dbpos`, an INC's
   integer, an APC's float) is encoded generically and unit-tested, never captured.
-- **The buffered report control block's attribute list, and the SGCB's `ResvTms`,** are self-derived
-  from IEC 61850-7-2 and then reconciled against what the oracle serves; the two spellings and the
-  optional attribute are `Options` fields precisely because there is no single right answer.
-- **SCL emission is not implemented at all** — this is a parser and a resolver, not a writer. See
-  Deferred.
+- **The two spellings of `TimeOfEntry`.** `scl.Options.brcb_attributes` exists because
+  implementations disagree (`TimeOfEntry` vs `TimeofEntry`); the RCB emitter answers to both.
+- **`GetJournalStatus`.** IEC 61850's own `GetLogStatusValues` is served by *reading the LCB*
+  (`OldEntr`/`NewEntr`/`OldEntrTm`/`NewEntrTm`), and that path is driven against a third party. The
+  MMS `[68]` service itself is encoded from the published ISO 9506 layout and round-tripped against
+  this module's own decoder — **no peer was observed sending it**, and no reference client offers it.
+- **The `BufOvfl` and `EntryID` resume paths of a BRCB** are driven end to end against this module's
+  own client and unit-tested against a bounded buffer, but the reference clients never disable a
+  BRCB long enough to overrun one, so the overflow flag was never observed arriving at a third party.
+- **`Owner` on an RCB** is emitted on request and never driven; multi-client reservation is modelled
+  as a value, not enforced across associations, because one `Server` serves one association.
 - **The SCL `Substation` section is skipped**, not parsed: `Scl.has_substation` records that it was
   there (which is what `kind()` uses) and nothing more. Single-line diagrams are a configuration-tool
   concern, not a client's.
 
 ### Fuzz + hostile input
 
-20 `std.testing.fuzz` sweeps, all asserting "typed error or valid result, never a panic and never a
+23 `std.testing.fuzz` sweeps, all asserting "typed error or valid result, never a panic and never a
 hang":
 
 - `ber.decode` over arbitrary bytes — anything that decodes with a definite length must **re-encode
@@ -523,6 +656,12 @@ hang":
 - `scl.parse` + `scl.resolve` over arbitrary bytes, and over a hostile identifier glued into a valid
   SCL skeleton so the *resolver* rather than the lexer is what gets exercised; every name it
   produces must be a legal MMS item id within `acsi.max_reference_len`.
+- an arbitrary `Data` value written into every RCB attribute of both kinds, then a `tick` and an
+  `emitNext` on whatever state that left behind;
+- an arbitrary `Data` value written into every SGCB attribute, then `SetEditSGValue`,
+  `ConfirmEditSGValues`, `GetSGValues` and `GetEditSGValue` on the wreckage;
+- arbitrary bytes through `ReadJournal`'s request and response decoders and `GetJournalStatus`'s,
+  walking every journal entry and every variable inside it.
 
 Explicit hostile-input tests (not fuzz) cover every case named in the task and more: a TPKT shorter
 than its header, a bad version, a non-zero reserved octet, a length below the header, a length that
@@ -549,6 +688,20 @@ one that truncates the PDU, an `allData` count contradicting the entries in **bo
 non-GOOSE EtherType, a dangling VLAN tag, a PDU missing a mandatory field; SV fixed-width fields of
 the wrong width and a `noASDU` disagreeing with `seqASDU`; and roughly forty malformed object
 references in both syntaxes.
+
+For the new server-side halves specifically: a BRCB enabled with a `DatSet` that does not resolve
+(reports nothing rather than faulting), an `OptFlds` combination the encoder does not support (there
+is none — all 512 are cross-tested against the decoder — but an inclusion index outside the data set
+and a data set wider than the inclusion bit string are both typed errors), an `EntryID` resume point
+that has fallen out of the bounded buffer (`error.EntryIdNotFound`, and `0` still resolves to
+"whatever is left"), a log query that spans a purge (returns what survived, never an error), an
+entry whose captured values do not fit its slot (`error.EntryTooLarge`, never a truncated report), a
+`ConfirmEditSGValues` with no preceding `SelectEditSG` and one with a selection but nothing edited
+(both refused, over the wire as well as in-process), a setting value larger than its slot, a
+`Setting` table that does not match `NumOfSG`, an SGCB edit taken by a second client, a
+reconfiguration of an enabled RCB, and an SCL emission of a model with a **cyclic type reference**
+(direct, two-step and through an `SDO`) — refused with `error.CyclicType` before an octet is
+written, and terminating rather than looping even with the check disabled.
 
 For the control model and SCL specifically, every case is covered by an explicit test: an SCL type
 reference that does not resolve (at all three levels — `lnType`, `DO type`, `DA type`), a **direct**
@@ -607,8 +760,13 @@ IEC 61850 is **unauthenticated and unencrypted** by design, and its two halves f
 - **Deployments must put transport security under MMS** — IEC 62351-4 (TLS on 102) or a VPN. This
   module implements none and callers should hand the `Transport` seam an already-terminated stream,
   exactly as the repo's BYO-TLS rule (CONVENTIONS §2) prescribes.
-- **The `Server` is a simulator, not an IED.** No SCL model, no control model, no access control, no
-  reporting engine. Do not put it on a network where something might mistake it for real equipment.
+- **The `Server` is a simulator, not an IED.** It now enforces the control model, reports, logs and
+  switches setting groups — which makes it *more* convincing on a wire, not more trustworthy. There
+  is still no SCL model loader, no access control and no file system. Do not put it on a network
+  where something might mistake it for real equipment.
+- **A report is an attack surface pointing outwards.** An enabled BRCB retains data for a client
+  that may never come back; the buffer is bounded by the caller's storage precisely so that a
+  disappeared client cannot be turned into unbounded memory growth. Size it deliberately.
 
 ## Deferred
 
@@ -617,12 +775,16 @@ enormous; this module ships MMS read/write/browse, the control model, SCL parsin
 and GOOSE publish/subscribe, each done properly.
 
 **Driven end to end (client and server, live against a third party):** association, `GetNameList`
-at all three scopes, `Read` and `Write` over named variables and named variable lists, RCB read /
-enable / general interrogation / disable, `InformationReport` reception, and — new — **the whole
-control model**: `ctlModel`/`sboTimeout` reads, the `SBO` read and the `SBOw` write, `Oper` under all
-four models, `CommandTermination` in both directions, `LastApplError` received from a real IED, and
-`GetVariableAccessAttributes` on a control object answered by this server to a real client's
-satisfaction.
+at all three scopes, `Read` and `Write` over named variables and named variable lists,
+`GetNamedVariableListAttributes` answered by this server, RCB read / enable / general interrogation
+/ disable, `InformationReport` reception, the whole **control model** (`ctlModel`/`sboTimeout`
+reads, the `SBO` read and the `SBOw` write, `Oper` under all four models, `CommandTermination` in
+both directions, `LastApplError` received from a real IED, `GetVariableAccessAttributes` on a
+control object answered to a real client's satisfaction), and — new — the whole **server-side
+reporting engine** (a third-party client subscribing to our URCB and receiving data-change,
+integrity and general-interrogation reports with the right per-member reason codes), **logging**
+(`LogEna` written, the LCB read, `ReadJournal` answered with entries a third-party client decoded),
+and **setting groups and the BRCB** read back by a third-party MMS browser.
 
 **Driven against a real IED's own name space (not against a peer, but against ground truth):** the
 whole SCL parse and type resolution — twelve configuration files, 3,273 names, exact in both
@@ -630,33 +792,52 @@ directions against the `GetNameList` of the IED each file configures.
 
 **Codec-only (encoded and decoded, unit-tested, never driven against a peer):** `Identify`,
 `GetVariableAccessAttributes` for anything that is **not** a control object (the general type tree is
-decoded but this server only describes control objects),
-`GetNamedVariableListAttributes`, `DefineNamedVariableList`, `DeleteNamedVariableList`, all four file
-services' *responses*, buffered report control blocks, segmented reports, `data_reference` reports,
-SV in both directions, the alternate-access sub-specification (preserved verbatim, not interpreted),
-`operTm` on a control command, a `ctlVal` that is not a `BOOLEAN`, and every `AddCause` other than
-`Object-not-selected` (produced and consumed by this module's own two halves, never observed from a
-third party — no oracle model exposes an interlock or a synchrocheck).
+decoded but this server only describes control objects), `DefineNamedVariableList`,
+`DeleteNamedVariableList`, all four file services' *responses*, **`GetJournalStatus`**, segmented
+reports, `data_reference` reports, `Owner` on an RCB, SV in both directions, the alternate-access
+sub-specification (preserved verbatim, not interpreted), `operTm` on a control command, a `ctlVal`
+that is not a `BOOLEAN`, and every `AddCause` other than `Object-not-selected` (produced and
+consumed by this module's own two halves, never observed from a third party — no oracle model
+exposes an interlock or a synchrocheck).
+
+Partly implemented, with the boundary stated:
+
+- **Emitting SCL** now exists (`sclwrite.zig`) and is round-tripped through the resolver over 44
+  real files, but it is a **model writer, not an editor for someone else's document**. It emits what
+  `scl.zig` parses and nothing more, so a document with a `Substation` section, `Services`,
+  `SampledValueControl`, `Inputs`/`ExtRef`, `<Log>` bodies, `Private`/`Text` elements or a `desc` on
+  an `LN`/`ReportControl` loses them — `emitParsed` refuses outright when `has_substation` is set
+  unless the caller passes `allow_lossy`. An empty attribute and an absent one are indistinguishable
+  once parsed, so the writer picks whichever form every consumer accepts. Attribute *order* and
+  whitespace are the writer's, not the source's; `LN0` is moved to the front because the schema
+  sequences it there.
+- **The server-side reporting engine** implements the trigger set, `BufTm` coalescing, the integrity
+  period, general interrogation, the bounded buffered-report guarantee with `EntryID` resume and
+  `BufOvfl`, and the whole RCB attribute surface. It does **not** implement report segmentation
+  (`OptFlds.segmentation` is encoded and decoded but this server never splits a report), dynamic
+  `DatSet` re-binding at runtime (a client may write back the value it read, nothing else), or
+  multi-client reservation across associations — one `Server` serves one association, so `Resv` and
+  `Owner` are modelled per-server.
+- **Logging** implements the LCB, a bounded circular store and `ReadJournal`/`GetJournalStatus`. It
+  does not implement `listOfVariables` filtering in a query (the whole entry is returned),
+  per-entry `originatingApplication` (an empty `ApplicationReference` is emitted, which is what the
+  reference IED does), or log *deletion* services.
+- **Setting groups** implement all six services and the edit-then-confirm invariant. `ResvTms`
+  (edition 2's multi-client edit reservation) is read as zero and never enforced, and there is no
+  timer on an abandoned edit — the selection is released when the association drops, not on a
+  deadline.
 
 Not implemented at all:
 
-- **Emitting SCL.** This is a parser and a resolver; there is no writer. A round trip
-  (parse → modify → serialise) would need the whole IEC 61850-6 schema including the sections this
-  module deliberately skips, and a canonicalisation story for a format whose tools all differ. **We
-  do not emit SCL.**
 - **The SCL `Substation` section** (single-line diagram, voltage levels, bays, conducting equipment,
   `LNode` bindings) and `Private`/`Text` elements. `Scl.has_substation` records that it was present
-  and nothing else. Also unparsed: `Services` capabilities, `SampledValueControl`, `Inputs`/`ExtRef`
-  (the subscription bindings edition 2 uses), and `<Log>` bodies.
-- **The server-side reporting engine.** The `Server` answers reads and writes and now enforces the
-  control model, but it does not evaluate `TrgOps`, buffer entries, assign `EntryID`s or emit
-  report `InformationReport`s. Report *decoding* and RCB *manipulation* are complete on the client
-  side; the only unsolicited PDUs this server emits are control notifications.
-- **Logging** (`LG`, `ReadJournal`, `GetJournalStatus`) — SCL's `LogControl` resolves into the right
-  MMS names, but the log itself, the journal services and the entry store are not here.
-- **Setting-group *services*** (`SelectActiveSG`, `SelectEditSG`, `ConfirmEditSGValues`). SCL's
-  `SettingControl` resolves into `LLN0$SP$SGCB` and its attributes, and the `SE`→`SG` mirroring is
-  done, but nothing switches a group.
+  and nothing else. Also unparsed, and therefore also not emitted: `Services` capabilities,
+  `SampledValueControl`, `Inputs`/`ExtRef` (the subscription bindings edition 2 uses), and `<Log>`
+  bodies. These three are exactly the reasons 11 of 42 emitted files produce a generated model that
+  differs from the original's.
+- **Validating an emitted document against the IEC 61850-6 XSD.** The schema is not redistributable
+  and is not present here; validation is `xmllint` well-formedness plus acceptance by a third-party
+  SCL model generator. That is a weaker claim than schema validity and is stated as such.
 - **Control extras:** `Time-activated operate` beyond carrying `operTm` on the wire (nothing
   schedules it), `sboClass` (`operate-once` vs `operate-many` — a select is always released by the
   operate here), `opRcvd`/`opOk`/`tOpOk` under the `OR` constraint (resolved as names, not driven),
@@ -684,5 +865,9 @@ Not implemented at all:
 ## Status
 
 `gap · any (pure codecs + state machines; only the optional TcpTransport touches std.Io.net) ·
-both (client + server, publisher + subscriber) · single_owner` + deps: `xml` (SCL only; every other
-file is std-only and allocation-free) — canonical source is `pub const meta` in src/root.zig.
+both (client + server, publisher + subscriber) · single_owner` + deps: `xml` (SCL parsing, and the
+round-trip check on emission; every other file is std-only and allocation-free) — canonical source
+is `pub const meta` in src/root.zig.
+
+349 tests, 341 offline, 8 live and env-gated (each printing `SKIPPED: …` and passing when no peer
+is present).

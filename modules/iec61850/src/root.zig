@@ -81,12 +81,23 @@ pub const mms = @import("mms.zig");
 pub const acsi = @import("acsi.zig");
 /// Report control blocks and the reports they emit.
 pub const report = @import("report.zig");
+/// The **server side** of reporting: live control blocks, buffering and the
+/// report encoder.
+pub const reporting = @import("reporting.zig");
 /// The control model: `Oper`/`SBO`/`SBOw`/`Cancel`, `AddCause`,
 /// `LastApplError` and the select-before-operate state machines.
 pub const control = @import("control.zig");
+/// Logging (IEC 61850-7-2 §18): the log control block, the bounded log store
+/// and the MMS journal services.
+pub const logging = @import("logging.zig");
+/// Setting groups (IEC 61850-7-2 §19): the SGCB and the edit-then-confirm
+/// services.
+pub const settinggroups = @import("settinggroups.zig");
 /// SCL (IEC 61850-6): the substation configuration language, and the type
 /// resolution that turns it into the object model the MMS layer addresses.
 pub const scl = @import("scl.zig");
+/// Emitting SCL: serialising a model back to an `ICD`/`CID` document.
+pub const sclwrite = @import("sclwrite.zig");
 /// GOOSE frames and PDUs.
 pub const goose = @import("goose.zig");
 /// The GOOSE publisher state machine.
@@ -147,6 +158,14 @@ pub const FunctionalConstraint = acsi.FunctionalConstraint;
 pub const parseAcsi = acsi.parseAcsi;
 pub const parseMms = acsi.parseMms;
 
+pub const ReportControl = server.ReportControl;
+pub const LogControl = server.LogControl;
+pub const SettingGroups = server.SettingGroups;
+pub const ReportTrigger = reporting.Trigger;
+pub const ReportBuffer = reporting.Buffer;
+pub const LogStore = logging.Store;
+pub const Setting = settinggroups.Setting;
+
 pub const Rcb = report.Rcb;
 pub const Report = report.Report;
 pub const OptFlds = report.OptFlds;
@@ -163,6 +182,8 @@ pub const ControlHandler = client.ControlHandler;
 
 pub const Scl = scl.Scl;
 pub const SclModel = scl.Model;
+pub const emitScl = sclwrite.emitParsed;
+pub const SclDocument = sclwrite.Document;
 pub const parseScl = scl.parse;
 pub const resolveScl = scl.resolve;
 
@@ -187,8 +208,12 @@ test {
     _ = mms;
     _ = acsi;
     _ = report;
+    _ = reporting;
+    _ = logging;
+    _ = settinggroups;
     _ = control;
     _ = scl;
+    _ = sclwrite;
     _ = goose;
     _ = publisher;
     _ = subscriber;
@@ -1048,4 +1073,307 @@ test "live: real GOOSE frames through the subscriber" {
         .{ frames, decoded, refreshes, state_changes, gaps, if (sub) |s| s.dataUsable() else false },
     );
     try testing.expect(decoded > 0);
+}
+
+// Set IEC61850_TEST_LISTEN_REPORT=host:port and point a real IEC 61850
+// **reporting** or **log** client at it.
+//
+// The model deliberately carries the names the reference stack's own examples
+// are hard-wired to: `simpleIOGenericIO/LLN0.RP.EventsRCB01` over
+// `simpleIOGenericIO/LLN0$Events` for the reporting client, and
+// `TestIEDGenericIO/LLN0$EventLog` for the log client — so an off-the-shelf
+// client drives this server without being told anything about it.
+//
+// The loop is what makes reports possible at all: a short read timeout, and on
+// every expiry the server's clock advances and whatever the reporting engine
+// produced is pushed out unsolicited.
+test "live: a real IEC 61850 client subscribing to reports from our server" {
+    const endpoint = envVar("IEC61850_TEST_LISTEN_REPORT") orelse {
+        std.debug.print("SKIPPED: live reporting server (set IEC61850_TEST_LISTEN_REPORT=host:port)\n", .{});
+        return error.SkipZigTest;
+    };
+    const ep = splitEndpoint(endpoint) orelse return error.SkipZigTest;
+
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const addr = std.Io.net.IpAddress.parse(ep.host, ep.port) catch return error.SkipZigTest;
+    var listener = addr.listen(io, .{ .reuse_address = true }) catch {
+        std.debug.print("SKIPPED: live reporting server (cannot bind {s})\n", .{endpoint});
+        return error.SkipZigTest;
+    };
+    defer listener.socket.close(io);
+    std.debug.print("live reporting server listening on {s}\n", .{endpoint});
+
+    const rpt_ld = "simpleIOGenericIO";
+    const log_ld = "TestIEDGenericIO";
+
+    var storage: [6][8]u8 = undefined;
+    var vars: [6]Variable = undefined;
+    const rpt_items = [_][]const u8{
+        "GGIO1$ST$Ind1$stVal", "GGIO1$ST$Ind2$stVal",
+        "GGIO1$ST$Ind3$stVal", "GGIO1$ST$Ind4$stVal",
+    };
+    for (0..4) |i| {
+        vars[i] = .{
+            .domain = rpt_ld,
+            .item = rpt_items[i],
+            .storage = &storage[i],
+            .len = try emitInto(&storage[i], .{ .boolean = false }),
+            .writable = true,
+        };
+    }
+    for (4..6) |i| {
+        vars[i] = .{
+            .domain = log_ld,
+            .item = rpt_items[i - 4],
+            .storage = &storage[i],
+            .len = try emitInto(&storage[i], .{ .boolean = false }),
+            .writable = true,
+        };
+    }
+    const sets = [_]DataSet{
+        .{ .domain = rpt_ld, .item = "LLN0$Events", .members = &[_]usize{ 0, 1, 2, 3 } },
+        .{ .domain = log_ld, .item = "LLN0$Events", .members = &[_]usize{ 4, 5 } },
+    };
+
+    const opt = OptFlds{
+        .sequence_number = true,
+        .report_time_stamp = true,
+        .reason_for_inclusion = true,
+        .data_set_name = true,
+        .buffer_overflow = true,
+        .conf_revision = true,
+    };
+    const trg = TrgOps{
+        .data_change = true,
+        .quality_change = true,
+        .integrity = true,
+        .general_interrogation = true,
+    };
+    var urcb_entries: [16]reporting.Entry = @splat(.{});
+    var urcb_arena: [16 * 512]u8 = undefined;
+    var brcb_entries: [16]reporting.Entry = @splat(.{});
+    var brcb_arena: [16 * 512]u8 = undefined;
+    var rcbs = [_]server.ReportControl{
+        .{
+            .kind = .unbuffered,
+            .domain = rpt_ld,
+            .item = "LLN0$RP$EventsRCB01",
+            .rpt_id = "Events1",
+            .dat_set = rpt_ld ++ "/LLN0$Events",
+            .data_set = 0,
+            .conf_rev = 1,
+            .opt_flds = opt,
+            .trg_ops = trg,
+            .buf_tm_ms = 50,
+            .intg_pd_ms = 1000,
+            .buffer = try reporting.Buffer.init(&urcb_entries, &urcb_arena),
+        },
+        .{
+            .kind = .buffered,
+            .domain = rpt_ld,
+            .item = "LLN0$BR$EventsBRCB01",
+            .rpt_id = "Events2",
+            .dat_set = rpt_ld ++ "/LLN0$Events",
+            .data_set = 0,
+            .conf_rev = 1,
+            .opt_flds = opt,
+            .trg_ops = trg,
+            .buf_tm_ms = 50,
+            .intg_pd_ms = 1000,
+            .buffer = try reporting.Buffer.init(&brcb_entries, &brcb_arena),
+        },
+    };
+    var log_entries: [16]logging.Entry = @splat(.{});
+    var log_arena: [16 * 512]u8 = undefined;
+    var logs = [_]server.LogControl{.{
+        .domain = log_ld,
+        .item = "LLN0$LG$EventLog",
+        .journal = "LLN0$EventLog",
+        .log_ref = log_ld ++ "/LLN0$EventLog",
+        .dat_set = log_ld ++ "/LLN0$Events",
+        .data_set = 1,
+        .trg_ops = trg,
+        .store = try logging.Store.init(&log_entries, &log_arena),
+        // A configured IED logs from the moment it starts; a client that writes
+        // `LogEna` is turning it *off* and on again, not switching it on.
+        .log_ena = true,
+    }};
+
+    var set_store: [4 * 16]u8 = undefined;
+    var set_lens: [4]usize = @splat(0);
+    var settings = [_]settinggroups.Setting{.{
+        .domain = rpt_ld,
+        .ln = "PTOC1",
+        .path = "StrVal$setMag$f",
+        .storage = &set_store,
+        .lens = &set_lens,
+    }};
+    for (0..4) |g| {
+        var tmp: [16]u8 = undefined;
+        var w = ber.Writer.init(&tmp);
+        try Emit.float(&w, @floatFromInt(g + 1));
+        const d = w.done();
+        @memcpy(set_store[g * 16 ..][0..d.len], d);
+        set_lens[g] = d.len;
+    }
+    var sgcb = server.SettingGroups{ .domain = rpt_ld, .groups = 3, .settings = &settings };
+    try sgcb.validate();
+
+    const domains = [_][]const u8{ rpt_ld, log_ld };
+    var srv = Server.init(.{}, .{
+        .variables = &vars,
+        .data_sets = &sets,
+        .report_controls = &rcbs,
+        .logs = &logs,
+        .setting_groups = &sgcb,
+        .domains = &domains,
+    });
+
+    const peers = std.fmt.parseInt(usize, envVar("IEC61850_TEST_PEERS") orelse "1", 10) catch 1;
+    var in: [16384]u8 = undefined;
+    var out: [32768]u8 = undefined;
+    var notify: [16384]u8 = undefined;
+    var served: usize = 0;
+    // A plausible wall clock, so a third-party client prints a sensible
+    // `TimeOfEntry` — the module still owns no clock; this is the caller's.
+    var now: u64 = 1_700_000_000_000;
+    var next_toggle: u64 = now + 400;
+    var toggles: usize = 0;
+    while (served < peers) : (served += 1) {
+        const stream = listener.accept(io) catch break;
+        var tt = TcpTransport.fromStream(io, stream);
+        // Short, so an idle connection still lets the clock move.
+        tt.setReadTimeout(200);
+        const t = tt.transport();
+        var idle: usize = 0;
+        var rounds: usize = 0;
+        while (rounds < 20000 and idle < 150) : (rounds += 1) {
+            // A read timeout comes back as **zero bytes**, not as an error, so
+            // both have to land on the idle path — otherwise the clock never
+            // moves and no report is ever produced on the server's own
+            // schedule.
+            const n = t.read(&in) catch 0;
+            if (n == 0) {
+                // The read timed out: advance the IED's clock, flip a status
+                // point if enough of it has passed, and push whatever that
+                // produced. The process runs on its own schedule, not on the
+                // client's — which is the entire point of a report.
+                idle += 1;
+                now += 200;
+                if (now >= next_toggle) {
+                    next_toggle = now + 400;
+                    const which = toggles % 4;
+                    const value = (toggles / 4) % 2 == 0;
+                    vars[which].len = emitInto(&storage[which], .{ .boolean = value }) catch 0;
+                    srv.signal(which, .data_change);
+                    vars[4 + (which % 2)].len =
+                        emitInto(&storage[4 + (which % 2)], .{ .boolean = value }) catch 0;
+                    srv.signal(4 + (which % 2), .data_change);
+                    toggles += 1;
+                }
+                srv.tick(now);
+                while (srv.pendingNotification(&notify) catch null) |note| {
+                    t.write(note) catch break;
+                }
+                continue;
+            }
+            idle = 0;
+            now += 10;
+            srv.tick(now);
+            const reply = srv.handle(in[0..n], &out) catch continue;
+            const rep = reply orelse break;
+            t.write(rep) catch break;
+            while (srv.pendingNotification(&notify) catch null) |note| {
+                t.write(note) catch break;
+            }
+        }
+        srv.releaseAssociation();
+        tt.close();
+    }
+    if (served == 0) {
+        std.debug.print("SKIPPED: live reporting server (no peer connected)\n", .{});
+        return error.SkipZigTest;
+    }
+    std.debug.print(
+        "live reporting server: peers={d} reads={d} writes={d} reports_sent={d} " ++
+            "journal_reads={d} urcb_reports={d} brcb_reports={d} log_entries={d} sg_confirms={d}\n",
+        .{
+            served,                  srv.reads,               srv.writes,
+            srv.reports_sent,        srv.journal_reads,       rcbs[0].reports_emitted,
+            rcbs[1].reports_emitted, logs[0].entries_written, sgcb.confirmations,
+        },
+    );
+    try testing.expect(srv.reads + srv.writes > 0);
+}
+
+// Set IEC61850_TEST_SCL_FILE=<path> to run the **emission** round trip over a
+// real configuration file: parse it, serialise the model back to SCL, parse the
+// emission and assert the two resolved name spaces are identical, name for
+// name. IEC61850_TEST_SCL_IED picks the IED (default: the only one);
+// IEC61850_TEST_SCL_OUT, when set, writes the emitted document there so a
+// third-party tool can be pointed at it.
+test "live: an SCL file survives parse → emit → parse with an identical name space" {
+    const path = envVar("IEC61850_TEST_SCL_FILE") orelse {
+        std.debug.print("SKIPPED: live SCL emission (set IEC61850_TEST_SCL_FILE=<path>)\n", .{});
+        return error.SkipZigTest;
+    };
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const source = std.Io.Dir.cwd().readFileAlloc(io, path, testing.allocator, .unlimited) catch {
+        std.debug.print("SKIPPED: live SCL emission (cannot read {s})\n", .{path});
+        return error.SkipZigTest;
+    };
+    defer testing.allocator.free(source);
+
+    var a = scl.parse(testing.allocator, source, .{ .allow_unknown_btype = true, .check_values = false }) catch |e| {
+        std.debug.print("SKIPPED: live SCL emission ({s} does not parse: {t})\n", .{ path, e });
+        return error.SkipZigTest;
+    };
+    defer a.deinit();
+    if (a.ieds.len == 0) {
+        std.debug.print("SKIPPED: live SCL emission ({s} has no IED)\n", .{path});
+        return error.SkipZigTest;
+    }
+    const ied_name = envVar("IEC61850_TEST_SCL_IED") orelse a.ieds[0].name;
+
+    var model_a = scl.resolve(&a, testing.allocator, ied_name) catch |e| {
+        // The *source* does not resolve — an `.scd` whose data sets reach into
+        // another IED, most often. Nothing to say about the emitter here.
+        std.debug.print("SKIPPED: live SCL emission ({s} does not resolve: {t})\n", .{ path, e });
+        return error.SkipZigTest;
+    };
+    defer model_a.deinit();
+
+    const emitted = try sclwrite.emitParsed(testing.allocator, &a, .{ .allow_lossy = true });
+    defer testing.allocator.free(emitted);
+    if (envVar("IEC61850_TEST_SCL_OUT")) |out_path| {
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = emitted }) catch {};
+    }
+
+    var b = try scl.parse(testing.allocator, emitted, .{ .allow_unknown_btype = true, .check_values = false });
+    defer b.deinit();
+    var model_b = try scl.resolve(&b, testing.allocator, ied_name);
+    defer model_b.deinit();
+
+    // Compared as a **set**: the emitter puts `LN0` first because the schema
+    // sequences it there, and plenty of real files do not.
+    try testing.expectEqual(model_a.nodes.len, model_b.nodes.len);
+    var mismatches: usize = 0;
+    for (model_a.nodes) |x| {
+        const y = model_b.find(x.domain, x.item) orelse {
+            mismatches += 1;
+            continue;
+        };
+        if (x.fc != y.fc or x.b_type != y.b_type or x.leaf != y.leaf) mismatches += 1;
+    }
+    std.debug.print(
+        "live SCL emission: {s} ied={s} names={d} emitted={d} bytes mismatches={d}\n",
+        .{ path, ied_name, model_a.nodes.len, emitted.len, mismatches },
+    );
+    try testing.expectEqual(@as(usize, 0), mismatches);
+    try testing.expect(model_a.nodes.len > 0);
 }

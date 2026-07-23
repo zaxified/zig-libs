@@ -8,13 +8,17 @@
 //! per simulated IED); and it forces the decode paths for every request shape
 //! to be written, which a client-only module never exercises.
 //!
-//! What it is **not**: an IED. There is no SCL model loader, no control model
-//! (`Oper`/`SBO`), no reporting engine and no file system. It serves a flat
-//! table of named variables and data sets that the caller supplies, and it says
-//! so loudly — see SPEC.md's deferred list before pointing anything at it.
+//! What it serves: a flat table of named variables and data sets the caller
+//! supplies, the **control model**, the **reporting engine** (BRCB and URCB,
+//! `TrgOps`, `BufTm` buffering, integrity and general interrogation),
+//! **logging** with the MMS journal services, and **setting groups**. What it is
+//! still not: an IED. There is no SCL model loader and no file system — see
+//! SPEC.md's deferred list before pointing anything at it.
 //!
 //! `handle` takes one TPKT and returns one TPKT (or null when the association
-//! is over). No clock, no thread, no socket.
+//! is over). No clock, no thread, no socket: reports leave through
+//! `pendingNotification`, and `BufTm` / `IntgPd` expire because the caller calls
+//! `tick`.
 
 const std = @import("std");
 const ber = @import("ber.zig");
@@ -26,9 +30,13 @@ const acse = @import("acse.zig");
 const mms = @import("mms.zig");
 const mmsdata = @import("mmsdata.zig");
 const control = @import("control.zig");
+const reporting = @import("reporting.zig");
+const logging = @import("logging.zig");
+const settinggroups = @import("settinggroups.zig");
 
 pub const Error = mms.Error || presentation.Error || acse.Error ||
-    session.Error || cotp.Error || tpkt.Error || control.Error || error{
+    session.Error || cotp.Error || tpkt.Error || control.Error ||
+    reporting.Error || logging.Error || error{
     /// The request is not one this responder models.
     Unsupported,
     BufferTooSmall,
@@ -64,6 +72,14 @@ pub const DataSet = struct {
 /// attributes by hand.
 pub const ControlPoint = control.Point;
 
+/// A live report control block — see `reporting.zig`. The caller owns its
+/// buffer, which is what bounds how much a BRCB may retain.
+pub const ReportControl = reporting.ControlBlock;
+/// A live log control block and its bounded store — see `logging.zig`.
+pub const LogControl = logging.ControlBlock;
+/// The setting-group control block — see `settinggroups.zig`.
+pub const SettingGroups = settinggroups.ControlBlock;
+
 pub const Model = struct {
     variables: []Variable,
     data_sets: []const DataSet = &.{},
@@ -71,6 +87,13 @@ pub const Model = struct {
     /// `SBOw` and `Cancel` hang off. Empty by default, which is exactly the
     /// old behaviour: `CO` writes then fall through to the flat variable table.
     controls: []ControlPoint = &.{},
+    /// Report control blocks, addressed by their `LN$RP$name` / `LN$BR$name`
+    /// prefix. Empty by default: a server with none behaves exactly as before.
+    report_controls: []ReportControl = &.{},
+    /// Log control blocks, addressed by their `LN$LG$name` prefix.
+    logs: []LogControl = &.{},
+    /// The one setting-group control block a logical device may have.
+    setting_groups: ?*SettingGroups = null,
     vendor: []const u8 = "zig-libs",
     model: []const u8 = "iec61850-responder",
     revision: []const u8 = "0.1",
@@ -97,6 +120,11 @@ pub const Config = struct {
 pub const max_notification_len: usize = 512;
 pub const max_pending_notifications: usize = 4;
 
+/// The largest `InformationReport` this server encodes. A sixty-four-member
+/// data set with references and reasons fits comfortably; anything larger is a
+/// `BufferTooSmall` rather than a silently truncated report.
+pub const max_report_len: usize = 8192;
+
 const Pending = struct {
     len: usize = 0,
     bytes: [max_notification_len]u8 = undefined,
@@ -121,6 +149,13 @@ pub const Server = struct {
     notifications: [max_pending_notifications]Pending = @splat(.{}),
     notify_head: usize = 0,
     notify_count: usize = 0,
+    /// Scratch for one encoded report. A report is built lazily when the caller
+    /// drains it, straight out of the control block's buffer, so this is the
+    /// only reporting storage the `Server` itself owns.
+    report_out: [max_report_len]u8 = undefined,
+    /// Round-robin cursor over the report control blocks, so one busy block
+    /// cannot starve the others.
+    report_cursor: usize = 0,
     /// Diagnostics a test asserts on.
     reads: u64 = 0,
     writes: u64 = 0,
@@ -128,6 +163,8 @@ pub const Server = struct {
     selects: u64 = 0,
     operates: u64 = 0,
     control_rejections: u64 = 0,
+    reports_sent: u64 = 0,
+    journal_reads: u64 = 0,
 
     pub fn init(config: Config, model: Model) Server {
         return .{ .config = config, .model = model };
@@ -259,6 +296,11 @@ pub const Server = struct {
     }
 
     fn service(self: *Server, req: mms.ConfirmedRequest, body: []u8) Error![]const u8 {
+        // The journal services carry high tag numbers and are matched before
+        // the switch: `mms.Service` is non-exhaustive, so `.read_journal` and
+        // its status sibling are values, not cases.
+        if (req.service == logging.read_journal_service) return self.readJournal(req, body);
+        if (req.service == logging.get_journal_status_service) return self.journalStatus(req, body);
         return switch (req.service) {
             .identify => mms.encodeIdentifyResponse(req.invoke_id, .{
                 .vendor = self.model.vendor,
@@ -269,6 +311,7 @@ pub const Server = struct {
             .read => self.read(req, body),
             .write => self.write(req, body),
             .get_variable_access_attributes => self.variableAccessAttributes(req, body),
+            .get_named_variable_list_attributes => self.dataSetAttributes(req, body),
             else => mms.encodeConfirmedError(req.invoke_id, .service, 0, body),
         };
     }
@@ -344,6 +387,28 @@ pub const Server = struct {
         return mms.encodeGetVariableAccessAttributesResponse(req.invoke_id, false, w.done(), body);
     }
 
+    /// `GetNamedVariableListAttributes` — the members of a data set. A
+    /// reporting client asks for this to map a report's inclusion bit string
+    /// onto names; without it, a report decodes but nothing can be *labelled*.
+    fn dataSetAttributes(self: *Server, req: mms.ConfirmedRequest, body: []u8) Error![]const u8 {
+        const name = mms.ObjectName.decode(req.body) catch
+            return mms.encodeConfirmedError(req.invoke_id, .service, 0, body);
+        const ds = self.lookupDataSet(name) orelse
+            return mms.encodeConfirmedError(req.invoke_id, .access, 0, body);
+        var members: [reporting.max_members]mms.ObjectName = undefined;
+        var n: usize = 0;
+        for (ds.members) |idx| {
+            if (n == members.len) break;
+            if (idx >= self.model.variables.len) continue;
+            const v = self.model.variables[idx];
+            members[n] = .{ .domain_specific = .{ .domain = v.domain, .item = v.item } };
+            n += 1;
+        }
+        // A configured data set is not deletable, which is what an SCL-driven
+        // IED reports and what stops a client trying to delete it.
+        return mms.encodeGetNamedVariableListAttributesResponse(req.invoke_id, false, members[0..n], body);
+    }
+
     fn read(self: *Server, req: mms.ConfirmedRequest, body: []u8) Error![]const u8 {
         self.reads += 1;
         const r = mms.decodeReadRequest(req.body) catch
@@ -353,37 +418,35 @@ pub const Server = struct {
         const m = w.mark();
         switch (r.spec) {
             .variables => |it_const| {
-                // Written backwards, so collect first then emit in reverse.
+                // Written backwards, so resolve first then emit in reverse.
                 // The select an `SBO` read performs is a *side effect* and must
                 // happen in the order the client asked, not in the writer's
                 // reverse order, so it is done in this forward pass and only
-                // its answer is emitted later.
+                // its answer is emitted later. Everything else resolves to a
+                // description the reverse pass renders.
                 var it = it_const;
-                var found: [64]?*const Variable = undefined;
-                var selects: [64]?[]const u8 = undefined;
+                var resolved: [64]Resolution = undefined;
                 var arena: [4 * acsi.max_reference_len]u8 = undefined;
                 var used: usize = 0;
                 var n: usize = 0;
                 while (try it.next()) |name| {
-                    if (n == found.len) break;
-                    selects[n] = if (used + acsi.max_reference_len <= arena.len)
+                    if (n == resolved.len) break;
+                    const select: ?[]const u8 = if (used + acsi.max_reference_len <= arena.len)
                         self.controlSelect(name, arena[used..])
                     else
                         null;
-                    if (selects[n]) |s| used += s.len;
-                    found[n] = if (selects[n] == null) self.lookup(name) else null;
+                    if (select) |sel| {
+                        used += sel.len;
+                        resolved[n] = .{ .select = sel };
+                    } else {
+                        resolved[n] = self.resolveRead(name);
+                    }
                     n += 1;
                 }
                 var i: usize = n;
                 while (i > 0) {
                     i -= 1;
-                    if (selects[i]) |s| {
-                        try mmsdata.Emit.visibleString(&w, s);
-                    } else if (found[i]) |v| {
-                        try w.bytes(v.value());
-                    } else {
-                        try mms.emitAccessFailure(&w, .object_non_existent);
-                    }
+                    try self.emitResolved(&w, resolved[i]);
                 }
             },
             .variable_list => |name| {
@@ -447,8 +510,305 @@ pub const Server = struct {
         // control model, not the flat variable table: that is the whole point
         // of having one.
         if (self.controlWrite(name, value)) |r| return r;
+        if (self.blockWrite(name, value)) |r| return r;
         const v = self.lookupMut(name) orelse return .{ .failure = .object_non_existent };
-        return self.store(v, value);
+        const r = self.store(v, value);
+        // A successful write to a data-set member is a data change like any
+        // other, and a client that writes one expects the report it subscribed
+        // to. Nothing else in this server knows the value moved.
+        if (r == .success) {
+            if (self.indexOfVariable(v)) |i| self.signal(i, .data_change);
+        }
+        return r;
+    }
+
+    // ── the reporting, logging and setting-group control blocks ────────────
+
+    /// How one read request name resolved. Everything but `select` is free of
+    /// side effects, which is what lets the reverse-order emit pass render it.
+    const Resolution = union(enum) {
+        missing,
+        variable: *const Variable,
+        /// The already-formatted answer of an `SBO` select.
+        select: []const u8,
+        /// A report control block, whole (`attribute.len == 0`) or one member.
+        rcb: Named,
+        /// A log control block.
+        lcb: Named,
+        /// The setting-group control block.
+        sgcb: []const u8,
+        /// One `SE` / `SG` setting.
+        setting: struct { index: usize, half: settinggroups.Half },
+        /// A read the server understands and must refuse per object.
+        refused: mms.DataAccessError,
+    };
+
+    const Named = struct { index: usize, attribute: []const u8 };
+
+    /// Splits `LLN0$RP$urcb01$RptEna` against a block's own `LLN0$RP$urcb01`.
+    fn matchBlock(item: []const u8, prefix: []const u8) ?[]const u8 {
+        if (!std.mem.startsWith(u8, item, prefix)) return null;
+        const rest = item[prefix.len..];
+        if (rest.len == 0) return rest;
+        if (rest[0] != '$') return null;
+        return rest[1..];
+    }
+
+    fn resolveRead(self: *Server, name: mms.ObjectName) Resolution {
+        const d = switch (name) {
+            .domain_specific => |x| x,
+            else => return .missing,
+        };
+        for (self.model.report_controls, 0..) |*cb, i| {
+            if (!std.mem.eql(u8, cb.domain, d.domain)) continue;
+            if (matchBlock(d.item, cb.item)) |attr| return .{ .rcb = .{ .index = i, .attribute = attr } };
+        }
+        for (self.model.logs, 0..) |*lg, i| {
+            if (!std.mem.eql(u8, lg.domain, d.domain)) continue;
+            if (matchBlock(d.item, lg.item)) |attr| return .{ .lcb = .{ .index = i, .attribute = attr } };
+        }
+        if (self.model.setting_groups) |sg| {
+            if (std.mem.eql(u8, sg.domain, d.domain)) {
+                if (matchBlock(d.item, sg.item)) |attr| return .{ .sgcb = attr };
+                if (sg.find(d.domain, d.item)) |hit| {
+                    return .{ .setting = .{ .index = hit.index, .half = hit.half } };
+                }
+            }
+        }
+        if (self.lookup(name)) |v| return .{ .variable = v };
+        return .missing;
+    }
+
+    fn emitResolved(self: *Server, w: *ber.Writer, r: Resolution) Error!void {
+        switch (r) {
+            .missing => try mms.emitAccessFailure(w, .object_non_existent),
+            .refused => |e| try mms.emitAccessFailure(w, e),
+            .variable => |v| try w.bytes(v.value()),
+            .select => |s| try mmsdata.Emit.visibleString(w, s),
+            .rcb => |n| {
+                const cb = &self.model.report_controls[n.index];
+                if (n.attribute.len == 0) {
+                    cb.emitStructure(w) catch try mms.emitAccessFailure(w, .object_non_existent);
+                } else {
+                    cb.emitAttribute(n.attribute, w) catch
+                        try mms.emitAccessFailure(w, .object_non_existent);
+                }
+            },
+            .lcb => |n| {
+                const lg = &self.model.logs[n.index];
+                if (n.attribute.len == 0) {
+                    lg.emitStructure(w) catch try mms.emitAccessFailure(w, .object_non_existent);
+                } else {
+                    lg.emitAttribute(n.attribute, w) catch
+                        try mms.emitAccessFailure(w, .object_non_existent);
+                }
+            },
+            .sgcb => |attr| {
+                const sg = self.model.setting_groups.?;
+                if (attr.len == 0) {
+                    sg.emitStructure(w) catch try mms.emitAccessFailure(w, .object_non_existent);
+                } else {
+                    sg.emitAttribute(attr, w) catch try mms.emitAccessFailure(w, .object_non_existent);
+                }
+            },
+            .setting => |s| {
+                const sg = self.model.setting_groups.?;
+                const bytes = switch (s.half) {
+                    .active => sg.activeValue(s.index) catch {
+                        try mms.emitAccessFailure(w, .object_non_existent);
+                        return;
+                    },
+                    // Reading `SE` with no edit group selected is refused, which
+                    // is what a real IED does and what tells a browsing client
+                    // it has to `SelectEditSG` first.
+                    .edit => sg.editValue(s.index) catch {
+                        try mms.emitAccessFailure(w, .temporarily_unavailable);
+                        return;
+                    },
+                };
+                try w.bytes(bytes);
+            },
+        }
+    }
+
+    /// A write to a report control block, a log control block, the SGCB or a
+    /// setting. Returns null when the name is none of those.
+    fn blockWrite(self: *Server, name: mms.ObjectName, value: []const u8) ?mms.WriteResult {
+        const r = self.resolveRead(name);
+        switch (r) {
+            .rcb, .lcb, .sgcb, .setting => {},
+            else => return null,
+        }
+        const d = mmsdata.Data.decode(value) catch return .{ .failure = .type_inconsistent };
+        d.validate() catch return .{ .failure = .type_inconsistent };
+
+        return switch (r) {
+            .rcb => |n| self.writeRcb(n, d),
+            .lcb => |n| blk: {
+                if (n.attribute.len == 0) break :blk .{ .failure = .object_access_denied };
+                break :blk toResult(self.model.logs[n.index].writeAttribute(n.attribute, d, self.now_ms));
+            },
+            .sgcb => |attr| blk: {
+                if (attr.len == 0) break :blk .{ .failure = .object_access_denied };
+                const sg = self.model.setting_groups.?;
+                break :blk toResult(sg.writeAttribute(attr, d, self.peer, self.now_ms));
+            },
+            .setting => |s| blk: {
+                const sg = self.model.setting_groups.?;
+                // `SG` is the active group's read-only view; only `SE` is
+                // writable, and only between a select and a confirm.
+                if (s.half == .active) break :blk .{ .failure = .object_access_denied };
+                sg.setEditValue(s.index, self.peer, value) catch |e| break :blk switch (e) {
+                    error.EditGroupBusy => .{ .failure = .object_access_denied },
+                    error.NoEditGroup => .{ .failure = .temporarily_unavailable },
+                    else => .{ .failure = .object_value_invalid },
+                };
+                break :blk .success;
+            },
+            else => unreachable,
+        };
+    }
+
+    fn writeRcb(self: *Server, n: Named, d: mmsdata.Data) mms.WriteResult {
+        if (n.attribute.len == 0) return .{ .failure = .object_access_denied };
+        const cb = &self.model.report_controls[n.index];
+        // `DatSet` and `RptID` name strings that live in the caller's model, not
+        // in the request buffer. A client writing back what it read is accepted;
+        // re-pointing a block at another data set at runtime is not something
+        // this server offers, and saying so beats aliasing a freed buffer.
+        if (std.mem.eql(u8, n.attribute, "DatSet") or std.mem.eql(u8, n.attribute, "RptID")) {
+            const s = d.visibleString() catch return .{ .failure = .type_inconsistent };
+            const current = if (std.mem.eql(u8, n.attribute, "DatSet"))
+                cb.dat_set
+            else if (cb.rpt_id.len > 0) cb.rpt_id else cb.item;
+            return if (std.mem.eql(u8, s, current))
+                .success
+            else
+                .{ .failure = .object_access_denied };
+        }
+        const outcome = cb.writeAttribute(n.attribute, d, self.peer, self.now_ms);
+        if (outcome == .ok and std.mem.eql(u8, n.attribute, "GI") and cb.gi) {
+            // The general interrogation happens now; `GI` self-clears once the
+            // report has been generated, which is what the standard says and
+            // what stops a client's single write producing a sweep for ever.
+            _ = cb.sweep(self.reportSource(), .general_interrogation, self.now_ms) catch {};
+            cb.gi = false;
+        }
+        return toResult(outcome);
+    }
+
+    fn toResult(o: reporting.WriteOutcome) mms.WriteResult {
+        return switch (o) {
+            .ok => .success,
+            .denied => .{ .failure = .object_access_denied },
+            .invalid => .{ .failure = .object_value_invalid },
+            .unknown => .{ .failure = .object_non_existent },
+        };
+    }
+
+    // ── the reporting engine's view of this model ──────────────────────────
+
+    pub fn reportSource(self: *Server) reporting.Source {
+        return .{ .ctx = self, .vtable = &source_vtable };
+    }
+
+    const source_vtable = reporting.Source.VTable{
+        .count = sourceCount,
+        .value = sourceValue,
+        .reference = sourceReference,
+    };
+
+    fn sourceCount(ctx: *anyopaque, data_set: usize) usize {
+        const self: *Server = @ptrCast(@alignCast(ctx));
+        if (data_set >= self.model.data_sets.len) return 0;
+        return self.model.data_sets[data_set].members.len;
+    }
+
+    fn sourceValue(ctx: *anyopaque, data_set: usize, member: usize) ?[]const u8 {
+        const self: *Server = @ptrCast(@alignCast(ctx));
+        if (data_set >= self.model.data_sets.len) return null;
+        const ds = self.model.data_sets[data_set];
+        if (member >= ds.members.len) return null;
+        const idx = ds.members[member];
+        if (idx >= self.model.variables.len) return null;
+        return self.model.variables[idx].value();
+    }
+
+    fn sourceReference(ctx: *anyopaque, data_set: usize, member: usize, out: []u8) ?[]const u8 {
+        const self: *Server = @ptrCast(@alignCast(ctx));
+        if (data_set >= self.model.data_sets.len) return null;
+        const ds = self.model.data_sets[data_set];
+        if (member >= ds.members.len) return null;
+        const idx = ds.members[member];
+        if (idx >= self.model.variables.len) return null;
+        const v = self.model.variables[idx];
+        return std.fmt.bufPrint(out, "{s}/{s}", .{ v.domain, v.item }) catch null;
+    }
+
+    fn indexOfVariable(self: *const Server, v: *const Variable) ?usize {
+        const base = @intFromPtr(self.model.variables.ptr);
+        const here = @intFromPtr(v);
+        if (here < base) return null;
+        const off = here - base;
+        if (off % @sizeOf(Variable) != 0) return null;
+        const i = off / @sizeOf(Variable);
+        return if (i < self.model.variables.len) i else null;
+    }
+
+    /// The application changed a process value. Every report control block and
+    /// every log whose data set contains it evaluates its `TrgOps`; nothing
+    /// leaves the server until the caller drains `pendingNotification`.
+    ///
+    /// This is the seam a simulator drives: `signal(3, .data_change)` after
+    /// writing `variables[3]`.
+    pub fn signal(self: *Server, variable_index: usize, trigger: reporting.Trigger) void {
+        const src = self.reportSource();
+        for (self.model.data_sets, 0..) |ds, dsi| {
+            for (ds.members, 0..) |vi, mi| {
+                if (vi != variable_index) continue;
+                for (self.model.report_controls) |*cb| {
+                    _ = cb.signal(src, dsi, mi, trigger, self.now_ms) catch {};
+                }
+                for (self.model.logs) |*lg| {
+                    _ = lg.signal(src, dsi, mi, trigger, self.now_ms) catch {};
+                }
+            }
+        }
+    }
+
+    /// Answers `ReadJournal` out of the log whose journal name the request
+    /// carries.
+    fn readJournal(self: *Server, req: mms.ConfirmedRequest, body: []u8) Error![]const u8 {
+        self.journal_reads += 1;
+        const q = logging.decodeReadJournal(req.body) catch
+            return mms.encodeConfirmedError(req.invoke_id, .service, 0, body);
+        const lg = self.findJournal(q.journal) orelse
+            return mms.encodeConfirmedError(req.invoke_id, .access, 0, body);
+        return logging.answerReadJournal(lg, q, req.invoke_id, body) catch
+            mms.encodeConfirmedError(req.invoke_id, .resource, 0, body);
+    }
+
+    fn journalStatus(self: *Server, req: mms.ConfirmedRequest, body: []u8) Error![]const u8 {
+        const name = logging.decodeGetJournalStatus(req.body) catch
+            return mms.encodeConfirmedError(req.invoke_id, .service, 0, body);
+        const lg = self.findJournal(name) orelse
+            return mms.encodeConfirmedError(req.invoke_id, .access, 0, body);
+        return logging.encodeGetJournalStatusResponse(req.invoke_id, .{
+            .current_entries = @intCast(lg.store.count),
+            .limit_entries = @intCast(lg.store.entries.len),
+        }, body);
+    }
+
+    fn findJournal(self: *Server, name: mms.ObjectName) ?*logging.ControlBlock {
+        const d = switch (name) {
+            .domain_specific => |x| x,
+            else => return null,
+        };
+        for (self.model.logs) |*lg| {
+            if (!std.mem.eql(u8, lg.domain, d.domain)) continue;
+            if (std.mem.eql(u8, lg.journal, d.item)) return lg;
+        }
+        return null;
     }
 
     // ── the control model (IEC 61850-7-2 §20) ──────────────────────────────
@@ -467,6 +827,11 @@ pub const Server = struct {
             if (!p.tick(now_ms)) continue;
             if (was_executing) self.queueTermination(i, .time_limit_over, num);
         }
+        // …and the same for the reporting deadlines: `BufTm` windows close and
+        // `IntgPd` sweeps happen here, not on a thread.
+        const src = self.reportSource();
+        for (self.model.report_controls) |*cb| _ = cb.tick(src, now_ms) catch {};
+        for (self.model.logs) |*lg| _ = lg.tick(src, now_ms) catch {};
     }
 
     /// The application finished (or failed) an execution the responder is
@@ -483,11 +848,38 @@ pub const Server = struct {
     /// it after every `handle` and after every `tick`: a `CommandTermination`
     /// is *not* a response, so it cannot come back out of `handle`.
     pub fn pendingNotification(self: *Server, out: []u8) Error!?[]const u8 {
-        if (self.notify_count == 0) return null;
-        const n = &self.notifications[self.notify_head];
-        self.notify_head = (self.notify_head + 1) % max_pending_notifications;
-        self.notify_count -= 1;
-        return try self.wrap(n.bytes[0..n.len], self.mms_context, out);
+        if (self.notify_count > 0) {
+            const n = &self.notifications[self.notify_head];
+            self.notify_head = (self.notify_head + 1) % max_pending_notifications;
+            self.notify_count -= 1;
+            return try self.wrap(n.bytes[0..n.len], self.mms_context, out);
+        }
+        // A report is encoded here, on demand, straight out of the control
+        // block's buffer — so a report that is never drained costs nothing but
+        // the buffer entry it already occupies.
+        const blocks = self.model.report_controls;
+        if (blocks.len == 0) return null;
+        var i: usize = 0;
+        while (i < blocks.len) : (i += 1) {
+            const idx = (self.report_cursor + i) % blocks.len;
+            var w = ber.Writer.init(&self.report_out);
+            const src = self.reportSource();
+            if (blocks[idx].emitNext(src, &w) catch continue) {
+                self.report_cursor = (idx + 1) % blocks.len;
+                self.reports_sent += 1;
+                return try self.wrap(w.done(), self.mms_context, out);
+            }
+        }
+        return null;
+    }
+
+    /// The association ended. Report control blocks release their client — a
+    /// URCB throws its buffer away, a BRCB keeps it, which is the whole point of
+    /// the letter B — and any half-finished setting-group edit is dropped.
+    pub fn releaseAssociation(self: *Server) void {
+        for (self.model.report_controls) |*cb| cb.associationLost();
+        if (self.model.setting_groups) |sg| sg.associationLost(self.peer);
+        self.associated = false;
     }
 
     fn findControl(self: *const Server, ld: []const u8, prefix: []const u8) ?usize {
@@ -557,6 +949,9 @@ pub const Server = struct {
         if (cmd.ctl_val.len > v.storage.len) return;
         @memcpy(v.storage[0..cmd.ctl_val.len], cmd.ctl_val);
         v.len = cmd.ctl_val.len;
+        // Operating a breaker moves a status point, and a status point in a
+        // reported data set is exactly what a client subscribed for.
+        self.signal(idx, .data_change);
     }
 
     /// Handles a read of `…$CO$<DO>$SBO` — the `sbo-with-normal-security`
@@ -747,8 +1142,9 @@ pub const Server = struct {
 };
 
 /// `servicesSupportedCalled` for this responder: status, getNameList, identify,
-/// read, write and informationReport. Everything else is answered with a
-/// `confirmed-ErrorPDU`, which is what an honest server does.
+/// read, write, getVariableAccessAttributes, informationReport and the two
+/// journal services. Everything else is answered with a `confirmed-ErrorPDU`,
+/// which is what an honest server does.
 pub const server_services_supported = blk: {
     var bits = [_]u8{0} ** 12;
     bits[0] = 3; // unused bits in the last octet
@@ -760,6 +1156,9 @@ pub const server_services_supported = blk: {
         mms.Initiate.service_bit.write,
         mms.Initiate.service_bit.information_report,
         mms.Initiate.service_bit.get_variable_access_attributes,
+        mms.Initiate.service_bit.get_named_variable_list_attributes,
+        mms.Initiate.service_bit.read_journal,
+        mms.Initiate.service_bit.get_journal_status,
     };
     for (set) |b| bits[1 + b / 8] |= @as(u8, 0x80) >> @intCast(b % 8);
     break :blk bits;
@@ -771,6 +1170,7 @@ const testing = std.testing;
 const client = @import("client.zig");
 const transport = @import("transport.zig");
 const acsi = @import("acsi.zig");
+const report = @import("report.zig");
 
 const domain = "TESTLD";
 
@@ -883,6 +1283,7 @@ test "round trip: our client against our server over an in-memory wire" {
     try testing.expect(c.serverSupports(mms.Initiate.service_bit.read));
     try testing.expect(c.serverSupports(mms.Initiate.service_bit.write));
     try testing.expect(!c.serverSupports(mms.Initiate.service_bit.define_named_variable_list));
+    try testing.expect(c.serverSupports(mms.Initiate.service_bit.get_named_variable_list_attributes));
 
     // Identify.
     const ident = try c.identify();
@@ -923,6 +1324,21 @@ test "round trip: our client against our server over an in-memory wire" {
     try testing.expectEqual(@as(usize, 4), try c.getLogicalDeviceDirectory(domain, &names));
     try testing.expectEqual(@as(usize, 1), try c.getDataSetDirectory(domain, &names));
     try testing.expectEqualStrings("LLN0$Events", names[0]);
+
+    // The data set's members by name — what a reporting client needs to label
+    // a report's inclusion bit string.
+    var dsreq: [256]u8 = undefined;
+    const dspdu = try mms.encodeGetNamedVariableListAttributes(77, .{ .domain_specific = .{
+        .domain = domain,
+        .item = "LLN0$Events",
+    } }, &dsreq);
+    var attrs = try mms.decodeGetNamedVariableListAttributesResponse(
+        try c.exchange(dspdu, 77, .get_named_variable_list_attributes),
+    );
+    try testing.expect(!attrs.deletable);
+    try testing.expectEqualStrings("GGIO1$ST$Ind1$stVal", (try attrs.variables.next()).?.domain_specific.item);
+    try testing.expectEqualStrings("GGIO1$ST$Ind2$stVal", (try attrs.variables.next()).?.domain_specific.item);
+    try testing.expect((try attrs.variables.next()) == null);
 
     // A whole data set in one request.
     var it = try c.readDataSet("TESTLD/LLN0$Events");
@@ -1030,6 +1446,9 @@ test "the advertised service bit string really names what is implemented" {
     try testing.expect(bs.bit(mms.Initiate.service_bit.get_name_list));
     try testing.expect(bs.bit(mms.Initiate.service_bit.identify));
     try testing.expect(bs.bit(mms.Initiate.service_bit.information_report));
+    // Not implemented, and not claimed.
+    try testing.expect(bs.bit(mms.Initiate.service_bit.get_named_variable_list_attributes));
+    try testing.expect(bs.bit(mms.Initiate.service_bit.read_journal));
     // Not implemented, and not claimed.
     try testing.expect(!bs.bit(mms.Initiate.service_bit.define_named_variable_list));
     try testing.expect(!bs.bit(mms.Initiate.service_bit.file_open));
@@ -1345,4 +1764,489 @@ fn fuzzServer(_: void, smith: *std.testing.Smith) !void {
     // And again once associated, so the MMS path is reached too.
     srv.associated = true;
     _ = srv.handle(input[0..len], &out) catch {};
+}
+
+// ── reporting, logging and setting groups, client against server ────────────
+
+/// Four status booleans, one data set over them, one URCB, one BRCB, one log —
+/// the shape of the reference IED's `LLN0$Events` model.
+const ReportFixture = struct {
+    ind: [4][8]u8 = undefined,
+    vars: [4]Variable = undefined,
+    sets: [1]DataSet = undefined,
+    domains: [1][]const u8 = .{domain},
+    urcb_entries: [8]reporting.Entry = @splat(.{}),
+    urcb_arena: [8 * 256]u8 = undefined,
+    brcb_entries: [8]reporting.Entry = @splat(.{}),
+    brcb_arena: [8 * 256]u8 = undefined,
+    rcbs: [2]ReportControl = undefined,
+    log_entries: [8]logging.Entry = @splat(.{}),
+    log_arena: [8 * 512]u8 = undefined,
+    logs: [1]LogControl = undefined,
+
+    const items = [_][]const u8{
+        "GGIO1$ST$Ind1$stVal",
+        "GGIO1$ST$Ind2$stVal",
+        "GGIO1$ST$Ind3$stVal",
+        "GGIO1$ST$Ind4$stVal",
+    };
+
+    fn init(self: *ReportFixture) !Model {
+        for (0..4) |i| {
+            self.vars[i] = .{
+                .domain = domain,
+                .item = items[i],
+                .storage = &self.ind[i],
+                .len = try emitBool(&self.ind[i], false),
+                .writable = true,
+            };
+        }
+        self.sets[0] = .{ .domain = domain, .item = "LLN0$Events", .members = &[_]usize{ 0, 1, 2, 3 } };
+        const opt = reporting.OptFlds{
+            .sequence_number = true,
+            .report_time_stamp = true,
+            .reason_for_inclusion = true,
+            .data_set_name = true,
+            .buffer_overflow = true,
+            .entry_id = true,
+            .conf_revision = true,
+        };
+        const trg = reporting.TrgOps{
+            .data_change = true,
+            .quality_change = true,
+            .integrity = true,
+            .general_interrogation = true,
+        };
+        self.rcbs[0] = .{
+            .kind = .unbuffered,
+            .domain = domain,
+            .item = "LLN0$RP$EventsRCB01",
+            .rpt_id = "Events1",
+            .dat_set = domain ++ "/LLN0$Events",
+            .conf_rev = 1,
+            .opt_flds = opt,
+            .trg_ops = trg,
+            .buffer = try reporting.Buffer.init(&self.urcb_entries, &self.urcb_arena),
+        };
+        self.rcbs[1] = .{
+            .kind = .buffered,
+            .domain = domain,
+            .item = "LLN0$BR$EventsBRCB01",
+            .rpt_id = "Events2",
+            .dat_set = domain ++ "/LLN0$Events",
+            .conf_rev = 1,
+            .opt_flds = opt,
+            .trg_ops = trg,
+            .buffer = try reporting.Buffer.init(&self.brcb_entries, &self.brcb_arena),
+        };
+        self.logs[0] = .{
+            .domain = domain,
+            .item = "LLN0$LG$EventLog",
+            .journal = "LLN0$EventLog",
+            .log_ref = domain ++ "/LLN0$EventLog",
+            .dat_set = domain ++ "/LLN0$Events",
+            .trg_ops = trg,
+            .store = try logging.Store.init(&self.log_entries, &self.log_arena),
+        };
+        return .{
+            .variables = &self.vars,
+            .data_sets = &self.sets,
+            .report_controls = &self.rcbs,
+            .logs = &self.logs,
+            .domains = &self.domains,
+        };
+    }
+};
+
+var seen_reports: usize = 0;
+var seen_entries: usize = 0;
+var seen_gi: usize = 0;
+var seen_dchg: usize = 0;
+var seen_integrity: usize = 0;
+
+fn onReport(_: *anyopaque, r: report.Report) void {
+    seen_reports += 1;
+    seen_entries += r.entry_count;
+    for (r.included()) |e| {
+        const reason = e.reason orelse continue;
+        if (reason.general_interrogation) seen_gi += 1;
+        if (reason.data_change) seen_dchg += 1;
+        if (reason.integrity) seen_integrity += 1;
+    }
+}
+
+fn resetCounters() void {
+    seen_reports = 0;
+    seen_entries = 0;
+    seen_gi = 0;
+    seen_dchg = 0;
+    seen_integrity = 0;
+}
+
+test "our client subscribes to our server's URCB and receives all three report kinds" {
+    var fx: ReportFixture = .{};
+    const model = try fx.init();
+    var srv = Server.init(.{}, model);
+    var paired = Paired{ .server = &srv };
+    var buf: [65536]u8 = undefined;
+    var c = try client.Client.init(paired.seam(), &buf, .{});
+    try c.connect();
+    resetCounters();
+    var dummy: u8 = 0;
+    c.setReportHandler(.{ .ctx = &dummy, .on_report = onReport });
+
+    const rcb_ref = domain ++ "/LLN0.EventsRCB01";
+    // The RCB reads back as the eleven-member URCB structure.
+    const rcb = try c.readRcb(rcb_ref, .unbuffered);
+    try testing.expectEqualStrings("Events1", rcb.rpt_id);
+    try testing.expectEqualStrings(domain ++ "/LLN0$Events", rcb.dat_set);
+    try testing.expect(!rcb.rpt_ena);
+
+    try c.enableReporting(rcb_ref, .unbuffered, .{
+        .data_change = true,
+        .integrity = true,
+        .general_interrogation = true,
+    }, 1000);
+    try testing.expect(srv.model.report_controls[0].rpt_ena);
+
+    // 1. General interrogation: every member, reason `general-interrogation`.
+    try c.generalInterrogation(rcb_ref, .unbuffered);
+    try drainReports(&paired, &c, 8);
+    try testing.expectEqual(@as(usize, 1), seen_reports);
+    try testing.expectEqual(@as(usize, 4), seen_entries);
+    try testing.expectEqual(@as(usize, 4), seen_gi);
+
+    // 2. Data change: one member, reason `data-change`.
+    resetCounters();
+    var vbuf: [8]u8 = undefined;
+    var vw = ber.Writer.init(&vbuf);
+    try mmsdata.Emit.boolean(&vw, true);
+    try c.writeObject(domain ++ "/GGIO1.Ind2.stVal", .ST, vw.done());
+    try drainReports(&paired, &c, 8);
+    try testing.expectEqual(@as(usize, 1), seen_reports);
+    try testing.expectEqual(@as(usize, 1), seen_entries);
+    try testing.expectEqual(@as(usize, 1), seen_dchg);
+
+    // 3. Integrity period: the IED's own clock moves, nothing is asked for.
+    resetCounters();
+    srv.tick(1000);
+    try drainReports(&paired, &c, 8);
+    try testing.expectEqual(@as(usize, 1), seen_reports);
+    try testing.expectEqual(@as(usize, 4), seen_entries);
+    try testing.expectEqual(@as(usize, 4), seen_integrity);
+
+    try c.disableReporting(rcb_ref, .unbuffered);
+    try testing.expect(!srv.model.report_controls[0].rpt_ena);
+    try testing.expectEqual(@as(u64, 3), srv.reports_sent);
+    try testing.expectEqual(@as(usize, 0), paired.failures);
+    c.disconnect();
+}
+
+/// Pushes the server's queued reports across the wire and lets the client
+/// dispatch them.
+fn drainReports(paired: *Paired, c: *client.Client, rounds: usize) !void {
+    try paired.drain();
+    var i: usize = 0;
+    while (i < rounds) : (i += 1) {
+        _ = c.poll() catch break;
+    }
+}
+
+test "a BRCB retains what happened while the client was away and resumes by EntryID" {
+    var fx: ReportFixture = .{};
+    const model = try fx.init();
+    var srv = Server.init(.{}, model);
+    var paired = Paired{ .server = &srv };
+    var buf: [65536]u8 = undefined;
+    var c = try client.Client.init(paired.seam(), &buf, .{});
+    try c.connect();
+    resetCounters();
+    var dummy: u8 = 0;
+    c.setReportHandler(.{ .ctx = &dummy, .on_report = onReport });
+
+    const brcb = &srv.model.report_controls[1];
+    // Three changes with nobody subscribed at all.
+    for ([_]usize{ 0, 1, 2 }) |i| {
+        fx.vars[i].len = try emitBool(&fx.ind[i], true);
+        srv.signal(i, .data_change);
+    }
+    try testing.expectEqual(@as(usize, 3), brcb.buffer.count);
+    try testing.expect(!brcb.pending()); // buffered, but not enabled
+
+    const ref = domain ++ "/LLN0.EventsBRCB01";
+    try c.enableReporting(ref, .buffered, .{ .data_change = true }, null);
+    try drainReports(&paired, &c, 12);
+    // All three arrive on enable — the buffered guarantee.
+    try testing.expectEqual(@as(usize, 3), seen_reports);
+    try testing.expectEqual(@as(usize, 3), seen_dchg);
+
+    // The BRCB read exposes the resume point.
+    const rcb = try c.readRcb(ref, .buffered);
+    try testing.expect(rcb.resv == null);
+    try testing.expectEqual(false, rcb.purge_buf.?);
+    try testing.expectEqual(@as(u64, 3), std.mem.readInt(u64, rcb.entry_id.?[0..8], .big));
+    c.disconnect();
+}
+
+test "our server's report is what our own decoder reads, byte for byte" {
+    // The server encodes; `report.Report.decode` — the client-side half, which
+    // was validated against captured third-party traffic — reads it back.
+    var fx: ReportFixture = .{};
+    const model = try fx.init();
+    var srv = Server.init(.{}, model);
+    srv.model.report_controls[0].enable(1, 0);
+    _ = try srv.model.report_controls[0].sweep(srv.reportSource(), .general_interrogation, 42);
+
+    var out: [16384]u8 = undefined;
+    srv.transport_up = true;
+    const frame = (try srv.pendingNotification(&out)).?;
+    // A complete TPKT that unwraps to an InformationReport.
+    const pkt = try tpkt.decode(frame);
+    const dt = (try cotp.decode(pkt.payload)).dt;
+    const ppdu = try session.decodeDataTransfer(dt.payload);
+    var contexts = presentation.ContextTable{};
+    try contexts.define(presentation.context_mms, &ber.oids.mms_abstract_syntax);
+    try contexts.applyResults(&[_]presentation.Result{.acceptance});
+    const pdv = try presentation.decodeUserData(ppdu, &contexts);
+    const r = try report.decodeInformationReport((try mms.decode(pdv.value)).unconfirmed.body);
+    try testing.expectEqualStrings("Events1", r.rpt_id);
+    try testing.expectEqualStrings(domain ++ "/LLN0$Events", r.dat_set.?);
+    try testing.expectEqual(@as(u16, 4), r.entry_count);
+    for (r.included()) |e| try testing.expect(e.reason.?.general_interrogation);
+    try testing.expect((try srv.pendingNotification(&out)) == null);
+}
+
+test "a log fills, is read back over MMS, and its LCB reports the store's range" {
+    var fx: ReportFixture = .{};
+    const model = try fx.init();
+    var srv = Server.init(.{}, model);
+    var paired = Paired{ .server = &srv };
+    var buf: [65536]u8 = undefined;
+    var c = try client.Client.init(paired.seam(), &buf, .{});
+    try c.connect();
+
+    // Enable the log the way a client does: write `LogEna`.
+    var vbuf: [8]u8 = undefined;
+    var vw = ber.Writer.init(&vbuf);
+    try mmsdata.Emit.boolean(&vw, true);
+    try c.writeObject(domain ++ "/LLN0.EventLog.LogEna", .LG, vw.done());
+    try testing.expect(srv.model.logs[0].log_ena);
+
+    srv.tick(1_700_000_000_000);
+    for ([_]usize{ 0, 1, 2 }) |i| {
+        fx.vars[i].len = try emitBool(&fx.ind[i], true);
+        srv.signal(i, .data_change);
+    }
+    try testing.expectEqual(@as(usize, 3), srv.model.logs[0].store.count);
+
+    // `GetLogStatusValues` is a read of the LCB.
+    // Each read is decoded out of the same reassembly buffer, so it has to be
+    // consumed before the next request overwrites it.
+    const old = try c.readObject(domain ++ "/LLN0.EventLog.OldEntr", .LG);
+    try testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, (try old.octetString())[0..8], .big));
+    const new = try c.readObject(domain ++ "/LLN0.EventLog.NewEntr", .LG);
+    try testing.expectEqual(@as(u64, 3), std.mem.readInt(u64, (try new.octetString())[0..8], .big));
+
+    // …and `QueryLogAfter` is a ReadJournal.
+    const status = try c.getJournalStatus(domain ++ "/LLN0$EventLog");
+    try testing.expectEqual(@as(u32, 3), status.current_entries);
+    try testing.expectEqual(@as(u32, 8), status.limit_entries.?);
+
+    const resp = try c.readJournal(domain ++ "/LLN0$EventLog", .{});
+    var it = resp.entries;
+    var n: usize = 0;
+    while (try it.next()) |e| : (n += 1) {
+        var vars = e.iterate();
+        var pairs: usize = 0;
+        while (try vars.next()) |_| pairs += 1;
+        // One member and its ReasonCode.
+        try testing.expectEqual(@as(usize, 2), pairs);
+    }
+    try testing.expectEqual(@as(usize, 3), n);
+    try testing.expect(srv.journal_reads > 0);
+
+    // A journal this server does not serve is a service error, not a crash.
+    try testing.expectError(error.ServiceFailed, c.readJournal(domain ++ "/LLN0$NoSuchLog", .{}));
+    c.disconnect();
+}
+
+/// Two settings across three groups, on top of the report fixture's model.
+const SettingFixture = struct {
+    base: ReportFixture = .{},
+    a_store: [4 * 16]u8 = undefined,
+    a_lens: [4]usize = @splat(0),
+    b_store: [4 * 16]u8 = undefined,
+    b_lens: [4]usize = @splat(0),
+    settings: [2]settinggroups.Setting = undefined,
+    sgcb: SettingGroups = undefined,
+
+    fn init(self: *SettingFixture) !Model {
+        var model = try self.base.init();
+        self.settings[0] = .{
+            .domain = domain,
+            .ln = "PTOC1",
+            .path = "StrVal$setMag$f",
+            .storage = &self.a_store,
+            .lens = &self.a_lens,
+        };
+        self.settings[1] = .{
+            .domain = domain,
+            .ln = "PTOC1",
+            .path = "OpDlTmms$setVal",
+            .storage = &self.b_store,
+            .lens = &self.b_lens,
+        };
+        self.sgcb = .{ .domain = domain, .groups = 3, .settings = &self.settings };
+        try self.sgcb.validate();
+        for (0..3) |g| {
+            var tmp: [16]u8 = undefined;
+            var w = ber.Writer.init(&tmp);
+            try mmsdata.Emit.float(&w, @floatFromInt(g + 1));
+            try setSetting(self.settings[0], g, w.done());
+            var w2 = ber.Writer.init(&tmp);
+            try mmsdata.Emit.integer(&w2, @intCast((g + 1) * 100));
+            try setSetting(self.settings[1], g, w2.done());
+        }
+        model.setting_groups = &self.sgcb;
+        return model;
+    }
+};
+
+fn setSetting(s: settinggroups.Setting, slot: usize, bytes: []const u8) !void {
+    const n = s.storage.len / s.lens.len;
+    if (bytes.len > n) return error.TestExpectedEqual;
+    @memcpy(s.storage[slot * n ..][0..bytes.len], bytes);
+    s.lens[slot] = bytes.len;
+}
+
+test "the setting-group services run end to end and an uncommitted edit stays invisible" {
+    var fx: SettingFixture = .{};
+    const model = try fx.init();
+    var srv = Server.init(.{}, model);
+    var paired = Paired{ .server = &srv };
+    var buf: [65536]u8 = undefined;
+    var c = try client.Client.init(paired.seam(), &buf, .{});
+    try c.connect();
+
+    const sgcb_ref = domain ++ "/LLN0.SGCB";
+    const setting = domain ++ "/PTOC1.StrVal.setMag.f";
+
+    // The SGCB reads back as five members.
+    try testing.expectEqual(@as(u32, 3), try (try c.readObject(sgcb_ref ++ ".NumOfSG", .SP)).unsigned(u32));
+    try testing.expectEqual(@as(u32, 1), try (try c.readObject(sgcb_ref ++ ".ActSG", .SP)).unsigned(u32));
+    // `GetSGValues`: group one.
+    try testing.expectApproxEqAbs(
+        @as(f64, 1.0),
+        try (try c.readObject(setting, .SG)).asFloat(),
+        1e-6,
+    );
+    // An `SE` read with no edit group selected is refused, not answered.
+    try testing.expectError(error.AccessFailed, c.readObject(setting, .SE));
+
+    // SelectEditSG(1) — the *active* group, so a leak would be immediate.
+    try c.selectEditSG(sgcb_ref, 1);
+    var vbuf: [16]u8 = undefined;
+    var vw = ber.Writer.init(&vbuf);
+    try mmsdata.Emit.float(&vw, 42.0);
+    try c.writeObject(setting, .SE, vw.done());
+    // The edit buffer has it…
+    try testing.expectApproxEqAbs(@as(f64, 42.0), try (try c.readObject(setting, .SE)).asFloat(), 1e-6);
+    // …and the active group does not.
+    try testing.expectApproxEqAbs(@as(f64, 1.0), try (try c.readObject(setting, .SG)).asFloat(), 1e-6);
+
+    try c.confirmEditSGValues(sgcb_ref);
+    try testing.expectApproxEqAbs(@as(f64, 42.0), try (try c.readObject(setting, .SG)).asFloat(), 1e-6);
+
+    // SelectActiveSG(2): a different parameter set, immediately.
+    try c.selectActiveSG(sgcb_ref, 2);
+    try testing.expectApproxEqAbs(@as(f64, 2.0), try (try c.readObject(setting, .SG)).asFloat(), 1e-6);
+    try testing.expectEqual(@as(u64, 1), srv.model.setting_groups.?.confirmations);
+
+    // A group outside `1..NumOfSG` is refused per object.
+    try testing.expectError(error.AccessFailed, c.selectActiveSG(sgcb_ref, 9));
+    // Writing `SG` directly is refused: it is the active group's read-only view.
+    try testing.expectError(error.AccessFailed, c.writeObject(setting, .SG, vw.done()));
+    c.disconnect();
+}
+
+test "a confirm with no preceding edit is refused over the wire" {
+    var fx: SettingFixture = .{};
+    const model = try fx.init();
+    var srv = Server.init(.{}, model);
+    var paired = Paired{ .server = &srv };
+    var buf: [65536]u8 = undefined;
+    var c = try client.Client.init(paired.seam(), &buf, .{});
+    try c.connect();
+    const sgcb_ref = domain ++ "/LLN0.SGCB";
+    try testing.expectError(error.AccessFailed, c.confirmEditSGValues(sgcb_ref));
+    try c.selectEditSG(sgcb_ref, 2);
+    // Selected but nothing written.
+    try testing.expectError(error.AccessFailed, c.confirmEditSGValues(sgcb_ref));
+    try testing.expectEqual(@as(u64, 0), srv.model.setting_groups.?.confirmations);
+    c.disconnect();
+}
+
+test "an RCB enabled with a data set that does not resolve reports nothing" {
+    var fx: ReportFixture = .{};
+    var model = try fx.init();
+    // Point the URCB at a data set index that is not in the model.
+    fx.rcbs[0].data_set = 7;
+    model.report_controls = &fx.rcbs;
+    var srv = Server.init(.{}, model);
+    var paired = Paired{ .server = &srv };
+    var buf: [65536]u8 = undefined;
+    var c = try client.Client.init(paired.seam(), &buf, .{});
+    try c.connect();
+
+    const ref = domain ++ "/LLN0.EventsRCB01";
+    try c.enableReporting(ref, .unbuffered, .{ .general_interrogation = true }, null);
+    try c.generalInterrogation(ref, .unbuffered);
+    // A data set of zero members produces no entry at all, and no report.
+    var out: [16384]u8 = undefined;
+    try testing.expect((try srv.pendingNotification(&out)) == null);
+    try testing.expectEqual(@as(u64, 0), srv.reports_sent);
+    try testing.expectEqual(@as(usize, 0), paired.failures);
+    c.disconnect();
+}
+
+test "a report control block cannot be reconfigured while a client has it enabled" {
+    var fx: ReportFixture = .{};
+    const model = try fx.init();
+    var srv = Server.init(.{}, model);
+    var paired = Paired{ .server = &srv };
+    var buf: [65536]u8 = undefined;
+    var c = try client.Client.init(paired.seam(), &buf, .{});
+    try c.connect();
+
+    const ref = domain ++ "/LLN0.EventsRCB01";
+    var w: [16]u8 = undefined;
+    var vw = ber.Writer.init(&w);
+    try mmsdata.Emit.unsigned(&vw, 250);
+    try c.writeObject(ref ++ ".BufTm", .RP, vw.done());
+    try testing.expectEqual(@as(u32, 250), srv.model.report_controls[0].buf_tm_ms);
+
+    try c.enableReporting(ref, .unbuffered, .{ .data_change = true }, null);
+    var vw2 = ber.Writer.init(&w);
+    try mmsdata.Emit.unsigned(&vw2, 10);
+    try testing.expectError(error.AccessFailed, c.writeObject(ref ++ ".BufTm", .RP, vw2.done()));
+    try testing.expectEqual(@as(u32, 250), srv.model.report_controls[0].buf_tm_ms);
+    c.disconnect();
+}
+
+test "releasing the association purges a URCB and keeps a BRCB" {
+    var fx: ReportFixture = .{};
+    const model = try fx.init();
+    var srv = Server.init(.{}, model);
+    srv.model.report_controls[0].enable(1, 0);
+    srv.model.report_controls[1].enable(1, 0);
+    for ([_]usize{ 0, 1 }) |i| {
+        fx.vars[i].len = try emitBool(&fx.ind[i], true);
+        srv.signal(i, .data_change);
+    }
+    try testing.expectEqual(@as(usize, 2), srv.model.report_controls[0].buffer.count);
+    try testing.expectEqual(@as(usize, 2), srv.model.report_controls[1].buffer.count);
+    srv.releaseAssociation();
+    try testing.expectEqual(@as(usize, 0), srv.model.report_controls[0].buffer.count);
+    try testing.expectEqual(@as(usize, 2), srv.model.report_controls[1].buffer.count);
+    try testing.expect(!srv.associated);
 }

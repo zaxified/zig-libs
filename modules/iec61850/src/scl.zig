@@ -190,6 +190,11 @@ pub const BType = enum {
         return error.UnknownBasicType;
     }
 
+    /// The SCL spelling of this basic type — what `parse` accepts back.
+    pub fn name(self: BType) []const u8 {
+        return @tagName(self);
+    }
+
     /// Maximum string length, for the `VisString*`/`Octet*`/`Unicode*` types.
     pub fn maxLen(self: BType) ?usize {
         return switch (self) {
@@ -370,7 +375,12 @@ pub const OptFields = struct {
     data_ref: bool = false,
     entry_id: bool = false,
     config_ref: bool = false,
-    buf_ovfl: bool = false,
+    /// **Defaults to true**, unlike every other flag here. IEC 61850-6 gives
+    /// `bufOvfl` a schema default of `"true"`, so a `<OptFields>` that does not
+    /// mention it still asks for the buffer-overflow field — which is why a
+    /// parser that defaults it to false quietly produces a different RCB from
+    /// every other tool reading the same file.
+    buf_ovfl: bool = true,
     segmentation: bool = false,
 };
 
@@ -1064,7 +1074,7 @@ const Parser = struct {
                     .data_ref = boolAttr(c, "dataRef", false),
                     .entry_id = boolAttr(c, "entryID", false),
                     .config_ref = boolAttr(c, "configRef", false),
-                    .buf_ovfl = boolAttr(c, "bufOvfl", false),
+                    .buf_ovfl = boolAttr(c, "bufOvfl", true),
                     .segmentation = boolAttr(c, "segmentation", false),
                 };
             } else if (std.mem.eql(u8, c.local, "RptEnabled")) {

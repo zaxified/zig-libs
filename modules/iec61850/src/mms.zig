@@ -475,6 +475,8 @@ pub const Initiate = struct {
         pub const get_named_variable_list_attributes: usize = 12;
         pub const delete_named_variable_list: usize = 13;
         pub const information_report: usize = 79;
+        pub const read_journal: usize = 65;
+        pub const get_journal_status: usize = 68;
         pub const file_open: usize = 72;
         pub const file_read: usize = 73;
         pub const file_close: usize = 74;
@@ -1104,6 +1106,33 @@ pub fn decodeGetNamedVariableListAttributesResponse(body: []const u8) Error!Name
         }
     }
     return .{ .deletable = deletable, .variables = vars orelse return error.MissingField };
+}
+
+/// The responder half of `GetNamedVariableListAttributes`: the members of a
+/// data set, in order. `deletable` is false for a data set the configuration
+/// created, which is every data set an SCL-configured IED serves.
+pub fn encodeGetNamedVariableListAttributesResponse(
+    invoke_id: u32,
+    deletable: bool,
+    members: []const ObjectName,
+    out: []u8,
+) Error![]const u8 {
+    var w = ber.Writer.init(out);
+    const m = w.mark();
+    const list = w.mark();
+    var i: usize = members.len;
+    while (i > 0) {
+        i -= 1;
+        const entry = w.mark();
+        const spec = w.mark();
+        try members[i].encode(&w);
+        try w.header(ber.Tag.ctxc(0), spec);
+        try w.header(ber.Tag.sequence, entry);
+    }
+    try w.header(ber.Tag.ctxc(1), list);
+    try w.boolean(ber.Tag.ctx(0), deletable);
+    try closeConfirmedResponse(&w, m, .get_named_variable_list_attributes, invoke_id);
+    return w.done();
 }
 
 pub fn encodeDefineNamedVariableList(

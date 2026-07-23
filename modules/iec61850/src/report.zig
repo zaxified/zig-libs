@@ -155,9 +155,25 @@ pub const Reason = struct {
         };
     }
 
+    pub const bit_count: u8 = 6;
+
     pub fn any(self: Reason) bool {
         return self.data_change or self.quality_change or self.data_update or
             self.integrity or self.general_interrogation;
+    }
+
+    pub fn toInt(self: Reason) u64 {
+        var v: u64 = 0;
+        if (self.data_change) v |= @as(u64, 1) << (bit_count - 1 - 1);
+        if (self.quality_change) v |= @as(u64, 1) << (bit_count - 1 - 2);
+        if (self.data_update) v |= @as(u64, 1) << (bit_count - 1 - 3);
+        if (self.integrity) v |= @as(u64, 1) << (bit_count - 1 - 4);
+        if (self.general_interrogation) v |= @as(u64, 1) << (bit_count - 1 - 5);
+        return v;
+    }
+
+    pub fn emit(self: Reason, w: *ber.Writer) Error!void {
+        try w.bitString(mmsdata.Kind.bit_string.tag(), self.toInt(), bit_count);
     }
 };
 
@@ -168,9 +184,20 @@ pub const RcbKind = enum { buffered, unbuffered };
 /// A report control block as read from an IED — the MMS `structure` a read of
 /// `LD/LLN0$RP$xxx` or `LD/LLN0$BR$xxx` returns.
 ///
-/// A BRCB and a URCB differ in two members: a URCB has `Resv` where a BRCB has
-/// `PurgeBuf`, and a BRCB additionally carries `EntryID` and `TimeOfEntry`.
-/// Members are matched by **order**, because MMS structures carry no names.
+/// The two shapes differ by more than a member. A URCB has eleven members and
+/// carries `Resv` third; a BRCB has **no `Resv` at all** and instead appends
+/// `PurgeBuf`, `EntryID`, `TimeOfEntry` and `ResvTms` *after* `GI`:
+///
+/// ```text
+/// URCB: RptID RptEna Resv DatSet ConfRev OptFlds BufTm SqNum TrgOps IntgPd GI
+/// BRCB: RptID RptEna      DatSet ConfRev OptFlds BufTm SqNum TrgOps IntgPd GI
+///       PurgeBuf EntryID TimeOfEntry ResvTms
+/// ```
+///
+/// Members are matched by **order**, because MMS structures carry no names, so
+/// getting this wrong reads `PurgeBuf` out of `DatSet`. The layout is the one
+/// `scl.default_urcb_attributes` / `scl.default_brcb_attributes` name and was
+/// confirmed member by member against a live third-party IED (SPEC.md).
 pub const Rcb = struct {
     kind: RcbKind,
     rpt_id: []const u8 = &.{},
@@ -189,6 +216,8 @@ pub const Rcb = struct {
     gi: bool = false,
     /// BRCB only.
     entry_id: ?[]const u8 = null,
+    /// BRCB only, and only when the IED exposes the edition-2 member.
+    resv_tms: ?i16 = null,
 
     /// Decodes the `structure` an RCB read returns.
     pub fn decode(d: mmsdata.Data, kind: RcbKind) Error!Rcb {
@@ -196,10 +225,7 @@ pub const Rcb = struct {
         var it = try d.members();
         r.rpt_id = try (try next(&it)).visibleString();
         r.rpt_ena = try (try next(&it)).boolean();
-        switch (kind) {
-            .unbuffered => r.resv = try (try next(&it)).boolean(),
-            .buffered => r.purge_buf = try (try next(&it)).boolean(),
-        }
+        if (kind == .unbuffered) r.resv = try (try next(&it)).boolean();
         r.dat_set = try (try next(&it)).visibleString();
         r.conf_rev = try (try next(&it)).unsigned(u32);
         r.opt_flds = OptFlds.parse(try (try next(&it)).bitString());
@@ -208,9 +234,13 @@ pub const Rcb = struct {
         r.trg_ops = TrgOps.parse(try (try next(&it)).bitString());
         r.intg_pd_ms = try (try next(&it)).unsigned(u32);
         r.gi = try (try next(&it)).boolean();
-        // A BRCB's EntryID and TimeOfEntry follow when the IED includes them.
+        // A BRCB's PurgeBuf, EntryID, TimeOfEntry and ResvTms follow, each only
+        // when the IED includes it — edition 1 stops after TimeOfEntry.
         if (kind == .buffered) {
+            if (try it.next()) |e| r.purge_buf = try e.boolean();
             if (try it.next()) |e| r.entry_id = e.octetString() catch null;
+            _ = try it.next(); // TimeOfEntry: decoded by the caller if wanted.
+            if (try it.next()) |e| r.resv_tms = e.integer(i16) catch null;
         }
         return r;
     }

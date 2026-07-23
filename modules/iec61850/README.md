@@ -4,11 +4,13 @@ Pure-Zig **substation automation**: the IEC 61850 MMS stack an IED and a SCADA
 client speak on TCP port 102, and **GOOSE**, the layer-2 multicast protocol
 protection schemes trip breakers with. A typed, allocation-free codec for the
 whole OSI sandwich (TPKT → COTP → session → presentation → ACSE → MMS), a
-transport-agnostic client and server, the ACSI naming layer, report control
-blocks, the **control model** that actually operates a breaker, an **SCL
-parser and type resolver**, and **pure time-injected publisher and subscriber
-state machines** for GOOSE. Sampled values (IEC 61850-9-2) come along for the
-ride.
+transport-agnostic client and server, the ACSI naming layer, a **server-side
+reporting engine** (BRCB and URCB, `TrgOps`, `BufTm` coalescing, integrity and
+general interrogation), **logging** with the MMS journal services, **setting
+groups**, the **control model** that actually operates a breaker, an **SCL
+parser, type resolver and writer**, and **pure time-injected publisher and
+subscriber state machines** for GOOSE. Sampled values (IEC 61850-9-2) come along
+for the ride.
 
 - No pure-Zig IEC 61850 library exists; the field is C (`libiec61850`) and its
   bindings.
@@ -100,11 +102,38 @@ ride.
   `LN → LNodeType → DOType → DAType → DAType…` — and produces the flat list of
   MMS names the wire uses, with cycle detection, a depth bound and typed errors
   for every way the graph can lie. This is the only file here that allocates.
+- **`sclwrite`** — the other direction: serialises a model back to an `ICD`/`CID`
+  document. Optional attributes are written **only when they differ from the
+  schema default** and the source's own namespace is kept, because a reader
+  decides which edition's defaults to apply from that URI. A cyclic type graph is
+  refused before an octet is written. The test that backs it is a round trip
+  through the resolver: parse → emit → parse → **identical name space**.
+- **`reporting`** — the **server side** of IEC 61850-7-2 §17. Live report control
+  blocks: `RptID`, `RptEna`, `Resv`/`ResvTms`, `DatSet`, `ConfRev`, `OptFlds`,
+  `BufTm`, `SqNum`, `TrgOps`, `IntgPd`, `GI`, and for a BRCB `PurgeBuf`,
+  `EntryID` and `TimeOfEntry`. Data-change / quality-change / data-update /
+  integrity / general-interrogation triggers each produce the right per-member
+  `ReasonCode`; `BufTm` **coalesces** a burst into one report instead of a storm;
+  and a BRCB **retains** what happened while no client was listening, resuming
+  from the client's `EntryID` and raising `BufOvfl` when its bounded, caller-owned
+  buffer wraps over something undelivered. Pure and time-injected: `BufTm` and
+  `IntgPd` expire because the caller calls `tick`.
+- **`logging`** — IEC 61850-7-2 §18. The `LCB` (`LogEna`, `LogRef`, `DatSet`,
+  `OldEntrTm`, `NewEntrTm`, `OldEntr`, `NewEntr`, `TrgOps`, `IntgPd`), a bounded
+  circular log over caller-owned storage, and the MMS journal services
+  `ReadJournal` and `GetJournalStatus` in both directions.
+- **`settinggroups`** — IEC 61850-7-2 §19. `SelectActiveSG`, `SelectEditSG`,
+  `SetEditSGValue`, `ConfirmEditSGValues` and `GetSGValues` over the `SGCB` and
+  the `SE`/`SG` functional constraints. **An uncommitted edit is invisible**:
+  writing `SE` changes the edit buffer, `SG` still reads the active group, and a
+  confirm with no preceding edit is refused rather than committing an empty
+  buffer over a live relay setting.
 - **`server`** — a `Server`: the IED side as a pure function from one packet to
-  one packet, backed by a caller-supplied table of named variables, data sets
-  **and control objects**. It enforces the control model, arms and expires
-  selects, and emits `CommandTermination`/`LastApplError`. Stand up one per
-  simulated IED for fleet simulation.
+  one packet, backed by a caller-supplied table of named variables, data sets,
+  **control objects, report control blocks, logs and setting groups**. It
+  enforces the control model, arms and expires selects, emits
+  `CommandTermination`/`LastApplError`, and pushes reports out of
+  `pendingNotification`. Stand up one per simulated IED for fleet simulation.
 
 ### The GOOSE half
 
@@ -313,8 +342,9 @@ Anyone with a path to TCP 102 can write a setpoint; anyone on the station bus
 can forge a GOOSE frame with a higher `stNum` and it will win. This module
 implements no IEC 62351 security; put transport security under it and read
 SPEC.md, "Threat model", before pointing any of it at real equipment. The
-`Server` is a **simulator, not an IED**: it now enforces the control model, but
-it has no access control, no reporting engine and no file system.
+`Server` is a **simulator, not an IED**: it enforces the control model and it
+now reports, logs and switches setting groups, but it has no access control and
+no file system.
 
 **Writing under `CO` operates plant.** The control model is here so that a
 client applies the interlocks a real one applies — the select, the `ctlNum`, the
@@ -330,7 +360,7 @@ zig build test-iec61850 -Doptimize=ReleaseFast
 zig fmt --check modules/iec61850
 ```
 
-280 tests, of which 274 are fully offline. The six live tests skip gracefully
+349 tests, of which 341 are fully offline. The eight live tests skip gracefully
 (printing `SKIPPED:` and passing) when no peer is present:
 
 ```
@@ -351,6 +381,14 @@ IEC61850_TEST_LISTEN=127.0.0.1:10102 IEC61850_TEST_PEERS=3 \
 
 # a real IEC 61850 CONTROL client -> our server's control objects
 IEC61850_TEST_LISTEN_CONTROL=127.0.0.1:102 zig build test-iec61850
+
+# a real IEC 61850 REPORTING or LOG client -> our server (RCBs, a log, an SGCB)
+IEC61850_TEST_LISTEN_REPORT=127.0.0.1:10102 IEC61850_TEST_PEERS=3 \
+  zig build test-iec61850
+
+# an SCL file through parse -> emit -> parse, name space compared
+IEC61850_TEST_SCL_FILE=./ied.icd IEC61850_TEST_SCL_OUT=/tmp/out.icd \
+  zig build test-iec61850
 
 # real GOOSE frames (one hex frame per line) through the subscriber
 IEC61850_TEST_GOOSE_HEX=./goose.hex zig build test-iec61850
@@ -373,6 +411,16 @@ The SCL resolver was checked against **twelve different configuration files**
 by standing up the IED each one configures and comparing the resolved name
 space against its own `GetNameList`, in both directions: **3,273 names, every
 one matched, none missing and none invented**.
+
+The **reporting engine** is driven by third-party clients rather than only by
+its own tests: a reference stack's reporting and log example clients were
+pointed at this server and observed to receive data-change, integrity and
+general-interrogation reports with the right per-member reason codes, to read
+the URCB and the fourteen-member BRCB, and to read a log back over
+`ReadJournal`. The **SCL writer** was checked by emitting 44 real configuration
+files and re-resolving each emission to the identical name space, and by feeding
+every emission to a third-party SCL model generator — none rejected. See SPEC.md
+for exactly what ran in which direction.
 
 Provenance: clean-room from the published ISO 8073 / RFC 1006 / ISO 8327 / ISO
 8823 / ISO 8650 / ISO 9506 / IEC 61850-8-1 layouts. No third-party source was
