@@ -48,26 +48,88 @@ OPC-UA (IEC 62541 / OPC 10000) binary client **and** server. Usage: see
 
 ## Threat model
 
-**Server side: `SecurityMode=None` / `SecurityPolicy#None` only.** The client
-half of this module speaks `Basic256Sha256` at Sign and SignAndEncrypt
-(`security.zig`, over the `rsa` module). The server half deliberately does
-**not**: it implements no asymmetric handshake, no certificate chain
-validation, no message signing or encryption, and answers
-`BadSecurityPolicyRejected` to any OPN that asks for one. That is stated
-plainly rather than half-implemented, because a server that *advertises*
-security it cannot enforce is worse than one that advertises none.
-Consequences a deployment must accept:
+**Both halves speak `SecurityPolicy#Basic256Sha256` at Sign and
+SignAndEncrypt** (`security.zig`, over the `rsa` module). The server side is
+opt-in: `Config.security = null` (the default) keeps it `#None`-only, with
+every byte on the wire identical to the pre-security server; setting it to a
+`SecurityConfig` (an RSA key pair + application certificate, plus a trust
+policy) turns on the whole thing — asymmetric OpenSecureChannel, P-SHA256 key
+derivation, per-chunk symmetric sign/encrypt, SecurityToken renewal with an
+overlap window, the CreateSession/ActivateSession signature exchange and
+RSA-OAEP-encrypted `UserNameIdentityToken`s.
 
-- the wire is exactly as unauthenticated and unencrypted as CoAP-over-plain-
-  UDP or SNMPv1/v2c — appropriate on an already-trusted OT/industrial LAN
-  segment, never over an untrusted network;
-- a `UserNameIdentityToken` therefore travels **in the clear**. `Config.users`
-  is empty by default; passwords are compared in constant time so a wrong one
-  cannot be found byte-by-byte from response timing, but that only removes
-  the timing oracle, not the eavesdropper;
-- `AuthenticationToken`s are 32 random bytes from the caller-supplied
-  `std.Random` (pass a real CSPRNG — it is a bearer credential) and are
-  compared in constant time, but anyone who can read the wire has them.
+**What security is enforced.**
+
+| Property | Mechanism | Failure |
+|---|---|---|
+| the peer holds the key it presents | RSA-PKCS1v1.5/SHA-256 signature over the whole OPN message | `BadSecurityChecksFailed` |
+| the OPN was meant for *us* | `ReceiverCertificateThumbprint` == SHA-1 of our certificate, constant-time | `BadCertificateInvalid` |
+| the peer certificate is well-formed and in date | `std.crypto.Certificate` behind a bounds-checked DER pre-walk + `notBefore`/`notAfter` vs the injected wall clock | `BadCertificateInvalid` / `BadCertificateTimeInvalid` |
+| the peer certificate is *trusted* | caller-supplied `CertificatePolicy.check` | whatever the policy returns |
+| only advertised modes are usable | the (policy, mode) pair must appear in `Config.endpoints` | `BadSecurityModeRejected` |
+| the nonce carries full entropy | `ClientNonce.len == 32` (the policy's key length) | `BadNonceInvalid` |
+| every chunk is authentic | HMAC-SHA256 over the plaintext incl. the MessageHeader; AES-256-CBC under it at SignAndEncrypt | `BadSecurityChecksFailed` |
+| a token cannot outlive its lease | `now_ms - created > RevisedLifetime` | `BadSecureChannelTokenUnknown` |
+| a renewal does not cut off in-flight messages | the previous token stays valid for `token_renewal_overlap_ms`, capped at its own expiry | `BadSecureChannelTokenUnknown` past the window |
+| the channel and the session belong together | `ClientSignature` over serverCertificate ‖ serverNonce, verified against the session's `ClientCertificate` | `BadApplicationSignatureInvalid` |
+| the session cannot move channels | session is channel-bound; no transfer is implemented | `BadSecureChannelIdInvalid` |
+| the client can authenticate *us* | `ServerSignature` over clientCertificate ‖ clientNonce | client-side check |
+| a password is not readable or replayable | RSA-OAEP over `UInt32 len ‖ password ‖ serverNonce`, nonce compared constant-time | `BadIdentityTokenInvalid` |
+| a policy cannot be downgraded | a plaintext password against a non-`#None` `UserTokenPolicy` is refused | `BadIdentityTokenInvalid` |
+
+Every secret-dependent comparison — thumbprints, nonces, passwords,
+authentication tokens, HMAC tags — goes through
+`std.crypto.timing_safe` (`security.constantTimeEql`, built on
+`timing_safe.compare`, or `timing_safe.eql` for fixed-size arrays). There is
+no `std.mem.eql` on a secret anywhere in the security path.
+
+**What is *not* enforced, and must be understood before deploying.**
+
+- **No trust store, no chain walk, no revocation.** The module validates a
+  certificate's structure and validity period and then asks
+  `SecurityConfig.certificate_policy`; with `certificate_policy = null` it
+  accepts any structurally valid, in-date certificate, self-signed included.
+  That authenticates the *channel* (the peer proved possession of the key it
+  showed) but authenticates no *identity*. A real deployment wires the policy
+  to its trust list — e.g. the sibling `x509` module's `verifyChain` against
+  the DER files in the server's PKI directory. CRL/OCSP is likewise the
+  policy's business. This is a deliberate seam, not an oversight: an OPC UA
+  trust list is a deployment artifact, and a library that invented one would
+  be wrong everywhere.
+- **No `ApplicationUri`-vs-SAN check** (OPC 10000-6 §6.2.3). open62541's
+  server does this and answers `BadCertificateUriInvalid`; this one does not.
+- **Certificate-time checks are skipped when `Server.wall_clock_epoch == 0`**
+  — the caller injected no wall clock, so the server's time base is
+  1601-01-01 and there is nothing honest to compare `notBefore`/`notAfter`
+  against. Inject a real epoch in production.
+- **`SecurityPolicy#None` is still offered** by any endpoint list that
+  includes a None endpoint, and at `#None` everything below is true instead:
+
+  - the wire is exactly as unauthenticated and unencrypted as CoAP-over-plain-
+    UDP or SNMPv1/v2c — appropriate on an already-trusted OT/industrial LAN
+    segment, never over an untrusted network;
+  - a `UserNameIdentityToken` travels **in the clear** unless the endpoint
+    offers the encrypted policy (`noneEndpointWithEncryptedUserTokens`).
+    `Config.users` is empty by default; passwords are compared in constant
+    time so a wrong one cannot be found byte-by-byte from response timing, but
+    that only removes the timing oracle, not the eavesdropper;
+  - `AuthenticationToken`s are 32 random bytes from the caller-supplied
+    `std.Random` (pass a real CSPRNG — it is a bearer credential) and are
+    compared in constant time, but anyone who can read the wire has them.
+
+- **`Connection.deinit` must be called** on a secured connection: it frees the
+  peer certificate copy and `secureZero`s both key sets. It is a no-op on a
+  `#None` connection, which is why the callers that predate the security layer
+  are still correct.
+
+**Hostile DER is a first-class input.** `std.crypto.Certificate`'s reader
+indexes without bounds checks and computes element ends without clamping, so
+`security.certificatePublicKey`/`certificateValidity` put a recursive DER
+well-formedness walk plus a zero-padded scratch copy in front of it. A
+truncated, mutated or entirely fabricated certificate is
+`error.InvalidCertificate`; the tests sweep every prefix and every
+single-byte mutation of a real certificate and fuzz arbitrary bytes through
+both entry points.
 
 **Resource bounds are the other half of the threat model.** A server is
 reachable by definition, so every unbounded thing is a DoS surface. Bounded
@@ -100,7 +162,8 @@ opening it half-way).
 Everything in `encoding` and `services` is a codec; what makes it *driven* is
 whether a state machine in `root` (client) or `server` (server) uses it.
 
-- **Driven, both directions:** OpenSecureChannel/CloseSecureChannel,
+- **Driven, both directions, at `#None` *and* `Basic256Sha256`
+  Sign/SignAndEncrypt:** OpenSecureChannel/CloseSecureChannel,
   GetEndpoints, FindServers, CreateSession, ActivateSession, CloseSession,
   Read, Write, Browse, BrowseNext, Call, CreateSubscription, ModifySubscription,
   SetPublishingMode, DeleteSubscriptions, CreateMonitoredItems,
@@ -111,11 +174,14 @@ whether a state machine in `root` (client) or `server` (server) uses it.
   `EventNotificationList`/`EventFieldList` (no server-side event model),
   `StatusChangeNotification` on the client side, `DiagnosticInfo` trees
   (always encoded empty), `SignedSoftwareCertificate`, `X509IdentityToken`
-  and `IssuedIdentityToken` type ids.
+  and `IssuedIdentityToken` type ids, `ActivateSessionRequest.
+  UserTokenSignature` (decoded, never required — it only matters for the
+  X509/Issued tokens, which are not implemented), and
+  `SecurityPolicy.aes256_sha256_rsapss` (an enum value + `uri()` only).
 
 ## Verification
 
-`zig build test-opcua` — 139 tests, Debug and ReleaseFast.
+`zig build test-opcua` — 164 tests, Debug and ReleaseFast.
 
 - **Offline:** RFC/spec-shaped round-trips for every built-in type, transport
   framing, secure-channel KATs, address-space unit tests, and an end-to-end
@@ -128,6 +194,20 @@ whether a state machine in `root` (client) or `server` (server) uses it.
   MSG before OPN, wrong TokenId, rejected security policy — each asserted to
   produce a typed error/fault, never a crash or a hang. Plus
   `std.testing.fuzz` feeding arbitrary bytes into `feed`/`tick`.
+- **Hostile security input** (all asserted to produce a specific `Bad…`
+  status, and to close the channel rather than answer politely): a flipped bit
+  in the chunk-type byte / SecureChannelId / ciphertext, a chunk sealed with
+  the wrong keys, a correctly-MAC'd chunk with a `PaddingSize` pointing past
+  the message, an expired SecurityToken, the previous token used past its
+  renewal overlap, an OPN addressed to another server's certificate, an OPN
+  with a wrong-length nonce, an unadvertised SecurityMode, a certificate the
+  trust policy rejects, a certificate outside its validity window, an absent /
+  stale-nonce / foreign-key `ClientSignature`, a `CreateSession` presenting a
+  certificate other than the channel's, a session replayed on a second
+  channel, a replayed encrypted password, and a plaintext password against an
+  encrypted `UserTokenPolicy`. Certificate parsing additionally gets every
+  prefix of a real certificate, every single-byte mutation of one, hand-built
+  malformed DER, and `std.testing.fuzz`.
 - **Live (the real oracle), skipping loudly when unavailable:**
   - *their client → our server*: open62541 1.0.5's stock
     `tutorial_client_firststeps` (connect + Read i=2258),
@@ -136,11 +216,37 @@ whether a state machine in `root` (client) or `server` (server) uses it.
     login, Browse of the Objects folder, Read/Write of a String NodeId,
     subscription, method Call) run from `docker.io/open62541/open62541` with
     `--network host`; their stdout is the assertion;
+  - *their client → our server, secured*: Python **`asyncua` 2.0.1** (LGPL-3.0,
+    used as a black box — a stock interpreter running a driver script, its
+    stdout is the assertion) generates its own throwaway RSA-2048 certificate
+    and connects at **Basic256Sha256 / SignAndEncrypt**, then browses the
+    Objects folder, reads and writes `ns=1;s=the.answer`, calls a method and
+    receives subscription notifications; it reconnects at **Sign** with a
+    Basic256Sha256-encrypted `UserNameIdentityToken`; and it runs a third
+    connection with a 4 s SecurityToken while reading every 500 ms for 10 s,
+    which forces real mid-stream renewals across the overlap window. Plus
+    open62541's stock `client_encryption`, which picks our SignAndEncrypt
+    endpoint out of `GetEndpoints` on its own;
   - *our client → their server*: the pre-existing live tests against a real
     `server_ctt`, including Basic256Sha256 Sign and SignAndEncrypt;
   - *our client → our server*: over a real loopback socket, with the server
     driven from a second thread.
-- **Goldens** cut from that live traffic (`OPCUA_CAPTURE_DIR=… zig build
+- **Basic256Sha256 goldens** — all **self-derived** and labelled so, because
+  no published OPC UA vector exists for a secured chunk and a captured one
+  would have to embed a real peer's certificate: a full asymmetric
+  `OpenSecureChannel` message (791 bytes, from a fixed key seed and a fixed
+  OAEP seed, so the whole stack under it — `rsa.generate`,
+  `rsa.selfSignedCert`, RSA-OAEP, RSA-PKCS1v1.5 — is pinned byte-for-byte) and
+  one MSG chunk at each of Sign and SignAndEncrypt. Each is re-encoded and
+  re-opened identically. **Key derivation KAT:** `deriveKeys` over two fixed
+  32-byte nonces against expected bytes computed by an *independent* Python
+  implementation of RFC 5246 §5's P_hash with SHA-256 (OPC 10000-6 §6.7.5's
+  construction); `pSha256` itself is separately anchored by the published
+  TLS-1.2 PRF/SHA-256 vector, and the *layout* (which slice is which key, and
+  which nonce is secret vs seed per direction) is cross-checked by the live
+  interop — a real asyncua/open62541 client cannot exchange one signed chunk
+  with this server if any of the six outputs is wrong or swapped.
+- **`#None` goldens** cut from live traffic (`OPCUA_CAPTURE_DIR=… zig build
   test-opcua` dumps the raw streams): Hello, OpenSecureChannel, GetEndpoints,
   CreateSession, ActivateSession, Read, Browse, CreateSubscription,
   CreateMonitoredItems and an acknowledging Publish request are **captured**
@@ -165,9 +271,16 @@ whether a state machine in `root` (client) or `server` (server) uses it.
 Server side, deliberately out of scope for this part — each is a Bad status,
 never a silent partial answer:
 
-- **Security:** no server-side `SecurityPolicy#Basic256Sha256` (or any signed/
-  encrypted policy), no certificate validation, no trust list, no
-  `X509IdentityToken`/`IssuedIdentityToken`. `BadSecurityPolicyRejected`.
+- **Security policies other than `#None` and `Basic256Sha256`:** no
+  `Basic128Rsa15`, no `Basic256` (both deprecated), no `Aes128Sha256RsaOaep`,
+  no `Aes256Sha256RsaPss` (an enum value + URI only). Any OPN naming one is
+  `BadSecurityPolicyRejected`.
+- **Identity tokens:** no `X509IdentityToken`, no `IssuedIdentityToken`
+  (`BadIdentityTokenInvalid`) — and therefore no `UserTokenSignature`
+  verification, which is what those tokens need.
+- **PKI:** no trust store, no chain building, no CRL/OCSP, no
+  `ApplicationUri`-vs-SAN matching — see the threat model; the accept/reject
+  verdict is the caller's `CertificatePolicy`.
 - **NumericRange (index ranges)** on Read/Write: `BadIndexRangeInvalid`.
 - **Filters:** no deadband or event filters on monitored items
   (`BadMonitoredItemFilterUnsupported`), and therefore no events, no

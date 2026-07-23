@@ -22,13 +22,25 @@
 //! event loop — which is the point (a simulated OPC UA server is this
 //! module's most valuable server-side use).
 //!
-//! **Security: `SecurityPolicy#None` only.** The client half of this module
-//! also speaks Basic256Sha256 (`security.zig`), but that path is *client-only*
-//! — the server side implements no asymmetric handshake, no certificate
-//! validation and no message signing/encryption, and rejects any OPN asking
-//! for one with `BadSecurityPolicyRejected`. Said plainly rather than
-//! half-implemented: an unsigned OPC UA server belongs on an already-trusted
-//! network segment only. See SPEC.md.
+//! **Security: `SecurityPolicy#None` *and* `#Basic256Sha256` at Sign and
+//! SignAndEncrypt.** `Config.security` is `null` by default, which keeps the
+//! None-only behaviour byte-for-byte; give it a `SecurityConfig` (a key pair +
+//! application certificate, plus a trust-policy callback) and this server
+//! performs the full asymmetric OpenSecureChannel handshake, P-SHA256 key
+//! derivation, per-chunk symmetric sign/encrypt, SecurityToken renewal with an
+//! overlap window, the CreateSession/ActivateSession signature exchange and
+//! RSA-OAEP-encrypted `UserNameIdentityToken`s. All of the crypto is the
+//! *same* `security.zig` the client half has always used — only the state
+//! machine around it is new. Any other policy is still
+//! `BadSecurityPolicyRejected`; see SPEC.md for what is deliberately missing
+//! (Aes128Sha256RsaOaep, Aes256Sha256RsaPss, X509/Issued identity tokens).
+//!
+//! **The trust decision is the caller's.** This module validates a peer
+//! certificate's *structure* (parses, RSA key, thumbprint addressed to us)
+//! and its *validity period*, then hands the DER to
+//! `SecurityConfig.certificate_policy` — it does not ship a trust store,
+//! does not read files and does not walk a chain, because an OPC UA trust
+//! list is a deployment artifact, not a library constant.
 //!
 //! Model: OPC 10000-4 (Services) + OPC 10000-6 (mappings), with open62541
 //! (MPL-2.0) used as a live black-box interop oracle — its `client`,
@@ -40,6 +52,7 @@ const encoding = @import("encoding.zig");
 const transport = @import("transport.zig");
 const services = @import("services.zig");
 const nodestore = @import("nodestore.zig");
+const security = @import("security.zig");
 
 /// The StatusCode table (see `services.status`).
 pub const status = services.status;
@@ -92,15 +105,78 @@ pub const UserCredential = struct {
     password: []const u8,
 };
 
+/// The caller's trust decision about a peer's application certificate — the
+/// one thing this module refuses to guess. `check` gets the *structurally
+/// valid, in-date* DER certificate the peer presented and answers with
+/// `status.good` to accept or any `Bad…` code to reject (the code is
+/// returned to the peer verbatim, so pick a truthful one:
+/// `bad_certificate_untrusted`, `bad_certificate_revoked`,
+/// `bad_certificate_use_not_allowed`, …).
+///
+/// A real deployment wires this to a trust list — e.g. the sibling `x509`
+/// module's `verifyChain` against the DER files in the server's PKI
+/// directory. This module deliberately ships neither the store nor the
+/// walk: an OPC UA trust list is a deployment artifact.
+pub const CertificatePolicy = struct {
+    context: ?*anyopaque = null,
+    check: *const fn (context: ?*anyopaque, certificate_der: []const u8) encoding.StatusCode,
+};
+
+/// Everything the server needs to serve `SecurityPolicy#Basic256Sha256`.
+/// `Config.security = null` (the default) leaves the server None-only, with
+/// every byte on the wire identical to before this existed.
+pub const SecurityConfig = struct {
+    /// This server's own RSA key pair + application certificate. The
+    /// certificate is what `GetEndpoints`/`CreateSession` publish as
+    /// `ServerCertificate` and what clients encrypt the OPN request to;
+    /// OPC 10000-6 §6.2.3 wants its `subjectAltName` to carry the server's
+    /// `ApplicationUri` (`ClientCredentials.generateSelfSigned` can do that,
+    /// and any real PKI certificate will).
+    credentials: security.Credentials,
+    /// The trust decision (see `CertificatePolicy`). `null` accepts every
+    /// structurally valid, in-date certificate — including self-signed ones.
+    /// That is a *lab* setting: it authenticates the channel (the peer
+    /// proved possession of the key it presented) but authenticates no
+    /// identity. Production must set this.
+    certificate_policy: ?CertificatePolicy = null,
+    /// How long the *previous* SecurityToken keeps working after an
+    /// `OpenSecureChannel(renew)` issued a new one (OPC 10000-6 §6.7.6: both
+    /// tokens are valid during the changeover, because the client may still
+    /// have messages in flight under the old one). Never extends a token
+    /// past its own expiry. Zero would break every long-lived client, which
+    /// is why it is not the default.
+    token_renewal_overlap_ms: u32 = 30_000,
+    /// Shortest / longest `RevisedLifetime` this server grants a
+    /// SecurityToken; a client's `RequestedLifetime` is clamped into the
+    /// band (§5.5.2.2).
+    min_token_lifetime_ms: u32 = 60_000,
+    max_token_lifetime_ms: u32 = 3_600_000,
+    /// Largest peer certificate this server will hold, bytes. A 2048-bit
+    /// application certificate is ~900 bytes and a 4096-bit one ~1.6 kB;
+    /// anything past this is `BadCertificateInvalid` rather than an
+    /// unbounded allocation driven by a stranger.
+    max_certificate_len: usize = 8192,
+};
+
 pub const Config = struct {
     application_uri: []const u8 = "urn:zig-libs:opcua:server",
     product_uri: []const u8 = "urn:zig-libs:opcua",
     application_name: encoding.LocalizedText = .{ .locale = "en", .text = "zig-libs opcua server" },
     /// The endpoints `GetEndpoints`/`CreateSession` answer with — borrowed,
-    /// caller-owned, expected to have static lifetime. Only
-    /// `MessageSecurityMode.none` endpoints can actually be *used* (see the
-    /// module doc comment); build the list with `noneEndpoint`.
+    /// caller-owned, expected to have static lifetime. **This list is the
+    /// authority**: an `OpenSecureChannel` naming a (SecurityPolicy,
+    /// SecurityMode) pair no endpoint here offers is rejected
+    /// (`BadSecurityPolicyRejected` / `BadSecurityModeRejected`), so a
+    /// client can trust what it picked out of `GetEndpoints`. Build entries
+    /// with `noneEndpoint` / `noneEndpointWithEncryptedUserTokens` /
+    /// `secureEndpoint`.
     endpoints: []const services.EndpointDescription,
+    /// `null` (the default) = `SecurityPolicy#None` only, byte-for-byte the
+    /// behaviour this server had before the security layer landed. Set it to
+    /// serve `Basic256Sha256` at Sign / SignAndEncrypt — and note that the
+    /// `endpoints` list must advertise those modes too, or nothing will use
+    /// them.
+    security: ?SecurityConfig = null,
     /// Accept `AnonymousIdentityToken` on ActivateSession.
     allow_anonymous: bool = true,
     /// Accept `UserNameIdentityToken` for any of these credentials.
@@ -157,13 +233,43 @@ pub const default_user_token_policies = [_]services.UserTokenPolicy{
     },
 };
 
+/// The `UserTokenPolicy` id for a username token whose password must be
+/// RSA-OAEP-encrypted to the server certificate (OPC 10000-4 §7.36.4) rather
+/// than sent in the clear. A distinct PolicyId from `user_name_policy_id` so
+/// one endpoint list can offer both and the client's echoed PolicyId says
+/// unambiguously which rules it followed.
+pub const encrypted_user_name_policy_id = "username-basic256sha256";
+
+/// Identity tokens for an endpoint where the *channel* does not already
+/// encrypt (`#None`, or Basic256Sha256 at `Sign`): anonymous, plus a
+/// username token whose password is encrypted under Basic256Sha256 to the
+/// server certificate. Offering a `#None` username policy there would put
+/// the password on the wire in the clear.
+pub const encrypted_user_token_policies = [_]services.UserTokenPolicy{
+    .{
+        .policy_id = anonymous_policy_id,
+        .token_type = .anonymous,
+        .issued_token_type = null,
+        .issuer_endpoint_url = null,
+        .security_policy_uri = services.security_policy_none_uri,
+    },
+    .{
+        .policy_id = encrypted_user_name_policy_id,
+        .token_type = .user_name,
+        .issued_token_type = null,
+        .issuer_endpoint_url = null,
+        .security_policy_uri = services.security_policy_basic256sha256_uri,
+    },
+};
+
 /// The opc.tcp binary transport profile URI every endpoint advertises
 /// (OPC 10000-7 §7.1).
 pub const transport_profile_uri = "http://opcfoundation.org/UA-Profile/Transport/uatcp-uasc-uabinary";
 
-/// Build the one endpoint shape this server can honestly serve:
 /// `SecurityPolicy#None` at `MessageSecurityMode.none`, offering the anonymous
-/// + username identity tokens.
+/// + username identity tokens — both in the clear. Unchanged since before the
+/// security layer existed; `noneEndpointWithEncryptedUserTokens` is the
+/// variant that at least protects the password.
 pub fn noneEndpoint(endpoint_url: []const u8, app: services.ApplicationDescription) services.EndpointDescription {
     return .{
         .endpoint_url = endpoint_url,
@@ -175,6 +281,88 @@ pub fn noneEndpoint(endpoint_url: []const u8, app: services.ApplicationDescripti
         .transport_profile_uri = transport_profile_uri,
         .security_level = 0,
     };
+}
+
+/// `SecurityPolicy#None` at `MessageSecurityMode.none`, but publishing the
+/// server certificate and demanding a Basic256Sha256-encrypted password. The
+/// channel is still unauthenticated and unencrypted — only the
+/// `UserNameIdentityToken` is protected, which is exactly the trade OPC UA
+/// makes for a discovery-grade endpoint that still wants a login.
+pub fn noneEndpointWithEncryptedUserTokens(
+    endpoint_url: []const u8,
+    app: services.ApplicationDescription,
+    server_certificate: []const u8,
+) services.EndpointDescription {
+    return .{
+        .endpoint_url = endpoint_url,
+        .server = app,
+        .server_certificate = server_certificate,
+        .security_mode = .none,
+        .security_policy_uri = services.security_policy_none_uri,
+        .user_identity_tokens = &encrypted_user_token_policies,
+        .transport_profile_uri = transport_profile_uri,
+        .security_level = 0,
+    };
+}
+
+/// `SecurityPolicy#Basic256Sha256` at `mode` (`.sign` or `.sign_and_encrypt`).
+///
+/// * `server_certificate` is the DER of `SecurityConfig.credentials` — a
+///   client needs it to encrypt the OPN request and to check the
+///   `CreateSessionResponse` signature, so an endpoint without it is unusable.
+/// * `security_level` is the *relative* ranking a client uses to pick the
+///   "most secure" endpoint (OPC 10000-4 §7.14: higher is better; `0` means
+///   "no security"). The defaults below leave room between the rungs.
+/// * The identity tokens follow the channel: at SignAndEncrypt the channel
+///   already encrypts, so a `#None` username policy is correct and is what
+///   both open62541 and asyncua expect; at Sign the password would otherwise
+///   be readable, so the encrypted policy is offered instead.
+pub fn secureEndpoint(
+    endpoint_url: []const u8,
+    app: services.ApplicationDescription,
+    mode: services.MessageSecurityMode,
+    server_certificate: []const u8,
+    security_level: u8,
+) services.EndpointDescription {
+    std.debug.assert(mode == .sign or mode == .sign_and_encrypt);
+    return .{
+        .endpoint_url = endpoint_url,
+        .server = app,
+        .server_certificate = server_certificate,
+        .security_mode = mode,
+        .security_policy_uri = services.security_policy_basic256sha256_uri,
+        .user_identity_tokens = if (mode == .sign_and_encrypt)
+            &default_user_token_policies
+        else
+            &encrypted_user_token_policies,
+        .transport_profile_uri = transport_profile_uri,
+        .security_level = security_level,
+    };
+}
+
+/// Does `config.endpoints` advertise this (SecurityPolicy, SecurityMode)
+/// pair? The gate every `OpenSecureChannel` passes through, so that what a
+/// client read out of `GetEndpoints` is exactly what it can use — no more
+/// (an unadvertised mode is refused) and no less.
+pub fn endpointOffers(config: Config, policy_uri: []const u8, mode: services.MessageSecurityMode) bool {
+    for (config.endpoints) |ep| {
+        const uri = ep.security_policy_uri orelse continue;
+        if (ep.security_mode == mode and std.mem.eql(u8, uri, policy_uri)) return true;
+    }
+    return false;
+}
+
+/// The `UserTokenPolicy` an endpoint list advertises under `policy_id`, or
+/// `null` if no endpoint offers it. Used to decide whether an inbound
+/// identity token was allowed to be plaintext.
+fn userTokenPolicy(config: Config, policy_id: []const u8) ?services.UserTokenPolicy {
+    for (config.endpoints) |ep| {
+        for (ep.user_identity_tokens orelse continue) |p| {
+            const id = p.policy_id orelse continue;
+            if (std.mem.eql(u8, id, policy_id)) return p;
+        }
+    }
+    return null;
 }
 
 /// The `ApplicationDescription` matching a `Config` — handy when building the
@@ -327,9 +515,15 @@ pub const Session = struct {
     /// `SubscriptionAcknowledgement` results owed to the client; they ride the
     /// next PublishResponse this session gets (§5.13.5). Owned.
     pending_ack_results: ?[]encoding.StatusCode = null,
+    /// The `ClientCertificate` from `CreateSessionRequest`, owned — the key
+    /// `ActivateSession`'s `ClientSignature` over (serverCertificate ‖
+    /// serverNonce) is verified against (§5.6.3.1). `null` on a
+    /// SecurityMode=None session, where no signature is exchanged.
+    client_certificate: ?[]u8 = null,
 
     fn deinit(session: *Session) void {
         const a = session.allocator;
+        if (session.client_certificate) |cert| a.free(cert);
         for (session.subscriptions.items) |sub| {
             sub.deinit(a);
             a.destroy(sub);
@@ -397,6 +591,15 @@ pub const Server = struct {
     /// The OPC UA `DateTime` for a driver-supplied millisecond timestamp.
     pub fn dateTime(srv: *const Server, now_ms: i64) encoding.DateTime {
         return srv.wall_clock_epoch +% (now_ms *% 10_000);
+    }
+
+    /// The same instant as **Unix seconds** — what X.509 `notBefore`/
+    /// `notAfter` are measured in. 11644473600 is the 1601→1970 epoch offset
+    /// in seconds; a `wall_clock_epoch` of 0 therefore lands in 1601, which
+    /// is exactly why certificate-time checks are skipped when the caller
+    /// never injected a wall clock.
+    pub fn unixSeconds(srv: *const Server, now_ms: i64) i64 {
+        return @divFloor(srv.dateTime(now_ms), 10_000_000) - 11_644_473_600;
     }
 
     /// Refresh `Server_ServerStatus` (i=2256) + `CurrentTime` (i=2258) from
@@ -502,6 +705,37 @@ pub const Connection = struct {
     endpoint_url_buf: [256]u8 = undefined,
     endpoint_url_len: usize = 0,
 
+    // ── SecurityPolicy#Basic256Sha256 state ─────────────────────────────────
+    // All of it is inert at `SecurityPolicy#None`: `sec_mode == .none` is the
+    // single branch every secured path is behind, so a None channel runs the
+    // exact code (and produces the exact bytes) it did before.
+
+    /// The policy this channel was opened with.
+    sec_policy: security.SecurityPolicy = .none,
+    /// The policy of the OPN currently being processed, set by
+    /// `openAsymmetricChunk` once it has decided (and, for a signed policy,
+    /// cryptographically proved) what arrived. One message is in flight at a
+    /// time per connection, so a single slot is enough — and it keeps
+    /// `handleOpenSecureChannel` from having to re-parse a header the
+    /// security stage already validated.
+    opn_policy: security.SecurityPolicy = .none,
+    /// The mode this channel was opened with — `.none` until a
+    /// Basic256Sha256 `OpenSecureChannel` succeeds.
+    sec_mode: services.MessageSecurityMode = .none,
+    /// The peer's application certificate from the OPN
+    /// `AsymmetricAlgorithmSecurityHeader`, validated and then copied with
+    /// the *server* allocator (it must outlive the per-message arena — the
+    /// OPN response is encrypted to it, and `CreateSession` compares against
+    /// it). Freed by `deinit`.
+    client_certificate: ?[]u8 = null,
+    /// Symmetric keys for the current token (`token_id`).
+    keys: ?security.ChannelKeys = null,
+    /// The token a renewal superseded, still accepted until
+    /// `prev_token_valid_until_ms` (OPC 10000-6 §6.7.6's overlap). `0` = none.
+    prev_token_id: u32 = 0,
+    prev_token_valid_until_ms: i64 = 0,
+    prev_keys: ?security.ChannelKeys = null,
+
     pub const InitError = error{BufferTooSmall};
 
     /// `recv_buf` must be >= the configured `receive_buffer_size` (a chunk is
@@ -511,6 +745,21 @@ pub const Connection = struct {
         if (recv_buf.len < server.config.limits.receive_buffer_size) return error.BufferTooSmall;
         if (msg_buf.len < min_buffer_size) return error.BufferTooSmall;
         return .{ .server = server, .recv = recv_buf, .msg = msg_buf };
+    }
+
+    /// Release this connection's security state: free the peer certificate
+    /// and `secureZero` both key sets. A `SecurityPolicy#None` connection
+    /// owns nothing, so this is a no-op there — which is why the pre-security
+    /// callers that never had a `deinit` to call are still correct. Any
+    /// caller that opens `Config.security` channels must call it (the
+    /// certificate copy is heap-allocated).
+    pub fn deinit(c: *Connection) void {
+        if (c.client_certificate) |cert| c.server.allocator.free(cert);
+        c.client_certificate = null;
+        if (c.keys) |*k| k.wipe();
+        if (c.prev_keys) |*k| k.wipe();
+        c.keys = null;
+        c.prev_keys = null;
     }
 
     pub fn endpointUrl(c: *const Connection) []const u8 {
@@ -576,8 +825,12 @@ pub const Connection = struct {
             }
             if (c.recv_len < size) return; // wait for the rest of this chunk
 
+            // The 8-byte MessageHeader is part of the *signed* range of a
+            // secured chunk (OPC 10000-6 §6.7.2), so it is carried alongside
+            // the body rather than dropped once parsed.
+            const header: [header_size]u8 = c.recv[0..header_size].*;
             const body = c.recv[header_size..size];
-            try c.processChunk(message_type, chunk_type, body, out, now_ms);
+            try c.processChunk(&header, message_type, chunk_type, body, out, now_ms);
 
             const leftover = c.recv_len - size;
             if (leftover > 0) std.mem.copyForwards(u8, c.recv[0..leftover], c.recv[size..c.recv_len]);
@@ -587,6 +840,7 @@ pub const Connection = struct {
 
     fn processChunk(
         c: *Connection,
+        header: *const [header_size]u8,
         message_type: transport.MessageType,
         chunk_type: transport.ChunkType,
         body: []const u8,
@@ -606,7 +860,7 @@ pub const Connection = struct {
                 .hello => try c.fail(out, status.bad_tcp_message_type_invalid, "Hello after the handshake"),
                 // A client never sends these.
                 .acknowledge, .error_msg => try c.fail(out, status.bad_tcp_message_type_invalid, "server-only message type from a client"),
-                .open_secure_channel, .message, .close_secure_channel => try c.handleSecureChunk(message_type, chunk_type, body, out, now_ms),
+                .open_secure_channel, .message, .close_secure_channel => try c.handleSecureChunk(header, message_type, chunk_type, body, out, now_ms),
             },
         }
     }
@@ -685,41 +939,59 @@ pub const Connection = struct {
 
     fn handleSecureChunk(
         c: *Connection,
+        header: *const [header_size]u8,
         message_type: transport.MessageType,
         chunk_type: transport.ChunkType,
-        body: []const u8,
+        wire_body: []const u8,
         out: *std.Io.Writer,
         now_ms: i64,
     ) ServerError!void {
+        // Stage 1 — security. At SecurityMode=None this whole block resolves
+        // to `body = wire_body` and nothing is allocated. Otherwise the chunk
+        // is decrypted + signature-verified here, *before* a single field of
+        // it is believed, and `body` becomes the recovered plaintext (same
+        // layout: SecureChannelId, security header, SequenceHeader, payload).
+        var opened: ?[]u8 = null;
+        defer if (opened) |o| {
+            std.crypto.secureZero(u8, o);
+            c.server.allocator.free(o);
+        };
+        var body = wire_body;
+
         if (body.len < 4) {
             try c.fail(out, status.bad_tcp_internal_error, "truncated secure-conversation header");
             return;
         }
+        const unsealed: ChunkOpen = switch (message_type) {
+            .open_secure_channel => try c.openAsymmetricChunk(header, wire_body, out, now_ms),
+            .message, .close_secure_channel => try c.openSymmetricChunk(header, wire_body, out, now_ms),
+            else => unreachable,
+        };
+        switch (unsealed) {
+            .failed => return, // the ERR is already written, the socket is done
+            .plaintext => {},
+            .opened => |plain| {
+                opened = plain;
+                body = plain;
+            },
+        }
+
+        // Stage 2 — the plaintext chunk headers, identical at every mode.
         var r: std.Io.Reader = .fixed(body);
         const channel_id = r.takeInt(u32, .little) catch unreachable;
 
         switch (message_type) {
             .open_secure_channel => {
                 // AsymmetricAlgorithmSecurityHeader: SecurityPolicyUri,
-                // SenderCertificate, ReceiverCertificateThumbprint (§6.7.2).
-                const policy_uri = takeStringSlice(&r) catch {
-                    try c.fail(out, status.bad_tcp_internal_error, "truncated asymmetric security header");
-                    return;
-                };
-                _ = takeStringSlice(&r) catch {
-                    try c.fail(out, status.bad_tcp_internal_error, "truncated sender certificate");
-                    return;
-                };
-                _ = takeStringSlice(&r) catch {
-                    try c.fail(out, status.bad_tcp_internal_error, "truncated certificate thumbprint");
-                    return;
-                };
-                const uri = policy_uri orelse "";
-                if (!std.mem.eql(u8, uri, services.security_policy_none_uri)) {
-                    // Said plainly rather than half-implemented: this server
-                    // has no asymmetric crypto (see the module doc comment).
-                    try c.fail(out, status.bad_security_policy_rejected, "only SecurityPolicy#None is implemented server-side");
-                    return;
+                // SenderCertificate, ReceiverCertificateThumbprint (§6.7.2)
+                // — already inspected (and, when secured, cryptographically
+                // bound to the message) by `openAsymmetricChunk`; skipped
+                // here without allocating.
+                for (0..3) |_| {
+                    _ = takeStringSlice(&r) catch {
+                        try c.fail(out, status.bad_tcp_internal_error, "truncated asymmetric security header");
+                        return;
+                    };
                 }
                 if (channel_id != 0 and channel_id != c.channel_id) {
                     try c.fail(out, status.bad_tcp_secure_channel_unknown, "unknown secure channel");
@@ -735,7 +1007,11 @@ pub const Connection = struct {
                     try c.fail(out, status.bad_tcp_internal_error, "truncated symmetric security header");
                     return;
                 };
-                if (token_id != c.token_id) {
+                // At SecurityMode != None `openSymmetricChunk` already picked
+                // (and time-checked) the token this chunk was signed under —
+                // reaching here means it was the current one or the one still
+                // inside the renewal overlap.
+                if (c.sec_mode == .none and token_id != c.token_id) {
                     try c.fail(out, status.bad_tcp_secure_channel_unknown, "unknown security token");
                     return;
                 }
@@ -794,6 +1070,209 @@ pub const Connection = struct {
         try c.processMessage(message_type, request_id, message, out, now_ms);
     }
 
+    /// What the security stage did with an inbound chunk.
+    const ChunkOpen = union(enum) {
+        /// `SecurityPolicy#None`: the wire body *is* the plaintext body.
+        plaintext,
+        /// Recovered plaintext, server-allocator-owned (caller frees).
+        opened: []u8,
+        /// Rejected — an `ERR` is already on the wire and the connection is
+        /// closed. Every failure in this stage is fatal to the channel by
+        /// design: a chunk that does not decrypt, does not verify, names an
+        /// unknown token or carries an untrusted certificate is not a service
+        /// error to be answered politely, it is a broken or hostile peer
+        /// (OPC 10000-6 §6.7.2, §7.1.4).
+        failed,
+    };
+
+    /// Security stage for an OPN chunk. The
+    /// `AsymmetricAlgorithmSecurityHeader` rides in the clear precisely so
+    /// this can happen: read the policy, decide whether we serve it, check
+    /// that the sender addressed *our* certificate, run the sender's
+    /// certificate past the caller's trust policy, then RSA-OAEP-decrypt the
+    /// body with our private key and RSA-PKCS1v1.5/SHA-256-verify the
+    /// signature against the certificate the header carried.
+    fn openAsymmetricChunk(
+        c: *Connection,
+        header: *const [header_size]u8,
+        wire_body: []const u8,
+        out: *std.Io.Writer,
+        now_ms: i64,
+    ) ServerError!ChunkOpen {
+        const view = security.viewAsymmetricHeader(wire_body) orelse {
+            try c.fail(out, status.bad_tcp_internal_error, "truncated asymmetric security header");
+            return .failed;
+        };
+        if (std.mem.eql(u8, view.security_policy_uri, services.security_policy_none_uri)) {
+            if (c.sec_mode != .none) {
+                // A secured channel cannot be renewed in the clear.
+                try c.fail(out, status.bad_security_policy_rejected, "SecurityPolicy#None OPN on a secured channel");
+                return .failed;
+            }
+            c.opn_policy = .none;
+            return .plaintext;
+        }
+        if (!std.mem.eql(u8, view.security_policy_uri, services.security_policy_basic256sha256_uri)) {
+            try c.fail(out, status.bad_security_policy_rejected, "unsupported SecurityPolicy");
+            return .failed;
+        }
+
+        const sec = c.server.config.security orelse {
+            // No key pair configured: say so plainly rather than pretend.
+            try c.fail(out, status.bad_security_policy_rejected, "this server is configured for SecurityPolicy#None only");
+            return .failed;
+        };
+
+        // The sender must have encrypted to *our* certificate; a mismatched
+        // thumbprint means the OPN was meant for a different server (or was
+        // replayed at us), and our private key would produce garbage.
+        const thumbprint = security.certificateThumbprint(sec.credentials.certificate_der);
+        const claimed = view.receiver_certificate_thumbprint orelse &.{};
+        if (!security.constantTimeEql(claimed, &thumbprint)) {
+            try c.fail(out, status.bad_certificate_invalid, "ReceiverCertificateThumbprint is not this server's certificate");
+            return .failed;
+        }
+
+        const client_cert = view.sender_certificate orelse {
+            try c.fail(out, status.bad_certificate_invalid, "no SenderCertificate on a secured OpenSecureChannel");
+            return .failed;
+        };
+        if (client_cert.len > sec.max_certificate_len) {
+            try c.fail(out, status.bad_certificate_invalid, "SenderCertificate exceeds max_certificate_len");
+            return .failed;
+        }
+        const verdict = c.checkPeerCertificate(sec, client_cert, now_ms);
+        if (verdict != status.good) {
+            try c.fail(out, verdict, "SenderCertificate rejected");
+            return .failed;
+        }
+        // On a *renewal* the certificate must be the one that opened the
+        // channel — otherwise anyone who can reach the socket could re-key it.
+        if (c.client_certificate) |pinned| {
+            if (!security.constantTimeEql(pinned, client_cert)) {
+                try c.fail(out, status.bad_certificate_invalid, "OpenSecureChannel certificate differs from the one that opened this channel");
+                return .failed;
+            }
+        }
+
+        const plain = security.openAsymmetricMessage(
+            c.server.allocator,
+            header,
+            wire_body,
+            sec.credentials.private_key,
+            client_cert,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidCertificate => {
+                try c.fail(out, status.bad_certificate_invalid, "SenderCertificate carries no usable RSA key");
+                return .failed;
+            },
+            error.SignatureVerificationFailed => {
+                try c.fail(out, status.bad_security_checks_failed, "OpenSecureChannel signature did not verify");
+                return .failed;
+            },
+            error.DecryptionError, error.InvalidSecureMessage, error.BufferTooSmall => {
+                try c.fail(out, status.bad_security_checks_failed, "OpenSecureChannel did not decrypt");
+                return .failed;
+            },
+        };
+        errdefer c.server.allocator.free(plain);
+
+        // Only now — after the signature proved the sender holds the key —
+        // is the certificate worth keeping.
+        if (c.client_certificate == null) {
+            c.client_certificate = try c.server.allocator.dupe(u8, client_cert);
+        }
+        c.opn_policy = .basic256sha256;
+        return .{ .opened = plain };
+    }
+
+    /// Security stage for a MSG/CLO chunk on a secured channel: pick the
+    /// SecurityToken the chunk names (current, or the previous one still
+    /// inside its renewal overlap), reject an expired one, then decrypt +
+    /// HMAC-verify with that token's keys.
+    fn openSymmetricChunk(
+        c: *Connection,
+        header: *const [header_size]u8,
+        wire_body: []const u8,
+        out: *std.Io.Writer,
+        now_ms: i64,
+    ) ServerError!ChunkOpen {
+        if (c.sec_mode == .none) return .plaintext;
+        if (wire_body.len < 8) {
+            try c.fail(out, status.bad_tcp_internal_error, "truncated symmetric security header");
+            return .failed;
+        }
+        const token_id = std.mem.readInt(u32, wire_body[4..8], .little);
+        const keys: security.ChannelKeys = blk: {
+            if (token_id == c.token_id) {
+                if (c.tokenExpired(now_ms)) {
+                    try c.fail(out, status.bad_secure_channel_token_unknown, "SecurityToken lifetime elapsed without a renewal");
+                    return .failed;
+                }
+                break :blk c.keys orelse {
+                    try c.fail(out, status.bad_secure_channel_token_unknown, "no keys for this SecurityToken");
+                    return .failed;
+                };
+            }
+            if (token_id != 0 and token_id == c.prev_token_id and now_ms <= c.prev_token_valid_until_ms) {
+                break :blk c.prev_keys.?;
+            }
+            try c.fail(out, status.bad_secure_channel_token_unknown, "unknown or expired security token");
+            return .failed;
+        };
+
+        const plain = security.symmetricDecryptAndVerify(
+            c.server.allocator,
+            header,
+            wire_body,
+            c.sec_mode,
+            keys,
+            .client_to_server,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.SignatureVerificationFailed => {
+                try c.fail(out, status.bad_security_checks_failed, "chunk signature did not verify");
+                return .failed;
+            },
+            error.InvalidSecureMessage => {
+                try c.fail(out, status.bad_security_checks_failed, "malformed secure chunk (padding/alignment)");
+                return .failed;
+            },
+        };
+        return .{ .opened = plain };
+    }
+
+    /// Has the current SecurityToken outlived its `RevisedLifetime`? Only
+    /// enforced on a secured channel: at `SecurityPolicy#None` the token is
+    /// a bookkeeping number with nothing behind it, and enforcing it there
+    /// would change long-standing None behaviour for no security gain.
+    fn tokenExpired(c: *const Connection, now_ms: i64) bool {
+        if (c.sec_mode == .none) return false;
+        if (c.token_lifetime_ms == 0) return false;
+        return now_ms -| c.token_created_ms > @as(i64, c.token_lifetime_ms);
+    }
+
+    /// Structure + validity period + the caller's trust policy, in that
+    /// order. Returns `status.good` or the `Bad…` code to answer with.
+    fn checkPeerCertificate(c: *Connection, sec: SecurityConfig, certificate_der: []const u8, now_ms: i64) encoding.StatusCode {
+        // Must parse and carry an RSA key — everything downstream assumes it.
+        _ = security.certificatePublicKey(certificate_der) catch return status.bad_certificate_invalid;
+
+        // notBefore/notAfter, against the wall clock the caller injected.
+        // `wall_clock_epoch == 0` means no wall clock was injected at all
+        // (the server's time base is then 1601-01-01), so there is nothing
+        // honest to compare against and the window check is skipped — see
+        // `Server.wall_clock_epoch`.
+        if (c.server.wall_clock_epoch != 0) {
+            const validity = security.certificateValidity(certificate_der) catch return status.bad_certificate_invalid;
+            if (!validity.covers(c.server.unixSeconds(now_ms))) return status.bad_certificate_time_invalid;
+        }
+
+        if (sec.certificate_policy) |policy| return policy.check(policy.context, certificate_der);
+        return status.good;
+    }
+
     fn resetAssembly(c: *Connection) void {
         c.msg_len = 0;
         c.msg_type = null;
@@ -848,7 +1327,12 @@ pub const Connection = struct {
         request_id: u32,
         payload: []const u8,
     ) ServerError!void {
-        const max_body: usize = @max(@as(usize, 1), c.limits.send_buffer_size -| symmetric_overhead);
+        // The signature + padding footer eat into what a chunk can carry, so
+        // a secured chunk's payload budget is smaller than a plain one's.
+        const max_body: usize = @max(@as(usize, 1), if (c.sec_mode == .none)
+            c.limits.send_buffer_size -| symmetric_overhead
+        else
+            security.maxSymmetricPayload(c.limits.send_buffer_size, c.sec_mode));
         const chunks = (payload.len + max_body - 1) / max_body;
         if (c.limits.max_chunk_count != 0 and chunks > c.limits.max_chunk_count) return error.ResponseTooLarge;
 
@@ -856,32 +1340,116 @@ pub const Connection = struct {
         while (true) {
             const take = @min(payload.len - offset, max_body);
             const is_final = offset + take == payload.len;
-            try writeChunkHeader(out, message_type, if (is_final) .final else .intermediate, symmetric_overhead + take);
-            try out.writeInt(u32, c.channel_id, .little);
-            try out.writeInt(u32, c.token_id, .little);
-            try out.writeInt(u32, c.nextSequenceNumber(), .little);
-            try out.writeInt(u32, request_id, .little);
-            try out.writeAll(payload[offset..][0..take]);
+            const chunk_type: transport.ChunkType = if (is_final) .final else .intermediate;
+            if (c.sec_mode == .none) {
+                try writeChunkHeader(out, message_type, chunk_type, symmetric_overhead + take);
+                try out.writeInt(u32, c.channel_id, .little);
+                try out.writeInt(u32, c.token_id, .little);
+                try out.writeInt(u32, c.nextSequenceNumber(), .little);
+                try out.writeInt(u32, request_id, .little);
+                try out.writeAll(payload[offset..][0..take]);
+            } else {
+                try c.sendSecuredChunk(out, message_type, chunk_type, request_id, payload[offset..][0..take]);
+            }
             offset += take;
             if (is_final) break;
         }
     }
 
+    /// One MSG/CLO chunk, signed (and at SignAndEncrypt encrypted) under the
+    /// *current* SecurityToken's keys. Built into a scratch buffer because
+    /// the signature covers the finished MessageHeader — the size field can
+    /// only be filled in once the padding is known, so nothing can be
+    /// streamed straight to `out`.
+    fn sendSecuredChunk(
+        c: *Connection,
+        out: *std.Io.Writer,
+        message_type: transport.MessageType,
+        chunk_type: transport.ChunkType,
+        request_id: u32,
+        payload: []const u8,
+    ) ServerError!void {
+        const keys = c.keys orelse return error.ResponseTooLarge; // unreachable in practice: sec_mode != none implies keys
+        var body = std.Io.Writer.Allocating.init(c.server.allocator);
+        defer body.deinit();
+        try body.writer.writeInt(u32, c.channel_id, .little);
+        try body.writer.writeInt(u32, c.token_id, .little);
+        try body.writer.writeInt(u32, c.nextSequenceNumber(), .little);
+        try body.writer.writeInt(u32, request_id, .little);
+        try body.writer.writeAll(payload);
+
+        const sealed = try security.symmetricSealChunk(
+            c.server.allocator,
+            message_type.code(),
+            @intFromEnum(chunk_type),
+            body.writer.buffered(),
+            c.sec_mode,
+            keys,
+            .server_to_client,
+        );
+        defer c.server.allocator.free(sealed);
+        std.crypto.secureZero(u8, body.writer.buffered());
+        try out.writeAll(sealed);
+    }
+
     /// The OPN response carries the `AsymmetricAlgorithmSecurityHeader`
     /// instead of a TokenId (§6.7.2). Always a single chunk: at
-    /// SecurityMode=None the response is a couple of hundred bytes.
+    /// SecurityMode=None the response is a couple of hundred bytes, and at
+    /// Basic256Sha256 it is the response plus one certificate.
     fn sendOpenResponse(c: *Connection, out: *std.Io.Writer, request_id: u32, payload: []const u8) ServerError!void {
-        const uri = services.security_policy_none_uri;
-        const size = header_size + 4 + (4 + uri.len) + 4 + 4 + 8 + payload.len;
-        try writeChunkHeader(out, .open_secure_channel, .final, size);
-        try out.writeInt(u32, c.channel_id, .little);
-        try out.writeInt(i32, @intCast(uri.len), .little);
-        try out.writeAll(uri);
-        try out.writeInt(i32, -1, .little); // SenderCertificate: none
-        try out.writeInt(i32, -1, .little); // ReceiverCertificateThumbprint: none
-        try out.writeInt(u32, c.nextSequenceNumber(), .little);
-        try out.writeInt(u32, request_id, .little);
-        try out.writeAll(payload);
+        if (c.sec_mode == .none) {
+            const uri = services.security_policy_none_uri;
+            const size = header_size + 4 + (4 + uri.len) + 4 + 4 + 8 + payload.len;
+            try writeChunkHeader(out, .open_secure_channel, .final, size);
+            try out.writeInt(u32, c.channel_id, .little);
+            try out.writeInt(i32, @intCast(uri.len), .little);
+            try out.writeAll(uri);
+            try out.writeInt(i32, -1, .little); // SenderCertificate: none
+            try out.writeInt(i32, -1, .little); // ReceiverCertificateThumbprint: none
+            try out.writeInt(u32, c.nextSequenceNumber(), .little);
+            try out.writeInt(u32, request_id, .little);
+            try out.writeAll(payload);
+            return;
+        }
+
+        // Basic256Sha256: our certificate goes out in the clear, the client's
+        // thumbprint says whose key we encrypted to, and everything from the
+        // SequenceHeader on is signed with our private key and encrypted to
+        // the client's certificate — the mirror of `openAsymmetricChunk`.
+        const sec = c.server.config.security.?;
+        const client_cert = c.client_certificate.?;
+        const thumbprint = security.certificateThumbprint(client_cert);
+
+        var body = std.Io.Writer.Allocating.init(c.server.allocator);
+        defer body.deinit();
+        var e = encoding.Encoder.init(&body.writer);
+        try body.writer.writeInt(u32, c.channel_id, .little);
+        try security.encodeAsymmetricAlgorithmSecurityHeader(&e, .{
+            .security_policy_uri = c.sec_policy.uri(),
+            .sender_certificate = sec.credentials.certificate_der,
+            .receiver_certificate_thumbprint = &thumbprint,
+        });
+        const encrypted_region_offset = body.writer.buffered().len;
+        try body.writer.writeInt(u32, c.nextSequenceNumber(), .little);
+        try body.writer.writeInt(u32, request_id, .little);
+        try body.writer.writeAll(payload);
+
+        const sealed = security.sealAsymmetricMessage(
+            c.server.allocator,
+            c.server.random,
+            transport.MessageType.open_secure_channel.code(),
+            body.writer.buffered(),
+            encrypted_region_offset,
+            sec.credentials,
+            client_cert,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            // The client certificate was parsed and accepted on the way in,
+            // and our own key is our own — neither can fail here in practice.
+            else => return error.ResponseTooLarge,
+        };
+        defer c.server.allocator.free(sealed);
+        try out.writeAll(sealed);
     }
 
     // ── entry point 2: the clock ────────────────────────────────────────────
@@ -1068,29 +1636,96 @@ pub const Connection = struct {
         const request = try services.decodeOpenSecureChannelRequest(d);
         ctx.request_handle = request.request_header.request_handle;
 
-        if (request.security_mode != .none) {
-            try sendFault(ctx, status.bad_security_mode_rejected);
-            return;
+        // `openAsymmetricChunk` already decided (and, for Basic256Sha256,
+        // cryptographically proved) which policy this OPN arrived under.
+        const policy = c.opn_policy;
+        if (policy == .none) {
+            if (request.security_mode != .none) {
+                try sendFault(ctx, status.bad_security_mode_rejected);
+                return;
+            }
+        } else {
+            // A secured OPN whose *request* is unacceptable gets a
+            // transport-level `ERR`, not a ServiceFault: the client is
+            // expecting an encrypted OPN response and could not read a
+            // plaintext one, whereas `ERR` is defined to ride in the clear.
+            if (request.security_mode != .sign and request.security_mode != .sign_and_encrypt) {
+                try c.fail(ctx.out, status.bad_security_mode_rejected, "SecurityMode must be Sign or SignAndEncrypt under a signed SecurityPolicy");
+                return;
+            }
+            // GetEndpoints is the contract: a mode no endpoint advertises is
+            // not on offer, however well the crypto would have worked.
+            if (!endpointOffers(ctx.srv.config, policy.uri(), request.security_mode)) {
+                try c.fail(ctx.out, status.bad_security_mode_rejected, "no endpoint offers this SecurityPolicy/SecurityMode pair");
+                return;
+            }
+            const client_nonce = request.client_nonce orelse &.{};
+            // §6.7.5: the nonce length must equal the policy's symmetric key
+            // length, or the derived keys carry less entropy than they claim.
+            if (client_nonce.len != security.lengths(policy).?.nonce_len) {
+                try c.fail(ctx.out, status.bad_nonce_invalid, "ClientNonce length does not match the SecurityPolicy");
+                return;
+            }
         }
+
         switch (request.request_type) {
             .issue => {
                 c.channel_id = c.server.next_channel_id;
                 c.server.next_channel_id +%= 1;
                 if (c.server.next_channel_id == 0) c.server.next_channel_id = 1;
                 c.send_sequence_number = 0;
+                // A fresh channel starts with no superseded token.
+                if (c.prev_keys) |*k| k.wipe();
+                c.prev_keys = null;
+                c.prev_token_id = 0;
+                c.prev_token_valid_until_ms = 0;
             },
             .renew => {
                 if (c.channel_id == 0) {
                     try sendFault(ctx, status.bad_secure_channel_id_invalid);
                     return;
                 }
+                // §6.7.6: the token being replaced stays valid for the
+                // overlap window — a client with messages already in flight
+                // under the old token must not be cut off. Never past the
+                // old token's own expiry, which is a hard deadline.
+                if (policy != .none and c.token_id != 0) {
+                    if (c.prev_keys) |*k| k.wipe();
+                    c.prev_token_id = c.token_id;
+                    c.prev_keys = c.keys;
+                    const sec = ctx.srv.config.security.?;
+                    const own_expiry = c.token_created_ms +| @as(i64, c.token_lifetime_ms);
+                    const overlap_end = ctx.now_ms +| @as(i64, sec.token_renewal_overlap_ms);
+                    c.prev_token_valid_until_ms = @min(own_expiry, overlap_end);
+                }
             },
         }
+
         c.token_id = c.server.next_token_id;
         c.server.next_token_id +%= 1;
         if (c.server.next_token_id == 0) c.server.next_token_id = 1;
         c.token_created_ms = ctx.now_ms;
-        c.token_lifetime_ms = clampLifetime(request.requested_lifetime);
+        c.token_lifetime_ms = if (ctx.srv.config.security) |sec|
+            clampLifetimeBand(request.requested_lifetime, sec.min_token_lifetime_ms, sec.max_token_lifetime_ms)
+        else
+            clampLifetime(request.requested_lifetime);
+
+        // The server nonce: 32 bytes of the caller's CSPRNG at
+        // Basic256Sha256, "present but empty" at SecurityMode=None (which is
+        // exactly what this module's own client sends in that position).
+        var server_nonce: [32]u8 = undefined;
+        var response_nonce: []const u8 = &.{};
+        if (policy != .none) {
+            ctx.srv.random.bytes(&server_nonce);
+            response_nonce = &server_nonce;
+            // P-SHA256 over the nonce pair — both directions' signing keys,
+            // encrypting keys and IVs (§6.7.5).
+            if (c.keys) |*k| k.wipe();
+            c.keys = security.deriveKeys(request.client_nonce.?, &server_nonce, policy);
+            c.sec_policy = policy;
+            c.sec_mode = request.security_mode;
+        }
+        defer std.crypto.secureZero(u8, &server_nonce);
 
         var body = std.Io.Writer.Allocating.init(ctx.arena);
         var e = encoding.Encoder.init(&body.writer);
@@ -1104,9 +1739,7 @@ pub const Connection = struct {
                 .created_at = ctx.srv.dateTime(ctx.now_ms),
                 .revised_lifetime = c.token_lifetime_ms,
             },
-            // SecurityMode=None: the nonce is present but empty — exactly what
-            // this module's own client sends in the same position.
-            .server_nonce = &.{},
+            .server_nonce = response_nonce,
         });
         try c.sendOpenResponse(ctx.out, ctx.request_id, body.writer.buffered());
     }
@@ -1114,6 +1747,11 @@ pub const Connection = struct {
     fn clampLifetime(requested: u32) u32 {
         if (requested == 0) return 600_000;
         return std.math.clamp(requested, 60_000, 3_600_000);
+    }
+
+    fn clampLifetimeBand(requested: u32, min_ms: u32, max_ms: u32) u32 {
+        if (requested == 0) return @min(600_000, max_ms);
+        return std.math.clamp(requested, @min(min_ms, max_ms), max_ms);
     }
 
     // ── §5.4: discovery ─────────────────────────────────────────────────────
@@ -1164,6 +1802,29 @@ pub const Connection = struct {
         else
             std.math.clamp(requested, ctx.srv.config.min_session_timeout_ms, ctx.srv.config.max_session_timeout_ms);
 
+        // §5.6.2 on a secured channel: the ClientCertificate the session is
+        // created with must be the certificate that opened the channel.
+        // Anything else would let a session be bound to a key the channel
+        // never proved possession of.
+        var session_certificate: ?[]u8 = null;
+        if (c.sec_mode != .none) {
+            const presented = request.client_certificate orelse {
+                try sendFault(ctx, status.bad_certificate_invalid);
+                return;
+            };
+            if (!security.constantTimeEql(presented, c.client_certificate.?)) {
+                try sendFault(ctx, status.bad_certificate_invalid);
+                return;
+            }
+            const nonce = request.client_nonce orelse &.{};
+            if (nonce.len != security.lengths(c.sec_policy).?.nonce_len) {
+                try sendFault(ctx, status.bad_nonce_invalid);
+                return;
+            }
+            session_certificate = try ctx.srv.allocator.dupe(u8, presented);
+        }
+        errdefer if (session_certificate) |cert| ctx.srv.allocator.free(cert);
+
         const session = try ctx.srv.allocator.create(Session);
         errdefer ctx.srv.allocator.destroy(session);
         const name = try ctx.srv.allocator.dupe(u8, request.session_name orelse "");
@@ -1177,6 +1838,7 @@ pub const Connection = struct {
             .channel_id = c.channel_id,
             .timeout_ms = timeout,
             .last_activity_ms = ctx.now_ms,
+            .client_certificate = session_certificate,
         };
         ctx.srv.random.bytes(&session.auth_token);
         ctx.srv.random.bytes(&session.server_nonce);
@@ -1184,16 +1846,44 @@ pub const Connection = struct {
         if (ctx.srv.next_session_id == 0) ctx.srv.next_session_id = 1;
         try ctx.srv.sessions.append(ctx.srv.allocator, session);
 
+        // §5.6.2.2 `ServerSignature`: RSA-PKCS1v1.5/SHA-256 over
+        // clientCertificate ‖ clientNonce, proving to the client that the
+        // application holding the endpoint's certificate is the one on the
+        // other end of *this* session — the mirror of the ClientSignature
+        // `ActivateSession` will bring back. Null at SecurityMode=None,
+        // where there is no certificate to sign with.
+        var server_signature: services.SignatureData = .{ .algorithm = null, .signature = null };
+        var server_certificate: ?[]const u8 = null;
+        if (c.sec_mode != .none) {
+            const sec = ctx.srv.config.security.?;
+            server_certificate = sec.credentials.certificate_der;
+            const client_cert = session_certificate.?;
+            const client_nonce = request.client_nonce.?;
+            const to_sign = try ctx.arena.alloc(u8, client_cert.len + client_nonce.len);
+            @memcpy(to_sign[0..client_cert.len], client_cert);
+            @memcpy(to_sign[client_cert.len..], client_nonce);
+            server_signature = .{
+                .algorithm = security.signature_algorithm_rsa_sha256,
+                .signature = security.asymmetricSign(ctx.arena, to_sign, sec.credentials.private_key) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => {
+                        try sendFault(ctx, status.bad_internal_error);
+                        return;
+                    },
+                },
+            };
+        }
+
         try sendResponse(ctx, services.type_id.create_session_response, services.CreateSessionResponse, .{
             .response_header = ctx.responseHeader(status.good),
             .session_id = session.sessionId(),
             .authentication_token = session.authenticationToken(),
             .revised_session_timeout = timeout,
             .server_nonce = &session.server_nonce,
-            .server_certificate = null, // SecurityMode=None: there is none
+            .server_certificate = server_certificate,
             .server_endpoints = ctx.srv.config.endpoints,
             .server_software_certificates = null,
-            .server_signature = .{ .algorithm = null, .signature = null },
+            .server_signature = server_signature,
             .max_request_message_size = ctx.conn.limits.max_message_size,
         }, services.encodeCreateSessionResponse);
     }
@@ -1202,8 +1892,50 @@ pub const Connection = struct {
         const request = try services.decodeActivateSessionRequest(d);
         ctx.request_handle = request.request_header.request_handle;
 
+        // `sessionOrFault` is where the session↔channel binding is enforced:
+        // a valid AuthenticationToken replayed on a *different* SecureChannel
+        // is `BadSecureChannelIdInvalid`. Session transfer between channels
+        // is not implemented, so there is no "with the correct proof" branch
+        // to get wrong — the door is shut, not ajar.
         const session = try sessionOrFault(ctx, request.request_header, false) orelse return;
-        const identity_result = c.checkIdentity(ctx, request.user_identity_token);
+
+        // §5.6.3.1 `ClientSignature`: RSA-PKCS1v1.5/SHA-256 over
+        // serverCertificate ‖ serverNonce, verified against the certificate
+        // this session was created with. This is what makes the session
+        // credential unusable by anyone who merely *saw* it: they would also
+        // have to hold the client's private key.
+        if (c.sec_mode != .none) {
+            const sec = ctx.srv.config.security.?;
+            const client_cert = session.client_certificate orelse {
+                try sendFault(ctx, status.bad_certificate_invalid);
+                return;
+            };
+            const sig = request.client_signature.signature orelse {
+                try sendFault(ctx, status.bad_application_signature_invalid);
+                return;
+            };
+            const algo = request.client_signature.algorithm orelse "";
+            if (!std.mem.eql(u8, algo, security.signature_algorithm_rsa_sha256) and
+                !std.mem.eql(u8, algo, security.signature_algorithm_rsa_sha256_legacy))
+            {
+                try sendFault(ctx, status.bad_application_signature_invalid);
+                return;
+            }
+            const server_cert = sec.credentials.certificate_der;
+            const to_verify = try ctx.arena.alloc(u8, server_cert.len + session.server_nonce.len);
+            @memcpy(to_verify[0..server_cert.len], server_cert);
+            @memcpy(to_verify[server_cert.len..], &session.server_nonce);
+            const client_pk = security.certificatePublicKey(client_cert) catch {
+                try sendFault(ctx, status.bad_certificate_invalid);
+                return;
+            };
+            security.asymmetricVerify(to_verify, sig, client_pk) catch {
+                try sendFault(ctx, status.bad_application_signature_invalid);
+                return;
+            };
+        }
+
+        const identity_result = c.checkIdentity(ctx, session, request.user_identity_token);
         if (identity_result != status.good) {
             try sendFault(ctx, identity_result);
             return;
@@ -1220,10 +1952,22 @@ pub const Connection = struct {
         }, services.encodeActivateSessionResponse);
     }
 
-    /// Anonymous and username identity tokens (§7.36). A username token's
-    /// password is compared in constant time; at SecurityPolicy#None it
-    /// arrived in the clear, which is why `Config.users` is empty by default.
-    fn checkIdentity(c: *Connection, ctx: *Ctx, token: encoding.ExtensionObject) encoding.StatusCode {
+    /// Anonymous and username identity tokens (§7.36).
+    ///
+    /// A username token's password may arrive two ways, and which one is
+    /// *allowed* comes from the `UserTokenPolicy` the client echoed back:
+    ///
+    /// * `EncryptionAlgorithm` empty — plaintext. Only accepted if the
+    ///   PolicyId the client named advertises `SecurityPolicy#None`
+    ///   (`bad_identity_token_invalid` otherwise): a client must not be able
+    ///   to downgrade an encrypted policy by simply not encrypting.
+    /// * `EncryptionAlgorithm = …xmlenc#rsa-oaep` — RSA-OAEP/SHA-1 to this
+    ///   server's certificate over `UInt32 len ‖ password ‖ serverNonce`
+    ///   (§7.36.4). The trailing nonce must be this session's, which is what
+    ///   stops a captured token being replayed into another session.
+    ///
+    /// Either way the recovered password is compared in constant time.
+    fn checkIdentity(c: *Connection, ctx: *Ctx, session: *Session, token: encoding.ExtensionObject) encoding.StatusCode {
         _ = c;
         const cfg = ctx.srv.config;
         if (token.encoding == .no_body or token.body.len == 0) {
@@ -1237,11 +1981,39 @@ pub const Connection = struct {
             var r: std.Io.Reader = .fixed(token.body);
             var td = encoding.Decoder.init(&r, ctx.arena);
             const parsed = services.decodeUserNameIdentityToken(&td) catch return status.bad_identity_token_invalid;
-            if (parsed.encryption_algorithm) |algo| {
-                if (algo.len != 0) return status.bad_identity_token_invalid; // no decryption here
-            }
+            const algo = parsed.encryption_algorithm orelse "";
             const user = parsed.user_name orelse return status.bad_identity_token_invalid;
-            const password = parsed.password orelse &.{};
+            var password = parsed.password orelse &.{};
+            if (algo.len == 0) {
+                // Plaintext. Refuse it if the policy the client named
+                // demands encryption — the whole point of that policy.
+                if (parsed.policy_id) |pid| {
+                    if (userTokenPolicy(cfg, pid)) |policy| {
+                        const policy_uri = policy.security_policy_uri orelse services.security_policy_none_uri;
+                        if (!std.mem.eql(u8, policy_uri, services.security_policy_none_uri)) {
+                            return status.bad_identity_token_invalid;
+                        }
+                    }
+                }
+            } else if (std.mem.eql(u8, algo, security.encryption_algorithm_rsa_oaep)) {
+                const sec = cfg.security orelse return status.bad_identity_token_invalid;
+                password = security.decryptUserTokenSecret(
+                    ctx.arena,
+                    password,
+                    sec.credentials.private_key,
+                    &session.server_nonce,
+                ) catch |err| return switch (err) {
+                    error.OutOfMemory => status.bad_out_of_memory,
+                    // A nonce mismatch is a replay; everything else is a
+                    // token this server cannot read. Both are
+                    // `BadIdentityTokenInvalid` on the wire (§7.36) — the
+                    // distinction stays here rather than leaking a probing
+                    // oracle to the client.
+                    else => status.bad_identity_token_invalid,
+                };
+            } else {
+                return status.bad_identity_token_invalid;
+            }
             var matched = false;
             for (cfg.users) |cred| {
                 // Both comparisons run unconditionally (no early exit) so the
@@ -2525,6 +3297,69 @@ fn testAnswerMethod(
     return status.good;
 }
 
+/// A throwaway client/server key pair + self-signed application certificate
+/// pair for the Basic256Sha256 tests. **Test material only** — generated
+/// fresh in-process from a seeded deterministic PRNG, never read from disk,
+/// never a real key. 512-bit moduli keep the suite fast; the live interop
+/// tests exercise real 2048-bit certificates against real third-party clients.
+const TestPki = struct {
+    client: security.Credentials,
+    server: security.Credentials,
+    prng: *std.Random.DefaultCsprng,
+
+    /// The default validity window brackets `TestRig.start_time`
+    /// (2020-01-01, the wall clock every rig injects) so the server's
+    /// certificate-time check passes; the negative test narrows it to a
+    /// window that does not.
+    fn init(gpa: std.mem.Allocator, prng: *std.Random.DefaultCsprng, opts: struct {
+        server_not_before: []const u8 = "190101000000Z",
+        server_not_after: []const u8 = "300101000000Z",
+        client_not_before: []const u8 = "190101000000Z",
+        client_not_after: []const u8 = "300101000000Z",
+    }) !TestPki {
+        const random = prng.random();
+        const client = try security.Credentials.generateSelfSigned(gpa, random, .{
+            .modulus_bits = 512,
+            .common_name = "zig-libs opcua test client",
+            .not_before = opts.client_not_before,
+            .not_after = opts.client_not_after,
+            .application_uri = "urn:zig-libs:opcua:test-client",
+        });
+        errdefer client.deinit(gpa);
+        const server_creds = try security.Credentials.generateSelfSigned(gpa, random, .{
+            .modulus_bits = 512,
+            .common_name = "zig-libs opcua test server",
+            .not_before = opts.server_not_before,
+            .not_after = opts.server_not_after,
+            .application_uri = "urn:zig-libs:opcua:test-server",
+        });
+        return .{ .client = client, .server = server_creds, .prng = prng };
+    }
+
+    fn deinit(pki: TestPki, gpa: std.mem.Allocator) void {
+        pki.client.deinit(gpa);
+        pki.server.deinit(gpa);
+    }
+};
+
+/// The three-endpoint list a secured test server advertises: the None
+/// endpoint plus Basic256Sha256 at Sign and at SignAndEncrypt, each with the
+/// server certificate and an increasing `SecurityLevel`.
+fn secureTestEndpoints(buf: *[3]services.EndpointDescription, server_certificate: []const u8) []const services.EndpointDescription {
+    buf[0] = noneEndpointWithEncryptedUserTokens(test_endpoint_url, test_app, server_certificate);
+    buf[1] = secureEndpoint(test_endpoint_url, test_app, .sign, server_certificate, 10);
+    buf[2] = secureEndpoint(test_endpoint_url, test_app, .sign_and_encrypt, server_certificate, 20);
+    return buf;
+}
+
+fn secureTestConfig(endpoints: []const services.EndpointDescription, pki: TestPki) Config {
+    return .{
+        .endpoints = endpoints,
+        .users = &test_users,
+        .security = .{ .credentials = pki.server },
+    };
+}
+
 const TestRig = struct {
     gpa: std.mem.Allocator,
     store: nodestore.NodeStore,
@@ -2540,6 +3375,9 @@ const TestRig = struct {
     channel: services.Channel = undefined,
     now_ms: i64 = 0,
     auth_token: [32]u8 = @splat(0),
+    /// The most recent `ServerNonce` (CreateSession, then every
+    /// ActivateSession) — what the next `ClientSignature` has to cover.
+    server_nonce: [32]u8 = @splat(0),
     session_id: encoding.NodeId = services.null_node_id,
     /// The user variable every rig exposes (writable Int32, ns=1).
     answer_id: encoding.NodeId = undefined,
@@ -2596,6 +3434,7 @@ const TestRig = struct {
     }
 
     fn deinit(rig: *TestRig) void {
+        rig.conn.deinit();
         rig.srv.deinit();
         rig.store.deinit();
         rig.gpa.free(rig.recv_buf);
@@ -2793,6 +3632,193 @@ const TestRig = struct {
         const response = try rig.channel.recvService(message_type, Response, response_type_id, decodeFn, resultFn);
         rig.clearServerOut();
         return response;
+    }
+
+    // ── Basic256Sha256 helpers ──────────────────────────────────────────────
+    // The client side of every secure exchange below is the module's *own*
+    // client (`services.Channel` with a `security.SecurityContext` — the same
+    // path `root.SecureChannel`/`root.Session` drive), so a passing test means
+    // the two halves agree on bytes, not just on structs.
+
+    /// Point the rig's client half at a Basic256Sha256 channel. Must be called
+    /// before `openChannelSecure`.
+    fn armSecurity(rig: *TestRig, mode: services.MessageSecurityMode, client: security.Credentials, server_certificate: []const u8) void {
+        rig.channel.security = .{
+            .policy = .basic256sha256,
+            .mode = mode,
+            .credentials = client,
+            .server_certificate = server_certificate,
+            .random = rig.prng.random(),
+        };
+    }
+
+    /// The client half of `OpenSecureChannel` under Basic256Sha256: a real
+    /// 32-byte nonce out, the server's nonce back, P-SHA256 over the pair.
+    fn openChannelSecure(
+        rig: *TestRig,
+        mode: services.MessageSecurityMode,
+        request_type: services.SecurityTokenRequestType,
+        requested_lifetime_ms: u32,
+    ) !services.ChannelSecurityToken {
+        var client_nonce: [32]u8 = undefined;
+        rig.channel.security.?.random.?.bytes(&client_nonce);
+        rig.channel.security.?.mode = mode;
+        const response = try rig.call(
+            .open_secure_channel,
+            services.type_id.open_secure_channel_request,
+            services.OpenSecureChannelRequest,
+            .{
+                .request_header = rig.channel.nextRequestHeader(services.null_node_id, 10_000),
+                .client_protocol_version = 0,
+                .request_type = request_type,
+                .security_mode = mode,
+                .client_nonce = &client_nonce,
+                .requested_lifetime = requested_lifetime_ms,
+            },
+            services.encodeOpenSecureChannelRequest,
+            services.OpenSecureChannelResponse,
+            services.type_id.open_secure_channel_response,
+            services.decodeOpenSecureChannelResponse,
+            services.result_fns.open_secure_channel,
+        );
+        defer services.freeOpenSecureChannelResponse(rig.gpa, response);
+        const server_nonce = response.server_nonce orelse return error.TestExpectedServerNonce;
+        try testing.expectEqual(@as(usize, 32), server_nonce.len);
+        rig.channel.channel_id = response.security_token.channel_id;
+        rig.channel.token_id = response.security_token.token_id;
+        rig.channel.security.?.keys = security.deriveKeys(&client_nonce, server_nonce, .basic256sha256);
+        return response.security_token;
+    }
+
+    /// Send a Basic256Sha256 `OpenSecureChannel` and pump it into the server
+    /// *without* trying to read a response — for the negative cases whose
+    /// answer is a transport `ERR` rather than an OPN response (`rig.call`
+    /// drains the output buffer on the way out, which would eat the `ERR`).
+    fn sendOpenSecure(
+        rig: *TestRig,
+        mode: services.MessageSecurityMode,
+        request_type: services.SecurityTokenRequestType,
+        client_nonce: []const u8,
+    ) !void {
+        rig.channel.security.?.mode = mode;
+        rig.channel.sendService(
+            .open_secure_channel,
+            services.type_id.open_secure_channel_request,
+            services.OpenSecureChannelRequest,
+            .{
+                .request_header = rig.channel.nextRequestHeader(services.null_node_id, 10_000),
+                .client_protocol_version = 0,
+                .request_type = request_type,
+                .security_mode = mode,
+                .client_nonce = client_nonce,
+                .requested_lifetime = 600_000,
+            },
+            services.encodeOpenSecureChannelRequest,
+        ) catch unreachable;
+        try rig.pump();
+    }
+
+    /// `CreateSession` carrying the client certificate + nonce, checking the
+    /// `ServerSignature` over clientCertificate ‖ clientNonce on the way back.
+    fn createSessionSecure(rig: *TestRig, client: security.Credentials, server_certificate: []const u8) !void {
+        var client_nonce: [32]u8 = undefined;
+        rig.channel.security.?.random.?.bytes(&client_nonce);
+        const response = try rig.call(
+            .message,
+            services.type_id.create_session_request,
+            services.CreateSessionRequest,
+            .{
+                .request_header = rig.header(services.null_node_id),
+                .client_description = .{
+                    .application_uri = "urn:zig-libs:opcua:test-client",
+                    .product_uri = "urn:zig-libs:opcua",
+                    .application_name = .{ .locale = "en", .text = "zig-libs opcua test client" },
+                    .application_type = .client,
+                    .gateway_server_uri = null,
+                    .discovery_profile_uri = null,
+                    .discovery_urls = null,
+                },
+                .server_uri = null,
+                .endpoint_url = test_endpoint_url,
+                .session_name = "secure-test",
+                .client_nonce = &client_nonce,
+                .client_certificate = client.certificate_der,
+                .requested_session_timeout = 120_000,
+                .max_response_message_size = 0,
+            },
+            services.encodeCreateSessionRequest,
+            services.CreateSessionResponse,
+            services.type_id.create_session_response,
+            services.decodeCreateSessionResponse,
+            services.result_fns.create_session,
+        );
+        defer services.freeCreateSessionResponse(rig.gpa, response);
+        defer encoding.freeNodeId(rig.gpa, response.authentication_token);
+        defer encoding.freeNodeId(rig.gpa, response.session_id);
+
+        // The server must publish its certificate and prove it holds the key.
+        try testing.expectEqualSlices(u8, server_certificate, response.server_certificate.?);
+        try testing.expectEqualStrings(security.signature_algorithm_rsa_sha256, response.server_signature.algorithm.?);
+        const signed = try rig.gpa.alloc(u8, client.certificate_der.len + client_nonce.len);
+        defer rig.gpa.free(signed);
+        @memcpy(signed[0..client.certificate_der.len], client.certificate_der);
+        @memcpy(signed[client.certificate_der.len..], &client_nonce);
+        try security.asymmetricVerify(signed, response.server_signature.signature.?, try security.certificatePublicKey(server_certificate));
+
+        const token = response.authentication_token.byte_string.id.?;
+        @memcpy(&rig.auth_token, token);
+        rig.session_id = response.session_id;
+        @memcpy(&rig.server_nonce, response.server_nonce.?);
+    }
+
+    /// The `ClientSignature` over serverCertificate ‖ serverNonce that
+    /// `ActivateSession` needs. `nonce` is normally `rig.server_nonce`;
+    /// passing a different one is how the negative tests forge it.
+    fn clientSignature(rig: *TestRig, client: security.Credentials, server_certificate: []const u8, nonce: []const u8, buf: *[]u8) !services.SignatureData {
+        const signed = try rig.gpa.alloc(u8, server_certificate.len + nonce.len);
+        defer rig.gpa.free(signed);
+        @memcpy(signed[0..server_certificate.len], server_certificate);
+        @memcpy(signed[server_certificate.len..], nonce);
+        buf.* = try security.asymmetricSign(rig.gpa, signed, client.private_key);
+        return .{ .algorithm = security.signature_algorithm_rsa_sha256, .signature = buf.* };
+    }
+
+    fn activateSessionSecure(rig: *TestRig, signature: services.SignatureData, identity: encoding.ExtensionObject) !void {
+        const response = try rig.call(
+            .message,
+            services.type_id.activate_session_request,
+            services.ActivateSessionRequest,
+            .{
+                .request_header = rig.header(rig.authToken()),
+                .client_signature = signature,
+                .client_software_certificates = null,
+                .locale_ids = null,
+                .user_identity_token = identity,
+                .user_token_signature = .{ .algorithm = null, .signature = null },
+            },
+            services.encodeActivateSessionRequest,
+            services.ActivateSessionResponse,
+            services.type_id.activate_session_response,
+            services.decodeActivateSessionResponse,
+            services.result_fns.activate_session,
+        );
+        defer services.freeActivateSessionResponse(rig.gpa, response);
+        if (response.server_nonce) |n| {
+            if (n.len == 32) @memcpy(&rig.server_nonce, n);
+        }
+    }
+
+    /// HEL → secure OPN → CreateSession → ActivateSession(anonymous).
+    fn connectSecure(rig: *TestRig, mode: services.MessageSecurityMode, pki: TestPki) !void {
+        try rig.handshake();
+        rig.armSecurity(mode, pki.client, pki.server.certificate_der);
+        _ = try rig.openChannelSecure(mode, .issue, 600_000);
+        try rig.createSessionSecure(pki.client, pki.server.certificate_der);
+        var sig_buf: []u8 = &.{};
+        const sig = try rig.clientSignature(pki.client, pki.server.certificate_der, &rig.server_nonce, &sig_buf);
+        defer rig.gpa.free(sig_buf);
+        var token_buf: [128]u8 = undefined;
+        try rig.activateSessionSecure(sig, try rig.anonymousToken(&token_buf));
     }
 
     /// The `ERR` message (§7.1.4) the server wrote, if any.
@@ -4272,5 +5298,863 @@ test "hostile: a chunk header whose size disagrees with the bytes that follow" {
         std.mem.writeInt(u32, frame[8..12], rig.channel.channel_id, .little);
         try rig.conn.feed(&frame, &rig.server_out.writer, 0);
         try rig.expectTransportError(status.bad_tcp_internal_error);
+    }
+}
+
+// ── SecurityPolicy#Basic256Sha256, server side ──────────────────────────────
+
+test "secure: GetEndpoints advertises None + Sign + SignAndEncrypt with certificates and levels" {
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultCsprng.init([_]u8{0x11} ** 32);
+    const pki = try TestPki.init(gpa, &prng, .{});
+    defer pki.deinit(gpa);
+    var endpoint_buf: [3]services.EndpointDescription = undefined;
+    const endpoints = secureTestEndpoints(&endpoint_buf, pki.server.certificate_der);
+
+    var rig: TestRig = undefined;
+    try rig.init(gpa, secureTestConfig(endpoints, pki));
+    defer rig.deinit();
+    try rig.connect(); // over the plain None endpoint, as a client discovering
+
+    const response = try rig.call(
+        .message,
+        services.type_id.get_endpoints_request,
+        services.GetEndpointsRequest,
+        .{
+            .request_header = rig.header(services.null_node_id),
+            .endpoint_url = test_endpoint_url,
+            .locale_ids = null,
+            .profile_uris = null,
+        },
+        services.encodeGetEndpointsRequest,
+        services.GetEndpointsResponse,
+        services.type_id.get_endpoints_response,
+        services.decodeGetEndpointsResponse,
+        services.result_fns.get_endpoints,
+    );
+    defer services.freeGetEndpointsResponse(gpa, response);
+
+    const eps = response.endpoints.?;
+    try testing.expectEqual(@as(usize, 3), eps.len);
+
+    // 1. None — server certificate published (so the username token can be
+    //    encrypted to it), SecurityLevel 0, encrypted username policy.
+    try testing.expectEqual(services.MessageSecurityMode.none, eps[0].security_mode);
+    try testing.expectEqualStrings(services.security_policy_none_uri, eps[0].security_policy_uri.?);
+    try testing.expectEqual(@as(u8, 0), eps[0].security_level);
+    try testing.expectEqualSlices(u8, pki.server.certificate_der, eps[0].server_certificate.?);
+    try testing.expectEqualStrings(encrypted_user_name_policy_id, eps[0].user_identity_tokens.?[1].policy_id.?);
+    try testing.expectEqualStrings(services.security_policy_basic256sha256_uri, eps[0].user_identity_tokens.?[1].security_policy_uri.?);
+
+    // 2. Basic256Sha256 / Sign — the channel signs but does not encrypt, so
+    //    the username policy must still encrypt the password itself.
+    try testing.expectEqual(services.MessageSecurityMode.sign, eps[1].security_mode);
+    try testing.expectEqualStrings(services.security_policy_basic256sha256_uri, eps[1].security_policy_uri.?);
+    try testing.expectEqual(@as(u8, 10), eps[1].security_level);
+    try testing.expectEqualStrings(encrypted_user_name_policy_id, eps[1].user_identity_tokens.?[1].policy_id.?);
+
+    // 3. Basic256Sha256 / SignAndEncrypt — highest SecurityLevel; the channel
+    //    already encrypts, so a #None user-token policy is correct here.
+    try testing.expectEqual(services.MessageSecurityMode.sign_and_encrypt, eps[2].security_mode);
+    try testing.expectEqual(@as(u8, 20), eps[2].security_level);
+    try testing.expectEqualStrings(user_name_policy_id, eps[2].user_identity_tokens.?[1].policy_id.?);
+    try testing.expectEqualStrings(services.security_policy_none_uri, eps[2].user_identity_tokens.?[1].security_policy_uri.?);
+
+    // Every endpoint names the opc.tcp binary transport profile.
+    for (eps) |ep| try testing.expectEqualStrings(transport_profile_uri, ep.transport_profile_uri.?);
+
+    // And the list really is the authority the OPN gate consults.
+    const cfg = secureTestConfig(endpoints, pki);
+    try testing.expect(endpointOffers(cfg, services.security_policy_basic256sha256_uri, .sign));
+    try testing.expect(endpointOffers(cfg, services.security_policy_basic256sha256_uri, .sign_and_encrypt));
+    try testing.expect(endpointOffers(cfg, services.security_policy_none_uri, .none));
+    try testing.expect(!endpointOffers(cfg, "http://opcfoundation.org/UA/SecurityPolicy#Aes256_Sha256_RsaPss", .sign));
+}
+
+test "secure: Basic256Sha256 end-to-end at Sign and at SignAndEncrypt" {
+    const gpa = testing.allocator;
+    for ([_]services.MessageSecurityMode{ .sign, .sign_and_encrypt }) |mode| {
+        var prng = std.Random.DefaultCsprng.init([_]u8{0x22} ** 32);
+        const pki = try TestPki.init(gpa, &prng, .{});
+        defer pki.deinit(gpa);
+        var endpoint_buf: [3]services.EndpointDescription = undefined;
+        const endpoints = secureTestEndpoints(&endpoint_buf, pki.server.certificate_der);
+
+        var rig: TestRig = undefined;
+        try rig.init(gpa, secureTestConfig(endpoints, pki));
+        defer rig.deinit();
+        try rig.connectSecure(mode, pki);
+
+        // The channel really is secured on the server side.
+        try testing.expectEqual(mode, rig.conn.sec_mode);
+        try testing.expectEqual(security.SecurityPolicy.basic256sha256, rig.conn.sec_policy);
+        try testing.expect(rig.conn.keys != null);
+        try testing.expectEqualSlices(u8, pki.client.certificate_der, rig.conn.client_certificate.?);
+
+        // Read a value over the secured channel.
+        {
+            const ids = [_]services.ReadValueId{.{
+                .node_id = rig.answer_id,
+                .attribute_id = services.attribute_id.value,
+                .index_range = null,
+                .data_encoding = .{ .namespace_index = 0, .name = null },
+            }};
+            const response = try rig.call(
+                .message,
+                services.type_id.read_request,
+                services.ReadRequest,
+                .{
+                    .request_header = rig.header(rig.authToken()),
+                    .max_age = 0,
+                    .timestamps_to_return = .both,
+                    .nodes_to_read = &ids,
+                },
+                services.encodeReadRequest,
+                services.ReadResponse,
+                services.type_id.read_response,
+                services.decodeReadResponse,
+                services.result_fns.read,
+            );
+            defer services.freeReadResponse(gpa, response);
+            try testing.expectEqual(@as(i32, 42), response.results.?[0].value.?.scalar.int32);
+        }
+
+        // Write, then read it back — proves both directions of the symmetric
+        // path, not just responses.
+        {
+            const writes = [_]services.WriteValue{.{
+                .node_id = rig.answer_id,
+                .attribute_id = services.attribute_id.value,
+                .index_range = null,
+                .value = .{ .value = .{ .scalar = .{ .int32 = 4242 } }, .status = null, .source_timestamp = null, .server_timestamp = null },
+            }};
+            const response = try rig.call(
+                .message,
+                services.type_id.write_request,
+                services.WriteRequest,
+                .{ .request_header = rig.header(rig.authToken()), .nodes_to_write = &writes },
+                services.encodeWriteRequest,
+                services.WriteResponse,
+                services.type_id.write_response,
+                services.decodeWriteResponse,
+                services.result_fns.write,
+            );
+            defer services.freeWriteResponse(gpa, response);
+            try testing.expectEqual(status.good, response.results.?[0]);
+        }
+        {
+            const ids = [_]services.ReadValueId{.{
+                .node_id = rig.answer_id,
+                .attribute_id = services.attribute_id.value,
+                .index_range = null,
+                .data_encoding = .{ .namespace_index = 0, .name = null },
+            }};
+            const response = try rig.call(
+                .message,
+                services.type_id.read_request,
+                services.ReadRequest,
+                .{
+                    .request_header = rig.header(rig.authToken()),
+                    .max_age = 0,
+                    .timestamps_to_return = .both,
+                    .nodes_to_read = &ids,
+                },
+                services.encodeReadRequest,
+                services.ReadResponse,
+                services.type_id.read_response,
+                services.decodeReadResponse,
+                services.result_fns.read,
+            );
+            defer services.freeReadResponse(gpa, response);
+            try testing.expectEqual(@as(i32, 4242), response.results.?[0].value.?.scalar.int32);
+        }
+
+        // Browse — a bigger response, which is where multi-chunk secured
+        // framing would break if `maxSymmetricPayload` were wrong.
+        {
+            const descs = [_]services.BrowseDescription{.{
+                .node_id = nodestore.n0(nodestore.id.objects_folder),
+                .browse_direction = .forward,
+                .reference_type_id = services.null_node_id,
+                .include_subtypes = true,
+                .node_class_mask = 0,
+                .result_mask = 63,
+            }};
+            const response = try rig.call(
+                .message,
+                services.type_id.browse_request,
+                services.BrowseRequest,
+                .{
+                    .request_header = rig.header(rig.authToken()),
+                    .view = .{ .view_id = services.null_node_id, .timestamp = 0, .view_version = 0 },
+                    .requested_max_references_per_node = 0,
+                    .nodes_to_browse = &descs,
+                },
+                services.encodeBrowseRequest,
+                services.BrowseResponse,
+                services.type_id.browse_response,
+                services.decodeBrowseResponse,
+                services.result_fns.browse,
+            );
+            defer services.freeBrowseResponse(gpa, response);
+            try testing.expect(response.results.?[0].references.?.len > 0);
+        }
+
+        // A subscription + Publish over the secured channel: the server also
+        // *originates* secured chunks from `tick`, not only replies.
+        {
+            const sub = try createSubscription(&rig, 100, 3);
+            try testing.expectEqual(status.good, sub.response_header.service_result);
+            const item = try rigCreateMonitoredItem(&rig, sub.subscription_id, rig.answer_id, 7);
+            defer services.freeCreateMonitoredItemsResponse(gpa, item);
+            try testing.expectEqual(status.good, item.results.?[0].status_code);
+            _ = try parkPublish(&rig, &.{});
+            try rig.tick(200);
+            const pub_response = try readParkedPublish(&rig);
+            defer services.freePublishResponse(gpa, pub_response);
+            try testing.expectEqual(sub.subscription_id, pub_response.subscription_id);
+            try testing.expect(pub_response.notification_message.notification_data.?.len > 0);
+        }
+    }
+}
+
+test "secure: token renewal keeps the old token alive for the overlap, then stops" {
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultCsprng.init([_]u8{0x33} ** 32);
+    const pki = try TestPki.init(gpa, &prng, .{});
+    defer pki.deinit(gpa);
+    var endpoint_buf: [3]services.EndpointDescription = undefined;
+    const endpoints = secureTestEndpoints(&endpoint_buf, pki.server.certificate_der);
+    var config = secureTestConfig(endpoints, pki);
+    config.security.?.token_renewal_overlap_ms = 5_000;
+
+    var rig: TestRig = undefined;
+    try rig.init(gpa, config);
+    defer rig.deinit();
+    try rig.connectSecure(.sign_and_encrypt, pki);
+
+    const first_token = rig.conn.token_id;
+    const first_keys = rig.conn.keys.?;
+
+    // Renew. New TokenId, new keys, same channel.
+    rig.now_ms = 1_000;
+    const renewed = try rig.openChannelSecure(.sign_and_encrypt, .renew, 600_000);
+    try testing.expect(renewed.token_id != first_token);
+    try testing.expectEqual(rig.conn.channel_id, renewed.channel_id);
+    try testing.expect(!std.mem.eql(u8, std.mem.asBytes(&first_keys), std.mem.asBytes(&rig.conn.keys.?)));
+    try testing.expectEqual(first_token, rig.conn.prev_token_id);
+    try testing.expectEqual(@as(i64, 6_000), rig.conn.prev_token_valid_until_ms); // 1000 + 5000 overlap
+
+    // A request still riding the OLD token, inside the overlap, must work —
+    // this is the case a server that drops the old token instantly breaks.
+    // Sent with the old token and the old keys, then read back with the new
+    // ones: exactly what a real client does with a request that was already
+    // in flight when the renewal response landed (§6.7.6 — the server moves
+    // to the new token for its own messages the moment it issues it, while
+    // still *accepting* the old one).
+    {
+        var forge = rig.channel;
+        forge.token_id = first_token;
+        forge.security.?.keys = first_keys;
+        rig.now_ms = 4_000;
+        forge.sendService(
+            .message,
+            services.type_id.read_request,
+            services.ReadRequest,
+            .{
+                .request_header = forge.nextRequestHeader(rig.authToken(), 10_000),
+                .max_age = 0,
+                .timestamps_to_return = .both,
+                .nodes_to_read = &[_]services.ReadValueId{.{
+                    .node_id = rig.answer_id,
+                    .attribute_id = services.attribute_id.value,
+                    .index_range = null,
+                    .data_encoding = .{ .namespace_index = 0, .name = null },
+                }},
+            },
+            services.encodeReadRequest,
+        ) catch unreachable;
+        try rig.pump();
+        // The client half has already switched to the new token's keys.
+        rig.channel.request_id = forge.request_id;
+        rig.channel.sequence_number = forge.sequence_number;
+        rig.aimReader();
+        const response = try rig.channel.recvService(
+            .message,
+            services.ReadResponse,
+            services.type_id.read_response,
+            services.decodeReadResponse,
+            services.result_fns.read,
+        );
+        defer services.freeReadResponse(gpa, response);
+        rig.clearServerOut();
+        try testing.expectEqual(@as(i32, 42), response.results.?[0].value.?.scalar.int32);
+    }
+
+    // Past the overlap the old token is gone.
+    {
+        rig.channel.token_id = first_token;
+        rig.channel.security.?.keys = first_keys;
+        rig.now_ms = 6_001;
+        rig.channel.sendService(
+            .message,
+            services.type_id.read_request,
+            services.ReadRequest,
+            .{
+                .request_header = rig.header(rig.authToken()),
+                .max_age = 0,
+                .timestamps_to_return = .both,
+                .nodes_to_read = &[_]services.ReadValueId{.{
+                    .node_id = rig.answer_id,
+                    .attribute_id = services.attribute_id.value,
+                    .index_range = null,
+                    .data_encoding = .{ .namespace_index = 0, .name = null },
+                }},
+            },
+            services.encodeReadRequest,
+        ) catch unreachable;
+        try rig.pump();
+        try rig.expectTransportError(status.bad_secure_channel_token_unknown);
+    }
+}
+
+test "secure: an expired SecurityToken is refused" {
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultCsprng.init([_]u8{0x44} ** 32);
+    const pki = try TestPki.init(gpa, &prng, .{});
+    defer pki.deinit(gpa);
+    var endpoint_buf: [3]services.EndpointDescription = undefined;
+    const endpoints = secureTestEndpoints(&endpoint_buf, pki.server.certificate_der);
+    var config = secureTestConfig(endpoints, pki);
+    config.security.?.min_token_lifetime_ms = 1_000;
+    config.security.?.max_token_lifetime_ms = 10_000;
+
+    var rig: TestRig = undefined;
+    try rig.init(gpa, config);
+    defer rig.deinit();
+    try rig.handshake();
+    rig.armSecurity(.sign_and_encrypt, pki.client, pki.server.certificate_der);
+    const token = try rig.openChannelSecure(.sign_and_encrypt, .issue, 2_000);
+    try testing.expectEqual(@as(u32, 2_000), token.revised_lifetime); // clamped into the band
+
+    // One millisecond past the lifetime, with no renewal, the channel is done.
+    rig.now_ms = 2_001;
+    rig.channel.sendService(
+        .message,
+        services.type_id.get_endpoints_request,
+        services.GetEndpointsRequest,
+        .{ .request_header = rig.header(services.null_node_id), .endpoint_url = test_endpoint_url, .locale_ids = null, .profile_uris = null },
+        services.encodeGetEndpointsRequest,
+    ) catch unreachable;
+    try rig.pump();
+    try rig.expectTransportError(status.bad_secure_channel_token_unknown);
+}
+
+test "secure negatives: tampered signature, wrong keys, malformed padding" {
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultCsprng.init([_]u8{0x55} ** 32);
+    const pki = try TestPki.init(gpa, &prng, .{});
+    defer pki.deinit(gpa);
+    var endpoint_buf: [3]services.EndpointDescription = undefined;
+    const endpoints = secureTestEndpoints(&endpoint_buf, pki.server.certificate_der);
+
+    // (a) One flipped bit anywhere in the ciphertext or the header.
+    // Byte 3 = the chunk-type byte (inside the signed range), 9 = the
+    // plaintext SecureChannelId, 20 and 40 = ciphertext. The MessageSize
+    // bytes are deliberately not in the list: corrupting a length stalls
+    // reassembly waiting for bytes that never come, which is a different
+    // (already-tested) behaviour, not a security rejection.
+    for ([_]usize{ 3, 9, 20, 40 }) |flip| {
+        var rig: TestRig = undefined;
+        try rig.init(gpa, secureTestConfig(endpoints, pki));
+        defer rig.deinit();
+        try rig.connectSecure(.sign_and_encrypt, pki);
+
+        rig.channel.sendService(
+            .message,
+            services.type_id.get_endpoints_request,
+            services.GetEndpointsRequest,
+            .{ .request_header = rig.header(services.null_node_id), .endpoint_url = test_endpoint_url, .locale_ids = null, .profile_uris = null },
+            services.encodeGetEndpointsRequest,
+        ) catch unreachable;
+        const bytes = rig.client_out.written();
+        if (flip >= bytes.len) continue;
+        // Byte 3 is the chunk-type byte: flipping it changes the framing but
+        // is still inside the signed range.
+        if (flip == 3) bytes[flip] = 'C' else bytes[flip] ^= 0x01;
+        try rig.conn.feed(bytes, &rig.server_out.writer, rig.now_ms);
+        rig.client_out.clearRetainingCapacity();
+        rig.aimReader();
+        var buf: [512]u8 = undefined;
+        const chunk = try rig.client_conn.recvChunk(&buf);
+        try testing.expectEqual(transport.MessageType.error_msg, chunk.header.message_type);
+        try testing.expect(rig.conn.isClosed());
+        rig.clearServerOut();
+    }
+
+    // (b) A chunk signed and encrypted with the *right* structure but the
+    //     wrong keys (a peer who guessed the TokenId but has no key material).
+    {
+        var rig: TestRig = undefined;
+        try rig.init(gpa, secureTestConfig(endpoints, pki));
+        defer rig.deinit();
+        try rig.connectSecure(.sign_and_encrypt, pki);
+
+        const wrong_keys = security.deriveKeys("wrong-client-nonce-0123456789abc", "wrong-server-nonce-0123456789abc", .basic256sha256);
+        var body: [64]u8 = undefined;
+        std.mem.writeInt(u32, body[0..4], rig.conn.channel_id, .little);
+        std.mem.writeInt(u32, body[4..8], rig.conn.token_id, .little);
+        std.mem.writeInt(u32, body[8..12], 99, .little);
+        std.mem.writeInt(u32, body[12..16], 99, .little);
+        @memset(body[16..], 0);
+        const forged = try security.symmetricSignAndEncrypt(gpa, "MSG", &body, .sign_and_encrypt, wrong_keys, .client_to_server);
+        defer gpa.free(forged);
+        try rig.conn.feed(forged, &rig.server_out.writer, rig.now_ms);
+        try rig.expectTransportError(status.bad_security_checks_failed);
+    }
+
+    // (c) Correct HMAC, deliberately broken padding: `PaddingSize` points
+    //     past the start of the message. Must be a clean rejection, never an
+    //     out-of-bounds walk.
+    {
+        var rig: TestRig = undefined;
+        try rig.init(gpa, secureTestConfig(endpoints, pki));
+        defer rig.deinit();
+        try rig.connectSecure(.sign_and_encrypt, pki);
+        const keys = rig.conn.keys.?;
+
+        var raw: [8 + 16 + 24 + 32]u8 = undefined;
+        raw[0..3].* = "MSG".*;
+        raw[3] = 'F';
+        std.mem.writeInt(u32, raw[4..8], raw.len, .little);
+        std.mem.writeInt(u32, raw[8..12], rig.conn.channel_id, .little);
+        std.mem.writeInt(u32, raw[12..16], rig.conn.token_id, .little);
+        std.mem.writeInt(u32, raw[16..20], 5, .little);
+        std.mem.writeInt(u32, raw[20..24], 5, .little);
+        @memset(raw[24..][0..24], 0xEE); // PaddingSize = 238, far past the body
+        std.crypto.auth.hmac.sha2.HmacSha256.create(raw[raw.len - 32 ..][0..32], raw[0 .. raw.len - 32], &keys.client_signing_key);
+        security.aes256CbcEncrypt(&keys.client_encrypting_key, &keys.client_iv, raw[16..]);
+        try rig.conn.feed(&raw, &rig.server_out.writer, rig.now_ms);
+        try rig.expectTransportError(status.bad_security_checks_failed);
+    }
+}
+
+test "secure negatives: the OpenSecureChannel gate" {
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultCsprng.init([_]u8{0x66} ** 32);
+    const pki = try TestPki.init(gpa, &prng, .{});
+    defer pki.deinit(gpa);
+
+    // (a) A mode no endpoint advertises. The server offers only None here.
+    {
+        var rig: TestRig = undefined;
+        try rig.init(gpa, .{ .endpoints = &test_endpoints, .security = .{ .credentials = pki.server } });
+        defer rig.deinit();
+        try rig.handshake();
+        rig.armSecurity(.sign_and_encrypt, pki.client, pki.server.certificate_der);
+        var nonce: [32]u8 = @splat(0x5C);
+        try rig.sendOpenSecure(.sign_and_encrypt, .issue, &nonce);
+        try rig.expectTransportError(status.bad_security_mode_rejected);
+    }
+
+    // (b) Basic256Sha256 asked of a server with no key pair at all.
+    {
+        var rig: TestRig = undefined;
+        try rig.init(gpa, TestRig.defaultConfig());
+        defer rig.deinit();
+        try rig.handshake();
+        rig.armSecurity(.sign_and_encrypt, pki.client, pki.server.certificate_der);
+        var nonce: [32]u8 = @splat(0x5C);
+        try rig.sendOpenSecure(.sign_and_encrypt, .issue, &nonce);
+        try rig.expectTransportError(status.bad_security_policy_rejected);
+    }
+
+    // (c) The OPN encrypted to somebody else's certificate: the
+    //     ReceiverCertificateThumbprint does not name this server.
+    {
+        var endpoint_buf: [3]services.EndpointDescription = undefined;
+        const endpoints = secureTestEndpoints(&endpoint_buf, pki.server.certificate_der);
+        const stranger = try security.Credentials.generateSelfSigned(gpa, prng.random(), .{
+            .modulus_bits = 512,
+            .common_name = "a different server",
+            .not_before = "190101000000Z",
+            .not_after = "300101000000Z",
+        });
+        defer stranger.deinit(gpa);
+
+        var rig: TestRig = undefined;
+        try rig.init(gpa, secureTestConfig(endpoints, pki));
+        defer rig.deinit();
+        try rig.handshake();
+        rig.armSecurity(.sign_and_encrypt, pki.client, stranger.certificate_der);
+        var nonce: [32]u8 = @splat(0x5C);
+        try rig.sendOpenSecure(.sign_and_encrypt, .issue, &nonce);
+        try rig.expectTransportError(status.bad_certificate_invalid);
+    }
+
+    // (d) A ClientNonce of the wrong length — the derived keys would carry
+    //     less entropy than the policy claims.
+    {
+        var endpoint_buf: [3]services.EndpointDescription = undefined;
+        const endpoints = secureTestEndpoints(&endpoint_buf, pki.server.certificate_der);
+        var rig: TestRig = undefined;
+        try rig.init(gpa, secureTestConfig(endpoints, pki));
+        defer rig.deinit();
+        try rig.handshake();
+        rig.armSecurity(.sign_and_encrypt, pki.client, pki.server.certificate_der);
+        rig.channel.sendService(
+            .open_secure_channel,
+            services.type_id.open_secure_channel_request,
+            services.OpenSecureChannelRequest,
+            .{
+                .request_header = rig.channel.nextRequestHeader(services.null_node_id, 10_000),
+                .client_protocol_version = 0,
+                .request_type = .issue,
+                .security_mode = .sign_and_encrypt,
+                .client_nonce = "too-short",
+                .requested_lifetime = 600_000,
+            },
+            services.encodeOpenSecureChannelRequest,
+        ) catch unreachable;
+        try rig.pump();
+        try rig.expectTransportError(status.bad_nonce_invalid);
+    }
+
+    // (e) An untrusted certificate: the caller's policy says no.
+    {
+        var endpoint_buf: [3]services.EndpointDescription = undefined;
+        const endpoints = secureTestEndpoints(&endpoint_buf, pki.server.certificate_der);
+        var config = secureTestConfig(endpoints, pki);
+        config.security.?.certificate_policy = .{ .check = struct {
+            fn reject(_: ?*anyopaque, _: []const u8) encoding.StatusCode {
+                return status.bad_certificate_untrusted;
+            }
+        }.reject };
+
+        var rig: TestRig = undefined;
+        try rig.init(gpa, config);
+        defer rig.deinit();
+        try rig.handshake();
+        rig.armSecurity(.sign_and_encrypt, pki.client, pki.server.certificate_der);
+        var nonce: [32]u8 = @splat(0x5C);
+        try rig.sendOpenSecure(.sign_and_encrypt, .issue, &nonce);
+        try rig.expectTransportError(status.bad_certificate_untrusted);
+    }
+
+    // (f) A certificate whose validity window does not cover the server's
+    //     injected wall clock.
+    {
+        const expired = try TestPki.init(gpa, &prng, .{
+            .client_not_before = "210101000000Z",
+            .client_not_after = "220101000000Z", // starts a year after TestRig.start_time
+        });
+        defer expired.deinit(gpa);
+        var endpoint_buf: [3]services.EndpointDescription = undefined;
+        const endpoints = secureTestEndpoints(&endpoint_buf, expired.server.certificate_der);
+
+        var rig: TestRig = undefined;
+        try rig.init(gpa, secureTestConfig(endpoints, expired));
+        defer rig.deinit();
+        try rig.handshake();
+        rig.armSecurity(.sign_and_encrypt, expired.client, expired.server.certificate_der);
+        var nonce: [32]u8 = @splat(0x5C);
+        try rig.sendOpenSecure(.sign_and_encrypt, .issue, &nonce);
+        try rig.expectTransportError(status.bad_certificate_time_invalid);
+    }
+}
+
+test "secure: the session's ClientSignature must cover serverCertificate + serverNonce" {
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultCsprng.init([_]u8{0x77} ** 32);
+    const pki = try TestPki.init(gpa, &prng, .{});
+    defer pki.deinit(gpa);
+    var endpoint_buf: [3]services.EndpointDescription = undefined;
+    const endpoints = secureTestEndpoints(&endpoint_buf, pki.server.certificate_der);
+
+    // (a) No signature at all.
+    {
+        var rig: TestRig = undefined;
+        try rig.init(gpa, secureTestConfig(endpoints, pki));
+        defer rig.deinit();
+        try rig.handshake();
+        rig.armSecurity(.sign_and_encrypt, pki.client, pki.server.certificate_der);
+        _ = try rig.openChannelSecure(.sign_and_encrypt, .issue, 600_000);
+        try rig.createSessionSecure(pki.client, pki.server.certificate_der);
+        var token_buf: [128]u8 = undefined;
+        try testing.expectError(
+            error.ServiceFault,
+            rig.activateSessionSecure(.{ .algorithm = null, .signature = null }, try rig.anonymousToken(&token_buf)),
+        );
+        try testing.expectEqual(status.bad_application_signature_invalid, rig.channel.last_service_result);
+    }
+
+    // (b) A signature over the WRONG nonce — a replay of a signature captured
+    //     from an earlier activation of the same session.
+    {
+        var rig: TestRig = undefined;
+        try rig.init(gpa, secureTestConfig(endpoints, pki));
+        defer rig.deinit();
+        try rig.handshake();
+        rig.armSecurity(.sign_and_encrypt, pki.client, pki.server.certificate_der);
+        _ = try rig.openChannelSecure(.sign_and_encrypt, .issue, 600_000);
+        try rig.createSessionSecure(pki.client, pki.server.certificate_der);
+        var stale_nonce: [32]u8 = rig.server_nonce;
+        stale_nonce[0] ^= 0xFF;
+        var sig_buf: []u8 = &.{};
+        const sig = try rig.clientSignature(pki.client, pki.server.certificate_der, &stale_nonce, &sig_buf);
+        defer gpa.free(sig_buf);
+        var token_buf: [128]u8 = undefined;
+        try testing.expectError(error.ServiceFault, rig.activateSessionSecure(sig, try rig.anonymousToken(&token_buf)));
+        try testing.expectEqual(status.bad_application_signature_invalid, rig.channel.last_service_result);
+    }
+
+    // (c) A well-formed signature made with somebody else's private key.
+    {
+        const impostor = try security.Credentials.generateSelfSigned(gpa, prng.random(), .{
+            .modulus_bits = 512,
+            .common_name = "impostor",
+            .not_before = "190101000000Z",
+            .not_after = "300101000000Z",
+        });
+        defer impostor.deinit(gpa);
+
+        var rig: TestRig = undefined;
+        try rig.init(gpa, secureTestConfig(endpoints, pki));
+        defer rig.deinit();
+        try rig.handshake();
+        rig.armSecurity(.sign_and_encrypt, pki.client, pki.server.certificate_der);
+        _ = try rig.openChannelSecure(.sign_and_encrypt, .issue, 600_000);
+        try rig.createSessionSecure(pki.client, pki.server.certificate_der);
+        var sig_buf: []u8 = &.{};
+        const sig = try rig.clientSignature(impostor, pki.server.certificate_der, &rig.server_nonce, &sig_buf);
+        defer gpa.free(sig_buf);
+        var token_buf: [128]u8 = undefined;
+        try testing.expectError(error.ServiceFault, rig.activateSessionSecure(sig, try rig.anonymousToken(&token_buf)));
+        try testing.expectEqual(status.bad_application_signature_invalid, rig.channel.last_service_result);
+    }
+
+    // (d) CreateSession presenting a certificate other than the channel's.
+    {
+        const other = try security.Credentials.generateSelfSigned(gpa, prng.random(), .{
+            .modulus_bits = 512,
+            .common_name = "other client",
+            .not_before = "190101000000Z",
+            .not_after = "300101000000Z",
+        });
+        defer other.deinit(gpa);
+
+        var rig: TestRig = undefined;
+        try rig.init(gpa, secureTestConfig(endpoints, pki));
+        defer rig.deinit();
+        try rig.handshake();
+        rig.armSecurity(.sign_and_encrypt, pki.client, pki.server.certificate_der);
+        _ = try rig.openChannelSecure(.sign_and_encrypt, .issue, 600_000);
+        try testing.expectError(error.ServiceFault, rig.createSessionSecure(other, pki.server.certificate_der));
+        try testing.expectEqual(status.bad_certificate_invalid, rig.channel.last_service_result);
+    }
+}
+
+test "secure: a session presented on a different SecureChannel is refused" {
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultCsprng.init([_]u8{0x88} ** 32);
+    const pki = try TestPki.init(gpa, &prng, .{});
+    defer pki.deinit(gpa);
+    var endpoint_buf: [3]services.EndpointDescription = undefined;
+    const endpoints = secureTestEndpoints(&endpoint_buf, pki.server.certificate_der);
+
+    var rig: TestRig = undefined;
+    try rig.init(gpa, secureTestConfig(endpoints, pki));
+    defer rig.deinit();
+    try rig.connectSecure(.sign_and_encrypt, pki);
+    const stolen_token = rig.auth_token;
+
+    // Second connection, second channel, same server — the AuthenticationToken
+    // is a bearer credential, so this is exactly the theft that must not pay.
+    const recv2 = try gpa.alloc(u8, 65536);
+    defer gpa.free(recv2);
+    const msg2 = try gpa.alloc(u8, 1 << 20);
+    defer gpa.free(msg2);
+    var conn2 = try Connection.init(&rig.srv, recv2, msg2);
+    defer conn2.deinit();
+
+    const saved_conn = rig.conn;
+    rig.conn = conn2;
+    rig.channel = .{ .conn = &rig.client_conn, .allocator = gpa };
+    try rig.handshake();
+    rig.armSecurity(.sign_and_encrypt, pki.client, pki.server.certificate_der);
+    _ = try rig.openChannelSecure(.sign_and_encrypt, .issue, 600_000);
+    rig.auth_token = stolen_token;
+
+    try testing.expectError(error.ServiceFault, rig.call(
+        .message,
+        services.type_id.read_request,
+        services.ReadRequest,
+        .{
+            .request_header = rig.header(rig.authToken()),
+            .max_age = 0,
+            .timestamps_to_return = .both,
+            .nodes_to_read = &[_]services.ReadValueId{.{
+                .node_id = rig.answer_id,
+                .attribute_id = services.attribute_id.value,
+                .index_range = null,
+                .data_encoding = .{ .namespace_index = 0, .name = null },
+            }},
+        },
+        services.encodeReadRequest,
+        services.ReadResponse,
+        services.type_id.read_response,
+        services.decodeReadResponse,
+        services.result_fns.read,
+    ));
+    try testing.expectEqual(status.bad_secure_channel_id_invalid, rig.channel.last_service_result);
+
+    rig.conn.deinit();
+    rig.conn = saved_conn;
+}
+
+test "secure: encrypted UserNameIdentityToken over a SecurityPolicy#None channel" {
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultCsprng.init([_]u8{0x99} ** 32);
+    const pki = try TestPki.init(gpa, &prng, .{});
+    defer pki.deinit(gpa);
+    var endpoint_buf: [3]services.EndpointDescription = undefined;
+    const endpoints = secureTestEndpoints(&endpoint_buf, pki.server.certificate_der);
+
+    const Token = struct {
+        /// Build a `UserNameIdentityToken` whose password is RSA-OAEP
+        /// encrypted to `server_certificate` over `len ‖ password ‖ nonce`.
+        fn encrypted(
+            alloc: std.mem.Allocator,
+            policy_id: []const u8,
+            user: []const u8,
+            password: []const u8,
+            nonce: []const u8,
+            server_certificate: []const u8,
+            random: std.Random,
+            out: *std.Io.Writer.Allocating,
+        ) !encoding.ExtensionObject {
+            const pk = try security.certificatePublicKey(server_certificate);
+            const blob = try security.encryptUserTokenSecret(alloc, password, nonce, pk, random);
+            defer alloc.free(blob);
+            var e = encoding.Encoder.init(&out.writer);
+            try services.encodeUserNameIdentityToken(&e, .{
+                .policy_id = policy_id,
+                .user_name = user,
+                .password = blob,
+                .encryption_algorithm = security.encryption_algorithm_rsa_oaep,
+            });
+            return .{
+                .type_id = services.type_id.user_name_identity_token,
+                .encoding = .byte_string,
+                .body = out.writer.buffered(),
+            };
+        }
+    };
+
+    // (a) The happy path: the password never appears on the wire.
+    {
+        var rig: TestRig = undefined;
+        try rig.init(gpa, secureTestConfig(endpoints, pki));
+        defer rig.deinit();
+        try rig.handshake();
+        try rig.openChannel(); // plain None channel
+        try rig.createSession();
+
+        var out = std.Io.Writer.Allocating.init(gpa);
+        defer out.deinit();
+        const token = try Token.encrypted(
+            gpa,
+            encrypted_user_name_policy_id,
+            test_users[0].user_name,
+            test_users[0].password,
+            &rig.srv.sessions.items[0].server_nonce,
+            pki.server.certificate_der,
+            prng.random(),
+            &out,
+        );
+        try testing.expect(std.mem.indexOf(u8, token.body, test_users[0].password) == null);
+        try rig.activateSession(token);
+        try testing.expect(rig.srv.sessions.items[0].activated);
+    }
+
+    // (b) The same blob replayed into a *different* session: the trailing
+    //     nonce no longer matches, so the token is refused.
+    {
+        var rig: TestRig = undefined;
+        try rig.init(gpa, secureTestConfig(endpoints, pki));
+        defer rig.deinit();
+        try rig.handshake();
+        try rig.openChannel();
+        try rig.createSession();
+
+        var stale_nonce: [32]u8 = rig.srv.sessions.items[0].server_nonce;
+        stale_nonce[31] ^= 0x01;
+        var out = std.Io.Writer.Allocating.init(gpa);
+        defer out.deinit();
+        const token = try Token.encrypted(
+            gpa,
+            encrypted_user_name_policy_id,
+            test_users[0].user_name,
+            test_users[0].password,
+            &stale_nonce,
+            pki.server.certificate_der,
+            prng.random(),
+            &out,
+        );
+        try testing.expectError(error.ServiceFault, rig.activateSession(token));
+        try testing.expectEqual(status.bad_identity_token_invalid, rig.channel.last_service_result);
+    }
+
+    // (c) The right password, correctly encrypted, but for a user this server
+    //     does not know.
+    {
+        var rig: TestRig = undefined;
+        try rig.init(gpa, secureTestConfig(endpoints, pki));
+        defer rig.deinit();
+        try rig.handshake();
+        try rig.openChannel();
+        try rig.createSession();
+
+        var out = std.Io.Writer.Allocating.init(gpa);
+        defer out.deinit();
+        const token = try Token.encrypted(
+            gpa,
+            encrypted_user_name_policy_id,
+            "intruder",
+            test_users[0].password,
+            &rig.srv.sessions.items[0].server_nonce,
+            pki.server.certificate_der,
+            prng.random(),
+            &out,
+        );
+        try testing.expectError(error.ServiceFault, rig.activateSession(token));
+        try testing.expectEqual(status.bad_user_access_denied, rig.channel.last_service_result);
+    }
+
+    // (d) A plaintext password offered against a policy that demands
+    //     encryption — the downgrade that must not be allowed.
+    {
+        var rig: TestRig = undefined;
+        try rig.init(gpa, secureTestConfig(endpoints, pki));
+        defer rig.deinit();
+        try rig.handshake();
+        try rig.openChannel();
+        try rig.createSession();
+
+        var out = std.Io.Writer.Allocating.init(gpa);
+        defer out.deinit();
+        var e = encoding.Encoder.init(&out.writer);
+        try services.encodeUserNameIdentityToken(&e, .{
+            .policy_id = encrypted_user_name_policy_id,
+            .user_name = test_users[0].user_name,
+            .password = test_users[0].password,
+            .encryption_algorithm = null,
+        });
+        try testing.expectError(error.ServiceFault, rig.activateSession(.{
+            .type_id = services.type_id.user_name_identity_token,
+            .encoding = .byte_string,
+            .body = out.writer.buffered(),
+        }));
+        try testing.expectEqual(status.bad_identity_token_invalid, rig.channel.last_service_result);
     }
 }

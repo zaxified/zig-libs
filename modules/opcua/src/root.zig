@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MIT
 
-//! opcua — an OPC-UA (IEC 62541 / OPC 10000) binary client: the opc.tcp wire
-//! protocol (OPC 10000-6) over `SecurityPolicy#None` (the default) or
-//! `SecurityPolicy#Basic256Sha256` at SecurityMode Sign/SignAndEncrypt
-//! (`security.zig`, layered on the `rsa` module).
+//! opcua — an OPC-UA (IEC 62541 / OPC 10000) binary client **and** server:
+//! the opc.tcp wire protocol (OPC 10000-6) over `SecurityPolicy#None` (the
+//! default) or `SecurityPolicy#Basic256Sha256` at SecurityMode
+//! Sign/SignAndEncrypt (`security.zig`, layered on the `rsa` module) — the
+//! same crypto on both halves; `server.zig` drives it from the other side.
 //!
 //! This is F1 "core": the built-in type codec (`encoding`, OPC 10000-6 §5.2)
 //! and the opc.tcp transport framing (`transport`, OPC 10000-6 §7), with the
@@ -22,7 +23,7 @@ pub const meta = .{
     .role = .both, // client (this file) + server/device (`server.zig` over `nodestore.zig`)
     .concurrency = .single_owner, // caller-owned state, no locks: one loop owns a Server + its Connections
     .model_after = "OPC 10000-6 (OPC UA Binary + opc.tcp) + OPC 10000-4 (Services); structure ref open62541 (MPL-2.0) / node-opcua (MIT) — behavioral only, no source copied",
-    .deps = .{"rsa"}, // Basic256Sha256 secure-channel crypto (security.zig, client-side)
+    .deps = .{"rsa"}, // Basic256Sha256 secure-channel crypto (security.zig, both halves)
 };
 
 /// The built-in type codec (OPC 10000-6 §5.2): `Encoder`/`Decoder` over a
@@ -267,6 +268,25 @@ pub const Session = struct {
         );
         errdefer services.freeCreateSessionResponse(allocator, response);
 
+        // §5.6.2.2 `ServerSignature`: RSA-PKCS1v1.5/SHA-256 over
+        // clientCertificate ‖ clientNonce, verified against the *pinned*
+        // server certificate (never the one the response carries — that is
+        // the peer's own claim). Proves this session belongs to the same
+        // application the channel was opened to, and it is the mirror of the
+        // ClientSignature `activate` sends back.
+        if (secure) {
+            const sec = chan_sec.?;
+            const server_cert = sec.server_certificate.?;
+            const client_cert = sec.credentials.?.certificate_der;
+            const signature = response.server_signature.signature orelse return error.InvalidSecureMessage;
+            const server_pk = security.certificatePublicKey(server_cert) catch return error.InvalidSecureMessage;
+            const signed = try allocator.alloc(u8, client_cert.len + session_nonce.len);
+            defer allocator.free(signed);
+            @memcpy(signed[0..client_cert.len], client_cert);
+            @memcpy(signed[client_cert.len..], &session_nonce);
+            security.asymmetricVerify(signed, signature, server_pk) catch return error.InvalidSecureMessage;
+        }
+
         session.session_id = response.session_id;
         session.authentication_token = response.authentication_token;
         session.revised_timeout_ms = response.revised_session_timeout;
@@ -334,7 +354,7 @@ pub const Session = struct {
             @memcpy(to_sign[server_cert.len..], server_nonce);
             signature_bytes = try security.asymmetricSign(session.allocator, to_sign, sec.credentials.?.private_key);
             client_signature = .{
-                .algorithm = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",
+                .algorithm = security.signature_algorithm_rsa_sha256,
                 .signature = signature_bytes,
             };
         }
@@ -666,9 +686,10 @@ pub fn call(session: *Session, methods_to_call: []const services.CallMethodReque
 // DeleteMonitoredItems (§5.12.2/§5.12.6), and the Publish/Republish long-poll
 // loop (§5.13.5/§5.13.6) that delivers `NotificationMessage`s — this module's
 // pub-style data-change notification path, the OPC UA feature `read`/`write`
-// polling can't replace. Still no crypto (`SecurityMode=None`, the module's
-// scope throughout); the wire shapes themselves carry no security-relevant
-// content this module would need to sign/encrypt anyway.
+// polling can't replace. Nothing security-specific here: these ride MSG chunks,
+// so whatever the channel's SecurityMode is applies to them automatically
+// (`services.Channel`'s send/recv hooks) — the wire shapes themselves carry
+// no security-relevant content of their own.
 
 /// One decoded `NotificationMessage.NotificationData[i]` — the entry's
 /// `ExtensionObject.TypeId` classifies which concrete `NotificationData`

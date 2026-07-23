@@ -7,15 +7,20 @@ OPC 10000-6 §7), the secure channel (`security`, layered on the sibling `rsa`
 module), and the Part-4 services on both sides of the wire — a client that
 drives a real server, and a server (device) a real client can drive.
 
-**Status: implemented, both roles.** Client: codec, transport, secure channel
-(incl. `Basic256Sha256` Sign/SignAndEncrypt), session lifecycle,
+**Status: implemented, both roles, both secured.** Client: codec, transport,
+secure channel (`Basic256Sha256` Sign/SignAndEncrypt), session lifecycle,
 attribute/method services and subscriptions. Server: the opc.tcp connection
-state machine with explicit chunk limits, sessions with anonymous/username
-identity, a caller-owned address space (`nodestore`) seeded with the standard
-namespace-0 skeleton, Read/Write/Browse/BrowseNext/TranslateBrowsePaths/Call,
-and the full subscription + Publish-queue engine. Every layer of both halves
-was validated live against `open62541`: our client against their server, and
-**their stock client binaries against our server**.
+state machine with explicit chunk limits, **the full server side of
+`Basic256Sha256`** (asymmetric OpenSecureChannel, P-SHA256 key derivation,
+per-chunk sign/encrypt, SecurityToken renewal with an overlap window, the
+CreateSession/ActivateSession signature exchange and RSA-OAEP-encrypted
+username tokens), sessions with anonymous/username identity, a caller-owned
+address space (`nodestore`) seeded with the standard namespace-0 skeleton,
+Read/Write/Browse/BrowseNext/TranslateBrowsePaths/Call, and the full
+subscription + Publish-queue engine. Every layer of both halves was validated
+live against third-party stacks: our client against a real `open62541` server
+at Basic256Sha256, and **their stock client binaries plus Python `asyncua`
+driving our server** — the latter at SignAndEncrypt.
 
 ```zig
 const opcua = @import("opcua");
@@ -48,7 +53,7 @@ try conn2.tick(&out_writer, now_ms);                        // the clock: publis
 - **Role:** both (client + server/device). **Platform:** any (pure codec +
   caller-supplied streams; no socket, no timer, no thread of its own).
   **Deps:** `rsa` (Basic256Sha256 secure-channel crypto in `security.zig`,
-  client-side only). **Concurrency:** single-owner — one loop owns a `Server`
+  used by both halves). **Concurrency:** single-owner — one loop owns a `Server`
   and its `Connection`s; nothing is internally synchronized and nothing is
   shared implicitly.
 
@@ -166,15 +171,70 @@ devices sharing one event loop.
   continuation points, operations per request, and the fastest sampling /
   publishing intervals a client may be granted.
 
-**Security: the server side is `SecurityPolicy#None` only.** The client half
-also speaks `Basic256Sha256` Sign/SignAndEncrypt; the server half implements
-no asymmetric handshake, no certificate validation and no message
-signing/encryption, and answers `BadSecurityPolicyRejected` to any OPN asking
-for one. Said plainly rather than half-implemented — see SPEC.md.
+## Server: security (`opcua.server`, `opcua.security`)
+
+`Config.security = null` (the default) leaves the server at
+`SecurityPolicy#None`, byte-for-byte as before. Give it a `SecurityConfig` and
+the same `security.zig` the client half has always used runs in reverse:
+
+```zig
+var srv = opcua.server.Server.init(gpa, &store, .{
+    .endpoints = &.{
+        opcua.server.noneEndpointWithEncryptedUserTokens(url, app, creds.certificate_der),
+        opcua.server.secureEndpoint(url, app, .sign,             creds.certificate_der, 10),
+        opcua.server.secureEndpoint(url, app, .sign_and_encrypt, creds.certificate_der, 20),
+    },
+    .security = .{
+        .credentials = creds,                          // key pair + application certificate
+        .certificate_policy = .{ .check = myTrustList }, // the caller's trust decision
+    },
+}, csprng.random());
+```
+
+- **`OpenSecureChannel`** at `Basic256Sha256` / Sign / SignAndEncrypt: the
+  request is RSA-OAEP-decrypted with the server key and its
+  RSA-PKCS1v1.5/SHA-256 signature verified against the certificate the
+  (plaintext) `AsymmetricAlgorithmSecurityHeader` carries; the response is
+  signed and encrypted back to that certificate.
+- **The endpoint list is the authority.** A (SecurityPolicy, SecurityMode)
+  pair no endpoint advertises is `BadSecurityModeRejected`, so what a client
+  picked out of `GetEndpoints` is exactly what it can use.
+- **Key derivation + symmetric security:** P-SHA256 over the nonce pair gives
+  both directions a signing key, an encrypting key and an IV; every MSG/CLO
+  chunk is HMAC-SHA256-signed and (at SignAndEncrypt) AES-256-CBC encrypted,
+  with the OPC UA padding footer.
+- **SecurityToken renewal with an overlap.** An `OpenSecureChannel(renew)`
+  issues a new token while the previous one stays valid for
+  `token_renewal_overlap_ms` (never past its own expiry) — a server that drops
+  the old token immediately breaks every long-lived client.
+- **Session security binding:** `CreateSession` returns a `ServerSignature`
+  over clientCertificate ‖ clientNonce; `ActivateSession` must bring back a
+  `ClientSignature` over serverCertificate ‖ serverNonce, verified against the
+  session's certificate. A session replayed on a different SecureChannel is
+  `BadSecureChannelIdInvalid`.
+- **Encrypted user identity:** a `UserNameIdentityToken` whose PolicyId names
+  a Basic256Sha256 policy must carry its password RSA-OAEP-encrypted over
+  `UInt32 len ‖ password ‖ serverNonce`; the trailing nonce is checked in
+  constant time, so a captured token cannot be replayed into another session.
+  Offering the password in the clear against such a policy is refused.
+- **Time stays injected:** token lifetimes, the renewal overlap and
+  certificate validity are all evaluated against the `now_ms` the caller
+  passes to `feed`/`tick` — no clock, no thread.
+- **The trust decision is the caller's.** This module checks a peer
+  certificate's structure and validity period, then hands the DER to
+  `SecurityConfig.certificate_policy`. It ships no trust store and walks no
+  chain: an OPC UA trust list is a deployment artifact. `null` accepts any
+  structurally valid, in-date certificate — a lab setting, documented as such.
+
+Not implemented, each a `Bad…` status rather than a silent partial answer:
+`Basic128Rsa15`, `Basic256`, `Aes128Sha256RsaOaep`, `Aes256Sha256RsaPss`,
+`X509IdentityToken`/`IssuedIdentityToken`, certificate revocation (no CRL/OCSP
+— fold that into your `certificate_policy`), and `ApplicationUri`-vs-SAN
+matching. See SPEC.md.
 
 ## Verification
 
-`zig build test-opcua` — 139 tests, green in Debug and ReleaseFast:
+`zig build test-opcua` — 164 tests, green in Debug and ReleaseFast:
 
 - Offline: codec round-trips, transport framing, secure-channel crypto
   vectors, service-message goldens, address-space unit tests, and the whole
@@ -184,10 +244,26 @@ for one. Said plainly rather than half-implemented — see SPEC.md.
   NodeIds/ExtensionObjects, foreign continuation points, publish
   acknowledgements for unknown sequence numbers — all typed errors or
   ServiceFaults, never a crash or a hang.
-- Live (skips loudly if `podman`/the image/the port is unavailable):
-  **open62541's stock `tutorial_client_firststeps`, `client_subscription_loop`
-  and `client` binaries driving this server** (browse, read, write, subscribe,
-  call, username login), this module's client driving a real open62541 server,
-  and this module's client driving this server over a loopback socket.
-- Goldens captured from that live traffic, each decoding *and* re-encoding
-  byte-identically, with the self-derived ones labelled as such.
+- Negative security tests: a tampered chunk signature, a chunk sealed with
+  the wrong keys, an expired SecurityToken, a malformed padding footer, an
+  OPN addressed to another server's certificate, a wrong-length nonce, an
+  untrusted or out-of-date certificate, a forged/absent/stale
+  `ClientSignature`, a session replayed on another channel, a replayed
+  encrypted password, and a plaintext password against an encrypted policy —
+  each asserted to produce the right `Bad…` status. Certificate parsing is
+  fuzzed and prefix/mutation-swept: hostile DER is a typed error, never a
+  panic.
+- Live (skips loudly if `podman`/`python3`+`asyncua`/the port is unavailable):
+  **open62541's stock `tutorial_client_firststeps`, `client_subscription_loop`,
+  `client` and `client_encryption` binaries driving this server**, **Python
+  `asyncua` driving it at Basic256Sha256 SignAndEncrypt** (browse, read, write,
+  call, subscribe) plus Sign with an encrypted username token and a run that
+  forces SecurityToken renewals mid-stream, this module's client driving a real
+  open62541 server at Basic256Sha256, and this module's client driving this
+  server over a loopback socket.
+- Goldens: captured open62541 bytes for the `#None` traffic, plus **self-
+  derived, fully deterministic** goldens for the Basic256Sha256 asymmetric
+  handshake and for signed / signed-and-encrypted MSG chunks. Each one decodes
+  *and* re-encodes byte-identically; self-derived ones are labelled as such.
+  Key derivation has a KAT whose expected bytes come from an independent
+  implementation of P-SHA256.

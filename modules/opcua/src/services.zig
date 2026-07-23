@@ -186,10 +186,17 @@ pub const status = struct {
     pub const bad_service_unsupported: encoding.StatusCode = 0x800B_0000;
     pub const bad_nothing_to_do: encoding.StatusCode = 0x800F_0000;
     pub const bad_too_many_operations: encoding.StatusCode = 0x8010_0000;
+    pub const bad_security_checks_failed: encoding.StatusCode = 0x8013_0000;
+    pub const bad_certificate_invalid: encoding.StatusCode = 0x8012_0000;
+    pub const bad_certificate_time_invalid: encoding.StatusCode = 0x8014_0000;
+    pub const bad_certificate_uri_invalid: encoding.StatusCode = 0x8017_0000;
+    pub const bad_certificate_use_not_allowed: encoding.StatusCode = 0x8018_0000;
+    pub const bad_certificate_untrusted: encoding.StatusCode = 0x801A_0000;
     pub const bad_user_access_denied: encoding.StatusCode = 0x801F_0000;
     pub const bad_identity_token_invalid: encoding.StatusCode = 0x8020_0000;
     pub const bad_identity_token_rejected: encoding.StatusCode = 0x8021_0000;
     pub const bad_secure_channel_id_invalid: encoding.StatusCode = 0x8022_0000;
+    pub const bad_nonce_invalid: encoding.StatusCode = 0x8024_0000;
     pub const bad_session_id_invalid: encoding.StatusCode = 0x8025_0000;
     pub const bad_session_closed: encoding.StatusCode = 0x8026_0000;
     pub const bad_session_not_activated: encoding.StatusCode = 0x8027_0000;
@@ -216,6 +223,8 @@ pub const status = struct {
     pub const bad_security_mode_rejected: encoding.StatusCode = 0x8054_0000;
     pub const bad_security_policy_rejected: encoding.StatusCode = 0x8055_0000;
     pub const bad_too_many_sessions: encoding.StatusCode = 0x8056_0000;
+    pub const bad_user_signature_invalid: encoding.StatusCode = 0x8057_0000;
+    pub const bad_application_signature_invalid: encoding.StatusCode = 0x8058_0000;
     pub const bad_no_match: encoding.StatusCode = 0x806F_0000;
     pub const bad_type_mismatch: encoding.StatusCode = 0x8074_0000;
     pub const bad_method_invalid: encoding.StatusCode = 0x8075_0000;
@@ -239,7 +248,16 @@ pub const status = struct {
     pub const bad_tcp_not_enough_resources: encoding.StatusCode = 0x8081_0000;
     pub const bad_tcp_internal_error: encoding.StatusCode = 0x8082_0000;
     pub const bad_tcp_endpoint_url_invalid: encoding.StatusCode = 0x8083_0000;
+    pub const bad_secure_channel_closed: encoding.StatusCode = 0x8086_0000;
+    pub const bad_secure_channel_token_unknown: encoding.StatusCode = 0x8087_0000;
+    pub const bad_sequence_number_invalid: encoding.StatusCode = 0x8088_0000;
 };
+
+/// The `SecurityPolicy#Basic256Sha256` URI, spelled once (the enum
+/// `security.SecurityPolicy.uri()` returns the same string; this constant
+/// exists so `services`/`server` can compare a wire URI without importing
+/// the security layer just for a string).
+pub const security_policy_basic256sha256_uri = "http://opcfoundation.org/UA/SecurityPolicy#Basic256Sha256";
 
 /// `AttributeId` (OPC Foundation UA-Nodeset `Schema/AttributeIds.csv`, MIT
 /// License 1.00) — a plain namespace of `u32` constants, not an enum:

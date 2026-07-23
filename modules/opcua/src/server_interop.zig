@@ -28,6 +28,7 @@ const transport = @import("transport.zig");
 const services = @import("services.zig");
 const nodestore = @import("nodestore.zig");
 const server = @import("server.zig");
+const security = @import("security.zig");
 
 const testing = std.testing;
 
@@ -38,6 +39,10 @@ const testing = std.testing;
 const live_hosts = [_][]const u8{ "::1", "127.0.0.1" };
 const live_port: u16 = 4840;
 const live_endpoint_url = "opc.tcp://localhost:4840";
+/// A second loopback port for the Basic256Sha256 interop server, so a secured
+/// run never collides with the SecurityPolicy#None one above.
+const live_secure_port: u16 = 4841;
+const live_secure_endpoint_url = "opc.tcp://localhost:4841";
 const live_ns_uri = "urn:zig-libs:opcua:interop";
 
 /// `Objects/the.answer` — the node the open62541 `client` example reads,
@@ -119,8 +124,19 @@ const Driver = struct {
     /// Bumped every serve iteration so a monitored `the.answer` actually
     /// changes for a subscribing client.
     counter: i32 = 42,
+    /// Basic256Sha256 material, when this driver was built with
+    /// `InitOptions.secure`. **Test material**: a 2048-bit RSA key pair and a
+    /// self-signed application certificate generated in-process at test time
+    /// from the module's own `rsa`; never read from disk, never a real key.
+    creds: ?security.Credentials = null,
+    /// Backing storage for the endpoint list a secured driver advertises
+    /// (None + Basic256Sha256 Sign + Basic256Sha256 SignAndEncrypt); the
+    /// certificate they embed is `creds`, so it cannot be a comptime array.
+    endpoint_storage: [3]services.EndpointDescription = undefined,
+    endpoint_count: usize = 0,
+    port: u16 = live_port,
 
-    const endpoints = [_]services.EndpointDescription{server.noneEndpoint(live_endpoint_url, .{
+    const app: services.ApplicationDescription = .{
         .application_uri = "urn:zig-libs:opcua:interop-server",
         .product_uri = "urn:zig-libs:opcua",
         .application_name = .{ .locale = "en", .text = "zig-libs opcua interop server" },
@@ -128,19 +144,34 @@ const Driver = struct {
         .gateway_server_uri = null,
         .discovery_profile_uri = null,
         .discovery_urls = null,
-    })};
+    };
+
+    const endpoints = [_]services.EndpointDescription{server.noneEndpoint(live_endpoint_url, app)};
 
     /// open62541's `client` example connects with `UA_Client_connect_username
     /// ("user1", "password")`, so the interop server accepts exactly that pair
     /// — a test fixture, not a credential of anything real.
     const users = [_]server.UserCredential{.{ .user_name = "user1", .password = "password" }};
 
+    const InitOptions = struct {
+        /// Stand the server up with `SecurityPolicy#Basic256Sha256` at Sign
+        /// and SignAndEncrypt as well as None, generating a fresh test key
+        /// pair + self-signed certificate for it.
+        secure: bool = false,
+        port: u16 = live_port,
+        endpoint_url: []const u8 = live_endpoint_url,
+    };
+
     fn init(d: *Driver, gpa: std.mem.Allocator, io: std.Io) !void {
+        return d.initWith(gpa, io, .{});
+    }
+
+    fn initWith(d: *Driver, gpa: std.mem.Allocator, io: std.Io, options: InitOptions) !void {
         var bound_host: []const u8 = live_hosts[0];
         const listener = blk: {
             var last_err: anyerror = error.AddressInUse;
             for (live_hosts) |host| {
-                const addr = std.Io.net.IpAddress.parse(host, live_port) catch continue;
+                const addr = std.Io.net.IpAddress.parse(host, options.port) catch continue;
                 if (addr.listen(io, .{ .reuse_address = true })) |l| {
                     bound_host = host;
                     break :blk l;
@@ -163,6 +194,7 @@ const Driver = struct {
             .capture_s2c = .empty,
             .start_ms = monotonicMs(),
             .start_time = opcUaNow(),
+            .port = options.port,
         };
 
         try d.store.addStandardNodes(.{ .start_time = d.start_time });
@@ -187,11 +219,39 @@ const Driver = struct {
             .implementation = echoMethod,
         });
 
+        var security_config: ?server.SecurityConfig = null;
+        if (options.secure) {
+            // 2048 bits: the conventional application-certificate size for
+            // Basic256Sha256, and what a real third-party client expects to
+            // meet. `not_before`/`not_after` bracket a decade so the test
+            // does not rot.
+            const creds = try security.Credentials.generateSelfSigned(gpa, d.prng.random(), .{
+                .modulus_bits = 2048,
+                .common_name = "zig-libs opcua interop server",
+                .not_before = "200101000000Z",
+                .not_after = "350101000000Z",
+                .application_uri = "urn:zig-libs:opcua:interop-server",
+            });
+            d.creds = creds;
+            d.endpoint_storage[0] = server.noneEndpointWithEncryptedUserTokens(options.endpoint_url, app, creds.certificate_der);
+            d.endpoint_storage[1] = server.secureEndpoint(options.endpoint_url, app, .sign, creds.certificate_der, 10);
+            d.endpoint_storage[2] = server.secureEndpoint(options.endpoint_url, app, .sign_and_encrypt, creds.certificate_der, 20);
+            d.endpoint_count = 3;
+            // No trust list: this interop server accepts any structurally
+            // valid, in-date client certificate. Stated plainly — it is what
+            // makes the test self-contained, and it is not a production
+            // posture (see `server.CertificatePolicy`).
+            security_config = .{ .credentials = creds };
+        }
+        const endpoint_slice: []const services.EndpointDescription =
+            if (options.secure) d.endpoint_storage[0..d.endpoint_count] else &endpoints;
+
         d.srv = server.Server.init(gpa, &d.store, .{
             .application_uri = "urn:zig-libs:opcua:interop-server",
             .application_name = .{ .locale = "en", .text = "zig-libs opcua interop server" },
-            .endpoints = &endpoints,
+            .endpoints = endpoint_slice,
             .users = &users,
+            .security = security_config,
         }, d.prng.random());
         // `now_ms` is measured from `start_ms`, so the wall clock's zero point
         // is the server's start instant.
@@ -200,6 +260,7 @@ const Driver = struct {
 
     fn deinit(d: *Driver) void {
         d.listener.socket.close(d.io);
+        if (d.creds) |c| c.deinit(d.gpa);
         d.srv.deinit();
         d.store.deinit();
         d.gpa.free(d.recv_buf);
@@ -241,6 +302,7 @@ const Driver = struct {
         var write_buf: [64 * 1024]u8 = undefined;
         var stream_writer: ?std.Io.net.Stream.Writer = null;
         defer if (stream) |s| s.close(d.io);
+        defer if (conn) |*c| c.deinit();
 
         const started = monotonicMs();
         var last_close_ms: ?i64 = null;
@@ -273,6 +335,7 @@ const Driver = struct {
                     stream.?.close(d.io);
                     stream = null;
                     stream_writer = null;
+                    if (conn) |*c| c.deinit(); // frees the peer certificate, wipes the keys
                     conn = null;
                     last_close_ms = monotonicMs();
                     continue;
@@ -296,6 +359,7 @@ const Driver = struct {
                     stream.?.close(d.io);
                     stream = null;
                     stream_writer = null;
+                    c.deinit();
                     conn = null;
                     last_close_ms = monotonicMs();
                 }
@@ -1325,4 +1389,648 @@ test "golden (self-derived): the server's GetEndpoints / Read / Publish response
         try testing.expect(dcn.monitored_items.?[0].value.source_timestamp != null);
         try testing.expect(dcn.monitored_items.?[0].value.server_timestamp != null);
     }
+}
+
+// ── LIVE Basic256Sha256: a real third-party client against our server ───────
+//
+// The oracle here is **Python `asyncua`** (LGPL-3.0), used purely as a black
+// box: no asyncua source is read, built or linked — the test runs a stock
+// interpreter with the driver script below and asserts on its *stdout*. It is
+// the natural second opinion to open62541: a wholly independent stack, written
+// in a different language, with its own reading of OPC 10000-6 §6.7.
+//
+// The script generates its own throwaway 2048-bit RSA key pair and
+// self-signed certificate (via `cryptography`, in a temp dir it makes and
+// owns) — **no certificate or private key ships in this repository**, and the
+// server's own key pair is likewise generated in-process by `Driver.initWith`.
+//
+// Skips loudly when the interpreter or `asyncua` is unavailable. Set
+// `OPCUA_PYTHON` to point at a specific interpreter (e.g. a virtualenv).
+
+const asyncua_script =
+    \\import asyncio, datetime, os, sys, tempfile
+    \\from asyncua import Client, ua
+    \\from cryptography import x509
+    \\from cryptography.x509.oid import NameOID
+    \\from cryptography.hazmat.primitives import hashes, serialization
+    \\from cryptography.hazmat.primitives.asymmetric import rsa as crsa
+    \\
+    \\URL = "opc.tcp://localhost:4841"
+    \\ANSWER = ua.NodeId("the.answer", 1)
+    \\METHOD = ua.NodeId(62541, 1)
+    \\
+    \\def make_cert(d):
+    \\    key = crsa.generate_private_key(public_exponent=65537, key_size=2048)
+    \\    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "asyncua interop client")])
+    \\    now = datetime.datetime.now(datetime.timezone.utc)
+    \\    cert = (x509.CertificateBuilder()
+    \\            .subject_name(name).issuer_name(name)
+    \\            .public_key(key.public_key())
+    \\            .serial_number(x509.random_serial_number())
+    \\            .not_valid_before(now - datetime.timedelta(days=1))
+    \\            .not_valid_after(now + datetime.timedelta(days=365))
+    \\            .add_extension(x509.SubjectAlternativeName(
+    \\                [x509.UniformResourceIdentifier("urn:zig-libs:opcua:asyncua-client")]), critical=False)
+    \\            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+    \\            .add_extension(x509.KeyUsage(digital_signature=True, content_commitment=True,
+    \\                                         key_encipherment=True, data_encipherment=True,
+    \\                                         key_agreement=False, key_cert_sign=False, crl_sign=False,
+    \\                                         encipher_only=False, decipher_only=False), critical=True)
+    \\            .sign(key, hashes.SHA256()))
+    \\    cp = os.path.join(d, "client.der")
+    \\    kp = os.path.join(d, "client.pem")
+    \\    with open(cp, "wb") as f:
+    \\        f.write(cert.public_bytes(serialization.Encoding.DER))
+    \\    with open(kp, "wb") as f:
+    \\        f.write(key.private_bytes(serialization.Encoding.PEM,
+    \\                                  serialization.PrivateFormat.PKCS8,
+    \\                                  serialization.NoEncryption()))
+    \\    return cp, kp
+    \\
+    \\class Handler:
+    \\    def __init__(self):
+    \\        self.count = 0
+    \\    def datachange_notification(self, node, val, data):
+    \\        self.count += 1
+    \\
+    \\async def secure_client(cp, kp, mode, user=None, password=None, timeout_ms=None):
+    \\    c = Client(url=URL)
+    \\    if timeout_ms is not None:
+    \\        c.secure_channel_timeout = timeout_ms
+    \\    await c.set_security_string("Basic256Sha256,%s,%s,%s" % (mode, cp, kp))
+    \\    if user is not None:
+    \\        c.set_user(user)
+    \\        c.set_password(password)
+    \\    return c
+    \\
+    \\async def main():
+    \\    d = tempfile.mkdtemp(prefix="ziglibs-opcua-")
+    \\    cp, kp = make_cert(d)
+    \\
+    \\    eps = await Client(url=URL).connect_and_get_server_endpoints()
+    \\    modes = sorted({"%s|%s" % (e.SecurityPolicyUri.rsplit("#", 1)[-1], e.SecurityMode.name) for e in eps})
+    \\    print("ZIGLIBS-OK-ENDPOINTS", len(eps), ",".join(modes), flush=True)
+    \\    for e in eps:
+    \\        if e.SecurityMode != ua.MessageSecurityMode.None_:
+    \\            assert e.ServerCertificate, "secure endpoint without a ServerCertificate"
+    \\
+    \\    # ---- SignAndEncrypt, anonymous: browse / read / write / call / subscribe
+    \\    c = await secure_client(cp, kp, "SignAndEncrypt")
+    \\    async with c:
+    \\        print("ZIGLIBS-OK-CONNECT SignAndEncrypt", flush=True)
+    \\        children = await c.nodes.objects.get_children()
+    \\        names = [ (await ch.read_browse_name()).Name for ch in children ]
+    \\        assert "the.answer" in names, names
+    \\        print("ZIGLIBS-OK-BROWSE", len(children), flush=True)
+    \\
+    \\        node = c.get_node(ANSWER)
+    \\        v = await node.read_value()
+    \\        print("ZIGLIBS-OK-READ", v, flush=True)
+    \\
+    \\        await node.write_value(ua.DataValue(ua.Variant(31337, ua.VariantType.Int32)))
+    \\        back = await node.read_value()
+    \\        assert back == 31337, back
+    \\        print("ZIGLIBS-OK-WRITE", back, flush=True)
+    \\
+    \\        out = await c.nodes.objects.call_method(METHOD, ua.Variant("ping", ua.VariantType.String))
+    \\        print("ZIGLIBS-OK-CALL", out, flush=True)
+    \\
+    \\        h = Handler()
+    \\        sub = await c.create_subscription(200, h)
+    \\        await sub.subscribe_data_change(node)
+    \\        await asyncio.sleep(2.0)
+    \\        await sub.delete()
+    \\        assert h.count >= 1, h.count
+    \\        print("ZIGLIBS-OK-SUBSCRIPTION", h.count, flush=True)
+    \\
+    \\    # ---- Sign only, with a Basic256Sha256-encrypted UserNameIdentityToken
+    \\    c = await secure_client(cp, kp, "Sign", user="user1", password="password")
+    \\    async with c:
+    \\        v = await c.get_node(ANSWER).read_value()
+    \\        print("ZIGLIBS-OK-SIGN-USERNAME", v, flush=True)
+    \\
+    \\    # ---- SecurityToken renewal: a 4 s channel lifetime held for ~10 s makes
+    \\    #      asyncua renew at least twice while requests keep flowing.
+    \\    c = await secure_client(cp, kp, "SignAndEncrypt", timeout_ms=4000)
+    \\    async with c:
+    \\        node = c.get_node(ANSWER)
+    \\        reads = 0
+    \\        for _ in range(20):
+    \\            await node.read_value()
+    \\            reads += 1
+    \\            await asyncio.sleep(0.5)
+    \\        print("ZIGLIBS-OK-RENEWAL", reads, flush=True)
+    \\
+    \\    print("ZIGLIBS-ALL-DONE", flush=True)
+    \\
+    \\asyncio.run(main())
+;
+
+/// Spawn `argv` and collect its output. `runPodman`'s generalisation — the
+/// Python driver is not a container, but the plumbing is the same.
+fn runProcess(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) !PodmanResult {
+    var child = std.process.spawn(io, .{
+        .argv = argv,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    }) catch return error.SkipZigTest;
+
+    var out_buf: [4096]u8 = undefined;
+    var stdout_reader = child.stdout.?.reader(io, &out_buf);
+    const stdout = try stdout_reader.interface.allocRemaining(gpa, .unlimited);
+    errdefer gpa.free(stdout);
+
+    var err_buf: [4096]u8 = undefined;
+    var stderr_reader = child.stderr.?.reader(io, &err_buf);
+    const stderr = try stderr_reader.interface.allocRemaining(gpa, .unlimited);
+    errdefer gpa.free(stderr);
+
+    const term = try child.wait(io);
+    return .{
+        .exit_code = switch (term) {
+            .exited => |code| code,
+            else => null,
+        },
+        .stdout = stdout,
+        .stderr = stderr,
+    };
+}
+
+/// The interpreter to drive `asyncua` with: `$OPCUA_PYTHON` if set (point it
+/// at a virtualenv), otherwise whatever `python3` resolves to.
+fn pythonInterpreter() []const u8 {
+    return std.process.Environ.getPosix(std.testing.environ, "OPCUA_PYTHON") orelse "python3";
+}
+
+test "LIVE asyncua -> our server: Basic256Sha256 SignAndEncrypt browse/read/write/call/subscribe, Sign + encrypted username, token renewal" {
+    const gpa = testing.allocator;
+    if (builtin.os.tag != .linux) {
+        std.debug.print("\nSKIPPED: LIVE asyncua interop needs Linux.\n", .{});
+        return error.SkipZigTest;
+    }
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const python = pythonInterpreter();
+    {
+        var probe = runProcess(gpa, io, &.{ python, "-c", "import asyncua, cryptography" }) catch {
+            std.debug.print("\nSKIPPED: LIVE asyncua interop: no usable `{s}` (set OPCUA_PYTHON).\n", .{python});
+            return error.SkipZigTest;
+        };
+        defer probe.deinit(gpa);
+        if (probe.exit_code != 0) {
+            std.debug.print(
+                "\nSKIPPED: LIVE asyncua interop: `{s}` lacks the `asyncua`/`cryptography` packages (set OPCUA_PYTHON to a venv that has them).\n",
+                .{python},
+            );
+            return error.SkipZigTest;
+        }
+    }
+
+    var driver: Driver = undefined;
+    driver.initWith(gpa, io, .{
+        .secure = true,
+        .port = live_secure_port,
+        .endpoint_url = live_secure_endpoint_url,
+    }) catch |err| {
+        std.debug.print("\nSKIPPED: LIVE asyncua interop cannot bind loopback:{d} ({t}).\n", .{ live_secure_port, err });
+        return error.SkipZigTest;
+    };
+    defer driver.deinit();
+    // A short SecurityToken floor so the renewal leg of the script actually
+    // forces renewals inside a test-sized window (the product default is 60 s).
+    driver.srv.config.security.?.min_token_lifetime_ms = 2_000;
+
+    var ctx: LoopbackCtx = .{ .driver = &driver };
+    const thread = std.Thread.spawn(.{}, secureServeThread, .{&ctx}) catch {
+        std.debug.print("\nSKIPPED: LIVE asyncua interop cannot spawn a thread.\n", .{});
+        return error.SkipZigTest;
+    };
+
+    var result = runProcess(gpa, io, &.{ python, "-c", asyncua_script }) catch |err| {
+        ctx.done.store(true, .release);
+        thread.join();
+        return err;
+    };
+    defer result.deinit(gpa);
+    thread.join();
+    driver.dumpCapture("asyncua-basic256sha256");
+
+    if (driver.connections == 0) {
+        std.debug.print(
+            "\nSKIPPED: LIVE asyncua interop: nothing ever connected to loopback:{d} (port held by another process?).\nstderr: {s}\n",
+            .{ live_secure_port, result.stderr },
+        );
+        return error.SkipZigTest;
+    }
+
+    const logs = result.stdout;
+    const expectations = [_][]const u8{
+        "ZIGLIBS-OK-ENDPOINTS 3 Basic256Sha256|Sign,Basic256Sha256|SignAndEncrypt,None|None_",
+        "ZIGLIBS-OK-CONNECT SignAndEncrypt", // the asymmetric handshake + key derivation agreed
+        "ZIGLIBS-OK-BROWSE", // Browse over signed+encrypted chunks
+        "ZIGLIBS-OK-READ", // Read
+        "ZIGLIBS-OK-WRITE 31337", // Write, read back through the same channel
+        "ZIGLIBS-OK-CALL", // Call
+        "ZIGLIBS-OK-SUBSCRIPTION", // CreateSubscription + Publish
+        "ZIGLIBS-OK-SIGN-USERNAME", // Sign mode + RSA-OAEP-encrypted UserNameIdentityToken
+        "ZIGLIBS-OK-RENEWAL 20", // 20 reads across ~10 s with a 4 s token: renewals happened mid-stream
+        "ZIGLIBS-ALL-DONE",
+    };
+    for (expectations) |needle| {
+        if (std.mem.indexOf(u8, logs, needle) == null) {
+            std.debug.print("\nasyncua driver output missing \"{s}\":\nstdout:\n{s}\nstderr:\n{s}\n", .{ needle, logs, result.stderr });
+            return error.TestUnexpectedResult;
+        }
+    }
+    try testing.expectEqual(@as(?u8, 0), result.exit_code);
+    // Four separate connections: endpoint discovery, SignAndEncrypt, Sign,
+    // and the renewal run.
+    try testing.expect(driver.connections >= 4);
+}
+
+fn secureServeThread(ctx: *LoopbackCtx) void {
+    // `vary_value = false`: the write/read-back assertion in the driver script
+    // would race a server that keeps bumping the same node.
+    ctx.driver.serve(.{ .deadline_ms = 120_000, .idle_stop_ms = 3_000, .vary_value = false }) catch {};
+    ctx.done.store(true, .release);
+}
+
+// ── LIVE Basic256Sha256: open62541's stock encrypted client ─────────────────
+
+/// Where the openssl-generated test key pair for the open62541 client is
+/// staged so the container can bind-mount it. **Test material only**: a
+/// throwaway 2048-bit key generated per run and deleted afterwards; no
+/// certificate or private key is stored in this repository.
+const o62_pki_dir = "/tmp/opcua-zig-libs-o62-encryption";
+
+/// Minimal openssl config giving the generated certificate the shape an OPC UA
+/// application certificate needs (OPC 10000-6 §6.2.3: an `ApplicationUri` in
+/// the `subjectAltName`, plus the key usages the profile requires).
+const o62_openssl_config =
+    \\[req]
+    \\distinguished_name = dn
+    \\prompt = no
+    \\[dn]
+    \\CN = zig-libs opcua interop peer
+    \\[v3]
+    \\basicConstraints = CA:FALSE
+    \\keyUsage = digitalSignature,nonRepudiation,keyEncipherment,dataEncipherment
+    \\extendedKeyUsage = clientAuth
+    \\subjectAltName = URI:urn:open62541.client.application,DNS:localhost
+    \\
+;
+
+/// Generate a throwaway RSA-2048 key pair + self-signed certificate in DER
+/// with `openssl` (a black box — open62541's mbedtls build wants a DER
+/// PKCS#1 private key, which this module's `rsa` has no encoder for).
+/// Returns `false` if openssl is unavailable or unhappy, so the caller skips.
+fn makeO62ClientPki(gpa: std.mem.Allocator, io: std.Io) bool {
+    std.Io.Dir.cwd().createDirPath(io, o62_pki_dir) catch return false;
+    std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = o62_pki_dir ++ "/openssl.cnf",
+        .data = o62_openssl_config,
+    }) catch return false;
+
+    const steps = [_][]const []const u8{
+        &.{
+            "openssl",     "req",
+            "-x509",       "-newkey",
+            "rsa:2048",    "-nodes",
+            "-keyout",     o62_pki_dir ++ "/key.pem",
+            "-out",        o62_pki_dir ++ "/cert.pem",
+            "-days",       "3650",
+            "-config",     o62_pki_dir ++ "/openssl.cnf",
+            "-extensions", "v3",
+        },
+        &.{ "openssl", "x509", "-in", o62_pki_dir ++ "/cert.pem", "-outform", "der", "-out", o62_pki_dir ++ "/client_cert.der" },
+        &.{ "openssl", "rsa", "-in", o62_pki_dir ++ "/key.pem", "-outform", "der", "-out", o62_pki_dir ++ "/client_key.der" },
+    };
+    for (steps) |argv| {
+        var result = runProcess(gpa, io, argv) catch return false;
+        defer result.deinit(gpa);
+        if (result.exit_code != 0) return false;
+    }
+    return true;
+}
+
+fn removeO62ClientPki(io: std.Io) void {
+    for ([_][]const u8{ "openssl.cnf", "key.pem", "cert.pem", "client_cert.der", "client_key.der" }) |name| {
+        var buf: [256]u8 = undefined;
+        const path = std.fmt.bufPrint(&buf, "{s}/{s}", .{ o62_pki_dir, name }) catch continue;
+        std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    }
+    std.Io.Dir.cwd().deleteDir(io, o62_pki_dir) catch {};
+}
+
+test "LIVE open62541 client_encryption -> our server: picks the Basic256Sha256 SignAndEncrypt endpoint out of GetEndpoints" {
+    const gpa = testing.allocator;
+    if (builtin.os.tag != .linux) {
+        std.debug.print("\nSKIPPED: LIVE open62541 encryption interop needs Linux (podman --network host).\n", .{});
+        return error.SkipZigTest;
+    }
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const name = "opcua-zig-libs-server-encryption";
+    stopContainer(gpa, io, name); // leftover cleanup from a crashed run
+
+    if (!makeO62ClientPki(gpa, io)) {
+        std.debug.print("\nSKIPPED: LIVE open62541 encryption interop needs `openssl` to stage a throwaway client key pair.\n", .{});
+        removeO62ClientPki(io);
+        return error.SkipZigTest;
+    }
+    defer removeO62ClientPki(io);
+
+    var driver: Driver = undefined;
+    driver.initWith(gpa, io, .{
+        .secure = true,
+        .port = live_secure_port,
+        .endpoint_url = live_secure_endpoint_url,
+    }) catch |err| {
+        std.debug.print("\nSKIPPED: LIVE open62541 encryption interop cannot bind loopback:{d} ({t}).\n", .{ live_secure_port, err });
+        return error.SkipZigTest;
+    };
+    defer driver.deinit();
+
+    var run_result = runPodman(gpa, io, &.{
+        "run",                                                 "-d",
+        "--network",                                           "host",
+        "--name",                                              name,
+        "-v",                                                  o62_pki_dir ++ ":/certs:Z",
+        "--pull=never",                                        image,
+        "/opt/open62541/build/bin/examples/client_encryption", live_secure_endpoint_url,
+        "/certs/client_cert.der",                              "/certs/client_key.der",
+    }) catch |err| switch (err) {
+        error.SkipZigTest => {
+            std.debug.print("\nSKIPPED: LIVE open62541 encryption interop: `podman` is not available here.\n", .{});
+            return error.SkipZigTest;
+        },
+        else => return err,
+    };
+    defer run_result.deinit(gpa);
+    if (run_result.exit_code != 0) {
+        std.debug.print(
+            "\nSKIPPED: LIVE open62541 encryption interop: `podman run` failed (image not pulled / podman unusable).\nstderr: {s}\n",
+            .{run_result.stderr},
+        );
+        return error.SkipZigTest;
+    }
+    defer stopContainer(gpa, io, name);
+
+    try driver.serve(.{ .deadline_ms = 40_000, .idle_stop_ms = 2_000, .vary_value = false });
+    driver.dumpCapture("open62541-client_encryption");
+
+    if (driver.connections == 0) {
+        std.debug.print(
+            "\nSKIPPED: LIVE open62541 encryption interop: `client_encryption` never connected to loopback:{d}.\n",
+            .{live_secure_port},
+        );
+        return error.SkipZigTest;
+    }
+
+    const logs = try runPodman(gpa, io, &.{ "logs", name });
+    defer gpa.free(logs.stdout);
+    defer gpa.free(logs.stderr);
+    // open62541 logs to stderr; take whichever stream carried the text.
+    const text = if (logs.stderr.len > logs.stdout.len) logs.stderr else logs.stdout;
+
+    // The client discovers our endpoints over an unsecured channel, rejects
+    // the ones whose SecurityMode does not match what it wants, and selects
+    // ours — its own words, which is the assertion.
+    const expectations = [_][]const u8{
+        "Opened SecureChannel with SecurityPolicy http://opcfoundation.org/UA/SecurityPolicy#Basic256Sha256",
+        "SecurityMode SignAndEncrypt",
+    };
+    for (expectations) |needle| {
+        if (std.mem.indexOf(u8, text, needle) == null) {
+            std.debug.print("\nclient_encryption output missing \"{s}\":\n{s}\n", .{ needle, text });
+            return error.TestUnexpectedResult;
+        }
+    }
+    // It connects twice: once at #None to read GetEndpoints, then again on
+    // the endpoint it picked.
+    try testing.expect(driver.connections >= 2);
+}
+
+// ── Basic256Sha256 goldens ─────────────────────────────────────────────────
+//
+// **SELF-DERIVED**, all of them: there is no published OPC UA test vector for
+// a secured chunk, and a *captured* one would have to embed a real peer's
+// certificate — which this repository does not carry. What makes them worth
+// freezing anyway is that every input is fixed and every output is
+// deterministic, so the constants below pin the exact bytes this module puts
+// on the wire across the whole stack underneath them (`rsa.generate`,
+// `rsa.selfSignedCert`, RSA-OAEP, RSA-PKCS1v1.5, P-SHA256, AES-256-CBC,
+// HMAC-SHA256 and the padding arithmetic). A change anywhere in that stack
+// that alters a single byte fails here rather than silently at a customer's
+// server. Each one is checked in both directions: it must be *reproduced* by
+// the encoder and *opened* by the decoder back to the exact input.
+//
+// The third-party cross-check that these bytes are also *correct* — not just
+// stable — is the live interop above: open62541 and asyncua both speak this
+// framing back to us.
+
+/// The nonce pair every symmetric golden derives its keys from. Fixed
+/// constants, not secrets.
+const golden_client_nonce = [_]u8{0x11} ** 32;
+const golden_server_nonce = [_]u8{0x22} ** 32;
+
+/// Plaintext MSG body behind both symmetric goldens: SecureChannelId 42,
+/// TokenId 7, SequenceNumber 51, RequestId 51, then 24 bytes of payload.
+const golden_sym_body_hex =
+    "2a0000000700000033000000330000007a69672d6c696273206f7063756120676f6c64656e212121";
+
+/// SELF-DERIVED. One `SecurityMode=Sign` MSG chunk, server→client:
+/// MessageHeader + body + HMAC-SHA256 signature, no padding, no encryption.
+const golden_sym_sign_hex =
+    "4d534746500000002a0000000700000033000000330000007a69672d6c696273206f7063756120676f6c" ++
+    "64656e2121216abfd9d25bcdcf49131b6522dd9967a8841ac419e1abb518c91f90560519eebb";
+
+/// SELF-DERIVED. The same body at `SecurityMode=SignAndEncrypt`: the region
+/// from the SequenceHeader on is padded to whole AES blocks, signed, then
+/// AES-256-CBC encrypted — 96 bytes against Sign's 80, the 16 extra being one
+/// full block of padding footer.
+const golden_sym_sign_and_encrypt_hex =
+    "4d534746600000002a00000007000000b613b3590329a8422241fafe38c59f87c0887e22bcc9e2e10745" ++
+    "a225102dbc37b960935b272a350c5b18cf295ea3534f865b1783f324276ac867c078e35a259d43a98dad" ++
+    "6fd3046300d4b8d62d2086ea";
+
+test "golden (self-derived): symmetric MSG chunks at Sign and SignAndEncrypt" {
+    const gpa = testing.allocator;
+    const keys = security.deriveKeys(&golden_client_nonce, &golden_server_nonce, .basic256sha256);
+
+    var body_buf: [64]u8 = undefined;
+    const body = try std.fmt.hexToBytes(&body_buf, golden_sym_body_hex);
+
+    const cases = [_]struct { mode: services.MessageSecurityMode, hex: []const u8 }{
+        .{ .mode = .sign, .hex = golden_sym_sign_hex },
+        .{ .mode = .sign_and_encrypt, .hex = golden_sym_sign_and_encrypt_hex },
+    };
+    for (cases) |c| {
+        var expected_buf: [256]u8 = undefined;
+        const expected = try std.fmt.hexToBytes(&expected_buf, c.hex);
+
+        // Re-encode: the module must still produce exactly these bytes.
+        const produced = try security.symmetricSignAndEncrypt(gpa, "MSG", body, c.mode, keys, .server_to_client);
+        defer gpa.free(produced);
+        try testing.expectEqualSlices(u8, expected, produced);
+
+        // Decode: the frozen bytes must open back to exactly the input body.
+        const opened = try security.symmetricDecryptAndVerify(gpa, expected[0..8], expected[8..], c.mode, keys, .server_to_client);
+        defer gpa.free(opened);
+        try testing.expectEqualSlices(u8, body, opened);
+    }
+
+    // Sign carries only the 32-byte MAC; SignAndEncrypt adds a full padding
+    // block on top — the arithmetic, stated as a number.
+    try testing.expectEqual(@as(usize, 8 + 40 + 32), golden_sym_sign_hex.len / 2);
+    try testing.expectEqual(@as(usize, 8 + 40 + 16 + 32), golden_sym_sign_and_encrypt_hex.len / 2);
+}
+
+/// The deterministic seeds behind the asymmetric golden. `rsa.generate` is a
+/// pure function of its random stream, so a fixed CSPRNG seed pins the whole
+/// key pair — and therefore the certificate, the OAEP ciphertext and the
+/// PKCS#1 v1.5 signature.
+const golden_key_seed = [_]u8{0xA5} ** 32;
+const golden_seal_seed = [_]u8{0x5A} ** 32;
+
+/// SELF-DERIVED. The 512-bit client application certificate `golden_key_seed`
+/// produces (a small key so the golden stays readable; the live interop runs
+/// 2048-bit).
+const golden_client_cert_hex =
+    "3082016e30820118a003020102020101300d06092a864886f70d01010b050030183116301406035504030c" ++
+    "0d676f6c64656e20636c69656e74301e170d3230303130313030303030305a170d33353031303130303030" ++
+    "30305a30183116301406035504030c0d676f6c64656e20636c69656e74305c300d06092a864886f70d0101" ++
+    "010500034b003048024100c7254c11347503e8c9d0f6af7aff56417b39df593a7df80f5ca0c7a4e5562ec8" ++
+    "dd2c99337529dac692f368669b0127fdba17b9881bc044926143adf1b928bbd90203010001a34d304b300c" ++
+    "0603551d130101ff04023000300e0603551d0f0101ff040403020780302b0603551d1104243022862075726" ++
+    "e3a7a69672d6c6962733a6f706375613a676f6c64656e2d636c69656e74300d06092a864886f70d01010b05" ++
+    "000341008b20ad1fb69041d8127a36cf28647f192912277502bf4a6042a39a8d9e232a66f3896d2ea73144b" ++
+    "e309b5566264a304afed1fbf618ca3cbadd4e02ed8a15009d";
+
+/// SELF-DERIVED. The server certificate from the same stream (generated
+/// second, hence a different key).
+const golden_server_cert_hex =
+    "3082016e30820118a003020102020101300d06092a864886f70d01010b050030183116301406035504030c" ++
+    "0d676f6c64656e20736572766572301e170d3230303130313030303030305a170d33353031303130303030" ++
+    "30305a30183116301406035504030c0d676f6c64656e20736572766572305c300d06092a864886f70d0101" ++
+    "010500034b003048024100d6ba93d3c73da9e9a8a4792a525dd35d7b785b0970ae0328348db281487ee044" ++
+    "c697c70006bbfe9c5cb291a7fe6e282724b9e72984082f8d69ae8dd86f7c27b50203010001a34d304b300c" ++
+    "0603551d130101ff04023000300e0603551d0f0101ff040403020780302b0603551d1104243022862075726" ++
+    "e3a7a69672d6c6962733a6f706375613a676f6c64656e2d736572766572300d06092a864886f70d01010b05" ++
+    "00034100330003458a2830ea61082f3429050a0d13ad9ec9bffecb0239121002bca2f25e3078db2413ebf6c" ++
+    "92ddc3737b339bb57cd40a690d261c540402e4ed005299d9a";
+
+/// SELF-DERIVED. A complete `OpenSecureChannel` message under
+/// Basic256Sha256: `OPNF` + size, SecureChannelId 0, the plaintext
+/// `AsymmetricAlgorithmSecurityHeader` (policy URI, the client certificate
+/// above, the SHA-1 thumbprint of the server certificate), then the
+/// SequenceHeader + payload + padding + RSA-PKCS1v1.5/SHA-256 signature,
+/// RSA-OAEP/SHA-1-encrypted to the server key in 64-byte blocks. 791 bytes:
+/// 8 header + 455 clear security header + 328 ciphertext.
+const golden_opn_hex =
+    "4f504e46170300000000000039000000687474703a2f2f6f7063666f756e646174696f6e2e6f72672f5541" ++
+    "2f5365637572697479506f6c696379234261736963323536536861323536720100003082016e3082011" ++
+    "8a003020102020101300d06092a864886f70d01010b050030183116301406035504030c0d676f6c64656e" ++
+    "20636c69656e74301e170d3230303130313030303030305a170d3335303130313030303030305a3018311" ++
+    "6301406035504030c0d676f6c64656e20636c69656e74305c300d06092a864886f70d0101010500034b00" ++
+    "3048024100c7254c11347503e8c9d0f6af7aff56417b39df593a7df80f5ca0c7a4e5562ec8dd2c9933752" ++
+    "9dac692f368669b0127fdba17b9881bc044926143adf1b928bbd90203010001a34d304b300c0603551d13" ++
+    "0101ff04023000300e0603551d0f0101ff040403020780302b0603551d11042430228620" ++
+    "75726e3a7a69672d6c6962733a6f706375613a676f6c64656e2d636c69656e74300d06092a864886f70d0" ++
+    "1010b05000341008b20ad1fb69041d8127a36cf28647f192912277502bf4a6042a39a8d9e232a66f3896d" ++
+    "2ea73144be309b5566264a304afed1fbf618ca3cbadd4e02ed8a15009d140000000a217643bd4fe67aa32" ++
+    "e2226257a61374f442aef1c5a47c197cca95553c5fb13b1bcb3e51793d55ed743e7e74f5e91b4039a437d" ++
+    "57af291e09b258b8103542b39a6fa9d8cddfa83ce4f4e63931401625bb8523c3620b66d0fc4de6f0b797f" ++
+    "3de026432a393588bb3123ba3e714392d102357c77e5deaf264779fea3781bef74227f26af310521877aa" ++
+    "2351d3593aaf45e892f31ebce097f66b1031736f60a334266a391d61d0ef0a369bdd50f6af8f681d5729d" ++
+    "cb1f11f779c21f3b754bf8a630721c8391ab60715032dc5e12a5569d297c8bbf202de9607ead691516a27" ++
+    "2e5b8076ac617573b8012dd995f85b848490cb0eff96e48d80ff03b514eb195f0f7888d2766cfc27796c4" ++
+    "2f77d37aeb0f57597973e28673759260ae25f519cd02bd98ee981d56493a3784af5cbee36fcdbfb4dcfdd" ++
+    "6c5d10e32dd72126ecd7636dfb78f8d0b99b55026af3ef71e5a67bd20b9b2a60fa";
+
+test "golden (self-derived): the Basic256Sha256 asymmetric OpenSecureChannel handshake" {
+    const gpa = testing.allocator;
+
+    // 1. The key material is reproducible from its seed, certificates included.
+    var prng = std.Random.DefaultCsprng.init(golden_key_seed);
+    const rnd = prng.random();
+    const client = try security.Credentials.generateSelfSigned(gpa, rnd, .{
+        .modulus_bits = 512,
+        .common_name = "golden client",
+        .not_before = "200101000000Z",
+        .not_after = "350101000000Z",
+        .application_uri = "urn:zig-libs:opcua:golden-client",
+    });
+    defer client.deinit(gpa);
+    const srv = try security.Credentials.generateSelfSigned(gpa, rnd, .{
+        .modulus_bits = 512,
+        .common_name = "golden server",
+        .not_before = "200101000000Z",
+        .not_after = "350101000000Z",
+        .application_uri = "urn:zig-libs:opcua:golden-server",
+    });
+    defer srv.deinit(gpa);
+
+    var cert_buf: [512]u8 = undefined;
+    try testing.expectEqualSlices(u8, try std.fmt.hexToBytes(&cert_buf, golden_client_cert_hex), client.certificate_der);
+    var cert_buf2: [512]u8 = undefined;
+    try testing.expectEqualSlices(u8, try std.fmt.hexToBytes(&cert_buf2, golden_server_cert_hex), srv.certificate_der);
+
+    // 2. Rebuild the plaintext OPN body and seal it with the same OAEP seed.
+    var bw = std.Io.Writer.Allocating.init(gpa);
+    defer bw.deinit();
+    var e = encoding.Encoder.init(&bw.writer);
+    try bw.writer.writeInt(u32, 0, .little); // SecureChannelId: 0 on a fresh channel
+    const thumbprint = security.certificateThumbprint(srv.certificate_der);
+    try security.encodeAsymmetricAlgorithmSecurityHeader(&e, .{
+        .security_policy_uri = security.SecurityPolicy.basic256sha256.uri(),
+        .sender_certificate = client.certificate_der,
+        .receiver_certificate_thumbprint = &thumbprint,
+    });
+    const encrypted_region_offset = bw.writer.buffered().len;
+    try bw.writer.writeInt(u32, 1, .little); // SequenceNumber
+    try bw.writer.writeInt(u32, 1, .little); // RequestId
+    try bw.writer.writeAll("OPN-REQUEST-PAYLOAD-GOLDEN");
+    const plain_body = bw.writer.buffered();
+
+    var seal_prng = std.Random.DefaultCsprng.init(golden_seal_seed);
+    const produced = try security.sealAsymmetricMessage(
+        gpa,
+        seal_prng.random(),
+        "OPN",
+        plain_body,
+        encrypted_region_offset,
+        client,
+        srv.certificate_der,
+    );
+    defer gpa.free(produced);
+
+    var expected_buf: [1024]u8 = undefined;
+    const expected = try std.fmt.hexToBytes(&expected_buf, golden_opn_hex);
+    try testing.expectEqualSlices(u8, expected, produced);
+    try testing.expectEqual(@as(usize, 791), expected.len);
+    try testing.expectEqual(expected.len, std.mem.readInt(u32, expected[4..8], .little));
+    // The security header rides in the clear so a receiver can pick a key
+    // before it can decrypt anything (§6.7.2.3).
+    try testing.expectEqualSlices(u8, plain_body[0..encrypted_region_offset], expected[8..][0..encrypted_region_offset]);
+    // …and the encrypted region is a whole number of 64-byte RSA blocks.
+    try testing.expectEqual(@as(usize, 0), (expected.len - 8 - encrypted_region_offset) % 64);
+
+    // 3. The receiving side: the frozen bytes must open back to exactly the
+    //    plaintext body, verified against the sender certificate the header
+    //    carried.
+    const view = security.viewAsymmetricHeader(expected[8..]).?;
+    try testing.expectEqualStrings(security.SecurityPolicy.basic256sha256.uri(), view.security_policy_uri);
+    try testing.expectEqualSlices(u8, client.certificate_der, view.sender_certificate.?);
+    try testing.expectEqualSlices(u8, &thumbprint, view.receiver_certificate_thumbprint.?);
+    try testing.expectEqual(encrypted_region_offset, view.encrypted_region_offset);
+
+    const opened = try security.openAsymmetricMessage(gpa, expected[0..8], expected[8..], srv.private_key, client.certificate_der);
+    defer gpa.free(opened);
+    try testing.expectEqualSlices(u8, plain_body, opened);
 }

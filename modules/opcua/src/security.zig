@@ -54,6 +54,14 @@
 //! `Aes256_Sha256_RsaPss` (OPC 10000-7 §6.4.6) remains reserved as an enum
 //! value + `uri()` only (asym encrypt = RSA-OAEP-SHA256, asym sign =
 //! RSA-PSS-SHA256) — no crypto wiring.
+//!
+//! **Both roles use this file.** Nothing in it is client-specific: a client
+//! seals with `.client_to_server` and opens with `.server_to_client`, a
+//! server does the reverse, and `sealAsymmetricMessage`/
+//! `openAsymmetricMessage` take *whose* key pair and *whose* peer
+//! certificate as explicit parameters. `server.zig` drives exactly these
+//! functions for the server half of Basic256Sha256 — the server side added
+//! no crypto of its own, only the state machine around it (see SPEC.md).
 
 const std = @import("std");
 const rsa = @import("rsa");
@@ -91,6 +99,25 @@ pub const SecurityPolicy = enum {
         };
     }
 };
+
+/// Basic256Sha256's *asymmetric signature* algorithm URI — the value that
+/// goes into a `SignatureData.Algorithm` field (`CreateSessionResponse.
+/// ServerSignature`, `ActivateSessionRequest.ClientSignature`), OPC 10000-7
+/// §6.4.5 "AsymmetricSignatureAlgorithm". RSA-SHA256 lives in the
+/// *xmldsig-more* namespace; the older `…2000/09/xmldsig#rsa-sha1` namespace
+/// only ever defined SHA-1 (see `signature_algorithm_rsa_sha256_legacy`).
+pub const signature_algorithm_rsa_sha256 = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
+
+/// The `…2000/09/xmldsig#rsa-sha256` spelling some stacks emit. Not what
+/// OPC 10000-7 says, but accepted on receipt (never sent) — refusing a
+/// signature that verifies perfectly over a namespace typo helps nobody.
+pub const signature_algorithm_rsa_sha256_legacy = "http://www.w3.org/2000/09/xmldsig#rsa-sha256";
+
+/// Basic256Sha256's *asymmetric encryption* algorithm URI — the value that
+/// goes into `UserNameIdentityToken.EncryptionAlgorithm` when the password
+/// is encrypted to the server certificate (OPC 10000-4 §7.36.4,
+/// OPC 10000-7 §6.4.5 "AsymmetricEncryptionAlgorithm": RSA-OAEP/SHA-1).
+pub const encryption_algorithm_rsa_oaep = "http://www.w3.org/2001/04/xmlenc#rsa-oaep";
 
 /// Per-`SecurityPolicy` algorithm/length constants. Values below are for a
 /// 2048-bit (256-byte) RSA key — the conventional size open62541/node-opcua
@@ -238,6 +265,25 @@ pub const ClientCredentials = struct {
     }
 };
 
+/// Constant-time byte-slice equality for **runtime** lengths, built on
+/// `std.crypto.timing_safe.compare` (std's `timing_safe.eql` needs a
+/// comptime-known array type, which a wire-length nonce, thumbprint,
+/// password or signature is not). The *length* comparison short-circuits and
+/// is therefore leaked — a length is not the secret here, the contents are.
+/// Every secret-dependent comparison in this module and in `server.zig` goes
+/// through this function or through `timing_safe.eql` directly; there is no
+/// `std.mem.eql` on a secret anywhere in the security path.
+pub fn constantTimeEql(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    return std.crypto.timing_safe.compare(u8, a, b, .big) == .eq;
+}
+
+/// An application's own key pair + certificate, whichever end of the wire it
+/// sits on. `ClientCredentials` is the original (client-side) name; the
+/// server half of this module holds exactly the same three fields, so this
+/// alias exists to let `server.zig` say what it means without a second type.
+pub const Credentials = ClientCredentials;
+
 // ── Certificate helpers ───────────────────────────────────────────────────
 
 /// SHA-1 thumbprint of a DER certificate — the value the OPN request's
@@ -251,14 +297,123 @@ pub fn certificateThumbprint(certificate_der: []const u8) [Sha1.digest_length]u8
 
 pub const CertificatePublicKeyError = error{InvalidCertificate};
 
+/// Largest certificate the two parsing helpers below will look at. A 2048-bit
+/// OPC UA application certificate is ~900 bytes and a 4096-bit one ~1.6 kB, so
+/// this is generous; the point of a bound at all is that the parse runs in a
+/// fixed-size scratch buffer (see `safeCertificate`).
+pub const max_parsed_certificate_len: usize = 8192;
+
+/// Zero bytes appended behind the certificate in `safeCertificate`'s scratch
+/// buffer. See that function for why they exist and why this many is enough.
+const der_parse_slack: usize = 64;
+
+const DerWalkError = error{Malformed};
+
+/// Recursively check that `bytes[start..end)` is an exact tiling of
+/// well-formed DER TLVs, every length inside its parent, no indefinite
+/// lengths and no multi-byte tags (neither occurs in DER X.509).
+///
+/// **Why this exists.** `std.crypto.Certificate`'s `der.Element.parse` reads
+/// `bytes[i]`/`bytes[i+1]` *without a bounds check* and computes
+/// `end = start + declared_length` without clamping — feed it a truncated or
+/// hostile certificate and it panics (index out of bounds), which on a server
+/// is a remote crash triggered by an attacker-supplied `SenderCertificate`.
+/// This walk is the precondition that makes that parser safe: afterwards every
+/// element boundary std can reach is known to be inside the buffer.
+fn walkDer(bytes: []const u8, start: usize, end: usize, depth: u8) DerWalkError!void {
+    if (depth == 0) return error.Malformed;
+    var i = start;
+    while (i < end) {
+        if (i + 2 > end) return error.Malformed;
+        const tag = bytes[i];
+        if (tag & 0x1f == 0x1f) return error.Malformed; // multi-byte tag
+        const constructed = tag & 0x20 != 0;
+        var j = i + 1;
+        const size_byte = bytes[j];
+        j += 1;
+        var content_len: usize = undefined;
+        if (size_byte & 0x80 == 0) {
+            content_len = size_byte;
+        } else {
+            const n: usize = size_byte & 0x7f;
+            // 0 = indefinite length (BER only); > 4 is more than the
+            // `u32` std's parser computes lengths in.
+            if (n == 0 or n > 4) return error.Malformed;
+            if (j + n > end) return error.Malformed;
+            content_len = 0;
+            for (bytes[j..][0..n]) |b| content_len = (content_len << 8) | b;
+            j += n;
+        }
+        if (content_len > end - j) return error.Malformed;
+        const content_end = j + content_len;
+        if (constructed) try walkDer(bytes, j, content_end, depth - 1);
+        i = content_end;
+    }
+    return;
+}
+
+/// Validate `certificate_der` and return a `std.crypto.Certificate` over a
+/// zero-padded copy of it in `scratch`, safe to hand to std's parser.
+///
+/// Two guarantees together make the parse total:
+///  1. `walkDer` proves every element boundary *inside* the certificate is in
+///     bounds, so no declared length can send the parser off the end;
+///  2. the 64 zero bytes behind it absorb the parser's *sibling probes* —
+///     the places it parses at `some_element.slice.end` without first
+///     checking that a next sibling exists (a certificate with a 6-element
+///     `tbsCertificate`, an `AttributeTypeAndValue` with one child, an
+///     extension with no value…). Each such probe starts no further than one
+///     byte past a validated boundary and reads a `00 00` TLV out of the
+///     padding, i.e. an empty element two bytes further on; the parser makes
+///     at most a handful of these in a row and every loop it runs is bounded
+///     by a validated end, so 64 bytes cannot be walked through.
+fn safeCertificate(certificate_der: []const u8, scratch: []u8) CertificatePublicKeyError!std.crypto.Certificate {
+    if (certificate_der.len == 0 or certificate_der.len > max_parsed_certificate_len) return error.InvalidCertificate;
+    walkDer(certificate_der, 0, certificate_der.len, 32) catch return error.InvalidCertificate;
+    @memcpy(scratch[0..certificate_der.len], certificate_der);
+    @memset(scratch[certificate_der.len..][0..der_parse_slack], 0);
+    return .{ .buffer = scratch[0 .. certificate_der.len + der_parse_slack], .index = 0 };
+}
+
 /// Extract the RSA public key from a DER X.509 certificate — std's
 /// independent `std.crypto.Certificate` parser locates the
 /// `SubjectPublicKeyInfo`, the `rsa` module parses the `RSAPublicKey` inside.
+/// Total on arbitrary bytes (see `safeCertificate`): a malformed certificate
+/// is `error.InvalidCertificate`, never a panic.
 pub fn certificatePublicKey(certificate_der: []const u8) CertificatePublicKeyError!rsa.PublicKey {
-    const cert: std.crypto.Certificate = .{ .buffer = certificate_der, .index = 0 };
+    var scratch: [max_parsed_certificate_len + der_parse_slack]u8 = undefined;
+    const cert = try safeCertificate(certificate_der, &scratch);
     const parsed = cert.parse() catch return error.InvalidCertificate;
     if (parsed.pub_key_algo != .rsaEncryption) return error.InvalidCertificate;
     return rsa.PublicKey.fromDer(parsed.pubKey()) catch error.InvalidCertificate;
+}
+
+/// A DER certificate's `notBefore`/`notAfter`, in Unix seconds.
+pub const CertificateValidity = struct {
+    not_before_sec: i64,
+    not_after_sec: i64,
+
+    /// RFC 5280 §6.1.3 (a)(2) / OPC 10000-4 Table "BadCertificateTimeInvalid":
+    /// is `now_sec` inside the certificate's validity period?
+    pub fn covers(self: CertificateValidity, now_sec: i64) bool {
+        return now_sec >= self.not_before_sec and now_sec <= self.not_after_sec;
+    }
+};
+
+/// Parse a DER certificate's validity period (std's independent X.509
+/// parser does the ASN.1). *Only* the time window — chain building and the
+/// trust decision are deliberately not here: an OPC UA server's trust list
+/// is a deployment artifact, so `server.zig` takes the accept/reject verdict
+/// from a caller-supplied policy callback instead of inventing a trust store
+/// (see `server.CertificatePolicy`).
+pub fn certificateValidity(certificate_der: []const u8) CertificatePublicKeyError!CertificateValidity {
+    var scratch: [max_parsed_certificate_len + der_parse_slack]u8 = undefined;
+    const cert = try safeCertificate(certificate_der, &scratch);
+    const parsed = cert.parse() catch return error.InvalidCertificate;
+    return .{
+        .not_before_sec = @intCast(parsed.validity.not_before),
+        .not_after_sec = @intCast(parsed.validity.not_after),
+    };
 }
 
 // ── ChannelKeys ───────────────────────────────────────────────────────────
@@ -523,6 +678,23 @@ pub fn symmetricSignAndEncrypt(
     keys: ChannelKeys,
     direction: Direction,
 ) SymmetricSignAndEncryptError![]u8 {
+    return symmetricSealChunk(allocator, msg_code, 'F', unsecured_body, mode, keys, direction);
+}
+
+/// `symmetricSignAndEncrypt` with an explicit chunk-type byte — `'F'` final,
+/// `'C'` intermediate, `'A'` abort (OPC 10000-6 §7.1.1). A *chunked* secure
+/// response secures each chunk on its own (the signature covers that chunk's
+/// own MessageHeader, chunk byte included), which is why the server's
+/// multi-chunk path cannot go through the `'F'`-only wrapper above.
+pub fn symmetricSealChunk(
+    allocator: std.mem.Allocator,
+    msg_code: *const [3]u8,
+    chunk_byte: u8,
+    unsecured_body: []const u8,
+    mode: SecurityMode,
+    keys: ChannelKeys,
+    direction: Direction,
+) SymmetricSignAndEncryptError![]u8 {
     std.debug.assert(mode == .sign or mode == .sign_and_encrypt);
     std.debug.assert(unsecured_body.len >= 16); // ChannelId + TokenId + SequenceHeader
     const dk = directionKeys(&keys, direction);
@@ -542,7 +714,7 @@ pub fn symmetricSignAndEncrypt(
     errdefer allocator.free(buf);
 
     buf[0..3].* = msg_code.*;
-    buf[3] = 'F';
+    buf[3] = chunk_byte;
     std.mem.writeInt(u32, buf[4..8], @intCast(total), .little);
     @memcpy(buf[8..][0..unsecured_body.len], unsecured_body);
     if (pad_footprint > 0) {
@@ -557,6 +729,24 @@ pub fn symmetricSignAndEncrypt(
         aes256CbcEncrypt(dk.encrypting_key, dk.iv, buf[16..]);
     }
     return buf;
+}
+
+/// Largest service payload that still fits one `chunk_capacity`-byte MSG/CLO
+/// chunk once the Secure-Conversation framing (MessageHeader 8 +
+/// SecureChannelId 4 + TokenId 4 + SequenceHeader 8 = 24), the HMAC-SHA256
+/// signature (32) and — at SignAndEncrypt — the worst-case padding footer
+/// (PaddingSize byte + up to 15 padding bytes) are accounted for. Deliberately
+/// the *worst case* rather than the exact per-chunk figure: a chunk a few
+/// bytes shorter than it had to be is legal, an over-long one is not.
+/// Returns 0 when the buffer cannot hold even an empty secured chunk.
+pub fn maxSymmetricPayload(chunk_capacity: usize, mode: SecurityMode) usize {
+    const framing: usize = 8 + 4 + 4 + 8;
+    const overhead: usize = switch (mode) {
+        .none, .invalid => framing,
+        .sign => framing + sym_signature_len,
+        .sign_and_encrypt => framing + sym_signature_len + aes_block_len,
+    };
+    return chunk_capacity -| overhead;
 }
 
 pub const SymmetricDecryptAndVerifyError = std.mem.Allocator.Error || error{
@@ -646,6 +836,55 @@ fn asymmetricHeaderEnd(body: []const u8, offset: usize) ?usize {
         }
     }
     return off;
+}
+
+/// A *borrowed* look at the plaintext `AsymmetricAlgorithmSecurityHeader` at
+/// the front of an OPN chunk body — every field points into the caller's
+/// buffer, nothing is allocated.
+pub const AsymmetricHeaderView = struct {
+    /// `SecurityPolicyUri`; `""` when the field was null (never a valid
+    /// policy, so the caller's `eql` against a real URI rejects it anyway).
+    security_policy_uri: []const u8,
+    /// `SenderCertificate` — the *peer's* DER certificate as it claims it.
+    /// Attacker-controlled until validated: this is the certificate a server
+    /// must run through its trust policy before trusting anything signed
+    /// with it.
+    sender_certificate: ?[]const u8,
+    /// `ReceiverCertificateThumbprint` — SHA-1 of the certificate the sender
+    /// encrypted to, i.e. ours.
+    receiver_certificate_thumbprint: ?[]const u8,
+    /// Offset within `chunk_body` where the (possibly encrypted) region
+    /// begins — one past the header's last byte.
+    encrypted_region_offset: usize,
+};
+
+/// Scan the OPN chunk body (which starts at `SecureChannelId`) far enough to
+/// read the `AsymmetricAlgorithmSecurityHeader` without allocating and
+/// without trusting a single length prefix. `null` = truncated/malformed.
+/// This is the *first* thing a server can look at: the header rides in the
+/// clear precisely so the receiver can pick a policy and a key before it can
+/// decrypt anything (OPC 10000-6 §6.7.2.3).
+pub fn viewAsymmetricHeader(chunk_body: []const u8) ?AsymmetricHeaderView {
+    if (chunk_body.len < 4) return null;
+    var off: usize = 4; // past SecureChannelId
+    var fields: [3]?[]const u8 = .{ null, null, null };
+    for (&fields) |*field| {
+        if (off + 4 > chunk_body.len) return null;
+        const len = std.mem.readInt(i32, chunk_body[off..][0..4], .little);
+        off += 4;
+        if (len == -1) continue;
+        if (len < 0) return null;
+        const l: usize = @intCast(len);
+        if (off + l > chunk_body.len) return null;
+        field.* = chunk_body[off..][0..l];
+        off += l;
+    }
+    return .{
+        .security_policy_uri = fields[0] orelse "",
+        .sender_certificate = fields[1],
+        .receiver_certificate_thumbprint = fields[2],
+        .encrypted_region_offset = off,
+    };
 }
 
 pub const SealAsymmetricError = std.mem.Allocator.Error || rsa.EncryptOaepError || rsa.SignPkcs1v15Error || error{InvalidCertificate};
@@ -792,6 +1031,88 @@ pub fn openAsymmetricMessage(
         if (b != pad_low) return error.InvalidSecureMessage;
     }
     return allocator.dupe(u8, plain[8..body_end]);
+}
+
+// ── Encrypted user identity token secret (OPC 10000-4 §7.36.4) ───────────
+
+/// The plaintext a `UserNameIdentityToken.Password` (or an
+/// `IssuedIdentityToken.TokenData`) is built from before RSA-OAEP encryption
+/// to the *server's* certificate:
+///
+///     UInt32 length  ‖  secret  ‖  serverNonce
+///
+/// where `length` counts `secret ‖ serverNonce`, little-endian like every
+/// other OPC UA UInt32. The server nonce is what makes the ciphertext
+/// unreplayable — it comes from the `CreateSessionResponse`/previous
+/// `ActivateSessionResponse` and is checked byte-for-byte on decryption
+/// (`std.crypto.timing_safe.eql`).
+pub const UserTokenSecretError = std.mem.Allocator.Error || error{
+    /// Structurally broken: not a whole number of RSA blocks, a length
+    /// prefix that does not match the recovered plaintext, or a plaintext
+    /// too short to contain the nonce.
+    InvalidSecureMessage,
+    /// RSA-OAEP could not recover the block.
+    DecryptionError,
+    /// The trailing nonce is not the one this server issued (constant-time
+    /// comparison) — a replayed or cross-session token.
+    NonceMismatch,
+    MessageTooLong,
+};
+
+/// Build and RSA-OAEP/SHA-1-encrypt the `length ‖ secret ‖ serverNonce` blob
+/// above to `receiver_public_key` (the server's certificate key). The
+/// caller-side half of `decryptUserTokenSecret`; used by the tests and
+/// available to any client this module grows later.
+pub fn encryptUserTokenSecret(
+    allocator: std.mem.Allocator,
+    secret: []const u8,
+    server_nonce: []const u8,
+    receiver_public_key: rsa.PublicKey,
+    random: std.Random,
+) UserTokenSecretError![]u8 {
+    const plain = try allocator.alloc(u8, 4 + secret.len + server_nonce.len);
+    defer {
+        std.crypto.secureZero(u8, plain);
+        allocator.free(plain);
+    }
+    const declared = std.math.cast(u32, secret.len + server_nonce.len) orelse return error.MessageTooLong;
+    std.mem.writeInt(u32, plain[0..4], declared, .little);
+    @memcpy(plain[4..][0..secret.len], secret);
+    @memcpy(plain[4 + secret.len ..], server_nonce);
+    return asymmetricEncrypt(allocator, plain, receiver_public_key, random) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.MessageTooLong, error.BufferTooSmall => error.MessageTooLong,
+    };
+}
+
+/// Decrypt an encrypted identity-token secret with this application's private
+/// key, check the length prefix and the trailing server nonce, and return the
+/// `allocator`-owned secret (the password). Every failure is a distinct
+/// typed error, never a partially-recovered password.
+pub fn decryptUserTokenSecret(
+    allocator: std.mem.Allocator,
+    ciphertext: []const u8,
+    private_key: rsa.SecretKey,
+    expected_server_nonce: []const u8,
+) UserTokenSecretError![]u8 {
+    const plain = asymmetricDecrypt(allocator, ciphertext, private_key) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.DecryptionError, error.BufferTooSmall => return error.DecryptionError,
+    };
+    defer {
+        std.crypto.secureZero(u8, plain);
+        allocator.free(plain);
+    }
+    if (plain.len < 4) return error.InvalidSecureMessage;
+    const declared = std.mem.readInt(u32, plain[0..4], .little);
+    // OAEP blocks recover exactly, so the declared length must land inside
+    // the recovered plaintext; a longer one means the wrong key/format.
+    if (declared > plain.len - 4) return error.InvalidSecureMessage;
+    if (declared < expected_server_nonce.len) return error.InvalidSecureMessage;
+    const secret_len = declared - expected_server_nonce.len;
+    const nonce = plain[4 + secret_len ..][0..expected_server_nonce.len];
+    if (!constantTimeEql(nonce, expected_server_nonce)) return error.NonceMismatch;
+    return allocator.dupe(u8, plain[4..][0..secret_len]);
 }
 
 // ── AsymmetricAlgorithmSecurityHeader (OPC 10000-6 §7.2) ─────────────────────
@@ -1178,4 +1499,335 @@ test "sealAsymmetricMessage -> openAsymmetricMessage round-trip (two key pairs)"
     }
     // Wrong sender certificate must fail the signature.
     try testing.expectError(error.SignatureVerificationFailed, openAsymmetricMessage(testing.allocator, wire[0..8], wire[8..], server.private_key, server.certificate_der));
+}
+
+test "deriveKeys KAT: P-SHA256 over two fixed 32-byte nonces (OPC 10000-6 §6.7.5)" {
+    // **Provenance.** The expected bytes below were produced by an
+    // *independent* implementation of the published construction: Python's
+    // `hmac`/`hashlib` running RFC 5246 §5's P_hash with SHA-256 and no TLS
+    // label, exactly as OPC 10000-6 §6.7.5 specifies, over the two nonces
+    // here. They are therefore self-derived rather than lifted from a
+    // published OPC UA vector (the OPC Foundation publishes no key-derivation
+    // KAT), but they are not this code checking itself:
+    //   * `pSha256` is independently anchored by the TLS-1.2 PRF/SHA-256
+    //     vector KAT above, an externally published test vector;
+    //   * the *layout* (which 32/32/16-byte slice is which key, and which
+    //     nonce is secret vs seed in each direction) is cross-checked by the
+    //     live interop in `server_interop.zig`: a real open62541/asyncua
+    //     client cannot exchange a single signed chunk with this server if
+    //     any one of the six outputs is wrong or swapped.
+    const client_nonce = [_]u8{
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+    };
+    const server_nonce = [_]u8{
+        0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae, 0xaf,
+        0xb0, 0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0xbb, 0xbc, 0xbd, 0xbe, 0xbf,
+    };
+    const keys = deriveKeys(&client_nonce, &server_nonce, .basic256sha256);
+
+    const cases = [_]struct { expected_hex: []const u8, got: []const u8 }{
+        .{ .expected_hex = "a70a99cc2ac5a962005d4ec1762c192a07390a85772b5bf5e2c96d9fc18406d2", .got = &keys.client_signing_key },
+        .{ .expected_hex = "5f99e138f539b8356b9b40d05411e856a7ff4bc5b416cf15f9600de1d8b652fa", .got = &keys.client_encrypting_key },
+        .{ .expected_hex = "2c23b363b407b3f737fcae16bacebc2f", .got = &keys.client_iv },
+        .{ .expected_hex = "49adaac108434c093e9175f2d07c7159ef60b69ea0159f874cba31f99c949ef2", .got = &keys.server_signing_key },
+        .{ .expected_hex = "574b5bd1027338064dd4be7f0956e1910b5cfd5a873ae212c30f8d191890cc45", .got = &keys.server_encrypting_key },
+        .{ .expected_hex = "0668bd6612fd9776cf39b099e064384b", .got = &keys.server_iv },
+    };
+    var buf: [32]u8 = undefined;
+    for (cases) |c| {
+        const expected = try std.fmt.hexToBytes(buf[0 .. c.expected_hex.len / 2], c.expected_hex);
+        try testing.expectEqualSlices(u8, expected, c.got);
+    }
+    // Direction asymmetry is the whole point: swapping the nonces must NOT
+    // reproduce the same table (it produces the mirror one).
+    const swapped = deriveKeys(&server_nonce, &client_nonce, .basic256sha256);
+    try testing.expectEqualSlices(u8, &keys.client_signing_key, &swapped.server_signing_key);
+    try testing.expectEqualSlices(u8, &keys.server_signing_key, &swapped.client_signing_key);
+}
+
+test "symmetricSealChunk: intermediate ('C') chunks are secured individually" {
+    const keys = deriveKeys("client-nonce-0123456789abcdefghi", "server-nonce-0123456789abcdefghi", .basic256sha256);
+    var body_buf: [64]u8 = undefined;
+    const body = testChunkBody(&body_buf, "chunk-payload");
+
+    for ([_]u8{ 'C', 'F' }) |chunk_byte| {
+        const wire = try symmetricSealChunk(testing.allocator, "MSG", chunk_byte, body, .sign_and_encrypt, keys, .server_to_client);
+        defer testing.allocator.free(wire);
+        try testing.expectEqual(chunk_byte, wire[3]);
+        const recovered = try symmetricDecryptAndVerify(testing.allocator, wire[0..8], wire[8..], .sign_and_encrypt, keys, .server_to_client);
+        defer testing.allocator.free(recovered);
+        try testing.expectEqualSlices(u8, body, recovered);
+
+        // The chunk byte is inside the signed range, so flipping it must
+        // break verification — an attacker cannot turn a final chunk into an
+        // intermediate one (or an abort) without the signing key.
+        var forged: [8]u8 = wire[0..8].*;
+        forged[3] = if (chunk_byte == 'C') 'F' else 'C';
+        try testing.expectError(
+            error.SignatureVerificationFailed,
+            symmetricDecryptAndVerify(testing.allocator, &forged, wire[8..], .sign_and_encrypt, keys, .server_to_client),
+        );
+    }
+}
+
+test "symmetric padding: every payload length across two AES-block boundaries round-trips" {
+    // Chunk padding under encryption is the classic place to be off by one:
+    // the padding is sized so that SequenceHeader + payload + PaddingSize
+    // byte + padding + signature fills whole 16-byte blocks, and the
+    // PaddingSize byte itself counts. Sweeping 0..47 crosses three block
+    // boundaries in the *payload*, so every residue of the modulus — and the
+    // "padding is exactly 0" case — is hit.
+    const keys = deriveKeys("client-nonce-0123456789abcdefghi", "server-nonce-0123456789abcdefghi", .basic256sha256);
+    var payload: [48]u8 = undefined;
+    for (&payload, 0..) |*b, i| b.* = @truncate(i);
+
+    var zero_padding_seen = false;
+    for (0..payload.len + 1) |n| {
+        var body_buf: [80]u8 = undefined;
+        const body = testChunkBody(&body_buf, payload[0..n]);
+        const wire = try symmetricSignAndEncrypt(testing.allocator, "MSG", body, .sign_and_encrypt, keys, .client_to_server);
+        defer testing.allocator.free(wire);
+
+        // The encrypted region (message offset 16 onwards) must be whole
+        // AES blocks, every time.
+        try testing.expectEqual(@as(usize, 0), (wire.len - 16) % 16);
+        try testing.expectEqual(wire.len, std.mem.readInt(u32, wire[4..8], .little));
+        // Total = header(8) + body + 1 PaddingSize byte + padding + MAC(32).
+        const pad = wire.len - 8 - body.len - 1 - 32;
+        try testing.expect(pad < 16);
+        if (pad == 0) zero_padding_seen = true;
+
+        const recovered = try symmetricDecryptAndVerify(testing.allocator, wire[0..8], wire[8..], .sign_and_encrypt, keys, .client_to_server);
+        defer testing.allocator.free(recovered);
+        try testing.expectEqualSlices(u8, body, recovered);
+    }
+    // The exactly-aligned case (no padding bytes at all beyond the
+    // PaddingSize byte) really is exercised, not just the padded ones.
+    try testing.expect(zero_padding_seen);
+}
+
+test "maxSymmetricPayload: the advertised budget always fits the buffer" {
+    for ([_]SecurityMode{ .sign, .sign_and_encrypt }) |mode| {
+        const keys = deriveKeys("client-nonce-0123456789abcdefghi", "server-nonce-0123456789abcdefghi", .basic256sha256);
+        const capacity: usize = 512;
+        const budget = maxSymmetricPayload(capacity, mode);
+        try testing.expect(budget > 0);
+
+        const payload = try testing.allocator.alloc(u8, budget);
+        defer testing.allocator.free(payload);
+        @memset(payload, 0xAB);
+        const body = try testing.allocator.alloc(u8, 16 + budget);
+        defer testing.allocator.free(body);
+        _ = testChunkBody(body, payload);
+
+        const wire = try symmetricSignAndEncrypt(testing.allocator, "MSG", body, mode, keys, .server_to_client);
+        defer testing.allocator.free(wire);
+        try testing.expect(wire.len <= capacity);
+    }
+    try testing.expectEqual(@as(usize, 0), maxSymmetricPayload(8, .sign_and_encrypt));
+}
+
+test "viewAsymmetricHeader: borrows the three plaintext fields, refuses truncation" {
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var e = encoding.Encoder.init(&w);
+    try w.writeInt(u32, 0, .little); // SecureChannelId
+    try encodeAsymmetricAlgorithmSecurityHeader(&e, .{
+        .security_policy_uri = SecurityPolicy.basic256sha256.uri(),
+        .sender_certificate = "peer-cert-der",
+        .receiver_certificate_thumbprint = "0123456789abcdefghij",
+    });
+    const header_end = w.buffered().len;
+    try w.writeAll("encrypted-region-bytes");
+    const body = w.buffered();
+
+    const view = viewAsymmetricHeader(body).?;
+    try testing.expectEqualStrings(SecurityPolicy.basic256sha256.uri(), view.security_policy_uri);
+    try testing.expectEqualStrings("peer-cert-der", view.sender_certificate.?);
+    try testing.expectEqualStrings("0123456789abcdefghij", view.receiver_certificate_thumbprint.?);
+    try testing.expectEqual(header_end, view.encrypted_region_offset);
+    // The fields really are borrowed, not copied.
+    try testing.expect(@intFromPtr(view.sender_certificate.?.ptr) >= @intFromPtr(body.ptr));
+
+    // SecurityMode=None's shape: null certificate + null thumbprint.
+    var none_buf: [128]u8 = undefined;
+    var nw: std.Io.Writer = .fixed(&none_buf);
+    var ne = encoding.Encoder.init(&nw);
+    try nw.writeInt(u32, 0, .little);
+    try encodeAsymmetricAlgorithmSecurityHeader(&ne, .{
+        .security_policy_uri = SecurityPolicy.none.uri(),
+        .sender_certificate = null,
+        .receiver_certificate_thumbprint = null,
+    });
+    const none_view = viewAsymmetricHeader(nw.buffered()).?;
+    try testing.expectEqualStrings(SecurityPolicy.none.uri(), none_view.security_policy_uri);
+    try testing.expect(none_view.sender_certificate == null);
+
+    // Truncation at every prefix must be `null`, never an out-of-bounds read.
+    for (0..body.len) |cut| {
+        if (cut >= header_end) continue;
+        try testing.expect(viewAsymmetricHeader(body[0..cut]) == null);
+    }
+    // A negative (non -1) length prefix is malformed, not "null".
+    var bad = try testing.allocator.dupe(u8, body);
+    defer testing.allocator.free(bad);
+    std.mem.writeInt(i32, bad[4..8], -7, .little);
+    try testing.expect(viewAsymmetricHeader(bad) == null);
+}
+
+test "user identity token secret: encrypt -> decrypt, replayed nonce and wrong key rejected" {
+    var prng = std.Random.DefaultCsprng.init([_]u8{0x21} ** 32);
+    const random = prng.random();
+    const server_kp = try rsa.generate(random, 512, 65537);
+    const other_kp = try rsa.generate(random, 512, 65537);
+
+    const server_nonce = "server-nonce-0123456789abcdefghi"; // 32 bytes
+    const password = "correct horse battery staple";
+
+    const blob = try encryptUserTokenSecret(testing.allocator, password, server_nonce, server_kp.public_key, random);
+    defer testing.allocator.free(blob);
+    // Whole RSA blocks, and nothing recognisable of the password in them.
+    try testing.expectEqual(@as(usize, 0), blob.len % 64);
+    try testing.expect(std.mem.indexOf(u8, blob, password) == null);
+
+    const recovered = try decryptUserTokenSecret(testing.allocator, blob, server_kp.secret_key, server_nonce);
+    defer testing.allocator.free(recovered);
+    try testing.expectEqualStrings(password, recovered);
+
+    // Replay into a different session (= a different server nonce) fails on
+    // the nonce, not on the padding — that is what makes the blob
+    // session-bound rather than a reusable bearer secret.
+    try testing.expectError(
+        error.NonceMismatch,
+        decryptUserTokenSecret(testing.allocator, blob, server_kp.secret_key, "server-nonce-DIFFERENT-0123456789"[0..32]),
+    );
+    // Encrypted to us, decrypted with somebody else's key.
+    try testing.expectError(
+        error.DecryptionError,
+        decryptUserTokenSecret(testing.allocator, blob, other_kp.secret_key, server_nonce),
+    );
+    // Structurally broken ciphertext.
+    try testing.expectError(
+        error.DecryptionError,
+        decryptUserTokenSecret(testing.allocator, blob[0 .. blob.len - 1], server_kp.secret_key, server_nonce),
+    );
+    // An empty password is legal and must round-trip (some servers allow it).
+    const empty = try encryptUserTokenSecret(testing.allocator, "", server_nonce, server_kp.public_key, random);
+    defer testing.allocator.free(empty);
+    const empty_back = try decryptUserTokenSecret(testing.allocator, empty, server_kp.secret_key, server_nonce);
+    defer testing.allocator.free(empty_back);
+    try testing.expectEqual(@as(usize, 0), empty_back.len);
+}
+
+test "certificateValidity: notBefore/notAfter come back out of a certificate we built" {
+    var prng = std.Random.DefaultCsprng.init([_]u8{0x33} ** 32);
+    var creds = try ClientCredentials.generateSelfSigned(testing.allocator, prng.random(), .{
+        .modulus_bits = 512,
+        .common_name = "validity-test",
+        .not_before = "260101000000Z", // 2026-01-01T00:00:00Z
+        .not_after = "270101000000Z", // 2027-01-01T00:00:00Z
+    });
+    defer creds.deinit(testing.allocator);
+
+    const v = try certificateValidity(creds.certificate_der);
+    try testing.expectEqual(@as(i64, 1_767_225_600), v.not_before_sec); // 2026-01-01
+    try testing.expectEqual(@as(i64, 1_798_761_600), v.not_after_sec); // 2027-01-01
+    try testing.expect(v.covers(1_767_225_600));
+    try testing.expect(v.covers(1_798_761_600));
+    try testing.expect(!v.covers(1_767_225_599));
+    try testing.expect(!v.covers(1_798_761_601));
+    try testing.expectError(error.InvalidCertificate, certificateValidity("not a certificate"));
+}
+
+test "constantTimeEql: agrees with mem.eql on every short case" {
+    try testing.expect(constantTimeEql("", ""));
+    try testing.expect(constantTimeEql("abc", "abc"));
+    try testing.expect(!constantTimeEql("abc", "abd"));
+    try testing.expect(!constantTimeEql("abc", "ab"));
+    var a: [64]u8 = undefined;
+    var b: [64]u8 = undefined;
+    for (&a, 0..) |*x, i| x.* = @truncate(i * 7);
+    b = a;
+    try testing.expect(constantTimeEql(&a, &b));
+    for (0..b.len) |i| {
+        b[i] ^= 0x80;
+        try testing.expect(!constantTimeEql(&a, &b));
+        b[i] ^= 0x80;
+    }
+}
+
+test "hostile certificates: truncation, tampering and garbage are typed errors, never panics" {
+    // `std.crypto.Certificate`'s DER reader is unchecked (`bytes[i]` with no
+    // bounds test, `end = start + declared_len` with no clamp), and on a
+    // server the certificate is entirely attacker-supplied — so the two
+    // parsing helpers must be *total*. This is the test that keeps them so.
+    var prng = std.Random.DefaultCsprng.init([_]u8{0x5A} ** 32);
+    var creds = try ClientCredentials.generateSelfSigned(testing.allocator, prng.random(), .{
+        .modulus_bits = 512,
+        .common_name = "hostile-cert-test",
+        .not_before = "260101000000Z",
+        .not_after = "270101000000Z",
+        .application_uri = "urn:zig-libs:opcua:hostile-test",
+    });
+    defer creds.deinit(testing.allocator);
+    // The genuine article still works — this test must not be vacuous.
+    _ = try certificatePublicKey(creds.certificate_der);
+    _ = try certificateValidity(creds.certificate_der);
+
+    // Every prefix (the classic "declared length outruns the buffer").
+    for (0..creds.certificate_der.len) |cut| {
+        try testing.expectError(error.InvalidCertificate, certificatePublicKey(creds.certificate_der[0..cut]));
+        try testing.expectError(error.InvalidCertificate, certificateValidity(creds.certificate_der[0..cut]));
+    }
+
+    // Every single-byte corruption: either it still parses (a byte inside a
+    // string or key) or it is a typed error. Never a crash.
+    const mutant = try testing.allocator.dupe(u8, creds.certificate_der);
+    defer testing.allocator.free(mutant);
+    for (0..mutant.len) |i| {
+        for ([_]u8{ 0x00, 0x01, 0x7f, 0x80, 0xff }) |v| {
+            const original = mutant[i];
+            mutant[i] = v;
+            if (certificatePublicKey(mutant)) |_| {} else |err| try testing.expectEqual(error.InvalidCertificate, err);
+            if (certificateValidity(mutant)) |_| {} else |err| try testing.expectEqual(error.InvalidCertificate, err);
+            mutant[i] = original;
+        }
+    }
+
+    // Hand-built hostile shapes.
+    const nasties = [_][]const u8{
+        "",
+        &.{0x30},
+        &.{ 0x30, 0x82 }, // long form, length bytes missing
+        &.{ 0x30, 0x84, 0xff, 0xff, 0xff, 0xff }, // 4 GB SEQUENCE
+        &.{ 0x30, 0x80, 0x00, 0x00 }, // BER indefinite length
+        &.{ 0x30, 0x02, 0x30, 0x00 }, // SEQUENCE { SEQUENCE {} } — no fields at all
+        &.{ 0x30, 0x03, 0x30, 0x01, 0x00 }, // child claims one byte it does not tile
+        "not a certificate",
+    };
+    for (nasties) |bytes| {
+        try testing.expectError(error.InvalidCertificate, certificatePublicKey(bytes));
+        try testing.expectError(error.InvalidCertificate, certificateValidity(bytes));
+    }
+
+    // Oversize input is refused by length, before any parsing.
+    const huge = try testing.allocator.alloc(u8, max_parsed_certificate_len + 1);
+    defer testing.allocator.free(huge);
+    @memset(huge, 0x30);
+    try testing.expectError(error.InvalidCertificate, certificatePublicKey(huge));
+}
+
+test "fuzz: arbitrary bytes through the certificate parsers" {
+    try std.testing.fuzz({}, struct {
+        fn run(_: void, smith: *std.testing.Smith) anyerror!void {
+            var buf: [1024]u8 = undefined;
+            smith.bytes(&buf);
+            const n: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+            if (certificatePublicKey(buf[0..n])) |_| {} else |_| {}
+            if (certificateValidity(buf[0..n])) |_| {} else |_| {}
+            // Chunk-shaped input into the header scanner, same contract.
+            _ = viewAsymmetricHeader(buf[0..n]);
+        }
+    }.run, .{});
 }
