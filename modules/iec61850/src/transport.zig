@@ -144,6 +144,11 @@ pub const TcpTransport = struct {
         return .{ .ctx = self, .vtable = &.{ .read = readFn, .write = writeFn } };
     }
 
+    // Pairing a Reader and a Writer on the same stream is safe: each keeps its
+    // own copy of the two-word `Stream` and its own buffer. The `Stream.Reader`
+    // "stops writes reaching the wire" hazard noted in
+    // `modules/bacnet/src/sc_interop.zig` does not reproduce — see the
+    // regression test at the end of this file, which pins it.
     fn ensure(self: *TcpTransport) void {
         if (self.reader == null) self.reader = self.stream.reader(self.io, &self.rbuf);
         if (self.writer == null) self.writer = self.stream.writer(self.io, &self.wbuf);
@@ -339,4 +344,156 @@ test "a frame larger than the receive buffer is an error, not a truncation" {
     a.deliver(&[_]u8{0xAA} ** 100);
     var small: [10]u8 = undefined;
     try testing.expectError(error.RecvFailed, a.link().recv(&small));
+}
+
+// ── regression: the paired Stream.Reader / Stream.Writer over a real socket ──
+//
+// `TcpTransport` pairs a `std.Io.net.Stream.Reader` and a
+// `std.Io.net.Stream.Writer` on the **same** stream (see `ensure`). A prior
+// report — see `modules/bacnet/src/sc_interop.zig` — claimed that creating a
+// `Stream.Reader` on a socket stops subsequent writes through the paired
+// `Stream.Writer` from reaching the wire under `std.Io.Threaded`. That claim
+// does **not** reproduce: reader and writer each hold their own copy of the
+// two-word `Stream` and their own buffer, neither touches the fd's flags, and
+// both `netRead`/`netWrite` are plain `readv`/`sendmsg`. The paired pattern is
+// sound.
+//
+// The genuine hazard in code like this is a **readiness/buffer mismatch**: a
+// buffered `Reader` can already hold a whole TPKT that a later `poll(2)` on the
+// raw fd will never report as readable, so a naive `read` that always polls
+// first would stall on coalesced frames. `readFn` guards against it with the
+// `r.bufferedLen() == 0` check before `waitReadable()`.
+//
+// This test pins both properties with **no env gate and no external peer**: an
+// in-process loopback socket, a write → read → write sequence, and a peer that
+// answers with two TPKTs coalesced into one segment so the guard is exercised.
+// Removing the `bufferedLen()` check in `readFn` makes the second `read` stall
+// and this test fail.
+
+const test_port_regression: u16 = 15684;
+
+const RegressionPeer = struct {
+    got_first: bool = false,
+    got_second: bool = false,
+    first_len: usize = 0,
+    second_len: usize = 0,
+};
+
+fn regressionSleepMs(ms: u64) void {
+    var req: std.posix.timespec = .{
+        .sec = @intCast(ms / 1000),
+        .nsec = @intCast((ms % 1000) * 1_000_000),
+    };
+    var rem: std.posix.timespec = undefined;
+    while (std.posix.errno(std.posix.system.nanosleep(&req, &rem)) == .INTR) req = rem;
+}
+
+fn regressionReadOnce(fd: std.posix.fd_t, buf: []u8, ms: i32) usize {
+    var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+    const ready = std.posix.poll(&fds, ms) catch return 0;
+    if (ready == 0) return 0;
+    return std.posix.read(fd, buf) catch 0;
+}
+
+/// The peer side: an *observer* of what reached the wire, using the raw
+/// descriptor rather than the code under test.
+fn regressionPeer(res: *RegressionPeer, ready: *std.atomic.Value(bool)) void {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const addr = std.Io.net.IpAddress.parse("127.0.0.1", test_port_regression) catch return;
+    var server = addr.listen(io, .{ .reuse_address = true }) catch return;
+    defer server.socket.close(io);
+    ready.store(true, .release);
+
+    const conn = server.accept(io) catch return;
+    defer conn.close(io);
+    const fd = conn.socket.handle;
+
+    var buf: [64]u8 = undefined;
+    res.first_len = regressionReadOnce(fd, &buf, 2000);
+    res.got_first = res.first_len == tpkt.header_len + 1;
+
+    // Two one-octet-payload TPKTs written in one syscall, so the transport's
+    // Reader over-reads the second into its own buffer — the coalesced case.
+    var a: [tpkt.header_len + 1]u8 = undefined;
+    var b: [tpkt.header_len + 1]u8 = undefined;
+    _ = tpkt.encode(&[_]u8{0xA1}, &a) catch return;
+    _ = tpkt.encode(&[_]u8{0xB2}, &b) catch return;
+    var reply: [2 * (tpkt.header_len + 1)]u8 = undefined;
+    @memcpy(reply[0..a.len], &a);
+    @memcpy(reply[a.len..], &b);
+    _ = std.posix.system.write(fd, &reply, reply.len);
+
+    res.second_len = regressionReadOnce(fd, &buf, 2000);
+    res.got_second = res.second_len == tpkt.header_len + 1;
+}
+
+test "TcpTransport delivers write->read->write over a real socket (no env gate)" {
+    var res = RegressionPeer{};
+    var ready = std.atomic.Value(bool).init(false);
+    const th = std.Thread.spawn(.{}, regressionPeer, .{ &res, &ready }) catch |e| {
+        std.debug.print("SKIPPED: cannot spawn thread ({t})\n", .{e});
+        return error.SkipZigTest;
+    };
+
+    var spin: usize = 0;
+    while (!ready.load(.acquire)) : (spin += 1) {
+        if (spin > 500) {
+            th.join();
+            return error.PeerNeverListened;
+        }
+        regressionSleepMs(2);
+    }
+
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", test_port_regression);
+
+    var tt: TcpTransport = undefined;
+    var tries: usize = 0;
+    while (true) : (tries += 1) {
+        tt = TcpTransport.connect(io, addr) catch |e| {
+            if (tries > 500) {
+                th.join();
+                return e;
+            }
+            regressionSleepMs(2);
+            continue;
+        };
+        break;
+    }
+    defer tt.close();
+    tt.setReadTimeout(200);
+    const t = tt.transport();
+
+    // Write #1 — before any read.
+    var f1: [tpkt.header_len + 1]u8 = undefined;
+    _ = try tpkt.encode(&[_]u8{0x11}, &f1);
+    try t.write(&f1);
+
+    // Read both coalesced replies; the second is served from the Reader's
+    // internal buffer, which the `bufferedLen()` guard makes possible.
+    var rbuf: [4096]u8 = undefined;
+    try testing.expectEqual(@as(usize, tpkt.header_len + 1), try regressionReadFrame(t, &rbuf));
+    try testing.expectEqual(@as(usize, tpkt.header_len + 1), try regressionReadFrame(t, &rbuf));
+
+    // Write #2 — after the reads.
+    var f2: [tpkt.header_len + 1]u8 = undefined;
+    _ = try tpkt.encode(&[_]u8{0x22}, &f2);
+    try t.write(&f2);
+
+    th.join();
+    try testing.expect(res.got_first);
+    try testing.expect(res.got_second);
+}
+
+fn regressionReadFrame(t: Transport, buf: []u8) !usize {
+    var tries: usize = 0;
+    while (tries < 30) : (tries += 1) {
+        const n = try t.read(buf);
+        if (n != 0) return n;
+    }
+    return error.ReadTimeout;
 }

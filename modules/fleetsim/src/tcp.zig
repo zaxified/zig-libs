@@ -144,6 +144,11 @@ pub fn serveTcpOn(
     const wbuf = try gpa.alloc(u8, opts.read_buf);
     defer gpa.free(wbuf);
 
+    // Pairing a Reader and a Writer on the same stream is safe: each keeps its
+    // own copy of the two-word `Stream` and its own buffer. The `Stream.Reader`
+    // "stops writes reaching the wire" hazard noted in
+    // `modules/bacnet/src/sc_interop.zig` does not reproduce — the regression
+    // test at the end of this file pins it.
     var reader = stream.reader(io, rbuf);
     var writer = stream.writer(io, wbuf);
     const r = &reader.interface;
@@ -375,6 +380,8 @@ pub fn serveTcpMulti(
                     .buf = block[base..][0..opts.read_buf],
                     .carry = 0,
                 };
+                // Paired Reader+Writer on one stream is safe; see the note in
+                // `serveTcpOn` and the regression test at the end of this file.
                 peers[slot].reader = stream.reader(io, block[base + opts.read_buf ..][0..opts.read_buf]);
                 peers[slot].writer = stream.writer(io, block[base + 2 * opts.read_buf ..][0..opts.read_buf]);
                 live += 1;
@@ -575,6 +582,7 @@ const modbus = @import("modbus");
 
 const test_port_a: u16 = 15571;
 const test_port_b: u16 = 15572;
+const test_port_single: u16 = 15573;
 
 const ClientResult = struct {
     port: u16,
@@ -730,4 +738,73 @@ test "serveTcpMulti: an unbindable address is a typed error, not a hang" {
         error.NoPeer,
         serveTcpMulti(gpa, io, &f, &.{}, .{ .run_ms = 100 }),
     );
+}
+
+// ── regression: the paired Stream.Reader / Stream.Writer over a real socket ──
+//
+// Both `serveTcpOn` and `serveTcpMulti` pair a `std.Io.net.Stream.Reader` and a
+// `std.Io.net.Stream.Writer` on the **same** stream. A prior report — see
+// `modules/bacnet/src/sc_interop.zig` — claimed that creating a `Stream.Reader`
+// stops subsequent writes through the paired `Stream.Writer` from reaching the
+// wire under `std.Io.Threaded`. That claim does **not** reproduce: reader and
+// writer each hold their own copy of the two-word `Stream` and their own
+// buffer, neither touches the fd's flags, and both `netRead`/`netWrite` are
+// plain `readv`/`sendmsg`. The paired pattern is sound.
+//
+// The `serveTcpMulti` test above already drives two paired reader/writers to
+// completion without an env gate. This one pins the single-peer `serveTcp` loop
+// the same way: a real master (a client thread) writes a request, the serve
+// loop reads it and writes the reply, four times over. It proves the serve
+// loop's write path reaches the client after its read path has consumed a
+// request — the exact write → read → write shape the report worried about.
+test "serveTcp: one master round-trips over a real socket (no env gate)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var f = try Fleet.init(gpa, .{ .seed = 9, .max_frame_len = 512, .outbox_bytes = 1 << 16 });
+    defer f.deinit();
+
+    const adapters = @import("adapters.zig");
+    var holdings = [_]u16{ 100, 200, 300, 400 };
+    var slave = adapters.Modbus.init(
+        .{ .unit_id = 1, .framing = .tcp },
+        .{ .holding_registers = .{ .base = 0, .values = &holdings } },
+    );
+    const node = try f.addNode(.{ .node = slave.node(), .tag = 1 });
+
+    var req: [12]u8 = undefined;
+    const request = try modbus.tcp.encodeAdu(&req, 0x0001, 1, &.{ 0x03, 0, 0, 0, 4 });
+
+    var hold: std.atomic.Value(bool) = .init(true);
+    var c = ClientResult{ .port = test_port_single, .request = request, .rounds = 4, .hold = &hold };
+    const th = try std.Thread.spawn(.{}, testClient, .{&c});
+
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", test_port_single);
+    const report = serveTcp(gpa, io, &f, node, addr, .{
+        .idle_ms = 20,
+        .run_ms = 4000,
+        .max_frames = 4,
+    }) catch |e| {
+        hold.store(false, .release);
+        th.join();
+        switch (e) {
+            error.BindFailed, error.NoPeer => {
+                std.debug.print("SKIPPED: serveTcp (cannot bind 127.0.0.1:{d})\n", .{test_port_single});
+                return error.SkipZigTest;
+            },
+            else => return e,
+        }
+    };
+    hold.store(false, .release);
+    th.join();
+
+    // The master connected, all four requests were read, and all four replies
+    // were written back and received — write → read → write, four times.
+    try testing.expect(report.connected);
+    try testing.expectEqual(@as(usize, 4), c.replies);
+    try testing.expect(report.frames_out >= 4);
+    try testing.expect(report.bytes_in > 0);
+    try testing.expect(f.stats(node).replied >= 4);
 }

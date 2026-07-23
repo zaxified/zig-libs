@@ -104,6 +104,11 @@ pub const TcpTransport = struct {
         return .{ .ctx = self, .vtable = &.{ .read = readFn, .write = writeFn } };
     }
 
+    // Pairing a Reader and a Writer on the same stream is safe: each keeps its
+    // own copy of the two-word `Stream` and its own buffer. The `Stream.Reader`
+    // "stops writes reaching the wire" hazard noted in
+    // `modules/bacnet/src/sc_interop.zig` does not reproduce — see the
+    // regression test at the end of this file, which pins it.
     fn ensure(self: *TcpTransport) void {
         if (self.reader == null) self.reader = self.stream.reader(self.io, &self.rbuf);
         if (self.writer == null) self.writer = self.stream.writer(self.io, &self.wbuf);
@@ -186,3 +191,162 @@ pub const LoopTransport = struct {
         self.to_peer_len += bytes.len;
     }
 };
+
+// ── regression: the paired Stream.Reader / Stream.Writer over a real socket ──
+//
+// `TcpTransport` pairs a `std.Io.net.Stream.Reader` and a
+// `std.Io.net.Stream.Writer` on the **same** stream (see `ensure`). A prior
+// report — see `modules/bacnet/src/sc_interop.zig` — claimed that merely
+// creating a `Stream.Reader` on a socket stops subsequent writes through the
+// paired `Stream.Writer` from reaching the wire under `std.Io.Threaded`. That
+// claim does **not** reproduce: reader and writer each hold their own copy of
+// the two-word `Stream` and their own buffer; neither touches the fd's flags,
+// and both `netRead`/`netWrite` are plain `readv`/`sendmsg`. The paired pattern
+// is sound.
+//
+// The real hazard in code shaped like this is a **readiness/buffer mismatch**:
+// a buffered `Reader` can already hold a whole APDU that a later `poll(2)` on
+// the raw fd will never report as readable — so a naive `read` that always
+// polls before reading would stall on coalesced frames. `readFn` guards against
+// exactly this with the `r.bufferedLen() == 0` check before `waitReadable()`.
+//
+// This test pins both properties with **no env gate and no external peer**: an
+// in-process loopback socket, a write → read → write sequence, and a peer that
+// answers with two APDUs coalesced into one segment so the guard is exercised.
+// Removing the `bufferedLen()` check in `readFn` makes the second `read` stall
+// and this test fail — which is what gives it teeth.
+
+const testing = std.testing;
+
+const test_port_regression: u16 = 15683;
+
+const RegressionPeer = struct {
+    got_first: bool = false,
+    got_second: bool = false,
+    first_len: usize = 0,
+    second_len: usize = 0,
+};
+
+fn regressionSleepMs(ms: u64) void {
+    var req: std.posix.timespec = .{
+        .sec = @intCast(ms / 1000),
+        .nsec = @intCast((ms % 1000) * 1_000_000),
+    };
+    var rem: std.posix.timespec = undefined;
+    while (std.posix.errno(std.posix.system.nanosleep(&req, &rem)) == .INTR) req = rem;
+}
+
+/// Reads once, waiting up to `ms`, and returns the byte count (0 on timeout).
+fn regressionReadOnce(fd: std.posix.fd_t, buf: []u8, ms: i32) usize {
+    var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+    const ready = std.posix.poll(&fds, ms) catch return 0;
+    if (ready == 0) return 0;
+    return std.posix.read(fd, buf) catch 0;
+}
+
+/// The peer side: listen, accept, observe the transport's first write, answer
+/// with two coalesced APDUs, then observe the transport's second write. It uses
+/// the raw descriptor deliberately — it is an *observer* of what reached the
+/// wire, not the code under test.
+fn regressionPeer(res: *RegressionPeer, ready: *std.atomic.Value(bool)) void {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const addr = std.Io.net.IpAddress.parse("127.0.0.1", test_port_regression) catch return;
+    var server = addr.listen(io, .{ .reuse_address = true }) catch return;
+    defer server.socket.close(io);
+    ready.store(true, .release);
+
+    const conn = server.accept(io) catch return;
+    defer conn.close(io);
+    const fd = conn.socket.handle;
+
+    var buf: [64]u8 = undefined;
+    res.first_len = regressionReadOnce(fd, &buf, 2000);
+    res.got_first = res.first_len == apci.apci_len;
+
+    // Two U-format APDUs written in one syscall, so the transport's Reader
+    // over-reads the second into its own buffer — the coalesced case.
+    const a = apci.encodeU(.testfr_con);
+    const b = apci.encodeU(.startdt_con);
+    var reply: [2 * apci.apci_len]u8 = undefined;
+    @memcpy(reply[0..apci.apci_len], &a);
+    @memcpy(reply[apci.apci_len..], &b);
+    _ = std.posix.system.write(fd, &reply, reply.len);
+
+    res.second_len = regressionReadOnce(fd, &buf, 2000);
+    res.got_second = res.second_len == apci.apci_len;
+}
+
+test "TcpTransport delivers write->read->write over a real socket (no env gate)" {
+    var res = RegressionPeer{};
+    var ready = std.atomic.Value(bool).init(false);
+    const th = std.Thread.spawn(.{}, regressionPeer, .{ &res, &ready }) catch |e| {
+        std.debug.print("SKIPPED: cannot spawn thread ({t})\n", .{e});
+        return error.SkipZigTest;
+    };
+
+    // Wait for the peer to be listening before dialling in.
+    var spin: usize = 0;
+    while (!ready.load(.acquire)) : (spin += 1) {
+        if (spin > 500) {
+            th.join();
+            return error.PeerNeverListened;
+        }
+        regressionSleepMs(2);
+    }
+
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", test_port_regression);
+
+    var tt: TcpTransport = undefined;
+    var tries: usize = 0;
+    while (true) : (tries += 1) {
+        tt = TcpTransport.connect(io, addr) catch |e| {
+            if (tries > 500) {
+                th.join();
+                return e;
+            }
+            regressionSleepMs(2);
+            continue;
+        };
+        break;
+    }
+    defer tt.close();
+    try tt.setReadTimeout(200);
+    const t = tt.transport();
+
+    // Write #1 — issued *before* any read, the write the bug report agreed
+    // does reach the wire.
+    const f1 = apci.encodeU(.startdt_act);
+    try t.write(&f1);
+
+    // Read both coalesced replies back through the real adapter. The second
+    // one is served from the Reader's internal buffer, not the socket — the
+    // `bufferedLen()` guard is what keeps it from stalling.
+    var rbuf: [apci.max_apdu_len]u8 = undefined;
+    try testing.expectEqual(apci.apci_len, try regressionReadFrame(t, &rbuf));
+    try testing.expectEqual(apci.apci_len, try regressionReadFrame(t, &rbuf));
+
+    // Write #2 — issued *after* the reads, the write the report claimed never
+    // reaches the wire.
+    const f2 = apci.encodeU(.stopdt_act);
+    try t.write(&f2);
+
+    th.join();
+    try testing.expect(res.got_first); // write #1 reached the peer
+    try testing.expect(res.got_second); // write #2 reached the peer, post-read
+}
+
+/// Polls the adapter until it yields one frame, so a slow peer does not turn a
+/// single-shot 0 into a false failure.
+fn regressionReadFrame(t: Transport, buf: []u8) !usize {
+    var tries: usize = 0;
+    while (tries < 30) : (tries += 1) {
+        const n = try t.read(buf);
+        if (n != 0) return n;
+    }
+    return error.ReadTimeout;
+}

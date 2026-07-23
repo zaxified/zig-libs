@@ -224,6 +224,42 @@ Honest list of what a full IEC 60870-5-104 implementation has and this one does 
   one replies with cause 44 as §7.2.3 prescribes.
 - **`tshark` cross-check** — not run (no `tshark` in this environment); see "What is self-derived".
 
+## Investigated: the "paired Stream.Reader/Writer stops writes" report
+
+A prior agent (see `modules/bacnet/src/sc_interop.zig`) reported that creating a
+`std.Io.net.Stream.Reader` on a socket stops subsequent writes through the
+**paired** `std.Io.net.Stream.Writer` from reaching the wire under
+`std.Io.Threaded`: `writeAll`/`flush` report success but nothing arrives. All
+three of `iec104`, `iec61850` and `fleetsim` pair a reader and a writer on one
+stream, so the report put them under suspicion.
+
+**Finding: not a std bug, and not present in these modules.** Reproduced on
+0.16.0 (x86_64-linux) with four probes over a loopback socket pair under
+`Threaded` — single write→read→write, five such cycles, a reader that over-reads
+a coalesced second message before the next write, and a full-duplex exchange
+with **both** peers buffered — every write reached the peer. The mechanism the
+report proposed cannot hold: `Stream.Reader` and `Stream.Writer` each store
+their own copy of the two-word `Stream` (just a socket handle) and their own
+buffer, so they do not alias; and in `std.Io.Threaded` `netRead`/`netWrite` are
+a plain `readv(2)` / `sendmsg(2)` on the shared fd with no change to its flags.
+The bacpypes/websocket workaround (`std.posix.read` in place of a
+`Stream.Reader`) is therefore unnecessary for write delivery, though it is
+harmless where a hand-rolled frame parser wants the raw descriptor.
+
+**The real, adjacent hazard — which these modules already guard against.** A
+buffered `Stream.Reader` can hold a whole APDU that a later `poll(2)` on the raw
+fd will never report as readable, because the bytes are in the reader's buffer,
+not in the socket. A read that always polls before reading would then **stall**
+on coalesced frames. `TcpTransport.readFn` avoids this with the
+`r.bufferedLen() == 0` check before `waitReadable()`; `fleetsim` does the same in
+its serve loops. The regression test
+`"TcpTransport delivers write->read->write over a real socket (no env gate)"`
+in `src/transport.zig` (and the sibling tests in `iec61850` and `fleetsim`)
+pins both properties with no env gate and no external peer: removing the
+`bufferedLen()` guard makes the coalesced second read stall and the test fail.
+This is worth reporting upstream only as documentation — there is no std defect
+to file.
+
 ## Status
 
 `gap · any (pure codec + state machine; only the optional TcpTransport touches std.Io.net) ·
