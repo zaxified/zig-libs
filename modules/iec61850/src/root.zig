@@ -12,6 +12,14 @@
 //!   **presentation context definition list**) → `acse` (AARQ/AARE) → `mms`.
 //!   On top: the `Data` type, the ACSI object-reference syntax in both its
 //!   forms, reporting control blocks, and a client and a server.
+//! * **The control model (IEC 61850-7-2 §20).** All four `ctlModel`s,
+//!   `Oper`/`SBO`/`SBOw`/`Cancel`, `AddCause`, `LastApplError` and the
+//!   `CommandTermination` that arrives *after* the write response — plus a pure,
+//!   time-injected state machine on each side.
+//! * **SCL (IEC 61850-6).** The configuration language, parsed with the `xml`
+//!   sibling, and — the real deliverable — a resolver that walks
+//!   `LN → LNodeType → DOType → DAType` and produces the flat list of MMS names
+//!   the wire uses.
 //! * **GOOSE (the fast half).** The Ethernet frame with its optional 802.1Q
 //!   tag, the BER PDU, and — the part worth the trouble — the **retransmission
 //!   state machines**: a publisher that walks a backoff ladder after a state
@@ -46,8 +54,9 @@ pub const meta = .{
     // Publisher/Subscriber owns one control block's counters. Nothing shared,
     // no clock, no thread — those are the caller's.
     .concurrency = .single_owner,
-    .model_after = "ISO 9506 (MMS) as profiled by IEC 61850-8-1, over ISO 8073/8327/8823/8650; wire behaviour cross-checked against captured traffic between two independent third-party stacks and against the Wireshark mms/goose dissectors (see SPEC.md)",
-    .deps = .{},
+    .model_after = "ISO 9506 (MMS) as profiled by IEC 61850-8-1, over ISO 8073/8327/8823/8650, plus the IEC 61850-7-2 control model and IEC 61850-6 SCL; wire behaviour cross-checked against captured traffic between two independent third-party stacks, against the Wireshark mms/goose dissectors, and — for SCL — against the GetNameList of the IEDs the parsed files configure (see SPEC.md)",
+    // `xml` is used by `scl` alone; every other file here is std-only.
+    .deps = .{"xml"},
 };
 
 // ── layers ──────────────────────────────────────────────────────────────────
@@ -72,6 +81,12 @@ pub const mms = @import("mms.zig");
 pub const acsi = @import("acsi.zig");
 /// Report control blocks and the reports they emit.
 pub const report = @import("report.zig");
+/// The control model: `Oper`/`SBO`/`SBOw`/`Cancel`, `AddCause`,
+/// `LastApplError` and the select-before-operate state machines.
+pub const control = @import("control.zig");
+/// SCL (IEC 61850-6): the substation configuration language, and the type
+/// resolution that turns it into the object model the MMS layer addresses.
+pub const scl = @import("scl.zig");
 /// GOOSE frames and PDUs.
 pub const goose = @import("goose.zig");
 /// The GOOSE publisher state machine.
@@ -88,6 +103,8 @@ pub const client = @import("client.zig");
 pub const server = @import("server.zig");
 /// Byte-exact frames captured from third-party traffic.
 pub const goldens = @import("goldens.zig");
+/// Byte-exact **control-model** frames captured from real traffic.
+pub const controlgoldens = @import("controlgoldens.zig");
 
 // ── top-level names (the ones a consumer actually types) ────────────────────
 
@@ -100,6 +117,7 @@ pub const ServerConfig = server.Config;
 pub const Model = server.Model;
 pub const Variable = server.Variable;
 pub const DataSet = server.DataSet;
+pub const ServerControlPoint = server.ControlPoint;
 
 pub const Publisher = publisher.Publisher;
 pub const PublisherConfig = publisher.Config;
@@ -134,6 +152,20 @@ pub const Report = report.Report;
 pub const OptFlds = report.OptFlds;
 pub const TrgOps = report.TrgOps;
 
+pub const ControlMachine = control.Machine;
+pub const ControlPoint = control.Point;
+pub const ControlCommand = control.Command;
+pub const CtlModel = control.CtlModel;
+pub const AddCause = control.AddCause;
+pub const LastApplError = control.LastApplError;
+pub const ControlNotification = control.Notification;
+pub const ControlHandler = client.ControlHandler;
+
+pub const Scl = scl.Scl;
+pub const SclModel = scl.Model;
+pub const parseScl = scl.parse;
+pub const resolveScl = scl.resolve;
+
 pub const GooseFrame = goose.Frame;
 pub const GoosePdu = goose.Pdu;
 pub const Vlan = goose.Vlan;
@@ -155,6 +187,8 @@ test {
     _ = mms;
     _ = acsi;
     _ = report;
+    _ = control;
+    _ = scl;
     _ = goose;
     _ = publisher;
     _ = subscriber;
@@ -163,14 +197,19 @@ test {
     _ = client;
     _ = server;
     _ = goldens;
+    _ = controlgoldens;
 }
 
 // ── tests: the whole stack, client against server ──────────────────────────
 
 const testing = std.testing;
 
-test "meta names no sibling dependencies" {
-    try testing.expectEqual(@as(usize, 0), meta.deps.len);
+test "meta.deps names the one module this one is built on" {
+    // SCL is XML, and the sibling `xml` module is a hardened, C14N-grade parser
+    // built for XML-DSig. Writing a second one here would be a worse parser and
+    // a second attack surface.
+    try testing.expectEqual(@as(usize, 1), meta.deps.len);
+    try testing.expectEqualStrings("xml", meta.deps[0]);
 }
 
 test "the MMS and GOOSE halves share one BER codec" {
@@ -219,6 +258,106 @@ test "an ACSI reference survives a whole client-side round trip" {
     var out: [128]u8 = undefined;
     try testing.expectEqualStrings("simpleIOGenericIO/GGIO1.AnIn1.mag.f", try back.toAcsi(&out));
     try testing.expectEqual(FunctionalConstraint.MX, back.fc.?);
+}
+
+test "a GOOSE subscriber configured from SCL accepts the publisher SCL describes" {
+    // The cross-check the whole SCL layer exists for: the configuration file
+    // says what the publisher will send, and the GOOSE decoder must agree.
+    // Nothing here is hand-wired — every string comes out of the document.
+    var doc = try scl.parse(testing.allocator, scl.sample, .{});
+    defer doc.deinit();
+    var model = try scl.resolve(&doc, testing.allocator, "TESTIED");
+    defer model.deinit();
+
+    const ied = doc.ied("TESTIED").?;
+    const ld = ied.access_points[0].devices[0];
+    const ln0 = ld.lns[0];
+    const gcb = ln0.gse_controls[0];
+
+    var domain_buf: [64]u8 = undefined;
+    const domain = try ld.domain(ied.name, &domain_buf);
+    var ln_buf: [64]u8 = undefined;
+    const ln_name = try ln0.mmsName(&ln_buf);
+
+    var gocb_buf: [128]u8 = undefined;
+    const gocb_ref = try scl.controlBlockRef(domain, ln_name, .GO, gcb.name, &gocb_buf);
+    try testing.expectEqualStrings("TESTIEDGenericIO/LLN0$GO$gcbEvents", gocb_ref);
+    // The control block really is in the resolved name space.
+    var item_buf: [128]u8 = undefined;
+    try testing.expect(model.has(domain, try std.fmt.bufPrint(&item_buf, "{s}$GO${s}", .{ ln_name, gcb.name })));
+
+    // The data set it publishes, and the members it will carry.
+    var ds: ?scl.DataSet = null;
+    for (ln0.data_sets) |d| {
+        if (std.mem.eql(u8, d.name, gcb.dat_set)) ds = d;
+    }
+    var ds_buf: [128]u8 = undefined;
+    const dat_set = try scl.dataSetRef(domain, ln_name, ds.?.name, &ds_buf);
+    try testing.expectEqualStrings("TESTIEDGenericIO/LLN0$Events", dat_set);
+
+    // Every FCDA must name something the resolver produced, or the publisher
+    // will send values for objects the subscriber cannot map.
+    for (ds.?.fcdas) |f| {
+        var fbuf: [128]u8 = undefined;
+        try testing.expect(model.has(domain, try f.mmsItem(&fbuf)));
+    }
+
+    // The layer-2 parameters come from `Communication`, not from the control
+    // block, and the frame is built with exactly those.
+    const addr = doc.cbAddress(ied.name, ld.inst, gcb.name).?;
+    var values: [8]u8 = undefined;
+    var vw = ber.Writer.init(&values);
+    try Emit.boolean(&vw, true);
+
+    const pdu = GoosePdu{
+        .gocb_ref = gocb_ref,
+        .time_allowed_to_live_ms = addr.max_time_ms.? * 2,
+        .dat_set = dat_set,
+        .go_id = gcb.app_id,
+        .t = UtcTime.fromMillis(1_700_000_000_000, 10),
+        .st_num = 1,
+        .sq_num = 0,
+        .test_mode = false,
+        .conf_rev = gcb.conf_rev,
+        .nds_com = false,
+        .num_dat_set_entries = @intCast(ds.?.fcdas.len),
+        .all_data = &.{},
+    };
+    var pdu_buf: [512]u8 = undefined;
+    const encoded = try pdu.encode(&[_][]const u8{vw.done()}, &pdu_buf);
+
+    var frame_buf: [512]u8 = undefined;
+    const template = GooseFrame{
+        .dst = .{ 0x01, 0x0C, 0xCD, 0x01, 0x00, 0x01 },
+        .src = .{ 0x02, 0x00, 0x00, 0x00, 0x00, 0x01 },
+        .vlan = .{ .id = addr.address.vlanId().?, .priority = addr.address.vlanPriority().? },
+        .appid = addr.address.appId().?,
+        .pdu = encoded,
+        .total_len = 0,
+    };
+    const frame = try template.encode(encoded, &frame_buf);
+
+    // And the decoder agrees, field for field, with what the file said.
+    const decoded_frame = try GooseFrame.decode(frame);
+    try testing.expectEqual(@as(u16, 1000), decoded_frame.appid);
+    try testing.expectEqual(@as(u12, 100), decoded_frame.vlan.?.id);
+    const decoded = try GoosePdu.decode(decoded_frame.pdu);
+    try testing.expectEqualStrings(gocb_ref, decoded.gocb_ref);
+    try testing.expectEqualStrings(dat_set, decoded.dat_set);
+    try testing.expectEqual(gcb.conf_rev, decoded.conf_rev);
+    try testing.expectEqual(@as(u32, @intCast(ds.?.fcdas.len)), decoded.num_dat_set_entries);
+
+    // A subscriber configured straight from the file binds to it.
+    var sub = Subscriber.init(.{ .gocb_ref = gocb_ref, .expected_conf_rev = gcb.conf_rev });
+    try testing.expect(sub.matches(decoded));
+    const ev = sub.onFrame(decoded, 0);
+    try testing.expect(!ev.has(.conf_rev_mismatch));
+    try testing.expect(sub.dataUsable());
+
+    // …and one configured from a *stale* copy of the file does not, which is
+    // the failure `confRev` exists to catch.
+    var stale = Subscriber.init(.{ .gocb_ref = gocb_ref, .expected_conf_rev = gcb.conf_rev - 1 });
+    try testing.expect(stale.onFrame(decoded, 0).has(.conf_rev_mismatch));
 }
 
 // ── live interop ────────────────────────────────────────────────────────────
@@ -359,6 +498,399 @@ test "live: our client against a real IEC 61850 server" {
         .{ ld_count, var_count, ds_count, mag_value, write_ok, readback_ok, ds_values, rcb_ok, live_reports, live_report_entries, vendor },
     );
     try testing.expect(ld_count > 0 and var_count > 50);
+}
+
+var live_notifications: usize = 0;
+var live_last_kind: ?control.NotificationKind = null;
+var live_last_cause: ?control.AddCause = null;
+
+fn onLiveNotification(_: *anyopaque, n: control.Notification) void {
+    live_notifications += 1;
+    live_last_kind = n.kind;
+    live_last_cause = n.addCause();
+}
+
+// Set IEC61850_TEST_CONTROL=host:port to drive the **control model** against a
+// live IEC 61850 server that has controllable objects (the reference stack's
+// control example serves `SPCSO1`..`SPCSO9` with one ctlModel each).
+// IEC61850_TEST_CONTROL_LD names the logical device.
+test "live: our client operating a real IED through every control model" {
+    const endpoint = envVar("IEC61850_TEST_CONTROL") orelse {
+        std.debug.print("SKIPPED: live IEC 61850 control (set IEC61850_TEST_CONTROL=host:port)\n", .{});
+        return error.SkipZigTest;
+    };
+    const ep = splitEndpoint(endpoint) orelse return error.SkipZigTest;
+    const ld = envVar("IEC61850_TEST_CONTROL_LD") orelse "simpleIOGenericIO";
+
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = std.Io.net.IpAddress.parse(ep.host, ep.port) catch return error.SkipZigTest;
+    var tt = TcpTransport.connect(io, addr) catch {
+        std.debug.print("SKIPPED: live IEC 61850 control (cannot connect to {s})\n", .{endpoint});
+        return error.SkipZigTest;
+    };
+    defer tt.close();
+    tt.setReadTimeout(3000);
+
+    var buf: [131072]u8 = undefined;
+    var c = try Client.init(tt.transport(), &buf, .{});
+    try c.connect();
+    defer c.disconnect();
+
+    var dummy: u8 = 0;
+    c.setControlHandler(.{ .ctx = &dummy, .on_notification = onLiveNotification });
+    live_notifications = 0;
+
+    var value: [8]u8 = undefined;
+    var vw = ber.Writer.init(&value);
+    try Emit.boolean(&vw, true);
+    const on = vw.done();
+
+    // The four objects the reference control model advertises, one per
+    // ctlModel. Each is driven through the whole state machine, and the
+    // resulting `stVal` is read back over MMS — so the assertion is that the
+    // *IED* moved, not that our write returned.
+    const objects = [_][]const u8{ "SPCSO1", "SPCSO2", "SPCSO3", "SPCSO4" };
+    var operated: usize = 0;
+    var models: [4]control.CtlModel = undefined;
+    var terminations: usize = 0;
+    for (objects, 0..) |obj, i| {
+        var ref_buf: [128]u8 = undefined;
+        const ref = try std.fmt.bufPrint(&ref_buf, "{s}/GGIO1.{s}", .{ ld, obj });
+        models[i] = try c.readCtlModel(ref);
+        const sbo_timeout = (try c.readSboTimeout(ref)) orelse 2000;
+
+        var m = control.Machine.init(models[i], sbo_timeout);
+        const before = live_notifications;
+        c.executeControl(&m, ref, .{
+            .ctl_val = on,
+            .origin = .{ .or_cat = .station_control, .or_ident = "zig-libs" },
+            .t = UtcTime.fromMillis(1_700_000_000_000, 10),
+        }, 0) catch |e| {
+            std.debug.print("live control: {s} model={s} failed: {t} add_cause={?s}\n", .{
+                obj,
+                @tagName(models[i]),
+                e,
+                if (m.failure) |f| (if (f.add_cause) |a| a.name() else null) else null,
+            });
+            continue;
+        };
+        if (m.state != .succeeded) continue;
+        operated += 1;
+        if (models[i].isEnhanced() and live_notifications > before) terminations += 1;
+
+        // And the status point really moved.
+        var st_buf: [128]u8 = undefined;
+        const st = try std.fmt.bufPrint(&st_buf, "{s}/GGIO1.{s}.stVal", .{ ld, obj });
+        try testing.expect(try (try c.readObject(st, .ST)).boolean());
+    }
+
+    // The failure path: operate a select-before-operate object without
+    // selecting it. A real IED answers with a `LastApplError` naming
+    // `Object-not-selected`, which is the field this module exists to surface.
+    var bad_buf: [128]u8 = undefined;
+    const bad_ref = try std.fmt.bufPrint(&bad_buf, "{s}/GGIO1.SPCSO4", .{ld});
+    var refused_cause: ?control.AddCause = null;
+    live_last_cause = null;
+    c.operateObject(bad_ref, .{
+        .ctl_val = on,
+        .ctl_num = 200,
+        .origin = .{ .or_cat = .station_control, .or_ident = "zig-libs" },
+        .t = UtcTime.fromMillis(1_700_000_000_000, 10),
+    }) catch {
+        refused_cause = c.lastAddCause();
+    };
+
+    std.debug.print(
+        "live IEC 61850 control: models={s}/{s}/{s}/{s} operated={d} terminations={d} " ++
+            "notifications={d} unselected_operate_add_cause={?s}\n",
+        .{
+            @tagName(models[0]), @tagName(models[1]), @tagName(models[2]), @tagName(models[3]),
+            operated,            terminations,        live_notifications,  if (refused_cause) |r| r.name() else null,
+        },
+    );
+    try testing.expectEqual(@as(usize, 4), operated);
+    // Both enhanced-security objects owed a CommandTermination and sent one.
+    try testing.expect(terminations >= 2);
+    try testing.expect(refused_cause != null);
+}
+
+// The SCL round trip that matters: parse the **same configuration file** a real
+// IED was built from, resolve its type graph, and compare the resulting MMS
+// names against what that IED reports over the wire.
+//
+//   IEC61850_TEST_SCL_FILE=<path to .icd/.cid>
+//   IEC61850_TEST_SCL_SERVER=host:port
+//   IEC61850_TEST_SCL_IED=<IED name>   (default: the file's only IED)
+test "live: an SCL file resolves to exactly the names the IED it configures serves" {
+    const path = envVar("IEC61850_TEST_SCL_FILE") orelse {
+        std.debug.print("SKIPPED: live SCL round trip (set IEC61850_TEST_SCL_FILE=<path>)\n", .{});
+        return error.SkipZigTest;
+    };
+    const endpoint = envVar("IEC61850_TEST_SCL_SERVER") orelse {
+        std.debug.print("SKIPPED: live SCL round trip (set IEC61850_TEST_SCL_SERVER=host:port)\n", .{});
+        return error.SkipZigTest;
+    };
+    const ep = splitEndpoint(endpoint) orelse return error.SkipZigTest;
+
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const source = try std.Io.Dir.cwd().readFileAlloc(io, path, testing.allocator, .limited(1 << 22));
+    defer testing.allocator.free(source);
+
+    // IEC 61850-8-1 spells the BRCB timestamp `TimeOfEntry`; a widely deployed
+    // stack spells it `TimeofEntry`. `IEC61850_TEST_SCL_TIMEOFENTRY` supplies
+    // the spelling the IED under test uses, which is why the resolver takes the
+    // BRCB attribute list as an option rather than hard-coding one.
+    var brcb: [scl.default_brcb_attributes.len][]const u8 = undefined;
+    for (scl.default_brcb_attributes, 0..) |a, i| {
+        brcb[i] = if (std.mem.eql(u8, a, "TimeOfEntry"))
+            (envVar("IEC61850_TEST_SCL_TIMEOFENTRY") orelse a)
+        else
+            a;
+    }
+    // Likewise `ResvTms`: edition 2's optional SGCB reservation attribute.
+    var sgcb: [scl.default_sgcb_attributes.len + 1][]const u8 = undefined;
+    for (scl.default_sgcb_attributes, 0..) |a, i| sgcb[i] = a;
+    sgcb[scl.default_sgcb_attributes.len] = "ResvTms";
+    const sgcb_len: usize = if (envVar("IEC61850_TEST_SCL_RESVTMS") != null)
+        sgcb.len
+    else
+        scl.default_sgcb_attributes.len;
+
+    var doc = try scl.parse(testing.allocator, source, .{
+        .allow_unknown_btype = true,
+        .brcb_attributes = &brcb,
+        .sgcb_attributes = sgcb[0..sgcb_len],
+    });
+    defer doc.deinit();
+    const ied_name = envVar("IEC61850_TEST_SCL_IED") orelse doc.ieds[0].name;
+    var model = try scl.resolve(&doc, testing.allocator, ied_name);
+    defer model.deinit();
+
+    // The live IED.
+    const addr = std.Io.net.IpAddress.parse(ep.host, ep.port) catch return error.SkipZigTest;
+    var tt = TcpTransport.connect(io, addr) catch {
+        std.debug.print("SKIPPED: live SCL round trip (cannot connect to {s})\n", .{endpoint});
+        return error.SkipZigTest;
+    };
+    defer tt.close();
+    tt.setReadTimeout(3000);
+    var buf: [262144]u8 = undefined;
+    var c = try Client.init(tt.transport(), &buf, .{});
+    try c.connect();
+    defer c.disconnect();
+
+    var domain_slices: [64][]const u8 = undefined;
+    const domain_count = try c.getServerDirectory(&domain_slices);
+    // Every decoded name points into the reassembly buffer, which the next
+    // request reuses — so the domains are copied out before anything else is
+    // asked of the IED.
+    var domains: std.ArrayList([]u8) = .empty;
+    defer {
+        for (domains.items) |x| testing.allocator.free(x);
+        domains.deinit(testing.allocator);
+    }
+    for (domain_slices[0..domain_count]) |name| {
+        try domains.append(testing.allocator, try testing.allocator.dupe(u8, name));
+    }
+
+    var missing: usize = 0; // served by the IED, not produced by the resolver
+    var extra: usize = 0; // produced by the resolver, not served by the IED
+    var matched: usize = 0;
+    var live_total: usize = 0;
+    var first_missing_buf: [256]u8 = undefined;
+    var first_missing: []const u8 = "";
+    var first_extra_buf: [256]u8 = undefined;
+    var first_extra: []const u8 = "";
+
+    var d: usize = 0;
+    while (d < domain_count) : (d += 1) {
+        // The names have to be copied: `getLogicalDeviceDirectory` hands back
+        // slices into the reassembly buffer, which the next request reuses.
+        var live_names: [2048][]const u8 = undefined;
+        const n = try c.getLogicalDeviceDirectory(domains.items[d], &live_names);
+        var owned: std.ArrayList([]u8) = .empty;
+        defer {
+            for (owned.items) |s| testing.allocator.free(s);
+            owned.deinit(testing.allocator);
+        }
+        for (live_names[0..n]) |name| {
+            try owned.append(testing.allocator, try testing.allocator.dupe(u8, name));
+        }
+        const domain = domains.items[d];
+        live_total += owned.items.len;
+
+        for (owned.items) |name| {
+            if (model.has(domain, name)) {
+                matched += 1;
+            } else {
+                if (envVar("IEC61850_TEST_SCL_VERBOSE") != null) {
+                    std.debug.print("  only on IED: {s}/{s}\n", .{ domain, name });
+                }
+                if (first_missing.len == 0 and name.len <= first_missing_buf.len) {
+                    @memcpy(first_missing_buf[0..name.len], name);
+                    first_missing = first_missing_buf[0..name.len];
+                }
+                missing += 1;
+            }
+        }
+        for (model.nodes) |node| {
+            if (!std.mem.eql(u8, node.domain, domain)) continue;
+            var found = false;
+            for (owned.items) |name| {
+                if (std.mem.eql(u8, name, node.item)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                if (envVar("IEC61850_TEST_SCL_VERBOSE") != null) {
+                    std.debug.print("  only in model: {s}/{s}\n", .{ domain, node.item });
+                }
+                if (first_extra.len == 0 and node.item.len <= first_extra_buf.len) {
+                    @memcpy(first_extra_buf[0..node.item.len], node.item);
+                    first_extra = first_extra_buf[0..node.item.len];
+                }
+                extra += 1;
+            }
+        }
+    }
+
+    std.debug.print(
+        "live SCL round trip: file={s} ied={s} resolved={d} live={d} matched={d} " ++
+            "only_on_ied={d}{s}{s} only_in_model={d}{s}{s}\n",
+        .{
+            std.fs.path.basename(path),        ied_name,      model.nodes.len,
+            live_total,                        matched,       missing,
+            if (missing > 0) " e.g. " else "", first_missing, extra,
+            if (extra > 0) " e.g. " else "",   first_extra,
+        },
+    );
+    // The claim: the resolver reproduces the IED's own name space exactly.
+    try testing.expect(live_total > 100);
+    try testing.expectEqual(@as(usize, 0), missing);
+    try testing.expectEqual(@as(usize, 0), extra);
+}
+
+// Set IEC61850_TEST_LISTEN_CONTROL=host:port and point a real IEC 61850
+// **control** client at it. The model mirrors the reference control example:
+// four `SPCSO` objects, one per ctlModel, each with its `ctlModel` under `CF`
+// and its `stVal` under `ST`.
+test "live: a real IEC 61850 client operating our control objects" {
+    const endpoint = envVar("IEC61850_TEST_LISTEN_CONTROL") orelse {
+        std.debug.print("SKIPPED: live control server (set IEC61850_TEST_LISTEN_CONTROL=host:port)\n", .{});
+        return error.SkipZigTest;
+    };
+    const ep = splitEndpoint(endpoint) orelse return error.SkipZigTest;
+
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const addr = std.Io.net.IpAddress.parse(ep.host, ep.port) catch return error.SkipZigTest;
+    var listener = addr.listen(io, .{ .reuse_address = true }) catch {
+        std.debug.print("SKIPPED: live control server (cannot bind {s})\n", .{endpoint});
+        return error.SkipZigTest;
+    };
+    defer listener.socket.close(io);
+    std.debug.print("live control server listening on {s}\n", .{endpoint});
+
+    const ld = envVar("IEC61850_TEST_LISTEN_LD") orelse "simpleIOGenericIO";
+    const models = [_]control.CtlModel{
+        .direct_with_normal_security,
+        .sbo_with_normal_security,
+        .direct_with_enhanced_security,
+        .sbo_with_enhanced_security,
+    };
+    var st_storage: [4][8]u8 = undefined;
+    var cf_storage: [4][8]u8 = undefined;
+    var vars: [8]Variable = undefined;
+    var points: [4]ServerControlPoint = undefined;
+    const st_items = [_][]const u8{
+        "GGIO1$ST$SPCSO1$stVal", "GGIO1$ST$SPCSO2$stVal",
+        "GGIO1$ST$SPCSO3$stVal", "GGIO1$ST$SPCSO4$stVal",
+    };
+    const cf_items = [_][]const u8{
+        "GGIO1$CF$SPCSO1$ctlModel", "GGIO1$CF$SPCSO2$ctlModel",
+        "GGIO1$CF$SPCSO3$ctlModel", "GGIO1$CF$SPCSO4$ctlModel",
+    };
+    const co_items = [_][]const u8{
+        "GGIO1$CO$SPCSO1", "GGIO1$CO$SPCSO2", "GGIO1$CO$SPCSO3", "GGIO1$CO$SPCSO4",
+    };
+    for (0..4) |i| {
+        var w = ber.Writer.init(&st_storage[i]);
+        try Emit.boolean(&w, false);
+        const d = w.done();
+        std.mem.copyForwards(u8, st_storage[i][0..d.len], d);
+        vars[i] = .{ .domain = ld, .item = st_items[i], .storage = &st_storage[i], .len = d.len };
+
+        var cw = ber.Writer.init(&cf_storage[i]);
+        // `ctlModel` is an enumerated integer on the wire.
+        try Emit.integer(&cw, @intFromEnum(models[i]));
+        const cd = cw.done();
+        std.mem.copyForwards(u8, cf_storage[i][0..cd.len], cd);
+        vars[4 + i] = .{ .domain = ld, .item = cf_items[i], .storage = &cf_storage[i], .len = cd.len };
+
+        points[i] = .{
+            .domain = ld,
+            .item = co_items[i],
+            .ctl_model = models[i],
+            .sbo_timeout_ms = 30_000,
+            .st_val = i,
+        };
+    }
+    const domains = [_][]const u8{ld};
+    var srv = Server.init(.{}, .{
+        .variables = &vars,
+        .controls = &points,
+        .domains = &domains,
+    });
+
+    const peers = std.fmt.parseInt(usize, envVar("IEC61850_TEST_PEERS") orelse "1", 10) catch 1;
+    var in: [16384]u8 = undefined;
+    var out: [32768]u8 = undefined;
+    var notify: [4096]u8 = undefined;
+    var served: usize = 0;
+    var now: u64 = 0;
+    while (served < peers) : (served += 1) {
+        const stream = listener.accept(io) catch break;
+        var tt = TcpTransport.fromStream(io, stream);
+        tt.setReadTimeout(5000);
+        const t = tt.transport();
+        var rounds: usize = 0;
+        while (rounds < 4000) : (rounds += 1) {
+            const n = t.read(&in) catch break;
+            if (n == 0) continue;
+            now += 10;
+            srv.tick(now);
+            const reply = srv.handle(in[0..n], &out) catch continue;
+            const rep = reply orelse break;
+            t.write(rep) catch break;
+            // A CommandTermination is not a response; it goes out on its own.
+            while (srv.pendingNotification(&notify) catch null) |note| {
+                t.write(note) catch break;
+            }
+        }
+        tt.close();
+    }
+    if (served == 0) {
+        std.debug.print("SKIPPED: live control server (no peer connected)\n", .{});
+        return error.SkipZigTest;
+    }
+    var operated: usize = 0;
+    for (0..4) |i| {
+        if ((mmsdata.Data.decode(vars[i].value()) catch continue).boolean() catch continue) operated += 1;
+    }
+    std.debug.print(
+        "live control server: peers={d} reads={d} writes={d} selects={d} operates={d} " ++
+            "rejections={d} stVal_now={d}/4\n",
+        .{ served, srv.reads, srv.writes, srv.selects, srv.operates, srv.control_rejections, operated },
+    );
+    try testing.expect(srv.operates > 0);
 }
 
 // Set IEC61850_TEST_LISTEN=host:port and point a real IEC 61850 client at it.

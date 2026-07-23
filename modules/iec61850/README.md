@@ -5,8 +5,10 @@ client speak on TCP port 102, and **GOOSE**, the layer-2 multicast protocol
 protection schemes trip breakers with. A typed, allocation-free codec for the
 whole OSI sandwich (TPKT → COTP → session → presentation → ACSE → MMS), a
 transport-agnostic client and server, the ACSI naming layer, report control
-blocks, and **pure time-injected publisher and subscriber state machines** for
-GOOSE. Sampled values (IEC 61850-9-2) come along for the ride.
+blocks, the **control model** that actually operates a breaker, an **SCL
+parser and type resolver**, and **pure time-injected publisher and subscriber
+state machines** for GOOSE. Sampled values (IEC 61850-9-2) come along for the
+ride.
 
 - No pure-Zig IEC 61850 library exists; the field is C (`libiec61850`) and its
   bindings.
@@ -62,8 +64,9 @@ GOOSE. Sampled values (IEC 61850-9-2) come along for the ride.
   `LDName/LNName.DOName.DAName` and the `$`-separated MMS form
   `GGIO1$MX$AnIn1$mag$f`, with the functional constraint injected between the
   logical node and the data object. All 17 functional constraints
-  (ST/MX/CO/SP/SV/CF/DC/SG/SE/EX/BR/RP/LG/GO/GS/MS/US). Malformed forms are
-  typed errors, never a silently wrong name.
+  (ST/MX/CO/SP/SV/CF/DC/SG/SE/EX/BR/RP/LG/GO/GS/MS/US); `scl.Fc` adds edition
+  2's `OR`/`BL` and 2.1's `SR` on top for SCL parsing. Malformed forms are typed
+  errors, never a silently wrong name.
 - **`report`** — buffered and unbuffered report control blocks, and the report
   they emit through an `InformationReport`: `OptFlds` decides which header
   fields are present and therefore **where every later field starts**, and the
@@ -74,9 +77,34 @@ GOOSE. Sampled values (IEC 61850-9-2) come along for the ride.
   directory services with continuation, `Identify`, RCB read, enable, general
   interrogation and disable, and a report handler that is dispatched even when
   a report lands **in the middle of** a request/response exchange.
+- **`control`** (IEC 61850-7-2 §20) — the part that operates plant rather than
+  reading it. All four `ctlModel`s (direct/sbo × normal/enhanced),
+  `Oper`/`SBO`/`SBOw`/`Cancel` with `ctlVal`, `operTm`, `origin`, `ctlNum`, `T`,
+  `Test` and `Check`; the 28-value **`AddCause`** enumeration and the
+  **`LastApplError`** structure that carries it, which is the difference between
+  "it failed" and "the synchrocheck refused"; and **`CommandTermination`**,
+  which under the enhanced models arrives *after* the write response as an
+  unsolicited `InformationReport` — so a client that stops at the write reports
+  a trip that never happened. Two state machines, both **pure and
+  time-injected**: `Machine` on the client side (select → operate →
+  termination, `sboTimeout`, the `ctlNum` matching rule, `Cancel` at any point)
+  and `Point` on the server side (arms and expires selects, enforces
+  ownership and the interlocks, owes the terminations).
+- **`scl`** (IEC 61850-6) — the configuration language, parsed with the `xml`
+  sibling: `Header`, `Communication` (`SubNetwork`/`ConnectedAP` with the IP,
+  OSI, MAC, APPID and VLAN parameters, and the `GSE`/`SMV` addresses that live
+  there rather than next to their control blocks), the
+  `IED → AccessPoint → Server → LDevice → LN0/LN → DOI/DAI` tree, `DataSet`s
+  with their `FCDA`s, `ReportControl`/`GSEControl`/`LogControl`/`SettingControl`,
+  and `DataTypeTemplates`. **`resolve` walks the type graph** —
+  `LN → LNodeType → DOType → DAType → DAType…` — and produces the flat list of
+  MMS names the wire uses, with cycle detection, a depth bound and typed errors
+  for every way the graph can lie. This is the only file here that allocates.
 - **`server`** — a `Server`: the IED side as a pure function from one packet to
-  one packet, backed by a caller-supplied table of named variables and data
-  sets. Stand up one per simulated IED for fleet simulation.
+  one packet, backed by a caller-supplied table of named variables, data sets
+  **and control objects**. It enforces the control model, arms and expires
+  selects, and emits `CommandTermination`/`LastApplError`. Stand up one per
+  simulated IED for fleet simulation.
 
 ### The GOOSE half
 
@@ -173,6 +201,63 @@ while (true) {
     try link.write(reply);
 }
 
+// ── operating a breaker (IEC 61850-7-2 §20) ─────────────────────────────────
+const ref = "substationLD/CSWI1.Pos";
+
+// 1. Ask the IED what it expects. Everything below follows from ctlModel.
+const ctl_model = try ied.readCtlModel(ref);
+const sbo_timeout = (try ied.readSboTimeout(ref)) orelse 30_000;
+
+// 2. Drive the whole command: select if needed, operate, and — under an
+//    enhanced model — WAIT for the CommandTermination, which is the only thing
+//    that says the breaker actually moved.
+ied.setControlHandler(.{ .ctx = &my_state, .on_notification = onControl });
+
+var value: [8]u8 = undefined;
+var vw = iec61850.ber.Writer.init(&value);
+try iec61850.Emit.boolean(&vw, true); // close
+
+var machine = iec61850.control.Machine.init(ctl_model, sbo_timeout);
+ied.executeControl(&machine, ref, .{
+    .ctl_val = vw.done(),
+    .origin  = .{ .or_cat = .station_control, .or_ident = "scada-1" },
+    .t       = iec61850.UtcTime.fromMillis(now_ms, 10),
+}, now_ms) catch |e| switch (e) {
+    error.ControlRejected => {
+        // Not "it failed" — *why* it failed.
+        const f = machine.failure.?;
+        log("{s} refused at {s}: {s}", .{ ref, @tagName(f.stage),
+            if (f.add_cause) |a| a.name() else "(no AddCause)" });
+        if (f.add_cause) |a| if (a.transient()) scheduleRetry();
+    },
+    else => return e,
+};
+
+// ── SCL: address a substation without being told every reference ────────────
+var doc = try iec61850.scl.parse(gpa, cid_bytes, .{});
+defer doc.deinit();
+var model = try iec61850.scl.resolve(&doc, gpa, "MyIED");
+defer model.deinit();
+
+for (model.nodes) |n| if (n.leaf) {
+    // n.domain / n.item is exactly what GetNameList returns, e.g.
+    // "substationLD" / "GGIO1$CO$SPCSO4$SBOw$origin$orCat"
+};
+
+// The control model comes out of the file too, so no round trip is needed.
+const from_file = model.ctlModel("substationLD", "CSWI1$CO$Pos").?;
+
+// A GOOSE subscriber configured from the SCD rather than hand-wired.
+const ln0 = doc.ied("MyIED").?.access_points[0].devices[0].lns[0];
+const gcb = ln0.gse_controls[0];
+const addr = doc.cbAddress("MyIED", "substationLD", gcb.name).?;
+var ref_buf: [128]u8 = undefined;
+var sub_from_scl = iec61850.Subscriber.init(.{
+    .gocb_ref = try iec61850.scl.controlBlockRef("substationLD", "LLN0", .GO, gcb.name, &ref_buf),
+    .expected_conf_rev = gcb.conf_rev,
+});
+_ = addr.address.appId(); // and the APPID/MAC/VLAN to bind the NIC filter with
+
 // ── GOOSE publisher ─────────────────────────────────────────────────────────
 var pub_ = try iec61850.Publisher.init(.{
     .gocb_ref = "ZIGLD/LLN0$GO$gcbEvents",
@@ -228,8 +313,14 @@ Anyone with a path to TCP 102 can write a setpoint; anyone on the station bus
 can forge a GOOSE frame with a higher `stNum` and it will win. This module
 implements no IEC 62351 security; put transport security under it and read
 SPEC.md, "Threat model", before pointing any of it at real equipment. The
-`Server` is a **simulator, not an IED** — no control model, no access control,
-no SCL.
+`Server` is a **simulator, not an IED**: it now enforces the control model, but
+it has no access control, no reporting engine and no file system.
+
+**Writing under `CO` operates plant.** The control model is here so that a
+client applies the interlocks a real one applies — the select, the `ctlNum`, the
+`Check` bits, the `AddCause` — rather than writing `Oper` by hand. Nothing stops
+a caller writing by hand; `FunctionalConstraint.isOperational` names the five
+constraints under which a write changes what the plant does.
 
 ## Verify
 
@@ -239,7 +330,7 @@ zig build test-iec61850 -Doptimize=ReleaseFast
 zig fmt --check modules/iec61850
 ```
 
-217 tests, of which 214 are fully offline. The three live tests skip gracefully
+280 tests, of which 274 are fully offline. The six live tests skip gracefully
 (printing `SKIPPED:` and passing) when no peer is present:
 
 ```
@@ -247,23 +338,41 @@ zig fmt --check modules/iec61850
 IEC61850_TEST_SERVER=127.0.0.1:102 IEC61850_TEST_LD=simpleIOGenericIO \
   zig build test-iec61850
 
+# our client OPERATING a real IED, through every control model
+IEC61850_TEST_CONTROL=127.0.0.1:102 zig build test-iec61850
+
+# an SCL file resolved and compared against the IED it configures, name for name
+IEC61850_TEST_SCL_FILE=./model.cid IEC61850_TEST_SCL_SERVER=127.0.0.1:102 \
+  zig build test-iec61850
+
 # a real IEC 61850 client -> our server (serves N peers in sequence)
 IEC61850_TEST_LISTEN=127.0.0.1:10102 IEC61850_TEST_PEERS=3 \
   zig build test-iec61850
+
+# a real IEC 61850 CONTROL client -> our server's control objects
+IEC61850_TEST_LISTEN_CONTROL=127.0.0.1:102 zig build test-iec61850
 
 # real GOOSE frames (one hex frame per line) through the subscriber
 IEC61850_TEST_GOOSE_HEX=./goose.hex zig build test-iec61850
 ```
 
-The offline suite includes **82 byte-exact MMS goldens captured from real
-traffic between two independent third-party implementations**, plus real
-captured GOOSE and SV frames — every one of them decodes, and every one this
-module has an encoder for **re-encodes to the identical octets from its decoded
-fields**, including the entire 187-octet association handshake rebuilt from
-scratch. On top of that: full client↔server round trips over an in-memory wire,
-a publisher↔subscriber round trip with an injected clock and a deliberately
-dropped frame, and 16 `std.testing.fuzz` sweeps. See SPEC.md for what is
-third-party-validated versus self-derived, and what is deferred.
+The offline suite includes **82 byte-exact MMS goldens plus 15 control-model
+goldens captured from real traffic between two independent third-party
+implementations**, plus real captured GOOSE and SV frames — every one of them
+decodes, and every one this module has an encoder for **re-encodes to the
+identical octets from its decoded fields**, including the entire 187-octet
+association handshake rebuilt from scratch and the `TypeSpecification` of a
+select-before-operate control object rebuilt octet for octet from this module's
+own model. On top of that: full client↔server round trips over an in-memory wire
+covering all four control models, a publisher↔subscriber round trip with an
+injected clock and a deliberately dropped frame, and 20 `std.testing.fuzz`
+sweeps. See SPEC.md for what is third-party-validated versus self-derived, and
+what is deferred.
+
+The SCL resolver was checked against **twelve different configuration files**
+by standing up the IED each one configures and comparing the resolved name
+space against its own `GetNameList`, in both directions: **3,273 names, every
+one matched, none missing and none invented**.
 
 Provenance: clean-room from the published ISO 8073 / RFC 1006 / ISO 8327 / ISO
 8823 / ISO 8650 / ISO 9506 / IEC 61850-8-1 layouts. No third-party source was

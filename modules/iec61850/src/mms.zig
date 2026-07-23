@@ -988,6 +988,76 @@ pub const ComponentIterator = struct {
     }
 };
 
+// ── writing a TypeSpecification ─────────────────────────────────────────────
+//
+// The leaf alternatives share their numbers with `Data`, but their *content* is
+// a size rather than a value: `[5] 08` is "INTEGER, 8 bits wide", and a
+// negative size on a string type means "up to this many octets". The two
+// zero-length forms (`[3]` boolean, `[17]` utc-time) carry no size at all.
+
+/// `boolean [3]` — no size.
+pub fn emitTypeBoolean(w: *ber.Writer) Error!void {
+    try w.primitive(ber.Tag.ctx(3), &.{});
+}
+/// `bit-string [4]`; a negative size means "at most".
+pub fn emitTypeBitString(w: *ber.Writer, size: i32) Error!void {
+    try w.integer(ber.Tag.ctx(4), size);
+}
+/// `integer [5]`, width in bits.
+pub fn emitTypeInteger(w: *ber.Writer, bits: i32) Error!void {
+    try w.integer(ber.Tag.ctx(5), bits);
+}
+/// `unsigned [6]`, width in bits.
+pub fn emitTypeUnsigned(w: *ber.Writer, bits: i32) Error!void {
+    try w.integer(ber.Tag.ctx(6), bits);
+}
+/// `octet-string [9]`; a negative size means "at most".
+pub fn emitTypeOctetString(w: *ber.Writer, size: i32) Error!void {
+    try w.integer(ber.Tag.ctx(9), size);
+}
+/// `visible-string [10]`; a negative size means "at most".
+pub fn emitTypeVisibleString(w: *ber.Writer, size: i32) Error!void {
+    try w.integer(ber.Tag.ctx(10), size);
+}
+/// `utc-time [17]` — no size.
+pub fn emitTypeUtcTime(w: *ber.Writer) Error!void {
+    try w.primitive(ber.Tag.ctx(17), &.{});
+}
+
+/// Wraps one already-written type specification as a **named component** of a
+/// structure: `SEQUENCE { componentName [0], componentType [1] }`.
+pub fn closeTypeComponent(w: *ber.Writer, mark: usize, name: []const u8) Error!void {
+    try w.header(ber.Tag.ctxc(1), mark);
+    try w.primitive(ber.Tag.ctx(0), name);
+    try w.header(ber.Tag.sequence, mark);
+}
+
+/// Closes `structure [2] { components [1] SEQUENCE OF StructComponent }` around
+/// the components written since `mark`. Like every encoder here it runs
+/// backwards, so the components go out last-to-first.
+pub fn closeTypeStructure(w: *ber.Writer, mark: usize) Error!void {
+    try w.header(ber.Tag.ctxc(1), mark);
+    try w.header(ber.Tag.ctxc(2), mark);
+}
+
+/// `GetVariableAccessAttributes-Response`. `type_spec` is a complete
+/// `TypeSpecification` TLV.
+pub fn encodeGetVariableAccessAttributesResponse(
+    invoke_id: u32,
+    deletable: bool,
+    type_spec: []const u8,
+    out: []u8,
+) Error![]const u8 {
+    var w = ber.Writer.init(out);
+    const m = w.mark();
+    const t = w.mark();
+    try w.bytes(type_spec);
+    try w.header(ber.Tag.ctxc(2), t); // typeDescription [2]
+    try w.boolean(ber.Tag.ctx(0), deletable);
+    try closeConfirmedResponse(&w, m, .get_variable_access_attributes, invoke_id);
+    return w.done();
+}
+
 pub const VariableAccessAttributes = struct {
     deletable: bool,
     type_spec: TypeSpec,

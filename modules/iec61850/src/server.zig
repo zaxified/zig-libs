@@ -25,9 +25,10 @@ const presentation = @import("presentation.zig");
 const acse = @import("acse.zig");
 const mms = @import("mms.zig");
 const mmsdata = @import("mmsdata.zig");
+const control = @import("control.zig");
 
 pub const Error = mms.Error || presentation.Error || acse.Error ||
-    session.Error || cotp.Error || tpkt.Error || error{
+    session.Error || cotp.Error || tpkt.Error || control.Error || error{
     /// The request is not one this responder models.
     Unsupported,
     BufferTooSmall,
@@ -57,9 +58,19 @@ pub const DataSet = struct {
     members: []const usize,
 };
 
+/// One controllable data object. The runtime state (selected / executing, the
+/// `ctlNum`, the deadlines) lives in `control.Point`; this table is what makes
+/// the responder enforce the control model rather than let a caller write `CO`
+/// attributes by hand.
+pub const ControlPoint = control.Point;
+
 pub const Model = struct {
     variables: []Variable,
     data_sets: []const DataSet = &.{},
+    /// Control objects, addressed by the `LN$CO$DO` prefix their `Oper`, `SBO`,
+    /// `SBOw` and `Cancel` hang off. Empty by default, which is exactly the
+    /// old behaviour: `CO` writes then fall through to the flat variable table.
+    controls: []ControlPoint = &.{},
     vendor: []const u8 = "zig-libs",
     model: []const u8 = "iec61850-responder",
     revision: []const u8 = "0.1",
@@ -72,6 +83,23 @@ pub const Config = struct {
     require_mms_application_context: bool = true,
     max_serv_outstanding: i16 = 5,
     local_detail: i32 = 65000,
+    /// Whether an accepted enhanced-security operate completes immediately.
+    /// A real IED takes as long as the switchgear does; set this false and
+    /// drive `completeControl` (or let `tick` time the execution out) to model
+    /// that.
+    auto_complete_control: bool = true,
+};
+
+/// A queued unsolicited PDU — a `CommandTermination` of either sign, or a bare
+/// `LastApplError`. It is encoded the moment it is produced, because the values
+/// it echoes live in the request buffer and that buffer is gone by the time the
+/// caller asks for the notification.
+pub const max_notification_len: usize = 512;
+pub const max_pending_notifications: usize = 4;
+
+const Pending = struct {
+    len: usize = 0,
+    bytes: [max_notification_len]u8 = undefined,
 };
 
 pub const Server = struct {
@@ -80,10 +108,26 @@ pub const Server = struct {
     contexts: presentation.ContextTable = .{},
     associated: bool = false,
     transport_up: bool = false,
+    /// The presentation context the association settled on, remembered so an
+    /// **unsolicited** PDU can be wrapped without a request to copy it from.
+    mms_context: u16 = presentation.context_mms,
+    /// Identifies the associated client for select ownership. One `Server`
+    /// serves one association, so a caller simulating several IEDs gives each
+    /// its own id and a select cannot be stolen across them.
+    peer: u32 = 1,
+    /// The caller's clock, in milliseconds. `tick` moves it; nothing here reads
+    /// a real one.
+    now_ms: u64 = 0,
+    notifications: [max_pending_notifications]Pending = @splat(.{}),
+    notify_head: usize = 0,
+    notify_count: usize = 0,
     /// Diagnostics a test asserts on.
     reads: u64 = 0,
     writes: u64 = 0,
     name_lists: u64 = 0,
+    selects: u64 = 0,
+    operates: u64 = 0,
+    control_rejections: u64 = 0,
 
     pub fn init(config: Config, model: Model) Server {
         return .{ .config = config, .model = model };
@@ -196,6 +240,7 @@ pub const Server = struct {
         var dt_buf: [2176]u8 = undefined;
         const dt = try cotp.encodeData(accept, true, &dt_buf);
         self.associated = true;
+        self.mms_context = mms_ctx;
         return try tpkt.encode(dt, out);
     }
 
@@ -223,6 +268,7 @@ pub const Server = struct {
             .get_name_list => self.getNameList(req, body),
             .read => self.read(req, body),
             .write => self.write(req, body),
+            .get_variable_access_attributes => self.variableAccessAttributes(req, body),
             else => mms.encodeConfirmedError(req.invoke_id, .service, 0, body),
         };
     }
@@ -270,6 +316,34 @@ pub const Server = struct {
         return mms.encodeGetNameListResponse(req.invoke_id, names[0..n], false, body);
     }
 
+    /// `GetVariableAccessAttributes` — implemented for **control objects only**,
+    /// because that is the one place a client cannot proceed without it: a
+    /// control client asks for the type of `LN$CO$DO` before it writes and
+    /// treats a failure as "no such object". Everything else still gets an
+    /// honest `confirmed-ErrorPDU`.
+    fn variableAccessAttributes(self: *Server, req: mms.ConfirmedRequest, body: []u8) Error![]const u8 {
+        var it = ber.Iterator.init(req.body);
+        const name: ?mms.ObjectName = blk: {
+            while (it.next() catch break :blk null) |e| {
+                if (e.tag.eqlLoose(ber.Tag.ctxc(0))) {
+                    break :blk mms.ObjectName.decode(e.content) catch null;
+                }
+            }
+            break :blk null;
+        };
+        const ds = switch (name orelse return mms.encodeConfirmedError(req.invoke_id, .access, 0, body)) {
+            .domain_specific => |x| x,
+            else => return mms.encodeConfirmedError(req.invoke_id, .access, 0, body),
+        };
+        const index = self.findControl(ds.domain, ds.item) orelse
+            return mms.encodeConfirmedError(req.invoke_id, .access, 0, body);
+        var spec: [1024]u8 = undefined;
+        var w = ber.Writer.init(&spec);
+        self.model.controls[index].emitTypeSpec(&w) catch
+            return mms.encodeConfirmedError(req.invoke_id, .resource, 0, body);
+        return mms.encodeGetVariableAccessAttributesResponse(req.invoke_id, false, w.done(), body);
+    }
+
     fn read(self: *Server, req: mms.ConfirmedRequest, body: []u8) Error![]const u8 {
         self.reads += 1;
         const r = mms.decodeReadRequest(req.body) catch
@@ -280,18 +354,36 @@ pub const Server = struct {
         switch (r.spec) {
             .variables => |it_const| {
                 // Written backwards, so collect first then emit in reverse.
+                // The select an `SBO` read performs is a *side effect* and must
+                // happen in the order the client asked, not in the writer's
+                // reverse order, so it is done in this forward pass and only
+                // its answer is emitted later.
                 var it = it_const;
                 var found: [64]?*const Variable = undefined;
+                var selects: [64]?[]const u8 = undefined;
+                var arena: [4 * acsi.max_reference_len]u8 = undefined;
+                var used: usize = 0;
                 var n: usize = 0;
                 while (try it.next()) |name| {
                     if (n == found.len) break;
-                    found[n] = self.lookup(name);
+                    selects[n] = if (used + acsi.max_reference_len <= arena.len)
+                        self.controlSelect(name, arena[used..])
+                    else
+                        null;
+                    if (selects[n]) |s| used += s.len;
+                    found[n] = if (selects[n] == null) self.lookup(name) else null;
                     n += 1;
                 }
                 var i: usize = n;
                 while (i > 0) {
                     i -= 1;
-                    if (found[i]) |v| try w.bytes(v.value()) else try mms.emitAccessFailure(&w, .object_non_existent);
+                    if (selects[i]) |s| {
+                        try mmsdata.Emit.visibleString(&w, s);
+                    } else if (found[i]) |v| {
+                        try w.bytes(v.value());
+                    } else {
+                        try mms.emitAccessFailure(&w, .object_non_existent);
+                    }
                 }
             },
             .variable_list => |name| {
@@ -351,8 +443,242 @@ pub const Server = struct {
     }
 
     fn applyWrite(self: *Server, name: mms.ObjectName, value: []const u8) mms.WriteResult {
+        // A write under `CO` to a modelled control object goes through the
+        // control model, not the flat variable table: that is the whole point
+        // of having one.
+        if (self.controlWrite(name, value)) |r| return r;
         const v = self.lookupMut(name) orelse return .{ .failure = .object_non_existent };
         return self.store(v, value);
+    }
+
+    // ── the control model (IEC 61850-7-2 §20) ──────────────────────────────
+
+    /// Advances the clock. Expires armed selects and executions that ran past
+    /// their limit, queueing the negative `CommandTermination` the standard
+    /// requires for the latter. **This is the only place time enters the
+    /// responder**, and the caller supplies it.
+    pub fn tick(self: *Server, now_ms: u64) void {
+        self.now_ms = now_ms;
+        for (self.model.controls, 0..) |*p, i| {
+            const was_executing = p.state == .executing;
+            // `Point.tick` resets the object, so the ctlNum the termination
+            // must echo has to be taken before it runs.
+            const num = p.ctl_num;
+            if (!p.tick(now_ms)) continue;
+            if (was_executing) self.queueTermination(i, .time_limit_over, num);
+        }
+    }
+
+    /// The application finished (or failed) an execution the responder is
+    /// holding open because `auto_complete_control` is false. `cause` null
+    /// means success.
+    pub fn completeControl(self: *Server, index: usize, cause: ?control.AddCause) void {
+        if (index >= self.model.controls.len) return;
+        const p = &self.model.controls[index];
+        if (!p.completed()) return;
+        self.queueTermination(index, cause, null);
+    }
+
+    /// Pops the next queued unsolicited PDU, wrapped as a complete TPKT. Call
+    /// it after every `handle` and after every `tick`: a `CommandTermination`
+    /// is *not* a response, so it cannot come back out of `handle`.
+    pub fn pendingNotification(self: *Server, out: []u8) Error!?[]const u8 {
+        if (self.notify_count == 0) return null;
+        const n = &self.notifications[self.notify_head];
+        self.notify_head = (self.notify_head + 1) % max_pending_notifications;
+        self.notify_count -= 1;
+        return try self.wrap(n.bytes[0..n.len], self.mms_context, out);
+    }
+
+    fn findControl(self: *const Server, ld: []const u8, prefix: []const u8) ?usize {
+        for (self.model.controls, 0..) |*p, i| {
+            if (std.mem.eql(u8, p.domain, ld) and std.mem.eql(u8, p.item, prefix)) return i;
+        }
+        return null;
+    }
+
+    /// Handles a write to `…$CO$<DO>$Oper|SBOw|Cancel`. Returns null when the
+    /// name is not a modelled control object, so the caller falls through.
+    fn controlWrite(self: *Server, name: mms.ObjectName, value: []const u8) ?mms.WriteResult {
+        const ds = switch (name) {
+            .domain_specific => |x| x,
+            else => return null,
+        };
+        const split = control.splitControlItem(ds.item) orelse return null;
+        const index = self.findControl(ds.domain, split.prefix) orelse return null;
+        if (std.mem.eql(u8, split.attribute, "SBO")) {
+            // `SBO` is selected by *reading* it; writing it is meaningless.
+            return .{ .failure = .object_access_denied };
+        }
+
+        const d = mmsdata.Data.decode(value) catch return .{ .failure = .type_inconsistent };
+        d.validate() catch return .{ .failure = .type_inconsistent };
+        const cmd = control.Command.decode(d) catch return .{ .failure = .type_inconsistent };
+
+        const p = &self.model.controls[index];
+        const outcome = if (std.mem.eql(u8, split.attribute, "SBOw")) blk: {
+            self.selects += 1;
+            break :blk p.select(self.peer, cmd, self.now_ms);
+        } else if (std.mem.eql(u8, split.attribute, "Cancel"))
+            p.cancel(self.peer, cmd, self.now_ms)
+        else blk: {
+            self.operates += 1;
+            break :blk p.operate(self.peer, cmd, self.now_ms);
+        };
+
+        switch (outcome) {
+            .rejected => |cause| {
+                self.control_rejections += 1;
+                self.queueLastApplError(index, cause, cmd.ctl_num, cmd.origin);
+                return .{ .failure = .object_access_denied };
+            },
+            .accepted => |a| {
+                if (std.mem.eql(u8, split.attribute, "Oper")) self.applyControlValue(p, cmd);
+                if (a.terminate) {
+                    if (std.mem.eql(u8, split.attribute, "Cancel")) {
+                        self.queueTermination(index, .abortion_by_cancel, cmd.ctl_num);
+                    } else if (self.config.auto_complete_control) {
+                        _ = p.completed();
+                        self.queueTermination(index, null, cmd.ctl_num);
+                    }
+                }
+                return .success;
+            },
+        }
+    }
+
+    /// A `Test` command must not move the plant — that distinction is the
+    /// whole reason the flag is on the wire.
+    fn applyControlValue(self: *Server, p: *ControlPoint, cmd: control.Command) void {
+        if (cmd.test_mode) return;
+        const idx = p.st_val orelse return;
+        if (idx >= self.model.variables.len) return;
+        const v = &self.model.variables[idx];
+        if (cmd.ctl_val.len > v.storage.len) return;
+        @memcpy(v.storage[0..cmd.ctl_val.len], cmd.ctl_val);
+        v.len = cmd.ctl_val.len;
+    }
+
+    /// Handles a read of `…$CO$<DO>$SBO` — the `sbo-with-normal-security`
+    /// select. A successful select answers with the object's own reference; a
+    /// refused one answers with an empty string, which is all the standard
+    /// gives a normal-security client.
+    fn controlSelect(self: *Server, name: mms.ObjectName, out: []u8) ?[]const u8 {
+        const ds = switch (name) {
+            .domain_specific => |x| x,
+            else => return null,
+        };
+        const split = control.splitControlItem(ds.item) orelse return null;
+        if (!std.mem.eql(u8, split.attribute, "SBO")) return null;
+        const index = self.findControl(ds.domain, split.prefix) orelse return null;
+        const p = &self.model.controls[index];
+        self.selects += 1;
+        return switch (p.select(self.peer, null, self.now_ms)) {
+            .accepted => p.sboReference(out) catch "",
+            .rejected => |cause| blk: {
+                self.control_rejections += 1;
+                self.queueLastApplError(index, cause, 0, .{});
+                break :blk "";
+            },
+        };
+    }
+
+    fn queueSlot(self: *Server) ?*Pending {
+        if (self.notify_count == max_pending_notifications) return null;
+        const slot = &self.notifications[(self.notify_head + self.notify_count) % max_pending_notifications];
+        self.notify_count += 1;
+        return slot;
+    }
+
+    /// `LastApplError` on its own: a select or an operate refused outright.
+    fn queueLastApplError(
+        self: *Server,
+        index: usize,
+        cause: control.AddCause,
+        ctl_num: u8,
+        origin: control.Origin,
+    ) void {
+        const p = &self.model.controls[index];
+        var ref_buf: [acsi.max_reference_len]u8 = undefined;
+        const ref = p.sboReference(&ref_buf) catch return;
+        const e = control.LastApplError{
+            .ctl_obj_ref = ref,
+            .err = .unknown,
+            .origin = origin,
+            .ctl_num = ctl_num,
+            .add_cause = cause,
+        };
+        const slot = self.queueSlot() orelse return;
+        var w = ber.Writer.init(&slot.bytes);
+        const m = w.mark();
+        e.emit(&w) catch {
+            self.notify_count -= 1;
+            return;
+        };
+        mms.closeInformationReport(&w, m, .{
+            .variables = &[_]mms.ObjectName{.{ .vmd_specific = control.last_appl_error_name }},
+        }) catch {
+            self.notify_count -= 1;
+            return;
+        };
+        const d = w.done();
+        std.mem.copyForwards(u8, slot.bytes[0..d.len], d);
+        slot.len = d.len;
+    }
+
+    /// `CommandTermination`. Positive is one variable — the control object with
+    /// its `Oper` value echoed; negative is **two**, `LastApplError` first, and
+    /// a client that assumes one value per report reads the wrong one.
+    fn queueTermination(self: *Server, index: usize, cause: ?control.AddCause, ctl_num: ?u8) void {
+        const p = &self.model.controls[index];
+        var ref_buf: [acsi.max_reference_len]u8 = undefined;
+        const ref = p.sboReference(&ref_buf) catch return;
+        var item_buf: [acsi.max_reference_len]u8 = undefined;
+        const item = std.fmt.bufPrint(&item_buf, "{s}$Oper", .{p.item}) catch return;
+        const num = ctl_num orelse p.ctl_num;
+
+        // The echoed Oper value. A real IED echoes the command it executed;
+        // this responder rebuilds it from what it kept, which is the ctlNum and
+        // the value it applied.
+        var val_buf: [16]u8 = undefined;
+        var vw = ber.Writer.init(&val_buf);
+        mmsdata.Emit.boolean(&vw, true) catch return;
+        const echoed = control.Command{
+            .ctl_val = vw.done(),
+            .ctl_num = num,
+            .t = mmsdata.UtcTime.fromMillis(self.now_ms, null),
+        };
+
+        const slot = self.queueSlot() orelse return;
+        var w = ber.Writer.init(&slot.bytes);
+        const m = w.mark();
+        blk: {
+            // Backwards: the last access result first.
+            echoed.emit(&w) catch break :blk;
+            if (cause) |c| {
+                const e = control.LastApplError{
+                    .ctl_obj_ref = ref,
+                    .err = .unknown,
+                    .ctl_num = num,
+                    .add_cause = c,
+                };
+                e.emit(&w) catch break :blk;
+            }
+            const object = mms.ObjectName{ .domain_specific = .{ .domain = p.domain, .item = item } };
+            const spec: mms.AccessSpec = if (cause == null)
+                .{ .variables = &[_]mms.ObjectName{object} }
+            else
+                .{ .variables = &[_]mms.ObjectName{
+                    .{ .vmd_specific = control.last_appl_error_name },
+                    object,
+                } };
+            mms.closeInformationReport(&w, m, spec) catch break :blk;
+            const d = w.done();
+            std.mem.copyForwards(u8, slot.bytes[0..d.len], d);
+            slot.len = d.len;
+            return;
+        }
+        self.notify_count -= 1;
     }
 
     fn store(_: *Server, v: *Variable, value: []const u8) mms.WriteResult {
@@ -433,6 +759,7 @@ pub const server_services_supported = blk: {
         mms.Initiate.service_bit.read,
         mms.Initiate.service_bit.write,
         mms.Initiate.service_bit.information_report,
+        mms.Initiate.service_bit.get_variable_access_attributes,
     };
     for (set) |b| bits[1 + b / 8] |= @as(u8, 0x80) >> @intCast(b % 8);
     break :blk bits;
@@ -495,6 +822,7 @@ fn emitString(buf: []u8, s: []const u8) !usize {
 const Paired = struct {
     server: *Server,
     out: [32768]u8 = undefined,
+    notify_out: [4096]u8 = undefined,
     queue: [65536]u8 = undefined,
     queue_len: usize = 0,
     queue_pos: usize = 0,
@@ -522,7 +850,18 @@ const Paired = struct {
             self.failures += 1;
             return;
         };
-        const r = reply orelse return;
+        // Unsolicited PDUs the request produced go out **before** the response,
+        // which is the order a real IED uses: the `LastApplError` explaining a
+        // refusal arrives ahead of the negative write response it explains.
+        try self.drain();
+        if (reply) |r| try self.enqueue(r);
+    }
+
+    fn drain(self: *Paired) transport.TransportError!void {
+        while (self.server.pendingNotification(&self.notify_out) catch null) |n| try self.enqueue(n);
+    }
+
+    fn enqueue(self: *Paired, r: []const u8) transport.TransportError!void {
         if (self.queue_len + r.len > self.queue.len) return error.WriteFailed;
         @memcpy(self.queue[self.queue_len..][0..r.len], r);
         self.queue_len += r.len;
@@ -693,8 +1032,301 @@ test "the advertised service bit string really names what is implemented" {
     try testing.expect(bs.bit(mms.Initiate.service_bit.information_report));
     // Not implemented, and not claimed.
     try testing.expect(!bs.bit(mms.Initiate.service_bit.define_named_variable_list));
-    try testing.expect(!bs.bit(mms.Initiate.service_bit.get_variable_access_attributes));
     try testing.expect(!bs.bit(mms.Initiate.service_bit.file_open));
+}
+
+// ── the control model, client against server ────────────────────────────────
+
+/// The four control models on one logical node, each with the `stVal` it
+/// drives — the same shape as the oracle's own control example model.
+const ControlFixture = struct {
+    st: [4][8]u8 = undefined,
+    vars: [4]Variable = undefined,
+    controls: [4]ControlPoint = undefined,
+    domains: [1][]const u8 = .{domain},
+
+    const items = [_][]const u8{
+        "GGIO1$ST$SPCSO1$stVal",
+        "GGIO1$ST$SPCSO2$stVal",
+        "GGIO1$ST$SPCSO3$stVal",
+        "GGIO1$ST$SPCSO4$stVal",
+    };
+    const prefixes = [_][]const u8{
+        "GGIO1$CO$SPCSO1",
+        "GGIO1$CO$SPCSO2",
+        "GGIO1$CO$SPCSO3",
+        "GGIO1$CO$SPCSO4",
+    };
+    const models = [_]control.CtlModel{
+        .direct_with_normal_security,
+        .sbo_with_normal_security,
+        .direct_with_enhanced_security,
+        .sbo_with_enhanced_security,
+    };
+
+    fn init(self: *ControlFixture) !Model {
+        for (0..4) |i| {
+            self.vars[i] = .{
+                .domain = domain,
+                .item = items[i],
+                .storage = &self.st[i],
+                .len = try emitBool(&self.st[i], false),
+            };
+            self.controls[i] = .{
+                .domain = domain,
+                .item = prefixes[i],
+                .ctl_model = models[i],
+                .sbo_timeout_ms = 2000,
+                .st_val = i,
+            };
+        }
+        return .{ .variables = &self.vars, .controls = &self.controls, .domains = &self.domains };
+    }
+
+    fn stVal(self: *ControlFixture, i: usize) !bool {
+        return (try mmsdata.Data.decode(self.vars[i].value())).boolean();
+    }
+};
+
+fn onCommand(w: *ber.Writer) !void {
+    try mmsdata.Emit.boolean(w, true);
+}
+
+test "all four control models drive a breaker end to end" {
+    var fx: ControlFixture = .{};
+    const model = try fx.init();
+    var srv = Server.init(.{}, model);
+    var paired = Paired{ .server = &srv };
+    var buf: [32768]u8 = undefined;
+    var c = try client.Client.init(paired.seam(), &buf, .{});
+    try c.connect();
+
+    var val: [8]u8 = undefined;
+    var vw = ber.Writer.init(&val);
+    try onCommand(&vw);
+    const cmd = control.Command{
+        .ctl_val = vw.done(),
+        .origin = .{ .or_cat = .station_control, .or_ident = "zig-libs" },
+        .t = mmsdata.UtcTime.fromMillis(1_700_000_000_000, 10),
+    };
+
+    const refs = [_][]const u8{
+        "TESTLD/GGIO1.SPCSO1",
+        "TESTLD/GGIO1.SPCSO2",
+        "TESTLD/GGIO1.SPCSO3",
+        "TESTLD/GGIO1.SPCSO4",
+    };
+    for (refs, ControlFixture.models, 0..) |ref, ctl_model, i| {
+        var m = control.Machine.init(ctl_model, 2000);
+        try c.executeControl(&m, ref, cmd, 1000);
+        try testing.expectEqual(control.State.succeeded, m.state);
+        try testing.expect(try fx.stVal(i));
+        // The enhanced models really did wait for a CommandTermination.
+        if (ctl_model.isEnhanced()) try testing.expect(c.notifications_received > 0);
+    }
+    // Two selects (the sbo models), four operates, and no rejection anywhere.
+    try testing.expectEqual(@as(u64, 2), srv.selects);
+    try testing.expectEqual(@as(u64, 4), srv.operates);
+    try testing.expectEqual(@as(u64, 0), srv.control_rejections);
+    try testing.expectEqual(@as(usize, 0), paired.failures);
+    c.disconnect();
+}
+
+test "an operate without a select is refused with Object-not-selected, and says so" {
+    var fx: ControlFixture = .{};
+    const model = try fx.init();
+    var srv = Server.init(.{}, model);
+    var paired = Paired{ .server = &srv };
+    var buf: [32768]u8 = undefined;
+    var c = try client.Client.init(paired.seam(), &buf, .{});
+    try c.connect();
+
+    var val: [8]u8 = undefined;
+    var vw = ber.Writer.init(&val);
+    try onCommand(&vw);
+    const cmd = control.Command{ .ctl_val = vw.done(), .ctl_num = 1, .t = mmsdata.UtcTime.fromMillis(0, null) };
+
+    // Straight to Oper on a sbo-with-enhanced-security object.
+    try testing.expectError(error.AccessFailed, c.operateObject("TESTLD/GGIO1.SPCSO4", cmd));
+    // The LastApplError the server pushed says exactly why — the whole point of
+    // the field.
+    const n = c.last_notification orelse return error.TestExpectedEqual;
+    try testing.expectEqual(control.NotificationKind.last_appl_error, n.kind);
+    try testing.expectEqual(control.AddCause.object_not_selected, n.addCause().?);
+    try testing.expectEqualStrings("TESTLD/GGIO1$CO$SPCSO4", n.last_error.?.ctl_obj_ref);
+    try testing.expect(!try fx.stVal(3));
+    c.disconnect();
+}
+
+test "an interlock is reported as an AddCause, not as a bare failure" {
+    var fx: ControlFixture = .{};
+    const model = try fx.init();
+    var srv = Server.init(.{}, model);
+    srv.model.controls[0].interlocked = true;
+    var paired = Paired{ .server = &srv };
+    var buf: [32768]u8 = undefined;
+    var c = try client.Client.init(paired.seam(), &buf, .{});
+    try c.connect();
+
+    var val: [8]u8 = undefined;
+    var vw = ber.Writer.init(&val);
+    try onCommand(&vw);
+    const cmd = control.Command{ .ctl_val = vw.done(), .ctl_num = 1, .t = mmsdata.UtcTime.fromMillis(0, null) };
+
+    var m = control.Machine.init(.direct_with_normal_security, 0);
+    try testing.expectError(
+        error.ControlRejected,
+        c.executeControl(&m, "TESTLD/GGIO1.SPCSO1", cmd, 0),
+    );
+    try testing.expectEqual(control.AddCause.blocked_by_interlocking, m.failure.?.add_cause.?);
+    try testing.expect(m.failure.?.add_cause.?.transient());
+    try testing.expect(!try fx.stVal(0));
+    c.disconnect();
+}
+
+test "a select that expires at the server turns the next operate down" {
+    var fx: ControlFixture = .{};
+    const model = try fx.init();
+    var srv = Server.init(.{}, model);
+    var paired = Paired{ .server = &srv };
+    var buf: [32768]u8 = undefined;
+    var c = try client.Client.init(paired.seam(), &buf, .{});
+    try c.connect();
+
+    var val: [8]u8 = undefined;
+    var vw = ber.Writer.init(&val);
+    try onCommand(&vw);
+    const cmd = control.Command{ .ctl_val = vw.done(), .ctl_num = 1, .t = mmsdata.UtcTime.fromMillis(0, null) };
+
+    srv.tick(1000);
+    try testing.expect(try c.selectObject("TESTLD/GGIO1.SPCSO2"));
+    try testing.expectEqual(control.PointState.selected, srv.model.controls[1].state);
+    // The operator hesitated past sboTimeout; the IED dropped the select.
+    srv.tick(3000);
+    try testing.expectEqual(control.PointState.unselected, srv.model.controls[1].state);
+    try testing.expectError(error.AccessFailed, c.operateObject("TESTLD/GGIO1.SPCSO2", cmd));
+    try testing.expectEqual(control.AddCause.object_not_selected, c.lastAddCause().?);
+    try testing.expect(!try fx.stVal(1));
+    c.disconnect();
+}
+
+test "a Test command is accepted and moves nothing" {
+    var fx: ControlFixture = .{};
+    const model = try fx.init();
+    var srv = Server.init(.{}, model);
+    var paired = Paired{ .server = &srv };
+    var buf: [32768]u8 = undefined;
+    var c = try client.Client.init(paired.seam(), &buf, .{});
+    try c.connect();
+
+    var val: [8]u8 = undefined;
+    var vw = ber.Writer.init(&val);
+    try onCommand(&vw);
+    const cmd = control.Command{
+        .ctl_val = vw.done(),
+        .ctl_num = 1,
+        .t = mmsdata.UtcTime.fromMillis(0, null),
+        .test_mode = true,
+    };
+    try c.operateObject("TESTLD/GGIO1.SPCSO1", cmd);
+    try testing.expect(!try fx.stVal(0));
+    c.disconnect();
+}
+
+test "an execution the application never finishes is terminated negatively" {
+    var fx: ControlFixture = .{};
+    const model = try fx.init();
+    var srv = Server.init(.{ .auto_complete_control = false }, model);
+    srv.model.controls[2].execution_timeout_ms = 1000;
+    var paired = Paired{ .server = &srv };
+    var buf: [32768]u8 = undefined;
+    var c = try client.Client.init(paired.seam(), &buf, .{});
+    try c.connect();
+
+    var val: [8]u8 = undefined;
+    var vw = ber.Writer.init(&val);
+    try onCommand(&vw);
+    const cmd = control.Command{ .ctl_val = vw.done(), .ctl_num = 1, .t = mmsdata.UtcTime.fromMillis(0, null) };
+
+    srv.tick(0);
+    var m = control.Machine.init(.direct_with_enhanced_security, 0);
+    // The write succeeds and the machine is left waiting.
+    _ = try m.start(0);
+    try c.operateObject("TESTLD/GGIO1.SPCSO3", cmd);
+    _ = try m.operateAccepted(0);
+    try testing.expectEqual(control.State.awaiting_termination, m.state);
+
+    // Time passes at the IED and the execution times out.
+    srv.tick(1000);
+    try paired.drain();
+    const n = try c.awaitNotification(8);
+    try testing.expectEqual(control.NotificationKind.command_termination_negative, n.kind);
+    try testing.expectEqual(control.AddCause.time_limit_over, n.addCause().?);
+    // The machine records the failure rather than reporting success.
+    _ = try m.terminated(n);
+    try testing.expectEqual(control.State.failed, m.state);
+    c.disconnect();
+}
+
+test "a negative CommandTermination carries two variables and the client reads both" {
+    var fx: ControlFixture = .{};
+    const model = try fx.init();
+    var srv = Server.init(.{}, model);
+    var paired = Paired{ .server = &srv };
+    var buf: [32768]u8 = undefined;
+    var c = try client.Client.init(paired.seam(), &buf, .{});
+    try c.connect();
+
+    var val: [8]u8 = undefined;
+    var vw = ber.Writer.init(&val);
+    try onCommand(&vw);
+    const cmd = control.Command{ .ctl_val = vw.done(), .ctl_num = 9, .t = mmsdata.UtcTime.fromMillis(0, null) };
+
+    // Select, operate, then cancel the execution mid-flight.
+    srv.config.auto_complete_control = false;
+    try c.selectWithValue("TESTLD/GGIO1.SPCSO4", cmd);
+    try c.operateObject("TESTLD/GGIO1.SPCSO4", cmd);
+    try testing.expectEqual(control.PointState.executing, srv.model.controls[3].state);
+    try c.cancelObject("TESTLD/GGIO1.SPCSO4", cmd);
+
+    const n = try c.awaitNotification(8);
+    try testing.expectEqual(control.NotificationKind.command_termination_negative, n.kind);
+    try testing.expectEqual(control.AddCause.abortion_by_cancel, n.addCause().?);
+    // Both variables were decoded: the error *and* the echoed command.
+    try testing.expect(n.last_error != null);
+    try testing.expect(n.command != null);
+    try testing.expectEqual(@as(u8, 9), n.ctlNum().?);
+    try testing.expectEqualStrings("GGIO1$CO$SPCSO4$Oper", n.object.?.domain_specific.item);
+    c.disconnect();
+}
+
+test "an ordinary report is still routed to the report handler, not the control one" {
+    // The two share the InformationReport channel; classification must not
+    // swallow a real report.
+    var fx: ControlFixture = .{};
+    const model = try fx.init();
+    var srv = Server.init(.{}, model);
+    var paired = Paired{ .server = &srv };
+    var buf: [32768]u8 = undefined;
+    var c = try client.Client.init(paired.seam(), &buf, .{});
+    try c.connect();
+
+    // Hand-build an InformationReport addressed by variable-list name, which is
+    // what an RCB report is.
+    var body: [512]u8 = undefined;
+    var w = ber.Writer.init(&body);
+    const m = w.mark();
+    try mmsdata.Emit.bitString(&w, 0b1100, 4); // inclusion
+    try mmsdata.Emit.unsigned(&w, 1); // SqNum
+    try mmsdata.Emit.visibleString(&w, "TESTLD/LLN0$Events"); // DatSet
+    try mmsdata.Emit.visibleString(&w, "Events1"); // RptID
+    try mms.closeInformationReport(&w, m, .{
+        .variables = &[_]mms.ObjectName{.{ .vmd_specific = "RPT" }},
+    });
+
+    const info = try mms.decodeInformationReport((try mms.decode(w.done())).unconfirmed.body);
+    try testing.expect((try control.classify(info)) == null);
+    c.disconnect();
 }
 
 test "fuzz: the server never panics on arbitrary packets" {

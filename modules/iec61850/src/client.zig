@@ -41,11 +41,12 @@ const mms = @import("mms.zig");
 const mmsdata = @import("mmsdata.zig");
 const acsi = @import("acsi.zig");
 const report = @import("report.zig");
+const control = @import("control.zig");
 const transport = @import("transport.zig");
 
 pub const Error = mms.Error || presentation.Error || acse.Error ||
     session.Error || cotp.Error || tpkt.Error || acsi.Error || report.Error ||
-    transport.TransportError || error{
+    control.Error || transport.TransportError || error{
     NotConnected,
     AlreadyConnected,
     /// The peer refused the transport connection.
@@ -87,6 +88,16 @@ pub const ReportHandler = struct {
     on_report: *const fn (ctx: *anyopaque, r: report.Report) void,
 };
 
+/// Called for every unsolicited **control** notification — a
+/// `CommandTermination` of either sign, or a bare `LastApplError`. These arrive
+/// on the same `InformationReport` channel as ordinary reports and are told
+/// apart by `control.classify`, so a client that only registers a
+/// `ReportHandler` would decode a termination as a report and read nonsense.
+pub const ControlHandler = struct {
+    ctx: *anyopaque,
+    on_notification: *const fn (ctx: *anyopaque, n: control.Notification) void,
+};
+
 /// The smallest sensible buffer: one 8 kB TPDU each for receive, reassembly,
 /// transmit and request scratch.
 pub const min_buffer_size: usize = 4 * 8192;
@@ -113,10 +124,16 @@ pub const Client = struct {
     /// Negotiated ceiling on an MMS PDU.
     max_pdu: usize = 8192,
     handler: ?ReportHandler = null,
+    control_handler: ?ControlHandler = null,
+    /// The most recent control notification. Like every decoded value here it
+    /// points into the reassembly buffer and is invalidated by the next
+    /// request — copy what you need out of it.
+    last_notification: ?control.Notification = null,
     /// Octets held by a partially reassembled COTP sequence.
     reasm_len: usize = 0,
     /// Diagnostics.
     reports_received: u64 = 0,
+    notifications_received: u64 = 0,
 
     pub fn init(link: transport.Transport, buf: []u8, config: Config) Error!Client {
         if (buf.len < 4 * 512) return error.BufferTooSmall;
@@ -133,6 +150,10 @@ pub const Client = struct {
 
     pub fn setReportHandler(self: *Client, h: ReportHandler) void {
         self.handler = h;
+    }
+
+    pub fn setControlHandler(self: *Client, h: ControlHandler) void {
+        self.control_handler = h;
     }
 
     // ── association ────────────────────────────────────────────────────────
@@ -471,6 +492,166 @@ pub const Client = struct {
         try self.writeObject(try attribute(rcb_reference, "RptEna", &ref_buf), fc, wr.done());
     }
 
+    // ── the control model (IEC 61850-7-2 §20) ──────────────────────────────
+
+    /// Reads `<object>.ctlModel` under `CF` — the first thing a control client
+    /// must do, because it decides whether to select and whether to wait for a
+    /// `CommandTermination`.
+    pub fn readCtlModel(self: *Client, object_reference: []const u8) Error!control.CtlModel {
+        var item: [acsi.max_reference_len]u8 = undefined;
+        const name = try control.controlName(object_reference, .CF, "ctlModel", &item);
+        return control.CtlModel.fromData(try self.readName(name));
+    }
+
+    /// Reads `<object>.sboTimeout` under `CF`, in milliseconds. Null when the
+    /// IED does not publish one — most do not, and then nothing expires
+    /// client-side.
+    pub fn readSboTimeout(self: *Client, object_reference: []const u8) Error!?u32 {
+        var item: [acsi.max_reference_len]u8 = undefined;
+        const name = try control.controlName(object_reference, .CF, "sboTimeout", &item);
+        const d = self.readName(name) catch return null;
+        const v = d.asInt() catch return null;
+        if (v < 0) return null;
+        return @intCast(@min(v, std.math.maxInt(u32)));
+    }
+
+    /// `sbo-with-normal-security` select: a **read** of `SBO`. A successful
+    /// select answers with the object's own reference; an empty string is the
+    /// standard's "refused", and the IED reports no reason at all.
+    pub fn selectObject(self: *Client, object_reference: []const u8) Error!bool {
+        var item: [acsi.max_reference_len]u8 = undefined;
+        const name = try control.controlName(object_reference, .CO, "SBO", &item);
+        self.last_notification = null;
+        const d = self.readName(name) catch |e| switch (e) {
+            error.AccessFailed => return false,
+            else => return e,
+        };
+        const s = try d.visibleString();
+        return s.len > 0;
+    }
+
+    /// `sbo-with-enhanced-security` select: a **write** of `SBOw`, carrying the
+    /// same structure the `Oper` will carry — including the `ctlNum` the
+    /// operate must repeat.
+    pub fn selectWithValue(self: *Client, object_reference: []const u8, cmd: control.Command) Error!void {
+        return self.writeControl(object_reference, "SBOw", cmd);
+    }
+
+    /// Writes `Oper`. A positive answer under an **enhanced** model means only
+    /// "accepted for execution" — call `awaitNotification` for the verdict.
+    pub fn operateObject(self: *Client, object_reference: []const u8, cmd: control.Command) Error!void {
+        return self.writeControl(object_reference, "Oper", cmd);
+    }
+
+    /// Writes `Cancel`. Legal at any point: it deselects an armed select and
+    /// aborts an execution in flight.
+    pub fn cancelObject(self: *Client, object_reference: []const u8, cmd: control.Command) Error!void {
+        var c = cmd;
+        c.check = null; // Cancel has no Check member.
+        return self.writeControl(object_reference, "Cancel", c);
+    }
+
+    /// The `AddCause` of the most recent rejection, when the IED sent a
+    /// `LastApplError` alongside the negative write response. Null when it did
+    /// not — normal-security models usually do not.
+    pub fn lastAddCause(self: *const Client) ?control.AddCause {
+        const n = self.last_notification orelse return null;
+        return n.addCause();
+    }
+
+    fn writeControl(
+        self: *Client,
+        object_reference: []const u8,
+        attr: []const u8,
+        cmd: control.Command,
+    ) Error!void {
+        var item: [acsi.max_reference_len]u8 = undefined;
+        const name = try control.controlName(object_reference, .CO, attr, &item);
+        var value: [control.Command.max_encoded_len]u8 = undefined;
+        const encoded = try cmd.encode(&value);
+        // A `LastApplError` for this command arrives *before* the negative
+        // write response, so clear the slot first and it is waiting when the
+        // write fails.
+        self.last_notification = null;
+        return self.writeName(name, encoded);
+    }
+
+    /// Discards any control notification already received. `writeControl` calls
+    /// it before every command, so `awaitNotification` afterwards cannot return
+    /// a stale one.
+    pub fn clearNotification(self: *Client) void {
+        self.last_notification = null;
+    }
+
+    /// Waits for an unsolicited control notification. **Returns one that has
+    /// already arrived**: a `CommandTermination` frequently overtakes the write
+    /// response it follows — the two are separate TPKTs and `exchange` reads
+    /// past anything unconfirmed — so a client that unconditionally polls again
+    /// waits for a second termination that never comes. The slot is cleared by
+    /// the next command, not here.
+    pub fn awaitNotification(self: *Client, rounds: u32) Error!control.Notification {
+        if (!self.connected) return error.NotConnected;
+        if (self.last_notification) |n| return n;
+        var i: u32 = 0;
+        while (i < rounds) : (i += 1) {
+            _ = self.poll() catch continue;
+            if (self.last_notification) |n| return n;
+        }
+        return error.NoResponse;
+    }
+
+    /// Drives one whole command through `machine`: select if the model needs
+    /// one, operate, and — under an enhanced model — wait for the
+    /// `CommandTermination`. `now_ms` is the caller's clock; nothing here owns
+    /// a timer, so a `sboTimeout` can only expire across calls.
+    ///
+    /// The command's `ctlNum` is taken from the machine, never from the
+    /// caller: matching it is the machine's job.
+    pub fn executeControl(
+        self: *Client,
+        machine: *control.Machine,
+        object_reference: []const u8,
+        command: control.Command,
+        now_ms: u64,
+    ) Error!void {
+        var cmd = command;
+        var step = try machine.start(now_ms);
+        while (true) {
+            cmd.ctl_num = machine.ctl_num;
+            switch (step) {
+                .read_sbo => {
+                    const ok = try self.selectObject(object_reference);
+                    if (!ok) {
+                        _ = machine.selectFailed(self.lastAddCause(), null);
+                        return error.ControlRejected;
+                    }
+                    step = try machine.selectSucceeded(now_ms);
+                },
+                .write_sbow => {
+                    self.selectWithValue(object_reference, cmd) catch {
+                        _ = machine.selectFailed(self.lastAddCause(), null);
+                        return error.ControlRejected;
+                    };
+                    step = try machine.selectSucceeded(now_ms);
+                },
+                .write_oper => {
+                    _ = try machine.beginOperate(now_ms);
+                    self.operateObject(object_reference, cmd) catch {
+                        _ = machine.operateRejected(self.lastAddCause(), null);
+                        return error.ControlRejected;
+                    };
+                    step = try machine.operateAccepted(now_ms);
+                },
+                .wait_termination => {
+                    const n = try self.awaitNotification(self.config.max_read_rounds);
+                    step = try machine.terminated(n);
+                    if (machine.state == .failed) return error.ControlRejected;
+                },
+                .finished => return,
+            }
+        }
+    }
+
     /// Reads one pending unsolicited PDU, if any, dispatching reports to the
     /// handler. Returns true when something was processed.
     pub fn poll(self: *Client) Error!bool {
@@ -554,6 +735,19 @@ pub const Client = struct {
 
     fn dispatchUnconfirmed(self: *Client, u: mms.UnconfirmedPdu) Error!void {
         if (u.service != .information_report) return;
+        // A `CommandTermination` and an ordinary report arrive on the same
+        // channel and are not distinguishable by the service tag: the control
+        // one names the control object (or `LastApplError`) rather than a
+        // report control block. Classify first, or a termination is decoded as
+        // a report and its `Oper` structure read as a sequence number.
+        if (mms.decodeInformationReport(u.body)) |info| {
+            if (control.classify(info) catch null) |n| {
+                self.notifications_received += 1;
+                self.last_notification = n;
+                if (self.control_handler) |ch| ch.on_notification(ch.ctx, n);
+                return;
+            }
+        } else |_| {}
         self.reports_received += 1;
         const h = self.handler orelse return;
         const r = report.decodeInformationReport(u.body) catch return;
