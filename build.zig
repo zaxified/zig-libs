@@ -84,6 +84,7 @@ const module_list = [_]Module{
     .{ .name = "netconf", .deps = &.{ "ssh", "xml" } },
     .{ .name = "nftables", .deps = &.{"netlink"} },
     .{ .name = "trie" },
+    .{ .name = "fuzzysearch", .deps = &.{"trie"} },
     .{ .name = "modbus" },
     .{ .name = "iec104" },
     .{ .name = "fleetsim", .deps = &.{ "modbus", "dnp3", "iec104", "s7comm", "bacnet", "enip", "opcua", "netsim" } },

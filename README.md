@@ -11,7 +11,7 @@ cross-project-reusable capability — a production-grade implementation of a pro
 or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
 authors' other projects depend on it, not the reverse.
 
-**Status:** 189 modules · 7864 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 190 modules · 7864 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ## Using a module
@@ -189,6 +189,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `jsonshape` | JSON → `dataset` reshaping — dot-path descent + typed column projection (jq-style minimal subset) | any | dataset |
 | `finstats` | Portfolio/financial statistics over `dataset` — XIRR/TWR/risk/beta/Monte-Carlo/correlation matrix | any | dataset |
 | `trie` | Prefix index for instant autocomplete over a large static string set | any | — |
+| `fuzzysearch` | Bounded-edit-distance typo-tolerant lookup over a static string set — DoS-bounded, the typo-tolerant sibling of `trie` | any | trie |
 
 ### Crypto
 
