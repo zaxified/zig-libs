@@ -545,6 +545,20 @@ project git history).
                reference only. No packet-dissector source (Wireshark / lldpd /
                net-snmp / tcpdump) was consulted or copied.
 
+  isis-lsdb  — clean-room from ISO/IEC 10589 §7.3 (the IS-IS update process),
+               a public spec (merger doctrine, policy §0 — needs no attribution
+               for the construction). Recorded here for one behavior
+               cross-check, not a ported source: the §7.3.16.1 newer-LSP
+               comparison — specifically the *oriented* purge/checksum tie-break
+               (a zero-lifetime purge, or a differing checksum, against an
+               ACTIVE stored copy is "more recent") — was confirmed against
+               FRRouting isisd `isisd/isis_lsp.c:lsp_compare` (GPL-2.0-or-later,
+               Copyright the FRRouting authors) as a behavior reference for the
+               correct reading of the ISO clause. No FRR source was ported or
+               adapted; the code, tests, and structure are the authors' own and
+               the rule is ISO's. (The sibling `isis` codec + `isis-adj` FSM are
+               pure spec-only clean-room and carry no NOTICE entry.)
+
   latency-stats — the streaming moment stats (min/max/mean/stddev + RFC 3550
                jitter) are the authors' own original work. The `Histogram`
                percentile support is clean-room from Gil Tene's HdrHistogram
