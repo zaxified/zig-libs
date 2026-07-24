@@ -88,6 +88,7 @@ const module_list = [_]Module{
     .{ .name = "geoindex" },
     .{ .name = "readthrough", .deps = &.{"ramcache"} },
     .{ .name = "timelock_envelope", .deps = &.{ "tlock", "hqc", "chachapoly" } },
+    .{ .name = "drand", .deps = &.{ "bls12_381", "tlock" } },
     .{ .name = "modbus" },
     .{ .name = "iec104" },
     .{ .name = "fleetsim", .deps = &.{ "modbus", "dnp3", "iec104", "s7comm", "bacnet", "enip", "opcua", "netsim" } },
