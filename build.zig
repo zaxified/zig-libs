@@ -68,6 +68,7 @@ const module_list = [_]Module{
     .{ .name = "l2encap" },
     .{ .name = "isis" },
     .{ .name = "isis-adj", .deps = &.{"isis"} },
+    .{ .name = "isis-lsdb", .deps = &.{"isis"} },
     .{ .name = "aeadframe", .deps = &.{"chachapoly"} },
     .{ .name = "netsim" },
     .{ .name = "loopfree-reconv", .deps = &.{ "netsim", "spf-ect" } },

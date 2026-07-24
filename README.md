@@ -11,7 +11,7 @@ cross-project-reusable capability — a production-grade implementation of a pro
 or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
 authors' other projects depend on it, not the reverse.
 
-**Status:** 199 modules · 7864 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 200 modules · 7864 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ## Using a module
@@ -149,6 +149,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `l2disco` | Layer-2 / neighbor discovery codec — LLDP (802.1AB) + CDP + ARP (RFC 826) + DHCP options (RFC 2131/2132) + MAC helper | any | netaddr |
 | `isis` | IS-IS (ISO/IEC 10589) PDU codec — common header + TLV framework + IIH/LSP PDUs + SPB (802.1aq) TLVs + raw-TLV escape hatch; pure bounds-checked encode/decode of untrusted link bytes, the wire foundation for an SPB control plane | any | — |
 | `isis-adj` | IS-IS point-to-point adjacency state machine (ISO 10589 §8.2 + RFC 5303 three-way handshake) — a pure time-injected FSM driving one P2P neighbour Down→Init→Up from received IIH PDUs (`isis` codec) + hold-timer expiry; no threads/timers/sockets | any | isis |
+| `isis-lsdb` | IS-IS link-state database — store LSPs by LSP-ID, ISO 10589 §7.3 newer-LSP comparison (seq → zero-lifetime → checksum), time-injected aging + MaxAge purge, per-interface SRM/SSN flag sets for flooding; pure (caller drives I/O), on the `isis` codec | any | isis |
 | `seqmap` | Fixed 65 536-slot 16-bit request/reply correlation map, O(1) | any | — |
 | `latency-stats` | Online RTT stats — min/max/mean/stddev + RFC 3550 jitter + loss % (O(1)/sample, no alloc) + an **HdrHistogram** for bounded-error percentiles (p50–p99.9) | any | — |
 | `pping` | Passive RTT estimation from TCP TSval/TSecr echo matching (RFC 7323 / Pollere pping) — first-echo match-and-consume, insert-if-first, aging-before-capacity eviction over a bounded per-direction table; no double-counting of duplicate/delayed ACKs | any | — |
