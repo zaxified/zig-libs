@@ -104,10 +104,35 @@ pub const TCA_FQ_CODEL = struct {
     pub const CE_THRESHOLD_MASK: u16 = 11;
 };
 
+/// cake attribute types (linux/pkt_sched.h `TCA_CAKE_*`).
+pub const TCA_CAKE = struct {
+    pub const UNSPEC: u16 = 0;
+    pub const PAD: u16 = 1;
+    pub const BASE_RATE64: u16 = 2;
+    pub const DIFFSERV_MODE: u16 = 3;
+    pub const ATM: u16 = 4;
+    pub const FLOW_MODE: u16 = 5;
+    pub const OVERHEAD: u16 = 6;
+    pub const RTT: u16 = 7;
+    pub const TARGET: u16 = 8;
+    pub const AUTORATE: u16 = 9;
+    pub const MEMORY: u16 = 10;
+    pub const NAT: u16 = 11;
+    pub const RAW: u16 = 12;
+    pub const WASH: u16 = 13;
+    pub const MPU: u16 = 14;
+    pub const INGRESS: u16 = 15;
+    pub const ACK_FILTER: u16 = 16;
+    pub const SPLIT_GSO: u16 = 17;
+    pub const FWMARK: u16 = 18;
+};
+
 pub const kind_netem = "netem";
 pub const kind_htb = "htb";
 pub const kind_tbf = "tbf";
 pub const kind_fq_codel = "fq_codel";
+pub const kind_mq = "mq";
+pub const kind_cake = "cake";
 
 /// `sizeof(struct tc_netem_qopt)`.
 pub const tc_netem_qopt_len = 24;
@@ -763,6 +788,202 @@ pub fn parseFqCodelOptions(data: []const u8) codec.Error!FqCodelWire {
     return fw;
 }
 
+// ── mq ──────────────────────────────────────────────────────────────────────
+
+/// The multiqueue root qdisc (`sch_mq`). It is a pure pivot: attaching it to a
+/// multiqueue device makes the kernel auto-create one child class per hardware
+/// TX queue (`1:1`, `1:2`, …), onto which per-CPU qdisc trees are hung. The
+/// request carries **no `TCA_OPTIONS` at all** — not even an empty nest — which
+/// is why `QdiscSpec.carriesOptions` returns false for it; the per-queue child
+/// classes are created by the kernel, never by this call.
+pub const Mq = struct {};
+
+// ── cake ────────────────────────────────────────────────────────────────────
+
+/// `TCA_CAKE_DIFFSERV_MODE` values (kernel `sch_cake.c` `CAKE_DIFFSERV_*`).
+/// Non-exhaustive so a value a newer kernel adds still decodes.
+pub const CakeDiffservMode = enum(u32) {
+    diffserv3 = 0,
+    diffserv4 = 1,
+    diffserv8 = 2,
+    besteffort = 3,
+    precedence = 4,
+    _,
+};
+
+/// `TCA_CAKE_FLOW_MODE` values (`CAKE_FLOW_*`). The dual/triple modes are bit
+/// unions of the host/flow bits, exactly as the kernel names them.
+pub const CakeFlowMode = enum(u32) {
+    flowblind = 0,
+    srchost = 1,
+    dsthost = 2,
+    hosts = 3,
+    flows = 4,
+    dual_srchost = 5,
+    dual_dsthost = 6,
+    triple_isolate = 7,
+    _,
+};
+
+/// `TCA_CAKE_ATM` link-layer compensation values (`CAKE_ATM_*`).
+pub const CakeAtmMode = enum(u32) {
+    noatm = 0,
+    atm = 1,
+    ptm = 2,
+    _,
+};
+
+/// `TCA_CAKE_ACK_FILTER` values (`CAKE_ACK_*`).
+pub const CakeAckFilter = enum(u32) {
+    none = 0,
+    filter = 1,
+    aggressive = 2,
+    _,
+};
+
+/// A CAKE AQM/shaper qdisc (`sch_cake`, the LibreQoS per-subscriber leaf).
+/// Every field is optional: `null` omits its attribute and keeps the kernel
+/// default, exactly like leaving the argument off a `tc … cake` command line.
+///
+/// A few of `tc`'s command-line words expand to more than one attribute, and
+/// this struct exposes each attribute directly so a request stays byte-exact:
+///   * `bandwidth R` / `unlimited` set `bandwidth` **and** `autorate_ingress`
+///     (to 0). `unlimited` is `bandwidth = 0`; a plain `bandwidth = null`
+///     omits the attribute entirely (also unlimited, but no byte on the wire).
+///   * `rtt T` sets `rtt_us` **and** `target_us` (to `rtt/20`).
+///   * `raw` sets `atm = .noatm`, `overhead = 0` **and** `raw = true`.
+/// See SPEC.md for the emission order and the `raw` position caveat.
+pub const Cake = struct {
+    /// `bandwidth`/`unlimited` shaper rate in **bytes per second**
+    /// (`TCA_CAKE_BASE_RATE64`, u64). null omits it (kernel-default unlimited);
+    /// 0 emits an explicit unlimited like `tc … cake unlimited`.
+    bandwidth: ?u64 = null,
+    /// DiffServ tin mapping (`diffserv3`/`diffserv4`/…, `TCA_CAKE_DIFFSERV_MODE`).
+    diffserv: ?CakeDiffservMode = null,
+    /// Link-layer ATM/PTM compensation (`atm`/`ptm`/`noatm`, `TCA_CAKE_ATM`).
+    atm: ?CakeAtmMode = null,
+    /// Flow-isolation mode (`srchost`/`hosts`/`triple-isolate`/…,
+    /// `TCA_CAKE_FLOW_MODE`).
+    flow_mode: ?CakeFlowMode = null,
+    /// Per-packet overhead in bytes (`overhead`, `TCA_CAKE_OVERHEAD`); signed,
+    /// `tc` accepts −64..256.
+    overhead: ?i32 = null,
+    /// `raw` — disable the overhead/ATM keep-the-kernel-honest compensation
+    /// (`TCA_CAKE_RAW`, a presence flag carrying 0).
+    raw: bool = false,
+    /// Minimum packet size in bytes (`mpu`, `TCA_CAKE_MPU`).
+    mpu: ?u32 = null,
+    /// AQM interval in microseconds (`rtt`, `TCA_CAKE_RTT`).
+    rtt_us: ?u32 = null,
+    /// AQM target in microseconds (`TCA_CAKE_TARGET`); `tc`'s `rtt` keyword
+    /// sets this to `rtt/20`.
+    target_us: ?u32 = null,
+    /// `autorate-ingress` bandwidth estimation (`TCA_CAKE_AUTORATE`, 0/1).
+    autorate_ingress: ?bool = null,
+    /// Queue-memory budget in bytes (`memlimit`, `TCA_CAKE_MEMORY`).
+    memlimit: ?u32 = null,
+    /// Firewall-mark mask for tin selection (`fwmark`, `TCA_CAKE_FWMARK`).
+    fwmark: ?u32 = null,
+    /// De-NAT host isolation (`nat`/`nonat`, `TCA_CAKE_NAT`, 0/1).
+    nat: ?bool = null,
+    /// Clear DSCP after classifying (`wash`/`nowash`, `TCA_CAKE_WASH`, 0/1).
+    wash: ?bool = null,
+    /// Coalesce super-packets before shaping (`split-gso`/`no-split-gso`,
+    /// `TCA_CAKE_SPLIT_GSO`, 0/1).
+    split_gso: ?bool = null,
+    /// ACK-thinning mode (`ack-filter`/`ack-filter-aggressive`/`no-ack-filter`,
+    /// `TCA_CAKE_ACK_FILTER`).
+    ack_filter: ?CakeAckFilter = null,
+    /// Shape at ingress instead of egress (`ingress`, `TCA_CAKE_INGRESS`, 0/1).
+    ingress: ?bool = null,
+};
+
+/// Wire readback of a cake qdisc's options — the raw kernel values, one
+/// optional per attribute (mirroring `FqCodelWire`).
+pub const CakeWire = struct {
+    bandwidth: ?u64 = null,
+    diffserv: ?u32 = null,
+    atm: ?u32 = null,
+    flow_mode: ?u32 = null,
+    overhead: ?i32 = null,
+    raw: bool = false,
+    mpu: ?u32 = null,
+    rtt_us: ?u32 = null,
+    target_us: ?u32 = null,
+    autorate_ingress: ?u32 = null,
+    memlimit: ?u32 = null,
+    fwmark: ?u32 = null,
+    nat: ?u32 = null,
+    wash: ?u32 = null,
+    split_gso: ?u32 = null,
+    ack_filter: ?u32 = null,
+    ingress: ?u32 = null,
+};
+
+fn appendCakeOptions(
+    c: Cake,
+    gpa: std.mem.Allocator,
+    list: *std.ArrayList(u8),
+) EncodeError!void {
+    // Emission order mirrors iproute2's q_cake.c so a request is byte-identical
+    // to the equivalent `tc` command line (verified against captured goldens).
+    if (c.bandwidth) |v| try appendAttrU64(gpa, list, TCA_CAKE.BASE_RATE64, v);
+    if (c.diffserv) |v| try codec.appendAttrU32(gpa, list, TCA_CAKE.DIFFSERV_MODE, @intFromEnum(v));
+    if (c.atm) |v| try codec.appendAttrU32(gpa, list, TCA_CAKE.ATM, @intFromEnum(v));
+    if (c.flow_mode) |v| try codec.appendAttrU32(gpa, list, TCA_CAKE.FLOW_MODE, @intFromEnum(v));
+    if (c.overhead) |v| try codec.appendAttrU32(gpa, list, TCA_CAKE.OVERHEAD, @bitCast(v));
+    if (c.raw) try codec.appendAttrU32(gpa, list, TCA_CAKE.RAW, 0);
+    if (c.mpu) |v| try codec.appendAttrU32(gpa, list, TCA_CAKE.MPU, v);
+    if (c.rtt_us) |v| try codec.appendAttrU32(gpa, list, TCA_CAKE.RTT, v);
+    if (c.target_us) |v| try codec.appendAttrU32(gpa, list, TCA_CAKE.TARGET, v);
+    if (c.autorate_ingress) |v| try codec.appendAttrU32(gpa, list, TCA_CAKE.AUTORATE, @intFromBool(v));
+    if (c.memlimit) |v| try codec.appendAttrU32(gpa, list, TCA_CAKE.MEMORY, v);
+    if (c.fwmark) |v| try codec.appendAttrU32(gpa, list, TCA_CAKE.FWMARK, v);
+    if (c.nat) |v| try codec.appendAttrU32(gpa, list, TCA_CAKE.NAT, @intFromBool(v));
+    if (c.wash) |v| try codec.appendAttrU32(gpa, list, TCA_CAKE.WASH, @intFromBool(v));
+    if (c.split_gso) |v| try codec.appendAttrU32(gpa, list, TCA_CAKE.SPLIT_GSO, @intFromBool(v));
+    if (c.ack_filter) |v| try codec.appendAttrU32(gpa, list, TCA_CAKE.ACK_FILTER, @intFromEnum(v));
+    if (c.ingress) |v| try codec.appendAttrU32(gpa, list, TCA_CAKE.INGRESS, @intFromBool(v));
+}
+
+/// Parse a `TCA_OPTIONS` payload for a cake qdisc: a flat list of `TCA_CAKE_*`
+/// TLVs. Attributes with an unexpected length are ignored rather than
+/// rejected, exactly like the other option parsers.
+pub fn parseCakeOptions(data: []const u8) codec.Error!CakeWire {
+    var cw: CakeWire = .{};
+    var it: codec.AttrIterator = .{ .buf = data };
+    while (try it.next()) |a| switch (a.type) {
+        TCA_CAKE.BASE_RATE64 => if (a.data.len == 8) {
+            cw.bandwidth = std.mem.readInt(u64, a.data[0..8], native_endian);
+        },
+        TCA_CAKE.RAW => cw.raw = true,
+        TCA_CAKE.OVERHEAD => if (a.data.len == 4) {
+            cw.overhead = @bitCast(std.mem.readInt(u32, a.data[0..4], native_endian));
+        },
+        else => if (a.data.len == 4) {
+            const v = std.mem.readInt(u32, a.data[0..4], native_endian);
+            switch (a.type) {
+                TCA_CAKE.DIFFSERV_MODE => cw.diffserv = v,
+                TCA_CAKE.ATM => cw.atm = v,
+                TCA_CAKE.FLOW_MODE => cw.flow_mode = v,
+                TCA_CAKE.MPU => cw.mpu = v,
+                TCA_CAKE.RTT => cw.rtt_us = v,
+                TCA_CAKE.TARGET => cw.target_us = v,
+                TCA_CAKE.AUTORATE => cw.autorate_ingress = v,
+                TCA_CAKE.MEMORY => cw.memlimit = v,
+                TCA_CAKE.FWMARK => cw.fwmark = v,
+                TCA_CAKE.NAT => cw.nat = v,
+                TCA_CAKE.WASH => cw.wash = v,
+                TCA_CAKE.SPLIT_GSO => cw.split_gso = v,
+                TCA_CAKE.ACK_FILTER => cw.ack_filter = v,
+                TCA_CAKE.INGRESS => cw.ingress = v,
+                else => {},
+            }
+        },
+    };
+    return cw;
+}
+
 // ── the spec unions ─────────────────────────────────────────────────────────
 
 /// Escape hatch for a kind this module does not model: a `TCA_KIND` string
@@ -778,6 +999,8 @@ pub const QdiscSpec = union(enum) {
     htb: Htb,
     tbf: Tbf,
     fq_codel: FqCodel,
+    mq: Mq,
+    cake: Cake,
     raw: Raw,
 
     pub fn kind(self: QdiscSpec) []const u8 {
@@ -786,12 +1009,27 @@ pub const QdiscSpec = union(enum) {
             .htb => kind_htb,
             .tbf => kind_tbf,
             .fq_codel => kind_fq_codel,
+            .mq => kind_mq,
+            .cake => kind_cake,
             .raw => |r| r.kind,
         };
     }
 
+    /// Whether this kind puts a `TCA_OPTIONS` attribute on the wire at all.
+    /// `mq` sends **none** — not even an empty nest — because the kernel
+    /// auto-populates its per-queue children; a byte-exact request must omit
+    /// the attribute entirely. Every other kind carries an options nest (empty
+    /// when no knobs are set, exactly like `tc`).
+    pub fn carriesOptions(self: QdiscSpec) bool {
+        return switch (self) {
+            .mq => false,
+            else => true,
+        };
+    }
+
     /// Append this spec's `TCA_OPTIONS` **payload** (the caller owns the
-    /// surrounding nest).
+    /// surrounding nest). Never called for a kind whose `carriesOptions` is
+    /// false.
     pub fn appendOptions(
         self: QdiscSpec,
         gpa: std.mem.Allocator,
@@ -803,6 +1041,8 @@ pub const QdiscSpec = union(enum) {
             .htb => |h| try appendHtbOptions(h, gpa, list),
             .tbf => |t| try appendTbfOptions(t, gpa, list, ps),
             .fq_codel => |f| try appendFqCodelOptions(f, gpa, list),
+            .mq => {}, // no options; carriesOptions() gates the nest away
+            .cake => |c| try appendCakeOptions(c, gpa, list),
             .raw => |r| {
                 if (r.options.len > std.math.maxInt(u16)) return error.OptionsTooLong;
                 try list.appendSlice(gpa, r.options);
@@ -860,6 +1100,7 @@ pub const Qdisc = struct {
     htb: ?HtbWire = null,
     tbf: ?TbfWire = null,
     fq_codel: ?FqCodelWire = null,
+    cake: ?CakeWire = null,
 
     /// The qdisc kind string ("netem", "noqueue", "fq_codel", …).
     pub fn kind(q: *const Qdisc) []const u8 {
@@ -916,6 +1157,8 @@ pub fn parseQdisc(payload: []const u8) codec.Error!Qdisc {
             q.tbf = try parseTbfOptions(opt);
         } else if (std.mem.eql(u8, k, kind_fq_codel)) {
             q.fq_codel = try parseFqCodelOptions(opt);
+        } else if (std.mem.eql(u8, k, kind_cake)) {
+            q.cake = try parseCakeOptions(opt);
         }
     }
     return q;
@@ -992,6 +1235,16 @@ test "attribute-type constants agree with the kernel UAPI" {
     try testing.expectEqual(@as(u16, 6), TCA_TBF.BURST);
     try testing.expectEqual(@as(u16, 2), TCA_FQ_CODEL.LIMIT);
     try testing.expectEqual(@as(u16, 6), TCA_FQ_CODEL.QUANTUM);
+    try testing.expectEqual(@as(u16, 2), TCA_CAKE.BASE_RATE64);
+    try testing.expectEqual(@as(u16, 6), TCA_CAKE.OVERHEAD);
+    try testing.expectEqual(@as(u16, 14), TCA_CAKE.MPU);
+    try testing.expectEqual(@as(u16, 16), TCA_CAKE.ACK_FILTER);
+    try testing.expectEqual(@as(u16, 18), TCA_CAKE.FWMARK);
+    // cake enum values match the kernel's sch_cake.c constants.
+    try testing.expectEqual(@as(u32, 1), @intFromEnum(CakeDiffservMode.diffserv4));
+    try testing.expectEqual(@as(u32, 5), @intFromEnum(CakeFlowMode.dual_srchost));
+    try testing.expectEqual(@as(u32, 2), @intFromEnum(CakeAtmMode.ptm));
+    try testing.expectEqual(@as(u32, 1), @intFromEnum(CakeAckFilter.filter));
     try testing.expectEqual(@as(usize, 20), tcmsg_len);
     try testing.expectEqual(@as(usize, 44), tc_htb_opt_len);
     try testing.expectEqual(@as(usize, 36), tc_tbf_qopt_len);
@@ -1068,6 +1321,49 @@ test "encode/decode round-trip: fq_codel omits unset fields" {
     try testing.expectEqual(@as(?u32, null), fw.quantum);
 }
 
+test "encode/decode round-trip: cake omits unset fields" {
+    const gpa = testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    try appendCakeOptions(.{
+        .bandwidth = 12_500_000, // 100 Mbit/s in bytes/s
+        .diffserv = .diffserv4,
+        .flow_mode = .dual_srchost,
+        .overhead = -18,
+        .mpu = 64,
+        .ack_filter = .aggressive,
+    }, gpa, &list);
+    const cw = try parseCakeOptions(list.items);
+    try testing.expectEqual(@as(?u64, 12_500_000), cw.bandwidth);
+    try testing.expectEqual(@as(?u32, 1), cw.diffserv);
+    try testing.expectEqual(@as(?u32, 5), cw.flow_mode);
+    try testing.expectEqual(@as(?i32, -18), cw.overhead); // signed round-trip
+    try testing.expectEqual(@as(?u32, 64), cw.mpu);
+    try testing.expectEqual(@as(?u32, 2), cw.ack_filter);
+    // Everything left unset stays absent, and no RAW attribute was emitted.
+    try testing.expectEqual(false, cw.raw);
+    try testing.expectEqual(@as(?u32, null), cw.rtt_us);
+    try testing.expectEqual(@as(?u32, null), cw.fwmark);
+    try testing.expectEqual(@as(?u32, null), cw.ingress);
+}
+
+test "cake: unlimited bandwidth and the raw flag" {
+    const gpa = testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    // Explicit unlimited emits BASE_RATE64 = 0 (like `tc … cake unlimited`),
+    // and `raw` emits a bare presence attribute the parser flags true.
+    try appendCakeOptions(.{ .bandwidth = 0, .raw = true }, gpa, &list);
+    const cw = try parseCakeOptions(list.items);
+    try testing.expectEqual(@as(?u64, 0), cw.bandwidth);
+    try testing.expectEqual(true, cw.raw);
+
+    // A wholly-default cake emits nothing at all.
+    list.clearRetainingCapacity();
+    try appendCakeOptions(.{}, gpa, &list);
+    try testing.expectEqual(@as(usize, 0), list.items.len);
+}
+
 test "spec validation rejects unbuildable qdiscs before allocating" {
     const gpa = testing.allocator;
     var list: std.ArrayList(u8) = .empty;
@@ -1091,8 +1387,14 @@ test "QdiscSpec.kind covers every modelled kind" {
     try testing.expectEqualStrings("htb", (QdiscSpec{ .htb = .{} }).kind());
     try testing.expectEqualStrings("tbf", (QdiscSpec{ .tbf = .{ .rate = 1, .burst = 1, .limit = 1 } }).kind());
     try testing.expectEqualStrings("fq_codel", (QdiscSpec{ .fq_codel = .{} }).kind());
+    try testing.expectEqualStrings("mq", (QdiscSpec{ .mq = .{} }).kind());
+    try testing.expectEqualStrings("cake", (QdiscSpec{ .cake = .{} }).kind());
     try testing.expectEqualStrings("sfq", (QdiscSpec{ .raw = .{ .kind = "sfq" } }).kind());
     try testing.expectEqualStrings("htb", (ClassSpec{ .htb = .{ .rate = 1 } }).kind());
+    // Only mq withholds the options nest.
+    try testing.expect(!(QdiscSpec{ .mq = .{} }).carriesOptions());
+    try testing.expect((QdiscSpec{ .cake = .{} }).carriesOptions());
+    try testing.expect((QdiscSpec{ .fq_codel = .{} }).carriesOptions());
 }
 
 test "fuzz: option parsers never crash on arbitrary payloads" {
@@ -1109,6 +1411,7 @@ fn fuzzParseOptions(_: void, smith: *std.testing.Smith) !void {
     if (parseHtbClassOptions(buf)) |_| {} else |_| {}
     if (parseTbfOptions(buf)) |_| {} else |_| {}
     if (parseFqCodelOptions(buf)) |_| {} else |_| {}
+    if (parseCakeOptions(buf)) |_| {} else |_| {}
     if (parseQdisc(buf)) |_| {} else |_| {}
     if (parseClass(buf)) |_| {} else |_| {}
 }

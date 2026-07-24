@@ -4,7 +4,10 @@ Linux traffic control over rtnetlink — **qdiscs, classes, filters and actions*
 Zig with no `tc` binary shell-out and no libc.
 
 - **qdiscs** (`RTM_NEWQDISC`/`DELQDISC`/`GETQDISC`) — `netem` (delay/jitter, loss,
-  duplication, reordering, corruption, rate), `htb`, `tbf`, `fq_codel`, plus a `raw`
+  duplication, reordering, corruption, rate), `htb`, `tbf`, `fq_codel`, `mq` (the
+  option-less multiqueue root whose per-queue child classes the kernel auto-creates), and
+  `cake` (the CAKE AQM/shaper: bandwidth, RTT/target, DiffServ/flow modes, NAT, wash,
+  ACK-filter, overhead/MPU/ATM, memory, split-GSO, fwmark, ingress), plus a `raw`
   escape hatch that takes a kind string and a pre-encoded `TCA_OPTIONS` payload.
 - **classes** (`RTM_NEWTCLASS`/`DELTCLASS`/`GETTCLASS`) — htb rate/ceil token buckets
   including the psched **rate tables** and the 64-bit `TCA_HTB_RATE64`/`CEIL64`
@@ -130,7 +133,7 @@ class's direct children, and `filters(ifi, parent)` matches the attach point exa
 - `Handle` — `init(major, minor)`, `.root`/`.ingress`/`.clsact`/`.unspec`, `major()`,
   `minor()`, `qdisc()`, `isClass()`, `parse("1:10")`, `{f}` formatting. **Hexadecimal**,
   like `tc`.
-- `QdiscSpec` = `.netem` | `.htb` | `.tbf` | `.fq_codel` | `.raw`;
+- `QdiscSpec` = `.netem` | `.htb` | `.tbf` | `.fq_codel` | `.mq` | `.cake` | `.raw`;
   `ClassSpec` = `.htb` | `.raw`; `FilterSpec` = `.u32` | `.flower` | `.raw`;
   `ActionSpec` = `.gact` | `.mirred` | `.police` | `.skbedit` | `.vlan` | `.raw`.
 - `Verdict` — the `TC_ACT_*` return codes (`.ok`, `.shot`, `.pipe`, `.stolen`,
@@ -145,12 +148,13 @@ class's direct children, and `filters(ifi, parent)` matches the attach point exa
   `gen`, `cookie()`, an optional per-kind wire struct (`a.gact`/`a.mirred`/`a.police`/
   `a.skbedit`/`a.vlan`), plus `stats` and `tm` when the kernel sent them.
   `Filter.actions()` returns the list attached to a dumped filter.
-- `Netem`, `Htb`, `HtbClass`, `Tbf`, `FqCodel`, `U32` + `U32Key`, `Flower` + `Prefix4`/
+- `Netem`, `Htb`, `HtbClass`, `Tbf`, `FqCodel`, `Mq`, `Cake` (+ `CakeDiffservMode`/
+  `CakeFlowMode`/`CakeAtmMode`/`CakeAckFilter`), `U32` + `U32Key`, `Flower` + `Prefix4`/
   `Prefix6` — the ergonomic input structs; every field is doc-commented in
   `src/qdisc.zig` / `src/filter.zig`. Rates are **bytes per second** (`1mbit` = 125000).
 - `Qdisc`, `Class`, `Filter` — dump results, each with a `kind()` plus an optional
   decoded-options field per modelled kind (`q.netem`, `q.htb`, `q.tbf`, `q.fq_codel`,
-  `c.htb`, `f.u32_sel`, `f.flower`, `f.classid()`).
+  `q.cake`, `c.htb`, `f.u32_sel`, `f.flower`, `f.classid()`).
 - `Psched`, `RateSpec`, `LinkLayer` and the rate-table helpers in `tc.ratespec`.
 - `tc.message` — the pure request builders (`buildQdiscSet`, `buildClassSet`,
   `buildFilterSet`, `buildDump`, …) if you want the bytes without a socket.
@@ -169,7 +173,7 @@ unshare -rn zig build test-tc     # + the live netns round-trip (qdisc→class�
 
 Every write op needs `CAP_NET_ADMIN`; the `RTM_GET*` dumps do not. The encoders are
 checked against **byte-exact requests captured from a real `iproute2` `tc`** under
-`strace` (43 goldens, each with the exact command in a comment) — see SPEC.md for the
+`strace` (50 goldens, each with the exact command in a comment) — see SPEC.md for the
 full verification story and the deferred list.
 
 One asymmetry worth knowing: qdiscs, classes and filters are namespaced, so

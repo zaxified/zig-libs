@@ -158,9 +158,14 @@ pub fn buildQdiscSet(
     const hdr = try codec.appendHeader(gpa, &list, RTM_NEWQDISC, op.flags(), seq, 0);
     try appendTcmsg(gpa, &list, target.ifindex, target.handle, target.parent, 0);
     try appendKind(gpa, &list, spec.kind());
-    const nest = try codec.nestBegin(gpa, &list, qdisc.TCA.OPTIONS);
-    try spec.appendOptions(gpa, &list, ps);
-    codec.nestEnd(&list, nest);
+    // `mq` (and any future kind whose children the kernel populates) carries no
+    // `TCA_OPTIONS` at all; every other kind gets a nest, empty when it has no
+    // knobs, exactly as `tc` does.
+    if (spec.carriesOptions()) {
+        const nest = try codec.nestBegin(gpa, &list, qdisc.TCA.OPTIONS);
+        try spec.appendOptions(gpa, &list, ps);
+        codec.nestEnd(&list, nest);
+    }
     codec.finishHeader(&list, hdr);
     return list.toOwnedSlice(gpa);
 }

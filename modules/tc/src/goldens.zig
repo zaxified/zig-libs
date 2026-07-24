@@ -375,6 +375,67 @@ const g_netem_qdisc_add =
     "00000000";
 const seq_netem_qdisc_add: u32 = 1784724314;
 
+// ── captured mq + cake qdisc requests ───────────────────────────────────────
+//
+// Same host (iproute2-6.19.0, Linux 7.0, sch_cake/sch_mq loaded) and the same
+// raw-buffer recipe the action goldens use, so there is no re-encoding step —
+// the exact `sendmsg` bytes are pasted here after being checked against each
+// message's own `nlmsg_len`:
+//
+// ```sh
+// unshare -rn strace -f -e trace=sendmsg -e write=all -xx -s 8192 \
+//     -e abbrev=none ./commands.sh
+// ```
+//
+// `lo` is a single-queue device so the kernel rejects the mq/cake attach, but
+// the request bytes are what a golden pins (as with the rejected `parent 1:`
+// action captures above).
+const seq_mq_cake: u32 = 1784885003;
+
+// ### RTM_NEWQDISC type=36 flags=0x505 seq=1784885003 len=44
+// tc qdisc replace dev lo root handle 1: mq
+// Note: NO TCA_OPTIONS attribute at all — only TCA_KIND "mq".
+const g_mq_qdisc_replace =
+    "2c000000240005050b2f636a00000000000000000100000000000100ffffffff00000000070001006d710000";
+
+// ### RTM_NEWQDISC type=36 flags=0x605 seq=1784885003 len=52
+// tc qdisc add dev lo root handle 8: cake   (an empty TCA_OPTIONS nest)
+const g_cake_qdisc_add_bare =
+    "34000000240005060b2f636a00000000000000000100000000000800ffffffff000000000900010063616b650000000004000200";
+
+// ### RTM_NEWQDISC type=36 flags=0x605 seq=1784885003 len=72
+// tc qdisc add dev lo root handle 8: cake bandwidth 100mbit
+// BASE_RATE64 = 12_500_000 B/s, then AUTORATE = 0 (tc emits it with any rate).
+const g_cake_qdisc_add_bandwidth =
+    "48000000240005060b2f636a00000000000000000100000000000800ffffffff000000000900010063616b6500000000180002000c00020020bcbe00000000000800090000000000";
+
+// ### RTM_NEWQDISC type=36 flags=0x605 seq=1784885003 len=152
+// tc qdisc add dev lo root handle 8: cake bandwidth 1gbit diffserv4 \
+//   dual-srchost nat wash ack-filter overhead 18 mpu 64 memlimit 4194304 \
+//   split-gso fwmark 0xff
+const g_cake_qdisc_add_full =
+    "98000000240005060b2f636a00000000000000000100000000000800ffffffff000000000900010063616b6500000000680002000c000200405973070000000008000300010000000800050005000000080006001200000008000e0040000000080009000000000008000a000000400008001200ff00000008000b000100000008000d000100000008001100010000000800100001000000";
+
+// ### RTM_NEWQDISC type=36 flags=0x605 seq=1784885003 len=120
+// tc qdisc add dev lo root handle 8: cake bandwidth 50mbit overhead 10 \
+//   mpu 84 rtt 100ms ingress split-gso
+// rtt expands to RTT = 100000 us and TARGET = 5000 us (= rtt/20).
+const g_cake_qdisc_add_mpu_rtt =
+    "78000000240005060b2f636a00000000000000000100000000000800ffffffff000000000900010063616b6500000000480002000c000200105e5f0000000000080006000a00000008000e005400000008000700a086010008000800881300000800090000000000080011000100000008000f0001000000";
+
+// ### RTM_NEWQDISC type=36 flags=0x605 seq=1784885003 len=120
+// tc qdisc add dev lo root handle 8: cake unlimited besteffort flowblind \
+//   ptm no-ack-filter nowash nonat
+// `unlimited` = BASE_RATE64 0.
+const g_cake_qdisc_add_unlimited =
+    "78000000240005060b2f636a00000000000000000100000000000800ffffffff000000000900010063616b6500000000480002000c0002000000000000000000080003000300000008000400020000000800050000000000080009000000000008000b000000000008000d00000000000800100000000000";
+
+// ### RTM_NEWQDISC type=36 flags=0x605 seq=1784885003 len=76
+// tc qdisc add dev lo root handle 8: cake raw
+// `raw` sets atm=noatm(0), overhead=0 and the RAW presence flag (value 0).
+const g_cake_qdisc_add_raw =
+    "4c000000240005060b2f636a00000000000000000100000000000800ffffffff000000000900010063616b65000000001c0002000800040000000000080006000000000008000c0000000000";
+
 // ── captured action requests ────────────────────────────────────────────────
 //
 // Same host, same netns, same `tc`, captured with `strace`'s raw buffer dump
@@ -806,6 +867,169 @@ test "golden: netem qdisc add (the v1 encoder, now checked against real tc)" {
     );
     defer gpa.free(req);
     try expectGolden(g_netem_qdisc_add, req);
+}
+
+test "golden: mq qdisc replace (kind only, no TCA_OPTIONS)" {
+    // tc qdisc replace dev lo root handle 1: mq
+    const req = try message.buildQdiscSet(
+        gpa,
+        seq_mq_cake,
+        .replace,
+        .{ .ifindex = lo, .handle = Handle.init(1, 0), .parent = Handle.root },
+        .{ .mq = .{} },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_mq_qdisc_replace, req);
+}
+
+test "golden: cake qdisc add (bare — an empty options nest)" {
+    // tc qdisc add dev lo root handle 8: cake
+    const req = try message.buildQdiscSet(
+        gpa,
+        seq_mq_cake,
+        .add,
+        .{ .ifindex = lo, .handle = Handle.init(8, 0), .parent = Handle.root },
+        .{ .cake = .{} },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_cake_qdisc_add_bare, req);
+}
+
+test "golden: cake qdisc add with a bandwidth" {
+    // tc qdisc add dev lo root handle 8: cake bandwidth 100mbit
+    const req = try message.buildQdiscSet(
+        gpa,
+        seq_mq_cake,
+        .add,
+        .{ .ifindex = lo, .handle = Handle.init(8, 0), .parent = Handle.root },
+        .{ .cake = .{ .bandwidth = 12_500_000, .autorate_ingress = false } },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_cake_qdisc_add_bandwidth, req);
+}
+
+test "golden: cake qdisc add with the full knob set" {
+    // tc qdisc add dev lo root handle 8: cake bandwidth 1gbit diffserv4
+    //   dual-srchost nat wash ack-filter overhead 18 mpu 64 memlimit 4194304
+    //   split-gso fwmark 0xff
+    const req = try message.buildQdiscSet(
+        gpa,
+        seq_mq_cake,
+        .add,
+        .{ .ifindex = lo, .handle = Handle.init(8, 0), .parent = Handle.root },
+        .{ .cake = .{
+            .bandwidth = 125_000_000,
+            .diffserv = .diffserv4,
+            .flow_mode = .dual_srchost,
+            .overhead = 18,
+            .mpu = 64,
+            .autorate_ingress = false,
+            .memlimit = 4_194_304,
+            .fwmark = 0xff,
+            .nat = true,
+            .wash = true,
+            .split_gso = true,
+            .ack_filter = .filter,
+        } },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_cake_qdisc_add_full, req);
+}
+
+test "golden: cake qdisc add with overhead/mpu/rtt/ingress" {
+    // tc qdisc add dev lo root handle 8: cake bandwidth 50mbit overhead 10
+    //   mpu 84 rtt 100ms ingress split-gso
+    const req = try message.buildQdiscSet(
+        gpa,
+        seq_mq_cake,
+        .add,
+        .{ .ifindex = lo, .handle = Handle.init(8, 0), .parent = Handle.root },
+        .{
+            .cake = .{
+                .bandwidth = 6_250_000,
+                .overhead = 10,
+                .mpu = 84,
+                .rtt_us = 100_000,
+                .target_us = 5_000, // tc's rtt keyword also sets target = rtt/20
+                .autorate_ingress = false,
+                .split_gso = true,
+                .ingress = true,
+            },
+        },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_cake_qdisc_add_mpu_rtt, req);
+}
+
+test "golden: cake qdisc add unlimited with mode/flag knobs" {
+    // tc qdisc add dev lo root handle 8: cake unlimited besteffort flowblind
+    //   ptm no-ack-filter nowash nonat
+    const req = try message.buildQdiscSet(
+        gpa,
+        seq_mq_cake,
+        .add,
+        .{ .ifindex = lo, .handle = Handle.init(8, 0), .parent = Handle.root },
+        .{
+            .cake = .{
+                .bandwidth = 0, // explicit unlimited
+                .diffserv = .besteffort,
+                .atm = .ptm,
+                .flow_mode = .flowblind,
+                .autorate_ingress = false,
+                .nat = false,
+                .wash = false,
+                .ack_filter = .none,
+            },
+        },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_cake_qdisc_add_unlimited, req);
+}
+
+test "golden: cake qdisc add raw (atm+overhead+raw flag)" {
+    // tc qdisc add dev lo root handle 8: cake raw
+    const req = try message.buildQdiscSet(
+        gpa,
+        seq_mq_cake,
+        .add,
+        .{ .ifindex = lo, .handle = Handle.init(8, 0), .parent = Handle.root },
+        .{ .cake = .{ .atm = .noatm, .overhead = 0, .raw = true } },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_cake_qdisc_add_raw, req);
+}
+
+test "cake golden re-parses back into a CakeWire" {
+    // Feed the full-knob golden's TCA_OPTIONS back through parseQdisc and check
+    // the decoded values field by field against real kernel-shaped bytes.
+    if (native_endian != .little) return error.SkipZigTest;
+    const codec = @import("netlink").codec;
+    var raw: [512]u8 = undefined;
+    const bytes = try std.fmt.hexToBytes(raw[0 .. g_cake_qdisc_add_full.len / 2], g_cake_qdisc_add_full);
+    var it: codec.MessageIterator = .{ .buf = bytes };
+    const m = (try it.next()).?;
+    const q = try qdisc.parseQdisc(m.payload);
+    try testing.expectEqualStrings("cake", q.kind());
+    const cw = q.cake.?;
+    try testing.expectEqual(@as(?u64, 125_000_000), cw.bandwidth);
+    try testing.expectEqual(@as(?u32, 1), cw.diffserv); // diffserv4
+    try testing.expectEqual(@as(?u32, 5), cw.flow_mode); // dual-srchost
+    try testing.expectEqual(@as(?i32, 18), cw.overhead);
+    try testing.expectEqual(@as(?u32, 64), cw.mpu);
+    try testing.expectEqual(@as(?u32, 0), cw.autorate_ingress);
+    try testing.expectEqual(@as(?u32, 4_194_304), cw.memlimit);
+    try testing.expectEqual(@as(?u32, 0xff), cw.fwmark);
+    try testing.expectEqual(@as(?u32, 1), cw.nat);
+    try testing.expectEqual(@as(?u32, 1), cw.wash);
+    try testing.expectEqual(@as(?u32, 1), cw.split_gso);
+    try testing.expectEqual(@as(?u32, 1), cw.ack_filter); // ack-filter
 }
 
 test "golden: qdisc del" {

@@ -38,7 +38,7 @@ policy: which request, which reply type, which parser, and the client-side
 |---|---|
 | `handle.zig` | `Handle` (`major:minor`), `TC_H_*`, `TC_H_MAKE`, hex parse/format |
 | `ratespec.zig` | `Psched` calibration, `tc_ratespec`, the 256-entry rate tables |
-| `qdisc.zig` | netem/htb/tbf/fq_codel option encode+decode, `Qdisc`/`Class` parsing |
+| `qdisc.zig` | netem/htb/tbf/fq_codel/mq/cake option encode+decode, `Qdisc`/`Class` parsing |
 | `filter.zig` | u32 + flower encode+decode, `tcm_info` packing, `Filter` parsing |
 | `action.zig` | the `TCA_ACT_*` list, `tc_gen`/`TC_ACT_*`, gact/mirred/police/skbedit/vlan |
 | `message.zig` | `tcmsg` + every request builder (pure: allocator in, bytes out) |
@@ -260,6 +260,40 @@ On dump, a real kernel may report the legacy pair as nonzero (it back-fills them
 internal nanosecond value for old tools); `NetemWire.legacy_latency`/`.legacy_jitter`
 capture that, informational only.
 
+### mq carries no options, cake is a flat attribute list
+
+Two qdisc kinds were added after the v2 batch, both with captured goldens.
+
+**`mq`** (`sch_mq`) is a pure pivot: attaching it to a multiqueue device makes the kernel
+auto-create one child class per hardware TX queue, onto which per-CPU qdisc trees hang.
+Its request is `TCA_KIND = "mq"` and **nothing else** — not even an empty `TCA_OPTIONS`
+nest (the `tc qdisc replace … mq` capture is 44 bytes: header + `tcmsg` + the padded kind
+attribute). `QdiscSpec.carriesOptions` returns false for `mq`, and `buildQdiscSet` gates
+the whole `nestBegin`/`appendOptions`/`nestEnd` block on it, so an `mq` request omits the
+attribute entirely while every other kind still writes a nest (empty when it has no knobs,
+exactly like `tc`). The per-queue child classes are the kernel's to create, never this
+call's.
+
+**`cake`** (`sch_cake`, the LibreQoS per-subscriber leaf) is a flat list of `TCA_CAKE_*`
+TLVs inside `TCA_OPTIONS` — no fixed struct, unlike the shaping qdiscs. `Cake` models it
+the way `FqCodel` models fq_codel: every field is optional, `null` omits its attribute and
+keeps the kernel default. Only `TCA_CAKE_BASE_RATE64` is a u64; everything else is a u32
+(`TCA_CAKE_OVERHEAD` is a *signed* s32, round-tripped through `@bitCast`). The enum-valued
+knobs (`CakeDiffservMode`/`CakeFlowMode`/`CakeAtmMode`/`CakeAckFilter`) carry the kernel's
+own `sch_cake.c` numeric values and are non-exhaustive so a newer value still decodes.
+
+The **emission order** mirrors iproute2's `q_cake.c` so a request is byte-identical to the
+command line: BASE_RATE64, DIFFSERV_MODE, ATM, FLOW_MODE, OVERHEAD, RAW, MPU, RTT, TARGET,
+AUTORATE, MEMORY, FWMARK, NAT, WASH, SPLIT_GSO, ACK_FILTER, INGRESS. Five captured goldens
+pin every position except RAW's and INGRESS-vs-ACK_FILTER's relative order (see the
+deferred list). A few `tc` words expand to more than one attribute, and `Cake` exposes each
+attribute directly rather than reproducing the CLI's coupling: `bandwidth`/`unlimited` also
+emit `AUTORATE = 0`; `rtt T` also emits `TARGET = rtt/20` (confirmed by the `rtt 100ms`
+golden: RTT 100000 µs, TARGET 5000 µs); `raw` also sets `atm = noatm` and `overhead = 0`.
+`unlimited` is `bandwidth = 0` (an explicit `BASE_RATE64` of 0); a `null` bandwidth omits
+the attribute (also unlimited, but zero bytes on the wire). Callers reproduce a given `tc`
+line by setting exactly the fields that line sets — the goldens do precisely that.
+
 ### Dump filtering
 
 The kernel dumps every qdisc/class/filter of an ifindex regardless of the handle/parent
@@ -340,8 +374,19 @@ caller-supplied rate/size can panic in ReleaseSafe or wrap in ReleaseFast.
 - **flower beyond L2–L4 basics**: MAC addresses, VLAN/CVLAN, MPLS, tunnel keys, ARP,
   ICMP type/code, TCP flags, IP TOS/TTL, ct state, port ranges, `TCA_FLOWER_INDEV`. The
   `skip_hw`/`skip_sw` bits are settable via `Flower.flags` but untested against hardware.
-- **Other qdiscs**: hfsc, cake, prio, sfq, red, codel, pfifo/bfifo, mq, clsact/ingress
-  attachment helpers. `QdiscSpec.raw` covers them if you encode the options yourself.
+- **Other qdiscs**: hfsc, prio, sfq, red, codel, pfifo/bfifo, clsact/ingress attachment
+  helpers. `QdiscSpec.raw` covers them if you encode the options yourself. (`mq` and `cake`
+  are now modelled — see the "mq carries no options" section.)
+- **CAKE knobs not modelled**: the built-in RTT/bandwidth *presets* (`datacentre`, `lan`,
+  `metro`, `regional`, `internet`, `oceanic`, `satellite`) — these are just CLI shorthands
+  that resolve to an `rtt`/`bandwidth` pair on iproute2's side, so set `rtt_us`/`bandwidth`
+  directly instead. The read-only `TCA_CAKE_STATS`/`TIN_STATS` sub-attributes (tin
+  occupancy, drop/mark counters, capacity estimate) are not decoded on a dump — `CakeWire`
+  carries the configuration attributes only, matching the module-wide "stats are ignored on
+  qdisc dumps" stance. The exact emission position of `TCA_CAKE_RAW` (only ever seen in
+  isolation, where it follows `OVERHEAD`) is placed right after `OVERHEAD`/before `MPU`; no
+  capture combines `raw` with `mpu`/`rtt` to pin it further, and the kernel is order-agnostic
+  within `TCA_OPTIONS`, so this has no behavioural effect.
 - **htb offload** (`TCA_HTB_OFFLOAD`) is emitted when asked for but never verified against
   offload-capable hardware.
 - **`TCA_STAB`** (size tables / per-packet overhead outside the rate table) and the
@@ -358,7 +403,7 @@ caller-supplied rate/size can panic in ReleaseSafe or wrap in ReleaseFast.
 
 ## Verification
 
-- **Byte-exact goldens from real `iproute2`** (`goldens.zig`, 43 requests). The v2 batch
+- **Byte-exact goldens from real `iproute2`** (`goldens.zig`, 50 requests). The v2 batch
   was recovered from
   `unshare -rn strace -f -e trace=sendmsg -xx -s 8192 -e abbrev=none <cmd>` and re-encoded
   from strace's decode; the action batch adds `-e write=all`, which prints the exact
@@ -380,6 +425,13 @@ caller-supplied rate/size can panic in ReleaseSafe or wrap in ReleaseFast.
   | tbf (peak) | `… handle 2: tbf rate 10mbit burst 10kb latency 50ms peakrate 20mbit mtu 1540` |
   | fq_codel | `… handle 6: fq_codel limit 1200 flows 1024 target 5ms interval 100ms quantum 1514` |
   | netem | `… handle 3: netem delay 100ms 10ms loss 1%` |
+  | mq | `tc qdisc replace dev lo root handle 1: mq` (kind only, no `TCA_OPTIONS`) |
+  | cake (bare) | `… handle 8: cake` (an empty options nest) |
+  | cake (bandwidth) | `… cake bandwidth 100mbit` |
+  | cake (full) | `… cake bandwidth 1gbit diffserv4 dual-srchost nat wash ack-filter overhead 18 mpu 64 memlimit 4194304 split-gso fwmark 0xff` |
+  | cake (overhead/mpu/rtt) | `… cake bandwidth 50mbit overhead 10 mpu 84 rtt 100ms ingress split-gso` |
+  | cake (unlimited/modes) | `… cake unlimited besteffort flowblind ptm no-ack-filter nowash nonat` |
+  | cake (raw) | `… cake raw` |
   | u32 filter | `tc filter add dev lo parent 1: protocol ip prio 1 u32 match ip dst 10.0.0.1/32 flowid 1:10` |
   | u32 filter (2 keys) | `… u32 match ip src 192.168.1.0/24 match ip dst 10.0.0.1/32 flowid 1:10` |
   | flower filter | `… protocol ip prio 2 flower ip_proto tcp dst_ip 10.0.0.0/24 dst_port 80 classid 1:10` |
@@ -449,9 +501,12 @@ caller-supplied rate/size can panic in ReleaseSafe or wrap in ReleaseFast.
   requested and the kernel's own `refcnt`/`TCA_ACT_STATS` asserted), and an unprivileged
   `RTM_GETACTION` dump. Every assertion is against what the kernel echoed back.
 
-  This was run in the development environment: **119 pass / 1 skip under `unshare -rn` in
-  both Debug and `--release=fast`** (120 tests); unprivileged, 114 pass and 6 privileged
-  tests skip. `zig build test-netlink` stays green (81/81).
+  This was run in the development environment: **129 pass / 1 skip under `unshare -rn` in
+  both Debug and `--release=fast`** (130 tests); unprivileged, 124 pass and 6 privileged
+  tests skip. `zig build test-netlink` stays green (81/81). The mq/cake batch was captured
+  on the same host and recipe as the action goldens (`-e write=all`, exact `sendmsg` bytes
+  checked against each message's own `nlmsg_len`); `lo` is single-queue so the kernel
+  rejects the attach, but the request bytes are what the golden pins.
 
   The one test that still skips inside `unshare -rn` is the shared-action-table write
   (`tc actions add|del`), which needs `CAP_NET_ADMIN` in the initial user namespace — see
