@@ -68,6 +68,7 @@ const module_list = [_]Module{
     .{ .name = "l2encap" },
     .{ .name = "l2forward" },
     .{ .name = "pbb" },
+    .{ .name = "bumtree", .deps = &.{"spf-ect"} },
     .{ .name = "isis" },
     .{ .name = "isis-adj", .deps = &.{"isis"} },
     .{ .name = "isis-dis", .deps = &.{"isis"} },

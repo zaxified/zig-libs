@@ -11,7 +11,7 @@ cross-project-reusable capability — a production-grade implementation of a pro
 or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
 authors' other projects depend on it, not the reverse.
 
-**Status:** 206 modules · 7864 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 207 modules · 7864 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ## Using a module
@@ -183,6 +183,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `l2encap` | Tenant-tagged (24-bit I-SID) L2-over-tunnel encapsulation for a multi-tenant L2VPN fabric — lean versioned header (I-SID + TTL + BUM/split-horizon bits) wrapping a customer Ethernet frame for encrypted-backbone transport; bounds-checked untrusted decode, composes with `ethfrag` | any | — |
 | `l2forward` | E-LAN edge forwarding table — per-I-SID customer-MAC learning (MAC → remote PE) with time-injected aging + the BUM ingress-replication set with split-horizon; forward decision (known-unicast PE vs replication set) for a multi-tenant L2VPN fabric; pairs with `l2encap` | any | — |
 | `pbb` | IEEE 802.1ah Provider Backbone Bridge (MAC-in-MAC) codec — wrap a customer Ethernet frame in a backbone header (B-DA/B-SA/optional B-Tag) + I-TAG (24-bit I-SID) and decode back; the real-Ethernet SPB (802.1aq) encap, distinct from `l2encap`'s lean over-WG variant; bounds-checked untrusted decode | any | — |
+| `bumtree` | SPB per-source loop-free BUM distribution tree + RPF check over `spf-ect` — for an I-SID member set + a source, the per-node replication next-hops (pruned source SPT) + the single RPF ingress; the control-plane loop-free BUM tree `l2encap`/`l2forward` defer to | any | spf-ect |
 
 ### Data & storage
 
