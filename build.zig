@@ -70,6 +70,7 @@ const module_list = [_]Module{
     .{ .name = "isis-adj", .deps = &.{"isis"} },
     .{ .name = "isis-lsdb", .deps = &.{"isis"} },
     .{ .name = "isis-flood", .deps = &.{ "isis", "isis-lsdb" } },
+    .{ .name = "isis-spf", .deps = &.{ "isis", "isis-lsdb", "spf-ect" } },
     .{ .name = "aeadframe", .deps = &.{"chachapoly"} },
     .{ .name = "netsim" },
     .{ .name = "loopfree-reconv", .deps = &.{ "netsim", "spf-ect" } },

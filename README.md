@@ -11,7 +11,7 @@ cross-project-reusable capability — a production-grade implementation of a pro
 or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
 authors' other projects depend on it, not the reverse.
 
-**Status:** 201 modules · 7864 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 202 modules · 7864 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ## Using a module
@@ -151,6 +151,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `isis-adj` | IS-IS point-to-point adjacency state machine (ISO 10589 §8.2 + RFC 5303 three-way handshake) — a pure time-injected FSM driving one P2P neighbour Down→Init→Up from received IIH PDUs (`isis` codec) + hold-timer expiry; no threads/timers/sockets | any | isis |
 | `isis-lsdb` | IS-IS link-state database — store LSPs by LSP-ID, ISO 10589 §7.3 newer-LSP comparison (seq → zero-lifetime → checksum), time-injected aging + MaxAge purge, per-interface SRM/SSN flag sets for flooding; pure (caller drives I/O), on the `isis` codec | any | isis |
 | `isis-flood` | IS-IS flooding transmit scheduler — drain `isis-lsdb` per-interface SRM/SSN flags into the ordered PDUs to send, pace LSP (re)transmission + emit periodic CSNPs; pure time-injected (caller supplies now + Up-adjacency ifaces, does the sends) | any | isis, isis-lsdb |
+| `isis-spf` | Compute the IS-IS shortest-path forwarding table from an `isis-lsdb` — IS-reachability TLVs → topology graph (two-way-checked edges) → `spf-ect` Dijkstra + ECT tie-break from the local system → route table (dest system-id → next-hop + metric); pure, deterministic | any | isis, isis-lsdb, spf-ect |
 | `seqmap` | Fixed 65 536-slot 16-bit request/reply correlation map, O(1) | any | — |
 | `latency-stats` | Online RTT stats — min/max/mean/stddev + RFC 3550 jitter + loss % (O(1)/sample, no alloc) + an **HdrHistogram** for bounded-error percentiles (p50–p99.9) | any | — |
 | `pping` | Passive RTT estimation from TCP TSval/TSecr echo matching (RFC 7323 / Pollere pping) — first-echo match-and-consume, insert-if-first, aging-before-capacity eviction over a bounded per-direction table; no double-counting of duplicate/delayed ACKs | any | — |
