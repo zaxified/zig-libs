@@ -76,6 +76,7 @@ const module_list = [_]Module{
     .{ .name = "isis-lsdb", .deps = &.{"isis"} },
     .{ .name = "isis-flood", .deps = &.{ "isis", "isis-lsdb" } },
     .{ .name = "isis-spf", .deps = &.{ "isis", "isis-lsdb", "spf-ect" } },
+    .{ .name = "isis-sim", .deps = &.{ "netsim", "isis", "isis-lsdb", "isis-flood", "isis-spf" } },
     .{ .name = "aeadframe", .deps = &.{"chachapoly"} },
     .{ .name = "tenantkex", .deps = &.{"noise"} },
     .{ .name = "netsim" },
