@@ -136,6 +136,46 @@ file for the general methodology. This module's specific provenance:
   procedure directly — nothing about that methodology is specific to
   `ebpf`'s own three programs.
 
+## CPUMAP steering (`buildCpumapSteerProgram` + `createCpuMap`/`populateCpu`)
+
+The classifier stashes a class handle and returns `XDP_PASS`; the steer
+program is the piece that actually **routes** a flow — the last LibreQoS shaper
+primitive, `XDP bpf_redirect_map(&cpumap, cpu) → BPF_MAP_TYPE_CPUMAP → per-CPU
+tc MQ/HTB tree`. It is the same tier verdict as the classifier — **no Fable
+core** — and for the same reason: it reuses this module's own already-proven
+`ctx`-decode + single-bounds-check + EtherType/IHL parse + LPM-lookup sequence
+verbatim (instructions 0-24 of its golden are byte-identical to
+`golden_classifier`'s), and appends a `bpf_redirect_map` (BPF helper id 51,
+confirmed against `std.os.linux.BPF.Helper.redirect_map` and the UAPI
+`enum bpf_func_id`) tail. The one genuinely new fragment — load the matched
+class into the redirect key register and reduce it `% cpu_count` (`BPF_ALU64 |
+BPF_MOD | BPF_K`) — is trivial scalar arithmetic, not a verifier-hard pattern.
+
+- **CPU-selection policy — class-reduced, per-subscriber, NOT per-flow.** CPU =
+  `class % cpu_count`. Real LibreQoS derives the CPU from a per-subscriber
+  prefix lookup, so every packet of a subscriber's prefix lands on ONE CPU's
+  HTB tree; a per-flow 5-tuple RSS hash would split a subscriber across CPUs and
+  break that invariant. This is the design decision the flow→CPU invariant
+  hinges on: **the steer program's `class → CPU` map and `tcplan`'s per-CPU HTB
+  tree are two halves of one guarantee** — a subscriber's traffic must be
+  shapeable on exactly one CPU's queue, which requires it to be steered to
+  exactly one CPU. `cpu_count == 0` is rejected at build (`InvalidCpuCount`) —
+  it is also a verifier rejection (`BPF_MOD` by zero), so guarding it early
+  turns a load-time failure into a caller-visible build error.
+- **`struct bpf_cpumap_val` layout (UAPI `include/uapi/linux/bpf.h`).** 8 bytes:
+  `u32 qsize` at offset 0, then a 4-byte union (`int fd` on write / `u32 id` on
+  read) at offset 4. `maps.CpumapVal` is an `extern struct` matching that C ABI
+  byte-for-byte; its size (8) and field offsets (0, 4) are pinned by a
+  non-privileged `smoke` test — the CPUMAP analogue of the classifier's LPM-key
+  layout anchor. The kernel accepts a CPUMAP `value_size` of 4 or 8; this module
+  always uses 8 so `populateCpu` can carry the optional per-CPU program.
+- **Fallback.** Any parse/bounds failure or LPM miss returns `XDP_PASS` (packet
+  continues up the stack); a hit returns the `bpf_redirect_map` result. The
+  `% cpu_count` reduction keeps the redirect index in range, so a fully
+  populated CPUMAP never misses; `redirect_flags` (default 0) may be set to
+  `XDP_PASS` on kernels with the redirect-fallback-action feature (≥ 5.15) for a
+  defensive fallback on an unpopulated slot — the program never depends on it.
+
 ## Verification harness
 
 - **Offline, unprivileged (always runs):** `src/classifier.zig`'s golden
@@ -159,6 +199,21 @@ file for the general methodology. This module's specific provenance:
   `bpf_map_lookup_elem` round-trip (both the single-rule and
   whole-`RuleSet` population paths), cross-checked against
   `rules.lookupReference`'s userspace prediction for the same ruleset.
+- **CPUMAP steering, offline (always runs):** a byte-exact golden for
+  `buildCpumapSteerProgram` (its parse/lookup prefix reused verbatim from the
+  classifier golden); structural tests (redirect_map with helper id 51,
+  cpumap referenced via a pseudo `ld_map_fd`, key reduced `% cpu_count`, every
+  non-hit path falling through to a single trailing `XDP_PASS`); the
+  `key_field = .dst` offset check; the `cpu_count == 0` build-error check; and a
+  **permanent positive-control test** that corrupts the redirect helper id in a
+  copy of a real program and asserts the structural predicate flips to false
+  (guarding against a vacuous check). The `CpumapVal` size/offset `smoke` test
+  is likewise unprivileged.
+- **CPUMAP steering, CAP_BPF/root-gated:** `createCpuMap` + `populateCpu` +
+  real `bpf_map_lookup_elem` round-trip of a `CpumapVal`; and a real
+  `ebpf.load` of `buildCpumapSteerProgram` against a live CPUMAP fd, asserting
+  the in-kernel verifier accepts it (loaded under `"GPL"` to sidestep any
+  gpl-only-helper ambiguity for `bpf_redirect_map`). Skips cleanly unprivileged.
 - Green in Debug and `-Doptimize=ReleaseFast`.
 
 ## Backlog / deliberately out of scope
@@ -172,11 +227,13 @@ file for the general methodology. This module's specific provenance:
   (dynamic scalar-range-tracked pointer arithmetic vs. this module's fixed
   compile-time offsets throughout) and the most plausible future Fable-tier
   candidate if this module is extended, per the tier-verdict section above.
-- **Flow-keyed (not single-slot) output**, or a `bpf_xdp_adjust_meta`-based
-  handoff to a downstream `tc` classifier for a real per-packet (not
-  last-packet-per-CPU) classification result — see README "Design notes".
-  Deliberately out of scope for a scaffold whose job was proving the
-  classify-and-lookup core, not the full production output-plumbing story.
+- **CPUMAP steering is now built** (`buildCpumapSteerProgram`, see the CPUMAP
+  section above) — the production output path that redirects a matched flow to
+  a per-CPU `tc` MQ/HTB tree. Still out of scope: a `bpf_xdp_adjust_meta`-based
+  per-packet metadata handoff to a downstream `tc` classifier (a different
+  mechanism — passing the class inline in packet metadata rather than steering
+  by CPU), and a per-flow (rather than per-subscriber) output keying, which the
+  CPU-selection note above argues against for a LibreQoS-style shaper.
 - A DROP-on-no-match program variant (README "Scope") — a one-instruction
   change, not built since it's not what LibreQoS-style classify-then-shape
   wants by default.

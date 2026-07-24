@@ -68,6 +68,12 @@ pub const lpm_value_size = maps_mod.lpm_value_size;
 pub const scratch_key_size = maps_mod.scratch_key_size;
 pub const scratch_value_size = maps_mod.scratch_value_size;
 pub const scratch_max_entries = maps_mod.scratch_max_entries;
+// CPUMAP steering (see classifier.buildCpumapSteerProgram).
+pub const CpumapVal = maps_mod.CpumapVal;
+pub const createCpuMap = maps_mod.createCpuMap;
+pub const populateCpu = maps_mod.populateCpu;
+pub const cpumap_key_size = maps_mod.cpumap_key_size;
+pub const cpumap_value_size = maps_mod.cpumap_value_size;
 
 const classifier_mod = @import("classifier.zig");
 pub const KeyField = classifier_mod.KeyField;
@@ -76,6 +82,11 @@ pub const ClassifierOptions = classifier_mod.ClassifierOptions;
 /// Fully implemented, golden-tested, structurally verified, and
 /// CAP_BPF-load-verified (gated).
 pub const buildClassifierProgram = classifier_mod.buildClassifierProgram;
+// CPUMAP steering: redirect a matched flow to a chosen CPU (the last
+// LibreQoS shaper primitive) — see `classifier.buildCpumapSteerProgram`.
+pub const CpumapSteerOptions = classifier_mod.CpumapSteerOptions;
+pub const SteerBuildError = classifier_mod.SteerBuildError;
+pub const buildCpumapSteerProgram = classifier_mod.buildCpumapSteerProgram;
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────────
 //

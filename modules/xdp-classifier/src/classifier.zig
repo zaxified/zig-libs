@@ -301,6 +301,174 @@ const Buf = struct {
     }
 };
 
+// ── CPUMAP steering: redirect a matched flow to a chosen CPU ────────────────
+//
+// The classifier above stashes a class handle and returns XDP_PASS; this
+// second builder is the piece that actually STEERS a flow, the last shaper
+// primitive in the LibreQoS pipeline
+// (`XDP bpf_redirect_map(&cpumap, cpu) -> BPF_MAP_TYPE_CPUMAP -> per-CPU tc
+// MQ/HTB tree`). It reuses this file's exact house patterns — the same
+// `ctx`-decode + single dominating bounds check + EtherType/IHL parse + LPM
+// lookup as `buildClassifierProgram` — and appends a `bpf_redirect_map` tail
+// instead of a scratch write.
+
+const XDP_PASS_action: i32 = 2; // == XDP_PASS; used as the redirect fallback
+
+/// Fixed contract for `buildCpumapSteerProgram`, same struct-not-positional
+/// convention as `ClassifierOptions`.
+pub const CpumapSteerOptions = struct {
+    /// `BPF_MAP_TYPE_LPM_TRIE` fd — the SAME ruleset map `buildClassifierProgram`
+    /// uses (see `ClassifierOptions.lpm_map_fd` / `maps.createLpmTrieMap`). The
+    /// matched `u32` value is the class handle whose reduction picks the CPU
+    /// (see the CPU-selection note below).
+    lpm_map_fd: linux.fd_t,
+    /// `BPF_MAP_TYPE_CPUMAP` fd (see `maps.createCpuMap`) this program redirects
+    /// into. Its `max_entries` should be `cpu_count`, and every slot
+    /// `0..cpu_count` should be populated (`maps.populateCpu`) — an unpopulated
+    /// slot is a runtime redirect miss that falls back to `redirect_flags`
+    /// (see below), not a verifier problem.
+    cpumap_fd: linux.fd_t,
+    /// Number of CPUs the ruleset's class handles are reduced onto. The target
+    /// CPU is `class % cpu_count` (see the CPU-selection note). Must be
+    /// non-zero — a 0 divisor is both a build error here and a verifier
+    /// rejection (BPF_MOD by zero); `buildCpumapSteerProgram` returns
+    /// `SteerBuildError.InvalidCpuCount` for it.
+    cpu_count: u32,
+    /// Which IPv4 address field the LPM key is drawn from — same meaning and
+    /// same 26/30 offsets as `ClassifierOptions.key_field`. `.src` keys on the
+    /// subscriber's source address (the LibreQoS default for upstream/egress
+    /// classification).
+    key_field: KeyField = .src,
+    /// The `flags` argument to `bpf_redirect_map(map, key, flags)`. Kept 0 by
+    /// default — the most portable value, accepted by every kernel. On kernels
+    /// with the redirect-fallback-action feature (>= 5.15), a caller may set
+    /// this to `XDP_PASS` (2) so a redirect into an unpopulated CPUMAP slot
+    /// returns XDP_PASS instead of XDP_ABORTED; this program never depends on
+    /// that (it reduces the key with `% cpu_count` so the index is always in
+    /// range, and a fully populated map has no miss), it is exposed only so a
+    /// defensive caller can opt in.
+    redirect_flags: u32 = 0,
+};
+
+pub const SteerBuildError = error{
+    /// `cpu_count == 0` — see `CpumapSteerOptions.cpu_count`.
+    InvalidCpuCount,
+};
+
+/// Build the redirect-to-CPUMAP steering program.
+///
+/// `BPF_PROG_TYPE_XDP`. For each packet it parses Ethernet+IPv4 (the IDENTICAL
+/// `ctx`-decode + single dominating `[data, data+34)` bounds check + EtherType
+/// + IHL-must-be-5 sequence as `buildClassifierProgram` — see that function's
+/// doc comment points 1-4, reused verbatim here), does the SAME LPM lookup on
+/// `opts.key_field`'s /32 key, and then:
+///
+///  - **CPU-selection policy: class-reduced, not per-flow-hashed.** The matched
+///    class handle `c` selects CPU `c % opts.cpu_count`. This mirrors real
+///    LibreQoS, whose XDP program takes the CPU straight from a per-subscriber
+///    prefix lookup (NOT a per-flow RSS hash): every packet of a subscriber's
+///    prefix resolves to the same class, hence the same CPU, hence the same
+///    per-CPU MQ/HTB tree a downstream `tc`/`tcplan` stage shapes. A per-flow
+///    5-tuple hash would keep each *flow* on one CPU but SPLIT one subscriber
+///    across CPUs, breaking the per-subscriber shaping invariant — so it is
+///    deliberately not used. A deployment wanting an explicit class->CPU table
+///    stores CPU-valued handles (`c < cpu_count`, so `c % cpu_count == c`).
+///  - **Redirect + fallback.** `r2 = class`, `r2 %= cpu_count` (always in
+///    range), then `bpf_redirect_map(&cpumap, r2, opts.redirect_flags)`; the
+///    program returns the helper's result (`XDP_REDIRECT` on success). Every
+///    OTHER path — too-short packet, non-IPv4 EtherType, IPv4 options, or an
+///    LPM miss — returns `XDP_PASS`, the safe fallback (the packet continues up
+///    the normal stack, exactly the classifier's "unclassified = best-effort"
+///    default).
+///
+/// Returns `SteerBuildError.InvalidCpuCount` if `opts.cpu_count == 0`. Same
+/// file-scope-buffer storage contract as `buildClassifierProgram`, but a
+/// SEPARATE buffer (`steer_prog_buf`) so a caller may build and hold both a
+/// classifier and a steer program at once.
+pub fn buildCpumapSteerProgram(opts: CpumapSteerOptions) SteerBuildError![]const Insn {
+    if (opts.cpu_count == 0) return SteerBuildError.InvalidCpuCount;
+
+    const R = Insn.Reg;
+    const key_off = opts.key_field.offset();
+
+    var b: Buf = .{ .buf = &steer_prog_buf };
+
+    // (1) ctx->data_end then ctx->data (data_end first — the second load
+    //     clobbers r1). Same retype as buildClassifierProgram point 1.
+    b.emit(Insn.ldx(.word, R.r2, R.r1, 4)); // r2 = data_end
+    b.emit(Insn.ldx(.word, R.r1, R.r1, 0)); // r1 = data
+
+    // (2) Single dominating bounds check: [data, data+34) covers Ethernet(14)
+    //     + fixed IPv4(20). Reused verbatim from buildClassifierProgram
+    //     point 2.
+    b.emit(Insn.mov(R.r3, R.r1));
+    b.emit(Insn.add(R.r3, 34));
+    const bounds_jmp = b.reserve(); // jgt r3, r2 -> PASS
+
+    // (3) EtherType must be IPv4 (point 1's native-endian constant).
+    b.emit(Insn.ldx(.half_word, R.r4, R.r1, 12));
+    const ethertype_jmp = b.reserve(); // jne r4, ipv4 -> PASS
+
+    // (4) IHL must be 5 (no options) — point 3.
+    b.emit(Insn.ldx(.byte, R.r4, R.r1, 14));
+    b.emit(Insn.alu_and(R.r4, 0x0f));
+    const ihl_jmp = b.reserve(); // jne r4, 5 -> PASS
+
+    // (5) Copy the 4 key-field address bytes into [r10-4, r10) and prepend a
+    //     native-endian prefixlen of 32 — identical to buildClassifierProgram
+    //     point 4 (same rules.LpmKey byte layout both sides commit to).
+    var k: i16 = 0;
+    while (k < 4) : (k += 1) {
+        b.emit(Insn.ldx(.byte, R.r5, R.r1, key_off + k));
+        b.emit(Insn.stx(.byte, R.r10, -4 + k, R.r5));
+    }
+    b.emit(Insn.st(.word, R.r10, -8, 32));
+
+    // (6) LPM lookup: r2 = &key, r1 = map via pseudo-fd (point 5 discipline).
+    b.emit(Insn.mov(R.r2, R.r10));
+    b.emit(Insn.add(R.r2, -8));
+    b.emit(Insn.ld_map_fd1(R.r1, opts.lpm_map_fd));
+    b.emit(Insn.ld_map_fd2(opts.lpm_map_fd));
+    b.emit(Insn.call(.map_lookup_elem));
+    const lpm_miss_jmp = b.reserve(); // jeq r0, 0 -> PASS
+
+    // (7) Hit: class = *(u32*)(r0), loaded straight into r2 (the redirect KEY
+    //     register), then reduced to a valid CPU index by `% cpu_count`. r0 is
+    //     PTR_TO_MAP_VALUE here (null-checked above), size == value_size (4),
+    //     so the word load needs no further bounds check — same reasoning as
+    //     buildClassifierProgram point 7.
+    b.emit(Insn.ldx(.word, R.r2, R.r0, 0));
+    b.emit(Insn.alu(64, .mod, R.r2, @as(i32, @bitCast(opts.cpu_count))));
+
+    // (8) redirect_map(&cpumap, cpu, flags): r1 = cpumap via pseudo-fd (this
+    //     clobbers r1, harmless — r2 holds the key, preserved across the
+    //     ld_map_fd pair and the flags mov), r3 = flags. The program returns
+    //     the helper's result (XDP_REDIRECT on success). helper id 51.
+    b.emit(Insn.ld_map_fd1(R.r1, opts.cpumap_fd));
+    b.emit(Insn.ld_map_fd2(opts.cpumap_fd));
+    b.emit(Insn.mov(R.r3, @as(i32, @bitCast(opts.redirect_flags))));
+    b.emit(Insn.call(.redirect_map));
+    b.emit(Insn.exit());
+
+    // PASS: every parse/bounds failure or LPM miss lands here — safe fallback.
+    const pass_idx = b.len();
+    b.emit(Insn.mov(R.r0, XDP_PASS_action));
+    b.emit(Insn.exit());
+
+    b.patchJumpTo(bounds_jmp, Insn.jgt(R.r3, R.r2, 0), pass_idx);
+    b.patchJumpTo(ethertype_jmp, Insn.jne(R.r4, @as(i32, ethertype_ipv4_native), 0), pass_idx);
+    b.patchJumpTo(ihl_jmp, Insn.jne(R.r4, @as(i32, 5), 0), pass_idx);
+    b.patchJumpTo(lpm_miss_jmp, Insn.jeq(R.r0, 0, 0), pass_idx);
+
+    return b.slice();
+}
+
+// Separate file-scope buffer from `prog_buf` (see that buffer's storage
+// contract) so a caller may build a classifier AND a steer program and hold
+// both returned slices at once; a second buildCpumapSteerProgram call still
+// overwrites the previous steer slice, same single_owner discipline.
+var steer_prog_buf: [64]Insn = undefined;
+
 // ── tests ────────────────────────────────────────────────────────────────────
 //
 // Same two layers as ebpf.programs.zig: an offline golden-vector +
@@ -562,5 +730,239 @@ test "load: buildClassifierProgram passes the in-kernel verifier (needs CAP_BPF/
     const insns = buildClassifierProgram(.{ .lpm_map_fd = lpm_fd, .scratch_map_fd = scratch_fd });
     const prog: ebpf.Program = .{ .prog_type = .xdp, .insns = insns };
     const fd = try ebpf.load(prog, "MIT");
+    _ = linux.close(fd);
+}
+
+// ── CPUMAP steering tests ───────────────────────────────────────────────────
+
+const redirect_map_helper_id: i32 = @intFromEnum(std.os.linux.BPF.Helper.redirect_map);
+
+// Golden vector for buildCpumapSteerProgram. Instructions 0-24 are the SAME
+// ctx-decode / bounds-check / EtherType+IHL / key-copy / LPM-lookup sequence
+// as `golden_classifier` above (already clang-cross-checked + CAP_BPF-load-
+// verified there) — reused, not re-derived. The genuinely new tail (25-33) is
+// hand-derived from the BPF ISA: load the matched class into the redirect KEY
+// register (r2), reduce it `% cpu_count` (BPF_ALU64|MOD|K == 0x97), then the
+// pseudo-fd/flags/redirect_map(helper 51) call and a return of its result;
+// every non-hit path jumps to the shared XDP_PASS tail (32-33).
+const golden_steer_lpm_fd: linux.fd_t = 10;
+const golden_steer_cpumap_fd: linux.fd_t = 12;
+
+const golden_steer = [_]Insn{
+    .{ .code = 0x61, .dst = 2, .src = 1, .off = 4, .imm = 0 }, // 0  ldx W r2 = data_end
+    .{ .code = 0x61, .dst = 1, .src = 1, .off = 0, .imm = 0 }, // 1  ldx W r1 = data
+    .{ .code = 0xbf, .dst = 3, .src = 1, .off = 0, .imm = 0 }, // 2  mov r3 = r1
+    .{ .code = 0x07, .dst = 3, .src = 0, .off = 0, .imm = 34 }, // 3  add r3 += 34
+    .{ .code = 0x2d, .dst = 3, .src = 2, .off = 27, .imm = 0 }, // 4  jgt r3 > data_end -> PASS(32)
+    .{ .code = 0x69, .dst = 4, .src = 1, .off = 12, .imm = 0 }, // 5  ldx H r4 = ethertype
+    .{ .code = 0x55, .dst = 4, .src = 0, .off = 25, .imm = 8 }, // 6  jne r4 != 0x0008 -> PASS(32)
+    .{ .code = 0x71, .dst = 4, .src = 1, .off = 14, .imm = 0 }, // 7  ldx B r4 = version_ihl
+    .{ .code = 0x57, .dst = 4, .src = 0, .off = 0, .imm = 15 }, // 8  and r4 &= 0x0f
+    .{ .code = 0x55, .dst = 4, .src = 0, .off = 22, .imm = 5 }, // 9  jne r4 != 5 -> PASS(32)
+    .{ .code = 0x71, .dst = 5, .src = 1, .off = 26, .imm = 0 }, // 10 ldx B r5 = data[26]
+    .{ .code = 0x73, .dst = 10, .src = 5, .off = -4, .imm = 0 }, // 11 stx B key[0]
+    .{ .code = 0x71, .dst = 5, .src = 1, .off = 27, .imm = 0 }, // 12 ldx B r5 = data[27]
+    .{ .code = 0x73, .dst = 10, .src = 5, .off = -3, .imm = 0 }, // 13 stx B key[1]
+    .{ .code = 0x71, .dst = 5, .src = 1, .off = 28, .imm = 0 }, // 14 ldx B r5 = data[28]
+    .{ .code = 0x73, .dst = 10, .src = 5, .off = -2, .imm = 0 }, // 15 stx B key[2]
+    .{ .code = 0x71, .dst = 5, .src = 1, .off = 29, .imm = 0 }, // 16 ldx B r5 = data[29]
+    .{ .code = 0x73, .dst = 10, .src = 5, .off = -1, .imm = 0 }, // 17 stx B key[3]
+    .{ .code = 0x62, .dst = 10, .src = 0, .off = -8, .imm = 32 }, // 18 st W prefixlen = 32
+    .{ .code = 0xbf, .dst = 2, .src = 10, .off = 0, .imm = 0 }, // 19 mov r2 = r10
+    .{ .code = 0x07, .dst = 2, .src = 0, .off = 0, .imm = -8 }, // 20 add r2 += -8
+    .{ .code = 0x18, .dst = 1, .src = 1, .off = 0, .imm = golden_steer_lpm_fd }, // 21 ld_map_fd1 r1 = lpm(10)
+    .{ .code = 0x00, .dst = 0, .src = 0, .off = 0, .imm = 0 }, // 22 ld_map_fd2 (hi32)
+    .{ .code = 0x85, .dst = 0, .src = 0, .off = 0, .imm = 1 }, // 23 call map_lookup_elem
+    .{ .code = 0x15, .dst = 0, .src = 0, .off = 7, .imm = 0 }, // 24 jeq r0==0 -> PASS(32)
+    .{ .code = 0x61, .dst = 2, .src = 0, .off = 0, .imm = 0 }, // 25 ldx W r2 = *(u32*)(r0)  (class -> redirect key)
+    .{ .code = 0x97, .dst = 2, .src = 0, .off = 0, .imm = 4 }, // 26 mod r2 %= cpu_count(4)
+    .{ .code = 0x18, .dst = 1, .src = 1, .off = 0, .imm = golden_steer_cpumap_fd }, // 27 ld_map_fd1 r1 = cpumap(12)
+    .{ .code = 0x00, .dst = 0, .src = 0, .off = 0, .imm = 0 }, // 28 ld_map_fd2 (hi32)
+    .{ .code = 0xb7, .dst = 3, .src = 0, .off = 0, .imm = 0 }, // 29 mov r3 = redirect_flags(0)
+    .{ .code = 0x85, .dst = 0, .src = 0, .off = 0, .imm = 51 }, // 30 call redirect_map (helper 51)
+    .{ .code = 0x95, .dst = 0, .src = 0, .off = 0, .imm = 0 }, // 31 exit (returns r0 = redirect result)
+    .{ .code = 0xb7, .dst = 0, .src = 0, .off = 0, .imm = 2 }, // 32 PASS: mov r0 = XDP_PASS
+    .{ .code = 0x95, .dst = 0, .src = 0, .off = 0, .imm = 0 }, // 33 exit
+};
+
+test "golden: buildCpumapSteerProgram matches the hand-derived sequence" {
+    const insns = try buildCpumapSteerProgram(.{
+        .lpm_map_fd = golden_steer_lpm_fd,
+        .cpumap_fd = golden_steer_cpumap_fd,
+        .cpu_count = 4,
+        .key_field = .src,
+        .redirect_flags = 0,
+    });
+    try testing.expectEqual(redirect_map_helper_id, @as(i32, 51)); // brief-claimed id, confirmed
+    try testing.expectEqualSlices(Insn, &golden_steer, insns);
+}
+
+/// Structural well-formedness predicate for a steer program, shared by the
+/// positive assertion below and the positive-CONTROL test: the program must
+/// end in `exit`, contain exactly one `redirect_map` call, reference the
+/// cpumap via a pseudo-`ld_map_fd` immediately before that call, and reduce
+/// the redirect KEY (r2) with a `% cpu_count` (BPF_MOD) op. A mutation of any
+/// of these (see the positive-control test) makes it return false.
+fn steerLooksWellFormed(insns: []const Insn) bool {
+    if (insns.len == 0 or insns[insns.len - 1].code != 0x95) return false;
+
+    var redirect_i: ?usize = null;
+    var redirect_calls: usize = 0;
+    for (insns, 0..) |ins, i| {
+        if (ins.code == 0x85 and ins.imm == redirect_map_helper_id) {
+            redirect_i = i;
+            redirect_calls += 1;
+        }
+    }
+    if (redirect_calls != 1) return false;
+    const ri = redirect_i.?;
+
+    // The redirect KEY must be reduced mod cpu_count into r2 somewhere before
+    // the call (BPF_ALU64|MOD|K == 0x97, dst r2).
+    var has_mod_key = false;
+    for (insns[0..ri]) |ins| {
+        if (ins.code == 0x97 and ins.dst == 2) has_mod_key = true;
+    }
+    if (!has_mod_key) return false;
+
+    // The cpumap must be loaded via a two-slot pseudo ld_map_fd (0x18 into r1
+    // with src == PSEUDO_MAP_FD(1), followed by the 0x00 continuation) that
+    // precedes the redirect call. Require such a pair between the mod and the
+    // call.
+    if (ri < 2) return false;
+    const hi = insns[ri - 1];
+    const lo = insns[ri - 2];
+    if (!(lo.code == 0x18 and lo.dst == 1 and lo.src == 1)) {
+        // ...unless a flags mov sits between the ld_map_fd pair and the call.
+        if (ri < 3) return false;
+        const hi2 = insns[ri - 2];
+        const lo2 = insns[ri - 3];
+        if (!(lo2.code == 0x18 and lo2.dst == 1 and lo2.src == 1 and hi2.code == 0x00)) return false;
+    } else if (hi.code != 0x00) {
+        return false;
+    }
+    return true;
+}
+
+test "structural: steer program is well-formed (redirect_map + cpumap pseudo-fd + mod key)" {
+    const insns = try buildCpumapSteerProgram(.{ .lpm_map_fd = 7, .cpumap_fd = 9, .cpu_count = 8 });
+    try testing.expect(steerLooksWellFormed(insns));
+
+    // The redirect call references the cpumap fd (9), not the lpm fd (7): find
+    // the ld_map_fd pair feeding the redirect call.
+    var found_cpumap_ref = false;
+    for (insns, 0..) |ins, i| {
+        if (ins.code == 0x85 and ins.imm == redirect_map_helper_id) {
+            // Walk back to the nearest 0x18 (ld_map_fd1) — that is the map arg.
+            var j = i;
+            while (j > 0) : (j -= 1) {
+                if (insns[j - 1].code == 0x18) {
+                    try testing.expectEqual(@as(i32, 9), insns[j - 1].imm);
+                    found_cpumap_ref = true;
+                    break;
+                }
+            }
+        }
+    }
+    try testing.expect(found_cpumap_ref);
+}
+
+test "structural: every non-hit path falls back to a single trailing XDP_PASS" {
+    const insns = try buildCpumapSteerProgram(.{ .lpm_map_fd = 7, .cpumap_fd = 9, .cpu_count = 8 });
+
+    // Exactly two exits: the redirect-tail exit and the PASS-tail exit.
+    var exits: usize = 0;
+    for (insns) |ins| {
+        if (ins.code == 0x95) exits += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), exits);
+
+    // Last instruction is exit; the one before it sets r0 = XDP_PASS(2).
+    try testing.expectEqual(@as(u8, 0x95), insns[insns.len - 1].code);
+    const pass = insns[insns.len - 2];
+    try testing.expectEqual(@as(u8, 0xb7), pass.code);
+    try testing.expectEqual(@as(u4, 0), pass.dst);
+    try testing.expectEqual(@as(i32, 2), pass.imm);
+    const pass_idx = insns.len - 2;
+
+    // Every forward branch (jgt bounds, the two jne parse checks, the jeq LPM
+    // miss) targets that shared PASS instruction.
+    var branches: usize = 0;
+    for (insns, 0..) |ins, i| {
+        const is_branch = ins.code == 0x2d or ins.code == 0x55 or (ins.code == 0x15 and ins.dst == 0);
+        if (is_branch) {
+            const target = i + 1 + @as(usize, @intCast(ins.off));
+            try testing.expectEqual(pass_idx, target);
+            branches += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 4), branches); // jgt + 2x jne + jeq
+}
+
+test "buildCpumapSteerProgram: key_field = .dst reads offsets 30-33" {
+    const insns = try buildCpumapSteerProgram(.{ .lpm_map_fd = 3, .cpumap_fd = 4, .cpu_count = 2, .key_field = .dst });
+    var byte_reads_from_packet: usize = 0;
+    for (insns) |ins| {
+        if (ins.code == 0x71 and ins.src == 1 and ins.dst == 5) {
+            try testing.expect(ins.off >= 30 and ins.off <= 33);
+            byte_reads_from_packet += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 4), byte_reads_from_packet);
+}
+
+test "buildCpumapSteerProgram: cpu_count = 0 is a build error, not a div-by-zero program" {
+    try testing.expectError(SteerBuildError.InvalidCpuCount, buildCpumapSteerProgram(.{
+        .lpm_map_fd = 3,
+        .cpumap_fd = 4,
+        .cpu_count = 0,
+    }));
+}
+
+test "positive control: a steer stream with the wrong redirect helper id is rejected" {
+    // Prove the structural check actually bites: take a real, well-formed steer
+    // program, corrupt ONLY the redirect helper id (51 -> map_lookup_elem 1),
+    // and confirm steerLooksWellFormed flips from true to false. This is the
+    // permanent guard that the well-formedness predicate is not vacuous.
+    const good = try buildCpumapSteerProgram(.{ .lpm_map_fd = 7, .cpumap_fd = 9, .cpu_count = 8 });
+    try testing.expect(steerLooksWellFormed(good));
+
+    var broken: [64]Insn = undefined;
+    @memcpy(broken[0..good.len], good);
+    for (broken[0..good.len]) |*ins| {
+        if (ins.code == 0x85 and ins.imm == redirect_map_helper_id) ins.imm = 1; // wrong helper
+    }
+    try testing.expect(!steerLooksWellFormed(broken[0..good.len]));
+}
+
+test "load: buildCpumapSteerProgram passes the in-kernel verifier (needs CAP_BPF/root)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!hasBpfCapability()) return error.SkipZigTest;
+
+    const maps = @import("maps.zig");
+
+    const lpm_fd = maps.createLpmTrieMap(64) catch |e| switch (e) {
+        error.PermissionDenied => return error.SkipZigTest,
+        else => return e,
+    };
+    defer _ = linux.close(lpm_fd);
+
+    const cpumap_fd = maps.createCpuMap(4) catch |e| switch (e) {
+        error.PermissionDenied => return error.SkipZigTest,
+        else => return e,
+    };
+    defer _ = linux.close(cpumap_fd);
+
+    const insns = try buildCpumapSteerProgram(.{ .lpm_map_fd = lpm_fd, .cpumap_fd = cpumap_fd, .cpu_count = 4 });
+    const prog: ebpf.Program = .{ .prog_type = .xdp, .insns = insns };
+    // Loaded under "GPL": bpf_redirect_map is not a GPL-only helper on current
+    // kernels, but claiming GPL removes any gpl-only-helper ambiguity for the
+    // verifier acceptance check this test exists to make (the license string is
+    // a claim about the generated program, independent of this module's MIT
+    // license). Skips cleanly without CAP_BPF, like every gated test here.
+    const fd = ebpf.load(prog, "GPL") catch |e| switch (e) {
+        error.PermissionDenied => return error.SkipZigTest,
+        else => return e,
+    };
     _ = linux.close(fd);
 }

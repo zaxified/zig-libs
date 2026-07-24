@@ -96,6 +96,60 @@ defer xdp.detach() catch {};
 const class = try xdp_classifier.readScratchClass(scratch_fd);
 ```
 
+### CPUMAP steering (redirect a matched flow to a chosen CPU)
+
+`buildClassifierProgram` classifies and returns `XDP_PASS`; `buildCpumapSteerProgram`
+is the piece that actually **steers** a flow — the last primitive in the
+LibreQoS pipeline `XDP bpf_redirect_map(&cpumap, cpu) → BPF_MAP_TYPE_CPUMAP →
+per-CPU tc MQ/HTB tree`. It reuses the exact same Ethernet+IPv4 parse + LPM
+lookup as the classifier, then redirects the packet to a CPU:
+
+```zig
+// Create the CPUMAP (one slot per CPU) and populate each slot.
+const ncpu = 4;
+const cpumap_fd = try xdp_classifier.createCpuMap(ncpu); // BPF_MAP_TYPE_CPUMAP
+var cpu: u32 = 0;
+while (cpu < ncpu) : (cpu += 1) {
+    try xdp_classifier.populateCpu(cpumap_fd, cpu, 192, null); // qsize 192, no per-CPU prog
+}
+
+// Build + load the steer program (reuses the SAME lpm_fd as the classifier).
+const steer = try xdp_classifier.buildCpumapSteerProgram(.{
+    .lpm_map_fd = lpm_fd,
+    .cpumap_fd = cpumap_fd,
+    .cpu_count = ncpu,
+    .key_field = .src,
+});
+const steer_prog: ebpf.Program = .{ .prog_type = .xdp, .insns = steer };
+const steer_fd = try ebpf.load(steer_prog, "GPL");
+defer std.os.linux.close(steer_fd);
+```
+
+- **CPU-selection policy: class-reduced, not per-flow-hashed.** The matched
+  class handle `c` selects CPU `c % cpu_count`. This mirrors real LibreQoS,
+  whose XDP program takes the CPU from a per-subscriber prefix lookup, **not** a
+  per-flow RSS hash: every packet of a subscriber's prefix resolves to the same
+  class, hence the same CPU, hence the same per-CPU MQ/HTB tree the downstream
+  `tc`/`tcplan` stage shapes. A per-flow 5-tuple hash would keep each *flow* on
+  one CPU but split one subscriber across CPUs, breaking the per-subscriber
+  shaping invariant — so it is deliberately not used. A deployment wanting an
+  explicit class→CPU table stores CPU-valued handles (`c < cpu_count`, so
+  `c % cpu_count == c`).
+- **`bpf_cpumap_val` (`CpumapVal`)** is the 8-byte CPUMAP value: a `u32 qsize`
+  (per-CPU backlog queue length — 192 in LibreQoS) plus a 4-byte union carrying
+  an optional per-CPU XDP program (fd on write, id on read). See
+  `src/maps.zig`'s doc comment for the UAPI citation.
+- **Fallback = `XDP_PASS`.** Any parse/bounds failure or LPM miss returns
+  `XDP_PASS` (the packet continues up the normal stack); on a hit the program
+  returns the `bpf_redirect_map` result (`XDP_REDIRECT` on success). Because the
+  key is reduced `% cpu_count`, the redirect index is always in range for a
+  fully populated CPUMAP; `redirect_flags` defaults to 0 and may be set to
+  `XDP_PASS` on kernels ≥ 5.15 for a fallback action on an unpopulated slot.
+- **Privilege:** creating/populating the CPUMAP and loading the program need
+  `CAP_BPF`/root, same as the classifier — the offline golden/structural tests
+  need no privilege; the map round-trip and verifier-load tests skip cleanly
+  without it.
+
 Low-level, for callers building their own rule-population/tooling: `Ipv4Prefix`
 + `ClassifierRule` + `RuleSet` (validation), `LpmKey` (the exact 8-byte
 `BPF_MAP_TYPE_LPM_TRIE` key encoding, shared byte-for-byte between rule

@@ -22,6 +22,46 @@ pub const scratch_value_size: u32 = 4;
 /// `classifier.ClassifierOptions.scratch_map_fd`'s doc comment.
 pub const scratch_max_entries: u32 = 1;
 
+/// `BPF_MAP_TYPE_CPUMAP` key layout: a native-endian `u32` CPU index. See
+/// `createCpuMap`.
+pub const cpumap_key_size: u32 = 4;
+/// `BPF_MAP_TYPE_CPUMAP` value layout: `struct bpf_cpumap_val` — 8 bytes, see
+/// `CpumapVal`. The kernel accepts a CPUMAP `value_size` of either 4 (bare
+/// `qsize`) or 8 (`qsize` + the optional per-CPU program) — this module always
+/// uses 8 so `populateCpu` can carry a per-CPU XDP program when asked.
+pub const cpumap_value_size: u32 = @sizeOf(CpumapVal);
+
+/// `struct bpf_cpumap_val` (linux UAPI `include/uapi/linux/bpf.h`, added in
+/// kernel 5.9 alongside CPUMAP's optional per-CPU XDP program support): an
+/// 8-byte value written into a `BPF_MAP_TYPE_CPUMAP` slot.
+///
+///   struct bpf_cpumap_val {
+///       __u32 qsize;            // queue size to remote target CPU
+///       union {
+///           int   fd;           // program fd on map write
+///           __u32 id;           // program id on map read
+///       } bpf_prog;
+///   };
+///
+/// `extern struct` (not `packed`) so the field layout is the C ABI the kernel
+/// copies in/out verbatim: `qsize` at offset 0, the union at offset 4, total
+/// size 8 — asserted by this file's `smoke` test, the same
+/// non-privilege-needed layout anchor `rules.LpmKey` has for its own key.
+pub const CpumapVal = extern struct {
+    /// Per-CPU backlog queue length — the number of packets that may sit
+    /// queued for the remote CPU's `cpu_map_kthread` before drops start.
+    /// LibreQoS uses 192; document your own choice at the `populateCpu` call.
+    qsize: u32,
+    /// Optional per-CPU XDP program run on the remote CPU after redirect. A
+    /// union because the kernel takes an fd on write and hands back an id on
+    /// read (see the struct doc above); pass `null` to `populateCpu` for the
+    /// common "no per-CPU program" case, which writes `fd = 0`.
+    bpf_prog: extern union {
+        fd: i32,
+        id: u32,
+    },
+};
+
 pub const CreateMapError = error{
     PermissionDenied,
     Unexpected,
@@ -120,6 +160,42 @@ pub fn readScratchClass(scratch_map_fd: linux.fd_t) !u32 {
     return std.mem.readInt(u32, &value, @import("builtin").cpu.arch.endian());
 }
 
+// ── CPUMAP steering (see classifier.buildCpumapSteerProgram) ────────────────
+//
+// The redirect-to-cpumap XDP program (`classifier.buildCpumapSteerProgram`)
+// steers a matched flow onto a chosen CPU via `bpf_redirect_map(&cpumap, cpu,
+// flags)`; these two helpers create and populate that `BPF_MAP_TYPE_CPUMAP` on
+// the control side, the same setup-time role `createLpmTrieMap`/`populateRule`
+// play for the classifier. The per-CPU HTB/MQ tree a downstream `tc`/`tcplan`
+// stage builds is what actually shapes each CPU's redirected traffic — the
+// flow->CPU decision here and the per-CPU queue there are two halves of one
+// invariant (a subscriber's packets must land on exactly one CPU's queue),
+// see this module's SPEC.
+
+/// Create a `BPF_MAP_TYPE_CPUMAP` (map type 16). `max_entries` = the number of
+/// CPUs the steer program may target; a redirect to an index `>= max_entries`
+/// (or to an unpopulated slot) is a runtime miss, not a creation error. Unlike
+/// `createLpmTrieMap`, CPUMAP needs no creation-time `map_flags`, so
+/// `std.os.linux.BPF.map_create`'s ordinary wrapper is sufficient (same as
+/// `createScratchMap`). Key = native-endian `u32` CPU index
+/// (`cpumap_key_size`), value = `CpumapVal` (`cpumap_value_size`).
+pub fn createCpuMap(max_entries: u32) !linux.fd_t {
+    return BPF.map_create(.cpumap, cpumap_key_size, cpumap_value_size, max_entries);
+}
+
+/// Populate one CPUMAP slot: at key `cpu`, write a `CpumapVal{ .qsize, .fd =
+/// prog_fd orelse 0 }`. `qsize` is the per-CPU backlog queue length (LibreQoS
+/// uses 192 — big enough to absorb bursts without inflating latency); a
+/// non-null `prog_fd` attaches an optional per-CPU XDP program run after the
+/// redirect. The value is written in native `CpumapVal` (C-ABI) layout, which
+/// is exactly what the kernel copies into `struct bpf_cpumap_val`.
+pub fn populateCpu(map_fd: linux.fd_t, cpu: u32, qsize: u32, prog_fd: ?linux.fd_t) PopulateError!void {
+    var key: [4]u8 = undefined;
+    std.mem.writeInt(u32, &key, cpu, @import("builtin").cpu.arch.endian());
+    var value: CpumapVal = .{ .qsize = qsize, .bpf_prog = .{ .fd = prog_fd orelse 0 } };
+    BPF.map_update_elem(map_fd, &key, std.mem.asBytes(&value), 0) catch |e| return mapPopulateError(e);
+}
+
 // ── tests ────────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -157,6 +233,44 @@ test "createLpmTrieMap + populateRule + real lookup round-trip (needs CAP_BPF/ro
     var value: [4]u8 = undefined;
     try BPF.map_lookup_elem(lpm_fd, &lookup_key, &value);
     try testing.expectEqual(@as(u32, 7), std.mem.readInt(u32, &value, builtin.cpu.arch.endian()));
+}
+
+test "smoke: CpumapVal has the exact 8-byte struct bpf_cpumap_val layout" {
+    // Non-privileged layout anchor for the CPUMAP steering path — the same
+    // role the LPM key-size constants play above. If the kernel UAPI layout
+    // and this struct ever disagree, populateCpu would write mis-aligned
+    // bytes the kernel silently reinterprets, so pin size AND offsets.
+    try testing.expectEqual(@as(usize, 8), @sizeOf(CpumapVal));
+    try testing.expectEqual(@as(usize, 0), @offsetOf(CpumapVal, "qsize"));
+    try testing.expectEqual(@as(usize, 4), @offsetOf(CpumapVal, "bpf_prog"));
+    try testing.expectEqual(@as(u32, 4), cpumap_key_size);
+    try testing.expectEqual(@as(u32, 8), cpumap_value_size);
+}
+
+test "createCpuMap + populateCpu + real lookup round-trip (needs CAP_BPF/root)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!hasBpfCapability()) return error.SkipZigTest;
+
+    const cpumap_fd = createCpuMap(4) catch |e| switch (e) {
+        error.PermissionDenied => return error.SkipZigTest,
+        else => return e,
+    };
+    defer _ = linux.close(cpumap_fd);
+
+    // qsize 192 (LibreQoS's per-CPU backlog), no per-CPU program.
+    populateCpu(cpumap_fd, 0, 192, null) catch |e| switch (e) {
+        error.PermissionDenied => return error.SkipZigTest,
+        else => return e,
+    };
+
+    var key: [4]u8 = undefined;
+    std.mem.writeInt(u32, &key, 0, builtin.cpu.arch.endian());
+    var value: [cpumap_value_size]u8 = undefined;
+    try BPF.map_lookup_elem(cpumap_fd, &key, &value);
+    const got: CpumapVal = std.mem.bytesToValue(CpumapVal, &value);
+    try testing.expectEqual(@as(u32, 192), got.qsize);
+    // No per-CPU program was written, so the read-back program id is 0.
+    try testing.expectEqual(@as(u32, 0), got.bpf_prog.id);
 }
 
 test "createScratchMap + readScratchClass round-trip (needs CAP_BPF/root)" {
