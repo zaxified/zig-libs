@@ -11,7 +11,7 @@ cross-project-reusable capability — a production-grade implementation of a pro
 or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
 authors' other projects depend on it, not the reverse.
 
-**Status:** 194 modules · 7864 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 195 modules · 7864 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ## Using a module
@@ -125,6 +125,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `ethtool` | Ethernet device control over the ethtool netlink family — link settings/state, ring/coalesce/pause/channel parameters, feature flags, per-queue and driver statistics, EEPROM/module info | **linux** | genetlink, netlink |
 | `wireguard` | Native WireGuard device config over genetlink — get/set device, peers, allowed-ips (retires `wg` shell-outs) | **linux** | netlink, genetlink |
 | `tc` | Traffic control over rtnetlink — qdiscs (`netem`, `htb`, `tbf`, `fq_codel`, `mq`, `cake`, `raw`), htb classes, `u32`/`flower` filters and the `gact`/`mirred`/`police`/`skbedit`/`vlan` action families, byte-exact to `iproute2` with read-back verify (retires `tc` shell-outs) | **linux** | netlink |
+| `tcplan` | Compile a hierarchical shaping topology (site→AP→subscriber, committed/ceil rates) into a deterministic ordered plan of `tc` ops — `mq` root + per-CPU HTB trees + CAKE leaves + filters, cpumap→MQ→per-CPU aligned; pure (caller executes via `tc`+`netlink`) | linux | tc |
 | `nftables` | Typed firewall-ruleset builder → libnftables JSON for `nft -j -f -` (families/chains/rules/sets, match + verdict statements) | any (apply: linux) | — |
 | `bacnet` | BACnet building automation over **BACnet/IP and BACnet/SC** — BVLL/BVLC framing, NPDU routing header, APDU services (ReadProperty, ReadPropertyMultiple, WriteProperty, WhoIs/IAm, COV subscription), and the ASN.1-style primitive encoding Plus Annex AB Secure Connect: the SC BVLC with VMAC/UUID addressing and header options, a time-injected node and hub connection state machine with heartbeats, backoff and hub failover, over the `websocket` module with TLS as a seam. | any | netaddr, websocket |
 | `s7comm` | Siemens S7 communication — ISO-on-TCP (RFC 1006 TPKT + COTP) plus the S7 protocol: connection setup, area read/write (DB/M/I/Q/T/C), PLC info and cyclic services | any | — |
