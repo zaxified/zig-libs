@@ -65,6 +65,7 @@ const module_list = [_]Module{
     .{ .name = "pping" },
     .{ .name = "spf-ect" },
     .{ .name = "ethfrag" },
+    .{ .name = "l2encap" },
     .{ .name = "netsim" },
     .{ .name = "loopfree-reconv", .deps = &.{ "netsim", "spf-ect" } },
     .{ .name = "df-elect", .deps = &.{"netsim"} },
