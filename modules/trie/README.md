@@ -94,22 +94,13 @@ files crossing a trust boundary; queries are bounds-checked either way.
 
 The frozen buffer is compact (~40 B per key) and the **query side allocates
 nothing** on the `lookup` / `topN` paths — that is the deployed hot path and it
-is lean. The **build** phase, however, is allocation-heavy: each trie node holds
-two independently grown arrays (child labels + child ids), i.e. two allocations
-per node, and a large key set is millions of nodes. Consequences the caller must
-know when building at RÚIAN scale (millions of keys):
-
-- **Do not build under a debug/safety allocator** (`DebugAllocator`,
-  sanitizer-style GPAs). Per-allocation metadata over millions of tiny
-  allocations can balloon RSS by an order of magnitude and OOM the process.
-  Use `std.heap.smp_allocator` / a plain general-purpose allocator (or
-  `page_allocator`) for the build.
-- A bare `ArenaAllocator` keeps memory *simple* but *retains* every intermediate
-  buffer left behind by array doubling (no reuse), costing ~1 KB transient per
-  key. Fine up to a few hundred k keys; for millions prefer a freeing GPA.
-- Measured (freeing arena, this repo's host): build RSS grows **linearly** at
-  ~1 GB per 1 M keys; the frozen output is ~40 MB per 1 M keys. Freeze is a
-  one-time cost; ship the frozen buffer and never build in the request path.
-
-A lower-allocation two-pass builder (exact-size child arrays) is a planned
-optimization — see `SPEC.md`.
+is lean. The **build** phase keeps the whole trie in just **two growable pools** (a node
+pool + an edge pool), so a millions-of-keys build is a handful of allocations,
+not two per node. That makes build RSS both low and **allocator-insensitive** —
+it does not blow up under a debug/safety allocator. Measured on this repo's host
+(synthetic address keys): build RSS is **linear**, ~80–300 B per key
+(≈ 80–300 MB per 1 M keys, freeing GPA at the low end, bare arena at the high
+end); the frozen output is ~40 MB per 1 M keys. Freeze is a one-time cost — ship
+the frozen buffer and never build in the request path. A bare `ArenaAllocator`
+still costs a little more than a freeing GPA (it never reuses a pool's old halves
+after a realloc), but both are safe at scale; see `SPEC.md` for the numbers.

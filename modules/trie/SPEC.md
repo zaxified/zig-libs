@@ -150,34 +150,38 @@ file at a higher layer if producer authenticity matters.
 
 ## Build-time memory profile (measured)
 
-Build RSS is **linear** in the key count — no algorithmic blow-up. On this
-repo's host, with a freeing arena over synthetic address-like keys:
+Build RSS is **linear** in the key count — no algorithmic blow-up. The builder
+keeps the whole trie in **two growable pools**: a node pool and an edge pool.
+Each node's children are an intrusive singly-linked sibling list threaded through
+the edge pool (`Node.first_edge` heads it, each `Edge.next` chains on); `freeze`
+sorts each node's edges by label just before emission. So the entire build is a
+handful of pool doublings (~O(log N) allocations total), **not two allocations
+per node**. Consequences:
 
-| keys | distinct | frozen buffer | build RSS |
-|-----:|---------:|--------------:|----------:|
-| 50 k | ~50 k | 2.4 MB | 80 MB |
-| 100 k | ~100 k | 4.4 MB | 130 MB |
-| 200 k | ~200 k | 8.1 MB | 261 MB |
-| 400 k | ~400 k | 14.9 MB | 417 MB |
+- Build RSS is low and, crucially, **allocator-insensitive** — it does not
+  explode under a debug/safety allocator, because the safety allocator now tracks
+  ~tens of pool allocations, not millions of per-node ones.
+- Descent is a linear scan of a node's sibling list instead of a binary search,
+  but child counts are tiny (≤ 256 distinct byte labels, usually a handful), so
+  this is not a hot cost.
 
-≈ **1 GB build RSS per 1 M keys**, frozen output ≈ 40 B/key. The cost comes from
-the builder holding **two grow-by-doubling arrays per node** (child labels +
-child ids): millions of nodes ⇒ millions of small allocations. Two caller-facing
-consequences, documented in the README:
+Measured on this repo's host, synthetic address-like keys:
 
-1. Building under a **debug/safety allocator** is pathological — per-allocation
-   metadata over millions of tiny allocations can inflate RSS ~10× and OOM the
-   process. (This is the mechanism behind a 22 GB OOM observed when an early
-   benchmark built ≥1 M keys under `DebugAllocator`.) Build with a plain
-   general-purpose allocator.
-2. A bare arena retains doubling-intermediate buffers (~1 KB transient/key). Fine
-   to a few hundred k; prefer a freeing GPA for millions.
+| keys | frozen buffer | build RSS (freeing GPA) | build RSS (bare arena) |
+|-----:|--------------:|------------------------:|-----------------------:|
+| 200 k | 8.1 MB | 19 MB (82 B/key) | 62 MB (324 B/key) |
+| 400 k | 14.9 MB | 31 MB (82 B/key) | 116 MB (304 B/key) |
 
-**Planned optimization (not yet done):** a two-pass builder that counts children
-per node first, then allocates each node's child arrays once at exact size —
-eliminating the doubling churn, cutting the allocation count from ~2/node to
-~1/node, and making build memory allocator-insensitive. Query API and frozen
-format are unaffected.
+≈ 80–300 B build RSS per key (GPA … arena), frozen output ≈ 40 B/key.
+
+**History:** an earlier builder held two grow-by-doubling arrays *per node*
+(child labels + child ids). That was ~1 KB transient/key under an arena and
+**pathological under a debug/safety allocator** — per-allocation metadata over
+millions of tiny allocations inflated RSS ~10× and OOM-killed a ≥1 M-key
+benchmark at 22 GB. The two-pool sibling-list build above replaced it, cutting
+the arena path ~3.6× (1095 → 304 B/key) and turning the safety-allocator path
+from an OOM into the *leanest* path (82 B/key, no leaks). Query API and frozen
+format are unchanged (the differential oracle tests pass identically).
 
 ## API sharp edge — `topN` key buffer sizing
 
@@ -189,8 +193,6 @@ stride returns `error.KeyTooLong`. Callers must therefore size `key_buf` as
 
 ## Deliberately deferred
 
-- **Two-pass exact-size builder** — see "Build-time memory profile" above; the
-  highest-value remaining optimization for the millions-of-keys use case.
 - **Suffix minimization (DAFSA/FST).** The biggest memory win; deferrable behind
   the same query API + a bumped `format_version`. Un-minimized fits RAM at
   RÚIAN scale.

@@ -28,58 +28,69 @@ pub const FreezeError = error{
     TooLarge,
 };
 
-/// One in-memory trie node. Children are kept as two parallel, label-sorted
-/// arrays (`labels[i]` routes to `kids[i]`); binary search descends during
-/// build. `best` is filled in by `freeze`'s post-order pass.
+/// Sentinel "no edge" index — the empty first_edge / end of a sibling list.
+const no_edge: u32 = std.math.maxInt(u32);
+
+/// One in-memory trie node. Children are an intrusive singly-linked sibling
+/// list threaded through the builder-global `edges` pool (`first_edge` heads
+/// the list, each `Edge.next` chains on); this keeps the whole trie in just TWO
+/// growable pools (`nodes` + `edges`) with amortized O(1) allocations total,
+/// instead of two grow-by-doubling arrays PER node. `best` is filled in by
+/// `freeze`'s post-order pass. The sibling list is unordered during build;
+/// `freeze` sorts each node's edges by label (the format requires ascending
+/// labels for the query-side binary search).
 const Node = struct {
     terminal: bool = false,
     value: u32 = 0,
     best: u32 = 0,
-    labels: std.ArrayListUnmanaged(u8) = .empty,
-    kids: std.ArrayListUnmanaged(u32) = .empty,
+    first_edge: u32 = no_edge,
+    edge_count: u16 = 0,
+};
 
-    fn deinit(self: *Node, gpa: Allocator) void {
-        self.labels.deinit(gpa);
-        self.kids.deinit(gpa);
-    }
-
-    /// Index of `label` in the sorted `labels`, or the insertion point.
-    fn search(self: *const Node, label: u8) struct { found: bool, index: usize } {
-        var lo: usize = 0;
-        var hi: usize = self.labels.items.len;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            const l = self.labels.items[mid];
-            if (l < label) {
-                lo = mid + 1;
-            } else if (l > label) {
-                hi = mid;
-            } else {
-                return .{ .found = true, .index = mid };
-            }
-        }
-        return .{ .found = false, .index = lo };
-    }
+/// One parent→child edge in the builder-global pool. `child` is a node id;
+/// `next` chains to the next sibling under the same parent (or `no_edge`).
+const Edge = struct {
+    label: u8,
+    child: u32,
+    next: u32,
 };
 
 /// Incremental trie builder. Insert `(key, value)` pairs in any order, then
 /// `freeze` once. Not reusable after `freeze` consumes it (call `deinit` if you
 /// abandon a builder without freezing).
+///
+/// Memory: exactly two growable pools (`nodes`, `edges`), each doubling only
+/// O(log N) times over the WHOLE build — so a millions-of-keys build is a
+/// handful of allocations, not millions of tiny ones. That makes build RSS both
+/// low (~32 B/node) and allocator-insensitive: it no longer explodes under a
+/// debug/safety allocator, which is what previously OOM'd a large build.
 pub const Builder = struct {
     gpa: Allocator,
     nodes: std.ArrayListUnmanaged(Node),
+    edges: std.ArrayListUnmanaged(Edge),
     key_count: u64 = 0,
 
     pub fn init(gpa: Allocator) BuildError!Builder {
         var nodes: std.ArrayListUnmanaged(Node) = .empty;
         try nodes.append(gpa, .{}); // node 0 = root
-        return .{ .gpa = gpa, .nodes = nodes };
+        return .{ .gpa = gpa, .nodes = nodes, .edges = .empty };
     }
 
     pub fn deinit(self: *Builder) void {
-        for (self.nodes.items) |*n| n.deinit(self.gpa);
         self.nodes.deinit(self.gpa);
+        self.edges.deinit(self.gpa);
         self.* = undefined;
+    }
+
+    /// Index of the edge under node `parent` whose label is `b`, or `no_edge`.
+    /// Linear over the sibling list — child counts are tiny (≤ 256 distinct
+    /// byte labels, in practice a handful).
+    fn findChildEdge(self: *const Builder, parent: u32, b: u8) u32 {
+        var e = self.nodes.items[parent].first_edge;
+        while (e != no_edge) : (e = self.edges.items[e].next) {
+            if (self.edges.items[e].label == b) return e;
+        }
+        return no_edge;
     }
 
     /// Insert or overwrite `key` → `value`. Arbitrary bytes; the empty key is
@@ -87,18 +98,22 @@ pub const Builder = struct {
     pub fn insert(self: *Builder, key: []const u8, value: u32) BuildError!void {
         var cur: u32 = 0; // root
         for (key) |b| {
-            const s = self.nodes.items[cur].search(b);
-            if (s.found) {
-                cur = self.nodes.items[cur].kids.items[s.index];
+            const found = self.findChildEdge(cur, b);
+            if (found != no_edge) {
+                cur = self.edges.items[found].child;
             } else {
-                // Create the child first (may realloc the pool); then edit the
-                // parent by index — never hold a Node pointer across the append.
+                // Append the child node and its edge to the global pools (each
+                // may realloc). Read the parent's old list head BEFORE the
+                // appends, then re-index the parent by id afterwards — never
+                // hold a pointer across an append.
                 const new_id: u32 = @intCast(self.nodes.items.len);
+                const prev_head = self.nodes.items[cur].first_edge;
                 try self.nodes.append(self.gpa, .{});
+                const new_edge: u32 = @intCast(self.edges.items.len);
+                try self.edges.append(self.gpa, .{ .label = b, .child = new_id, .next = prev_head });
                 const parent = &self.nodes.items[cur];
-                try parent.labels.insert(self.gpa, s.index, b);
-                errdefer _ = parent.labels.orderedRemove(s.index);
-                try parent.kids.insert(self.gpa, s.index, new_id);
+                parent.first_edge = new_edge; // prepend (order fixed at freeze)
+                parent.edge_count += 1;
                 cur = new_id;
             }
         }
@@ -119,7 +134,10 @@ pub const Builder = struct {
                 i -= 1;
                 const n = &self.nodes.items[i];
                 var best: u32 = if (n.terminal) n.value else 0;
-                for (n.kids.items) |kid| best = @max(best, self.nodes.items[kid].best);
+                var e = n.first_edge;
+                while (e != no_edge) : (e = self.edges.items[e].next) {
+                    best = @max(best, self.nodes.items[self.edges.items[e].child].best);
+                }
                 n.best = best;
             }
         }
@@ -152,11 +170,24 @@ pub const Builder = struct {
             }
             std.mem.writeInt(u32, buf[p .. p + 4][0..4], n.best, .little);
             p += format.best_size;
-            std.mem.writeInt(u16, buf[p .. p + 2][0..2], @intCast(n.labels.items.len), .little);
+            std.mem.writeInt(u16, buf[p .. p + 2][0..2], n.edge_count, .little);
             p += format.edge_count_size;
-            for (n.labels.items, n.kids.items) |label, kid| {
-                buf[p] = label;
-                std.mem.writeInt(u32, buf[p + 1 .. p + 5][0..4], offsets[kid], .little);
+            // Collect this node's sibling list and sort by label ascending — the
+            // format (and the query-side binary search) require ordered edges.
+            // A node has at most 256 distinct byte labels, so a fixed buffer and
+            // a small sort suffice; no allocation.
+            var tmp: [256]Edge = undefined;
+            var cnt: usize = 0;
+            var e = n.first_edge;
+            while (e != no_edge) : (e = self.edges.items[e].next) {
+                tmp[cnt] = self.edges.items[e];
+                cnt += 1;
+            }
+            std.debug.assert(cnt == n.edge_count);
+            std.mem.sort(Edge, tmp[0..cnt], {}, edgeLabelLess);
+            for (tmp[0..cnt]) |edge| {
+                buf[p] = edge.label;
+                std.mem.writeInt(u32, buf[p + 1 .. p + 5][0..4], offsets[edge.child], .little);
                 p += format.edge_size;
             }
         }
@@ -174,10 +205,14 @@ pub const Builder = struct {
     }
 };
 
+fn edgeLabelLess(_: void, a: Edge, b: Edge) bool {
+    return a.label < b.label;
+}
+
 fn nodeSize(n: *const Node) usize {
     var s: usize = format.flags_size + format.best_size + format.edge_count_size;
     if (n.terminal) s += format.value_size;
-    s += n.labels.items.len * format.edge_size;
+    s += @as(usize, n.edge_count) * format.edge_size;
     return s;
 }
 
@@ -203,7 +238,10 @@ test "build: child ids always exceed parent ids (offset invariant precondition)"
     try b.insert("xyz", 3);
     // Re-walk: every edge must point to a higher id.
     for (b.nodes.items, 0..) |*n, id| {
-        for (n.kids.items) |kid| try testing.expect(kid > id);
+        var e = n.first_edge;
+        while (e != no_edge) : (e = b.edges.items[e].next) {
+            try testing.expect(b.edges.items[e].child > id);
+        }
     }
 }
 
