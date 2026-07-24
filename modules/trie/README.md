@@ -73,16 +73,43 @@ const f = try trie.Frozen.load(buf);           // fast: header only, O(1)
 const v = try f.lookup("praha");               // ?u32
 
 var results: [10]trie.Completion = undefined;
-var key_buf: [256]u8 = undefined;
+// key_buf is SHARED across the N result slots: it must hold results.len ×
+// (longest completion). topN slices it into results.len equal strides, so an
+// undersized buffer yields error.KeyTooLong. Size it N × max-key, not max-key.
+var key_buf: [10 * 128]u8 = undefined;
 const top = try f.topN("p", &results, &key_buf, .{});
 // top.items ranked best-first; top.status == .complete or .truncated_budget
 
 var it = try f.prefixIterator(gpa, "p");        // lexicographic enumeration
 defer it.deinit();
-var kb: [256]u8 = undefined;
+var kb: [256]u8 = undefined;                    // one key at a time: max-key is enough
 while (try it.next(&kb)) |c| { /* c.value, c.key */ }
 ```
 
 A `Completion.key` borrows the caller's `key_buf`; it is valid only until that
 buffer is reused. `loadVerified` adds a one-time full node-region CRC check for
 files crossing a trust boundary; queries are bounds-checked either way.
+
+### Build-time memory
+
+The frozen buffer is compact (~40 B per key) and the **query side allocates
+nothing** on the `lookup` / `topN` paths — that is the deployed hot path and it
+is lean. The **build** phase, however, is allocation-heavy: each trie node holds
+two independently grown arrays (child labels + child ids), i.e. two allocations
+per node, and a large key set is millions of nodes. Consequences the caller must
+know when building at RÚIAN scale (millions of keys):
+
+- **Do not build under a debug/safety allocator** (`DebugAllocator`,
+  sanitizer-style GPAs). Per-allocation metadata over millions of tiny
+  allocations can balloon RSS by an order of magnitude and OOM the process.
+  Use `std.heap.smp_allocator` / a plain general-purpose allocator (or
+  `page_allocator`) for the build.
+- A bare `ArenaAllocator` keeps memory *simple* but *retains* every intermediate
+  buffer left behind by array doubling (no reuse), costing ~1 KB transient per
+  key. Fine up to a few hundred k keys; for millions prefer a freeing GPA.
+- Measured (freeing arena, this repo's host): build RSS grows **linearly** at
+  ~1 GB per 1 M keys; the frozen output is ~40 MB per 1 M keys. Freeze is a
+  one-time cost; ship the frozen buffer and never build in the request path.
+
+A lower-allocation two-pass builder (exact-size child arrays) is a planned
+optimization — see `SPEC.md`.

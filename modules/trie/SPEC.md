@@ -148,8 +148,49 @@ file at a higher layer if producer authenticity matters.
 - Green in Debug and `-Doptimize=ReleaseFast`; `zig fmt --check` clean;
   `zig build check-catalog` exit 0.
 
+## Build-time memory profile (measured)
+
+Build RSS is **linear** in the key count — no algorithmic blow-up. On this
+repo's host, with a freeing arena over synthetic address-like keys:
+
+| keys | distinct | frozen buffer | build RSS |
+|-----:|---------:|--------------:|----------:|
+| 50 k | ~50 k | 2.4 MB | 80 MB |
+| 100 k | ~100 k | 4.4 MB | 130 MB |
+| 200 k | ~200 k | 8.1 MB | 261 MB |
+| 400 k | ~400 k | 14.9 MB | 417 MB |
+
+≈ **1 GB build RSS per 1 M keys**, frozen output ≈ 40 B/key. The cost comes from
+the builder holding **two grow-by-doubling arrays per node** (child labels +
+child ids): millions of nodes ⇒ millions of small allocations. Two caller-facing
+consequences, documented in the README:
+
+1. Building under a **debug/safety allocator** is pathological — per-allocation
+   metadata over millions of tiny allocations can inflate RSS ~10× and OOM the
+   process. (This is the mechanism behind a 22 GB OOM observed when an early
+   benchmark built ≥1 M keys under `DebugAllocator`.) Build with a plain
+   general-purpose allocator.
+2. A bare arena retains doubling-intermediate buffers (~1 KB transient/key). Fine
+   to a few hundred k; prefer a freeing GPA for millions.
+
+**Planned optimization (not yet done):** a two-pass builder that counts children
+per node first, then allocates each node's child arrays once at exact size —
+eliminating the doubling churn, cutting the allocation count from ~2/node to
+~1/node, and making build memory allocator-insensitive. Query API and frozen
+format are unaffected.
+
+## API sharp edge — `topN` key buffer sizing
+
+`topN` shares one `key_buf` across all `results.len` output slots, slicing it
+into equal strides of `key_buf.len / results.len`. A completion longer than one
+stride returns `error.KeyTooLong`. Callers must therefore size `key_buf` as
+**`results.len × longest-expected-completion`**, not just one key. (The single
+`prefixIterator` `next(buf)` path has no such multiplier — one key at a time.)
+
 ## Deliberately deferred
 
+- **Two-pass exact-size builder** — see "Build-time memory profile" above; the
+  highest-value remaining optimization for the millions-of-keys use case.
 - **Suffix minimization (DAFSA/FST).** The biggest memory win; deferrable behind
   the same query API + a bumped `format_version`. Un-minimized fits RAM at
   RÚIAN scale.
