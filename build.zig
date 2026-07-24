@@ -73,6 +73,7 @@ const module_list = [_]Module{
     .{ .name = "isis-flood", .deps = &.{ "isis", "isis-lsdb" } },
     .{ .name = "isis-spf", .deps = &.{ "isis", "isis-lsdb", "spf-ect" } },
     .{ .name = "aeadframe", .deps = &.{"chachapoly"} },
+    .{ .name = "tenantkex", .deps = &.{"noise"} },
     .{ .name = "netsim" },
     .{ .name = "loopfree-reconv", .deps = &.{ "netsim", "spf-ect" } },
     .{ .name = "df-elect", .deps = &.{"netsim"} },
