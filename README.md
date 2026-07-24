@@ -11,7 +11,7 @@ cross-project-reusable capability — a production-grade implementation of a pro
 or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
 authors' other projects depend on it, not the reverse.
 
-**Status:** 202 modules · 7864 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 203 modules · 7864 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ## Using a module
@@ -180,6 +180,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `lockfree` | **Lock-free concurrency primitives** for shared-memory worker pools (Michael & Scott MPMC queue, PODC 1996 + Fraser/crossbeam epoch reclamation) — the workspace's first lock-free structure; immediate consumer = the in-process worker pool. The mechanical layer (typed atomic helpers + backoff, a poisoning node pool whose canary catches use-after-free, the EBR domain/participant storage + registration, the queue node/init/deinit) and the entire real-threads concurrent-stress harness (N-producer/M-consumer multiset invariant — no lost/duplicated/corrupted — with a correct spinlock oracle, a deliberately-racy `BrokenRing` positive control, and deterministic checker + canary teeth) are green in Debug + ReleaseFast. The concurrency-correctness **core is implemented** — EBR `enterCritical`/`exitCritical`/`retire`/`tryAdvance` (the safe-reclaim predicate) + the queue `enqueue`/`dequeue` CAS loops — under a **`seq_cst` discipline** (Zig 0.16 removed `@fence`, so every reclamation-relevant atomic is `.seq_cst`, giving one total order that forbids the store-buffering UAF); the grace-period safety theorem is documented at `ebr.Domain.tryAdvance`. Sanitizers unusable here (no pure-Zig ASan flag; TSan links libc + misses a blatant race) → the poison/canary pool is the in-tree UAF detector, verified to catch a grace-period sabotage 6/6 | any | — |
 | `ethfrag` | Hardened inner-frame fragmentation/reassembly codec — RFC 5722 whole-datagram overlap rejection, bounded per-datagram + concurrent-datagram memory, caller-clocked timeout, fuzz-tested never-panic | any | — |
 | `l2encap` | Tenant-tagged (24-bit I-SID) L2-over-tunnel encapsulation for a multi-tenant L2VPN fabric — lean versioned header (I-SID + TTL + BUM/split-horizon bits) wrapping a customer Ethernet frame for encrypted-backbone transport; bounds-checked untrusted decode, composes with `ethfrag` | any | — |
+| `l2forward` | E-LAN edge forwarding table — per-I-SID customer-MAC learning (MAC → remote PE) with time-injected aging + the BUM ingress-replication set with split-horizon; forward decision (known-unicast PE vs replication set) for a multi-tenant L2VPN fabric; pairs with `l2encap` | any | — |
 
 ### Data & storage
 
