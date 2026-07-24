@@ -69,6 +69,7 @@ const module_list = [_]Module{
     .{ .name = "l2forward" },
     .{ .name = "isis" },
     .{ .name = "isis-adj", .deps = &.{"isis"} },
+    .{ .name = "isis-dis", .deps = &.{"isis"} },
     .{ .name = "isis-lsdb", .deps = &.{"isis"} },
     .{ .name = "isis-flood", .deps = &.{ "isis", "isis-lsdb" } },
     .{ .name = "isis-spf", .deps = &.{ "isis", "isis-lsdb", "spf-ect" } },

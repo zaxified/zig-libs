@@ -11,7 +11,7 @@ cross-project-reusable capability — a production-grade implementation of a pro
 or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
 authors' other projects depend on it, not the reverse.
 
-**Status:** 204 modules · 7864 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 205 modules · 7864 tests (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ## Using a module
@@ -149,6 +149,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `l2disco` | Layer-2 / neighbor discovery codec — LLDP (802.1AB) + CDP + ARP (RFC 826) + DHCP options (RFC 2131/2132) + MAC helper | any | netaddr |
 | `isis` | IS-IS (ISO/IEC 10589) PDU codec — common header + TLV framework + IIH/LSP PDUs + SPB (802.1aq) TLVs + raw-TLV escape hatch; pure bounds-checked encode/decode of untrusted link bytes, the wire foundation for an SPB control plane | any | — |
 | `isis-adj` | IS-IS point-to-point adjacency state machine (ISO 10589 §8.2 + RFC 5303 three-way handshake) — a pure time-injected FSM driving one P2P neighbour Down→Init→Up from received IIH PDUs (`isis` codec) + hold-timer expiry; no threads/timers/sockets | any | isis |
+| `isis-dis` | IS-IS LAN Designated-IS election (ISO 10589 §8.4.5) — from the LAN routers' priority + SNPA elect the DIS (highest priority, SNPA tie-break, preemptive), report whether this system is DIS + derive the pseudonode LSP-ID; pure time-injected, adds LAN to the P2P isis stack | any | isis |
 | `isis-lsdb` | IS-IS link-state database — store LSPs by LSP-ID, ISO 10589 §7.3 newer-LSP comparison (seq → zero-lifetime → checksum), time-injected aging + MaxAge purge, per-interface SRM/SSN flag sets for flooding; pure (caller drives I/O), on the `isis` codec | any | isis |
 | `isis-flood` | IS-IS flooding transmit scheduler — drain `isis-lsdb` per-interface SRM/SSN flags into the ordered PDUs to send, pace LSP (re)transmission + emit periodic CSNPs; pure time-injected (caller supplies now + Up-adjacency ifaces, does the sends) | any | isis, isis-lsdb |
 | `isis-spf` | Compute the IS-IS shortest-path forwarding table from an `isis-lsdb` — IS-reachability TLVs → topology graph (two-way-checked edges) → `spf-ect` Dijkstra + ECT tie-break from the local system → route table (dest system-id → next-hop + metric); pure, deterministic | any | isis, isis-lsdb, spf-ect |
