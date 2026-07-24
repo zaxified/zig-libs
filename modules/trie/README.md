@@ -1,5 +1,88 @@
 # trie
 
-Prefix index for instant autocomplete over a large, static string set.
+Memory-efficient **frozen prefix index for instant autocomplete** over a large,
+static string set. Build an index from `(key, value)` pairs, **freeze** it to a
+flat, self-describing, versioned, little-endian byte buffer, then query that
+buffer **zero-copy** from an mmap'd / read-only slice — no per-query allocation
+on the exact-lookup and top-N paths.
 
-**Status:** gap (placeholder — implementation pending).
+The driving consumer is a Czech RÚIAN address search: millions of UTF-8 address
+strings, a user-typed prefix, and a sub-millisecond "top-N completions" answer.
+The module itself is general — any static string→`u32` set that needs prefix
+completion.
+
+- **Model after:** BurntSushi/`fst` (Rust), Lucene FST — the frozen-index
+  autocomplete lineage. (This build is a byte-labelled trie, not a minimized
+  FST/DAFSA; see `SPEC.md` for the A-vs-B decision and the deferred minimization.)
+- **Platform:** any — pure logic, no OS dependency (the only clock use is
+  test-only benchmarking). **Role:** util. **Concurrency:** `reentrant` — a
+  frozen buffer is immutable, so any number of threads may query one buffer
+  concurrently with no synchronization.
+- **Deps:** none (`std` only).
+
+> **Status: implemented.** Build → freeze → zero-copy load → query is complete
+> and tested. A naive sorted-slice oracle differential (randomized, over
+> adversarial key sets — prefix-of-another, duplicates, single-byte, very long,
+> shared-prefix, multi-byte UTF-8) pins `lookup`, prefix enumeration, and
+> top-N ordering; a corrupt-buffer fuzz harness pins the untrusted-buffer
+> loader; hand-malformed positive controls prove the checkers have teeth. See
+> `SPEC.md` for the wire format field-by-field and the threat model.
+
+Provenance: clean-room. Design references only — BurntSushi/`fst` and Lucene FST
+(frozen-index autocomplete *approach*); no third-party source consulted or
+copied. See `NOTICE`.
+
+## Contracts
+
+- **Keys are arbitrary bytes, compared bytewise.** Unicode normalization
+  (NFC / case-folding / diacritic-stripping) is the **caller's** job: to get
+  accent- or case-insensitive matching, fold both the stored keys and the query
+  prefix the same way *before* handing them here. The empty key is allowed (it
+  marks the root as terminal).
+- **Duplicate keys: last write wins.** Inserting the same key twice keeps the
+  last value; `key_count` counts distinct keys. In a frozen trie every key is
+  therefore distinct.
+- **Top-N ranking is a total order:** primary — higher stored `u32` value first
+  (descending); tie-break — smaller key first (lexicographic byte order). Since
+  keys are distinct this never ties.
+- **Bounded work / DoS guard:** `topN` takes a `QueryOptions.max_visited` node
+  budget (default 50 000). A one-character prefix over millions of keys stops at
+  the budget and returns `status = .truncated_budget` with a best-effort partial
+  answer, rather than walking the whole set. `subtree_best` pruning means
+  well-ranked queries usually finish far under budget. `max_visited = 0` means
+  unbounded — do not use on untrusted prefixes.
+
+## API
+
+```zig
+const trie = @import("trie");
+
+// Build.
+var b = try trie.Builder.init(gpa);
+defer b.deinit();
+try b.insert("praha", 100);
+try b.insert("plzen", 90);
+const buf = try b.freeze(gpa);   // caller owns `buf`; write it to a file / mmap
+defer gpa.free(buf);
+// or one-shot: const buf = try trie.freezeFromPairs(gpa, gpa, pairs);
+
+// Query a frozen buffer (zero-copy; `buf` may be a read-only mmap).
+const f = try trie.Frozen.load(buf);           // fast: header only, O(1)
+// const f = try trie.Frozen.loadVerified(buf); // untrusted file: + body CRC
+
+const v = try f.lookup("praha");               // ?u32
+
+var results: [10]trie.Completion = undefined;
+var key_buf: [256]u8 = undefined;
+const top = try f.topN("p", &results, &key_buf, .{});
+// top.items ranked best-first; top.status == .complete or .truncated_budget
+
+var it = try f.prefixIterator(gpa, "p");        // lexicographic enumeration
+defer it.deinit();
+var kb: [256]u8 = undefined;
+while (try it.next(&kb)) |c| { /* c.value, c.key */ }
+```
+
+A `Completion.key` borrows the caller's `key_buf`; it is valid only until that
+buffer is reused. `loadVerified` adds a one-time full node-region CRC check for
+files crossing a trust boundary; queries are bounds-checked either way.
