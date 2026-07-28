@@ -10,8 +10,28 @@ this exists so you don't have to.
 | **While working** | `scripts/test.sh` | Tests only what your change can affect |
 | **Before committing** | `scripts/test.sh all` | Every module — the same gate CI runs |
 | Investigating slowness | `scripts/test.sh time` | Serial per-module duration table |
-| New machine / unexpected skips | `scripts/test.sh env` | What this host can and cannot do |
-| Closing those gaps | `scripts/test.sh prepare [--yes]` | Dry-run unless `--yes` is passed |
+
+## Environment gaps
+
+Every runner starts with a capability check. It is **silent when this host can
+run everything**; otherwise it names each gap, what coverage it costs, and the
+exact command that closes it — permanently where that is possible (a sysctl
+drop-in rather than `sysctl -w`, which reverts on reboot). The driver only
+prints those commands; it never runs anything privileged or networked for you.
+
+Two things the printed commands get right that a hand-written one usually does
+not: an **absolute** `zig` path, because sudo's `secure_path` does not include a
+toolchain under `~/.config` or `~/.local`, and **separate cache directories**,
+because `zig build` as root otherwise leaves root-owned entries in the repo's
+`.zig-cache` and breaks your next ordinary build.
+
+One gap stays interactive on purpose. `tc`'s `RTM_NEWACTION` checks
+`CAP_NET_ADMIN` against the *initial* user namespace, so neither `unshare -rn`
+nor a rootless podman container can grant it — both run in a user namespace
+(`uid_map` `0 1000 1`), which is exactly the wall. Only real root clears it, and
+a `NOPASSWD` sudoers rule for `zig build` would not be a narrow grant: `zig
+build` executes `build.zig`, i.e. arbitrary code, as root. One skipped test
+group is the better trade.
 
 ## How `changed` decides what to run
 

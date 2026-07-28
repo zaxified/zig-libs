@@ -12,9 +12,12 @@
 #   scripts/test.sh changed [REF]   — test what changed (vs REF, or the
 #                                     working tree/index/untracked files)
 #   scripts/test.sh all             — every module; the pre-commit/CI gate
-#   scripts/test.sh time             — serial per-module timing table
-#   scripts/test.sh env              — read-only host capability report
-#   scripts/test.sh prepare [--yes]  — close fixable environment gaps
+#   scripts/test.sh time            — serial per-module timing table
+#
+# Every runner starts with a capability check: silent when the host can do
+# everything, otherwise it names each gap and prints the exact least-privileged
+# command that closes it. The driver only PRINTS those commands — it never runs
+# anything privileged or networked for you.
 #
 # See scripts/README.md for the long version of each subcommand.
 
@@ -51,7 +54,8 @@ cd "$REPO_ROOT"
 #   - tc's RTM_NEWACTION checks CAP_NET_ADMIN against the *initial* user
 #     namespace, so `unshare -rn` is not enough for that one path; tc's own
 #     source documents this (grep `initial user namespace`). Nothing this
-#     script can do about that short of real root — see `env`/`prepare`.
+#     script can do about that short of real root; the capability check
+#     prints the one-off `sudo unshare -n zig build test-tc` for it.
 NETNS_MODULES="netlink genetlink nl80211 ethtool devlink tc conntrack nftables wireguard rawsock"
 
 # ── module-graph plumbing ────────────────────────────────────────────────
@@ -173,7 +177,7 @@ run_modules() {
         if have_unshare; then
             step "netns build+test (${#netns[@]} modules, unshare -rn)" unshare -rn zig build "${targets[@]}"
         else
-            echo "note: unshare -rn unavailable — running netns-gated modules plainly; their privileged tests will SKIP (see \`scripts/test.sh env\`)" >&2
+            echo "note: unshare -rn unavailable — running netns-gated modules plainly; their privileged tests will SKIP" >&2
             step "netns build+test (${#netns[@]} modules, NO unshare)" zig build "${targets[@]}"
         fi
     fi
@@ -195,6 +199,101 @@ changed_files() {
     fi
 }
 
+# Runs before every runner. Silent when the host can do everything — a clean
+# host must not print noise. Otherwise names each gap, what it costs in
+# coverage, and the EXACT command that closes it.
+#
+# Every command below is the least-privileged one that works, and the driver
+# only ever PRINTS them — it never runs anything privileged or networked on
+# your behalf. In particular there is deliberately no "give this user
+# passwordless sudo" advice: the one gap that genuinely needs root is closed by
+# running a single command under sudo interactively, not by widening sudoers.
+_CAP_CHECKED=""
+capability_check() {
+    # `changed` can delegate to `all`; report once per invocation, not twice.
+    [[ -n "$_CAP_CHECKED" ]] && return 0
+    _CAP_CHECKED=1
+
+    local -a gaps=()
+
+    # The userns knob differs by distro. `sysctl -w` only lasts until reboot,
+    # so what we print is the persistent drop-in form plus a reload — one line,
+    # survives reboots, and is a system policy toggle rather than a privilege
+    # grant to this user.
+    local userns_key=""
+    if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+        userns_key='kernel.apparmor_restrict_unprivileged_userns=0' # Ubuntu 24.04+
+    elif [[ -e /proc/sys/kernel/unprivileged_userns_clone ]]; then
+        userns_key='kernel.unprivileged_userns_clone=1' # Debian-family
+    fi
+    local userns_persist="echo '$userns_key' | sudo tee /etc/sysctl.d/60-zig-libs-userns.conf >/dev/null && sudo sysctl --system >/dev/null"
+
+    if ! { command -v unshare >/dev/null 2>&1 && unshare -rn true >/dev/null 2>&1; }; then
+        local fix
+        if [[ -n "$userns_key" ]]; then
+            fix="$userns_persist"
+        else
+            fix='sudo apt install util-linux   # or your distro'"'"'s equivalent'
+        fi
+        gaps+=("unshare -rn unavailable|netlink writes in $NETNS_MODULES run unsandboxed (netlink then FAILS, it does not skip)|$fix")
+    elif [[ -n "$userns_key" ]] && ! grep -rqs "${userns_key%%=*}" /etc/sysctl.d /etc/sysctl.conf; then
+        # Works now, but only because someone ran `sysctl -w` by hand — it
+        # reverts on reboot and the netns modules start failing again.
+        gaps+=("userns enabled at runtime only (reverts on reboot)|nothing today; after a reboot the $NETNS_MODULES gap returns|$userns_persist")
+    fi
+
+    if ! command -v podman >/dev/null 2>&1; then
+        gaps+=("podman missing|opcua live server-interop tests skip|sudo apt install podman")
+    else
+        if ! podman image exists docker.io/open62541/open62541:latest 2>/dev/null; then
+            gaps+=("open62541 image not pulled|opcua live server-interop tests skip|podman pull docker.io/open62541/open62541:latest")
+        fi
+        # Rootless podman needs a userspace network backend. Nothing today
+        # depends on container networking, but without one any container that
+        # does will fail at startup rather than skip.
+        if [[ "$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null)" == true ]] \
+            && ! { command -v pasta >/dev/null 2>&1 || command -v slirp4netns >/dev/null 2>&1; }; then
+            gaps+=("rootless podman has no network backend|nothing today; any future networked container fails to start|sudo apt install passt")
+        fi
+    fi
+
+    # opcua's asyncua interop drives a Python client; the interpreter needs
+    # asyncua + cryptography. This is a separate gate from podman — the
+    # container-backed tests pass without it.
+    local opcua_py="${OPCUA_PYTHON:-python3}"
+    if ! "$opcua_py" -c 'import asyncua, cryptography' >/dev/null 2>&1; then
+        gaps+=("python lacks asyncua/cryptography|1 opcua live asyncua-interop test skips|python3 -m venv ~/.cache/zig-libs-opcua && ~/.cache/zig-libs-opcua/bin/pip -q install asyncua cryptography && echo 'export OPCUA_PYTHON=~/.cache/zig-libs-opcua/bin/python3' >> ~/.bashrc")
+    fi
+
+    # Always present: RTM_NEWACTION checks CAP_NET_ADMIN in the INITIAL user
+    # namespace, so `unshare -rn` cannot grant it however userns is configured.
+    #
+    # Two things this command must get right, both learned the hard way:
+    #   * an absolute zig path — sudo's secure_path does not include a
+    #     toolchain under ~/.config or ~/.local, so a bare `zig` gives
+    #     "unshare: failed to exec zig: No such file or directory";
+    #   * separate cache directories — `zig build` as root would otherwise
+    #     leave root-owned entries in the repo's .zig-cache and break the
+    #     next ordinary build.
+    #
+    # This one stays interactive on purpose. A NOPASSWD sudoers rule for it
+    # would be passwordless root, not a narrow grant: `zig build` executes
+    # build.zig, i.e. arbitrary code, as root.
+    local zig_abs; zig_abs="$(command -v zig 2>/dev/null || echo zig)"
+    gaps+=("tc RTM_NEWACTION needs real root|tc action tests skip (the rest of tc runs)|sudo unshare -n $zig_abs build test-tc --cache-dir /tmp/zig-cache-root --global-cache-dir /tmp/zig-gcache-root")
+
+    [[ ${#gaps[@]} -eq 0 ]] && return 0
+
+    echo "environment: ${#gaps[@]} gap(s) reducing coverage — run these to close them:"
+    local g
+    for g in "${gaps[@]}"; do
+        local what="${g%%|*}"; local rest="${g#*|}"
+        local cost="${rest%%|*}"; local fix="${rest#*|}"
+        printf '  %s\n      cost: %s\n      fix:  %s\n' "$what" "$cost" "$fix"
+    done
+    echo
+}
+
 # ── subcommands ──────────────────────────────────────────────────────────
 
 cmd_changed() {
@@ -206,6 +305,8 @@ cmd_changed() {
         echo "changed: no changed/staged/untracked files$( [[ -n "$base_ref" ]] && echo " vs $base_ref" ) — nothing to test"
         exit 0
     fi
+
+    capability_check
 
     local trigger_all=0 trigger_catalog=0
     local seeds=" " f name
@@ -286,6 +387,7 @@ cmd_changed() {
 }
 
 cmd_all() {
+    capability_check
     graph_load
     local all_mods="${G_NAMES[*]}"
     local n=${#G_NAMES[@]}
@@ -297,6 +399,7 @@ cmd_all() {
 }
 
 cmd_time() {
+    capability_check
     graph_load
     echo "time: running every module SERIALLY — measurement only. \`zig build test\`"
     echo "(and this driver's own 'changed'/'all') run steps in PARALLEL, so per-module"
@@ -339,100 +442,7 @@ cmd_time() {
     rm -f "$rows"
 }
 
-cmd_env() {
-    echo "Environment capability report (read-only — changes nothing):"
-    echo
 
-    local unshare_ok=no
-    if command -v unshare >/dev/null 2>&1 && unshare -rn true >/dev/null 2>&1; then
-        unshare_ok=yes
-    fi
-
-    local podman_ok=no
-    command -v podman >/dev/null 2>&1 && podman_ok=yes
-
-    local image_ok=no
-    if [[ "$podman_ok" == yes ]] && podman image exists docker.io/open62541/open62541:latest 2>/dev/null; then
-        image_ok=yes
-    fi
-
-    local sudo_ok=no
-    sudo -n true >/dev/null 2>&1 && sudo_ok=yes
-
-    printf '  %-32s %-4s  %s\n' "unshare -rn" "$unshare_ok" \
-        "$( [[ $unshare_ok == yes ]] && echo "gates: $NETNS_MODULES" || echo "fix: install util-linux unshare + unprivileged userns clone" )"
-    printf '  %-32s %-4s  %s\n' "podman" "$podman_ok" \
-        "$( [[ $podman_ok == yes ]] && echo "gates: opcua LIVE server-interop" || echo "fix: install podman (podman.io/docs/installation)" )"
-    printf '  %-32s %-4s  %s\n' "open62541 image pulled" "$image_ok" \
-        "$( [[ $image_ok == yes ]] && echo "-" || echo "fix: podman pull docker.io/open62541/open62541:latest" )"
-    printf '  %-32s %-4s  %s\n' "sudo -n (passwordless)" "$sudo_ok" \
-        "$( [[ $sudo_ok == yes ]] && echo "-" || echo "fix: passwordless sudo for this user (visudo), or run gated commands interactively" )"
-
-    echo
-    echo "Modules whose tests stay (partly) skipped as a result of the gaps above:"
-    if [[ "$unshare_ok" != yes ]]; then
-        echo "  - $NETNS_MODULES"
-        echo "      (no unshare -rn -> CAP_NET_ADMIN/CAP_NET_RAW-gated live tests SKIP)"
-    fi
-    if [[ "$podman_ok" != yes || "$image_ok" != yes ]]; then
-        echo "  - opcua"
-        echo "      (LIVE open62541 server-interop tests need podman + the pulled image)"
-    fi
-    echo "  - tc (partial, regardless of the above)"
-    echo "      (RTM_NEWACTION checks CAP_NET_ADMIN in the *initial* user namespace;"
-    echo "       unshare -rn is not enough for that one path — needs real root, e.g."
-    echo "       \`sudo unshare -n\`. Not fixable by \`prepare\` — sudo would have to run"
-    echo "       interactively, which this driver refuses to do.)"
-
-    echo
-    echo "Run \`scripts/test.sh prepare\` to see (and, with --yes, close) the fixable gaps."
-}
-
-cmd_prepare() {
-    local do_it=0
-    [[ "${1:-}" == "--yes" ]] && do_it=1
-
-    local podman_ok=no
-    command -v podman >/dev/null 2>&1 && podman_ok=yes
-    local need_pull=0
-    if [[ "$podman_ok" == yes ]] && ! podman image exists docker.io/open62541/open62541:latest 2>/dev/null; then
-        need_pull=1
-    fi
-
-    echo "prepare: gaps this can close automatically:"
-    if [[ $need_pull -eq 1 ]]; then
-        echo "  - podman pull docker.io/open62541/open62541:latest  (network action, ~565 MB;"
-        echo "    unlocks opcua's LIVE server-interop tests)"
-    elif [[ "$podman_ok" != yes ]]; then
-        echo "  - (podman itself is missing — install it first; see \`scripts/test.sh env\`)"
-    else
-        echo "  - (nothing — the open62541 image is already pulled)"
-    fi
-
-    echo
-    echo "Gaps this will NEVER attempt (report only):"
-    if ! sudo -n true >/dev/null 2>&1; then
-        echo "  - sudo -n fails here — tc's initial-userns CAP_NET_ADMIN gap needs real root"
-        echo "    and this driver will never prompt for a password interactively."
-    fi
-    if ! { command -v unshare >/dev/null 2>&1 && unshare -rn true >/dev/null 2>&1; }; then
-        echo "  - unshare -rn is unavailable on this host — a kernel/policy property, not"
-        echo "    something this script can install."
-    fi
-
-    echo
-    if [[ $do_it -ne 1 ]]; then
-        echo "Dry run only (pass --yes to actually pull). Nothing was changed."
-        exit 0
-    fi
-
-    if [[ $need_pull -eq 1 ]]; then
-        echo "Pulling docker.io/open62541/open62541:latest ..."
-        podman pull docker.io/open62541/open62541:latest
-    else
-        echo "Nothing to do."
-    fi
-}
 
 usage() {
     cat <<'EOF'
@@ -447,11 +457,10 @@ Usage: scripts/test.sh [subcommand] [args]
   time                  run every module SERIALLY, print a duration-sorted
                         table. Slow; measurement only, never use this to
                         decide what to run.
-  env                   read-only report of what this host can/can't do for
-                        the netns- and podman-gated tests.
-  prepare [--yes]       close the fixable environment gaps (currently: pull
-                        the open62541 image). Dry-run unless --yes is given;
-                        never touches anything needing interactive sudo.
+Every runner begins with a capability check. It is silent when this host can
+run everything; otherwise it names each gap, what coverage it costs, and the
+exact least-privileged command that closes it. Those commands are only ever
+printed — the driver runs nothing privileged or networked for you.
 
 Which do I run? While working: `changed` (fast, scoped). Before committing:
 `all` (the full, authoritative gate).
@@ -466,8 +475,6 @@ main() {
         changed) cmd_changed "${rest[@]:-}" ;;
         all) cmd_all "${rest[@]:-}" ;;
         time) cmd_time "${rest[@]:-}" ;;
-        env) cmd_env "${rest[@]:-}" ;;
-        prepare) cmd_prepare "${rest[@]:-}" ;;
         -h|--help|help) usage ;;
         *)
             echo "test.sh: unknown subcommand '$cmd'" >&2
