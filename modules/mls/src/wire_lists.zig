@@ -101,6 +101,19 @@ pub fn encodeVarVec(comptime T: type, w: *codec.Writer, items: []const T) codec.
     for (items) |it| try it.encode(w);
 }
 
+/// `encodeVarVec` for element types whose own `encode` returns a WIDER
+/// error set than `codec.Error` — e.g. `content.ProposalOrRef`, which can
+/// bottom out in a `tree.LeafNode` (`error.Malformed` for a `select`-guarded
+/// field missing) or a `KeyPackage`. Identical body; the only difference is
+/// the inferred error set, which `encodeVarVec`'s explicit `codec.Error!void`
+/// cannot widen to without changing every existing caller's contract.
+pub fn encodeVarVecAny(comptime T: type, w: *codec.Writer, items: []const T) !void {
+    var body: usize = 0;
+    for (items) |it| body += it.encodedLen();
+    try w.writeVarint(body);
+    for (items) |it| try it.encode(w);
+}
+
 /// Reads a `T foo<V>` vector of variable-width elements by repeatedly
 /// calling `T.decode` until the vector's aliased byte range is exhausted —
 /// works for both allocator-free element decoders (`fn (*codec.Reader)

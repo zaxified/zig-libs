@@ -62,8 +62,9 @@ Provenance
    implementation source from any of the repository's per-language
    interop targets (`build/`, `interop/`, `docker/`) was read or ported.
 
-   (Item 5 below records a THIRD fetch round from this same repository
-   revision, for the Part 4 key-schedule/secret-tree vectors.)
+   (Items 5 and 6 below record a THIRD and FOURTH fetch round from this
+   same repository revision, for the Part 4 key-schedule/secret-tree
+   vectors and the Part 5 framing vectors respectively.)
 
 4. **`mlswg/mls-implementations`, Part 2 (TreeKEM) vectors** —
    `kat_treekem_test.zig`'s KAT source: `test-vectors/tree-validation.json`,
@@ -135,13 +136,90 @@ Provenance
    string while every neighbouring field is hex — but no implementation
    source from any per-language interop target was read or ported.
 
+6. **`mlswg/mls-implementations`, Part 5 (message framing) vectors** —
+   `kat_framing_test.zig`'s and `kat_messages_test.zig`'s KAT source:
+   `test-vectors/message-protection.json`,
+   `test-vectors/transcript-hashes.json`, `test-vectors/messages.json`,
+   fetched directly (not hand-transcribed) on 2026-07-29 from the same
+   repository's `main` branch — HEAD still
+   `cfd450286d1bfd9cd2519b95c80f9771f94a5b1a` (commit date 2026-04-22),
+   UNCHANGED from items 3/4/5's 2026-07-15/16/28 fetches, so all four fetch
+   rounds pin the same upstream revision. Per-file last-modified commits at
+   that revision: `message-protection.json` →
+   `5b3461fdecc5c8c44ea0b40a6587da8fdb983600` (2023-02-17, "Make commit in
+   the message protection vector valid"), `transcript-hashes.json` →
+   `292f586b47ed4a282ddd7afd7c02cc41f8b8e106` (2023-03-07, "Correct
+   confirmation key sizes in transcript hashes test"), `messages.json` →
+   `413c3aa8e76a354b9a100995e272d852752d870b` (2023-03-08, "interop: Update
+   'Messages' (w/o) trailing blank nodes.").
+
+   **Two of the three are embedded VERBATIM** — `message-protection.json`
+   (30 812 bytes, all 7 cipher suites) and `transcript-hashes.json` (7 328
+   bytes, all 7 cipher suites) — same reasoning as item 5: they are small
+   enough that the stronger provenance claim (byte-identical to upstream,
+   independently re-verifiable by hash) beats the parse saved. SHA-256 as
+   fetched, and of the embedded copies:
+   `message-protection.json` =
+   `f7c1ae62ce63c3003e526d539c99f2b1444f65ee0a487d3a5667d46867526c45`,
+   `transcript-hashes.json` =
+   `58046b58fbd98519b4e60953a105f550e4b427e2b140ea67dedcb751260eecb8`.
+
+   **`messages.json` IS filtered, and this entry records exactly how,
+   because the filter is not a suite filter.** Upstream's file is 2 685 714
+   bytes: 300 entries, each carrying 17 fields, with NO `cipher_suite` key
+   at all (every entry is suite-agnostic), so item 4's
+   `select(.cipher_suite==1)` approach does not apply. Two reductions were
+   applied instead, in this order:
+
+     jq -c '[.[0:20][] | {mls_key_package, add_proposal, update_proposal,
+             remove_proposal, pre_shared_key_proposal, re_init_proposal,
+             external_init_proposal, group_context_extensions_proposal,
+             commit, public_message_application, public_message_proposal,
+             public_message_commit, private_message}]' messages.json
+
+   (a) FIELD projection — the 13 fields Part 5 has structures for, dropping
+   `mls_welcome`/`mls_group_info`/`ratchet_tree`/`group_secrets`, whose
+   payloads are Part 6's and cannot be driven by anything in this module
+   today; (b) ENTRY prefix — the first 20 of 300. The entry cut needs
+   justifying, so: all 300 entries were decoded and their structural
+   variants counted before choosing. They are structurally IDENTICAL i.i.d.
+   samples — every entry has a `member` sender, an `add` proposal in
+   `public_message_proposal`, a Commit with one by-reference `ProposalOrRef`
+   and a 1-node `UpdatePath`, an `update` LeafNode with source `update`, and
+   an `external` PSK type. The ONLY field that varies structurally across
+   the file is `private_message.content_type`, which takes all three values,
+   and the shortest prefix covering all three is 3 entries. 20 was taken
+   rather than 3 for margin (all three content types appear 9/5/6 times in
+   it), giving 113 230 bytes — the same order as the already-embedded
+   filtered `tree-validation.json` (115 KB), against 1.7 MB for the
+   field-projected full file. `kat_messages_test.zig` ASSERTS the coverage
+   this reasoning rests on (all three §6 content types, all three §17.2 wire
+   formats, at least one Commit with a path and at least one by-reference
+   proposal), so a future re-filter that silently lost a variant fails the
+   test rather than passing quietly. SHA-256 of the embedded (filtered)
+   file: `b9f90562025292f3849576f5a74606bc6813383261bdd67691ca3c10154cdce6`;
+   of the unfiltered upstream file as fetched:
+   `b194abe1561995223482dbad51c180146920dc2f637e74d01e07a388308791fb`.
+
+   Same public-conformance-data posture as items 3/4/5 — no explicit OSS
+   license on the source repository, but public NUMERIC interop data
+   (serialized message structures, AEAD ciphertexts, MAC and hash outputs),
+   not copyrightable expression. The repository's own `test-vectors.md` (the
+   vector-FORMAT specification) was read to determine each file's field
+   semantics and its stated verification procedure — specifically
+   `message-protection.json`'s "use the member with LeafIndex 1 as the
+   sender", its "Initialize a secret tree for 2 members", and its
+   requirement that protecting an application message as a `PublicMessage`
+   must FAIL — but no implementation source from any per-language interop
+   target was read or ported.
+
 No third-party MLS IMPLEMENTATION (mls-rs, OpenMLS, mlspp, or any other
 language's MLS library) was read, consulted as a design reference, or
 ported from for this module. Every algorithm was implemented directly
 from RFC 9420's own text/pseudocode (item 1/2) and verified against the
-public interop vectors (items 3/4) — the same "spec + KAT, no third-party
-source" posture this repo's `hpke`/`signal` NOTICE-free modules document
-in their own SPEC.md "no NOTICE entry" reasoning; this file exists only
-because items 3/4's vector-fetch and item 2's direct-port relationship
-warrant the same explicit-citation caution `bn254`/`bls12_381` apply to
-their own KAT sources.
+public interop vectors (items 3/4/5/6) — the same "spec + KAT, no
+third-party source" posture this repo's `hpke`/`signal` NOTICE-free
+modules document in their own SPEC.md "no NOTICE entry" reasoning; this
+file exists only because items 3-6's vector-fetch and item 2's
+direct-port relationship warrant the same explicit-citation caution
+`bn254`/`bls12_381` apply to their own KAT sources.

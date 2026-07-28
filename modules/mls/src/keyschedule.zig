@@ -54,13 +54,18 @@
 //! chain, §8.5's `MLS-Exporter`, §8's `external_pub` derivation, and §6.1's
 //! `confirmation_tag`/`membership_tag` MAC computations (they live here
 //! because they consume `confirmation_key`/`membership_key` and nothing
-//! else in this Part; their INPUTS are framing structs Part 5 builds).
-//! NOT here: §8.2's transcript hashes and §8.3's external initialization.
-//! Both need structures this Part does not have — §8.2 hashes an encoded
-//! `AuthenticatedContent` (Part 5's `ConfirmedTranscriptHashInput`) and
-//! §8.3 needs an HPKE `SetupBaseS`/`SetupBaseR` context for the
-//! external-commit join flow (Part 6). Neither is exercised by
-//! `key-schedule.json`, and stubbing them here would mean shipping
+//! else in this Part; their INPUTS are framing structs Part 5 builds —
+//! `framing.membershipTag` assembles the `AuthenticatedContentTBM` that
+//! `membershipTag` below MACs).
+//! **§8.2's transcript hashes are now in `transcript.zig`** (Part 5): they
+//! hash an encoded `AuthenticatedContent`, which did not exist until the
+//! framing layer did, and they live in their own file rather than here
+//! because `framing.zig` imports THIS file — folding §8.2 back in would
+//! close the loop into an import cycle.
+//! Still NOT here and still not anywhere: §8.3's external initialization,
+//! which needs an HPKE `SetupBaseS`/`SetupBaseR` context for the
+//! external-commit join flow (Part 6). It is not exercised by
+//! `key-schedule.json`, and stubbing it here would mean shipping
 //! untestable code.
 //!
 //! Model: RFC 9420 §8 (Key Schedule) + §8.1 (Group Context) + §8.4

@@ -194,11 +194,15 @@ fn extensionListLen(list: []const Extension) usize {
 fn encodeExtensionList(w: *codec.Writer, list: []const Extension) codec.Error!void {
     try wire.encodeVarVec(Extension, w, list);
 }
-/// Test/decode-only helper made `pub` so `kat_treekem_test.zig`'s
-/// test-local `KeyPackage` parser (needed only to drive `tree-
-/// operations.json`'s Add proposals — full `KeyPackage` is Part 3's public
-/// API, see `SPEC.md`) can decode `KeyPackage.extensions<V>`, which is the
-/// identical wire shape as `LeafNode.extensions<V>`.
+/// Made `pub` so callers outside this file can decode an
+/// `Extension extensions<V>` vector, which several RFC 9420 structs carry
+/// with the identical wire shape: `kat_treekem_test.zig`'s test-local
+/// `KeyPackage` parser (needed to drive `tree-operations.json`'s Add
+/// proposals), `keypackage.KeyPackage.extensions`, and
+/// `content.ReInit`/`content.Proposal.group_context_extensions` (Part 5).
+/// NOTE: `keypackage.zig` now provides a real `KeyPackage` — the
+/// test-local parser in `kat_treekem_test.zig` predates it and has not been
+/// switched over (see `SPEC.md`'s Backlog).
 pub fn decodeExtensionList(allocator: std.mem.Allocator, r: *codec.Reader) ![]Extension {
     return wire.decodeVarVec(Extension, false, allocator, r, Extension.decode);
 }

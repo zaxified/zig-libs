@@ -20,7 +20,14 @@ schedule + secret tree** — RFC 9420 §8's epoch chain, §8.1's
 `confirmation_tag`/`membership_tag`, and §9's secret tree with its
 per-leaf sender ratchets and out-of-order window — pinned byte-exact
 against the official `key-schedule`/`psk_secret`/`secret-tree` vectors,
-see `SPEC.md`'s "Part 4" section.
+see `SPEC.md`'s "Part 4" section. **Part 5: message framing** — all of
+RFC 9420 §6 (`FramedContent`, `AuthenticatedContent`, the §6.1 signature
+and its two tags, §6.2's `PublicMessage`, §6.3's `PrivateMessage` with
+content and sender-data encryption, `MLSMessage`), the §12.1 `Proposal`
+and §12.4 `Commit` wire formats framing carries, the §10 `KeyPackage`
+wire format an `Add` carries, and §8.2's transcript hashes — pinned
+byte-exact against the official `messages`/`message-protection`/
+`transcript-hashes` vectors, see `SPEC.md`'s "Part 5" section.
 
 **Status: Part 1 COMPLETE, entirely Sonnet-tier. Part 2 COMPLETE** — the
 data/codec/tree-hash/tree-editing pieces are Sonnet-tier (mechanical
@@ -29,14 +36,18 @@ vectors); the five Fable-tier tree-algorithm cores are implemented and
 KAT-pinned (all 14 trees' resolutions, 275 single-byte parent-hash tamper
 rejections, 62 UpdatePath processings across 328 receiver views, and 62
 merges reproducing `tree_hash_after`) behind `gate.treekem_core_implemented`
-(now `true`). **Part 4 COMPLETE** (Sonnet-tier), except §8.2's transcript
-hashes and §8.3's external initialization — both need structures later
-parts build, so neither is stubbed here.
-KeyPackage/LeafNode-validation/Credential (Part 3) and
-Proposal/Commit/framing (Part 5) are LATER parts; see `SPEC.md`'s "Arc
-breakdown" for the full decomposition. Parts 1+2+4 together are the
-complete cryptographic spine of an epoch, but not yet a usable client:
-nothing can be sent or received until Part 5's framing exists.
+(now `true`). **Part 4 COMPLETE** (Sonnet-tier), except §8.3's external
+initialization, which needs Part 6's external-commit flow and is not
+stubbed here. **Part 5 COMPLETE** (Sonnet-tier) — and it closed §8.2, the
+other gap Part 4 had left open.
+Part 3 (KeyPackage/LeafNode VALIDATION + Credential) and Part 6 (external
+commit / `Welcome` / `GroupInfo` / reinit) remain; see `SPEC.md`'s "Arc
+breakdown". What this module can do today: produce and consume real MLS
+messages other implementations accept byte-for-byte, for a group whose
+state the caller maintains. What it cannot: join a group (no
+`Welcome`/`GroupInfo`), decide whether a KeyPackage or LeafNode should be
+admitted (§10.1/§7.3), or apply a Commit to a tree and advance an epoch
+(§12.2-§12.4.2) — it has no group-state object.
 
 | File | Provides |
 |---|---|
@@ -55,12 +66,19 @@ nothing can be sent or received until Part 5's framing exists.
 | `secrettree.zig` | Part 4's §9 secret tree (`nodeSecret`/`ratchetBaseSecret`), §9.1 `Ratchet` + the generation-indexed out-of-order `Window`, §6.3.2 `senderDataKeys` |
 | `kat_keyschedule_test.zig` | Part 4's official interop vectors `key-schedule.json` + `psk_secret.json`, driven per-stage byte-exact |
 | `kat_secrettree_test.zig` | Part 4's official `secret-tree.json`, driven byte-exact both forward (`Ratchet`) and out-of-order (`Window`) |
+| `keypackage.zig` | Part 5's §10 `KeyPackage`/`KeyPackageTBS` WIRE FORMAT + self-signature (`verifySignature`/`sign`). §10.1's validation rules are Part 3's and are NOT here |
+| `content.zig` | Part 5's §12.1 `Proposal` (all seven types) + §12.4 `Commit`/`ProposalOrRef` — wire shape only; no proposal-list validity, no commit processing |
+| `framing.zig` | Part 5's whole of §6: `Sender`/`FramedContent`/`AuthenticatedContent`, §6.1 sign+verify, §6.2 `PublicMessage` + `protectPublic`/`unprotectPublic`, §6.3 `PrivateMessage` + `protectPrivate`/`decryptSenderData`/`decryptContent`/`parsePrivateContent`, `MLSMessage` |
+| `transcript.zig` | Part 5's §8.2 `confirmedTranscriptHash`/`interimTranscriptHash`/`advance` — the gap Part 4 named and could not fill |
+| `kat_messages_test.zig` | Part 5's official `messages.json`, every embedded field decode→re-encode byte-exact |
+| `kat_framing_test.zig` | Part 5's official `message-protection.json` (protect/unprotect byte-exact both directions) + `transcript-hashes.json` (§8.2) |
 
 - **Model after:** RFC 9420 (Messaging Layer Security); `treemath.zig`
   ports Appendix C's own published reference algorithm.
-- **Platform:** any. **Role:** util (pure computation, no owned transport
-  — a later framing part may add wire I/O). **Concurrency:** reentrant —
-  every type is a plain caller-owned value.
+- **Platform:** any. **Role:** util (pure computation, no owned transport;
+  Part 5's framing returns BYTES to send and takes bytes received — MLS
+  does not specify a transport, so owning one here would be an invention).
+  **Concurrency:** reentrant — every type is a plain caller-owned value.
 - **Deps:** `hpke` (the sibling module supplies suite `0x0001`'s
   DHKEM(X25519, HKDF-SHA256) + AES-128-GCM machinery via `sealBase`/
   `openBase`; MLS's own `ExpandWithLabel`/`RefHash`/`SignWithLabel` are a
@@ -221,7 +239,7 @@ secrets.epoch_authenticator; // §8.7, for out-of-band comparison
 const external_pub = ks.externalKeyPair(S, secrets.external_secret).public_key;
 try ks.mlsExporter(S, secrets.exporter_secret, "my-app label", context, out);
 
-// §6.1, over structures Part 5 assembles
+// §6.1, over structures Part 5 assembles (framing.membershipTag)
 const tag = ks.confirmationTag(S, secrets.confirmation_key, confirmed_transcript_hash);
 try ks.verifyConfirmationTag(S, secrets.confirmation_key, confirmed_transcript_hash, received_tag);
 ```
@@ -252,6 +270,99 @@ const kn2 = try window.get(generation);     // consumed: a second get() fails
 const sd = try st.senderDataKeys(S, secrets.sender_data_secret, ciphertext);
 ```
 
+## API surface (Part 5 — message framing)
+
+**Sending** (`framing.zig`, RFC 9420 §6). Both `protect*` calls return
+freshly allocated wire bytes; wrap them in an `MLSMessage` to put them on
+the network:
+
+```zig
+const fr = mls.framing;
+
+const fc: fr.FramedContent = .{
+    .group_id = group_id,
+    .epoch = epoch,
+    .sender = .{ .member = my_leaf_index },
+    .authenticated_data = &.{},
+    .body = .{ .proposal = .{ .remove = 2 } },   // or .commit / .application
+};
+
+// §6.2 — signed, MAC'd, not encrypted. Refuses application content
+// (error.ApplicationContentMustBeEncrypted), per §6's MUST.
+const pub_bytes = try fr.protectPublic(S, allocator, .{
+    .signature_key_pair = my_signature_key,
+    .membership_key = secrets.membership_key,
+    .group_context = encoded_gc,
+    .content = fc,
+    .confirmation_tag = null,        // required iff `fc` is a commit
+});
+defer allocator.free(pub_bytes);
+
+// §6.3 — encrypted. The reuse guard MUST be freshly random per message
+// (§6.3.1); this module never owns a randomness policy.
+const priv_bytes = try fr.protectPrivate(S, allocator, .{
+    .signature_key_pair = my_signature_key,
+    .group_context = encoded_gc,
+    .content = fc,
+    .key_nonce = kn,                 // from secrettree.Ratchet.current()
+    .generation = ratchet.generation,
+    .reuse_guard = my_fresh_random_4_bytes,
+    .sender_data_secret = secrets.sender_data_secret,
+    .padding_len = 0,
+});
+defer allocator.free(priv_bytes);
+```
+
+**Receiving.** A `PublicMessage` unprotects in one call; a `PrivateMessage`
+is genuinely two-phase, because §6.3.2's sender data names the key §6.3.1's
+content needs, and the lookup between them is yours:
+
+```zig
+var r = mls.codec.Reader.init(received);
+const msg = try fr.MLSMessage.decode(allocator, &r);
+defer msg.deinit(allocator);
+
+switch (msg) {
+    .public_message => {
+        // checks BOTH §6.2 MUSTs: membership_tag and the signature
+        const pm = try fr.unprotectPublic(S, allocator, bare_bytes, sender_pub, secrets.membership_key, encoded_gc);
+        defer pm.deinit(allocator);
+        _ = pm.content.body;
+    },
+    .private_message => |pm| {
+        const sd = try fr.decryptSenderData(S, allocator, pm, secrets.sender_data_secret);
+        // YOUR job: check sd.leaf_index names a non-blank leaf (§6.3.2),
+        // then pick that leaf's handshake/application Window.
+        const kn2 = try window.get(sd.generation);
+        const plaintext = try fr.decryptContent(S, allocator, pm, kn2, sd.reuse_guard);
+        defer allocator.free(plaintext);
+        const ac = try fr.parsePrivateContent(allocator, pm, plaintext, sd.leaf_index);
+        defer ac.deinit(allocator);
+        try fr.verifyFramedContent(S, allocator, sender_pub, ac, encoded_gc);
+    },
+    .key_package => {},
+}
+```
+
+**Transcript hashes** (`transcript.zig`, RFC 9420 §8.2) — what feeds the
+next epoch's `GroupContext.confirmed_transcript_hash`:
+
+```zig
+const th = try mls.transcript.advance(S, allocator, interim_prev, commit_ac);
+th.confirmed;  // -> GroupContext.confirmed_transcript_hash, and the
+               //    confirmation_tag's MAC input
+th.interim;    // -> the NEXT epoch's interim_prev
+// epoch 0 seeds both with the ZERO-LENGTH string, not a zero digest:
+// mls.transcript.empty_transcript_hash
+```
+
+**Proposal references** (§5.2) — what a Commit puts in a by-reference
+`ProposalOrRef`:
+
+```zig
+const ref = try fr.proposalRef(S, allocator, proposal_authenticated_content);
+```
+
 ## Verify
 
 ```sh
@@ -276,6 +387,15 @@ Table 4 secret, the encoded `GroupContext` in both directions,
 10 PSKs), and `secret-tree.json` (1/8/32-leaf trees, both ratchets of every
 leaf at every published generation, driven forward AND out-of-order, plus
 §6.3.2's sender-data keys) — all byte-exact.
+Part 5 adds `messages.json` (every embedded entry's §12.1 proposal bodies,
+§12.4 `Commit`, §10 `KeyPackage` and §6 `MLSMessage` wire formats, decode →
+re-encode byte-exact), `message-protection.json` (`PrivateMessage` for all
+three content types and `PublicMessage` for the two handshake types,
+unprotected AND re-protected byte-exact — stronger than that vector's own
+round-trip procedure, see `SPEC.md`; application content as a
+`PublicMessage` is checked to be REFUSED, per §6), and
+`transcript-hashes.json` (§8.2's two hashes plus the Commit's own
+`confirmation_tag`) — all byte-exact.
 Green in Debug and ReleaseFast.
 
 ## Provenance

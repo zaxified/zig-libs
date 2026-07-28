@@ -16,12 +16,16 @@ define (`crypto.zig`), the ratchet tree's pure integer math
 (`codec.zig`). Part 1 deliberately builds NO group state, NO TreeKEM
 key-derivation-along-a-path, NO KeyPackage/Proposal/Commit message types,
 and NO key schedule — those are later parts (see "Arc breakdown" below).
-**Part 2** (TreeKEM) and **Part 4** (key schedule + secret tree) have since
-landed; between them the module now covers the whole cryptographic spine of
-an epoch — given a ratchet tree and a transcript, every key the epoch uses
-is derivable and interop-verified. What is still missing before a client
-can send or receive anything is Part 3's `KeyPackage` and Part 5's
-Proposal/Commit/framing.
+**Part 2** (TreeKEM), **Part 4** (key schedule + secret tree) and **Part 5**
+(message framing, RFC 9420 §6 + §8.2) have since landed. With Part 5 the
+module can produce and consume real MLS messages that other implementations
+accept byte-for-byte: a Proposal, a Commit or application data, framed and
+signed as a `PublicMessage` or fully encrypted as a `PrivateMessage`. What
+is still missing before this is a CLIENT is Part 3's KeyPackage/LeafNode
+validation and Part 6's join flow (`Welcome`/`GroupInfo`), plus the
+group-state object that would tie an epoch's tree, transcript and key
+schedule together — none of which is a wire format, all of which is policy
+and state machinery over what Parts 1-5 already compute.
 
 ## Design & invariants
 
@@ -120,9 +124,9 @@ parent-hash validation logic does (see Part 2 below).
 |---|---|---|---|
 | **1 (this part)** | Cipher suite, labeled crypto, tree math, codec | **Sonnet** | `tree-math.json`, `crypto-basics.json` |
 | **2 — TreeKEM** | `LeafNode`/`ParentNode`/`Node`/`RatchetTree` + wire codec + tree-shape edits (§7.1/§7.2/§7.7/§12.1.1-3) + tree-hash (§7.8) — Sonnet, DONE. `resolution` (§4.1), `parentHash`+chain validation (§7.9), path-secret-derivation-and-UpdatePath (§7.4-§7.6) — **IMPLEMENTED + KAT-pinned 2026-07-16, Fable**. Whole part **COMPLETE**. | Split tier: the data/codec/tree-hash/tree-editing is mechanical (Sonnet, KAT'd byte-exact); the five cores are the genuinely hard piece the task brief flags — subtle recursive tree-validation logic with real security consequences if wrong (a forged parent-hash or a wrong resolution set can let a malicious member inject an unauthorized key into another member's derived path) — the "hardest TIER, not crypto-only" bar this repo's Fable pool applies, now pinned byte-exact | `tree-operations.json` (real), `tree-validation.json` (tree-hash/leaf-signature + resolution + parent-hash accept/tamper), `treekem.json` (`processUpdatePath` + `applyUpdatePath`) — all byte-exact, gate now `true`; see "Part 2 — TreeKEM" below |
-| **3 — LeafNode / KeyPackage / Credential** | §5.3 credentials, §7.2/§7.3 `LeafNode` content + validation (`leaf_node_validation.json`), `KeyPackage` (§10) wire format + validation | **Sonnet** — mostly `codec.zig`-shaped serialization plus signature verification (`SignWithLabel`/`VerifyWithLabel` from THIS part) over well-specified structs; the validation RULES (§7.3's numbered list) are mechanical checks, not novel crypto | `key-package-validation.json`, `leaf-node-validation.json` |
-| **4 — Key Schedule + Secret Tree** | §8's full `init_secret_[n-1] → ... → init_secret_[n]` chain, §8.1 `GroupContext`, §8.4 `psk_secret`, §8.5 exporter, §6.1's two MACs, §9 Secret Tree + sender ratchets, §6.3.2 sender-data keys — **DONE 2026-07-28**, whole part **COMPLETE** except §8.2 (transcript hashes, needs Part 5) and §8.3 (external init, needs Part 6) | **Sonnet** — pure composition of `ExpandWithLabel`/`DeriveSecret` (already built) over a well-specified derivation graph. One correction to the original note below: Figure 22 pins the ORDER unambiguously, but Figure 24 (§8.4's PSK chain) does NOT — it contradicts its own prose on the Extract argument order, and only the vector settles it | `key-schedule.json`, `secret-tree.json`, `psk_secret.json` — all byte-exact; see "Part 4" below |
-| **5 — Proposal / Commit / framing** | §11-§12 Proposal types, Commit processing, `PublicMessage`/`PrivateMessage` framing + the membership/confirmation MACs | **Sonnet** — mechanical message-type composition over Parts 1-4's primitives, EXCEPT the Commit-processing state machine's interaction with TreeKEM (applying a Commit's proposals correctly against the ratchet tree) which leans on Part 2's resolution logic being right | `messages.json`, `commit-processing` vectors |
+| **3 — LeafNode / KeyPackage / Credential VALIDATION** | §5.3 credentials, §7.2/§7.3 `LeafNode` content + validation (`leaf_node_validation.json`), `KeyPackage` (§10) validation. NOTE: §10's WIRE FORMAT was taken by Part 5 (`keypackage.zig`) because §12.1.1's `Add` cannot be decoded without it; what remains for Part 3 is §10.1's and §7.3's admission RULES | **Sonnet** — mostly `codec.zig`-shaped serialization plus signature verification (`SignWithLabel`/`VerifyWithLabel` from THIS part) over well-specified structs; the validation RULES (§7.3's numbered list) are mechanical checks, not novel crypto | `key-package-validation.json`, `leaf-node-validation.json` |
+| **4 — Key Schedule + Secret Tree** | §8's full `init_secret_[n-1] → ... → init_secret_[n]` chain, §8.1 `GroupContext`, §8.4 `psk_secret`, §8.5 exporter, §6.1's two MACs, §9 Secret Tree + sender ratchets, §6.3.2 sender-data keys — **DONE 2026-07-28**, whole part **COMPLETE** except §8.3 (external init, needs Part 6); §8.2's transcript hashes were the other gap and Part 5 closed them (`transcript.zig`) | **Sonnet** — pure composition of `ExpandWithLabel`/`DeriveSecret` (already built) over a well-specified derivation graph. One correction to the original note below: Figure 22 pins the ORDER unambiguously, but Figure 24 (§8.4's PSK chain) does NOT — it contradicts its own prose on the Extract argument order, and only the vector settles it | `key-schedule.json`, `secret-tree.json`, `psk_secret.json` — all byte-exact; see "Part 4" below |
+| **5 — Message framing** | ALL of §6 (`FramedContent`/`AuthenticatedContent`/§6.1 TBS+auth/§6.2 `PublicMessage`+`membership_tag`/§6.3 `PrivateMessage`+§6.3.1 content encryption+§6.3.2 sender data/`MLSMessage`), the §12.1 `Proposal` and §12.4 `Commit` WIRE FORMATS framing carries, the §10 `KeyPackage` wire format `Add` carries, and §8.2's transcript hashes — **DONE 2026-07-29**, whole part **COMPLETE**. Commit PROCESSING (§12.2/§12.3/§12.4.1/§12.4.2) is explicitly NOT here — see "Part 5" below for where that boundary falls and why | **Sonnet** — mechanical composition over Parts 1/2/4's primitives with an authoritative byte-exact oracle for every path. No new cryptography: every derivation it performs was already built and vector-pinned by an earlier part | `messages.json`, `message-protection.json`, `transcript-hashes.json` — all byte-exact; see "Part 5" below |
 | **6 — External Commit / PSK / Reinit / Sub-group ops** | §12.4.3 external Commit, §8's `psk_secret` injection (§13), §16's reinit/branch | **Sonnet**, lowest priority — genuinely-used-but-optional MLS features; defer until a real consumer needs them (this repo's std/dedup consumer-check convention) | — |
 
 **Where TreeKEM/Fable lands, restated plainly:** it's Part 2, specifically
@@ -334,24 +338,212 @@ rather than attacker-driven growth.
 
 ### Scope boundary, stated precisely
 
-Two of §8's subsections are NOT implemented, and the reason in both cases
-is a missing input rather than a missing algorithm:
+When Part 4 landed, two of §8's subsections were not implemented, in both
+cases for a missing input rather than a missing algorithm:
 
 - **§8.2 transcript hashes** hash an encoded `AuthenticatedContent`
   (`ConfirmedTranscriptHashInput`/`InterimTranscriptHashInput`), which is a
   Part 5 framing structure. The upstream vector for it
   (`transcript-hashes.json`) supplies a serialized `AuthenticatedContent`
-  and therefore cannot be driven before Part 5 either.
+  and therefore could not be driven before Part 5 either.
+  **CLOSED 2026-07-29 by Part 5** — `transcript.zig`, vector-pinned; see
+  "Part 5" below. It is a separate file rather than an addition to
+  `keyschedule.zig` only because `framing.zig` imports `keyschedule.zig`,
+  so §8.2 living there would be an import cycle.
 - **§8.3 external initialization** needs an HPKE `SetupBaseS`/`SetupBaseR`
   context (the sibling `hpke` module exposes `sealBase`/`openBase` but not
   a bare setup returning a `Context`), and is only reachable through Part
-  6's external-commit flow.
+  6's external-commit flow. **STILL OPEN.**
 
-Both are named in `keyschedule.zig`'s module doc comment so the omission is
-discoverable from the code, not only from here. `confirmation_tag` and
-`membership_tag` themselves ARE implemented — they consume Part 4's keys —
-but their inputs are assembled by Part 5, so they take already-encoded
-bytes.
+Both were named in `keyschedule.zig`'s module doc comment so the omission
+was discoverable from the code, not only from here; that comment now points
+at `transcript.zig` for §8.2 and still names §8.3. `confirmation_tag` and
+`membership_tag` themselves were implemented in Part 4 — they consume Part
+4's keys — but their inputs are assembled by Part 5, so they take
+already-encoded bytes, and `framing.membershipTag` is the function that
+assembles the `AuthenticatedContentTBM` for them.
+
+## Part 5 — Message framing (2026-07-29)
+
+**Files:** `framing.zig` (all of RFC 9420 §6), `content.zig` (§12.1's seven
+`Proposal` types + §12.4's `Commit`/`ProposalOrRef`), `keypackage.zig`
+(§10's `KeyPackage`/`KeyPackageTBS` wire format), `transcript.zig` (§8.2),
+`kat_messages_test.zig`, `kat_framing_test.zig`. One addition to Part 2's
+`wire_lists.zig` (`encodeVarVecAny`) was needed and is described below.
+
+### §6's actual subsection structure
+
+Worth stating because it is smaller than the section's reputation suggests
+— §6 has exactly three subsections and one sub-subsection pair:
+
+| Section | Contents |
+|---|---|
+| §6 (body) | `ProtocolVersion`, `ContentType`, `SenderType`, `Sender`, `WireFormat`, `FramedContent`, `MLSMessage`, `AuthenticatedContent` |
+| §6.1 Content Authentication | `FramedContentTBS`, `MAC`, `FramedContentAuthData` |
+| §6.2 Encoding and Decoding a Public Message | `PublicMessage`, `AuthenticatedContentTBM`, `membership_tag` |
+| §6.3 Encoding and Decoding a Private Message | `PrivateMessage` |
+| §6.3.1 Content Encryption | `PrivateMessageContent`, `PrivateContentAAD`, the reuse guard, the padding MUST |
+| §6.3.2 Sender Data Encryption | `SenderData`, `SenderDataAAD`, `ciphertext_sample` |
+
+`Proposal` and `Commit` are NOT in §6 — they are §12.1 and §12.4, and §6
+only references them from `FramedContent`'s `select`. They are implemented
+here anyway (as `content.zig`) because a framing layer that cannot decode
+them can decode nothing but application data. §10's `KeyPackage` follows for
+the same reason one level down: §12.1.1's `Add` is `struct { KeyPackage
+key_package; }`.
+
+### What it is verified against
+
+| Vector | Drives | Checked |
+|---|---|---|
+| `message-protection.json` | `protectPublic`/`unprotectPublic`, `protectPrivate`/`decryptSenderData`/`decryptContent`/`parsePrivateContent`, `signFramedContent`/`verifyFramedContent`, `membershipTag`, and Part 4's `secrettree` ratchets underneath | `PrivateMessage` for all three content types and `PublicMessage` for the two handshake types, byte-exact **in both directions** — plus the §6 refusal of application content as a `PublicMessage`, which is why that pairing is absent rather than untested. See below |
+| `transcript-hashes.json` | `transcript.confirmedTranscriptHash`/`interimTranscriptHash`/`advance`, `AuthenticatedContent.encode`/`decode`, and Part 4's `verifyConfirmationTag` | Both §8.2 hashes byte-exact, the `AuthenticatedContent` re-encode byte-exact, and the Commit's own `confirmation_tag` verified against the confirmed hash it produces |
+| `messages.json` | Every §12.1 proposal body, §12.4 `Commit`, §10 `KeyPackage`, and the §6 `MLSMessage` wire formats | decode → re-encode byte-exact for all 13 embedded fields per entry |
+
+Every vector matched on the first run — no stage needed adjusting, no
+vector was edited, and no code was changed in response to a divergence
+because there was none. That is a weaker statement than it looks (this part
+introduces no new cryptography; every derivation under it was pinned by
+Parts 1/2/4 first), but it does mean the §6 wire shapes and the two TBS/TBM
+framings were read correctly off the RFC the first time.
+
+### The protect direction is pinned byte-exact, which upstream does not ask for
+
+`message-protection.json`'s own procedure only requires a ROUND-TRIP in the
+send direction: "verify that protecting the raw value ... produces a
+PublicMessage that verifies". That is because a generic implementation
+picks a random reuse guard (§6.3.1 requires it) and an arbitrary padding
+length (§6.3.1 leaves it to the application), so its output cannot be
+compared against the vector's bytes.
+
+Both choices are recoverable from the vector itself, though:
+
+- the **reuse guard** and the **generation** fall out of the decrypted
+  `SenderData` (§6.3.2);
+- the **padding length** is the decrypted plaintext length minus the
+  encoded body and `FramedContentAuthData`.
+
+Feed those back in and the whole construction is deterministic — Ed25519 is
+(RFC 8032, and this module passes no hedging noise), AES-GCM is given
+key/nonce/AAD, and HMAC/HKDF always are. So `kat_framing_test.zig`
+reproduces `proposal_pub`, `commit_pub`, `proposal_priv`, `commit_priv` and
+`application_priv` byte-for-byte. This matters: a round-trip test passes
+happily with a systematically wrong `FramedContentTBS` (sign and verify
+with the same wrong bytes and nothing complains), and byte-exactness does
+not.
+
+The one thing the harness does NOT claim byte-exactness for is the four
+`MLSMessage` header bytes in front of each protected message — `protect*`
+returns a bare `PublicMessage`/`PrivateMessage`, so the harness derives the
+header length by re-encoding the decoded message and asserting the vector
+ends with it, rather than assuming a constant.
+
+### Where the boundary falls, stated precisely
+
+Implemented: every wire structure in §6, §12.1, §12.4 and §10, plus §8.2.
+
+NOT implemented, and not stubbed either:
+
+- **§12.2 proposal-list validity / §12.3 application order / §12.4.1
+  Creating a Commit / §12.4.2 Processing a Commit.** `content.zig` decodes
+  a `Commit`; nothing in this part decides whether its proposal list is
+  legal, applies it to a ratchet tree, or advances an epoch. That is a
+  state machine over Part 2's tree editing and Part 4's key schedule, and
+  it needs a group-state object this module does not have yet.
+- **§10.1 KeyPackage validation and §7.3 LeafNode validation.**
+  `keypackage.zig` has the struct and its self-signature check — a pure
+  function of the bytes — and none of the admission rules (lifetime
+  freshness, capability/extension consistency, `leaf_node_source ==
+  key_package`, init-key/encryption-key distinctness, uniqueness within a
+  Commit). Those stay Part 3's.
+- **`Welcome` / `GroupInfo`.** `framing.MLSMessage.decode` returns
+  `error.WireFormatNotInThisPart` for wire formats 3 and 4 — a NAMED
+  refusal, deliberately distinct from the `error.Malformed` an unregistered
+  value gets, so a caller can tell "not built yet" from "not a thing".
+- **Key lookup and member validation.** `unprotect*` hands back a decoded,
+  signature-verified `AuthenticatedContent` and the `SenderData.leaf_index`
+  it decrypted. Checking that the index names a non-blank leaf (§6.3.2's
+  closing MUST) needs a `RatchetTree`; choosing which leaf's ratchet and
+  which generation to try needs a per-leaf `secrettree.Window`. Both are
+  the caller's, and `framing.zig`'s doc comment says so.
+- **Randomness.** §6.3.1 requires a fresh random four-byte reuse guard per
+  message; `ProtectPrivateParams.reuse_guard` is a caller input. Same
+  posture as `keyschedule.PreSharedKeyId.psk_nonce` — this module never
+  owns a randomness policy.
+
+### Three §6 details that are easy to get wrong, and are load-bearing
+
+1. **The signature covers the wire format.** `FramedContentTBS` begins
+   `version || wire_format`, so the same `FramedContent` produces a
+   different signature for a `PublicMessage` than for a `PrivateMessage`.
+   That is what stops a handshake message being lifted out of its encrypted
+   envelope and replayed in the clear. There is deliberately no "sign once,
+   encode either way" entry point.
+2. **The GroupContext is in the TBS for `member`/`new_member_commit` only.**
+   §6.1's `select` gives `external`/`new_member_proposal` an empty struct.
+   Always appending it would reject legitimate external proposals; never
+   appending it would accept a member's signature from the wrong epoch.
+   `Sender.tbsIncludesGroupContext()` is the single place that decision
+   lives, and `framedContentTbsAlloc` returns `error.MissingGroupContext`
+   rather than silently producing a shorter TBS.
+3. **The reuse guard is XORed into the nonce, not appended to it** — into
+   the FIRST four bytes, leaving the rest of the key-schedule nonce
+   untouched (§6.3.1's figure). `applyReuseGuard` is involutive and is used
+   by both directions, so protect and unprotect cannot disagree about it.
+
+Additionally, §8.2's `InterimTranscriptHashInput` is `struct { MAC
+confirmation_tag; }` — one `opaque<V>` field — so the tag enters that hash
+LENGTH-PREFIXED, not raw. Dropping that one varint produces a
+perfectly plausible 32-byte hash that no other implementation agrees with;
+`transcript.zig` has an explicit test contrasting the two constructions.
+
+### Why §8.2 needs two hashes rather than one
+
+A Commit's `confirmation_tag` is a MAC over the confirmed transcript hash
+that that same Commit produces (§6.1). A single running hash that also
+covered the tag would therefore require the tag to compute the hash the tag
+is computed over. §8.2 breaks the circularity by cutting the update in two
+at exactly the signature boundary: `ConfirmedTranscriptHashInput` stops at
+`signature`, and `InterimTranscriptHashInput` is nothing but the tag. This
+is why `transcript.confirmedInputEncode` is not simply
+`AuthenticatedContent.encode` — there is a test asserting the former is a
+strict prefix of the latter, differing by exactly the trailing tag.
+
+### The addition to Part 2's files
+
+- **`wire_lists.encodeVarVecAny`** (new). `wire_lists.encodeVarVec`
+  declares `codec.Error!void`, which every Part 2 element type satisfies.
+  `content.ProposalOrRef` does not: it can bottom out in a `tree.LeafNode`
+  or a `KeyPackage`, whose `encode` can fail with `error.Malformed` (a
+  `select`-guarded field missing) and whose error set includes
+  `OutOfMemory`. Rather than widening the existing helper's declared error
+  set — which would change the contract every current caller relies on —
+  the new one has an inferred error set and an otherwise identical body.
+
+### Teeth
+
+Each of the three new vectors was corrupted by ONE byte, the suite re-run,
+and the failure confirmed to name the diverging stage; then restored and
+re-verified by SHA-256 against the fetched originals (hashes in `NOTICE`):
+
+| Corruption | Failure |
+|---|---|
+| `messages.json` entry 0's `public_message_commit`, 2nd hex digit | `'public_message_commit (§6.2)' re-encode diverged at entry 0 (want 428 bytes, got 428)` |
+| `message-protection.json` suite-1 `application`, 3rd hex digit | `'application_priv -> application body' diverged (want 42 bytes, got 42)` |
+| `message-protection.json` suite-1 `membership_key`, 3rd hex digit | `'proposal_pub membership_tag (§6.2)' failed: MacMismatch` |
+| `transcript-hashes.json` suite-1 `interim_transcript_hash_before`, 3rd hex digit | `'confirmed_transcript_hash_after' diverged (want 32 bytes, got 32)` |
+
+The membership-key case is why both harnesses name the stage on an ERROR as
+well as on a byte mismatch: every iteration of an `inline for` shares one
+source line, so a bare `error.MacMismatch` would not have said which
+content type or which of the two tags produced it.
+
+Beyond the vectors, three in-file negative controls exist because a
+positive-only harness would pass without them: a tampered ciphertext byte
+must fail the content AEAD; a wrong reuse guard must fail it too (proving
+the XOR is actually reaching the nonce); and the Commit's `confirmation_tag`
+must NOT verify against the interim hash or the previous interim hash
+(proving §8.2's two same-width hashes are not being confused).
 
 ## Threat model
 
@@ -423,6 +615,28 @@ bytes.
   works, not just the deterministic-input decrypt half.
 
 ## Backlog
+
+- **`kat_treekem_test.zig` still carries a test-local `KeyPackage` parser.**
+  It predates `keypackage.zig` (Part 5) and was written only to reach
+  `tree-operations.json`'s Add proposals. Switching it to
+  `keypackage.KeyPackage` would delete duplicated parsing and give that
+  vector a second consumer; left alone in this pass to avoid touching a
+  passing Part 2 KAT for a cosmetic win. `tree.decodeExtensionList`'s doc
+  comment names this.
+- **`content.zig` has no standalone `Add`/`Update`/`Remove`/`PreSharedKey`/
+  `ExternalInit`/`GroupContextExtensions` types** — each §12.1 body is a
+  `Proposal` union arm holding the type it wraps (`Add` is a `KeyPackage`,
+  `Remove` is a `u32`, …), since none of those RFC structs has a second
+  field. The consequence is that `kat_messages_test.zig` drives the bare
+  `*_proposal` vector fields through the WRAPPED types, prepending the
+  §17.4 type value where the vector has none. If a future extension
+  proposal type needs a real struct, that is when to split them out.
+- **`framing.zig` exposes no single `unprotectPrivate`.** Decryption is
+  genuinely two-phase (§6.3.2's sender data names the key that §6.3.1's
+  content needs), and the key lookup between the phases is the caller's, so
+  the three stages are exposed separately rather than behind a callback.
+  Revisit if a group-state object in a later part makes the lookup
+  internal.
 
 - **Scratch-buffer size (512 bytes) — RESOLVED 2026-07-28** by the second
   of the two options this item listed: `crypto.ExpandWithLabelScratch` takes

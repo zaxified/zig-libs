@@ -17,15 +17,30 @@
 //! `psk_secret`, §8.5's exporter, §6.1's two MACs, and §9's secret tree +
 //! sender ratchets + §6.3.2 sender-data keys (`secrettree.zig`), all pinned
 //! byte-exact against the official `key-schedule`/`psk_secret`/`secret-tree`
-//! vectors — see `SPEC.md`'s "Part 4" section. Two §8 subsections are
-//! deliberately NOT in it: §8.2's transcript hashes (needs Part 5's encoded
-//! `AuthenticatedContent`) and §8.3's external initialization (needs Part
-//! 6's external-commit flow).
-//! KeyPackage/LeafNode-validation/Credential (Part 3) and
-//! Proposal/Commit/framing (Part 5) are LATER parts — see `SPEC.md`'s
-//! "Arc breakdown" for the full decomposition. Part 4 landed before Part 3
+//! vectors — see `SPEC.md`'s "Part 4" section. **Part 5: message framing —
+//! COMPLETE.** All of RFC 9420 §6 (`framing.zig`: `FramedContent`,
+//! `AuthenticatedContent`, §6.1's `FramedContentTBS`/`FramedContentAuthData`,
+//! §6.2's `PublicMessage` + `membership_tag`, §6.3's `PrivateMessage` with
+//! §6.3.1's content encryption/reuse guard/padding and §6.3.2's sender-data
+//! encryption, and `MLSMessage`), the two content types framing carries
+//! (`content.zig`: §12.1's seven `Proposal` types, §12.4's `Commit`/
+//! `ProposalOrRef`) with the §10 `KeyPackage` wire format an `Add` needs
+//! (`keypackage.zig`), and **§8.2's transcript hashes** (`transcript.zig`) —
+//! the one hole Part 4 deliberately left open, now closed. Pinned byte-exact
+//! against the official `messages`/`message-protection`/`transcript-hashes`
+//! vectors, including reproducing every protected message in
+//! `message-protection.json` byte-for-byte in the SEND direction, which is
+//! stronger than that vector's own stated procedure — see `SPEC.md`'s
+//! "Part 5" section.
+//! Of §8, only §8.3's external initialization is still missing (it needs
+//! Part 6's external-commit flow).
+//! Part 3 (LeafNode/KeyPackage VALIDATION + Credential) and Part 6
+//! (external commit / Welcome / GroupInfo / reinit) are the remaining
+//! parts — see `SPEC.md`'s "Arc breakdown". Part 4 landed before Part 3
 //! because the key schedule depends on neither: it consumes a tree HASH,
-//! not a `KeyPackage`.
+//! not a `KeyPackage`; Part 5 then landed before Part 3 too, and took §10's
+//! KeyPackage *wire format* with it (but none of §10.1's validation
+//! rules) because §12.1.1's `Add` proposal cannot be decoded without it.
 //!
 //! | File | What it provides |
 //! |---|---|
@@ -44,6 +59,12 @@
 //! | `secrettree.zig` | Part 4's RFC 9420 §9 secret tree (derived downward from `encryption_secret`), the per-leaf handshake/application sender ratchets (§9.1), a generation-indexed out-of-order `Window` with consume-once and bounded-forward-jump policy (§9.2), and §6.3.2's sender-data key/nonce |
 //! | `kat_keyschedule_test.zig` | Part 4's KAT harness for `key-schedule.json` (per-STAGE, so a divergence names the failing link) + `psk_secret.json` (chains of 0 through 10 PSKs) |
 //! | `kat_secrettree_test.zig` | Part 4's KAT harness for `secret-tree.json` — 1/8/32-leaf trees, each leaf's generations driven twice: forward through a bare `Ratchet` and in reverse through a `Window` |
+//! | `keypackage.zig` | Part 5's RFC 9420 §10 `KeyPackage`/`KeyPackageTBS` WIRE FORMAT (plus its self-signature) — here because §12.1.1's `Add` carries one; §10.1's VALIDATION rules are Part 3's and are not in it |
+//! | `content.zig` | Part 5's §12.1 `Proposal` (all seven types) and §12.4 `Commit`/`ProposalOrRef`/`ProposalOrRefType` — the two non-application bodies §6's `FramedContent` selects between. Wire shape only: no §12.2 proposal-list validity, no §12.3 application order, no commit-processing state machine |
+//! | `framing.zig` | Part 5's whole of §6: `WireFormat`/`ContentType`/`SenderType`/`Sender`, `FramedContent`, `AuthenticatedContent`, §6.1's `FramedContentTBS` + sign/verify, §6.2's `PublicMessage`/`AuthenticatedContentTBM`/`membership_tag` + `protectPublic`/`unprotectPublic`, §6.3's `PrivateMessage` + §6.3.1's `PrivateMessageContent`/`PrivateContentAAD`/reuse guard/padding + §6.3.2's `SenderData`/`SenderDataAAD`, and `MLSMessage` |
+//! | `transcript.zig` | Part 5's RFC 9420 §8.2 — `ConfirmedTranscriptHashInput`/`InterimTranscriptHashInput` and both recurrences. Separate from `keyschedule.zig` only because `framing.zig` imports that file, so §8.2 sitting there would be an import cycle |
+//! | `kat_messages_test.zig` | Part 5's KAT harness for `messages.json`: every §12.1 proposal body, §12.4 `Commit`, and the §6 `MLSMessage` wire formats, decode→re-encode byte-exact (a WIRE-format anchor — upstream states this vector's MACs may be invalid) |
+//! | `kat_framing_test.zig` | Part 5's KAT harness for `message-protection.json` (the full §6 protect/unprotect path with real keys — `PrivateMessage` for all three content types, `PublicMessage` for the two handshake types, byte-exact in BOTH directions, plus §6's refusal of application content as a `PublicMessage`) and `transcript-hashes.json` (§8.2's two hashes plus the Commit's own `confirmation_tag`) |
 //!
 //! **Status: Part 1 COMPLETE (Sonnet-tier). Part 2 COMPLETE (Sonnet
 //! data/codec/tree-hash/tree-editing + Fable tree-algorithm cores, all
@@ -51,7 +72,10 @@
 //! Part 1's primitives, but with an authoritative per-stage conformance
 //! oracle; the only judgment call was §8.4's Extract argument order, where
 //! the RFC's prose and its Figure 24 disagree and `psk_secret.json`
-//! settles it — see `keyschedule.pskSecret`'s doc comment).**
+//! settles it — see `keyschedule.pskSecret`'s doc comment). Part 5
+//! COMPLETE (Sonnet — wire shapes plus composition of Parts 1/2/4's
+//! primitives; no new cryptography, and every vector matched on the first
+//! run with nothing adjusted on either side).**
 //! `treemath.zig` is a pure port of the RFC's own
 //! reference code; `crypto.zig` composes `codec.zig` + the sibling
 //! `hpke`/std.crypto primitives exactly as RFC 9420 §5/§8/§9.1 specify,
@@ -66,19 +90,24 @@
 //!
 //! Consumer: a group-messaging application wanting RFC 9420 interop
 //! (Matrix, MLS-based E2EE messaging, or any protocol layering on MLS's
-//! group key agreement) — Parts 1+2+4 are still not a usable MLS client
-//! (no KeyPackage, no Proposal/Commit/framing, so nothing can be sent or
-//! received yet), but they are now the complete CRYPTOGRAPHIC spine: given
-//! a tree and a transcript, every key an epoch uses is derivable and
-//! interop-verified. What Parts 3/5 add is the message plumbing that feeds
-//! this spine its inputs. See `README.md` for the current/planned surface.
+//! group key agreement). With Part 5 the module can now, for a group whose
+//! state the caller maintains, PRODUCE and CONSUME real MLS messages that
+//! other implementations accept byte-for-byte — a proposal, a commit or an
+//! application message, signed and MAC'd or fully encrypted. What it still
+//! cannot do is BE a client on its own: there is no group-state object, no
+//! Welcome/GroupInfo (so no way to join a group — Part 6), and no §10.1/
+//! §7.3 validation deciding whether a KeyPackage or LeafNode should be
+//! admitted (Part 3). Framing hands a caller a decoded, cryptographically
+//! verified `AuthenticatedContent` and a `SenderData.leaf_index`; deciding
+//! that the index names a real member, and applying the proposals, is
+//! still above this module. See `README.md` for the current surface.
 //!
 //! Provenance: clean-room from RFC 9420 (a public IETF specification, not
 //! copyrightable expression — see `CONVENTIONS.md` §5's merger-doctrine
 //! note) plus `treemath.zig`'s direct port of RFC 9420 Appendix C's own
 //! published reference algorithm (the RFC's stated intent — it publishes
 //! runnable code, not just prose, specifically so implementations match
-//! it exactly). The four `kat_*_test.zig` harnesses embed official
+//! it exactly). The six `kat_*_test.zig` harnesses embed official
 //! `mlswg/mls-implementations` interop vectors — public conformance DATA,
 //! not copyrightable expression, same posture as this repo's `bn254`/
 //! `bls12_381` KAT sources; see `NOTICE` for the exact commit/fetch-date
@@ -95,6 +124,10 @@ pub const treehash = @import("treehash.zig");
 pub const treekem = @import("treekem.zig");
 pub const keyschedule = @import("keyschedule.zig");
 pub const secrettree = @import("secrettree.zig");
+pub const keypackage = @import("keypackage.zig");
+pub const content = @import("content.zig");
+pub const framing = @import("framing.zig");
+pub const transcript = @import("transcript.zig");
 pub const gate = @import("gate.zig");
 
 // Flat re-exports of the surface most callers want.
@@ -145,12 +178,52 @@ pub const Ratchet = secrettree.Ratchet;
 pub const Window = secrettree.Window;
 pub const senderDataKeys = secrettree.senderDataKeys;
 
+pub const KeyPackage = keypackage.KeyPackage;
+
+pub const ProposalType = content.ProposalType;
+pub const Proposal = content.Proposal;
+pub const ProposalOrRef = content.ProposalOrRef;
+pub const ProposalOrRefType = content.ProposalOrRefType;
+pub const Commit = content.Commit;
+pub const ReInit = content.ReInit;
+
+pub const WireFormat = framing.WireFormat;
+pub const ContentType = framing.ContentType;
+pub const SenderType = framing.SenderType;
+pub const Sender = framing.Sender;
+pub const FramedContent = framing.FramedContent;
+pub const FramedContentBody = framing.FramedContentBody;
+pub const FramedContentAuthData = framing.FramedContentAuthData;
+pub const AuthenticatedContent = framing.AuthenticatedContent;
+pub const PublicMessage = framing.PublicMessage;
+pub const PrivateMessage = framing.PrivateMessage;
+pub const SenderData = framing.SenderData;
+pub const MLSMessage = framing.MLSMessage;
+pub const protectPublic = framing.protectPublic;
+pub const unprotectPublic = framing.unprotectPublic;
+pub const protectPrivate = framing.protectPrivate;
+pub const decryptSenderData = framing.decryptSenderData;
+pub const decryptContent = framing.decryptContent;
+pub const parsePrivateContent = framing.parsePrivateContent;
+pub const signFramedContent = framing.signFramedContent;
+pub const verifyFramedContent = framing.verifyFramedContent;
+pub const proposalRef = framing.proposalRef;
+
+pub const confirmedTranscriptHash = transcript.confirmedTranscriptHash;
+pub const interimTranscriptHash = transcript.interimTranscriptHash;
+pub const advanceTranscript = transcript.advance;
+pub const empty_transcript_hash = transcript.empty_transcript_hash;
+
 pub const meta = .{
     .platform = .any,
     // Pure computation over caller-supplied bytes/keys, like the sibling
-    // `hpke`/`signal` modules — no owned socket/transport of its own (a
-    // later framing part may introduce wire I/O, but Part 1 is
-    // computation-only).
+    // `hpke`/`signal` modules — no owned socket/transport of its own. Part
+    // 5's framing layer was where wire I/O might have appeared and did not:
+    // `protectPublic`/`protectPrivate` return BYTES for the caller to send,
+    // and `unprotect*` takes bytes the caller received. MLS deliberately
+    // does not specify a transport (RFC 9420 §2's Delivery Service is an
+    // architectural role, not a protocol), so owning one here would be an
+    // invention rather than an implementation.
     .role = .util,
     // No shared/global state — every type here is a plain caller-owned
     // value (`codec.Writer`/`Reader` wrap a caller-supplied buffer;
@@ -178,10 +251,16 @@ test {
     _ = treekem;
     _ = keyschedule;
     _ = secrettree;
+    _ = keypackage;
+    _ = content;
+    _ = framing;
+    _ = transcript;
     _ = gate;
     _ = @import("kat_treekem_test.zig");
     _ = @import("kat_keyschedule_test.zig");
     _ = @import("kat_secrettree_test.zig");
+    _ = @import("kat_messages_test.zig");
+    _ = @import("kat_framing_test.zig");
 }
 
 test "meta.deps is exactly {\"hpke\"}" {
