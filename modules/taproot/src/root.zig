@@ -312,4 +312,3 @@ test "tweakSecretKey's internal bip340.KeyPair.deinit zeroizes the normalized sc
     kp.deinit();
     try std.testing.expectEqualSlices(u8, &zero, &kp.secret);
 }
-

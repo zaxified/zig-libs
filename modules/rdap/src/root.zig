@@ -1469,11 +1469,13 @@ test "client: related link at a loopback host is refused, falls back to the firs
         \\  ]
         \\}
     ;
-    var stub: StubFetcher = .{ .entries = &.{
-        .{ .url = "https://rdap.verisign.com/com/v1/domain/example.com", .body = ssrf_related_json },
-        // If the guard failed, this would be reachable — it must never be dialed.
-        .{ .url = "http://127.0.0.1:6379/rdap/domain/example.com", .body = domain_json },
-    } };
+    var stub: StubFetcher = .{
+        .entries = &.{
+            .{ .url = "https://rdap.verisign.com/com/v1/domain/example.com", .body = ssrf_related_json },
+            // If the guard failed, this would be reachable — it must never be dialed.
+            .{ .url = "http://127.0.0.1:6379/rdap/domain/example.com", .body = domain_json },
+        },
+    };
     var client: Client = .{ .fetcher = stub.fetcher(), .gpa = testing.allocator };
     var buf: [8192]u8 = undefined;
 
