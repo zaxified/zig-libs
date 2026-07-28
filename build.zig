@@ -286,6 +286,21 @@ pub fn build(b: *std.Build) void {
         one.dependOn(&run.step);
     }
 
+    // Machine-readable module graph: `zig build module-graph`.
+    // One TSV line per module — `name<TAB>heavy<TAB>dep,dep,...` (deps empty
+    // when there are none). `scripts/test.sh` reads this to work out which
+    // modules a change affects, so build.zig stays the single source of truth
+    // for the graph and nothing has to parse Zig source.
+    const graph = b.step("module-graph", "Print the module dependency graph as TSV (name, heavy, deps)");
+    const graph_inner = b.allocator.create(std.Build.Step) catch @panic("OOM");
+    graph_inner.* = std.Build.Step.init(.{
+        .id = .custom,
+        .name = "module-graph",
+        .owner = b,
+        .makeFn = printModuleGraph,
+    });
+    graph.dependOn(graph_inner);
+
     // Catalog consistency gate: `zig build check-catalog` (CI runs it).
     // Verifies module_list ↔ modules/ ↔ the README catalog table agree, so a
     // module can't ship without a catalog row (6 rows had drifted before this
@@ -299,6 +314,40 @@ pub fn build(b: *std.Build) void {
         .makeFn = checkCatalog,
     });
     check.dependOn(check_inner);
+}
+
+/// `zig build module-graph` — dump module_list as TSV so tooling does not have
+/// to parse Zig source. One line per module:
+///
+///     name<TAB>heavy|light<TAB>dep,dep,...
+///
+/// The deps column is empty for a module with no siblings. Consumed by
+/// `scripts/test.sh` to map changed files onto the modules they affect,
+/// including reverse dependencies.
+fn printModuleGraph(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
+    _ = options;
+    const b = step.owner;
+
+    var out: std.Io.Writer.Allocating = .init(b.allocator);
+    defer out.deinit();
+    const w = &out.writer;
+
+    for (module_list) |m| {
+        try w.print("{s}\t{s}\t", .{ m.name, if (m.heavy) "heavy" else "light" });
+        for (m.deps, 0..) |dep, i| {
+            if (i != 0) try w.writeAll(",");
+            try w.writeAll(dep);
+        }
+        try w.writeAll("\n");
+    }
+
+    // Straight to stdout: this step's whole purpose is its output, and the
+    // build runner reserves stderr for genuine problems (see the skip-print
+    // rule in the module test helpers).
+    var buf: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writerStreaming(b.graph.io, &buf);
+    try stdout.interface.writeAll(out.written());
+    try stdout.interface.flush();
 }
 
 fn checkCatalog(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
