@@ -10,16 +10,18 @@ Merkle-tree BIP-340 signature). Usage: see ./README.md.
   bech32 codec — BOLT#11 explicitly waives BIP173's 90-character ceiling, so the `bech32` module's
   capped `encode`/`decode` can't be reused; also a checksum-less variant for BOLT#12) ·
   `bitpack.zig` (5-bit-quintet ↔ byte/integer conversions, shared by both BOLTs) ·
-  `ecdsa_recover.zig` (RFC 6979 deterministic ECDSA sign + standard public-key recovery over
-  `k256`'s field/group/scalar — `k256/src/sign.zig` was checked and ships BIP340 Schnorr +
-  plain ECDSA *verify* but no ECDSA *sign* and no *recovery*, both needed here) · `bolt11.zig` /
+  `ecdsa_recover.zig` (a thin re-export of `k256.ecdsa_recover` — see below) · `bolt11.zig` /
   `bolt12.zig` (the wire formats themselves).
 
-- **`k256` had no recoverable-ECDSA support — this module adds it, not `k256`.** `k256/src/sign.zig`
-  is deliberately thin ("a verification harness surface, not the module's reason to exist");
-  BOLT#11's recoverable-signature scheme is genuinely lninvoice's own concern (Bitcoin/BIP340 code
-  never needed it), so it lives here rather than growing k256's scope. `ecdsa_recover.zig` is
-  self-contained and reusable standalone (re-exported at `lninvoice`'s root).
+- **Recoverable ECDSA now lives in `k256`, not here.** BOLT#11's recoverable-signature scheme
+  (RFC 6979 deterministic sign + standard public-key recovery, `Q = r⁻¹(sR − eG)`) was originally
+  implemented in this module, because at the time `k256/src/sign.zig` shipped only BIP340 Schnorr
+  and plain ECDSA *verify* — no ECDSA *sign*, no *recovery* — and no other consumer needed either.
+  Once it became clear the functionality is general secp256k1 machinery rather than anything
+  BOLT#11-specific, it was moved to `k256/src/ecdsa_recover.zig` (exported as `k256.ecdsa_recover`).
+  `lninvoice/src/ecdsa_recover.zig` is now a thin re-export shim, kept so `bolt11.zig`'s existing
+  `ecdsa.*` call sites and `lninvoice`'s root-level `sign`/`recoverPubkey`/`Signature`/`isLowS`
+  re-exports need no changes.
 
 - **Fail-closed throughout, specific typed errors per rejection reason** — `bolt11.DecodeError` is
   a large union covering: bech32-layer failures (`MixedCase`/`NoSeparator`/`InvalidChecksum`/...,

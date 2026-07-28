@@ -61,6 +61,11 @@ const xy = R.affineCoordinates();
 const sig = try k256.sign.bip340Sign(secret_key, msg, aux_rand);
 const ok  = k256.sign.bip340Verify(pubkey_xonly, msg, sig);
 const ok2 = k256.sign.ecdsaVerify(pubkey_sec1, msg, sig_rs);
+
+// Recoverable ECDSA (RFC 6979 deterministic sign + public-key recovery —
+// e.g. Lightning BOLT#11's invoice signature).
+const rsig = try k256.ecdsa_recover.sign(privkey, hash32);
+const q = try k256.ecdsa_recover.recoverPubkey(hash32, rsig.r, rsig.s, rsig.recid);
 ```
 
 `k256.Scalar` (arithmetic mod the group order `n`) is re-exported from std on
@@ -82,7 +87,10 @@ a green light). The suite includes the field/group/scalar differentials vs
 `std.crypto.ecc.Secp256k1` (thousands of random inputs, bit-exact via `toBytes`),
 the GLV decomposition + β-endomorphism checks, the 19 official BIP340 vectors
 (8 sign rows byte-exact, all 19 verify rows), an ECDSA differential against std's
-signer, and a broken-Solinas-constant positive control the harness flags RED.
+signer, a broken-Solinas-constant positive control the harness flags RED, and
+`ecdsa_recover`'s own sign/recover round-trip + tampered-signature tests
+(originally `lninvoice`'s, moved here — general secp256k1 machinery, not
+BOLT#11-specific).
 
 Measured on this host (ReleaseFast, portable path — the SCAFFOLD baseline, not
 the accelerated target): field mul **25 ns/op** vs std 59, field sq **47** vs 100,

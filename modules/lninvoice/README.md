@@ -7,9 +7,11 @@ deferred and why).
 - The `lnwire` module's own doc comment already named this as future work: "BOLT#11 invoices /
   BOLT#12 offers (bech32-based — a future `lninvoice` module)". It reuses `bech32`'s charset + BCH
   checksum algorithm (reimplemented length-uncapped — BOLT#11 waives BIP173's 90-character
-  ceiling), `k256`'s field/group/scalar arithmetic (adding the recoverable-ECDSA sign/recover
-  BOLT#11 needs, which `k256` doesn't ship — see `SPEC.md`), and `lnwire`'s generic TLV stream
-  parser (for BOLT#12's `offer` payload).
+  ceiling), `k256.ecdsa_recover`'s RFC 6979 sign + public-key recovery for BOLT#11's recoverable
+  signature (originally implemented in this module, moved to `k256` once it turned out to be
+  general secp256k1 machinery — see `SPEC.md`), `lnwire`'s generic TLV stream parser (for BOLT#12's
+  `offer`/`invoice_request`/`invoice` payloads), and `bip340`'s Schnorr sign/verify + tagged
+  hashing (for BOLT#12's Merkle-tree signature).
 - **Platform:** any — pure transform over caller-owned strings/bytes, no I/O. Allocator-based
   throughout (unlike `bech32`'s fixed-buffer codec: invoices are unbounded length and carry
   variable-length fields).
@@ -28,7 +30,8 @@ Implemented — see `SPEC.md` for the full design/threat-model writeup and exact
 - **BOLT#11 encode** (`encode`) — build + sign a payment request from a field list, either from a
   caller-supplied signature or a private key (RFC 6979 deterministic signing).
 - **Recoverable ECDSA** (`ecdsa_recover.zig`, re-exported at root) — `sign`/`recoverPubkey`/
-  `isLowS` over `k256`, usable standalone.
+  `isLowS`, now implemented in `k256.ecdsa_recover`; this module just re-exports it, usable
+  standalone either way.
 - **BOLT#12 offer decode** (`decodeOffer`) — the `lno1...` checksum-less bech32-style TLV payload,
   every scalar `offer_*` field. `invoice_request`/`invoice` (BIP-340 Merkle-tree signing) are
   deferred — see `SPEC.md`.

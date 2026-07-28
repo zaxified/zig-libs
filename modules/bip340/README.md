@@ -12,8 +12,8 @@ the design and threat model.
 
 | File | Contents |
 |---|---|
-| `hash.zig` | `taggedHash`/`taggedHasher` (BIP340's `SHA256(SHA256(tag)‖SHA256(tag)‖msg)`, all three domain tags, comptime-midstate-optimized) |
-| `root.zig` | `XOnlyPublicKey` (parse + `lift_x`), `SecretKey`/`PublicKey`/`KeyPair` (even-y normalization + derivation), `Signature` (parse/serialize + canonical range checks), `sign`, `verify`, `verifyBatch` |
+| `hash.zig` | `taggedHash`/`taggedHasher` (BIP340's `SHA256(SHA256(tag)‖SHA256(tag)‖msg)`, all three domain tags, comptime-midstate-optimized) + `taggedHashRuntime`/`taggedHasherRuntime` (same construction for tags only known at runtime, e.g. BOLT#12's per-stream nonce-leaf tag) |
+| `root.zig` | `XOnlyPublicKey` (parse + `lift_x`), `xonlyBytesOf` (structural 33-or-32-byte point field → 32-byte x-only view), `SecretKey`/`PublicKey`/`KeyPair` (even-y normalization + derivation), `Signature` (parse/serialize + canonical range checks), `sign`, `verify`, `verifyBatch` |
 | `kat_vectors.zig` | The 19 official BIP340 test vectors, embedded |
 | `kat_test.zig` | Full KAT assertions (codecs, derivation, sign round-trip, verify accept/reject) + batch-verification correctness tests |
 
@@ -66,6 +66,23 @@ building on the same domain-separation convention):
 
 ```zig
 const e = bip340.taggedHash(bip340.hash.challenge_tag, r_x ++ p_x ++ msg);
+```
+
+For a tag that is only known at runtime (not a comptime-known string — e.g.
+BOLT#12's per-stream `"LnNonce" || first_tlv` nonce-leaf tag), use
+`taggedHashRuntime`, which takes the tag as a slice of parts to concatenate:
+
+```zig
+const h = bip340.taggedHashRuntime(&.{ "LnNonce", first_tlv }, type_bytes);
+```
+
+**Point-field x-only extraction** (structural, not cryptographic — for
+specs whose point fields are interchangeably 33-byte SEC1-compressed or
+already-x-only 32-byte, e.g. BOLT#12's `invreq_payer_id`/`invoice_node_id`):
+
+```zig
+const xonly_bytes = try bip340.xonlyBytesOf(point_field); // drops the SEC1 prefix if present
+const xonly = try bip340.XOnlyPublicKey.fromBytes(xonly_bytes); // validates on-curve-ness
 ```
 
 ## Verify

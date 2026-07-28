@@ -49,11 +49,25 @@ purpose and API. Provenance: see [NOTICE](NOTICE).
   cross-file privacy in Zig, so a value-copy is a real snapshot, not a
   simulation) is precomputed once per tag at comptime and reused by every
   `taggedHash` call for that tag, which then only hashes `msg`.
+  `taggedHashRuntime`/`taggedHasherRuntime` implement the same construction
+  for a tag that is only known at runtime (no comptime midstate to cache —
+  the tag hash is recomputed per call); `tag` is taken as a slice of parts
+  so a tag built by concatenation (e.g. BOLT#12's `"LnNonce" ‖ first_tlv`)
+  needs no intermediate allocation. Added for DRY: BOLT#12's `lninvoice`
+  module had hand-rolled this exact construction because its tag varies per
+  TLV stream.
 - **x-only public key / `lift_x`** (`XOnlyPublicKey`): parse rejects a
   non-canonical x (`x ≥ p`, `Fe.fromBytes`'s built-in check) and an x with
   no valid y (`recoverY`'s `error.NotSquare`). `lift()` always resolves to
   the EVEN-y point (BIP340's fixed convention — there is no "requested
   parity" parameter at this layer, unlike raw `recoverY`).
+- **`xonlyBytesOf`**: a purely structural helper (no on-curve validation)
+  that strips the SEC1 parity-prefix byte from a 33-byte compressed point
+  or passes an already-32-byte x-only value through unchanged. Added for
+  DRY: `lninvoice`'s BOLT#12 module had a local copy of exactly this
+  33-or-32-byte-length switch for its `invreq_payer_id`/`invoice_node_id`
+  fields (both stored as 33-byte compressed points but verified x-only,
+  since BIP340 forces even-y via `lift_x` regardless of the parity byte).
 - **Key derivation** (`SecretKey`/`PublicKey`/`KeyPair`): `SecretKey.
   fromBytes` enforces `d ∈ [1, n−1]`. `KeyPair.fromSecretKey` computes `P =
   d*G` and applies BIP340's even-y normalization (`d ← n − d` if `P.y` is

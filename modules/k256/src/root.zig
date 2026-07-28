@@ -23,6 +23,13 @@
 //! with the branch-free Solinas fold, and the GLV+wNAF variable-base +
 //! double-base public multiplies. The core-vs-portable differentials in
 //! `oracle_test.zig` are live. See `gate.zig`, `fast_core.zig`, `SPEC.md`.
+//!
+//! `sign.zig` supplies BIP340 Schnorr sign/verify and plain ECDSA verify;
+//! `ecdsa_recover.zig` supplies the two ECDSA operations that layer doesn't
+//! (RFC 6979 deterministic sign + public-key recovery from a compact
+//! recoverable signature) — moved in from `lninvoice` (the original, and
+//! for a while only, consumer) once it became clear the functionality is
+//! general secp256k1 machinery rather than anything BOLT#11-specific.
 
 const std = @import("std");
 
@@ -30,6 +37,7 @@ pub const field = @import("field.zig");
 pub const group = @import("group.zig");
 pub const scalar = @import("scalar.zig");
 pub const sign = @import("sign.zig");
+pub const ecdsa_recover = @import("ecdsa_recover.zig");
 pub const gate = @import("gate.zig");
 pub const fast_core = @import("fast_core.zig");
 
@@ -62,6 +70,7 @@ test {
     _ = group;
     _ = scalar;
     _ = sign;
+    _ = ecdsa_recover;
     _ = @import("kat_vectors.zig");
     _ = @import("kat_test.zig");
     _ = @import("oracle_test.zig");

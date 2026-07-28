@@ -42,6 +42,46 @@ pub fn taggedHasher(comptime tag: []const u8) Sha256 {
     return comptime midstate(tag);
 }
 
+// ── runtime-tag variant ──────────────────────────────────────────────────
+//
+// `taggedHash`/`taggedHasher` above require `tag` to be comptime-known so
+// the fixed 64-byte prefix's midstate can be precomputed once per tag. Some
+// BIP340-family tagged hashes need a tag that is only known at RUNTIME —
+// e.g. BOLT#12's nonce leaf, whose tag is the literal `"LnNonce"`
+// concatenated with the current TLV stream's first record (a value, not a
+// fixed string). These callers cannot use the comptime path at all, so they
+// re-implemented the tagged-hash construction by hand; the two functions
+// below give them a shared, correct implementation instead. There is no
+// midstate caching here (the tag varies per call, so there is nothing to
+// cache) — the comptime versions above remain the fast path whenever the
+// tag actually is fixed.
+
+/// Runtime-tag form of `taggedHash`: `SHA256(SHA256(tag) || SHA256(tag) ||
+/// msg)`, where `tag` itself may be assembled from multiple runtime parts
+/// (`tag_parts`, concatenated in order before the tag hash) — this covers
+/// tags like BOLT#12's `"LnNonce" || first_tlv` without requiring the
+/// caller to allocate a concatenated buffer first.
+pub fn taggedHashRuntime(tag_parts: []const []const u8, msg: []const u8) [32]u8 {
+    var d = taggedHasherRuntime(tag_parts);
+    d.update(msg);
+    return d.finalResult();
+}
+
+/// Streaming variant of `taggedHashRuntime`: returns a hasher already
+/// seeded with the runtime tag's fixed 64-byte prefix (`SHA256(tag) ||
+/// SHA256(tag)`, `tag` built from `tag_parts`); call `update` for each
+/// message part, then `finalResult()`.
+pub fn taggedHasherRuntime(tag_parts: []const []const u8) Sha256 {
+    var tag_hasher = Sha256.init(.{});
+    for (tag_parts) |part| tag_hasher.update(part);
+    const tag_digest = tag_hasher.finalResult();
+
+    var d = Sha256.init(.{});
+    d.update(&tag_digest);
+    d.update(&tag_digest);
+    return d;
+}
+
 /// The SHA-256 state after absorbing exactly one block, `SHA256(tag) ||
 /// SHA256(tag)` (64 bytes = one block), starting from a fresh instance.
 /// Computed once at comptime per distinct `tag`.
@@ -107,4 +147,35 @@ test "empty message" {
     // Exercised directly by BIP340 test-vector index 15 ("message of size
     // 0"), which needs the challenge tagged hash to work over msg.len == 0.
     _ = taggedHash(challenge_tag, "");
+}
+
+test "taggedHashRuntime agrees with taggedHash when the tag is a single, comptime-known part" {
+    const msg = "same message";
+    const comptime_result = taggedHash(nonce_tag, msg);
+    const runtime_result = taggedHashRuntime(&.{nonce_tag}, msg);
+    try std.testing.expectEqualSlices(u8, &comptime_result, &runtime_result);
+}
+
+test "taggedHashRuntime: a multi-part tag equals taggedHash over the concatenated tag" {
+    // BOLT#12's nonce leaf builds its tag from two runtime parts
+    // ("LnNonce" || first_tlv); this must equal hashing the same bytes
+    // concatenated as a single tag string.
+    const tag_a = "LnNonce";
+    const tag_b = "\x01\x02\x03";
+    const msg = "\x04\x05";
+    const multi_part = taggedHashRuntime(&.{ tag_a, tag_b }, msg);
+    const concatenated = taggedHashRuntime(&.{tag_a ++ tag_b}, msg);
+    try std.testing.expectEqualSlices(u8, &concatenated, &multi_part);
+}
+
+test "taggedHasherRuntime streaming over parts equals taggedHashRuntime over the concatenation" {
+    const tag_parts = &.{"RuntimeTag"};
+    const part_a = "abc";
+    const part_b = "defgh";
+    var d = taggedHasherRuntime(tag_parts);
+    d.update(part_a);
+    d.update(part_b);
+    const streamed = d.finalResult();
+    const one_shot = taggedHashRuntime(tag_parts, part_a ++ part_b);
+    try std.testing.expectEqualSlices(u8, &one_shot, &streamed);
 }

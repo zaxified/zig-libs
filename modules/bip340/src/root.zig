@@ -34,6 +34,11 @@ const Scalar = scalar.Scalar;
 
 pub const hash = @import("hash.zig");
 pub const taggedHash = hash.taggedHash;
+/// Runtime-tag variant of `taggedHash` for tags only known at runtime
+/// (e.g. BOLT#12's per-stream `"LnNonce" || first_tlv` nonce-leaf tag) —
+/// see `hash.zig`'s doc comment for why the comptime midstate trick doesn't
+/// apply here.
+pub const taggedHashRuntime = hash.taggedHashRuntime;
 
 pub const meta = .{
     .platform = .any,
@@ -82,6 +87,23 @@ pub const XOnlyPublicKey = struct {
         return Secp256k1.fromAffineCoordinates(.{ .x = x, .y = y }) catch return error.InvalidPublicKey;
     }
 };
+
+/// Extract the 32-byte x-only view of a point field that may be encoded
+/// either as a 33-byte SEC1-compressed key (`prefix (1) || x (32)`) or as
+/// an already x-only 32-byte key — the point encoding several Lightning
+/// specs use interchangeably (e.g. BOLT#12's `invreq_payer_id (33)` /
+/// `invoice_node_id (33)`, both verified x-only per BIP340's forced-even-y
+/// convention, so the parity prefix byte is simply dropped rather than
+/// consulted). Purely structural: it does not validate that the extracted
+/// 32 bytes are a valid curve x-coordinate — feed the result to
+/// `XOnlyPublicKey.fromBytes` for that.
+pub fn xonlyBytesOf(point: []const u8) error{BadPointLength}![32]u8 {
+    return switch (point.len) {
+        33 => point[1..33].*,
+        32 => point[0..32].*,
+        else => error.BadPointLength,
+    };
+}
 
 // ── secret key / public key / key pair ──────────────────────────────────────
 
@@ -451,6 +473,23 @@ test "meta.model_after names BIP340 and std's Secp256k1" {
 test "XOnlyPublicKey encoded_length and Signature encoded_length" {
     try std.testing.expectEqual(@as(usize, 32), XOnlyPublicKey.encoded_length);
     try std.testing.expectEqual(@as(usize, 64), Signature.encoded_length);
+}
+
+test "xonlyBytesOf: 33-byte compressed drops the prefix, 32-byte passes through, other lengths reject" {
+    var compressed: [33]u8 = undefined;
+    compressed[0] = 0x02;
+    for (compressed[1..33], 0..) |*b, i| b.* = @intCast(i);
+    const from33 = try xonlyBytesOf(&compressed);
+    try std.testing.expectEqualSlices(u8, compressed[1..33], &from33);
+
+    const from32 = try xonlyBytesOf(compressed[1..33]);
+    try std.testing.expectEqualSlices(u8, compressed[1..33], &from32);
+
+    try std.testing.expectError(error.BadPointLength, xonlyBytesOf(compressed[0..30]));
+    var too_long: [34]u8 = undefined;
+    too_long[0..33].* = compressed;
+    too_long[33] = 0x00;
+    try std.testing.expectError(error.BadPointLength, xonlyBytesOf(&too_long));
 }
 
 test "KeyPair.deinit zeroizes the effective signing scalar but leaves public untouched (regression: fails if secureZero is removed)" {

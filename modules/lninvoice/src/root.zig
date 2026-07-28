@@ -10,12 +10,14 @@
 //! already named as future work ("BOLT#11 invoices / BOLT#12 offers
 //! (bech32-based — a future `lninvoice` module)"): it reuses `bech32`'s
 //! charset + BCH-checksum algorithm (reimplemented length-uncapped, since
-//! BOLT#11 waives BIP173's 90-character ceiling), `k256`'s field/group/
-//! scalar arithmetic (adding the recoverable-ECDSA sign/recover BOLT#11
-//! needs, which `k256` doesn't ship), `lnwire`'s generic TLV stream (for
-//! BOLT#12's `offer`/`invoice_request`/`invoice` payloads), and `bip340`'s
-//! Schnorr sign/verify + tagged hashing (for BOLT#12's Merkle-tree
-//! signature).
+//! BOLT#11 waives BIP173's 90-character ceiling), `k256.ecdsa_recover`'s
+//! RFC 6979 deterministic sign + standard public-key recovery for BOLT#11's
+//! recoverable signature (originally implemented here, moved to `k256`
+//! once it turned out to be general secp256k1 machinery rather than
+//! anything BOLT#11-specific — `ecdsa_recover.zig` is now a thin
+//! re-export), `lnwire`'s generic TLV stream (for BOLT#12's
+//! `offer`/`invoice_request`/`invoice` payloads), and `bip340`'s Schnorr
+//! sign/verify + tagged hashing (for BOLT#12's Merkle-tree signature).
 
 const std = @import("std");
 

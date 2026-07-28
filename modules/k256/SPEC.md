@@ -162,6 +162,12 @@ bounded. The GLV decomposition and the endomorphism constants ARE k256's own.
 - **ECDSA differential** (`oracle_test.zig`): `sign.ecdsaVerify` accepts every
   signature from `std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256` and rejects tampered
   ones.
+- **Recoverable ECDSA** (`ecdsa_recover.zig`'s own tests): RFC 6979 deterministic
+  `sign` + `recoverPubkey` round-trip to the signer's own pubkey over random
+  keys/messages, cross-checked against `sign.ecdsaVerify`; a bit-flipped signature
+  recovers a DIFFERENT (or non-recoverable) key; the low-S boundary. Moved in from
+  `lninvoice` (the original, and for a while only, consumer) — general secp256k1
+  machinery, not anything BOLT#11-specific.
 - **Broken positive control** (`kat_test.zig`): a Solinas fold with `c = 2^32 +
   976` (off by one) disagrees with std on >400/500 random inputs — proving the
   reduction constant is load-bearing and the equality checks have teeth.

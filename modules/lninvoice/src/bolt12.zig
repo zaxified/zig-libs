@@ -50,7 +50,6 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const Sha256 = std.crypto.hash.sha2.Sha256;
 const lnwire = @import("lnwire");
 const bip340 = @import("bip340");
 const bech32raw = @import("bech32_raw.zig");
@@ -248,19 +247,13 @@ fn branchHash(a: [32]u8, b: [32]u8) [32]u8 {
 /// `H("LnNonce"||first_tlv, tlv_type)` — the *tag* is the literal string
 /// `"LnNonce"` concatenated with the whole first TLV record of the stream
 /// (so it varies per stream and cannot use the comptime-midstate helper),
-/// and the message is the current record's type-field bytes. Implements the
-/// tagged-hash definition `SHA256(SHA256(tag) || SHA256(tag) || msg)`
-/// directly.
+/// and the message is the current record's type-field bytes.
+/// `bip340.hash.taggedHashRuntime` implements the shared runtime-tag form
+/// of the tagged-hash definition `SHA256(SHA256(tag) || SHA256(tag) ||
+/// msg)`, taking the tag as parts so the `"LnNonce" || first_tlv`
+/// concatenation needs no intermediate buffer.
 fn nonceLeaf(first_tlv: []const u8, type_bytes: []const u8) [32]u8 {
-    var td = Sha256.init(.{});
-    td.update("LnNonce");
-    td.update(first_tlv);
-    const tag_digest = td.finalResult();
-    var h = Sha256.init(.{});
-    h.update(&tag_digest);
-    h.update(&tag_digest);
-    h.update(type_bytes);
-    return h.finalResult();
+    return bip340.hash.taggedHashRuntime(&.{ "LnNonce", first_tlv }, type_bytes);
 }
 
 /// Recursively combine an ascending list of (already leaf+nonce-paired) node
@@ -366,17 +359,6 @@ pub fn verifyMerkle(
     return bip340.verify(pk, &digest, sig);
 }
 
-/// The x-only (32-byte) view of a BOLT#12 point field: a 33-byte compressed
-/// key drops its parity prefix (BIP-340 forces even-y via `lift_x`), a
-/// 32-byte value is already x-only. Any other length is rejected.
-fn xonlyOf(point: []const u8) error{BadPointLength}![32]u8 {
-    return switch (point.len) {
-        33 => point[1..33].*,
-        32 => point[0..32].*,
-        else => error.BadPointLength,
-    };
-}
-
 // ── invoice_request (`lnr1...`) TLV field types ──────────────────────────
 
 const IREQ_METADATA: u64 = 0;
@@ -427,7 +409,7 @@ pub const InvoiceRequest = struct {
     pub fn verify(self: InvoiceRequest, allocator: Allocator) (VerifyError || error{ MissingSignature, MissingPayerId })!bool {
         const sig = self.signature orelse return error.MissingSignature;
         const payer = self.invreq_payer_id orelse return error.MissingPayerId;
-        const xonly = xonlyOf(&payer) catch unreachable; // fixed 33 bytes
+        const xonly = bip340.xonlyBytesOf(&payer) catch unreachable; // fixed 33 bytes
         return verifyMerkle(allocator, self.raw, invoice_request_sig_tag, xonly, sig);
     }
 };
@@ -580,7 +562,7 @@ pub const Invoice = struct {
     pub fn verify(self: Invoice, allocator: Allocator) (VerifyError || error{ MissingSignature, MissingNodeId })!bool {
         const sig = self.signature orelse return error.MissingSignature;
         const node = self.invoice_node_id orelse return error.MissingNodeId;
-        const xonly = xonlyOf(&node) catch unreachable; // fixed 33 bytes
+        const xonly = bip340.xonlyBytesOf(&node) catch unreachable; // fixed 33 bytes
         return verifyMerkle(allocator, self.raw, invoice_sig_tag, xonly, sig);
     }
 };
