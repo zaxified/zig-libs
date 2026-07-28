@@ -192,6 +192,7 @@ const module_list = [_]Module{
     .{ .name = "bitcointx", .deps = &.{"bip340"} },
     .{ .name = "psbt", .deps = &.{ "bitcointx", "bitcoinscript" } },
     .{ .name = "bitcoinscript", .deps = &.{ "bitcointx", "k256", "bip340", "ripemd160" } },
+    .{ .name = "btcp2p", .deps = &.{"bitcointx"} },
     .{ .name = "lnwire" },
     .{ .name = "lninvoice", .deps = &.{ "bech32", "k256", "lnwire", "bip340" } },
     .{ .name = "musig2", .deps = &.{ "bip340", "k256" } },
