@@ -7,17 +7,24 @@ returns a trusted `AuthnResult`, or a typed error.
 
 ## Profile supported
 
-- **SAML 2.0 Web Browser SSO, relying-party (SP) side** only.
+- **SAML 2.0 Web Browser SSO, relying-party (SP) side** only. **Single Logout
+  (SLO)** and the **Artifact binding** (message layer) are also implemented —
+  see their own sections below. The IdP side is out of scope throughout.
 - **HTTP-POST binding** for the Response (base64 of the XML) is the priority.
-  A **HTTP-Redirect** decode helper (`decodeRedirectField`: base64 → raw
-  DEFLATE, capped at 1 MiB) is provided for completeness (Redirect is used mostly
-  for *requests*); URL-decoding is the caller's job.
+  A **HTTP-Redirect** codec (`decodeRedirectField` / `encodeRedirectField`:
+  base64 ↔ raw DEFLATE, capped at 1 MiB on decode) is provided; URL-encoding
+  is the caller's job. SLO messages fully support Redirect, including the
+  query-string signing scheme (`buildSignedRedirectQuery` /
+  `verifyRedirectSignature`) — see "Single Logout" below.
 - Signed **Assertion** and/or signed **Response** are both accepted
   (`Config.signature_policy` = `.assertion` | `.response` | `.either`, default
   `.either`).
-- Signature algorithms and canonicalization are whatever `xmldsig` allows:
-  RSA-SHA256/384/512 and ECDSA-P256-SHA256 (SHA-1 only behind
-  `allow_weak_sha1`), Exclusive/Canonical C14N, enveloped-signature transform.
+- Signature algorithms and canonicalization, for VERIFYING an IdP's
+  signatures, are whatever `xmldsig` allows: RSA-SHA256/384/512 and
+  ECDSA-P256-SHA256 (SHA-1 only behind `allow_weak_sha1`), Exclusive/Canonical
+  C14N, enveloped-signature transform. For the SP's OWN outgoing signatures
+  (SLO, Artifact) it is RSA-SHA256/exclusive-C14N only — see "SP-side signing"
+  below.
 
 ## Trust model
 
@@ -286,6 +293,158 @@ also surfaced verbatim in `AuthnResult.authn_context_class_ref`.
   `<md:KeyDescriptor use="signing">` certificate **DER** (raw bytes only, for the
   caller to parse/pin).
 
+## SP-side signing (`SigningKey`) — the one departure from "verify-only"
+
+Every capability above this point (and everything before this section was
+added) is pure verification — this module checks an IdP's signature, never
+produces one, mirroring `xmldsig`'s own stated scope. Single Logout and the
+Artifact binding both require the SP to sign its own OUTGOING message (a
+`LogoutRequest`/`LogoutResponse` it sends, or the `ArtifactResolve`
+back-channel call), so a small signing primitive was added for exactly that:
+
+- **RSA-SHA256 / exclusive C14N only.** This is already the primary algorithm
+  everywhere else in this module. ECDSA-P256 signing is deliberately **not**
+  implemented for the SP's own signatures: XML-DSig ECDSA needs a fresh
+  per-signature nonce, and this module's standing rule is "no RNG, no clock"
+  (the caller supplies IDs and timestamps — see `AuthnRequestOptions`, unchanged).
+  A safe nonce-supplying API is separate work from the two gaps this closes.
+  **Verifying** the IdP's own signatures is entirely unaffected and still
+  accepts RSA-SHA256/384/512 and ECDSA-P256 via `xmldsig.verify`.
+- `signProtocolMessage` (private) is the shared two-pass signer
+  (`buildLogoutRequest`, `buildLogoutResponse`, `buildArtifactResolveSoap` all
+  call it): assemble with a placeholder digest → canonicalize the whole
+  element minus the (still-placeholder) `<ds:Signature>` (enveloped transform +
+  exclusive C14N) → hash → splice the digest in → canonicalize the now-real
+  `<ds:SignedInfo>` → RSA-sign → splice the `<ds:SignatureValue>` in. Same
+  recipe `test_sign.zig` already used to mint fixtures; this is the PRODUCTION
+  copy the SP runs on its own messages.
+- Failure modes: `error.SigningAssemblyFailed` (an internal invariant — the
+  self-generated, pre-escaped XML failed to parse — should never happen, typed
+  rather than a panic) and `error.SigningFailed` (the configured RSA key was
+  rejected by `rsa.signPkcs1v15`: too small for SHA-256 PKCS1v15 padding, or a
+  computation-integrity fault).
+
+## Single Logout (SAML Core §3.7 / Bindings) — SLO
+
+`LogoutRequest`/`LogoutResponse`: build (+ optionally RSA-SHA256-sign) an
+outgoing message, or parse + verify an incoming one, over both the POST and
+Redirect bindings.
+
+- **Mandatory signature, no downgrade.** An incoming `LogoutRequest` is ALWAYS
+  signature-verified before its `NameID`/`SessionIndex` are trusted — same
+  "no optional signature" posture as the Response/Assertion path. This matters
+  specifically because an unauthenticated `LogoutRequest` is a
+  denial-of-service against the named session: anyone who could forge one
+  could log out any user at will. `LogoutResponse` is held to the same
+  standard for consistency (a forged failure/success status is otherwise
+  trivially spoofable), even though SAML Core does not strictly mandate it.
+- **`NameID` may be `<saml:EncryptedID>`.** Symmetrically with the existing
+  Response/Subject path, `decryptWrappedElement` (generalized — see "DRY"
+  below) decrypts it via `Config.sp_decrypt_key`; null ⇒
+  `error.EncryptedIdUnsupported`. Because `LogoutRequest` has no enclosing
+  signed Assertion the way a Subject's `EncryptedID` does, the decryption here
+  runs on the ALREADY signature-verified `LogoutRequest` itself (verify → then
+  decrypt, same safe ordering).
+- **The two bindings are mutually exclusive by construction (SAML Bindings
+  §3.4 vs §3.5).** POST embeds a `<ds:Signature>` in the XML; Redirect signs
+  the QUERY STRING instead and the message XML carries none. `SignatureSource`
+  (`.embedded` | `.redirect_verified`) makes the caller state which trust
+  mechanism already ran — `.embedded` looks for and verifies a `<ds:Signature>`
+  itself; `.redirect_verified` is the caller's ATTESTATION that
+  `verifyRedirectSignature` already returned `true` out-of-band. There is no
+  way to enforce that attestation from inside a pure codec with no side
+  channel to the HTTP layer — the naming and doc comments are the safeguard,
+  same as e.g. `Config.allow_idp_initiated`'s trust-the-caller precedent
+  elsewhere in this module.
+- **Redirect query-string signing (`buildSignedRedirectQuery` /
+  `verifyRedirectSignature`, SAML Bindings §3.4.4.1)** — did not exist in this
+  module before. The SigningInput is the exact percent-encoded
+  `SAMLRequest=`/`SAMLResponse=` value, then (if present) `&RelayState=`
+  value, then `&SigAlg=` value, in that fixed order, nothing else.
+  `appendPercentEncoded` is RFC 3986 percent-encoding (unreserved
+  `A-Za-z0-9-_.~` pass through, everything else `%XX` uppercase) — applied
+  identically when signing and when reconstructing the SigningInput to verify,
+  so it is deterministic regardless of how a peer implementation happened to
+  percent-encode the same bytes. RSA-SHA256 only, matching `SigningKey`; a
+  `sig_alg` naming anything else is `error.UnsupportedAlgorithm` (an IdP
+  configured for ECDSA-P256 here is out of scope — the POST binding, an
+  embedded XML signature via `xmldsig.verify`, is unaffected and already
+  accepts it).
+- **Replay — caller responsibility (this module does no I/O and keeps no
+  state).** A captured, genuinely-signed `LogoutRequest` replayed later must
+  not terminate a session established AFTER it was issued. Two properties
+  combine to bound this:
+  1. **`SessionIndex` scoping.** The IdP mints a FRESH `SessionIndex` on every
+     new authentication, so a `LogoutRequest` naming index X can only ever
+     affect the (single) local session recorded under X — a session
+     re-established after logout gets a NEW index, so a replayed request for
+     the old one is inert against it. **The caller MUST key its session store
+     by `SessionIndex`** (or `NameID`+`SessionIndex`), never "the current
+     session for this NameID" without checking the index.
+  2. **`ID`/`IssueInstant` deduplication.** Nothing stops an attacker replaying
+     the EXACT SAME captured request against the SAME still-live session
+     before it naturally expires. **The caller MUST maintain a seen-`ID`
+     cache** (keyed by `LogoutRequestResult.id`) for at least the message's
+     validity window (`not_on_or_after` if present, else a caller-chosen bound
+     from `issue_instant` + clock skew) and reject a repeat. This module
+     surfaces `id`/`issue_instant`/`not_on_or_after` precisely so the caller
+     can implement this — it cannot do so itself.
+- **`LogoutResponse` status is checked, never assumed.** The top-level
+  `<samlp:StatusCode>` must be the Success URI or `error.StatusNotSuccess`; a
+  NESTED second-level `<samlp:StatusCode>` (e.g.
+  `urn:oasis:names:tc:SAML:2.0:status:PartialLogout`, used by some responders
+  to flag that not every session participant was reached, on an otherwise
+  Success top-level status) is surfaced as
+  `LogoutResponseResult.second_level_status_code` — **the caller MUST inspect
+  it** to detect a partial logout.
+- **XSW.** `LogoutRequest`/`LogoutResponse` have only one element that could
+  ever be the signing target (the message root itself — no nested Assertion
+  the way Response has), but the pointer-pin (`signedTargetMatches`, reused
+  verbatim) still matters: a moved signature whose `#id` Reference resolves to
+  a buried decoy copy of the genuinely-signed original, rather than to the
+  (attacker-forged) outer root, is `error.SignatureWrappingDetected` — proven
+  in `test_slo.zig`, not merely assumed because the defense exists for
+  Response/Assertion.
+
+## Artifact binding (SAML Bindings §3.6) — message layer only
+
+`Artifact`/`encodeArtifact`/`decodeArtifact` (the `SAMLart` wire format: 2-byte
+TypeCode `0x0004` + 2-byte EndpointIndex + 20-byte SourceID + 20-byte
+MessageHandle, all big-endian/raw, base64'd for transport) and the
+`ArtifactResolve`/`ArtifactResponse` SOAP payloads.
+
+- **The library/application boundary, stated plainly.** The back-channel
+  resolution step is an HTTP round trip to the IdP's
+  ArtifactResolutionService (typically over mutual TLS) — this is a LIBRARY,
+  not an HTTP client, so PERFORMING that call is explicitly NOT this module's
+  job. `buildArtifactResolveSoap` constructs the request bytes; the caller
+  sends them over their own HTTP/SOAP client and gets a response body;
+  `consumeArtifactResponseSoap` verifies that response body and extracts the
+  enclosed message. This mirrors how the rest of this module already separates
+  codec from I/O (`parseIdpMetadata` hands back endpoints/DER for the caller
+  to dereference/pin, never fetches anything itself).
+- **`SourceID`** is conventionally (not mandatorily, per the format) SHA-1 of
+  the issuing entityID — `sourceIdFromEntityId`. **`MessageHandle`** gets NO
+  RNG from this module (the standing "no RNG, no clock" rule): the caller
+  generates it securely and owns its uniqueness.
+- **`ArtifactResponse`'s own signature is mandatory**, pointer-pinned exactly
+  like every other message this module verifies — no optional-signature
+  downgrade. Verifying it authenticates every byte inside via the enveloped
+  transform, including the enclosed message.
+- **Extracting the enclosed message.** `consumeArtifactResponseSoap` returns
+  it re-serialized via `xmldsig.c14n.canonicalize` (Exclusive C14N) into a
+  self-contained standalone document, safe to re-parse and hand to
+  `consumeResponseXml`/`consumeLogoutResponseXml`/etc., which perform their OWN
+  full independent verification. This is sound specifically because Exclusive
+  C14N is, by design, independent of ancestor context — an embedded signature
+  inside the enclosed message (over its own content) canonicalizes identically
+  whether it is still nested inside the `ArtifactResponse` or has been lifted
+  out into its own document, exactly the property the existing
+  `EncryptedAssertion`-inside-a-signed-`Response` path already relies on with
+  the reverse operation (decrypt-and-re-parse rather than serialize-and-lift).
+- **The IdP side (building `ArtifactResponse`, consuming `ArtifactResolve`) is
+  out of scope**, unchanged from every other message type in this module.
+
 ## Deferred / out of scope
 
 - **Holder-of-Key cross-form match (cert ↔ `<ds:KeyValue>`)** — **DONE**, over
@@ -293,7 +452,14 @@ also surfaced verbatim in `AuthnResult.authn_context_class_ref`.
   waiting on). Only RSA and EC P-256 keys are comparable, matching what
   `PresentedKey` can express; anything else is
   `error.HolderOfKeyCrossFormUnsupported`. See "Holder-of-Key".
-- **Single Logout (SLO)**, artifact binding, and the IdP side — not implemented.
+- **Single Logout (SLO)** — **DONE**, see above.
+- **Artifact binding** — **DONE** (message layer; the back-channel HTTP round
+  trip is explicitly the caller's job), see above.
+- **The IdP side** — still not implemented, and not planned: this module is
+  the SP (relying-party) side only, as stated in its header.
+- **ECDSA-P256 for the SP's OWN outgoing signatures** (`SigningKey` is
+  RSA-SHA256 only) — see "SP-side signing" above. Verifying the IdP's
+  signatures is unaffected.
 
 ## Fixture provenance (be honest about interop)
 
@@ -333,11 +499,88 @@ them, so a blob exercises the exact code path a real key would; the HoK
 and matches them against the same `rsa.PublicKey`, exercising the genuine
 integer-equality path. All RSA keys in these tests are test material only.
 
+### Single Logout / Redirect-signing / Artifact fixtures (be honest about interop)
+
+- **`test_slo.zig`** (LogoutRequest/LogoutResponse): every signed fixture is a
+  **CONSTRUCTED, SELF round-trip** — a locally-generated RSA key signs (via
+  the module's own `signProtocolMessage`) and the module's own
+  `consumeLogoutRequestXml`/`consumeLogoutResponseXml` verify. There is no
+  OASIS-published byte-exact `LogoutRequest`/`LogoutResponse` fixture to anchor
+  against, so this follows the SAME precedent `test_sign.zig` already set for
+  the EncryptedID/HoK suites: the underlying RSA-SHA256/exclusive-C14N
+  enveloped-signature PRIMITIVE is already externally anchored elsewhere in
+  this module (`test_fixture.zig`, openssl+lxml, byte-exact; the W3C C14N
+  vectors in `xmldsig`) — what these tests newly prove is the ORCHESTRATION on
+  top: schema assembly, NameID/SessionIndex/status extraction, and — the part
+  that most needed re-proving rather than assuming — that the
+  mandatory-signature and XSW pointer-pin defenses are actually wired in for
+  this NEW message type. That last property is proven by MUTATION, not merely
+  by a positive test: with `consumeLogoutRequestXml`'s signature check
+  temporarily reduced to `.embedded => {}` (an actual edit made and reverted
+  during development, not a hypothetical), the "unsigned rejected", "flipped
+  SignatureValue", and "XSW moved-signature" tests all genuinely FAILED —
+  including the XSW case, which the mutation caused to return the
+  attacker-forged `NameID` as if it were the victim's. That confirms the tests
+  fail for the reason they claim, not for some unrelated defect.
+- **`test_redirect_binding.zig`** (HTTP-Redirect query-string signing) carries
+  the one genuine EXTERNAL anchor this task added:
+  `verifyRedirectSignature: EXTERNAL anchor` signs a fixed 120-byte
+  SigningInput (chosen to exercise `+`, `/`, `=`, space, `&`, `:`, `#`
+  percent-encoding all at once) OFFLINE with `openssl dgst -sha256 -sign`
+  under a throwaway 2048-bit RSA key (private key discarded after signing;
+  only the public key and the resulting signature are embedded in the test),
+  independently confirmed with `openssl dgst -sha256 -verify` before being
+  pasted in. A green `verifyRedirectSignature` against that fixed signature is
+  real cross-implementation interop for the percent-encoding + SigningInput
+  construction + RSA-SHA256/PKCS1v15 verification path — nothing in this
+  module reproduces the anchor value at test time. A paired tamper test
+  (`EXTERNAL anchor tamper`) flips one byte of `RelayState` and confirms the
+  SAME openssl signature then fails, proving the anchor actually exercises
+  message content. Every other test in that file (`buildSignedRedirectQuery`
+  round-trips, the flipped-signature/wrong-key/tampered-message negative
+  tests, the end-to-end Redirect-binding `LogoutRequest` test) is explicitly a
+  CONSTRUCTED self round-trip — this module's own signer feeding its own
+  verifier — because there was, before this task, no prior anchor for this
+  mechanism to reuse; anchoring it externally once (above) and self-testing
+  the rest is the same posture `test_sign.zig` takes for minted assertion
+  fixtures.
+- **`test_artifact.zig`**: `Artifact` encode/decode is pure bit-twiddling
+  (byte-order/length checks), not a signature scheme, so no external anchor
+  applies. `buildArtifactResolveSoap`'s signed output is checked against
+  `xmldsig.verify` DIRECTLY (an independent code path from this module's own
+  wrapper) rather than round-tripped through `saml`'s own consumer — a
+  slightly stronger self-check than a pure round-trip, though still
+  CONSTRUCTED, not external interop. `consumeArtifactResponseSoap` needs a
+  stand-in "IdP-signed" `ArtifactResponse` to test against; since `saml` is
+  SP-only and never builds that message type (the IdP side is out of scope,
+  same as `<samlp:Response>`), `signArtifactResponse` in the test file mints
+  one with the same two-pass recipe `test_sign.zig` already uses for
+  `<samlp:Response>` fixtures, for the identical reason. The
+  missing-signature and flipped-SignatureValue tests are a matched pair
+  (`SignatureMissing` vs `SignatureInvalid`) proving the rejection reasons are
+  distinct, not merely "some check failed".
+
 ## DRY / hazard follow-ups
 
 - **xsd:dateTime parsing** is reproduced here (civil→epoch via Hinnant's
   algorithm) because `saml` depends only on `xmldsig`+`xml`. `datefmt.partsToUnix`
   does the same arithmetic; a shared `datetime`/`iso8601` helper would let `saml`,
   a future `xmldsig` conditions check, and `jwt` (`exp`/`nbf`) share one parser.
+  Its return type is now the minimal `error{InvalidDateTime}` rather than the
+  wider `ConsumeError`, specifically so the Single-Logout/Artifact code (their
+  own, narrower error sets) can `try` it directly — Zig widens a narrower
+  error set at the call site automatically, so this is a compatible narrowing,
+  not a behavior change for existing callers.
 - **`std.crypto.Certificate.parse`** is avoided on adversarial DER (metadata /
   KeyInfo certs handed back as raw bytes) — the caller pins.
+- **Signature-algorithm URI string constants** (`sig_alg_rsa_sha256`,
+  `dig_alg_sha256`, `alg_enveloped_sig`) are duplicated from `xmldsig`'s own
+  (private, unexported) equivalents, for the same reason the xsd:dateTime
+  parsing is duplicated: `saml` depends on `xmldsig` but these URI strings are
+  not part of its public API. If `xmldsig` ever exports them, `signProtocolMessage`
+  and the Redirect-signing code should switch to the shared constants.
+- **`decryptWrappedElement`** is now generic over the caller's error-set type
+  (`comptime E: type`) instead of hardcoding `ConsumeError`, and takes
+  `sp_decrypt_key`/`allow_weak_rsa15`/`decrypt_kek` directly instead of a whole
+  `Config` — this is what let the Single-Logout `EncryptedID` path reuse it
+  without duplicating the decrypt-then-reparse logic a third time.

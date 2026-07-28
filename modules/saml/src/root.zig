@@ -86,8 +86,31 @@
 //! `<AuthnContextClassRef>`. See SPEC.md for the HoK matching matrix and the
 //! sender-vouches trust model.
 //!
+//! ## Single Logout (SLO) — build/sign/parse/verify, both bindings
+//! `buildLogoutRequest` / `buildLogoutResponse` assemble and (optionally)
+//! RSA-SHA256-sign an outgoing protocol message; `consumeLogoutRequestXml` /
+//! `consumeLogoutResponseXml` parse and verify an incoming one. A
+//! `LogoutRequest` is ALWAYS signature-verified before its `NameID` /
+//! `SessionIndex` are trusted (an unauthenticated logout is a denial-of-service
+//! against the named session) — there is no optional-signature downgrade, same
+//! as every other message this module consumes. The Redirect binding signs the
+//! QUERY STRING instead of embedding a `<ds:Signature>` (`buildSignedRedirectQuery`
+//! / `verifyRedirectSignature`, RSA-SHA256 only); `SignatureSource` makes the
+//! caller state which trust path they went through. See SPEC.md for the
+//! replay/session-index discipline the CALLER is responsible for.
+//!
+//! ## Artifact binding — message layer only
+//! `Artifact`/`encodeArtifact`/`decodeArtifact` are the `SAMLart` wire format;
+//! `buildArtifactResolveSoap` builds the SP's SOAP request and
+//! `consumeArtifactResponseSoap` verifies the IdP's SOAP response and extracts
+//! the enclosed message. Actually PERFORMING the back-channel HTTP round trip
+//! to the IdP is the caller's job (this is a library, not an HTTP client).
+//!
 //! ## Out of scope (see SPEC.md)
-//!   - Single Logout, artifact binding, the IdP side.
+//!   - The IdP side (this module is SP-only, as everywhere else).
+//!   - ECDSA-P256 for the SP's OWN outgoing signatures (`SigningKey` is
+//!     RSA-SHA256 only); verifying the IdP's signatures is unaffected and
+//!     still accepts ECDSA-P256 via `xmldsig.verify`.
 //!
 //! Never reads the system clock. Never panics on malformed / adversarial input:
 //! every failure is a typed error.
@@ -130,6 +153,23 @@ const eidas_loa_high = "http://eidas.europa.eu/LoA/high";
 // The single P-256 (secp256r1 / prime256v1) NamedCurve identifier accepted for
 // an `<ECKeyValue>` match. Mirrors `xmldsig.VerifyKey`, which is P-256-only.
 const named_curve_p256 = "urn:oid:1.2.840.10045.3.1.7";
+
+// The SOAP 1.1 envelope namespace (Artifact binding back-channel).
+const soap_ns = "http://schemas.xmlsoap.org/soap/envelope/";
+
+// The one signing algorithm this module's OWN outgoing signatures use (see
+// `SigningKey`). These mirror `xmldsig`'s private algorithm-URI consts
+// (duplicated here for the same reason `xsd:dateTime` parsing is: `saml`
+// depends on `xmldsig` but the URI strings are not part of its public API —
+// see SPEC.md "DRY / hazard follow-ups").
+const sig_alg_rsa_sha256 = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
+const dig_alg_sha256 = "http://www.w3.org/2001/04/xmlenc#sha256";
+const alg_enveloped_sig = "http://www.w3.org/2000/09/xmldsig#enveloped-signature";
+// A placeholder swapped for the real base64 digest between the two signing
+// passes (see `signProtocolMessage`); distinct from any real base64 output.
+const digest_placeholder_slo = "__SLO_DIGEST_PLACEHOLDER__";
+
+const Sha256 = std.crypto.hash.sha2.Sha256;
 
 /// A decompression-bomb cap for the HTTP-Redirect (DEFLATE) binding.
 pub const max_redirect_inflated = 1 << 20;
@@ -586,11 +626,15 @@ fn verifyCovering(
 }
 
 fn sigOpts(config: Config) xmldsig.Options {
-    return .{
-        .key = config.idp_key,
-        .allow_weak_sha1 = config.allow_weak_sha1,
-        .id_attr = config.id_attr,
-    };
+    return sigOptsFor(config.idp_key, config.allow_weak_sha1, config.id_attr);
+}
+
+/// The `xmldsig.Options` triple every message type this module verifies needs
+/// (IdP key, weak-SHA1 gate, ID-attribute name). Factored out so the Response,
+/// LogoutRequest/LogoutResponse, and ArtifactResponse verifiers — each with
+/// their own, differently-shaped `Config` — build it identically.
+fn sigOptsFor(key: xmldsig.VerifyKey, allow_weak_sha1: bool, id_attr: []const u8) xmldsig.Options {
+    return .{ .key = key, .allow_weak_sha1 = allow_weak_sha1, .id_attr = id_attr };
 }
 
 /// The eIDAS encrypt profile. `enc` is the `<saml:EncryptedAssertion>` (a direct
@@ -727,23 +771,33 @@ const Decrypted = struct {
 /// Decrypt a `<saml:EncryptedID>` / `<saml:EncryptedAttribute>` wrapper (each
 /// carries a single `<xenc:EncryptedData>` exactly like `<EncryptedAssertion>`)
 /// and re-parse the recovered octets into their own standalone document (caller
-/// `deinit`s the returned `Decrypted`). `config.sp_decrypt_key` MUST be non-null
-/// (the caller checks and raises the wrapper-specific `…Unsupported` error
+/// `deinit`s the returned `Decrypted`). `sp_decrypt_key` MUST be non-null (the
+/// caller checks and raises the wrapper-specific `…Unsupported` error
 /// otherwise). Every crypto/structure failure collapses to `fail_err` — a single
 /// generic outcome, no oracle signal (`xmlenc`'s own posture). This runs ONLY on
-/// the already-signature-verified assertion, so the ciphertext is authenticated
-/// by enclosure before the private key ever touches it.
+/// the already-signature-verified assertion (or, for Single Logout, the
+/// already-signature-verified `LogoutRequest`), so the ciphertext is
+/// authenticated by enclosure before the private key ever touches it.
+///
+/// Generic over the caller's own error-set type `E` (`ConsumeError` for the
+/// Response/Assertion path, `LogoutRequestError` for Single Logout) so ONE
+/// implementation serves every `Config`-shaped caller without coupling this
+/// helper to any single `Config` type — it takes the three relevant fields
+/// directly instead.
 fn decryptWrappedElement(
+    comptime E: type,
     alloc: std.mem.Allocator,
     wrapper: *const xml.Element,
-    config: Config,
-    fail_err: ConsumeError,
-) ConsumeError!Decrypted {
-    const sk = config.sp_decrypt_key orelse return error.EncryptedIdUnsupported; // unreachable in practice
+    sp_decrypt_key: ?rsa.SecretKey,
+    allow_weak_rsa15: bool,
+    decrypt_kek: ?[]const u8,
+    fail_err: E,
+) E!Decrypted {
+    const sk = sp_decrypt_key orelse return fail_err; // unreachable in practice: caller checks first
     const ed = childEl(wrapper, xmlenc.xenc_ns, "EncryptedData") orelse return fail_err;
     const plaintext = xmlenc.decryptData(alloc, ed, sk, .{
-        .allow_weak_rsa15 = config.allow_weak_rsa15,
-        .kek = config.decrypt_kek,
+        .allow_weak_rsa15 = allow_weak_rsa15,
+        .kek = decrypt_kek,
     }) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return fail_err,
@@ -821,7 +875,7 @@ fn buildResult(alloc: std.mem.Allocator, asrt: *const xml.Element, config: Confi
         if (childEl(subject, saml_ns, "NameID")) |nid| break :nid nid;
         if (childEl(subject, saml_ns, "EncryptedID")) |enc_id| {
             if (config.sp_decrypt_key == null) return error.EncryptedIdUnsupported;
-            var dec = try decryptWrappedElement(alloc, enc_id, config, error.IdDecryptionFailed);
+            var dec = try decryptWrappedElement(ConsumeError, alloc, enc_id, config.sp_decrypt_key, config.allow_weak_rsa15, config.decrypt_kek, error.IdDecryptionFailed);
             if (!isEl(dec.doc.root, saml_ns, "NameID")) {
                 dec.deinit(alloc);
                 return error.IdDecryptionFailed;
@@ -1453,7 +1507,7 @@ fn extractAttributes(a: std.mem.Allocator, alloc: std.mem.Allocator, asrt: *cons
                 try appendAttribute(a, &out, attr_el);
             } else if (isEl(attr_el, saml_ns, "EncryptedAttribute")) {
                 if (config.sp_decrypt_key == null) return error.EncryptedAttributeUnsupported;
-                var dec = try decryptWrappedElement(alloc, attr_el, config, error.AttributeDecryptionFailed);
+                var dec = try decryptWrappedElement(ConsumeError, alloc, attr_el, config.sp_decrypt_key, config.allow_weak_rsa15, config.decrypt_kek, error.AttributeDecryptionFailed);
                 defer dec.deinit(alloc);
                 if (!isEl(dec.doc.root, saml_ns, "Attribute")) return error.AttributeDecryptionFailed;
                 try appendAttribute(a, &out, dec.doc.root);
@@ -1637,6 +1691,1128 @@ fn findX509(el: *const xml.Element) ?*xml.Element {
     return null;
 }
 
+// ── SP-side signing (Single Logout, Artifact resolution) ────────────────────
+//
+// Every capability above this point is PURE VERIFICATION: the SP checks an
+// IdP's signature, never produces one — mirroring `xmldsig`'s own stated scope
+// ("we are the relying party... never producing one"). Single Logout and the
+// Artifact binding both require the SP to sign its OWN outgoing message (a
+// `LogoutRequest` sent to the IdP, or the `ArtifactResolve` back-channel call),
+// so this module now also contains a small, deliberately narrow signing
+// primitive for that.
+//
+// RSA-SHA256 / exclusive C14N only — the primary algorithm this module (and
+// `xmldsig`) already defaults to everywhere else. ECDSA-P256 signing is
+// deliberately NOT implemented: XML-DSig ECDSA needs a fresh per-signature
+// nonce, and this module's standing design rule is "no RNG, no clock" (the
+// caller supplies IDs and timestamps — see `AuthnRequestOptions`); a safe
+// nonce-supplying signing API is a separate piece of work from the two eIDAS
+// gaps this closes. Verifying the IdP's OWN signatures is entirely unaffected
+// and still accepts RSA-SHA256/384/512 and ECDSA-P256 via `xmldsig.verify`,
+// exactly as before this file.
+pub const SigningKey = union(enum) {
+    /// The SP's own RSA private key, used to sign an outgoing protocol message.
+    rsa: rsa.SecretKey,
+};
+
+/// Every typed failure `signProtocolMessage` (and everything built on it) can
+/// raise, beyond allocation failure.
+pub const ProtocolMessageBuildError = error{
+    /// Internal invariant failure: the XML assembled from already-ESCAPED
+    /// caller strings (via `appendAttrEscaped`/`appendTextEscaped`) failed to
+    /// parse, or the `<ds:Signature>`/`<ds:SignedInfo>` just inserted could not
+    /// be found back. This should never happen — every builder in this module
+    /// escapes all caller-supplied text/attribute content before it reaches
+    /// here — but it is a typed error rather than `unreachable`/a panic, to
+    /// keep this module's zero-panic guarantee airtight even for its own
+    /// output.
+    SigningAssemblyFailed,
+    /// The configured `SigningKey` was rejected by the underlying
+    /// `rsa.signPkcs1v15` primitive: the modulus is too small to hold a
+    /// SHA-256 PKCS1v15 padding, or a computation-integrity fault was detected
+    /// during the RSA operation itself. Never returned for a caller-INPUT
+    /// reason — only a misconfigured or too-small signing key.
+    SigningFailed,
+} || std.mem.Allocator.Error;
+
+/// Assemble and RSA-SHA256/exclusive-C14N-sign one protocol message.
+/// `root_open` is the already-complete opening tag (carrying `ID="id"` and
+/// namespace declarations), `issuer_xml` the serialized `<saml:Issuer>` (or ""
+/// if the message carries none), `rest_xml` everything else, `root_close` the
+/// matching closing tag. The `<ds:Signature>` is spliced in immediately after
+/// `<saml:Issuer>` — the position `RequestAbstractType`/`StatusResponseType`
+/// require it in.
+///
+/// Two-pass, identical recipe to `test_sign.zig`'s minted-fixture signer (this
+/// copy is PRODUCTION code the SP runs on its own outgoing messages, not a
+/// test fixture): (1) assemble with a placeholder `<ds:DigestValue>`,
+/// canonicalize the whole element minus the (still-placeholder) `Signature`
+/// (enveloped transform + exclusive C14N), hash, splice the real digest in;
+/// (2) canonicalize the now-real `<ds:SignedInfo>` and RSA-sign it, splice the
+/// `<ds:SignatureValue>` in.
+fn signProtocolMessage(
+    alloc: std.mem.Allocator,
+    root_open: []const u8,
+    issuer_xml: []const u8,
+    rest_xml: []const u8,
+    root_close: []const u8,
+    id: []const u8,
+    key: SigningKey,
+) ProtocolMessageBuildError![]u8 {
+    const sk = switch (key) {
+        .rsa => |s| s,
+    };
+
+    const assembled = try std.fmt.allocPrint(alloc, "{s}{s}<ds:Signature xmlns:ds=\"{s}\"><ds:SignedInfo>" ++
+        "<ds:CanonicalizationMethod Algorithm=\"{s}\"/>" ++
+        "<ds:SignatureMethod Algorithm=\"{s}\"/>" ++
+        "<ds:Reference URI=\"#{s}\"><ds:Transforms>" ++
+        "<ds:Transform Algorithm=\"{s}\"/>" ++
+        "<ds:Transform Algorithm=\"{s}\"/>" ++
+        "</ds:Transforms><ds:DigestMethod Algorithm=\"{s}\"/>" ++
+        "<ds:DigestValue>{s}</ds:DigestValue></ds:Reference>" ++
+        "</ds:SignedInfo><ds:SignatureValue></ds:SignatureValue></ds:Signature>{s}{s}", .{
+        root_open, issuer_xml, xmldsig.ds_ns,
+        xmldsig.exc_c14n_ns, // CanonicalizationMethod
+        sig_alg_rsa_sha256, // SignatureMethod
+        id, // Reference URI
+        alg_enveloped_sig, // Transform 1 (enveloped)
+        xmldsig.exc_c14n_ns, // Transform 2 (exclusive C14N)
+        dig_alg_sha256, // DigestMethod
+        digest_placeholder_slo, // DigestValue placeholder
+        rest_xml,
+        root_close,
+    });
+    defer alloc.free(assembled);
+
+    // Pass 1: reference digest over the element with the Signature omitted.
+    var doc1 = xml.parse(alloc, assembled, .{ .id_attr_names = &.{"ID"} }) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.SigningAssemblyFailed,
+    };
+    defer doc1.deinit();
+    const sig1 = childEl(doc1.root, xmldsig.ds_ns, "Signature") orelse return error.SigningAssemblyFailed;
+    const ref_canon = try xmldsig.c14n.canonicalize(alloc, doc1.root, .{ .mode = .exclusive, .omit = sig1 });
+    defer alloc.free(ref_canon);
+    var dgst: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(ref_canon, &dgst, .{});
+    const digest_b64 = try base64EncodeAlloc(alloc, &dgst);
+    defer alloc.free(digest_b64);
+
+    const with_digest = try std.mem.replaceOwned(u8, alloc, assembled, digest_placeholder_slo, digest_b64);
+    defer alloc.free(with_digest);
+
+    // Pass 2: canonicalize SignedInfo in its real tree context and RSA-sign it.
+    var doc2 = xml.parse(alloc, with_digest, .{ .id_attr_names = &.{"ID"} }) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.SigningAssemblyFailed,
+    };
+    defer doc2.deinit();
+    const sig2 = childEl(doc2.root, xmldsig.ds_ns, "Signature") orelse return error.SigningAssemblyFailed;
+    const si2 = childEl(sig2, xmldsig.ds_ns, "SignedInfo") orelse return error.SigningAssemblyFailed;
+    const si_canon = try xmldsig.c14n.canonicalize(alloc, si2, .{ .mode = .exclusive });
+    defer alloc.free(si_canon);
+
+    var sig_buf: [rsa.max_modulus_len]u8 = undefined;
+    const sig = rsa.signPkcs1v15(sk, Sha256, si_canon, &sig_buf) catch |e| switch (e) {
+        error.EncodedMessageTooShort, error.BufferTooSmall, error.FaultDetected => return error.SigningFailed,
+    };
+    const sig_b64 = try base64EncodeAlloc(alloc, sig);
+    defer alloc.free(sig_b64);
+
+    const empty_sv = "<ds:SignatureValue></ds:SignatureValue>";
+    const filled_sv = try std.fmt.allocPrint(alloc, "<ds:SignatureValue>{s}</ds:SignatureValue>", .{sig_b64});
+    defer alloc.free(filled_sv);
+    return std.mem.replaceOwned(u8, alloc, with_digest, empty_sv, filled_sv);
+}
+
+// ── HTTP-Redirect binding: encode + sign the query string ───────────────────
+//
+// The Redirect binding (SAML Bindings §3.4) never embeds a `<ds:Signature>` in
+// the message XML — instead the `SigAlg`/`Signature` query parameters sign the
+// QUERY STRING itself (§3.4.4.1), and the two mechanisms are mutually
+// exclusive by design (an embedded signature is for the POST binding).
+// `decodeRedirectField` (above) already handles the base64+raw-DEFLATE half
+// for INCOMING messages; the functions below are its outbound counterpart
+// (`encodeRedirectField`) and the signing/verification of the query string
+// itself (`buildSignedRedirectQuery` / `verifyRedirectSignature`), used by
+/// LogoutRequest/LogoutResponse over Redirect. RSA-SHA256 only — see `SigningKey`.
+pub const RedirectMessageKind = enum { request, response };
+
+/// Deflate (raw RFC 1951, no zlib/gzip header — the SAML DEFLATE encoding)
+/// then base64-encode `xml_bytes`: the encoding half of `decodeRedirectField`'s
+/// decode. Returns the `SAMLRequest`/`SAMLResponse` FIELD VALUE; URL-encoding
+/// it into an actual query string is the caller's job (mirroring
+/// `decodeRedirectField`'s "caller does URL-decoding" split), unless you use
+/// `buildSignedRedirectQuery`, which does both together.
+pub fn encodeRedirectField(alloc: std.mem.Allocator, xml_bytes: []const u8) std.mem.Allocator.Error![]u8 {
+    var aw = try std.Io.Writer.Allocating.initCapacity(alloc, 256);
+    errdefer aw.deinit();
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    var comp = std.compress.flate.Compress.init(&aw.writer, &window, .raw, .default) catch return error.OutOfMemory;
+    comp.writer.writeAll(xml_bytes) catch return error.OutOfMemory;
+    comp.finish() catch return error.OutOfMemory;
+    const deflated = try aw.toOwnedSlice();
+    defer alloc.free(deflated);
+    return base64EncodeAlloc(alloc, deflated);
+}
+
+/// RFC 3986 percent-encoding: unreserved characters (`A-Za-z0-9-_.~`) pass
+/// through; everything else becomes `%XX` (uppercase hex). Deterministic, so
+/// re-percent-encoding an already-URL-DECODED value on the verify side
+/// reconstructs the exact same bytes the signer produced, regardless of how
+/// the original sender happened to encode it.
+fn appendPercentEncoded(alloc: std.mem.Allocator, w: *std.ArrayList(u8), s: []const u8) std.mem.Allocator.Error!void {
+    const hex = "0123456789ABCDEF";
+    for (s) |c| {
+        const unreserved = (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or
+            (c >= '0' and c <= '9') or c == '-' or c == '_' or c == '.' or c == '~';
+        if (unreserved) {
+            try w.append(alloc, c);
+        } else {
+            try w.append(alloc, '%');
+            try w.append(alloc, hex[c >> 4]);
+            try w.append(alloc, hex[c & 0x0F]);
+        }
+    }
+}
+
+/// The exact SigningInput SAML Bindings §3.4.4.1 defines: percent-encoded
+/// `SAMLRequest=`/`SAMLResponse=` value, then (if present) `&RelayState=`
+/// value, then `&SigAlg=` value — this fixed order, nothing else.
+fn appendRedirectSigningInput(
+    alloc: std.mem.Allocator,
+    w: *std.ArrayList(u8),
+    kind: RedirectMessageKind,
+    message_field: []const u8,
+    relay_state: ?[]const u8,
+    sig_alg: []const u8,
+) std.mem.Allocator.Error!void {
+    try w.appendSlice(alloc, if (kind == .request) "SAMLRequest=" else "SAMLResponse=");
+    try appendPercentEncoded(alloc, w, message_field);
+    if (relay_state) |rs| {
+        try w.appendSlice(alloc, "&RelayState=");
+        try appendPercentEncoded(alloc, w, rs);
+    }
+    try w.appendSlice(alloc, "&SigAlg=");
+    try appendPercentEncoded(alloc, w, sig_alg);
+}
+
+pub const RedirectSignError = error{SigningFailed} || std.mem.Allocator.Error;
+
+pub const BuildSignedRedirectQueryOptions = struct {
+    kind: RedirectMessageKind,
+    /// Already `encodeRedirectField`-encoded (base64 of raw-DEFLATE) message.
+    message_field: []const u8,
+    relay_state: ?[]const u8 = null,
+    key: SigningKey,
+};
+
+/// Build the full, ALREADY URL-ENCODED HTTP-Redirect query string:
+/// `SAMLRequest=...&RelayState=...&SigAlg=...&Signature=...` (`RelayState`
+/// omitted when null). Per SAML Bindings §3.4.4.1 the SigningInput is the
+/// exact percent-encoded `key=value&...` byte string in this fixed order; the
+/// resulting RSA-SHA256 signature is base64'd and appended as a final,
+/// also-percent-encoded `Signature` parameter.
+pub fn buildSignedRedirectQuery(alloc: std.mem.Allocator, opts: BuildSignedRedirectQueryOptions) RedirectSignError![]u8 {
+    const sk = switch (opts.key) {
+        .rsa => |s| s,
+    };
+
+    var q: std.ArrayList(u8) = .empty;
+    errdefer q.deinit(alloc);
+    try appendRedirectSigningInput(alloc, &q, opts.kind, opts.message_field, opts.relay_state, sig_alg_rsa_sha256);
+
+    var sig_buf: [rsa.max_modulus_len]u8 = undefined;
+    const sig = rsa.signPkcs1v15(sk, Sha256, q.items, &sig_buf) catch |e| switch (e) {
+        error.EncodedMessageTooShort, error.BufferTooSmall, error.FaultDetected => return error.SigningFailed,
+    };
+    const sig_b64 = try base64EncodeAlloc(alloc, sig);
+    defer alloc.free(sig_b64);
+
+    try q.appendSlice(alloc, "&Signature=");
+    try appendPercentEncoded(alloc, &q, sig_b64);
+    return q.toOwnedSlice(alloc);
+}
+
+pub const RedirectVerifyError = error{
+    /// `sig_alg` was not the RSA-SHA256 URI. This module supports NO other
+    /// algorithm on the Redirect query-string scheme (see `SigningKey`); an
+    /// IdP configured for ECDSA-P256 here is out of scope — the POST binding
+    /// (embedded XML signature, via `xmldsig.verify`) is unaffected and
+    /// already accepts ECDSA-P256.
+    UnsupportedAlgorithm,
+    /// `signature_b64` was not valid base64.
+    InvalidEncoding,
+} || std.mem.Allocator.Error;
+
+pub const VerifyRedirectQueryOptions = struct {
+    kind: RedirectMessageKind,
+    /// The `SAMLRequest`/`SAMLResponse` field value, already URL-DECODED by
+    /// the caller (mirroring `decodeRedirectField`'s split of concerns).
+    message_field: []const u8,
+    /// The `RelayState` value, already URL-DECODED, or null if absent.
+    relay_state: ?[]const u8 = null,
+    /// The `SigAlg` value, already URL-DECODED.
+    sig_alg: []const u8,
+    /// The `Signature` value, already URL-DECODED (still base64 inside).
+    signature_b64: []const u8,
+    key: rsa.PublicKey,
+};
+
+/// Verify an HTTP-Redirect binding query-string signature (SAML Bindings
+/// §3.4.4.1). All FOUR field values must already be URL-DECODED by the caller.
+/// This reconstructs the canonical percent-encoded SigningInput itself (the
+/// encoding is deterministic regardless of how the original sender happened to
+/// percent-encode it — see `appendPercentEncoded`) and checks the signature
+/// over it. Returns `false` for a structurally-fine signature that simply does
+/// not verify (mirrors `xmldsig.Result.valid`); a typed error only for an
+/// unsupported algorithm or malformed base64.
+pub fn verifyRedirectSignature(alloc: std.mem.Allocator, opts: VerifyRedirectQueryOptions) RedirectVerifyError!bool {
+    if (!std.mem.eql(u8, opts.sig_alg, sig_alg_rsa_sha256)) return error.UnsupportedAlgorithm;
+
+    var signing_input: std.ArrayList(u8) = .empty;
+    defer signing_input.deinit(alloc);
+    try appendRedirectSigningInput(alloc, &signing_input, opts.kind, opts.message_field, opts.relay_state, opts.sig_alg);
+
+    const sig = decodeBase64(alloc, opts.signature_b64) catch return error.InvalidEncoding;
+    defer alloc.free(sig);
+
+    rsa.verifyPkcs1v15(opts.key, Sha256, signing_input.items, sig) catch return false;
+    return true;
+}
+
+// ── Single Logout (SAML Core §3.7 / Bindings) ────────────────────────────────
+//
+// `LogoutRequest`/`LogoutResponse`, built+signed (outgoing, SP→IdP or SP→IdP
+// response) or parsed+verified (incoming, IdP→SP), over both the POST and
+// Redirect bindings.
+//
+// SECURITY: an incoming `LogoutRequest` is ALWAYS signature-verified before
+// its `NameID`/`SessionIndex` are trusted — there is no optional-signature
+// downgrade, exactly like every other message this module consumes. This
+// matters specifically because an unauthenticated `LogoutRequest` is a
+// denial-of-service against the named session: anyone who could forge one
+// could log out any user at will.
+//
+// REPLAY (caller responsibility — this module does no I/O and keeps no
+// state): a captured, genuinely-signed `LogoutRequest` replayed later must not
+// terminate a session established AFTER it was issued. Two independent
+// properties combine to bound this:
+//   1. `SessionIndex` scoping: the IdP mints a FRESH `SessionIndex` on every
+//      new authentication, so a `LogoutRequest` naming session index X can
+//      only ever affect the (single) local session the SP recorded under X —
+//      a session re-established after logout gets a NEW index, so a replayed
+//      request for the old one is inert against it. The caller MUST key its
+//      session store by `SessionIndex` (or `NameID`+`SessionIndex`), never
+//      terminate "the current session for this NameID" without checking it.
+//   2. `ID`/`IssueInstant` deduplication: nothing stops an attacker replaying
+//      the EXACT SAME captured request against the SAME still-live session
+///     before it naturally expires. The caller MUST maintain a seen-`ID` cache
+//      (keyed by `LogoutRequestResult.id`) for at least the message's validity
+//      window (`not_on_or_after`, if present, else a caller-chosen bound based
+//      on `issue_instant` + clock skew) and reject a repeat. This module
+//      surfaces `id`/`issue_instant`/`not_on_or_after` precisely so the caller
+//      can implement this; it cannot do so itself (no shared state, no I/O).
+
+/// States which of the two bindings' trust mechanisms already ran, since they
+/// are mutually exclusive by design (SAML Bindings §3.4 vs §3.5):
+///   - `.embedded`: the XML itself carries a `<ds:Signature>` (POST binding).
+///     `consumeLogoutRequestXml`/`consumeLogoutResponseXml` locate, verify, and
+///     pointer-pin it themselves — nothing is trusted before that succeeds.
+///   - `.redirect_verified`: the signature was already checked out-of-band
+///     over the HTTP-Redirect query string via `verifyRedirectSignature`,
+///     which returned `true`. The XML itself carries no `<ds:Signature>` (none
+///     is expected or looked for); the caller is ATTESTING that the
+///     out-of-band check already passed. Passing this without having actually
+///     called `verifyRedirectSignature` defeats every guarantee this module
+///     makes — there is no way to enforce that from inside a pure codec with
+///     no side channel to the HTTP layer, so the naming and doc comment are
+///     the safeguard.
+pub const SignatureSource = union(enum) {
+    embedded,
+    redirect_verified,
+};
+
+// ── LogoutRequest: build + sign ──────────────────────────────────────────────
+
+pub const LogoutRequestOptions = struct {
+    /// Caller-generated unique request ID (no RNG in this module).
+    id: []const u8,
+    /// xsd:dateTime the caller formats (not generated here — no clock either).
+    issue_instant: []const u8,
+    /// This SP's entityID (becomes `<Issuer>`).
+    issuer: []const u8,
+    /// The IdP's Single-Logout endpoint (`Destination`); optional.
+    destination: ?[]const u8 = null,
+    /// The principal's `<NameID>` text (as the SP knows it from the original
+    /// assertion — this module does not support emitting an `EncryptedID`).
+    name_id: []const u8,
+    name_id_format: ?[]const u8 = null,
+    name_id_sp_qualifier: ?[]const u8 = null,
+    /// Zero or more `<samlp:SessionIndex>` — the specific session(s) to end.
+    /// Empty means "all sessions for this NameID" per SAML Core §3.7.1.
+    session_indexes: []const []const u8 = &.{},
+    /// `Reason` attribute (a URI), optional.
+    reason: ?[]const u8 = null,
+    /// `NotOnOrAfter` attribute (xsd:dateTime), optional.
+    not_on_or_after: ?[]const u8 = null,
+    /// When set, an enveloped `<ds:Signature>` (RSA-SHA256, exclusive C14N) is
+    /// embedded right after `<Issuer>` — required for the POST binding. Leave
+    /// null for the Redirect binding, which signs the query string instead
+    /// (`buildSignedRedirectQuery`).
+    sign_with: ?SigningKey = null,
+};
+
+/// Build (and, if `opts.sign_with` is set, RSA-SHA256-sign) a
+/// `<samlp:LogoutRequest>` — the SP's outgoing SP-initiated-logout message, or
+/// its relay of an IdP-initiated one to other session participants. The
+/// caller applies the binding (base64 for POST; `encodeRedirectField` +
+/// `buildSignedRedirectQuery` for Redirect, in which case leave `sign_with`
+/// null here).
+pub fn buildLogoutRequest(alloc: std.mem.Allocator, opts: LogoutRequestOptions) ProtocolMessageBuildError![]u8 {
+    var open: std.ArrayList(u8) = .empty;
+    errdefer open.deinit(alloc);
+    try open.appendSlice(alloc, "<samlp:LogoutRequest xmlns:samlp=\"");
+    try open.appendSlice(alloc, samlp_ns);
+    try open.appendSlice(alloc, "\" xmlns:saml=\"");
+    try open.appendSlice(alloc, saml_ns);
+    try open.appendSlice(alloc, "\" ID=\"");
+    try appendAttrEscaped(alloc, &open, opts.id);
+    try open.appendSlice(alloc, "\" Version=\"2.0\" IssueInstant=\"");
+    try appendAttrEscaped(alloc, &open, opts.issue_instant);
+    try open.appendSlice(alloc, "\"");
+    if (opts.destination) |d| {
+        try open.appendSlice(alloc, " Destination=\"");
+        try appendAttrEscaped(alloc, &open, d);
+        try open.appendSlice(alloc, "\"");
+    }
+    if (opts.reason) |r| {
+        try open.appendSlice(alloc, " Reason=\"");
+        try appendAttrEscaped(alloc, &open, r);
+        try open.appendSlice(alloc, "\"");
+    }
+    if (opts.not_on_or_after) |n| {
+        try open.appendSlice(alloc, " NotOnOrAfter=\"");
+        try appendAttrEscaped(alloc, &open, n);
+        try open.appendSlice(alloc, "\"");
+    }
+    try open.appendSlice(alloc, ">");
+
+    var issuer_buf: std.ArrayList(u8) = .empty;
+    errdefer issuer_buf.deinit(alloc);
+    try issuer_buf.appendSlice(alloc, "<saml:Issuer>");
+    try appendTextEscaped(alloc, &issuer_buf, opts.issuer);
+    try issuer_buf.appendSlice(alloc, "</saml:Issuer>");
+
+    var rest: std.ArrayList(u8) = .empty;
+    errdefer rest.deinit(alloc);
+    try rest.appendSlice(alloc, "<saml:NameID");
+    if (opts.name_id_format) |f| {
+        try rest.appendSlice(alloc, " Format=\"");
+        try appendAttrEscaped(alloc, &rest, f);
+        try rest.appendSlice(alloc, "\"");
+    }
+    if (opts.name_id_sp_qualifier) |q| {
+        try rest.appendSlice(alloc, " SPNameQualifier=\"");
+        try appendAttrEscaped(alloc, &rest, q);
+        try rest.appendSlice(alloc, "\"");
+    }
+    try rest.appendSlice(alloc, ">");
+    try appendTextEscaped(alloc, &rest, opts.name_id);
+    try rest.appendSlice(alloc, "</saml:NameID>");
+    for (opts.session_indexes) |si| {
+        try rest.appendSlice(alloc, "<samlp:SessionIndex>");
+        try appendTextEscaped(alloc, &rest, si);
+        try rest.appendSlice(alloc, "</samlp:SessionIndex>");
+    }
+
+    const root_open = try open.toOwnedSlice(alloc);
+    defer alloc.free(root_open);
+    const issuer_xml = try issuer_buf.toOwnedSlice(alloc);
+    defer alloc.free(issuer_xml);
+    const rest_xml = try rest.toOwnedSlice(alloc);
+    defer alloc.free(rest_xml);
+
+    if (opts.sign_with) |key| {
+        return signProtocolMessage(alloc, root_open, issuer_xml, rest_xml, "</samlp:LogoutRequest>", opts.id, key);
+    }
+    return std.fmt.allocPrint(alloc, "{s}{s}{s}</samlp:LogoutRequest>", .{ root_open, issuer_xml, rest_xml });
+}
+
+// ── LogoutResponse: build + sign ─────────────────────────────────────────────
+
+pub const LogoutResponseOptions = struct {
+    id: []const u8,
+    issue_instant: []const u8,
+    issuer: []const u8,
+    destination: ?[]const u8 = null,
+    /// The `ID` of the `LogoutRequest` this responds to.
+    in_response_to: ?[]const u8 = null,
+    /// Full `<samlp:StatusCode Value="...">` URI. Defaults to Success;
+    /// override to report e.g. `urn:oasis:names:tc:SAML:2.0:status:Requester`
+    /// back to a peer whose `LogoutRequest` this SP could not honor.
+    status_code: []const u8 = status_success,
+    status_message: ?[]const u8 = null,
+    sign_with: ?SigningKey = null,
+};
+
+/// Build (and, if `opts.sign_with` is set, RSA-SHA256-sign) a
+/// `<samlp:LogoutResponse>` — the SP's reply to an IdP-initiated
+/// `LogoutRequest` it just consumed.
+pub fn buildLogoutResponse(alloc: std.mem.Allocator, opts: LogoutResponseOptions) ProtocolMessageBuildError![]u8 {
+    var open: std.ArrayList(u8) = .empty;
+    errdefer open.deinit(alloc);
+    try open.appendSlice(alloc, "<samlp:LogoutResponse xmlns:samlp=\"");
+    try open.appendSlice(alloc, samlp_ns);
+    try open.appendSlice(alloc, "\" xmlns:saml=\"");
+    try open.appendSlice(alloc, saml_ns);
+    try open.appendSlice(alloc, "\" ID=\"");
+    try appendAttrEscaped(alloc, &open, opts.id);
+    try open.appendSlice(alloc, "\" Version=\"2.0\" IssueInstant=\"");
+    try appendAttrEscaped(alloc, &open, opts.issue_instant);
+    try open.appendSlice(alloc, "\"");
+    if (opts.destination) |d| {
+        try open.appendSlice(alloc, " Destination=\"");
+        try appendAttrEscaped(alloc, &open, d);
+        try open.appendSlice(alloc, "\"");
+    }
+    if (opts.in_response_to) |irt| {
+        try open.appendSlice(alloc, " InResponseTo=\"");
+        try appendAttrEscaped(alloc, &open, irt);
+        try open.appendSlice(alloc, "\"");
+    }
+    try open.appendSlice(alloc, ">");
+
+    var issuer_buf: std.ArrayList(u8) = .empty;
+    errdefer issuer_buf.deinit(alloc);
+    try issuer_buf.appendSlice(alloc, "<saml:Issuer>");
+    try appendTextEscaped(alloc, &issuer_buf, opts.issuer);
+    try issuer_buf.appendSlice(alloc, "</saml:Issuer>");
+
+    var rest: std.ArrayList(u8) = .empty;
+    errdefer rest.deinit(alloc);
+    try rest.appendSlice(alloc, "<samlp:Status><samlp:StatusCode Value=\"");
+    try appendAttrEscaped(alloc, &rest, opts.status_code);
+    try rest.appendSlice(alloc, "\"/>");
+    if (opts.status_message) |m| {
+        try rest.appendSlice(alloc, "<samlp:StatusMessage>");
+        try appendTextEscaped(alloc, &rest, m);
+        try rest.appendSlice(alloc, "</samlp:StatusMessage>");
+    }
+    try rest.appendSlice(alloc, "</samlp:Status>");
+
+    const root_open = try open.toOwnedSlice(alloc);
+    defer alloc.free(root_open);
+    const issuer_xml = try issuer_buf.toOwnedSlice(alloc);
+    defer alloc.free(issuer_xml);
+    const rest_xml = try rest.toOwnedSlice(alloc);
+    defer alloc.free(rest_xml);
+
+    if (opts.sign_with) |key| {
+        return signProtocolMessage(alloc, root_open, issuer_xml, rest_xml, "</samlp:LogoutResponse>", opts.id, key);
+    }
+    return std.fmt.allocPrint(alloc, "{s}{s}{s}</samlp:LogoutResponse>", .{ root_open, issuer_xml, rest_xml });
+}
+
+// ── LogoutRequest: parse + verify (incoming, IdP-initiated) ─────────────────
+
+pub const LogoutRequestConfig = struct {
+    idp_entity_id: []const u8,
+    idp_key: xmldsig.VerifyKey,
+    now_unix: i64,
+    clock_skew_secs: i64 = 60,
+    allow_weak_sha1: bool = false,
+    id_attr: []const u8 = "ID",
+    /// When set, `<LogoutRequest Destination>` (if present) must equal this —
+    /// this SP's Single-Logout endpoint URL.
+    expected_destination: ?[]const u8 = null,
+    /// This SP's RSA private key, for decrypting a `<saml:EncryptedID>` NameID.
+    /// Null (default) ⇒ refused with `error.EncryptedIdUnsupported`, mirroring
+    /// the Response/Assertion path's opt-in discipline.
+    sp_decrypt_key: ?rsa.SecretKey = null,
+    allow_weak_rsa15: bool = false,
+    decrypt_kek: ?[]const u8 = null,
+};
+
+pub const LogoutRequestError = error{
+    InvalidEncoding,
+    MalformedRequest,
+    NotLogoutRequest,
+    IssuerMismatch,
+    DestinationMismatch,
+    /// No `<ds:Signature>` found under `.embedded` — never downgraded to
+    /// trusting an unsigned request.
+    SignatureMissing,
+    SignatureInvalid,
+    SignatureWrappingDetected,
+    /// Neither `<saml:NameID>` nor `<saml:EncryptedID>` present.
+    SubjectMissing,
+    EncryptedIdUnsupported,
+    IdDecryptionFailed,
+    /// `now` is at/after `NotOnOrAfter` (+skew), when present.
+    RequestExpired,
+    InvalidDateTime,
+} || std.mem.Allocator.Error;
+
+pub const LogoutRequestResult = struct {
+    arena: std.heap.ArenaAllocator,
+    /// The request `ID` — the caller's seen-ID replay cache key (see the
+    /// "Single Logout" section doc comment above).
+    id: []const u8,
+    issue_instant: i64,
+    name_id: []const u8,
+    name_id_format: ?[]const u8,
+    name_id_sp_qualifier: ?[]const u8,
+    /// The session(s) to end. Empty means "every session for this NameID" per
+    /// SAML Core §3.7.1 — the caller decides how to interpret that.
+    session_indexes: []const []const u8,
+    reason: ?[]const u8,
+    not_on_or_after: ?i64,
+
+    pub fn deinit(self: *LogoutRequestResult) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+/// Consume a POST-binding `SAMLRequest` form field carrying a `LogoutRequest`
+/// (base64 of the XML, which itself carries the embedded signature — POST
+/// always uses `.embedded`).
+pub fn consumeLogoutRequest(alloc: std.mem.Allocator, saml_request_field: []const u8, config: LogoutRequestConfig) LogoutRequestError!LogoutRequestResult {
+    const xml_bytes = decodePostField(alloc, saml_request_field) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidEncoding,
+    };
+    defer alloc.free(xml_bytes);
+    return consumeLogoutRequestXml(alloc, xml_bytes, .embedded, config);
+}
+
+/// Parse + verify an already-decoded `<samlp:LogoutRequest>`. `source` states
+/// which binding's trust mechanism already ran — see `SignatureSource`. For
+/// the Redirect binding: `decodeRedirectField` the `SAMLRequest` field, call
+/// `verifyRedirectSignature` on the (URL-decoded) query parameters yourself,
+/// and only on `true` call this with `.redirect_verified`.
+pub fn consumeLogoutRequestXml(
+    alloc: std.mem.Allocator,
+    xml_bytes: []const u8,
+    source: SignatureSource,
+    config: LogoutRequestConfig,
+) LogoutRequestError!LogoutRequestResult {
+    var doc = xml.parse(alloc, xml_bytes, .{ .id_attr_names = &.{"ID"} }) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.MalformedRequest,
+    };
+    defer doc.deinit();
+    const root = doc.root;
+    if (!isEl(root, samlp_ns, "LogoutRequest")) return error.NotLogoutRequest;
+
+    if (childEl(root, saml_ns, "Issuer")) |iss| {
+        const t = try textAlloc(alloc, iss);
+        defer alloc.free(t);
+        if (!std.mem.eql(u8, trim(t), config.idp_entity_id)) return error.IssuerMismatch;
+    }
+    if (root.attr("", "Destination")) |dest| {
+        if (config.expected_destination) |exp| {
+            if (!std.mem.eql(u8, dest, exp)) return error.DestinationMismatch;
+        }
+    }
+
+    switch (source) {
+        .embedded => {
+            const sig = childEl(root, xmldsig.ds_ns, "Signature") orelse return error.SignatureMissing;
+            var res = xmldsig.verify(alloc, &doc, sig, sigOptsFor(config.idp_key, config.allow_weak_sha1, config.id_attr)) catch return error.SignatureInvalid;
+            defer res.deinit(alloc);
+            if (!res.valid) return error.SignatureInvalid;
+            if (!signedTargetMatches(&doc, &res, root, config.id_attr)) return error.SignatureWrappingDetected;
+        },
+        .redirect_verified => {},
+    }
+
+    const id_val = root.attr("", config.id_attr) orelse return error.MalformedRequest;
+    const issue_instant_raw = root.attr("", "IssueInstant") orelse return error.MalformedRequest;
+    const issue_instant = try parseDateTime(issue_instant_raw);
+
+    var not_on_or_after: ?i64 = null;
+    if (root.attr("", "NotOnOrAfter")) |noa| {
+        const t = try parseDateTime(noa);
+        if (config.now_unix - config.clock_skew_secs >= t) return error.RequestExpired;
+        not_on_or_after = t;
+    }
+
+    // The NameID may be cleartext or, symmetrically with the Response path, a
+    // `<saml:EncryptedID>` — decrypted (opt-in) into its own standalone
+    // document, which must outlive extraction below.
+    var enc_id_dec: ?Decrypted = null;
+    defer if (enc_id_dec) |*d| d.deinit(alloc);
+    const name_id_el = nid: {
+        if (childEl(root, saml_ns, "NameID")) |nid| break :nid nid;
+        if (childEl(root, saml_ns, "EncryptedID")) |enc_id| {
+            if (config.sp_decrypt_key == null) return error.EncryptedIdUnsupported;
+            var dec = try decryptWrappedElement(LogoutRequestError, alloc, enc_id, config.sp_decrypt_key, config.allow_weak_rsa15, config.decrypt_kek, error.IdDecryptionFailed);
+            if (!isEl(dec.doc.root, saml_ns, "NameID")) {
+                dec.deinit(alloc);
+                return error.IdDecryptionFailed;
+            }
+            enc_id_dec = dec;
+            break :nid enc_id_dec.?.doc.root;
+        }
+        return error.SubjectMissing;
+    };
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+
+    var sidx: std.ArrayList([]const u8) = .empty;
+    for (root.children) |c| switch (c.content) {
+        .element => |el| if (isEl(el, samlp_ns, "SessionIndex")) {
+            try sidx.append(a, try dupTrimmedText(a, el));
+        },
+        else => {},
+    };
+
+    // Every arena allocation MUST happen before the struct literal below: the
+    // literal copies `arena` BY VALUE into `.arena`, so an allocation made
+    // in a LATER field of the same literal (which still runs through `a`,
+    // pointing at THIS still-live local `arena`) would land in a buffer the
+    // already-copied `.arena` snapshot never learns about — a real leak on
+    // the caller's `deinit()`, not merely a style preference.
+    const id_owned = try a.dupe(u8, id_val);
+    const name_id_owned = try dupTrimmedText(a, name_id_el);
+    const name_id_format = try dupAttr(a, name_id_el, "Format");
+    const name_id_spq = try dupAttr(a, name_id_el, "SPNameQualifier");
+    const session_indexes = try sidx.toOwnedSlice(a);
+    const reason = try dupAttr(a, root, "Reason");
+
+    return .{
+        .arena = arena,
+        .id = id_owned,
+        .issue_instant = issue_instant,
+        .name_id = name_id_owned,
+        .name_id_format = name_id_format,
+        .name_id_sp_qualifier = name_id_spq,
+        .session_indexes = session_indexes,
+        .reason = reason,
+        .not_on_or_after = not_on_or_after,
+    };
+}
+
+// ── LogoutResponse: parse + verify (incoming, reply to an SP-initiated
+//    LogoutRequest) ───────────────────────────────────────────────────────────
+
+pub const LogoutResponseConfig = struct {
+    idp_entity_id: []const u8,
+    idp_key: xmldsig.VerifyKey,
+    now_unix: i64,
+    clock_skew_secs: i64 = 60,
+    allow_weak_sha1: bool = false,
+    id_attr: []const u8 = "ID",
+    expected_destination: ?[]const u8 = null,
+    /// The `ID` of the `LogoutRequest` this SP sent; the response's
+    /// `InResponseTo` MUST equal it.
+    expected_in_response_to: []const u8,
+};
+
+pub const LogoutResponseError = error{
+    InvalidEncoding,
+    MalformedResponse,
+    NotLogoutResponse,
+    IssuerMismatch,
+    DestinationMismatch,
+    SignatureMissing,
+    SignatureInvalid,
+    SignatureWrappingDetected,
+    InResponseToMismatch,
+    /// The top-level `<samlp:StatusCode>` was not
+    /// `urn:oasis:names:tc:SAML:2.0:status:Success` — checked explicitly, never
+    /// assumed. See `LogoutResponseResult.second_level_status_code` for the
+    /// nested code some responders use to signal e.g. `PartialLogout` on an
+    /// otherwise-successful top-level status.
+    StatusNotSuccess,
+    InvalidDateTime,
+} || std.mem.Allocator.Error;
+
+pub const LogoutResponseResult = struct {
+    arena: std.heap.ArenaAllocator,
+    id: []const u8,
+    issue_instant: i64,
+    in_response_to: ?[]const u8,
+    /// The top-level status code — always the Success URI by construction
+    /// (anything else is `error.StatusNotSuccess`).
+    status_code: []const u8,
+    /// A NESTED `<samlp:StatusCode>` inside the top-level one, if present
+    /// (e.g. `urn:oasis:names:tc:SAML:2.0:status:PartialLogout`) — the caller
+    /// MUST inspect this to detect a partial logout despite an overall Success.
+    second_level_status_code: ?[]const u8,
+    status_message: ?[]const u8,
+
+    pub fn deinit(self: *LogoutResponseResult) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+/// Consume a POST-binding `SAMLResponse` form field carrying a
+/// `LogoutResponse` (`.embedded`).
+pub fn consumeLogoutResponse(alloc: std.mem.Allocator, saml_response_field: []const u8, config: LogoutResponseConfig) LogoutResponseError!LogoutResponseResult {
+    const xml_bytes = decodePostField(alloc, saml_response_field) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidEncoding,
+    };
+    defer alloc.free(xml_bytes);
+    return consumeLogoutResponseXml(alloc, xml_bytes, .embedded, config);
+}
+
+/// Parse + verify an already-decoded `<samlp:LogoutResponse>`. See
+/// `consumeLogoutRequestXml`'s doc comment for how `source` relates to the two
+/// bindings.
+pub fn consumeLogoutResponseXml(
+    alloc: std.mem.Allocator,
+    xml_bytes: []const u8,
+    source: SignatureSource,
+    config: LogoutResponseConfig,
+) LogoutResponseError!LogoutResponseResult {
+    var doc = xml.parse(alloc, xml_bytes, .{ .id_attr_names = &.{"ID"} }) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.MalformedResponse,
+    };
+    defer doc.deinit();
+    const root = doc.root;
+    if (!isEl(root, samlp_ns, "LogoutResponse")) return error.NotLogoutResponse;
+
+    if (childEl(root, saml_ns, "Issuer")) |iss| {
+        const t = try textAlloc(alloc, iss);
+        defer alloc.free(t);
+        if (!std.mem.eql(u8, trim(t), config.idp_entity_id)) return error.IssuerMismatch;
+    }
+    if (root.attr("", "Destination")) |dest| {
+        if (config.expected_destination) |exp| {
+            if (!std.mem.eql(u8, dest, exp)) return error.DestinationMismatch;
+        }
+    }
+    const irt = root.attr("", "InResponseTo") orelse return error.InResponseToMismatch;
+    if (!std.mem.eql(u8, irt, config.expected_in_response_to)) return error.InResponseToMismatch;
+
+    switch (source) {
+        .embedded => {
+            const sig = childEl(root, xmldsig.ds_ns, "Signature") orelse return error.SignatureMissing;
+            var res = xmldsig.verify(alloc, &doc, sig, sigOptsFor(config.idp_key, config.allow_weak_sha1, config.id_attr)) catch return error.SignatureInvalid;
+            defer res.deinit(alloc);
+            if (!res.valid) return error.SignatureInvalid;
+            if (!signedTargetMatches(&doc, &res, root, config.id_attr)) return error.SignatureWrappingDetected;
+        },
+        .redirect_verified => {},
+    }
+
+    const status = childEl(root, samlp_ns, "Status") orelse return error.MalformedResponse;
+    const status_code_el = childEl(status, samlp_ns, "StatusCode") orelse return error.MalformedResponse;
+    const code = status_code_el.attr("", "Value") orelse return error.MalformedResponse;
+    if (!std.mem.eql(u8, code, status_success)) return error.StatusNotSuccess;
+
+    const id_val = root.attr("", config.id_attr) orelse return error.MalformedResponse;
+    const issue_instant_raw = root.attr("", "IssueInstant") orelse return error.MalformedResponse;
+    const issue_instant = try parseDateTime(issue_instant_raw);
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+
+    var second_level: ?[]const u8 = null;
+    if (childEl(status_code_el, samlp_ns, "StatusCode")) |nested| {
+        if (nested.attr("", "Value")) |v| second_level = try a.dupe(u8, v);
+    }
+    var status_message: ?[]const u8 = null;
+    if (childEl(status, samlp_ns, "StatusMessage")) |sm| status_message = try dupTrimmedText(a, sm);
+
+    // See the identical comment in `consumeLogoutRequestXml`: every arena
+    // allocation must happen BEFORE the struct literal, not inline within it
+    // alongside `.arena = arena` (which copies the arena by value at that
+    // point in evaluation) — otherwise a later field's allocation lands in a
+    // buffer the copied `.arena` snapshot never learns about, leaking it.
+    const id_owned = try a.dupe(u8, id_val);
+    const in_response_to_owned = try a.dupe(u8, irt);
+    const status_code_owned = try a.dupe(u8, code);
+
+    return .{
+        .arena = arena,
+        .id = id_owned,
+        .issue_instant = issue_instant,
+        .in_response_to = in_response_to_owned,
+        .status_code = status_code_owned,
+        .second_level_status_code = second_level,
+        .status_message = status_message,
+    };
+}
+
+// ── Artifact binding (SAML Bindings §3.6) — message layer only ──────────────
+//
+// The `SAMLart` artifact format (type code, endpoint index, SourceID,
+// MessageHandle) and the `ArtifactResolve`/`ArtifactResponse` SOAP payloads.
+//
+// The boundary: the back-channel resolution step is an HTTP round trip to the
+// IdP's ArtifactResolutionService (typically over mutual TLS) — this is a
+// LIBRARY, not an HTTP client, so PERFORMING that call is explicitly NOT this
+// module's job, the same way `saml` elsewhere hands back DER/endpoints for the
+// caller to dereference rather than doing I/O itself. `buildArtifactResolveSoap`
+// constructs the request bytes; the caller sends them and gets a response body;
+// `consumeArtifactResponseSoap` parses, verifies, and extracts the enclosed
+// message from that response body.
+
+const artifact_type_code: u16 = 0x0004; // SAML 2.0's only defined artifact type
+
+pub const Artifact = struct {
+    endpoint_index: u16,
+    /// Identifies the artifact issuer. Conventionally (not mandatorily) SHA-1
+    /// of its entityID — see `sourceIdFromEntityId` — the `SAMLart` FORMAT
+    /// itself only mandates the length, not the derivation.
+    source_id: [20]u8,
+    /// A unique-per-artifact correlation handle. NO RNG here (this module's
+    /// standing "no RNG, no clock" rule — see `AuthnRequestOptions`): the
+    /// caller generates this securely (CSPRNG, 20 bytes) and is responsible
+    /// for its uniqueness.
+    message_handle: [20]u8,
+};
+
+/// SHA-1 of an entityID — the conventional (not mandatory) derivation of
+/// `Artifact.source_id` (SAML Bindings §3.6.2.1).
+pub fn sourceIdFromEntityId(entity_id: []const u8) [20]u8 {
+    var out: [20]u8 = undefined;
+    std.crypto.hash.Sha1.hash(entity_id, &out, .{});
+    return out;
+}
+
+/// The raw 44-octet `SAMLart` wire format: 2-byte TypeCode (big-endian, always
+/// `0x0004`) + 2-byte EndpointIndex (big-endian) + 20-byte SourceID + 20-byte
+/// MessageHandle.
+pub fn encodeArtifact(a: Artifact) [44]u8 {
+    var out: [44]u8 = undefined;
+    std.mem.writeInt(u16, out[0..2], artifact_type_code, .big);
+    std.mem.writeInt(u16, out[2..4], a.endpoint_index, .big);
+    @memcpy(out[4..24], &a.source_id);
+    @memcpy(out[24..44], &a.message_handle);
+    return out;
+}
+
+/// Base64 of `encodeArtifact` — the `SAMLart` query/form FIELD VALUE, and the
+/// text content of `<samlp:Artifact>` in an `ArtifactResolve`.
+pub fn encodeArtifactBase64(alloc: std.mem.Allocator, a: Artifact) std.mem.Allocator.Error![]u8 {
+    const raw = encodeArtifact(a);
+    return base64EncodeAlloc(alloc, &raw);
+}
+
+pub const ArtifactDecodeError = error{
+    /// Not exactly 44 octets (or not valid base64, for the `*Base64` form).
+    InvalidArtifact,
+    /// Decoded to 44 octets, but the TypeCode was not `0x0004` — the only
+    /// artifact type SAML 2.0 defines.
+    UnsupportedTypeCode,
+};
+
+/// Decode the raw 44-octet `SAMLart` format. See `Artifact`.
+pub fn decodeArtifact(raw: []const u8) ArtifactDecodeError!Artifact {
+    if (raw.len != 44) return error.InvalidArtifact;
+    const type_code = std.mem.readInt(u16, raw[0..2], .big);
+    if (type_code != artifact_type_code) return error.UnsupportedTypeCode;
+    const endpoint_index = std.mem.readInt(u16, raw[2..4], .big);
+    var source_id: [20]u8 = undefined;
+    @memcpy(&source_id, raw[4..24]);
+    var message_handle: [20]u8 = undefined;
+    @memcpy(&message_handle, raw[24..44]);
+    return .{ .endpoint_index = endpoint_index, .source_id = source_id, .message_handle = message_handle };
+}
+
+/// Base64-decode then `decodeArtifact` — the inverse of `encodeArtifactBase64`.
+pub fn decodeArtifactBase64(alloc: std.mem.Allocator, field: []const u8) (ArtifactDecodeError || std.mem.Allocator.Error)!Artifact {
+    const raw = decodeBase64(alloc, field) catch return error.InvalidArtifact;
+    defer alloc.free(raw);
+    return decodeArtifact(raw);
+}
+
+pub const ArtifactResolveOptions = struct {
+    id: []const u8,
+    issue_instant: []const u8,
+    issuer: []const u8,
+    destination: ?[]const u8 = null,
+    /// From `encodeArtifactBase64` — the exact artifact the SP received.
+    artifact_b64: []const u8,
+    sign_with: ?SigningKey = null,
+};
+
+/// Build a SOAP-wrapped `<samlp:ArtifactResolve>` — the SP's back-channel
+/// request BODY. Sending it (HTTP POST to the IdP's
+/// ArtifactResolutionService) is the caller's job.
+pub fn buildArtifactResolveSoap(alloc: std.mem.Allocator, opts: ArtifactResolveOptions) ProtocolMessageBuildError![]u8 {
+    var open: std.ArrayList(u8) = .empty;
+    errdefer open.deinit(alloc);
+    try open.appendSlice(alloc, "<samlp:ArtifactResolve xmlns:samlp=\"");
+    try open.appendSlice(alloc, samlp_ns);
+    try open.appendSlice(alloc, "\" xmlns:saml=\"");
+    try open.appendSlice(alloc, saml_ns);
+    try open.appendSlice(alloc, "\" ID=\"");
+    try appendAttrEscaped(alloc, &open, opts.id);
+    try open.appendSlice(alloc, "\" Version=\"2.0\" IssueInstant=\"");
+    try appendAttrEscaped(alloc, &open, opts.issue_instant);
+    try open.appendSlice(alloc, "\"");
+    if (opts.destination) |d| {
+        try open.appendSlice(alloc, " Destination=\"");
+        try appendAttrEscaped(alloc, &open, d);
+        try open.appendSlice(alloc, "\"");
+    }
+    try open.appendSlice(alloc, ">");
+
+    var issuer_buf: std.ArrayList(u8) = .empty;
+    errdefer issuer_buf.deinit(alloc);
+    try issuer_buf.appendSlice(alloc, "<saml:Issuer>");
+    try appendTextEscaped(alloc, &issuer_buf, opts.issuer);
+    try issuer_buf.appendSlice(alloc, "</saml:Issuer>");
+
+    var rest: std.ArrayList(u8) = .empty;
+    errdefer rest.deinit(alloc);
+    try rest.appendSlice(alloc, "<samlp:Artifact>");
+    try appendTextEscaped(alloc, &rest, opts.artifact_b64);
+    try rest.appendSlice(alloc, "</samlp:Artifact>");
+
+    const root_open = try open.toOwnedSlice(alloc);
+    defer alloc.free(root_open);
+    const issuer_xml = try issuer_buf.toOwnedSlice(alloc);
+    defer alloc.free(issuer_xml);
+    const rest_xml = try rest.toOwnedSlice(alloc);
+    defer alloc.free(rest_xml);
+
+    const inner = if (opts.sign_with) |key|
+        try signProtocolMessage(alloc, root_open, issuer_xml, rest_xml, "</samlp:ArtifactResolve>", opts.id, key)
+    else
+        try std.fmt.allocPrint(alloc, "{s}{s}{s}</samlp:ArtifactResolve>", .{ root_open, issuer_xml, rest_xml });
+    defer alloc.free(inner);
+
+    return std.fmt.allocPrint(alloc, "<soap:Envelope xmlns:soap=\"{s}\"><soap:Body>{s}</soap:Body></soap:Envelope>", .{ soap_ns, inner });
+}
+
+pub const ArtifactResponseConfig = struct {
+    idp_entity_id: []const u8,
+    idp_key: xmldsig.VerifyKey,
+    now_unix: i64,
+    clock_skew_secs: i64 = 60,
+    allow_weak_sha1: bool = false,
+    id_attr: []const u8 = "ID",
+    expected_destination: ?[]const u8 = null,
+    /// The `ID` of the `ArtifactResolve` this SP sent.
+    expected_in_response_to: []const u8,
+};
+
+pub const ArtifactResponseError = error{
+    MalformedSoap,
+    NotArtifactResponse,
+    IssuerMismatch,
+    DestinationMismatch,
+    SignatureMissing,
+    SignatureInvalid,
+    SignatureWrappingDetected,
+    InResponseToMismatch,
+    StatusNotSuccess,
+    /// The `ArtifactResponse` carried no enclosed message element (a
+    /// legitimate outcome — e.g. the artifact had already been resolved once,
+    /// or was unknown/expired at the IdP — the caller decides how to react).
+    NoEnclosedMessage,
+} || std.mem.Allocator.Error;
+
+pub const ArtifactResponseResult = struct {
+    /// The enclosed protocol message (e.g. `<samlp:Response>` or
+    /// `<samlp:LogoutResponse>`), re-serialized via Exclusive C14N into a
+    /// self-contained, standalone document — safe to re-parse and hand to
+    /// `consumeResponseXml`/`consumeLogoutResponseXml`/etc., which perform
+    /// their OWN full signature/condition verification independently.
+    /// Exclusive C14N is, by design, independent of ancestor context, so an
+    /// embedded signature inside the enclosed message (over ITS OWN content)
+    /// is unaffected by having been extracted this way. Owned by the caller.
+    enclosed_message_xml: []u8,
+
+    pub fn deinit(self: *ArtifactResponseResult, alloc: std.mem.Allocator) void {
+        alloc.free(self.enclosed_message_xml);
+        self.* = undefined;
+    }
+};
+
+/// Parse + verify a SOAP-wrapped `<samlp:ArtifactResponse>` (the IdP's
+/// back-channel reply to `buildArtifactResolveSoap`) and extract the enclosed
+/// message. The `ArtifactResponse`'s OWN `<ds:Signature>` is REQUIRED and
+/// pointer-pinned exactly like every other message this module verifies (no
+/// optional-signature downgrade) — verifying it authenticates every byte
+/// inside via the enveloped transform, including the enclosed message.
+pub fn consumeArtifactResponseSoap(alloc: std.mem.Allocator, soap_xml: []const u8, config: ArtifactResponseConfig) ArtifactResponseError!ArtifactResponseResult {
+    var doc = xml.parse(alloc, soap_xml, .{ .id_attr_names = &.{"ID"} }) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.MalformedSoap,
+    };
+    defer doc.deinit();
+
+    if (!isEl(doc.root, soap_ns, "Envelope")) return error.MalformedSoap;
+    const body = childEl(doc.root, soap_ns, "Body") orelse return error.MalformedSoap;
+    const root = firstChildElement(body) orelse return error.MalformedSoap;
+    if (!isEl(root, samlp_ns, "ArtifactResponse")) return error.NotArtifactResponse;
+
+    if (childEl(root, saml_ns, "Issuer")) |iss| {
+        const t = try textAlloc(alloc, iss);
+        defer alloc.free(t);
+        if (!std.mem.eql(u8, trim(t), config.idp_entity_id)) return error.IssuerMismatch;
+    }
+    if (root.attr("", "Destination")) |dest| {
+        if (config.expected_destination) |exp| {
+            if (!std.mem.eql(u8, dest, exp)) return error.DestinationMismatch;
+        }
+    }
+    const irt = root.attr("", "InResponseTo") orelse return error.InResponseToMismatch;
+    if (!std.mem.eql(u8, irt, config.expected_in_response_to)) return error.InResponseToMismatch;
+
+    const sig = childEl(root, xmldsig.ds_ns, "Signature") orelse return error.SignatureMissing;
+    var res = xmldsig.verify(alloc, &doc, sig, sigOptsFor(config.idp_key, config.allow_weak_sha1, config.id_attr)) catch return error.SignatureInvalid;
+    defer res.deinit(alloc);
+    if (!res.valid) return error.SignatureInvalid;
+    if (!signedTargetMatches(&doc, &res, root, config.id_attr)) return error.SignatureWrappingDetected;
+
+    const status = childEl(root, samlp_ns, "Status") orelse return error.MalformedSoap;
+    const status_code_el = childEl(status, samlp_ns, "StatusCode") orelse return error.MalformedSoap;
+    const code = status_code_el.attr("", "Value") orelse return error.MalformedSoap;
+    if (!std.mem.eql(u8, code, status_success)) return error.StatusNotSuccess;
+
+    const enclosed = findEnclosedMessage(root) orelse return error.NoEnclosedMessage;
+    const enclosed_xml = try xmldsig.c14n.canonicalize(alloc, enclosed, .{ .mode = .exclusive });
+    return .{ .enclosed_message_xml = enclosed_xml };
+}
+
+fn firstChildElement(parent: *const xml.Element) ?*xml.Element {
+    for (parent.children) |c| switch (c.content) {
+        .element => |el| return el,
+        else => {},
+    };
+    return null;
+}
+
+/// The `ArtifactResponse`'s payload: the first child that is none of
+/// `Issuer`/`Signature`/`Status`/`Extensions` — whatever protocol message
+/// (`Response`, `LogoutResponse`, ...) the IdP resolved the artifact to.
+fn findEnclosedMessage(root: *const xml.Element) ?*xml.Element {
+    for (root.children) |c| switch (c.content) {
+        .element => |el| {
+            if (isEl(el, saml_ns, "Issuer")) continue;
+            if (isEl(el, xmldsig.ds_ns, "Signature")) continue;
+            if (isEl(el, samlp_ns, "Status")) continue;
+            if (isEl(el, samlp_ns, "Extensions")) continue;
+            return el;
+        },
+        else => {},
+    };
+    return null;
+}
+
+fn base64EncodeAlloc(alloc: std.mem.Allocator, data: []const u8) std.mem.Allocator.Error![]u8 {
+    const enc = std.base64.standard.Encoder;
+    const out = try alloc.alloc(u8, enc.calcSize(data.len));
+    _ = enc.encode(out, data);
+    return out;
+}
+
 // ── small helpers ────────────────────────────────────────────────────────────
 
 fn isEl(el: *const xml.Element, uri: []const u8, local: []const u8) bool {
@@ -1715,7 +2891,13 @@ fn appendTextEscaped(alloc: std.mem.Allocator, w: *std.ArrayList(u8), s: []const
 // depends only on `xmldsig`+`xml`; the calendar math is reproduced here rather
 // than pulling in `datefmt`. A future `datetime`/`iso8601` helper would let all
 // three (saml, xmldsig-conditions, jwt exp/nbf) share one parser.
-fn parseDateTime(s: []const u8) ConsumeError!i64 {
+//
+// The return type is the minimal `error{InvalidDateTime}` (never allocates),
+// not the wider `ConsumeError` — Zig's error-set coercion widens it back to
+// `ConsumeError` at the existing call sites automatically, and it lets the
+// Single-Logout / Artifact code (their own, narrower error sets) `try` this
+// directly instead of duplicating the calendar arithmetic a second time.
+fn parseDateTime(s: []const u8) error{InvalidDateTime}!i64 {
     // Minimum: "YYYY-MM-DDThh:mm:ss" = 19 chars.
     if (s.len < 19) return error.InvalidDateTime;
     if (s[4] != '-' or s[7] != '-' or (s[10] != 'T' and s[10] != 't') or s[13] != ':' or s[16] != ':') {
@@ -1761,7 +2943,7 @@ fn parseDateTime(s: []const u8) ConsumeError!i64 {
     return secs - tz_offset;
 }
 
-fn parseIntField(comptime T: type, s: []const u8) ConsumeError!T {
+fn parseIntField(comptime T: type, s: []const u8) error{InvalidDateTime}!T {
     var v: T = 0;
     if (s.len == 0) return error.InvalidDateTime;
     for (s) |c| {
@@ -1796,6 +2978,9 @@ test {
     _ = @import("test_hok_keyvalue.zig");
     _ = @import("test_hok_crossform.zig");
     _ = @import("test_eidas.zig");
+    _ = @import("test_slo.zig");
+    _ = @import("test_redirect_binding.zig");
+    _ = @import("test_artifact.zig");
 }
 
 const testing = std.testing;
