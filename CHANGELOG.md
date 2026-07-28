@@ -87,6 +87,28 @@ Per-module API changes since v0.1.0 worth calling out:
   discovered `engineBoots‖engineTime`, so a client restart does not resume the
   counter from a fixed constant. `priv.decrypt` is unchanged (its salt comes off
   the wire). Scope and limits documented in `modules/snmp/SPEC.md`.
+- **`hpke`:** `mode_psk`, `mode_auth` and `mode_auth_psk` are now anchored to
+  RFC 9180's own Appendix A vectors (A.1.2/3/4 for X25519, A.3.2/3/4 for
+  P-256) instead of only to this module's round-trip; the implementations
+  needed no correction. New single-shot wrappers `sealPsk`/`openPsk`,
+  `sealAuth`/`openAuth`, `sealAuthPsk`/`openAuthPsk` alongside the existing
+  `sealBase`/`openBase`. **BREAKING (behavioral):** a psk-bearing mode now
+  rejects a PSK shorter than `Nh` with `error.PskTooShort` — deliberately
+  stricter than the RFC's `VerifyPSKInputs` pseudocode, on the grounds that
+  §5.1.2's "MUST have at least 32 bytes of entropy" cannot hold for a PSK
+  shorter than 32 bytes, and length is the only checkable projection of that
+  requirement. Appendix A's own PSK vectors satisfy the floor.
+- **`k256`:** new `k256.ecdsa_recover` — RFC 6979 deterministic-nonce ECDSA
+  signing and public-key recovery (`Q = r⁻¹(sR − eG)`), moved here from
+  `lninvoice`, which had implemented them locally because `k256` shipped only
+  Schnorr and ECDSA *verify*. `lninvoice` re-exports them, so its callers are
+  unaffected; the algorithm is unchanged.
+- **`bip340`:** new `taggedHashRuntime`/`taggedHasherRuntime` — the BIP-340
+  tagged hash with a **runtime** tag assembled from parts, for callers whose
+  tag is not comptime-known (BOLT#12's nonce leaf, BIP-341 leaf hashes). The
+  comptime `taggedHash`/`taggedHasher` remain the fast path. New
+  `xonlyBytesOf` (33-byte compressed → 32-byte x-only), also moved out of
+  `lninvoice`.
 - **`minisign`:** new module — sign/verify in the minisign file format over
   Ed25519, both legacy (`Ed`) and prehashed-BLAKE2b (`ED`), including
   scrypt-encrypted secret keys and the trusted-comment global signature.
