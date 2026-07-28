@@ -570,11 +570,17 @@ test "golden interop: every captured error Report classifies to the right typed 
 }
 
 test "golden interop: a truncated or corrupted capture is a typed error, never a panic" {
-    const all = [_][]const u8{
-        &discovery_report,           &md5_authnopriv_response,
-        &sha1_aes_authpriv_response, &sha512_aes_authpriv_response,
+    // Each capture is paired with the protocol that actually signed it, so the
+    // corruption sweep below can verify under the REAL key. Verifying under an
+    // all-zero key would pass even against an accept-anything `verify`.
+    const all = [_]struct { dg: []const u8, auth: ?usm.AuthProtocol }{
+        .{ .dg = &discovery_report, .auth = null }, // noAuthNoPriv: nothing to verify
+        .{ .dg = &md5_authnopriv_response, .auth = .hmac_md5 },
+        .{ .dg = &sha1_aes_authpriv_response, .auth = .hmac_sha1 },
+        .{ .dg = &sha512_aes_authpriv_response, .auth = .hmac_sha512 },
     };
-    for (all) |dg| {
+    for (all) |case| {
+        const dg = case.dg;
         // Every truncation.
         for (0..dg.len) |n| {
             if (v3.decode(dg[0..n])) |m| {
@@ -597,8 +603,17 @@ test "golden interop: a truncated or corrupted capture is a typed error, never a
             mut[i] ^= 0xff;
             if (v3.decode(mut[0..dg.len])) |m| {
                 if (usm.parse(m.security_parameters)) |sp| {
-                    var key: [usm.max_key_len]u8 = @splat(0);
-                    usm.verify(.hmac_sha1, &key, mut[0..dg.len], sp) catch {};
+                    if (case.auth) |proto| {
+                        var key_buf: [usm.max_key_len]u8 = undefined;
+                        const key = try usm.passwordToKey(proto, password, &engine_id, &key_buf);
+                        // Negative control: the whole message is authenticated,
+                        // so NO single-byte corruption may ever authenticate.
+                        // Rejection may be AuthenticationFailed or a typed parse
+                        // error — either way it must not be accepted.
+                        try testing.expect(std.meta.isError(
+                            usm.verify(proto, key, mut[0..dg.len], sp),
+                        ));
+                    }
                 } else |_| {}
             } else |_| {}
         }

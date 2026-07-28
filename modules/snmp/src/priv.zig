@@ -487,15 +487,36 @@ test "the detector is adjacent-only: an A,B,A salt sequence is NOT caught" {
     // IV is remembered, so an older repeat sails through. This is why the
     // counter source — not this check — is what the design rests on.
     const key = [_]u8{ 0xa5, 0x5a } ** 8;
-    var out: [32]u8 = undefined;
-    var src = SaltSource.fixedForInterop([8]u8{ 1, 1, 1, 1, 1, 1, 1, 1 });
-    const a = try encrypt(.des_cbc, &key, 3, 42, &src, "x" ** 16, &out);
-    src.mode = .{ .fixed_for_interop = [8]u8{ 2, 2, 2, 2, 2, 2, 2, 2 } };
-    _ = try encrypt(.des_cbc, &key, 3, 42, &src, "x" ** 16, &out);
-    src.mode = .{ .fixed_for_interop = [8]u8{ 1, 1, 1, 1, 1, 1, 1, 1 } };
-    const c = try encrypt(.des_cbc, &key, 3, 42, &src, "x" ** 16, &out);
-    try testing.expectEqualSlices(u8, &a.salt, &c.salt); // the reuse is real…
-    // …and it was accepted. Adjacent-only detection, exactly as documented.
+    const salt_a = [8]u8{ 1, 1, 1, 1, 1, 1, 1, 1 };
+    const salt_b = [8]u8{ 2, 2, 2, 2, 2, 2, 2, 2 };
+    // Separate buffers: `encrypt` returns a slice INTO `out`, so a shared
+    // buffer would leave `a.ciphertext` and `c.ciphertext` aliased (and
+    // trivially equal) instead of independently produced.
+    var out_a: [32]u8 = undefined;
+    var out_b: [32]u8 = undefined;
+    var out_c: [32]u8 = undefined;
+    var src = SaltSource.fixedForInterop(salt_a);
+    const a = try encrypt(.des_cbc, &key, 3, 42, &src, "x" ** 16, &out_a);
+    src.mode = .{ .fixed_for_interop = salt_b };
+    const b = try encrypt(.des_cbc, &key, 3, 42, &src, "x" ** 16, &out_b);
+    src.mode = .{ .fixed_for_interop = salt_a };
+    // Reaching here at all is the documented behaviour: A,B,A is ACCEPTED.
+    // Were the detector ever widened beyond adjacent-only, this `try` fails.
+    const c = try encrypt(.des_cbc, &key, 3, 42, &src, "x" ** 16, &out_c);
+
+    // Anchor each salt against the pinned literal it was seeded with, rather
+    // than against each other — comparing a.salt to c.salt is constant-vs-
+    // constant and cannot fail even if the salt were reported as garbage.
+    try testing.expectEqualSlices(u8, &salt_a, &a.salt);
+    try testing.expectEqualSlices(u8, &salt_a, &c.salt);
+    // The reuse is real where it matters: same key, same boots/time and the
+    // same salt rebuild the same DES IV, so the ciphertext repeats byte for
+    // byte. This is derived by the cipher, not restated from the input.
+    try testing.expectEqualSlices(u8, a.ciphertext, c.ciphertext);
+    // Negative control: the intervening B salt must NOT collide — proves the
+    // comparison above discriminates rather than always matching.
+    try testing.expectEqualSlices(u8, &salt_b, &b.salt);
+    try testing.expect(!std.mem.eql(u8, a.ciphertext, b.ciphertext));
 }
 
 test "a DES counter source refuses to wrap its 32-bit budget under one boots" {

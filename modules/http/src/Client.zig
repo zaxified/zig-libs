@@ -1519,8 +1519,15 @@ test "setupBody framing decisions on fabricated heads" {
     conn.sr = undefined;
 
     const chunked_head = try h1.ResponseHead.parse("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n");
+    // Control: setupBody must SELECT chunked framing for this head. Without
+    // this call the chunked branch of setupBody is never exercised here — the
+    // body below was hand-built, so the decision under test was skipped.
+    // The reader it installs points at conn.sr (not streamable in this
+    // socket-free fixture), so only the selection is asserted.
+    setupBody(&conn, .get, chunked_head);
+    try testing.expect(conn.body == .chunked);
+    // Re-point at a fixed reader to exercise the decode itself.
     conn.body = .{ .chunked = h1.ChunkedReader.init(&src, conn.body_buf) };
-    _ = chunked_head;
     var out: [64]u8 = undefined;
     var w: std.Io.Writer = .fixed(&out);
     _ = try conn.body.chunked.reader.streamRemaining(&w);

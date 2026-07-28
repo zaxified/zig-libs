@@ -453,7 +453,12 @@ test "Verifier.verifyBody: rotation — old and new secret both accepted, withou
 
     try testing.expect(v.verifyBody(body, new_sig)); // current secret
     try testing.expect(v.verifyBody(body, old_sig)); // rotated-out secret still valid
-    try testing.expect(!v.verifyBody(body, sign("gone-secret", body, &nbuf))); // never configured
+    // `sign` returns a slice INTO its out_buf: signing into `nbuf` here would
+    // clobber `new_sig` and silently defang the tampered-body control below.
+    var gbuf: [64 + 8]u8 = undefined;
+    try testing.expect(!v.verifyBody(body, sign("gone-secret", body, &gbuf))); // never configured
+    // Negative control: a signature valid for `body` must NOT verify against a
+    // different body — proves the MAC covers the body, not just the secret set.
     try testing.expect(!v.verifyBody("event=pull", new_sig)); // tampered body
 }
 
