@@ -902,3 +902,124 @@ test "quoted keys and types round-trip" {
 test "meta is well-formed" {
     try testing.expect(meta.role == .codec);
 }
+
+// ── fuzz: parse never panics; parse -> serialize -> parse is stable ───────
+//
+// `parse` is a config-FILE parser, but the file is not always a trusted
+// local artifact: `uci import`-style flows, config pulled from a management
+// backend, or a device restoring a peer-supplied backup all hand this module
+// bytes it did not write. Two harnesses:
+//
+//  1. Raw arbitrary bytes into `parse` — the "never panic/OOB/hang" bar
+//     every parser here must clear. Mostly rejects at the first keyword
+//     check, which is fine — it is the cheap, mandatory half.
+//  2. A `Package` built directly in memory (bypassing the text grammar
+//     entirely, so every generated instance is well-formed by construction)
+//     is `serialize`d, `parse`d back, and the two models compared with
+//     `Package.eql`, then serialized again and compared byte-for-byte — the
+//     round-trip-stability invariant the module doc comment promises. This
+//     is the half that actually reaches the serializer's bare-vs-quoted
+//     decision and the quote-escaping path, which pure random bytes almost
+//     never do (a `config`/`option` keyword match is already astronomically
+//     unlikely from raw noise).
+
+test "fuzz: parse never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzParse, .{});
+}
+
+fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
+    var buf: [1024]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    var pkg = parse(testing.allocator, buf[0..len]) catch return;
+    pkg.deinit(testing.allocator);
+}
+
+/// Fill `buf` with `smith`-chosen random bytes and return the whole slice —
+/// including bytes below 0x20 (other than `\n`/`\t`/`\r`), which `serialize`
+/// legitimately rejects with `error.UnserializableValue`; the caller is
+/// expected to propagate that as an early, no-bug return.
+fn fuzzToken(smith: *std.testing.Smith, buf: []u8, min_len: usize) []const u8 {
+    smith.bytes(buf);
+    const len: usize = @max(min_len, smith.valueRangeAtMost(u16, 0, @intCast(buf.len)));
+    return buf[0..len];
+}
+
+test "fuzz: parse(serialize(pkg)) round-trips to an equal Package (and reserializes byte-identical)" {
+    try testing.fuzz({}, fuzzRoundTrip, .{});
+}
+
+fn fuzzRoundTrip(_: void, smith: *std.testing.Smith) !void {
+    var pkg_name_buf: [16]u8 = undefined;
+    var type_bufs: [3][8]u8 = undefined;
+    var name_bufs: [3][16]u8 = undefined;
+    var key_bufs: [3][3][8]u8 = undefined;
+    var val_bufs: [3][3][3][16]u8 = undefined;
+    var value_slices: [3][3][3][]const u8 = undefined;
+    var options: [3][3]Option = undefined;
+    var sections: [3]Section = undefined;
+
+    const pkg_name: ?[]const u8 = if (smith.value(bool)) fuzzToken(smith, &pkg_name_buf, 1) else null;
+
+    const n_sections = smith.valueRangeAtMost(u8, 0, 3);
+    for (0..n_sections) |si| {
+        const sec_type = fuzzToken(smith, &type_bufs[si], 1);
+        const has_name = smith.value(bool);
+        // min_len 1, not 0: the parser collapses an explicit empty-quoted
+        // section name to anonymous (`name = null`, see `parseLine`'s
+        // "config" branch) — a hand-built `Section{ .name = "" }` is a shape
+        // `parse` can never itself produce, so it is deliberately excluded
+        // here rather than hitting a spurious round-trip mismatch.
+        const sec_name: ?[]const u8 = if (has_name) fuzzToken(smith, &name_bufs[si], 1) else null;
+
+        const n_opts = smith.valueRangeAtMost(u8, 0, 3);
+        for (0..n_opts) |oi| {
+            const key = fuzzToken(smith, &key_bufs[si][oi], 1);
+            // Force distinct keys within one section: a real parse can never
+            // produce two Option entries sharing a key (repeated `option`
+            // overwrites; `list`/`option` mixed under one key is itself a
+            // parse error, `MixedOptionList`) — an accidental collision here
+            // would build a Package shape the parser structurally cannot
+            // reproduce, and would misreport as a round-trip bug instead of
+            // a harness artifact.
+            key_bufs[si][oi][0] = 'A' + @as(u8, @intCast(oi));
+            const kind: Option.Kind = if (smith.value(bool)) .single else .list;
+            const n_values: usize = if (kind == .single) 1 else smith.valueRangeAtMost(u8, 1, 3);
+            for (0..n_values) |vi| {
+                value_slices[si][oi][vi] = fuzzToken(smith, &val_bufs[si][oi][vi], 0);
+            }
+            options[si][oi] = .{ .key = key, .kind = kind, .values = value_slices[si][oi][0..n_values] };
+        }
+        sections[si] = .{
+            .type = sec_type,
+            .name = sec_name,
+            .anonymous = sec_name == null,
+            .options = options[si][0..n_opts],
+        };
+    }
+
+    const pkg = Package{ .name = pkg_name, .sections = sections[0..n_sections] };
+
+    const gpa = testing.allocator;
+    const s1 = serialize(gpa, &pkg) catch |err| switch (err) {
+        // A generated value containing an unescapable control byte — a
+        // documented rejection, not a round-trip question.
+        error.UnserializableValue, error.OutOfMemory => return,
+    };
+    defer gpa.free(s1);
+
+    var reparsed = parse(gpa, s1) catch |err| {
+        std.debug.print("uci fuzz: serialize()'d text failed to re-parse: {s}\nerror: {t}\n", .{ s1, err });
+        return err;
+    };
+    defer reparsed.deinit(gpa);
+
+    if (!pkg.eql(&reparsed)) {
+        std.debug.print("uci fuzz: round-trip mismatch\ninput text:\n{s}\n", .{s1});
+        return error.RoundTripMismatch;
+    }
+
+    const s2 = try serialize(gpa, &reparsed);
+    defer gpa.free(s2);
+    try testing.expectEqualStrings(s1, s2);
+}

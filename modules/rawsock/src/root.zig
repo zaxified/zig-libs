@@ -696,6 +696,86 @@ test "arp build/parse round-trip (surfaces netaddr.Ip)" {
     try testing.expect(got.ip.eql(.{ .v4 = target_ip }));
 }
 
+// ── fuzz: frame-off-the-wire parsers, never panic ──────────────────────────
+//
+// `EthHeader.parse`, `parseHwaddr` and `arp.parseReply` are the three pure
+// parsers in this module that touch bytes an attacker on the local segment
+// controls directly — a captured frame's link-layer header, operator/config
+// input for a MAC address, and an ARP reply body (classic ARP-spoofing
+// territory). None require a socket, so the harness drives them offline.
+
+test "fuzz: EthHeader.parse never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzEthHeaderParse, .{});
+}
+
+fn fuzzEthHeaderParse(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    if (EthHeader.parse(buf[0..len])) |h| {
+        var out: [eth_hdr_len]u8 = undefined;
+        h.write(&out);
+    }
+}
+
+test "fuzz: parseHwaddr never panics on arbitrary text" {
+    try testing.fuzz({}, fuzzParseHwaddr, .{});
+}
+
+fn fuzzParseHwaddr(_: void, smith: *std.testing.Smith) !void {
+    // Two shapes: raw random bytes (exercises the length/separator gate),
+    // and a structurally-correct "xx:xx:xx:xx:xx:xx" skeleton with random
+    // hex digits, separator and case — this is the only way to reach the
+    // per-octet `charToDigit` calls instead of bailing out at the length or
+    // separator check on the first try.
+    if (smith.value(bool)) {
+        var buf: [64]u8 = undefined;
+        smith.bytes(&buf);
+        const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+        _ = parseHwaddr(buf[0..len]);
+    } else {
+        const sep: u8 = if (smith.value(bool)) ':' else '-';
+        var text: [hwaddr_text_len]u8 = undefined;
+        const hex_digits = "0123456789abcdefABCDEFxyz "; // last three: deliberately invalid
+        for (0..hwaddr_len) |i| {
+            text[i * 3] = hex_digits[smith.index(hex_digits.len)];
+            text[i * 3 + 1] = hex_digits[smith.index(hex_digits.len)];
+            if (i != hwaddr_len - 1) text[i * 3 + 2] = sep;
+        }
+        _ = parseHwaddr(&text);
+    }
+}
+
+test "fuzz: arp.parseReply never panics on arbitrary or structurally ARP-shaped frames" {
+    try testing.fuzz({}, fuzzArpParseReply, .{});
+}
+
+fn fuzzArpParseReply(_: void, smith: *std.testing.Smith) !void {
+    var buf: [128]u8 = undefined;
+
+    // Half the time: raw random bytes at random length (the length/ethertype
+    // gate). The other half: start from a real ARP reply frame and mutate
+    // random bytes — gets past the ethertype/oper checks so the sender
+    // IP/MAC extraction actually runs on hostile data.
+    if (smith.value(bool)) {
+        smith.bytes(&buf);
+        const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+        _ = arp.parseReply(buf[0..len]);
+    } else {
+        var reply = arp.buildRequest(
+            .{ 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff },
+            .{ 192, 0, 2, 1 },
+            .{ 192, 0, 2, 2 },
+        );
+        std.mem.writeInt(u16, reply[20..22], 0x0002, .big); // oper = reply
+        const n_mutations = smith.valueRangeAtMost(u8, 0, 6);
+        for (0..n_mutations) |_| {
+            reply[smith.index(reply.len)] = smith.value(u8);
+        }
+        _ = arp.parseReply(&reply);
+    }
+}
+
 // ── tests: socket path (gated on CAP_NET_RAW / a netns) ───────────────────────
 //
 // These need CAP_NET_RAW. Run them under an unprivileged network namespace:

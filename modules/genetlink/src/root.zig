@@ -492,6 +492,72 @@ fn buildMcastGroupsAttrs(
     codec.nestEnd(list, outer);
 }
 
+// ── fuzz: genlmsghdr split + nlctrl attribute walk, never panic ────────────
+//
+// `splitPayload` and `findMcastGroupId` are the two byte-parsers this module
+// runs directly against a kernel reply's payload before any interpretation —
+// a genl reply is as untrusted as any other netlink datagram (a compromised
+// or buggy kernel module, a malicious network namespace peer with
+// CAP_NET_ADMIN, or simply a future kernel that reshapes the nlctrl wire
+// format). `splitPayload` itself is a single length check, so the harness
+// also drives `findMcastGroupId`'s nested-nest TLV walk (outer
+// CTRL_ATTR_MCAST_GROUPS -> per-group nest -> NAME/ID) — the deeper,
+// actually-interesting parser reachable from `splitPayload`'s output.
+
+test "fuzz: splitPayload never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzSplitPayload, .{});
+}
+
+fn fuzzSplitPayload(_: void, smith: *std.testing.Smith) !void {
+    var buf: [64]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    _ = splitPayload(buf[0..len]) catch {};
+}
+
+test "fuzz: findMcastGroupId never panics on arbitrary or structurally-nested attribute bytes" {
+    try testing.fuzz({}, fuzzFindMcastGroupId, .{});
+}
+
+fn fuzzFindMcastGroupId(_: void, smith: *std.testing.Smith) !void {
+    var buf: [512]u8 = undefined;
+
+    // Half the time: raw random bytes (the outer AttrIterator walk itself).
+    // The other half: a structurally valid CTRL_ATTR_MCAST_GROUPS nest of
+    // valid group sub-nests wrapping RANDOM name/id attribute bytes, so the
+    // fuzzer reaches the inner nest walk and the name-comparison branch
+    // instead of bailing out at the first `Truncated`/`BadLength`.
+    const len: usize = if (smith.value(bool)) blk: {
+        smith.bytes(&buf);
+        break :blk smith.valueRangeAtMost(u16, 0, buf.len);
+    } else blk: {
+        var list: std.ArrayList(u8) = .empty;
+        defer list.deinit(testing.allocator);
+        const outer = codec.nestBegin(testing.allocator, &list, CTRL_ATTR_MCAST_GROUPS) catch return;
+        const n_groups = smith.valueRangeAtMost(u8, 0, 4);
+        for (0..n_groups) |i| {
+            const inner = codec.nestBegin(testing.allocator, &list, @intCast(i + 1)) catch return;
+            if (smith.value(bool)) {
+                codec.appendAttrU32(testing.allocator, &list, CTRL_ATTR_MCAST_GRP_ID, smith.value(u32)) catch return;
+            }
+            var name_buf: [16]u8 = undefined;
+            smith.bytes(&name_buf);
+            const name_len: usize = smith.valueRangeAtMost(u8, 0, name_buf.len);
+            codec.appendAttrString(testing.allocator, &list, CTRL_ATTR_MCAST_GRP_NAME, name_buf[0..name_len]) catch return;
+            codec.nestEnd(&list, inner);
+        }
+        codec.nestEnd(&list, outer);
+        if (list.items.len > buf.len) return;
+        @memcpy(buf[0..list.items.len], list.items);
+        break :blk list.items.len;
+    };
+
+    var want_buf: [16]u8 = undefined;
+    smith.bytes(&want_buf);
+    const want_len: usize = smith.valueRangeAtMost(u8, 0, want_buf.len);
+    _ = findMcastGroupId(buf[0..len], want_buf[0..want_len]) catch {};
+}
+
 test "findMcastGroupId picks the named group out of CTRL_ATTR_MCAST_GROUPS" {
     var list: std.ArrayList(u8) = .empty;
     defer list.deinit(testing.allocator);

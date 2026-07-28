@@ -150,3 +150,30 @@ pub fn ecdsaVerify(pubkey_sec1: []const u8, msg: []const u8, sig_rs: [64]u8) boo
     const v = reduceToScalar(R.affineCoordinates().x.toBytes(.big));
     return v.equivalent(r);
 }
+
+// ── fuzz: bip340Verify never panics on arbitrary signature/pubkey bytes ──
+//
+// `bip340Verify` is a Schnorr *verifier* — by construction it runs on data
+// an adversary controls end to end (a forged Taproot spend, a malicious
+// relay's signature). It touches three independent byte-loaders in
+// sequence (`Fe.fromBytes` on the x-only pubkey, `Fe.fromBytes` on `r`,
+// `Scalar.fromBytes` on `s`) before ever doing curve arithmetic, and must
+// return `false` — never panic, never accept — for anything that fails any
+// of them. `msg` is also fuzzed independently since it participates in the
+// challenge hash.
+
+test "fuzz: bip340Verify never panics on arbitrary bytes" {
+    try std.testing.fuzz({}, fuzzBip340Verify, .{});
+}
+
+fn fuzzBip340Verify(_: void, smith: *std.testing.Smith) !void {
+    var pubkey: [32]u8 = undefined;
+    smith.bytes(&pubkey);
+    var sig: [64]u8 = undefined;
+    smith.bytes(&sig);
+    var msg_buf: [96]u8 = undefined;
+    smith.bytes(&msg_buf);
+    const msg_len: usize = smith.valueRangeAtMost(u8, 0, msg_buf.len);
+
+    _ = bip340Verify(pubkey, msg_buf[0..msg_len], sig);
+}

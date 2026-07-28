@@ -538,3 +538,51 @@ test "DHKEM P-256 AuthEncap/AuthDecap: self-consistency round trip" {
     const dec_wrong = try P256Kem.authDecap(got.enc, skR, wrong.public_key);
     try testing.expect(!std.mem.eql(u8, &got.shared_secret, &dec_wrong));
 }
+
+// ── fuzz: P256Kem.decap/authDecap never panic on arbitrary enc/pkS bytes ──
+//
+// `enc` (the sender's ephemeral public key) and, for auth mode, `pkS` are
+// exactly the two DHKEM inputs a REMOTE PEER supplies on the wire — decap
+// runs on them before any authentication has happened (there is no MAC or
+// signature over the KEM ciphertext itself; the AEAD that follows is the
+// only integrity check, and it authenticates the wrong thing to catch a
+// malformed `enc`). Both are SEC1-encoded points (`P256.fromSec1`), so the
+// harness biases the tag byte the same way `p256`'s own `fromSec1` fuzzer
+// does. (X25519Kem's `enc`/`pkS` are raw 32-byte strings with no rejecting
+// decode step at all — every bitstring is a valid input — so there is no
+// analogous parser to fuzz there.)
+
+test "fuzz: P256Kem.decap never panics on arbitrary enc bytes" {
+    try testing.fuzz({}, fuzzP256Decap, .{});
+}
+
+fn fuzzedSec1Bytes(smith: *std.testing.Smith, buf: *[P256Kem.Npk]u8) void {
+    smith.bytes(buf);
+    buf[0] = switch (smith.valueRangeAtMost(u8, 0, 4)) {
+        0 => 0,
+        1 => 2,
+        2 => 3,
+        3 => 4,
+        else => smith.value(u8),
+    };
+}
+
+fn fuzzP256Decap(_: void, smith: *std.testing.Smith) !void {
+    const skR = P256Kem.deriveKeyPair("hpke fuzz decap receiver");
+    var enc: P256Kem.EncappedKey = undefined;
+    fuzzedSec1Bytes(smith, &enc);
+    _ = P256Kem.decap(enc, skR) catch {};
+}
+
+test "fuzz: P256Kem.authDecap never panics on arbitrary enc/pkS bytes" {
+    try testing.fuzz({}, fuzzP256AuthDecap, .{});
+}
+
+fn fuzzP256AuthDecap(_: void, smith: *std.testing.Smith) !void {
+    const skR = P256Kem.deriveKeyPair("hpke fuzz auth-decap receiver");
+    var enc: P256Kem.EncappedKey = undefined;
+    fuzzedSec1Bytes(smith, &enc);
+    var pkS: P256Kem.PublicKey = undefined;
+    fuzzedSec1Bytes(smith, &pkS);
+    _ = P256Kem.authDecap(enc, skR, pkS) catch {};
+}

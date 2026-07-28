@@ -304,6 +304,71 @@ test "encode: BufferTooSmall on an undersized destination" {
     try testing.expectError(error.BufferTooSmall, nst.encode(&tiny));
 }
 
+// ── fuzz: NewSessionTicket.decode never panics on arbitrary bytes ─────────
+//
+// `decode` is the client-side parser for a handshake message the SERVER
+// sends — a malicious or compromised server (or an on-path attacker on an
+// unauthenticated transport, before the handshake completes) fully controls
+// these bytes. Structured half of the harness: the fixed-width fields
+// (lifetime/age_add/nonce_len/ticket_len/ext_total_len) are exactly the
+// length-prefixed shape that rejects on the first check when purely random —
+// this half assembles a wire-shaped message with the right field ORDER but
+// random values/lengths (including ones that overrun the buffer), so the
+// per-field bounds checks and the extension-nest loop actually run.
+
+test "fuzz: NewSessionTicket.decode never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzTicketDecode, .{});
+}
+
+fn fuzzTicketDecode(_: void, smith: *std.testing.Smith) !void {
+    var ext_buf: [8]Extension = undefined;
+
+    if (smith.value(bool)) {
+        var buf: [512]u8 = undefined;
+        smith.bytes(&buf);
+        const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+        _ = NewSessionTicket.decode(buf[0..len], &ext_buf) catch {};
+        return;
+    }
+
+    var buf: [512]u8 = undefined;
+    var w: usize = 0;
+    std.mem.writeInt(u32, buf[w..][0..4], smith.value(u32), .big);
+    w += 4;
+    std.mem.writeInt(u32, buf[w..][0..4], smith.value(u32), .big);
+    w += 4;
+    // nonce_len: bias toward small values (in range) but allow the full u8
+    // domain (including ones that overrun the remaining buffer).
+    const nonce_len = smith.value(u8);
+    buf[w] = nonce_len;
+    w += 1;
+    if (w + nonce_len > buf.len) return;
+    smith.bytes(buf[w..][0..nonce_len]);
+    w += nonce_len;
+
+    const ticket_len = smith.value(u16);
+    if (w + 2 + @as(usize, ticket_len) > buf.len) return;
+    std.mem.writeInt(u16, buf[w..][0..2], ticket_len, .big);
+    w += 2;
+    smith.bytes(buf[w..][0..ticket_len]);
+    w += ticket_len;
+
+    const ext_total_len = smith.value(u16);
+    if (w + 2 + @as(usize, ext_total_len) > buf.len) return;
+    std.mem.writeInt(u16, buf[w..][0..2], ext_total_len, .big);
+    w += 2;
+    smith.bytes(buf[w..][0..ext_total_len]); // arbitrary extension bytes
+    w += ext_total_len;
+
+    // Occasionally append trailing garbage (must be rejected, not ignored).
+    if (smith.value(bool) and w < buf.len) {
+        buf[w] = smith.value(u8);
+        w += 1;
+    }
+
+    _ = NewSessionTicket.decode(buf[0..w], &ext_buf) catch {};
+}
+
 test "maxEarlyDataSize: null when no early_data extension is present" {
     const nst = NewSessionTicket{
         .ticket_lifetime = 1,

@@ -357,6 +357,62 @@ test "verify: tampered body / wrong secret / malformed all rejected (constant-ti
     try testing.expect(!verify(secret, body, tampered[0..value.len]));
 }
 
+// ── fuzz: verify (presentedMac decode) never panics on arbitrary input ────
+//
+// `verify`/`verifyWithPrefix` run on the `X-Signature-256` request header —
+// an attacker fully controls `presented` (and, for the request-signing use
+// case, `body` too). `presentedMac` is the byte-parser underneath: strip a
+// prefix, then hex-decode a fixed-width tail. Structured half: builds a
+// value shaped like `sha256=<64 hex chars>` (the exact length gate
+// `presentedMac` requires to reach `hexToBytes`) with random hex/non-hex
+// characters and surrounding whitespace, so the hex-decode path — not just
+// the length/prefix check — actually runs.
+
+test "fuzz: verify never panics on arbitrary secret/body/presented" {
+    try testing.fuzz({}, fuzzVerify, .{});
+}
+
+fn fuzzVerify(_: void, smith: *std.testing.Smith) !void {
+    var secret_buf: [32]u8 = undefined;
+    smith.bytes(&secret_buf);
+    const secret_len: usize = smith.valueRangeAtMost(u8, 1, secret_buf.len); // Verifier requires nonempty; verify() itself has no such requirement but exercising both is fine
+    const secret = secret_buf[0..secret_len];
+
+    var body_buf: [64]u8 = undefined;
+    smith.bytes(&body_buf);
+    const body_len: usize = smith.valueRangeAtMost(u8, 0, body_buf.len);
+    const body = body_buf[0..body_len];
+
+    var presented_buf: [96]u8 = undefined;
+    const presented: []const u8 = if (smith.value(bool)) blk: {
+        // Raw random bytes at random length — the cheap length/prefix gate.
+        smith.bytes(&presented_buf);
+        const len: usize = smith.valueRangeAtMost(u8, 0, presented_buf.len);
+        break :blk presented_buf[0..len];
+    } else blk: {
+        // "sha256=" (or a random same-length prefix) + 64 mostly-hex chars,
+        // optionally padded with tabs/spaces (which presentedMac trims) —
+        // gets past the length gate into hexToBytes.
+        var w: usize = 0;
+        if (smith.value(bool)) {
+            presented_buf[0..7].* = "sha256=".*;
+            w = 7;
+        } else {
+            smith.bytes(presented_buf[0..7]);
+            w = 7;
+        }
+        const hex_alphabet = "0123456789abcdefABCDEF ghij"; // last 5: deliberately non-hex
+        for (0..signature_hex_len) |_| {
+            presented_buf[w] = hex_alphabet[smith.index(hex_alphabet.len)];
+            w += 1;
+        }
+        break :blk presented_buf[0..w];
+    };
+
+    _ = verify(secret, body, presented);
+    _ = verifyWithPrefix("sha256=", secret, body, presented);
+}
+
 test "computeHex is lowercase hex and matches the GitHub HMAC-SHA256 test vector shape" {
     // Known RFC-style vector: HMAC-SHA256(key="key", msg="The quick brown
     // fox jumps over the lazy dog") = f7bc83f430538424b13298e6aa6fb143

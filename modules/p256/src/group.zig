@@ -779,3 +779,35 @@ test "SEC1 round-trip (compressed + uncompressed) matches std" {
         try eqAffine(back, sp);
     }
 }
+
+// ── fuzz: fromSec1 never panics on arbitrary attacker-supplied encodings ──
+//
+// `fromSec1` is the entry point for every externally-supplied P-256 point
+// this repo's protocols decode (TLS key shares, JWK/COSE keys, HPKE's
+// P-256 DHKEM `enc`/public keys, X.509 SubjectPublicKeyInfo) — the tag byte
+// selects three structurally different decode paths (identity / compressed
+// / uncompressed), so the harness biases toward each valid tag with random
+// payload bytes, plus fully random bytes for the tag-rejection path.
+
+test "fuzz: fromSec1 never panics on arbitrary bytes" {
+    try std.testing.fuzz({}, fuzzFromSec1, .{});
+}
+
+fn fuzzFromSec1(_: void, smith: *std.testing.Smith) !void {
+    var buf: [65]u8 = undefined;
+    smith.bytes(&buf);
+    const tag: u8 = switch (smith.valueRangeAtMost(u8, 0, 4)) {
+        0 => 0,
+        1 => 2,
+        2 => 3,
+        3 => 4,
+        else => smith.value(u8), // fully arbitrary, including invalid tags
+    };
+    buf[0] = tag;
+    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    if (len == 0) {
+        _ = P256.fromSec1(&.{}) catch return;
+        return;
+    }
+    _ = P256.fromSec1(buf[0..len]) catch {};
+}

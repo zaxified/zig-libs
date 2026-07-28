@@ -166,6 +166,41 @@ fn firstByteMask(form: HeaderForm) u8 {
 
 const testing = std.testing;
 
+// ── fuzz: `remove` (receive-side header unprotection), never panic ────────
+//
+// `remove` is the very first thing this repo's QUIC stack would do to a
+// packet off the wire — BEFORE the AEAD tag is checked (packet protection
+// removal, §5.3, comes after header protection removal, §5.4). Every byte
+// `remove` touches (`packet`, `pn_offset`) is attacker-controlled at that
+// point: `pn_offset` is derived from the long/short header's own
+// (also-unauthenticated) connection-ID length field. The self-discovered
+// `pn_len` (read from the packet's own first byte AFTER this function
+// unmasks it) is exactly the kind of "attacker picks the field width" input
+// this harness is built to reach — a fixed `pn_offset` alone would only ever
+// exercise 4 of the 4 possible `pn_len` values by luck; here `pn_offset` is
+// fuzzed too so short/zero-length PN windows and windows that hang off the
+// end of `packet` are both hit deliberately.
+
+test "fuzz: remove never panics on arbitrary packet bytes / offsets / masks" {
+    try testing.fuzz({}, fuzzRemove, .{});
+}
+
+fn fuzzRemove(_: void, smith: *std.testing.Smith) !void {
+    var packet: [64]u8 = undefined;
+    smith.bytes(&packet);
+    const len: usize = smith.valueRangeAtMost(u8, 0, packet.len);
+
+    const form: HeaderForm = if (smith.value(bool)) .long else .short;
+    // pn_offset is deliberately allowed to range past packet.len (an
+    // attacker-controlled connection-ID length field can claim anything).
+    const pn_offset: usize = smith.valueRangeAtMost(u16, 0, packet.len + 8);
+
+    var mask: Mask = undefined;
+    smith.bytes(&mask);
+
+    _ = remove(packet[0..len], form, pn_offset, mask) catch {};
+}
+
 fn hexTo(comptime n: usize, s: []const u8) [n]u8 {
     var out: [n]u8 = undefined;
     _ = std.fmt.hexToBytes(&out, s) catch unreachable;

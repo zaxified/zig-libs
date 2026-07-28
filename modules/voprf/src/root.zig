@@ -787,3 +787,38 @@ test "deserializeScalar enforces canonicity" {
     try std.testing.expectError(error.InvalidScalar, deserializeScalar([_]u8{0xff} ** 32));
     _ = try deserializeScalar([_]u8{0} ** 32); // zero is canonical (validity is contextual)
 }
+
+// ── fuzz: Element.fromBytes / Proof.fromBytes never panic ─────────────────
+//
+// Both are wire-decode entry points for values a peer sends over the OPRF/
+// POPRF protocol — a `BlindedElement`/`EvaluationElement` (`Element`) and a
+// verifiable-mode `Proof` (`c||s`). `Element.fromBytes` composes ristretto255
+// decode + identity-rejection; `Proof.fromBytes` decodes two independent
+// scalars. Random 32/64-byte strings are the natural fuzz shape here (no
+// length-prefix/tag structure to get past — every byte is part of the fixed-
+// width encoding), plus the identity/all-0xff edge cases already unit-tested
+// above are folded in via biased byte fills.
+
+test "fuzz: Element.fromBytes never panics on arbitrary bytes" {
+    try std.testing.fuzz({}, fuzzElementFromBytes, .{});
+}
+
+fn fuzzElementFromBytes(_: void, smith: *std.testing.Smith) !void {
+    var buf: [Ne]u8 = undefined;
+    switch (smith.valueRangeAtMost(u8, 0, 2)) {
+        0 => @memset(&buf, 0), // canonical identity encoding
+        1 => @memset(&buf, 0xff), // non-canonical junk
+        else => smith.bytes(&buf),
+    }
+    _ = Element.fromBytes(buf) catch {};
+}
+
+test "fuzz: Proof.fromBytes never panics on arbitrary bytes" {
+    try std.testing.fuzz({}, fuzzProofFromBytes, .{});
+}
+
+fn fuzzProofFromBytes(_: void, smith: *std.testing.Smith) !void {
+    var buf: [Proof.encoded_length]u8 = undefined;
+    smith.bytes(&buf);
+    _ = Proof.fromBytes(buf) catch {};
+}

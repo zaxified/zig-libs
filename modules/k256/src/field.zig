@@ -402,3 +402,29 @@ test "algebraic identities: a·a⁻¹ = 1, a − a = 0, (a·b) = (b·a)" {
         try std.testing.expect(a.k.mul(b.k).equivalent(b.k.mul(a.k)));
     }
 }
+
+// ── fuzz: Fe.fromBytes never panics on arbitrary attacker-supplied bytes ──
+//
+// `Fe.fromBytes` is the field-element byte-loader every point/scalar
+// decoder above it (SEC1 in `group.zig`, x-only pubkeys and `r` in
+// `sign.zig`'s `bip340Verify`) ultimately calls — a 32-byte string is
+// attacker-controlled wherever a public key, signature component or Bitcoin
+// script value crosses the wire. `rejectNonCanonical` (>= p) is the only
+// rejection this loader has, so the harness biases toward the boundary
+// (values at/near `p`) as well as fully random 32-byte strings.
+
+test "fuzz: Fe.fromBytes never panics on arbitrary bytes" {
+    try std.testing.fuzz({}, fuzzFeFromBytes, .{});
+}
+
+fn fuzzFeFromBytes(_: void, smith: *std.testing.Smith) !void {
+    var s: [Fe.encoded_length]u8 = undefined;
+    smith.bytes(&s);
+    if (smith.value(bool)) {
+        // Bias toward the p / p-1 / p+1 boundary in big-endian form.
+        s = std.mem.toBytes(std.mem.nativeToBig(u256, field_order));
+        if (smith.value(bool)) s[Fe.encoded_length - 1] +%= if (smith.value(bool)) 1 else 0xff;
+    }
+    const endian: std.builtin.Endian = if (smith.value(bool)) .big else .little;
+    _ = Fe.fromBytes(s, endian) catch {};
+}

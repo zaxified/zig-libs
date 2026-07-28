@@ -748,3 +748,34 @@ test "recoverY / lift_x matches std" {
         }
     }
 }
+
+// ── fuzz: fromSec1 never panics on arbitrary attacker-supplied encodings ──
+//
+// The SEC1 point decoder underneath `ecdsaVerify`'s `pubkey_sec1` and every
+// Bitcoin/secp256k1 public-key input this repo will ever parse. Same shape
+// as `p256`'s equivalent harness: bias the tag byte toward each of the three
+// valid encodings (identity/compressed/uncompressed) plus fully random
+// bytes for the invalid-tag/short-input path.
+
+test "fuzz: fromSec1 never panics on arbitrary bytes" {
+    try std.testing.fuzz({}, fuzzFromSec1, .{});
+}
+
+fn fuzzFromSec1(_: void, smith: *std.testing.Smith) !void {
+    var buf: [65]u8 = undefined;
+    smith.bytes(&buf);
+    const tag: u8 = switch (smith.valueRangeAtMost(u8, 0, 4)) {
+        0 => 0,
+        1 => 2,
+        2 => 3,
+        3 => 4,
+        else => smith.value(u8),
+    };
+    buf[0] = tag;
+    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    if (len == 0) {
+        _ = Secp256k1.fromSec1(&.{}) catch return;
+        return;
+    }
+    _ = Secp256k1.fromSec1(buf[0..len]) catch {};
+}

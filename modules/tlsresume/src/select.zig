@@ -277,6 +277,54 @@ test "SessionState: truncated input is a typed Malformed error" {
     try testing.expectError(error.Malformed, S.parse(&[_]u8{0} ** 10));
 }
 
+// ── fuzz: SessionState.parse never panics on arbitrary bytes ──────────────
+//
+// `SessionState(rms_len).parse` decodes the canonical plaintext prefix this
+// module writes INSIDE a STEK-sealed ticket. In the real `selectPsk` path it
+// only ever runs on bytes that already passed AEAD authentication — but the
+// function is exported and pure, taking a raw byte slice with a
+// length-prefixed field (`ticket_nonce`) in the middle, so it is fuzzed
+// directly rather than relying on that call-site invariant holding forever
+// (a future caller, or a different ring implementation with a weaker
+// integrity story, could feed it un-authenticated bytes). Structured half:
+// a real `serialize`d record with the nonce length byte independently
+// mutated, to drive the "nonce runs past the buffer" bounds check specifically.
+
+test "fuzz: SessionState(32).parse never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzSessionStateParse, .{});
+}
+
+fn fuzzSessionStateParse(_: void, smith: *std.testing.Smith) !void {
+    const S = SessionState(32);
+    var buf: [128]u8 = undefined;
+
+    if (smith.value(bool)) {
+        smith.bytes(&buf);
+        const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+        _ = S.parse(buf[0..len]) catch {};
+        return;
+    }
+
+    var nonce: [8]u8 = undefined;
+    smith.bytes(&nonce);
+    const nonce_len: usize = smith.valueRangeAtMost(u8, 0, nonce.len);
+    const s = S{
+        .resumption_master_secret = [_]u8{0xAB} ** 32,
+        .ticket_nonce = nonce[0..nonce_len],
+        .issued_at_ms = smith.value(i64),
+        .ticket_age_add = smith.value(u32),
+    };
+    const wire = s.serialize(&buf) catch return;
+    // Independently mutate the nonce-length byte (index 32) so the parser
+    // sees a claimed length that disagrees with what actually follows it —
+    // exactly the shape the bounds check at `bytes.len < r + nonce_len + 8 + 4`
+    // exists to catch.
+    var mutated: [128]u8 = undefined;
+    @memcpy(mutated[0..wire.len], wire);
+    if (smith.value(bool)) mutated[32] = smith.value(u8);
+    _ = S.parse(mutated[0..wire.len]) catch {};
+}
+
 const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const Sha256 = std.crypto.hash.sha2.Sha256;

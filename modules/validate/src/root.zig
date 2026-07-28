@@ -3026,3 +3026,123 @@ test "integration: 400 on invalid body/query over a real socket; valid body reac
         try testing.expect(probe.invoked);
     }
 }
+
+// ── fuzz: validateJson / validateFormat never panic on arbitrary input ────
+//
+// This module is the edge gate for request bodies/query/path params — every
+// byte `validateJson` sees is an untrusted client-supplied body, and every
+// string `validateFormat` checks is a client-supplied field value (email/
+// URI/UUID/hostname/date/…). Two harnesses:
+//
+//  1. `validateJson` against a FIXED schema that exercises string/int/array/
+//     object/format/pattern/nested-object/nested-array rules all at once —
+//     the schema stays constant so only the body varies, and the body is
+//     either raw random bytes (rejects at `json_invalid`, the cheap half) or
+//     built from a small set of JSON skeletons whose shape matches the
+//     schema (object with the right keys) but whose values are randomized —
+//     this is what actually reaches the per-kind/format/pattern/nested
+//     validators instead of bailing out at the parse step.
+//  2. `validateFormat` over every `Format` value with both raw random
+//     strings and near-miss structured strings (containing the separators
+//     each format's validator looks for: `@`, `.`, `:`, `-`), so the deeper
+//     per-character validators in each format run, not just the trivial
+//     empty/too-long rejections.
+
+const fuzz_schema = [_]Rule{
+    .{ .field = "name", .kind = .string, .required = true, .min_len = 1, .max_len = 32 },
+    .{ .field = "age", .kind = .int, .min = 0, .max = 150 },
+    .{ .field = "email", .kind = .string, .format = .email },
+    .{ .field = "code", .kind = .string, .pattern = .{ .prefix = "ID-" } },
+    .{ .field = "tags", .kind = .array, .min_len = 0, .max_len = 5, .items = &.{ .field = "", .kind = .string } },
+    .{ .field = "meta", .kind = .object, .fields = &.{
+        .{ .field = "id", .kind = .int, .required = true },
+        .{ .field = "active", .kind = .bool },
+    } },
+};
+
+test "fuzz: validateJson never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzValidateJson, .{});
+}
+
+fn fuzzValidateJson(_: void, smith: *std.testing.Smith) !void {
+    var buf: [512]u8 = undefined;
+
+    const body: []const u8 = if (smith.value(bool)) blk: {
+        smith.bytes(&buf);
+        const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+        break :blk buf[0..len];
+    } else blk: {
+        // Shape-matching skeleton: an object with (some of) the schema's
+        // keys, random-typed values, so the fuzzer reaches the field-level
+        // validators (type gate, format, pattern, min_len/max_len, nested
+        // object/array) instead of json_invalid.
+        var w: std.Io.Writer = .fixed(&buf);
+        w.writeByte('{') catch return;
+        const fields = [_][]const u8{ "name", "age", "email", "code", "tags", "meta" };
+        var first = true;
+        for (fields) |f| {
+            if (!smith.value(bool)) continue;
+            if (!first) w.writeByte(',') catch return;
+            first = false;
+            w.print("\"{s}\":", .{f}) catch return;
+            switch (smith.valueRangeAtMost(u8, 0, 5)) {
+                0 => w.print("{d}", .{smith.value(i32)}) catch return,
+                1 => {
+                    var s: [24]u8 = undefined;
+                    smith.bytes(&s);
+                    const n: usize = smith.valueRangeAtMost(u8, 0, s.len);
+                    w.writeByte('"') catch return;
+                    for (s[0..n]) |c| {
+                        // Keep it valid-ish JSON string content (skip the
+                        // two bytes that would need escaping); this is a
+                        // shape generator, not a JSON-string fuzzer.
+                        if (c == '"' or c == '\\') continue;
+                        w.writeByte(c) catch return;
+                    }
+                    w.writeByte('"') catch return;
+                },
+                2 => w.writeAll(if (smith.value(bool)) "true" else "false") catch return,
+                3 => w.writeAll("null") catch return,
+                4 => {
+                    w.writeByte('[') catch return;
+                    const n_items = smith.valueRangeAtMost(u8, 0, 4);
+                    for (0..n_items) |i| {
+                        if (i != 0) w.writeByte(',') catch return;
+                        w.print("\"t{d}\"", .{smith.value(u8)}) catch return;
+                    }
+                    w.writeByte(']') catch return;
+                },
+                else => w.writeAll("{\"id\":1,\"active\":true}") catch return,
+            }
+        }
+        w.writeByte('}') catch return;
+        break :blk w.buffered();
+    };
+
+    var r = validateJson(testing.allocator, body, &fuzz_schema) catch return;
+    defer r.deinit();
+}
+
+test "fuzz: validateFormat never panics on any Format + arbitrary/near-miss strings" {
+    try testing.fuzz({}, fuzzValidateFormat, .{});
+}
+
+fn fuzzValidateFormat(_: void, smith: *std.testing.Smith) !void {
+    const format = smith.value(Format);
+    var buf: [128]u8 = undefined;
+
+    if (smith.value(bool)) {
+        smith.bytes(&buf);
+        const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+        _ = validateFormat(format, buf[0..len]);
+        return;
+    }
+
+    // Near-miss: a random string built from an alphabet that includes the
+    // separators each format's grammar hinges on, so the deeper per-
+    // character walk (not just a length/emptiness bail-out) actually runs.
+    const alphabet = "abcAZ09@.:-_[]%/T+ \t";
+    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    for (0..len) |i| buf[i] = alphabet[smith.index(alphabet.len)];
+    _ = validateFormat(format, buf[0..len]);
+}

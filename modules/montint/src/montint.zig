@@ -587,3 +587,46 @@ test "public byte loaders instantiate and round-trip (regression: Modint.Error a
     // A value >= m is non-canonical.
     try std.testing.expectError(error.NonCanonical, modulus.elementFromBytesBE(&m_be));
 }
+
+// ── fuzz: the byte loaders never panic on arbitrary bytes ─────────────────
+//
+// `fromBytesBE` builds a modulus straight from a caller-supplied big-endian
+// byte string (an RSA/Paillier N, a VDF group order — every real caller
+// sources this from a certificate, a config file, or a peer, none of them
+// trusted to hand back a well-formed odd modulus). `elementFromBytesBE`
+// reduces an arbitrary byte string against an already-validated modulus
+// (an operand read off the wire). Both were the exact functions the
+// regression test above pins as "never previously exercised at all" (the
+// missing `Self.Error` alias compiled-error was latent precisely because
+// nothing called them) — the natural next gap being no adversarial-input
+// coverage either.
+
+test "fuzz: fromBytesBE never panics on arbitrary bytes" {
+    try std.testing.fuzz({}, fuzzFromBytesBE, .{});
+}
+
+fn fuzzFromBytesBE(_: void, smith: *std.testing.Smith) !void {
+    const M = Modint(256);
+    var buf: [48]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    _ = M.fromBytesBE(buf[0..len]) catch {};
+}
+
+test "fuzz: elementFromBytesBE never panics on arbitrary bytes" {
+    try std.testing.fuzz({}, fuzzElementFromBytesBE, .{});
+}
+
+fn fuzzElementFromBytesBE(_: void, smith: *std.testing.Smith) !void {
+    const M = Modint(256);
+    // A fixed, already-validated modulus — the byte loader under test is
+    // `elementFromBytesBE`, not modulus construction (covered separately
+    // above); the two must not be conflated in one harness.
+    const m_be = [_]u8{ 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 };
+    const modulus = M.fromBytesBE(&m_be) catch unreachable;
+
+    var buf: [48]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    _ = modulus.elementFromBytesBE(buf[0..len]) catch {};
+}
