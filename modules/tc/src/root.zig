@@ -470,7 +470,17 @@ pub const Socket = struct {
                         .overrun => return error.SystemResources,
                         .malformed => return error.MalformedReply,
                         .record => |rec| {
-                            if (rec.type != RTM_NEWACTION) continue;
+                            // The kernel's action *dump* path (tc_dump_action)
+                            // echoes the request's nlmsg_type, so these records
+                            // arrive as RTM_GETACTION — unlike the single-object
+                            // GET path (tca_get_fill), which is handed
+                            // RTM_NEWACTION as its event and does emit that.
+                            // Accepting only RTM_NEWACTION here silently dropped
+                            // every dumped action and returned an empty table:
+                            // no error, no short read, just nothing. Both types
+                            // are accepted so the reader does not depend on
+                            // which of the two the running kernel echoes.
+                            if (rec.type != RTM_GETACTION and rec.type != RTM_NEWACTION) continue;
                             // One RTM_NEWACTION carries the whole table slice,
                             // so the messages are flattened into one list.
                             var acts = (action.actionsOf(rec.payload) catch
@@ -509,7 +519,13 @@ pub const Socket = struct {
                     codec.NLMSG_DONE => return null,
                     codec.NLMSG_NOOP => {},
                     codec.NLMSG_OVERRUN => return error.SystemResources,
-                    RTM_NEWACTION => {
+                    // Same nlmsg_type caveat as `actions()`: depending on the
+                    // path taken, the kernel answers a GET with either the
+                    // RTM_NEWACTION event or an echo of the RTM_GETACTION
+                    // request. Matching only the former left this loop blocked
+                    // in recvDatagram() forever — an unrecognised type falls to
+                    // `else` and we wait for a reply that already arrived.
+                    RTM_GETACTION, RTM_NEWACTION => {
                         var acts = (action.actionsOf(m.payload) catch
                             return error.MalformedReply) orelse return null;
                         return acts.next() catch return error.MalformedReply;
@@ -1211,6 +1227,11 @@ test "integration (root, init userns): the shared action table (add, ls, get, de
     {
         const list = try sock.actions("gact");
         defer testing.allocator.free(list);
+        // Regression guard: the dump used to come back empty because the
+        // reply's nlmsg_type is RTM_GETACTION, not RTM_NEWACTION. An empty
+        // table would make the loop below vacuous, so assert non-empty
+        // before relying on it.
+        try testing.expect(list.len > 0);
         var seen = false;
         for (list) |a| {
             if (a.gen.index != slot) continue;
