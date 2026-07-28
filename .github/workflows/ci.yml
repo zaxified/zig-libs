@@ -28,6 +28,12 @@ jobs:
             args: "-Dstrict-debug"
           - name: ReleaseFast
             args: "-Doptimize=ReleaseFast"
+          # Integrators build in all three release modes; ReleaseSafe was the
+          # only one no lane covered. See CONVENTIONS.md 7.1.
+          # Slowest lane by a wide margin — ~1170s locally cold vs ~680s for
+          # strict Debug and ~360s for the default, so it sets the wall clock.
+          - name: ReleaseSafe
+            args: "-Doptimize=ReleaseSafe"
     name: test — ${{ matrix.name }}
     steps:
       - uses: actions/checkout@v4

@@ -155,6 +155,30 @@ reference, not a re-explanation of everything the README already covers.
 - No shared `testkit` harness exists yet — it was scoped and **deferred** (see the Roadmap
   section of README.md); each module hand-rolls its own wire-test/fake-clock helpers for now.
 
+### 7.1 Optimize modes — what each CI lane proves
+
+This workspace ships **source**, never a binary. The optimize mode of the artifact is
+the integrator's decision, made in their build; we have no deployment to hold an
+opinion about. Our modes exist purely to test, benchmark and prove the code, and each
+lane proves something the others cannot:
+
+| Lane | What it proves |
+|------|----------------|
+| default (Debug, heavy modules at `ReleaseSafe`) | correctness with every safety check armed, fast enough to run on each change |
+| `-Dstrict-debug` | real Debug for the heavy modules too — the default lane relaxes them for wall-clock, so on its own it no longer proves Debug |
+| `-Doptimize=ReleaseFast` | the code is free of undefined behaviour that the safety checks would otherwise mask, and of anything that only holds because of them |
+| `-Doptimize=ReleaseSafe` | the middle mode is green — integrators build in all three, so all three must pass |
+
+**A note worth passing to integrators** (belongs in module docs where a parser is
+exposed, not enforced here): every parser that touches bytes it did not produce is
+held to a "never panic on arbitrary input" threat model, backed by **301 fuzz
+harnesses across 84 modules**. Those harnesses assert that arbitrary input never trips
+a safety check — an assertion that only carries meaning in a build where the checks
+exist. Compiled `ReleaseFast`, the bound the fuzzer proved untripped is simply gone,
+and the input that would have panicked reads out of bounds instead. So the fuzz corpus
+is evidence about a Debug or `ReleaseSafe` build of the consuming binary, and says
+nothing about a `ReleaseFast` one. What an integrator does with that is their call.
+
 ## 8. Versioning, releases & spin-offs
 
 - **One semver for the whole collection.** A release = a git tag (`vX.Y.Z`) on `main` with
