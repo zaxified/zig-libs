@@ -1,2 +1,8 @@
 .zig-cache/
 zig-out/
+
+# VM test harness (scripts/vm/): images are fetched on demand by
+# scripts/vm/fetch-images.sh, never committed — the OpenWRT image alone is
+# ~126 MB and would blow up repo size. See scripts/vm/README.md.
+scripts/vm/images/
+scripts/vm/work/

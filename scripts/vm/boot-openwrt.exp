@@ -1,0 +1,57 @@
+#!/usr/bin/expect -f
+# Boots the OpenWRT image with -snapshot, waits out first-boot config
+# generation, brings up br-lan, and runs exactly one shell command batch
+# built by run.sh. Same ===VM_CMD_BEGIN=== / ===VM_CMD_END=== marker
+# convention as boot-debian.exp so run.sh's output-slicing is shared code.
+#
+# OpenWRT's serial askfirst console auto-logs root in with no password (no
+# credential injection needed here, unlike Debian).
+#
+# `-cpu host` is required here too, not just perf: the QEMU default CPU
+# model (no -cpu flag) is missing something Zig-compiled binaries assume
+# even at the "baseline" target CPU — every musl test binary died with
+# SIGILL on its first instruction without it (see boot-debian.exp's longer
+# note; same root cause, verified the same way).
+#
+# Args: <image> <memory-MB> <command-to-run>
+
+set timeout 90
+set img [lindex $argv 0]
+set mem [lindex $argv 1]
+set runcmd [lindex $argv 2]
+
+spawn qemu-system-x86_64 -machine accel=kvm:tcg -cpu host -m $mem -no-reboot -nographic -snapshot \
+    -drive file=$img,format=raw,if=ide \
+    -netdev user,id=n0 -device e1000,netdev=n0
+
+expect {
+    "activate this console" {}
+    timeout { puts "\nTIMEOUT waiting for console"; exit 1 }
+}
+send "\r"
+expect {
+    -re {root@[^:]*:[^#]*#} {}
+    timeout { puts "\nTIMEOUT waiting for shell prompt"; exit 1 }
+}
+
+# config_generate + br-lan creation both happen after the shell first comes
+# up; settling on /etc/config/network alone races br-lan (seen empirically:
+# "ip: can't find device 'br-lan'"), so wait for the actual link too.
+send "while \[ ! -f /etc/config/network \] || ! ip link show br-lan >/dev/null 2>&1; do sleep 1; done; sleep 3; echo SET''TLED\r"
+expect {
+    -re {SETTLED} {}
+    timeout { puts "\nTIMEOUT waiting for first-boot settle"; exit 1 }
+}
+expect -re {root@[^:]*:[^#]*#}
+
+send "ip addr add 10.0.2.15/24 dev br-lan 2>/dev/null; ip route add default via 10.0.2.2 2>/dev/null; echo ===VM_CMD_BEGIN===; $runcmd; echo ===VM_CMD_END===\r"
+expect {
+    -re {===VM_CMD_END===} {}
+    timeout { puts "\nTIMEOUT waiting for command to finish" }
+}
+
+send "\rpoweroff\r"
+expect {
+    eof {}
+    timeout { puts "\nTIMEOUT on poweroff" }
+}

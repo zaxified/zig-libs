@@ -444,6 +444,14 @@ cmd_time() {
 
 
 
+cmd_vm() {
+    if [[ $# -eq 0 ]]; then
+        echo "usage: scripts/test.sh vm <module> [openwrt|debian] [--test-filter PATTERN]" >&2
+        exit 1
+    fi
+    exec "$SCRIPT_DIR/vm/run.sh" "$@"
+}
+
 usage() {
     cat <<'EOF'
 Usage: scripts/test.sh [subcommand] [args]
@@ -457,13 +465,25 @@ Usage: scripts/test.sh [subcommand] [args]
   time                  run every module SERIALLY, print a duration-sorted
                         table. Slow; measurement only, never use this to
                         decide what to run.
+  vm <module> [plat]    OPT-IN ONLY — never part of `changed`/`all`, which
+                        exist to be fast. Boots a disposable QEMU VM (real
+                        root, no host namespace tricks) and runs one
+                        module's tests for real inside it — for the gaps
+                        `unshare -rn` cannot close: tc's RTM_NEWACTION
+                        (needs CAP_NET_ADMIN in the *initial* user
+                        namespace) and any netlink/nftables/wireguard write
+                        that would otherwise collide with host state.
+                        `plat` is openwrt or debian; omit it to use the
+                        routing table in scripts/vm/run.sh. First run:
+                        `scripts/vm/fetch-images.sh`. See scripts/vm/README.md.
 Every runner begins with a capability check. It is silent when this host can
 run everything; otherwise it names each gap, what coverage it costs, and the
 exact least-privileged command that closes it. Those commands are only ever
 printed — the driver runs nothing privileged or networked for you.
 
 Which do I run? While working: `changed` (fast, scoped). Before committing:
-`all` (the full, authoritative gate).
+`all` (the full, authoritative gate). Closing a real-root gap that `changed`/
+`all` can only skip and print a fix command for: `vm`.
 EOF
 }
 
@@ -475,6 +495,7 @@ main() {
         changed) cmd_changed "${rest[@]:-}" ;;
         all) cmd_all "${rest[@]:-}" ;;
         time) cmd_time "${rest[@]:-}" ;;
+        vm) cmd_vm "${rest[@]:-}" ;;
         -h|--help|help) usage ;;
         *)
             echo "test.sh: unknown subcommand '$cmd'" >&2

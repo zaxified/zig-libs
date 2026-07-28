@@ -1,0 +1,83 @@
+#!/usr/bin/expect -f
+# Boots the Debian nocloud image with -snapshot (disk changes are discarded
+# on exit — see README "Is -snapshot enough?"), logs in as root, then runs
+# exactly one shell command batch built by run.sh and echoed to stdout
+# between ===VM_CMD_BEGIN=== / ===VM_CMD_END=== markers so run.sh can slice
+# out just the guest's own output from the surrounding kernel/systemd noise.
+#
+# Args: <image> <hashed-root-password> <memory-MB> <command-to-run>
+#
+# "nocloud" only means "no cloud-init datasource" — it does NOT mean
+# unattended boot. Without credentials, systemd-firstboot blocks on an
+# interactive locale/timezone/root-password wizard forever (verified: it
+# hangs at "Press any key to proceed" and then a live "Please enter the new
+# timezone..." prompt). Fed via QEMU fw_cfg (not SMBIOS OEM strings — those
+# were empirically flaky here, occasionally truncating a credential and
+# leaving one wizard question un-answered; fw_cfg's file-backed transfer
+# doesn't have that problem), these same credentials make firstboot
+# non-interactive and reach a real login prompt in ~10s. This is boot-time
+# credential injection, not image seeding: the image on disk is untouched
+# (and -snapshot discards even the ephemeral in-VM writes on exit).
+#
+# `-cpu host` matters, not just perf: the QEMU default CPU model (no -cpu
+# flag) is missing something Zig-compiled binaries assume even at the
+# "baseline" target CPU, and every test binary died with SIGILL on the very
+# first instruction under it (verified: `qemu-x86_64` user-mode emulation
+# and direct host execution both ran the same binary fine, isolating the
+# fault to full-system QEMU's default CPU model, not the binary or the
+# kernel). Real hardware pass-through via `accel=kvm` + `-cpu host` sidesteps
+# it entirely.
+
+set timeout 90
+set img [lindex $argv 0]
+set hash [lindex $argv 1]
+set mem [lindex $argv 2]
+set runcmd [lindex $argv 3]
+
+spawn qemu-system-x86_64 -machine accel=kvm:tcg -cpu host -m $mem -no-reboot -nographic -snapshot \
+    -drive file=$img,format=qcow2,if=virtio \
+    -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
+    -fw_cfg name=opt/io.systemd.credentials/passwd.hashed-password.root,string=$hash \
+    -fw_cfg name=opt/io.systemd.credentials/firstboot.locale,string=C.UTF-8 \
+    -fw_cfg name=opt/io.systemd.credentials/firstboot.timezone,string=UTC \
+    -fw_cfg name=opt/io.systemd.credentials/firstboot.keymap,string=us
+
+# Login, tolerant of the (harmless, credential-satisfied) firstboot banner
+# and of agetty's own 60s LOGIN_TIMEOUT occasionally firing under host load
+# (observed on a loaded dev box; the retry just re-types "root" — cheap and
+# correct either way).
+set login_tries 0
+expect {
+    -re {login: $} {}
+    "Press any key to proceed" { send "\r"; exp_continue }
+    -re {Please enter[^\r\n]*} { send "\r"; exp_continue }
+    "timed out after" {
+        incr login_tries
+        if {$login_tries > 3} { puts "\nFAIL: agetty login timed out repeatedly"; exit 1 }
+        exp_continue
+    }
+    timeout { puts "\nTIMEOUT waiting for login prompt"; exit 1 }
+}
+send "root\r"
+expect {
+    -re {[Pp]assword:} {}
+    "timed out after" { send "\r"; exp_continue }
+    timeout { puts "\nTIMEOUT waiting for password prompt"; exit 1 }
+}
+send "zigvm\r"
+expect {
+    -re {[#\$] $} {}
+    timeout { puts "\nTIMEOUT waiting for shell after login"; exit 1 }
+}
+
+send "echo ===VM_CMD_BEGIN===; $runcmd; echo ===VM_CMD_END===\r"
+expect {
+    -re {===VM_CMD_END===} {}
+    timeout { puts "\nTIMEOUT waiting for command to finish" }
+}
+
+send "\rpoweroff\r"
+expect {
+    eof {}
+    timeout { puts "\nTIMEOUT on poweroff" }
+}
