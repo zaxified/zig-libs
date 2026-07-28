@@ -524,6 +524,7 @@ pub const cose = @import("cose.zig");
 test {
     _ = cose;
     _ = @import("kat_test.zig");
+    _ = @import("cose_kat_test.zig");
 }
 
 test "smoke: encode/decode round-trip a small map" {

@@ -188,6 +188,12 @@ fn parseKeyHex(text: []const u8) KeyEncodingError![32]u8 {
 
 // ── tests ────────────────────────────────────────────────────────────────────
 
+// Dark-tests aggregator (CONVENTIONS.md §6.3): a bare re-export does not pull
+// a submodule's tests into the test binary — this reference does.
+test {
+    _ = @import("kat_test.zig");
+}
+
 test "round-trip: buffer API, various sizes including empty" {
     const io = std.testing.io;
     const kp = KeyPair.generate(io);

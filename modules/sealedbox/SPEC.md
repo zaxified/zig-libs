@@ -35,7 +35,36 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
 ## Verification
 
 RFC 7748-cross-checked X25519 KATs, end-to-end serialize→deserialize→seal→open, tamper/forgery
-rejection, and malformed-key-input typed errors. 9 tests. Run: `zig build test-sealedbox`.
+rejection, and malformed-key-input typed errors. Run: `zig build test-sealedbox`.
+
+**External anchor for the seal/open composition (`kat_test.zig` / `kat_vectors.zig`, added
+2026-07-28):** the tests above only round-trip through this module's own `seal`/`open` — a shared
+misreading of the spec on both sides would still pass. Two independent anchors close that:
+
+1. **Underlying `crypto_box_easy` layer** — the classic djb/NaCl `crypto_box` test vector (Alice's
+   secret key + Bob's public key = RFC 7748 §6.1's own X25519 test keypairs, a fixed nonce, and a
+   published ciphertext) from libsodium's `test/default/box.c` + `box.exp`
+   (github.com/jedisct1/libsodium, fetched 2026-07-28). `std.crypto.nacl.Box.seal`/`.open` — the
+   primitive `SealedBox` composes on top of — reproduces the published 147-byte
+   `tag ‖ ciphertext` byte-exact on the first try.
+2. **The full `crypto_box_seal` composition** (ephemeral key + BLAKE2b nonce + box) — libsodium's
+   *own* test suite (`test/default/box_seal.c`) cannot publish a fixed expected ciphertext because
+   `crypto_box_seal` uses a random ephemeral key by construction (confirmed by reading that file:
+   it only checks a random round-trip). This module's `seal(io, ...)` takes its ephemeral-key
+   entropy through the caller-supplied `io: std.Io`, so a test `Io` whose `.random` returns a fixed
+   32-byte seed (RFC 7748 "Alice", reused as an arbitrary constant) makes the *entire* composition
+   deterministic through the real, unmodified `seal()` — no source change. The expected output was
+   computed independently via **PyNaCl** (a CFFI binding to the real libsodium C library, not this
+   module) directly calling `crypto_scalarmult_base` / `crypto_generichash` (BLAKE2b-192) /
+   `crypto_box` in the same order as libsodium's own `crypto_box_seal.c`
+   (confirmed by reading that file). Result: byte-exact match on the first run — no
+   interoperability divergence found. Teeth confirmed: corrupting one byte of the expected vector
+   produces a real, reported mismatch (verified, then reverted).
+3. **What remains unanchored, and why that's the honest limit:** libsodium's own published test
+   data for `crypto_box_seal` itself is inherently non-deterministic (random ephemeral key), so no
+   third-party-*published* fixed `crypto_box_seal` ciphertext exists anywhere to paste in; the
+   vector above is the closest achievable substitute (real libsodium code, fixed inputs we chose),
+   not a vector libsodium itself publishes.
 
 ## Backlog / deferred
 

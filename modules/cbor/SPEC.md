@@ -117,6 +117,32 @@ check) using the ctap2pin-style field layout, missing-field/unsupported-kty erro
 `Sig_structure`-shape check. Verified green in Debug and ReleaseFast; `zig fmt --check modules/cbor`
 clean. Run: `zig build test-cbor`.
 
+**COSE layer external anchor (`cose_kat_test.zig` / `cose_kat_vectors.zig`, added 2026-07-28):**
+the tests above are all self-round-trip (build then parse through this module's own code) — real
+external `COSE_Sign1` vectors close that gap. Anchored against:
+- **RFC 9052 Appendix C.2.1** ("Single ECDSA Signature") — the spec's own canonical
+  `COSE_Sign1` worked example (protected header `{1: -7}`, tag-18-wrapped), taken from the RFC
+  text itself, cross-checked byte-identical against `cose-wg/Examples`
+  (github.com/cose-wg/Examples) `sign1-tests/sign-fail-01.json`'s `output.cbor` (same vector,
+  tag deliberately mutated to 998 for that repo's own "wrong tag" failure case).
+- **`cose-wg/Examples` `sign1-tests/sign-pass-02.json`** — a second real vector, used to check
+  `sigStructure()` byte-exact against the file's published `Sig_structure` intermediate
+  (`ToBeSign_hex`) with a non-empty `external_aad`.
+- The tag-18-wrapped and bare-array forms are both exercised against the *same* real vector
+  (strip the one leading tag byte), confirming the module's documented dual-form acceptance
+  against external bytes, not just a homemade pair.
+- **Finding, not a bug:** `sign-fail-01`'s "wrong CBOR tag" (998 instead of 18) still parses
+  successfully through `parseSign1`, because this module deliberately never checks the tag
+  number (documented in `cose.zig`'s doc comment). Confirmed against real external test data
+  rather than assumed.
+- **Negative case:** no external COSE suite publishes a pure-CBOR-shape failure (the WG's own
+  `sign-fail-*` vectors are all signature/semantic failures, which parse fine structurally); the
+  negative test truncates the real RFC 9052 C.2.1 vector to a 3-element array to check the
+  `COSE_Sign1` 4-tuple requirement (RFC 9052 §4.2) against real vector bytes.
+- All four new vectors passed byte-exact on the first run (no divergence from this
+  implementation found). Teeth confirmed: corrupting one byte of the expected `signature_hex`
+  produces a real, reported mismatch (verified, then reverted — not left corrupted).
+
 ## Backlog / deferred
 
 See README "Deferred": indefinite-length round-trip fidelity, float-width minimization, bignum
