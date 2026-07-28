@@ -23,12 +23,15 @@ and BGV are deferred increments.
 |---|---|---|
 | Plaintext placement | scaled by `Δ=⌊q/t⌋` in the high bits | in the low bits (mod `t`) |
 | Noise control on mul | one `⌊t/q·…⌉` rescale | modulus-switch chain (extra bookkeeping) |
-| Cross-check oracle | **SEAL default** (byte-exact target) | HElib (less canonical as a "default") |
+| Cross-check oracle | **SEAL default** (byte-exact target *in principle* — see below) | HElib (less canonical as a "default") |
 | Encoding | exact integer | exact integer |
 
 Both are exact-integer leveled schemes of the same difficulty class; BFV wins
 on *fewest independent noise-management mechanisms to get right first* and on
-having SEAL as a canonical KAT oracle.
+SEAL being available as a canonical KAT oracle **for tiering purposes** — this
+row is a *could-be-anchored* argument for why BFV is not Fable-tier, not a
+claim that a SEAL KAT has been run. No SEAL vectors exist in this repo; see
+"Anchors (verification harness)" below for what is actually checked.
 
 ## Part-1 scope, and the sub-split
 
@@ -41,8 +44,11 @@ cleanly** rather than everything half-built:
   byte-exact-KAT'd; `bfv.Bfv` ships real types/`add`/`sub` with the
   scheme cores gated (byte codecs deferred — see backlog below).
 - **Part 2 (Opus) — `keyGen` / `encrypt` / `decrypt` / (observe `add`).**
-  Textbook leveled-BFV over the now-real RNS ring; KAT-able byte-exact against
-  SEAL. Turns on `gate.scheme_core_implemented`.
+  Textbook leveled-BFV over the now-real RNS ring; a construction that a
+  SEAL KAT *could* validate byte-exact, which is why it is tiered Opus and
+  not Fable — but no SEAL KAT has actually been produced (see "Anchors"
+  below for what validates it today: `Dec(Enc(·))` round-trips against this
+  module's own reference). Turns on `gate.scheme_core_implemented`.
 - **Part 3 (Fable) — `mul` (tensor + `⌊t/q·…⌉` rescale) + `relinearize`
   (relin-key key-switch) + `noiseBudget`.** The noise-management core. Turns on
   `gate.fable_core_implemented`.
@@ -69,9 +75,14 @@ self-consistent-but-wrong test can pass, or the design space is nontrivial):
   and against an independent schoolbook convolution. Small fix-space, strong
   deterministic feedback → a careful non-Fable pass lands it. (These are done in
   Part 1.)
-- **`keyGen`/`encrypt`/`decrypt` — Opus (Part 2).** Textbook, and byte-exact
-  against SEAL vectors. The decrypt `⌊t/q·(c0+c1·s)⌉` rounding is the only
-  noise-adjacent piece, but it too has an external anchor.
+- **`keyGen`/`encrypt`/`decrypt` — Opus (Part 2).** Textbook, and a
+  construction *for which* byte-exact SEAL vectors would exist to check
+  against — that possibility, not an actual SEAL cross-check, is the basis
+  for the Opus/not-Fable call. **No SEAL vectors have been produced or run**
+  (`modules/bfv/data/` is empty); what actually validates this layer is
+  `Dec(Enc(·))` round-trips against `encode.addRef`/`mulRef`. The decrypt
+  `⌊t/q·(c0+c1·s)⌉` rounding is the only noise-adjacent piece, and it too has
+  no external anchor in place — only the same round-trip check.
 - **`mul` + `relinearize` + `noiseBudget` — genuine Fable (Part 3).** This is
   the "no simple anchor for the hard part" case. Self-consistent tests can pass
   while noise is silently mismanaged: a multiply that "works" for tiny inputs

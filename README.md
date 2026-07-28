@@ -88,7 +88,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `health` | Liveness (`/healthz`) + readiness (`/readyz`) probe middleware — 200/503 from registered dependency checks (k8s probe contract) | any | router, http |
 | `requestid` | Request/correlation-ID middleware — adopt incoming `X-Request-Id` or generate, echo on the response, expose via `current()` (composes with auth) | any | router, http |
 | `tracecontext` | **W3C Trace Context** — `traceparent`/`tracestate` parse + generate + a propagation middleware (child span per hop, `current()`) for distributed tracing | any | router, http |
-| `webhooksig` | **HMAC webhook signatures** (GitHub/Stripe style) — `sign`/`verify` (constant-time) + a middleware gating requests by `HMAC-SHA256(secret, body)`, key rotation | any | router, http |
+| `webhooksig` | **HMAC webhook signatures** (GitHub style: `sha256=<hex>`) — `sign`/`verify` (constant-time) + a middleware gating requests by `HMAC-SHA256(secret, body)`, key rotation; Stripe's `t=…,v1=…` scheme is a different construction and is not implemented | any | router, http |
 | `idempotency` | **Idempotency-Key** dedup of unsafe retries — a middleware + ramcache-backed `Store` replaying a key's cached response without re-running the handler | any | router, http, ramcache |
 | `resilience` | Circuit breaker + retry/backoff + timeout + **bulkhead** (concurrency limiter) for calling upstreams (generic) | posix | — |
 | `upstream` | Load-balanced upstream pool + failover — round-robin/weighted/least-conn/EWMA strategies, per-upstream breaker+bulkhead, active+passive health | any | resilience, probe |

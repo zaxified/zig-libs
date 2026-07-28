@@ -24,41 +24,43 @@ See `README.md` for the consumer-facing API summary and Provenance note.
   (`Hash.digest_length`) — matching spec §5.1/§5.2 verbatim rather than
   deriving `k`'s width from `Cipher.key_length`.
 
-## Status (2026-07-10)
+## Status
 
-Compiling scaffold only. Every §5 method — `CipherState.{initializeKey,
-hasKey, setNonce, encryptWithAd, decryptWithAd, rekey}`,
-`SymmetricState.{initializeSymmetric, mixKey, mixHash, mixKeyAndHash,
-getHandshakeHash, encryptAndHash, decryptAndHash, split}`,
-`HandshakeState.{initialize, writeMessage, readMessage}` — is a
-`@panic("TODO(agent): ...")` stub. No DH exchange, no AEAD seal/open, no
-HKDF/HMAC ratchet is wired up. The module compiles and its tests (pattern
-data + type-shape checks) pass; nothing that would touch the panicking
-stubs is exercised.
+**Implemented.** Every §5 method — `CipherState.{initializeKey, hasKey,
+setNonce, encryptWithAd, decryptWithAd, rekey}`, `SymmetricState.
+{initializeSymmetric, mixKey, mixHash, mixKeyAndHash, getHandshakeHash,
+encryptAndHash, decryptAndHash, split}`, `HandshakeState.{initialize,
+writeMessage, readMessage}` — is real: no `@panic`/TODO stub remains in
+`state.zig`. DH exchange, AEAD seal/open, and the HKDF/HMAC ratchet are
+all wired up over the comptime-bound `Suite(DH, Cipher, Hash)`.
 
-## Fill-in plan (future pass)
+The implementation follows the plan that used to live in this section
+(§5.1 nonce encoding for `CipherState`, a from-scratch HKDF ratchet for
+`SymmetricState` generic over `Hash` — not imported from `wireguard`,
+since this module has zero deps — and the §5.3 `WriteMessage`/
+`ReadMessage` token-by-token pseudocode for `HandshakeState`).
 
-1. **`CipherState`**: wire the suite's `Cipher` (an AEAD from
-   `std.crypto.aead.*`) for `encryptWithAd`/`decryptWithAd`, following the
-   spec's own nonce-encoding rule for `n` (spec §5.1) rather than
-   WireGuard's framing (that framing belongs to the `wireguard` module,
-   not here).
-2. **`SymmetricState`**: an HKDF ratchet over the suite's `Hash`. The
-   `wireguard` module's `noise.zig` (`kdf1`/`kdf2`/`kdf3` over
-   `std.crypto.kdf.hkdf.Hkdf`) is a useful *shape* reference for how this
-   codebase idiomatically drives `std.crypto.kdf.hkdf` — but do not import
-   from `wireguard`; reimplement locally, generic over `Hash`, since this
-   module has zero deps.
-3. **`HandshakeState`**: drive `pattern.message_patterns[message_index]`
-   token-by-token per the spec §5.3 `WriteMessage`/`ReadMessage`
-   pseudocode, incrementing `message_index` and returning `Split()`'s pair
-   once the pattern is exhausted.
-
-## Verification (future pass)
+## Verification
 
 Per `CONVENTIONS.md` §7's "Protocol codecs" tier: golden/known-answer
-vectors are the right oracle here. The official Noise vectors (the
-`cacophony` JSON vector format) live in rweather/noise-c's `vectors/`
-directory on GitHub, and in snow's / cacophony's own vector files — none
-are consulted yet, since there is no crypto implementation to check them
-against in this pass.
+vectors anchor this module. `state.zig` embeds six official noise-c
+vectors (the `cacophony` JSON format, from rweather/noise-c's `vectors/`
+directory), transcribed as byte literals and run end-to-end through
+`HandshakeState`/`CipherState`: `Noise_NN_25519_ChaChaPoly_SHA256`,
+`Noise_NK_25519_ChaChaPoly_SHA256`, `Noise_XX_25519_ChaChaPoly_SHA256`
+(covers both `es` and `se` token directions), `Noise_IK_25519_ChaChaPoly_
+SHA256` (covers `es`+`ss`+`se`), `Noise_XX_25519_ChaChaPoly_BLAKE2s` (a
+second hash function), and `Noise_IK_25519_ChaChaPoly_SHA512` (HASHLEN=64
+truncation to 32-byte keys). Each vector checks every transport-message
+ciphertext AND the final `handshake_hash`, byte-exact. Beyond the KATs:
+`SymmetricState`'s HKDF is checked against RFC 5869 HKDF with empty info;
+self-consistency round-trips exercise all four patterns with generated
+(non-vector) ephemerals; a tampered-message test asserts AEAD auth
+failure; a fuzz test asserts `HandshakeState.readMessage` never panics on
+arbitrary bytes. Also exercised indirectly end-to-end by the sibling
+`bolt8` module, whose BOLT#8 appendix vectors run over this framework.
+
+snow's and cacophony's own vector JSON files (same `cacophony` format)
+were not additionally consulted — the noise-c set already covers every
+pattern/hash/DH combination this module implements, so they would be
+redundant, not a stronger check.

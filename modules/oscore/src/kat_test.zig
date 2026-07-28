@@ -2,19 +2,17 @@
 //! Tests against RFC 8613 (OSCORE) Appendix C's official test vectors
 //! (`kat_vectors.zig`).
 //!
-//! **Current status: the CBOR/codec tests below (`encodeInfo`,
-//! `encodeAadArray`, `OscoreOption`) are REAL and PASS today** — they
-//! cross-validate this module's deterministic byte-assembly against every
-//! `info`/`aad_array`/`OSCORE option value` field Appendix C publishes.
-//! **Every test that calls `deriveKey`/`deriveContext`/`computeNonce`/
-//! `buildAad`/`protect`/`unprotect` WILL PANIC** (crash the test binary)
-//! until a follow-up crypto pass fills those six `@panic("TODO(fable):
-//! ...")` stubs in — this is the expected, correct state of a scaffold:
-//! `zig build test-oscore` must COMPILE (it does) even though it does not
-//! yet fully PASS. See `root.zig`'s module doc comment for exactly which
-//! functions are real vs. stubbed.
+//! **Current status: all six crypto cores are REAL and every test below
+//! PASSES.** The CBOR/codec tests (`encodeInfo`, `encodeAadArray`,
+//! `OscoreOption`) cross-validate this module's deterministic
+//! byte-assembly against every `info`/`aad_array`/`OSCORE option value`
+//! field Appendix C publishes; the tests calling `deriveKey`/
+//! `deriveContext`/`computeNonce`/`buildAad`/`protect`/`unprotect` run
+//! and pass against the same Appendix C vectors. No `@panic`/TODO stub
+//! remains in `root.zig`. See `root.zig`'s module doc comment for exactly
+//! which construction each function follows.
 //!
-//! Coverage, by category, once the stubs are filled in:
+//! Coverage, by category:
 //!
 //!   - `deriveKey`/`deriveContext` reproduce all six Appendix C.1-C.3
 //!     vectors' Sender Key, Recipient Key, and Common IV, byte-exact

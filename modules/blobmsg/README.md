@@ -20,8 +20,12 @@ codec is an independent Zig implementation of the OpenWRT libubox wire format
 specified in its headers `blob.h`/`blobmsg.h` (ISC); the ubus envelope reuses
 only the ubus protocol constants + the packed msghdr layout from `ubusmsg.h`
 (LGPL-2.1) as uncopyrightable protocol facts. `libubus-io.c` contributed no
-code — the socket transport is original. Byte-parity verified against
-`ubus -S` on real hardware. See `NOTICE`.
+code — the socket transport is original. The wire format is golden-byte
+tested against hand-derived expected output (from the documented libubox
+spec, not a captured device transcript) and exercised end-to-end against a
+real `ubusd` when one is reachable (see "Testing without hardware" below);
+a textual byte-parity comparison against `ubus -S` output on real hardware
+has **not** been done — no such transcript exists in this repo. See `NOTICE`.
 
 ## API
 
@@ -101,7 +105,13 @@ bool→INT8, integer→INT32 (INT64 when it overflows i32), float→DOUBLE.
   CLI-fallback layer — this module reports errors and lets the caller decide.
 - **Testing without hardware:** a scripted in-process daemon (unix socket +
   thread) speaks the exact reply choreography, asserting both required
-  behaviors from the daemon side; golden byte tests pin the wire format; a
-  real-ubusd integration test runs when `/var/run/ubus/ubus.sock` exists and
-  skips cleanly otherwise. Ground truth is a qemu parity check
-  (native output == `ubus -S`).
+  behaviors from the daemon side; golden byte tests pin the wire format
+  against hand-derived expected bytes (from the documented libubox spec, not
+  a captured device transcript). A real-ubusd integration test runs when
+  `/var/run/ubus/ubus.sock` exists and skips cleanly otherwise — it checks
+  that `list()` returns at least one object and that `invoke("system",
+  "board", null)` round-trips to parseable JSON, **not** a byte-level
+  comparison against anything. **Not yet done:** a textual parity check of
+  this client's decoded output against `ubus -S`'s own output, captured on
+  real OpenWRT hardware or in the qemu VM lane (`scripts/vm/`) — no such
+  transcript or script exists in this repo yet; see SPEC.md's backlog.

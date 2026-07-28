@@ -444,16 +444,20 @@ project git history).
                layout and the ubus protocol constants (MSG_*/ATTR_*) as
                declared in ubus ubusmsg.h (LGPL-2.1); these are uncopyrightable
                protocol facts (integer constants + a packed struct),
-               re-derivable from the `ubus -S` golden captures the module is
-               tested against. libubus-io.c (LGPL-2.1) contributed NO code: the
-               unix-socket transport (blocking read/write loops, single-buffer
-               send, fixed-header framing, seq-matched request/reply) is an
-               independent implementation — none of libubus-io.c's expression
-               (writev/iovec scatter-gather, chunked reader, SCM_RIGHTS
-               fd-passing, callback request-registry, reconnect state machine)
-               is present. Byte-parity verified against `ubus -S` on real
-               hardware. Published under MIT; the only copyleft touchpoint is
-               the uncopyrightable ubus protocol facts above.
+               re-derivable from the documented header layout (not from a
+               captured `ubus -S` transcript — none exists in this repo, see
+               modules/blobmsg/SPEC.md's backlog). libubus-io.c (LGPL-2.1)
+               contributed NO code: the unix-socket transport (blocking
+               read/write loops, single-buffer send, fixed-header framing,
+               seq-matched request/reply) is an independent implementation —
+               none of libubus-io.c's expression (writev/iovec scatter-gather,
+               chunked reader, SCM_RIGHTS fd-passing, callback
+               request-registry, reconnect state machine) is present. A real
+               ubusd integration test (connect, list, invoke) passes against a
+               live daemon when present; a byte-parity comparison against
+               `ubus -S` output on real hardware has not yet been done.
+               Published under MIT; the only copyleft touchpoint is the
+               uncopyrightable ubus protocol facts above.
 
   ramcache   — the TTL + generation-invalidation + byte/entry-cap cache is the
                authors' own original work. The W-TinyLFU admission/eviction

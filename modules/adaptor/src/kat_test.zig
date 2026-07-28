@@ -5,11 +5,10 @@
 //! exists for Schnorr adaptor signatures).
 //!
 //! Every test below is written against `root.zig`'s FINAL public API
-//! (`preSign`/`preVerify`/`adapt`/`extract`), which currently
-//! `@panic("TODO(fable): ...")`s — so `zig build test-adaptor` compiles
-//! but PANICS at runtime until a crypto-core pass fills in the four
-//! function bodies. That is the expected, correct state of this scaffold
-//! (see `root.zig`'s module doc comment and `SPEC.md`).
+//! (`preSign`/`preVerify`/`adapt`/`extract`), which is fully implemented —
+//! no `@panic`/TODO stub remains, and `zig build test-adaptor` runs these
+//! assertions for real (see `root.zig`'s module doc comment and
+//! `SPEC.md`).
 //!
 //! Two layers of assertion, deliberately BOTH present:
 //!

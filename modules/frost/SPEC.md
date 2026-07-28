@@ -4,13 +4,19 @@ FROST (Flexible Round-Optimized Schnorr Threshold signatures), RFC 9591,
 **secp256k1/SHA-256 ciphersuite (§6.5) only**; see [README.md](README.md)
 for purpose and API. Provenance: see [NOTICE](NOTICE).
 
-**Status: scaffold.** Wire codecs, RFC §4.3 list operations, and the five
+**Status: complete.** Wire codecs, RFC §4.3 list operations, and the five
 ciphersuite hash functions plus their pure-glue callers
 (`computeChallenge`, `nonceGenerate`, `generateNonces`) are implemented
 and cross-validated byte-exact against RFC 9591 Appendix E.5's published
-intermediate values. The ten threshold-specific cryptographic cores are
-`@panic("TODO(fable): ...")` stubs with fixed final signatures — see
-"TODO(fable) — remaining" below.
+intermediate values. The ten threshold-specific cryptographic cores
+(`deriveInterpolatingValue`, `computeBindingFactors`,
+`computeGroupCommitment`, `round1Commit`, `round2Sign`, `aggregate`,
+`verifySignatureShare`, `verify`, `trustedDealerKeygen`,
+`secretShareCombine`) are all implemented — no `@panic`/TODO stubs remain
+in `root.zig` — and are likewise byte-exact against RFC 9591 Appendix
+E.5 (32/32 tests, Debug + ReleaseFast; `zig build test-frost`). See
+`src/root.zig`'s module doc comment for the exact construction each core
+follows and what its KAT covers.
 
 ## Design
 
@@ -175,18 +181,17 @@ intermediate values. The ten threshold-specific cryptographic cores are
   `trustedDealerKeygen` returns `vss_commitment`, which a caller can
   independently check a share against via `vss_verify`'s formula
   (`S_i == sum(vss_commitment[j] * i^j)`), but this module does not
-  itself expose a `vssVerify` helper in this scaffolding pass. A
-  reasonable, small follow-up.
+  itself expose a `vssVerify` helper. A reasonable, small follow-up.
 - Distributed/removed-Coordinator deployment shapes (RFC 9591 §7.5) — the
   Coordinator role here is left to the caller/consumer, same as the RFC's
   own framing (this module supplies the per-role FUNCTIONS, not a
   network protocol or role-assignment policy).
 
-## TODO(fable) — remaining
+## The ten threshold-specific cryptographic cores (all implemented)
 
-The ten threshold-specific cryptographic cores, each a
-`@panic("TODO(fable): ...")` stub in `root.zig` with a fixed final
-signature and a doc comment spelling out the exact RFC 9591 construction:
+All ten are implemented in `root.zig` (no `@panic`/TODO stubs remain) per
+each function's doc comment, which spells out the exact RFC 9591
+construction:
 
 - `deriveInterpolatingValue` (§4.2) — the Lagrange coefficient at `x=0`.
   THE threshold-specific primitive; everything else built on top of it
@@ -209,6 +214,6 @@ signature and a doc comment spelling out the exact RFC 9591 construction:
   split (`secret_share_shard` + `vss_commit`) and combine
   (`secret_share_combine` via `polynomial_interpolate_constant`).
 
-Once filled in, `kat_test.zig`'s existing assertions (already written
-against each core's fixed final signature) become the acceptance check —
-no test-file changes should be needed, only `root.zig`'s stub bodies.
+`kat_test.zig`'s assertions (one per core, against RFC 9591 Appendix E.5's
+published intermediate/final values) are the acceptance check, and all
+pass — 32/32, Debug and ReleaseFast.

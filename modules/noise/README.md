@@ -66,10 +66,11 @@ BSD-2-Clause), noise-c (https://github.com/rweather/noise-c,
 BSD-2-Clause), snow (Rust, Apache-2.0 OR MIT) — see `../../NOTICE` for the
 repo-wide provenance ledger entry.
 
-Official test vectors for the eventual crypto implementation:
-- rweather/noise-c's `vectors/` directory on GitHub — the canonical
-  `cacophony`-format vector JSON, covering the standard patterns/suites.
-- snow's and cacophony's own vector JSON files (same `cacophony` vector
-  format), useful as an independent cross-check.
-
-Neither is consulted yet — this pass only reserves the API surface.
+Test vectors actually consulted: six official `cacophony`-format vectors
+from rweather/noise-c's `vectors/` directory on GitHub, transcribed into
+`state.zig` and checked byte-exact end-to-end (ciphertexts + handshake
+hash) across `NN`/`NK`/`XX`/`IK`, both hash choices (SHA-256/SHA-512), and
+a second hash function (BLAKE2s) — see `SPEC.md`'s "Verification" for the
+full list. snow's and cacophony's own vector files (same format) were not
+additionally consulted — the noise-c set already covers every pattern/
+suite this module implements.

@@ -5,8 +5,10 @@
 //! slices and is fully unit- and fuzz-testable on any OS.
 //!
 //! Wire format (big-endian, 4-byte alignment), clean-room from the OpenWRT
-//! sources (libubox `blob.h`/`blobmsg.h`, ubus `ubusmsg.h`) and byte-parity
-//! verified against `ubus -S` on real hardware (see the module README):
+//! header specs (libubox `blob.h`/`blobmsg.h`, ubus `ubusmsg.h`) and pinned
+//! by golden-byte tests derived from those specs; a textual byte-parity
+//! check against `ubus -S` on real hardware has not yet been done — see the
+//! module README/SPEC.md:
 //!
 //! ```text
 //! ubus_msghdr:  u8 version | u8 type | u16 seq (BE) | u32 peer (BE)   (8 bytes)

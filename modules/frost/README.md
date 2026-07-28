@@ -7,7 +7,7 @@ signing protocol — any `MIN_PARTICIPANTS`-sized subset of
 aggregate signature `(R, z)` verifiable under one group public key, with
 no interaction needed from signers outside that subset.
 
-**Status: scaffold.** Wire codecs, RFC §4.3 list operations, and the
+**Status: complete.** Wire codecs, RFC §4.3 list operations, and the
 five ciphersuite hash functions (`h1`..`h5`) plus their pure-glue callers
 (`computeChallenge`, `nonceGenerate`, `generateNonces`) are implemented
 and cross-validated byte-exact against RFC 9591 Appendix E.5's own
@@ -15,16 +15,16 @@ published intermediate values (`kat_test.zig`). The ten
 threshold-specific cryptographic cores (`computeBindingFactors`,
 `computeGroupCommitment`, `deriveInterpolatingValue`, `round1Commit`,
 `round2Sign`, `aggregate`, `verifySignatureShare`, `verify`,
-`trustedDealerKeygen`, `secretShareCombine`) are `@panic("TODO(fable):
-...")` stubs with fixed final signatures, ready for a follow-up crypto
-pass. See `SPEC.md` for the design, the BIP340-compatibility finding
-(short version: **NOT compatible** — different element encoding,
-different signature length, different challenge hash), and the full
-threat model.
+`trustedDealerKeygen`, `secretShareCombine`) are all implemented (no
+`@panic`/TODO stubs remain in `root.zig`) and likewise byte-exact against
+RFC 9591 Appendix E.5 (32/32 tests, Debug + ReleaseFast). See `SPEC.md`
+for the design, the BIP340-compatibility finding (short version: **NOT
+compatible** — different element encoding, different signature length,
+different challenge hash), and the full threat model.
 
 | File | Contents |
 |---|---|
-| `root.zig` | Every public type (`Identifier`, `Element`/`GroupPublicKey`/`VerifyingShare`/`NonceCommitment`, `SigningShare`, `SignatureShare`, `SigningNonces`, `SigningCommitments`, `Signature`), the REAL hash layer (`h1`..`h5`, `computeChallenge`, `nonceGenerate`, `generateNonces`), REAL §4.3 list operations (`encodeGroupCommitmentList`, `participantsFromCommitmentList`, `bindingFactorForParticipant`, `sortCommitmentsByIdentifier`), and the 9 stubbed crypto cores |
+| `root.zig` | Every public type (`Identifier`, `Element`/`GroupPublicKey`/`VerifyingShare`/`NonceCommitment`, `SigningShare`, `SignatureShare`, `SigningNonces`, `SigningCommitments`, `Signature`), the REAL hash layer (`h1`..`h5`, `computeChallenge`, `nonceGenerate`, `generateNonces`), REAL §4.3 list operations (`encodeGroupCommitmentList`, `participantsFromCommitmentList`, `bindingFactorForParticipant`, `sortCommitmentsByIdentifier`), and all ten threshold-specific crypto cores |
 | `kat_vectors.zig` | RFC 9591 Appendix E.5's official secp256k1/SHA-256 test vector, embedded |
 | `kat_test.zig` | KAT assertions against every embedded value + an end-to-end (2,3) round-trip test |
 
@@ -90,7 +90,7 @@ frost.bindingFactorForParticipant(binding_factor_list: []const BindingFactor, id
 frost.sortCommitmentsByIdentifier(commitment_list: []SigningCommitments) void
 ```
 
-**Crypto cores (STUBBED — `@panic`)**:
+**Crypto cores (all implemented)**:
 
 ```zig
 frost.deriveInterpolatingValue(participant_list: []const Identifier, x_i: Identifier) !Scalar
@@ -105,7 +105,7 @@ frost.trustedDealerKeygen(allocator, secret_key: Scalar, coefficients: []const S
 frost.secretShareCombine(shares: []const ParticipantShare) !Scalar
 ```
 
-## Usage shape (once the cores are implemented)
+## Usage
 
 ```zig
 // Trusted-dealer keygen (2-of-3):
@@ -130,8 +130,7 @@ std.debug.assert(frost.verify(msg, sig, keygen.group_public_key));
 zig build test-frost
 ```
 
-Currently: 16 real tests pass; 16 tests reach a `@panic("TODO(fable):
-...")` stub and crash — this is the expected state of a scaffold (the
-build COMPILES; the crypto cores are not yet implemented). See
-`SPEC.md`'s "TODO(fable) — remaining" for exactly what a follow-up pass
-needs to fill in.
+32/32 tests pass (Debug and ReleaseFast) — the hash-layer tests plus the
+ten threshold-specific cores' KATs against RFC 9591 Appendix E.5, and an
+end-to-end (2,3) round-trip. See `SPEC.md` for exactly which construction
+each core follows.

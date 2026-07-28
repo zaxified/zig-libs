@@ -2,7 +2,10 @@
 
 //! webhooksig — HMAC-SHA256 request/webhook signature signing and
 //! verification, plus a `router` middleware that gates inbound webhooks
-//! (GitHub / Stripe style) on a valid signature header.
+//! (GitHub style: one `<prefix><hex-mac>` header value) on a valid
+//! signature header. Stripe's `Stripe-Signature` (`t=…,v1=…`,
+//! timestamp-prefixed payload) is a different construction and is NOT
+//! implemented — see README.md's "Scope" section.
 //!
 //! The sender computes `HMAC-SHA256(secret, raw_body)` and presents it in
 //! a header, e.g. `X-Signature-256: sha256=<hex-lowercase>` (GitHub) — the
@@ -67,7 +70,7 @@ pub const meta = .{
     // state, so sharing a single Verifier across all connection threads is
     // safe without locking.
     .concurrency = .threadsafe,
-    .model_after = "GitHub/Stripe webhook HMAC signatures; RFC 2104 HMAC",
+    .model_after = "GitHub webhook HMAC signatures (sha256=<hex>); RFC 2104 HMAC",
     .deps = .{ "router", "http" },
 };
 

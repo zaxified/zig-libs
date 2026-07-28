@@ -1,18 +1,18 @@
 # webhooksig
 
 HMAC-SHA256 request/webhook signature **signing** and **verification**,
-plus a `router` middleware that gates inbound webhooks (GitHub / Stripe
-style) on a valid signature header — the signature layer of the Web/API
-cluster.
+plus a `router` middleware that gates inbound webhooks (GitHub style: a
+single `<prefix><hex-mac>` header value) on a valid signature header — the
+signature layer of the Web/API cluster. **Stripe's `Stripe-Signature`
+scheme is not implemented** — see "Scope" below.
 
-Provenance: clean-room from the GitHub / Stripe webhook-HMAC convention
-(`X-Signature-256: sha256=<hex>` / `X-Hub-Signature-256`) and RFC 2104
-(HMAC) over FIPS 180-4 SHA-256 — original work of the zig-libs authors
-(MIT); no third-party source consulted or copied — see NOTICE. Constant-time
-compare and the middleware shape mirror the sibling `aaa-gate` module (same
-repo, MIT).
+Provenance: clean-room from the GitHub webhook-HMAC convention
+(`X-Hub-Signature-256: sha256=<hex>`) and RFC 2104 (HMAC) over FIPS 180-4
+SHA-256 — original work of the zig-libs authors (MIT); no third-party
+source consulted or copied — see NOTICE. Constant-time compare and the
+middleware shape mirror the sibling `aaa-gate` module (same repo, MIT).
 
-- **Model after:** GitHub / Stripe webhook HMAC signatures; RFC 2104 HMAC.
+- **Model after:** GitHub webhook HMAC signatures (`sha256=<hex>`); RFC 2104 HMAC.
 - **Platform:** any. **Role:** server. **Concurrency:** threadsafe — the
   `Verifier` is immutable after `init` (fixed secret set + config, no
   shared counters), so one instance is safely shared across all of
@@ -28,7 +28,20 @@ Import name: registers as **`webhooksig`** — `@import("webhooksig")`.
 The sender computes `HMAC-SHA256(secret, raw_body)` and presents it in a
 header, e.g. `X-Signature-256: sha256=<hex-lowercase>` (GitHub). The
 receiver recomputes the MAC over the **exact bytes it received** and
-compares. Both the header name and the `sha256=` prefix are configurable.
+compares. Both the header name and the `sha256=` prefix are configurable —
+that covers any provider using GitHub's single-value `<prefix><hex>` shape.
+
+## Scope: GitHub-style only, not Stripe
+
+Stripe's `Stripe-Signature` header is a different construction: a
+comma-separated list `t=<unix-timestamp>,v1=<hex-mac>[,v0=<hex-mac>]`, and
+the MAC covers `"<timestamp>.<raw body>"`, not the raw body by itself.
+Neither the comma-list parsing nor the timestamp-prefixed signed payload is
+implemented — `header`/`prefix` configure one fixed prefix directly in
+front of the hex MAC, which cannot express Stripe's multi-field header or
+its different signed-payload construction. There is no timestamp field,
+parsed or otherwise, anywhere in this module. Adding Stripe support is a
+separate feature decision, not something this module does today.
 
 The compare is **constant-time**: the recomputed MAC and the decoded
 presented MAC are checked with `std.crypto.timing_safe.eql` over the

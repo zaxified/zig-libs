@@ -5,12 +5,13 @@ end-to-end application-layer security for CoAP, AES-CCM-16-64-128 +
 HKDF-SHA-256 only. See [README.md](README.md) for purpose and API.
 Provenance: see [NOTICE](NOTICE).
 
-**Status: scaffold.** The §3.2.1 `info` CBOR encoder, the §5.4
+**Status: complete.** The §3.2.1 `info` CBOR encoder, the §5.4
 `aad_array`/`Enc_structure` CBOR encoders, the §6.1 compressed COSE option
-codec, and the §3.2.2 anti-replay sliding window are implemented for real.
-The six crypto cores (`deriveKey`, `deriveContext`, `computeNonce`,
-`buildAad`, `protect`, `unprotect`) are `@panic("TODO(fable): ...")`
-stubs — see "TODO(fable)" below for exactly what remains.
+codec, the §3.2.2 anti-replay sliding window, and the six crypto cores
+(`deriveKey`, `deriveContext`, `computeNonce`, `buildAad`, `protect`,
+`unprotect`) are all implemented — no `@panic`/TODO stub remains in
+`root.zig`. See "The six crypto cores" below for what each does and how
+it is anchored.
 
 ## Design
 
@@ -184,10 +185,10 @@ does not mandate an exact size ("may be different in the two endpoints",
   CBOR encoders handle only PUBLIC data (sequence numbers, IDs, option
   bytes) and have no constant-time obligation.
 
-## TODO(fable)
+## The six crypto cores (all implemented)
 
-The six crypto cores in `root.zig` are `@panic("TODO(fable): ...")`
-stubs. Each function's own doc comment spells out the exact RFC 8613
+The six crypto cores in `root.zig` are all real — no `@panic`/TODO stub
+remains. Each function's own doc comment spells out the exact RFC 8613
 construction step-by-step:
 
 1. **`deriveKey`** (§3.2.1) — `encodeInfo` (already real) into
@@ -214,13 +215,8 @@ material.
 
 ## Verification
 
-- `zig build test-oscore` (Debug) currently reports 22 real tests
-  passing and 10 crashing at the first crypto-core call each reaches
-  (expected — see `root.zig`'s module doc comment). Once the six cores
-  are implemented: `zig build test-oscore` and `-Doptimize=ReleaseFast`
-  should both go green; `zig fmt --check modules/oscore/` clean (already
-  verified clean as of this scaffold).
+- `zig build test-oscore` and `-Doptimize=ReleaseFast` both go green;
+  `zig fmt --check modules/oscore/` clean.
 - Disk-vs-running test count (CONVENTIONS.md §6 step 3):
-  `grep -c '^\s*test ' modules/oscore/src/*.zig` summed across files must
-  equal `zig build test-oscore --summary all`'s reported total, once the
-  suite can run past the panics.
+  `grep -c '^\s*test ' modules/oscore/src/*.zig` summed across files
+  equals `zig build test-oscore --summary all`'s reported total.

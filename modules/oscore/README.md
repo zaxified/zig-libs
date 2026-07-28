@@ -10,16 +10,14 @@ this AEAD; `std.crypto.kdf.hkdf.HkdfSha256` is exactly this KDF — neither
 is a gap. The OSCORE-specific construction around them (security context,
 nonce, AAD, compressed wire option, replay protection) is this module.
 
-**Status: scaffold.** The §3.2.1 `info` CBOR encoder (`encodeInfo`), the
+**Status: complete.** The §3.2.1 `info` CBOR encoder (`encodeInfo`), the
 §5.4 `aad_array`/`Enc_structure` CBOR encoders (`encodeAadArray`,
 `encodeEncStructure`), the §6.1 compressed COSE option codec
-(`OscoreOption`), and the §3.2.2 anti-replay sliding window
-(`ReplayWindow`) are implemented and tested today. The six crypto cores
-(`deriveKey`, `deriveContext`, `computeNonce`, `buildAad`, `protect`,
-`unprotect`) are stubbed (`@panic("TODO(fable): ...")`) with their final
-signatures fixed and the exact construction fully documented in
-`root.zig`'s doc comments — see [SPEC.md](SPEC.md) for the design, the
-nonce/AAD byte layouts, and the TODO list.
+(`OscoreOption`), the §3.2.2 anti-replay sliding window (`ReplayWindow`),
+and the six crypto cores (`deriveKey`, `deriveContext`, `computeNonce`,
+`buildAad`, `protect`, `unprotect`) are all implemented and KAT-validated
+— no `@panic`/TODO stub remains in `root.zig`. See [SPEC.md](SPEC.md) for
+the design and the nonce/AAD byte layouts.
 
 **CoAP-agnostic by design**: this module has no build dependency on the
 sibling `coap` module and never parses or builds a CoAP message itself —
@@ -30,7 +28,7 @@ those bytes and calling into `oscore` as its object-security layer.
 
 | File | Contents |
 |---|---|
-| `root.zig` | Security context types (`SecurityContext`, `CommonContext`, `SenderContext`, `RecipientContext`); `ReplayWindow` (REAL); the CBOR/option codecs (`encodeInfo`, `encodeAadArray`, `encodeEncStructure`, `OscoreOption` — all REAL); the 6 stubbed crypto cores (`deriveKey`, `deriveContext`, `computeNonce`, `buildAad`, `protect`, `unprotect`) |
+| `root.zig` | Security context types (`SecurityContext`, `CommonContext`, `SenderContext`, `RecipientContext`); `ReplayWindow`; the CBOR/option codecs (`encodeInfo`, `encodeAadArray`, `encodeEncStructure`, `OscoreOption`); the 6 crypto cores (`deriveKey`, `deriveContext`, `computeNonce`, `buildAad`, `protect`, `unprotect`) — all REAL |
 | `kat_vectors.zig` | RFC 8613 Appendix C's official test vectors — all six C.1-C.3 key-derivation vectors (client + server) and all five C.4-C.8 protected-message vectors |
 | `kat_test.zig` | Byte-exact KAT assertions against every Appendix C field, plus tamper-rejection, replay-rejection, and an end-to-end round-trip test |
 
@@ -40,7 +38,7 @@ those bytes and calling into `oscore` as its object-security layer.
 const oscore = @import("oscore");
 ```
 
-## Shape (once the crypto cores are filled in)
+## Usage
 
 ```zig
 // Derive a full security context from the small set of RFC 8613 §3.2
@@ -68,7 +66,7 @@ const plaintext = try oscore.unprotect(
 defer allocator.free(plaintext);
 ```
 
-`OscoreOption.encode`/`.decode` (REAL today) handle the §6.1 compressed
+`OscoreOption.encode`/`.decode` handle the §6.1 compressed
 COSE option wire format directly:
 
 ```zig
@@ -77,8 +75,8 @@ const wire = try opt.encode(allocator); // -> CoAP OSCORE option value bytes
 const decoded = try oscore.OscoreOption.decode(wire);
 ```
 
-`ReplayWindow` (REAL today) is a standalone sliding anti-replay bitmap —
-useful on its own even before the crypto cores land:
+`ReplayWindow` is a standalone sliding anti-replay bitmap, usable on its
+own:
 
 ```zig
 var rw = oscore.ReplayWindow{};
@@ -100,15 +98,15 @@ depending on `coap`, see the module doc comment's "Scope / non-goals".
 ## Verify
 
 ```
-zig build test-oscore                        # Debug — 22 real tests pass, 10 PANIC at the first crypto-core call each reaches (expected; see SPEC.md)
+zig build test-oscore                        # Debug — green
+zig build test-oscore -Doptimize=ReleaseFast
 zig fmt --check modules/oscore/
 ```
 
-Once the six crypto cores are implemented, `kat_test.zig` asserts
-byte-exact `deriveKey`/`deriveContext`/`computeNonce`/`buildAad`/
-`protect`/`unprotect` output against every RFC 8613 Appendix C.1-C.8
-value, plus a tampered-ciphertext rejection, a replayed-Partial-IV
-rejection, and an end-to-end round trip with fresh (non-published) key
-material.
+`kat_test.zig` asserts byte-exact `deriveKey`/`deriveContext`/
+`computeNonce`/`buildAad`/`protect`/`unprotect` output against every RFC
+8613 Appendix C.1-C.8 value, plus a tampered-ciphertext rejection, a
+replayed-Partial-IV rejection, and an end-to-end round trip with fresh
+(non-published) key material.
 
 Provenance: see [NOTICE](NOTICE).

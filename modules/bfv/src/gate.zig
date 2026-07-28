@@ -8,9 +8,15 @@
 //!
 //!   • `scheme_core_implemented` — Part 2, **Opus tier**: `keyGen` / `encrypt`
 //!     / `decrypt` / `add`. Textbook leveled-BFV over the (already real) RNS
-//!     ring; KAT-able byte-exact against Microsoft SEAL, so a careful non-Fable
-//!     pass lands it. The decrypt `⌊t/q·(c0+c1·s)⌉` rounding is the only
-//!     noise-adjacent piece here, and even it has an external anchor.
+//!     ring; the construction is KAT-**able** byte-exact against Microsoft
+//!     SEAL in principle (small fix-space, deterministic feedback), which is
+//!     why a careful non-Fable pass could land it — but no SEAL vectors have
+//!     actually been produced or checked in (`modules/bfv/data/` is empty).
+//!     What IS checked today is `Dec(Enc(x)) == x` and the additive
+//!     homomorphic property against this module's own plaintext-space
+//!     reference (`encode.addRef`), not an external oracle. The decrypt
+//!     `⌊t/q·(c0+c1·s)⌉` rounding is the only noise-adjacent piece here, and
+//!     even it has no external anchor actually in place yet.
 //!
 //!   • `fable_core_implemented` — Part 3, **genuine Fable tier**: `mul`
 //!     (ciphertext tensoring + the `⌊t/q·…⌉` RNS rescale) + `relinearize`

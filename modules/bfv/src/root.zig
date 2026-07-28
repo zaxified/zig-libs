@@ -5,9 +5,14 @@
 //! **Fully Homomorphic Encryption, Part 1 (arithmetic backbone + scheme
 //! scaffold).** FHE lets you compute on ciphertexts: `Dec(f(Enc(x))) = f(x)`.
 //! BFV (Fan-Vercauteren 2012) is the cleanest EXACT-integer scheme — no
-//! CKKS-style approximate rescaling — and matches Microsoft SEAL's default, so
-//! it is cross-checkable. This module targets a *leveled* BFV that can
-//! homomorphically ADD and MULTIPLY to a bounded depth (no bootstrapping).
+//! CKKS-style approximate rescaling — and matches Microsoft SEAL's default
+//! parameter/NTT design, which makes it cross-checkable **in principle**
+//! (small fix-space, deterministic construction). No SEAL vectors have
+//! actually been produced or checked in, though (`modules/bfv/data/` is
+//! empty) — what validates the scheme layer today is `Dec(Enc(x)) == x` and
+//! the homomorphic property against this module's own reference helpers, not
+//! against SEAL. This module targets a *leveled* BFV that can homomorphically
+//! ADD and MULTIPLY to a bounded depth (no bootstrapping).
 //!
 //! ## Part-1 status (this commit)
 //! The whole **arithmetic backbone is REAL and byte-exact-KAT'd** — the piece
@@ -29,10 +34,21 @@
 //! The **scheme layer (`bfv.Bfv`) is complete**: the `SecretKey`/`PublicKey`/
 //! `RelinKey`/`Ciphertext` types and the (non-noise-sensitive) homomorphic
 //! `add`/`sub` are real; `keyGen`/`encrypt`/`decrypt` landed as
-//! `scheme_core_implemented` (Part 2, Opus — SEAL-KAT-able) and
-//! `mul`/`relinearize`/`noiseBudget` as `fable_core_implemented` (Part 3, the
-//! genuine-Fable noise-management core). See `gate.zig`, `SPEC.md`. (Byte
-//! codecs for the key/ciphertext types are a deferred backlog item.)
+//! `scheme_core_implemented` (Part 2, Opus — SEAL-KAT-**able**, meaning the
+//! construction is the kind an external byte-exact KAT could validate, NOT
+//! that a SEAL KAT has actually been run — see "Verification" below and
+//! `gate.zig`) and `mul`/`relinearize`/`noiseBudget` as
+//! `fable_core_implemented` (Part 3, the genuine-Fable noise-management
+//! core). See `gate.zig`, `SPEC.md`. (Byte codecs for the key/ciphertext
+//! types are a deferred backlog item.)
+//!
+//! ## Verification (what actually backs "complete")
+//! `keyGen`/`encrypt`/`decrypt`/`add` are checked by `Dec(Enc(x)) == x` and
+//! `Dec(Enc(a) + Enc(b)) == a+b (mod t)` against this module's own
+//! `encode.addRef` reference — never against Microsoft SEAL. `mul`/
+//! `relinearize` are checked the same way against `encode.mulRef`, plus the
+//! worst-case noise-ledger argument in SPEC.md. No SEAL output, KAT vector,
+//! or transcript exists anywhere in this repo for bfv.
 //!
 //! Deferred increments: bootstrapping, CKKS (approximate), key rotation /
 //! Galois automorphisms (batching rotations), full CRT-slot SIMD encoding,

@@ -5,10 +5,10 @@ the scriptless-scripts construction) over BIP340 on secp256k1; see
 [README.md](README.md) for purpose and API. Provenance: see
 [NOTICE](NOTICE).
 
-**Status: scaffold.** Wire codecs (`AdaptorPoint`, `PreSignature`) are
-implemented for real. The four crypto cores (`preSign`, `preVerify`,
-`adapt`, `extract`) are `@panic("TODO(fable): ...")` stubs — see "TODO
-(fable)" below for exactly what remains.
+**Status: complete.** Wire codecs (`AdaptorPoint`, `PreSignature`) and the
+four crypto cores (`preSign`, `preVerify`, `adapt`, `extract`) are all
+implemented — no `@panic`/TODO stub remains in `root.zig`. See "The four
+crypto cores" below for what each does and how it is anchored.
 
 ## Design
 
@@ -174,14 +174,13 @@ solves differently). The chain of reasoning:
   most such cases, but the `r`-mismatch check fails fast and gives a
   clearer error (`error.NonceMismatch` vs `error.AdaptorSecretMismatch`).
 
-## TODO(fable)
+## The four crypto cores (all implemented)
 
-The four crypto cores in `root.zig` are `@panic("TODO(fable): ...")`
-stubs. Each function's own doc comment in `root.zig` spells out the exact
-construction step-by-step (nothing left to design, only to transcribe into
-`std.crypto.ecc.Secp256k1`/`Scalar` operations following `bip340`'s own
-established idioms — masked constant-time parity selects, `taggedHasher`
-streaming, `mulDoubleBasePublic` for the public verify equation):
+The four crypto cores in `root.zig` are all real — no `@panic`/TODO stub
+remains. Each function's own doc comment in `root.zig` spells out the
+exact construction step-by-step, following `bip340`'s own established
+idioms (masked constant-time parity selects, `taggedHasher` streaming,
+`mulDoubleBasePublic` for the public verify equation):
 
 1. **`preSign`** — 9 steps (KeyPair normalization; aux-rand-masked nonce
    folding in `bytes(T)`; `R_hat = k0·G + T`; `needs_negation =
@@ -205,12 +204,8 @@ independent correctness signal beyond the byte-exact numbers.
 
 ## Verification
 
-- `zig build test-adaptor` (Debug) currently PANICS at the first crypto-
-  core call (expected — see `root.zig`'s module doc comment). Once the
-  four cores are implemented: `zig build test-adaptor` and
-  `-Doptimize=ReleaseFast` should both go green; `zig fmt --check
-  modules/adaptor/` clean (already verified clean as of this scaffold).
+- `zig build test-adaptor` and `-Doptimize=ReleaseFast` both go green;
+  `zig fmt --check modules/adaptor/` clean.
 - Disk-vs-running test count (CONVENTIONS.md §6 step 3):
-  `grep -c '^\s*test ' modules/adaptor/src/*.zig` summed across files must
-  equal `zig build test-adaptor --summary all`'s reported total, once the
-  suite can run past the panics.
+  `grep -c '^\s*test ' modules/adaptor/src/*.zig` summed across files
+  equals `zig build test-adaptor --summary all`'s reported total.

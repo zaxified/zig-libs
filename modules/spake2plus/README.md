@@ -9,20 +9,18 @@ the Prover (client) holds a password-derived `w0` AND `w1`; the Verifier
 itself — so a Verifier-database compromise does not directly hand an
 attacker the password.
 
-**Status: scaffold.** Ciphersuite constants and wire encoders
+**Status: complete.** Ciphersuite constants, wire encoders
 (`m_compressed_sec1`/`n_compressed_sec1`, `mPoint`/`nPoint`,
-`computeTranscript`, the `hash`/`mac`/`kdf` primitive wrappers) are
-implemented and tested. The seven crypto cores (`computeW0W1`,
-`computeL`, `proverStart`, `verifierStart`, `deriveKeys`, `proverFinish`,
-`verifierFinish`) are stubbed (`@panic("TODO(fable): ...")`) with their
-final signatures fixed and the exact construction fully documented in
-`root.zig`'s doc comments — see [SPEC.md](SPEC.md) for the design, the
-`V`-computation asymmetry this scheme's security hinges on, and the TODO
-list.
+`computeTranscript`, the `hash`/`mac`/`kdf` primitive wrappers), and the
+seven crypto cores (`computeW0W1`, `computeL`, `proverStart`,
+`verifierStart`, `deriveKeys`, `proverFinish`, `verifierFinish`) are all
+implemented and KAT-validated — no `@panic`/TODO stub remains in
+`root.zig`. See [SPEC.md](SPEC.md) for the design and the
+`V`-computation asymmetry this scheme's security hinges on.
 
 | File | Contents |
 |---|---|
-| `root.zig` | `M`/`N` ciphersuite constants + `mPoint`/`nPoint` (REAL), `computeTranscript` (REAL), `hash`/`mac`/`kdf` wrappers (REAL) — plus the 7 stubbed crypto cores (`computeW0W1`, `computeL`, `proverStart`, `verifierStart`, `deriveKeys`, `proverFinish`, `verifierFinish`) |
+| `root.zig` | `M`/`N` ciphersuite constants + `mPoint`/`nPoint`, `computeTranscript`, `hash`/`mac`/`kdf` wrappers, and the 7 crypto cores (`computeW0W1`, `computeL`, `proverStart`, `verifierStart`, `deriveKeys`, `proverFinish`, `verifierFinish`) — all REAL |
 | `kat_vectors.zig` | RFC 9383 Appendix C's 1 official P-256/SHA-256 test vector, byte-exact |
 | `kat_test.zig` | "REAL TODAY" tests (`computeTranscript`/`mac`, pass now) + byte-exact KAT assertions + an end-to-end Prover<->Verifier property harness + tamper-rejection tests |
 
@@ -81,17 +79,17 @@ spake2plus → std.crypto.ecc.P256 / std.crypto.hash.sha2.Sha256 /
 ## Verify
 
 ```
-zig build test-spake2plus                    # Debug — "REAL TODAY" tests pass; panics at the first crypto-core call (expected; see SPEC.md)
+zig build test-spake2plus                     # Debug — green
+zig build test-spake2plus -Doptimize=ReleaseFast
 zig fmt --check modules/spake2plus/
 ```
 
-Once the seven crypto cores are implemented, `kat_test.zig` asserts
-byte-exact `computeL`/`proverStart`/`verifierStart`/`deriveKeys`/
-`proverFinish`/`verifierFinish` output against RFC 9383 Appendix C's
-official P-256/SHA-256 vector, plus an end-to-end property test
-(Prover<->Verifier agreement on `K_shared`, driven only through the
-public API) and tamper rejection (corrupted confirmation MAC, corrupted
-share). `computeW0W1` has no official byte-exact oracle — see
-`SPEC.md`'s note.
+`kat_test.zig` asserts byte-exact `computeL`/`proverStart`/
+`verifierStart`/`deriveKeys`/`proverFinish`/`verifierFinish` output
+against RFC 9383 Appendix C's official P-256/SHA-256 vector, plus an
+end-to-end property test (Prover<->Verifier agreement on `K_shared`,
+driven only through the public API) and tamper rejection (corrupted
+confirmation MAC, corrupted share). `computeW0W1` has no official
+byte-exact oracle — see `SPEC.md`'s note.
 
 Provenance: see [NOTICE](NOTICE).

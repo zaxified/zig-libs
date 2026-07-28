@@ -2,26 +2,19 @@
 //! Byte-exact and property tests against `kat_vectors.zig`'s official
 //! RFC 9383 Appendix C P-256/SHA-256 vector.
 //!
-//! Two sections, deliberately kept separate:
+//! Two sections, kept separate for what each isolates:
 //!
-//!   1. **"REAL TODAY"**: tests written against the parts of `root.zig`
-//!      that are ALREADY implemented (`computeTranscript`, `mac`) — these
-//!      PASS right now, with zero crypto cores filled in. They exist
-//!      both as regression coverage for the real code and as a concrete
-//!      demonstration that the transcript field order / length-prefix
-//!      width / point encoding this scaffold committed to are correct
-//!      against the RFC's own published numbers, independent of
-//!      whatever the crypto-core pass eventually does.
+//!   1. **Transcript/MAC plumbing**: tests written against
+//!      `computeTranscript`/`mac` in isolation — a concrete demonstration
+//!      that the transcript field order / length-prefix width / point
+//!      encoding are correct against the RFC's own published numbers,
+//!      independent of the other six crypto cores.
 //!   2. **Byte-exact KAT + property harness**: written against `root.
-//!      zig`'s FINAL public API (`computeW0W1` is the one function with
+//!      zig`'s full public API (`computeW0W1` is the one function with
 //!      no oracle here — see its own doc comment — every other function
-//!      IS exercised), which currently `@panic("TODO(fable): ...")`s —
-//!      so `zig build test-spake2plus` compiles but PANICS at runtime
-//!      partway through this section until a crypto-core pass fills in
-//!      the six remaining function bodies (`computeL`, `proverStart`,
-//!      `verifierStart`, `deriveKeys`, `proverFinish`, `verifierFinish`).
-//!      That is the expected, correct state of this scaffold (see
-//!      `root.zig`'s module doc comment and `SPEC.md`).
+//!      IS exercised). All seven crypto cores are implemented, so this
+//!      section runs and passes for real (see `root.zig`'s module doc
+//!      comment and `SPEC.md`).
 
 const std = @import("std");
 const spake2plus = @import("root.zig");

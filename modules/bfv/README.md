@@ -4,7 +4,12 @@
 `Dec(f(Enc(x))) = f(x)`, so an untrusted party can evaluate a function over data
 it can never read. BFV (Fan–Vercauteren, ePrint 2012/144) is the cleanest
 **exact-integer** scheme — no CKKS-style approximate rescaling — and matches
-Microsoft SEAL's default, making it cross-checkable. This module targets a
+Microsoft SEAL's default parameter/NTT design, which makes it cross-checkable
+**in principle** against SEAL (small fix-space, deterministic construction).
+**No SEAL vectors have actually been produced or checked in** —
+`modules/bfv/data/` is empty; what validates the scheme today is
+`Dec(Enc(x)) == x` and the homomorphic property against this module's own
+reference helpers (see "Verification" below). This module targets a
 *leveled* BFV that can homomorphically **add** and **multiply** to a bounded
 multiplicative depth (no bootstrapping). This is a first-in-pure-Zig
 capability: `std` ships lattice KEM/signatures (ML-KEM/ML-DSA) but no

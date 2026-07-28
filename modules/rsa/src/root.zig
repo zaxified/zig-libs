@@ -84,9 +84,8 @@ pub const meta = .{
     // NOTE: CONVENTIONS.md's `meta` tag vocabulary (platform/role/concurrency/
     // model_after/deps) has no dedicated "status" tag; module maturity lives
     // in each SPEC.md's closing "Status" line instead, using the catalog's
-    // `extract` (built) / `gap` (not yet built) vocabulary. This module's
-    // SPEC.md uses `gap` — the closest existing term for "skeleton, not yet
-    // implemented" — until phase P1 lands.
+    // `extract` (built) / `gap` (not yet built) vocabulary. All phases P1-P6
+    // have landed, so SPEC.md's Status line uses `extract`.
     .platform = .any,
     .role = .util, // pure computation (no I/O, no wire framing of its own) -> util, not .codec
     .concurrency = .reentrant, // no shared/global state; PublicKey/SecretKey are plain value types

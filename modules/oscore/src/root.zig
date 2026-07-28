@@ -454,8 +454,8 @@ pub fn encodeAadArray(allocator: std.mem.Allocator, params: AadParams) std.mem.A
 /// REAL — pure CBOR assembly + concatenation, no OSCORE-specific
 /// judgment (this is plain RFC 8152 COSE, reusable by any COSE_Encrypt0
 /// consumer). Byte-exact against every one of Appendix C.4-C.8's `AAD`
-/// fields once composed with `encodeAadArray`'s output (`kat_test.zig`,
-/// via `buildAad` once that stub is filled in).
+/// fields when composed with `encodeAadArray`'s output (`kat_test.zig`,
+/// via `buildAad`).
 pub fn encodeEncStructure(allocator: std.mem.Allocator, external_aad: []const u8) std.mem.Allocator.Error![]u8 {
     var list: std.ArrayList(u8) = .empty;
     errdefer list.deinit(allocator);
@@ -626,7 +626,7 @@ pub const OscoreOption = struct {
     }
 };
 
-// ── crypto cores (RFC 8613 §3.2.1 / §5.2 / §8) — @panic stubs ────────────
+// ── crypto cores (RFC 8613 §3.2.1 / §5.2 / §8) ───────────────────────────
 
 pub const DeriveKeyError = std.mem.Allocator.Error;
 

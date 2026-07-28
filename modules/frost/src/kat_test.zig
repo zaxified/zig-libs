@@ -2,18 +2,18 @@
 //! Tests against the official RFC 9591 Appendix E.5 secp256k1/SHA-256
 //! test vector (`kat_vectors.zig`).
 //!
-//! **Current status: the hash-layer tests (`h1`/`h3`/`h4`/`h5`) are REAL
-//! and PASS today** — they cross-validate this module's
+//! **Current status: all ten threshold-specific cores are REAL and every
+//! test below PASSES** (32/32, Debug and ReleaseFast) — the hash-layer
+//! tests (`h1`/`h3`/`h4`/`h5`) cross-validate this module's
 //! `expand_message_xmd`/`hash_to_field` implementation against the RFC's
-//! own published intermediate values. **Every other test below calls at
-//! least one `@panic("TODO(fable): ...")` stub in `root.zig` and WILL
-//! PANIC (crash the test binary) until a follow-up crypto pass fills
-//! those stubs in** — this is the expected, correct state of a
-//! scaffold: `zig build test-frost` must COMPILE (it does) even though
-//! it does not yet fully PASS. See `root.zig`'s module doc comment for
-//! exactly which functions are real vs. stubbed.
+//! own published intermediate values, and the tests below exercise the
+//! ten cores (`trustedDealerKeygen`, `secretShareCombine`,
+//! `round1Commit`, `computeBindingFactors`, `aggregate`, `verify`,
+//! `verifySignatureShare`, …) against the same Appendix E.5 vector. No
+//! `@panic`/TODO stub remains in `root.zig`. See `root.zig`'s module doc
+//! comment for exactly which construction each function follows.
 //!
-//! Coverage, by category, once the stubs are filled in:
+//! Coverage, by category:
 //!
 //!   - `trustedDealerKeygen` reproduces the vector's 3 participant
 //!     shares AND group public key from the vector's group secret key +
@@ -159,7 +159,7 @@ test "h5(encodeGroupCommitmentList) matches the H5 output embedded in P1's bindi
     try std.testing.expectEqualSlices(u8, &hexN(32, expected), &got);
 }
 
-// ── round1Commit — STUB, will panic until implemented ────────────────────
+// ── round1Commit ──────────────────────────────────────────────────────────
 
 test "round1Commit(P1 nonces) reproduces P1's published commitments" {
     const nonces = frost.SigningNonces{
@@ -190,7 +190,7 @@ fn vectorCommitmentList() [2]frost.SigningCommitments {
     };
 }
 
-// ── computeBindingFactors — STUB, will panic until implemented ───────────
+// ── computeBindingFactors ─────────────────────────────────────────────────
 
 test "computeBindingFactors reproduces both P1's and P3's published binding factors" {
     const gpa = std.testing.allocator;
@@ -210,7 +210,7 @@ test "computeBindingFactors reproduces both P1's and P3's published binding fact
     try std.testing.expectEqualSlices(u8, &hexN(32, v.round1_p3.binding_factor), &p3_factor.toBytes(.big));
 }
 
-// ── trustedDealerKeygen / secretShareCombine — STUB, will panic ──────────
+// ── trustedDealerKeygen / secretShareCombine ──────────────────────────────
 
 test "trustedDealerKeygen(group secret, [coefficient_1], 3, 2) reproduces all 3 published shares + group public key" {
     const gpa = std.testing.allocator;
@@ -262,7 +262,7 @@ test "secretShareCombine reconstructs the group secret from the {2,3} subset too
     try std.testing.expectEqualSlices(u8, &hexN(32, v.group.secret_key), &got.toBytes(.big));
 }
 
-// ── round2Sign / aggregate / verify — STUB, will panic ────────────────────
+// ── round2Sign / aggregate / verify ───────────────────────────────────────
 
 test "aggregate reproduces the exact published final signature" {
     const gpa = std.testing.allocator;
@@ -336,7 +336,7 @@ test "verify rejects a tampered R" {
     try std.testing.expect(!frost.verify(&msg, sig, group_public_key));
 }
 
-// ── verifySignatureShare — STUB, will panic ───────────────────────────────
+// ── verifySignatureShare ──────────────────────────────────────────────────
 
 test "verifySignatureShare accepts P1's published share" {
     const gpa = std.testing.allocator;

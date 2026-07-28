@@ -4,11 +4,11 @@ SPAKE2+, an AUGMENTED (asymmetric) PAKE, per RFC 9383 —
 P-256/SHA-256/HKDF-SHA256/HMAC-SHA256 ciphersuite; see [README.md](README.md)
 for purpose and API. Provenance: see [NOTICE](NOTICE).
 
-**Status: scaffold.** Ciphersuite constants and wire encoders are
-implemented for real. The seven crypto cores (`computeW0W1`, `computeL`,
-`proverStart`, `verifierStart`, `deriveKeys`, `proverFinish`,
-`verifierFinish`) are `@panic("TODO(fable): ...")` stubs — see "TODO
-(fable)" below for exactly what remains.
+**Status: complete.** Ciphersuite constants, wire encoders, and the seven
+crypto cores (`computeW0W1`, `computeL`, `proverStart`, `verifierStart`,
+`deriveKeys`, `proverFinish`, `verifierFinish`) are all implemented — no
+`@panic`/TODO stub remains in `root.zig`. See "The seven crypto cores"
+below for what each does and how it is anchored.
 
 ## Design
 
@@ -173,16 +173,15 @@ its own doc comment), just without a KAT to check it against; see
   binding an adaptor point to the right protocol context is the
   caller's job, not the primitive's).
 
-## TODO(fable)
+## The seven crypto cores (all implemented)
 
-The seven crypto cores in `root.zig` are `@panic("TODO(fable): ...")`
-stubs. Each function's own doc comment spells out the exact RFC 9383
-construction step-by-step (nothing left to design, only to transcribe
-into `std.crypto.ecc.P256`/`Scalar` operations following the sibling
-`bip340`/`frost`/`adaptor` modules' established idioms — constant-time
-multiply-then-add for secret-touching scalar ops, `Scalar.fromBytes48`
-wide reduction, allocator-owned variable-length output, constant-time
-MAC/confirmation comparison):
+The seven crypto cores in `root.zig` are all real — no `@panic`/TODO stub
+remains. Each function's own doc comment spells out the exact RFC 9383
+construction step-by-step, following the sibling `bip340`/`frost`/
+`adaptor` modules' established idioms (constant-time multiply-then-add
+for secret-touching scalar ops, `Scalar.fromBytes48` wide reduction,
+allocator-owned variable-length output, constant-time MAC/confirmation
+comparison):
 
 1. **`computeW0W1`** — split an 80-byte PBKDF output into two 40-byte
    halves, wide-reduce each mod `p` via `Scalar.fromBytes48`. No KAT
@@ -209,24 +208,17 @@ MAC/confirmation comparison):
 
 Byte-exact oracle for six of the seven: RFC 9383 Appendix C's OFFICIAL
 P-256/SHA-256 test vector (`kat_vectors.zig`), exercised by
-`kat_test.zig`. `computeTranscript` and `mac` are ALREADY real and
-independently pass against this same vector today ("REAL TODAY"
-section) — proof the transcript/MAC plumbing the six stubs feed into is
-correct before any core lands. The property-test layer (end-to-end
+`kat_test.zig`. `computeTranscript` and `mac` pass against this same
+vector too — the transcript/MAC plumbing the six cores feed into is
+correct independent of them. The property-test layer (end-to-end
 Prover<->Verifier agreement on `K_shared`, tamper rejection of a
 corrupted confirmation MAC or a corrupted share) provides a SECOND,
 independent correctness signal beyond the byte-exact numbers.
 
 ## Verification
 
-- `zig build test-spake2plus` (Debug) currently runs the "REAL TODAY"
-  section green, then PANICS at the first crypto-core call in the byte-
-  exact KAT section (expected — see `root.zig`'s module doc comment).
-  Once the seven cores are implemented: `zig build test-spake2plus` and
-  `-Doptimize=ReleaseFast` should both go green; `zig fmt --check
-  modules/spake2plus/` clean (already verified clean as of this
-  scaffold).
+- `zig build test-spake2plus` and `-Doptimize=ReleaseFast` both go green;
+  `zig fmt --check modules/spake2plus/` clean.
 - Disk-vs-running test count (CONVENTIONS.md §6 step 3):
   `grep -c '^\s*test ' modules/spake2plus/src/*.zig` summed across files
-  must equal `zig build test-spake2plus --summary all`'s reported total,
-  once the suite can run past the panics.
+  equals `zig build test-spake2plus --summary all`'s reported total.

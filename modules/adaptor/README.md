@@ -8,16 +8,15 @@ tagged hashing, x-only key handling, and — crucially — the exact challenge
 tag, so a completed adaptor signature is a plain, ordinary BIP340
 signature indistinguishable from one produced by `bip340.sign` directly.
 
-**Status: scaffold.** Wire codecs (`AdaptorPoint`, `PreSignature`) are
-implemented and tested. The four crypto cores (`preSign`, `preVerify`,
-`adapt`, `extract`) are stubbed (`@panic("TODO(fable): ...")`) with their
-final signatures fixed and the exact construction fully documented in
-`root.zig`'s doc comments — see [SPEC.md](SPEC.md) for the design, the
-parity subtlety this scheme's correctness hinges on, and the TODO list.
+**Status: complete.** Wire codecs (`AdaptorPoint`, `PreSignature`) and the
+four crypto cores (`preSign`, `preVerify`, `adapt`, `extract`) are all
+implemented and KAT-validated — no `@panic`/TODO stub remains in
+`root.zig`. See [SPEC.md](SPEC.md) for the design and the parity
+subtlety this scheme's correctness hinges on.
 
 | File | Contents |
 |---|---|
-| `root.zig` | `AdaptorPoint` (33-byte general point), `PreSignature` (65-byte pre-signature codec) — both REAL — plus the 4 stubbed crypto cores (`preSign`, `preVerify`, `adapt`, `extract`) |
+| `root.zig` | `AdaptorPoint` (33-byte general point), `PreSignature` (65-byte pre-signature codec), and the 4 crypto cores (`preSign`, `preVerify`, `adapt`, `extract`) — all REAL |
 | `kat_vectors.zig` | 6 self-authored reference vectors (no official BIP/spec exists for this scheme) — both `needs_negation` branches, both BIP340 key-normalization branches |
 | `kat_test.zig` | Byte-exact KAT assertions + a round-trip property harness (`preVerify` accept, `bip340.verify` accept, `extract` round-trip) + tamper-rejection tests |
 
@@ -69,16 +68,17 @@ adaptor → bip340 → std.crypto.ecc.Secp256k1 / std.crypto.hash.sha2.Sha256
 ## Verify
 
 ```
-zig build test-adaptor                       # Debug — currently PANICS at the first crypto-core call (expected; see SPEC.md)
+zig build test-adaptor                       # Debug — green
+zig build test-adaptor -Doptimize=ReleaseFast # also green
 zig fmt --check modules/adaptor/
 ```
 
-Once the four crypto cores are implemented, `kat_test.zig` asserts
-byte-exact `preSign`/`adapt`/`extract` output against all 6 self-authored
-`kat_vectors.zig` vectors, plus a full-pipeline property test
-(`preSign → preVerify → adapt → bip340.verify → extract`) and tamper
-rejection (wrong `T`, wrong message, flipped `needs_negation`, mismatched
-nonce). No official BIP/spec test vectors exist for this scheme — see
-`NOTICE` for how the vectors here were generated and cross-validated.
+`kat_test.zig` asserts byte-exact `preSign`/`adapt`/`extract` output
+against all 6 self-authored `kat_vectors.zig` vectors, plus a
+full-pipeline property test (`preSign → preVerify → adapt →
+bip340.verify → extract`) and tamper rejection (wrong `T`, wrong message,
+flipped `needs_negation`, mismatched nonce). No official BIP/spec test
+vectors exist for this scheme — see `NOTICE` for how the vectors here
+were generated and cross-validated.
 
 Provenance: see [NOTICE](NOTICE).

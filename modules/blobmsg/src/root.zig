@@ -19,9 +19,13 @@
 //! ```
 //!
 //! The wire format is a clean-room reimplementation, byte-for-byte from the
-//! OpenWRT C sources (openwrt/ubus `ubusmsg.h` + `libubus-io.c`,
-//! openwrt/libubox `blob.h` + `blobmsg.h`), verified against a real daemon
-//! (native output must equal `ubus -S`). Two daemon behaviors are
+//! OpenWRT C header specs (openwrt/ubus `ubusmsg.h`, openwrt/libubox
+//! `blob.h` + `blobmsg.h`) — pinned by golden-byte tests derived from those
+//! headers, not from a captured device transcript. An integration test
+//! exercises `list`/`invoke` against a real ubusd when one is reachable
+//! (connectivity + well-formed JSON out, not byte comparison); a textual
+//! parity check of this client's output against `ubus -S`'s own output has
+//! not yet been done (see SPEC.md's backlog). Two daemon behaviors are
 //! reproduced exactly because ubusd depends on them:
 //!
 //! 1. An INVOKE must carry a `UBUS_ATTR_DATA` attr even when there are no

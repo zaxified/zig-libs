@@ -43,7 +43,7 @@
 //! signers' round-1 nonces/commitments/binding-factor inputs/binding
 //! factors, both signers' round-2 signature shares, and the final
 //! aggregate signature) byte-exact, transcribed from the RFC text — see
-//! `NOTICE`. `kat_test.zig` asserts (once the cores are filled in): (1)
+//! `NOTICE`. `kat_test.zig` asserts: (1)
 //! `trustedDealerKeygen` reproduces the vector's 3 shares + group public
 //! key from the vector's secret + coefficient, and `secretShareCombine`
 //! reconstructs the group secret from any 2-of-3 subset; (2) each
@@ -133,7 +133,7 @@
 //! module's own (clean-room from RFC 9591 + RFC 9380's public text — see
 //! `NOTICE`).
 //!
-//! Only the secp256k1/SHA-256 ciphersuite (RFC 9591 §6.5) is scaffolded.
+//! Only the secp256k1/SHA-256 ciphersuite (RFC 9591 §6.5) is implemented.
 //! RFC 9591 Appendix E also publishes vectors for Ed25519, Ed448,
 //! ristretto255, and P-256 (§6.1-§6.4) — none of those are in scope
 //! here; a ristretto255 pass would need its own module (different group,

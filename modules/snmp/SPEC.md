@@ -108,6 +108,21 @@ USM is the security-sensitive part.
   reply; an empty-password panic found in the pass was fixed.
 
 ## Verification
+
+**Anchoring is not uniform across the module, and that asymmetry matters for how much to trust
+each layer.** The v1/v2c BER/message codec (`ber.zig`, `message.zig`) has **no external anchor at
+all**: its golden-byte KATs are transcribed by hand from RFC 1157/1905/3416 + X.690 by this
+module's own authors (see e.g. `message.zig`'s `"v2c GetRequest for two OIDs: exact bytes"` test,
+whose comment says exactly this) — there is no captured real-agent datagram and no independently-
+produced reference encoder behind them, so these tests catch a codec that disagrees with itself
+across a change, but cannot catch a codec that is self-consistently wrong in a way that also
+matches the hand-derivation error. `client.zig`'s v1/v2c manager likewise has no live-interop test
+(no `SNMP_TEST_AGENT`-equivalent gate) — only offline `Transport` round-trips against this same
+module's own encoder/decoder. The v3/USM stack below is anchored far more strongly: RFC 3414
+Appendix A KATs, fifteen byte-exact captures from a real net-snmp agent, and (as of 2026-07-23) a
+green live-interop run against a real `snmpd`. Do not generalize the v3 anchoring's strength to the
+v1/v2c layer — they are validated to very different standards.
+
 BER + message golden-byte KATs, length-boundary + garbage sweeps, scripted-agent round-trips
 (offline `Transport`); trap receiver v1/v2c/inform decode + `NotATrap` + ack round-trip; v3
 encode/decode round-trips incl. the encrypted-branch capture; privacy KATs (FIPS 46-3 DES, NIST
