@@ -6,13 +6,16 @@ X3DH (signal.org/docs/specifications/x3dh) + XEdDSA
 for purpose and API. Provenance: see [NOTICE](NOTICE).
 
 **Status: Part 1 + Part 2 complete.** `x3dh.zig`'s DH+HKDF agreement, both
-wire codecs, and `xeddsa.zig`'s `sign`/`verify` (with the
-Montgomery->Edwards sign-0 recovery, `edwardsFromMontgomery`), plus
-`ratchet.zig`'s full Double Ratchet (`State` + `initAlice`/`initBob`/
-`encrypt`/`decrypt`, `KDF_RK`/`KDF_CK`, the DH + symmetric-key ratchets,
-`max_skip`-bounded out-of-order handling, transactional fail-closed
-`decrypt`) are implemented and tested — green in Debug and ReleaseFast,
-including a libsignal known-answer vector; see "Verification" below.
+wire codecs, and `xeddsa.zig`'s `sign`/`verify` (spec variant, with the
+Montgomery->Edwards sign-0 recovery, `edwardsFromMontgomery`) PLUS
+`xeddsa.libsignal.sign`/`verify` (deployed-libsignal variant, for
+interop with real Signal), plus `ratchet.zig`'s full Double Ratchet
+(`State` + `initAlice`/`initBob`/`encrypt`/`decrypt`, `KDF_RK`/`KDF_CK`,
+the DH + symmetric-key ratchets, `max_skip`-bounded out-of-order
+handling, transactional fail-closed `decrypt`) are implemented and
+tested — green in Debug and ReleaseFast, including a libsignal
+known-answer vector pinned against BOTH XEdDSA variants; see
+"Verification" below.
 
 ## Design
 
@@ -59,15 +62,23 @@ including a libsignal known-answer vector; see "Verification" below.
   REVERSE, `Curve25519.fromEdwards25519`, used by `X25519.KeyPair.
   fromEd25519`) — `xeddsa.edwardsFromMontgomery` (`y = (u-1)/(u+1)`, then
   decompress with sign bit 0) is the module's fill for that gap.
-- **Spec variant, not deployed-libsignal variant** (`xeddsa.zig`'s module
-  doc comment): the XEdDSA paper forces the signer's Edwards key to
-  sign 0 and leaves `s` a canonical scalar; DEPLOYED libsignal (C, Java,
-  and current Rust — its source says so explicitly) instead signs with
-  the natural-sign key and smuggles the sign bit in `s`'s top bit. This
-  module implements the PAPER. The two are wire-incompatible for the
-  ~half of keys whose natural Edwards point has sign 1 — `kat_test.zig`
-  pins the incompatibility (and validates the shared recovery math) with
-  libsignal's own published test vector.
+- **Both variants, chosen explicitly at the call site** (`xeddsa.zig`'s
+  module doc comment): the XEdDSA paper forces the signer's Edwards key
+  to sign 0 and leaves `s` a canonical scalar; DEPLOYED libsignal (C,
+  Java, and current Rust — its source says so explicitly) instead signs
+  with the natural-sign key and smuggles the sign bit in `s`'s top bit.
+  The two are wire-incompatible for the ~half of keys whose natural
+  Edwards point has sign 1. Top-level `sign`/`verify` implement the
+  PAPER; the `libsignal` namespace (`xeddsa.libsignal.sign`/
+  `xeddsa.libsignal.verify`) implements the DEPLOYED variant, for a
+  caller that needs to interoperate with real Signal clients/servers
+  rather than a spec-faithful peer. There is no silently-chosen default —
+  a caller must name one or the other. `kat_test.zig` pins libsignal's
+  own published test vector (whose key is itself sign-1, the exact case
+  the spec variant cannot handle) as an EXTERNAL ANCHOR against BOTH:
+  `xeddsa.libsignal.verify` must accept it byte-exactly (with all 64
+  single-byte tampers rejected), and the spec-pure `xeddsa.verify` must
+  reject the identical bytes.
 
 ## Threat model / limits
 
@@ -128,36 +139,60 @@ including a libsignal known-answer vector; see "Verification" below.
 
 ## XEdDSA implementation notes
 
-`xeddsa.zig` implements the spec's construction on std primitives only:
+`xeddsa.zig` implements the spec's construction on std primitives only,
+in two variants sharing the same `Signature`/`RandomData` wire types and
+the same `edwardsFromMontgomery` conversion:
 
-1. **`sign`** — Montgomery-seed -> sign-0-forced Edwards keypair
-   (`calculateKeyPair`: clamp, reduce, `basePoint.mul`, branchless
-   negate-if-sign-1); `hash1`-domain-separated nonce
-   (`SHA-512(0xFE || 0xFF*31 || a || M || Z)`, wide-reduced mod L, over
-   the possibly-negated scalar `a` per spec); `R = r·B`;
+1. **`sign`/`verify` (spec variant)** — `sign`: Montgomery-seed ->
+   sign-0-forced Edwards keypair (`calculateKeyPair`: clamp, reduce,
+   `basePoint.mul`, branchless negate-if-sign-1); `hash1`-domain-separated
+   nonce (`SHA-512(0xFE || 0xFF*31 || a || M || Z)`, wide-reduced mod L,
+   over the possibly-negated scalar `a` per spec); `R = r·B`;
    plain-`SHA-512`-domain challenge `h = hash(R || A || M) mod L`;
-   `s = r + h·a mod L` (`scalar.mulAdd`); return `R || s`.
-2. **`verify`** — `edwardsFromMontgomery` recovers the sign-0 Edwards
-   point `A` from the Montgomery `u`-coordinate alone (`y = (u-1)/(u+1)`
-   via `Fe` ops, then `Edwards25519.fromBytes` with sign bit 0 picks the
-   even-`x` root and rejects twist points), fail-closed on non-canonical
-   `u` and the `u = p-1` pole; then `rejectIdentity`/`rejectLowOrder`,
-   `scalar.rejectNonCanonical(s)`, and the standard Ed25519-shaped
-   `sB - hA == R` cofactorless byte comparison
-   (`Edwards25519.mulDoubleBasePublic`). Every failure path returns
-   `false`; nothing panics on attacker input.
+   `s = r + h·a mod L` (`scalar.mulAdd`); return `R || s`, `s` always
+   canonical (`< L`). `verify`: `edwardsFromMontgomery` recovers the
+   sign-0 Edwards point `A` from the Montgomery `u`-coordinate alone
+   (`y = (u-1)/(u+1)` via `Fe` ops, then `Edwards25519.fromBytes` with
+   sign bit 0 picks the even-`x` root and rejects twist points),
+   fail-closed on non-canonical `u` and the `u = p-1` pole; then
+   `rejectIdentity`/`rejectLowOrder`, `scalar.rejectNonCanonical(s)` (the
+   FULL 32 bytes — a set top bit puts `s >= 2^255 > L` and is rejected,
+   which is exactly what makes a deployed-variant sign-1 signature land
+   here), and the standard Ed25519-shaped `sB - hA == R` cofactorless byte
+   comparison (`Edwards25519.mulDoubleBasePublic`). Every failure path
+   returns `false`; nothing panics on attacker input.
+2. **`libsignal.sign`/`libsignal.verify` (deployed variant)** — identical
+   shape, EXCEPT: `naturalKeyPair` skips the sign-0 forcing (the scalar
+   and public point are used exactly as clamp+reduce produces them); the
+   natural public point's sign bit is OR'd into `sig[63]`'s top bit after
+   `mulAdd` (safe because a canonical scalar is `< L < 2^253`, so that bit
+   is always free beforehand); `libsignal.verify` reads `sig[63] >> 7`,
+   negates the sign-0-recovered `A` back to the natural-sign point if the
+   bit is 1, and — the canonicality check that MUST differ from variant
+   1 above — masks the bit off `s` (`s[31] &= 0x7F`) BEFORE calling
+   `scalar.rejectNonCanonical`, since the bit is not part of the scalar.
+   Skipping the mask would reject every genuine sign-1 signature as
+   non-canonical; masking unconditionally without first reading the bit
+   (or reading it after masking) would silently accept a corrupted sign
+   bit instead of checking against the correct `A`.
 
 Test-vector status: the XEdDSA spec text publishes no numeric vector.
 `src/kat_test.zig` embeds libsignal's own `test_curve25519_signature`
 vector (numeric facts from libsignal-protocol-c's test suite; see
-`NOTICE`) and exercises it two ways — a test-local verifier faithful to
-DEPLOYED libsignal's sign-bit-in-`s` variant (built on this module's
-`edwardsFromMontgomery`) must accept it byte-exactly with all 64
-single-byte tampers rejected, and the module's spec-pure `verify` must
-reject it (variant incompatibility, pinned). `sign` is additionally
-cross-checked against `std.crypto.sign.Ed25519`'s independent verifier
-(an XEdDSA challenge hash is byte-identical to Ed25519's, so a spec-pure
-XEdDSA signature must verify as Ed25519 under the recovered sign-0 `A`).
+`NOTICE`) as an EXTERNAL ANCHOR exercised against BOTH variants: the
+module's shipped `xeddsa.libsignal.verify` must accept it byte-exactly
+with all 64 single-byte tampers rejected (this vector's key is sign-1,
+so this is also the positive anchor for a natural-sign-1 key — the case
+the spec variant cannot handle), and the module's spec-pure `verify` must
+reject the identical bytes (variant incompatibility, pinned). `sign` is
+additionally cross-checked against `std.crypto.sign.Ed25519`'s
+independent verifier (an XEdDSA challenge hash is byte-identical to
+Ed25519's, so a spec-pure XEdDSA signature must verify as Ed25519 under
+the recovered sign-0 `A`). `xeddsa.zig`'s own in-file tests additionally
+cover `libsignal.sign`/`verify` self-consistency (both sign-bit branches,
+seeded deterministically — an IN-HOUSE RE-DERIVATION, not an external
+anchor, since only the libsignal vector's own nonce could reproduce its
+exact bytes and that nonce isn't published).
 
 ## Double Ratchet (Part 2, `ratchet.zig`)
 
@@ -258,8 +293,13 @@ provided.
   tampered signature / malformed-key-and-signature fail-closed battery;
   sign-0 convention agreement (`verify`'s recovered `A` == `sign`'s
   forced `A`, both natural-sign branches exercised); libsignal
-  known-answer vector (accept under the variant verifier, reject under
-  spec-pure `verify`, round-trip under this module's own `sign` with the
-  vector's sign-1 key); std-Ed25519 cross-verification; X3DH
-  `generateSignedPreKey` -> `initiate` -> `respond` end-to-end plus
+  known-answer vector — EXTERNAL ANCHOR — accepted byte-exactly (all 64
+  single-byte tampers rejected) by the shipped `xeddsa.libsignal.verify`,
+  rejected by the spec-pure `verify`, self-round-tripped under both
+  `xeddsa.sign` and `xeddsa.libsignal.sign` over the vector's own sign-1
+  key (nonce differs from libsignal's, so these round-trips are IN-HOUSE
+  RE-DERIVATION, not a byte-exact reproduction of the vector's signature);
+  `libsignal.sign`/`verify` self-consistency across both sign-bit branches
+  (`xeddsa.zig`'s own in-file tests); std-Ed25519 cross-verification;
+  X3DH `generateSignedPreKey` -> `initiate` -> `respond` end-to-end plus
   tampered-signature / substituted-prekey fail-closed cases.

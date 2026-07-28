@@ -95,10 +95,16 @@ by carrying the signer's Edwards sign bit in the top bit of `s` instead
 of forcing sign 0. This module's implementation itself was written from
 the specification text (already fully transcribed into `xeddsa.zig`'s
 doc comments during the scaffold pass, before any libsignal source was
-looked at) and implements the PAPER's convention, deliberately NOT the
-deployed variant — see `xeddsa.zig`'s module doc comment and `SPEC.md`.
-`sign` is additionally cross-checked against `std.crypto.sign.Ed25519`'s
-independent verifier (MIT, part of Zig).
+looked at). `xeddsa.zig` now ships BOTH conventions as distinct, explicit
+call sites: top-level `sign`/`verify` implement the PAPER's convention
+unchanged, and the `xeddsa.libsignal` namespace implements the deployed
+variant identified above — see `xeddsa.zig`'s module doc comment and
+`SPEC.md`. Both `sign`s are additionally cross-checked (`sign` against
+`std.crypto.sign.Ed25519`'s independent verifier, MIT, part of Zig; the
+`libsignal.sign`/`verify` pair against each other and against the
+libsignal vector) — no libsignal code was ported into either
+implementation; only the numeric vector and the documented sign-bit fact
+were taken from it.
 
 Status of this pass
 --------------------
@@ -106,13 +112,16 @@ Status of this pass
 **Part 1 + Part 2 complete.** `x3dh.zig`'s four-DH + HKDF agreement
 (`initiateUnverified`/`respond`), both wire codecs (`PreKeyBundle`,
 `InitialMessage`), the fail-closed `initiate`/`generateSignedPreKey`
-entry points, `xeddsa.zig`'s `sign`/`verify` (including
+entry points, `xeddsa.zig`'s `sign`/`verify` (spec variant) AND
+`libsignal.sign`/`verify` (deployed-libsignal variant) — including
 `edwardsFromMontgomery`, the Montgomery->Edwards sign-0 point recovery
-std does not provide), and `ratchet.zig`'s full Double Ratchet
-(`State` + `initAlice`/`initBob`/`encrypt`/`decrypt`, `KDF_RK`/`KDF_CK`,
-the DH + symmetric-key ratchets, `max_skip`-bounded out-of-order
-handling, and a transactional fail-closed `decrypt`) are implemented and
-tested — 39/39 in Debug and ReleaseFast. Together they form a usable
-Signal-style end-to-end-encrypted session. Header encryption (Double
-Ratchet spec §4), PQXDH seeding, and a stability-committed session-
-persistence format remain out of scope — see `README.md`/`SPEC.md`.
+std does not provide and both variants share — and `ratchet.zig`'s full
+Double Ratchet (`State` + `initAlice`/`initBob`/`encrypt`/`decrypt`,
+`KDF_RK`/`KDF_CK`, the DH + symmetric-key ratchets, `max_skip`-bounded
+out-of-order handling, and a transactional fail-closed `decrypt`) are
+implemented and tested — all green in Debug and ReleaseFast. Together
+they form a usable Signal-style end-to-end-encrypted session, either
+self-consistent (spec variant) or wire-compatible with real Signal
+(`libsignal` variant). Header encryption (Double Ratchet spec §4), PQXDH
+seeding, and a stability-committed session-persistence format remain out
+of scope — see `README.md`/`SPEC.md`.

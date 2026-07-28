@@ -19,22 +19,31 @@
 //! the Montgomery->Edwards direction std does not provide; std only ships
 //! the reverse, `Curve25519.fromEdwards25519`).
 //!
-//! **Variant note (deployed libsignal differs from the spec paper):**
-//! Signal's shipped implementations (libsignal-protocol-c/-java and the
-//! current Rust libsignal — its `curve25519.rs` says so in a doc comment
-//! verbatim) do NOT force sign 0. They instead sign with the natural-sign
-//! `A` and smuggle `A`'s sign bit in the most-significant bit of `s`
+//! **Two variants, both implemented, chosen explicitly at the call site
+//! (deployed libsignal differs from the spec paper):** Signal's shipped
+//! implementations (libsignal-protocol-c/-java and the current Rust
+//! libsignal — its `curve25519.rs` says so in a doc comment verbatim) do
+//! NOT force sign 0. They instead sign with the natural-sign `A` and
+//! smuggle `A`'s sign bit in the most-significant bit of `s`
 //! (`signature[63]`), which the spec's construction leaves always-zero.
 //! The two variants produce incompatible signatures for the ~half of all
-//! keys whose natural Edwards point has sign 1. THIS module implements
-//! the SPEC variant (sign-0 forced, no bit smuggled — `s` is a canonical
-//! scalar `< L`), so it round-trips with itself and with any other
-//! spec-faithful implementation, but a signature produced by deployed
-//! libsignal with a sign-1 key is (correctly, per this module's contract)
-//! rejected by `verify` — see `kat_test.zig`, which pins BOTH facts
-//! against libsignal's own published test vector. See `SPEC.md` for the
-//! threat-model caveat (key reuse across DH and signing contexts) this
-//! scheme deliberately accepts.
+//! keys whose natural Edwards point has sign 1. Top-level `sign`/`verify`
+//! implement the SPEC variant (sign-0 forced, no bit smuggled — `s` is a
+//! canonical scalar `< L`), so they round-trip with themselves and with
+//! any other spec-faithful implementation, but reject a signature
+//! produced by deployed libsignal for a sign-1 key. The `libsignal`
+//! namespace below (`libsignal.sign`/`libsignal.verify`) implements
+//! DEPLOYED libsignal's variant instead — natural-sign `A`, sign bit
+//! smuggled into `s[31]`'s top bit — for a caller that needs to
+//! interoperate with real Signal clients/servers rather than a
+//! spec-faithful peer. There is no default: a caller must write either
+//! `xeddsa.sign`/`xeddsa.verify` or `xeddsa.libsignal.sign`/
+//! `xeddsa.libsignal.verify`, so which wire format is in play is always
+//! visible at the call site — see `kat_test.zig`, which pins BOTH
+//! variants against libsignal's own published test vector (whose key is
+//! itself a natural-sign-1 key, the exact case the spec variant cannot
+//! handle). See `SPEC.md` for the threat-model caveat (key reuse across
+//! DH and signing contexts) this scheme deliberately accepts.
 //!
 //! Constant-time posture: `sign` handles the secret scalar exclusively
 //! with `Edwards25519.scalar`'s constant-time ops and a constant-time
@@ -62,11 +71,16 @@ const Sha512 = std.crypto.hash.sha2.Sha512;
 /// A 64-byte XEdDSA signature: `R (32 bytes, Edwards-compressed) || s (32
 /// bytes, little-endian scalar)` — the same wire shape as a plain Ed25519
 /// signature (`std.crypto.sign.Ed25519.Signature.encoded_length`), but
-/// computed over the sign-bit-forced Edwards point derived from a
-/// Montgomery keypair rather than a native Ed25519 one. `s` is always a
-/// canonical scalar (`< L`, top bit clear) — this module implements the
-/// spec variant, NOT deployed libsignal's smuggle-the-sign-bit-in-`s[31]`
-/// variant (see the module doc comment).
+/// computed over an Edwards point derived from a Montgomery keypair
+/// rather than a native Ed25519 one. The SAME 64-byte type is shared by
+/// both variants this module implements (see the module doc comment):
+/// under top-level `sign`/`verify` (the spec variant), `s` is always a
+/// canonical scalar (`< L`, top bit clear); under `libsignal.sign`/
+/// `libsignal.verify` (deployed libsignal's variant), `s`'s top bit
+/// instead carries the signer's natural Edwards sign bit, and the
+/// remaining 255 bits must be `< L`. A `Signature` value is only
+/// meaningful together with the variant that produced it — the two
+/// `verify` functions deliberately disagree on sign-1-key signatures.
 pub const Signature = [64]u8;
 
 /// `Z`, the 64-byte random-data input the spec's `sign(a, M, Z)` takes
@@ -270,13 +284,131 @@ pub fn verify(montgomery_pub: [32]u8, msg: []const u8, sig: Signature) bool {
     return std.crypto.timing_safe.eql([32]u8, r_check.toBytes(), sig[0..32].*);
 }
 
+/// The `libsignal` variant's key derivation (spec § "Sign", `calculate_
+/// key_pair(k)`, WITHOUT the sign-0 forcing step): clamp + wide-reduce the
+/// Montgomery seed exactly like `calculateKeyPair`, but return the scalar
+/// and public point AS-IS — no negate-if-sign-1 selection. `public`'s
+/// compressed sign bit is therefore whatever the key naturally has
+/// (0 or 1), which is exactly the bit `libsignal.sign` smuggles into
+/// `s[31]` and `libsignal.verify` reads back out.
+fn naturalKeyPair(montgomery_priv: [32]u8) struct {
+    scalar: scalar.CompressedScalar,
+    public: [32]u8,
+} {
+    var t = montgomery_priv;
+    defer std.crypto.secureZero(u8, &t);
+    scalar.clamp(&t);
+    var k = scalar.reduce(t);
+    defer std.crypto.secureZero(u8, &k);
+    // Same degenerate-key posture as calculateKeyPair (see its comment):
+    // unreachable for an honest key, not attacker-triggerable through
+    // verify.
+    const e = Edwards25519.basePoint.mul(k) catch
+        @panic("xeddsa: degenerate private key (clamped scalar is 0 mod L)");
+    return .{ .scalar = k, .public = e.toBytes() };
+}
+
+/// **Deployed libsignal's XEdDSA variant** (see the module doc comment
+/// and `SPEC.md`'s "Spec variant, not deployed-libsignal variant"
+/// section): libsignal-protocol-c/-java and the current Rust libsignal
+/// (`curve25519.rs`) sign with the signer's NATURAL-sign Edwards point —
+/// no forcing — and instead smuggle that sign bit into the
+/// most-significant bit of `s` (`signature[63]`, always zero in a
+/// canonical scalar since the group order `L < 2^253`, so the bit is free
+/// to reuse). Byte-exactly interoperable with real Signal clients/
+/// servers; NOT interoperable with the top-level `sign`/`verify` for a
+/// sign-1 key (see `kat_test.zig`'s KAT block, which is the reason this
+/// namespace exists rather than a silent default).
+pub const libsignal = struct {
+    /// `libsignal.sign(k, M, Z)`: identical construction to the top-level
+    /// `sign` EXCEPT step 1 uses `naturalKeyPair` (no sign forcing) and
+    /// the returned `s` has the natural public key's sign bit OR'd into
+    /// its top bit before being returned. Because `mulAdd`'s result is
+    /// always `< L < 2^253`, that bit is guaranteed zero beforehand, so
+    /// OR-ing it in never collides with the scalar's own value — this is
+    /// exactly the encoding `libsignal.verify` (and real Signal) expects.
+    pub fn sign(montgomery_priv: [32]u8, msg: []const u8, z: RandomData) Signature {
+        var kp = naturalKeyPair(montgomery_priv);
+        defer std.crypto.secureZero(u8, &kp.scalar);
+        const sign_bit: u8 = kp.public[31] >> 7;
+
+        var st = Sha512.init(.{});
+        st.update(&hash1_prefix);
+        st.update(&kp.scalar);
+        st.update(msg);
+        st.update(&z);
+        var r64: [64]u8 = undefined;
+        defer std.crypto.secureZero(u8, &r64);
+        st.final(&r64);
+        var r = scalar.reduce64(r64);
+        defer std.crypto.secureZero(u8, &r);
+
+        const r_point = Edwards25519.basePoint.mul(r) catch
+            @panic("xeddsa: nonce reduced to 0 mod L");
+        const r_bytes = r_point.toBytes();
+
+        st = Sha512.init(.{});
+        st.update(&r_bytes);
+        st.update(&kp.public);
+        st.update(msg);
+        var h64: [64]u8 = undefined;
+        st.final(&h64);
+        const h = scalar.reduce64(h64);
+
+        var sig: Signature = undefined;
+        sig[0..32].* = r_bytes;
+        sig[32..64].* = scalar.mulAdd(h, kp.scalar, r);
+        sig[63] |= sign_bit << 7;
+        return sig;
+    }
+
+    /// `libsignal.verify(u, M, (R || s))`: same shape as the top-level
+    /// `verify` except (a) the sign-0 point `edwardsFromMontgomery`
+    /// recovers is conditionally negated back to the signer's NATURAL
+    /// sign using the bit smuggled in `sig[63]`, and (b) that bit is
+    /// masked off `s` before the canonicality check and the `sB - hA`
+    /// equation, since it is not part of the scalar. Masking is
+    /// mandatory, not optional decoration: skip it and a genuine sign-1
+    /// signature's `s` reads as `>= 2^255 > L` and is wrongly rejected as
+    /// non-canonical; mask unconditionally without reading the bit first
+    /// (e.g. always clearing it) and a corrupted top bit on a sign-0
+    /// signature would be silently ignored instead of changing which `A`
+    /// is checked against.
+    pub fn verify(montgomery_pub: [32]u8, msg: []const u8, sig: Signature) bool {
+        const a_sign0 = edwardsFromMontgomery(montgomery_pub) catch return false;
+        a_sign0.rejectIdentity() catch return false;
+        a_sign0.rejectLowOrder() catch return false;
+
+        const sign_bit: u8 = sig[63] >> 7;
+        const a_point = if (sign_bit == 1) a_sign0.neg() else a_sign0;
+        const a_bytes = a_point.toBytes();
+
+        var s = sig[32..64].*;
+        s[31] &= 0x7F;
+        scalar.rejectNonCanonical(s) catch return false;
+
+        var st = Sha512.init(.{});
+        st.update(sig[0..32]);
+        st.update(&a_bytes);
+        st.update(msg);
+        var h64: [64]u8 = undefined;
+        st.final(&h64);
+        const h = scalar.reduce64(h64);
+
+        const r_check = Edwards25519.basePoint.mulDoubleBasePublic(s, a_point.neg(), h) catch return false;
+        return std.crypto.timing_safe.eql([32]u8, r_check.toBytes(), sig[0..32].*);
+    }
+};
+
 // ── dark-tests aggregator note ──────────────────────────────────────────
 //
 // This file's in-file tests cover the internal `calculateKeyPair` <->
-// `edwardsFromMontgomery` sign-0 agreement (only reachable from inside
-// this file); the sign/verify round-trip, tamper-rejection, libsignal
-// known-answer vector, and X3DH end-to-end tests live in `kat_test.zig`
-// (imported by `root.zig`'s aggregator).
+// `edwardsFromMontgomery` sign-0 agreement and `naturalKeyPair` <->
+// `libsignal.sign`/`verify` self-consistency (only reachable from inside
+// this file, both self round-trips — no external anchor); the sign/verify
+// round-trip, tamper-rejection, libsignal known-answer vector (the
+// EXTERNAL anchor, exercised against both variants), and X3DH end-to-end
+// tests live in `kat_test.zig` (imported by `root.zig`'s aggregator).
 
 test "Signature/RandomData sizes match the XEdDSA wire shape" {
     try std.testing.expectEqual(@as(usize, 64), @sizeOf(Signature));
@@ -319,6 +451,41 @@ test "sign-0 convention agrees end-to-end: verify's recovered A == sign's forced
         const mont_pub = try std.crypto.dh.X25519.recoverPublicKey(seed);
         const recovered = try edwardsFromMontgomery(mont_pub);
         try std.testing.expectEqualSlices(u8, &kp.public, &recovered.toBytes());
+    }
+    try std.testing.expect(seen_sign_bit[0]);
+    try std.testing.expect(seen_sign_bit[1]);
+}
+
+test "libsignal variant round-trips (self-consistency, both sign-bit branches) and s carries the natural sign bit" {
+    // In-house re-derivation, not an external anchor (the libsignal KAT
+    // vector's sign-1 anchor lives in kat_test.zig): confirms
+    // naturalKeyPair's UNFORCED public point is exactly what
+    // libsignal.sign/verify agree on, for both sign-bit branches, and
+    // that the smuggled bit in s[63] matches the signer's natural sign.
+    var seen_sign_bit = [2]bool{ false, false };
+    var seed_src: [64]u8 = undefined;
+    var z: RandomData = undefined;
+    for (&z, 0..) |*b, i| b.* = @intCast(i);
+    var i: u8 = 0;
+    while (i < 16) : (i += 1) {
+        Sha512.hash(&[_]u8{ 'x', 'e', 'd', 'd', 's', 'a', 'l', 's', i }, &seed_src, .{});
+        const seed = seed_src[0..32].*;
+
+        const kp = naturalKeyPair(seed);
+        const natural_sign = kp.public[31] >> 7;
+        seen_sign_bit[natural_sign] = true;
+
+        const msg = "libsignal-variant self round-trip";
+        const sig = libsignal.sign(seed, msg, z);
+        try std.testing.expectEqual(natural_sign, sig[63] >> 7);
+        try std.testing.expect(libsignal.verify((try std.crypto.dh.X25519.recoverPublicKey(seed)), msg, sig));
+
+        // Tampering the smuggled sign bit alone (holding every other bit
+        // of s fixed) must flip verification to false: it changes WHICH
+        // A the equation checks against, not a harmless spare bit.
+        var flipped = sig;
+        flipped[63] ^= 0x80;
+        try std.testing.expect(!libsignal.verify((try std.crypto.dh.X25519.recoverPublicKey(seed)), msg, flipped));
     }
     try std.testing.expect(seen_sign_bit[0]);
     try std.testing.expect(seen_sign_bit[1]);

@@ -19,17 +19,19 @@
 //! (`test_curve25519_signature` in libsignal-protocol-c's
 //! `tests/test_curve25519.c`; the same bytes appear in
 //! libsignal-protocol-java) — numeric facts only, no code taken; see
-//! `../NOTICE`. Deployed libsignal implements a documented VARIANT of the
-//! spec (the sign bit of the signer's Edwards key is smuggled in `s`'s
-//! top bit instead of being forced to 0 — see `xeddsa.zig`'s module doc
-//! comment), so the vector is exercised two ways: a test-local
-//! variant-faithful verifier built on this module's
-//! `xeddsa.edwardsFromMontgomery` must ACCEPT it byte-exactly (proving
-//! the Montgomery->Edwards recovery and the whole `sB - hA` equation
-//! against a real libsignal-produced signature), and the module's own
-//! spec-pure `xeddsa.verify` must REJECT it (the variants are
-//! deliberately incompatible for sign-1 keys, and this vector's key is
-//! sign-1).
+//! `../NOTICE`. **EXTERNAL ANCHOR**, exercised against BOTH variants this
+//! module ships (`xeddsa.zig`'s module doc comment): the module's public
+//! `xeddsa.libsignal.verify` must ACCEPT this vector byte-exactly with
+//! all 64 single-byte tampers rejected — a positive anchor for the
+//! deployed-libsignal variant, proving the Montgomery->Edwards recovery
+//! and the whole `sB - hA` equation against a real libsignal-produced
+//! signature the module did not itself create — and the spec-pure
+//! top-level `xeddsa.verify` must REJECT the very same bytes (the
+//! variants are deliberately incompatible for sign-1 keys, and this
+//! vector's key IS sign-1 — exactly the case the spec variant cannot
+//! handle). Before this pass, only a test-local reimplementation of the
+//! variant (`libsignalVariantVerify`, since removed) accepted the vector;
+//! the shipped `xeddsa.libsignal.verify` is now exercised directly.
 
 const std = @import("std");
 const x3dh = @import("x3dh.zig");
@@ -374,53 +376,32 @@ const ls_signature: [64]u8 = .{
     0xce, 0xf0, 0x47, 0xbd, 0x60, 0xb8, 0x6e, 0x88,
 };
 
-/// Deployed libsignal's VARIANT of XEdDSA verification (see this file's
-/// module doc comment): `A`'s sign bit rides in `s`'s top bit
-/// (`sig[63] >> 7`) instead of being fixed to 0, and the challenge hash
-/// uses the natural-sign `A`. Built on the module's own
-/// `xeddsa.edwardsFromMontgomery` recovery, so a byte-exact accept of the
-/// libsignal vector validates that recovery (and the whole `sB - hA`
-/// equation) against a signature this module did not produce. TEST-ONLY —
-/// the module's public `verify` is spec-pure and stays that way.
-fn libsignalVariantVerify(montgomery_pub: [32]u8, msg: []const u8, sig: [64]u8) bool {
-    const Edwards25519 = std.crypto.ecc.Edwards25519;
-    const scalar = Edwards25519.scalar;
-    const a_sign0 = xeddsa.edwardsFromMontgomery(montgomery_pub) catch return false;
-    a_sign0.rejectLowOrder() catch return false;
-    const a_point = if (sig[63] >> 7 == 1) a_sign0.neg() else a_sign0;
-    const a_bytes = a_point.toBytes();
-    var s = sig[32..64].*;
-    s[31] &= 0x7F;
-    scalar.rejectNonCanonical(s) catch return false;
-    var st = std.crypto.hash.sha2.Sha512.init(.{});
-    st.update(sig[0..32]);
-    st.update(&a_bytes);
-    st.update(msg);
-    var h64: [64]u8 = undefined;
-    st.final(&h64);
-    const h = scalar.reduce64(h64);
-    const r_check = Edwards25519.basePoint.mulDoubleBasePublic(s, a_point.neg(), h) catch return false;
-    return std.mem.eql(u8, &r_check.toBytes(), sig[0..32]);
-}
-
 test "XEdDSA KAT: the libsignal vector's keypair is a genuine X25519 pair (vector transcription sanity)" {
     const derived = try X25519.recoverPublicKey(ls_alice_priv);
     try std.testing.expectEqualSlices(u8, &ls_alice_pub, &derived);
 }
 
-test "XEdDSA KAT: libsignal test_curve25519_signature accepted byte-exactly by the variant verifier; every 1-byte tamper rejected" {
-    // This vector's key is a sign-1 key (sig[63]'s top bit is set), so it
-    // exercises the negated branch of the Montgomery->Edwards recovery.
+test "XEdDSA KAT: libsignal test_curve25519_signature accepted byte-exactly by xeddsa.libsignal.verify; every 1-byte tamper rejected" {
+    // EXTERNAL ANCHOR (libsignal-protocol-c's own KAT — see this file's
+    // module doc comment and ../NOTICE), exercised against the module's
+    // SHIPPED deployed-libsignal-variant verifier, not a test-local
+    // reimplementation. This vector's key is a sign-1 key (sig[63]'s top
+    // bit is set), which is exactly the case the spec variant cannot
+    // handle — so this is also the required positive anchor for a
+    // natural-sign-1 key.
     try std.testing.expectEqual(@as(u8, 1), ls_signature[63] >> 7);
-    try std.testing.expect(libsignalVariantVerify(ls_alice_pub, &ls_message, ls_signature));
+    try std.testing.expect(xeddsa.libsignal.verify(ls_alice_pub, &ls_message, ls_signature));
 
-    // Same tamper sweep libsignal's own C test runs: flip the low bit of
-    // each of the 64 signature bytes in turn — all must reject.
+    // Teeth check: same tamper sweep libsignal's own C test runs — flip
+    // the low bit of each of the 64 signature bytes in turn, confirm
+    // EVERY one is rejected, then move to the next (each iteration starts
+    // from a fresh untampered copy, so the vector itself is never left
+    // corrupted for the accept-check above, which already ran first).
     var i: usize = 0;
     while (i < ls_signature.len) : (i += 1) {
         var tampered = ls_signature;
         tampered[i] ^= 0x01;
-        try std.testing.expect(!libsignalVariantVerify(ls_alice_pub, &ls_message, tampered));
+        try std.testing.expect(!xeddsa.libsignal.verify(ls_alice_pub, &ls_message, tampered));
     }
 }
 
@@ -432,16 +413,38 @@ test "XEdDSA KAT: the spec-pure verify deliberately REJECTS libsignal's sign-bit
     try std.testing.expect(!xeddsa.verify(ls_alice_pub, &ls_message, ls_signature));
 }
 
-test "XEdDSA KAT: this module's sign round-trips over the libsignal vector's own (sign-1) key" {
+test "XEdDSA KAT: this module's spec-variant sign round-trips over the libsignal vector's own (sign-1) key" {
+    // Self round-trip, NOT an external anchor: `z` here is this test's own
+    // choice, not libsignal's, so it cannot reproduce `ls_signature`'s
+    // exact bytes (a different nonce yields a different, equally valid,
+    // signature) — it only checks this module's own sign/verify agree.
     var z: xeddsa.RandomData = undefined;
     for (&z, 0..) |*b, i| b.* = @intCast(i);
     const sig = xeddsa.sign(ls_alice_priv, &ls_message, z);
     // Spec variant: s is canonical, top bit never smuggled.
     try std.testing.expectEqual(@as(u8, 0), sig[63] >> 7);
     try std.testing.expect(xeddsa.verify(ls_alice_pub, &ls_message, sig));
-    // And the variant verifier accepts it too: a spec signature is the
-    // sign_bit == 0 special case of the variant.
-    try std.testing.expect(libsignalVariantVerify(ls_alice_pub, &ls_message, sig));
+    // And the deployed-variant verifier accepts it too: a spec signature
+    // is the sign_bit == 0 special case of the variant.
+    try std.testing.expect(xeddsa.libsignal.verify(ls_alice_pub, &ls_message, sig));
+}
+
+test "XEdDSA KAT: xeddsa.libsignal.sign self-round-trips over the libsignal vector's own (sign-1) key" {
+    // Self round-trip, NOT an external anchor (same nonce caveat as
+    // above): confirms the module's OWN deployed-variant signer produces
+    // a signature its OWN deployed-variant verifier accepts, and that it
+    // reproduces the vector's sign-1 bit (a property of the KEY, not the
+    // nonce) even though the signature bytes themselves necessarily
+    // differ from `ls_signature`.
+    var z: xeddsa.RandomData = undefined;
+    for (&z, 0..) |*b, i| b.* = @intCast(255 - i);
+    const sig = xeddsa.libsignal.sign(ls_alice_priv, &ls_message, z);
+    try std.testing.expectEqual(@as(u8, 1), sig[63] >> 7);
+    try std.testing.expect(xeddsa.libsignal.verify(ls_alice_pub, &ls_message, sig));
+    // A sign-1 deployed-variant signature must NOT verify under the
+    // spec-pure verifier (non-canonical s, same reasoning as the raw
+    // libsignal vector above).
+    try std.testing.expect(!xeddsa.verify(ls_alice_pub, &ls_message, sig));
 }
 
 // ── independent cross-check via std's Ed25519 verifier ─────────────────

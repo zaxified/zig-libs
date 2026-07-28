@@ -25,11 +25,13 @@
 //! `initAlice`/`initBob`/`encrypt`/`decrypt`, `KDF_RK`/`KDF_CK`, the DH +
 //! symmetric-key ratchets, `max_skip`-bounded out-of-order handling, and a
 //! transactional fail-closed `decrypt`) is real and tested end-to-end
-//! seeded from a live X3DH agreement. XEdDSA follows the SPEC's sign-0
-//! convention, which deployed libsignal deliberately deviates from — see
-//! `xeddsa.zig`'s module doc comment for the variant note and
-//! `src/kat_test.zig` for how the libsignal known-answer vector is used
-//! to validate both facts.
+//! seeded from a live X3DH agreement. `xeddsa.sign`/`verify` follow the
+//! SPEC's sign-0 convention; `xeddsa.libsignal.sign`/`verify` implement
+//! deployed libsignal's documented deviation instead (natural-sign key,
+//! sign bit smuggled in `s`'s top bit) — a caller names one or the other
+//! explicitly, there is no default. See `xeddsa.zig`'s module doc comment
+//! for the variant note and `src/kat_test.zig` for how the libsignal
+//! known-answer vector anchors BOTH.
 //!
 //! Consumer: an end-to-end-encrypted messaging application — a client
 //! fetches a recipient's `PreKeyBundle` from a directory/coordination

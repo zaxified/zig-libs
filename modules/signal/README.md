@@ -23,19 +23,24 @@ Ratchet (`ratchet.State`: `initAlice`/`initBob`/`encrypt`/`decrypt`) is
 real and tested end-to-end seeded from a live X3DH agreement — interleaved
 sessions with repeated DH ratchets, out-of-order delivery (within a chain
 and across a ratchet boundary), `max_skip` DoS rejection, and a
-transactional fail-closed `decrypt`. Note: XEdDSA here is the SPEC variant
-(signer's Edwards sign bit forced to 0); deployed libsignal ships a
-documented deviation (sign bit smuggled in `s`'s top bit) — the two are
-wire-incompatible for ~half of all keys, and `src/kat_test.zig` pins both
-facts against libsignal's own test vector. See [SPEC.md](SPEC.md).
+transactional fail-closed `decrypt`. **Two XEdDSA variants, chosen
+explicitly at the call site:** `xeddsa.sign`/`xeddsa.verify` are the SPEC
+variant (signer's Edwards sign bit forced to 0); `xeddsa.libsignal.sign`/
+`xeddsa.libsignal.verify` are deployed libsignal's variant (natural-sign
+key, sign bit smuggled in `s`'s top bit), for a caller that needs to
+interoperate with real Signal clients/servers. The two are
+wire-incompatible for ~half of all keys, and `src/kat_test.zig` pins
+libsignal's own test vector — whose key is itself sign-1 — as an external
+anchor accepted byte-exactly by `xeddsa.libsignal.verify` and rejected by
+the spec-pure `xeddsa.verify`. See [SPEC.md](SPEC.md).
 
 | File | Contents |
 |---|---|
 | `src/root.zig` | `meta`, flat re-exports of the X3DH + Double Ratchet surface, dark-tests aggregator |
 | `src/x3dh.zig` | Key types (`IdentityKey`/`SignedPreKey`/`OneTimePreKey`/`EphemeralKey`), `PreKeyBundle`/`InitialMessage` codecs, the four-DH + HKDF agreement (`initiateUnverified`/`respond`), fail-closed `initiate`, `generateSignedPreKey` |
-| `src/xeddsa.zig` | XEdDSA `sign`/`verify` + `edwardsFromMontgomery` (the sign-0 Montgomery->Edwards recovery), sign-0-convention tests |
+| `src/xeddsa.zig` | XEdDSA `sign`/`verify` (spec variant) + `libsignal.sign`/`verify` (deployed-libsignal variant) + `edwardsFromMontgomery` (the sign-0 Montgomery->Edwards recovery both variants share), sign-0-convention + libsignal-variant self-consistency tests |
 | `src/ratchet.zig` | Double Ratchet `State` (`initAlice`/`initBob`/`encrypt`/`decrypt`), `Header`/`Message` + header codec, `KDF_RK`/`KDF_CK`, DH + symmetric-key ratchets, `max_skip`-bounded skipped-key store, transactional decrypt; full-session / out-of-order / MAX_SKIP / tamper tests |
-| `src/kat_test.zig` | X3DH agreement + codec tests; XEdDSA round-trip/tamper/fail-closed tests; the libsignal known-answer vector (variant-verifier accept + spec-verify reject); std-Ed25519 cross-check; `initiate`/`respond` end-to-end |
+| `src/kat_test.zig` | X3DH agreement + codec tests; XEdDSA round-trip/tamper/fail-closed tests; the libsignal known-answer vector as an external anchor exercised against BOTH variants (`xeddsa.libsignal.verify` byte-exact accept + 64-tamper rejection, `xeddsa.verify` reject); std-Ed25519 cross-check; `initiate`/`respond` end-to-end |
 
 ## Import
 
@@ -77,6 +82,22 @@ signature check — kept for testing the agreement math in isolation;
 real callers should use `signal.initiate` (skipping verification breaks
 X3DH's mutual-authentication guarantee — see [SPEC.md](SPEC.md)'s threat
 model).
+
+`x3dh.zig` itself always uses the spec's XEdDSA variant (`xeddsa.sign`/
+`xeddsa.verify`) internally — that is a private implementation detail of
+this module's own protocol, self-consistent between its own Alice/Bob.
+A caller that instead needs to verify a signature FROM a real Signal
+client/server (or produce one a real Signal peer can verify) calls
+`signal.xeddsa.libsignal.sign`/`signal.xeddsa.libsignal.verify` directly:
+
+```zig
+// Verifying a signed prekey signature that came from real Signal:
+const ok = signal.xeddsa.libsignal.verify(their_montgomery_pub, signed_prekey_bytes, their_signature);
+```
+
+The two variants are wire-incompatible for keys whose natural Edwards
+point has sign 1 (~half of all keys) — see [SPEC.md](SPEC.md)'s "Both
+variants, chosen explicitly at the call site" section.
 
 ## Double Ratchet walkthrough (Part 2)
 
