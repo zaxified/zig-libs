@@ -42,6 +42,40 @@ The collection grew 77 → 148 modules since v0.1.0. Highlights, by area:
   6 modules missing README catalog rows); versioning + spin-off policy
   (`CONVENTIONS.md` §8); this changelog.
 
+Per-module API changes since v0.1.0 worth calling out:
+
+- **`x509`:** new `x509.spkiOf(certificate_der)` → `x509.Spki` — a
+  certificate's `SubjectPublicKeyInfo` (full TLV + algorithm OID + parameters
+  + key bits) extracted over the defensive `safe.zig` walk, never through
+  `std.crypto.Certificate.parse`. Every returned slice borrows the caller's
+  buffer. Works on RSASSA-PSS-signed certificates, which std cannot parse at
+  all. Adds `safe.oid_*` OID constants.
+- **`saml`:** Holder-of-Key subject confirmation now performs **cross-form**
+  matching (an `<ds:X509Certificate>` confirmation against a configured bare
+  `presented_holder_key`, and a `<ds:KeyValue>` confirmation against a
+  configured `presented_holder_cert_der`) over `x509.spkiOf`, comparing key
+  parameters — RSA modulus/exponent, P-256 affine point — never encodings.
+  **BREAKING (behavioral, not signature):** pairings that previously always
+  returned `error.HolderOfKeyCrossFormUnsupported` can now confirm a subject,
+  and that error's meaning narrows to "key material was named but none of it
+  could be reduced to a comparable key". Same-form matching, and every
+  non-HoK path, are unchanged. New sibling dependency: `x509`.
+- **`dtls`:** `signature_algorithms` is now genuinely negotiated instead of
+  advertised-and-ignored. New `Config.signature_algorithms` drives both what
+  this side offers and what it will accept; the scheme used to sign
+  CertificateVerify is chosen from peer-advertised ∩ self-permitted ∩
+  key-producible. A peer signing with a scheme we never advertised is
+  rejected (`error.SignatureSchemeNotAdvertised`); an empty intersection
+  fails the handshake (`error.NoSignatureSchemeOverlap`). The PSK-mode
+  ClientHello now advertises the extension at all (RFC 8446 §9.2 makes it
+  mandatory; it was omitted), and the server's `CertificateRequest` carries
+  it. **BREAKING:** `CertConfig.signature_scheme` is removed — the scheme is
+  negotiated, no longer configured. New `certverify.candidateSchemes`.
+- **`minisign`:** new module — sign/verify in the minisign file format over
+  Ed25519, both legacy (`Ed`) and prehashed-BLAKE2b (`ED`), including
+  scrypt-encrypted secret keys and the trusted-comment global signature.
+  Byte-exact against artifacts produced by the reference `minisign` binary.
+
 ## v0.1.0 — 2026-07-10
 
 Initial public release: 77 modules, 1844 tests, CI green in Debug +
