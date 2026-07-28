@@ -409,6 +409,70 @@ test "regression: over-long NSEC3 owner-hash label does not overflow (was OOB st
     try testing.expect(decodeOwnerHash(evil_label, &out) == null);
 }
 
+/// Owner-hash label (base32hex text) for `name` under the given parameters,
+/// written into `out` (>= 32 bytes). Mirrors what a signer puts in the zone.
+fn ownerLabel(name: []const u8, salt: []const u8, iterations: u16, out: []u8) []u8 {
+    const h = hashName(name, salt, iterations).?;
+    return encode(&h, out);
+}
+
+test "proveDenial NSEC3: the next-closer/wildcard COVER is honored — an empty-gap chain is bogus" {
+    // Teeth for `coverNsec3`. Every other NSEC3 test in this module (and the
+    // ldns-oracle ones in oracle_test.zig) asserts a *successful* proof, so all
+    // of them still pass against an implementation whose cover check is a no-op
+    // ("any NSEC3 record covers any hash") — verified by mutation. These two
+    // sets are byte-identical except for `next_hashed_owner_name`, so the ONLY
+    // thing that can flip the verdict between them is the hash-range check.
+    const salt = "\xab\xcd";
+    const iters: u16 = 5;
+    var label_buf: [64]u8 = undefined;
+    const ce_label = ownerLabel("www.example", salt, iters, &label_buf);
+    const ce_hash = hashName("www.example", salt, iters).?;
+    const empty_types: rdata.TypeBitMap = .{ .raw = "" };
+
+    // (a) next == owner: the record wraps, so its gap spans the whole hash
+    //     circle and covers both the next closer (sub.www.example) and the
+    //     wildcard (*.www.example) -> a complete NXDOMAIN proof.
+    const wide: Nsec3Set = .{ .records = &[_]Nsec3Record{.{
+        .owner_hash_label = ce_label,
+        .rdata = .{
+            .hash_algorithm = hash_algorithm_sha1,
+            .flags = 0,
+            .iterations = iters,
+            .salt = salt,
+            .next_hashed_owner_name = &ce_hash,
+            .types = empty_types,
+        },
+    }} };
+    try testing.expectEqual(DenialResult.name_error, proveDenial("sub.www.example", 1, wide, salt, iters));
+
+    // (b) next == owner+1: the same record, same match, but its gap is empty and
+    //     therefore covers nothing. The closest encloser still MATCHES, so this
+    //     is precisely "denial proof present but invalid", not "proof absent".
+    var next_plus_one: [sha1_digest_len]u8 = ce_hash;
+    var i: usize = next_plus_one.len;
+    while (i > 0) {
+        i -= 1;
+        if (next_plus_one[i] != 0xff) {
+            next_plus_one[i] += 1;
+            break;
+        }
+        next_plus_one[i] = 0;
+    }
+    const narrow: Nsec3Set = .{ .records = &[_]Nsec3Record{.{
+        .owner_hash_label = ce_label,
+        .rdata = .{
+            .hash_algorithm = hash_algorithm_sha1,
+            .flags = 0,
+            .iterations = iters,
+            .salt = salt,
+            .next_hashed_owner_name = &next_plus_one,
+            .types = empty_types,
+        },
+    }} };
+    try testing.expectEqual(DenialResult.bogus, proveDenial("sub.www.example", 1, narrow, salt, iters));
+}
+
 test "proveDenial: over-limit NSEC3 iterations downgrade to insecure (RFC 9276, audit F3)" {
     const empty: Nsec3Set = .{ .records = &[_]Nsec3Record{} };
     // Above the cap: refuse the amplified hashing, return insecure before any work.

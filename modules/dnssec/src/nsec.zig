@@ -363,6 +363,16 @@ test "proveDenial NXDOMAIN: RED if gap-coverage is honored — qname just outsid
     // a.example exists (matched, type A present) → cannot be NXDOMAIN; querying
     // a type it HAS is not a denial at all → bogus.
     try testing.expectEqual(DenialResult.bogus, proveDenial("a.example", 1, .{ .records = &set }));
+
+    // The assertion above only exercises the MATCH path (owner-name equality +
+    // bitmap), so it passes unchanged against an implementation whose cover
+    // check is a no-op ("any NSEC covers any name") — verified by mutation.
+    // Teeth for the gap check proper: take the same chain minus its wrapping
+    // record, so `zzz.example` (which sorts after every owner) falls outside
+    // every remaining gap. Only a real owner<name<next test can tell this from
+    // the covered case in the positive control above.
+    const truncated = set[0..2].*;
+    try testing.expectEqual(DenialResult.bogus, proveDenial("zzz.example", 1, .{ .records = &truncated }));
 }
 
 test "proveDenial NXDOMAIN: forged next-name that does not cover the qname is bogus" {

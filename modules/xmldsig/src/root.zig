@@ -717,6 +717,35 @@ test "verify: ECDSA-P256-SHA256 enveloped signature round-trips" {
     var res = try verify(a, &doc, sig, .{ .key = .{ .ecdsa_p256_sec1 = &pub_sec1 } });
     defer res.deinit(a);
     try testing.expect(res.valid);
+
+    // Teeth for the ECDSA branch specifically. The round-trip above passes
+    // unchanged against a `verifySignature` whose `.ecdsa_sha256` arm just
+    // returns true — the negative signature tests elsewhere in this file all go
+    // through the RSA arm, so nothing else can catch that (verified by
+    // mutation). Both checks below leave the document, its transforms and its
+    // reference digest intact, so only the ECDSA verify can flip the verdict.
+
+    // (a) Right document, a different (valid) P-256 key.
+    const other_pub = (try p256.P256.combMulBase([_]u8{0x22} ** 32, .big)).toUncompressedSec1();
+    var wrong_key_res = try verify(a, &doc, sig, .{ .key = .{ .ecdsa_p256_sec1 = &other_pub } });
+    defer wrong_key_res.deinit(a);
+    try testing.expect(!wrong_key_res.valid);
+    try testing.expect(wrong_key_res.references[0].digest_valid); // the digest still matches
+
+    // (b) Right key, one flipped bit in the raw r‖s SignatureValue.
+    var bad_rs = rs;
+    bad_rs[0] ^= 0x01;
+    var bad_b64: [128]u8 = undefined;
+    const bad_sig_b64 = std.base64.standard.Encoder.encode(&bad_b64, &bad_rs);
+    const flipped = try std.fmt.allocPrint(a, doc_template, .{ digest_b64, bad_sig_b64 });
+    defer a.free(flipped);
+    var doc_f = try xml.parse(a, flipped, .{});
+    defer doc_f.deinit();
+    const sig_f = childByName(doc_f.root, "Signature").?;
+    var flipped_res = try verify(a, &doc_f, sig_f, .{ .key = .{ .ecdsa_p256_sec1 = &pub_sec1 } });
+    defer flipped_res.deinit(a);
+    try testing.expect(!flipped_res.valid);
+    try testing.expect(flipped_res.references[0].digest_valid);
 }
 
 test "verify: unsupported transform (XPath) is rejected" {

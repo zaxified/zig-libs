@@ -159,6 +159,53 @@ test "reject: tampered signature byte -> BadSignature/InvalidSignature" {
     try testing.expect(err == error.BadSignature or err == error.InvalidSignature);
 }
 
+// Both reject-teeth above run through the ES256 arm of `verifySignature`. The
+// RS256 and EdDSA arms had positive vectors only, so the whole suite stayed
+// green against an implementation that discarded their verify results
+// (confirmed by mutation). These two are the missing per-algorithm teeth: the
+// tampered byte sits in signCount — inside the signed message, but past
+// rpIdHash and the flags — so only the signature check can reject it.
+
+test "reject: tampered authenticatorData byte, RS256 credential -> BadSignature" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const v = vectors.packed_rs256;
+    const key = try keyFromHex(a, &v.credential_public_key);
+    try testing.expect(key == .rsa); // the RSA arm, not ES256, is what runs here
+
+    var tampered = v.authenticator_data;
+    tampered[35] ^= 0x01;
+    try testing.expectError(error.BadSignature, webauthn.verifyAssertion(
+        a,
+        &tampered,
+        &v.assertion_client_data_json,
+        &v.signature,
+        key,
+        baseOptions(v),
+    ));
+}
+
+test "reject: tampered authenticatorData byte, EdDSA credential -> BadSignature" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const v = vectors.packed_eddsa;
+    const key = try keyFromHex(a, &v.credential_public_key);
+    try testing.expect(key == .okp); // the Ed25519 arm, not ES256, is what runs here
+
+    var tampered = v.authenticator_data;
+    tampered[35] ^= 0x01;
+    try testing.expectError(error.BadSignature, webauthn.verifyAssertion(
+        a,
+        &tampered,
+        &v.assertion_client_data_json,
+        &v.signature,
+        key,
+        baseOptions(v),
+    ));
+}
+
 test "reject: wrong rpId -> RpIdMismatch" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
