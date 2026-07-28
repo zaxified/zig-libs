@@ -198,6 +198,7 @@ const module_list = [_]Module{
     .{ .name = "opaque", .deps = &.{"voprf"} },
     .{ .name = "bulletproofs" },
     .{ .name = "xmss" },
+    .{ .name = "minisign" },
     .{ .name = "otp" },
     .{ .name = "ctap2pin", .deps = &.{"p256"} },
     .{ .name = "bls12_381" },

@@ -603,6 +603,32 @@ project git history).
                golang-jwt, …) was consulted or copied; the signatures use
                `std.crypto`.
 
+  minisign   — clean-room from the minisign wire-format facts documented in
+               jedisct1/minisign's `minisign.h`/`minisign.c` (ISC License) —
+               the fixed struct layouts (`RawPublicKey`/`RawSecretKey`/
+               `RawSignature`), the 2-byte algorithm tags ("Ed"/"ED" signing,
+               "Sc"/none KDF, "B2" checksum), and the untrusted/trusted
+               comment file framing are uncopyrightable format facts (merger
+               doctrine, policy §0), independently re-derived in Zig and
+               cross-checked byte-exact against the real `minisign` 0.12
+               binary (Debian/Ubuntu package) run as a black-box test oracle
+               (needs no attribution per policy §0 on its own — recorded
+               here anyway because minisign.c/.h WAS read directly for the
+               exact byte layout, which the black-box-oracle policy §0
+               carve-out does not cover). `isPrintableComment` mirrors
+               minisign.c's `is_printable` control-character/UTF-8-validity
+               algorithm shape — a genuine design reference, ported
+               algorithm-for-algorithm (not literally copied C) since it is
+               a small, precisely specified check with no other reasonable
+               expression. Design ref: jedisct1/zig-minisign (ISC License)
+               for the Zig-idiomatic API shape (not read line-by-line, but
+               named as this module's Zig-ecosystem sibling per
+               CONVENTIONS §5). scrypt parameter derivation (ops/mem-limit
+               → N/r/p) reuses Zig std's own
+               `std.crypto.pwhash.scrypt.Params.fromLimits`, which already
+               matches libsodium's `pickparams` algorithm identically — no
+               separate port was needed or done.
+
   http.sse   — clean-room from the WHATWG HTML "server-sent events" standard
                (the text/event-stream wire format: event/id/retry/data fields,
                multi-line data, comment lines). No third-party source consulted
