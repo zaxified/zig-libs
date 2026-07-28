@@ -38,6 +38,7 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 source "$SCRIPT_DIR/manifest.sh"
+source "$SCRIPT_DIR/recipe.sh"
 
 cd "$REPO_ROOT" || exit 1
 
@@ -60,12 +61,17 @@ done
 
 # ── routing table ────────────────────────────────────────────────────────
 # Verified empirically (2026-07-28), not assumed:
-#   tc       -> debian. OpenWRT's default x86-64 build has NO tc qdisc/action
+#   tc       -> debian. OpenWRT's *stock* x86-64 build has NO tc qdisc/action
 #               kernel modules at all — `modprobe sch_netem`/`act_gact`/
 #               `cls_u32`/`cls_flower` all fail "not found", and there is no
 #               `tc` userspace binary either. This is a real kernel gap, not
 #               a privilege gap: Debian's generic cloud kernel loads every
 #               one of those modules cleanly and ships tc/iproute2 6.15.
+#               The PROVISIONED OpenWRT image (scripts/vm/provision.sh) does
+#               have all of them and runs this suite fine — `scripts/vm/
+#               run.sh tc openwrt` is execution-verified. The default stays
+#               debian only because it needs no provisioning step; pick
+#               openwrt explicitly to test the musl/OpenWRT kernel side.
 #   nftables -> openwrt. Execution-verified: `zig build test-nftables`'s live
 #               round-trip/atomicity/JSON-consistency suite (73 tests) all
 #               pass for real, incl. an actual create/list/delete round-trip
@@ -100,17 +106,40 @@ IMAGES_DIR="$SCRIPT_DIR/images"
 WORK_DIR="$SCRIPT_DIR/work"
 mkdir -p "$WORK_DIR"
 
+# ── image selection: provisioned first, stock as a loud fallback ─────────
+# The provisioned image's filename embeds its recipe hash (scripts/vm/
+# recipe.sh), so a package-list change makes the current recipe resolve to a
+# name that does not exist yet — a guaranteed miss. A stale image built from
+# an older list is never reachable, because nothing ever asks for its name.
+# That matters: "provisioned image is out of date" and "the package didn't
+# install" produce identical test failures, and only one of them is a bug in
+# the code under test.
 case "$PLATFORM" in
-    openwrt) IMG="$IMAGES_DIR/$VM_OPENWRT_FILE" ;;
-    debian) IMG="$IMAGES_DIR/$VM_DEBIAN_FILE" ;;
+    openwrt) STOCK_IMG="$IMAGES_DIR/$VM_OPENWRT_FILE" ;;
+    debian) STOCK_IMG="$IMAGES_DIR/$VM_DEBIAN_FILE" ;;
 esac
+PROV_IMG="$(provisioned_image "$PLATFORM")"
+IMAGE_KIND="provisioned"
+IMG="$PROV_IMG"
+if ! provisioned_ok "$PLATFORM"; then
+    IMAGE_KIND="STOCK (unprovisioned)"
+    IMG="$STOCK_IMG"
+    echo "run.sh: no provisioned $PLATFORM image for recipe $(recipe_hash "$PLATFORM" | cut -c1-12)" >&2
+    stale="$(list_stale_provisioned "$PLATFORM")"
+    if [[ -n "$stale" ]]; then
+        echo "        (provisioned images DO exist for other recipes — the package list changed:" >&2
+        echo "$stale" | sed 's/^/          /' >&2
+        echo "         they are NOT used; a stale guest would silently look like a code bug)" >&2
+    fi
+    echo "        falling back to the STOCK image — run: scripts/vm/provision.sh $PLATFORM" >&2
+fi
 if [[ ! -f "$IMG" ]]; then
     echo "run.sh: image missing: $IMG" >&2
-    echo "        run: scripts/vm/fetch-images.sh $PLATFORM" >&2
+    echo "        run: scripts/vm/fetch-images.sh $PLATFORM && scripts/vm/provision.sh $PLATFORM" >&2
     exit 1
 fi
 
-echo "vm: module=$MODULE platform=$PLATFORM target=$TARGET_TRIPLE image=$(basename "$IMG")"
+echo "vm: module=$MODULE platform=$PLATFORM target=$TARGET_TRIPLE image=$(basename "$IMG") [$IMAGE_KIND]"
 
 # ── 1. dependency closure (forward: what MODULE depends on) ────────────
 declare -a G_NAMES=() G_DEPS=()

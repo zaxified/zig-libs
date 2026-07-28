@@ -1,0 +1,100 @@
+#!/usr/bin/expect -f
+# Provisions the Debian image IN PLACE — the one boot in this whole harness
+# that deliberately runs WITHOUT -snapshot, because its entire purpose is to
+# make disk changes that survive poweroff.
+#
+# Args: <writable-image> <hashed-root-password> <memory-MB> <space-separated-packages>
+#
+# Called only by provision.sh, and only ever on a *copy* (provision.sh copies
+# the checksum-verified stock qcow2 to a temp name first, provisions that,
+# and renames it into place on success). The upstream image in
+# scripts/vm/images/ is never written to, so its pinned SHA-512 keeps
+# verifying forever.
+#
+# Why boot+apt and not libguestfs/virt-customize: virt-customize needs to
+# read /boot/vmlinuz-* to build its appliance, and on this host those are
+# mode 0600 root-only. Widening that is a privilege change, which is out of
+# scope — so the guest installs its own packages, as itself, over the serial
+# console that already works.
+#
+# Networking: plain `-netdev user` (slirp). Verified before relying on it —
+# DHCP hands the guest 10.0.2.15, systemd-resolved's stub forwards to slirp's
+# DNS, and deb.debian.org resolves and downloads. No proxy needed.
+#
+# The login/firstboot dance is identical to boot-debian.exp (same fw_cfg
+# systemd credentials — "nocloud" does NOT mean unattended). After this run
+# firstboot has actually completed on disk, so later boots skip it outright.
+
+# apt over slirp is the slow part (~750 kB/s here) — 90s is not enough.
+set timeout 900
+set img [lindex $argv 0]
+set hash [lindex $argv 1]
+set mem [lindex $argv 2]
+set pkgs [lindex $argv 3]
+
+spawn qemu-system-x86_64 -machine accel=kvm:tcg -cpu host -m $mem -no-reboot -nographic \
+    -drive file=$img,format=qcow2,if=virtio \
+    -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
+    -fw_cfg name=opt/io.systemd.credentials/passwd.hashed-password.root,string=$hash \
+    -fw_cfg name=opt/io.systemd.credentials/firstboot.locale,string=C.UTF-8 \
+    -fw_cfg name=opt/io.systemd.credentials/firstboot.timezone,string=UTC \
+    -fw_cfg name=opt/io.systemd.credentials/firstboot.keymap,string=us
+
+set login_tries 0
+expect {
+    -re {login: $} {}
+    "Press any key to proceed" { send "\r"; exp_continue }
+    -re {Please enter[^\r\n]*} { send "\r"; exp_continue }
+    "timed out after" {
+        incr login_tries
+        if {$login_tries > 3} { puts "\nFAIL: agetty login timed out repeatedly"; exit 1 }
+        exp_continue
+    }
+    timeout { puts "\nTIMEOUT waiting for login prompt"; exit 1 }
+}
+send "root\r"
+expect {
+    -re {[Pp]assword:} {}
+    "timed out after" { send "\r"; exp_continue }
+    timeout { puts "\nTIMEOUT waiting for password prompt"; exit 1 }
+}
+send "zigvm\r"
+expect {
+    -re {[#\$] $} {}
+    timeout { puts "\nTIMEOUT waiting for shell after login"; exit 1 }
+}
+
+# Wait for DHCP/resolved to actually be up before apt tries to use them —
+# otherwise the first `apt-get update` can fail on DNS and the whole
+# provisioning step "succeeds" with nothing installed.
+send "for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do getent hosts deb.debian.org >/dev/null 2>&1 && break; sleep 2; done; getent hosts deb.debian.org >/dev/null 2>&1 && echo NET''_OK || echo NET''_FAIL\r"
+expect {
+    "NET_OK" {}
+    "NET_FAIL" { puts "\nFAIL: guest cannot resolve deb.debian.org over slirp"; exit 1 }
+    timeout { puts "\nTIMEOUT waiting for guest network"; exit 1 }
+}
+expect -re {[#\$] $}
+
+# One command batch, one exit code. DEBIAN_FRONTEND=noninteractive so a
+# postinst that wants a debconf answer can't wedge the console forever.
+send "export DEBIAN_FRONTEND=noninteractive; echo ===VM_CMD_BEGIN===; apt-get update && apt-get install -y --no-install-recommends $pkgs && apt-get clean; echo PROVISION_EXIT=\$?; echo ===VM_CMD_END===\r"
+expect {
+    -re {===VM_CMD_END===} {}
+    timeout { puts "\nTIMEOUT during apt-get"; exit 1 }
+}
+expect -re {[#\$] $}
+
+# Flush the page cache to the qcow2 before cutting power. `poweroff` does
+# this too, but an explicit sync makes the failure mode ("provisioned image
+# is missing what apt just installed") impossible to reach by accident.
+send "sync; echo SYN''CED\r"
+expect {
+    "SYNCED" {}
+    timeout { puts "\nTIMEOUT on sync" }
+}
+
+send "\rpoweroff\r"
+expect {
+    eof {}
+    timeout { puts "\nTIMEOUT on poweroff"; exit 1 }
+}

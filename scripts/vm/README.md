@@ -24,9 +24,17 @@ exist for.
 ## Quick start
 
 ```
-scripts/vm/fetch-images.sh          # one-time, ~530 MB total
+scripts/vm/fetch-images.sh          # one-time, ~570 MB of upstream artifacts
+scripts/vm/provision.sh             # one-time, ~3 min — see "Provisioning" below
 scripts/test.sh vm tc               # or: scripts/vm/run.sh tc debian
+scripts/vm/run.sh tc openwrt        # now works too — see "Provisioning"
 ```
+
+`fetch-images.sh` downloads and checksum-verifies **upstream** artifacts.
+`provision.sh` turns them into guests that actually have this repo's
+prerequisites installed (OpenWRT gains `tc` + the sched/netem kmods; Debian
+gains `bpftool` & friends). Both are idempotent: re-running them is a no-op
+unless a package list in `manifest.sh` changed.
 
 ## What actually works — verified, not assumed
 
@@ -35,12 +43,14 @@ that Debian's "nocloud" cloud image needed no seeding. Both assumptions were
 wrong; here's what's actually true, checked by booting real VMs and running
 real test binaries in them (not by reading docs):
 
-- **OpenWRT's default x86-64 build has no `tc` support at all.** No `tc`
+- **OpenWRT's *stock* x86-64 build has no `tc` support at all.** No `tc`
   binary, and none of `sch_netem`/`sch_htb`/`sch_tbf`/`act_gact`/`cls_u32`/
   `cls_flower` load (`modprobe` reports "not found" for every one) — this is
-  a genuine kernel-config gap, not a privilege wall. `tc` tests are routed
-  to Debian, whose generic cloud kernel (6.12.96) loads all of those
-  cleanly and ships `tc`/iproute2 6.15.
+  a genuine package/kernel-config gap, not a privilege wall. It is **fixed by
+  provisioning** (see below): the ImageBuilder-built image has `tc` 6.18.0 and
+  loads every one of those. Debian, whose generic cloud kernel (6.12.96) has
+  them all built or packaged already and ships `tc`/iproute2 6.15, stays the
+  default route for `tc` because it needs no build step.
 - **OpenWRT *does* have nftables** (`nft` binary present, `nf_tables.ko` +
   the `nft_ct`/`nft_fib`/`nft_nat`/`nft_masq`/`nft_reject`/… companion
   modules). `scripts/vm/run.sh nftables openwrt` execution-verifies this:
@@ -83,7 +93,7 @@ real test binaries in them (not by reading docs):
 
 | Module | Platform | Status |
 |---|---|---|
-| `tc` | debian | execution-verified (kernel modules load; `tc` CLI round-trips) |
+| `tc` | debian (default) **or openwrt** | both execution-verified: 129 passed / 1 failed on each, the same failure (see "A real bug this lane found"). openwrt needs `provision.sh` first; that's the only reason debian stays the default |
 | `nftables` | openwrt | execution-verified (73 tests incl. live round-trip) |
 | `conntrack` | openwrt | execution-verified (28 tests) |
 | everything else | debian (default) | most NETNS_MODULES don't need this lane at all — `unshare -rn` already covers them (see `scripts/test.sh`'s own `NETNS_MODULES` comment); route here only for isolation, not privilege |
@@ -91,6 +101,123 @@ real test binaries in them (not by reading docs):
 Override with `scripts/vm/run.sh <module> openwrt|debian` when the default
 routing is wrong for your case. The table lives in `scripts/vm/run.sh`
 (`route_platform`), not duplicated here, so there's one place to update.
+
+## Provisioning: giving a guest what the stock image lacks
+
+The stock OpenWRT image has no `tc` at all (see above) — no binary, no
+`sch_netem`/`sch_htb`/`sch_tbf`/`act_gact`/`cls_u32`/`cls_flower` kernel
+modules. `scripts/vm/provision.sh` closes gaps like that **declaratively**:
+edit a package list in `scripts/vm/manifest.sh`, run the script, get a guest
+that has the prerequisite. Nothing about `run.sh`'s own flow changes.
+
+**One mechanism per platform, both unprivileged, no sudo, nothing written
+outside `scripts/vm/`:**
+
+- **OpenWRT → the official ImageBuilder.** Downloaded and checksum-verified
+  exactly like the stock image (`scripts/vm/fetch-images.sh imagebuilder`),
+  then `make image PROFILE=generic PACKAGES="..."` builds a brand-new image
+  from scratch out of the declarative list. ImageBuilder is self-contained
+  (own toolchain under `staging_dir/host/bin`, own `apk` implementation) and
+  runs as a normal user — no kernel recompile, no loop mounts.
+- **Debian → boot + apt + commit.** `provision.sh` copies the verified stock
+  qcow2, boots that copy **without `-snapshot`** (`provision-debian.exp`,
+  a sibling of `boot-debian.exp` that reuses its login/firstboot dance and
+  marker convention but keeps disk writes instead of discarding them), runs
+  `apt-get update && apt-get install` for the declared list over the same
+  console `boot-debian.exp` already uses, `sync`s, and powers off. The
+  resulting qcow2 is the new provisioned base; ordinary `run.sh` runs then
+  layer their own `-snapshot` on top of it exactly as they do on the stock
+  image today. Deliberately NOT libguestfs/virt-customize: that needs
+  `/boot/vmlinuz-*` readable, which is root-only on this host, and widening
+  that is out of scope.
+
+**Two-stage trust** (full rationale in `scripts/vm/manifest.sh` and
+`scripts/vm/recipe.sh`): fetching an image is a real supply-chain guarantee —
+somebody upstream published a checksum, `fetch-images.sh` verifies it, a
+mismatch aborts loudly. The moment `provision.sh` *changes* that image, that
+guarantee stops applying to the result: the derived image's own SHA-256 is a
+fact about this machine's build, not a signature from anyone, and writing it
+down as if it were an upstream checksum would misrepresent where the trust
+comes from. What **is** reproducible is the *recipe* — upstream artifact
+checksum + package list + platform + a hand-bumped procedure version — and
+that tuple is what gets hashed and baked into the provisioned image's
+filename (`openwrt-...-prov-<hash>.img`, `debian-...-prov-<hash>.qcow2`).
+Each image carries a `.provenance` sidecar with the full recipe text in the
+clear and one clearly-labelled `derived-sha256:` line for change detection
+only — never presented as an upstream guarantee.
+
+**Caching by recipe hash, not by convention.** Because the hash is IN the
+filename, a package-list edit makes the current recipe resolve to a name
+that doesn't exist yet — a guaranteed cache miss, never a stale hit. `run.sh`
+looks for that exact name; if it's not there it falls back to the stock
+image with a loud warning (naming any stale provisioned images left over
+from an older recipe, so "wrong image" and "the package didn't install"
+never look like the same failure).
+
+Demonstrated live on both mechanisms:
+
+- **OpenWRT**: adding `kmod-sched-cake` moved `recipe-sha256` from
+  `86cf4482d2f0…` to `43f8fc41e153…`, `provision.sh --recipe openwrt`
+  flipped to `cached: NO (would rebuild)`, `run.sh tc openwrt` refused the
+  `86cf…` image by name and said so on stderr, and `provision.sh openwrt`
+  rebuilt (1m57s, 9 packages in the manifest instead of 8). Reverting the
+  one-line edit put the hash back to `86cf4482d2f0…` and `provision.sh
+  openwrt` returned in **50 ms** — cache hit, no rebuild, with the
+  now-orphaned `43f8…` image listed as safe to delete.
+- **Debian**: adding `moreutils` moved `recipe-sha256` from `0deab535a92e…`
+  to `1ba61b765ad9…`, `--recipe debian` flipped to `cached: NO`, and
+  `provision.sh debian` rebuilt in 1m14s (fresh copy + boot + apt-get
+  update/install + poweroff). Reverting put the hash back to
+  `0deab535a92e…` and `provision.sh debian` returned in **52 ms** — cache
+  hit, the `1ba6…` image named as safe to delete.
+
+`scripts/vm/provision.sh --recipe [openwrt|debian]` prints the exact recipe
+text, its hash, the image path it resolves to, and whether that's cached —
+without building anything. Useful for checking "would this run.sh invocation
+rebuild?" before committing to a 2-3 minute wait.
+
+### OpenWRT package list (verified against the ImageBuilder's own index, not guessed)
+
+| Package | What it provides | Why |
+|---|---|---|
+| `tc-full` | userspace `tc` (iproute2 6.18.0) | OpenWRT splits tc into tc-tiny/tc-full/tc-bpf; tc-full is the one with the complete qdisc/filter/action set and already depends on kmod-sched-core |
+| `kmod-sched-core` | `sch_htb`, `sch_tbf`, `sch_hfsc`, `sch_ingress`, `cls_u32`, `act_gact`, `act_mirred`, `act_skbedit`, `cls_basic/flow/fw/route/matchall`, `em_u32` | one bundle, not one kmod per qdisc — so most of what the tc suite needs arrives here |
+| `kmod-sched` | `sch_codel`, `sch_fq`, `sch_gred`, ... | `kmod-netem`'s own declared dependency |
+| `kmod-netem` | `sch_netem` | its own top-level package, NOT under the `kmod-sched-*` namespace |
+| `kmod-sched-flower` | `cls_flower` | separate package, own .ko |
+| `kmod-sched-act-police` | `act_police` | the tc suite's "filter action list" test chains a u32 filter into a policer action; not part of sched-core |
+| `kmod-ifb` | `ifb.ko` | future S2 edge-shaper work |
+| `kmod-veth` | `veth.ko` | netns-style topologies |
+
+How those names were established — three checks, no guessing:
+
+1. **The index.** `apk adbdump packages.adb` (using the ImageBuilder's own
+   `staging_dir/host/bin/apk`) over the repositories listed in the
+   ImageBuilder's `repositories` file. That is where `tc-full` vs `tc-tiny`
+   vs `tc-bpf` came from, and where `kmod-netem` turned up as a top-level
+   package rather than a `kmod-sched-*` one.
+2. **The payloads.** `apk adbdump <pkg>.apk` lists the `.ko` files each
+   package actually installs — so "kmod-sched-core contains `sch_htb`" is
+   read off the artifact, not inferred from a description string. This is
+   what showed `act_police` is *not* in sched-core and needs its own
+   package, which no amount of `kmod-sched*` pattern-matching would have.
+3. **The build manifest.** After `make image`, `provision.sh` greps the
+   ImageBuilder's own `.manifest` and **fails loudly** if any requested
+   package is missing — ImageBuilder otherwise only warns on an unknown name
+   and keeps going, which would ship a "successful" image missing exactly
+   the thing that was just added.
+
+Then execution-verified in the booted guest: `which tc` → `/sbin/tc`,
+`tc -V` → `iproute2-6.18.0`, and `modprobe` succeeds for all of
+`sch_netem sch_htb sch_tbf act_gact act_police act_mirred act_skbedit
+cls_u32 cls_flower sch_fq_codel ifb veth`.
+
+### Debian package list
+
+| Package | Already on stock image? | Why declared anyway |
+|---|---|---|
+| `iproute2`, `ethtool` | yes | declares the guarantee explicitly rather than assuming it (apt makes it a no-op) |
+| `kmod`, `bpftool` | **no** (verified: absent on stock) | future eBPF/module-probing test needs |
 
 ## Adding a module to the VM lane
 
@@ -133,10 +260,26 @@ Debian; add a row there once you know which platform actually serves it
 
 ## Wall time
 
-~20-30s per `scripts/vm/run.sh` invocation end to end (compile + boot +
-transfer + run + shutdown), measured across a dozen+ runs of both images.
-Boot itself is ~10s of that; the rest is the cross-compile (dominated by
-`tc`'s golden-byte test tables) and the guest-side run.
+Two different costs, not to be confused:
+
+- **One-off provisioning** (`scripts/vm/provision.sh`, only pays when the
+  recipe hash changes):
+  - OpenWRT ImageBuilder: **1m48s** with the ImageBuilder tree already
+    unpacked, **1m58s** cold (unpacking the 41 MB tarball first). Package
+    downloads from downloads.openwrt.org are included in both.
+  - Debian boot+apt: **1m12s** end to end — copy the 388 MB stock qcow2,
+    boot without `-snapshot`, `apt-get update` (28.4 MB of index over slirp,
+    ~38s), install, `sync`, poweroff.
+  - Cache hit (recipe unchanged): **50 ms**, no boot, no build.
+- **Steady-state `scripts/vm/run.sh`** (cache hit, no rebuild): ~20-30s per
+  invocation end to end (compile + boot + transfer + run + shutdown),
+  measured across a dozen+ runs of both images, provisioned and stock alike
+  — provisioning only changes *which* image file gets booted, not how the
+  boot/transfer/run steps work. Boot itself is ~10s of that; the rest is the
+  cross-compile (dominated by `tc`'s golden-byte test tables) and the
+  guest-side run. Concretely, both on provisioned images:
+  `scripts/vm/run.sh tc openwrt` **26.8s** (25s of it inside the VM),
+  `scripts/vm/run.sh tc debian` **20.9s** (19s inside).
 
 ## A real bug this lane found
 
@@ -148,15 +291,28 @@ whose index matches — `try testing.expect(seen)` at `modules/tc/src/
 root.zig:1222` fails, deterministically, both in the full suite and isolated
 with `--test-filter`.
 
-This is not an environment or harness artifact: the real `tc` CLI (present
-on the Debian image) round-trips the identical `tc actions add action gact
-drop index 77` / `tc actions ls action gact` sequence perfectly (`total acts
-1`, index 77 present) on the same kernel, same boot. The kernel path is
-fine; something in this module's own request-encoding or dump-decoding for
-the standalone action table isn't. Left unfixed per this task's constraints
+This is not an environment or harness artifact: the real `tc` CLI round-trips
+the identical `tc actions add action gact drop index 77` / `tc actions ls
+action gact` sequence perfectly (`total acts 1`, index 77 present) on the
+same kernel, same boot — on the Debian image, and (since provisioning) on
+the OpenWRT image too, with iproute2 6.18.0 against the 6.12.87 musl kernel.
+The kernel path is fine on both; something in this module's own
+request-encoding or dump-decoding for the standalone action table isn't.
+
+**Reproduces byte-identically on the provisioned OpenWRT kernel.** With
+provisioning in place, `scripts/vm/run.sh tc openwrt` runs this test for
+real too (previously it never even reached this code path — the kmod was
+missing) and fails at the exact same `root.zig:1222` with the exact same
+`TestUnexpectedResult`, same test count either side (129 passed / 1
+failed) on both platforms. Same failure on two different kernels
+(OpenWRT's musl/6.12.87 vs Debian's glibc/6.12.96), two different libc's,
+built from the same source by two different cross-compiles, is strong
+evidence the defect is in the module's own netlink encode/decode, not an
+environment quirk of either guest. Left unfixed per this task's constraints
 (no module-source edits) — flagged here as exactly the kind of finding a
 real-root lane is supposed to produce: a test that would otherwise pass
-vacuously forever (SKIP, exit 0) now fails loudly instead.
+vacuously forever (SKIP, exit 0) now fails loudly instead, identically,
+everywhere it can run at all.
 
 ## Image details
 
@@ -168,6 +324,9 @@ vacuously forever (SKIP, exit 0) now fails loudly instead.
 | Fetched from | downloads.openwrt.org | cloud.debian.org (nocloud variant) |
 | Checksum | SHA-256 (of both the `.gz` and the decompressed image) | SHA-512 (Debian only publishes that) |
 | Login | auto (serial askfirst console, no password) | `root` / `zigvm` (fixed, throwaway — ephemeral `-snapshot` guest, no host port exposed) |
+| Provisioning input | `openwrt-imagebuilder-25.12.4-x86-64.Linux-x86_64.tar.zst` (41 MB, SHA-256 pinned) | the stock qcow2 itself, copied |
+| Provisioned as | `openwrt-25.12.4-x86-64-ext4-prov-<recipe12>.img` (raw, 121 MB) | `debian-13-nocloud-amd64-prov-<recipe12>.qcow2` (639 MB after apt) |
+| Provisioned login | unchanged (auto) | unchanged; `systemd-firstboot` has now genuinely completed *on disk*, so later boots skip the wizard rather than answering it from fw_cfg every time |
 
 Both pinned in `scripts/vm/manifest.sh` with exact URLs and checksums,
 verified after every download — a mismatch deletes the partial file and
@@ -178,4 +337,9 @@ machine already has, but the download path is exercised and works from a
 fresh clone too (this is only a fast-path, not the only path).
 
 Neither image is ever committed — see the repo's `.gitignore`
-(`scripts/vm/images/`, `scripts/vm/work/`).
+(`scripts/vm/images/`, `scripts/vm/work/`). That covers the provisioned
+images too: they are build artifacts, reproducible on a fresh clone with
+`scripts/vm/fetch-images.sh && scripts/vm/provision.sh`. The stock images are
+never written to by provisioning (OpenWRT's is not even an input — the
+ImageBuilder is; Debian's is copied first), so their pinned checksums keep
+verifying forever.

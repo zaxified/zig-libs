@@ -2,7 +2,12 @@
 zig-out/
 
 # VM test harness (scripts/vm/): images are fetched on demand by
-# scripts/vm/fetch-images.sh, never committed — the OpenWRT image alone is
-# ~126 MB and would blow up repo size. See scripts/vm/README.md.
+# scripts/vm/fetch-images.sh and customised by scripts/vm/provision.sh,
+# never committed — the OpenWRT image alone is ~126 MB and would blow up repo
+# size. images/ also holds the *provisioned* (locally derived) guests and the
+# 41 MB OpenWRT ImageBuilder tarball; work/ holds the unpacked ImageBuilder
+# tree (~530 MB) and the cross-compiled test binaries. All of it is
+# reproducible from a fresh clone with `fetch-images.sh && provision.sh`.
+# See scripts/vm/README.md.
 scripts/vm/images/
 scripts/vm/work/
