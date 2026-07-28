@@ -45,7 +45,7 @@ pub const meta = .{
     // drive register/obtain from one thread at a time.
     .concurrency = .threadsafe,
     .model_after = "golang.org/x/crypto/acme + certbot flow semantics; RFC 8555/7515/7638/8737 wire",
-    .deps = .{ "http", "router", "std.crypto (ecdsa P-256, Certificate)", "std.json" },
+    .deps = .{ "http", "router" }, // also uses std.crypto (ecdsa P-256, Certificate), std.json
 };
 
 /// The ACME protocol client — see `Client.init` / `Client.obtain`.

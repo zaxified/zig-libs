@@ -112,7 +112,10 @@ pub const meta = .{
     // concurrently (nothing here ever mutates a value in place).
     .concurrency = .reentrant,
     .model_after = "R. Gennaro, S. Goldfeder, \"One Round Threshold ECDSA with Identifiable Abort\" (GG20, IACR ePrint 2020/540); R. Gennaro, S. Goldfeder, \"Fast Multiparty Threshold ECDSA with Fast Trustless Setup\" (GG18, IACR ePrint 2019/114) for the ring-Pedersen auxiliary-parameter construction; this repo's own `frost`/`bls12_381.threshold` modules for the Shamir+Feldman+Lagrange shape, ported onto std.crypto.ecc.Secp256k1's scalar field/group",
-    .deps = .{"paillier"},
+    // `paillier`: per-party additively-homomorphic keypairs.
+    // `montint`: zkproofs.zig's constant-time Montgomery modexp over the
+    // ring-Pedersen (Ñ, h1, h2) commitments -- wider than Paillier's own N².
+    .deps = .{ "paillier", "montint" },
 };
 
 /// The curve this whole arc is built over. Re-exported so callers don't

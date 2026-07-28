@@ -31,9 +31,10 @@ floor, `error.PskTooShort`).
   application decides how `enc` and ciphertext travel). **Concurrency:**
   reentrant — `Context` is a plain caller-owned value, every free function
   touches only its parameters.
-- **Deps:** none (`std` only — `std.crypto.dh.X25519`,
-  `std.crypto.ecc.P256`, `std.crypto.kdf.hkdf.HkdfSha256`,
-  `std.crypto.aead.aes_gcm`, `std.crypto.aead.chacha_poly`).
+- **Deps:** `p256` (DHKEM(P-256)'s group — byte-exact to
+  `std.crypto.ecc.P256`; the X25519 KEM path stays on `std`). Also `std`
+  directly: `std.crypto.dh.X25519`, `std.crypto.kdf.hkdf.HkdfSha256`,
+  `std.crypto.aead.aes_gcm`, `std.crypto.aead.chacha_poly`.
 
 ## Import
 

@@ -55,7 +55,7 @@ pub const meta = .{
     .role = .codec,
     .concurrency = .reentrant, // Socket itself is single_owner
     .model_after = "libnftables JSON (nft -j) schema + kernel UAPI nf_tables.h",
-    .deps = .{}, // std only
+    .deps = .{"netlink"}, // Socket's nlmsghdr/nlattr codec is shared with netlink
 };
 
 // ── shared vocabulary ───────────────────────────────────────────────────────

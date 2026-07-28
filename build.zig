@@ -304,7 +304,16 @@ pub fn build(b: *std.Build) void {
     // Catalog consistency gate: `zig build check-catalog` (CI runs it).
     // Verifies module_list ↔ modules/ ↔ the README catalog table agree, so a
     // module can't ship without a catalog row (6 rows had drifted before this
-    // existed) and the README's module count can't go stale.
+    // existed) and the README's module count can't go stale. Also verifies
+    // the README catalog row's Deps column and each module's root.zig
+    // `meta.deps` field against module_list's `.deps` -- the field that
+    // actually wires `mod.addImport` in pass 2 above, i.e. what really gates
+    // compilation. 26 README rows and 7 meta.deps blocks (plus 4 more
+    // meta.deps blocks mixing std-usage notes into the tuple, since fixed
+    // to keep the tuple sibling-names-only) were found to have drifted
+    // before this existed -- e.g. `hpke` really depends on `p256` via
+    // DHKEM(P-256), but its README row said "—" and its own
+    // modules/hpke/README.md said "Deps: none".
     const check = b.step("check-catalog", "Verify module_list matches modules/ and the README catalog");
     const check_inner = b.allocator.create(std.Build.Step) catch @panic("OOM");
     check_inner.* = std.Build.Step.init(.{
@@ -358,13 +367,37 @@ fn checkCatalog(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anye
 
     var failed = false;
     for (module_list) |m| {
-        b.build_root.handle.access(io, b.fmt("modules/{s}/src/root.zig", .{m.name}), .{}) catch {
+        const root_path = b.fmt("modules/{s}/src/root.zig", .{m.name});
+        var root_ok = true;
+        b.build_root.handle.access(io, root_path, .{}) catch {
             std.log.err("module_list entry '{s}' has no modules/{s}/src/root.zig", .{ m.name, m.name });
             failed = true;
+            root_ok = false;
         };
+
         if (std.mem.indexOf(u8, readme, b.fmt("| `{s}` |", .{m.name})) == null) {
             std.log.err("module '{s}' has no README catalog row (`| \\`{s}\\` |`)", .{ m.name, m.name });
             failed = true;
+        } else if (readmeDepsCell(readme, m.name, b)) |readme_deps| {
+            checkDepsMatch(m.name, "README catalog row's Deps column", m.deps, readme_deps, b, &failed);
+        }
+
+        // meta.deps cross-check: only readable once we know root.zig exists.
+        if (root_ok) {
+            const root_src = try b.build_root.handle.readFileAlloc(io, root_path, b.allocator, .limited(2 * 1024 * 1024));
+            if (metaDepsFromRoot(root_src, b)) |meta_deps| {
+                checkDepsMatch(m.name, "root.zig's meta.deps", m.deps, meta_deps, b, &failed);
+            } else if (m.deps.len > 0) {
+                // Two modules (brotli, aeskw) currently have no `meta` block
+                // at all; both are zero-dep in module_list, so they never
+                // reach here. Any module_list entry that DOES declare deps
+                // must have somewhere to document them.
+                std.log.err(
+                    "module '{s}' declares deps ({s}) in build.zig but modules/{s}/src/root.zig has no `meta.deps` field to document them",
+                    .{ m.name, std.mem.join(b.allocator, ", ", m.deps) catch @panic("OOM"), m.name },
+                );
+                failed = true;
+            }
         }
     }
 
@@ -388,4 +421,120 @@ fn checkCatalog(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anye
     }
 
     if (failed) return step.fail("catalog drift — see errors above", .{});
+}
+
+/// Extract the module names in a README catalog row's Deps column (the
+/// last `|`-delimited cell) for `name` -- e.g. a cell reading
+/// `ocsp, http, x509` becomes three names, an empty/`—` cell becomes zero.
+/// Row *existence* is checked by the caller before this runs, so `null`
+/// here only means the located row's line was too malformed to have a
+/// trailing cell (should not happen for a well-formed table row).
+fn readmeDepsCell(readme: []const u8, name: []const u8, b: *std.Build) ?[]const []const u8 {
+    const needle = b.fmt("| `{s}` |", .{name});
+    const start = std.mem.indexOf(u8, readme, needle) orelse return null;
+    const line_end = std.mem.indexOfScalarPos(u8, readme, start, '\n') orelse readme.len;
+    const line = std.mem.trimEnd(u8, readme[start..line_end], " \t\r");
+    if (!std.mem.endsWith(u8, line, "|")) return null;
+    const body = line[0 .. line.len - 1];
+    const last_pipe = std.mem.lastIndexOfScalar(u8, body, '|') orelse return null;
+    const cell = std.mem.trim(u8, body[last_pipe + 1 ..], " \t");
+    if (cell.len == 0 or std.mem.eql(u8, cell, "—") or std.mem.eql(u8, cell, "-")) {
+        return &.{};
+    }
+
+    var out: std.ArrayList([]const u8) = .empty;
+    var toks = std.mem.splitScalar(u8, cell, ',');
+    while (toks.next()) |tok| {
+        const trimmed = std.mem.trim(u8, tok, " \t");
+        if (trimmed.len > 0) out.append(b.allocator, trimmed) catch @panic("OOM");
+    }
+    return out.toOwnedSlice(b.allocator) catch @panic("OOM");
+}
+
+/// Extract the sibling-module names inside a root.zig's `pub const meta`
+/// block's `.deps = .{...}` tuple, e.g. `.deps = .{"p256"}` -> `{"p256"}`.
+/// Returns `null` when the module has no `meta` block at all, or the block
+/// has no `.deps` field -- the caller treats both as "nothing stated".  An
+/// explicit empty tuple `.deps = .{}` returns a non-null empty slice, which
+/// IS compared against module_list (so a module that silently grew a real
+/// dep without updating a `.deps = .{}` stub still gets caught).
+///
+/// Only the repo's dominant shape is recognised: a tuple of quoted
+/// sibling-module-name strings, with any `std.*` usage noted in a trailing
+/// `//` comment rather than inside the tuple itself (see CONVENTIONS.md and
+/// most modules for the pattern) -- a narrow, well-known shape to locate
+/// with `mem.indexOf` + quote-scanning, unlike a general `@import` scan
+/// (see the authoritative-source note above `check-catalog`'s definition
+/// in `build()`, and CONVENTIONS.md, for why that stays out of the gate).
+fn metaDepsFromRoot(src: []const u8, b: *std.Build) ?[]const []const u8 {
+    const meta_idx = std.mem.indexOf(u8, src, "pub const meta") orelse return null;
+    const meta_end = std.mem.indexOfPos(u8, src, meta_idx, "\n};") orelse src.len;
+    const block = src[meta_idx..meta_end];
+
+    // Match the compound literal ".deps = .{", not bare ".deps" -- a
+    // module's doc comment can talk *about* `meta.deps` in prose (e.g.
+    // `` `meta.deps = .{}` `` as a design-rationale aside) ahead of the
+    // real field, and a bare-".deps" search would land on that prose
+    // instead. The compound literal only ever matches the real field.
+    const deps_idx = std.mem.indexOf(u8, block, ".deps = .{") orelse return null;
+    const open = std.mem.indexOfScalarPos(u8, block, deps_idx, '{') orelse return null;
+    const close = std.mem.indexOfScalarPos(u8, block, open, '}') orelse return null;
+    const inner = block[open + 1 .. close];
+
+    var out: std.ArrayList([]const u8) = .empty;
+    var i: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, inner, i, '"')) |q1| {
+        const q2 = std.mem.indexOfScalarPos(u8, inner, q1 + 1, '"') orelse break;
+        out.append(b.allocator, inner[q1 + 1 .. q2]) catch @panic("OOM");
+        i = q2 + 1;
+    }
+    return out.toOwnedSlice(b.allocator) catch @panic("OOM");
+}
+
+fn containsName(list: []const []const u8, name: []const u8) bool {
+    for (list) |n| {
+        if (std.mem.eql(u8, n, name)) return true;
+    }
+    return false;
+}
+
+/// Compare `want` (build.zig's module_list `.deps` -- the ground truth,
+/// since `mod.addImport` in pass 2 of `build()` is what actually lets a
+/// module `@import` a sibling) against `have` (what a doc surface --
+/// the README table or root.zig's `meta.deps` -- claims). Logs one
+/// precise error per direction that disagrees and flips `failed.*`; never
+/// stops at the first module or the first surface.
+fn checkDepsMatch(
+    name: []const u8,
+    surface: []const u8,
+    want: []const []const u8,
+    have: []const []const u8,
+    b: *std.Build,
+    failed: *bool,
+) void {
+    var missing: std.ArrayList([]const u8) = .empty;
+    for (want) |w| {
+        if (!containsName(have, w)) missing.append(b.allocator, w) catch @panic("OOM");
+    }
+    var extra: std.ArrayList([]const u8) = .empty;
+    for (have) |h| {
+        if (!containsName(want, h)) extra.append(b.allocator, h) catch @panic("OOM");
+    }
+    if (missing.items.len == 0 and extra.items.len == 0) return;
+
+    if (missing.items.len > 0) {
+        const joined = std.mem.join(b.allocator, ", ", missing.items) catch @panic("OOM");
+        std.log.err(
+            "module '{s}': {s} is missing dep(s) [{s}] that build.zig's module_list declares",
+            .{ name, surface, joined },
+        );
+    }
+    if (extra.items.len > 0) {
+        const joined = std.mem.join(b.allocator, ", ", extra.items) catch @panic("OOM");
+        std.log.err(
+            "module '{s}': {s} lists dep(s) [{s}] that build.zig's module_list does not declare",
+            .{ name, surface, joined },
+        );
+    }
+    failed.* = true;
 }

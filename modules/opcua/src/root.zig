@@ -35,7 +35,7 @@ pub const meta = .{
     .role = .both, // client (this file) + server/device (`server.zig` over `nodestore.zig`)
     .concurrency = .single_owner, // caller-owned state, no locks: one loop owns a Server + its Connections
     .model_after = "OPC 10000-6 (OPC UA Binary + opc.tcp) + OPC 10000-4 (Services); structure ref open62541 (MPL-2.0) / node-opcua (MIT) — behavioral only, no source copied",
-    .deps = .{"rsa"}, // Basic256Sha256 secure-channel crypto (security.zig, both halves)
+    .deps = .{ "rsa", "x509" }, // rsa: Basic256Sha256 secure-channel crypto (security.zig, both halves); x509: defensive DER cert parse + SPKI extraction
 };
 
 /// The built-in type codec (OPC 10000-6 §5.2): `Encoder`/`Decoder` over a

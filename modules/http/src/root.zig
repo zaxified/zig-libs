@@ -47,7 +47,7 @@ pub const meta = .{
     // must be thread-safe if they share state.
     .concurrency = .single_owner,
     .model_after = "lalinsky/dusty (1.1 client shape) + Go net/http (redirect semantics, Server shape, gzip handler); nghttp2 later for h2",
-    .deps = .{ "netaddr", "std.crypto.tls", "std.Io.net", "std.compress.flate" },
+    .deps = .{"netaddr"}, // also uses std.crypto.tls, std.Io.net, std.compress.flate
 };
 
 /// Pure HTTP/1.1 wire framing (request/response head parse, chunked codec,

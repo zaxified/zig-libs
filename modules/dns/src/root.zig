@@ -33,7 +33,7 @@ pub const meta = .{
     .role = .client,
     .concurrency = .blocking, // every lookup blocks; one owner per Resolver
     .model_after = "Go net dnsclient + miekg/dns (codec) / c-ares; RFC 1035/2782/8659 (wire), RFC 8484 (DoH)",
-    .deps = .{ "netaddr", "http", "std.json", "std.Io.net" },
+    .deps = .{ "netaddr", "http" }, // also uses std.json, std.Io.net
 };
 
 /// Pure wire codec (encode query / decode response) — no I/O.

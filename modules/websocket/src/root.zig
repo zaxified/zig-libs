@@ -23,7 +23,7 @@ pub const meta = .{
     .role = .both, // server (accept/parse-inbound-masked) + client (request/parse-inbound-unmasked)
     .concurrency = .reentrant, // no shared/global state; a `Connection` is single-owner if shared across calls
     .model_after = "RFC 6455 (The WebSocket Protocol) §1.3/§4 handshake, §5 framing",
-    .deps = .{ "http", "std.crypto.hash.Sha1", "std.base64", "std.unicode" },
+    .deps = .{"http"}, // also uses std.crypto.hash.Sha1, std.base64, std.unicode
 };
 
 /// Opening handshake (§1.3/§4): server-side `acceptHandshake` +

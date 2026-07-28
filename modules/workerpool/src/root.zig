@@ -62,7 +62,7 @@ pub const meta = .{
     // one thread orchestrates teardown after producers have quiesced.
     .concurrency = .threadsafe,
     .model_after = "std.Thread.Pool / crossbeam worker pool over a Michael-Scott MPMC queue (lockfree)",
-    .deps = .{ .lockfree = {} },
+    .deps = .{"lockfree"},
 };
 
 // ── public types ─────────────────────────────────────────────────────────────

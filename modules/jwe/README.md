@@ -22,7 +22,9 @@ cipher).
   RFC 3394 (AES Key Wrap).
 - **Platform:** any. **Role:** codec (pure wire format + crypto dispatch, no
   I/O). **Concurrency:** reentrant — no shared/global state.
-- **Deps:** `rsa` (RSA-OAEP / RSA-OAEP-256 key wrap).
+- **Deps:** `rsa` (RSA-OAEP / RSA-OAEP-256 key wrap), `p256` (ECDH-ES's
+  P-256 curve — X25519 stays on `std`), `aescbc` + `aeskw` (the shared
+  CBC content-encryption and RFC 3394 key-wrap cores).
 
 ## Status
 

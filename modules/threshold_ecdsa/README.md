@@ -68,7 +68,9 @@ section for the one documented gap.
   .EcdsaSecp256k1Sha256` is the FINAL verification target Phase 2d's output
   must satisfy.
 - **Platform:** any. **Role:** util. **Concurrency:** reentrant.
-- **Deps:** `paillier` (each party's additively-homomorphic keypair).
+- **Deps:** `paillier` (each party's additively-homomorphic keypair),
+  `montint` (`zkproofs.zig`'s constant-time Montgomery modexp over the
+  ring-Pedersen commitments, wider than Paillier's own N²).
 
 ## Provenance
 

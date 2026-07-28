@@ -130,8 +130,10 @@ pub const meta = .{
     // literally `@import`ing `rsa` — none of `rsa`/`paillier`/
     // `threshold_ecdsa`'s own per-module Miller-Rabin helpers are `pub`
     // anyway, so there is nothing to import even for the parts that ARE
-    // conceptually identical.
-    .deps = .{},
+    // conceptually identical. It DOES `@import("montint")` directly in
+    // `group.zig` for the constant-time Montgomery modexp `eval`/`prove`
+    // ride on.
+    .deps = .{"montint"},
 };
 
 pub const group = @import("group.zig");
@@ -183,8 +185,9 @@ test "meta.model_after names Wesolowski" {
     try std.testing.expect(std.mem.indexOf(u8, meta.model_after, "Wesolowski") != null);
 }
 
-test "meta.deps is empty (std-only; see root.zig's meta.deps note)" {
-    try std.testing.expectEqual(@as(usize, 0), meta.deps.len);
+test "meta.deps is {\"montint\"} (the big-integer core; see root.zig's meta.deps note)" {
+    try std.testing.expectEqual(@as(usize, 1), meta.deps.len);
+    try std.testing.expectEqualStrings("montint", meta.deps[0]);
 }
 
 test "gate is flipped: prove/verify cores are implemented" {

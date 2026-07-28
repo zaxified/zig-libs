@@ -53,9 +53,10 @@ try conn2.tick(&out_writer, now_ms);                        // the clock: publis
 - **Role:** both (client + server/device). **Platform:** any (pure codec +
   caller-supplied streams; no socket, no timer, no thread of its own).
   **Deps:** `rsa` (Basic256Sha256 secure-channel crypto in `security.zig`,
-  used by both halves). **Concurrency:** single-owner — one loop owns a `Server`
-  and its `Connection`s; nothing is internally synchronized and nothing is
-  shared implicitly.
+  used by both halves), `x509` (defensive DER certificate parsing + SPKI
+  extraction, also in `security.zig`). **Concurrency:** single-owner — one
+  loop owns a `Server` and its `Connection`s; nothing is internally
+  synchronized and nothing is shared implicitly.
 
 Provenance: clean-room from OPC 10000-6 (OPC UA Binary + opc.tcp),
 OPC 10000-4 (Services) and OPC 10000-3 (Address Space Model); structure

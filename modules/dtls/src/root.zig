@@ -210,10 +210,13 @@ pub const meta = .{
     // `ssh` module's Transport reasoning).
     .concurrency = .single_owner,
     .model_after = "RFC 9147 (DTLS 1.3, PSK mode + PSK-less cert-only ephemeral-X25519 mode) + RFC 8446 (TLS 1.3 shared key schedule/handshake message shapes; RFC 9147 §5.8/§5.9 reuse these with the \"dtls13\" label prefix); RFC 8446 §4.2.7/§4.2.8 (supported_groups/key_share) + RFC 7748 (X25519); RFC 8446 §4.4.3 (CertificateVerify, in `certverify.zig`)",
-    // `rsa`: solely for `certverify.zig`'s RSASSA-PSS dispatch
-    // (rsa_pss_rsae_sha{256,384,512}) -- the PSK-only flight engine itself
-    // still needs no sibling modules, see the "meta.deps" test below.
-    .deps = .{"rsa"},
+    // `rsa`: `certverify.zig`'s RSASSA-PSS dispatch (rsa_pss_rsae_sha{256,384,512}).
+    // `x509`: `certauth.zig`'s certificate-DER parsing, routed through
+    // `x509.spkiOf`/`x509.safe.safeCertificate` instead of
+    // `std.crypto.Certificate.parse` (see certauth.zig's doc comment).
+    // The PSK-only flight engine itself still needs no sibling modules,
+    // see the "meta.deps" test below.
+    .deps = .{ "rsa", "x509" },
 };
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────
@@ -237,9 +240,10 @@ test {
     _ = certauth;
 }
 
-test "meta.deps is {\"rsa\"} (only certverify.zig's RSASSA-PSS dispatch needs it; the PSK flight engine itself needs no sibling modules)" {
-    try std.testing.expectEqual(@as(usize, 1), meta.deps.len);
+test "meta.deps is {\"rsa\", \"x509\"} (certverify.zig's RSASSA-PSS dispatch + certauth.zig's cert parsing; the PSK flight engine itself needs no sibling modules)" {
+    try std.testing.expectEqual(@as(usize, 2), meta.deps.len);
     try std.testing.expectEqualStrings("rsa", meta.deps[0]);
+    try std.testing.expectEqualStrings("x509", meta.deps[1]);
 }
 
 test "keyschedule.hkdfExpandLabel: uses the DTLS \"dtls13\" prefix (RFC 9147 §5.9)" {

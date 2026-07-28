@@ -59,8 +59,10 @@ copied.
   **except `Provider`**, which holds one mutable JWKS cache and needs external
   sync under a threaded server — inject `ResourceServer.lock` (see its docs).
 - **Deps:** `http` (the `HttpFetcher` + the middleware's request/response
-  types, and P7's `TokenRequest.method`), `router` (the middleware). The
-  signature core and P7's request/response builders need neither.
+  types, and P7's `TokenRequest.method`), `router` (the middleware), `p256`
+  (the fast ES256 curve — byte-exact to `std.crypto.sign.ecdsa.EcdsaP256Sha256`).
+  The signature core and P7's request/response builders need neither `http`
+  nor `router`.
 
 ## SECURITY
 

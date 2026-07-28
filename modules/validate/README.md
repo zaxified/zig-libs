@@ -19,8 +19,8 @@ comptime reflection; behavior only) — see NOTICE. No source copied.
   per-request allocation is request-scoped (one arena per validation run,
   owned by the returned `Report`).
 - **Deps:** `router` (Middleware/Ctx/Next/ctx.data/Params), `http`
-  (`Request` body/query, `ResponseWriter`), `std.json` (Value +
-  parseFromSlice/parseFromValue).
+  (`Request` body/query, `ResponseWriter`), `netaddr` (the `ipv4`/`ipv6`
+  format validators), `std.json` (Value + parseFromSlice/parseFromValue).
 
 ## Usage
 
