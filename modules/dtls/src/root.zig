@@ -88,8 +88,10 @@
 //! machinery — real new crypto, out of scope); certificates add a real
 //! signature-based identity check ON TOP, not a replacement key exchange.
 //! See `Connection.zig`'s "certificate mode" section for the full design
-//! rationale and every deferred piece (signature_algorithms negotiation,
-//! full RFC 5280 path building, CertificateEntry extensions), and
+//! rationale. `signature_algorithms` extension negotiation (RFC 8446 §4.2.3)
+//! IS implemented (`Connection.zig`'s `selectSignatureScheme` +
+//! `verifyPeerCert`'s downgrade guard) — what remains deferred is full RFC
+//! 5280 path building and `CertificateEntry` extensions. See also
 //! `certauth.zig`'s module doc "KNOWN GAP" note — `std.crypto.Certificate
 //! .parse` is confirmed (by fuzzing) NOT panic-safe against adversarial DER
 //! in Zig 0.16, which this module inherits and cannot fix without a

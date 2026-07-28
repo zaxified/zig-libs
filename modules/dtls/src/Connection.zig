@@ -92,17 +92,15 @@ pub const CertConfig = struct {
     /// leaf signed directly by a peer-trusted anchor, or `&.{ leaf,
     /// intermediate }` for a one-hop chain. Each entry is raw DER, not PEM.
     chain: []const []const u8,
-    /// This side's private key for `certverify.sign`'s CertificateVerify —
-    /// its key family MUST match `signature_scheme` (a mismatch is a typed
-    /// `error.KeyMismatch` at sign time, not a panic).
+    /// This side's private key for `certverify.sign`'s CertificateVerify.
+    /// The `SignatureScheme` actually used is NEGOTIATED at handshake time
+    /// (`selectSignatureScheme`, RFC 8446 §4.2.3), not fixed here — it is
+    /// whichever of `certverify.candidateSchemes(private_key)` (the schemes
+    /// this key's FAMILY can sign under) the peer also advertised in its
+    /// `signature_algorithms` extension AND `Config.signature_algorithms`
+    /// permits. `error.NoSignatureSchemeOverlap` if none exists — never a
+    /// silent fallback to a hardcoded scheme.
     private_key: certverify.SecretKey,
-    /// The `SignatureScheme` this side signs CertificateVerify with (RFC
-    /// 8446 §4.2.3). No `signature_algorithms` extension negotiation is
-    /// performed (see the "certificate mode: deferred" notes below) — both
-    /// peers must be independently configured for a scheme they both
-    /// support; the peer learns which scheme was actually used from the
-    /// CertificateVerify message itself.
-    signature_scheme: certverify.SignatureScheme,
 };
 
 /// Trust policy for a peer's presented certificate chain (RFC 8446 §4.4.2).
@@ -173,6 +171,19 @@ pub const Config = struct {
     /// but presented none (or an empty `certificate_list`) fails with
     /// `error.PeerCertificateRequired` instead of silently completing.
     require_peer_cert: bool = false,
+    /// The `SignatureScheme`s (RFC 8446 §4.2.3) this side is willing to
+    /// negotiate — advertised in this side's own `signature_algorithms`
+    /// extension (the ClientHello, and a server's `CertificateRequest` when
+    /// `request_client_cert` is set) AND enforced as a downgrade guard when
+    /// VERIFYING a peer's CertificateVerify: a scheme this side never put in
+    /// that advertised list is rejected outright (`error
+    /// .SignatureSchemeNotAdvertised`), even one `certverify.zig` otherwise
+    /// implements — a peer must not be able to steer this side into
+    /// accepting a scheme it never offered. Defaults to every scheme
+    /// `certverify.zig` supports (`default_signature_algorithms`), so
+    /// leaving this at its default reproduces "accept anything this module
+    /// can verify," the widest-compatible posture.
+    signature_algorithms: []const certverify.SignatureScheme = &default_signature_algorithms,
     /// Caller-supplied wall-clock time (Unix epoch seconds), used ONLY by
     /// `PeerVerify.trust_anchor`'s validity-period check
     /// (`certauth.verifyLeafAgainstAnchor`). This module makes no
@@ -287,6 +298,22 @@ pub const CertModeError = certverify.SignError || error{
     /// certificate (or an empty `certificate_list`, RFC 8446 §4.4.2's "no
     /// certificate available" answer).
     PeerCertificateRequired,
+    /// `signature_algorithms` negotiation (RFC 8446 §4.2.3, see
+    /// `selectSignatureScheme`) found no `SignatureScheme` simultaneously
+    /// (a) advertised by the peer, (b) permitted by this side's own
+    /// `Config.signature_algorithms`, and (c) producible by this side's
+    /// configured `CertConfig.private_key`'s key family
+    /// (`certverify.candidateSchemes`). The handshake fails cleanly here
+    /// rather than silently signing under some default scheme the peer
+    /// never offered.
+    NoSignatureSchemeOverlap,
+    /// A peer's CertificateVerify used a `SignatureScheme` this side never
+    /// advertised in its own `signature_algorithms` extension (`Config
+    /// .signature_algorithms`) — rejected before the signature is even
+    /// checked. RFC 8446 §4.2.3 downgrade protection: a peer must not be
+    /// able to steer this side into accepting a scheme it never offered,
+    /// even one `certverify.zig` otherwise implements.
+    SignatureSchemeNotAdvertised,
 };
 
 pub const SendError = error{
@@ -356,27 +383,75 @@ const max_certreq_body: usize = 128;
 /// without needing to know the configured scheme at comptime.
 const max_sig_len: usize = certverify.maxSignatureLen(.rsa_pss_rsae_sha256);
 
+/// `Config.signature_algorithms`'s default: every `SignatureScheme`
+/// `certverify.zig` implements. Advertised in the `signature_algorithms`
+/// extension (ClientHello — both `.psk` and `.cert_dhe` modes — and a
+/// server's `CertificateRequest`) and used as the downgrade-guard set when
+/// verifying a peer's CertificateVerify (see `Config.signature_algorithms`'s
+/// doc comment and `selectSignatureScheme`/`verifyPeerCert` below).
+const default_signature_algorithms = [_]certverify.SignatureScheme{
+    .ecdsa_secp256r1_sha256,
+    .ecdsa_secp384r1_sha384,
+    .rsa_pss_rsae_sha256,
+    .rsa_pss_rsae_sha384,
+    .rsa_pss_rsae_sha512,
+    .ed25519,
+};
+
+/// Encodes `schemes` as a wire `signature_algorithms` extension (RFC 8446
+/// §4.2.3) into `buf`, returning the ready-to-send `messages.Extension`.
+/// Shared by the ClientHello (both key-exchange modes) and the server's
+/// `CertificateRequest` — the only two messages this module ever sends one
+/// in (RFC 8446 §4.2.3 defines no other carrier).
+fn signatureAlgorithmsExtension(schemes: []const certverify.SignatureScheme, buf: []u8) HandshakeError!messages.Extension {
+    var raw: [8]u16 = undefined;
+    if (schemes.len > raw.len) return error.BufferTooShort;
+    for (schemes, 0..) |s, i| raw[i] = @intFromEnum(s);
+    const data = messages.encodeSignatureAlgorithms(raw[0..schemes.len], buf) catch return error.BufferTooShort;
+    return .{ .ext_type = @intFromEnum(messages.ExtensionType.signature_algorithms), .data = data };
+}
+
+/// RFC 8446 §4.2.3 `signature_algorithms` negotiation: picks the
+/// `SignatureScheme` this side signs a CertificateVerify with, from the
+/// intersection of THREE sets — never a hardcoded default:
+///   1. `certverify.candidateSchemes(cc.private_key)` — what `cc`'s key
+///      FAMILY can actually produce a signature under;
+///   2. `our_signature_algorithms` (`Config.signature_algorithms`) — what
+///      this side is willing to use at all;
+///   3. `peer_sig_algs` — the wire `signature_algorithms` values the PEER
+///      advertised (its ClientHello, or its CertificateRequest).
+/// Preference order follows (1) (most-preferred first, e.g. sha256 before
+/// sha384/sha512 for an RSA key). No match in all three ⇒
+/// `error.NoSignatureSchemeOverlap` — the handshake fails cleanly rather
+/// than silently proceeding under some default scheme the peer never
+/// offered or this side never agreed to use.
+fn selectSignatureScheme(
+    cc: CertConfig,
+    our_signature_algorithms: []const certverify.SignatureScheme,
+    peer_sig_algs: []const u16,
+) error{NoSignatureSchemeOverlap}!certverify.SignatureScheme {
+    for (certverify.candidateSchemes(cc.private_key)) |candidate| {
+        var ours_too = false;
+        for (our_signature_algorithms) |ours| {
+            if (ours == candidate) {
+                ours_too = true;
+                break;
+            }
+        }
+        if (!ours_too) continue;
+        for (peer_sig_algs) |peer_raw| {
+            if (peer_raw == @intFromEnum(candidate)) return candidate;
+        }
+    }
+    return error.NoSignatureSchemeOverlap;
+}
+
 // ── cert-only-DHE (`.cert_dhe`) mode constants ────────────────────────────
 
 /// The single (EC)DHE group this module computes shares for (RFC 8446
 /// §4.2.8.1 / RFC 7748 X25519). `supported_groups` additionally advertises
 /// secp256r1 for parser-compatibility, but only x25519 shares are generated.
 const x25519_group: u16 = @intFromEnum(messages.NamedGroup.x25519);
-
-/// The `signature_algorithms` (RFC 8446 §4.2.3) this module's ClientHello
-/// advertises in `.cert_dhe` mode. This is INFORMATIONAL only — no scheme
-/// negotiation is performed (see the "certificate mode" deferred notes); a
-/// peer learns the scheme actually used from each CertificateVerify's own
-/// `algorithm` field. The list simply covers every scheme `certverify`
-/// supports so a compliant peer's ClientHello parser is satisfied.
-const advertised_sig_algs = [_]u16{
-    @intFromEnum(certverify.SignatureScheme.ecdsa_secp256r1_sha256),
-    @intFromEnum(certverify.SignatureScheme.ecdsa_secp384r1_sha384),
-    @intFromEnum(certverify.SignatureScheme.rsa_pss_rsae_sha256),
-    @intFromEnum(certverify.SignatureScheme.rsa_pss_rsae_sha384),
-    @intFromEnum(certverify.SignatureScheme.rsa_pss_rsae_sha512),
-    @intFromEnum(certverify.SignatureScheme.ed25519),
-};
 
 /// The `supported_groups` (RFC 8446 §4.2.7) advertised in `.cert_dhe` mode.
 const advertised_groups = [_]u16{
@@ -723,11 +798,17 @@ pub const Connection = struct {
 
     /// Builds the ClientHello BODY (post-handshake-header) into `body_buf`:
     /// random || empty session id || `config.cipher_suites` ||
-    /// {psk_key_exchange_modes=[psk_ke], pre_shared_key} — the latter MUST
-    /// be the last extension (RFC 8446 §4.2.11) since its binder covers
-    /// everything before it. Patches in the REAL PSK binder in place of a
-    /// same-length placeholder once the (still-empty-so-far) transcript's
-    /// truncated hash is known (RFC 8446 §4.2.11.2).
+    /// {psk_key_exchange_modes=[psk_ke], signature_algorithms,
+    /// pre_shared_key} — `pre_shared_key` MUST be the last extension (RFC
+    /// 8446 §4.2.11) since its binder covers everything before it;
+    /// `signature_algorithms` is real RFC 8446 §9.2-mandatory advertising
+    /// (NOT PSK-mode-only informational filler — a PSK-mode server can
+    /// still authenticate with a certificate ON TOP of the PSK, see
+    /// `Config.cert`, and needs this list to negotiate a scheme for its
+    /// CertificateVerify: `serverProcessClientHello`'s `selectSignatureScheme`
+    /// call). Patches in the REAL PSK binder in place of a same-length
+    /// placeholder once the (still-empty-so-far) transcript's truncated hash
+    /// is known (RFC 8446 §4.2.11.2).
     fn buildClientHello(self: *Connection, random: std.Random, body_buf: []u8) HandshakeError![]u8 {
         var random_bytes: [32]u8 = undefined;
         random.bytes(&random_bytes);
@@ -740,6 +821,9 @@ pub const Connection = struct {
         var modes_buf: [4]u8 = undefined;
         const modes_ext = try messages.encodePskKeyExchangeModes(&.{.psk_ke}, &modes_buf);
 
+        var sigalgs_buf: [2 + 2 * default_signature_algorithms.len]u8 = undefined;
+        const sigalgs_ext = try signatureAlgorithmsExtension(self.config.signature_algorithms, &sigalgs_buf);
+
         // 32-byte (SHA-256) placeholder binder, patched below.
         var placeholder_binder = [_]u8{0} ** 32;
         var psk_buf: [128]u8 = undefined;
@@ -749,6 +833,7 @@ pub const Connection = struct {
 
         const exts = [_]messages.Extension{
             .{ .ext_type = @intFromEnum(messages.ExtensionType.psk_key_exchange_modes), .data = modes_ext },
+            sigalgs_ext,
             .{ .ext_type = @intFromEnum(messages.ExtensionType.pre_shared_key), .data = psk_ext_data },
         };
 
@@ -811,8 +896,8 @@ pub const Connection = struct {
         var groups_buf: [2 + 2 * advertised_groups.len]u8 = undefined;
         const groups_ext = try messages.encodeSupportedGroups(&advertised_groups, &groups_buf);
 
-        var sigalgs_buf: [2 + 2 * advertised_sig_algs.len]u8 = undefined;
-        const sigalgs_ext = try messages.encodeSignatureAlgorithms(&advertised_sig_algs, &sigalgs_buf);
+        var sigalgs_buf: [2 + 2 * default_signature_algorithms.len]u8 = undefined;
+        const sigalgs_ext = try signatureAlgorithmsExtension(self.config.signature_algorithms, &sigalgs_buf);
 
         var ks_buf: [2 + 4 + 32]u8 = undefined;
         const ks_entries = [_]messages.KeyShareEntry{.{ .group = x25519_group, .key_exchange = &self.ecdhe_public }};
@@ -820,7 +905,7 @@ pub const Connection = struct {
 
         const exts = [_]messages.Extension{
             .{ .ext_type = @intFromEnum(messages.ExtensionType.supported_groups), .data = groups_ext },
-            .{ .ext_type = @intFromEnum(messages.ExtensionType.signature_algorithms), .data = sigalgs_ext },
+            sigalgs_ext,
             .{ .ext_type = @intFromEnum(messages.ExtensionType.key_share), .data = ks_ext },
         };
 
@@ -1025,16 +1110,18 @@ pub const Connection = struct {
     // documented extension of it, built entirely from already-implemented
     // pieces (`certverify.zig`'s sign/verify, `certauth.zig`'s DER bridge).
     //
+    // `signature_algorithms` extension negotiation (RFC 8446 §4.2.3) IS
+    // implemented (see `selectSignatureScheme`, `signAndSendCertificateVerify`,
+    // `verifyPeerCert`'s downgrade guard) — CertConfig no longer carries a
+    // fixed `signature_scheme`; the scheme is picked from the intersection
+    // of the peer's advertised list, `Config.signature_algorithms`, and
+    // `certverify.candidateSchemes(cc.private_key)`, failing the handshake
+    // with `error.NoSignatureSchemeOverlap` rather than falling back to a
+    // default when there is no overlap.
+    //
     // DEFERRED (not silently skipped):
     //   - A genuine PSK-less, (EC)DHE-based certificate-only key exchange
     //     (would need a `key_share` extension + ECDH — new crypto).
-    //   - `signature_algorithms` extension negotiation (CertificateRequest/
-    //     ClientHello never advertise or negotiate a scheme list — each
-    //     side is configured with the one scheme it will use; the peer
-    //     always learns which scheme was actually used from the
-    //     CertificateVerify message's own `algorithm` field, so a mismatch
-    //     just fails cleanly at verify time rather than being negotiated
-    //     away in advance).
     //   - Full RFC 5280 §6 certification-path building (multi-hop chains,
     //     name constraints, key usage / basicConstraints policy checks,
     //     revocation) — `PeerVerify.trust_anchor` is a minimal one-hop
@@ -1078,42 +1165,53 @@ pub const Connection = struct {
     /// Signs the CURRENT transcript hash (i.e. through whatever was last
     /// `sendEpoch2Message`-ed — the caller must call this immediately after
     /// sending this side's own Certificate message, per RFC 8446 §4.4.3)
-    /// under `cc.signature_scheme`/`cc.private_key`, encodes a
+    /// under the ALREADY-NEGOTIATED `scheme` (see `selectSignatureScheme` —
+    /// callers compute this before calling here; this function performs no
+    /// negotiation itself, only signs)/`cc.private_key`, encodes a
     /// CertificateVerify message body, and sends it via `sendEpoch2Message`.
     fn signAndSendCertificateVerify(
         self: *Connection,
         cc: CertConfig,
+        scheme: certverify.SignatureScheme,
         side: certverify.Side,
         random: std.Random,
         out: []u8,
     ) HandshakeError!SentRecord {
         const th = self.transcript.currentHash();
         var sig_buf: [max_sig_len]u8 = undefined;
-        const sig = try certverify.sign(cc.signature_scheme, cc.private_key, side, &th, random, &sig_buf);
+        const sig = try certverify.sign(scheme, cc.private_key, side, &th, random, &sig_buf);
 
         var cv_body_buf: [max_certverify_body]u8 = undefined;
-        const cv_body = messages.encodeCertificateVerify(.{ .algorithm = @intFromEnum(cc.signature_scheme), .signature = sig }, &cv_body_buf) catch return error.BufferTooShort;
+        const cv_body = messages.encodeCertificateVerify(.{ .algorithm = @intFromEnum(scheme), .signature = sig }, &cv_body_buf) catch return error.BufferTooShort;
 
         var frag_buf: [max_certverify_body + handshake.header_len]u8 = undefined;
         return self.sendEpoch2Message(.certificate_verify, cv_body, &frag_buf, out);
     }
 
-    /// Verifies an incoming CertificateVerify: the signature itself (real
+    /// Verifies an incoming CertificateVerify: FIRST, the downgrade guard —
+    /// `scheme_raw` must be one of `self.config.signature_algorithms` (the
+    /// schemes THIS side actually advertised to the peer, RFC 8446 §4.2.3);
+    /// a peer that answers with anything else is rejected with
+    /// `error.SignatureSchemeNotAdvertised` before the signature is even
+    /// checked — a peer must never be able to steer this side into
+    /// accepting a scheme it never offered. THEN the signature itself (real
     /// crypto, `certverify.verify` — proves possession of `leaf_der`'s
-    /// private key over `transcript_hash`) is checked UNCONDITIONALLY;
-    /// every `certverify.VerifyError` case collapses to
-    /// `error.CertVerifyFailed` (matching this module's existing style of
-    /// one typed error per "verify failed" event — see `BinderVerifyFailed`/
-    /// `FinishedVerifyFailed` — rather than leaking which of six internal
-    /// sub-reasons applied). THEN, only if that passed, `self.config
-    /// .peer_verify`'s chain-to-anchor trust decision is applied (also
-    /// collapsed, to `error.CertificateRejected`).
+    /// private key over `transcript_hash`); every `certverify.VerifyError`
+    /// case collapses to `error.CertVerifyFailed` (matching this module's
+    /// existing style of one typed error per "verify failed" event — see
+    /// `BinderVerifyFailed`/`FinishedVerifyFailed` — rather than leaking
+    /// which of six internal sub-reasons applied). THEN, only if that
+    /// passed, `self.config.peer_verify`'s chain-to-anchor trust decision is
+    /// applied (also collapsed, to `error.CertificateRejected`).
     ///
     /// `scheme_raw` is the wire `SignatureScheme` value from the peer's
     /// CertificateVerify message — `certverify.SignatureScheme` is a
     /// non-exhaustive enum specifically so this cast can never panic on an
     /// unrecognized value (`certverify.verify` itself rejects it with
-    /// `error.UnsupportedScheme`, folded into `CertVerifyFailed` here).
+    /// `error.UnsupportedScheme`, folded into `CertVerifyFailed` here; an
+    /// unrecognized value also never matches anything in
+    /// `self.config.signature_algorithms`, so the downgrade guard rejects it
+    /// first anyway).
     fn verifyPeerCert(
         self: *Connection,
         leaf_der: []const u8,
@@ -1122,6 +1220,15 @@ pub const Connection = struct {
         transcript_hash: []const u8,
         signer_side: certverify.Side,
     ) HandshakeError!void {
+        var advertised = false;
+        for (self.config.signature_algorithms) |s| {
+            if (@intFromEnum(s) == scheme_raw) {
+                advertised = true;
+                break;
+            }
+        }
+        if (!advertised) return error.SignatureSchemeNotAdvertised;
+
         const scheme: certverify.SignatureScheme = @enumFromInt(scheme_raw);
         const pubkey = certauth.parseLeafPublicKey(leaf_der) catch return error.CertificateRejected;
         certverify.verify(scheme, pubkey, signer_side, transcript_hash, signature) catch return error.CertVerifyFailed;
@@ -1142,6 +1249,18 @@ pub const Connection = struct {
         requested_client_cert: bool = false,
         creq_context: [255]u8 = undefined,
         creq_context_len: usize = 0,
+        /// The `signature_algorithms` extension carried in the
+        /// CertificateRequest, if any (RFC 8446 §4.3.2 mandates one; decoded
+        /// here so `handleFlightClient` can negotiate THIS side's own
+        /// CertificateVerify scheme against it via `selectSignatureScheme` —
+        /// see that function's doc comment). Empty if
+        /// `requested_client_cert` is false, or the peer's CertificateRequest
+        /// omitted the extension (negotiation then sees an empty peer list,
+        /// which — like any other empty intersection — surfaces as
+        /// `error.NoSignatureSchemeOverlap` rather than silently picking a
+        /// default).
+        peer_sig_algs_buf: [8]u16 = undefined,
+        peer_sig_algs_len: usize = 0,
         /// A `Certificate` message was seen at all — set even for an empty
         /// `certificate_list` (RFC 8446 §4.4.2's "no certificate" answer),
         /// which is why `leaf_len == 0` (not `!saw_cert`) is the "peer
@@ -1162,6 +1281,10 @@ pub const Connection = struct {
 
         fn finishedVerifyData(self: *const PeerCertResult) []const u8 {
             return self.fin_buf[0..self.fin_len];
+        }
+
+        fn peerSigAlgs(self: *const PeerCertResult) []const u16 {
+            return self.peer_sig_algs_buf[0..self.peer_sig_algs_len];
         }
     };
 
@@ -1228,6 +1351,11 @@ pub const Connection = struct {
                 if (creq.certificate_request_context.len > result.creq_context.len) return error.Malformed;
                 @memcpy(result.creq_context[0..creq.certificate_request_context.len], creq.certificate_request_context);
                 result.creq_context_len = creq.certificate_request_context.len;
+                for (creq.extensions) |e| {
+                    if (e.ext_type != @intFromEnum(messages.ExtensionType.signature_algorithms)) continue;
+                    const sig_algs = messages.decodeU16ListExtension(e.data, &result.peer_sig_algs_buf) catch return error.Malformed;
+                    result.peer_sig_algs_len = sig_algs.len;
+                }
                 result.requested_client_cert = true;
                 self.transcript.append(parsed.msg_type, parsed.body);
             } else if (parsed.msg_type == @intFromEnum(messages.HandshakeType.certificate)) {
@@ -1286,6 +1414,21 @@ pub const Connection = struct {
 
         var ext_buf: [8]messages.Extension = undefined;
         const dec = messages.decodeClientHello(ch_body, &ext_buf) catch return error.Malformed;
+
+        // The ClientHello's own `signature_algorithms` (RFC 8446 §4.2.3) —
+        // what schemes the CLIENT can verify — captured here (while `dec
+        // .extensions` is alive) for `selectSignatureScheme` below, ONLY
+        // consulted if this server actually signs a CertificateVerify
+        // (`self.config.cert` set). Absent extension ⇒ empty peer list,
+        // which negotiation treats like any other empty intersection
+        // (`error.NoSignatureSchemeOverlap`), never a silent default.
+        var client_sig_algs_buf: [8]u16 = undefined;
+        var client_sig_algs_len: usize = 0;
+        for (dec.extensions) |e| {
+            if (e.ext_type != @intFromEnum(messages.ExtensionType.signature_algorithms)) continue;
+            const sig_algs = messages.decodeU16ListExtension(e.data, &client_sig_algs_buf) catch return error.Malformed;
+            client_sig_algs_len = sig_algs.len;
+        }
 
         const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
         const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
@@ -1441,8 +1584,16 @@ pub const Connection = struct {
         var extra_n: usize = 0;
 
         if (self.config.request_client_cert) {
+            // RFC 8446 §4.3.2: CertificateRequest MUST carry a
+            // `signature_algorithms` extension telling the client what
+            // schemes this server can verify — the client's own
+            // `selectSignatureScheme` call (`handleFlightClient`) negotiates
+            // against exactly this list.
+            var sigalgs_buf: [2 + 2 * default_signature_algorithms.len]u8 = undefined;
+            const sigalgs_ext = try signatureAlgorithmsExtension(self.config.signature_algorithms, &sigalgs_buf);
+            const creq_exts = [_]messages.Extension{sigalgs_ext};
             var creq_body_buf: [max_certreq_body]u8 = undefined;
-            const creq_body = messages.encodeCertificateRequest(.{ .certificate_request_context = &.{}, .extensions = &.{} }, &creq_body_buf) catch return error.BufferTooShort;
+            const creq_body = messages.encodeCertificateRequest(.{ .certificate_request_context = &.{}, .extensions = &creq_exts }, &creq_body_buf) catch return error.BufferTooShort;
             var frag_buf: [max_certreq_body + handshake.header_len]u8 = undefined;
             const r = try self.sendEpoch2Message(.certificate_request, creq_body, &frag_buf, out[cursor..]);
             cursor += r.bytes.len;
@@ -1459,7 +1610,13 @@ pub const Connection = struct {
             extra_records[extra_n] = .{ .epoch = 2, .sequence_number = cert_r.seq };
             extra_n += 1;
 
-            const cv_r = try self.signAndSendCertificateVerify(cc, .server, random, out[cursor..]);
+            // RFC 8446 §4.2.3 negotiation (see `selectSignatureScheme`): the
+            // scheme this server signs with must be one the CLIENT actually
+            // advertised in its ClientHello, one this server itself is
+            // willing to use, AND one `cc.private_key`'s key family can
+            // produce — never a hardcoded default.
+            const scheme = try selectSignatureScheme(cc, self.config.signature_algorithms, client_sig_algs_buf[0..client_sig_algs_len]);
+            const cv_r = try self.signAndSendCertificateVerify(cc, scheme, .server, random, out[cursor..]);
             cursor += cv_r.bytes.len;
             extra_records[extra_n] = .{ .epoch = 2, .sequence_number = cv_r.seq };
             extra_n += 1;
@@ -1676,7 +1833,13 @@ pub const Connection = struct {
                 extra_records[extra_n] = .{ .epoch = 2, .sequence_number = r.seq };
                 extra_n += 1;
 
-                const cv_r = try self.signAndSendCertificateVerify(cc, .client, random, out[cursor..]);
+                // RFC 8446 §4.2.3 negotiation: the scheme this client signs
+                // with must be one the SERVER advertised in its
+                // CertificateRequest (`cert_result.peerSigAlgs()`), one this
+                // client itself is willing to use, AND one `cc.private_key`
+                // can produce (see `selectSignatureScheme`).
+                const scheme = try selectSignatureScheme(cc, self.config.signature_algorithms, cert_result.peerSigAlgs());
+                const cv_r = try self.signAndSendCertificateVerify(cc, scheme, .client, random, out[cursor..]);
                 cursor += cv_r.bytes.len;
                 extra_records[extra_n] = .{ .epoch = 2, .sequence_number = cv_r.seq };
                 extra_n += 1;
@@ -2485,6 +2648,73 @@ fn clientEcdsaKeyPair() certverify.SecretKey {
     return .{ .ecdsa_p256 = std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey.fromBytes(cert_kat.client_secret_key_bytes) catch unreachable };
 }
 
+// ── signature_algorithms negotiation (RFC 8446 §4.2.3): direct unit tests
+// ── of `selectSignatureScheme`/`verifyPeerCert`'s downgrade guard ────────
+//
+// These call the private `selectSignatureScheme`/`verifyPeerCert` directly
+// (legitimate same-file access, not a workaround) specifically to isolate
+// the SELECTION/GUARD logic from AEAD sealing: a real handshake's
+// CertificateVerify travels inside an AEAD-protected record, so a
+// wire-level "wrong scheme got through" tamper is indistinguishable from
+// any other bit flip (`error.DecryptionFailed` fires first, before either
+// check ever runs) — these unit tests instead prove the checks themselves
+// are correct, and the "mandatory oracle" tests further below prove they
+// are genuinely WIRED into the real handshake (not a dead helper nothing
+// calls — removing either call site there breaks those tests).
+
+test "selectSignatureScheme: intersects peer-advertised x self-permitted x key-producible, non-preference-order peer list" {
+    // `.rsa` tag is all `candidateSchemes`/`selectSignatureScheme` inspect —
+    // the union payload is never read by this pure selection logic.
+    const cc = CertConfig{ .chain = &.{}, .private_key = .{ .rsa = undefined } };
+    const our_sig_algs = [_]certverify.SignatureScheme{ .rsa_pss_rsae_sha256, .rsa_pss_rsae_sha384, .rsa_pss_rsae_sha512 };
+    // Peer advertises sha384 (NOT this side's most-preferred sha256) plus an
+    // unrelated scheme — proves a real intersection is computed, not "peer
+    // offered something, so use our first candidate".
+    const peer_sig_algs = [_]u16{ @intFromEnum(certverify.SignatureScheme.ed25519), @intFromEnum(certverify.SignatureScheme.rsa_pss_rsae_sha384) };
+    try testing.expectEqual(certverify.SignatureScheme.rsa_pss_rsae_sha384, try selectSignatureScheme(cc, &our_sig_algs, &peer_sig_algs));
+}
+
+test "selectSignatureScheme: peer advertises nothing this key's family can produce -> NoSignatureSchemeOverlap" {
+    const cc = CertConfig{ .chain = &.{}, .private_key = .{ .ecdsa_p256 = undefined } };
+    const our_sig_algs = default_signature_algorithms; // permissive on our side
+    const peer_sig_algs = [_]u16{ @intFromEnum(certverify.SignatureScheme.rsa_pss_rsae_sha256), @intFromEnum(certverify.SignatureScheme.ed25519) };
+    try testing.expectError(error.NoSignatureSchemeOverlap, selectSignatureScheme(cc, &our_sig_algs, &peer_sig_algs));
+}
+
+test "selectSignatureScheme: peer DOES advertise a key-producible scheme, but OUR OWN signature_algorithms excludes it -> NoSignatureSchemeOverlap" {
+    // Proves the "AND we support" leg is real: without it, this case would
+    // wrongly succeed (peer + key overlap alone is not sufficient).
+    const cc = CertConfig{ .chain = &.{}, .private_key = .{ .ecdsa_p256 = undefined } };
+    const our_sig_algs = [_]certverify.SignatureScheme{.ed25519}; // deliberately excludes ecdsa_secp256r1_sha256
+    const peer_sig_algs = [_]u16{@intFromEnum(certverify.SignatureScheme.ecdsa_secp256r1_sha256)};
+    try testing.expectError(error.NoSignatureSchemeOverlap, selectSignatureScheme(cc, &our_sig_algs, &peer_sig_algs));
+}
+
+test "verifyPeerCert: rejects a CertificateVerify scheme this side never advertised, before touching the signature (downgrade guard)" {
+    var conn = try Connection.clientInit(.{
+        .role = .client,
+        .psk_identity = "device-042",
+        .psk = "a-shared-pre-shared-key",
+        .cipher_suites = &.{.aes_128_gcm_sha256},
+        .signature_algorithms = &.{.ecdsa_secp256r1_sha256}, // narrowed: no RSA
+    });
+    // `rsa_pss_rsae_sha256`'s wire code point is NOT in the list above — the
+    // guard must reject it immediately. `leaf_der`/`signature`/
+    // `transcript_hash` below are garbage on purpose: if the guard were
+    // missing, this call would instead fail LATER with a DIFFERENT error
+    // (`error.CertificateRejected` from a malformed-DER leaf, or
+    // `error.CertVerifyFailed` from certverify's own scheme/key-family
+    // dispatch) — proving THIS specific check is what fires here, not some
+    // other rejection downstream.
+    const garbage_leaf = [_]u8{0} ** 4;
+    const garbage_sig = [_]u8{0} ** 4;
+    const garbage_th = [_]u8{0} ** 32;
+    try testing.expectError(
+        error.SignatureSchemeNotAdvertised,
+        conn.verifyPeerCert(&garbage_leaf, @intFromEnum(certverify.SignatureScheme.rsa_pss_rsae_sha256), &garbage_sig, &garbage_th, .server),
+    );
+}
+
 test "cert-mode: server-cert-only handshake completes, derives matching keys, app data round-trips" {
     const psk_identity = "device-042";
     const psk = "a-shared-pre-shared-key";
@@ -2504,7 +2734,6 @@ test "cert-mode: server-cert-only handshake completes, derives matching keys, ap
         .cert = .{
             .chain = &.{&cert_kat.server_cert_der},
             .private_key = serverEcdsaKeyPair(),
-            .signature_scheme = .ecdsa_secp256r1_sha256,
         },
     };
     var client = try Connection.clientInit(cfg_client);
@@ -2553,7 +2782,6 @@ test "cert-mode: CertificateVerify signed with the WRONG key is rejected (typed 
             // hash and finds it doesn't verify under the leaf's real key.
             .chain = &.{&cert_kat.server_cert_der},
             .private_key = clientEcdsaKeyPair(),
-            .signature_scheme = .ecdsa_secp256r1_sha256,
         },
     };
     var client = try Connection.clientInit(cfg_client);
@@ -2586,7 +2814,6 @@ test "cert-mode: a directly-tampered CertificateVerify signature byte is rejecte
         .cert = .{
             .chain = &.{&cert_kat.server_cert_der},
             .private_key = serverEcdsaKeyPair(),
-            .signature_scheme = .ecdsa_secp256r1_sha256,
         },
     };
     var client = try Connection.clientInit(cfg_client);
@@ -2643,7 +2870,6 @@ test "cert-mode: peer chain signed by an UNTRUSTED anchor is rejected" {
         .cert = .{
             .chain = &.{&cert_kat.server_cert_der},
             .private_key = serverEcdsaKeyPair(),
-            .signature_scheme = .ecdsa_secp256r1_sha256,
         },
     };
     var client = try Connection.clientInit(cfg_client);
@@ -2698,7 +2924,6 @@ test "cert-mode: CertificateRequest -> client presents its own cert -> mutual au
         .cert = .{
             .chain = &.{&cert_kat.client_cert_der},
             .private_key = clientEcdsaKeyPair(),
-            .signature_scheme = .ecdsa_secp256r1_sha256,
         },
     };
     const cfg_server = Config{
@@ -2709,7 +2934,6 @@ test "cert-mode: CertificateRequest -> client presents its own cert -> mutual au
         .cert = .{
             .chain = &.{&cert_kat.server_cert_der},
             .private_key = serverEcdsaKeyPair(),
-            .signature_scheme = .ecdsa_secp256r1_sha256,
         },
         .peer_verify = .{ .trust_anchor = &cert_kat.anchor_cert_der },
         .now_sec = cert_kat.valid_now_sec,
@@ -2752,7 +2976,6 @@ test "cert-mode: server requires a client cert but client has none configured ->
         .cert = .{
             .chain = &.{&cert_kat.server_cert_der},
             .private_key = serverEcdsaKeyPair(),
-            .signature_scheme = .ecdsa_secp256r1_sha256,
         },
         .request_client_cert = true,
         .require_peer_cert = true,
@@ -2790,6 +3013,120 @@ test "cert-mode: PSK-only Config fields (cert=null, peer_verify=.none) reproduce
     try driveHandshake(&client, &server, testRandom(&csprng), &buf1, &buf2);
     try testing.expectEqual(State.connected, client.state);
     try testing.expectEqual(State.connected, server.state);
+}
+
+// ── signature_algorithms negotiation (RFC 8446 §4.2.3): REAL handshake
+// ── proof that `selectSignatureScheme` is genuinely on the wired code path
+// ── (not just unit-tested in isolation above) ────────────────────────────
+
+test "cert-mode: signature_algorithms negotiation picks the mutually-supported scheme from a restricted, non-default, non-preference-order list on both sides" {
+    const psk_identity = "device-042";
+    const psk = "a-shared-pre-shared-key";
+    const cfg_client = Config{
+        .role = .client,
+        .psk_identity = psk_identity,
+        .psk = psk,
+        .cipher_suites = &.{.aes_128_gcm_sha256},
+        .peer_verify = .{ .trust_anchor = &cert_kat.anchor_cert_der },
+        .now_sec = cert_kat.valid_now_sec,
+        // Deliberately NOT this module's default list, deliberately NOT
+        // ecdsa-first — if the negotiation just took peer/self index 0 (or
+        // ignored the lists entirely) rather than a real intersection, this
+        // would either pick the wrong scheme or fail outright.
+        .signature_algorithms = &.{ .ed25519, .rsa_pss_rsae_sha256, .ecdsa_secp256r1_sha256 },
+    };
+    const cfg_server = Config{
+        .role = .server,
+        .psk_identity = psk_identity,
+        .psk = psk,
+        .cipher_suites = &.{.aes_128_gcm_sha256},
+        .cert = .{ .chain = &.{&cert_kat.server_cert_der}, .private_key = serverEcdsaKeyPair() },
+        .signature_algorithms = &.{ .rsa_pss_rsae_sha384, .ecdsa_secp256r1_sha256, .rsa_pss_rsae_sha512 },
+    };
+    var client = try Connection.clientInit(cfg_client);
+    var server = try Connection.serverInit(cfg_server);
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x67} ** 32);
+    var buf1: [2048]u8 = undefined;
+    var buf2: [2048]u8 = undefined;
+
+    // Only overlap across (client's advertised list) x (server's own list)
+    // x (server's ECDSA-P256 key's one candidate) is `ecdsa_secp256r1_sha256`
+    // — completing at all proves that scheme, and only that scheme, was
+    // negotiated end-to-end through the real flight engine.
+    try driveHandshake(&client, &server, testRandom(&csprng), &buf1, &buf2);
+    try testing.expectEqual(State.connected, client.state);
+    try testing.expectEqual(State.connected, server.state);
+}
+
+test "cert-mode: no mutually-supported signature scheme for the server's own CertificateVerify -> real handshake fails with the named error, not a silent default" {
+    const psk_identity = "device-042";
+    const psk = "a-shared-pre-shared-key";
+    const cfg_client = Config{
+        .role = .client,
+        .psk_identity = psk_identity,
+        .psk = psk,
+        .cipher_suites = &.{.aes_128_gcm_sha256},
+        // Only claims to verify RSA-PSS schemes — the server's configured
+        // credential is ECDSA P-256, whose one candidate scheme
+        // (ecdsa_secp256r1_sha256) is absent from this list, so the server
+        // can find no overlap for its own CertificateVerify.
+        .signature_algorithms = &.{ .rsa_pss_rsae_sha256, .rsa_pss_rsae_sha384 },
+    };
+    const cfg_server = Config{
+        .role = .server,
+        .psk_identity = psk_identity,
+        .psk = psk,
+        .cipher_suites = &.{.aes_128_gcm_sha256},
+        .cert = .{ .chain = &.{&cert_kat.server_cert_der}, .private_key = serverEcdsaKeyPair() },
+    };
+    var client = try Connection.clientInit(cfg_client);
+    var server = try Connection.serverInit(cfg_server);
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x68} ** 32);
+    const rnd = testRandom(&csprng);
+    var buf1: [2048]u8 = undefined;
+    var buf2: [2048]u8 = undefined;
+
+    const ch = try client.startHandshake(rnd, 0, &buf1);
+    // If `selectSignatureScheme` were removed from `serverProcessClientHello`
+    // (e.g. reverted to some hardcoded scheme), this would instead complete
+    // (or fail some other, unrelated way) — this test fails exactly when
+    // that real wiring is missing.
+    try testing.expectError(error.NoSignatureSchemeOverlap, server.handleFlight(ch, rnd, 0, &buf2));
+}
+
+test "cert-mode: no mutually-supported signature scheme for the CLIENT's own CertificateVerify -> real handshake fails with the named error" {
+    const psk_identity = "device-042";
+    const psk = "a-shared-pre-shared-key";
+    const cfg_client = Config{
+        .role = .client,
+        .psk_identity = psk_identity,
+        .psk = psk,
+        .cipher_suites = &.{.aes_128_gcm_sha256},
+        .cert = .{ .chain = &.{&cert_kat.client_cert_der}, .private_key = clientEcdsaKeyPair() },
+    };
+    const cfg_server = Config{
+        .role = .server,
+        .psk_identity = psk_identity,
+        .psk = psk,
+        .cipher_suites = &.{.aes_128_gcm_sha256},
+        // No `cert` — this test isolates the CLIENT's own negotiation
+        // (server presents no CertificateVerify of its own to interfere).
+        .request_client_cert = true,
+        // The server's CertificateRequest advertises ONLY rsa_pss_rsae_sha256
+        // (RFC 8446 §4.3.2's signature_algorithms) — the client's ECDSA
+        // P-256 credential's one candidate scheme is absent from it.
+        .signature_algorithms = &.{.rsa_pss_rsae_sha256},
+    };
+    var client = try Connection.clientInit(cfg_client);
+    var server = try Connection.serverInit(cfg_server);
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x69} ** 32);
+    const rnd = testRandom(&csprng);
+    var buf1: [2048]u8 = undefined;
+    var buf2: [2048]u8 = undefined;
+
+    const ch = try client.startHandshake(rnd, 0, &buf1);
+    const flight2 = try server.handleFlight(ch, rnd, 0, &buf2);
+    try testing.expectError(error.NoSignatureSchemeOverlap, client.handleFlight(flight2.out, rnd, 0, &buf1));
 }
 
 // ── cert-only-DHE (`.cert_dhe`) mode: PSK-less ephemeral-X25519 handshake ──
@@ -2859,7 +3196,6 @@ fn certDheServerConfig() Config {
         .cert = .{
             .chain = &.{&cert_kat.server_cert_der},
             .private_key = serverEcdsaKeyPair(),
-            .signature_scheme = .ecdsa_secp256r1_sha256,
         },
     };
 }
@@ -2926,7 +3262,6 @@ test "cert-DHE: mutual auth (CertificateRequest -> client cert) completes" {
     cfg_c.cert = .{
         .chain = &.{&cert_kat.client_cert_der},
         .private_key = clientEcdsaKeyPair(),
-        .signature_scheme = .ecdsa_secp256r1_sha256,
     };
     var cfg_s = certDheServerConfig();
     cfg_s.request_client_cert = true;
@@ -2986,7 +3321,6 @@ test "cert-DHE reject: CertificateVerify signed with the WRONG key is rejected" 
         // Presents the real server leaf but signs with the CLIENT's key.
         .chain = &.{&cert_kat.server_cert_der},
         .private_key = clientEcdsaKeyPair(),
-        .signature_scheme = .ecdsa_secp256r1_sha256,
     };
     var client = try Connection.clientInit(certDheClientConfig());
     var server = try Connection.serverInit(cfg_s);

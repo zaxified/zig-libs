@@ -193,6 +193,26 @@ pub const SecretKey = union(enum) {
     ed25519: Ed25519.SecretKey,
 };
 
+// ── candidateSchemes: signature_algorithms negotiation support ──────────
+
+/// The `SignatureScheme`(s) `secret_key`'s key FAMILY can actually produce a
+/// signature under, most-preferred first — the fact a negotiator (see
+/// `Connection.zig`'s `selectSignatureScheme`) needs to intersect against a
+/// peer's advertised `signature_algorithms` list. An RSA key is hash-agnostic
+/// (RFC 8446 §4.2.3: the same key works under any `rsa_pss_rsae_sha*`
+/// scheme, differing only in which hash the PSS padding uses), so it has
+/// three candidates; ECDSA/Ed25519 keys are each tied to exactly one scheme
+/// (the curve fixes the hash). Never empty — every `SecretKey` union case
+/// maps to at least one scheme.
+pub fn candidateSchemes(secret_key: SecretKey) []const SignatureScheme {
+    return switch (secret_key) {
+        .rsa => &.{ .rsa_pss_rsae_sha256, .rsa_pss_rsae_sha384, .rsa_pss_rsae_sha512 },
+        .ecdsa_p256 => &.{.ecdsa_secp256r1_sha256},
+        .ecdsa_p384 => &.{.ecdsa_secp384r1_sha384},
+        .ed25519 => &.{.ed25519},
+    };
+}
+
 // ── maxSignatureLen: caller-facing output-buffer sizing ──────────────────
 
 /// Conservative upper bound (bytes) on a `sign()` output for `scheme`, for
@@ -607,6 +627,26 @@ test "SignatureScheme: RFC 8446 §4.2.3 wire code points" {
     try testing.expectEqual(@as(u16, 0x0805), @intFromEnum(SignatureScheme.rsa_pss_rsae_sha384));
     try testing.expectEqual(@as(u16, 0x0806), @intFromEnum(SignatureScheme.rsa_pss_rsae_sha512));
     try testing.expectEqual(@as(u16, 0x0807), @intFromEnum(SignatureScheme.ed25519));
+}
+
+// -- candidateSchemes: real, complete --
+
+test "candidateSchemes: an RSA key offers all three rsa_pss_rsae_* schemes" {
+    const sk = try kat.rsa_pss_sha256_server.secretKey();
+    const schemes = candidateSchemes(.{ .rsa = sk });
+    try testing.expectEqual(@as(usize, 3), schemes.len);
+    try testing.expectEqual(SignatureScheme.rsa_pss_rsae_sha256, schemes[0]);
+    try testing.expectEqual(SignatureScheme.rsa_pss_rsae_sha384, schemes[1]);
+    try testing.expectEqual(SignatureScheme.rsa_pss_rsae_sha512, schemes[2]);
+}
+
+test "candidateSchemes: ECDSA/Ed25519 keys each offer exactly their one paired scheme" {
+    const p256_sk = try kat.ecdsa_p256_server.secretKey();
+    try testing.expectEqualSlices(SignatureScheme, &.{.ecdsa_secp256r1_sha256}, candidateSchemes(.{ .ecdsa_p256 = p256_sk }));
+    const p384_sk = try kat.ecdsa_p384_server.secretKey();
+    try testing.expectEqualSlices(SignatureScheme, &.{.ecdsa_secp384r1_sha384}, candidateSchemes(.{ .ecdsa_p384 = p384_sk }));
+    const ed_kp = try kat.ed25519_client.keyPair();
+    try testing.expectEqualSlices(SignatureScheme, &.{.ed25519}, candidateSchemes(.{ .ed25519 = ed_kp.secret_key }));
 }
 
 // -- verify/sign reject-path dispatch: real, complete, never touches the

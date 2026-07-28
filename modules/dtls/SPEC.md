@@ -131,8 +131,23 @@ left in place rather than silently deleted, corrected here):
   wrong-key rejection, untrusted-anchor rejection, required-but-absent-cert
   rejection) — same in-memory-oracle style as the PSK suite, no external
   peer.
-- **Still deferred (now explicit, not silently absent):**
-  `signature_algorithms` extension negotiation; full RFC 5280 §6
+- **`signature_algorithms` extension negotiation (RFC 8446 §4.2.3) — LANDED
+  (was listed as deferred here; corrected):** the ClientHello (both `.psk`
+  and `.cert_dhe` modes) and a server's `CertificateRequest` now advertise
+  `Config.signature_algorithms` (defaults to every scheme `certverify.zig`
+  implements) for real; `Connection.zig`'s `selectSignatureScheme` picks the
+  scheme a CertificateVerify signs with from the intersection of the peer's
+  advertised list, `Config.signature_algorithms`, and
+  `certverify.candidateSchemes(cc.private_key)` (what the configured key's
+  FAMILY can actually sign under — RSA keys offer all three
+  `rsa_pss_rsae_sha*` schemes, EC/Ed25519 keys exactly one each), failing
+  with `error.NoSignatureSchemeOverlap` rather than a silent default when
+  there is no overlap. `verifyPeerCert` additionally rejects (`error
+  .SignatureSchemeNotAdvertised`) a peer's CertificateVerify that used a
+  scheme THIS side never put in its own `signature_algorithms` — a downgrade
+  guard, checked before the signature itself. `CertConfig` no longer carries
+  a fixed `signature_scheme` field.
+- **Still deferred (now explicit, not silently absent):** full RFC 5280 §6
   certification-path building (multi-hop chains, name constraints,
   `basicConstraints`/`keyUsage` policy checks, revocation) — `.trust_anchor`
   is a minimal one-hop check only; `CertificateEntry` extensions (OCSP
