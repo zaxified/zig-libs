@@ -510,9 +510,29 @@ fn feFromBig(m: Modulus, x: *const BigInt) !Fe {
     return Fe.fromBytes(m, &buf, .big);
 }
 
-/// d = e⁻¹ (mod m) via the extended Euclidean algorithm; fails unless
-/// gcd(e, m) = 1. Variable-time (see the `fromPrimes` timing note).
-fn bigModInverse(gpa: std.mem.Allocator, e: *const BigInt, m: *const BigInt) !BigInt {
+/// `e⁻¹ (mod m)` via the extended Euclidean algorithm over a (possibly
+/// composite) `m`; fails with `error.InvalidPrivateKey` unless gcd(e, m) = 1.
+/// VARIABLE-TIME in both operands (division-based Euclid — `std.crypto.ff`
+/// has no `invert`, and Fermat inversion needs a *prime* modulus, which a
+/// composite-modulus caller may not even know the factorization of). Used
+/// internally for `d = e⁻¹ mod λ(n)` key derivation (`fromPrimes`, offline,
+/// operates on already-known primes) and per-op CRT base-blinding
+/// (`invModN`, called on a fresh public random `r`, never on secret key
+/// material) — both call sites only ever feed it a *non-secret* operand.
+///
+/// `pub` so sibling modules needing a generic composite-modulus inverse
+/// (currently `blindrsa`, for its RFC 9474 blinding-factor inversion) can
+/// reuse this instead of carrying their own copy. It is a bare arithmetic
+/// primitive with NO masking of its own — a caller with a secret operand
+/// MUST mask it (multiply by a fresh independent random unit) before
+/// calling, the same way `invModN` above and `blindrsa`'s `maskedInvert`
+/// do; passing a secret directly leaks it through the run's data-dependent
+/// branch count. The returned `BigInt` is a fresh, caller-owned value (the
+/// caller's allocator is used for it, same as every other scratch value
+/// here); this module always draws `gpa` from a `FixedBufferAllocator`
+/// arena and lets the whole arena die together, never calling `.deinit()`
+/// individually — a caller using a real allocator must deinit the result.
+pub fn bigModInverse(gpa: std.mem.Allocator, e: *const BigInt, m: *const BigInt) !BigInt {
     // Invariants: t0*e ≡ r0, t1*e ≡ r1 (mod m).
     var r0 = try newBig(gpa);
     try r0.copy(m.toConst());
@@ -1166,7 +1186,14 @@ pub fn decryptOaepH(sk: SecretKey, comptime LabelHash: type, comptime MgfHash: t
 ///   H = Hash((0x00 × 8) || Hash(msg) || salt)
 ///   EM = (DB ^ MGF1(H)) || H || 0xbc, DB = PS(0x00…) || 0x01 || salt,
 /// with the leftmost 8·emLen - emBits bits of maskedDB cleared (step 11).
-fn emsaPssEncode(comptime Hash: type, msg: []const u8, salt: []const u8, em_bits: usize, em: []u8) EmsaEncodeError!void {
+///
+/// `pub` so a caller needing EMSA-PSS-ENCODE as a standalone step — decoupled
+/// from RSASP1 — can reuse it instead of carrying an independent copy.
+/// `blindrsa`'s RFC 9474 Blind is exactly this: it encodes, then blinds the
+/// encoded integer, and only signs (via `rsasp1`) later, server-side, over
+/// the blinded value — it never calls `signPss` here. `blindrsa.pssEncode`
+/// is now a thin wrapper delegating straight to this function.
+pub fn emsaPssEncode(comptime Hash: type, msg: []const u8, salt: []const u8, em_bits: usize, em: []u8) EmsaEncodeError!void {
     const h_len = Hash.digest_length;
     const em_len = em.len;
     std.debug.assert(em_len == byteLen(em_bits));

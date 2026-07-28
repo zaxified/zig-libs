@@ -19,7 +19,7 @@ private-op blinding on top of the mandatory fail-closed self-check — see
 
 | File | Contents |
 |---|---|
-| `root.zig` | The four RFC 9474 operations (+ `blindWithFactor` KAT seam), `pssEncode`, `prepareIdentity`/`prepareRandomize`, `Context`, and the local composite-modulus extended-Euclid inverse (`TODO(dry)`: consolidate into `rsa`) |
+| `root.zig` | The four RFC 9474 operations (+ `blindWithFactor` KAT seam), `pssEncode` (delegates to `rsa.emsaPssEncode`), `prepareIdentity`/`prepareRandomize`, `Context`, and the masked composite-modulus inverse (`feInvert`/`maskedInvert`, calling `rsa.bigModInverse`) |
 | `kat_vectors.zig` | RFC 9474 Appendix A.1 (RSABSSA-SHA384-PSS-Randomized) and A.4 (RSABSSA-SHA384-PSSZERO-Deterministic) official test vectors, transcribed from the RFC's own published hex, plus the recomputed blinding factor `r` (= the RFC's `inv`⁻¹ mod n, cross-checked in Python) |
 | `kat_test.zig` | Byte-exact KAT assertions for all four operations + fail-closed reject tests + random-path round-trips (RFC key and a fresh `rsa.generate` keypair) |
 

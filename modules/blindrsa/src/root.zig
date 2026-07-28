@@ -17,18 +17,17 @@
 //! BYTE-EXACT against RFC 9474 Appendix A.1 (RSABSSA-SHA384-PSS-
 //! Randomized) and A.4 (RSABSSA-SHA384-PSSZERO-Deterministic) —
 //! `kat_test.zig`:
-//!   - `pssEncode` — EMSA-PSS-ENCODE (RFC 8017 §9.1.1), independently
-//!     re-implemented here (see "Why this module carries its own
-//!     PSS-encode" below).
+//!   - `pssEncode` — EMSA-PSS-ENCODE (RFC 8017 §9.1.1); a thin wrapper over
+//!     the sibling `rsa` module's `emsaPssEncode` (see "PSS-encode + MGF1
+//!     reuse" below).
 //!   - `prepareIdentity` / `prepareRandomize` — RFC 9474 §4's two message
 //!     "Prepare" functions (trivial: identity, or prepend a fresh 32-byte
 //!     random prefix).
 //!   - `blind` (+ the deterministic `blindWithFactor` KAT/test seam) —
 //!     RFC 9474 §4 Blind: encode, gcd(m,n) check, sample `r ∈ [1,n)`
 //!     (rejection sampling, see SPEC.md's uniformity note), invert `r`
-//!     mod the COMPOSITE modulus `n` (local extended Euclid — see "the
-//!     composite-modulus inverse" below), `x = RSAVP1(pk, r)`,
-//!     `blinded_msg = m·x mod n`.
+//!     mod the COMPOSITE modulus `n` (see "the composite-modulus inverse"
+//!     below), `x = RSAVP1(pk, r)`, `blinded_msg = m·x mod n`.
 //!   - `blindSign` — RFC 9474 §4 BlindSign (RSASP1 via `rsa.rsasp1`'s CRT
 //!     path + the mandatory RSAVP1 self-check), WITH RFC 9474 §7.2's
 //!     RECOMMENDED private-op blinding implemented on top (see
@@ -46,48 +45,29 @@
 //! repo's public API provides is a modular INVERSE over a composite
 //! modulus (`ff` has `pow`/`powPublic` but no `invert`; Fermat inversion
 //! `x^(n-2)` needs a PRIME modulus, and the client doing the inverting
-//! does not know `n`'s factorization). `rsa`'s own key derivation
-//! implements exactly this privately (`bigModInverse`); this module
-//! carries its own local copy (`bigModInverse` below, extended Euclid over
-//! `std.math.big.int`) rather than reaching into `rsa`'s internals — see
-//! the `TODO(dry)` on it. The Euclid loop is VARIABLE-TIME in its
-//! operands, so the secret-input paths never feed a raw secret into it:
-//! `blind`/`blindSign` invert through `maskedInvert` (multiplicative
-//! blinding of the Euclid operand itself — the divisions run on `x·u mod
-//! n` for a fresh uniform secret `u`, a value statistically independent
-//! of `x`). Only the deterministic `blindWithFactor` KAT seam runs the
-//! Euclid loop on its input directly — see its doc comment.
+//! does not know `n`'s factorization). `rsa`'s own key derivation needs
+//! exactly this too (`d = e⁻¹ mod λ(n)`) and now exports the routine as
+//! `pub fn bigModInverse` for exactly this cross-module reuse — this
+//! module no longer carries a local copy, only the byte<->BigInt glue
+//! (`newBig`/`bigFromBytes`) and its own masking layer around the call.
+//! `rsa.bigModInverse`'s Euclid loop is VARIABLE-TIME in its operands, so
+//! the secret-input paths never feed a raw secret into it: `blind`/
+//! `blindSign` invert through `maskedInvert` (multiplicative blinding of
+//! the Euclid operand itself — the divisions run on `x·u mod n` for a
+//! fresh uniform secret `u`, a value statistically independent of `x`).
+//! Only the deterministic `blindWithFactor` KAT seam runs the Euclid loop
+//! on its input directly — see its doc comment.
 //!
-//! ## Why this module carries its own PSS-encode + MGF1
+//! ## PSS-encode + MGF1 reuse
 //!
-//! The sibling `rsa` module already implements EMSA-PSS-ENCODE
-//! (`emsaPssEncode`) and MGF1 (`mgf1Xor`) internally (`modules/rsa/src/
-//! root.zig`, used by its own `signPss`) — but BOTH are private,
-//! module-file-scoped functions, not `pub`. RFC 9474's Blind algorithm
-//! needs EMSA-PSS-ENCODE as a standalone step (it encodes, then blinds the
-//! encoded integer — it never calls RSASP1 directly the way `rsa.signPss`
-//! does), so this module cannot reuse `rsa`'s copy through its public API
-//! today. Rather than hack around that (e.g. vendoring the encoded message
-//! via a side channel, or reimplementing RSASSA-PSS-SIGN just to throw the
-//! signature away), `pssEncode`/`mgf1Xor` below are independently
-//! re-implemented directly from RFC 8017 §9.1.1/§B.2.1 (public spec text,
-//! not `rsa`'s source — see NOTICE) and validated byte-exact against RFC
-//! 9474's own published vectors. **This is a DRY gap, not a correctness
-//! gap**: the owner should consider exporting `rsa.emsaPssEncode`/
-//! `rsa.mgf1Xor` (or an equivalent public seam) in a follow-up so this
-//! module can drop its local copy — see `SPEC.md`.
-//!
-//! ## Remaining DRY gaps (for the owner)
-//!
-//! 1. **EMSA-PSS-ENCODE not exported by `rsa`** — see above; worked
-//!    around with a local, independently written copy.
-//! 2. **The composite-modulus inverse is now duplicated too** — `rsa`'s
-//!    private `bigModInverse` (key derivation) and this module's
-//!    `bigModInverse` (blinding-factor inversion) implement the same
-//!    extended-Euclid routine. A follow-up could export both seams from
-//!    `rsa` (`emsaPssEncode`/`mgf1Xor` + `bigModInverse`) and delete this
-//!    module's local copies with no behavior change — see the
-//!    `TODO(dry)` markers below.
+//! The sibling `rsa` module's EMSA-PSS-ENCODE (`emsaPssEncode`, which
+//! internally owns MGF1 too) is now `pub` (`modules/rsa/src/root.zig`),
+//! exported specifically so RFC 9474's Blind algorithm — which needs
+//! EMSA-PSS-ENCODE as a standalone step, encoding then blinding the
+//! encoded integer, never calling RSASP1 directly the way `rsa.signPss`
+//! does — can reuse it instead of an independent re-implementation.
+//! `pssEncode` below is a thin wrapper over `rsa.emsaPssEncode`; there is
+//! no local MGF1 copy anymore.
 //!
 //! ## RSABSSA variants (RFC 9474 §5)
 //!
@@ -133,11 +113,12 @@ fn byteLen(bits: usize) usize {
 // scratch lives in a stack FixedBufferAllocator arena that is securely
 // zeroed on exit (the operands are secret blinding factors).
 //
-// TODO(dry): the sibling `rsa` module implements the identical primitive
-// privately (`bigModInverse`, used by `SecretKey.fromPrimes` to derive
-// `d = e⁻¹ mod λ(n)`). A follow-up could export it from `rsa` (alongside
-// `emsaPssEncode`/`mgf1Xor` — see the module doc comment) and delete this
-// local copy with no behavior change.
+// The Euclid loop itself is `rsa.bigModInverse` (exported `pub` for exactly
+// this reuse — see its doc comment in `modules/rsa/src/root.zig`), the same
+// routine `SecretKey.fromPrimes` uses privately to derive `d = e⁻¹ mod λ(n)`.
+// This file only keeps the byte<->BigInt conversion helpers below (`newBig`/
+// `bigFromBytes`), still needed locally for `isCoprime`'s own gcd check and
+// for building `feInvert`'s operands before handing them to `rsa`.
 
 const BigInt = std.math.big.int.Managed;
 
@@ -164,47 +145,10 @@ fn bigFromBytes(gpa: std.mem.Allocator, bytes: []const u8) !BigInt {
     return x;
 }
 
-/// x⁻¹ (mod m) via the extended Euclidean algorithm; fails unless
-/// gcd(x, m) = 1. Works over a COMPOSITE modulus. VARIABLE-TIME in both
-/// operands (big.int division-based Euclid — `ff` cannot express this);
-/// secret inputs must be masked first, see `maskedInvert`.
-fn bigModInverse(gpa: std.mem.Allocator, x: *const BigInt, m: *const BigInt) !BigInt {
-    // Invariants: t0*x ≡ r0, t1*x ≡ r1 (mod m).
-    var r0 = try newBig(gpa);
-    try r0.copy(m.toConst());
-    var r1 = try newBig(gpa);
-    try r1.copy(x.toConst());
-    var t0 = try newBig(gpa);
-    try t0.set(0);
-    var t1 = try newBig(gpa);
-    try t1.set(1);
-    var quot = try newBig(gpa);
-    var rem = try newBig(gpa);
-    var tmp = try newBig(gpa);
-    var new_t = try newBig(gpa);
-
-    while (!r1.eqlZero()) {
-        try quot.divFloor(&rem, &r0, &r1);
-        // (r0, r1) <- (r1, r0 mod r1)
-        r0.swap(&r1);
-        r1.swap(&rem);
-        // (t0, t1) <- (t1, t0 - quot*t1)
-        try tmp.mul(&quot, &t1);
-        try new_t.sub(&t0, &tmp);
-        t0.swap(&t1);
-        t1.swap(&new_t);
-    }
-    // r0 = gcd(x, m); must be 1 for x to be invertible.
-    if (r0.toConst().orderAgainstScalar(1) != .eq) return error.NotInvertible;
-    // t0*x ≡ 1 (mod m); normalize t0 (possibly negative) into [0, m).
-    try quot.divFloor(&rem, &t0, m);
-    return rem;
-}
-
 const InvertError = error{NotInvertible};
 
 /// `x⁻¹ mod m` at the `Fe` level. VARIABLE-TIME in `x` (see
-/// `bigModInverse`) — callers holding a secret `x` go through
+/// `rsa.bigModInverse`) — callers holding a secret `x` go through
 /// `maskedInvert` instead; this direct form is for the deterministic
 /// `blindWithFactor` KAT seam and for values already independent of any
 /// long-term secret.
@@ -228,7 +172,7 @@ fn feInvert(m: rsa.Modulus, x: rsa.Fe) InvertError!rsa.Fe {
         fn run(a: std.mem.Allocator, xb: []const u8, nb: []const u8, out: []u8) !void {
             var bx = try bigFromBytes(a, xb);
             var bm = try bigFromBytes(a, nb);
-            var inv = try bigModInverse(a, &bx, &bm);
+            var inv = try rsa.bigModInverse(a, &bx, &bm);
             inv.toConst().writeTwosComplement(out, .big);
         }
     };
@@ -298,31 +242,17 @@ fn sampleFe(m: rsa.Modulus, random: std.Random) rsa.Fe {
     }
 }
 
-// ── MGF1 (RFC 8017 §B.2.1) — REAL, local copy ───────────────────────────
+// ── EMSA-PSS-ENCODE (RFC 8017 §9.1.1) — delegates to `rsa` ──────────────
 //
-// Identical algorithm to `rsa`'s own private `mgf1Xor`; duplicated here
-// because that copy isn't exported (see the module doc comment's "Why this
-// module carries its own PSS-encode + MGF1"). Independently written
-// directly from the RFC, not copied from `rsa`'s source.
-
-fn mgf1Xor(comptime Hash: type, seed: []const u8, data: []u8) void {
-    var counter: u32 = 0;
-    var off: usize = 0;
-    while (off < data.len) : (counter += 1) {
-        var c: [4]u8 = undefined;
-        std.mem.writeInt(u32, &c, counter, .big);
-        var st = Hash.init(.{});
-        st.update(seed);
-        st.update(&c);
-        var digest: [Hash.digest_length]u8 = undefined;
-        st.final(&digest);
-        const n = @min(digest.len, data.len - off);
-        for (data[off..][0..n], digest[0..n]) |*d, m| d.* ^= m;
-        off += n;
-    }
-}
-
-// ── EMSA-PSS-ENCODE (RFC 8017 §9.1.1) — REAL ────────────────────────────
+// `rsa.emsaPssEncode` (which internally also owns MGF1/`mgf1Xor`) is now
+// `pub`, exported specifically for this reuse — see its doc comment in
+// `modules/rsa/src/root.zig`. This module no longer carries an independent
+// re-implementation or a local `mgf1Xor`: `pssEncode` below is a thin
+// wrapper, kept as a distinct public name (rather than a bare re-export)
+// because RFC 9474's Blind step 1 calls EMSA-PSS-ENCODE as a standalone
+// step — unlike `rsa.signPss`, which always runs RSASP1 immediately after
+// encoding — so this is the module's own documented entry point for that
+// step, not merely an alias of convenience.
 
 pub const PssEncodeError = error{EncodedMessageTooShort};
 
@@ -335,42 +265,11 @@ pub const PssEncodeError = error{EncodedMessageTooShort};
 /// `salt.len == 0` selects the PSSZERO variants; `salt.len ==
 /// Hash.digest_length` (48 for SHA-384) selects plain PSS.
 ///
-/// REAL — independently re-implemented from RFC 8017 §9.1.1 (see the
-/// module doc comment); validated BYTE-EXACT against RFC 9474 Appendix
-/// A.1's and A.4's published `encoded_msg` values (`kat_test.zig`).
+/// Delegates to `rsa.emsaPssEncode` (see above); validated BYTE-EXACT
+/// against RFC 9474 Appendix A.1's and A.4's published `encoded_msg`
+/// values (`kat_test.zig`).
 pub fn pssEncode(comptime Hash: type, msg: []const u8, salt: []const u8, em_bits: usize, em: []u8) PssEncodeError!void {
-    const h_len = Hash.digest_length;
-    const em_len = em.len;
-    std.debug.assert(em_len == byteLen(em_bits));
-    // §9.1.1 step 3: emLen >= hLen + sLen + 2.
-    if (em_len < h_len + 2 or salt.len > em_len - h_len - 2) return error.EncodedMessageTooShort;
-
-    const db = em[0 .. em_len - h_len - 1];
-    const h = em[em_len - h_len - 1 ..][0..h_len];
-
-    // steps 2, 5-6: mHash = Hash(msg); H = Hash(M'),
-    // M' = (0x00 × 8) || mHash || salt.
-    var m_hash: [Hash.digest_length]u8 = undefined;
-    Hash.hash(msg, &m_hash, .{});
-    var st = Hash.init(.{});
-    st.update(&[_]u8{0} ** 8);
-    st.update(&m_hash);
-    st.update(salt);
-    st.final(h);
-
-    // steps 7-8: DB = PS (zeros) || 0x01 || salt.
-    @memset(db[0 .. db.len - salt.len - 1], 0x00);
-    db[db.len - salt.len - 1] = 0x01;
-    @memcpy(db[db.len - salt.len ..], salt);
-
-    // steps 9-10: maskedDB = DB ^ MGF1(H, emLen - hLen - 1).
-    mgf1Xor(Hash, h, db);
-
-    // step 11: clear the leftmost 8*emLen - emBits bits of maskedDB so that
-    // OS2IP(EM) < 2^emBits.
-    em[0] &= @as(u8, 0xff) >> @intCast(8 * em_len - em_bits);
-
-    em[em_len - 1] = 0xbc; // step 12: trailer field.
+    return rsa.emsaPssEncode(Hash, msg, salt, em_bits, em);
 }
 
 // ── message preparation (RFC 9474 §4) — REAL ────────────────────────────

@@ -28,22 +28,17 @@ design decisions" below for how the former "TODO(fable)" items landed.
   the RFC 9474 protocol sequencing. This mirrors the `jwe`/`opcua`/`x509`/
   `dnssec` pattern of thin RSA-consumer modules built on `rsa`, not a
   parallel RSA implementation.
-- **Why this module carries its own `pssEncode`/MGF1** (see also
-  `root.zig`'s module doc comment): `rsa`'s own EMSA-PSS-ENCODE
-  (`emsaPssEncode`) and MGF1 (`mgf1Xor`) are file-private, used only
-  internally by `rsa.signPss`, which always follows encoding immediately
-  with RSASP1. RFC 9474's Blind needs the ENCODED INTEGER on its own —
-  the RSA private-key operation happens later, server-side, over the
-  BLINDED integer, in `blindSign`. There is no way to get `rsa`'s
-  encoding step without also getting its signing step through the
-  current public API. `pssEncode`/`mgf1Xor` here are therefore
-  independently re-implemented straight from RFC 8017 §9.1.1/§B.2.1 — not
-  ported from `rsa`'s source (a public spec is not a copyrightable work;
-  see CONVENTIONS.md §5's merger-doctrine note) — and validated
-  byte-exact against RFC 9474's own vectors before being trusted. **This
-  is flagged as a DRY gap for the owner**, not hidden: a follow-up that
-  exports `rsa.emsaPssEncode`/`rsa.mgf1Xor` (or an equivalent seam) could
-  delete this module's copy entirely with no behavior change.
+- **`pssEncode` delegates to `rsa`** (see also `root.zig`'s module doc
+  comment): `rsa`'s EMSA-PSS-ENCODE (`emsaPssEncode`, which internally
+  also owns MGF1) is now `pub`, exported specifically because RFC 9474's
+  Blind needs the ENCODED INTEGER on its own — the RSA private-key
+  operation happens later, server-side, over the BLINDED integer, in
+  `blindSign` — unlike `rsa.signPss`, which always follows encoding
+  immediately with RSASP1. `pssEncode` here is a thin wrapper over
+  `rsa.emsaPssEncode`, kept as its own public name (not a bare re-export)
+  because it is this module's documented entry point for that standalone
+  step. No local MGF1 copy remains. Validated byte-exact against RFC
+  9474's own vectors (`kat_test.zig`).
 - **`Context`** bundles exactly what `finalize` needs that `blind` alone
   produces: `r_inv` (the blinding inverse), `prepared_msg` (borrowed,
   for the trailing `verify` call), and `salt_len`. It deliberately does
@@ -84,19 +79,26 @@ are new transcription, not new design.
 
 ## Resolved design decisions (the former "TODO(fable)" items)
 
-1. **The composite-modulus inverse** — resolved as option (a): `blindrsa`
-   carries its own local `bigModInverse` (extended Euclid over
-   `std.math.big.int.Managed`, the same algorithm `rsa`'s private copy
-   uses; `std.crypto.ff` has no `invert` and Fermat inversion needs a
-   prime modulus). Flagged `TODO(dry)` in `root.zig`: a follow-up could
-   export `rsa.bigModInverse` (alongside `rsa.emsaPssEncode`/`mgf1Xor` —
-   the other DRY gap) and delete both local copies here. Validated
-   against RFC-published data: inverting the RFC's `r` reproduces the
-   RFC's published `inv` byte-exact over the real 4096-bit composite `n`
-   (plus small hand-checkable cases and gcd≠1 rejection).
-   **Timing posture**: the Euclid loop is variable-time in its operands,
-   so secret inputs never reach it raw — see "Constant-time" under
-   "Threat model" below for the masking construction.
+1. **The composite-modulus inverse** — needs extended Euclid over
+   `std.math.big.int.Managed` (`std.crypto.ff` has no `invert`, and Fermat
+   inversion needs a prime modulus). `rsa` needed the identical routine
+   for its own key derivation and now exports it as `pub fn
+   bigModInverse` (`modules/rsa/src/root.zig`); this module calls that
+   directly (via `feInvert`) instead of carrying a local copy — the only
+   code that remains here is the byte<->BigInt glue (`newBig`/
+   `bigFromBytes`, still needed for `isCoprime`'s own gcd check) and the
+   masking layer (`maskedInvert`) around the call. Validated against
+   RFC-published data: inverting the RFC's `r` reproduces the RFC's
+   published `inv` byte-exact over the real 4096-bit composite `n` (plus
+   small hand-checkable cases and gcd≠1 rejection).
+   **Timing posture**: `rsa.bigModInverse`'s Euclid loop is variable-time
+   in its operands (same contract in both modules — verified before
+   unifying: `rsa` and `blindrsa`'s prior local copies were the same
+   bare, unmasked algorithm; the masking is layered on top by the caller
+   in both cases — `rsa`'s own `invModN` masks by only ever calling it on
+   a fresh random `r`, `blindrsa`'s `maskedInvert` masks explicitly), so
+   secret inputs never reach it raw — see "Constant-time" under "Threat
+   model" below for the masking construction.
 2. **`blind`** — implemented per the RFC construction (gcd(m,n) check via
    `big.int.gcd`, rejection-sampled uniform `r ∈ [1,n)`, masked inverse,
    `x = RSAVP1(pk,r)` via `rsa.rsavp1`, `blinded_msg = m·x mod n` via
@@ -223,7 +225,7 @@ feeds `blindSign`'s §7.2 blinding factor and `maskedInvert`'s masks.
   plain `verify`, out-of-range or wrong-length `blinded_msg` at
   `blindSign`, and bad blinding factors at `blindWithFactor` (zero,
   `>= n`, and `r = p` — a real factor of `n`, the gcd≠1 path).
-- Private-helper unit tests in `root.zig`: `bigModInverse` via `feInvert`
+- Private-helper unit tests in `root.zig`: `rsa.bigModInverse` via `feInvert`
   (small hand-checkable case, non-coprime rejection, RFC `r` ↔ `inv`
   round-trip over the real 4096-bit composite, factor-of-`n` rejection),
   `maskedInvert` (mask cancels exactly; rejects non-invertible input),
