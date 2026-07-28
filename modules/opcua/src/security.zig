@@ -321,17 +321,27 @@ fn safeCertificate(certificate_der: []const u8, scratch: []u8) CertificatePublic
     return x509.safe.safeCertificate(certificate_der, scratch) catch return error.InvalidCertificate;
 }
 
-/// Extract the RSA public key from a DER X.509 certificate — std's
-/// independent `std.crypto.Certificate` parser locates the
-/// `SubjectPublicKeyInfo`, the `rsa` module parses the `RSAPublicKey` inside.
-/// Total on arbitrary bytes (see `safeCertificate`): a malformed certificate
+/// Extract the RSA public key from a DER X.509 certificate: `x509.spkiOf`
+/// locates the `SubjectPublicKeyInfo`, the `rsa` module parses the
+/// `RSAPublicKey` inside. Total on arbitrary bytes — a malformed certificate
 /// is `error.InvalidCertificate`, never a panic.
+///
+/// This needs the public key and nothing else, so it takes `spkiOf` rather
+/// than the `safeCertificate` route its neighbours use: `spkiOf` walks the
+/// DER with x509's own bounds-checked decoder, never reaches
+/// `std.crypto.Certificate.parse` at all, decodes no field contents, and
+/// needs no scratch buffer. `certificateValidity` below genuinely needs
+/// `notBefore`/`notAfter`, which `spkiOf` deliberately does not decode, so it
+/// keeps the guarded-std path.
+///
+/// One behavioural gain: this now also works on certificates std cannot parse
+/// at all, such as RSASSA-PSS-*signed* ones carrying an ordinary
+/// `rsaEncryption` key. A key whose own algorithm is `rsassa_pss` still does
+/// not match and is rejected, exactly as before.
 pub fn certificatePublicKey(certificate_der: []const u8) CertificatePublicKeyError!rsa.PublicKey {
-    var scratch: [max_parsed_certificate_len + der_parse_slack]u8 = undefined;
-    const cert = try safeCertificate(certificate_der, &scratch);
-    const parsed = cert.parse() catch return error.InvalidCertificate;
-    if (parsed.pub_key_algo != .rsaEncryption) return error.InvalidCertificate;
-    return rsa.PublicKey.fromDer(parsed.pubKey()) catch error.InvalidCertificate;
+    const spki = x509.spkiOf(certificate_der) catch return error.InvalidCertificate;
+    if (!spki.algorithmIs(&x509.safe.oid_rsa_encryption)) return error.InvalidCertificate;
+    return rsa.PublicKey.fromDer(spki.key_bits) catch error.InvalidCertificate;
 }
 
 /// A DER certificate's `notBefore`/`notAfter`, in Unix seconds.
