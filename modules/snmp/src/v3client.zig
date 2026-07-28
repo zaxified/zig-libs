@@ -177,10 +177,18 @@ pub const V3Client = struct {
     engine: EngineState = .{},
     next_msg_id: i32,
     next_request_id: i32,
-    /// The privacy salt source. RFC 3826 §3.3.1 requires the value to never
-    /// repeat under one key; a monotonically increasing 64-bit counter cannot.
-    /// Seed it from a random source if you keep long-lived keys across restarts.
-    salt_counter: u64,
+    /// The privacy salt source (`priv.SaltSource`) — it, not the caller, owns
+    /// `msgPrivacyParameters`, so no code path here can hand the cipher a
+    /// repeated salt. If `Options.initial_salt` was left null the counter is
+    /// re-seeded from the engine's discovered `engineBoots‖engineTime` before
+    /// the first encrypted message, so a client restart does not resume the
+    /// counter from the same place (RFC 3414 §8.1.1.1 "pseudo-random at boot").
+    /// That gives one-second separation, not a guarantee: two runs that reach
+    /// their first authPriv message inside the same engine second still start
+    /// from the same value.
+    salt_source: priv.SaltSource,
+    /// Whether `salt_source` still needs its engine-derived seed.
+    salt_needs_seed: bool,
     /// `contextName` sent in every ScopedPDU (RFC 3412 §6.8); "" is the default
     /// context and what agents expect.
     context_name: []const u8,
@@ -192,7 +200,11 @@ pub const V3Client = struct {
     pub const Options = struct {
         initial_msg_id: i32 = 1,
         initial_request_id: i32 = 1,
-        initial_salt: u64 = 1,
+        /// Seed for the privacy-salt counter. `null` (the default) means "derive
+        /// it from the engine's discovered clock" — see `salt_source`. Set it
+        /// explicitly only to make salts reproducible in a test, or to supply a
+        /// better (random) seed than the engine clock.
+        initial_salt: ?u64 = null,
         context_name: []const u8 = &.{},
     };
 
@@ -202,7 +214,8 @@ pub const V3Client = struct {
             .user = user,
             .next_msg_id = options.initial_msg_id,
             .next_request_id = options.initial_request_id,
-            .salt_counter = options.initial_salt,
+            .salt_source = priv.SaltSource.counter(options.initial_salt orelse 0),
+            .salt_needs_seed = options.initial_salt == null,
             .context_name = options.context_name,
         };
     }
@@ -448,29 +461,18 @@ pub const V3Client = struct {
         else
             &.{};
 
-        var salt: [8]u8 = undefined;
-        const salt_slice: []const u8 = if (level.hasPriv()) blk: {
-            c.nextSalt(&salt);
-            break :blk &salt;
-        } else &.{};
-
-        var sp_buf: [128]u8 = undefined;
-        const sp = try usm.encode(&sp_buf, .{
-            .engine_id = c.engine.id(),
-            .engine_boots = c.engine.clock.engine_boots,
-            .engine_time = c.engine.clock.engine_time,
-            .user_name = c.user.name,
-            .auth_params = auth_placeholder,
-            .priv_params = salt_slice,
-        });
-
         const flags: v3.MsgFlags = .{
             .auth = level.hasAuth(),
             .priv = level.hasPriv(),
             .reportable = true,
         };
 
+        // `msgPrivacyParameters` is whatever the salt source chose, so the
+        // ScopedPDU has to be encrypted BEFORE the USM header is built — the
+        // salt is an output of encryption here, not an input to it.
+        var sp_buf: [128]u8 = undefined;
         const wire = if (level.hasPriv()) w: {
+            c.seedSaltSource();
             const plain = try v3.encodeScopedPdu(&c.scoped_buf, .{
                 .context_engine_id = c.engine.id(),
                 .context_name = c.context_name,
@@ -478,29 +480,47 @@ pub const V3Client = struct {
             });
             // DES pads to a multiple of 8; encrypt in the plaintext scratch's
             // sibling buffer so neither aliases the outgoing datagram.
-            const cipher = try priv.encrypt(
+            const enc = try priv.encrypt(
                 c.user.priv_protocol,
                 c.engine.privKey(),
                 c.engine.clock.engine_boots,
                 c.engine.clock.engine_time,
-                &salt,
+                &c.salt_source,
                 plain,
                 &c.plain_buf,
             );
+            const sp = try usm.encode(&sp_buf, .{
+                .engine_id = c.engine.id(),
+                .engine_boots = c.engine.clock.engine_boots,
+                .engine_time = c.engine.clock.engine_time,
+                .user_name = c.user.name,
+                .auth_params = auth_placeholder,
+                .priv_params = &enc.salt,
+            });
             break :w try v3.encodeEncrypted(&c.request_buf, .{
                 .msg_id = msg_id,
                 .flags = flags,
                 .security_parameters = sp,
-                .encrypted_pdu = cipher,
+                .encrypted_pdu = enc.ciphertext,
             });
-        } else try v3.encode(&c.request_buf, .{
-            .msg_id = msg_id,
-            .flags = flags,
-            .security_parameters = sp,
-            .context_engine_id = c.engine.id(),
-            .context_name = c.context_name,
-            .pdu = pdu,
-        });
+        } else w: {
+            const sp = try usm.encode(&sp_buf, .{
+                .engine_id = c.engine.id(),
+                .engine_boots = c.engine.clock.engine_boots,
+                .engine_time = c.engine.clock.engine_time,
+                .user_name = c.user.name,
+                .auth_params = auth_placeholder,
+                .priv_params = &.{},
+            });
+            break :w try v3.encode(&c.request_buf, .{
+                .msg_id = msg_id,
+                .flags = flags,
+                .security_parameters = sp,
+                .context_engine_id = c.engine.id(),
+                .context_name = c.context_name,
+                .pdu = pdu,
+            });
+        };
 
         // Sign in place. The encoder writes backwards, so `wire` is the tail of
         // request_buf; take the same range mutably rather than casting away
@@ -643,21 +663,19 @@ pub const V3Client = struct {
         return rid;
     }
 
-    /// Produce the next `msgPrivacyParameters`. For AES-CFB (RFC 3826 §3.3.1)
-    /// the salt is any never-repeating 64-bit value; for DES-CBC (RFC 3414
-    /// §8.1.1.1) it is `snmpEngineBoots ‖ a local 32-bit counter`. Both are
-    /// filled from the same monotonic counter, so neither can repeat under one
-    /// key — the property the whole privacy layer rests on.
-    fn nextSalt(c: *V3Client, out: *[8]u8) void {
-        const n = c.salt_counter;
-        c.salt_counter +%= 1;
-        switch (c.user.priv_protocol) {
-            .des_cbc => {
-                std.mem.writeInt(u32, out[0..4], c.engine.clock.engine_boots, .big);
-                std.mem.writeInt(u32, out[4..8], @truncate(n), .big);
-            },
-            .aes128_cfb => std.mem.writeInt(u64, out, n, .big),
-        }
+    /// Give the salt counter its one-time engine-derived seed, unless the caller
+    /// pinned one via `Options.initial_salt`. RFC 3414 §8.1.1.1 wants the local
+    /// integer "set to a pseudo-random value at boot time"; this module owns no
+    /// clock and no RNG (deliberately — see SPEC), so the closest varying value
+    /// available is the engine's own `engineBoots‖engineTime`, which is already
+    /// on the wire anyway. It separates two runs of this client that start more
+    /// than a second apart; it does not separate two runs inside one second.
+    fn seedSaltSource(c: *V3Client) void {
+        if (!c.salt_needs_seed) return;
+        c.salt_needs_seed = false;
+        const seed = (@as(u64, c.engine.clock.engine_boots) << 32) |
+            @as(u64, c.engine.clock.engine_time);
+        c.salt_source = priv.SaltSource.counter(seed);
     }
 };
 
@@ -734,9 +752,17 @@ pub const FakeAgent = struct {
     scratch: [max_message_len]u8 = undefined,
     plain: [max_message_len]u8 = undefined,
     out: [max_message_len]u8 = undefined,
+    /// The last request datagram as received, so a test can assert on what the
+    /// client actually put on the wire (e.g. `msgPrivacyParameters`).
+    last_req: [max_message_len]u8 = undefined,
+    last_req_len: usize = 0,
 
     pub fn transport(a: *FakeAgent) Transport {
         return .{ .ctx = a, .exchangeFn = exchangeFn };
+    }
+
+    pub fn lastRequest(a: *const FakeAgent) []const u8 {
+        return a.last_req[0..a.last_req_len];
     }
 
     fn authKey(a: *FakeAgent, buf: []u8) ![]const u8 {
@@ -755,6 +781,8 @@ pub const FakeAgent = struct {
     }
 
     fn serve(a: *FakeAgent, req: []const u8) ![]const u8 {
+        @memcpy(a.last_req[0..req.len], req);
+        a.last_req_len = req.len;
         const m = try v3.decode(req);
         const params = try usm.parse(m.security_parameters);
 
@@ -862,7 +890,10 @@ pub const FakeAgent = struct {
         const skewed: u32 = @intCast(@max(0, @as(i64, a.time) + a.time_skew));
         const zeros = [_]u8{0} ** usm.max_digest_len;
         const auth_ph: []const u8 = if (authed) zeros[0..a.user.auth_protocol.digestLen()] else &.{};
-        var salt: [8]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 9 };
+        // The fake agent pins its reply salt so datagrams are reproducible; a
+        // fresh source per reply keeps that behaviour byte-identical.
+        var salt_src = priv.SaltSource.fixedForInterop(.{ 0, 0, 0, 0, 0, 0, 0, 9 });
+        const salt = salt_src.mode.fixed_for_interop;
         var sp_buf: [128]u8 = undefined;
         const sp = try usm.encode(&sp_buf, .{
             .engine_id = a.engine_id,
@@ -879,12 +910,12 @@ pub const FakeAgent = struct {
             });
             var kb: [usm.max_key_len]u8 = undefined;
             const key = try a.privKey(&kb);
-            const cipher = try priv.encrypt(a.user.priv_protocol, key, a.boots, skewed, &salt, plain, &a.plain);
+            const enc = try priv.encrypt(a.user.priv_protocol, key, a.boots, skewed, &salt_src, plain, &a.plain);
             break :w try v3.encodeEncrypted(&a.out, .{
                 .msg_id = msg_id,
                 .flags = .{ .auth = authed, .priv = true },
                 .security_parameters = sp,
-                .encrypted_pdu = cipher,
+                .encrypted_pdu = enc.ciphertext,
             });
         } else try v3.encode(&a.out, .{
             .msg_id = msg_id,
@@ -1114,30 +1145,84 @@ test "seedEngine: missing credentials and bad engine IDs are typed errors" {
     try testing.expectError(error.BadUserName, c3.seedEngine("engine", 1, 1));
 }
 
-test "the privacy salt never repeats and matches the protocol's shape" {
-    var agent: FakeAgent = .{ .user = .{ .name = "u" } };
-    var c = V3Client.init(agent.transport(), .{
-        .name = "u",
+test "the privacy salt never repeats across real authPriv requests" {
+    // Drive two authPriv requests through the full send path and read the salt
+    // back off the wire. The client, not the caller, chose both — they must
+    // differ, and so must the ciphertext of the (identical) ScopedPDUs.
+    const vals = try sysNameVarBinds();
+    inline for (.{ priv.PrivProtocol.aes128_cfb, priv.PrivProtocol.des_cbc }) |proto| {
+        const user: User = .{
+            .name = "privUser",
+            .level = .auth_priv,
+            .auth_protocol = .hmac_sha1,
+            .auth_password = "maplesyrup",
+            .priv_protocol = proto,
+            .priv_password = "maplesyrup",
+        };
+        var agent: FakeAgent = .{ .user = user, .values = &vals };
+        var c = V3Client.init(agent.transport(), user, .{});
+        try c.discover();
+
+        const oid = try Oid.parse("1.3.6.1.2.1.1.5.0");
+        _ = try c.get(&.{oid});
+        var first: [8]u8 = undefined;
+        var first_ct: [256]u8 = undefined;
+        const n1 = blk: {
+            const m = try v3.decode(agent.lastRequest());
+            const sp = try usm.parse(m.security_parameters);
+            first = sp.priv_params[0..8].*;
+            @memcpy(first_ct[0..m.data.encrypted.len], m.data.encrypted);
+            break :blk m.data.encrypted.len;
+        };
+
+        _ = try c.get(&.{oid});
+        const m2 = try v3.decode(agent.lastRequest());
+        const sp2 = try usm.parse(m2.security_parameters);
+
+        try testing.expect(!std.mem.eql(u8, &first, sp2.priv_params));
+        try testing.expect(!std.mem.eql(u8, first_ct[0..n1], m2.data.encrypted));
+
+        // RFC 3414 §8.1.1.1: a DES salt carries snmpEngineBoots up front.
+        if (proto == .des_cbc) {
+            var boots: [4]u8 = undefined;
+            std.mem.writeInt(u32, &boots, c.engine.clock.engine_boots, .big);
+            try testing.expectEqualSlices(u8, &boots, sp2.priv_params[0..4]);
+        }
+    }
+}
+
+test "the salt counter is seeded from the engine clock, not from a constant" {
+    // Two clients built identically must not start their salt counters at the
+    // same place when the engine clock differs — the cross-restart hazard.
+    const vals = try sysNameVarBinds();
+    const user: User = .{
+        .name = "privUser",
         .level = .auth_priv,
+        .auth_protocol = .hmac_sha1,
         .auth_password = "maplesyrup",
-        .priv_protocol = .aes128_cfb,
+        .priv_protocol = .des_cbc,
         .priv_password = "maplesyrup",
-    }, .{ .initial_salt = 0x0102030405060708 });
+    };
+    var salts: [2][8]u8 = undefined;
+    inline for (.{ 1000, 2000 }, 0..) |agent_time, i| {
+        var agent: FakeAgent = .{ .user = user, .values = &vals, .time = agent_time };
+        var c = V3Client.init(agent.transport(), user, .{});
+        try c.discover();
+        _ = try c.get(&.{try Oid.parse("1.3.6.1.2.1.1.5.0")});
+        const m = try v3.decode(agent.lastRequest());
+        const sp = try usm.parse(m.security_parameters);
+        salts[i] = sp.priv_params[0..8].*;
+    }
+    try testing.expect(!std.mem.eql(u8, &salts[0], &salts[1]));
 
-    var s1: [8]u8 = undefined;
-    var s2: [8]u8 = undefined;
-    c.nextSalt(&s1);
-    c.nextSalt(&s2);
-    try testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 }, &s1);
-    try testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3, 4, 5, 6, 7, 9 }, &s2);
-
-    // DES (RFC 3414 §8.1.1.1): the first 4 bytes are snmpEngineBoots.
-    c.user.priv_protocol = .des_cbc;
-    c.engine.clock.engine_boots = 0xdeadbeef;
-    var s3: [8]u8 = undefined;
-    c.nextSalt(&s3);
-    try testing.expectEqualSlices(u8, &[_]u8{ 0xde, 0xad, 0xbe, 0xef }, s3[0..4]);
-    try testing.expectEqualSlices(u8, &[_]u8{ 5, 6, 7, 0x0a }, s3[4..8]);
+    // An explicit seed still overrides it (reproducible salts for tests/KATs).
+    var agent: FakeAgent = .{ .user = user, .values = &vals, .time = 1000 };
+    var c = V3Client.init(agent.transport(), user, .{ .initial_salt = 0x0102030405060708 });
+    try c.discover();
+    _ = try c.get(&.{try Oid.parse("1.3.6.1.2.1.1.5.0")});
+    const m = try v3.decode(agent.lastRequest());
+    const sp = try usm.parse(m.security_parameters);
+    try testing.expectEqualSlices(u8, &[_]u8{ 5, 6, 7, 8 }, sp.priv_params[4..8]);
 }
 
 test "msgID mismatch and request-id mismatch are typed errors" {

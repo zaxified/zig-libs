@@ -54,6 +54,12 @@ network-device management work (alongside `netlink`, `nftables`, `icmp`).
   - **Privacy** (`priv`, `des`): CBC-DES (RFC 3414 §8, on a from-scratch FIPS
     46-3 DES — see the note below) and AES-128-CFB128 (RFC 3826), with the
     correct key/pre-IV/salt derivation and the boots‖time‖salt IV.
+    `priv.encrypt` takes a `priv.SaltSource`, **not** a salt: the library draws
+    `msgPrivacyParameters` from a never-repeating counter and hands it back in
+    `Encrypted.salt`, so no caller can accidentally reuse one. Pinning a salt to
+    reproduce a published vector or a captured datagram is the explicit opt-in
+    `priv.SaltSource.fixedForInterop`. `V3Client` needs no configuration for
+    this — see SPEC.md for what the guarantee covers and what it does not.
   - **Anti-replay** (`timewin`): the RFC 3414 §3.2 ±150 s window with
     per-engine boots/time state, in both the authoritative and
     non-authoritative roles.

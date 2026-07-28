@@ -46,13 +46,40 @@ USM is the security-sensitive part.
   recommendation** (56-bit key); Zig's std has no DES, so `des.zig` is a from-scratch FIPS 46-3
   implementation. AES-192/256 (draft-blumenthal / Cisco variants) and SNMPv3 over TLS/DTLS
   (RFC 6353) remain out of scope.
-- **Salt uniqueness.** The `priv` layer still requires the CALLER to supply a unique
-  `msgPrivacyParameters` per message under a given key — it neither generates nor tracks one.
-  `V3Client` closes that hole for its own traffic: it drives a **monotonic 64-bit counter**
-  (`Options.initial_salt`), which cannot repeat, shaped per protocol (AES: the counter big-endian,
-  RFC 3826 §3.3.1; DES: `snmpEngineBoots ‖ counter[31:0]`, RFC 3414 §8.1.1.1). Seed it randomly if
-  keys outlive a process restart. Reusing a salt reuses the AES-CFB keystream / DES-CBC IV under
-  the same key and leaks plaintext via `C1 XOR C2 = P1 XOR P2`.
+- **Salt uniqueness — the library owns it, not the caller.** `msgPrivacyParameters` is the only
+  thing standing between an authPriv session and keystream/IV reuse, so it is not an API parameter.
+  `priv.encrypt` takes a `priv.SaltSource` and *returns* the salt it drew (`Encrypted.salt`) for the
+  USM header; there is no call shape that accepts a salt for live traffic. The default source,
+  `SaltSource.counter(seed)`, is a monotonic 64-bit counter shaped per protocol (AES: the counter
+  big-endian, RFC 3826 §3.3.1; DES: `snmpEngineBoots ‖ counter[31:0]`, RFC 3414 §8.1.1.1).
+  - **What that guarantees:** within one source's lifetime every salt — hence every IV — is
+    distinct, for *all* pairs of messages, because it is generated rather than checked.
+  - **Escape hatch, deliberately conspicuous:** `SaltSource.fixedForInterop(salt)` pins the salt so
+    a published KAT or a captured net-snmp datagram reproduces byte-for-byte. Every message from
+    such a source carries the same salt; it is a test/interop construct and never belongs on live
+    traffic. It is the only way to get a repeated salt through this API.
+  - **Detection is a tripwire, not the mechanism.** A source remembers the IV of the *immediately
+    preceding* encryption and returns `error.SaltReuse` if the next one matches. That catches an
+    adjacent repeat only — an `A, B, A` sequence is **not** caught, and the tests say so explicitly.
+    Full history would need unbounded per-key state, which this zero-allocation module does not
+    carry, and would still not survive a process restart; the counter, not this check, is what the
+    design rests on.
+  - **`error.SaltExhausted`:** RFC 3414 §8.1.1.1 gives DES only a 32-bit local integer, so a DES
+    counter source has 2^32 salts per `snmpEngineBoots` epoch — reachable in weeks at a few thousand
+    messages/second. It refuses rather than wrapping into a repeat. AES-CFB has the full 64 bits.
+  - **DES-CBC is the sharper edge, and the asymmetry is intentional in the RFC, not here.** The
+    AES-CFB IV is `boots‖time‖salt`, so the engine clock varies it even if a salt repeats; the
+    DES-CBC IV is `pre_iv XOR salt`, with **no** boots/time input at all, so the salt is the only
+    thing separating two IVs. DES is therefore fully dependent on this layer.
+  - **Cross-restart.** No in-process state can see a previous run. `V3Client` therefore seeds its
+    counter from the engine's discovered `engineBoots‖engineTime` before the first encrypted message
+    (RFC 3414 §8.1.1.1 asks for a pseudo-random boot-time value; this module owns no clock and no RNG
+    by design, and the engine clock is the varying value it already has). That separates two runs
+    starting more than one engine-second apart. It does **not** separate two runs that reach their
+    first authPriv message inside the same second — pass `Options.initial_salt` with a random value
+    if that matters. Consequence of getting it wrong: AES-CFB reuses the keystream outright
+    (`C1 XOR C2 = P1 XOR P2`); DES-CBC reuses the IV, which leaks equality of ScopedPDU block
+    prefixes — and SNMP ScopedPDU prefixes are highly structured.
 - **Anti-replay window.** engineBoots/engineTime ±150 s check (§3.2), per-engine state, both roles.
 - **Report handling and trust.** A Report-PDU is never returned as data — it becomes a typed error.
   Trust rules in `V3Client.processReply`, in order: (1) a reply claiming `authFlag` must verify
@@ -85,7 +112,14 @@ BER + message golden-byte KATs, length-boundary + garbage sweeps, scripted-agent
 (offline `Transport`); trap receiver v1/v2c/inform decode + `NotATrap` + ack round-trip; v3
 encode/decode round-trips incl. the encrypted-branch capture; privacy KATs (FIPS 46-3 DES, NIST
 SP 800-38A CFB128-AES128) plus full authPriv datagram round-trips; time-window accept/reject.
-**145 tests** (144 + 1 gated live). Run: `zig build test-snmp`.
+Salt behaviour is tested for the property, not the round-trip: two successive encryptions of the
+*same* plaintext under the same key/boots/time must produce different salts and different
+ciphertext (a keystream-reuse detector, since a repeat would make `C1 XOR C2` all-zero); the
+`fixedForInterop` reuse tripwire fires for AES and — because its IV has no clock input — for DES
+even when `engineTime` moves; the adjacent-only limit of that tripwire is pinned by an `A, B, A`
+test that asserts the repeat is *not* caught; the DES 2^32-per-boots budget refuses to wrap; and
+two `V3Client`s against engines with different clocks start their counters at different values.
+**151 tests** (150 + 1 gated live). Run: `zig build test-snmp`.
 
 The v3 stack is anchored three independent ways:
 

@@ -125,6 +125,10 @@ pub const MsgFlags = v3.MsgFlags;
 pub const UsmSecurityParameters = usm.UsmSecurityParameters;
 pub const AuthProtocol = usm.AuthProtocol;
 pub const PrivProtocol = priv.PrivProtocol;
+/// Owner of `msgPrivacyParameters`. `priv.encrypt` draws the salt from one of
+/// these rather than taking it from the caller — see `priv.SaltSource`.
+pub const SaltSource = priv.SaltSource;
+pub const Encrypted = priv.Encrypted;
 pub const EngineTimeState = timewin.EngineTimeState;
 pub const ReportReason = report.Reason;
 pub const ReportError = report.ReportError;

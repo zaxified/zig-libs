@@ -21,6 +21,11 @@
 //!     big-endian) ‖ 8-byte salt. CFB is a stream mode, so ciphertext length
 //!     equals plaintext length (no padding).
 //!
+//! Salt ownership: `encrypt` does NOT take a salt from the caller. It draws one
+//! from a `SaltSource` it is handed, so the never-repeat obligation is the
+//! library's, not the caller's — see `SaltSource` for exactly what that buys and
+//! what it does not.
+//!
 //! Provenance: clean-room from RFC 3414 §8 (DES) and RFC 3826 (AES-CFB); FIPS
 //! 46-3 (DES tables, in `des.zig`) and NIST SP 800-38A (CFB mode). No source
 //! consulted.
@@ -64,26 +69,145 @@ pub const PrivError = error{
     InvalidLength,
     /// `out` was too small for the result.
     BufferTooSmall,
-} || v3.DecodeError;
+} || SaltError || v3.DecodeError;
+
+pub const SaltError = error{
+    /// The IV this encryption would use is byte-identical to the IV the same
+    /// `SaltSource` produced on the immediately preceding encryption. Only
+    /// reachable through `SaltSource.fixedForInterop`; a counter source cannot
+    /// hit it. See `SaltSource` for the exact scope of this check.
+    SaltReuse,
+    /// A DES-CBC counter source has issued all 2^32 distinct salts available
+    /// under one `snmpEngineBoots` value (RFC 3414 §8.1.1.1 gives the local
+    /// integer only 32 bits). Continuing would repeat an IV, so it refuses.
+    SaltExhausted,
+};
+
+/// The source of `msgPrivacyParameters`. `encrypt` draws the salt from here
+/// instead of accepting one from the caller, so a salt cannot be accidentally
+/// repeated by whoever is calling.
+///
+/// What the default (`SaltSource.counter`) guarantees: within the lifetime of
+/// one source, every salt — and therefore every IV — is distinct. That is
+/// structural (a monotonic counter), not a check, so it holds for every pair of
+/// messages, not just adjacent ones.
+///
+/// What it does NOT guarantee: uniqueness across two sources used with the same
+/// localized key, or across a process restart that re-seeds the counter to the
+/// same value. Those are outside anything in-process state can see. Seed the
+/// counter with a varying value (`V3Client` does this from the discovered
+/// engineBoots‖engineTime by default) so a restart does not resume from the
+/// same point.
+///
+/// The `last_iv` check below is a *detector*, deliberately weaker than the
+/// generator: it rejects only an IV identical to the one used on the
+/// immediately preceding call of the same source. It does not remember any
+/// earlier IV — full history would need unbounded per-key state, which this
+/// zero-allocation module does not carry. Treat it as a tripwire on the
+/// `fixedForInterop` path, not as "reuse is prevented".
+pub const SaltSource = struct {
+    mode: Mode,
+    /// The IV produced by the previous encryption through this source (8 bytes
+    /// for DES-CBC, 16 for AES-CFB); `last_iv_len == 0` means "none yet".
+    last_iv: [16]u8 = [_]u8{0} ** 16,
+    last_iv_len: u8 = 0,
+    /// DES-CBC only: the `snmpEngineBoots` epoch the low 32 counter bits are
+    /// being consumed under, and how many salts have gone out inside it.
+    des_boots: u32 = 0,
+    des_issued: u64 = 0,
+
+    pub const Mode = union(enum) {
+        /// RFC 3826 §3.3.1 / RFC 3414 §8.1.1.1: a never-repeating local integer.
+        /// This is the default and the only shape suitable for live traffic.
+        counter: u64,
+        /// OPT-IN ESCAPE HATCH — pins the salt to a caller-chosen value so a
+        /// published test vector or a captured interop datagram can be
+        /// reproduced byte-for-byte. Every message drawn from such a source uses
+        /// the SAME salt, which is exactly the keystream/IV reuse the counter
+        /// mode exists to prevent. Never put one of these on live traffic.
+        fixed_for_interop: [8]u8,
+    };
+
+    /// The safe default: a counter source. RFC 3414 §8.1.1.1 asks for the local
+    /// integer to be set to a pseudo-random value at boot; pass such a `seed` if
+    /// the localized keys outlive the process.
+    pub fn counter(seed: u64) SaltSource {
+        return .{ .mode = .{ .counter = seed } };
+    }
+
+    /// Interop/KAT only — see `Mode.fixed_for_interop`.
+    pub fn fixedForInterop(salt: [8]u8) SaltSource {
+        return .{ .mode = .{ .fixed_for_interop = salt } };
+    }
+
+    /// Produce the next salt. AES-CFB (RFC 3826 §3.3.1) takes the whole 64-bit
+    /// counter big-endian; DES-CBC (RFC 3414 §8.1.1.1) is
+    /// `snmpEngineBoots ‖ counter[31:0]`.
+    fn draw(s: *SaltSource, proto: PrivProtocol, engine_boots: u32) SaltError![8]u8 {
+        switch (s.mode) {
+            .fixed_for_interop => |salt| return salt,
+            .counter => |*n| {
+                const v = n.*;
+                var out: [8]u8 = undefined;
+                switch (proto) {
+                    .aes128_cfb => std.mem.writeInt(u64, &out, v, .big),
+                    .des_cbc => {
+                        // A new boots epoch restarts the 32-bit budget: the
+                        // engineBoots prefix already separates the two epochs.
+                        if (s.des_boots != engine_boots) {
+                            s.des_boots = engine_boots;
+                            s.des_issued = 0;
+                        }
+                        if (s.des_issued == @as(u64, 1) << 32) return error.SaltExhausted;
+                        s.des_issued += 1;
+                        std.mem.writeInt(u32, out[0..4], engine_boots, .big);
+                        std.mem.writeInt(u32, out[4..8], @truncate(v), .big);
+                    },
+                }
+                n.* +%= 1;
+                return out;
+            },
+        }
+    }
+
+    /// Reject an IV identical to the previous one, then record it. Adjacent
+    /// calls only — see the type doc.
+    fn recordIv(s: *SaltSource, iv: []const u8) SaltError!void {
+        if (s.last_iv_len == iv.len and std.mem.eql(u8, s.last_iv[0..iv.len], iv)) {
+            return error.SaltReuse;
+        }
+        @memcpy(s.last_iv[0..iv.len], iv);
+        s.last_iv_len = @intCast(iv.len);
+    }
+};
+
+/// What `encrypt` produced: the ciphertext plus the salt it chose, which the
+/// caller must copy into `msgPrivacyParameters`.
+pub const Encrypted = struct {
+    /// A subslice of the caller's `out`.
+    ciphertext: []u8,
+    /// The `msgPrivacyParameters` value for this message.
+    salt: [8]u8,
+};
 
 /// Encrypt a plaintext ScopedPDU (the full `SEQUENCE { ... }` TLV, already BER-
-/// encoded) into `out`, returning the ciphertext slice. `engine_boots`/
-/// `engine_time` are used only by AES-CFB (RFC 3826 IV); DES-CBC ignores them.
-/// `priv_params` is the 8-byte salt (`msgPrivacyParameters`). For DES the output
-/// is zero-padded up to a multiple of 8, so `out` may need up to 7 bytes more
-/// than `plaintext.len`; for AES the output length equals `plaintext.len`.
+/// encoded) into `out`. `engine_boots`/`engine_time` are used only by AES-CFB
+/// (RFC 3826 IV); DES-CBC ignores them — which is why DES depends on the salt
+/// alone for IV variation. The salt comes from `salt_source`, not from the
+/// caller; it is returned in `Encrypted.salt` for the USM header. For DES the
+/// output is zero-padded up to a multiple of 8, so `out` may need up to 7 bytes
+/// more than `plaintext.len`; for AES the output length equals `plaintext.len`.
 pub fn encrypt(
     proto: PrivProtocol,
     localized_priv_key: []const u8,
     engine_boots: u32,
     engine_time: u32,
-    priv_params: []const u8,
+    salt_source: *SaltSource,
     plaintext: []const u8,
     out: []u8,
-) PrivError![]u8 {
+) PrivError!Encrypted {
     if (localized_priv_key.len < proto.keyLen()) return error.KeyTooShort;
-    if (priv_params.len != 8) return error.BadSalt;
-    const salt: [8]u8 = priv_params[0..8].*;
+    const salt = try salt_source.draw(proto, engine_boots);
 
     switch (proto) {
         .des_cbc => {
@@ -95,19 +219,22 @@ pub fn encrypt(
             // irrelevant — the inner BER length delimits the real payload).
             const padded = std.mem.alignForward(usize, plaintext.len, des.block_len);
             if (out.len < padded) return error.BufferTooSmall;
+            try salt_source.recordIv(&iv);
             @memcpy(out[0..plaintext.len], plaintext);
             @memset(out[plaintext.len..padded], 0);
-            return des.cbcEncrypt(key, iv, out[0..padded], out[0..padded]) catch |e| switch (e) {
-                error.BufferTooSmall => error.BufferTooSmall,
+            const ct = des.cbcEncrypt(key, iv, out[0..padded], out[0..padded]) catch |e| switch (e) {
+                error.BufferTooSmall => return error.BufferTooSmall,
                 error.NotPadded, error.InvalidLength => unreachable, // we padded
             };
+            return .{ .ciphertext = ct, .salt = salt };
         },
         .aes128_cfb => {
             if (out.len < plaintext.len) return error.BufferTooSmall;
             const key: [16]u8 = localized_priv_key[0..16].*;
             const iv = aesIv(engine_boots, engine_time, salt);
+            try salt_source.recordIv(&iv);
             cfb128(false, Aes128.initEnc(key), iv, plaintext, out[0..plaintext.len]);
-            return out[0..plaintext.len];
+            return .{ .ciphertext = out[0..plaintext.len], .salt = salt };
         },
     }
 }
@@ -270,13 +397,118 @@ test "keyLen / saltLen" {
     try testing.expectEqual(@as(usize, 8), PrivProtocol.aes128_cfb.saltLen());
 }
 
-test "encrypt rejects short key / bad salt" {
+test "encrypt rejects short key; decrypt rejects a wrong-length wire salt" {
     var out: [64]u8 = undefined;
+    var src = SaltSource.counter(1);
     const short_key = [_]u8{0} ** 8;
-    try testing.expectError(error.KeyTooShort, encrypt(.aes128_cfb, &short_key, 0, 0, &[_]u8{0} ** 8, "hello", &out));
+    try testing.expectError(error.KeyTooShort, encrypt(.aes128_cfb, &short_key, 0, 0, &src, "hello", &out));
     const key16 = [_]u8{0} ** 16;
-    try testing.expectError(error.BadSalt, encrypt(.aes128_cfb, &key16, 0, 0, &[_]u8{0} ** 4, "hello", &out));
+    // `decrypt` still takes the salt off the wire, so it must range-check it.
     try testing.expectError(error.BadSalt, decrypt(.des_cbc, &key16, 0, 0, &[_]u8{0} ** 7, &[_]u8{0} ** 8, &out));
+    try testing.expectError(error.BadSalt, decrypt(.aes128_cfb, &key16, 0, 0, &[_]u8{0} ** 9, &[_]u8{0} ** 8, &out));
+}
+
+test "successive encryptions under one key use different salts and different IVs" {
+    // The property the SaltSource buys: the SAME plaintext under the SAME key,
+    // boots and time must not produce the same ciphertext twice. If the salt
+    // repeated, AES-CFB would reuse the keystream outright (C1^C2 == P1^P2) and
+    // DES-CBC would reuse the IV.
+    const key = [_]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 } ** 2;
+    const pt = "0123456789abcdef0123456789abcdef";
+    inline for (.{ PrivProtocol.aes128_cfb, PrivProtocol.des_cbc }) |proto| {
+        var src = SaltSource.counter(0x0102030405060708);
+        var b1: [64]u8 = undefined;
+        var b2: [64]u8 = undefined;
+        const e1 = try encrypt(proto, &key, 7, 900, &src, pt, &b1);
+        const e2 = try encrypt(proto, &key, 7, 900, &src, pt, &b2);
+
+        try testing.expect(!std.mem.eql(u8, &e1.salt, &e2.salt));
+        try testing.expect(!std.mem.eql(u8, e1.ciphertext, e2.ciphertext));
+
+        // And the XOR of the two ciphertexts must NOT be the XOR of the two
+        // plaintexts (which are equal here, so that XOR is all-zero) — the exact
+        // failure keystream reuse would produce.
+        var all_zero = true;
+        for (e1.ciphertext, e2.ciphertext) |a, b| {
+            if (a ^ b != 0) all_zero = false;
+        }
+        try testing.expect(!all_zero);
+
+        // Both still decrypt back to the plaintext under their own salt.
+        var d1: [64]u8 = undefined;
+        var d2: [64]u8 = undefined;
+        const p1 = try decrypt(proto, &key, 7, 900, &e1.salt, e1.ciphertext, &d1);
+        const p2 = try decrypt(proto, &key, 7, 900, &e2.salt, e2.ciphertext, &d2);
+        try testing.expectEqualStrings(pt, p1[0..pt.len]);
+        try testing.expectEqualStrings(pt, p2[0..pt.len]);
+    }
+}
+
+test "counter salts have the RFC shape (AES: 64-bit BE; DES: boots ‖ counter[31:0])" {
+    const key = [_]u8{0} ** 16;
+    var out: [32]u8 = undefined;
+
+    var aes_src = SaltSource.counter(0x0102030405060708);
+    const a1 = try encrypt(.aes128_cfb, &key, 1, 1, &aes_src, "x" ** 16, &out);
+    const a2 = try encrypt(.aes128_cfb, &key, 1, 1, &aes_src, "x" ** 16, &out);
+    try testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 }, &a1.salt);
+    try testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3, 4, 5, 6, 7, 9 }, &a2.salt);
+
+    var des_src = SaltSource.counter(0x0102030405060708);
+    const d1 = try encrypt(.des_cbc, &key, 0xdeadbeef, 1, &des_src, "x" ** 16, &out);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xde, 0xad, 0xbe, 0xef }, d1.salt[0..4]);
+    try testing.expectEqualSlices(u8, &[_]u8{ 5, 6, 7, 8 }, d1.salt[4..8]);
+}
+
+test "a deliberately repeated salt is rejected (adjacent-IV detector)" {
+    const key = [_]u8{ 0xa5, 0x5a } ** 8;
+    var out: [32]u8 = undefined;
+    const salt = [8]u8{ 1, 1, 1, 1, 1, 1, 1, 1 };
+
+    // AES-CFB: the IV is boots‖time‖salt, so a pinned salt at the SAME
+    // boots/time repeats the IV exactly — rejected.
+    var aes_src = SaltSource.fixedForInterop(salt);
+    _ = try encrypt(.aes128_cfb, &key, 3, 42, &aes_src, "x" ** 16, &out);
+    try testing.expectError(error.SaltReuse, encrypt(.aes128_cfb, &key, 3, 42, &aes_src, "x" ** 16, &out));
+    // A different engineTime moves the AES IV even with the salt pinned, so it
+    // is accepted — the boots/time prefix really is doing work for AES.
+    _ = try encrypt(.aes128_cfb, &key, 3, 43, &aes_src, "x" ** 16, &out);
+
+    // DES-CBC has NO boots/time in its IV (iv = pre_iv XOR salt), so the very
+    // same time change does not help: the IV repeats and is rejected.
+    var des_src = SaltSource.fixedForInterop(salt);
+    _ = try encrypt(.des_cbc, &key, 3, 42, &des_src, "x" ** 16, &out);
+    try testing.expectError(error.SaltReuse, encrypt(.des_cbc, &key, 3, 43, &des_src, "x" ** 16, &out));
+    try testing.expectError(error.SaltReuse, encrypt(.des_cbc, &key, 9, 999, &des_src, "x" ** 16, &out));
+}
+
+test "the detector is adjacent-only: an A,B,A salt sequence is NOT caught" {
+    // Documenting the limit, not endorsing it: only the immediately preceding
+    // IV is remembered, so an older repeat sails through. This is why the
+    // counter source — not this check — is what the design rests on.
+    const key = [_]u8{ 0xa5, 0x5a } ** 8;
+    var out: [32]u8 = undefined;
+    var src = SaltSource.fixedForInterop([8]u8{ 1, 1, 1, 1, 1, 1, 1, 1 });
+    const a = try encrypt(.des_cbc, &key, 3, 42, &src, "x" ** 16, &out);
+    src.mode = .{ .fixed_for_interop = [8]u8{ 2, 2, 2, 2, 2, 2, 2, 2 } };
+    _ = try encrypt(.des_cbc, &key, 3, 42, &src, "x" ** 16, &out);
+    src.mode = .{ .fixed_for_interop = [8]u8{ 1, 1, 1, 1, 1, 1, 1, 1 } };
+    const c = try encrypt(.des_cbc, &key, 3, 42, &src, "x" ** 16, &out);
+    try testing.expectEqualSlices(u8, &a.salt, &c.salt); // the reuse is real…
+    // …and it was accepted. Adjacent-only detection, exactly as documented.
+}
+
+test "a DES counter source refuses to wrap its 32-bit budget under one boots" {
+    const key = [_]u8{0} ** 16;
+    var out: [32]u8 = undefined;
+    var src = SaltSource.counter(0);
+    _ = try encrypt(.des_cbc, &key, 4, 0, &src, "x" ** 16, &out);
+    // Fast-forward to one salt short of the RFC 3414 §8.1.1.1 32-bit space.
+    src.des_issued = (@as(u64, 1) << 32) - 1;
+    _ = try encrypt(.des_cbc, &key, 4, 0, &src, "x" ** 16, &out);
+    try testing.expectError(error.SaltExhausted, encrypt(.des_cbc, &key, 4, 0, &src, "x" ** 16, &out));
+    // A new engineBoots epoch has its own 32-bit space (boots is in the salt).
+    _ = try encrypt(.des_cbc, &key, 5, 0, &src, "x" ** 16, &out);
 }
 
 test "DES decrypt rejects non-multiple-of-8 ciphertext" {
@@ -311,7 +543,10 @@ fn expectPrivRoundTrip(proto: PrivProtocol) !void {
     });
 
     var cipher_buf: [280]u8 = undefined;
-    const cipher = try encrypt(proto, key, boots, time, &salt, scoped_plain, &cipher_buf);
+    // A pinned salt: this test asserts a fixed wire shape, which is exactly what
+    // the opt-in interop source is for.
+    var salt_src = SaltSource.fixedForInterop(salt);
+    const cipher = (try encrypt(proto, key, boots, time, &salt_src, scoped_plain, &cipher_buf)).ciphertext;
 
     // DES pads to a multiple of 8; AES is a stream cipher (exact length).
     switch (proto) {
