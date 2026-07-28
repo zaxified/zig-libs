@@ -11,7 +11,10 @@
 #   scripts/test.sh                 — same as `changed` with no BASE_REF
 #   scripts/test.sh changed [REF]   — test what changed (vs REF, or the
 #                                     working tree/index/untracked files)
-#   scripts/test.sh all             — every module; the pre-commit/CI gate
+#   scripts/test.sh all [ZIG_ARGS…] — every module; the pre-commit/CI gate.
+#                                     Trailing args go to `zig build`, e.g.
+#                                     `all -Doptimize=ReleaseFast` or
+#                                     `all -Dstrict-debug`.
 #   scripts/test.sh time            — serial per-module timing table
 #
 # Every runner starts with a capability check: silent when the host can do
@@ -147,6 +150,12 @@ have_unshare() {
     [[ "$_HAVE_UNSHARE" == yes ]]
 }
 
+# Extra `zig build` arguments, taken from the subcommand's trailing CLI args
+# (e.g. `scripts/test.sh all -Doptimize=ReleaseFast`, or `-Dstrict-debug` to
+# force real Debug for the compute-heavy modules). An array, so an argument
+# containing spaces stays one argument.
+EXTRA_ZIG_ARGS=()
+
 # run_modules "mod1 mod2 ..." — partitions the set into NETNS_MODULES vs the
 # rest and invokes each partition as ONE `zig build test-a test-b ...`
 # command (not a loop of 1-module invocations!) so zig's own step
@@ -168,17 +177,17 @@ run_modules() {
     if [[ ${#rest[@]} -gt 0 ]]; then
         local -a targets=()
         for m in "${rest[@]}"; do targets+=("test-$m"); done
-        step "build+test (${#rest[@]} modules)" zig build "${targets[@]}"
+        step "build+test (${#rest[@]} modules)" zig build "${targets[@]}" "${EXTRA_ZIG_ARGS[@]}"
     fi
 
     if [[ ${#netns[@]} -gt 0 ]]; then
         local -a targets=()
         for m in "${netns[@]}"; do targets+=("test-$m"); done
         if have_unshare; then
-            step "netns build+test (${#netns[@]} modules, unshare -rn)" unshare -rn zig build "${targets[@]}"
+            step "netns build+test (${#netns[@]} modules, unshare -rn)" unshare -rn zig build "${targets[@]}" "${EXTRA_ZIG_ARGS[@]}"
         else
             echo "note: unshare -rn unavailable — running netns-gated modules plainly; their privileged tests will SKIP" >&2
-            step "netns build+test (${#netns[@]} modules, NO unshare)" zig build "${targets[@]}"
+            step "netns build+test (${#netns[@]} modules, NO unshare)" zig build "${targets[@]}" "${EXTRA_ZIG_ARGS[@]}"
         fi
     fi
 }
@@ -387,6 +396,13 @@ cmd_changed() {
 }
 
 cmd_all() {
+    # Drop empty arguments rather than passing them on: main dispatches with
+    # "${rest[@]:-}", which expands an EMPTY array to one empty string, and
+    # `zig build ""` fails with `no step named ''`. Filtering here keeps this
+    # correct no matter how the caller quotes.
+    EXTRA_ZIG_ARGS=()
+    local a
+    for a in "$@"; do [[ -n "$a" ]] && EXTRA_ZIG_ARGS+=("$a"); done
     capability_check
     graph_load
     local all_mods="${G_NAMES[*]}"

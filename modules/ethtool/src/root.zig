@@ -278,7 +278,7 @@ test "live: LINKMODES_GET decodes in BOTH bitset encodings, and they agree" {
         error.NotSupported, error.NoSuchDevice, error.InvalidRequest => {
             // A Wi-Fi or virtual interface has no ethtool link settings; the
             // kernel usually says so in words.
-            if (et.lastErrorMessage()) |m| std.debug.print("  (kernel said: {s})\n", .{m});
+            if (verboseSkip()) if (et.lastErrorMessage()) |m| std.debug.print("  (kernel said: {s})\n", .{m});
             return skip("LINKMODES_GET on this device");
         },
         error.AccessDenied => return skip("LINKMODES_GET"),

@@ -252,7 +252,10 @@ test "live: DEVLINK_CMD_GET dump (an empty result is the normal answer)" {
     }
     if (list.len == 0)
         return skip("no devlink instance on this machine (no SmartNIC/switch ASIC; e1000e and iwlwifi register none)");
-    std.debug.print("  (found {d} devlink instance(s))\n", .{list.len});
+    // Success-path diagnostic: gated because scripts/test-lib.sh treats any
+    // stderr from a passing step as a failure — a rule that only holds if
+    // passing tests stay silent.
+    if (verboseSkip()) std.debug.print("  (found {d} devlink instance(s))\n", .{list.len});
 }
 
 test "live: PORT_GET dump, and the ports belong to devices that exist" {

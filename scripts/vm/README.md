@@ -93,9 +93,10 @@ real test binaries in them (not by reading docs):
 
 | Module | Platform | Status |
 |---|---|---|
-| `tc` | debian (default) **or openwrt** | both execution-verified: 129 passed / 1 failed on each, the same failure (see "A real bug this lane found"). openwrt needs `provision.sh` first; that's the only reason debian stays the default |
+| `tc` | debian (default) **or openwrt** | both execution-verified, **130/130 on each** since the action-table bug this lane found was fixed (see "A real bug this lane found"). openwrt needs `provision.sh` first; that's the only reason debian stays the default |
 | `nftables` | openwrt | execution-verified (73 tests incl. live round-trip) |
 | `conntrack` | openwrt | execution-verified (28 tests) |
+| `ebpf` | debian | execution-verified, **137/137**. Six live attach tests (kprobe, uprobe, tracepoint, raw tracepoint, cgroup link) need `CAP_BPF` + `CAP_PERFMON` and skip on any normal host; OpenWRT's kernel has no BPF tooling at all, so this one is debian-only |
 | everything else | debian (default) | most NETNS_MODULES don't need this lane at all — `unshare -rn` already covers them (see `scripts/test.sh`'s own `NETNS_MODULES` comment); route here only for isolation, not privilege |
 
 Override with `scripts/vm/run.sh <module> openwrt|debian` when the default

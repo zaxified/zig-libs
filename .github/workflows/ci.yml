@@ -8,19 +8,37 @@ on:
 # Linux-only: several modules (procnet, rawsock, netlink, wireguard, …) are
 # raw-syscall Linux members and are compiled by `zig build test`; socket/netns
 # tests SkipZigTest cleanly on a constrained runner.
+#
+# The three optimisation lanes are deliberate. Compute-heavy modules build at
+# ReleaseSafe when Debug is requested (see `heavy` in build.zig — it takes
+# bls12_381 from 182s to 5s and it is the suite's critical path), so the plain
+# lane no longer proves anything about real Debug. `-Dstrict-debug` forces it
+# back, keeping CONVENTIONS §6.4's "green in Debug and ReleaseFast" honest.
+# They run as separate jobs so the slow one does not gate the fast one.
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default (heavy modules at ReleaseSafe)
+            args: ""
+          - name: strict Debug
+            args: "-Dstrict-debug"
+          - name: ReleaseFast
+            args: "-Doptimize=ReleaseFast"
+    name: test — ${{ matrix.name }}
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
-      - name: Format check
-        run: zig fmt --check build.zig build.zig.zon modules
-      - name: Catalog consistency
-        run: zig build check-catalog
-      - name: Build & test (Debug)
-        run: zig build test
-      - name: Build & test (ReleaseFast)
-        run: zig build test -Doptimize=ReleaseFast
+      # scripts/test.sh all runs the format check, the catalog gate and every
+      # module, and wraps the netlink-writing modules in `unshare -rn` where
+      # the runner allows it — otherwise those tests skip rather than fight
+      # the runner's own network state. It also prints a capability report
+      # naming anything the runner cannot do, so a lane that silently covers
+      # less than it looks like is visible in the log.
+      - name: Test (${{ matrix.name }})
+        run: bash scripts/test.sh all ${{ matrix.args }}

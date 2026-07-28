@@ -9,6 +9,7 @@ this exists so you don't have to.
 |------|---------|--------------|
 | **While working** | `scripts/test.sh` | Tests only what your change can affect |
 | **Before committing** | `scripts/test.sh all` | Every module — the same gate CI runs |
+| Reproducing a CI lane | `scripts/test.sh all -Dstrict-debug` / `-Doptimize=ReleaseFast` | Trailing args pass through to `zig build` |
 | Investigating slowness | `scripts/test.sh time` | Serial per-module duration table |
 
 ## Environment gaps
@@ -71,4 +72,19 @@ problem**. Set `ZIG_LIBS_VERBOSE_SKIP=1` to see why something skipped; the skip
 Compute-heavy modules (pairings, hash-based signatures, FHE, scrypt, RSA) build
 at ReleaseSafe when Debug is requested — same safety checks, a fraction of the
 wall clock, since they are the suite's critical path. `-Dstrict-debug` forces
-real Debug; that is what the CI matrix should use.
+real Debug.
+
+CI runs three lanes off this one command — default, `-Dstrict-debug` and
+`-Doptimize=ReleaseFast` — as separate jobs, so the slow one does not gate the
+fast one. The strict-debug lane is not optional bookkeeping: without it the
+plain lane no longer proves anything about real Debug for the heavy modules,
+and CONVENTIONS §6.4's "green in Debug and ReleaseFast" would quietly stop
+meaning what it says.
+
+## Privileged tests
+
+`scripts/test.sh vm` (and `scripts/vm/run.sh <module> [platform]`) runs a
+module inside a disposable VM, where tests gated on real root actually
+execute instead of skipping. That is not a formality — the `tc` action-table
+bug in `modules/tc` was invisible for as long as its test skipped. See
+[vm/README.md](vm/README.md).

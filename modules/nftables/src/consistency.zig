@@ -413,7 +413,8 @@ test "consistency: the native batch and the JSON builder describe the same rules
         };
     }
 
-    std.debug.print(
+    // Success-path diagnostic — see socket.zig's note.
+    if (verboseSkip()) std.debug.print(
         "\nJSON<->native consistency: native batch applied, `nft -j list ruleset` " ++
             "decompiles all 3 rules to the JSON builder's own statements.\n",
         .{},

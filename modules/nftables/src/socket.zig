@@ -679,7 +679,10 @@ test "live: native batch round-trip — create, list, delete" {
     defer tables2.deinit();
     for (tables2.items) |t| try testing.expect(!std.mem.eql(u8, t.name, test_table));
 
-    std.debug.print("\nLIVE nftables round-trip: create/list/delete OK.\n", .{});
+    // Success-path diagnostic: gated, because the driver treats any stderr
+    // from a passing step as a failure (scripts/test-lib.sh) — a rule that
+    // only holds if passing tests stay silent.
+    if (verboseSkip()) std.debug.print("\nLIVE nftables round-trip: create/list/delete OK.\n", .{});
 }
 
 test "live: a bad batch is rolled back atomically and names the failing command" {
@@ -737,7 +740,8 @@ test "live: a bad batch is rolled back atomically and names the failing command"
     defer tables.deinit();
     for (tables.items) |t| try testing.expect(!std.mem.eql(u8, t.name, test_table));
 
-    std.debug.print(
+    // Success-path diagnostic — see the note above.
+    if (verboseSkip()) std.debug.print(
         "\nLIVE nftables atomicity: batch rolled back, failure attributed to " ++
             "command #{?d} ({s}{s}{s}).\n",
         .{

@@ -87,9 +87,17 @@ done
 # treat a route here as a starting guess, not a claim.
 route_platform() {
     case "$1" in
+        # tc runs on either now that the provisioned OpenWRT image carries
+        # tc-full and the sched kmods; Debian stays the default for it
+        # because its stock kernel already had them.
         tc) echo debian ;;
         nftables) echo openwrt ;;
         conntrack) echo openwrt ;;
+        # ebpf needs CAP_BPF + CAP_PERFMON and a kernel with full BPF: six
+        # live attach tests (kprobe, uprobe, tracepoint, raw tracepoint,
+        # cgroup link) skip on any normal host. Debian only — OpenWRT's
+        # kernel has no BPF tooling.
+        ebpf) echo debian ;;
         *) echo debian ;;
     esac
 }
