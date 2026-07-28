@@ -9,7 +9,10 @@
 //! outer ciphersuite's `kdf_id`).
 //!
 //! **Everything here is REAL** (crypto-implementation pass done —
-//! KAT-validated against RFC 9180 Appendix A.1/A.3, see `kat_rfc9180.zig`).
+//! KAT-validated against RFC 9180 Appendix A.1/A.3, see `kat_rfc9180.zig`;
+//! `AuthEncap`/`AuthDecap` and `P256Kem.deriveKeyPair` included, against
+//! A.1.3/A.1.4 and A.3.3/A.3.4's published `enc`/`shared_secret` and
+//! `ikmS`/`skSm`/`pkSm`).
 //! `encapDeterministic`/`authEncapDeterministic` take the ephemeral keypair
 //! as a parameter (rather than drawing one from `std.Io`'s randomness
 //! internally) so the RFC 9180 Appendix A known-answer vectors — which fix
@@ -465,12 +468,14 @@ test "DHKEM X25519 Encap: low-order pkR (all-zero DH output) fails closed with e
     try testing.expectError(error.DhFailed, X25519Kem.decap(low_order_pk, skR));
 }
 
-test "DHKEM X25519 AuthEncap/AuthDecap: self-consistency round trip (no official RFC vector for auth mode here)" {
-    // SPEC.md TODO item 8's verification pattern: AuthEncap's output must
-    // AuthDecap back to the identical shared_secret for the matching
-    // (skE, pkR, skS)/(skR, pkS) triple — the dtls/tlsresume-style
-    // self-consistency check, since RFC 9180 Appendix A's auth-mode
-    // vectors aren't embedded in this module (base-mode A.1/A.2/A.3 only).
+test "DHKEM X25519 AuthEncap/AuthDecap: self-consistency round trip + wrong-pkS divergence" {
+    // The BYTE-EXACT anchor for this fold is `kat_rfc9180.zig`'s A.1.3/
+    // A.1.4 vectors (and A.3.3/A.3.4 for P-256) — this test covers the
+    // property those vectors cannot: that a WRONG sender public key
+    // produces a different shared secret, i.e. the auth binding is load-
+    // bearing rather than decorative. Round-trip agreement alone would
+    // prove nothing about spec conformance (both sides could share one
+    // misreading), which is exactly why the vectors came first.
     const skR = X25519Kem.deriveKeyPair("hpke auth-mode test receiver ikm");
     const skS = X25519Kem.deriveKeyPair("hpke auth-mode test sender ikm");
     const eph = X25519Kem.deriveKeyPair("hpke auth-mode test ephemeral ikm");
@@ -506,7 +511,7 @@ test "DHKEM P-256 Encap/Decap: malformed SEC1 pkR fails closed with error.Deseri
     try testing.expectError(error.DeserializeError, P256Kem.decap(bad, skR));
 }
 
-test "DHKEM P-256 deriveKeyPair: deterministic, on-curve, distinct per ikm (self-consistency; A.3 header has no ikm fields)" {
+test "DHKEM P-256 deriveKeyPair: deterministic, on-curve, distinct per ikm (byte-exact anchor lives in the A.3.2/A.3.3/A.3.4 KATs)" {
     const kp1 = P256Kem.deriveKeyPair("hpke p256 derive test ikm 1");
     const kp1_again = P256Kem.deriveKeyPair("hpke p256 derive test ikm 1");
     try testing.expectEqualSlices(u8, &kp1.secret_key, &kp1_again.secret_key);

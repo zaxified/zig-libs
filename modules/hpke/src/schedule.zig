@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: MIT
 //! HPKE key schedule + encryption context (RFC 9180 §5): `KeySchedule`
 //! (§5.1, mode/PSK/info -> `Context`), `Context.seal`/`.open`/
-//! `.exportSecret` (§5.2/§5.3), and the single-shot `sealBase`/`openBase`
-//! wrappers (§6.1). All REAL (crypto-implementation pass done) —
+//! `.exportSecret` (§5.2/§5.3), and §6.1's single-shot wrappers for all
+//! four modes — `sealBase`/`sealPsk`/`sealAuth`/`sealAuthPsk` and their
+//! `open*` mirrors. All REAL (crypto-implementation pass done) —
 //! KAT-validated against RFC 9180 Appendix A.1's published
 //! key/base_nonce/exporter_secret, all 6 encryption tuples, and all 3
-//! exported values (see `kat_rfc9180.zig`). The KDF is hard-wired to
+//! exported values, in every mode (A.1.1/A.1.2/A.1.3/A.1.4, plus the
+//! P-256 suite's A.3.x; see `kat_rfc9180.zig`). The KDF is hard-wired to
 //! HKDF-SHA256 (the only `KdfId` this module instantiates — `Nh` is kept
 //! as an explicit parameter so widening to HKDF-SHA384/512 later is a
 //! type-parameter change, not a resignature).
@@ -38,16 +40,31 @@ pub const SeqError = error{MessageLimitReached};
 pub const SealError = SeqError || error{InvalidLength};
 pub const OpenError = SeqError || error{ DecryptionFailed, InvalidLength };
 
-/// RFC 9180 §5.1: `KeySchedule`'s own precondition failures — an
-/// auth/auth_psk call missing the PSK the mode requires, or vice versa
-/// (§5.1 Table 1's mode/PSK-requirement matrix), which this module DOES
-/// validate up front (a pure "did the caller pass the right combination of
-/// optional params" check, not a crypto judgment call).
+/// RFC 9180 §5.1: `KeySchedule`'s own precondition failures — a psk/
+/// auth_psk call missing the PSK the mode requires, or vice versa (§5.1
+/// Table 1's mode/PSK-requirement matrix), which this module DOES validate
+/// up front (a pure "did the caller pass the right combination of optional
+/// params" check, not a crypto judgment call) — plus §5.1.2's PSK-length
+/// floor, the one strictness this module adds beyond the RFC's own
+/// `VerifyPSKInputs` pseudocode.
 pub const KeyScheduleError = error{
     /// `mode` is `.psk`/`.auth_psk` but `psk`/`psk_id` was empty, or
     /// `mode` is `.base`/`.auth` but a non-empty `psk`/`psk_id` was
     /// supplied (RFC 9180 §5.1 "VerifyPSKInputs").
     InconsistentPsk,
+    /// A psk-bearing mode was given a PSK shorter than `Nh` (32 bytes for
+    /// HKDF-SHA256, the only KDF this module instantiates). RFC 9180
+    /// §5.1.2: "The PSK MUST have at least 32 bytes of entropy and SHOULD
+    /// be of length Nh bytes or longer." A PSK shorter than 32 BYTES
+    /// cannot carry 32 bytes of entropy, so a short PSK is a provable
+    /// violation of that MUST, not merely of the SHOULD — this is the one
+    /// part of §5.1.2 an implementation can actually check (entropy of a
+    /// long-enough PSK is not observable from the bytes), and this module
+    /// fails closed on it rather than deriving a key schedule from PSK
+    /// material the RFC forbids. NOT part of RFC 9180's own
+    /// `VerifyPSKInputs` pseudocode, which checks presence/consistency
+    /// only; see SPEC.md's threat model for the deviation rationale.
+    PskTooShort,
 };
 
 /// RFC 9180 §5.2: the AEAD nonce for sequence number `seq` — `base_nonce
@@ -176,13 +193,17 @@ pub fn Context(comptime Aead: type, comptime Nh: usize) type {
 /// RFC 9180 §5.1 `KeySchedule(mode, shared_secret, info, psk, psk_id)` —
 /// the composition step every other helper in this module feeds:
 /// `suite.labeledExtract`/`suite.labeledExpand` supply every HKDF call.
-/// KAT: reproduces RFC 9180 A.1.1's `key`/`base_nonce`/`exporter_secret`
-/// end-to-end from `shared_secret` (see `kat_rfc9180.zig`).
+/// KAT: reproduces the published `key`/`base_nonce`/`exporter_secret`
+/// end-to-end from `shared_secret` for all four modes — A.1.1 (base),
+/// A.1.2 (psk), A.1.3 (auth), A.1.4 (auth_psk), and the same three
+/// non-base modes over the P-256 suite (A.3.2/A.3.3/A.3.4). See
+/// `kat_rfc9180.zig`.
 ///
 /// Recipe (RFC 9180 §5.1, `suite_id = suite.suiteId(kem_id, kdf_id,
 /// aead_id)` — the OUTER suite id, not the KEM's):
 /// ```text
 /// VerifyPSKInputs(mode, psk, psk_id)   // KeyScheduleError.InconsistentPsk on a mismatch, see that error's doc comment
+/// // plus §5.1.2's PSK floor: a psk shorter than Nh -> KeyScheduleError.PskTooShort (NOT in the RFC's VerifyPSKInputs pseudocode; see that error's doc comment)
 /// psk_id_hash = LabeledExtract(suite_id, "", "psk_id_hash", psk_id)
 /// info_hash   = LabeledExtract(suite_id, "", "info_hash", info)
 /// key_schedule_context = concat(I2OSP(mode, 1), psk_id_hash, info_hash)
@@ -214,6 +235,11 @@ pub fn keySchedule(
     if (got_psk != (psk_id.len != 0)) return error.InconsistentPsk;
     const mode_needs_psk = mode == .psk or mode == .auth_psk;
     if (got_psk != mode_needs_psk) return error.InconsistentPsk;
+    // §5.1.2's PSK-strength floor, checked AFTER the consistency rules so a
+    // caller who got the mode/PSK combination wrong still sees
+    // `InconsistentPsk` (the RFC's own diagnosis) rather than a length
+    // complaint about a PSK that shouldn't have been supplied at all.
+    if (got_psk and psk.len < Nh) return error.PskTooShort;
 
     const psk_id_hash = suite.labeledExtract(HkdfSha256, suite_id, "", "psk_id_hash", psk_id);
     const info_hash = suite.labeledExtract(HkdfSha256, suite_id, "", "info_hash", info);
@@ -300,11 +326,7 @@ pub fn sealBaseDeterministic(
     pt: []const u8,
     out: []u8,
 ) !Sealed(Kem) {
-    const encapped = try Kem.encapDeterministic(pkR, eph);
-    const suite_id = comptime suiteIdOf(Kem, Aead);
-    var ctx = try keySchedule(Aead, Nh, .base, &suite_id, &encapped.shared_secret, info, "", "");
-    try ctx.seal(aad, pt, out);
-    return .{ .enc = encapped.enc };
+    return sealEncapped(Kem, Aead, Nh, try Kem.encapDeterministic(pkR, eph), .base, info, "", "", aad, pt, out);
 }
 
 /// RFC 9180 §6.1 `OpenBase(enc, skR, info, aad, ct)`: the receiver mirror
@@ -321,10 +343,256 @@ pub fn openBase(
     ct: []const u8,
     out: []u8,
 ) !void {
-    const shared_secret = try Kem.decap(enc, skR);
+    return openDecapped(Kem, Aead, Nh, try Kem.decap(enc, skR), .base, info, "", "", aad, ct, out);
+}
+
+// ── single-shot psk / auth / auth_psk wrappers (RFC 9180 §6.1) ──────────
+//
+// §6.1 defines SealPSK/OpenPSK, SealAuth/OpenAuth and SealAuthPSK/
+// OpenAuthPSK as exactly SealBase/OpenBase with (a) the mode byte, (b) the
+// psk/psk_id pair, and (c) the KEM's authenticated fold swapped in. Every
+// one of them is therefore the SAME three-step composition, and they share
+// the `sealEncapped`/`openDecapped` bodies below rather than each carrying
+// its own copy of the key-schedule + seal lines — a per-mode copy is
+// precisely where a `mode` argument or a `psk` argument silently goes
+// missing, and (unlike a KAT mismatch) a sender and recipient making the
+// same omission still round-trip perfectly.
+//
+// Parameter order mirrors `sealBase`/`openBase` exactly, with each extra
+// input placed next to its own kind: the sender's static keypair `skS` /
+// public key `pkS` next to the other KEM key (`pkR`/`skR`), and
+// `psk`/`psk_id` next to the other key-schedule input (`info`). `aad`, `pt`
+// / `ct` and `out` stay last, unchanged.
+
+/// The post-KEM half of every single-shot `Seal*`: `KeySchedule(mode,
+/// shared_secret, info, psk, psk_id)` then exactly ONE `Context.Seal(aad,
+/// pt)`. `mode`'s consistency with `psk`/`psk_id` is not re-checked here —
+/// `keySchedule` owns RFC 9180 §5.1's `VerifyPSKInputs` (plus §5.1.2's PSK
+/// floor) and rejects a wrong combination with `KeyScheduleError`, so a
+/// duplicate check in each wrapper would only be a second place to get the
+/// rule wrong.
+fn sealEncapped(
+    comptime Kem: type,
+    comptime Aead: type,
+    comptime Nh: usize,
+    encapped: Kem.Encapped,
+    mode: suite.Mode,
+    info: []const u8,
+    psk: []const u8,
+    psk_id: []const u8,
+    aad: []const u8,
+    pt: []const u8,
+    out: []u8,
+) !Sealed(Kem) {
     const suite_id = comptime suiteIdOf(Kem, Aead);
-    var ctx = try keySchedule(Aead, Nh, .base, &suite_id, &shared_secret, info, "", "");
+    var ctx = try keySchedule(Aead, Nh, mode, &suite_id, &encapped.shared_secret, info, psk, psk_id);
+    try ctx.seal(aad, pt, out);
+    return .{ .enc = encapped.enc };
+}
+
+/// The post-KEM half of every single-shot `Open*` — the mirror of
+/// `sealEncapped`.
+fn openDecapped(
+    comptime Kem: type,
+    comptime Aead: type,
+    comptime Nh: usize,
+    shared_secret: [Kem.Nsecret]u8,
+    mode: suite.Mode,
+    info: []const u8,
+    psk: []const u8,
+    psk_id: []const u8,
+    aad: []const u8,
+    ct: []const u8,
+    out: []u8,
+) !void {
+    const suite_id = comptime suiteIdOf(Kem, Aead);
+    var ctx = try keySchedule(Aead, Nh, mode, &suite_id, &shared_secret, info, psk, psk_id);
     try ctx.open(aad, ct, out);
+}
+
+/// RFC 9180 §6.1 `SealPSK(pkR, info, aad, pt, psk, psk_id)`: `Encap(pkR)`
+/// (the same unauthenticated KEM call `sealBase` makes) then
+/// `KeySchedule(mode_psk, shared_secret, info, psk, psk_id)` then one
+/// `Context.Seal`. The recipient is assured the sender held `psk`; the
+/// sender is assured of nothing about the recipient beyond `pkR`, exactly
+/// as in base mode. `psk` MUST be at least `Nh` bytes (RFC 9180 §5.1.2) —
+/// `keySchedule` enforces that, `error.PskTooShort`.
+/// KAT: reproduces RFC 9180 A.1.2's `enc` + first ciphertext.
+pub fn sealPsk(
+    comptime Kem: type,
+    comptime Aead: type,
+    comptime Nh: usize,
+    pkR: Kem.PublicKey,
+    io: std.Io,
+    info: []const u8,
+    psk: []const u8,
+    psk_id: []const u8,
+    aad: []const u8,
+    pt: []const u8,
+    out: []u8,
+) !Sealed(Kem) {
+    return sealPskDeterministic(Kem, Aead, Nh, pkR, Kem.generateKeyPair(io), info, psk, psk_id, aad, pt, out);
+}
+
+/// `sealPsk` with the ephemeral keypair injected instead of drawn from
+/// `io` — the KAT seam, exactly as `sealBaseDeterministic` is to
+/// `sealBase`. Real callers want `sealPsk`.
+pub fn sealPskDeterministic(
+    comptime Kem: type,
+    comptime Aead: type,
+    comptime Nh: usize,
+    pkR: Kem.PublicKey,
+    eph: Kem.KeyPair,
+    info: []const u8,
+    psk: []const u8,
+    psk_id: []const u8,
+    aad: []const u8,
+    pt: []const u8,
+    out: []u8,
+) !Sealed(Kem) {
+    return sealEncapped(Kem, Aead, Nh, try Kem.encapDeterministic(pkR, eph), .psk, info, psk, psk_id, aad, pt, out);
+}
+
+/// RFC 9180 §6.1 `OpenPSK(enc, skR, info, aad, ct, psk, psk_id)` — the
+/// receiver mirror of `sealPsk`. A recipient holding a DIFFERENT `psk` (or
+/// the same `psk` under a different `psk_id`) derives a different key
+/// schedule and the AEAD open fails with `error.DecryptionFailed`; that is
+/// the entire authentication the mode provides.
+pub fn openPsk(
+    comptime Kem: type,
+    comptime Aead: type,
+    comptime Nh: usize,
+    enc: Kem.EncappedKey,
+    skR: Kem.KeyPair,
+    info: []const u8,
+    psk: []const u8,
+    psk_id: []const u8,
+    aad: []const u8,
+    ct: []const u8,
+    out: []u8,
+) !void {
+    return openDecapped(Kem, Aead, Nh, try Kem.decap(enc, skR), .psk, info, psk, psk_id, aad, ct, out);
+}
+
+/// RFC 9180 §6.1 `SealAuth(pkR, info, aad, pt, skS)`: `AuthEncap(pkR, skS)`
+/// — the KEM fold that binds the SENDER's static keypair into the shared
+/// secret (`dh || dh2`, see `dhkem.zig`) — then `KeySchedule(mode_auth,
+/// shared_secret, info, "", "")` then one `Context.Seal`. `skS` is a
+/// long-term keypair the recipient must already know the public half of;
+/// reusing it is the point of the mode (unlike the per-call ephemeral).
+/// KAT: reproduces RFC 9180 A.1.3's `enc` + first ciphertext.
+pub fn sealAuth(
+    comptime Kem: type,
+    comptime Aead: type,
+    comptime Nh: usize,
+    pkR: Kem.PublicKey,
+    skS: Kem.KeyPair,
+    io: std.Io,
+    info: []const u8,
+    aad: []const u8,
+    pt: []const u8,
+    out: []u8,
+) !Sealed(Kem) {
+    return sealAuthDeterministic(Kem, Aead, Nh, pkR, skS, Kem.generateKeyPair(io), info, aad, pt, out);
+}
+
+/// `sealAuth` with the ephemeral keypair injected — the KAT seam. Note the
+/// ephemeral (`eph`) and the sender's static keypair (`skS`) are DIFFERENT
+/// keys serving different purposes; passing the static key as the ephemeral
+/// would destroy HPKE's per-message key freshness.
+pub fn sealAuthDeterministic(
+    comptime Kem: type,
+    comptime Aead: type,
+    comptime Nh: usize,
+    pkR: Kem.PublicKey,
+    skS: Kem.KeyPair,
+    eph: Kem.KeyPair,
+    info: []const u8,
+    aad: []const u8,
+    pt: []const u8,
+    out: []u8,
+) !Sealed(Kem) {
+    return sealEncapped(Kem, Aead, Nh, try Kem.authEncapDeterministic(pkR, skS, eph), .auth, info, "", "", aad, pt, out);
+}
+
+/// RFC 9180 §6.1 `OpenAuth(enc, skR, info, aad, ct, pkS)` — the receiver
+/// mirror of `sealAuth`. `pkS` is REQUIRED (no "authenticate against
+/// whoever sent it" path): `AuthDecap` with the wrong `pkS` yields a
+/// different shared secret and the open fails, which IS the sender
+/// authentication — see SPEC.md's threat model on sender-key confusion.
+pub fn openAuth(
+    comptime Kem: type,
+    comptime Aead: type,
+    comptime Nh: usize,
+    enc: Kem.EncappedKey,
+    skR: Kem.KeyPair,
+    pkS: Kem.PublicKey,
+    info: []const u8,
+    aad: []const u8,
+    ct: []const u8,
+    out: []u8,
+) !void {
+    return openDecapped(Kem, Aead, Nh, try Kem.authDecap(enc, skR, pkS), .auth, info, "", "", aad, ct, out);
+}
+
+/// RFC 9180 §6.1 `SealAuthPSK(pkR, info, aad, pt, psk, psk_id, skS)`: both
+/// authenticators at once — `AuthEncap(pkR, skS)` AND a psk-bearing
+/// `KeySchedule(mode_auth_psk, ...)`. The recipient is assured the sender
+/// held BOTH the static private key matching `pkS` and the PSK.
+/// KAT: reproduces RFC 9180 A.1.4's `enc` + first ciphertext.
+pub fn sealAuthPsk(
+    comptime Kem: type,
+    comptime Aead: type,
+    comptime Nh: usize,
+    pkR: Kem.PublicKey,
+    skS: Kem.KeyPair,
+    io: std.Io,
+    info: []const u8,
+    psk: []const u8,
+    psk_id: []const u8,
+    aad: []const u8,
+    pt: []const u8,
+    out: []u8,
+) !Sealed(Kem) {
+    return sealAuthPskDeterministic(Kem, Aead, Nh, pkR, skS, Kem.generateKeyPair(io), info, psk, psk_id, aad, pt, out);
+}
+
+/// `sealAuthPsk` with the ephemeral keypair injected — the KAT seam.
+pub fn sealAuthPskDeterministic(
+    comptime Kem: type,
+    comptime Aead: type,
+    comptime Nh: usize,
+    pkR: Kem.PublicKey,
+    skS: Kem.KeyPair,
+    eph: Kem.KeyPair,
+    info: []const u8,
+    psk: []const u8,
+    psk_id: []const u8,
+    aad: []const u8,
+    pt: []const u8,
+    out: []u8,
+) !Sealed(Kem) {
+    return sealEncapped(Kem, Aead, Nh, try Kem.authEncapDeterministic(pkR, skS, eph), .auth_psk, info, psk, psk_id, aad, pt, out);
+}
+
+/// RFC 9180 §6.1 `OpenAuthPSK(enc, skR, info, aad, ct, psk, psk_id, pkS)` —
+/// the receiver mirror of `sealAuthPsk`; a wrong `pkS` OR a wrong
+/// `psk`/`psk_id` fails the open.
+pub fn openAuthPsk(
+    comptime Kem: type,
+    comptime Aead: type,
+    comptime Nh: usize,
+    enc: Kem.EncappedKey,
+    skR: Kem.KeyPair,
+    pkS: Kem.PublicKey,
+    info: []const u8,
+    psk: []const u8,
+    psk_id: []const u8,
+    aad: []const u8,
+    ct: []const u8,
+    out: []u8,
+) !void {
+    return openDecapped(Kem, Aead, Nh, try Kem.authDecap(enc, skR, pkS), .auth_psk, info, psk, psk_id, aad, ct, out);
 }
 
 // ── tests ─────────────────────────────────────────────────────────────
@@ -348,22 +616,50 @@ test "incrementSeq: overflow guard fails closed at maxInt(u64), never wraps" {
     try testing.expectEqual(std.math.maxInt(u64), seq); // unchanged on rejection
 }
 
+/// A PSK long enough to clear RFC 9180 §5.1.2's `Nh`-byte floor — test-only
+/// filler, NOT key material anything outside this file may reuse.
+const test_psk = [_]u8{0xab} ** 32;
+
 test "keySchedule: VerifyPSKInputs rejects every inconsistent mode/psk combination" {
     const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
     const suite_id = suite.suiteId(0x0020, 0x0001, 0x0001);
     const ss = [_]u8{0x42} ** 32;
     // base mode with a PSK supplied.
-    try testing.expectError(error.InconsistentPsk, keySchedule(Aes128Gcm, 32, .base, &suite_id, &ss, "", "some psk", "some id"));
+    try testing.expectError(error.InconsistentPsk, keySchedule(Aes128Gcm, 32, .base, &suite_id, &ss, "", &test_psk, "some id"));
     // psk mode with no PSK.
     try testing.expectError(error.InconsistentPsk, keySchedule(Aes128Gcm, 32, .psk, &suite_id, &ss, "", "", ""));
     // psk without psk_id (and vice versa).
-    try testing.expectError(error.InconsistentPsk, keySchedule(Aes128Gcm, 32, .psk, &suite_id, &ss, "", "some psk", ""));
+    try testing.expectError(error.InconsistentPsk, keySchedule(Aes128Gcm, 32, .psk, &suite_id, &ss, "", &test_psk, ""));
     try testing.expectError(error.InconsistentPsk, keySchedule(Aes128Gcm, 32, .psk, &suite_id, &ss, "", "", "some id"));
+    // A too-short PSK in an otherwise-CONSISTENT combination is still
+    // reported as an inconsistency, not a length problem — the mode/PSK
+    // shape rules are checked first (see keySchedule).
+    try testing.expectError(error.InconsistentPsk, keySchedule(Aes128Gcm, 32, .auth, &suite_id, &ss, "", "short", "some id"));
     // Consistent combinations construct fine.
     _ = try keySchedule(Aes128Gcm, 32, .base, &suite_id, &ss, "", "", "");
-    _ = try keySchedule(Aes128Gcm, 32, .psk, &suite_id, &ss, "", "some psk", "some id");
+    _ = try keySchedule(Aes128Gcm, 32, .psk, &suite_id, &ss, "", &test_psk, "some id");
     _ = try keySchedule(Aes128Gcm, 32, .auth, &suite_id, &ss, "", "", "");
-    _ = try keySchedule(Aes128Gcm, 32, .auth_psk, &suite_id, &ss, "", "some psk", "some id");
+    _ = try keySchedule(Aes128Gcm, 32, .auth_psk, &suite_id, &ss, "", &test_psk, "some id");
+}
+
+test "keySchedule: RFC 9180 §5.1.2 PSK floor — a psk shorter than Nh fails closed with error.PskTooShort" {
+    // "The PSK MUST have at least 32 bytes of entropy" (§5.1.2): a PSK
+    // shorter than 32 BYTES cannot satisfy that, whatever its content, so
+    // this module rejects it rather than deriving a key schedule from it.
+    // Not part of the RFC's VerifyPSKInputs pseudocode — see
+    // KeyScheduleError.PskTooShort's doc comment and SPEC.md.
+    const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
+    const suite_id = suite.suiteId(0x0020, 0x0001, 0x0001);
+    const ss = [_]u8{0x42} ** 32;
+    for ([_]usize{ 1, 8, 16, 31 }) |n| {
+        const short = ([_]u8{0xcd} ** 32)[0..n];
+        try testing.expectError(error.PskTooShort, keySchedule(Aes128Gcm, 32, .psk, &suite_id, &ss, "", short, "some id"));
+        try testing.expectError(error.PskTooShort, keySchedule(Aes128Gcm, 32, .auth_psk, &suite_id, &ss, "", short, "some id"));
+    }
+    // Exactly Nh bytes is accepted (the floor is inclusive) — and the RFC's
+    // own Appendix A PSK vectors are exactly 32 bytes, so a stricter floor
+    // would reject the spec's own test vectors.
+    _ = try keySchedule(Aes128Gcm, 32, .psk, &suite_id, &ss, "", ([_]u8{0xcd} ** 32)[0..32], "some id");
 }
 
 test "Context.seal/.open: round trip, seq advances, tampered ct rejected WITHOUT advancing seq" {
@@ -486,5 +782,95 @@ test "sealBase -> openBase: end-to-end round trip on fresh random keys (P-256 + 
 
     var out: [pt.len]u8 = undefined;
     try openBase(dhkem.P256Kem, ChaCha20Poly1305, 32, sealed.enc, skR, "", "", &ct, &out);
+    try testing.expectEqualSlices(u8, pt, &out);
+}
+
+test "sealPsk/sealAuth/sealAuthPsk -> matching open: round trip on fresh random keys, and every mismatch rejected" {
+    // Round-trip coverage only — these three modes' BYTE-EXACT behaviour is
+    // pinned by the RFC 9180 A.1.2/A.1.3/A.1.4 vectors in kat_rfc9180.zig
+    // (a round trip alone cannot catch a misreading both sides share).
+    // What this test adds is the negative half: each authenticator actually
+    // has to match for the open to succeed.
+    const dhkem = @import("dhkem.zig");
+    const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
+    const Kem = dhkem.X25519Kem;
+
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const skR = Kem.generateKeyPair(io);
+    const skS = Kem.generateKeyPair(io);
+    const wrong_sender = Kem.generateKeyPair(io);
+    const psk_id = "psk id";
+    const wrong_psk = [_]u8{0xcd} ** 32;
+
+    const pt = "single-shot non-base modes";
+    var ct: [pt.len + Aes128Gcm.tag_length]u8 = undefined;
+    var out: [pt.len]u8 = undefined;
+
+    // mode_psk
+    {
+        const sealed = try sealPsk(Kem, Aes128Gcm, 32, skR.public_key, io, "info", &test_psk, psk_id, "aad", pt, &ct);
+        try openPsk(Kem, Aes128Gcm, 32, sealed.enc, skR, "info", &test_psk, psk_id, "aad", &ct, &out);
+        try testing.expectEqualSlices(u8, pt, &out);
+        try testing.expectError(error.DecryptionFailed, openPsk(Kem, Aes128Gcm, 32, sealed.enc, skR, "info", &wrong_psk, psk_id, "aad", &ct, &out));
+        try testing.expectError(error.DecryptionFailed, openPsk(Kem, Aes128Gcm, 32, sealed.enc, skR, "info", &test_psk, "other id", "aad", &ct, &out));
+        // A too-short PSK is rejected by the key schedule before any AEAD work.
+        try testing.expectError(error.PskTooShort, sealPsk(Kem, Aes128Gcm, 32, skR.public_key, io, "info", "short", psk_id, "aad", pt, &ct));
+    }
+
+    // mode_auth
+    {
+        const sealed = try sealAuth(Kem, Aes128Gcm, 32, skR.public_key, skS, io, "info", "aad", pt, &ct);
+        try openAuth(Kem, Aes128Gcm, 32, sealed.enc, skR, skS.public_key, "info", "aad", &ct, &out);
+        try testing.expectEqualSlices(u8, pt, &out);
+        // Wrong sender public key: the whole point of the mode.
+        try testing.expectError(error.DecryptionFailed, openAuth(Kem, Aes128Gcm, 32, sealed.enc, skR, wrong_sender.public_key, "info", "aad", &ct, &out));
+        // And base-mode open must NOT accept an auth-mode ciphertext.
+        try testing.expectError(error.DecryptionFailed, openBase(Kem, Aes128Gcm, 32, sealed.enc, skR, "info", "aad", &ct, &out));
+    }
+
+    // mode_auth_psk
+    {
+        const sealed = try sealAuthPsk(Kem, Aes128Gcm, 32, skR.public_key, skS, io, "info", &test_psk, psk_id, "aad", pt, &ct);
+        try openAuthPsk(Kem, Aes128Gcm, 32, sealed.enc, skR, skS.public_key, "info", &test_psk, psk_id, "aad", &ct, &out);
+        try testing.expectEqualSlices(u8, pt, &out);
+        try testing.expectError(error.DecryptionFailed, openAuthPsk(Kem, Aes128Gcm, 32, sealed.enc, skR, wrong_sender.public_key, "info", &test_psk, psk_id, "aad", &ct, &out));
+        try testing.expectError(error.DecryptionFailed, openAuthPsk(Kem, Aes128Gcm, 32, sealed.enc, skR, skS.public_key, "info", &wrong_psk, psk_id, "aad", &ct, &out));
+        // auth (no PSK) must not open an auth_psk ciphertext: different mode
+        // byte in key_schedule_context, hence a different key.
+        try testing.expectError(error.DecryptionFailed, openAuth(Kem, Aes128Gcm, 32, sealed.enc, skR, skS.public_key, "info", "aad", &ct, &out));
+    }
+}
+
+test "single-shot wrappers: P-256 + ChaCha20Poly1305 cross-pairing round-trips in all three non-base modes" {
+    // Same cross-pairing rationale as the base-mode P-256/ChaCha test above:
+    // proves the wrappers are generic over the KEM's key widths (Npk=65) and
+    // the AEAD's key width (Nk=32), not accidentally X25519/AES-specific.
+    const dhkem = @import("dhkem.zig");
+    const ChaCha20Poly1305 = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
+    const Kem = dhkem.P256Kem;
+
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const skR = Kem.generateKeyPair(io);
+    const skS = Kem.generateKeyPair(io);
+    const pt = "p256 + chacha, non-base modes";
+    var ct: [pt.len + ChaCha20Poly1305.tag_length]u8 = undefined;
+    var out: [pt.len]u8 = undefined;
+
+    const s1 = try sealPsk(Kem, ChaCha20Poly1305, 32, skR.public_key, io, "", &test_psk, "id", "", pt, &ct);
+    try openPsk(Kem, ChaCha20Poly1305, 32, s1.enc, skR, "", &test_psk, "id", "", &ct, &out);
+    try testing.expectEqualSlices(u8, pt, &out);
+
+    const s2 = try sealAuth(Kem, ChaCha20Poly1305, 32, skR.public_key, skS, io, "", "", pt, &ct);
+    try openAuth(Kem, ChaCha20Poly1305, 32, s2.enc, skR, skS.public_key, "", "", &ct, &out);
+    try testing.expectEqualSlices(u8, pt, &out);
+
+    const s3 = try sealAuthPsk(Kem, ChaCha20Poly1305, 32, skR.public_key, skS, io, "", &test_psk, "id", "", pt, &ct);
+    try openAuthPsk(Kem, ChaCha20Poly1305, 32, s3.enc, skR, skS.public_key, "", &test_psk, "id", "", &ct, &out);
     try testing.expectEqualSlices(u8, pt, &out);
 }

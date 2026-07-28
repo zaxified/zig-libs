@@ -7,23 +7,29 @@
 //! consumers).
 //!
 //! **Status: crypto-implementation pass DONE — every core is real and
-//! KAT-validated** against RFC 9180 Appendix A.1 (X25519 + AES-128-GCM
-//! base mode, the full vector: DHKEM Encap/Decap/DeriveKeyPair, key
-//! schedule, all 6 encryption tuples, all 3 exported values, and the
-//! single-shot `sealBase`/`openBase`), A.2 (ChaCha20Poly1305), and A.3
-//! (P-256), byte-exact:
+//! KAT-validated** against RFC 9180 Appendix A, byte-exact, in ALL FOUR
+//! modes:
+//!
+//! | Mode | Vectors driven end-to-end |
+//! |---|---|
+//! | `base` (0x00) | A.1.1 (full: DeriveKeyPair, Encap/Decap, key schedule, all 6 encryption tuples, all 3 exports, single-shot `sealBase`/`openBase`) + A.2/A.3 headers |
+//! | `psk` (0x01) | A.1.2 (full) + A.3.2 (P-256) |
+//! | `auth` (0x02) | A.1.3 (full) + A.3.3 (P-256) |
+//! | `auth_psk` (0x03) | A.1.4 (full) + A.3.4 (P-256) |
 //!
 //! | File | What it provides |
 //! |---|---|
 //! | `suite.zig` | Suite/KEM id constants, `Mode`, `I2OSP`/`OS2IP`, `suite_id`/`kem_suite_id` construction, `LabeledExtract`/`LabeledExpand` (§4) |
 //! | `dhkem.zig` | `X25519Kem`/`P256Kem`: `Encap`/`Decap`/`AuthEncap`/`AuthDecap`/`DeriveKeyPair`/`generateKeyPair` (§4.1/§7.1.1-§7.1.3) |
-//! | `schedule.zig` | `KeySchedule` (§5.1), `Context.seal`/`.open`/`.exportSecret` (§5.2/§5.3), `computeNonce`/`incrementSeq`, `sealBase`/`openBase` (§6.1) |
-//! | `kat_rfc9180.zig` | RFC 9180 Appendix A.1 (full) + A.2/A.3 (headers) known-answer vectors, driven end-to-end |
+//! | `schedule.zig` | `KeySchedule` (§5.1), `Context.seal`/`.open`/`.exportSecret` (§5.2/§5.3), `computeNonce`/`incrementSeq`, and §6.1's single-shot `sealBase`/`sealPsk`/`sealAuth`/`sealAuthPsk` + their `open*` mirrors |
+//! | `kat_rfc9180.zig` | RFC 9180 Appendix A known-answer vectors (A.1 all four modes, A.2/A.3 headers, A.3 all three non-base modes), driven end-to-end |
 //!
-//! `auth`/`auth_psk`-mode KEM folds (`AuthEncap`/`AuthDecap`) are
-//! implemented and self-consistency-tested (RFC 9180 Appendix A publishes
-//! no auth-mode vector this module embeds — see SPEC.md's done-record
-//! item 8). See `SPEC.md` for the full threat model.
+//! The `auth`/`auth_psk` KEM folds (`AuthEncap`/`AuthDecap`) are anchored
+//! to the RFC's own published `enc`/`shared_secret` for BOTH KEMs — not
+//! merely round-trip-tested, which cannot detect a misreading the sender
+//! and recipient share. See `SPEC.md` for the full threat model, including
+//! the one place this module is deliberately stricter than RFC 9180 (§5.1.2's
+//! PSK-length floor, enforced as `error.PskTooShort`).
 //!
 //! Provenance: clean-room from RFC 9180 (a public IETF specification, not
 //! copyrightable expression — see CONVENTIONS.md §5's merger-doctrine
@@ -51,8 +57,20 @@ pub const P256Kem = dhkem.P256Kem;
 
 pub const Context = schedule.Context;
 pub const keySchedule = schedule.keySchedule;
+
+// RFC 9180 §6.1's single-shot `Seal*`/`Open*` pairs, one per mode. The
+// `*Deterministic` variants (ephemeral keypair injected instead of drawn
+// from `io`) stay behind `schedule.` — they exist for the Appendix A KATs,
+// and reusing an ephemeral key across calls voids HPKE's security argument,
+// so they are deliberately not re-exported at the top level.
 pub const sealBase = schedule.sealBase;
 pub const openBase = schedule.openBase;
+pub const sealPsk = schedule.sealPsk;
+pub const openPsk = schedule.openPsk;
+pub const sealAuth = schedule.sealAuth;
+pub const openAuth = schedule.openAuth;
+pub const sealAuthPsk = schedule.sealAuthPsk;
+pub const openAuthPsk = schedule.openAuthPsk;
 
 pub const meta = .{
     .platform = .any,
