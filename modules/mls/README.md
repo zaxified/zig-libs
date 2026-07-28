@@ -14,7 +14,13 @@ verification, tree hash, and the mechanical tree-shape edits, PLUS the
 five algorithmically-hard TreeKEM cores (`resolution`/`parentHash`/
 `validateParentHashes`/`processUpdatePath`/`applyUpdatePath`) —
 implemented and pinned byte-exact against the official mlswg interop
-vectors — see `SPEC.md`'s "Part 2 — TreeKEM" section.
+vectors — see `SPEC.md`'s "Part 2 — TreeKEM" section. **Part 4: key
+schedule + secret tree** — RFC 9420 §8's epoch chain, §8.1's
+`GroupContext`, §8.4's `psk_secret`, §8.5's exporter, §6.1's
+`confirmation_tag`/`membership_tag`, and §9's secret tree with its
+per-leaf sender ratchets and out-of-order window — pinned byte-exact
+against the official `key-schedule`/`psk_secret`/`secret-tree` vectors,
+see `SPEC.md`'s "Part 4" section.
 
 **Status: Part 1 COMPLETE, entirely Sonnet-tier. Part 2 COMPLETE** — the
 data/codec/tree-hash/tree-editing pieces are Sonnet-tier (mechanical
@@ -23,9 +29,14 @@ vectors); the five Fable-tier tree-algorithm cores are implemented and
 KAT-pinned (all 14 trees' resolutions, 275 single-byte parent-hash tamper
 rejections, 62 UpdatePath processings across 328 receiver views, and 62
 merges reproducing `tree_hash_after`) behind `gate.treekem_core_implemented`
-(now `true`). KeyPackage/LeafNode-validation/Credential (Part 3), the key
-schedule (Part 4), and Proposal/Commit/framing (Part 5) are LATER parts;
-see `SPEC.md`'s "Arc breakdown" for the full decomposition.
+(now `true`). **Part 4 COMPLETE** (Sonnet-tier), except §8.2's transcript
+hashes and §8.3's external initialization — both need structures later
+parts build, so neither is stubbed here.
+KeyPackage/LeafNode-validation/Credential (Part 3) and
+Proposal/Commit/framing (Part 5) are LATER parts; see `SPEC.md`'s "Arc
+breakdown" for the full decomposition. Parts 1+2+4 together are the
+complete cryptographic spine of an epoch, but not yet a usable client:
+nothing can be sent or received until Part 5's framing exists.
 
 | File | Provides |
 |---|---|
@@ -40,6 +51,10 @@ see `SPEC.md`'s "Arc breakdown" for the full decomposition.
 | `treekem.zig` | Part 2's `HPKECiphertext`/`UpdatePathNode`/`UpdatePath` (§7.6) + the five Fable cores (`resolution`/`parentHash`/`validateParentHashes`/`processUpdatePath`/`applyUpdatePath`), implemented and KAT-pinned |
 | `gate.zig` | Part 2's `treekem_core_implemented` switch — now `true` (the five cores are implemented; the gated TreeKEM KATs run) |
 | `kat_treekem_test.zig` | Part 2's official RFC 9420 interop vectors (`tree-validation.json`/`tree-operations.json`/`treekem.json`), driven byte-exact against the five cores |
+| `keyschedule.zig` | Part 4's §8 epoch chain (`joinerSecret`/`welcomeSecret`/`epochSecret`/`deriveEpoch`), §8.1 `GroupContext`, §8.4 `PreSharedKeyId`/`pskSecret`, §8.5 `mlsExporter`, `externalKeyPair`, §6.1 `confirmationTag`/`membershipTag` (+ constant-time verifiers) |
+| `secrettree.zig` | Part 4's §9 secret tree (`nodeSecret`/`ratchetBaseSecret`), §9.1 `Ratchet` + the generation-indexed out-of-order `Window`, §6.3.2 `senderDataKeys` |
+| `kat_keyschedule_test.zig` | Part 4's official interop vectors `key-schedule.json` + `psk_secret.json`, driven per-stage byte-exact |
+| `kat_secrettree_test.zig` | Part 4's official `secret-tree.json`, driven byte-exact both forward (`Ratchet`) and out-of-order (`Window`) |
 
 - **Model after:** RFC 9420 (Messaging Layer Security); `treemath.zig`
   ports Appendix C's own published reference algorithm.
@@ -173,6 +188,70 @@ const processed = try treekem.processUpdatePath(S, allocator, &rt, receiver, sen
 try treekem.applyUpdatePath(arena_allocator, &rt, sender_index, up);
 ```
 
+## API surface (Part 4 — key schedule + secret tree)
+
+**Epoch key schedule** (`keyschedule.zig`, RFC 9420 §8). The allocator is
+there because a `GroupContext` has no size bound — it is serialized, and it
+is fed to the KDF as a label context:
+
+```zig
+const ks = mls.keyschedule;
+
+const gc: ks.GroupContext = .{
+    .cipher_suite = S.id,
+    .group_id = group_id,
+    .epoch = epoch,
+    .tree_hash = tree_hash,                       // from treehash.rootHash
+    .confirmed_transcript_hash = confirmed_transcript_hash,
+    .extensions = &.{},
+};
+const encoded_gc = try gc.encodeAlloc(allocator);
+defer allocator.free(encoded_gc);
+
+// psk_secret from the Commit's PreSharedKey proposals (§8.4), or all-zero
+const psk = try ks.pskSecret(S, allocator, psks); // `&.{}` => ks.zeroSecret(S)
+
+var secrets = try ks.deriveEpoch(S, allocator, init_secret_prev, commit_secret, psk, encoded_gc);
+defer secrets.wipe(); // §9.2
+
+secrets.encryption_secret;   // -> the secret tree, below
+secrets.init_secret;         // -> the NEXT epoch's deriveEpoch
+secrets.epoch_authenticator; // §8.7, for out-of-band comparison
+
+const external_pub = ks.externalKeyPair(S, secrets.external_secret).public_key;
+try ks.mlsExporter(S, secrets.exporter_secret, "my-app label", context, out);
+
+// §6.1, over structures Part 5 assembles
+const tag = ks.confirmationTag(S, secrets.confirmation_key, confirmed_transcript_hash);
+try ks.verifyConfirmationTag(S, secrets.confirmation_key, confirmed_transcript_hash, received_tag);
+```
+
+**Secret tree and sender ratchets** (`secrettree.zig`, RFC 9420 §9). A
+sender walks a `Ratchet` forward; a receiver uses a `Window`, which
+tolerates reordering, refuses replays, and bounds how far an
+unauthenticated generation can make it ratchet:
+
+```zig
+const st = mls.secrettree;
+
+// sender: leaf 3's application ratchet
+const base = try st.ratchetBaseSecret(S, secrets.encryption_secret, n_leaves, 3, .application);
+var ratchet = st.Ratchet(S).init(base);
+defer ratchet.wipe();
+const kn = try ratchet.current(); // kn.key, kn.nonce for ratchet.generation
+try ratchet.advance();
+
+// receiver: same base, tolerant of out-of-order delivery
+var window = st.Window(S, 32).init(base);
+defer window.wipe();
+window.max_forward_jump = 256;              // default 1024
+const kn2 = try window.get(generation);     // consumed: a second get() fails
+// error.GenerationConsumed / .GenerationTooFarAhead
+
+// §6.3.2 sender-data keys, bound to a sample of the message ciphertext
+const sd = try st.senderDataKeys(S, secrets.sender_data_secret, ciphertext);
+```
+
 ## Verify
 
 ```sh
@@ -191,6 +270,12 @@ bytes + both tree hashes, 5 vectors); and the whole `treekem.json`
 (`processUpdatePath` reproducing `commit_secret` + first path secret for
 all 62 UpdatePaths across 328 receiver views, and `applyUpdatePath`
 merging each of the 62 to reproduce `tree_hash_after`, all byte-exact).
+Part 4 adds `key-schedule.json` (every stage of a five-epoch chain, each
+Table 4 secret, the encoded `GroupContext` in both directions,
+`external_pub`, and the exporter), `psk_secret.json` (chains of 0 through
+10 PSKs), and `secret-tree.json` (1/8/32-leaf trees, both ratchets of every
+leaf at every published generation, driven forward AND out-of-order, plus
+§6.3.2's sender-data keys) — all byte-exact.
 Green in Debug and ReleaseFast.
 
 ## Provenance

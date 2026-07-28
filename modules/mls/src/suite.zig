@@ -77,6 +77,14 @@ pub fn CipherSuite(
         /// `.PublicKey`, `.Signature` the way `std.crypto.sign.Ed25519`
         /// does.
         pub const Sig = Sig_;
+        /// MLS's MAC function — RFC 9420 §17.1's text under Table 7: "All
+        /// of the non-GREASE cipher suites use HMAC [RFC2104] as their MAC
+        /// function, with different hashes per cipher suite." DERIVED from
+        /// `Hash` (never independently declared), so a suite's
+        /// `confirmation_tag`/`membership_tag` MAC can't drift from its
+        /// transcript hash. Used by `keyschedule.confirmationTag`/
+        /// `membershipTag` (RFC 9420 §6.1).
+        pub const Mac = std.crypto.auth.hmac.Hmac(Hash_);
         pub const id = id_;
 
         /// `KDF.Nh` — the KDF's PRK/hash output width in bytes (RFC 9420
@@ -88,6 +96,9 @@ pub fn CipherSuite(
         pub const Nk = Aead.key_length;
         /// `AEAD.Nn` — the AEAD nonce width in bytes.
         pub const Nn = Aead.nonce_length;
+        /// `MAC.Nm` — the MAC output width in bytes (RFC 9420 §6.1's
+        /// `MAC` type; HMAC's output is its hash's digest length).
+        pub const Nm = Mac.mac_length;
         /// The signature scheme's encoded-signature width in bytes (RFC
         /// 9420 §5.1.2: EdDSA signatures are `R || S`; ECDSA signatures
         /// are DER, so `Nx` is suite-specific — not named directly by the
@@ -139,6 +150,7 @@ test "default suite: widths match RFC 9420 §17.1's MLS_128_DHKEMX25519_AES128GC
     try testing.expectEqual(@as(usize, 16), default.Nk);
     try testing.expectEqual(@as(usize, 12), default.Nn);
     try testing.expectEqual(@as(usize, 64), default.Nx); // Ed25519: R(32) || S(32)
+    try testing.expectEqual(@as(usize, 32), default.Nm); // HMAC-SHA256
     try testing.expectEqual(CipherSuiteId.mls_128_dhkemx25519_aes128gcm_sha256_ed25519, default.id);
 }
 

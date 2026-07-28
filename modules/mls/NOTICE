@@ -62,6 +62,9 @@ Provenance
    implementation source from any of the repository's per-language
    interop targets (`build/`, `interop/`, `docker/`) was read or ported.
 
+   (Item 5 below records a THIRD fetch round from this same repository
+   revision, for the Part 4 key-schedule/secret-tree vectors.)
+
 4. **`mlswg/mls-implementations`, Part 2 (TreeKEM) vectors** —
    `kat_treekem_test.zig`'s KAT source: `test-vectors/tree-validation.json`,
    `test-vectors/tree-operations.json`, `test-vectors/treekem.json`,
@@ -89,6 +92,48 @@ Provenance
    `src/data/tree-validation.json` (115 KB, 14 entries) /
    `src/data/tree-operations.json` (49 KB, 5 entries) /
    `src/data/treekem.json` (164 KB, 11 entries).
+
+5. **`mlswg/mls-implementations`, Part 4 (key schedule + secret tree)
+   vectors** — `kat_keyschedule_test.zig`'s and `kat_secrettree_test.zig`'s
+   KAT source: `test-vectors/key-schedule.json`,
+   `test-vectors/secret-tree.json`, `test-vectors/psk_secret.json`, fetched
+   directly (not hand-transcribed) on 2026-07-28 from the same repository's
+   `main` branch — HEAD still `cfd450286d1bfd9cd2519b95c80f9771f94a5b1a`
+   (commit date 2026-04-22), UNCHANGED from item 3's 2026-07-15 and item
+   4's 2026-07-16 fetches, so all three fetch rounds pin the same upstream
+   revision. Per-file last-modified commits at that revision:
+   `key-schedule.json` → `fd51ea702fe637e48452b8118123bff118767731`
+   (2023-03-01, "Key schedule test vector with 'exported'"),
+   `secret-tree.json` → `cb8c5e6b55d52d84a480b025757d86b89d414462`
+   (2023-02-07, "Update secret tree test vector"), `psk_secret.json` →
+   `9918564bd26a9fcc81f63bb090fa5c1676003e1c` (2023-02-17, "Add PSK test
+   cases with empty lists").
+
+   **UNLIKE item 4, embedded VERBATIM — not filtered to cipher suite
+   `0x0001`.** Item 4's filtering was justified by size (3.4 MB across
+   three files); these three total ~460 KB unfiltered, comparable to the
+   already-embedded filtered Part 2 set, so the stronger provenance claim
+   (the embedded bytes are byte-identical to upstream and independently
+   re-verifiable by hash) is worth more than the parse saved. The suites
+   this module does not wire are skipped at test time instead, the same way
+   Part 1's `crypto-basics.json` is — and the skip COUNT is asserted, so
+   the vectors for suites `0x0002`-`0x0007` being present is itself pinned.
+   SHA-256 of the embedded files, as fetched:
+   `key-schedule.json` =
+   `05aa9a68bd2538ace72d8c53375984cc728ef62220ebf314df675708546d97a7`,
+   `secret-tree.json` =
+   `08f92e6272452e2c832e32d38e16cf0c4aa28967e47d3842c60bc354c6b67a94`,
+   `psk_secret.json` =
+   `2b534969dba0b65a04b7d790496af5c0ccdb472b3fc4ca25c8c82df3e8523784`.
+
+   Same public-conformance-data posture as items 3/4 — no explicit OSS
+   license on the source repository, but public NUMERIC interop data (HKDF
+   derivation chains, per-leaf AEAD keys and nonces, PSK-chain outputs),
+   not copyrightable expression. The repository's own `test-vectors.md`
+   (the vector-FORMAT specification) was read to determine field semantics
+   — specifically that `key-schedule.json`'s `exporter.label` is a plain
+   string while every neighbouring field is hex — but no implementation
+   source from any per-language interop target was read or ported.
 
 No third-party MLS IMPLEMENTATION (mls-rs, OpenMLS, mlspp, or any other
 language's MLS library) was read, consulted as a design reference, or

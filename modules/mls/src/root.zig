@@ -12,9 +12,20 @@
 //! official mlswg `tree-validation`/`tree-operations`/`treekem` interop
 //! vectors (the `gate.treekem_core_implemented` switch is now `true`) — see
 //! `SPEC.md`'s "Part 2 — TreeKEM" section for the full breakdown.
-//! KeyPackage/LeafNode-validation/Credential (Part 3), the key
-//! schedule (Part 4), and Proposal/Commit/framing (Part 5) are LATER
-//! parts — see `SPEC.md`'s "Arc breakdown" for the full decomposition.
+//! **Part 4: key schedule + secret tree — COMPLETE.** RFC 9420 §8's whole
+//! epoch chain (`keyschedule.zig`), §8.1's `GroupContext`, §8.4's
+//! `psk_secret`, §8.5's exporter, §6.1's two MACs, and §9's secret tree +
+//! sender ratchets + §6.3.2 sender-data keys (`secrettree.zig`), all pinned
+//! byte-exact against the official `key-schedule`/`psk_secret`/`secret-tree`
+//! vectors — see `SPEC.md`'s "Part 4" section. Two §8 subsections are
+//! deliberately NOT in it: §8.2's transcript hashes (needs Part 5's encoded
+//! `AuthenticatedContent`) and §8.3's external initialization (needs Part
+//! 6's external-commit flow).
+//! KeyPackage/LeafNode-validation/Credential (Part 3) and
+//! Proposal/Commit/framing (Part 5) are LATER parts — see `SPEC.md`'s
+//! "Arc breakdown" for the full decomposition. Part 4 landed before Part 3
+//! because the key schedule depends on neither: it consumes a tree HASH,
+//! not a `KeyPackage`.
 //!
 //! | File | What it provides |
 //! |---|---|
@@ -27,12 +38,21 @@
 //! | `tree.zig` | Part 2's `LeafNode`/`ParentNode`/`Node`/`RatchetTree` (§7.1/§7.2/§12.4.3.3), wire codec, leaf-signature verification, and the mechanical (non-Fable) tree-shape edits `addLeaf`/`updateLeaf`/`removeLeaf` (§7.7/§12.1.1-3) |
 //! | `treehash.zig` | Part 2's RFC 9420 §7.8 tree hash — real, recursive, KAT'd byte-exact |
 //! | `treekem.zig` | Part 2's `HPKECiphertext`/`UpdatePathNode`/`UpdatePath` (§7.6) plus the five Fable cores (`resolution`/`parentHash`/`validateParentHashes`/`processUpdatePath`/`applyUpdatePath`), implemented and KAT-pinned |
-//! | `gate.zig` | Part 2's `treekem_core_implemented` switch — now `true` (the five cores are implemented; the gated TreeKEM KATs run) |
+//! | `gate.zig` | Part 2's `treekem_core_implemented` switch — now `true` (the five cores are implemented; the gated TreeKEM KATs run). Part 4 adds no gate: every line of it is real and vector-driven |
 //! | `kat_treekem_test.zig` | Part 2's KAT harness: `tree-validation.json`/`tree-operations.json`/`treekem.json` driven byte-exact against the five cores (the `gate.treekem_core_implemented`-gated tests now run — resolution, parent-hash accept/tamper, UpdatePath process + merge) |
+//! | `keyschedule.zig` | Part 4's RFC 9420 §8 epoch chain (`init_secret` → `joiner_secret` → `welcome_secret` → `epoch_secret` → Table 4's eight secrets + the next `init_secret`), §8.1's `GroupContext` wire format, §8.4's `PreSharedKeyID`/`PSKLabel`/`psk_secret` chain, §8.5's `MLS-Exporter`, `external_pub`, and §6.1's `confirmation_tag`/`membership_tag` |
+//! | `secrettree.zig` | Part 4's RFC 9420 §9 secret tree (derived downward from `encryption_secret`), the per-leaf handshake/application sender ratchets (§9.1), a generation-indexed out-of-order `Window` with consume-once and bounded-forward-jump policy (§9.2), and §6.3.2's sender-data key/nonce |
+//! | `kat_keyschedule_test.zig` | Part 4's KAT harness for `key-schedule.json` (per-STAGE, so a divergence names the failing link) + `psk_secret.json` (chains of 0 through 10 PSKs) |
+//! | `kat_secrettree_test.zig` | Part 4's KAT harness for `secret-tree.json` — 1/8/32-leaf trees, each leaf's generations driven twice: forward through a bare `Ratchet` and in reverse through a `Window` |
 //!
 //! **Status: Part 1 COMPLETE (Sonnet-tier). Part 2 COMPLETE (Sonnet
 //! data/codec/tree-hash/tree-editing + Fable tree-algorithm cores, all
-//! KAT-pinned byte-exact).** `treemath.zig` is a pure port of the RFC's own
+//! KAT-pinned byte-exact). Part 4 COMPLETE (Sonnet — pure composition over
+//! Part 1's primitives, but with an authoritative per-stage conformance
+//! oracle; the only judgment call was §8.4's Extract argument order, where
+//! the RFC's prose and its Figure 24 disagree and `psk_secret.json`
+//! settles it — see `keyschedule.pskSecret`'s doc comment).**
+//! `treemath.zig` is a pure port of the RFC's own
 //! reference code; `crypto.zig` composes `codec.zig` + the sibling
 //! `hpke`/std.crypto primitives exactly as RFC 9420 §5/§8/§9.1 specify,
 //! byte-exact against `kat_test.zig`'s embedded vectors (including a
@@ -46,17 +66,19 @@
 //!
 //! Consumer: a group-messaging application wanting RFC 9420 interop
 //! (Matrix, MLS-based E2EE messaging, or any protocol layering on MLS's
-//! group key agreement) — Parts 1+2 alone are not yet a usable MLS client
-//! (no KeyPackage/Proposal/Commit framing, no key schedule); it's the
-//! foundation later parts build group operations on. See `README.md` for
-//! the current/planned surface.
+//! group key agreement) — Parts 1+2+4 are still not a usable MLS client
+//! (no KeyPackage, no Proposal/Commit/framing, so nothing can be sent or
+//! received yet), but they are now the complete CRYPTOGRAPHIC spine: given
+//! a tree and a transcript, every key an epoch uses is derivable and
+//! interop-verified. What Parts 3/5 add is the message plumbing that feeds
+//! this spine its inputs. See `README.md` for the current/planned surface.
 //!
 //! Provenance: clean-room from RFC 9420 (a public IETF specification, not
 //! copyrightable expression — see `CONVENTIONS.md` §5's merger-doctrine
 //! note) plus `treemath.zig`'s direct port of RFC 9420 Appendix C's own
 //! published reference algorithm (the RFC's stated intent — it publishes
 //! runnable code, not just prose, specifically so implementations match
-//! it exactly). `kat_test.zig`/`kat_treekem_test.zig` embed official
+//! it exactly). The four `kat_*_test.zig` harnesses embed official
 //! `mlswg/mls-implementations` interop vectors — public conformance DATA,
 //! not copyrightable expression, same posture as this repo's `bn254`/
 //! `bls12_381` KAT sources; see `NOTICE` for the exact commit/fetch-date
@@ -71,6 +93,8 @@ pub const treemath = @import("treemath.zig");
 pub const tree = @import("tree.zig");
 pub const treehash = @import("treehash.zig");
 pub const treekem = @import("treekem.zig");
+pub const keyschedule = @import("keyschedule.zig");
+pub const secrettree = @import("secrettree.zig");
 pub const gate = @import("gate.zig");
 
 // Flat re-exports of the surface most callers want.
@@ -98,6 +122,28 @@ pub const rootHash = treehash.rootHash;
 pub const UpdatePath = treekem.UpdatePath;
 pub const UpdatePathNode = treekem.UpdatePathNode;
 pub const HPKECiphertext = treekem.HPKECiphertext;
+
+pub const GroupContext = keyschedule.GroupContext;
+pub const ProtocolVersion = keyschedule.ProtocolVersion;
+pub const EpochSecrets = keyschedule.EpochSecrets;
+pub const deriveEpoch = keyschedule.deriveEpoch;
+pub const zeroSecret = keyschedule.zeroSecret;
+pub const externalKeyPair = keyschedule.externalKeyPair;
+pub const mlsExporter = keyschedule.mlsExporter;
+pub const confirmationTag = keyschedule.confirmationTag;
+pub const verifyConfirmationTag = keyschedule.verifyConfirmationTag;
+pub const membershipTag = keyschedule.membershipTag;
+pub const verifyMembershipTag = keyschedule.verifyMembershipTag;
+pub const PreSharedKeyId = keyschedule.PreSharedKeyId;
+pub const PreSharedKey = keyschedule.PreSharedKey;
+pub const pskSecret = keyschedule.pskSecret;
+
+pub const SecretTreeError = secrettree.Error;
+pub const RatchetKind = secrettree.RatchetKind;
+pub const ratchetBaseSecret = secrettree.ratchetBaseSecret;
+pub const Ratchet = secrettree.Ratchet;
+pub const Window = secrettree.Window;
+pub const senderDataKeys = secrettree.senderDataKeys;
 
 pub const meta = .{
     .platform = .any,
@@ -130,8 +176,12 @@ test {
     _ = tree;
     _ = treehash;
     _ = treekem;
+    _ = keyschedule;
+    _ = secrettree;
     _ = gate;
     _ = @import("kat_treekem_test.zig");
+    _ = @import("kat_keyschedule_test.zig");
+    _ = @import("kat_secrettree_test.zig");
 }
 
 test "meta.deps is exactly {\"hpke\"}" {

@@ -16,6 +16,12 @@ define (`crypto.zig`), the ratchet tree's pure integer math
 (`codec.zig`). Part 1 deliberately builds NO group state, NO TreeKEM
 key-derivation-along-a-path, NO KeyPackage/Proposal/Commit message types,
 and NO key schedule — those are later parts (see "Arc breakdown" below).
+**Part 2** (TreeKEM) and **Part 4** (key schedule + secret tree) have since
+landed; between them the module now covers the whole cryptographic spine of
+an epoch — given a ratchet tree and a transcript, every key the epoch uses
+is derivable and interop-verified. What is still missing before a client
+can send or receive anything is Part 3's `KeyPackage` and Part 5's
+Proposal/Commit/framing.
 
 ## Design & invariants
 
@@ -115,7 +121,7 @@ parent-hash validation logic does (see Part 2 below).
 | **1 (this part)** | Cipher suite, labeled crypto, tree math, codec | **Sonnet** | `tree-math.json`, `crypto-basics.json` |
 | **2 — TreeKEM** | `LeafNode`/`ParentNode`/`Node`/`RatchetTree` + wire codec + tree-shape edits (§7.1/§7.2/§7.7/§12.1.1-3) + tree-hash (§7.8) — Sonnet, DONE. `resolution` (§4.1), `parentHash`+chain validation (§7.9), path-secret-derivation-and-UpdatePath (§7.4-§7.6) — **IMPLEMENTED + KAT-pinned 2026-07-16, Fable**. Whole part **COMPLETE**. | Split tier: the data/codec/tree-hash/tree-editing is mechanical (Sonnet, KAT'd byte-exact); the five cores are the genuinely hard piece the task brief flags — subtle recursive tree-validation logic with real security consequences if wrong (a forged parent-hash or a wrong resolution set can let a malicious member inject an unauthorized key into another member's derived path) — the "hardest TIER, not crypto-only" bar this repo's Fable pool applies, now pinned byte-exact | `tree-operations.json` (real), `tree-validation.json` (tree-hash/leaf-signature + resolution + parent-hash accept/tamper), `treekem.json` (`processUpdatePath` + `applyUpdatePath`) — all byte-exact, gate now `true`; see "Part 2 — TreeKEM" below |
 | **3 — LeafNode / KeyPackage / Credential** | §5.3 credentials, §7.2/§7.3 `LeafNode` content + validation (`leaf_node_validation.json`), `KeyPackage` (§10) wire format + validation | **Sonnet** — mostly `codec.zig`-shaped serialization plus signature verification (`SignWithLabel`/`VerifyWithLabel` from THIS part) over well-specified structs; the validation RULES (§7.3's numbered list) are mechanical checks, not novel crypto | `key-package-validation.json`, `leaf-node-validation.json` |
-| **4 — Key Schedule** | §8's full `init_secret_[n-1] → ... → init_secret_[n]` chain, §8.1 `GroupContext`, §9 Secret Tree (`DeriveTreeSecret` from THIS part slots in directly) | **Sonnet** — pure composition of `ExpandWithLabel`/`DeriveSecret` (already built) over a well-specified derivation graph; the only subtlety is getting the derivation ORDER exactly right, which the RFC's own diagram (Figure 22) pins unambiguously | `key-schedule.json`, `secret-tree.json`, `message-protection.json` |
+| **4 — Key Schedule + Secret Tree** | §8's full `init_secret_[n-1] → ... → init_secret_[n]` chain, §8.1 `GroupContext`, §8.4 `psk_secret`, §8.5 exporter, §6.1's two MACs, §9 Secret Tree + sender ratchets, §6.3.2 sender-data keys — **DONE 2026-07-28**, whole part **COMPLETE** except §8.2 (transcript hashes, needs Part 5) and §8.3 (external init, needs Part 6) | **Sonnet** — pure composition of `ExpandWithLabel`/`DeriveSecret` (already built) over a well-specified derivation graph. One correction to the original note below: Figure 22 pins the ORDER unambiguously, but Figure 24 (§8.4's PSK chain) does NOT — it contradicts its own prose on the Extract argument order, and only the vector settles it | `key-schedule.json`, `secret-tree.json`, `psk_secret.json` — all byte-exact; see "Part 4" below |
 | **5 — Proposal / Commit / framing** | §11-§12 Proposal types, Commit processing, `PublicMessage`/`PrivateMessage` framing + the membership/confirmation MACs | **Sonnet** — mechanical message-type composition over Parts 1-4's primitives, EXCEPT the Commit-processing state machine's interaction with TreeKEM (applying a Commit's proposals correctly against the ratchet tree) which leans on Part 2's resolution logic being right | `messages.json`, `commit-processing` vectors |
 | **6 — External Commit / PSK / Reinit / Sub-group ops** | §12.4.3 external Commit, §8's `psk_secret` injection (§13), §16's reinit/branch | **Sonnet**, lowest priority — genuinely-used-but-optional MLS features; defer until a real consumer needs them (this repo's std/dedup consumer-check convention) | — |
 
@@ -246,6 +252,107 @@ than duplicating the contracts here (SPEC.md's non-overlap rule,
 `GroupContext` — that type is Part 4's (Key Schedule) job per the Arc
 breakdown table; Part 2 doesn't build it just to pass a parameter through.
 
+## Part 4 — Key Schedule + Secret Tree (2026-07-28)
+
+**Files:** `keyschedule.zig` (RFC 9420 §8's epoch chain, §8.1's
+`GroupContext`, §8.4's `PreSharedKeyID`/`PSKLabel`/`psk_secret`, §8.5's
+`MLS-Exporter`, `external_pub`, and §6.1's `confirmation_tag`/
+`membership_tag`), `secrettree.zig` (§9's secret tree, §9.1's sender
+ratchets and the out-of-order `Window`, §6.3.2's sender-data key/nonce),
+`kat_keyschedule_test.zig`, `kat_secrettree_test.zig`. Two small additions
+to Part 1's files were needed and are described below.
+
+### What it is verified against
+
+| Vector | Drives | Checked |
+|---|---|---|
+| `key-schedule.json` | `GroupContext.encode`/`decode`, `joinerSecret`, `welcomeSecret`, `epochSecret`, `deriveEpoch`, `externalKeyPair`, `mlsExporter` | Every stage of a five-epoch chain, per stage and per Table 4 row, byte-exact — including the encoded `GroupContext` itself, in both directions |
+| `psk_secret.json` | `PreSharedKeyId.encode`, `PskLabel`, `pskSecret` | Chains of 0 through 10 PSKs, byte-exact, including the empty-list case (§8.4's all-zero `psk_secret_[0]`) |
+| `secret-tree.json` | `nodeSecret`, `ratchetBaseSecret`, `Ratchet`, `Window`, `senderDataKeys` | 1/8/32-leaf trees; every named generation of both ratchets of every leaf, byte-exact, driven twice (forward through `Ratchet`, in reverse through `Window`) |
+
+Every vector matched on the first run — no stage needed adjusting, and no
+vector was edited. The harness's teeth were then confirmed the only way
+that means anything: one byte was flipped in each of the three files
+(`key-schedule.json`'s epoch-0 `joiner_secret`, `secret-tree.json`'s leaf-0
+generation-0 `application_key`, `psk_secret.json`'s one-PSK `psk_secret`)
+and each produced a failure naming that exact stage; the files were then
+restored and re-verified by SHA-256 against the fetched originals (hashes
+recorded in `NOTICE`).
+
+### The one genuine ambiguity in §8, and how it was resolved
+
+RFC 9420 §8.4 specifies the PSK chain's second Extract twice, and the two
+specifications disagree:
+
+- the **prose** says `psk_secret_[i] = KDF.Extract(psk_input_[i-1],
+  psk_secret_[i-1])` — i.e. salt = `psk_input`, IKM = `psk_secret`;
+- **Figure 24** draws `psk_secret_[i-1]` entering that Extract from the
+  TOP, and §8's own figure legend states that the top argument is the salt
+  — i.e. the opposite assignment.
+
+`pskSecret` follows the prose. This is not a coin flip: the alternative was
+implemented and run, and `psk_secret.json` rejects it (the `psk_secret`
+stage diverges while every other stage still passes). Recorded here because
+the next reader of Figure 24 will have the same doubt.
+
+Note that the KAT is what makes this decidable at all — both readings
+produce well-distributed output, and no round-trip or self-consistency test
+could tell them apart.
+
+### Changes to Part 1's files
+
+- **`crypto.kdfLabelLen` + `crypto.ExpandWithLabelScratch`** (new). Part 1's
+  Backlog predicted that a `GroupContext` with extensions would outgrow
+  `ExpandWithLabel`'s fixed 512-byte scratch, and the key schedule is that
+  consumer: it feeds an encoded `GroupContext` in as `Context` twice per
+  epoch. Rather than widening the constant to some new arbitrary number,
+  the caller can now size the scratch exactly. `ExpandWithLabel` is
+  unchanged for everyone else — it simply delegates. This closes that
+  Backlog item.
+- **`suite.CipherSuite.Mac` / `.Nm`** (new). RFC 9420 §17.1's text under
+  Table 7: the non-GREASE suites use HMAC with the suite's hash as their
+  MAC. Derived from `Hash`, never independently declared, so a suite's
+  `confirmation_tag` can't drift from its transcript hash.
+
+### The out-of-order window is policy, not spec
+
+§9.2 says only that members "MAY keep unconsumed values around for some
+reasonable amount of time". `secrettree.Window` makes that concrete with
+two limits that exist for security rather than memory, and are exposed as
+parameters rather than buried:
+
+- **consume-once**: `get` erases the key/nonce it returns, so a replayed
+  message fails `error.GenerationConsumed` instead of decrypting twice;
+- **bounded forward jump** (`max_forward_jump`, default 1024): the
+  generation is an unauthenticated `uint32` read off the wire, so an
+  unbounded ratchet-forward would let four bytes buy four billion KDF
+  invocations.
+
+Capacity is a compile-time parameter and the ring is fixed-size — no
+allocator, so retained-key memory is a constant the caller can reason about
+rather than attacker-driven growth.
+
+### Scope boundary, stated precisely
+
+Two of §8's subsections are NOT implemented, and the reason in both cases
+is a missing input rather than a missing algorithm:
+
+- **§8.2 transcript hashes** hash an encoded `AuthenticatedContent`
+  (`ConfirmedTranscriptHashInput`/`InterimTranscriptHashInput`), which is a
+  Part 5 framing structure. The upstream vector for it
+  (`transcript-hashes.json`) supplies a serialized `AuthenticatedContent`
+  and therefore cannot be driven before Part 5 either.
+- **§8.3 external initialization** needs an HPKE `SetupBaseS`/`SetupBaseR`
+  context (the sibling `hpke` module exposes `sealBase`/`openBase` but not
+  a bare setup returning a `Context`), and is only reachable through Part
+  6's external-commit flow.
+
+Both are named in `keyschedule.zig`'s module doc comment so the omission is
+discoverable from the code, not only from here. `confirmation_tag` and
+`membership_tag` themselves ARE implemented — they consume Part 4's keys —
+but their inputs are assembled by Part 5, so they take already-encoded
+bytes.
+
 ## Threat model
 
 - **`codec.Reader` on hostile input.** Every `read*` function is bounds-
@@ -284,6 +391,28 @@ breakdown table; Part 2 doesn't build it just to pass a parameter through.
   an already-constructed `KeyPair`/`PublicKey`) — key generation, storage,
   and rotation are entirely the caller's (a later part's KeyPackage
   lifecycle) responsibility, mirroring `hpke`'s own scoping.
+- **A forged `generation` on an inbound message (Part 4).** The generation
+  in a `SenderData` is a `uint32` that has not been authenticated at the
+  point the receiver must use it to find a key. `secrettree.Window` bounds
+  the resulting work with `max_forward_jump` (default 1024) — without it,
+  four attacker-chosen bytes would buy up to 2^32 KDF invocations per
+  message. Rejection is `error.GenerationTooFarAhead`, cheap and typed.
+- **Replay of a captured message (Part 4).** `Window.get` erases each
+  key/nonce as it hands it out, so a generation can be served at most once;
+  a replay gets `error.GenerationConsumed`. This is stronger than §9.2
+  requires (which speaks only of deleting consumed values) and is what
+  turns the deletion schedule into an actual anti-replay property rather
+  than only a forward-secrecy one.
+- **MAC comparison (Part 4).** `verifyConfirmationTag`/`verifyMembershipTag`
+  compare with `std.crypto.timing_safe.eql`, never `std.mem.eql` — both
+  tags arrive from the network. Length is checked before the compare so a
+  short tag cannot alias into a partial match.
+- **Key material lifetime (Part 4).** `EpochSecrets.wipe`, `Ratchet.wipe`,
+  `Window.wipe` and `KeyNonce.wipe` use `std.crypto.secureZero`, and
+  `Ratchet.advance` overwrites the secret it derived from in place rather
+  than dropping it — a ratchet that could be rewound would defeat §9.2's
+  point. Calling `wipe` at the right moment is still the caller's decision;
+  this module provides the mechanism, not the schedule.
 - **`EncryptWithLabel`'s randomness source.** Takes `io: std.Io` and draws
   a fresh ephemeral KEM keypair per call via `hpke.sealBase` (never an
   injected/fixed ephemeral in the real entry point) — the KAT's
@@ -295,12 +424,21 @@ breakdown table; Part 2 doesn't build it just to pass a parameter through.
 
 ## Backlog
 
-- **Scratch-buffer size (512 bytes) may need revisiting once `GroupContext`
-  (Part 4) exists** — a `GroupContext` with several MLS extensions could
-  plausibly exceed 512 bytes as an `ExpandWithLabel` `context` argument.
-  Options when that part lands: widen `label_scratch_len`, or add a
-  caller-supplied-scratch-slice overload alongside the current
-  fixed-buffer convenience functions.
+- **Scratch-buffer size (512 bytes) — RESOLVED 2026-07-28** by the second
+  of the two options this item listed: `crypto.ExpandWithLabelScratch` takes
+  a caller-supplied slice and `crypto.kdfLabelLen` sizes it exactly, while
+  `ExpandWithLabel` keeps the fixed-buffer convenience for the bounded
+  callers. `keyschedule.zig` uses it for the two `GroupContext`-carrying
+  derivations; a regression test drives a 4 KB context through both entry
+  points and asserts the fixed one refuses rather than truncates.
+- **The secret tree's non-power-of-two tree shape is not vector-covered.**
+  `secrettree.nodeSecret` walks `treemath`'s truncated tree, which is what
+  §9 requires ("the same structure as the group's ratchet tree"), but
+  `secret-tree.json` only publishes trees of 1, 8 and 32 leaves — all
+  powers of two. The truncated-tree path is therefore reasoned-correct (it
+  reuses Part 1's already-vector-pinned `treemath`) rather than
+  externally anchored. A later part that builds a real group of, say, 5
+  members exercises it for free.
 - **Part 2 (TreeKEM) vector fetch/audit — DONE 2026-07-16**, see "Part 2 —
   TreeKEM" above (was previously listed here as not-yet-done).
 - **`treemath.zig`'s `common_ancestor_semantic`/`common_ancestor_direct`**

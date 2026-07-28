@@ -20,6 +20,14 @@
 //! commit-secret vectors (62 update paths, 328 receiver views, and 62
 //! merges reproducing `tree_hash_after`).
 //!
+//! **This file gates Part 2 and only Part 2.** Part 4 (`keyschedule.zig`/
+//! `secrettree.zig`, RFC 9420 §8/§9) deliberately adds no switch of its
+//! own: every function in it is real and every one is driven byte-exact by
+//! `key-schedule.json`/`psk_secret.json`/`secret-tree.json`, so there is
+//! nothing to stage. A gate constant that is always `true` for work that
+//! was never staged would be exactly the "describes finished work as
+//! provisional" noise this module has been keeping out.
+//!
 //! The switch is retained (rather than deleted) so the ratchet-tree data/
 //! codec/tree-hash/tree-editing layer stays independently testable should a
 //! future refactor of the five cores need staging again — flipping it back

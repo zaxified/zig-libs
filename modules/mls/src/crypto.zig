@@ -131,14 +131,47 @@ fn encodeKdfLabel(buf: []u8, length: u16, label: []const u8, context: []const u8
     return w.finish();
 }
 
+/// The exact number of bytes `encodeKdfLabel` will write for this
+/// (`label`, `context`) pair — i.e. the smallest scratch buffer
+/// `ExpandWithLabelScratch` can succeed with. Exposed because the KEY
+/// SCHEDULE (RFC 9420 §8) derives `joiner_secret`/`epoch_secret` with a
+/// serialized `GroupContext` as `Context`, and a `GroupContext` carrying
+/// group extensions has NO fixed upper bound — exactly the case this
+/// file's module doc comment flagged as needing more than
+/// `label_scratch_len`. Returns `error.VarintTooLarge` if either field is
+/// too long to be varint-length-prefixed at all.
+pub fn kdfLabelLen(label: []const u8, context: []const u8) Error!usize {
+    const full_label_len = mls10_label_prefix.len + label.len;
+    return 2 // uint16 length
+    + try codec.varint.encodedLen(full_label_len) + full_label_len +
+        try codec.varint.encodedLen(context.len) + context.len;
+}
+
+/// `ExpandWithLabel` over a CALLER-SUPPLIED scratch buffer, for contexts
+/// with no compile-time size bound (a serialized `GroupContext`). Size
+/// `scratch` with `kdfLabelLen(label, context)`; anything smaller yields
+/// `error.LabelTooLong`.
+pub fn ExpandWithLabelScratch(
+    comptime S: type,
+    secret: [S.Nh]u8,
+    label: []const u8,
+    context: []const u8,
+    out: []u8,
+    scratch: []u8,
+) Error!void {
+    const length = std.math.cast(u16, out.len) orelse return error.LabelTooLong;
+    const info = encodeKdfLabel(scratch, length, label, context) catch return error.LabelTooLong;
+    S.Hkdf.expand(out, info, secret);
+}
+
 /// RFC 9420 §8 `ExpandWithLabel(Secret, Label, Context, Length) =
 /// KDF.Expand(Secret, KDFLabel, Length)`. Writes exactly `out.len` bytes
-/// (`Length = out.len`).
+/// (`Length = out.len`). Uses this file's fixed `label_scratch_len` stack
+/// buffer — see `ExpandWithLabelScratch` when `context` can be arbitrarily
+/// large.
 pub fn ExpandWithLabel(comptime S: type, secret: [S.Nh]u8, label: []const u8, context: []const u8, out: []u8) Error!void {
-    const length = std.math.cast(u16, out.len) orelse return error.LabelTooLong;
     var buf: [label_scratch_len]u8 = undefined;
-    const info = encodeKdfLabel(&buf, length, label, context) catch return error.LabelTooLong;
-    S.Hkdf.expand(out, info, secret);
+    return ExpandWithLabelScratch(S, secret, label, context, out, &buf);
 }
 
 /// RFC 9420 §8 `DeriveSecret(Secret, Label) = ExpandWithLabel(Secret,
@@ -285,6 +318,29 @@ test "DeriveSecret: equals ExpandWithLabel(secret, label, \"\", Nh)" {
     var want: [TestSuite.Nh]u8 = undefined;
     try ExpandWithLabel(TestSuite, secret, "test label", "", &want);
     try testing.expectEqualSlices(u8, &want, &got);
+}
+
+test "kdfLabelLen: matches what encodeKdfLabel actually writes, and sizes ExpandWithLabelScratch exactly" {
+    const secret = [_]u8{0x33} ** TestSuite.Nh;
+    // A context far larger than `label_scratch_len` — the GroupContext-with-
+    // extensions case `ExpandWithLabel`'s fixed buffer cannot serve.
+    const big_context = [_]u8{0xab} ** 4096;
+    const label = "epoch";
+
+    const need = try kdfLabelLen(label, &big_context);
+    var buf: [4200]u8 = undefined;
+    const encoded = try encodeKdfLabel(buf[0..need], 32, label, &big_context);
+    try testing.expectEqual(need, encoded.len);
+
+    // The fixed-buffer entry point must REFUSE rather than truncate.
+    var out_fixed: [TestSuite.Nh]u8 = undefined;
+    try testing.expectError(error.LabelTooLong, ExpandWithLabel(TestSuite, secret, label, &big_context, &out_fixed));
+
+    // The scratch entry point succeeds at exactly `need` bytes, and fails
+    // one byte short.
+    var out: [TestSuite.Nh]u8 = undefined;
+    try ExpandWithLabelScratch(TestSuite, secret, label, &big_context, &out, buf[0..need]);
+    try testing.expectError(error.LabelTooLong, ExpandWithLabelScratch(TestSuite, secret, label, &big_context, &out, buf[0 .. need - 1]));
 }
 
 test "DeriveTreeSecret: context is the big-endian uint32 generation" {
