@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: MIT
 //! HPKE key schedule + encryption context (RFC 9180 §5): `KeySchedule`
 //! (§5.1, mode/PSK/info -> `Context`), `Context.seal`/`.open`/
-//! `.exportSecret` (§5.2/§5.3), and §6.1's single-shot wrappers for all
-//! four modes — `sealBase`/`sealPsk`/`sealAuth`/`sealAuthPsk` and their
-//! `open*` mirrors. All REAL (crypto-implementation pass done) —
+//! `.exportSecret` (§5.2/§5.3), §5.1's own `setupBaseS`/`setupBaseR` (+
+//! `psk`/`auth`/`auth_psk` variants) which hand back the `Context` itself
+//! for multi-message/export-only use, and §6.1's single-shot wrappers for
+//! all four modes — `sealBase`/`sealPsk`/`sealAuth`/`sealAuthPsk` and their
+//! `open*` mirrors, now thin compositions over the `setup*` functions. All
+//! REAL (crypto-implementation pass done) —
 //! KAT-validated against RFC 9180 Appendix A.1's published
 //! key/base_nonce/exporter_secret, all 6 encryption tuples, and all 3
 //! exported values, in every mode (A.1.1/A.1.2/A.1.3/A.1.4, plus the
@@ -291,6 +294,254 @@ pub fn Sealed(comptime Kem: type) type {
     return struct { enc: Kem.EncappedKey };
 }
 
+// ── setup: obtain the multi-message Context itself (RFC 9180 §5.1 ──────
+// `SetupBaseS`/`SetupBaseR` + the psk/auth/auth_psk variants) ───────────
+//
+// The single-shot `seal*`/`open*` wrappers above run `KeySchedule` and then
+// immediately consume the resulting `Context` for exactly ONE `Seal`/`Open`
+// — the RFC's §6.1 convenience layer, for the (extremely common) one-message
+// case. §5.1 itself is one layer lower: `SetupBaseS(pkR, info)` etc. return
+// the encapsulation and the `Context`, full stop — no assumption that the
+// caller wants to seal anything at all. A caller that only ever wants
+// `Context.Export` (RFC 9420 MLS's external-init/external-commit, §8.3/
+// §12.4 — derive `init_secret` from an HPKE exchange, never `Seal`/`Open`
+// a message through it) needs exactly this layer, not §6.1's.
+//
+// `setup*S`/`setup*R` are additive: they call the exact same
+// `Kem.encap*`/`Kem.decap*`/`Kem.authEncap*`/`Kem.authDecap*` + `keySchedule`
+// steps the single-shot wrappers already call (see `setupEncapped`/
+// `setupDecapped` below, which `sealEncapped`/`openDecapped` now compose
+// over too) — no new crypto, just a stopping point one step earlier that
+// hands back the `Context` instead of consuming it.
+
+/// `setup*S`/`setup*SDeterministic`'s result: the `enc` the sender must
+/// transmit, paired with the `Context` the caller now owns for as many
+/// `seal`/`open`/`exportSecret` calls as its protocol needs — unlike
+/// `Sealed`, which is `sealBase`'s single-shot return with no `Context`
+/// exposed at all.
+pub fn Setup(comptime Kem: type, comptime Aead: type, comptime Nh: usize) type {
+    return struct { enc: Kem.EncappedKey, context: Context(Aead, Nh) };
+}
+
+/// The post-KEM half of every `setup*S` entry point below: `KeySchedule(mode,
+/// shared_secret, info, psk, psk_id)`, packaged with the `enc` the sender
+/// must transmit. `sealEncapped` (the single-shot `Seal*` wrappers' shared
+/// body, further down) is now a thin wrapper over this plus one
+/// `Context.seal` — see that function's doc comment.
+fn setupEncapped(
+    comptime Kem: type,
+    comptime Aead: type,
+    comptime Nh: usize,
+    encapped: Kem.Encapped,
+    mode: suite.Mode,
+    info: []const u8,
+    psk: []const u8,
+    psk_id: []const u8,
+) !Setup(Kem, Aead, Nh) {
+    const suite_id = comptime suiteIdOf(Kem, Aead);
+    const context = try keySchedule(Aead, Nh, mode, &suite_id, &encapped.shared_secret, info, psk, psk_id);
+    return .{ .enc = encapped.enc, .context = context };
+}
+
+/// The post-KEM half of every `setup*R` entry point below — the mirror of
+/// `setupEncapped`. `openDecapped` is now a thin wrapper over this plus one
+/// `Context.open`.
+fn setupDecapped(
+    comptime Kem: type,
+    comptime Aead: type,
+    comptime Nh: usize,
+    shared_secret: [Kem.Nsecret]u8,
+    mode: suite.Mode,
+    info: []const u8,
+    psk: []const u8,
+    psk_id: []const u8,
+) !Context(Aead, Nh) {
+    const suite_id = comptime suiteIdOf(Kem, Aead);
+    return keySchedule(Aead, Nh, mode, &suite_id, &shared_secret, info, psk, psk_id);
+}
+
+/// RFC 9180 §5.1 `SetupBaseS(pkR, info)`: `Encap(pkR)` then
+/// `KeySchedule(mode_base, shared_secret, info, "", "")`, returning `enc`
+/// alongside the `Context` itself (contrast `sealBase`, which consumes the
+/// `Context` for exactly one `Seal` and never exposes it).
+pub fn setupBaseS(
+    comptime Kem: type,
+    comptime Aead: type,
+    comptime Nh: usize,
+    pkR: Kem.PublicKey,
+    io: std.Io,
+    info: []const u8,
+) !Setup(Kem, Aead, Nh) {
+    return setupBaseSDeterministic(Kem, Aead, Nh, pkR, Kem.generateKeyPair(io), info);
+}
+
+/// `setupBaseS` with the ephemeral keypair injected instead of drawn from
+/// `io` — the KAT seam, same pattern as `sealBaseDeterministic`. Real
+/// callers want `setupBaseS`.
+pub fn setupBaseSDeterministic(
+    comptime Kem: type,
+    comptime Aead: type,
+    comptime Nh: usize,
+    pkR: Kem.PublicKey,
+    eph: Kem.KeyPair,
+    info: []const u8,
+) !Setup(Kem, Aead, Nh) {
+    return setupEncapped(Kem, Aead, Nh, try Kem.encapDeterministic(pkR, eph), .base, info, "", "");
+}
+
+/// RFC 9180 §5.1 `SetupBaseR(enc, skR, info)` — the receiver mirror of
+/// `setupBaseS`: `Decap(enc, skR)` then the same `KeySchedule` call,
+/// returning the `Context` alone (the receiver already has `enc` — nothing
+/// to echo back).
+pub fn setupBaseR(
+    comptime Kem: type,
+    comptime Aead: type,
+    comptime Nh: usize,
+    enc: Kem.EncappedKey,
+    skR: Kem.KeyPair,
+    info: []const u8,
+) !Context(Aead, Nh) {
+    return setupDecapped(Kem, Aead, Nh, try Kem.decap(enc, skR), .base, info, "", "");
+}
+
+/// RFC 9180 §5.1 `SetupPSKS(pkR, info, psk, psk_id)` — `setupBaseS`'s
+/// psk-mode sibling, parameter order matching `sealPsk` (minus `aad`/`pt`/
+/// `out`). `psk` MUST be at least `Nh` bytes (§5.1.2); `keySchedule`
+/// enforces that, `error.PskTooShort`.
+pub fn setupPskS(
+    comptime Kem: type,
+    comptime Aead: type,
+    comptime Nh: usize,
+    pkR: Kem.PublicKey,
+    io: std.Io,
+    info: []const u8,
+    psk: []const u8,
+    psk_id: []const u8,
+) !Setup(Kem, Aead, Nh) {
+    return setupPskSDeterministic(Kem, Aead, Nh, pkR, Kem.generateKeyPair(io), info, psk, psk_id);
+}
+
+/// `setupPskS` with the ephemeral keypair injected — the KAT seam.
+pub fn setupPskSDeterministic(
+    comptime Kem: type,
+    comptime Aead: type,
+    comptime Nh: usize,
+    pkR: Kem.PublicKey,
+    eph: Kem.KeyPair,
+    info: []const u8,
+    psk: []const u8,
+    psk_id: []const u8,
+) !Setup(Kem, Aead, Nh) {
+    return setupEncapped(Kem, Aead, Nh, try Kem.encapDeterministic(pkR, eph), .psk, info, psk, psk_id);
+}
+
+/// RFC 9180 §5.1 `SetupPSKR(enc, skR, info, psk, psk_id)` — the receiver
+/// mirror of `setupPskS`.
+pub fn setupPskR(
+    comptime Kem: type,
+    comptime Aead: type,
+    comptime Nh: usize,
+    enc: Kem.EncappedKey,
+    skR: Kem.KeyPair,
+    info: []const u8,
+    psk: []const u8,
+    psk_id: []const u8,
+) !Context(Aead, Nh) {
+    return setupDecapped(Kem, Aead, Nh, try Kem.decap(enc, skR), .psk, info, psk, psk_id);
+}
+
+/// RFC 9180 §5.1 `SetupAuthS(pkR, info, skS)` — `setupBaseS`'s auth-mode
+/// sibling: `AuthEncap(pkR, skS)` then `KeySchedule(mode_auth, ...)`.
+/// Parameter order matches `sealAuth` (minus `aad`/`pt`/`out`).
+pub fn setupAuthS(
+    comptime Kem: type,
+    comptime Aead: type,
+    comptime Nh: usize,
+    pkR: Kem.PublicKey,
+    skS: Kem.KeyPair,
+    io: std.Io,
+    info: []const u8,
+) !Setup(Kem, Aead, Nh) {
+    return setupAuthSDeterministic(Kem, Aead, Nh, pkR, skS, Kem.generateKeyPair(io), info);
+}
+
+/// `setupAuthS` with the ephemeral keypair injected — the KAT seam. `eph`
+/// and the sender's static keypair `skS` are DIFFERENT keys, exactly as in
+/// `sealAuthDeterministic`.
+pub fn setupAuthSDeterministic(
+    comptime Kem: type,
+    comptime Aead: type,
+    comptime Nh: usize,
+    pkR: Kem.PublicKey,
+    skS: Kem.KeyPair,
+    eph: Kem.KeyPair,
+    info: []const u8,
+) !Setup(Kem, Aead, Nh) {
+    return setupEncapped(Kem, Aead, Nh, try Kem.authEncapDeterministic(pkR, skS, eph), .auth, info, "", "");
+}
+
+/// RFC 9180 §5.1 `SetupAuthR(enc, skR, info, pkS)` — the receiver mirror of
+/// `setupAuthS`; `pkS` is REQUIRED, exactly as in `openAuth`.
+pub fn setupAuthR(
+    comptime Kem: type,
+    comptime Aead: type,
+    comptime Nh: usize,
+    enc: Kem.EncappedKey,
+    skR: Kem.KeyPair,
+    pkS: Kem.PublicKey,
+    info: []const u8,
+) !Context(Aead, Nh) {
+    return setupDecapped(Kem, Aead, Nh, try Kem.authDecap(enc, skR, pkS), .auth, info, "", "");
+}
+
+/// RFC 9180 §5.1 `SetupAuthPSKS(pkR, info, psk, psk_id, skS)` — both
+/// authenticators at once. Parameter order matches `sealAuthPsk` (minus
+/// `aad`/`pt`/`out`).
+pub fn setupAuthPskS(
+    comptime Kem: type,
+    comptime Aead: type,
+    comptime Nh: usize,
+    pkR: Kem.PublicKey,
+    skS: Kem.KeyPair,
+    io: std.Io,
+    info: []const u8,
+    psk: []const u8,
+    psk_id: []const u8,
+) !Setup(Kem, Aead, Nh) {
+    return setupAuthPskSDeterministic(Kem, Aead, Nh, pkR, skS, Kem.generateKeyPair(io), info, psk, psk_id);
+}
+
+/// `setupAuthPskS` with the ephemeral keypair injected — the KAT seam.
+pub fn setupAuthPskSDeterministic(
+    comptime Kem: type,
+    comptime Aead: type,
+    comptime Nh: usize,
+    pkR: Kem.PublicKey,
+    skS: Kem.KeyPair,
+    eph: Kem.KeyPair,
+    info: []const u8,
+    psk: []const u8,
+    psk_id: []const u8,
+) !Setup(Kem, Aead, Nh) {
+    return setupEncapped(Kem, Aead, Nh, try Kem.authEncapDeterministic(pkR, skS, eph), .auth_psk, info, psk, psk_id);
+}
+
+/// RFC 9180 §5.1 `SetupAuthPSKR(enc, skR, info, psk, psk_id, pkS)` — the
+/// receiver mirror of `setupAuthPskS`.
+pub fn setupAuthPskR(
+    comptime Kem: type,
+    comptime Aead: type,
+    comptime Nh: usize,
+    enc: Kem.EncappedKey,
+    skR: Kem.KeyPair,
+    pkS: Kem.PublicKey,
+    info: []const u8,
+    psk: []const u8,
+    psk_id: []const u8,
+) !Context(Aead, Nh) {
+    return setupDecapped(Kem, Aead, Nh, try Kem.authDecap(enc, skR, pkS), .auth_psk, info, psk, psk_id);
+}
+
 /// RFC 9180 §6.1 `SealBase(pkR, info, aad, pt)`: `Encap(pkR)` (a
 /// `dhkem.*Kem.encap` call) then `KeySchedule(mode_base, shared_secret,
 /// info, "", "")` then one `Context.Seal(aad, pt)` — a single-shot helper
@@ -364,13 +615,14 @@ pub fn openBase(
 // `psk`/`psk_id` next to the other key-schedule input (`info`). `aad`, `pt`
 // / `ct` and `out` stay last, unchanged.
 
-/// The post-KEM half of every single-shot `Seal*`: `KeySchedule(mode,
-/// shared_secret, info, psk, psk_id)` then exactly ONE `Context.Seal(aad,
-/// pt)`. `mode`'s consistency with `psk`/`psk_id` is not re-checked here —
-/// `keySchedule` owns RFC 9180 §5.1's `VerifyPSKInputs` (plus §5.1.2's PSK
-/// floor) and rejects a wrong combination with `KeyScheduleError`, so a
-/// duplicate check in each wrapper would only be a second place to get the
-/// rule wrong.
+/// The post-KEM half of every single-shot `Seal*`: `setupEncapped` (§5.1
+/// `KeySchedule`) then exactly ONE `Context.Seal(aad, pt)` — literally
+/// `setup*S` immediately followed by one seal, discarding the `Context`
+/// afterward. `mode`'s consistency with `psk`/`psk_id` is not re-checked
+/// here — `keySchedule` (reached through `setupEncapped`) owns RFC 9180
+/// §5.1's `VerifyPSKInputs` (plus §5.1.2's PSK floor) and rejects a wrong
+/// combination with `KeyScheduleError`, so a duplicate check in each
+/// wrapper would only be a second place to get the rule wrong.
 fn sealEncapped(
     comptime Kem: type,
     comptime Aead: type,
@@ -384,14 +636,13 @@ fn sealEncapped(
     pt: []const u8,
     out: []u8,
 ) !Sealed(Kem) {
-    const suite_id = comptime suiteIdOf(Kem, Aead);
-    var ctx = try keySchedule(Aead, Nh, mode, &suite_id, &encapped.shared_secret, info, psk, psk_id);
-    try ctx.seal(aad, pt, out);
-    return .{ .enc = encapped.enc };
+    var setup = try setupEncapped(Kem, Aead, Nh, encapped, mode, info, psk, psk_id);
+    try setup.context.seal(aad, pt, out);
+    return .{ .enc = setup.enc };
 }
 
 /// The post-KEM half of every single-shot `Open*` — the mirror of
-/// `sealEncapped`.
+/// `sealEncapped`: `setupDecapped` then exactly ONE `Context.Open`.
 fn openDecapped(
     comptime Kem: type,
     comptime Aead: type,
@@ -405,9 +656,8 @@ fn openDecapped(
     ct: []const u8,
     out: []u8,
 ) !void {
-    const suite_id = comptime suiteIdOf(Kem, Aead);
-    var ctx = try keySchedule(Aead, Nh, mode, &suite_id, &shared_secret, info, psk, psk_id);
-    try ctx.open(aad, ct, out);
+    var context = try setupDecapped(Kem, Aead, Nh, shared_secret, mode, info, psk, psk_id);
+    try context.open(aad, ct, out);
 }
 
 /// RFC 9180 §6.1 `SealPSK(pkR, info, aad, pt, psk, psk_id)`: `Encap(pkR)`

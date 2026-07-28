@@ -23,7 +23,7 @@ floor, `error.PskTooShort`).
 |---|---|
 | `suite.zig` | `KemId`/`KdfId`/`AeadId`/`Mode`, `i2osp`/`os2ip`, `suiteId`/`kemSuiteId`, `labeledExtract`/`labeledExpand` (§4) |
 | `dhkem.zig` | `X25519Kem`/`P256Kem`: `encap`/`encapDeterministic`/`decap`/`authEncapDeterministic`/`authDecap`/`deriveKeyPair`/`generateKeyPair` (§4.1/§7.1.1–§7.1.3) |
-| `schedule.zig` | `keySchedule` (§5.1), `Context(Aead, Nh).seal`/`.open`/`.exportSecret` (§5.2/§5.3), `computeNonce`/`incrementSeq`, and §6.1's single-shot `sealBase`/`sealPsk`/`sealAuth`/`sealAuthPsk` (+ `*Deterministic` KAT seams) with their `open*` mirrors |
+| `schedule.zig` | `keySchedule` (§5.1), `Context(Aead, Nh).seal`/`.open`/`.exportSecret` (§5.2/§5.3), `computeNonce`/`incrementSeq`, §5.1's `setupBaseS`/`setupPskS`/`setupAuthS`/`setupAuthPskS` (+ `*Deterministic` KAT seams) with their `setup*R` mirrors — return the `Context` itself, for multi-message/export-only use — and §6.1's single-shot `sealBase`/`sealPsk`/`sealAuth`/`sealAuthPsk` with their `open*` mirrors, now thin compositions over `setup*` |
 | `kat_rfc9180.zig` | RFC 9180 Appendix A vectors: A.1 in all four modes (full), A.2/A.3 headers, A.3's three non-base modes — driven end-to-end through the real implementation |
 
 - **Model after:** RFC 9180 (Hybrid Public Key Encryption).
@@ -99,6 +99,29 @@ try hpke.openAuthPsk(hpke.X25519Kem, Aes128Gcm, 32, s3.enc, skR, skS.public_key,
 `mode_auth` authenticates the sender **to this recipient only** — the
 recipient can compute the same shared secret, so it is not a signature and
 not transferable to a third party (SPEC.md, threat model).
+
+**The multi-message flow (§5.1): `setup*S`/`setup*R`.** For a caller that
+wants the `Context` itself — to seal/open more than one message, or (like
+MLS's external-init/external-commit, RFC 9420 §8.3/§12.4) to call ONLY
+`Context.exportSecret` and never seal anything — `setupBaseS`/`setupBaseR`
+(and the `psk`/`auth`/`auth_psk` siblings, same parameter shape as the
+single-shot wrappers minus `aad`/`pt`/`out`) hand back the encapsulation and
+the `Context`, not a consumed one-shot ciphertext:
+
+```zig
+const setup = try hpke.setupBaseS(hpke.X25519Kem, Aes128Gcm, 32, pkR, io, info);
+// send setup.enc to the receiver holding skR
+
+var context = try hpke.setupBaseR(hpke.X25519Kem, Aes128Gcm, 32, setup.enc, skR, info);
+
+// repeated seal/open over the SAME context:
+try setup.context.seal(aad, pt, &ct_buf);
+try context.open(aad, ct_buf[0..], &pt_buf);
+
+// or, export-only (no seal/open at all — the MLS external-init/-commit use):
+var secret: [32]u8 = undefined;
+try context.exportSecret(&suite_id, "my exporter label", &secret);
+```
 
 ## Verify
 

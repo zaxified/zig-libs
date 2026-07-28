@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: MIT
 //! hpke — Hybrid Public Key Encryption (RFC 9180): DHKEM + HKDF + AEAD
-//! composed into a single-shot "seal to a public key" / "open with a
-//! private key" API, plus a multi-message `Context` for streaming use
-//! (§5.2) and secret export for higher-level protocols to derive their own
-//! keys from an HPKE exchange (§5.3, e.g. MLS/draft-irtf-cfrg-hpke's own
-//! consumers).
+//! composed into §5.1's `setupBaseS`/`setupBaseR` (+ psk/auth/auth_psk
+//! variants) — encapsulate/decapsulate to a public key and hand back the
+//! multi-message `Context` itself — plus §6.1's single-shot "seal to a
+//! public key" / "open with a private key" wrappers built as thin
+//! compositions over that same `setup*`/`Context` pair. `Context.seal`/
+//! `.open` (§5.2) serve repeated messages; `Context.exportSecret` (§5.3)
+//! lets higher-level protocols derive their own keys from an HPKE exchange
+//! without ever sealing a message through it (e.g. MLS/RFC 9420's
+//! external-init and external-commit, §8.3/§12.4).
 //!
 //! **Status: crypto-implementation pass DONE — every core is real and
 //! KAT-validated** against RFC 9180 Appendix A, byte-exact, in ALL FOUR
@@ -21,7 +25,7 @@
 //! |---|---|
 //! | `suite.zig` | Suite/KEM id constants, `Mode`, `I2OSP`/`OS2IP`, `suite_id`/`kem_suite_id` construction, `LabeledExtract`/`LabeledExpand` (§4) |
 //! | `dhkem.zig` | `X25519Kem`/`P256Kem`: `Encap`/`Decap`/`AuthEncap`/`AuthDecap`/`DeriveKeyPair`/`generateKeyPair` (§4.1/§7.1.1-§7.1.3) |
-//! | `schedule.zig` | `KeySchedule` (§5.1), `Context.seal`/`.open`/`.exportSecret` (§5.2/§5.3), `computeNonce`/`incrementSeq`, and §6.1's single-shot `sealBase`/`sealPsk`/`sealAuth`/`sealAuthPsk` + their `open*` mirrors |
+//! | `schedule.zig` | `KeySchedule` (§5.1), `Context.seal`/`.open`/`.exportSecret` (§5.2/§5.3), `computeNonce`/`incrementSeq`, §5.1's `setupBaseS`/`setupPskS`/`setupAuthS`/`setupAuthPskS` + their `setup*R` mirrors (return the `Context` itself), and §6.1's single-shot `sealBase`/`sealPsk`/`sealAuth`/`sealAuthPsk` + their `open*` mirrors (thin compositions over `setup*` + one `Context.seal`/`.open`) |
 //! | `kat_rfc9180.zig` | RFC 9180 Appendix A known-answer vectors (A.1 all four modes, A.2/A.3 headers, A.3 all three non-base modes), driven end-to-end |
 //!
 //! The `auth`/`auth_psk` KEM folds (`AuthEncap`/`AuthDecap`) are anchored
@@ -57,6 +61,26 @@ pub const P256Kem = dhkem.P256Kem;
 
 pub const Context = schedule.Context;
 pub const keySchedule = schedule.keySchedule;
+
+// RFC 9180 §5.1's `Setup*S`/`Setup*R` pairs, one per mode — the
+// multi-message counterpart to §6.1's single-shot `Seal*`/`Open*` pairs
+// below: returns the `Context` itself (plus `enc`, for the sender) instead
+// of consuming it for one `Seal`/`Open`. This is what a protocol layered
+// over HPKE that wants ONLY `Context.exportSecret` (e.g. MLS's
+// external-init/external-commit, RFC 9420 §8.3/§12.4 — derive an
+// `init_secret`, never seal/open a message through the HPKE context
+// itself) needs instead of the single-shot wrappers. The `*Deterministic`
+// variants stay behind `schedule.` for the same reason `sealBaseDeterministic`
+// etc. do below.
+pub const Setup = schedule.Setup;
+pub const setupBaseS = schedule.setupBaseS;
+pub const setupBaseR = schedule.setupBaseR;
+pub const setupPskS = schedule.setupPskS;
+pub const setupPskR = schedule.setupPskR;
+pub const setupAuthS = schedule.setupAuthS;
+pub const setupAuthR = schedule.setupAuthR;
+pub const setupAuthPskS = schedule.setupAuthPskS;
+pub const setupAuthPskR = schedule.setupAuthPskR;
 
 // RFC 9180 §6.1's single-shot `Seal*`/`Open*` pairs, one per mode. The
 // `*Deterministic` variants (ephemeral keypair injected instead of drawn

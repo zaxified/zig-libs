@@ -975,6 +975,126 @@ test "non-base vectors disagree pairwise: mode byte / psk / sender key each chan
     try testing.expectEqualSlices(u8, a1.key_schedule_context[33..65], a1_auth_psk.key_schedule_context[33..65]);
 }
 
+// ── setup*S/setup*R (RFC 9180 §5.1): the NEW multi-message entry points ──
+//
+// Everything above drives `Context.exportSecret` against a `Context` either
+// built directly by `schedule.keySchedule` (the base-mode tests) or by
+// `driveVector`'s hand-composed `Kem.encap*`/`Kem.decap*` +
+// `schedule.keySchedule` (the non-base modes) — i.e. the exact sequence
+// `schedule.setupBaseS`/`setupPskS`/`setupAuthS`/`setupAuthPskS` (and their
+// `setup*R` mirrors) now perform internally, but assembled by hand in the
+// test rather than through those entry points. `driveSetupVector` below
+// re-drives the SAME vectors through the real `setup*` functions instead,
+// which is a strictly stronger check on the new API surface specifically:
+// it is the difference between "this module's internals can reproduce the
+// RFC" (already proven above) and "the `Context` a `setup*` CALLER actually
+// receives reproduces the RFC" — the thing MLS's external-init/
+// external-commit (RFC 9420 §8.3/§12.4) will call directly.
+fn driveSetupVector(comptime V: type, comptime Kem: type, comptime Aead: type) !void {
+    const mode: suite.Mode = @enumFromInt(V.mode);
+    const is_psk = comptime (mode == .psk or mode == .auth_psk);
+
+    // RFC 9180 §5.1's default_psk/default_psk_id are both "" (see
+    // driveVector's own comment on this).
+    const psk: []const u8 = if (comptime is_psk) &V.psk else "";
+    const psk_id: []const u8 = if (comptime is_psk) &V.psk_id else "";
+
+    const eph = Kem.KeyPair{ .secret_key = V.skEm, .public_key = V.pkEm };
+    const skR = Kem.KeyPair{ .secret_key = V.skRm, .public_key = V.pkRm };
+
+    // Sender side: `setup*SDeterministic` (the KAT seam — same ephemeral
+    // pattern as `sealBaseDeterministic` etc.), dispatched on `mode` at
+    // comptime so a non-auth vector never has to declare a `skSm`/`pkSm`
+    // field it doesn't have (mirrors `driveVector`'s `is_auth` guard).
+    var setup = if (comptime mode == .base)
+        try schedule.setupBaseSDeterministic(Kem, Aead, 32, V.pkRm, eph, &V.info)
+    else if (comptime mode == .psk)
+        try schedule.setupPskSDeterministic(Kem, Aead, 32, V.pkRm, eph, &V.info, psk, psk_id)
+    else if (comptime mode == .auth) blk: {
+        const skS = Kem.KeyPair{ .secret_key = V.skSm, .public_key = V.pkSm };
+        break :blk try schedule.setupAuthSDeterministic(Kem, Aead, 32, V.pkRm, skS, eph, &V.info);
+    } else blk: {
+        const skS = Kem.KeyPair{ .secret_key = V.skSm, .public_key = V.pkSm };
+        break :blk try schedule.setupAuthPskSDeterministic(Kem, Aead, 32, V.pkRm, skS, eph, &V.info, psk, psk_id);
+    };
+
+    try testing.expectEqualSlices(u8, &V.enc, &setup.enc);
+    try testing.expectEqualSlices(u8, &V.key, &setup.context.key);
+    try testing.expectEqualSlices(u8, &V.base_nonce, &setup.context.base_nonce);
+    try testing.expectEqualSlices(u8, &V.exporter_secret, &setup.context.exporter_secret);
+    try testing.expectEqual(@as(u64, 0), setup.context.seq);
+
+    // Receiver side: `setup*R`, given the `enc` the sender side just
+    // produced (which already matched `V.enc` above).
+    var receiver = if (comptime mode == .base)
+        try schedule.setupBaseR(Kem, Aead, 32, setup.enc, skR, &V.info)
+    else if (comptime mode == .psk)
+        try schedule.setupPskR(Kem, Aead, 32, setup.enc, skR, &V.info, psk, psk_id)
+    else if (comptime mode == .auth)
+        try schedule.setupAuthR(Kem, Aead, 32, setup.enc, skR, V.pkSm, &V.info)
+    else
+        try schedule.setupAuthPskR(Kem, Aead, 32, setup.enc, skR, V.pkSm, &V.info, psk, psk_id);
+
+    try testing.expectEqualSlices(u8, &V.key, &receiver.key);
+    try testing.expectEqualSlices(u8, &V.base_nonce, &receiver.base_nonce);
+    try testing.expectEqualSlices(u8, &V.exporter_secret, &receiver.exporter_secret);
+
+    // §5.2 spot check: the setup-returned `Context` still seals/opens (not
+    // this harness's main point — `driveVector` already covers every
+    // published tuple — but proof the returned `Context` is a live,
+    // correctly-keyed one, not just a struct with the right-looking bytes).
+    const first = V.encryptions[0];
+    var ct: [45]u8 = undefined;
+    try setup.context.seal(first.aad, first.pt, &ct);
+    try testing.expectEqualSlices(u8, first.ct, &ct);
+    var pt: [29]u8 = undefined;
+    try receiver.open(first.aad, &ct, &pt);
+    try testing.expectEqualSlices(u8, first.pt, &pt);
+
+    // §5.3 — the point of this harness: every published exported value,
+    // through `Context.exportSecret` called on the `setup*`-returned
+    // `Context`, on BOTH the sender's copy and the receiver's independently
+    // constructed copy.
+    const suite_id = suite.suiteId(V.kem_id, V.kdf_id, V.aead_id);
+    for (V.exports) |exp| {
+        std.debug.assert(exp.l == 32);
+        var got_s: [32]u8 = undefined;
+        var got_r: [32]u8 = undefined;
+        try setup.context.exportSecret(&suite_id, exp.exporter_context, &got_s);
+        try receiver.exportSecret(&suite_id, exp.exporter_context, &got_r);
+        try testing.expectEqualSlices(u8, &exp.exported_value, &got_s);
+        try testing.expectEqualSlices(u8, &exp.exported_value, &got_r);
+    }
+}
+
+test "setupBaseS/setupBaseR (A.1.1): Context fields + all 3 exports byte-exact through the new §5.1 entry points" {
+    try driveSetupVector(a1, dhkem.X25519Kem, std.crypto.aead.aes_gcm.Aes128Gcm);
+}
+
+test "setupPskS/setupPskR (A.1.2): Context fields + all 3 exports byte-exact through the new §5.1 entry points" {
+    try driveSetupVector(a1_psk, dhkem.X25519Kem, std.crypto.aead.aes_gcm.Aes128Gcm);
+}
+
+test "setupAuthS/setupAuthR (A.1.3): Context fields + all 3 exports byte-exact through the new §5.1 entry points" {
+    try driveSetupVector(a1_auth, dhkem.X25519Kem, std.crypto.aead.aes_gcm.Aes128Gcm);
+}
+
+test "setupAuthPskS/setupAuthPskR (A.1.4): Context fields + all 3 exports byte-exact through the new §5.1 entry points" {
+    try driveSetupVector(a1_auth_psk, dhkem.X25519Kem, std.crypto.aead.aes_gcm.Aes128Gcm);
+}
+
+test "setupPskS/setupPskR (A.3.2): P-256 + AES-128-GCM, Context fields + exports byte-exact through the new entry points" {
+    try driveSetupVector(a3_psk, dhkem.P256Kem, std.crypto.aead.aes_gcm.Aes128Gcm);
+}
+
+test "setupAuthS/setupAuthR (A.3.3): P-256 + AES-128-GCM, Context fields + exports byte-exact through the new entry points" {
+    try driveSetupVector(a3_auth, dhkem.P256Kem, std.crypto.aead.aes_gcm.Aes128Gcm);
+}
+
+test "setupAuthPskS/setupAuthPskR (A.3.4): P-256 + AES-128-GCM, Context fields + exports byte-exact through the new entry points" {
+    try driveSetupVector(a3_auth_psk, dhkem.P256Kem, std.crypto.aead.aes_gcm.Aes128Gcm);
+}
+
 test "A.1.2/A.1.3/A.1.4: the single-shot sealPsk/sealAuth/sealAuthPsk wrappers reproduce enc + the first ciphertext" {
     // The §6.1 one-call path has its own composition (KEM call + mode byte +
     // psk plumbing) that the multi-step tests above do NOT cover: a wrapper

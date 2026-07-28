@@ -49,6 +49,41 @@ wrapper pair (`sealPsk`/`openPsk`, `sealAuth`/`openAuth`,
 `sealAuthPsk`/`openAuthPsk`) alongside `sealBase`/`openBase`, KATed against
 the same vectors' `enc` + first ciphertext.
 
+## Setup layer: `setup*S`/`setup*R` (RFC 9180 §5.1)
+
+§6.1's single-shot `seal*`/`open*` wrappers (above) run `KeySchedule` and
+immediately consume the resulting `Context` for exactly one `Seal`/`Open`,
+never exposing it. §5.1 itself — `SetupBaseS`/`SetupBaseR` and the psk/
+auth/auth_psk variants — is one layer lower: it returns the encapsulation
+(sender side) and the `Context` itself, full stop, with no assumption the
+caller wants to seal anything at all. Every mode has both halves:
+`setupBaseS`/`setupBaseR`, `setupPskS`/`setupPskR`, `setupAuthS`/
+`setupAuthR`, `setupAuthPskS`/`setupAuthPskR` (plus the `*Deterministic`
+KAT seams on the sender side, same pattern as `sealBaseDeterministic`).
+
+This is what a protocol layered over HPKE that only ever wants
+`Context.Export` — never `Seal`/`Open` — needs: MLS (RFC 9420) §8.3
+external initialization and §12.4 external commits derive their
+`init_secret` this way. Added 2026-07-29 for exactly that consumer
+(`modules/mls`); no new crypto — `setup*S`/`setup*R` call the identical
+`Kem.encap*`/`Kem.decap*`/`Kem.authEncap*`/`Kem.authDecap*` +
+`keySchedule` steps the single-shot wrappers already called, through two
+small shared helpers (`setupEncapped`/`setupDecapped`) that `sealEncapped`/
+`openDecapped` (the single-shot wrappers' shared body) now compose over
+too, so both layers stay provably in sync rather than carrying two copies
+of the same recipe.
+
+KAT: every mode is re-driven through the real `setup*S`/`setup*R` entry
+points against the same RFC 9180 Appendix A vectors already anchoring
+`keySchedule` (A.1.1–A.1.4 over X25519, A.3.2–A.3.4 over P-256) —
+`enc` and every `Context` field checked on both sides, one `Seal`/`Open`
+round trip, and (the point of this pass) every published exported value
+reproduced through `Context.exportSecret` called on the `Context` a
+`setup*` caller actually receives, not a hand-built stand-in. Mutation-
+checked: corrupting one byte of a published exported value turns the new
+`setupBaseS`/`setupBaseR` test red (alongside the two tests that already
+covered that byte), confirming the new path is not vacuous.
+
 **One deliberate deviation from the RFC's pseudocode: the PSK-length
 floor.** RFC 9180 §5.1.2 — "The PSK MUST have at least 32 bytes of entropy
 and SHOULD be of length Nh bytes or longer" — is normative prose that the
@@ -305,6 +340,23 @@ implemented and KAT-verified (order preserved):
     "Modes covered" above for the MUST-vs-SHOULD reasoning and why the
     floor sits at exactly `Nh`.
 
+## Done-record — §5.1 setup layer for `mls` (2026-07-29)
+
+14. ✅ **`setupBaseS`/`setupBaseR` + `setupPskS`/`setupPskR` +
+    `setupAuthS`/`setupAuthR` + `setupAuthPskS`/`setupAuthPskR`** — see
+    "Setup layer" above. `Context` and `keySchedule` were ALREADY public
+    (re-exported at `hpke.Context`/`hpke.keySchedule`) and already
+    KAT-driven directly against every mode's exported values (item 11);
+    what was missing was purely the Encap/Decap+KeySchedule convenience
+    composition RFC 9180 §5.1 itself names, one layer below §6.1's
+    single-shot wrappers. `sealEncapped`/`openDecapped` (the single-shot
+    wrappers' shared body) were refactored to compose over the new
+    `setupEncapped`/`setupDecapped` helpers — behavior-preserving, verified
+    by the full existing `zig build test-hpke` suite staying green
+    unchanged. `modules/mls`'s `test-mls` also verified green (its only
+    consumption of this module, `sealBase`/`openBase` in `crypto.zig`, is
+    untouched).
+
 ## Verification status
 
 1. **KAT (Debug + ReleaseFast):** `zig build test-hpke` — all tests
@@ -314,7 +366,11 @@ implemented and KAT-verified (order preserved):
    the real implementation; A.2 (ChaCha20Poly1305) and A.3 (P-256)
    headers byte-exact; and A.1.2/A.1.3/A.1.4 + A.3.2/A.3.3/A.3.4 drive
    the same full chain for `mode_psk`/`mode_auth`/`mode_auth_psk` over
-   both KEMs.
+   both KEMs. All seven of those vectors are ALSO driven through the
+   `setup*S`/`setup*R` entry points directly (`driveSetupVector` in
+   `kat_rfc9180.zig`) — `enc`, every `Context` field, one Seal/Open round
+   trip, and every published exported value via `Context.exportSecret`
+   called on the `Context` the new API hands back.
 2. **Negative-path:** low-order X25519 pkR (`error.DhFailed`), malformed
    P-256 SEC1 (`error.DeserializeError`), AEAD tamper/wrong-aad/
    truncated-ct (`error.DecryptionFailed`, `seq` not advanced),
