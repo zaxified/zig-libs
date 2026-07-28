@@ -654,6 +654,25 @@ test "Proof codec: rejects wrong-length input" {
     try testing.expectError(error.WrongLength, Proof.fromBytes(&short));
 }
 
+// ── fuzz: Proof.fromBytes never panics on arbitrary bytes ────────────────
+//
+// `Proof.fromBytes` is this module's only variable-length byte-loading
+// entry point (a proof exchanged between prover and verifier over an
+// untrusted channel) -- shallow by construction (an exact-length check
+// then a plain `@memcpy`, no internal structure to speak of), but it's
+// the module's one boundary of this kind, so it gets a harness rather
+// than being skipped outright.
+test "fuzz: Proof.fromBytes never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzProofFromBytes, .{});
+}
+
+fn fuzzProofFromBytes(_: void, smith: *std.testing.Smith) !void {
+    var buf: [group.modulus_bytes + 8]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, @intCast(buf.len));
+    _ = Proof.fromBytes(buf[0..len]) catch return;
+}
+
 test "hashToPrime: deterministic given the same binding" {
     const n = "N-placeholder";
     const x = "x-placeholder";

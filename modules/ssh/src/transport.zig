@@ -1634,6 +1634,49 @@ test "KEXINIT encode/decode round-trip" {
     try t.expectEqual(false, got.first_kex_packet_follows);
 }
 
+// ── fuzz: KexInit.decode off the wire, never panics ─────────────────────────
+//
+// `KexInit.decode` parses SSH_MSG_KEXINIT — the very first payload exchanged
+// (RFC 4253 §7.1), sent and received before any authentication and before
+// any cipher is active. It chains eleven length-prefixed name-list reads
+// through `readListOwned`; a length-parsing bug here is reachable by any
+// unauthenticated peer. Build a structurally valid KEXINIT (16-byte cookie,
+// 11 small length-prefixed fields, boolean, uint32 reserved) so the fuzzer
+// exercises the full decode chain and its errdefer unwind, not just the
+// first length prefix.
+
+test "fuzz: KexInit.decode never panics on arbitrary bytes" {
+    try std.testing.fuzz({}, fuzzKexInitDecode, .{});
+}
+
+fn fuzzKexInitDecode(_: void, smith: *std.testing.Smith) !void {
+    var wire: [2048]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&wire);
+
+    var cookie: [16]u8 = undefined;
+    smith.bytes(&cookie);
+    w.writeAll(&cookie) catch return;
+
+    var i: usize = 0;
+    while (i < 11) : (i += 1) {
+        const len: u32 = smith.valueRangeAtMost(u32, 0, 96);
+        var hdr: [4]u8 = undefined;
+        std.mem.writeInt(u32, &hdr, len, .big);
+        w.writeAll(&hdr) catch return;
+        var namebuf: [96]u8 = undefined;
+        smith.bytes(namebuf[0..len]);
+        w.writeAll(namebuf[0..len]) catch return;
+    }
+    w.writeByte(if (smith.boolWeighted(1, 1)) 1 else 0) catch return;
+    var rbuf: [4]u8 = undefined;
+    smith.bytes(&rbuf);
+    w.writeAll(&rbuf) catch return;
+
+    var r: std.Io.Reader = .fixed(w.buffered());
+    var got = KexInit.decode(std.testing.allocator, &r) catch return;
+    got.deinit(std.testing.allocator);
+}
+
 test "negotiation picks first client algorithm the server also lists" {
     const client = [_][]const u8{ "a", "b", "c" };
     const server = [_][]const u8{ "x", "c", "b" };
@@ -1658,6 +1701,43 @@ test "packet codec round-trip: none" {
     // §6: block-aligned, padding >= 4.
     try t.expect(pkt.padding_length >= 4);
     try t.expectEqual(@as(usize, 0), (4 + pkt.packet_length) % 8);
+}
+
+// ── fuzz: readPacket (unencrypted) off the wire, never panics ──────────────
+//
+// `readPacket` under `CipherState.none` is what the binary packet protocol
+// looks like before KEXINIT/kex has negotiated any cipher — i.e. every
+// packet up to and including the peer's own KEXINIT is read through this
+// exact branch, from an unauthenticated, potentially hostile peer. Build a
+// plausible 4-byte-length-prefixed frame (so the fuzzer reaches the
+// padding-length and payload-slicing arithmetic instead of bouncing off
+// `PacketTooLarge` on every call), while still occasionally corrupting the
+// length field to hit the mismatched-length/truncated-body paths.
+
+test "fuzz: readPacket (cipher .none) never panics on arbitrary bytes" {
+    try std.testing.fuzz({}, fuzzReadPacketNone, .{});
+}
+
+fn fuzzReadPacketNone(_: void, smith: *std.testing.Smith) !void {
+    var wire: [300]u8 = undefined;
+    const body_len: u32 = smith.valueRangeAtMost(u32, 0, 250);
+    var hdr: [4]u8 = undefined;
+    std.mem.writeInt(u32, &hdr, body_len, .big);
+    @memcpy(wire[0..4], &hdr);
+    smith.bytes(wire[4 .. 4 + body_len]);
+
+    // Occasionally declare a length unrelated to what's actually in the
+    // buffer (attacker lies about the length; buffer may be shorter, or the
+    // declared length may exceed max_wire_string_len).
+    if (smith.boolWeighted(1, 4)) {
+        const bogus = smith.value(u32);
+        std.mem.writeInt(u32, wire[0..4], bogus, .big);
+    }
+
+    var r: std.Io.Reader = .fixed(wire[0 .. 4 + body_len]);
+    var cipher: CipherState = .none;
+    var buf: [256]u8 = undefined;
+    _ = readPacket(&r, &cipher, &buf) catch return;
 }
 
 test "packet codec round-trip: chacha20-poly1305@openssh (fixed keys)" {

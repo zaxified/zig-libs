@@ -316,3 +316,45 @@ test "stripContinuation: removes '+' and following whitespace (BOLT#12 QR-split)
     defer allocator.free(stripped);
     try testing.expectEqualStrings("lno1xxxxxxxxyyyyyyyyyyyyzzzzz", stripped);
 }
+
+// ── fuzz: decode never panics on an arbitrary raw string ─────────────────
+//
+// This is a from-scratch reimplementation of BIP173's HRP/checksum state
+// machine (see the module doc comment for why -- the sibling `bech32`
+// module's own fuzzed `decode` enforces a 90-char cap BOLT#11 explicitly
+// waives, so it can't be reused here), so it needs its own harness rather
+// than inheriting `bech32`'s coverage. Unlike `bolt11.zig`'s fuzz harness
+// (which always routes through this module's own `encode` to reach a
+// checksum-valid string), this one mutates the wire text MORE directly --
+// biased toward the bech32 charset/separator/case rules most of the time,
+// with fully-random byte splices the rest, so the HRP-range/mixed-case/
+// out-of-charset paths get exercised on their own, not only via a
+// well-formed encoder round-trip.
+test "fuzz: decode never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzDecode, .{});
+}
+
+fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
+    const allocator = testing.allocator;
+    var buf: [128]u8 = undefined;
+    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    for (buf[0..len]) |*c| {
+        if (smith.value(bool)) {
+            // Bias toward the 32-symbol bech32 charset plus the '1'
+            // separator -- what a real (possibly-corrupted) invoice
+            // string is actually made of.
+            const alphabet = charset ++ "1";
+            c.* = alphabet[smith.valueRangeAtMost(u8, 0, alphabet.len - 1)];
+        } else {
+            c.* = smith.value(u8);
+        }
+    }
+    // Occasionally flip ASCII-letter case on a byte, to reach MixedCase.
+    if (len > 0 and smith.value(bool)) {
+        const i: usize = smith.valueRangeAtMost(u8, 0, @intCast(len - 1));
+        if (std.ascii.isAlphabetic(buf[i])) buf[i] = if (std.ascii.isUpper(buf[i])) std.ascii.toLower(buf[i]) else std.ascii.toUpper(buf[i]);
+    }
+
+    var dec = decode(allocator, buf[0..len]) catch return;
+    defer dec.deinit(allocator);
+}

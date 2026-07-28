@@ -651,3 +651,44 @@ test "deserializePartial reports the exact byte count consumed (no forced whole-
     defer r.tx.deinit(allocator);
     try testing.expectEqual(raw.len, r.consumed);
 }
+
+// ── fuzz: deserializePartial never panics on arbitrary attacker bytes ────
+//
+// A Bitcoin transaction is consensus data straight off the p2p wire (or a
+// PSBT's `UNSIGNED_TX`/`(NON_)WITNESS_UTXO` value -- see `psbt`, which
+// calls this same function on a caller-supplied slice). Plain uniform
+// bytes would die almost immediately on the leading CompactSize
+// vin-count's own truncation check; this harness biases every
+// CompactSize-shaped field (vin/vout/script-length/witness-item counts)
+// toward small single-byte forms most of the time -- explores the
+// TooManyItems/per-field-Truncated boundary the module doc comment claims
+// ("a hostile huge count can never by itself force a large allocation")
+// -- with fully random bytes the rest, so the multi-byte 0xfd/0xfe/0xff
+// CompactSize forms and the marker/flag/witness disambiguation also get
+// hit.
+test "fuzz: deserializePartial never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzDeserializePartial, .{});
+}
+
+fn fuzzDeserializePartial(_: void, smith: *std.testing.Smith) !void {
+    const allocator = testing.allocator;
+    var buf: [256]u8 = undefined;
+    smith.bytes(&buf);
+
+    // Bias the byte right after the 4-byte version field (where a
+    // CompactSize vin-count, or the 0x00 segwit marker, is read) toward
+    // small counts / the marker byte / random -- three-way split so all
+    // three code paths (legacy-small-count, segwit-marker, arbitrary
+    // multi-byte-form) get real traffic.
+    if (buf.len > 4) {
+        buf[4] = switch (smith.valueRangeAtMost(u8, 0, 2)) {
+            0 => smith.valueRangeAtMost(u8, 0, 4), // small vin count
+            1 => 0x00, // segwit marker
+            else => smith.value(u8),
+        };
+    }
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+
+    var r = deserializePartial(allocator, buf[0..len]) catch return;
+    defer r.tx.deinit(allocator);
+}

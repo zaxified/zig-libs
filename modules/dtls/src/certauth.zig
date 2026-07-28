@@ -222,3 +222,31 @@ test "verifyLeafAgainstAnchor: a tampered leaf signature is rejected" {
     tampered[tampered.len - 1] ^= 0x01; // flip the last byte of the ECDSA signature
     try testing.expectError(error.CertificateSignatureInvalid, verifyLeafAgainstAnchor(&tampered, &kat.anchor_cert_der, kat.valid_now_sec));
 }
+
+// ── fuzz: parseLeafPublicKey off the wire, never panics ─────────────────────
+//
+// `cert_der` here is a `Certificate` message entry straight off the wire
+// (RFC 8446 §4.4.2), from an unauthenticated peer, during the handshake —
+// same threat model as the record layer. NOTE most of this function's own
+// logic is deliberately NOT re-fuzzed here: it is a thin dispatcher over
+// `x509.spkiOf` (already fuzzed directly at `x509/src/safe.zig`'s "fuzz:
+// arbitrary bytes through spkiOf never panic", which itself drives
+// `rsa.PublicKey.fromDer` and `EcdsaP256Sha256.fromSec1` on the exact same
+// extracted `key_bits`/`der` this function passes them), and `rsa
+// .PublicKey.fromDer` is fuzzed a second time, independently, in
+// `rsa/src/root.zig`. Re-fuzzing that path here would test nothing new.
+// What genuinely has no existing coverage is the P-384 and Ed25519 dispatch
+// arms (`EcdsaP384Sha384.fromSec1` / `Ed25519.PublicKey.fromBytes`), which
+// only this function reaches — hence a harness at this level rather than
+// skipping it entirely.
+
+test "fuzz: parseLeafPublicKey never panics on arbitrary DER" {
+    try testing.fuzz({}, fuzzParseLeafPublicKey, .{});
+}
+
+fn fuzzParseLeafPublicKey(_: void, smith: *std.testing.Smith) !void {
+    var buf: [1024]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    _ = parseLeafPublicKey(buf[0..len]) catch return;
+}

@@ -393,3 +393,69 @@ test "writeNameList/readNameList round-trip: empty list" {
     defer list.deinit();
     try t.expectEqual(@as(usize, 0), list.raw.len);
 }
+
+// ── fuzz: readString/readMpint off the wire, never panics ──────────────────
+//
+// `readString` is the length-prefixed-string primitive underlying every
+// SSH message field (name-lists, key blobs, signatures); `readMpint` layers
+// a sign-pad-stripping step on top and is the one that parses an
+// attacker-supplied *big-integer* length during unauthenticated key
+// exchange (DH/RSA host-key blobs). Both run before authentication, off a
+// raw socket. Keep the declared length mostly plausible (small, or right at
+// the `max_wire_string_len` boundary) so the fuzzer spends its budget in
+// the allocate-and-read path rather than bouncing off the cap on every call.
+
+test "fuzz: readString never panics on arbitrary length-prefixed bytes" {
+    try std.testing.fuzz({}, fuzzReadString, .{});
+}
+
+fn fuzzReadString(_: void, smith: *std.testing.Smith) !void {
+    var wire: [768]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&wire);
+
+    // Bias the declared length toward the interesting edges: small values,
+    // and the max_wire_string_len boundary (+/- a couple bytes) where the
+    // StringTooLarge cap kicks in.
+    const len: u32 = if (smith.boolWeighted(1, 4))
+        max_wire_string_len -% 2 +% smith.valueRangeAtMost(u32, 0, 4)
+    else
+        smith.valueRangeAtMost(u32, 0, 700);
+    var hdr: [4]u8 = undefined;
+    std.mem.writeInt(u32, &hdr, len, .big);
+    w.writeAll(&hdr) catch return;
+
+    // The actual bytes present may be fewer than `len` announces (truncated
+    // wire) — that must surface as a read error, never an OOB read.
+    var body: [700]u8 = undefined;
+    const present: u16 = smith.valueRangeAtMost(u16, 0, body.len);
+    smith.bytes(body[0..present]);
+    w.writeAll(body[0..present]) catch return;
+
+    var r: std.Io.Reader = .fixed(w.buffered());
+    const s = readString(std.testing.allocator, &r) catch return;
+    std.testing.allocator.free(s);
+}
+
+test "fuzz: readMpint never panics on arbitrary length-prefixed bytes" {
+    try std.testing.fuzz({}, fuzzReadMpint, .{});
+}
+
+fn fuzzReadMpint(_: void, smith: *std.testing.Smith) !void {
+    var wire: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&wire);
+
+    const len: u32 = smith.valueRangeAtMost(u32, 0, 96);
+    var hdr: [4]u8 = undefined;
+    std.mem.writeInt(u32, &hdr, len, .big);
+    w.writeAll(&hdr) catch return;
+
+    var body: [96]u8 = undefined;
+    smith.bytes(body[0..len]);
+    // Bias toward the sign-pad-stripping branch (`raw.len > 1 and raw[0] == 0`).
+    if (len > 1 and smith.boolWeighted(1, 2)) body[0] = 0;
+    w.writeAll(body[0..len]) catch return;
+
+    var r: std.Io.Reader = .fixed(w.buffered());
+    const m = readMpint(std.testing.allocator, &r) catch return;
+    std.testing.allocator.free(m);
+}

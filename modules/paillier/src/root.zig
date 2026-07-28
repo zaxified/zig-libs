@@ -1661,3 +1661,77 @@ test "smoke: module compiles and constants are sane" {
     try testing.expect(max_bits == modulus_bits * 2);
     try testing.expect(modulus_sq_bytes == 2 * modulus_bytes);
 }
+
+// ── fuzz: byte-loaders never panic on arbitrary attacker-supplied bytes ──
+//
+// `PublicKey.fromBytes`/`SecretKey.fromBytes`/`Ciphertext.fromBytes` are
+// this module's only untrusted-input boundary: raw big-endian `n`/`g`/
+// `lambda`/`mu`/ciphertext bytes loaded from storage or a wire message,
+// turned into `std.crypto.ff` values via a hand-rolled `stripLeadingZeros`
+// + length-bound check (`n_bytes.len == 0 or n_bytes.len > modulus_bytes`)
+// BEFORE `Modulus.fromBytes`/`Fe.fromBytes` ever run -- unlike the
+// sibling k256/p256/bls12_381 group modules' fixed-size-array `fromBytes`,
+// these take variable-length `[]const u8` directly, so the length-bound
+// check itself is in-scope here. `smith.bytes` biased toward lengths at/
+// over the `modulus_bytes`/`modulus_sq_bytes` boundary, mixed with leading
+// zero runs (exercises `stripLeadingZeros`) and fully random content.
+test "fuzz: PublicKey.fromBytes never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzPublicKeyFromBytes, .{});
+}
+
+fn fuzzedFieldBytes(smith: *std.testing.Smith, buf: []u8) []const u8 {
+    smith.bytes(buf);
+    // Occasionally force a run of leading zeros (stripLeadingZeros path).
+    if (smith.value(bool)) {
+        const n_zeros: usize = smith.valueRangeAtMost(u8, 0, @intCast(buf.len));
+        @memset(buf[0..n_zeros], 0);
+    }
+    // Bias length toward at/over the modulus_bytes boundary as well as
+    // fully random.
+    const len: usize = if (smith.value(bool))
+        @min(buf.len, modulus_bytes - 4 + smith.valueRangeAtMost(u8, 0, 8))
+    else
+        smith.valueRangeAtMost(u16, 0, @intCast(buf.len));
+    return buf[0..len];
+}
+
+fn fuzzPublicKeyFromBytes(_: void, smith: *std.testing.Smith) !void {
+    var n_buf: [modulus_bytes + 16]u8 = undefined;
+    const n_bytes = fuzzedFieldBytes(smith, &n_buf);
+
+    var g_buf: [modulus_sq_bytes + 16]u8 = undefined;
+    const g_bytes: ?[]const u8 = if (smith.value(bool)) fuzzedFieldBytes(smith, &g_buf) else null;
+
+    _ = PublicKey.fromBytes(n_bytes, g_bytes) catch return;
+}
+
+test "fuzz: SecretKey.fromBytes never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzSecretKeyFromBytes, .{});
+}
+
+fn fuzzSecretKeyFromBytes(_: void, smith: *std.testing.Smith) !void {
+    var n_buf: [modulus_bytes + 16]u8 = undefined;
+    const n_bytes = fuzzedFieldBytes(smith, &n_buf);
+    var lambda_buf: [modulus_sq_bytes + 16]u8 = undefined;
+    const lambda_bytes = fuzzedFieldBytes(smith, &lambda_buf);
+    var mu_buf: [modulus_bytes + 16]u8 = undefined;
+    const mu_bytes = fuzzedFieldBytes(smith, &mu_buf);
+
+    var sk = SecretKey.fromBytes(n_bytes, lambda_bytes, mu_bytes) catch return;
+    sk.deinit();
+}
+
+test "fuzz: Ciphertext.fromBytes never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzCiphertextFromBytes, .{});
+}
+
+fn fuzzCiphertextFromBytes(_: void, smith: *std.testing.Smith) !void {
+    // A real (small, toy) key so `pk.n_sq` is a valid modulus context --
+    // the point here is fuzzing the ciphertext bytes, not the key parse
+    // (already covered by `fuzzPublicKeyFromBytes` above).
+    const pk = PublicKey.fromBytes(&kat_n, null) catch unreachable;
+
+    var buf: [modulus_sq_bytes + 16]u8 = undefined;
+    const bytes = fuzzedFieldBytes(smith, &buf);
+    _ = Ciphertext.fromBytes(pk, bytes) catch return;
+}

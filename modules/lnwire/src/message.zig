@@ -310,3 +310,37 @@ test "hostile: an unknown even TLV type in the extension fails closed" {
     try tlv.appendStream(&buf, allocator, &.{.{ .type = 2, .value = &.{} }}); // even, unknown
     try testing.expectError(error.UnknownEvenType, decodeExtension(allocator, buf.items, &.{0}));
 }
+
+// ── fuzz: the shared reader chain every message decode runs through ───────
+//
+// `openFrame` (the 2-byte type frame) and `decodeExtension` (the trailing
+// `tlv_stream`, `tlv.zig`'s own fuzz harness covers `parseStream` itself in
+// depth) are the two pieces of machinery EVERY `bolt1`/`bolt2`/`bolt7`
+// message decoder runs through before/after its own fixed fields -- an
+// adversarial peer's raw message bytes reach both directly. `Reader`'s
+// individual `takeBytes`/`bytesU16` truncation behavior is already
+// covered by the hostile tests above; this harness instead drives the two
+// public entry points end to end over arbitrary bytes.
+test "fuzz: openFrame + decodeExtension never panic on arbitrary bytes" {
+    try testing.fuzz({}, fuzzFrameAndExtension, .{});
+}
+
+fn fuzzFrameAndExtension(_: void, smith: *std.testing.Smith) !void {
+    const allocator = testing.allocator;
+    var buf: [512]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const bytes = buf[0..len];
+
+    // Bias `want` toward the type actually encoded at the front of `bytes`
+    // half the time (reaches the payload-Reader path instead of always
+    // bailing out on `error.WrongType`), fully random the other half.
+    const want: u16 = if (bytes.len >= 2 and smith.value(bool))
+        std.mem.readInt(u16, bytes[0..2], .big)
+    else
+        smith.value(u16);
+
+    var r = openFrame(bytes, want) catch return;
+    var ext = decodeExtension(allocator, r.rest(), &.{ 0, 1, 3, 254 }) catch return;
+    defer ext.deinit(allocator);
+}

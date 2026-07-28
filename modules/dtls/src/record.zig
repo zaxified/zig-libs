@@ -329,3 +329,41 @@ test "reconstructSequenceNumber: clamps at the 48-bit ceiling" {
     const got = reconstructSequenceNumber(max_seq, .short, 0);
     try testing.expect(got <= max_seq);
 }
+
+// ── fuzz: record headers off the wire, never panic ──────────────────────────
+//
+// `decodeUnified`/`decodePlaintext` are the very first bytes this module (or
+// any DTLS implementation) touches on a received UDP datagram — from an
+// unauthenticated, potentially hostile peer, before any handshake state
+// exists. `decodeUnified` is gated by a 3-bit fixed pattern in byte 0, so
+// pure random bytes fail that check almost every time; bias byte 0 toward
+// the valid pattern most of the time so the fuzzer reaches the CID/
+// sequence-number/length-field arithmetic instead of only ever hitting
+// `error.InvalidHeader`. `decodePlaintext` has no such gate (only a length
+// check), so plain random bytes at a plausible length already exercise it.
+
+test "fuzz: decodeUnified never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzDecodeUnified, .{});
+}
+
+fn fuzzDecodeUnified(_: void, smith: *std.testing.Smith) !void {
+    var buf: [64]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    if (len > 0 and smith.boolWeighted(1, 6)) {
+        buf[0] = (buf[0] & ~fixed_mask) | fixed_value;
+    }
+    const cid_len: usize = smith.valueRangeAtMost(u8, 0, 4);
+    _ = decodeUnified(buf[0..len], cid_len) catch return;
+}
+
+test "fuzz: decodePlaintext never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzDecodePlaintext, .{});
+}
+
+fn fuzzDecodePlaintext(_: void, smith: *std.testing.Smith) !void {
+    var buf: [64]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    _ = decodePlaintext(buf[0..len]) catch return;
+}

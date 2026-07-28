@@ -883,3 +883,65 @@ test "RFC6979 byte-exact re-derivation: signing the donation vector's own hash w
     const Q = try ecdsa.recoverPubkey(hash, sig.r, sig.s, sig.recid);
     try testing.expectEqualSlices(u8, &spec_node_id, &Q.toCompressedSec1());
 }
+
+// ── fuzz: decode never panics on a user-pasted invoice string ────────────
+//
+// `decode` is the module's whole reason to exist: a BOLT#11 invoice is
+// text a user copy-pastes from an untrusted counterparty/webpage straight
+// into a wallet. Plain random bytes would die almost immediately on
+// `bech32_raw.decode`'s checksum check (a 1-in-2^30 chance of passing by
+// luck), testing nothing past it -- so this harness builds a
+// checksum-VALID bech32 string via `bech32_raw.encode` itself (real HRP
+// grammar: "ln" + a real network prefix + an optional amount+multiplier;
+// real data-part length, biased toward >= 7+104 quintets so the
+// tagged-field loop at the heart of this file actually runs) and lets
+// only the HRP shape, amount digits, and tagged-field quintets vary
+// randomly. This is what actually drives the parser into
+// `TruncatedTaggedField`/fixed-length-field/signature-recovery territory
+// instead of bouncing off `InvalidChecksum` every time.
+test "fuzz: decode never panics on arbitrary attacker-supplied invoice strings" {
+    try testing.fuzz({}, fuzzDecode, .{});
+}
+
+fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
+    const allocator = testing.allocator;
+
+    var hrp_buf: [16]u8 = undefined;
+    var hrp_len: usize = 0;
+    const net_prefixes = [_][]const u8{ "bc", "tb", "tbs", "bcrt" };
+    const net = net_prefixes[smith.valueRangeAtMost(u8, 0, net_prefixes.len - 1)];
+    @memcpy(hrp_buf[0..2], "ln");
+    hrp_len = 2;
+    @memcpy(hrp_buf[hrp_len..][0..net.len], net);
+    hrp_len += net.len;
+    if (smith.value(bool)) {
+        const digits = "0123456789";
+        const n_digits = smith.valueRangeAtMost(u8, 0, 5);
+        var i: u8 = 0;
+        while (i < n_digits) : (i += 1) {
+            hrp_buf[hrp_len] = digits[smith.valueRangeAtMost(u8, 0, 9)];
+            hrp_len += 1;
+        }
+        if (n_digits > 0 and smith.value(bool)) {
+            const mults = "munp";
+            hrp_buf[hrp_len] = mults[smith.valueRangeAtMost(u8, 0, 3)];
+            hrp_len += 1;
+        }
+    }
+
+    // Data part: random quintets, biased toward >= 7+104 (timestamp +
+    // signature) so the tagged-field loop actually runs most of the time;
+    // occasionally shorter, to exercise `InvoiceTooShort` too.
+    var data_buf: [200]u5 = undefined;
+    const data_len: usize = if (smith.value(bool))
+        smith.valueRangeAtMost(u16, 111, data_buf.len)
+    else
+        smith.valueRangeAtMost(u16, 0, data_buf.len);
+    for (data_buf[0..data_len]) |*q| q.* = @intCast(smith.valueRangeAtMost(u8, 0, 31));
+
+    const invoice = bech32raw.encode(allocator, hrp_buf[0..hrp_len], data_buf[0..data_len]) catch return;
+    defer allocator.free(invoice);
+
+    var inv = decode(allocator, invoice) catch return;
+    defer inv.deinit(allocator);
+}

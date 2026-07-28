@@ -602,3 +602,57 @@ test "hostile: truncated integer wider than the target type is rejected" {
     try testing.expectError(error.TooLong, decodeTruncated(u16, &.{ 1, 2, 3 }));
     try testing.expectError(error.TooLong, decodeTruncated(u32, &.{ 1, 2, 3, 4, 5 }));
 }
+
+// ── fuzz: parseStream never panics on arbitrary attacker-supplied bytes ────
+//
+// `parseStream` is the generic decoder underneath EVERY BOLT#1/#2/#7
+// message's trailing `tlv_stream` (see `message.zig`'s `decodeExtension`)
+// -- an adversarial peer controls these bytes end to end. It is also the
+// richest state machine in this module: nested BigSize type/length reads,
+// a strictly-increasing-type check, and an even/odd-unknown-type branch,
+// all before the generic ordering/truncation checks even apply. Plain
+// uniform bytes would almost always die on the very first BigSize's
+// multi-byte-prefix truncation check, so the `Smith` is biased to spend
+// most of its budget constructing a run of syntactically well-formed
+// `(type, length, value)` records (small single-byte BigSize forms,
+// mostly-in-bounds lengths) with only occasional fully-random bytes
+// spliced in -- this is what actually drives the parser past the first
+// record and into the ordering/known-type logic the hostile-input tests
+// above target by hand.
+test "fuzz: parseStream never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzParseStream, .{});
+}
+
+fn fuzzParseStream(_: void, smith: *std.testing.Smith) !void {
+    const allocator = testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    const n_records = smith.valueRangeAtMost(u8, 0, 12);
+    var i: u8 = 0;
+    while (i < n_records) : (i += 1) {
+        // Bias the type/length BigSize prefixes toward small single-byte
+        // forms (0..0xfc) most of the time -- the multi-byte 0xfd/0xfe/0xff
+        // forms are already exhaustively covered by `decodeBigSize`'s own
+        // vector tests; occasionally emit a raw random byte instead so the
+        // 0xfd/0xfe/0xff truncation/non-minimal paths still get exercised.
+        const t: u8 = if (smith.value(bool)) smith.valueRangeAtMost(u8, 0, 0xfc) else smith.value(u8);
+        buf.append(allocator, t) catch return;
+        const len: u8 = if (smith.value(bool)) smith.valueRangeAtMost(u8, 0, 16) else smith.value(u8);
+        buf.append(allocator, len) catch return;
+        var vbuf: [16]u8 = undefined;
+        smith.bytes(&vbuf);
+        buf.appendSlice(allocator, vbuf[0..@min(len, vbuf.len)]) catch return;
+    }
+    // Splice in a tail of fully-random bytes too, unconstrained by the
+    // record-shaped loop above -- catches anything the biased construction
+    // above structurally can't produce.
+    var tail: [32]u8 = undefined;
+    smith.bytes(&tail);
+    const tail_len: usize = smith.valueRangeAtMost(u8, 0, tail.len);
+    buf.appendSlice(allocator, tail[0..tail_len]) catch return;
+
+    const known_types = [_]u64{ 0, 1, 2, 3, 254 };
+    var parsed = parseStream(allocator, buf.items, &known_types) catch return;
+    defer parsed.deinit(allocator);
+}

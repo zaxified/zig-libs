@@ -1476,6 +1476,60 @@ const Synth = struct {
     }
 };
 
+// ── fuzz: parse off the wire, never panics ──────────────────────────────────
+//
+// `parse` is the entry point for a BTF blob straight off the wire or lifted
+// out of an untrusted object file's `.BTF` section — this file's own module
+// doc calls out exactly this threat model (header offset/length fields
+// that must be checked in u64 so they cannot wrap, a `vlen` that must not
+// overrun the remaining type section, cyclic type graphs). Build a
+// structurally valid, richly-varied blob via the same `Synth.good` fixture
+// the hand-written hostile-input tests below already use — 20 types across
+// every `Kind` the format defines — so the fuzzer reaches the type-section
+// walk and every per-kind accessor instead of bouncing off `NotBtf` on the
+// first two magic bytes, then truncate and/or flip bytes.
+
+test "fuzz: parse never panics on a truncated/mutated synthetic BTF blob" {
+    try testing.fuzz({}, fuzzParse, .{});
+}
+
+fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
+    const gpa = testing.allocator;
+    const seed = Synth.good(gpa) catch return;
+    defer gpa.free(seed);
+
+    const len: u32 = smith.valueRangeAtMost(u32, 0, @intCast(seed.len));
+    const mutant = gpa.dupe(u8, seed[0..len]) catch return;
+    defer gpa.free(mutant);
+
+    const n_flips: u8 = smith.valueRangeAtMost(u8, 0, 16);
+    var k: u8 = 0;
+    while (k < n_flips and mutant.len > 0) : (k += 1) {
+        mutant[smith.index(mutant.len)] = smith.value(u8);
+    }
+
+    var b = parse(gpa, mutant, .{}) catch return;
+    defer b.deinit();
+
+    // Walk the deferred-validation surface the module doc calls out: `byId`
+    // on a fuzzer-chosen id (very possibly out of range after mutation), and
+    // every per-kind accessor the doc says must reject a bad `vlen`/
+    // `name_off` cleanly rather than read out of bounds.
+    const id: u32 = smith.value(u32);
+    if (b.byId(id) catch null) |t| {
+        var i: u16 = 0;
+        while (i < t.vlen and i < 64) : (i += 1) {
+            _ = b.member(t, i) catch {};
+            _ = b.param(t, i) catch {};
+            _ = b.varSecInfo(t, i) catch {};
+        }
+        _ = b.str(t.name_off);
+        _ = b.resolve(id) catch {};
+        _ = b.sizeOf(id) catch {};
+    }
+    _ = b.findByNameKind("point_t", .typedef);
+}
+
 test "synthetic BTF: every kind decodes, with exact expectations" {
     const gpa = testing.allocator;
     const blob = try Synth.good(gpa);

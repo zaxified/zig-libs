@@ -1157,3 +1157,228 @@ test "HandshakeType: RFC 8446 §4 wire code points for the cert-mode types" {
     try testing.expectEqual(@as(u8, 13), @intFromEnum(HandshakeType.certificate_request));
     try testing.expectEqual(@as(u8, 15), @intFromEnum(HandshakeType.certificate_verify));
 }
+
+// ── fuzz: handshake message bodies off the wire, never panic ───────────────
+//
+// Every function in this file decodes a DTLS 1.3 handshake message BODY —
+// received from an unauthenticated peer (the record/handshake-fragmentation
+// layers above only reassemble bytes; these are what interpret them).
+// `decodeClientHello`/`decodeServerHello`/`decodeCertificate` are the three
+// highest-value targets: build a structurally valid message via the
+// existing `encode*` counterpart (so the fuzzer reaches every field
+// extraction instead of bouncing off the first length check), then
+// sometimes flip one byte to probe the bounds-checked paths against a
+// message that looks valid until one field disagrees. The remaining
+// extension-family sub-decoders have no magic-number gate at all (only
+// length fields), so plain random bytes at a plausible length already
+// reach their interior loops.
+
+test "fuzz: decodeClientHello never panics on a structurally-plausible, possibly-mutated message" {
+    try testing.fuzz({}, fuzzDecodeClientHello, .{});
+}
+
+fn fuzzDecodeClientHello(_: void, smith: *std.testing.Smith) !void {
+    var random: [32]u8 = undefined;
+    smith.bytes(&random);
+    var sid_buf: [32]u8 = undefined;
+    const sid_len = smith.valueRangeAtMost(u8, 0, 32);
+    smith.bytes(sid_buf[0..sid_len]);
+
+    var cs_buf: [32]u16 = undefined;
+    const n_cs = smith.valueRangeAtMost(u8, 0, cs_buf.len);
+    for (cs_buf[0..n_cs]) |*c| c.* = smith.value(u16);
+
+    var ext_data: [4][32]u8 = undefined;
+    var exts: [4]Extension = undefined;
+    const n_ext = smith.valueRangeAtMost(u8, 0, 4);
+    for (0..n_ext) |k| {
+        const dl = smith.valueRangeAtMost(u8, 0, 32);
+        smith.bytes(ext_data[k][0..dl]);
+        exts[k] = .{ .ext_type = smith.value(u16), .data = ext_data[k][0..dl] };
+    }
+
+    const ch = ClientHello{
+        .random = random,
+        .legacy_session_id = sid_buf[0..sid_len],
+        .cipher_suites = cs_buf[0..n_cs],
+        .extensions = exts[0..n_ext],
+    };
+    var wire: [1024]u8 = undefined;
+    const enc = encodeClientHello(ch, &wire) catch return;
+    if (enc.len > 0 and smith.boolWeighted(1, 2)) {
+        wire[smith.index(enc.len)] = smith.value(u8);
+    }
+
+    var out: [8]Extension = undefined;
+    _ = decodeClientHello(enc, &out) catch return;
+}
+
+test "fuzz: decodeServerHello never panics on a structurally-plausible, possibly-mutated message" {
+    try testing.fuzz({}, fuzzDecodeServerHello, .{});
+}
+
+fn fuzzDecodeServerHello(_: void, smith: *std.testing.Smith) !void {
+    var random: [32]u8 = undefined;
+    smith.bytes(&random);
+    var sid_buf: [32]u8 = undefined;
+    const sid_len = smith.valueRangeAtMost(u8, 0, 32);
+    smith.bytes(sid_buf[0..sid_len]);
+
+    var ext_data: [4][32]u8 = undefined;
+    var exts: [4]Extension = undefined;
+    const n_ext = smith.valueRangeAtMost(u8, 0, 4);
+    for (0..n_ext) |k| {
+        const dl = smith.valueRangeAtMost(u8, 0, 32);
+        smith.bytes(ext_data[k][0..dl]);
+        exts[k] = .{ .ext_type = smith.value(u16), .data = ext_data[k][0..dl] };
+    }
+
+    const sh = ServerHello{
+        .random = random,
+        .legacy_session_id_echo = sid_buf[0..sid_len],
+        .cipher_suite = smith.value(u16),
+        .extensions = exts[0..n_ext],
+    };
+    var wire: [1024]u8 = undefined;
+    const enc = encodeServerHello(sh, &wire) catch return;
+    if (enc.len > 0 and smith.boolWeighted(1, 2)) {
+        wire[smith.index(enc.len)] = smith.value(u8);
+    }
+
+    var out: [8]Extension = undefined;
+    _ = decodeServerHello(enc, &out) catch return;
+}
+
+test "fuzz: decodeCertificate never panics on a structurally-plausible, possibly-mutated message" {
+    try testing.fuzz({}, fuzzDecodeCertificate, .{});
+}
+
+fn fuzzDecodeCertificate(_: void, smith: *std.testing.Smith) !void {
+    var ctx_buf: [64]u8 = undefined;
+    const ctx_len = smith.valueRangeAtMost(u8, 0, 64);
+    smith.bytes(ctx_buf[0..ctx_len]);
+
+    var cert_bufs: [4][128]u8 = undefined;
+    var certs: [4][]const u8 = undefined;
+    const n_certs = smith.valueRangeAtMost(u8, 0, 4);
+    for (0..n_certs) |k| {
+        const cl = smith.valueRangeAtMost(u8, 1, 128);
+        smith.bytes(cert_bufs[k][0..cl]);
+        certs[k] = cert_bufs[k][0..cl];
+    }
+
+    var wire: [1024]u8 = undefined;
+    const enc = encodeCertificate(ctx_buf[0..ctx_len], certs[0..n_certs], &wire) catch return;
+    if (enc.len > 0 and smith.boolWeighted(1, 2)) {
+        wire[smith.index(enc.len)] = smith.value(u8);
+    }
+
+    var out: [8]CertificateEntry = undefined;
+    _ = decodeCertificate(enc, &out) catch return;
+}
+
+test "fuzz: decodeExtensions never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzDecodeExtensions, .{});
+}
+
+fn fuzzDecodeExtensions(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    var out: [16]Extension = undefined;
+    _ = decodeExtensions(buf[0..len], &out) catch return;
+}
+
+test "fuzz: decodeCookieExtension never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzDecodeCookieExtension, .{});
+}
+
+fn fuzzDecodeCookieExtension(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    _ = decodeCookieExtension(buf[0..len]) catch return;
+}
+
+test "fuzz: decodePskKeyExchangeModes never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzDecodePskModes, .{});
+}
+
+fn fuzzDecodePskModes(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    var out: [256]PskKeyExchangeMode = undefined;
+    _ = decodePskKeyExchangeModes(buf[0..len], &out) catch return;
+}
+
+test "fuzz: decodeOfferedPsks never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzDecodeOfferedPsks, .{});
+}
+
+fn fuzzDecodeOfferedPsks(_: void, smith: *std.testing.Smith) !void {
+    var buf: [512]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    var ids: [16]PskIdentity = undefined;
+    var binders: [16][]const u8 = undefined;
+    _ = decodeOfferedPsks(buf[0..len], &ids, &binders) catch return;
+}
+
+test "fuzz: decodeU16ListExtension never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzDecodeU16List, .{});
+}
+
+fn fuzzDecodeU16List(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    var out: [128]u16 = undefined;
+    _ = decodeU16ListExtension(buf[0..len], &out) catch return;
+}
+
+test "fuzz: decodeKeyShareClientHello never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzDecodeKeyShareClientHello, .{});
+}
+
+fn fuzzDecodeKeyShareClientHello(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    var out: [16]KeyShareEntry = undefined;
+    _ = decodeKeyShareClientHello(buf[0..len], &out) catch return;
+}
+
+test "fuzz: decodeKeyShareServerHello never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzDecodeKeyShareServerHello, .{});
+}
+
+fn fuzzDecodeKeyShareServerHello(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    _ = decodeKeyShareServerHello(buf[0..len]) catch return;
+}
+
+test "fuzz: decodeCertificateVerify never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzDecodeCertificateVerify, .{});
+}
+
+fn fuzzDecodeCertificateVerify(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    _ = decodeCertificateVerify(buf[0..len]) catch return;
+}
+
+test "fuzz: decodeCertificateRequest never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzDecodeCertificateRequest, .{});
+}
+
+fn fuzzDecodeCertificateRequest(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    var out: [16]Extension = undefined;
+    _ = decodeCertificateRequest(buf[0..len], &out) catch return;
+}

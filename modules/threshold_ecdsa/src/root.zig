@@ -1251,6 +1251,20 @@ pub const PublicKeys = struct {
     pub fn fromBytesAlloc(allocator: std.mem.Allocator, bytes: []const u8) (std.mem.Allocator.Error || FromBytesError)!PublicKeys {
         if (bytes.len < 4) return error.InvalidEncoding;
         const count = std.mem.readInt(u32, bytes[0..4], .big);
+        // BUG FIX (unbounded allocation): `count` is attacker-controlled and
+        // was previously handed straight to `allocator.alloc` with no check
+        // that `bytes` could possibly back that many entries -- a 4-byte
+        // message with count = 0xFFFFFFFF forced a ~29 TB allocation
+        // attempt (sizeOf(PartyPublicKeys) is ~6.8 KB; verified at a safe
+        // scale that count=200_000 alone already peaks ~1.3 GB RSS for a
+        // 4-byte input). Every entry needs at least 16 bytes on the wire
+        // (index(4) + 3 length-prefixes(4 each), even before any of the
+        // length-prefixed payloads), so reject a `count` the remaining
+        // bytes could not possibly satisfy BEFORE allocating -- the same
+        // bound `FeldmanCommitments.fromBytesAlloc` above already enforces
+        // for its own (fixed-size-element) count.
+        const min_entry_bytes = 16;
+        if ((bytes.len - 4) / min_entry_bytes < count) return error.InvalidEncoding;
         var offset: usize = 4;
 
         const entries = try allocator.alloc(PartyPublicKeys, count);
@@ -1925,4 +1939,114 @@ test "generateAuxParamsWithTrapdoor: retains p̃/q̃/lambda; p̃*q̃ == n_tilde 
     // `generateAuxParams` test checks via the internal `lambda`.
     const h2_check = try gen.params.n_tilde.pow(gen.params.h1, gen.trapdoor.lambda);
     try testing.expect(h2_check.eql(gen.params.h2));
+}
+
+// ── fuzz: the length-prefixed / counted wire codecs never panic or ───────
+// over-allocate on arbitrary attacker-supplied bytes ─────────────────────
+//
+// `FeldmanCommitments`/`PublicKeys`/`AuxParams` are exactly the shape this
+// pass is watching hardest for: a `u32`-BE count or length read straight
+// from the wire and used to size an allocation or a loop BEFORE the rest
+// of the buffer is known to actually hold that much data (`PSBT`-map /
+// `TLV`-stream territory, per the module's own doc comments citing
+// `bls12_381.threshold.VerificationVector`'s length-prefixed idiom).
+//
+// **A real bug of exactly this shape was found and fixed while writing
+// this harness**: `PublicKeys.fromBytesAlloc` read its `u32`-BE `count`
+// and called `allocator.alloc(PartyPublicKeys, count)` *before* checking
+// that `bytes` could possibly back that many entries — a 4-byte message
+// with `count = 0xFFFFFFFF` forced a ~29 TB allocation attempt
+// (`sizeOf(PartyPublicKeys)` is ~6.8 KB; verified at a safe scale that
+// `count = 200_000` alone already peaks ~1.3 GB RSS for a 4-byte input).
+// Fixed by rejecting a `count` the remaining bytes could not possibly
+// satisfy before allocating (mirroring `FeldmanCommitments.fromBytesAlloc`,
+// which already had the analogous `expected_len` check). This harness
+// guards against a regression of that exact class, alongside
+// `FeldmanCommitments`/`AuxParams`'s own counted/length-prefixed fields.
+test "fuzz: FeldmanCommitments.fromBytesAlloc never panics or over-allocates" {
+    try testing.fuzz({}, fuzzFeldmanCommitmentsFromBytesAlloc, .{});
+}
+
+fn fuzzFeldmanCommitmentsFromBytesAlloc(_: void, smith: *std.testing.Smith) !void {
+    const allocator = testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    // Bias the count toward both small-real values and the
+    // maximum-u32/near-buffer-size boundary -- the two ends of the
+    // "could this possibly be backed by real data" check.
+    const count: u32 = switch (smith.valueRangeAtMost(u8, 0, 2)) {
+        0 => smith.valueRangeAtMost(u8, 0, 5),
+        1 => std.math.maxInt(u32),
+        else => smith.value(u32),
+    };
+    var count_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &count_buf, count, .big);
+    buf.appendSlice(allocator, &count_buf) catch return;
+
+    var tail: [128]u8 = undefined;
+    smith.bytes(&tail);
+    const tail_len: usize = smith.valueRangeAtMost(u8, 0, tail.len);
+    buf.appendSlice(allocator, tail[0..tail_len]) catch return;
+
+    const result = FeldmanCommitments.fromBytesAlloc(allocator, buf.items) catch return;
+    defer allocator.free(result.commitments);
+}
+
+test "fuzz: PublicKeys.fromBytesAlloc never panics or over-allocates" {
+    try testing.fuzz({}, fuzzPublicKeysFromBytesAlloc, .{});
+}
+
+fn fuzzPublicKeysFromBytesAlloc(_: void, smith: *std.testing.Smith) !void {
+    const allocator = testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    // Same three-way count bias as the FeldmanCommitments harness above --
+    // this is the exact field the fixed bug lived in.
+    const count: u32 = switch (smith.valueRangeAtMost(u8, 0, 2)) {
+        0 => smith.valueRangeAtMost(u8, 0, 3),
+        1 => std.math.maxInt(u32),
+        else => smith.value(u32),
+    };
+    var count_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &count_buf, count, .big);
+    buf.appendSlice(allocator, &count_buf) catch return;
+
+    var tail: [256]u8 = undefined;
+    smith.bytes(&tail);
+    const tail_len: usize = smith.valueRangeAtMost(u16, 0, tail.len);
+    buf.appendSlice(allocator, tail[0..tail_len]) catch return;
+
+    const result = PublicKeys.fromBytesAlloc(allocator, buf.items) catch return;
+    defer allocator.free(result.entries);
+}
+
+test "fuzz: AuxParams.fromBytesAlloc never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzAuxParamsFromBytesAlloc, .{});
+}
+
+fn fuzzAuxParamsFromBytesAlloc(_: void, smith: *std.testing.Smith) !void {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+
+    // Three independent len-prefixed fields (n_tilde/h1/h2) -- bias each
+    // length toward small-real and near-buffer-boundary values so
+    // `readLenPrefixed`'s own bound check gets real traffic both ways.
+    var i: u8 = 0;
+    while (i < 3) : (i += 1) {
+        var field_buf: [64]u8 = undefined;
+        smith.bytes(&field_buf);
+        const field_len: usize = smith.valueRangeAtMost(u8, 0, field_buf.len);
+        var len_buf: [4]u8 = undefined;
+        const declared_len: u32 = if (smith.value(bool))
+            @intCast(field_len) // honest length
+        else
+            smith.value(u32); // lying length
+        std.mem.writeInt(u32, &len_buf, declared_len, .big);
+        buf.appendSlice(testing.allocator, &len_buf) catch return;
+        buf.appendSlice(testing.allocator, field_buf[0..field_len]) catch return;
+    }
+
+    _ = AuxParams.fromBytesAlloc(buf.items) catch return;
 }

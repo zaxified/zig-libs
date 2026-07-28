@@ -915,3 +915,31 @@ test "hostile: any message decoder rejects the wrong 2-byte type" {
     const bytes = [_]u8{ 0x00, ACCEPT_CHANNEL_TYPE };
     try testing.expectError(error.WrongType, decodeFundingSigned(&bytes));
 }
+
+// ── fuzz: decodeOpenChannel never panics on arbitrary attacker bytes ──────
+//
+// `open_channel` is the first message a channel-establishment peer sends
+// off an untrusted transport -- and the richest BOLT#2 shape in this
+// file: 17 fixed fields (six `u64`s, a `u32`, two `u16`s, six 33-byte
+// points, a byte) followed by the generic TLV extension every other
+// decoder in this file also ends with (already exercised standalone by
+// `message.zig`/`tlv.zig`'s own fuzz harnesses). Representative of the
+// whole "many fixed fields + trailing tlv_stream" BOLT#2 family this file
+// implements (`accept_channel`/`channel_ready`/`update_add_htlc`/etc. all
+// share the same `Reader`-then-`decodeExtension` shape).
+test "fuzz: decodeOpenChannel never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzDecodeOpenChannel, .{});
+}
+
+fn fuzzDecodeOpenChannel(_: void, smith: *std.testing.Smith) !void {
+    const allocator = testing.allocator;
+    var buf: [400]u8 = undefined;
+    smith.bytes(&buf);
+    // Force the 2-byte type frame so the fuzzer reaches the actual field
+    // reader chain most of the time, rather than dying on `WrongType`.
+    std.mem.writeInt(u16, buf[0..2], OPEN_CHANNEL_TYPE, .big);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+
+    var m = decodeOpenChannel(allocator, buf[0..len]) catch return;
+    defer m.deinit(allocator);
+}

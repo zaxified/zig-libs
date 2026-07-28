@@ -884,6 +884,89 @@ test "formatKeyId matches the CLI's le64-hex convention" {
     try std.testing.expectEqualStrings("5903374ED1B3A96B", &formatKeyId(key_number));
 }
 
+// ── fuzz: parseSignatureFile never panics on an arbitrary signature file ──
+//
+// A `.minisig` file is exactly what an attacker hands a verifier: 4
+// newline-separated lines (comment/base64-signature/comment/base64-
+// global-signature) that `parseSignatureFile` splits and base64-decodes
+// with no prior validation. Plain random bytes would almost always die on
+// the very first `MissingUntrustedCommentPrefix` check -- so this harness
+// builds a structurally-real 4-line skeleton (correct line prefixes, a
+// real base64-encoded `RawSignature`/global-signature payload built via
+// this file's own codecs) and only randomizes the comment text and the
+// two payloads' actual bytes/lengths, which is what drives the parser
+// into the base64-length/algorithm-tag/printable-comment checks instead
+// of bouncing off the first line every time.
+test "fuzz: parseSignatureFile never panics on arbitrary bytes" {
+    try std.testing.fuzz({}, fuzzParseSignatureFile, .{});
+}
+
+fn fuzzB64Line(smith: *std.testing.Smith, comptime wire_length: usize, out: *[Base64Codec(wire_length).encoded_length]u8) []const u8 {
+    const Codec = Base64Codec(wire_length);
+    if (smith.value(bool)) {
+        // A real base64-encoded payload of correct length, random content.
+        var raw: [wire_length]u8 = undefined;
+        smith.bytes(&raw);
+        out.* = Codec.encode(raw);
+        return out;
+    }
+    // Garbage of arbitrary length -- exercises WrongLength/InvalidBase64.
+    var buf: [Codec.encoded_length + 16]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    @memcpy(out[0..@min(len, out.len)], buf[0..@min(len, out.len)]);
+    return out[0..@min(len, out.len)];
+}
+
+fn fuzzParseSignatureFile(_: void, smith: *std.testing.Smith) !void {
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(std.testing.allocator);
+    const allocator = std.testing.allocator;
+
+    try text.appendSlice(allocator, untrusted_comment_prefix);
+    var comment_buf: [32]u8 = undefined;
+    smith.bytes(&comment_buf);
+    const comment_len: usize = smith.valueRangeAtMost(u8, 0, comment_buf.len);
+    try text.appendSlice(allocator, comment_buf[0..comment_len]);
+    try text.append(allocator, '\n');
+
+    var sig_out: [SignatureCodec.encoded_length]u8 = undefined;
+    try text.appendSlice(allocator, fuzzB64Line(smith, RawSignature.wire_length, &sig_out));
+    try text.append(allocator, '\n');
+
+    try text.appendSlice(allocator, trusted_comment_prefix);
+    var trusted_buf: [32]u8 = undefined;
+    smith.bytes(&trusted_buf);
+    const trusted_len: usize = smith.valueRangeAtMost(u8, 0, trusted_buf.len);
+    try text.appendSlice(allocator, trusted_buf[0..trusted_len]);
+    try text.append(allocator, '\n');
+
+    var gsig_out: [GlobalSignatureCodec.encoded_length]u8 = undefined;
+    try text.appendSlice(allocator, fuzzB64Line(smith, signature_length, &gsig_out));
+    if (smith.value(bool)) try text.append(allocator, '\n');
+
+    _ = parseSignatureFile(text.items) catch return;
+}
+
+// ── fuzz: isPrintableComment never panics/OOB-reads on arbitrary bytes ───
+//
+// A hand-rolled UTF-8 validator (ported from minisign.c's `is_printable`)
+// with its own byte-length/continuation-byte bookkeeping (`i + need >=
+// text.len`, overlong/surrogate range checks) -- exactly the shape of
+// parser most prone to an off-by-one OOB read, and it runs directly over
+// the trusted-comment bytes of an attacker-supplied signature file before
+// `parseSignatureFile` ever echoes them anywhere.
+test "fuzz: isPrintableComment never panics on arbitrary bytes" {
+    try std.testing.fuzz({}, fuzzIsPrintableComment, .{});
+}
+
+fn fuzzIsPrintableComment(_: void, smith: *std.testing.Smith) !void {
+    var buf: [64]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    _ = isPrintableComment(buf[0..len]);
+}
+
 test {
     _ = @import("kat_vectors.zig");
     _ = @import("kat_test.zig");

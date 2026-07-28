@@ -882,6 +882,74 @@ const SynthExt = struct {
     }
 };
 
+// ── fuzz: parseExt off the wire, never panics ───────────────────────────────
+//
+// `parseExt` is the entry point for a `.BTF.ext` blob lifted out of an
+// untrusted object file — same container shape as `btf.parse` (magic gate,
+// header length, offset/length pairs into `data` checked in u64 so a
+// `0xffffffff` offset cannot wrap), plus its own layer of
+// `{sec_name_off, num_info, records…}` groups per sub-section
+// (`validateGroups`). Build a structurally valid three-sub-section blob via
+// the same `SynthExt` fixture the hand-written tests below already use, so
+// the fuzzer reaches the group walk and the per-record accessors instead of
+// bouncing off `NotBtfExt` on the first two bytes, then truncate and/or
+// flip bytes.
+
+test "fuzz: parseExt never panics on a truncated/mutated synthetic .BTF.ext blob" {
+    try testing.fuzz({}, fuzzParseExt, .{});
+}
+
+fn fuzzParseExt(_: void, smith: *std.testing.Smith) !void {
+    const gpa = testing.allocator;
+    const func = SynthExt.section(gpa, 8, 1, &.{ 0, 7, 16, 9 }) catch return; // 2 FuncInfo
+    defer gpa.free(func);
+    const line = SynthExt.section(gpa, 16, 1, &.{ 0, 2, 3, (5 << 10) | 4 }) catch return; // 1 LineInfo
+    defer gpa.free(line);
+    const core = SynthExt.section(gpa, 16, 1, &.{ 8, 4, 11, 0, 24, 4, 15, 5 }) catch return; // 2 CoreRelo
+    defer gpa.free(core);
+    const seed = SynthExt.build(gpa, func, line, core, header_size_full) catch return;
+    defer gpa.free(seed);
+
+    const len: u32 = smith.valueRangeAtMost(u32, 0, @intCast(seed.len));
+    const mutant = gpa.dupe(u8, seed[0..len]) catch return;
+    defer gpa.free(mutant);
+
+    const n_flips: u8 = smith.valueRangeAtMost(u8, 0, 16);
+    var k: u8 = 0;
+    while (k < n_flips and mutant.len > 0) : (k += 1) {
+        mutant[smith.index(mutant.len)] = smith.value(u8);
+    }
+
+    const ext = parseExt(mutant) catch return;
+    _ = ext.hdr.hasCoreRelos();
+
+    // `parseExt` validates every group eagerly (`SectionIter.next` "cannot
+    // fail"), so walking every iterator to exhaustion and decoding every
+    // record is exactly the deferred-looking-but-actually-immediate surface
+    // worth exercising here.
+    var fit = ext.funcInfos();
+    var fi_groups: u32 = 0;
+    while (fit.next()) |s| : (fi_groups += 1) {
+        if (fi_groups > 64) break;
+        var i: u32 = 0;
+        while (i < s.count and i < 64) : (i += 1) _ = s.funcInfo(i);
+    }
+    var lit = ext.lineInfos();
+    var li_groups: u32 = 0;
+    while (lit.next()) |s| : (li_groups += 1) {
+        if (li_groups > 64) break;
+        var i: u32 = 0;
+        while (i < s.count and i < 64) : (i += 1) _ = s.lineInfo(i);
+    }
+    var cit = ext.coreRelos();
+    var cr_groups: u32 = 0;
+    while (cit.next()) |s| : (cr_groups += 1) {
+        if (cr_groups > 64) break;
+        var i: u32 = 0;
+        while (i < s.count and i < 64) : (i += 1) _ = s.coreRelo(i);
+    }
+}
+
 test "synthetic .BTF.ext: sections, groups and forward-compatible records" {
     const gpa = testing.allocator;
 

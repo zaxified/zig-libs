@@ -675,3 +675,121 @@ test "hostile: keylen of 0xff-class CompactSize with declared length far beyond 
     try buf.appendSlice(testing.allocator, &[_]u8{ 0xff, 0xff, 0xff, 0x7f }); // huge keylen
     try testing.expectError(error.Truncated, parse(testing.allocator, buf.items));
 }
+
+// ── fuzz: parse never panics on an arbitrary attacker-supplied PSBT ──────
+//
+// A PSBT is a file two wallets exchange directly over an untrusted
+// channel (BIP174's whole reason to exist). Plain random bytes after the
+// 5-byte magic would almost always die on the very first CompactSize
+// keylen -- so this harness builds a STRUCTURALLY valid skeleton (a real
+// legacy, no-witness, no-scriptSig unsigned tx via `bitcointx.
+// serializeLegacy`, so `n_in`/`n_out` come out non-degenerate and the
+// input/output map loops actually run) and only randomizes the part that
+// matters for THIS module: each map's key-value records, with the keytype
+// biased toward the real registries (`global_key`/`input_key`/
+// `output_key`) and the value bytes biased toward both the exact required
+// shape and arbitrary lengths -- this is what drives `validateGlobalMap`/
+// `validateInputMap`/`validateOutputMap`'s per-keytype shape checks
+// (`requirePubkeyLen`/`requireFixedValueLen`/`requireBip32ValueShape`)
+// instead of bouncing off the map-level CompactSize truncation checks
+// every time.
+test "fuzz: parse never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzParse, .{});
+}
+
+fn appendFuzzRecord(list: *std.ArrayList(u8), allocator: Allocator, keytype: u64, keydata: []const u8, value: []const u8) !void {
+    var keytype_buf: [9]u8 = undefined;
+    const kt_enc = bitcointx.encodeCompactSize(keytype, &keytype_buf) catch unreachable;
+    try appendCompactSize(list, allocator, kt_enc.len + keydata.len);
+    try list.appendSlice(allocator, kt_enc);
+    try list.appendSlice(allocator, keydata);
+    try appendCompactSize(list, allocator, value.len);
+    try list.appendSlice(allocator, value);
+}
+
+/// Appends `n` Smith-driven pseudo-random records to `list`, biased toward
+/// `known_keytypes` and toward the value shapes each keytype's validator
+/// actually checks (a 33-byte pubkey keydata, a 4-or-4k-byte BIP32/fixed
+/// value) -- with fully random keytype/keydata/value lengths some of the
+/// time, so both the "valid shape" and "wrong shape" branches get hit.
+fn appendFuzzedRecords(
+    list: *std.ArrayList(u8),
+    allocator: Allocator,
+    smith: *std.testing.Smith,
+    known_keytypes: []const u64,
+) !void {
+    const n = smith.valueRangeAtMost(u8, 0, 5);
+    var i: u8 = 0;
+    while (i < n) : (i += 1) {
+        const keytype: u64 = if (smith.value(bool))
+            known_keytypes[smith.valueRangeAtMost(u8, 0, @intCast(known_keytypes.len - 1))]
+        else
+            smith.value(u16);
+
+        var keydata_buf: [65]u8 = undefined;
+        const keydata_len: usize = if (smith.value(bool))
+            (if (smith.value(bool)) @as(usize, 33) else 65) // pubkey-shaped
+        else
+            smith.valueRangeAtMost(u8, 0, keydata_buf.len);
+        smith.bytes(keydata_buf[0..keydata_len]);
+
+        var value_buf: [80]u8 = undefined;
+        const value_len: usize = if (smith.value(bool))
+            4 * (1 + smith.valueRangeAtMost(u8, 0, 4)) // BIP32/fixed-field-shaped: 4, 8, 12, ...
+        else
+            smith.valueRangeAtMost(u8, 0, value_buf.len);
+        smith.bytes(value_buf[0..value_len]);
+
+        try appendFuzzRecord(list, allocator, keytype, keydata_buf[0..keydata_len], value_buf[0..value_len]);
+    }
+    try list.append(allocator, 0x00); // map terminator
+}
+
+fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
+    const allocator = testing.allocator;
+
+    const n_in: usize = smith.valueRangeAtMost(u8, 0, 3);
+    const n_out: usize = smith.valueRangeAtMost(u8, 0, 3);
+
+    var vin_buf: [3]bitcointx.TxIn = undefined;
+    for (vin_buf[0..n_in]) |*vin| {
+        vin.* = .{ .prevout = .{ .txid = @splat(0), .vout = 0 }, .script_sig = &.{}, .sequence = 0xffffffff };
+    }
+    var vout_buf: [3]bitcointx.TxOut = undefined;
+    for (vout_buf[0..n_out]) |*vout| {
+        vout.* = .{ .value = 0, .script_pubkey = &.{} };
+    }
+    const utx: bitcointx.Transaction = .{
+        .version = 2,
+        .vin = vin_buf[0..n_in],
+        .vout = vout_buf[0..n_out],
+        .witness = &.{},
+        .locktime = 0,
+        .has_witness = false,
+    };
+    const utx_bytes = bitcointx.serializeLegacy(allocator, utx) catch return;
+    defer allocator.free(utx_bytes);
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try buf.appendSlice(allocator, &magic);
+
+    // Global map: the mandatory UNSIGNED_TX record, then fuzzed extras.
+    try appendFuzzRecord(&buf, allocator, global_key.UNSIGNED_TX, &.{}, utx_bytes);
+    try appendFuzzedRecords(&buf, allocator, smith, &.{ global_key.XPUB, global_key.VERSION, global_key.PROPRIETARY });
+
+    var i: usize = 0;
+    while (i < n_in) : (i += 1) {
+        try appendFuzzedRecords(&buf, allocator, smith, &.{
+            input_key.NON_WITNESS_UTXO, input_key.WITNESS_UTXO,     input_key.PARTIAL_SIG,
+            input_key.SIGHASH_TYPE,     input_key.BIP32_DERIVATION,
+        });
+    }
+    i = 0;
+    while (i < n_out) : (i += 1) {
+        try appendFuzzedRecords(&buf, allocator, smith, &.{ output_key.REDEEM_SCRIPT, output_key.BIP32_DERIVATION });
+    }
+
+    var psbt = parse(allocator, buf.items) catch return;
+    defer psbt.deinit(allocator);
+}

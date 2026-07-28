@@ -635,3 +635,34 @@ test "hostile: reply_channel_range with an encoded_short_ids length prefix excee
     try buf.appendSlice(testing.allocator, &.{ 0xff, 0xff }); // len=65535, nothing follows
     try testing.expectError(error.Truncated, decodeReplyChannelRange(testing.allocator, buf.items));
 }
+
+// ── fuzz: decodeQueryShortChannelIds never panics on arbitrary bytes ──────
+//
+// The BOLT#7 gossip-query family's other recurring shape: a fixed prefix
+// plus a `u16`-length-prefixed variable field (`encoded_short_ids`, whose
+// own length prefix is exactly the "PSBT/TLV length-prefix" hazard class
+// this pass is watching for) before the trailing tlv_stream. `chain_hash`
+// (32) + `bytesU16` + `decodeExtension` is also `reply_channel_range`'s
+// and `channel_announcement`'s `features` field's shape, so this one
+// harness stands in for that whole sub-family.
+test "fuzz: decodeQueryShortChannelIds never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzDecodeQueryShortChannelIds, .{});
+}
+
+fn fuzzDecodeQueryShortChannelIds(_: void, smith: *std.testing.Smith) !void {
+    const allocator = testing.allocator;
+    var buf: [256]u8 = undefined;
+    smith.bytes(&buf);
+    std.mem.writeInt(u16, buf[0..2], QUERY_SHORT_CHANNEL_IDS_TYPE, .big);
+    // Bias the encoded_short_ids length prefix (bytes[34..36], right after
+    // the 2-byte type + 32-byte chain_hash) toward both near-buffer-size
+    // values (exercise the truncation path) and fully random ones.
+    if (smith.value(bool)) {
+        const near: u16 = @intCast(buf.len - 36 + smith.valueRangeAtMost(u8, 0, 4));
+        std.mem.writeInt(u16, buf[34..36], near, .big);
+    }
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+
+    var m = decodeQueryShortChannelIds(allocator, buf[0..len]) catch return;
+    defer m.deinit(allocator);
+}

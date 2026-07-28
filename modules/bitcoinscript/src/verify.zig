@@ -434,3 +434,71 @@ test "DoS: oversized scriptPubKey rejected before any execution" {
     @memset(&big, 0x61);
     try testing.expectError(error.ScriptSize, verifyScript(arena.allocator(), &.{}, &big, &.{}, ScriptFlags.none, dummyCtx()));
 }
+
+// ── fuzz: verifyScript never panics on arbitrary attacker-controlled ─────
+// script/witness bytes ────────────────────────────────────────────────────
+//
+// `verifyScript` is THE consensus-critical boundary this whole module
+// exists for: `script_sig` comes from a peer's transaction, `script_pubkey`
+// from whatever previous output is being spent, `witness` from the same
+// transaction's witness stack -- all attacker-controlled the moment this
+// runs inside a node validating an incoming tx/block. It drives the
+// interpreter's full opcode dispatch (arithmetic, stack manipulation,
+// hashing, CHECKSIG/CHECKMULTISIG, the P2SH/segwit/taproot sub-paths) --
+// exactly where a real script interpreter's classic bug classes live
+// (stack-depth/height confusion, `CScriptNum` decode edge cases, push-size
+// bookkeeping). Bytes are biased toward *some* structure: most opcode
+// bytes are drawn from the actual defined range (`0x00..0xba`, covering
+// every real opcode including the push-data forms) rather than fully
+// uniform, so the interpreter's dispatch table and its push-length
+// bookkeeping actually get exercised instead of dying on the first
+// undefined-opcode byte; flags and the witness stack are randomized too,
+// so the P2SH/segwit-v0/taproot sub-paths of `verifyScript` above get a
+// turn as well.
+test "fuzz: verifyScript never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzVerifyScript, .{});
+}
+
+fn fuzzScriptBytes(smith: *std.testing.Smith, buf: []u8) []u8 {
+    for (buf) |*b| {
+        // Real opcodes (incl. push-data forms) 5-in-6 of the time; fully
+        // random (incl. bytes past 0xba) the rest.
+        b.* = if (smith.valueRangeAtMost(u8, 0, 5) != 0) smith.valueRangeAtMost(u8, 0, 0xba) else smith.value(u8);
+    }
+    const len: usize = smith.valueRangeAtMost(u8, 0, @intCast(buf.len));
+    return buf[0..len];
+}
+
+fn fuzzVerifyScript(_: void, smith: *std.testing.Smith) !void {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var sig_buf: [64]u8 = undefined;
+    const script_sig = fuzzScriptBytes(smith, &sig_buf);
+    var pubkey_buf: [96]u8 = undefined;
+    const script_pubkey = fuzzScriptBytes(smith, &pubkey_buf);
+
+    const n_witness = smith.valueRangeAtMost(u8, 0, 4);
+    var witness_bufs: [4][80]u8 = undefined;
+    var witness_items: [4][]const u8 = undefined;
+    var i: u8 = 0;
+    while (i < n_witness) : (i += 1) {
+        smith.bytes(&witness_bufs[i]);
+        const wlen: usize = smith.valueRangeAtMost(u8, 0, witness_bufs[i].len);
+        witness_items[i] = witness_bufs[i][0..wlen];
+    }
+
+    const sf: ScriptFlags = .{
+        .p2sh = smith.value(bool),
+        .dersig = smith.value(bool),
+        .low_s = smith.value(bool),
+        .strictenc = smith.value(bool),
+        .cleanstack = smith.value(bool),
+        .witness = smith.value(bool),
+        .minimaldata = smith.value(bool),
+        .taproot = smith.value(bool),
+    };
+
+    verifyScript(a, script_sig, script_pubkey, witness_items[0..n_witness], sf, dummyCtx()) catch return;
+}

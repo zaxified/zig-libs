@@ -1015,6 +1015,69 @@ const SynthElf = struct {
     }
 };
 
+// ── fuzz: openImage off the wire, never panics ──────────────────────────────
+//
+// `openImage` is the entry point for a BPF loader's ELF64 container parse —
+// bytes from a `.o` a caller asks to load, an attacker-supplied binary with
+// offset/count tables (`e_shoff`/`e_shnum`, `sh_offset`/`sh_size`) that point
+// into each other exactly like this file's own module doc warns about
+// ("only the header and the section-header table are validated eagerly; a
+// section whose sh_offset/sh_size runs past the end of the buffer is caught
+// when its data is asked for"). Build a structurally valid image via the
+// same `SynthElf` builder the round-trip tests above already use (so the
+// fuzzer reaches the section-table walk and every accessor's deferred
+// bounds-check, instead of bouncing off `NotAnElf` on the first four
+// bytes), then truncate and/or flip bytes.
+//
+// NOTE: `readFileAlloc` (also named in the task this harness closes out) is
+// deliberately NOT fuzzed here — it is a thin file-read wrapper (open +
+// size-check against a caller-supplied cap + pread), not a parser; it never
+// interprets the bytes it reads, so there is nothing structural to fuzz.
+// `openImage` is the actual untrusted-container parser: it takes bytes
+// directly with no file I/O at all, which is the real boundary and the
+// target below.
+
+test "fuzz: openImage never panics on a truncated/mutated synthetic ELF image" {
+    try testing.fuzz({}, fuzzOpenImage, .{});
+}
+
+fn fuzzOpenImage(_: void, smith: *std.testing.Smith) !void {
+    const gpa = testing.allocator;
+    const seed = SynthElf.build(gpa) catch return;
+    defer gpa.free(seed);
+
+    const len: u32 = smith.valueRangeAtMost(u32, 0, @intCast(seed.len));
+    const mutant = gpa.dupe(u8, seed[0..len]) catch return;
+    defer gpa.free(mutant);
+
+    const n_flips: u8 = smith.valueRangeAtMost(u8, 0, 12);
+    var k: u8 = 0;
+    while (k < n_flips and mutant.len > 0) : (k += 1) {
+        mutant[smith.index(mutant.len)] = smith.value(u8);
+    }
+
+    var image = openImage(gpa, mutant, false) catch return;
+    defer image.deinit();
+
+    // Walk the deferred-validation accessors: every one of these must fail
+    // closed (a typed `ImageError`), never panic, even against a section
+    // table whose sh_offset/sh_size/sh_entsize the mutation above may have
+    // pushed out of range.
+    if (image.sections.len > 0) {
+        const i = smith.index(image.sections.len);
+        _ = image.sectionName(i);
+        _ = image.sectionData(i) catch {};
+        if (image.symbolCount(i) catch null) |cnt| {
+            if (cnt > 0) _ = image.symbol(i, @intCast(smith.index(cnt))) catch {};
+        }
+        if (image.relocationCount(i) catch null) |rcnt| {
+            if (rcnt > 0) _ = image.relocation(i, @intCast(smith.index(rcnt))) catch {};
+        }
+    }
+    _ = image.symtabIndex();
+    _ = image.findSection("license");
+}
+
 /// Write `bytes` to a private temp path and return the path (caller frees).
 /// Raw syscalls only — this module forbids libc, and `std.fs`'s 0.16 API
 /// needs an `Io` this module deliberately does not take.
