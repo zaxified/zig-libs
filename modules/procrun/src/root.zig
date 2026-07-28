@@ -461,13 +461,28 @@ fn loadParentEnv(gpa: std.mem.Allocator, io: std.Io, map: *std.process.Environ.M
             // /proc/self/environ is the libc-free way to read the ambient
             // environment without an `Init`. Absent on non-Linux POSIX → the
             // parent snapshot is simply empty (documented on EnvMode.merge).
+            //
+            // Deliberately NOT `file.reader(io, &buf)` + `allocRemaining`:
+            // that path (`Io.Writer.Allocating.sendFile`) trusts
+            // `File.Reader.getSize()` (a `stat()` call) to decide how many
+            // bytes remain, and procfs files report `st_size == 0` — so
+            // `additional = size - pos` comes out `0` and it returns
+            // `error.EndOfStream` before a single byte is read, silently
+            // yielding an EMPTY environment. Reading via a raw
+            // `readStreaming` loop (same primitive `drainLoop` above uses)
+            // never consults the reported size — it just reads until the
+            // kernel reports EOF (`n == 0`).
             var file = std.Io.Dir.cwd().openFile(io, "/proc/self/environ", .{}) catch return;
             defer file.close(io);
+            var data: std.ArrayList(u8) = .empty;
+            defer data.deinit(gpa);
             var rbuf: [4096]u8 = undefined;
-            var reader = file.reader(io, &rbuf);
-            const data = reader.interface.allocRemaining(gpa, .unlimited) catch return;
-            defer gpa.free(data);
-            var it = std.mem.splitScalar(u8, data, 0);
+            while (true) {
+                const n = file.readStreaming(io, &.{rbuf[0..]}) catch break;
+                if (n == 0) break;
+                try data.appendSlice(gpa, rbuf[0..n]);
+            }
+            var it = std.mem.splitScalar(u8, data.items, 0);
             while (it.next()) |entry| {
                 if (entry.len == 0) continue;
                 const eq = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
@@ -1294,6 +1309,54 @@ test "run: merge env overlays the child environment" {
 
     try testing.expect(out.term == .exited);
     try testing.expectEqualStrings("merged", out.stdout);
+}
+
+test "run: merge env actually INHERITS the parent's variables" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest; // needs /proc
+    if (!std.process.can_spawn) return error.SkipZigTest;
+
+    // The overlay test above passes even when the parent snapshot is empty —
+    // it only ever asserts the variable it supplied itself. That is what let
+    // a real bug hide: `/proc/self/environ` reports `st_size == 0`, the size-
+    // trusting read path returned zero bytes, and `.merge` silently produced
+    // an environment containing ONLY the overlay. This asserts the other half,
+    // the half that was broken: a variable the caller did NOT supply, which
+    // exists only because the parent had it, must reach the child.
+    //
+    // Ground truth is `std.testing.environ` — the environment captured at
+    // process start, independent of the /proc read being tested, so the test
+    // cannot agree with the code under test by sharing its mistake.
+    var parent = std.testing.environ.createMap(testing.allocator) catch return error.SkipZigTest;
+    defer parent.deinit();
+
+    // Any inherited variable will do; prefer well-known ones so the name is
+    // shell-safe to interpolate. A stripped environment skips rather than
+    // failing — there would be nothing to inherit.
+    const probe = for ([_][]const u8{ "PATH", "HOME", "USER", "LANG" }) |name| {
+        if (parent.get(name)) |v| if (v.len > 0) break .{ .name = name, .value = v };
+    } else return error.SkipZigTest;
+
+    var overlay = std.process.Environ.Map.init(testing.allocator);
+    defer overlay.deinit();
+    try overlay.put("PROCRUN_TEST_OVERLAY", "x"); // deliberately NOT the probe
+
+    const cmd = try std.fmt.allocPrint(testing.allocator, "printf %s \"${s}\"", .{probe.name});
+    defer testing.allocator.free(cmd);
+
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var out = try run(testing.allocator, io, .{
+        .argv = &.{ "sh", "-c", cmd },
+        .env = &overlay,
+        .env_mode = .merge,
+    }, "");
+    defer out.deinit(testing.allocator);
+
+    try testing.expect(out.term == .exited);
+    // Against the bug this was "" — the parent snapshot never arrived.
+    try testing.expectEqualStrings(probe.value, out.stdout);
 }
 
 // ── process-group tree-kill tests ───────────────────────────────────────────
