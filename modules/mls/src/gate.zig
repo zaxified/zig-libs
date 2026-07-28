@@ -21,23 +21,29 @@
 //! merges reproducing `tree_hash_after`).
 //!
 //! **This file gates Part 2 and only Part 2.** Part 4 (`keyschedule.zig`/
-//! `secrettree.zig`, RFC 9420 §8/§9) and Part 5 (`framing.zig`/
-//! `content.zig`/`keypackage.zig`/`transcript.zig`, RFC 9420 §6/§8.2 plus
-//! the §10/§12.1/§12.4 structures framing carries) deliberately add no
-//! switch of their own: every function in them is real and every one is
-//! driven byte-exact by an official interop vector
-//! (`key-schedule.json`/`psk_secret.json`/`secret-tree.json` for Part 4;
-//! `messages.json`/`message-protection.json`/`transcript-hashes.json` for
-//! Part 5), so there is nothing to stage. A gate constant that is always
-//! `true` for work that was never staged would be exactly the "describes
-//! finished work as provisional" noise this module has been keeping out.
+//! `secrettree.zig`, RFC 9420 §8/§9), Part 5 (`framing.zig`/`content.zig`/
+//! `keypackage.zig`/`transcript.zig`, RFC 9420 §6/§8.2 plus the §10/§12.1/
+//! §12.4 structures framing carries) and Part 6 (`welcome.zig`, RFC 9420
+//! §12.4.3/§12.4.3.1/§12.4.3.3) deliberately add no switch of their own:
+//! every function in them is real and every one is driven byte-exact by an
+//! official interop vector (`key-schedule.json`/`psk_secret.json`/
+//! `secret-tree.json` for Part 4; `messages.json`/
+//! `message-protection.json`/`transcript-hashes.json` for Part 5;
+//! `welcome.json` plus `messages.json`'s Part 6 fields for Part 6), so
+//! there is nothing to stage. A gate constant that is always `true` for
+//! work that was never staged would be exactly the "describes finished
+//! work as provisional" noise this module has been keeping out.
 //!
-//! What Part 5 leaves out is left out ENTIRELY rather than gated — no
-//! `Welcome`/`GroupInfo` payload (`framing.MLSMessage.decode` returns
-//! `error.WireFormatNotInThisPart`, a named refusal, not a stub), no §10.1
-//! KeyPackage validation, no §12.2 proposal-list validity, no
-//! commit-processing state machine. There is no half-built code behind a
-//! switch anywhere in it.
+//! What Parts 5 and 6 leave out is left out ENTIRELY rather than gated —
+//! no §10.1 KeyPackage validation, no §12.2 proposal-list validity, no
+//! commit-processing state machine, and no external-Commit path
+//! (§12.4.3.2/§8.3 — scoped out, not blocked; see `welcome.zig`'s doc
+//! comment). There is no half-built code behind a switch anywhere in
+//! them. Note that Part 5's one named refusal,
+//! `error.WireFormatNotInThisPart`, is GONE: Part 6 supplied the
+//! `Welcome`/`GroupInfo` payloads it stood for, so
+//! `framing.MLSMessage.decode` now handles every §17.2 wire format and the
+//! error would have no reachable return site.
 //!
 //! The switch is retained (rather than deleted) so the ratchet-tree data/
 //! codec/tree-hash/tree-editing layer stays independently testable should a

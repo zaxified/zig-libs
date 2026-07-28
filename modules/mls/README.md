@@ -28,6 +28,11 @@ and §12.4 `Commit` wire formats framing carries, the §10 `KeyPackage`
 wire format an `Add` carries, and §8.2's transcript hashes — pinned
 byte-exact against the official `messages`/`message-protection`/
 `transcript-hashes` vectors, see `SPEC.md`'s "Part 5" section.
+**Part 6: joining a group** — RFC 9420 §12.4.3's `GroupInfo`, §12.4.3.1's
+`Welcome`/`GroupSecrets` with both encryption layers, §12.4.3.3's
+`ratchet_tree`/`external_pub` extensions and the tree-hash binding, and
+the joiner's own procedure (`join`) — pinned byte-exact against the
+official `welcome` vector, see `SPEC.md`'s "Part 6" section.
 
 **Status: Part 1 COMPLETE, entirely Sonnet-tier. Part 2 COMPLETE** — the
 data/codec/tree-hash/tree-editing pieces are Sonnet-tier (mechanical
@@ -37,17 +42,22 @@ KAT-pinned (all 14 trees' resolutions, 275 single-byte parent-hash tamper
 rejections, 62 UpdatePath processings across 328 receiver views, and 62
 merges reproducing `tree_hash_after`) behind `gate.treekem_core_implemented`
 (now `true`). **Part 4 COMPLETE** (Sonnet-tier), except §8.3's external
-initialization, which needs Part 6's external-commit flow and is not
-stubbed here. **Part 5 COMPLETE** (Sonnet-tier) — and it closed §8.2, the
-other gap Part 4 had left open.
-Part 3 (KeyPackage/LeafNode VALIDATION + Credential) and Part 6 (external
-commit / `Welcome` / `GroupInfo` / reinit) remain; see `SPEC.md`'s "Arc
-breakdown". What this module can do today: produce and consume real MLS
-messages other implementations accept byte-for-byte, for a group whose
-state the caller maintains. What it cannot: join a group (no
-`Welcome`/`GroupInfo`), decide whether a KeyPackage or LeafNode should be
-admitted (§10.1/§7.3), or apply a Commit to a tree and advance an epoch
-(§12.2-§12.4.2) — it has no group-state object.
+initialization, which belongs with Part 6's external-commit flow and is
+not stubbed here. **Part 5 COMPLETE** (Sonnet-tier) — and it closed §8.2, the
+other gap Part 4 had left open. **Part 6 COMPLETE for the Welcome path**
+(Sonnet-tier); §8.3 and §12.4.3.2's external commits are what remain of
+it — scoped out of that batch, not blocked (the sibling `hpke` module
+exports RFC 9180 §5.1's setup layer, which is what §8.3 needs), and
+neither is stubbed here.
+Part 3 (KeyPackage/LeafNode VALIDATION + Credential) also remains; see
+`SPEC.md`'s "Arc breakdown". What this module can do today: produce and
+consume real MLS messages other implementations accept byte-for-byte, and
+JOIN a group from a `Welcome` — arriving at the same epoch secrets,
+`GroupContext` and transcript hashes as every existing member, with the
+`confirmation_tag` checked against a `confirmation_key` it derived itself.
+What it cannot: FOLLOW the group afterwards (no §12.2-§12.4.2 commit
+processing — it has no group-state object), join by external Commit, or
+decide whether a KeyPackage or LeafNode should be admitted (§10.1/§7.3).
 
 | File | Provides |
 |---|---|
@@ -70,8 +80,10 @@ admitted (§10.1/§7.3), or apply a Commit to a tree and advance an epoch
 | `content.zig` | Part 5's §12.1 `Proposal` (all seven types) + §12.4 `Commit`/`ProposalOrRef` — wire shape only; no proposal-list validity, no commit processing |
 | `framing.zig` | Part 5's whole of §6: `Sender`/`FramedContent`/`AuthenticatedContent`, §6.1 sign+verify, §6.2 `PublicMessage` + `protectPublic`/`unprotectPublic`, §6.3 `PrivateMessage` + `protectPrivate`/`decryptSenderData`/`decryptContent`/`parsePrivateContent`, `MLSMessage` |
 | `transcript.zig` | Part 5's §8.2 `confirmedTranscriptHash`/`interimTranscriptHash`/`advance` — the gap Part 4 named and could not fill |
-| `kat_messages_test.zig` | Part 5's official `messages.json`, every embedded field decode→re-encode byte-exact |
+| `kat_messages_test.zig` | Parts 5+6's official `messages.json`, every embedded field decode→re-encode byte-exact (including §12.4.3.1's `Welcome`/`GroupInfo`/`GroupSecrets` and §12.4.3.3's bare `ratchet_tree`) |
 | `kat_framing_test.zig` | Part 5's official `message-protection.json` (protect/unprotect byte-exact both directions) + `transcript-hashes.json` (§8.2) |
+| `welcome.zig` | Part 6's §12.4.3 `GroupInfo` (+ `sign`/`verifySignature`), §12.4.3.1 `GroupSecrets`/`EncryptedGroupSecrets`/`Welcome`, `welcomeKeyNonce`/`encryptGroupInfo`/`decryptGroupInfo`, `encryptGroupSecrets`/`decryptGroupSecrets`, `join`, and §12.4.3.3's `ratchetTree`/`externalPub`/`verifyTreeHash` |
+| `kat_welcome_test.zig` | Part 6's official `welcome.json`, the whole join staged per layer — plus the vector's `encrypted_group_info` reproduced in the SEND direction |
 
 - **Model after:** RFC 9420 (Messaging Layer Security); `treemath.zig`
   ports Appendix C's own published reference algorithm.
@@ -340,7 +352,7 @@ switch (msg) {
         defer ac.deinit(allocator);
         try fr.verifyFramedContent(S, allocator, sender_pub, ac, encoded_gc);
     },
-    .key_package => {},
+    .key_package, .welcome, .group_info => {},
 }
 ```
 
@@ -361,6 +373,63 @@ th.interim;    // -> the NEXT epoch's interim_prev
 
 ```zig
 const ref = try fr.proposalRef(S, allocator, proposal_authenticated_content);
+```
+
+## API surface (Part 6 — joining a group)
+
+**Joining** (`welcome.zig`, RFC 9420 §12.4.3/§12.4.3.1). One call runs the
+whole receiving procedure: find this client's slot, HPKE-open the
+`GroupSecrets`, derive `welcome_secret`, decrypt and verify the
+`GroupInfo`, enter §8's chain at `joiner_secret`, and check the
+`confirmation_tag` against the `confirmation_key` it just derived.
+
+```zig
+var r = mls.codec.Reader.init(received_welcome);
+const msg = try mls.framing.MLSMessage.decode(allocator, &r);
+defer msg.deinit(allocator);
+
+// §5.2 over YOUR encoded KeyPackage — what names your slot in the Welcome
+const my_ref = try mls.make_keypackage_ref(S, my_encoded_key_package);
+
+var joined = try mls.welcome.join(S, allocator, .{
+    .welcome = msg.welcome,
+    .key_package_ref = &my_ref,
+    .init_key_pair = my_init_key_pair,      // private half of KeyPackage.init_key
+    // §12.4.3: the signature_key of the tree leaf at GroupInfo.signer.
+    // Resolving it needs the tree, so it is YOURS to supply.
+    .signer_key = signer_leaf_signature_key,
+    .psks = &.{},                            // resolved in GroupSecrets order
+});
+defer joined.deinit(allocator);
+
+joined.secrets;                    // every §8 secret for the epoch
+joined.group_info.group_context;   // the signed GroupContext
+joined.interim_transcript_hash;    // §8.2, for the NEXT epoch
+joined.group_secrets.path_secret;  // §12.4.3.1, if the Commit reset your path
+```
+
+**The tree** (§12.4.3.3). A `GroupInfo` may carry the whole ratchet tree in
+a `ratchet_tree` extension, or the tree may arrive out of band. Either way
+the tree hash is what binds it to the signed `GroupContext`, so check it:
+
+```zig
+var t = try joined.group_info.ratchetTree(allocator);  // error.ExtensionNotFound if absent
+defer t.deinit();
+try mls.welcome.verifyTreeHash(S, allocator, &t, joined.group_info.group_context);
+// still YOURS: treekem.validateParentHashes, §7.3 leaf validation,
+// finding your own leaf, installing private keys from path_secret.
+const external_pub = try joined.group_info.externalPub();  // §12.4.3.2, wire read only
+```
+
+**Sending a Welcome.** The two layers are separate calls, because the
+committer owns the group state that assembles them:
+
+```zig
+const egi = try mls.welcome.encryptGroupInfo(S, allocator, welcome_secret, encoded_group_info);
+defer allocator.free(egi);
+// NOTE the context argument: the whole `egi` blob, which is what binds
+// each per-member ciphertext to this one GroupInfo (§12.4.3.1).
+const ct = try mls.welcome.encryptGroupSecrets(S, allocator, io, recipient_init_key, egi, encoded_group_secrets);
 ```
 
 ## Verify
@@ -396,6 +465,14 @@ round-trip procedure, see `SPEC.md`; application content as a
 `PublicMessage` is checked to be REFUSED, per §6), and
 `transcript-hashes.json` (§8.2's two hashes plus the Commit's own
 `confirmation_tag`) — all byte-exact.
+Part 6 adds `welcome.json` (the whole §12.4.3.1 join with real keys, staged
+per layer, plus the vector's own `encrypted_group_info` reproduced in the
+SEND direction — stronger than that vector's stated receive-only
+procedure) and extends `messages.json` to §12.4.3.1's `Welcome`/
+`GroupInfo`/`GroupSecrets` and §12.4.3.3's bare `ratchet_tree`, decode →
+re-encode byte-exact. The per-member HPKE layer is round-trip only in the
+SEND direction and says so: HPKE draws a fresh ephemeral keypair per
+encryption and the vector publishes only the resulting public `kem_output`.
 Green in Debug and ReleaseFast.
 
 ## Provenance

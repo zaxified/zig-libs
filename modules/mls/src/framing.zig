@@ -83,6 +83,12 @@ const keypackage = @import("keypackage.zig");
 const keyschedule = @import("keyschedule.zig");
 const secrettree = @import("secrettree.zig");
 const wire = @import("wire_lists.zig");
+// `welcome.zig` imports `transcript.zig`, which imports this file back —
+// a legal import cycle in Zig (files are analyzed lazily) and NOT a type
+// cycle: no struct here contains one whose size depends on this one.
+// `MLSMessage` carries `welcome.Welcome`/`welcome.GroupInfo` by value, and
+// neither of those reaches back into `framing`.
+const welcome_mod = @import("welcome.zig");
 
 const varintLen = wire.varintLen;
 
@@ -103,11 +109,6 @@ pub const Error = error{
     /// rather than producing a message that is legal TLS-presentation
     /// syntax and illegal MLS.
     ApplicationContentMustBeEncrypted,
-    /// An `MLSMessage` named `mls_welcome`/`mls_group_info` — real §17.2
-    /// wire formats whose payloads (`Welcome`, `GroupInfo`) are a later
-    /// part's structures, so this file cannot decode past the header. NOT
-    /// the same as an unrecognized value, which is `Malformed`.
-    WireFormatNotInThisPart,
     /// A `PrivateMessageContent`'s padding region contained a non-zero
     /// octet (RFC 9420 §6.3.1: "A receiver MUST verify that there are no
     /// non-zero bytes in the padding field, and if this check fails, the
@@ -1031,24 +1032,31 @@ pub fn protectPrivate(comptime S: type, allocator: std.mem.Allocator, params: Pr
 
 // ── §6: MLSMessage ────────────────────────────────────────────────────────
 
-/// RFC 9420 §6's outermost envelope. This part decodes the three arms whose
-/// payloads exist: `mls_public_message`, `mls_private_message` and
-/// `mls_key_package` (see `keypackage.zig` for why §10's struct is here).
-/// `mls_welcome`/`mls_group_info` are real §17.2 wire formats whose bodies
-/// (`Welcome`, `GroupInfo`, RFC 9420 §12.4.3.1) are a later part's — they
-/// decode to `error.WireFormatNotInThisPart`, distinct from the
-/// `error.Malformed` an unregistered value gets, so a caller can tell "not
-/// yet implemented" from "not a thing".
+/// RFC 9420 §6's outermost envelope, covering every §17.2 wire format the
+/// registry defines: `mls_public_message`, `mls_private_message` and
+/// `mls_key_package` (see `keypackage.zig` for why §10's struct is here),
+/// plus `mls_welcome` and `mls_group_info`, whose bodies live in
+/// `welcome.zig` (RFC 9420 §12.4.3/§12.4.3.1). An unregistered wire-format
+/// value is `error.Malformed` — there is nothing to decode past it.
+///
+/// Note the asymmetry `mls_welcome` introduces: a `Welcome` is the ONE arm
+/// whose cipher suite is carried in the message itself rather than in a
+/// `GroupContext`, because its recipient is by definition not yet a member
+/// and has no group state to look it up in.
 pub const MLSMessage = union(enum) {
     public_message: PublicMessage,
     private_message: PrivateMessage,
     key_package: keypackage.KeyPackage,
+    welcome: welcome_mod.Welcome,
+    group_info: welcome_mod.GroupInfo,
 
     pub fn wireFormat(self: MLSMessage) WireFormat {
         return switch (self) {
             .public_message => .mls_public_message,
             .private_message => .mls_private_message,
             .key_package => .mls_key_package,
+            .welcome => .mls_welcome,
+            .group_info => .mls_group_info,
         };
     }
 
@@ -1057,16 +1065,20 @@ pub const MLSMessage = union(enum) {
             .public_message => |m| m.encodedLen(),
             .private_message => |m| m.encodedLen(),
             .key_package => |m| m.encodedLen(),
+            .welcome => |m| m.encodedLen(),
+            .group_info => |m| m.encodedLen(),
         };
     }
 
-    pub fn encode(self: MLSMessage, w: *codec.Writer) Error!void {
+    pub fn encode(self: MLSMessage, w: *codec.Writer) !void {
         try w.writeEnum(keyschedule.ProtocolVersion, .mls10);
         try w.writeEnum(WireFormat, self.wireFormat());
         switch (self) {
             .public_message => |m| try m.encode(w),
             .private_message => |m| try m.encode(w),
             .key_package => |m| try m.encode(w),
+            .welcome => |m| try m.encode(w),
+            .group_info => |m| try m.encode(w),
         }
     }
 
@@ -1076,7 +1088,8 @@ pub const MLSMessage = union(enum) {
             .mls_public_message => .{ .public_message = try PublicMessage.decode(allocator, r) },
             .mls_private_message => .{ .private_message = try PrivateMessage.decode(r) },
             .mls_key_package => .{ .key_package = try keypackage.KeyPackage.decode(allocator, r) },
-            .mls_welcome, .mls_group_info => error.WireFormatNotInThisPart,
+            .mls_welcome => .{ .welcome = try welcome_mod.Welcome.decode(allocator, r) },
+            .mls_group_info => .{ .group_info = try welcome_mod.GroupInfo.decode(allocator, r) },
             else => error.Malformed,
         };
     }
@@ -1086,6 +1099,8 @@ pub const MLSMessage = union(enum) {
             .public_message => |m| m.deinit(allocator),
             .private_message => {},
             .key_package => |m| m.deinit(allocator),
+            .welcome => |m| m.deinit(allocator),
+            .group_info => |m| m.deinit(allocator),
         }
     }
 
@@ -1351,11 +1366,17 @@ test "applyReuseGuard: involutive, and touches only the first four bytes" {
     try testing.expectEqualSlices(u8, &nonce, &applyReuseGuard(TestSuite, once, guard));
 }
 
-test "MLSMessage: welcome/group_info are named as a later part, unknown values are Malformed" {
-    // version=1, wire_format=3 (mls_welcome)
+test "MLSMessage: every §17.2 wire format decodes; an unregistered value is Malformed" {
+    // A truncated `mls_welcome` header now reaches the Welcome DECODER (it
+    // runs out of input) rather than being refused at the wire-format
+    // switch — the check that this arm is really wired, not still stubbed.
     var welcome = [_]u8{ 0x00, 0x01, 0x00, 0x03 };
     var r = codec.Reader.init(&welcome);
-    try testing.expectError(error.WireFormatNotInThisPart, MLSMessage.decode(testing.allocator, &r));
+    try testing.expectError(error.BufferTooShort, MLSMessage.decode(testing.allocator, &r));
+
+    var group_info = [_]u8{ 0x00, 0x01, 0x00, 0x04 };
+    var rg = codec.Reader.init(&group_info);
+    try testing.expectError(error.BufferTooShort, MLSMessage.decode(testing.allocator, &rg));
 
     var unknown = [_]u8{ 0x00, 0x01, 0xff, 0xff };
     var r2 = codec.Reader.init(&unknown);
@@ -1364,5 +1385,7 @@ test "MLSMessage: welcome/group_info are named as a later part, unknown values a
     // §17.2's Table 8 values.
     try testing.expectEqual(@as(u16, 1), @intFromEnum(WireFormat.mls_public_message));
     try testing.expectEqual(@as(u16, 2), @intFromEnum(WireFormat.mls_private_message));
+    try testing.expectEqual(@as(u16, 3), @intFromEnum(WireFormat.mls_welcome));
+    try testing.expectEqual(@as(u16, 4), @intFromEnum(WireFormat.mls_group_info));
     try testing.expectEqual(@as(u16, 5), @intFromEnum(WireFormat.mls_key_package));
 }

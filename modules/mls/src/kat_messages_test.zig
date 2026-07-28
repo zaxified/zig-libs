@@ -39,6 +39,7 @@ const content = @import("content.zig");
 const framing = @import("framing.zig");
 const keypackage = @import("keypackage.zig");
 const keyschedule = @import("keyschedule.zig");
+const welcome = @import("welcome.zig");
 
 const messages_json = @embedFile("data/messages.json");
 
@@ -177,9 +178,30 @@ test "messages.json: every Part 5 wire format decodes and re-encodes byte-exact"
         // ── §12.4: Commit (ProposalOrRef list + optional<UpdatePath>) ──
         try roundTripAlloc(content.Commit, "commit (§12.4)", i, alloc, try hexDecode(arena, obj.get("commit").?.string));
 
-        // ── §6: the four MLSMessage wire formats this part decodes ──
+        // ── §12.4.3.1: GroupSecrets, the per-member half of a Welcome ──
+        try roundTripAlloc(welcome.GroupSecrets, "group_secrets (§12.4.3.1)", i, alloc, try hexDecode(arena, obj.get("group_secrets").?.string));
+
+        // ── §12.4.3.3: the bare `optional<Node> ratchet_tree<V>` ──
+        // Driven separately from `roundTripAlloc` because `RatchetTree`'s
+        // encoder allocates its own buffer (it has to: the encoding trims
+        // trailing blanks, so the length isn't a pure function of the
+        // decoded value's node count).
+        const ratchet_tree_bytes = try hexDecode(arena, obj.get("ratchet_tree").?.string);
+        {
+            var r = codec.Reader.init(ratchet_tree_bytes);
+            var t = tree.RatchetTree.decode(alloc, &r) catch |err| return noteDecode("ratchet_tree (§12.4.3.3)", i, err);
+            defer t.deinit();
+            if (!r.atEnd()) return noteDecode("ratchet_tree (§12.4.3.3)", i, error.TrailingBytes);
+            const re = try t.encode(alloc);
+            defer alloc.free(re);
+            try expectReencode("ratchet_tree (§12.4.3.3)", i, ratchet_tree_bytes, re);
+        }
+
+        // ── §6/§17.2: every MLSMessage wire format ──
         inline for (.{
             .{ "mls_key_package", "mls_key_package (§6 MLSMessage/§10)" },
+            .{ "mls_welcome", "mls_welcome (§12.4.3.1 Welcome)" },
+            .{ "mls_group_info", "mls_group_info (§12.4.3 GroupInfo)" },
             .{ "public_message_application", "public_message_application (§6.2)" },
             .{ "public_message_proposal", "public_message_proposal (§6.2)" },
             .{ "public_message_commit", "public_message_commit (§6.2)" },
@@ -194,7 +216,25 @@ test "messages.json: every Part 5 wire format decodes and re-encodes byte-exact"
             switch (msg) {
                 .public_message => |pm| content_types_seen[@intFromEnum(pm.content.contentType())] = true,
                 .private_message => |pm| content_types_seen[@intFromEnum(pm.content_type)] = true,
-                .key_package => {},
+                .key_package, .welcome => {},
+                .group_info => |gi| {
+                    // §12.4.3.3's extension really is the same serialization
+                    // as the standalone `ratchet_tree` field — the check
+                    // that `GroupInfo.ratchetTree`'s extension lookup and
+                    // the bare tree codec agree, using two independently
+                    // generated fields of the vector as the two sides.
+                    const ext = gi.extension(welcome.extension_type_ratchet_tree) orelse
+                        return noteDecode(spec[1] ++ " ratchet_tree extension", i, error.ExtensionNotFound);
+                    try expectReencode(spec[1] ++ " ratchet_tree extension", i, ratchet_tree_bytes, ext);
+                    var t = try gi.ratchetTree(alloc);
+                    t.deinit();
+                    // §12.4.3.2's ExternalPub is an `opaque<V>` INSIDE the
+                    // extension body, so a reader that returned the raw
+                    // extension_data would be off by its length prefix.
+                    const xp = (try gi.externalPub()) orelse
+                        return noteDecode(spec[1] ++ " external_pub extension", i, error.ExtensionNotFound);
+                    try testing.expectEqual(@as(usize, S.Kem.Npk), xp.len);
+                },
             }
             const re = try msg.encodeAlloc(alloc);
             defer alloc.free(re);
@@ -212,7 +252,32 @@ test "messages.json: every Part 5 wire format decodes and re-encodes byte-exact"
     try testing.expect(content_types_seen[@intFromEnum(framing.ContentType.commit)]);
     try testing.expect(wire_formats_seen[@intFromEnum(framing.WireFormat.mls_public_message)]);
     try testing.expect(wire_formats_seen[@intFromEnum(framing.WireFormat.mls_private_message)]);
+    try testing.expect(wire_formats_seen[@intFromEnum(framing.WireFormat.mls_welcome)]);
+    try testing.expect(wire_formats_seen[@intFromEnum(framing.WireFormat.mls_group_info)]);
     try testing.expect(wire_formats_seen[@intFromEnum(framing.WireFormat.mls_key_package)]);
+}
+
+test "messages.json: the GroupSecrets vectors really do exercise the optional<PathSecret> present arm and a PSK list" {
+    // Same guard as the Commit one below, for §12.4.3.1: a `GroupSecrets`
+    // whose `path_secret` is always absent and whose `psks` list is always
+    // empty would leave both of that structure's variable parts untested
+    // while the re-encode check still passed.
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, messages_json, .{});
+    defer parsed.deinit();
+    const arena = parsed.arena.allocator();
+
+    var with_path: usize = 0;
+    var with_psks: usize = 0;
+    for (parsed.value.array.items) |entry| {
+        const bytes = try hexDecode(arena, entry.object.get("group_secrets").?.string);
+        var r = codec.Reader.init(bytes);
+        const gs = try welcome.GroupSecrets.decode(testing.allocator, &r);
+        defer gs.deinit(testing.allocator);
+        if (gs.path_secret != null) with_path += 1;
+        if (gs.psks.len > 0) with_psks += 1;
+    }
+    try testing.expect(with_path > 0);
+    try testing.expect(with_psks > 0);
 }
 
 test "messages.json: the Commit vectors really do exercise an UpdatePath and a by-reference proposal" {

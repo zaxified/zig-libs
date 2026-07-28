@@ -32,11 +32,29 @@
 //! `message-protection.json` byte-for-byte in the SEND direction, which is
 //! stronger than that vector's own stated procedure — see `SPEC.md`'s
 //! "Part 5" section.
-//! Of §8, only §8.3's external initialization is still missing (it needs
-//! Part 6's external-commit flow).
-//! Part 3 (LeafNode/KeyPackage VALIDATION + Credential) and Part 6
-//! (external commit / Welcome / GroupInfo / reinit) are the remaining
-//! parts — see `SPEC.md`'s "Arc breakdown". Part 4 landed before Part 3
+//! **Part 6: joining a group — COMPLETE for the Welcome path.** RFC 9420
+//! §12.4.3's `GroupInfo`/`GroupInfoTBS`, §12.4.3.1's `PathSecret`/
+//! `GroupSecrets`/`EncryptedGroupSecrets`/`Welcome` with both encryption
+//! layers, §12.4.3.3's `ratchet_tree` and `external_pub` extension
+//! accessors and the tree-hash binding, and the joiner's own procedure
+//! (`welcome.zig`'s `join`), plus §8's chain entered one step lower at
+//! `joiner_secret` (`keyschedule.deriveEpochFromJoiner`). `MLSMessage` now
+//! decodes ALL five §17.2 wire formats — `error.WireFormatNotInThisPart` is
+//! gone, because there is no longer a format this module refuses. Pinned
+//! byte-exact against the official `welcome.json` vector, including
+//! reproducing its `encrypted_group_info` in the SEND direction, which is
+//! stronger than that vector's own stated procedure — see `SPEC.md`'s
+//! "Part 6" section.
+//! Of §8, only §8.3's external initialization is still missing, and of
+//! §12.4.3 only §12.4.3.2's external commits. Both are SCOPED OUT of this
+//! batch rather than blocked: the sibling `hpke` module exports RFC 9180
+//! §5.1's whole setup layer (`setupBaseS`/`setupBaseR` +
+//! `Context.exportSecret`), which is all §8.3 needs. §8.3 is two small
+//! functions; §12.4.3.2 on top of it also needs commit processing. Neither
+//! has an upstream interop vector.
+//! Part 3 (LeafNode/KeyPackage VALIDATION + Credential) and the rest of
+//! Part 6 (external commits, reinit/branch) are what remain — see
+//! `SPEC.md`'s "Arc breakdown". Part 4 landed before Part 3
 //! because the key schedule depends on neither: it consumes a tree HASH,
 //! not a `KeyPackage`; Part 5 then landed before Part 3 too, and took §10's
 //! KeyPackage *wire format* with it (but none of §10.1's validation
@@ -63,7 +81,9 @@
 //! | `content.zig` | Part 5's §12.1 `Proposal` (all seven types) and §12.4 `Commit`/`ProposalOrRef`/`ProposalOrRefType` — the two non-application bodies §6's `FramedContent` selects between. Wire shape only: no §12.2 proposal-list validity, no §12.3 application order, no commit-processing state machine |
 //! | `framing.zig` | Part 5's whole of §6: `WireFormat`/`ContentType`/`SenderType`/`Sender`, `FramedContent`, `AuthenticatedContent`, §6.1's `FramedContentTBS` + sign/verify, §6.2's `PublicMessage`/`AuthenticatedContentTBM`/`membership_tag` + `protectPublic`/`unprotectPublic`, §6.3's `PrivateMessage` + §6.3.1's `PrivateMessageContent`/`PrivateContentAAD`/reuse guard/padding + §6.3.2's `SenderData`/`SenderDataAAD`, and `MLSMessage` |
 //! | `transcript.zig` | Part 5's RFC 9420 §8.2 — `ConfirmedTranscriptHashInput`/`InterimTranscriptHashInput` and both recurrences. Separate from `keyschedule.zig` only because `framing.zig` imports that file, so §8.2 sitting there would be an import cycle |
-//! | `kat_messages_test.zig` | Part 5's KAT harness for `messages.json`: every §12.1 proposal body, §12.4 `Commit`, and the §6 `MLSMessage` wire formats, decode→re-encode byte-exact (a WIRE-format anchor — upstream states this vector's MACs may be invalid) |
+//! | `kat_messages_test.zig` | Parts 5+6's KAT harness for `messages.json`: every §12.1 proposal body, §12.4 `Commit`, §12.4.3.1's `GroupSecrets`, §12.4.3.3's bare `ratchet_tree`, and ALL five §17.2 `MLSMessage` wire formats, decode→re-encode byte-exact (a WIRE-format anchor — upstream states this vector's MACs may be invalid) |
+//! | `welcome.zig` | Part 6's RFC 9420 §12.4.3 `GroupInfo`/`GroupInfoTBS` (+ sign/verify), §12.4.3.1's `PathSecret`/`GroupSecrets`/`EncryptedGroupSecrets`/`Welcome`, the two encryption layers (`welcomeKeyNonce`/`encryptGroupInfo`/`decryptGroupInfo` and `encryptGroupSecrets`/`decryptGroupSecrets`) and the joiner's whole procedure (`join`), plus §12.4.3.3's `ratchet_tree`/`external_pub` extension accessors and `verifyTreeHash`. External commits (§12.4.3.2) and §8.3 are NOT here — see the file's doc comment for the `hpke` dependency that blocks them |
+//! | `kat_welcome_test.zig` | Part 6's KAT harness for `welcome.json` — the whole §12.4.3.1 join with real keys, staged per layer (KeyPackageRef → HPKE open → welcome key → group-info AEAD → signature → confirmation tag), and reproducing the vector's `encrypted_group_info` in the SEND direction |
 //! | `kat_framing_test.zig` | Part 5's KAT harness for `message-protection.json` (the full §6 protect/unprotect path with real keys — `PrivateMessage` for all three content types, `PublicMessage` for the two handshake types, byte-exact in BOTH directions, plus §6's refusal of application content as a `PublicMessage`) and `transcript-hashes.json` (§8.2's two hashes plus the Commit's own `confirmation_tag`) |
 //!
 //! **Status: Part 1 COMPLETE (Sonnet-tier). Part 2 COMPLETE (Sonnet
@@ -75,7 +95,12 @@
 //! settles it — see `keyschedule.pskSecret`'s doc comment). Part 5
 //! COMPLETE (Sonnet — wire shapes plus composition of Parts 1/2/4's
 //! primitives; no new cryptography, and every vector matched on the first
-//! run with nothing adjusted on either side).**
+//! run with nothing adjusted on either side). Part 6 COMPLETE for the
+//! WELCOME path (Sonnet — again no new cryptography: the two encryption
+//! layers are `crypto.EncryptWithLabel` and a plain AEAD under a key
+//! `keyschedule` already derived; `welcome.json` matched on the first run
+//! with nothing adjusted on either side). External commits remain, scoped
+//! out rather than blocked — see above.**
 //! `treemath.zig` is a pure port of the RFC's own
 //! reference code; `crypto.zig` composes `codec.zig` + the sibling
 //! `hpke`/std.crypto primitives exactly as RFC 9420 §5/§8/§9.1 specify,
@@ -90,16 +115,25 @@
 //!
 //! Consumer: a group-messaging application wanting RFC 9420 interop
 //! (Matrix, MLS-based E2EE messaging, or any protocol layering on MLS's
-//! group key agreement). With Part 5 the module can now, for a group whose
+//! group key agreement). With Part 5 the module can, for a group whose
 //! state the caller maintains, PRODUCE and CONSUME real MLS messages that
 //! other implementations accept byte-for-byte — a proposal, a commit or an
-//! application message, signed and MAC'd or fully encrypted. What it still
-//! cannot do is BE a client on its own: there is no group-state object, no
-//! Welcome/GroupInfo (so no way to join a group — Part 6), and no §10.1/
-//! §7.3 validation deciding whether a KeyPackage or LeafNode should be
-//! admitted (Part 3). Framing hands a caller a decoded, cryptographically
-//! verified `AuthenticatedContent` and a `SenderData.leaf_index`; deciding
-//! that the index names a real member, and applying the proposals, is
+//! application message, signed and MAC'd or fully encrypted. With Part 6 it
+//! can also ENTER such a group: given a `Welcome` addressed to one of its
+//! `KeyPackage`s, `welcome.join` yields the epoch secrets, the signed
+//! `GroupContext` and the transcript hashes that every existing member
+//! holds, with the `confirmation_tag` checked against a `confirmation_key`
+//! it derived itself.
+//! What it still cannot do is BE a client on its own: there is no
+//! group-state object, so it cannot FOLLOW the group after joining (no
+//! §12.2/§12.3/§12.4.2 commit processing), it cannot join by external
+//! Commit (§12.4.3.2/§8.3, not built), and it has no
+//! §10.1/§7.3 validation deciding whether a KeyPackage or LeafNode should
+//! be admitted (Part 3). Framing hands a caller a decoded,
+//! cryptographically verified `AuthenticatedContent` and a
+//! `SenderData.leaf_index`; `welcome.join` hands back a `GroupInfo.signer`
+//! index and a `path_secret`. Deciding that an index names a real member,
+//! installing private keys into a tree, and applying proposals are all
 //! still above this module. See `README.md` for the current surface.
 //!
 //! Provenance: clean-room from RFC 9420 (a public IETF specification, not
@@ -107,7 +141,7 @@
 //! note) plus `treemath.zig`'s direct port of RFC 9420 Appendix C's own
 //! published reference algorithm (the RFC's stated intent — it publishes
 //! runnable code, not just prose, specifically so implementations match
-//! it exactly). The six `kat_*_test.zig` harnesses embed official
+//! it exactly). The `kat_*_test.zig` harnesses embed official
 //! `mlswg/mls-implementations` interop vectors — public conformance DATA,
 //! not copyrightable expression, same posture as this repo's `bn254`/
 //! `bls12_381` KAT sources; see `NOTICE` for the exact commit/fetch-date
@@ -128,6 +162,7 @@ pub const keypackage = @import("keypackage.zig");
 pub const content = @import("content.zig");
 pub const framing = @import("framing.zig");
 pub const transcript = @import("transcript.zig");
+pub const welcome = @import("welcome.zig");
 pub const gate = @import("gate.zig");
 
 // Flat re-exports of the surface most callers want.
@@ -214,6 +249,21 @@ pub const interimTranscriptHash = transcript.interimTranscriptHash;
 pub const advanceTranscript = transcript.advance;
 pub const empty_transcript_hash = transcript.empty_transcript_hash;
 
+pub const GroupInfo = welcome.GroupInfo;
+pub const GroupSecrets = welcome.GroupSecrets;
+pub const EncryptedGroupSecrets = welcome.EncryptedGroupSecrets;
+pub const Welcome = welcome.Welcome;
+pub const Joined = welcome.Joined;
+pub const JoinParams = welcome.JoinParams;
+pub const joinWelcome = welcome.join;
+pub const welcomeKeyNonce = welcome.welcomeKeyNonce;
+pub const encryptGroupInfo = welcome.encryptGroupInfo;
+pub const decryptGroupInfo = welcome.decryptGroupInfo;
+pub const encryptGroupSecrets = welcome.encryptGroupSecrets;
+pub const decryptGroupSecrets = welcome.decryptGroupSecrets;
+pub const verifyTreeHash = welcome.verifyTreeHash;
+pub const deriveEpochFromJoiner = keyschedule.deriveEpochFromJoiner;
+
 pub const meta = .{
     .platform = .any,
     // Pure computation over caller-supplied bytes/keys, like the sibling
@@ -255,12 +305,14 @@ test {
     _ = content;
     _ = framing;
     _ = transcript;
+    _ = welcome;
     _ = gate;
     _ = @import("kat_treekem_test.zig");
     _ = @import("kat_keyschedule_test.zig");
     _ = @import("kat_secrettree_test.zig");
     _ = @import("kat_messages_test.zig");
     _ = @import("kat_framing_test.zig");
+    _ = @import("kat_welcome_test.zig");
 }
 
 test "meta.deps is exactly {\"hpke\"}" {

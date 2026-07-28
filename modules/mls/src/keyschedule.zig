@@ -304,6 +304,30 @@ pub fn deriveEpoch(
     group_context: []const u8,
 ) Error!EpochSecrets(S) {
     const joiner = try joinerSecret(S, allocator, init_secret_prev, commit_secret, group_context);
+    return deriveEpochFromJoiner(S, allocator, joiner, psk_secret, group_context);
+}
+
+/// Figure 22 entered ONE STEP LOWER — from `joiner_secret` rather than from
+/// `init_secret_[n-1] + commit_secret`. This is the entry point a NEW MEMBER
+/// uses: RFC 9420 §12.4.3.1 hands a joiner the `joiner_secret` itself inside
+/// `GroupSecrets`, precisely because it has neither the previous epoch's
+/// `init_secret` nor the Commit's `commit_secret` and could not run
+/// `deriveEpoch` at all. Everything from `member_secret` down is identical,
+/// so `deriveEpoch` is now literally `joinerSecret` followed by this — the
+/// two paths cannot drift apart.
+///
+/// Note that `joiner_secret` is where an existing member's and a joiner's
+/// views of the epoch MUST meet: the joiner takes it on trust from the
+/// committer, and what proves the committer was honest is the
+/// `confirmation_tag` check the joiner runs afterwards with the
+/// `confirmation_key` this function derives.
+pub fn deriveEpochFromJoiner(
+    comptime S: type,
+    allocator: std.mem.Allocator,
+    joiner: [S.Nh]u8,
+    psk_secret: [S.Nh]u8,
+    group_context: []const u8,
+) Error!EpochSecrets(S) {
     const member = memberSecret(S, joiner, psk_secret);
 
     var out: [S.Nh]u8 = undefined;
