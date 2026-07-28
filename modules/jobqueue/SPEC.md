@@ -41,7 +41,7 @@ Not a security boundary — durability/correctness, not adversarial hardening:
 
 ## Verification
 
-12 tests over the `kv.SimStorage` fault-injecting fake covering enqueue/dequeue/ack/nack lifecycle,
+Tests run over the `kv.SimStorage` fault-injecting fake covering enqueue/dequeue/ack/nack lifecycle,
 lease expiry + `reapExpiredLeases`, retry backoff + DLQ transition, partition-FIFO ordering under
 priority, `run_at`/`delay_ns` visibility gating, `StaleLease` rejection, and crash-recovery replay
 of the durable id-counter/orphan-record invariant. Run: `zig build test-jobqueue`.

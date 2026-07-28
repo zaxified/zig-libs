@@ -29,8 +29,8 @@ Validated with **live interop against real OpenSSH 10.2p1 in both
 directions, including authentication and command execution**: our client
 authenticates to a spawned real `sshd` with a public key and runs a command
 (asserting stdout, stderr and exit status), and a real `ssh` client
-authenticates to our server and runs one. 79 tests, Debug and ReleaseFast,
-0 skipped.
+authenticates to our server and runs one. Green in Debug and ReleaseFast,
+no skips.
 
 - **Model after:** RFC 4253 (Transport) / RFC 4251 (Architecture — wire types)
   / RFC 4252 (Authentication) / RFC 4254 (Connection) / RFC 8731
@@ -149,7 +149,7 @@ mishandled. See SPEC.md → Backlog.
 
 ## Tests
 
-`zig build test-ssh` — **79 tests, Debug and ReleaseFast, 0 skipped** with
+`zig build test-ssh` — **all passing, Debug and ReleaseFast, no skips** with
 OpenSSH installed:
 
 - wire-codec round-trips and `Cursor` bounds tests (oversize/off-by-one/

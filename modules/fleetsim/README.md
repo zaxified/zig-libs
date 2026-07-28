@@ -138,8 +138,8 @@ zig build test-fleetsim                # Debug
 zig build test-fleetsim --release=fast
 ```
 
-64 tests, green in Debug and ReleaseFast (8 of them are the live tests below,
-which skip without an endpoint). They cover the framing rules and the frame
+Green in Debug and ReleaseFast (the live tests below skip without an
+endpoint). They cover the framing rules and the frame
 iterator, every adapter's round-trip plus its restart and its trouble path
 (including a real BACnet `ReadProperty` of `Reliability` and a real CIP
 `Get_Attributes_All` refused with `0x10`), an OPC UA HEL/ACK round-trip through
@@ -148,7 +148,7 @@ proofs plus a fourth over a toy node, hostile input, a `std.testing.fuzz` target
 over three-adapter dispatch, the 1000-node scale run, the shim's buffer
 discipline, and the multi-peer binding driven by two in-process clients at once.
 
-The eight live tests print `SKIPPED: …` and pass unless an endpoint is given.
+The live tests print `SKIPPED: …` and pass unless an endpoint is given.
 Each one binds, waits for its master, and schedules a `trouble` fault at
 t=15 s so the master watches the device degrade under it:
 

@@ -214,7 +214,7 @@ cross-checked against FRRouting `isis_lsp.c:lsp_compare`.
   each other through the `isis` wire codec, converging.
 
 Green in Debug + ReleaseFast; `zig fmt --check` clean; `zig build check-catalog`
-green; the sibling `isis` suite (46 tests) unaffected.
+green; the sibling `isis` suite unaffected.
 
 Provenance: clean-room from ISO/IEC 10589 §7.3; §7.3.16.1 cross-checked against
 FRRouting `isis_lsp.c` (behaviour reference, no source ported). See `/NOTICE` (no

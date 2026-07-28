@@ -130,7 +130,7 @@ No sibling-module dependency (`deps = .{}`).
 ## Verify
 
 ```
-zig build test-signal                       # 39/39 pass (Debug and -Doptimize=ReleaseFast)
+zig build test-signal                       # green (Debug and -Doptimize=ReleaseFast)
 zig fmt --check modules/signal/
 ```
 

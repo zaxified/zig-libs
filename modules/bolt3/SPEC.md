@@ -40,7 +40,7 @@ beyond `std.crypto.ecc`'s constant-time scalar ladder.
   byte-exact.
 - Cross-checks: each derived secret's public point equals the independently
   derived public key; a real shachain secret feeds the revocation derivation.
-- 13 tests, Debug + ReleaseFast.
+- Green in Debug + ReleaseFast.
 
 ## Backlog / deferred
 

@@ -134,7 +134,7 @@ ciphertext (a keystream-reuse detector, since a repeat would make `C1 XOR C2` al
 even when `engineTime` moves; the adjacent-only limit of that tripwire is pinned by an `A, B, A`
 test that asserts the repeat is *not* caught; the DES 2^32-per-boots budget refuses to wrap; and
 two `V3Client`s against engines with different clocks start their counters at different values.
-**151 tests** (150 + 1 gated live). Run: `zig build test-snmp`.
+One test is gated live. Run: `zig build test-snmp`.
 
 The v3 stack is anchored three independent ways:
 

@@ -26,7 +26,7 @@ form falls back to the last explicit transition's offset rather than erroring (a
 approximation, not a crash).
 
 ## Verification
-`zig build test-tz` (Debug and `-Doptimize=ReleaseFast`), 9 tests: zone lookup by name, offset lookup
+`zig build test-tz` (Debug and `-Doptimize=ReleaseFast`): zone lookup by name, offset lookup
 before/between/at-or-after the last explicit transition, POSIX-footer-rule evaluation for a
 present-day instant, DST flag correctness across a transition, and POSIX footer `Jn`/plain-`n`
 Julian-day rule evaluation (including a leap-year positive control — see Backlog). Correctness oracle

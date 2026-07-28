@@ -46,7 +46,7 @@ notes) — do not use it for legal/financial date arithmetic requiring exact his
 correctness.
 
 ## Verification
-`zig build test-dataset` (+ `-Doptimize=ReleaseFast`; `zig fmt --check modules/dataset`). 15 tests:
+`zig build test-dataset` (+ `-Doptimize=ReleaseFast`; `zig fmt --check modules/dataset`):
 `Value` coercion/comparison/ordering (`asFloat`/`asInt`/`cast`/`eql`/`order` incl. null<bool<numeric<
 text, and `decimal`'s exact-raw-i128 compare/coercion), `Dataset` accessors (`columnIndex`/
 `columnType`/`cell`/`floatColumn`/`seriesXY`), `concat` (same-schema append + `error.SchemaMismatch`),

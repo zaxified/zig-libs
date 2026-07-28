@@ -17,7 +17,7 @@ cryptographic cores `sign`/`verify`/`proofGen`/`proofVerify` are all
 implemented and byte-exact KAT-pinned against `mattrglobal/pairing_crypto`'s
 official `bls12_381_sha_256` fixtures (pinned to
 draft-irtf-cfrg-bbs-signatures-04 — see [SPEC.md](SPEC.md) for why).
-`gate.core_implemented = true` and the full suite (34 tests) passes
+`gate.core_implemented = true` and the full suite passes
 byte-exact in Debug and ReleaseFast, including the selective-disclosure
 proof vectors (fed the draft's deterministic mocked RNG) and the
 signature/proof tamper-rejection cases.
@@ -102,7 +102,7 @@ zig build test-bbs -Doptimize=ReleaseFast --summary all
 zig fmt --check modules/bbs/
 ```
 
-With `gate.core_implemented = true` (current): all 34 tests PASS
+With `gate.core_implemented = true` (current): all tests PASS
 byte-exact against the embedded fixtures in both Debug and ReleaseFast —
 the ciphersuite/generators/`KeyGen`/mocked-RNG vectors plus the gated
 `sign`/`verify`/`proofGen`/`proofVerify` byte-exact and tamper-rejection

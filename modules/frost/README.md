@@ -17,7 +17,7 @@ threshold-specific cryptographic cores (`computeBindingFactors`,
 `round2Sign`, `aggregate`, `verifySignatureShare`, `verify`,
 `trustedDealerKeygen`, `secretShareCombine`) are all implemented (no
 `@panic`/TODO stubs remain in `root.zig`) and likewise byte-exact against
-RFC 9591 Appendix E.5 (32/32 tests, Debug + ReleaseFast). See `SPEC.md`
+RFC 9591 Appendix E.5 (Debug + ReleaseFast). See `SPEC.md`
 for the design, the BIP340-compatibility finding (short version: **NOT
 compatible** — different element encoding, different signature length,
 different challenge hash), and the full threat model.
@@ -130,7 +130,7 @@ std.debug.assert(frost.verify(msg, sig, keygen.group_public_key));
 zig build test-frost
 ```
 
-32/32 tests pass (Debug and ReleaseFast) — the hash-layer tests plus the
+All tests pass (Debug and ReleaseFast) — the hash-layer tests plus the
 ten threshold-specific cores' KATs against RFC 9591 Appendix E.5, and an
 end-to-end (2,3) round-trip. See `SPEC.md` for exactly which construction
 each core follows.

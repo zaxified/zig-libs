@@ -36,7 +36,7 @@ defaults. Not an authentication mechanism, and not a defense against connection-
 
 ## Verification
 
-16 tests. Offline deterministic: bucket math, refill and `retry_after` exactness, per-key isolation,
+Offline deterministic: bucket math, refill and `retry_after` exactness, per-key isolation,
 LRU eviction + TTL sweep, an 8-thread over-admission race check, fail-open OOM. Middleware goldens
 over the socket-free `http.Server.serveStream`: 429 wire bytes, XFF/`X-Real-IP`/API-key/custom key
 extraction, spoof resistance, peer-address fallback (port-insensitive, IPv4-mapped unified, headers

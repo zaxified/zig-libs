@@ -154,7 +154,7 @@ control plane's concern (deferred list).
 ## Verification
 
 Offline only — pure logic, no live-interop surface. `zig build test-l2forward`
-(17 tests, Debug + `-Doptimize=ReleaseFast`): BUM classification; known-unicast
+(Debug + `-Doptimize=ReleaseFast`): BUM classification; known-unicast
 learn→forward + unknown-unicast fallback; split-horizon (`{2,3,4}` src 3 →
 `{2,4}` ascending; non-member source excludes nothing; `BufferTooSmall`); tenant
 isolation; MAC move (last-writer-wins, one entry); ageing (boundary fresh/expired,
@@ -165,8 +165,7 @@ identical decisions, insertion-order-independent sorted flood set); a permanent
 positive-control test proving a flood set that *keeps* the source PE contradicts
 split-horizon (so a regression there goes red); and a `testing.allocator` leak
 check that `deinit` frees every nested membership + FDB map. `zig fmt --check`
-clean; `zig build check-catalog` green. Test count on disk equals the running
-count (single-file module — no dark-tests aggregator gap).
+clean; `zig build check-catalog` green.
 
 ## Status
 

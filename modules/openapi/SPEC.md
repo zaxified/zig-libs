@@ -39,7 +39,7 @@ doesn't honor is a caller bug this module cannot catch. Does not generate client
 request/response validation at runtime, or support OpenAPI 3.0/Swagger 2.0 output.
 
 ## Verification
-`zig build test-openapi`, 7 tests. Offline: golden OpenAPI 3.1 JSON for a known route set
+`zig build test-openapi`. Offline: golden OpenAPI 3.1 JSON for a known route set
 (`:id`→`{id}` conversion, required path parameters, `RouteDoc` fields surfaced, default 200 for
 undocumented routes); empty router produces a valid empty-`paths` document with no panic; method
 grouping deterministic by `http.Method` enum order; malformed `request_schema` returns

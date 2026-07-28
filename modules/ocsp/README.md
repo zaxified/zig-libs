@@ -17,8 +17,8 @@ in the response, directly signed by the issuer and bearing the
 signature (RSA PKCS#1 v1.5 SHA-1/256/384/512, ECDSA-P256 SHA-256), confirms the
 `CertID` binds to the subject certificate (recomputed issuerNameHash /
 issuerKeyHash / serial), checks freshness against a caller-supplied `now_unix`,
-and matches a request nonce if one was sent. `zig build test-ocsp` (15 tests,
-Debug + ReleaseFast) covers good / revoked / unknown, tampered signature,
+and matches a request nonce if one was sent. `zig build test-ocsp` (Debug +
+ReleaseFast) covers good / revoked / unknown, tampered signature,
 CertID mismatch, stale, not-yet-valid, missing-nextUpdate max-age, nonce
 mismatch, unsuccessful status, both delegated-responder cases, the ECDSA path,
 and a malformed-DER fuzz batch.

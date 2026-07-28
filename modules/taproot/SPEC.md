@@ -139,5 +139,5 @@ Design references: none beyond the BIP341 specification text itself,
   mutually consistent and usable through `bip340` on every row;
   `TweakedPublicKey.toBytes`/`asXOnly` round-trip on a real on-curve value.
 - Both `zig build test-taproot` (Debug) and `-Doptimize=ReleaseFast` pass
-  13/13 — zero skips, no test failures — and `zig fmt --check
+  — zero skips, no test failures — and `zig fmt --check
   modules/taproot/` is clean.

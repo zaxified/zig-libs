@@ -82,7 +82,7 @@ zig build test-bfv --summary all                    # Debug
 zig build test-bfv -Doptimize=ReleaseFast --summary all
 ```
 
-Parts 1–3: 36 pass / 0 skip (Debug and ReleaseFast). The set includes the
+Parts 1–3: green in Debug and ReleaseFast. The set includes the
 byte-exact NTT + RNS KATs, three deliberately-broken positive controls (a
 cyclic-vs-negacyclic discriminator, a wrong-scale "encryptor", and a
 corrupted-relin-key catch), a deterministic noiseless-ciphertext decrypt KAT

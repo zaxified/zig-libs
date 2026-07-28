@@ -39,7 +39,7 @@ is opt-in and effectively permanent). Helmet's legacy/no-longer-relevant extras
 
 ## Verification
 
-11 tests. Offline goldens over the socket-free `http.Server.serveStream`: byte-exact default header
+Offline goldens over the socket-free `http.Server.serveStream`: byte-exact default header
 set, per-header disable + all-off bare response, per-header value overrides, CSP/Report-Only
 opt-in, COEP opt-in, HSTS value for every flag combination including the `maxInt(u64)` buffer bound,
 handler-override precedence with no duplicate header, `Server` replacement over the auto value,

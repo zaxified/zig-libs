@@ -195,5 +195,5 @@ beyond the BIP340 specification text itself and `std.crypto.ecc.Secp256k1`
   cross-checked against `verify` (all-valid batch + empty batch accept;
   any single corrupted signature/message/pubkey, or a non-lifting `r`,
   rejects the whole batch).
-- Both `zig build test-bip340` (Debug) and `-Doptimize=ReleaseFast` pass
-  (18/18 tests); no `error.SkipZigTest` remains in the module.
+- Both `zig build test-bip340` (Debug) and `-Doptimize=ReleaseFast` pass;
+  no `error.SkipZigTest` remains in the module.

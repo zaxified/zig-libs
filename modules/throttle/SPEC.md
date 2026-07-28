@@ -29,7 +29,7 @@ parked request keeps occupying its server connection task — the backpressure i
 bounded by `max_waiters × max_wait_ms`, not a queueing mechanism that frees resources while waiting.
 
 ## Verification
-15 tests. Offline: acquire-to-cap/release semantics, 0-wait fast path, an 8-thread over-admission
+Offline: acquire-to-cap/release semantics, 0-wait fast path, an 8-thread over-admission
 stress for both `tryAcquire` and the bounded-wait path, deadline shed with the full wait honored,
 release-inside-the-window handoff, waiter-cap immediate shed. Middleware goldens over the
 socket-free `http.Server.serveStream` (503 wire bytes + `Retry-After` rounding, release-on-handler-

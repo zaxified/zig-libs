@@ -87,7 +87,7 @@ WOTS+/XMSS/hypertree/FORS code serves all twelve sets.
 
 ## Verification
 
-- `zig build test-slhdsa` — 31 tests: NIST ACVP KATs for all twelve
+- `zig build test-slhdsa`: NIST ACVP KATs for all twelve
   parameter sets (keyGen + deterministic-internal sigGen each, byte-exact;
   128f also hedged-internal + pure-with-context), WOTS+/XMSS/FORS
   component round-trips (SHA2 cat-1 + SHAKE + SHA2 cat-3 hashes),

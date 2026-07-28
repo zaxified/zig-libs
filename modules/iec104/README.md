@@ -128,8 +128,8 @@ zig build test-iec104 -Doptimize=ReleaseFast
 zig fmt --check modules/iec104
 ```
 
-106 tests, of which 104 are fully offline. The two live tests skip gracefully
-(printing `SKIPPED:` and passing) when no peer is present:
+The suite runs fully offline except for the live tests below, which skip
+gracefully (printing `SKIPPED:` and passing) when no peer is present:
 
 ```
 IEC104_TEST_SERVER=host:port  IEC104_TEST_CA=47   # our client -> a real RTU

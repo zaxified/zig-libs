@@ -384,10 +384,10 @@ their site — none carries a cross-thread happens-before obligation.
 Cross-built `zig test` binaries (`-O ReleaseSafe`, asserts + the poison canary
 live) were run under qemu-user:
 
-- `qemu-aarch64`: **17/17 tests pass, exit 0** — including the `REAL CORE: MPMC +
+- `qemu-aarch64`: **all tests pass, exit 0** — including the `REAL CORE: MPMC +
   EBR survive N×M stress` test and the `DRIVER TEETH` positive control (which
   still catches the deliberately-racy `BrokenRing`).
-- `qemu-riscv64`: **17/17 tests pass, exit 0** — same suite.
+- `qemu-riscv64`: **all tests pass, exit 0** — same suite.
 
 This confirms functional correctness under a non-x86 ABI/instruction set and that
 the cross-compiled core is not obviously broken. It is **explicitly

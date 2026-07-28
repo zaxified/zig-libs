@@ -49,7 +49,7 @@ independently bounded beyond the chunk buffer sizing the caller picks. Failure m
 quoting is a flagged field (`unbalanced_quote`), never a hang or OOB read.
 
 ## Verification
-`zig build test-csvstream` (headless; Debug + ReleaseFast). 67 tests: `line.zig` carries the 22
+`zig build test-csvstream` (headless; Debug + ReleaseFast). `line.zig` carries the
 verbatim oracle tests + `stripBom` tests; `stream.zig` has file/streaming + integration tests
 (offsets index the exact source bytes across a multi-chunk file; a positional re-read proves
 seek-back) + BOM-strip and `nextFields`/delimiter tests; `writer.zig` covers RFC 4180 quoting

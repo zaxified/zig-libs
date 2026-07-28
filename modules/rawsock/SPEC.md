@@ -45,9 +45,9 @@ implemented).
 ## Verification
 
 Root-free tests (pure helpers, `sockaddr_ll` decode, BPF encoding, struct ABI sizes, fuzz-style
-never-panic checks) always run: 10 pass, 2 skip (the two socket tests need `CAP_NET_RAW` and
-`SkipZigTest` without it). Under an unprivileged network namespace where root has the capability
-(`unshare -rn zig build test-rawsock`) all 12 pass, including open/filter/promisc and an
+never-panic checks) always run; the two socket tests need `CAP_NET_RAW` and `SkipZigTest`
+without it. Under an unprivileged network namespace where root has the capability
+(`unshare -rn zig build test-rawsock`) all tests pass, including open/filter/promisc and an
 inject→capture loopback round-trip on `lo`. Run:
 `zig build test-rawsock` (add `-Doptimize=ReleaseFast` for the release check; `unshare -rn` prefix
 for the full socket path).

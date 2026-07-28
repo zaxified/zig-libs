@@ -96,11 +96,11 @@ zig build test-tlock -Doptimize=ReleaseFast --summary all
 zig fmt --check modules/tlock/
 ```
 
-With `gate.core_implemented = true` (current): all **32** tests PASS,
-0 SKIP — the ciphersuite/hash/pairing-sanity/`Ciphertext`-codec tests,
+With `gate.core_implemented = true` (current): all tests PASS,
+no skips — the ciphersuite/hash/pairing-sanity/`Ciphertext`-codec tests,
 the `fp12Pow` algebraic-law tests, the gated `encrypt`/`decrypt`
 round-trip and tamper/FO-rejection tests, and the byte-exact drand
-interop vector (decrypt + re-encrypt). Both counts hold in Debug and
+interop vector (decrypt + re-encrypt). This holds in Debug and
 ReleaseFast.
 
 Provenance: see [NOTICE](NOTICE).

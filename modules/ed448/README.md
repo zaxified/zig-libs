@@ -77,7 +77,7 @@ zig build -Doptimize=ReleaseFast test-ed448   # ReleaseFast — all green
 zig fmt --check modules/ed448/
 ```
 
-All 48 tests pass in both modes. `kat_test.zig` asserts byte-exact
+All tests pass in both modes. `kat_test.zig` asserts byte-exact
 output against the official RFC 7748 §5.2/§6.2 (X448: both single-vector
 tests, the 1-iteration test, and the full Alice/Bob Diffie-Hellman
 example) and RFC 8032 §7.4/§7.5 (Ed448: the empty-message, 1-octet,

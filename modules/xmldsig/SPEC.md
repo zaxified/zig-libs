@@ -148,7 +148,7 @@ tests remain green.
 
 ## Validation & external-vector provenance
 
-25 tests, green in Debug and ReleaseFast (UB-checked).
+Green in Debug and ReleaseFast (UB-checked).
 
 **Canonicalization — external-vector-backed (byte-exact):** the worked examples
 of the W3C *Exclusive XML Canonicalization 1.0* and *Canonical XML 1.0* specs.

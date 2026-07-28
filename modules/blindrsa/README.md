@@ -94,8 +94,8 @@ blindrsa → rsa → std.crypto.ff / std.crypto.hash
 ## Verify
 
 ```
-zig build test-blindrsa                      # 36/36 pass (Debug)
-zig build test-blindrsa -Doptimize=ReleaseFast   # 36/36 pass
+zig build test-blindrsa                      # Debug
+zig build test-blindrsa -Doptimize=ReleaseFast
 zig fmt --check modules/blindrsa/
 ```
 

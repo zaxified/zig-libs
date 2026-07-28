@@ -166,13 +166,9 @@ real — see "Implementation notes" below.
 ## Verification
 
 - `zig build test-ecvrf` (Debug) and `zig build -Doptimize=ReleaseFast
-  test-ecvrf`: **all 20 tests pass in both modes** (verified 2026-07-16).
+  test-ecvrf`: **all tests pass in both modes** (verified 2026-07-16).
   `zig fmt --check modules/ecvrf/` is clean.
-- Disk-vs-running test count (CONVENTIONS.md §6 step 3):
-  `grep -c '^\s*test ' modules/ecvrf/src/*.zig` sums to 20 (`ecvrf.zig`
-  3, `kat_vectors.zig` 2, `kat_test.zig` 11, `root.zig` 4), matching
-  `zig build test-ecvrf --summary all`'s reported total (20) exactly.
-- Byte-exact KATs among those 20: RFC 9381 Appendix B.3's three official
+- Byte-exact KATs: RFC 9381 Appendix B.3's three official
   ECVRF-EDWARDS25519-SHA512-TAI vectors (Examples 16/17/18), each
   checked at every layer the RFC publishes an intermediate value for —
   `SK -> x` (`secretScalar`), `SK -> PK` (`publicKey`), `(PK, alpha) ->

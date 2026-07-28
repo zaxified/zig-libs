@@ -87,7 +87,7 @@ source consulted or copied.
 ## Verification
 
 `zig build test-loopix` — offline, green in Debug **and** ReleaseFast, no leaks,
-**23/23 tests pass, 0 skip**. Highlights:
+all pass, no skips. Highlights:
 
 - a **real Sphinx onion** built for a 3-mix stratified route and peeled
   hop-by-hop, each hop recovering its `(next_hop, delay)` (the packet-substrate

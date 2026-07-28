@@ -54,7 +54,7 @@ coalescing/fold/reset, window-0 disable, max-keys bound, OOM fail-open) plus wir
 the socket-free `http.Server.serveStream` (401 + challenge, valid/wrong/missing token, malformed
 `Authorization` corpus never panics, `.mutations` split, audit-entry fields, throttle keying) and a
 loopback integration (`router`+`http.Server`+`http.Client`), skipping only when loopback binding is
-unavailable. 28 tests.
+unavailable.
 
 ## Backlog / deferred
 Reviewed 2026-07-10 (adversarial security pass, paired with `jwt`): const-time compare,

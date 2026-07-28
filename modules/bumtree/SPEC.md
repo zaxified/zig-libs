@@ -93,7 +93,7 @@ modes are all bounded and defined, never a panic:
 ## Verification
 
 Offline only — pure logic, no live-interop surface. `zig build test-bumtree`
-(11 tests, Debug + `-Doptimize=ReleaseFast`):
+(Debug + `-Doptimize=ReleaseFast`):
 
 - **Golden topology** — a 7-node tree with one deliberately member-less branch
   (node 6); asserts the exact per-node `replicate_to`, `rpf_ingress`, and
@@ -122,8 +122,7 @@ Offline only — pure logic, no live-interop surface. `zig build test-bumtree`
   isolated source, unreachable member.
 - A `testing.allocator` run leak-checks that `deinit` frees `nodes` + `backing`.
 
-`zig fmt --check` clean; `zig build check-catalog` green. Test count on disk
-equals the running count (single-file module — no dark-tests aggregator gap).
+`zig fmt --check` clean; `zig build check-catalog` green.
 
 ## Deliberately deferred (out of scope by design, not oversight)
 

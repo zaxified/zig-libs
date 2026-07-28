@@ -26,13 +26,13 @@ complaint/justification sub-protocol, no single party ever learns `x`) is
 explicitly OUT OF SCOPE — a distinct follow-up module, not merely a
 different `splitSecretKey` signature.
 
-**What's implemented (all REAL, 0 panics — Phase 2c's prove/verify number
+**What's implemented (all REAL, no panics — Phase 2c's prove/verify number
 theory AND Phase 2d's online signing are now implemented and tested, see the
-dedicated sections below). `zig build test-threshold_ecdsa`: 43/43 pass in
-ReleaseFast; in Debug the 14 checked-path tests that need 2048-bit keys (the
-audit-F2 floor) are `SkipZigTest`-gated to keep the Debug run fast, so Debug
-reports 29 pass + 14 skip. The audit-F1/F2 received-parameter validation and
-its own reject tests run in BOTH modes:**
+dedicated sections below). `zig build test-threshold_ecdsa` passes in
+ReleaseFast; in Debug the checked-path tests that need 2048-bit keys (the
+audit-F2 floor) are `SkipZigTest`-gated to keep the Debug run fast. The
+audit-F1/F2 received-parameter validation and its own reject tests run in
+BOTH modes:**
 
 - **Keygen core** — `Element` (SEC1-compressed secp256k1 point codec),
   `scalarFromIndex`/`evalPolynomialAt` (Shamir, Horner's method over Zq),

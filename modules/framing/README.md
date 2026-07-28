@@ -60,7 +60,7 @@ against both the announced length and the caller's buffer capacity).
 
 ## Tests
 
-`zig build test-framing` — 10 tests, all on a domain-free test-only
+`zig build test-framing` — tests run on a domain-free test-only
 `union(enum)` (no application types imported): frame round-trip, oversize rejection
 on both the write and read paths (incl. `max_frame` enforced independently of
 buffer size), envelope round-trip (normal + empty payload), an enum-payload

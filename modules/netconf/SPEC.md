@@ -213,11 +213,9 @@ are byte-exact in the strong sense.
 * Three `std.testing.fuzz` targets: the framer (both dialects, arbitrary bytes),
   `parseHello`, and `parseReply`/`parseNotification`/`classify`.
 
-### Test counts
-
-63 tests in `zig build test-netconf` (62 named + the dark-tests aggregator). Without a live
-server, 61 pass and the 2 live tests print `SKIPPED:` and pass; with `NETCONF_TEST_SERVER`
-set, all 63 run. Green in both `Debug` and `--release=fast`.
+Without a live server, the live tests print `SKIPPED:` and pass; with
+`NETCONF_TEST_SERVER` set, they all run for real. Green in both `Debug` and
+`--release=fast`.
 
 ## Provenance
 

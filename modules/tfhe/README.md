@@ -69,7 +69,7 @@ zig build test-tfhe --summary all                    # Debug
 zig build test-tfhe -Doptimize=ReleaseFast --summary all
 ```
 
-30/30 pass, 0 skip (Debug and ReleaseFast). This includes the core-dependent
+All pass, no skips (Debug and ReleaseFast). This includes the core-dependent
 end-to-end anchors — the programmable gate (`bootstrap(identity)`/
 `bootstrap(NOT)`), a 2-input homomorphic AND, an unlimited-depth bootstrap
 chain, a corrupted-bootstrap-key control, and the output noise-budget

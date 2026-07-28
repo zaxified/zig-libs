@@ -34,7 +34,7 @@ Reliability, not adversarial security:
 Unit tests + the randomized deterministic **VOPR** (`vopr.zig`): PRNG-driven fuzz of recovery across
 torn/partial writes, short reads, garbage tails, and crash points ×4 modes (incl. non-contiguous /
 out-of-order durability, see below) over chained epochs; min-fault-count asserts + the sabotage
-self-test (≥10/12 runs catch a data-losing recovery). 59 tests. Run: `zig build test-kv`.
+self-test (≥10/12 runs catch a data-losing recovery). Run: `zig build test-kv`.
 
 - **Fault-scheduling policy is a seam** (`scheduler.zig`, 2026-07-15): the epoch-planning
   decision (which fault, how soon) that used to be inline in `Vopr.runSeed` is a pluggable
@@ -70,7 +70,7 @@ self-test (≥10/12 runs catch a data-losing recovery). 59 tests. Run: `zig buil
   ordered-scan B-tree → atomic batches → MVCC snapshot reads → secondary indexes. Bitcask kv is
   enough until then.
 - **VOPR fault-sweep DONE (2026-07-10):** green at 10× the shipped
-  run count (20k runs, 0 failures); crash-anywhere + torn/partial + byte-arbitrary-tear faults are
+  run count (20k runs, no failures); crash-anywhere + torn/partial + byte-arbitrary-tear faults are
   covered, CRC-gated fail-stop replay is sound (torn/corrupt tail truncated, never replayed as valid).
 - **Out-of-order / non-contiguous durability — COVERED 2026-07-10.** The former gap (`SimStorage`
   could only collapse an un-synced window to a *contiguous prefix*) is closed: a new

@@ -83,7 +83,7 @@ weakness introduced by this module).
 ## Verification
 
 Offline only — this is a pure codec, no live-interop surface. `zig build test-ethfrag`:
-21 tests — round-trip smoke (no-frag, zero-length, multi-fragment, reordered delivery),
+round-trip smoke (no-frag, zero-length, multi-fragment, reordered delivery),
 a 300-iteration seeded property test (`fragment` → shuffle → `Reassembler` → exact
 byte-identical output, across random frame lengths/MTUs/header-overheads), a targeted
 adversarial corpus (one test per threat-model bullet above: overlap, duplicate, teardrop

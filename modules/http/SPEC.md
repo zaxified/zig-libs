@@ -53,12 +53,12 @@ Hardened for direct internet exposure (no reverse proxy required):
 ## Verification
 HPACK vs RFC 7541 Appendix C vectors (bytes + decoded fields + dynamic-table state per step); h2
 offline scripted client↔server pipe exchanges + h2spec-style negatives; h2 DoS attack-sim tests
-(rapid-reset proves 0 handler runs); serveStream goldens for conditional/range/multipart/content-
+(rapid-reset proves no handler runs); serveStream goldens for conditional/range/multipart/content-
 neg; smuggling/timeout/size negatives; a BYO-TLS in-memory dogfood (connectH2Over ↔ serveStream).
 h2 upstreaming: loopback h1-proxy → h2c-backend end-to-end (forwarding headers + hop-by-hop strip +
 large-body flow control + concurrent clients over one shared upstream connection + 502 on dead
 backend); pool-level multiplex (two streams in flight on one connection), sequential-reuse and
-buffer-pool reuse/bounded proofs. 340 tests. Run: `zig build test-http`.
+buffer-pool reuse/bounded proofs. Run: `zig build test-http`.
 
 **Fuzz harnesses (HD1):** every untrusted-wire parser has a `std.testing.fuzz` harness asserting
 "typed error or valid result, never a panic" — `h1.RequestHead.parse`/`ResponseHead.parse`/

@@ -105,7 +105,7 @@ targets the thread-per-connection `TcpServer`; the offline core remains single-o
 and fully socket-free for testing.
 
 ## Verification
-Client + codec: 37 offline tests (folded into the module total below) — golden-byte KATs against
+Client + codec offline tests — golden-byte KATs against
 the spec wire layout, every remaining-length varint boundary, a scripted fake broker driving full
 QoS 1/QoS 2 handshakes, DUP retransmit + receive dedup, keep-alive/ping timeout, packet-id wrap +
 pool exhaustion, rx-buffer overflow, a topic-match truth table, and two 1000-iteration garbage-byte
@@ -150,7 +150,7 @@ Race-detection method: Zig **0.16.0's `-fsanitize-thread` is a no-op** here — 
 emits **zero `__tsan_*` instrumentation** and fails to flag a deliberate data race — so, per the SPEC's
 own fallback, race detection is the real-thread run under **Debug and `-Doptimize=ReleaseFast`, repeated
 (the committed 16×40 config was run 15× Debug + 40× ReleaseFast, plus one heavy 48×150 pass, all clean)**
-and cross-checked with a **valgrind `memcheck` pass (0 errors, 0 leaks, no invalid read/write** — i.e. no
+and cross-checked with a **valgrind `memcheck` pass (no errors, no leaks, no invalid read/write** — i.e. no
 use-after-free in the reference-counted teardown). No race, deadlock, or UAF was found; the hardening is
 confirmed. Run: `zig build test-mqtt` (also green under `-Doptimize=ReleaseFast`).
 

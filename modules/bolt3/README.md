@@ -30,7 +30,7 @@ Byte-exact against the official BOLT#3 test vectors: **Appendix E** (all four
 base/revocation × public/secret derivations) and **Appendix D** (all five
 `generate_from_seed` generation vectors), plus cross-checks that each derived
 secret's public point equals the independently derived public key, and that a
-real shachain secret feeds the revocation derivation end-to-end. 13 tests,
+real shachain secret feeds the revocation derivation end-to-end. Green in
 Debug + ReleaseFast.
 
 ## Dependencies

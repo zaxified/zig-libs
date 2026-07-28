@@ -154,7 +154,7 @@ not something this formatter can detect).
 
 ## Verification
 
-`zig build test-accesslog` (Debug + ReleaseFast). 16 tests: byte-exact golden strings for a
+`zig build test-accesslog` (Debug + ReleaseFast): byte-exact golden strings for a
 representative `Entry` in each of the 3 formats + the `write` enum-dispatch wrapper +
 missing-optional-fields rendering per format's convention; the log-injection suite (JSON/
 logfmt/Combined, each with a shared adversarial payload plus a Combined-specific forged-line

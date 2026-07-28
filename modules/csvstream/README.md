@@ -11,7 +11,7 @@ memory** — peak is the chunk size, not the file size.
   state). **Deps:** none (std-only, pure Zig — no C/libc).
 
 Provenance: original work of the zig-libs authors (MIT). Two layers — an
-in-memory `LineIterator`/`splitFields` core (pinned by 22 oracle tests) and a
+in-memory `LineIterator`/`splitFields` core (pinned by dedicated oracle tests) and a
 record-aligned `ChunkReader` — composed by `StreamReader`. No third-party code.
 
 ## Two layers, one record model
@@ -127,7 +127,7 @@ bounded-memory streaming. Quoting still protects the *delimiter* within a line.
 ## Tests
 
 `zig build test-csvstream` (headless; green in Debug and
-`-Doptimize=ReleaseFast`). 67 tests across `line.zig` (22 verbatim oracle tests
+`-Doptimize=ReleaseFast`). Tests span `line.zig` (verbatim oracle cases
 + `stripBom`), `stream.zig` (file/streaming + integration, incl. BOM-strip and
 `nextFields`/delimiter), `writer.zig` (RFC 4180 quoting incl. two positive
 controls + a file round-trip through `StreamReader`), `header.zig` (`Header`

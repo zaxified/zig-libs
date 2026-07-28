@@ -18,8 +18,8 @@ GET form, Appendix A.1.1), and — only if `ocsp.verify` accepts the response
 status) is a typed error that leaves any existing cache entry untouched (the
 soft-fail posture). `Cache.getStapled` serves the cached DER while it's
 genuinely still valid; `Cache.needsRefresh` tells a scheduler when to call
-`refresh` again, ahead of actual expiry. `zig build test-ocspcache` (17
-tests, Debug + ReleaseFast) covers AIA discovery (present/absent/malformed),
+`refresh` again, ahead of actual expiry. `zig build test-ocspcache` (Debug +
+ReleaseFast) covers AIA discovery (present/absent/malformed),
 a full fetch→verify→cache→serve round trip via a mock transport (no
 network), the proactive-margin vs. hard-expiry distinction, a tampered
 response never being cached, a `tryLater` response being soft-failed while

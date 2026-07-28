@@ -35,7 +35,7 @@ shape only, not the RFC 4122 variant/version nibbles; duplicate JSON object keys
 not authenticate, authorize, or sanitize for injection (SQL/HTML); callers still own that.
 
 ## Verification
-59 tests: every rule's code+path, cross-field aggregation, nested paths (`a.b`/`a[i]`), malformed/
+Every rule's code+path, cross-field aggregation, nested paths (`a.b`/`a[i]`), malformed/
 empty/truncated JSON → clean `json_invalid` (never a panic), structural-limit rejections at each
 bound, typed `parseInto` (derived bounds/enums/defaults/optionals, `validate_rules` merge, JSON-type-
 error → pathed-error mapping), query coercion/percent-decoding/duplicate-key handling,

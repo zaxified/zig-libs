@@ -80,7 +80,7 @@ zig build test-p256 -Doptimize=ReleaseFast --summary all
 P256_BENCH=1 zig build test-p256 -Doptimize=ReleaseFast # opt-in ns/op baseline
 ```
 
-25 pass / 1 skip in both Debug and ReleaseFast (the single skip is the opt-in
+Green in both Debug and ReleaseFast (the single skip is the opt-in
 bench). On amd64+ADX+BMI2 the three gated core-vs-portable differentials run for
 real (field asm == portable, comb/windowed == CT ladder + std); on a non-amd64
 host the field differential skips — a skip there means "core not present on this

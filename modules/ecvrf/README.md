@@ -98,7 +98,7 @@ zig build -Doptimize=ReleaseFast test-ecvrf   # ReleaseFast — all green
 zig fmt --check modules/ecvrf/
 ```
 
-All 20 tests pass in both modes. `kat_test.zig` asserts byte-exact output
+All tests pass in both modes. `kat_test.zig` asserts byte-exact output
 against RFC 9381 Appendix B.3's three official ECVRF-EDWARDS25519-SHA512-TAI
 vectors — secret-key-to-scalar and secret-key-to-public-key derivation,
 `encodeToCurve`'s `H` (including the published `try_and_increment`

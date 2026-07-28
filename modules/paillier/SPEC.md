@@ -138,7 +138,7 @@ see `// TODO(phase2)` in `src/root.zig`.
 
 ## Verification
 
-`zig build test-paillier`: **20/20 tests pass, Debug and ReleaseFast** (CONVENTIONS.md §7
+`zig build test-paillier` is **green in Debug and ReleaseFast** (CONVENTIONS.md §7
 "pure logic" harness: unit tests + round-trip + property tests). The Debug run takes ~20 s,
 almost all of it the full 2048-bit `generate` round-trip test (ReleaseFast runs in ~1 s).
 

@@ -15,8 +15,8 @@ REAL and tested. The two genuinely irreducible zero-knowledge cores — the
 Inner-Product Argument (`ipa.zig`'s `proveIpa`/`verifyIpa`) and the
 range-proof polynomial construction/reduction (`rangeproof.zig`'s
 `prove`/`verify`) — are implemented and `gate.core_implemented` is `true`,
-so `kat_test.zig`'s full completeness + soundness suite runs for real (50
-tests, green in Debug + ReleaseFast). See [SPEC.md](SPEC.md) for the
+so `kat_test.zig`'s full completeness + soundness suite runs for real
+(green in Debug + ReleaseFast). See [SPEC.md](SPEC.md) for the
 design and the verification methodology.
 
 | File | Contents |
@@ -98,8 +98,8 @@ No sibling-module dependencies (`meta.deps = .{}`).
 ## Verify
 
 ```
-zig build test-bulletproofs                    # Debug — 50/50 pass
-zig build test-bulletproofs -Doptimize=ReleaseFast   # 50/50 pass
+zig build test-bulletproofs                    # Debug
+zig build test-bulletproofs -Doptimize=ReleaseFast
 zig fmt --check modules/bulletproofs/
 ```
 

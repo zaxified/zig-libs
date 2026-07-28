@@ -33,7 +33,7 @@ The RFC 5769 test vectors are the oracle — the exact sample byte sequences fro
 (IPv4 response), §2.3 (IPv6 response) are used as fixtures (not invented ones): the sample request
 decodes and its MESSAGE-INTEGRITY (with the §2.1 password) and FINGERPRINT verify; the responses
 decode to `192.0.2.1:32853` and the IPv6 equivalent; tamper tests flip a covered byte and assert both
-checks fail. 12 tests. Run: `zig build test-stun` (Debug and `-Doptimize=ReleaseFast`).
+checks fail. Run: `zig build test-stun` (Debug and `-Doptimize=ReleaseFast`).
 
 ## Backlog / deferred
 Server side; long-term credential mechanism (RFC 8489 §9.2); UNKNOWN-ATTRIBUTES generation; ICE

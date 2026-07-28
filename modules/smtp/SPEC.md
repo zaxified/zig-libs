@@ -318,11 +318,8 @@ LF, every LF preceded by CR, and every line within 998), and the whole message r
 (asserting the line limit and that the boundary occurs exactly four times — the
 `Content-Type` parameter, two delimiters and the closer).
 
-### Test counts
-
-116 tests in `zig build test-smtp` (114 named + the dark-tests aggregator + the `meta`
-check). Without a live server, 115 pass and the 1 live test prints `SKIPPED:` and passes;
-with `SMTP_TEST_SERVER` set, all 116 run. Green in both `Debug` and `--release=fast`.
+`zig build test-smtp` is green in both `Debug` and `--release=fast`. Without a live server,
+the one live test prints `SKIPPED:` and passes; with `SMTP_TEST_SERVER` set, it runs for real.
 
 ## Provenance
 

@@ -90,8 +90,8 @@ Miller-Rabin helper).
 ## Verify
 
 ```
-zig build test-vdf                              # Debug — 35 pass, 0 skip
-zig build test-vdf -Doptimize=ReleaseFast        # 35 pass, 0 skip
+zig build test-vdf                              # Debug — all pass, no skips
+zig build test-vdf -Doptimize=ReleaseFast        # all pass, no skips
 zig fmt --check modules/vdf/
 ```
 

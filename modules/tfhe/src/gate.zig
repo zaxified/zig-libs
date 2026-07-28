@@ -36,7 +36,7 @@
 //! `@panic` remains) and every previously SKIP-gated test — the programmable
 //! gate, the 2-input AND, the unlimited-depth bootstrap chain, the
 //! corrupted-bootstrap-key control, and the noise-budget assertion — runs and
-//! passes (30/30, 0 skip).
+//! passes, with no skips.
 
 /// The genuine Fable core: externalProduct / cmux / blindRotate / bootstrap.
 /// IMPLEMENTED — see this file's module doc comment and `tfhe.zig`'s

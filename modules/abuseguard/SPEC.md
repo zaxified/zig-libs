@@ -36,7 +36,7 @@ memory stays bounded regardless). Not encryption or authentication — complemen
 TLS/auth; does not inspect request bodies or protocol content.
 
 ## Verification
-`zig build test-abuseguard` — 22 tests. Offline deterministic (injected clock): ban/greylist add +
+`zig build test-abuseguard` — offline deterministic (injected clock): ban/greylist add +
 TTL expiry, strike accumulation → greylist → ban on repeat, exact decay, per-IP counter inc/dec via
 the hook pair, per-IP + global caps, LRU eviction (live-pinning + banned-last + empty-sweep),
 v4-mapped unification, fail-closed OOM, an 8-thread admission race and an exact-threshold concurrent

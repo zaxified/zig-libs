@@ -24,7 +24,7 @@ of scope: HMAC/keyed hashing, KDFs, streaming over a network, and constant-time 
 
 ## Verification
 Official empty-string and `"abc"` known-answer vectors for all 9 algorithms; incremental-equals-
-one-shot; the `/proc`-style size-0 file read. 17 tests. Run: `zig build test-hashdigest`.
+one-shot; the `/proc`-style size-0 file read. Run: `zig build test-hashdigest`.
 
 ## Backlog / deferred
 None.

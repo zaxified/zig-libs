@@ -215,7 +215,7 @@ consumer needs them — `keyIdentifier [0]` covers essentially every CA in
 practice). `chain.zig`: **DONE** — `verifyChain` plus the five named
 sub-algorithms (`buildPath`, `checkNameConstraints`, `checkPathLength`,
 `checkExtendedKeyUsage`, `verifyPssLink`) are implemented and covered by
-`chain_test.zig`'s 40 tests (`zig build test-x509`, green in Debug and
+`chain_test.zig` (`zig build test-x509`, green in Debug and
 ReleaseFast), including an openssl-3.5-generated oracle chain per supported
 signature algorithm (RSA PKCS1v15, RSASSA-PSS, ECDSA P-256, ECDSA P-384,
 Ed25519) and dedicated rejection-case hierarchies (expired/not-yet-valid,

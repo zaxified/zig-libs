@@ -183,7 +183,7 @@ whether a state machine in `root` (client) or `server` (server) uses it.
 
 ## Verification
 
-`zig build test-opcua` — 164 tests, Debug and ReleaseFast.
+`zig build test-opcua` — green in Debug and ReleaseFast.
 
 - **Offline:** RFC/spec-shaped round-trips for every built-in type, transport
   framing, secure-channel KATs, address-space unit tests, and an end-to-end
@@ -260,7 +260,7 @@ whether a state machine in `root` (client) or `server` (server) uses it.
   (Wireshark 4.6.4, same dissectors) is: each captured message was framed as
   a pcap-style record and fed through
   `rawshark -r /dev/stdin -d proto:opcua -F <field>`. Result: 198/198 messages
-  across the six streams dissected, **0 `_ws.malformed`**, and the dissector
+  across the six streams dissected, **no `_ws.malformed`**, and the dissector
   reads this server's own fields correctly — `opcua.EndpointUrl =
   "opc.tcp://localhost:4840"`, `opcua.ApplicationUri =
   "urn:zig-libs:opcua:interop-server"`, three `opcua.SecurityPolicyUri =

@@ -87,7 +87,7 @@ drop (drops to `nobody`, asserts `setuid(0)` fails) and capability bounding-set 
 tests cover the BPF program shape (arch guard + per-syscall compare + allow/deny leaves + descending
 `jt`), struct ABI sizes, and the monotone Landlock access mask. Run: `zig build test-sandbox`
 (add `-Doptimize=ReleaseFast` for the release check; `sudo` prefix to also exercise the two
-root-gated tests — 12 pass).
+root-gated tests).
 
 ## Backlog / deferred
 

@@ -241,5 +241,5 @@ new ones); `kat_test.zig` now carries zero skips:
   its own error paths (`HopCountMismatch`, `ReservedPayloadLength`, both
   `RouteTooLong` forms, `InvalidPublicKey`).
 - Both `zig build test-sphinx` (Debug) and `-Doptimize=ReleaseFast` pass
-  43/43 with zero skips; the full repo `zig build test` is green;
+  in full, with no skips; the full repo `zig build test` is green;
   `zig fmt --check modules/sphinx/` is clean.

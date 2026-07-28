@@ -13,7 +13,7 @@
 //! because `verify` here calls into it.
 //!
 //! **Status: complete** — all ten threshold cores implemented and
-//! KAT-validated (32/32 tests, Debug + ReleaseFast). Wire codecs
+//! KAT-validated (Debug + ReleaseFast). Wire codecs
 //! (`Identifier`, `Element`,
 //! `SigningShare`, `SignatureShare`, `Signature`, `SigningCommitments`),
 //! RFC §4.3 "List Operations" (`encodeGroupCommitmentList`,

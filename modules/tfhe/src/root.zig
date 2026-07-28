@@ -15,7 +15,7 @@
 //! bootstrapping demonstration.
 //!
 //! ## Status: the gated Fable core is IMPLEMENTED (`gate.fable_core_implemented
-//! = true`) — no `@panic` remains in this module; 30/30 tests pass (0 skip).
+//! = true`) — no `@panic` remains in this module; all tests pass, no skips.
 //! The mechanical layer — the negacyclic ring (`poly`), the signed gadget
 //! decomposition (`gadget`), torus (de)coding and modulus switching (`torus`),
 //! plus `tfhe.Tfhe`'s LWE/GLWE/GGSW keygen/encrypt/decrypt, bootstrap-key +

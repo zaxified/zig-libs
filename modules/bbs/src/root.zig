@@ -25,7 +25,7 @@
 //! directory (see `SPEC.md` for the exact draft version/commit pinned).
 //! `gate.core_implemented = true`, so every gated KAT — the sign/proof
 //! byte-exact vectors and the signature/proof tamper-rejection cases —
-//! runs and passes (34/34, Debug + ReleaseFast). See `bbs.zig`'s module
+//! runs and passes (Debug + ReleaseFast). See `bbs.zig`'s module
 //! doc comment for why `proofGen`/`proofVerify` (the selective-disclosure
 //! Fiat-Shamir NIZK), not `sign`/`verify`, are the genuinely hard core.
 //!

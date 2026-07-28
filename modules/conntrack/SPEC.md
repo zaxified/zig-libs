@@ -228,8 +228,8 @@ namespace) runs three live tests, all of which passed in Debug and in `--release
 Without the namespace (plain `zig build test-conntrack` as an ordinary user) the kernel answers
 `EPERM` to everything, and each live test prints `SKIPPED: …` and passes.
 
-Test totals: **28 tests, all passing** in Debug and `--release=fast`; unprivileged, 25 offline
-tests run and 3 live tests skip-and-pass; under `unshare -rn`, all 28 run for real. One fuzz
+**All tests pass** in Debug and `--release=fast`; unprivileged, the offline tests run and the
+live tests skip-and-pass; under `unshare -rn`, every test runs for real. One fuzz
 target (`decodeFlow` + message walker).
 
 ## Deferred (honest list)

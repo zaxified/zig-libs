@@ -10,7 +10,7 @@ irreducible zero-knowledge cores — the Inner-Product Argument (`ipa.zig`'s
 `proveIpa`/`verifyIpa`) and the range-proof polynomial
 construction/reduction (`rangeproof.zig`'s `prove`/`verify`) — are
 implemented (Fable core pass) and `gate.core_implemented` is `true`, so
-the full completeness + soundness KAT suite runs (50 tests, green in Debug
+the full completeness + soundness KAT suite runs (green in Debug
 + ReleaseFast). See "Caveats" below for the non-constant-time and
 Linux-only-proving notes.
 

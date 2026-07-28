@@ -135,7 +135,7 @@ count that drains cleanly to zero (no take-over zombie). It is socket-gated
 (`error.SkipZigTest` where loopback/threads are unavailable). Zig 0.16.0's
 `-fsanitize-thread` is a no-op (no `__tsan_*` instrumentation is linked), so the
 race detection is the real-thread run under Debug and `-Doptimize=ReleaseFast`,
-repeated many times, cross-checked with a valgrind `memcheck` pass (0 errors).
+repeated many times, cross-checked with a valgrind `memcheck` pass (no errors).
 
 Provenance: clean-room from the OASIS MQTT Version 3.1.1 specification
 (open standard, royalty-free); mosquitto (EPL/EDL) and Eclipse Paho

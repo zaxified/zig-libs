@@ -34,7 +34,7 @@
 //! module implements.
 //!
 //! **Status: complete** — all seven crypto cores implemented and
-//! KAT-validated (19/19 tests, Debug + ReleaseFast). REAL pure-bytes
+//! KAT-validated, green in Debug + ReleaseFast. REAL pure-bytes
 //! pieces: the ciphersuite's fixed group elements `M`/`N` (RFC 9383 §4's
 //! P-256 table, transcribed byte-exact — see `NOTICE`), `mPoint`/`nPoint`
 //! (parse-once accessors, `std.crypto.ecc.P256.fromSec1`), the

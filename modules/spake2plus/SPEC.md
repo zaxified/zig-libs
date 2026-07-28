@@ -219,6 +219,3 @@ independent correctness signal beyond the byte-exact numbers.
 
 - `zig build test-spake2plus` and `-Doptimize=ReleaseFast` both go green;
   `zig fmt --check modules/spake2plus/` clean.
-- Disk-vs-running test count (CONVENTIONS.md §6 step 3):
-  `grep -c '^\s*test ' modules/spake2plus/src/*.zig` summed across files
-  equals `zig build test-spake2plus --summary all`'s reported total.

@@ -11,7 +11,7 @@ Montgomery->Edwards sign-0 recovery, `edwardsFromMontgomery`), plus
 `ratchet.zig`'s full Double Ratchet (`State` + `initAlice`/`initBob`/
 `encrypt`/`decrypt`, `KDF_RK`/`KDF_CK`, the DH + symmetric-key ratchets,
 `max_skip`-bounded out-of-order handling, transactional fail-closed
-`decrypt`) are implemented and tested — 39/39 in Debug and ReleaseFast,
+`decrypt`) are implemented and tested — green in Debug and ReleaseFast,
 including a libsignal known-answer vector; see "Verification" below.
 
 ## Design
@@ -222,12 +222,9 @@ XEdDSA signature must verify as Ed25519 under the recovered sign-0 `A`).
 
 ## Verification
 
-- `zig build test-signal`: **39/39 PASS**, Debug AND
+- `zig build test-signal`: **all pass**, Debug AND
   `-Doptimize=ReleaseFast`, zero panics. `zig fmt --check
   modules/signal/` clean.
-- Disk-vs-running test count (CONVENTIONS.md §6 step 3):
-  `grep -c '^\s*test ' modules/signal/src/*.zig` summed across files (39)
-  equals `zig build test-signal --summary all`'s reported total (39).
 - Double Ratchet coverage: full interleaved Alice<->Bob session seeded
   from a live `x3dh.initiateUnverified`/`respond`, forcing repeated DH
   ratchets, every message round-tripping; out-of-order delivery within a

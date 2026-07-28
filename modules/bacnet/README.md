@@ -236,7 +236,7 @@ zig build test-bacnet -Doptimize=ReleaseFast
 zig fmt --check modules/bacnet
 ```
 
-239 tests, of which 229 are fully offline. The ten live tests skip gracefully
+The suite is fully offline apart from a handful of live tests, which skip gracefully
 (printing `SKIPPED:` and passing) when no peer is present:
 
 ```

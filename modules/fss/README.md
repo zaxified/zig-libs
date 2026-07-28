@@ -17,7 +17,7 @@ tested — and the Fable-irreducible core — the **correction-word construction
 is implemented (`gate.core_implemented = true`). Every formerly-gated test now
 executes: full-domain exhaustive reconstruction, the byte-exact KAT vs the
 independent reference vectors, the security smell test, and the CW-perturbation
-positive control (18 pass / 0 skip, Debug + ReleaseFast). See [SPEC.md](SPEC.md)
+positive control (all pass, no skips, Debug + ReleaseFast). See [SPEC.md](SPEC.md)
 for the construction, the output-group choice, the exact Fable boundary, and the
 external-reference anchoring.
 
@@ -89,12 +89,12 @@ fss → std.crypto.hash.sha2.Sha256   (std-only; meta.deps = .{})
 ## Verify
 
 ```
-zig build test-fss                          # Debug — 18 pass, 0 skip
-zig build test-fss -Doptimize=ReleaseFast   # 18 pass, 0 skip
+zig build test-fss                          # Debug — all pass, no skips
+zig build test-fss -Doptimize=ReleaseFast   # all pass, no skips
 zig fmt --check modules/fss/
 ```
 
-All 18 tests execute (the gate is `true`): the four formerly-gated
+All tests execute (the gate is `true`): the four formerly-gated
 core-dependent tests (full-domain correctness, byte-exact KAT, security smell,
 CW-perturbation control) plus the deterministic positive controls
 (`brokenAllBeta`/`brokenAllZero` → the `firstMismatch` checker), which are

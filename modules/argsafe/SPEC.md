@@ -43,7 +43,7 @@ base64 exactly-44 with 43/45 rejected, `isSafePath` rejecting `..`,
 `isSafeCidrList` rejecting a leading dash even when the caller's `sep` is `'-'` itself), a
 property-style adversarial sweep feeding every predicate a raw NUL/`\n`/leading-`-`/`..`/DEL/ESC and
 asserting none are accepted, and `Argv` tests (validated build; a rejected `pushChecked`/`pushIf`
-poisons `slice()`). 18 tests. Green in Debug and ReleaseFast; `zig fmt --check` clean.
+poisons `slice()`). Green in Debug and ReleaseFast; `zig fmt --check` clean.
 
 ## Backlog / deferred
 Windows argv quoting and environment-variable-injection allowlisting are explicitly out of scope for

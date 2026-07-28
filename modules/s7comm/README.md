@@ -206,10 +206,10 @@ zig build test-s7comm -Doptimize=ReleaseFast
 zig fmt --check modules/s7comm
 ```
 
-161 tests, of which 159 are fully offline (the classic suite plus the
-S7CommPlus codec, framing, path, session/integrity and client↔responder round
-trips). The two live tests — both classic S7comm — skip gracefully (printing
-`SKIPPED:` and passing) when no peer is present:
+Fully offline (the classic suite plus the S7CommPlus codec, framing, path,
+session/integrity and client↔responder round trips), except for two live
+tests — both classic S7comm — which skip gracefully (printing `SKIPPED:` and
+passing) when no peer is present:
 
 ```
 # our client -> a real S7 server (e.g. a snap7 server on an unprivileged port)

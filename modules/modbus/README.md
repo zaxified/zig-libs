@@ -94,7 +94,7 @@ zig build test-modbus -Doptimize=ReleaseFast
 zig fmt --check modules/modbus
 ```
 
-73 tests, all offline. Known-answer tests byte-compare every function code
+All tests run offline. Known-answer tests byte-compare every function code
 against the worked wire examples in the application-protocol spec (§6.1–6.17)
 in *both* directions — the client building each request and the server
 producing each response. The CRC-16 is pinned to the canonical

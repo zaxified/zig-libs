@@ -110,7 +110,7 @@ control child without the restriction succeeds — the only honest way to verify
 a security boundary.
 
 ```
-zig build test-sandbox                          # 10 pass, 2 skip (priv-drop is root-gated)
+zig build test-sandbox                          # priv-drop tests are root-gated (skip otherwise)
 zig build test-sandbox -Doptimize=ReleaseFast
 ```
 
@@ -125,7 +125,7 @@ zig build test-sandbox -Doptimize=ReleaseFast
   it cannot `setuid(0)` back. Skips cleanly when not run as root:
 
 ```
-sudo zig build test-sandbox                     # 12 pass (adds the priv-drop tests)
+sudo zig build test-sandbox                     # adds the priv-drop tests
 ```
 
 ## Deferred (v2)

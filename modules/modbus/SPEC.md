@@ -48,7 +48,7 @@ limit, an address span that overflows the 16-bit space, a write value that is ne
 file-record, mask-write and FIFO function codes; serial line timing (t1.5/t3.5).
 
 ## Verification
-73 offline tests. Known-answer tests byte-compare every function code against the worked wire
+All tests run offline. Known-answer tests byte-compare every function code against the worked wire
 examples in the application spec §6.1–6.17, now in both directions: the client building each
 request and the server producing each response, including the FC 17 write-before-read ordering
 made observable by reading exactly the range being written. CRC-16 pinned to the canonical

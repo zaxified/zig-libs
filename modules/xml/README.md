@@ -83,7 +83,7 @@ rejected). Canonicalization and signature verification themselves live in the
 
 ## Verification
 
-`zig build test-xml` — 35 tests, green in Debug and `-Doptimize=ReleaseFast`.
+`zig build test-xml` — green in Debug and `-Doptimize=ReleaseFast`.
 Composition: W3C-pattern well-formed docs (namespaces / mixed content / entities
 / spans), W3C-pattern not-well-formed rejections (modeled on xmlconf `not-wf/sa`
 + Namespaces error cases), and security tests (XXE, billion-laughs, depth,

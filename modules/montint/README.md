@@ -69,7 +69,7 @@ zig build test-montint -Doptimize=ReleaseFast --summary all
 MONTINT_BENCH=1 zig build test-montint -Doptimize=ReleaseFast  # opt-in ns/op bench
 ```
 
-16 pass / 1 skip (Debug and ReleaseFast on amd64+ADX+BMI2). The one skip is the
+Green (Debug and ReleaseFast on amd64+ADX+BMI2). The one skip is the
 opt-in bench; the asm-vs-portable differential now runs. The suite includes the
 byte-exact modmul+modexp KATs at 256/512/2048/4096 bits, the live asm-vs-portable
 differential, the BrokenMont positive control (a dropped conditional-subtract,

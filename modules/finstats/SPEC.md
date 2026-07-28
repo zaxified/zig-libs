@@ -49,7 +49,7 @@ arbitrary VaR confidence level, and an xirr Newton-with-bisection-fallback were 
 here — now implemented, see Design & invariants above.)
 
 ## Verification
-22 tests pinning the numeric conventions above: xirr against known cash-
+Tests pin the numeric conventions above: xirr against known cash-
 flow fixtures, twrDaily Modified-Dietz with warm-up trim, riskMetrics' 9-metric row incl. historical
 VaR/CVaR and Sharpe/Sortino/Calmar/Ulcer, betaAlpha's cov/var/r² derivation, monteCarlo's
 reproducible percentile output under the fixed seed, correlationMatrix's min_overlap gating,

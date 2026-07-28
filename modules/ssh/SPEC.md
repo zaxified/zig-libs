@@ -103,7 +103,7 @@ so the security properties below are in effect, not aspirational.
 
 ## Verification
 
-`zig build test-ssh` — **79 tests, all passing, Debug and ReleaseFast native, 0 skipped** in an
+`zig build test-ssh` — **all passing, Debug and ReleaseFast native, no skips** in an
 environment with OpenSSH installed.
 
 - **Wire codec:** `messages.zig` round-trips (string incl. empty, mpint incl. the high-bit
@@ -146,7 +146,7 @@ environment with OpenSSH installed.
   assertions and observing the failures. Caveat inherited from the pre-existing live-test harness:
   each picks a random loopback port and reports `error.SkipZigTest` if the spawned `sshd` never
   listens, so a port collision can turn one live test into a skip on an individual run (observed
-  once in ~10 runs); a run that reports 0 skipped is the one that proves interop.
+  once in ~10 runs); a run that reports no skips is the one that proves interop.
 
 ## Backlog / deferred
 

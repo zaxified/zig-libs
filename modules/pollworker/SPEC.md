@@ -43,7 +43,7 @@ modes: a `fork`/`thread-spawn` failure returns a typed error (`spawn_failed` in 
 case, never assumed successful.
 
 ## Verification
-4 tests. `Loop.poll`: a pipe becomes readable within timeout (real syscall, Linux-gated). `Loop.
+`Loop.poll`: a pipe becomes readable within timeout (real syscall, Linux-gated). `Loop.
 tick`: maintenance callbacks run in registration order. `JobTable`: claim/finish/drain handoff plus
 slot reuse under N-jobs-through-2-slots (multi-round, real threads, asserts exact sum/count and
 zero-busy after drain — proves the acquire/release handoff is actually visible, not just

@@ -95,7 +95,7 @@ zig build test-ibe -Doptimize=ReleaseFast --summary all
 zig fmt --check modules/ibe/
 ```
 
-All **34** tests PASS in both Debug and ReleaseFast — ciphersuite hash
+All tests PASS in both Debug and ReleaseFast — ciphersuite hash
 tests, `Ciphertext` codec tests, `setup`/`extract` tests, the private
 `fp12Pow` algebraic-law tests, and `kat_test.zig`'s round-trip,
 pairing-consistency, and soundness/CCA-rejection KATs.

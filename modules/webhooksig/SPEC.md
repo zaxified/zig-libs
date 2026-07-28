@@ -33,7 +33,7 @@ storage/distribution, transport security (TLS is the server's), and asymmetric w
 memory; the module does not zeroize it.
 
 ## Verification
-8 tests: an HMAC-SHA256 known-answer check, sign→verify round-trip and GitHub-style
+An HMAC-SHA256 known-answer check, sign→verify round-trip and GitHub-style
 (`sha256=<hex>`) header-format parse/reject tests, constant-time-compare accept/reject, key-rotation
 (old+new secret) acceptance, tamper negatives (wrong secret, mutated body → reject). There is no
 Stripe-format test — no Stripe parsing exists to test (see above). Run: `zig build test-webhooksig`.

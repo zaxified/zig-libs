@@ -27,7 +27,7 @@ callbacks are called synchronously on every `/readyz` hit and must already be ch
 flag), not a live database ping.
 
 ## Verification
-4 offline tests through `http.Server.serveStream`: liveness always-200 + pass-through of other
+Offline tests through `http.Server.serveStream`: liveness always-200 + pass-through of other
 paths, readiness 200/503 with the failing-check listing, the empty-checks default (no checks
 registered → always ready), custom probe paths. Green in Debug + ReleaseFast. Run: `zig build
 test-health`.

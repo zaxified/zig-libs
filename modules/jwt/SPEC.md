@@ -108,7 +108,7 @@ rejection) and Provider cache/rotation/TTL tests behind a scripted fetcher. The 
 guard adds self-constructed policy tests (own signer, not external interop KATs — the correct
 approach for policy logic): `Guard.authenticate` valid/missing/garbage/expired/insufficient/
 alg=none/RS→HS-confusion decisions, RFC 9068 `at+jwt` typ on/off, `scope`+`scp` scope helpers
-(single/all/any), and `writeBearerChallenge` header formatting. 83 tests. Run: `zig build test-jwt`.
+(single/all/any), and `writeBearerChallenge` header formatting. Run: `zig build test-jwt`.
 
 ## Backlog / deferred
 

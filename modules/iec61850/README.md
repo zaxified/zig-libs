@@ -373,8 +373,8 @@ zig build test-iec61850 -Doptimize=ReleaseFast
 zig fmt --check modules/iec61850
 ```
 
-395 tests, of which 385 are fully offline. The ten live tests skip gracefully
-(printing `SKIPPED:` and passing) when no peer is present:
+The suite runs fully offline except for the live tests below, which skip
+gracefully (printing `SKIPPED:` and passing) when no peer is present:
 
 ```
 # our client -> a real IEC 61850 server
@@ -423,8 +423,8 @@ association handshake rebuilt from scratch and the `TypeSpecification` of a
 select-before-operate control object rebuilt octet for octet from this module's
 own model. On top of that: full client↔server round trips over an in-memory wire
 covering all four control models, a publisher↔subscriber round trip with an
-injected clock and a deliberately dropped frame, and 25 `std.testing.fuzz`
-sweeps. See SPEC.md for what is third-party-validated versus self-derived, and
+injected clock and a deliberately dropped frame, and `std.testing.fuzz`
+sweeps over every decoder. See SPEC.md for what is third-party-validated versus self-derived, and
 what is deferred.
 
 The SCL resolver was checked against **twelve different configuration files**

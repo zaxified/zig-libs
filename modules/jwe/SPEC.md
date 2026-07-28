@@ -150,7 +150,7 @@ placement).
 
 ## Verification
 
-`zig build test-jwe`: 53 tests pass, 0 skipped (header round-trips + `zip`
+`zig build test-jwe`: all pass, no skips (header round-trips + `zip`
 rejection, `A128GCM`/`A256GCM` real round-trips + tamper detection,
 AES-192 documented-std-gap checks, `dir`/`RSA-OAEP-256`/GCMKW/PBES2 wiring,
 RFC 3394 §4.1 AES-KW KAT + fail-closed tests, RFC 7518 B.1/B.3 CBC-HMAC

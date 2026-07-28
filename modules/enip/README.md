@@ -193,7 +193,7 @@ zig build test-enip -Doptimize=ReleaseFast
 zig fmt --check modules/enip
 ```
 
-147 tests, of which 144 are fully offline. The three live tests skip
+The suite runs fully offline except for a few live tests, which skip
 gracefully (printing `SKIPPED:` and passing) when no peer is present:
 
 ```

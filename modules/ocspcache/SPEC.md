@@ -190,5 +190,5 @@ distinct certificate once the bound is reached without disturbing the first.
 Implemented: AIA-based responder discovery, an injectable fetch `Transport`
 (POST priority + GET form + an `http`-backed production adapter), and a
 `Cache` (`getStapled` / `needsRefresh` / `refresh`) with verify-before-cache
-and the soft-fail posture. `zig build test-ocspcache` — 17 tests green in
+and the soft-fail posture. `zig build test-ocspcache` — green in
 Debug and ReleaseFast.

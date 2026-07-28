@@ -301,11 +301,8 @@ cross-signer rejection check.
   published JSON files under `bip-0327/vectors/` in `bitcoin/bips` (see
   `NOTICE`; only `det_sign_vectors.json` remains deliberately not
   embedded), transcribed into `src/kat_vectors.zig`.
-- `zig build test-musig2` (Debug) and `-Doptimize=ReleaseFast`: 25 pass /
-  0 skip (of 25 total) — every embedded official vector asserts for real
-  (untweaked AND tweaked), plus the two end-to-end tests. `zig fmt
+- `zig build test-musig2` (Debug) and `-Doptimize=ReleaseFast`: all pass,
+  no skips — every embedded official vector asserts for real
+  (untweaked AND tweaked), plus the end-to-end tests. `zig fmt
   --check modules/musig2/` clean; a repo-hygiene grep for
   scratch/home-directory leakage over this module's tree has no hits.
-- Disk-vs-running test count (CONVENTIONS.md §6 step 3): counting
-  top-level `test` blocks across `src/*.zig` sums to 25, matching
-  `zig build test-musig2 --summary all`'s "25 total".

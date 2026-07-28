@@ -42,7 +42,7 @@ vision content blocks, the Batch API, and connection reuse (each request opens a
 via `http.Client`'s `Connection: close`, so a long chat session pays a new TLS handshake per turn).
 
 ## Verification
-15 tests across `root.zig`/`Client.zig`/`response.zig`/`sse_parse.zig`/`types.zig` (dark-aggregated
+Tests span `root.zig`/`Client.zig`/`response.zig`/`sse_parse.zig`/`types.zig` (dark-aggregated
 via the `test { _ = ...; }` block in root.zig). Covers: golden request headers/URL construction,
 non-2xx → `error.UnexpectedStatus` + `lastErrorBody` round-trip, request/response type re-exports,
 JSON stringify of polymorphic content-block/tool-choice unions, response parsing of every

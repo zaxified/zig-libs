@@ -71,7 +71,7 @@ All 7 rows of the official BIP341 `wallet-test-vectors.json` pass end to
 end — `tapTweakHash`, `tweakPublicKey` (tweaked pubkey + parity + tweak),
 and `tweakSecretKey` (tweaked privkey) each byte-exact (both the one
 key-path-only row and the six script-tree rows), plus a per-row
-`bip340.sign`→`verify` round-trip with the tweaked key pair. 13/13 tests,
-zero skips, Debug and ReleaseFast.
+`bip340.sign`→`verify` round-trip with the tweaked key pair. Zero skips,
+Debug and ReleaseFast.
 
 Provenance: see [NOTICE](NOTICE).

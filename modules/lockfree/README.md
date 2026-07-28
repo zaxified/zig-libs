@@ -74,7 +74,7 @@ required (see CONVENTIONS §5).
 ## Verification
 
 `zig build test-lockfree` — offline, green in Debug **and** ReleaseFast, no
-leaks. **17/17, 0 skipped:** with the core implemented, the gated "REAL CORE"
+leaks, no skips: with the core implemented, the gated "REAL CORE"
 stress test (8 producers × 8 consumers × 50 000 ops, then the pool canary) now
 runs for real. The harness proves it bites before *and* after the core exists:
 

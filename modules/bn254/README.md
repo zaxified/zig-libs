@@ -30,7 +30,7 @@ Groth16/BN254 proof (darkforest-v0.3's "move" circuit) — the real proof
 verifies TRUE, six independent tamper cases each verify FALSE. Every
 field/curve constant independently verified (see `SPEC.md`), byte-exact
 KAT coverage against independently-computed AND (Parts 5-6)
-independently-SOURCED reference vectors, 154/154 tests pass in Debug AND
+independently-SOURCED reference vectors, all passing in Debug AND
 ReleaseFast.
 
 This module was built by careful, verified ADAPTATION of the sibling
@@ -140,8 +140,8 @@ comments.
 ## Verify
 
 ```
-zig build test-bn254                        # Debug — 154/154 pass
-zig build test-bn254 -Doptimize=ReleaseFast # ReleaseFast — 154/154 pass
+zig build test-bn254                        # Debug
+zig build test-bn254 -Doptimize=ReleaseFast # ReleaseFast
 zig fmt --check modules/bn254/
 ```
 

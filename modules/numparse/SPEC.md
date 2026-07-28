@@ -32,7 +32,7 @@ broader ICU `NumberFormat` locale coverage. A caller passing the wrong separator
 locale gets `null` (safe failure), not a mis-parsed number silently accepted.
 
 ## Verification
-2 tests (covering both grouping conventions, adapted for `decimal`'s error-union `parse`):
+Tests cover both grouping conventions, adapted for `decimal`'s error-union `parse`:
 American-format accept cases (grouped integers/decimals, negative, exact group boundaries) and
 reject cases (ungrouped, wrong group size); European-format mirror of the same, plus a
 cross-locale negative (comma/dot swapped). Run: `zig build test-numparse`.

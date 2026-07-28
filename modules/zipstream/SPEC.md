@@ -75,7 +75,7 @@ round-trip `ArchiveWriter`'s output (Store + Deflate) back through this module's
 directly (so a wrong field written by `ArchiveWriter` can't hide behind a lenient reader), and confirm
 `addEntry` rejects zip-slip names. Ad hoc (not a standing test — no external-tool dependency added to
 the suite): a small `ArchiveWriter`-produced archive was verified against the real `unzip`/`zipinfo`
-(`unzip -t` clean, `unzip -p` byte-exact for both a Store and a Deflate entry). 14 tests. Run: `zig build
+(`unzip -t` clean, `unzip -p` byte-exact for both a Store and a Deflate entry). Run: `zig build
 test-zipstream`.
 
 ## Backlog / deferred

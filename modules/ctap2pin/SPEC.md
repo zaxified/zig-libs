@@ -65,7 +65,7 @@ round-trips (`kat_test.zig`):
 | HMAC-SHA-256 | RFC 4231 §4.3 TC2 | byte-exact |
 | Protocols One/Two | round-trip | two-sided `encapsulate` agreement; `decrypt∘encrypt = id`; `verify∘authenticate = true`; tamper/length rejection |
 
-25/25 tests green in Debug and ReleaseFast (`zig build test-ctap2pin
+Green in Debug and ReleaseFast (`zig build test-ctap2pin
 [-Doptimize=ReleaseFast]`).
 
 ## Non-goals

@@ -217,6 +217,3 @@ material.
 
 - `zig build test-oscore` and `-Doptimize=ReleaseFast` both go green;
   `zig fmt --check modules/oscore/` clean.
-- Disk-vs-running test count (CONVENTIONS.md §6 step 3):
-  `grep -c '^\s*test ' modules/oscore/src/*.zig` summed across files
-  equals `zig build test-oscore --summary all`'s reported total.

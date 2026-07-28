@@ -238,17 +238,13 @@ inline (dedicated squaring, windowed scalar mul, `mulSmall`, fused
 ## Verification
 
 - `zig build test-ed448` (Debug) and `zig build test-ed448
-  -Doptimize=ReleaseFast`: **all 48 tests pass in both modes, 0 panics**
+  -Doptimize=ReleaseFast`: **all tests pass in both modes, no panics**
   (verified 2026-07-15, the day the crypto core landed). `zig fmt
   --check modules/ed448/` is clean.
-- Byte-exact KATs among those 48: X448 RFC 7748 §5.2 vectors 1+2, the
+- Byte-exact KATs: X448 RFC 7748 §5.2 vectors 1+2, the
   §5.2 1-iteration vector, the §6.2 Alice/Bob DH example (public keys +
   shared secret both directions); Ed448 RFC 8032 §7.4 Blank / 1 octet /
   1 octet-with-context / 11 octets (keygen public key, 114-byte
   signature, verify-accept, tamper-reject each); Ed448ph §7.5 "TEST
   abc"; plus context-binding and Ed448-vs-Ed448ph cross-rejection
   property tests.
-- Disk-vs-running test count (CONVENTIONS.md §6 step 3):
-  `grep -c '^\s*test ' modules/ed448/src/*.zig` summed across files (48)
-  matches `zig build test-ed448 --summary all`'s reported total (48) —
-  verified post-implementation.

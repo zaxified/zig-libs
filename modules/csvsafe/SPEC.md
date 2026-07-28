@@ -24,7 +24,7 @@ leads only — a non-UTF-8/homoglyph lead is unguarded); **configurable guard ch
 exposed as `guard_char` for reference only, not a parameter).
 
 ## Verification
-`zig build test-csvsafe` (+ `-Doptimize=ReleaseFast`; `zig fmt --check modules/csvsafe`). 8 tests:
+`zig build test-csvsafe` (+ `-Doptimize=ReleaseFast`; `zig fmt --check modules/csvsafe`):
 `needsGuard`/`needsGuardSep` over the dangerous-lead set and the signed-number exception (both
 decimal separators), `writeSafe`/`writeSafeSep` streaming output, `guard`/`guardSep` allocation
 round-trip.

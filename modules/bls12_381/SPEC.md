@@ -743,7 +743,7 @@ see "Part 6 design" below.
 
 ## Verification
 
-- **KAT/oracle vectors wired** (all pass — 94 tests):
+- **KAT/oracle vectors wired** (all pass):
   - `fp.zig`: `p` is odd and exactly 381 bits (`modulus.bits()`);
     `half_p_bytes` independently recomputed as `(p-1)>>1` via raw byte
     arithmetic; zero/one round-trips; canonical-boundary rejection;
@@ -778,8 +778,7 @@ see "Part 6 design" below.
     round-trips with both sort-bit values plus a `NotOnCurve` reject
     vector; uncompressed round-trips through real Jacobian arithmetic.
   - `root.zig`: every `encoded_bytes` constant matches its documented
-    wire width; the dark-tests aggregator lists every submodule (disk
-    test-block count == runtime count == 112, Parts 1+2).
+    wire width; the dark-tests aggregator lists every submodule (Parts 1+2).
   - `fp12.zig` (Part-2 additions): `cyclotomicSquare == square` on a
     REAL cyclotomic-subgroup element (built pairing-free via the easy-
     part construction, iterated 3 steps) and on `one`;
@@ -802,7 +801,7 @@ see "Part 6 design" below.
 - **Green in both modes (Parts 1-2)**: `zig build test-bls12_381`
   (Debug) and `zig build test-bls12_381 -Doptimize=ReleaseFast`
   (ReleaseFast — exercised deliberately, this repo has been bitten by
-  Debug-only-green UB before) both report **112/112 tests pass, 0
+  Debug-only-green UB before) both report **all tests pass, no
   panics**. `zig fmt --check modules/bls12_381/` is clean.
 - **Part 3 vectors (`hash_to_curve.zig` + the new `fp.zig`/`fp2.zig`
   helpers — ALL PASS)**: `expandMessageXmd` against RFC 9380
@@ -823,17 +822,16 @@ see "Part 6 design" below.
   `E1'`/`E2'` with `sgn0(y) == 0`; `Fp`/`Fp2` `inv0`/`sgn0` unit tests
   (including the `sgn0`-vs-`isLexicographicallyLargest` convention
   distinction). **Net (Parts 1-3): `zig build test-bls12_381` reports
-  128/128 pass, 0 panics, in both Debug and ReleaseFast** (`zig fmt
-  --check` clean; disk test-block count == runtime count == 128).
-- **Part 4 (`bls_sig.zig`) — COMPLETE, 148 total tests (128 + 20
-  new)**: the 12 scaffold-era tests (wire codecs, `keyGen`
+  all tests pass, no panics, in both Debug and ReleaseFast** (`zig fmt
+  --check` clean).
+- **Part 4 (`bls_sig.zig`) — COMPLETE**: the scaffold-era tests (wire codecs, `keyGen`
   IKM/determinism, `skToPk`+`keyValidate`, `keyValidate` rejecting the
   identity and a non-subgroup point, `aggregate`/`aggregatePublicKeys`
   empty-set rejection, single-signature and commutativity/associativity
   properties, `coreAggregateVerify`/`aggregateVerify`/
   `fastAggregateVerify` precondition rejection, and the byte-exact
   `aggregate` KAT against `ethereum/bls12-381-tests` v0.1.2's
-  `aggregate_0xabab...ab.json`); the 5 pairing-core tests, now passing:
+  `aggregate_0xabab...ab.json`); the pairing-core tests, now passing:
   `sign` against `sign_case_11b8c7cad5238946.json` (byte-exact 96-byte
   signature), `verify` accept/reject against
   `verify_valid_case_195246ee3bd3b6ec.json` (the reject case
@@ -846,7 +844,7 @@ see "Part 6 design" below.
   wrong-key proof rejected), and a self-consistent end-to-end
   `keyGen`->`skToPk`->`sign`->`verify`->`aggregate`->`aggregateVerify`
   round trip with wrong-message/wrong-key/swapped-message tampering;
-  PLUS 3 new security-check tests proving the mandatory checks FIRE:
+  PLUS new security-check tests proving the mandatory checks FIRE:
   `verify`/`popVerify`/`aggregateVerify` reject the IDENTITY public
   key (KeyValidate fires, fail-closed, no panic); `verify`/`popVerify`/
   `aggregateVerify`/`fastAggregateVerify` reject an on-curve
@@ -855,10 +853,9 @@ see "Part 6 design" below.
   precondition); and an 8-signer `aggregateVerify` round trip (9
   pairing terms) crossing `coreAggregateVerify`'s Miller-chunk
   boundary, with a cross-boundary message-swap tamper rejected.
-  **`zig build test-bls12_381` reports 148/148 pass, 0 panics, in both
-  Debug and ReleaseFast** (`zig fmt --check` clean; disk test-block
-  count == runtime count == 148).
-- **Part 5 (`kzg.zig`) — COMPLETE, 36 tests**: constants cross-checked
+  **`zig build test-bls12_381` reports all tests pass, no panics, in both
+  Debug and ReleaseFast** (`zig fmt --check` clean).
+- **Part 5 (`kzg.zig`) — COMPLETE**: constants cross-checked
   against the fetched spec text (including an independent decimal->hex
   conversion confirming `BLS_MODULUS == scalar.r_bytes`);
   `G1_POINT_AT_INFINITY` cross-checked against `g1.zig`'s own compressed-
@@ -903,8 +900,7 @@ see "Part 6 design" below.
   the scaffold's cross-check that the constant blob's KAT commitment
   independently equals `g1.zig`'s own pre-existing `[2]G` KAT.
   **`zig build test-bls12_381` (Debug) and `zig test -OReleaseFast`
-  report 184/184 pass, 0 panics** (`zig fmt --check` clean; disk
-  test-block count == runtime count).
+  report all tests pass, no panics** (`zig fmt --check` clean).
 
 ## Status
 
@@ -950,7 +946,7 @@ chunked Miller accumulator and the draft-faithful
 `fastAggregateVerify`). Byte-exact against the `ethereum/bls12-381-tests`
 v0.1.2 `sign`/`verify`/`aggregate`/`fast_aggregate_verify` vectors;
 mandatory subgroup/`KeyValidate` checks proven to fire by dedicated
-fail-closed tests. `zig build test-bls12_381`: 148/148 pass, 0 panics,
+fail-closed tests. `zig build test-bls12_381`: pass, no panics,
 Debug AND ReleaseFast — see "Verification" above.
 
 **Part 5 COMPLETE (crypto-core pass, 2026-07-14).** EIP-4844 (deneb)
@@ -975,7 +971,7 @@ checks: `e(proof, [s]₂ - [z]₂) == e(commitment - [y]₁, [1]₂)` as
 `ethereum/c-kzg-4844` KATs across every public function, over both a
 constant and a permutation-sensitive random blob, plus two
 monomial-vs-Lagrange ceremony cross-checks and a full property suite —
-see "Verification" above. `zig build test-bls12_381`: 184/184 pass, 0
+see "Verification" above. `zig build test-bls12_381`: pass, no
 panics, Debug AND ReleaseFast.
 
 **Part 6 COMPLETE (crypto-core pass 2026-07-14).** Trusted-dealer
@@ -1004,7 +1000,7 @@ signature), a below-threshold sanity check (2 partials of a `t=3`
 dealing interpolate a WRONG signature that fails `bls_sig.verify` —
 `t` really is the threshold), and precondition rejection
 (too-few/duplicate-index/zero-index partials, invalid `(t, n,
-coefficients)` splits). `zig build test-bls12_381`: 200/200 pass, 0
+coefficients)` splits). `zig build test-bls12_381`: pass, no
 panics, Debug AND ReleaseFast.
 
 ### Backlog (deferred)

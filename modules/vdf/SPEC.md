@@ -6,7 +6,7 @@ Wesolowski Verifiable Delay Function over an RSA hidden-order group; see
 **Status: COMPLETE.** `group.zig` (Z_N* wrapper + the RSA-2048 Factoring
 Challenge modulus + element validation) and `vdf.zig`'s `eval`,
 `hashToPrime`, `pow2Mod`, and `Proof`'s codec are real and tested — as are
-the two irreducible cores `prove` and `verify` (35 tests, green in Debug +
+the two irreducible cores `prove` and `verify` (green in Debug +
 ReleaseFast). `gate.core_implemented = true`, so the completeness/soundness
 tests that call `prove`/`verify` run (and pass). See "The Fable cores"
 below.

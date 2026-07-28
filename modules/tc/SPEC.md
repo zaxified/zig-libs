@@ -491,7 +491,7 @@ caller-supplied rate/size can panic in ReleaseSafe or wrap in ReleaseFast.
   `parseAction`/`parseActionList`/`parseStats`/`actionsOf` and all `parse*Options` over
   arbitrary bytes — never panic, never over-read.
 - **Live netns round-trip** (env-gated; prints `SKIPPED: …` and passes when unprivileged):
-  `unshare -rn zig build test-tc`. Seven integration tests exercise an unprivileged qdisc
+  `unshare -rn zig build test-tc`. Integration tests exercise an unprivileged qdisc
   dump, the v1 netem add/show/change/del cycle, an htb tree (qdisc → two classes, one of
   them needing RATE64 → an fq_codel leaf under a class → u32 + flower filters → dumps of
   all three families → filter del → class del), a tbf round-trip, an extended-ACK probe
@@ -501,9 +501,10 @@ caller-supplied rate/size can panic in ReleaseSafe or wrap in ReleaseFast.
   requested and the kernel's own `refcnt`/`TCA_ACT_STATS` asserted), and an unprivileged
   `RTM_GETACTION` dump. Every assertion is against what the kernel echoed back.
 
-  This was run in the development environment: **129 pass / 1 skip under `unshare -rn` in
-  both Debug and `--release=fast`** (130 tests); unprivileged, 124 pass and 6 privileged
-  tests skip. `zig build test-netlink` stays green (81/81). The mq/cake batch was captured
+  This was run in the development environment: green under `unshare -rn` in
+  both Debug and `--release=fast`, with only the shared-action-table write skipping; run
+  fully unprivileged, the privileged-only tests skip cleanly instead. `zig build test-netlink`
+  stays green. The mq/cake batch was captured
   on the same host and recipe as the action goldens (`-e write=all`, exact `sendmsg` bytes
   checked against each message's own `nlmsg_len`); `lo` is single-queue so the kernel
   rejects the attach, but the request bytes are what the golden pins.

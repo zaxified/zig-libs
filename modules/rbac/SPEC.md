@@ -125,7 +125,7 @@ design reference — pure clean-room-from-spec (NIST RBAC / XACML), so no NOTICE
 
 ## Verification
 
-`zig build test-rbac` (Debug) and `zig build test-rbac -Doptimize=ReleaseFast`; 36/36 tests,
+`zig build test-rbac` (Debug) and `zig build test-rbac -Doptimize=ReleaseFast`,
 both green. This is policy logic with no external interop target — there is no third-party
 "RBAC KAT" or "ABAC KAT" corpus to validate against (unlike e.g. a crypto primitive or wire
 codec), so **self-constructed test cases are the correct verification approach here**, per

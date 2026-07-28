@@ -70,7 +70,7 @@ defer gpa.free(bytes);
 
 ## Status
 
-25 tests, green in Debug and ReleaseFast. Canonicalization is validated
+Green in Debug and ReleaseFast. Canonicalization is validated
 byte-exact against the W3C exc-c14n / c14n-1.0 spec examples; signature
 verification is validated with constructed round-trip fixtures (sign with the
 sibling `rsa`/`p256` signers, then verify and mutate). See `SPEC.md`.

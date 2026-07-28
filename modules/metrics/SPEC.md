@@ -28,7 +28,7 @@ registry becomes an unbounded memory leak. This is why the middleware defaults t
 not raw path. No push-gateway / remote-write — text exposition only.
 
 ## Verification
-`zig build test-metrics`, 20 tests: counter monotonicity + get-or-register identity, gauge
+`zig build test-metrics` covers: counter monotonicity + get-or-register identity, gauge
 set/inc/dec/add/sub, histogram cumulative buckets (inclusive `le`, `_sum`/`_count`,
 empty-bucket-list, NaN), name/label/bucket validation errors, input-copy proof, golden exact-bytes
 exposition (escaping, `le="+Inf"`), an 8-thread stress on shared instruments with exact totals plus

@@ -10,7 +10,7 @@ The four irreducible field-math cores were `@panic`-stubbed by the
 scaffold pass behind `gate.core_implemented`; a Fable pass then
 implemented ONLY those four and flipped the gate — with zero edits to
 `kat_test.zig`/`kat_vectors.zig`, matching `ed448`'s and `bn254`'s own
-scaffold-then-implement track record. 29/29 tests now run and pass.
+scaffold-then-implement track record. All tests now run and pass.
 
 ## Design
 
@@ -138,12 +138,8 @@ are constructed by machinery independent of the stub under test.
 ## Verification
 
 - `zig build test-decaf448` (Debug) and `zig build test-decaf448
-  -Doptimize=ReleaseFast`: **29/29 tests pass, 0 skip, 0 fail, in both
-  modes**. `zig fmt --check modules/decaf448/` is clean.
-- Disk-vs-running test count (CONVENTIONS.md §6 step 3):
-  `grep -c '^\s*test ' modules/decaf448/src/*.zig` summed across files
-  (29) matches `zig build test-decaf448 --summary all`'s reported total
-  (29) — verified at scaffold time.
+  -Doptimize=ReleaseFast`: **all tests pass, no skips, no failures, in
+  both modes**. `zig fmt --check modules/decaf448/` is clean.
 - A repo-hygiene grep for developer-machine home-directory paths and
   personal identifiers over `modules/decaf448/` is empty.
 

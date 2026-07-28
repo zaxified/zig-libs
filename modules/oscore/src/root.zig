@@ -7,8 +7,8 @@
 //! 13-byte nonce, 64-bit/8-byte tag) for the AEAD, and **HKDF-SHA-256**
 //! (RFC 5869) for §3.2.1 context derivation.
 //!
-//! **Status: complete** — all six crypto cores implemented and KAT-validated
-//! (32/32 tests, Debug + ReleaseFast). REAL pure-bookkeeping pieces: the
+//! **Status: complete** — all six crypto cores implemented and KAT-validated,
+//! green in Debug + ReleaseFast. REAL pure-bookkeeping pieces: the
 //! §3.2.1 `info` CBOR encoder (`encodeInfo`), the §5.4 `aad_array`/
 //! `Enc_structure` CBOR encoders (`encodeAadArray`, `encodeEncStructure`),
 //! the §6.1 compressed COSE option codec (`OscoreOption`), and the §3.2.2

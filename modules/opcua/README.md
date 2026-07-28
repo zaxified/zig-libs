@@ -235,7 +235,7 @@ matching. See SPEC.md.
 
 ## Verification
 
-`zig build test-opcua` — 164 tests, green in Debug and ReleaseFast:
+`zig build test-opcua` — green in Debug and ReleaseFast:
 
 - Offline: codec round-trips, transport framing, secure-channel crypto
   vectors, service-message goldens, address-space unit tests, and the whole

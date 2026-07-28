@@ -42,7 +42,7 @@ canonical-field-element enforcement, `blobToKzgCommitment`,
 FFT/inverse-FFT and Pippenger `G1` multi-scalar-multiplication
 primitives — byte-exact against `ethereum/c-kzg-4844`'s official KAT
 vectors across every public function (see `kzg.zig`'s module doc
-comment and `SPEC.md`). Parts 1-6: 200/200 tests pass, 0 panics, in
+comment and `SPEC.md`). Parts 1-6: all pass, no panics, in
 Debug AND ReleaseFast (see `SPEC.md` for the design record).
 
 **Part 6 (`threshold.zig`) is COMPLETE.** Trusted-dealer threshold BLS
@@ -178,8 +178,8 @@ BLS pitfall; see `SPEC.md`'s threat model).
 ## Verify
 
 ```
-zig build test-bls12_381                        # Debug — 200/200 pass (slow: the KZG KATs dominate, several minutes)
-zig build test-bls12_381 -Doptimize=ReleaseFast # ReleaseFast — 200/200 pass (~1 min)
+zig build test-bls12_381                        # Debug (slow: the KZG KATs dominate, several minutes)
+zig build test-bls12_381 -Doptimize=ReleaseFast # ReleaseFast (~1 min)
 zig fmt --check modules/bls12_381/
 ```
 

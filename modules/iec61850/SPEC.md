@@ -702,7 +702,7 @@ were parsed, emitted and re-parsed:
 
 ### Fuzz + hostile input
 
-25 `std.testing.fuzz` sweeps, all asserting "typed error or valid result, never a panic and never a
+`std.testing.fuzz` sweeps, all asserting "typed error or valid result, never a panic and never a
 hang":
 
 - `ber.decode` over arbitrary bytes — anything that decodes with a definite length must **re-encode
@@ -975,5 +975,5 @@ both (client + server, publisher + subscriber) · single_owner` + deps: `xml` (S
 round-trip check on emission; every other file is std-only and allocation-free) — canonical source
 is `pub const meta` in src/root.zig.
 
-395 tests, 385 offline, 10 live and env-gated (each printing `SKIPPED: …` and passing when no peer
-is present).
+The suite runs offline except for a handful of live, env-gated tests (each printing `SKIPPED: …`
+and passing when no peer is present).

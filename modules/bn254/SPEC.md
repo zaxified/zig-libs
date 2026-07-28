@@ -853,7 +853,7 @@ read from `py_ecc`'s source).
   crypto cores — `millerLoop` (`6x+2` Miller loop with the BN-specific
   Frobenius-tail steps) and `finalExponentiation` (easy part + the
   BN-specific exact-`d` hard-part addition chain) — are implemented and
-  tested, `gate.pairing_core_implemented` flipped to `true`; 123/123
+  tested, `gate.pairing_core_implemented` flipped to `true`;
   pass in Debug AND ReleaseFast, byte-exact against py_ecc. See "Part 4
   — pairing" above.
 - Part 5: EIP-196/197 precompile-exact semantics (point-at-infinity

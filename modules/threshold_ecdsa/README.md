@@ -13,7 +13,7 @@ none of whom ever holds the whole key).
 
 **Status:** keygen + aux-params + MtA + the Phase-2c zero-knowledge proofs
 are all REAL and tested (`zig build test-threshold_ecdsa`: every Phase
-2a/2b/2c test passes, 0 panics — see `SPEC.md` for the full breakdown).
+2a/2b/2c test passes, no panics — see `SPEC.md` for the full breakdown).
 **Phase 2d (`signing.zig`, this pass) is REAL end to end too:**
 `signWithShares` runs the full GG20 online-signing protocol in-process over
 a `t`-of-`n` `KeyShare` subset and produces a signature that genuinely

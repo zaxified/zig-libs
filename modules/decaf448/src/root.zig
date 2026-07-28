@@ -28,7 +28,7 @@
 //! (RFC 9496 §5.2), `Element.encode` (§5.3.2), `Element.decode` (§5.3.1),
 //! and the inner `MAP` primitive backing `oneWayMap` (§5.3.4) — are now
 //! implemented and `gate.core_implemented` is `true`, so every KAT test
-//! runs (29/29 pass, byte-exact against RFC 9496 Appendix B in both Debug
+//! runs (all pass, byte-exact against RFC 9496 Appendix B in both Debug
 //! and ReleaseFast); see `gate.zig`'s own doc comment for the real/gated
 //! split and `element.zig` for each core's full doc-commented contract.
 //!

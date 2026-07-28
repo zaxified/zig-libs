@@ -209,7 +209,7 @@ feeds `blindSign`'s §7.2 blinding factor and `maskedInvert`'s masks.
 
 ## Verification
 
-- `zig build test-blindrsa` — **36/36 pass**, Debug AND
+- `zig build test-blindrsa` — pass, Debug AND
   `-Doptimize=ReleaseFast`, zero panics. `zig fmt` clean.
 - Byte-exact KATs against RFC 9474 Appendix A.1 (PSS-Randomized) and A.4
   (PSSZERO-Deterministic): `pssEncode` → `encoded_msg`;
@@ -236,10 +236,6 @@ feeds `blindSign`'s §7.2 blinding factor and `maskedInvert`'s masks.
   the RFC 4096-bit key (both PSS and PSSZERO salt lengths, asserting a
   fresh `r` does NOT reproduce the KAT `blinded_msg`) and over a fresh
   `rsa.generate(1024)` keypair, including same-session tamper rejection.
-- Disk-vs-running test count (CONVENTIONS.md §6 step 3):
-  `grep -c '^\s*test ' modules/blindrsa/src/*.zig` sums to 36
-  (13 root.zig + 3 kat_vectors.zig + 20 kat_test.zig) ==
-  `zig build test-blindrsa --summary all`'s reported total — verified.
 - To re-derive/re-check `kat_vectors.zig`'s recomputed `r` in Python:
   `r = pow(inv, -1, n)`, then assert `r * inv % n == 1` and
   `blinded_msg == encoded_msg * pow(r, e, n) % n` for both A.1 and A.4.

@@ -37,7 +37,7 @@ catch or classify errors itself.
 
 ## Verification
 
-33 tests. Offline: the full matrix (matching, precedence, backtracking, params, 404/405 + `Allow`,
+Offline: the full matrix (matching, precedence, backtracking, params, 404/405 + `Allow`,
 HEAD→GET, both trailing-slash policies, middleware order/short-circuit/state, groups, keep-alive)
 driven through the socket-free `http.Server.serveStream`. In-process integration: `http.Server` +
 this router on `127.0.0.1:0`, exercised with the Phase-1 `http.Client` (dispatch, params, middleware

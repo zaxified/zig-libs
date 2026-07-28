@@ -28,7 +28,7 @@ GBK/GB18030, Big5), and UTF-16. The `build(&overrides)` table pattern would gene
 no in-house need beyond the European subset; reopen only on a concrete requirement.
 
 ## Verification
-12 tests: round-trip decode/encode for all five code pages across the full high-half table,
+Tests cover: round-trip decode/encode for all five code pages across the full high-half table,
 ASCII-identity of the low half, alias parsing (case-insensitive + all listed aliases per page),
 lenient-fallback behavior on unmappable codepoints (encode → `'?'`) and unmappable bytes (decode →
 verbatim passthrough), and invalid/truncated UTF-8 passthrough on encode. Run: `zig build

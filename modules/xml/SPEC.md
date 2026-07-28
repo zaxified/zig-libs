@@ -107,8 +107,8 @@ these are canonicalization policy, not infoset data.
 
 | Vector | Policy | Test |
 |--------|--------|------|
-| **XXE / external entities / external DTD** | `<!DOCTYPE>` is **rejected by default** (`error.DoctypeForbidden`) — an external subset is never even inspected. With `doctype = .ignore` the DTD is *skipped without parsing any entity declaration*; the parser has **no filesystem/network code path at all**, so `SYSTEM "file:///…"` can never be dereferenced, and the later `&xxe;` fails as `UndefinedEntity`. | `security XXE: *` (3 tests incl. positive control) |
-| **Entity-expansion DoS** (billion laughs / quadratic blowup) | User-defined general entities are **never supported**. Only the 5 predefined + numeric refs expand. A custom `&lol3;` is simply undefined ⇒ `UndefinedEntity` (or `DoctypeForbidden` under the default policy) — no recursive expansion, no memory growth. | `security billion-laughs: *` (2 tests) |
+| **XXE / external entities / external DTD** | `<!DOCTYPE>` is **rejected by default** (`error.DoctypeForbidden`) — an external subset is never even inspected. With `doctype = .ignore` the DTD is *skipped without parsing any entity declaration*; the parser has **no filesystem/network code path at all**, so `SYSTEM "file:///…"` can never be dereferenced, and the later `&xxe;` fails as `UndefinedEntity`. | `security XXE: *` (incl. a positive control) |
+| **Entity-expansion DoS** (billion laughs / quadratic blowup) | User-defined general entities are **never supported**. Only the 5 predefined + numeric refs expand. A custom `&lol3;` is simply undefined ⇒ `UndefinedEntity` (or `DoctypeForbidden` under the default policy) — no recursive expansion, no memory growth. | `security billion-laughs: *` |
 | **Adversarial nesting / stack exhaustion** | Element depth capped at `Options.max_depth` (default 256); the parser uses an explicit heap stack (no native recursion on nesting). | `security depth: *` (reject + positive control) |
 | **Pathological attribute counts** | `Options.max_attributes` (default 4096) ⇒ `TooManyAttributes`. | `security bounds: too many attributes` |
 | **Oversized names** | `Options.max_name_len` (default 1 MiB) ⇒ `NameTooLong`. | (bound enforced in `parseNameRaw`) |
@@ -144,7 +144,7 @@ outside the root.
 
 ## Validation
 
-35 tests, green in Debug and ReleaseFast (UB-checked). Composition:
+Green in Debug and ReleaseFast (UB-checked). Composition:
 - **W3C-pattern well-formed**: nested elements/attributes/document-order,
   namespace default/prefixed/scoping/shadowing/resolution, mixed content with
   comments + PIs + CDATA + byte-span round-trip, entity + numeric-ref decoding,

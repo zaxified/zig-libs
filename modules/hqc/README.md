@@ -102,7 +102,7 @@ zig build test-hqc --summary all                        # Debug
 zig build test-hqc --summary all -Doptimize=ReleaseFast  # ReleaseFast
 ```
 
-67 tests, all passing (Debug + ReleaseFast): Part 1's parameter-table
+All tests pass (Debug + ReleaseFast): Part 1's parameter-table
 cross-checks, `gf2x` algebraic identities, and `prng`'s `Xof`/`Prng`/
 `hashI`/`hashG`/sampler chain reproduced byte-exact against the reference
 implementation's own intermediate-value dump; Part 2's `gf256` field-axiom

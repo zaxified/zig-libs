@@ -91,9 +91,10 @@ The `.secure`/`.bogus` verdict IS attackable now, so:
 
 ## Verification
 
-`zig build test-dnssec` — 57 offline tests (Debug + ReleaseFast, both green;
-`zig fmt --check` clean). 44 mechanical unit tests over the parsers/hashers
-plus 13 end-to-end known-answer tests. The KATs use a REAL offline oracle:
+`zig build test-dnssec` — runs entirely offline (Debug + ReleaseFast, both
+green; `zig fmt --check` clean). Mechanical unit tests over the
+parsers/hashers plus end-to-end known-answer tests. The KATs use a REAL
+offline oracle:
 zones signed by `ldns-signzone`/`ldns-keygen` across algorithms 8/13/14/15
 (RSA-SHA256, ECDSA-P256, ECDSA-P384, Ed25519), with NSEC, NSEC3 and NSEC3
 Opt-Out, a wildcard, and NODATA/NXDOMAIN denial cases — each source zone

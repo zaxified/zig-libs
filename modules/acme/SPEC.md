@@ -39,7 +39,7 @@ issuance, and renewal. Usage: see ./README.md. Attribution/provenance: see /NOTI
   for HTTP-01 the caller runs the port-80 `http.Server`. RSA account keys not supported (ES256 only).
 
 ## Verification
-`zig build test-acme` — 33 tests, all offline + loopback, no real CA ever contacted. Offline units:
+`zig build test-acme` — all offline + loopback, no real CA ever contacted. Offline units:
 ES256 KAT (RFC 7515 A.3), JWK thumbprint (RFC 7638 §3.1), key-authorization computation, **RFC 8737
 acmeIdentifier = SHA-256(keyAuthorization) against a hand-computed oracle**, base64url vectors, JWS
 sign→verify round-trips (jwk + kid, tampering fails), CSR DER build→parse-back (SANs + self-signature,

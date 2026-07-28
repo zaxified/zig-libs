@@ -41,7 +41,7 @@ backpressure signaling to callers beyond the per-upstream bulkhead cap and `NoHe
 responsibility, not this module's.
 
 ## Verification
-17 tests, fully offline and deterministic (scripted fake operation + fake `HealthChecker` + virtual
+Fully offline and deterministic (scripted fake operation + fake `HealthChecker` + virtual
 clock, no real sockets): registration bounds/duplicate/parse errors; round-robin cycles the healthy
 set; a failing upstream trips its breaker, is skipped, and is re-admitted after cooldown;
 bulkhead-full upstreams are skipped and `pick` returns null when all are full; least-connections and

@@ -8,7 +8,7 @@ for purpose and API. Provenance: see [NOTICE](NOTICE).
 `Signature`/`Proof` wire codecs, and the four irreducible cryptographic
 cores — `sign`/`verify`/`proofGen`/`proofVerify` (`bbs.zig`) — are all
 implemented and byte-exact KAT-pinned. `gate.core_implemented = true`;
-the full suite (34 tests) passes byte-exact in Debug and ReleaseFast.
+the full suite passes byte-exact in Debug and ReleaseFast.
 See `bbs.zig`'s own module doc comment for the exact construction each
 core transcribes.
 

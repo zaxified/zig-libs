@@ -31,7 +31,7 @@ handler that sets `Vary` itself replaces (not merges) the middleware's value. rs
 `OptionsPassthrough` and `Access-Control-Allow-Private-Network` are out of scope for now.
 
 ## Verification
-14 tests (`zig build test-cors`). Offline goldens over the socket-free `http.Server.serveStream`:
+`zig build test-cors`. Offline goldens over the socket-free `http.Server.serveStream`:
 byte-exact 204 preflight + handler-not-invoked proof; `.reflect` echo + absent-ACRH omission; each
 failing gate → 204 with `Vary` and zero CORS headers incl. case-sensitivity; preflight interception
 on would-be 405/404; actual-request echo + `Vary: Origin` + credentials + exposed headers; `.any` →

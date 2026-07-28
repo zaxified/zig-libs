@@ -39,7 +39,7 @@ concatenation of quoted segments, comments/blank lines, empty quoted value. Sema
 sections, list accumulation, duplicate-option last-wins, mixed option/list rejected. Errors (with
 asserted line numbers): unterminated single/double quote, option before any section, bad keyword,
 missing/too-many arguments, line-too-long, input-too-large. Plus accessor lookups, CRLF input,
-`package` header serialization, and quoted keys/types round-tripping. 30 tests. Run: `zig build
+`package` header serialization, and quoted keys/types round-tripping. Run: `zig build
 test-uci`.
 
 ## Backlog / deferred

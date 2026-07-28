@@ -307,8 +307,8 @@ implemented and KAT-verified (order preserved):
 
 ## Verification status
 
-1. **KAT (Debug + ReleaseFast):** `zig build test-hpke` — 55/55 tests
-   pass, zero skip guards. RFC 9180 Appendix A.1's full vector drives
+1. **KAT (Debug + ReleaseFast):** `zig build test-hpke` — all tests
+   pass, no skip guards. RFC 9180 Appendix A.1's full vector drives
    DHKEM Encap/Decap/DeriveKeyPair, KeySchedule, all 6 Seal/Open tuples,
    all 3 exports, and single-shot sealBase/openBase end-to-end through
    the real implementation; A.2 (ChaCha20Poly1305) and A.3 (P-256)

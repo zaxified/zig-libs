@@ -34,7 +34,7 @@ response bytes (Time Exceeded, Echo Reply, Destination Unreachable, drops, late 
 balanced hops, malformed/hostile input) through the real `icmp.echo` parsers on a deterministic
 virtual clock — TTL/ident/seq stamping, terminal-code handling, `*` timeouts, `distinctAddresses`,
 per-hop `latency-stats`, IPv4 raw-header shape, IPv6, option validation. One live test traces
-`127.0.0.1`, skipped without CAP_NET_RAW. 15 tests. Run: `zig build test-traceroute`.
+`127.0.0.1`, skipped without CAP_NET_RAW. Run: `zig build test-traceroute`.
 
 ## Backlog / deferred
 None beyond the documented out-of-scope list (parallel probing,

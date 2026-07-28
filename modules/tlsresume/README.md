@@ -107,7 +107,7 @@ of `select.selectPsk`.
 zig build test-tlsresume
 ```
 
-42 tests pass (Debug + ReleaseFast): codec round-trip against the actual
+Green in Debug + ReleaseFast: codec round-trip against the actual
 RFC 8448 §3 NewSessionTicket bytes; the full §4 resumption chain
 (PSK/early-secret/binder-key/binder) byte-exact; the §4 0-RTT early-data
 chain ("c e traffic"/"e exp master"/key/iv) byte-exact — including opening

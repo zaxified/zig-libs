@@ -175,8 +175,8 @@ mix's measured behaviour + flip the gate) to **Opus**.
 
 ## Verification
 
-`zig build test-loopix`, green in Debug **and** ReleaseFast, no leaks, 23 tests,
-**0 skip** (the gate is flipped — every test that used to be gated now runs for
+`zig build test-loopix`, green in Debug **and** ReleaseFast, no leaks,
+no skips (the gate is flipped — every test that used to be gated now runs for
 real):
 
 - **Sphinx substrate:** a real onion for a 3-mix route peels hop-by-hop,

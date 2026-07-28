@@ -8,7 +8,7 @@ Pure-Zig Paillier additively-homomorphic public-key cryptosystem (Paillier
 Miller-Rabin probable-prime search, `fromPrimes` for deterministic/KAT
 construction), `encrypt`/`decrypt`, and the homomorphic ops
 (`addCiphertexts`/`addPlaintext`/`mulPlaintext`) are all real.
-`zig build test-paillier`: 20/20 tests pass in Debug and ReleaseFast,
+`zig build test-paillier` is green in Debug and ReleaseFast,
 cross-checked value-exact against `phe` (python-paillier) 1.5.0 toy-key
 vectors plus self-checking round-trip/homomorphic-property tests and real
 512-/2048-bit `generate` round trips — see SPEC.md "Verification".

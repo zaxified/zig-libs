@@ -81,7 +81,7 @@ zig build -Doptimize=ReleaseFast test-decaf448   # ReleaseFast
 zig fmt --check modules/decaf448/
 ```
 
-29 of 29 tests pass in both Debug and ReleaseFast — the mechanical
+All tests pass in both Debug and ReleaseFast — the mechanical
 group-op layer, the scalar width bridge, the RFC 9496 §5.1 constant
 self-checks, and the byte-exact RFC 9496 Appendix B KATs (encode of
 `[0]G..[15]G`, decode round-trip, the 21 invalid-encoding rejections,

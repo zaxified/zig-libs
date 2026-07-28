@@ -253,7 +253,7 @@ source was read, and no design decision here was taken from it.
    - `SubscribeCOV` → `SimpleACK` followed by the **immediate initial notification** clause
      13.14.2 requires, then a cancellation.
 
-   All seven live client tests passed in **Debug and ReleaseFast**.
+   All of the above passed in **Debug and ReleaseFast**.
 
 5. **Live round trip, a third-party client → our device** (`interop.zig`, gated on
    `BACNET_TEST_LISTEN`). Our `Device` was bound to `127.0.0.1:47811` and driven by a bacpypes3

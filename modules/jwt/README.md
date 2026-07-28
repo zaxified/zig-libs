@@ -332,9 +332,8 @@ defer id_token.deinit();
 
 ## Verification
 
-`zig build test-jwt` — 83 fully offline tests (21 from P1 incl. the
-mandatory-audience confused-deputy test, 12 from P2, 6 from P3, 10 from P4,
-9 from P5, 9 from P6+`Guard` combined, 16 from P7 — see below), green under
+`zig build test-jwt` — fully offline tests spanning P1 (incl. the
+mandatory-audience confused-deputy test) through P7 (see below), green under
 Debug and ReleaseFast. A dedicated `SECURITY: mandatory audience …` test
 proves a token minted for a sibling service is rejected by default and
 accepted only when the `aud` matches or `.any` is set; the P5 `fetchJwks`

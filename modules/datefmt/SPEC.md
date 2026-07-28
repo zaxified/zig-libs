@@ -29,7 +29,7 @@ takes/returns plain day/month/year counts), and named canned formats (RFC 2822/3
 generic token engine, no shortcuts).
 
 ## Verification
-19 tests: civil-core round-trips (epoch-day↔ymd, incl. pre-1970 and leap-year boundaries), token
+Civil-core round-trips (epoch-day↔ymd, incl. pre-1970 and leap-year boundaries), token
 parse/format for every documented token incl. 12h AM/PM and `ZZ` offsets, calendar arithmetic
 (`addMonths` day-clamping, `nthWeekdayOfMonth`), strict ISO parse/format, and malformed-format-string
 error paths. Run: `zig build test-datefmt` (also `-Doptimize=ReleaseFast`), `zig fmt --check

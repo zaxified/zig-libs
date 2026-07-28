@@ -131,7 +131,7 @@ whole domain (tested at the field extremes). No allocation, no failure mode.
 ## Verification
 
 Offline only — pure logic, no live-interop surface. `zig build test-spbfib`
-(15 tests, Debug + `-Doptimize=ReleaseFast`):
+is green in Debug + `-Doptimize=ReleaseFast`:
 
 **Unicast FIB**
 - **Golden line A—B—C** — a real `isis-spf.RouteTable` (`{a,a,0}`, `{b,b,10}`,
@@ -165,8 +165,7 @@ Offline only — pure logic, no live-interop surface. `zig build test-spbfib`
 - **Positive control** — a deliberately mis-placed construction (I-SID written
   where the SPSourceID belongs) differs from the correct DA.
 
-`zig fmt --check` clean; `zig build check-catalog` green. Test count on disk (15)
-equals the running count (single-file module — no dark-tests aggregator gap).
+`zig fmt --check` clean; `zig build check-catalog` green.
 
 ## Deliberately deferred (out of scope by design, not oversight)
 

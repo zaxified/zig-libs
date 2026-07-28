@@ -43,7 +43,7 @@ global/shared state: multiple upstreams need their own `CircuitBreaker`/`Bulkhea
 
 ## Verification
 
-26 tests, fully deterministic and offline (injected clock + injected recording delay + fail-scripted
+Fully deterministic and offline (injected clock + injected recording delay + fail-scripted
 synthetic operations, no real sleeps): breaker trips after N consecutive failures, success resets
 the streak, fast-fail while open, half-open after cooldown with fresh-cooldown re-open, probe budget
 honored; exponential backoff progression + cap + overflow safety; full/equal jitter bounds and

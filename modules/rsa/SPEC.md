@@ -60,7 +60,7 @@ small-public-exponent sanity checks apply to parsed keys (`fromBytes`/`fromDer`/
 
 ## Verification
 
-**68 tests in `root.zig` + 6 in `openssh.zig`**, all passing (`zig build test-rsa`). Anchored
+`zig build test-rsa` is green across `root.zig` and `openssh.zig`. Anchored
 against OpenSSL-generated known-answer vectors: keys generated with `openssl genpkey -algorithm
 RSA` (OpenSSL 3.5.5, 2026-07-10), components dumped via `openssl pkey -text`, signatures produced
 with `openssl dgst -shaN -sign` for PKCS1-v1.5 (deterministic, so these are byte-exact KATs) and

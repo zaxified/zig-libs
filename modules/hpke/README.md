@@ -106,7 +106,7 @@ not transferable to a third party (SPEC.md, threat model).
 zig build test-hpke
 ```
 
-55 tests, all real, no skip guards: the full RFC 9180 A.1 vector driven
+All tests are real, no skip guards: the full RFC 9180 A.1 vector driven
 end-to-end through the actual implementation (DHKEM Encap/Decap/
 DeriveKeyPair, key schedule, all 6 published encryption tuples including
 the seq-skipping ones, all 3 exported values, `sealBaseDeterministic` →

@@ -147,12 +147,12 @@ source is recorded here, not in `NOTICE`).
 
 ## Tests
 
-`zig build test-dnssec` — 57 tests, all offline. The 44 mechanical unit
+`zig build test-dnssec` — all tests run offline. The mechanical unit
 tests (RDATA parsing incl. a hand-computed RFC 4034 Appendix B key-tag
 vector, Type Bit Map bounds checks, base32hex round-trips, NSEC3
 iterated-hash vs. manual SHA-1 chaining, DS digest vs. manual hashing,
 RSA/ECDSA/Ed25519 decode + sign/verify round-trips, RFC 1982 time-window
-wraparound) plus 13 end-to-end known-answer tests over the `ldns`-signed
+wraparound) plus end-to-end known-answer tests over the `ldns`-signed
 oracle: every RRset (SOA/NS/MX/TXT/A/NSEC/DNSKEY) across algorithms
 8/13/14/15 verifies `.secure` and turns `.bogus` on a single flipped
 signature byte; typed SOA/MX/NS/A records canonicalize byte-exact; a

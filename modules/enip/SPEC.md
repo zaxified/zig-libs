@@ -246,7 +246,7 @@ Concretely:
    `enip.cpf.typeid`, `cip.service` (including the services *inside* an
    `Unconnected_Send` and inside a `Multiple_Service_Packet`), `cip.genstat`
    and `cip.symbol` was compared field by field against this module's:
-   **61 packets compared, 0 mismatched fields.** That comparison is a one-off
+   **61 packets compared, no mismatched fields.** That comparison is a one-off
    external check and is not part of the test suite (the suite must not depend
    on Wireshark being installed).
 
@@ -347,8 +347,8 @@ what the cpppo client sends.
 
 ### Fuzz + hostile input
 
-`std.testing.fuzz` sweeps (14 of them), all asserting "typed error or valid
-result, never a panic and never a hang":
+`std.testing.fuzz` sweeps across every decoder and the tag-path parser, all
+asserting "typed error or valid result, never a panic and never a hang":
 
 - `encap.decode` over arbitrary bytes — anything that decodes must re-encode to
   the identical octets and its `total_len` must equal the input length.

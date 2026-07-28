@@ -148,7 +148,7 @@ End-to-end (now live — `gate.prover_core_implemented == true`, Part 2):
   `out3=(x+y)²`); tampered proof (negated `πA`/`πC`) / wrong public input /
   non-satisfying witness → `false`.
 
-Counts: 31 pass, Debug **and** ReleaseFast.
+All pass, Debug **and** ReleaseFast.
 
 ## 7. Deferred increments (out of Phase 1)
 

@@ -35,7 +35,7 @@ auth/permissions layer on the socket.
 
 ## Verification
 
-5 tests covering the raw transport (`FdReader`/`FdWriter` `std.Io` adapters over a socket fd,
+Tests cover the raw transport (`FdReader`/`FdWriter` `std.Io` adapters over a socket fd,
 oversize-frame rejection via `framing.readFrame`, end-of-stream handling) and the framing
 integration. Run: `zig build test-ipcbus`.
 

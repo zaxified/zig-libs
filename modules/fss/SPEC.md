@@ -156,8 +156,8 @@ full-domain reconstruction is exhaustive), so every assertion is exact.
 
 The Fable pass implemented the two core functions to reproduce
 `kat_vectors.zig` byte-exact and flipped `gate.core_implemented` to `true`, so
-every formerly-gated test now runs as an executed assertion (18 pass / 0 skip,
-Debug + ReleaseFast). While the flag was `false`, those tests reported **SKIP**
+every formerly-gated test now runs as an executed assertion (all pass, no
+skips, Debug + ReleaseFast). While the flag was `false`, those tests reported **SKIP**
 (`error.SkipZigTest`) — a skip was never a pass.
 
 ## Scoped out (future increments, NOT Phase 1)

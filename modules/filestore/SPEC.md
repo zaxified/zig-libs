@@ -59,9 +59,9 @@ caveat the option's own doc comment states; TTL/CAS interaction with each other 
 not consult or clear the `.expiry` sidecar — they are independent, orthogonal sidecars, see above).
 
 ## Verification
-12 tests: the original 6 (put/get/delete/list round-trip, atomic temp+rename visibility,
-`segmentSafe` traversal rejection, typed-JSON round-trip, `listTyped` skipped-count) plus 6 new for
-this backlog batch — TTL present-then-expired-then-still-`list`-visible (deterministic via an
+Tests cover: the original set (put/get/delete/list round-trip, atomic temp+rename visibility,
+`segmentSafe` traversal rejection, typed-JSON round-trip, `listTyped` skipped-count) plus additions
+from this backlog batch — TTL present-then-expired-then-still-`list`-visible (deterministic via an
 injectable `Store.clock`/`ManualClock`, no real-time sleeps), `sweep` reaping only expired keys and
 leaving live-TTL/no-TTL keys + returning the exact count, CAS create/update/mismatch semantics
 end-to-end, a **positive control** proving a lost update silently happens with plain `putBytes` and

@@ -88,7 +88,7 @@ third-party source consulted or copied; no NOTICE entry required.
 (`-Doptimize=ReleaseFast`), no leaks (`std.testing.allocator` is a
 DebugAllocator; a leak or double-free fails the test). Real threads throughout;
 a watchdog turns any wakeup/shutdown deadlock into a loud panic instead of a
-silent hang. **9/9, 0 skipped:**
+silent hang. **All pass, none skipped:**
 
 - **exactly-once:** 20 000 jobs (≫ 4 workers) each increment a shared atomic;
   after `drain`, the count and `completedCount` both equal 20 000.

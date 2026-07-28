@@ -152,7 +152,7 @@ submitted-vs-completed reconciliation dance.
 ## 6. Verification — real threads, both opt levels
 
 `zig build test-workerpool` and `… -Doptimize=ReleaseFast`, both green, no
-leaks. 9 tests, all on real `std.Thread`s over a real `std.Io.Threaded` futex; a
+leaks. All on real `std.Thread`s over a real `std.Io.Threaded` futex; a
 **watchdog** thread panics if any operation misses its deadline, converting a
 (hypothetical) lost-wakeup/deadlock from a silent hang into a loud, bounded
 failure. Coverage: exactly-once over 20 000 jobs ≫ workers; graceful-drain

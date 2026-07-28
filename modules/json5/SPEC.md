@@ -31,8 +31,8 @@ semantic correctness of the resulting document — only `std.json` syntax validi
 
 ## Verification
 
-23 tests (11 base preprocessor + 9 annotated recovery variants + 1 OOB-safety
-regression test + 2 fuzz targets over `preprocess`/`preprocessAnnotated`), green
+Covers the base preprocessor, annotated recovery variants, an OOB-safety
+regression test, and fuzz targets over `preprocess`/`preprocessAnnotated`; green
 in Debug and `-Doptimize=ReleaseFast`; `zig fmt --check modules/json5` clean.
 Run: `zig build test-json5`.
 

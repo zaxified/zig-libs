@@ -25,7 +25,7 @@ message/suggest memory before reading the collector back gets a dangling-slice b
 caller's responsibility, not this module's.
 
 ## Verification
-4 tests: append + count/countBySeverity accounting across severities, the doc-comment usage
+Tests cover: append + count/countBySeverity accounting across severities, the doc-comment usage
 pattern (arena-lifetime append then read), and structural field coverage (path/line/col/end/
 byte-offset/code/message/suggest all round-trip through `items`). Run: `zig build test-diagnostics`.
 

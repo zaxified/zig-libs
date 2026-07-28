@@ -142,6 +142,6 @@ batches; secondary indexes; automatic compaction thresholds; in-memory value
 cache (compose with `ramcache`); cross-process lock file. The v0 keydir is
 an unordered hash map.
 
-Tests: `zig build test-kv` (59 tests — unit + sim-semantics + the fixed
+Tests: `zig build test-kv` (unit + sim-semantics + the fixed
 sweep + the randomized VOPR + the scheduler/shrink extras above;
 deterministic, tmp-dir round-trips on the real filesystem included).

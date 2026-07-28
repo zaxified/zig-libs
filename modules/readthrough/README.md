@@ -104,7 +104,7 @@ const s = c.getStats();             // hits / misses / loads / coalesced / ...
 
 ## Tests
 
-`zig build test-readthrough` (and `-Doptimize=ReleaseFast`) — 18 tests,
+`zig build test-readthrough` (and `-Doptimize=ReleaseFast`) is green and
 `DebugAllocator`-clean (no leaked `Call` / in-flight key / value). Deterministic
 unit tests (injected manual clock, a counting loader) cover read-through basics,
 distinct-key independence, TTL expiry, `invalidate`/`invalidateAll`, negative

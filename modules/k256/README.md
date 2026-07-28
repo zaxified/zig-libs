@@ -84,7 +84,7 @@ zig build test-k256 -Doptimize=ReleaseFast --summary all
 K256_BENCH=1 zig build test-k256 -Doptimize=ReleaseFast # opt-in ns/op baseline
 ```
 
-30 pass / 1 skip in both Debug and ReleaseFast (the 1 skip is the opt-in
+Green in both Debug and ReleaseFast (the one skip is the opt-in
 `K256_BENCH` micro-benchmark, gated behind an env var, not a core gap — both
 Fable cores are implemented and their differentials run for real). The suite
 includes the field/group/scalar differentials vs `std.crypto.ecc.Secp256k1`

@@ -124,9 +124,9 @@ zig build test-musig2 -Doptimize=ReleaseFast # ReleaseFast
 zig fmt --check modules/musig2/
 ```
 
-25 pass / 0 skip (25 total) — every embedded official vector asserts
+All pass, no skips — every embedded official vector asserts
 byte-exact (valid AND "invalid contribution"/error cases across all seven
-embedded vector files, tweaked cases included), plus two 3-signer
+embedded vector files, tweaked cases included), plus 3-signer
 end-to-end protocol tests (untweaked, and x-only/Taproot-style tweaked)
 each ending in a plain `bip340.verify` accept.
 

@@ -39,7 +39,7 @@ survive, incl. >100-byte GNU 'L'/'K' long names, dirs, symlinks, hard links; a g
 header/content, mid-archive truncation, bad checksum, garbage block, hostile 'L' size, empty archive.
 A live external cross-check writes an archive that system GNU `tar` must list (`tvf`) and extract
 (`xf`), and reads a GNU-tar-produced archive back (skips cleanly with no `tar` on PATH); `packDir`
-round-trips real statx attrs on Linux. 20 tests. Run: `zig build test-tar`.
+round-trips real statx attrs on Linux. Run: `zig build test-tar`.
 
 ## Backlog / deferred
 None beyond the documented out-of-scope list (pax interpretation,

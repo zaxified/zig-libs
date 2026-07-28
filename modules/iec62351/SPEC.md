@@ -304,8 +304,8 @@ assumed. Path validation is `x509.verifyChain`; revocation is `ocsp`/`ocspcache`
 
 ### What was run
 
-- `zig build test-iec62351` in **Debug** and **`--release=fast`**: 104 tests,
-  0 failures, 0 skipped in both.
+- `zig build test-iec62351` in **Debug** and **`--release=fast`**: all pass,
+  no failures, no skips, in both.
 - `zig build test-x509` and `zig build test-rsa` (the two sibling dependencies):
   green.
 - `zig fmt --check modules/iec62351`: clean.

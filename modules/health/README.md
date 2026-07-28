@@ -39,6 +39,6 @@ source consulted or copied.
 
 ## Verification
 
-`zig build test-health` — 4 offline tests through `http.Server.serveStream`
+`zig build test-health` — offline tests through `http.Server.serveStream`
 (liveness always-200 + pass-through, readiness 200/503 with the failing-check
 listing, empty-checks default, custom paths), green in Debug + ReleaseFast.

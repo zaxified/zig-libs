@@ -4,8 +4,8 @@ Pure-Zig RSA (PKCS#1 v2.2, RFC 8017) over `std.crypto.ff` — no bignum
 reimplementation, no libc, no `@cImport`.
 
 **Status: ALL PHASES (P1–P6) IMPLEMENTED.** No `@panic`/TODO stub remains
-in `src/root.zig` or `src/openssh.zig`. `zig build test-rsa` runs 68 + 6
-tests, all passing, anchored against OpenSSL-generated known-answer
+in `src/root.zig` or `src/openssh.zig`. `zig build test-rsa` is green across
+`root.zig` and `openssh.zig`, anchored against OpenSSL-generated known-answer
 vectors (see "Verification" below).
 
 - **P1** — `signPkcs1v15`/`verifyPkcs1v15`: EMSA-PKCS1-v1_5
@@ -81,8 +81,8 @@ with its RFC 8017 section reference.
 
 ## Verification
 
-`zig build test-rsa` — 68 tests in `root.zig` + 6 in `openssh.zig`, all
-passing. Anchored against OpenSSL-generated known-answer vectors: keys via
+`zig build test-rsa` is green across `root.zig` and `openssh.zig`. Anchored
+against OpenSSL-generated known-answer vectors: keys via
 `openssl genpkey -algorithm RSA`, signatures via `openssl dgst -shaN -sign`
 (PKCS1-v1.5) and `openssl dgst -sigopt rsa_padding_mode:pss` (PSS).
 `generate`, `selfSignedCert`, and the OpenSSH bcrypt-pbkdf are additionally

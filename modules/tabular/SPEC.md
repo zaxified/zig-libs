@@ -35,7 +35,7 @@ on join fan-out (a caller joining two large unfiltered datasets can produce a la
 caller's arena/allocator is the only bound).
 
 ## Verification
-`zig build test-tabular` (headless; green in Debug and `-Doptimize=ReleaseFast`), 31 tests across
+`zig build test-tabular` (headless; green in Debug and `-Doptimize=ReleaseFast`), across
 `transforms`+`series`, using hand-computed golden values as the correctness oracle for the lift plus
 new cases for the fx-convert-before-sum path, join fan-out/outer/anti-semi variants (incl. a
 composite-key positive control that fails under naive single-key matching), `distinct` vs.

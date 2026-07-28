@@ -14,7 +14,7 @@ intermediate values. The ten threshold-specific cryptographic cores
 `verifySignatureShare`, `verify`, `trustedDealerKeygen`,
 `secretShareCombine`) are all implemented — no `@panic`/TODO stubs remain
 in `root.zig` — and are likewise byte-exact against RFC 9591 Appendix
-E.5 (32/32 tests, Debug + ReleaseFast; `zig build test-frost`). See
+E.5 (Debug + ReleaseFast; `zig build test-frost`). See
 `src/root.zig`'s module doc comment for the exact construction each core
 follows and what its KAT covers.
 
@@ -216,4 +216,4 @@ construction:
 
 `kat_test.zig`'s assertions (one per core, against RFC 9591 Appendix E.5's
 published intermediate/final values) are the acceptance check, and all
-pass — 32/32, Debug and ReleaseFast.
+pass, Debug and ReleaseFast.

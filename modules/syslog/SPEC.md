@@ -34,7 +34,7 @@ Offline golden-byte tests (no live socket): a full message with structured data,
 all-NILVALUE message, SD escaping of `"`/`\`/`]`, PRI for several facility/severity pairs,
 timezone-offset timestamps, field truncation at the length limits, and the RFC 6587 octet-count
 prefix. The real UDP/TCP send paths are compile-checked only and gated behind runtime construction /
-`error.SkipZigTest`. 19 tests (README states 20 incl. a live-gated case). Run: `zig build
+`error.SkipZigTest`. Run: `zig build
 test-syslog` (Debug and `-Doptimize=ReleaseFast`).
 
 ## Backlog / deferred

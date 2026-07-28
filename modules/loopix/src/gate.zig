@@ -18,5 +18,5 @@
 //!
 //! Left `false`, that test would report **SKIP** (via `error.SkipZigTest`),
 //! not PASS — a skip is not a green light. With the flag `true`, the test
-//! actually runs (0 skips in `zig build test-loopix`).
+//! actually runs (no skips in `zig build test-loopix`).
 pub const fable_core_implemented = true;

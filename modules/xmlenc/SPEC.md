@@ -142,7 +142,7 @@ for A192*). The CEK length must match the content algorithm's key size, else
 
 ## Status
 
-`extract` — implemented and tested (23 tests, green in Debug and ReleaseFast).
+`extract` — implemented and tested (green in Debug and ReleaseFast).
 Decryption side only. Depends on `xml` (structure walk), `rsa` (OAEP / v1.5 /
 RSADP, including decoupled-hash OAEP), `aescbc` (CBC core + XML-Enc unpad),
 and `aeskw` (RFC 3394 key unwrap) — this module no longer carries any local

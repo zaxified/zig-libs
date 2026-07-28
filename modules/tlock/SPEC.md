@@ -148,7 +148,7 @@ interop vector proved the flag right, in an unexpected place:
   byte-identical copy of the same commit's `testdata/lorem.txt`.
   `encrypt` is interop-pinned by the same vector: re-encrypting the
   recovered `(filekey, sigma)` reproduces the Go ciphertext's 128
-  bytes exactly. Three gated tests in `kat_test.zig` section 3
+  bytes exactly. Gated tests in `kat_test.zig` section 3
   (decrypt byte-exact, re-encrypt byte-exact, cross-beacon FO
   rejection).
 - **Round-trip against a real quicknet round signature (GATED,

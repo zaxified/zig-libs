@@ -65,9 +65,9 @@ filter expressions.
 
 ## Verification
 
-14 tests: the original 5 (generic-column projection, the `[x,y]` default shorthand in its
+Tests cover the original set (generic-column projection, the `[x,y]` default shorthand in its
 object-key/positional-array/scalar-item forms, missing-path → empty-dataset, malformed-JSON →
-`Error.BadJson`) plus 9 new ones with teeth for the JSONPath-subset engine — array index
+`Error.BadJson`) plus a set with teeth for the JSONPath-subset engine — array index
 (`a.b[2]`), array wildcard (`a.b[*]`), object wildcard (`a.*`), recursive descent (`..name`,
 3 matches at 3 different depths), multi-array concatenation (`pages[*].items` flattening two
 paginated arrays into one 5-row set), a filter positive control (`list[?(@.status == "ok")]` —

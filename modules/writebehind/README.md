@@ -79,7 +79,7 @@ c.flushAll();     // block until the cache is clean (graceful barrier); alias: s
 
 ## Tests
 
-`zig build test-writebehind` (and `-Doptimize=ReleaseFast`) — 12 tests, real
+`zig build test-writebehind` (and `-Doptimize=ReleaseFast`) — real
 threads via the pool, `DebugAllocator`-clean. Covers: immediate cache
 readability + post-flush sink consistency; last-writer-wins; delete +
 read-shadow; sink read-through; **crash recovery** (drop the coordinator+cache

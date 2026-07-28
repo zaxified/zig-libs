@@ -21,7 +21,7 @@ aliasing across a full 2^16 wrap.
 
 ## Verification
 Unit tests: add/fetch/release lifecycle, round-robin non-reuse, exhaustion at 65536, idempotent
-release, `answered` dup-detection flag, `clear` for a new round. 5 tests. Run: `zig build test-seqmap`.
+release, `answered` dup-detection flag, `clear` for a new round. Run: `zig build test-seqmap`.
 
 ## Backlog / deferred
 None beyond the documented round-robin-wrap caveat above.

@@ -33,7 +33,7 @@ codec's concern.
 
 ## Verification
 
-10 tests, all on a domain-free test-only `union(enum)` (no application types imported): frame round-trip,
+Tests run on a domain-free test-only `union(enum)` (no application types imported): frame round-trip,
 oversize rejection on both the write and read paths (incl. `max_frame` enforced independently of
 buffer size), envelope round-trip (normal + empty payload), an enum-payload variant, a payload
 with embedded newline/`\r\n`/`NUL` bytes (proving the framing is not newline-delimited), a full

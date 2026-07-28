@@ -102,7 +102,7 @@ implemented in `tfhe.zig`; `gate.fable_core_implemented` is flipped `true`, no
 `@panic` remains behind it, and every previously SKIP-gated anchor now runs:
 the programmable-gate test, the 2-input homomorphic AND, the unlimited-depth
 bootstrap chain, the corrupted-bootstrap-key control, and the noise-budget
-assertion all pass (30/30 tests, 0 skip — see README.md's "Verify" section).
+assertion all pass, no skips (see README.md's "Verify" section).
 This did **not** change the Fable-tier call above, which is a verdict about
 *why* the work needed Fable-level skill (no external anchor, nontrivial
 design space), not a claim that the work remains undone.

@@ -23,7 +23,7 @@ caller-owned allocator (normally an arena).
 Provenance: original work of the zig-libs authors (MIT); modeled after the
 Python `empyrical`/`ffn` metric set and a QuantLib subset (behavior/
 metric-set only, no code consulted or copied) — see NOTICE. Algorithms and
-constants are exact and the numeric behaviour is pinned by 11 tests.
+constants are exact and the numeric behaviour is pinned by tests.
 
 ## Numeric conventions (kept exact — these are decisions, not bugs)
 
