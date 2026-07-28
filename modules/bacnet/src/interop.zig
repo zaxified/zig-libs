@@ -29,6 +29,18 @@ const service = @import("service.zig");
 const transport = @import("transport.zig");
 const client = @import("client.zig");
 
+// Skip diagnostics are opt-in: `zig build test` must be silent on
+// success (any stderr triggers the build runner's `failed command:`
+// line even when the step succeeded), while the skip *count* still
+// shows up in the summary regardless. Set ZIG_LIBS_VERBOSE_SKIP to any
+// non-empty value to see the reasons. (std.posix.getenv doesn't exist
+// in 0.16 — std.testing.environ + Environ.getPosix is the repo's
+// existing env-read pattern for tests, see netconf's `envVar`.)
+fn verboseSkip() bool {
+    const v = std.process.Environ.getPosix(std.testing.environ, "ZIG_LIBS_VERBOSE_SKIP") orelse return false;
+    return v.len > 0;
+}
+
 const testing = std.testing;
 
 const Env = struct {
@@ -72,7 +84,7 @@ fn envInt(name: []const u8, default: u32) u32 {
 }
 
 fn skip(comptime what: []const u8) void {
-    std.debug.print(
+    if (verboseSkip()) std.debug.print(
         "SKIPPED: {s} (set BACNET_TEST_DEVICE=host:port to run)\n",
         .{what},
     );
@@ -395,7 +407,7 @@ test "live: our device side answers a real third-party client" {
     // *client*, not a device. Set BACNET_TEST_LISTEN=host:port and point a
     // third-party client (e.g. bacpypes3's `read-property` sample) at it.
     const spec = envVar("BACNET_TEST_LISTEN") orelse {
-        std.debug.print(
+        if (verboseSkip()) std.debug.print(
             "SKIPPED: live device side (set BACNET_TEST_LISTEN=host:port and point a real client at it)\n",
             .{},
         );

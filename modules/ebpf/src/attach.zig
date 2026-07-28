@@ -47,6 +47,18 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+
+// Skip diagnostics are opt-in: `zig build test` must be silent on
+// success (any stderr triggers the build runner's `failed command:`
+// line even when the step succeeded), while the skip *count* still
+// shows up in the summary regardless. Set ZIG_LIBS_VERBOSE_SKIP to any
+// non-empty value to see the reasons. (std.posix.getenv doesn't exist
+// in 0.16 — std.testing.environ + Environ.getPosix is the repo's
+// existing env-read pattern for tests, see netconf's `envVar`.)
+fn verboseSkip() bool {
+    const v = std.process.Environ.getPosix(std.testing.environ, "ZIG_LIBS_VERBOSE_SKIP") orelse return false;
+    return v.len > 0;
+}
 const linux = std.os.linux;
 const BPF = linux.BPF;
 const netlink = @import("netlink");
@@ -1903,7 +1915,7 @@ test "attachKprobe rejects a symbol it can never encode as a C string" {
 test "LIVE: kprobe attach + detach against a real kernel" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     if (!hasBpfCapability()) {
-        std.debug.print(
+        if (verboseSkip()) std.debug.print(
             "\nLIVE ebpf kprobe attach test SKIPPED: needs CAP_BPF+CAP_PERFMON (running as uid {d}).\n",
             .{linux.geteuid()},
         );
@@ -1914,7 +1926,7 @@ test "LIVE: kprobe attach + detach against a real kernel" {
     const load = @import("load.zig").load;
 
     const map_fd = BPF.map_create(.array, 4, 8, 1) catch {
-        std.debug.print("\nLIVE ebpf kprobe attach test SKIPPED: BPF_MAP_CREATE refused.\n", .{});
+        if (verboseSkip()) std.debug.print("\nLIVE ebpf kprobe attach test SKIPPED: BPF_MAP_CREATE refused.\n", .{});
         return;
     };
     defer _ = linux.close(map_fd);
@@ -1924,7 +1936,7 @@ test "LIVE: kprobe attach + detach against a real kernel" {
         .insns = programs.kprobeCounter(map_fd),
     };
     const prog_fd = load(prog, "MIT") catch {
-        std.debug.print("\nLIVE ebpf kprobe attach test SKIPPED: BPF_PROG_LOAD refused.\n", .{});
+        if (verboseSkip()) std.debug.print("\nLIVE ebpf kprobe attach test SKIPPED: BPF_PROG_LOAD refused.\n", .{});
         return;
     };
     defer _ = linux.close(prog_fd);
@@ -1938,7 +1950,7 @@ test "LIVE: kprobe attach + detach against a real kernel" {
         break;
     }
     var kp = handle orelse {
-        std.debug.print("\nLIVE ebpf kprobe attach test SKIPPED: no probeable symbol among the candidates.\n", .{});
+        if (verboseSkip()) std.debug.print("\nLIVE ebpf kprobe attach test SKIPPED: no probeable symbol among the candidates.\n", .{});
         return;
     };
     defer kp.detach();
@@ -2057,7 +2069,7 @@ test "tracepointId reads a real id, or explains why it cannot" {
     // tracefs is root-only on most distros, so this is informational: it
     // asserts the SUCCESS shape when readable and never fails otherwise.
     const id = tracepointId("syscalls", "sys_enter_write") catch |e| {
-        std.debug.print(
+        if (verboseSkip()) std.debug.print(
             "\nebpf tracepointId SKIPPED: {s} (tracefs is typically root-only; uid {d}).\n",
             .{ @errorName(e), linux.geteuid() },
         );
@@ -2178,7 +2190,7 @@ test "Link: the uniform handle covers the new hooks and stays idempotent" {
 test "LIVE: uprobe on a real binary fires and can be detached" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     if (!hasBpfCapability()) {
-        std.debug.print(
+        if (verboseSkip()) std.debug.print(
             "\nLIVE ebpf uprobe test SKIPPED: needs CAP_BPF+CAP_PERFMON (running as uid {d}).\n",
             .{linux.geteuid()},
         );
@@ -2194,13 +2206,13 @@ test "LIVE: uprobe on a real binary fires and can be detached" {
     var exe_buf: [256]u8 = undefined;
     const exe_len = linux.readlink("/proc/self/exe", &exe_buf, exe_buf.len);
     if (linux.errno(exe_len) != .SUCCESS) {
-        std.debug.print("\nLIVE ebpf uprobe test SKIPPED: cannot read /proc/self/exe.\n", .{});
+        if (verboseSkip()) std.debug.print("\nLIVE ebpf uprobe test SKIPPED: cannot read /proc/self/exe.\n", .{});
         return;
     }
     const exe = exe_buf[0..exe_len];
 
     const sym = elfsym.resolveFunc(testing.allocator, exe, uprobe_target_symbol) catch |e| {
-        std.debug.print(
+        if (verboseSkip()) std.debug.print(
             "\nLIVE ebpf uprobe test SKIPPED: '{s}' not resolvable in the test binary ({s}).\n",
             .{ uprobe_target_symbol, @errorName(e) },
         );
@@ -2208,7 +2220,7 @@ test "LIVE: uprobe on a real binary fires and can be detached" {
     };
 
     const map_fd = BPF.map_create(.array, 4, 8, 1) catch {
-        std.debug.print("\nLIVE ebpf uprobe test SKIPPED: BPF_MAP_CREATE refused.\n", .{});
+        if (verboseSkip()) std.debug.print("\nLIVE ebpf uprobe test SKIPPED: BPF_MAP_CREATE refused.\n", .{});
         return;
     };
     defer _ = linux.close(map_fd);
@@ -2218,7 +2230,7 @@ test "LIVE: uprobe on a real binary fires and can be detached" {
         .prog_type = .kprobe,
         .insns = programs.kprobeCounter(map_fd),
     }, "MIT") catch {
-        std.debug.print("\nLIVE ebpf uprobe test SKIPPED: BPF_PROG_LOAD refused.\n", .{});
+        if (verboseSkip()) std.debug.print("\nLIVE ebpf uprobe test SKIPPED: BPF_PROG_LOAD refused.\n", .{});
         return;
     };
     defer _ = linux.close(prog_fd);
@@ -2226,7 +2238,7 @@ test "LIVE: uprobe on a real binary fires and can be detached" {
     var up = attachUprobeOpts(testing.allocator, exe, uprobe_target_symbol, prog_fd, .{
         .offset = sym.file_offset,
     }) catch |e| {
-        std.debug.print("\nLIVE ebpf uprobe test SKIPPED: uprobe attach failed ({s}).\n", .{@errorName(e)});
+        if (verboseSkip()) std.debug.print("\nLIVE ebpf uprobe test SKIPPED: uprobe attach failed ({s}).\n", .{@errorName(e)});
         return;
     };
     defer up.detach();
@@ -2268,7 +2280,7 @@ comptime {
 test "LIVE: tracepoint attach + detach against a real kernel" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     if (!hasBpfCapability()) {
-        std.debug.print(
+        if (verboseSkip()) std.debug.print(
             "\nLIVE ebpf tracepoint test SKIPPED: needs CAP_BPF+CAP_PERFMON (running as uid {d}).\n",
             .{linux.geteuid()},
         );
@@ -2278,13 +2290,13 @@ test "LIVE: tracepoint attach + detach against a real kernel" {
     // The smallest valid tracepoint program: r0 = 0; exit.
     const insns = [_]BPF.Insn{ BPF.Insn.mov(.r0, 0), BPF.Insn.exit() };
     const prog_fd = BPF.prog_load(.tracepoint, &insns, null, "MIT", 0, 0) catch {
-        std.debug.print("\nLIVE ebpf tracepoint test SKIPPED: tracepoint BPF_PROG_LOAD refused.\n", .{});
+        if (verboseSkip()) std.debug.print("\nLIVE ebpf tracepoint test SKIPPED: tracepoint BPF_PROG_LOAD refused.\n", .{});
         return;
     };
     defer _ = linux.close(prog_fd);
 
     var tp = attachTracepoint(testing.allocator, "syscalls", "sys_enter_write", prog_fd) catch |e| {
-        std.debug.print("\nLIVE ebpf tracepoint test SKIPPED: attach failed ({s}).\n", .{@errorName(e)});
+        if (verboseSkip()) std.debug.print("\nLIVE ebpf tracepoint test SKIPPED: attach failed ({s}).\n", .{@errorName(e)});
         return;
     };
     defer tp.detach();
@@ -2316,7 +2328,7 @@ test "LIVE: tracepoint attach + detach against a real kernel" {
 test "LIVE: raw tracepoint attach + detach" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     if (!hasBpfCapability()) {
-        std.debug.print(
+        if (verboseSkip()) std.debug.print(
             "\nLIVE ebpf raw-tracepoint test SKIPPED: needs CAP_BPF (running as uid {d}).\n",
             .{linux.geteuid()},
         );
@@ -2325,13 +2337,13 @@ test "LIVE: raw tracepoint attach + detach" {
 
     const insns = [_]BPF.Insn{ BPF.Insn.mov(.r0, 0), BPF.Insn.exit() };
     const prog_fd = BPF.prog_load(.raw_tracepoint, &insns, null, "MIT", 0, 0) catch {
-        std.debug.print("\nLIVE ebpf raw-tracepoint test SKIPPED: raw_tracepoint BPF_PROG_LOAD refused.\n", .{});
+        if (verboseSkip()) std.debug.print("\nLIVE ebpf raw-tracepoint test SKIPPED: raw_tracepoint BPF_PROG_LOAD refused.\n", .{});
         return;
     };
     defer _ = linux.close(prog_fd);
 
     var rt = attachRawTracepoint(testing.allocator, "sys_enter", prog_fd) catch |e| {
-        std.debug.print("\nLIVE ebpf raw-tracepoint test SKIPPED: attach failed ({s}).\n", .{@errorName(e)});
+        if (verboseSkip()) std.debug.print("\nLIVE ebpf raw-tracepoint test SKIPPED: attach failed ({s}).\n", .{@errorName(e)});
         return;
     };
     defer rt.detach();
@@ -2351,7 +2363,7 @@ test "LIVE: raw tracepoint attach + detach" {
 test "LIVE: cgroup attach prefers a BPF link and reports which path it took" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     if (!hasBpfCapability()) {
-        std.debug.print(
+        if (verboseSkip()) std.debug.print(
             "\nLIVE ebpf cgroup-link test SKIPPED: needs CAP_BPF (running as uid {d}).\n",
             .{linux.geteuid()},
         );
@@ -2363,7 +2375,7 @@ test "LIVE: cgroup attach prefers a BPF link and reports which path it took" {
     switch (linux.errno(linux.mkdir(dir.ptr, 0o755))) {
         .SUCCESS => {},
         else => {
-            std.debug.print("\nLIVE ebpf cgroup-link test SKIPPED: cannot create {s}.\n", .{dir});
+            if (verboseSkip()) std.debug.print("\nLIVE ebpf cgroup-link test SKIPPED: cannot create {s}.\n", .{dir});
             return;
         },
     }
@@ -2371,7 +2383,7 @@ test "LIVE: cgroup attach prefers a BPF link and reports which path it took" {
 
     const dir_rc = linux.open(dir.ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
     if (linux.errno(dir_rc) != .SUCCESS) {
-        std.debug.print("\nLIVE ebpf cgroup-link test SKIPPED: cannot open the cgroup directory.\n", .{});
+        if (verboseSkip()) std.debug.print("\nLIVE ebpf cgroup-link test SKIPPED: cannot open the cgroup directory.\n", .{});
         return;
     }
     const cgroup_fd: linux.fd_t = @intCast(dir_rc);
@@ -2379,14 +2391,14 @@ test "LIVE: cgroup attach prefers a BPF link and reports which path it took" {
 
     const insns = [_]BPF.Insn{ BPF.Insn.mov(.r0, 1), BPF.Insn.exit() };
     const prog_fd = BPF.prog_load(.cgroup_skb, &insns, null, "MIT", 0, 0) catch {
-        std.debug.print("\nLIVE ebpf cgroup-link test SKIPPED: cgroup_skb BPF_PROG_LOAD refused.\n", .{});
+        if (verboseSkip()) std.debug.print("\nLIVE ebpf cgroup-link test SKIPPED: cgroup_skb BPF_PROG_LOAD refused.\n", .{});
         return;
     };
     defer _ = linux.close(prog_fd);
 
     // .auto: whichever the kernel supports, reported honestly.
     var auto = attachCgroupAuto(cgroup_fd, prog_fd, .cgroup_inet_egress, .{}, .auto) catch |e| {
-        std.debug.print("\nLIVE ebpf cgroup-link test SKIPPED: attach failed ({s}).\n", .{@errorName(e)});
+        if (verboseSkip()) std.debug.print("\nLIVE ebpf cgroup-link test SKIPPED: attach failed ({s}).\n", .{@errorName(e)});
         return;
     };
     std.debug.print("\nLIVE ebpf cgroup attach took the {s} path.\n", .{@tagName(auto.path)});
@@ -2402,7 +2414,7 @@ test "LIVE: cgroup attach prefers a BPF link and reports which path it took" {
 test "LIVE: cgroup attach + detach in a throwaway cgroup" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     if (!hasBpfCapability()) {
-        std.debug.print(
+        if (verboseSkip()) std.debug.print(
             "\nLIVE ebpf cgroup attach test SKIPPED: needs CAP_BPF+CAP_NET_ADMIN (running as uid {d}).\n",
             .{linux.geteuid()},
         );
@@ -2415,7 +2427,7 @@ test "LIVE: cgroup attach + detach in a throwaway cgroup" {
     switch (linux.errno(linux.mkdir(dir.ptr, 0o755))) {
         .SUCCESS => {},
         else => {
-            std.debug.print("\nLIVE ebpf cgroup attach test SKIPPED: cannot create {s} (cgroup v2 not mounted?).\n", .{dir});
+            if (verboseSkip()) std.debug.print("\nLIVE ebpf cgroup attach test SKIPPED: cannot create {s} (cgroup v2 not mounted?).\n", .{dir});
             return;
         },
     }
@@ -2423,7 +2435,7 @@ test "LIVE: cgroup attach + detach in a throwaway cgroup" {
 
     const dir_rc = linux.open(dir.ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
     if (linux.errno(dir_rc) != .SUCCESS) {
-        std.debug.print("\nLIVE ebpf cgroup attach test SKIPPED: cannot open the cgroup directory.\n", .{});
+        if (verboseSkip()) std.debug.print("\nLIVE ebpf cgroup attach test SKIPPED: cannot open the cgroup directory.\n", .{});
         return;
     }
     const cgroup_fd: linux.fd_t = @intCast(dir_rc);
@@ -2432,13 +2444,13 @@ test "LIVE: cgroup attach + detach in a throwaway cgroup" {
     // The smallest valid cgroup_skb program: r0 = 1 (allow), exit.
     const insns = [_]BPF.Insn{ BPF.Insn.mov(.r0, 1), BPF.Insn.exit() };
     const prog_fd = BPF.prog_load(.cgroup_skb, &insns, null, "MIT", 0, 0) catch {
-        std.debug.print("\nLIVE ebpf cgroup attach test SKIPPED: cgroup_skb BPF_PROG_LOAD refused.\n", .{});
+        if (verboseSkip()) std.debug.print("\nLIVE ebpf cgroup attach test SKIPPED: cgroup_skb BPF_PROG_LOAD refused.\n", .{});
         return;
     };
     defer _ = linux.close(prog_fd);
 
     var cg = attachCgroup(cgroup_fd, prog_fd, .cgroup_inet_egress) catch |e| {
-        std.debug.print("\nLIVE ebpf cgroup attach test SKIPPED: BPF_PROG_ATTACH failed ({s}).\n", .{@errorName(e)});
+        if (verboseSkip()) std.debug.print("\nLIVE ebpf cgroup attach test SKIPPED: BPF_PROG_ATTACH failed ({s}).\n", .{@errorName(e)});
         return;
     };
     defer cg.deinit();

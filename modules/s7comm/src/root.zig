@@ -46,6 +46,18 @@
 
 const std = @import("std");
 
+// Skip diagnostics are opt-in: `zig build test` must be silent on
+// success (any stderr triggers the build runner's `failed command:`
+// line even when the step succeeded), while the skip *count* still
+// shows up in the summary regardless. Set ZIG_LIBS_VERBOSE_SKIP to any
+// non-empty value to see the reasons. (std.posix.getenv doesn't exist
+// in 0.16 — std.testing.environ + Environ.getPosix is the repo's
+// existing env-read pattern for tests, see netconf's `envVar`.)
+fn verboseSkip() bool {
+    const v = std.process.Environ.getPosix(std.testing.environ, "ZIG_LIBS_VERBOSE_SKIP") orelse return false;
+    return v.len > 0;
+}
+
 pub const meta = .{
     // The codecs, the client's PDU logic and the responder are pure
     // computation; only the optional TcpTransport touches std.Io.net.
@@ -363,7 +375,7 @@ fn splitEndpoint(endpoint: []const u8) ?Endpoint {
 // what a snap7 server expects.
 test "live: our client against a real S7 server" {
     const endpoint = envVar("S7COMM_TEST_SERVER") orelse {
-        std.debug.print("SKIPPED: live S7 interop (set S7COMM_TEST_SERVER=host:port)\n", .{});
+        if (verboseSkip()) std.debug.print("SKIPPED: live S7 interop (set S7COMM_TEST_SERVER=host:port)\n", .{});
         return error.SkipZigTest;
     };
     const ep = splitEndpoint(endpoint) orelse return error.SkipZigTest;
@@ -377,7 +389,7 @@ test "live: our client against a real S7 server" {
 
     const addr = std.Io.net.IpAddress.parse(ep.host, ep.port) catch return error.SkipZigTest;
     var tt = TcpTransport.connect(io, addr) catch {
-        std.debug.print("SKIPPED: live S7 interop (cannot connect to {s})\n", .{endpoint});
+        if (verboseSkip()) std.debug.print("SKIPPED: live S7 interop (cannot connect to {s})\n", .{endpoint});
         return error.SkipZigTest;
     };
     defer tt.close();
@@ -447,7 +459,7 @@ test "live: our client against a real S7 server" {
 // client, for instance). Without the variable the test prints SKIPPED.
 test "live: a real S7 client against our responder" {
     const endpoint = envVar("S7COMM_TEST_LISTEN") orelse {
-        std.debug.print("SKIPPED: live S7 responder (set S7COMM_TEST_LISTEN=host:port)\n", .{});
+        if (verboseSkip()) std.debug.print("SKIPPED: live S7 responder (set S7COMM_TEST_LISTEN=host:port)\n", .{});
         return error.SkipZigTest;
     };
     const ep = splitEndpoint(endpoint) orelse return error.SkipZigTest;
@@ -458,14 +470,14 @@ test "live: a real S7 client against our responder" {
 
     const addr = std.Io.net.IpAddress.parse(ep.host, ep.port) catch return error.SkipZigTest;
     var listener = addr.listen(io, .{ .reuse_address = true }) catch {
-        std.debug.print("SKIPPED: live S7 responder (cannot bind {s})\n", .{endpoint});
+        if (verboseSkip()) std.debug.print("SKIPPED: live S7 responder (cannot bind {s})\n", .{endpoint});
         return error.SkipZigTest;
     };
     defer listener.socket.close(io);
     std.debug.print("live S7 responder listening on {s}\n", .{endpoint});
 
     const stream = listener.accept(io) catch {
-        std.debug.print("SKIPPED: live S7 responder (no peer connected)\n", .{});
+        if (verboseSkip()) std.debug.print("SKIPPED: live S7 responder (no peer connected)\n", .{});
         return error.SkipZigTest;
     };
     var tt = TcpTransport.fromStream(io, stream);

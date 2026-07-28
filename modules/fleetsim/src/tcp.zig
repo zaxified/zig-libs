@@ -25,6 +25,18 @@ const std = @import("std");
 const fleet_mod = @import("fleet.zig");
 const node_mod = @import("node.zig");
 
+// Skip diagnostics are opt-in: `zig build test` must be silent on
+// success (any stderr triggers the build runner's `failed command:`
+// line even when the step succeeded), while the skip *count* still
+// shows up in the summary regardless. Set ZIG_LIBS_VERBOSE_SKIP to any
+// non-empty value to see the reasons. (std.posix.getenv doesn't exist
+// in 0.16 — std.testing.environ + Environ.getPosix is the repo's
+// existing env-read pattern for tests, see netconf's `envVar`.)
+fn verboseSkip() bool {
+    const v = std.process.Environ.getPosix(std.testing.environ, "ZIG_LIBS_VERBOSE_SKIP") orelse return false;
+    return v.len > 0;
+}
+
 const Fleet = fleet_mod.Fleet;
 const NodeId = node_mod.NodeId;
 const Time = node_mod.Time;
@@ -698,7 +710,7 @@ test "serveTcpMulti: two masters, two nodes, one thread, at the same time" {
         tb.join();
         switch (e) {
             error.BindFailed, error.NoPeer => {
-                std.debug.print("SKIPPED: serveTcpMulti (cannot bind 127.0.0.1:{d}/{d})\n", .{ test_port_a, test_port_b });
+                if (verboseSkip()) std.debug.print("SKIPPED: serveTcpMulti (cannot bind 127.0.0.1:{d}/{d})\n", .{ test_port_a, test_port_b });
                 return error.SkipZigTest;
             },
             else => return e,
@@ -791,7 +803,7 @@ test "serveTcp: one master round-trips over a real socket (no env gate)" {
         th.join();
         switch (e) {
             error.BindFailed, error.NoPeer => {
-                std.debug.print("SKIPPED: serveTcp (cannot bind 127.0.0.1:{d})\n", .{test_port_single});
+                if (verboseSkip()) std.debug.print("SKIPPED: serveTcp (cannot bind 127.0.0.1:{d})\n", .{test_port_single});
                 return error.SkipZigTest;
             },
             else => return e,

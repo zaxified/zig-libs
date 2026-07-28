@@ -36,6 +36,18 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+
+// Skip diagnostics are opt-in: `zig build test` must be silent on
+// success (any stderr triggers the build runner's `failed command:`
+// line even when the step succeeded), while the skip *count* still
+// shows up in the summary regardless. Set ZIG_LIBS_VERBOSE_SKIP to any
+// non-empty value to see the reasons. (std.posix.getenv doesn't exist
+// in 0.16 — std.testing.environ + Environ.getPosix is the repo's
+// existing env-read pattern for tests, see netconf's `envVar`.)
+fn verboseSkip() bool {
+    const v = std.process.Environ.getPosix(std.testing.environ, "ZIG_LIBS_VERBOSE_SKIP") orelse return false;
+    return v.len > 0;
+}
 const linux = std.os.linux;
 const netlink = @import("netlink");
 const codec = netlink.codec;
@@ -520,7 +532,7 @@ test "group masks match the kernel's 1-based nfnetlink_groups enum" {
 fn liveSocket(what: []const u8) ?Socket {
     if (builtin.os.tag != .linux) return null;
     var sock = Socket.open(testing.allocator) catch |err| {
-        std.debug.print(
+        if (verboseSkip()) std.debug.print(
             "\nLIVE conntrack {s} test SKIPPED: cannot open a NETLINK_NETFILTER socket ({s}).\n",
             .{ what, @errorName(err) },
         );
@@ -542,7 +554,7 @@ test "live: dump the conntrack table over a real ctnetlink socket" {
         error.WouldBlock,
         error.Unexpected,
         => {
-            std.debug.print(
+            if (verboseSkip()) std.debug.print(
                 "\nLIVE conntrack dump test SKIPPED: the kernel refused the dump ({s}) — " ++
                     "needs CAP_NET_ADMIN and a loaded nf_conntrack.\n",
                 .{@errorName(err)},
@@ -599,7 +611,7 @@ test "live: insert -> get -> dump -> delete round-trip (needs a netns)" {
         error.WouldBlock,
         error.Unexpected,
         => {
-            std.debug.print(
+            if (verboseSkip()) std.debug.print(
                 "\nLIVE conntrack round-trip test SKIPPED: insert refused ({s}{s}{s}) — " ++
                     "run it as `unshare -rn zig build test-conntrack`.\n",
                 .{
@@ -611,7 +623,7 @@ test "live: insert -> get -> dump -> delete round-trip (needs a netns)" {
             return;
         },
         error.Exists => {
-            std.debug.print(
+            if (verboseSkip()) std.debug.print(
                 "\nLIVE conntrack round-trip test SKIPPED: the test tuple is already tracked.\n",
                 .{},
             );
@@ -667,7 +679,7 @@ test "live: insert -> get -> dump -> delete round-trip (needs a netns)" {
 test "live: an event socket sees the flow another socket creates" {
     if (builtin.os.tag != .linux) return;
     var events = Socket.openEvents(testing.allocator, Group.all_conntrack) catch |err| {
-        std.debug.print(
+        if (verboseSkip()) std.debug.print(
             "\nLIVE conntrack event test SKIPPED: cannot bind the conntrack event groups ({s}) — " ++
                 "needs CAP_NET_ADMIN.\n",
             .{@errorName(err)},
@@ -690,7 +702,7 @@ test "live: an event socket sees the flow another socket creates" {
         .dst_port = 59422,
     };
     ctl.insert(.ipv4, .{ .orig = orig, .reply = orig.invert(), .timeout = 60 }) catch |err| {
-        std.debug.print(
+        if (verboseSkip()) std.debug.print(
             "\nLIVE conntrack event test SKIPPED: insert refused ({s}).\n",
             .{@errorName(err)},
         );
@@ -704,7 +716,7 @@ test "live: an event socket sees the flow another socket creates" {
     var datagrams: usize = 0;
     while (datagrams < 8 and !found) : (datagrams += 1) {
         var it = events.nextEvents() catch |err| {
-            std.debug.print(
+            if (verboseSkip()) std.debug.print(
                 "\nLIVE conntrack event test SKIPPED: no event datagram ({s}).\n",
                 .{@errorName(err)},
             );

@@ -30,6 +30,18 @@
 //! queued rather than mistaken for one, and drained with `nextNotification`.
 
 const std = @import("std");
+
+// Skip diagnostics are opt-in: `zig build test` must be silent on
+// success (any stderr triggers the build runner's `failed command:`
+// line even when the step succeeded), while the skip *count* still
+// shows up in the summary regardless. Set ZIG_LIBS_VERBOSE_SKIP to any
+// non-empty value to see the reasons. (std.posix.getenv doesn't exist
+// in 0.16 — std.testing.environ + Environ.getPosix is the repo's
+// existing env-read pattern for tests, see netconf's `envVar`.)
+fn verboseSkip() bool {
+    const v = std.process.Environ.getPosix(std.testing.environ, "ZIG_LIBS_VERBOSE_SKIP") orelse return false;
+    return v.len > 0;
+}
 const testing = std.testing;
 const builtin = @import("builtin");
 
@@ -791,7 +803,7 @@ fn liveRoundTrip(advertise: []const []const u8, want: framing.Dialect) !void {
     const gpa = testing.allocator;
 
     const endpoint = envVar("NETCONF_TEST_SERVER") orelse {
-        std.debug.print(
+        if (verboseSkip()) std.debug.print(
             "SKIPPED: live NETCONF interop (set NETCONF_TEST_SERVER=host:port" ++
                 " NETCONF_TEST_USER=… NETCONF_TEST_PASSWORD=…)\n",
             .{},
@@ -811,7 +823,7 @@ fn liveRoundTrip(advertise: []const []const u8, want: framing.Dialect) !void {
 
     const addr = std.Io.net.IpAddress.parse(host, port) catch return error.SkipZigTest;
     var stream = addr.connect(io, .{ .mode = .stream }) catch {
-        std.debug.print("SKIPPED: live NETCONF interop (cannot connect to {s})\n", .{endpoint});
+        if (verboseSkip()) std.debug.print("SKIPPED: live NETCONF interop (cannot connect to {s})\n", .{endpoint});
         return error.SkipZigTest;
     };
     defer stream.close(io);

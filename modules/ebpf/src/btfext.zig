@@ -60,6 +60,18 @@ const std = @import("std");
 const builtin = @import("builtin");
 const btf = @import("btf.zig");
 
+// Skip diagnostics are opt-in: `zig build test` must be silent on
+// success (any stderr triggers the build runner's `failed command:`
+// line even when the step succeeded), while the skip *count* still
+// shows up in the summary regardless. Set ZIG_LIBS_VERBOSE_SKIP to any
+// non-empty value to see the reasons. (std.posix.getenv doesn't exist
+// in 0.16 — std.testing.environ + Environ.getPosix is the repo's
+// existing env-read pattern for tests, see netconf's `envVar`.)
+fn verboseSkip() bool {
+    const v = std.process.Environ.getPosix(std.testing.environ, "ZIG_LIBS_VERBOSE_SKIP") orelse return false;
+    return v.len > 0;
+}
+
 const native_endian = builtin.cpu.arch.endian();
 
 const Btf = btf.Btf;
@@ -1276,7 +1288,7 @@ fn kernelAvailable() bool {
 test "CO-RE: relocate a real clang object against /sys/kernel/btf/vmlinux" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     if (!kernelAvailable()) {
-        std.debug.print("\nSKIPPED: ebpf CO-RE kernel test — no /sys/kernel/btf/vmlinux.\n", .{});
+        if (verboseSkip()) std.debug.print("\nSKIPPED: ebpf CO-RE kernel test — no /sys/kernel/btf/vmlinux.\n", .{});
         return;
     }
     const gpa = testing.allocator;
@@ -1298,7 +1310,7 @@ test "CO-RE: relocate a real clang object against /sys/kernel/btf/vmlinux" {
     //  reported `'pid' type_id=141016 bits_offset=22400` -> byte 2800. That
     //  NUMBER is not asserted; it changes with every kernel build.)
     const task_k = kernel.findByNameKind("task_struct", .@"struct") orelse {
-        std.debug.print("\nSKIPPED: ebpf CO-RE — this kernel's BTF has no task_struct.\n", .{});
+        if (verboseSkip()) std.debug.print("\nSKIPPED: ebpf CO-RE — this kernel's BTF has no task_struct.\n", .{});
         return;
     };
     const task_size = try kernel.sizeOf(task_k);
@@ -1403,7 +1415,7 @@ test "CO-RE: relocate a real clang object against /sys/kernel/btf/vmlinux" {
 test "fieldByName resolves against the running kernel" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     if (!kernelAvailable()) {
-        std.debug.print("\nSKIPPED: ebpf fieldByName kernel test — no kernel BTF.\n", .{});
+        if (verboseSkip()) std.debug.print("\nSKIPPED: ebpf fieldByName kernel test — no kernel BTF.\n", .{});
         return;
     }
     const gpa = testing.allocator;

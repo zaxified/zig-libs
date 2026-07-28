@@ -76,6 +76,18 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+
+// Skip diagnostics are opt-in: `zig build test` must be silent on
+// success (any stderr triggers the build runner's `failed command:`
+// line even when the step succeeded), while the skip *count* still
+// shows up in the summary regardless. Set ZIG_LIBS_VERBOSE_SKIP to any
+// non-empty value to see the reasons. (std.posix.getenv doesn't exist
+// in 0.16 — std.testing.environ + Environ.getPosix is the repo's
+// existing env-read pattern for tests, see netconf's `envVar`.)
+fn verboseSkip() bool {
+    const v = std.process.Environ.getPosix(std.testing.environ, "ZIG_LIBS_VERBOSE_SKIP") orelse return false;
+    return v.len > 0;
+}
 const linux = std.os.linux;
 const BPF = linux.BPF;
 
@@ -951,7 +963,7 @@ test "MapInfo mirrors the kernel's bpf_map_info prefix layout" {
 test "LIVE: mmap a real ringbuf map and consume a record end-to-end" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     if (!hasBpfCapability()) {
-        std.debug.print(
+        if (verboseSkip()) std.debug.print(
             "\nLIVE ebpf ringbuf test SKIPPED: needs CAP_BPF (running as uid {d}).\n",
             .{linux.geteuid()},
         );
@@ -963,13 +975,13 @@ test "LIVE: mmap a real ringbuf map and consume a record end-to-end" {
     const ring_size: u32 = @intCast(page * 4);
 
     const map_fd = BPF.map_create(.ringbuf, 0, 0, ring_size) catch {
-        std.debug.print("\nLIVE ebpf ringbuf test SKIPPED: BPF_MAP_CREATE(.ringbuf) refused.\n", .{});
+        if (verboseSkip()) std.debug.print("\nLIVE ebpf ringbuf test SKIPPED: BPF_MAP_CREATE(.ringbuf) refused.\n", .{});
         return;
     };
     defer _ = linux.close(map_fd);
 
     var rb = Reader.open(map_fd) catch |e| {
-        std.debug.print("\nLIVE ebpf ringbuf test SKIPPED: mmap of the ringbuf map failed ({s}).\n", .{@errorName(e)});
+        if (verboseSkip()) std.debug.print("\nLIVE ebpf ringbuf test SKIPPED: mmap of the ringbuf map failed ({s}).\n", .{@errorName(e)});
         return;
     };
     defer rb.close();
@@ -994,11 +1006,11 @@ test "LIVE: mmap a real ringbuf map and consume a record end-to-end" {
         .ringbuf_map_fd = map_fd,
         .record_size = record_size,
     }) catch {
-        std.debug.print("\nLIVE ebpf ringbuf test SKIPPED: ringbufEmit builder rejected the options.\n", .{});
+        if (verboseSkip()) std.debug.print("\nLIVE ebpf ringbuf test SKIPPED: ringbufEmit builder rejected the options.\n", .{});
         return;
     };
     const prog_fd = load(.{ .prog_type = .kprobe, .insns = insns }, "MIT") catch {
-        std.debug.print("\nLIVE ebpf ringbuf test SKIPPED: BPF_PROG_LOAD refused the ringbuf-emit program.\n", .{});
+        if (verboseSkip()) std.debug.print("\nLIVE ebpf ringbuf test SKIPPED: BPF_PROG_LOAD refused the ringbuf-emit program.\n", .{});
         return;
     };
     defer _ = linux.close(prog_fd);
@@ -1010,7 +1022,7 @@ test "LIVE: mmap a real ringbuf map and consume a record end-to-end" {
         break;
     }
     var kp = handle orelse {
-        std.debug.print("\nLIVE ebpf ringbuf test SKIPPED: no probeable symbol among the candidates.\n", .{});
+        if (verboseSkip()) std.debug.print("\nLIVE ebpf ringbuf test SKIPPED: no probeable symbol among the candidates.\n", .{});
         return;
     };
     defer kp.detach();

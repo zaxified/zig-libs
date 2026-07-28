@@ -45,6 +45,18 @@
 
 const std = @import("std");
 
+// Skip diagnostics are opt-in: `zig build test` must be silent on
+// success (any stderr triggers the build runner's `failed command:`
+// line even when the step succeeded), while the skip *count* still
+// shows up in the summary regardless. Set ZIG_LIBS_VERBOSE_SKIP to any
+// non-empty value to see the reasons. (std.posix.getenv doesn't exist
+// in 0.16 — std.testing.environ + Environ.getPosix is the repo's
+// existing env-read pattern for tests, see netconf's `envVar`.)
+fn verboseSkip() bool {
+    const v = std.process.Environ.getPosix(std.testing.environ, "ZIG_LIBS_VERBOSE_SKIP") orelse return false;
+    return v.len > 0;
+}
+
 pub const meta = .{
     // The codecs and the state machine are pure computation; only the
     // optional TcpTransport touches std.Io.net.
@@ -464,7 +476,7 @@ fn envVar(name: []const u8) ?[]const u8 {
 test "live: a third-party controlling station drives our outstation" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const endpoint = envVar("IEC104_TEST_LISTEN") orelse {
-        std.debug.print("SKIPPED: live IEC 104 outstation (set IEC104_TEST_LISTEN=host:port)\n", .{});
+        if (verboseSkip()) std.debug.print("SKIPPED: live IEC 104 outstation (set IEC104_TEST_LISTEN=host:port)\n", .{});
         return error.SkipZigTest;
     };
     const colon = std.mem.lastIndexOfScalar(u8, endpoint, ':') orelse return error.SkipZigTest;
@@ -477,14 +489,14 @@ test "live: a third-party controlling station drives our outstation" {
 
     const addr = std.Io.net.IpAddress.parse(host, port) catch return error.SkipZigTest;
     var listener = addr.listen(io, .{ .reuse_address = true }) catch {
-        std.debug.print("SKIPPED: live IEC 104 outstation (cannot bind {s})\n", .{endpoint});
+        if (verboseSkip()) std.debug.print("SKIPPED: live IEC 104 outstation (cannot bind {s})\n", .{endpoint});
         return error.SkipZigTest;
     };
     defer listener.socket.close(io);
     std.debug.print("live IEC 104 outstation listening on {s}\n", .{endpoint});
 
     const stream = listener.accept(io) catch {
-        std.debug.print("SKIPPED: live IEC 104 outstation (no peer connected)\n", .{});
+        if (verboseSkip()) std.debug.print("SKIPPED: live IEC 104 outstation (no peer connected)\n", .{});
         return error.SkipZigTest;
     };
 

@@ -30,6 +30,18 @@ const nodestore = @import("nodestore.zig");
 const server = @import("server.zig");
 const security = @import("security.zig");
 
+// Skip diagnostics are opt-in: `zig build test` must be silent on
+// success (any stderr triggers the build runner's `failed command:`
+// line even when the step succeeded), while the skip *count* still
+// shows up in the summary regardless. Set ZIG_LIBS_VERBOSE_SKIP to any
+// non-empty value to see the reasons. (std.posix.getenv doesn't exist
+// in 0.16 — std.testing.environ + Environ.getPosix is the repo's
+// existing env-read pattern for tests, see netconf's `envVar`.)
+fn verboseSkip() bool {
+    const v = std.process.Environ.getPosix(std.testing.environ, "ZIG_LIBS_VERBOSE_SKIP") orelse return false;
+    return v.len > 0;
+}
+
 const testing = std.testing;
 
 /// The open62541 example binaries connect to a hard-coded
@@ -466,28 +478,28 @@ const LiveClient = struct {
 /// stdout. Skips loudly when podman/the image/the port is unavailable.
 fn runLiveClient(gpa: std.mem.Allocator, io: std.Io, name: []const u8, example: []const u8, options: Driver.ServeOptions) !LiveClient {
     if (builtin.os.tag != .linux) {
-        std.debug.print("\nSKIPPED: LIVE opcua server interop needs Linux (podman --network host).\n", .{});
+        if (verboseSkip()) std.debug.print("\nSKIPPED: LIVE opcua server interop needs Linux (podman --network host).\n", .{});
         return error.SkipZigTest;
     }
     stopContainer(gpa, io, name); // leftover cleanup from a crashed run
 
     var driver: Driver = undefined;
     driver.init(gpa, io) catch |err| {
-        std.debug.print("\nSKIPPED: LIVE opcua server interop cannot bind loopback:{d} ({t}).\n", .{ live_port, err });
+        if (verboseSkip()) std.debug.print("\nSKIPPED: LIVE opcua server interop cannot bind loopback:{d} ({t}).\n", .{ live_port, err });
         return error.SkipZigTest;
     };
     errdefer driver.deinit();
 
     var run_result = startClient(gpa, io, name, example) catch |err| switch (err) {
         error.SkipZigTest => {
-            std.debug.print("\nSKIPPED: LIVE opcua server interop: `podman` is not available here.\n", .{});
+            if (verboseSkip()) std.debug.print("\nSKIPPED: LIVE opcua server interop: `podman` is not available here.\n", .{});
             return error.SkipZigTest;
         },
         else => return err,
     };
     defer run_result.deinit(gpa);
     if (run_result.exit_code != 0) {
-        std.debug.print(
+        if (verboseSkip()) std.debug.print(
             "\nSKIPPED: LIVE opcua server interop: `podman run` failed (image not pulled / podman unusable).\nstderr: {s}\n",
             .{run_result.stderr},
         );
@@ -503,7 +515,7 @@ fn runLiveClient(gpa: std.mem.Allocator, io: std.Io, name: []const u8, example: 
     // what this test assumes, or the image lacks the example. That is an
     // environment gap, not a server bug: skip loudly rather than fail.
     if (driver.connections == 0) {
-        std.debug.print(
+        if (verboseSkip()) std.debug.print(
             "\nSKIPPED: LIVE opcua server interop: `{s}` never connected to loopback:{d} (port held by another process, or podman networking unavailable).\n",
             .{ example, live_port },
         );
@@ -612,7 +624,7 @@ fn loopbackServeThread(ctx: *LoopbackCtx) void {
 
 test "LIVE loopback: this module's own client drives this module's own server over TCP" {
     if (builtin.os.tag != .linux) {
-        std.debug.print("\nSKIPPED: loopback server test needs Linux sockets.\n", .{});
+        if (verboseSkip()) std.debug.print("\nSKIPPED: loopback server test needs Linux sockets.\n", .{});
         return error.SkipZigTest;
     }
     const gpa = testing.allocator;
@@ -624,14 +636,14 @@ test "LIVE loopback: this module's own client drives this module's own server ov
 
     var driver: Driver = undefined;
     driver.init(gpa, io) catch |err| {
-        std.debug.print("\nSKIPPED: loopback server test cannot bind loopback:{d} ({t}).\n", .{ live_port, err });
+        if (verboseSkip()) std.debug.print("\nSKIPPED: loopback server test cannot bind loopback:{d} ({t}).\n", .{ live_port, err });
         return error.SkipZigTest;
     };
     defer driver.deinit();
 
     var ctx: LoopbackCtx = .{ .driver = &driver };
     const thread = std.Thread.spawn(.{}, loopbackServeThread, .{&ctx}) catch {
-        std.debug.print("\nSKIPPED: loopback server test cannot spawn a thread.\n", .{});
+        if (verboseSkip()) std.debug.print("\nSKIPPED: loopback server test cannot spawn a thread.\n", .{});
         return error.SkipZigTest;
     };
     defer thread.join();
@@ -643,7 +655,7 @@ test "LIVE loopback: this module's own client drives this module's own server ov
             if (addr.connect(io, .{ .mode = .stream })) |s| break :blk s else |_| {}
             sleepMs(50);
         }
-        std.debug.print("\nSKIPPED: loopback server test could not connect.\n", .{});
+        if (verboseSkip()) std.debug.print("\nSKIPPED: loopback server test could not connect.\n", .{});
         return error.SkipZigTest;
     };
     defer stream.close(io);
@@ -1566,7 +1578,7 @@ fn pythonInterpreter() []const u8 {
 test "LIVE asyncua -> our server: Basic256Sha256 SignAndEncrypt browse/read/write/call/subscribe, Sign + encrypted username, token renewal" {
     const gpa = testing.allocator;
     if (builtin.os.tag != .linux) {
-        std.debug.print("\nSKIPPED: LIVE asyncua interop needs Linux.\n", .{});
+        if (verboseSkip()) std.debug.print("\nSKIPPED: LIVE asyncua interop needs Linux.\n", .{});
         return error.SkipZigTest;
     }
     var threaded = std.Io.Threaded.init(gpa, .{});
@@ -1576,12 +1588,12 @@ test "LIVE asyncua -> our server: Basic256Sha256 SignAndEncrypt browse/read/writ
     const python = pythonInterpreter();
     {
         var probe = runProcess(gpa, io, &.{ python, "-c", "import asyncua, cryptography" }) catch {
-            std.debug.print("\nSKIPPED: LIVE asyncua interop: no usable `{s}` (set OPCUA_PYTHON).\n", .{python});
+            if (verboseSkip()) std.debug.print("\nSKIPPED: LIVE asyncua interop: no usable `{s}` (set OPCUA_PYTHON).\n", .{python});
             return error.SkipZigTest;
         };
         defer probe.deinit(gpa);
         if (probe.exit_code != 0) {
-            std.debug.print(
+            if (verboseSkip()) std.debug.print(
                 "\nSKIPPED: LIVE asyncua interop: `{s}` lacks the `asyncua`/`cryptography` packages (set OPCUA_PYTHON to a venv that has them).\n",
                 .{python},
             );
@@ -1595,7 +1607,7 @@ test "LIVE asyncua -> our server: Basic256Sha256 SignAndEncrypt browse/read/writ
         .port = live_secure_port,
         .endpoint_url = live_secure_endpoint_url,
     }) catch |err| {
-        std.debug.print("\nSKIPPED: LIVE asyncua interop cannot bind loopback:{d} ({t}).\n", .{ live_secure_port, err });
+        if (verboseSkip()) std.debug.print("\nSKIPPED: LIVE asyncua interop cannot bind loopback:{d} ({t}).\n", .{ live_secure_port, err });
         return error.SkipZigTest;
     };
     defer driver.deinit();
@@ -1605,7 +1617,7 @@ test "LIVE asyncua -> our server: Basic256Sha256 SignAndEncrypt browse/read/writ
 
     var ctx: LoopbackCtx = .{ .driver = &driver };
     const thread = std.Thread.spawn(.{}, secureServeThread, .{&ctx}) catch {
-        std.debug.print("\nSKIPPED: LIVE asyncua interop cannot spawn a thread.\n", .{});
+        if (verboseSkip()) std.debug.print("\nSKIPPED: LIVE asyncua interop cannot spawn a thread.\n", .{});
         return error.SkipZigTest;
     };
 
@@ -1619,7 +1631,7 @@ test "LIVE asyncua -> our server: Basic256Sha256 SignAndEncrypt browse/read/writ
     driver.dumpCapture("asyncua-basic256sha256");
 
     if (driver.connections == 0) {
-        std.debug.print(
+        if (verboseSkip()) std.debug.print(
             "\nSKIPPED: LIVE asyncua interop: nothing ever connected to loopback:{d} (port held by another process?).\nstderr: {s}\n",
             .{ live_secure_port, result.stderr },
         );
@@ -1728,7 +1740,7 @@ fn removeO62ClientPki(io: std.Io) void {
 test "LIVE open62541 client_encryption -> our server: picks the Basic256Sha256 SignAndEncrypt endpoint out of GetEndpoints" {
     const gpa = testing.allocator;
     if (builtin.os.tag != .linux) {
-        std.debug.print("\nSKIPPED: LIVE open62541 encryption interop needs Linux (podman --network host).\n", .{});
+        if (verboseSkip()) std.debug.print("\nSKIPPED: LIVE open62541 encryption interop needs Linux (podman --network host).\n", .{});
         return error.SkipZigTest;
     }
     var threaded = std.Io.Threaded.init(gpa, .{});
@@ -1739,7 +1751,7 @@ test "LIVE open62541 client_encryption -> our server: picks the Basic256Sha256 S
     stopContainer(gpa, io, name); // leftover cleanup from a crashed run
 
     if (!makeO62ClientPki(gpa, io)) {
-        std.debug.print("\nSKIPPED: LIVE open62541 encryption interop needs `openssl` to stage a throwaway client key pair.\n", .{});
+        if (verboseSkip()) std.debug.print("\nSKIPPED: LIVE open62541 encryption interop needs `openssl` to stage a throwaway client key pair.\n", .{});
         removeO62ClientPki(io);
         return error.SkipZigTest;
     }
@@ -1751,7 +1763,7 @@ test "LIVE open62541 client_encryption -> our server: picks the Basic256Sha256 S
         .port = live_secure_port,
         .endpoint_url = live_secure_endpoint_url,
     }) catch |err| {
-        std.debug.print("\nSKIPPED: LIVE open62541 encryption interop cannot bind loopback:{d} ({t}).\n", .{ live_secure_port, err });
+        if (verboseSkip()) std.debug.print("\nSKIPPED: LIVE open62541 encryption interop cannot bind loopback:{d} ({t}).\n", .{ live_secure_port, err });
         return error.SkipZigTest;
     };
     defer driver.deinit();
@@ -1766,14 +1778,14 @@ test "LIVE open62541 client_encryption -> our server: picks the Basic256Sha256 S
         "/certs/client_cert.der",                              "/certs/client_key.der",
     }) catch |err| switch (err) {
         error.SkipZigTest => {
-            std.debug.print("\nSKIPPED: LIVE open62541 encryption interop: `podman` is not available here.\n", .{});
+            if (verboseSkip()) std.debug.print("\nSKIPPED: LIVE open62541 encryption interop: `podman` is not available here.\n", .{});
             return error.SkipZigTest;
         },
         else => return err,
     };
     defer run_result.deinit(gpa);
     if (run_result.exit_code != 0) {
-        std.debug.print(
+        if (verboseSkip()) std.debug.print(
             "\nSKIPPED: LIVE open62541 encryption interop: `podman run` failed (image not pulled / podman unusable).\nstderr: {s}\n",
             .{run_result.stderr},
         );
@@ -1785,7 +1797,7 @@ test "LIVE open62541 client_encryption -> our server: picks the Basic256Sha256 S
     driver.dumpCapture("open62541-client_encryption");
 
     if (driver.connections == 0) {
-        std.debug.print(
+        if (verboseSkip()) std.debug.print(
             "\nSKIPPED: LIVE open62541 encryption interop: `client_encryption` never connected to loopback:{d}.\n",
             .{live_secure_port},
         );

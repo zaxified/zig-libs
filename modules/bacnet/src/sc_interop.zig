@@ -40,6 +40,18 @@ const sc_ws = @import("sc_ws.zig");
 const sc_node = @import("sc_node.zig");
 const sc_hub = @import("sc_hub.zig");
 
+// Skip diagnostics are opt-in: `zig build test` must be silent on
+// success (any stderr triggers the build runner's `failed command:`
+// line even when the step succeeded), while the skip *count* still
+// shows up in the summary regardless. Set ZIG_LIBS_VERBOSE_SKIP to any
+// non-empty value to see the reasons. (std.posix.getenv doesn't exist
+// in 0.16 — std.testing.environ + Environ.getPosix is the repo's
+// existing env-read pattern for tests, see netconf's `envVar`.)
+fn verboseSkip() bool {
+    const v = std.process.Environ.getPosix(std.testing.environ, "ZIG_LIBS_VERBOSE_SKIP") orelse return false;
+    return v.len > 0;
+}
+
 const testing = std.testing;
 
 fn envVar(name: []const u8) ?[]const u8 {
@@ -60,7 +72,7 @@ fn address(spec: []const u8) ?std.Io.net.IpAddress {
 }
 
 fn skip(comptime what: []const u8, comptime which: []const u8) void {
-    std.debug.print("SKIPPED: {s} (set {s}=host:port to run)\n", .{ what, which });
+    if (verboseSkip()) std.debug.print("SKIPPED: {s} (set {s}=host:port to run)\n", .{ what, which });
 }
 
 // ── minimal HTTP-head scanning, for this file only ─────────────────────────

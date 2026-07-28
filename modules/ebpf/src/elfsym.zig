@@ -45,6 +45,18 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+
+// Skip diagnostics are opt-in: `zig build test` must be silent on
+// success (any stderr triggers the build runner's `failed command:`
+// line even when the step succeeded), while the skip *count* still
+// shows up in the summary regardless. Set ZIG_LIBS_VERBOSE_SKIP to any
+// non-empty value to see the reasons. (std.posix.getenv doesn't exist
+// in 0.16 — std.testing.environ + Environ.getPosix is the repo's
+// existing env-read pattern for tests, see netconf's `envVar`.)
+fn verboseSkip() bool {
+    const v = std.process.Environ.getPosix(std.testing.environ, "ZIG_LIBS_VERBOSE_SKIP") orelse return false;
+    return v.len > 0;
+}
 const linux = std.os.linux;
 const elf = std.elf;
 
@@ -1192,19 +1204,19 @@ test "real library: resolved offsets agree with an independent derivation" {
             break c;
         }
     } else {
-        std.debug.print("\nebpf elfsym real-library test SKIPPED: no libc.so.6 found.\n", .{});
+        if (verboseSkip()) std.debug.print("\nebpf elfsym real-library test SKIPPED: no libc.so.6 found.\n", .{});
         return;
     };
 
     const sym = resolveFunc(gpa, path, "malloc") catch |e| {
-        std.debug.print("\nebpf elfsym real-library test SKIPPED: malloc unresolvable ({s}).\n", .{@errorName(e)});
+        if (verboseSkip()) std.debug.print("\nebpf elfsym real-library test SKIPPED: malloc unresolvable ({s}).\n", .{@errorName(e)});
         return;
     };
     try testing.expect(sym.vaddr != 0);
     try testing.expect(sym.kind == .func or sym.kind == .ifunc);
 
     const oracle = (try fileOffsetViaSections(gpa, path, sym.vaddr)) orelse {
-        std.debug.print("\nebpf elfsym cross-check SKIPPED: no section covers malloc's vaddr.\n", .{});
+        if (verboseSkip()) std.debug.print("\nebpf elfsym cross-check SKIPPED: no section covers malloc's vaddr.\n", .{});
         return;
     };
     try testing.expectEqual(oracle, sym.file_offset);

@@ -50,6 +50,18 @@
 
 const std = @import("std");
 
+// Skip diagnostics are opt-in: `zig build test` must be silent on
+// success (any stderr triggers the build runner's `failed command:`
+// line even when the step succeeded), while the skip *count* still
+// shows up in the summary regardless. Set ZIG_LIBS_VERBOSE_SKIP to any
+// non-empty value to see the reasons. (std.posix.getenv doesn't exist
+// in 0.16 — std.testing.environ + Environ.getPosix is the repo's
+// existing env-read pattern for tests, see netconf's `envVar`.)
+fn verboseSkip() bool {
+    const v = std.process.Environ.getPosix(std.testing.environ, "ZIG_LIBS_VERBOSE_SKIP") orelse return false;
+    return v.len > 0;
+}
+
 pub const meta = .{
     // The codecs, the client's logic and the adapter are pure computation;
     // only the optional TcpTransport/UdpDiscovery adapters touch std.Io.net.
@@ -556,7 +568,7 @@ fn directRouting() bool {
 // non-routing device wants.
 test "live: our client against a real EtherNet/IP target" {
     const endpoint = envVar("ENIP_TEST_SERVER") orelse {
-        std.debug.print("SKIPPED: live EtherNet/IP interop (set ENIP_TEST_SERVER=host:port)\n", .{});
+        if (verboseSkip()) std.debug.print("SKIPPED: live EtherNet/IP interop (set ENIP_TEST_SERVER=host:port)\n", .{});
         return error.SkipZigTest;
     };
     const ep = splitEndpoint(endpoint) orelse return error.SkipZigTest;
@@ -569,7 +581,7 @@ test "live: our client against a real EtherNet/IP target" {
 
     const addr = std.Io.net.IpAddress.parse(ep.host, ep.port) catch return error.SkipZigTest;
     var tt = TcpTransport.connect(io, addr) catch {
-        std.debug.print("SKIPPED: live EtherNet/IP interop (cannot connect to {s})\n", .{endpoint});
+        if (verboseSkip()) std.debug.print("SKIPPED: live EtherNet/IP interop (cannot connect to {s})\n", .{endpoint});
         return error.SkipZigTest;
     };
     defer tt.close();
@@ -658,7 +670,7 @@ test "live: our client against a real EtherNet/IP target" {
 // target implements Forward_Open.
 test "live: a Class 3 connection against a real target" {
     const endpoint = envVar("ENIP_TEST_CONNECTED") orelse {
-        std.debug.print(
+        if (verboseSkip()) std.debug.print(
             "SKIPPED: live EtherNet/IP connected messaging (set ENIP_TEST_CONNECTED=host:port)\n",
             .{},
         );
@@ -673,7 +685,7 @@ test "live: a Class 3 connection against a real target" {
 
     const addr = std.Io.net.IpAddress.parse(ep.host, ep.port) catch return error.SkipZigTest;
     var tt = TcpTransport.connect(io, addr) catch {
-        std.debug.print("SKIPPED: live connected messaging (cannot connect to {s})\n", .{endpoint});
+        if (verboseSkip()) std.debug.print("SKIPPED: live connected messaging (cannot connect to {s})\n", .{endpoint});
         return error.SkipZigTest;
     };
     defer tt.close();
@@ -710,7 +722,7 @@ test "live: a Class 3 connection against a real target" {
 // Without the variable the test prints SKIPPED.
 test "live: a real EtherNet/IP client against our adapter" {
     const endpoint = envVar("ENIP_TEST_LISTEN") orelse {
-        std.debug.print("SKIPPED: live EtherNet/IP adapter (set ENIP_TEST_LISTEN=host:port)\n", .{});
+        if (verboseSkip()) std.debug.print("SKIPPED: live EtherNet/IP adapter (set ENIP_TEST_LISTEN=host:port)\n", .{});
         return error.SkipZigTest;
     };
     const ep = splitEndpoint(endpoint) orelse return error.SkipZigTest;
@@ -721,7 +733,7 @@ test "live: a real EtherNet/IP client against our adapter" {
 
     const addr = std.Io.net.IpAddress.parse(ep.host, ep.port) catch return error.SkipZigTest;
     var listener = addr.listen(io, .{ .reuse_address = true }) catch {
-        std.debug.print("SKIPPED: live EtherNet/IP adapter (cannot bind {s})\n", .{endpoint});
+        if (verboseSkip()) std.debug.print("SKIPPED: live EtherNet/IP adapter (cannot bind {s})\n", .{endpoint});
         return error.SkipZigTest;
     };
     defer listener.socket.close(io);

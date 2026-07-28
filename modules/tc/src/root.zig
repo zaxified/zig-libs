@@ -66,6 +66,18 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+
+// Skip diagnostics are opt-in: `zig build test` must be silent on
+// success (any stderr triggers the build runner's `failed command:`
+// line even when the step succeeded), while the skip *count* still
+// shows up in the summary regardless. Set ZIG_LIBS_VERBOSE_SKIP to any
+// non-empty value to see the reasons. (std.posix.getenv doesn't exist
+// in 0.16 — std.testing.environ + Environ.getPosix is the repo's
+// existing env-read pattern for tests, see netconf's `envVar`.)
+fn verboseSkip() bool {
+    const v = std.process.Environ.getPosix(std.testing.environ, "ZIG_LIBS_VERBOSE_SKIP") orelse return false;
+    return v.len > 0;
+}
 const linux = std.os.linux;
 const native_endian = builtin.cpu.arch.endian();
 
@@ -791,7 +803,7 @@ fn fuzzParseQdisc(_: void, smith: *std.testing.Smith) !void {
 // `netlink`/`wireguard`/`rawsock`).
 
 fn skip(comptime what: []const u8) error{SkipZigTest} {
-    std.debug.print("SKIPPED: {s} (needs CAP_NET_ADMIN in a netns: `unshare -rn zig build test-tc`)\n", .{what});
+    if (verboseSkip()) std.debug.print("SKIPPED: {s} (needs CAP_NET_ADMIN in a netns: `unshare -rn zig build test-tc`)\n", .{what});
     return error.SkipZigTest;
 }
 
@@ -799,7 +811,7 @@ fn skip(comptime what: []const u8) error{SkipZigTest} {
 /// checks `CAP_NET_ADMIN` against the **initial** user namespace there, so a
 /// `unshare -rn` namespace does not grant it.
 fn skipInitUserns(comptime what: []const u8) error{SkipZigTest} {
-    std.debug.print(
+    if (verboseSkip()) std.debug.print(
         "SKIPPED: {s} (needs CAP_NET_ADMIN in the *initial* user namespace — " ++
             "`unshare -rn` is not enough for RTM_NEWACTION; try `sudo unshare -n`)\n",
         .{what},

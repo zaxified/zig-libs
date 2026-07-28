@@ -50,6 +50,18 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+// Skip diagnostics are opt-in: `zig build test` must be silent on
+// success (any stderr triggers the build runner's `failed command:`
+// line even when the step succeeded), while the skip *count* still
+// shows up in the summary regardless. Set ZIG_LIBS_VERBOSE_SKIP to any
+// non-empty value to see the reasons. (std.posix.getenv doesn't exist
+// in 0.16 — std.testing.environ + Environ.getPosix is the repo's
+// existing env-read pattern for tests, see netconf's `envVar`.)
+fn verboseSkip() bool {
+    const v = std.process.Environ.getPosix(std.testing.environ, "ZIG_LIBS_VERBOSE_SKIP") orelse return false;
+    return v.len > 0;
+}
+
 const ber = @import("ber.zig");
 const oid_mod = @import("oid.zig");
 const message = @import("message.zig");
@@ -781,7 +793,7 @@ test "live: SNMPv3 GET + walk against a real agent" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
 
     const endpoint = envVar("SNMP_TEST_AGENT") orelse {
-        std.debug.print(
+        if (verboseSkip()) std.debug.print(
             "SKIPPED: live SNMPv3 interop (set SNMP_TEST_AGENT=host:port," ++
                 " optionally SNMP_TEST_USER / SNMP_TEST_AUTH_PASSWORD /" ++
                 " SNMP_TEST_PRIV_PASSWORD)\n",
@@ -793,15 +805,15 @@ test "live: SNMPv3 GET + walk against a real agent" {
     const auth_pw = envVar("SNMP_TEST_AUTH_PASSWORD") orelse password;
     const priv_pw = envVar("SNMP_TEST_PRIV_PASSWORD") orelse password;
     const auth_proto = authProtoFromEnv() orelse {
-        std.debug.print("SKIPPED: live SNMPv3 interop (unknown SNMP_TEST_AUTH_PROTO)\n", .{});
+        if (verboseSkip()) std.debug.print("SKIPPED: live SNMPv3 interop (unknown SNMP_TEST_AUTH_PROTO)\n", .{});
         return error.SkipZigTest;
     };
     const priv_proto = privProtoFromEnv() orelse {
-        std.debug.print("SKIPPED: live SNMPv3 interop (unknown SNMP_TEST_PRIV_PROTO)\n", .{});
+        if (verboseSkip()) std.debug.print("SKIPPED: live SNMPv3 interop (unknown SNMP_TEST_PRIV_PROTO)\n", .{});
         return error.SkipZigTest;
     };
     const level = levelFromEnv() orelse {
-        std.debug.print("SKIPPED: live SNMPv3 interop (unknown SNMP_TEST_LEVEL)\n", .{});
+        if (verboseSkip()) std.debug.print("SKIPPED: live SNMPv3 interop (unknown SNMP_TEST_LEVEL)\n", .{});
         return error.SkipZigTest;
     };
 
@@ -817,7 +829,7 @@ test "live: SNMPv3 GET + walk against a real agent" {
     var udp = client_mod.UdpTransport.open(io, addr, .{
         .timeout = .{ .duration = .{ .raw = .fromMilliseconds(3000), .clock = .awake } },
     }) catch {
-        std.debug.print("SKIPPED: live SNMPv3 interop (cannot open a socket to {s})\n", .{endpoint});
+        if (verboseSkip()) std.debug.print("SKIPPED: live SNMPv3 interop (cannot open a socket to {s})\n", .{endpoint});
         return error.SkipZigTest;
     };
     defer udp.close();
@@ -832,7 +844,7 @@ test "live: SNMPv3 GET + walk against a real agent" {
     }, .{});
 
     c.discover() catch |err| {
-        std.debug.print(
+        if (verboseSkip()) std.debug.print(
             "SKIPPED: live SNMPv3 interop (no answer from {s}: {t})\n",
             .{ endpoint, err },
         );

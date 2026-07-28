@@ -92,6 +92,18 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+
+// Skip diagnostics are opt-in: `zig build test` must be silent on
+// success (any stderr triggers the build runner's `failed command:`
+// line even when the step succeeded), while the skip *count* still
+// shows up in the summary regardless. Set ZIG_LIBS_VERBOSE_SKIP to any
+// non-empty value to see the reasons. (std.posix.getenv doesn't exist
+// in 0.16 — std.testing.environ + Environ.getPosix is the repo's
+// existing env-read pattern for tests, see netconf's `envVar`.)
+fn verboseSkip() bool {
+    const v = std.process.Environ.getPosix(std.testing.environ, "ZIG_LIBS_VERBOSE_SKIP") orelse return false;
+    return v.len > 0;
+}
 const linux = std.os.linux;
 const BPF = linux.BPF;
 
@@ -2116,7 +2128,7 @@ test "CO-RE: relocate a real object against /sys/kernel/btf/vmlinux" {
     // Reading kernel BTF needs NO capability — /sys/kernel/btf/vmlinux is
     // 0444 — so this one really runs on an unprivileged box.
     var vmlinux = btf_mod.loadKernel(gpa) catch {
-        std.debug.print("\nSKIPPED: ebpf.object CO-RE-vs-vmlinux — no /sys/kernel/btf/vmlinux.\n", .{});
+        if (verboseSkip()) std.debug.print("\nSKIPPED: ebpf.object CO-RE-vs-vmlinux — no /sys/kernel/btf/vmlinux.\n", .{});
         return;
     };
     defer vmlinux.deinit();
@@ -2127,7 +2139,7 @@ test "CO-RE: relocate a real object against /sys/kernel/btf/vmlinux" {
     const local = &obj.btf.?;
 
     const n = applyCoreRelos(p, local, &vmlinux) catch |e| {
-        std.debug.print("\nSKIPPED: ebpf.object CO-RE-vs-vmlinux — {s}.\n", .{@errorName(e)});
+        if (verboseSkip()) std.debug.print("\nSKIPPED: ebpf.object CO-RE-vs-vmlinux — {s}.\n", .{@errorName(e)});
         return;
     };
     try testing.expectEqual(p.core_relos.len, n);
@@ -2139,7 +2151,8 @@ test "CO-RE: relocate a real object against /sys/kernel/btf/vmlinux" {
         if (p.insns[r.insn_off].off > 16) any_moved = true;
     }
     try testing.expect(any_moved);
-    std.debug.print(
+    // Informational, not a failure — same stderr rule as the skip reasons.
+    if (verboseSkip()) std.debug.print(
         "\nebpf.object: CO-RE against this kernel put task_struct.pid at byte {d}.\n",
         .{p.insns[p.core_relos[0].insn_off].off},
     );
@@ -2392,7 +2405,7 @@ test "load() reaches the syscall: refused for lack of CAP_BPF, never a crash" {
         for (obj.maps) |m| try testing.expect(m.fd >= 0);
     }
     if (!hasBpfCapability())
-        std.debug.print("\nSKIPPED (syscall half only): ebpf.object load — needs CAP_BPF (uid {d}).\n", .{linux.geteuid()});
+        if (verboseSkip()) std.debug.print("\nSKIPPED (syscall half only): ebpf.object load — needs CAP_BPF (uid {d}).\n", .{linux.geteuid()});
 }
 
 test "LIVE: create maps and load an XDP object end to end" {
@@ -2400,7 +2413,7 @@ test "LIVE: create maps and load an XDP object end to end" {
     const gpa = testing.allocator;
 
     if (!hasBpfCapability()) {
-        std.debug.print(
+        if (verboseSkip()) std.debug.print(
             "\nSKIPPED: LIVE ebpf.object XDP load — needs CAP_BPF (running as uid {d}).\n",
             .{linux.geteuid()},
         );
@@ -2410,7 +2423,7 @@ test "LIVE: create maps and load an XDP object end to end" {
     defer obj.deinit();
 
     load(&obj, .{}) catch |e| {
-        std.debug.print(
+        if (verboseSkip()) std.debug.print(
             "\nSKIPPED: LIVE ebpf.object XDP load refused ({s}): {s}\n",
             .{ @errorName(e), obj.verifier_log },
         );
@@ -2425,7 +2438,7 @@ test "LIVE: a BTF-defined hash map is created and its fd relocated in" {
     const gpa = testing.allocator;
 
     if (!hasBpfCapability()) {
-        std.debug.print(
+        if (verboseSkip()) std.debug.print(
             "\nSKIPPED: LIVE ebpf.object map+kprobe load — needs CAP_BPF (running as uid {d}).\n",
             .{linux.geteuid()},
         );
@@ -2435,7 +2448,7 @@ test "LIVE: a BTF-defined hash map is created and its fd relocated in" {
     defer obj.deinit();
 
     load(&obj, .{}) catch |e| {
-        std.debug.print(
+        if (verboseSkip()) std.debug.print(
             "\nSKIPPED: LIVE ebpf.object map+kprobe load refused ({s}): {s}\n",
             .{ @errorName(e), obj.verifier_log },
         );
@@ -2453,7 +2466,7 @@ test "LIVE: .rodata is created, seeded and frozen" {
     const gpa = testing.allocator;
 
     if (!hasBpfCapability()) {
-        std.debug.print(
+        if (verboseSkip()) std.debug.print(
             "\nSKIPPED: LIVE ebpf.object .rodata load — needs CAP_BPF (running as uid {d}).\n",
             .{linux.geteuid()},
         );
@@ -2463,7 +2476,7 @@ test "LIVE: .rodata is created, seeded and frozen" {
     defer obj.deinit();
 
     load(&obj, .{}) catch |e| {
-        std.debug.print(
+        if (verboseSkip()) std.debug.print(
             "\nSKIPPED: LIVE ebpf.object .rodata load refused ({s}): {s}\n",
             .{ @errorName(e), obj.verifier_log },
         );

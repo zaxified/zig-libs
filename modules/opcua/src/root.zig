@@ -18,6 +18,18 @@
 
 const std = @import("std");
 
+// Skip diagnostics are opt-in: `zig build test` must be silent on
+// success (any stderr triggers the build runner's `failed command:`
+// line even when the step succeeded), while the skip *count* still
+// shows up in the summary regardless. Set ZIG_LIBS_VERBOSE_SKIP to any
+// non-empty value to see the reasons. (std.posix.getenv doesn't exist
+// in 0.16 — std.testing.environ + Environ.getPosix is the repo's
+// existing env-read pattern for tests, see netconf's `envVar`.)
+fn verboseSkip() bool {
+    const v = std.process.Environ.getPosix(std.testing.environ, "ZIG_LIBS_VERBOSE_SKIP") orelse return false;
+    return v.len > 0;
+}
+
 pub const meta = .{
     .platform = .any, // pure codec + a caller-supplied stream; no socket of its own
     .role = .both, // client (this file) + server/device (`server.zig` over `nodestore.zig`)
@@ -1922,14 +1934,14 @@ test "LIVE open62541 interop: connect -> OPN(None) -> CreateSession -> ActivateS
         "docker.io/open62541/open62541:latest",
     }) catch |err| switch (err) {
         error.SkipZigTest => {
-            std.debug.print("\nLIVE opcua interop test SKIPPED: `podman` is not available in this environment.\n", .{});
+            if (verboseSkip()) std.debug.print("\nLIVE opcua interop test SKIPPED: `podman` is not available in this environment.\n", .{});
             return error.SkipZigTest;
         },
         else => return err,
     };
     defer run_result.deinit(gpa);
     if (run_result.exit_code != 0) {
-        std.debug.print(
+        if (verboseSkip()) std.debug.print(
             "\nLIVE opcua interop test SKIPPED: `podman run` failed (image not pulled / podman unusable here).\nstderr: {s}\n",
             .{run_result.stderr},
         );
@@ -1947,7 +1959,7 @@ test "LIVE open62541 interop: connect -> OPN(None) -> CreateSession -> ActivateS
             if (addr.connect(io, .{ .mode = .stream })) |s| break :blk s else |_| {}
             sleepMs(250);
         }
-        std.debug.print("\nLIVE opcua interop test SKIPPED: could not connect to opc.tcp://127.0.0.1:4840 within 15s.\n", .{});
+        if (verboseSkip()) std.debug.print("\nLIVE opcua interop test SKIPPED: could not connect to opc.tcp://127.0.0.1:4840 within 15s.\n", .{});
         return error.SkipZigTest;
     };
     defer stream.close(io);
@@ -2098,14 +2110,14 @@ test "LIVE open62541 interop: subscriptions -> CreateSubscription -> CreateMonit
         "--name", live_subs_container_name, "--pull=never", "docker.io/open62541/open62541:latest",
     }) catch |err| switch (err) {
         error.SkipZigTest => {
-            std.debug.print("\nLIVE opcua subscriptions test SKIPPED: `podman` is not available in this environment.\n", .{});
+            if (verboseSkip()) std.debug.print("\nLIVE opcua subscriptions test SKIPPED: `podman` is not available in this environment.\n", .{});
             return error.SkipZigTest;
         },
         else => return err,
     };
     defer run_result.deinit(gpa);
     if (run_result.exit_code != 0) {
-        std.debug.print(
+        if (verboseSkip()) std.debug.print(
             "\nLIVE opcua subscriptions test SKIPPED: `podman run` failed (image not pulled / podman unusable here).\nstderr: {s}\n",
             .{run_result.stderr},
         );
@@ -2120,7 +2132,7 @@ test "LIVE open62541 interop: subscriptions -> CreateSubscription -> CreateMonit
             if (addr.connect(io, .{ .mode = .stream })) |s| break :blk s else |_| {}
             sleepMs(250);
         }
-        std.debug.print("\nLIVE opcua subscriptions test SKIPPED: could not connect to opc.tcp://127.0.0.1:4840 within 15s.\n", .{});
+        if (verboseSkip()) std.debug.print("\nLIVE opcua subscriptions test SKIPPED: could not connect to opc.tcp://127.0.0.1:4840 within 15s.\n", .{});
         return error.SkipZigTest;
     };
     defer stream.close(io);
@@ -2340,14 +2352,14 @@ test "LIVE open62541 secure interop: Basic256Sha256 SignAndEncrypt + Sign -> OPN
         "--trustlistFolder",                    "/trust",                                       "--enableUnencrypted",                        "--enableAnonymous",
     }) catch |err| switch (err) {
         error.SkipZigTest => {
-            std.debug.print("\nLIVE opcua secure interop test SKIPPED: `podman` is not available in this environment.\n", .{});
+            if (verboseSkip()) std.debug.print("\nLIVE opcua secure interop test SKIPPED: `podman` is not available in this environment.\n", .{});
             return error.SkipZigTest;
         },
         else => return err,
     };
     defer run_result.deinit(gpa);
     if (run_result.exit_code != 0) {
-        std.debug.print(
+        if (verboseSkip()) std.debug.print(
             "\nLIVE opcua secure interop test SKIPPED: `podman run` failed (image not pulled / podman unusable here).\nstderr: {s}\n",
             .{run_result.stderr},
         );
@@ -2365,7 +2377,7 @@ test "LIVE open62541 secure interop: Basic256Sha256 SignAndEncrypt + Sign -> OPN
                 if (addr.connect(io, .{ .mode = .stream })) |s| break :blk s else |_| {}
                 sleepMs(250);
             }
-            std.debug.print("\nLIVE opcua secure interop test SKIPPED: could not connect to opc.tcp://127.0.0.1:4840 within 15s.\n", .{});
+            if (verboseSkip()) std.debug.print("\nLIVE opcua secure interop test SKIPPED: could not connect to opc.tcp://127.0.0.1:4840 within 15s.\n", .{});
             return error.SkipZigTest;
         };
         probe.close(io);
@@ -2377,7 +2389,7 @@ test "LIVE open62541 secure interop: Basic256Sha256 SignAndEncrypt + Sign -> OPN
     });
     defer cert_result.deinit(gpa);
     if (cert_result.exit_code != 0 or cert_result.stdout.len == 0) {
-        std.debug.print("\nLIVE opcua secure interop test SKIPPED: could not read the server certificate from the container.\nstderr: {s}\n", .{cert_result.stderr});
+        if (verboseSkip()) std.debug.print("\nLIVE opcua secure interop test SKIPPED: could not read the server certificate from the container.\nstderr: {s}\n", .{cert_result.stderr});
         return error.SkipZigTest;
     }
     const server_certificate = cert_result.stdout;
@@ -2414,7 +2426,7 @@ test "LIVE open62541 secure interop: Basic256Sha256 SignAndEncrypt + Sign -> OPN
         var cp_result = try runPodman(gpa, io, &.{ "cp", host_cert_path, live_secure_container_name ++ ":/trust/client_cert.der" });
         defer cp_result.deinit(gpa);
         if (cp_result.exit_code != 0) {
-            std.debug.print("\nLIVE opcua secure interop test SKIPPED: `podman cp` into the container failed.\nstderr: {s}\n", .{cp_result.stderr});
+            if (verboseSkip()) std.debug.print("\nLIVE opcua secure interop test SKIPPED: `podman cp` into the container failed.\nstderr: {s}\n", .{cp_result.stderr});
             return error.SkipZigTest;
         }
     }

@@ -73,6 +73,18 @@ const std = @import("std");
 const builtin = @import("builtin");
 const netlink = @import("netlink");
 
+// Skip diagnostics are opt-in: `zig build test` must be silent on
+// success (any stderr triggers the build runner's `failed command:`
+// line even when the step succeeded), while the skip *count* still
+// shows up in the summary regardless. Set ZIG_LIBS_VERBOSE_SKIP to any
+// non-empty value to see the reasons. (std.posix.getenv doesn't exist
+// in 0.16 — std.testing.environ + Environ.getPosix is the repo's
+// existing env-read pattern for tests, see netconf's `envVar`.)
+fn verboseSkip() bool {
+    const v = std.process.Environ.getPosix(std.testing.environ, "ZIG_LIBS_VERBOSE_SKIP") orelse return false;
+    return v.len > 0;
+}
+
 pub const meta = .{
     .platform = .linux, // AF_NETLINK raw syscalls — conscious ceiling
     .role = .client,
@@ -164,7 +176,7 @@ pub const stats_group_names = stats.group_names;
 const testing = std.testing;
 
 fn skip(comptime what: []const u8) error{SkipZigTest} {
-    std.debug.print("SKIPPED: {s}\n", .{what});
+    if (verboseSkip()) std.debug.print("SKIPPED: {s}\n", .{what});
     return error.SkipZigTest;
 }
 

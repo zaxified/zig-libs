@@ -43,6 +43,18 @@
 
 const std = @import("std");
 
+// Skip diagnostics are opt-in: `zig build test` must be silent on
+// success (any stderr triggers the build runner's `failed command:`
+// line even when the step succeeded), while the skip *count* still
+// shows up in the summary regardless. Set ZIG_LIBS_VERBOSE_SKIP to any
+// non-empty value to see the reasons. (std.posix.getenv doesn't exist
+// in 0.16 — std.testing.environ + Environ.getPosix is the repo's
+// existing env-read pattern for tests, see netconf's `envVar`.)
+fn verboseSkip() bool {
+    const v = std.process.Environ.getPosix(std.testing.environ, "ZIG_LIBS_VERBOSE_SKIP") orelse return false;
+    return v.len > 0;
+}
+
 pub const meta = .{
     .platform = .any, // the core is pure; only `tcp.zig` needs a POSIX socket
     .role = .server, // it answers masters
@@ -810,7 +822,8 @@ test "scale: 1000 in-process Modbus nodes, advanced over simulated minutes" {
     const elapsed = tcp.nowMs() - start;
     const peak = residentBytes();
 
-    std.debug.print(
+    // Informational, not a failure — same stderr rule as the skip reasons.
+    if (verboseSkip()) std.debug.print(
         "\nscale: {d} nodes, {d} signals, {d} polls, {d} replies, {d} events, {d} ms wall" ++
             " ({d:.2} us/poll), rss {?d} -> {?d} -> {?d} KiB, capacity losses {d}\n",
         .{
@@ -875,7 +888,7 @@ fn liveBindings(node_id: NodeId, ep: Endpoint, out: *[1]Binding) ![]const Bindin
 fn liveSkip(name: []const u8, e: anyerror) anyerror {
     switch (e) {
         error.BindFailed, error.NoPeer => {
-            std.debug.print("SKIPPED: {s} (no listener/peer)\n", .{name});
+            if (verboseSkip()) std.debug.print("SKIPPED: {s} (no listener/peer)\n", .{name});
             return error.SkipZigTest;
         },
         else => return e,
@@ -885,7 +898,7 @@ fn liveSkip(name: []const u8, e: anyerror) anyerror {
 test "live: a real DNP3 master drives a simulated outstation, and sees IIN1.6" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const endpoint = envVar("FLEETSIM_DNP3_LISTEN") orelse {
-        std.debug.print("SKIPPED: live fleetsim DNP3 (set FLEETSIM_DNP3_LISTEN=host:port)\n", .{});
+        if (verboseSkip()) std.debug.print("SKIPPED: live fleetsim DNP3 (set FLEETSIM_DNP3_LISTEN=host:port)\n", .{});
         return error.SkipZigTest;
     };
     const ep = splitEndpoint(endpoint) orelse return error.SkipZigTest;
@@ -964,7 +977,7 @@ test "live: a real DNP3 master drives a simulated outstation, and sees IIN1.6" {
 test "live: a real IEC 104 master drives a simulated outstation, and sees iv quality" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const endpoint = envVar("FLEETSIM_IEC104_LISTEN") orelse {
-        std.debug.print("SKIPPED: live fleetsim IEC 104 (set FLEETSIM_IEC104_LISTEN=host:port)\n", .{});
+        if (verboseSkip()) std.debug.print("SKIPPED: live fleetsim IEC 104 (set FLEETSIM_IEC104_LISTEN=host:port)\n", .{});
         return error.SkipZigTest;
     };
     const ep = splitEndpoint(endpoint) orelse return error.SkipZigTest;
@@ -1017,7 +1030,7 @@ test "live: a real IEC 104 master drives a simulated outstation, and sees iv qua
 test "live: a real S7 client drives a simulated CPU, and sees it go to STOP" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const endpoint = envVar("FLEETSIM_S7_LISTEN") orelse {
-        std.debug.print("SKIPPED: live fleetsim S7comm (set FLEETSIM_S7_LISTEN=host:port)\n", .{});
+        if (verboseSkip()) std.debug.print("SKIPPED: live fleetsim S7comm (set FLEETSIM_S7_LISTEN=host:port)\n", .{});
         return error.SkipZigTest;
     };
     const ep = splitEndpoint(endpoint) orelse return error.SkipZigTest;
@@ -1080,7 +1093,7 @@ test "live: a real S7 client drives a simulated CPU, and sees it go to STOP" {
 test "live: a real OPC UA client drives a simulated server, and sees BadDeviceFailure" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const endpoint = envVar("FLEETSIM_OPCUA_LISTEN") orelse {
-        std.debug.print("SKIPPED: live fleetsim OPC UA (set FLEETSIM_OPCUA_LISTEN=host:port)\n", .{});
+        if (verboseSkip()) std.debug.print("SKIPPED: live fleetsim OPC UA (set FLEETSIM_OPCUA_LISTEN=host:port)\n", .{});
         return error.SkipZigTest;
     };
     const ep = splitEndpoint(endpoint) orelse return error.SkipZigTest;
@@ -1142,7 +1155,7 @@ test "live: a real OPC UA client drives a simulated server, and sees BadDeviceFa
 test "live: two real masters, two nodes, one binding thread" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const endpoint = envVar("FLEETSIM_MULTI_LISTEN") orelse {
-        std.debug.print("SKIPPED: live fleetsim multi-peer (set FLEETSIM_MULTI_LISTEN=host:portA,portB)\n", .{});
+        if (verboseSkip()) std.debug.print("SKIPPED: live fleetsim multi-peer (set FLEETSIM_MULTI_LISTEN=host:portA,portB)\n", .{});
         return error.SkipZigTest;
     };
     const comma = std.mem.indexOfScalar(u8, endpoint, ',') orelse return error.SkipZigTest;
@@ -1205,7 +1218,7 @@ test "live: two real masters, two nodes, one binding thread" {
 test "live: a real Modbus master drives a simulated slave over the TCP binding" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const endpoint = envVar("FLEETSIM_TEST_LISTEN") orelse {
-        std.debug.print("SKIPPED: live fleetsim Modbus (set FLEETSIM_TEST_LISTEN=host:port)\n", .{});
+        if (verboseSkip()) std.debug.print("SKIPPED: live fleetsim Modbus (set FLEETSIM_TEST_LISTEN=host:port)\n", .{});
         return error.SkipZigTest;
     };
     const ep = splitEndpoint(endpoint) orelse return error.SkipZigTest;
@@ -1250,11 +1263,11 @@ test "live: a real Modbus master drives a simulated slave over the TCP binding" 
         .max_sessions = 8,
     }) catch |e| switch (e) {
         error.BindFailed => {
-            std.debug.print("SKIPPED: live fleetsim Modbus (cannot bind {s})\n", .{endpoint});
+            if (verboseSkip()) std.debug.print("SKIPPED: live fleetsim Modbus (cannot bind {s})\n", .{endpoint});
             return error.SkipZigTest;
         },
         error.NoPeer => {
-            std.debug.print("SKIPPED: live fleetsim Modbus (no peer connected)\n", .{});
+            if (verboseSkip()) std.debug.print("SKIPPED: live fleetsim Modbus (no peer connected)\n", .{});
             return error.SkipZigTest;
         },
         else => return e,
@@ -1273,7 +1286,7 @@ test "live: a real Modbus master drives a simulated slave over the TCP binding" 
 test "live: a real EtherNet/IP master drives a simulated adapter" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const endpoint = envVar("FLEETSIM_ENIP_LISTEN") orelse {
-        std.debug.print("SKIPPED: live fleetsim EtherNet/IP (set FLEETSIM_ENIP_LISTEN=host:port)\n", .{});
+        if (verboseSkip()) std.debug.print("SKIPPED: live fleetsim EtherNet/IP (set FLEETSIM_ENIP_LISTEN=host:port)\n", .{});
         return error.SkipZigTest;
     };
     const ep = splitEndpoint(endpoint) orelse return error.SkipZigTest;
@@ -1338,7 +1351,7 @@ test "live: a real EtherNet/IP master drives a simulated adapter" {
 test "live: a real BACnet client discovers a simulated device over UDP" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const endpoint = envVar("FLEETSIM_BACNET_LISTEN") orelse {
-        std.debug.print("SKIPPED: live fleetsim BACnet (set FLEETSIM_BACNET_LISTEN=host:port)\n", .{});
+        if (verboseSkip()) std.debug.print("SKIPPED: live fleetsim BACnet (set FLEETSIM_BACNET_LISTEN=host:port)\n", .{});
         return error.SkipZigTest;
     };
     const ep = splitEndpoint(endpoint) orelse return error.SkipZigTest;
@@ -1387,7 +1400,7 @@ test "live: a real BACnet client discovers a simulated device over UDP" {
         .run_ms = live_run_ms,
     }) catch |e| switch (e) {
         error.BindFailed => {
-            std.debug.print("SKIPPED: live fleetsim BACnet (cannot bind {s})\n", .{endpoint});
+            if (verboseSkip()) std.debug.print("SKIPPED: live fleetsim BACnet (cannot bind {s})\n", .{endpoint});
             return error.SkipZigTest;
         },
         else => return e,

@@ -37,6 +37,18 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+
+// Skip diagnostics are opt-in: `zig build test` must be silent on
+// success (any stderr triggers the build runner's `failed command:`
+// line even when the step succeeded), while the skip *count* still
+// shows up in the summary regardless. Set ZIG_LIBS_VERBOSE_SKIP to any
+// non-empty value to see the reasons. (std.posix.getenv doesn't exist
+// in 0.16 — std.testing.environ + Environ.getPosix is the repo's
+// existing env-read pattern for tests, see netconf's `envVar`.)
+fn verboseSkip() bool {
+    const v = std.process.Environ.getPosix(std.testing.environ, "ZIG_LIBS_VERBOSE_SKIP") orelse return false;
+    return v.len > 0;
+}
 const linux = std.os.linux;
 const netlink = @import("netlink");
 
@@ -494,7 +506,7 @@ const test_table = "zig_nftables_live";
 fn liveSocket(what: []const u8) ?Socket {
     if (builtin.os.tag != .linux) return null;
     var sock = Socket.open(testing.allocator) catch |err| {
-        std.debug.print(
+        if (verboseSkip()) std.debug.print(
             "\nLIVE nftables {s} test SKIPPED: cannot open a NETLINK_NETFILTER socket ({s}).\n",
             .{ what, @errorName(err) },
         );
@@ -506,7 +518,7 @@ fn liveSocket(what: []const u8) ?Socket {
 }
 
 fn skipUnprivileged(sock: *Socket, what: []const u8, err: anyerror) void {
-    std.debug.print(
+    if (verboseSkip()) std.debug.print(
         "\nLIVE nftables {s} test SKIPPED: the kernel refused the batch ({s}{s}{s}) — " ++
             "run it as `unshare -rn zig build test-nftables`.\n",
         .{

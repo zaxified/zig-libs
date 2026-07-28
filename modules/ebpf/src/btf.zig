@@ -68,6 +68,18 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+
+// Skip diagnostics are opt-in: `zig build test` must be silent on
+// success (any stderr triggers the build runner's `failed command:`
+// line even when the step succeeded), while the skip *count* still
+// shows up in the summary regardless. Set ZIG_LIBS_VERBOSE_SKIP to any
+// non-empty value to see the reasons. (std.posix.getenv doesn't exist
+// in 0.16 — std.testing.environ + Environ.getPosix is the repo's
+// existing env-read pattern for tests, see netconf's `envVar`.)
+fn verboseSkip() bool {
+    const v = std.process.Environ.getPosix(std.testing.environ, "ZIG_LIBS_VERBOSE_SKIP") orelse return false;
+    return v.len > 0;
+}
 const linux = std.os.linux;
 const BPF = linux.BPF;
 const std_btf = BPF.btf;
@@ -1930,7 +1942,7 @@ fn kernelBtfAvailable() bool {
 test "real kernel BTF: /sys/kernel/btf/vmlinux parses and resolves" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     if (!kernelBtfAvailable()) {
-        std.debug.print(
+        if (verboseSkip()) std.debug.print(
             "\nSKIPPED: ebpf.btf kernel test — {s} not readable (CONFIG_DEBUG_INFO_BTF=n?).\n",
             .{sysfs_vmlinux},
         );
@@ -1955,7 +1967,7 @@ test "real kernel BTF: /sys/kernel/btf/vmlinux parses and resolves" {
 
     // `struct task_struct` and a few members every kernel since ~2.6 has.
     const task = k.findByNameKind("task_struct", .@"struct") orelse {
-        std.debug.print("\nSKIPPED: no `struct task_struct` in this kernel's BTF.\n", .{});
+        if (verboseSkip()) std.debug.print("\nSKIPPED: no `struct task_struct` in this kernel's BTF.\n", .{});
         return;
     };
     {
@@ -2070,7 +2082,7 @@ test "real kernel BTF: /sys/kernel/btf/vmlinux parses and resolves" {
 test "real kernel BTF: a module's split BTF resolves only with vmlinux as its base" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     if (!kernelBtfAvailable()) {
-        std.debug.print("\nSKIPPED: ebpf.btf module-BTF test — no kernel BTF.\n", .{});
+        if (verboseSkip()) std.debug.print("\nSKIPPED: ebpf.btf module-BTF test — no kernel BTF.\n", .{});
         return;
     }
     const gpa = testing.allocator;
@@ -2118,10 +2130,11 @@ test "real kernel BTF: a module's split BTF resolves only with vmlinux as its ba
         defer gpa.free(bytes);
         try testing.expectError(error.SplitBtfNeedsBase, parse(gpa, bytes, .{}));
 
-        std.debug.print("\nebpf.btf: verified split BTF against module `{s}` ({d} types, ids from {d}).\n", .{ name, m.typeCount(), m.start_id });
+        // Informational, not a failure — same stderr rule as the skip reasons.
+        if (verboseSkip()) std.debug.print("\nebpf.btf: verified split BTF against module `{s}` ({d} types, ids from {d}).\n", .{ name, m.typeCount(), m.start_id });
         return;
     }
-    std.debug.print("\nSKIPPED: ebpf.btf module-BTF test — none of the candidate modules has BTF here.\n", .{});
+    if (verboseSkip()) std.debug.print("\nSKIPPED: ebpf.btf module-BTF test — none of the candidate modules has BTF here.\n", .{});
 }
 
 test "loadModule rejects a name that could escape /sys/kernel/btf" {
@@ -2158,7 +2171,7 @@ test "LIVE: BPF_BTF_LOAD accepts a blob this module built" {
     }
 
     if (linux.geteuid() != 0) {
-        std.debug.print(
+        if (verboseSkip()) std.debug.print(
             "\nSKIPPED: LIVE ebpf.btf BPF_BTF_LOAD — needs CAP_BPF (running as uid {d}).\n",
             .{linux.geteuid()},
         );
@@ -2167,7 +2180,7 @@ test "LIVE: BPF_BTF_LOAD accepts a blob this module built" {
 
     var log: [4096]u8 = undefined;
     const fd = loadIntoKernel(blob, &log) catch |e| {
-        std.debug.print("\nSKIPPED: LIVE ebpf.btf BPF_BTF_LOAD refused ({s}): {s}\n", .{ @errorName(e), std.mem.sliceTo(&log, 0) });
+        if (verboseSkip()) std.debug.print("\nSKIPPED: LIVE ebpf.btf BPF_BTF_LOAD refused ({s}): {s}\n", .{ @errorName(e), std.mem.sliceTo(&log, 0) });
         return;
     };
     defer _ = linux.close(fd);

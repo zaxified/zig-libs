@@ -69,6 +69,18 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+
+// Skip diagnostics are opt-in: `zig build test` must be silent on
+// success (any stderr triggers the build runner's `failed command:`
+// line even when the step succeeded), while the skip *count* still
+// shows up in the summary regardless. Set ZIG_LIBS_VERBOSE_SKIP to any
+// non-empty value to see the reasons. (std.posix.getenv doesn't exist
+// in 0.16 — std.testing.environ + Environ.getPosix is the repo's
+// existing env-read pattern for tests, see netconf's `envVar`.)
+fn verboseSkip() bool {
+    const v = std.process.Environ.getPosix(std.testing.environ, "ZIG_LIBS_VERBOSE_SKIP") orelse return false;
+    return v.len > 0;
+}
 const linux = std.os.linux;
 const native_endian = builtin.cpu.arch.endian();
 
@@ -2739,7 +2751,7 @@ test "integration: address dump has a loopback address on lo" {
         // A fresh network namespace (`unshare -rn zig build test-netlink`)
         // starts with `lo` down and unaddressed — the kernel really does
         // report nothing, which is not a failure of this module.
-        std.debug.print(
+        if (verboseSkip()) std.debug.print(
             "SKIPPED (loopback address): the namespace has no addresses at all\n",
             .{},
         );
@@ -2883,7 +2895,7 @@ test "integration (netns): link/address/route/neighbor write→read round-trip" 
     switch (linux.errno(rc)) {
         .SUCCESS => {},
         else => {
-            std.debug.print("SKIPPED (netns round-trip): fork() not permitted\n", .{});
+            if (verboseSkip()) std.debug.print("SKIPPED (netns round-trip): fork() not permitted\n", .{});
             return error.SkipZigTest;
         },
     }
@@ -2916,7 +2928,7 @@ test "integration (netns): link/address/route/neighbor write→read round-trip" 
     switch (@as(u8, @truncate(status >> 8))) {
         0 => {},
         netns_skip => {
-            std.debug.print(
+            if (verboseSkip()) std.debug.print(
                 "SKIPPED (netns round-trip): no CLONE_NEWUSER/CLONE_NEWNET here — " ++
                     "re-run as root or under `unshare -rn` for live write coverage\n",
                 .{},
@@ -3121,7 +3133,7 @@ test "integration (netns): bridge/FDB/VLAN/brport write→read round-trip" {
     switch (linux.errno(rc)) {
         .SUCCESS => {},
         else => {
-            std.debug.print("SKIPPED (netns bridge round-trip): fork() not permitted\n", .{});
+            if (verboseSkip()) std.debug.print("SKIPPED (netns bridge round-trip): fork() not permitted\n", .{});
             return error.SkipZigTest;
         },
     }
@@ -3152,7 +3164,7 @@ test "integration (netns): bridge/FDB/VLAN/brport write→read round-trip" {
     switch (@as(u8, @truncate(status >> 8))) {
         0 => {},
         netns_skip => {
-            std.debug.print(
+            if (verboseSkip()) std.debug.print(
                 "SKIPPED (netns bridge round-trip): no CLONE_NEWUSER/CLONE_NEWNET or no " ++
                     "bridge/veth driver here — re-run as root or under `unshare -rn` " ++
                     "for live bridge coverage\n",

@@ -61,6 +61,18 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+
+// Skip diagnostics are opt-in: `zig build test` must be silent on
+// success (any stderr triggers the build runner's `failed command:`
+// line even when the step succeeded), while the skip *count* still
+// shows up in the summary regardless. Set ZIG_LIBS_VERBOSE_SKIP to any
+// non-empty value to see the reasons. (std.posix.getenv doesn't exist
+// in 0.16 — std.testing.environ + Environ.getPosix is the repo's
+// existing env-read pattern for tests, see netconf's `envVar`.)
+fn verboseSkip() bool {
+    const v = std.process.Environ.getPosix(std.testing.environ, "ZIG_LIBS_VERBOSE_SKIP") orelse return false;
+    return v.len > 0;
+}
 const linux = std.os.linux;
 const BPF = linux.BPF;
 const attach = @import("attach.zig");
@@ -1185,7 +1197,7 @@ test "parseCpuList handles the kernel's range/comma syntax" {
 test "onlineCpus reports at least one CPU on this machine" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const cpus = onlineCpus(testing.allocator) catch |e| {
-        std.debug.print("\nebpf perfbuf onlineCpus SKIPPED: {s}\n", .{@errorName(e)});
+        if (verboseSkip()) std.debug.print("\nebpf perfbuf onlineCpus SKIPPED: {s}\n", .{@errorName(e)});
         return;
     };
     defer testing.allocator.free(cpus);
@@ -1207,7 +1219,7 @@ test "PerfBuffer.open rejects a bad page count before any syscall" {
 test "LIVE: a real PERF_EVENT_ARRAY consumed end-to-end through a tracepoint" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     if (!hasBpfCapability()) {
-        std.debug.print(
+        if (verboseSkip()) std.debug.print(
             "\nLIVE ebpf perfbuf test SKIPPED: needs CAP_BPF+CAP_PERFMON (running as uid {d}).\n",
             .{linux.geteuid()},
         );
@@ -1217,20 +1229,20 @@ test "LIVE: a real PERF_EVENT_ARRAY consumed end-to-end through a tracepoint" {
     const load = @import("load.zig").load;
 
     const cpus = onlineCpus(testing.allocator) catch {
-        std.debug.print("\nLIVE ebpf perfbuf test SKIPPED: cannot enumerate CPUs.\n", .{});
+        if (verboseSkip()) std.debug.print("\nLIVE ebpf perfbuf test SKIPPED: cannot enumerate CPUs.\n", .{});
         return;
     };
     defer testing.allocator.free(cpus);
 
     // key = u32 cpu, value = u32 perf fd, one slot per CPU.
     const map_fd = BPF.map_create(.perf_event_array, 4, 4, @intCast(cpus.len)) catch {
-        std.debug.print("\nLIVE ebpf perfbuf test SKIPPED: BPF_MAP_CREATE(.perf_event_array) refused.\n", .{});
+        if (verboseSkip()) std.debug.print("\nLIVE ebpf perfbuf test SKIPPED: BPF_MAP_CREATE(.perf_event_array) refused.\n", .{});
         return;
     };
     defer _ = linux.close(map_fd);
 
     var pb = PerfBuffer.open(testing.allocator, map_fd, .{ .pages = 8 }) catch |e| {
-        std.debug.print("\nLIVE ebpf perfbuf test SKIPPED: PerfBuffer.open failed ({s}).\n", .{@errorName(e)});
+        if (verboseSkip()) std.debug.print("\nLIVE ebpf perfbuf test SKIPPED: PerfBuffer.open failed ({s}).\n", .{@errorName(e)});
         return;
     };
     defer pb.close();
@@ -1271,13 +1283,13 @@ test "LIVE: a real PERF_EVENT_ARRAY consumed end-to-end through a tracepoint" {
         BPF.Insn.exit(),
     };
     const prog_fd = load(.{ .prog_type = .tracepoint, .insns = &insns }, "MIT") catch |e| {
-        std.debug.print("\nLIVE ebpf perfbuf test SKIPPED: BPF_PROG_LOAD refused ({s}).\n", .{@errorName(e)});
+        if (verboseSkip()) std.debug.print("\nLIVE ebpf perfbuf test SKIPPED: BPF_PROG_LOAD refused ({s}).\n", .{@errorName(e)});
         return;
     };
     defer _ = linux.close(prog_fd);
 
     var tp = attach.attachTracepoint(testing.allocator, "syscalls", "sys_enter_write", prog_fd) catch |e| {
-        std.debug.print("\nLIVE ebpf perfbuf test SKIPPED: tracepoint attach failed ({s}).\n", .{@errorName(e)});
+        if (verboseSkip()) std.debug.print("\nLIVE ebpf perfbuf test SKIPPED: tracepoint attach failed ({s}).\n", .{@errorName(e)});
         return;
     };
     defer tp.deinit();

@@ -45,6 +45,18 @@
 
 const std = @import("std");
 
+// Skip diagnostics are opt-in: `zig build test` must be silent on
+// success (any stderr triggers the build runner's `failed command:`
+// line even when the step succeeded), while the skip *count* still
+// shows up in the summary regardless. Set ZIG_LIBS_VERBOSE_SKIP to any
+// non-empty value to see the reasons. (std.posix.getenv doesn't exist
+// in 0.16 — std.testing.environ + Environ.getPosix is the repo's
+// existing env-read pattern for tests, see netconf's `envVar`.)
+fn verboseSkip() bool {
+    const v = std.process.Environ.getPosix(std.testing.environ, "ZIG_LIBS_VERBOSE_SKIP") orelse return false;
+    return v.len > 0;
+}
+
 pub const meta = .{
     // Codecs, state machines, client PDU logic and the responder are pure
     // computation; only the optional TcpTransport touches std.Io.net.
@@ -418,7 +430,7 @@ fn onLiveReport(_: *anyopaque, r: Report) void {
 // (default `simpleIOGenericIO`).
 test "live: our client against a real IEC 61850 server" {
     const endpoint = envVar("IEC61850_TEST_SERVER") orelse {
-        std.debug.print("SKIPPED: live IEC 61850 client (set IEC61850_TEST_SERVER=host:port)\n", .{});
+        if (verboseSkip()) std.debug.print("SKIPPED: live IEC 61850 client (set IEC61850_TEST_SERVER=host:port)\n", .{});
         return error.SkipZigTest;
     };
     const ep = splitEndpoint(endpoint) orelse return error.SkipZigTest;
@@ -430,7 +442,7 @@ test "live: our client against a real IEC 61850 server" {
 
     const addr = std.Io.net.IpAddress.parse(ep.host, ep.port) catch return error.SkipZigTest;
     var tt = TcpTransport.connect(io, addr) catch {
-        std.debug.print("SKIPPED: live IEC 61850 client (cannot connect to {s})\n", .{endpoint});
+        if (verboseSkip()) std.debug.print("SKIPPED: live IEC 61850 client (cannot connect to {s})\n", .{endpoint});
         return error.SkipZigTest;
     };
     defer tt.close();
@@ -545,7 +557,7 @@ fn onLiveNotification(_: *anyopaque, n: control.Notification) void {
 // IEC61850_TEST_CONTROL_LD names the logical device.
 test "live: our client operating a real IED through every control model" {
     const endpoint = envVar("IEC61850_TEST_CONTROL") orelse {
-        std.debug.print("SKIPPED: live IEC 61850 control (set IEC61850_TEST_CONTROL=host:port)\n", .{});
+        if (verboseSkip()) std.debug.print("SKIPPED: live IEC 61850 control (set IEC61850_TEST_CONTROL=host:port)\n", .{});
         return error.SkipZigTest;
     };
     const ep = splitEndpoint(endpoint) orelse return error.SkipZigTest;
@@ -557,7 +569,7 @@ test "live: our client operating a real IED through every control model" {
 
     const addr = std.Io.net.IpAddress.parse(ep.host, ep.port) catch return error.SkipZigTest;
     var tt = TcpTransport.connect(io, addr) catch {
-        std.debug.print("SKIPPED: live IEC 61850 control (cannot connect to {s})\n", .{endpoint});
+        if (verboseSkip()) std.debug.print("SKIPPED: live IEC 61850 control (cannot connect to {s})\n", .{endpoint});
         return error.SkipZigTest;
     };
     defer tt.close();
@@ -655,11 +667,11 @@ test "live: our client operating a real IED through every control model" {
 //   IEC61850_TEST_SCL_IED=<IED name>   (default: the file's only IED)
 test "live: an SCL file resolves to exactly the names the IED it configures serves" {
     const path = envVar("IEC61850_TEST_SCL_FILE") orelse {
-        std.debug.print("SKIPPED: live SCL round trip (set IEC61850_TEST_SCL_FILE=<path>)\n", .{});
+        if (verboseSkip()) std.debug.print("SKIPPED: live SCL round trip (set IEC61850_TEST_SCL_FILE=<path>)\n", .{});
         return error.SkipZigTest;
     };
     const endpoint = envVar("IEC61850_TEST_SCL_SERVER") orelse {
-        std.debug.print("SKIPPED: live SCL round trip (set IEC61850_TEST_SCL_SERVER=host:port)\n", .{});
+        if (verboseSkip()) std.debug.print("SKIPPED: live SCL round trip (set IEC61850_TEST_SCL_SERVER=host:port)\n", .{});
         return error.SkipZigTest;
     };
     const ep = splitEndpoint(endpoint) orelse return error.SkipZigTest;
@@ -704,7 +716,7 @@ test "live: an SCL file resolves to exactly the names the IED it configures serv
     // The live IED.
     const addr = std.Io.net.IpAddress.parse(ep.host, ep.port) catch return error.SkipZigTest;
     var tt = TcpTransport.connect(io, addr) catch {
-        std.debug.print("SKIPPED: live SCL round trip (cannot connect to {s})\n", .{endpoint});
+        if (verboseSkip()) std.debug.print("SKIPPED: live SCL round trip (cannot connect to {s})\n", .{endpoint});
         return error.SkipZigTest;
     };
     defer tt.close();
@@ -812,7 +824,7 @@ test "live: an SCL file resolves to exactly the names the IED it configures serv
 // and its `stVal` under `ST`.
 test "live: a real IEC 61850 client operating our control objects" {
     const endpoint = envVar("IEC61850_TEST_LISTEN_CONTROL") orelse {
-        std.debug.print("SKIPPED: live control server (set IEC61850_TEST_LISTEN_CONTROL=host:port)\n", .{});
+        if (verboseSkip()) std.debug.print("SKIPPED: live control server (set IEC61850_TEST_LISTEN_CONTROL=host:port)\n", .{});
         return error.SkipZigTest;
     };
     const ep = splitEndpoint(endpoint) orelse return error.SkipZigTest;
@@ -822,7 +834,7 @@ test "live: a real IEC 61850 client operating our control objects" {
     const io = threaded.io();
     const addr = std.Io.net.IpAddress.parse(ep.host, ep.port) catch return error.SkipZigTest;
     var listener = addr.listen(io, .{ .reuse_address = true }) catch {
-        std.debug.print("SKIPPED: live control server (cannot bind {s})\n", .{endpoint});
+        if (verboseSkip()) std.debug.print("SKIPPED: live control server (cannot bind {s})\n", .{endpoint});
         return error.SkipZigTest;
     };
     defer listener.socket.close(io);
@@ -907,7 +919,7 @@ test "live: a real IEC 61850 client operating our control objects" {
         tt.close();
     }
     if (served == 0) {
-        std.debug.print("SKIPPED: live control server (no peer connected)\n", .{});
+        if (verboseSkip()) std.debug.print("SKIPPED: live control server (no peer connected)\n", .{});
         return error.SkipZigTest;
     }
     var operated: usize = 0;
@@ -925,7 +937,7 @@ test "live: a real IEC 61850 client operating our control objects" {
 // Set IEC61850_TEST_LISTEN=host:port and point a real IEC 61850 client at it.
 test "live: a real IEC 61850 client against our server" {
     const endpoint = envVar("IEC61850_TEST_LISTEN") orelse {
-        std.debug.print("SKIPPED: live IEC 61850 server (set IEC61850_TEST_LISTEN=host:port)\n", .{});
+        if (verboseSkip()) std.debug.print("SKIPPED: live IEC 61850 server (set IEC61850_TEST_LISTEN=host:port)\n", .{});
         return error.SkipZigTest;
     };
     const ep = splitEndpoint(endpoint) orelse return error.SkipZigTest;
@@ -936,7 +948,7 @@ test "live: a real IEC 61850 client against our server" {
 
     const addr = std.Io.net.IpAddress.parse(ep.host, ep.port) catch return error.SkipZigTest;
     var listener = addr.listen(io, .{ .reuse_address = true }) catch {
-        std.debug.print("SKIPPED: live IEC 61850 server (cannot bind {s})\n", .{endpoint});
+        if (verboseSkip()) std.debug.print("SKIPPED: live IEC 61850 server (cannot bind {s})\n", .{endpoint});
         return error.SkipZigTest;
     };
     defer listener.socket.close(io);
@@ -987,7 +999,7 @@ test "live: a real IEC 61850 client against our server" {
         tt.close();
     }
     if (served == 0) {
-        std.debug.print("SKIPPED: live IEC 61850 server (no peer connected)\n", .{});
+        if (verboseSkip()) std.debug.print("SKIPPED: live IEC 61850 server (no peer connected)\n", .{});
         return error.SkipZigTest;
     }
     std.debug.print(
@@ -1025,7 +1037,7 @@ fn emitInto(buf: []u8, seed: Seed) !usize {
 // `transport.zig` about wiring the sibling `rawsock` module.
 test "live: real GOOSE frames through the subscriber" {
     const path = envVar("IEC61850_TEST_GOOSE_HEX") orelse {
-        std.debug.print("SKIPPED: live GOOSE replay (set IEC61850_TEST_GOOSE_HEX=<file>)\n", .{});
+        if (verboseSkip()) std.debug.print("SKIPPED: live GOOSE replay (set IEC61850_TEST_GOOSE_HEX=<file>)\n", .{});
         return error.SkipZigTest;
     };
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
@@ -1033,7 +1045,7 @@ test "live: real GOOSE frames through the subscriber" {
     const io = threaded.io();
     var text_buf: [1 << 20]u8 = undefined;
     const text = std.Io.Dir.cwd().readFile(io, path, &text_buf) catch {
-        std.debug.print("SKIPPED: live GOOSE replay (cannot read {s})\n", .{path});
+        if (verboseSkip()) std.debug.print("SKIPPED: live GOOSE replay (cannot read {s})\n", .{path});
         return error.SkipZigTest;
     };
 
@@ -1093,7 +1105,7 @@ test "live: real GOOSE frames through the subscriber" {
 // produced is pushed out unsolicited.
 test "live: a real IEC 61850 client subscribing to reports from our server" {
     const endpoint = envVar("IEC61850_TEST_LISTEN_REPORT") orelse {
-        std.debug.print("SKIPPED: live reporting server (set IEC61850_TEST_LISTEN_REPORT=host:port)\n", .{});
+        if (verboseSkip()) std.debug.print("SKIPPED: live reporting server (set IEC61850_TEST_LISTEN_REPORT=host:port)\n", .{});
         return error.SkipZigTest;
     };
     const ep = splitEndpoint(endpoint) orelse return error.SkipZigTest;
@@ -1103,7 +1115,7 @@ test "live: a real IEC 61850 client subscribing to reports from our server" {
     const io = threaded.io();
     const addr = std.Io.net.IpAddress.parse(ep.host, ep.port) catch return error.SkipZigTest;
     var listener = addr.listen(io, .{ .reuse_address = true }) catch {
-        std.debug.print("SKIPPED: live reporting server (cannot bind {s})\n", .{endpoint});
+        if (verboseSkip()) std.debug.print("SKIPPED: live reporting server (cannot bind {s})\n", .{endpoint});
         return error.SkipZigTest;
     };
     defer listener.socket.close(io);
@@ -1297,7 +1309,7 @@ test "live: a real IEC 61850 client subscribing to reports from our server" {
         tt.close();
     }
     if (served == 0) {
-        std.debug.print("SKIPPED: live reporting server (no peer connected)\n", .{});
+        if (verboseSkip()) std.debug.print("SKIPPED: live reporting server (no peer connected)\n", .{});
         return error.SkipZigTest;
     }
     std.debug.print(
@@ -1320,7 +1332,7 @@ test "live: a real IEC 61850 client subscribing to reports from our server" {
 // third-party tool can be pointed at it.
 test "live: an SCL file survives parse → emit → parse with an identical name space" {
     const path = envVar("IEC61850_TEST_SCL_FILE") orelse {
-        std.debug.print("SKIPPED: live SCL emission (set IEC61850_TEST_SCL_FILE=<path>)\n", .{});
+        if (verboseSkip()) std.debug.print("SKIPPED: live SCL emission (set IEC61850_TEST_SCL_FILE=<path>)\n", .{});
         return error.SkipZigTest;
     };
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
@@ -1328,18 +1340,18 @@ test "live: an SCL file survives parse → emit → parse with an identical name
     const io = threaded.io();
 
     const source = std.Io.Dir.cwd().readFileAlloc(io, path, testing.allocator, .unlimited) catch {
-        std.debug.print("SKIPPED: live SCL emission (cannot read {s})\n", .{path});
+        if (verboseSkip()) std.debug.print("SKIPPED: live SCL emission (cannot read {s})\n", .{path});
         return error.SkipZigTest;
     };
     defer testing.allocator.free(source);
 
     var a = scl.parse(testing.allocator, source, .{ .allow_unknown_btype = true, .check_values = false }) catch |e| {
-        std.debug.print("SKIPPED: live SCL emission ({s} does not parse: {t})\n", .{ path, e });
+        if (verboseSkip()) std.debug.print("SKIPPED: live SCL emission ({s} does not parse: {t})\n", .{ path, e });
         return error.SkipZigTest;
     };
     defer a.deinit();
     if (a.ieds.len == 0) {
-        std.debug.print("SKIPPED: live SCL emission ({s} has no IED)\n", .{path});
+        if (verboseSkip()) std.debug.print("SKIPPED: live SCL emission ({s} has no IED)\n", .{path});
         return error.SkipZigTest;
     }
     const ied_name = envVar("IEC61850_TEST_SCL_IED") orelse a.ieds[0].name;
@@ -1347,7 +1359,7 @@ test "live: an SCL file survives parse → emit → parse with an identical name
     var model_a = scl.resolve(&a, testing.allocator, ied_name) catch |e| {
         // The *source* does not resolve — an `.scd` whose data sets reach into
         // another IED, most often. Nothing to say about the emitter here.
-        std.debug.print("SKIPPED: live SCL emission ({s} does not resolve: {t})\n", .{ path, e });
+        if (verboseSkip()) std.debug.print("SKIPPED: live SCL emission ({s} does not resolve: {t})\n", .{ path, e });
         return error.SkipZigTest;
     };
     defer model_a.deinit();
@@ -1395,7 +1407,7 @@ test "live: an SCL file survives parse → emit → parse with an identical name
 // reassembling.
 test "live: a real IEC 61850 client reassembling a segmented report from our server" {
     const endpoint = envVar("IEC61850_TEST_LISTEN_SEGMENT") orelse {
-        std.debug.print("SKIPPED: live segmented reporting (set IEC61850_TEST_LISTEN_SEGMENT=host:port)\n", .{});
+        if (verboseSkip()) std.debug.print("SKIPPED: live segmented reporting (set IEC61850_TEST_LISTEN_SEGMENT=host:port)\n", .{});
         return error.SkipZigTest;
     };
     const ep = splitEndpoint(endpoint) orelse return error.SkipZigTest;
@@ -1405,7 +1417,7 @@ test "live: a real IEC 61850 client reassembling a segmented report from our ser
     const io = threaded.io();
     const addr = std.Io.net.IpAddress.parse(ep.host, ep.port) catch return error.SkipZigTest;
     var listener = addr.listen(io, .{ .reuse_address = true }) catch {
-        std.debug.print("SKIPPED: live segmented reporting (cannot bind {s})\n", .{endpoint});
+        if (verboseSkip()) std.debug.print("SKIPPED: live segmented reporting (cannot bind {s})\n", .{endpoint});
         return error.SkipZigTest;
     };
     defer listener.socket.close(io);
@@ -1541,7 +1553,7 @@ test "live: a real IEC 61850 client reassembling a segmented report from our ser
         tt.close();
     }
     if (served == 0) {
-        std.debug.print("SKIPPED: live segmented reporting (no peer connected)\n", .{});
+        if (verboseSkip()) std.debug.print("SKIPPED: live segmented reporting (no peer connected)\n", .{});
         return error.SkipZigTest;
     }
     std.debug.print(
@@ -1575,7 +1587,7 @@ test "live: a real IEC 61850 client reassembling a segmented report from our ser
 // its own.
 test "live: two real IEC 61850 clients contending for one report control block" {
     const endpoint = envVar("IEC61850_TEST_LISTEN_RESV") orelse {
-        std.debug.print("SKIPPED: live RCB reservation (set IEC61850_TEST_LISTEN_RESV=host:port)\n", .{});
+        if (verboseSkip()) std.debug.print("SKIPPED: live RCB reservation (set IEC61850_TEST_LISTEN_RESV=host:port)\n", .{});
         return error.SkipZigTest;
     };
     const ep = splitEndpoint(endpoint) orelse return error.SkipZigTest;
@@ -1585,7 +1597,7 @@ test "live: two real IEC 61850 clients contending for one report control block" 
     const io = threaded.io();
     const addr = std.Io.net.IpAddress.parse(ep.host, ep.port) catch return error.SkipZigTest;
     var listener = addr.listen(io, .{ .reuse_address = true }) catch {
-        std.debug.print("SKIPPED: live RCB reservation (cannot bind {s})\n", .{endpoint});
+        if (verboseSkip()) std.debug.print("SKIPPED: live RCB reservation (cannot bind {s})\n", .{endpoint});
         return error.SkipZigTest;
     };
     defer listener.socket.close(io);
@@ -1656,7 +1668,7 @@ test "live: two real IEC 61850 clients contending for one report control block" 
     // blocking accept would starve whoever got in first.
     {
         const stream = listener.accept(io) catch {
-            std.debug.print("SKIPPED: live RCB reservation (no peer connected)\n", .{});
+            if (verboseSkip()) std.debug.print("SKIPPED: live RCB reservation (no peer connected)\n", .{});
             return error.SkipZigTest;
         };
         links[0] = TcpTransport.fromStream(io, stream);
