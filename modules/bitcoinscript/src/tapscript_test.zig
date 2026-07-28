@@ -17,9 +17,9 @@
 //!   output, sign the tapscript sighash with `bip340`, and verify): they
 //!   prove the CHECKSIG/CHECKSIGADD/OP_SUCCESS/budget wiring end-to-end, and
 //!   each has a positive control. They are NOT byte-exact against an
-//!   external transaction vector — a real `feature_taproot.py`-derived
-//!   consensus transaction vector is noted in the coordinator's
-//!   interop-vector backlog.
+//!   external transaction vector — for that, see `consensus_kat_test.zig`
+//!   (real Bitcoin Core `script_assets_test.json` consensus transactions,
+//!   added 2026-07-28; a representative slice, not the full corpus).
 
 const std = @import("std");
 const testing = std.testing;

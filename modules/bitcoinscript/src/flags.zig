@@ -49,9 +49,9 @@ pub const ScriptFlags = struct {
     /// operands — see `number.zig`) must use the shortest possible push
     /// opcode for their length.
     minimaldata: bool = false,
-    /// BIP341/342: enable taproot (P2TR) key-path (and, if implemented,
-    /// script-path) spending. This module implements key-path only —
-    /// script-path (tapscript) support is deferred (SPEC.md).
+    /// BIP341/342: enable taproot (P2TR) key-path AND script-path
+    /// (tapscript) spending — both are implemented (`verify.zig`'s
+    /// `verifyTaprootKeyPath`/`verifyTaprootScriptPath`; see SPEC.md).
     taproot: bool = false,
     /// Mempool-relay policy only (not consensus): `scriptSig` must be
     /// push-only, checked unconditionally at the very start of

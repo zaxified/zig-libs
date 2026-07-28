@@ -754,6 +754,54 @@ test "hostile: an unknown ODD top-level TLV type is silently discarded, decode s
     try testing.expectEqualStrings("still parses", offer.description.?);
 }
 
+// Byte-exact external KATs for `decodeOffer` — closes the gap the module
+// doc comment used to flag as self-round-trip-only ("a hand-built minimal
+// offer... independently constructed, not hand-typed hex"). Source:
+// `lightning/bolts` `bolt12/offers-test.json` (fetched from
+// raw.githubusercontent.com 2026-07-28; each `bolt12` string and `fields`
+// list below is reproduced verbatim, not hand-typed).
+const issuer_id_hex = "02eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619";
+
+test "BOLT#12 KAT: decodeOffer 'Minimal bolt12 offer' — offers-test.json" {
+    const allocator = testing.allocator;
+    const bolt12_str = "lno1zcss9mk8y3wkklfvevcrszlmu23kfrxh49px20665dqwmn4p72pksese";
+    var offer = try decodeOffer(allocator, bolt12_str);
+    defer offer.deinit(allocator);
+    const want_issuer_id = try hexAlloc(allocator, issuer_id_hex);
+    defer allocator.free(want_issuer_id);
+    try testing.expectEqualSlices(u8, want_issuer_id, &offer.issuer_id.?);
+    try testing.expect(offer.description == null);
+    try testing.expect(offer.amount == null);
+}
+
+test "BOLT#12 KAT: decodeOffer 'with description (but no amount)' — offers-test.json" {
+    const allocator = testing.allocator;
+    const bolt12_str = "lno1pgx9getnwss8vetrw3hhyuckyypwa3eyt44h6txtxquqh7lz5djge4afgfjn7k4rgrkuag0jsd5xvxg";
+    var offer = try decodeOffer(allocator, bolt12_str);
+    defer offer.deinit(allocator);
+    try testing.expectEqualStrings("Test vectors", offer.description.?);
+    const want_issuer_id = try hexAlloc(allocator, issuer_id_hex);
+    defer allocator.free(want_issuer_id);
+    try testing.expectEqualSlices(u8, want_issuer_id, &offer.issuer_id.?);
+    try testing.expect(offer.amount == null);
+}
+
+test "BOLT#12 KAT: decodeOffer 'with currency' (USD $100.00) — offers-test.json" {
+    const allocator = testing.allocator;
+    const bolt12_str = "lno1qcp4256ypqpzwyq2p32x2um5ypmx2cm5dae8x93pqthvwfzadd7jejes8q9lhc4rvjxd022zv5l44g6qah82ru5rdpnpj";
+    var offer = try decodeOffer(allocator, bolt12_str);
+    defer offer.deinit(allocator);
+    try testing.expectEqualStrings("USD", offer.currency.?);
+    try testing.expectEqual(@as(?u64, 10000), offer.amount); // $100.00 in cents
+    try testing.expectEqualStrings("Test vectors", offer.description.?);
+}
+
+test "BOLT#12 KAT: decodeOffer rejects an unknown EVEN TLV type (type 78) — offers-test.json 'Malformed'" {
+    const allocator = testing.allocator;
+    const bolt12_str = "lno1pgz5znzfgdz3vggzqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpysgr0u2xq4dh3kdevrf4zg6hx8a60jv0gxe0ptgyfc6xkryqqqqqqqq";
+    try testing.expectError(error.UnknownEvenType, decodeOffer(allocator, bolt12_str));
+}
+
 // ── BOLT#12 Merkle / signature tests ─────────────────────────────────────
 
 /// Decode a hex string (no separators, even length) into freshly-allocated
@@ -941,6 +989,54 @@ test "BOLT#12 round-trip: build+sign+decode+verify an invoice" {
     // Reject-tooth: tamper a value byte → verify fails.
     inv.raw[2] ^= 0x01;
     try testing.expect(!try inv.verify(allocator));
+}
+
+// Byte-exact external KAT for the `invoice` (`lni1`) Merkle root + signature
+// — closes the gap the module doc comment used to describe as unclosable
+// ("the official bolt12/signature-test.json ships an invoice_request worked
+// example but no invoice one"). That claim was true of `signature-test.json`
+// specifically, but NOT of the `bolt12/` directory as a whole: a full
+// `invoice` worked example (Merkle root, sighash, and BIP-340 signature) is
+// published in the sibling file `bolt12/payer-proof-test.json` (`lightning/
+// bolts`, "full_disclosure" vector), fetched from
+// `raw.githubusercontent.com/lightning/bolts/master/bolt12/payer-proof-test.json`
+// 2026-07-28 and reproduced byte-for-byte below (`invoice_hex`/
+// `invoice_merkle_root`/`invoice_signature`/the `invoice_node_id` keypair —
+// no byte hand-edited). `merkleRoot`/`verifyMerkle` run directly over the
+// raw TLV stream (not through `decodeInvoice`) since the vector carries
+// several payer-proof-specific field types (e.g. a private/experimental
+// type `3000000001`) this module's typed `Invoice` decoder doesn't model —
+// the Merkle/signature core under test doesn't need field-level semantics.
+test "BOLT#12 KAT: invoice Merkle root + signature verify — payer-proof-test.json 'full_disclosure'" {
+    const allocator = testing.allocator;
+    const invoice_hex = "0010000000000000000000000000000000001621024bc2a31265153f07e70e0bab08724e6b85e217f8cd628ceb62974247bb493382520203e858210324653eac434488002cc06bbfb7f10fe18991e35f9fe4302dbea6d2353dc0ab1ca076027f31ebc5462c1fdce1b737ecff52d37d75dea43ce11c74d25aa297165faa2007032c0b7cf95324a07d05398b240174dc0c2be444d96b159aa6c7f7b1e668680991" ++
+        "0102edabbd16b41c8371b92ef2f04c1185b4f03b6dcd52ba9b78d9d7c89c8f221145001000000000000000000000000000000000a21c00000001000000020003000000000000000400000000000000050000a40467527988a82072cd6e8422c407fb6d098690f1130b7ded7ec2f7f5e1d30bd9d521f015363793aa0203e8ae0d08000000000000000000000000b021024bc2a31265153f07e70e0bab08724e6b85e217f8cd628ceb62974247bb493382f040fbb932e6a9d5b4d88ca0ddc9cf9f8cc880ef41e3ec9574da89f624db898ab3e9d3ed6caa8744633b855167da009119d9834ae71f7b06f02732dc4c1debab0577feb2d05e010142";
+    const want_merkle = "cb9e0c81bb39fc244f9f523c748ab4de0e09f1a5fef74359c2e1f7cc7cdc7447";
+    const invoice_signature = "fbb932e6a9d5b4d88ca0ddc9cf9f8cc880ef41e3ec9574da89f624db898ab3e9d3ed6caa8744633b855167da009119d9834ae71f7b06f02732dc4c1debab0577";
+    // `invoice_node_id` (== `offer_issuer_id` here), x-only (33-byte
+    // compressed pubkey with the leading 0x02/0x03 parity byte stripped).
+    const invoice_node_id_xonly = "4bc2a31265153f07e70e0bab08724e6b85e217f8cd628ceb62974247bb493382";
+
+    const stream = try hexAlloc(allocator, invoice_hex);
+    defer allocator.free(stream);
+
+    const want_root = try hexAlloc(allocator, want_merkle);
+    defer allocator.free(want_root);
+    const root = try merkleRoot(allocator, stream);
+    try testing.expectEqualSlices(u8, want_root, &root);
+
+    const xonly_buf = try hexAlloc(allocator, invoice_node_id_xonly);
+    defer allocator.free(xonly_buf);
+    const xonly = xonly_buf[0..32].*;
+    const sig_buf = try hexAlloc(allocator, invoice_signature);
+    defer allocator.free(sig_buf);
+    const sig = sig_buf[0..64].*;
+    try testing.expect(try verifyMerkle(allocator, stream, invoice_sig_tag, xonly, sig));
+
+    // Teeth: flip one signature bit → verify fails (not errors).
+    var bad_sig = sig;
+    bad_sig[10] ^= 0x01;
+    try testing.expect(!try verifyMerkle(allocator, stream, invoice_sig_tag, xonly, bad_sig));
 }
 
 test "BOLT#12 Merkle: signature TLVs (240-1000) are excluded from the tree" {

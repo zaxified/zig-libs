@@ -122,10 +122,15 @@ builds+signs+encodes from caller-supplied ascending signature-free records.
 BOLT#4 route-blinding — a distinct spec), and `invoice`'s optional `invoice_blindedpay`/
 `invoice_fallbacks` sub-structures. These stay in the record stream / `raw` buffer and are not
 decoded; the signed-blob correctness (Merkle root + BIP-340 signature) and mandatory scalar fields
-are modelled fully. **Interop-vector caveat:** the `invoice` (`lni1`) sign/verify path is validated
-by sign→verify round-trip ONLY — the official `bolt12/signature-test.json` ships an `invoice_request`
-worked example but no `invoice` one, so `invoice` shares the (KAT-backed) Merkle+signature core but
-has no standalone external `invoice` signature vector.
+are modelled fully. **Interop-vector caveat, corrected 2026-07-28:** this section previously said the
+`invoice` (`lni1`) sign/verify path was validated by sign→verify round-trip ONLY, because
+`bolt12/signature-test.json` ships an `invoice_request` worked example but no `invoice` one. That
+was true of `signature-test.json` specifically but the claim was checked against the wrong file: the
+sibling `bolt12/payer-proof-test.json` (`lightning/bolts`) DOES publish a full `invoice` worked
+example (Merkle root, sighash, and BIP-340 signature — its `"full_disclosure"` vector), now wired in
+as an external byte-exact KAT (`bolt12.zig`, "BOLT#12 KAT: invoice Merkle root + signature verify").
+`invoice`'s Merkle+signature core is now externally anchored, same as `invoice_request`'s; only the
+*offer* round-trip (see the BOLT#12 offer note above) remains self-constructed.
 
 ## Verification
 
@@ -148,7 +153,12 @@ the spec's node ID — signer and verifier agree end-to-end.
 `bitpack.bytesToQuintets` → `bech32_raw.encodeNoChecksum` → `decodeOffer` (independently
 constructed, not hand-typed hex), `+`-continuation stripping, wrong-prefix rejection, and the
 generic TLV even/odd-unknown-type rules (reusing `lnwire`'s own machinery, not re-tested from
-scratch).
+scratch). **Externally anchored as of 2026-07-28**: `bolt12.zig` now also decodes 3 real `lno1…`
+strings byte-for-byte from `lightning/bolts` `bolt12/offers-test.json` ("Minimal bolt12 offer",
+"with description (but no amount)", "with currency" — the last cross-checks `currency`/`amount`/
+`description`/`issuer_id` all at once against the JSON's own field list) plus 1 real invalid vector
+("Malformed: unknown even TLV type 78") proving the even/odd rejection against a genuine malformed
+wire string, not just a self-constructed one.
 
 **BOLT#12 signature calculation**, byte-exact against the spec's own vectors
 (`lightning/bolts` `bolt12/signature-test.json`, "Signature Calculation"):
@@ -159,13 +169,21 @@ scratch).
   signature *reproduction* by signing with Bob's key + BIP-340 `aux_rand=0` (matches `b8f83ea3…`
   to the byte). Also decoded end-to-end from the KAT `lnr1…` string through the
   bech32/bitpack/TLV path.
+- **`invoice` worked example, externally anchored as of 2026-07-28** (`lightning/bolts`
+  `bolt12/payer-proof-test.json`, "full_disclosure" vector — NOT `signature-test.json`, which has
+  no `invoice` example; see the corrected interop-vector caveat above): Merkle root `cb9e0c81…`
+  reproduced byte-exact from the vector's raw `invoice_hex` TLV stream, and the published
+  `invoice_signature` (`fbb932e6…`) verifies against `invoice_node_id`'s x-only key over
+  `merkleRoot`+`invoice_sig_tag`. Run directly through `merkleRoot`/`verifyMerkle` (not
+  `decodeInvoice`) since the vector carries payer-proof-specific TLV types this module's typed
+  decoder doesn't model.
 - **Reject-teeth**: flipped signature bit → verify `false`; corrupted stream byte → verify `false`;
   swapped signer pubkey → verify `false`; length-overrun TLV → `error.Truncated`; empty /
   signature-only stream → `error.EmptyMerkleStream`; signature-TLV-exclusion invariant (a type-240
   record does not change the root).
 - **Round-trip**: `encodeSignedInvoiceRequest`/`encodeSignedInvoice` → decode → `verify` for both
-  `lnr1`/`lni1`. The `invoice` (`lni1`) path is **round-trip-only** (no external `invoice`
-  signature vector exists — see the BOLT#12 section's interop caveat).
+  `lnr1`/`lni1`, in addition to (not instead of) the externally-anchored `invoice` Merkle/signature
+  KAT above.
 
 Run: `zig build test-lninvoice` (Debug and `-Doptimize=ReleaseFast`).
 

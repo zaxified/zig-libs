@@ -91,6 +91,8 @@ test {
     _ = @import("e2e_test.zig");
     _ = @import("dos_test.zig");
     _ = @import("tapscript_test.zig");
+    _ = @import("consensus_kat_vectors.zig");
+    _ = @import("consensus_kat_test.zig");
 }
 
 test "meta.deps names bitcointx, k256, bip340, ripemd160" {

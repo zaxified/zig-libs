@@ -125,8 +125,17 @@ is now implemented end to end:
 external BIP341 vectors / `bitcointx`'s KAT-backed key-path sigMsg respectively. The end-to-end
 tapscript *spends* (`tapscript_test.zig`) are **constructed round-trips** (build output → sign the
 tapscript sighash → verify, each with a positive control), not byte-exact against an external
-consensus transaction vector. A real `feature_taproot.py`-derived transaction vector is noted for
-the coordinator's interop-vector backlog.
+consensus transaction vector — **but this gap is now separately closed** by
+`consensus_kat_test.zig`/`consensus_kat_vectors.zig` (2026-07-28): 5 real transactions
+machine-extracted, byte-for-byte, from Bitcoin Core's own
+`bitcoin-core/qa-assets:unit_test_data/script_assets_test.json` fuzz/unit corpus (the same corpus
+`src/test/script_tests.cpp`'s `script_assets_test` runs), each with a `success` witness that MUST
+verify and a `failure` witness (same tx/prevouts/flags) that MUST fail, run through the real
+`verifyScript` entry point (full tx deserialization + all inputs' spent outputs, not a stand-in).
+Covers: plain key-path spend, a script-path spend with an annex, an `OP_SUCCESSx` short-circuit, a
+control-block length-validation failure, and the unknown-leaf-version anyone-can-spend path. This
+is a representative slice, not exhaustive coverage of the corpus (2244 entries total) — widening it
+is left for the interop backlog.
 
 `FindAndDelete(vchSig)` (the historical per-signature literal-byte-removal quirk in `SignatureHash`,
 distinct from `FindAndDelete(OP_CODESEPARATOR)`, which IS implemented) is also out of scope — see
