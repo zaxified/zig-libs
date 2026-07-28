@@ -341,3 +341,26 @@ test "encode: TooLong rejected" {
     @memset(&data_buf, 0);
     try testing.expectError(error.TooLong, encode(&hrp_buf, &data_buf, .bech32));
 }
+
+// ── fuzz: bech32/bech32m string decode, never panics ────────────────────────
+//
+// `decode` is what runs on an address/invoice a user pastes in, or scans
+// from a QR code — attacker/user-controlled text with no structural
+// guarantee until the checksum is verified. Bias toward the bech32 charset
+// plus the '1' separator so the fuzzer gets past the length gate into the
+// charset/checksum math this file's own doc calls out as the real target.
+
+test "fuzz: decode never panics on arbitrary text" {
+    try testing.fuzz({}, fuzzDecode, .{});
+}
+
+fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
+    const alphabet = "qpzry9x8gf2tvdw0s3jn54khce6mua7l1"; // charset + separator
+    var buf: [128]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    for (buf[0..len]) |*c| {
+        if (smith.boolWeighted(1, 3)) c.* = alphabet[c.* % alphabet.len];
+    }
+    _ = decode(buf[0..len]) catch return;
+}

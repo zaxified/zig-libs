@@ -337,3 +337,22 @@ test "ARP garbage sweep: no panics on random input" {
         _ = EthIpv4.parse(buf[0..len]) catch {};
     }
 }
+
+// ── fuzz: ARP frame parse off the wire, never panics ────────────────────────
+//
+// `Packet.parse`/`EthIpv4.parse` run on raw Ethernet frames arriving on a
+// LAN segment — no authentication of any kind at this layer. The manual
+// PRNG sweep above predates the `Smith` harness convention this collection
+// standardises on; this drives the same boundary through `std.testing.fuzz`.
+
+test "fuzz: ARP parse never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzArpParse, .{});
+}
+
+fn fuzzArpParse(_: void, smith: *std.testing.Smith) !void {
+    var buf: [64]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    _ = Packet.parse(buf[0..len]) catch {};
+    _ = EthIpv4.parse(buf[0..len]) catch {};
+}

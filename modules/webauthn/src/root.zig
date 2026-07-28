@@ -598,3 +598,41 @@ test "smoke: module compiles and CoseKey.alg dispatch works" {
     const key: CoseKey = .{ .ec2 = .{ .alg = cbor.cose.alg_es256, .crv = cbor.cose.crv_p256, .x = &[_]u8{0} ** 32, .y = &[_]u8{0} ** 32 } };
     try std.testing.expectEqual(@as(?i64, cbor.cose.alg_es256), key.alg());
 }
+
+// ── fuzz: clientDataJSON + authenticatorData, never panic ──────────────────
+//
+// `parseClientData` runs on `clientDataJSON` — JSON the browser sends,
+// itself echoing an origin the *client* asserts (exactly the field a
+// malicious page controls). `parseAuthenticatorData` runs on
+// `authenticatorData`, a binary blob from the browser's WebAuthn API that
+// in turn embeds a CBOR credential public key — both are the untrusted
+// wire this collection's threat model calls out (a relying-party server
+// verifying a credential from an arbitrary client).
+
+test "fuzz: parseClientData never panics on arbitrary JSON" {
+    try std.testing.fuzz({}, fuzzParseClientData, .{});
+}
+
+fn fuzzParseClientData(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    _ = parseClientData(arena.allocator(), buf[0..len]) catch return;
+}
+
+test "fuzz: parseAuthenticatorData never panics on arbitrary bytes" {
+    try std.testing.fuzz({}, fuzzParseAuthenticatorData, .{});
+}
+
+fn fuzzParseAuthenticatorData(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    _ = parseAuthenticatorData(arena.allocator(), buf[0..len]) catch return;
+}

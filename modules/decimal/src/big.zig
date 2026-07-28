@@ -933,3 +933,27 @@ test "Fable worklist: div/rescale KAT (roundedDivMag)" {
         };
     }
 }
+
+// ── fuzz: arbitrary-precision decimal string parse, never panics ───────────
+//
+// Same untrusted-text boundary as `Decimal.parse`, but unbounded in
+// significand width — a hostile digit run of thousands of characters is
+// exactly the shape this arena-backed parser has to reject or accept
+// without a fixed-width assumption tripping it up.
+
+test "fuzz: parse never panics on arbitrary text" {
+    try testing.fuzz({}, fuzzParse, .{});
+}
+
+fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
+    const alphabet = "0123456789+-.eE";
+    var buf: [256]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    for (buf[0..len]) |*c| {
+        if (smith.boolWeighted(1, 4)) c.* = alphabet[c.* % alphabet.len];
+    }
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    _ = BigDecimal.parse(arena.allocator(), buf[0..len]) catch return;
+}

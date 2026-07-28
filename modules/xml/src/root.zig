@@ -1299,3 +1299,29 @@ test "unsupported: non-UTF-8 encoding declaration rejected" {
 test "unsupported: XML 1.1 version rejected" {
     try testing.expectError(error.UnsupportedVersion, parse(testing.allocator, "<?xml version=\"1.1\"?><a/>", .{}));
 }
+
+// ── fuzz: document parse off arbitrary bytes, never panics ─────────────────
+//
+// `parse` is the canonical XML fuzz target: this collection's own
+// `xmldsig`/`saml`/`xmlenc` all sit on top of it, so a crash here is a
+// crash in every one of them too. Bias the byte pool toward XML's own
+// syntax characters (`<>/="'&;`) so the fuzzer reaches the tag/attribute/
+// entity state machines instead of bouncing off "doesn't even start with
+// `<`" on the first byte.
+
+test "fuzz: parse never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzParse, .{});
+}
+
+fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
+    const alphabet = "<>/=\"'&;! ?abcCDATA0123\n\t";
+    var buf: [512]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    for (buf[0..len]) |*c| {
+        if (smith.boolWeighted(1, 3)) c.* = alphabet[c.* % alphabet.len];
+    }
+
+    var doc = parse(testing.allocator, buf[0..len], .{}) catch return;
+    doc.deinit();
+}

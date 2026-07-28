@@ -1148,6 +1148,40 @@ fn systemTar(gpa: Allocator, io: std.Io, cwd: std.Io.Dir, argv: []const []const 
     return error.ChildFailed;
 }
 
+// ── fuzz: streaming tar parse off an untrusted archive, never panics ───────
+//
+// `Reader.next`/`Reader.read` are what unpacks an archive that arrived over
+// the network or off disk — a hostile ustar/GNU header (bad checksum, a GNU
+// long-name/long-link payload, a base-256 size field near `maxInt(u64)`) is
+// exactly this parser's threat model per its own doc comment. Drive a full
+// entry-by-entry walk (headers + content) over fuzzed bytes the way a real
+// extractor would.
+
+test "fuzz: Reader.next/read never panic on an arbitrary archive" {
+    try testing.fuzz({}, fuzzReader, .{});
+}
+
+fn fuzzReader(_: void, smith: *std.testing.Smith) !void {
+    var buf: [4 * block_size]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+
+    var src: std.Io.Reader = .fixed(buf[0..len]);
+    var tr = Reader.init(testing.allocator, &src);
+    defer tr.deinit();
+
+    var content_buf: [256]u8 = undefined;
+    var entries: usize = 0;
+    while (entries < 16) : (entries += 1) {
+        const entry = (tr.next() catch return) orelse return;
+        _ = entry;
+        while (true) {
+            const n = tr.read(&content_buf) catch return;
+            if (n == 0) break;
+        }
+    }
+}
+
 test "GNU tar extracts + lists our archive (external cross-check)" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const gpa = testing.allocator;

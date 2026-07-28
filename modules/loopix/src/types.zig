@@ -327,3 +327,22 @@ test "MixHeader.decode fails closed on truncated / malformed input, never OOB" {
     try testing.expectEqual(MsgKind.real, g.kind);
     try testing.expectEqual(@as(u8, max_layers), g.n_hops);
 }
+
+// ── fuzz: mix header decode off the wire, never panics ──────────────────────
+//
+// `MixHeader.decode`'s doc already flags itself as the boundary that must
+// never trust a mixnet header blindly (each hop only sees what the previous
+// hop forwarded, which — outside the sim — is an untrusted peer's bytes).
+// The manual truncation/malformed sweep above is example-based; this adds
+// `Smith` corpus-guided coverage of the same function.
+
+test "fuzz: MixHeader.decode never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzMixHeaderDecode, .{});
+}
+
+fn fuzzMixHeaderDecode(_: void, smith: *std.testing.Smith) !void {
+    var buf: [64]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    _ = MixHeader.decode(buf[0..len]) catch return;
+}

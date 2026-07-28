@@ -315,3 +315,25 @@ test "p2wpkhWitnessProgram is exactly hash160(pubkey)" {
 
     try testing.expectEqualSlices(u8, &want, &got);
 }
+
+// ── fuzz: base58 / base58check string decode, never panics ─────────────────
+//
+// `decode`/`checkDecode` run on a Bitcoin address or extended key a user
+// pastes in — text with no structural guarantee (leading '1's, out-of-
+// alphabet characters, and the checksum are all attacker/user chosen).
+
+test "fuzz: decode/checkDecode never panic on arbitrary text" {
+    try testing.fuzz({}, fuzzDecode, .{});
+}
+
+fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
+    var buf: [128]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    for (buf[0..len]) |*c| {
+        if (smith.boolWeighted(1, 3)) c.* = alphabet[c.* % alphabet.len];
+    }
+    var out: [max_payload_len]u8 = undefined;
+    _ = decode(buf[0..len], &out) catch return;
+    _ = checkDecode(buf[0..len], &out) catch return;
+}

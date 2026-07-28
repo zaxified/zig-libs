@@ -696,6 +696,24 @@ test "parseResponse: malformed / truncated input never panics" {
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
+// ── fuzz: OCSP response DER decode off the wire, never panics ──────────────
+//
+// `parseResponse` is what a TLS/certificate-validation client runs on the
+// body of an HTTP response from an OCSP responder (or the raw bytes an
+// attacker-in-the-middle substitutes) — untrusted DER, no signature checked
+// yet at this layer.
+
+test "fuzz: parseResponse never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzParseResponse, .{});
+}
+
+fn fuzzParseResponse(_: void, smith: *std.testing.Smith) !void {
+    var buf: [512]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    _ = ocsp.parseResponse(buf[0..len]) catch return;
+}
+
 /// Extract the SubjectPublicKeyInfo TLV bytes from a certificate.
 fn spkiOf(cert: []const u8) ![]const u8 {
     const c = try elem(cert, 0);

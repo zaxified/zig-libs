@@ -561,3 +561,42 @@ test "decodeCloseBody: invalid UTF-8 reason is rejected" {
     const payload = [_]u8{ 0x03, 0xe8, 0xff, 0xfe }; // code=1000, invalid UTF-8 reason
     try testing.expectError(error.InvalidUtf8, decodeCloseBody(&payload));
 }
+
+// ── fuzz: frame parsing off the wire, never panics ──────────────────────────
+//
+// `parseFrame` is the first thing done with bytes read straight off a
+// WebSocket TCP socket — fully attacker-controlled, including the extended
+// length fields and the mask key. Drive it as a real reader loop would:
+// repeatedly parse-and-advance over a fuzzed buffer, so multi-frame streams
+// (and `.need_more` retries) are exercised, not just a single header.
+
+test "fuzz: parseFrame never panics on arbitrary bytes, server role" {
+    try testing.fuzz({}, fuzzParseFrameServer, .{});
+}
+
+fn fuzzParseFrameServer(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+
+    var off: usize = 0;
+    var iterations: usize = 0;
+    while (off < len and iterations < 64) : (iterations += 1) {
+        const result = parseFrame(buf[off..len], .server, 1 << 16) catch return;
+        switch (result) {
+            .need_more => return,
+            .frame => |f| off += f.consumed,
+        }
+    }
+}
+
+test "fuzz: decodeCloseBody never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzDecodeCloseBody, .{});
+}
+
+fn fuzzDecodeCloseBody(_: void, smith: *std.testing.Smith) !void {
+    var buf: [128]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    _ = decodeCloseBody(buf[0..len]) catch return;
+}

@@ -860,3 +860,20 @@ test "computeDigest: deterministic; equals plain HMAC when the region is already
     hmac.Hmac(hash.Md5).create(&full, &msg, &key);
     try testing.expectEqualSlices(u8, full[0..digest_len], &d1);
 }
+
+// ── fuzz: USM security-parameters decode, never panics ──────────────────────
+//
+// `parse` runs on the `msgSecurityParameters` OCTET STRING of an SNMPv3
+// datagram *before* the HMAC in `auth_params` has been checked — i.e. on
+// fully unauthenticated, attacker-controlled BER.
+
+test "fuzz: parse never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzParse, .{});
+}
+
+fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    _ = parse(buf[0..len]) catch return;
+}

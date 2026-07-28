@@ -521,3 +521,30 @@ test "CDP garbage sweep: no panics on random input" {
         _ = Frame.parse(buf[0..len], .{}) catch {};
     }
 }
+
+// ── fuzz: CDP frame parse off the wire, never panics ────────────────────────
+//
+// `Frame.parse` runs on a raw CDP multicast frame from any neighbour on the
+// LAN segment — no authentication at this layer. Fuzz with checksum
+// verification off (as the manual sweep above does) so the TLV/address
+// walker past the checksum gate is actually reached, plus once with default
+// options so the checksum path itself is exercised too.
+
+test "fuzz: CDP Frame.parse never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzCdpParse, .{});
+}
+
+fn fuzzCdpParse(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const bytes = buf[0..len];
+
+    if (Frame.parse(bytes, .{ .verify_checksum = false })) |f| {
+        if (f.addressIterator() catch null) |it_opt| {
+            var it = it_opt;
+            while (it.next() catch null) |_| {}
+        }
+    } else |_| {}
+    _ = Frame.parse(bytes, .{}) catch {};
+}

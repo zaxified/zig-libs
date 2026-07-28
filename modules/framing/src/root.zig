@@ -140,6 +140,27 @@ test "readFrame enforces max_frame even when the buffer is larger" {
     try t.expectError(error.FrameTooLarge, readFrame(&r, &roomy, .{ .max_frame = 8 }));
 }
 
+// ── fuzz: length-prefixed frame read off an untrusted stream, never panics ──
+//
+// `readFrame` is what any consumer of this framing (`ipcbus`, an
+// `EnvelopeCodec`-based protocol) runs directly on bytes from a socket or
+// pipe — the 4-byte length prefix is exactly attacker-controlled before any
+// bound has been checked.
+
+test "fuzz: readFrame never panics on an arbitrary stream" {
+    try std.testing.fuzz({}, fuzzReadFrame, .{});
+}
+
+fn fuzzReadFrame(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+
+    var r: std.Io.Reader = .fixed(buf[0..len]);
+    var out: [128]u8 = undefined;
+    _ = readFrame(&r, &out, .{}) catch return;
+}
+
 // ── tests: EnvelopeCodec(T), on a domain-free test-only union ───────────────
 
 const TestStatus = enum { idle, running, done };

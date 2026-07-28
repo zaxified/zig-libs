@@ -219,3 +219,22 @@ test "ECDSA P-256 sign/verify round-trip through this module's decode + verifySi
 test "UnsupportedAlgorithm surfaces for an unregistered algorithm number" {
     try testing.expectError(error.UnsupportedAlgorithm, decodePublicKey(200, "\x00"));
 }
+
+// ── fuzz: DNSKEY public-key material decode, never panics ──────────────────
+//
+// `decodePublicKey` loads the RSA/ECDSA/Ed25519 key bytes straight out of a
+// DNSKEY RDATA — an unauthenticated DNS response is exactly where this key
+// material comes from (this decode has to succeed *before* anything can be
+// verified with it), so `public_key` here is fully attacker-controlled.
+
+test "fuzz: decodePublicKey never panics on arbitrary bytes/algorithm" {
+    try testing.fuzz({}, fuzzDecodePublicKey, .{});
+}
+
+fn fuzzDecodePublicKey(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const algorithm = smith.value(u8);
+    _ = decodePublicKey(algorithm, buf[0..len]) catch return;
+}

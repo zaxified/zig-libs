@@ -619,3 +619,25 @@ test "DHCP garbage sweep: no panics on random input" {
         _ = Message.parse(buf[0..len]) catch {};
     }
 }
+
+// ── fuzz: DHCP message parse off the wire, never panics ────────────────────
+//
+// `Message.parse` runs on a UDP datagram from any host on the broadcast
+// domain (client or server, both unauthenticated at this layer). Stamp the
+// magic cookie in about half the cases (mirroring the manual sweep above) so
+// the option walker past the cookie gate is actually reached by `Smith`'s
+// otherwise-uniform bytes, not just the 4-byte cookie check.
+
+test "fuzz: DHCP Message.parse never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzDhcpParse, .{});
+}
+
+fn fuzzDhcpParse(_: void, smith: *std.testing.Smith) !void {
+    var buf: [512]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    if (smith.boolWeighted(1, 1) and len >= header_len + 4) {
+        buf[header_len..][0..4].* = magic_cookie;
+    }
+    _ = Message.parse(buf[0..len]) catch {};
+}

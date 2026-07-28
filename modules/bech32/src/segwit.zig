@@ -224,3 +224,24 @@ test "decodeSegwit: malicious oversized data section fails closed, no overflow" 
     const addr = try bech32.encode("bc", &data, .bech32);
     try testing.expectError(error.InvalidProgramLength, decodeSegwit("bc", addr.slice()));
 }
+
+// ── fuzz: segwit address decode, never panics ───────────────────────────────
+//
+// `decodeSegwit` is the entry point a wallet calls on a raw address string a
+// user pasted or a QR code produced — bech32 decode plus the witness-
+// version/program-length validation the regression above targets.
+
+test "fuzz: decodeSegwit never panics on arbitrary text" {
+    try testing.fuzz({}, fuzzDecodeSegwit, .{});
+}
+
+fn fuzzDecodeSegwit(_: void, smith: *std.testing.Smith) !void {
+    const alphabet = "qpzry9x8gf2tvdw0s3jn54khce6mua7l1bc";
+    var buf: [128]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    for (buf[0..len]) |*c| {
+        if (smith.boolWeighted(1, 3)) c.* = alphabet[c.* % alphabet.len];
+    }
+    _ = decodeSegwit("bc", buf[0..len]) catch return;
+}

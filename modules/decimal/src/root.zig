@@ -834,3 +834,26 @@ test "quantize — GDA/Python-style exponent" {
     try expectStr(try dec("1.5").quantize(-30, .down), "1.5"); // beyond precision: exact
     try testing.expectError(error.Overflow, dec("5").quantize(40, .up));
 }
+
+// ── fuzz: decimal string parse, never panics ────────────────────────────────
+//
+// `parse` reads a decimal literal straight out of a config file, a CSV
+// column, or a user-typed amount — text this process did not produce, with
+// no structural guarantee (sign/exponent/digit-run lengths are all
+// attacker/user chosen). Bias toward digit/sign/dot/exponent characters so
+// the mantissa and scientific-notation paths are actually reached.
+
+test "fuzz: parse never panics on arbitrary text" {
+    try testing.fuzz({}, fuzzParse, .{});
+}
+
+fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
+    const alphabet = "0123456789+-.eE";
+    var buf: [80]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    for (buf[0..len]) |*c| {
+        if (smith.boolWeighted(1, 4)) c.* = alphabet[c.* % alphabet.len];
+    }
+    _ = Decimal.parse(buf[0..len]) catch return;
+}

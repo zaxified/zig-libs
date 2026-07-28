@@ -1227,3 +1227,40 @@ test "Archive/EntryReader: zip64 with Deflate-compressed data" {
     try er.reader().appendRemaining(a, &out, .unlimited);
     try testing.expectEqualStrings(data, out.items);
 }
+
+// ── fuzz: central-directory parse off a hostile archive, never panics ──────
+//
+// `Archive.init` walks a ZIP central directory that (per the "hostile
+// central-directory header" regression above) `std.zip.Iterator` itself is
+// not safe to point at arbitrary bytes without this module's pre-validation
+// — an archive downloaded, uploaded, or otherwise received is exactly
+// untrusted input. Real ZIP tooling almost always starts with a plausible
+// End Of Central Directory signature near the tail, so stamp one in about
+// half the fuzz cases to get the parser past the "is this even a zip"
+// rejection and into the directory-walking logic the regression above hit.
+
+test "fuzz: Archive.init never panics on an arbitrary file" {
+    try testing.fuzz({}, fuzzArchiveInit, .{});
+}
+
+fn fuzzArchiveInit(_: void, smith: *std.testing.Smith) !void {
+    var buf: [512]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const bytes = buf[0..len];
+
+    if (smith.boolWeighted(1, 1) and bytes.len >= 22) {
+        // EOCD signature "PK\x05\x06" in the last 22 bytes (no comment).
+        bytes[bytes.len - 22 ..][0..4].* = .{ 0x50, 0x4b, 0x05, 0x06 };
+    }
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    tmp.dir.writeFile(testing.io, .{ .sub_path = "f.zip", .data = bytes }) catch return;
+    var f = tmp.dir.openFile(testing.io, "f.zip", .{}) catch return;
+    defer f.close(testing.io);
+
+    var archive: Archive = undefined;
+    archive.init(testing.io, testing.allocator, f) catch return;
+    defer archive.deinit();
+}

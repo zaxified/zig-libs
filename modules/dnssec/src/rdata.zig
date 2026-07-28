@@ -473,3 +473,37 @@ test "parseNsec3Param: trailing garbage rejected" {
     const rdata = "\x01" ++ "\x00" ++ "\x00\x0a" ++ "\x00" ++ "\xff";
     try testing.expectError(error.BadRecord, parseNsec3Param(rdata));
 }
+
+// ── fuzz: every RDATA parser off a hostile DNS response, never panics ──────
+//
+// All seven parsers here take `rdata` straight from an unauthenticated DNS
+// response (`dns.decode`'s `unknown` payload for record types it doesn't
+// natively model) — before DNSSEC validation has even had a chance to reject
+// it. Driving them all over the same buffer also reaches `wire
+// .decodeUncompressedName` (via `parseRrsig`/`parseNsec`) and the shared
+// `parseTypeBitMap` (via `parseNsec`/`parseNsec3`), so one harness covers the
+// whole file's parsing surface, not just the top-level entry points.
+
+test "fuzz: RDATA parsers never panic on arbitrary bytes" {
+    try testing.fuzz({}, fuzzRdata, .{});
+}
+
+fn fuzzRdata(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const rdata = buf[0..len];
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+
+    _ = parseDnskey(rdata) catch {};
+    _ = parseRrsig(gpa, rdata) catch {};
+    _ = parseDs(rdata) catch {};
+    _ = parseTypeBitMap(rdata) catch {};
+    _ = parseNsec(gpa, rdata) catch {};
+    _ = parseNsec3(rdata) catch {};
+    _ = parseNsec3Param(rdata) catch {};
+    _ = keyTag(rdata, smith.value(u8));
+}

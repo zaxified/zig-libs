@@ -1529,3 +1529,37 @@ test "HttpFetcher compiles (never dialed in tests)" {
     _ = HttpFetcher.fetchFn;
     _ = HttpFetcher.fetcher;
 }
+
+// ── fuzz: RDAP response + IANA bootstrap JSON parse, never panics ──────────
+//
+// `parseResponse` runs on the HTTP response body from whatever RDAP server
+// a query was routed to (a registry/registrar an attacker may control or
+// spoof); `parseBootstrap` runs on the IANA bootstrap registry file the
+// client fetches to find that server in the first place — both are JSON
+// this process did not produce.
+
+test "fuzz: parseResponse never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzParseResponse, .{});
+}
+
+fn fuzzParseResponse(_: void, smith: *std.testing.Smith) !void {
+    var buf: [512]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+
+    var parsed = parseResponse(testing.allocator, buf[0..len]) catch return;
+    parsed.deinit();
+}
+
+test "fuzz: parseBootstrap never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzParseBootstrap, .{});
+}
+
+fn fuzzParseBootstrap(_: void, smith: *std.testing.Smith) !void {
+    var buf: [512]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+
+    var bootstrap = parseBootstrap(testing.allocator, buf[0..len]) catch return;
+    bootstrap.deinit();
+}

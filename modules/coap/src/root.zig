@@ -577,3 +577,23 @@ test "Code helpers" {
     try testing.expect(!Code.content.isRequest());
     try testing.expect(!Code.empty.isRequest());
 }
+
+// ── fuzz: datagram parse, never panics ──────────────────────────────────────
+//
+// `parse` is the first thing done with a UDP datagram off the wire — no
+// transport-layer authentication, fully attacker-controlled bytes including
+// the delta-encoded option lengths (a classic place for an off-by-one to
+// walk past the buffer).
+
+test "fuzz: parse never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzParse, .{});
+}
+
+fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
+    var buf: [512]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+
+    var options_buf: [32]Option = undefined;
+    _ = parse(buf[0..len], &options_buf) catch return;
+}

@@ -151,3 +151,24 @@ test "encodeCanonicalName: label too long errors" {
     const long_label = "a" ** 64;
     try testing.expectError(error.BadLabel, encodeCanonicalName(long_label, &buf));
 }
+
+// ── fuzz: uncompressed name decode off hostile RDATA, never panics ─────────
+//
+// Called directly on an RRSIG signer name / NSEC next name straight out of
+// an unauthenticated DNS response, at an attacker-influenced starting
+// offset (both `rdata.parseRrsig` and `rdata.parseNsec` call this at a
+// caller-chosen `start`, not necessarily 0).
+
+test "fuzz: decodeUncompressedName never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzDecodeUncompressedName, .{});
+}
+
+fn fuzzDecodeUncompressedName(_: void, smith: *std.testing.Smith) !void {
+    var buf: [300]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const start: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+
+    var out: [max_name_text_len]u8 = undefined;
+    _ = decodeUncompressedName(buf[0..len], start, &out) catch return;
+}

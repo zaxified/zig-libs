@@ -1967,3 +1967,28 @@ test "readLine: an over-long unterminated line is capped, not buffered unbounded
     const l2 = try readLine(alloc, &in2, &buf);
     try testing.expectEqualStrings("hello", l2.?);
 }
+
+// ── fuzz: one JSON-RPC message dispatch, never panics ───────────────────────
+//
+// `handleMessage` is the boundary between a stdio transport (or, via
+// `mcp-http`, an HTTP POST body) and this server — a fully untrusted peer
+// line reaching every dispatch branch (initialize/tools/resources/prompts),
+// not just the JSON parse itself. Drive it against a server with a real
+// registered tool so `tools/call`'s param-validation path is reachable too,
+// not only the outer parse-error branches.
+
+test "fuzz: handleMessage never panics on an arbitrary JSON-RPC line" {
+    try testing.fuzz({}, fuzzHandleMessage, .{});
+}
+
+fn fuzzHandleMessage(_: void, smith: *std.testing.Smith) !void {
+    var buf: [512]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+
+    var s = testServer(null);
+    defer s.deinit();
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    s.handleMessage(buf[0..len], &aw.writer) catch return;
+}

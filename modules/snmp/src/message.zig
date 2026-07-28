@@ -711,6 +711,32 @@ test "garbage and truncation sweep: decode never panics" {
     }
 }
 
+// ── fuzz: message decode off the wire, never panics ─────────────────────────
+//
+// `decode` (and the lazy varbind walk it defers) is the first thing run on a
+// UDP datagram from an SNMP agent/manager — fully attacker-controlled BER.
+// The manual PRNG sweep above predates the `Smith` harness convention this
+// collection standardises on; this drives the same boundary through
+// `std.testing.fuzz` for corpus-guided coverage.
+
+test "fuzz: decode never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzDecode, .{});
+}
+
+fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
+    var buf: [512]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+
+    const msg = decode(buf[0..len]) catch return;
+    switch (msg.pdu) {
+        inline else => |p| {
+            var it = p.varbinds.iterator();
+            while (it.next() catch null) |_| {}
+        },
+    }
+}
+
 test "Report-PDU [8] encodes and decodes as a BasicPdu (RFC 3416 §3)" {
     var buf: [128]u8 = undefined;
     const vbs = [_]VarBind{

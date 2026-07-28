@@ -764,3 +764,21 @@ test "TcpTransport compiles (never dialed in tests)" {
     _ = TcpTransport.exchangeFn;
     _ = TcpTransport.transport;
 }
+
+// ── fuzz: referral line parse off a hostile WHOIS response, never panics ───
+//
+// `parseServerRef` scans a referral line out of the plaintext response of
+// whatever WHOIS server the query landed on — an unauthenticated TCP
+// response is exactly this parser's threat model (a malicious or
+// compromised registry server chooses this text).
+
+test "fuzz: parseServerRef never panics on arbitrary text" {
+    try testing.fuzz({}, fuzzParseServerRef, .{});
+}
+
+fn fuzzParseServerRef(_: void, smith: *std.testing.Smith) !void {
+    var buf: [128]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    _ = parseServerRef(buf[0..len]);
+}

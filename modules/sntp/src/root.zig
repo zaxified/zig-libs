@@ -636,3 +636,25 @@ test "query: live network (skipped offline)" {
     // Gate any real query behind SkipZigTest — no live server in CI.
     return error.SkipZigTest;
 }
+
+// ── fuzz: server response decode off the wire, never panics ────────────────
+//
+// `decodeResponse` (and `verifyOriginate` behind it) is what a client runs on
+// a UDP datagram from a server it asked nothing more of than its address —
+// no auth, no length-agility (fixed 48 bytes), so an off-length or
+// off-nominal-field datagram must fail cleanly, not panic. Vary the length
+// across and away from the fixed 48 so both `error.InvalidLength` and the
+// full field decode are exercised.
+
+test "fuzz: decodeResponse never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzDecodeResponse, .{});
+}
+
+fn fuzzDecodeResponse(_: void, smith: *std.testing.Smith) !void {
+    var buf: [64]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+
+    const reply = decodeResponse(buf[0..len]) catch return;
+    verifyOriginate(reply, reply.originate) catch return;
+}

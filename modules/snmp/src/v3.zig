@@ -427,3 +427,22 @@ test "decodeScopedPdu on a hand-built ScopedPDU SEQUENCE content" {
     try testing.expectEqualStrings("N", scoped.context_name);
     try testing.expectEqual(@as(i32, 55), scoped.pdu.trap_v2.request_id);
 }
+
+// ── fuzz: v3 envelope decode off the wire, never panics ─────────────────────
+//
+// `decode` is the first thing run on a datagram claiming to be SNMPv3 — the
+// header (msgID/msgMaxSize/flags/securityModel), the opaque
+// securityParameters OCTET STRING (USM bytes, untouched here), and either a
+// plaintext ScopedPDU or an `.encrypted` blob are all attacker-controlled
+// BER before any authentication has been checked.
+
+test "fuzz: decode never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzDecode, .{});
+}
+
+fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
+    var buf: [512]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    _ = decode(buf[0..len]) catch return;
+}

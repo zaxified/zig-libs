@@ -1187,6 +1187,37 @@ test "garbage frames never panic" {
     }
 }
 
+// ── fuzz: ADU decode off the wire, never panics ─────────────────────────────
+//
+// `tcp.decodeAdu`/`rtu.decodeAdu` are the first thing run on bytes read from
+// a TCP socket or serial line to/from a Modbus device — fully
+// attacker/device-controlled (a compromised or malfunctioning field device
+// is exactly this module's threat model). The manual xorshift sweep above
+// predates the `Smith` harness convention this collection standardises on;
+// this drives the same boundary (plus the PDU response parsers) through
+// `std.testing.fuzz` for corpus-guided coverage instead of a fixed seed.
+
+test "fuzz: tcp/rtu decodeAdu and PDU response parsers never panic" {
+    try testing.fuzz({}, fuzzDecodeAdu, .{});
+}
+
+fn fuzzDecodeAdu(_: void, smith: *std.testing.Smith) !void {
+    var buf: [300]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const bytes = buf[0..len];
+
+    _ = tcp.decodeAdu(bytes) catch {};
+    _ = rtu.decodeAdu(bytes) catch {};
+
+    var regs: [125]u16 = undefined;
+    var bits: [64]bool = undefined;
+    pdu.parseReadRegistersResponse(bytes, .read_holding_registers, &regs) catch {};
+    pdu.parseReadBitsResponse(bytes, .read_coils, &bits) catch {};
+    pdu.parseWriteSingleResponse(bytes, .write_single_register, 1, 2) catch {};
+    pdu.parseWriteMultipleResponse(bytes, .write_multiple_registers, 1, 2) catch {};
+}
+
 test "meta is well-formed" {
     try testing.expectEqual(.any, meta.platform);
     try testing.expectEqual(.both, meta.role);

@@ -1109,3 +1109,32 @@ test "decode: 1000-iteration garbage sweep never panics" {
         _ = decode(buf[0 .. 2 + len]) catch continue;
     }
 }
+
+// ── fuzz: control-packet decode off the wire, never panics ─────────────────
+//
+// `decode` is the first thing run on bytes read from a TCP (or WebSocket)
+// stream to a broker — fully attacker-controlled, including the
+// variable-length "remaining length" varint and every per-packet-type body
+// (CONNECT's payload in particular has half a dozen optional, length-
+// prefixed sub-fields). The manual PRNG sweep above predates the `Smith`
+// harness convention this collection standardises on; this drives the same
+// boundary through `std.testing.fuzz`, and advances over a stream the way a
+// real reader loop would so back-to-back packets are exercised too.
+
+test "fuzz: decode never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzDecode, .{});
+}
+
+fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+
+    var off: usize = 0;
+    var iterations: usize = 0;
+    while (off < len and iterations < 64) : (iterations += 1) {
+        const decoded = decode(buf[off..len]) catch return;
+        const d = decoded orelse return; // need more data
+        off += d.consumed;
+    }
+}

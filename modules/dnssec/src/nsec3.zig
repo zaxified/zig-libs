@@ -481,3 +481,43 @@ test "proveDenial: over-limit NSEC3 iterations downgrade to insecure (RFC 9276, 
     // confirming 100 is accepted and 101 is the first rejected value.
     try testing.expectEqual(DenialResult.bogus, proveDenial("www.example", 1, empty, "", max_nsec3_iterations));
 }
+
+// ── fuzz: NSEC3 owner-hash label decode, never panics ───────────────────────
+//
+// The label a hostile NSEC3 record uses as its wire owner name is
+// attacker-controlled base32hex text — exactly the field the fixed
+// "over-long owner-hash label" regression above was found in
+// (`decodeOwnerHash`'s fixed `[64]u8` scratch buffer). Drive `proveDenial`
+// itself (the real entry point over a `Nsec3Set` built from wire records) so
+// both `decodeOwnerHash` and the general `decode` base32hex routine are
+// reached with a fuzzed label length/content, not just a single regression
+// value.
+
+test "fuzz: proveDenial never panics on a hostile owner-hash label" {
+    try testing.fuzz({}, fuzzProveDenial, .{});
+}
+
+fn fuzzProveDenial(_: void, smith: *std.testing.Smith) !void {
+    var label_buf: [256]u8 = undefined;
+    smith.bytes(&label_buf);
+    const label_len: usize = smith.valueRangeAtMost(u16, 0, label_buf.len);
+    // Keep the alphabet in-range often enough to actually reach `decode`
+    // (arbitrary bytes mostly just bounce off `decodeChar`'s `else`).
+    for (label_buf[0..label_len]) |*c| {
+        if (smith.boolWeighted(1, 3)) c.* = "0123456789ABCDEFGHIJKLMNOPQRSTUV"[c.* % 32];
+    }
+
+    const record: Nsec3Record = .{
+        .owner_hash_label = label_buf[0..label_len],
+        .rdata = .{
+            .hash_algorithm = hash_algorithm_sha1,
+            .flags = 0,
+            .iterations = 0,
+            .salt = "",
+            .next_hashed_owner_name = &[_]u8{0} ** sha1_digest_len,
+            .types = .{ .raw = "" },
+        },
+    };
+    const set: Nsec3Set = .{ .records = &[_]Nsec3Record{record} };
+    _ = proveDenial("www.example", 1, set, "", 0);
+}

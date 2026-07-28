@@ -1910,3 +1910,44 @@ test "parseIdpMetadata: endpoints + signing cert DER (untrusted)" {
     try testing.expectEqual(@as(usize, 1), m.signing_certs_der.len);
     try testing.expectEqualStrings("Hello", m.signing_certs_der[0]);
 }
+
+// ── fuzz: HTTP-binding field decode + IdP metadata parse, never panics ─────
+//
+// `decodePostField`/`decodeRedirectField` run on the `SAMLResponse` query/
+// form field of an inbound HTTP request — base64 (POST binding) or
+// base64+raw-DEFLATE (Redirect binding), both fully attacker-controlled
+// before any XML signature has been checked. `parseIdpMetadata` runs on a
+// metadata document fetched from (or forwarded by) an IdP, which this
+// module's own doc calls out as untrusted (certs come back as raw DER,
+// "never parsed here" — this file just has to survive hostile XML shape).
+
+test "fuzz: decodePostField/decodeRedirectField never panic on arbitrary bytes" {
+    try testing.fuzz({}, fuzzDecodeFields, .{});
+}
+
+fn fuzzDecodeFields(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const field = buf[0..len];
+
+    if (decodePostField(testing.allocator, field)) |d| testing.allocator.free(d) else |_| {}
+    if (decodeRedirectField(testing.allocator, field)) |d| testing.allocator.free(d) else |_| {}
+}
+
+test "fuzz: parseIdpMetadata never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzParseIdpMetadata, .{});
+}
+
+fn fuzzParseIdpMetadata(_: void, smith: *std.testing.Smith) !void {
+    const alphabet = "<>/=\"'&;! ?abcmdsEntityDescriptorIDPSSOKeyInfoX509CertificateSingleSignOnServiceBinding0123\n\t";
+    var buf: [512]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    for (buf[0..len]) |*c| {
+        if (smith.boolWeighted(1, 3)) c.* = alphabet[c.* % alphabet.len];
+    }
+
+    var m = parseIdpMetadata(testing.allocator, buf[0..len]) catch return;
+    m.deinit();
+}

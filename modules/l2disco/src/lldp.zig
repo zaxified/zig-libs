@@ -777,3 +777,29 @@ test "LLDP garbage sweep: no panics on random input" {
         } else |_| {}
     }
 }
+
+// ── fuzz: LLDPDU parse off the wire, never panics ───────────────────────────
+//
+// `Lldpdu.parse` and its three sub-iterators (generic TLV, org-specific,
+// management-address) run on raw Ethernet frames from any neighbour on the
+// LAN — no authentication at this layer. The manual PRNG sweep above
+// predates the `Smith` harness convention this collection standardises on;
+// this drives the same boundary through `std.testing.fuzz`.
+
+test "fuzz: LLDPDU parse never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzLldpParse, .{});
+}
+
+fn fuzzLldpParse(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+
+    const du = Lldpdu.parse(buf[0..len]) catch return;
+    var it = du.tlvIterator();
+    while (it.next() catch null) |_| {}
+    var org = du.orgIterator();
+    while (org.next() catch null) |o| _ = o.decode();
+    var ma = du.managementAddressIterator();
+    while (ma.next() catch null) |_| {}
+}

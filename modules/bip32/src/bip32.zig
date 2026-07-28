@@ -460,3 +460,38 @@ test "parseExtended rejects a bad-length / bad-checksum string" {
         "xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHL",
     ));
 }
+
+// ── fuzz: extended-key + derivation-path text parse, never panics ──────────
+//
+// `parseExtended` is what loads an `xprv`/`xpub` a user pastes in (or an
+// exchange/wallet imports) — Base58Check text with no structural guarantee
+// until the checksum's been verified. `parsePath` similarly takes a
+// derivation-path string a caller (config, CLI, wallet UI) may pass through
+// verbatim from a user.
+
+test "fuzz: parseExtended never panics on arbitrary text" {
+    try testing.fuzz({}, fuzzParseExtended, .{});
+}
+
+fn fuzzParseExtended(_: void, smith: *std.testing.Smith) !void {
+    var buf: [128]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    _ = parseExtended(buf[0..len]) catch return;
+}
+
+test "fuzz: parsePath never panics on arbitrary text" {
+    try testing.fuzz({}, fuzzParsePath, .{});
+}
+
+fn fuzzParsePath(_: void, smith: *std.testing.Smith) !void {
+    const alphabet = "0123456789/'hHmM";
+    var buf: [96]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    for (buf[0..len]) |*c| {
+        if (smith.boolWeighted(1, 4)) c.* = alphabet[c.* % alphabet.len];
+    }
+    var out: [max_path_depth]u32 = undefined;
+    _ = parsePath(buf[0..len], &out) catch return;
+}
