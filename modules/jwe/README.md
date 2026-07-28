@@ -35,9 +35,10 @@ cipher).
 | `A128GCMKW` / `A256GCMKW` (key management) | **REAL** (`std.crypto.aead.aes_gcm`) |
 | `A128KW` / `A256KW` (key management) | **REAL** (RFC 3394 AES Key Wrap; §4.1 + RFC 7516 A.3 KATs) |
 | `PBES2-HS256+A128KW` / `PBES2-HS512+A256KW` | **REAL** (PBKDF2 KDF feeding the AES Key Wrap above) |
+| `ECDH-ES` / `ECDH-ES+A128KW` / `ECDH-ES+A256KW` (key management) | **REAL** (ephemeral-static ECDH on P-256 or X25519 + Concat KDF; RFC 7518 Appendix C KAT) |
 | `A128GCM` / `A256GCM` (content encryption) | **REAL** (`std.crypto.aead.aes_gcm`) |
 | `A128CBC-HS256` / `A256CBC-HS512` (content encryption) | **REAL** (AES-CBC + HMAC encrypt-then-MAC; RFC 7518 B.1/B.3 KATs) |
-| `A192GCM` / `A192GCMKW` / `A192KW` / `A192CBC-HS384` / `PBES2-HS384+A192KW` | **UNSUPPORTED** — std 0.16 has no AES-192 cipher |
+| `A192GCM` / `A192GCMKW` / `A192KW` / `A192CBC-HS384` / `PBES2-HS384+A192KW` / `ECDH-ES+A192KW` | **UNSUPPORTED** — std 0.16 has no AES-192 cipher |
 
 "UNSUPPORTED" means std 0.16 has no AES-192 primitive at all
 (`std.crypto.core.aes` ships only `Aes128`/`Aes256`, in every backend) — a

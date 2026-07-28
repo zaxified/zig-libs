@@ -6,8 +6,9 @@
 //! `bn254` verifier accepts. Construction: Groth 2016, "On the Size of
 //! Pairing-based Non-interactive Arguments".
 //!
-//! **Status: Phase-1 SCAFFOLD.** The entire mechanical + math layer is REAL
-//! and heavily anchored:
+//! **Status: implemented.** The entire mechanical + math layer AND the
+//! prover core (`prover.setup` + `prover.prove`) are implemented and
+//! anchored:
 //!   - `field`  — `Fr` helpers over `bn254`'s scalar field.
 //!   - `poly`   — dense `Fr[x]` arithmetic + division by `Z(x) = x^n − 1`.
 //!   - `domain` — radix-2 evaluation domain (`n`-th roots of unity, 2-adicity
@@ -21,13 +22,15 @@
 //!   - `qap`    — R1CS→QAP interpolation + `A·B−C` divisibility by `Z` — which
 //!                equals R1CS satisfaction, the self-contained teeth-test.
 //!
-//! The one part NOT implemented is the **prover core** — `prover.setup` (toy
-//! trusted setup) and `prover.prove` (proof assembly) — gated behind
-//! `gate.prover_core_implemented` (`false`), so they `@panic` and the
-//! end-to-end test SKIPs. That core is an **Opus** task, not a Fable one: the
-//! `bn254` verifier is a COMPLETE deterministic anchor, so any prover error is
-//! caught (no self-consistent-but-wrong failure mode the way a Fable-tier core
-//! has). See `gate.zig` and `SPEC.md`'s tier call.
+//! The **prover core** — `prover.setup` (toy trusted setup) and
+//! `prover.prove` (proof assembly) — is real too: `gate.prover_core_implemented`
+//! is `true` (the flag is retained as a self-documenting marker of the
+//! scaffold→core boundary, not a live switch), so `setup`/`prove` no longer
+//! `@panic` and the end-to-end test runs unconditionally. That core was an
+//! **Opus** task, not a Fable one: the `bn254` verifier is a COMPLETE
+//! deterministic anchor, so any prover error is caught (no
+//! self-consistent-but-wrong failure mode the way a Fable-tier core has). See
+//! `gate.zig` and `SPEC.md`'s tier call.
 //!
 //! Deferred increments (all OUT of Phase 1 — see `SPEC.md`): snarkjs `.zkey`/
 //! witness ingestion for a byte-exact external anchor, Pippenger MSM,

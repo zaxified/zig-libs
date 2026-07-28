@@ -54,9 +54,10 @@ pub const Scalar = scalar.Scalar;
 /// inputs. Rewired onto by jwt (ES256) + jwe (ECDH-ES). See `sign.zig`.
 pub const EcdsaP256Sha256 = sign.EcdsaP256Sha256;
 
-/// True iff the field multiply/square hot path is running on the gated amd64
-/// `MULX/ADX` core rather than the portable Solinas reduction. In this scaffold
-/// (both gates `false`) it is `false` on every target.
+/// True iff the field multiply/square hot path is running on the amd64
+/// `MULX/ADX` core rather than the portable Solinas reduction. Both gates are
+/// now `true`, so this is `true` on x86-64+ADX+BMI2 targets and `false`
+/// (portable fallback) everywhere else.
 pub const field_asm_active = field.field_asm_active;
 
 pub const meta = .{

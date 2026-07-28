@@ -21,21 +21,24 @@ already has secp256k1 — it is a *performance-specialized reimplementation*
 justified by the measured gap plus the collection's thesis that native Zig should
 be usable INSTEAD of linking a C crypto library. See `SPEC.md §Dedup`.
 
-## Status: SCAFFOLD (portable oracle real; two Fable cores gated)
+## Status: core phase done (both Fable cores implemented and gated ON)
 
 The **portable path is real, constant-time, and byte-exact against
 `std.crypto.ecc.Secp256k1` + the 19 official BIP340 vectors** — it is the
-correctness oracle. Two irreducible cores are gated off, the portable path
-standing in until a Fable agent fills them:
+correctness oracle and the non-amd64 fallback. The two irreducible cores below
+are now IMPLEMENTED, with `gate.field_asm_implemented` /
+`gate.glv_scalarmul_implemented` both flipped to `true`, so the
+core-vs-portable differentials in `oracle_test.zig` run live (not skipped):
 
-| Gate flag | Core | Portable fallback (the oracle it must match) |
+| Gate flag | Core | Portable fallback (the oracle it's pinned against) |
 |---|---|---|
 | `gate.field_asm_implemented` | `fast_core.fieldMul` / `fast_core.fieldSq` — amd64 `MULX/ADX` field mul + square | `field.mulPortable` / `field.sqPortable` (wide-int Solinas) |
 | `gate.glv_scalarmul_implemented` | `group.mulPublicGlv` — GLV+wNAF variable-base scalarmul | `group.mulPublicDoubleAdd` |
 
-The GLV **decomposition** (`scalar.splitScalar`, the lattice constants) is already
-real and tested byte-exact vs std, so the gated scalarmul core has a proven
-reference to build on.
+The GLV **decomposition** (`scalar.splitScalar`, the lattice constants) is
+real and tested byte-exact vs std, and both gated cores now build on it for
+real — see `gate.zig` for the exact cut-lines and `SPEC.md`'s Performance
+status section for measured numbers.
 
 ## Usage
 
@@ -81,10 +84,12 @@ zig build test-k256 -Doptimize=ReleaseFast --summary all
 K256_BENCH=1 zig build test-k256 -Doptimize=ReleaseFast # opt-in ns/op baseline
 ```
 
-18 pass / 2 skip in both Debug and ReleaseFast (the 2 skips are the gated
-core-vs-portable differentials, which light up when a core lands — a skip is not
-a green light). The suite includes the field/group/scalar differentials vs
-`std.crypto.ecc.Secp256k1` (thousands of random inputs, bit-exact via `toBytes`),
+30 pass / 1 skip in both Debug and ReleaseFast (the 1 skip is the opt-in
+`K256_BENCH` micro-benchmark, gated behind an env var, not a core gap — both
+Fable cores are implemented and their differentials run for real). The suite
+includes the field/group/scalar differentials vs `std.crypto.ecc.Secp256k1`
+(thousands of random inputs, bit-exact via `toBytes`), the core-vs-portable
+differentials for the amd64 `MULX/ADX` field core and the GLV scalarmul core,
 the GLV decomposition + β-endomorphism checks, the 19 official BIP340 vectors
 (8 sign rows byte-exact, all 19 verify rows), an ECDSA differential against std's
 signer, a broken-Solinas-constant positive control the harness flags RED, and
@@ -92,12 +97,12 @@ signer, a broken-Solinas-constant positive control the harness flags RED, and
 (originally `lninvoice`'s, moved here — general secp256k1 machinery, not
 BOLT#11-specific).
 
-Measured on this host (ReleaseFast, portable path — the SCAFFOLD baseline, not
-the accelerated target): field mul **25 ns/op** vs std 59, field sq **47** vs 100,
-constant-time base-point scalarmul **192 µs** vs std 219, ECDSA verify **238 µs**
-vs std 815. The gated `MULX/ADX` field core + GLV push toward the
-~2–4×-libsecp256k1 target; the owner-verify + Fable phases produce the real
-accelerated numbers.
+Measured on this host (ReleaseFast, accelerated MULX/ADX + GLV + comb-base
+path vs std): ECDSA/BIP340 verify **~2–3.5× libsecp256k1** (field mul ~2.9×,
+ECDSA verify ~2.5× libsecp / ~6.5× std), BIP340/ECDSA sign **~2.3×
+libsecp256k1** via the fixed-base comb table (`group.combMulBase`) — both
+signature paths land inside the module's ~2–4×-libsecp256k1 target. See
+`SPEC.md`'s Performance status section for the full breakdown.
 
 Provenance: clean-room from the secp256k1 domain parameters + BIP340 public spec;
 libsecp256k1 studied as the technique reference (special-prime reduction, GLV,

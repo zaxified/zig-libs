@@ -21,8 +21,9 @@
 //!   - `clearBootstrap` — the NOISELESS cleartext LUT+rotation reference the
 //!     homomorphic `bootstrap` must reproduce (the anti-self-consistency oracle).
 //!
-//! ## What is GATED (the Fable core — `gate.fable_core_implemented`)
-//!   - `externalProduct` (GGSW ⊠ GLWE), `cmux`, `blindRotate`, `bootstrap`.
+//! ## The Fable core — `gate.fable_core_implemented` (now `true`, IMPLEMENTED)
+//!   - `externalProduct` (GGSW ⊠ GLWE), `cmux`, `blindRotate`, `bootstrap` — all
+//!     real; no `@panic` remains behind the gate.
 //!
 //! Randomness is caller-supplied (`std.Random`) so the module is `platform =
 //! .any` and tests are reproducible.

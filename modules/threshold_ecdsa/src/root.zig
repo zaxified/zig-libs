@@ -1,14 +1,23 @@
 // SPDX-License-Identifier: MIT
 //! threshold_ecdsa — GG20 threshold-ECDSA over secp256k1: **Phase 2a
 //! (trusted-dealer keygen) + Phase 2b (ring-Pedersen aux params + the
-//! semi-honest MtA core)** of the arc (2a keygen · 2b aux-params/MtA · 2c
-//! range proofs + MtAwc · 2d signing). Depends on the sibling `paillier`
-//! module: GG20's whole design hinges on every party holding its own
-//! additively-homomorphic Paillier keypair — MtA (`mta.zig`) is literally
-//! `paillier`'s homomorphic ops composed into a multiplicative→additive
-//! share conversion.
+//! semi-honest MtA core) + Phase 2c (GG18 Appendix A zero-knowledge MtA
+//! range proofs + MtAwc, `zkproofs.zig`) + Phase 2d (GG20 online signing,
+//! `signing.zig`)** — the full arc (2a keygen · 2b aux-params/MtA · 2c
+//! range proofs + MtAwc · 2d signing) is implemented end to end. Depends
+//! on the sibling `paillier` module: GG20's whole design hinges on every
+//! party holding its own additively-homomorphic Paillier keypair — MtA
+//! (`mta.zig`) is literally `paillier`'s homomorphic ops composed into a
+//! multiplicative→additive share conversion.
 //!
-//! **Status: keygen + aux-params + MtA implemented.** The
+//! **Status: keygen + aux-params + MtA + range proofs + online signing are
+//! all implemented (`signWithShares` genuinely produces a standard
+//! secp256k1 ECDSA signature verifying under `std.crypto.sign.ecdsa
+//! .EcdsaSecp256k1Sha256`).** One security layer remains a documented,
+//! deliberate scope cut: GG20's identifiable-abort culprit-naming apparatus
+//! (`signing.identifyAbortCulprit`) is `@panic`-stubbed — "abort-only v1"
+//! never returns a bad signature but cannot name a culprit on abort; see
+//! `signing.zig`'s module doc comment for the exact boundary. The
 //! Shamir-secret-sharing + Feldman-VSS + Lagrange-interpolation core
 //! (`splitSecretKey`, `groupPublicKey`, `derivePublicKeyShare`,
 //! `reconstructSecret`) is a direct port of this repo's already-KAT-
@@ -35,9 +44,10 @@
 //! learning the other's input. Its malicious-security layer — the GG18
 //! Appendix A zero-knowledge range proofs (which consume `AuxParams` as
 //! their Pedersen commitment base) and the MtAwc check — is Phase 2c
-//! (`zkproofs.zig`), now IMPLEMENTED (verified against the paper) and wired
-//! into `mta.zig`'s fail-closed `*Checked` entry points; the signing rounds
-//! are Phase 2d (still out of scope).
+//! (`zkproofs.zig`), IMPLEMENTED (verified against the paper) and wired
+//! into `mta.zig`'s fail-closed `*Checked` entry points; the online signing
+//! rounds are Phase 2d (`signing.zig`), also IMPLEMENTED — see that file's
+//! module doc comment for the identifiable-abort scope cut.
 //!
 //! `AuxParams`' STRUCT and byte codec round-trip on hand-constructed toy
 //! values too (see the tests at the bottom).

@@ -22,8 +22,12 @@
 //! Scope: transport/KEX handshake only, ending with the responder side of
 //! SSH_MSG_SERVICE_REQUEST → SSH_MSG_SERVICE_ACCEPT. Userauth (RFC 4252,
 //! SSH_MSG_USERAUTH_*) and connection-protocol channels (RFC 4254,
-//! SSH_MSG_CHANNEL_*) are out of scope here, same as `root.zig`'s
-//! `userauth`/`openSession`/`exec` placeholders.
+//! SSH_MSG_CHANNEL_*) are out of scope in THIS FILE — they are implemented,
+//! for both roles, in the sibling `userauth.zig` (`serveUserauth`) and
+//! `connection.zig` (`serveSession`), which `root.zig` re-exports as real
+//! (not placeholder) entry points: `authenticate`/`openSession`/`exec`. See
+//! `root.zig`'s module doc comment and the full-stack loopback self-interop
+//! test at the bottom of `connection.zig`.
 //!
 //! Provenance: clean-room from RFC 4253/4251/8731 (+ RFC 8332/8709/5656 for
 //! the host-key algorithms and OpenSSH `PROTOCOL.key`/
@@ -823,8 +827,10 @@ fn pickFirst(preferred: []const []const u8, available: []const []const u8) ?[]co
 /// client's SSH_MSG_SERVICE_REQUEST `"ssh-userauth"` with
 /// SSH_MSG_SERVICE_ACCEPT.
 ///
-/// After this returns, `t` is an encrypted transport ready for userauth
-/// (out of scope here, see `root.zig`'s `userauth` placeholder).
+/// After this returns, `t` is an encrypted transport ready for userauth —
+/// out of scope in THIS FILE, but implemented server-side by
+/// `userauth.serveUserauth` (real, not a placeholder; see `root.zig`'s
+/// module doc comment).
 pub fn serverHandshake(t: *transport.Transport, gpa: std.mem.Allocator, config: ServerConfig) transport.TransportError!void {
     if (config.host_keys.len == 0) return error.UnsupportedAlgorithm;
 

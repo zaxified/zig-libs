@@ -104,9 +104,12 @@ placement).
   output buffer is zeroed (`std.crypto.secureZero`) so no partially-unwrapped
   key material leaks to the caller.
 - **Out of scope for v1:** General/Flattened JSON serialization (multiple
-  recipients — see Design above), ECDH-ES (RFC 7518 §4.6, elliptic-curve key
-  agreement — not in the assigned scope), and any `enc`/`alg` this file
-  doesn't list.
+  recipients — see Design above), and any `enc`/`alg` this file doesn't
+  list. `ECDH-ES` / `ECDH-ES+A128KW` / `ECDH-ES+A256KW` (RFC 7518 §4.6,
+  elliptic-curve key agreement on P-256 or X25519 + the Concat KDF) ARE in
+  scope and implemented — see `ecdhes.zig`, byte-exact against RFC 7518
+  Appendix C. Only `ECDH-ES+A192KW` is unsupported, for the same AES-192 std
+  gap as the other `A192*` algorithms.
 
 ## `TODO(fable)` checklist — done-record (completed 2026-07-11)
 
@@ -147,15 +150,18 @@ placement).
 
 ## Verification
 
-`zig build test-jwe`: 37 tests pass, 0 skipped (header round-trips + `zip`
+`zig build test-jwe`: 53 tests pass, 0 skipped (header round-trips + `zip`
 rejection, `A128GCM`/`A256GCM` real round-trips + tamper detection,
 AES-192 documented-std-gap checks, `dir`/`RSA-OAEP-256`/GCMKW/PBES2 wiring,
 RFC 3394 §4.1 AES-KW KAT + fail-closed tests, RFC 7518 B.1/B.3 CBC-HMAC
 KATs both directions + B.2 HMAC-half + padding-vs-tag indistinguishability,
-full `encryptCompact`/`decryptCompact` round-trips including
-key-material-confusion and malformed-token rejection, and the byte-exact
-RFC 7516 A.1 (decrypt-direction) and A.3 (both-directions) token KATs).
-Run: `zig build test-jwe` (Debug + ReleaseFast both green).
+the RFC 7518 Appendix C ECDH-ES KATs (P-256 ECDH `Z` and Concat-KDF-derived
+key, both byte-exact) plus cross-curve/invalid-peer-material/zeroing tests
+for both P-256 and X25519, full `encryptCompact`/`decryptCompact`
+round-trips including key-material-confusion and malformed-token rejection,
+and the byte-exact RFC 7516 A.1 (decrypt-direction) and A.3
+(both-directions) token KATs). Run: `zig build test-jwe` (Debug + ReleaseFast
+both green).
 
 ## Status
 

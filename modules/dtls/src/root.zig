@@ -16,11 +16,16 @@
 //!     `certverify`/`certauth` plumbing. Validated: the X25519 key_share +
 //!     key-schedule feed against RFC 8448 §3's external ECDHE vector; the
 //!     full flow by client↔server self-interop (server-only + mutual auth).
-//! Deliberately does NOT depend on this
-//! collection's separate `x509` certificate-chain-validator scaffold (own
-//! module, own SPEC.md) — certificate mode here reuses `std.crypto
-//! .Certificate` + this module's existing `rsa` dependency directly
-//! (`certauth.zig`). Intended transport for the `coap` module's secure-UDP
+//! Certificate mode reuses `std.crypto.Certificate.Parsed.verify` for the
+//! actual issuer/validity/signature checks plus this module's existing
+//! `rsa` dependency (`certauth.zig`), but — unlike an earlier pass of this
+//! module — DER parsing is now routed through this collection's `x509`
+//! module's bounds-checked `spkiOf`/`safeCertificate` bridge rather than
+//! calling `std.crypto.Certificate.parse` directly (see `certauth.zig`'s
+//! "CLOSED GAP" note for why: std's own parser is not panic-safe against
+//! adversarial DER in Zig 0.16). `meta.deps` below is therefore
+//! `.{"rsa", "x509"}`, not `.{"rsa"}` alone. Intended transport for the
+//! `coap` module's secure-UDP
 //! needs (IoT/SCADA fleet management: CoAP-over-DTLS is RFC 7925's
 //! constrained-device profile) — the PSK+certificate combination in
 //! particular targets devices provisioned with both a shared secret AND a

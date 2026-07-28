@@ -12,10 +12,11 @@ extraction, and LWE key switching. It is self-contained and **std-only** — no
 pairing, no NTT prime (the `2^32` modulus makes the ring arithmetic exact
 wrapping `u32`), no external C.
 
-This is a **scaffold commit**: the entire mechanical layer is real and tested;
-the irreducible soundness core (external product / CMux / blind rotation /
-bootstrap) is scaffolded behind a gate for a later Fable-tier pass. Toy/test
-parameters only — **no security level is claimed**.
+**The module is complete**: the entire mechanical layer is real and tested,
+and the irreducible soundness core (external product / CMux / blind rotation /
+bootstrap) — previously gated behind a flag for a later Fable-tier pass — is
+now implemented for real (`gate.fable_core_implemented = true`, no `@panic`
+remains). Toy/test parameters only — **no security level is claimed**.
 
 ## What is real today (mechanical)
 
@@ -27,10 +28,10 @@ parameters only — **no security level is claimed**.
 | Parameters | `params.zig` | `Params` + validation; the `toy` set and the failure-probability ledger |
 | Scheme | `tfhe.zig` | `Tfhe(P)`: LWE/GLWE/GGSW keygen·encrypt·decrypt, bootstrap-key + key-switch-key gen, `sampleExtract`, `keySwitch`, `decomposeGlwe`, LUT builder, and `clearBootstrap` (the cleartext oracle) |
 
-## The gated Fable core
+## The Fable core (now implemented)
 
-`Tfhe(P)` exposes four functions behind `gate.fable_core_implemented` (currently
-`false`; each `@panic("TODO(fable/core)")`):
+`Tfhe(P)` exposes four functions behind `gate.fable_core_implemented` (now
+`true`; no `@panic` remains):
 
 - `externalProduct(ggsw, glwe)` — GGSW ⊠ GLWE (decompose + dot with the GGSW
   rows); the noise-growth heart.
@@ -40,7 +41,7 @@ parameters only — **no security level is claimed**.
 - `bootstrap(bsk, ksk, lut, ct)` — mod-switch → blind-rotate → sample-extract →
   key-switch → fresh LWE.
 
-## Usage (once the core lands)
+## Usage
 
 ```zig
 const tfhe = @import("tfhe");
@@ -57,8 +58,9 @@ const ct   = T.lweEncrypt(64, &sk, T.encodeBit(1), rand);
 const fresh = T.bootstrap(&bsk, &ksk, &lut, &ct);   // Dec == 1, noise reset
 ```
 
-The mechanical surface is usable and tested standalone today (the ring, the
-gadget, `sampleExtract`/`keySwitch`, and the `clearBootstrap` cleartext oracle).
+Every piece above — the mechanical surface (ring, gadget, `sampleExtract`/
+`keySwitch`, `clearBootstrap`) AND `bootstrap` itself — is real and tested
+today; the snippet runs end to end.
 
 ## Verify
 
@@ -67,14 +69,15 @@ zig build test-tfhe --summary all                    # Debug
 zig build test-tfhe -Doptimize=ReleaseFast --summary all
 ```
 
-24 pass / 5 skip (Debug and ReleaseFast). The skips are the core-dependent
-end-to-end anchors (programmable gate, 2-input AND, unlimited-depth chain,
-corrupted-key control, noise budget) that light up when the gate flips. Real
-today: the ring/gadget/torus tests, the LWE/GLWE round-trips, the sample-extract
-and key-switch anchors, the cleartext LUT+rotation oracle over 64 random bits,
-and three deliberately-broken positive controls (sign-dropped sample extraction,
-dropped-level gadget decomposition, wrong-sign rotation exponent) proving the
-harness has teeth before the core exists.
+30/30 pass, 0 skip (Debug and ReleaseFast). This includes the core-dependent
+end-to-end anchors — the programmable gate (`bootstrap(identity)`/
+`bootstrap(NOT)`), a 2-input homomorphic AND, an unlimited-depth bootstrap
+chain, a corrupted-bootstrap-key control, and the output noise-budget
+assertion — plus the ring/gadget/torus tests, the LWE/GLWE round-trips, the
+sample-extract and key-switch anchors, the cleartext LUT+rotation oracle over
+64 random bits, and three deliberately-broken positive controls (sign-dropped
+sample extraction, dropped-level gadget decomposition, wrong-sign rotation
+exponent) that prove the harness has teeth independent of the core.
 
 Provenance: clean-room from the TFHE (ePrint 2016/870) and FHEW (EUROCRYPT 2015)
 papers; no third-party source ported and no implementation studied as a design

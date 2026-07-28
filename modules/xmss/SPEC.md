@@ -37,9 +37,20 @@ len_1 = 64, len_2 = 3, len = 67):
 
 **Not implemented:** XMSS^MT (§4.2 multi-tree — different OID space and
 hypertree signing); the SHA-512 and SHAKE suites (§5 OPTIONAL; RFC only
-REQUIRES the SHA2-256 sets); BDS/fractional traversal ([BDS09] — the RFC
-explicitly leaves auth-path computation implementation-defined; we use
-the naive recompute, O(2^h) hashing per signature).
+REQUIRES the SHA2-256 sets).
+
+**Auth-path traversal — BDS, implemented (not the naive recompute).** RFC
+8391 explicitly leaves auth-path computation implementation-defined
+([BDS09] is cited but not mandated). This module ports the
+Buchmann–Dahmen–Schneider log-space traversal from the reference
+`xmss_core_fast.c` (parameter k = 0), held in `SecretKey.bds`: `sign`
+emits the current leaf's precomputed auth path and advances the state to
+the next leaf in ~O(h) hashing (about verify cost) instead of rebuilding
+the whole path in O(2^h). The BDS state tracks `covered_idx` in lockstep
+with `sk.idx`; a caller that jumps `idx` out of band (index partitioning,
+a restored key) triggers an automatic O(2^h) resync so the emitted
+signature is still byte-exact. `keyGen` remains O(2^h) (it now also seeds
+the initial BDS state) — only per-signature auth-path cost is reduced.
 
 ## Statefulness — the key hazard
 
@@ -86,6 +97,19 @@ same comptime code path, exercised only at h ≤ 10.
 Round-trip-only (no external bytes involved): the h = 2 stateful walk —
 sign 4 messages, verify each, index monotonicity, `KeyExhausted` on the
 5th, cross-message rejection.
+
+**BDS traversal, differential against a from-scratch reference (no
+external oracle for this — RFC 8391 leaves it implementation-defined, so
+there is no third-party BDS vector to match; the reference oracle instead
+is this module's own naive `buildAuth`, a full O(2^h) recompute):** the
+h = 4 exhaustive sweep signs and verifies every one of the 16 leaves,
+byte-comparing the BDS-produced auth path against `buildAuth` at each
+index; the h = 6 sweep does the same for all 64 leaves, with the
+differential re-run at the boundary indices around the 2^(h-1)
+left/right-subtree transition (the part of BDS most likely to be
+mis-ported); a dedicated test jumps `idx` out of band (skipping several
+leaves, and landing exactly on the h = 6 transition leaf) and confirms
+the auto-resync still reproduces the from-scratch auth path byte-exactly.
 
 ## Threat notes
 

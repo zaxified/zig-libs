@@ -34,10 +34,11 @@ around that seam:
 
 Layout mirrors the repo's scaffold→gate→positive-control→harness pattern
 (`df-elect`, `raft`): `types.zig` (config + header codec), `routing.zig`
-(stratified routes + the Sphinx proof), `mixing.zig` (**the gated core**),
-`adversary.zig` (**the anonymity invariant + measurement — the real content**),
-`protocol.zig` (the `netsim.Protocol` consumers + the FIFO positive control),
-`gate.zig` (the one switch).
+(stratified routes + the Sphinx proof), `mixing.zig` (**the mixing core, now
+implemented — see "Part 2 result" below**), `adversary.zig` (**the anonymity
+invariant + measurement — the real content**), `protocol.zig` (the
+`netsim.Protocol` consumers + the FIFO positive control), `gate.zig` (the one
+switch, now flipped `true`).
 
 ## Threat model — the anonymity invariant, and how it is measured
 
@@ -88,19 +89,20 @@ flukes:
   still memoryless, but at a low real-traffic rate a mix often holds a *single*
   packet, so the causal candidate set is `{d*}` — effective set collapses to 1
   even though `p(d*)` looks unremarkable. It fails clause 1. (Demonstrated by
-  `adversary.zig`'s synthetic thin-pool test; the running no-cover control needs
-  the gated core, so it activates with clause-1 teeth once the flag flips.)
+  `adversary.zig`'s synthetic thin-pool test; the running no-cover control, now
+  that the core is implemented, confirms clause-1 teeth for real — measured
+  `min_eff_set 1.06` against the `2.0` bound, see "Part 2 result" below.)
 
 The separation is **1.0 vs ~1/pool, not 0.6 vs 0.4** — there is no seed on which
 FIFO "accidentally mixes", so no threshold tuning can make the teeth flaky. The
 metric is a pure function of a concrete transcript, itself a pure function of the
 netsim seed, so a seed sweep just averages independent draws (LLN). This
 robustness is the design's whole point and the reason the harness — not the
-gated core — is the Fable-worthy work.
+mixing core itself — is the Fable-worthy work.
 
 ## The Fable boundary — and an honest tier call for the core
 
-**Gated core (`mixing.zig`, three `@panic` stubs):**
+**Core (`mixing.zig`, now implemented — see "Part 2 result" below):**
 
 - `sampleExpDelay(prng, mean) Time` — a **memoryless integer** delay draw. The
   one real subtlety: netsim time is integer ticks, and a floored *continuous*
@@ -173,8 +175,9 @@ mix's measured behaviour + flip the gate) to **Opus**.
 
 ## Verification
 
-`zig build test-loopix`, green in Debug **and** ReleaseFast, no leaks, 18 tests
-(17 run + 1 gated skip):
+`zig build test-loopix`, green in Debug **and** ReleaseFast, no leaks, 23 tests,
+**0 skip** (the gate is flipped — every test that used to be gated now runs for
+real):
 
 - **Sphinx substrate:** a real onion for a 3-mix route peels hop-by-hop,
   recovering each hop's `(next_hop, delay)`, final hop flagged.
@@ -185,6 +188,7 @@ mix's measured behaviour + flip the gate) to **Opus**.
 - **FIFO positive control end-to-end:** run through netsim, its transcript scored
   by `measure` — `max_link_prob > 0.9`, `min_effective_set < 1.5`, invariant
   fails; and a seed sweep under fuzzed faults keeps flagging it.
-- **Gated:** the real `Loopix` mix's cross-seed anonymity test SKIPs until
-  `gate.fable_core_implemented` flips (its call sites into `mixing.zig` are still
-  type-checked).
+- **Real `Loopix` mix, cross-seed:** with `gate.fable_core_implemented = true`
+  this test now runs (not skipped) and drives the real Poisson mix through
+  netsim across a seed sweep, asserting `AnonymityBound` holds — see "Part 2
+  result" above for the measured separation from the FIFO/no-cover controls.

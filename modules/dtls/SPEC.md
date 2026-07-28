@@ -6,13 +6,21 @@ see that file's placement note).
 
 ## Design & invariants
 
-**STATUS UPDATE (crypto core landed):** the crypto-core layer
-(`keyschedule.zig`, `aead.zig`) is now REAL and KAT-validated — the 15
+**STATUS UPDATE (crypto core AND flight engine landed):** the crypto-core
+layer (`keyschedule.zig`, `aead.zig`) is REAL and KAT-validated — the 15
 functions below are implemented (see each file's tests + `root.zig`'s module
-doc for the oracles). What remains deferred is the handshake FLIGHT ENGINE
-(`Connection.startHandshake` returns `error.HandshakeEngineNotImplemented`).
-The rest of this SPEC is the original design/recon notes; the itemized
-15-function checklist below is retained as an implementation record.
+doc for the oracles). The handshake FLIGHT ENGINE (`Connection.startHandshake`
+/ `.handleFlight` / `.poll`) is now ALSO implemented — a real RFC 9147 §5
+PSK-only (and, additively, `.cert_dhe` certificate-only) client+server
+handshake, proven by an in-memory client↔server interop suite (see
+`Connection.zig`'s tests and `root.zig`'s module doc for the full list of
+what is exercised). The `error.HandshakeEngineNotImplemented` this section
+used to describe no longer exists in the code. What remains genuinely open is
+third-party-peer interop (the engine is validated for SELF-interop only —
+see `root.zig`'s "SCOPE CAVEAT" — and HelloRetryRequest/0-RTT/resumption/key
+update/CCM stay explicitly out of scope, not stubbed). The rest of this SPEC
+is the original design/recon notes; the itemized 15-function checklist below
+is retained as an implementation record (all 15 are done).
 
 **Layered, like this repo's other DTLS/TLS-family scaffolds
 (`opcua`/`noise`/`x509`):** the wire-framing layer (`record.zig`,
@@ -21,9 +29,10 @@ where practical, and operates only on caller-supplied byte slices — no I/O,
 no wall-clock calls (`flight.zig`'s timer takes `now_ms` from the caller),
 no key material. The crypto-core layer (`keyschedule.zig`, `aead.zig`) is now
 real. `Connection.zig` wires the two together: `Config.validate`,
-`clientInit`/`serverInit`, and the application-data record path
-(`installApplicationKeys` + `send`/`recv`) are real and tested;
-`startHandshake` (the flight engine) is the one deferred piece.
+`clientInit`/`serverInit`, the application-data record path
+(`installApplicationKeys` + `send`/`recv`), and `startHandshake` /
+`handleFlight` / `poll` (the flight engine) are all real and tested — see
+the "STATUS UPDATE" above.
 
 **Key correction to the recon below:** items reference DTLS reusing the TLS
 1.3 key schedule "unchanged" and treating `hkdfExpandLabel` as a std
@@ -89,9 +98,11 @@ names the exact RFC section; this is the itemized checklist:
     — RFC 9147 §4.2.3's ChaCha20-suite equivalent (confirm it is NOT simply
     the AES path with the cipher swapped before assuming so).
 
-Once (1)-(15) are real, `Connection.startHandshake`/`send`/`recv` need their
-`@panic` calls replaced with the actual sequencing (each documents exactly
-which real framing calls surround the panic today).
+(Historical note: this "once (1)-(15) are real" instruction has since been
+carried out — `Connection.startHandshake`/`handleFlight`/`send`/`recv` no
+longer have `@panic` placeholders; see the "STATUS UPDATE" at the top of this
+file. Retained here as the original implementation record, not current
+guidance.)
 
 ## Crypto-heaviness, honestly assessed vs. this repo's other scaffolds
 
@@ -153,22 +164,23 @@ left in place rather than silently deleted, corrected here):
   is a minimal one-hop check only; `CertificateEntry` extensions (OCSP
   stapling/SCT) — framed empty on send, length-validated-but-discarded on
   receive.
-- **KNOWN GAP, not this module's to fix:** `std.crypto.Certificate.parse`
-  (Zig 0.16) is confirmed (by fuzzing, during this work) NOT panic-safe
-  against malformed/adversarial DER — even trivial few-byte or random
-  ~30-60-byte inputs reliably crash the process via an unguarded array
-  index deep in std's ASN.1 walker, rather than returning a typed error.
-  `certauth.zig`'s own error handling cannot intercept a panic (Zig has no
-  exception mechanism). A live deployment that feeds a PEER-supplied
-  Certificate message's bytes into `certauth.parseLeafPublicKey`/
-  `.verifyLeafAgainstAnchor` is exposed to a process-crash DoS from a
-  malformed certificate until std fixes this (or a from-scratch hardened
-  DER parser replaces this bridge — a real, substantial undertaking, out of
-  a "no new crypto" Sonnet-tier pass). See `certauth.zig`'s module doc
-  "KNOWN GAP" section for the full writeup + the fuzz evidence retained in
-  that file's own test suite (`test "parseLeafPublicKey: ..."` intentionally
-  does NOT test adversarial input for exactly this reason — see its
-  comment).
+- **CLOSED GAP (corrected from an earlier draft of this SPEC):**
+  `std.crypto.Certificate.parse` (Zig 0.16) was confirmed by fuzzing to be
+  NOT panic-safe against malformed/adversarial DER — even trivial few-byte
+  or random ~30-60-byte inputs reliably crashed the process via an
+  unguarded array index deep in std's ASN.1 walker, rather than returning a
+  typed error, and `certauth.zig` could not intercept a panic (Zig has no
+  exception mechanism). This is no longer live: both `certauth.zig` entry
+  points (`parseLeafPublicKey`, `verifyLeafAgainstAnchor`) now route
+  PEER-supplied Certificate bytes through this collection's `x509` module's
+  bounds-checked `spkiOf`/`safeCertificate` bridge first and never call
+  `std.crypto.Certificate.parse` directly, so the same hardened parser
+  `iec62351` and `opcua` already use closes this module's copy of the gap
+  too. See `certauth.zig`'s module doc "CLOSED GAP" note for the full
+  writeup, and its `test "parseLeafPublicKey: adversarial DER returns a
+  typed error instead of panicking"` for the fuzz-style regression coverage
+  (empty/truncated/malformed DER and a full truncation sweep of a real
+  certificate, all typed-error, no crash).
 
 ## Cert-only (EC)DHE mode (RFC 8446 §4.2.8 key_share + X25519, LANDED)
 

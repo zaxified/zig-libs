@@ -220,10 +220,13 @@ Constant-time contract (secret nonce — verified by disassembly of the ReleaseF
 
 ## Backlog (the Fable phase + beyond)
 
-1. `fast_core.fieldMul`/`fieldSq` — the `MULX/ADX` field mul + square with the
-   special-prime fold (watch the fold-carry propagation; see montint's asm notes).
-2. `group.mulPublicGlv` — GLV+wNAF variable-base multiply on the proven
-   `splitScalar`; extend GLV to the double-base verify path.
+1. ~~`fast_core.fieldMul`/`fieldSq` — the `MULX/ADX` field mul + square with the
+   special-prime fold (watch the fold-carry propagation; see montint's asm notes).~~
+   **DONE** — `gate.field_asm_implemented = true`; core-vs-portable differential
+   live in `oracle_test.zig`.
+2. ~~`group.mulPublicGlv` — GLV+wNAF variable-base multiply on the proven
+   `splitScalar`; extend GLV to the double-base verify path.~~
+   **DONE** — `gate.glv_scalarmul_implemented = true`; differential live.
 3. ~~Fixed-base wNAF/precomp table for `G` (constant-time base-point mul).~~
    **DONE** — `group.combMulBase` (fixed-base comb, w=4, signed-digit,
    blackBox-guarded CT gather). Sign ~4.3× faster (~2.3× libsecp256k1).

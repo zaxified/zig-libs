@@ -208,10 +208,15 @@ a `Backend`), not a hard dependency, because `http` is foundational and
 drag the resilience/probe stack into every `http` consumer). An
 `upstream.Pool` (load-balanced, health-checked backends) or a `router`
 route composes from above through that seam; `resilience` wraps the
-forward operation there too. **Known gaps this pass:** no `Client`
-connection pooling (one backend connection per request — `Client`'s own
-Phase-1 non-goal), HTTP/1.1 backends only (no h2 upstreaming), no shared
-response buffer pool.
+forward operation there too. Backends can also be forwarded over **HTTP/2**
+per-backend (`Backend.protocol` = `.h2c`/`.h2`), multiplexed through an
+`h2_upstream.Pool` — see "Reverse proxy" below. **Known gaps this pass:**
+h2-upstream bodies are buffered (bounded), not streamed like the h1 path;
+no shared response buffer pool for the *server*-side `ResponseWriter`
+(the *client*-side one, `Client.Options.buffer_pool`, already exists).
+Backend connection pooling is **not** a gap: `Client` keeps a keyed idle
+`Pool` on by default, and every backend connection this handler opens is
+checked out of and returned to it transparently.
 
 ## Direct-internet posture (Phase 2.1 hardening)
 
@@ -323,8 +328,15 @@ covers the client population; `deflate` adds nothing over it).
   307/308 preserve method + body (Go semantics). `Authorization` is dropped
   when the redirect changes the host (exact host match, unlike Go's
   subdomain rule). Cap via `Options.max_redirects`.
-- **Connections:** one per request, `Connection: close`. Keep-alive/pooling
-  is a deliberate Phase 1 non-goal (TODO).
+- **Connections:** a keyed idle-connection `Pool` (`Options.pool`, on by
+  default) keeps warm, keep-alive-eligible connections per origin; a
+  request checks one out on a hit or dials fresh on a miss, and returns it
+  to the pool only when the response left it clean and fully drained
+  (`Connection: close`, an HTTP/1.0 response with no explicit
+  `keep-alive`, a `101` upgrade, an undrained body, or any read/write error
+  all close the connection instead of pooling it). Set
+  `Options.pool.enabled = false` for the old one-shot-per-request behavior
+  (`Connection: close` on every request).
 - **TLS:** `std.crypto.tls.Client`, system CA bundle loaded lazily once per
   Client; `tls.verify = .insecure_no_verify` opt-out for testing.
 - **Timeouts:** `total_timeout_ms` is checked between phases (connect, head,

@@ -91,7 +91,10 @@ pub const transport = @import("transport.zig");
 pub const application = @import("application.zig");
 /// Object-header framing + the core static object library.
 pub const objects = @import("objects.zig");
-/// SCAFFOLD ONLY -- Secure Authentication (g120) hook. See its doc comment.
+/// Secure Authentication, SAv2 symmetric core (g120) — implemented (AES Key
+/// Wrap, MAC-algorithm registry, message codecs, challenge-response flow);
+/// the SAv5/SAv6 asymmetric update-key change is out of scope. See its own
+/// doc comment for the full implemented/out-of-scope/validated breakdown.
 pub const sa = @import("sa.zig");
 /// Table-driven codec for every static and event object variation the
 /// outstation speaks (the object records that follow an object header).

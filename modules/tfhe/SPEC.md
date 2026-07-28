@@ -95,6 +95,18 @@ that collapses the fix-space; if a future pass finds published byte-exact TFHE
 vectors for a fixed parameter set, the core should be de-tiered — but none is
 known.
 
+## Fable core — done-record (was: gated/TODO)
+
+All four cores (`externalProduct`, `cmux`, `blindRotate`, `bootstrap`) are
+implemented in `tfhe.zig`; `gate.fable_core_implemented` is flipped `true`, no
+`@panic` remains behind it, and every previously SKIP-gated anchor now runs:
+the programmable-gate test, the 2-input homomorphic AND, the unlimited-depth
+bootstrap chain, the corrupted-bootstrap-key control, and the noise-budget
+assertion all pass (30/30 tests, 0 skip — see README.md's "Verify" section).
+This did **not** change the Fable-tier call above, which is a verdict about
+*why* the work needed Fable-level skill (no external anchor, nontrivial
+design space), not a claim that the work remains undone.
+
 ## Verification harness (anchors)
 
 No external KAT, so the harness leans on three independent teeth:
@@ -107,15 +119,15 @@ No external KAT, so the harness leans on three independent teeth:
    place off-by-one/sign bugs live) BEFORE the core exists, and is the reference
    the gated `bootstrap` end-to-end tests decrypt against. Verified today over 64
    random bits for both the identity and NOT LUTs.
-2. **Homomorphic property end-to-end (SKIP-gated until the core lands).** A
-   programmable gate (`bootstrap(identity)` == in, `bootstrap(NOT)` == ¬in), a
-   2-input homomorphic **AND** via LWE sum + LUT, and — the whole point — an
-   **unlimited-depth chain**: bootstrap the identity LUT in a chain and confirm
-   the message survives every refresh (a leveled scheme fails long before; only
-   correct noise-RESET sustains it). Plus a noise-budget assertion (output noise
-   `< Δ/4 ≪ Δ/2`).
-3. **Deliberately-broken positive controls (PASS today — teeth before the
-   core).**
+2. **Homomorphic property end-to-end (now real, was SKIP-gated until the core
+   landed).** A programmable gate (`bootstrap(identity)` == in,
+   `bootstrap(NOT)` == ¬in), a 2-input homomorphic **AND** via LWE sum + LUT,
+   and — the whole point — an **unlimited-depth chain**: bootstrap the
+   identity LUT in a chain and confirm the message survives every refresh (a
+   leveled scheme fails long before; only correct noise-RESET sustains it).
+   Plus a noise-budget assertion (output noise `< Δ/4 ≪ Δ/2`). All pass today.
+3. **Deliberately-broken positive controls (PASS today — teeth independent of
+   the core).**
    - *Sign-dropped sample extraction* — omitting the negacyclic sign flip
      `a_ext[j] = −a(X)_{N−j}` decrypts to a different value; the real extraction
      is always correct.
@@ -125,9 +137,9 @@ No external KAT, so the harness leans on three independent teeth:
    - *Wrong-sign rotation exponent* — flipping the phase sign reads the wrong LUT
      slot and misdecodes; the correct rotation is always right. (Directly targets
      the blind-rotation off-by-one bug class.)
-   - *(SKIP-gated)* a corrupted bootstrap key must NOT bootstrap correctly —
-     proving the CMux/key-switch path is load-bearing (mirrors `bfv`'s
-     corrupted-relin-key control).
+   - A corrupted bootstrap key must NOT bootstrap correctly — proving the
+     CMux/key-switch path is load-bearing (mirrors `bfv`'s corrupted-relin-key
+     control). Also passes today.
 
 ## Noise / failure-probability ledger
 
@@ -151,13 +163,14 @@ NTT for speed; here the exact schoolbook is the correctness oracle and is fine
 for the toy dimensions (`N ≤ 512`). The only rounding in the mechanical layer is
 the modulus switch's half-ulp, which is deterministic and bounded.
 
-## Threats / caveats (scaffold)
+## Threats / caveats
 
 - **No security level claimed.** `toy` is correctness-only; do not encrypt
-  anything real until a security-grade parameter set + the core land.
+  anything real until a security-grade parameter set lands.
 - **Not constant-time.** Samplers and gadget code are public-data-shaped, but the
-  secret-dependent paths (keygen/encrypt and the future blind rotation) must be
-  audited for timing when the core is implemented — flagged for the Fable pass.
+  secret-dependent paths (keygen/encrypt and blind rotation, now implemented)
+  have not had a dedicated timing audit — still an open item, not something
+  landing the core resolved.
 - **Probabilistic correctness.** Bootstrapping correctness is average-case (see
   the ledger); the toy set's `≈68σ` margin makes failure astronomically
   unlikely, but there is no worst-case guarantee — this is intrinsic to TFHE and

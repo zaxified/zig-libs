@@ -48,7 +48,7 @@ allocation — the caller gets a truncated/capped view instead. Out of scope: wr
 `/proc` read permissions.
 
 ## Verification
-27 offline tests across `arp.zig`/`routes.zig`/`sockets.zig`/`conntrack.zig`/`process.zig`
+29 offline tests across `arp.zig`/`routes.zig`/`sockets.zig`/`conntrack.zig`/`process.zig`
 (dark-aggregated from `root.zig`), golden-text fixtures under `src/testdata/` for each table
 (including real `tcp6`/`udp6` kernel captures verifying the little-endian-hex IPv6 decode),
 malformed-row-skipped-not-fatal cases, and the `readVirtualFile` streaming-vs-`stat`-size-0

@@ -248,5 +248,5 @@ Run: `zig build test-nftables` (and `--release=fast`), `unshare -rn zig build te
   endian-explicit and would need a big-endian capture to be pinned.
 
 ## Status
-`gap · any · codec · reentrant` + deps: none (std only) — canonical source is `pub const meta` in
-src/root.zig. `Socket` is Linux-only and `single_owner`.
+`gap · any · codec · reentrant` + deps: `netlink` (Socket's nlmsghdr/nlattr codec is shared) —
+canonical source is `pub const meta` in src/root.zig. `Socket` is Linux-only and `single_owner`.

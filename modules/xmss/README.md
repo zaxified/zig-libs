@@ -41,9 +41,16 @@ updated key *before* releasing the signature; never sign from a restored
 backup or from two copies of the key. If you cannot guarantee that, use
 the stateless sibling module `slhdsa` instead. See SPEC.md.
 
-**Not implemented:** XMSS^MT (multi-tree), SHA-512/SHAKE suites, BDS
-traversal (signing recomputes the auth path: O(2^h) hashes per signature —
-fine at h = 10, use out-of-band caching before reaching for h = 20).
+**Not implemented:** XMSS^MT (multi-tree), SHA-512/SHAKE suites.
+
+**Auth-path traversal is BDS (Buchmann–Dahmen–Schneider), not a naive
+recompute:** `sign` emits the current leaf's auth path from `SecretKey.bds`
+and advances it in ~O(h) hashing per signature (about verify cost), instead
+of rebuilding the whole path in O(2^h) — cheap even at h = 20. An
+out-of-band `idx` jump (index partitioning, a restored key) auto-resyncs
+the BDS state in O(2^h) before that one signature, then stays O(h) again.
+See SPEC.md for how this is validated (differential against a from-scratch
+reference at every leaf for two heights, plus a dedicated resync test).
 
 - **Model after:** RFC 8391 (public IRTF spec, clean-room); the XMSS
   reference implementation used only as a black-box KAT oracle (NOTICE).

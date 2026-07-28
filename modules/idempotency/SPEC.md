@@ -27,27 +27,34 @@ public docs + `draft-ietf-httpapi-idempotency-key-header`); built on sibling `ra
 `http` — see NOTICE.
 
 ## Threat model / out of scope
-**Concurrent first-flights of the same key are not handled**: two requests arriving before either
-has recorded a response will both execute the handler (no in-progress "409 in flight" lock) — a
-true concurrent-retry race can still double-run the side effect; this module dedupes *sequential*
-retries against a *completed* response only. **Request-fingerprint mismatch is not detected**: a
-client reusing a key with a different request body gets the originally recorded response regardless
-— treated as the client's bug, not verified against. Not a general response cache (only ever serves
-the byte-for-byte original response back to the *same key*), and not a security boundary — a key is
-whatever the client sends, with no authentication tying it to a caller identity.
+**Concurrent first-flights of the same key ARE handled**, via an in-flight reservation set
+(`Store.in_flight`, a `StringHashMapUnmanaged(void)`): the first request to see a miss reserves the
+key for the duration of its handler; a second same-key request arriving before the first completes
+sees the reservation and is answered **409** (`reserve` returns `.in_flight`) rather than running the
+handler a second time — proven by a reentrant test that fires the duplicate *from inside* the first
+handler while it is still executing (`"concurrent first-flight of the same key does not double-run
+(in-flight 409)"`). This closes the true concurrent-retry race for requests routed through the same
+process; it does not span multiple processes/machines (the reservation set is in-process state, not
+shared via `ramcache`). **Request-fingerprint mismatch is not detected**: a client reusing a key with
+a different request body gets the originally recorded response regardless — treated as the client's
+bug, not verified against. Not a general response cache (only ever serves the byte-for-byte original
+response back to the *same key*), and not a security boundary — a key is whatever the client sends,
+with no authentication tying it to a caller identity.
 
 ## Verification
-8 offline tests through `http.Server.serveStream` with a real `router` + `ramcache`: first key runs
+9 offline tests through `http.Server.serveStream` with a real `router` + `ramcache`: first key runs
 the handler once and a replay returns the cached response without re-running (hit-counter
-asserted), a different key runs again, a non-idempotent method (GET) bypasses, a POST with no key
-bypasses, an invalid key → 400, target-scope isolation across paths, TTL expiry re-runs the handler
-(injected clock), encode/decode round-trip. `zig fmt --check` clean. Run: `zig build
-test-idempotency`.
+asserted), a concurrent same-key duplicate fired from inside the first handler is rejected 409
+in-flight without a second handler run, a different key runs again, a non-idempotent method (GET)
+bypasses, a POST with no key bypasses, an invalid key → 400, target-scope isolation across paths,
+TTL expiry re-runs the handler (injected clock), encode/decode round-trip. `zig fmt --check` clean.
+Run: `zig build test-idempotency`.
 
 ## Backlog / deferred
-None beyond the two explicit non-goals in Threat model (concurrent-first-flight locking,
-request-fingerprint verification) — `idempotency` sits in the prod-API hardening cluster
-with no further per-module gap noted.
+None beyond the one explicit non-goal in Threat model (request-fingerprint verification) —
+`idempotency` sits in the prod-API hardening cluster with no further per-module gap noted.
+In-flight reservation is single-process only; a multi-process/multi-machine deployment sharing one
+`ramcache`-backed store would still need a distributed lock to close the same race across processes.
 
 ## Status
 `gap · any · server · threadsafe` · deps: `router`, `http`, `ramcache` — canonical source is `pub

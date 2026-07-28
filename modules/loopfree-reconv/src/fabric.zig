@@ -72,8 +72,9 @@ const Allocator = std.mem.Allocator;
 const NodeId = netsim.NodeId;
 
 /// Which FIB-update-ordering strategy the conductor uses on every topology
-/// change. `naive_bad` never touches the Fable stub; `ordered_fable` is the
-/// real thing under test (and therefore panics until it's implemented).
+/// change. `naive_bad` is the deliberately-wrong baseline (applies FIB
+/// updates in an unordered/racy sequence); `ordered_fable` drives the real,
+/// implemented `fib.computeUpdateOrder` kernel under test (see `fib.zig`).
 pub const Mode = enum { naive_bad, ordered_fable };
 
 pub const NODE_COUNT: usize = 4;

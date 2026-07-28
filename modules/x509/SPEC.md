@@ -9,39 +9,41 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
 bounds-checked DER TLV decoding of the X.509v3 extension fields
 `std.crypto.Certificate.Parsed` does not expose — no policy decisions, no
 cryptography, just "turn these bytes into a typed Zig value." `chain.zig`
-(API real, algorithm stubbed) is the RFC 5280 §6 path-validation DECISION
-layer built on top: given a peer-supplied certificate chain and a trust
-store, decide whether to trust it. That decision requires, per RFC 5280:
+(API and algorithm both real, **DONE** — see "Status" below) is the RFC
+5280 §6 path-validation DECISION layer built on top: given a peer-supplied
+certificate chain and a trust store, decide whether to trust it. That
+decision requires, per RFC 5280 — and `verifyChain` implements all of it:
 
 - Path building (finding a chain of issuer/subject matches from leaf to a
   trust anchor, potentially among multiple same-subject-DN candidates —
   RFC 5280 doesn't specify an algorithm for this; RFC 4158 is the closest
-  reference).
+  reference) — `buildPath`, with backtracking over alternate candidates.
 - Per-link cryptographic verification — **delegated entirely to
   `std.crypto.Certificate.Parsed.verify`**, not reimplemented, except for
-  the RSA-PSS gap (`verifyPssLink`, still stubbed) since std cannot even
-  parse a PSS-signed certificate.
+  the RSA-PSS gap (`verifyPssLink`, implemented and KAT-tested against
+  OpenSSL — see "Status") since std cannot even parse a PSS-signed
+  certificate.
 - basicConstraints/keyUsage enforcement (every non-leaf cert must be a CA
   with `keyCertSign`) — real values come from `extensions.zig`; the
-  enforcement DECISION is `chain.zig`'s stub.
+  enforcement DECISION is `chain.zig`'s `checkIsCaSigner`.
 - pathLenConstraint bookkeeping with the self-issued-certificate exception
   (RFC 5280 §6.1.4 (l) — the single most commonly-mis-implemented rule in
   this whole algorithm: self-issued certificates, subject==issuer
-  byte-for-byte, do not count against ANY CA's path-length budget).
+  byte-for-byte, do not count against ANY CA's path-length budget) —
+  `checkPathLength`.
 - Name-constraint matching (§6.1.4 (g), §4.2.1.10) — per-`GeneralName`-type
   matching rules (dNSName label-suffix, directoryName RDN-prefix
   containment, iPAddress CIDR, etc.) applied to the accumulated permitted/
-  excluded subtrees from every CA in the path.
+  excluded subtrees from every CA in the path — `checkNameConstraints`.
 - Extended-key-usage consistency/chaining and the leaf's required-purpose
-  check.
+  check — `checkExtendedKeyUsage`.
 - Hostname matching — **delegated to `std.crypto.Certificate.Parsed.verifyHostName`**,
   already RFC-6125-tested by std, not reimplemented.
 
-Every stub in `chain.zig` has a doc comment naming exactly which of the
-above it covers and why it's algorithm work rather than parsing. See
-`src/root.zig`'s module doc comment for the full `std.crypto.Certificate`
-recon this design decision (build on std, don't reparse/reverify) is based
-on.
+Every named sub-algorithm in `chain.zig` has a doc comment naming exactly
+which of the above it covers. See `src/root.zig`'s module doc comment for
+the full `std.crypto.Certificate` recon this design decision (build on std,
+don't reparse/reverify) is based on.
 
 **Explicitly out of scope, not silently skipped:** revocation checking
 (CRL/OCSP, RFC 5280 §6.3 — a separate online/offline data-fetching concern)

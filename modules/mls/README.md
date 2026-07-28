@@ -180,7 +180,7 @@ zig build test-mls --summary all
 zig build test-mls --summary all -Doptimize=ReleaseFast
 ```
 
-44 tests, all running (the `gate.treekem_core_implemented`-gated TreeKEM
+46 tests, all running (the `gate.treekem_core_implemented`-gated TreeKEM
 tests now execute). Coverage includes Part 1's `tree-math.json`/
 `crypto-basics.json` KATs (see below); Part 2's `tree-validation.json`
 (tree hash + leaf signatures + resolution for every node across 14

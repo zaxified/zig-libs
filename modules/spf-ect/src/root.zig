@@ -273,8 +273,9 @@ pub const Tree = struct {
 ///     their comparison key from a function of the path that's symmetric
 ///     under reversal (e.g. built from the SET of node ids on the path, or
 ///     from a canonically-oriented digest of it), not from positional
-///     front-to-back order. That derivation is the actual hard part; this
-///     doc comment is the spec, `@panic` below is the TODO.
+///     front-to-back order. That derivation was the actual hard part; the
+///     implementation below is this doc comment's contract made real (no
+///     `@panic` remains — see the lexicographic composite it builds).
 ///
 /// `a`/`b` may have different lengths (equal path COST does not imply equal
 /// hop count when weights vary).

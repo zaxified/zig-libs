@@ -16,14 +16,14 @@
 //! other arch. Inline asm in Zig is still native Zig — no libc, no C — so the
 //! zero-C invariant holds.
 //!
-//! ## Scaffold status (this phase)
+//! ## Status: complete (asm core implemented)
 //! The PORTABLE path is **real, constant-time, and byte-exact vs an independent
 //! CPython-bignum oracle** at 256/512/2048/4096 bits — it is the correctness
-//! oracle. The irreducible amd64 asm core is a GATED stub
-//! (`gate.asm_core_implemented = false`); dispatch runs entirely on the
-//! portable oracle until a Fable agent fills `asm_core.montMul` and flips the
-//! flag, at which point the asm-vs-portable differential harness lights up. See
-//! `gate.zig`, `asm_core.zig`, `SPEC.md`.
+//! oracle. The amd64 asm core is now implemented too
+//! (`gate.asm_core_implemented = true`): dispatch routes large moduli
+//! (`L >= asm_min_limbs`) to `asm_core.montMul`/`montSqr` on x86-64+ADX+BMI2
+//! targets, and the asm-vs-portable differential harness runs for real (not
+//! skipped). See `gate.zig`, `asm_core.zig`, `SPEC.md`.
 
 const std = @import("std");
 

@@ -56,14 +56,16 @@
 //! spec explicitly allows this); this module returns exactly the spec's
 //! own 64-byte core so a caller can extend it.
 //!
-//! **Part 2 boundary (Double Ratchet, not implemented here):** X3DH's
+//! **Part 2 boundary (Double Ratchet, not implemented in THIS FILE):** X3DH's
 //! output IS `SK`/`AD` — nothing more. The spec explicitly hands off to
 //! "a post-X3DH protocol" for actually encrypting messages; Signal's own
-//! choice (and this arc's planned Part 2) is the Double Ratchet, seeded
-//! with `SK` as its initial root key. `InitialMessage.ciphertext` here is
-//! therefore an OPAQUE, caller-supplied byte slice — this module carries
-//! it, but does not produce or interpret it (no AEAD is invoked by this
-//! file at all). See `../README.md`'s "Part 2" section.
+//! choice — and this arc's Part 2, implemented and COMPLETE in the sibling
+//! `ratchet.zig` — is the Double Ratchet, seeded with `SK` as its initial
+//! root key. `InitialMessage.ciphertext` here is therefore an OPAQUE,
+//! caller-supplied byte slice — this module carries it, but does not
+//! produce or interpret it (no AEAD is invoked by this file at all). See
+//! `../README.md`'s "Part 2" section and `ratchet.zig`'s own module doc
+//! comment.
 
 const std = @import("std");
 const xeddsa = @import("xeddsa.zig");

@@ -32,6 +32,13 @@
 //!
 //! While `false`, the four cores `@panic` and the dependent tests report SKIP
 //! (a skip is NOT a green light) — the same convention as `bfv`/`fss`/`coconut`.
+//! **The flag is now `true`**: the four cores are implemented for real (no
+//! `@panic` remains) and every previously SKIP-gated test — the programmable
+//! gate, the 2-input AND, the unlimited-depth bootstrap chain, the
+//! corrupted-bootstrap-key control, and the noise-budget assertion — runs and
+//! passes (30/30, 0 skip).
 
 /// The genuine Fable core: externalProduct / cmux / blindRotate / bootstrap.
+/// IMPLEMENTED — see this file's module doc comment and `tfhe.zig`'s
+/// "Fable core" section.
 pub const fable_core_implemented = true;

@@ -31,16 +31,16 @@ touches a socket.
 
 ## Design & invariants
 
-**Layered like `dtls`/`noise` (this repo's other TLS-family scaffolds):**
-codec/bookkeeping is real and allocation-light; the AEAD/HKDF/HMAC crypto
-core is deferred. See `root.zig`'s module doc table for the exact
-real-vs-stub split per file. This is a deliberate split, not laziness: the
-codec (`ticket.zig`) and bookkeeping (`stek.zig`'s ring rotation,
-`select.zig`'s `SessionState` packing) have ONE correct byte layout each,
-provably matched against a real wire trace; the crypto core involves
-security-critical judgment calls (nonce-reuse policy, constant-time
-compares, replay-window sizing) that deserve a dedicated, carefully
-KAT-verified pass rather than a first guess baked into a scaffold.
+**Layered like `dtls`/`noise` (this repo's other TLS-family modules) — and,
+like them, now fully past that split.** The module landed in two passes:
+codec/bookkeeping first (allocation-light, one correct byte layout each,
+provably matched against a real wire trace), then a dedicated
+crypto-implementation pass (see "Crypto-implementation pass — DONE" below)
+that filled in the AEAD/HKDF/HMAC core with the security-critical judgment
+calls (nonce-reuse policy, constant-time compares, replay-window sizing) a
+first guess would have risked getting wrong. Both passes are done; see
+`root.zig`'s module doc table for the current real (no stub) status per
+file.
 
 **Engine-agnostic, no owned state machine.** Every function takes
 already-computed bytes (transcript hashes, secrets, wall-clock readings) as

@@ -35,7 +35,8 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
 
 Offline tests over the `http` server harness: POST→JSON and POST→202, SSE-on-POST progress
 delivery, Origin accept/reject, session assign/validate/unknown-404, GET drain-and-close with
-`Last-Event-ID` replay, and `DELETE` teardown. 13 tests. Run: `zig build test-mcp-http`.
+`Last-Event-ID` replay, `DELETE` teardown, and a `max_sessions` cap rejection (audit MED). 14
+tests. Run: `zig build test-mcp-http`.
 
 ## Backlog / deferred
 

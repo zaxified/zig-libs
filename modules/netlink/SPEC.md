@@ -307,7 +307,7 @@ the entry, the VLANs, release the port and delete both devices (checking the vet
 with its partner). Nothing touches the host: the namespace dies with the child. Where namespaces or
 the bridge/veth drivers are unavailable the child reports a skip code and the test prints
 `SKIPPED` and passes — the suite never fails for lack of privilege. Run: `zig build test-netlink`
-(and `--release=fast`): **81/81 pass, 0 skipped** on a stock Linux 7.0 with user namespaces
+(and `--release=fast`): **86/86 pass, 0 skipped** on a stock Linux 7.0 with user namespaces
 enabled, i.e. both live round-trips really execute there.
 
 ## Backlog / deferred

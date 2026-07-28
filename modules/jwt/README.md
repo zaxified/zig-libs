@@ -23,7 +23,13 @@ the **`ResourceServer` `router` middleware** (P6, RFC 6750) that reads
 `Authorization: Bearer <token>`, runs `Provider.verify`, and either attaches a
 verified `Identity` to the request (`identityOf(ctx)`) or short-circuits with
 the Bearer challenge — **401** `error="invalid_token"` (bare `Bearer` when no
-credential is presented) or **403** `error="insufficient_scope"`.
+credential is presented) or **403** `error="insufficient_scope"`. For hosts
+that don't use `router`, P6 also ships **`Guard`** — the same RFC 6750
+enforcement as a framework-agnostic `authenticate(req)` call that returns an
+owned `AuthContext` or a structured `AuthError` (with `authStatus`/
+`writeBearerChallenge` for the caller to render its own 401/403), plus
+`scopeGranted`/`requireScope`/`requireAllScopes`/`requireAnyScope` and
+optional RFC 9068 `at+jwt` `typ` enforcement.
 
 The **RP flow** (P7) is the mirror image — this module is also an OAuth2/OIDC
 *client*: **PKCE** (RFC 7636 — `pkceGenerateS256`/`pkceGeneratePlain`/
@@ -100,10 +106,12 @@ that. Never authorize from a `ParsedToken` alone.
   A token without `kid` resolves only against a set with exactly one
   usable key — the module never guesses among keys.
 
-Delivery plan (**all six done**): P1 parse + claims · P2 signature verify
+Delivery plan (**all seven done**): P1 parse + claims · P2 signature verify
 (HS/ES/EdDSA) · P3 RSA (RS256/384/512) · P4 JWKS key sets · P5 OIDC
 discovery + JWKS fetch + caching `Provider` · P6 `ResourceServer` `router`
-middleware.
+middleware + framework-agnostic `Guard` · P7 OAuth2/OIDC relying-party flow
+(PKCE, state/nonce, authorization-request + token-exchange builders,
+ID-token acceptance).
 
 ## API
 
@@ -134,6 +142,9 @@ middleware.
 | `ResourceServer.init(gpa, Options) !ResourceServer` (+ `deinit`) | build the `router` middleware; `Options`: `provider`, `claim_opts`, `required_scopes`, `protect` (`all`/`mutations`), `clock`, `lock`, `realm` |
 | `ResourceServer.middleware() router.Middleware` | register before routes; verifies each request's Bearer token |
 | `identityOf(ctx) ?*Identity` | the attached identity — `subject()`, `claims()`, `scopes()` (RFC 6749 space-split), `hasScope()` |
+| `Guard.authenticate(req) AuthError!AuthContext` | framework-agnostic RFC 6750 check (no `router` dependency): same `Provider.verify` underneath, returns an owned `AuthContext` or a structured `AuthError` |
+| `authStatus(AuthError) u16` / `writeBearerChallenge(...)` | map an `AuthError` to 401/403 and render the matching `WWW-Authenticate: Bearer` challenge, for a host that renders its own responses |
+| `scopeGranted` / `requireScope` / `requireAllScopes` / `requireAnyScope` | scope-string / `scp`-array helpers shared by `Guard` and `ResourceServer` |
 | `Clock` / `Lock` | injected wall-clock (`.system`) and Provider-serialization seams (`.none` default) |
 | `Metadata.authorization_endpoint` / `.token_endpoint` | Discovery's OP endpoints (P7) — optional, so a resource-server-only discovery document (P5's original scope) still parses when it omits them |
 | `pkceGenerateS256(random) Pkce` / `pkceGeneratePlain(random) Pkce` | RFC 7636 PKCE pair from a caller-supplied `std.Random` (a real CSPRNG in production); `.plain` is DISCOURAGED — see SPEC.md |
@@ -321,19 +332,25 @@ defer id_token.deinit();
 
 ## Verification
 
-`zig build test-jwt` — 78 fully offline tests (21 from P1 incl. the
+`zig build test-jwt` — 83 fully offline tests (21 from P1 incl. the
 mandatory-audience confused-deputy test, 12 from P2, 6 from P3, 10 from P4,
-9 from P5, 4 from P6, 16 from P7 — see below), green under Debug and
-ReleaseFast. A dedicated `SECURITY: mandatory audience …` test proves a token
-minted for a sibling service is rejected by default and accepted only when
-the `aud` matches or `.any` is set; the P5 `fetchJwks` test proves a
-network-fetched `oct` key is refused (`oct_from_network`) while the same set
-is accepted locally. P5 drives the `Provider` over a scripted `Fetcher`
-(discovery, fetch, TTL/rotation refresh, rate limit, typed failures); P6 runs
-the middleware end-to-end over a real `router` + `http.Server.serveStream`
-(valid → 200 + identity; missing/invalid/expired/wrong-scheme → 401 with the
-right challenge; insufficient scope → 403; `protect=.mutations` lets reads
-through untouched; `ScopeIter` + `InvalidRealm`).
+9 from P5, 9 from P6+`Guard` combined, 16 from P7 — see below), green under
+Debug and ReleaseFast. A dedicated `SECURITY: mandatory audience …` test
+proves a token minted for a sibling service is rejected by default and
+accepted only when the `aud` matches or `.any` is set; the P5 `fetchJwks`
+test proves a network-fetched `oct` key is refused (`oct_from_network`)
+while the same set is accepted locally. P5 drives the `Provider` over a
+scripted `Fetcher` (discovery, fetch, TTL/rotation refresh, rate limit, typed
+failures); P6 runs the `ResourceServer` middleware end-to-end over a real
+`router` + `http.Server.serveStream` (valid → 200 + identity;
+missing/invalid/expired/wrong-scheme → 401 with the right challenge;
+insufficient scope → 403; `protect=.mutations` lets reads through untouched;
+`ScopeIter` + `InvalidRealm`), plus the shared scope helpers and
+`writeBearerChallenge` formatting, and separately exercises
+`Guard.authenticate` directly (valid/missing/garbage/expired/
+insufficient-scope/wrong-alg/algorithm-confusion denials, plus RFC 9068
+`at+jwt` `typ` enforcement on and off and an end-to-end `scp`-array scope
+check).
 
 P7 (relying-party flow): PKCE's S256 challenge reproduces RFC 7636 Appendix
 B's known-answer vector byte-exact; `pkceGenerateS256`/`pkceGeneratePlain`/

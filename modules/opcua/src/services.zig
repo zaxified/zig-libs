@@ -3,9 +3,10 @@
 //! OPC UA service framing (OPC 10000-4) — the `RequestHeader`/`ResponseHeader`
 //! envelope every service call rides in, the array-of-struct wire pattern
 //! (Int32 count + elements, `-1` = null array — OPC UA Binary's array
-//! convention, used throughout Part 4) hand-rolled here since `encoding.zig`
-//! only has array support as a `Variant`-array TODO (a different, narrower
-//! case), plus the concrete request/response structures F2 needs:
+//! convention, used throughout Part 4) hand-rolled here since `encoding.zig`'s
+//! array support is scoped to `Variant` elements (a different, narrower case:
+//! a homogeneous array of one built-in scalar type, not an arbitrary struct),
+//! plus the concrete request/response structures F2 needs:
 //! OpenSecureChannel, CreateSession, ActivateSession, CloseSession/
 //! CloseSecureChannel, and ServiceFault. `Channel` is the low-level
 //! send/recv-with-chunking helper `root.zig`'s `SecureChannel`/`Session`

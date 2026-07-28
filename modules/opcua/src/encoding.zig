@@ -13,10 +13,9 @@
 //! "null" — distinct from a present-but-empty value (length 0) — modeled here
 //! as `?[]const u8` (`null` = OPC UA null, `&.{}` = present-but-empty).
 //!
-//! `NodeId` and `Variant` are real tagged unions (not stubs) — only their
-//! `encode`/`decode` bodies are `@panic("TODO(agent): ...")`. Every other
-//! built-in type (Boolean .. DiagnosticInfo) is a real Zig type with stubbed
-//! codec methods on `Encoder`/`Decoder`.
+//! `NodeId` and `Variant` are real tagged unions with real `encode`/`decode`
+//! bodies, same as every other built-in type (Boolean .. DiagnosticInfo) — a
+//! real Zig type with a real codec method on `Encoder`/`Decoder`.
 
 const std = @import("std");
 

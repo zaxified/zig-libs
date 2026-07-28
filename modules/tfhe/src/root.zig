@@ -14,19 +14,23 @@
 //! negacyclic ring, no pairing, no external C) and is the canonical
 //! bootstrapping demonstration.
 //!
-//! ## Scaffold status (this commit)
-//! The whole **mechanical layer is REAL and tested** — the negacyclic ring
-//! (`poly`), the signed gadget decomposition (`gadget`), torus (de)coding and
-//! modulus switching (`torus`), plus `tfhe.Tfhe`'s LWE/GLWE/GGSW keygen/encrypt/
-//! decrypt, bootstrap-key + key-switch-key generation, sample extraction, LWE
-//! key switching, and the cleartext LUT+rotation oracle (`clearBootstrap`).
-//!
-//! The **irreducible soundness core is GATED** behind `gate.fable_core_implemented`
-//! (`@panic("TODO(fable/core)")`): `externalProduct`, `cmux`, `blindRotate`,
-//! `bootstrap`. There is no external byte-exact KAT for these, so the harness
-//! defends with a cleartext oracle, deliberately-broken positive controls that
-//! pass today, and (once the core lands) an unlimited-depth bootstrap chain.
-//! See `SPEC.md` for the Fable boundary and the failure-probability ledger.
+//! ## Status: the gated Fable core is IMPLEMENTED (`gate.fable_core_implemented
+//! = true`) — no `@panic` remains in this module; 30/30 tests pass (0 skip).
+//! The mechanical layer — the negacyclic ring (`poly`), the signed gadget
+//! decomposition (`gadget`), torus (de)coding and modulus switching (`torus`),
+//! plus `tfhe.Tfhe`'s LWE/GLWE/GGSW keygen/encrypt/decrypt, bootstrap-key +
+//! key-switch-key generation, sample extraction, LWE key switching, and the
+//! cleartext LUT+rotation oracle (`clearBootstrap`) — was always real and
+//! tested. The **irreducible soundness core** — `externalProduct`, `cmux`,
+//! `blindRotate`, `bootstrap` — is now real too: the once-gated
+//! `@panic("TODO(fable/core)")` stubs are gone, and the previously
+//! SKIP-gated end-to-end anchors (programmable gate, 2-input AND,
+//! unlimited-depth bootstrap chain, corrupted-bootstrap-key control, noise
+//! budget) all run and pass. There is still no external byte-exact KAT for
+//! these four functions, so verification leans on the cleartext oracle, the
+//! deliberately-broken positive controls, and the unlimited-depth chain
+//! property instead — see `SPEC.md` for the full verification-level
+//! breakdown and the failure-probability ledger.
 //!
 //! **Toy/test parameters only — no security level is claimed.**
 

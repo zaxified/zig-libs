@@ -71,11 +71,18 @@ a byte cap, an entry cap, and W-TinyLFU admission/eviction — so an unbounded
 stream of one-shot keys cannot flush the hot set or exhaust memory. The cache
 owns its copies of the recorded status/`Content-Type`/body bytes.
 
+### Concurrent first-flights: handled via in-flight reservation
+
+Two requests carrying the same key that arrive before either has recorded a
+response do **not** both run the handler: the first to see a miss reserves the
+key (`Store.in_flight`) for the duration of its handler, and a second same-key
+request arriving in that window is answered **409** (already in flight)
+instead of re-running it. This is in-process state, not shared through
+`ramcache` — it closes the race within one process but not across multiple
+processes/machines sharing one store.
+
 ### Not handled
 
-- **Concurrent first-flights** of one key: two requests that arrive before
-  either records both execute (the store remembers only *completed* responses —
-  there is no in-progress "409 in flight" lock).
 - **Request-fingerprint mismatch**: a client reusing a key with a different
   body is the client's bug; the recorded response is returned regardless.
 
@@ -100,10 +107,11 @@ modules.
 
 ## Verification
 
-`zig build test-idempotency` — 8 offline tests through `http.Server.serveStream`
+`zig build test-idempotency` — 9 offline tests through `http.Server.serveStream`
 with a real `router` + `ramcache`: first key runs the handler once and a replay
 returns the cached response without re-running (hit-counter asserted), a
-different key runs again, a non-idempotent method (GET) bypasses, a POST with no
-key bypasses, an invalid key → 400, target-scope isolation across paths, TTL
-expiry re-runs the handler (injected clock), and encode/decode round-trip.
-`zig fmt --check` clean.
+concurrent same-key duplicate fired from inside the first handler is rejected
+409 in-flight rather than double-running it, a different key runs again, a
+non-idempotent method (GET) bypasses, a POST with no key bypasses, an invalid
+key → 400, target-scope isolation across paths, TTL expiry re-runs the handler
+(injected clock), and encode/decode round-trip. `zig fmt --check` clean.

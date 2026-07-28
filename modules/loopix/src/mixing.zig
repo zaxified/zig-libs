@@ -82,16 +82,16 @@ pub const CoverEvent = struct {
     kind: MsgKind,
 };
 
-/// TODO(fable/core): the node's Poisson cover-traffic process. Draw the delay
-/// to the next chaff emission as an integer exponential with mean
-/// `cfg.cover_mean_interval` (see the discrete-memorylessness note at the top
-/// of this file — a Poisson process has geometric inter-arrivals in discrete
-/// time), and pick `loop_cover` vs `drop_cover` from `prng`. Called once per
-/// emission by every node (mixes AND clients) to self-clock its chaff stream;
-/// the caller re-arms a timer for `delay` and re-invokes. Cover volume is the
-/// only thing keeping every mix's anonymity set above `AnonymityBound.
-/// min_effective_set` — this is the function the `no-cover` failure mode
-/// disables.
+/// The node's Poisson cover-traffic process (implemented — see
+/// `gate.fable_core_implemented`). Draws the delay to the next chaff emission
+/// as an integer exponential with mean `cfg.cover_mean_interval` (see the
+/// discrete-memorylessness note at the top of this file — a Poisson process
+/// has geometric inter-arrivals in discrete time), and picks `loop_cover` vs
+/// `drop_cover` from `prng`. Called once per emission by every node (mixes AND
+/// clients) to self-clock its chaff stream; the caller re-arms a timer for
+/// `delay` and re-invokes. Cover volume is the only thing keeping every mix's
+/// anonymity set above `AnonymityBound.min_effective_set` — this is the
+/// function the `no-cover` failure mode disables.
 pub fn nextCover(prng: *Prng, cfg: LoopixConfig) CoverEvent {
     // Inter-arrival of the Poisson cover process = the same memoryless integer
     // draw the mix hold uses (a Poisson process has geometric gaps in discrete
@@ -108,12 +108,13 @@ pub fn nextCover(prng: *Prng, cfg: LoopixConfig) CoverEvent {
 
 // ── the Poisson mix hold/release decision (GATED) ────────────────────────────
 
-/// TODO(fable/core): the memoryless per-hop delay primitive. Return an integer
-/// exponential draw with mean `mean` ticks — the discrete-time memoryless
-/// (geometric) law, NOT a floored continuous exponential (see the file-top
-/// note). This is the single primitive both the mix hold (`scheduleRelease`)
-/// and the cover process (`nextCover`) are built on; getting its distribution
-/// right is what makes output timing independent of input timing.
+/// The memoryless per-hop delay primitive (implemented — see
+/// `gate.fable_core_implemented`). Returns an integer exponential draw with
+/// mean `mean` ticks — the discrete-time memoryless (geometric) law, NOT a
+/// floored continuous exponential (see the file-top note). This is the single
+/// primitive both the mix hold (`scheduleRelease`) and the cover process
+/// (`nextCover`) are built on; getting its distribution right is what makes
+/// output timing independent of input timing.
 pub fn sampleExpDelay(prng: *Prng, mean: Time) Time {
     if (mean <= 1) return 0; // degenerate: a per-tick hazard of ~1 ⇒ release now
     // Geometric inverse-CDF. With per-tick success (release) probability
@@ -133,16 +134,16 @@ pub fn sampleExpDelay(prng: *Prng, mean: Time) Time {
     return @intFromFloat(k); // ⌊·⌋ (k ≥ 0, so truncation == floor)
 }
 
-/// TODO(fable/core): the mix pool's hold/release decision for one arriving
-/// packet. Given the packet arrived at `arrival`, return the ABSOLUTE sim time
-/// at which the mix must release (forward) it — i.e. `arrival +
-/// sampleExpDelay(prng, cfg.mean_delay)`. The caller (`protocol.zig`'s
-/// `Loopix.onMessage`) stashes the packet and `setTimer`s exactly this
-/// release time; on the timer it forwards to the next hop and logs the
-/// completed `(arrival, departure)` transit for the adversary. The whole
-/// anonymity guarantee rests on this hold being an INDEPENDENT exponential per
-/// arrival — a constant offset here reduces the mix to the `FifoMix` control
-/// the harness already flags.
+/// The mix pool's hold/release decision for one arriving packet (implemented —
+/// see `gate.fable_core_implemented`). Given the packet arrived at `arrival`,
+/// returns the ABSOLUTE sim time at which the mix must release (forward) it —
+/// i.e. `arrival + sampleExpDelay(prng, cfg.mean_delay)`. The caller
+/// (`protocol.zig`'s `Loopix.onMessage`) stashes the packet and `setTimer`s
+/// exactly this release time; on the timer it forwards to the next hop and
+/// logs the completed `(arrival, departure)` transit for the adversary. The
+/// whole anonymity guarantee rests on this hold being an INDEPENDENT
+/// exponential per arrival — a constant offset here reduces the mix to the
+/// `FifoMix` control the harness already flags.
 pub fn scheduleRelease(prng: *Prng, cfg: LoopixConfig, arrival: Time) Time {
     // One INDEPENDENT memoryless hold per arrival (Poisson mix, not a batch or
     // threshold): the release time is this packet's own draw added to when it

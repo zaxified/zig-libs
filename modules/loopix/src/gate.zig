@@ -1,22 +1,22 @@
 // SPDX-License-Identifier: MIT
 
-//! gate — the single switch that turns on the tests exercising the real,
-//! stub-backed Poisson mix (`protocol.zig`'s `Loopix`, which calls
+//! gate — the single switch that turns on the tests exercising the real
+//! Poisson mix (`protocol.zig`'s `Loopix`, which calls
 //! `mixing.scheduleRelease` / `mixing.nextCover`). Everything ELSE in this
 //! module — the header/route codecs (`types.zig`, `routing.zig`), the entire
 //! anonymity measurement (`adversary.zig`), and the `FifoMix` positive control
-//! with its teeth tests (`protocol.zig`) — is fully real today and needs no
-//! gate; it is the proof that the harness has teeth independent of whether the
-//! mixing core is filled in yet.
+//! with its teeth tests (`protocol.zig`) — was fully real from the start and
+//! needed no gate; it is the proof that the harness has teeth independent of
+//! whether the mixing core was filled in yet.
 //!
-//! Flip this to `true` once `mixing.zig`'s three `@panic` stubs
-//! (`sampleExpDelay` / `scheduleRelease` / `nextCover`) are implemented. The
-//! gated test in `protocol.zig` will then drive the real `Loopix` mix through
-//! netsim and enforce the anonymity invariant (`AnonymityBound`) against it
-//! across a seed sweep.
+//! **Now `true`: `mixing.zig`'s three functions (`sampleExpDelay` /
+//! `scheduleRelease` / `nextCover`) are real implementations, not `@panic`
+//! stubs.** The gated test in `protocol.zig` now drives the real `Loopix` mix
+//! through netsim and enforces the anonymity invariant (`AnonymityBound`)
+//! against it across a seed sweep — see SPEC.md's "Part 2 result" for the
+//! measured separation.
 //!
-//! Leaving it `false` makes that test report **SKIP** (via
-//! `error.SkipZigTest`), not PASS — a skip is not a green light. The gated
-//! test still compiles (so the mix's call sites into `mixing.zig` are
-//! type-checked), it just never calls into the panicking bodies.
+//! Left `false`, that test would report **SKIP** (via `error.SkipZigTest`),
+//! not PASS — a skip is not a green light. With the flag `true`, the test
+//! actually runs (0 skips in `zig build test-loopix`).
 pub const fable_core_implemented = true;

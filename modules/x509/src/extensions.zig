@@ -11,7 +11,7 @@
 //! `parseVersion`, `parseExtensionId`, the `GeneralNameTag` enum) — no
 //! cryptography, no policy DECISION (matching a name against a constraint,
 //! chaining EKU/pathLen across a path, building a path) — those are the hard
-//! RFC 5280 §6 core and live as stubs in `chain.zig`. This file only turns
+//! RFC 5280 §6 core and are implemented in `chain.zig`. This file only turns
 //! raw extension bytes into typed Zig values.
 
 const std = @import("std");

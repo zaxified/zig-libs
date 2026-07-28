@@ -35,7 +35,7 @@ defer alloc.free(r.out);
   Deferred below), just the subset needed by a config/editor
   use case.
 
-Provenance: original work of the zig-libs authors (MIT), ~949 LOC / 20 tests.
+Provenance: original work of the zig-libs authors (MIT), ~949 LOC / 23 tests.
 
 ## Deferred (not covered — full JSON5 spec gaps)
 
@@ -52,6 +52,7 @@ grammar. Not covered:
 
 ## Verification
 
-`zig build test-json5` — 20 tests (11 base preprocessor + 9 annotated
-recovery variants), green in Debug and `-Doptimize=ReleaseFast`.
-`zig fmt --check modules/json5` clean.
+`zig build test-json5` — 23 tests (11 base preprocessor + 9 annotated
+recovery variants + 1 OOB-safety regression test + 2 fuzz targets covering
+`preprocess`/`preprocessAnnotated` on arbitrary bytes), green in Debug and
+`-Doptimize=ReleaseFast`. `zig fmt --check modules/json5` clean.

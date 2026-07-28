@@ -58,10 +58,10 @@ package — no `mcp_dart` or other MCP-transport source consulted or copied.
 
 ## Verification
 
-`zig build test-mcp-http` — 13 offline tests through a real `router` +
+`zig build test-mcp-http` — 14 offline tests through a real `router` +
 `http.Server.serveStream`: request/response (initialize, tools/list, tools/call,
 notification → 202), SSE-on-POST (streamed result, **live tool progress**,
 notification → 202, `stream=.off`), Origin allowlist (match/mismatch/absent),
 sessions (assign + validate + 404 + DELETE, `GET` push + `Last-Event-ID` replay
-+ heartbeat, unknown-session 404), path pass-through / 405, oversized → 413.
-Green in Debug + ReleaseFast.
++ heartbeat, unknown-session 404, `max_sessions` cap rejected), path
+pass-through / 405, oversized → 413. Green in Debug + ReleaseFast.

@@ -606,7 +606,7 @@ pub fn decodeEncryptedExtensions(buf: []const u8, out: []Extension) MessageError
 
 pub const Finished = struct {
     /// Opaque — crypto-core value (HMAC(finished_key, transcript_hash),
-    /// RFC 8446 §4.4.4 / `keyschedule.zig`'s `verifyDataFinished` stub).
+    /// RFC 8446 §4.4.4 / `keyschedule.zig`'s `computeFinishedVerifyData`).
     /// Length equals the negotiated hash's digest length (32 for SHA-256,
     /// 48 for SHA-384); the wrapping handshake header's `length` field is
     /// what tells a decoder how many bytes to expect, so this body carries

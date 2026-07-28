@@ -1,9 +1,16 @@
 // SPDX-License-Identifier: MIT
-//! jsonshape — reshape JSON into a canonical `dataset`: dot-path descent to an
-//! array node + typed column projection (jq-style minimal subset).
+//! jsonshape — reshape JSON into a canonical `dataset`: path descent to
+//! array item(s) + typed column projection (jq-style minimal subset — a
+//! bounded JSONPath dialect, not the full JSONPath spec).
 //!
-//! Remote-feed shaping (`getDataview` / `dataviewGet`): walk a **dot-path** to
-//! an array node, then project each item into columns. Two modes:
+//! Remote-feed shaping (`getDataview` / `dataviewGet`): resolve `spec.path`
+//! to the item(s) to project, then project each item into columns. The path
+//! is one of two auto-detected dialects: the original **legacy dot-path**
+//! (a dot-separated chain of object-key lookups to one array node, e.g.
+//! `"data.prices"`), or a **JSONPath subset** — object keys, array indices
+//! (`a.b[2]`), wildcards (`a.b[*]`, `a.*`), recursive descent (`..name`),
+//! and single-comparison filter expressions (`items[?(@.n > 5)]`). Projection
+//! has two modes:
 //!   * **columns** (generic): `[]JsonCol{name,key,type}` — one column per field.
 //!   * **[x,y] default** (when `columns` is empty): 2 columns from
 //!     `x`/`y` keys, or positional `item[0]/item[1]` for array items, or

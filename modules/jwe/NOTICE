@@ -40,13 +40,16 @@ primitives via its public `encryptOaep`/`decryptOaep`.
 No GPL/LGPL/AGPL source was consulted or copied anywhere in this module.
 
 **Status: real — no stubs remain.** `dir`, RSA-OAEP/RSA-OAEP-256 (wraps
-`rsa`), A128GCM/A256GCM content encryption, A128CBC-HS256/A256CBC-HS512
-content encryption (RFC 7518 §5.2, byte-exact against Appendix B.1/B.3),
-A128GCMKW/A256GCMKW key wrap, A128KW/A256KW + PBES2-* key wrap (RFC 3394,
-byte-exact against §4.1 and RFC 7516 A.3 both directions), the JOSE header
-codec, and the compact-serialization encrypt/decrypt dispatch — all tested
-(KATs where the assigned RFCs publish them; RFC 7516 A.1 decrypt-direction
-byte-exact). The only remaining limitation is AES-192 (`A192GCM`/
-`A192GCMKW`/`A192KW`/`A192CBC-HS384`): Zig 0.16's std ships no AES-192
-cipher at all — a typed `error.UnsupportedKeyLength`, documented in SPEC.md
-(the B.2 vector's HMAC half is still validated in tests).
+`rsa`), ECDH-ES/ECDH-ES+A128KW/ECDH-ES+A256KW (RFC 7518 §4.6,
+ephemeral-static ECDH on P-256 — via the `p256` module — or X25519, feeding
+the Concat KDF; byte-exact against RFC 7518 Appendix C), A128GCM/A256GCM
+content encryption, A128CBC-HS256/A256CBC-HS512 content encryption (RFC
+7518 §5.2, byte-exact against Appendix B.1/B.3), A128GCMKW/A256GCMKW key
+wrap, A128KW/A256KW + PBES2-* key wrap (RFC 3394, byte-exact against §4.1
+and RFC 7516 A.3 both directions), the JOSE header codec, and the
+compact-serialization encrypt/decrypt dispatch — all tested (KATs where the
+assigned RFCs publish them; RFC 7516 A.1 decrypt-direction byte-exact). The
+only remaining limitation is AES-192 (`A192GCM`/`A192GCMKW`/`A192KW`/
+`A192CBC-HS384`/`ECDH-ES+A192KW`): Zig 0.16's std ships no AES-192 cipher at
+all — a typed `error.UnsupportedKeyLength`, documented in SPEC.md (the B.2
+vector's HMAC half is still validated in tests).

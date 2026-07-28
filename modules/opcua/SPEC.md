@@ -313,5 +313,5 @@ never a silent partial answer:
 
 ## Status
 
-`gap · any · both(client + server) · single_owner` + deps: `rsa` — canonical
-source is `pub const meta` in src/root.zig.
+`gap · any · both(client + server) · single_owner` + deps: `rsa`, `x509` —
+canonical source is `pub const meta` in src/root.zig.

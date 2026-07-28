@@ -82,7 +82,7 @@ Root-free tests (the pure helpers, `sockaddr_ll` decode, BPF encoding, struct
 ABI sizes) always run:
 
 ```
-zig build test-rawsock                          # 7 pass, 2 skip (no CAP_NET_RAW)
+zig build test-rawsock                          # 10 pass, 2 skip (no CAP_NET_RAW)
 zig build test-rawsock -Doptimize=ReleaseFast
 ```
 
@@ -91,7 +91,7 @@ round-trip on `lo`) need `CAP_NET_RAW`; without it they `SkipZigTest`. Run them
 under an unprivileged network namespace, where root has the capability:
 
 ```
-unshare -rn zig build test-rawsock              # 9 pass (full socket path)
+unshare -rn zig build test-rawsock              # 12 pass (full socket path)
 ```
 
 ## Deferred (v2)

@@ -55,7 +55,13 @@
 //! the request (`identityOf(ctx)`) and continues, or short-circuits with the
 //! RFC 6750 challenge — **401** `WWW-Authenticate: Bearer error="invalid_token"`
 //! (or a bare `Bearer` when no credential was presented) and **403**
-//! `error="insufficient_scope"` when a required scope is missing.
+//! `error="insufficient_scope"` when a required scope is missing. For hosts
+//! that don't use `router`, P6 also ships `Guard` — the same RFC 6750 (+
+//! optional RFC 9068 `at+jwt` `typ`) enforcement as a framework-agnostic
+//! `authenticate(req) AuthError!AuthContext` call, with `authStatus`/
+//! `writeBearerChallenge` for the caller to render its own 401/403, and the
+//! shared `scopeGranted`/`requireScope`/`requireAllScopes`/`requireAnyScope`
+//! helpers.
 //!
 //! ## Usage
 //!
