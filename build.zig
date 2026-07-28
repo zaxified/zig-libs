@@ -13,6 +13,15 @@ const std = @import("std");
 const Module = struct {
     name: []const u8,
     deps: []const []const u8 = &.{},
+    /// Compute-bound: the tests are dominated by arithmetic (pairings,
+    /// hash-based signatures, FHE, scrypt, RSA), which an unoptimized Debug
+    /// build makes ~5x slower — `bls12_381` alone goes 35s -> 182s. These
+    /// modules ARE the test suite's critical path, so they are built at
+    /// ReleaseSafe when the requested mode is Debug. ReleaseSafe keeps every
+    /// safety check; only Debug-specific behaviour (0xAA-poisoned undefined
+    /// memory) is given up. Pass `-Dstrict-debug` to force real Debug — that
+    /// is what the CI matrix does. Threshold: >15s measured serially.
+    heavy: bool = false,
 };
 
 const module_list = [_]Module{
@@ -92,9 +101,9 @@ const module_list = [_]Module{
     .{ .name = "pagecache", .deps = &.{ "kvtree", "ramcache" } },
     .{ .name = "hashdigest" },
     .{ .name = "sealedbox" },
-    .{ .name = "rsa", .deps = &.{"montint"} },
+    .{ .name = "rsa", .deps = &.{"montint"}, .heavy = true },
     .{ .name = "blindrsa", .deps = &.{"rsa"} },
-    .{ .name = "ssh", .deps = &.{"rsa"} },
+    .{ .name = "ssh", .deps = &.{"rsa"}, .heavy = true },
     .{ .name = "netconf", .deps = &.{ "ssh", "xml" } },
     .{ .name = "nftables", .deps = &.{"netlink"} },
     .{ .name = "trie" },
@@ -127,8 +136,8 @@ const module_list = [_]Module{
     .{ .name = "rbac" },
     .{ .name = "xml" },
     .{ .name = "xmldsig", .deps = &.{ "xml", "rsa", "p256" } },
-    .{ .name = "saml", .deps = &.{ "xmldsig", "xml", "xmlenc", "rsa", "x509" } },
-    .{ .name = "xmlenc", .deps = &.{ "xml", "rsa", "aescbc", "aeskw" } },
+    .{ .name = "saml", .deps = &.{ "xmldsig", "xml", "xmlenc", "rsa", "x509" }, .heavy = true },
+    .{ .name = "xmlenc", .deps = &.{ "xml", "rsa", "aescbc", "aeskw" }, .heavy = true },
     .{ .name = "aescbc" },
     .{ .name = "aeskw" },
     .{ .name = "jwe", .deps = &.{ "rsa", "p256", "aescbc", "aeskw" } },
@@ -164,16 +173,16 @@ const module_list = [_]Module{
     .{ .name = "syslog" },
     .{ .name = "sntp" },
     .{ .name = "stun", .deps = &.{"netaddr"} },
-    .{ .name = "opcua", .deps = &.{ "rsa", "x509" } },
+    .{ .name = "opcua", .deps = &.{ "rsa", "x509" }, .heavy = true },
     .{ .name = "noise" },
     .{ .name = "x509", .deps = &.{"rsa"} },
-    .{ .name = "ocsp", .deps = &.{ "x509", "rsa", "p256" } },
+    .{ .name = "ocsp", .deps = &.{ "x509", "rsa", "p256" }, .heavy = true },
     .{ .name = "ocspcache", .deps = &.{ "ocsp", "http", "x509" } },
     .{ .name = "dnssec", .deps = &.{ "dns", "rsa" } },
     .{ .name = "dnp3", .deps = &.{"aeskw"} },
-    .{ .name = "slhdsa" },
+    .{ .name = "slhdsa", .heavy = true },
     .{ .name = "falcon" },
-    .{ .name = "hqc" },
+    .{ .name = "hqc", .heavy = true },
     .{ .name = "dtls", .deps = &.{"rsa"} },
     .{ .name = "tlsresume" },
     .{ .name = "quic-crypto" },
@@ -197,21 +206,21 @@ const module_list = [_]Module{
     .{ .name = "voprf" },
     .{ .name = "opaque", .deps = &.{"voprf"} },
     .{ .name = "bulletproofs" },
-    .{ .name = "xmss" },
-    .{ .name = "minisign" },
+    .{ .name = "xmss", .heavy = true },
+    .{ .name = "minisign", .heavy = true },
     .{ .name = "otp" },
     .{ .name = "ctap2pin", .deps = &.{"p256"} },
-    .{ .name = "bls12_381" },
+    .{ .name = "bls12_381", .heavy = true },
     .{ .name = "bbs", .deps = &.{"bls12_381"} },
-    .{ .name = "coconut", .deps = &.{"bls12_381"} },
+    .{ .name = "coconut", .deps = &.{"bls12_381"}, .heavy = true },
     .{ .name = "tlock", .deps = &.{"bls12_381"} },
-    .{ .name = "ibe", .deps = &.{"bls12_381"} },
-    .{ .name = "bn254" },
+    .{ .name = "ibe", .deps = &.{"bls12_381"}, .heavy = true },
+    .{ .name = "bn254", .heavy = true },
     .{ .name = "ed448" },
     .{ .name = "decaf448", .deps = &.{"ed448"} },
-    .{ .name = "paillier", .deps = &.{"montint"} },
-    .{ .name = "threshold_ecdsa", .deps = &.{ "paillier", "montint" } },
-    .{ .name = "dkg", .deps = &.{ "threshold_ecdsa", "paillier" } },
+    .{ .name = "paillier", .deps = &.{"montint"}, .heavy = true },
+    .{ .name = "threshold_ecdsa", .deps = &.{ "paillier", "montint" }, .heavy = true },
+    .{ .name = "dkg", .deps = &.{ "threshold_ecdsa", "paillier" }, .heavy = true },
     .{ .name = "vdf", .deps = &.{"montint"} },
     .{ .name = "signal" },
     .{ .name = "mls", .deps = &.{"hpke"} },
@@ -221,8 +230,8 @@ const module_list = [_]Module{
     .{ .name = "fss" },
     .{ .name = "bfv" },
     .{ .name = "groth16", .deps = &.{"bn254"} },
-    .{ .name = "tfhe" },
-    .{ .name = "montint" },
+    .{ .name = "tfhe", .heavy = true },
+    .{ .name = "montint", .heavy = true },
     .{ .name = "chachapoly" },
     .{ .name = "k256" },
     .{ .name = "p256" },
@@ -239,13 +248,26 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run every module's tests");
 
+    // `heavy` modules (see the Module doc comment) are compute-bound: Debug
+    // makes their tests ~5x slower and they are the suite's critical path, so
+    // a Debug request builds them at ReleaseSafe instead — same safety checks,
+    // a fraction of the wall clock. `-Dstrict-debug` opts back into real Debug
+    // for the CI matrix. Any explicit non-Debug mode is honoured as-is.
+    const strict_debug = b.option(
+        bool,
+        "strict-debug",
+        "Build compute-heavy modules at Debug too (much slower; the CI matrix uses this)",
+    ) orelse false;
+    const heavy_optimize: std.builtin.OptimizeMode =
+        if (optimize == .Debug and !strict_debug) .ReleaseSafe else optimize;
+
     // Pass 1: create each module so inter-module deps can be wired in pass 2.
     var mods = std.StringHashMap(*std.Build.Module).init(b.allocator);
     for (module_list) |m| {
         const mod = b.addModule(m.name, .{
             .root_source_file = b.path(b.fmt("modules/{s}/src/root.zig", .{m.name})),
             .target = target,
-            .optimize = optimize,
+            .optimize = if (m.heavy) heavy_optimize else optimize,
         });
         mods.put(m.name, mod) catch @panic("OOM");
     }
