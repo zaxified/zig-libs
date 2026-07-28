@@ -22,15 +22,19 @@ NameID) and `<saml:EncryptedAttribute>`s, decrypted only **after** the enclosing
 assertion is signature-verified. **Holder-of-Key**, **sender-vouches** and
 **Bearer** subject confirmation are selected via `Config.subject_confirmation`
 (`.bearer` | `.holder_of_key` | `.sender_vouches` | `.either`). HoK matches the
-presenter's key — as a certificate DER (`presented_holder_cert_der`, X.509-DER
-byte-equality) and/or a bare `<ds:KeyValue>` (`presented_holder_key`: an RSA
-modulus+exponent or a SEC1 P-256 point) — all same-form, no DER parsing.
+presenter's key — supplied as a certificate DER (`presented_holder_cert_der`)
+and/or a bare public key (`presented_holder_key`: an RSA modulus+exponent or a
+SEC1 P-256 point) — against whatever the confirmation names, **same-form**
+(cert↔cert DER byte-equality, `<ds:KeyValue>`↔key structural equality) **and
+cross-form** (cert↔`<ds:KeyValue>`, via the certificate's SubjectPublicKeyInfo
+extracted with `x509.spkiOf` — never `std.crypto.Certificate.parse` — then
+compared by key parameters, so re-encoding cannot spoof it).
 Sender-vouches trusts the signature alone (no key/recipient binding — the caller
 must trust `idp_key` as the attesting authority). An optional eIDAS
 `Config.required_loa` enforces a minimum `<AuthnContextClassRef>` (low <
 substantial < high; exact match for non-eIDAS class refs). See `SPEC.md` for the
-encrypted-ID/attribute error model, the HoK match forms and the cert↔KeyValue
-cross-form limitation, the sender-vouches trust assumption, and the LoA semantics.
+encrypted-ID/attribute error model, the full HoK matching matrix, the
+sender-vouches trust assumption, and the LoA semantics.
 
 ## Worked example — verify a POST-binding Response
 

@@ -168,27 +168,54 @@ TLS client certificate) and/or as a bare public key
     only EC curve `xmldsig.VerifyKey` supports) and the base64 `<PublicKey>` point
     is compared **byte-for-byte** to the presented `PresentedKey.ec_sec1`
     (SEC1-encoded point).
-- **Limitations.** A re-encoded but equivalent certificate, or a differently
-  encoded EC point (compressed vs uncompressed), will not match — the same
-  deliberate safety/simplicity trade throughout. **Cross-form is deferred:** if the
-  confirmation names the key ONLY as an `<X509Certificate>` while the caller
-  configured only `presented_holder_key` (or the confirmation carries only a bare
-  `<ds:KeyValue>` while the caller configured only `presented_holder_cert_der`),
-  matching would require extracting the SubjectPublicKeyInfo from the certificate
-  DER — i.e. parsing untrusted DER via `std.crypto.Certificate`, a Zig 0.16 panic
-  hazard the module avoids. That case is `error.HolderOfKeyCrossFormUnsupported`;
-  supply the matching form. (A defensive DER→SPKI extractor would lift this.)
+- **Key match — two CROSS-FORM comparisons** (the confirmation names the key in
+  the other form from the one the caller supplied). Both run only after every
+  same-form pairing has been tried and has not matched.
+  - `<X509Certificate>` vs `presented_holder_key`: the certificate's
+    `SubjectPublicKeyInfo` is extracted with **`x509.spkiOf`**, a defensive
+    raw-DER walk that validates the whole TLV structure and never calls
+    `std.crypto.Certificate.parse` (see the `x509` module's SPEC). The recovered
+    key is then compared with the presented one **by parameters**: RSA by
+    big-endian modulus + exponent (the same comparison the same-form
+    `<RSAKeyValue>` path uses), P-256 by the affine point recovered through
+    `fromSec1`.
+  - `<ds:KeyValue>` vs `presented_holder_cert_der`: the certificate is reduced to
+    a key once, up front, the same way; an `<RSAKeyValue>` is then matched with
+    the very same `rsaKeyValueMatches` the same-form path uses, and an
+    `<ECKeyValue>` by canonical point comparison.
+- **Why cross-form cannot be spoofed by re-encoding.** Nothing in the cross-form
+  path compares encodings. An RSA key is (n, e), compared as integers with
+  leading zeros stripped — two encodings of one key compare equal and two
+  distinct keys cannot. A P-256 key is an affine point: both sides go through
+  `fromSec1`, which rejects malformed and off-curve inputs and yields the
+  canonical uncompressed form, so a compressed `<PublicKey>` naming the
+  certificate's key matches while no other byte string can. Different
+  algorithms never match each other (an RSA certificate is never confirmed by
+  any EC point, whatever its bytes). Anything that cannot be reduced to a key —
+  malformed DER, an algorithm outside RSA/P-256, an EC key without a
+  `namedCurve`, a non-P-256 curve — is **incomparable**, which is a rejection,
+  never a match.
+- **Remaining same-form limitations (unchanged).** Same-form certificate
+  matching is still DER byte-equality, so a re-encoded but equivalent
+  certificate does not match it; same-form `<ECKeyValue>` matching is still
+  point-byte equality against the caller's opaque `.ec_sec1` blob. Both are
+  deliberately left as they were: the cross-form path is where curve context
+  exists on both sides, so it is the one that canonicalizes. In practice a
+  re-encoded certificate now still matches *via* the cross-form key comparison
+  whenever the caller also supplies `presented_holder_key`.
 - **HoK vs Bearer checks.** The HoK key check **replaces** the Bearer `Recipient`
   check. Per the SAML HoK Web-SSO profile, `Recipient` / `InResponseTo` MAY be
   omitted for HoK; when present they are still honored (`RecipientMismatch` /
   `InResponseToMismatch`). `NotBefore` / `NotOnOrAfter`, when present, are enforced.
 - **Errors.** A method disallowed by policy (a HoK confirmation under `.bearer`,
   etc.) → `error.SubjectConfirmationMethodNotAllowed`. HoK required but neither
-  presented cert nor presented key configured → `error.PresentedKeyMissing`. A
-  same-form comparison was possible but nothing matched →
-  `error.HolderOfKeyMismatch`. Only a cross-form pairing was possible →
-  `error.HolderOfKeyCrossFormUnsupported`. Defaults keep the Bearer path
-  byte-for-byte unchanged.
+  presented cert nor presented key configured → `error.PresentedKeyMissing`. At
+  least one comparison ran to a verdict and none matched →
+  `error.HolderOfKeyMismatch`. Key material was named but NONE of it could be
+  reduced to a comparable key → `error.HolderOfKeyCrossFormUnsupported` (kept,
+  with its meaning narrowed from "cross-form is not implemented" to "nothing
+  here could be compared"). Defaults keep the Bearer path byte-for-byte
+  unchanged.
 
 ## Sender-vouches subject confirmation
 
@@ -261,12 +288,11 @@ also surfaced verbatim in `AuthnResult.authn_context_class_ref`.
 
 ## Deferred / out of scope
 
-- **Holder-of-Key cross-form match (cert ↔ `<ds:KeyValue>`)** — same-form matches
-  (cert-DER ↔ `presented_holder_cert_der`, `<KeyValue>` ↔ `presented_holder_key`)
-  are supported; matching an `<X509Certificate>` confirmation against a bare
-  presented key (or vice-versa) is `error.HolderOfKeyCrossFormUnsupported`, pending
-  a defensive DER→SubjectPublicKeyInfo extractor (parsing untrusted DER via
-  `std.crypto.Certificate` is a Zig 0.16 panic hazard). See "Holder-of-Key".
+- **Holder-of-Key cross-form match (cert ↔ `<ds:KeyValue>`)** — **DONE**, over
+  `x509.spkiOf` (the defensive DER→SubjectPublicKeyInfo extractor this was
+  waiting on). Only RSA and EC P-256 keys are comparable, matching what
+  `PresentedKey` can express; anything else is
+  `error.HolderOfKeyCrossFormUnsupported`. See "Holder-of-Key".
 - **Single Logout (SLO)**, artifact binding, and the IdP side — not implemented.
 
 ## Fixture provenance (be honest about interop)

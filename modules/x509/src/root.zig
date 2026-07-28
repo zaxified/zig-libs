@@ -139,6 +139,17 @@ pub const Options = chain.Options;
 pub const VerifiedChain = chain.VerifiedChain;
 pub const VerifyChainError = chain.VerifyChainError;
 
+/// `x509.spkiOf(cert_der)` — the supported way to name a certificate's public
+/// key without verifying anything about the certificate: it returns the
+/// `SubjectPublicKeyInfo` TLV (plus its decomposed algorithm OID, parameters
+/// and key bits) from untrusted DER, over the defensive walk in `safe.zig`
+/// and **never** through `std.crypto.Certificate.parse`. Every returned slice
+/// borrows the caller's buffer — see `safe.Spki`'s doc comment for the full
+/// lifetime contract, and `safe.spkiOf`'s for what it does and does not prove.
+pub const spkiOf = safe.spkiOf;
+pub const Spki = safe.Spki;
+pub const SpkiError = safe.SpkiError;
+
 pub const meta = .{
     .platform = .any,
     .role = .util, // pure verification logic; no I/O, no wire framing of its own

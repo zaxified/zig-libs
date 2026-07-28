@@ -74,12 +74,17 @@
 //! `error.IdDecryptionFailed` / `error.AttributeDecryptionFailed`. Subject
 //! confirmation is selected via `Config.subject_confirmation` (`.bearer` |
 //! `.holder_of_key` | `.sender_vouches` | `.either`): Holder-of-Key matches the
-//! presenter's key by SAME-FORM structural compare (X.509-DER byte-equality vs
+//! presenter's key structurally — SAME-FORM (X.509-DER byte-equality vs
 //! `presented_holder_cert_der`, or a bare `<ds:KeyValue>` RSA modulus+exponent /
-//! EC SEC1 point vs `presented_holder_key` — never parsing DER); sender-vouches
-//! trusts the verified signature alone (no key/recipient binding). An optional
-//! `Config.required_loa` enforces a minimum eIDAS `<AuthnContextClassRef>`. See
-//! SPEC.md for the HoK cross-form limitation and the sender-vouches trust model.
+//! EC SEC1 point vs `presented_holder_key`) and CROSS-FORM (certificate ↔
+//! `<ds:KeyValue>`, via the certificate's `SubjectPublicKeyInfo` extracted with
+//! `x509.spkiOf`, a defensive walk that never calls
+//! `std.crypto.Certificate.parse`, then compared by key PARAMETERS — RSA
+//! modulus+exponent, or the P-256 affine point — never by encoding);
+//! sender-vouches trusts the verified signature alone (no key/recipient
+//! binding). An optional `Config.required_loa` enforces a minimum eIDAS
+//! `<AuthnContextClassRef>`. See SPEC.md for the HoK matching matrix and the
+//! sender-vouches trust model.
 //!
 //! ## Out of scope (see SPEC.md)
 //!   - Single Logout, artifact binding, the IdP side.
@@ -92,13 +97,18 @@ const xml = @import("xml");
 const xmldsig = @import("xmldsig");
 const xmlenc = @import("xmlenc");
 const rsa = @import("rsa");
+const x509 = @import("x509");
+
+/// P-256 public keys, the one EC form `xmldsig.VerifyKey` (and therefore this
+/// module's Holder-of-Key matching) supports.
+const P256PublicKey = std.crypto.sign.ecdsa.EcdsaP256Sha256.PublicKey;
 
 pub const meta = .{
     .platform = .any,
     .role = .codec, // consumes an untrusted wire document into a trusted result
     .concurrency = .reentrant,
     .model_after = "OASIS SAML 2.0 (SAMLCore / SAMLProf) Web Browser SSO, SP side; XSW-hardened per 'On Breaking SAML'",
-    .deps = .{ "xmldsig", "xml", "xmlenc", "rsa" },
+    .deps = .{ "xmldsig", "xml", "xmlenc", "rsa", "x509" }, // x509: the panic-safe SubjectPublicKeyInfo extractor behind HoK cross-form matching
 };
 
 // ── namespaces ───────────────────────────────────────────────────────────────
@@ -200,24 +210,23 @@ pub const Config = struct {
     /// (the Web-SSO default; unchanged for existing callers).
     subject_confirmation: SubjectConfirmationPolicy = .bearer,
     /// For Holder-of-Key confirmation: the DER of the certificate the presenter
-    /// authenticated the transport with (e.g. the TLS client certificate). The
-    /// HoK `<ds:KeyInfo>` in `<SubjectConfirmationData>` must carry an
-    /// `<ds:X509Certificate>` whose DER is byte-identical to this. Null (the
-    /// default) ⇒ no certificate is presented; irrelevant to the Bearer path. See
-    /// SPEC.md "Holder-of-Key" for the byte-equality match rationale and its
-    /// limitation. A HoK confirmation with NEITHER `presented_holder_cert_der`
-    /// NOR `presented_holder_key` configured cannot be satisfied
-    /// (`error.PresentedKeyMissing`).
+    /// authenticated the transport with (e.g. the TLS client certificate). It
+    /// matches an `<ds:X509Certificate>` in the HoK `<ds:KeyInfo>` by DER
+    /// byte-equality (same form), and a bare `<ds:KeyValue>` by comparing this
+    /// certificate's extracted public key with the one the `<ds:KeyValue>`
+    /// names (cross-form). Null (the default) ⇒ no certificate is presented;
+    /// irrelevant to the Bearer path. A HoK confirmation with NEITHER
+    /// `presented_holder_cert_der` NOR `presented_holder_key` configured cannot
+    /// be satisfied (`error.PresentedKeyMissing`). See SPEC.md "Holder-of-Key".
     presented_holder_cert_der: ?[]const u8 = null,
-    /// For Holder-of-Key confirmation with a bare `<ds:KeyValue>` (RSA/EC public
-    /// key, no `<X509Certificate>`): the public key the presenter authenticated
-    /// the transport with. An `<RSAKeyValue>` is matched to a `.rsa` key by
-    /// big-endian modulus+exponent equality; an `<ECKeyValue>` is matched to a
-    /// `.ec_sec1` key by NamedCurve (P-256) + point-byte equality. No parsing of
-    /// untrusted DER is involved. May be set together with (or instead of)
-    /// `presented_holder_cert_der`. A cross-form pairing (confirmation carries a
-    /// certificate while only a bare key is configured, or vice-versa) is NOT
-    /// matched — see `error.HolderOfKeyCrossFormUnsupported` and SPEC.md.
+    /// For Holder-of-Key confirmation: the public key the presenter
+    /// authenticated the transport with. It matches an `<RSAKeyValue>` by
+    /// big-endian modulus+exponent equality and an `<ECKeyValue>` by NamedCurve
+    /// (P-256) + point-byte equality (same form), and an `<ds:X509Certificate>`
+    /// by comparing it with that certificate's extracted public key
+    /// (cross-form). May be set together with (or instead of)
+    /// `presented_holder_cert_der`; ANY of the four pairings matching confirms
+    /// the subject. See SPEC.md "Holder-of-Key".
     presented_holder_key: ?PresentedKey = null,
 
     /// eIDAS Level-of-Assurance minimum. When set, the returned
@@ -374,19 +383,18 @@ pub const ConsumeError = error{
     /// `Config.presented_holder_cert_der` nor `Config.presented_holder_key` is
     /// configured — the SP cannot prove the presenter holds the key.
     PresentedKeyMissing,
-    /// A Holder-of-Key `<SubjectConfirmation>`'s `<ds:KeyInfo>` carried key
-    /// material in a form the caller supplied (an `<X509Certificate>` vs
-    /// `presented_holder_cert_der`, or an `<RSAKeyValue>`/`<ECKeyValue>` vs
-    /// `presented_holder_key`) but no such same-form entry matched.
+    /// A Holder-of-Key `<SubjectConfirmation>`'s `<ds:KeyInfo>` named key
+    /// material that WAS compared — same-form or cross-form — against what the
+    /// caller supplied, and none of it was the presenter's key. This is the
+    /// real "you do not hold this key" verdict.
     HolderOfKeyMismatch,
-    /// A Holder-of-Key `<SubjectConfirmation>` carried ONLY key material of a form
-    /// the caller did not supply the counterpart for (e.g. an `<X509Certificate>`
-    /// while only `presented_holder_key` was configured, or a bare
-    /// `<ds:KeyValue>` while only `presented_holder_cert_der` was configured).
-    /// Matching those would require extracting the SubjectPublicKeyInfo from the
-    /// certificate DER — i.e. parsing untrusted DER via `std.crypto.Certificate`,
-    /// a Zig 0.16 panic hazard the module deliberately avoids. Deferred; supply
-    /// the matching form. See SPEC.md.
+    /// A Holder-of-Key `<SubjectConfirmation>` named key material, but NONE of
+    /// it could be reduced to a public key to compare at all, so nothing was
+    /// proved either way and the confirmation fails closed. Reached when a
+    /// cross-form pairing is the only one available and the certificate in
+    /// question is malformed DER, or carries a public-key algorithm outside
+    /// RSA and EC P-256 (the two forms `PresentedKey` can express). Same-form
+    /// pairings never produce this. See SPEC.md.
     HolderOfKeyCrossFormUnsupported,
     /// A `<saml:EncryptedID>` was present in the Subject but no
     /// `Config.sp_decrypt_key` was configured — the SP did not opt in to
@@ -963,15 +971,27 @@ fn validateBearerData(sc: *const xml.Element, config: Config, now: i64, skew: i6
 /// present they are still honored. `NotBefore` / `NotOnOrAfter`, when present,
 /// are enforced.
 ///
-/// Match (all SAME-FORM, no certificate/DER parsing — Zig 0.16's
-/// `std.crypto.Certificate.parse` is not panic-safe on hostile DER):
+/// SAME-FORM matches (no DER parsing at all):
 ///   - `<ds:X509Certificate>` DER byte-equality vs `presented_holder_cert_der`;
 ///   - `<ds:KeyValue><ds:RSAKeyValue>` modulus+exponent integer-equality vs a
 ///     `presented_holder_key` `.rsa`;
 ///   - `<ds:KeyValue><ds:ECKeyValue>` NamedCurve(P-256)+point byte-equality vs a
 ///     `presented_holder_key` `.ec_sec1`.
-/// A re-encoded (but equivalent) certificate, or a cross-form cert↔KeyValue
-/// pairing, will not match. See SPEC.md.
+///
+/// CROSS-FORM matches (the confirmation names the key in the other form from
+/// the one the caller supplied): the certificate's `SubjectPublicKeyInfo` is
+/// extracted with `x509.spkiOf` — a defensive raw-DER walk that never touches
+/// `std.crypto.Certificate.parse`, the Zig 0.16 panic hazard — reduced to a
+/// canonical public key, and compared with the *other* side's key by
+/// PARAMETERS, never by encoding: RSA by big-endian modulus+exponent integers,
+/// P-256 by the affine point recovered through `fromSec1` (which also proves
+/// the point is on the curve). Two encodings of one key therefore compare
+/// equal, and two different keys cannot compare equal regardless of encoding.
+///
+/// Order: same-form first (cheapest, and unchanged for existing callers), then
+/// cross-form. ANY match confirms — the confirmation may legitimately name the
+/// same key several ways. Everything that cannot be reduced to a comparable
+/// key fails closed. See SPEC.md.
 fn validateHolderOfKeyData(alloc: std.mem.Allocator, sc: *const xml.Element, config: Config, now: i64, skew: i64) ConsumeError!void {
     const scd = childEl(sc, saml_ns, "SubjectConfirmationData") orelse return error.SubjectConfirmationFailed;
     // NotBefore / NotOnOrAfter are optional for HoK; enforce them if present.
@@ -995,42 +1015,249 @@ fn validateHolderOfKeyData(alloc: std.mem.Allocator, sc: *const xml.Element, con
         }
     }
     // The HoK key check: the presenter must hold the confirmation key. The
-    // confirmation may name it as an `<X509Certificate>` (matched by DER
-    // byte-equality to `presented_holder_cert_der`) and/or as a bare
-    // `<ds:KeyValue>` (`<RSAKeyValue>`/`<ECKeyValue>` matched to
-    // `presented_holder_key`). SAME-FORM matches only — a cross-form pairing is
-    // deliberately not attempted (it would need untrusted DER parsing).
+    // confirmation may name it as an `<X509Certificate>` and/or as a bare
+    // `<ds:KeyValue>`; the caller may have supplied either form (or both).
+    // All four pairings are tried — see this function's doc comment.
     const have_cert = config.presented_holder_cert_der != null;
     const have_key = config.presented_holder_key != null;
     if (!have_cert and !have_key) return error.PresentedKeyMissing;
 
-    var same_form_possible = false;
+    // `decided` = at least one comparison ran all the way to a verdict, so a
+    // failure really means "the presenter does not hold this key".
+    // `incomparable` = key material was named but could not be reduced to a
+    // key at all (malformed DER, an unsupported algorithm/curve) — a rejection
+    // either way, but a distinguishable one for the operator.
+    var decided = false;
+    var incomparable = false;
 
     // X.509 same-form: presented cert DER vs an `<X509Certificate>`.
     if (config.presented_holder_cert_der) |cert_der| {
         if (anyX509Present(scd)) {
-            same_form_possible = true;
+            decided = true;
             if (anyX509Matches(alloc, scd, cert_der)) return; // confirmed
         }
     }
     // KeyValue same-form: presented public key vs an `<RSAKeyValue>`/`<ECKeyValue>`.
     if (config.presented_holder_key) |pk| {
         if (anyKeyValuePresent(scd)) {
-            same_form_possible = true;
+            decided = true;
             if (anyKeyValueMatches(alloc, scd, pk)) return; // confirmed
         }
     }
+    // Cross-form: an `<X509Certificate>` in the confirmation vs the caller's
+    // bare presented key.
+    if (config.presented_holder_key) |pk| {
+        if (anyX509Present(scd)) switch (anyX509MatchesKey(alloc, scd, pk)) {
+            .match => return, // confirmed
+            .mismatch => decided = true,
+            .incomparable => incomparable = true,
+        };
+    }
+    // Cross-form: a bare `<ds:KeyValue>` in the confirmation vs the caller's
+    // presented certificate.
+    if (config.presented_holder_cert_der) |cert_der| {
+        if (anyKeyValuePresent(scd)) switch (anyKeyValueMatchesCert(alloc, scd, cert_der)) {
+            .match => return, // confirmed
+            .mismatch => decided = true,
+            .incomparable => incomparable = true,
+        };
+    }
 
-    // A same-form comparison was attempted but nothing matched.
-    if (same_form_possible) return error.HolderOfKeyMismatch;
-
-    // No same-form comparison was possible. If the confirmation nonetheless named
-    // a key in the OTHER form, the only possible match would be cross-form
-    // (cert↔KeyValue), which we do not do (DER-parse hazard).
-    if (anyX509Present(scd) or anyKeyValuePresent(scd)) return error.HolderOfKeyCrossFormUnsupported;
-
+    // A comparison ran and nothing matched: the presenter does not hold the key.
+    if (decided) return error.HolderOfKeyMismatch;
+    // Nothing could be compared, because nothing could be reduced to a key.
+    if (incomparable) return error.HolderOfKeyCrossFormUnsupported;
     // The confirmation carried no recognizable key material at all.
     return error.HolderOfKeyMismatch;
+}
+
+// ── Holder-of-Key cross-form matching (certificate ↔ `<ds:KeyValue>`) ────────
+
+/// The verdict of one cross-form comparison. `.incomparable` is NOT a match and
+/// NOT a mismatch: the key material was present but could not be reduced to a
+/// public key at all, so nothing was actually proved either way. It never
+/// confirms a subject.
+const CrossMatch = enum { match, mismatch, incomparable };
+
+/// A public key recovered from a certificate's `SubjectPublicKeyInfo`, reduced
+/// to a canonical form — the whole point of the cross-form path is to compare
+/// key PARAMETERS, so neither variant stores anything encoding-specific.
+const CertKey = union(enum) {
+    /// Compared by big-endian modulus + exponent integer equality (the same
+    /// comparison the same-form `<RSAKeyValue>` path uses).
+    rsa: rsa.PublicKey,
+    /// The P-256 point in its canonical uncompressed SEC1 form. `fromSec1`
+    /// already proved it is a point on the curve, so equality of these 65 bytes
+    /// is equality of the affine (x, y) coordinates — key identity, not
+    /// encoding identity. A compressed and an uncompressed encoding of one key
+    /// both reduce to this, and two distinct keys cannot reduce to the same
+    /// value.
+    ec_p256: [65]u8,
+};
+
+/// Recover the public key named by a certificate, or `null` when it cannot be
+/// reduced to one this module can compare (malformed/hostile DER, or an
+/// algorithm outside RSA and EC P-256).
+///
+/// `x509.spkiOf` is a defensive raw-DER walk: it validates the whole TLV
+/// structure first and never routes the bytes through
+/// `std.crypto.Certificate.parse`, which is not panic-safe on adversarial DER
+/// in Zig 0.16. `rsa.PublicKey.fromDer` and `fromSec1` are both total on
+/// arbitrary bytes. So this is safe on a certificate lifted straight out of an
+/// attacker-supplied assertion.
+fn certPublicKey(cert_der: []const u8) ?CertKey {
+    const spki = x509.spkiOf(cert_der) catch return null;
+    if (spki.algorithmIs(&x509.safe.oid_rsa_encryption)) {
+        return .{ .rsa = rsa.PublicKey.fromDer(spki.der) catch return null };
+    }
+    if (spki.algorithmIs(&x509.safe.oid_ec_public_key)) {
+        // RFC 5480 §2.1.1: the parameters must name the curve. An absent /
+        // implicit / explicitly-specified curve is not comparable — fail closed
+        // rather than assume P-256.
+        const curve_oid = spki.namedCurveOid() orelse return null;
+        if (!std.mem.eql(u8, curve_oid, &x509.safe.oid_prime256v1)) return null;
+        const pk = P256PublicKey.fromSec1(spki.key_bits) catch return null;
+        return .{ .ec_p256 = pk.toUncompressedSec1() };
+    }
+    return null;
+}
+
+/// Whether two `rsa.PublicKey`s are the same key: big-endian modulus and
+/// exponent integers, leading-zero-insensitive. Never a signature op, and
+/// never a comparison of encodings.
+fn rsaPublicKeysEqual(a: rsa.PublicKey, b: rsa.PublicKey) bool {
+    var a_n: [rsa.max_modulus_len]u8 = undefined;
+    var b_n: [rsa.max_modulus_len]u8 = undefined;
+    const a_len = (a.n.bits() + 7) / 8;
+    const b_len = (b.n.bits() + 7) / 8;
+    if (a_len > a_n.len or b_len > b_n.len) return false;
+    a.n.toBytes(a_n[0..a_len], .big) catch return false;
+    b.n.toBytes(b_n[0..b_len], .big) catch return false;
+
+    var a_e: [rsa.max_modulus_len]u8 = undefined;
+    var b_e: [rsa.max_modulus_len]u8 = undefined;
+    a.e.toBytes(&a_e, .big) catch return false;
+    b.e.toBytes(&b_e, .big) catch return false;
+
+    return std.mem.eql(u8, stripLeadingZeros(a_n[0..a_len]), stripLeadingZeros(b_n[0..b_len])) and
+        std.mem.eql(u8, stripLeadingZeros(&a_e), stripLeadingZeros(&b_e));
+}
+
+/// Whether a key recovered from a certificate is the same key the presenter
+/// authenticated the transport with. Different algorithms never match (an RSA
+/// key is not an EC key, whatever their bytes look like).
+fn certKeyMatchesPresented(ck: CertKey, presented: PresentedKey) bool {
+    return switch (ck) {
+        .rsa => |cert_pk| switch (presented) {
+            .rsa => |pres_pk| rsaPublicKeysEqual(cert_pk, pres_pk),
+            .ec_sec1 => false,
+        },
+        .ec_p256 => |cert_point| switch (presented) {
+            .rsa => false,
+            // The presented point is canonicalized the same way, so a caller
+            // holding the compressed form of the certificate's key still matches.
+            .ec_sec1 => |sec1| blk: {
+                const pres = P256PublicKey.fromSec1(sec1) catch break :blk false;
+                break :blk std.mem.eql(u8, &cert_point, &pres.toUncompressedSec1());
+            },
+        },
+    };
+}
+
+/// Cross-form, direction 1: an `<ds:X509Certificate>` anywhere under `el` whose
+/// public key is the caller's `presented` bare key. Walks the whole subtree,
+/// like `anyX509Matches`. A certificate that does not decode to a comparable
+/// key contributes `.incomparable`, never a match.
+fn anyX509MatchesKey(alloc: std.mem.Allocator, el: *const xml.Element, presented: PresentedKey) CrossMatch {
+    var decided = false;
+    for (el.children) |c| switch (c.content) {
+        .element => |child| {
+            const verdict = if (isEl(child, xmldsig.ds_ns, "X509Certificate"))
+                x509CertMatchesKey(alloc, child, presented)
+            else
+                anyX509MatchesKey(alloc, child, presented);
+            switch (verdict) {
+                .match => return .match,
+                .mismatch => decided = true,
+                .incomparable => {},
+            }
+        },
+        else => {},
+    };
+    return if (decided) .mismatch else .incomparable;
+}
+
+fn x509CertMatchesKey(alloc: std.mem.Allocator, cert_el: *const xml.Element, presented: PresentedKey) CrossMatch {
+    const txt = textAlloc(alloc, cert_el) catch return .incomparable;
+    defer alloc.free(txt);
+    const cert_der = decodeBase64(alloc, trim(txt)) catch return .incomparable;
+    defer alloc.free(cert_der);
+    const ck = certPublicKey(cert_der) orelse return .incomparable;
+    return if (certKeyMatchesPresented(ck, presented)) .match else .mismatch;
+}
+
+/// Cross-form, direction 2: a bare `<RSAKeyValue>`/`<ECKeyValue>` anywhere under
+/// `el` that names the public key of the caller's `presented_holder_cert_der`.
+/// The certificate is reduced to a key ONCE, up front: if that fails, nothing
+/// under `el` is comparable at all.
+fn anyKeyValueMatchesCert(alloc: std.mem.Allocator, el: *const xml.Element, cert_der: []const u8) CrossMatch {
+    const ck = certPublicKey(cert_der) orelse return .incomparable;
+    return anyKeyValueMatchesCertKey(alloc, el, ck);
+}
+
+fn anyKeyValueMatchesCertKey(alloc: std.mem.Allocator, el: *const xml.Element, ck: CertKey) CrossMatch {
+    var decided = false;
+    for (el.children) |c| switch (c.content) {
+        .element => |child| {
+            if (std.mem.eql(u8, child.local, "RSAKeyValue")) {
+                switch (ck) {
+                    // Reuses the SAME-FORM comparison verbatim: once the
+                    // certificate is reduced to an `rsa.PublicKey`, matching it
+                    // against an `<RSAKeyValue>` is exactly the same problem the
+                    // same-form path already solves.
+                    .rsa => |pk| {
+                        decided = true;
+                        if (rsaKeyValueMatches(alloc, child, pk)) return .match;
+                    },
+                    .ec_p256 => {},
+                }
+            } else if (std.mem.eql(u8, child.local, "ECKeyValue")) {
+                switch (ck) {
+                    .ec_p256 => |point| {
+                        decided = true;
+                        if (ecKeyValueMatchesPoint(alloc, child, point)) return .match;
+                    },
+                    .rsa => {},
+                }
+            } else switch (anyKeyValueMatchesCertKey(alloc, child, ck)) {
+                .match => return .match,
+                .mismatch => decided = true,
+                .incomparable => {},
+            }
+        },
+        else => {},
+    };
+    return if (decided) .mismatch else .incomparable;
+}
+
+/// Match an `<ECKeyValue>` against a canonical uncompressed P-256 point. Unlike
+/// the same-form `ecKeyValueMatches` — which byte-compares an opaque presented
+/// blob because the caller supplied no curve context — both sides here are
+/// known-good curve points, so they are compared as POINTS: the XML point is
+/// put through `fromSec1` (rejecting off-curve and malformed encodings) and its
+/// canonical uncompressed form compared. A compressed `<PublicKey>` naming the
+/// certificate's key therefore matches, and no non-key byte string can.
+fn ecKeyValueMatchesPoint(alloc: std.mem.Allocator, ekv: *const xml.Element, canonical: [65]u8) bool {
+    const nc = childByLocal(ekv, "NamedCurve") orelse return false;
+    const uri = nc.attr("", "URI") orelse return false;
+    if (!std.mem.eql(u8, trim(uri), named_curve_p256)) return false;
+    const pk_el = childByLocal(ekv, "PublicKey") orelse return false;
+    const pk_txt = textAlloc(alloc, pk_el) catch return false;
+    defer alloc.free(pk_txt);
+    const point = decodeBase64(alloc, trim(pk_txt)) catch return false;
+    defer alloc.free(point);
+    const parsed = P256PublicKey.fromSec1(point) catch return false;
+    return std.mem.eql(u8, &canonical, &parsed.toUncompressedSec1());
 }
 
 /// True iff any `<ds:X509Certificate>` anywhere under `el` decodes to DER that is
@@ -1567,6 +1794,7 @@ test {
     _ = @import("test_encrypted_id_attr.zig");
     _ = @import("test_hok.zig");
     _ = @import("test_hok_keyvalue.zig");
+    _ = @import("test_hok_crossform.zig");
     _ = @import("test_eidas.zig");
 }
 

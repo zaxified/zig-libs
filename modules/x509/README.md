@@ -122,6 +122,37 @@ const cert = try x509.safe.safeCertificate(peer_cert_der, &scratch);
 const parsed = try cert.parse(); // total: a hostile cert is a typed error, never a crash
 ```
 
+## `x509.spkiOf` — name a certificate's public key, safely
+
+When all you need from an untrusted certificate is *which key it names* — a
+Holder-of-Key subject confirmation, a key-pinning check, a
+certificate ↔ bare-public-key comparison — `x509.spkiOf` gives you its
+`SubjectPublicKeyInfo` without ever going through
+`std.crypto.Certificate.parse`. It runs `safe.validateCertificate` first, then
+walks the `TBSCertificate` fields with `safe.zig`'s own bounds-checked header
+decoder; no dates, extensions or signature bytes are decoded at all. It works
+on certificates std cannot parse (RSASSA-PSS-signed ones), and every failure is
+a typed `x509.SpkiError`.
+
+```zig
+const spki = try x509.spkiOf(peer_cert_der);       // every field borrows peer_cert_der
+if (spki.algorithmIs(&x509.safe.oid_rsa_encryption)) {
+    const pk = try rsa.PublicKey.fromDer(spki.der); // spki.der = the whole SPKI TLV
+} else if (spki.algorithmIs(&x509.safe.oid_ec_public_key)) {
+    const curve = spki.namedCurveOid() orelse return error.NoNamedCurve;
+    if (std.mem.eql(u8, curve, &x509.safe.oid_prime256v1)) {
+        const pk = try EcdsaP256Sha256.PublicKey.fromSec1(spki.key_bits);
+    }
+}
+```
+
+`spki.der` / `.algorithm_oid` / `.parameters` / `.key_bits` are **sub-slices of
+the caller's buffer** — nothing is copied or allocated, so the whole `Spki` is
+valid exactly as long as `peer_cert_der` is. This is a field accessor, not a
+verifier: it proves the bytes are the certificate's SubjectPublicKeyInfo and
+nothing about the certificate's signature, validity or issuer — use
+`verifyChain` for that.
+
 ## Provenance
 
 Clean-room implementation from RFC 5280 (X.509 v3 / PKIX Certificate and CRL

@@ -221,6 +221,171 @@ pub fn safeCertificate(certificate_der: []const u8, scratch: []u8) SafeCertifica
     return .{ .buffer = scratch[0 .. certificate_der.len + parse_slack], .index = 0 };
 }
 
+// ── SubjectPublicKeyInfo extraction (never via Certificate.parse) ───────────
+
+/// Well-known `AlgorithmIdentifier` OIDs, as raw OID *content* bytes (no
+/// tag/length octets) — directly comparable with `Spki.algorithm_oid` /
+/// `Spki.namedCurveOid`.
+pub const oid_rsa_encryption = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01 }; // 1.2.840.113549.1.1.1
+pub const oid_ec_public_key = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01 }; // 1.2.840.10045.2.1
+pub const oid_prime256v1 = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07 }; // 1.2.840.10045.3.1.7
+pub const oid_secp384r1 = [_]u8{ 0x2b, 0x81, 0x04, 0x00, 0x22 }; // 1.3.132.0.34
+pub const oid_ed25519 = [_]u8{ 0x2b, 0x65, 0x70 }; // 1.3.101.112
+
+/// A certificate's `SubjectPublicKeyInfo`, decomposed.
+///
+/// **Lifetime / borrowing contract: every field is a sub-slice of the
+/// `certificate_der` buffer passed to `spkiOf` — nothing is copied and nothing
+/// is allocated.** The whole `Spki` is therefore valid exactly as long as that
+/// buffer is, and becomes dangling the moment the caller frees or reuses it.
+/// A caller that needs the key material to outlive the certificate bytes must
+/// copy it (or parse it into an owned key type, e.g. `rsa.PublicKey.fromDer`,
+/// which copies) before the buffer goes away. `spkiOf` never mutates its input.
+pub const Spki = struct {
+    /// The full `SubjectPublicKeyInfo` TLV — tag and length octets included,
+    /// exactly the shape `rsa.PublicKey.fromDer` and OpenSSL's
+    /// `d2i_PUBKEY` accept.
+    der: []const u8,
+    /// The `AlgorithmIdentifier.algorithm` OID's *content* bytes (no tag or
+    /// length octets) — compare against `oid_rsa_encryption` and friends.
+    algorithm_oid: []const u8,
+    /// `AlgorithmIdentifier.parameters`, full TLV, or `null` when the
+    /// AlgorithmIdentifier carries no second field at all. For an EC key this
+    /// is the `namedCurve` OBJECT IDENTIFIER (see `namedCurveOid`); for RSA it
+    /// is conventionally a NULL.
+    parameters: ?[]const u8,
+    /// The `subjectPublicKey` BIT STRING's content with the leading
+    /// unused-bits octet already stripped — for an EC key this is the SEC1
+    /// point, for RSA the embedded PKCS#1 `RSAPublicKey` DER. A BIT STRING
+    /// with a non-zero unused-bit count is rejected by `spkiOf` outright, so
+    /// this is always whole octets.
+    key_bits: []const u8,
+
+    /// Whether the key's algorithm OID equals `oid_content` (raw OID content
+    /// bytes — use one of the `oid_*` constants in this file).
+    pub fn algorithmIs(self: Spki, oid_content: []const u8) bool {
+        return std.mem.eql(u8, self.algorithm_oid, oid_content);
+    }
+
+    /// The `namedCurve` OID's content bytes when `parameters` is a single
+    /// OBJECT IDENTIFIER (the only EC parameter form RFC 5480 §2.1.1 permits
+    /// in a PKIX certificate), `null` otherwise — including for the
+    /// `implicitCurve`/`specifiedCurve` forms, which are deliberately NOT
+    /// decoded: a caller must treat "no named curve" as "cannot compare".
+    pub fn namedCurveOid(self: Spki) ?[]const u8 {
+        const p = self.parameters orelse return null;
+        if (p.len == 0 or p[0] != 0x06) return null; // universal, primitive, OBJECT IDENTIFIER
+        const h = decodeHeader(p, 0, p.len) catch return null;
+        if (h.content_end != p.len) return null; // exactly one OID, no trailing bytes
+        return p[h.content_start..h.content_end];
+    }
+};
+
+pub const SpkiError = Error || error{
+    /// The input is well-formed DER but its `TBSCertificate` field sequence
+    /// does not reach a `subjectPublicKeyInfo` (a field is missing, or the
+    /// outer/`tbsCertificate` element is not a SEQUENCE).
+    MalformedTbsCertificate,
+    /// `subjectPublicKeyInfo` is not `SEQUENCE { AlgorithmIdentifier SEQUENCE
+    /// { OBJECT IDENTIFIER, parameters OPTIONAL }, BIT STRING }`, carries
+    /// extra fields, or its BIT STRING is empty / not byte-aligned (non-zero
+    /// unused-bit count).
+    MalformedSubjectPublicKeyInfo,
+};
+
+/// One TLV header at `pos`, or `null` when no element starts there (the
+/// container is exhausted, or its remainder is too short to hold a header).
+/// Total on any input: `decodeHeader` is the bounds-checked primitive that
+/// does not trust std's reader, and `pos + 2 > limit` is checked before any
+/// indexing.
+fn nextField(bytes: []const u8, pos: usize, limit: usize) ?Header {
+    if (pos + 2 > limit) return null;
+    return decodeHeader(bytes, pos, limit) catch null;
+}
+
+/// Extract a certificate's `SubjectPublicKeyInfo` **without ever calling
+/// `std.crypto.Certificate.parse`** — the point of this function.
+///
+/// `certificate_der` is untrusted, attacker-controlled input by assumption
+/// (a TLS/OPC-UA peer certificate, a SAML `<ds:X509Certificate>`, an OCSP
+/// responder certificate). It is first run through `validateCertificate`, so
+/// every TLV in the buffer is proven to sit wholly inside it and to tile its
+/// container exactly; the field walk that follows (version → serialNumber →
+/// signature → issuer → validity → subject → subjectPublicKeyInfo, RFC 5280
+/// §4.1) then uses only this file's own bounds-checked `decodeHeader`. No
+/// validity dates, algorithm OIDs, extensions or signature bytes are decoded
+/// — none of them is needed to name the key, and each one is another parser
+/// to get wrong. **Fails closed:** anything that does not decode exactly is a
+/// typed `SpkiError`, never a panic and never a partial result.
+///
+/// **Lifetime:** the returned `Spki`'s fields all borrow `certificate_der` —
+/// see `Spki`'s doc comment.
+///
+/// Note what this does and does not prove. It proves that the returned bytes
+/// are the certificate's SubjectPublicKeyInfo field. It proves nothing about
+/// the certificate's signature, validity window, issuer, or extensions — this
+/// is a field accessor, not a verifier. Use `chain.verifyChain` for that.
+pub fn spkiOf(certificate_der: []const u8) SpkiError!Spki {
+    try validateCertificate(certificate_der);
+    const b = certificate_der;
+
+    // Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signatureValue }
+    const certificate = decodeHeader(b, 0, b.len) catch return error.MalformedTbsCertificate;
+    const tbs_start = certificate.content_start;
+    const tbs = nextField(b, tbs_start, certificate.content_end) orelse return error.MalformedTbsCertificate;
+    if (b[tbs_start] != 0x30) return error.MalformedTbsCertificate;
+
+    // TBSCertificate ::= SEQUENCE { version [0] EXPLICIT DEFAULT v1,
+    //   serialNumber, signature, issuer, validity, subject,
+    //   subjectPublicKeyInfo, ... }
+    const lim = tbs.content_end;
+    var pos = tbs.content_start;
+    var f = nextField(b, pos, lim) orelse return error.MalformedTbsCertificate;
+    if (b[pos] == 0xa0) { // the OPTIONAL version tag; serialNumber is the next field
+        pos = f.content_end;
+        f = nextField(b, pos, lim) orelse return error.MalformedTbsCertificate;
+    }
+    pos = f.content_end; // -> signature
+    for (0..4) |_| { // signature, issuer, validity, subject
+        f = nextField(b, pos, lim) orelse return error.MalformedTbsCertificate;
+        pos = f.content_end;
+    }
+
+    // SubjectPublicKeyInfo ::= SEQUENCE { algorithm AlgorithmIdentifier,
+    //   subjectPublicKey BIT STRING }
+    const spki_start = pos;
+    const spki = nextField(b, spki_start, lim) orelse return error.MalformedTbsCertificate;
+    if (b[spki_start] != 0x30) return error.MalformedSubjectPublicKeyInfo;
+
+    const alg_start = spki.content_start;
+    const alg = nextField(b, alg_start, spki.content_end) orelse return error.MalformedSubjectPublicKeyInfo;
+    if (b[alg_start] != 0x30) return error.MalformedSubjectPublicKeyInfo;
+
+    const oid_start = alg.content_start;
+    const oid = nextField(b, oid_start, alg.content_end) orelse return error.MalformedSubjectPublicKeyInfo;
+    if (b[oid_start] != 0x06) return error.MalformedSubjectPublicKeyInfo;
+
+    const parameters: ?[]const u8 = if (oid.content_end < alg.content_end) params: {
+        const p = nextField(b, oid.content_end, alg.content_end) orelse return error.MalformedSubjectPublicKeyInfo;
+        if (p.content_end != alg.content_end) return error.MalformedSubjectPublicKeyInfo; // exactly one parameters field
+        break :params b[oid.content_end..p.content_end];
+    } else null;
+
+    const bits_start = alg.content_end;
+    const bits = nextField(b, bits_start, spki.content_end) orelse return error.MalformedSubjectPublicKeyInfo;
+    if (b[bits_start] != 0x03) return error.MalformedSubjectPublicKeyInfo; // BIT STRING
+    if (bits.content_end != spki.content_end) return error.MalformedSubjectPublicKeyInfo; // exactly two fields
+    if (bits.content_end == bits.content_start) return error.MalformedSubjectPublicKeyInfo; // no unused-bits octet
+    if (b[bits.content_start] != 0) return error.MalformedSubjectPublicKeyInfo; // must be whole octets
+
+    return .{
+        .der = b[spki_start..spki.content_end],
+        .algorithm_oid = b[oid.content_start..oid.content_end],
+        .parameters = parameters,
+        .key_bits = b[bits.content_start + 1 .. bits.content_end],
+    };
+}
+
 // ── tests ───────────────────────────────────────────────────────────────────
 //
 // The bar here is the union of what the three modules that used to carry their
@@ -353,6 +518,161 @@ test "regression: the std hazard is neutralised (verified panic out of band)" {
     var scratch: [max_certificate_len + parse_slack]u8 = undefined;
     const cert = try safeCertificate(hostile, &scratch);
     try testing.expectError(error.CertificateFieldHasWrongDataType, cert.parse());
+}
+
+// ── spkiOf ──────────────────────────────────────────────────────────────────
+
+const rsa = @import("rsa");
+
+/// Oracle for the walk: std's own field walk, reached through the guard so it
+/// cannot panic. `Parsed.pubKey()` is the BIT STRING content std lands on —
+/// which must be byte-identical to what `spkiOf` reports as `key_bits`, even
+/// though the two walks share no code.
+fn stdPubKey(cert_der: []const u8, scratch: []u8) ![]const u8 {
+    const cert = try safeCertificate(cert_der, scratch);
+    const parsed = try cert.parse();
+    return parsed.pubKey();
+}
+
+test "spkiOf: agrees with std's own walk on every std-parsable fixture" {
+    var scratch: [max_certificate_len + parse_slack]u8 = undefined;
+    inline for (.{
+        "root_rsa",    "inter_rsa",   "leaf_rsa",   "subleaf_rsa",
+        "root_ec256",  "inter_ec256", "leaf_ec256", "root_ec384",
+        "inter_ec384", "leaf_ec384",  "root_ed",    "inter_ed",
+        "leaf_ed",
+    }) |name| {
+        const cert_der = &@field(fixtures, name);
+        const spki = try spkiOf(cert_der);
+        try testing.expectEqualSlices(u8, try stdPubKey(cert_der, &scratch), spki.key_bits);
+        // The reported TLV really is a sub-slice of the caller's buffer (the
+        // documented borrowing contract) and really is a SEQUENCE.
+        try testing.expect(@intFromPtr(spki.der.ptr) >= @intFromPtr(cert_der.ptr));
+        try testing.expect(@intFromPtr(spki.der.ptr) + spki.der.len <= @intFromPtr(cert_der.ptr) + cert_der.len);
+        try testing.expectEqual(@as(u8, 0x30), spki.der[0]);
+    }
+}
+
+test "spkiOf: RSA fixture yields a SPKI rsa.PublicKey.fromDer accepts" {
+    const spki = try spkiOf(&fixtures.leaf_rsa);
+    try testing.expect(spki.algorithmIs(&oid_rsa_encryption));
+    try testing.expectEqual(@as(?[]const u8, null), spki.namedCurveOid());
+    const pk = try rsa.PublicKey.fromDer(spki.der);
+    try testing.expectEqual(@as(usize, 2048), pk.n.bits());
+    // Same key, reached the other way: the BIT STRING content is the bare
+    // PKCS#1 RSAPublicKey.
+    const pk2 = try rsa.PublicKey.fromDer(spki.key_bits);
+    try testing.expectEqual(pk.n.bits(), pk2.n.bits());
+}
+
+test "spkiOf: EC fixtures report the right named curve; Ed25519 reports none" {
+    const p256 = try spkiOf(&fixtures.leaf_ec256);
+    try testing.expect(p256.algorithmIs(&oid_ec_public_key));
+    try testing.expectEqualSlices(u8, &oid_prime256v1, p256.namedCurveOid().?);
+    try testing.expectEqual(@as(u8, 0x04), p256.key_bits[0]); // uncompressed SEC1
+    try testing.expectEqual(@as(usize, 65), p256.key_bits.len);
+    // The extracted point is a real curve point, not just the right length.
+    _ = try std.crypto.sign.ecdsa.EcdsaP256Sha256.PublicKey.fromSec1(p256.key_bits);
+
+    const p384 = try spkiOf(&fixtures.leaf_ec384);
+    try testing.expectEqualSlices(u8, &oid_secp384r1, p384.namedCurveOid().?);
+
+    const ed = try spkiOf(&fixtures.leaf_ed);
+    try testing.expect(ed.algorithmIs(&oid_ed25519));
+    try testing.expectEqual(@as(?[]const u8, null), ed.parameters); // no AlgorithmIdentifier parameters at all
+    try testing.expectEqual(@as(usize, 32), ed.key_bits.len);
+}
+
+test "spkiOf: works on RSASSA-PSS certificates, which std cannot parse at all" {
+    // The whole reason this is not built on `Certificate.parse`: std rejects a
+    // PSS-signed certificate outright (`CertificateHasUnrecognizedObjectId`)
+    // before yielding anything, yet its SubjectPublicKeyInfo is a wholly
+    // separate, perfectly ordinary field.
+    var scratch: [max_certificate_len + parse_slack]u8 = undefined;
+    const cert = try safeCertificate(&fixtures.inter_pss, &scratch);
+    try testing.expectError(error.CertificateHasUnrecognizedObjectId, cert.parse());
+
+    inline for (.{ "root_pss", "inter_pss", "leaf_pss" }) |name| {
+        const spki = try spkiOf(&@field(fixtures, name));
+        try testing.expect(spki.key_bits.len > 0);
+        try testing.expectEqual(@as(u8, 0x30), spki.der[0]);
+    }
+}
+
+test "spkiOf: hostile input — every prefix of a real certificate is a typed error, never a panic" {
+    // Item 4 of the verify gate: run in Debug, where the std panic this module
+    // exists to avoid would fire.
+    inline for (.{ "leaf_rsa", "leaf_ec256", "leaf_pss" }) |name| {
+        const cert = &@field(fixtures, name);
+        _ = try spkiOf(cert); // not vacuous: the genuine article works
+        for (0..cert.len) |cut| {
+            // A strict prefix is never a SEQUENCE that fills its own buffer.
+            if (spkiOf(cert[0..cut])) |_| try testing.expect(false) else |_| {}
+        }
+    }
+}
+
+test "spkiOf: hostile input — every single-byte mutation is a typed error or a clean result" {
+    const mutant = try testing.allocator.dupe(u8, &fixtures.leaf_ec256);
+    defer testing.allocator.free(mutant);
+    for (0..mutant.len) |i| {
+        for ([_]u8{ 0x00, 0x01, 0x03, 0x30, 0x7f, 0x80, 0xa0, 0xff }) |v| {
+            const original = mutant[i];
+            mutant[i] = v;
+            if (spkiOf(mutant)) |spki| {
+                // Whatever it found must still lie inside the input buffer.
+                try testing.expect(@intFromPtr(spki.der.ptr) >= @intFromPtr(mutant.ptr));
+                try testing.expect(@intFromPtr(spki.der.ptr) + spki.der.len <= @intFromPtr(mutant.ptr) + mutant.len);
+                _ = spki.namedCurveOid();
+                _ = rsa.PublicKey.fromDer(spki.der) catch {};
+                _ = std.crypto.sign.ecdsa.EcdsaP256Sha256.PublicKey.fromSec1(spki.key_bits) catch {};
+            } else |_| {}
+            mutant[i] = original;
+        }
+    }
+}
+
+test "spkiOf: shapes that are well-formed DER but not a certificate fail closed" {
+    // `SEQUENCE { SEQUENCE {} }` — the exact shape that walks std's parser off
+    // the end of the buffer. Here it simply runs out of TBSCertificate fields.
+    try testing.expectError(error.MalformedTbsCertificate, spkiOf(&.{ 0x30, 0x02, 0x30, 0x00 }));
+    // Not a certificate at all.
+    try testing.expectError(error.NotCertificate, spkiOf(&.{ 0x02, 0x01, 0x00 }));
+    // Certificate-shaped with only five TBS fields (serialNumber .. subject):
+    // no subjectPublicKeyInfo follows at all.
+    const five = [_]u8{ 0x30, 0x0c, 0x30, 0x0a } ++ [_]u8{ 0x02, 0x00 } ** 5;
+    try testing.expectError(error.MalformedTbsCertificate, spkiOf(&five));
+    // Six TBS fields, so a subjectPublicKeyInfo slot exists — but it holds an
+    // INTEGER rather than a SEQUENCE.
+    const six = [_]u8{ 0x30, 0x0e, 0x30, 0x0c } ++ [_]u8{ 0x02, 0x00 } ** 6;
+    try testing.expectError(error.MalformedSubjectPublicKeyInfo, spkiOf(&six));
+}
+
+test "spkiOf: a BIT STRING with unused bits is rejected rather than silently truncated" {
+    // Flip the leaf's subjectPublicKey unused-bits octet from 0 to 1: the key
+    // is no longer whole octets, so it must not be handed on as if it were.
+    const mutant = try testing.allocator.dupe(u8, &fixtures.leaf_ec256);
+    defer testing.allocator.free(mutant);
+    const good = try spkiOf(mutant);
+    const unused_bits_index = (@intFromPtr(good.key_bits.ptr) - @intFromPtr(mutant.ptr)) - 1;
+    mutant[unused_bits_index] = 1;
+    try testing.expectError(error.MalformedSubjectPublicKeyInfo, spkiOf(mutant));
+}
+
+test "fuzz: arbitrary bytes through spkiOf never panic" {
+    try testing.fuzz({}, struct {
+        fn run(_: void, smith: *std.testing.Smith) anyerror!void {
+            var buf: [1024]u8 = undefined;
+            smith.bytes(&buf);
+            const n: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+            if (spkiOf(buf[0..n])) |spki| {
+                _ = spki.namedCurveOid();
+                _ = spki.algorithmIs(&oid_rsa_encryption);
+                _ = rsa.PublicKey.fromDer(spki.der) catch {};
+                _ = std.crypto.sign.ecdsa.EcdsaP256Sha256.PublicKey.fromSec1(spki.key_bits) catch {};
+            } else |_| {}
+        }
+    }.run, .{});
 }
 
 test "fuzz: arbitrary bytes through the validator and the safe parser never panic" {

@@ -89,6 +89,60 @@ ReleaseFast; `30 82` (truncated length) segfaults in ReleaseFast.
   zero-pad by `safe.parse_slack` (64), and return a `std.crypto.Certificate`
   safe to `parse`. `safe.max_certificate_len` (8192) bounds the input so a
   caller can size `[max_certificate_len + parse_slack]u8` on the stack.
+- `safe.spkiOf(certificate_der)` (lifted as `x509.spkiOf`) — the certificate's
+  `SubjectPublicKeyInfo`, extracted without `std.crypto.Certificate.parse` at
+  all. See the section below.
+
+### `spkiOf` — SubjectPublicKeyInfo extraction
+
+**Why it exists.** Several consumers need only to *name* an untrusted
+certificate's public key — Holder-of-Key subject confirmation in `saml`, key
+pinning, comparing a certificate against a bare public key — with no interest
+in its dates, extensions or signature. Routing that through
+`Certificate.parse` would drag the whole hazard above into an authentication
+path for no benefit, and would additionally fail outright on a PSS-signed
+certificate whose SubjectPublicKeyInfo is a perfectly ordinary field.
+
+**How it stays safe.** `validateCertificate` runs first, so every TLV in the
+buffer is proven to sit wholly inside it and to tile its container exactly.
+The field walk that follows (version `[0]` OPTIONAL → serialNumber →
+signature → issuer → validity → subject → subjectPublicKeyInfo, RFC 5280
+§4.1) uses only `safe.zig`'s own `decodeHeader`, and decodes no field
+*contents* whatsoever — not a single date, OID enum or bit flag. The
+`subjectPublicKeyInfo` is then required to be exactly
+`SEQUENCE { AlgorithmIdentifier SEQUENCE { OBJECT IDENTIFIER, parameters
+OPTIONAL }, BIT STRING }` with no extra fields and a zero unused-bit count;
+anything else is `error.MalformedSubjectPublicKeyInfo`. Fails closed
+throughout: `SpkiError` (= `safe.Error` + `MalformedTbsCertificate` +
+`MalformedSubjectPublicKeyInfo`), never a panic, never a partial result.
+
+**Borrowing contract.** `Spki.der` (the full SPKI TLV), `.algorithm_oid` (OID
+content bytes), `.parameters` (full TLV or null) and `.key_bits` (BIT STRING
+content, unused-bits octet stripped) are all sub-slices of the caller's
+`certificate_der`. Nothing is copied, nothing is allocated, the input is never
+mutated, and the whole `Spki` dangles the moment that buffer does. A caller
+needing the key to outlive the certificate bytes must copy it or parse it into
+an owned key type (`rsa.PublicKey.fromDer` copies).
+
+**What it does NOT prove.** Only that the returned bytes are the certificate's
+SubjectPublicKeyInfo field. Nothing about the signature, validity window,
+issuer or extensions — it is a field accessor, not a verifier. `verifyChain`
+is the verifier.
+
+**Verification.** Cross-checked against std's *own* independent field walk
+(reached through `safeCertificate`, so it cannot panic): for every fixture
+certificate std can parse — RSA, EC P-256, EC P-384, Ed25519, at root,
+intermediate and leaf positions — `spkiOf(...).key_bits` must equal
+`Parsed.pubKey()` byte for byte, although the two walks share no code. Plus:
+the RSA fixture's SPKI round-trips through `rsa.PublicKey.fromDer` (both as
+the whole TLV and as the bare PKCS#1 key bits), the P-256 fixture's key bits
+are accepted by `fromSec1` and its `namedCurveOid` is `prime256v1`, the three
+PSS fixtures extract cleanly (with a paired assertion that std's own
+`parse` rejects one of them), and hostile-input sweeps — every prefix of three
+real certificates, every single-byte mutation of one under eight substituted
+values, explicit shapes with too-few TBS fields / a non-SEQUENCE SPKI / a
+non-zero unused-bit count, and a `std.testing.fuzz` walk feeding arbitrary
+bytes into `spkiOf` and on into `rsa.PublicKey.fromDer` / `fromSec1`.
 
 **Why the zero-padded copy is kept, not dropped.** Well-formedness is
 necessary but **not sufficient** to make `std.crypto.Certificate.parse`
