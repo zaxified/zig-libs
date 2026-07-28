@@ -134,6 +134,17 @@ pub const DfElect = struct {
     delivery: checks.DeliveryChecker = .{},
     transitions: std.ArrayList(checks.DfTransition) = .empty,
 
+    /// Frames dropped because they did not decode, or because `origin`/`seq`
+    /// fell outside the range this node's dedup state can represent.
+    ///
+    /// Dropping is the correct data-plane response — an edge switch discards a
+    /// runt or unparseable frame, it does not answer it — and there is no
+    /// control-plane NAK to send. Counting keeps it visible: a sustained
+    /// non-zero count means either a codec bug or a peer emitting garbage, and
+    /// in this harness (where every frame comes from our own `encode`) it must
+    /// stay 0, which the model-check asserts.
+    malformed_dropped: u64 = 0,
+
     pub fn init(gpa: Allocator, node_count: usize, cfg: ElectConfig) Allocator.Error!DfElect {
         const hello_last_seq = try gpa.alloc(u32, node_count * node_count);
         @memset(hello_last_seq, 0);
@@ -201,6 +212,7 @@ pub const DfElect = struct {
         @memset(self.bum_seq, 0);
         self.delivery.reset();
         self.transitions.clearRetainingCapacity();
+        self.malformed_dropped = 0;
     }
 
     fn onStart(ctx: *anyopaque, sim: *Sim, node: NodeId) anyerror!void {
@@ -244,7 +256,11 @@ pub const DfElect = struct {
 
     fn onMessage(ctx: *anyopaque, sim: *Sim, node: NodeId, from: NodeId, payload: []const u8) anyerror!void {
         const self = cast(ctx);
-        switch (types.tagOf(payload)) {
+        const tag = types.tagOf(payload) catch {
+            self.malformed_dropped += 1;
+            return;
+        };
+        switch (tag) {
             .hello => try self.handleHello(sim, node, from, payload),
             .bum => try self.handleBum(sim, node, from, payload),
         }
@@ -286,7 +302,19 @@ pub const DfElect = struct {
     }
 
     fn handleHello(self: *DfElect, sim: *Sim, node: NodeId, from: NodeId, payload: []const u8) anyerror!void {
-        const h = types.Hello.decode(payload);
+        const h = types.Hello.decode(payload) catch {
+            self.malformed_dropped += 1;
+            return;
+        };
+        // `origin` is a wire u32 used directly as an index into a
+        // node_count*node_count array — a well-formed 13-byte Hello claiming
+        // origin 0xFFFFFFFF would read and then WRITE far out of bounds. The
+        // decoder cannot catch this (it does not know the topology), so the
+        // range check belongs here.
+        if (h.origin >= self.node_count) {
+            self.malformed_dropped += 1;
+            return;
+        }
         const idx = node * self.node_count + h.origin;
         if (h.seq <= self.hello_last_seq[idx]) return; // stale or duplicate — supersede semantics
         self.hello_last_seq[idx] = h.seq;
@@ -302,7 +330,19 @@ pub const DfElect = struct {
     }
 
     fn handleBum(self: *DfElect, sim: *Sim, node: NodeId, from: NodeId, payload: []const u8) anyerror!void {
-        const f = types.BumFrame.decode(payload);
+        const f = types.BumFrame.decode(payload) catch {
+            self.malformed_dropped += 1;
+            return;
+        };
+        // Two untrusted VALUES, neither of which a length check can catch:
+        // `origin` indexes `bum_seen` (as in `handleHello`), and `seq` is a
+        // wire u32 used as a shift amount into a u64 bitmask — `@intCast` to
+        // u6 panics for any seq >= 64, so a single frame with seq = 64 was a
+        // remote panic even though the frame is perfectly well-formed.
+        if (f.origin >= self.node_count or f.seq >= @bitSizeOf(u64)) {
+            self.malformed_dropped += 1;
+            return;
+        }
         const idx = node * self.node_count + f.origin;
         const bit = @as(u64, 1) << @intCast(f.seq);
         if (self.bum_seen[idx] & bit != 0) return; // already processed this exact frame
@@ -444,8 +484,13 @@ pub const BrokenAlwaysDf = struct {
 
     fn onMessage(ctx: *anyopaque, sim: *Sim, node: NodeId, from: NodeId, payload: []const u8) anyerror!void {
         const self = cast(ctx);
-        if (types.tagOf(payload) != .bum) return; // this broken protocol never sends Hellos
-        const f = types.BumFrame.decode(payload);
+        // The control is deliberately wrong about the ELECTION, not about
+        // parsing — it must not be crashable by a malformed frame either, or a
+        // decode panic would masquerade as the checker firing.
+        const tag = types.tagOf(payload) catch return;
+        if (tag != .bum) return; // this broken protocol never sends Hellos
+        const f = types.BumFrame.decode(payload) catch return;
+        if (f.origin >= self.node_count or f.seq >= @bitSizeOf(u64)) return;
         const idx = node * self.node_count + f.origin;
         const bit = @as(u64, 1) << @intCast(f.seq);
         if (self.bum_seen[idx] & bit != 0) return;
@@ -603,5 +648,90 @@ test "real: bounded-badness — the worst observed DF-count window stays within 
             std.debug.print("df-elect: seed {} worst DF window {} exceeds bound {}\n", .{ seed, worst, bound });
         }
         try testing.expect(worst <= bound);
+    }
+}
+
+// ── malformed inbound frames: dropped, counted, never fatal ─────────────────
+//
+// Length validity is only half the exposure. `origin` is used as an index into
+// a NODE_N*NODE_N array and `seq` as a shift into a u64 bitmask, so a
+// PERFECTLY WELL-FORMED 13-byte frame carrying `origin = 0xFFFFFFFF` or
+// `seq = 64` was an out-of-bounds write / a `@intCast` panic respectively —
+// neither of which a bounds-checked decoder can catch, because the decoder
+// does not know the topology. Those checks live in the handlers.
+
+fn feedFrames(df: *DfElect, payloads: []const []const u8) !void {
+    const gpa = testing.allocator;
+    var log: netsim.Log = .{};
+    defer log.deinit(gpa);
+    var sim = netsim.Sim.init(gpa, 0, df.protocol(), &log, UNTIL, 10_000);
+    defer sim.deinit();
+    try scenario(&sim);
+    const p = df.protocol();
+    // Node 3 (an edge member of SEG_A) receiving from its core neighbour.
+    for (payloads) |payload| try p.onMessageFn(p.ctx, &sim, SEG_A.nodes[0], CORE0, payload);
+}
+
+test "malformed inbound frames are dropped and counted, and never crash the node" {
+    const gpa = testing.allocator;
+    var df = try DfElect.init(gpa, NODE_N, DEFAULT_CFG);
+    defer df.deinit(gpa);
+
+    // Well-formed length, hostile field VALUES.
+    var wild_origin: [types.Hello.wire_len]u8 = undefined;
+    (types.Hello{ .origin = 0xFFFF_FFFF, .seq = 1, .segment = SEG_A.id }).encode(&wild_origin);
+    var wild_bum_origin: [types.BumFrame.wire_len]u8 = undefined;
+    (types.BumFrame{ .origin = 0xFFFF_FFFF, .seq = 1, .ingress_segment = types.no_ingress }).encode(&wild_bum_origin);
+    // seq = 64 is exactly the first shift amount a u64 bitmask cannot hold.
+    var wild_seq: [types.BumFrame.wire_len]u8 = undefined;
+    (types.BumFrame{ .origin = 1, .seq = 64, .ingress_segment = types.no_ingress }).encode(&wild_seq);
+
+    const cases = [_][]const u8{
+        &.{}, // empty: tagOf out of bounds
+        &.{7}, // undefined tag byte: "invalid enum value"
+        &.{@intFromEnum(types.MsgTag.hello)}, // the reported reproducer
+        &.{@intFromEnum(types.MsgTag.bum)},
+        &wild_origin,
+        &wild_bum_origin,
+        &wild_seq,
+    };
+    try feedFrames(&df, &cases);
+
+    try testing.expectEqual(@as(u64, cases.len), df.malformed_dropped);
+    // No dedup state was touched by any of them.
+    for (df.hello_last_seq) |s| try testing.expectEqual(@as(u32, 0), s);
+    for (df.bum_seen) |s| try testing.expectEqual(@as(u64, 0), s);
+}
+
+test "a well-formed frame is still accepted (the guard is not over-tight)" {
+    const gpa = testing.allocator;
+    var df = try DfElect.init(gpa, NODE_N, DEFAULT_CFG);
+    defer df.deinit(gpa);
+
+    var buf: [types.Hello.wire_len]u8 = undefined;
+    (types.Hello{ .origin = SEG_A.nodes[1], .seq = 9, .segment = SEG_A.id }).encode(&buf);
+    try feedFrames(&df, &.{&buf});
+
+    try testing.expectEqual(@as(u64, 0), df.malformed_dropped);
+    const idx = @as(usize, SEG_A.nodes[0]) * NODE_N + SEG_A.nodes[1];
+    try testing.expectEqual(@as(u32, 9), df.hello_last_seq[idx]);
+}
+
+test "real: the fabric never drops a frame of its own making" {
+    if (!gate.fable_core_implemented) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var df = try DfElect.init(gpa, NODE_N, DEFAULT_CFG);
+    defer df.deinit(gpa);
+    const template = netsim.Case{ .seed = 0, .scenario = scenario, .protocol = df.protocol(), .until = UNTIL };
+
+    // Every frame on this wire came from our own `encode`; a drop would mean a
+    // codec bug that the fail-closed decoders would otherwise hide.
+    var seed: u64 = 1;
+    while (seed <= 25) : (seed += 1) {
+        var case = template;
+        case.seed = seed;
+        var gr = try netsim.run(gpa, case, .{});
+        defer gr.trace.deinit();
+        try testing.expectEqual(@as(u64, 0), df.malformed_dropped);
     }
 }

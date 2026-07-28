@@ -164,6 +164,17 @@ pub const RaftServer = struct {
     /// can observe the new leaderCommit), so first-record term == commit term.
     commit_terms: std.AutoHashMapUnmanaged(LogIndex, Term) = .empty,
 
+    /// Inbound messages dropped because they did not decode (see
+    /// `dropMalformed`). Raft has no "your message was garbage" reply in
+    /// Figure 2, so a malformed datagram is DROPPED — but it is counted, not
+    /// silently swallowed, because a drop is otherwise invisible.
+    ///
+    /// In this harness the only sender is our own `encode`, so a non-zero
+    /// count means a codec bug on our side, and the model-check asserts it
+    /// stays 0 (`expectNoMalformed`). That is what makes the counter load-
+    /// bearing rather than decorative.
+    malformed_dropped: u64 = 0,
+
     pub fn init(gpa: Allocator, node_count: usize, cfg: RaftConfig) Allocator.Error!RaftServer {
         const nodes = try gpa.alloc(NodeState, node_count);
         var made: usize = 0;
@@ -206,6 +217,7 @@ pub const RaftServer = struct {
         for (self.nodes) |*n| n.resetAll();
         self.checker.reset();
         self.commit_terms.clearRetainingCapacity();
+        self.malformed_dropped = 0;
     }
 
     // ── timers ──────────────────────────────────────────────────────────────
@@ -319,9 +331,39 @@ pub const RaftServer = struct {
         }
     }
 
+    /// A message that did not decode is dropped and counted.
+    ///
+    /// Why drop: Figure 2 defines no negative acknowledgement, so there is
+    /// nothing legal to reply. Inventing one would add a protocol message AND
+    /// an amplification vector (an attacker sending 1-byte datagrams would get
+    /// full-size replies). Dropping is also exactly what the network already
+    /// does to a corrupted packet, and Raft's liveness argument is built on
+    /// tolerating loss: a dropped RequestVote is retried by the next election
+    /// timeout, a dropped AppendEntries by the next heartbeat. So a drop costs
+    /// no more liveness than the packet loss Raft already assumes.
+    ///
+    /// Why count: a peer that emits ONLY malformed messages is, to this node,
+    /// indistinguishable from a dead link — and if enough peers do it, the
+    /// cluster loses quorum while every node looks healthy. That is a real
+    /// liveness concern, but it is not one a decoder can fix: the correct
+    /// response (evict the peer? alarm? refuse to count it toward quorum?) is
+    /// an operational policy decision above this layer. The counter is
+    /// deliberately the whole mechanism here — it makes the condition
+    /// observable and leaves the policy to the caller. See SPEC.md
+    /// §"Malformed messages".
+    fn dropMalformed(self: *RaftServer, err: types.DecodeError) void {
+        // Both variants are dropped identically today; the switch exists so
+        // that a future policy split (e.g. alarm only on InvalidEncoding, which
+        // cannot be caused by truncation in transit) has an obvious home.
+        switch (err) {
+            error.Truncated, error.InvalidEncoding => self.malformed_dropped += 1,
+        }
+    }
+
     fn onMessage(ctx: *anyopaque, sim: *Sim, node: NodeId, from: NodeId, payload: []const u8) anyerror!void {
         const self = cast(ctx);
-        switch (types.tagOf(payload)) {
+        const tag = types.tagOf(payload) catch |e| return self.dropMalformed(e);
+        switch (tag) {
             .request_vote_req => try self.handleVoteReq(sim, node, from, payload),
             .request_vote_resp => try self.handleVoteResp(sim, node, from, payload),
             .append_entries_req => try self.handleAppendReq(sim, node, from, payload),
@@ -331,7 +373,7 @@ pub const RaftServer = struct {
 
     fn handleVoteReq(self: *RaftServer, sim: *Sim, node: NodeId, from: NodeId, payload: []const u8) anyerror!void {
         const ns = &self.nodes[node];
-        const req = types.RequestVoteReq.decode(payload);
+        const req = types.RequestVoteReq.decode(payload) catch |e| return self.dropMalformed(e);
         // THE FABLE CORE: the grant decision (term step-up + single-vote +
         // up-to-date restriction).
         const d = safety.handleRequestVote(ns.current_term, ns.voted_for, ns.log.info(), req);
@@ -351,7 +393,7 @@ pub const RaftServer = struct {
 
     fn handleVoteResp(self: *RaftServer, sim: *Sim, node: NodeId, from: NodeId, payload: []const u8) anyerror!void {
         const ns = &self.nodes[node];
-        const resp = types.RequestVoteResp.decode(payload);
+        const resp = types.RequestVoteResp.decode(payload) catch |e| return self.dropMalformed(e);
         const obs = safety.observeTerm(ns.current_term, resp.term);
         if (obs.term_advanced) {
             ns.current_term = obs.new_term;
@@ -371,7 +413,7 @@ pub const RaftServer = struct {
     fn handleAppendReq(self: *RaftServer, sim: *Sim, node: NodeId, from: NodeId, payload: []const u8) anyerror!void {
         const ns = &self.nodes[node];
         var scratch: [types.max_entries_per_msg]LogEntry = undefined;
-        const req = types.AppendEntriesReq.decode(payload, &scratch);
+        const req = types.AppendEntriesReq.decode(payload, &scratch) catch |e| return self.dropMalformed(e);
         // THE FABLE CORE: consistency check + conflict-only truncation +
         // follower commit advancement.
         const out = safety.handleAppendEntries(ns.current_term, &ns.log, ns.commit_index, req);
@@ -404,7 +446,7 @@ pub const RaftServer = struct {
     fn handleAppendResp(self: *RaftServer, sim: *Sim, node: NodeId, from: NodeId, payload: []const u8) anyerror!void {
         _ = sim;
         const ns = &self.nodes[node];
-        const resp = types.AppendEntriesResp.decode(payload);
+        const resp = types.AppendEntriesResp.decode(payload) catch |e| return self.dropMalformed(e);
         const obs = safety.observeTerm(ns.current_term, resp.term);
         if (obs.term_advanced) {
             ns.current_term = obs.new_term;
@@ -681,4 +723,97 @@ test "real: a leader is eventually elected on a quiet network (liveness sanity)"
         if (n.role == .leader) leaders += 1;
     }
     try testing.expect(leaders >= 1);
+}
+
+// ── malformed inbound messages: dropped, counted, never fatal ───────────────
+//
+// Every payload below used to PANIC inside `onMessage` (out-of-bounds index,
+// "invalid enum value", or — with safety off — an out-of-bounds write past
+// `handleAppendReq`'s 8-element `scratch`). Driving them through the real
+// `Protocol` vtable is what proves the fix reaches the actual entry point and
+// not just the codec: `tagOf` runs before any decoder, so a fail-closed
+// decoder behind a panicking tag read would never have been reached.
+
+fn feedMalformed(srv: *RaftServer, payloads: []const []const u8) !void {
+    const gpa = testing.allocator;
+    var log: netsim.Log = .{};
+    defer log.deinit(gpa);
+    var sim = netsim.Sim.init(gpa, 0, srv.protocol(), &log, UNTIL, 10_000);
+    defer sim.deinit();
+    try scenario(&sim);
+    const p = srv.protocol();
+    for (payloads) |payload| try p.onMessageFn(p.ctx, &sim, 0, 1, payload);
+}
+
+test "malformed inbound messages are dropped and counted, and never crash the node" {
+    const gpa = testing.allocator;
+    var srv = try RaftServer.init(gpa, CLUSTER_N, DEFAULT_CFG);
+    defer srv.deinit(gpa);
+
+    // A header claiming 65535 entries — the out-of-bounds WRITE.
+    var lying_count = [_]u8{0} ** types.AppendEntriesReq.header_len;
+    lying_count[0] = @intFromEnum(types.RpcTag.append_entries_req);
+    std.mem.writeInt(u16, lying_count[37..39], 0xFFFF, .little);
+
+    // A well-formed tag whose entry count exceeds the bytes present.
+    var short_batch = [_]u8{0} ** types.AppendEntriesReq.header_len;
+    short_batch[0] = @intFromEnum(types.RpcTag.append_entries_req);
+    std.mem.writeInt(u16, short_batch[37..39], 4, .little);
+
+    const cases = [_][]const u8{
+        &.{}, // empty: tagOf out of bounds
+        &.{99}, // undefined RPC tag: "invalid enum value"
+        &.{@intFromEnum(types.RpcTag.request_vote_req)}, // the reported reproducer
+        &.{@intFromEnum(types.RpcTag.request_vote_resp)},
+        &.{@intFromEnum(types.RpcTag.append_entries_req)},
+        &.{@intFromEnum(types.RpcTag.append_entries_resp)},
+        &lying_count,
+        &short_batch,
+    };
+    try feedMalformed(&srv, &cases);
+
+    // Every one was dropped — counted, not silently swallowed.
+    try testing.expectEqual(@as(u64, cases.len), srv.malformed_dropped);
+    // …and none of them moved the consensus state.
+    for (srv.nodes) |*n| {
+        try testing.expectEqual(@as(Term, 0), n.current_term);
+        try testing.expectEqual(no_vote, n.voted_for);
+        try testing.expectEqual(@as(LogIndex, 0), n.log.lastIndex());
+    }
+}
+
+test "a well-formed message is still accepted (the guard is not over-tight)" {
+    const gpa = testing.allocator;
+    var srv = try RaftServer.init(gpa, CLUSTER_N, DEFAULT_CFG);
+    defer srv.deinit(gpa);
+
+    var rq: [types.RequestVoteReq.wire_len]u8 = undefined;
+    (types.RequestVoteReq{ .term = 5, .candidate_id = 1, .last_log_index = 0, .last_log_term = 0 }).encode(&rq);
+    try feedMalformed(&srv, &.{&rq});
+
+    try testing.expectEqual(@as(u64, 0), srv.malformed_dropped);
+    // The vote request was acted on: node 0 stepped up to term 5 and voted.
+    try testing.expectEqual(@as(Term, 5), srv.nodes[0].current_term);
+    try testing.expectEqual(@as(NodeId, 1), srv.nodes[0].voted_for);
+}
+
+test "real: the model-checked cluster never drops a message of its own making" {
+    if (!gate.fable_core_implemented) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var srv = try RaftServer.init(gpa, CLUSTER_N, DEFAULT_CFG);
+    defer srv.deinit(gpa);
+    const template = netsim.Case{ .seed = 0, .scenario = scenario, .protocol = srv.protocol(), .until = UNTIL };
+
+    // Every byte on this wire came from our own `encode`, so a single drop
+    // would mean an encoder/decoder disagreement — the fail-closed decoders
+    // turn what used to be a panic into a silent drop, and this is what keeps
+    // that from hiding a real codec bug.
+    var seed: u64 = 1;
+    while (seed <= 25) : (seed += 1) {
+        var case = template;
+        case.seed = seed;
+        var gr = try netsim.run(gpa, case, .{});
+        defer gr.trace.deinit();
+        try testing.expectEqual(@as(u64, 0), srv.malformed_dropped);
+    }
 }

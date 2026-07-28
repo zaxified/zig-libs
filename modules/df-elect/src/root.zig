@@ -39,6 +39,8 @@ pub const EdgeSegment = types.EdgeSegment;
 pub const ElectConfig = types.ElectConfig;
 pub const Hello = types.Hello;
 pub const BumFrame = types.BumFrame;
+/// Both wire decoders fail closed — see `types.zig`'s module doc.
+pub const DecodeError = types.DecodeError;
 pub const no_ingress = types.no_ingress;
 
 /// FABLE tier — see `election.zig`. `decide` is the irreducible algorithm;

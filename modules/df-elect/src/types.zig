@@ -4,6 +4,20 @@
 //! module puts on the netsim link (`Hello` for link-state liveness, `BumFrame`
 //! for broadcast/unknown-unicast/multicast traffic). Pure data + mechanical
 //! (de)serialization only — no election logic lives here, see `election.zig`.
+//!
+//! ## Decoding fails closed
+//!
+//! `tagOf` / `Hello.decode` / `BumFrame.decode` return `DecodeError!T` and
+//! bounds-check before indexing. These frames arrive from the fabric, which in
+//! a real deployment spans customer-facing edge ports; a one-byte frame used to
+//! panic ("index out of bounds: index 5, len 1") and an undefined tag byte used
+//! to panic on `@enumFromInt` ("invalid enum value").
+//!
+//! Length validity is only half of it. `origin` and `seq` are also untrusted
+//! *values*: `protocol.zig` uses them as an array index and a shift amount
+//! respectively, so the decoders being total is necessary but not sufficient —
+//! see `DfElect.handleHello`/`handleBum`, which range-check both against the
+//! live topology before use.
 
 const std = @import("std");
 const netsim = @import("netsim");
@@ -65,8 +79,25 @@ pub const ElectConfig = struct {
 /// payload byte.
 pub const MsgTag = enum(u8) { hello = 0, bum = 1 };
 
-pub fn tagOf(payload: []const u8) MsgTag {
-    return @enumFromInt(payload[0]);
+/// Why a frame could not be decoded. Same vocabulary as the neighbouring wire
+/// decoders (`pbb.DecodeError`, `raft.DecodeError`).
+pub const DecodeError = error{
+    /// Fewer bytes than the fields being read require.
+    Truncated,
+    /// Long enough, but the tag byte is not one of the two defined kinds.
+    InvalidEncoding,
+};
+
+/// Read the message tag off an untrusted frame. This is the first thing done
+/// with every inbound payload, so it must be total: an empty frame and an
+/// undefined tag byte both used to panic here.
+pub fn tagOf(payload: []const u8) DecodeError!MsgTag {
+    if (payload.len < 1) return error.Truncated;
+    return switch (payload[0]) {
+        @intFromEnum(MsgTag.hello) => .hello,
+        @intFromEnum(MsgTag.bum) => .bum,
+        else => error.InvalidEncoding,
+    };
 }
 
 /// Link-state liveness advertisement: "`origin` is alive and is a member of
@@ -87,7 +118,8 @@ pub const Hello = struct {
         std.mem.writeInt(u32, buf[9..13], self.segment, .little);
     }
 
-    pub fn decode(payload: []const u8) Hello {
+    pub fn decode(payload: []const u8) DecodeError!Hello {
+        if (payload.len < wire_len) return error.Truncated;
         return .{
             .origin = std.mem.readInt(u32, payload[1..5], .little),
             .seq = std.mem.readInt(u32, payload[5..9], .little),
@@ -119,7 +151,8 @@ pub const BumFrame = struct {
         std.mem.writeInt(u32, buf[9..13], self.ingress_segment, .little);
     }
 
-    pub fn decode(payload: []const u8) BumFrame {
+    pub fn decode(payload: []const u8) DecodeError!BumFrame {
+        if (payload.len < wire_len) return error.Truncated;
         return .{
             .origin = std.mem.readInt(u32, payload[1..5], .little),
             .seq = std.mem.readInt(u32, payload[5..9], .little),
@@ -141,8 +174,8 @@ test "Hello round-trips through its wire encoding" {
     var buf: [Hello.wire_len]u8 = undefined;
     const h = Hello{ .origin = 7, .seq = 900, .segment = 3 };
     h.encode(&buf);
-    try testing.expectEqual(MsgTag.hello, tagOf(&buf));
-    const h2 = Hello.decode(&buf);
+    try testing.expectEqual(MsgTag.hello, try tagOf(&buf));
+    const h2 = try Hello.decode(&buf);
     try testing.expectEqual(h.origin, h2.origin);
     try testing.expectEqual(h.seq, h2.seq);
     try testing.expectEqual(h.segment, h2.segment);
@@ -152,8 +185,8 @@ test "BumFrame round-trips through its wire encoding, including the ingress tag"
     var buf: [BumFrame.wire_len]u8 = undefined;
     const f = BumFrame{ .origin = 2, .seq = 55, .ingress_segment = no_ingress };
     f.encode(&buf);
-    try testing.expectEqual(MsgTag.bum, tagOf(&buf));
-    const f2 = BumFrame.decode(&buf);
+    try testing.expectEqual(MsgTag.bum, try tagOf(&buf));
+    const f2 = try BumFrame.decode(&buf);
     try testing.expectEqual(f.origin, f2.origin);
     try testing.expectEqual(f.seq, f2.seq);
     try testing.expectEqual(f.ingress_segment, f2.ingress_segment);
@@ -162,7 +195,7 @@ test "BumFrame round-trips through its wire encoding, including the ingress tag"
     const g = BumFrame{ .origin = 2, .seq = 55, .ingress_segment = 9 };
     var buf2: [BumFrame.wire_len]u8 = undefined;
     g.encode(&buf2);
-    const g2 = BumFrame.decode(&buf2);
+    const g2 = try BumFrame.decode(&buf2);
     try testing.expectEqual(@as(SegmentId, 9), g2.ingress_segment);
     // Same (origin, seq) as `f` — `id()` collapses ingress tag, by design
     // (duplicate-delivery tracking is keyed separately by segment; see
@@ -180,4 +213,52 @@ test "EdgeSegment.indexOf / otherOf / priorityOf" {
     try testing.expectEqual(@as(?u32, 10), seg.priorityOf(4));
     try testing.expectEqual(@as(?u32, 20), seg.priorityOf(9));
     try testing.expectEqual(@as(?u32, null), seg.priorityOf(5));
+}
+
+// ── rejection tests: both decoders fail closed ──────────────────────────────
+
+test "tagOf and the frame decoders reject short and undefined input" {
+    try testing.expectError(error.Truncated, tagOf(&[_]u8{}));
+    // The exact reproducer from the bug report.
+    try testing.expectError(error.Truncated, Hello.decode(&[_]u8{0}));
+    try testing.expectError(error.Truncated, BumFrame.decode(&[_]u8{1}));
+
+    // Every prefix of a valid frame is rejected; the full frame still decodes.
+    var buf: [Hello.wire_len]u8 = undefined;
+    (Hello{ .origin = 1, .seq = 1, .segment = 1 }).encode(&buf);
+    for (0..buf.len) |n| try testing.expectError(error.Truncated, Hello.decode(buf[0..n]));
+    _ = try Hello.decode(&buf);
+
+    // Undefined tag bytes: previously "invalid enum value" panics.
+    for (2..256) |b| try testing.expectError(error.InvalidEncoding, tagOf(&[_]u8{@intCast(b)}));
+    try testing.expectEqual(MsgTag.hello, try tagOf(&[_]u8{0}));
+    try testing.expectEqual(MsgTag.bum, try tagOf(&[_]u8{1}));
+}
+
+// ── fuzz: both decoders are total over arbitrary bytes ──────────────────────
+
+test "fuzz: tagOf never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzTagOf, .{});
+}
+
+fn fuzzTagOf(_: void, smith: *std.testing.Smith) !void {
+    var buf: [8]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    _ = tagOf(buf[0..len]) catch return;
+}
+
+test "fuzz: Hello/BumFrame decode never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzFrames, .{});
+}
+
+fn fuzzFrames(_: void, smith: *std.testing.Smith) !void {
+    var buf: [Hello.wire_len * 2]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    _ = Hello.decode(buf[0..len]) catch {};
+    if (BumFrame.decode(buf[0..len])) |f| {
+        // `id()` is called on every decoded frame by the delivery checker.
+        std.mem.doNotOptimizeAway(f.id());
+    } else |_| {}
 }

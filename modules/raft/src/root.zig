@@ -44,6 +44,8 @@ pub const NodeId = types.NodeId;
 pub const Command = types.Command;
 pub const no_vote = types.no_vote;
 pub const EntryKind = types.EntryKind;
+/// Every wire decoder here fails closed — see `types.zig`'s module doc.
+pub const DecodeError = types.DecodeError;
 pub const LogEntry = types.LogEntry;
 pub const RpcTag = types.RpcTag;
 pub const RequestVoteReq = types.RequestVoteReq;

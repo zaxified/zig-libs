@@ -7,6 +7,31 @@
 //! logic lives here (that is `safety.zig`, the Fable core). Modeled on the RPC
 //! message set of Ongaro & Ousterhout, "In Search of an Understandable Consensus
 //! Algorithm" (extended version), Figure 2.
+//!
+//! ## Decoding fails closed
+//!
+//! Every `decode` / `deserialize` here returns `DecodeError!T` and validates
+//! each field against the buffer BEFORE indexing it. A peer's RPC bytes are
+//! untrusted input: in the sim they only ever come from this module's own
+//! `encode`, but the codec is the module's outer boundary and a consensus
+//! implementation that can be crashed by one malformed datagram has no
+//! availability story at all. Concretely, before this was enforced:
+//!
+//!  - any short payload panicked on an out-of-bounds index (`decode(&[_]u8{0})`
+//!    → "index out of bounds: index 9, len 1");
+//!  - an undefined RPC tag or entry-kind byte panicked on `@enumFromInt`
+//!    ("invalid enum value") — a validity fault, not a length fault;
+//!  - `AppendEntriesReq.decode` took its entry count off the wire and guarded
+//!    it with `std.debug.assert`, which is compiled out when safety is off:
+//!    a 39-byte message declaring 65535 entries wrote past the caller's
+//!    8-element stack array (measured: SIGSEGV in `ReleaseFast`). An
+//!    out-of-bounds WRITE from two attacker-chosen bytes.
+//!  - `PersistentState.deserialize` allocated its entry count off the wire
+//!    with no check that the buffer could back it — the same unbounded-count
+//!    class fixed in `threshold_ecdsa.PublicKeys.fromBytesAlloc`.
+//!
+//! A count or length field is therefore always checked against the REMAINING
+//! buffer before it is looped on or allocated from, never after.
 
 const std = @import("std");
 const netsim = @import("netsim");
@@ -39,6 +64,31 @@ pub const no_vote: NodeId = 0xFFFF_FFFF;
 /// carries a membership change (design-only in Phase 1 — see SPEC.md §Membership).
 pub const EntryKind = enum(u8) { noop = 0, command = 1, config = 2 };
 
+/// Why a buffer could not be decoded. Same vocabulary as the other wire
+/// decoders in this library (`pbb.DecodeError`, `isis`'s TLV iterator): a
+/// length problem is `Truncated`, a well-sized but impossible field is
+/// `InvalidEncoding`.
+pub const DecodeError = error{
+    /// Fewer bytes than the fixed fields being read require, or a declared
+    /// entry count the remaining bytes cannot back.
+    Truncated,
+    /// The bytes are long enough but a field is semantically impossible: an
+    /// undefined RPC tag or entry-kind byte, or an entry count above
+    /// `max_entries_per_msg`.
+    InvalidEncoding,
+};
+
+/// Validate an entry-kind byte instead of `@enumFromInt`-ing it, which panics
+/// with "invalid enum value" for anything outside the three defined kinds.
+fn entryKindFrom(b: u8) DecodeError!EntryKind {
+    return switch (b) {
+        @intFromEnum(EntryKind.noop) => .noop,
+        @intFromEnum(EntryKind.command) => .command,
+        @intFromEnum(EntryKind.config) => .config,
+        else => error.InvalidEncoding,
+    };
+}
+
 /// One replicated log entry: the term in which the leader that created it was in
 /// power, its kind, and its command payload.
 pub const LogEntry = struct {
@@ -54,10 +104,11 @@ pub const LogEntry = struct {
         std.mem.writeInt(u64, buf[9..17], self.command, .little);
     }
 
-    pub fn decode(b: []const u8) LogEntry {
+    pub fn decode(b: []const u8) DecodeError!LogEntry {
+        if (b.len < wire_len) return error.Truncated;
         return .{
             .term = std.mem.readInt(u64, b[0..8], .little),
-            .kind = @enumFromInt(b[8]),
+            .kind = try entryKindFrom(b[8]),
             .command = std.mem.readInt(u64, b[9..17], .little),
         };
     }
@@ -76,8 +127,19 @@ pub const RpcTag = enum(u8) {
     append_entries_resp = 3,
 };
 
-pub fn tagOf(payload: []const u8) RpcTag {
-    return @enumFromInt(payload[0]);
+/// Read the RPC tag off an untrusted payload. Rejects an empty buffer and any
+/// byte outside the four defined tags — `@enumFromInt` on a raw wire byte
+/// panics, and this is the FIRST thing done with every inbound datagram, so a
+/// fail-closed decoder behind a panicking tag read would never be reached.
+pub fn tagOf(payload: []const u8) DecodeError!RpcTag {
+    if (payload.len < 1) return error.Truncated;
+    return switch (payload[0]) {
+        @intFromEnum(RpcTag.request_vote_req) => .request_vote_req,
+        @intFromEnum(RpcTag.request_vote_resp) => .request_vote_resp,
+        @intFromEnum(RpcTag.append_entries_req) => .append_entries_req,
+        @intFromEnum(RpcTag.append_entries_resp) => .append_entries_resp,
+        else => error.InvalidEncoding,
+    };
 }
 
 // ── RequestVote (Figure 2) ──────────────────────────────────────────────────
@@ -98,7 +160,8 @@ pub const RequestVoteReq = struct {
         std.mem.writeInt(u64, buf[21..29], self.last_log_term, .little);
     }
 
-    pub fn decode(p: []const u8) RequestVoteReq {
+    pub fn decode(p: []const u8) DecodeError!RequestVoteReq {
+        if (p.len < wire_len) return error.Truncated;
         return .{
             .term = std.mem.readInt(u64, p[1..9], .little),
             .candidate_id = std.mem.readInt(u32, p[9..13], .little),
@@ -120,7 +183,8 @@ pub const RequestVoteResp = struct {
         buf[9] = @intFromBool(self.vote_granted);
     }
 
-    pub fn decode(p: []const u8) RequestVoteResp {
+    pub fn decode(p: []const u8) DecodeError!RequestVoteResp {
+        if (p.len < wire_len) return error.Truncated;
         return .{
             .term = std.mem.readInt(u64, p[1..9], .little),
             .vote_granted = p[9] != 0,
@@ -161,13 +225,25 @@ pub const AppendEntriesReq = struct {
 
     /// Decode, materializing the entries into caller-owned `out`. The returned
     /// value's `entries` slice borrows `out[0..count]`.
-    pub fn decode(p: []const u8, out: *[max_entries_per_msg]LogEntry) AppendEntriesReq {
+    ///
+    /// `count` is read off the wire and therefore bounded TWICE before the loop
+    /// runs: once against `out`'s fixed capacity and once against the bytes
+    /// actually present. This used to be a `std.debug.assert`, which is
+    /// compiled out whenever safety is off — a 39-byte message declaring 65535
+    /// entries then wrote ~1.5 MB past an 8-element stack array (measured:
+    /// SIGSEGV under `ReleaseFast`). An assert is a statement about our own
+    /// bugs; a wire field is someone else's input and needs a real check.
+    pub fn decode(p: []const u8, out: *[max_entries_per_msg]LogEntry) DecodeError!AppendEntriesReq {
+        if (p.len < header_len) return error.Truncated;
         const count = std.mem.readInt(u16, p[37..39], .little);
-        std.debug.assert(count <= max_entries_per_msg);
+        if (count > max_entries_per_msg) return error.InvalidEncoding;
+        // Only now is `count` known to fit `out`; check the payload can back it
+        // before reading a single entry.
+        if ((p.len - header_len) / LogEntry.wire_len < count) return error.Truncated;
         var off: usize = header_len;
         var i: usize = 0;
         while (i < count) : (i += 1) {
-            out[i] = LogEntry.decode(p[off..][0..LogEntry.wire_len]);
+            out[i] = try LogEntry.decode(p[off..][0..LogEntry.wire_len]);
             off += LogEntry.wire_len;
         }
         return .{
@@ -203,7 +279,8 @@ pub const AppendEntriesResp = struct {
         std.mem.writeInt(u64, buf[10..18], self.match_index, .little);
     }
 
-    pub fn decode(p: []const u8) AppendEntriesResp {
+    pub fn decode(p: []const u8) DecodeError!AppendEntriesResp {
+        if (p.len < wire_len) return error.Truncated;
         return .{
             .term = std.mem.readInt(u64, p[1..9], .little),
             .success = p[9] != 0,
@@ -231,12 +308,12 @@ pub const PersistentState = struct {
 
     /// Serialize to a fresh gpa-owned byte image. Caller frees the slice.
     pub fn serialize(self: PersistentState, gpa: Allocator) Allocator.Error![]u8 {
-        const total = 8 + 4 + 4 + self.log.len * LogEntry.wire_len;
+        const total = header_len + self.log.len * LogEntry.wire_len;
         const buf = try gpa.alloc(u8, total);
         std.mem.writeInt(u64, buf[0..8], self.current_term, .little);
         std.mem.writeInt(u32, buf[8..12], self.voted_for, .little);
         std.mem.writeInt(u32, buf[12..16], @intCast(self.log.len), .little);
-        var off: usize = 16;
+        var off: usize = header_len;
         for (self.log) |e| {
             e.encode(buf[off..][0..LogEntry.wire_len]);
             off += LogEntry.wire_len;
@@ -244,17 +321,32 @@ pub const PersistentState = struct {
         return buf;
     }
 
+    pub const header_len = 8 + 4 + 4; // term(8) + voted_for(4) + log count(4)
+
     /// Deserialize; the returned `log` slice is gpa-owned (free with
     /// `gpa.free(state.log)`).
-    pub fn deserialize(gpa: Allocator, bytes: []const u8) Allocator.Error!PersistentState {
+    ///
+    /// The stored image is the crash-recovery path, so it is not "our own
+    /// bytes" in any meaningful sense — it is whatever survived the crash, or
+    /// whatever is on the disk now. The entry count is validated against the
+    /// remaining bytes BEFORE `alloc`, the same guard
+    /// `threshold_ecdsa.PublicKeys.fromBytesAlloc` uses: without it a 16-byte
+    /// image declaring 1_000_000 entries allocated 24 MB and then read far past
+    /// the buffer (measured: "index out of bounds: index 33, len 16"), and
+    /// `0xFFFFFFFF` demanded ~103 GB. With safety off that read would silently
+    /// pull adjacent heap into the replicated log.
+    pub fn deserialize(gpa: Allocator, bytes: []const u8) (Allocator.Error || DecodeError)!PersistentState {
+        if (bytes.len < header_len) return error.Truncated;
         const term = std.mem.readInt(u64, bytes[0..8], .little);
         const voted = std.mem.readInt(u32, bytes[8..12], .little);
         const n = std.mem.readInt(u32, bytes[12..16], .little);
+        if ((bytes.len - header_len) / LogEntry.wire_len < n) return error.Truncated;
         const log = try gpa.alloc(LogEntry, n);
-        var off: usize = 16;
+        errdefer gpa.free(log);
+        var off: usize = header_len;
         var i: usize = 0;
         while (i < n) : (i += 1) {
-            log[i] = LogEntry.decode(bytes[off..][0..LogEntry.wire_len]);
+            log[i] = try LogEntry.decode(bytes[off..][0..LogEntry.wire_len]);
             off += LogEntry.wire_len;
         }
         return .{ .current_term = term, .voted_for = voted, .log = log };
@@ -269,7 +361,7 @@ test "LogEntry round-trips through its wire encoding" {
     var buf: [LogEntry.wire_len]u8 = undefined;
     const e = LogEntry{ .term = 7, .kind = .config, .command = 0xDEAD_BEEF };
     e.encode(&buf);
-    const d = LogEntry.decode(&buf);
+    const d = try LogEntry.decode(&buf);
     try testing.expectEqual(e.term, d.term);
     try testing.expectEqual(e.kind, d.kind);
     try testing.expectEqual(e.command, d.command);
@@ -279,8 +371,8 @@ test "RequestVote req/resp round-trip + tag" {
     var rq: [RequestVoteReq.wire_len]u8 = undefined;
     const req = RequestVoteReq{ .term = 3, .candidate_id = 2, .last_log_index = 9, .last_log_term = 2 };
     req.encode(&rq);
-    try testing.expectEqual(RpcTag.request_vote_req, tagOf(&rq));
-    const rd = RequestVoteReq.decode(&rq);
+    try testing.expectEqual(RpcTag.request_vote_req, try tagOf(&rq));
+    const rd = try RequestVoteReq.decode(&rq);
     try testing.expectEqual(req.term, rd.term);
     try testing.expectEqual(req.candidate_id, rd.candidate_id);
     try testing.expectEqual(req.last_log_index, rd.last_log_index);
@@ -289,8 +381,8 @@ test "RequestVote req/resp round-trip + tag" {
     var rs: [RequestVoteResp.wire_len]u8 = undefined;
     const resp = RequestVoteResp{ .term = 3, .vote_granted = true };
     resp.encode(&rs);
-    try testing.expectEqual(RpcTag.request_vote_resp, tagOf(&rs));
-    const sd = RequestVoteResp.decode(&rs);
+    try testing.expectEqual(RpcTag.request_vote_resp, try tagOf(&rs));
+    const sd = try RequestVoteResp.decode(&rs);
     try testing.expectEqual(resp.term, sd.term);
     try testing.expectEqual(resp.vote_granted, sd.vote_granted);
 }
@@ -311,10 +403,10 @@ test "AppendEntries req round-trips including a multi-entry batch" {
     };
     var buf: [AppendEntriesReq.max_wire]u8 = undefined;
     const n = req.encode(&buf);
-    try testing.expectEqual(RpcTag.append_entries_req, tagOf(buf[0..n]));
+    try testing.expectEqual(RpcTag.append_entries_req, try tagOf(buf[0..n]));
 
     var scratch: [max_entries_per_msg]LogEntry = undefined;
-    const d = AppendEntriesReq.decode(buf[0..n], &scratch);
+    const d = try AppendEntriesReq.decode(buf[0..n], &scratch);
     try testing.expectEqual(req.term, d.term);
     try testing.expectEqual(req.leader_id, d.leader_id);
     try testing.expectEqual(req.prev_log_index, d.prev_log_index);
@@ -341,7 +433,7 @@ test "AppendEntries req round-trips an empty (heartbeat) batch" {
     const n = req.encode(&buf);
     try testing.expectEqual(@as(usize, AppendEntriesReq.header_len), n);
     var scratch: [max_entries_per_msg]LogEntry = undefined;
-    const d = AppendEntriesReq.decode(buf[0..n], &scratch);
+    const d = try AppendEntriesReq.decode(buf[0..n], &scratch);
     try testing.expectEqual(@as(usize, 0), d.entries.len);
 }
 
@@ -349,7 +441,7 @@ test "AppendEntries resp round-trips" {
     var buf: [AppendEntriesResp.wire_len]u8 = undefined;
     const resp = AppendEntriesResp{ .term = 5, .success = true, .match_index = 12 };
     resp.encode(&buf);
-    const d = AppendEntriesResp.decode(&buf);
+    const d = try AppendEntriesResp.decode(&buf);
     try testing.expectEqual(resp.term, d.term);
     try testing.expectEqual(resp.success, d.success);
     try testing.expectEqual(resp.match_index, d.match_index);
@@ -386,4 +478,165 @@ test "PersistentState with an empty log and no vote round-trips" {
     try testing.expectEqual(@as(Term, 0), back.current_term);
     try testing.expectEqual(no_vote, back.voted_for);
     try testing.expectEqual(@as(usize, 0), back.log.len);
+}
+
+// ── rejection tests: every decoder fails closed ─────────────────────────────
+//
+// Each of these inputs previously PANICKED (out-of-bounds index, "invalid enum
+// value", or — for `AppendEntriesReq` with safety off — an out-of-bounds write
+// past the caller's 8-element array).
+
+test "decoders reject every input too short for their fixed fields" {
+    try testing.expectError(error.Truncated, tagOf(&[_]u8{}));
+    try testing.expectError(error.Truncated, LogEntry.decode(&[_]u8{0} ** (LogEntry.wire_len - 1)));
+    // The exact reproducer from the bug report.
+    try testing.expectError(error.Truncated, RequestVoteReq.decode(&[_]u8{0}));
+    try testing.expectError(error.Truncated, RequestVoteResp.decode(&[_]u8{0}));
+    try testing.expectError(error.Truncated, AppendEntriesResp.decode(&[_]u8{0}));
+
+    var scratch: [max_entries_per_msg]LogEntry = undefined;
+    try testing.expectError(error.Truncated, AppendEntriesReq.decode(&[_]u8{0}, &scratch));
+
+    // Every prefix of a valid encoding is rejected, none panics.
+    var rq: [RequestVoteReq.wire_len]u8 = undefined;
+    (RequestVoteReq{ .term = 1, .candidate_id = 0, .last_log_index = 0, .last_log_term = 0 }).encode(&rq);
+    for (0..rq.len) |n| try testing.expectError(error.Truncated, RequestVoteReq.decode(rq[0..n]));
+    _ = try RequestVoteReq.decode(&rq); // the full buffer still decodes
+}
+
+test "decoders reject undefined tag and entry-kind bytes" {
+    for (4..256) |b| try testing.expectError(error.InvalidEncoding, tagOf(&[_]u8{@intCast(b)}));
+    var e = [_]u8{0} ** LogEntry.wire_len;
+    for (3..256) |b| {
+        e[8] = @intCast(b);
+        try testing.expectError(error.InvalidEncoding, LogEntry.decode(&e));
+    }
+    for (0..3) |b| {
+        e[8] = @intCast(b);
+        _ = try LogEntry.decode(&e); // the three defined kinds still decode
+    }
+}
+
+test "AppendEntriesReq rejects a wire entry count the buffer cannot back" {
+    var scratch: [max_entries_per_msg]LogEntry = undefined;
+
+    // A bare header claiming 65535 entries. This is the out-of-bounds WRITE:
+    // with safety off the old `std.debug.assert` vanished and the loop wrote
+    // ~1.5 MB past `scratch` (measured: SIGSEGV under ReleaseFast).
+    var p = [_]u8{0} ** AppendEntriesReq.header_len;
+    std.mem.writeInt(u16, p[37..39], 0xFFFF, .little);
+    try testing.expectError(error.InvalidEncoding, AppendEntriesReq.decode(&p, &scratch));
+
+    // A count that fits `scratch` but that the payload does not carry: caught
+    // as Truncated, before the loop reads anything.
+    std.mem.writeInt(u16, p[37..39], max_entries_per_msg, .little);
+    try testing.expectError(error.Truncated, AppendEntriesReq.decode(&p, &scratch));
+
+    // One entry short of the declared count is still rejected.
+    var q = [_]u8{0} ** (AppendEntriesReq.header_len + 2 * LogEntry.wire_len);
+    std.mem.writeInt(u16, q[37..39], 3, .little);
+    try testing.expectError(error.Truncated, AppendEntriesReq.decode(&q, &scratch));
+    std.mem.writeInt(u16, q[37..39], 2, .little);
+    try testing.expectEqual(@as(usize, 2), (try AppendEntriesReq.decode(&q, &scratch)).entries.len);
+}
+
+test "PersistentState.deserialize rejects a log count the image cannot back" {
+    const gpa = testing.allocator;
+    try testing.expectError(error.Truncated, PersistentState.deserialize(gpa, &[_]u8{0} ** 15));
+
+    // 16 bytes claiming 1_000_000 entries: previously allocated 24 MB and then
+    // read far past the buffer ("index out of bounds: index 33, len 16").
+    var b = [_]u8{0} ** PersistentState.header_len;
+    std.mem.writeInt(u32, b[12..16], 1_000_000, .little);
+    try testing.expectError(error.Truncated, PersistentState.deserialize(gpa, &b));
+
+    // 0xFFFFFFFF demanded ~103 GB; rejected before `alloc` is reached.
+    std.mem.writeInt(u32, b[12..16], 0xFFFF_FFFF, .little);
+    try testing.expectError(error.Truncated, PersistentState.deserialize(gpa, &b));
+
+    // A truthful count still round-trips (the guard is not over-tight).
+    std.mem.writeInt(u32, b[12..16], 0, .little);
+    const st = try PersistentState.deserialize(gpa, &b);
+    defer gpa.free(st.log);
+    try testing.expectEqual(@as(usize, 0), st.log.len);
+}
+
+// ── fuzz: every decoder is total over arbitrary bytes ───────────────────────
+//
+// These could not have been landed before the fix: each one fails on its first
+// input against the old decoders (verified by reverting the guards — see
+// SPEC.md §"Malformed messages"). `smith.bytes` + a length draw covers both the
+// short-input and the hostile-field-value cases, and the buffers are sized past
+// `max_wire` so a well-formed header with a lying count is reachable.
+
+test "fuzz: tagOf never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzTagOf, .{});
+}
+
+fn fuzzTagOf(_: void, smith: *std.testing.Smith) !void {
+    var buf: [8]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    _ = tagOf(buf[0..len]) catch return;
+}
+
+test "fuzz: LogEntry.decode never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzLogEntry, .{});
+}
+
+fn fuzzLogEntry(_: void, smith: *std.testing.Smith) !void {
+    var buf: [LogEntry.wire_len * 2]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    _ = LogEntry.decode(buf[0..len]) catch return;
+}
+
+test "fuzz: RequestVote req/resp decode never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzRequestVote, .{});
+}
+
+fn fuzzRequestVote(_: void, smith: *std.testing.Smith) !void {
+    var buf: [RequestVoteReq.wire_len * 2]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    _ = RequestVoteReq.decode(buf[0..len]) catch {};
+    _ = RequestVoteResp.decode(buf[0..len]) catch {};
+}
+
+test "fuzz: AppendEntries req/resp decode never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzAppendEntries, .{});
+}
+
+fn fuzzAppendEntries(_: void, smith: *std.testing.Smith) !void {
+    // Wider than `max_wire` so a full header plus a lying entry count — the
+    // out-of-bounds-write case — is inside the drawn range.
+    var buf: [AppendEntriesReq.max_wire + 16]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+
+    var scratch: [max_entries_per_msg]LogEntry = undefined;
+    if (AppendEntriesReq.decode(buf[0..len], &scratch)) |req| {
+        // A successful decode must have produced a slice that really is backed
+        // by `scratch` — the property the old assert was standing in for.
+        std.debug.assert(req.entries.len <= max_entries_per_msg);
+        for (req.entries) |e| std.mem.doNotOptimizeAway(e.term);
+    } else |_| {}
+    _ = AppendEntriesResp.decode(buf[0..len]) catch {};
+}
+
+test "fuzz: PersistentState.deserialize never panics or over-allocates" {
+    try testing.fuzz({}, fuzzPersistentState, .{});
+}
+
+fn fuzzPersistentState(_: void, smith: *std.testing.Smith) !void {
+    var buf: [PersistentState.header_len + 4 * LogEntry.wire_len]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+
+    // The testing allocator is the guard against the unbounded-count bug: a
+    // count the buffer cannot back must be rejected BEFORE `alloc`, so this
+    // never asks for more than `buf` could possibly describe.
+    const st = PersistentState.deserialize(testing.allocator, buf[0..len]) catch return;
+    defer testing.allocator.free(st.log);
+    std.debug.assert(st.log.len * LogEntry.wire_len <= buf.len);
 }

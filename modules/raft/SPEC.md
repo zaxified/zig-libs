@@ -107,6 +107,51 @@ in for the disk write; in the sim a node crash clears only volatile state and a
 restart re-enters via the protocol's start hook, so "restart with term/vote/log
 intact" is a real, tested property (the serialize/deserialize round-trip test).
 
+## Malformed messages
+
+Every wire decoder in `types.zig` returns `DecodeError!T` (`Truncated` for a
+length problem, `InvalidEncoding` for a well-sized but impossible field) and
+validates against the buffer **before** indexing, looping, or allocating. This
+is a change in failure semantics: decoding used to be infallible-by-assumption
+and panicked on anything unexpected. Concretely it now rejects
+
+- any payload shorter than the fixed fields (`decode(&[_]u8{0})` used to panic
+  with `index out of bounds: index 9, len 1`);
+- an undefined RPC tag byte or `EntryKind` byte — `@enumFromInt` on raw wire
+  bytes panicked with `invalid enum value`. `tagOf` matters most: it runs
+  *before* any decoder, so a fail-closed decoder behind a panicking tag read
+  would never be reached;
+- an `AppendEntriesReq` entry count above `max_entries_per_msg`, **and** one the
+  remaining bytes cannot back — checked before the loop. This was previously a
+  `std.debug.assert`, which is compiled out when safety is off: a 39-byte
+  message declaring 65535 entries wrote past the caller's 8-element stack array
+  (measured: SIGSEGV under `ReleaseFast`) — an out-of-bounds *write* from two
+  attacker-chosen bytes;
+- a `PersistentState` log count the image cannot back, **before** `alloc` — the
+  same unbounded-count guard as `threshold_ecdsa.PublicKeys.fromBytesAlloc`. A
+  16-byte image claiming 1,000,000 entries used to allocate 24 MB and then read
+  far past the buffer; `0xFFFFFFFF` demanded ~103 GB.
+
+**Policy on a malformed message: drop it and count it** (`RaftServer.
+malformed_dropped`). Figure 2 defines no negative acknowledgement, so there is
+nothing legal to reply, and inventing one would add both a protocol message and
+an amplification vector. Dropping is what the network already does to a
+corrupted packet, and Raft's liveness argument is built on tolerating loss — a
+dropped RequestVote is retried by the next election timeout, a dropped
+AppendEntries by the next heartbeat — so a drop costs no more liveness than the
+packet loss the protocol already assumes.
+
+The counter is the mechanism that keeps the drop from being *silent*. A peer
+emitting only malformed messages is, to this node, indistinguishable from a dead
+link; if enough peers do it the cluster loses quorum while every node looks
+healthy. **That residual liveness concern is deliberately left to the operator,
+not decided here** — the correct response (evict the peer, alarm, stop counting
+it toward quorum) is policy above this layer. What this module guarantees is
+that the condition is observable. In the harness every byte on the wire comes
+from our own `encode`, so `malformed_dropped` must stay 0; the model-check
+asserts exactly that across a seed sweep, which is what stops a fail-closed
+decoder from quietly hiding a real codec bug.
+
 ## The positive control
 
 `server.BrokenRaft` reimplements a naive election that declares leadership on its

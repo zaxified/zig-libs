@@ -135,7 +135,31 @@ assumptions below. Out of scope: segments with >2 members (RFC 7432's general
 `DF = list[(ordinal) mod N]`); the LSA-flood/hold-timer control-plane details
 beyond the abstract `stale_after` liveness threshold; multi-segment split-horizon
 label interactions; and node authentication / Byzantine members (a lying Hello
-is out of the threat model — the flood is trusted).
+is out of the threat model — the flood's *content* is trusted).
+
+**Malformed frames are NOT trusted, though** — that is a separate axis from
+Byzantine content, and it is enforced. `tagOf` / `Hello.decode` /
+`BumFrame.decode` return `DecodeError!T` (`Truncated` / `InvalidEncoding`) and
+bounds-check before indexing; a 1-byte frame used to panic (`index out of
+bounds: index 5, len 1`) and an undefined tag byte used to panic on
+`@enumFromInt`.
+
+Length validity is only half of it. `origin` and `seq` are untrusted *values*,
+not just untrusted lengths: `origin` indexes the `node_count*node_count`
+`hello_last_seq`/`bum_seen` arrays and `seq` is a shift amount into a u64
+bitmask. A **perfectly well-formed** 13-byte frame carrying
+`origin = 0xFFFFFFFF` was an out-of-bounds write, and one carrying `seq = 64`
+was an `@intCast` panic. A bounds-checked decoder cannot catch either — it does
+not know the topology — so both are range-checked in
+`DfElect.handleHello`/`handleBum` against the live node count before use.
+
+Policy: drop the frame and increment `DfElect.malformed_dropped`. Dropping is
+the correct data-plane response (an edge switch discards a runt, it does not
+answer it) and there is no control-plane NAK to send; counting keeps a
+sustained fault visible rather than silent. In the harness every frame comes
+from our own `encode`, so the count must stay 0 — asserted across a seed sweep.
+`BrokenAlwaysDf` is hardened the same way, so that a decode panic can never
+masquerade as the checker firing.
 
 **Scaffold simplifications (deliberate, orthogonal to the election).** Liveness
 is a boolean `peer_alive` derived from a `stale_after` threshold over the last
