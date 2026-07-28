@@ -1040,9 +1040,57 @@ test "on_evict safety net: a dirty entry evicted before flush is still persisted
     try c.put("b", "2");
     try c.put("cc", "3"); // over capacity → an earlier dirty entry is evicted here
 
+    // CONTROL: the hook actually fired and registered the evicted key. Without
+    // this the test cannot fail when `on_evict` is a no-op — `flushAll`'s
+    // `flushOneSync` backstop drains any leftover WAL record regardless of the
+    // orphan bookkeeping, so the sink ends up correct either way.
+    try testing.expect(c.orphans.count() >= 1);
+    // The orphan is a key that is no longer resident in the cache: it can only
+    // be reached by the flusher via the on_evict safety net.
+    {
+        var it = c.orphans.keyIterator();
+        const orphan = it.next().?.*;
+        try testing.expect(!c.cache.isDirty(orphan)); // gone from the cache entirely
+    }
+
     // Whichever entry was evicted fired on_evict(dirty) → orphan; its WAL record
     // is still durable. flushAll must persist all three, none silently dropped.
     c.flushAll();
+    try testing.expectEqual(@as(usize, 0), c.pendingCount());
+    try testing.expectEqual(@as(usize, 3), rig.sink.count());
+    try testing.expectEqualStrings("1", rig.sink.peek("a").?);
+    try testing.expectEqualStrings("2", rig.sink.peek("b").?);
+    try testing.expectEqualStrings("3", rig.sink.peek("cc").?);
+}
+
+test "on_evict safety net: the evicted entry reaches the sink via drain() ALONE (no flushAll backstop)" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+
+    var c = try Coordinator.init(testing.allocator, .{
+        .io = rig.threaded.io(),
+        .sink = rig.sink.sink(),
+        .wal_store = rig.wal_sim.storage(),
+        .wal_path = "wal.jq",
+        .max_cache_bytes = 1 << 20,
+        .max_cache_entries = 2,
+        .n_workers = 2,
+    });
+    defer c.deinit();
+
+    try c.put("a", "1");
+    try c.put("b", "2");
+    try c.put("cc", "3"); // over capacity → one dirty entry is evicted here
+
+    // `flushAll` would mask a broken safety net: its `flushOneSync` backstop
+    // drains ANY leftover WAL record, including one no bookkeeping selected.
+    // `drain()` has no such backstop — `kick` can only reach a key that is no
+    // longer resident in the cache through the orphan set `on_evict` fills, so
+    // this loop persists all three ONLY if the safety net works.
+    var spins: usize = 0;
+    while (c.pendingCount() > 0 and spins < 100_000) : (spins += 1) c.drain();
+
     try testing.expectEqual(@as(usize, 0), c.pendingCount());
     try testing.expectEqual(@as(usize, 3), rig.sink.count());
     try testing.expectEqualStrings("1", rig.sink.peek("a").?);

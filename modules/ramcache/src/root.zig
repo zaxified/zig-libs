@@ -706,6 +706,21 @@ test "eviction takes an expired entry before the LRU one" {
     // At t=100 both fill the cap; inserting 4 more bytes forces one eviction.
     // Pure LRU would take "lru" (older) — expired-first must take "exp".
     c.put("new", "cccc", 100, 0, 0);
+    // CONTROL: check residency directly, BEFORE any `get`. `get("exp", 100, …)`
+    // returns null for an expired entry whether or not it was evicted (it drops
+    // it lazily), so a `get`-based assertion alone cannot fail here.
+    try testing.expect(!c.map.contains("exp")); // physically gone, not just stale
+    try testing.expect(c.map.contains("lru"));
+    try testing.expect(c.map.contains("new"));
+    // CONTROL: it left via the expired-first branch, not the frequency contest.
+    // Without this the test passes even with expired-first removed: "exp" is
+    // also the window-LRU candidate and loses the admission gate anyway, so the
+    // surviving/evicted set is identical — only these counters tell them apart.
+    try testing.expectEqual(@as(u64, 0), c.stats.rejections);
+    try testing.expectEqual(@as(u64, 0), c.stats.admissions);
+    // ...and by eviction, not by a lazy TTL drop on read.
+    try testing.expectEqual(@as(u64, 0), c.stats.expired);
+
     try testing.expect(c.get("exp", 100, 0) == null); // the expired one went
     try testing.expect(c.get("lru", 100, 0) != null); // the LRU survivor stays
     try testing.expect(c.get("new", 100, 0) != null);

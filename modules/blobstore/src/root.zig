@@ -874,8 +874,23 @@ test "crash safety: an abandoned temp never becomes a live blob" {
         try fw.interface.flush();
         temp.file.close(io);
     }
-    // the temp exists but no live blob was ever created from it
-    store.discardTemp(temp.tmp);
+    // ── the ABANDONED state: a real crash runs no cleanup, so assert the
+    // invariant while the temp is still on disk. Discarding it first (as the
+    // recovery sweep does) would make every check below vacuous — the artifact
+    // they are supposed to rule out would already be gone.
+    //
+    // CONTROL: the temp genuinely survived the "crash". Without this, the whole
+    // block passes trivially whether or not a temp was ever left behind.
+    try std.Io.Dir.cwd().access(io, temp.tmp, .{});
+
+    // The abandoned temp is NOT content-addressable: hashing its partial bytes
+    // and asking the store for them must miss. This is the actual failure mode
+    // — a torn upload becoming readable under a digest someone can guess.
+    const partial_hex = hashdigest.sha256HexBuf("half-written garbage");
+    const partial: Digest = .{ .hex = partial_hex };
+    try t.expect(!store.has(partial));
+    try t.expectError(error.NotFound, store.verify(partial));
+    try t.expect((try store.open(partial)) == null);
 
     // the previously committed blob is intact and still verifies
     try t.expect(store.has(live));
@@ -883,14 +898,27 @@ test "crash safety: an abandoned temp never becomes a live blob" {
     // and nothing leaked into the fan-out as a live object other than `live`
     var fbuf: [300]u8 = undefined;
     const fan = try std.fmt.bufPrint(&fbuf, "{s}/cas/{s}", .{ store.base, live.hex[0..2] });
-    var dir = try std.Io.Dir.cwd().openDir(io, fan, .{ .iterate = true });
-    defer dir.close(io);
-    var it = dir.iterate();
-    while (try it.next(io)) |e| {
-        if (e.kind != .file) continue;
-        if (std.mem.endsWith(u8, e.name, ".rc")) continue; // refcount sidecar, not a blob
-        try t.expectEqualStrings(&live.hex, e.name);
+    {
+        var dir = try std.Io.Dir.cwd().openDir(io, fan, .{ .iterate = true });
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (try it.next(io)) |e| {
+            if (e.kind != .file) continue;
+            if (std.mem.endsWith(u8, e.name, ".rc")) continue; // refcount sidecar, not a blob
+            try t.expectEqualStrings(&live.hex, e.name);
+        }
     }
+    // gc must not mistake the abandoned temp for a collectable blob, nor
+    // resurrect it: it sweeps nothing and `live` survives.
+    const gc_stats = try store.gc(std.testing.allocator, &.{}, .{});
+    try t.expectEqual(@as(u64, 0), gc_stats.blobs_removed);
+    try t.expect(store.has(live));
+    try t.expect(!store.has(partial));
+
+    // ── only NOW run the crash-recovery sweep that removes the stale temp.
+    store.discardTemp(temp.tmp);
+    try t.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, temp.tmp, .{}));
+    try t.expect(store.has(live)); // the sweep touched nothing live
 }
 
 test "raw layer: create/commit/open/delete + traversal rejected" {
