@@ -28,34 +28,27 @@
 //! A caller that needs any of that should use `Connection.Config.PeerVerify
 //! .verify_fn` instead of `.trust_anchor` — see that type's doc comment.
 //!
-//! ## KNOWN GAP (not fixable within this module): `std.crypto.Certificate
-//! .parse` is NOT panic-safe against malformed/adversarial DER in Zig
-//! 0.16 — confirmed here by fuzzing (see this file's `test`s and the
-//! session that wrote them): even short, structurally-truncated buffers
-//! (as small as 3 bytes, and ~random 26-64 byte buffers reliably) crash
-//! the process with an unguarded `bytes[i]` index-out-of-bounds panic
-//! DEEP inside std's ASN.1 walker, rather than returning a typed
-//! `ParseError`. This function's own error handling (`cert.parse() catch
-//! return error.MalformedCertificate`) cannot intercept a panic — Zig has
-//! no exception/panic-catching mechanism — so `parseLeafPublicKey`/
-//! `verifyLeafAgainstAnchor` inherit this std gap whole. Fixing it would
-//! mean vendoring/writing a bounds-hardened DER parser from scratch,
-//! which is a real, substantial, crypto-adjacent-parsing undertaking, NOT
-//! "plumbing over certverify with no new crypto" — explicitly out of this
-//! module's scope. **Practical consequence: a live deployment that feeds
-//! a PEER-supplied (i.e. potentially adversarial) `Certificate` message's
-//! bytes into this bridge is exposed to a process-crash DoS from a
-//! malformed certificate, until either std fixes this or a hardened
-//! parser replaces this bridge.** Flagged prominently rather than hidden;
-//! not something a Sonnet-tier "wire the existing pieces together" pass
-//! should attempt to silently paper over with a false sense of safety
-//! (a superficial length-floor check was considered and rejected — the
-//! fuzz results above show it would not meaningfully close the gap: most
-//! crashing inputs found were already comfortably longer than any sane
-//! floor).
+//! ## CLOSED GAP: `std.crypto.Certificate.parse` is NOT panic-safe against
+//! malformed/adversarial DER in Zig 0.16 — confirmed here by fuzzing: even
+//! short, structurally-truncated buffers (as small as 3 bytes, and ~random
+//! 26-64 byte buffers reliably) crash the process with an unguarded
+//! `bytes[i]` index-out-of-bounds panic deep inside std's ASN.1 walker,
+//! rather than returning a typed `ParseError`. Since a `Certificate`
+//! message is peer-supplied, that was a crash-DoS on this bridge.
+//!
+//! Both entry points now go through `x509`'s bounds-checked decoder first:
+//! `parseLeafPublicKey` reads the `SubjectPublicKeyInfo` with
+//! `x509.spkiOf`, which never invokes std's parser at all, and
+//! `verifyLeafAgainstAnchor` — which genuinely needs issuer/validity/
+//! signature, fields `spkiOf` deliberately does not decode — feeds std a
+//! copy vetted and zero-padded by `x509.safe.safeCertificate`. The
+//! hardened parser this note once called out of scope was written
+//! separately (`x509/src/safe.zig`) and is shared with `iec62351` and
+//! `opcua`, which had each grown their own guard against the same hazard.
 
 const std = @import("std");
 const rsa = @import("rsa");
+const x509 = @import("x509");
 const certverify = @import("certverify.zig");
 
 const Certificate = std.crypto.Certificate;
@@ -78,31 +71,43 @@ pub const Error = error{
 /// — the key `certverify.verify` needs to check a `CertificateVerify`
 /// signature produced by this certificate's holder.
 pub fn parseLeafPublicKey(cert_der: []const u8) Error!certverify.PublicKey {
-    const cert = Certificate{ .buffer = cert_der, .index = 0 };
-    const parsed = cert.parse() catch return error.MalformedCertificate;
-    const key_bytes = parsed.pubKey();
+    // Routed through `x509.spkiOf`, NOT `std.crypto.Certificate.parse`: std's
+    // DER reader indexes without bounds checks and panics or reads out of
+    // bounds on hostile input, and a peer's Certificate message is exactly
+    // that. `spkiOf` walks the certificate with x509's own bounds-checked
+    // decoder, decodes no field contents at all, and fails closed.
+    const spki = x509.spkiOf(cert_der) catch return error.MalformedCertificate;
+    const key_bytes = spki.key_bits;
 
-    return switch (parsed.pub_key_algo) {
-        .rsaEncryption => .{
-            .rsa = rsa.PublicKey.fromDer(key_bytes) catch return error.InvalidPublicKey,
-        },
-        .X9_62_id_ecPublicKey => |curve| switch (curve) {
-            .X9_62_prime256v1 => .{
+    if (spki.algorithmIs(&x509.safe.oid_rsa_encryption)) {
+        return .{ .rsa = rsa.PublicKey.fromDer(key_bytes) catch return error.InvalidPublicKey };
+    }
+    if (spki.algorithmIs(&x509.safe.oid_ec_public_key)) {
+        // No named curve (implicitCurve/specifiedCurve) is deliberately not
+        // decoded by `namedCurveOid`, so it lands here as unsupported rather
+        // than being guessed at.
+        const curve = spki.namedCurveOid() orelse return error.UnsupportedPublicKeyAlgorithm;
+        if (std.mem.eql(u8, curve, &x509.safe.oid_prime256v1)) {
+            return .{
                 .ecdsa_p256 = std.crypto.sign.ecdsa.EcdsaP256Sha256.PublicKey.fromSec1(key_bytes) catch return error.InvalidPublicKey,
-            },
-            .secp384r1 => .{
-                .ecdsa_p384 = std.crypto.sign.ecdsa.EcdsaP384Sha384.PublicKey.fromSec1(key_bytes) catch return error.InvalidPublicKey,
-            },
-            .secp521r1 => error.UnsupportedPublicKeyAlgorithm,
-        },
-        .curveEd25519 => blk: {
-            if (key_bytes.len != std.crypto.sign.Ed25519.PublicKey.encoded_length) return error.InvalidPublicKey;
-            break :blk .{
-                .ed25519 = std.crypto.sign.Ed25519.PublicKey.fromBytes(key_bytes[0..std.crypto.sign.Ed25519.PublicKey.encoded_length].*) catch return error.InvalidPublicKey,
             };
-        },
-        .rsassa_pss => error.UnsupportedPublicKeyAlgorithm,
-    };
+        }
+        if (std.mem.eql(u8, curve, &x509.safe.oid_secp384r1)) {
+            return .{
+                .ecdsa_p384 = std.crypto.sign.ecdsa.EcdsaP384Sha384.PublicKey.fromSec1(key_bytes) catch return error.InvalidPublicKey,
+            };
+        }
+        return error.UnsupportedPublicKeyAlgorithm; // P-521 and anything else
+    }
+    if (spki.algorithmIs(&x509.safe.oid_ed25519)) {
+        const len = std.crypto.sign.Ed25519.PublicKey.encoded_length;
+        if (key_bytes.len != len) return error.InvalidPublicKey;
+        return .{
+            .ed25519 = std.crypto.sign.Ed25519.PublicKey.fromBytes(key_bytes[0..len].*) catch return error.InvalidPublicKey,
+        };
+    }
+    // Includes rsassa_pss-tagged keys, which carry their own OID.
+    return error.UnsupportedPublicKeyAlgorithm;
 }
 
 /// Minimal one-hop chain-to-trust-anchor check (see module doc comment for
@@ -110,8 +115,16 @@ pub fn parseLeafPublicKey(cert_der: []const u8) Error!certverify.PublicKey {
 /// (real signature check) by `anchor_der`'s key, and `now_sec` must fall
 /// inside `leaf_der`'s validity period.
 pub fn verifyLeafAgainstAnchor(leaf_der: []const u8, anchor_der: []const u8, now_sec: i64) Error!void {
-    const leaf = Certificate{ .buffer = leaf_der, .index = 0 };
-    const anchor = Certificate{ .buffer = anchor_der, .index = 0 };
+    // Unlike `parseLeafPublicKey`, this needs fields `spkiOf` deliberately does
+    // not decode — issuer, validity, signature — so std's parser is still the
+    // one doing the work. It is fed through `x509.safe.safeCertificate`, which
+    // walks the DER with a bounds-checked decoder first and hands std a
+    // zero-padded copy that absorbs its boundary probes. Feeding a peer's
+    // certificate to std's parser unguarded is a crash-DoS.
+    var leaf_scratch: [x509.safe.max_certificate_len + x509.safe.parse_slack]u8 = undefined;
+    var anchor_scratch: [x509.safe.max_certificate_len + x509.safe.parse_slack]u8 = undefined;
+    const leaf = x509.safe.safeCertificate(leaf_der, &leaf_scratch) catch return error.MalformedCertificate;
+    const anchor = x509.safe.safeCertificate(anchor_der, &anchor_scratch) catch return error.MalformedCertificate;
     const leaf_parsed = leaf.parse() catch return error.MalformedCertificate;
     const anchor_parsed = anchor.parse() catch return error.MalformedCertificate;
     try leaf_parsed.verify(anchor_parsed, now_sec);
@@ -141,21 +154,44 @@ test "parseLeafPublicKey: RSA-2048 leaf (real X.509 DER from OpenSSL)" {
 }
 
 test "parseLeafPublicKey: structurally-intact DER with an unrecognized curve OID is a typed error" {
-    // A DELIBERATELY LIMITED "malformed input" test — see this file's
-    // module doc comment's "KNOWN GAP" section: std.crypto.Certificate
-    // .parse panics (not a typed error) on many truncated/adversarial
-    // inputs, which cannot be caught here (Zig has no panic-catching).
-    // What CAN be demonstrated honestly: an input that keeps every
-    // length/offset field self-consistent (so std's ASN.1 walker never
-    // reads past a declared boundary) but carries WRONG CONTENT — here, a
-    // corrupted named-curve OID byte — reaches this module's own typed
-    // `error.MalformedCertificate` cleanly, via std's `ParseEnumError
-    // .CertificateHasUnrecognizedObjectId`, not a crash.
+    // An input that keeps every length/offset field self-consistent but
+    // carries wrong CONTENT — a corrupted named-curve OID byte — must reach
+    // a typed error, not a crash.
+    //
+    // The error changed when this moved off std's parser, and the new one is
+    // the accurate one. std mapped OIDs onto a closed enum, so an unknown
+    // curve surfaced as `CertificateHasUnrecognizedObjectId` and this module
+    // reported `MalformedCertificate` — but the certificate is not malformed.
+    // It is structurally perfect and simply names a curve we do not support,
+    // which is exactly what `UnsupportedPublicKeyAlgorithm` is documented to
+    // mean. `x509.spkiOf` returns the OID's raw bytes without deciding
+    // whether they are "recognized", so the classification is now made here,
+    // deliberately, rather than inherited from std's enum coverage.
     var corrupted = kat.server_cert_der;
     const p256_curve_oid = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07 };
     const idx = std.mem.indexOf(u8, &corrupted, &p256_curve_oid).?;
     corrupted[idx + p256_curve_oid.len - 1] ^= 0x01; // flip the OID's last byte -> unrecognized curve
-    try testing.expectError(error.MalformedCertificate, parseLeafPublicKey(&corrupted));
+    try testing.expectError(error.UnsupportedPublicKeyAlgorithm, parseLeafPublicKey(&corrupted));
+}
+
+test "parseLeafPublicKey: adversarial DER returns a typed error instead of panicking" {
+    // Previously impossible to assert: std's parser panicked on inputs like
+    // these, and Zig cannot catch a panic. Routing through x509's
+    // bounds-checked decoder makes it expressible as an ordinary test.
+    const cases: []const []const u8 = &.{
+        &.{},
+        &.{0x30},
+        &.{ 0x30, 0x82, 0xff, 0xff },
+        &.{ 0x30, 0x03, 0x02, 0x01, 0x00 },
+        &.{ 0x02, 0x01, 0x00 }, // INTEGER, not a SEQUENCE
+    };
+    for (cases) |c| try testing.expect(std.meta.isError(parseLeafPublicKey(c)));
+
+    // Every truncation of a real certificate must also stay typed.
+    var i: usize = 0;
+    while (i < kat.server_cert_der.len) : (i += 7) {
+        _ = parseLeafPublicKey(kat.server_cert_der[0..i]) catch continue;
+    }
 }
 
 test "verifyLeafAgainstAnchor: real signature check accepts a genuinely anchor-signed leaf" {

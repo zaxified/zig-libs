@@ -183,7 +183,7 @@ const module_list = [_]Module{
     .{ .name = "slhdsa", .heavy = true },
     .{ .name = "falcon" },
     .{ .name = "hqc", .heavy = true },
-    .{ .name = "dtls", .deps = &.{"rsa"} },
+    .{ .name = "dtls", .deps = &.{ "rsa", "x509" } },
     .{ .name = "tlsresume" },
     .{ .name = "quic-crypto" },
     .{ .name = "sandbox" },
