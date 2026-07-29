@@ -156,6 +156,38 @@ pub const Error = error{
     /// whose `KeyPackage` names a different cipher suite or protocol
     /// version than the group's.
     KeyPackageMismatch,
+
+    // ── §12.2's SECOND procedure: an external Commit's proposal list.
+    // Five errors rather than one `InvalidProposalList`, because unlike a
+    // regular Commit's blacklist this is a four-line whitelist and each
+    // line fails for a materially different reason — and because a caller
+    // that gets one of these back should be able to tell "you sent the
+    // wrong kind of proposal" from "you sent two of the right kind".
+    /// §12.2: an external Commit's list carried a proposal type the
+    /// whitelist does not name (anything but ExternalInit, Remove, PSK).
+    ProposalNotAllowedInExternalCommit,
+    /// §12.2: "Exactly one ExternalInit" — there was none.
+    MissingExternalInit,
+    /// §12.2: "Exactly one ExternalInit" — there were several.
+    MultipleExternalInit,
+    /// §12.2: "At most one Remove proposal, with which the joiner removes
+    /// an old version of themselves" — there were several.
+    MultipleRemoveInExternalCommit,
+    /// §12.4.3.2: "The Commit MUST NOT include any proposals by reference,
+    /// since an external joiner cannot determine the validity of proposals
+    /// sent within the group."
+    ProposalByReferenceInExternalCommit,
+    /// §6.2: a `PublicMessage` from a `new_member_commit` sender carried a
+    /// `membership_tag`. That sender is not a member and holds no
+    /// `membership_key`, so §6.2's `select` gives it no tag field at all.
+    UnexpectedMembershipTag,
+    /// §12.4.3.2: "External Commits MUST contain a path field."
+    ExternalCommitRequiresPath,
+    /// The `GroupInfo` offered for an external join carries no
+    /// `external_pub` extension, so §8.3's sender half has no key to
+    /// encapsulate to (§12.4.3.2: "to join a group via an external Commit,
+    /// a new member needs a GroupInfo with an external_pub extension").
+    ExternalPubUnavailable,
 } || tree.Error || keyschedule.Error || transcript.Error || std.mem.Allocator.Error ||
     std.crypto.errors.Error || error{ Malformed, EndOfStream };
 
@@ -583,31 +615,8 @@ pub fn Group(comptime S: type) type {
             if (!gi_reader.atEnd()) return error.Malformed;
             if (group_info.group_context.cipher_suite != S.id) return error.CipherSuiteMismatch;
 
-            // ── §12.4.3.3: the tree, from the extension or from out of band.
-            var rt: tree.RatchetTree = blk: {
-                if (params.ratchet_tree) |ext_bytes| {
-                    const copy = try arena.dupe(u8, ext_bytes);
-                    var r = codec.Reader.init(copy);
-                    const t = try tree.RatchetTree.decode(arena, &r);
-                    if (!r.atEnd()) return error.Malformed;
-                    break :blk t;
-                }
-                break :blk group_info.ratchetTree(arena) catch |e| switch (e) {
-                    error.ExtensionNotFound => return error.RatchetTreeUnavailable,
-                    else => return e,
-                };
-            };
-
-            // §12.4.3.1's tree-integrity block, which Part 6 left to the
-            // caller: the tree really is the one the signed GroupContext
-            // names, and its parent-hash chain is intact.
-            try welcome_mod.verifyTreeHash(S, gpa, &rt, group_info.group_context);
-            try treekem.validateParentHashes(S, gpa, &rt);
-
-            // Only now can the GroupInfo signature be checked: the signer
-            // index means nothing without the tree.
-            const signer_key = try leafSignatureKey(&rt, group_info.signer);
-            try group_info.verifySignature(S, gpa, signer_key);
+            // ── §12.4.3.3's tree + §12.4.3.1's integrity block.
+            var rt = try verifiedTreeFromGroupInfo(gpa, arena, group_info, params.ratchet_tree);
 
             // ── §8: the epoch, entered at joiner_secret.
             const gc_bytes = group_info.raw.?.group_context;
@@ -685,6 +694,49 @@ pub fn Group(comptime S: type) type {
             return self;
         }
 
+        /// §12.4.3.3's "the tree, from the extension or from out of band"
+        /// followed by §12.4.3.1's tree-integrity block and §12.4.3's
+        /// `GroupInfo` signature check — the three things that have to
+        /// happen, in this order, before ANY field of a received
+        /// `GroupInfo` may be believed.
+        ///
+        /// Shared by the two ways of entering a group from one
+        /// (`fromWelcome` and `joinByExternalCommit`) because the order is
+        /// the whole point: the signature cannot be checked before the tree
+        /// is known (the signer is a leaf index), and the tree cannot be
+        /// trusted before its root hash is matched against the
+        /// `GroupContext` the signature covers. Two copies would be two
+        /// chances to reorder it.
+        ///
+        /// The tree is allocated from `arena` and aliases either
+        /// `out_of_band` or the `GroupInfo`'s own buffer, so both must
+        /// outlive it — this file's standing convention.
+        fn verifiedTreeFromGroupInfo(
+            gpa: std.mem.Allocator,
+            arena: std.mem.Allocator,
+            group_info: welcome_mod.GroupInfo,
+            out_of_band: ?[]const u8,
+        ) !tree.RatchetTree {
+            var rt: tree.RatchetTree = blk: {
+                if (out_of_band) |ext_bytes| {
+                    const copy = try arena.dupe(u8, ext_bytes);
+                    var r = codec.Reader.init(copy);
+                    const t = try tree.RatchetTree.decode(arena, &r);
+                    if (!r.atEnd()) return error.Malformed;
+                    break :blk t;
+                }
+                break :blk group_info.ratchetTree(arena) catch |e| switch (e) {
+                    error.ExtensionNotFound => return error.RatchetTreeUnavailable,
+                    else => return e,
+                };
+            };
+            try welcome_mod.verifyTreeHash(S, gpa, &rt, group_info.group_context);
+            try treekem.validateParentHashes(S, gpa, &rt);
+            const signer_key = try leafSignatureKey(&rt, group_info.signer);
+            try group_info.verifySignature(S, gpa, signer_key);
+            return rt;
+        }
+
         // ── §12.4.2: processing a Commit ──────────────────────────────────
 
         /// The inputs one epoch transition consumes.
@@ -699,9 +751,42 @@ pub fn Group(comptime S: type) type {
             external_psks: []const ExternalPsk = &.{},
         };
 
-        /// RFC 9420 §12.4.2, bullet by bullet. On success the group has
+        /// RFC 9420 §12.4.2, bullet by bullet, for BOTH kinds of Commit —
+        /// a regular one from a `member` sender and §12.4.3.2's external
+        /// one from a `new_member_commit` sender. On success the group has
         /// advanced one epoch; on failure see this file's note on
         /// atomicity.
+        ///
+        /// **Where the external branch diverges, and why each divergence is
+        /// forced.** §12.4.2 states one procedure with two "if this is an
+        /// external Commit" clauses in it, but three earlier steps also
+        /// have to change, and they change because the sender is not in the
+        /// tree yet:
+        ///
+        ///   * no `membership_tag` (§6.2 gives a `new_member_commit`
+        ///     `PublicMessage` no tag field at all — the sender holds no
+        ///     `membership_key`), so the signature is the ONLY thing
+        ///     authenticating the message. That is not a weakening: an
+        ///     external Commit is meant to be acceptable from a stranger,
+        ///     and what binds it to this group is the `GroupContext` inside
+        ///     §6.1's `FramedContentTBS` plus the `confirmation_tag`, which
+        ///     nobody without the group's `external_priv` can produce;
+        ///   * the signature key comes out of `commit.path.leaf_node`
+        ///     (§6.1's `new_member_commit` bullet), because there is no
+        ///     leaf to read it from. The joiner therefore picks its own
+        ///     verification key — again not a weakening, because §12.4.3.2
+        ///     leaves accepting the identity in that leaf to the
+        ///     application ("Whether existing members of the group will
+        ///     accept or reject an external Commit follows the same rules
+        ///     that are applied to other handshake messages");
+        ///   * §12.2's list validation is a different procedure — a
+        ///     whitelist, see `validateExternalProposalList`;
+        ///   * the sender's leaf index is COMPUTED, not transmitted (the
+        ///     `Sender` arm carries no index), so both sides derive it from
+        ///     the post-proposal tree and a disagreement shows up as a
+        ///     failed `confirmation_tag`;
+        ///   * §12.3's last-but-one bullet substitutes §8.3's `init_secret`
+        ///     for the previous epoch's.
         pub fn processCommit(self: *Self, params: CommitParams) !void {
             try self.check();
             const arena = self.arena.allocator();
@@ -726,29 +811,59 @@ pub fn Group(comptime S: type) type {
             if (pm.content.epoch != self.epoch) return error.WrongEpoch;
             if (pm.content.contentType() != .commit) return error.WrongContentType;
 
-            // Bullets 2-3: unprotect with the CURRENT epoch's keys, then
-            // check the signature — both against the OLD GroupContext.
-            const committer: u32 = switch (pm.content.sender) {
-                .member => |i| i,
-                else => return error.UnexpectedSenderType,
-            };
-            const committer_key = try leafSignatureKey(&self.ratchet_tree, committer);
-            try framing.verifyMembershipTag(S, gpa, self.secrets.membership_key, pm, old_gc);
-            const ac = pm.authenticatedContent();
-            try framing.verifyFramedContent(S, gpa, committer_key, ac, old_gc);
-
+            // The body is read BEFORE the signature check rather than after,
+            // because an external Commit's verification key is inside it
+            // (§6.1's `new_member_commit` bullet). Reading a union arm
+            // authenticates nothing on its own; every byte of it is still
+            // covered by the signature verified two statements below.
             const commit = switch (pm.content.body) {
                 .commit => |c| c,
                 else => return error.WrongContentType,
             };
 
+            const external = pm.content.sender == .new_member_commit;
+
+            // Bullets 2-3: unprotect with the CURRENT epoch's keys, then
+            // check the signature — both against the OLD GroupContext.
+            //
+            // `member_committer` is the sender's leaf index for a regular
+            // Commit. An external Commit has none yet: §12.4.2's
+            // path bullet ASSIGNS one, after the proposals have been
+            // applied, so it cannot be known here.
+            var member_committer: u32 = undefined;
+            const ac = pm.authenticatedContent();
+            if (external) {
+                try rejectExternalCommitFraming(pm);
+                // §12.4.3.2: "External Commits MUST contain a path field
+                // (and is therefore a 'full' Commit)." Checked here rather
+                // than at bullet 7's `needs_path` because the LeafNode in
+                // it is what the next line verifies the signature with — a
+                // pathless external Commit has nothing to check at all.
+                const path = commit.path orelse return error.ExternalCommitRequiresPath;
+                const key = try leafNodeSignatureKey(path.leaf_node);
+                try framing.verifyFramedContent(S, gpa, key, ac, old_gc);
+            } else {
+                member_committer = switch (pm.content.sender) {
+                    .member => |i| i,
+                    else => return error.UnexpectedSenderType,
+                };
+                const committer_key = try leafSignatureKey(&self.ratchet_tree, member_committer);
+                try framing.verifyMembershipTag(S, gpa, self.secrets.membership_key, pm, old_gc);
+                try framing.verifyFramedContent(S, gpa, committer_key, ac, old_gc);
+            }
+
             // Bullet 4: resolve every ProposalOrRef, then §12.2-validate the
-            // resulting list. Resolution needs the proposal messages, which
-            // may themselves contribute LeafNodes (an Add's KeyPackage), so
-            // they are copied into the arena too.
+            // resulting list — by one of that section's TWO procedures.
+            // Resolution needs the proposal messages, which may themselves
+            // contribute LeafNodes (an Add's KeyPackage), so they are copied
+            // into the arena too.
             const resolved = try self.resolveProposals(arena, gpa, commit.proposals, params.proposal_msgs, old_gc);
             defer gpa.free(resolved);
-            try self.validateProposalList(gpa, resolved, committer);
+            if (external) {
+                try validateExternalProposalList(resolved);
+            } else {
+                try self.validateProposalList(gpa, resolved, member_committer);
+            }
 
             // From here on the tree is mutated; any failure poisons.
             self.poisoned = true;
@@ -763,6 +878,17 @@ pub fn Group(comptime S: type) type {
             // Bullet 7: path presence.
             if (applied.needs_path and commit.path == null) return error.PathRequired;
 
+            // Bullet 8's FIRST clause: "If this is an external Commit,
+            // assign the sender the leftmost blank leaf node in the new
+            // ratchet tree." AFTER §12.3's application, so a Remove in this
+            // same Commit (§12.2's resync flavor) can free the very leaf the
+            // sender lands in — and BEFORE anything reads the committer's
+            // index. See `tree.RatchetTree.assignBlankLeaf`.
+            const committer: u32 = if (external)
+                @intCast(try self.ratchet_tree.assignBlankLeaf())
+            else
+                member_committer;
+
             // Bullet 8: validate and apply the path.
             var commit_secret = keyschedule.zeroSecret(S);
             var derived: []const treekem.PathSecretEntry = &.{};
@@ -772,8 +898,12 @@ pub fn Group(comptime S: type) type {
                 try verifyLeafSignature(S, gpa, path.leaf_node, .commit, self.group_id, committer);
 
                 // The committer's encryption key must actually change —
-                // read BEFORE the merge replaces the leaf.
-                {
+                // read BEFORE the merge replaces the leaf. An external
+                // committer has no current leaf to compare against (the
+                // slot just assigned is blank by construction), so §12.4.2's
+                // "different from the committer's current leaf node" has no
+                // subject and is vacuous rather than skipped.
+                if (!external) {
                     const cur = self.ratchet_tree.nodes[committer * 2] orelse return error.UnknownMember;
                     if (std.mem.eql(u8, cur.leaf.encryption_key, path.leaf_node.encryption_key))
                         return error.InvalidUpdatePath;
@@ -839,11 +969,22 @@ pub fn Group(comptime S: type) type {
             const new_gc_bytes = try new_gc.encodeAlloc(gpa);
             defer gpa.free(new_gc_bytes);
 
-            // Bullets 10-11: the key schedule.
+            // Bullets 10-11: the key schedule. §12.3's last-but-one bullet
+            // ("If there is an ExternalInit proposal, use it to derive the
+            // init_secret for use later in Commit processing") REPLACES the
+            // salt of §8's first Extract; it does not mix with the previous
+            // epoch's value. That is what lets a stranger — who by
+            // definition does not have `init_secret_[n-1]` — land in the
+            // same epoch as everyone else.
+            const init_secret = if (applied.external_init) |kem|
+                try self.externalInitSecret(kem)
+            else
+                self.secrets.init_secret;
+
             const secrets = try keyschedule.deriveEpoch(
                 S,
                 gpa,
-                self.secrets.init_secret,
+                init_secret,
                 commit_secret,
                 psk_secret,
                 new_gc_bytes,
@@ -880,6 +1021,18 @@ pub fn Group(comptime S: type) type {
             try self.adoptPathSecrets(arena, derived);
             try self.resumption_history.append(arena, .{ .epoch = self.epoch, .secret = secrets.resumption_psk });
             self.poisoned = false;
+        }
+
+        /// RFC 9420 §8.3's RECEIVING half, wired to this epoch: recover the
+        /// `init_secret` a joiner encapsulated to the group's published
+        /// `external_pub`. `external_priv` is `KEM.DeriveKeyPair(
+        /// external_secret)` for the epoch the Commit was made against —
+        /// i.e. the CURRENT one, which is why this is a method and not a
+        /// free function.
+        fn externalInitSecret(self: *const Self, kem_output: []const u8) ![S.Nh]u8 {
+            if (kem_output.len != S.Kem.Npk) return error.WrongKeyLength;
+            const kp = keyschedule.externalKeyPair(S, self.secrets.external_secret);
+            return keyschedule.externalInitReceiver(S, kem_output[0..S.Kem.Npk].*, kp);
         }
 
         // ── §12.1: creating a proposal ────────────────────────────────────
@@ -1096,9 +1249,52 @@ pub fn Group(comptime S: type) type {
         ///      §6.2's `AuthenticatedContentTBM` covers the whole
         ///      `FramedContentAuthData` including the tag.
         pub fn createCommit(self: *Self, allocator: std.mem.Allocator, params: CreateCommitParams) !Created {
+            return self.commitInner(allocator, params, .member);
+        }
+
+        /// Which of §12.4's two Commit flavors `commitInner` is building.
+        ///
+        /// One function builds both, rather than an `externalCommit` beside
+        /// `createCommit`, for the same reason `applyProposals` is shared
+        /// between sending and receiving: §12.4.1's step list is stated once
+        /// and the external flavor is stated as a handful of substitutions
+        /// inside it (§12.4.3.2: "In principle, external Commits work like
+        /// regular Commits. However, their content has to meet a specific
+        /// set of requirements"). A second copy would be a second place for
+        /// the provisional-GroupContext ordering, the sign-then-confirm
+        /// ordering and §12.3's application order to drift — and a drift in
+        /// any of them produces a Commit that looks fine and that nobody
+        /// can process.
+        const CommitMode = union(enum) {
+            /// §12.4.1: an existing member commits from its own leaf.
+            member,
+            /// §12.4.3.2: a newcomer commits itself into the group. It
+            /// carries the two things that are normally read off the
+            /// group — because a non-member has neither.
+            external: struct {
+                /// §8.3's `init_secret`, the joiner's own half of the
+                /// exchange whose `kem_output` is in the ExternalInit
+                /// proposal. It REPLACES the previous epoch's `init_secret`,
+                /// which a non-member does not have.
+                init_secret: [S.Nh]u8,
+                /// The identity half of the leaf the joiner will occupy —
+                /// its signature key, credential, capabilities and
+                /// extensions. Its encryption key is NOT used: §7.5 samples
+                /// a fresh one for every commit-sourced leaf.
+                leaf: tree.LeafNode,
+            },
+        };
+
+        fn commitInner(
+            self: *Self,
+            allocator: std.mem.Allocator,
+            params: CreateCommitParams,
+            mode: CommitMode,
+        ) !Created {
             try self.check();
             const arena = self.arena.allocator();
             const gpa = self.gpa;
+            const external = mode == .external;
 
             const old_gc = try self.groupContextAlloc(gpa);
             defer gpa.free(old_gc);
@@ -1122,7 +1318,15 @@ pub fn Group(comptime S: type) type {
                     res_slot.* = .{ .proposal = c.proposal, .sender = c.sender, .by_reference = true };
                 },
             };
-            try self.validateProposalList(gpa, resolved, self.my_leaf_index);
+            // §12.2 opens with "A group member creating a Commit and a group
+            // member processing a Commit MUST verify..." — so a sender runs
+            // the same procedure, and the same CHOICE of procedure, that
+            // every receiver will.
+            if (external) {
+                try validateExternalProposalList(resolved);
+            } else {
+                try self.validateProposalList(gpa, resolved, self.my_leaf_index);
+            }
             for (resolved) |rp| {
                 if (rp.proposal == .add) {
                     const kp = rp.proposal.add;
@@ -1138,6 +1342,14 @@ pub fn Group(comptime S: type) type {
             var applied = try self.applyProposals(arena, gpa, resolved, params.external_psks);
             defer applied.deinit(gpa);
 
+            // ── §12.4.1 bullet 4's FIRST sub-bullet: "If this is an external
+            // Commit, assign the sender the leftmost blank leaf node in the
+            // new ratchet tree." The mirror of `processCommit`'s, run at the
+            // same point of the same sequence — after §12.3's application,
+            // before the path — because that is the only way two parties
+            // that never exchange the index arrive at the same one.
+            if (external) self.my_leaf_index = @intCast(try self.ratchet_tree.assignBlankLeaf());
+
             // ── §12.4.1 bullets 4-5: the path.
             //
             // The committer's leaf content is duplicated into the arena
@@ -1145,15 +1357,25 @@ pub fn Group(comptime S: type) type {
             // builds the replacement, which frees the list containers the
             // old leaf owned — reading them afterwards would be a
             // use-after-free the DebugAllocator catches only if a test
-            // happens to look at them.
-            const base_leaf = try dupLeafNode(arena, try self.ownLeaf());
+            // happens to look at them. An external committer has no old leaf
+            // to lose; its content comes from the KeyPackage it published.
+            const base_leaf = switch (mode) {
+                .member => try dupLeafNode(arena, try self.ownLeaf()),
+                .external => |e| e.leaf,
+            };
 
             var commit: content.Commit = .{ .proposals = por, .path = null };
             var commit_secret = keyschedule.zeroSecret(S);
             var staged: ?treekem.Staged(S) = null;
             var new_leaf_priv = self.my_encryption_priv;
 
-            const want_path = applied.needs_path or !params.omit_path_when_allowed;
+            // §12.4.3.2: "External Commits MUST contain a path field (and is
+            // therefore a 'full' Commit)." `applied.needs_path` is already
+            // true for any list holding an ExternalInit (§12.4's
+            // `pathRequiredTypes`), so this disjunct is redundant today —
+            // and it is spelled out because the two rules are independent
+            // and only one of them is unconditional.
+            const want_path = external or applied.needs_path or !params.omit_path_when_allowed;
             if (want_path) {
                 var path_secret_0: [S.Nh]u8 = undefined;
                 params.io.random(&path_secret_0);
@@ -1204,10 +1426,18 @@ pub fn Group(comptime S: type) type {
             defer if (commit.path) |p| p.deinitSealed(gpa);
 
             // ── §12.4.1: the FramedContent, signed under the OLD context.
+            //
+            // §12.4.3.2: "The sender type for the AuthenticatedContent
+            // encapsulating the external Commit MUST be
+            // new_member_commit." That arm carries NO index (§6's `Sender`
+            // gives it an empty struct), which is precisely why both sides
+            // have to compute the leaf independently. §6.1 still puts the
+            // GroupContext in the TBS for it, so an external Commit is
+            // bound to this group and this epoch exactly as a member's is.
             const fc: framing.FramedContent = .{
                 .group_id = self.group_id,
                 .epoch = self.epoch,
-                .sender = .{ .member = self.my_leaf_index },
+                .sender = if (external) .new_member_commit else .{ .member = self.my_leaf_index },
                 .authenticated_data = params.authenticated_data,
                 .body = .{ .commit = commit },
             };
@@ -1237,10 +1467,20 @@ pub fn Group(comptime S: type) type {
             const new_gc_bytes = try new_gc.encodeAlloc(gpa);
             defer gpa.free(new_gc_bytes);
 
+            // §12.3's ExternalInit bullet, from the SENDER's side: the
+            // joiner already holds §8.3's `init_secret` (it drew it when it
+            // encapsulated to `external_pub`), so unlike the receiver it
+            // does not recover it from the proposal — it IS the party that
+            // chose it. Same value, opposite half of the exchange; the
+            // `confirmation_tag` below is what proves the two agree.
+            const init_secret = switch (mode) {
+                .member => self.secrets.init_secret,
+                .external => |e| e.init_secret,
+            };
             const secrets = try keyschedule.deriveEpoch(
                 S,
                 gpa,
-                self.secrets.init_secret,
+                init_secret,
                 commit_secret,
                 applied.psk_secret,
                 new_gc_bytes,
@@ -1259,9 +1499,20 @@ pub fn Group(comptime S: type) type {
             // signature that goes on the wire. Ed25519 is deterministic so
             // the two would agree today, but "the transcript covers the
             // bytes we sent" should not rest on that.
-            const mtag = try framing.membershipTag(S, gpa, self.secrets.membership_key, fc, ac.auth, old_gc);
+            // An external committer holds no `membership_key` — it is not a
+            // member of the epoch it is committing against — and §6.2 gives
+            // its `PublicMessage` no field to put a tag in. `null` here is
+            // not "we skipped a step": it is the wire format.
+            const mtag: ?[S.Nm]u8 = if (external)
+                null
+            else
+                try framing.membershipTag(S, gpa, self.secrets.membership_key, fc, ac.auth, old_gc);
             const commit_msg: framing.MLSMessage = .{
-                .public_message = .{ .content = fc, .auth = ac.auth, .membership_tag = &mtag },
+                .public_message = .{
+                    .content = fc,
+                    .auth = ac.auth,
+                    .membership_tag = if (mtag) |*t| t else null,
+                },
             };
             const commit_bytes = try commit_msg.encodeAlloc(allocator);
             errdefer allocator.free(commit_bytes);
@@ -1349,6 +1600,244 @@ pub fn Group(comptime S: type) type {
             self.poisoned = false;
 
             return .{ .commit = commit_bytes, .welcome = welcome_bytes, .group_info = group_info_bytes };
+        }
+
+        // ── §12.4.3.2: joining by external Commit ─────────────────────────
+
+        /// Everything `joinByExternalCommit` needs. Byte slices are borrowed
+        /// for the duration of the call; whatever the group retains is
+        /// copied into its own arena.
+        pub const ExternalJoinParams = struct {
+            /// Draws §8.3's HPKE ephemeral, §7.4's `path_secret[0]`, the
+            /// fresh leaf key pair and the ciphertext ephemerals.
+            io: std.Io,
+            /// The published `MLSMessage(GroupInfo)` — §12.4.1's third
+            /// output, unencrypted, as a Delivery Service caches it. MUST
+            /// carry an `external_pub` extension (§12.4.3.2), and each one
+            /// is good for exactly ONE external join, because that join
+            /// changes the epoch.
+            group_info_msg: []const u8,
+            /// This client's own whole `MLSMessage(KeyPackage)`. ONLY its
+            /// `leaf_node`'s identity half is used — signature key,
+            /// credential, capabilities, extensions — because §7.5 samples a
+            /// fresh `encryption_key` for the commit-sourced leaf this
+            /// builds, and no `init_key` is ever encapsulated to (there is
+            /// no `Welcome`). It is taken as a whole KeyPackage anyway, for
+            /// symmetry with `create`/`fromWelcome` and because a client
+            /// that can join a group has one.
+            key_package_msg: []const u8,
+            signature_key_pair: S.Sig.KeyPair,
+            /// Proposals to commit ALONGSIDE the ExternalInit, which this
+            /// function contributes itself (the caller cannot: its
+            /// `kem_output` is drawn here). §12.2's whitelist admits only a
+            /// Remove — the "resync" flavor, removing an old appearance of
+            /// this same client — and PreSharedKeys. Anything else is
+            /// `error.ProposalNotAllowedInExternalCommit`, and so is a
+            /// second ExternalInit.
+            proposals: []const content.Proposal = &.{},
+            /// §12.4.3.3's out-of-band tree, when the `GroupInfo` carries no
+            /// `ratchet_tree` extension.
+            ratchet_tree: ?[]const u8 = null,
+            external_psks: []const ExternalPsk = &.{},
+            authenticated_data: []const u8 = &.{},
+            include_ratchet_tree: bool = true,
+            include_external_pub: bool = false,
+            group_info_extensions: []const tree.Extension = &.{},
+            policy: Policy = .{},
+        };
+
+        /// What an external join produces: the joiner's own group state, and
+        /// the messages §12.4.1's steps produce for everyone else.
+        pub const ExternalJoin = struct {
+            /// The joiner, in the NEW epoch — already advanced, exactly as
+            /// `createCommit` leaves a committer.
+            group: Self,
+            /// `commit` and `group_info` as `createCommit` produces them.
+            /// `welcome` is always `null`: §12.2's whitelist admits no Add,
+            /// so an external Commit adds nobody but its own sender, and
+            /// that sender needs no Welcome — it has the group state
+            /// already.
+            messages: Created,
+        };
+
+        /// RFC 9420 §12.4.3.2: turn a published `GroupInfo` into an external
+        /// Commit and the group state that Commit lands the sender in — the
+        /// second of the two ways into a group, and the one that needs
+        /// nobody already inside to be online.
+        ///
+        /// **What the joiner can and cannot check, stated plainly.** It
+        /// verifies the tree against the signed `tree_hash`, the tree's
+        /// parent-hash chain, and the `GroupInfo` signature under the
+        /// signer's leaf key — the same three checks `fromWelcome` runs, via
+        /// the same function. It CANNOT verify the `confirmation_tag` the
+        /// `GroupInfo` carries: doing so needs that epoch's
+        /// `confirmation_key`, which is exactly what a non-member does not
+        /// have. A forged tag is nonetheless not silently absorbed, it is
+        /// only detected LATER and by somebody else: the tag feeds §8.2's
+        /// `interim_transcript_hash`, so a wrong one gives the joiner a
+        /// different `confirmed_transcript_hash` for the new epoch than
+        /// every member computes, and the Commit is rejected by all of them
+        /// at §12.4.2's `confirmation_tag` bullet. The joiner ends up in an
+        /// epoch of one; it never ends up in the group holding a state
+        /// nobody else holds.
+        ///
+        /// **The identity in the leaf is not vouched for by anything here**,
+        /// and by design: §12.4.3.2 says accepting an external Commit
+        /// "follows the same rules that are applied to other handshake
+        /// messages", i.e. it is the receiving application's call. This
+        /// function signs the joiner's own leaf with the joiner's own key
+        /// and stops there.
+        ///
+        /// **Resumption PSKs are not resolvable here.** §12.2's whitelist
+        /// admits PreSharedKey proposals, and §12.4.3.2 even suggests a
+        /// `reinit` resumption PSK as the way to gate the resync flavor —
+        /// but a resumption PSK is looked up in `resumption_history`, which
+        /// a group entered this way starts empty. An external PSK works;
+        /// a resumption one is `error.PskNotAvailable`. Carrying prior-epoch
+        /// secrets into a fresh join means a way to hand them in, which this
+        /// does not have; noted in `SPEC.md` rather than half-built.
+        pub fn joinByExternalCommit(
+            gpa: std.mem.Allocator,
+            allocator: std.mem.Allocator,
+            params: ExternalJoinParams,
+        ) !ExternalJoin {
+            const arena_ptr = try gpa.create(std.heap.ArenaAllocator);
+            errdefer gpa.destroy(arena_ptr);
+            arena_ptr.* = .init(gpa);
+            errdefer arena_ptr.deinit();
+            const arena = arena_ptr.allocator();
+
+            // ── our own KeyPackage, for the identity half of the leaf we
+            // are about to occupy. Verified like `create` verifies the
+            // founder's: a group whose newest leaf does not self-verify is
+            // one every receiver rejects, and finding that out here is
+            // cheaper than finding it out from silence.
+            const kp_copy = try arena.dupe(u8, params.key_package_msg);
+            var kp_reader = codec.Reader.init(kp_copy);
+            const kp_msg = try framing.MLSMessage.decode(arena, &kp_reader);
+            if (!kp_reader.atEnd()) return error.Malformed;
+            if (kp_msg != .key_package) return error.Malformed;
+            const my_kp = kp_msg.key_package;
+            if (my_kp.cipher_suite != S.id) return error.CipherSuiteMismatch;
+            try my_kp.verifySignature(S, gpa);
+            try verifyLeafSignature(S, gpa, my_kp.leaf_node, .key_package, null, null);
+
+            // ── the GroupInfo. Its GroupContext extensions and (usually)
+            // its tree are retained, so decode from an arena-owned copy.
+            const gi_copy = try arena.dupe(u8, params.group_info_msg);
+            var gi_reader = codec.Reader.init(gi_copy);
+            const gi_msg = try framing.MLSMessage.decode(arena, &gi_reader);
+            if (!gi_reader.atEnd()) return error.Malformed;
+            if (gi_msg != .group_info) return error.WrongContentType;
+            const group_info = gi_msg.group_info;
+            if (group_info.group_context.cipher_suite != S.id) return error.CipherSuiteMismatch;
+
+            const rt = try verifiedTreeFromGroupInfo(gpa, arena, group_info, params.ratchet_tree);
+
+            // ── §8.3's sender half. `external_pub` is the ONLY thing in the
+            // GroupInfo that a non-member could not have computed for
+            // itself, and it is what makes the whole mechanism work: the
+            // joiner encapsulates a fresh `init_secret` to it, and only a
+            // holder of `external_secret` for this epoch — i.e. an actual
+            // member — can recover it.
+            const ext_pub_bytes = (try group_info.externalPub()) orelse return error.ExternalPubUnavailable;
+            if (ext_pub_bytes.len != S.Kem.Npk) return error.WrongKeyLength;
+            const ext_init = try keyschedule.externalInitSender(S, ext_pub_bytes[0..S.Kem.Npk].*, params.io);
+
+            // ── the proposal list: §12.2's mandatory ExternalInit first,
+            // then whatever the caller added. FIRST rather than last only
+            // because a reader of the wire bytes should see the proposal
+            // that makes this Commit external before anything else; §12.2's
+            // whitelist is explicitly order-independent ("not necessarily in
+            // this order"), and §12.3's application order is fixed and
+            // unrelated.
+            const sources = try gpa.alloc(CommitSource, params.proposals.len + 1);
+            defer gpa.free(sources);
+            sources[0] = .{ .by_value = .{ .external_init = &ext_init.kem_output } };
+            for (params.proposals, sources[1..]) |p, *slot| slot.* = .{ .by_value = p };
+
+            // ── the bootstrap state the Commit is built against: the group
+            // AS THE GroupInfo DESCRIBES IT, one epoch back.
+            const conf = group_info.group_context.confirmed_transcript_hash;
+            if (group_info.group_context.tree_hash.len != S.Hash.digest_length) return error.Malformed;
+            // §8.2 allows exactly two widths — a digest, or epoch 0's
+            // zero-length string. Same rule, same reason as `fromWelcome`.
+            if (conf.len != S.Hash.digest_length and conf.len != 0) return error.Malformed;
+
+            var self: Self = .{
+                .gpa = gpa,
+                .arena = arena_ptr,
+                .policy = params.policy,
+                .group_id = group_info.group_context.group_id,
+                .epoch = group_info.group_context.epoch,
+                .tree_hash = undefined,
+                .confirmed_transcript_hash = undefined,
+                .confirmed_len = conf.len,
+                .extensions = group_info.group_context.extensions,
+                .interim_transcript_hash = try transcript.interimTranscriptHash(
+                    S,
+                    conf,
+                    group_info.confirmation_tag,
+                ),
+                .ratchet_tree = rt,
+                // Every secret of the epoch being committed AGAINST, which
+                // a non-member has none of. Zeroed rather than left
+                // `undefined` so that a mis-wired external branch produces a
+                // deterministic, testable wrong answer instead of whatever
+                // was on the stack — and `commitInner` reads exactly two
+                // fields of it, `init_secret` and `membership_key`, both of
+                // which the `.external` mode replaces or suppresses. The
+                // whole struct is overwritten with the NEW epoch's secrets
+                // before this function returns.
+                .secrets = std.mem.zeroes(keyschedule.EpochSecrets(S)),
+                // Assigned by `commitInner`'s §12.4.1 bullet-4 step, after
+                // the proposals have been applied. Nothing reads it before
+                // then; `ownLeaf` — the one thing that would — is not on the
+                // `.external` path.
+                .my_leaf_index = undefined,
+                .my_encryption_priv = @splat(0),
+                .my_path_secrets = .empty,
+                .resumption_history = .empty,
+                .pending_updates = .empty,
+            };
+            @memcpy(&self.tree_hash, group_info.group_context.tree_hash);
+            @memcpy(self.confirmed_transcript_hash[0..conf.len], conf);
+            // The §7.3 rule this object owns, applied to the leaf we are
+            // about to occupy — the same check an Add's KeyPackage gets in
+            // `applyProposals`. `stageUpdatePath` carries the capabilities
+            // and extensions over unchanged, so answering it for the
+            // KeyPackage's leaf answers it for the commit-sourced leaf that
+            // will be built from it.
+            try self.checkLeafSelfConsistent(my_kp.leaf_node);
+
+            // The re-encoded GroupContext must equal the bytes the
+            // GroupInfo's signature covered. If it does not, the context
+            // this Commit is signed under is not the one the members hold,
+            // and every one of them rejects it — a mismatch worth catching
+            // here, where it can still be attributed.
+            {
+                const gc_bytes = try group_info.groupContextBytes(gpa);
+                defer if (gc_bytes.owned) gpa.free(gc_bytes.bytes);
+                const re = try self.groupContextAlloc(gpa);
+                defer gpa.free(re);
+                if (!std.mem.eql(u8, gc_bytes.bytes, re)) return error.Malformed;
+            }
+
+            const messages = try self.commitInner(allocator, .{
+                .io = params.io,
+                .signature_key_pair = params.signature_key_pair,
+                .proposals = sources,
+                .external_psks = params.external_psks,
+                .authenticated_data = params.authenticated_data,
+                .include_ratchet_tree = params.include_ratchet_tree,
+                .include_external_pub = params.include_external_pub,
+                .group_info_extensions = params.group_info_extensions,
+            }, .{ .external = .{
+                .init_secret = ext_init.init_secret,
+                .leaf = my_kp.leaf_node,
+            } });
+
+            return .{ .group = self, .messages = messages };
         }
 
         /// RFC 9420 §12.4.3.1's SEND direction: one `Welcome` covering every
@@ -1572,6 +2061,12 @@ pub fn Group(comptime S: type) type {
             /// the same list.
             psk_ids: []keyschedule.PreSharedKeyId,
             psk_secret: [S.Nh]u8,
+            /// §12.3: "If there is an ExternalInit proposal, use it to
+            /// derive the init_secret for use later in Commit processing" —
+            /// the proposal's `kem_output`, or `null` for a regular Commit
+            /// (whose §12.2 procedure rejects the proposal outright). A
+            /// view into the arena-owned proposal.
+            external_init: ?[]const u8,
             /// §12.4's `pathRequired` (see `applyProposals`).
             needs_path: bool,
 
@@ -1702,12 +2197,26 @@ pub fn Group(comptime S: type) type {
                 else => {},
             };
 
+            // §12.3's "If there is an ExternalInit proposal, use it to
+            // derive the init_secret". Only NOTED here, not consumed: the
+            // derivation belongs at the key-schedule step, and the two
+            // sides of an external Commit reach the same value by opposite
+            // halves of §8.3 (`externalInitSender`/`externalInitReceiver`),
+            // so this function — which is shared by both — must not pick
+            // one. `validateExternalProposalList` has already established
+            // there is at most one.
+            var external_init: ?[]const u8 = null;
+            for (resolved) |rp| {
+                if (rp.proposal == .external_init) external_init = rp.proposal.external_init;
+            }
+
             return .{
                 .extensions = new_extensions,
                 .added = added_slice,
                 .added_leaves = added_leaves,
                 .psk_ids = psk_ids,
                 .psk_secret = psk_secret,
+                .external_init = external_init,
                 .needs_path = needs_path,
             };
         }
@@ -1794,6 +2303,69 @@ pub fn Group(comptime S: type) type {
                     }
                 }
             }
+        }
+
+        /// RFC 9420 §12.2's SECOND procedure, for an EXTERNAL Commit, plus
+        /// the one list rule §12.4.3.2 states instead of §12.2.
+        ///
+        /// **This is a whitelist, and that is the whole difference.** The
+        /// regular procedure above enumerates ways a list can be bad and
+        /// accepts everything else; this one enumerates what a list may
+        /// contain and rejects everything else — "the list is valid if it
+        /// contains only the following proposals ... Exactly one
+        /// ExternalInit ... At most one Remove ... Zero or more
+        /// PreSharedKey ... No other proposals". Reusing the blacklist here
+        /// and bolting an ExternalInit counter onto it would silently admit
+        /// Adds, Updates, GroupContextExtensions and ReInits from a party
+        /// that is not yet a member, which is exactly what the split
+        /// procedure exists to prevent. It takes no committer index because
+        /// there is no committer leaf yet, and consults no tree because
+        /// none of the four lines reads one.
+        ///
+        /// **Two rules deliberately NOT carried over from the regular
+        /// procedure**, both because §12.2's external list is closed and
+        /// neither appears in it:
+        ///
+        ///   * "multiple PreSharedKey proposals that reference the same
+        ///     PreSharedKeyID". §8.4's chain is position-dependent and
+        ///     would happily process a repeat; both sides derive the same
+        ///     `psk_secret` from the same repeated list, so it costs
+        ///     correctness nothing. A stricter implementer could
+        ///     legitimately read §12.2's "invalid as specified in
+        ///     Section 12.1" spirit as applying and reject it — noted in
+        ///     `SPEC.md`;
+        ///   * §12.2's closing "after processing the Commit the ratchet
+        ///     tree is invalid" rule, which is NOT skipped — it is
+        ///     `checkKeyUniqueness`, run once per epoch transition for both
+        ///     kinds of Commit.
+        ///
+        /// §12.2's own extra condition on the Remove ("the LeafNode in the
+        /// path field MUST meet the same criteria as would the LeafNode in
+        /// an Update for the removed leaf ... the credential MUST present a
+        /// set of identifiers that is acceptable to the application for the
+        /// removed participant") is an Authentication Service question, and
+        /// so stays the application's for the same reason §7.3's credential
+        /// bullet does — see this file's §7.3 boundary note.
+        fn validateExternalProposalList(list: []const Resolved) !void {
+            var n_external_init: usize = 0;
+            var n_remove: usize = 0;
+            for (list) |rp| {
+                // §12.4.3.2: "The Commit MUST NOT include any proposals by
+                // reference, since an external joiner cannot determine the
+                // validity of proposals sent within the group." Checked
+                // per-entry rather than over `commit.proposals` so it reads
+                // off the same list every other rule here does.
+                if (rp.by_reference) return error.ProposalByReferenceInExternalCommit;
+                switch (rp.proposal) {
+                    .external_init => n_external_init += 1,
+                    .remove => n_remove += 1,
+                    .psk => {},
+                    else => return error.ProposalNotAllowedInExternalCommit,
+                }
+            }
+            if (n_external_init == 0) return error.MissingExternalInit;
+            if (n_external_init > 1) return error.MultipleExternalInit;
+            if (n_remove > 1) return error.MultipleRemoveInExternalCommit;
         }
 
         fn appendUnique(gpa: std.mem.Allocator, list: *std.ArrayList(u32), v: u32) !void {
@@ -1978,6 +2550,34 @@ fn leafSignatureKey(t: *const tree.RatchetTree, leaf_index: u32) !std.crypto.sig
 /// RFC 9420 §7.3's `LeafNodeTBS` signature check, with the `group_id`/
 /// `leaf_index` binding that `update`/`commit`-sourced leaves carry and
 /// `key_package`-sourced ones do not.
+/// RFC 9420 §6.1's `new_member_commit` bullet: "The signature key in the
+/// LeafNode in the Commit's path". The one sender type whose verification
+/// key is inside the message it authenticates rather than in the tree —
+/// see `processCommit`'s note on why that is not the weakening it looks
+/// like.
+fn leafNodeSignatureKey(leaf: tree.LeafNode) !std.crypto.sign.Ed25519.PublicKey {
+    if (leaf.signature_key.len != 32) return error.WrongKeyLength;
+    return std.crypto.sign.Ed25519.PublicKey.fromBytes(leaf.signature_key[0..32].*);
+}
+
+/// RFC 9420 §6.2's `select (PublicMessage.content.sender.sender_type)`: a
+/// `new_member_commit` message has no `membership_tag` field.
+///
+/// **This guard is unreachable through `PublicMessage.decode` today, and it
+/// is here anyway.** That decoder reads a tag only when the sender is
+/// `member`, so bytes appended after a `new_member_commit` message come
+/// back as trailing input and `processCommit`'s `reader.atEnd()` rejects
+/// them as `error.Malformed` — which a test pins. What this guard covers is
+/// the OTHER direction: a `PublicMessage` value that reached
+/// `processCommit` by some path other than that decoder (a future
+/// `PrivateMessage` unprotect, a caller-built struct) and carries a tag
+/// nobody can have computed, since the sender holds no `membership_key`.
+/// Accepting it would mean ignoring an authenticator rather than requiring
+/// its absence, and the difference is invisible in a passing round trip.
+fn rejectExternalCommitFraming(pm: framing.PublicMessage) !void {
+    if (pm.membership_tag != null) return error.UnexpectedMembershipTag;
+}
+
 fn verifyLeafSignature(
     comptime S: type,
     gpa: std.mem.Allocator,
@@ -3008,4 +3608,631 @@ test "§12.4.1: a tampered Commit is rejected by the receiver, so the round trip
     bad_welcome[bad_welcome.len - 8] ^= 0x01;
     const carol = try TestClient.init(aa, "carol", 23);
     try testing.expectError(error.DecryptionFailed, carol.join(gpa, bad_welcome, &.{}));
+}
+
+// ── §12.4.3.2: external Commits ───────────────────────────────────────────
+//
+// **What anchors these, and what does not.** There is no external-Commit
+// test vector in `mlswg/mls-implementations` at the pinned revision — the
+// `passive-client-*.json` sessions never contain one — so unlike every
+// Commit-processing claim in `kat_passive_test.zig`, nothing below is
+// compared against another implementation. What replaces that, and the
+// reason a half-built direction would have been worse than none, is that
+// the two directions here are built from OPPOSITE halves of §8.3 and meet
+// only at a value neither of them transports: an external joiner derives
+// `init_secret` by `SetupBaseS` to the published `external_pub`, a member
+// recovers it by `SetupBaseR` with `external_priv`, and the
+// `epoch_authenticator` they are compared on is
+// `DeriveSecret(epoch_secret, "authentication")` — downstream of that
+// secret, of the tree hash, of the whole transcript and of a leaf index
+// that appears nowhere on the wire. Two parties agreeing on it agree on
+// every one of those.
+
+/// A hostile external joiner: takes an external Commit this module built,
+/// swaps the proposal list for `proposals`, and RE-SIGNS the result with
+/// the joiner's own signature key.
+///
+/// The re-signing is what makes these tests reach §12.4.2's bullet 4 at
+/// all. §6.1 verifies a `new_member_commit` with the key in
+/// `commit.path.leaf_node` — a key the sender chooses — so an attacker
+/// controls the signature completely and a receiver cannot reject a bad
+/// proposal list by signature check. Simply corrupting the bytes would
+/// fail at bullet 3 instead and prove nothing about the whitelist. The
+/// `confirmation_tag` is left as it was: §12.4.2 checks it at bullet 12,
+/// nine steps after the list, so a whitelist that works never gets there.
+fn resignExternalCommit(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    commit_msg: []const u8,
+    signer: TestSuite.Sig.KeyPair,
+    old_gc: []const u8,
+    proposals: []const content.ProposalOrRef,
+) ![]u8 {
+    return resignExternalCommitOpts(gpa, arena, commit_msg, signer, old_gc, proposals, false);
+}
+
+/// `drop_path` strips the `UpdatePath` — the one edit a joiner can make that
+/// §12.4.3.2 forbids on its own ("External Commits MUST contain a path
+/// field") rather than through §12.4's `needs_path` bookkeeping.
+fn resignExternalCommitOpts(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    commit_msg: []const u8,
+    signer: TestSuite.Sig.KeyPair,
+    old_gc: []const u8,
+    proposals: []const content.ProposalOrRef,
+    drop_path: bool,
+) ![]u8 {
+    var r = codec.Reader.init(commit_msg);
+    const msg = try framing.MLSMessage.decode(arena, &r);
+    try testing.expect(r.atEnd());
+    var pm = msg.public_message;
+    var commit = pm.content.body.commit;
+    commit.proposals = proposals;
+    if (drop_path) commit.path = null;
+    pm.content.body = .{ .commit = commit };
+
+    const sig = try framing.signFramedContent(TestSuite, gpa, signer, .mls_public_message, pm.content, old_gc);
+    const sig_bytes = sig.toBytes();
+    pm.auth.signature = &sig_bytes;
+    const out: framing.MLSMessage = .{ .public_message = pm };
+    return out.encodeAlloc(gpa);
+}
+
+test "§12.4.3.2: a stranger turns a published GroupInfo into an external Commit, and every member lands in its epoch" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const alice = try TestClient.init(aa, "alice", 31);
+    const bob = try TestClient.init(aa, "bob", 32);
+    const dave = try TestClient.init(aa, "dave", 33);
+
+    var a = try Group(TestSuite).create(gpa, .{
+        .io = io,
+        .group_id = "external-join",
+        .key_package_msg = alice.kp_msg,
+        .encryption_priv = alice.enc_priv,
+    });
+    defer a.deinit();
+
+    var b = blk: {
+        const c = try a.createCommit(gpa, .{
+            .io = io,
+            .signature_key_pair = alice.sig,
+            .proposals = &.{.{ .by_value = .{ .add = bob.kp } }},
+            // §12.4.3.2: "to join a group via an external Commit, a new
+            // member needs a GroupInfo with an external_pub extension" —
+            // and it is per-epoch, so it has to be asked for on the Commit
+            // whose epoch will be published.
+            .include_external_pub = true,
+        });
+        defer c.deinit(gpa);
+        break :blk try bob.join(gpa, c.welcome.?, &.{});
+    };
+    defer b.deinit();
+    try expectSameEpoch(&a, &b);
+
+    // The GroupInfo alice published for epoch 2 — the only thing dave has.
+    // He was never added, no member did anything for him, and this object
+    // is public.
+    const published_gi = blk: {
+        const c = try a.createCommit(gpa, .{
+            .io = io,
+            .signature_key_pair = alice.sig,
+            .include_external_pub = true,
+        });
+        defer c.deinit(gpa);
+        try b.processCommit(.{ .commit_msg = c.commit });
+        break :blk try gpa.dupe(u8, c.group_info);
+    };
+    defer gpa.free(published_gi);
+    try expectSameEpoch(&a, &b);
+
+    var joined = try Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+        .io = io,
+        .group_info_msg = published_gi,
+        .key_package_msg = dave.kp_msg,
+        .signature_key_pair = dave.sig,
+    });
+    var d = joined.group;
+    defer d.deinit();
+    defer joined.messages.deinit(gpa);
+
+    // §12.2's whitelist admits no Add, so there is nobody to welcome.
+    try testing.expectEqual(@as(?[]u8, null), joined.messages.welcome);
+    // §12.4.3.2: the sender type MUST be new_member_commit, and §6.2 gives
+    // that sender no membership_tag field. Read off the wire, not off the
+    // struct that produced it.
+    {
+        var r = codec.Reader.init(joined.messages.commit);
+        const msg = try framing.MLSMessage.decode(aa, &r);
+        try testing.expect(r.atEnd());
+        try testing.expectEqual(framing.Sender.new_member_commit, msg.public_message.content.sender);
+        try testing.expectEqual(@as(?[]const u8, null), msg.public_message.membership_tag);
+        // "External Commits MUST contain a path field."
+        try testing.expect(msg.public_message.content.body.commit.path != null);
+    }
+
+    // Dave was at epoch 3 before anybody else saw his Commit; the members
+    // are still at epoch 2.
+    try testing.expectEqual(@as(u64, 3), d.epoch);
+    try testing.expectEqual(@as(u64, 2), a.epoch);
+
+    try a.processCommit(.{ .commit_msg = joined.messages.commit });
+    try b.processCommit(.{ .commit_msg = joined.messages.commit });
+
+    // THE anchor: three parties, one of whom was a stranger a moment ago,
+    // on the same `epoch_authenticator`. Dave computed his `init_secret`
+    // with `SetupBaseS`; alice and bob recovered it with `SetupBaseR`; his
+    // leaf index was never transmitted.
+    try expectSameEpoch(&a, &b);
+    try expectSameEpoch(&a, &d);
+
+    // This is §12.4.1's OTHER leaf-assignment branch: alice and bob fill a
+    // two-leaf tree, so there is no blank leaf and the tree is "expanded to
+    // the right as defined in Section 7.7", which doubles it — dave takes
+    // "the leftmost new blank leaf", index 2, and leaf 3 stays blank.
+    try testing.expectEqual(@as(u32, 2), d.my_leaf_index);
+    try testing.expectEqual(@as(usize, 4), a.treeSize());
+    try testing.expect(a.ratchet_tree.nodes[3 * 2] == null);
+
+    // …and the group still works afterwards, in both directions: the
+    // newcomer commits, and the founder processes it. An external join that
+    // produced a state which cannot take another Commit would satisfy every
+    // assertion above.
+    {
+        const c = try d.createCommit(gpa, .{ .io = io, .signature_key_pair = dave.sig });
+        defer c.deinit(gpa);
+        try a.processCommit(.{ .commit_msg = c.commit });
+        try b.processCommit(.{ .commit_msg = c.commit });
+        try expectSameEpoch(&a, &d);
+        try expectSameEpoch(&b, &d);
+    }
+}
+
+test "§12.4.1/§12.4.2: an external joiner lands in the LEFTMOST blank leaf, not the rightmost" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const alice = try TestClient.init(aa, "alice", 41);
+    const bob = try TestClient.init(aa, "bob", 42);
+    const carol = try TestClient.init(aa, "carol", 43);
+    const dave = try TestClient.init(aa, "dave", 44);
+
+    var a = try Group(TestSuite).create(gpa, .{
+        .io = io,
+        .group_id = "leftmost",
+        .key_package_msg = alice.kp_msg,
+        .encryption_priv = alice.enc_priv,
+    });
+    defer a.deinit();
+
+    // alice=0, bob=1, carol=2 — a four-leaf tree whose leaf 3 is blank.
+    var c_group = blk: {
+        const c = try a.createCommit(gpa, .{
+            .io = io,
+            .signature_key_pair = alice.sig,
+            .proposals = &.{
+                .{ .by_value = .{ .add = bob.kp } },
+                .{ .by_value = .{ .add = carol.kp } },
+            },
+        });
+        defer c.deinit(gpa);
+        break :blk try carol.join(gpa, c.welcome.?, &.{});
+    };
+    defer c_group.deinit();
+    try testing.expectEqual(@as(usize, 4), a.treeSize());
+
+    // Remove bob. §7.7 truncates only TRAILING blanks and carol still holds
+    // leaf 2, so the tree stays four leaves wide with TWO blanks in it —
+    // leaf 1 and leaf 3. That is the shape that can tell the RFC's rule
+    // ("the leftmost blank leaf node") apart from any other rule that also
+    // finds a free slot.
+    const published_gi = blk: {
+        const c = try a.createCommit(gpa, .{
+            .io = io,
+            .signature_key_pair = alice.sig,
+            .proposals = &.{.{ .by_value = .{ .remove = 1 } }},
+            .include_external_pub = true,
+        });
+        defer c.deinit(gpa);
+        try c_group.processCommit(.{ .commit_msg = c.commit });
+        break :blk try gpa.dupe(u8, c.group_info);
+    };
+    defer gpa.free(published_gi);
+    try testing.expectEqual(@as(usize, 4), a.treeSize());
+    try testing.expect(a.ratchet_tree.nodes[1 * 2] == null);
+    try testing.expect(a.ratchet_tree.nodes[3 * 2] == null);
+
+    var joined = try Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+        .io = io,
+        .group_info_msg = published_gi,
+        .key_package_msg = dave.kp_msg,
+        .signature_key_pair = dave.sig,
+    });
+    var d = joined.group;
+    defer d.deinit();
+    defer joined.messages.deinit(gpa);
+
+    // The sender's own view…
+    try testing.expectEqual(@as(u32, 1), d.my_leaf_index);
+    try a.processCommit(.{ .commit_msg = joined.messages.commit });
+    try c_group.processCommit(.{ .commit_msg = joined.messages.commit });
+    try expectSameEpoch(&a, &d);
+    try expectSameEpoch(&a, &c_group);
+
+    // …and every receiver's, computed independently. A rule that picked
+    // the rightmost blank would put dave at leaf 3 on BOTH sides and the
+    // round trip above would still pass — which is exactly why this
+    // assertion names the index rather than only comparing the two views.
+    try testing.expectEqual(@as(usize, 4), a.treeSize());
+    const dave_leaf = a.ratchet_tree.nodes[1 * 2].?.leaf;
+    try testing.expectEqualStrings("dave", dave_leaf.credential.basic);
+    try testing.expect(a.ratchet_tree.nodes[3 * 2] == null);
+}
+
+test "§12.2: an external Commit's proposal list is a WHITELIST, and a receiver enforces it" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const alice = try TestClient.init(aa, "alice", 51);
+    const dave = try TestClient.init(aa, "dave", 52);
+    const mallory = try TestClient.init(aa, "mallory", 53);
+
+    var a = try Group(TestSuite).create(gpa, .{
+        .io = io,
+        .group_id = "whitelist",
+        .key_package_msg = alice.kp_msg,
+        .encryption_priv = alice.enc_priv,
+    });
+    defer a.deinit();
+    const published_gi = blk: {
+        const c = try a.createCommit(gpa, .{
+            .io = io,
+            .signature_key_pair = alice.sig,
+            .include_external_pub = true,
+        });
+        defer c.deinit(gpa);
+        break :blk try gpa.dupe(u8, c.group_info);
+    };
+    defer gpa.free(published_gi);
+
+    // A well-formed external Commit, to be spoiled four ways.
+    var joined = try Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+        .io = io,
+        .group_info_msg = published_gi,
+        .key_package_msg = dave.kp_msg,
+        .signature_key_pair = dave.sig,
+    });
+    joined.group.deinit();
+    defer joined.messages.deinit(gpa);
+
+    const old_gc = try a.groupContextAlloc(gpa);
+    defer gpa.free(old_gc);
+    const ext_init: content.ProposalOrRef = blk: {
+        var r = codec.Reader.init(joined.messages.commit);
+        const msg = try framing.MLSMessage.decode(aa, &r);
+        break :blk msg.public_message.content.body.commit.proposals[0];
+    };
+
+    const cases = [_]struct {
+        want: anyerror,
+        proposals: []const content.ProposalOrRef,
+    }{
+        // "No other proposals" — an Add is the interesting one, because it
+        // is the proposal a regular Commit's blacklist happily accepts, and
+        // it is how a stranger would smuggle a member in.
+        .{
+            .want = error.ProposalNotAllowedInExternalCommit,
+            .proposals = &.{ ext_init, .{ .proposal = .{ .add = mallory.kp } } },
+        },
+        // "Exactly one ExternalInit" — none.
+        .{ .want = error.MissingExternalInit, .proposals = &.{} },
+        // "Exactly one ExternalInit" — two.
+        .{ .want = error.MultipleExternalInit, .proposals = &.{ ext_init, ext_init } },
+        // "At most one Remove proposal".
+        .{
+            .want = error.MultipleRemoveInExternalCommit,
+            .proposals = &.{ ext_init, .{ .proposal = .{ .remove = 7 } }, .{ .proposal = .{ .remove = 8 } } },
+        },
+    };
+    for (cases) |c| {
+        const bad = try resignExternalCommit(gpa, aa, joined.messages.commit, dave.sig, old_gc, c.proposals);
+        defer gpa.free(bad);
+        try testing.expectError(c.want, a.processCommit(.{ .commit_msg = bad }));
+        // Every one of these is refused at §12.4.2's bullet 4, before the
+        // tree is touched — so the group is not poisoned and still works.
+        try testing.expectEqual(@as(u64, 1), a.epoch);
+        try testing.expect(!a.poisoned);
+    }
+
+    // §12.4.3.2's "MUST NOT include any proposals by reference". A
+    // `ProposalRef` that resolves to nothing fails earlier, at resolution,
+    // so the one that reaches the whitelist has to name a real proposal —
+    // here one alice herself published this epoch.
+    {
+        const p_msg = try a.createProposal(gpa, .{
+            .signature_key_pair = alice.sig,
+            .proposal = .{ .remove = 0 },
+        });
+        defer gpa.free(p_msg);
+        const ref = blk: {
+            var r = codec.Reader.init(p_msg);
+            const m = try framing.MLSMessage.decode(aa, &r);
+            const rf = try framing.proposalRef(TestSuite, gpa, m.public_message.authenticatedContent());
+            break :blk try aa.dupe(u8, &rf);
+        };
+        const bad = try resignExternalCommit(gpa, aa, joined.messages.commit, dave.sig, old_gc, &.{
+            ext_init,
+            .{ .reference = ref },
+        });
+        defer gpa.free(bad);
+        try testing.expectError(
+            error.ProposalByReferenceInExternalCommit,
+            a.processCommit(.{ .commit_msg = bad, .proposal_msgs = &.{p_msg} }),
+        );
+        try testing.expectEqual(@as(u64, 1), a.epoch);
+    }
+
+    // The unspoiled Commit is still accepted, which is what makes the four
+    // refusals above about the list and not about the fixture.
+    try a.processCommit(.{ .commit_msg = joined.messages.commit });
+    try testing.expectEqual(@as(u64, 2), a.epoch);
+}
+
+test "§6.2: a new_member_commit PublicMessage has no membership_tag field, and neither half of that is assumed" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const alice = try TestClient.init(aa, "alice", 61);
+    const dave = try TestClient.init(aa, "dave", 62);
+
+    var a = try Group(TestSuite).create(gpa, .{
+        .io = io,
+        .group_id = "no-tag",
+        .key_package_msg = alice.kp_msg,
+        .encryption_priv = alice.enc_priv,
+    });
+    defer a.deinit();
+    const published_gi = blk: {
+        const c = try a.createCommit(gpa, .{
+            .io = io,
+            .signature_key_pair = alice.sig,
+            .include_external_pub = true,
+        });
+        defer c.deinit(gpa);
+        break :blk try gpa.dupe(u8, c.group_info);
+    };
+    defer gpa.free(published_gi);
+
+    var joined = try Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+        .io = io,
+        .group_info_msg = published_gi,
+        .key_package_msg = dave.kp_msg,
+        .signature_key_pair = dave.sig,
+    });
+    joined.group.deinit();
+    defer joined.messages.deinit(gpa);
+
+    // On the WIRE: §6.2's `select` gives this sender no tag field, so a tag
+    // appended to the message is not a tag at all — it is trailing input,
+    // and `processCommit` refuses to decode a message it has bytes left
+    // over from. (Silently ignoring them would let a Delivery Service pad
+    // handshake messages undetectably.)
+    {
+        const padded = try gpa.alloc(u8, joined.messages.commit.len + 33);
+        defer gpa.free(padded);
+        @memcpy(padded[0..joined.messages.commit.len], joined.messages.commit);
+        padded[joined.messages.commit.len] = 32; // varint length prefix
+        @memset(padded[joined.messages.commit.len + 1 ..], 0xAA);
+        try testing.expectError(error.Malformed, a.processCommit(.{ .commit_msg = padded }));
+    }
+
+    // In the STRUCT: the guard `processCommit` runs before it trusts
+    // anything else about an external Commit. Driven directly because no
+    // decode path can produce this value — see
+    // `rejectExternalCommitFraming`'s doc comment for why it exists anyway.
+    {
+        var r = codec.Reader.init(joined.messages.commit);
+        const msg = try framing.MLSMessage.decode(aa, &r);
+        var pm = msg.public_message;
+        try rejectExternalCommitFraming(pm); // as decoded: no tag, accepted
+        pm.membership_tag = &[_]u8{0} ** 32;
+        try testing.expectError(error.UnexpectedMembershipTag, rejectExternalCommitFraming(pm));
+    }
+
+    try a.processCommit(.{ .commit_msg = joined.messages.commit });
+    try testing.expectEqual(@as(u64, 2), a.epoch);
+}
+
+test "§12.4.3.2: an external Commit with no path is refused by its OWN rule, not by §12.4's needs_path" {
+    // §12.4.3.2 states two rules that happen to coincide today: "External
+    // Commits MUST contain a path field", and §12.4's `needs_path`, which
+    // lists `external_init` among the proposal types that require one. They
+    // are independent — only the first is unconditional — and a receiver
+    // that leaned on the second would still pass every other test here.
+    //
+    // So this test pins the DISTINCT error. Without it, replacing
+    // `error.ExternalCommitRequiresPath` with the generic
+    // `error.PathRequired` changes nothing that any test can see, and the
+    // unconditional rule quietly becomes an accident of proposal typing.
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const aa = arena_state.allocator();
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const alice = try TestClient.init(aa, "alice", 61);
+    const dave = try TestClient.init(aa, "dave", 62);
+
+    var a = try Group(TestSuite).create(gpa, .{
+        .io = io,
+        .group_id = "external-path-rule",
+        .key_package_msg = alice.kp_msg,
+        .encryption_priv = alice.enc_priv,
+    });
+    defer a.deinit();
+    const published_gi = blk: {
+        const c = try a.createCommit(gpa, .{
+            .io = io,
+            .signature_key_pair = alice.sig,
+            .include_external_pub = true,
+        });
+        defer c.deinit(gpa);
+        break :blk try gpa.dupe(u8, c.group_info);
+    };
+    defer gpa.free(published_gi);
+
+    var joined = try Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+        .io = io,
+        .group_info_msg = published_gi,
+        .key_package_msg = dave.kp_msg,
+        .signature_key_pair = dave.sig,
+    });
+    joined.group.deinit();
+    defer joined.messages.deinit(gpa);
+
+    const old_gc = try a.groupContextAlloc(gpa);
+    defer gpa.free(old_gc);
+    const ext_init: content.ProposalOrRef = blk: {
+        var r = codec.Reader.init(joined.messages.commit);
+        const msg = try framing.MLSMessage.decode(aa, &r);
+        break :blk msg.public_message.content.body.commit.proposals[0];
+    };
+
+    // The proposal list stays legal — only the path is removed — so nothing
+    // in the whitelist can be what rejects this.
+    const pathless = try resignExternalCommitOpts(gpa, aa, joined.messages.commit, dave.sig, old_gc, &.{ext_init}, true);
+    defer gpa.free(pathless);
+
+    try testing.expectError(error.ExternalCommitRequiresPath, a.processCommit(.{
+        .commit_msg = pathless,
+    }));
+    // Refused before anything was mutated: the group is untouched.
+    try testing.expect(!a.poisoned);
+    try testing.expectEqual(@as(u64, 1), a.epoch);
+}
+
+test "§12.4.3.2: joinByExternalCommit refuses what a receiver would, and refuses a GroupInfo it cannot use" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const alice = try TestClient.init(aa, "alice", 71);
+    const dave = try TestClient.init(aa, "dave", 72);
+    const mallory = try TestClient.init(aa, "mallory", 73);
+
+    var a = try Group(TestSuite).create(gpa, .{
+        .io = io,
+        .group_id = "sender-refusals",
+        .key_package_msg = alice.kp_msg,
+        .encryption_priv = alice.enc_priv,
+    });
+    defer a.deinit();
+
+    // §12.4.3.2: a GroupInfo WITHOUT `external_pub` cannot be joined
+    // against — §8.3 has nothing to encapsulate to. This is the default
+    // shape of a GroupInfo, so the refusal has to be explicit.
+    {
+        const c = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = alice.sig });
+        defer c.deinit(gpa);
+        try testing.expectError(error.ExternalPubUnavailable, Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+            .io = io,
+            .group_info_msg = c.group_info,
+            .key_package_msg = dave.kp_msg,
+            .signature_key_pair = dave.sig,
+        }));
+    }
+
+    const published_gi = blk: {
+        const c = try a.createCommit(gpa, .{
+            .io = io,
+            .signature_key_pair = alice.sig,
+            .include_external_pub = true,
+        });
+        defer c.deinit(gpa);
+        break :blk try gpa.dupe(u8, c.group_info);
+    };
+    defer gpa.free(published_gi);
+
+    // §12.2 opens with "A group member creating a Commit AND a group member
+    // processing a Commit MUST verify" — so the sender runs the same
+    // whitelist, and a caller that asks for a forbidden proposal is told so
+    // rather than handed bytes nobody will accept.
+    try testing.expectError(
+        error.ProposalNotAllowedInExternalCommit,
+        Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+            .io = io,
+            .group_info_msg = published_gi,
+            .key_package_msg = dave.kp_msg,
+            .signature_key_pair = dave.sig,
+            .proposals = &.{.{ .add = mallory.kp }},
+        }),
+    );
+    // The ExternalInit is contributed by `joinByExternalCommit` itself, so
+    // a caller supplying one asks for two.
+    try testing.expectError(
+        error.MultipleExternalInit,
+        Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+            .io = io,
+            .group_info_msg = published_gi,
+            .key_package_msg = dave.kp_msg,
+            .signature_key_pair = dave.sig,
+            .proposals = &.{.{ .external_init = &[_]u8{0xaa} ** 32 }},
+        }),
+    );
+
+    // A GroupInfo whose signature does not verify is refused before any of
+    // it is believed — the joiner has no other reason to trust its
+    // tree_hash, its epoch or its external_pub.
+    {
+        const bad = try gpa.dupe(u8, published_gi);
+        defer gpa.free(bad);
+        bad[bad.len - 1] ^= 0x01;
+        try testing.expectError(error.SignatureVerificationFailed, Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+            .io = io,
+            .group_info_msg = bad,
+            .key_package_msg = dave.kp_msg,
+            .signature_key_pair = dave.sig,
+        }));
+    }
+
+    // …and the good one still works, so none of the above was a fixture
+    // problem.
+    var joined = try Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+        .io = io,
+        .group_info_msg = published_gi,
+        .key_package_msg = dave.kp_msg,
+        .signature_key_pair = dave.sig,
+    });
+    defer joined.group.deinit();
+    defer joined.messages.deinit(gpa);
+    try a.processCommit(.{ .commit_msg = joined.messages.commit });
+    try expectSameEpoch(&a, &joined.group);
 }

@@ -649,6 +649,47 @@ pub const RatchetTree = struct {
         self.nodes[index] = null;
     }
 
+    /// RFC 9420 §12.4.1/§12.4.2's external-Commit step: "assign the sender
+    /// the leftmost blank leaf node in the new ratchet tree. If there are
+    /// no blank leaf nodes in the new ratchet tree, expand the tree to the
+    /// right as defined in Section 7.7 and assign the leftmost new blank
+    /// leaf to the sender." Returns that leaf index; the slot is left
+    /// BLANK.
+    ///
+    /// **Why this is not `addLeaf`, even though both hunt the leftmost
+    /// blank.** `addLeaf` is §12.1.1's Add: it installs a leaf and appends
+    /// the new index to `unmerged_leaves` on every non-blank ancestor,
+    /// because an Add publishes a leaf that nobody's path secrets cover
+    /// yet. An external Commit's sender fills the slot from its own
+    /// `UpdatePath` instead (§12.4.3.2: external Commits MUST carry a
+    /// path), and §7.5's merge blanks that whole direct path and rebuilds
+    /// it with EMPTY `unmerged_leaves` — so doing the Add bookkeeping here
+    /// would write state the very next step erases. Reserving the index
+    /// without touching anything else is the whole operation.
+    ///
+    /// Both sides of an external Commit call this and MUST reach the same
+    /// index; it is the one step the RFC makes sender and receiver compute
+    /// independently rather than transmit.
+    pub fn assignBlankLeaf(self: *RatchetTree) !usize {
+        const n_leaves = self.nLeaves();
+        var i: usize = 0;
+        while (i < n_leaves) : (i += 1) {
+            if (self.nodes[i * 2] == null) return i;
+        }
+        // §7.7's expansion: the tree doubles in leaves, so the node array
+        // goes from `w` to `2w + 1` (a new root plus a right subtree the
+        // size of the old whole tree). Identical arithmetic to `addLeaf`'s
+        // extension branch — deliberately, since a group that reaches the
+        // same shape by an Add and by an external join must have the same
+        // tree.
+        const old_width = self.nodes.len;
+        const new_width = if (old_width == 0) 1 else old_width * 2 + 1;
+        const new_nodes = try self.allocator.realloc(self.nodes, new_width);
+        for (new_nodes[old_width..]) |*slot| slot.* = null;
+        self.nodes = new_nodes;
+        return n_leaves;
+    }
+
     /// RFC 9420 §12.1.1 Add proposal application (tree-shape half only —
     /// NOT the "add L's leaf index to unmerged_leaves" bookkeeping's
     /// interaction with `resolution`, which doesn't apply here: this is

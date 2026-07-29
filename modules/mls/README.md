@@ -84,16 +84,20 @@ filtered out, and a member with no way to adopt the private key of an Update
 it had published itself. Every upstream vector passes under either reading
 of §7.5, so only creating Commits could expose it. See `SPEC.md`'s
 "Part 8".
-Part 3 (the rest of §7.3/§10.1 VALIDATION + Credential) and §12.4.3.2's
-external Commits remain; see `SPEC.md`'s "Arc breakdown".
+Part 9 then added §12.4.3.2's external Commits, in both directions. Part 3
+(the rest of §7.3/§10.1 VALIDATION + Credential) and §11.2/§11.3
+(reinit/branch) remain; see `SPEC.md`'s "Arc breakdown".
 What this module can do today: produce and consume real MLS messages other
 implementations accept byte-for-byte, CREATE a group, JOIN one from a
 `Welcome`, FOLLOW it through Commits — validated against recorded sessions
 from another implementation, one of them 200 Commits long — and now SPEAK:
 create proposals, create Commits with a full `UpdatePath`, and produce the
 `Welcome` and `GroupInfo` that go with them. A two-way client is complete.
-What it cannot: send or accept `PrivateMessage` handshakes, join by external
-Commit (§12.4.3.2, Part 8's stated boundary), or apply the §10.1/§7.3
+Both ways INTO a group are built: by invitation (§12.4.3.1's `Welcome`) and
+by §12.4.3.2's external Commit, which needs nobody already inside to be
+online.
+What it cannot: send or accept `PrivateMessage` handshakes, follow through
+on a `ReInit` (§11.2) or branch (§11.3), or apply the §10.1/§7.3
 admission rules that need a clock, a credential authority or an extension
 registry — the two §7.3 rules that need only the leaf and the tree ARE
 applied, in both directions.
@@ -523,8 +527,9 @@ per epoch is not this object's job. `error.GroupPoisoned` — a previous
 `processCommit` failed after the tree was already mutated, so the object is
 unusable rather than silently half-applied.
 
-**What it does not do:** send or accept `PrivateMessage` handshakes, join by
-external Commit (§12.4.3.2), or apply the §7.3/§10.1 admission rules that
+**What it does not do:** send or accept `PrivateMessage` handshakes, follow
+through on a `ReInit` (§11.2) or branch (§11.3), or apply the §7.3/§10.1
+admission rules that
 need a clock, a credential authority or an extension registry (Part 3) — the
 two that need only the leaf and the tree are applied, see
 `mls.GroupPolicy`.
@@ -617,6 +622,66 @@ Note its anchoring honestly: no upstream MLS vector covers §8.3, so unlike
 every other derivation in `keyschedule.zig` it is pinned by a
 sender/receiver round trip plus RFC 9180's own KATs one layer down, not by
 a byte-exact interop vector.
+
+## API surface (Part 9 — joining without an invitation)
+
+RFC 9420 §12.4.3.2. A newcomer with nothing but a published `GroupInfo`
+adds *itself* to the group — no existing member has to be online, and
+nobody issues an Add on its behalf. The `GroupInfo` must carry an
+`external_pub` extension, which is what `createCommit`'s
+`include_external_pub = true` puts there, and it is good for exactly one
+external join because that join changes the epoch.
+
+```zig
+var joined = try mls.Group(S).joinByExternalCommit(gpa, allocator, .{
+    .io = io,
+    .group_info_msg = published_group_info,   // MLSMessage(GroupInfo), public
+    .key_package_msg = my_key_package_msg,    // identity half of my new leaf
+    .signature_key_pair = my_sig,
+    // §12.2's whitelist also admits a Remove (the "resync" flavor: drop an
+    // old appearance of myself) and PreSharedKeys. Nothing else.
+    .proposals = &.{},
+});
+defer joined.group.deinit();
+defer joined.messages.deinit(allocator);
+// joined.group is already IN the new epoch.
+// joined.messages.commit goes to every member; .welcome is always null.
+```
+
+Existing members feed those bytes to the same `processCommit` they use for
+any other Commit — the `new_member_commit` sender type is handled inside.
+
+```zig
+try alice.processCommit(.{ .commit_msg = joined.messages.commit });
+// alice.epochAuthenticator() == joined.group.epochAuthenticator()
+```
+
+**What the joiner can and cannot check.** It verifies the tree against the
+signed `tree_hash`, the parent-hash chain and the `GroupInfo` signature. It
+cannot verify the `GroupInfo`'s `confirmation_tag` — that needs the epoch's
+`confirmation_key`, which is exactly what a non-member lacks. A forged tag
+is not absorbed silently: it changes the joiner's transcript, so every
+member rejects the resulting Commit and the joiner ends up in an epoch of
+one rather than in the group holding state nobody else holds.
+
+**What it refuses, by name.** `error.ExternalPubUnavailable` — the
+`GroupInfo` carries no `external_pub`, so §8.3 has nothing to encapsulate
+to. `error.MissingExternalInit` / `MultipleExternalInit` /
+`MultipleRemoveInExternalCommit` / `ProposalNotAllowedInExternalCommit` /
+`ProposalByReferenceInExternalCommit` — §12.2's whitelist and §12.4.3.2's
+by-reference ban, enforced by BOTH the sender and every receiver.
+`error.UnexpectedMembershipTag` / `ExternalCommitRequiresPath` — §6.2 and
+§12.4.3.2's framing requirements.
+
+**Anchoring, stated honestly.** There is no upstream external-commit test
+vector, so this is round-trip-anchored: what makes the round trip worth
+something is that the two directions meet at an `epoch_authenticator`
+neither of them transports, having reached it by opposite halves of §8.3
+and via a leaf index that appears nowhere on the wire. See `SPEC.md`'s
+"Part 9".
+
+**Not supported yet:** a resumption PSK in an external join (the joiner has
+no epoch history to resolve it against — `error.PskNotAvailable`).
 
 ## Verify
 

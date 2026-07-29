@@ -88,10 +88,16 @@
 //! per test rather than blurred.
 //! What Part 8 does NOT do: accept or send handshake messages framed as
 //! `PrivateMessage` (`error.PrivateHandshakeNotSupported` — driving the §9
-//! secret tree per epoch is a separate concern), and §12.4.3.2's external
-//! Commits, which are the deliberate boundary of this part — see
-//! `SPEC.md`'s "Part 8" for exactly what they still need and why they are a
-//! second piece rather than a loose end of this one.
+//! secret tree per epoch is a separate concern).
+//!
+//! Part 9 adds §12.4.3.2's external Commits, in both directions and in one
+//! piece: `Group(S).joinByExternalCommit` turns a published `GroupInfo`
+//! into a Commit that puts a stranger in the group, and `processCommit`
+//! grew a `new_member_commit` branch that accepts one. §12.2's SECOND
+//! (whitelist) validation procedure, §8.3's `init_secret` substitution and
+//! the leftmost-blank-leaf assignment both sides must compute
+//! independently are what that took. There is no upstream vector for it —
+//! see `SPEC.md`'s Part 9 for what anchors it instead.
 //! Part 3 (the rest of §7.3/§10.1 VALIDATION + Credential) and §11.2/§11.3
 //! (reinit/branch) are what remain — see `SPEC.md`'s "Arc breakdown". Part
 //! 4 landed before Part 3 because the key schedule depends on neither: it
@@ -126,9 +132,9 @@
 //! | `framing.zig` | Part 5's whole of §6: `WireFormat`/`ContentType`/`SenderType`/`Sender`, `FramedContent`, `AuthenticatedContent`, §6.1's `FramedContentTBS` + sign/verify, §6.2's `PublicMessage`/`AuthenticatedContentTBM`/`membership_tag` + `protectPublic`/`unprotectPublic`, §6.3's `PrivateMessage` + §6.3.1's `PrivateMessageContent`/`PrivateContentAAD`/reuse guard/padding + §6.3.2's `SenderData`/`SenderDataAAD`, and `MLSMessage` |
 //! | `transcript.zig` | Part 5's RFC 9420 §8.2 — `ConfirmedTranscriptHashInput`/`InterimTranscriptHashInput` and both recurrences. Separate from `keyschedule.zig` only because `framing.zig` imports that file, so §8.2 sitting there would be an import cycle |
 //! | `kat_messages_test.zig` | Parts 5+6's KAT harness for `messages.json`: every §12.1 proposal body, §12.4 `Commit`, §12.4.3.1's `GroupSecrets`, §12.4.3.3's bare `ratchet_tree`, and ALL five §17.2 `MLSMessage` wire formats, decode→re-encode byte-exact (a WIRE-format anchor — upstream states this vector's MACs may be invalid) |
-//! | `welcome.zig` | Part 6's RFC 9420 §12.4.3 `GroupInfo`/`GroupInfoTBS` (+ sign/verify), §12.4.3.1's `PathSecret`/`GroupSecrets`/`EncryptedGroupSecrets`/`Welcome`, the two encryption layers (`welcomeKeyNonce`/`encryptGroupInfo`/`decryptGroupInfo` and `encryptGroupSecrets`/`decryptGroupSecrets`) and the joiner's whole procedure (`join`), plus §12.4.3.3's `ratchet_tree`/`external_pub` extension accessors and `verifyTreeHash`. External commits (§12.4.3.2) and §8.3 are NOT here — see the file's doc comment for the `hpke` dependency that blocks them |
+//! | `welcome.zig` | Part 6's RFC 9420 §12.4.3 `GroupInfo`/`GroupInfoTBS` (+ sign/verify), §12.4.3.1's `PathSecret`/`GroupSecrets`/`EncryptedGroupSecrets`/`Welcome`, the two encryption layers (`welcomeKeyNonce`/`encryptGroupInfo`/`decryptGroupInfo` and `encryptGroupSecrets`/`decryptGroupSecrets`) and the joiner's whole procedure (`join`), plus §12.4.3.3's `ratchet_tree`/`external_pub` extension accessors and `verifyTreeHash`. §8.3's two halves live in `keyschedule.zig` and §12.4.3.2's external Commits in `group.zig`; this file supplies the `GroupInfo` they both read |
 //! | `kat_welcome_test.zig` | Part 6's KAT harness for `welcome.json` — the whole §12.4.3.1 join with real keys, staged per layer (KeyPackageRef → HPKE open → welcome key → group-info AEAD → signature → confirmation tag), and reproducing the vector's `encrypted_group_info` in the SEND direction |
-//! | `group.zig` | Part 7's `Group(S)` — the group STATE and the receiving half of an epoch transition: §12.4.3.1's `fromWelcome`, §12.4.2's `processCommit` (proposal resolution by §5.2 ref, §12.2 validation, §12.3's application order, the UpdatePath's provisional-GroupContext decryption, the key schedule and the `confirmation_tag`), plus §8.4 PSK resolution over application-supplied and remembered-resumption keys — and Part 8's SENDING half in the same object, because it is the same state: §11's `create`, §12.1's `createProposal`/`updateLeaf`, and §12.4.1's `createCommit` (which also produces the §12.4.3.1 `Welcome` and a signed `GroupInfo`) |
+//! | `group.zig` | Part 7's `Group(S)` — the group STATE and the receiving half of an epoch transition: §12.4.3.1's `fromWelcome`, §12.4.2's `processCommit` (proposal resolution by §5.2 ref, §12.2 validation, §12.3's application order, the UpdatePath's provisional-GroupContext decryption, the key schedule and the `confirmation_tag`), plus §8.4 PSK resolution over application-supplied and remembered-resumption keys — and Part 8's SENDING half in the same object, because it is the same state: §11's `create`, §12.1's `createProposal`/`updateLeaf`, and §12.4.1's `createCommit` (which also produces the §12.4.3.1 `Welcome` and a signed `GroupInfo`) — and Part 9's §12.4.3.2 external Commits in BOTH directions, again in the same object: `joinByExternalCommit` (GroupInfo → external Commit + group state) and `processCommit`'s `new_member_commit` branch, sharing §12.2's second (whitelist) validation procedure and §12.4.1's leftmost-blank-leaf assignment |
 //! | `kat_passive_test.zig` | Part 7's KAT harness for the three `passive-client-*.json` vectors — recorded sessions replayed Commit by Commit against `epoch_authenticator`, plus the assertions that keep each file's reduction honest |
 //! | `kat_commit_test.zig` | Part 8's KAT harness: an `UpdatePath` GENERATED from a `treekem.json` vector's own `path_secret[0]`, compared byte-exact against that vector's node public keys / `commit_secret` / committer-leaf `parent_hash` and then opened by every one of its recorded members; plus Commits created on top of group states restored from the `passive-client-*.json` sessions. Each assertion is labelled anchored or round trip |
 //! | `kat_framing_test.zig` | Part 5's KAT harness for `message-protection.json` (the full §6 protect/unprotect path with real keys — `PrivateMessage` for all three content types, `PublicMessage` for the two handshake types, byte-exact in BOTH directions, plus §6's refusal of application content as a `PublicMessage`) and `transcript-hashes.json` (§8.2's two hashes plus the Commit's own `confirmation_tag`) |
@@ -206,13 +212,17 @@
 //! `Group(S)` objects can drive a group between them indefinitely, and a
 //! group state restored from another implementation's recorded session can
 //! be committed on directly.
+//! Both ways into a group are now built: by invitation (§12.4.3.1's
+//! `Welcome`) and by §12.4.3.2's external Commit, which needs nobody
+//! already inside to be online.
+//!
 //! What it still cannot do: send or accept handshake messages framed as a
 //! `PrivateMessage` (the §9 secret tree is built, but the group object does
-//! not drive it per epoch), join by external Commit (§12.4.3.2 — the
-//! deliberate boundary of Part 8), and apply the §10.1/§7.3 admission rules
-//! that need a clock, a credential authority or an extension registry (Part
-//! 3); the two §7.3 rules that need only the leaf and the tree ARE applied,
-//! in both directions. See `README.md` for the current surface.
+//! not drive it per epoch), follow through on a `ReInit` (§11.2) or branch
+//! (§11.3), and apply the §10.1/§7.3 admission rules that need a clock, a
+//! credential authority or an extension registry (Part 3); the two §7.3
+//! rules that need only the leaf and the tree ARE applied, in both
+//! directions. See `README.md` for the current surface.
 //!
 //! Provenance: clean-room from RFC 9420 (a public IETF specification, not
 //! copyrightable expression — see `CONVENTIONS.md` §5's merger-doctrine

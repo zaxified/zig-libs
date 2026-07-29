@@ -25,7 +25,7 @@ as a `PublicMessage` or fully encrypted as a `PrivateMessage`. With Part 6
 it can also ENTER a group from a `Welcome`, arriving at the same epoch
 secrets and transcript hashes as every existing member. What is still
 missing before this is a CLIENT is Part 3's KeyPackage/LeafNode validation,
-the external-Commit join (§12.4.3.2/§8.3, not built — see "Part 6"),
+the external-Commit join (§12.4.3.2/§8.3 — see "Part 9"),
 and the group-state object that would tie an epoch's tree, transcript and
 key schedule together so the module could FOLLOW a group after joining —
 none of which is a wire format, all of which is policy and state machinery
@@ -131,7 +131,7 @@ parent-hash validation logic does (see Part 2 below).
 | **3 — LeafNode / KeyPackage / Credential VALIDATION** | §5.3 credentials, §7.2/§7.3 `LeafNode` content + validation (`leaf_node_validation.json`), `KeyPackage` (§10) validation. NOTE: §10's WIRE FORMAT was taken by Part 5 (`keypackage.zig`) because §12.1.1's `Add` cannot be decoded without it; what remains for Part 3 is §10.1's and §7.3's admission RULES | **Sonnet** — mostly `codec.zig`-shaped serialization plus signature verification (`SignWithLabel`/`VerifyWithLabel` from THIS part) over well-specified structs; the validation RULES (§7.3's numbered list) are mechanical checks, not novel crypto | `key-package-validation.json`, `leaf-node-validation.json` |
 | **4 — Key Schedule + Secret Tree** | §8's full `init_secret_[n-1] → ... → init_secret_[n]` chain, §8.1 `GroupContext`, §8.4 `psk_secret`, §8.5 exporter, §6.1's two MACs, §9 Secret Tree + sender ratchets, §6.3.2 sender-data keys — **DONE 2026-07-28**, whole part **COMPLETE** except §8.3 (external init — Part 6 established that the `hpke` dependency it needs is already satisfied, so this is unbuilt work rather than a blocker); §8.2's transcript hashes were the other gap and Part 5 closed them (`transcript.zig`), and Part 6 added the joiner's entry point into the same chain (`deriveEpochFromJoiner`) | **Sonnet** — pure composition of `ExpandWithLabel`/`DeriveSecret` (already built) over a well-specified derivation graph. One correction to the original note below: Figure 22 pins the ORDER unambiguously, but Figure 24 (§8.4's PSK chain) does NOT — it contradicts its own prose on the Extract argument order, and only the vector settles it | `key-schedule.json`, `secret-tree.json`, `psk_secret.json` — all byte-exact; see "Part 4" below |
 | **5 — Message framing** | ALL of §6 (`FramedContent`/`AuthenticatedContent`/§6.1 TBS+auth/§6.2 `PublicMessage`+`membership_tag`/§6.3 `PrivateMessage`+§6.3.1 content encryption+§6.3.2 sender data/`MLSMessage`), the §12.1 `Proposal` and §12.4 `Commit` WIRE FORMATS framing carries, the §10 `KeyPackage` wire format `Add` carries, and §8.2's transcript hashes — **DONE 2026-07-29**, whole part **COMPLETE**. Commit PROCESSING (§12.2/§12.3/§12.4.1/§12.4.2) is explicitly NOT here — see "Part 5" below for where that boundary falls and why | **Sonnet** — mechanical composition over Parts 1/2/4's primitives with an authoritative byte-exact oracle for every path. No new cryptography: every derivation it performs was already built and vector-pinned by an earlier part | `messages.json`, `message-protection.json`, `transcript-hashes.json` — all byte-exact; see "Part 5" below |
-| **6 — Joining a group (Welcome), then external Commit / reinit** | §12.4.3's `GroupInfo`/`GroupInfoTBS`, §12.4.3.1's `Welcome`/`GroupSecrets`/`EncryptedGroupSecrets` + both encryption layers + the joiner's procedure, §12.4.3.3's `ratchet_tree`/`external_pub` extensions and the tree-hash binding, and §8's chain entered at `joiner_secret` — **DONE 2026-07-29**, the WELCOME path **COMPLETE**. What remains of this part: §12.4.3.2 external Commits + §8.3 external init (scoped out, NOT blocked — see "Part 6" below), and §11.2/§11.3 reinit/branch | **Sonnet** — no new cryptography at all: the group-info layer is a plain AEAD under a key `keyschedule.zig` already derived, and the per-member layer is `crypto.EncryptWithLabel` unchanged. The judgment calls were scope ones, not crypto ones | `welcome.json` + `messages.json`'s Part 6 fields — byte-exact; see "Part 6" below |
+| **6 — Joining a group (Welcome), then external Commit / reinit** | §12.4.3's `GroupInfo`/`GroupInfoTBS`, §12.4.3.1's `Welcome`/`GroupSecrets`/`EncryptedGroupSecrets` + both encryption layers + the joiner's procedure, §12.4.3.3's `ratchet_tree`/`external_pub` extensions and the tree-hash binding, and §8's chain entered at `joiner_secret` — **DONE 2026-07-29**, the WELCOME path **COMPLETE**. §12.4.3.2 external Commits + §8.3 external init landed later, in Part 9; §11.2/§11.3 reinit/branch remain | **Sonnet** — no new cryptography at all: the group-info layer is a plain AEAD under a key `keyschedule.zig` already derived, and the per-member layer is `crypto.EncryptWithLabel` unchanged. The judgment calls were scope ones, not crypto ones | `welcome.json` + `messages.json`'s Part 6 fields — byte-exact; see "Part 6" below |
 | **7 — Group state machine** | `Group(S)`: the state a member carries between epochs, §12.2's proposal-list validation, §12.3's application order, §12.4.2's whole Commit-processing procedure, and §12.4.3.1's join run to completion (`fromWelcome`) — **DONE 2026-07-29**, COMPLETE for the FOLLOWER. Also §8.3 external init, which Part 6 listed as unbuilt. NOT here: Commit/proposal CREATION (no sender half of §7.5), `PrivateMessage` handshakes, §12.4.3.2 external Commits, §11.2/§11.3 reinit/branch | **Sonnet** — still no new cryptography, but the first part of this arc whose vectors did NOT match on the first run. Three coding defects in Parts 1/2/4 and one specification MISREADING surfaced here and nowhere else; see "Part 7" below | `passive-client-welcome.json`, `passive-client-handling-commit.json`, `passive-client-random.json` — whole recorded sessions replayed Commit by Commit against `epoch_authenticator`; see "Part 7" below |
 | **8 — Creating Commits** | The sender half of everything Part 7 could only receive: §11 group creation, §12.1 proposal creation, §7.4/§7.5's `UpdatePath` GENERATION (`treekem.stageUpdatePath`/`sealUpdatePath`), §12.4.1's Commit creation, §12.4.3.1's `Welcome` production, and §10's `KeyPackage` construction — **DONE 2026-07-29**, COMPLETE for REGULAR Commits. Also the two §7.3 rules that need only the leaf and the tree, applied in both directions. NOT here: §12.4.3.2 external Commits (the stated boundary — see "Part 8"), `PrivateMessage` handshakes, §11.2/§11.3, committer-chosen leaf content | **Sonnet** — no new cryptography; the mirror image of Part 7 over Parts 1-6's primitives. The judgement calls were about what can be ANCHORED when the output has three random inputs, and about which half of §7.3 belongs here. Building the send half found three RECEIVE-side problems that 200 replayed Commits could not reach — including a §7.5 misreading Part 7 introduced and no upstream vector can see | `treekem.json` driven in the SEND direction (a generation seeded from the vector's own `path_secret[0]` reproduces its node public keys, `commit_secret` and committer-leaf `parent_hash` byte-exact, then faces its recorded members); Commits created on states restored from `passive-client-handling-commit.json`/`passive-client-random.json`. See "Part 8" for what is anchored and what is a round trip |
 
@@ -574,7 +574,7 @@ There is no top-level "Welcome" section. Everything lives under §12.4.3
 |---|---|
 | §12.4.3 (body) | `GroupInfo`, `GroupInfoTBS` — NOT in a numbered subsection of their own |
 | §12.4.3.1 Joining via Welcome Message | `PathSecret`, `GroupSecrets`, `EncryptedGroupSecrets`, `Welcome`, the `welcome_key`/`welcome_nonce` derivation, and the twelve-step receiving procedure |
-| §12.4.3.2 Joining via External Commits | `ExternalPub`, the external-Commit rules — NOT in scope, see below |
+| §12.4.3.2 Joining via External Commits | `ExternalPub`, the external-Commit rules — **built, see Part 9** (this row read "NOT in scope" while Part 6 was the newest part) |
 | §12.4.3.3 Ratchet Tree Extension | the `optional<Node> ratchet_tree<V>` encoding and its closing tree-hash MUST |
 
 The two supporting facts that are elsewhere: §17.2 assigns `mls_welcome` =
@@ -939,8 +939,8 @@ complete client, and the gaps are named rather than implied:
   changing, no `UpdatePath` public key already present in the tree — and
   verifies the signature on every `LeafNode` it installs. It does not check
   lifetimes, credential acceptability or capability support.
-- **No external Commits (§12.4.3.2).** See the Backlog for why the reason is
-  now "no anchor" rather than "blocked".
+- **No external Commits (§12.4.3.2)** — at the time of Part 7. Built in
+  Part 9; see there.
 - **Not atomic.** A failure after the tree is mutated poisons the object
   (`error.GroupPoisoned`) instead of rolling back. Backlog.
 
@@ -1198,41 +1198,13 @@ and all three `passive-client-*.json` sessions replay green with them on —
 which is itself a small piece of evidence that the reading is the same one
 the reference implementation uses.
 
-### Where the boundary falls: external Commits are the next piece, not a
-### loose end of this one
+### Where the boundary fell, and where it moved to
 
-§12.4.3.2 is NOT in this part, and the reason has changed since Part 7 said
-"no anchor". The anchor argument is now weaker — creation exists, so an
-external Commit could be round-tripped inside this module exactly as
-everything else in Part 8 is. What has NOT changed is that there is still no
-upstream external-commit vector, so it would be round-trip-only either way;
-and what it needs is a second substantial piece rather than a few lines on
-top of `createCommit`:
-
-- a second §12.2 validation procedure (the RFC states one for regular
-  Commits and a completely different, whitelist-shaped one for external
-  ones: exactly one ExternalInit, at most one Remove, zero or more PSK,
-  nothing else);
-- a `new_member_commit` branch through `processCommit`'s first half — no
-  `membership_tag` (the sender is not a member), and the signature key comes
-  from `commit.path.leaf_node` rather than from the tree, because the sender
-  has no leaf yet;
-- leaf assignment on BOTH sides ("assign the sender the leftmost blank leaf
-  node in the new ratchet tree", extending the tree if there is none) — the
-  one step where sender and receiver must independently compute the same
-  index;
-- substituting §8.3's external `init_secret` for the previous epoch's inside
-  the key schedule (§12.3's "If there is an ExternalInit proposal, use it to
-  derive the init_secret for use later in Commit processing").
-
-Everything each of those reads already exists —
-`keyschedule.externalInitSender`/`externalInitReceiver`,
-`welcome.GroupInfo.externalPub`, `framing.SenderType.new_member_commit`,
-`content.Proposal.external_init`, `createCommit`'s
-`include_external_pub` — so the piece is well-defined and unblocked. It is
-listed in the Backlog with that decomposition rather than started here,
-because a half-built external Commit next to a finished regular one would
-make it impossible to tell which of the two a failing test was about.
+§12.4.3.2 was NOT in Part 8, on the ground that it is a second substantial
+piece rather than a few lines on top of `createCommit`, and that a
+half-built external Commit next to a finished regular one would make it
+impossible to tell which of the two a failing test was about. Part 9 below
+builds it, in both directions at once, for exactly that reason.
 
 ### Everything else this part does NOT do
 
@@ -1286,6 +1258,215 @@ make it impossible to tell which of the two a failing test was about.
   above was re-introduced and the suite re-run, and the SPEC records which
   tests catch it. The one change no test catches (§7.9.1's wording) says so
   in the same list rather than being presented alongside the others.
+
+## Part 9 — External Commits (2026-07-29)
+
+RFC 9420 §12.4.3.2: the second way into a group. A newcomer turns a
+published `GroupInfo` into a Commit that adds itself, and no existing
+member has to be online for it. Both directions land together —
+`Group(S).joinByExternalCommit` and a `new_member_commit` branch through
+`processCommit` — because there is no upstream vector for either, so the
+only thing that can anchor one is the other.
+
+### What the earlier decomposition got right, and the two things it missed
+
+The four-part decomposition recorded at the end of Part 8 held up against
+the RFC and against the code. §12.2's second, whitelist-shaped procedure;
+a `new_member_commit` branch with no `membership_tag` and the signature key
+read out of `commit.path.leaf_node`; leaf assignment on both sides; §8.3's
+`init_secret` substituted for the previous epoch's — all four are real, all
+four are what the work consisted of. Every symbol it claimed already
+existed does exist and has the shape it needed
+(`keyschedule.externalInitSender`/`externalInitReceiver`,
+`welcome.GroupInfo.externalPub`, `framing.SenderType.new_member_commit`,
+`content.Proposal.external_init`, `createCommit`'s `include_external_pub`).
+
+It missed two REQUIREMENTS, both stated in §12.4.3.2 rather than in §12.2,
+and both of which a receiver has to enforce:
+
+- **"The Commit MUST NOT include any proposals by reference, since an
+  external joiner cannot determine the validity of proposals sent within
+  the group."** This is not a §12.2 rule and so is not in §12.2's
+  whitelist; a whitelist built from §12.2 alone accepts a by-reference
+  ExternalInit. It is `error.ProposalByReferenceInExternalCommit`, checked
+  per entry of the resolved list.
+- **"External Commits MUST contain a path field (and is therefore a 'full'
+  Commit)."** §12.4's `pathRequiredTypes` already contains `external_init`,
+  so `needs_path` is true for any list that passes the whitelist and the
+  two rules coincide today — but they are independent rules and only one of
+  them is unconditional. Both are spelled out.
+
+It also under-described the leaf assignment slightly. It said "the leftmost
+blank leaf node in the new ratchet tree", which is §12.4.1's wording;
+§12.4.2's wording for the receiving side is "add a blank leaf to the right
+side of the new ratchet tree" where §12.4.1 says "expand the tree to the
+right as defined in Section 7.7". These describe the same operation, and
+`tree.RatchetTree.assignBlankLeaf` implements §7.7's doubling — the same
+arithmetic `addLeaf` uses, deliberately, so that a group reaching a given
+shape by an Add and by an external join has the same tree.
+
+### `assignBlankLeaf` is not `addLeaf`, and the difference is load-bearing
+
+Both hunt the leftmost blank leaf. `addLeaf` is §12.1.1's Add: it installs
+a leaf and appends the new index to `unmerged_leaves` on every non-blank
+ancestor, because an Add publishes a leaf no existing path secret covers.
+An external Commit's sender fills its slot from its own `UpdatePath`
+instead, and §7.5's merge blanks that entire direct path and rebuilds it
+with EMPTY `unmerged_leaves` — so the Add bookkeeping would write state the
+very next step erases. Reserving the index and touching nothing else is the
+whole operation.
+
+### One function builds both flavors of Commit
+
+`createCommit` and `joinByExternalCommit` are one implementation
+(`commitInner` plus a `CommitMode`), for the same reason §12.3's
+application order is one implementation shared between sending and
+receiving: §12.4.1 states its step list once and §12.4.3.2 states the
+external flavor as substitutions inside it ("In principle, external Commits
+work like regular Commits. However, their content has to meet a specific
+set of requirements"). A second copy would be a second place for the
+provisional-GroupContext ordering, the sign-then-confirm ordering and
+§12.3's application order to drift — and a drift in any of them produces a
+Commit that looks well-formed and that nobody can process.
+
+The substitutions, in order: which §12.2 procedure validates the list; the
+leaf index (assigned, not read from `my_leaf_index`); where the base leaf's
+identity content comes from (the joiner's KeyPackage, not `ownLeaf`); the
+`Sender` arm; the `init_secret`; and whether a `membership_tag` exists at
+all. Everything else — §12.3's application, the path, the transcript, the
+key schedule, the `GroupInfo` — is the same code.
+
+### The joiner runs against a bootstrap group state whose secrets are zero
+
+A non-member has none of the epoch it is committing against.
+`joinByExternalCommit` builds a `Group(S)` from the `GroupInfo` — group id,
+epoch, tree hash, confirmed transcript hash, extensions, tree, and the
+interim transcript hash derived from the published `confirmation_tag` — and
+fills `secrets` with zeroes. `commitInner` reads exactly two fields of it:
+`init_secret`, which `.external` mode replaces with §8.3's, and
+`membership_key`, which `.external` mode does not use because §6.2 gives
+that sender no tag field. Zeroes rather than `undefined` so a mis-wired
+external branch produces a deterministic, testable wrong answer instead of
+stack garbage; the whole struct is overwritten with the new epoch's secrets
+before the function returns.
+
+### What the joiner cannot verify, and why that is safe
+
+It verifies the tree against the signed `tree_hash`, the parent-hash chain,
+and the `GroupInfo` signature under the signer's leaf key — the same three
+checks `fromWelcome` runs, through the same function
+(`verifiedTreeFromGroupInfo`, extracted so the ORDER cannot drift between
+the two entry points: the signature cannot be checked before the tree is
+known, and the tree cannot be trusted before its root hash is matched
+against the `GroupContext` the signature covers).
+
+It CANNOT verify the `confirmation_tag` the `GroupInfo` carries; that needs
+the epoch's `confirmation_key`, which is exactly what a non-member lacks. A
+forged tag is not silently absorbed, only detected later and by somebody
+else: the tag feeds §8.2's `interim_transcript_hash`, so a wrong one gives
+the joiner a different `confirmed_transcript_hash` for the new epoch than
+every member computes, and every member rejects the Commit at §12.4.2's
+`confirmation_tag` bullet. The joiner lands in an epoch of one; it never
+lands in the group holding state nobody else holds.
+
+Symmetrically, the identity in the joiner's leaf is vouched for by nothing
+in this module. §12.4.3.2 says accepting an external Commit "follows the
+same rules that are applied to other handshake messages", i.e. it is the
+receiving application's call — the same place §7.3's credential bullet
+lands.
+
+### A reading a different implementer could reasonably make differently
+
+§12.2's external procedure is a CLOSED list ("the list is valid if it
+contains only the following proposals"), and it does not repeat the regular
+procedure's "multiple PreSharedKey proposals that reference the same
+PreSharedKeyID" rule. `validateExternalProposalList` follows it literally
+and permits a repeated `PreSharedKeyID`: §8.4's chain is
+position-dependent, both sides derive the same `psk_secret` from the same
+repeated list, and correctness costs nothing. An implementer who reads
+§12.2's "an individual proposal that is invalid as specified in Section
+12.1" as carrying over would reject it. Nothing in this module depends on
+the choice, and no vector exercises it.
+
+### Scope, stated precisely
+
+- **No resumption PSKs in an external join.** §12.2's whitelist admits
+  PreSharedKey proposals and §12.4.3.2 even suggests a `reinit` resumption
+  PSK as the way to gate the resync flavor — but a resumption PSK is looked
+  up in `resumption_history`, which a group entered this way starts empty.
+  An external PSK works; a resumption one is `error.PskNotAvailable`.
+  Carrying prior-epoch secrets into a fresh join needs a way to hand them
+  in, which `ExternalJoinParams` does not have.
+- **The resync flavor is built but only partly exercised.** §12.2's "at
+  most one Remove, with which the joiner removes an old version of
+  themselves" is enforced, and a Remove in an external Commit is applied by
+  the shared `applyProposals` before the leaf is assigned — so the joiner
+  can legitimately land in the leaf its own old appearance just vacated.
+  What is NOT tested is the case where the RECEIVER is the removed member.
+- **§12.2's extra condition on that Remove** — "the LeafNode in the path
+  field MUST meet the same criteria as would the LeafNode in an Update for
+  the removed leaf ... the credential MUST present a set of identifiers
+  that is acceptable to the application for the removed participant" — is
+  an Authentication Service question and stays the application's, for the
+  same reason §7.3's credential bullet does.
+- **No committer-chosen leaf content**, unchanged from Part 8. The joiner's
+  KeyPackage supplies the identity half of its leaf and §7.5 samples the
+  encryption key; nothing else is settable.
+
+### Teeth
+
+- **The round trip is a genuine one.** Three parties — one of whom was a
+  stranger a moment earlier — end on the same `epoch_authenticator`, which
+  is `DeriveSecret(epoch_secret, "authentication")` and therefore
+  downstream of the §8.3 secret, the tree hash, the whole transcript and a
+  leaf index that appears nowhere on the wire. The two sides reach that
+  secret by OPPOSITE halves of §8.3 (`SetupBaseS` on the joiner,
+  `SetupBaseR` on each member), so agreement is not two copies of one
+  computation. The group is then driven one further Commit BY the newcomer
+  and processed by the founder, because a join that produced a state which
+  cannot take another Commit would satisfy every other assertion.
+- **The leftmost-blank rule is pinned by index, not by agreement.** A
+  three-member group with bob removed leaves TWO blanks (leaf 1 and leaf
+  3); the joiner must land at 1. This matters because sender and receiver
+  call the SAME function: a leftmost→rightmost change keeps them agreeing
+  and the round trip alone would pass. The other branch — a full tree,
+  §7.7 expansion, "the leftmost NEW blank leaf" — is pinned in the round
+  trip test.
+- **The whitelist is enforced END TO END, against a hostile joiner.** The
+  reject tests re-sign a real external Commit with the joiner's own
+  signature key after swapping its proposal list — which is exactly what an
+  attacker can do, since §6.1 verifies a `new_member_commit` with the key
+  in `commit.path.leaf_node`. So a receiver cannot reject a bad list by
+  signature check, and these tests reach §12.4.2's bullet 4 rather than
+  failing at bullet 3. Four distinct typed errors: an Add
+  (`ProposalNotAllowedInExternalCommit`), no ExternalInit
+  (`MissingExternalInit`), two (`MultipleExternalInit`), two Removes
+  (`MultipleRemoveInExternalCommit`), plus a by-reference proposal that
+  resolves correctly and is still refused
+  (`ProposalByReferenceInExternalCommit`). Each leaves the group unpoisoned
+  and at its old epoch, and the unspoiled Commit is then accepted — which
+  is what makes the refusals about the list and not about the fixture.
+- **Both halves of "no `membership_tag`" are checked.** On the wire, a tag
+  appended to the message is trailing input and `processCommit` refuses to
+  decode it (`error.Malformed`) rather than ignoring it. In the struct,
+  `rejectExternalCommitFraming` returns `UnexpectedMembershipTag`.
+- **Mutation-tested.** Three deliberate defects were introduced and
+  reverted, and the SPEC records which tests caught each:
+  `assignBlankLeaf` returning the RIGHTMOST blank — caught ONLY by the
+  leftmost test, with the round trip still green, which is the point of
+  that test existing; `processCommit` keeping the previous epoch's
+  `init_secret` instead of §8.3's — caught by all five external-Commit
+  tests with `MacMismatch` at §12.4.2's `confirmation_tag` bullet; and the
+  whitelist's `else` arm made permissive — caught by both whitelist tests,
+  with the sender-side one showing that `joinByExternalCommit` would
+  otherwise happily emit a Commit smuggling an Add.
+- **One thing NO test catches, stated rather than glossed:** deleting the
+  `rejectExternalCommitFraming` CALL from `processCommit`. No decode path
+  can produce a `PublicMessage` with a `new_member_commit` sender and a
+  non-null `membership_tag`, so the call site is unreachable through the
+  public API; the guard is defensive against a future path (a
+  `PrivateMessage` unprotect, a caller-built struct) and its doc comment
+  says so. The function itself is tested directly.
 
 ## Threat model
 
@@ -1402,29 +1583,16 @@ make it impossible to tell which of the two a failing test was about.
   by a byte-exact interop vector. Its export-context string and HPKE
   `suite_id` are pinned as literals separately, because a round trip alone
   cannot catch a label both sides get wrong the same way.
-- **External Commits (§12.4.3.2) are the next piece, and they are fully
-  unblocked — DECOMPOSED 2026-07-29.** The old reason for deferring them
-  ("no anchor: a receiver has no counterpart while creation does not exist")
-  expired when Part 8 landed. They are still out, and the reason is now
-  size and separability rather than testability. Four pieces, none of them a
-  few lines on `createCommit`: (1) §12.2's SECOND validation procedure, a
-  whitelist (exactly one ExternalInit, at most one Remove, zero or more PSK,
-  nothing else) rather than the regular Commit's blacklist; (2) a
-  `new_member_commit` branch through `processCommit`'s first half — no
-  `membership_tag`, and the signature key read out of
-  `commit.path.leaf_node` because the sender has no leaf yet; (3) leaf
-  assignment on BOTH sides ("the leftmost blank leaf node in the new ratchet
-  tree", extending the tree if there is none), the one step where sender and
-  receiver must independently compute the same index; (4) substituting
-  §8.3's external `init_secret` for the previous epoch's inside the key
-  schedule. Everything they READ exists already
-  (`keyschedule.externalInitSender`/`externalInitReceiver`,
-  `welcome.GroupInfo.externalPub`, `framing.SenderType.new_member_commit`,
-  `content.Proposal.external_init`, `createCommit`'s
-  `include_external_pub`, which publishes a `GroupInfo` an external joiner
-  can use today). Note there is still no upstream external-commit vector, so
-  it will land round-trip-anchored — the same footing the rest of Part 8's
-  creation side is on, and honest about it.
+- **External Commits (§12.4.3.2) — DONE 2026-07-29 (Part 9).** Both
+  directions in one batch (`Group(S).joinByExternalCommit` and
+  `processCommit`'s `new_member_commit` branch), because with no upstream
+  external-commit vector the only thing that can anchor one direction is
+  the other. The four-part decomposition recorded here beforehand held up;
+  it missed §12.4.3.2's "MUST NOT include any proposals by reference" and
+  its "MUST contain a path field", both of which are receiver-enforced
+  rules that live outside §12.2. See "Part 9" for what anchors it and for
+  the two things it deliberately leaves out (resumption PSKs in an external
+  join; the resync case where the RECEIVER is the removed member).
 - **`createCommit` cannot change the committer's leaf CONTENT.** §7.5 allows
   a Commit to carry a new credential, capabilities or extensions for the
   committer's leaf; Part 8 carries the current content over and rotates only
