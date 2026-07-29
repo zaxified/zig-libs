@@ -74,6 +74,52 @@ var res2 = try up.finish();
 defer res2.deinit();
 ```
 
+### HTTP/2 client: multiplexed, and incremental in both directions
+
+`Client.connectH2c` (cleartext h2c, prior knowledge) / `connectH2Over` (a
+stream that ALPN already selected `h2` on) return an `H2Session` that
+multiplexes any number of requests. Buffered use is `request` + a fully
+assembled `awaitResponse`. Underneath it — and usable directly for a body
+you do not have yet, a response you must process as it arrives, or both at
+once on one stream — is the incremental surface:
+
+```zig
+const hs = try client.connectH2c("127.0.0.1", 8080, .{});
+defer hs.close();
+
+const sid = try hs.openStream(.post, "/rpc", .{});  // HEADERS, no END_STREAM
+const s = &hs.session;                              // the rest lives here
+
+try s.sendData(sid, first_chunk, false);            // blocks until it is away
+const head = try s.awaitHead(sid);                  // status/headers, early
+try s.sendData(sid, last_chunk, true);              // END_STREAM: body done
+
+var buf: [4096]u8 = undefined;
+while (true) {
+    const n = try s.readBody(sid, &buf);            // 0 = body complete
+    if (n == 0) break;
+    consume(buf[0..n]);
+}
+if (s.trailers(sid)) |tr| { … }                     // distinct from the end
+s.release(sid);
+```
+
+- **Receive-side flow control follows consumption, not arrival**: the
+  WINDOW_UPDATE for an octet (§6.9) is sent when `readBody` hands it to the
+  caller, so "credit outstanding" means "buffer space actually free". A
+  caller that stops reading applies real backpressure to the peer (and, on
+  the shared connection window, to the other streams — §6.9 head-of-line
+  blocking, which is what backpressure over one connection *is*).
+- **Send-side**: `sendData` blocks until every octet is away, reading the
+  connection for grants when the peer's window is shut; `sendDataPartial`
+  is the non-blocking variant and returns the count it accepted, which Zig
+  will not let you drop by accident.
+- `cancel(sid, .cancel)` aborts a stream (RST_STREAM) and returns the
+  unconsumed octets' connection-window credit — §6.9.1, or an abandoned
+  download shrinks the shared window for good.
+- `awaitResponse` is written on top of all this, so there is one
+  flow-control engine, not a buffered one and a streaming one that drift.
+
 ## Server API
 
 ```zig

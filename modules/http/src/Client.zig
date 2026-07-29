@@ -549,6 +549,26 @@ pub const H2Session = struct {
         return hs.session.awaitResponse(stream_id);
     }
 
+    /// Start a request whose body is fed **incrementally**: only the HEADERS
+    /// go out here, then `hs.session.sendData`/`closeSend` push the body over
+    /// time while `hs.session.awaitHead`/`readBody` consume the response as
+    /// it arrives — both directions live on the one stream. `:authority`
+    /// defaults to the connected host[:port], as for `request`.
+    ///
+    /// Only the opening needs a wrapper (for that default); the rest of the
+    /// incremental surface is called on `hs.session` directly — see
+    /// `h2_client`'s module doc for the whole shape.
+    pub fn openStream(
+        hs: *H2Session,
+        method: http.Method,
+        path: []const u8,
+        options: h2_client.StreamOptions,
+    ) h2_client.Error!u31 {
+        var opts = options;
+        if (opts.authority == null) opts.authority = hs.authority;
+        return hs.session.openStream(method, path, opts);
+    }
+
     /// Graceful GOAWAY (best effort), close the socket when this client
     /// owns it (`connectH2c`), free everything. Over a caller-provided
     /// stream (`connectH2Over`) the transport is left open — close it
@@ -1694,6 +1714,60 @@ test "h2c dogfood: large response streams past the initial window (flow control,
         @as(i64, h2.default_initial_window_size),
         hs.session.conn.conn_recv_window,
     );
+}
+
+test "h2c dogfood: the same body read INCREMENTALLY over a real socket (loopback)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const server = try h2LoopbackServer(io);
+    defer testing.allocator.destroy(server);
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, h2ServeWrap, .{server});
+    defer thread.join();
+    defer server.shutdown();
+    const port = server.boundAddress().getPort();
+
+    var client = Client.init(io, gpa, .{});
+    defer client.deinit();
+    const hs = client.connectH2c("127.0.0.1", port, .{}) catch |err| {
+        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer hs.close();
+
+    // The condition the socket-free tests structurally cannot reach: a real
+    // transport where one pump sees a partial frame, and a 200 KiB body that
+    // only fits through a 64 KiB window if the consumption-driven
+    // WINDOW_UPDATEs really leave the socket while the reader is mid-body.
+    // A 4 KiB sink means the server is genuinely throttled by our reading.
+    const sid = try hs.request(.get, "/huge", .{});
+    const head = try hs.session.awaitHead(sid);
+    try testing.expectEqual(@as(u16, 200), head.status);
+
+    var buf: [4096]u8 = undefined;
+    var total: usize = 0;
+    while (true) {
+        const n = try hs.session.readBody(sid, &buf);
+        if (n == 0) break;
+        // Verify against the generator as we go, rather than buffering the
+        // body — the point of reading it this way.
+        for (buf[0..n], total..) |b, off| {
+            try testing.expectEqual(@as(u8, 'A' + @as(u8, @intCast((off / 1024) % 26))), b);
+        }
+        total += n;
+    }
+    try testing.expectEqual(@as(usize, huge_blocks * 1024), total);
+    try testing.expect(hs.session.ended(sid));
+    try testing.expect(hs.session.trailers(sid) == null);
+    // Every consumed octet was granted back (§6.9 reconciliation).
+    try testing.expectEqual(
+        @as(i64, h2.default_initial_window_size),
+        hs.session.conn.conn_recv_window,
+    );
+    hs.session.release(sid);
 }
 
 // ── tests (BYO-TLS seam dogfood: in-memory duplex pipe, no TLS, no sockets) ──

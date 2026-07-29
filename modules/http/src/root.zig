@@ -69,7 +69,11 @@ pub const h2 = @import("h2.zig");
 /// HTTP/2 client engine (Phase 3.2): `h2_client.Session` drives
 /// `h2.Connection` in client role over any byte transport, multiplexing
 /// requests (demux by stream id) with §5.2/§6.9 flow control and typed
-/// GOAWAY/RST_STREAM handling. `Client.connectH2c` binds it to a TCP
+/// GOAWAY/RST_STREAM handling. Two surfaces over one engine: buffered
+/// (`request` + `awaitResponse`) and incremental (`openStream` +
+/// `sendData`/`closeSend` on one side, `awaitHead`/`readBody`/`trailers`
+/// on the other — both live at once on a stream, with receive-window
+/// credit returned as the caller CONSUMES). `Client.connectH2c` binds it to a TCP
 /// stream for cleartext h2c via prior knowledge (RFC 9113 §3.3);
 /// `Client.connectH2Over` binds it to a caller-provided (e.g. TLS)
 /// stream after ALPN selected `alpn_h2`.

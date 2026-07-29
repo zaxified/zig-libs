@@ -120,8 +120,10 @@ extra — the perf gap being traded away is small next to what a missed bounds c
 directly-exposed parser.
 
 ## Backlog / deferred
-**h2 upstream forwarding** reuses the multiplexing `h2_client.Session`, so it (a) buffers
-request/response bodies in memory (bounded) rather than streaming like the h1 path, (b) does not
+**h2 upstream forwarding** reuses the multiplexing `h2_client.Session` through its *buffered*
+surface, so it (a) buffers request/response bodies in memory (bounded) rather than streaming like
+the h1 path — no longer an engine limitation since `h2_client` grew `openStream`/`sendData`/
+`readBody`, just work not yet done in `h2_upstream`/`proxy` — (b) does not
 forward trailers, and (c) serializes response collection per upstream connection under a mutex —
 genuinely parallel in-flight streams across OS threads would need a dedicated per-connection reader
 task (a larger async redesign), deferred to avoid forking a second h2 stack. A shared *server*-side
