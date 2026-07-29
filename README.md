@@ -11,7 +11,7 @@ cross-project-reusable capability — a production-grade implementation of a pro
 or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
 authors' other projects depend on it, not the reverse.
 
-**Status:** 215 modules (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 216 modules (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ## Using a module
@@ -190,6 +190,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | Module | What it does | Platform | Deps |
 |---|---|---|---|
 | `kv` | Crash-consistent embedded KV store (Bitcask-style log + **randomized seeded VOPR**: model-checked crash recovery across fuzzed fault schedules) | any | — |
+| `tsdb` | Time-series persistence over `kvtree` — order-preserving `(series, timestamp)` key codec (fixed-width big-endian, sign-flipped timestamps so pre-epoch samples sort below the epoch; the byte-order == logical-order identity is asserted as a property over random pairs, not spot-checked), restart-stable series ids from an order-independent injective canonicalisation of (name, labels), streaming half-open `[from, to)` range scans, and retention-by-age as **bounded, resumable, idempotent** chunks (each chunk = one transaction that both deletes ≤ N points and advances the durable resume position; crash-swept in all four `SimStorage` modes). v1 deliberately omits sample compression, rollups, a query language and aggregation | any | kvtree |
 | `kvtree` | Ordered **transactional** KV store — copy-on-write B-tree (LMDB/BoltDB lineage): MVCC snapshot isolation, multi-key ACID txns, ordered range scans, VOPR-checked crash-safety. Crash-atomicity core (COW commit / crash-recovery meta-selection / reader-safe reclaim) implemented; property + crash-sweep tests run for real | any | kv |
 | `ramcache` | Bounded in-memory cache — **W-TinyLFU** admission/eviction (window+SLRU+CMS sketch) + TTL + generation invalidation, plus a sharded thread-safe wrapper | any | — |
 | `decimal` | Exact i128 fixed-point decimal (money math), float-free — with IEEE/GDA rounding modes, rescale + rounded division | any | — |

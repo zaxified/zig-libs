@@ -99,6 +99,7 @@ const module_list = [_]Module{
     .{ .name = "shardstore", .deps = &.{"kvtree"} },
     .{ .name = "writebehind", .deps = &.{ "ramcache", "workerpool", "jobqueue", "kvtree" } },
     .{ .name = "pagecache", .deps = &.{ "kvtree", "ramcache" } },
+    .{ .name = "tsdb", .deps = &.{"kvtree"} },
     .{ .name = "hashdigest" },
     .{ .name = "sealedbox" },
     .{ .name = "rsa", .deps = &.{"montint"}, .heavy = true },
