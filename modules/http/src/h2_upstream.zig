@@ -58,8 +58,9 @@
 //! forward path streams them. Flow control is still exercised end to end: a
 //! body larger than the 64 KiB initial window drives WINDOW_UPDATE on send
 //! (`sendBody` blocks for grants) and on receive (`awaitResponse` replenishes
-//! the window). Trailers are not surfaced by the h2 client (dropped, per its
-//! doc) — consistent with this module's read-only-trailer posture.
+//! the window). The h2 client now surfaces a response trailer section
+//! (`Response.trailers`), but this pool does not relay it to the proxied
+//! response — trailer forwarding through the reverse proxy is still open.
 //!
 //! ## Failure recovery
 //!

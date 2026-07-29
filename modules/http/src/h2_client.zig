@@ -109,6 +109,10 @@ pub const Response = struct {
     status: u16,
     headers: hpack.HeaderList,
     body: []u8,
+    /// The **trailer section** (RFC 9113 §8.1) — the fields of the HEADERS
+    /// frame that followed the DATA frames, or null when the response had
+    /// none. Field names are lowercase, as on the wire.
+    trailers: ?hpack.HeaderList = null,
 
     /// First value of a response header (case-insensitive), or null.
     pub fn header(res: *const Response, name: []const u8) ?[]const u8 {
@@ -118,8 +122,21 @@ pub const Response = struct {
         return null;
     }
 
+    /// First value of a response **trailer** field (case-insensitive), or
+    /// null. Kept separate from `header` on purpose: a trailer arrives
+    /// after the caller may already have acted on the head, so merging the
+    /// two namespaces would let a late field masquerade as an early one.
+    pub fn trailer(res: *const Response, name: []const u8) ?[]const u8 {
+        const hl = res.trailers orelse return null;
+        for (hl.fields) |f| {
+            if (std.ascii.eqlIgnoreCase(f.name, name)) return f.value;
+        }
+        return null;
+    }
+
     pub fn deinit(res: *Response, gpa: Allocator) void {
         res.headers.deinit(gpa);
+        if (res.trailers) |*hl| hl.deinit(gpa);
         gpa.free(res.body);
         res.* = undefined;
     }
@@ -129,6 +146,8 @@ pub const Response = struct {
 const Pending = struct {
     /// Final response header list (interim 1xx responses are skipped).
     headers: ?hpack.HeaderList = null,
+    /// Trailer section: a second HEADERS frame after the DATA frames.
+    trailers: ?hpack.HeaderList = null,
     body: std.ArrayList(u8) = .empty,
     /// END_STREAM seen — the response is complete.
     end: bool = false,
@@ -139,6 +158,7 @@ const Pending = struct {
 
     fn deinit(p: *Pending, gpa: Allocator) void {
         if (p.headers) |*hl| hl.deinit(gpa);
+        if (p.trailers) |*hl| hl.deinit(gpa);
         p.body.deinit(gpa);
     }
 };
@@ -282,7 +302,12 @@ pub const Session = struct {
         const headers = pending.headers orelse return error.MalformedResponse;
         const status = statusOf(headers) orelse return error.MalformedResponse;
         const body = try pending.body.toOwnedSlice(s.gpa);
-        return .{ .status = status, .headers = headers, .body = body };
+        return .{
+            .status = status,
+            .headers = headers,
+            .body = body,
+            .trailers = pending.trailers,
+        };
     }
 
     // ── internals ───────────────────────────────────────────────────────────
@@ -376,8 +401,15 @@ pub const Session = struct {
                         } else {
                             p.headers = hd.headers; // ownership moves
                         }
+                    } else if (p.trailers == null and !containsPseudoHeader(hd.headers)) {
+                        // The trailer section (§8.1). A trailer block that
+                        // carries pseudo-header fields is malformed by the
+                        // same section, and a `:status` arriving after the
+                        // real one is a response-override primitive — such
+                        // a block is dropped rather than surfaced.
+                        p.trailers = hd.headers; // ownership moves
                     } else {
-                        hd.headers.deinit(s.gpa); // trailers: no surface, dropped
+                        hd.headers.deinit(s.gpa); // malformed or a third block
                     }
                     if (hd.end_stream) p.end = true;
                 },
@@ -452,6 +484,18 @@ fn statusOf(list: hpack.HeaderList) ?u16 {
             return std.fmt.parseInt(u16, f.value, 10) catch null;
     }
     return null;
+}
+
+/// Whether a decoded field block contains any pseudo-header field. RFC 9113
+/// §8.1 forbids them in a trailer section — a `:status` (or `:path`) turning
+/// up after the response head is exactly the kind of late override an
+/// intermediary might act on, so such a block is refused wholesale rather
+/// than filtered field by field.
+fn containsPseudoHeader(list: hpack.HeaderList) bool {
+    for (list.fields) |f| {
+        if (f.name.len != 0 and f.name[0] == ':') return true;
+    }
+    return false;
 }
 
 /// Connection-specific headers that must not cross into h2 (RFC 9113 §8.2.2).
@@ -617,6 +661,87 @@ test "h2 client: multiplexing — interleaved DATA frames demux by stream id (of
     try testing.expectEqualStrings("AA-1 AA-2", res_a.body);
     try testing.expectEqual(@as(u16, 200), res_b.status);
     try testing.expectEqualStrings("BB-1 BB-2", res_b.body);
+}
+
+test "h2 client: response trailers are surfaced separately from the headers (offline)" {
+    const gpa = testing.allocator;
+    var in: Reader = .fixed("");
+    var out_buf: [8192]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var s: Session = try .init(gpa, &in, &out, .{});
+    defer s.deinit();
+
+    const sid = try s.request(.get, "/t", .{ .authority = "t" });
+    var srv: ScriptedServer = try .init(out.buffered());
+    defer srv.deinit();
+    try srv.conn.sendHeaders(&srv.wire, sid, &ok_fields, false);
+    try srv.conn.sendData(&srv.wire, sid, "hello", false); // no END_STREAM: trailers follow
+    try srv.conn.sendHeaders(&srv.wire, sid, &.{
+        .{ .name = "x-checksum", .value = "deadbeef" },
+        .{ .name = "x-rows", .value = "3" },
+    }, true);
+    in = .fixed(srv.wire.items);
+
+    var res = try s.awaitResponse(sid);
+    defer res.deinit(gpa);
+    try testing.expectEqual(@as(u16, 200), res.status);
+    try testing.expectEqualStrings("hello", res.body);
+    try testing.expectEqualStrings("deadbeef", res.trailer("X-Checksum").?); // case-insensitive
+    try testing.expectEqualStrings("3", res.trailer("x-rows").?);
+    // Two namespaces, deliberately: a field that only arrived in the trailer
+    // section must never answer a `header` lookup, or a late value could
+    // masquerade as one the caller already validated.
+    try testing.expectEqual(@as(?[]const u8, null), res.header("x-checksum"));
+    try testing.expectEqual(@as(?[]const u8, null), res.trailer("nope"));
+}
+
+test "h2 client: a response without trailers reports none (offline)" {
+    const gpa = testing.allocator;
+    var in: Reader = .fixed("");
+    var out_buf: [8192]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var s: Session = try .init(gpa, &in, &out, .{});
+    defer s.deinit();
+
+    const sid = try s.request(.get, "/t", .{ .authority = "t" });
+    var srv: ScriptedServer = try .init(out.buffered());
+    defer srv.deinit();
+    try srv.conn.sendHeaders(&srv.wire, sid, &ok_fields, false);
+    try srv.conn.sendData(&srv.wire, sid, "hello", true);
+    in = .fixed(srv.wire.items);
+
+    var res = try s.awaitResponse(sid);
+    defer res.deinit(gpa);
+    try testing.expect(res.trailers == null);
+    try testing.expectEqual(@as(?[]const u8, null), res.trailer("x-checksum"));
+}
+
+test "h2 client: a trailer block carrying pseudo-headers is dropped (§8.1)" {
+    const gpa = testing.allocator;
+    var in: Reader = .fixed("");
+    var out_buf: [8192]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var s: Session = try .init(gpa, &in, &out, .{});
+    defer s.deinit();
+
+    const sid = try s.request(.get, "/t", .{ .authority = "t" });
+    var srv: ScriptedServer = try .init(out.buffered());
+    defer srv.deinit();
+    try srv.conn.sendHeaders(&srv.wire, sid, &ok_fields, false);
+    try srv.conn.sendData(&srv.wire, sid, "hello", false);
+    // A second `:status` after the real one — the override this guard is for.
+    try srv.conn.sendHeaders(&srv.wire, sid, &.{
+        .{ .name = ":status", .value = "500" },
+        .{ .name = "x-checksum", .value = "deadbeef" },
+    }, true);
+    in = .fixed(srv.wire.items);
+
+    var res = try s.awaitResponse(sid);
+    defer res.deinit(gpa);
+    // The real status stands and the whole malformed block is gone.
+    try testing.expectEqual(@as(u16, 200), res.status);
+    try testing.expect(res.trailers == null);
+    try testing.expectEqualStrings("hello", res.body);
 }
 
 test "h2 client: server RST_STREAM fails that request; other streams continue (offline)" {

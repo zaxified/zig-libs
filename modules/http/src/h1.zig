@@ -612,8 +612,31 @@ pub const ChunkedWriter = struct {
     /// Flush pending data as a final chunk and write the 0-chunk terminator
     /// (no trailers). The underlying writer is not flushed.
     pub fn finish(c: *ChunkedWriter) Writer.Error!void {
+        return c.finishWithTrailers(&.{});
+    }
+
+    /// `finish` plus a **trailer section** (RFC 9112 §7.1.2). Wire order is
+    /// load-bearing and is the whole point of this function: the last-chunk
+    /// line `0\r\n` comes FIRST, then the trailer fields as ordinary
+    /// `name: value` CRLF lines, then the blank line that ends the message.
+    ///
+    ///     0⏎ X-Checksum: deadbeef⏎ X-Rows: 3⏎ ⏎
+    ///
+    /// Emitting the fields before the `0` line instead turns each of them
+    /// into a chunk-size line, which is a hard parse error on every
+    /// conformant client (curl fails the transfer with exit 56) — an
+    /// ordering mistake here is not a cosmetic one.
+    ///
+    /// Field names/values are written verbatim; the caller is responsible
+    /// for validating them (see `Server.ResponseWriter.setTrailer`, which
+    /// rejects both malformed and RFC 9110 §6.5.1-forbidden fields). With
+    /// an empty `trailers` the bytes are exactly `finish`'s `0\r\n\r\n`.
+    /// The underlying writer is not flushed.
+    pub fn finishWithTrailers(c: *ChunkedWriter, trailers: []const HeaderEntry) Writer.Error!void {
         try c.writer.flush();
-        try c.out.writeAll("0\r\n\r\n");
+        try c.out.writeAll("0\r\n");
+        for (trailers) |t| try c.out.print("{s}: {s}\r\n", .{ t.name, t.value });
+        try c.out.writeAll("\r\n");
     }
 };
 

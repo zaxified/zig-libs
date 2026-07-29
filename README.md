@@ -290,7 +290,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `linkheader` | Web Linking (RFC 8288) `Link` header build + parse (rel/title/type), `pagination` (first/prev/next/last), `find(rel)` — zero-alloc | any | — |
 | `cookies` | HTTP cookies (RFC 6265) — `Cookie` request parser (`parse`/`find`) **and** `Set-Cookie` builder (`SetCookie` w/ Path/Domain/Max-Age/Expires/**Secure/HttpOnly/SameSite**, injection-guarded, SameSite=None⇒Secure) + `get`/`set` http helpers | any | http |
 | `blobmsg` | OpenWRT ubus client + blob/blobmsg wire codec | **linux** (codec itself: any) | — |
-| `mcp` | Model Context Protocol server (JSON-RPC 2.0) — tools + resources + prompts, app-state ctx | any | — |
+| `mcp` | Model Context Protocol server (JSON-RPC 2.0) — tools + resources + prompts, app-state ctx; server→client **sampling** + **elicitation** requests (capability-gated, schema-restricted, credential-refusing) | any | — |
 | `mcp-http` | MCP **Streamable HTTP** transport (2025-06-18) — `POST /mcp` → JSON-RPC response (`application/json` **or live SSE** with tool-progress streaming) / 202, as a `router` middleware over a `mcp.Server`. Optional **sessions** (`Mcp-Session-Id` + `GET /mcp` server→client SSE stream with `Last-Event-ID` resumable replay + `DELETE` teardown); built-in **Origin** (DNS-rebinding) guard, size cap, Lock seam | any | router, http, mcp |
 | `uci` | OpenWRT UCI config parser + serializer + typed model (stable round-trip) | any | — |
 | `argsafe` | Allowlist validators + a typed argv builder — neutralizes argument/flag injection into an exec `argv` | any | — |

@@ -20,11 +20,25 @@ multiplexed h2 connection per backend origin, each proxied request a stream on i
 shared across both forward paths; the h2 path buffers bodies (bounded, `h2_max_body_bytes`) where h1
 streams, and per-connection response collection is mutex-serialized (multiplex is on the wire, full
 cross-thread parallelism needs a dedicated reader task — deferred). h2 flow control is exercised
-end-to-end (WINDOW_UPDATE past the initial window); h2 upstream trailers are not forwarded (h2 client
-does not surface them). **Client buffer pool (`bufpool.BufferPool`):** an optional bounded, shared,
+end-to-end (WINDOW_UPDATE past the initial window); h2 upstream trailers are not forwarded (the h2
+client surfaces them on `Response.trailers`, but the proxy layer does not relay them). **Client buffer pool (`bufpool.BufferPool`):** an optional bounded, shared,
 thread-safe slab pool wired via `Client.Options.buffer_pool`, backing h2 upstream dial buffers so a
 gateway that churns h2 connections reuses `O(peak)` slabs instead of allocating one per dial (h1's
-idle `Pool` already recycles whole warm connections, so it does not need it). Never-panic: malformed
+idle `Pool` already recycles whole warm connections, so it does not need it). **Trailers, both directions, both protocols:** the read side captures an incoming chunked trailer
+section (h1) or request trailer HEADERS frame (h2) behind one handler surface
+(`Request.trailer`/`iterateTrailers`/`trailers`); the write side is
+`ResponseWriter.declareTrailers` + `setTrailer`, emitted after the terminating chunk on h1 (RFC 9112
+§7.1.2) and as a trailing HEADERS frame carrying END_STREAM on h2 (RFC 9113 §8.1 — the final DATA
+frame then does *not* carry it). Declaring trailers commits the response to chunked framing, so
+`Trailer` and `Content-Length` can never coexist; every framing that cannot carry a trailer section
+(HTTP/1.0 peer, declared Content-Length, HEAD/1xx/204/304) is a typed error at set time, never a
+silent drop. **Trailer field policy is deny-list ∧ allow-list:** the RFC 9110 §6.5.1 forbidden set
+(framing/routing/request-modifier/auth/response-control/payload-processing fields, plus
+connection-specific ones, `Cookie`/`Set-Cookie` and any `:`-prefixed pseudo-header) is rejected
+unconditionally, *and* a field must have been advertised in `Trailer` first — arbitrary
+handler-chosen trailers are a request-smuggling and cache-poisoning vector because intermediaries
+treat trailers inconsistently. Incoming h2 trailer blocks containing pseudo-headers are dropped
+whole (§8.1 malformed; a late `:status`/`:path` is an override primitive). Never-panic: malformed
 requests are typed errors → 400/413/414/431/500; handler errors/panics become a clean 500.
 Foundational module: `router`, `dns` (DoH),
 `rdap`, `acme`, `mcp-http`, and the whole REST/API cluster sit on it. Original work of the zig-libs
@@ -47,15 +61,24 @@ Hardened for direct internet exposure (no reverse proxy required):
 - Response bodies of 304/204/1xx are suppressed (framing correctness).
 - **Out of scope:** TLS termination (bring-your-own via the seam — reverse proxy today, ianic/std
   server later), HTTP/3 (QUIC), auth (`aaa-gate`/`jwt`), rate limiting (`ratelimit`), path-traversal
-  normalization beyond what `router` does, and response-trailer *writing* (read side only —
-  deferred as disproportionately invasive).
+  normalization beyond what `router` does.
 
 ## Verification
 HPACK vs RFC 7541 Appendix C vectors (bytes + decoded fields + dynamic-table state per step); h2
 offline scripted client↔server pipe exchanges + h2spec-style negatives; h2 DoS attack-sim tests
 (rapid-reset proves no handler runs); serveStream goldens for conditional/range/multipart/content-
 neg; smuggling/timeout/size negatives; a BYO-TLS in-memory dogfood (connectH2Over ↔ serveStream).
-h2 upstreaming: loopback h1-proxy → h2c-backend end-to-end (forwarding headers + hop-by-hop strip +
+**Trailers are anchored against a live third party, not only against ourselves**
+(`src/curl_interop.zig`): a real `Server` on loopback answered by `curl` 8.18 / nghttp2 1.68 on both
+`--http1.1` and `--http2-prior-knowledge`, asserting curl's own header dump carries the trailer
+fields *after* the head — i.e. curl parsed a trailer section, rather than our bytes merely containing
+those strings. Self-interop cannot catch a shared misreading of the framing (the writer and reader
+agree on the same mistake); mutation testing confirms the difference — emitting the h1 trailer block
+before the last-chunk line fails curl outright (exit 56), and leaving END_STREAM on the last h2 DATA
+frame makes curl/nghttp2 *silently discard* the trailer frame and still exit 0, so on h2 the
+load-bearing assertion is the surfacing check rather than the exit code. Offline byte goldens pin the
+h1 wire layout and the h2 END_STREAM placement; the forbidden-field policy has its own rejection
+tests for both gates. h2 upstreaming: loopback h1-proxy → h2c-backend end-to-end (forwarding headers + hop-by-hop strip +
 large-body flow control + concurrent clients over one shared upstream connection + 502 on dead
 backend); pool-level multiplex (two streams in flight on one connection), sequential-reuse and
 buffer-pool reuse/bounded proofs. Run: `zig build test-http`.
@@ -97,8 +120,7 @@ extra — the perf gap being traded away is small next to what a missed bounds c
 directly-exposed parser.
 
 ## Backlog / deferred
-Response-trailer *writing* remains explicitly deferred (read side only) as disproportionately
-invasive. **h2 upstream forwarding** reuses the multiplexing `h2_client.Session`, so it (a) buffers
+**h2 upstream forwarding** reuses the multiplexing `h2_client.Session`, so it (a) buffers
 request/response bodies in memory (bounded) rather than streaming like the h1 path, (b) does not
 forward trailers, and (c) serializes response collection per upstream connection under a mutex —
 genuinely parallel in-flight streams across OS threads would need a dedicated per-connection reader

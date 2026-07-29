@@ -44,6 +44,52 @@ The collection grew 77 → 148 modules since v0.1.0. Highlights, by area:
 
 Per-module API changes since v0.1.0 worth calling out:
 
+- **`http`:** response **trailers** — the write side, which was previously
+  documented as out of scope. `ResponseWriter.declareTrailers` +
+  `setTrailer` emit a trailer section after the terminating chunk on
+  HTTP/1.1 (RFC 9112 §7.1.2) and as a trailing HEADERS frame carrying
+  END_STREAM on HTTP/2 (RFC 9113 §8.1 — the last DATA frame therefore does
+  not carry it), from the same handler code. Declaring trailers commits the
+  response to chunked framing, so `Trailer` and `Content-Length` can never
+  coexist, and every framing that cannot carry a trailer section (HTTP/1.0
+  peer, declared `Content-Length`, HEAD/1xx/204/304) is a typed error at set
+  time rather than silently dropped output. Field policy is **deny-list ∧
+  allow-list**: the RFC 9110 §6.5.1 forbidden set (framing, routing, request
+  modifiers, auth, response control data, payload processing, plus
+  connection-specific fields, `Cookie`/`Set-Cookie` and any `:`
+  pseudo-header) is refused unconditionally, *and* a field must have been
+  advertised in `Trailer` first — unconstrained trailers are a
+  request-smuggling and cache-poisoning vector because intermediaries handle
+  them inconsistently. The h2 **read** gaps closed with it: request trailers
+  now reach the handler through the same `Request.trailer` surface as h1, and
+  `h2_client.Response.trailers`/`.trailer(name)` surfaces response trailers
+  (a trailer block containing pseudo-headers is dropped whole, §8.1). Anchored
+  against **live curl 8.18 / nghttp2 1.68** on both protocols
+  (`src/curl_interop.zig`), not only against our own client.
+
+- **`mcp` / `mcp-http`:** server→client requests — `sampling/createMessage`
+  and `elicitation/create`. Both are gated on the capabilities the client
+  declares at `initialize`, which are now *stored* (`Server.client_capabilities`,
+  all-false before a handshake, replaced wholesale on re-`initialize`) rather
+  than parsed and discarded. Because `handleMessage` owns no reader and the HTTP
+  transport receives the client's answer on a *separate POST*, the API is
+  issue-now / correlate-later: `sendSamplingRequest`/`sendElicitationRequest`
+  allocate a never-reused id, write one request line and register it pending;
+  `handleMessage` correlates the inbound response and invokes the registered
+  `ResponseHandler` (a tool that needs the answer is therefore two calls). No
+  handler ever blocks and no async runtime was added. Elicitation schemas are
+  validated against the spec's restricted JSON-Schema subset, and form-mode
+  schemas with credential-shaped fields are **refused** (`SchemaSensitiveField`)
+  — the spec's "MUST NOT ask for secrets" enforced rather than documented, with
+  URL mode as the sanctioned alternative. Request lines are pinned byte-for-byte
+  against the specification's own JSON examples. **Fixes:** a client's JSON-RPC
+  *response* previously hit the "Missing method" branch and got a `-32600` reply
+  (JSON-RPC forbids answering a response); `negotiateVersion` echoed the
+  caller's slice, which lives on the per-message arena; and `mcp-http`'s
+  `application/json` body concatenated every line the server wrote instead of
+  just the response. `mcp-http` also scopes correlation per session, so one
+  session's answer cannot resolve another's request.
+
 - **`brotli`:** the encoder now actually compresses. It was store-mode only
   (ratio ~1.0); it now does LZ77 backward references plus a per-meta-block
   Huffman code for literals, insert-and-copy commands and distances, with the

@@ -29,7 +29,9 @@
 //! but completed requests are handled **sequentially** on the connection's
 //! task (no concurrent-stream scheduling yet). The handler writes an
 //! ordinary HTTP/1.1 response into memory through the stock
-//! `ResponseWriter`; that response is then re-framed as h2 HEADERS + DATA:
+//! `ResponseWriter`; that response is then re-framed as h2 HEADERS + DATA
+//! (+ a trailing HEADERS frame when the handler set response trailers —
+//! §8.1, which also moves END_STREAM off the last DATA frame):
 //! connection-specific headers are stripped (§8.2.2), names lowercased
 //! (§8.2.1), the peer's SETTINGS_MAX_FRAME_SIZE honored (`h2.Connection`
 //! splits DATA/CONTINUATION), and both flow-control windows respected —
@@ -204,9 +206,18 @@ pub fn serveStream(
 
 /// One request stream being assembled: HEADERS (+ CONTINUATION) decoded,
 /// DATA possibly still streaming in. Owns its header list and body copy.
+/// Capture budget for the staged response's trailer section on its way to
+/// an h2 trailer HEADERS frame. Generous next to `ResponseWriter`'s own
+/// limits (`max_response_trailers` fields, `trailer_decl_bytes` of names),
+/// so the writer's caps are what actually bound this, not the buffer.
+const trailer_capture_bytes = 4096;
+
 const Job = struct {
     id: u31,
     headers: hpack.HeaderList,
+    /// Request trailer section (§8.1): the fields of a second HEADERS frame
+    /// on this stream, surfaced to the handler as `Request.trailer`.
+    trailers: ?hpack.HeaderList = null,
     body: std.ArrayList(u8) = .empty,
     /// END_STREAM seen — ready for the handler.
     complete: bool = false,
@@ -215,6 +226,7 @@ const Job = struct {
 
     fn deinit(job: *Job, gpa: Allocator) void {
         job.headers.deinit(gpa);
+        if (job.trailers) |*hl| hl.deinit(gpa);
         job.body.deinit(gpa);
     }
 };
@@ -334,9 +346,19 @@ const Session = struct {
 
     fn onHeaders(s: *Session, hd: *@FieldType(h2.Event, "headers")) void {
         if (s.jobs.getPtr(hd.stream_id)) |job| {
-            // Trailers (§8.1): the handler API has no trailer surface, so
-            // the fields are dropped; END_STREAM completes the request.
-            hd.headers.deinit(s.gpa);
+            // A second HEADERS on a live stream is the request trailer
+            // section (§8.1); END_STREAM completes the request either way.
+            //
+            // A trailer block carrying pseudo-header fields is malformed by
+            // that same section — and `:method`/`:path`/`:authority`
+            // arriving *after* the handler-visible request was built is a
+            // routing-override primitive — so it is dropped rather than
+            // surfaced. (Dropping, not resetting: it stays byte-compatible
+            // with the previous behavior and cannot be used to kill a
+            // stream the handler is already working on.)
+            if (job.trailers == null and !containsPseudoHeader(hd.headers)) {
+                job.trailers = hd.headers; // ownership moves into the job
+            } else hd.headers.deinit(s.gpa);
             if (hd.end_stream) job.complete = true;
             return;
         }
@@ -526,6 +548,16 @@ const Session = struct {
             .{ .limited = .init(&body_inner, job.body.items.len, body_scratch) }
         else
             .{ .none = .fixed("") };
+        // Request trailers (§8.1) → the stock `Request.trailer` surface:
+        // the decoded fields are re-serialized as a raw CRLF block, which is
+        // the shape `Request` already reads on the h1 chunked path.
+        var trailer_block: ?[]const u8 = null;
+        if (job.trailers) |hl| {
+            var tb: Writer.Allocating = .init(arena);
+            for (hl.fields) |f|
+                tb.writer.print("{s}: {s}\r\n", .{ f.name, f.value }) catch return .close;
+            trailer_block = tb.written();
+        }
         var req: Server.Request = .{
             .method = method,
             .target = target,
@@ -533,6 +565,7 @@ const Session = struct {
             .query = query,
             .head = head,
             .body = &body,
+            .trailer_block = trailer_block,
             .context = s.opts.context,
             .peer = s.opts.peer,
             .conn_request_index = s.req_index,
@@ -574,14 +607,33 @@ const Session = struct {
         const res_block = h1.readHead(&rr, head_buf) catch return .close;
         const res = h1.ResponseHead.parse(res_block) catch return .close;
         var payload: Writer.Allocating = .init(arena);
+        var trailer_fields: std.ArrayList(hpack.Field) = .empty;
         if (res.chunked) {
             var scratch: [256]u8 = undefined;
-            var cr: h1.ChunkedReader = .init(&rr, &scratch);
+            // Capture the staged trailer section instead of discarding it:
+            // in h2 it becomes a second HEADERS frame (§8.1), so it has to
+            // survive the h1 chunked decode. The buffer is arena-owned, and
+            // the field slices point into it — both outlive the send below.
+            const tbuf = arena.alloc(u8, trailer_capture_bytes) catch return .close;
+            var cr: h1.ChunkedReader = .initCapturingTrailers(&rr, &scratch, tbuf);
             _ = cr.reader.streamRemaining(&payload.writer) catch return .close;
+            var tit = h1.blockIterator(cr.trailers());
+            while (tit.next()) |t| {
+                // §8.2.1: field names are lowercase on the wire. The names
+                // themselves were already vetted by `ResponseWriter`'s
+                // trailer filter (RFC 9110 §6.5.1 + the `Trailer` advert),
+                // which is also what keeps a pseudo-header out of this
+                // block — `:`-prefixed names never make it into the staged
+                // response at all.
+                const name = std.ascii.allocLowerString(arena, t.name) catch return .close;
+                trailer_fields.append(arena, .{ .name = name, .value = t.value }) catch
+                    return .close;
+            }
         } else {
             _ = rr.streamRemaining(&payload.writer) catch return .close;
         }
         const body_bytes = payload.written();
+        const has_trailers = trailer_fields.items.len != 0;
 
         var fields: std.ArrayList(hpack.Field) = .empty;
         const status_str = std.fmt.allocPrint(arena, "{d}", .{res.status}) catch return .close;
@@ -595,14 +647,29 @@ const Session = struct {
             fields.append(arena, .{ .name = name, .value = hd.value }) catch return .close;
         }
 
-        s.conn.sendHeaders(&s.wire, job.id, fields.items, body_bytes.len == 0) catch |err|
+        // §8.1: END_STREAM belongs on the LAST thing sent. With a trailer
+        // section that is the trailing HEADERS frame — never the response
+        // HEADERS, and never the final DATA frame. Getting this wrong loses
+        // the trailers *silently*: measured against curl 8.18/nghttp2 1.68,
+        // a peer that already saw END_STREAM discards the later HEADERS
+        // frame and still reports the transfer as successful, so nothing
+        // but an explicit "were the trailers surfaced?" check catches it.
+        s.conn.sendHeaders(&s.wire, job.id, fields.items, body_bytes.len == 0 and !has_trailers) catch |err|
             switch (err) {
                 error.OutOfMemory => return .close,
                 else => return .keep, // stream reset by the peer meanwhile
             };
         s.flushWire() catch return .close;
         if (body_bytes.len != 0) {
-            if (s.sendBody(job.id, body_bytes) == .close) return .close;
+            if (s.sendBody(job.id, body_bytes, !has_trailers) == .close) return .close;
+        }
+        if (has_trailers) {
+            s.conn.sendHeaders(&s.wire, job.id, trailer_fields.items, true) catch |err|
+                switch (err) {
+                    error.OutOfMemory => return .close,
+                    else => return .keep, // stream reset by the peer meanwhile
+                };
+            s.flushWire() catch return .close;
         }
         if (rw.connectionMustClose()) {
             // The handler asked for `Connection: close` — h2 has no such
@@ -618,7 +685,10 @@ const Session = struct {
     /// send what the connection + stream windows allow (the layer splits
     /// frames per the peer's SETTINGS_MAX_FRAME_SIZE), and when both are
     /// exhausted keep reading the connection until WINDOW_UPDATE opens room.
-    fn sendBody(s: *Session, id: u31, body: []const u8) Disposition {
+    ///
+    /// `end_stream` says whether the final DATA frame closes the stream —
+    /// false when a trailer HEADERS frame still has to follow (§8.1).
+    fn sendBody(s: *Session, id: u31, body: []const u8, end_stream: bool) Disposition {
         var off: usize = 0;
         while (off < body.len) {
             const st = s.conn.stream(id) orelse return .keep;
@@ -632,7 +702,7 @@ const Session = struct {
                 continue;
             }
             const n = @min(body.len - off, @as(usize, @intCast(win)));
-            const last = off + n == body.len;
+            const last = end_stream and off + n == body.len;
             s.conn.sendData(&s.wire, id, body[off..][0..n], last) catch |err| switch (err) {
                 error.OutOfMemory => return .close,
                 // Raced a SETTINGS window shrink applied by a pump above.
@@ -672,6 +742,15 @@ const Session = struct {
         return .keep;
     }
 };
+
+/// Whether a decoded field block contains any pseudo-header field — never
+/// legal in a trailer section (RFC 9113 §8.1).
+fn containsPseudoHeader(list: hpack.HeaderList) bool {
+    for (list.fields) |f| {
+        if (f.name.len != 0 and f.name[0] == ':') return true;
+    }
+    return false;
+}
 
 /// Connection-specific headers that must not cross the h1↔h2 boundary
 /// (RFC 9113 §8.2.2).
@@ -730,6 +809,35 @@ fn testHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
         }
         var buf: [32]u8 = undefined;
         try rw.writeAll(try std.fmt.bufPrint(&buf, "drained {d}", .{total}));
+    } else if (std.mem.eql(u8, req.path, "/outtrailers")) {
+        try rw.setHeader("Content-Type", "text/plain");
+        try rw.declareTrailers(&.{ "X-Checksum", "X-Rows" });
+        try rw.writeAll("hello");
+        try rw.setTrailer("X-Checksum", "deadbeef");
+        try rw.setTrailer("X-Rows", "3");
+    } else if (std.mem.eql(u8, req.path, "/outtrailers-empty")) {
+        // Trailers with no body at all: the response HEADERS must not carry
+        // END_STREAM either, and no DATA frame may be sent.
+        try rw.declareTrailer("X-Checksum");
+        try rw.setTrailer("X-Checksum", "deadbeef");
+    } else if (std.mem.eql(u8, req.path, "/reqtrailers")) {
+        // Drain the body first — a trailer section arrives after it on both
+        // protocols — then echo what came through.
+        const r = req.reader();
+        while (true) {
+            _ = r.discard(.limited(4096)) catch |err| switch (err) {
+                error.EndOfStream => break,
+                error.ReadFailed => return error.BodyReadFailed,
+            };
+        }
+        var buf: [128]u8 = undefined;
+        var w: Writer = .fixed(&buf);
+        try w.print("trailer={s}", .{req.trailer("X-Checksum") orelse "none"});
+        var it = req.iterateTrailers();
+        var n: usize = 0;
+        while (it.next()) |_| n += 1;
+        try w.print(" count={d}", .{n});
+        try rw.writeAll(w.buffered());
     } else if (std.mem.eql(u8, req.path, "/fail")) {
         try rw.writeAll("partial");
         return error.Boom;
@@ -742,10 +850,21 @@ fn testHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
 /// One response stream as seen by the test client.
 const Collected = struct {
     status: u16 = 0,
-    /// The response header list (moved out of the event; trailers dropped).
+    /// The response header list (moved out of the event).
     headers: ?hpack.HeaderList = null,
+    /// A SECOND HEADERS frame on the stream = the trailer section (§8.1).
+    trailers: ?hpack.HeaderList = null,
     body: std.ArrayList(u8) = .empty,
     data_frames: u32 = 0,
+    /// Whether the response HEADERS carried END_STREAM.
+    headers_end_stream: bool = false,
+    /// Whether ANY DATA frame carried END_STREAM. Must be false when a
+    /// trailer HEADERS frame follows — that is the h2 framing rule a
+    /// self-consistent implementation would otherwise never notice.
+    data_end_stream: bool = false,
+    trailers_end_stream: bool = false,
+    /// DATA frames seen before the trailer HEADERS arrived (ordering).
+    data_frames_before_trailers: u32 = 0,
     end: bool = false,
     rst: ?h2.ErrorCode = null,
 
@@ -757,8 +876,17 @@ const Collected = struct {
         return null;
     }
 
+    fn trailer(c: *const Collected, name: []const u8) ?[]const u8 {
+        const hl = c.trailers orelse return null;
+        for (hl.fields) |f| {
+            if (std.mem.eql(u8, f.name, name)) return f.value;
+        }
+        return null;
+    }
+
     fn deinit(c: *Collected, gpa: Allocator) void {
         if (c.headers) |*hl| hl.deinit(gpa);
+        if (c.trailers) |*hl| hl.deinit(gpa);
         c.body.deinit(gpa);
     }
 };
@@ -799,8 +927,13 @@ const TestPeer = struct {
                 if (!g.found_existing) g.value_ptr.* = .{};
                 if (g.value_ptr.headers == null) {
                     g.value_ptr.headers = hd.headers; // take ownership
+                    g.value_ptr.headers_end_stream = hd.end_stream;
                     if (g.value_ptr.header(":status")) |v|
                         g.value_ptr.status = std.fmt.parseInt(u16, v, 10) catch 0;
+                } else if (g.value_ptr.trailers == null) {
+                    g.value_ptr.trailers = hd.headers; // the trailer section
+                    g.value_ptr.trailers_end_stream = hd.end_stream;
+                    g.value_ptr.data_frames_before_trailers = g.value_ptr.data_frames;
                 } else hd.headers.deinit(p.gpa);
                 if (hd.end_stream) g.value_ptr.end = true;
             },
@@ -809,7 +942,10 @@ const TestPeer = struct {
                 if (!g.found_existing) g.value_ptr.* = .{};
                 try g.value_ptr.body.appendSlice(p.gpa, d.data);
                 g.value_ptr.data_frames += 1;
-                if (d.end_stream) g.value_ptr.end = true;
+                if (d.end_stream) {
+                    g.value_ptr.data_end_stream = true;
+                    g.value_ptr.end = true;
+                }
             },
             .stream_reset => |r| {
                 const g = try p.resps.getOrPut(p.gpa, r.stream_id);
@@ -1211,6 +1347,138 @@ test "h2c serve: legit request with CONTINUATIONs under the limit succeeds" {
     try testing.expectEqual(@as(u16, 200), peer.resp(sid).status);
     try testing.expectEqualStrings("hello", peer.resp(sid).body.items);
     try testing.expectEqual(@as(?h2.ErrorCode, null), peer.goaway);
+}
+
+// ── response trailers (RFC 9113 §8.1) ───────────────────────────────────────
+
+test "h2: response trailers are a HEADERS frame AFTER the DATA frames (§8.1)" {
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try peer.conn.startStream(&peer.wire, &fieldsFor("GET", "/outtrailers"), true);
+
+    var out_buf: [8192]u8 = undefined;
+    try runOffline(&peer, .{ .handler = testHandler }, &out_buf);
+
+    const c = peer.resp(sid);
+    try testing.expectEqual(@as(u16, 200), c.status);
+    try testing.expectEqualStrings("hello", c.body.items);
+    // The h1 chunked framing does NOT cross over: only the frame layer
+    // delimits an h2 body.
+    try testing.expectEqual(@as(?[]const u8, null), c.header("transfer-encoding"));
+    // The advert does cross over (lowercased, §8.2.1).
+    try testing.expectEqualStrings("X-Checksum, X-Rows", c.header("trailer").?);
+
+    // The three END_STREAM placements, which is the whole framing rule:
+    // not on the response HEADERS, not on the last DATA frame, only on the
+    // trailer HEADERS. Leave it on DATA and a real peer (nghttp2) drops the
+    // trailer frame without complaining — a failure mode that produces no
+    // error anywhere, which is exactly why it is asserted explicitly.
+    try testing.expect(!c.headers_end_stream);
+    try testing.expect(!c.data_end_stream);
+    try testing.expect(c.trailers_end_stream);
+
+    try testing.expect(c.trailers != null);
+    try testing.expect(c.data_frames_before_trailers > 0); // after the body, not before
+    try testing.expectEqualStrings("deadbeef", c.trailer("x-checksum").?);
+    try testing.expectEqualStrings("3", c.trailer("x-rows").?);
+    // Lowercase on the wire, so the mixed-case handler spelling is gone.
+    try testing.expectEqual(@as(?[]const u8, null), c.trailer("X-Checksum"));
+    try testing.expect(c.end);
+    try testing.expectEqual(@as(?h2.ErrorCode, null), peer.goaway);
+}
+
+test "h2: trailers on an empty body send no DATA frame at all" {
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try peer.conn.startStream(&peer.wire, &fieldsFor("GET", "/outtrailers-empty"), true);
+
+    var out_buf: [8192]u8 = undefined;
+    try runOffline(&peer, .{ .handler = testHandler }, &out_buf);
+
+    const c = peer.resp(sid);
+    try testing.expectEqual(@as(u16, 200), c.status);
+    try testing.expectEqual(@as(u32, 0), c.data_frames);
+    // Without trailers this response would have been a single HEADERS with
+    // END_STREAM; the trailer section moves the flag one frame later.
+    try testing.expect(!c.headers_end_stream);
+    try testing.expect(c.trailers_end_stream);
+    try testing.expectEqualStrings("deadbeef", c.trailer("x-checksum").?);
+    try testing.expect(c.end);
+    try testing.expectEqual(@as(?h2.ErrorCode, null), peer.goaway);
+}
+
+test "h2: a response without trailers is byte-framed exactly as before" {
+    // Regression guard for the END_STREAM plumbing: the no-trailer path must
+    // still put END_STREAM on the last DATA frame.
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try peer.conn.startStream(&peer.wire, &get_fields, true);
+
+    var out_buf: [8192]u8 = undefined;
+    try runOffline(&peer, .{ .handler = testHandler }, &out_buf);
+
+    const c = peer.resp(sid);
+    try testing.expectEqual(@as(u16, 200), c.status);
+    try testing.expect(c.trailers == null);
+    try testing.expect(c.data_end_stream);
+    try testing.expect(c.end);
+}
+
+test "h2: incoming request trailers reach the handler (§8.1 read side)" {
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/reqtrailers"), false);
+    try peer.conn.sendData(&peer.wire, sid, "Wikipedia", false);
+    // The trailer section: a second HEADERS frame carrying END_STREAM.
+    try peer.conn.sendHeaders(&peer.wire, sid, &.{
+        .{ .name = "x-checksum", .value = "deadbeef" },
+        .{ .name = "x-rows", .value = "2" },
+    }, true);
+
+    var out_buf: [8192]u8 = undefined;
+    try runOffline(&peer, .{ .handler = testHandler }, &out_buf);
+
+    const c = peer.resp(sid);
+    try testing.expectEqual(@as(u16, 200), c.status);
+    // Same `Request.trailer` surface the h1 chunked path uses, and the
+    // case-insensitive lookup hides h2's lowercase wire names.
+    try testing.expectEqualStrings("trailer=deadbeef count=2", c.body.items);
+    try testing.expectEqual(@as(?h2.ErrorCode, null), peer.goaway);
+}
+
+test "h2: a request trailer block with pseudo-headers is dropped, not surfaced" {
+    // §8.1 forbids pseudo-headers in a trailer section, and a late
+    // `:path`/`:method` would be a routing-override primitive — the whole
+    // block is refused rather than filtered field by field.
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/reqtrailers"), false);
+    try peer.conn.sendData(&peer.wire, sid, "Wikipedia", false);
+    try peer.conn.sendHeaders(&peer.wire, sid, &.{
+        .{ .name = "x-checksum", .value = "deadbeef" },
+        .{ .name = ":path", .value = "/admin" },
+    }, true);
+
+    var out_buf: [8192]u8 = undefined;
+    try runOffline(&peer, .{ .handler = testHandler }, &out_buf);
+
+    const c = peer.resp(sid);
+    try testing.expectEqual(@as(u16, 200), c.status);
+    // Nothing from that block reached the handler — not even the innocent
+    // field that shared it.
+    try testing.expectEqualStrings("trailer=none count=0", c.body.items);
+    // …and the stream still completed normally (END_STREAM was honored).
+    try testing.expect(c.end);
 }
 
 // ── loopback integration (Server.enable_h2c end to end) ─────────────────────

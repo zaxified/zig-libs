@@ -1169,6 +1169,13 @@ pub const Request = struct {
     /// returns this decoded (e.g. gunzipped) stream instead of `body`'s raw
     /// framing reader. The framing `body` remains the drain source.
     decoded: ?*Reader = null,
+    /// Trailer-source override: when set, `trailer`/`iterateTrailers`/
+    /// `trailers` read this raw CRLF field block instead of the chunked
+    /// body's captured one. The h2 path uses it — there is no chunked
+    /// framing there, the trailer section is a HEADERS frame, so the
+    /// decoded fields are re-serialized into a block and pointed at here.
+    /// That keeps ONE trailer surface for handlers across both protocols.
+    trailer_block: ?[]const u8 = null,
     /// `Options.context` passthrough for stateful handlers.
     context: ?*anyopaque,
     /// Socket peer address — see `peerAddress`.
@@ -1218,19 +1225,25 @@ pub const Request = struct {
     /// end-of-stream first. Empty for non-chunked bodies or when capture is
     /// off. `trailer` looks one up (case-insensitive); `iterateTrailers`
     /// walks them in wire order; `trailers` returns the raw block.
+    ///
+    /// On HTTP/2 the same three functions surface the request's trailer
+    /// HEADERS frame (RFC 9113 §8.1) via `trailer_block`, with the same
+    /// "drain the body first" rule — so a handler reads trailers one way on
+    /// both protocols. h2 field names are lowercase on the wire; the
+    /// lookups are case-insensitive, so that difference does not leak.
     pub fn trailer(req: *const Request, name: []const u8) ?[]const u8 {
-        return h1.blockHeader(req.body.trailerBlock(), name);
+        return h1.blockHeader(req.trailers(), name);
     }
 
     /// Iterate captured incoming chunked trailers in wire order (see
     /// `trailer`).
     pub fn iterateTrailers(req: *const Request) h1.HeaderIterator {
-        return h1.blockIterator(req.body.trailerBlock());
+        return h1.blockIterator(req.trailers());
     }
 
     /// The raw captured incoming chunked trailer block (see `trailer`).
     pub fn trailers(req: *const Request) []const u8 {
-        return req.body.trailerBlock();
+        return req.trailer_block orelse req.body.trailerBlock();
     }
 };
 
@@ -1417,6 +1430,15 @@ pub const GunzipBody = struct {
 
 const max_response_headers = 32;
 
+/// Response **trailer** fields a handler may declare and emit
+/// (`ResponseWriter.declareTrailers` / `setTrailer`). Small on purpose: a
+/// trailer section is for a handful of computed-at-the-end facts (checksum,
+/// row count, server timing), not a second header table.
+pub const max_response_trailers = 8;
+
+/// Stable storage for the generated `Trailer` header value ("A, B, C").
+const trailer_decl_bytes = 256;
+
 /// Response builder + body writer for one request. Buffers the body up to
 /// its buffer's capacity: a handler that finishes within it gets an exact
 /// automatic `Content-Length`; larger bodies switch to chunked streaming
@@ -1438,7 +1460,15 @@ const max_response_headers = 32;
 /// and `Vary: Accept-Encoding` is added to every response unless the
 /// handler's own `Vary` already covers it.
 ///
-/// Not movable once `writer` has been handed out.
+/// Response trailers (RFC 9112 §7.1.2 / RFC 9113 §8.1): `declareTrailers`
+/// before the head goes out, `setTrailer` any time before `end` — see those
+/// two functions for the rules and the security policy. Declaring trailers
+/// **commits the response to chunked framing**, so `Trailer` and
+/// `Content-Length` can never appear on the same response.
+///
+/// Not movable once `writer` has been handed out — nor once trailers are
+/// declared: the emitted `Trailer` header value points into
+/// `trailer_decl_buf`, i.e. into the writer itself.
 pub const ResponseWriter = struct {
     out: *Writer,
     chunk_buf: []u8,
@@ -1460,6 +1490,19 @@ pub const ResponseWriter = struct {
     headers_len: usize = 0,
     /// Explicit Content-Length set via `setHeader`.
     declared_len: ?u64 = null,
+    /// Trailer field names advertised in the `Trailer` header, as slices
+    /// into `trailer_decl_buf`. Non-empty ⇒ the response is committed to
+    /// chunked framing (a trailer section has nowhere else to live).
+    declared_trailers: [max_response_trailers][]const u8 = undefined,
+    declared_trailers_len: usize = 0,
+    /// Stable backing store for the `Trailer` header value; the header
+    /// table entry and every `declared_trailers` slice point into it.
+    trailer_decl_buf: [trailer_decl_bytes]u8 = undefined,
+    trailer_decl_len: usize = 0,
+    /// Trailer fields to emit after the body (`setTrailer`); like
+    /// `headers`, the name/value slices are stored WITHOUT copying.
+    trailers: [max_response_trailers]http.Header = undefined,
+    trailers_len: usize = 0,
     sent_head: bool = false,
     ended: bool = false,
     failed: bool = false,
@@ -1561,14 +1604,71 @@ pub const ResponseWriter = struct {
         if (rw.sent_head) return error.HeadersSent;
         if (!validHeaderName(name) or !validHeaderValue(value)) return error.InvalidHeader;
         if (std.ascii.eqlIgnoreCase(name, "content-length")) {
+            // Content-Length and a trailer section are mutually exclusive:
+            // trailers exist only in chunked framing (RFC 9112 §7.1.2), so
+            // a response that already advertised `Trailer` cannot take one.
+            // Rejecting here closes the other half of the ordering — the
+            // Content-Length-first order is caught by `declareTrailer`.
+            if (rw.declared_trailers_len != 0) return error.InvalidHeader;
             rw.declared_len = std.fmt.parseInt(u64, value, 10) catch return error.InvalidHeader;
             return;
         }
         if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) return; // managed
+        if (std.ascii.eqlIgnoreCase(name, "trailer")) {
+            // One mutation path for the advert: a hand-written `Trailer`
+            // header is parsed as the RFC 9110 §6.6.2 field-name list and
+            // pushed through `declareTrailer`, so the advertised set and
+            // the set `setTrailer` will accept can never disagree — and a
+            // forbidden name cannot be smuggled in by writing the header
+            // directly instead of calling `declareTrailers`. The precise
+            // reasons (`ForbiddenTrailer`, `TrailersUnsupported`, …) are
+            // flattened into this function's narrower error set; call
+            // `declareTrailers` to see them.
+            //
+            // All-or-nothing: `Trailer: X-Ok, Content-Length` must declare
+            // NOTHING, not quietly keep `X-Ok`. A partially applied advert
+            // would put field names on the wire the handler never asked
+            // for, and would widen the `setTrailer` allow-list as a side
+            // effect of a call that reported failure.
+            const saved_names = rw.declared_trailers_len;
+            const saved_bytes = rw.trailer_decl_len;
+            const saved_headers = rw.headers_len;
+            var it = std.mem.splitScalar(u8, value, ',');
+            while (it.next()) |raw| {
+                const tok = std.mem.trim(u8, raw, " \t");
+                if (tok.len == 0) continue;
+                rw.declareTrailer(tok) catch |err| {
+                    rw.declared_trailers_len = saved_names;
+                    rw.trailer_decl_len = saved_bytes;
+                    if (saved_names == 0) {
+                        // The advert entry was appended by the first
+                        // `declareTrailer` above and nothing else has
+                        // touched the table since — drop it again.
+                        rw.headers_len = saved_headers;
+                    } else {
+                        rw.putHeader("Trailer", rw.trailer_decl_buf[0..saved_bytes]) catch {};
+                    }
+                    return switch (err) {
+                        error.HeadersSent => error.HeadersSent,
+                        error.TooManyTrailers => error.TooManyHeaders,
+                        else => error.InvalidHeader,
+                    };
+                };
+            }
+            return;
+        }
         if (std.ascii.eqlIgnoreCase(name, "connection")) {
             if (h1.tokenListContains(value, "close")) rw.close_connection = true;
             return;
         }
+        return rw.putHeader(name, value);
+    }
+
+    /// Raw header-table insert (replace by name, else append) — the single
+    /// place the table grows, bypassing the managed-header interception in
+    /// `setHeader` (which is how `declareTrailer` maintains its `Trailer`
+    /// entry without recursing).
+    fn putHeader(rw: *ResponseWriter, name: []const u8, value: []const u8) error{TooManyHeaders}!void {
         for (rw.headers[0..rw.headers_len]) |*hd| {
             if (std.ascii.eqlIgnoreCase(hd.name, name)) {
                 hd.* = .{ .name = name, .value = value };
@@ -1599,6 +1699,161 @@ pub const ResponseWriter = struct {
         // `writeHead` like any other header.
         rw.headers[rw.headers_len] = .{ .name = "Set-Cookie", .value = value };
         rw.headers_len += 1;
+    }
+
+    pub const TrailerError = error{
+        /// The head is already on the wire, so the `Trailer` advert can no
+        /// longer be added (`declareTrailers` only).
+        HeadersSent,
+        /// Not a valid field name (RFC 9110 token), or the value carries
+        /// CR/LF/NUL.
+        InvalidHeader,
+        /// The field is never legal in a trailer section — see
+        /// `forbiddenTrailerName` for the list and the reasoning.
+        ForbiddenTrailer,
+        /// `setTrailer` for a name that no `Trailer` header advertised.
+        TrailerNotDeclared,
+        /// This response cannot carry a trailer section at all — see
+        /// `trailersSupported`.
+        TrailersUnsupported,
+        /// More than `max_response_trailers` fields, or the advertised
+        /// names outgrew `trailer_decl_bytes`.
+        TooManyTrailers,
+    };
+
+    /// Whether a trailer section is possible on this response at all.
+    /// False when the peer is HTTP/1.0 (no chunked transfer coding exists
+    /// there, so there is no place to put trailers — and an HTTP/1.0
+    /// response has no h2 equivalent either), when the response carries no
+    /// body (HEAD / 1xx / 204 / 304 — no body means no trailer section),
+    /// or when the handler declared a `Content-Length` (identity framing
+    /// ends at the last body byte).
+    ///
+    /// Handlers that must serve HTTP/1.0 clients too should branch on this
+    /// instead of eating `error.TrailersUnsupported`.
+    pub fn trailersSupported(rw: *const ResponseWriter) bool {
+        return !rw.http1_0 and !rw.noBody() and rw.declared_len == null;
+    }
+
+    /// Advertise the trailer fields this response will end with (the
+    /// `Trailer` header, RFC 9110 §6.6.2) — repeatable and idempotent;
+    /// each accepted name is appended to the emitted header value.
+    ///
+    /// Two things happen here, and both matter:
+    ///
+    ///  1. **It is the allow-list.** `setTrailer` refuses any name that was
+    ///     not declared first (`error.TrailerNotDeclared`). See the policy
+    ///     note on `setTrailer`.
+    ///  2. **It commits the response to chunked framing.** Once anything is
+    ///     declared, `setHeader("Content-Length", …)` is refused and `end`
+    ///     emits a chunked body even for a payload that fit the buffer,
+    ///     because a `Content-Length` response has nowhere to put a trailer
+    ///     section. So `Trailer` and `Content-Length` can never both reach
+    ///     the wire.
+    ///
+    /// Must be called before the head goes out (the advert rides in the
+    /// head): before the first `flush`, and before the body outgrows the
+    /// response buffer.
+    ///
+    /// The names are **copied** into the writer (unlike `setHeader`
+    /// values), so a computed name does not need caller-stable memory.
+    pub fn declareTrailers(rw: *ResponseWriter, names: []const []const u8) TrailerError!void {
+        for (names) |n| try rw.declareTrailer(n);
+    }
+
+    /// `declareTrailers` for a single name.
+    pub fn declareTrailer(rw: *ResponseWriter, name: []const u8) TrailerError!void {
+        if (rw.sent_head) return error.HeadersSent;
+        // Deny-list before the token check: a `:status` pseudo-header must
+        // report as forbidden, not merely as a malformed name, so the
+        // predicate keeps its meaning independent of the name validator.
+        if (forbiddenTrailerName(name)) return error.ForbiddenTrailer;
+        if (!validHeaderName(name)) return error.InvalidHeader;
+        if (!rw.trailersSupported()) return error.TrailersUnsupported;
+        if (rw.declaredTrailer(name)) return; // idempotent
+        if (rw.declared_trailers_len == max_response_trailers) return error.TooManyTrailers;
+        const sep: usize = if (rw.trailer_decl_len == 0) 0 else 2;
+        if (rw.trailer_decl_len + sep + name.len > rw.trailer_decl_buf.len)
+            return error.TooManyTrailers;
+        if (sep != 0) {
+            @memcpy(rw.trailer_decl_buf[rw.trailer_decl_len..][0..2], ", ");
+            rw.trailer_decl_len += sep;
+        }
+        const at = rw.trailer_decl_len;
+        @memcpy(rw.trailer_decl_buf[at..][0..name.len], name);
+        rw.trailer_decl_len += name.len;
+        rw.declared_trailers[rw.declared_trailers_len] = rw.trailer_decl_buf[at..][0..name.len];
+        rw.declared_trailers_len += 1;
+        // Re-register the advert every time: the value slice just grew, so
+        // the header table's entry has to be replaced, not appended to.
+        rw.putHeader("Trailer", rw.trailer_decl_buf[0..rw.trailer_decl_len]) catch
+            return error.TooManyTrailers;
+    }
+
+    /// Whether `name` was advertised in the `Trailer` header.
+    pub fn declaredTrailer(rw: *const ResponseWriter, name: []const u8) bool {
+        for (rw.declared_trailers[0..rw.declared_trailers_len]) |d|
+            if (std.ascii.eqlIgnoreCase(d, name)) return true;
+        return false;
+    }
+
+    /// Set a trailer field, replacing an existing one of the same name.
+    /// Legal **after** the head and body have gone out — that is the whole
+    /// point of a trailer: a value only known once the body is finished
+    /// (payload checksum, row count, generation time). Emitted by `end`
+    /// after the terminating chunk (h1) or as a final HEADERS frame (h2).
+    ///
+    /// Name and value slices are stored WITHOUT copying, exactly like
+    /// `setHeader` — they must stay valid until `end`.
+    ///
+    /// ## Which fields are allowed, and why both gates exist
+    ///
+    /// A trailer is the single most inconsistently-handled part of an HTTP
+    /// message: some intermediaries merge trailers into the header set,
+    /// some forward them, some drop them, and caches disagree about what a
+    /// trailer may modify. That makes a handler-controlled trailer a
+    /// request-smuggling and cache-poisoning primitive unless it is
+    /// constrained, so this implementation applies **both** available
+    /// constraints rather than choosing between them:
+    ///
+    ///  * **Deny-list** (`forbiddenTrailerName`) — the RFC 9110 §6.5.1 set
+    ///    of fields that must never appear in a trailer section: message
+    ///    framing, routing, request modifiers, authentication, response
+    ///    control data, payload-processing fields, plus h2/h3
+    ///    pseudo-headers. Checked FIRST and unconditionally, so it holds
+    ///    even for a name that somehow got advertised.
+    ///  * **Allow-list** — the field must appear in the response's
+    ///    `Trailer` header (`declareTrailers`). Recipients are only
+    ///    entitled to act on trailers they were told to expect, and
+    ///    forcing the advert means the sender decided the field set up
+    ///    front, in the head, rather than at the end of a body whose
+    ///    content may be attacker-influenced.
+    ///
+    /// Neither is sufficient alone. A deny-list alone cannot be exhaustive
+    /// — it does not know about fields defined after this code was written,
+    /// nor about the application's own routing/auth headers — and it leaves
+    /// recipients with no advert. An allow-list alone puts the whole policy
+    /// in handler code, so one `declareTrailers(&.{userSuppliedName})` or
+    /// one careless `Content-Length` re-export reopens the vector. The
+    /// intersection is what is safe to put on the wire.
+    pub fn setTrailer(rw: *ResponseWriter, name: []const u8, value: []const u8) TrailerError!void {
+        // Deny-list first: a forbidden field must report as forbidden even
+        // if it somehow reached the advert, so this check never depends on
+        // the declaration bookkeeping being correct — nor on the name
+        // validator (`:status` is caught here, not as a bad token).
+        if (forbiddenTrailerName(name)) return error.ForbiddenTrailer;
+        if (!validHeaderName(name) or !validHeaderValue(value)) return error.InvalidHeader;
+        if (!rw.declaredTrailer(name)) return error.TrailerNotDeclared;
+        if (!rw.trailersSupported()) return error.TrailersUnsupported;
+        for (rw.trailers[0..rw.trailers_len]) |*t| {
+            if (std.ascii.eqlIgnoreCase(t.name, name)) {
+                t.* = .{ .name = name, .value = value };
+                return;
+            }
+        }
+        if (rw.trailers_len == max_response_trailers) return error.TooManyTrailers;
+        rw.trailers[rw.trailers_len] = .{ .name = name, .value = value };
+        rw.trailers_len += 1;
     }
 
     /// The response-body writer. First use beyond the buffer capacity (or a
@@ -1651,6 +1906,18 @@ pub const ResponseWriter = struct {
     pub fn end(rw: *ResponseWriter) Writer.Error!void {
         if (rw.ended) return;
         rw.ended = true;
+        // Trailers with no trailer section to put them in. `declareTrailer`
+        // and `setTrailer` reject every framing that cannot carry one, so
+        // the only way to get here is to declare trailers and *then* make
+        // the response bodiless — `setStatus(204)` / `setStatus(304)`,
+        // which returns void and so cannot report it. Fail the response:
+        // silently dropping declared trailer fields is exactly the
+        // "the client never learns the checksum" bug this API exists to
+        // prevent, and `Trailer:` is already in the head by now.
+        if (rw.declared_trailers_len != 0 and !rw.trailersSupported()) {
+            rw.failed = true;
+            return error.WriteFailed;
+        }
         if (rw.body == .buffering and rw.shouldCompress(rw.interface.buffered().len)) {
             // Fully buffered body, eligible: compress it through the
             // streaming pipeline (single encoding path — see beginGzip).
@@ -1678,6 +1945,15 @@ pub const ResponseWriter = struct {
                     else
                         .none;
                     try rw.writeHead(framing);
+                } else if (rw.declared_trailers_len != 0) {
+                    // Declared trailers commit the response to chunked
+                    // framing even though the whole body fit the buffer and
+                    // an exact Content-Length was available: a
+                    // Content-Length response has no trailer section.
+                    try rw.writeHead(.chunked);
+                    rw.body = .{ .chunked = .init(rw.out, rw.chunk_buf) };
+                    try rw.body.chunked.writer.writeAll(body_bytes);
+                    try rw.finishChunked(&rw.body.chunked);
                 } else {
                     const n = rw.declared_len orelse body_bytes.len;
                     if (n != body_bytes.len) {
@@ -1690,7 +1966,7 @@ pub const ResponseWriter = struct {
             },
             .chunked => {
                 try rw.interface.flush();
-                try rw.body.chunked.finish();
+                try rw.finishChunked(&rw.body.chunked);
             },
             .identity => {
                 try rw.interface.flush();
@@ -1714,11 +1990,27 @@ pub const ResponseWriter = struct {
         rw.status = 200;
         rw.headers_len = 0;
         rw.declared_len = null;
+        rw.declared_trailers_len = 0;
+        rw.trailer_decl_len = 0;
+        rw.trailers_len = 0;
         rw.ended = false;
         rw.failed = false;
         rw.content_encoding_gzip = false;
         rw.body = .buffering;
         rw.interface.end = 0;
+    }
+
+    /// Terminate a chunked body, appending the trailer section when the
+    /// handler set one. Every chunked-termination path goes through here so
+    /// there is exactly one place that knows trailers come after the
+    /// 0-chunk — the plain streaming body, the buffered-body-forced-chunked
+    /// body, and the gzip pipeline.
+    fn finishChunked(rw: *ResponseWriter, cw: *h1.ChunkedWriter) Writer.Error!void {
+        if (rw.trailers_len == 0) return cw.finish();
+        var fields: [max_response_trailers]h1.HeaderEntry = undefined;
+        for (rw.trailers[0..rw.trailers_len], 0..) |t, i|
+            fields[i] = .{ .name = t.name, .value = t.value };
+        return cw.finishWithTrailers(fields[0..rw.trailers_len]);
     }
 
     fn noBody(rw: *const ResponseWriter) bool {
@@ -1790,7 +2082,7 @@ pub const ResponseWriter = struct {
             }
         }
         try g.compress.finish();
-        try g.chunked.finish();
+        try rw.finishChunked(&g.chunked);
     }
 
     const Framing = union(enum) { none, content_length: u64, chunked };
@@ -1938,6 +2230,89 @@ fn validHeaderName(name: []const u8) bool {
 fn validHeaderValue(value: []const u8) bool {
     for (value) |c| if (c == '\r' or c == '\n' or c == 0) return false;
     return true;
+}
+
+/// Fields that must never appear in a **trailer section** (RFC 9110 §6.5.1,
+/// which keeps RFC 7230 §4.1.2's list). The reason a deny-list is needed at
+/// all: intermediaries handle trailers inconsistently — some merge them into
+/// the header set, some forward them, some drop them — so a field that
+/// changes how a message is framed, routed, cached or authorized is a
+/// request-smuggling / cache-poisoning primitive when it arrives *after* the
+/// recipient has already acted on the head.
+///
+/// The RFC's categories, in order:
+///   * message framing — a `Content-Length`/`Transfer-Encoding` that
+///     contradicts the head is the classic desync;
+///   * routing — `Host` after the request was already routed;
+///   * request modifiers (controls and conditionals) — `Cache-Control` &
+///     friends arriving too late to be honored consistently;
+///   * authentication — credentials/challenges a proxy may or may not see;
+///   * response control data — `Date`/`Location`/`Vary`/`Expires`… , the
+///     fields a cache keys and validates on;
+///   * payload processing — `Content-Type`/`Content-Encoding`/
+///     `Content-Range`, plus `Trailer` itself (no recursion).
+///
+/// Beyond the RFC list this also rejects connection-specific fields (RFC
+/// 9112 §9.1 / RFC 9113 §8.2.2 — they must not cross the h1↔h2 boundary at
+/// all), `Cookie`/`Set-Cookie` (state-management fields whose late arrival
+/// browsers and proxies treat differently), and anything starting with `:`
+/// — an h2/h3 pseudo-header in a trailer block is malformed per RFC 9113
+/// §8.1 and would be a direct `:status`/`:path` override primitive. The
+/// pseudo-header test is kept even though `validHeaderName` already rejects
+/// `:` (not a tchar): this predicate must stand on its own if the name
+/// validator is ever relaxed.
+///
+/// Case-insensitive. Deliberately over-broad — a handler that needs one of
+/// these has a design problem, not a missing feature.
+pub fn forbiddenTrailerName(name: []const u8) bool {
+    if (name.len == 0) return true;
+    if (name[0] == ':') return true; // h2/h3 pseudo-header
+    const forbidden = [_][]const u8{
+        // message framing
+        "content-length",
+        "transfer-encoding",
+        // routing
+        "host",
+        // request modifiers: controls and conditionals
+        "cache-control",
+        "expect",
+        "max-forwards",
+        "pragma",
+        "range",
+        "te",
+        "if-match",
+        "if-none-match",
+        "if-modified-since",
+        "if-unmodified-since",
+        "if-range",
+        // authentication / state management
+        "authorization",
+        "proxy-authorization",
+        "www-authenticate",
+        "proxy-authenticate",
+        "cookie",
+        "set-cookie",
+        // response control data
+        "age",
+        "date",
+        "expires",
+        "location",
+        "retry-after",
+        "vary",
+        "warning",
+        // payload processing (incl. the advert itself)
+        "content-encoding",
+        "content-type",
+        "content-range",
+        "trailer",
+        // connection-specific
+        "connection",
+        "keep-alive",
+        "proxy-connection",
+        "upgrade",
+    };
+    for (forbidden) |f| if (std.ascii.eqlIgnoreCase(name, f)) return true;
+    return false;
 }
 
 /// Canonical reason phrase for common status codes; "" when unknown (the
@@ -2128,6 +2503,24 @@ fn testHandler(req: *Request, rw: *ResponseWriter) anyerror!void {
         const cs = req.trailer("X-Checksum") orelse "none";
         var buf: [96]u8 = undefined;
         try rw.writeAll(try std.fmt.bufPrint(&buf, "trailer={s}", .{cs}));
+    } else if (std.mem.eql(u8, req.path, "/outtrailers")) {
+        // Response trailers on a body that FITS the response buffer: the
+        // declaration alone must force chunked framing (an exact
+        // Content-Length was available and must not be used).
+        try rw.setHeader("Content-Type", "text/plain");
+        try rw.declareTrailers(&.{ "X-Checksum", "X-Rows" });
+        try rw.writeAll("hello");
+        try rw.setTrailer("X-Checksum", "deadbeef");
+        try rw.setTrailer("X-Rows", "3");
+    } else if (std.mem.eql(u8, req.path, "/outtrailers-stream")) {
+        // Same, on a body that outgrows the buffer (already chunked) and is
+        // flushed mid-handler, i.e. the head is long gone when the trailer
+        // value is computed — the case trailers exist for.
+        try rw.setHeader("Content-Type", "text/plain");
+        try rw.declareTrailer("X-Checksum");
+        try rw.writeAll(big_body);
+        try rw.flush();
+        try rw.setTrailer("X-Checksum", "deadbeef");
     } else if (std.mem.eql(u8, req.path, "/stream")) {
         // Incremental streaming: each write+flush becomes its own chunk on the
         // wire (proves flush() reaches the socket mid-handler — the SSE path).
@@ -2908,6 +3301,234 @@ test "serveStream: a body with no trailers reports none (Task 3)" {
     // Content-Length body: no trailer concept at all → none.
     const cl = runStream(null, "POST /trailers HTTP/1.1\r\nHost: t\r\nContent-Length: 3\r\n\r\nabc", &out_buf);
     try testing.expect(std.mem.endsWith(u8, cl, "trailer=none"));
+}
+
+// ── tests (offline — response trailer WRITE side) ───────────────────────────
+
+test "serveStream: response trailers land AFTER the terminating chunk (RFC 9112 §7.1.2)" {
+    var out_buf: [4096]u8 = undefined;
+    const got = runStream(null, "GET /outtrailers HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out_buf);
+    // Byte golden. Two things it pins that nothing else would:
+    //   * `Trailer: X-Checksum, X-Rows` is in the HEAD (RFC 9110 §6.6.2) —
+    //     drop the advert and this string vanishes;
+    //   * the fields come after `0\r\n`, not before it — swap the order and
+    //     the two lines move above the last-chunk line.
+    // The body ("hello", 5 bytes) fits the 64-byte response buffer, so the
+    // chunked framing here is purely the trailer commitment at work.
+    try testing.expectEqualStrings("HTTP/1.1 200 OK\r\n" ++
+        "Content-Type: text/plain\r\n" ++
+        "Trailer: X-Checksum, X-Rows\r\n" ++
+        "Date: " ++ test_date ++ "\r\n" ++
+        "Server: test\r\n" ++
+        "Connection: close\r\n" ++
+        "Transfer-Encoding: chunked\r\n" ++
+        "\r\n" ++
+        "5\r\nhello\r\n" ++
+        "0\r\n" ++
+        "X-Checksum: deadbeef\r\n" ++
+        "X-Rows: 3\r\n" ++
+        "\r\n", got);
+    // No Content-Length anywhere: declaring trailers commits to chunked.
+    try testing.expect(std.mem.indexOf(u8, got, "Content-Length") == null);
+}
+
+test "serveStream: trailers on a streamed body arrive after the last chunk" {
+    var out_buf: [4096]u8 = undefined;
+    const got = runStream(null, "GET /outtrailers-stream HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out_buf);
+    try testing.expect(std.mem.indexOf(u8, got, "Trailer: X-Checksum\r\n") != null);
+    try testing.expect(std.mem.endsWith(u8, got, "0\r\nX-Checksum: deadbeef\r\n\r\n"));
+    // The body really did stream (multiple chunks), so the head was on the
+    // wire well before `setTrailer` ran.
+    try testing.expect(std.mem.count(u8, got, "\r\n") > 8);
+}
+
+test "ResponseWriter: our own chunked reader recovers the written trailers" {
+    // Writer ↔ reader round trip. On its own this proves little — a shared
+    // misreading of the framing survives it, which is why the live-curl
+    // tests in curl_interop.zig exist — but it does pin that the emitted
+    // block is parseable as a trailer section at all.
+    var out_buf: [4096]u8 = undefined;
+    const got = runStream(null, "GET /outtrailers HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out_buf);
+    var rr: Reader = .fixed(got);
+    var head_buf: [1024]u8 = undefined;
+    const res = try h1.ResponseHead.parse(try h1.readHead(&rr, &head_buf));
+    try testing.expect(res.chunked);
+    try testing.expectEqualStrings("X-Checksum, X-Rows", res.header("trailer").?);
+    var scratch: [256]u8 = undefined;
+    var tbuf: [256]u8 = undefined;
+    var cr: h1.ChunkedReader = .initCapturingTrailers(&rr, &scratch, &tbuf);
+    var body: [64]u8 = undefined;
+    var bw: Writer = .fixed(&body);
+    _ = try cr.reader.streamRemaining(&bw);
+    try testing.expectEqualStrings("hello", bw.buffered());
+    try testing.expectEqualStrings("deadbeef", cr.trailer("x-checksum").?);
+    try testing.expectEqualStrings("3", cr.trailer("X-Rows").?);
+}
+
+/// A `ResponseWriter` over `out_buf` with the usual small test buffers.
+fn trailerWriter(out: *Writer, body_buf: []u8, chunk_buf: []u8, opts: ResponseWriter.InitOptions) ResponseWriter {
+    return .init(out, body_buf, chunk_buf, opts);
+}
+
+test "ResponseWriter: forbidden trailer fields are rejected, both ways in" {
+    var out_buf: [512]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    var rw = trailerWriter(&out, &body_buf, &chunk_buf, .{});
+
+    // RFC 9110 §6.5.1, one per category — the fields that make a trailer a
+    // smuggling / cache-poisoning primitive.
+    const forbidden = [_][]const u8{
+        "Content-Length",   "Transfer-Encoding", "Host",
+        "Cache-Control",    "TE",                "Authorization",
+        "WWW-Authenticate", "Set-Cookie",        "Date",
+        "Location",         "Vary",              "Expires",
+        "Content-Type",     "Content-Encoding",  "Content-Range",
+        "Trailer",          "Connection",        "Upgrade",
+        "Keep-Alive",       "If-None-Match",     "Range",
+    };
+    for (forbidden) |name| {
+        // Gate 1: the advert refuses them…
+        try testing.expectError(error.ForbiddenTrailer, rw.declareTrailer(name));
+        // …and gate 2 refuses them independently of the advert, so the
+        // deny-list never relies on the declaration bookkeeping.
+        try testing.expectError(error.ForbiddenTrailer, rw.setTrailer(name, "x"));
+    }
+    // h2/h3 pseudo-headers: a `:status` trailer would be a direct response
+    // override. Rejected as forbidden even before the token check.
+    try testing.expectError(error.ForbiddenTrailer, rw.declareTrailer(":status"));
+    try testing.expectError(error.ForbiddenTrailer, rw.setTrailer(":status", "500"));
+    // Case-insensitive: the deny-list is not a spelling test.
+    try testing.expectError(error.ForbiddenTrailer, rw.declareTrailer("cOnTeNt-LeNgTh"));
+    // …and neither is writing the advert by hand instead of declaring it —
+    // setHeader routes `Trailer` through the same gate (flattened error).
+    try testing.expectError(error.InvalidHeader, rw.setHeader("Trailer", "X-Ok, Content-Length"));
+    // …all-or-nothing: the good name in that list was NOT kept, so a
+    // rejected advert cannot widen the allow-list as a side effect.
+    try testing.expect(!rw.declaredTrailer("X-Ok"));
+    try testing.expectError(error.TrailerNotDeclared, rw.setTrailer("X-Ok", "1"));
+
+    // Nothing above stuck: a legitimate trailer still works, and the wire
+    // carries no trace of the rejected names.
+    try rw.declareTrailer("X-Checksum");
+    try rw.writeAll("hi");
+    try rw.setTrailer("X-Checksum", "deadbeef");
+    try rw.end();
+    const wire = out.buffered();
+    try testing.expectEqualStrings("HTTP/1.1 200 OK\r\n" ++
+        "Trailer: X-Checksum\r\n" ++
+        "Transfer-Encoding: chunked\r\n" ++
+        "\r\n2\r\nhi\r\n0\r\nX-Checksum: deadbeef\r\n\r\n", wire);
+}
+
+test "ResponseWriter: an undeclared trailer is refused (the Trailer advert is the allow-list)" {
+    var out_buf: [512]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    var rw = trailerWriter(&out, &body_buf, &chunk_buf, .{});
+    try testing.expectError(error.TrailerNotDeclared, rw.setTrailer("X-Checksum", "deadbeef"));
+    // Declaring by hand-writing the header works too, and enables it.
+    try rw.setHeader("Trailer", "X-Checksum ,  X-Rows");
+    try testing.expect(rw.declaredTrailer("x-checksum"));
+    try testing.expect(rw.declaredTrailer("X-ROWS"));
+    try rw.setTrailer("X-Checksum", "deadbeef");
+    // Still refused for a sibling name that was never advertised.
+    try testing.expectError(error.TrailerNotDeclared, rw.setTrailer("X-Other", "1"));
+    // Malformed names/values never get that far.
+    try testing.expectError(error.InvalidHeader, rw.setTrailer("Bad Name", "x"));
+    try testing.expectError(error.InvalidHeader, rw.setTrailer("X-Checksum", "a\r\nX-Evil: 1"));
+    try rw.end();
+    const wire = out.buffered();
+    try testing.expect(std.mem.indexOf(u8, wire, "X-Evil") == null);
+    try testing.expect(std.mem.indexOf(u8, wire, "X-Other") == null);
+    try testing.expectEqualStrings("HTTP/1.1 200 OK\r\n" ++
+        "Trailer: X-Checksum, X-Rows\r\n" ++
+        "Transfer-Encoding: chunked\r\n" ++
+        "\r\n0\r\nX-Checksum: deadbeef\r\n\r\n", wire);
+}
+
+test "ResponseWriter: trailers are refused on framings that cannot carry them" {
+    var out_buf: [512]u8 = undefined;
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+
+    { // Declared Content-Length → identity framing, no trailer section.
+        var out: Writer = .fixed(&out_buf);
+        var rw = trailerWriter(&out, &body_buf, &chunk_buf, .{});
+        try rw.setHeader("Content-Length", "2");
+        try testing.expect(!rw.trailersSupported());
+        try testing.expectError(error.TrailersUnsupported, rw.declareTrailer("X-Checksum"));
+    }
+    { // …and the other order: Content-Length after the advert is refused,
+        // so `Trailer` + `Content-Length` can never both reach the wire.
+        var out: Writer = .fixed(&out_buf);
+        var rw = trailerWriter(&out, &body_buf, &chunk_buf, .{});
+        try rw.declareTrailer("X-Checksum");
+        try testing.expectError(error.InvalidHeader, rw.setHeader("Content-Length", "2"));
+    }
+    { // HTTP/1.0 peer: no chunked transfer coding exists there.
+        var out: Writer = .fixed(&out_buf);
+        var rw = trailerWriter(&out, &body_buf, &chunk_buf, .{ .http1_0 = true });
+        try testing.expect(!rw.trailersSupported());
+        try testing.expectError(error.TrailersUnsupported, rw.declareTrailer("X-Checksum"));
+    }
+    { // HEAD / 204 / 304: no body ⇒ no trailer section.
+        var out: Writer = .fixed(&out_buf);
+        var rw = trailerWriter(&out, &body_buf, &chunk_buf, .{ .head_request = true });
+        try testing.expectError(error.TrailersUnsupported, rw.declareTrailer("X-Checksum"));
+        var out2: Writer = .fixed(&out_buf);
+        var rw2 = trailerWriter(&out2, &body_buf, &chunk_buf, .{});
+        rw2.setStatus(204);
+        try testing.expectError(error.TrailersUnsupported, rw2.declareTrailer("X-Checksum"));
+    }
+    { // The one case the setters cannot catch: declare first, THEN make the
+        // response bodiless. `setStatus` returns void, so `end` must fail
+        // the response instead of quietly dropping the advertised fields.
+        var out: Writer = .fixed(&out_buf);
+        var rw = trailerWriter(&out, &body_buf, &chunk_buf, .{});
+        try rw.declareTrailer("X-Checksum");
+        try rw.setTrailer("X-Checksum", "deadbeef");
+        rw.setStatus(204);
+        try testing.expectError(error.WriteFailed, rw.end());
+        try testing.expect(rw.connectionMustClose());
+    }
+}
+
+test "ResponseWriter: trailer capacity is bounded" {
+    var out_buf: [1024]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    var rw = trailerWriter(&out, &body_buf, &chunk_buf, .{});
+    const names = [_][]const u8{ "X-A", "X-B", "X-C", "X-D", "X-E", "X-F", "X-G", "X-H" };
+    try rw.declareTrailers(&names); // exactly max_response_trailers
+    try testing.expectError(error.TooManyTrailers, rw.declareTrailer("X-I"));
+    // Re-declaring an existing name is idempotent, not a capacity charge.
+    try rw.declareTrailer("x-a");
+    try testing.expectEqualStrings("X-A, X-B, X-C, X-D, X-E, X-F, X-G, X-H", rw.headers[0].value);
+    // A name list longer than `trailer_decl_bytes` is refused too.
+    var out2: Writer = .fixed(&out_buf);
+    var rw2 = trailerWriter(&out2, &body_buf, &chunk_buf, .{});
+    const long = "X-" ++ ("a" ** 200);
+    try rw2.declareTrailer(long);
+    try testing.expectError(error.TooManyTrailers, rw2.declareTrailer(long ++ "b"));
+}
+
+test "ResponseWriter: a gzip-compressed body still carries its trailers" {
+    // The compressed pipeline terminates its own chunked stream; the
+    // trailer section has to survive that path too, not just the plain one.
+    var out_buf: [4096]u8 = undefined;
+    const got = runStreamWith(
+        .{ .compression = .{ .min_size = 1 } },
+        null,
+        "GET /outtrailers HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n",
+        &out_buf,
+    );
+    try testing.expect(std.mem.indexOf(u8, got, "Content-Encoding: gzip\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "Trailer: X-Checksum, X-Rows\r\n") != null);
+    try testing.expect(std.mem.endsWith(u8, got, "0\r\nX-Checksum: deadbeef\r\nX-Rows: 3\r\n\r\n"));
 }
 
 // ── tests (offline — Task 1: inbound gzip request-body decoding) ────────────

@@ -112,6 +112,40 @@ try server.serve();                   // accept loop; or server.listen() = bind+
 // server.activeConnections() = admitted, not-yet-closed connections.
 ```
 
+### Response trailers
+
+Fields whose value is only known once the body is finished (payload
+checksum, row count, generation time) — RFC 9112 §7.1.2 on HTTP/1.1, RFC
+9113 §8.1 on HTTP/2, from the same handler code:
+
+```zig
+try rw.declareTrailers(&.{ "X-Checksum", "X-Rows" }); // before the head goes out
+try rw.writeAll(body);                                 // stream as usual
+try rw.setTrailer("X-Checksum", checksum_hex);         // after it
+try rw.setTrailer("X-Rows", rows_str);
+```
+
+- **Declaring commits the response to chunked framing** — an exact
+  `Content-Length` is deliberately not used, and `setHeader("Content-Length",
+  …)` afterwards is refused. h2 re-frames that as a trailing HEADERS frame
+  with END_STREAM (so the last DATA frame does not carry it).
+- **`setTrailer` is a two-gate filter.** The name must not be in the RFC 9110
+  §6.5.1 forbidden set (`error.ForbiddenTrailer`: framing, routing, request
+  modifiers, auth, response control data, payload-processing fields, plus
+  connection-specific ones, `Cookie`/`Set-Cookie` and any `:` pseudo-header),
+  **and** it must have been advertised (`error.TrailerNotDeclared`).
+  Arbitrary handler-chosen trailers are a request-smuggling / cache-poisoning
+  vector — intermediaries treat trailers inconsistently.
+- **Nothing is dropped silently.** A response that cannot carry a trailer
+  section — HTTP/1.0 peer, declared `Content-Length`, HEAD/1xx/204/304 —
+  fails with `error.TrailersUnsupported` at set time (check
+  `rw.trailersSupported()` first if you must serve HTTP/1.0 too), or fails
+  `end()` in the one case only `setStatus` could have caused.
+- Reading them is symmetric: `req.trailer("X-Checksum")` /
+  `req.iterateTrailers()` work on both protocols, valid once the request body
+  has been drained to end-of-stream. On the client, `h2_client`'s
+  `Response.trailer(name)` / `Response.trailers`.
+
 The codec works **without a socket**: `h1.RequestHead.parse` +
 `Server.RequestBody` decode requests from any `std.Io.Reader`,
 `Server.ResponseWriter` emits to any `std.Io.Writer`, and
