@@ -60,6 +60,59 @@ Per-module API changes since v0.1.0 worth calling out:
   and that error's meaning narrows to "key material was named but none of it
   could be reduced to a comparable key". Same-form matching, and every
   non-HoK path, are unchanged. New sibling dependency: `x509`.
+- **`megolm`:** new module — Matrix's Megolm group ratchet, the third
+  real-world group-messaging construction here alongside `signal` (pairwise
+  Double Ratchet) and `mls` (RFC 9420). A one-way four-part HMAC-SHA-256 hash
+  ratchet that fast-forwards to any future index but never rewinds, plus
+  Ed25519 signatures over the message frame; `OutboundSession` /
+  `InboundGroupSession` and the exact session-sharing, session-export and
+  message wire formats. The cipher is not a choice: the spec mandates
+  AES-256-CBC/PKCS#7 + HMAC-SHA-256 truncated to 8 bytes, taken from the
+  sibling `aescbc`. `decrypt` separates four failure causes into distinct
+  typed errors (`InvalidSignature`, `MessageIndexTooOld`, `InvalidMac`,
+  `InvalidPadding`) and verifies signature → MAC → padding in that order, so
+  the padding check is unreachable without a valid MAC. Byte-exact against
+  libolm's own `test_megolm.cpp` ratchet vectors — including the 2^24/2^16/2^8
+  boundary crossings and the 32-bit counter wraparound — and a real
+  libolm-produced session-key + message pair from `test_group_session.cpp`,
+  independently re-derived end to end with a separate Python toolchain
+  (PyNaCl + `cryptography` + stdlib `hmac`) as a non-libolm cross-check. The
+  ratchet advance is a cascade, not a per-part rehash: crossing a boundary
+  rehashes the crossed part and everything to its right **from the same
+  pre-update value** — implementing it as an independent per-part rehash
+  still round-trips, and is caught only by a boundary-crossing vector. Olm,
+  the Matrix event-JSON layer and key backup are out of scope.
+- **`poseidon`:** new module — the Poseidon ZK-friendly hash over `bn254`
+  (circomlib's parameters, `t = 2..17`) and `bls12_381` (the authors'
+  `poseidonperm_x5_255_{3,5}`). `groth16` and `bulletproofs` had no hash that
+  is cheap *inside* a circuit, which left the ZK domain half-covered: SHA-256
+  costs tens of thousands of constraints where Poseidon costs a few hundred.
+  Field arithmetic is reused unchanged from the sibling curve modules.
+  Round constants and MDS matrices are **derived** by a port of the authors'
+  Grain-LFSR generator rather than embedded (~700 KB of hex avoided), and
+  pinned by SHA-256 digests over the upstream constant files so a generator
+  drift is distinguishable from a permutation bug. Anchored byte-exactly
+  against the authors' own `hadeshash` `test_vectors.txt` (all four GF(p)
+  instances, every output word), circomlibjs's published known answers, and a
+  full `t = 2..17` sweep produced by *executing* circomlibjs's reference and
+  optimized implementations and requiring them to agree.
+  Two deployment realities are followed over the paper and documented:
+  circomlib rounds `R_P` up to a multiple of `t`, and it ships Poseidon twice
+  (a folded/optimized form storing the MDS transposed, and the reference
+  form) — this implements the reference form, byte-compatible with both.
+  **Boundaries stated rather than glossed:** the generator's MDS
+  security checks (`algorithm_1/2/3`) are not re-implemented, which is sound
+  only because every shipped parameter set accepts its first candidate — a
+  fact proven by matching all 18 upstream tables, not assumed — so this code
+  **cannot be pointed at a new `(n, t, R_F, R_P)` and trusted** without
+  running the sage script alongside. The permutation is constant-time
+  (fixed bounds, no data-dependent branch or index) but not
+  disassembly-verified, unlike `k256`/`montint`; parameter derivation is not
+  constant-time and consumes only public inputs. On BLS12-381 only the
+  permutation is anchored — the `hash`/`compress` framing has no deployed
+  counterpart on that field and differs from `neptune`/dusk/arkworks, which
+  is flagged at the call site. Variable-length sponge, Poseidon2 and
+  Rescue/Rescue-Prime are out of scope; Rescue is named as the follow-up.
 - **`mls`:** external Commits (RFC 9420 §12.4.3.2) — joining a group **without
   an invitation**. Until now the only way in was a Welcome, which requires an
   existing member to have added you; an external Commit lets a newcomer join

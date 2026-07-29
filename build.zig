@@ -225,6 +225,7 @@ const module_list = [_]Module{
     .{ .name = "vdf", .deps = &.{"montint"} },
     .{ .name = "signal" },
     .{ .name = "mls", .deps = &.{"hpke"} },
+    .{ .name = "megolm", .deps = &.{"aescbc"} },
     .{ .name = "ebpf", .deps = &.{"netlink"} },
     .{ .name = "xdp-classifier", .deps = &.{"ebpf"} },
     .{ .name = "ecvrf" },
@@ -232,6 +233,11 @@ const module_list = [_]Module{
     .{ .name = "pir", .deps = &.{"fss"} },
     .{ .name = "bfv" },
     .{ .name = "groth16", .deps = &.{"bn254"} },
+    // Not heavy: the parameter derivation + all 30 tests run in 5s under
+    // -Dstrict-debug, well under the >15s threshold (and a Debug compile of
+    // this module is ~1s against ~27s at ReleaseSafe, so marking it heavy
+    // would cost more than it saves).
+    .{ .name = "poseidon", .deps = &.{ "bn254", "bls12_381" } },
     .{ .name = "tfhe", .heavy = true },
     .{ .name = "montint", .heavy = true },
     .{ .name = "chachapoly" },

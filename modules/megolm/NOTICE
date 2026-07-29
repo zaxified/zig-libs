@@ -1,0 +1,111 @@
+megolm — provenance note
+=========================
+
+Kept as a module-local NOTICE (same placement as the sibling `signal`/
+`mls`/`bip340`/`adaptor`/`bolt8` modules — self-contained protocol/crypto
+modules not folded into the root `NOTICE`).
+
+Provenance
+----------
+
+megolm — clean-room implementation of Matrix's Megolm group ratchet,
+specified in a single public document published by the Matrix.org
+Foundation:
+
+  - Megolm: "Megolm group ratchet", https://gitlab.matrix.org/matrix-org/olm/-/blob/master/docs/megolm.md
+    (Apache License 2.0, per the spec document's own "License" section)
+
+A public specification's text is not copyrightable expression (merger
+doctrine, CONVENTIONS.md §5) — implementing it, however closely, is not
+"derived from" any third party's code.
+
+**Design references (not ported, but read and relied on)**: the Megolm
+spec's own "advance the ratchet" description is a piecewise per-part
+recurrence, not directly an algorithm for fast-forwarding to an arbitrary
+index without visiting every intermediate one — settling the exact
+cascade mechanics (which HMAC argument is the key vs. the message; how
+"advance to an arbitrary target" decomposes into per-byte-position
+rehash counts; the 32-bit-counter wraparound edge case) required reading
+two reference implementations as design references, per CONVENTIONS.md
+§5's "design reference" category:
+
+  - **libolm** (C, Apache License 2.0) — `src/megolm.c`/`include/olm/
+    megolm.h` (the `megolm_advance`/`megolm_advance_to`/`rehash_part`
+    functions) and `tests/test_megolm.cpp`/`tests/test_message.cpp`/
+    `tests/test_group_session.cpp` (numeric test vectors — see "Test
+    vectors" below). Fetched from
+    https://gitlab.matrix.org/matrix-org/olm (the canonical upstream).
+  - **vodozemac** (Rust, Apache License 2.0) — `src/megolm/ratchet.rs`,
+    `src/megolm/message.rs`, `src/megolm/session_keys.rs`,
+    `src/cipher/mod.rs` (confirms the same cascade algorithm, the
+    HKDF/AES-CBC/HMAC cipher instantiation, and the wire-format byte
+    layouts independently of libolm's C). Fetched from
+    https://github.com/matrix-org/vodozemac (the current Matrix.org
+    reference implementation, successor to libolm).
+
+This module's `ratchet.zig`/`cipher.zig`/`message.zig`/`session_key.zig`/
+`session.zig` are a from-scratch Zig implementation of the algorithm and
+formats those two implementations were read to confirm — no libolm C or
+vodozemac Rust source was copied, ported, or transliterated line-by-line
+into this module. `std.crypto.kdf.hkdf.HkdfSha256`/`std.crypto.auth.
+hmac.sha2.HmacSha256`/`std.crypto.sign.Ed25519`/`std.base64` (all MIT,
+part of Zig itself) and the sibling `aescbc` module (this repository's
+own, MIT) supply every cryptographic primitive; no new hash, HMAC, HKDF,
+signature, or AES-CBC implementation is written here.
+
+No GPL/LGPL/AGPL source was consulted or copied anywhere in this module.
+
+Test vectors
+------------
+
+`src/kat_test.zig` embeds NUMERIC FACTS (ratchet byte states at specific
+indices, and a real session-key + message byte pair) from libolm's own
+test suite — not copyrightable expression, per the same merger-doctrine
+reasoning as the spec text itself, and consistent with how `signal`'s
+NOTICE treats libsignal's published test vector. Specifically:
+
+  - `tests/test_megolm.cpp`'s `Megolm::advance`/`Megolm::advance
+    wraparound`/`Megolm::advance overflow by one`/`Megolm::advance
+    overflow` test cases — the `random_bytes` seed and `expected1`/
+    `expected2`/`expected3` byte arrays, extracted programmatically (see
+    `kat_test.zig`'s module doc comment for the exact reproduction
+    command) rather than hand-transcribed.
+  - `tests/test_message.cpp`'s "Group message encode test" — the
+    `_olm_encode_group_message` header bytes for `(version=3,
+    counter=200, ciphertext_len=10)`.
+  - `tests/test_group_session.cpp`'s "Inbound group session export/
+    import" and "Invalid signature group message" test cases — two real,
+    complete `session_key`/`message` base64 byte pairs, plus the exact
+    single-byte tamper the latter test applies (the message's final byte,
+    part of its Ed25519 signature, set to ASCII `'E'`).
+
+All of the above were fetched with `curl` from
+`gitlab.matrix.org/matrix-org/olm` (see `kat_test.zig` for the exact
+URLs) and extracted with small Python regex scripts over the raw `.cpp`
+source text, not read and retyped by hand — a first by-eye transcription
+of the 128-byte ASCII ratchet seed (`"0123456789ABCDEF"` repeated 8
+times) misread it as containing `"...ABDEF..."` (a missing `C`); the
+programmatic extraction caught this before it reached a test, and is the
+version actually embedded in `kat_test.zig`.
+
+**Independent re-derivation**: the two full session-key + message vectors
+above were additionally decoded, signature-verified, key-derived, and
+decrypted with a THIRD, unrelated toolchain — Python's `cryptography`
+library (AES-256-CBC, HKDF-SHA256), the Python standard library's
+`hmac`/`hashlib` (HMAC-SHA256), and PyNaCl 1.5 (Ed25519) — sharing no
+code with libolm, vodozemac, or this module's Zig implementation, before
+being trusted and embedded as test vectors.
+
+Status of this pass
+--------------------
+
+**Complete** for the scope stated in README.md: `ratchet.zig`'s hash
+ratchet (`advanceStep`/`advanceToUnchecked`/guarded `advanceTo`),
+`cipher.zig`'s HKDF+AES-256-CBC+HMAC-SHA256 layer, `message.zig`'s wire
+message codec, `session_key.zig`'s session-sharing/session-export
+formats, and `session.zig`'s `OutboundSession`/`InboundGroupSession` are
+implemented and tested — green in Debug, byte-exact against libolm's own
+test vectors where they exist (see SPEC.md's anchoring-grade table for
+exactly which areas that covers and which are self-consistency only).
+Olm (the pairwise partner protocol), the Matrix event-JSON layer, and key
+backup are out of scope — see README.md.
