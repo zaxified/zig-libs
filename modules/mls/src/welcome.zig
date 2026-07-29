@@ -323,13 +323,13 @@ pub const GroupInfo = struct {
         @memcpy(&sig_bytes, self.signature);
 
         if (self.raw) |raw| {
-            return crypto.VerifyWithLabel(S, signature_key, label_group_info_tbs, raw.tbs, S.Sig.Signature.fromBytes(sig_bytes));
+            return crypto.VerifyWithLabelAlloc(S, allocator, signature_key, label_group_info_tbs, raw.tbs, S.Sig.Signature.fromBytes(sig_bytes));
         }
         const buf = try allocator.alloc(u8, self.tbsEncodedLen());
         defer allocator.free(buf);
         var w = codec.Writer.init(buf);
         try self.tbsEncode(&w);
-        return crypto.VerifyWithLabel(S, signature_key, label_group_info_tbs, w.finish(), S.Sig.Signature.fromBytes(sig_bytes));
+        return crypto.VerifyWithLabelAlloc(S, allocator, signature_key, label_group_info_tbs, w.finish(), S.Sig.Signature.fromBytes(sig_bytes));
     }
 
     /// The signing counterpart of `verifySignature`: produces the
@@ -347,7 +347,7 @@ pub const GroupInfo = struct {
         defer allocator.free(buf);
         var w = codec.Writer.init(buf);
         try self.tbsEncode(&w);
-        return crypto.SignWithLabel(S, key_pair, label_group_info_tbs, w.finish());
+        return crypto.SignWithLabelAlloc(S, allocator, key_pair, label_group_info_tbs, w.finish());
     }
 
     /// The `extension_data` of the first extension of `extension_type`, or
@@ -662,7 +662,17 @@ pub fn encryptGroupSecrets(
 ) !treekem.HPKECiphertext {
     const ct = try allocator.alloc(u8, group_secrets.len + S.Aead.tag_length);
     errdefer allocator.free(ct);
-    const enc = try crypto.EncryptWithLabel(S, init_key, io, label_welcome, encrypted_group_info, group_secrets, ct);
+    // The `EncryptContext` here embeds the WHOLE `encrypted_group_info`,
+    // which grows with the group (it carries the ratchet tree), so it does
+    // not fit `crypto.EncryptWithLabel`'s fixed stack scratch for any group
+    // of realistic size — see `crypto.encryptContextLen`. An exactly-sized
+    // heap scratch also makes `error.LabelTooLong` unreachable below, which
+    // matters: `decryptGroupSecrets` used to map it to
+    // `error.DecryptionFailed` and so reported a buffer-size bug as a
+    // wrong-key one.
+    const scratch = try allocator.alloc(u8, try crypto.encryptContextLen(label_welcome, encrypted_group_info));
+    defer allocator.free(scratch);
+    const enc = try crypto.EncryptWithLabelScratch(S, init_key, io, label_welcome, encrypted_group_info, group_secrets, ct, scratch);
 
     const kem_output = try allocator.alloc(u8, enc.len);
     errdefer allocator.free(kem_output);
@@ -688,7 +698,13 @@ pub fn decryptGroupSecrets(
 
     const pt = try allocator.alloc(u8, ct.ciphertext.len - tag_len);
     errdefer allocator.free(pt);
-    crypto.DecryptWithLabel(S, enc, init_key_pair, label_welcome, encrypted_group_info, ct.ciphertext, pt) catch
+    // Exactly-sized scratch — see `encryptGroupSecrets` for why the fixed
+    // buffer is not enough here, and why sizing it exactly is what keeps
+    // the `catch` below honest (it can now only mean a real AEAD/decap
+    // failure).
+    const scratch = try allocator.alloc(u8, try crypto.encryptContextLen(label_welcome, encrypted_group_info));
+    defer allocator.free(scratch);
+    crypto.DecryptWithLabelScratch(S, enc, init_key_pair, label_welcome, encrypted_group_info, ct.ciphertext, pt, scratch) catch
         return error.DecryptionFailed;
     return pt;
 }

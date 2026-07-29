@@ -480,7 +480,7 @@ test "treekem.json: processUpdatePath yields byte-exact commit_secret + first pa
                     .encryption_priv = enc_priv,
                     .known_path_secrets = known,
                 };
-                const processed = try treekem.processUpdatePath(S, testing.allocator, &dt.tree, receiver, sender, update_path, group_context);
+                const processed = try treekem.processUpdatePath(S, testing.allocator, &dt.tree, receiver, sender, update_path, group_context, &.{});
                 defer freeProcessed(testing.allocator, processed);
 
                 // commit_secret = path_secret[n+1] (one DeriveSecret(·,
@@ -548,7 +548,9 @@ test "treekem.json: applyUpdatePath merges each UpdatePath into the public tree 
             var arena = std.heap.ArenaAllocator.init(testing.allocator);
             defer arena.deinit();
 
-            try treekem.applyUpdatePath(arena.allocator(), &dt.tree, sender, update_path);
+            // No Add proposals anywhere in `treekem.json`, so RFC 9420 §7.5's
+            // excluded set is empty here — see `treekem.resolutionExcluding`.
+            try treekem.applyUpdatePath(arena.allocator(), &dt.tree, sender, update_path, &.{});
 
             const got = try treehash.rootHash(S, testing.allocator, &dt.tree);
             try testing.expectEqualSlices(u8, want_tree_hash_after, &got);

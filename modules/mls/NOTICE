@@ -250,18 +250,113 @@ Provenance
    but no implementation source from any per-language interop target was
    read or ported.
 
-   The three `passive-client-*.json` vectors in the same directory were
-   NOT fetched or embedded: they replay whole recorded sessions (Commits
-   applied epoch by epoch) and cannot be driven without commit processing,
-   which this module does not have.
+   (The note that stood here saying the three `passive-client-*.json`
+   vectors were NOT fetched, because they need commit processing this
+   module did not have, is superseded by item 8: Part 7 supplied the
+   commit processing and all three are now embedded.)
+
+8. **`mlswg/mls-implementations`, Part 7 (passive client / group state
+   machine) vectors** — `kat_passive_test.zig`'s KAT sources:
+   `test-vectors/passive-client-welcome.json`,
+   `test-vectors/passive-client-handling-commit.json` and
+   `test-vectors/passive-client-random.json`, fetched directly (not
+   hand-transcribed) on 2026-07-29 from the same repository's `main`
+   branch — HEAD still `cfd450286d1bfd9cd2519b95c80f9771f94a5b1a` (commit
+   date 2026-04-22), UNCHANGED from items 3/4/5/6/7's fetches, so all six
+   fetch rounds pin the same upstream revision. Per-file last-modified
+   commits at that revision:
+   `passive-client-welcome.json` ->
+   `df3aa1d01fc85d0a62edbc06f26043d6e7545dac` (2023-03-03, "Fix a bug in
+   welcome passive tests"); `passive-client-handling-commit.json` and
+   `passive-client-random.json` ->
+   `183f4e8b1da0a03b3e9f9db2a5594ac6c854bf40` (2024-03-15, "Fix format of
+   EdDSA keys (#186)").
+
+   **Two are FILTERED to cipher suite `0x0001` before embedding**, the same
+   reduction item 4 applies and for the same reason (this module wires only
+   suite `0x0001`, see `suite.zig`), entry order preserved:
+
+     jq -c '[.[] | select(.cipher_suite==1)]' passive-client-welcome.json
+     jq -c '[.[] | select(.cipher_suite==1)]' passive-client-handling-commit.json
+
+   The filter keeps WHOLE entries, so no recorded session is truncated:
+   every session that survives the filter is replayed to its last Commit.
+   Sizes: `passive-client-welcome.json` 719 346 -> 65 882 bytes (56 entries
+   -> 8, one per suite per scenario); `passive-client-handling-commit.json`
+   1 285 850 -> 117 079 bytes (91 -> 13). SHA-256 of the embedded
+   (filtered) files: `passive-client-welcome.json` =
+   `c4ee72349ec1da76dccc311f41c1c1fa69bdc9971a482288c94eaba2fc5ca9b3`,
+   `passive-client-handling-commit.json` =
+   `b10273634ba091f3df08fdafb70635dde284ab47a3338ca3ac5c117eeead1a2e`; of
+   the unfiltered upstream files as fetched:
+   `92ebb04b67b1aca4290965ae363650921842ceebe275bd79a2733414078d849c` and
+   `b24949fdf857bf79d511f57504a8bdc7ce3247eb199684745e439c11b1a1da21`.
+
+   `kat_passive_test.zig` ASSERTS the coverage each filter rests on, so a
+   future re-filter that silently loses a case fails the test rather than
+   passing quietly: for `passive-client-welcome`, all four combinations of
+   (tree carried in the Welcome / tree supplied out of band) x (no PSK /
+   one external PSK), and that it records zero Commits; for
+   `passive-client-handling-commit`, epochs with no proposals, with one,
+   and with several, and that every entry injects an external PSK; and for
+   both, that every recorded message really is a `PublicMessage` (the one
+   form `group.zig` accepts — asserting it is what keeps
+   `error.PrivateHandshakeNotSupported` an honest boundary rather than an
+   untested one).
+
+   **`passive-client-random.json` is embedded VERBATIM, 1 948 393 bytes,
+   and that size is a deliberate, recorded cost.** SHA-256 as fetched and
+   as embedded (identical, which is the point):
+   `0095d863e9d316872e237fc708debcd20ba2687ee905a3e831f97dd3e578d3c1`.
+   It is the largest embedded file in this repository — larger than
+   `bls12_381`'s 807 KB `trusted_setup.txt` — so it needs a reason, and
+   "too small to bother filtering" is not it. The reason is that NO
+   reduction is available that keeps what the file is for. It is a SINGLE
+   entry, already cipher suite `0x0001`, so item 4's suite filter does not
+   apply; the only remaining axis is an epoch PREFIX, and the length of the
+   chain is precisely the property under test — the vector's value is that
+   it replays 200 consecutive Commits, each an independent chance for a
+   systematic error to surface, with no way for the state machine to
+   resynchronize. A prefix would not even save much before it started
+   costing coverage: the recorded group grows until an `UpdatePath` spans
+   seven levels (a tree of up to 128 leaves, with correspondingly deep
+   filtered direct paths and large copath resolutions), and that depth is
+   not reached until epoch 110 of 200. `kat_passive_test.zig` asserts
+   exactly that — 200 epochs replayed, maximum `UpdatePath` depth 7, both
+   path-present and path-absent Commits, both inline and by-reference
+   `ProposalOrRef`s, and at least one empty proposal list — so a future
+   attempt to shrink this file fails loudly instead of quietly removing the
+   coverage that justifies its size.
+
+   Same public-conformance-data posture as items 3-7 — no explicit OSS
+   license on the source repository, but public NUMERIC interop data
+   (serialized MLS messages, HPKE and AEAD ciphertexts, MACs and derived
+   secrets), not copyrightable expression. The repository's own
+   `test-vectors.md` (the vector-FORMAT specification) was read to
+   determine field semantics and its stated verification procedure —
+   specifically its "Passive Client Scenarios" section: that
+   `signature_priv`/`encryption_priv`/`init_priv` are to be checked against
+   the KeyPackage's public keys, that `ratchet_tree` is a hex-encoded
+   `optional<Node> ratchet_tree<V>` and is null when the tree travels in
+   the Welcome, that the client joins with the Welcome plus the
+   `external_psks`, that `initial_epoch_authenticator` is compared after
+   the join, and that for each epoch the Commit is applied "using any
+   values from `proposals` that are incorporated by reference in the
+   Commit" before comparing that epoch's `epoch_authenticator` — but no
+   implementation source from any per-language interop target was read or
+   ported. In particular, where the recorded sessions disagreed with a
+   plain reading of RFC 9420 §12.3 (see `SPEC.md`'s Part 7 note on §7.5's
+   exclusion of same-Commit Adds), the disagreement was resolved by
+   re-reading the RFC until the governing sentence was found, NOT by
+   consulting another implementation's code.
 
 No third-party MLS IMPLEMENTATION (mls-rs, OpenMLS, mlspp, or any other
 language's MLS library) was read, consulted as a design reference, or
 ported from for this module. Every algorithm was implemented directly
 from RFC 9420's own text/pseudocode (item 1/2) and verified against the
-public interop vectors (items 3/4/5/6) — the same "spec + KAT, no
+public interop vectors (items 3/4/5/6/7/8) — the same "spec + KAT, no
 third-party source" posture this repo's `hpke`/`signal` NOTICE-free
 modules document in their own SPEC.md "no NOTICE entry" reasoning; this
-file exists only because items 3-7's vector-fetch and item 2's
+file exists only because items 3-8's vector-fetch and item 2's
 direct-port relationship warrant the same explicit-citation caution
 `bn254`/`bls12_381` apply to their own KAT sources.

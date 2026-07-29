@@ -156,7 +156,7 @@ pub const KeyPackage = struct {
         const pk = try S.Sig.PublicKey.fromBytes(pk_bytes);
         var sig_bytes: [64]u8 = undefined;
         @memcpy(&sig_bytes, self.signature);
-        try crypto.VerifyWithLabel(S, pk, label_tbs, w.finish(), S.Sig.Signature.fromBytes(sig_bytes));
+        try crypto.VerifyWithLabelAlloc(S, allocator, pk, label_tbs, w.finish(), S.Sig.Signature.fromBytes(sig_bytes));
     }
 
     /// The signing counterpart of `verifySignature`: produces the
@@ -169,7 +169,7 @@ pub const KeyPackage = struct {
         defer allocator.free(buf);
         var w = codec.Writer.init(buf);
         try self.tbsEncode(&w);
-        return crypto.SignWithLabel(S, key_pair, label_tbs, w.finish());
+        return crypto.SignWithLabelAlloc(S, allocator, key_pair, label_tbs, w.finish());
     }
 };
 

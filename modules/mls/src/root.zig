@@ -45,13 +45,34 @@
 //! reproducing its `encrypted_group_info` in the SEND direction, which is
 //! stronger than that vector's own stated procedure — see `SPEC.md`'s
 //! "Part 6" section.
-//! Of §8, only §8.3's external initialization is still missing, and of
-//! §12.4.3 only §12.4.3.2's external commits. Both are SCOPED OUT of this
-//! batch rather than blocked: the sibling `hpke` module exports RFC 9180
-//! §5.1's whole setup layer (`setupBaseS`/`setupBaseR` +
-//! `Context.exportSecret`), which is all §8.3 needs. §8.3 is two small
-//! functions; §12.4.3.2 on top of it also needs commit processing. Neither
-//! has an upstream interop vector.
+//! **Part 7: the group state machine — COMPLETE for the follower.**
+//! `group.zig`'s `Group(S)`: the state a member carries between epochs, the
+//! whole of RFC 9420 §12.4.2's Commit-processing procedure in the RFC's own
+//! bullet order, §12.2's proposal-list validation, §12.3's fixed
+//! application order, and §12.4.3.1's joining procedure run to completion
+//! (`fromWelcome`, which resolves the `GroupInfo` signer out of the tree —
+//! the step `welcome.join` has to take as a parameter). Also §8.3's
+//! external initialization (`keyschedule.externalInitSender`/
+//! `externalInitReceiver`), which the previous batch listed as missing.
+//! Anchored against the official `passive-client-welcome`/
+//! `passive-client-handling-commit`/`passive-client-random` vectors — whole
+//! recorded sessions replayed Commit by Commit with the
+//! `epoch_authenticator` compared at every step, including one 200-Commit
+//! session. This is the strongest end-to-end evidence in the module: it is
+//! the closest thing available to interoperating with another
+//! implementation. Four real defects in Parts 1/2/4 surfaced only here and
+//! are fixed — see `SPEC.md`'s "Part 7" section.
+//! What Part 7 does NOT do: CREATE Commits (there is still no sender half
+//! of §7.5, so no `UpdatePath` generation and no `Welcome` production), and
+//! accept handshake messages framed as `PrivateMessage`
+//! (`error.PrivateHandshakeNotSupported` — driving the §9 secret tree per
+//! epoch is a separate concern). §12.4.3.2's external commits remain
+//! SCOPED OUT, and now for a sharper reason than before: unlike §8.3, which
+//! this batch anchors by a sender/receiver round trip inside this module,
+//! an external-commit RECEIVER has no counterpart here to round-trip
+//! against while commit CREATION does not exist, and there is no upstream
+//! vector — so it would be untestable code, which is the same reason §8.3
+//! was not stubbed earlier either.
 //! Part 3 (LeafNode/KeyPackage VALIDATION + Credential) and the rest of
 //! Part 6 (external commits, reinit/branch) are what remain — see
 //! `SPEC.md`'s "Arc breakdown". Part 4 landed before Part 3
@@ -84,6 +105,8 @@
 //! | `kat_messages_test.zig` | Parts 5+6's KAT harness for `messages.json`: every §12.1 proposal body, §12.4 `Commit`, §12.4.3.1's `GroupSecrets`, §12.4.3.3's bare `ratchet_tree`, and ALL five §17.2 `MLSMessage` wire formats, decode→re-encode byte-exact (a WIRE-format anchor — upstream states this vector's MACs may be invalid) |
 //! | `welcome.zig` | Part 6's RFC 9420 §12.4.3 `GroupInfo`/`GroupInfoTBS` (+ sign/verify), §12.4.3.1's `PathSecret`/`GroupSecrets`/`EncryptedGroupSecrets`/`Welcome`, the two encryption layers (`welcomeKeyNonce`/`encryptGroupInfo`/`decryptGroupInfo` and `encryptGroupSecrets`/`decryptGroupSecrets`) and the joiner's whole procedure (`join`), plus §12.4.3.3's `ratchet_tree`/`external_pub` extension accessors and `verifyTreeHash`. External commits (§12.4.3.2) and §8.3 are NOT here — see the file's doc comment for the `hpke` dependency that blocks them |
 //! | `kat_welcome_test.zig` | Part 6's KAT harness for `welcome.json` — the whole §12.4.3.1 join with real keys, staged per layer (KeyPackageRef → HPKE open → welcome key → group-info AEAD → signature → confirmation tag), and reproducing the vector's `encrypted_group_info` in the SEND direction |
+//! | `group.zig` | Part 7's `Group(S)` — the group STATE and the receiving half of an epoch transition: §12.4.3.1's `fromWelcome`, §12.4.2's `processCommit` (proposal resolution by §5.2 ref, §12.2 validation, §12.3's application order, the UpdatePath's provisional-GroupContext decryption, the key schedule and the `confirmation_tag`), plus §8.4 PSK resolution over application-supplied and remembered-resumption keys |
+//! | `kat_passive_test.zig` | Part 7's KAT harness for the three `passive-client-*.json` vectors — recorded sessions replayed Commit by Commit against `epoch_authenticator`, plus the assertions that keep each file's reduction honest |
 //! | `kat_framing_test.zig` | Part 5's KAT harness for `message-protection.json` (the full §6 protect/unprotect path with real keys — `PrivateMessage` for all three content types, `PublicMessage` for the two handshake types, byte-exact in BOTH directions, plus §6's refusal of application content as a `PublicMessage`) and `transcript-hashes.json` (§8.2's two hashes plus the Commit's own `confirmation_tag`) |
 //!
 //! **Status: Part 1 COMPLETE (Sonnet-tier). Part 2 COMPLETE (Sonnet
@@ -99,8 +122,15 @@
 //! WELCOME path (Sonnet — again no new cryptography: the two encryption
 //! layers are `crypto.EncryptWithLabel` and a plain AEAD under a key
 //! `keyschedule` already derived; `welcome.json` matched on the first run
-//! with nothing adjusted on either side). External commits remain, scoped
-//! out rather than blocked — see above.**
+//! with nothing adjusted on either side). Part 7 COMPLETE for the FOLLOWER
+//! (Sonnet — no new cryptography again, but the first part of this arc
+//! where the vectors did NOT match on the first run: the passive-client
+//! replays found a fixed-scratch overflow that made Welcomes and Commits
+//! undecryptable for any group of realistic size, an over-constrained PSK
+//! width that rejected legal input, an unsorted `unmerged_leaves` insert,
+//! and — the one that is a specification reading rather than a coding bug —
+//! RFC 9420 §7.5's rule that members added by the same Commit are excluded
+//! from the UpdatePath resolutions. Details in `SPEC.md`'s "Part 7".)**
 //! `treemath.zig` is a pure port of the RFC's own
 //! reference code; `crypto.zig` composes `codec.zig` + the sibling
 //! `hpke`/std.crypto primitives exactly as RFC 9420 §5/§8/§9.1 specify,
@@ -124,17 +154,21 @@
 //! `GroupContext` and the transcript hashes that every existing member
 //! holds, with the `confirmation_tag` checked against a `confirmation_key`
 //! it derived itself.
-//! What it still cannot do is BE a client on its own: there is no
-//! group-state object, so it cannot FOLLOW the group after joining (no
-//! §12.2/§12.3/§12.4.2 commit processing), it cannot join by external
-//! Commit (§12.4.3.2/§8.3, not built), and it has no
+//! With Part 7 it can FOLLOW that group: `group.Group(S)` holds the tree,
+//! the transcript, the epoch secrets and this member's private path
+//! secrets, and `processCommit` advances all of it across a Commit exactly
+//! as §12.4.2 specifies — validated against recorded sessions produced by
+//! another implementation, one of them 200 Commits long. A PASSIVE client
+//! is complete.
+//! What it still cannot do is SPEAK: there is no Commit or proposal
+//! CREATION (no sender half of §7.5, so no `UpdatePath` generation and no
+//! `Welcome` production), no handshake message framed as a
+//! `PrivateMessage` (the §9 secret tree is built, but the group object does
+//! not drive it per epoch), no external-Commit join (§12.4.3.2), and no
 //! §10.1/§7.3 validation deciding whether a KeyPackage or LeafNode should
-//! be admitted (Part 3). Framing hands a caller a decoded,
-//! cryptographically verified `AuthenticatedContent` and a
-//! `SenderData.leaf_index`; `welcome.join` hands back a `GroupInfo.signer`
-//! index and a `path_secret`. Deciding that an index names a real member,
-//! installing private keys into a tree, and applying proposals are all
-//! still above this module. See `README.md` for the current surface.
+//! be admitted at all (Part 3) — `processCommit` checks only the leaf
+//! properties §12.4.2 itself names. See `README.md` for the current
+//! surface.
 //!
 //! Provenance: clean-room from RFC 9420 (a public IETF specification, not
 //! copyrightable expression — see `CONVENTIONS.md` §5's merger-doctrine
@@ -163,6 +197,7 @@ pub const content = @import("content.zig");
 pub const framing = @import("framing.zig");
 pub const transcript = @import("transcript.zig");
 pub const welcome = @import("welcome.zig");
+pub const group = @import("group.zig");
 pub const gate = @import("gate.zig");
 
 // Flat re-exports of the surface most callers want.
@@ -263,6 +298,12 @@ pub const encryptGroupSecrets = welcome.encryptGroupSecrets;
 pub const decryptGroupSecrets = welcome.decryptGroupSecrets;
 pub const verifyTreeHash = welcome.verifyTreeHash;
 pub const deriveEpochFromJoiner = keyschedule.deriveEpochFromJoiner;
+pub const externalInitSender = keyschedule.externalInitSender;
+pub const externalInitReceiver = keyschedule.externalInitReceiver;
+
+pub const Group = group.Group;
+pub const ExternalPsk = group.ExternalPsk;
+pub const GroupPolicy = group.Policy;
 
 pub const meta = .{
     .platform = .any,
@@ -306,6 +347,7 @@ test {
     _ = framing;
     _ = transcript;
     _ = welcome;
+    _ = group;
     _ = gate;
     _ = @import("kat_treekem_test.zig");
     _ = @import("kat_keyschedule_test.zig");
@@ -313,6 +355,7 @@ test {
     _ = @import("kat_messages_test.zig");
     _ = @import("kat_framing_test.zig");
     _ = @import("kat_welcome_test.zig");
+    _ = @import("kat_passive_test.zig");
 }
 
 test "meta.deps is exactly {\"hpke\"}" {

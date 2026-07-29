@@ -148,20 +148,65 @@ pub const UpdatePath = struct {
 /// resolution here either drops a legitimate recipient's ciphertext or
 /// hands a path secret to a node that shouldn't have it).
 pub fn resolution(allocator: std.mem.Allocator, t: *const tree.RatchetTree, index: usize) Error![]usize {
+    return resolutionExcluding(allocator, t, index, &.{});
+}
+
+/// `resolution` with RFC 9420 §7.5's exclusion applied: "Any new member
+/// (from an Add proposal) added in the same Commit MUST be excluded from
+/// this resolution."
+///
+/// **This one sentence is the whole reason this variant exists, and it is
+/// easy to miss because it is stated in §7.5 rather than anywhere in §12.**
+/// A member added by the same Commit that carries the UpdatePath must NOT
+/// receive the path secrets through that UpdatePath — it gets its state
+/// from the `Welcome` instead. So the committer builds one fewer ciphertext
+/// than a naive reading of "the resolution of the copath node" suggests,
+/// and a receiver that does not apply the same exclusion computes a
+/// resolution one entry too long, mismatches the ciphertext count, and
+/// cannot process the Commit at all. `passive-client-handling-commit.json`
+/// contains exactly this case; see `group.processCommit`'s Add handling.
+///
+/// `excluded` holds LEAF indices. Exclusion applies both to a leaf reached
+/// directly and to a leaf named in a `ParentNode.unmerged_leaves` list —
+/// a newly added member is unmerged at its non-blank ancestors, so leaving
+/// it in through that path would defeat the exclusion just as surely.
+pub fn resolutionExcluding(
+    allocator: std.mem.Allocator,
+    t: *const tree.RatchetTree,
+    index: usize,
+    excluded: []const u32,
+) Error![]usize {
     var list: std.ArrayList(usize) = .empty;
     errdefer list.deinit(allocator);
-    try resolutionInto(allocator, t, index, &list);
+    try resolutionInto(allocator, t, index, excluded, &list);
     return list.toOwnedSlice(allocator);
 }
 
-fn resolutionInto(allocator: std.mem.Allocator, t: *const tree.RatchetTree, index: usize, list: *std.ArrayList(usize)) Error!void {
+fn isExcludedLeaf(excluded: []const u32, node_index: usize) bool {
+    if (!treemath.is_leaf(node_index)) return false;
+    const leaf_index = node_index / 2;
+    for (excluded) |e| if (e == leaf_index) return true;
+    return false;
+}
+
+fn resolutionInto(
+    allocator: std.mem.Allocator,
+    t: *const tree.RatchetTree,
+    index: usize,
+    excluded: []const u32,
+    list: *std.ArrayList(usize),
+) Error!void {
     if (t.nodes[index]) |node| {
         // Non-blank node: itself, then (parent nodes only) its unmerged
         // leaves — each a LEAF index on the wire, DOUBLED to the array/node
         // index a resolution is made of (RFC 9420 §4.1.1).
+        if (isExcludedLeaf(excluded, index)) return;
         try list.append(allocator, index);
         switch (node) {
-            .parent => |p| for (p.unmerged_leaves) |li| try list.append(allocator, 2 * @as(usize, li)),
+            .parent => |p| for (p.unmerged_leaves) |li| {
+                if (isExcludedLeaf(excluded, 2 * @as(usize, li))) continue;
+                try list.append(allocator, 2 * @as(usize, li));
+            },
             .leaf => {},
         }
         return;
@@ -169,8 +214,8 @@ fn resolutionInto(allocator: std.mem.Allocator, t: *const tree.RatchetTree, inde
     if (treemath.is_leaf(index)) return; // blank leaf: empty resolution
     // Blank parent: left child's resolution, then right child's (left-first,
     // depth-first). `index` is odd here, so left/right can never be null.
-    try resolutionInto(allocator, t, treemath.left(index) orelse return error.Malformed, list);
-    try resolutionInto(allocator, t, treemath.right(index) orelse return error.Malformed, list);
+    try resolutionInto(allocator, t, treemath.left(index) orelse return error.Malformed, excluded, list);
+    try resolutionInto(allocator, t, treemath.right(index) orelse return error.Malformed, excluded, list);
 }
 
 // ── shared private helpers for the parent-hash / UpdatePath cores ─────────
@@ -308,7 +353,12 @@ const FdpEntry = struct { node: usize, copath_child: usize };
 /// The filtered direct path of the leaf at node index `leaf_node_index`
 /// (RFC 9420 §4.1.2), leaf-to-root order — the node ordering `UpdatePath
 /// .nodes` mirrors (§7.6). Caller frees the returned slice.
-fn filteredDirectPath(allocator: std.mem.Allocator, t: *const tree.RatchetTree, leaf_node_index: usize) Error![]FdpEntry {
+fn filteredDirectPath(
+    allocator: std.mem.Allocator,
+    t: *const tree.RatchetTree,
+    leaf_node_index: usize,
+    excluded: []const u32,
+) Error![]FdpEntry {
     const n_leaves = t.nLeaves();
     var dp_buf: [treemath.max_path_len]usize = undefined;
     const dp = treemath.direct_path(leaf_node_index, n_leaves, &dp_buf) catch return error.Malformed;
@@ -317,7 +367,12 @@ fn filteredDirectPath(allocator: std.mem.Allocator, t: *const tree.RatchetTree, 
     var list: std.ArrayList(FdpEntry) = .empty;
     errdefer list.deinit(allocator);
     for (dp, cp) |d, c| {
-        const res = try resolution(allocator, t, c);
+        // §7.5's exclusion changes the FILTER too, not just the ciphertext
+        // count: a copath subtree containing nothing but members added by
+        // this Commit resolves to the empty list, so its direct-path node
+        // drops out of the filtered path entirely and the UpdatePath is one
+        // node shorter.
+        const res = try resolutionExcluding(allocator, t, c, excluded);
         const non_empty = res.len > 0;
         allocator.free(res);
         if (non_empty) try list.append(allocator, .{ .node = d, .copath_child = c });
@@ -557,6 +612,11 @@ pub fn processUpdatePath(
     sender_leaf_index: usize,
     update_path: UpdatePath,
     group_context: []const u8,
+    /// RFC 9420 §7.5's excluded set: the LEAF indices of members added by
+    /// the same Commit that carries this `UpdatePath`. Pass `&.{}` for an
+    /// `UpdatePath` that stands alone (an Update-only Commit, or the
+    /// `treekem.json` vectors, none of which carry an Add).
+    added_this_commit: []const u32,
 ) Error!ProcessedUpdatePath {
     const sender_node = 2 * sender_leaf_index;
     const receiver_node = 2 * receiver.leaf_index;
@@ -564,7 +624,7 @@ pub fn processUpdatePath(
 
     // §7.6: UpdatePath.nodes mirrors the sender's filtered direct path,
     // leaf-to-root, one entry per surviving direct-path node.
-    const fdp = try filteredDirectPath(allocator, t, sender_node);
+    const fdp = try filteredDirectPath(allocator, t, sender_node, added_this_commit);
     defer allocator.free(fdp);
     if (update_path.nodes.len != fdp.len) return error.Malformed;
 
@@ -583,7 +643,7 @@ pub fn processUpdatePath(
     // §7.5 (decrypt) step 2: the resolution entry the receiver holds a
     // private key for. The ciphertext list is ordered BY that resolution
     // (§7.6), so the entry's position selects the ciphertext.
-    const res = try resolution(allocator, t, fdp[overlap].copath_child);
+    const res = try resolutionExcluding(allocator, t, fdp[overlap].copath_child, added_this_commit);
     defer allocator.free(res);
     if (update_path.nodes[overlap].encrypted_path_secret.len != res.len) return error.Malformed;
 
@@ -626,7 +686,14 @@ pub fn processUpdatePath(
     if (ct.ciphertext.len != S.Nh + S.Aead.tag_length) return error.Malformed;
     const enc: S.Kem.EncappedKey = ct.kem_output[0..S.Kem.Npk].*;
     var path_secret: [S.Nh]u8 = undefined;
-    crypto.DecryptWithLabel(S, enc, kp, "UpdatePathNode", group_context, ct.ciphertext, &path_secret) catch
+    // Exactly-sized heap scratch rather than `crypto.DecryptWithLabel`'s
+    // fixed stack buffer: the context here is a serialized `GroupContext`,
+    // which carries the group's extensions and so has no upper bound (see
+    // `crypto.encryptContextLen`). Sizing it exactly also means the `catch`
+    // below cannot swallow a buffer-size error as a decryption failure.
+    const ctx_scratch = try allocator.alloc(u8, try crypto.encryptContextLen("UpdatePathNode", group_context));
+    defer allocator.free(ctx_scratch);
+    crypto.DecryptWithLabelScratch(S, enc, kp, "UpdatePathNode", group_context, ct.ciphertext, &path_secret, ctx_scratch) catch
         return error.Malformed; // AEAD/decap failure = reject (Error has no HPKE-specific member)
 
     // §7.4/§7.5 steps 4-6: walk the chain up the filtered direct path,
@@ -688,7 +755,15 @@ pub fn processUpdatePath(
 /// regardless of whether IT can decrypt anything from this particular
 /// `UpdatePath` (only nodes in the resolution the sender encrypted to
 /// can), but every member updates the same public tree.
-pub fn applyUpdatePath(allocator: std.mem.Allocator, t: *tree.RatchetTree, sender_leaf_index: usize, update_path: UpdatePath) Error!void {
+pub fn applyUpdatePath(
+    allocator: std.mem.Allocator,
+    t: *tree.RatchetTree,
+    sender_leaf_index: usize,
+    update_path: UpdatePath,
+    /// RFC 9420 §7.5's excluded set — see `processUpdatePath`. It changes
+    /// the FILTERED direct path, hence which nodes this merge writes to.
+    added_this_commit: []const u32,
+) Error!void {
     // Suite note: this signature carries no `comptime S` (fixed by the
     // scaffold), yet step 3's parent hashes need the suite hash — so it
     // uses the module's only wired suite, `suite.default` (`0x0001`), the
@@ -705,7 +780,7 @@ pub fn applyUpdatePath(allocator: std.mem.Allocator, t: *tree.RatchetTree, sende
     // blanking the direct path wouldn't change them anyway — but the
     // UpdatePath's node count must be checked against the tree as it
     // stands.
-    const fdp = try filteredDirectPath(allocator, t, sender_node);
+    const fdp = try filteredDirectPath(allocator, t, sender_node, added_this_commit);
     defer allocator.free(fdp);
     if (update_path.nodes.len != fdp.len) return error.Malformed;
 

@@ -132,6 +132,7 @@ parent-hash validation logic does (see Part 2 below).
 | **4 — Key Schedule + Secret Tree** | §8's full `init_secret_[n-1] → ... → init_secret_[n]` chain, §8.1 `GroupContext`, §8.4 `psk_secret`, §8.5 exporter, §6.1's two MACs, §9 Secret Tree + sender ratchets, §6.3.2 sender-data keys — **DONE 2026-07-28**, whole part **COMPLETE** except §8.3 (external init — Part 6 established that the `hpke` dependency it needs is already satisfied, so this is unbuilt work rather than a blocker); §8.2's transcript hashes were the other gap and Part 5 closed them (`transcript.zig`), and Part 6 added the joiner's entry point into the same chain (`deriveEpochFromJoiner`) | **Sonnet** — pure composition of `ExpandWithLabel`/`DeriveSecret` (already built) over a well-specified derivation graph. One correction to the original note below: Figure 22 pins the ORDER unambiguously, but Figure 24 (§8.4's PSK chain) does NOT — it contradicts its own prose on the Extract argument order, and only the vector settles it | `key-schedule.json`, `secret-tree.json`, `psk_secret.json` — all byte-exact; see "Part 4" below |
 | **5 — Message framing** | ALL of §6 (`FramedContent`/`AuthenticatedContent`/§6.1 TBS+auth/§6.2 `PublicMessage`+`membership_tag`/§6.3 `PrivateMessage`+§6.3.1 content encryption+§6.3.2 sender data/`MLSMessage`), the §12.1 `Proposal` and §12.4 `Commit` WIRE FORMATS framing carries, the §10 `KeyPackage` wire format `Add` carries, and §8.2's transcript hashes — **DONE 2026-07-29**, whole part **COMPLETE**. Commit PROCESSING (§12.2/§12.3/§12.4.1/§12.4.2) is explicitly NOT here — see "Part 5" below for where that boundary falls and why | **Sonnet** — mechanical composition over Parts 1/2/4's primitives with an authoritative byte-exact oracle for every path. No new cryptography: every derivation it performs was already built and vector-pinned by an earlier part | `messages.json`, `message-protection.json`, `transcript-hashes.json` — all byte-exact; see "Part 5" below |
 | **6 — Joining a group (Welcome), then external Commit / reinit** | §12.4.3's `GroupInfo`/`GroupInfoTBS`, §12.4.3.1's `Welcome`/`GroupSecrets`/`EncryptedGroupSecrets` + both encryption layers + the joiner's procedure, §12.4.3.3's `ratchet_tree`/`external_pub` extensions and the tree-hash binding, and §8's chain entered at `joiner_secret` — **DONE 2026-07-29**, the WELCOME path **COMPLETE**. What remains of this part: §12.4.3.2 external Commits + §8.3 external init (scoped out, NOT blocked — see "Part 6" below), and §11.2/§11.3 reinit/branch | **Sonnet** — no new cryptography at all: the group-info layer is a plain AEAD under a key `keyschedule.zig` already derived, and the per-member layer is `crypto.EncryptWithLabel` unchanged. The judgment calls were scope ones, not crypto ones | `welcome.json` + `messages.json`'s Part 6 fields — byte-exact; see "Part 6" below |
+| **7 — Group state machine** | `Group(S)`: the state a member carries between epochs, §12.2's proposal-list validation, §12.3's application order, §12.4.2's whole Commit-processing procedure, and §12.4.3.1's join run to completion (`fromWelcome`) — **DONE 2026-07-29**, COMPLETE for the FOLLOWER. Also §8.3 external init, which Part 6 listed as unbuilt. NOT here: Commit/proposal CREATION (no sender half of §7.5), `PrivateMessage` handshakes, §12.4.3.2 external Commits, §11.2/§11.3 reinit/branch | **Sonnet** — still no new cryptography, but the first part of this arc whose vectors did NOT match on the first run. Three coding defects in Parts 1/2/4 and one specification MISREADING surfaced here and nowhere else; see "Part 7" below | `passive-client-welcome.json`, `passive-client-handling-commit.json`, `passive-client-random.json` — whole recorded sessions replayed Commit by Commit against `epoch_authenticator`; see "Part 7" below |
 
 **Where TreeKEM/Fable lands, restated plainly:** it's Part 2, specifically
 the path-secret-derivation-along-the-copath + parent-hash-chain
@@ -755,6 +756,239 @@ pinned to the group's); a `GroupContext` with a bumped epoch must derive a
 different `confirmation_key`; and a tree whose root hash is not the signed
 `tree_hash` must fail `verifyTreeHash`.
 
+## Part 7 — The group state machine (2026-07-29)
+
+`group.zig` — `Group(S)`, the object that turns Parts 1-6's codecs and
+derivations into a client that can FOLLOW a group: RFC 9420 §12.2 (proposal
+list validation), §12.3 (applying a proposal list), §12.4.2 (processing a
+Commit), and §12.4.3.1's joining procedure run all the way to a usable
+state. Plus §8.3's external initialization in `keyschedule.zig`, which Part
+6 listed as unbuilt.
+
+### What it is verified against
+
+The three official `passive-client-*.json` vectors, which are a different
+kind of evidence from everything else this module embeds. Every other vector
+pins one derivation, one codec or one message — it proves a FUNCTION is
+right. These replay a whole recorded session: a client is added to a real
+group by another implementation, then follows that group through a sequence
+of Commits made by other members, with the `epoch_authenticator` compared at
+every single step.
+
+| Vector | What it drives | Result |
+|---|---|---|
+| `passive-client-welcome.json` | 8 recorded joins (suite `0x0001`), spanning both §12.4.3.3 tree sources and both PSK cases. **No Commits at all** — its `epochs` array is empty in every entry | green |
+| `passive-client-handling-commit.json` | 13 recorded sessions of 2 Commits each, every one injecting an external PSK; the epochs span empty, single and multi-proposal Commits, including one carrying an Add, a Remove, two PSKs and a GroupContextExtensions together | green |
+| `passive-client-random.json` | ONE recorded session of **200 consecutive Commits**, growing the group until an `UpdatePath` spans seven levels | green |
+
+The `epoch_authenticator` is `DeriveSecret(epoch_secret, "authentication")`,
+and `epoch_secret` depends on the `GroupContext` — hence on the tree hash
+and on the entire transcript — and on the previous epoch's `init_secret`.
+There is no way for the state machine to resynchronize: one wrong bit
+anywhere makes that epoch and every later one wrong. A session that reaches
+epoch 200 has had 200 independent chances to fail.
+
+**None of these matched on the first run.** That is the first time in this
+arc that has happened, and it is the whole reason the part was worth doing:
+four separate defects were hiding behind vectors that were all too small to
+expose them. See "What the replays found" below.
+
+### Where the RFC actually puts commit processing, because the brief for this part was incomplete
+
+The brief named §12.2, §12.3 and §12.4.2 as "the neighbourhood", and those
+three are indeed the spine — §12.2's validity rules, §12.3's fixed
+application order, §12.4.2's eleven ordered bullets. They are correct as far
+as they go.
+
+But the single rule that decides whether a Commit can be processed AT ALL is
+in **§7.5**, which the brief did not mention and which contains no other
+Commit-processing text:
+
+> Any new member (from an Add proposal) added in the same Commit MUST be
+> excluded from this resolution.
+
+A member added by the same Commit that carries the `UpdatePath` must not
+receive the path secrets through it — it gets its state from the `Welcome`
+instead. So the committer builds one fewer ciphertext than "the resolution
+of the copath node" suggests, and, because the §4.1.2 filter is defined in
+terms of resolution EMPTINESS, a copath subtree containing only
+same-Commit additions drops out of the filtered direct path entirely,
+making the whole `UpdatePath` one node shorter.
+
+This is not a subtle key divergence that shows up later as a wrong secret.
+A receiver that misses it computes a resolution one entry too long, the
+ciphertext count does not match, and the Commit is rejected outright. It is
+the reason `treekem.resolutionExcluding` exists and why
+`processUpdatePath`/`applyUpdatePath` now take an `added_this_commit`
+argument.
+
+### What the replays found
+
+Four defects, each invisible to every previously embedded vector. Three are
+coding bugs in Parts 1/2/4; one is a specification misreading in this part.
+
+1. **`crypto`'s 512-byte label scratch overflowed for any realistically
+   sized group — Parts 1/6, real bug.** `EncryptWithLabel`'s `Context` and
+   `SignWithLabel`'s `Content` have no upper bound in RFC 9420's own uses of
+   them: §12.4.3.1 seals each member's `GroupSecrets` with the WHOLE
+   `encrypted_group_info` as the context (which contains the ratchet tree),
+   §7.5 opens each `UpdatePathNode` under the serialized `GroupContext`,
+   `GroupInfoTBS` contains a `GroupContext` plus the `ratchet_tree`
+   extension, and `FramedContentTBS` for a Commit contains a whole
+   `UpdatePath`. All four are kilobytes for a real group. `welcome.json`'s
+   group was small enough to fit; the passive-client groups are not, and
+   every one of them failed. Fixed by mirroring the existing
+   `kdfLabelLen`/`ExpandWithLabelScratch` precedent:
+   `crypto.encryptContextLen` + `EncryptWithLabelScratch`/
+   `DecryptWithLabelScratch`, and `crypto.signContentLen` +
+   `SignWithLabelAlloc`/`VerifyWithLabelAlloc`, with every call site that
+   can see an unbounded argument (and that already allocates its TBS buffer)
+   switched over.
+   **A second defect was hiding behind the first:**
+   `welcome.decryptGroupSecrets` mapped every error from
+   `DecryptWithLabel` to `error.DecryptionFailed`, so a buffer-size bug was
+   reported as a wrong-key one. Sizing the scratch exactly makes
+   `error.LabelTooLong` unreachable there, so the surviving `catch` can only
+   mean a genuine AEAD/decap failure.
+2. **`keyschedule.PreSharedKey.secret` was width-constrained to `[Nh]u8` —
+   Part 4, real bug.** RFC 9420 §8.4's first step is
+   `psk_extracted = KDF.Extract(0, psk)`: the PSK is HKDF *input keying
+   material*, which has no required width. The passive-client vectors'
+   external PSKs are **14 bytes**, and were rejected outright.
+   `psk_secret.json`'s suite-`0x0001` entries all happen to be 32 bytes,
+   which is exactly why no earlier vector caught it. Now `[]const u8`.
+3. **`ParentNode.withAppendedUnmerged` appended instead of inserting in
+   sorted position — Part 2, real bug.** RFC 9420 §7.1: "The entries in the
+   unmerged_leaves vector MUST be sorted in increasing order." Appending is
+   correct only while leaves are added strictly rightward, which is all Part
+   2 could produce. An Add that reuses a blank leaf to the LEFT of an
+   existing unmerged leaf breaks the invariant, and the damage is silent
+   until a `resolution` — which reads the list in order — hands a path
+   secret to the wrong node or a tree hash diverges.
+4. **§7.5's same-Commit-Add exclusion, described above — a misreading, not a
+   bug.** The first implementation applied §12.3's order literally and
+   computed resolutions over the post-Add tree. Worth recording how it was
+   resolved, because the wrong fix was very plausible: the observed
+   ciphertext counts `[1, 1, 3]` were ALSO consistent with "the Add must not
+   reuse a leaf vacated by a Remove in the same Commit, so extend the tree
+   instead". That hypothesis was implemented, and it failed differently (the
+   filtered direct path became one node too LONG), which is what sent the
+   search back to the RFC until §7.5's sentence turned up. §12.1.1's
+   leftmost-blank-leaf placement is unchanged and DOES reuse a
+   just-vacated leaf — the recorded sessions confirm it.
+
+### The three orderings that are load-bearing
+
+`processCommit` is deliberately one function following §12.4.2's bullets in
+order, with each step commented by its bullet, because splitting it up is
+how the order drifts. Three places in it produce perfectly well-formed
+32-byte secrets when wrong:
+
+1. **Two different `GroupContext`s in one function.** The Commit's signature
+   and `membership_tag` are verified against the OLD context (the epoch the
+   sender was in); the key schedule consumes the NEW one.
+2. **A third, PROVISIONAL `GroupContext` for the `UpdatePath`.** §12.4.2 is
+   explicit: new `epoch`, new `tree_hash` (after the proposals AND after
+   merging the `UpdatePath`), but the OLD `confirmed_transcript_hash`,
+   because the transcript cannot yet include the Commit being processed. It
+   differs from the final context in exactly one field, and using the final
+   one there derives an epoch nobody else derived.
+3. **§12.3's application order is not the Commit's list order.**
+   GroupContextExtensions, then Update, then Remove, then Add, then PSK.
+   Applying Adds before Removes puts new members in the wrong leaves and
+   every subsequent tree hash diverges.
+
+### Where the boundary falls, stated precisely
+
+`Group(S)` is a complete PASSIVE client and a complete FOLLOWER. It is not a
+complete client, and the gaps are named rather than implied:
+
+- **No Commit or proposal CREATION.** There is still no sender half of §7.5
+  (`treekem.zig` does not generate an `UpdatePath`), and no `Welcome`
+  production. This is the receiving half only.
+- **No `PrivateMessage` handshakes** — `error.PrivateHandshakeNotSupported`.
+  `secrettree.zig` owns §9's ratchets, but this object does not drive them
+  per epoch; that has its own generation and deletion policy. The
+  passive-client vectors contain only `PublicMessage`s, and
+  `kat_passive_test.zig` ASSERTS that, so the boundary stays an honest one
+  rather than an untested claim.
+- **No §7.3/§10.1 admission validation** (Part 3). `processCommit` checks
+  the leaf properties §12.4.2 names in its own bullets —
+  `leaf_node_source == commit`, the committer's encryption key actually
+  changing, no `UpdatePath` public key already present in the tree — and
+  verifies the signature on every `LeafNode` it installs. It does not check
+  lifetimes, credential acceptability or capability support.
+- **No external Commits (§12.4.3.2).** See the Backlog for why the reason is
+  now "no anchor" rather than "blocked".
+- **Not atomic.** A failure after the tree is mutated poisons the object
+  (`error.GroupPoisoned`) instead of rolling back. Backlog.
+
+Two §12.2 rules are explicitly application-defined by the RFC ("multiple Add
+proposals that ... represent the same client according to the application,
+for example, identical signature keys"). They are implemented on the RFC's
+own parenthetical reading and exposed as `group.Policy`, defaulting ON,
+because the failure they prevent — a group silently containing two leaves
+for one client — is not detectable afterwards.
+
+### `fromWelcome` re-sequences the join rather than calling `welcome.join`
+
+`welcome.join` takes the signer's public key as a PARAMETER, because Part 6
+had no way to resolve a leaf index to a key. But `GroupInfo.signer` is
+inside the encrypted `GroupInfo`, and so is the tree that resolves it, so a
+caller holding only a Welcome cannot supply that argument without decrypting
+first. Part 7 can, because it owns the tree. `fromWelcome` runs the same
+steps in the same order over the same public building blocks
+(`welcome.decryptGroupSecrets`/`welcomeKeyNonce`/`decryptGroupInfo`/
+`verifyTreeHash`, `keyschedule.deriveEpochFromJoiner`/
+`verifyConfirmationTag`, `transcript.interimTranscriptHash`) and adds the
+three steps §12.4.3.1 lists that Part 6 explicitly left to the caller:
+verify the tree hash, verify the parent-hash chain
+(`treekem.validateParentHashes`), and find this client's own leaf. It also
+checks that a re-encode of the resulting `GroupContext` equals the bytes the
+key schedule just consumed — otherwise every later epoch, which uses the
+re-encoded form, would silently diverge from the first.
+
+### Memory model
+
+One arena for retained state, the caller's allocator for scratch. This
+module's decoders alias their input buffers, and a group's tree accumulates
+leaves aliasing a DIFFERENT buffer per epoch (the Welcome's `GroupInfo`,
+then each Commit's `UpdatePath`, then each Add's `KeyPackage`).
+Deep-copying every `LeafNode` would mean a second implementation of
+`tree.zig`'s decode layer, so `Group` copies each message it retains state
+from into its own arena and decodes from that copy. Group state is retained
+wholesale and dropped wholesale, which is how MLS treats it too. The cost is
+recorded in the Backlog: the arena grows monotonically with session length.
+
+### Teeth
+
+Each of the three vectors was corrupted by ONE hex nibble and the failure
+checked to name the stage that diverged, then restored:
+
+- one byte inside `passive-client-welcome`'s first `welcome` blob →
+  `fromWelcome failed: DecryptionFailed` (the group-info AEAD layer);
+- one byte inside `passive-client-handling-commit`'s entry-0 epoch-1
+  `commit` → `entry 0, epoch index 1: processCommit failed: MacMismatch`
+  (the `membership_tag`, i.e. §12.4.2's second bullet, before anything is
+  applied);
+- one byte of the EXPECTED `epoch_authenticator` at epoch 150 of the
+  200-Commit session → `entry 0, epoch index 150: epoch_authenticator
+  diverged`, with the differing bytes printed.
+
+Every diagnostic names the vector, the entry and the epoch index, because a
+failure at epoch 137 of 200 that says only "slices differ" is not
+actionable.
+
+Beyond the vectors, `keyschedule.zig`'s §8.3 tests pin the export-context
+string's exact bytes and the HPKE `suite_id`'s exact bytes as literals
+(a round trip alone passes for ANY label both sides agree on), and check
+that the derived `init_secret` is bound to the group's external key and to
+the `kem_output` — including the fact that decapsulating with the wrong
+private key yields a DIFFERENT secret rather than an error, since X25519
+decap cannot fail on a well-formed point. What makes an external Commit safe
+is therefore the `confirmation_tag`, not §8.3's exchange, and the test says
+so.
+
 ## Threat model
 
 - **`codec.Reader` on hostile input.** Every `read*` function is bounds-
@@ -863,27 +1097,57 @@ different `confirmation_key`; and a tree whose root hash is not the signed
   `*_proposal` vector fields through the WRAPPED types, prepending the
   §17.4 type value where the vector has none. If a future extension
   proposal type needs a real struct, that is when to split them out.
-- **External commits (§12.4.3.2) and §8.3 external init are UNBLOCKED and
-  unbuilt.** `hpke` exports RFC 9180 §5.1's setup layer
-  (`setupBaseS`/`setupBaseR`/`Context.exportSecret`), which is exactly what
-  §8.3 needs. Everything else those two sections need already exists here: the `ExternalPub` extension is read
-  (`welcome.GroupInfo.externalPub`), `keyschedule.externalKeyPair` derives
-  the group's side of the key, `framing.SenderType.new_member_commit` is
-  wired, and `content.Proposal.external_init` decodes. §8.3 alone is a
-  small, self-contained next task; §12.4.3.2 waits on commit processing.
-  Neither has an upstream interop vector.
-- **The `passive-client-*.json` vectors are unclaimed.** They are the
-  strongest end-to-end check available for this module (a recorded session
-  replayed epoch by epoch against an `epoch_authenticator`), and they are
-  blocked on commit processing (§12.2/§12.3/§12.4.2) plus a group-state
-  object rather than on anything cryptographic. Whoever builds that state
-  machine should take these vectors with it — they are what will prove it.
+- **§8.3 external init — DONE 2026-07-29** (`keyschedule.externalInitSender`/
+  `externalInitReceiver`), and honestly labelled: it is the only derivation
+  in `keyschedule.zig` with no external MLS anchor, so it is pinned by a
+  sender/receiver round trip plus RFC 9180's own KATs one layer down, not
+  by a byte-exact interop vector. Its export-context string and HPKE
+  `suite_id` are pinned as literals separately, because a round trip alone
+  cannot catch a label both sides get wrong the same way.
+- **External Commits (§12.4.3.2) are still unbuilt, and the reason is now
+  sharper than "unblocked".** Everything they read already exists
+  (`welcome.GroupInfo.externalPub`, `keyschedule.externalKeyPair`, §8.3
+  above, `framing.SenderType.new_member_commit`,
+  `content.Proposal.external_init`, and now a group-state object). What is
+  missing is an ANCHOR. §8.3 could be round-tripped because this module
+  contains both of its halves; an external-Commit RECEIVER has no
+  counterpart to round-trip against while Commit CREATION does not exist,
+  and there is no upstream vector. Building it now would mean shipping
+  untestable code — the same reason `keyschedule.zig` gave for not stubbing
+  §8.3 before `hpke` exported its setup layer. **Take it together with
+  Commit creation, not before.**
+- **`passive-client-*.json` — CLAIMED and green 2026-07-29** (Part 7). All
+  three replay end to end, including the 200-Commit session. See "Part 7".
 - **`framing.zig` exposes no single `unprotectPrivate`.** Decryption is
   genuinely two-phase (§6.3.2's sender data names the key that §6.3.1's
   content needs), and the key lookup between the phases is the caller's, so
   the three stages are exposed separately rather than behind a callback.
-  Revisit if a group-state object in a later part makes the lookup
-  internal.
+  Part 7's group object did NOT make the lookup internal, because it does
+  not drive the §9 secret tree per epoch — see
+  `group.Error.PrivateHandshakeNotSupported`. Revisit together with that.
+- **`group.processCommit` is not atomic.** A Commit that fails a check
+  after the tree has been mutated leaves the object poisoned
+  (`error.GroupPoisoned`) rather than rolled back. Real rollback means
+  processing into a COPY of the ratchet tree and swapping on success, which
+  is a memory-model change rather than a bug fix: the tree's byte fields
+  alias the arena, so a copy needs either a deep clone or a second arena.
+  The current behaviour fails closed and says so, which is why this is a
+  backlog item and not a defect.
+- **`group.Group`'s arena grows monotonically with session length.** Every
+  Commit whose `UpdatePath` or Add contributes a `LeafNode` is copied into
+  the group's arena and never freed, because the tree aliases those bytes
+  (`tree.zig`'s stated convention). For the 200-Commit vector this is a few
+  megabytes and irrelevant; for a long-lived group it is a leak in all but
+  name. The fix is the same one the atomicity item needs — owning leaf
+  bytes rather than aliasing them — so do both together.
+- **`hpke` does not export the HPKE `suite_id`.** `Context.exportSecret`
+  takes one as a parameter, but `schedule.suiteIdOf` is private, so
+  `keyschedule.hpkeSuiteId` restates the `Aead` -> `aead_id` mapping in
+  order to call it. `hpke.suite.suiteId` and `Kem.kem_id` ARE public, so
+  only that one mapping is duplicated, and it `@compileError`s rather than
+  guessing for an unregistered AEAD. The clean fix is upstream in `hpke`
+  (export `suiteIdOf`, or have `Context` carry its own suite id); this
+  batch was scoped out of that module.
 
 - **Scratch-buffer size (512 bytes) — RESOLVED 2026-07-28** by the second
   of the two options this item listed: `crypto.ExpandWithLabelScratch` takes

@@ -23,23 +23,36 @@
 //! **This file gates Part 2 and only Part 2.** Part 4 (`keyschedule.zig`/
 //! `secrettree.zig`, RFC 9420 §8/§9), Part 5 (`framing.zig`/`content.zig`/
 //! `keypackage.zig`/`transcript.zig`, RFC 9420 §6/§8.2 plus the §10/§12.1/
-//! §12.4 structures framing carries) and Part 6 (`welcome.zig`, RFC 9420
-//! §12.4.3/§12.4.3.1/§12.4.3.3) deliberately add no switch of their own:
-//! every function in them is real and every one is driven byte-exact by an
-//! official interop vector (`key-schedule.json`/`psk_secret.json`/
+//! §12.4 structures framing carries), Part 6 (`welcome.zig`, RFC 9420
+//! §12.4.3/§12.4.3.1/§12.4.3.3) and Part 7 (`group.zig`, RFC 9420 §12.2/
+//! §12.3/§12.4.2) deliberately add no switch of their own: every function
+//! in them is real and every one is driven byte-exact by an official
+//! interop vector (`key-schedule.json`/`psk_secret.json`/
 //! `secret-tree.json` for Part 4; `messages.json`/
 //! `message-protection.json`/`transcript-hashes.json` for Part 5;
-//! `welcome.json` plus `messages.json`'s Part 6 fields for Part 6), so
+//! `welcome.json` plus `messages.json`'s Part 6 fields for Part 6; the
+//! three `passive-client-*.json` recorded sessions for Part 7), so
 //! there is nothing to stage. A gate constant that is always `true` for
 //! work that was never staged would be exactly the "describes finished
 //! work as provisional" noise this module has been keeping out.
 //!
-//! What Parts 5 and 6 leave out is left out ENTIRELY rather than gated —
-//! no §10.1 KeyPackage validation, no §12.2 proposal-list validity, no
-//! commit-processing state machine, and no external-Commit path
-//! (§12.4.3.2/§8.3 — scoped out, not blocked; see `welcome.zig`'s doc
-//! comment). There is no half-built code behind a switch anywhere in
-//! them. Note that Part 5's one named refusal,
+//! What Parts 5, 6 and 7 leave out is left out ENTIRELY rather than gated —
+//! no §10.1 KeyPackage validation, no §7.3 LeafNode validation beyond the
+//! properties §12.4.2 names in its own bullets, no Commit or proposal
+//! CREATION, and no external-Commit path (§12.4.3.2 — still scoped out;
+//! §8.3, which it needs, is now built and lives in `keyschedule.zig`).
+//! There is no half-built code behind a switch anywhere in them.
+//!
+//! **The two boundaries Part 7 states as named refusals rather than
+//! silence** are worth knowing about, because a caller meets them at
+//! runtime: `group.Error.PrivateHandshakeNotSupported` (a Commit or
+//! proposal framed as a `PrivateMessage` — the §9 secret tree exists but
+//! this object does not drive it per epoch) and `group.Error.GroupPoisoned`
+//! (a Commit that failed after the tree was already mutated leaves the
+//! object unusable rather than silently half-applied). Neither is a gate:
+//! they are permanent, documented properties of what this part owns.
+//!
+//! Note that Part 5's one named refusal,
 //! `error.WireFormatNotInThisPart`, is GONE: Part 6 supplied the
 //! `Welcome`/`GroupInfo` payloads it stood for, so
 //! `framing.MLSMessage.decode` now handles every §17.2 wire format and the

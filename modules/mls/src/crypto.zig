@@ -238,6 +238,54 @@ pub fn VerifyWithLabel(comptime S: type, public_key: S.Sig.PublicKey, label: []c
     try signature.verify(sign_content, public_key);
 }
 
+/// Exactly how many bytes `encodeSignContent(label, content)` needs.
+///
+/// **RFC 9420's own signed contents are not bounded by
+/// `label_scratch_len`.** `GroupInfoTBS` contains a whole `GroupContext`
+/// plus the `ratchet_tree` extension (§12.4.3.3), so it is kilobytes for
+/// any real group; `FramedContentTBS` for a Commit contains a whole
+/// `UpdatePath`, one HPKE ciphertext per resolution entry, so it grows with
+/// the group too; `KeyPackageTBS` and `LeafNodeTBS` grow with their
+/// extension lists. Every one of those call sites already allocates its
+/// TBS buffer, so they use `SignWithLabelAlloc`/`VerifyWithLabelAlloc`
+/// below. The fixed-buffer `SignWithLabel`/`VerifyWithLabel` stay for
+/// bounded content and still fail closed (`error.LabelTooLong`).
+pub fn signContentLen(label: []const u8, content: []const u8) Error!usize {
+    const full_label_len = mls10_label_prefix.len + label.len;
+    return try codec.varint.encodedLen(full_label_len) + full_label_len +
+        try codec.varint.encodedLen(content.len) + content.len;
+}
+
+/// `SignWithLabel` over an exactly-sized heap scratch — for content with no
+/// compile-time size bound. See `signContentLen`.
+pub fn SignWithLabelAlloc(
+    comptime S: type,
+    allocator: std.mem.Allocator,
+    key_pair: S.Sig.KeyPair,
+    label: []const u8,
+    content: []const u8,
+) !S.Sig.Signature {
+    const buf = try allocator.alloc(u8, try signContentLen(label, content));
+    defer allocator.free(buf);
+    const sign_content = try encodeSignContent(buf, label, content);
+    return key_pair.sign(sign_content, null);
+}
+
+/// The verifying mirror of `SignWithLabelAlloc`.
+pub fn VerifyWithLabelAlloc(
+    comptime S: type,
+    allocator: std.mem.Allocator,
+    public_key: S.Sig.PublicKey,
+    label: []const u8,
+    content: []const u8,
+    signature: S.Sig.Signature,
+) !void {
+    const buf = try allocator.alloc(u8, try signContentLen(label, content));
+    defer allocator.free(buf);
+    const sign_content = try encodeSignContent(buf, label, content);
+    try signature.verify(sign_content, public_key);
+}
+
 // ── §5.1.3: EncryptWithLabel / DecryptWithLabel ───────────────────────────
 
 /// Assembles `EncryptContext { opaque label<V>; opaque context<V>; }` (RFC
@@ -250,6 +298,61 @@ fn encodeEncryptContext(buf: []u8, label: []const u8, context: []const u8) codec
     try w.writeVectorConcat(&.{ mls10_label_prefix, label });
     try w.writeVector(context);
     return w.finish();
+}
+
+/// Exactly how many bytes `encodeEncryptContext(label, context)` needs —
+/// the `EncryptContext` mirror of `kdfLabelLen`, and it exists for the same
+/// reason.
+///
+/// **`EncryptWithLabel`'s `Context` has no fixed upper bound either, and
+/// two of RFC 9420's own uses of it exceed `label_scratch_len` in ordinary
+/// groups.** §12.4.3.1 seals each member's `GroupSecrets` with the whole
+/// `encrypted_group_info` as the context, which grows with the group (it
+/// contains the ratchet tree); §7.5 opens each `UpdatePathNode` with the
+/// serialized `GroupContext`, which grows with the group's extensions.
+/// Callers that can see either MUST use the `*Scratch` forms below —
+/// `welcome.zig` and `treekem.zig` do. The fixed-buffer
+/// `EncryptWithLabel`/`DecryptWithLabel` remain for callers whose context
+/// is genuinely bounded, and they still fail closed (`error.LabelTooLong`)
+/// rather than truncating.
+pub fn encryptContextLen(label: []const u8, context: []const u8) Error!usize {
+    const full_label_len = mls10_label_prefix.len + label.len;
+    return try codec.varint.encodedLen(full_label_len) + full_label_len +
+        try codec.varint.encodedLen(context.len) + context.len;
+}
+
+/// `EncryptWithLabel` over a CALLER-SUPPLIED scratch buffer, for contexts
+/// with no compile-time size bound. Size `scratch` with
+/// `encryptContextLen(label, context)`; anything smaller yields
+/// `error.LabelTooLong`.
+pub fn EncryptWithLabelScratch(
+    comptime S: type,
+    pkR: S.Kem.PublicKey,
+    io: std.Io,
+    label: []const u8,
+    context: []const u8,
+    plaintext: []const u8,
+    ciphertext_out: []u8,
+    scratch: []u8,
+) !S.Kem.EncappedKey {
+    const info = encodeEncryptContext(scratch, label, context) catch return error.LabelTooLong;
+    const sealed = try hpke.sealBase(S.Kem, S.Aead, S.Nh, pkR, io, info, "", plaintext, ciphertext_out);
+    return sealed.enc;
+}
+
+/// The receiver mirror of `EncryptWithLabelScratch`.
+pub fn DecryptWithLabelScratch(
+    comptime S: type,
+    enc: S.Kem.EncappedKey,
+    skR: S.Kem.KeyPair,
+    label: []const u8,
+    context: []const u8,
+    ciphertext: []const u8,
+    plaintext_out: []u8,
+    scratch: []u8,
+) !void {
+    const info = encodeEncryptContext(scratch, label, context) catch return error.LabelTooLong;
+    try hpke.openBase(S.Kem, S.Aead, S.Nh, enc, skR, info, "", ciphertext, plaintext_out);
 }
 
 /// RFC 9420 §5.1.3 `EncryptWithLabel(PublicKey, Label, Context,

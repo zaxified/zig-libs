@@ -428,7 +428,7 @@ pub fn signFramedContent(
 ) !S.Sig.Signature {
     const tbs = try framedContentTbsAlloc(allocator, wf, fc, group_context);
     defer allocator.free(tbs);
-    return crypto.SignWithLabel(S, key_pair, label_framed_content_tbs, tbs);
+    return crypto.SignWithLabelAlloc(S, allocator, key_pair, label_framed_content_tbs, tbs);
 }
 
 /// The verification counterpart. Only suite `0x0001` (Ed25519) is wired, so
@@ -446,7 +446,7 @@ pub fn verifyFramedContent(
     defer allocator.free(tbs);
     var sig_bytes: [S.Nx]u8 = undefined;
     @memcpy(&sig_bytes, ac.auth.signature);
-    try crypto.VerifyWithLabel(S, public_key, label_framed_content_tbs, tbs, S.Sig.Signature.fromBytes(sig_bytes));
+    try crypto.VerifyWithLabelAlloc(S, allocator, public_key, label_framed_content_tbs, tbs, S.Sig.Signature.fromBytes(sig_bytes));
 }
 
 // ── §6: AuthenticatedContent ──────────────────────────────────────────────

@@ -221,7 +221,9 @@ test "psk_secret.json: RFC 9420 §8.4's psk_secret chain for 0..10 PSKs, byte-ex
                     .id = .{ .external = try hexDecode(arena, p.object.get("psk_id").?.string) },
                     .psk_nonce = try hexDecode(arena, p.object.get("psk_nonce").?.string),
                 },
-                .secret = try hexSecret(p.object.get("psk").?.string),
+                // §8.4 feeds the PSK to `KDF.Extract` as IKM, so it is NOT
+                // width-constrained — see `keyschedule.PreSharedKey.secret`.
+                .secret = try hexDecode(arena, p.object.get("psk").?.string),
             };
         }
 

@@ -62,19 +62,26 @@
 //! framing layer did, and they live in their own file rather than here
 //! because `framing.zig` imports THIS file — folding §8.2 back in would
 //! close the loop into an import cycle.
-//! Still NOT here and still not anywhere: §8.3's external initialization,
-//! which needs an HPKE `SetupBaseS`/`SetupBaseR` context for the
-//! external-commit join flow (Part 6). It is not exercised by
-//! `key-schedule.json`, and stubbing it here would mean shipping
-//! untestable code.
+//! **§8.3's external initialization is now here too** (Part 7), which the
+//! comment in this place previously said was "not here and not anywhere":
+//! the sibling `hpke` module exports RFC 9180 §5.1's `setupBaseS`/
+//! `setupBaseR` and `Context.exportSecret`, so `externalInitSender`/
+//! `externalInitReceiver` are the two three-line compositions §8.3 asks
+//! for. Note honestly what that costs in ANCHORING: `key-schedule.json`
+//! does not exercise §8.3 and neither does any other upstream vector, so
+//! unlike every other derivation in this file those two are pinned by a
+//! sender/receiver ROUND TRIP and by RFC 9180's own KATs one layer down —
+//! not by an external byte-exact MLS anchor. See their doc comments.
 //!
-//! Model: RFC 9420 §8 (Key Schedule) + §8.1 (Group Context) + §8.4
-//! (Pre-Shared Keys) + §8.5 (Exporters) + §6.1 (Content Authentication's
-//! two MACs). Verified byte-exact against the official
-//! `mlswg/mls-implementations` `key-schedule.json` and `psk_secret.json`
-//! vectors — see `kat_keyschedule_test.zig` and `NOTICE`.
+//! Model: RFC 9420 §8 (Key Schedule) + §8.1 (Group Context) + §8.3
+//! (External Initialization) + §8.4 (Pre-Shared Keys) + §8.5 (Exporters) +
+//! §6.1 (Content Authentication's two MACs). Verified byte-exact against
+//! the official `mlswg/mls-implementations` `key-schedule.json` and
+//! `psk_secret.json` vectors — see `kat_keyschedule_test.zig` and
+//! `NOTICE`.
 
 const std = @import("std");
+const hpke = @import("hpke");
 const codec = @import("codec.zig");
 const suite = @import("suite.zig");
 const crypto = @import("crypto.zig");
@@ -382,6 +389,131 @@ pub fn externalKeyPair(comptime S: type, external_secret: [S.Nh]u8) S.Kem.KeyPai
     return S.Kem.deriveKeyPair(&external_secret);
 }
 
+// ── §8.3: external initialization ─────────────────────────────────────────
+
+/// RFC 9420 §8.3's export context string, verbatim. A one-character
+/// difference here produces a perfectly well-distributed `init_secret` that
+/// no other implementation derives, so it is a named constant read by both
+/// directions rather than a literal typed twice.
+pub const label_external_init = "MLS 1.0 external init secret";
+
+/// The outer HPKE `suite_id` (RFC 9180 §5.1/§7.2.1, `"HPKE" ||
+/// I2OSP(kem_id, 2) || I2OSP(kdf_id, 2) || I2OSP(aead_id, 2)`) that
+/// `hpke.Context.exportSecret` needs as its first argument.
+///
+/// **Why this is computed here rather than asked of `hpke`.** `hpke`
+/// derives the identical value internally (`schedule.zig`'s `suiteIdOf`)
+/// but does not export it, and `Context.exportSecret` takes it as a
+/// parameter — so an MLS caller holding a `Context` has no supported way to
+/// name the suite that `Context` was built for. `hpke.suite.suiteId` and
+/// `Kem.kem_id` ARE public, so only the `Aead` → `aead_id` mapping has to
+/// be restated, and it is restated for exactly the suites `suite.zig`
+/// wires. Anything else is a `@compileError` rather than a wrong id
+/// silently derived. See `SPEC.md`'s Backlog: the clean fix is upstream in
+/// `hpke`, which this batch was scoped out of.
+fn hpkeSuiteId(comptime S: type) [10]u8 {
+    const aead_id: u16 = if (S.Aead == std.crypto.aead.aes_gcm.Aes128Gcm)
+        @intFromEnum(hpke.AeadId.aes128gcm)
+    else if (S.Aead == std.crypto.aead.aes_gcm.Aes256Gcm)
+        @intFromEnum(hpke.AeadId.aes256gcm)
+    else if (S.Aead == std.crypto.aead.chacha_poly.ChaCha20Poly1305)
+        @intFromEnum(hpke.AeadId.chacha20poly1305)
+    else
+        @compileError("mls: no RFC 9180 aead_id registered for " ++ @typeName(S.Aead));
+    return hpke.suite.suiteId(
+        S.Kem.kem_id,
+        @intFromEnum(hpke.KdfId.hkdf_sha256),
+        aead_id,
+    );
+}
+
+/// What `externalInitSender` produces: the `kem_output` that goes into the
+/// `ExternalInit` proposal (RFC 9420 §12.1.6) and the `init_secret` the
+/// sender feeds its own key schedule with.
+pub fn ExternalInit(comptime S: type) type {
+    return struct {
+        kem_output: S.Kem.EncappedKey,
+        init_secret: [S.Nh]u8,
+    };
+}
+
+/// RFC 9420 §8.3, the JOINER's half:
+///
+/// ```text
+/// kem_output, context = SetupBaseS(external_pub, "")
+/// init_secret = context.export("MLS 1.0 external init secret", KDF.Nh)
+/// ```
+///
+/// `external_pub` is the group's published external key (the `external_pub`
+/// GroupInfo extension, or `externalKeyPair(external_secret).public_key` for
+/// a member computing it locally). The `info` argument is the EMPTY string,
+/// and the export context is `label_external_init` — neither is MLS's
+/// `ExpandWithLabel`/`KDFLabel` framing, because this derivation is
+/// RFC 9180's export, not RFC 9420's KDF.
+///
+/// **Anchoring, stated plainly.** No upstream MLS interop vector covers
+/// §8.3 — `key-schedule.json` stops at `external_secret` and there is no
+/// external-commit vector in `mlswg/mls-implementations` at the pinned
+/// revision. This function is therefore anchored two ways, neither of them
+/// an external MLS anchor: `externalInitReceiver` reproduces its
+/// `init_secret` from the `kem_output` alone (a round trip that a
+/// systematically wrong label breaks only if the two directions disagree —
+/// which is why the label is one shared constant and the test also pins its
+/// exact bytes), and the HPKE layer underneath it IS byte-exact KAT'd, in
+/// the sibling `hpke` module against RFC 9180's own published vectors.
+pub fn externalInitSender(
+    comptime S: type,
+    external_pub: S.Kem.PublicKey,
+    io: std.Io,
+) !ExternalInit(S) {
+    const setup = try hpke.setupBaseS(S.Kem, S.Aead, S.Nh, external_pub, io, "");
+    var init_secret: [S.Nh]u8 = undefined;
+    try setup.context.exportSecret(&hpkeSuiteId(S), label_external_init, &init_secret);
+    return .{ .kem_output = setup.enc, .init_secret = init_secret };
+}
+
+/// `externalInitSender` with the ephemeral KEM keypair injected rather than
+/// drawn from `io` — the deterministic seam its round-trip test needs, and
+/// the mirror of `hpke.schedule.setupBaseSDeterministic`'s reason to exist.
+/// Real callers want `externalInitSender`.
+pub fn externalInitSenderDeterministic(
+    comptime S: type,
+    external_pub: S.Kem.PublicKey,
+    ephemeral: S.Kem.KeyPair,
+) !ExternalInit(S) {
+    const setup = try hpke.schedule.setupBaseSDeterministic(S.Kem, S.Aead, S.Nh, external_pub, ephemeral, "");
+    var init_secret: [S.Nh]u8 = undefined;
+    try setup.context.exportSecret(&hpkeSuiteId(S), label_external_init, &init_secret);
+    return .{ .kem_output = setup.enc, .init_secret = init_secret };
+}
+
+/// RFC 9420 §8.3, the EXISTING MEMBERS' half — what every member runs on
+/// seeing an `ExternalInit` proposal carrying `kem_output`:
+///
+/// ```text
+/// context = SetupBaseR(kem_output, external_priv, "")
+/// init_secret = context.export("MLS 1.0 external init secret", KDF.Nh)
+/// ```
+///
+/// The resulting `init_secret` REPLACES the previous epoch's `init_secret`
+/// as the salt of the new epoch's first Extract (§12.4.2 via §12.3: "If
+/// there is an ExternalInit proposal, use it to derive the init_secret for
+/// use later in Commit processing") — it does not mix with it.
+///
+/// `external_key_pair` is `externalKeyPair(S, secrets.external_secret)` for
+/// the epoch the external Commit was made against. Same anchoring caveat as
+/// `externalInitSender` — see there.
+pub fn externalInitReceiver(
+    comptime S: type,
+    kem_output: S.Kem.EncappedKey,
+    external_key_pair: S.Kem.KeyPair,
+) ![S.Nh]u8 {
+    var context = try hpke.setupBaseR(S.Kem, S.Aead, S.Nh, kem_output, external_key_pair, "");
+    var init_secret: [S.Nh]u8 = undefined;
+    try context.exportSecret(&hpkeSuiteId(S), label_external_init, &init_secret);
+    return init_secret;
+}
+
 // ── §8.5: MLS-Exporter ────────────────────────────────────────────────────
 
 /// RFC 9420 §8.5 `MLS-Exporter(Label, Context, Length) =
@@ -549,9 +681,24 @@ pub const PreSharedKeyId = struct {
 /// `id` — resolving that is the caller's job (this file has no access to
 /// other epochs' state).
 pub fn PreSharedKey(comptime S: type) type {
+    _ = S; // the secret is no longer width-constrained; see `secret` below
     return struct {
         id: PreSharedKeyId,
-        secret: [S.Nh]u8,
+        /// **Any length.** §8.4's first step is `psk_extracted =
+        /// KDF.Extract(0, psk)`, i.e. the PSK is HKDF *input keying
+        /// material*, which HKDF accepts at any width — an application PSK
+        /// is whatever the out-of-band mechanism produced and is under no
+        /// obligation to be `KDF.Nh` bytes. This field was `[S.Nh]u8` until
+        /// the `passive-client-*.json` vectors (whose external PSKs are 14
+        /// bytes) showed that rejecting other widths refuses perfectly
+        /// legal input; `psk_secret.json`'s suite-`0x0001` entries all
+        /// happen to use 32-byte PSKs, which is why no earlier vector
+        /// caught it.
+        ///
+        /// For a RESUMPTION PSK the secret is the `resumption_psk` of the
+        /// group/epoch named in `id`, and that one IS `KDF.Nh` wide by
+        /// construction.
+        secret: []const u8,
     };
 }
 
@@ -603,7 +750,7 @@ pub fn pskSecret(comptime S: type, allocator: std.mem.Allocator, psks: []const P
     const zero = zeroSecret(S);
 
     for (psks, 0..) |psk, i| {
-        const extracted = S.Hkdf.extract(&zero, &psk.secret);
+        const extracted = S.Hkdf.extract(&zero, psk.secret);
 
         const psk_label: PskLabel = .{ .id = psk.id, .index = @intCast(i), .count = count };
         const label_buf = try allocator.alloc(u8, psk_label.encodedLen());
@@ -753,11 +900,11 @@ test "pskSecret: empty list is psk_secret_[0], and order/count/nonce all change 
     const nonce_b = [_]u8{0xb0} ** TestSuite.Nh;
     const k0: PreSharedKey(TestSuite) = .{
         .id = .{ .id = .{ .external = "id-0" }, .psk_nonce = &nonce_a },
-        .secret = [_]u8{0x10} ** TestSuite.Nh,
+        .secret = &[_]u8{0x10} ** TestSuite.Nh,
     };
     const k1: PreSharedKey(TestSuite) = .{
         .id = .{ .id = .{ .external = "id-1" }, .psk_nonce = &nonce_b },
-        .secret = [_]u8{0x20} ** TestSuite.Nh,
+        .secret = &[_]u8{0x20} ** TestSuite.Nh,
     };
 
     const forward = try pskSecret(TestSuite, testing.allocator, &.{ k0, k1 });
@@ -850,4 +997,59 @@ test "externalKeyPair: deterministic in external_secret, and a distinct secret g
     const kb = externalKeyPair(TestSuite, b);
     try testing.expectEqualSlices(u8, &ka1.public_key, &ka2.public_key);
     try testing.expect(!std.mem.eql(u8, &ka1.public_key, &kb.public_key));
+}
+
+// ── §8.3 ──────────────────────────────────────────────────────────────
+//
+// ROUND-TRIP ANCHORED ONLY, and deliberately so — there is no upstream MLS
+// interop vector for §8.3 (see `externalInitSender`'s doc comment). What
+// these tests can still pin independently of the round trip: the export
+// context string's exact bytes, that the derivation is bound to the group's
+// external key pair, and that it is bound to the `kem_output`.
+
+test "§8.3: the export context string is RFC 9420's exact bytes" {
+    // Spelled out rather than compared to itself: the round-trip test below
+    // passes for ANY label as long as both directions use the same one, so
+    // this is the only check that pins the wire-visible constant.
+    try testing.expectEqualStrings("MLS 1.0 external init secret", label_external_init);
+    try testing.expectEqual(@as(usize, 28), label_external_init.len);
+}
+
+test "§8.3: hpkeSuiteId reproduces RFC 9180 §7.2.1's suite_id for suite 0x0001" {
+    // "HPKE" || kem_id(0x0020, DHKEM(X25519,HKDF-SHA256)) ||
+    // kdf_id(0x0001, HKDF-SHA256) || aead_id(0x0001, AES-128-GCM).
+    const want = [_]u8{ 'H', 'P', 'K', 'E', 0x00, 0x20, 0x00, 0x01, 0x00, 0x01 };
+    try testing.expectEqualSlices(u8, &want, &hpkeSuiteId(TestSuite));
+}
+
+test "§8.3: sender and receiver derive the same init_secret, and it is bound to both inputs" {
+    const external_secret = [_]u8{0x5a} ** TestSuite.Nh;
+    const group_key = externalKeyPair(TestSuite, external_secret);
+
+    var eph_seed: [32]u8 = @splat(0x77);
+    const eph = try TestSuite.Kem.KeyPair.generateDeterministic(eph_seed);
+    eph_seed = @splat(0);
+
+    const sent = try externalInitSenderDeterministic(TestSuite, group_key.public_key, eph);
+    const received = try externalInitReceiver(TestSuite, sent.kem_output, group_key);
+    try testing.expectEqualSlices(u8, &sent.init_secret, &received);
+
+    // An `init_secret` that ignored the group's external key would let any
+    // non-member drive the group into an epoch of their choosing.
+    const other_group = externalKeyPair(TestSuite, [_]u8{0x5b} ** TestSuite.Nh);
+    const other_sent = try externalInitSenderDeterministic(TestSuite, other_group.public_key, eph);
+    try testing.expect(!std.mem.eql(u8, &sent.init_secret, &other_sent.init_secret));
+
+    // …and a receiver handed a kem_output from that other exchange must not
+    // land on this one's secret either.
+    const cross = try externalInitReceiver(TestSuite, other_sent.kem_output, other_group);
+    try testing.expect(!std.mem.eql(u8, &sent.init_secret, &cross));
+
+    // Decapsulating with the wrong private key yields a DIFFERENT secret
+    // rather than an error: X25519 decap cannot fail on a well-formed
+    // point, so §8.3 has no built-in authentication of the group — what
+    // makes an external Commit safe is the confirmation_tag check the
+    // committer's own key schedule ends with, not this exchange.
+    const wrong = try externalInitReceiver(TestSuite, sent.kem_output, other_group);
+    try testing.expect(!std.mem.eql(u8, &sent.init_secret, &wrong));
 }

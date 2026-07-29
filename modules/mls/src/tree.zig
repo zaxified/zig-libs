@@ -424,7 +424,7 @@ pub const LeafNode = struct {
         var sig_bytes: [64]u8 = undefined;
         @memcpy(&sig_bytes, self.signature);
         const sig = S.Sig.Signature.fromBytes(sig_bytes);
-        try crypto.VerifyWithLabel(S, pk, "LeafNodeTBS", content, sig);
+        try crypto.VerifyWithLabelAlloc(S, allocator, pk, "LeafNodeTBS", content, sig);
     }
 };
 
@@ -463,10 +463,26 @@ pub const ParentNode = struct {
     /// allocation containing the old list plus `leaf_index` appended
     /// (caller frees the OLD `unmerged_leaves` — this does not, since the
     /// caller may still hold other references to it, e.g. mid-iteration).
+    /// **Inserted in sorted position, not appended.** RFC 9420 §7.1: "The
+    /// entries in the unmerged_leaves vector MUST be sorted in increasing
+    /// order." Appending happens to be sorted whenever leaves are only ever
+    /// added to the right, which is the only case Part 2 could produce —
+    /// but an Add that reuses a blank leaf to the LEFT of an existing
+    /// unmerged leaf breaks it, and the damage is invisible until a
+    /// `resolution` (which reads this list in order) hands a path secret to
+    /// the wrong node, or a tree hash diverges.
     pub fn withAppendedUnmerged(self: ParentNode, allocator: std.mem.Allocator, leaf_index: u32) !ParentNode {
         var new_list = try allocator.alloc(u32, self.unmerged_leaves.len + 1);
-        @memcpy(new_list[0..self.unmerged_leaves.len], self.unmerged_leaves);
-        new_list[self.unmerged_leaves.len] = leaf_index;
+        var at: usize = self.unmerged_leaves.len;
+        for (self.unmerged_leaves, 0..) |existing, i| {
+            if (existing > leaf_index) {
+                at = i;
+                break;
+            }
+        }
+        @memcpy(new_list[0..at], self.unmerged_leaves[0..at]);
+        new_list[at] = leaf_index;
+        @memcpy(new_list[at + 1 ..], self.unmerged_leaves[at..]);
         return .{ .encryption_key = self.encryption_key, .parent_hash = self.parent_hash, .unmerged_leaves = new_list };
     }
 };
@@ -703,6 +719,39 @@ pub const RatchetTree = struct {
         }
     }
 };
+
+// ── §7.1: unmerged_leaves stays sorted ────────────────────────────────────
+
+// Regression guard for `withAppendedUnmerged`. §7.1 makes the ordering a
+// MUST, and it is load-bearing: `resolution` reads this list in order, so
+// an out-of-order entry hands a path secret to the wrong node. No KAT
+// covers it — the passive-client sessions never happen to add a leaf to
+// the LEFT of an existing unmerged one, so a plain append passes all of
+// them. Without this test the ordering could be lost silently.
+test "§7.1: withAppendedUnmerged inserts in order, not at the end" {
+    const gpa = std.testing.allocator;
+    const node: ParentNode = .{
+        .encryption_key = &.{},
+        .parent_hash = &.{},
+        .unmerged_leaves = &.{ 2, 5 },
+    };
+
+    // A leaf reclaimed to the LEFT of both must land first, not last.
+    const left = try node.withAppendedUnmerged(gpa, 1);
+    defer gpa.free(left.unmerged_leaves);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 5 }, left.unmerged_leaves);
+
+    // ... and one in the middle keeps the run ascending.
+    const mid = try node.withAppendedUnmerged(gpa, 3);
+    defer gpa.free(mid.unmerged_leaves);
+    try std.testing.expectEqualSlices(u32, &.{ 2, 3, 5 }, mid.unmerged_leaves);
+
+    // The append case must still work — this is the one a plain append
+    // would also get right, which is why it cannot stand alone.
+    const right = try node.withAppendedUnmerged(gpa, 9);
+    defer gpa.free(right.unmerged_leaves);
+    try std.testing.expectEqualSlices(u32, &.{ 2, 5, 9 }, right.unmerged_leaves);
+}
 
 // ── fuzz: the untrusted-wire tree decoders never panic/OOB ────────────────
 
