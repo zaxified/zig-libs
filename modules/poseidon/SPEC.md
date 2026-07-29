@@ -239,7 +239,7 @@ module's own, borrowed from the BN254 side; it does not match Filecoin's
 `neptune` or dusk, which use domain tags. `bls12_381_poseidon.zig` says so at
 the call site.
 
-### Candidate follow-up: Rescue / Rescue-Prime
+### Follow-up, now BUILT: Rescue-Prime Optimized (`modules/rescue/`)
 
 The obvious sibling. Same motivation (cheap in a circuit), same field, but a
 different design strategy — every round is full, with alternating `x^alpha`
@@ -248,6 +248,14 @@ evaluation for a lower algebraic degree. Rescue-Prime has a published
 specification and KATs, so it would be anchorable at the same grade. It would
 be a separate module, not a mode of this one: different round function,
 different parameter generator, nothing shared but the field.
+
+**Built as `modules/rescue/` — and two of the expectations above were wrong.**
+It is a separate module as predicted, but it shares no field with this one:
+the deployed variant (RPO) uses Goldilocks `p = 2^64 − 2^32 + 1`, which this
+collection did not have, so `rescue` carries its own small field. And
+"Rescue-Prime has published KATs" is false — the Rescue-Prime reference
+implementation publishes none; RPO publishes 38. Anchoring, not deployment,
+is what decided the variant.
 
 ## Performance note
 

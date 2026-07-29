@@ -524,12 +524,27 @@ pub fn Pir(comptime domain_bits: usize, comptime word_bytes: usize) type {
             };
         }
 
+        // ── malicious-server detection ────────────────────────────────────
+
+        /// Detection of a lying server: this value protocol unchanged, plus a
+        /// MACed tag channel in a ring widened by `tag_slack_bytes` (soundness
+        /// error `2^(1−8·tag_slack_bytes)`; `8` is the recommended default).
+        /// Detection only — abort, no recovery, no attribution; see
+        /// `verify.zig`'s module doc for the exact security statement.
+        pub fn Verified(comptime tag_slack_bytes: usize) type {
+            return @import("verify.zig").Verified(domain_bits, word_bytes, tag_slack_bytes);
+        }
+
         // ── record ↔ word decomposition ───────────────────────────────────
 
         /// Word `j` of `record`, little-endian, zero-padded past the end.
         /// Reading past the record is defined rather than an error so the
         /// final partial word needs no special case in the hot loop.
-        fn wordAt(record: []const u8, j: usize) Word {
+        /// `pub` because the `Verified` layer's tag channel must decompose
+        /// records into EXACTLY these words (zero-extended) — a re-derived
+        /// decomposition that drifted from this one would break the honest
+        /// `t_j == m·w_j` relation.
+        pub fn wordAt(record: []const u8, j: usize) Word {
             var buf: [word_bytes]u8 = @splat(0);
             const start = j * word_bytes;
             if (start < record.len) {

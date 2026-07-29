@@ -222,16 +222,16 @@ except at `i`. This is a full-domain scan and nothing more. `privacy_test.zig`
 executes this attack as a passing test rather than describing it, because a
 threat model in prose is a threat model people skip.
 
-**Other real failure modes, none of which this module can detect:**
+**Other real failure modes, none of which the BASE protocol can detect** (the
+`Verified` layer detects the first two — see §"Malicious-server detection"):
 
 - *Replica divergence.* Both servers must hold byte-identical databases in the
   same order. Off-target terms cancel term-by-term across the two servers; a
   record that differs between them, or a differing record count, leaves an
   uncancelled term and silently corrupts the answer.
-- *Malicious answers.* There is no verification step. A server can return
-  anything; the client reconstructs garbage without noticing. Two-server PIR
-  has no integrity mechanism, and adding one (e.g. an authenticated variant)
-  is a different protocol, not a flag.
+- *Malicious answers.* The base protocol has no verification step. A server
+  can return anything; the client reconstructs garbage without noticing.
+  `Verified` turns that into an abort — detection, never recovery.
 - *Seed reuse.* `query`'s two seeds are the protocol's only randomness and the
   DPF is deterministic given them. Reusing a seed pair across queries for
   different indices hands a server two shares related by a known structure.
@@ -241,6 +241,172 @@ threat model in prose is a threat model people skip.
   is all it takes.
 - *Traffic analysis above this layer.* Query timing, frequency and correlation
   with observable events are outside a library with no I/O.
+
+## Malicious-server detection (`verify.zig`)
+
+The base protocol's security model is honest-but-curious: a server learns
+nothing about `i`, but is trusted to answer honestly. `Verified(domain_bits,
+word_bytes, tag_slack_bytes)` removes the honesty assumption for **integrity**:
+a client detects a lying server and aborts. It deliberately does **not**
+attempt more than that, and this section is exact about the boundary.
+
+### The construction chosen
+
+**A client-side secret-scalar MAC carried through the protocol's own
+linearity, checked in a widened ring.** Alongside the unchanged value channel
+(a DPF for `f_{i,1}` in `Z_{2^{8L}}`), the client runs an independent **tag
+channel**: a DPF for `f_{i,m}` — the DPF's value parameter β set to a secret
+ring element `m` only the client knows — evaluated in the widened ring
+`Z_{2^{8(L+S)}}`, `S = tag_slack_bytes`. The server's tag inner product runs
+over the *same* `L`-byte record words as the value channel, zero-extended,
+plus one extra **presence word** whose coefficient is 1 for every record.
+Honest reconstruction therefore yields `t_j = m·w_j` for every value word and
+`t_presence = m`, and the client checks exactly that.
+
+Everything a deviating server can do — flip bits, replay an old answer,
+answer over a privately modified database, return zeros, return arbitrary
+bytes — lands as an additive error `(e_v, e_t)` on the reconstruction,
+because the transcript is linear and the honest answers are determined by
+(key, database). The whole argument is then two steps:
+
+1. *The error is independent of `m`.* A server's view is its two keys and the
+   database; the tag key hides β = m exactly as it hides α (the DPF's hiding
+   property covers the pair). So `(e_v, e_t)` is chosen by something that —
+   computationally — knows nothing about `m`.
+2. *Passing the check requires knowing `m`.* Accepting requires
+   `e_t ≡ m·(e_v − δ·2^{8L}) (mod 2^{8(L+S)})` per word, where `δ ∈ {0,1}` is
+   the carry of the value word's wrap. For `e_v ≠ 0` the right-hand side is
+   `m` times a nonzero integer of 2-adic valuation ≤ `8L−1`, so over a uniform
+   odd `m` the adversary's chosen `e_t` matches with probability at most
+   `2^{−8S}` per carry guess, `2^{1−8S}` hedging both. An `e_t`-only error
+   (`e_v = 0`) is caught deterministically.
+
+**Soundness error: ≤ `2^{1−8S}` + Adv_PRG**, a function of `tag_slack_bytes`
+and of nothing else — not of `N`, not of the record length, not of the queried
+index. `S = 8` (the recommended default) gives `2^{−63}` plus the PRG term.
+`m` is forced odd (one entropy bit spent to remove the even weak class and
+make the presence check exact; the bound above already assumes odd `m`) and
+must be fresh per query — against a reused `m`, each *rejected* forgery
+attempt eliminates candidate values, degrading soundness linearly in the
+number of attempts.
+
+**Why the ring is widened.** With `S = 0` the check is not weak but broken:
+`m·2^{8L−1} = 2^{8L−1}` for every odd `m` (zero divisors of `Z_{2^k}` — the
+standard MAC-over-`Z_{2^k}` failure), so flipping the value's top bit and
+adding `2^{8L−1}` to the tag forges with probability 1 and no knowledge of
+`m`. Widening is the standard fix (cf. the SPDZ2k MAC): the compensating tag
+error becomes `m·2^{8L−1} mod 2^{8(L+S)}`, a function of `8S+1` secret bits of
+`m`. `S = 0` is a compile error; the attack is a test, in both forms — it
+demonstrably succeeds in the un-widened arithmetic and demonstrably fails
+against the widened check.
+
+**Why the presence word exists.** `t = m·v` is satisfied by the all-zero
+transcript, and *two malicious servers that each independently zero their own
+answers* — no collusion needed — would otherwise make the client accept an
+all-zero record. The presence word pins `t_presence = m ≠ 0`, which no
+transcript built without `m` can supply. Consequence, chosen deliberately: a
+query for an index inside the domain but past the database — an all-zero
+reconstruction in the base layer — **rejects** in the verified layer, because
+an honest all-zero is indistinguishable from the zeroing forgery. The
+verified layer requires `index < db.count()`.
+
+### The exact security statement
+
+- **Detection, not robustness.** On a lie the client gets
+  `error.AnswerRejected` — it does not recover the record, and it cannot tell
+  *which* server lied (only the sum of the two answers is checkable). With two
+  servers and one of them malicious, detect-but-not-recover is the honest
+  ceiling for this construction; Byzantine-robust PIR needs more servers.
+- **One malicious server:** any deviation that would change the reconstructed
+  record is detected except with probability ≤ `2^{1−8S}` + Adv_PRG.
+  Deviations that would *not* change the record (tag-only tampering) also
+  abort — detection is conservative.
+- **Both servers malicious, not colluding:** still detected, same bound —
+  their errors add, and the sum is still independent of `m`.
+- **Both servers colluding:** no integrity, and no privacy — they pool the tag
+  keys, run the same full-domain scan that recovers `i`, read off `m`, and
+  forge `e_t = m·(e_v − δ·2^{8L})` exactly (they know `record[i]`, hence the
+  carry). Collusion was already total loss in the base protocol; the verified
+  layer does not move that boundary, and a test performs the forgery so the
+  limitation is executable rather than a footnote.
+- **Both servers honestly serving the same wrong database: NOT detected.** The
+  MAC binds the answer to the database the two servers *jointly* used, not to
+  any database the client expects. A test asserts the acceptance. Binding to
+  a published database is authenticated PIR — see below.
+- **Privacy is not degraded.** The tag key is one more DPF key under the same
+  hiding assumption; lengths are geometry-only (asserted, including across `m`
+  values); and the only new observable, the abort bit, shifts by at most the
+  soundness error across indices — a fixed `m`-independent tampering rejects
+  for *every* index (asserted), so there is no selective-failure index test.
+  The carve-out, stated exactly: an adversary can make the *carry* `δ` of an
+  attacked word depend on `record[i]`, but acceptance still requires hitting
+  `m`, so the abort probability varies across indices by at most `2^{1−8S}`.
+
+### Against the alternatives
+
+- **Authenticated PIR (Colombo et al., USENIX Security 2023) — digest +
+  verifiable answers.** Strictly stronger in one dimension: it binds answers
+  to a *published* database digest, so even two servers agreeing on a modified
+  database are caught. Not chosen because it changes what the system *is*:
+  the client must obtain and refresh an authentic digest out of band (a new
+  trust anchor and a publishing pipeline), and the scheme dictates the
+  database encoding rather than composing over this module's. The chosen
+  construction needs no digest, no publisher, no database change and no new
+  primitive — and the one property it thereby gives up is stated and tested
+  (`ATTACK NOT CAUGHT`) rather than blurred. Where database authenticity
+  matters, a digest mechanism *composes on top* (e.g. records carrying
+  publisher signatures verified after retrieval) without touching this layer.
+- **Cross-checking / repetition.** Repeating the query with fresh keys and
+  comparing fails against the simplest adversary: a server that adds the
+  *same* constant to its answer every time produces identical wrong
+  reconstructions that compare equal. Repetition detects only *inconsistent*
+  lying, doubles bandwidth, and its guarantee degrades with an adversary that
+  remembers. Rejected outright.
+- **Merkle / Poseidon commitment with per-record openings.** Same trust-model
+  change as authenticated PIR (an authentic root must reach the client), plus
+  a mechanical cost this module would inherit: an opening is `log N` siblings
+  whose positions depend on `i`, so retrieving it privately means `log N`
+  further PIR queries (or growing every record by the whole path). `poseidon`
+  landing in this repo makes the hash cheap, not the protocol — considered
+  and declined; it becomes attractive only together with the digest trust
+  model, i.e. as part of a future authenticated-PIR module, not as a flag
+  here.
+- **"Verifiable DPF" (BGI sketching and successors).** Protects the *servers*
+  from a malformed client key — the opposite direction from what is wanted
+  here, and conflating the two would produce a module that sounds right and
+  protects nothing. Nothing in this layer validates the client's key
+  (nothing can, in plain two-server PIR); a malicious client can still only
+  corrupt its own retrieval.
+
+### Constant-time position
+
+The client's check is a fixed-trip loop of ring multiply/add/xor accumulating
+one difference word — no data-dependent branch, no early exit — with a single
+final branch on the accept bit, which is the protocol's own public output (the
+abort is visible by definition). Timing therefore does not reveal which word
+mismatched or by how much. Wide-integer `*%` compiles to branch-free multiply
+chains on the supported targets. The DPF evaluation underneath keeps `fss`'s
+documented posture (control-bit-gated branches, hardening scoped out there);
+this layer adds no new branch on secret data.
+
+### Anchoring the verified layer
+
+No external vector exists, for the base protocol's reasons plus one of its
+own: the MAC scalar is a per-query client secret, so a published vector would
+have to fix it, and there is no published construction to borrow one from —
+the layer is a composition (DPF β-programming + SPDZ2k-style widened check)
+assembled here, not an implementation of a named scheme's wire format. The
+test labels extend the base table with one entry:
+
+| Label | Meaning |
+|---|---|
+| `ATTACK` | a simulated malicious server; the module plays both attacker and defender. SELF-grade evidence for the *detection* property: it proves the check fires on these concrete deviations (bit flips at every position, zeroing by one and by both servers, replay, one-sided database modification, the top-bit ring forgery) and — just as deliberately — that two specific attacks are **accepted**: the colluding forgery and the agreed-wrong-database, which are the two documented limitations made executable. |
+
+The tag channel's honest value is separately `DERIVED` (recomputed as `m·word`
+straight from the plaintext, no DPF), and both new untrusted boundaries (a
+server parsing a bundled share; a client parsing four answers) carry the same
+exhaustive length sweeps and `std.testing.fuzz` harnesses as the base codec,
+including the full hostile-share server path over both channels.
 
 ## Privacy — what is and is not established
 
@@ -373,6 +539,9 @@ applied, the suite run, and the mutation reverted:
 | server's loop stops one record short | the retrieval sweep, the `DERIVED` re-derivation, and the every-record-influences test |
 | a **real** one-bit index leak into `cw_final` in the live `query` path | the correctness tests **and the STAT privacy test** — which is the evidence that the STAT test fires on a genuine regression, not only on its own synthetic controls |
 | `reconstructFromBytes` derives its word count from the **input** buffer instead of the receiver's geometry (the bug shape the brief flags) | the exhaustive length sweep, the geometry-error test, and a hard `SIGABRT` under the standalone hammer |
+| **(Verified)** the presence-word check dropped from `reconstruct` | the coordinated-zeroing test, the presence-bit-flip sweep, and the unpopulated-index test — 3 tests, exactly the ones that exist because of that word |
+| **(Verified)** the MAC loop checks only word 0 (`per` → `min(per, 1)`) | both bit-flip sweeps, on flips in words ≥ 1 |
+| **(Verified)** the tag comparison truncated to the low `8L` bits — an "inconclusive" check that silently reintroduces the un-widened ring | the tag-answer bit-flip sweep (high-bit flips sail through) **and the top-bit ring-forgery test** — the test built to guard the widening catches its removal |
 
 ## Fuzzing
 
@@ -480,8 +649,13 @@ protocol modules: bytes in, bytes out, and the transport is the integrator's.
   outside, instances inside) but still costs `k·N` DPF evaluations. The
   cuckoo/batch-code multi-point construction would cut that to `O(N)`; it is
   scoped out in `fss` with its revisit trigger stated there.
-- **Answer verification / malicious-server security.** A different protocol
-  (authenticated or verifiable PIR), not a flag on this one.
+- ~~**Answer verification / malicious-server security.**~~ **Built** —
+  `Verified`, §"Malicious-server detection" above: detection of a lying
+  server via a secret-scalar MAC in a widened ring. What remains scoped out
+  of *that* is stated there: recovery/robustness, attribution, binding to a
+  published database (authenticated PIR), and a verified `Multi(k)` (`k` tag
+  channels compose the same way; nothing new cryptographically, deferred
+  until a consumer wants it).
 - **PIR by keyword.** Index lookup only; keyword PIR needs a hashing/cuckoo
   layer above this.
 - **Hiding `k` itself.** `k` is public protocol geometry and the share length

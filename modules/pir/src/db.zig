@@ -22,9 +22,10 @@
 
 const std = @import("std");
 
-/// Every error this module can return. All of them are length/size
-/// disagreements or out-of-range parameters; none is a cryptographic failure
-/// (PIR has no verification step — see `SPEC.md` §"What this does not do").
+/// Every error this module can return. All but one are length/size
+/// disagreements or out-of-range parameters; the exception is
+/// `AnswerRejected`, the `Verified` layer's integrity failure (the base
+/// protocol still has no verification step — see `SPEC.md`).
 pub const Error = error{
     /// a database with no records: there is nothing to retrieve
     EmptyDatabase,
@@ -51,6 +52,11 @@ pub const Error = error{
     SeedReuse,
     /// more than `2^31` records — beyond the DPF's maximum domain
     DatabaseTooLarge,
+    /// the `Verified` layer's integrity check failed: at least one server's
+    /// answer is not the honest answer over the two servers' common database
+    /// (or the queried index is past the database — see `verify.zig` on why
+    /// that case rejects). Detection only: no recovery, no attribution.
+    AnswerRejected,
 };
 
 /// A borrowed, fixed-record-length view over a database. Both servers MUST

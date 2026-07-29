@@ -896,4 +896,17 @@ project git history).
                P-256 has no efficiently-computable endomorphism, so — unlike
                k256 — there is no GLV construction to attribute.
 
+`rescue`   —  Rescue-Prime Optimized (RPO). The permutation, its parameters
+               and the constant-derivation rule are public specification facts
+               from the RPO report (github.com/ASDiscreteMathematics/rpo) and
+               eprint 2020/1143. The 38 published test vectors in that report,
+               Winterfell's Rescue-XLIX permutation KAT, and miden-crypto's
+               `EXPECTED` digests are used as byte-exact test ORACLES — policy
+               §0's black-box-oracle relationship, needing no attribution and
+               recorded here only for provenance. Winterfell's Rescue-XLIX
+               round constants could NOT be re-derived from the published
+               generator and are embedded as a pinned blob; that table is the
+               one place where an upstream artifact is carried rather than
+               reproduced, and `modules/rescue/SPEC.md` says so.
+
 See each module's README "Provenance" note for its specific design references.

@@ -238,6 +238,12 @@ const module_list = [_]Module{
     // this module is ~1s against ~27s at ReleaseSafe, so marking it heavy
     // would cost more than it saves).
     .{ .name = "poseidon", .deps = &.{ "bn254", "bls12_381" } },
+    // Not heavy, despite the inverse S-box (72 multiplies per element per
+    // half-round). Measured serially on this host: strict-Debug compile ~8.5s
+    // + run ~1.0s = 9.5s, under the >15s threshold — and a ReleaseSafe compile
+    // of this module is ~46s (comptime SHAKE256 derivation + heavily unrolled
+    // field code), so marking it heavy would cost 5x what it saves.
+    .{ .name = "rescue" },
     .{ .name = "tfhe", .heavy = true },
     .{ .name = "montint", .heavy = true },
     .{ .name = "chachapoly" },

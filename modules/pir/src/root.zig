@@ -40,6 +40,11 @@
 //!     single multi-point inner product actually computes (`Σ_j record[α_j]`,
 //!     one record of download — an aggregate, *not* `k`-record retrieval).
 //!     ⚠ `k` is public: the share length and the answer width both reveal it.
+//!   - `Verified(domain_bits, word_bytes, tag_slack_bytes)` — **detection of
+//!     a lying server**: the same protocol plus a MACed tag channel; the
+//!     client aborts (`error.AnswerRejected`) instead of silently
+//!     reconstructing a doctored record. Detection only — no recovery, no
+//!     attribution, colluding servers still win. Also `Pir(b,L).Verified(S)`.
 //!   - `Database` — a borrowed, fixed-record-length view over bytes you
 //!     already have.
 //!   - `domainBitsFor(count)` — pick `domain_bits` for a record count.
@@ -47,11 +52,15 @@
 //! ## Scoped out
 //!
 //! Multi-*record*-sized retrieval — a whole block rather than a bit — needed
-//! nothing extra and is the default case: see `pir.zig`. Still out:
-//! keyword/PIR-by-keyword, answer verification against a malicious server, and
-//! **sublinear** batch PIR (`Multi(k)` amortizes the database pass but still
-//! costs `k` DPF evaluations per record; the cuckoo/batch-code multi-point
-//! construction that would fix that is scoped out in `fss`).
+//! nothing extra and is the default case: see `pir.zig`. Answer verification
+//! against a malicious server is now `Verified` (`verify.zig`) — detection
+//! and abort, never recovery. Still out: keyword/PIR-by-keyword, robustness
+//! and attribution (inherent at two servers), binding answers to a
+//! *published* database digest (authenticated PIR — a different trust model,
+//! see `SPEC.md`), a verified `Multi(k)`, and **sublinear** batch PIR
+//! (`Multi(k)` amortizes the database pass but still costs `k` DPF
+//! evaluations per record; the cuckoo/batch-code multi-point construction
+//! that would fix that is scoped out in `fss`).
 
 const std = @import("std");
 
@@ -65,10 +74,19 @@ pub const meta = .{
 
 const db_mod = @import("db.zig");
 const pir_mod = @import("pir.zig");
+const verify_mod = @import("verify.zig");
 
 /// `Pir(domain_bits, word_bytes)` — the two-server PIR protocol over a
 /// `2^domain_bits` index domain. See `pir.zig`.
 pub const Pir = pir_mod.Pir;
+
+/// `Verified(domain_bits, word_bytes, tag_slack_bytes)` — the same protocol
+/// with **detection of a lying server**: a MACed tag channel that makes the
+/// client abort (`error.AnswerRejected`) instead of silently reconstructing a
+/// doctored record. Also reachable as `Pir(b, L).Verified(S)`. Detection
+/// only — no recovery, no attribution, and colluding servers still defeat it
+/// (as they already defeat privacy). See `verify.zig`.
+pub const Verified = verify_mod.Verified;
 
 /// A borrowed, fixed-record-length view over a database. See `db.zig`.
 pub const Database = db_mod.Database;
@@ -88,6 +106,7 @@ test {
     std.testing.refAllDecls(@This());
     _ = db_mod;
     _ = pir_mod;
+    _ = verify_mod;
     _ = @import("privacy_test.zig");
 }
 

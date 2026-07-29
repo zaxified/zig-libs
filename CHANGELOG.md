@@ -60,6 +60,62 @@ Per-module API changes since v0.1.0 worth calling out:
   and that error's meaning narrows to "key material was named but none of it
   could be reduced to a comparable key". Same-form matching, and every
   non-HoK path, are unchanged. New sibling dependency: `x509`.
+- **`pir`:** malicious-server detection (`Verified(...)`). The module's model
+  was honest-but-curious: a server learned nothing about the index but was
+  assumed to answer honestly, so a doctored share made the client silently
+  reconstruct a wrong record. It now runs a second DPF for the same index
+  whose payload is a **client-secret odd scalar `m`**, so the tag answer is
+  `m·word` by the protocol's own linearity, checked in a widened ring
+  (SPDZ2k-style) together with a presence word. No new dependency: the tag
+  key is one more DPF key under the same hiding.
+  The security statement, stated exactly because over-claiming here would be
+  worse than not building it: **detection, not robustness** — the client
+  aborts with `error.AnswerRejected`, does not recover the record and cannot
+  say which server lied. Any record-changing deviation by ONE server (or by
+  both, if they do not pool keys) is caught except with probability
+  `≤ 2^(1−8S) + Adv_PRG`, a function of `tag_slack_bytes` alone (2^−63 at the
+  default). **Colluding servers forge undetectably** — the same full-domain
+  scan that recovers the index recovers `m` — and **two servers holding the
+  same wrong database are accepted**, since the MAC binds to the servers'
+  common data rather than to a published digest. Both are asserted as
+  `ATTACK NOT CAUGHT` tests, not left implicit. Privacy is unchanged, and the
+  abort verdict is index-independent, so the check adds no selective-failure
+  oracle. `S = 0` is a `@compileError`: in the un-widened ring
+  `m·2^(8L−1) = 2^(8L−1)` for every odd `m`, so a top-bit forgery would pass
+  with probability 1. Querying past the database now **rejects** rather than
+  reconstructing to zero, because an honest all-zero answer is
+  indistinguishable from the coordinated-zeroing forgery the presence word
+  exists to stop. Authenticated PIR against a published digest (Colombo et
+  al.) is the composable upgrade and is named as such; cross-checking by
+  repetition was rejected outright, since a server adding the same constant
+  every time produces identical wrong reconstructions.
+- **`rescue`:** new module — Rescue-Prime Optimized (RPO) over Goldilocks
+  `p = 2^64 − 2^32 + 1`, at both published instances (`m = 12`, `m = 16`),
+  both sponge framings that exist upstream, and the paper's round order as a
+  separate permutation. The sibling to `poseidon`: same motivation (cheap
+  inside a circuit), opposite trade — Rescue alternates `x^α` with `x^(1/α)`,
+  which is far more expensive in software and cheaper to prove. Measured
+  here: the inverse S-box layer is **15× the forward one and 76% of the whole
+  permutation**; hashing 512 bytes costs 61× SHA-256. The field lives inside
+  the module (~240 lines, canonical, branch-free) rather than becoming a new
+  general-purpose module.
+  **The variant was chosen on anchoring, not deployment**: plain Rescue-Prime's
+  reference implementation publishes **no** test vectors, while RPO publishes
+  38. Constants are derived (SHAKE256) and pinned element-by-element against
+  miden-crypto's embedded values; `1/α` is computed and checked three ways,
+  including replaying its 72-multiply addition chain symbolically over
+  exponents. Three upstream divergences are documented rather than smoothed
+  over: miden-crypto changed its state layout in a `[BREAKING]` PR so every
+  digest changed (a single-value test tells the corpora apart); the two RPO
+  sponges disagree on padding, capacity placement and the empty input, so
+  both ship with a test asserting they never collide; and **Winterfell's
+  Rescue-XLIX round constants could not be re-derived** from the generator
+  its own comment cites, so that one table is an honestly-labelled embedded
+  blob pinned by file digest plus the published KAT — while the same
+  generator reproduces miden's RPO tables exactly. Constant-time throughout
+  (the inverse S-box is a fixed addition chain, not a ladder), not
+  disassembly-verified. Byte-level hashing is grade-2 anchored: no upstream
+  byte KAT exists anywhere in miden-crypto.
 - **`megolm`:** new module — Matrix's Megolm group ratchet, the third
   real-world group-messaging construction here alongside `signal` (pairwise
   Double Ratchet) and `mls` (RFC 9420). A one-way four-part HMAC-SHA-256 hash

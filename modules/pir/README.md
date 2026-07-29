@@ -12,12 +12,13 @@ Distributed Point Function. The DPF *is* the primitive two-server PIR is made
 of; almost everything hard lives there, and this module is the arithmetic and
 the codec that turn it into a retrieval protocol.
 
-**Status: COMPLETE for single-index and multi-index retrieval.** Query
-construction, both servers' answer computation, reconstruction, and the wire
-codecs are implemented and tested for both. Multi-index retrieval (`Multi(k)`,
-several records in one round trip) rides on `fss`'s multi-point FSS
-(`fss.Mpf`) — the blocker that used to be recorded here was in `fss`, and it
-is gone.
+**Status: COMPLETE for single-index and multi-index retrieval, plus
+malicious-server DETECTION.** Query construction, both servers' answer
+computation, reconstruction, and the wire codecs are implemented and tested
+for both. Multi-index retrieval (`Multi(k)`, several records in one round
+trip) rides on `fss`'s multi-point FSS (`fss.Mpf`). `Verified` adds a client
+that detects a lying server and aborts instead of silently reconstructing a
+doctored record — detection, not recovery; see below.
 
 ## Read this first
 
@@ -140,15 +141,59 @@ the answer size leak which record was retrieved. Pad at ingest.
 `answerSlices` takes `[]const []const u8` for callers whose database is not
 one contiguous buffer.
 
+### Detecting a lying server — `Verified`
+
+The base protocol trusts servers to answer honestly; a doctored answer
+reconstructs silently to garbage. `Verified` removes that trust for
+**integrity**: the client MACs its own query through the protocol's linearity
+— a second, independent DPF whose secret value parameter `m` only the client
+knows, evaluated in a ring widened by `tag_slack_bytes` (soundness error
+`2^(1−8·tag_slack_bytes)`; use `8`) — and aborts with `error.AnswerRejected`
+when the answers don't carry the matching tags.
+
+```zig
+const W = pir.Verified(3, 16, 8);        // == pir.Pir(3, 16).Verified(8)
+
+// CLIENT — four independent seeds + fresh MAC randomness, per query.
+const q = try W.query(want_index, mac_rand, s0, s1, s2, s3);
+
+// SERVERS — two answers each: the base value answer plus the tag answer.
+const per = W.Value.answerWords(database.record_len);
+const tw = W.tagWords(database.record_len);
+try W.answer(0, q.shares[0], database, v0[0..per], t0[0..tw]);
+try W.answer(1, q.shares[1], database, v1[0..per], t1[0..tw]);
+
+// CLIENT — verify-then-reconstruct; error.AnswerRejected on any lie.
+try W.reconstruct(q.secret, v0[0..per], v1[0..per], t0[0..tw], t1[0..tw], &record_out);
+```
+
+Read the security statement before relying on it (`SPEC.md`
+§"Malicious-server detection"). The short honest version:
+
+- **Detection only.** The client learns the answer is wrong and aborts; with
+  two servers it cannot recover the record and cannot tell which server lied.
+- Detects any deviation by **one malicious server** — and even by both, as
+  long as they do not pool their keys — except with probability
+  `2^(1−8·tag_slack_bytes)` plus the PRG advantage.
+- **Colluding servers defeat it** (they recover `m` the same way they already
+  recover `i`), and **both servers agreeing on the same wrong database passes**
+  — the MAC binds to the servers' common database, not to a published one.
+  Both non-detections are asserted by tests, not just documented.
+- **Privacy is unchanged** — the tag key is one more DPF key, and the abort
+  bit carries no usable index information (no selective-failure attack).
+- Querying an index past the database **rejects** here (the base layer's
+  all-zero convention is indistinguishable from a zeroing attack).
+- Costs: 2 keys and ~2 answers of bandwidth, 2 DPF evaluations per record.
+
 ### What this does not do
 
-No verification. A malicious server can return any answer it likes and the
-client will reconstruct garbage without noticing — two-server PIR has no
-integrity mechanism, and nothing here pretends otherwise. No keyword lookup
-(indices only). No protection against a server that returns a *different
-database* than its peer. `Multi(k)` amortizes the database *pass* but still
-costs `k` DPF evaluations per record — sublinear batch PIR needs the
-cuckoo/batch-code multi-point construction, scoped out in `fss`.
+No keyword lookup (indices only). `Verified` detects but never repairs — no
+recovery, no attribution, no protection when both servers serve the same
+modified database (see above). `Multi(k)` amortizes the database *pass* but
+still costs `k` DPF evaluations per record — sublinear batch PIR needs the
+cuckoo/batch-code multi-point construction, scoped out in `fss` — and has no
+verified variant yet. The base (unverified) protocol remains available where
+integrity is provided elsewhere.
 
 ## Verify
 
