@@ -199,6 +199,33 @@ pub fn Verified(
             };
         }
 
+        /// Query by keyword: exactly `query(Value.keywordIndex(keyword), …)`
+        /// and nothing else — the same total, deterministic, unconditional map
+        /// as the base layer's `queryKeyword`, with the same caller
+        /// discipline (one lookup, one query; never skip, never retry).
+        ///
+        /// ⚠ One interaction is specific to this layer: a keyword whose slot
+        /// is past the database REJECTS (`error.AnswerRejected`) rather than
+        /// reconstructing to zero — the presence word makes an honest
+        /// all-zero indistinguishable from the zeroing forgery (module doc).
+        /// So under `Verified`, "absent keyword whose slot is unpopulated" and
+        /// "a server lied" are the SAME client-visible outcome, and the
+        /// discipline above matters doubly: re-querying on that reject would
+        /// leak exactly the retry pattern `queryKeyword` exists to avoid. A
+        /// deployment wanting a verifiable "absent" must materialize every
+        /// slot (filler records up to `2^domain_bits`, or a domain sized to
+        /// the record count) so a miss is a present-but-filler record.
+        pub fn queryKeyword(
+            keyword: []const u8,
+            mac_rand: [tag_word_len]u8,
+            sv0: Seed,
+            sv1: Seed,
+            st0: Seed,
+            st1: Seed,
+        ) Error!Query {
+            return query(Value.keywordIndex(keyword), mac_rand, sv0, sv1, st0, st1);
+        }
+
         /// Serialize a bundled share: value key then tag key, fixed offsets,
         /// no header — the same no-length-field discipline as the base codec.
         pub fn shareToBytes(share: Ver.Share, buf: *[share_len]u8) void {
@@ -262,15 +289,29 @@ pub fn Verified(
             const per = Value.answerWords(database.record_len);
 
             @memset(tag_out, 0);
-            var x: usize = 0;
-            while (x < n) : (x += 1) {
-                const sel = TagDpf.eval(party, share.tag, @intCast(x));
-                const rec = database.record(x);
-                for (0..per) |j| {
-                    tag_out[j] +%= sel *% @as(TagWord, Value.wordAt(rec, j));
-                }
-                tag_out[per] +%= sel; // presence: coefficient 1 for every record
-            }
+            // The tag channel is just another instantiation of the same
+            // generic `fss.Dpf`, so it gets the same tree-reuse streaming walk
+            // the value channel's `Value.answer` uses (~1 PRG call per record
+            // instead of `domain_bits`), for the same allocator-free reason.
+            // The walk emits every `x < n` exactly once, in order — the
+            // access-pattern requirement is unchanged.
+            const Ctx = struct { database: Database, tag_out: []TagWord, per: usize };
+            TagDpf.evalFullWith(
+                party,
+                share.tag,
+                n,
+                Ctx{ .database = database, .tag_out = tag_out, .per = per },
+                struct {
+                    fn emit(ctx: Ctx, x: usize, sel: TagWord) void {
+                        const rec = ctx.database.record(x);
+                        for (0..ctx.per) |j| {
+                            ctx.tag_out[j] +%= sel *% @as(TagWord, Value.wordAt(rec, j));
+                        }
+                        // presence: coefficient 1 for every record
+                        ctx.tag_out[ctx.per] +%= sel;
+                    }
+                }.emit,
+            );
         }
 
         /// Serialize a tag answer, little-endian per tag word. The value
@@ -605,6 +646,92 @@ test "SELF: wire round-trip — bundled share and both answers survive serializa
     var got: [t_record_len]u8 = undefined;
     try V.reconstructFromBytes(run.q.secret, &vb[0], &vb[1], &tb[0], &tb[1], &got);
     try testing.expectEqualSlices(u8, run.database().record(3), &got);
+}
+
+test "SELF: verified keyword lookup — a hit verifies; an UNPOPULATED slot rejects (documented interaction)" {
+    const W = Verified(8, 4, 8);
+    const record_len = 12; // key field (8) + payload
+    var bytes: [W.domain_size * record_len]u8 = undefined;
+    @memset(&bytes, 0xFF); // filler in every slot
+
+    const kw = "alpha";
+    const idx = W.Value.keywordIndex(kw);
+    {
+        const rec = bytes[idx * record_len ..][0..record_len];
+        @memset(rec, 0);
+        @memcpy(rec[0..kw.len], kw);
+    }
+    const per = W.Value.answerWords(record_len);
+    const tw = W.tagWords(record_len);
+    var va: [2][3]W.Word = undefined;
+    var ta: [2][4]W.TagWord = undefined;
+    var got: [record_len]u8 = undefined;
+
+    // Hit over a fully-materialized domain: verifies and returns the record.
+    // Also pin that the keyword wrapper is exactly query∘keywordIndex here
+    // too — byte-identical bundled shares under the same inputs.
+    {
+        const database = try Database.init(&bytes, record_len);
+        const q = try W.queryKeyword(
+            kw,
+            detMac(W.tag_word_len, 6001),
+            detSeed(6002),
+            detSeed(6003),
+            detSeed(6004),
+            detSeed(6005),
+        );
+        const q_idx = try W.query(
+            idx,
+            detMac(W.tag_word_len, 6001),
+            detSeed(6002),
+            detSeed(6003),
+            detSeed(6004),
+            detSeed(6005),
+        );
+        var w_kw: [W.share_len]u8 = undefined;
+        var w_idx: [W.share_len]u8 = undefined;
+        for (0..2) |b| {
+            W.shareToBytes(q.shares[b], &w_kw);
+            W.shareToBytes(q_idx.shares[b], &w_idx);
+            try testing.expectEqualSlices(u8, &w_idx, &w_kw);
+        }
+        for (0..2) |b| {
+            try W.answer(@intCast(b), q.shares[b], database, va[b][0..per], ta[b][0..tw]);
+        }
+        try W.reconstruct(q.secret, va[0][0..per], va[1][0..per], ta[0][0..tw], ta[1][0..tw], &got);
+        try testing.expectEqualSlices(u8, kw, got[0..kw.len]);
+    }
+
+    // A keyword whose slot is PAST the record count: the query is still the
+    // same single unconditional call (the servers see nothing new), but the
+    // presence word makes the client REJECT rather than read all-zero —
+    // "absent" and "a server lied" are the same client-visible outcome here.
+    // That is why `Verified.queryKeyword`'s doc tells deployments wanting a
+    // verifiable absent to materialize every slot, as the hit case above does.
+    {
+        const small = try Database.init(bytes[0 .. 100 * record_len], record_len);
+        var buf: [16]u8 = undefined;
+        var t: usize = 0;
+        const far_kw = while (t < 1000) : (t += 1) {
+            const cand = std.fmt.bufPrint(&buf, "far-{d}", .{t}) catch unreachable;
+            if (W.Value.keywordIndex(cand) >= 100) break cand;
+        } else unreachable;
+        const q = try W.queryKeyword(
+            far_kw,
+            detMac(W.tag_word_len, 6101),
+            detSeed(6102),
+            detSeed(6103),
+            detSeed(6104),
+            detSeed(6105),
+        );
+        for (0..2) |b| {
+            try W.answer(@intCast(b), q.shares[b], small, va[b][0..per], ta[b][0..tw]);
+        }
+        try testing.expectError(
+            error.AnswerRejected,
+            W.reconstruct(q.secret, va[0][0..per], va[1][0..per], ta[0][0..tw], ta[1][0..tw], &got),
+        );
+    }
 }
 
 // ── ATTACK: the malicious-server battery ──────────────────────────────────

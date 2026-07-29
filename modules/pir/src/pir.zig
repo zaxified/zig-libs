@@ -131,6 +131,55 @@ pub fn Pir(comptime domain_bits: usize, comptime word_bytes: usize) type {
             return Dpf.genWithSeeds(@intCast(index), 1, s0, s1);
         }
 
+        // ── client: keyword lookup ────────────────────────────────────────
+
+        /// The PUBLIC keyword→index map: `SHA-256(keyword)`, first 8 hash
+        /// bytes read little-endian, truncated to the low `domain_bits` bits.
+        /// `domain_size` is a power of two, so the truncation is exact — no
+        /// modulo bias. Total (every byte string maps to some index),
+        /// deterministic, and free of any secret-dependent branch: SHA-256
+        /// and the mask are data-independent operations, and the map neither
+        /// knows nor asks whether the index is occupied.
+        ///
+        /// This is a convention shared by the database-builder and the
+        /// client, not a secret: the builder places the record for keyword
+        /// `kw` at index `keywordIndex(kw)` (records should carry their own
+        /// key field so a client can check the match locally — the same
+        /// "database layout is the caller's" stance as everything in `db.zig`).
+        ///
+        /// **Collisions are a provisioning obligation, stated exactly** (see
+        /// `SPEC.md` §"Keyword lookup"): two keywords may map to one index,
+        /// and then only the record the builder placed there is retrievable —
+        /// a FALSE NEGATIVE for the losing keyword, discovered locally after
+        /// reconstruction, never a privacy leak (nothing branches on it). For
+        /// `N` keywords, `P(any collision) ≈ N²/2^(domain_bits+1)`; keep it
+        /// below `ε` by choosing `domain_bits ≥ 2·log2(N) + log2(1/ε) − 1`.
+        pub fn keywordIndex(keyword: []const u8) usize {
+            var h: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(keyword, &h, .{});
+            const wide = std.mem.readInt(u64, h[0..8], .little);
+            return @intCast(wide & @as(u64, domain_size - 1));
+        }
+
+        /// Query by keyword: exactly `query(keywordIndex(keyword), s0, s1)`
+        /// and NOTHING else — no existence check, no retry, no probing, no
+        /// branch on database contents (this function has no database access
+        /// at all). Because the map is total and unconditional, a query for a
+        /// missing keyword and a query for a present one are the SAME
+        /// mechanical call, so the servers learn nothing from the fact of a
+        /// miss — **provided the caller keeps it that way**: never skip the
+        /// query for a keyword you "know" is absent, and never re-query on a
+        /// local mismatch. One lookup, one query, whatever comes back.
+        ///
+        /// A missing keyword (empty or never-populated slot) reconstructs to
+        /// the slot's content — the builder's filler, or all-zero past the
+        /// record count — and the client detects the miss locally by
+        /// comparing the record's own key field. See `SPEC.md` §"Keyword
+        /// lookup" for the full leakage statement.
+        pub fn queryKeyword(keyword: []const u8, s0: Seed, s1: Seed) Error![2]Share {
+            return query(keywordIndex(keyword), s0, s1);
+        }
+
         /// Serialize a share for the wire. Fixed length, no header, no length
         /// field — see `SPEC.md` §"The codec has no length fields".
         pub fn shareToBytes(share: Share, buf: *[share_len]u8) void {
@@ -170,23 +219,34 @@ pub fn Pir(comptime domain_bits: usize, comptime word_bytes: usize) type {
         /// Server `party`'s answer to `share`, over `database`, into `out`
         /// (`out.len` must be `answerWords(database.record_len)`).
         ///
-        /// Touches **every** record — the loop bound is `database.count()` and
-        /// there is no early exit, no data-dependent skip and no branch on the
-        /// evaluated share. An index-dependent access pattern here would leak
-        /// exactly what the DPF is there to hide, so this is load-bearing, and
-        /// there is a test asserting every record influences the result.
+        /// Touches **every** record — the DPF walk emits every `x < count()`
+        /// exactly once, in order, with no early exit, no data-dependent skip
+        /// and no branch on the evaluated share. An index-dependent access
+        /// pattern here would leak exactly what the DPF is there to hide, so
+        /// this is load-bearing, and there is a test asserting every record
+        /// influences the result.
+        ///
+        /// The evaluation is `fss.Dpf`'s tree-reuse `evalFullWith` — one walk
+        /// over the `[0, count())` prefix, ~1 PRG call per record instead of
+        /// `domain_bits` per record — in its STREAMING form because this
+        /// module has no allocator and no runtime-sized scratch anywhere
+        /// (`SPEC.md` §"Where the library stops"): each evaluation is folded
+        /// into `out` as the walk produces it, so no `count()`-sized buffer
+        /// exists. The domain's unused tail past `count()` is still never
+        /// evaluated (the walk skips those subtrees before their PRG calls).
         pub fn answer(party: u1, share: Share, database: Database, out: []Word) Error!void {
             if (out.len != answerWords(database.record_len)) return error.AnswerLengthMismatch;
             const n = database.count();
             if (n > domain_size) return error.DomainTooSmall;
 
             @memset(out, 0);
-            var x: usize = 0;
-            while (x < n) : (x += 1) {
-                const sel = Dpf.eval(party, share, @intCast(x));
-                const rec = database.record(x);
-                for (out, 0..) |*w, j| w.* +%= sel *% wordAt(rec, j);
-            }
+            const Ctx = struct { database: Database, out: []Word };
+            Dpf.evalFullWith(party, share, n, Ctx{ .database = database, .out = out }, struct {
+                fn emit(ctx: Ctx, x: usize, sel: Word) void {
+                    const rec = ctx.database.record(x);
+                    for (ctx.out, 0..) |*w, j| w.* +%= sel *% wordAt(rec, j);
+                }
+            }.emit);
         }
 
         /// `answer` over a slice of records rather than one flat buffer, for
@@ -202,10 +262,14 @@ pub fn Pir(comptime domain_bits: usize, comptime word_bytes: usize) type {
             if (out.len != answerWords(record_len)) return error.AnswerLengthMismatch;
 
             @memset(out, 0);
-            for (records, 0..) |rec, x| {
-                const sel = Dpf.eval(party, share, @intCast(x));
-                for (out, 0..) |*w, j| w.* +%= sel *% wordAt(rec, j);
-            }
+            // Same tree-reuse streaming walk as `answer`, same reasons.
+            const Ctx = struct { records: []const []const u8, out: []Word };
+            Dpf.evalFullWith(party, share, records.len, Ctx{ .records = records, .out = out }, struct {
+                fn emit(ctx: Ctx, x: usize, sel: Word) void {
+                    const rec = ctx.records[x];
+                    for (ctx.out, 0..) |*w, j| w.* +%= sel *% wordAt(rec, j);
+                }
+            }.emit);
         }
 
         /// Serialize an answer, little-endian per word.
@@ -1322,6 +1386,239 @@ test "SELF: exhaustive length sweep over the multi-index untrusted boundaries" {
         const r = M.shareFromBytes(big[0..n]);
         if (n == M.share_len) _ = try r else try testing.expectError(error.ShareLengthMismatch, r);
     }
+}
+
+// ── keyword lookup ────────────────────────────────────────────────────────
+//
+// The keyword layer is a PUBLIC total map (SHA-256 → the low domain_bits
+// bits) composed in front of the unchanged index protocol. What these tests
+// pin: the map's exact definition (independently re-derived), that
+// `queryKeyword` is definitionally `query ∘ keywordIndex` (byte-identical
+// shares), that a miss is mechanically the same call as a hit — including a
+// miss past the record count — and the design's honest cost run as a test: a
+// collision makes the losing keyword's record unreachable (a false negative,
+// not a leak). Plus the demonstration of the wrapper that must NOT be built.
+
+test "SELF: keywordIndex is deterministic, in-domain; queryKeyword is exactly query∘keywordIndex" {
+    const P = Pir(8, 4);
+    const kws = [_][]const u8{ "", "a", "alpha", "the same words", "the same words " };
+    for (kws, 0..) |kw, i| {
+        try testing.expectEqual(P.keywordIndex(kw), P.keywordIndex(kw));
+        const idx = P.keywordIndex(kw);
+        try testing.expect(idx < P.domain_size);
+
+        // Definitional, pinned as bytes: the keyword wrapper adds NOTHING to
+        // the query — same seeds, byte-identical shares.
+        const seeds = detSeeds(424242 + i);
+        const via_kw = try P.queryKeyword(kw, seeds[0], seeds[1]);
+        const via_idx = try P.query(idx, seeds[0], seeds[1]);
+        var b_kw: [P.share_len]u8 = undefined;
+        var b_idx: [P.share_len]u8 = undefined;
+        for (0..2) |b| {
+            P.shareToBytes(via_kw[b], &b_kw);
+            P.shareToBytes(via_idx[b], &b_idx);
+            try testing.expectEqualSlices(u8, &b_idx, &b_kw);
+        }
+    }
+    // Two instantiations mask different bit counts of the SAME hash, so the
+    // smaller domain's index is the larger one's low bits.
+    try testing.expectEqual(
+        Pir(8, 4).keywordIndex("alpha") & 0xF,
+        Pir(4, 4).keywordIndex("alpha"),
+    );
+}
+
+test "DERIVED: keywordIndex equals an independent re-derivation of SHA-256 + power-of-two reduction" {
+    // Route B builds the index bit by bit straight from the hash bytes — no
+    // readInt, no mask — so a transcription bug in the reduction step (wrong
+    // endianness, wrong byte window, off-by-one in the mask width) breaks the
+    // agreement even though both routes hash the same keyword.
+    const P = Pir(12, 4);
+    const kws = [_][]const u8{ "", "k", "keyword-pir", "\xff\x00\xff" };
+    for (kws) |kw| {
+        var h: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(kw, &h, .{});
+        var want: usize = 0;
+        for (0..12) |i| {
+            const bit: usize = (h[i / 8] >> @intCast(i % 8)) & 1;
+            want |= bit << @intCast(i);
+        }
+        try testing.expectEqual(want, P.keywordIndex(kw));
+    }
+}
+
+test "SELF: keyword retrieval — a hit returns the record; a miss is the SAME call, incl. past the record count" {
+    const P = Pir(8, 4);
+    const record_len = 16; // record's own key field (8 bytes) + payload
+    const count = P.domain_size; // every slot materialized
+    var bytes: [count * record_len]u8 = undefined;
+    @memset(&bytes, 0xFF); // filler: a key field no zero-padded keyword has
+
+    // The database-builder's side of the convention: record for `kw` lives at
+    // `keywordIndex(kw)`. Four keywords, pairwise-distinct slots (verified).
+    const kws = [_][]const u8{ "alpha", "bravo", "charlie", "delta" };
+    var idxs: [kws.len]usize = undefined;
+    for (kws, &idxs) |kw, *ix| ix.* = P.keywordIndex(kw);
+    for (idxs, 0..) |a, i| for (idxs[0..i]) |b| try testing.expect(a != b);
+    for (kws, idxs) |kw, ix| {
+        const rec = bytes[ix * record_len ..][0..record_len];
+        @memset(rec, 0);
+        @memcpy(rec[0..kw.len], kw);
+        rec[8] = @truncate(ix); // payload distinguishes records
+    }
+    const database = try Database.init(&bytes, record_len);
+    const n_words = P.answerWords(record_len);
+    var a0: [4]P.Word = undefined;
+    var a1: [4]P.Word = undefined;
+    var got: [record_len]u8 = undefined;
+
+    // Hits: retrieval by keyword, key field matches locally.
+    for (kws, idxs, 0..) |kw, ix, i| {
+        const seeds = detSeeds(9000 + i);
+        const shares = try P.queryKeyword(kw, seeds[0], seeds[1]);
+        try P.answer(0, shares[0], database, a0[0..n_words]);
+        try P.answer(1, shares[1], database, a1[0..n_words]);
+        try P.reconstruct(a0[0..n_words], a1[0..n_words], &got);
+        try testing.expectEqualSlices(u8, kw, got[0..kw.len]);
+        try testing.expectEqual(@as(u8, @truncate(ix)), got[8]);
+    }
+
+    // Miss on a filler slot: the SAME single call — no error, no branch —
+    // and "absent" is learned only locally, from the key-field mismatch.
+    {
+        const kw = "not-present";
+        const ix = P.keywordIndex(kw);
+        for (idxs) |occupied| try testing.expect(ix != occupied); // it IS a miss
+        const seeds = detSeeds(9100);
+        const shares = try P.queryKeyword(kw, seeds[0], seeds[1]);
+        try P.answer(0, shares[0], database, a0[0..n_words]);
+        try P.answer(1, shares[1], database, a1[0..n_words]);
+        try P.reconstruct(a0[0..n_words], a1[0..n_words], &got);
+        try testing.expect(!std.mem.eql(u8, kw, got[0..kw.len])); // filler came back
+    }
+
+    // Miss PAST the record count: domain 256 over a 100-record database. The
+    // map is total and `queryKeyword` must not "helpfully" range-check
+    // against any notion of the database (it has none): the query must
+    // succeed and reconstruct to the base layer's documented all-zero. This
+    // is the assertion that catches any smuggled-in existence/validity check.
+    {
+        const small = try Database.init(bytes[0 .. 100 * record_len], record_len);
+        var buf: [16]u8 = undefined;
+        var t: usize = 0;
+        const kw = while (t < 1000) : (t += 1) {
+            const cand = std.fmt.bufPrint(&buf, "far-{d}", .{t}) catch unreachable;
+            if (P.keywordIndex(cand) >= 100) break cand;
+        } else unreachable;
+        const seeds = detSeeds(9200);
+        const shares = try P.queryKeyword(kw, seeds[0], seeds[1]);
+        try P.answer(0, shares[0], small, a0[0..n_words]);
+        try P.answer(1, shares[1], small, a1[0..n_words]);
+        try P.reconstruct(a0[0..n_words], a1[0..n_words], &got);
+        try testing.expectEqualSlices(u8, &[_]u8{0} ** record_len, &got);
+    }
+}
+
+test "SELF: colliding keywords — the occupant comes back for BOTH; the loser gets a LOCAL false negative" {
+    // The design's honest cost, executable rather than prose: at
+    // domain_bits=4 a collision is easy to find. The builder placed one of
+    // the two keywords; retrieval by EITHER keyword is the same call and
+    // returns the occupant; the losing keyword discovers the mismatch only
+    // after reconstructing, locally. Nothing branched, nothing retried,
+    // nothing leaked — the correctness cost the provisioning rule
+    // (domain_bits ≥ 2·log2(N) + log2(1/ε) − 1) exists to keep rare.
+    const P = Pir(4, 4);
+    const record_len = 12;
+
+    // find two colliding keywords in a deterministic candidate sequence
+    // (pigeonhole: 17 candidates over 16 slots guarantee one)
+    var first: [P.domain_size]?usize = @splat(null);
+    var buf_a: [16]u8 = undefined;
+    var buf_b: [16]u8 = undefined;
+    var kw_a: []const u8 = undefined;
+    var kw_b: []const u8 = undefined;
+    var t: usize = 0;
+    const idx = outer: while (t < 100) : (t += 1) {
+        const cand = std.fmt.bufPrint(&buf_b, "kw-{d}", .{t}) catch unreachable;
+        const ix = P.keywordIndex(cand);
+        if (first[ix]) |prev| {
+            kw_b = cand;
+            kw_a = std.fmt.bufPrint(&buf_a, "kw-{d}", .{prev}) catch unreachable;
+            break :outer ix;
+        }
+        first[ix] = t;
+    } else unreachable;
+    try testing.expect(!std.mem.eql(u8, kw_a, kw_b));
+    try testing.expectEqual(idx, P.keywordIndex(kw_a)); // a verified collision
+    try testing.expectEqual(idx, P.keywordIndex(kw_b));
+
+    var bytes: [P.domain_size * record_len]u8 = undefined;
+    @memset(&bytes, 0xFF);
+    { // the builder placed kw_a; kw_b lost the slot
+        const rec = bytes[idx * record_len ..][0..record_len];
+        @memset(rec, 0);
+        @memcpy(rec[0..kw_a.len], kw_a);
+    }
+    const database = try Database.init(&bytes, record_len);
+    const n_words = P.answerWords(record_len);
+    var a0: [3]P.Word = undefined;
+    var a1: [3]P.Word = undefined;
+    var got_a: [record_len]u8 = undefined;
+    var got_b: [record_len]u8 = undefined;
+
+    inline for (.{ .{ &got_a, 1111 }, .{ &got_b, 2222 } }, 0..) |case, which| {
+        const kw = if (which == 0) kw_a else kw_b;
+        const seeds = detSeeds(case[1]);
+        const shares = try P.queryKeyword(kw, seeds[0], seeds[1]);
+        try P.answer(0, shares[0], database, a0[0..n_words]);
+        try P.answer(1, shares[1], database, a1[0..n_words]);
+        try P.reconstruct(a0[0..n_words], a1[0..n_words], case[0]);
+    }
+    // Both got the occupant's record — byte-identical answers.
+    try testing.expectEqualSlices(u8, &got_a, &got_b);
+    // kw_a's local check passes; kw_b's fails → false negative, found locally.
+    try testing.expectEqualSlices(u8, kw_a, got_a[0..kw_a.len]);
+    try testing.expect(!std.mem.eql(u8, kw_b, got_b[0..kw_b.len]));
+}
+
+test "SELF: what must NOT be built — an existence precheck makes presence observable; queryKeyword does not" {
+    // The tempting wrapper: keep a local set of known keys and skip the query
+    // on a miss (a Bloom filter, a cached directory — same shape). Its defect
+    // needs no cryptanalysis: the number of queries EMITTED depends on
+    // presence, and query count/timing on the wire is exactly what a server
+    // observes. Simulated by counting emissions.
+    const P = Pir(6, 4);
+    const known = [_][]const u8{ "alpha", "bravo" };
+
+    const naive = struct {
+        // the WRONG wrapper, deliberately local to this test
+        fn queriesEmitted(known_set: []const []const u8, kw: []const u8) usize {
+            for (known_set) |k| {
+                if (std.mem.eql(u8, k, kw)) return 1; // present → query
+            }
+            return 0; // "absent" → skip. THIS is the presence leak.
+        }
+    };
+    const hit_emits = naive.queriesEmitted(&known, "alpha");
+    const miss_emits = naive.queriesEmitted(&known, "zulu");
+    try testing.expectEqual(@as(usize, 1), hit_emits);
+    try testing.expectEqual(@as(usize, 0), miss_emits);
+    try testing.expect(hit_emits != miss_emits); // presence is on the wire
+
+    // queryKeyword: one query per lookup, unconditionally. Both calls
+    // succeed, both emit exactly one fixed-length share pair — the call
+    // shape carries no presence bit. (That the share BYTES hide the index is
+    // the DPF's hiding property, pinned in privacy_test.zig; the call shape
+    // is what this test pins.)
+    var emitted: usize = 0;
+    inline for (.{ "alpha", "zulu" }, 0..) |kw, i| {
+        const seeds = detSeeds(7700 + i);
+        const shares = try P.queryKeyword(kw, seeds[0], seeds[1]);
+        emitted += 1;
+        var w: [P.share_len]u8 = undefined;
+        P.shareToBytes(shares[0], &w); // same compile-time length either way
+    }
+    try testing.expectEqual(@as(usize, 2), emitted);
 }
 
 // ── fuzz: the untrusted boundaries ────────────────────────────────────────

@@ -51,9 +51,11 @@ little-endian, wrapping add), `L = out_bytes` a compile-time parameter
 
 **Domain parameterization:** the input domain is `{0,1}^n` (indices
 `0..2^n`), `n = n_bits` a compile-time parameter, `n ∈ 1..31`. Bits are read
-**MSB-first** (`i=1` is the top of the tree). `EvalAll` allocates `2^n`
-outputs, so it is only practical for small `n`; large-`n` DPFs use single-point
-`Eval`, which is `O(n)`.
+**MSB-first** (`i=1` is the top of the tree). `EvalAll` fills `2^n` outputs,
+so it is only practical for small `n`; large-`n` DPFs use single-point `Eval`
+(`O(n)`) or the tree-reuse `evalFull`/`evalFullWith` over a domain **prefix**
+(§"Tree-reuse prefix evaluation" below), which costs `O(out.len)` regardless
+of `2^n`.
 
 ## The Fable-core vs mechanical split
 
@@ -86,15 +88,18 @@ eyeball-correctness is what places it at the Fable tier, even though it is
   file's doc comment).
 - `group.zig` — `Z2k(L)` add/sub/neg + byte codec.
 - `dpf.zig` — the `Cw`/`Key` types, `serializeCw`/`toBytes`/`fromBytes`, the
-  mechanical `evalAll` loop over `eval`, and the `firstMismatch` full-domain
-  checker.
+  mechanical `evalAll` loop over `eval`, the tree-reuse `evalFull`/
+  `evalFullWith` prefix evaluator (§ below), and the `firstMismatch`
+  full-domain checker.
 - `kat_test.zig` — the entire harness.
 
-`evalAll` is deliberately the **naive** loop over `eval` (not the efficient
-tree-reuse full-domain evaluator): the efficient version shares `eval`'s exact
-per-level logic and would enlarge the Fable surface for an `O(2^n)`-vs-
-`O(n·2^n)` speedup that Phase 1 does not need. The optimized `evalFull` is a
-scoped-out increment.
+`evalAll` is deliberately the **naive** loop over `eval`, and stays that way
+now that the tree-reuse evaluator exists: the naive loop is structurally
+independent of the tree walk, which makes it the differential oracle
+`evalFull` is tested against element-for-element. The tree-reuse evaluator
+itself is mechanical scaffold, not new Fable surface — it re-applies `eval`'s
+already-anchored per-level formulas over the shared tree, and every value it
+produces is required to be bit-identical to `eval`'s.
 
 ## External-reference anchoring (anti-self-consistency)
 
@@ -199,9 +204,10 @@ can.
 consumer for which `k` passes over the data dominate. Server cost is `k·N`
 evaluations of `n` SHA-256 calls; at `k=100, N=2^20` that is ~2·10⁹ hashes per
 query, and the bucketed construction earns its failure probability. Note the
-cheaper fix comes first — the scoped-out tree-reuse `evalFull` cuts each pass
-from `O(N·n)` to `O(N)` hashes with **no** new cryptography, so that budget
-should be spent before the cuckoo complexity budget is.
+cheaper fix came first — the tree-reuse `evalFull` (now built, §"Tree-reuse
+prefix evaluation") cuts each pass from `O(N·n)` to `O(N)` hashes with **no**
+new cryptography — so the cuckoo revisit bar is now `k` itself, not the
+per-pass constant.
 
 ### Seed independence is a security requirement, and is enforced
 
@@ -259,6 +265,67 @@ Consequences, none of which is a vulnerability here:
 - A consumer that *does* any of those things must canonicalize first
   (`fromBytes` then `toBytes`) or it will treat equivalent keys as distinct.
 
+## Tree-reuse prefix evaluation (`evalFull` / `evalFullWith`)
+
+This was on the scoped-out list below ("Efficient tree-reuse `evalFull` —
+`O(2^n)` full-domain instead of the naive `O(n·2^n)` loop"); it is now built,
+and the entry has been removed.
+
+### What was built, and why it lives here and not in `pir`
+
+`eval` expands each on-path node's PRG and **throws away the sibling half** of
+every expansion; a full-domain evaluation as `2^n` independent `eval` calls
+therefore recomputes every shared ancestor, `O(n·2^n)` PRG calls total.
+`evalFull` walks the tree **once**, keeping both children at every internal
+node, so each node is expanded exactly once: ~`N` PRG calls for `N` outputs.
+The per-level formulas are `eval`'s own (the seed-CW XOR gated by the parent's
+control bit, the child control bits from `t_cw_l`/`t_cw_r`, the leaf's
+`convert` + `t`-gated `cw_final` + `(-1)^b`) — this is a *traversal-order*
+optimization of the anchored construction, not a new construction, which is
+why it belongs in this module next to `eval` rather than in any consumer:
+it needs `eval`'s internals, and every DPF consumer (`pir`'s value channel,
+`pir.Verified`'s tag channel, any future one) gets it from one place.
+
+### The prefix contract is the design point
+
+`evalFull(b, key, out)` evaluates the domain **prefix** `[0, out.len)`,
+`out.len ≤ 2^n` — it does NOT require or default to the whole domain. This is
+load-bearing for `pir`, whose SPEC documents domain truncation as a feature:
+`domain_bits` is picked generously above the record count and **the unused
+tail of the domain is never evaluated**. A full-domain-only evaluator would
+either break that invariant or regress a small database in a big domain to
+`O(2^n)` — the opposite of the intended speedup. The walk prunes any subtree
+lying entirely at/past `out.len` *before* its PRG call, so the cost is
+`O(out.len)` PRG calls plus at most `n` extra expansions for nodes straddling
+the prefix boundary, independent of `2^n`. (Recursion depth is bounded by
+`n ≤ 31` with a small frame; no allocation, no explicit stack needed.)
+
+`evalFullWith(b, key, count, ctx, emit)` is the same walk in streaming form:
+it calls `emit(ctx, x, value)` once per `x ∈ [0, count)`, in ascending order,
+materializing nothing. It exists because `pir` is a no-allocator module whose
+record count is a runtime value: the server folds each evaluation into its
+answer as the walk produces it, so no `count`-sized buffer exists anywhere.
+
+### Verification and measured effect
+
+Equivalence is exact and asserted, not argued: `kat_test.zig` requires
+`evalFull` to reproduce the `eval`/`evalAll` path **bit-for-bit,
+element-for-element** — full domains at `n=4` and `n=10`, a 300-point prefix
+of an `n=16` domain (α inside, at the prefix's last point, just past it, and
+at the far end of the domain), prefix lengths 0/1/257 (a full subtree plus a
+straddling leaf), for both parties — with `evalAll`'s naive loop as the
+structurally independent oracle, plus a streaming-form test asserting each
+index is emitted exactly once, in order. Mutation-tested: mis-gating one
+child's seed-CW application (parent's `t` → child's `t`) is caught by three of
+these tests; shortening the prefix by one at the consumer is caught by `pir`'s
+every-record-influences-the-answer test.
+
+Measured (`FSS_BENCH=1 zig build test-fss -Doptimize=ReleaseFast`, this
+host): `n=16` full domain 570 ms → 52 ms (**~11×**, theory `(2n+1)/3 ≈ 11`);
+500-point prefix of an `n=20` domain 5.1 ms → 0.36 ms (**~13–15×**), with
+`evalFull`'s per-point cost flat (~0.7–0.8 µs) across both — i.e. it follows
+the prefix length, not the domain size.
+
 ## Scoped out (future increments, NOT Phase 1)
 
 - **DCF / comparison functions** — `f_{α,β}^<(x) = β if x < α else 0`
@@ -272,7 +339,7 @@ Consequences, none of which is a vulnerability here:
 - **2-server PIR** built on `EvalAll` — now its own module, `pir`.
 - **Fixed-key-AES PRG** — the performance-standard, ~10× faster than SHA-256;
   would additionally enable byte-exact interop with Google's DPF vectors.
-- **Efficient tree-reuse `evalFull`** — `O(2^n)` full-domain instead of the
-  naive `O(n·2^n)` loop.
+  (Tree-reuse `evalFull` was on this list and is now built —
+  §"Tree-reuse prefix evaluation" above.)
 - **Constant-time review** of `Eval`'s control-bit-gated branches (side-channel
   hardening) — the branch on the running control bit is data-dependent.

@@ -26,7 +26,7 @@ external-reference anchoring.
 | `root.zig` | Module doc, `meta`, re-exports (`Dpf`, `prg`, `group`, `kat_vectors`), dark-tests aggregator |
 | `prg.zig` | **REAL.** SHA-256 length-doubling PRG `G` + seed→group `convert` (exact byte definitions pinned in-file) |
 | `group.zig` | **REAL.** `Z2k(L)` — the `Z_{2^{8L}}` output group (add/sub/neg + byte codec) |
-| `dpf.zig` | `Dpf(n,L)`. **REAL:** `Cw`/`Key` types, `serializeCw`/`toBytes`/`fromBytes`, `evalAll`, `firstMismatch`. **FABLE CORE (implemented):** `genWithSeeds`, `eval` |
+| `dpf.zig` | `Dpf(n,L)`. **REAL:** `Cw`/`Key` types, `serializeCw`/`toBytes`/`fromBytes`, `evalAll`, `evalFull`/`evalFullWith` (tree-reuse **prefix** evaluation, ~1 PRG call/point; `evalAll` kept naive as its oracle), `firstMismatch`. **FABLE CORE (implemented):** `genWithSeeds`, `eval` |
 | `mpf.zig` | `Mpf(n,L,k)` — **multi-point** FSS: `k` independent `Dpf` instances summed. No new cryptographic surface, no failure probability, keys linear in `k` |
 | `gate.zig` | The single switch (`core_implemented = true`) marking the correction-word core done |
 | `kat_vectors.zig` | Recorded independent-reference KAT vectors (the anti-self-consistency anchor) |
@@ -58,6 +58,16 @@ const y = D.G.add(share0, share1); // == beta if x==alpha else 0
 // Full-domain evaluation (into a caller buffer of D.domain_size elements):
 var out0: [D.domain_size]D.Elem = undefined;
 D.evalAll(0, k0, &out0);
+
+// Tree-reuse evaluation of a domain PREFIX [0, out.len), out.len <= 2^n:
+// ~out.len PRG calls total instead of eval's O(n) per point, and subtrees
+// past the prefix are never expanded (cost follows out.len, not 2^n).
+// Produces bit-for-bit what eval produces at each point.
+var fast: [300]D.Elem = undefined;
+D.evalFull(0, k0, &fast);
+// Streaming form for allocator-free consumers (pir's server loop): emits
+// (x, value) for each x in [0, count), ascending, materializing nothing.
+D.evalFullWith(0, k0, n_records, ctx, myEmitFn);
 
 // Verification oracle: first x where the two evals fail to reconstruct, or null.
 const bad = D.firstMismatch(&out0, &out1, alpha, beta);
@@ -130,6 +140,7 @@ fss → std.crypto.hash.sha2.Sha256   (std-only; meta.deps = .{})
 zig build test-fss                          # Debug — all pass, no skips
 zig build test-fss -Doptimize=ReleaseFast   # all pass, no skips
 zig build test-fss --fuzz --release=safe    # the real fuzzer (NOT Debug — see SPEC.md)
+FSS_BENCH=1 zig build test-fss -Doptimize=ReleaseFast  # evalFull vs eval-loop bench
 zig fmt --check modules/fss/
 ```
 

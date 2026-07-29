@@ -49,10 +49,10 @@
 //! guessed: a consumer for which `k` full passes over the database dominate.
 //! The server cost is `k·N` DPF evaluations of `n` SHA-256 calls each; at
 //! `k=100, N=2^20` that is ~2·10^9 hashes per query, and at that point the
-//! bucketed construction is worth its failure probability. Note the cheaper
-//! fix comes first: `fss`'s scoped-out tree-reuse `evalFull` cuts each pass
-//! from `O(N·n)` to `O(N)` hashes with **no** new cryptography, so it should be
-//! spent before the cuckoo complexity budget is.
+//! bucketed construction is worth its failure probability. The cheaper fix
+//! came first: `dpf`'s tree-reuse `evalFull` (built) cuts each pass from
+//! `O(N·n)` to `O(N)` hashes with **no** new cryptography, so the revisit bar
+//! is now the factor `k` itself.
 //!
 //! ## Why the bundle is not compressed, and what that buys
 //!

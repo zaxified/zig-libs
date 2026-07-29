@@ -34,7 +34,15 @@
 //!     `.query(i, s0, s1)` → two shares · `.answer(party, share, db, out)` ·
 //!     `.reconstruct(a0, a1, record_out)`, plus the wire codecs
 //!     `shareToBytes`/`shareFromBytes`/`answerToBytes`/`answerFromBytes`/
-//!     `reconstructFromBytes`.
+//!     `reconstructFromBytes`. The server side runs on `fss`'s tree-reuse
+//!     `evalFull` — ~1 PRG call per record, never touching the domain's
+//!     unused tail.
+//!   - `Pir(...).queryKeyword(kw, s0, s1)` — **lookup by keyword**: exactly
+//!     `query(keywordIndex(kw), …)`, where `keywordIndex` is a public, total,
+//!     deterministic SHA-256→index map. A miss is the same call as a hit —
+//!     PROVIDED the caller never skips a query and never retries; collisions
+//!     are a provisioned false-negative cost, not a leak. Read the README
+//!     callout / `SPEC.md` §"Keyword lookup" before using it.
 //!   - `Pir(...).Multi(k)` — **`k` records per round trip**, over `fss`'s
 //!     multi-point FSS. Same shape, plus `answerAggregate` for the query a
 //!     single multi-point inner product actually computes (`Σ_j record[α_j]`,
@@ -54,13 +62,14 @@
 //! Multi-*record*-sized retrieval — a whole block rather than a bit — needed
 //! nothing extra and is the default case: see `pir.zig`. Answer verification
 //! against a malicious server is now `Verified` (`verify.zig`) — detection
-//! and abort, never recovery. Still out: keyword/PIR-by-keyword, robustness
-//! and attribution (inherent at two servers), binding answers to a
-//! *published* database digest (authenticated PIR — a different trust model,
-//! see `SPEC.md`), a verified `Multi(k)`, and **sublinear** batch PIR
-//! (`Multi(k)` amortizes the database pass but still costs `k` DPF
+//! and abort, never recovery. Keyword lookup is now `queryKeyword` (above).
+//! Still out: robustness and attribution (inherent at two servers), binding
+//! answers to a *published* database digest (authenticated PIR — a different
+//! trust model, see `SPEC.md`), a verified `Multi(k)`, **sublinear** batch
+//! PIR (`Multi(k)` amortizes the database pass but still costs `k` DPF
 //! evaluations per record; the cuckoo/batch-code multi-point construction
-//! that would fix that is scoped out in `fss`).
+//! that would fix that is scoped out in `fss`), and the `evalFull` wiring of
+//! `Multi(k)`'s inner loop (see `SPEC.md` §"Scoped out").
 
 const std = @import("std");
 

@@ -60,6 +60,47 @@ Per-module API changes since v0.1.0 worth calling out:
   and that error's meaning narrows to "key material was named but none of it
   could be reduced to a comparable key". Same-form matching, and every
   non-HoK path, are unchanged. New sibling dependency: `x509`.
+- **`fss`:** `Dpf.evalFull` / `evalFullWith` — one tree traversal that emits
+  every leaf, instead of re-walking the tree from the root per point. Cost
+  drops from `O(N log N)` PRG calls to `O(N)`: measured **570 ms → 52 ms**
+  (~10.9×) for a full 2^16 domain, matching the `(2n+1)/3` prediction. It
+  fills a **prefix**, not only a whole domain — `pir`'s server evaluates
+  `x < database.count()` and domains are routinely provisioned far larger
+  than the current record count, so a full-domain-only evaluator would have
+  been a regression for the common case. Subtrees past the requested prefix
+  are pruned **before** the PRG call, so an oversized domain costs nothing:
+  a 500-point prefix of a 2^20 domain is **5.1 ms → 0.36 ms**. The streaming
+  form exists because `pir` has no allocator and no runtime-sized scratch —
+  it lets the server fold each value into its accumulator as the walk
+  produces it, leaving `answer`/`answerSlices` signatures untouched.
+  `evalAll` is deliberately left naive, as a structurally independent
+  differential oracle. Both `pir`'s value channel and `Verified`'s tag
+  channel are wired to it. `Multi(k)` is **not** — `k` prefix walks would
+  turn one pass over the records into `k`, and the right answer is an
+  interleaved walk of `k` trees; recorded as scoped out rather than done
+  badly.
+- **`pir`:** keyword lookup — `keywordIndex` / `queryKeyword`, also under
+  `Verified`. `queryKeyword` is literally `query(keywordIndex(kw), …)`, and
+  that is the point: the map is total, deterministic and unconditional
+  (`LE64(SHA-256(kw)[0..8])` masked to the domain — a mask, not a modulo, so
+  no reduction bias, since domains are powers of two), so **a query for a
+  missing keyword is byte- and shape-identical to one for a present
+  keyword**. Presence never enters the computation, so it cannot leave it.
+  That guarantee carries a caller obligation stated in the README and at the
+  call site, not buried in SPEC: **one lookup, one query, whatever comes
+  back**. A client that consults a local set and skips the query, or retries
+  on a mismatch, puts the presence bit back on the wire — a test demonstrates
+  exactly that wrapper's leak. Collisions are a **correctness** cost, never a
+  privacy one: two keywords may share a slot and the loser becomes a false
+  negative discovered locally, with the provisioning rule
+  `domain_bits >= 2·log2(N) + log2(1/eps) − 1` given for sizing. Under
+  `Verified`, a keyword whose slot lies past the database **rejects**, so
+  "absent" and "the server lied" are indistinguishable there — a deployment
+  wanting verifiable absence must materialise every slot. A published
+  key→index map was rejected because it needs the same always-query
+  discipline *plus* a distribution and freshness pipeline this
+  no-I/O module cannot provide; cuckoo/batch codes stay rejected, and would
+  compose above this layer rather than replace it.
 - **`pir`:** malicious-server detection (`Verified(...)`). The module's model
   was honest-but-curious: a server learned nothing about the index but was
   assumed to answer honestly, so a doctored share made the client silently

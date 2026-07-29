@@ -21,12 +21,14 @@
 //!     gated by the running control bit, then the output word.
 //!
 //! **Mechanical scaffold (REAL today):** the `Cw`/`Key` types, `serializeCw`
-//! + the byte codec, `evalAll` (a mechanical loop over `eval`), the
-//! `firstMismatch` full-domain checker, and everything in `prg.zig`/
-//! `group.zig`. `evalAll` is intentionally NOT the efficient tree-reuse
-//! full-domain evaluator (that shares `eval`'s core logic and is a scoped-out
-//! optimization — SPEC.md §"Scoped out"); the naive loop is correct once
-//! `eval` is and keeps the Fable surface minimal.
+//! + the byte codec, `evalAll` (a mechanical loop over `eval`), `evalFull`/
+//! `evalFullWith` (the tree-reuse prefix evaluator — `eval`'s exact per-level
+//! formulas batched over the shared tree, ~`out.len` PRG calls instead of
+//! `out.len·n`; SPEC.md §"Tree-reuse prefix evaluation"), the `firstMismatch`
+//! full-domain checker, and everything in `prg.zig`/`group.zig`. `evalAll`
+//! stays the naive loop over `eval` deliberately: it is the structurally
+//! independent oracle the tree-reuse evaluator is tested against
+//! element-for-element.
 
 const std = @import("std");
 const prg_mod = @import("prg.zig");
@@ -237,15 +239,110 @@ pub fn Dpf(comptime n_bits: usize, comptime out_bytes: usize) type {
         // ── Mechanical scaffold (REAL) ────────────────────────────────────
 
         /// **EvalAll** — evaluate party `b` at every domain point into `out`
-        /// (`out.len` must equal `domain_size`). Mechanical loop over `eval`
-        /// (so it panics through `eval` while the core is gated). Correct once
-        /// `eval` is; an efficient tree-reuse variant is scoped out (SPEC).
+        /// (`out.len` must equal `domain_size`). Mechanical loop over `eval`,
+        /// `O(domain_size · n)` PRG calls. Kept naive ON PURPOSE even though
+        /// `evalFull` exists: this loop is structurally independent of the
+        /// tree-reuse walk, which makes it the differential oracle the
+        /// equivalence tests compare `evalFull` against. Use `evalFull` when
+        /// you want the result fast.
         pub fn evalAll(b: u1, key: Key, out: []Elem) void {
             std.debug.assert(out.len == domain_size);
             var x: usize = 0;
             while (x < domain_size) : (x += 1) {
                 out[x] = eval(b, key, @intCast(x));
             }
+        }
+
+        /// **EvalFull** — tree-reuse evaluation of party `b` over the domain
+        /// **prefix** `[0, out.len)`, `out.len <= domain_size`. Fills `out[x]`
+        /// with bit-for-bit what `eval(b, key, x)` returns, for every `x` in
+        /// the prefix, in one walk of the GGM tree: each internal node's PRG
+        /// expansion is computed once and BOTH children are kept, so the cost
+        /// is ~`out.len` PRG calls (plus at most `n` for nodes straddling the
+        /// prefix boundary) instead of `eval`'s `out.len · n`.
+        ///
+        /// The prefix contract — rather than full-domain-only — is
+        /// load-bearing for the `pir` consumer: a PIR domain is normally sized
+        /// generously above the record count and the unused tail must never be
+        /// evaluated (`pir/SPEC.md` §"Truncating the domain is safe"). A
+        /// subtree lying entirely at/past `out.len` is skipped BEFORE its PRG
+        /// call, so the tail costs zero hashes and the cost is `O(out.len)`,
+        /// not `O(2^n)`.
+        pub fn evalFull(b: u1, key: Key, out: []Elem) void {
+            std.debug.assert(out.len <= domain_size);
+            const sink = struct {
+                fn emit(o: []Elem, x: usize, v: Elem) void {
+                    o[x] = v;
+                }
+            };
+            walkPrefix([]Elem, sink.emit, &key, b, key.seed, b, 0, 0, out.len, out);
+        }
+
+        /// **EvalFullWith** — the same tree-reuse prefix walk as `evalFull`,
+        /// streaming: `emit(context, x, elem)` is called once for each
+        /// `x ∈ [0, count)`, in ascending order, and nothing is materialized.
+        /// For consumers that must stay allocator-free over runtime-sized
+        /// prefixes (`pir`'s server loop): each evaluation is consumed as the
+        /// walk produces it, so no `count`-sized buffer exists anywhere.
+        pub fn evalFullWith(
+            b: u1,
+            key: Key,
+            count: usize,
+            context: anytype,
+            comptime emit: fn (@TypeOf(context), usize, Elem) void,
+        ) void {
+            std.debug.assert(count <= domain_size);
+            walkPrefix(@TypeOf(context), emit, &key, b, key.seed, b, 0, 0, count, context);
+        }
+
+        /// The shared walk under `evalFull`/`evalFullWith`. Recursive; depth
+        /// is bounded by `n <= 31` with a small frame, so stack use is
+        /// trivial. Per level this applies exactly `eval`'s formulas — the
+        /// seed CW XOR gated by the PARENT's control bit, the child control
+        /// bits from `t_cw_l`/`t_cw_r` — and at a leaf exactly `eval`'s output
+        /// step (`convert`, `t`-gated `cw_final`, `(-1)^b`). Equivalence to
+        /// `eval` is asserted element-for-element in `kat_test.zig`, with
+        /// `evalAll`'s independent naive loop as the oracle.
+        fn walkPrefix(
+            comptime Context: type,
+            comptime emit: fn (Context, usize, Elem) void,
+            key: *const Key,
+            b: u1,
+            s: Seed,
+            t: u1,
+            level: usize,
+            base: usize,
+            count: usize,
+            context: Context,
+        ) void {
+            // This node's subtree covers leaves [base, base + 2^(n-level)).
+            // If that lies entirely at/past the prefix end, skip before the
+            // PRG call — the unused tail of the domain costs zero hashes.
+            if (base >= count) return;
+            if (level == n_bits) {
+                var v: Elem = prg_mod.convert(out_bytes, s);
+                if (t == 1) v = G.add(v, key.cw_final);
+                if (b == 1) v = G.neg(v);
+                emit(context, base, v);
+                return;
+            }
+            const e = prg_mod.prg(s);
+            const c = key.cw[level];
+            const half = @as(usize, 1) << @intCast(n_bits - 1 - level);
+
+            var s_l = e.s_l;
+            const t_l = e.t_l ^ (t & c.t_cw_l);
+            if (t == 1) for (&s_l, c.s_cw) |*d, q| {
+                d.* ^= q;
+            };
+            walkPrefix(Context, emit, key, b, s_l, t_l, level + 1, base, count, context);
+
+            var s_r = e.s_r;
+            const t_r = e.t_r ^ (t & c.t_cw_r);
+            if (t == 1) for (&s_r, c.s_cw) |*d, q| {
+                d.* ^= q;
+            };
+            walkPrefix(Context, emit, key, b, s_r, t_r, level + 1, base + half, count, context);
         }
 
         /// Full-domain correctness checker (REAL/ungated). Given both parties'

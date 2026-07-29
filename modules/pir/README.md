@@ -12,13 +12,17 @@ Distributed Point Function. The DPF *is* the primitive two-server PIR is made
 of; almost everything hard lives there, and this module is the arithmetic and
 the codec that turn it into a retrieval protocol.
 
-**Status: COMPLETE for single-index and multi-index retrieval, plus
+**Status: COMPLETE for single-index, multi-index and keyword retrieval, plus
 malicious-server DETECTION.** Query construction, both servers' answer
 computation, reconstruction, and the wire codecs are implemented and tested
 for both. Multi-index retrieval (`Multi(k)`, several records in one round
-trip) rides on `fss`'s multi-point FSS (`fss.Mpf`). `Verified` adds a client
+trip) rides on `fss`'s multi-point FSS (`fss.Mpf`). Keyword lookup
+(`queryKeyword`) is a public hash-to-index map in front of the unchanged index
+protocol — read its callout below before using it. `Verified` adds a client
 that detects a lying server and aborts instead of silently reconstructing a
-doctored record — detection, not recovery; see below.
+doctored record — detection, not recovery; see below. Server answers run on
+`fss`'s tree-reuse `evalFull` (~1 PRG call per record instead of
+`domain_bits`; ~11× measured at `domain_bits=16`).
 
 ## Read this first
 
@@ -105,6 +109,46 @@ blocks); in the *aggregate* the same points add, to `2·record[7]`.
 > dummy indices; each index is hidden by its own instance, so padding hides the
 > *effective* count for free.
 
+### Looking up by keyword
+
+```zig
+// The database-builder places the record for `kw` at P.keywordIndex(kw)
+// (SHA-256, truncated to domain_bits — public, deterministic, total), and
+// gives every record its own key field so the client can check the match.
+
+// CLIENT — one unconditional query per lookup. Nothing else.
+const shares = try P.queryKeyword("alpha", s0, s1);
+// …servers answer, client reconstructs exactly as above, then checks the
+// record's own key field LOCALLY: match → hit; mismatch/filler → absent.
+```
+
+> **A miss is the same call as a hit — as long as you never skip and never
+> retry.** `queryKeyword(kw, …)` is exactly `query(keywordIndex(kw), …)`: the
+> map is total (every keyword lands on *some* index) and unconditional (no
+> existence check, no retry, no probing, no database access), so the servers
+> see the identical call shape whether the keyword exists or not, and the
+> derived index is hidden by the same DPF property as any other index. That
+> holds **only if the caller keeps the discipline: one lookup, one query,
+> whatever comes back.** Checking a local set/Bloom filter and skipping the
+> query, or re-querying on a mismatch, puts the presence bit back on the wire
+> — a test demonstrates exactly that wrapper's leak.
+>
+> **The cost is collisions, and it is a correctness cost, not a privacy
+> cost:** two keywords can hash to one slot; whichever record the builder
+> placed there is what comes back for both, and the losing keyword is simply
+> unreachable (a false negative you discover locally — nothing branches on
+> it). Provision for it: for `N` keywords,
+> `P(any collision) ≈ N²/2^(domain_bits+1)` — pick
+> `domain_bits ≥ 2·log2(N) + log2(1/ε) − 1` for probability ≤ `ε`
+> (e.g. 1000 keywords, `domain_bits = 30` → `P < 5·10⁻⁴`). Oversizing the
+> domain is cheap: the unused tail is never evaluated.
+>
+> **Under `Verified`:** `W.queryKeyword` exists too, but a keyword whose slot
+> is past the database **rejects** (`error.AnswerRejected`) — an honest
+> all-zero is indistinguishable from a zeroing attack — so "absent" and "a
+> server lied" look the same. A deployment wanting a verifiable absent must
+> materialize every slot with filler records. See `SPEC.md` §"Keyword lookup".
+
 ### Parameters
 
 | Parameter | Meaning |
@@ -187,13 +231,19 @@ Read the security statement before relying on it (`SPEC.md`
 
 ### What this does not do
 
-No keyword lookup (indices only). `Verified` detects but never repairs — no
-recovery, no attribution, no protection when both servers serve the same
-modified database (see above). `Multi(k)` amortizes the database *pass* but
-still costs `k` DPF evaluations per record — sublinear batch PIR needs the
-cuckoo/batch-code multi-point construction, scoped out in `fss` — and has no
-verified variant yet. The base (unverified) protocol remains available where
-integrity is provided elsewhere.
+Keyword lookup resolves collisions for nobody: a collision means the losing
+keyword is unreachable (provision `domain_bits` for your keyword count — see
+the callout), and there is no published-mapping distribution and no
+cuckoo/multi-slot placement (see `SPEC.md` §"Keyword lookup" for why both
+were declined). `Verified` detects but never repairs — no recovery, no
+attribution, no protection when both servers serve the same modified database
+(see above). `Multi(k)` amortizes the database *pass* but still costs `k` DPF
+evaluations per record — sublinear batch PIR needs the cuckoo/batch-code
+multi-point construction, scoped out in `fss` — and has no verified variant
+yet; its inner loop also still uses per-point `eval` (the `evalFull` wiring
+covers the single-index and `Verified` paths — see `SPEC.md` §"Scoped out").
+The base (unverified) protocol remains available where integrity is provided
+elsewhere.
 
 ## Verify
 

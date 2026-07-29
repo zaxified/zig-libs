@@ -177,3 +177,130 @@ test "positive control (stronger, GATED): flipping one CW bit breaks reconstruct
     D.evalAll(1, keys[1], &b1);
     try std.testing.expect(D.firstMismatch(&b0, &b1, alpha, beta) != null);
 }
+
+// ── evalFull: tree-reuse prefix evaluator vs the naive oracle ──────────────
+//
+// `evalFull` must produce EXACTLY what the per-point `eval` path produces —
+// bit-for-bit, no tolerance — because `pir` swaps one for the other inside its
+// server loop and the swap must be invisible. `evalAll` is the structurally
+// independent oracle here: it is a plain loop over `eval` and shares nothing
+// with the tree-reuse walk except `eval` itself.
+
+/// deterministic seed pair, distinct per tag
+fn efSeeds(tag: u8) [2][16]u8 {
+    var s0: [16]u8 = undefined;
+    var s1: [16]u8 = undefined;
+    for (&s0, &s1, 0..) |*p0, *p1, j| {
+        p0.* = @truncate(tag *% 31 +% j *% 3 +% 1);
+        p1.* = @truncate(tag *% 17 +% j *% 5 +% 200);
+    }
+    return .{ s0, s1 };
+}
+
+test "evalFull == evalAll element-for-element over the FULL domain (both parties)" {
+    if (!gate.core_implemented) return error.SkipZigTest;
+    // Small domain fully, and a medium domain fully. α at both edges and in
+    // the middle; β including 0 (the all-zero point function's edge).
+    inline for (.{ Dpf(4, 4), Dpf(10, 8) }) |D| {
+        const alphas = [_]D.Index{ 0, D.domain_size / 2, @intCast(D.domain_size - 1) };
+        const betas = [_]D.Elem{ 1, 0xDEADBEEF, 0 };
+        for (alphas, betas, 0..) |alpha, beta, i| {
+            const seeds = efSeeds(@intCast(i * 7 + D.n));
+            const keys = D.genWithSeeds(alpha, beta, seeds[0], seeds[1]);
+            inline for (.{ 0, 1 }) |b| {
+                var naive: [D.domain_size]D.Elem = undefined;
+                var fast: [D.domain_size]D.Elem = undefined;
+                D.evalAll(b, keys[b], &naive);
+                D.evalFull(b, keys[b], &fast);
+                try std.testing.expectEqualSlices(D.Elem, &naive, &fast);
+            }
+        }
+    }
+}
+
+test "evalFull over a PREFIX matches eval point-for-point (out.len far below 2^n)" {
+    if (!gate.core_implemented) return error.SkipZigTest;
+    // The contract pir depends on: a 2^16 domain of which only a few hundred
+    // leading points are evaluated. α inside the prefix, exactly at its last
+    // point, just past it, and at the far end of the domain — the spike being
+    // outside the prefix must simply never be seen.
+    const D = Dpf(16, 4);
+    const prefix_len = 300;
+    const alphas = [_]D.Index{ 0, 150, prefix_len - 1, prefix_len, 65535 };
+    var fast: [prefix_len]D.Elem = undefined;
+    for (alphas, 0..) |alpha, i| {
+        const seeds = efSeeds(@intCast(100 + i));
+        const keys = D.genWithSeeds(alpha, 0xC0FFEE, seeds[0], seeds[1]);
+        inline for (.{ 0, 1 }) |b| {
+            D.evalFull(b, keys[b], &fast);
+            for (0..prefix_len) |x| {
+                try std.testing.expectEqual(D.eval(b, keys[b], @intCast(x)), fast[x]);
+            }
+        }
+    }
+    // Both parties' prefix evaluations reconstruct f_{α,β} on the prefix:
+    // β where α is inside it, 0 everywhere else.
+    {
+        const seeds = efSeeds(200);
+        const alpha: D.Index = 150;
+        const keys = D.genWithSeeds(alpha, 42, seeds[0], seeds[1]);
+        var f0: [prefix_len]D.Elem = undefined;
+        var f1: [prefix_len]D.Elem = undefined;
+        D.evalFull(0, keys[0], &f0);
+        D.evalFull(1, keys[1], &f1);
+        for (0..prefix_len) |x| {
+            const want: D.Elem = if (x == alpha) 42 else 0;
+            try std.testing.expectEqual(want, D.G.add(f0[x], f1[x]));
+        }
+    }
+}
+
+test "evalFull prefix boundary cases: len 0, len 1, and a non-power-of-two straddle" {
+    if (!gate.core_implemented) return error.SkipZigTest;
+    const D = Dpf(10, 4);
+    const seeds = efSeeds(50);
+    const keys = D.genWithSeeds(700, 9, seeds[0], seeds[1]);
+    inline for (.{ 0, 1 }) |b| {
+        // len 0: a defined no-op.
+        var empty: [0]D.Elem = undefined;
+        D.evalFull(b, keys[b], &empty);
+        // len 1: only the leftmost path.
+        var one: [1]D.Elem = undefined;
+        D.evalFull(b, keys[b], &one);
+        try std.testing.expectEqual(D.eval(b, keys[b], 0), one[0]);
+        // 257 = 2^8 + 1 leaves: a full subtree plus a lone straddling leaf.
+        var odd: [257]D.Elem = undefined;
+        D.evalFull(b, keys[b], &odd);
+        for (0..odd.len) |x| {
+            try std.testing.expectEqual(D.eval(b, keys[b], @intCast(x)), odd[x]);
+        }
+    }
+}
+
+test "evalFullWith streams the same values, each index exactly once, in order" {
+    if (!gate.core_implemented) return error.SkipZigTest;
+    const D = Dpf(8, 4);
+    const seeds = efSeeds(77);
+    const keys = D.genWithSeeds(33, 0xABCD, seeds[0], seeds[1]);
+    const count = 100;
+    const Ctx = struct {
+        vals: *[count]D.Elem,
+        next: *usize,
+        fn emit(ctx: @This(), x: usize, v: D.Elem) void {
+            // ascending order, no skip, no repeat — pir's access-pattern
+            // requirement rides on this.
+            std.debug.assert(x == ctx.next.*);
+            ctx.next.* += 1;
+            ctx.vals[x] = v;
+        }
+    };
+    inline for (.{ 0, 1 }) |b| {
+        var vals: [count]D.Elem = undefined;
+        var next: usize = 0;
+        D.evalFullWith(b, keys[b], count, Ctx{ .vals = &vals, .next = &next }, Ctx.emit);
+        try std.testing.expectEqual(@as(usize, count), next);
+        var buf: [count]D.Elem = undefined;
+        D.evalFull(b, keys[b], &buf);
+        try std.testing.expectEqualSlices(D.Elem, &buf, &vals);
+    }
+}

@@ -82,6 +82,22 @@ the record count. The server evaluates only `x < N`; since `f_{i,1}(x) = 0`
 outside `x = i`, dropping the tail of the domain changes nothing, and querying
 a valid-but-unpopulated index reconstructs to all-zero rather than erroring.
 
+**Server cost: ~1 PRG call per record, via `fss`'s tree-reuse `evalFull`.**
+The server's inner product is driven by `fss.Dpf.evalFullWith` — one walk of
+the DPF tree over the `[0, N)` prefix, streaming each evaluation into the
+accumulator — instead of one `O(domain_bits)` root-to-leaf `eval` per record.
+Measured ~11× at `domain_bits=16` (see `fss/SPEC.md` §"Tree-reuse prefix
+evaluation"). Two properties were load-bearing in the wiring and are pinned by
+tests: the walk still **never evaluates the domain's unused tail** (subtrees
+past `N` are pruned before their PRG calls — the truncation invariant above,
+kept), and it emits every `x < N` exactly once in order with no data-dependent
+skip (the access-pattern requirement, still covered by the
+every-record-influences-the-answer test). The streaming form is used because
+this module has no allocator and no runtime-sized scratch (§"Where the library
+stops"): no `N`-sized buffer exists anywhere. The `Verified` layer's tag
+channel — another instantiation of the same generic `Dpf` — is wired the same
+way.
+
 ## Multi-index retrieval, and the correction it required
 
 `Pir(...).Multi(k)` retrieves `k` records per round trip over `fss`'s
@@ -206,6 +222,89 @@ A census test also asserts that the multi-index share's structurally-constant
 bits are exactly the single-index census **tiled with period `share_len`**,
 which is what pins that the concatenation introduced no header, separator,
 padding or per-instance counter of its own.
+
+## Keyword lookup (`keywordIndex` / `queryKeyword`)
+
+Was scoped out ("Index lookup only; keyword PIR needs a hashing/cuckoo layer
+above this"); now built, as the thinnest possible layer: a **public, total,
+deterministic hash-to-index map** composed in front of the unchanged index
+protocol.
+
+### The construction chosen
+
+`keywordIndex(kw) = LE64(SHA-256(kw)[0..8]) & (2^domain_bits − 1)` — the
+domain is a power of two, so the truncation is exact (no modulo bias) — and
+`queryKeyword(kw, s0, s1) = query(keywordIndex(kw), s0, s1)`, nothing else.
+The database-builder's side of the convention: the record for `kw` is placed
+at `keywordIndex(kw)`, and records carry their own key field so a client can
+check the match locally (a documented layout convention, not something this
+module enforces — the same "Database is a borrowed view" stance as `db.zig`).
+The `Verified` layer gets the same one-line wrapper over its own `query`.
+
+### The exact leakage statement
+
+- **A query for a missing keyword is byte- and shape-identical to a query for
+  a present one** — *provided the caller never skips a query and never
+  retries*. The map is total (every byte string lands on some index),
+  deterministic, and unconditional: `queryKeyword` has no database access, no
+  existence check, no retry, no probing, and no branch on anything but the
+  keyword bytes it hashes. Presence simply does not enter the computation, so
+  it cannot leave it. The condition is a real caller obligation, stated in the
+  API docs: one lookup, one query, whatever comes back — a client that
+  consults a local set/Bloom filter and skips, or re-queries on a local
+  mismatch, re-creates the presence leak in its own traffic (a test
+  demonstrates the call-count difference of exactly that wrapper).
+- **Nothing about the keyword or its hash reaches a server** except through
+  the DPF shares: the derived index goes down the exact same `query` path as
+  any other index, and the DPF's hiding property covers it. `keywordIndex`
+  itself has no secret-dependent branches (SHA-256 and an AND mask are
+  data-independent operations), and even that is defense in depth — it runs on
+  the client, and its output is then DPF-hidden.
+- **Collisions are a correctness cost, never a privacy cost.** Two keywords
+  may map to one index; the builder placed one record there, and that record
+  is what comes back for both — the losing keyword's record is unreachable (a
+  **false negative**), discovered only locally after reconstruction. There is
+  no resolution, no rehash, no second slot — deliberately, because every
+  resolution strategy is a data-dependent extra query. An executable test
+  constructs a real collision and runs the false negative. The caller's
+  provisioning obligation, exactly: for `N` keywords,
+  `P(any collision) ≈ N²/2^(domain_bits+1)`; keep it below `ε` by choosing
+  `domain_bits ≥ 2·log2(N) + log2(1/ε) − 1` (e.g. `N = 1000`,
+  `domain_bits = 30` gives `P < 5·10⁻⁴`). Note this couples `domain_bits` to
+  the *keyword universe*, not the record count — keyword deployments size the
+  domain generously, which is exactly the case `evalFull`'s prefix pruning
+  keeps cheap.
+- **Repeated-query privacy is unchanged**, because `queryKeyword` reduces to
+  `query` with fresh caller seeds: two lookups' shares are two independent DPF
+  instances, exactly as two index queries' are. The hash adds no correlation
+  between shares beyond the indices themselves (it is a public deterministic
+  map — the same statement as "the client queried index 5 twice", which the
+  base protocol already covers: with fresh seeds, repeats are computationally
+  invisible). Querying the *same* keyword twice is querying the same index
+  twice — already the base protocol's story, no weaker here.
+
+### Against the alternatives
+
+- **A published key→index mapping** (resolved locally, so the wire sees plain
+  index PIR) removes collisions — the publisher can assign injectively — but
+  is leak-free only under the *same* "always query, pad the misses" caller
+  discipline this design needs, **plus** an out-of-band publishing and
+  freshness pipeline: the mapping must reach every client and track every
+  database change, an ongoing service with its own consistency and version
+  side channels. A no-I/O module cannot provide, or even meaningfully specify,
+  that pipeline (§"Where the library stops"); a deployment that has one can
+  simply use index PIR directly — nothing here blocks it.
+- **Cuckoo hashing / batch codes** were already consciously rejected for
+  `fss`'s multi-point construction, with a stated revisit trigger (`fss`
+  SPEC). Nothing about keyword lookup distinguishes it from that rejection —
+  the mechanism would buy multi-slot placement (each key gets 2–3 candidate
+  slots, resolving collisions by displacement) at the price of the failure
+  probability, the stash policy, and — decisive here — **per-lookup
+  multi-slot queries whose shape the whole design exists to keep constant**.
+  Querying all candidate slots unconditionally (the leak-free way to do
+  cuckoo lookup) is `Multi(k)` composed with `keywordIndex` variants, which a
+  deployment can build above this layer if collision-freedom is worth k× the
+  work; it is not this module's default.
 
 ## Threat model
 
@@ -656,16 +755,29 @@ protocol modules: bytes in, bytes out, and the transport is the integrator's.
   published database (authenticated PIR), and a verified `Multi(k)` (`k` tag
   channels compose the same way; nothing new cryptographically, deferred
   until a consumer wants it).
-- **PIR by keyword.** Index lookup only; keyword PIR needs a hashing/cuckoo
-  layer above this.
+- ~~**PIR by keyword.**~~ **Built** — `keywordIndex`/`queryKeyword`,
+  §"Keyword lookup" above: a public total hash-to-index map with no retry and
+  no existence check, so a miss is the same call as a hit; collisions are a
+  provisioned false-negative cost, not a leak. What remains scoped out of
+  *that* is stated there: a published injective mapping (needs an out-of-band
+  publishing pipeline this no-I/O module cannot provide) and cuckoo/multi-slot
+  placement (rejected in `fss` with a stated trigger; a deployment can compose
+  `Multi(k)` over `keywordIndex` variants above this layer).
 - **Hiding `k` itself.** `k` is public protocol geometry and the share length
   reveals it; a client hides only its *effective* count, by padding. Making `k`
   itself private would mean padding every share to a deployment-wide maximum,
   which is a protocol decision above this layer.
-- **An efficient full-domain evaluator.** The server's cost is dominated by
-  one `Dpf.eval` per record, each `O(domain_bits)` SHA-256 calls. `fss`'s
-  scoped-out tree-reuse `evalFull` would cut that to `O(1)` amortized per
-  record and is the single biggest speedup available — it belongs in `fss`.
+- ~~**An efficient full-domain evaluator.**~~ **Built, in `fss` as
+  predicted** — `Dpf.evalFull`/`evalFullWith` (tree-reuse **prefix**
+  evaluation; `fss/SPEC.md` §"Tree-reuse prefix evaluation"), wired into
+  `answer`/`answerSlices` and `Verified.answer`'s tag channel
+  (§"Server cost" above): ~1 PRG call per record instead of `domain_bits`,
+  measured ~11× at `domain_bits=16`, with the unused-tail truncation invariant
+  and the access-pattern requirement both preserved and still tested. Not
+  wired (cheap follow-on, deliberately deferred): `Multi(k)`'s `Mpf.evalEach`
+  loop — doing it as `k` prefix walks would flip the documented
+  one-pass-over-records memory-traffic property into `k` passes, so it wants a
+  `k`-tree interleaved walk, deferred until a consumer cares.
 
 ## References
 

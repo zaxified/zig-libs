@@ -20,7 +20,11 @@
 //! ## Entry points
 //!   - `Dpf(n, L)` — a DPF over domain `{0,1}^n`, output group `Z_{2^{8L}}`.
 //!     `.genWithSeeds(α, β, s0, s1)` → `[2]Key`; `.eval(b, key, x)`;
-//!     `.evalAll(b, key, out)`; `.firstMismatch(...)` (verification oracle).
+//!     `.evalFull(b, key, out)` — tree-reuse evaluation of the domain
+//!     **prefix** `[0, out.len)` in ~`out.len` PRG calls (vs `eval`'s
+//!     `O(n)` each), with `.evalFullWith(...)` the allocation-free streaming
+//!     form; `.evalAll(b, key, out)` (naive full-domain loop, kept as the
+//!     independent oracle); `.firstMismatch(...)` (verification oracle).
 //!   - `Mpf(n, L, k)` — the **multi-point** scheme: shares of a function
 //!     non-zero at `k` chosen points. `k` independent `Dpf` instances summed —
 //!     no failure probability, no new cryptographic surface, key size linear in
@@ -75,6 +79,7 @@ test {
     _ = kat_vectors;
     _ = @import("kat_test.zig");
     _ = @import("mpf_test.zig");
+    _ = @import("bench.zig");
 }
 
 test "meta.model_after names the BGI DPF construction" {
