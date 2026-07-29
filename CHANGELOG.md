@@ -60,6 +60,40 @@ Per-module API changes since v0.1.0 worth calling out:
   and that error's meaning narrows to "key material was named but none of it
   could be reduced to a comparable key". Same-form matching, and every
   non-HoK path, are unchanged. New sibling dependency: `x509`.
+- **`dtls`:** live third-party interop, and the four wire defects it exposed.
+  `src/wolfssl_interop.zig` runs a real DTLS 1.3 PSK handshake over loopback
+  UDP against **wolfSSL 5.9.1** in both roles (our client vs its server, our
+  server vs its client), each with an application-data round trip; the peer
+  is a small C program embedded in the test and compiled by `cc` at test
+  time, skipping loudly when `cc` or wolfSSL is absent. Everything before
+  this was self-interop, which by construction cannot catch a misreading
+  both sides share — and four such defects were live:
+  **(1)** the ClientHello omitted DTLS's `legacy_cookie` field entirely (RFC
+  9147 §5.3 keeps it, present and empty); **(2)** the PSK binder was computed
+  over a transcript two bytes too long — RFC 8446 §4.2.11.2 truncates before
+  the binders *list*, whose own 2-byte length prefix was being left in;
+  **(3)** neither Hello carried `supported_versions`, so nothing on the wire
+  ever said DTLS 1.3; **(4)** the server sent no RFC 9147 §7 ACK for the
+  client's final flight — the one flight §7.1 excludes from implicit
+  acknowledgement — leaving a conforming client blocked forever.
+  **BREAKING (wire):** (1)–(4) all change the bytes this module sends and the
+  transcript it hashes, so a peer built from an older revision no longer
+  interoperates with this one; the binder change in particular makes the
+  mismatch surface as a handshake failure, not silent corruption. **BREAKING
+  (API):** `SendError` gains `ReceivedAck` and `ReceivedPostHandshakeMessage`
+  — `recv` used to call an ACK or a NewSessionTicket `error.Malformed`, and
+  a real peer sends both on the application epoch. `HandshakeError` gains
+  `VersionNotNegotiated`/`UnsupportedVersion`: the client now *requires*
+  `supported_versions` in the ServerHello and rejects any selection other
+  than DTLS 1.3, which is a downgrade guard, not only a compatibility fix.
+  Separately, a peer's `signature_algorithms` list is now filtered against
+  the schemes this module can select (new `messages.filterU16ListExtension`)
+  instead of being decoded whole into a `[8]u16` — wolfSSL advertises 18 and
+  OpenSSL a similar number, so every real client was being rejected with
+  `error.Malformed`. Documented in `SPEC.md`, including the correction that
+  its own oracle ranking was wrong: OpenSSL 3.5.5 and GnuTLS 3.8.12 have no
+  DTLS 1.3 at all, which is why "no peer exists" sat in the backlog until
+  someone checked what was installable.
 - **`dtls`:** `signature_algorithms` is now genuinely negotiated instead of
   advertised-and-ignored. New `Config.signature_algorithms` drives both what
   this side offers and what it will accept; the scheme used to sign

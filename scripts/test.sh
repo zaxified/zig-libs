@@ -266,6 +266,16 @@ capability_check() {
         fi
     fi
 
+    # dtls's live third-party interop compiles a small wolfSSL peer with cc.
+    # Both are needed: no compiler, or no wolfSSL headers/library, and the
+    # tests skip. wolfSSL is the DTLS 1.3 peer here because OpenSSL 3.5.5 and
+    # GnuTLS 3.8.12 have no DTLS 1.3 at all.
+    if ! command -v cc >/dev/null 2>&1; then
+        gaps+=("no C compiler (cc)|2 dtls live wolfSSL interop tests skip|sudo apt install build-essential")
+    elif [[ ! -e /usr/include/wolfssl/ssl.h ]]; then
+        gaps+=("wolfSSL headers missing|2 dtls live wolfSSL interop tests skip|sudo apt install libwolfssl-dev")
+    fi
+
     # opcua's asyncua interop drives a Python client; the interpreter needs
     # asyncua + cryptography. This is a separate gate from podman — the
     # container-backed tests pass without it.

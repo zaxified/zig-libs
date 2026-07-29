@@ -66,19 +66,22 @@
 //!   hasn't arrived. Proven by an in-memory client↔server interop test —
 //!   no external DTLS peer required (see `Connection.zig`'s tests).
 //!
-//!   SCOPE CAVEAT (honest): the flight engine is validated for SELF-interop
-//!   (this module's client with this module's server), NOT yet as a drop-in
-//!   for a third-party DTLS 1.3 peer. Two deliberate wire simplifications
-//!   stand in the way of real-peer interop and are called out rather than
-//!   hidden: (1) the epoch-0 ServerHello is framed with the legacy
-//!   `PlaintextHeader` rather than RFC 9147's unified-header form, and (2)
-//!   the ClientHello omits the `supported_versions`/`cookie` extensions a
-//!   real peer expects for version negotiation. Closing these (plus
-//!   cross-`handleFlight` fragment reassembly, currently single-fragment
-//!   only) is the remaining work before an OpenSSL `s_server -dtls1_3 -psk`
-//!   live-interop test. Certificate mode inherits the same self-interop-only
-//!   caveat, plus its own — see `Connection.zig`'s "certificate mode"
-//!   section.
+//!   ALSO proven against a THIRD-PARTY stack: `wolfssl_interop.zig` runs a
+//!   real DTLS 1.3 PSK handshake over a loopback UDP socket against wolfSSL
+//!   5.9.1 in both roles, each followed by an application-data round trip.
+//!   That mattered: self-interop passed for four separate wire defects
+//!   (missing `legacy_cookie`, a PSK-binder transcript two bytes too long,
+//!   no `supported_versions` in either Hello, and no §7 ACK for the client's
+//!   final flight), because both of its sides made each mistake together.
+//!   An earlier version of this note claimed the epoch-0 ServerHello's
+//!   legacy `PlaintextHeader` framing was a blocker; it is not — RFC 9147 §4
+//!   uses `DTLSPlaintext` for exactly those unprotected records, and a real
+//!   peer accepts it.
+//!
+//!   STILL single-fragment: a handshake message split across datagrams is
+//!   rejected rather than reassembled across `handleFlight` calls.
+//!   Certificate mode remains SELF-interop only — see `Connection.zig`'s
+//!   "certificate mode" section.
 //!
 //! **Certificate mode (RFC 8446 §4.4, ADDITIVE):** `Connection.Config` gains
 //! optional `cert`/`peer_verify`/`request_client_cert`/`require_peer_cert`/
@@ -243,6 +246,7 @@ test {
     _ = connection;
     _ = certverify;
     _ = certauth;
+    _ = @import("wolfssl_interop.zig");
 }
 
 test "meta.deps is {\"rsa\", \"x509\"} (certverify.zig's RSASSA-PSS dispatch + certauth.zig's cert parsing; the PSK flight engine itself needs no sibling modules)" {

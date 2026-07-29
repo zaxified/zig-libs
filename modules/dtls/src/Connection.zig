@@ -230,6 +230,10 @@ pub const content_type_application_data: u8 = 23;
 /// the handshake completes.
 pub const application_epoch: u16 = 3;
 
+/// The handshake-traffic epoch (RFC 9147 §6.1): everything after ServerHello
+/// and before the application keys are installed travels under it.
+pub const handshake_epoch: u16 = 2;
+
 pub const HandshakeError = messages.MessageError || handshake.FrameError || handshake.ReassembleError || record.RecordError || aead.RecordProtectionError || SendError || error{
     /// `startHandshake`/`handleFlight` called from a `State` that doesn't
     /// expect it (e.g. `handleFlight` on a client not in
@@ -247,6 +251,13 @@ pub const HandshakeError = messages.MessageError || handshake.FrameError || hand
     /// RFC 8446 §4.2.11.2: the offered PSK binder doesn't verify against
     /// this side's PSK — either a wrong PSK or a tampered ClientHello.
     BinderVerifyFailed,
+    /// RFC 8446 §4.2.1: the ServerHello carried no `supported_versions`
+    /// extension, so the peer never said which version it selected. Since
+    /// every version field on the wire reads DTLS 1.2, this is what a DTLS
+    /// 1.2-only server's answer looks like.
+    VersionNotNegotiated,
+    /// The ServerHello selected a version other than DTLS 1.3.
+    UnsupportedVersion,
     /// RFC 8446 §4.4.4: the peer's Finished `verify_data` doesn't match —
     /// either a wrong PSK/transcript mismatch or a tampered flight.
     FinishedVerifyFailed,
@@ -329,6 +340,21 @@ pub const SendError = error{
     /// has verified — an attacker cannot use this to probe the window
     /// without first producing a validly-authenticated record.
     ReplayedRecord,
+    /// The record authenticated and decrypted, but its inner content type is
+    /// `ack` (26) — RFC 9147 §7. A real peer sends these on the application
+    /// epoch: wolfSSL acknowledges the client's Finished with one before any
+    /// application data flows. It is ordinary protocol traffic, not damage,
+    /// so it gets its own error rather than `Malformed`; a caller that has
+    /// nothing to retransmit can simply read the next datagram.
+    ReceivedAck,
+    /// The record authenticated and decrypted, but its inner content type is
+    /// `handshake` (22) on the application epoch — a post-handshake message
+    /// (NewSessionTicket, KeyUpdate, RFC 8446 §4.6). This module implements
+    /// none of them (see the "Out of scope" list in `root.zig`), so the
+    /// record is reported rather than silently dropped: a caller that does
+    /// not need resumption or key update can read the next datagram, but it
+    /// is told what it is skipping.
+    ReceivedPostHandshakeMessage,
 };
 
 /// One direction's record-protection key material, derived from a traffic
@@ -359,6 +385,11 @@ const EpochSeqState = struct {
 /// content-type byte for handshake messages, as opposed to
 /// `content_type_application_data` above).
 const content_type_handshake: u8 = 22;
+
+/// RFC 9147 §7's "ack" content type. `flight.zig` encodes/decodes the ACK
+/// message body and leaves the carrying content type to its caller — this is
+/// that value.
+const content_type_ack: u8 = 26;
 
 // ── certificate-mode sizing constants ────────────────────────────────────
 //
@@ -396,6 +427,18 @@ const default_signature_algorithms = [_]certverify.SignatureScheme{
     .rsa_pss_rsae_sha384,
     .rsa_pss_rsae_sha512,
     .ed25519,
+};
+
+/// Every signature scheme this module can verify, as wire values — the
+/// filter applied to a peer's `signature_algorithms` list. A scheme outside
+/// this set can never be selected, so there is no reason to remember the
+/// peer offered it (and every reason not to: the peer decides how long that
+/// list is).
+const supported_scheme_wire_values = blk: {
+    const all = std.enums.values(certverify.SignatureScheme);
+    var out: [all.len]u16 = undefined;
+    for (all, 0..) |s, i| out[i] = @intFromEnum(s);
+    break :blk out;
 };
 
 /// Encodes `schemes` as a wire `signature_algorithms` extension (RFC 8446
@@ -668,15 +711,25 @@ pub const Connection = struct {
     /// (RFC 9147 §4.2.3). Returns `header || protected_record` written into
     /// `out`. Advances the send sequence number.
     pub fn send(self: *Connection, plaintext: []const u8, out: []u8) SendError![]const u8 {
+        return self.protectRecord(content_type_application_data, plaintext, out);
+    }
+
+    /// The record-protection half of `send`, parameterised by the inner
+    /// content type. `send` is this with `application_data`; the server's
+    /// RFC 9147 §7 ACK for the client's final flight is this with `ack`,
+    /// which is why the two are not one function: an ACK is not application
+    /// data, but it is protected identically and shares the send sequence
+    /// number space.
+    fn protectRecord(self: *Connection, inner_content_type: u8, payload: []const u8, out: []u8) SendError![]const u8 {
         if (self.state != .connected) return error.NotConnected;
         const params = suiteParams(self.suite) orelse return error.UnsupportedSuite;
 
         // DTLSInnerPlaintext = content || content_type (no extra padding).
         var inner_buf: [1500]u8 = undefined;
-        if (plaintext.len + 1 > inner_buf.len) return error.BufferTooShort;
-        @memcpy(inner_buf[0..plaintext.len], plaintext);
-        inner_buf[plaintext.len] = content_type_application_data;
-        const inner = inner_buf[0 .. plaintext.len + 1];
+        if (payload.len + 1 > inner_buf.len) return error.BufferTooShort;
+        @memcpy(inner_buf[0..payload.len], payload);
+        inner_buf[payload.len] = inner_content_type;
+        const inner = inner_buf[0 .. payload.len + 1];
 
         const ct_len = inner.len + params.tag_len;
         const seq_len: record.SeqNumLen = if (self.send_seq <= 0xff) .short else .long;
@@ -757,7 +810,11 @@ pub const Connection = struct {
         while (end > 0 and out[end - 1] == 0) end -= 1;
         if (end == 0) return error.Malformed;
         const ctype = out[end - 1];
-        if (ctype != content_type_application_data) return error.Malformed;
+        if (ctype != content_type_application_data) return switch (ctype) {
+            content_type_ack => error.ReceivedAck,
+            content_type_handshake => error.ReceivedPostHandshakeMessage,
+            else => error.Malformed,
+        };
 
         // RFC 9147 §4.5.1 anti-replay window. This MUST run only after the
         // AEAD tag above has already verified (it has, by this point) —
@@ -831,7 +888,29 @@ pub const Connection = struct {
         const binders = [_][]const u8{&placeholder_binder};
         const psk_ext_data = try messages.encodeOfferedPsks(.{ .identities = &identities, .binders = &binders }, &psk_buf);
 
+        var versions_buf: [3]u8 = undefined;
+        const versions_ext = try messages.encodeSupportedVersionsClientHello(&.{messages.version_dtls13}, &versions_buf);
+
+        // RFC 8446 §9.2 lets a psk_ke-only client omit `supported_groups` and
+        // `key_share`, but real servers do not all agree: wolfSSL answers a
+        // ClientHello without them with `alert(illegal_parameter)`. Sending
+        // `supported_groups` plus an EMPTY `key_share` is what wolfSSL's own
+        // psk_ke client sends, costs nothing, and keeps the exchange PSK-only
+        // — an empty `client_shares` offers no share to negotiate.
+        var groups_buf: [2 + 2 * 2]u8 = undefined;
+        const groups_ext = try messages.encodeSupportedGroups(&.{
+            @intFromEnum(messages.NamedGroup.x25519),
+            @intFromEnum(messages.NamedGroup.secp256r1),
+        }, &groups_buf);
+        var key_share_buf: [2]u8 = undefined;
+        const key_share_ext = try messages.encodeKeyShareClientHello(&.{}, &key_share_buf);
+
+        // `pre_shared_key` MUST be the last extension (RFC 8446 §4.2.11) —
+        // the binder is computed over everything that precedes it.
         const exts = [_]messages.Extension{
+            .{ .ext_type = @intFromEnum(messages.ExtensionType.supported_versions), .data = versions_ext },
+            .{ .ext_type = @intFromEnum(messages.ExtensionType.supported_groups), .data = groups_ext },
+            .{ .ext_type = @intFromEnum(messages.ExtensionType.key_share), .data = key_share_ext },
             .{ .ext_type = @intFromEnum(messages.ExtensionType.psk_key_exchange_modes), .data = modes_ext },
             sigalgs_ext,
             .{ .ext_type = @intFromEnum(messages.ExtensionType.pre_shared_key), .data = psk_ext_data },
@@ -845,11 +924,20 @@ pub const Connection = struct {
         }, body_buf);
 
         // RFC 8446 §4.2.11.2: binder = HMAC(finished_key,
-        // Transcript-Hash(Truncate(ClientHello1))). `psk_ext_data`'s layout
-        // (written above) is `ids... || binders_len(2) || len(1) ||
-        // binder(32)` — the trailing 33 bytes are exactly the one binder
-        // entry, so Truncate() is "drop the last 33 bytes of ch_full".
-        const binder_len: usize = 1 + 32;
+        // Transcript-Hash(Truncate(ClientHello1))), where the hashed prefix
+        // runs "up to and including the PreSharedKeyExtension.identities
+        // field. That is, it includes all of the ClientHello but not the
+        // binders list itself."
+        //
+        // `psk_ext_data`'s layout is `ids... || binders_len(2) || len(1) ||
+        // binder(32)`. The binders LIST is a vector, so its 2-byte length
+        // prefix belongs to the list and is dropped with it: Truncate() cuts
+        // the last 2 + 1 + 32 bytes, not 33. Cutting 33 (keeping
+        // `binders_len` in the hash) is a two-byte error invisible to
+        // self-interop — both sides simply agree on the wrong prefix — and
+        // it is what a live wolfSSL peer reported as
+        // `alert(illegal_parameter)` / "binder does not verify".
+        const binder_len: usize = 2 + 1 + 32;
         if (ch_full.len < binder_len) return error.Malformed;
         const truncated = ch_full[0 .. ch_full.len - binder_len];
         const binder_th = self.transcript.wouldBeHash(@intFromEnum(messages.HandshakeType.client_hello), ch_full.len, truncated);
@@ -1014,7 +1102,9 @@ pub const Connection = struct {
     /// the recovered inner content type is `content_type_handshake`, and
     /// returns the recovered fragment bytes (12-byte handshake header +
     /// body) written into `out`.
-    fn unprotectHandshakeMessage(self: *Connection, record_bytes: []const u8, out: []u8) HandshakeError![]const u8 {
+    /// `seq_out`, when given, receives the record's reconstructed 48-bit
+    /// sequence number — what an RFC 9147 §7 ACK has to name.
+    fn unprotectHandshakeMessage(self: *Connection, record_bytes: []const u8, out: []u8, seq_out: ?*u64) HandshakeError![]const u8 {
         const dec = record.decodeUnified(record_bytes, 0) catch return error.Malformed;
         const seq_len = dec.hdr.seq_len;
         const seq_bytes_n: usize = if (seq_len == .short) 1 else 2;
@@ -1055,6 +1145,7 @@ pub const Connection = struct {
         if (!replayCheckAndUpdate(&self.hs2.recv_seen_any, &self.hs2.recv_max_seq, &self.hs2.recv_window, full_seq))
             return error.ReplayedRecord;
 
+        if (seq_out) |p| p.* = full_seq;
         return out[0 .. end - 1];
     }
 
@@ -1269,6 +1360,13 @@ pub const Connection = struct {
         leaf_buf: [max_cert_message_body]u8 = undefined,
         leaf_len: usize = 0,
         saw_cv: bool = false,
+        /// The (epoch, sequence_number) of every epoch-2 record consumed
+        /// here — what an RFC 9147 §7 ACK for this flight has to name. The
+        /// client's final flight is the one flight the spec does NOT let a
+        /// receiver acknowledge implicitly, so the server has to send these
+        /// back or the peer never learns its Finished arrived.
+        acked_buf: [4]flight.RecordNumber = undefined,
+        acked_len: usize = 0,
         /// The closing `Finished` message's body (its `verify_data`),
         /// consumed by this same function — see the doc comment below for
         /// why `unprotectHandshakeMessage` cannot be safely called a second
@@ -1331,7 +1429,12 @@ pub const Connection = struct {
             if (pos.* >= datagram.len) return error.Malformed;
 
             var plain_buf: [max_cert_message_body + 64]u8 = undefined;
-            const fragment = try self.unprotectHandshakeMessage(datagram[pos.*..], &plain_buf);
+            var record_seq: u64 = 0;
+            const fragment = try self.unprotectHandshakeMessage(datagram[pos.*..], &plain_buf, &record_seq);
+            if (result.acked_len < result.acked_buf.len) {
+                result.acked_buf[result.acked_len] = .{ .epoch = handshake_epoch, .sequence_number = record_seq };
+                result.acked_len += 1;
+            }
             pos.* += try recordWireLen(datagram[pos.*..]);
             var msg_buf: [max_cert_message_body]u8 = undefined;
             var received_buf: [max_cert_message_body]bool = undefined;
@@ -1389,7 +1492,7 @@ pub const Connection = struct {
     fn handleFlightServer(self: *Connection, datagram: []const u8, random: std.Random, now_ms: u64, out: []u8) HandshakeError!HandshakeResult {
         return switch (self.state) {
             .start => self.serverProcessClientHello(datagram, random, now_ms, out),
-            .wait_finished => self.serverProcessClientFinished(datagram),
+            .wait_finished => self.serverProcessClientFinished(datagram, out),
             else => error.WrongState,
         };
     }
@@ -1422,11 +1525,16 @@ pub const Connection = struct {
         // (`self.config.cert` set). Absent extension ⇒ empty peer list,
         // which negotiation treats like any other empty intersection
         // (`error.NoSignatureSchemeOverlap`), never a silent default.
-        var client_sig_algs_buf: [8]u16 = undefined;
+        //
+        // Only the schemes THIS side could ever select are kept: a real peer
+        // advertises far more than any small fixed buffer holds (wolfSSL
+        // sends 18), and decoding the whole list into a `[8]u16` turned a
+        // perfectly ordinary ClientHello into `error.Malformed`.
+        var client_sig_algs_buf: [supported_scheme_wire_values.len]u16 = undefined;
         var client_sig_algs_len: usize = 0;
         for (dec.extensions) |e| {
             if (e.ext_type != @intFromEnum(messages.ExtensionType.signature_algorithms)) continue;
-            const sig_algs = messages.decodeU16ListExtension(e.data, &client_sig_algs_buf) catch return error.Malformed;
+            const sig_algs = messages.filterU16ListExtension(e.data, &supported_scheme_wire_values, &client_sig_algs_buf) catch return error.Malformed;
             client_sig_algs_len = sig_algs.len;
         }
 
@@ -1455,13 +1563,21 @@ pub const Connection = struct {
                 const binder0 = offered.binders[0];
                 if (binder0.len != 32) return error.Malformed;
 
-                // RFC 8446 §4.2.11.2 truncation point: right after the binders
-                // list's 2-byte length prefix, i.e. right before this (first,
-                // only) binder entry's own 1-byte length prefix. `binder0`
-                // aliases `ch_body` (no-copy decoding all the way down — see
+                // RFC 8446 §4.2.11.2 truncation point: "up to and including
+                // the PreSharedKeyExtension.identities field", i.e. right
+                // BEFORE the whole binders list — which, being a vector,
+                // starts at its own 2-byte length prefix. From this (first,
+                // only) binder entry that is 3 bytes back: 1 for the entry's
+                // length prefix, 2 for the list's. `binder0` aliases
+                // `ch_body` (no-copy decoding all the way down — see
                 // messages.zig), so its address gives the exact byte offset
                 // without assuming anything about extension count/order.
-                const truncate_at = (@intFromPtr(binder0.ptr) - 1) - @intFromPtr(ch_body.ptr);
+                //
+                // Stopping 1 byte back instead of 3 leaves the list length in
+                // the hash. Both of this module's own sides made that error
+                // together, so every self-interop test still passed; a live
+                // wolfSSL peer rejected it as "binder does not verify".
+                const truncate_at = (@intFromPtr(binder0.ptr) - 3) - @intFromPtr(ch_body.ptr);
                 if (truncate_at > ch_body.len) return error.Malformed;
                 const truncated = ch_body[0..truncate_at];
 
@@ -1530,7 +1646,17 @@ pub const Connection = struct {
                 break :blk .{ .ext_type = @intFromEnum(messages.ExtensionType.key_share), .data = ks };
             },
         };
-        const sh_exts = [_]messages.Extension{sh_ext};
+        // RFC 8446 §4.2.1: a server that negotiates 1.3 MUST answer with
+        // `supported_versions` carrying the selected version. Every version
+        // field on the wire still reads DTLS 1.2, so this extension is the
+        // only place the negotiated version appears — omitting it tells a
+        // conforming client it just did a DTLS 1.2 handshake.
+        var sh_versions_buf: [2]u8 = undefined;
+        const sh_versions = try messages.encodeSupportedVersionsServerHello(messages.version_dtls13, &sh_versions_buf);
+        const sh_exts = [_]messages.Extension{
+            .{ .ext_type = @intFromEnum(messages.ExtensionType.supported_versions), .data = sh_versions },
+            sh_ext,
+        };
         var sh_body_buf: [128]u8 = undefined;
         const sh_body = messages.encodeServerHello(.{
             .random = random_bytes,
@@ -1666,7 +1792,7 @@ pub const Connection = struct {
     /// client's Finished, verifies its `verify_data`, and installs the
     /// application traffic secrets derived earlier. Transitions
     /// `.wait_finished` -> `.connected`.
-    fn serverProcessClientFinished(self: *Connection, datagram: []const u8) HandshakeError!HandshakeResult {
+    fn serverProcessClientFinished(self: *Connection, datagram: []const u8, out: []u8) HandshakeError!HandshakeResult {
         var pos: usize = 0;
         const cert_result = try self.consumeOptionalCertMessages(datagram, &pos, .client, false);
         if (cert_result.saw_cert and cert_result.leaf_len > 0 and !cert_result.saw_cv) return error.Malformed;
@@ -1696,7 +1822,25 @@ pub const Connection = struct {
         self.clearFlightTracker();
         self.retransmit_timer.reset();
         self.last_flight_len = 0;
-        return .{ .out = &.{}, .done = true };
+
+        // RFC 9147 §7.1: "In general, flights MUST be ACKed unless they are
+        // implicitly acknowledged", and the list of implicitly-acknowledged
+        // flights is "handshake flights OTHER THAN the client's final flight
+        // of the main handshake". This is that flight — there is no
+        // responding flight left to carry an implicit ACK, so a server that
+        // stays silent here leaves a conforming peer waiting: wolfSSL's
+        // client blocks in `wolfSSL_connect` until it arrives.
+        //
+        // "After the handshake, implementations MUST use the highest
+        // available sending epoch" — the application keys were installed
+        // just above, so the ACK goes out on epoch 3 while naming epoch-2
+        // records, which §7 explicitly allows (the ACK's epoch must be equal
+        // to or higher than the records it acknowledges).
+        var ack_body_buf: [2 + 4 * flight.record_number_len]u8 = undefined;
+        const ack_body = flight.encodeAck(cert_result.acked_buf[0..cert_result.acked_len], &ack_body_buf) catch
+            return error.BufferTooShort;
+        const ack_record = try self.protectRecord(content_type_ack, ack_body, out);
+        return .{ .out = ack_record, .done = true };
     }
 
     /// Client side of flights 2+3 (RFC 9147 §5.4/§5.5): consumes ServerHello
@@ -1724,6 +1868,19 @@ pub const Connection = struct {
         var ext_buf: [8]messages.Extension = undefined;
         const sh_dec = messages.decodeServerHello(sh_parsed.body, &ext_buf) catch return error.Malformed;
         if (messages.isHelloRetryRequest(sh_dec.random)) return error.HelloRetryRequestUnsupported;
+
+        // Downgrade guard (RFC 8446 §4.2.1): the negotiated version lives ONLY
+        // in `supported_versions` — every version field on the wire says DTLS
+        // 1.2. A server that omits the extension, or names anything other than
+        // DTLS 1.3, has not negotiated the protocol this module speaks, and
+        // continuing would mean deriving 1.3 keys for a 1.2 handshake.
+        var negotiated_version: ?[2]u8 = null;
+        for (sh_dec.extensions) |e| {
+            if (e.ext_type == @intFromEnum(messages.ExtensionType.supported_versions))
+                negotiated_version = messages.decodeSupportedVersionsServerHello(e.data) catch return error.Malformed;
+        }
+        const version = negotiated_version orelse return error.VersionNotNegotiated;
+        if (!std.mem.eql(u8, &version, &messages.version_dtls13)) return error.UnsupportedVersion;
 
         const suite = cipherSuiteFromU16(sh_dec.cipher_suite) orelse return error.UnsupportedSuite;
         if (suiteParams(suite) == null) return error.UnsupportedSuite;
@@ -1778,7 +1935,7 @@ pub const Connection = struct {
 
         if (pos >= datagram.len) return error.Malformed;
         var ee_plain_buf: [128]u8 = undefined;
-        const ee_fragment = try self.unprotectHandshakeMessage(datagram[pos..], &ee_plain_buf);
+        const ee_fragment = try self.unprotectHandshakeMessage(datagram[pos..], &ee_plain_buf, null);
         pos += try recordWireLen(datagram[pos..]);
         var ee_msg_buf: [64]u8 = undefined;
         var ee_received_buf: [64]bool = undefined;

@@ -15,10 +15,12 @@ PSK-only (and, additively, `.cert_dhe` certificate-only) client+server
 handshake, proven by an in-memory client↔server interop suite (see
 `Connection.zig`'s tests and `root.zig`'s module doc for the full list of
 what is exercised). The `error.HandshakeEngineNotImplemented` this section
-used to describe no longer exists in the code. What remains genuinely open is
-third-party-peer interop (the engine is validated for SELF-interop only —
-see `root.zig`'s "SCOPE CAVEAT" — and HelloRetryRequest/0-RTT/resumption/key
-update/CCM stay explicitly out of scope, not stubbed). The rest of this SPEC
+used to describe no longer exists in the code. PSK-mode third-party interop
+is also proven — a live wolfSSL 5.9.1 handshake in both roles, see "Live
+third-party interop" below, which lists the four wire defects that only a
+third-party peer could surface. HelloRetryRequest/0-RTT/resumption/key
+update/CCM stay explicitly out of scope, not stubbed, and certificate mode
+is still self-interop only. The rest of this SPEC
 is the original design/recon notes; the itemized 15-function checklist below
 is retained as an implementation record (all 15 are done).
 
@@ -223,9 +225,10 @@ unaffected — proven by the untouched existing suite). Summary:
   public DTLS 1.3 cert-only byte-trace exists**, so this is validated by
   in-memory client↔server interop (server-only + mutual auth + reject-teeth:
   tampered ServerHello key_share, wrong CertificateVerify key, untrusted
-  anchor, missing key_share) — NOT against a third-party peer. **Flagged for
-  the interop-vector audit backlog** alongside the PSK-mode self-interop
-  caveat in `root.zig`.
+  anchor, missing key_share) — NOT against a third-party peer. Certificate
+  mode is now the ONLY remaining self-interop-only surface: PSK mode is
+  covered by the live wolfSSL test, so the same class of shared-misreading
+  defect it found there (four of them) is still possible here.
 
 **Untrusted-DER hazard (unchanged, inherited):** `.cert_dhe` mode parses the
 same PEER-supplied X.509 via the same `certauth` path, so it inherits the
@@ -250,32 +253,75 @@ follow-up.
   timing differences between "bad tag" and "bad padding"/other failure
   modes — attacker-controlled ciphertext must never reach a panic path.
 
-## Verification once the crypto core lands
+## Live third-party interop — done, and what it cost
 
-Recommended interop/verification oracles for PSK-mode DTLS 1.3, ranked by
-how realistic they are to stand up given PSK-ONLY (no cert infrastructure
-needed):
+`src/wolfssl_interop.zig` runs a real DTLS 1.3 PSK handshake over a loopback
+UDP socket against **wolfSSL 5.9.1**, in both roles, each followed by an
+application-data round trip.
 
-1. **OpenSSL `s_server`/`s_client -dtls1_3 -psk ... -cipher PSK-AES128-CCM8`
-   (or the TLS 1.3 PSK cipher-suite equivalent) — most realistic.** OpenSSL
-   3.2+ has DTLS 1.3 support and PSK mode needs zero certificate setup —
-   just a shared hex key on both sides. This is the natural first oracle:
-   run `openssl s_server -dtls -psk <hex> ... ` and have this module's
-   client complete a real handshake against it (and vice versa, this
-   module's `serverInit` against `openssl s_client -dtls1_3 -psk <hex>`).
-2. **GnuTLS `gnutls-cli`/`gnutls-serv --dtls --pskusername/--pskkey`** — a
-   second, independent implementation for cross-checking once OpenSSL
-   interop works, catching bugs that happen to agree with OpenSSL's (or this
-   module's) own misreading of the spec.
-3. **mbedTLS/tinydtls test vectors or a built binary** — both are
-   constrained-device-oriented DTLS stacks that default to PSK + CCM_8,
-   closest in spirit to this module's target profile (RFC 7925 CoAP), but
-   more work to stand up as a live oracle than OpenSSL/GnuTLS CLIs.
-4. **RFC 8448-style traces adapted for DTLS 1.3** — RFC 8448 publishes full
-   TLS 1.3 byte-exact handshake traces (including a PSK-resumption one) that
-   are extremely convenient as KATs, but RFC 8448 has no direct DTLS 1.3
-   counterpart yet; adapting one (re-deriving DTLS's different record/
-   handshake headers around the same key-schedule secrets) is possible but
-   is transcription work, not a drop-in vector source — treat this as a
-   secondary/cross-check tool once (1)/(2) already pass, not the first oracle
-   to reach for.
+**The oracle ranking this section used to carry was wrong, and the error was
+not a detail.** It ranked OpenSSL first on the claim that "OpenSSL 3.2+ has
+DTLS 1.3 support". OpenSSL has no DTLS 1.3 at all as of 3.5.5 — `s_server`
+offers only `-dtls1`/`-dtls1_2` — and GnuTLS 3.8.12, ranked second, stops at
+`VERS-DTLS1.2` (`+VERS-DTLS1.3` is not even a recognised token). Both
+"recommendations" were untested assumptions, and acting on them produced a
+backlog entry that read "blocked: no DTLS 1.3 peer exists" for as long as
+nobody checked what could be *installed*. wolfSSL was packaged the whole
+time (`libwolfssl-dev`, built with `WOLFSSL_DTLS13`).
+
+The peer is a ~170-line C program (`src/testdata/wolfssl_peer.c`) embedded
+into the test and compiled with `cc` at test time, so the test carries its
+own oracle; it skips loudly when `cc` or wolfSSL is absent.
+
+### What it found
+
+Four wire defects, none of which self-interop could ever have caught — a
+self-interop suite has both sides make the same mistake in lockstep:
+
+1. **The ClientHello had no `legacy_cookie` field at all** (RFC 9147 §5.3).
+   DTLS 1.3 moved the cookie into a HelloRetryRequest extension but keeps
+   the legacy field, present and empty. Omitting it shifts every following
+   byte, so the peer read the compression-methods length as half of
+   `cipher_suites`' — `alert(fatal, decode_error)`.
+2. **The PSK binder covered two bytes too many.** RFC 8446 §4.2.11.2 hashes
+   the ClientHello "up to and including the `identities` field", i.e. with
+   the whole binders **list** removed — and a list, being a vector, starts
+   at its own 2-byte length prefix. Both sides here truncated 1 byte later,
+   agreed with each other, and disagreed with everyone else:
+   `alert(illegal_parameter)`, "binder does not verify".
+3. **Neither Hello carried `supported_versions`.** Every version field on
+   the wire reads DTLS 1.2 by design (RFC 9147 §5.3), so this extension is
+   the only place the negotiated version appears. Without it a peer cannot
+   tell 1.3 was meant. The client now sends it and *requires* it in the
+   ServerHello (`error.VersionNotNegotiated` / `error.UnsupportedVersion`) —
+   a downgrade guard, not just a compatibility fix.
+4. **The server never ACKed the client's final flight** (RFC 9147 §7.1).
+   The spec's list of implicitly-acknowledged flights is "handshake flights
+   *other than* the client's final flight of the main handshake"; all others
+   "MUST be ACKed". Nothing follows that flight to carry an implicit ack, so
+   a silent server leaves a conforming client blocked in `connect` forever.
+
+A fifth was a robustness bug rather than a wire bug: the server decoded a
+peer's `signature_algorithms` into a fixed `[8]u16` and returned
+`error.Malformed` when it overflowed. wolfSSL advertises 18 schemes and
+OpenSSL a similar number, so any real client was rejected as malformed. The
+list is now filtered against the schemes this module can actually select,
+which bounds the buffer by OUR list instead of the peer's.
+
+### Still not proven / not implemented
+
+- **HelloRetryRequest and the stateless-cookie retry round trip** — detected
+  and rejected with a typed error, never mishandled. The test peer is
+  configured with `wolfSSL_disable_hrr_cookie` because a default DTLS 1.3
+  server *does* perform the cookie exchange, so this is a real interop
+  limitation, not a harness convenience.
+- **Cross-`handleFlight` fragment reassembly** — a handshake message split
+  across datagrams is rejected. wolfSSL did not split any flight at these
+  sizes, so this path is still untested against a real peer.
+- **Certificate mode** — self-interop only; the live test is PSK.
+- **A second independent stack.** wolfSSL agreeing with us rules out the
+  four defects above, but a bug the two happen to share would still pass.
+  mbedTLS or picotls would be the natural cross-check.
+- **CCM suites** — unwired (Zig 0.16 std ships only a 13-byte-nonce CCM; the
+  DTLS profile needs 12), so the RFC 7925 CoAP default suite is untested
+  against any peer.

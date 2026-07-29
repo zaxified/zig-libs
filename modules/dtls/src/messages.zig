@@ -72,6 +72,45 @@ pub const NamedGroup = enum(u16) {
 /// (mirrors TLS 1.3's ClientHello.legacy_version = {3, 3}, RFC 8446 §4.1.2).
 pub const legacy_version_dtls12 = [2]u8{ 0xFE, 0xFD };
 
+/// DTLS 1.3's real wire version, {254, 252}. It appears ONLY inside the
+/// `supported_versions` extension — never in a record or Hello version field.
+pub const version_dtls13 = [2]u8{ 0xFE, 0xFC };
+
+/// `supported_versions` in its ClientHello form: a 1-byte-length-prefixed
+/// list of versions (RFC 8446 §4.2.1).
+///
+/// Without this extension a peer has nothing to negotiate on — every version
+/// field on the wire says DTLS 1.2 — so it either downgrades or, as wolfSSL
+/// does, rejects the handshake outright. Sending it is not optional for a
+/// 1.3 client.
+pub fn encodeSupportedVersionsClientHello(versions: []const [2]u8, out: []u8) MessageError![]u8 {
+    const body_len = versions.len * 2;
+    if (body_len > std.math.maxInt(u8)) return error.ListTooLong;
+    if (out.len < 1 + body_len) return error.BufferTooShort;
+    out[0] = @intCast(body_len);
+    var i: usize = 1;
+    for (versions) |v| {
+        out[i..][0..2].* = v;
+        i += 2;
+    }
+    return out[0..i];
+}
+
+/// `supported_versions` in its ServerHello/HelloRetryRequest form: a single
+/// selected version, no list prefix (RFC 8446 §4.2.1).
+pub fn encodeSupportedVersionsServerHello(version: [2]u8, out: []u8) MessageError![]u8 {
+    if (out.len < 2) return error.BufferTooShort;
+    out[0..2].* = version;
+    return out[0..2];
+}
+
+/// Decodes the ServerHello form. Returns `error.Malformed` on any other length
+/// — a 1.3 server's answer is exactly two bytes.
+pub fn decodeSupportedVersionsServerHello(data: []const u8) MessageError![2]u8 {
+    if (data.len != 2) return error.Malformed;
+    return data[0..2].*;
+}
+
 /// RFC 8446 §4.1.3: the ServerHello.random magic value that means "this is
 /// actually a HelloRetryRequest" (same message type, distinguished only by
 /// this field). RFC 9147 does not redefine it, so it's reused directly from
@@ -333,6 +372,42 @@ pub fn decodeU16ListExtension(data: []const u8, out: []u16) MessageError![]u16 {
     return out[0..n];
 }
 
+/// Copies out only those entries of a u16-list extension that appear in
+/// `wanted`, preserving the peer's order, and reports how many were kept.
+///
+/// A plain "decode the whole list" needs a buffer sized for the PEER's list,
+/// which makes any fixed buffer a hard interop cliff: wolfSSL offers 18
+/// `signature_algorithms` entries and OpenSSL a similar number, so a
+/// receiver with room for 8 rejects the handshake outright — with a decode
+/// error, as if the peer had sent garbage. Nothing about a long list is
+/// malformed. Sizing the buffer by OUR OWN list instead removes the cliff:
+/// entries we could never select are exactly the ones we do not need to
+/// remember.
+pub fn filterU16ListExtension(data: []const u8, wanted: []const u16, out: []u16) MessageError![]u16 {
+    if (data.len < 2) return error.BufferTooShort;
+    const body_len: usize = std.mem.readInt(u16, data[0..2], .big);
+    if (body_len % 2 != 0) return error.Malformed;
+    if (data.len < 2 + body_len) return error.BufferTooShort;
+
+    var n: usize = 0;
+    var i: usize = 2;
+    while (i < 2 + body_len) : (i += 2) {
+        const v = std.mem.readInt(u16, data[i..][0..2], .big);
+        for (wanted) |w| {
+            if (w != v) continue;
+            // `wanted` is the caller's own list, so `out` sized to it always
+            // has room — unless the peer repeated an entry, which is not
+            // worth failing over.
+            if (n < out.len) {
+                out[n] = v;
+                n += 1;
+            }
+            break;
+        }
+    }
+    return out[0..n];
+}
+
 /// `supported_groups` (RFC 8446 §4.2.7) — alias of `encodeU16ListExtension`.
 pub fn encodeSupportedGroups(groups: []const u16, out: []u8) MessageError![]u8 {
     return encodeU16ListExtension(groups, out);
@@ -430,6 +505,18 @@ pub const ClientHello = struct {
     extensions: []const Extension,
 };
 
+/// DTLS's `legacy_cookie<0..2^8-1>`, which sits between `legacy_session_id`
+/// and `cipher_suites` in the ClientHello and has no TLS counterpart (RFC
+/// 9147 §5.3). DTLS 1.3 moved the cookie into a HelloRetryRequest extension
+/// and requires the legacy field to be **present and empty** — a client that
+/// drops the field entirely produces a body a real peer cannot parse, since
+/// the next byte is then read as the first half of `cipher_suites`' length.
+///
+/// This module emitted no cookie field at all until a live wolfSSL 5.9.1 peer
+/// answered our ClientHello with `alert(fatal, decode_error)`. Self-interop
+/// could never have caught it: our own decoder omitted the field to match.
+const legacy_cookie_len_bytes = 1;
+
 pub fn encodeClientHello(ch: ClientHello, out: []u8) MessageError![]u8 {
     if (ch.legacy_session_id.len > 32) return error.Malformed;
     var i: usize = 0;
@@ -444,6 +531,11 @@ pub fn encodeClientHello(ch: ClientHello, out: []u8) MessageError![]u8 {
     i += 1;
     @memcpy(out[i..][0..ch.legacy_session_id.len], ch.legacy_session_id);
     i += ch.legacy_session_id.len;
+
+    // `legacy_cookie<0..2^8-1>` — always empty in DTLS 1.3, never absent.
+    if (out.len < i + legacy_cookie_len_bytes) return error.BufferTooShort;
+    out[i] = 0;
+    i += legacy_cookie_len_bytes;
 
     const cs_len = ch.cipher_suites.len * 2;
     if (cs_len > std.math.maxInt(u16)) return error.ListTooLong;
@@ -497,6 +589,16 @@ pub fn decodeClientHello(buf: []const u8, extensions_out: []Extension) MessageEr
     if (buf.len < i + sid_len + 2) return error.BufferTooShort;
     const legacy_session_id = buf[i..][0..sid_len];
     i += sid_len;
+
+    // `legacy_cookie<0..2^8-1>` (RFC 9147 §5.3). DTLS 1.3 requires it empty,
+    // but a peer is free to send a non-empty one (e.g. a DTLS 1.2 client
+    // retrying with a HelloVerifyRequest cookie); skip whatever is there
+    // rather than assume the length byte is zero.
+    if (buf.len < i + legacy_cookie_len_bytes) return error.BufferTooShort;
+    const cookie_len = buf[i];
+    i += legacy_cookie_len_bytes;
+    if (buf.len < i + cookie_len + 2) return error.BufferTooShort;
+    i += cookie_len;
 
     const cs_len: usize = std.mem.readInt(u16, buf[i..][0..2], .big);
     i += 2;

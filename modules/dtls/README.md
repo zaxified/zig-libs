@@ -9,7 +9,8 @@ certificate handshake). Secure-UDP transport, intended primarily for the
 RFC 7925's constrained-device profile).
 
 **Status: crypto core + handshake flight engine both implemented and
-validated; third-party-peer interop not yet proven.**
+validated, including live interop against a third-party stack (wolfSSL
+5.9.1) in both roles.**
 
 Implemented and validated:
 - **PSK key schedule** (`src/keyschedule.zig`) — early/binder/handshake/
@@ -51,15 +52,33 @@ fragmentation/reassembly, RFC 9147 §7 ACK + retransmission timer + flight
 bookkeeping, and the handshake message bodies incl. the PSK and cert-mode
 extensions.
 
-**Scope caveat (honest):** the flight engine is validated for SELF-interop
-(this module's client against this module's own server), not yet as a
-drop-in for a third-party DTLS 1.3 stack. Two deliberate wire
-simplifications stand in the way: the epoch-0 ServerHello uses the legacy
-`PlaintextHeader` rather than RFC 9147's unified-header form, and the
-ClientHello omits `supported_versions`/`cookie`. Closing these (plus
-cross-`handleFlight` fragment reassembly, currently single-fragment only) is
-the remaining work before a live interop test against e.g. OpenSSL's
-`s_server -dtls1_3 -psk`.
+**Third-party interop (`src/wolfssl_interop.zig`):** a real DTLS 1.3 PSK
+handshake over a loopback UDP socket against **wolfSSL 5.9.1**, in both
+roles — our client against its server and our server against its client,
+each followed by an application-data round trip. The peer is a small C
+program compiled at test time; the tests skip loudly when `cc` or wolfSSL is
+missing (`sudo apt install libwolfssl-dev`).
+
+That test found four defects that self-interop is structurally incapable of
+finding, because both sides of a self-interop suite make the same mistake
+together:
+
+- the ClientHello omitted DTLS's `legacy_cookie` field entirely (RFC 9147
+  §5.3) — the peer answered `alert(decode_error)`;
+- the PSK binder was computed over a transcript two bytes too long: RFC 8446
+  §4.2.11.2 truncates the ClientHello before the binders **list**, and the
+  list's own 2-byte length prefix was being left in;
+- neither Hello carried `supported_versions`, so nothing on the wire ever
+  said DTLS 1.3 (every version field reads 1.2);
+- the server never sent the RFC 9147 §7 ACK for the client's final flight —
+  the one flight the spec explicitly excludes from implicit acknowledgement
+  — so a conforming client waited forever.
+
+Still not implemented, and therefore configured off in the test peer:
+HelloRetryRequest / the stateless-cookie retry round trip (`wolfSSL_disable
+_hrr_cookie`), which a default-configured DTLS 1.3 server does perform. Also
+still single-fragment: a handshake message split across datagrams is
+rejected, not reassembled across `handleFlight` calls.
 
 **Deferred / out of scope:** full RFC 5280 §6 certification-path building
 (multi-hop chains, name constraints, revocation — `.trust_anchor` is a
