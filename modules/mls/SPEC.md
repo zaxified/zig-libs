@@ -1390,13 +1390,59 @@ the choice, and no vector exercises it.
 
 ### Scope, stated precisely
 
-- **No resumption PSKs in an external join.** §12.2's whitelist admits
-  PreSharedKey proposals and §12.4.3.2 even suggests a `reinit` resumption
-  PSK as the way to gate the resync flavor — but a resumption PSK is looked
-  up in `resumption_history`, which a group entered this way starts empty.
-  An external PSK works; a resumption one is `error.PskNotAvailable`.
-  Carrying prior-epoch secrets into a fresh join needs a way to hand them
-  in, which `ExternalJoinParams` does not have.
+- **Resumption PSKs in an external join are CALLER-SUPPLIED.** A group
+  entered this way starts with an empty `resumption_history`, so there is
+  nothing to look a resumption `PreSharedKeyID` up in.
+  `ExternalJoinParams.resumption_psks` is how a client hands in prior-epoch
+  secrets it kept out of band — the resync case. The library checks that
+  every entry is `KDF.Nh` wide and that a `PreSharedKeyID` resolves only
+  against an entry naming the same `usage`, `psk_group_id` and `psk_epoch`;
+  it cannot check that the value is genuinely that group's `resumption_psk`
+  for that epoch, and says so in `ResumptionPsk`'s doc comment. A wrong one
+  costs a failed join and nothing more: every member resolves the same id
+  from its own history and rejects the Commit at the `confirmation_tag`.
+  The group's own history is consulted FIRST, so a caller-supplied entry can
+  never shadow a secret this group derived itself.
+- **§12.4.3.2's advice for gating the resync flavor contradicts §12.1.4, and
+  §12.1.4 wins.** §12.4.3.2's closing paragraph tells applications they may
+  allow a resync Commit "only if [it] contain[s] a 'reinit' PSK proposal
+  that demonstrates the joining member's presence in a prior epoch of the
+  group". §12.1.4 makes a PreSharedKey proposal invalid when it names usage
+  `reinit` outside §11.2's reinitialization, and §11.2 restates it as a flat
+  MUST ("A PreSharedKey proposal with type resumption and usage reinit MUST
+  be considered invalid"); §11.3 says the same for `branch`. An external
+  Commit is not a reinitialization, so the proposal §12.4.3.2 describes is
+  one every conforming receiver must reject. §12.4.3.2's paragraph is
+  non-normative application advice ("can choose to") and §12.1.4's is a
+  MUST, so `validatePskProposal` enforces the MUST — unconditionally, since
+  neither §11.2 nor §11.3 is built here — and returns
+  `error.ResumptionPskUsageNotAllowed`. The same gate is reachable with
+  usage `application`, which demonstrates presence in a prior epoch exactly
+  as well: only a client that held that epoch's `resumption_psk` can produce
+  a Commit the members accept. This is the shape the tests exercise.
+- **§12.1.4's other two conditions are enforced too**, by both §12.2
+  procedures, because §12.1.4 states them about the proposal rather than
+  about the list: the `psk_nonce` must be `KDF.Nh` wide
+  (`error.PskNonceLength`), and unassigned `ResumptionPSKUsage` codepoints
+  are NOT rejected — §12.1.4 names exactly two forbidden usages and this
+  follows it literally rather than inventing a rule for values a future
+  document may define.
+- **A resumption `PreSharedKeyID` is matched on `psk_group_id` AND
+  `psk_epoch`, not the epoch alone.** This was a live defect until
+  2026-07-29: `resolvePsksFromIds` matched a resumption id against the
+  group's `resumption_history` by epoch number only, so an id naming ANY
+  `psk_group_id` resolved to this group's own secret for that epoch. It is
+  the kind of bug no round trip can find — sender and receiver applied the
+  same wrong rule to the same id, agreed on the `psk_secret`, and the Commit
+  went through. What exposes it is the external-join path, where one side's
+  value is caller-supplied and the other's is not; see the "naming ANOTHER
+  group" test.
+- **No resumption PSKs in a WELCOME.** `fromWelcome` resolves the
+  `GroupSecrets` PSK list with no resumption source at all: the client has
+  lived through no epoch of a group it is only now joining, and the
+  `GroupInfo` naming that group has not been decrypted yet. §11.2/§11.3's
+  reinit and branch flows are the ones that would need it, and neither is
+  built.
 - **The resync flavor is built but only partly exercised.** §12.2's "at
   most one Remove, with which the joiner removes an old version of
   themselves" is enforced, and a Remove in an external Commit is applied by
@@ -1591,8 +1637,11 @@ the choice, and no vector exercises it.
   it missed §12.4.3.2's "MUST NOT include any proposals by reference" and
   its "MUST contain a path field", both of which are receiver-enforced
   rules that live outside §12.2. See "Part 9" for what anchors it and for
-  the two things it deliberately leaves out (resumption PSKs in an external
-  join; the resync case where the RECEIVER is the removed member).
+  what it deliberately leaves out (the resync case where the RECEIVER is the
+  removed member). Resumption PSKs in an external join were left out here
+  and closed on 2026-07-29 via `ExternalJoinParams.resumption_psks`; closing
+  them turned up a §8.4 lookup defect (epoch-only matching) and a genuine
+  contradiction between §12.4.3.2 and §12.1.4 — both under "Part 9" above.
 - **`createCommit` cannot change the committer's leaf CONTENT.** §7.5 allows
   a Commit to carry a new credential, capabilities or extensions for the
   committer's leaf; Part 8 carries the current content over and rotates only

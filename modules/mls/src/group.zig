@@ -136,6 +136,19 @@ pub const Error = error{
     /// material (§12.4.2: "Verify that all PreSharedKey proposals ... are
     /// available").
     PskNotAvailable,
+    /// §12.1.4: "A PreSharedKey proposal is invalid if ... the
+    /// PreSharedKeyID has psktype set to resumption and usage set to
+    /// reinit" (likewise `branch`) outside the one operation that admits
+    /// it — §11.2's reinitialization, §11.3's subgroup branching. Both
+    /// sections restate it as a flat MUST ("A PreSharedKey proposal with
+    /// type resumption and usage reinit MUST be considered invalid"), and
+    /// neither operation is built here, so in this module the rule is
+    /// unconditional. See `joinByExternalCommit` for the one place where
+    /// §12.4.3.2 appears to advise otherwise.
+    ResumptionPskUsageNotAllowed,
+    /// §12.1.4: "A PreSharedKey proposal is invalid if ... the psk_nonce is
+    /// not of length KDF.Nh."
+    PskNonceLength,
     /// The joiner's own `KeyPackage` does not match any leaf of the tree
     /// the `GroupInfo` carries.
     OwnLeafNotFound,
@@ -197,6 +210,54 @@ pub const Error = error{
 pub const ExternalPsk = struct {
     psk_id: []const u8,
     psk: []const u8,
+};
+
+/// One prior-epoch `resumption_psk` the CALLER hands in, for the one
+/// situation where the library cannot look one up for itself: a client
+/// entering a group by §12.4.3.2 external Commit has no epoch history to
+/// look in, because it has not lived through any epoch of that group yet.
+///
+/// **What the library checks.** Only that a `PreSharedKeyID` in the Commit
+/// names exactly this entry — same `usage`, same `psk_group_id`, same
+/// `psk_epoch` (§8.4 identifies a resumption PSK by group and epoch; the
+/// `usage` is required to match too, see below) — and that `secret` is
+/// `KDF.Nh` wide, which a `resumption_psk` is by construction.
+///
+/// **What the library CANNOT check, and what is therefore the caller's
+/// half of the trust.** That `secret` really is the `resumption_psk` the
+/// named group derived at the named epoch. A group entered by external
+/// Commit has no way to recompute it, no signature over it, and no member
+/// to ask. If the caller hands in a value an attacker chose, this module
+/// will mix it into the key schedule exactly as instructed — and the
+/// failure is not silent, but it is late and it is somebody else's: every
+/// real member resolves the same `PreSharedKeyID` from its OWN remembered
+/// history, derives a different `psk_secret`, and rejects the Commit at
+/// §12.4.2's `confirmation_tag` bullet. So a wrong secret costs a failed
+/// join, not a compromised group — but only because the members are
+/// checking, which is the reason this type is not a way to inject key
+/// material into a group that would otherwise refuse it.
+///
+/// The caller's obligation, stated as one sentence: hand in a value this
+/// client itself derived while it was a member of the named group at the
+/// named epoch, from storage it trusts as much as its own signature key.
+pub const ResumptionPsk = struct {
+    /// §8.4's `ResumptionPSKUsage`. Part of the match because here the
+    /// entry is an AUTHORIZATION rather than a lookup: a caller that hands
+    /// in a secret "for usage X" has not thereby authorized usage Y, whose
+    /// `PSKLabel` — and therefore whose contribution to `psk_secret` — is a
+    /// different value. (A group's own `resumption_history` is keyed by
+    /// group and epoch only, and deliberately: there the secret is one this
+    /// group derived, and §8.4 makes the same `resumption_psk` serve every
+    /// usage. The asymmetry is between "what the secret IS" and "what the
+    /// caller said it may be used for".)
+    usage: keyschedule.ResumptionPskUsage,
+    /// The group the epoch belongs to — NOT necessarily the group being
+    /// joined. §11.2/§11.3 point resumption PSKs at a predecessor group;
+    /// a resync points them at the group being rejoined.
+    group_id: []const u8,
+    epoch: u64,
+    /// Exactly `KDF.Nh` bytes.
+    secret: []const u8,
 };
 
 /// RFC 9420 §12.2's rules that the spec defers to "the application". They
@@ -601,7 +662,13 @@ pub fn Group(comptime S: type) type {
 
             // §12.4.3.1: the PSKs named in GroupSecrets, resolved in the
             // order they appear — §8.4's chain is position-dependent.
-            const psks = try resolvePsksFromIds(gpa, group_secrets.psks, params.external_psks, &.{});
+            // No resumption source at all: this client has lived through no
+            // epoch of a group it is only now joining, and the `GroupInfo`
+            // that would name the group has not been decrypted yet. A
+            // resumption `PreSharedKeyID` in the `GroupSecrets` is therefore
+            // `error.PskNotAvailable` here — §11.2/§11.3's reinit and branch
+            // flows are the ones that would need it, and neither is built.
+            const psks = try resolvePsksFromIds(gpa, group_secrets.psks, params.external_psks, .{});
             defer gpa.free(psks);
             const psk_secret = try keyschedule.pskSecret(S, gpa, psks);
 
@@ -869,8 +936,12 @@ pub fn Group(comptime S: type) type {
             self.poisoned = true;
 
             // Bullets 5-6 (§12.3): apply the proposals, in §12.3's order,
-            // and resolve the PSKs they name.
-            var applied = try self.applyProposals(arena, gpa, resolved, params.external_psks);
+            // and resolve the PSKs they name. No caller-supplied resumption
+            // secrets on this path even for an external Commit: a RECEIVER
+            // is a member and has its own history, and letting the receiving
+            // application hand in resumption secrets would let it agree with
+            // a sender's forged PSK instead of catching it.
+            var applied = try self.applyProposals(arena, gpa, resolved, params.external_psks, &.{});
             defer applied.deinit(gpa);
             const new_extensions = applied.extensions;
             const psk_secret = applied.psk_secret;
@@ -1282,6 +1353,12 @@ pub fn Group(comptime S: type) type {
                 /// extensions. Its encryption key is NOT used: §7.5 samples
                 /// a fresh one for every commit-sourced leaf.
                 leaf: tree.LeafNode,
+                /// Prior-epoch `resumption_psk` values the caller supplied.
+                /// It lives on THIS arm and not in `CreateCommitParams`
+                /// because a member committing into its own group has a
+                /// `resumption_history` and needs no such thing — the type
+                /// says where the hole is.
+                resumption_psks: []const ResumptionPsk = &.{},
             },
         };
 
@@ -1339,7 +1416,10 @@ pub fn Group(comptime S: type) type {
             self.poisoned = true;
 
             // ── §12.4.1 bullet 3 (§12.3): apply the proposals.
-            var applied = try self.applyProposals(arena, gpa, resolved, params.external_psks);
+            var applied = try self.applyProposals(arena, gpa, resolved, params.external_psks, switch (mode) {
+                .external => |e| e.resumption_psks,
+                .member => &.{},
+            });
             defer applied.deinit(gpa);
 
             // ── §12.4.1 bullet 4's FIRST sub-bullet: "If this is an external
@@ -1639,6 +1719,18 @@ pub fn Group(comptime S: type) type {
             /// `ratchet_tree` extension.
             ratchet_tree: ?[]const u8 = null,
             external_psks: []const ExternalPsk = &.{},
+            /// Prior-epoch `resumption_psk` values this client obtained OUT
+            /// OF BAND — from its own storage, from before it lost state, or
+            /// from a predecessor group. Nothing else can supply them: a
+            /// group entered this way has no epoch history, which is why a
+            /// resumption `PreSharedKeyID` in `proposals` is
+            /// `error.PskNotAvailable` without this list.
+            ///
+            /// Each entry's `secret` MUST be `KDF.Nh` bytes, checked for the
+            /// whole list up front. Read `ResumptionPsk` before using this:
+            /// the library can check that a `PreSharedKeyID` names an entry,
+            /// and cannot check that the entry is genuine.
+            resumption_psks: []const ResumptionPsk = &.{},
             authenticated_data: []const u8 = &.{},
             include_ratchet_tree: bool = true,
             include_external_pub: bool = false,
@@ -1688,14 +1780,36 @@ pub fn Group(comptime S: type) type {
         /// function signs the joiner's own leaf with the joiner's own key
         /// and stops there.
         ///
-        /// **Resumption PSKs are not resolvable here.** §12.2's whitelist
-        /// admits PreSharedKey proposals, and §12.4.3.2 even suggests a
-        /// `reinit` resumption PSK as the way to gate the resync flavor —
-        /// but a resumption PSK is looked up in `resumption_history`, which
-        /// a group entered this way starts empty. An external PSK works;
-        /// a resumption one is `error.PskNotAvailable`. Carrying prior-epoch
-        /// secrets into a fresh join means a way to hand them in, which this
-        /// does not have; noted in `SPEC.md` rather than half-built.
+        /// **Resumption PSKs come in through `resumption_psks`, and the
+        /// trust in them is the caller's.** A group entered this way starts
+        /// with an empty `resumption_history`, so there is nothing to look a
+        /// resumption `PreSharedKeyID` up in; `ExternalJoinParams
+        /// .resumption_psks` is how the caller hands in prior-epoch secrets
+        /// it obtained out of band — the resync case, where this client was
+        /// in this group before and kept the secret. What is checked here:
+        /// that every entry is `KDF.Nh` wide, and that a `PreSharedKeyID`
+        /// resolves only against an entry naming the same `usage`,
+        /// `psk_group_id` and `psk_epoch`. What is NOT and cannot be
+        /// checked: that the value is really that group's `resumption_psk`
+        /// for that epoch. A wrong one is caught by the members, not here —
+        /// they resolve the same id from their own history and reject the
+        /// Commit at the `confirmation_tag`. See `ResumptionPsk`.
+        ///
+        /// **§12.4.3.2's own suggestion for gating the resync flavor cannot
+        /// be followed literally.** Its closing paragraph offers, as
+        /// application advice, allowing a resync Commit "only if [it]
+        /// contain[s] a 'reinit' PSK proposal that demonstrates the joining
+        /// member's presence in a prior epoch of the group". But §12.1.4
+        /// makes a PreSharedKey proposal invalid when it names usage
+        /// `reinit` outside §11.2's reinitialization, and §11.2 restates
+        /// that as a flat MUST — and an external Commit is not a
+        /// reinitialization. A conforming receiver must therefore reject
+        /// exactly the proposal that advice describes, and this module does
+        /// (`error.ResumptionPskUsageNotAllowed`, see `validatePskProposal`).
+        /// The gate is still available with usage `application`, which
+        /// demonstrates presence in a prior epoch identically: only the
+        /// client that held that epoch's `resumption_psk` can produce a
+        /// Commit the members accept.
         pub fn joinByExternalCommit(
             gpa: std.mem.Allocator,
             allocator: std.mem.Allocator,
@@ -1706,6 +1820,16 @@ pub fn Group(comptime S: type) type {
             arena_ptr.* = .init(gpa);
             errdefer arena_ptr.deinit();
             const arena = arena_ptr.allocator();
+
+            // §8.4: a resumption PSK IS the named epoch's `resumption_psk`,
+            // which is `KDF.Nh` wide by construction. Checked over the WHOLE
+            // list here rather than at the point of use, so that a
+            // mis-sized entry is reported even when this Commit happens not
+            // to name it — a caller whose storage layer is handing back the
+            // wrong thing should learn it on the first join, not the tenth.
+            for (params.resumption_psks) |p| {
+                if (p.secret.len != S.Nh) return error.WrongSecretLength;
+            }
 
             // ── our own KeyPackage, for the identity half of the leaf we
             // are about to occupy. Verified like `create` verifies the
@@ -1835,6 +1959,7 @@ pub fn Group(comptime S: type) type {
             }, .{ .external = .{
                 .init_secret = ext_init.init_secret,
                 .leaf = my_kp.leaf_node,
+                .resumption_psks = params.resumption_psks,
             } });
 
             return .{ .group = self, .messages = messages };
@@ -2094,6 +2219,11 @@ pub fn Group(comptime S: type) type {
             gpa: std.mem.Allocator,
             resolved: []const Resolved,
             external_psks: []const ExternalPsk,
+            /// Non-empty only on the §12.4.3.2 external-join path — see
+            /// `ResumptionPsk`. A member processing or creating a regular
+            /// Commit resolves resumption PSKs from its own history and
+            /// nothing else.
+            resumption_psks: []const ResumptionPsk,
         ) !Applied {
             var new_extensions = self.extensions;
             for (resolved) |rp| {
@@ -2172,7 +2302,7 @@ pub fn Group(comptime S: type) type {
             }
             const psk_ids = try ids.toOwnedSlice(gpa);
             errdefer gpa.free(psk_ids);
-            const psks = try self.resolvePsks(gpa, psk_ids, external_psks);
+            const psks = try self.resolvePsks(gpa, psk_ids, external_psks, resumption_psks);
             defer gpa.free(psks);
             const psk_secret = try keyschedule.pskSecret(S, gpa, psks);
 
@@ -2258,6 +2388,8 @@ pub fn Group(comptime S: type) type {
                     try removed.append(gpa, idx);
                 },
                 .psk => |id| {
+                    // §12.1.4's own three conditions, before §12.2's.
+                    try validatePskProposal(id);
                     // "multiple PreSharedKey proposals that reference the
                     // same PreSharedKeyID" — compared by ENCODED bytes so a
                     // future arm cannot be silently skipped.
@@ -2359,13 +2491,56 @@ pub fn Group(comptime S: type) type {
                 switch (rp.proposal) {
                     .external_init => n_external_init += 1,
                     .remove => n_remove += 1,
-                    .psk => {},
+                    // §12.2's whitelist says only "Zero or more PreSharedKey
+                    // proposals"; §12.1.4's per-proposal conditions are
+                    // stated about the proposal itself and so apply to both
+                    // procedures.
+                    .psk => |id| try validatePskProposal(id),
                     else => return error.ProposalNotAllowedInExternalCommit,
                 }
             }
             if (n_external_init == 0) return error.MissingExternalInit;
             if (n_external_init > 1) return error.MultipleExternalInit;
             if (n_remove > 1) return error.MultipleRemoveInExternalCommit;
+        }
+
+        /// RFC 9420 §12.1.4's three conditions that make a `PreSharedKey`
+        /// PROPOSAL invalid, applied by both §12.2 procedures because
+        /// §12.1.4 states them about the proposal and not about the list.
+        ///
+        /// **The `reinit`/`branch` rule is unconditional here, and the RFC
+        /// is not self-consistent about it.** §12.1.4 makes the two usages
+        /// invalid only outside §11.2's reinitialization and §11.3's
+        /// branching; §11.2 and §11.3 each restate it flat ("A PreSharedKey
+        /// proposal with type resumption and usage reinit MUST be considered
+        /// invalid"). Neither operation is built in this module, so the
+        /// conditional and the flat reading coincide and this is the flat
+        /// one. Against that, §12.4.3.2's closing paragraph advises
+        /// applications that they may "allow such resync commits only if
+        /// they contain a 'reinit' PSK proposal that demonstrates the
+        /// joining member's presence in a prior epoch of the group" — which
+        /// is precisely the proposal §12.1.4 forbids, since an external
+        /// Commit is not a reinitialization. That advice is non-normative
+        /// ("can choose to") and §12.1.4's rule is a MUST, so the MUST wins;
+        /// the implementable form of the same gate is a resumption PSK with
+        /// usage `application`, which demonstrates presence in a prior epoch
+        /// exactly as well. Noted in `SPEC.md`.
+        fn validatePskProposal(id: keyschedule.PreSharedKeyId) !void {
+            // "The psk_nonce is not of length KDF.Nh." §8.4's reason: the
+            // nonce is what stops a re-used PSK from producing a re-used
+            // `psk_input`, and a short one is a caller that skipped it.
+            if (id.psk_nonce.len != S.Nh) return error.PskNonceLength;
+            switch (id.id) {
+                .external => {},
+                .resumption => |r| switch (r.usage) {
+                    .reinit, .branch => return error.ResumptionPskUsageNotAllowed,
+                    // `application`, and the open enum's unassigned values:
+                    // §12.1.4 names exactly two usages and this follows it
+                    // literally rather than inventing a rule for codepoints
+                    // a future document may define.
+                    else => {},
+                },
+            }
         }
 
         fn appendUnique(gpa: std.mem.Allocator, list: *std.ArrayList(u32), v: u32) !void {
@@ -2375,20 +2550,53 @@ pub fn Group(comptime S: type) type {
 
         // ── PSK resolution ────────────────────────────────────────────────
 
+        /// Where a §8.4 RESUMPTION PSK may be found. Split out because the
+        /// three call sites have three genuinely different answers, and
+        /// because two of the three fields are security-relevant enough
+        /// that passing them positionally invites getting them the wrong
+        /// way round.
+        const ResumptionSource = struct {
+            /// The group `history` belongs to. Load-bearing: a
+            /// `PreSharedKeyID` names a resumption PSK by `psk_group_id`
+            /// AND `psk_epoch`, so matching on the epoch alone would
+            /// resolve an id naming SOMEBODY ELSE'S group to this group's
+            /// own secret for that epoch number — and because both the
+            /// sender and every receiver would apply the same wrong rule to
+            /// the same id, they would agree, the Commit would be accepted,
+            /// and nothing would look wrong from inside.
+            group_id: []const u8 = &.{},
+            /// Epochs this group actually lived through.
+            history: []const ResumptionEntry = &.{},
+            /// Prior-epoch secrets the CALLER supplied — see `ResumptionPsk`
+            /// for which half of the trust that is.
+            supplied: []const ResumptionPsk = &.{},
+        };
+
         fn resolvePsks(
             self: *const Self,
             gpa: std.mem.Allocator,
             ids: []const keyschedule.PreSharedKeyId,
             external: []const ExternalPsk,
+            supplied: []const ResumptionPsk,
         ) ![]keyschedule.PreSharedKey(S) {
-            return resolvePsksFromIds(gpa, ids, external, self.resumption_history.items);
+            return resolvePsksFromIds(gpa, ids, external, .{
+                .group_id = self.group_id,
+                .history = self.resumption_history.items,
+                .supplied = supplied,
+            });
         }
 
+        /// §8.4/§12.4.2: turn the `PreSharedKeyID` list into the key
+        /// material `pskSecret` chains, POSITIONALLY — `out[i]` is the
+        /// resolution of `ids[i]` and of nothing else, because §8.4's
+        /// `PSKLabel` binds each PSK to its index and a resolver that
+        /// grouped or reordered would produce a `psk_secret` that is wrong
+        /// in a way no round trip can see (both sides would reorder alike).
         fn resolvePsksFromIds(
             gpa: std.mem.Allocator,
             ids: []const keyschedule.PreSharedKeyId,
             external: []const ExternalPsk,
-            history: []const ResumptionEntry,
+            resumption: ResumptionSource,
         ) ![]keyschedule.PreSharedKey(S) {
             const out = try gpa.alloc(keyschedule.PreSharedKey(S), ids.len);
             errdefer gpa.free(out);
@@ -2396,15 +2604,33 @@ pub fn Group(comptime S: type) type {
                 // Borrowed, not copied: §8.4 puts no width constraint on a
                 // PSK (it is `KDF.Extract` IKM), so there is no fixed-size
                 // buffer to copy into. The slices point into the caller's
-                // `external` list or into `history`, both of which outlive
-                // the `pskSecret` call these feed.
+                // `external` list, into `history` or into `supplied`, all of
+                // which outlive the `pskSecret` call these feed.
                 const secret: []const u8 = switch (id.id) {
                     .external => |psk_id| for (external) |e| {
                         if (std.mem.eql(u8, e.psk_id, psk_id)) break e.psk;
                     } else return error.PskNotAvailable,
-                    .resumption => |r| for (history, 0..) |h, i| {
-                        if (h.epoch == r.psk_epoch) break history[i].secret[0..];
-                    } else return error.PskNotAvailable,
+                    .resumption => |r| blk: {
+                        // (a) an epoch this group lived through. Consulted
+                        // FIRST so that a caller-supplied entry can never
+                        // shadow a secret the group derived itself.
+                        if (std.mem.eql(u8, r.psk_group_id, resumption.group_id)) {
+                            for (resumption.history) |*h| {
+                                if (h.epoch == r.psk_epoch) break :blk h.secret[0..];
+                            }
+                        }
+                        // (b) what the caller handed in, matched on the
+                        // WHOLE triple — see `ResumptionPsk.usage`.
+                        for (resumption.supplied) |s| {
+                            if (s.usage == r.usage and
+                                s.epoch == r.psk_epoch and
+                                std.mem.eql(u8, s.group_id, r.psk_group_id))
+                            {
+                                break :blk s.secret;
+                            }
+                        }
+                        return error.PskNotAvailable;
+                    },
                 };
                 slot.* = .{ .id = id, .secret = secret };
             }
@@ -4235,4 +4461,545 @@ test "§12.4.3.2: joinByExternalCommit refuses what a receiver would, and refuse
     defer joined.messages.deinit(gpa);
     try a.processCommit(.{ .commit_msg = joined.messages.commit });
     try expectSameEpoch(&a, &joined.group);
+}
+
+// ── §8.4 resumption PSKs on the §12.4.3.2 external-join path ──────────────
+//
+// What these tests can and cannot anchor, stated before the first one so it
+// is not implied by omission:
+//
+//   * §8.4's `psk_secret` ladder — the `PSKLabel`, the "derived psk" label,
+//     the index/count binding and therefore its ORDER sensitivity — is
+//     pinned byte-exact by `psk_secret.json` for chains of 1 to 10 PSKs, in
+//     `kat_keyschedule_test.zig`. That is an EXTERNAL anchor and nothing
+//     here re-proves it.
+//   * every `PreSharedKeyID` in every vector this repo carries
+//     (`psk_secret.json`, `messages.json`, `passive-client-*.json`) has
+//     `psktype = external(1)`. The RESUMPTION arm — its lookup rules, its
+//     `usage`/`psk_group_id`/`psk_epoch` semantics — has NO external vector
+//     anywhere. What replaces one below is not a round trip: the joiner
+//     resolves the PSK from a value handed to it by its caller while every
+//     member resolves the SAME `PreSharedKeyID` from its own remembered
+//     `resumption_history`, by different code on a different path, and the
+//     two must agree or the `confirmation_tag` fails. A rule applied wrongly
+//     but consistently on both sides is exactly what that catches.
+
+/// The `resumption_psk` a group holds for one epoch it lived through — what
+/// a client would have kept in storage before losing the rest of its state.
+fn rememberedResumptionPsk(g: *const Group(TestSuite), epoch: u64) ![TestSuite.Nh]u8 {
+    for (g.resumption_history.items) |h| {
+        if (h.epoch == epoch) return h.secret;
+    }
+    return error.TestExpectedEqual;
+}
+
+fn resumptionId(
+    usage: keyschedule.ResumptionPskUsage,
+    group_id: []const u8,
+    epoch: u64,
+    nonce: []const u8,
+) keyschedule.PreSharedKeyId {
+    return .{
+        .id = .{ .resumption = .{ .usage = usage, .psk_group_id = group_id, .psk_epoch = epoch } },
+        .psk_nonce = nonce,
+    };
+}
+
+test "§12.4.3.2/§8.4: a resyncing joiner resolves a resumption PSK the CALLER supplied, and every member resolves the same id from its own history" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const alice = try TestClient.init(aa, "alice", 81);
+    const bob = try TestClient.init(aa, "bob", 82);
+
+    var a = try Group(TestSuite).create(gpa, .{
+        .io = io,
+        .group_id = "resync-group",
+        .key_package_msg = alice.kp_msg,
+        .encryption_priv = alice.enc_priv,
+    });
+    defer a.deinit();
+
+    var b = blk: {
+        const c = try a.createCommit(gpa, .{
+            .io = io,
+            .signature_key_pair = alice.sig,
+            .proposals = &.{.{ .by_value = .{ .add = bob.kp } }},
+        });
+        defer c.deinit(gpa);
+        break :blk try bob.join(gpa, c.welcome.?, &.{});
+    };
+    defer b.deinit();
+    try expectSameEpoch(&a, &b);
+    try testing.expectEqual(@as(u64, 1), b.epoch);
+    try testing.expectEqual(@as(u32, 1), b.my_leaf_index);
+
+    // The premise, made explicit rather than assumed: alice and bob derived
+    // the SAME `resumption_psk` for epoch 1, because §8's chain is the
+    // group's, not the member's. Bob keeps his copy; that is the only thing
+    // he will still have after losing his state.
+    const kept = try rememberedResumptionPsk(&b, 1);
+    try testing.expectEqualSlices(u8, &(try rememberedResumptionPsk(&a, 1)), &kept);
+
+    // Alice publishes a GroupInfo for epoch 2 — what a Delivery Service
+    // caches, and all a resyncing client has to work from.
+    const published_gi = blk: {
+        const c = try a.createCommit(gpa, .{
+            .io = io,
+            .signature_key_pair = alice.sig,
+            .include_external_pub = true,
+        });
+        defer c.deinit(gpa);
+        try b.processCommit(.{ .commit_msg = c.commit });
+        break :blk try gpa.dupe(u8, c.group_info);
+    };
+    defer gpa.free(published_gi);
+    try expectSameEpoch(&a, &b);
+
+    // §12.4.3.2's "resync" flavor: bob commits himself back in and removes
+    // his own prior appearance, gating it on a resumption PSK that only a
+    // client present at epoch 1 could hold. Usage `application`, NOT
+    // `reinit` — see `validatePskProposal` for why the RFC's own wording
+    // here cannot be followed literally.
+    const nonce = [_]u8{0x77} ** TestSuite.Nh;
+    const proposals = [_]content.Proposal{
+        .{ .psk = resumptionId(.application, "resync-group", 1, &nonce) },
+        .{ .remove = 1 },
+    };
+
+    // Before the feature this test exists for: the same call with nothing
+    // handed in cannot resolve the id, because a group entered by external
+    // Commit has an EMPTY `resumption_history`.
+    try testing.expectError(error.PskNotAvailable, Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+        .io = io,
+        .group_info_msg = published_gi,
+        .key_package_msg = bob.kp_msg,
+        .signature_key_pair = bob.sig,
+        .proposals = &proposals,
+    }));
+
+    var joined = try Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+        .io = io,
+        .group_info_msg = published_gi,
+        .key_package_msg = bob.kp_msg,
+        .signature_key_pair = bob.sig,
+        .proposals = &proposals,
+        .resumption_psks = &.{.{
+            .usage = .application,
+            .group_id = "resync-group",
+            .epoch = 1,
+            .secret = &kept,
+        }},
+    });
+    var b2 = joined.group;
+    defer b2.deinit();
+    defer joined.messages.deinit(gpa);
+
+    // THE anchor. Alice never saw `kept`; she resolves the same
+    // `PreSharedKeyID` out of her own `resumption_history` by a different
+    // branch of `resolvePsksFromIds`, chains it through §8.4 at the same
+    // position, and lands on the same `epoch_authenticator`. A `psk_secret`
+    // that differed by one bit would fail her `confirmation_tag` instead.
+    try a.processCommit(.{ .commit_msg = joined.messages.commit });
+    try expectSameEpoch(&a, &b2);
+
+    // …and it was really the PSK doing work, not a no-op: the same Commit
+    // shape with NO PreSharedKey proposal lands on a different epoch secret.
+    // (Different transcript too, hence the narrower assertion — what is
+    // being ruled out is a `psk_secret` that stayed all-zero.)
+    try testing.expectEqual(@as(u32, 1), b2.my_leaf_index);
+    try testing.expectEqual(@as(usize, 2), a.treeSize());
+    try testing.expect(!std.mem.eql(u8, &a.epochAuthenticator(), &[_]u8{0} ** TestSuite.Nh));
+
+    // The group still works: the resynced member commits, the founder
+    // follows. A join that produced state which cannot take another Commit
+    // would satisfy everything above.
+    {
+        const c = try b2.createCommit(gpa, .{ .io = io, .signature_key_pair = bob.sig });
+        defer c.deinit(gpa);
+        try a.processCommit(.{ .commit_msg = c.commit });
+        try expectSameEpoch(&a, &b2);
+    }
+}
+
+test "§8.4: a resumption PreSharedKeyID naming ANOTHER group does not resolve to this group's epoch" {
+    // The mutation this exists for is the one that hides: drop `psk_group_id`
+    // from the lookup and match on `psk_epoch` alone. Both the sender and
+    // every receiver then apply the same wrong rule to the same id, derive
+    // the same `psk_secret` from the same bytes, and the Commit is
+    // ACCEPTED — every round-trip assertion in this file stays green while
+    // an attacker-chosen `psk_group_id` silently resolves to our own secret.
+    // What breaks the symmetry is that the joiner's authorization is
+    // caller-supplied and the members' is not.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const alice = try TestClient.init(aa, "alice", 83);
+    const dave = try TestClient.init(aa, "dave", 84);
+
+    var a = try Group(TestSuite).create(gpa, .{
+        .io = io,
+        .group_id = "our-group",
+        .key_package_msg = alice.kp_msg,
+        .encryption_priv = alice.enc_priv,
+    });
+    defer a.deinit();
+    const published_gi = blk: {
+        const c = try a.createCommit(gpa, .{
+            .io = io,
+            .signature_key_pair = alice.sig,
+            .include_external_pub = true,
+        });
+        defer c.deinit(gpa);
+        break :blk try gpa.dupe(u8, c.group_info);
+    };
+    defer gpa.free(published_gi);
+    try testing.expectEqual(@as(u64, 1), a.epoch);
+
+    // Alice's epoch-1 secret — the value an epoch-only lookup would hand
+    // back for ANY `psk_group_id`. The joiner supplies exactly it, so the
+    // two sides cannot be told apart by the bytes.
+    const alice_epoch1 = try rememberedResumptionPsk(&a, 1);
+    const nonce = [_]u8{0x11} ** TestSuite.Nh;
+
+    var joined = try Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+        .io = io,
+        .group_info_msg = published_gi,
+        .key_package_msg = dave.kp_msg,
+        .signature_key_pair = dave.sig,
+        .proposals = &.{.{ .psk = resumptionId(.application, "some-other-group", 1, &nonce) }},
+        .resumption_psks = &.{.{
+            .usage = .application,
+            .group_id = "some-other-group",
+            .epoch = 1,
+            .secret = &alice_epoch1,
+        }},
+    });
+    defer joined.group.deinit();
+    defer joined.messages.deinit(gpa);
+
+    // The joiner accepts it: its caller authorized that exact triple, and
+    // this module does not pretend to know whether "some-other-group" epoch
+    // 1 is real.
+    try testing.expectEqual(@as(u64, 2), joined.group.epoch);
+
+    // Alice must NOT. Her history is her own group's; nothing in it answers
+    // to `psk_group_id = "some-other-group"`, however well the epoch number
+    // lines up.
+    try testing.expectError(error.PskNotAvailable, a.processCommit(.{
+        .commit_msg = joined.messages.commit,
+    }));
+    try testing.expectEqual(@as(u64, 1), a.epoch);
+    // PSK resolution happens inside §12.3's application step, i.e. after the
+    // tree may already have been touched — so the refusal poisons rather
+    // than rewinds. That is this module's documented atomicity, pinned here
+    // because it is what stops the next assertion from being written against
+    // a group that quietly carried on. The receiver-side epoch component of
+    // the same lookup is pinned directly in the positional-resolution test
+    // below, where it needs no second group to observe.
+    try testing.expect(a.poisoned);
+}
+
+test "§8.4: a caller-supplied resumption PSK matches on the WHOLE PreSharedKeyID triple, usage included" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const alice = try TestClient.init(aa, "alice", 85);
+    const bob = try TestClient.init(aa, "bob", 86);
+
+    var a = try Group(TestSuite).create(gpa, .{
+        .io = io,
+        .group_id = "triple",
+        .key_package_msg = alice.kp_msg,
+        .encryption_priv = alice.enc_priv,
+    });
+    defer a.deinit();
+    const published_gi = blk: {
+        const c = try a.createCommit(gpa, .{
+            .io = io,
+            .signature_key_pair = alice.sig,
+            .include_external_pub = true,
+        });
+        defer c.deinit(gpa);
+        break :blk try gpa.dupe(u8, c.group_info);
+    };
+    defer gpa.free(published_gi);
+
+    const real = try rememberedResumptionPsk(&a, 1);
+    const garbage = [_]u8{0xee} ** TestSuite.Nh;
+    const nonce = [_]u8{0x22} ** TestSuite.Nh;
+
+    // Two entries for the SAME group and epoch, differing only in `usage`
+    // and carrying different secrets — the wrong one first. §8.4 puts the
+    // whole `PreSharedKeyID` (usage and all) into the `PSKLabel`, so picking
+    // the wrong entry is not "the same either way": it yields a different
+    // `psk_secret` and alice, who resolves the id from her own history,
+    // rejects the Commit. A matcher that ignored `usage` takes the first.
+    const supplied = [_]ResumptionPsk{
+        .{ .usage = @enumFromInt(7), .group_id = "triple", .epoch = 1, .secret = &garbage },
+        .{ .usage = .application, .group_id = "triple", .epoch = 1, .secret = &real },
+    };
+
+    var joined = try Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+        .io = io,
+        .group_info_msg = published_gi,
+        .key_package_msg = bob.kp_msg,
+        .signature_key_pair = bob.sig,
+        .proposals = &.{.{ .psk = resumptionId(.application, "triple", 1, &nonce) }},
+        .resumption_psks = &supplied,
+    });
+    defer joined.group.deinit();
+    defer joined.messages.deinit(gpa);
+    try a.processCommit(.{ .commit_msg = joined.messages.commit });
+    try expectSameEpoch(&a, &joined.group);
+
+    // The epoch component of the triple, on its own: an entry for epoch 1
+    // does not answer an id naming epoch 0.
+    try testing.expectError(error.PskNotAvailable, Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+        .io = io,
+        .group_info_msg = published_gi,
+        .key_package_msg = bob.kp_msg,
+        .signature_key_pair = bob.sig,
+        .proposals = &.{.{ .psk = resumptionId(.application, "triple", 0, &nonce) }},
+        .resumption_psks = &.{.{
+            .usage = .application,
+            .group_id = "triple",
+            .epoch = 1,
+            .secret = &real,
+        }},
+    }));
+
+    // §8.4: a resumption PSK IS a `resumption_psk`, so it is `KDF.Nh` wide.
+    // Rejected over the whole list, whether or not this Commit names it.
+    try testing.expectError(error.WrongSecretLength, Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+        .io = io,
+        .group_info_msg = published_gi,
+        .key_package_msg = bob.kp_msg,
+        .signature_key_pair = bob.sig,
+        .resumption_psks = &.{.{
+            .usage = .application,
+            .group_id = "triple",
+            .epoch = 1,
+            .secret = real[0 .. TestSuite.Nh - 1],
+        }},
+    }));
+}
+
+test "§12.1.4: a PreSharedKey proposal with usage reinit or branch is invalid, and so is a short psk_nonce" {
+    // §12.1.4's own three conditions. The reinit/branch pair is the one
+    // §12.4.3.2's closing paragraph appears to recommend for gating a
+    // resync; §12.1.4 and §11.2/§11.3 are normative and say otherwise, so
+    // both the sender and the receiver refuse it here. Pinned because a
+    // silent acceptance is invisible: the Commit would go through and only
+    // a stricter peer would ever complain.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const alice = try TestClient.init(aa, "alice", 87);
+    const dave = try TestClient.init(aa, "dave", 88);
+
+    var a = try Group(TestSuite).create(gpa, .{
+        .io = io,
+        .group_id = "usage-rules",
+        .key_package_msg = alice.kp_msg,
+        .encryption_priv = alice.enc_priv,
+    });
+    defer a.deinit();
+    const published_gi = blk: {
+        const c = try a.createCommit(gpa, .{
+            .io = io,
+            .signature_key_pair = alice.sig,
+            .include_external_pub = true,
+        });
+        defer c.deinit(gpa);
+        break :blk try gpa.dupe(u8, c.group_info);
+    };
+    defer gpa.free(published_gi);
+
+    const secret = try rememberedResumptionPsk(&a, 1);
+    const nonce = [_]u8{0x33} ** TestSuite.Nh;
+    const short_nonce = [_]u8{0x33} ** (TestSuite.Nh - 1);
+
+    // ── the SENDER's half: §12.2 opens with "A group member creating a
+    // Commit AND a group member processing a Commit MUST verify", so a
+    // caller asking for one of these is told so rather than handed bytes
+    // nobody will accept.
+    const bad = [_]struct { want: anyerror, usage: keyschedule.ResumptionPskUsage, id: keyschedule.PreSharedKeyId }{
+        .{ .want = error.ResumptionPskUsageNotAllowed, .usage = .reinit, .id = resumptionId(.reinit, "usage-rules", 1, &nonce) },
+        .{ .want = error.ResumptionPskUsageNotAllowed, .usage = .branch, .id = resumptionId(.branch, "usage-rules", 1, &nonce) },
+        .{ .want = error.PskNonceLength, .usage = .application, .id = .{ .id = .{ .external = "x" }, .psk_nonce = &short_nonce } },
+        .{ .want = error.PskNonceLength, .usage = .application, .id = resumptionId(.application, "usage-rules", 1, short_nonce[0..]) },
+    };
+    for (bad, 0..) |c, i| {
+        errdefer std.debug.print("case {d}\n", .{i});
+        // Every case is supplied the key material it names, so the refusal
+        // can only be §12.1.4's rule and never `error.PskNotAvailable`.
+        const supplied = [_]ResumptionPsk{.{
+            .usage = c.usage,
+            .group_id = "usage-rules",
+            .epoch = 1,
+            .secret = &secret,
+        }};
+        // The external-join path, through §12.2's whitelist.
+        try testing.expectError(c.want, Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+            .io = io,
+            .group_info_msg = published_gi,
+            .key_package_msg = dave.kp_msg,
+            .signature_key_pair = dave.sig,
+            .proposals = &.{.{ .psk = c.id }},
+            .external_psks = &.{.{ .psk_id = "x", .psk = "k" }},
+            .resumption_psks = &supplied,
+        }));
+        // …and a REGULAR Commit, through §12.2's other procedure. §12.1.4 is
+        // stated about the proposal, so both procedures owe it.
+        try testing.expectError(c.want, a.createCommit(gpa, .{
+            .io = io,
+            .signature_key_pair = alice.sig,
+            .proposals = &.{.{ .by_value = .{ .psk = c.id } }},
+            .external_psks = &.{.{ .psk_id = "x", .psk = "k" }},
+        }));
+    }
+
+    // ── the RECEIVER's half, for the reinit case: a peer that followed
+    // §12.4.3.2's advice literally produces a Commit alice must refuse. The
+    // list is otherwise legal — one ExternalInit, one PreSharedKey — so
+    // nothing in the whitelist can be what rejects it.
+    var joined = try Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+        .io = io,
+        .group_info_msg = published_gi,
+        .key_package_msg = dave.kp_msg,
+        .signature_key_pair = dave.sig,
+    });
+    joined.group.deinit();
+    defer joined.messages.deinit(gpa);
+
+    const old_gc = try a.groupContextAlloc(gpa);
+    defer gpa.free(old_gc);
+    const ext_init: content.ProposalOrRef = blk: {
+        var r = codec.Reader.init(joined.messages.commit);
+        const msg = try framing.MLSMessage.decode(aa, &r);
+        break :blk msg.public_message.content.body.commit.proposals[0];
+    };
+    const forged = try resignExternalCommit(gpa, aa, joined.messages.commit, dave.sig, old_gc, &.{
+        ext_init,
+        .{ .proposal = .{ .psk = resumptionId(.reinit, "usage-rules", 1, &nonce) } },
+    });
+    defer gpa.free(forged);
+    try testing.expectError(error.ResumptionPskUsageNotAllowed, a.processCommit(.{ .commit_msg = forged }));
+    // Refused before anything was mutated.
+    try testing.expect(!a.poisoned);
+    try testing.expectEqual(@as(u64, 1), a.epoch);
+}
+
+test "§8.4: PSKs resolve POSITIONALLY — out[i] is the resolution of ids[i] and of nothing else" {
+    // §8.4's `PSKLabel` binds each PSK to its index, so a resolver that
+    // grouped by `psktype` or reversed would produce a wrong `psk_secret` —
+    // and would produce the SAME wrong one on every side, so no round trip
+    // could see it. This asserts the mapping directly instead.
+    //
+    // For EXTERNAL PSKs that guarantee turns out to be externally anchored
+    // already, which was worth finding out rather than assuming: filling
+    // `out` back-to-front while leaving `ids` alone also fails
+    // `passive-client-handling-commit.json`, so at least one recorded
+    // session commits two or more PSKs at once and the vector notices the
+    // permutation. What this test adds is the same guarantee for a MIXED
+    // list that includes the RESUMPTION arm — which no vector this repo
+    // carries exercises at all — and the two negative lookups below, which
+    // are a member's own history rules and have no vector either.
+    const gpa = testing.allocator;
+    const G = Group(TestSuite);
+
+    const nonce = [_]u8{0x44} ** TestSuite.Nh;
+    const from_history = [_]u8{0xa1} ** TestSuite.Nh;
+    const from_caller = [_]u8{0xa2} ** TestSuite.Nh;
+
+    const ids = [_]keyschedule.PreSharedKeyId{
+        .{ .id = .{ .external = "first" }, .psk_nonce = &nonce },
+        resumptionId(.application, "mine", 4, &nonce),
+        .{ .id = .{ .external = "second" }, .psk_nonce = &nonce },
+        resumptionId(.application, "elsewhere", 9, &nonce),
+    };
+    const external = [_]ExternalPsk{
+        .{ .psk_id = "second", .psk = "SECOND" },
+        .{ .psk_id = "first", .psk = "FIRST" },
+    };
+    const history = [_]G.ResumptionEntry{
+        .{ .epoch = 3, .secret = @splat(0xff) },
+        .{ .epoch = 4, .secret = from_history },
+    };
+    const supplied = [_]ResumptionPsk{
+        .{ .usage = .application, .group_id = "elsewhere", .epoch = 9, .secret = &from_caller },
+    };
+
+    const out = try G.resolvePsksFromIds(gpa, &ids, &external, .{
+        .group_id = "mine",
+        .history = &history,
+        .supplied = &supplied,
+    });
+    defer gpa.free(out);
+
+    try testing.expectEqual(@as(usize, 4), out.len);
+    try testing.expectEqualSlices(u8, "FIRST", out[0].secret);
+    try testing.expectEqualSlices(u8, &from_history, out[1].secret);
+    try testing.expectEqualSlices(u8, "SECOND", out[2].secret);
+    try testing.expectEqualSlices(u8, &from_caller, out[3].secret);
+    // The id travels with its secret — `pskSecret` reads it back out for the
+    // `PSKLabel`, so a slot carrying the right key under the wrong id would
+    // be just as wrong.
+    for (out, ids) |got, want| {
+        try testing.expectEqual(want.psk_nonce.ptr, got.id.psk_nonce.ptr);
+        try testing.expectEqual(@as(keyschedule.PskType, want.pskType()), got.id.pskType());
+    }
+
+    // The group's OWN history wins over a caller-supplied entry naming the
+    // same triple: a caller cannot shadow a secret this group derived.
+    const shadow = [_]ResumptionPsk{
+        .{ .usage = .application, .group_id = "mine", .epoch = 4, .secret = &from_caller },
+    };
+    const out2 = try G.resolvePsksFromIds(gpa, ids[1..2], &.{}, .{
+        .group_id = "mine",
+        .history = &history,
+        .supplied = &shadow,
+    });
+    defer gpa.free(out2);
+    try testing.expectEqualSlices(u8, &from_history, out2[0].secret);
+
+    // Both halves of a resumption PSK's identity, against a group's OWN
+    // history and with nothing supplied — the lookup a MEMBER performs when
+    // it receives somebody else's Commit, and the one that has no
+    // caller-supplied value to disagree with. An epoch this group never
+    // lived through, and this group's own epoch under somebody else's
+    // `psk_group_id`, must both be refused; the second is the one an
+    // epoch-only lookup would happily answer.
+    const refuse = [_]keyschedule.PreSharedKeyId{
+        resumptionId(.application, "mine", 5, &nonce),
+        resumptionId(.application, "not-mine", 4, &nonce),
+    };
+    for (refuse, 0..) |id, i| {
+        errdefer std.debug.print("refuse case {d}\n", .{i});
+        try testing.expectError(error.PskNotAvailable, G.resolvePsksFromIds(gpa, &.{id}, &.{}, .{
+            .group_id = "mine",
+            .history = &history,
+        }));
+    }
 }

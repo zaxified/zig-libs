@@ -680,8 +680,22 @@ neither of them transports, having reached it by opposite halves of §8.3
 and via a leaf index that appears nowhere on the wire. See `SPEC.md`'s
 "Part 9".
 
-**Not supported yet:** a resumption PSK in an external join (the joiner has
-no epoch history to resolve it against — `error.PskNotAvailable`).
+**Resumption PSKs in an external join.** A group entered this way has no
+epoch history, so `ExternalJoinParams.resumption_psks` is how the caller
+hands in prior-epoch `resumption_psk` values it kept out of band — the
+resync case, where this client was in this group before. The library checks
+the width (`KDF.Nh`) and that a `PreSharedKeyID` resolves only against an
+entry naming the same `usage`, `psk_group_id` and `psk_epoch`; it cannot
+check that the value is genuine, and a wrong one costs a failed join rather
+than a compromised group, because every member resolves the same id from its
+own history and rejects the Commit. Without the list, a resumption
+`PreSharedKeyID` is still `error.PskNotAvailable`.
+
+Note that §12.4.3.2's suggestion to gate the resync flavor on a `reinit` PSK
+proposal cannot be followed literally — §12.1.4 and §11.2 make that proposal
+invalid outside a reinitialization, and this module rejects it
+(`error.ResumptionPskUsageNotAllowed`). Use usage `application`; it
+demonstrates presence in a prior epoch identically. See `SPEC.md`'s "Part 9".
 
 ## Verify
 
