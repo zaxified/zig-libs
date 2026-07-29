@@ -20,6 +20,39 @@
 //! negotiation, dispatch, error objects) and, per the MCP spec, rejects
 //! JSON-RPC batches.
 //!
+//! ## Server→client requests (sampling / elicitation)
+//!
+//! `mcp.Server` can issue `sampling/createMessage` and `elicitation/create`.
+//! Over HTTP those are **not** request/response within one connection: the
+//! client's answer arrives as a *later, separate POST*, so nothing can park
+//! waiting for it (same constraint as the `GET` stream — see `Sessions`).
+//! What this transport wires up:
+//!
+//! - **Peer scoping.** Each session gets a numeric handle (`Sessions.tagOf`)
+//!   passed to `mcp.Server.handleMessageFrom` as the *peer*. A response POSTed
+//!   on session B can never resolve a request issued to session A, so one
+//!   user's sampling completion or elicitation answer cannot be delivered into
+//!   another user's tool call.
+//! - **Delivery.** A request issued from inside a `tools/call` rides that
+//!   POST's own response — an SSE `data:` event in stream mode; in
+//!   `application/json` mode the body must stay a single object, so it is
+//!   queued for the session's `GET` stream instead. To issue one *outside* a
+//!   call, write it to a `std.Io.Writer.Allocating` and `Sessions.push` the
+//!   bytes:
+//!
+//!   ```zig
+//!   var line: std.Io.Writer.Allocating = .init(gpa);
+//!   defer line.deinit();
+//!   _ = try server.sendSamplingRequest(&line.writer, req, .{
+//!       .peer = sessions.tagOf(sid).?, .on_response = &onAnswer, .ctx = app,
+//!   });
+//!   _ = try sessions.push(sid, std.mem.trimEnd(u8, line.written(), "\n"));
+//!   ```
+//!
+//! - **The answer.** The client POSTs its JSON-RPC response to `/mcp`; the
+//!   server produces no reply for it, so the endpoint answers **202 Accepted**
+//!   and the registered `mcp.ResponseHandler` runs during that POST.
+//!
 //! **Sessions** (optional — set `Transport.sessions` to a `*Sessions`): the
 //! transport assigns an `Mcp-Session-Id` at `initialize`, validates it on later
 //! requests (unknown ⇒ 404 so the client re-initializes), tears one down on
@@ -146,6 +179,11 @@ pub const Sessions = struct {
 
     const Session = struct {
         id: []const u8, // gpa-owned, stable for the session's life
+        /// Stable numeric handle for this session, handed to
+        /// `mcp.Server.handleMessageFrom` as the *peer*. It scopes the
+        /// correlation of server→client requests: a sampling/elicitation answer
+        /// POSTed on session B can never resolve a request issued to session A.
+        tag: u64,
         events: std.ArrayList(StoredEvent) = .empty,
         next_event_id: u64 = 1,
         closing: bool = false,
@@ -189,15 +227,25 @@ pub const Sessions = struct {
         errdefer self.gpa.free(id);
         const s = try self.gpa.create(Session);
         errdefer self.gpa.destroy(s);
-        s.* = .{ .id = id };
+        // seq is allocated under the lock and never reused, so it is a unique
+        // peer handle for this session's lifetime.
+        s.* = .{ .id = id, .tag = self.seq };
         try self.map.put(self.gpa, id, s);
         return id;
     }
 
     fn exists(self: *Sessions, id: []const u8) bool {
+        return self.tagOf(id) != null;
+    }
+
+    /// The session's peer handle (see `Session.tag`), or null when unknown.
+    /// Pass it as `mcp.RequestOptions.peer` when issuing a server→client
+    /// request for this session, so only that session's answer resolves it.
+    pub fn tagOf(self: *Sessions, id: []const u8) ?u64 {
         lockSpin(&self.lock);
         defer self.lock.unlock();
-        return self.map.contains(id);
+        const s = self.map.get(id) orelse return null;
+        return s.tag;
     }
 
     /// Tear a session down (on `DELETE`). Returns whether it existed.
@@ -429,9 +477,13 @@ fn handlePost(t: *const Transport, ctx: *router.Ctx) anyerror!void {
 
     // Session handling (only when a registry is configured). The client gets a
     // session id at `initialize` and must present it on every later request.
+    // `sid`/`peer` identify the session for the rest of the request: `peer` is
+    // what scopes server→client request correlation (see `Session.tag`).
+    var sid: ?[]const u8 = null;
+    var peer: u64 = 0;
     if (t.sessions) |sessions| {
         if (isInitialize(t.gpa, body)) {
-            const sid = sessions.create() catch |err| switch (err) {
+            const new_sid = sessions.create() catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.TooManySessions => {
                     ctx.res.setStatus(429);
@@ -440,33 +492,64 @@ fn handlePost(t: *const Transport, ctx: *router.Ctx) anyerror!void {
                     return;
                 },
             };
-            try ctx.res.setHeader("Mcp-Session-Id", sid);
+            try ctx.res.setHeader("Mcp-Session-Id", new_sid);
+            sid = new_sid;
+            peer = sessions.tagOf(new_sid) orelse 0;
         } else {
-            const sid = ctx.req.header("mcp-session-id") orelse return notFound(ctx);
-            if (!sessions.exists(sid)) return notFound(ctx);
+            const have = ctx.req.header("mcp-session-id") orelse return notFound(ctx);
+            peer = sessions.tagOf(have) orelse return notFound(ctx);
+            sid = have;
         }
     }
 
-    if (t.stream == .auto and acceptsSse(ctx.req)) return streamResponse(t, ctx, body);
-    return jsonResponse(t, ctx, body);
+    if (t.stream == .auto and acceptsSse(ctx.req)) return streamResponse(t, ctx, body, peer);
+    return jsonResponse(t, ctx, body, sid, peer);
 }
 
-/// The single-JSON-response path (client did not ask for SSE): capture the one
-/// response line the server writes and return `application/json`, or 202 for a
-/// notification.
-fn jsonResponse(t: *const Transport, ctx: *router.Ctx, body: []const u8) anyerror!void {
+/// The single-JSON-response path (client did not ask for SSE): capture what the
+/// server writes and return `application/json`, or 202 for a notification (and
+/// for a JSON-RPC *response* — a client answering a server→client request also
+/// produces no reply, which is exactly what the Streamable HTTP spec wants
+/// answered with 202).
+///
+/// The server may write **several** lines for one message: a tool's
+/// `notifications/progress` and any `sampling/createMessage` /
+/// `elicitation/create` it issues precede the response line. An
+/// `application/json` body must be a single JSON object, so only the last line
+/// (the response) becomes the body; the earlier server→client lines are queued
+/// on the session's `GET` stream when a registry is configured, and dropped
+/// when it is not — a stateless endpoint has no channel to deliver them on.
+fn jsonResponse(t: *const Transport, ctx: *router.Ctx, body: []const u8, sid: ?[]const u8, peer: u64) anyerror!void {
     var out: std.Io.Writer.Allocating = .init(t.gpa);
     defer out.deinit();
 
     t.lock.acquire();
-    const rc = t.server.handleMessage(body, &out.writer);
+    const rc = t.server.handleMessageFrom(body, &out.writer, peer);
     t.lock.release();
     // handleMessage only fails on OOM or a transport write failure; the
     // Allocating writer fails solely on OOM, so both surface as a 500.
     rc catch return error.OutOfMemory;
 
-    // A notification (or any id-less message) produces no response line.
-    const resp = std.mem.trimEnd(u8, out.written(), "\n");
+    // Split into lines; the last non-empty one is the response to this POST.
+    var resp: []const u8 = "";
+    var it = std.mem.splitScalar(u8, out.written(), '\n');
+    var prior: std.ArrayList([]const u8) = .empty;
+    defer prior.deinit(t.gpa);
+    while (it.next()) |raw| {
+        const line = std.mem.trimEnd(u8, raw, "\r");
+        if (line.len == 0) continue;
+        if (resp.len != 0) try prior.append(t.gpa, resp);
+        resp = line;
+    }
+    if (prior.items.len != 0) {
+        if (t.sessions) |sessions| {
+            if (sid) |session_id| {
+                for (prior.items) |line| _ = try sessions.push(session_id, line);
+            }
+        }
+    }
+
+    // A notification, or the client's response to one of our requests: no reply.
     if (resp.len == 0) {
         ctx.res.setStatus(202); // Accepted, no body
         return;
@@ -480,13 +563,13 @@ fn jsonResponse(t: *const Transport, ctx: *router.Ctx, body: []const u8) anyerro
 /// JSON-RPC line the server writes (progress notifications, then the response)
 /// as an SSE `data:` event, flushed live. If the message was a notification
 /// (the server wrote nothing), no stream is started and we answer 202.
-fn streamResponse(t: *const Transport, ctx: *router.Ctx, body: []const u8) anyerror!void {
+fn streamResponse(t: *const Transport, ctx: *router.Ctx, body: []const u8, peer: u64) anyerror!void {
     var buf: [4096]u8 = undefined;
     var adapter = SseAdapter.init(t.gpa, ctx.res, &buf);
     defer adapter.deinit();
 
     t.lock.acquire();
-    const rc = t.server.handleMessage(body, &adapter.writer);
+    const rc = t.server.handleMessageFrom(body, &adapter.writer, peer);
     t.lock.release();
     adapter.writer.flush() catch {}; // drain any bytes still buffered
     adapter.finish(); // emit a trailing partial line (defensive; mcp ends with \n)
@@ -1010,6 +1093,214 @@ test "oversized POST body → 413" {
         \\{"jsonrpc":"2.0","id":9,"method":"tools/list","params":{"padding":"xxxxxxxxxxxx"}}
     ), &buf);
     try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 413"));
+}
+
+// ── server→client requests over HTTP ───────────────────────────────────────
+
+const init_sampling_body =
+    \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"sampling":{},"elicitation":{}},"clientInfo":{"name":"c","version":"1"}}}
+;
+
+/// Records the client's answer to a server→client request.
+const Answers = struct {
+    calls: u32 = 0,
+    text: [64]u8 = @splat(0),
+    len: usize = 0,
+
+    fn on(ctx: ?*anyopaque, resp: *const mcp.ClientResponse) void {
+        const self: *Answers = @ptrCast(@alignCast(ctx.?));
+        self.calls += 1;
+        const r = resp.samplingResult() catch return;
+        const n = @min(r.content.text.len, self.text.len);
+        @memcpy(self.text[0..n], r.content.text[0..n]);
+        self.len = n;
+    }
+};
+
+/// A tool that fires an elicitation and returns immediately (the seam's shape).
+fn askTool(_: ?*anyopaque, call: *mcp.ToolCall) bool {
+    _ = call.requestElicitation(.{ .form = .{
+        .message = "Please provide your GitHub username",
+        .requested_schema =
+        \\{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}
+        ,
+    } }, .{}) catch return call.fail("refused");
+    call.write("{\"asked\":true}");
+    return false;
+}
+
+test "POST of a JSON-RPC response → 202 and the handler runs" {
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    var transport = Transport{ .gpa = gpa, .server = &server };
+
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+
+    var out: [4096]u8 = undefined;
+    _ = runWire(&r, post("/mcp", init_sampling_body), &out);
+
+    // Issue a sampling request out of band (stateless endpoint: the bytes would
+    // go wherever the app sends them; here we only need the pending entry).
+    var answers = Answers{};
+    var line: std.Io.Writer.Allocating = .init(gpa);
+    defer line.deinit();
+    const id = try server.sendSamplingRequest(&line.writer, .{
+        .messages = &.{.{ .role = .user, .content = .{ .text = "hi" } }},
+        .max_tokens = 32,
+    }, .{ .on_response = &Answers.on, .ctx = &answers });
+    try testing.expectEqual(@as(u64, 1), id);
+    try testing.expectEqual(@as(usize, 1), server.pendingCount());
+
+    // The client answers with a POST. No reply body ⇒ 202 Accepted.
+    const got = runWire(&r, post("/mcp",
+        \\{"jsonrpc":"2.0","id":1,"result":{"role":"assistant","content":{"type":"text","text":"Paris"},"model":"m","stopReason":"endTurn"}}
+    ), &out);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 202"));
+    try testing.expectEqualStrings("", bodyOf(got));
+    try testing.expectEqual(@as(u32, 1), answers.calls);
+    try testing.expectEqualStrings("Paris", answers.text[0..answers.len]);
+    try testing.expectEqual(@as(usize, 0), server.pendingCount());
+}
+
+test "sessions: a response POSTed on another session cannot resolve the request" {
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    var sessions = Sessions.init(gpa);
+    defer sessions.deinit();
+    var transport = Transport{ .gpa = gpa, .server = &server, .sessions = &sessions };
+
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+
+    var rbuf: [1024]u8 = undefined;
+    var out: [4096]u8 = undefined;
+
+    // Two independent sessions over the same mcp.Server.
+    const a_init = runWire(&r, postWithSession(&rbuf, "", init_sampling_body), &out);
+    var a_buf: [64]u8 = undefined;
+    const a_hdr = headerValue(a_init, "Mcp-Session-Id").?;
+    @memcpy(a_buf[0..a_hdr.len], a_hdr);
+    const sid_a = a_buf[0..a_hdr.len];
+
+    const b_init = runWire(&r, postWithSession(&rbuf, "", init_sampling_body), &out);
+    var b_buf: [64]u8 = undefined;
+    const b_hdr = headerValue(b_init, "Mcp-Session-Id").?;
+    @memcpy(b_buf[0..b_hdr.len], b_hdr);
+    const sid_b = b_buf[0..b_hdr.len];
+    try testing.expect(!std.mem.eql(u8, sid_a, sid_b));
+    try testing.expect(sessions.tagOf(sid_a).? != sessions.tagOf(sid_b).?);
+
+    // A sampling request bound to session A.
+    var answers = Answers{};
+    var line: std.Io.Writer.Allocating = .init(gpa);
+    defer line.deinit();
+    _ = try server.sendSamplingRequest(&line.writer, .{
+        .messages = &.{.{ .role = .user, .content = .{ .text = "hi" } }},
+        .max_tokens = 32,
+    }, .{ .peer = sessions.tagOf(sid_a).?, .on_response = &Answers.on, .ctx = &answers });
+    _ = try sessions.push(sid_a, std.mem.trimEnd(u8, line.written(), "\n"));
+
+    const answer =
+        \\{"jsonrpc":"2.0","id":1,"result":{"role":"assistant","content":{"type":"text","text":"leaked"},"model":"m"}}
+    ;
+    // Session B answers with the right id: 202 (nothing to reply), but the
+    // request must NOT resolve — otherwise B's user's data lands in A's flow.
+    const from_b = runWire(&r, postWithSession(&rbuf, sid_b, answer), &out);
+    try testing.expect(std.mem.startsWith(u8, from_b, "HTTP/1.1 202"));
+    try testing.expectEqual(@as(u32, 0), answers.calls);
+    try testing.expectEqual(@as(usize, 1), server.pendingCount());
+
+    // Session A answers: delivered.
+    const from_a = runWire(&r, postWithSession(&rbuf, sid_a, answer), &out);
+    try testing.expect(std.mem.startsWith(u8, from_a, "HTTP/1.1 202"));
+    try testing.expectEqual(@as(u32, 1), answers.calls);
+    try testing.expectEqualStrings("leaked", answers.text[0..answers.len]);
+    try testing.expectEqual(@as(usize, 0), server.pendingCount());
+
+    // The request itself was delivered to A's GET stream, not B's.
+    const a_stream = runWire(&r, getWithSession(&rbuf, sid_a, null), &out);
+    try testing.expect(std.mem.indexOf(u8, a_stream, "sampling/createMessage") != null);
+    const b_stream = runWire(&r, getWithSession(&rbuf, sid_b, null), &out);
+    try testing.expect(std.mem.indexOf(u8, b_stream, "sampling/createMessage") == null);
+}
+
+test "application/json mode: a tool's outbound request never lands in the body" {
+    // An `application/json` body must be exactly one JSON object. A tool that
+    // issues elicitation writes two lines; the earlier one must be routed to
+    // the session stream, not concatenated into the response.
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    try server.addTool(.{
+        .name = "ask",
+        .description = "asks the user",
+        .input_schema = "{\"type\":\"object\"}",
+        .handler = askTool,
+    });
+    var sessions = Sessions.init(gpa);
+    defer sessions.deinit();
+    var transport = Transport{ .gpa = gpa, .server = &server, .sessions = &sessions };
+
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+
+    var rbuf: [1024]u8 = undefined;
+    var out: [4096]u8 = undefined;
+    const init = runWire(&r, postWithSession(&rbuf, "", init_sampling_body), &out);
+    const sid_hdr = headerValue(init, "Mcp-Session-Id").?;
+    var sidbuf: [64]u8 = undefined;
+    @memcpy(sidbuf[0..sid_hdr.len], sid_hdr);
+    const sid = sidbuf[0..sid_hdr.len];
+
+    const got = runWire(&r, postWithSession(&rbuf, sid,
+        \\{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"ask"}}
+    ), &out);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
+    const b = bodyOf(got);
+    // Exactly the tool result, and nothing of the elicitation request.
+    try testing.expect(std.mem.indexOf(u8, b, "elicitation/create") == null);
+    try testing.expect(std.mem.indexOf(u8, b, "\"id\":5") != null);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, b, "\"jsonrpc\""));
+
+    // The elicitation request went to the session's GET stream instead.
+    const stream = runWire(&r, getWithSession(&rbuf, sid, null), &out);
+    try testing.expect(std.mem.indexOf(u8, stream, "elicitation/create") != null);
+}
+
+test "SSE mode: a tool's outbound request streams as its own event before the result" {
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    try server.addTool(.{
+        .name = "ask",
+        .description = "asks the user",
+        .input_schema = "{\"type\":\"object\"}",
+        .handler = askTool,
+    });
+    var transport = Transport{ .gpa = gpa, .server = &server };
+
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+
+    var out: [8192]u8 = undefined;
+    _ = runWire(&r, post("/mcp", init_sampling_body), &out);
+
+    var out2: [8192]u8 = undefined;
+    const got = runWire(&r, postAccept("text/event-stream",
+        \\{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"ask"}}
+    ), &out2);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
+    const req_at = std.mem.indexOf(u8, got, "elicitation/create") orelse return error.NoRequestEvent;
+    const res_at = std.mem.indexOf(u8, got, "\"id\":6") orelse return error.NoResult;
+    try testing.expect(req_at < res_at); // request precedes the tool result
+    try testing.expect(std.mem.count(u8, got, "data: ") >= 2);
 }
 
 test "Sessions.create: refuses new sessions past max_sessions (audit MED)" {

@@ -16,6 +16,21 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
   future push, so the stream drains the buffered queue and closes; EventSource auto-reconnect +
   `Last-Event-ID` replay (bounded per-session buffer) makes delivery lossless. `Sessions.push` is
   callable from any thread (one spinlock; snapshot-under-lock so a concurrent `DELETE` can't UAF).
+- **Server→client requests (sampling / elicitation)** are supported to exactly the degree HTTP
+  allows: the client's answer is a *later, separate POST*, so nothing parks waiting for it (the same
+  constraint the drain-and-close `GET` documents). Three concrete pieces: (1) each session's numeric
+  handle (`Sessions.tagOf`, allocated from the create-lock's `seq`, never reused) is passed to
+  `mcp.Server.handleMessageFrom` as the **peer**, so a response POSTed on session B cannot resolve a
+  request issued to session A — a cross-tenant data-delivery bug, not a cosmetic one; (2) a request
+  issued from inside a `tools/call` rides that POST's response — an SSE `data:` event in stream
+  mode, or (JSON mode) the session queue; (3) the client's response POST produces no reply line, so
+  the endpoint answers **202 Accepted** and the `mcp.ResponseHandler` runs during that POST.
+- **The `application/json` body is exactly one JSON object.** The server may write several lines for
+  one message (progress notifications, and now server→client requests) before the response line;
+  only the last is the body and the earlier ones are pushed to the session's `GET` queue (dropped on
+  a stateless endpoint, which has no channel for them). Previously the whole capture was returned,
+  so any pre-response line would have concatenated multiple objects into one body — latent before
+  (only reachable via a progressToken in JSON mode), unavoidable once a tool can issue a request.
 - Built on `http` (streaming `ResponseWriter.flush` + `sse` encoder) + `router`; a `Lock` seam for
   the session store; size-capped bodies.
 
@@ -28,6 +43,8 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
   earlier middleware; this module does not authenticate callers.
 - **Session ids** are unguessable capability tokens for stream resumption, not an auth boundary;
   the replay buffer is bounded (old events drop). No cross-process session sharing (single-server).
+  The session **peer handle** derived from them scopes response correlation only — it inherits the
+  session id's trust level and is not an authentication of the answering party.
 - **Out of scope:** TLS (the server's/a proxy's), rate limiting (`ratelimit`), and the older
   HTTP+SSE dual-endpoint transport (only Streamable HTTP is implemented).
 
@@ -35,8 +52,12 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
 
 Offline tests over the `http` server harness: POST→JSON and POST→202, SSE-on-POST progress
 delivery, Origin accept/reject, session assign/validate/unknown-404, GET drain-and-close with
-`Last-Event-ID` replay, `DELETE` teardown, and a `max_sessions` cap rejection (audit MED). 14
-tests. Run: `zig build test-mcp-http`.
+`Last-Event-ID` replay, `DELETE` teardown, and a `max_sessions` cap rejection (audit MED). Plus, for
+server→client requests: a response POST → 202 with the handler run, cross-session correlation
+refused (session B's answer leaves session A's request pending, and the request lands only on A's
+`GET` stream), the `application/json` body carrying exactly one object while the tool's elicitation
+goes to the session queue, and the SSE ordering (request event precedes the tool result). 18 tests.
+Run: `zig build test-mcp-http`.
 
 ## Backlog / deferred
 

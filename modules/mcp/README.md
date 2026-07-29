@@ -41,7 +41,13 @@ MCP spec 2025-11-25.
   messages) — register with `addPrompt`; a bad argument answers `-32602`.
 - `initialize` advertises the tools / resources / prompts capabilities it
   actually serves. (Resource `subscribe` is not implemented —
-  `subscribe:false` is advertised.)
+  `subscribe:false` is advertised.) It also **records what the client
+  advertised** in `server.client_capabilities` — the gate on the two
+  server→client requests below.
+- **Sampling / elicitation (server→client requests):**
+  `sendSamplingRequest` (`sampling/createMessage`) and
+  `sendElicitationRequest` (`elicitation/create`), plus `cancelRequest`
+  (`notifications/cancelled`). See "Server→client requests" below.
 
 Malformed input **never panics** — it yields the proper JSON-RPC error
 (`-32700` parse, `-32600` invalid request, `-32601` method not found,
@@ -112,10 +118,88 @@ arena freed after the response is written (`ToolCall.arena` — allocate freely,
 never store). Tool metadata slices must outlive the server.
 
 **JSON-RPC encode helpers** (`writeErrorLine`, `writeResultLine`,
+`writeSamplingRequestLine`, `writeElicitationRequestLine`,
 `mcp.error_code.*`) are public for custom transports.
+
+## Server→client requests (sampling + elicitation)
+
+`sampling/createMessage` asks the **client's** LLM for a completion;
+`elicitation/create` asks the client to collect input from the user. Both flow
+server→client, which is the opposite of everything else here.
+
+**They do not block.** `handleMessage` is given one message and one writer — it
+has no reader — and over `mcp-http` the client's answer arrives on a *separate
+POST*. So the API is issue-now / correlate-later:
+
+```zig
+// 1. issue (returns the server-side request id; never waits)
+const id = try server.sendElicitationRequest(writer, .{ .form = .{
+    .message = "Which branch should I deploy?",
+    .requested_schema =
+        \\{"type":"object","properties":{"branch":{"type":"string"}},"required":["branch"]}
+    ,
+} }, .{ .on_response = &onAnswer, .ctx = &app });
+
+// 2. correlate — handleMessage recognizes the client's response, matches it to
+//    the pending request and calls your handler. Nothing is written back
+//    (JSON-RPC never answers a response).
+fn onAnswer(ctx: ?*anyopaque, resp: *const mcp.ClientResponse) void {
+    const app: *App = @ptrCast(@alignCast(ctx.?));
+    const r = resp.elicitationResult() catch return;
+    switch (r.action) {
+        .accept => app.branch = copy(r.content.?),   // arena dies with the callback
+        .decline, .cancel => {},                     // NOT errors — normal outcomes
+    }
+}
+```
+
+A tool handler can issue one mid-call (`call.requestSampling` /
+`call.requestElicitation`); the request line goes out before the tool result.
+The answer still arrives later, so a tool that *needs* it must be two calls:
+ask on the first, act on the second. There is no third option that this
+transport can express.
+
+- **Capability-gated.** Both refuse (`error.SamplingNotSupported` /
+  `error.ElicitationNotSupported`, and per-mode `Elicitation{Form,Url}NotSupported`)
+  unless the client declared it at `initialize` — the spec's MUST NOT, enforced
+  rather than documented. Check `call.clientCapabilities()` first to avoid
+  offering a feature the client can't serve.
+- **Ids are never reused**, even when a send fails. Unanswered requests are
+  capped (`max_pending`, default 256); `cancelRequest` drops one and tells the
+  client.
+- **Peer scoping.** `RequestOptions.peer` + `handleMessageFrom` keep a response
+  from resolving another connection's request (`mcp-http` wires each session's
+  handle automatically).
+
+### Elicitation: schemas are restricted, and secrets are refused
+
+`requested_schema` is validated against the spec's restricted JSON-Schema
+subset — a **flat** object of primitives (string / number / integer / boolean,
+single-select enums in either the `enum`+`enumNames` or `oneOf` spelling, and
+2025-11-25 multi-select enum arrays). Nesting, arrays of objects and general
+JSON Schema are rejected, as are unknown keywords: a client that can't render
+what you asked for produces an unusable answer.
+
+The spec also says a server **MUST NOT** use form mode to ask for passwords,
+API keys, tokens or payment credentials, and **MUST** use URL mode instead.
+That one is a phishing primitive — the prompt is chosen by the server but
+rendered inside a client the user already trusts — so this module **refuses**
+it: a form schema with a credential-shaped property name or title fails with
+`error.SchemaSensitiveField` (`looksLikeSecretField` is public, so you can
+apply the same test yourself). It is a name heuristic, not a proof; it catches
+the accident, and the structural answer for a real credential is
+`.url` mode, where the value never transits the client at all.
+
+Not implemented: sampling-with-tools (`tools`/`toolChoice`), `includeContext`,
+`metadata`, and `notifications/elicitation/complete` (emit it yourself — it is
+one notification line).
 
 Tests: `zig build test-mcp` — JSON-RPC parse/encode incl. all standard error
 codes, version negotiation, golden `tools/list`/`initialize` JSON, ctx-pointer
 threading, structuredContent gating, progress interleaving, and a full
 in-process `initialize → initialized → tools/list → tools/call` round-trip
-over an in-memory pipe.
+over an in-memory pipe. For sampling/elicitation: request lines compared
+**byte-for-byte against the MCP specification's own JSON examples**, capability
+and per-mode gating, the schema subset, the credential refusal, response
+correlation (by id, out of order, wrong peer, unknown id, after cancel), and an
+ask-then-act round-trip over `serve`.

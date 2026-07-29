@@ -12,7 +12,9 @@ the zig-libs authors (MIT).
 - **Protocol surface:** `initialize` (echo the client's requested revision when in
   `supported_versions` = {2025-11-25, 2025-06-18}, else the latest), `notifications/initialized`,
   `tools/list`, `tools/call`, `resources/list`, `resources/templates/list`, `resources/read`,
-  `prompts/list`, `prompts/get`, `ping`, and server→client `notifications/progress`. Subscriptions,
+  `prompts/list`, `prompts/get`, `ping`, server→client `notifications/progress`, and the two
+  server→client *requests* `sampling/createMessage` + `elicitation/create` (with
+  `notifications/cancelled`). Subscriptions,
   list-change notifications and pagination (`nextCursor`) are deliberately not implemented (the
   advertised capabilities say so). Modeled after MCP spec revision 2025-11-25 + JSON-RPC 2.0; the
   JSON-RPC core is the zig-libs authors' original work (MIT).
@@ -27,6 +29,38 @@ the zig-libs authors (MIT).
   -32601/-32602/-32603, plus MCP's -32002 for an unresolvable `resources/read` uri), never a panic
   or a Zig error; only OOM and transport write-failure surface as `error`. A request (has `id`)
   gets exactly one response; a notification (no `id`) gets none.
+- **Server→client requests are issue-now / correlate-later, by necessity.** `handleMessage` takes
+  one message and one writer and owns no reader; under `mcp-http` the client's answer arrives on a
+  *different HTTP request*, which cannot be serviced while the first is parked (the same constraint
+  the `GET` drain-and-close stream documents). A "handler blocks on sampling" API is therefore not
+  implementable without an async runtime inside a transport module, and would deadlock the HTTP
+  transport outright. What is implemented instead: `sendSamplingRequest`/`sendElicitationRequest`
+  allocate a **never-reused** monotonic id (burnt even when the send fails), validate, check the
+  capability, write one request line and record a pending entry; `handleMessage` recognizes an
+  inbound response (`id` + `result`/`error`, no `method`), matches the pending table and invokes the
+  registered `ResponseHandler`, writing **nothing** — JSON-RPC forbids answering a response, and
+  answering with the same id would loop. Consequence a consumer must design around: a tool that
+  needs the answer is two calls (ask, then act). Pending entries are capped (`max_pending`);
+  `cancelRequest` drops one and emits `notifications/cancelled`. **This fixed a live bug**: before
+  this, a client's response hit the "Missing method" branch and got a -32600 *reply*.
+- **Capabilities are stored, not just parsed.** `initialize` records `client_capabilities` (and
+  `negotiated_version`), replacing any prior set wholesale, and all-false before a handshake — so a
+  server fails closed. The spec's MUST NOTs (no `sampling/createMessage` without `sampling`, no
+  `elicitation/create` without `elicitation`, no elicitation *mode* the client did not declare, with
+  `elicitation:{}` meaning form-only for backwards compatibility) are enforced at the send seam.
+  `negotiateVersion` returns one of **our** static literals, never the caller's slice — the request
+  is parsed on a per-message arena, so echoing it back would dangle in `negotiated_version`.
+- **Peer scoping.** `handleMessageFrom(msg, out, peer)` correlates a response only to a pending
+  request issued to the *same* peer; `handleMessage` is `peer = 0`. Multiplexing transports
+  (`mcp-http` sessions) pass a per-session handle, so one session cannot consume another's sampling
+  completion or the user's elicitation answer. Not a wildcard in either direction.
+- **Elicitation schema subset + credential refusal.** `requestedSchema` is validated against the
+  spec's restricted subset (flat object of primitives; single-select enums in both the 2025-06-18
+  `enum`/`enumNames` and 2025-11-25 `oneOf` spellings; 2025-11-25 multi-select enum arrays) and is
+  *strict* — an unknown keyword is rejected, not passed through, because a client that ignores it
+  renders a form that does not match what the server asked for. Elicitation results force
+  `content = null` on `decline`/`cancel`, so a refused answer cannot be read as data; neither
+  action is an error.
 - **Allocation + concurrency.** Allocator-explicit; each message is handled on a per-message arena
   freed after the response is written (handlers allocate freely on it, never store). Registered
   metadata slices must outlive the server. Reentrant — no globals; one `Server` = one owner (wrap
@@ -41,8 +75,28 @@ privileges, so exposing it (especially over HTTP) is the caller's trust decision
 framing/parse surface (malformed JSON, wrong types, batch arrays, stray notifications, an invalid
 registered schema literal → -32603 not a crash; a bounded per-message arena; the `structuredContent`
 structural re-check so a text/error blob never emits invalid structure). Out of scope: MCP
-client/host roles, sampling, roots, subscriptions and list-change notifications, pagination, and
-the HTTP/SSE session transport (the sibling `mcp-http` module).
+client/host roles, roots, subscriptions and list-change notifications, pagination, and
+the HTTP/SSE session transport (the sibling `mcp-http` module). Also out of scope within the
+sampling/elicitation surface: sampling-with-tools (`tools`/`toolChoice` and the tool-use/tool-result
+message shapes — `SamplingResult.parse` refuses an array content block rather than half-decoding
+it), `includeContext`, `metadata`, and emitting `notifications/elicitation/complete`.
+
+**Sampling's trust asymmetry.** The server picks the prompt; the client owns the model access, the
+credential and the bill. The spec expects a human in the loop client-side, but a server MUST NOT
+rely on it: the returned completion is untrusted text, never an instruction. Conversely a *client*
+cannot verify anything about the request it renders.
+
+**Elicitation is a phishing primitive if left unguarded**, which is why the spec forbids form mode
+for secrets and mandates URL mode instead: the message is chosen by the server but rendered inside a
+UI the user already trusts, and a form-mode value transits the client, its logs and possibly an LLM
+context. This module refuses form schemas whose property names/titles look like credentials
+(`looksLikeSecretField`, public and unit-tested in both directions so its false-positive behaviour
+is pinned). **Its limits are real**: it matches names only — not the free-text `message`, not intent,
+and not what the value is later used for — so it stops the accident, not the adversary. The
+structural mitigation is `.url` mode, whose URL is scheme-checked (https, or http for loopback only)
+so `javascript:`/`data:`/`file:` payloads never reach a client that is about to open them; every
+other URL-safety rule in the spec (no credentials in the URL, no pre-authenticated links, verifying
+that the user who opens it is the user it was minted for) is the application's, not this module's.
 
 ## Verification
 
@@ -55,13 +109,37 @@ handler failure, and progress notifications interleaving before the result; gold
 template-uri resolution + -32002 on an unresolvable uri, `prompts/get` argument substitution +
 -32602/-32603; duplicate registration rejected; blank-line/CRLF tolerance; and a full in-process
 `initialize → initialized → tools/list → tools/call` round-trip over an in-memory pipe via `serve`.
+
+Sampling/elicitation are anchored on the **specification's own JSON examples**, not on
+self-consistency: the emitted `sampling/createMessage` line (2025-11-25 "Creating Messages"), the
+form-mode and URL-mode `elicitation/create` lines (2025-11-25), the form-mode line for a 2025-06-18
+peer (that revision's example — no `mode` member), and the decode of both revisions' result examples
+including the `-1` "user rejected" error. Behaviours with **no external anchor** — pinned only by our
+own tests, and therefore only as good as the reasoning behind them: the image/audio request line and
+`temperature`/`stopSequences` placement (the spec shows no wire example carrying them), the exact
+`SchemaError`/`SendError` taxonomy, the credential-name word list, the loopback-http URL allowance,
+the never-reuse id rule, `max_pending`, and the whole `peer` concept (an implementation invention —
+the spec says nothing about multiplexing one server over several sessions).
+
+Every central invariant was **mutation-tested**: 21 deliberate mutations (drop the capability gate;
+accept a nested/array-of-objects schema; treat `decline` as an error; surface content on `decline`;
+reuse an id after a failed send; correlate by arrival order instead of id; drop the peer check; set
+peer to 0 on both the send and correlate sides — the *consistent* mutation that survives every
+round trip; answer a response instead of consuming it; record both request kinds as `.sampling`;
+misspell `maxTokens`; emit `mode` to a 2025-06-18 peer; reorder the URL-mode keys; remove the
+pending cap; remove the credential refusal; drop the empty-`elicitation:{}` form default; silently
+decode tool-use content; and, in `mcp-http`, let the JSON body keep every line and let all sessions
+share peer 0). All 21 turned a test red on behaviour, none on a compile error alone.
 Run: `zig build test-mcp`.
 
 ## Backlog / deferred
 
-None recorded beyond the explicit out-of-scope list above (client/host roles, sampling, roots,
-subscriptions, pagination) — no deferred-gap note and the module README has no Deferred
-section.
+None recorded beyond the explicit out-of-scope list above (client/host roles, roots, subscriptions,
+pagination, sampling-with-tools, `notifications/elicitation/complete`). Worth revisiting if a
+consumer needs it: sampling-with-tools is the largest remaining piece (a multi-turn tool loop with
+`ToolUseContent`/`ToolResultContent` balance rules the spec makes normative), and
+`URLElicitationRequiredError` (-32042) is exposed as a code but not as a helper that builds its
+`data.elicitations` payload.
 
 ## Status
 

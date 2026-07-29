@@ -65,3 +65,34 @@ notification → 202, `stream=.off`), Origin allowlist (match/mismatch/absent),
 sessions (assign + validate + 404 + DELETE, `GET` push + `Last-Event-ID` replay
 + heartbeat, unknown-session 404, `max_sessions` cap rejected), path
 pass-through / 405, oversized → 413. Green in Debug + ReleaseFast.
+
+## Server→client requests (sampling / elicitation)
+
+`mcp.Server` can ask the client for an LLM completion (`sampling/createMessage`)
+or for user input (`elicitation/create`). Over HTTP the answer arrives as a
+**separate later POST**, so nothing blocks waiting for it — see the `mcp`
+module's README for the issue-now / correlate-later shape.
+
+What this transport adds:
+
+- **Per-session peer scoping.** Each session gets a handle (`Sessions.tagOf`)
+  passed to `mcp.Server.handleMessageFrom`, so a response POSTed on one session
+  can never resolve a request issued to another. Pass it as
+  `mcp.RequestOptions.peer` when you issue a request out of band:
+
+  ```zig
+  var line: std.Io.Writer.Allocating = .init(gpa);
+  defer line.deinit();
+  _ = try server.sendSamplingRequest(&line.writer, req, .{
+      .peer = sessions.tagOf(sid).?, .on_response = &onAnswer, .ctx = app,
+  });
+  _ = try sessions.push(sid, std.mem.trimEnd(u8, line.written(), "\n"));
+  ```
+
+- **Delivery.** A request issued from inside a `tools/call` rides that POST's
+  response: an SSE `data:` event in stream mode; in `application/json` mode the
+  body must stay a single JSON object, so it is queued for the session's `GET`
+  stream instead (and dropped on a stateless endpoint, which has no channel for
+  it).
+- **The answer** POSTs to `/mcp` and produces no reply → **202 Accepted**; your
+  `mcp.ResponseHandler` runs during that request.
