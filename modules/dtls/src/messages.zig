@@ -55,11 +55,17 @@ pub const ExtensionType = enum(u16) {
 };
 
 /// RFC 8446 §4.2.7 `NamedGroup` code points for the (EC)DHE groups this
-/// module's cert-only-DHE handshake mode can offer/select. Only `x25519` is
-/// wired end-to-end (its `KeyShareEntry.key_exchange` is the raw 32-byte
-/// X25519 public key, RFC 8446 §4.2.8.1 / RFC 7748); `secp256r1` is listed
-/// so `supported_groups` can advertise it, but the key-exchange machinery in
-/// `Connection.zig` only computes X25519 shares.
+/// module's cert-only-DHE handshake mode can offer/select. BOTH are wired
+/// end-to-end in `Connection.zig` (see its `ecdheGenerate`/`ecdheSharedSecret`):
+///   * `x25519` — `KeyShareEntry.key_exchange` is the raw 32-byte X25519
+///     public key (RFC 8446 §4.2.8.1 / RFC 7748); shared secret = the 32-byte
+///     scalarmult output;
+///   * `secp256r1` — `key_exchange` is the 65-byte UNCOMPRESSED SEC1 point
+///     `0x04 || X || Y` (RFC 8446 §4.2.8.2); shared secret = the 32-byte X
+///     coordinate of the shared point ONLY, not the point encoding.
+/// An earlier version of this module advertised `secp256r1` in
+/// `supported_groups` while being unable to compute a share for it — which
+/// is exactly what makes a server answer with a HelloRetryRequest naming it.
 pub const NamedGroup = enum(u16) {
     secp256r1 = 0x0017,
     x25519 = 0x001d,
@@ -493,6 +499,29 @@ pub fn decodeKeyShareServerHello(data: []const u8) MessageError!KeyShareEntry {
     const klen: usize = std.mem.readInt(u16, data[2..4], .big);
     if (data.len < 4 + klen) return error.Malformed;
     return .{ .group = group, .key_exchange = data[4..][0..klen] };
+}
+
+/// The THIRD `key_share` form (RFC 8446 §4.2.8): inside a
+/// HelloRetryRequest the extension body is a bare `NamedGroup
+/// selected_group` — two bytes, no share, no length prefix — because the
+/// server is naming the group it wants a share IN, not supplying one.
+///
+/// Decoding this with `decodeKeyShareServerHello` would read the two bytes
+/// after the group as a length and run off the end; they are not
+/// interchangeable, which is why this exists as its own pair.
+pub fn encodeKeyShareHelloRetryRequest(selected_group: u16, out: []u8) MessageError![]u8 {
+    if (out.len < 2) return error.BufferTooShort;
+    std.mem.writeInt(u16, out[0..2], selected_group, .big);
+    return out[0..2];
+}
+
+/// Exact-length: a HelloRetryRequest `key_share` is two bytes and nothing
+/// else. Anything longer is either the ServerHello form (a real share) in
+/// the wrong message or a malformed extension — both must be refused rather
+/// than silently truncated to the first two bytes.
+pub fn decodeKeyShareHelloRetryRequest(data: []const u8) MessageError!u16 {
+    if (data.len != 2) return error.Malformed;
+    return std.mem.readInt(u16, data[0..2], .big);
 }
 
 // ── ClientHello (RFC 8446 §4.1.2, reused by DTLS 1.3 — RFC 9147 §5.3) ────
@@ -1238,6 +1267,27 @@ test "key_share ServerHello round-trip (single bare entry, no list prefix)" {
     const dec = try decodeKeyShareServerHello(enc);
     try testing.expectEqual(@as(u16, 0x001d), dec.group);
     try testing.expectEqualSlices(u8, &share, dec.key_exchange);
+}
+
+test "key_share HelloRetryRequest form: exactly two bytes, and NOT interchangeable with the ServerHello form" {
+    var buf: [8]u8 = undefined;
+    const enc = try encodeKeyShareHelloRetryRequest(@intFromEnum(NamedGroup.secp256r1), &buf);
+    try testing.expectEqual(@as(usize, 2), enc.len);
+    try testing.expectEqualSlices(u8, &.{ 0x00, 0x17 }, enc);
+    try testing.expectEqual(@as(u16, 0x0017), try decodeKeyShareHelloRetryRequest(enc));
+
+    // The two forms must not be confusable. A real ServerHello key_share
+    // (group + length + share) fed to the HRR decoder is rejected outright
+    // rather than silently read as "selected_group = x25519": a decoder that
+    // took only the first two bytes would turn a server's real share into a
+    // group name and the client would retry against a group the server never
+    // asked for.
+    const share = [_]u8{0xCD} ** 32;
+    var sh_buf: [64]u8 = undefined;
+    const sh_form = try encodeKeyShareServerHello(.{ .group = 0x001d, .key_exchange = &share }, &sh_buf);
+    try testing.expectError(error.Malformed, decodeKeyShareHelloRetryRequest(sh_form));
+    // ...and in the other direction the HRR form has no share to hand back.
+    try testing.expectError(error.BufferTooShort, decodeKeyShareServerHello(enc));
 }
 
 test "key_share ClientHello: inner length overrunning the list is a typed error, never a panic" {

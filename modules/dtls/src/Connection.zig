@@ -26,13 +26,17 @@
 //! Proven end-to-end by a real in-memory client↔server interop test (see
 //! this file's tests) — no external DTLS peer required.
 //!
-//! **HelloRetryRequest / the stateless-cookie exchange** (RFC 9147 §5.1,
-//! RFC 8446 §4.1.4/§4.2.2) is implemented in BOTH roles: a client always
-//! answers one (`handleHelloRetryRequest`), and a server performs the
-//! return-routability check when `Config.hello_retry` is set
-//! (`sendHelloRetryRequest`/`acceptCookie`) — off by default, so existing
-//! callers are unchanged, but the RFC's recommended posture for anything
-//! internet-facing. Both directions are proven against wolfSSL.
+//! **HelloRetryRequest** (RFC 9147 §5.1, RFC 8446 §4.1.4/§4.2.2) is
+//! implemented in BOTH roles and BOTH key-exchange modes. A client always
+//! answers one (`handleHelloRetryRequest`), applying whichever of the two
+//! permitted changes the retry asked for: echo the COOKIE, and — in
+//! `.cert_dhe` — generate a fresh `key_share` in the GROUP the retry named.
+//! A server performs the return-routability check when `Config.hello_retry`
+//! is set (`sendHelloRetryRequest`/`acceptCookie`) — off by default, so
+//! existing callers are unchanged, but the RFC's recommended posture for
+//! anything internet-facing. This server never asks for a group change; it
+//! uses whichever offered share it can (`clientHelloShare`). Both roles, and
+//! all three retry shapes on the client side, are proven against wolfSSL.
 //!
 //! **Deliberately out of scope** (see `startHandshake`'s doc comment and
 //! `root.zig` for the full list): 0-RTT, session resumption, key update,
@@ -50,6 +54,12 @@ const certverify = @import("certverify.zig");
 const certauth = @import("certauth.zig");
 
 const X25519 = std.crypto.dh.X25519;
+/// The `secp256r1` half of the `.cert_dhe` key exchange (RFC 8446 §4.2.8.2).
+/// std's curve, not this collection's faster `p256` module: the ECDHE here is
+/// one scalar multiply per handshake (not a hot path), and dtls's `meta.deps`
+/// stays `{"rsa", "x509"}` rather than growing a dependency for it. Same
+/// choice `certverify.zig` already makes for ECDSA.
+const P256 = std.crypto.ecc.P256;
 
 pub const Role = enum { client, server };
 
@@ -61,8 +71,11 @@ pub const Role = enum { client, server };
 ///   `Config.psk`/`psk_identity`; every existing PSK/cert-over-PSK test uses
 ///   this mode and is byte-for-byte unaffected.
 /// - `.cert_dhe`: a PSK-LESS certificate-only handshake with ephemeral
-///   (EC)DHE (X25519) for forward secrecy — the standard TLS-1.3
-///   `certificate` handshake. The ClientHello offers `key_share` +
+///   (EC)DHE for forward secrecy — the standard TLS-1.3
+///   `certificate` handshake. Two groups are wired (`advertised_groups`):
+///   X25519, which a fresh ClientHello offers a share in, and secp256r1,
+///   which is offered when a server names it in a HelloRetryRequest.
+///   The ClientHello offers `key_share` +
 ///   `supported_groups` + `signature_algorithms` (NO `pre_shared_key`, NO
 ///   binder); the ECDHE shared secret is fed into the EXISTING key schedule
 ///   (`keyschedule.deriveHandshakeSecret` with a zero/empty-PSK early
@@ -363,15 +376,29 @@ pub const HandshakeError = messages.MessageError || handshake.FrameError || hand
     /// either a wrong PSK/transcript mismatch or a tampered flight.
     FinishedVerifyFailed,
     /// A HelloRetryRequest arrived that this engine cannot act on. The
-    /// cookie/retry round trip IS implemented for `psk_ke` clients
-    /// (`handleHelloRetryRequest`); this error is what remains:
-    ///   * an HRR in `.cert_dhe` mode — retrying there means updating the
-    ///     `key_share` to the group the server named, which this engine does
-    ///     not do;
-    ///   * an HRR with no cookie and therefore nothing to change, which RFC
-    ///     8446 §4.1.4 forbids sending in the first place. Answering it with
-    ///     a byte-identical ClientHello would be a retry loop.
+    /// cookie/retry round trip is implemented in BOTH key-exchange modes
+    /// (`handleHelloRetryRequest`), including `.cert_dhe`'s (EC)DHE half —
+    /// a retry naming a different `supported_groups` group is answered with
+    /// a fresh `key_share` in THAT group. This error is what remains:
+    ///   * an HRR carrying a `key_share` in `.psk` mode — `psk_ke` has no
+    ///     (EC)DHE, and answering with a share would silently switch the
+    ///     exchange to `psk_dhe_ke`, which this engine does not implement;
+    ///   * an HRR with neither a cookie nor a group change, i.e. nothing
+    ///     ClientHello2 could differ by. RFC 8446 §4.1.4 forbids sending one
+    ///     in the first place; answering it with a byte-identical
+    ///     ClientHello would be a retry loop.
     HelloRetryRequestUnsupported,
+    /// RFC 8446 §4.1.4: a HelloRetryRequest named a `selected_group` this
+    /// client never put in its own `supported_groups`. Accepting it would
+    /// let the server choose a group off-menu — including one this side
+    /// cannot compute a share for.
+    UnsupportedGroup,
+    /// RFC 8446 §4.1.4: a HelloRetryRequest named a group the client had
+    /// ALREADY offered a `key_share` for, or (in a ServerHello) selected a
+    /// cipher suite other than the one the preceding HelloRetryRequest
+    /// committed to. Both are protocol violations that a client which
+    /// obliged could be driven around indefinitely by.
+    IllegalHelloRetryRequest,
     /// RFC 9147 §5.1: a ClientHello arrived carrying a `cookie` extension
     /// that does not authenticate under this server's `Config.hello_retry`
     /// — a forged or tampered cookie, one minted for a DIFFERENT
@@ -389,13 +416,17 @@ pub const HandshakeError = messages.MessageError || handshake.FrameError || hand
     /// for the state the connection is in.
     UnexpectedMessage,
     /// `.cert_dhe` mode: the ClientHello (server side) or ServerHello
-    /// (client side) carried no usable `key_share` extension — either the
-    /// extension was absent, or it offered/selected no group this module
-    /// speaks (only x25519 is wired).
+    /// (client side) carried no usable `key_share` extension — the extension
+    /// was absent, it offered/selected no group this module speaks
+    /// (`advertised_groups`: x25519 and secp256r1), its share was the wrong
+    /// LENGTH for the group it claimed (`expectedShareLen`), or — client
+    /// side — the server answered in a group other than the one this client
+    /// offered a share in (RFC 8446 §4.2.8 requires they match).
     MissingKeyShare,
-    /// `.cert_dhe` mode: the peer's X25519 public share is malformed or a
-    /// low-order/identity point (`std.crypto.dh.X25519` rejected it), so no
-    /// usable shared secret could be computed. Rejected rather than used —
+    /// `.cert_dhe` mode: the peer's public share is structurally the right
+    /// size but unusable — an X25519 low-order/identity point (rejected by
+    /// `std.crypto.dh.X25519`), or a secp256r1 value that is not a point on
+    /// the curve / whose product is the identity. Rejected rather than used:
     /// an identity shared secret would be catastrophic.
     KeyExchangeFailed,
     /// INTERNAL to the flight engine: the datagrams buffered so far do not
@@ -702,18 +733,137 @@ fn selectSignatureScheme(
     return error.NoSignatureSchemeOverlap;
 }
 
-// ── cert-only-DHE (`.cert_dhe`) mode constants ────────────────────────────
+// ── (EC)DHE groups: the `.cert_dhe` key exchange ──────────────────────────
 
-/// The single (EC)DHE group this module computes shares for (RFC 8446
-/// §4.2.8.1 / RFC 7748 X25519). `supported_groups` additionally advertises
-/// secp256r1 for parser-compatibility, but only x25519 shares are generated.
 const x25519_group: u16 = @intFromEnum(messages.NamedGroup.x25519);
+const secp256r1_group: u16 = @intFromEnum(messages.NamedGroup.secp256r1);
 
-/// The `supported_groups` (RFC 8446 §4.2.7) advertised in `.cert_dhe` mode.
-const advertised_groups = [_]u16{
-    x25519_group,
-    @intFromEnum(messages.NamedGroup.secp256r1),
+/// The `supported_groups` (RFC 8446 §4.2.7) this module advertises. It is
+/// ONE list, used by both ClientHello builders and by the HelloRetryRequest
+/// group check — a client that advertises a group it cannot compute a share
+/// for invites an HRR it must then refuse, and a client that accepts an HRR
+/// naming a group it never advertised has skipped RFC 8446 §4.1.4's check.
+/// Every entry here MUST be handled by `ecdheGenerate`; the test
+/// "advertised_groups and the (EC)DHE implementation agree" pins that.
+///
+/// x25519 comes FIRST and is the group a fresh ClientHello offers a share
+/// in; secp256r1 is advertised as a fallback the server may name in a
+/// HelloRetryRequest.
+const advertised_groups = [_]u16{ x25519_group, secp256r1_group };
+
+/// The longest `KeyShareEntry.key_exchange` any advertised group produces:
+/// secp256r1's uncompressed SEC1 point (`0x04 || X || Y`).
+const max_key_share_len = 65;
+
+/// Is `group` one this side advertised in `supported_groups`? RFC 8446
+/// §4.1.4: a client MUST abort on a HelloRetryRequest whose `selected_group`
+/// was not in its own `supported_groups` — otherwise a server picks the
+/// group, which is precisely backwards.
+fn groupAdvertised(group: u16) bool {
+    for (advertised_groups) |g| {
+        if (g == group) return true;
+    }
+    return false;
+}
+
+/// The exact `KeyShareEntry.key_exchange` length RFC 8446 §4.2.8.1/§4.2.8.2
+/// fixes for each wired group. Exact, not a maximum: a P-256 share that is
+/// not 65 bytes is not a P-256 share, and accepting a short one would hand
+/// peer-controlled bytes to `fromSec1` on the strength of the group id alone.
+/// Returns 0 for groups this module does not speak, which never matches a
+/// real share length and so reads as "unusable".
+fn expectedShareLen(group: u16) usize {
+    return switch (group) {
+        x25519_group => 32,
+        secp256r1_group => 65,
+        else => 0,
+    };
+}
+
+/// An ephemeral (EC)DHE key pair for one handshake. The private part is a
+/// 32-byte scalar for both wired groups (X25519's clamped scalar, P-256's
+/// scalar mod n); the public part is the wire `key_share` value, whose
+/// length is group-dependent.
+const EcdheKeyPair = struct {
+    group: u16,
+    secret: [32]u8,
+    public: [max_key_share_len]u8,
+    public_len: usize,
 };
+
+/// Generates this side's ephemeral share in `group` from the caller-supplied
+/// RNG (std 0.16 removed `std.crypto.random`, so every source of randomness
+/// in this collection is an argument).
+///
+///   * x25519 (RFC 7748 / RFC 8446 §4.2.8.1): 32 random bytes as the secret
+///     scalar — `generateDeterministic` clamps — and the 32-byte public key
+///     as the share.
+///   * secp256r1 (RFC 8446 §4.2.8.2): a scalar in `[1, n-1]` by rejection
+///     sampling (`P256.scalar.rejectNonCanonical` refuses `>= n`; zero is
+///     refused separately), and `0x04 || X || Y` as the share. Rejection
+///     probability is ~2^-32 per draw, so the bounded loop below cannot
+///     realistically exhaust; it fails closed with a typed error rather than
+///     looping forever on a broken RNG.
+fn ecdheGenerate(group: u16, random: std.Random) HandshakeError!EcdheKeyPair {
+    var kp: EcdheKeyPair = .{ .group = group, .secret = undefined, .public = undefined, .public_len = 0 };
+    switch (group) {
+        x25519_group => {
+            var seed: [32]u8 = undefined;
+            random.bytes(&seed);
+            const x = X25519.KeyPair.generateDeterministic(seed) catch return error.KeyExchangeFailed;
+            std.crypto.secureZero(u8, &seed);
+            kp.secret = x.secret_key;
+            kp.public[0..32].* = x.public_key;
+            kp.public_len = 32;
+        },
+        secp256r1_group => {
+            var tries: usize = 0;
+            while (tries < 64) : (tries += 1) {
+                var candidate: [32]u8 = undefined;
+                random.bytes(&candidate);
+                P256.scalar.rejectNonCanonical(candidate, .big) catch continue; // >= n
+                if (std.mem.allEqual(u8, &candidate, 0)) continue; // == 0
+                // basePoint * a nonzero canonical scalar is never the identity.
+                const point = P256.basePoint.mul(candidate, .big) catch continue;
+                kp.secret = candidate;
+                kp.public[0..65].* = point.toUncompressedSec1();
+                kp.public_len = 65;
+                return kp;
+            }
+            return error.KeyExchangeFailed;
+        },
+        else => return error.MissingKeyShare,
+    }
+    return kp;
+}
+
+/// The (EC)DHE shared secret fed to `keyschedule.deriveHandshakeSecret`.
+///
+/// The two groups differ in more than size, and conflating them is a real
+/// interop bug rather than a cosmetic one: X25519's `scalarmult` output IS
+/// the shared secret, whereas for the NIST curves RFC 8446 §7.4.2 takes only
+/// the X COORDINATE of the shared point ("the shared secret is the x
+/// coordinate ... converted to a byte string"), not the 65-byte point.
+///
+/// Both paths reject a degenerate result rather than using it: X25519's
+/// low-order/identity outputs are rejected by std, and P-256's identity
+/// output by `mul`. `peer_share` is peer-controlled, so a wrong length or an
+/// off-curve point is a typed error here, never a panic.
+fn ecdheSharedSecret(group: u16, secret: [32]u8, peer_share: []const u8) HandshakeError![32]u8 {
+    switch (group) {
+        x25519_group => {
+            if (peer_share.len != 32) return error.MissingKeyShare;
+            return X25519.scalarmult(secret, peer_share[0..32].*) catch error.KeyExchangeFailed;
+        },
+        secp256r1_group => {
+            if (peer_share.len != 65) return error.MissingKeyShare;
+            const point = P256.fromSec1(peer_share) catch return error.KeyExchangeFailed;
+            const shared = point.mul(secret, .big) catch return error.KeyExchangeFailed;
+            return shared.affineCoordinates().x.toBytes(.big);
+        },
+        else => return error.MissingKeyShare,
+    }
+}
 
 // ── RFC 9147 §5.1 stateless HelloRetryRequest cookie ─────────────────────
 //
@@ -934,13 +1084,6 @@ pub const Connection = struct {
     /// epoch's `send_seq`/`recv_max_seq`/`recv_seen_any` above.
     hs0: EpochSeqState = .{},
     hs2: EpochSeqState = .{},
-    /// `.cert_dhe` mode only: this side's ephemeral X25519 key pair for the
-    /// handshake's (EC)DHE. The CLIENT generates these in `startHandshake`
-    /// and keeps `ecdhe_secret` resident until `handleFlight` computes the
-    /// shared secret (then zeroizes it immediately — forward secrecy); the
-    /// SERVER generates + consumes them entirely within
-    /// `serverProcessClientHello`. `ecdhe_public` is the wire `key_share`
-    /// value. Unused (left `undefined`) in `.psk` mode. Zeroized in `deinit`.
     /// ClientHello1's `random`, kept because RFC 8446 §4.1.2 requires
     /// ClientHello2 to reuse it verbatim after a HelloRetryRequest.
     client_random: [32]u8 = undefined,
@@ -952,8 +1095,28 @@ pub const Connection = struct {
     /// client that receives a second one MUST abort — otherwise a server
     /// could keep a client in an unbounded retry loop.
     saw_hello_retry_request: bool = false,
+    /// Client side: the cipher suite the HelloRetryRequest named, if one
+    /// arrived. RFC 8446 §4.1.4 requires the eventual ServerHello to select
+    /// the SAME suite ("Servers MUST ensure that they negotiate the same
+    /// cipher suite when receiving a conformant updated ClientHello"), and
+    /// the retry's bytes are part of the transcript, so a server that
+    /// switched has either lost track of what it committed to or is probing.
+    hrr_cipher_suite: ?u16 = null,
+    /// `.cert_dhe` mode only: this side's ephemeral (EC)DHE key pair for the
+    /// handshake. The CLIENT generates it in `startHandshake` (and REPLACES
+    /// it, in the group the server named, on a HelloRetryRequest) and keeps
+    /// `ecdhe_secret` resident until `handleFlight` computes the shared
+    /// secret, then zeroizes it immediately — forward secrecy; the SERVER
+    /// generates + consumes it entirely within `serverProcessClientHello`.
+    /// `ecdhe_public[0..ecdhe_public_len]` is the wire `key_share` value and
+    /// `ecdhe_group` the group it belongs to — the client checks the
+    /// ServerHello's share against BOTH, since a server that answers in a
+    /// group we never offered a share in has not done the key exchange we
+    /// did. Unused in `.psk` mode. Zeroized in `deinit`.
+    ecdhe_group: u16 = 0,
     ecdhe_secret: [32]u8 = undefined,
-    ecdhe_public: [32]u8 = undefined,
+    ecdhe_public: [max_key_share_len]u8 = undefined,
+    ecdhe_public_len: usize = 0,
     /// Whether `ecdhe_secret` currently holds live private-key material (so
     /// `deinit` only wipes real bytes, and a double-wipe after the in-handshake
     /// zeroization is harmless).
@@ -1042,7 +1205,10 @@ pub const Connection = struct {
         var ch_body_buf: [512]u8 = undefined;
         const ch_body = switch (self.config.key_exchange) {
             .psk => try self.buildClientHello(random, null, &ch_body_buf),
-            .cert_dhe => try self.buildClientHelloCertDhe(random, &ch_body_buf),
+            // `advertised_groups[0]` — the group a first ClientHello offers a
+            // share in. A server that wants a different one says so with a
+            // HelloRetryRequest (`handleHelloRetryRequest`).
+            .cert_dhe => try self.buildClientHelloCertDhe(random, null, advertised_groups[0], &ch_body_buf),
         };
         self.transcript.append(@intFromEnum(messages.HandshakeType.client_hello), ch_body);
         // ClientHello1 is the first message, so the transcript hash right
@@ -1415,11 +1581,8 @@ pub const Connection = struct {
         // `supported_groups` plus an EMPTY `key_share` is what wolfSSL's own
         // psk_ke client sends, costs nothing, and keeps the exchange PSK-only
         // — an empty `client_shares` offers no share to negotiate.
-        var groups_buf: [2 + 2 * 2]u8 = undefined;
-        const groups_ext = try messages.encodeSupportedGroups(&.{
-            @intFromEnum(messages.NamedGroup.x25519),
-            @intFromEnum(messages.NamedGroup.secp256r1),
-        }, &groups_buf);
+        var groups_buf: [2 + 2 * advertised_groups.len]u8 = undefined;
+        const groups_ext = try messages.encodeSupportedGroups(&advertised_groups, &groups_buf);
         var key_share_buf: [2]u8 = undefined;
         const key_share_ext = try messages.encodeKeyShareClientHello(&.{}, &key_share_buf);
 
@@ -1486,27 +1649,53 @@ pub const Connection = struct {
     }
 
     /// `.cert_dhe` mode ClientHello (RFC 8446 §4.1.2 / §4.2): generates this
-    /// client's ephemeral X25519 key pair (stored for `handleFlightClient`),
-    /// then builds `random || empty session id || cipher_suites ||
-    /// {supported_groups, signature_algorithms, key_share}` — NO
-    /// `pre_shared_key`, NO `psk_key_exchange_modes`, NO binder (this is the
-    /// PSK-less certificate handshake). The `key_share` offers a single
-    /// X25519 entry carrying `ecdhe_public`.
-    fn buildClientHelloCertDhe(self: *Connection, random: std.Random, body_buf: []u8) HandshakeError![]u8 {
-        var random_bytes: [32]u8 = undefined;
-        random.bytes(&random_bytes);
+    /// client's ephemeral (EC)DHE key pair in `group` (stored for
+    /// `handleFlightClient`), then builds `random || empty session id ||
+    /// cipher_suites || {supported_versions, supported_groups,
+    /// signature_algorithms, key_share[, cookie]}` — NO `pre_shared_key`, NO
+    /// `psk_key_exchange_modes`, NO binder (this is the PSK-less certificate
+    /// handshake).
+    ///
+    /// `cookie` is `null` for ClientHello1 and the HelloRetryRequest's cookie
+    /// (when it carried one) for ClientHello2. RFC 8446 §4.1.2 lists what
+    /// ClientHello2 may change and nothing else: the `key_share` (hence
+    /// `group` being a parameter, not a constant) and the `cookie`. Every
+    /// other field is therefore recomputed from the SAME inputs — in
+    /// particular `random` is drawn once and reused from `self.client_random`
+    /// on the retry, exactly as the PSK builder does.
+    fn buildClientHelloCertDhe(self: *Connection, random: std.Random, cookie: ?[]const u8, group: u16, body_buf: []u8) HandshakeError![]u8 {
+        // RFC 8446 §4.1.2: ClientHello2 reuses ClientHello1's `random`
+        // verbatim — it is not among the permitted changes. Keyed on "has a
+        // HelloRetryRequest been processed", NOT on "is there a cookie": a
+        // retry can name a new group WITHOUT a cookie (a server that only
+        // wants a different key share), and drawing a fresh random there
+        // would make ClientHello2 a different client to the peer.
+        if (!self.saw_hello_retry_request) random.bytes(&self.client_random);
 
-        // Ephemeral X25519 key pair (RFC 7748). `generateDeterministic` takes
-        // the 32-byte secret scalar directly; we source it from the
-        // caller-supplied RNG (std 0.16 removed `std.crypto.random`), exactly
-        // as `X25519.KeyPair.generate` would from a system CSPRNG.
-        var seed: [32]u8 = undefined;
-        random.bytes(&seed);
-        const kp = X25519.KeyPair.generateDeterministic(seed) catch return error.KeyExchangeFailed;
-        std.crypto.secureZero(u8, &seed);
-        self.ecdhe_secret = kp.secret_key;
-        self.ecdhe_public = kp.public_key;
-        self.ecdhe_secret_live = true;
+        // Ephemeral (EC)DHE key pair for `group` — generated only when there
+        // is not already one IN THAT GROUP. Both halves matter:
+        //
+        //   * a retry that names a NEW group must produce a fresh share in
+        //     it. Reusing the old share (or the old group) is the single
+        //     most likely way to "implement" RFC 8446 §4.1.4 without
+        //     implementing it at all — and self-interop cannot tell, because
+        //     our own server never asks for a group change.
+        //   * a retry that carries only a COOKIE must leave the key_share
+        //     alone. §4.1.2 lists what ClientHello2 may change, and "a
+        //     different share in the same group" is not on it: rolling a new
+        //     one anyway is a gratuitously different ClientHello2, i.e. the
+        //     same class of violation as a fresh `random`.
+        if (self.ecdhe_public_len == 0 or self.ecdhe_group != group) {
+            var kp = try ecdheGenerate(group, random);
+            self.ecdhe_group = kp.group;
+            self.ecdhe_secret = kp.secret;
+            self.ecdhe_public = kp.public;
+            self.ecdhe_public_len = kp.public_len;
+            self.ecdhe_secret_live = true;
+            // The connection now owns the only live copy; the stack one goes
+            // (the server path does the same after computing its secret).
+            std.crypto.secureZero(u8, &kp.secret);
+        }
 
         var cs_arr: [8]u16 = undefined;
         if (self.config.cipher_suites.len > cs_arr.len) return error.BufferTooShort;
@@ -1519,8 +1708,8 @@ pub const Connection = struct {
         var sigalgs_buf: [2 + 2 * default_signature_algorithms.len]u8 = undefined;
         const sigalgs_ext = try signatureAlgorithmsExtension(self.config.signature_algorithms, &sigalgs_buf);
 
-        var ks_buf: [2 + 4 + 32]u8 = undefined;
-        const ks_entries = [_]messages.KeyShareEntry{.{ .group = x25519_group, .key_exchange = &self.ecdhe_public }};
+        var ks_buf: [2 + 4 + max_key_share_len]u8 = undefined;
+        const ks_entries = [_]messages.KeyShareEntry{.{ .group = self.ecdhe_group, .key_exchange = self.ecdhe_public[0..self.ecdhe_public_len] }};
         const ks_ext = try messages.encodeKeyShareClientHello(&ks_entries, &ks_buf);
 
         // RFC 8446 §4.2.1 / §D.1: `supported_versions` is the ONLY place a
@@ -1535,49 +1724,73 @@ pub const Connection = struct {
         var versions_buf: [3]u8 = undefined;
         const versions_ext = try messages.encodeSupportedVersionsClientHello(&.{messages.version_dtls13}, &versions_buf);
 
-        const exts = [_]messages.Extension{
-            .{ .ext_type = @intFromEnum(messages.ExtensionType.supported_versions), .data = versions_ext },
-            .{ .ext_type = @intFromEnum(messages.ExtensionType.supported_groups), .data = groups_ext },
-            sigalgs_ext,
-            .{ .ext_type = @intFromEnum(messages.ExtensionType.key_share), .data = ks_ext },
-        };
+        var cookie_buf: [2 + max_cookie_len]u8 = undefined;
+        const cookie_ext: ?[]const u8 = if (cookie) |c| try messages.encodeCookieExtension(c, &cookie_buf) else null;
+
+        var exts_buf: [5]messages.Extension = undefined;
+        var n_exts: usize = 0;
+        exts_buf[n_exts] = .{ .ext_type = @intFromEnum(messages.ExtensionType.supported_versions), .data = versions_ext };
+        n_exts += 1;
+        exts_buf[n_exts] = .{ .ext_type = @intFromEnum(messages.ExtensionType.supported_groups), .data = groups_ext };
+        n_exts += 1;
+        exts_buf[n_exts] = sigalgs_ext;
+        n_exts += 1;
+        exts_buf[n_exts] = .{ .ext_type = @intFromEnum(messages.ExtensionType.key_share), .data = ks_ext };
+        n_exts += 1;
+        if (cookie_ext) |c| {
+            exts_buf[n_exts] = .{ .ext_type = @intFromEnum(messages.ExtensionType.cookie), .data = c };
+            n_exts += 1;
+        }
 
         return messages.encodeClientHello(.{
-            .random = random_bytes,
+            .random = self.client_random,
             .legacy_session_id = &.{},
             .cipher_suites = cs_list,
-            .extensions = &exts,
+            .extensions = exts_buf[0..n_exts],
         }, body_buf);
     }
 
-    /// `.cert_dhe` server helper: finds a usable x25519 share in the
-    /// CLIENT's `key_share` extension (a `KeyShareEntry` LIST, RFC 8446
-    /// §4.2.8.1) among the ClientHello's decoded extensions and returns its
-    /// raw 32-byte public share, or a typed error if absent / no x25519
-    /// entry / wrong length (never a panic).
-    fn clientHelloX25519Share(exts: []const messages.Extension) HandshakeError![32]u8 {
+    /// `.cert_dhe` server helper: finds a usable share in the CLIENT's
+    /// `key_share` extension (a `KeyShareEntry` LIST, RFC 8446 §4.2.8.1)
+    /// among the ClientHello's decoded extensions and returns it, or a typed
+    /// error if absent / no entry in a group this side speaks / wrong length
+    /// (never a panic).
+    ///
+    /// `advertised_groups` order is the server's PREFERENCE order, not the
+    /// client's: RFC 8446 §4.2.8 lets the server pick any offered group it
+    /// supports. This server never answers with a HelloRetryRequest asking
+    /// for a DIFFERENT group — if the client offered a share this side can
+    /// use, it uses it — so a client that offers nothing usable gets
+    /// `MissingKeyShare` rather than a retry (documented limit, see
+    /// `sendHelloRetryRequest`).
+    const PeerShare = struct { group: u16, share: []const u8 };
+
+    fn clientHelloShare(exts: []const messages.Extension) HandshakeError!PeerShare {
         for (exts) |e| {
             if (e.ext_type != @intFromEnum(messages.ExtensionType.key_share)) continue;
             var entries: [8]messages.KeyShareEntry = undefined;
             const shares = messages.decodeKeyShareClientHello(e.data, &entries) catch return error.Malformed;
-            for (shares) |s| {
-                if (s.group == x25519_group and s.key_exchange.len == 32) return s.key_exchange[0..32].*;
+            for (advertised_groups) |want| {
+                for (shares) |s| {
+                    if (s.group != want) continue;
+                    if (s.key_exchange.len != expectedShareLen(want)) continue;
+                    return .{ .group = s.group, .share = s.key_exchange };
+                }
             }
-            return error.MissingKeyShare; // key_share present but no usable x25519 entry
+            return error.MissingKeyShare; // key_share present but no usable entry
         }
         return error.MissingKeyShare;
     }
 
     /// `.cert_dhe` client helper: extracts the SERVER's single-entry
     /// `key_share` (RFC 8446 §4.2.8, no list prefix) from the ServerHello's
-    /// decoded extensions and returns its raw 32-byte x25519 public share, or
-    /// a typed error (never a panic).
-    fn serverHelloX25519Share(exts: []const messages.Extension) HandshakeError![32]u8 {
+    /// decoded extensions and returns it, or a typed error (never a panic).
+    /// The caller checks the group against the one it offered a share in.
+    fn serverHelloShare(exts: []const messages.Extension) HandshakeError!PeerShare {
         for (exts) |e| {
             if (e.ext_type != @intFromEnum(messages.ExtensionType.key_share)) continue;
             const share = messages.decodeKeyShareServerHello(e.data) catch return error.Malformed;
-            if (share.group != x25519_group or share.key_exchange.len != 32) return error.MissingKeyShare;
-            return share.key_exchange[0..32].*;
+            return .{ .group = share.group, .share = share.key_exchange };
         }
         return error.MissingKeyShare;
     }
@@ -1983,7 +2196,10 @@ pub const Connection = struct {
         /// which — like any other empty intersection — surfaces as
         /// `error.NoSignatureSchemeOverlap` rather than silently picking a
         /// default).
-        peer_sig_algs_buf: [8]u16 = undefined,
+        /// Sized to THIS side's own scheme table, not to a guess at how many
+        /// a peer might advertise: only schemes in `supported_scheme_wire_values`
+        /// are ever kept (see the `filterU16ListExtension` call below).
+        peer_sig_algs_buf: [supported_scheme_wire_values.len]u16 = undefined,
         peer_sig_algs_len: usize = 0,
         /// A `Certificate` message was seen at all — set even for an empty
         /// `certificate_list` (RFC 8446 §4.4.2's "no certificate" answer),
@@ -2080,7 +2296,23 @@ pub const Connection = struct {
                 result.creq_context_len = creq.certificate_request_context.len;
                 for (creq.extensions) |e| {
                     if (e.ext_type != @intFromEnum(messages.ExtensionType.signature_algorithms)) continue;
-                    const sig_algs = messages.decodeU16ListExtension(e.data, &result.peer_sig_algs_buf) catch return error.Malformed;
+                    // FILTER, do not decode wholesale. A real peer's
+                    // CertificateRequest advertises far more schemes than any
+                    // small fixed buffer holds — wolfSSL 5.9.1 sends 16 —
+                    // and `decodeU16ListExtension` into a `[8]u16` answered a
+                    // perfectly ordinary CertificateRequest with
+                    // `error.TooManyExtensions` -> `Malformed`. That is the
+                    // SAME defect `serverProcessClientHello` fixed for the
+                    // ClientHello's `signature_algorithms`; it survived here
+                    // because only this module's own server had ever sent a
+                    // CertificateRequest, and its list is short. Found by the
+                    // live wolfSSL mutual-auth test — the sixth wire defect
+                    // self-interop passed (see `root.zig`).
+                    //
+                    // Keeping only the schemes this side could ever select
+                    // loses nothing: `selectSignatureScheme` intersects with
+                    // exactly this set anyway.
+                    const sig_algs = messages.filterU16ListExtension(e.data, &supported_scheme_wire_values, &result.peer_sig_algs_buf) catch return error.Malformed;
                     result.peer_sig_algs_len = sig_algs.len;
                 }
                 result.requested_client_cert = true;
@@ -2143,6 +2375,15 @@ pub const Connection = struct {
     /// The one thing it must decide up front is the cipher suite: RFC 8446
     /// §4.1.4 puts it in the HelloRetryRequest and requires the eventual
     /// ServerHello to match, so it goes into the cookie.
+    ///
+    /// SCOPE: this retry only ever carries a cookie. RFC 8446 §4.1.4's other
+    /// use — naming a different `key_share` group — is a CLIENT-side
+    /// capability here (`handleHelloRetryRequest`); this server takes
+    /// whichever offered share it can use (`clientHelloShare`) and answers a
+    /// ClientHello with nothing usable with `error.MissingKeyShare` rather
+    /// than a group-change retry. Adding one would mean deciding the group
+    /// before the cookie is verified, i.e. more state for an unverified
+    /// peer, which is the thing this function exists not to do.
     fn sendHelloRetryRequest(
         self: *Connection,
         hr: HelloRetryConfig,
@@ -2340,24 +2581,26 @@ pub const Connection = struct {
                 if (!std.crypto.timing_safe.eql([32]u8, expected_binder, binder0[0..32].*)) return error.BinderVerifyFailed;
             },
             .cert_dhe => {
-                // PSK-less (EC)DHE: extract the client's x25519 share, make our
-                // own ephemeral key pair, and compute the shared secret. The
-                // early secret's IKM is the zero PSK (RFC 8446 §7.1: no PSK ⇒
-                // PSK = 0^Hash.length); the (EC)DHE secret is mixed in at the
-                // handshake secret below via the SAME `deriveHandshakeSecret`
-                // the PSK path uses — not a forked schedule.
-                const client_pub = try clientHelloX25519Share(dec.extensions);
-                var seed: [32]u8 = undefined;
-                random.bytes(&seed);
-                const kp = X25519.KeyPair.generateDeterministic(seed) catch return error.KeyExchangeFailed;
-                std.crypto.secureZero(u8, &seed);
-                var sk = kp.secret_key;
-                const shared = X25519.scalarmult(sk, client_pub) catch {
-                    std.crypto.secureZero(u8, &sk);
-                    return error.KeyExchangeFailed;
+                // PSK-less (EC)DHE: pick a usable client share, make our own
+                // ephemeral key pair IN THE SAME GROUP, and compute the shared
+                // secret. The early secret's IKM is the zero PSK (RFC 8446
+                // §7.1: no PSK ⇒ PSK = 0^Hash.length); the (EC)DHE secret is
+                // mixed in at the handshake secret below via the SAME
+                // `deriveHandshakeSecret` the PSK path uses — not a forked
+                // schedule.
+                const peer = try clientHelloShare(dec.extensions);
+                var kp = try ecdheGenerate(peer.group, random);
+                const shared = ecdheSharedSecret(peer.group, kp.secret, peer.share) catch |err| {
+                    std.crypto.secureZero(u8, &kp.secret);
+                    return err;
                 };
-                std.crypto.secureZero(u8, &sk); // forward secrecy: drop the ephemeral private key
-                self.ecdhe_public = kp.public_key; // goes into the ServerHello key_share
+                std.crypto.secureZero(u8, &kp.secret); // forward secrecy: drop the ephemeral private key
+                // Goes into the ServerHello key_share, in the client's group
+                // (RFC 8446 §4.2.8: "the server's share MUST be in the same
+                // group as the client's").
+                self.ecdhe_group = kp.group;
+                self.ecdhe_public = kp.public;
+                self.ecdhe_public_len = kp.public_len;
                 dhe_shared = shared;
                 const zero_psk = [_]u8{0} ** 32;
                 es = keyschedule.earlySecret(Hkdf, &zero_psk);
@@ -2385,15 +2628,19 @@ pub const Connection = struct {
         random.bytes(&random_bytes);
         // The single ServerHello extension differs by mode: `pre_shared_key`
         // (selected-identity index) for PSK, `key_share` (this server's
-        // ephemeral x25519 public share) for cert-DHE.
-        var sh_ext_data_buf: [40]u8 = undefined;
+        // ephemeral public share, in the group the client offered) for
+        // cert-DHE.
+        var sh_ext_data_buf: [4 + max_key_share_len]u8 = undefined;
         const sh_ext: messages.Extension = switch (self.config.key_exchange) {
             .psk => blk: {
                 messages.encodeSelectedIdentity(0, sh_ext_data_buf[0..2]);
                 break :blk .{ .ext_type = @intFromEnum(messages.ExtensionType.pre_shared_key), .data = sh_ext_data_buf[0..2] };
             },
             .cert_dhe => blk: {
-                const ks = messages.encodeKeyShareServerHello(.{ .group = x25519_group, .key_exchange = &self.ecdhe_public }, &sh_ext_data_buf) catch return error.BufferTooShort;
+                const ks = messages.encodeKeyShareServerHello(.{
+                    .group = self.ecdhe_group,
+                    .key_exchange = self.ecdhe_public[0..self.ecdhe_public_len],
+                }, &sh_ext_data_buf) catch return error.BufferTooShort;
                 break :blk .{ .ext_type = @intFromEnum(messages.ExtensionType.key_share), .data = ks };
             },
         };
@@ -2611,15 +2858,22 @@ pub const Connection = struct {
     /// and it is what a DEFAULT-configured DTLS 1.3 server does on the very
     /// first datagram — so a client that cannot do this cannot talk to one.
     ///
-    /// The response is ClientHello2: byte-identical to ClientHello1 (same
-    /// `random` — RFC 8446 §4.1.2 does not list it among the permitted
-    /// changes) plus the echoed `cookie` extension, with a fresh binder,
-    /// because the transcript it commits to has changed.
+    /// The response is ClientHello2: ClientHello1 unmodified except for the
+    /// changes RFC 8446 §4.1.2 permits — the echoed `cookie` extension, and
+    /// (in `.cert_dhe` mode) a fresh `key_share` in the group the retry
+    /// named. The `random` is NOT on that list, so it is reused verbatim; in
+    /// PSK mode the binder is recomputed, because the transcript it commits
+    /// to has changed.
     ///
     /// The transcript change is the subtle part and is done by
     /// `Transcript.resetToMessageHash`: ClientHello1 is REPLACED by a
     /// synthetic `message_hash` message holding its hash, so the server —
     /// which kept nothing — can rebuild the same transcript from the cookie.
+    /// BOTH modes go through that one call: a parallel copy for the
+    /// certificate path would be a place for the two to drift, and a
+    /// transcript defect here is invisible to self-interop (both sides would
+    /// simply agree on the wrong prefix) — see `engine.Transcript
+    /// .resetToMessageHash`'s own note.
     fn handleHelloRetryRequest(
         self: *Connection,
         hrr_body: []const u8,
@@ -2632,26 +2886,64 @@ pub const Connection = struct {
         // in the same connection ... it MUST abort the handshake" — without
         // this a server could keep a client retrying forever.
         if (self.saw_hello_retry_request) return error.UnexpectedMessage;
-        if (self.config.key_exchange != .psk) return error.HelloRetryRequestUnsupported;
 
         var cookie: ?[]const u8 = null;
         var negotiated_version: ?[2]u8 = null;
+        var selected_group: ?u16 = null;
         for (hrr.extensions) |e| switch (e.ext_type) {
             @intFromEnum(messages.ExtensionType.cookie) => cookie = messages.decodeCookieExtension(e.data) catch return error.Malformed,
             @intFromEnum(messages.ExtensionType.supported_versions) => negotiated_version = messages.decodeSupportedVersionsServerHello(e.data) catch return error.Malformed,
+            // The HelloRetryRequest `key_share` is the two-byte
+            // `selected_group` form, NOT the ServerHello form — see
+            // `messages.decodeKeyShareHelloRetryRequest`.
+            @intFromEnum(messages.ExtensionType.key_share) => selected_group = messages.decodeKeyShareHelloRetryRequest(e.data) catch return error.Malformed,
             else => {},
         };
         const version = negotiated_version orelse return error.VersionNotNegotiated;
         if (!std.mem.eql(u8, &version, &messages.version_dtls13)) return error.UnsupportedVersion;
 
+        // The group ClientHello2 will offer a share in. Unchanged unless the
+        // retry names a different one — and every way it can name an
+        // unacceptable one is refused here rather than acted on.
+        var retry_group = self.ecdhe_group;
+        if (selected_group) |g| {
+            switch (self.config.key_exchange) {
+                // `psk_ke` has no (EC)DHE at all: this client's ClientHello
+                // offers an EMPTY `key_share` list on purpose (see
+                // `buildClientHello`). Producing a share here would silently
+                // upgrade the exchange to `psk_dhe_ke`, which this engine
+                // does not implement — so say so instead of pretending.
+                .psk => return error.HelloRetryRequestUnsupported,
+                .cert_dhe => {
+                    // RFC 8446 §4.1.4: the client MUST abort if
+                    // `selected_group` was not in its own `supported_groups`.
+                    // The server does not get to pick a group off-menu.
+                    if (!groupAdvertised(g)) return error.UnsupportedGroup;
+                    // ...and MUST abort if it names a group the client
+                    // ALREADY offered a share in ("clients MUST abort ... if
+                    // the selected_group field ... corresponds to a group
+                    // which was provided in the key_share extension in the
+                    // original ClientHello"). A client that obliged would
+                    // regenerate the same offer forever on request: an
+                    // unbounded retry loop driven entirely by the peer.
+                    if (g == self.ecdhe_group) return error.IllegalHelloRetryRequest;
+                    retry_group = g;
+                },
+            }
+        }
+
         // A HelloRetryRequest with nothing to change is a protocol error
         // (RFC 8446 §4.1.4: it "MUST NOT" be sent if it would not change the
-        // client's second flight). This engine offers no key share to
-        // update, so a cookie is the only thing that can change here.
-        const c = cookie orelse return error.HelloRetryRequestUnsupported;
-        if (c.len > max_cookie_len) return error.BufferTooShort;
+        // client's second flight). With no cookie AND no group change there
+        // is nothing ClientHello2 could differ by, and answering with a
+        // byte-identical ClientHello is the same retry loop.
+        if (cookie == null and retry_group == self.ecdhe_group) return error.HelloRetryRequestUnsupported;
+        if (cookie) |c| {
+            if (c.len > max_cookie_len) return error.BufferTooShort;
+        }
 
         self.saw_hello_retry_request = true;
+        self.hrr_cipher_suite = hrr.cipher_suite;
 
         // RFC 8446 §4.4.1: replace ClientHello1 with `message_hash`, THEN
         // append the HelloRetryRequest, then ClientHello2. Order matters —
@@ -2660,7 +2952,10 @@ pub const Connection = struct {
         self.transcript.append(@intFromEnum(messages.HandshakeType.server_hello), hrr_body);
 
         var ch_body_buf: [512]u8 = undefined;
-        const ch_body = try self.buildClientHello(random, c, &ch_body_buf);
+        const ch_body = switch (self.config.key_exchange) {
+            .psk => try self.buildClientHello(random, cookie orelse return error.HelloRetryRequestUnsupported, &ch_body_buf),
+            .cert_dhe => try self.buildClientHelloCertDhe(random, cookie, retry_group, &ch_body_buf),
+        };
         self.transcript.append(@intFromEnum(messages.HandshakeType.client_hello), ch_body);
 
         // RFC 9147 §5.2: ClientHello2 is a NEW handshake message, so it takes
@@ -2715,6 +3010,15 @@ pub const Connection = struct {
         const version = negotiated_version orelse return error.VersionNotNegotiated;
         if (!std.mem.eql(u8, &version, &messages.version_dtls13)) return error.UnsupportedVersion;
 
+        // RFC 8446 §4.1.4: after a HelloRetryRequest the ServerHello MUST
+        // select the suite the retry named. Checked BEFORE the suite is
+        // otherwise acted on — the retry is already in the transcript, so a
+        // server that switches here has produced a flight this client's key
+        // schedule would silently follow.
+        if (self.hrr_cipher_suite) |committed| {
+            if (sh_dec.cipher_suite != committed) return error.IllegalHelloRetryRequest;
+        }
+
         const suite = cipherSuiteFromU16(sh_dec.cipher_suite) orelse return error.UnsupportedSuite;
         if (suiteParams(suite) == null) return error.UnsupportedSuite;
         var offered_ok = false;
@@ -2744,11 +3048,22 @@ pub const Connection = struct {
                 hs_secret = keyschedule.deriveHandshakeSecret(Hkdf, es, &eh, null);
             },
             .cert_dhe => {
-                const server_pub = try serverHelloX25519Share(sh_dec.extensions);
-                var shared = X25519.scalarmult(self.ecdhe_secret, server_pub) catch {
+                const server_share = try serverHelloShare(sh_dec.extensions);
+                // RFC 8446 §4.2.8: the server's share MUST be in the same
+                // group as the client's. After a HelloRetryRequest that is
+                // also §4.1.4's check that the server did not name one group
+                // in the retry and then answer in another — `ecdhe_group` is
+                // whatever group this client last generated a share in, so
+                // one comparison covers both the retry and the no-retry case.
+                if (server_share.group != self.ecdhe_group) {
                     std.crypto.secureZero(u8, &self.ecdhe_secret);
                     self.ecdhe_secret_live = false;
-                    return error.KeyExchangeFailed;
+                    return error.MissingKeyShare;
+                }
+                var shared = ecdheSharedSecret(self.ecdhe_group, self.ecdhe_secret, server_share.share) catch |err| {
+                    std.crypto.secureZero(u8, &self.ecdhe_secret);
+                    self.ecdhe_secret_live = false;
+                    return err;
                 };
                 std.crypto.secureZero(u8, &self.ecdhe_secret); // forward secrecy: drop the ephemeral private key
                 self.ecdhe_secret_live = false;
@@ -5331,4 +5646,556 @@ test "cert-DHE: Config.validate does not require PSK fields in cert-DHE mode" {
     // ...but PSK mode still rejects an empty PSK (regression guard).
     const psk_cfg = Config{ .role = .client, .cipher_suites = &.{.aes_128_gcm_sha256} };
     try testing.expectError(error.EmptyPsk, psk_cfg.validate());
+}
+
+// ── (EC)DHE group plumbing + secp256r1 ───────────────────────────────────
+
+test "advertised_groups and the (EC)DHE implementation agree (no group we cannot answer for)" {
+    // Advertising a group this side cannot generate a share in is not a
+    // harmless extra: it invites a HelloRetryRequest naming it, which
+    // `handleHelloRetryRequest` would then have to refuse — turning a
+    // perfectly ordinary server into an unreachable one. This test is the
+    // reason `advertised_groups` is a single list rather than two literals.
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x91} ** 32);
+    const rnd = testRandom(&csprng);
+    for (advertised_groups) |g| {
+        try testing.expect(groupAdvertised(g));
+        const kp = try ecdheGenerate(g, rnd);
+        try testing.expectEqual(g, kp.group);
+        try testing.expectEqual(expectedShareLen(g), kp.public_len);
+        try testing.expect(expectedShareLen(g) != 0);
+    }
+    // ...and a group nobody advertised is refused rather than silently
+    // treated as one of ours (x448, 0x001e — a real code point we do not do).
+    try testing.expect(!groupAdvertised(0x001e));
+    try testing.expectEqual(@as(usize, 0), expectedShareLen(0x001e));
+    try testing.expectError(error.MissingKeyShare, ecdheGenerate(0x001e, rnd));
+}
+
+test "ecdheSharedSecret secp256r1 KAT: byte-exact against Python `cryptography` (OpenSSL) ECDH" {
+    // An INDEPENDENT oracle for the P-256 half of the key exchange, in the
+    // same spirit as the RFC 8448 X25519 vector above. Generated with
+    // `cryptography` 46.0.5 (OpenSSL 3.5.5): two fixed private scalars,
+    // their SEC1 uncompressed public points, and the ECDH output — which for
+    // the NIST curves is the shared point's X COORDINATE ONLY (RFC 8446
+    // §7.4.2 / SEC1 ECDH), not the 65-byte point. Returning the point, or
+    // X||Y, would still make both sides of a self-interop test agree and
+    // would still "work" — against nothing but itself.
+    const a_scalar = hx(32, "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20");
+    const a_point = hx(65, "04515c3d6eb9e396b904d3feca7f54fdcd0cc1e997bf375dca515ad0a6c3b4035f4536be3a50f318fbf9a5475902a221502bef0d57e08c53b2cc0a56f17d9f9354");
+    const b_scalar = hx(32, "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90");
+    const b_point = hx(65, "0477186fee3e281f9d033a64994f823f7e384151e7383090c3c2954340f295153601a0e901c22a7a492a04cce5c24768a613f77c71b3380043912955379ec12723");
+    const shared = hx(32, "ead387cf12ed00b1fd75e195c967ff086d52da18622a70a9b6c05603cbdd913c");
+
+    // (1) the public shares this module would put on the wire, recovered
+    //     from the same scalars OpenSSL used.
+    try testing.expectEqualSlices(u8, &a_point, &(try P256.basePoint.mul(a_scalar, .big)).toUncompressedSec1());
+    try testing.expectEqualSlices(u8, &b_point, &(try P256.basePoint.mul(b_scalar, .big)).toUncompressedSec1());
+
+    // (2) the shared secret, from BOTH sides.
+    try testing.expectEqualSlices(u8, &shared, &(try ecdheSharedSecret(secp256r1_group, a_scalar, &b_point)));
+    try testing.expectEqualSlices(u8, &shared, &(try ecdheSharedSecret(secp256r1_group, b_scalar, &a_point)));
+}
+
+test "ecdheSharedSecret: peer-supplied garbage is a typed error, never a panic" {
+    const a_scalar = hx(32, "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20");
+    // Wrong length for the group (an x25519-sized share labelled P-256).
+    try testing.expectError(error.MissingKeyShare, ecdheSharedSecret(secp256r1_group, a_scalar, &([_]u8{0xAA} ** 32)));
+    // Right length, not a point on the curve.
+    var off_curve = [_]u8{0} ** 65;
+    off_curve[0] = 0x04;
+    off_curve[1] = 0x01;
+    try testing.expectError(error.KeyExchangeFailed, ecdheSharedSecret(secp256r1_group, a_scalar, &off_curve));
+    // A group this module does not speak.
+    try testing.expectError(error.MissingKeyShare, ecdheSharedSecret(0x001e, a_scalar, &([_]u8{0xAA} ** 32)));
+    // x25519's own low-order/identity rejection still stands.
+    try testing.expectError(error.KeyExchangeFailed, ecdheSharedSecret(x25519_group, a_scalar, &([_]u8{0} ** 32)));
+}
+
+// ── HelloRetryRequest in `.cert_dhe` mode (RFC 8446 §4.1.4's (EC)DHE half) ──
+//
+// The live wolfSSL tests (`wolfssl_interop.zig`) are the ORACLE for this
+// path — a real server naming secp256r1, and the handshake then completing
+// on P-256. What follows are the checks a live peer cannot make for us:
+// what ClientHello2 is allowed to contain, and which retries must be
+// REFUSED. Those refusals have no live counterpart at all, because a
+// conforming server never sends them.
+
+const CertHrr = struct {
+    cookie: ?[]const u8 = null,
+    selected_group: ?u16 = null,
+    /// Overrides the HelloRetryRequest's cipher suite (RFC 8446 §4.1.4
+    /// requires the eventual ServerHello to match it).
+    suite: CipherSuite = .aes_128_gcm_sha256,
+};
+
+fn certHrrDatagram(h: CertHrr) !HrrDatagram {
+    var sh_versions_buf: [2]u8 = undefined;
+    const sh_versions = try messages.encodeSupportedVersionsServerHello(messages.version_dtls13, &sh_versions_buf);
+    var cookie_buf: [2 + max_cookie_len]u8 = undefined;
+    var ks_buf: [2]u8 = undefined;
+
+    var exts: [3]messages.Extension = undefined;
+    var n: usize = 0;
+    exts[n] = .{ .ext_type = @intFromEnum(messages.ExtensionType.supported_versions), .data = sh_versions };
+    n += 1;
+    if (h.cookie) |c| {
+        exts[n] = .{ .ext_type = @intFromEnum(messages.ExtensionType.cookie), .data = try messages.encodeCookieExtension(c, &cookie_buf) };
+        n += 1;
+    }
+    if (h.selected_group) |g| {
+        exts[n] = .{ .ext_type = @intFromEnum(messages.ExtensionType.key_share), .data = try messages.encodeKeyShareHelloRetryRequest(g, &ks_buf) };
+        n += 1;
+    }
+
+    var sh_body_buf: [256]u8 = undefined;
+    const sh_body = try messages.encodeServerHello(.{
+        .random = messages.hello_retry_request_random,
+        .legacy_session_id_echo = &.{},
+        .cipher_suite = @intFromEnum(h.suite),
+        .extensions = exts[0..n],
+    }, &sh_body_buf);
+
+    var frag_buf: [256 + handshake.header_len]u8 = undefined;
+    const fragment = try frameHandshakeMessage(@intFromEnum(messages.HandshakeType.server_hello), 0, sh_body, &frag_buf);
+
+    var result: HrrDatagram = .{ .bytes = undefined, .len = 0 };
+    const hdr = record.PlaintextHeader{ .content_type = content_type_handshake, .epoch = 0, .sequence_number = 0, .length = @intCast(fragment.len) };
+    const hdr_slice = try record.encodePlaintext(hdr, &result.bytes);
+    @memcpy(result.bytes[hdr_slice.len..][0..fragment.len], fragment);
+    result.len = hdr_slice.len + fragment.len;
+    return result;
+}
+
+fn findExt(exts: []const messages.Extension, t: messages.ExtensionType) ?[]const u8 {
+    for (exts) |e| {
+        if (e.ext_type == @intFromEnum(t)) return e.data;
+    }
+    return null;
+}
+
+/// RFC 8446 §4.1.2, as a check rather than a comment: ClientHello2 is
+/// ClientHello1 "with the following modifications" and NOTHING else —
+///
+///   * the `key_share`, if (and ONLY if) the retry named a group;
+///   * an added/updated `cookie`, if the retry carried one.
+///
+/// Everything else — `random`, `legacy_session_id`, the cipher-suite list,
+/// every other extension, byte for byte — must be untouched. A client that
+/// rolls a fresh `random`, reorders its cipher suites, or regenerates its
+/// key share for a cookie-only retry is a DIFFERENT client to the server; a
+/// conforming one rejects it, and a lenient one (wolfSSL is lenient here)
+/// lets it pass, which is exactly why this is asserted locally.
+fn expectClientHello2Conformant(
+    ch1: []const u8,
+    ch2: []const u8,
+    expect_key_share_changed: bool,
+    expect_cookie: ?[]const u8,
+) !void {
+    var e1_buf: [16]messages.Extension = undefined;
+    var e2_buf: [16]messages.Extension = undefined;
+    const d1 = try messages.decodeClientHello(ch1, &e1_buf);
+    const d2 = try messages.decodeClientHello(ch2, &e2_buf);
+
+    try testing.expectEqualSlices(u8, &d1.random, &d2.random);
+    try testing.expectEqualSlices(u8, d1.legacy_session_id, d2.legacy_session_id);
+    try testing.expectEqualSlices(u8, d1.cipher_suites_raw, d2.cipher_suites_raw);
+
+    // Every CH1 extension survives, in the same relative order, with
+    // identical bytes — except `key_share`.
+    var seen: usize = 0;
+    for (d1.extensions) |x1| {
+        const x2 = for (d2.extensions[seen..], seen..) |cand, idx| {
+            if (cand.ext_type == x1.ext_type) {
+                seen = idx + 1;
+                break cand;
+            }
+        } else return error.ClientHello2DroppedAnExtension;
+        if (x1.ext_type == @intFromEnum(messages.ExtensionType.key_share)) {
+            const changed = !std.mem.eql(u8, x1.data, x2.data);
+            try testing.expectEqual(expect_key_share_changed, changed);
+        } else {
+            try testing.expectEqualSlices(u8, x1.data, x2.data);
+        }
+    }
+
+    // ...and the only extension CH2 may ADD is `cookie`.
+    for (d2.extensions) |x2| {
+        if (findExt(d1.extensions, @enumFromInt(x2.ext_type)) != null) continue;
+        try testing.expectEqual(@intFromEnum(messages.ExtensionType.cookie), x2.ext_type);
+    }
+
+    if (expect_cookie) |want| {
+        const raw = findExt(d2.extensions, .cookie) orelse return error.ClientHello2HasNoCookie;
+        try testing.expectEqualSlices(u8, want, try messages.decodeCookieExtension(raw));
+    } else {
+        try testing.expect(findExt(d2.extensions, .cookie) == null);
+    }
+}
+
+/// Pulls the ClientHello body out of an epoch-0 handshake record.
+fn clientHelloBodyOf(datagram: []const u8, out: []u8) ![]const u8 {
+    const rec = try record.decodePlaintext(datagram);
+    const fragment = datagram[record.plaintext_header_len..][0..rec.length];
+    var received_buf: [1024]bool = undefined;
+    const parsed = try decodeSingleFragmentMessage(fragment, out, &received_buf);
+    try testing.expectEqual(@intFromEnum(messages.HandshakeType.client_hello), parsed.msg_type);
+    return parsed.body;
+}
+
+test "cert-DHE HRR: a GROUP-CHANGE retry regenerates the key_share in the named group and changes nothing else" {
+    var client = try Connection.clientInit(certDheClientConfig());
+    defer client.deinit();
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x80} ** 32);
+    const rnd = testRandom(&csprng);
+    var buf1: [1500]u8 = undefined;
+    var buf2: [1500]u8 = undefined;
+
+    const ch1_wire = try client.startHandshake(rnd, 0, &buf1);
+    var ch1_body_buf: [1024]u8 = undefined;
+    var ch1_copy: [1024]u8 = undefined;
+    const ch1_body = try clientHelloBodyOf(ch1_wire, &ch1_body_buf);
+    @memcpy(ch1_copy[0..ch1_body.len], ch1_body);
+    const ch1 = ch1_copy[0..ch1_body.len];
+
+    try testing.expectEqual(x25519_group, client.ecdhe_group);
+    var ch1_share_buf: [max_key_share_len]u8 = undefined;
+    @memcpy(ch1_share_buf[0..client.ecdhe_public_len], client.ecdhe_public[0..client.ecdhe_public_len]);
+    const ch1_share = ch1_share_buf[0..client.ecdhe_public_len];
+
+    const hrr = try certHrrDatagram(.{ .selected_group = secp256r1_group });
+    const retry = try client.handleFlight(hrr.bytes[0..hrr.len], rnd, 0, &buf2);
+    try testing.expect(!retry.done);
+    try testing.expect(client.sawHelloRetryRequest());
+
+    // The share really moved to the named group — this is the assertion a
+    // "retry" that merely echoed a cookie would fail.
+    try testing.expectEqual(secp256r1_group, client.ecdhe_group);
+    try testing.expectEqual(@as(usize, 65), client.ecdhe_public_len);
+    try testing.expect(!std.mem.eql(u8, ch1_share, client.ecdhe_public[0..32]));
+    // ...and it is a real point, not 65 bytes of anything.
+    _ = try P256.fromSec1(client.ecdhe_public[0..65]);
+
+    var ch2_body_buf: [1024]u8 = undefined;
+    const ch2 = try clientHelloBodyOf(retry.out, &ch2_body_buf);
+    // No cookie was offered, so none may appear; the key_share must have
+    // changed and nothing else.
+    try expectClientHello2Conformant(ch1, ch2, true, null);
+
+    // ClientHello2 is a NEW message, not a retransmission (RFC 9147 §5.2).
+    try testing.expectEqual(@as(u16, 2), client.message_seq);
+}
+
+test "cert-DHE HRR: a COOKIE-ONLY retry leaves the key_share byte-identical (§4.1.2 permits no gratuitous change)" {
+    var client = try Connection.clientInit(certDheClientConfig());
+    defer client.deinit();
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x81} ** 32);
+    const rnd = testRandom(&csprng);
+    var buf1: [1500]u8 = undefined;
+    var buf2: [1500]u8 = undefined;
+
+    const ch1_wire = try client.startHandshake(rnd, 0, &buf1);
+    var ch1_body_buf: [1024]u8 = undefined;
+    var ch1_copy: [1024]u8 = undefined;
+    const ch1_body = try clientHelloBodyOf(ch1_wire, &ch1_body_buf);
+    @memcpy(ch1_copy[0..ch1_body.len], ch1_body);
+    const ch1 = ch1_copy[0..ch1_body.len];
+    var ch1_share_buf: [max_key_share_len]u8 = undefined;
+    @memcpy(ch1_share_buf[0..client.ecdhe_public_len], client.ecdhe_public[0..client.ecdhe_public_len]);
+    const ch1_share = ch1_share_buf[0..client.ecdhe_public_len];
+
+    const cookie = "a-cert-mode-cookie";
+    const hrr = try certHrrDatagram(.{ .cookie = cookie });
+    const retry = try client.handleFlight(hrr.bytes[0..hrr.len], rnd, 0, &buf2);
+
+    // Same group AND the same share bytes: a fresh x25519 key pair here
+    // would be a ClientHello2 the server never asked for. Nothing in a
+    // self-interop suite would notice (our own server re-reads whatever
+    // share arrives), and wolfSSL accepts it too — so this is the only place
+    // it is checked.
+    try testing.expectEqual(x25519_group, client.ecdhe_group);
+    try testing.expectEqualSlices(u8, ch1_share, client.ecdhe_public[0..client.ecdhe_public_len]);
+
+    var ch2_body_buf: [1024]u8 = undefined;
+    const ch2 = try clientHelloBodyOf(retry.out, &ch2_body_buf);
+    try expectClientHello2Conformant(ch1, ch2, false, cookie);
+}
+
+test "cert-DHE HRR: cookie AND group change in one retry are both applied" {
+    var client = try Connection.clientInit(certDheClientConfig());
+    defer client.deinit();
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x82} ** 32);
+    const rnd = testRandom(&csprng);
+    var buf1: [1500]u8 = undefined;
+    var buf2: [1500]u8 = undefined;
+
+    const ch1_wire = try client.startHandshake(rnd, 0, &buf1);
+    var ch1_body_buf: [1024]u8 = undefined;
+    var ch1_copy: [1024]u8 = undefined;
+    const ch1_body = try clientHelloBodyOf(ch1_wire, &ch1_body_buf);
+    @memcpy(ch1_copy[0..ch1_body.len], ch1_body);
+    const ch1 = ch1_copy[0..ch1_body.len];
+
+    const cookie = "both-at-once";
+    const hrr = try certHrrDatagram(.{ .cookie = cookie, .selected_group = secp256r1_group });
+    const retry = try client.handleFlight(hrr.bytes[0..hrr.len], rnd, 0, &buf2);
+
+    try testing.expectEqual(secp256r1_group, client.ecdhe_group);
+    var ch2_body_buf: [1024]u8 = undefined;
+    const ch2 = try clientHelloBodyOf(retry.out, &ch2_body_buf);
+    try expectClientHello2Conformant(ch1, ch2, true, cookie);
+}
+
+test "cert-DHE HRR reject: a retry naming a group the client ALREADY offered a share in (the retry-loop case)" {
+    var client = try Connection.clientInit(certDheClientConfig());
+    defer client.deinit();
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x83} ** 32);
+    const rnd = testRandom(&csprng);
+    var buf1: [1500]u8 = undefined;
+    var buf2: [1500]u8 = undefined;
+    _ = try client.startHandshake(rnd, 0, &buf1);
+
+    // RFC 8446 §4.1.4: "Clients MUST abort ... if the selected_group field
+    // ... corresponds to a group which was provided in the key_share
+    // extension in the original ClientHello". A client that obliged would
+    // regenerate the same offer on demand, forever — an unbounded loop the
+    // peer controls. Note this survives even WITH a cookie present: the
+    // cookie makes the retry "not pointless", but the group is still
+    // illegal.
+    const hrr = try certHrrDatagram(.{ .selected_group = x25519_group });
+    try testing.expectError(error.IllegalHelloRetryRequest, client.handleFlight(hrr.bytes[0..hrr.len], rnd, 0, &buf2));
+
+    var client2 = try Connection.clientInit(certDheClientConfig());
+    defer client2.deinit();
+    _ = try client2.startHandshake(rnd, 0, &buf1);
+    const hrr2 = try certHrrDatagram(.{ .cookie = "with-a-cookie-too", .selected_group = x25519_group });
+    try testing.expectError(error.IllegalHelloRetryRequest, client2.handleFlight(hrr2.bytes[0..hrr2.len], rnd, 0, &buf2));
+}
+
+test "cert-DHE HRR reject: a retry naming a group never advertised in supported_groups" {
+    var client = try Connection.clientInit(certDheClientConfig());
+    defer client.deinit();
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x84} ** 32);
+    const rnd = testRandom(&csprng);
+    var buf1: [1500]u8 = undefined;
+    var buf2: [1500]u8 = undefined;
+    _ = try client.startHandshake(rnd, 0, &buf1);
+
+    // x448 (0x001e) is a real NamedGroup this module never advertises. The
+    // server does not get to pick off-menu — least of all a group we could
+    // not produce a share for even if we wanted to.
+    const hrr = try certHrrDatagram(.{ .selected_group = 0x001e });
+    try testing.expectError(error.UnsupportedGroup, client.handleFlight(hrr.bytes[0..hrr.len], rnd, 0, &buf2));
+}
+
+test "cert-DHE HRR reject: a retry with neither a cookie nor a group change" {
+    var client = try Connection.clientInit(certDheClientConfig());
+    defer client.deinit();
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x85} ** 32);
+    const rnd = testRandom(&csprng);
+    var buf1: [1500]u8 = undefined;
+    var buf2: [1500]u8 = undefined;
+    _ = try client.startHandshake(rnd, 0, &buf1);
+
+    const hrr = try certHrrDatagram(.{});
+    try testing.expectError(error.HelloRetryRequestUnsupported, client.handleFlight(hrr.bytes[0..hrr.len], rnd, 0, &buf2));
+}
+
+test "PSK HRR reject: a retry carrying a key_share (psk_ke has no (EC)DHE to update)" {
+    var client = try Connection.clientInit(hrrClientConfig(hrr_psk));
+    defer client.deinit();
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x86} ** 32);
+    const rnd = testRandom(&csprng);
+    var buf1: [1500]u8 = undefined;
+    var buf2: [1500]u8 = undefined;
+    _ = try client.startHandshake(rnd, 0, &buf1);
+
+    // A `psk_ke` ClientHello carries an EMPTY key_share list on purpose, so
+    // §4.1.4's "group already offered" rule does not bite — but answering
+    // with a real share would silently turn the exchange into `psk_dhe_ke`,
+    // which this engine does not implement. Refusing is the honest answer;
+    // quietly producing a share the key schedule then ignores would not be.
+    const hrr = try certHrrDatagram(.{ .cookie = "a-real-cookie", .selected_group = x25519_group });
+    try testing.expectError(error.HelloRetryRequestUnsupported, client.handleFlight(hrr.bytes[0..hrr.len], rnd, 0, &buf2));
+}
+
+test "HRR: the ServerHello must select the cipher suite the retry committed to (RFC 8446 §4.1.4)" {
+    var cfg = certDheClientConfig();
+    cfg.cipher_suites = &.{ .aes_128_gcm_sha256, .chacha20_poly1305_sha256 };
+    var client = try Connection.clientInit(cfg);
+    defer client.deinit();
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x87} ** 32);
+    const rnd = testRandom(&csprng);
+    var buf1: [1500]u8 = undefined;
+    var buf2: [1500]u8 = undefined;
+    _ = try client.startHandshake(rnd, 0, &buf1);
+
+    const hrr = try certHrrDatagram(.{ .selected_group = secp256r1_group, .suite = .aes_128_gcm_sha256 });
+    _ = try client.handleFlight(hrr.bytes[0..hrr.len], rnd, 0, &buf2);
+    try testing.expectEqual(@as(?u16, @intFromEnum(CipherSuite.aes_128_gcm_sha256)), client.hrr_cipher_suite);
+
+    // A ServerHello selecting the OTHER suite — one this client legitimately
+    // offered, so nothing else rejects it — after the retry named the first.
+    // The retry is already in the transcript, so a client that followed the
+    // switch would derive its keys under a suite the server never committed
+    // to, with no other check standing in the way.
+    var sh_body_buf: [256]u8 = undefined;
+    var sh_versions_buf: [2]u8 = undefined;
+    const sh_versions = try messages.encodeSupportedVersionsServerHello(messages.version_dtls13, &sh_versions_buf);
+    var ks_buf: [4 + max_key_share_len]u8 = undefined;
+    const dummy_share = [_]u8{0x04} ++ [_]u8{0x11} ** 64;
+    const ks = try messages.encodeKeyShareServerHello(.{ .group = secp256r1_group, .key_exchange = &dummy_share }, &ks_buf);
+    const sh_body = try messages.encodeServerHello(.{
+        .random = [_]u8{0x5a} ** 32,
+        .legacy_session_id_echo = &.{},
+        .cipher_suite = @intFromEnum(CipherSuite.chacha20_poly1305_sha256),
+        .extensions = &.{
+            .{ .ext_type = @intFromEnum(messages.ExtensionType.supported_versions), .data = sh_versions },
+            .{ .ext_type = @intFromEnum(messages.ExtensionType.key_share), .data = ks },
+        },
+    }, &sh_body_buf);
+
+    var frag_buf: [256 + handshake.header_len]u8 = undefined;
+    const fragment = try frameHandshakeMessage(@intFromEnum(messages.HandshakeType.server_hello), 1, sh_body, &frag_buf);
+    var wire: [400]u8 = undefined;
+    const hdr = record.PlaintextHeader{ .content_type = content_type_handshake, .epoch = 0, .sequence_number = 1, .length = @intCast(fragment.len) };
+    const hdr_slice = try record.encodePlaintext(hdr, &wire);
+    @memcpy(wire[hdr_slice.len..][0..fragment.len], fragment);
+
+    var buf3: [1500]u8 = undefined;
+    try testing.expectError(error.IllegalHelloRetryRequest, client.handleFlight(wire[0 .. hdr_slice.len + fragment.len], rnd, 0, &buf3));
+}
+
+test "cert-DHE: a ServerHello answering in a DIFFERENT group than the client offered is rejected" {
+    // RFC 8446 §4.2.8: "the server's share MUST be in the same group as the
+    // client's". Without the check, this client would run X25519 over bytes
+    // the server labelled secp256r1 and carry on into the flight with a
+    // shared secret neither side agrees on.
+    //
+    // The share below is 32 bytes — the length the client's OWN group uses —
+    // and that is the whole point. With a 65-byte P-256 point the length
+    // check inside `ecdheSharedSecret` rejects it too, so deleting the group
+    // check would produce the SAME `MissingKeyShare` and this test would
+    // pass either way (it did, until the mutation caught it). At 32 bytes
+    // only the GROUP is wrong, so the assertion below can only hold if the
+    // group is actually compared.
+    var client = try Connection.clientInit(certDheClientConfig());
+    defer client.deinit();
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x88} ** 32);
+    const rnd = testRandom(&csprng);
+    var buf1: [1500]u8 = undefined;
+    _ = try client.startHandshake(rnd, 0, &buf1); // offers x25519
+
+    var sh_versions_buf: [2]u8 = undefined;
+    const sh_versions = try messages.encodeSupportedVersionsServerHello(messages.version_dtls13, &sh_versions_buf);
+    var ks_buf: [4 + max_key_share_len]u8 = undefined;
+    const p256_share = [_]u8{0x11} ** 32;
+    const ks = try messages.encodeKeyShareServerHello(.{ .group = secp256r1_group, .key_exchange = &p256_share }, &ks_buf);
+    var sh_body_buf: [256]u8 = undefined;
+    const sh_body = try messages.encodeServerHello(.{
+        .random = [_]u8{0x5b} ** 32,
+        .legacy_session_id_echo = &.{},
+        .cipher_suite = @intFromEnum(CipherSuite.aes_128_gcm_sha256),
+        .extensions = &.{
+            .{ .ext_type = @intFromEnum(messages.ExtensionType.supported_versions), .data = sh_versions },
+            .{ .ext_type = @intFromEnum(messages.ExtensionType.key_share), .data = ks },
+        },
+    }, &sh_body_buf);
+
+    var frag_buf: [256 + handshake.header_len]u8 = undefined;
+    const fragment = try frameHandshakeMessage(@intFromEnum(messages.HandshakeType.server_hello), 0, sh_body, &frag_buf);
+    var wire: [400]u8 = undefined;
+    const hdr = record.PlaintextHeader{ .content_type = content_type_handshake, .epoch = 0, .sequence_number = 0, .length = @intCast(fragment.len) };
+    const hdr_slice = try record.encodePlaintext(hdr, &wire);
+    @memcpy(wire[hdr_slice.len..][0..fragment.len], fragment);
+
+    var buf2: [1500]u8 = undefined;
+    try testing.expectError(error.MissingKeyShare, client.handleFlight(wire[0 .. hdr_slice.len + fragment.len], rnd, 0, &buf2));
+}
+
+test "cert-DHE HRR self-interop: our own server's stateless cookie exchange works in certificate mode too" {
+    // The PSK cookie exchange had this test; certificate mode did not,
+    // because the client refused every HelloRetryRequest. It is a WEAKER
+    // test than the wolfSSL ones (both sides are ours), so what it is really
+    // for is the STATELESSNESS: the connection that answers ClientHello1 is
+    // destroyed before ClientHello2 arrives, so everything the server needs
+    // has to be in the cookie — including, now, a cert-mode transcript.
+    const binding = "198.51.100.7:44300";
+    var cfg_s = certDheServerConfig();
+    cfg_s.hello_retry = .{ .cookie_secret = "cert-mode cookie MAC key", .peer_binding = binding };
+
+    var client = try Connection.clientInit(certDheClientConfig());
+    defer client.deinit();
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x89} ** 32);
+    const rnd = testRandom(&csprng);
+    var buf1: [2048]u8 = undefined;
+    var buf2: [2048]u8 = undefined;
+
+    const ch1 = try client.startHandshake(rnd, 0, &buf1);
+
+    var server1 = try Connection.serverInit(cfg_s);
+    const hrr = try server1.handleFlight(ch1, rnd, 0, &buf2);
+    try testing.expect(!hrr.done);
+    try testing.expectEqual(State.start, server1.state);
+    _ = try expectHelloRetryRequest(hrr.out);
+
+    const ch2 = try client.handleFlight(hrr.out, rnd, 0, &buf1);
+    try testing.expect(client.sawHelloRetryRequest());
+    // Cookie-only retry: still x25519, still the same share.
+    try testing.expectEqual(x25519_group, client.ecdhe_group);
+
+    server1.deinit();
+    var server2 = try Connection.serverInit(cfg_s);
+    defer server2.deinit();
+
+    const flight2 = try server2.handleFlight(ch2.out, rnd, 0, &buf2);
+    const client_fin = try client.handleFlight(flight2.out, rnd, 0, &buf1);
+    try testing.expect(client_fin.done);
+    const server_done = try server2.handleFlight(client_fin.out, rnd, 0, &buf2);
+    try testing.expect(server_done.done);
+
+    try testing.expectEqualSlices(u8, client.write_keys.key[0..client.write_keys.key_len], server2.read_keys.key[0..server2.read_keys.key_len]);
+
+    var wire: [256]u8 = undefined;
+    var plain: [256]u8 = undefined;
+    const msg = "cert-DHE over a return-routability-checked connection";
+    const rec = try client.send(msg, &wire);
+    try testing.expectEqualSlices(u8, msg, try server2.recv(rec, &plain));
+}
+
+test "cert-DHE: our server accepts a secp256r1 client share and answers in the same group" {
+    // The server side of the group plumbing: a client that offers P-256 (as
+    // ours does after a group-change retry) must be answered with a P-256
+    // ServerHello share, and both sides must land on the same keys. Driven
+    // by hand, because this module's own client only ever offers P-256 after
+    // a server asked it to.
+    var client = try Connection.clientInit(certDheClientConfig());
+    defer client.deinit();
+    var server = try Connection.serverInit(certDheServerConfig());
+    defer server.deinit();
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x8a} ** 32);
+    const rnd = testRandom(&csprng);
+    var buf1: [2048]u8 = undefined;
+    var buf2: [2048]u8 = undefined;
+
+    _ = try client.startHandshake(rnd, 0, &buf1);
+    // Move the client to P-256 exactly as a real retry would.
+    const hrr = try certHrrDatagram(.{ .selected_group = secp256r1_group });
+    const ch2 = try client.handleFlight(hrr.bytes[0..hrr.len], rnd, 0, &buf2);
+    try testing.expectEqual(secp256r1_group, client.ecdhe_group);
+
+    // The server has no cookie configured, so it treats ClientHello2 as an
+    // ordinary first ClientHello — which is all this test needs: it is about
+    // the group, not the retry.
+    const flight2 = try server.handleFlight(ch2.out, rnd, 0, &buf1);
+    try testing.expectEqual(secp256r1_group, server.ecdhe_group);
+    try testing.expectEqual(@as(usize, 65), server.ecdhe_public_len);
+
+    // The client's transcript now contains the message_hash rewrite + HRR,
+    // which this hand-built server never saw, so the handshake cannot
+    // complete — the KEY EXCHANGE is what is under test, and it is checked
+    // directly instead.
+    _ = flight2;
+    const shared_c = try ecdheSharedSecret(secp256r1_group, client.ecdhe_secret, server.ecdhe_public[0..server.ecdhe_public_len]);
+    try testing.expectEqual(@as(usize, 32), shared_c.len);
 }

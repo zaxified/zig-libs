@@ -8,14 +8,18 @@
 //!     unchanged PSK key exchange — see `Connection.zig`'s "certificate mode"
 //!     section for the full design + deferred-scope notes.
 //!   - `.cert_dhe`: a PSK-LESS certificate-only handshake with ephemeral
-//!     (EC)DHE (X25519, RFC 8446 §4.2.8 `key_share`) for forward secrecy —
-//!     the standard TLS-1.3 `certificate` handshake. The ECDHE shared secret
-//!     is fed into the SAME key schedule (`keyschedule.deriveHandshakeSecret`
-//!     with a zero-PSK early secret, RFC 8446 §7.1 — the schedule was already
-//!     DHE-capable; no forked crypto), and certificate auth reuses the same
-//!     `certverify`/`certauth` plumbing. Validated: the X25519 key_share +
-//!     key-schedule feed against RFC 8448 §3's external ECDHE vector; the
-//!     full flow by client↔server self-interop (server-only + mutual auth).
+//!     (EC)DHE (RFC 8446 §4.2.8 `key_share`) for forward secrecy — the
+//!     standard TLS-1.3 `certificate` handshake. TWO groups are wired:
+//!     **X25519** (offered by default) and **secp256r1** (offered when a
+//!     server asks for it in a HelloRetryRequest — see the HRR section
+//!     below). The ECDHE shared secret is fed into the SAME key schedule
+//!     (`keyschedule.deriveHandshakeSecret` with a zero-PSK early secret,
+//!     RFC 8446 §7.1 — the schedule was already DHE-capable; no forked
+//!     crypto), and certificate auth reuses the same `certverify`/`certauth`
+//!     plumbing. Validated: the X25519 key_share + key-schedule feed against
+//!     RFC 8448 §3's external ECDHE vector, the secp256r1 ECDH against a
+//!     Python-`cryptography`/OpenSSL vector (X coordinate only, RFC 8446
+//!     §7.4.2), and the full flow against a live wolfSSL peer in BOTH roles.
 //! Certificate mode reuses `std.crypto.Certificate.Parsed.verify` for the
 //! actual issuer/validity/signature checks plus this module's existing
 //! `rsa` dependency (`certauth.zig`), but — unlike an earlier pass of this
@@ -100,9 +104,23 @@
 //!   are proven by the same external oracle. That found a FIFTH defect of
 //!   the same shape as the four above: the `.cert_dhe` ClientHello carried
 //!   no `supported_versions`, so a real DTLS 1.3 server negotiated 1.2.
-//!   What remains self-interop only inside certificate mode is MUTUAL
-//!   authentication (our own client certificate has never been checked by a
-//!   third party) and our server presenting a chain to a third-party client.
+//!
+//!   Certificate mode is now live in BOTH DIRECTIONS and BOTH IDENTITIES —
+//!   the two gaps an earlier version of this note flagged are closed:
+//!     * MUTUAL authentication: a wolfSSL server configured
+//!       `VERIFY_PEER | FAIL_IF_NO_PEER_CERT`, with the fixture anchor as
+//!       its only trusted CA, verifies OUR client's Certificate +
+//!       CertificateVerify;
+//!     * our SERVER's chain: a real wolfSSL certificate client verifies what
+//!       we present (`wolfSSL_get_verify_result` asserted inside the peer)
+//!       and round-trips application data under the keys our server derived.
+//!   The first of those found a SIXTH defect of exactly the same family: the
+//!   client decoded a CertificateRequest's `signature_algorithms` with
+//!   `decodeU16ListExtension` into a fixed `[8]u16`, so a real peer's list
+//!   (wolfSSL sends 16) came back `error.TooManyExtensions` -> `Malformed`.
+//!   The ClientHello path had already been fixed the same way, against the
+//!   same peer; the CertificateRequest path survived because only this
+//!   module's own server had ever sent one.
 //!
 //! **Certificate mode (RFC 8446 §4.4, ADDITIVE):** `Connection.Config` gains
 //! optional `cert`/`peer_verify`/`request_client_cert`/`require_peer_cert`/
@@ -112,10 +130,14 @@
 //! messages, reusing `certverify.sign`/`.verify` for the signature and
 //! `certauth.zig` (a `std.crypto.Certificate` + this module's `rsa`
 //! dependency bridge — no new module dependency) for DER parsing and a
-//! minimal one-hop chain-to-trust-anchor check. The PSK still supplies ALL
-//! session-key material unchanged (this engine has no (EC)DHE key-share
-//! machinery — real new crypto, out of scope); certificates add a real
-//! signature-based identity check ON TOP, not a replacement key exchange.
+//! minimal one-hop chain-to-trust-anchor check. In `.psk` mode the PSK still
+//! supplies ALL session-key material unchanged — that mode stays `psk_ke`
+//! and the certificates add a real signature-based identity check ON TOP,
+//! not a replacement key exchange. (The (EC)DHE machinery an earlier version
+//! of this note called "out of scope" does exist, but it belongs to
+//! `.cert_dhe`; wiring it into `psk_ke` would make the exchange
+//! `psk_dhe_ke`, which this engine still does not do — see
+//! `HelloRetryRequestUnsupported`.)
 //! See `Connection.zig`'s "certificate mode" section for the full design
 //! rationale. `signature_algorithms` extension negotiation (RFC 8446 §4.2.3)
 //! IS implemented (`Connection.zig`'s `selectSignatureScheme` +
@@ -136,8 +158,29 @@
 //! extensions (`messages.zig`).
 //!
 //! **HelloRetryRequest / the stateless-cookie exchange (RFC 9147 §5.1, RFC
-//! 8446 §4.1.4/§4.2.2):** implemented in BOTH roles and proven against
-//! wolfSSL in both. A client always answers one. A server performs the
+//! 8446 §4.1.4/§4.2.2):** implemented in BOTH roles, BOTH key-exchange
+//! modes, and proven against wolfSSL in each. A client always answers one:
+//!   * the COOKIE half (`psk_ke` and `.cert_dhe` alike) — echo it back in a
+//!     ClientHello2 that is otherwise ClientHello1 verbatim;
+//!   * the (EC)DHE half (`.cert_dhe` only, RFC 8446 §4.1.4) — when the retry
+//!     names a `supported_groups` group other than the one we offered a
+//!     share in, generate a FRESH share in that group. That is what makes
+//!     secp256r1 a real group here rather than an advertisement we could not
+//!     honour. Live-anchored three ways against a wolfSSL certificate
+//!     server: cookie only, group change only (wolfSSL restricted to
+//!     secp256r1 with its cookie exchange off, so the retry's sole content
+//!     is the group), and both in one retry.
+//! The refusals matter as much as the retry: a second HelloRetryRequest, one
+//! naming a group we never advertised (`error.UnsupportedGroup`), one naming
+//! a group we ALREADY offered a share in (`error.IllegalHelloRetryRequest` —
+//! a client that obliged could be driven round a retry loop by the peer),
+//! one with nothing to change at all, and a ServerHello that switches cipher
+//! suite after the retry committed to one. None of those has a live
+//! counterpart, because no conforming server sends them.
+//! A cookie-only retry deliberately leaves the `key_share` BYTE-IDENTICAL:
+//! §4.1.2 permits the listed changes and no others, and a gratuitously
+//! regenerated share is the same class of violation as a fresh `random`.
+//! A server performs the
 //! return-routability check when `Config.hello_retry` is set — it answers a
 //! cookie-less ClientHello with a HelloRetryRequest and keeps NOTHING,
 //! rebuilding the transcript on ClientHello2 from the cookie alone (RFC 8446

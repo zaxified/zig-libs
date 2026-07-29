@@ -27,7 +27,12 @@ const testing = std.testing;
 
 const Connection = @import("Connection.zig").Connection;
 const Config = @import("Connection.zig").Config;
+const certverify = @import("certverify.zig");
+const messages = @import("messages.zig");
 const cert_kat = @import("certauth_kat_vectors.zig");
+
+const x25519_group: u16 = @intFromEnum(messages.NamedGroup.x25519);
+const secp256r1_group: u16 = @intFromEnum(messages.NamedGroup.secp256r1);
 
 /// Test fixtures — duplicated verbatim in `testdata/wolfssl_peer.c`. Test
 /// material only; nothing here is a default for anything.
@@ -92,6 +97,19 @@ fn freeLoopbackPort(io: std.Io) !u16 {
     const sock = try addr.bind(io, .{ .mode = .dgram });
     defer sock.close(io);
     return sock.address.getPort();
+}
+
+/// One line of the peer's stdout, delimiter consumed.
+///
+/// NOT `takeDelimiterExclusive`: that tosses only the line's own bytes and
+/// leaves the `'\n'` in the stream, so the NEXT call sees the delimiter at
+/// position 0 and returns an empty slice — forever. A test that reads a
+/// single line never notices; one that reads two gets `""` for the second
+/// and every one after it. `takeDelimiterInclusive` consumes the delimiter,
+/// and the `\n` is trimmed here.
+fn peerLine(reader: *std.Io.Reader) ![]const u8 {
+    const raw = try reader.takeDelimiterInclusive('\n');
+    return std.mem.trimEnd(u8, raw, "\n");
 }
 
 /// A peer that stops answering must fail the test, not wedge the suite.
@@ -197,7 +215,7 @@ fn clientAgainstWolfsslServer(peer_mode: []const u8, expect: Expect) !void {
     // the socket, so a datagram sent afterwards cannot be lost.
     var ready_buf: [64]u8 = undefined;
     var stdout_reader = child.stdout.?.reader(io, &ready_buf);
-    const ready_line = stdout_reader.interface.takeDelimiterExclusive('\n') catch {
+    const ready_line = peerLine(&stdout_reader.interface) catch {
         if (verboseSkip()) std.debug.print("\nSKIPPED: LIVE dtls wolfSSL interop: peer never printed READY.\n", .{});
         return error.SkipZigTest;
     };
@@ -510,13 +528,24 @@ fn serverKeySec1Der() [121]u8 {
     return out;
 }
 
-/// A wolfSSL certificate server needs the leaf and its key as files; both
-/// come from this repo's own fixtures, so the anchor the Zig client trusts
-/// and the chain wolfSSL presents are the same material by construction.
+/// A wolfSSL certificate peer needs the leaf, its key and the trust anchor
+/// as files; all three come from this repo's own fixtures, so the anchor the
+/// Zig side trusts and the material wolfSSL uses are the same blobs by
+/// construction — "wolfSSL accepted it" cannot degrade into "wolfSSL trusted
+/// something else".
 fn writeCertFixtures(io: std.Io, dir: std.Io.Dir) !void {
     try dir.writeFile(io, .{ .sub_path = "server-cert.der", .data = &cert_kat.server_cert_der });
     const key = serverKeySec1Der();
     try dir.writeFile(io, .{ .sub_path = "server-key.der", .data = &key });
+    try dir.writeFile(io, .{ .sub_path = "anchor-cert.der", .data = &cert_kat.anchor_cert_der });
+}
+
+fn clientEcdsaKeyPair() certverify.SecretKey {
+    return .{ .ecdsa_p256 = std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey.fromBytes(cert_kat.client_secret_key_bytes) catch unreachable };
+}
+
+fn serverEcdsaKeyPair() certverify.SecretKey {
+    return .{ .ecdsa_p256 = std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey.fromBytes(cert_kat.server_secret_key_bytes) catch unreachable };
 }
 
 // Certificate mode had never met a third-party peer: every Certificate /
@@ -535,14 +564,99 @@ fn writeCertFixtures(io: std.Io, dir: std.Io.Dir) !void {
 // fragmented path cannot hide behind the easy one.
 
 test "LIVE wolfSSL peer: our cert client completes a PSK-less X25519+ECDSA DTLS 1.3 handshake against wolfSSL" {
-    try certClientAgainstWolfssl(0);
+    try certClientAgainstWolfssl(.{ .peer_mode = "server-cert" });
 }
 
 test "LIVE wolfSSL peer: the same certificate handshake at a 256-byte peer MTU — wolfSSL fragments its Certificate and we reassemble it" {
-    try certClientAgainstWolfssl(256);
+    try certClientAgainstWolfssl(.{ .peer_mode = "server-cert", .mtu = 256 });
 }
 
-fn certClientAgainstWolfssl(mtu: u16) !void {
+// ── HelloRetryRequest in CERTIFICATE mode (RFC 8446 §4.1.4) ───────────────
+//
+// Three live cases, because a HelloRetryRequest can ask for two independent
+// things and a client can be wrong about either one alone:
+//
+//   1. cookie only — a default-configured wolfSSL certificate server. The
+//      group is fine; only the return-routability cookie has to come back.
+//      This is the same code path the PSK-mode retry test already covers,
+//      but reached with a `.cert_dhe` ClientHello, which is a DIFFERENT
+//      ClientHello builder: it has to reuse `random`, re-emit every other
+//      extension unchanged, and add the cookie.
+//
+//   2. group change only — wolfSSL restricted to secp256r1, cookie exchange
+//      OFF. Our ClientHello offers an x25519 share, which this server cannot
+//      use, so it answers with a HelloRetryRequest whose ONLY content is
+//      `key_share = secp256r1`. This is the half that did not exist before:
+//      the client must generate a FRESH share in the named group, and the
+//      handshake then runs on P-256 ECDHE end to end. Nothing in this repo
+//      can check that arithmetic against itself — our own server never asks
+//      for a group change — so wolfSSL completing the handshake and
+//      decrypting our application data is the whole proof.
+//
+//   3. both at once — cookie AND group change in one retry, which is what a
+//      stock server behind a return-routability check actually sends.
+//
+// The `expect_*` fields are what stops these degrading into copies of the
+// no-retry test if wolfSSL's defaults ever change: a run that quietly did
+// not retry, or retried but stayed on x25519, fails.
+
+test "LIVE wolfSSL peer: our cert client answers a cookie-only HelloRetryRequest from a default-configured wolfSSL certificate server" {
+    try certClientAgainstWolfssl(.{
+        .peer_mode = "server-cert-hrr",
+        .expect_hello_retry_request = true,
+        .expect_group = x25519_group,
+    });
+}
+
+test "LIVE wolfSSL peer: our cert client answers a GROUP-CHANGE HelloRetryRequest — wolfSSL names secp256r1, we generate a fresh P-256 key_share and the handshake completes on it" {
+    try certClientAgainstWolfssl(.{
+        .peer_mode = "server-cert-p256",
+        .expect_hello_retry_request = true,
+        .expect_group = secp256r1_group,
+    });
+}
+
+test "LIVE wolfSSL peer: a HelloRetryRequest carrying BOTH a cookie and a group change is answered with one ClientHello2 that does both" {
+    try certClientAgainstWolfssl(.{
+        .peer_mode = "server-cert-p256-hrr",
+        .expect_hello_retry_request = true,
+        .expect_group = secp256r1_group,
+    });
+}
+
+// ── mutual authentication, live ──────────────────────────────────────────
+//
+// Until this test, every Certificate + CertificateVerify our CLIENT had ever
+// produced was checked by our own server — the exact self-interop shape that
+// hid five wire defects on the PSK/cert side (see `root.zig`). Here wolfSSL
+// is configured with `VERIFY_PEER | FAIL_IF_NO_PEER_CERT` and the fixture
+// anchor as its only trusted CA, so `wolfSSL_accept` cannot succeed unless a
+// third party parsed our certificate chain, chained it to the anchor, and
+// verified our CertificateVerify signature over its own transcript.
+test "LIVE wolfSSL peer: a wolfSSL server that REQUIRES a client certificate verifies OURS (mutual auth, third-party checked)" {
+    try certClientAgainstWolfssl(.{
+        .peer_mode = "server-cert-mutual",
+        .client_cert = true,
+        .expect_peer_cert_subject = "dtls-test-client",
+    });
+}
+
+const CertCase = struct {
+    peer_mode: []const u8,
+    /// Non-zero forces wolfSSL to fragment its Certificate flight.
+    mtu: u16 = 0,
+    /// Asserted after the handshake — see the block comment above.
+    expect_hello_retry_request: bool = false,
+    /// The group the handshake finally ran on.
+    expect_group: u16 = x25519_group,
+    /// Present our own client certificate when asked.
+    client_cert: bool = false,
+    /// When set, the peer must print `PEERCERT <…subject…>` containing this,
+    /// i.e. it really looked at the certificate we sent.
+    expect_peer_cert_subject: ?[]const u8 = null,
+};
+
+fn certClientAgainstWolfssl(case: CertCase) !void {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const gpa = testing.allocator;
     const io = testing.io;
@@ -556,10 +670,10 @@ fn certClientAgainstWolfssl(mtu: u16) !void {
     var port_buf: [8]u8 = undefined;
     const port_str = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
     var mtu_buf: [8]u8 = undefined;
-    const mtu_str = try std.fmt.bufPrint(&mtu_buf, "{d}", .{mtu});
+    const mtu_str = try std.fmt.bufPrint(&mtu_buf, "{d}", .{case.mtu});
 
     var child = try std.process.spawn(io, .{
-        .argv = &.{ "./wolfssl_peer", "server-cert", port_str, mtu_str },
+        .argv = &.{ "./wolfssl_peer", case.peer_mode, port_str, mtu_str },
         .cwd = .{ .dir = tmp.dir },
         .stdin = .ignore,
         .stdout = .pipe,
@@ -567,9 +681,9 @@ fn certClientAgainstWolfssl(mtu: u16) !void {
     });
     defer _ = child.wait(io) catch {};
 
-    var ready_buf: [64]u8 = undefined;
+    var ready_buf: [256]u8 = undefined;
     var stdout_reader = child.stdout.?.reader(io, &ready_buf);
-    const ready_line = stdout_reader.interface.takeDelimiterExclusive('\n') catch {
+    const ready_line = peerLine(&stdout_reader.interface) catch {
         if (verboseSkip()) std.debug.print("\nSKIPPED: LIVE dtls wolfSSL interop: cert peer never printed READY.\n", .{});
         return error.SkipZigTest;
     };
@@ -590,6 +704,10 @@ fn certClientAgainstWolfssl(mtu: u16) !void {
         .peer_verify = .{ .trust_anchor = &cert_kat.anchor_cert_der },
         .require_peer_cert = true,
         .now_sec = cert_kat.valid_now_sec,
+        .cert = if (case.client_cert) .{
+            .chain = &.{&cert_kat.client_cert_der},
+            .private_key = clientEcdsaKeyPair(),
+        } else null,
     });
     defer conn.deinit();
 
@@ -600,6 +718,9 @@ fn certClientAgainstWolfssl(mtu: u16) !void {
     var rx: [1500]u8 = undefined;
 
     const client_hello = try conn.startHandshake(rnd, 0, &out);
+    // Every fresh ClientHello offers x25519 — which is what makes the
+    // secp256r1 cases a genuine group CHANGE rather than a lucky first pick.
+    try testing.expectEqual(x25519_group, conn.ecdhe_group);
     try sock.send(io, &server_addr, client_hello);
 
     var steps: usize = 0;
@@ -619,13 +740,20 @@ fn certClientAgainstWolfssl(mtu: u16) !void {
         if (result.out.len > 0) try sock.send(io, &server_addr, result.out);
     }
 
-    if (mtu > 0) {
+    try testing.expectEqual(case.expect_hello_retry_request, conn.sawHelloRetryRequest());
+    // The group the session keys were actually derived from. For the
+    // secp256r1 cases this is the assertion that the retry was ACTED ON: a
+    // client that echoed the cookie but kept its original x25519 share would
+    // still be `sawHelloRetryRequest() == true` here.
+    try testing.expectEqual(case.expect_group, conn.ecdhe_group);
+
+    if (case.mtu > 0) {
         // Every datagram stayed inside the MTU, and the certificate alone is
         // bigger than one — so its Certificate message cannot have arrived
         // whole in any single datagram.
-        try testing.expect(largest_datagram <= mtu);
-        try testing.expect(cert_kat.server_cert_der.len > mtu);
-        try testing.expect(flight_bytes > mtu);
+        try testing.expect(largest_datagram <= case.mtu);
+        try testing.expect(cert_kat.server_cert_der.len > case.mtu);
+        try testing.expect(flight_bytes > case.mtu);
         // ...and the engine really did have to wait for more datagrams.
         try testing.expect(partial_steps >= 1);
     }
@@ -647,4 +775,120 @@ fn certClientAgainstWolfssl(mtu: u16) !void {
         };
     } else return error.NoApplicationData;
     try testing.expectEqualStrings(msg, echoed);
+
+    // The peer's own account of what it verified. Read only AFTER the
+    // application-data round trip, so the peer has certainly printed it, and
+    // only for the mutual-auth case — the handshake alone already proves
+    // wolfSSL accepted our certificate (it was configured to fail without
+    // one), but this pins WHICH certificate it saw.
+    if (case.expect_peer_cert_subject) |want| {
+        // The peer prints `HANDSHAKE <cipher>` first, so scan a couple of
+        // lines rather than assuming the next one. All of them are already
+        // in the pipe (they precede the echo we just consumed), so this
+        // cannot block.
+        var lines: usize = 0;
+        const found = while (lines < 4) : (lines += 1) {
+            const line = peerLine(&stdout_reader.interface) catch break false;
+            if (std.mem.startsWith(u8, line, "PEERCERT ")) {
+                try testing.expect(std.mem.indexOf(u8, line, want) != null);
+                break true;
+            }
+        } else false;
+        try testing.expect(found);
+    }
+}
+
+// ── direction 4: a wolfSSL CERTIFICATE CLIENT -> our certificate server ───
+//
+// The other half of the certificate-mode gap. Everything our SERVER had ever
+// put on the wire in `.cert_dhe` mode — its ServerHello `key_share`, its
+// Certificate message framing, its CertificateVerify over its own transcript
+// — had only ever been read by our own client. Here a third party verifies
+// the chain we present against the fixture anchor and refuses the handshake
+// (`wolfSSL_get_verify_result`, asserted inside the peer) if it does not
+// check out, then round-trips application data under the keys our server
+// derived.
+//
+// wolfSSL's client is restricted to x25519, matching what our server's
+// `clientHelloShare` prefers — this test is about the certificate direction,
+// not about group negotiation, which the HelloRetryRequest tests above cover.
+test "LIVE wolfSSL peer: a real wolfSSL certificate CLIENT verifies the chain OUR server presents" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try buildPeer(gpa, io, tmp.dir);
+    try writeCertFixtures(io, tmp.dir);
+
+    // This side binds first, so the port cannot be lost to a race.
+    const local: net.IpAddress = .{ .ip4 = .loopback(0) };
+    const sock = try local.bind(io, .{ .mode = .dgram });
+    defer sock.close(io);
+
+    var port_buf: [8]u8 = undefined;
+    const port_str = try std.fmt.bufPrint(&port_buf, "{d}", .{sock.address.getPort()});
+
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "./wolfssl_peer", "client-cert", port_str },
+        .cwd = .{ .dir = tmp.dir },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .pipe,
+    });
+    defer child.kill(io);
+
+    var conn = try Connection.serverInit(.{
+        .role = .server,
+        .key_exchange = .cert_dhe,
+        .cipher_suites = &.{.aes_128_gcm_sha256},
+        .cert = .{
+            .chain = &.{&cert_kat.server_cert_der},
+            .private_key = serverEcdsaKeyPair(),
+        },
+    });
+    defer conn.deinit();
+
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x4e} ** 32);
+    const rnd = testRandom(&csprng);
+
+    var out: [1500]u8 = undefined;
+    var rx: [1500]u8 = undefined;
+    var peer_addr: net.IpAddress = undefined;
+
+    var steps: usize = 0;
+    while (conn.state != .connected) : (steps += 1) {
+        if (steps > 16) return error.TooManyFlights;
+        const incoming = try sock.receiveTimeout(io, &rx, deadline(io, 10_000));
+        peer_addr = incoming.from;
+        const result = conn.handleFlight(incoming.data, rnd, 0, &out) catch |err| {
+            reportPeerDiagnosis(gpa, io, &child, false, "our cert server rejected wolfSSL's flight", err);
+            return err;
+        };
+        if (result.out.len > 0) try sock.send(io, &peer_addr, result.out);
+    }
+
+    var plain: [1500]u8 = undefined;
+    var skipped: usize = 0;
+    const received = while (skipped <= 8) {
+        const incoming = try sock.receiveTimeout(io, &rx, deadline(io, 10_000));
+        break conn.recv(incoming.data, &plain) catch |err| switch (err) {
+            error.ReceivedAck, error.ReceivedPostHandshakeMessage => {
+                skipped += 1;
+                continue;
+            },
+            else => return err,
+        };
+    } else return error.NoApplicationData;
+    try testing.expectEqualStrings("hello from wolfssl cert client", received);
+
+    const echo = try conn.send(received, &out);
+    try sock.send(io, &peer_addr, echo);
+
+    // The peer exits 0 only after `wolfSSL_get_verify_result` returned
+    // X509_V_OK and the echo came back — so a non-zero status here means the
+    // chain we presented was not accepted, not merely that the socket closed.
+    const term = try child.wait(io);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
 }

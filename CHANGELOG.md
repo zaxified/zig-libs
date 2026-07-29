@@ -67,6 +67,32 @@ Per-module API changes since v0.1.0 worth calling out:
   only a third party can find — the `.cert_dhe` ClientHello carried no
   `supported_versions`, so a real DTLS 1.3 server negotiated 1.2.
   Sending is still single-fragment.
+
+  HelloRetryRequest now works in `.cert_dhe` mode as well, including RFC 8446
+  §4.1.4's (EC)DHE half: a retry naming a different `supported_groups` group
+  is answered with a fresh `key_share` in THAT group, so `secp256r1` is now
+  a real key-exchange group (65-byte uncompressed SEC1 share, shared secret =
+  the X coordinate per RFC 8446 §7.4.2) rather than something advertised and
+  not implemented. `error.HelloRetryRequestUnsupported` no longer covers
+  cert-mode retries; new `error.UnsupportedGroup` (retry named a group we
+  never advertised) and `error.IllegalHelloRetryRequest` (retry named a group
+  we already offered a share in — the peer-driven retry loop; or a
+  ServerHello that switched cipher suite after the retry committed to one).
+  A cookie-only retry deliberately leaves the `key_share` byte-identical:
+  §4.1.2 permits no gratuitous change. Live-anchored against wolfSSL in three
+  shapes (cookie only, group change only, both), and the P-256 ECDH is
+  additionally KAT'd byte-exact against Python `cryptography`/OpenSSL.
+
+  Certificate mode's last two self-interop-only gaps are closed, both live:
+  a wolfSSL server configured with `VERIFY_PEER | FAIL_IF_NO_PEER_CERT` now
+  verifies OUR client certificate (mutual auth), and a real wolfSSL
+  certificate client verifies the chain OUR server presents. The first of
+  those found a sixth wire defect of the same family as the five before it:
+  the client decoded a CertificateRequest's `signature_algorithms` with
+  `decodeU16ListExtension` into a fixed `[8]u16`, so a real peer's list
+  (wolfSSL sends 16) came back `error.TooManyExtensions` → `Malformed`. It
+  now filters to this side's own scheme table, exactly as the ClientHello
+  path already did.
 - **`x509`:** new `x509.spkiOf(certificate_der)` → `x509.Spki` — a
   certificate's `SubjectPublicKeyInfo` (full TLV + algorithm OID + parameters
   + key bits) extracted over the defensive `safe.zig` walk, never through

@@ -18,12 +18,16 @@ what is exercised). The `error.HandshakeEngineNotImplemented` this section
 used to describe no longer exists in the code. PSK-mode third-party interop
 is also proven — a live wolfSSL 5.9.1 handshake in both roles, see "Live
 third-party interop" below, which lists the four wire defects that only a
-third-party peer could surface. HelloRetryRequest/0-RTT/resumption/key
-update/CCM stay explicitly out of scope, not stubbed. Certificate mode is
+third-party peer could surface. 0-RTT/resumption/key update/CCM stay
+explicitly out of scope, not stubbed; HelloRetryRequest is now IMPLEMENTED
+(both roles, both key-exchange modes, including RFC 8446 §4.1.4's group
+change). Certificate mode is
 **no longer self-interop only** — a live wolfSSL certificate server is now
 part of the suite (see "Live third-party interop"), including one run at a
 256-byte peer MTU that forces wolfSSL to fragment its Certificate across
-datagrams. The rest of this SPEC
+datagrams, a wolfSSL server that REQUIRES and verifies our client
+certificate, and a wolfSSL certificate CLIENT that verifies the chain our
+server presents. The rest of this SPEC
 is the original design/recon notes; the itemized 15-function checklist below
 is retained as an implementation record (all 15 are done).
 
@@ -198,9 +202,12 @@ unaffected — proven by the untouched existing suite). Summary:
 - **`messages.zig`:** `key_share` (RFC 8446 §4.2.8, ClientHello list +
   ServerHello single-entry forms), `supported_groups` (§4.2.7),
   `signature_algorithms` (§4.2.3) encode/decode, plus the `NamedGroup` enum.
-  Only **X25519** (group `0x001d`) is wired end-to-end; `secp256r1` is
-  advertised in `supported_groups` for parser-compatibility but no secp256r1
-  shares are computed.
+  Both **X25519** (`0x001d`) and **secp256r1** (`0x0017`) are wired end to
+  end; a fresh ClientHello offers an X25519 share and secp256r1 is used when
+  a server names it in a HelloRetryRequest (RFC 8446 §4.1.4). `key_share`
+  has a THIRD wire form for that message — a bare two-byte `selected_group`
+  (`encode`/`decodeKeyShareHelloRetryRequest`), not interchangeable with the
+  ServerHello form.
 - **`Connection.zig`:** in `.cert_dhe` mode the ClientHello offers
   `{supported_groups, signature_algorithms, key_share}` with a fresh
   ephemeral X25519 keypair (`std.crypto.dh.X25519`, seeded from the
@@ -235,10 +242,25 @@ unaffected — proven by the untouched existing suite). Summary:
   key_share, wrong CertificateVerify key, untrusted anchor, missing
   key_share). Going live immediately found a defect of exactly the class
   self-interop cannot find: the `.cert_dhe` ClientHello carried no
-  `supported_versions`, so a real server negotiated DTLS 1.2. **Still
-  self-interop only within certificate mode:** MUTUAL authentication (our
-  client's own Certificate/CertificateVerify has never been checked by a
-  third party) and our server presenting a chain to a third-party client.
+  `supported_versions`, so a real server negotiated DTLS 1.2.
+
+  The two remaining certificate-mode gaps an earlier version of this section
+  listed are now closed, both live: a wolfSSL server with
+  `VERIFY_PEER | FAIL_IF_NO_PEER_CERT` and the fixture anchor as its only CA
+  verifies OUR client's Certificate + CertificateVerify (mutual auth), and a
+  real wolfSSL certificate CLIENT verifies the chain our server presents
+  (`wolfSSL_get_verify_result` asserted inside the peer). The first found a
+  sixth defect of the same family: the client decoded a CertificateRequest's
+  `signature_algorithms` into a fixed `[8]u16`, so a real peer's list
+  (wolfSSL sends 16) came back `TooManyExtensions` → `Malformed` — the same
+  mistake the ClientHello path had already been fixed for, surviving here
+  because only our own server had ever sent a CertificateRequest.
+
+- **secp256r1 ECDH KAT (Python `cryptography` / OpenSSL 3.5.5):** two fixed
+  scalars, their SEC1 uncompressed points, and the ECDH output — which for
+  the NIST curves is the shared point's X COORDINATE only (RFC 8446 §7.4.2),
+  not the point encoding. An independent oracle, since the RFC 8448 vector
+  covers only the X25519 half.
 
 **Untrusted-DER hazard (unchanged, inherited):** `.cert_dhe` mode parses the
 same PEER-supplied X.509 via the same `certauth` path, so it inherits the
@@ -318,6 +340,46 @@ OpenSSL a similar number, so any real client was rejected as malformed. The
 list is now filtered against the schemes this module can actually select,
 which bounds the buffer by OUR list instead of the peer's.
 
+A **sixth** was the identical bug on the OTHER side of the same extension:
+the CLIENT decoded a `CertificateRequest`'s `signature_algorithms` with
+`decodeU16ListExtension` into a fixed `[8]u16`, so a real peer's list
+(wolfSSL 5.9.1 sends 16) became `TooManyExtensions` → `Malformed` and mutual
+auth against a third party could not complete at all. Only our own server
+had ever sent a `CertificateRequest`, and its list is short — so the fix
+applied to the ClientHello path never reached this one. Found the day the
+live mutual-auth test was written; same `filterU16ListExtension` fix.
+
+### Mutation testing: cert-mode HelloRetryRequest + secp256r1
+
+Every central invariant of the §4.1.4 work was deliberately broken and the
+suite re-run. What each mutation cost:
+
+| mutation | caught by |
+|---|---|
+| keep ClientHello1's `key_share` instead of regenerating in the named group | the group-change unit tests (`ecdhe_group` assertions) |
+| ALWAYS regenerate, even for a cookie-only retry (a §4.1.2 violation) | the cookie-only unit test's byte-identical `key_share` assertion — nothing else, wolfSSL accepts it |
+| draw a fresh ClientHello2 `random` | the §4.1.2 conformance comparator |
+| accept a retry naming a group already offered | its reject test (the retry-loop guard) |
+| accept a retry naming a group never advertised | its reject test |
+| secp256r1 shared secret = the Y coordinate instead of X | the OpenSSL-derived ECDH KAT |
+| drop the "ServerHello share must be in the group we offered" check | its reject test — **but only after the test was fixed.** The original version sent a 65-byte P-256 point, which the length check inside `ecdheSharedSecret` also rejects, so both the correct and the mutated code returned `MissingKeyShare` and the test passed either way. It now sends a 32-byte value labelled secp256r1, where only the GROUP is wrong |
+| RFC 8446 §4.4.1's synthetic `message_hash` type changed 254 → 253 (both sides share the constant) | **only** the live wolfSSL tests. All 18 local HelloRetryRequest tests stay green — the two sides simply agree on a transcript nobody else computes |
+| revert the `CertificateRequest` `signature_algorithms` fix above | **only** the live mutual-auth test (230 other tests passed) |
+
+Two of those are worth keeping in mind. The second — a gratuitously
+regenerated share — is a real protocol violation that **no live peer
+objected to**, so a live oracle is necessary but not sufficient. The
+seventh is the "it comes out the same either way" trap: a reject test whose
+expected error is also produced by a *different* check downstream proves
+nothing, and only mutation showed it.
+
+Note that fully REMOVING `resetToMessageHash`'s body (rather than changing
+the constant) is NOT a consistent mutation here and self-interop does catch
+it: our server is stateless, so it rebuilds the transcript on a brand-new
+`Connection` whose hasher starts empty, while the client's would still carry
+ClientHello1 — the two diverge. Only a mutation that keeps both sides doing
+the same wrong thing hides from self-interop.
+
 ### Proven against wolfSSL: the HelloRetryRequest cookie exchange, both roles
 
 RFC 9147 §5.1's return-routability check runs in both directions against a
@@ -351,12 +413,17 @@ two `Connection`s written from the same reading of the RFC cannot see.
   offers timestamps as an ALTERNATIVE to secret rotation, and rotation is
   what the API exposes. A clock would also be the first one this module
   reads.
-- **The HelloRetryRequest key_share path.** Neither role updates a
-  `key_share` in response to a retry, so `.cert_dhe` cannot do the exchange
-  in either direction (`error.HelloRetryRequestUnsupported` on the client;
-  a `.cert_dhe` server with `hello_retry` set would emit a cookie-only retry
-  its own client could not answer). The PSK path — the one this module's
-  live oracle exercises — is unaffected.
+- **A SERVER-initiated group change.** The client half of RFC 8446 §4.1.4's
+  `key_share` path is implemented (a retry naming another advertised group
+  is answered with a fresh share in it, live-anchored against wolfSSL); the
+  server half is not. This server takes whichever offered share it can use
+  and answers a ClientHello with nothing usable with
+  `error.MissingKeyShare`, never a group-change retry — deciding a group
+  before the cookie verifies would mean holding more state for an unverified
+  peer, which is what `sendHelloRetryRequest` exists not to do.
+- **`psk_dhe_ke`.** `.psk` mode stays PSK-only, so a retry carrying a
+  `key_share` there is `error.HelloRetryRequestUnsupported` rather than a
+  silent upgrade to an exchange this engine does not run.
 - **Send-side fragmentation.** This engine reassembles what it RECEIVES but
   never splits what it SENDS, so it needs a peer MTU large enough for its
   own largest message (`max_cert_message_body` and friends). A peer that

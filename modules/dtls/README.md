@@ -27,14 +27,15 @@ Implemented and validated:
   `handleFlight` / `poll`) — a real RFC 9147 §5 PSK client+server handshake
   (ClientHello with a real PSK binder → ServerHello → EncryptedExtensions +
   Finished → client Finished → application keys installed), plus the
-  additive certificate-mode messages and the `.cert_dhe` ephemeral-X25519
-  mode (validated against RFC 8448 §3's external ECDHE vector). Proven by an
+  additive certificate-mode messages and the `.cert_dhe` ephemeral-(EC)DHE
+  mode — X25519 (validated against RFC 8448 §3's external ECDHE vector) and
+  secp256r1 (against a Python-`cryptography`/OpenSSL vector). Proven by an
   in-memory client↔server interop suite: both validated suites reach
   `.connected` with byte-identical derived keys, a real `send`/`recv`
   round trip, caller-clocked retransmission on a dropped ClientHello, and
   typed-error (never panic) rejection of a wrong PSK, mismatched PSK
-  identity, corrupted ServerHello, and HelloRetryRequest. **Not yet proven
-  against a third-party DTLS 1.3 peer** — see "Scope caveat" below.
+  identity, corrupted ServerHello, and a malformed HelloRetryRequest — and
+  additionally against a live wolfSSL peer (see "Third-party interop").
 - **Application-data path** (`src/Connection.zig`) — `installApplicationKeys`
   + `send`/`recv` do real record protection, proven by client↔server
   self-consistency (round-trip both directions, tamper→`DecryptionFailed`).
@@ -66,7 +67,16 @@ compiled at test time; the tests skip loudly when `cc` or wolfSSL is missing
   against this repo's own trust anchor;
 - **the same certificate handshake at a 256-byte peer MTU**, where wolfSSL
   must split its Certificate across datagrams, so it only completes if the
-  reassembly above is real.
+  reassembly above is real;
+- **HelloRetryRequest in certificate mode, all three shapes** — cookie only,
+  a group change only (wolfSSL restricted to secp256r1, so the retry's sole
+  content is the group and the handshake then runs on P-256 ECDHE), and both
+  in one retry;
+- **mutual authentication** — a wolfSSL server with
+  `VERIFY_PEER | FAIL_IF_NO_PEER_CERT` and our anchor as its only CA
+  verifying OUR client certificate;
+- **our server's chain, verified by a third party** — a real wolfSSL
+  certificate client checking what we present.
 
 That test found four defects that self-interop is structurally incapable of
 finding, because both sides of a self-interop suite make the same mistake
@@ -88,13 +98,31 @@ the `.cert_dhe` ClientHello carried no `supported_versions` at all, so a real
 DTLS 1.3 server negotiated 1.2 and the handshake died on the first record.
 Self-interop never noticed, because this module's own server did not look.
 
+Extending it to MUTUAL auth found a sixth: the client decoded a
+CertificateRequest's `signature_algorithms` into a fixed `[8]u16`, so a real
+peer's list (wolfSSL sends 16) came back `TooManyExtensions` → `Malformed`.
+The ClientHello path had already been fixed the same way against the same
+peer; this one survived because only our own server — whose list is short —
+had ever sent a CertificateRequest.
+
 **HelloRetryRequest / the stateless-cookie exchange** (RFC 9147 §5.1, RFC
 8446 §4.1.4/§4.2.2) is implemented in **both roles**, each proven against
 wolfSSL playing the other.
 
 *Client:* always answers one — the posture a stock DTLS 1.3 server ships
 with, so without it this module could not talk to a default-configured peer
-at all.
+at all. It applies whichever of §4.1.2's permitted changes the retry asked
+for: echo the **cookie**, and — in `.cert_dhe` — generate a fresh
+**`key_share` in the group the retry named** (§4.1.4's (EC)DHE half, which
+is what makes `secp256r1` real here rather than merely advertised).
+Everything else in ClientHello2 is ClientHello1 verbatim, including the
+`random` and, for a cookie-only retry, the key share itself. Retries that
+must be REFUSED — a second one, a group we never advertised
+(`error.UnsupportedGroup`), a group we already offered a share in
+(`error.IllegalHelloRetryRequest`, the peer-driven retry loop), one with
+nothing to change, and a ServerHello that switches cipher suite after the
+retry committed to one — have no live counterpart, since no conforming
+server sends them, and are covered by unit tests instead.
 
 *Server:* opt in with `Config.hello_retry`. A cookie-less ClientHello is
 answered with a HelloRetryRequest and **nothing is kept** — no transcript, no
