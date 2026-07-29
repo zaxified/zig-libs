@@ -204,10 +204,14 @@ can.
 consumer for which `k` passes over the data dominate. Server cost is `k·N`
 evaluations of `n` SHA-256 calls; at `k=100, N=2^20` that is ~2·10⁹ hashes per
 query, and the bucketed construction earns its failure probability. Note the
-cheaper fix came first — the tree-reuse `evalFull` (now built, §"Tree-reuse
-prefix evaluation") cuts each pass from `O(N·n)` to `O(N)` hashes with **no**
-new cryptography — so the cuckoo revisit bar is now `k` itself, not the
-per-pass constant.
+cheaper fixes came first, both traversal-order changes with **no** new
+cryptography: the tree-reuse `evalFull` (§"Tree-reuse prefix evaluation") cut a
+single instance's pass from `O(N·n)` to `O(N)` hashes, and the *interleaved*
+`evalEachFullWith` (§"Interleaved multi-tree prefix evaluation") applies that
+walk to all `k` instances at once, so the consumer's data is traversed once and
+the total is `~k·N` hashes rather than `k·N·n`. The cuckoo revisit bar is
+therefore now the factor `k` itself — which is the construction, not the
+traversal, and no walk can remove it.
 
 ### Seed independence is a security requirement, and is enforced
 
@@ -325,6 +329,67 @@ host): `n=16` full domain 570 ms → 52 ms (**~11×**, theory `(2n+1)/3 ≈ 11`)
 500-point prefix of an `n=20` domain 5.1 ms → 0.36 ms (**~13–15×**), with
 `evalFull`'s per-point cost flat (~0.7–0.8 µs) across both — i.e. it follows
 the prefix length, not the domain size.
+
+## Interleaved multi-tree prefix evaluation (`Mpf.evalEachFullWith`)
+
+`pir.Multi(k)`'s server used `Mpf.evalEach` per record: `k` per-point
+evaluations, each re-walking its own tree from the root, `k·N·n` PRG calls over
+`N` records. The obvious repair — call `Dpf.evalFull` once per instance — fixes
+the hash count but breaks the property `pir` documents, because `k` prefix
+walks touch the consumer's data `k` times.
+
+`Mpf.evalEachFullWith(b, key, count, ctx, emit)` is the repair that keeps both:
+ONE descent of the prefix `[0, count)` carrying `k` tree states side by side,
+calling `emit(ctx, x, &shares)` once per `x` in ascending order with all `k`
+components of that index. Per level it applies `dpf.eval`'s own formulas once
+per instance, with instance `j`'s state advanced by instance `j`'s correction
+words: the instances share the traversal and **nothing else**, exactly as in
+`evalEach`. `evalFullWith`/`evalFull` are the same walk with the components
+summed (the multi-point function itself, for `pir`'s aggregate query).
+
+**Same construction, same keys, same outputs.** This changes evaluation
+strategy only. It is not the cuckoo/batch-code construction and does not
+approach it: the hash count stays `~k·N`, linear in `k`.
+
+**Cost and stack.** `~k` PRG calls per index (plus at most `k·n` for nodes
+straddling the prefix boundary), against the per-point path's `k·n`. The walk
+keeps both children in every tree, so a frame is `~2·k·17` bytes over depth
+`n ≤ 31` — a few KB at realistic `k`, ~1.1 MB at the `k=1024, n=31` corner the
+module's own cap allows. Stated rather than discovered.
+
+**The tail is still never touched, and the pruning is still data-independent.**
+A subtree lying entirely at/past `count` is skipped before its PRG calls, in
+all `k` trees at once, on the index range alone — never on a seed, a control
+bit or an evaluated share. So the emission sequence (and therefore a consumer's
+access pattern over its data) is a function of `count` alone; `mpf_test.zig`
+and `pir/privacy_test.zig` both pin that against keys spanning the domain and
+against arbitrary bytes decoded as a key.
+
+**Verification.** `mpf_test.zig` requires the walk to reproduce `evalEach`
+element-for-element and instance-for-instance — full domains at `n=1..8`,
+a 300-point prefix of an `n=10` domain with points inside/at/just past/far past
+the boundary, prefix lengths 0/1/2/255/256/257/511/512, both parties, plus the
+fuzz target's arbitrary key material over a fuzzer-chosen prefix. The oracle is
+`evalEach` (a loop over `dpf.eval`), deliberately left naive and untouched;
+`pir.zig` additionally keeps the pre-interleaving server loop as a test-only
+oracle and requires `Multi.answer`/`answerAggregate` to reproduce it word for
+word. Mutation-tested (each confirmed to turn the suite red):
+
+| mutation | caught by |
+|---|---|
+| instance 0's CWs applied to every tree | 4 `mpf` + 6 `pir` tests |
+| seed CW gated on the child's control bit, not the parent's | 4 `mpf` + 7 `pir` |
+| one instance's state not advanced into a child | 4 `mpf` + 6 `pir` |
+| **consistent** reorder: right subtree first with `base` adjusted to match, so every value still lands at its own index | 4 `mpf` tests — and in `pir` **only** the access-order pin (every functional test stays green, because the answer accumulation is commutative) |
+| instances 0 and 1 swapped at the leaf | 3 `mpf` + 5 `pir` — but **not** the summed-form test, which is permutation-invariant: the per-instance oracle is what has teeth here |
+| tail pruning off by one (`base > count`) | prefix-boundary test + bounds panics in both modules |
+
+Measured (`FSS_BENCH=1 zig build test-fss -Doptimize=ReleaseFast`, this host,
+against the per-point `evalEach` loop, both routes asserted equal first):
+`n=14, k=4` full `2^14` domain 495 ms → 52 ms (**~9.5×**); `n=20, k=8`, the
+`pir` shape of a 500-record prefix in a `2^20` domain, 43.1 ms → 3.0 ms
+(**~14×**). Both ratios track the theoretical `~(2n+1)/3`, as the single-tree
+case does.
 
 ## Scoped out (future increments, NOT Phase 1)
 

@@ -75,10 +75,22 @@ Per-module API changes since v0.1.0 worth calling out:
   produces it, leaving `answer`/`answerSlices` signatures untouched.
   `evalAll` is deliberately left naive, as a structurally independent
   differential oracle. Both `pir`'s value channel and `Verified`'s tag
-  channel are wired to it. `Multi(k)` is **not** — `k` prefix walks would
-  turn one pass over the records into `k`, and the right answer is an
-  interleaved walk of `k` trees; recorded as scoped out rather than done
-  badly.
+  channel are wired to it.
+- **`fss`:** `Mpf.evalEachFullWith` / `evalFullWith` / `evalFull` — the
+  multi-point counterpart, and the interleaved walk the `Dpf.evalFull` entry
+  above recorded as the right answer for `Multi(k)`. ONE descent of the
+  domain prefix carries all `k` tree states side by side and emits every
+  instance's share at each index, instead of `k` per-point evaluations
+  (`k·N·n` PRG calls) or `k` separate prefix walks (which would have turned
+  one pass over the consumer's data into `k`). Cost per index drops from
+  `k·n` PRG calls to `~k`: measured **495 ms → 52 ms** (~9.5×) for a full
+  2^14 domain at `k=4`, and **43.1 ms → 3.0 ms** (~14×) for a 500-point
+  prefix of a 2^20 domain at `k=8`. Same construction, same keys, same
+  outputs — a traversal-order change only, with the sum-of-`k`-DPFs
+  construction and its `k·N` evaluation count untouched (the cuckoo/batch-code
+  alternative stays scoped out). `evalEach` stays naive as the differential
+  oracle, and the walk's index-range-only pruning keeps the emission sequence
+  a function of the prefix length alone.
 - **`pir`:** keyword lookup — `keywordIndex` / `queryKeyword`, also under
   `Verified`. `queryKeyword` is literally `query(keywordIndex(kw), …)`, and
   that is the point: the map is total, deterministic and unconditional

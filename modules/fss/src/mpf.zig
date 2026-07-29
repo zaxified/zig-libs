@@ -47,12 +47,23 @@
 //!
 //! **What would justify revisiting it.** One thing, measured rather than
 //! guessed: a consumer for which `k` full passes over the database dominate.
-//! The server cost is `k·N` DPF evaluations of `n` SHA-256 calls each; at
+//! The server cost *was* `k·N` DPF evaluations of `n` SHA-256 calls each; at
 //! `k=100, N=2^20` that is ~2·10^9 hashes per query, and at that point the
-//! bucketed construction is worth its failure probability. The cheaper fix
-//! came first: `dpf`'s tree-reuse `evalFull` (built) cuts each pass from
-//! `O(N·n)` to `O(N)` hashes with **no** new cryptography, so the revisit bar
-//! is now the factor `k` itself.
+//! bucketed construction is worth its failure probability. The cheap fixes
+//! came first, both of them traversal-order changes with **no** new
+//! cryptography:
+//!
+//!   1. `dpf`'s tree-reuse `evalFull` cut a single instance's pass from
+//!      `O(N·n)` to `O(N)` hashes.
+//!   2. `evalEachFullWith` (below) applies that walk to all `k` instances
+//!      **simultaneously**: one descent of the domain prefix carrying `k`
+//!      tree states, so the consumer's data is traversed ONCE and the hash
+//!      count is `~k·N` rather than `k·N·n`.
+//!
+//! What neither can remove is the factor `k` in the hash count — that is the
+//! construction, not the traversal, and it is the revisit bar. Note what the
+//! interleaving does NOT change: the same `k` keys, the same per-instance
+//! formulas, the same outputs element for element.
 //!
 //! ## Why the bundle is not compressed, and what that buys
 //!
@@ -60,9 +71,10 @@
 //! instances — deliberately, because sharing anything between them is exactly
 //! what would make the indices' *relationship* observable (see below). The
 //! consequence is that the `k` components stay individually addressable, which
-//! is what `evalEach` exposes and what a `k`-record retrieval consumer needs:
-//! the summed `eval` is the multi-point function, but a consumer wanting `k`
-//! *separate* results needs the components, not their sum.
+//! is what `evalEach` (per point) and `evalEachFullWith` (over a prefix, one
+//! pass) expose, and what a `k`-record retrieval consumer needs: the summed
+//! `eval` is the multi-point function, but a consumer wanting `k` *separate*
+//! results needs the components, not their sum.
 //!
 //! ## Seed independence is load-bearing, and is checked
 //!
@@ -237,11 +249,166 @@ pub fn Mpf(comptime n_bits: usize, comptime out_bytes: usize, comptime k: usize)
 
         /// **EvalAll** — `eval` at every domain point into `out`
         /// (`out.len == domain_size`). Naive loop, for the same reason
-        /// `dpf.evalAll` is (SPEC.md §"Scoped out").
+        /// `dpf.evalAll` is (SPEC.md §"Scoped out"): it is structurally
+        /// independent of the interleaved walk below, which makes it the
+        /// differential oracle that walk is tested against. Use `evalFull`
+        /// when you want the result fast.
         pub fn evalAll(b: u1, key: Key, out: []Elem) void {
             std.debug.assert(out.len == domain_size);
             var x: usize = 0;
             while (x < domain_size) : (x += 1) out[x] = eval(b, key, @intCast(x));
+        }
+
+        // ── interleaved prefix evaluation (one pass, k trees) ──────────────
+
+        /// **EvalEachFullWith** — every instance's share at every `x` in the
+        /// domain **prefix** `[0, count)`, streamed, in ONE walk that descends
+        /// all `k` GGM trees together: `emit(context, x, &shares)` is called
+        /// once per `x` in ascending order, with `shares[j]` bit-for-bit what
+        /// `evalEach(b, key, x)[j]` returns.
+        ///
+        /// This is `dpf.evalFullWith` generalized across the bundle rather
+        /// than `k` calls to it. The distinction is the point: `k` separate
+        /// prefix walks would touch the prefix `k` times (`k` passes over
+        /// whatever the consumer folds each evaluation into — for `pir`, the
+        /// database), while this visits each domain index once and hands the
+        /// consumer all `k` components there. The PRG-call count is the same
+        /// as `k` prefix walks (`~k·count`, versus the per-point path's
+        /// `k·count·n`); what the interleaving buys on top is the single pass
+        /// over the consumer's data.
+        ///
+        /// The prefix contract is `dpf`'s, unchanged and for the same reason:
+        /// a subtree lying entirely at/past `count` is skipped BEFORE its PRG
+        /// calls, in **all** `k` trees at once (the skip depends only on the
+        /// index range, never on key material), so the domain's unused tail
+        /// costs zero hashes.
+        ///
+        /// Stack: the walk keeps both children of the current node in every
+        /// tree, so a frame is `~2·k·(16+1)` bytes and depth is `n ≤ 31` —
+        /// a few KB at the `k` this construction is the right one for, ~1.1 MB
+        /// at the extreme `k = 1024, n = 31` corner. A consumer running at
+        /// that corner should be revisiting the construction anyway (module
+        /// doc), but it must not do so on a small thread stack.
+        pub fn evalEachFullWith(
+            b: u1,
+            key: Key,
+            count: usize,
+            context: anytype,
+            comptime emit: fn (@TypeOf(context), usize, *const [k]Elem) void,
+        ) void {
+            std.debug.assert(count <= domain_size);
+            var s: [k]Seed = undefined;
+            var t: [k]u1 = undefined;
+            for (0..k) |j| {
+                s[j] = key.keys[j].seed;
+                t[j] = b;
+            }
+            walkPrefixEach(@TypeOf(context), emit, &key, b, &s, &t, 0, 0, count, context);
+        }
+
+        /// The interleaved walk under `evalEachFullWith`. Per level it applies
+        /// exactly `dpf.eval`'s formulas, once per instance, with instance
+        /// `j`'s state advanced by instance `j`'s own correction words — the
+        /// instances share the traversal and NOTHING else, which is the same
+        /// separation `evalEach` has and the reason a `k`-record consumer can
+        /// use either interchangeably. Equivalence to `evalEach` is asserted
+        /// element-for-element in `mpf_test.zig` against the naive per-point
+        /// oracle.
+        fn walkPrefixEach(
+            comptime Context: type,
+            comptime emit: fn (Context, usize, *const [k]Elem) void,
+            key: *const Key,
+            b: u1,
+            s: *const [k]Seed,
+            t: *const [k]u1,
+            level: usize,
+            base: usize,
+            count: usize,
+            context: Context,
+        ) void {
+            // This node's subtree covers leaves [base, base + 2^(n-level)) in
+            // every tree at once; if that lies past the prefix end, no tree is
+            // expanded. Index-range only — never a branch on key material.
+            if (base >= count) return;
+            if (level == n_bits) {
+                var v: [k]Elem = undefined;
+                for (0..k) |j| {
+                    var e: Elem = prg_mod.convert(out_bytes, s[j]);
+                    if (t[j] == 1) e = G.add(e, key.keys[j].cw_final);
+                    if (b == 1) e = G.neg(e);
+                    v[j] = e;
+                }
+                emit(context, base, &v);
+                return;
+            }
+
+            var s_l: [k]Seed = undefined;
+            var t_l: [k]u1 = undefined;
+            var s_r: [k]Seed = undefined;
+            var t_r: [k]u1 = undefined;
+            for (0..k) |j| {
+                const e = prg_mod.prg(s[j]);
+                const c = key.keys[j].cw[level];
+                s_l[j] = e.s_l;
+                t_l[j] = e.t_l ^ (t[j] & c.t_cw_l);
+                s_r[j] = e.s_r;
+                t_r[j] = e.t_r ^ (t[j] & c.t_cw_r);
+                // the seed CW is gated by the PARENT's control bit, per
+                // instance — applied after both children's bits are derived
+                // from that same parent bit.
+                if (t[j] == 1) {
+                    for (&s_l[j], c.s_cw) |*d, q| d.* ^= q;
+                    for (&s_r[j], c.s_cw) |*d, q| d.* ^= q;
+                }
+            }
+
+            const half = @as(usize, 1) << @intCast(n_bits - 1 - level);
+            walkPrefixEach(Context, emit, key, b, &s_l, &t_l, level + 1, base, count, context);
+            walkPrefixEach(Context, emit, key, b, &s_r, &t_r, level + 1, base + half, count, context);
+        }
+
+        fn SumSink(
+            comptime Context: type,
+            comptime emit: fn (Context, usize, Elem) void,
+        ) type {
+            return struct {
+                fn each(context: Context, x: usize, vals: *const [k]Elem) void {
+                    var acc: Elem = 0;
+                    for (vals) |v| acc = G.add(acc, v);
+                    emit(context, x, acc);
+                }
+            };
+        }
+
+        /// **EvalFullWith** — the multi-point function's own value (the `k`
+        /// components summed, i.e. `eval`) at every `x ∈ [0, count)`, streamed
+        /// in ascending order, over the same single interleaved walk. The
+        /// summed counterpart of `evalEachFullWith`, for a consumer that wants
+        /// the multi-point function rather than its components (`pir`'s
+        /// aggregate query).
+        pub fn evalFullWith(
+            b: u1,
+            key: Key,
+            count: usize,
+            context: anytype,
+            comptime emit: fn (@TypeOf(context), usize, Elem) void,
+        ) void {
+            const Sink = SumSink(@TypeOf(context), emit);
+            evalEachFullWith(b, key, count, context, Sink.each);
+        }
+
+        /// **EvalFull** — `eval` over the domain prefix `[0, out.len)` into
+        /// `out`, in one interleaved walk. Materializing form of
+        /// `evalFullWith`; `evalAll` is the naive full-domain oracle it is
+        /// checked against.
+        pub fn evalFull(b: u1, key: Key, out: []Elem) void {
+            std.debug.assert(out.len <= domain_size);
+            const sink = struct {
+                fn emit(o: []Elem, x: usize, v: Elem) void {
+                    o[x] = v;
+                }
+            };
+            evalFullWith(b, key, out.len, out, sink.emit);
         }
 
         /// Full-domain correctness oracle: the first `x` where

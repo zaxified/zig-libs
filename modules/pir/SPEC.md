@@ -116,8 +116,9 @@ record regardless of `k`), and it is exposed as `answerAggregate`, but it is an
 aggregate, not retrieval.
 
 Retrieval keeps the `k` instances apart: the server evaluates the components
-with `Mpf.evalEach` and accumulates `k` separate inner products, so an answer
-is `k` record-sized blocks and reconstruction yields all `k` records. There is
+(`Mpf.evalEachFullWith` — the interleaved walk, see below) and accumulates `k`
+separate inner products, so an answer is `k` record-sized blocks and
+reconstruction yields all `k` records. There is
 no way around the download cost — `k` records of information cannot arrive in
 one record of bytes — so "one answer per server" means one *message*, `k`
 blocks wide. A test asserts the aggregate's non-invertibility directly: two
@@ -142,9 +143,24 @@ Re-checked against `k` points rather than assumed:
    those same points add, so the aggregate gives `2·record[7]`. That divergence
    is exactly why retrieval uses the components and not the sum.
 
-The server makes **one pass** over the database (records outside, instances
-inside), so each record's bytes are decomposed once. That is a memory-traffic
-win only; the DPF evaluations are still `k·N`.
+The server makes **one pass** over the database, and since the interleaved
+evaluator landed it makes it in the evaluator too: `Mpf.evalEachFullWith`
+(`fss/SPEC.md` §"Interleaved multi-tree prefix evaluation") descends all `k`
+trees together over the `[0, count())` prefix and hands the server every
+instance's share at each record as it arrives, so each record's bytes are
+decomposed once and each record costs `~k` PRG calls instead of `k·domain_bits`
+(~9.5–14× measured). The DPF evaluations are still `k·N` — that factor is the
+multi-point construction, not the traversal, and no evaluation strategy
+removes it.
+
+Two properties survive the change unaltered, and both are tested rather than
+argued: the answer is **word-for-word identical** to the per-point loop it
+replaced (which `pir.zig` keeps as a test-only oracle), and the record access
+order is still `0, 1, …, count()-1` for every share, because the walk prunes
+the domain's unused tail on the index range alone. `privacy_test.zig` pins the
+second — and it is not redundant with the correctness tests: a traversal
+reorder that is internally consistent leaves every functional test green,
+since the answer accumulation is commutative.
 
 ## Multi-index privacy — does `k`, or the index relationship, leak?
 
@@ -744,8 +760,9 @@ protocol modules: bytes in, bytes out, and the transport is the integrator's.
 
 - ~~**Multi-index queries.**~~ **Built** — `Multi(k)`, above, once `fss` grew
   `Mpf`. The blocker was correctly identified as being in `fss`, not here.
-- **Sublinear batch PIR.** `Multi(k)` amortizes the *database pass* (records
-  outside, instances inside) but still costs `k·N` DPF evaluations. The
+- **Sublinear batch PIR.** `Multi(k)` amortizes the *database pass* (one
+  interleaved walk over the record prefix, all `k` trees at once) but still
+  costs `k·N` DPF evaluations. The
   cuckoo/batch-code multi-point construction would cut that to `O(N)`; it is
   scoped out in `fss` with its revisit trigger stated there.
 - ~~**Answer verification / malicious-server security.**~~ **Built** —
@@ -773,11 +790,13 @@ protocol modules: bytes in, bytes out, and the transport is the integrator's.
   `answer`/`answerSlices` and `Verified.answer`'s tag channel
   (§"Server cost" above): ~1 PRG call per record instead of `domain_bits`,
   measured ~11× at `domain_bits=16`, with the unused-tail truncation invariant
-  and the access-pattern requirement both preserved and still tested. Not
-  wired (cheap follow-on, deliberately deferred): `Multi(k)`'s `Mpf.evalEach`
-  loop — doing it as `k` prefix walks would flip the documented
-  one-pass-over-records memory-traffic property into `k` passes, so it wants a
-  `k`-tree interleaved walk, deferred until a consumer cares.
+  and the access-pattern requirement both preserved and still tested.
+  `Multi(k)`'s inner loop is now wired too, and to the shape this entry
+  predicted it needed: **not** `k` prefix walks (which would have flipped the
+  documented one-pass-over-records property into `k` passes) but `fss`'s
+  `Mpf.evalEachFullWith`, a single `k`-tree interleaved walk — ~`k` PRG calls
+  per record instead of `k·domain_bits`, measured ~9.5–14×, same keys, same
+  construction, answers word-for-word identical to the loop it replaced.
 
 ## References
 

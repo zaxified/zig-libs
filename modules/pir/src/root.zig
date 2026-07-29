@@ -66,10 +66,10 @@
 //! Still out: robustness and attribution (inherent at two servers), binding
 //! answers to a *published* database digest (authenticated PIR — a different
 //! trust model, see `SPEC.md`), a verified `Multi(k)`, **sublinear** batch
-//! PIR (`Multi(k)` amortizes the database pass but still costs `k` DPF
-//! evaluations per record; the cuckoo/batch-code multi-point construction
-//! that would fix that is scoped out in `fss`), and the `evalFull` wiring of
-//! `Multi(k)`'s inner loop (see `SPEC.md` §"Scoped out").
+//! PIR (`Multi(k)` makes one pass over the database — on `fss`'s interleaved
+//! `k`-tree walk — but still costs `k` DPF evaluations per record; the
+//! cuckoo/batch-code multi-point construction that would fix that is scoped
+//! out in `fss`).
 
 const std = @import("std");
 

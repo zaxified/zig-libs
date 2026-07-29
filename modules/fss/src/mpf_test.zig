@@ -218,6 +218,320 @@ test "DERIVED: evalEach's components sum to eval, and each component is its own 
     }
 }
 
+// ── the interleaved prefix walk vs the naive per-point oracle ─────────────
+//
+// `evalEachFullWith` descends all `k` trees in ONE pass over the domain
+// prefix. It must produce EXACTLY what the per-point path produces — bit for
+// bit, instance for instance, for both parties — because `pir` swaps one for
+// the other inside its server loop and the swap must be invisible.
+//
+// The oracle is `evalEach`, and it is deliberately left naive: it re-walks
+// every tree from its root for each `x` and shares no traversal state with the
+// interleaved walk. **Nothing below compares the fast path against itself.**
+//
+// What each test is teeth for (mutation-checked, see SPEC.md):
+//   - per-instance values      → catches any cross-instance state mix-up
+//                                (one tree's CW applied to another, one
+//                                instance's control bit gating all of them,
+//                                one instance's state not advanced).
+//   - emission ORDER and count → catches a traversal-order change that is
+//                                internally consistent (children visited
+//                                right-first with `base` adjusted to match
+//                                leaves every value correct at its own index).
+//   - prefix boundaries        → catches an off-by-one in the tail pruning.
+
+/// Collects `(x, shares)` pairs from `evalEachFullWith` in emission order.
+/// Deliberately records the ORDER as well as the values: an interleaving bug
+/// that reorders the walk while keeping every value at its right index is
+/// invisible to a value-only comparison.
+fn EachSink(comptime M: type) type {
+    return struct {
+        const K = M.points;
+        vals: []M.Elem, // K per emission, in emission order
+        xs: []usize, // the emitted index, in emission order
+        n: *usize,
+
+        fn emit(self: @This(), x: usize, shares: *const [K]M.Elem) void {
+            const i = self.n.*;
+            self.xs[i] = x;
+            for (shares, 0..) |v, j| self.vals[i * K + j] = v;
+            self.n.* = i + 1;
+        }
+    };
+}
+
+fn ElemSink(comptime M: type) type {
+    return struct {
+        vals: []M.Elem,
+        xs: []usize,
+        n: *usize,
+
+        fn emit(self: @This(), x: usize, v: M.Elem) void {
+            const i = self.n.*;
+            self.xs[i] = x;
+            self.vals[i] = v;
+            self.n.* = i + 1;
+        }
+    };
+}
+
+test "DERIVED: evalEachFullWith == evalEach, instance for instance, both parties" {
+    // Full domains, across the geometries the correctness sweep uses. Betas are
+    // pairwise distinct so that a permutation of the k components — the most
+    // plausible "it comes out the same either way" bug — cannot hide.
+    const cases = .{
+        .{ .n = 1, .k = 1 }, // smallest domain, one instance
+        .{ .n = 1, .k = 2 }, // k == domain_size
+        .{ .n = 2, .k = 4 },
+        .{ .n = 3, .k = 2 },
+        .{ .n = 4, .k = 3 },
+        .{ .n = 5, .k = 5 },
+        .{ .n = 6, .k = 1 }, // the single-instance case through the multi path
+        .{ .n = 8, .k = 4 }, // a domain deep enough for the walk to matter
+    };
+    inline for (cases) |c| {
+        const M = Mpf(c.n, 4, c.k);
+        var alphas: [c.k]M.Index = undefined;
+        var betas: [c.k]M.Elem = undefined;
+        for (0..c.k) |j| {
+            alphas[j] = @intCast((j * 7 + 1) % M.domain_size);
+            betas[j] = @intCast(j * 0x01010101 + 1); // pairwise distinct
+        }
+        const seeds = detSeeds(c.k, c.n * 131 + c.k);
+        const keys = try M.genWithSeeds(alphas, betas, seeds[0], seeds[1]);
+
+        inline for (.{ 0, 1 }) |b| {
+            var vals: [M.domain_size * c.k]M.Elem = undefined;
+            var xs: [M.domain_size]usize = undefined;
+            var n: usize = 0;
+            const Sink = EachSink(M);
+            M.evalEachFullWith(
+                b,
+                keys[b],
+                M.domain_size,
+                Sink{ .vals = &vals, .xs = &xs, .n = &n },
+                Sink.emit,
+            );
+
+            // every domain point emitted exactly once, in ascending order
+            try testing.expectEqual(M.domain_size, n);
+            for (0..M.domain_size) |x| try testing.expectEqual(x, xs[x]);
+
+            // …and each emission is the naive per-point evaluation, per instance
+            for (0..M.domain_size) |x| {
+                var want: [c.k]M.Elem = undefined;
+                M.evalEach(b, keys[b], @intCast(x), &want);
+                try testing.expectEqualSlices(
+                    M.Elem,
+                    &want,
+                    vals[x * c.k ..][0..c.k],
+                );
+            }
+        }
+    }
+}
+
+test "DERIVED: the interleaved walk over a PREFIX matches evalEach, and never touches the tail" {
+    // The contract `pir` depends on: a domain sized generously above the
+    // record count, of which only the leading `count` indices are evaluated.
+    // Points placed inside the prefix, exactly at its last index, one past it,
+    // and at the far end of the domain — the ones outside must simply never
+    // be seen, and must not perturb the ones inside.
+    const M = Mpf(10, 4, 3);
+    const prefix_len = 300;
+    const point_sets = [_][3]M.Index{
+        .{ 0, 150, 299 }, // all inside
+        .{ 299, 300, 301 }, // straddling the boundary
+        .{ 1023, 512, 300 }, // all outside
+        .{ 7, 1023, 7 }, // repeated index, one outside
+    };
+    for (point_sets, 0..) |alphas, t| {
+        const betas: [3]M.Elem = .{ 1, 0xDEADBEEF, 0 }; // incl. β = 0
+        const seeds = detSeeds(3, 31337 + t);
+        const keys = try M.genWithSeeds(alphas, betas, seeds[0], seeds[1]);
+        inline for (.{ 0, 1 }) |b| {
+            var vals: [prefix_len * 3]M.Elem = undefined;
+            var xs: [prefix_len]usize = undefined;
+            var n: usize = 0;
+            const Sink = EachSink(M);
+            M.evalEachFullWith(
+                b,
+                keys[b],
+                prefix_len,
+                Sink{ .vals = &vals, .xs = &xs, .n = &n },
+                Sink.emit,
+            );
+            try testing.expectEqual(@as(usize, prefix_len), n);
+            for (0..prefix_len) |x| {
+                try testing.expectEqual(x, xs[x]);
+                var want: [3]M.Elem = undefined;
+                M.evalEach(b, keys[b], @intCast(x), &want);
+                try testing.expectEqualSlices(M.Elem, &want, vals[x * 3 ..][0..3]);
+            }
+        }
+    }
+}
+
+test "SELF: prefix boundaries — 0, 1, a full subtree, a straddle, and the whole domain" {
+    // Where an off-by-one in the tail pruning lives. Each length is checked
+    // for the exact emission count AND the exact index set, so "one too many"
+    // and "one too few" are both caught, in both directions.
+    const M = Mpf(9, 4, 2);
+    const alphas: [2]M.Index = .{ 3, 400 };
+    const betas: [2]M.Elem = .{ 9, 11 };
+    const seeds = detSeeds(2, 4242);
+    const keys = try M.genWithSeeds(alphas, betas, seeds[0], seeds[1]);
+
+    for ([_]usize{ 0, 1, 2, 255, 256, 257, 511, 512 }) |count| {
+        inline for (.{ 0, 1 }) |b| {
+            var vals: [512 * 2]M.Elem = undefined;
+            var xs: [512]usize = undefined;
+            var n: usize = 0;
+            const Sink = EachSink(M);
+            M.evalEachFullWith(
+                b,
+                keys[b],
+                count,
+                Sink{ .vals = &vals, .xs = &xs, .n = &n },
+                Sink.emit,
+            );
+            try testing.expectEqual(count, n);
+            for (0..count) |x| {
+                try testing.expectEqual(x, xs[x]);
+                var want: [2]M.Elem = undefined;
+                M.evalEach(b, keys[b], @intCast(x), &want);
+                try testing.expectEqualSlices(M.Elem, &want, vals[x * 2 ..][0..2]);
+            }
+        }
+    }
+}
+
+test "DERIVED: the summed forms (evalFull / evalFullWith) equal the naive evalAll" {
+    // The multi-point function's own value over the same single walk. Checked
+    // against `evalAll` — the naive loop over `eval`, which is itself a loop
+    // over `dpf.eval` — so the summing step is anchored independently of the
+    // per-instance comparison above.
+    inline for (.{ .{ .n = 4, .k = 3 }, .{ .n = 8, .k = 2 }, .{ .n = 6, .k = 5 } }) |c| {
+        const M = Mpf(c.n, 4, c.k);
+        var alphas: [c.k]M.Index = undefined;
+        var betas: [c.k]M.Elem = undefined;
+        for (0..c.k) |j| {
+            alphas[j] = @intCast((j * 11 + 2) % M.domain_size);
+            betas[j] = @intCast(j * 0x02020202 + 3);
+        }
+        const seeds = detSeeds(c.k, c.n * 977 + c.k);
+        const keys = try M.genWithSeeds(alphas, betas, seeds[0], seeds[1]);
+
+        inline for (.{ 0, 1 }) |b| {
+            var naive: [M.domain_size]M.Elem = undefined;
+            var fast: [M.domain_size]M.Elem = undefined;
+            M.evalAll(b, keys[b], &naive);
+            M.evalFull(b, keys[b], &fast);
+            try testing.expectEqualSlices(M.Elem, &naive, &fast);
+
+            // the streaming form emits the same values, in order, once each
+            var vals: [M.domain_size]M.Elem = undefined;
+            var xs: [M.domain_size]usize = undefined;
+            var n: usize = 0;
+            const Sink = ElemSink(M);
+            M.evalFullWith(
+                b,
+                keys[b],
+                M.domain_size,
+                Sink{ .vals = &vals, .xs = &xs, .n = &n },
+                Sink.emit,
+            );
+            try testing.expectEqual(M.domain_size, n);
+            for (0..M.domain_size) |x| try testing.expectEqual(x, xs[x]);
+            try testing.expectEqualSlices(M.Elem, &naive, &vals);
+        }
+        // and both parties' prefix evaluations still reconstruct f_{A,B}
+        var f0: [M.domain_size]M.Elem = undefined;
+        var f1: [M.domain_size]M.Elem = undefined;
+        M.evalFull(0, keys[0], &f0);
+        M.evalFull(1, keys[1], &f1);
+        try testing.expectEqual(@as(?usize, null), M.firstMismatch(&f0, &f1, alphas, betas));
+    }
+}
+
+test "DERIVED: k=1's interleaved walk is dpf.evalFull; k=0 emits the prefix with nothing in it" {
+    // The two degenerate ends of the bundle. k=1 must be the single-tree walk
+    // exactly — same values, same indices — and k=0 must still be a defined,
+    // total traversal rather than a special case someone forgot.
+    const D = Dpf(7, 8);
+    const M1 = Mpf(7, 8, 1);
+    const s0 = detSeed(6001);
+    const s1 = detSeed(6002);
+    const single = D.genWithSeeds(55, 0x0BADF00DDEADBEEF, s0, s1);
+    const multi = try M1.genWithSeeds(.{55}, .{0x0BADF00DDEADBEEF}, .{s0}, .{s1});
+    inline for (.{ 0, 1 }) |b| {
+        var want: [D.domain_size]D.Elem = undefined;
+        var got: [M1.domain_size]M1.Elem = undefined;
+        D.evalFull(b, single[b], &want);
+        M1.evalFull(b, multi[b], &got);
+        try testing.expectEqualSlices(D.Elem, &want, &got);
+    }
+
+    const M0 = Mpf(5, 4, 0);
+    const keys0 = try M0.genWithSeeds(.{}, .{}, .{}, .{});
+    var xs: [32]usize = undefined;
+    var vals: [0]M0.Elem = undefined;
+    var n: usize = 0;
+    const Sink = EachSink(M0);
+    M0.evalEachFullWith(0, keys0[0], 20, Sink{ .vals = &vals, .xs = &xs, .n = &n }, Sink.emit);
+    try testing.expectEqual(@as(usize, 20), n);
+    for (0..20) |x| try testing.expectEqual(x, xs[x]);
+}
+
+test "SELF: the emitted index sequence is identical for every key and every party" {
+    // The side-channel statement, as an executable one: the walk's shape is a
+    // function of `count` alone. It prunes on the index range only, never on a
+    // seed, a control bit or an evaluated share — so a server's memory access
+    // pattern carries nothing about the client's points. Keys spanning the
+    // domain's extremes, plus arbitrary non-key bytes decoded as a key.
+    const M = Mpf(8, 4, 3);
+    const count = 200;
+    const alpha_sets = [_][3]M.Index{
+        .{ 0, 1, 2 },
+        .{ 255, 254, 253 },
+        .{ 0, 128, 255 },
+        .{ 77, 77, 77 },
+    };
+    var reference: [count]usize = undefined;
+    var have_reference = false;
+
+    for (alpha_sets, 0..) |alphas, t| {
+        const seeds = detSeeds(3, 808 + t);
+        const keys = try M.genWithSeeds(alphas, .{ 1, 1, 1 }, seeds[0], seeds[1]);
+        inline for (.{ 0, 1 }) |b| {
+            var xs: [count]usize = undefined;
+            var vals: [count * 3]M.Elem = undefined;
+            var n: usize = 0;
+            const Sink = EachSink(M);
+            M.evalEachFullWith(b, keys[b], count, Sink{ .vals = &vals, .xs = &xs, .n = &n }, Sink.emit);
+            try testing.expectEqual(@as(usize, count), n);
+            if (have_reference) {
+                try testing.expectEqualSlices(usize, &reference, &xs);
+            } else {
+                reference = xs;
+                have_reference = true;
+            }
+        }
+    }
+
+    // …and for key material that is not a key at all.
+    var buf: [M.Key.serialized_len]u8 = undefined;
+    for (&buf, 0..) |*byte, i| byte.* = @truncate(i *% 197 +% 13);
+    const junk = M.Key.fromBytes(&buf);
+    var xs: [count]usize = undefined;
+    var vals: [count * 3]M.Elem = undefined;
+    var n: usize = 0;
+    const Sink = EachSink(M);
+    M.evalEachFullWith(1, junk, count, Sink{ .vals = &vals, .xs = &xs, .n = &n }, Sink.emit);
+    try testing.expectEqual(@as(usize, count), n);
+    try testing.expectEqualSlices(usize, &reference, &xs);
+}
+
 // ── EXTERNAL: the inherited anchor ────────────────────────────────────────
 
 test "EXTERNAL: an Mpf key reproduces two independently-derived DPF KAT vectors" {
@@ -507,6 +821,24 @@ fn fuzzKeyFromBytes(_: void, smith: *std.testing.Smith) !void {
     const key = FuzzMpf.Key.fromBytes(&buf);
 
     const party: u1 = @truncate(smith.valueRangeAtMost(u8, 0, 1));
+
+    // The interleaved walk, over a prefix the fuzzer chooses, on key material
+    // that is not a key: equivalence to the naive per-point path must hold for
+    // arbitrary bytes, not only for keys `Gen` produced.
+    const count: usize = smith.valueRangeAtMost(u16, 0, FuzzMpf.domain_size);
+    var fast: [FuzzMpf.domain_size * 3]FuzzMpf.Elem = undefined;
+    var fast_xs: [FuzzMpf.domain_size]usize = undefined;
+    var emitted: usize = 0;
+    const Sink = EachSink(FuzzMpf);
+    FuzzMpf.evalEachFullWith(
+        party,
+        key,
+        count,
+        Sink{ .vals = &fast, .xs = &fast_xs, .n = &emitted },
+        Sink.emit,
+    );
+    try std.testing.expectEqual(count, emitted);
+
     var each: [3]FuzzMpf.Elem = undefined;
     var acc: FuzzMpf.Elem = 0;
     var x: usize = 0;
@@ -516,6 +848,10 @@ fn fuzzKeyFromBytes(_: void, smith: *std.testing.Smith) !void {
         var sum: FuzzMpf.Elem = 0;
         for (each) |e| sum +%= e;
         try std.testing.expectEqual(FuzzMpf.eval(party, key, xi), sum);
+        if (x < count) {
+            try std.testing.expectEqual(x, fast_xs[x]);
+            try std.testing.expectEqualSlices(FuzzMpf.Elem, &each, fast[x * 3 ..][0..3]);
+        }
         acc +%= sum;
     }
     std.mem.doNotOptimizeAway(acc);

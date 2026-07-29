@@ -372,10 +372,16 @@ pub fn Pir(comptime domain_bits: usize, comptime word_bytes: usize) type {
         ///   both blocks. In the summed function those same points would add
         ///   to `2·record[7]`; the two semantics diverge exactly at repetition,
         ///   which is why retrieval uses the components and not the sum.
-        /// - **One pass over the database, not `k`.** The loop is over records
-        ///   on the outside and instances on the inside, so each record's bytes
-        ///   are read and decomposed once. That is a memory-traffic win only —
-        ///   the DPF evaluations are still `k·N`.
+        /// - **One pass over the database, not `k`.** The server runs
+        ///   `fss.Mpf`'s *interleaved* tree-reuse walk (`evalEachFullWith`):
+        ///   one descent of the `[0, count())` prefix carrying all `k` tree
+        ///   states, handing the consumer every instance's share at each
+        ///   record as it arrives. So each record's bytes are read and
+        ///   decomposed once — and, unlike the earlier per-point loop, each
+        ///   record now costs ~`k` PRG calls instead of `k·domain_bits`.
+        ///   What no traversal can remove is the factor `k` itself: the
+        ///   evaluations are still `k·N` (see `fss/mpf.zig` on why this
+        ///   construction pays it).
         ///
         /// `k = 0` is a degenerate no-op (a zero-byte share, an empty answer),
         /// accepted so the boundary is defined rather than undefined.
@@ -472,7 +478,16 @@ pub fn Pir(comptime domain_bits: usize, comptime word_bytes: usize) type {
                 /// Touches every record exactly once, with no early exit and
                 /// no branch on any evaluated share — the same access-pattern
                 /// requirement as the single-index `answer`, and it matters
-                /// more here because there are `k` indices to leak.
+                /// more here because there are `k` indices to leak. The walk
+                /// that drives it (`Mpf.evalEachFullWith`) prunes only on the
+                /// index range, identically in all `k` trees, so the record
+                /// access order is a function of `count()` alone.
+                ///
+                /// Streaming, like the single-index `answer` and for the same
+                /// reason: this module has no allocator, so each record's `k`
+                /// components are folded into `out` as the walk produces them
+                /// and no `count()`-sized buffer exists. The domain's unused
+                /// tail past `count()` is never evaluated.
                 pub fn answer(party: u1, share: Mul.Share, database: Database, out: []Mul.Word) Error!void {
                     const per = Single.answerWords(database.record_len);
                     if (out.len != try Mul.answerWords(database.record_len)) {
@@ -482,18 +497,25 @@ pub fn Pir(comptime domain_bits: usize, comptime word_bytes: usize) type {
                     if (n > Mul.domain_size) return error.DomainTooSmall;
 
                     @memset(out, 0);
-                    var sel: [k]Mul.Word = undefined;
-                    var x: usize = 0;
-                    while (x < n) : (x += 1) {
-                        Mpf.evalEach(party, share, @intCast(x), &sel);
-                        const rec = database.record(x);
-                        // Records outside, instances inside: each record's
-                        // bytes are decomposed once and reused across all k.
-                        for (0..per) |w| {
-                            const word = Single.wordAt(rec, w);
-                            for (sel, 0..) |s, j| out[j * per + w] +%= s *% word;
-                        }
-                    }
+                    const Ctx = struct { database: Database, out: []Mul.Word, per: usize };
+                    Mpf.evalEachFullWith(
+                        party,
+                        share,
+                        n,
+                        Ctx{ .database = database, .out = out, .per = per },
+                        struct {
+                            fn emit(ctx: Ctx, x: usize, sel: *const [k]Mpf.Elem) void {
+                                const rec = ctx.database.record(x);
+                                // Records outside, instances inside: each
+                                // record's bytes are decomposed once and
+                                // reused across all k.
+                                for (0..ctx.per) |w| {
+                                    const word = Single.wordAt(rec, w);
+                                    for (sel, 0..) |s, j| ctx.out[j * ctx.per + w] +%= s *% word;
+                                }
+                            }
+                        }.emit,
+                    );
                 }
 
                 /// Combine the two servers' retrieval answers into the `k`
@@ -573,12 +595,21 @@ pub fn Pir(comptime domain_bits: usize, comptime word_bytes: usize) type {
                     if (n > Mul.domain_size) return error.DomainTooSmall;
 
                     @memset(out, 0);
-                    var x: usize = 0;
-                    while (x < n) : (x += 1) {
-                        const sel = Mpf.eval(party, share, @intCast(x));
-                        const rec = database.record(x);
-                        for (out, 0..) |*w, j| w.* +%= sel *% Single.wordAt(rec, j);
-                    }
+                    // The same single interleaved walk as `answer`, summed:
+                    // the multi-point function's own value per record.
+                    const Ctx = struct { database: Database, out: []Mul.Word };
+                    Mpf.evalFullWith(
+                        party,
+                        share,
+                        n,
+                        Ctx{ .database = database, .out = out },
+                        struct {
+                            fn emit(ctx: Ctx, x: usize, sel: Mpf.Elem) void {
+                                const rec = ctx.database.record(x);
+                                for (ctx.out, 0..) |*w, j| w.* +%= sel *% Single.wordAt(rec, j);
+                            }
+                        }.emit,
+                    );
                 }
 
                 /// Combine two aggregate answers into the summed record.
@@ -1159,6 +1190,145 @@ test "DERIVED: block j equals an independent single-index query on instance j's 
             block[0..per],
             multi_answer[j * per ..][0..per],
         );
+    }
+}
+
+// ── the interleaved walk vs the naive per-point server loop ───────────────
+//
+// `Multi.answer` runs `fss.Mpf`'s interleaved walk: ONE descent of the record
+// prefix carrying all k tree states. The two oracles below are the server loop
+// as it was *before* that walk existed — k independent per-point evaluations
+// per record, each re-walking its tree from the root. They share no traversal
+// state with the fast path, and they are the thing the fast path must
+// reproduce word for word. **They must not be "fixed" to match the fast path;
+// if they disagree, the fast path is wrong.**
+
+/// ORACLE: the naive k-record retrieval loop (`Mpf.evalEach` per record).
+fn answerNaive(
+    comptime P: type,
+    comptime k: usize,
+    party: u1,
+    share: P.Multi(k).Share,
+    database: Database,
+    out: []P.Word,
+) void {
+    const M = P.Multi(k);
+    const per = P.answerWords(database.record_len);
+    @memset(out, 0);
+    var sel: [k]P.Word = undefined;
+    var x: usize = 0;
+    while (x < database.count()) : (x += 1) {
+        M.Mpf.evalEach(party, share, @intCast(x), &sel);
+        const rec = database.record(x);
+        for (0..per) |w| {
+            const word = P.wordAt(rec, w);
+            for (sel, 0..) |s, j| out[j * per + w] +%= s *% word;
+        }
+    }
+}
+
+/// ORACLE: the naive aggregate loop (`Mpf.eval` per record).
+fn aggregateNaive(
+    comptime P: type,
+    comptime k: usize,
+    party: u1,
+    share: P.Multi(k).Share,
+    database: Database,
+    out: []P.Word,
+) void {
+    const M = P.Multi(k);
+    @memset(out, 0);
+    var x: usize = 0;
+    while (x < database.count()) : (x += 1) {
+        const sel = M.Mpf.eval(party, share, @intCast(x));
+        const rec = database.record(x);
+        for (out, 0..) |*w, j| w.* +%= sel *% P.wordAt(rec, j);
+    }
+}
+
+test "DERIVED: the interleaved server loop reproduces the naive per-record loop, word for word" {
+    // Geometries chosen where a traversal bug would surface: a database far
+    // below the domain (the pruned tail), one exactly filling it, non-powers of
+    // two either side of a subtree boundary, k=1 and k>count. Both parties,
+    // both the retrieval and the aggregate shape, record lengths straddling the
+    // word boundary.
+    const cases = .{
+        .{ .bits = 3, .count = 5, .k = 2 },
+        .{ .bits = 4, .count = 16, .k = 3 }, // database == domain
+        .{ .bits = 5, .count = 17, .k = 1 },
+        .{ .bits = 6, .count = 33, .k = 4 }, // one above a subtree boundary
+        .{ .bits = 6, .count = 31, .k = 2 }, // one below
+        .{ .bits = 8, .count = 40, .k = 3 }, // domain 256, most of it pruned
+        .{ .bits = 4, .count = 3, .k = 5 }, // k > count
+    };
+    const record_lens = [_]usize{ 1, 4, 7, 16 };
+
+    inline for (cases) |c| {
+        const P = Pir(c.bits, 4);
+        const M = P.Multi(c.k);
+        for (record_lens) |record_len| {
+            var storage: [256 * 16]u8 = undefined;
+            const bytes = storage[0 .. c.count * record_len];
+            fillDb(bytes, record_len);
+            const database = try Database.init(bytes, record_len);
+            const per = P.answerWords(record_len);
+            const n_words = try M.answerWords(record_len);
+
+            var indices: [c.k]usize = undefined;
+            for (&indices, 0..) |*idx, j| idx.* = (j * 5 + 1) % c.count;
+            const seeds = detSeedsK(c.k, @as(u64, c.bits) * 65537 + record_len);
+            const shares = try M.query(indices, seeds[0], seeds[1]);
+
+            inline for (.{ 0, 1 }) |party| {
+                var fast: [c.k * 4]M.Word = undefined;
+                var slow: [c.k * 4]M.Word = undefined;
+                try M.answer(party, shares[party], database, fast[0..n_words]);
+                answerNaive(P, c.k, party, shares[party], database, slow[0..n_words]);
+                try testing.expectEqualSlices(M.Word, slow[0..n_words], fast[0..n_words]);
+
+                var agg_fast: [4]M.Word = undefined;
+                var agg_slow: [4]M.Word = undefined;
+                try M.answerAggregate(party, shares[party], database, agg_fast[0..per]);
+                aggregateNaive(P, c.k, party, shares[party], database, agg_slow[0..per]);
+                try testing.expectEqualSlices(M.Word, agg_slow[0..per], agg_fast[0..per]);
+            }
+        }
+    }
+}
+
+test "DERIVED: the interleaved loop matches the naive one on key material Gen never produced" {
+    // A server answers with whatever bytes a client sent. Equivalence of the
+    // two traversals must therefore hold for arbitrary key material, not only
+    // for honest keys — and the control bits an arbitrary key carries are
+    // exactly what drives the per-level CW gating the walk had to re-implement.
+    const P = Pir(7, 8);
+    const k = 3;
+    const M = P.Multi(k);
+    const record_len = 11;
+    const count = 70;
+    var bytes: [count * record_len]u8 = undefined;
+    fillDb(&bytes, record_len);
+    const database = try Database.init(&bytes, record_len);
+    const per = P.answerWords(record_len);
+    const n_words = try M.answerWords(record_len);
+
+    for (0..8) |t| {
+        var buf: [M.share_len]u8 = undefined;
+        for (&buf, 0..) |*b, i| b.* = @truncate(i *% (31 + t * 2) +% t *% 97 +% 5);
+        const share = try M.shareFromBytes(&buf);
+        inline for (.{ 0, 1 }) |party| {
+            var fast: [k * 2]M.Word = undefined;
+            var slow: [k * 2]M.Word = undefined;
+            try M.answer(party, share, database, fast[0..n_words]);
+            answerNaive(P, k, party, share, database, slow[0..n_words]);
+            try testing.expectEqualSlices(M.Word, slow[0..n_words], fast[0..n_words]);
+
+            var agg_fast: [2]M.Word = undefined;
+            var agg_slow: [2]M.Word = undefined;
+            try M.answerAggregate(party, share, database, agg_fast[0..per]);
+            aggregateNaive(P, k, party, share, database, agg_slow[0..per]);
+            try testing.expectEqualSlices(M.Word, agg_slow[0..per], agg_fast[0..per]);
+        }
     }
 }
 

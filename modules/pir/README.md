@@ -237,11 +237,10 @@ the callout), and there is no published-mapping distribution and no
 cuckoo/multi-slot placement (see `SPEC.md` §"Keyword lookup" for why both
 were declined). `Verified` detects but never repairs — no recovery, no
 attribution, no protection when both servers serve the same modified database
-(see above). `Multi(k)` amortizes the database *pass* but still costs `k` DPF
-evaluations per record — sublinear batch PIR needs the cuckoo/batch-code
-multi-point construction, scoped out in `fss` — and has no verified variant
-yet; its inner loop also still uses per-point `eval` (the `evalFull` wiring
-covers the single-index and `Verified` paths — see `SPEC.md` §"Scoped out").
+(see above). `Multi(k)` makes a single pass over the database — `fss`'s
+interleaved `k`-tree prefix walk, ~`k` PRG calls per record — but still costs
+`k` DPF evaluations per record; sublinear batch PIR needs the cuckoo/batch-code
+multi-point construction, scoped out in `fss`. It has no verified variant yet.
 The base (unverified) protocol remains available where integrity is provided
 elsewhere.
 

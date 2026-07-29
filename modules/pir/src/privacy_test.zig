@@ -493,6 +493,73 @@ test "EXACT: per-instance level-1 CW parity is index-independent; the seed CW is
     }
 }
 
+test "EXACT: the multi-index server's record access order is a function of the record count alone" {
+    // `Multi.answer` no longer loops over records itself: it is driven by
+    // `fss.Mpf`'s interleaved k-tree walk, which decides in what order — and
+    // whether at all — each record is touched. That makes the walk's emission
+    // sequence exactly the server's memory access pattern over the database,
+    // so it is pinned here rather than left to the evaluator's own tests.
+    //
+    // The claim: the sequence is `0, 1, …, count-1` for EVERY share. The walk
+    // prunes on the index range only (identically in all k trees, before any
+    // PRG call), never on a seed, a control bit or an evaluated share — so a
+    // server that watched its own page faults would learn nothing about the k
+    // indices, and a client's `k` points cannot make the server skip, revisit
+    // or reorder a record.
+    const P = pir.Pir(8, 4);
+    const k = 3;
+    const M = P.Multi(k);
+
+    const Trace = struct {
+        xs: []usize,
+        n: *usize,
+        fn emit(self: @This(), x: usize, _: *const [k]M.Mpf.Elem) void {
+            self.xs[self.n.*] = x;
+            self.n.* += 1;
+        }
+    };
+
+    for ([_]usize{ 1, 2, 100, 255, 256 }) |count| {
+        var reference: [256]usize = undefined;
+        var have_reference = false;
+
+        const index_sets = [_][k]usize{
+            .{ 0, 1, 2 }, // clustered at the start
+            .{ 253, 254, 255 }, // clustered at the end, past small counts
+            .{ 7, 7, 7 }, // all equal
+            .{ 0, 128, 255 }, // spread
+        };
+        for (index_sets, 0..) |indices, t| {
+            const seeds = detSeedsK(k, 4700 + t);
+            const shares = try M.query(indices, seeds[0], seeds[1]);
+            inline for (.{ 0, 1 }) |party| {
+                var xs: [256]usize = undefined;
+                var n: usize = 0;
+                M.Mpf.evalEachFullWith(party, shares[party], count, Trace{ .xs = &xs, .n = &n }, Trace.emit);
+                try testing.expectEqual(count, n);
+                for (0..count) |x| try testing.expectEqual(x, xs[x]);
+                if (have_reference) {
+                    try testing.expectEqualSlices(usize, reference[0..count], xs[0..count]);
+                } else {
+                    @memcpy(reference[0..count], xs[0..count]);
+                    have_reference = true;
+                }
+            }
+        }
+
+        // …and for a share that is not a share: arbitrary bytes from a hostile
+        // client must not be able to steer the access pattern either.
+        var buf: [M.share_len]u8 = undefined;
+        for (&buf, 0..) |*b, i| b.* = @truncate(i *% 211 +% 17);
+        const junk = try M.shareFromBytes(&buf);
+        var xs: [256]usize = undefined;
+        var n: usize = 0;
+        M.Mpf.evalEachFullWith(1, junk, count, Trace{ .xs = &xs, .n = &n }, Trace.emit);
+        try testing.expectEqual(count, n);
+        try testing.expectEqualSlices(usize, reference[0..count], xs[0..count]);
+    }
+}
+
 // ── STAT (multi): does the relationship between the indices separate? ─────
 
 const PM = pir.Pir(8, 4).Multi(2);

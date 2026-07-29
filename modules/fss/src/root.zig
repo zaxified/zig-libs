@@ -32,7 +32,10 @@
 //!     constructions and for what would justify revisiting it.
 //!     `.genWithSeeds(αs, βs, s0s, s1s)`, `.eval` (the summed multi-point
 //!     value) and `.evalEach` (the `k` components, unsummed — what a consumer
-//!     wanting `k` *separate* results needs).
+//!     wanting `k` *separate* results needs), plus the prefix evaluators
+//!     `.evalEachFullWith` / `.evalFullWith` / `.evalFull`: ONE interleaved
+//!     walk descending all `k` trees together, so a consumer's data is
+//!     traversed once and each index costs ~`k` PRG calls instead of `k·n`.
 //!   - `prg` / `group` — the mechanical building blocks (both usable alone).
 //!
 //! Room to grow (all OUT of Phase 1, see SPEC.md): a `dcf.zig` Distributed
