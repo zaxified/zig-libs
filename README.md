@@ -191,7 +191,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 |---|---|---|---|
 | `kv` | Crash-consistent embedded KV store (Bitcask-style log + **randomized seeded VOPR**: model-checked crash recovery across fuzzed fault schedules) | any | — |
 | `kvtree` | Ordered **transactional** KV store — copy-on-write B-tree (LMDB/BoltDB lineage): MVCC snapshot isolation, multi-key ACID txns, ordered range scans, VOPR-checked crash-safety. Crash-atomicity core (COW commit / crash-recovery meta-selection / reader-safe reclaim) implemented; property + crash-sweep tests run for real | any | kv |
-| `ramcache` | Bounded in-memory cache — **W-TinyLFU** admission/eviction (window+SLRU+CMS sketch) + TTL + generation invalidation | any | — |
+| `ramcache` | Bounded in-memory cache — **W-TinyLFU** admission/eviction (window+SLRU+CMS sketch) + TTL + generation invalidation, plus a sharded thread-safe wrapper | any | — |
 | `decimal` | Exact i128 fixed-point decimal (money math), float-free — with IEEE/GDA rounding modes, rescale + rounded division | any | — |
 | `jobqueue` | Durable background-job queue over `kv` — lease/retry/DLQ, per-partition FIFO under priority, scheduled visibility | posix | kv |
 | `blobstore` | Content-addressed blob store (git-object/restic style) + name-addressed + small named-record layers, crash-safe | posix | hashdigest |

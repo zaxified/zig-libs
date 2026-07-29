@@ -12,9 +12,10 @@ Friedman) with design refs Caffeine and ristretto — see NOTICE.
 
 - **Model after:** Go `groupcache` / `ristretto`; the generation-tie is the novel bit.
 - **Platform:** any (pure `std`, dependency-free). **Role:** util.
-- **Concurrency:** `single_owner` — NOT internally synchronized, no lock by
-  design. One thread/event loop owns the instance; wrap it in your own lock if
-  you must share it.
+- **Concurrency:** `Cache` is `single_owner` — NOT internally synchronized, no
+  lock by design. One thread/event loop owns the instance. To share a cache
+  across threads use **`Sharded`** (below), a wrapper *alongside* `Cache`, so
+  the single-owner hit path stays lock-free.
 - **Determinism:** the caller supplies the clock (`now_ns`) and the generation
   counter on every call — zero global/time dependency, fully deterministic tests.
 
@@ -75,5 +76,60 @@ const Flusher = struct {
 c.drainDirty(Flusher.drain, null); // call periodically
 ```
 
+## `Sharded` — the thread-safe option
+
+`ramcache.Sharded` holds **N independent `Cache` instances**, each behind its own
+spinlock, selected by a hash of the key. `Cache` itself is untouched: a
+single-owner consumer keeps its lock-free hit path.
+
+```zig
+var sc = try ramcache.Sharded.init(gpa, .{
+    .max_bytes = 32 << 20,  // AGGREGATE budget — divided by the shard count
+    .max_entries = 4096,    // ditto
+    .shards = 16,           // rounded up to a power of two, clamped (see below)
+});
+defer sc.deinit();
+
+sc.put(key, value, now_ns, ttl_ns, gen);   // same contract as Cache.put
+
+// Zero-allocation read: the value is copied into YOUR buffer under the lock.
+var buf: [4096]u8 = undefined;
+switch (sc.getBuf(key, now_ns, cur_gen, &buf)) {
+    .ok => |v| use(v),                       // v aliases `buf`, not the cache
+    .miss => fetchFromOrigin(),
+    .buffer_too_small => |need| retryWith(need),
+}
+
+// Or an allocator-owned copy when you have no size bound:
+if (try sc.get(key, now_ns, cur_gen)) |owned| {
+    defer sc.free(owned);
+    use(owned);
+}
+```
+
+**There is no borrowed-slice `get`, deliberately.** `Cache.get` hands back a
+slice into cache storage; another thread can evict that entry the instant the
+lock is released, so that contract cannot be honoured concurrently. Both reads
+above finish copying before the lock drops. The signatures differ from
+`Cache`'s on purpose — single-owner code pasted across fails to *compile*
+instead of corrupting memory under load.
+
+**What sharding costs** (`Sharded`'s doc comment has the full statement):
+
+- **Eviction is per shard.** The admission gate, the frequency sketch, the
+  doorkeeper, the aging counter and the recency order are all per shard, so each
+  sketch sees ~1/N of the traffic and admission quality drops. `max_bytes` /
+  `max_entries` are floor-divided per shard, so a hot shard evicts while a cold
+  one has room, and a single value must fit `max_bytes / N`.
+- **Aggregate operations are not atomic across shards.** `stats()` is an
+  approximate, per-shard-consistent snapshot; `clear()` guarantees only that each
+  entry present when its shard was locked is gone; `drainDirty` visits each entry
+  dirty at the time its shard was locked.
+- **`on_evict` now fires from any thread, with a shard lock held.** It must be
+  thread-safe, cheap, and must **not** call back into the same `Sharded` (a
+  deadlock, not a detected error). Same for `drainDirty`'s callback — which is
+  why the async flusher's ack is `markCleanIf(key, flushed_value)`, a
+  compare-and-clear that refuses to ack a value another thread has overwritten.
+
 Tests: `zig build test-ramcache` (deterministic — injected `now_ns`/generation,
-no real clock).
+no real clock; the `Sharded` concurrency tests use real threads).

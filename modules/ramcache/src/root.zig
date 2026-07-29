@@ -45,7 +45,14 @@
 //!   * **Concurrency = single owner.** The cache is NOT internally
 //!     synchronized — no lock, by design (`meta.concurrency = .single_owner`).
 //!     One thread/event loop owns the instance; a caller who needs to share it
-//!     across threads must wrap it in their own lock.
+//!     across threads either wraps it in their own lock or uses this module's
+//!     **`Sharded`** (see `sharded.zig`) — N independent `Cache` instances,
+//!     each behind its own lock, selected by a hash of the key. `Sharded` is a
+//!     wrapper *alongside* `Cache`, never a lock inside it: the single-owner
+//!     hit path stays lock-free for the five modules that own an instance from
+//!     one thread. Its semantics differ where sharding forces them to
+//!     (per-shard eviction, non-atomic aggregates, a value handoff that cannot
+//!     return a borrowed slice) — all of that is documented on `Sharded`.
 //!   * `put` silently no-ops on OOM — a cache miss is never fatal. If the
 //!     frequency sketch itself cannot be allocated, the cache degrades to
 //!     plain LRU eviction (admission gate always passes).
@@ -64,10 +71,20 @@
 
 const std = @import("std");
 
+/// The internally-synchronized wrapper: N independent `Cache` instances, one
+/// lock each, picked by a hash of the key. Its own doc comment carries the
+/// full contract — the value handoff, the per-shard eviction semantics, and
+/// what the aggregate operations do and do not guarantee.
+pub const Sharded = @import("sharded.zig").Sharded;
+
 pub const meta = .{
     .platform = .any,
     .role = .util,
-    .concurrency = .single_owner, // one thread/loop owns it, lock-free by design
+    // Describes `Cache`, this module's primary type: one thread/loop owns it,
+    // lock-free by design. The opt-in `Sharded` wrapper in the same module is
+    // internally synchronized (it would tag `.threadsafe`); the vocabulary has
+    // one tag per module, so it names the default type.
+    .concurrency = .single_owner,
     .model_after = "W-TinyLFU (TinyLFU paper, Einziger & Friedman; Caffeine/ristretto design, clean-room); generation-tie novel",
     .deps = .{}, // std only
 };
@@ -618,6 +635,14 @@ pub const Cache = struct {
 };
 
 // ── tests (deterministic: injected now_ns + generation, no real clock) ──────
+
+// Multi-file aggregator (CONVENTIONS §6.3, the dark-tests rule): a bare
+// `pub const Sharded = @import("sharded.zig").Sharded` does NOT pull that
+// file's tests into the test binary.
+test {
+    _ = @import("sharded.zig");
+}
+
 const testing = std.testing;
 
 fn testCache(max_bytes: usize, max_entries: usize) Cache {
