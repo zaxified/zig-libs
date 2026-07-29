@@ -173,6 +173,76 @@ pub const KeyPackage = struct {
     }
 };
 
+// ── building one (Part 8) ─────────────────────────────────────────────────
+
+/// Everything a client chooses when it publishes a `KeyPackage`. The three
+/// key pairs are the caller's to generate and to KEEP: a `KeyPackage` is the
+/// public half of a join, and the private halves are what
+/// `group.Group(S).fromWelcome` later needs (`init_priv`,
+/// `encryption_priv`) plus what every message it sends is signed with.
+pub fn CreateParams(comptime S: type) type {
+    return struct {
+        /// Signs the `KeyPackageTBS` and the `LeafNodeTBS` inside it — RFC
+        /// 9420 §10 uses ONE key for both, `leaf_node.signature_key`.
+        signature_key_pair: S.Sig.KeyPair,
+        /// §10: the key a `Welcome` is encrypted to. MUST differ from
+        /// `encryption_key` (§10 keeps them distinct so joining and the
+        /// ratchet tree never share a key).
+        init_key: S.Kem.PublicKey,
+        /// §7.2: the leaf's ratchet-tree HPKE key.
+        encryption_key: S.Kem.PublicKey,
+        credential: tree.Credential,
+        capabilities: tree.Capabilities,
+        /// §7.2: `key_package` is the only `leaf_node_source` a KeyPackage's
+        /// leaf may carry (§7.3), and it is the source whose `select` field
+        /// is a `Lifetime` — so one is required here. This module reads no
+        /// clock (`meta.platform = .any`, no I/O), so the window is the
+        /// caller's to choose and the caller's to check on receipt.
+        lifetime: tree.Lifetime,
+        leaf_extensions: []const tree.Extension = &.{},
+        extensions: []const tree.Extension = &.{},
+    };
+}
+
+/// Assemble and sign a `KeyPackage` (RFC 9420 §10), inner `LeafNode` first
+/// (§7.2) and the whole structure second — the order the two signatures
+/// nest in, since `KeyPackageTBS` covers the already-signed leaf.
+///
+/// Every byte field of the result is allocated from `allocator`; the
+/// caller-supplied `credential`/`capabilities`/extension contents are
+/// aliased, not copied, and must outlive it. `deinit` is NOT the right way
+/// to free this — it frees only what `decode` allocates — so callers
+/// generally hand this an arena, or take `encodeAlloc`'s bytes and drop the
+/// struct.
+pub fn create(comptime S: type, allocator: std.mem.Allocator, params: CreateParams(S)) !KeyPackage {
+    var leaf: tree.LeafNode = .{
+        .encryption_key = try allocator.dupe(u8, &params.encryption_key),
+        .signature_key = try allocator.dupe(u8, &params.signature_key_pair.public_key.toBytes()),
+        .credential = params.credential,
+        .capabilities = params.capabilities,
+        .leaf_node_source = .key_package,
+        .lifetime = params.lifetime,
+        .extensions = params.leaf_extensions,
+        .signature = &.{},
+    };
+    // §7.2: `group_id`/`leaf_index` are NOT part of a key_package-sourced
+    // `LeafNodeTBS`, which is exactly why a KeyPackage can be published
+    // before any group exists. The two arguments are ignored here.
+    const leaf_sig = try leaf.sign(S, allocator, params.signature_key_pair, "", 0);
+    leaf.signature = try allocator.dupe(u8, &leaf_sig.toBytes());
+
+    var kp: KeyPackage = .{
+        .cipher_suite = S.id,
+        .init_key = try allocator.dupe(u8, &params.init_key),
+        .leaf_node = leaf,
+        .extensions = params.extensions,
+        .signature = &.{},
+    };
+    const sig = try kp.sign(S, allocator, params.signature_key_pair);
+    kp.signature = try allocator.dupe(u8, &sig.toBytes());
+    return kp;
+}
+
 // ── tests ─────────────────────────────────────────────────────────────
 
 const testing = std.testing;

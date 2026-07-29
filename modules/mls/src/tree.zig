@@ -426,6 +426,34 @@ pub const LeafNode = struct {
         const sig = S.Sig.Signature.fromBytes(sig_bytes);
         try crypto.VerifyWithLabelAlloc(S, allocator, pk, "LeafNodeTBS", content, sig);
     }
+
+    /// The signing counterpart of `verifySignature`: `SignWithLabel(.,
+    /// "LeafNodeTBS", LeafNodeTBS)` over `self` with its `signature` field
+    /// ignored. Does not mutate `self` — the caller stores the returned
+    /// bytes and assigns them, the same contract `keypackage.KeyPackage
+    /// .sign` and `welcome.GroupInfo.sign` have, and for the same reason:
+    /// `signature` aliases caller memory and this file owns no allocation
+    /// policy for it.
+    ///
+    /// `group_id`/`leaf_index` are ignored for a `key_package`-sourced leaf
+    /// and REQUIRED for an `update`- or `commit`-sourced one (§7.2's
+    /// `LeafNodeTBS` binds those two fields only in the latter case) —
+    /// exactly the asymmetry `tbsEncode` implements, expressed here by
+    /// taking the same two arguments rather than a second entry point.
+    pub fn sign(
+        self: LeafNode,
+        comptime S: type,
+        allocator: std.mem.Allocator,
+        key_pair: S.Sig.KeyPair,
+        group_id: []const u8,
+        leaf_index: u32,
+    ) !S.Sig.Signature {
+        const buf = try allocator.alloc(u8, self.tbsEncodedLen(group_id.len));
+        defer allocator.free(buf);
+        var w = codec.Writer.init(buf);
+        try self.tbsEncode(&w, group_id, leaf_index);
+        return crypto.SignWithLabelAlloc(S, allocator, key_pair, "LeafNodeTBS", w.finish());
+    }
 };
 
 // ── §7.1: ParentNode ──────────────────────────────────────────────────────
@@ -719,6 +747,57 @@ pub const RatchetTree = struct {
         }
     }
 };
+
+// ── §7.2: sign is the exact inverse of verifySignature ────────────────────
+
+test "§7.2: LeafNode.sign round-trips through verifySignature, and the group binding is real" {
+    const gpa = std.testing.allocator;
+    const S = @import("suite.zig").default;
+
+    var seed: [32]u8 = @splat(0x27);
+    const kp = try S.Sig.KeyPair.generateDeterministic(seed);
+    seed = @splat(0);
+    const sig_pub = kp.public_key.toBytes();
+
+    var leaf: LeafNode = .{
+        .encryption_key = &[_]u8{0xa0} ** 32,
+        .signature_key = &sig_pub,
+        .credential = .{ .basic = "signer" },
+        .capabilities = .{
+            .versions = &.{1},
+            .cipher_suites = &.{1},
+            .extensions = &.{},
+            .proposals = &.{},
+            .credentials = &.{1},
+        },
+        .leaf_node_source = .commit,
+        .parent_hash = &[_]u8{0xb0} ** 32,
+        .extensions = &.{},
+        .signature = &.{},
+    };
+
+    const sig = try leaf.sign(S, gpa, kp, "the-group", 3);
+    const sig_bytes = sig.toBytes();
+    leaf.signature = &sig_bytes;
+    try leaf.verifySignature(S, gpa, "the-group", 3);
+
+    // §7.2 binds `group_id` and `leaf_index` into a commit-sourced
+    // LeafNodeTBS. If it did not, a leaf signed for one position could be
+    // replayed into another — so both must break the check.
+    try std.testing.expectError(error.SignatureVerificationFailed, leaf.verifySignature(S, gpa, "the-group", 4));
+    try std.testing.expectError(error.SignatureVerificationFailed, leaf.verifySignature(S, gpa, "other-group", 3));
+
+    // ... and for a key_package-sourced leaf neither is in the TBS, so
+    // signing under one position and verifying under another MUST succeed.
+    var kp_leaf = leaf;
+    kp_leaf.leaf_node_source = .key_package;
+    kp_leaf.parent_hash = null;
+    kp_leaf.lifetime = .{ .not_before = 0, .not_after = 1 };
+    const kp_sig = try kp_leaf.sign(S, gpa, kp, "", 0);
+    const kp_sig_bytes = kp_sig.toBytes();
+    kp_leaf.signature = &kp_sig_bytes;
+    try kp_leaf.verifySignature(S, gpa, "anything-at-all", 77);
+}
 
 // ── §7.1: unmerged_leaves stays sorted ────────────────────────────────────
 

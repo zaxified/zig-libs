@@ -41,6 +41,16 @@ whole Commit-processing procedure, and §12.4.3.1's join run to completion
 official `passive-client-*` vectors — whole recorded sessions replayed
 Commit by Commit with the `epoch_authenticator` compared at every step,
 including one 200-Commit session — see `SPEC.md`'s "Part 7" section.
+**Part 8: creating Commits** — the sender half of everything Part 7 could
+only receive: §11's group creation, §12.1's proposal creation, §7.4/§7.5's
+`UpdatePath` GENERATION (`treekem.stageUpdatePath`/`sealUpdatePath`),
+§12.4.1's Commit creation, §12.4.3.1's `Welcome` production, and §10's
+`KeyPackage` construction. Anchored where creation can be anchored at all:
+an `UpdatePath` generated from a `treekem.json` vector's own
+`path_secret[0]` reproduces that vector's node public keys, `commit_secret`
+and committer-leaf `parent_hash` byte-exact, and is then opened by every one
+of that vector's recorded members — see `SPEC.md`'s "Part 8" section, which
+states per test what is anchored and what is a round trip.
 
 **Status: Part 1 COMPLETE, entirely Sonnet-tier. Part 2 COMPLETE** — the
 data/codec/tree-hash/tree-editing pieces are Sonnet-tier (mechanical
@@ -60,17 +70,33 @@ that overflowed for any realistically sized group, an over-constrained PSK
 width that rejected legal 14-byte input, and an `unmerged_leaves` insert
 that did not keep §7.1's required sort order) plus one specification
 misreading, RFC 9420 §7.5's rule that members added by the same Commit are
-excluded from the `UpdatePath` resolutions. See `SPEC.md`'s "Part 7".
-Part 3 (KeyPackage/LeafNode VALIDATION + Credential) and §12.4.3.2's
+excluded from the `UpdatePath` resolutions — which Part 8 then found had
+been applied one step too far, to §4.1.2's filtered direct path as well.
+See `SPEC.md`'s "Part 7".
+**Part 8 COMPLETE for regular Commits** (Sonnet-tier) — and building the
+SEND half found three problems on the RECEIVE side that 200 replayed
+Commits could not reach, because a passive client never generates anything:
+a §7.5 MISREADING Part 7 had introduced (applying the same-Commit-Add
+exclusion to §4.1.2's filtered direct path and not only to the resolution,
+which produces trees that fail §7.9.2's parent-hash validity), a joiner's
+path-secret chain that consumed a derivation step at nodes the committer had
+filtered out, and a member with no way to adopt the private key of an Update
+it had published itself. Every upstream vector passes under either reading
+of §7.5, so only creating Commits could expose it. See `SPEC.md`'s
+"Part 8".
+Part 3 (the rest of §7.3/§10.1 VALIDATION + Credential) and §12.4.3.2's
 external Commits remain; see `SPEC.md`'s "Arc breakdown".
 What this module can do today: produce and consume real MLS messages other
-implementations accept byte-for-byte, JOIN a group from a `Welcome`, and
-FOLLOW that group through Commits — validated against recorded sessions
-from another implementation, one of them 200 Commits long. A passive client
-is complete. What it cannot: SPEAK — there is no Commit, proposal or
-`Welcome` CREATION (no sender half of §7.5 anywhere in the module) — nor
-accept `PrivateMessage` handshakes, join by external Commit, or decide
-whether a KeyPackage or LeafNode should be admitted (§10.1/§7.3).
+implementations accept byte-for-byte, CREATE a group, JOIN one from a
+`Welcome`, FOLLOW it through Commits — validated against recorded sessions
+from another implementation, one of them 200 Commits long — and now SPEAK:
+create proposals, create Commits with a full `UpdatePath`, and produce the
+`Welcome` and `GroupInfo` that go with them. A two-way client is complete.
+What it cannot: send or accept `PrivateMessage` handshakes, join by external
+Commit (§12.4.3.2, Part 8's stated boundary), or apply the §10.1/§7.3
+admission rules that need a clock, a credential authority or an extension
+registry — the two §7.3 rules that need only the leaf and the tree ARE
+applied, in both directions.
 
 | File | Provides |
 |---|---|
@@ -82,14 +108,14 @@ whether a KeyPackage or LeafNode should be admitted (§10.1/§7.3).
 | `wire_lists.zig` | Part 2's shared variable-length-vector encode/decode helpers |
 | `tree.zig` | Part 2's `LeafNode`/`ParentNode`/`Node`/`RatchetTree` (§7.1/§7.2/§12.4.3.3), wire codec, leaf-signature verification, `addLeaf`/`updateLeaf`/`removeLeaf` (§7.7/§12.1.1-3) |
 | `treehash.zig` | Part 2's RFC 9420 §7.8 tree hash (real, recursive, KAT'd byte-exact) |
-| `treekem.zig` | Part 2's `HPKECiphertext`/`UpdatePathNode`/`UpdatePath` (§7.6) + the five Fable cores (`resolution`/`parentHash`/`validateParentHashes`/`processUpdatePath`/`applyUpdatePath`), implemented and KAT-pinned |
+| `treekem.zig` | Part 2's `HPKECiphertext`/`UpdatePathNode`/`UpdatePath` (§7.6) + the five Fable cores (`resolution`/`parentHash`/`validateParentHashes`/`processUpdatePath`/`applyUpdatePath`), implemented and KAT-pinned — plus Part 8's SENDER half of §7.5 (`stageUpdatePath`/`sealUpdatePath`) |
 | `gate.zig` | Part 2's `treekem_core_implemented` switch — now `true` (the five cores are implemented; the gated TreeKEM KATs run) |
 | `kat_treekem_test.zig` | Part 2's official RFC 9420 interop vectors (`tree-validation.json`/`tree-operations.json`/`treekem.json`), driven byte-exact against the five cores |
 | `keyschedule.zig` | Part 4's §8 epoch chain (`joinerSecret`/`welcomeSecret`/`epochSecret`/`deriveEpoch`), §8.1 `GroupContext`, §8.4 `PreSharedKeyId`/`pskSecret`, §8.5 `mlsExporter`, `externalKeyPair`, §6.1 `confirmationTag`/`membershipTag` (+ constant-time verifiers) |
 | `secrettree.zig` | Part 4's §9 secret tree (`nodeSecret`/`ratchetBaseSecret`), §9.1 `Ratchet` + the generation-indexed out-of-order `Window`, §6.3.2 `senderDataKeys` |
 | `kat_keyschedule_test.zig` | Part 4's official interop vectors `key-schedule.json` + `psk_secret.json`, driven per-stage byte-exact |
 | `kat_secrettree_test.zig` | Part 4's official `secret-tree.json`, driven byte-exact both forward (`Ratchet`) and out-of-order (`Window`) |
-| `keypackage.zig` | Part 5's §10 `KeyPackage`/`KeyPackageTBS` WIRE FORMAT + self-signature (`verifySignature`/`sign`). §10.1's validation rules are Part 3's and are NOT here |
+| `keypackage.zig` | Part 5's §10 `KeyPackage`/`KeyPackageTBS` WIRE FORMAT + self-signature (`verifySignature`/`sign`), plus Part 8's `create` (assemble and sign one). §10.1's validation rules are Part 3's and are NOT here |
 | `content.zig` | Part 5's §12.1 `Proposal` (all seven types) + §12.4 `Commit`/`ProposalOrRef` — wire shape only; no proposal-list validity, no commit processing |
 | `framing.zig` | Part 5's whole of §6: `Sender`/`FramedContent`/`AuthenticatedContent`, §6.1 sign+verify, §6.2 `PublicMessage` + `protectPublic`/`unprotectPublic`, §6.3 `PrivateMessage` + `protectPrivate`/`decryptSenderData`/`decryptContent`/`parsePrivateContent`, `MLSMessage` |
 | `transcript.zig` | Part 5's §8.2 `confirmedTranscriptHash`/`interimTranscriptHash`/`advance` — the gap Part 4 named and could not fill |
@@ -97,8 +123,9 @@ whether a KeyPackage or LeafNode should be admitted (§10.1/§7.3).
 | `kat_framing_test.zig` | Part 5's official `message-protection.json` (protect/unprotect byte-exact both directions) + `transcript-hashes.json` (§8.2) |
 | `welcome.zig` | Part 6's §12.4.3 `GroupInfo` (+ `sign`/`verifySignature`), §12.4.3.1 `GroupSecrets`/`EncryptedGroupSecrets`/`Welcome`, `welcomeKeyNonce`/`encryptGroupInfo`/`decryptGroupInfo`, `encryptGroupSecrets`/`decryptGroupSecrets`, `join`, and §12.4.3.3's `ratchetTree`/`externalPub`/`verifyTreeHash` |
 | `kat_welcome_test.zig` | Part 6's official `welcome.json`, the whole join staged per layer — plus the vector's `encrypted_group_info` reproduced in the SEND direction |
-| `group.zig` | Part 7's `Group(S)` — the group STATE plus the receiving half of an epoch transition: `fromWelcome` (§12.4.3.1 run to completion), `processCommit` (§12.2 validation, §12.3 ordering, §12.4.2's whole procedure), `epochAuthenticator`/`groupContext`, and §8.4 PSK resolution over application-supplied and remembered-resumption keys |
+| `group.zig` | Part 7's `Group(S)` — the group STATE plus the receiving half of an epoch transition: `fromWelcome` (§12.4.3.1 run to completion), `processCommit` (§12.2 validation, §12.3 ordering, §12.4.2's whole procedure), `epochAuthenticator`/`groupContext`, and §8.4 PSK resolution — plus Part 8's SENDING half on the same object: `create` (§11), `createProposal`/`updateLeaf` (§12.1), `createCommit` (§12.4.1, which also builds the §12.4.3.1 `Welcome` and a signed `GroupInfo`) |
 | `kat_passive_test.zig` | Part 7's official `passive-client-welcome`/`-handling-commit`/`-random` vectors — recorded sessions replayed Commit by Commit against `epoch_authenticator`, plus the assertions guarding each file's reduction |
+| `kat_commit_test.zig` | Part 8's harness: an `UpdatePath` GENERATED from `treekem.json`'s own recorded `path_secret[0]`, compared byte-exact against that vector and then opened by its recorded members; plus Commits created on group states restored from the `passive-client-*` sessions |
 
 - **Model after:** RFC 9420 (Messaging Layer Security); `treemath.zig`
   ports Appendix C's own published reference algorithm.
@@ -496,10 +523,85 @@ per epoch is not this object's job. `error.GroupPoisoned` — a previous
 `processCommit` failed after the tree was already mutated, so the object is
 unusable rather than silently half-applied.
 
-**What it does not do:** CREATE Commits, proposals or Welcomes (there is no
-sender half of §7.5 anywhere in this module), join by external Commit
-(§12.4.3.2), or apply §7.3/§10.1 admission rules (Part 3) — it checks only
-the leaf properties §12.4.2 names in its own bullets.
+**What it does not do:** send or accept `PrivateMessage` handshakes, join by
+external Commit (§12.4.3.2), or apply the §7.3/§10.1 admission rules that
+need a clock, a credential authority or an extension registry (Part 3) — the
+two that need only the leaf and the tree are applied, see
+`mls.GroupPolicy`.
+
+## API surface (Part 8 — speaking)
+
+The sender half lives on the same `Group(S)`, because a committer has to
+land in the state its receivers land in.
+
+```zig
+// §10: publish a KeyPackage. Keep all three private halves — the init and
+// encryption keys are what `fromWelcome` later needs, and the signature
+// key signs everything this client ever sends.
+const kp = try mls.createKeyPackage(S, arena, .{
+    .signature_key_pair = sig_kp,
+    .init_key = init_kp.public_key,
+    .encryption_key = enc_kp.public_key,
+    .credential = .{ .basic = "alice" },
+    .capabilities = caps,
+    .lifetime = .{ .not_before = not_before, .not_after = not_after },
+});
+const kp_msg = try (mls.MLSMessage{ .key_package = kp }).encodeAlloc(arena);
+
+// §11: create a one-member group. `io` supplies the single random value
+// §11 calls for; §8.2's epoch-0 confirmed transcript hash is the
+// ZERO-LENGTH string, which this object represents exactly.
+var g = try G.create(allocator, .{
+    .io = io,
+    .group_id = group_id,
+    .key_package_msg = kp_msg,
+    .encryption_priv = enc_kp.secret_key,
+});
+defer g.deinit();
+
+// §12.1: publish a proposal. Nothing is applied — a proposal only takes
+// effect through a Commit, so KEEP these bytes: they are what the
+// committer passes as `.by_reference` and what receivers pass as
+// `proposal_msgs`.
+const prop = try g.createProposal(allocator, .{
+    .signature_key_pair = sig_kp,
+    .proposal = .{ .add = their_key_package },
+});
+
+// §12.4.1: commit. Order in `proposals` is observable (§12.1.1 places Adds
+// at successive blank leaves in list order; §8.4's PSK chain is
+// position-dependent); §12.3's APPLICATION order is fixed and unrelated.
+const c = try g.createCommit(allocator, .{
+    .io = io,
+    .signature_key_pair = sig_kp,
+    .proposals = &.{
+        .{ .by_value = .{ .add = their_key_package } },
+        .{ .by_reference = someone_elses_proposal_msg },
+    },
+    .external_psks = psks,
+});
+defer c.deinit(allocator);
+// c.commit      -> MLSMessage(PublicMessage), send to every member
+// c.welcome     -> MLSMessage(Welcome) for the members this Commit added
+// c.group_info  -> MLSMessage(GroupInfo) for the DS to cache (external joins)
+// ...and `g` has ALREADY advanced into the epoch it just created.
+```
+
+To rotate this member's own leaf key without committing, build the Update's
+`LeafNode` with `g.updateLeaf(.{ .signature_key_pair = ..., .encryption_key_pair = ... })`
+and send it as a proposal: the group retains the private half and swaps it
+in when whichever Commit applies that Update arrives, which it must, because
+§12.3 applies Updates before the `UpdatePath` is decrypted.
+
+`createCommit` populates the path by default (§12.4: "By default, the path
+field of a Commit MUST be populated"). `omit_path_when_allowed = true` asks
+for §12.4's "partial" Commit — honoured only when the list covers at least
+one proposal and none of them is a path-required type.
+
+**What it refuses:** the same `error.GroupPoisoned` contract as
+`processCommit` — but every §12.2 refusal and every Add's KeyPackage
+signature check happens BEFORE the tree is touched, so a rejected proposal
+list leaves the group usable.
 
 RFC 9420 §8.3's external initialization lives in `keyschedule.zig`, since it
 is a key-schedule entry point rather than group state:
@@ -566,6 +668,17 @@ grows the group until an `UpdatePath` spans seven levels. Each file's
 reduction (see `NOTICE`) is guarded by assertions on the coverage it rests
 on, so a future re-filter that drops a case fails rather than passing
 quietly.
+Part 8 drives `treekem.json` in the SEND direction as well: a generation
+seeded from each update path's own recorded `path_secret[0]` reproduces that
+vector's node public keys, its `commit_secret` and its committer-leaf
+`parent_hash` byte-exact, and the `UpdatePath` it then seals is opened by
+every one of that vector's recorded members with their recorded private
+keys, landing on the recorded plaintexts. A negative control drives the same
+generation from a path secret one bit off and requires every anchored field
+to differ. Beyond that, creation is round-trip tested against this module's
+own (externally anchored) receive path — including Commits created on group
+states restored from the `passive-client-*` sessions, the 200-Commit one
+included. `SPEC.md`'s "Part 8" states which is which per test.
 Green in Debug and ReleaseFast.
 
 ## Provenance

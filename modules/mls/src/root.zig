@@ -61,25 +61,48 @@
 //! session. This is the strongest end-to-end evidence in the module: it is
 //! the closest thing available to interoperating with another
 //! implementation. Four real defects in Parts 1/2/4 surfaced only here and
-//! are fixed — see `SPEC.md`'s "Part 7" section.
-//! What Part 7 does NOT do: CREATE Commits (there is still no sender half
-//! of §7.5, so no `UpdatePath` generation and no `Welcome` production), and
-//! accept handshake messages framed as `PrivateMessage`
-//! (`error.PrivateHandshakeNotSupported` — driving the §9 secret tree per
-//! epoch is a separate concern). §12.4.3.2's external commits remain
-//! SCOPED OUT, and now for a sharper reason than before: unlike §8.3, which
-//! this batch anchors by a sender/receiver round trip inside this module,
-//! an external-commit RECEIVER has no counterpart here to round-trip
-//! against while commit CREATION does not exist, and there is no upstream
-//! vector — so it would be untestable code, which is the same reason §8.3
-//! was not stubbed earlier either.
-//! Part 3 (LeafNode/KeyPackage VALIDATION + Credential) and the rest of
-//! Part 6 (external commits, reinit/branch) are what remain — see
-//! `SPEC.md`'s "Arc breakdown". Part 4 landed before Part 3
-//! because the key schedule depends on neither: it consumes a tree HASH,
-//! not a `KeyPackage`; Part 5 then landed before Part 3 too, and took §10's
-//! KeyPackage *wire format* with it (but none of §10.1's validation
-//! rules) because §12.1.1's `Add` proposal cannot be decoded without it.
+//! are fixed — see `SPEC.md`'s "Part 7" section, including the correction
+//! Part 8 later made to the fourth of them (§7.5's exclusion was applied
+//! one step too far).
+//! **Part 8: speaking — COMPLETE for regular Commits.** The sender halves
+//! of everything Part 7 could only receive: RFC 9420 §11's group creation
+//! (`group.Group(S).create`), §12.1's proposal creation
+//! (`createProposal`/`updateLeaf`), §7.4/§7.5's `UpdatePath` GENERATION
+//! (`treekem.stageUpdatePath`/`sealUpdatePath` — the sender half that
+//! `treekem.zig` had never had), §12.4.1's whole Commit-creation procedure
+//! and §12.4.3.1's `Welcome` production (`createCommit`, which returns the
+//! Commit, the Welcome and a signed `GroupInfo` and advances the committer
+//! into the epoch it just created), plus §10's `KeyPackage` construction
+//! (`keypackage.create`) without which no client can be added at all.
+//! §12.3's application order and §12.2's validation are now ONE
+//! implementation shared by both directions, because §12.2 and §12.3 are
+//! each stated once for a creator and a processor together.
+//! Anchored where creation can be anchored at all — see `kat_commit_test
+//! .zig`: an `UpdatePath` generated from a `treekem.json` vector's own
+//! `path_secret[0]` reproduces that vector's node public keys, its
+//! `commit_secret` and its committer-leaf `parent_hash` byte-exact, and is
+//! then opened by every one of that vector's recorded members with their
+//! recorded private keys. Commits are also created on top of group states
+//! restored from the `passive-client-*.json` recorded sessions, including
+//! the 200-Commit one. What is a round trip and what is anchored is stated
+//! per test rather than blurred.
+//! What Part 8 does NOT do: accept or send handshake messages framed as
+//! `PrivateMessage` (`error.PrivateHandshakeNotSupported` — driving the §9
+//! secret tree per epoch is a separate concern), and §12.4.3.2's external
+//! Commits, which are the deliberate boundary of this part — see
+//! `SPEC.md`'s "Part 8" for exactly what they still need and why they are a
+//! second piece rather than a loose end of this one.
+//! Part 3 (the rest of §7.3/§10.1 VALIDATION + Credential) and §11.2/§11.3
+//! (reinit/branch) are what remain — see `SPEC.md`'s "Arc breakdown". Part
+//! 4 landed before Part 3 because the key schedule depends on neither: it
+//! consumes a tree HASH, not a `KeyPackage`; Part 5 then landed before Part
+//! 3 too, and took §10's KeyPackage *wire format* with it (but none of
+//! §10.1's validation rules) because §12.1.1's `Add` proposal cannot be
+//! decoded without it. Part 8 took the two §7.3 rules that need nothing but
+//! the leaf and the tree (`group.Policy`'s `check_leaf_extensions_supported`
+//! and `check_key_uniqueness`), because §12.2 makes a Commit invalid if the
+//! resulting tree breaks them — so a creator that skipped them would emit
+//! Commits its own receivers must reject.
 //!
 //! | File | What it provides |
 //! |---|---|
@@ -91,22 +114,23 @@
 //! | `wire_lists.zig` | Part 2's shared variable-length-vector encode/decode helpers (`Writer`/`Reader`-based, no allocator needed for `encode`/`encodedLen`) |
 //! | `tree.zig` | Part 2's `LeafNode`/`ParentNode`/`Node`/`RatchetTree` (§7.1/§7.2/§12.4.3.3), wire codec, leaf-signature verification, and the mechanical (non-Fable) tree-shape edits `addLeaf`/`updateLeaf`/`removeLeaf` (§7.7/§12.1.1-3) |
 //! | `treehash.zig` | Part 2's RFC 9420 §7.8 tree hash — real, recursive, KAT'd byte-exact |
-//! | `treekem.zig` | Part 2's `HPKECiphertext`/`UpdatePathNode`/`UpdatePath` (§7.6) plus the five Fable cores (`resolution`/`parentHash`/`validateParentHashes`/`processUpdatePath`/`applyUpdatePath`), implemented and KAT-pinned |
+//! | `treekem.zig` | Part 2's `HPKECiphertext`/`UpdatePathNode`/`UpdatePath` (§7.6) plus the five Fable cores (`resolution`/`parentHash`/`validateParentHashes`/`processUpdatePath`/`applyUpdatePath`), implemented and KAT-pinned — and Part 8's SENDER half of §7.5 (`stageUpdatePath` derives §7.4's path secrets, merges them and signs the committer's new leaf; `sealUpdatePath` encrypts them to the copath resolutions), split in two because the HPKE context the second half needs is the tree hash the first half produces |
 //! | `gate.zig` | Part 2's `treekem_core_implemented` switch — now `true` (the five cores are implemented; the gated TreeKEM KATs run). Part 4 adds no gate: every line of it is real and vector-driven |
 //! | `kat_treekem_test.zig` | Part 2's KAT harness: `tree-validation.json`/`tree-operations.json`/`treekem.json` driven byte-exact against the five cores (the `gate.treekem_core_implemented`-gated tests now run — resolution, parent-hash accept/tamper, UpdatePath process + merge) |
 //! | `keyschedule.zig` | Part 4's RFC 9420 §8 epoch chain (`init_secret` → `joiner_secret` → `welcome_secret` → `epoch_secret` → Table 4's eight secrets + the next `init_secret`), §8.1's `GroupContext` wire format, §8.4's `PreSharedKeyID`/`PSKLabel`/`psk_secret` chain, §8.5's `MLS-Exporter`, `external_pub`, and §6.1's `confirmation_tag`/`membership_tag` |
 //! | `secrettree.zig` | Part 4's RFC 9420 §9 secret tree (derived downward from `encryption_secret`), the per-leaf handshake/application sender ratchets (§9.1), a generation-indexed out-of-order `Window` with consume-once and bounded-forward-jump policy (§9.2), and §6.3.2's sender-data key/nonce |
 //! | `kat_keyschedule_test.zig` | Part 4's KAT harness for `key-schedule.json` (per-STAGE, so a divergence names the failing link) + `psk_secret.json` (chains of 0 through 10 PSKs) |
 //! | `kat_secrettree_test.zig` | Part 4's KAT harness for `secret-tree.json` — 1/8/32-leaf trees, each leaf's generations driven twice: forward through a bare `Ratchet` and in reverse through a `Window` |
-//! | `keypackage.zig` | Part 5's RFC 9420 §10 `KeyPackage`/`KeyPackageTBS` WIRE FORMAT (plus its self-signature) — here because §12.1.1's `Add` carries one; §10.1's VALIDATION rules are Part 3's and are not in it |
+//! | `keypackage.zig` | Part 5's RFC 9420 §10 `KeyPackage`/`KeyPackageTBS` WIRE FORMAT (plus its self-signature) — here because §12.1.1's `Add` carries one; §10.1's VALIDATION rules are Part 3's and are not in it. Part 8 adds `create`, which assembles and signs one (inner `LeafNode` first, whole structure second) — the entry point a client needs before it can be added to any group |
 //! | `content.zig` | Part 5's §12.1 `Proposal` (all seven types) and §12.4 `Commit`/`ProposalOrRef`/`ProposalOrRefType` — the two non-application bodies §6's `FramedContent` selects between. Wire shape only: no §12.2 proposal-list validity, no §12.3 application order, no commit-processing state machine |
 //! | `framing.zig` | Part 5's whole of §6: `WireFormat`/`ContentType`/`SenderType`/`Sender`, `FramedContent`, `AuthenticatedContent`, §6.1's `FramedContentTBS` + sign/verify, §6.2's `PublicMessage`/`AuthenticatedContentTBM`/`membership_tag` + `protectPublic`/`unprotectPublic`, §6.3's `PrivateMessage` + §6.3.1's `PrivateMessageContent`/`PrivateContentAAD`/reuse guard/padding + §6.3.2's `SenderData`/`SenderDataAAD`, and `MLSMessage` |
 //! | `transcript.zig` | Part 5's RFC 9420 §8.2 — `ConfirmedTranscriptHashInput`/`InterimTranscriptHashInput` and both recurrences. Separate from `keyschedule.zig` only because `framing.zig` imports that file, so §8.2 sitting there would be an import cycle |
 //! | `kat_messages_test.zig` | Parts 5+6's KAT harness for `messages.json`: every §12.1 proposal body, §12.4 `Commit`, §12.4.3.1's `GroupSecrets`, §12.4.3.3's bare `ratchet_tree`, and ALL five §17.2 `MLSMessage` wire formats, decode→re-encode byte-exact (a WIRE-format anchor — upstream states this vector's MACs may be invalid) |
 //! | `welcome.zig` | Part 6's RFC 9420 §12.4.3 `GroupInfo`/`GroupInfoTBS` (+ sign/verify), §12.4.3.1's `PathSecret`/`GroupSecrets`/`EncryptedGroupSecrets`/`Welcome`, the two encryption layers (`welcomeKeyNonce`/`encryptGroupInfo`/`decryptGroupInfo` and `encryptGroupSecrets`/`decryptGroupSecrets`) and the joiner's whole procedure (`join`), plus §12.4.3.3's `ratchet_tree`/`external_pub` extension accessors and `verifyTreeHash`. External commits (§12.4.3.2) and §8.3 are NOT here — see the file's doc comment for the `hpke` dependency that blocks them |
 //! | `kat_welcome_test.zig` | Part 6's KAT harness for `welcome.json` — the whole §12.4.3.1 join with real keys, staged per layer (KeyPackageRef → HPKE open → welcome key → group-info AEAD → signature → confirmation tag), and reproducing the vector's `encrypted_group_info` in the SEND direction |
-//! | `group.zig` | Part 7's `Group(S)` — the group STATE and the receiving half of an epoch transition: §12.4.3.1's `fromWelcome`, §12.4.2's `processCommit` (proposal resolution by §5.2 ref, §12.2 validation, §12.3's application order, the UpdatePath's provisional-GroupContext decryption, the key schedule and the `confirmation_tag`), plus §8.4 PSK resolution over application-supplied and remembered-resumption keys |
+//! | `group.zig` | Part 7's `Group(S)` — the group STATE and the receiving half of an epoch transition: §12.4.3.1's `fromWelcome`, §12.4.2's `processCommit` (proposal resolution by §5.2 ref, §12.2 validation, §12.3's application order, the UpdatePath's provisional-GroupContext decryption, the key schedule and the `confirmation_tag`), plus §8.4 PSK resolution over application-supplied and remembered-resumption keys — and Part 8's SENDING half in the same object, because it is the same state: §11's `create`, §12.1's `createProposal`/`updateLeaf`, and §12.4.1's `createCommit` (which also produces the §12.4.3.1 `Welcome` and a signed `GroupInfo`) |
 //! | `kat_passive_test.zig` | Part 7's KAT harness for the three `passive-client-*.json` vectors — recorded sessions replayed Commit by Commit against `epoch_authenticator`, plus the assertions that keep each file's reduction honest |
+//! | `kat_commit_test.zig` | Part 8's KAT harness: an `UpdatePath` GENERATED from a `treekem.json` vector's own `path_secret[0]`, compared byte-exact against that vector's node public keys / `commit_secret` / committer-leaf `parent_hash` and then opened by every one of its recorded members; plus Commits created on top of group states restored from the `passive-client-*.json` sessions. Each assertion is labelled anchored or round trip |
 //! | `kat_framing_test.zig` | Part 5's KAT harness for `message-protection.json` (the full §6 protect/unprotect path with real keys — `PrivateMessage` for all three content types, `PublicMessage` for the two handshake types, byte-exact in BOTH directions, plus §6's refusal of application content as a `PublicMessage`) and `transcript-hashes.json` (§8.2's two hashes plus the Commit's own `confirmation_tag`) |
 //!
 //! **Status: Part 1 COMPLETE (Sonnet-tier). Part 2 COMPLETE (Sonnet
@@ -130,7 +154,19 @@
 //! width that rejected legal input, an unsorted `unmerged_leaves` insert,
 //! and — the one that is a specification reading rather than a coding bug —
 //! RFC 9420 §7.5's rule that members added by the same Commit are excluded
-//! from the UpdatePath resolutions. Details in `SPEC.md`'s "Part 7".)**
+//! from the UpdatePath resolutions. Details in `SPEC.md`'s "Part 7".)
+//! Part 8 COMPLETE for regular Commits (Sonnet — no new cryptography
+//! again; the part is the mirror image of Part 7 over Parts 1-6's
+//! primitives. Building the sender half surfaced three RECEIVER-side
+//! problems that 200 replayed Commits could not reach, because a passive
+//! client never generates anything: a §7.5 MISREADING Part 7 introduced —
+//! applying the same-Commit-Add exclusion to §4.1.2's filtered direct path
+//! and not only to the resolution, which produces trees that fail §7.9.2 —
+//! plus a joiner's path-secret chain that consumed a derivation step at
+//! nodes the committer had filtered out, and a member with no way to adopt
+//! the private key of an Update it had published itself. Every upstream
+//! vector passes under either reading of §7.5, so only creating Commits
+//! could expose it. Details in `SPEC.md`'s "Part 8".)**
 //! `treemath.zig` is a pure port of the RFC's own
 //! reference code; `crypto.zig` composes `codec.zig` + the sibling
 //! `hpke`/std.crypto primitives exactly as RFC 9420 §5/§8/§9.1 specify,
@@ -160,15 +196,23 @@
 //! as §12.4.2 specifies — validated against recorded sessions produced by
 //! another implementation, one of them 200 Commits long. A PASSIVE client
 //! is complete.
-//! What it still cannot do is SPEAK: there is no Commit or proposal
-//! CREATION (no sender half of §7.5, so no `UpdatePath` generation and no
-//! `Welcome` production), no handshake message framed as a
+//! With Part 8 it can SPEAK. `Group(S).create` starts a group from this
+//! client's own `KeyPackage`; `createProposal` publishes a §12.1 proposal;
+//! `createCommit` takes a proposal list (by value or by reference),
+//! validates it, applies it, generates a full `UpdatePath`, advances the
+//! key schedule, and returns the Commit, a `Welcome` for every member it
+//! added and a signed `GroupInfo` — having already advanced this client
+//! into the epoch it just created. A two-way client is complete: two
+//! `Group(S)` objects can drive a group between them indefinitely, and a
+//! group state restored from another implementation's recorded session can
+//! be committed on directly.
+//! What it still cannot do: send or accept handshake messages framed as a
 //! `PrivateMessage` (the §9 secret tree is built, but the group object does
-//! not drive it per epoch), no external-Commit join (§12.4.3.2), and no
-//! §10.1/§7.3 validation deciding whether a KeyPackage or LeafNode should
-//! be admitted at all (Part 3) — `processCommit` checks only the leaf
-//! properties §12.4.2 itself names. See `README.md` for the current
-//! surface.
+//! not drive it per epoch), join by external Commit (§12.4.3.2 — the
+//! deliberate boundary of Part 8), and apply the §10.1/§7.3 admission rules
+//! that need a clock, a credential authority or an extension registry (Part
+//! 3); the two §7.3 rules that need only the leaf and the tree ARE applied,
+//! in both directions. See `README.md` for the current surface.
 //!
 //! Provenance: clean-room from RFC 9420 (a public IETF specification, not
 //! copyrightable expression — see `CONVENTIONS.md` §5's merger-doctrine
@@ -225,6 +269,10 @@ pub const rootHash = treehash.rootHash;
 pub const UpdatePath = treekem.UpdatePath;
 pub const UpdatePathNode = treekem.UpdatePathNode;
 pub const HPKECiphertext = treekem.HPKECiphertext;
+pub const stageUpdatePath = treekem.stageUpdatePath;
+pub const sealUpdatePath = treekem.sealUpdatePath;
+pub const StageParams = treekem.StageParams;
+pub const Staged = treekem.Staged;
 
 pub const GroupContext = keyschedule.GroupContext;
 pub const ProtocolVersion = keyschedule.ProtocolVersion;
@@ -249,6 +297,8 @@ pub const Window = secrettree.Window;
 pub const senderDataKeys = secrettree.senderDataKeys;
 
 pub const KeyPackage = keypackage.KeyPackage;
+pub const createKeyPackage = keypackage.create;
+pub const KeyPackageCreateParams = keypackage.CreateParams;
 
 pub const ProposalType = content.ProposalType;
 pub const Proposal = content.Proposal;
@@ -356,6 +406,7 @@ test {
     _ = @import("kat_framing_test.zig");
     _ = @import("kat_welcome_test.zig");
     _ = @import("kat_passive_test.zig");
+    _ = @import("kat_commit_test.zig");
 }
 
 test "meta.deps is exactly {\"hpke\"}" {

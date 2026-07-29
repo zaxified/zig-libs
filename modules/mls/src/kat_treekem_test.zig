@@ -548,9 +548,12 @@ test "treekem.json: applyUpdatePath merges each UpdatePath into the public tree 
             var arena = std.heap.ArenaAllocator.init(testing.allocator);
             defer arena.deinit();
 
-            // No Add proposals anywhere in `treekem.json`, so RFC 9420 §7.5's
-            // excluded set is empty here — see `treekem.resolutionExcluding`.
-            try treekem.applyUpdatePath(arena.allocator(), &dt.tree, sender, update_path, &.{});
+            // `applyUpdatePath` takes no excluded set: §7.5's exclusion
+            // narrows the resolutions ciphertexts are built over, and the
+            // public-side merge writes to the §4.1.2 filtered direct path,
+            // which that exclusion does not touch — see
+            // `treekem.filteredDirectPath`.
+            try treekem.applyUpdatePath(arena.allocator(), &dt.tree, sender, update_path);
 
             const got = try treehash.rootHash(S, testing.allocator, &dt.tree);
             try testing.expectEqualSlices(u8, want_tree_hash_after, &got);

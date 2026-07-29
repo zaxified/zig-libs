@@ -133,6 +133,7 @@ parent-hash validation logic does (see Part 2 below).
 | **5 — Message framing** | ALL of §6 (`FramedContent`/`AuthenticatedContent`/§6.1 TBS+auth/§6.2 `PublicMessage`+`membership_tag`/§6.3 `PrivateMessage`+§6.3.1 content encryption+§6.3.2 sender data/`MLSMessage`), the §12.1 `Proposal` and §12.4 `Commit` WIRE FORMATS framing carries, the §10 `KeyPackage` wire format `Add` carries, and §8.2's transcript hashes — **DONE 2026-07-29**, whole part **COMPLETE**. Commit PROCESSING (§12.2/§12.3/§12.4.1/§12.4.2) is explicitly NOT here — see "Part 5" below for where that boundary falls and why | **Sonnet** — mechanical composition over Parts 1/2/4's primitives with an authoritative byte-exact oracle for every path. No new cryptography: every derivation it performs was already built and vector-pinned by an earlier part | `messages.json`, `message-protection.json`, `transcript-hashes.json` — all byte-exact; see "Part 5" below |
 | **6 — Joining a group (Welcome), then external Commit / reinit** | §12.4.3's `GroupInfo`/`GroupInfoTBS`, §12.4.3.1's `Welcome`/`GroupSecrets`/`EncryptedGroupSecrets` + both encryption layers + the joiner's procedure, §12.4.3.3's `ratchet_tree`/`external_pub` extensions and the tree-hash binding, and §8's chain entered at `joiner_secret` — **DONE 2026-07-29**, the WELCOME path **COMPLETE**. What remains of this part: §12.4.3.2 external Commits + §8.3 external init (scoped out, NOT blocked — see "Part 6" below), and §11.2/§11.3 reinit/branch | **Sonnet** — no new cryptography at all: the group-info layer is a plain AEAD under a key `keyschedule.zig` already derived, and the per-member layer is `crypto.EncryptWithLabel` unchanged. The judgment calls were scope ones, not crypto ones | `welcome.json` + `messages.json`'s Part 6 fields — byte-exact; see "Part 6" below |
 | **7 — Group state machine** | `Group(S)`: the state a member carries between epochs, §12.2's proposal-list validation, §12.3's application order, §12.4.2's whole Commit-processing procedure, and §12.4.3.1's join run to completion (`fromWelcome`) — **DONE 2026-07-29**, COMPLETE for the FOLLOWER. Also §8.3 external init, which Part 6 listed as unbuilt. NOT here: Commit/proposal CREATION (no sender half of §7.5), `PrivateMessage` handshakes, §12.4.3.2 external Commits, §11.2/§11.3 reinit/branch | **Sonnet** — still no new cryptography, but the first part of this arc whose vectors did NOT match on the first run. Three coding defects in Parts 1/2/4 and one specification MISREADING surfaced here and nowhere else; see "Part 7" below | `passive-client-welcome.json`, `passive-client-handling-commit.json`, `passive-client-random.json` — whole recorded sessions replayed Commit by Commit against `epoch_authenticator`; see "Part 7" below |
+| **8 — Creating Commits** | The sender half of everything Part 7 could only receive: §11 group creation, §12.1 proposal creation, §7.4/§7.5's `UpdatePath` GENERATION (`treekem.stageUpdatePath`/`sealUpdatePath`), §12.4.1's Commit creation, §12.4.3.1's `Welcome` production, and §10's `KeyPackage` construction — **DONE 2026-07-29**, COMPLETE for REGULAR Commits. Also the two §7.3 rules that need only the leaf and the tree, applied in both directions. NOT here: §12.4.3.2 external Commits (the stated boundary — see "Part 8"), `PrivateMessage` handshakes, §11.2/§11.3, committer-chosen leaf content | **Sonnet** — no new cryptography; the mirror image of Part 7 over Parts 1-6's primitives. The judgement calls were about what can be ANCHORED when the output has three random inputs, and about which half of §7.3 belongs here. Building the send half found three RECEIVE-side problems that 200 replayed Commits could not reach — including a §7.5 misreading Part 7 introduced and no upstream vector can see | `treekem.json` driven in the SEND direction (a generation seeded from the vector's own `path_secret[0]` reproduces its node public keys, `commit_secret` and committer-leaf `parent_hash` byte-exact, then faces its recorded members); Commits created on states restored from `passive-client-handling-commit.json`/`passive-client-random.json`. See "Part 8" for what is anchored and what is a round trip |
 
 **Where TreeKEM/Fable lands, restated plainly:** it's Part 2, specifically
 the path-secret-derivation-along-the-copath + parent-hash-chain
@@ -254,8 +255,12 @@ than duplicating the contracts here (SPEC.md's non-overlap rule,
 - `resolution(allocator, tree, index) Error![]usize` — §4.1.
 - `parentHash(comptime S, allocator, tree, index) Error![S.Hash.digest_length]u8` — §7.9.
 - `validateParentHashes(comptime S, allocator, tree) Error!void` — §7.9.2.
-- `processUpdatePath(comptime S, allocator, tree, receiver: PrivateLeafState, sender_leaf_index, update_path, group_context) Error!ProcessedUpdatePath` — §7.4/§7.5/§7.6 (receiver side; yields `commit_secret`).
+- `resolutionExcluding(allocator, tree, index, excluded) Error![]usize` — §4.1 narrowed by §7.5's same-Commit-Add exclusion. For the CIPHERTEXT lists only, never for the §4.1.2 filter — see `filteredDirectPath`.
+- `filteredDirectPath(allocator, tree, leaf_node_index) Error![]FdpEntry` — §4.1.2, a property of the tree alone.
+- `processUpdatePath(comptime S, allocator, tree, receiver: PrivateLeafState, sender_leaf_index, update_path, group_context, added_this_commit) Error!ProcessedUpdatePath` — §7.4/§7.5/§7.6 (receiver side; yields `commit_secret`).
 - `applyUpdatePath(allocator, tree, sender_leaf_index, update_path) Error!void` — §7.5 (public-side merge).
+- `stageUpdatePath(comptime S, allocator, tree, sender_leaf_index, params: StageParams(S)) !Staged(S)` — Part 8: §7.4's derivation + §7.5's first block (sender side; mutates the tree, returns the signed leaf and every path secret).
+- `sealUpdatePath(comptime S, allocator, io, tree, staged, group_context, added_this_commit) !UpdatePath` — Part 8: §7.5's second block (encrypt to the copath resolutions). Split from `stageUpdatePath` because the `group_context` it needs contains the tree hash the first half produces.
 
 `group_context` is accepted as ALREADY-ENCODED bytes rather than a typed
 `GroupContext` — that type is Part 4's (Key Schedule) job per the Arc
@@ -810,10 +815,24 @@ Commit-processing text:
 A member added by the same Commit that carries the `UpdatePath` must not
 receive the path secrets through it — it gets its state from the `Welcome`
 instead. So the committer builds one fewer ciphertext than "the resolution
-of the copath node" suggests, and, because the §4.1.2 filter is defined in
-terms of resolution EMPTINESS, a copath subtree containing only
-same-Commit additions drops out of the filtered direct path entirely,
-making the whole `UpdatePath` one node shorter.
+of the copath node" suggests.
+
+> **Correction, Part 8.** This section originally continued: "and, because
+> the §4.1.2 filter is defined in terms of resolution EMPTINESS, a copath
+> subtree containing only same-Commit additions drops out of the filtered
+> direct path entirely, making the whole `UpdatePath` one node shorter."
+> That second half is wrong, and Part 8 removed it —
+> `treekem.filteredDirectPath` no longer takes an excluded set at all.
+> §7.5 places the exclusion inside the ENCRYPTION step, applying it to "this
+> resolution", while the loop is over §4.1.2's filtered direct path, which
+> is defined purely on the tree. The node stays and carries an
+> `UpdatePathNode` with zero ciphertexts. Dropping it instead leaves it
+> blank, which puts the new member's leaf into the resolution of a blank
+> node and breaks §7.9.2's `P.unmerged_leaves ∩ subtree(C) == resolution(C)
+> \ {D}` criterion — a tree this module's own `validateParentHashes`
+> rejects. Every upstream vector passes under either reading, so the error
+> was invisible until Commit CREATION made the distinguishing case
+> constructible. See "Part 8".
 
 This is not a subtle key divergence that shows up later as a wrong secret.
 A receiver that misses it computes a resolution one entry too long, the
@@ -875,7 +894,9 @@ coding bugs in Parts 1/2/4; one is a specification misreading in this part.
    filtered direct path became one node too LONG), which is what sent the
    search back to the RFC until §7.5's sentence turned up. §12.1.1's
    leftmost-blank-leaf placement is unchanged and DOES reuse a
-   just-vacated leaf — the recorded sessions confirm it.
+   just-vacated leaf — the recorded sessions confirm it. **Part 8 then
+   found that the fix had been applied one step too far** — to §4.1.2's
+   filter as well as to the resolution — see the correction box above.
 
 ### The three orderings that are load-bearing
 
@@ -988,6 +1009,283 @@ private key yields a DIFFERENT secret rather than an error, since X25519
 decap cannot fail on a well-formed point. What makes an external Commit safe
 is therefore the `confirmation_tag`, not §8.3's exchange, and the test says
 so.
+
+## Part 8 — Creating Commits (2026-07-29)
+
+**Files:** `treekem.zig` (`stageUpdatePath`/`sealUpdatePath` — the sender
+half of §7.5, and the first consumer `treekem.zig`'s own merge machinery has
+had in the send direction), `group.zig` (`Group(S).create`,
+`createProposal`, `updateLeaf`, `createCommit`, `buildWelcome`, and the
+shared `applyProposals`), `keypackage.zig` (`create`), `tree.zig`
+(`LeafNode.sign`), `kat_commit_test.zig`.
+
+Part 7 left a client that could join a group and follow it but not speak.
+This part is the other half of every one of those verbs, and it is
+deliberately the SAME object: `createCommit` and `processCommit` are two
+methods on one `Group(S)`, over one tree and one transcript, because a
+committer must land in exactly the state its receivers land in.
+
+### What the RFC actually calls these, because the brief for this part was
+### wrong twice
+
+The brief for this batch located `UpdatePath` generation via
+"`treemath.common_ancestor_*`, which has never had a consumer". Neither half
+is right. `treemath.zig` has never contained `common_ancestor_semantic` or
+`common_ancestor_direct` at all — RFC 9420 Appendix C does publish them, and
+`SPEC.md`'s own Backlog has recorded them as NOT ported since Part 1. And
+the operation they name already had a consumer before this part started:
+Part 7's `group.commonAncestor` (a direct-path intersection, not a port of
+Appendix C) has been serving §12.4.3.1's private-key installation step since
+`fromWelcome` landed. That Backlog entry was stale in the other direction
+too — it said the two would "arrive together or not at all" with the
+group-state object, and the group-state object arrived without them.
+
+The brief also cited §12.4.2 for Commit creation. Creation is **§12.4.1**;
+§12.4.2 is processing, which Part 7 built. The distinction matters here
+because the two sections are NOT mirror images: §12.4.1 has bullets §12.4.2
+has no counterpart for (constructing the `GroupInfo`, deriving the per-member
+path secret, building the `Welcome`), and it is the section that specifies
+the ORDER in which a Commit and its Welcome are produced.
+
+One more section disagrees with itself, and a creator has to pick a side:
+
+> **§12.4 vs §12.4.2 on when a path is required.** §12.4.2's bullet says
+> "Verify that the path value is populated if the proposals vector contains
+> any Update or Remove proposals, or if it's empty." §12.4's own pseudocode
+> says `pathRequiredTypes = [update, remove, external_init,
+> group_context_extensions]`. §12.4 is the section that defines the "Path
+> Required" column of §17.4's registry and states the rule as executable
+> logic, so `applyProposals` follows §12.4 — which is also the safe
+> direction to disagree in for a sender. All three `passive-client-*.json`
+> sessions still replay green under the stricter rule, so the reference
+> implementation that recorded them does not emit a Commit the two readings
+> would classify differently.
+
+### What it is verified against
+
+`kat_commit_test.zig`, and the file is explicit about which of its claims
+are anchored and which are round trips, because creation cannot be fully
+anchored by anything:
+
+| Claim | Kind | Against what |
+|---|---|---|
+| Every `node_pub[n]` of a generated `UpdatePath`, in order | **ANCHORED** | `treekem.json`'s `update_path.nodes[n].encryption_key`, byte-exact, for all 62 update paths |
+| The generated `commit_secret` | **ANCHORED** | `treekem.json`'s `commit_secret`, byte-exact, all 62 |
+| The committer leaf's `parent_hash` | **ANCHORED** | `treekem.json`'s `update_path.leaf_node.parent_hash`, byte-exact, all 62 |
+| The per-node ciphertext COUNT, and the node COUNT | **ANCHORED** | the lengths of `update_path.nodes` and of each `encrypted_path_secret` |
+| Every recorded member opens the generated `UpdatePath` and recovers its own recorded path secret and the recorded `commit_secret` | round trip through this module's decap, over the vector's tree, the vector's private keys and the vector's expected plaintexts | `treekem.json`'s `leaves_private` + `path_secrets` |
+| A Commit created on a state restored from a recorded session lands a new member on the committer's `epoch_authenticator` | round trip, from an externally-produced starting state | `passive-client-handling-commit.json`, `passive-client-random.json` (after all 200 Commits) |
+| Two to four `Group(S)` objects run a group through Commits in both directions and agree on epoch, tree hash, confirmed transcript hash and `epoch_authenticator` at every step | round trip | `group.zig`'s own tests |
+
+**How the first three become anchored at all.** A Commit has three random
+inputs — §7.4's `path_secret[0]`, §7.5's fresh leaf key pair, and one HPKE
+ephemeral per ciphertext — so its bytes are unreproducible by construction.
+But `treekem.json` publishes, per update path, the path secret each
+receiving leaf decrypts at its overlap node; for the receiver whose overlap
+is the FIRST node of the sender's filtered direct path, that value *is* the
+sender's `path_secret[0]`. Injecting it makes `stageUpdatePath`
+deterministic, and everything it derives becomes comparable with what the
+implementation that recorded the vector actually produced. The seed is
+located at runtime (not hardcoded), and the test fails with
+`NoSeedableReceiverInVector` rather than silently degrading to a round trip
+if a future re-fetch changes the shape.
+
+Two properties make that stronger than it first looks:
+
+- **the leaf content does not matter.** `ParentHashInput` for any node reads
+  that node's key, its stored `parent_hash`, and the tree hash of a COPATH
+  subtree — and no copath subtree of the sender's own direct path contains
+  the sender's leaf. So a dummy committer leaf still produces the vector's
+  exact parent hashes;
+- **one digest pins the whole chain.** §7.9's `ParentHashInput` embeds the
+  parent's own stored `parent_hash`, so a matching hash at the leaf implies
+  a matching hash at every node above it, all the way to the root.
+
+### What building the send half found on the RECEIVE side
+
+A passive client never generates anything, so Part 7's replays exercised
+every receive path and no send path. Three problems surfaced here that all
+live in Part 7's code, and one change that is faithfulness rather than a
+fix. Each is listed with what actually covers it, because two of them are
+not visible to any upstream vector at all.
+
+1. **§7.5's exclusion applied to the §4.1.2 FILTER, not only to the
+   resolution** — a specification misreading, corrected in
+   `treekem.filteredDirectPath`, which no longer takes an excluded set.
+   The full argument is in that function's doc comment and in the
+   correction box in "Part 7" above; the short form is that dropping the
+   node leaves it blank, which puts a same-Commit-added leaf into the
+   resolution of a blank node and breaks §7.9.2's third criterion.
+   *Covered by* the "adding a member into the committer's OWN sibling leaf"
+   scenario, whose final step is the new member JOINING — `fromWelcome`
+   runs `validateParentHashes`, which returns `error.Malformed` under the
+   old reading. Reverting the fix also breaks four other tests including
+   `treekem.json`'s `processUpdatePath` KAT.
+2. **A joiner's path-secret chain that stepped through filtered-out nodes.**
+   `group.derivePathSecretsUp` walked the joiner's UNFILTERED direct path
+   from the common ancestor and applied one `DeriveSecret(., "path")` per
+   node. §7.4's chain runs along the committer's FILTERED direct path, so
+   every node above a filtered-out one was off by a derivation step. The
+   failure mode is the quiet kind: `adoptPathSecrets` validates each stored
+   secret against the node's public key and silently drops the ones that do
+   not match, so nothing fails at join time — it surfaces epochs later as a
+   Commit the member cannot decrypt. Now skips blank nodes, which on a
+   just-merged tree is exactly "the committer's filtered direct path".
+   *Covered by* a purpose-built scenario: three members removed so that a
+   whole copath subtree is blank, then a joiner added below it, then an
+   assertion that the joiner holds a path secret for BOTH surviving nodes
+   of its direct path. No recorded session reaches this shape — the first
+   version of this test did not either, and the fix was verified uncovered
+   before the test was written to cover it.
+3. **No way to adopt the private key of one's own Update.** §12.3 applies
+   Update proposals BEFORE the `UpdatePath` is decrypted, so by the time
+   `processUpdatePath` runs, the updating member's leaf in the tree already
+   carries the Update's NEW `encryption_key` — and the committer sealed a
+   ciphertext to exactly that key. A member still holding its old private
+   key fails with a bare AEAD rejection several layers down. `Group` now
+   retains `pending_updates` (public key → private key, epoch-scoped) and
+   swaps the key in as the Update is applied, whoever committed it.
+   *Covered by* the three-member scenario, which is shaped the way it is
+   (carol proposes, dave commits by reference) because that is the only
+   legal shape — §12.2 forbids an Update generated by the committer. This
+   is the one that fired first, and it fired as an unexplained
+   `AuthenticationFailed` inside HPKE.
+
+And the faithfulness change, labelled as such rather than as a find:
+
+4. **§7.9.1's "next non-blank parent node" is now walked as written**
+   (`nextNonBlankAncestor`), where the old code walked §4.1.2's filter
+   instead. §7.9.1 gives both descriptions as one thing, and at every call
+   site they provably ARE one thing: `parentHash` is only called on a leaf
+   whose direct path was just merged, and the merge blanks that path and
+   re-fills exactly the filtered part. **No test distinguishes the two, and
+   reverting this change leaves the suite green** — that was checked, not
+   assumed. It is kept because it is what the section says and because it
+   stays correct if `parentHash` is ever called on a tree whose upper path
+   an Update or Remove blanked, where a blank node can sit above a
+   non-empty copath resolution.
+
+### The §7.3/§10.1 boundary, decided rather than deferred
+
+The brief asked whether §10.1/§7.3's admission rules belong here. §7.3's
+list splits cleanly, and the split is the boundary:
+
+**Stays the caller's (Part 3)** — each needs something this module does not
+have. "The credential in the LeafNode is valid, as described in §5.3.1" is
+an Authentication Service, i.e. an application. The `lifetime` window needs
+a clock, and this module reads none (`meta.platform = .any`, no I/O in it at
+all). `required_capabilities` compatibility and "the credential type is
+supported by all members" are policy over an extension registry the
+application owns. All of §10.1 is the same shape.
+
+**Taken here** — each needs only the leaf and the tree, and §12.2's closing
+rule makes a Commit INVALID if "after processing the Commit the ratchet tree
+is invalid, in particular, if it contains any leaf node that is invalid
+according to Section 7.3". A creator that skipped them would emit Commits
+its own receivers must reject, which is not a defensible place for a sender
+to be:
+
+- every extension in `LeafNode.extensions` listed in
+  `capabilities.extensions` (`Policy.check_leaf_extensions_supported`);
+- `signature_key`/`encryption_key` unique across the group, plus
+  §12.4.3.1's "the encryption key in the parent node does not appear in any
+  other node of the tree" (`Policy.check_key_uniqueness`), swept once per
+  epoch transition because it is a property of the finished tree and no
+  earlier point can answer it.
+
+Both default ON and both are `Policy` switches. Both run in BOTH directions,
+and all three `passive-client-*.json` sessions replay green with them on —
+which is itself a small piece of evidence that the reading is the same one
+the reference implementation uses.
+
+### Where the boundary falls: external Commits are the next piece, not a
+### loose end of this one
+
+§12.4.3.2 is NOT in this part, and the reason has changed since Part 7 said
+"no anchor". The anchor argument is now weaker — creation exists, so an
+external Commit could be round-tripped inside this module exactly as
+everything else in Part 8 is. What has NOT changed is that there is still no
+upstream external-commit vector, so it would be round-trip-only either way;
+and what it needs is a second substantial piece rather than a few lines on
+top of `createCommit`:
+
+- a second §12.2 validation procedure (the RFC states one for regular
+  Commits and a completely different, whitelist-shaped one for external
+  ones: exactly one ExternalInit, at most one Remove, zero or more PSK,
+  nothing else);
+- a `new_member_commit` branch through `processCommit`'s first half — no
+  `membership_tag` (the sender is not a member), and the signature key comes
+  from `commit.path.leaf_node` rather than from the tree, because the sender
+  has no leaf yet;
+- leaf assignment on BOTH sides ("assign the sender the leftmost blank leaf
+  node in the new ratchet tree", extending the tree if there is none) — the
+  one step where sender and receiver must independently compute the same
+  index;
+- substituting §8.3's external `init_secret` for the previous epoch's inside
+  the key schedule (§12.3's "If there is an ExternalInit proposal, use it to
+  derive the init_secret for use later in Commit processing").
+
+Everything each of those reads already exists —
+`keyschedule.externalInitSender`/`externalInitReceiver`,
+`welcome.GroupInfo.externalPub`, `framing.SenderType.new_member_commit`,
+`content.Proposal.external_init`, `createCommit`'s
+`include_external_pub` — so the piece is well-defined and unblocked. It is
+listed in the Backlog with that decomposition rather than started here,
+because a half-built external Commit next to a finished regular one would
+make it impossible to tell which of the two a failing test was about.
+
+### Everything else this part does NOT do
+
+- **No `PrivateMessage` handshakes**, in either direction. Unchanged from
+  Part 7: `error.PrivateHandshakeNotSupported`.
+- **`createCommit` is not atomic**, on exactly the terms `processCommit` is
+  not: a failure after the tree has been mutated poisons the object. The
+  refusals that CAN be made cheaply happen first, though — the whole §12.2
+  validation and every Add's KeyPackage signature are checked before
+  `self.poisoned` is set, so the common rejection cases leave a usable
+  group, and a test pins that.
+- **No committer-chosen leaf content.** §7.5 allows a Commit to change the
+  committer's credential, capabilities or extensions ("The application MAY
+  specify other changes to the leaf node"); `createCommit` carries the
+  current leaf's content over and rotates only the keys §7.5 requires.
+  Supporting the rest means deep-copying caller-owned credential and
+  capability data into the group's arena, which is plumbing this batch did
+  not add. `treekem.StageParams` already exposes the seam for a caller that
+  wants to do it by hand.
+- **No `ReInit` follow-through** (§11.2) and no branching (§11.3). A
+  `ReInit` proposal can be committed — §12.2's "a ReInit proposal together
+  with any other proposal" rule is enforced — but nothing creates the
+  successor group.
+
+### Teeth
+
+- **The anchored generation test has a negative control.** The same
+  generation run from a path secret that is one bit off must differ from the
+  vector in every anchored field — node public keys, `commit_secret` and the
+  leaf's `parent_hash` — while still producing a path of the SAME length,
+  since the §4.1.2 filter is a property of the tree and not of the secrets.
+  Without that control, a comparison against a value the test itself
+  computed would look identical to a comparison against the vector.
+- **A Commit corrupted in one byte is rejected** by a receiver that
+  otherwise accepts it (`MacMismatch`, §12.4.2's second bullet), and the
+  receiver does not advance; the uncorrupted Commit is then accepted and
+  both sides match. A `Welcome` corrupted in one byte fails
+  `DecryptionFailed` and produces no member.
+- **`createCommit` refuses the lists a receiver would reject** — a Remove of
+  the committer, two Adds with the same signature key, an inline
+  ExternalInit — and the group is still usable afterwards, which is what
+  distinguishes a pre-mutation refusal from a poisoned object.
+- **The zero-ciphertext `UpdatePathNode` is tested, not assumed away.** A
+  one-member group adding a second member produces an `UpdatePath` whose one
+  node carries NO ciphertexts, because its only copath child is the leaf
+  that same Commit added and §7.5 excludes it from the resolution. That is
+  the first Commit of every group's life; the test asserts the node count,
+  the empty ciphertext vector, and that the joiner is nonetheless merged at
+  that node via §12.4.3.1's `path_secret`.
+- **Every claimed fix was sabotage-checked.** Each of the three defects
+  above was re-introduced and the suite re-run, and the SPEC records which
+  tests catch it. The one change no test catches (§7.9.1's wording) says so
+  in the same list rather than being presented alongside the others.
 
 ## Threat model
 
@@ -1104,18 +1402,36 @@ so.
   by a byte-exact interop vector. Its export-context string and HPKE
   `suite_id` are pinned as literals separately, because a round trip alone
   cannot catch a label both sides get wrong the same way.
-- **External Commits (§12.4.3.2) are still unbuilt, and the reason is now
-  sharper than "unblocked".** Everything they read already exists
-  (`welcome.GroupInfo.externalPub`, `keyschedule.externalKeyPair`, §8.3
-  above, `framing.SenderType.new_member_commit`,
-  `content.Proposal.external_init`, and now a group-state object). What is
-  missing is an ANCHOR. §8.3 could be round-tripped because this module
-  contains both of its halves; an external-Commit RECEIVER has no
-  counterpart to round-trip against while Commit CREATION does not exist,
-  and there is no upstream vector. Building it now would mean shipping
-  untestable code — the same reason `keyschedule.zig` gave for not stubbing
-  §8.3 before `hpke` exported its setup layer. **Take it together with
-  Commit creation, not before.**
+- **External Commits (§12.4.3.2) are the next piece, and they are fully
+  unblocked — DECOMPOSED 2026-07-29.** The old reason for deferring them
+  ("no anchor: a receiver has no counterpart while creation does not exist")
+  expired when Part 8 landed. They are still out, and the reason is now
+  size and separability rather than testability. Four pieces, none of them a
+  few lines on `createCommit`: (1) §12.2's SECOND validation procedure, a
+  whitelist (exactly one ExternalInit, at most one Remove, zero or more PSK,
+  nothing else) rather than the regular Commit's blacklist; (2) a
+  `new_member_commit` branch through `processCommit`'s first half — no
+  `membership_tag`, and the signature key read out of
+  `commit.path.leaf_node` because the sender has no leaf yet; (3) leaf
+  assignment on BOTH sides ("the leftmost blank leaf node in the new ratchet
+  tree", extending the tree if there is none), the one step where sender and
+  receiver must independently compute the same index; (4) substituting
+  §8.3's external `init_secret` for the previous epoch's inside the key
+  schedule. Everything they READ exists already
+  (`keyschedule.externalInitSender`/`externalInitReceiver`,
+  `welcome.GroupInfo.externalPub`, `framing.SenderType.new_member_commit`,
+  `content.Proposal.external_init`, `createCommit`'s
+  `include_external_pub`, which publishes a `GroupInfo` an external joiner
+  can use today). Note there is still no upstream external-commit vector, so
+  it will land round-trip-anchored — the same footing the rest of Part 8's
+  creation side is on, and honest about it.
+- **`createCommit` cannot change the committer's leaf CONTENT.** §7.5 allows
+  a Commit to carry a new credential, capabilities or extensions for the
+  committer's leaf; Part 8 carries the current content over and rotates only
+  the keys. The blocker is plumbing, not design: caller-owned credential and
+  capability data would have to be deep-copied into the group's arena the
+  way `dupExtensions` does for GroupContext extensions.
+  `treekem.StageParams` already exposes the seam.
 - **`passive-client-*.json` — CLAIMED and green 2026-07-29** (Part 7). All
   three replay end to end, including the 200-Commit session. See "Part 7".
 - **`framing.zig` exposes no single `unprotectPrivate`.** Decryption is
@@ -1156,6 +1472,15 @@ so.
   callers. `keyschedule.zig` uses it for the two `GroupContext`-carrying
   derivations; a regression test drives a 4 KB context through both entry
   points and asserts the fixed one refuses rather than truncates.
+- **§12.4's `pathRequiredTypes` and §12.4.2's own bullet disagree**, and
+  this module follows §12.4 (the section that defines §17.4's "Path
+  Required" registry column). §12.4.2 names only Update, Remove and an empty
+  list; §12.4 adds `external_init` and `group_context_extensions`. Following
+  the broader rule can only reject Commits a §12.4.2-literal implementation
+  would accept — no recorded session in `passive-client-*.json` contains
+  one, so the disagreement is unobservable against the vectors available. If
+  it ever becomes observable, the receive side is the one to relax, not the
+  send side.
 - **The secret tree's non-power-of-two tree shape is not vector-covered.**
   `secrettree.nodeSecret` walks `treemath`'s truncated tree, which is what
   §9 requires ("the same structure as the group's ratchet tree"), but
@@ -1169,14 +1494,17 @@ so.
 - **`treemath.zig`'s `common_ancestor_semantic`/`common_ancestor_direct`**
   (RFC 9420 Appendix C also publishes these) are NOT implemented here —
   not required by `tree-math.json`'s published fields (`root`/`left`/
-  `right`/`parent`/`sibling` only). **Part 6 named the first real
-  consumer**: §12.4.3.1's private-key installation step ("Identify the
-  lowest common ancestor of the leaf node my_leaf and of the node of the
-  member with leaf index GroupInfo.signer") is exactly this function. That
-  step is out of Part 6's scope because it also needs a mutable tree to
-  write the keys into, so the two arrive together or not at all; add both
-  when the group-state object does, following the same direct-port
-  approach.
+  `right`/`parent`/`sibling` only). **This entry was stale as written, and
+  is corrected 2026-07-29.** It predicted the two would arrive with the
+  group-state object; the group-state object arrived in Part 7 without
+  them. §12.4.3.1's private-key installation step is served by
+  `group.commonAncestor`, a direct-path intersection written where it is
+  used rather than a port of Appendix C, and Part 8's send side needs
+  something the RFC's `common_ancestor_*` does not compute at all — "the
+  lowest node OF THE COMMITTER'S FILTERED DIRECT PATH covering this leaf",
+  which is `treekem.Staged.pathSecretFor`. Porting Appendix C's two
+  functions is therefore now a completeness item with no consumer, not a
+  prerequisite for anything.
 - **Part 2's five Fable cores are DONE 2026-07-16** —
   `resolution`/`parentHash`/`validateParentHashes`/`processUpdatePath`/
   `applyUpdatePath` (`treekem.zig`) are implemented and the gate

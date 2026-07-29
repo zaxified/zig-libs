@@ -120,6 +120,28 @@ pub const UpdatePath = struct {
         for (self.nodes) |n| n.deinit(allocator);
         allocator.free(self.nodes);
     }
+
+    /// The counterpart of `sealUpdatePath` rather than of `decode`: frees
+    /// the nodes and every ciphertext byte inside them, and NOT the
+    /// `leaf_node`.
+    ///
+    /// A sealed `UpdatePath` is not shaped like a decoded one. `decode`
+    /// allocates the leaf's lists and the node vector from one allocator,
+    /// so `deinit` frees both; `sealUpdatePath` produces ciphertexts that
+    /// live only until the Commit is serialized, while the leaf belongs to
+    /// the tree that adopted it and generally comes from a DIFFERENT
+    /// allocator (an arena). Calling `deinit` on one of those would free
+    /// arena memory through the wrong allocator.
+    pub fn deinitSealed(self: UpdatePath, allocator: std.mem.Allocator) void {
+        for (self.nodes) |n| {
+            for (n.encrypted_path_secret) |ct| {
+                allocator.free(ct.kem_output);
+                allocator.free(ct.ciphertext);
+            }
+            allocator.free(n.encrypted_path_secret);
+        }
+        allocator.free(self.nodes);
+    }
 };
 
 // ── Fable core #1: resolution (RFC 9420 §4.1) ─────────────────────────────
@@ -170,6 +192,15 @@ pub fn resolution(allocator: std.mem.Allocator, t: *const tree.RatchetTree, inde
 /// directly and to a leaf named in a `ParentNode.unmerged_leaves` list —
 /// a newly added member is unmerged at its non-blank ancestors, so leaving
 /// it in through that path would defeat the exclusion just as surely.
+///
+/// **Where this variant must NOT be used: the §4.1.2 filter.** §7.5 puts
+/// the exclusion sentence inside the encryption step's "compute the
+/// resolution of the node's child that is on the copath", not in the
+/// definition of the filtered direct path the step loops over — so a node
+/// whose copath resolution is entirely same-Commit Adds keeps its place in
+/// the path and carries an `UpdatePathNode` with zero ciphertexts. Applying
+/// it to the filter as well leaves that node blank and produces a tree that
+/// fails §7.9.2; `filteredDirectPath` carries the full argument.
 pub fn resolutionExcluding(
     allocator: std.mem.Allocator,
     t: *const tree.RatchetTree,
@@ -224,7 +255,7 @@ fn resolutionInto(
 /// (inclusive). In the array representation, `y` covers exactly the index
 /// span `[y - (2^level(y) - 1), y + (2^level(y) - 1)]` (RFC 9420 Appendix
 /// C's layout).
-fn inSubtree(x: usize, y: usize) bool {
+pub fn inSubtree(x: usize, y: usize) bool {
     const span = (@as(usize, 1) << @intCast(treemath.level(y))) - 1;
     return x + span >= y and x <= y + span;
 }
@@ -322,24 +353,37 @@ fn parentHashRaw(
     return S.hash(w.finish());
 }
 
-/// The next node ABOVE `index` on the filtered direct path (RFC 9420
-/// §4.1.2: a direct-path node is filtered out when its child on the copath
-/// has an empty resolution), plus that node's copath child. `null` when no
-/// such node exists (`index` is the root, or everything above it is
-/// filtered out).
+/// The next NON-BLANK parent node above `index`, plus that node's copath
+/// child. `null` when no such node exists (`index` is the root, or every
+/// parent above it is blank).
+///
+/// **Why "non-blank" and not "kept by the §4.1.2 filter", which is what
+/// this used to compute.** RFC 9420 §7.9.1 defines the value a
+/// `parent_hash` field carries as "the parent hash of the next non-blank
+/// parent node above the node in question (the next node in the filtered
+/// direct path)" — it offers both descriptions as one thing, and this
+/// follows the first.
+///
+/// **Stated honestly: at every call site the two are provably the same
+/// value, and no test distinguishes them.** `parentHash` is only ever
+/// called on a leaf whose direct path an `UpdatePath` has just been merged
+/// into, and §7.5's merge blanks that whole direct path and then re-fills
+/// exactly the filtered direct path — so along it, "non-blank" and "kept by
+/// the filter" coincide by construction. The change is for faithfulness to
+/// §7.9.1's wording and for robustness if this ever gets called on a tree
+/// whose upper path was blanked by an Update or a Remove, where a blank
+/// node can sit above a non-empty copath resolution and the filter-based
+/// walk would land on an empty slot.
 const FilteredLink = struct { p: usize, s: usize };
 
-fn nextFilteredAncestor(allocator: std.mem.Allocator, t: *const tree.RatchetTree, index: usize) Error!?FilteredLink {
+fn nextNonBlankAncestor(t: *const tree.RatchetTree, index: usize) ?FilteredLink {
     const n_leaves = t.nLeaves();
     const r = treemath.root(n_leaves);
     var prev = index;
     while (prev != r) {
         const q = treemath.parent(prev, n_leaves) orelse return null;
         const sib = treemath.sibling(prev, n_leaves) orelse return null;
-        const res = try resolution(allocator, t, sib);
-        const non_empty = res.len > 0;
-        allocator.free(res);
-        if (non_empty) return .{ .p = q, .s = sib };
+        if (t.nodes[q] != null) return .{ .p = q, .s = sib };
         prev = q;
     }
     return null;
@@ -348,16 +392,46 @@ fn nextFilteredAncestor(allocator: std.mem.Allocator, t: *const tree.RatchetTree
 /// One entry of a leaf's filtered direct path: the direct-path node kept by
 /// the §4.1.2 filter and its copath child (the child whose resolution the
 /// corresponding `UpdatePathNode`'s ciphertexts are encrypted to).
-const FdpEntry = struct { node: usize, copath_child: usize };
+pub const FdpEntry = struct { node: usize, copath_child: usize };
 
 /// The filtered direct path of the leaf at node index `leaf_node_index`
 /// (RFC 9420 §4.1.2), leaf-to-root order — the node ordering `UpdatePath
 /// .nodes` mirrors (§7.6). Caller frees the returned slice.
-fn filteredDirectPath(
+///
+/// **§7.5's same-Commit-Add exclusion does NOT apply here, and this is a
+/// correction to what Part 7 implemented.** §4.1.2 defines the filtered
+/// direct path purely as a property of the tree ("the node's direct path,
+/// with any node removed whose child on the copath of L has an empty
+/// resolution"), and §7.5 puts the exclusion inside the ENCRYPTION step —
+/// "For each node in the member's filtered direct path ... 1. Compute the
+/// resolution of the node's child that is on the copath of the sender. Any
+/// new member ... MUST be excluded from this resolution." The loop is over
+/// the unfiltered-by-exclusion path; only the resolution it computes per
+/// node is narrowed. A node whose copath resolution consists ENTIRELY of
+/// members this Commit adds therefore stays in the path and carries an
+/// `UpdatePathNode` with zero ciphertexts, rather than dropping out.
+///
+/// Applying the exclusion to the filter as well is not merely
+/// over-eager — it produces trees that fail §7.9.2. Take a Commit that
+/// adds a member into the committer's own sibling leaf: with the exclusion
+/// in the filter, the committer's parent node is dropped and left BLANK,
+/// so the new member's leaf lands in the resolution of that blank node,
+/// which is the child `C` of the next surviving parent `P`. §7.9.2's third
+/// criterion then requires `P.unmerged_leaves ∩ subtree(C) ==
+/// resolution(C) \ {D}` — but §7.5's merge sets `P.unmerged_leaves` to the
+/// empty list, while `resolution(C) \ {D}` contains the new member. The
+/// tree fails `validateParentHashes`, i.e. no conformant joiner would
+/// accept it. Keeping the node in the path leaves it non-blank,
+/// `resolution(C)` becomes `{C}` alone, and the criterion holds.
+///
+/// Every upstream vector at the pinned revision passes under EITHER
+/// reading — no recorded session happens to contain a copath subtree made
+/// only of same-Commit Adds — so the RFC's own wording and the §7.9.2
+/// consistency argument are what settle it. See `SPEC.md`'s "Part 8".
+pub fn filteredDirectPath(
     allocator: std.mem.Allocator,
     t: *const tree.RatchetTree,
     leaf_node_index: usize,
-    excluded: []const u32,
 ) Error![]FdpEntry {
     const n_leaves = t.nLeaves();
     var dp_buf: [treemath.max_path_len]usize = undefined;
@@ -367,12 +441,7 @@ fn filteredDirectPath(
     var list: std.ArrayList(FdpEntry) = .empty;
     errdefer list.deinit(allocator);
     for (dp, cp) |d, c| {
-        // §7.5's exclusion changes the FILTER too, not just the ciphertext
-        // count: a copath subtree containing nothing but members added by
-        // this Commit resolves to the empty list, so its direct-path node
-        // drops out of the filtered path entirely and the UpdatePath is one
-        // node shorter.
-        const res = try resolutionExcluding(allocator, t, c, excluded);
+        const res = try resolution(allocator, t, c);
         const non_empty = res.len > 0;
         allocator.free(res);
         if (non_empty) try list.append(allocator, .{ .node = d, .copath_child = c });
@@ -433,13 +502,13 @@ fn parentHashField(t: *const tree.RatchetTree, index: usize) ?[]const u8 {
 /// subtree(C) == resolution(C) \ {D}` — a full chain is valid iff it can
 /// be built bottom-up from some leaf to the root this way (§7.9.2).
 pub fn parentHash(comptime S: type, allocator: std.mem.Allocator, t: *const tree.RatchetTree, index: usize) Error![S.Hash.digest_length]u8 {
-    // P = the next node above `index` on the filtered direct path (§4.1.2
-    // filter; nodes whose copath child resolves to nothing are skipped,
-    // exactly the nodes an UpdatePath leaves blank). No such node — `index`
-    // is the root, or everything above is filtered — means there is no
-    // parent hash to compute here (the VALUE would be the zero-length
-    // string, which this fixed-width-digest function cannot express).
-    const link = (try nextFilteredAncestor(allocator, t, index)) orelse return error.Malformed;
+    // P = the next NON-BLANK parent node above `index` (§7.9.1's own words;
+    // see `nextNonBlankAncestor` for why that criterion rather than the
+    // §4.1.2 filter). No such node — `index` is the root, or every parent
+    // above it is blank — means there is no parent hash to compute here
+    // (the VALUE would be the zero-length string, which this fixed-width-
+    // digest function cannot express).
+    const link = nextNonBlankAncestor(t, index) orelse return error.Malformed;
     const p = switch (t.nodes[link.p] orelse return error.Malformed) {
         .parent => |p| p,
         .leaf => return error.Malformed,
@@ -613,9 +682,11 @@ pub fn processUpdatePath(
     update_path: UpdatePath,
     group_context: []const u8,
     /// RFC 9420 §7.5's excluded set: the LEAF indices of members added by
-    /// the same Commit that carries this `UpdatePath`. Pass `&.{}` for an
-    /// `UpdatePath` that stands alone (an Update-only Commit, or the
-    /// `treekem.json` vectors, none of which carry an Add).
+    /// the same Commit that carries this `UpdatePath`. It narrows the
+    /// RESOLUTION each node's ciphertexts are indexed by, and nothing else
+    /// — see `filteredDirectPath` for why it must not narrow the path.
+    /// Pass `&.{}` for an `UpdatePath` that stands alone (an Update-only
+    /// Commit, or the `treekem.json` vectors, none of which carry an Add).
     added_this_commit: []const u32,
 ) Error!ProcessedUpdatePath {
     const sender_node = 2 * sender_leaf_index;
@@ -624,7 +695,7 @@ pub fn processUpdatePath(
 
     // §7.6: UpdatePath.nodes mirrors the sender's filtered direct path,
     // leaf-to-root, one entry per surviving direct-path node.
-    const fdp = try filteredDirectPath(allocator, t, sender_node, added_this_commit);
+    const fdp = try filteredDirectPath(allocator, t, sender_node);
     defer allocator.free(fdp);
     if (update_path.nodes.len != fdp.len) return error.Malformed;
 
@@ -760,9 +831,6 @@ pub fn applyUpdatePath(
     t: *tree.RatchetTree,
     sender_leaf_index: usize,
     update_path: UpdatePath,
-    /// RFC 9420 §7.5's excluded set — see `processUpdatePath`. It changes
-    /// the FILTERED direct path, hence which nodes this merge writes to.
-    added_this_commit: []const u32,
 ) Error!void {
     // Suite note: this signature carries no `comptime S` (fixed by the
     // scaffold), yet step 3's parent hashes need the suite hash — so it
@@ -780,7 +848,7 @@ pub fn applyUpdatePath(
     // blanking the direct path wouldn't change them anyway — but the
     // UpdatePath's node count must be checked against the tree as it
     // stands.
-    const fdp = try filteredDirectPath(allocator, t, sender_node, added_this_commit);
+    const fdp = try filteredDirectPath(allocator, t, sender_node);
     defer allocator.free(fdp);
     if (update_path.nodes.len != fdp.len) return error.Malformed;
 
@@ -852,6 +920,326 @@ pub fn applyUpdatePath(
         // the leaf's parent hash is the zero-length string.
         if (leaf_claimed_ph.len != 0) return error.Malformed;
     }
+}
+
+// ── the SENDER half of §7.5 (Part 8) ─────────────────────────────────────
+//
+// `applyUpdatePath`/`processUpdatePath` above are the RECEIVER's two
+// halves. These two are the committer's, and they are split at exactly the
+// point RFC 9420 §12.4.1 splits them, for a reason that is not stylistic:
+// the HPKE `info` for the ciphertexts is the PROVISIONAL `GroupContext`,
+// whose `tree_hash` is the hash of the tree AFTER the new keys and the new
+// leaf are merged into it. So the tree must be updated (`stageUpdatePath`)
+// before the context that the encryption (`sealUpdatePath`) needs can be
+// computed at all. Fusing them would mean this file building a
+// `GroupContext`, i.e. depending on §8 — which is `keyschedule.zig`'s, and
+// which the caller already holds.
+
+/// What `stageUpdatePath` produced: the sender's own secrets for one
+/// epoch, plus the signed leaf that goes into the `UpdatePath`.
+pub fn Staged(comptime S: type) type {
+    return struct {
+        const Self = @This();
+
+        /// One node of the sender's filtered direct path, leaf-to-root —
+        /// the same order and the same length as `UpdatePath.nodes` (§7.6).
+        pub const Node = struct {
+            /// Array index of the direct-path node.
+            node: usize,
+            /// The copath child whose resolution this node's ciphertexts
+            /// are encrypted to (§7.5).
+            copath_child: usize,
+            /// §7.4's `path_secret[n]` for this node.
+            path_secret: [S.Nh]u8,
+            /// §7.4's `node_pub[n]`, already installed in the tree.
+            public_key: []const u8,
+        };
+
+        /// The committer's new `LeafNode` — `leaf_node_source = commit`,
+        /// the freshly sampled `encryption_key`, §7.5's `parent_hash`, and
+        /// a signature over all of it. Already installed in the tree.
+        leaf_node: tree.LeafNode,
+        nodes: []Node,
+        /// §12.4.1's `commit_secret`: `path_secret[n+1]`, one
+        /// `DeriveSecret(., "path")` past the last path secret — the same
+        /// value `processUpdatePath` hands a receiver.
+        commit_secret: [S.Nh]u8,
+
+        pub fn deinit(self: Self, allocator: std.mem.Allocator) void {
+            allocator.free(self.nodes);
+        }
+
+        /// The path secret a member at `leaf_index` should be given in a
+        /// `Welcome` (RFC 9420 §12.4.1: "Identify the lowest common
+        /// ancestor in the tree of the new member's leaf node and the
+        /// member sending the Commit ... Compute the path secret
+        /// corresponding to the common ancestor node"), or `null` when no
+        /// node of this path covers that leaf.
+        ///
+        /// **Why "lowest node OF THIS PATH that is an ancestor" and not
+        /// literally "the lowest common ancestor".** The two differ exactly
+        /// when the common ancestor was dropped from the filtered direct
+        /// path — which is precisely what §7.5's exclusion of same-Commit
+        /// Adds causes, and a new member is by definition such an Add. The
+        /// dropped node is left BLANK by the merge, so it has no key and no
+        /// path secret for anyone to send; the lowest node that does have
+        /// one is the next surviving node above it, which is what a joiner
+        /// can actually use.
+        pub fn pathSecretFor(self: Self, leaf_index: u32) ?[S.Nh]u8 {
+            for (self.nodes) |n| {
+                if (inSubtree(2 * @as(usize, leaf_index), n.node)) return n.path_secret;
+            }
+            return null;
+        }
+    };
+}
+
+/// Everything the committer chooses about its new leaf, plus §7.4's two
+/// fresh secrets. The two secrets are PARAMETERS rather than drawn inside:
+/// this file has no randomness of its own (`sealUpdatePath` is where
+/// `std.Io` first appears), which is also what lets `kat_commit_test.zig`
+/// seed a generation from a recorded vector's own path secret and compare
+/// the derived public keys byte-for-byte.
+pub fn StageParams(comptime S: type) type {
+    return struct {
+        /// The group's `group_id` — part of a commit-sourced `LeafNodeTBS`
+        /// (§7.2), so a leaf signed here cannot be replayed into another
+        /// group.
+        group_id: []const u8,
+        signature_key_pair: S.Sig.KeyPair,
+        /// §7.5 step 4: "Set the encryption_key to the public key of a
+        /// freshly sampled key pair."
+        leaf_key_pair: S.Kem.KeyPair,
+        /// §7.4: "path_secret[0] is sampled at random."
+        path_secret_0: [S.Nh]u8,
+        /// The rest of the leaf's content. §7.5: "The application MAY
+        /// specify other changes to the leaf node, e.g., providing a new
+        /// signature key, updated capabilities, or different extensions."
+        /// Every byte slice reachable from these ALIASES caller memory and
+        /// must outlive the tree — `tree.zig`'s standing convention.
+        signature_key: []const u8,
+        credential: tree.Credential,
+        capabilities: tree.Capabilities,
+        extensions: []const tree.Extension = &.{},
+    };
+}
+
+/// RFC 9420 §7.4 + §7.5's first block ("A member of the group updates their
+/// direct path"), which is §12.4.1's "Update the sender's direct path in
+/// the ratchet tree as described in Section 7.5":
+///
+///   1. Blank every node on the sender's direct path.
+///   2. Derive `path_secret[n]`/`node_pub[n]` for each node of the FILTERED
+///      direct path and install the public keys, with empty
+///      `unmerged_leaves`.
+///   3. Compute the new parent hashes, root to leaf.
+///   4. Build the sender's new leaf — source `commit`, the fresh
+///      encryption key, the parent hash from step 3 — and sign it.
+///
+/// `t` is MUTATED into the post-merge state, so a caller that must not lose
+/// the old tree on failure has to work on a copy (`group.zig` documents the
+/// same non-atomicity for `processCommit`). Allocations made here are
+/// adopted by the tree without being owned by it (`ParentNode.deinit` frees
+/// only `unmerged_leaves`), so pass an ARENA — the same contract
+/// `applyUpdatePath` states.
+///
+/// §7.5's same-Commit-Add exclusion is NOT a parameter here: it narrows the
+/// resolutions the CIPHERTEXTS are built over (`sealUpdatePath`) and never
+/// the §4.1.2 filter this phase walks — see `filteredDirectPath`.
+pub fn stageUpdatePath(
+    comptime S: type,
+    allocator: std.mem.Allocator,
+    t: *tree.RatchetTree,
+    sender_leaf_index: usize,
+    params: StageParams(S),
+) !Staged(S) {
+    const sender_node = 2 * sender_leaf_index;
+    if (sender_node >= t.nodes.len) return error.InvalidLeafIndex;
+
+    // The §4.1.2 filter, computed BEFORE the direct path is blanked. Copath
+    // subtrees are disjoint from the direct path, so blanking cannot change
+    // it — computing it first only keeps both phases reading one shape.
+    const fdp = try filteredDirectPath(allocator, t, sender_node);
+    defer allocator.free(fdp);
+
+    const nodes = try allocator.alloc(Staged(S).Node, fdp.len);
+    errdefer allocator.free(nodes);
+
+    // §7.4's chain: path_secret[0] is the sampled value; every later one is
+    // DeriveSecret(previous, "path"). node_secret = DeriveSecret(path_secret,
+    // "node"); (node_priv, node_pub) = KEM.DeriveKeyPair(node_secret).
+    var secret = params.path_secret_0;
+    for (fdp, nodes, 0..) |e, *slot, i| {
+        if (i > 0) secret = try crypto.DeriveSecret(S, secret, "path");
+        const node_secret = try crypto.DeriveSecret(S, secret, "node");
+        const kp = S.Kem.deriveKeyPair(&node_secret);
+        slot.* = .{
+            .node = e.node,
+            .copath_child = e.copath_child,
+            .path_secret = secret,
+            .public_key = try allocator.dupe(u8, &kp.public_key),
+        };
+    }
+    // §12.4.1: "Define commit_secret as the value path_secret[n+1] derived
+    // from the last path secret value (path_secret[n]) derived for the
+    // UpdatePath."
+    //
+    // An EMPTY filtered direct path is not an exotic case — it is the first
+    // Commit of every group's life (a one-member group adding a second
+    // member: the only copath child is the new leaf, which §7.5 excludes,
+    // so nothing survives the filter). There is then no `path_secret[n]`,
+    // and the sampled `path_secret[0]` is the last value derived, so it is
+    // what the chain continues from. Nothing else can observe the choice:
+    // an empty filtered direct path means every leaf other than the
+    // sender's is blank or added by this same Commit, so no EXISTING member
+    // decrypts this path, and a new member enters the key schedule at
+    // `joiner_secret` — below the point `commit_secret` feeds.
+    const commit_secret = try crypto.DeriveSecret(S, secret, "path");
+
+    // §7.5 merge step 1.
+    var dp_buf: [treemath.max_path_len]usize = undefined;
+    const dp = treemath.direct_path(sender_node, t.nLeaves(), &dp_buf) catch return error.Malformed;
+    for (dp) |idx| blankNode(t, idx);
+    blankNode(t, sender_node);
+
+    // §7.5 merge step 2. A fresh key pair means nobody is unmerged relative
+    // to these nodes any more, including a member added by this very
+    // Commit — which is exactly why that member has to be excluded from the
+    // resolutions instead.
+    for (nodes) |n| {
+        t.nodes[n.node] = .{
+            .parent = .{
+                .encryption_key = n.public_key,
+                .parent_hash = "", // root value; overwritten below for the rest
+                .unmerged_leaves = &.{},
+            },
+        };
+    }
+
+    // §7.5 merge step 3: root to leaf, so each node's stored field can feed
+    // its child's `ParentHashInput` (§7.9.1). Identical to the loop in
+    // `applyUpdatePath` — that one writes the keys it read off the wire,
+    // this one writes the keys it just derived.
+    if (nodes.len > 0) {
+        var i = nodes.len - 1;
+        while (i > 0) {
+            i -= 1;
+            const upper = switch (t.nodes[nodes[i + 1].node].?) {
+                .parent => |p| p,
+                .leaf => return error.Malformed,
+            };
+            const digest = try parentHashRaw(S, allocator, t, upper, nodes[i + 1].copath_child, upper.parent_hash);
+            const owned = try allocator.dupe(u8, &digest);
+            var cur = switch (t.nodes[nodes[i].node].?) {
+                .parent => |p| p,
+                .leaf => return error.Malformed,
+            };
+            cur.parent_hash = owned;
+            t.nodes[nodes[i].node] = .{ .parent = cur };
+        }
+    }
+
+    // §7.5 step 4 + §7.9.1: the leaf carries the parent hash of the first
+    // node in its filtered direct path, and the zero-length string when
+    // there is no such node.
+    const leaf_parent_hash: []const u8 = if (nodes.len > 0) blk: {
+        const d = try parentHash(S, allocator, t, sender_node);
+        break :blk try allocator.dupe(u8, &d);
+    } else "";
+
+    var leaf: tree.LeafNode = .{
+        .encryption_key = try allocator.dupe(u8, &params.leaf_key_pair.public_key),
+        .signature_key = params.signature_key,
+        .credential = params.credential,
+        .capabilities = params.capabilities,
+        .leaf_node_source = .commit,
+        .parent_hash = leaf_parent_hash,
+        .extensions = params.extensions,
+        .signature = &.{},
+    };
+    const sig = try leaf.sign(S, allocator, params.signature_key_pair, params.group_id, @intCast(sender_leaf_index));
+    leaf.signature = try allocator.dupe(u8, &sig.toBytes());
+
+    // The tree adopts its own copies of the leaf's LIST containers, exactly
+    // as `applyUpdatePath` does for a received leaf, so `RatchetTree.deinit`
+    // frees what it owns and nothing else.
+    t.nodes[sender_node] = .{ .leaf = try dupLeafNodeLists(t.allocator, leaf) };
+
+    return .{ .leaf_node = leaf, .nodes = nodes, .commit_secret = commit_secret };
+}
+
+/// RFC 9420 §7.5's second block ("The member then encrypts path secrets to
+/// the group"), which is §12.4.1's "Encrypt the path secrets resulting from
+/// the tree update to the group ... using the provisional group context as
+/// the context for HPKE encryption":
+///
+///   1. For each node of the filtered direct path, compute the resolution
+///      of that node's copath child, with members added by this same Commit
+///      excluded.
+///   2. Encrypt the node's path secret to every public key in that
+///      resolution, in resolution order — which is the order a receiver
+///      indexes the ciphertext vector by (§7.6).
+///
+/// `t` must be the tree `stageUpdatePath` returned. The copath subtrees it
+/// reads are the ones the merge did not touch, so the resolutions are the
+/// same before and after; passing the merged tree simply avoids keeping a
+/// second copy alive.
+///
+/// The returned `UpdatePath` owns its `nodes` (and every ciphertext inside)
+/// via `allocator` — `UpdatePath.deinit` frees them. Its `leaf_node` is
+/// `staged.leaf_node` unchanged, whose bytes are owned by whatever allocator
+/// `stageUpdatePath` was given.
+pub fn sealUpdatePath(
+    comptime S: type,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    t: *const tree.RatchetTree,
+    staged: Staged(S),
+    /// The ENCODED provisional `GroupContext` (§8.1) — see this section's
+    /// opening note for why the caller supplies it.
+    group_context: []const u8,
+    added_this_commit: []const u32,
+) !UpdatePath {
+    // Exactly-sized `EncryptContext` scratch: a serialized `GroupContext`
+    // carries the group's extensions and so has no upper bound, the same
+    // reason `processUpdatePath` sizes its own scratch on the heap.
+    const scratch = try allocator.alloc(u8, try crypto.encryptContextLen("UpdatePathNode", group_context));
+    defer allocator.free(scratch);
+
+    const out = try allocator.alloc(UpdatePathNode, staged.nodes.len);
+    errdefer allocator.free(out);
+
+    for (staged.nodes, out) |n, *slot| {
+        const res = try resolutionExcluding(allocator, t, n.copath_child, added_this_commit);
+        defer allocator.free(res);
+
+        const cts = try allocator.alloc(HPKECiphertext, res.len);
+        errdefer allocator.free(cts);
+        for (res, cts) |r, *ct| {
+            const pk_bytes = switch (t.nodes[r] orelse return error.Malformed) {
+                .leaf => |l| l.encryption_key,
+                .parent => |p| p.encryption_key,
+            };
+            if (pk_bytes.len != S.Kem.Npk) return error.WrongKeyLength;
+            const pk: S.Kem.PublicKey = pk_bytes[0..S.Kem.Npk].*;
+
+            const ciphertext = try allocator.alloc(u8, S.Nh + S.Aead.tag_length);
+            errdefer allocator.free(ciphertext);
+            const enc = crypto.EncryptWithLabelScratch(
+                S,
+                pk,
+                io,
+                "UpdatePathNode",
+                group_context,
+                &n.path_secret,
+                ciphertext,
+                scratch,
+            ) catch return error.Malformed;
+            ct.* = .{ .kem_output = try allocator.dupe(u8, &enc), .ciphertext = ciphertext };
+        }
+        slot.* = .{ .encryption_key = n.public_key, .encrypted_path_secret = cts };
+    }
+    return .{ .leaf_node = staged.leaf_node, .nodes = out };
 }
 
 /// Blank one node slot, freeing what the tree owned there (`RatchetTree
