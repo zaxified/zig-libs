@@ -9,8 +9,8 @@ a freshly released id is not immediately reused. Exactly one allocation, at `ini
 engine (on reply/timeout/send-error) — `add` returns `error.Exhausted` when all 65536 slots are
 live, so the caller's in-flight cap must stay below 65536. `fetch` on a stale/foreign id returns
 `null`, never panics; `release` is idempotent. Reentrant — no shared/global state, but one instance
-is single-owner (no cross-thread sharing without external sync). Modeled after fping's `seqmap.c`
-(round-robin fixed-table approach) — see NOTICE.
+is single-owner (no cross-thread sharing without external sync). Clean-room implementation — no
+third-party source consulted; needs no NOTICE entry.
 
 ## Threat model / out of scope
 Not a security primitive: `fetch` confirms an id maps to a live probe, not that a reply is genuine —

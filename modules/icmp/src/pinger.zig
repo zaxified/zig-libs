@@ -3,9 +3,11 @@
 //! The ping engine: schedules probes across many targets with global and
 //! per-subnet pacing, tracks timeouts and statistics.
 //!
-//! Design follows fping's main_loop (two time-ordered event queues plus a
-//! global minimum send interval), with additions aimed at large monitoring
-//! deployments (10k+ targets per cycle):
+//! The scheduling design references fping's main loop (two time-ordered event
+//! queues plus a global minimum send interval) — behavior only, no source
+//! consulted at the statement level; see NOTICE §2. The expression here is
+//! independent, with additions aimed at large monitoring deployments (10k+
+//! targets per cycle):
 //!
 //!  * binary heaps instead of linked lists for O(log n) scheduling,
 //!  * a hard cap on in-flight probes,

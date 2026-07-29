@@ -3,8 +3,7 @@
 DNS resolver: RFC 1035 message codec + UDP/TCP/DoH transports, forward
 (A/AAAA) and reverse (PTR) lookups.
 
-- The /etc/hosts + UDP-PTR core is derived from
-  fping's rdns logic; the general codec, TCP, EDNS(0) and DoH fill a
+- The /etc/hosts + UDP-PTR core, the general codec, TCP, EDNS(0) and DoH fill a
   real std gap (`std.Io.net.HostName.lookup` is forward-only and opaque — no
   PTR, no server/transport control, no DoH).
 - **Model after:** Go `net` dnsclient + `miekg/dns` (message codec) / c-ares;
@@ -13,9 +12,10 @@ DNS resolver: RFC 1035 message codec + UDP/TCP/DoH transports, forward
   RFC 6724 result ordering), `http` (DoH transport), `std.json` (DoH-JSON),
   `std.Io.net` (UDP/TCP).
 
-Provenance: the /etc/hosts + UDP-PTR core is derived from fping (Stanford
-license) — see the fping attribution in [NOTICE](../../NOTICE); the general
-codec / TCP / EDNS(0) / DoH are clean-room from RFC 1035 / RFC 8484.
+Provenance: clean-room from RFC 1035 / RFC 8484 throughout, including the
+`/etc/hosts` + UDP-PTR core; design refs (`miekg/dns`, c-ares) recorded in
+[NOTICE](../../NOTICE) §2. No fping code is involved — fping has no resolver at
+all, and an earlier note claiming derivation was a bookkeeping error.
 
 ## Layout
 

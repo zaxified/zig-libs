@@ -2,15 +2,17 @@
 //! icmp — ICMP echo (ping) engine: wire codec, unprivileged/raw sockets and
 //! a paced multi-target prober.
 //!
-//! Derived from fping (schweikert/fping) — see NOTICE for the required
-//! attribution. Three layers:
+//! Clean-room from RFC 792 / RFC 4443 / RFC 1071 and ip(7)/ipv6(7); the
+//! prober's scheduling design references fping (schweikert/fping) — see
+//! NOTICE §2 for the provenance record. Three layers:
 //!
 //!  * `echo` — pure ICMPv4/v6 echo + timestamp codec with the RFC 1071
 //!    internet checksum; bounds-checked parsing that never panics.
 //!  * `Socket` — non-blocking Linux ICMP sockets: unprivileged SOCK_DGRAM
 //!    first (net.ipv4.ping_group_range), SOCK_RAW fallback (CAP_NET_RAW);
 //!    sendmmsg/recvmmsg batching, kernel receive timestamps, TTL/TOS.
-//!  * `Pinger` — fping's main_loop as a library: global send pacing,
+//!  * `Pinger` — a paced multi-target scheduler as a library, following
+//!    fping's main-loop design: global send pacing,
 //!    in-flight cap, per-subnet spacing, retries with timeout backoff, and
 //!    reply correlation via the sibling `seqmap` module.
 //!
@@ -40,7 +42,7 @@ pub const meta = .{
     .platform = .linux, // raw syscalls (ICMP sockets), no portable fallback
     .role = .client,
     .concurrency = .single_owner, // one thread/loop owns a Pinger (stop() is signal-safe)
-    .model_after = "fping (schweikert/fping)",
+    .model_after = "RFC 792/4443/1071 (codec) + ip(7)/ipv6(7) (sockets); scheduler design ref: fping (schweikert/fping), behavior only",
     .deps = .{ "seqmap", "netaddr" },
 };
 

@@ -4,9 +4,9 @@ ICMP echo (**ping**) engine: pure ICMPv4/v6 **echo codec**, unprivileged/raw
 **ICMP sockets**, and a paced multi-target **Pinger** built for monitoring
 workloads (thousands of host checks per cycle).
 
-- Derived from fping's icmp/socket/pinger logic
-  (netaddr was the first carve-out from the same lineage).
-- **Model after:** fping (schweikert/fping) `main_loop` — plus scaling
+- Clean-room from RFC 792 / 4443 / 1071 (codec) and ip(7)/ipv6(7) (sockets).
+- **Model after:** fping (schweikert/fping) `main_loop` — scheduling design
+  reference, behavior only, no source copied — plus scaling
   additions (binary-heap scheduling, in-flight cap, per-subnet spacing,
   first-probe jitter, sendmmsg/recvmmsg).
 - **Why:** no small pure-Zig ICMP library exists; std has no ICMP support.
@@ -16,8 +16,9 @@ workloads (thousands of host checks per cycle).
   async-signal-safe).
 - **Deps:** `seqmap` (reply correlation), `netaddr` (address parse/format).
 
-Provenance: derived from fping (schweikert/fping) — the required fping/
-Stanford attribution is in the repository `NOTICE`. Wire formats per RFC 792
+Provenance: clean-room; the prober's scheduling design references fping
+(schweikert/fping) — recorded in the repository `NOTICE` §2 as provenance, not
+as a license obligation. No fping source is copied. Wire formats per RFC 792
 (ICMP), RFC 4443 (ICMPv6), RFC 1071 (internet checksum).
 
 ## API

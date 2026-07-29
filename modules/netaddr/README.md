@@ -2,9 +2,7 @@
 
 IP address parse/format + **RFC 6724** destination/source address selection.
 
-- Derived from fping's address-selection logic
-  (`sortByDestinationPolicy`, `policyPrecedence`, `destinationReachable`),
-  extended to the full RFC 6724 destination rule set.
+- Clean-room from RFC 6724, covering the full destination rule set.
 - **Model after:** Go `net/addrselect.go` + glibc `getaddrinfo` (UDP-connect
   route-probe trick). Policy table and rule coverage match Go row-for-row.
 - **Why:** RFC 6724 selection ("several candidate addresses for a dual-stack
@@ -14,9 +12,9 @@ IP address parse/format + **RFC 6724** destination/source address selection.
   **Role:** util. **Concurrency:** reentrant (no shared state).
   **Allocation:** none, anywhere.
 
-Provenance: derived from fping's address-selection logic (see the fping
-attribution in [NOTICE](../../NOTICE)); design refs (Go `net/addrselect`,
-glibc) in NOTICE.
+Provenance: clean-room from RFC 6724; design refs (Go `net/addrselect`,
+glibc `getaddrinfo`) recorded in [NOTICE](../../NOTICE) §2. No fping code is
+involved — an earlier note claiming otherwise was a bookkeeping error.
 
 ## API
 

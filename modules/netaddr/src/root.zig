@@ -9,7 +9,7 @@
 //! scope/policy classification, and the RFC 6724 "which address do I connect
 //! to first" ordering that `http`, `dns` and `icmp` build on.
 //!
-//! The RFC 6724 logic is derived from fping (see ../../NOTICE) and extended to
+//! The RFC 6724 logic is clean-room from the RFC, covering
 //! the full destination rule set, cross-checked against Go's
 //! `net/addrselect.go`. Like Go, rules that need OS state we don't track are
 //! skipped (rule 3 deprecated addresses, rule 4 home addresses, rule 7 native

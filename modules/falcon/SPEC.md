@@ -124,7 +124,7 @@ below for the signer/keygen internals and the constant-time caveat). See
 
 Both implemented, byte-exact against the NIST Round-3 KATs at both degrees.
 The internals are ports of the MIT-licensed Round-3 reference
-implementation (see the repo-root `NOTICE`); byte-exactness is the point —
+implementation (attribution in this directory's `NOTICE`); byte-exactness is the point —
 it pins the trapdoor sampler and keygen sampling, whose failure mode is
 "verifies fine, leaks the key".
 

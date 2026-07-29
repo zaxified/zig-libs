@@ -45,7 +45,7 @@
 //! (`fpr`/`fft`/`gaussian`/`ffsampling`) and keygen (`ntru`) are ports
 //! of the corresponding MIT-licensed reference-implementation routines
 //! (falcon-sign.info, (c) 2017-2019 Falcon Project / Thomas Pornin) —
-//! NOTICE should credit that origin accordingly.
+//! the required attribution ships beside this source as ./NOTICE.
 
 const std = @import("std");
 

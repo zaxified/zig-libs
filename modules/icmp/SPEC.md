@@ -4,7 +4,7 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
 
 ## Design & invariants
 Layered, codec is pure: `echo` — build/parse + internet checksum, bounds-checked, never panics on
-garbage; `Socket` — non-blocking sockets; `Pinger` — the paced engine (fping's `main_loop` as a
+garbage; `Socket` — non-blocking sockets; `Pinger` — the paced engine (fping's main-loop design as a
 library: global pacing, in-flight cap, per-subnet spacing, retries, reply correlation). Unprivileged
 first: `SOCK_DGRAM` + `IPPROTO_ICMP`/`ICMPV6` when `net.ipv4.ping_group_range` covers the process
 group, `SOCK_RAW` fallback (needs CAP_NET_RAW/root). Batched sends via `sendmmsg` (only when
@@ -14,10 +14,10 @@ and RAW). Concurrency: single_owner — one thread/loop owns a `Pinger`; `stop()
 safe. Reply correlation is delegated to the sibling `seqmap`, so the in-flight cap must stay <
 65536. Platform: Linux-only by design — errno-encoded `std.os.linux` raw syscalls, no libc, no
 portable fallback. Modes mirror fping: `.alive` (stop at first reply, retry timeouts with backoff),
-`.count` (exactly N), `.loop` (until `stop()`). Derived from fping (a Zig port of fping's
-icmp/socket/pinger logic) plus scaling additions (binary-heap scheduling, in-flight cap, per-subnet
-spacing, first-probe jitter). Wire formats per RFC 792/4443/1071. See NOTICE (shared fping/Stanford
-attribution with netaddr/dns/seqmap).
+`.count` (exactly N), `.loop` (until `stop()`). The scheduler follows fping's main-loop DESIGN
+(behavior only — no source copied, independent expression: binary heaps vs intrusive lists, ppoll
+vs select, plus an in-flight cap, per-subnet spacing and first-probe jitter). Wire formats per
+RFC 792/4443/1071. See NOTICE §2 — a provenance record, not a license obligation.
 
 ## Threat model / out of scope
 Raw/DGRAM ICMP sockets need CAP_NET_RAW or a permissive `ping_group_range`; the module does not

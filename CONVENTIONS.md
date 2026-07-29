@@ -62,7 +62,7 @@ Per-module design/threat-model lives in each module's `SPEC.md`.
   build.zig            # registers each module by name + `test` / `test-<name>` steps
   build.zig.zon        # one manifest for the whole collection
   CONVENTIONS.md        # this file — all repo rules
-  NOTICE                 # canonical provenance + third-party design-refs + licenses
+  NOTICE                 # third-party DESIGN REFERENCES only — no license conditions
   modules/
     _template/           # copy to start a module
     <name>/
@@ -105,10 +105,16 @@ One fact lives in exactly one place; everywhere else links to it, never restates
 doctrine — implementing one, however closely, is not "derived from" anyone's code). A module that
 is pure clean-room-from-spec, with no third-party source ported and no third-party implementation
 studied as a design reference, needs **no NOTICE entry** — its RFC/spec citation lives in the
-module's own SPEC.md instead (see whois/rdap/tar). NOTICE is reserved for (1) **required
-attribution** — third-party source actually ported, license terms reproduced; and (2) **design
-references** — a named third-party implementation consulted for behavior/algorithm/API shape even
-without copying source. Running an installed third-party binary purely as a black-box compatibility
+module's own SPEC.md instead (see whois/rdap/tar). The root NOTICE is reserved for **design
+references** — a named third-party implementation consulted for behavior/algorithm/API shape
+without copying source. Those are provenance records, never license conditions.
+
+**Required attribution goes in the module, not the root.** If a module ports third-party source,
+its license terms are reproduced in `modules/<name>/NOTICE`, beside the code that owes them, so the
+notice travels with the module (see `falcon`). Never add such an entry to the root NOTICE: keeping
+the root free of redistribution conditions is what lets zig-libs be consumed as plain MIT.
+
+Running an installed third-party binary purely as a black-box compatibility
 test oracle (e.g. diffing output against `tar`/`nft`) is neither of the above and needs no entry.
 
 **Non-overlap rule:** README answers "how do I use this" (consumer altitude); SPEC
@@ -140,7 +146,9 @@ reference, not a re-explanation of everything the README already covers.
    disk) must equal the running count from `zig build test-<m> --summary all`.
 4. `zig build test-<name>` (per module) and `zig build test` (all) — both green in
    **Debug and ReleaseFast**; `zig fmt --check modules/<name>` clean.
-5. Update `NOTICE` with any third-party design reference + its license.
+5. Update the root `NOTICE` with any third-party design reference + its license. If you
+   actually ported third-party source, its terms go in `modules/<name>/NOTICE` instead —
+   never in the root file.
 
 ## 7. Verification harness per module type
 

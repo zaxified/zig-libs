@@ -105,6 +105,6 @@ specification (the reference implementation was a wire-format design
 reference + KAT oracle for those); the signer and keygen internals
 (`fpr`/`fft`/`gaussian`/`ffsampling`/`ntru`) are ports of the MIT-licensed
 Round-3 reference implementation, required for byte-exact KAT
-reproduction — see the `falcon` entry in the repo-root `NOTICE` and
-SPEC.md. The Falcon-1024 squared-norm acceptance bound (⌊β²⌋ = 70265242) is
+reproduction — the required attribution ships as [NOTICE](NOTICE) in this
+directory; see also SPEC.md. The Falcon-1024 squared-norm acceptance bound (⌊β²⌋ = 70265242) is
 sourced from the reference `common.c` `l2bound` table — see SPEC.md.

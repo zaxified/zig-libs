@@ -60,12 +60,10 @@ Roadmap notes live in the "Roadmap / not yet built" section above and the git hi
 
 ## Licensing
 
-zig-libs' own code is MIT throughout. Four modules — `icmp`, `seqmap`, `netaddr`, `dns` — descend
-from fping (https://github.com/schweikert/fping), which carries a non-standard Stanford
-"BSD-with-advertising" license, not a plain permissive one. That license affirmatively requires
-that documentation and advertising materials for redistributions acknowledge the software was
-developed by Stanford University. Redistributors of those four modules (or of zig-libs as a whole)
-must preserve that fping attribution, reproduced in full in `NOTICE` §1.
+zig-libs is MIT. Using or redistributing it requires nothing beyond the MIT license's own terms.
+
+Detailed provenance — third-party origin, design references and any upstream license notices — is
+recorded with each module that has any, not at the repository root.
 
 ## Modules
 

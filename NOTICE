@@ -7,11 +7,14 @@ here as the canonical home. The authors' other projects depend on zig-libs,
 not the reverse. A module's internal development origin — which of the
 authors' own projects it was first prototyped in — is NOT recorded here: it
 carries no attribution weight and would read backwards once those projects
-import zig-libs. This file records only genuine THIRD-PARTY obligations and
-design references — software derived from, or designed with reference to, the
-third parties listed below. All are permissive (MIT/BSD-family) and
-MIT-compatible. Where actual third-party code was ported (not merely
-modeled), the required attribution is reproduced.
+import zig-libs. This file records THIRD-PARTY design references — software
+designed with reference to the third parties listed below. All are permissive
+(MIT/BSD-family) and MIT-compatible, and NONE of them imposes a condition
+beyond zig-libs' own MIT license.
+
+Where actual third-party code was ported, the required attribution lives in
+that module's own `NOTICE` file beside its source, so it travels with the
+module — not here. See §1.
 
 ====================================================================
 0. POLICY — what requires an entry here
@@ -28,12 +31,14 @@ closely, is not "derived from" anyone's code. Accordingly:
     RFC/spec citation lives in the module's own SPEC.md ("Verification" /
     design section) instead — see e.g. whois (RFC 3912), rdap (RFC
     7480-family), tar (POSIX ustar + documented GNU extensions).
-  - This file is reserved for two things: (1) REQUIRED ATTRIBUTION —
-    third-party source actually ported/translated, license terms
-    reproduced below; (2) DESIGN REFERENCES — a named third-party
+  - Third-party source actually ported/translated requires its license
+    terms reproduced — in `modules/<name>/NOTICE`, beside the source, so
+    the notice travels with the code that owes it. Never in this file.
+  - This file is reserved for DESIGN REFERENCES — a named third-party
     implementation that was consulted/studied for behavior, algorithm
     shape, or API design, even when no source was copied (recorded for
-    provenance so any future line-level reuse is caught).
+    provenance so any future line-level reuse is caught). These are
+    records, not license conditions.
   - Exercising an installed third-party binary purely as a black-box
     compatibility test oracle (e.g. running `tar`/`nft` and diffing
     output against this module's own encoder/decoder) is neither of the
@@ -44,86 +49,18 @@ closely, is not "derived from" anyone's code. Accordingly:
 1. REQUIRED ATTRIBUTION — ported code
 ====================================================================
 
-## fping  (affects modules: netaddr, dns, icmp, seqmap)
+NONE at the repository level. zig-libs imposes no redistribution condition
+beyond its own MIT license.
 
-The `netaddr` module's address-selection logic, the `icmp` module (echo
-codec, ICMP sockets and the paced ping engine), the `seqmap` module
-(sequence-number correlation map, after fping's seqmap.c), and the `dns`
-module's /etc/hosts + UDP-PTR core DERIVE FROM fping
-(https://github.com/schweikert/fping), a third-party work under the Stanford
-license reproduced below. fping's license therefore applies to the derived
-portions and is reproduced here as its terms require:
+Where a module ports third-party code, that module carries its own `NOTICE`
+file next to its source, and the notice travels with the module. Currently
+one module does:
 
-    Original author:      Roland Schemers   <schemers@stanford.edu>
-    IPv6 Support:         Jeroen Massar
-    Improved main loop:   David Schweikert
-    Debian Merge, TOS:    Tobi Oetiker
-    Bugfixes, byte order & seq numbers: Stephan Fuhrmann
+  falcon  — `modules/falcon/NOTICE` (Falcon reference implementation, MIT;
+            a second copyright holder, no condition beyond MIT's own)
 
-    Redistribution and use in source and binary forms are permitted
-    provided that the above copyright notice and this paragraph are
-    duplicated in all such forms and that any documentation, advertising
-    materials, and other materials related to such distribution and use
-    acknowledge that the software was developed by Stanford University.
-    The name of the University may not be used to endorse or promote
-    products derived from this software without specific prior written
-    permission. THIS SOFTWARE IS PROVIDED "AS IS" AND WITHOUT ANY EXPRESS
-    OR IMPLIED WARRANTIES, INCLUDING, WITHOUT LIMITATION, THE IMPLIED
-    WARRANTIES OF MERCHANTIBILITY AND FITNESS FOR A PARTICULAR PURPOSE.
-
-## IANA Time Zone Database  (affects module: tz)
-
-The `tz` module's zone table (`modules/tz/src/tz_data.zig`) is generated from
-the IANA Time Zone Database (tzdata 2026a, https://www.iana.org/time-zones)
-by the authors' `tz-gen` tool. The tz database is in the public domain, as
-stated in its own distribution:
-
-    This file is in the public domain, so clarified as of
-    2009-05-17 by Arthur David Olson.
-
-Only the UTC-offset transition data and POSIX-TZ footer rules are extracted
-(not the tz database source code). The offset-lookup logic is the authors'
-own (MIT).
-
-## Falcon reference implementation  (affects module: falcon — signer + keygen)
-
-The `falcon` module's signing and key-generation cores are a faithful PORT of
-the Falcon Round-3 reference implementation (Falcon-impl-20211101,
-https://falcon-sign.info), done to reproduce the NIST Round-3 KAT vectors
-byte-for-byte: `fpr.zig` (fpr.h/fpr.c constants + integer rounding), `fft.zig`
-(fft.c), `gaussian.zig` (rng.c `prng_*`, sign.c `gaussian0`/`BerExp`/
-`sampler`), `ffsampling.zig` (sign.c `ffSampling_fft_dyntree`/`do_sign_dyn`),
-and `ntru.zig` (keygen.c: `mkgauss`, the `zint_*`/`modp_*` bignum-RNS layer,
-and `solve_NTRU*`). The reference is under the MIT license, reproduced here as
-its terms require:
-
-    Copyright (c) 2017-2019  Falcon Project
-    Author: Thomas Pornin <thomas.pornin@nccgroup.com>
-
-    Permission is hereby granted, free of charge, to any person obtaining
-    a copy of this software and associated documentation files (the
-    "Software"), to deal in the Software without restriction, including
-    without limitation the rights to use, copy, modify, merge, publish,
-    distribute, sublicense, and/or sell copies of the Software, and to
-    permit persons to whom the Software is furnished to do so, subject to
-    the following conditions:
-
-    The above copyright notice and this permission notice shall be
-    included in all copies or substantial portions of the Software.
-
-    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
-    EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-    MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-    IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-    CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-    TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-    SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-The only intentional divergence from the reference source is the PRIMES table
-(keygen.c), regenerated at runtime from its definition rather than copied; all
-other ported routines follow the reference's structure and arithmetic exactly.
-The module's verification path and wire codecs are separately clean-room from
-the Falcon specification — see §2.
+New modules that port third-party code MUST follow the same pattern: a
+`modules/<name>/NOTICE` beside the source, not an entry here.
 
 ====================================================================
 2. DESIGN REFERENCES — clean-room (recorded for provenance)
@@ -131,10 +68,14 @@ the Falcon specification — see §2.
 
 The following modules are the authors' own original work, reimplemented from
 public specifications (RFCs) or designed with reference to the named
-third-party implementations below. No third-party source was copied. Each is
-listed with its upstream license so any future line-level reuse is attributed
-correctly. A full provenance/license audit was completed 2026-07-09 (recorded in the
-project git history).
+third-party implementations below. No third-party source code was copied (the
+sole data exception is `tz`, which extracts public-domain IANA tzdata — see
+its entry). Each is listed with its upstream license so any future line-level
+reuse is attributed correctly. NOTHING in this section imposes a
+redistribution obligation beyond zig-libs' own MIT license: these are
+provenance records kept for honesty and for future auditability, not license
+conditions. A full provenance/license audit was completed 2026-07-09 and
+re-examined 2026-07-29 (both recorded in the project git history).
 
   netaddr    — RFC 6724, RFC 5952 (specs); cross-checked vs Go net/addrselect
                (BSD-3-Clause, The Go Authors) + glibc getaddrinfo algorithm.
@@ -177,6 +118,38 @@ project git history).
   dns        — RFC 1035 (wire), RFC 8484 (DoH), RFC 2782 (SRV), RFC 8659
                (CAA); design ref: miekg/dns (BSD-3-Clause) + c-ares (MIT) —
                behavior only, no source copied.
+  icmp       — RFC 792 / RFC 4443 / RFC 1071 (echo codec + checksum), ip(7) /
+               ipv6(7) (socket options, IP_PKTINFO/IPV6_PKTINFO); design ref:
+               fping (schweikert/fping, Stanford BSD-with-advertising). The
+               paced ping engine (`pinger.zig`) follows fping's main-loop
+               DESIGN — two time-ordered event queues, timeouts serviced
+               first, a global minimum send interval, per-host cadence
+               scheduled off nominal event time, retry with timeout backoff —
+               and adopts fping's default timing constants (10 ms global
+               interval, 1000 ms per-host, 500 ms timeout, 3 retries, 1.5
+               backoff). NO fping source was copied: the expression is
+               independent throughout (binary heaps vs fping's intrusive
+               linked lists, a hard in-flight cap, per-subnet send spacing,
+               first-probe jitter, sendmmsg batching, ppoll vs select, lazy
+               vs eager purge of answered timeout events), no C statement
+               sequence and no comment text survives, and this is a library
+               with a callback API rather than a CLI's main loop. The
+               `--oiface` IP_PKTINFO/ipi_spec_dst construction in
+               `Socket.zig` was cross-checked against fping's `socket4.c`
+               behavior. Recorded here because architecture and functional
+               default values are not copyrightable expression (17 USC
+               102(b): procedure, process, system, method of operation) —
+               this is a provenance record, not an attribution obligation,
+               and fping's advertising clause does not reach it.
+  tz         — the zone table (`modules/tz/src/tz_data.zig`) is generated by
+               the authors' `tz-gen` tool from the IANA Time Zone Database
+               (tzdata 2026a, https://www.iana.org/time-zones), which is in
+               the PUBLIC DOMAIN ("This file is in the public domain, so
+               clarified as of 2009-05-17 by Arthur David Olson"). Only
+               UTC-offset transition data and POSIX-TZ footer rules are
+               extracted — not the tz database's source code — and the
+               offset-lookup logic is the authors' own. Public domain imposes
+               no redistribution condition; this entry is provenance only.
   router     — design ref: go-chi/chi (MIT), julienschmidt/httprouter
                (BSD-3-Clause).
   ratelimit  — design ref: golang.org/x/time/rate (BSD-3-Clause, The Go

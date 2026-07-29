@@ -4,8 +4,8 @@ O(1) correlation map for request/reply protocols keyed by a **16-bit sequence
 number**: a fixed table of **65536 slots**, handed out round-robin, mapping an
 in-flight probe's sequence id to `{ target, probe, sent_ns, answered }`.
 
-- Derives from fping's `seqmap.c` (round-robin fixed-table approach).
-- **Model after:** fping's `seqmap.c` (same round-robin fixed-table approach).
+- Clean-room implementation (round-robin fixed-table approach); see SPEC.md
+  for the two-stage process used.
 - **Why:** the correlation half of any ping/probe engine — a reply carries only
   a 16-bit id, and matching it back to "which target, which probe, sent when"
   must be O(1) at 10k+ probes in flight. Generic enough for any protocol that
@@ -15,8 +15,9 @@ in-flight probe's sequence id to `{ target, probe, sent_ns, answered }`.
   threads). **Allocation:** one table alloc at `init`; `add`/`fetch`/`release`
   never allocate.
 
-Provenance: derives from fping's `seqmap.c` (schweikert/fping; Stanford
-license) — see NOTICE.
+Provenance: clean-room, no third-party source involved — see SPEC.md. An
+earlier revision was written after fping's `seqmap.c`; it was replaced by a
+two-stage clean-room reimplementation, so no fping attribution applies.
 
 ## API
 
