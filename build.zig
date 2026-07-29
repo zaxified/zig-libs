@@ -229,6 +229,7 @@ const module_list = [_]Module{
     .{ .name = "xdp-classifier", .deps = &.{"ebpf"} },
     .{ .name = "ecvrf" },
     .{ .name = "fss" },
+    .{ .name = "pir", .deps = &.{"fss"} },
     .{ .name = "bfv" },
     .{ .name = "groth16", .deps = &.{"bn254"} },
     .{ .name = "tfhe", .heavy = true },
