@@ -66,6 +66,10 @@ fn abs(self) error{Overflow}!Decimal;
 fn order(a, b) std.math.Order;
 fn eql(a, b) bool;
 fn isZero(self) bool;
+
+// Bridge to/from the arbitrary-precision companion (see below).
+fn toBigDecimal(self, allocator) !BigDecimal;                    // exact, total
+fn fromBigDecimal(allocator, b: BigDecimal, mode) FromBigError!Decimal;
 ```
 
 ## Failure-path design
@@ -95,6 +99,15 @@ through `roundedDivMag`, the one sign-aware rounding primitive — every `Roundi
 KAT-verified against the IBM decTest suite. See SPEC.md's "BigDecimal" section for the design and
 the `std.math.big.int` inventory behind it.
 
+Also available: `remainder` (sign of the dividend, exponent `min(ea, eb)`), `min`/`max` (with GDA's
+exponent tie rule), `precision`, `signum`, `scaleByPowerOfTen`, `stripTrailingZeros` (an alias of
+`normalize`), `sqrt` — correctly rounded to a caller-given significant-digit count, not
+iterated-to-fixpoint — and `pow` for **non-negative integer exponents** (exact, the
+`java.math.BigDecimal.pow(int)` contract). `sqrt` and `pow` are the only operations that can make a
+value grow, so both check a `max_result_digits` budget *before* allocating; `pow` with an exponent
+like decTest's `1000000007` returns `error.ResultTooLarge` instead of trying to build a
+100-million-digit number.
+
 ```zig
 const BigDecimal = @import("decimal").BigDecimal;
 
@@ -106,6 +119,23 @@ var sum = try BigDecimal.add(allocator, a, b); // exact — no width limit
 defer sum.deinit();
 const s = try sum.toStringAlloc(allocator);
 defer allocator.free(s);
+
+// √2 to 60 correctly-rounded significant digits.
+var root = try BigDecimal.sqrt(allocator, b, 60, .half_even);
+defer root.deinit();
+```
+
+### Moving between the two types
+
+```zig
+const Decimal = @import("decimal").Decimal;
+
+var wide = try (try Decimal.parse("1.5")).toBigDecimal(allocator);
+defer wide.deinit();                     // exact and total: "1.500000000000"
+
+// Back again: excess digits are rounded with the caller's mode (never
+// truncated), and a magnitude past ±1.7e26 is error.Overflow.
+const narrow = try Decimal.fromBigDecimal(allocator, wide, .half_even);
 ```
 
 ## Verify

@@ -56,11 +56,14 @@ Where a module ports third-party code, that module carries its own `NOTICE`
 file next to its source, and the notice travels with the module. Currently
 one module does:
 
-  falcon  — `modules/falcon/NOTICE` (Falcon reference implementation, MIT;
-            a second copyright holder, no condition beyond MIT's own)
+  falcon   — `modules/falcon/NOTICE` (Falcon reference implementation, MIT;
+             a second copyright holder, no condition beyond MIT's own)
+  decimal  — `modules/decimal/NOTICE` (IBM decTest test-case text, reproduced
+             with permission; test vectors only, no source code)
 
-New modules that port third-party code MUST follow the same pattern: a
-`modules/<name>/NOTICE` beside the source, not an entry here.
+New modules that reproduce third-party code OR third-party data whose notice
+must be preserved MUST follow the same pattern: a `modules/<name>/NOTICE`
+beside the files that owe it, not an entry here.
 
 ====================================================================
 2. DESIGN REFERENCES — clean-room (recorded for provenance)
@@ -552,22 +555,15 @@ re-examined 2026-07-29 (both recorded in the project git history).
                documented interface.
 
   decimal    — the rounding modes (half_even/half_up/half_down/up/down/
-               ceiling/floor + rescale/quantize/divRound) are clean-room from
-               the published definitions: Java BigDecimal.RoundingMode javadoc,
-               the IBM General Decimal Arithmetic specification, and the Python
-               `decimal` docs — definitions/truth-tables only, no source code
-               consulted or copied. `BigDecimal` (big.zig, arbitrary-precision,
-               built on std.math.big.int) is likewise the authors'
-               own work modeled after Java BigDecimal / IBM GDA design, EXCEPT
-               its test vectors: a subset of the actual IBM/Mike Cowlishaw
-               "General Decimal Arithmetic Testcases" v2.62 (add.decTest,
-               multiply.decTest, quantize.decTest, divide.decTest,
-               rounding.decTest — https://speleotrove.com/decimal/dectest.html,
-               "Reproduced with permission ... Copyright 1997, 2009 by
-               International Business Machines Corporation") is transcribed
-               into big.zig's test blocks, test IDs kept for traceability.
-               This is required attribution for reproduced third-party
-               testcase text, not source code.
+               ceiling/floor + rescale/quantize/divRound) and `BigDecimal`
+               (big.zig, arbitrary-precision, built on std.math.big.int) are
+               clean-room from published definitions: the Java
+               BigDecimal.RoundingMode javadoc, the IBM General Decimal
+               Arithmetic specification, and the Python `decimal` docs —
+               definitions and truth-tables only, no source code consulted or
+               copied. The module additionally REPRODUCES IBM decTest
+               test-case text; that is a required attribution and lives in
+               `modules/decimal/NOTICE`, beside the vectors, not here.
 
   jwt        — clean-room from the JOSE/OAuth2 RFCs: RFC 7515 (JWS), RFC 7519
                (JWT), RFC 7517 (JWK/JWKS), RFC 7518 (JWA), RFC 8037 (EdDSA in
@@ -765,9 +761,9 @@ re-examined 2026-07-29 (both recorded in the project git history).
                wire-format/behavior facts (the NIST-API signed-message
                envelope, key/signature header bytes, codec canonicality
                rules, the l2bound norm table). The SIGNER + KEYGEN cores are
-               a PORT of that same MIT reference — see §1 "Falcon reference
-               implementation" for the reproduced license and the list of
-               ported files. The submission package's falcon512-KAT.rsp and
+               a PORT of that same MIT reference — see
+               `modules/falcon/NOTICE` for the reproduced license and the
+               list of ported files. The submission package's falcon512-KAT.rsp and
                falcon1024-KAT.rsp vectors are used purely as the test oracle
                (SHA-256 of each .rsp file recorded in the module's SPEC.md);
                each embedded vector's `seed` field (the NIST-KAT DRBG input)

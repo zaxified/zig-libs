@@ -38,14 +38,28 @@
 //! pass — but it is not an irreducibly novel algorithm the way, say,
 //! Knuth Algorithm D or a hash-to-curve map is.
 //!
+//! ## Operation surface beyond the rounding core
+//!
+//! `remainder`, `min`/`max`, `precision`, `signum`, `scaleByPowerOfTen`,
+//! `stripTrailingZeros`, `sqrt` and `pow` fill in the rest of the
+//! `java.math.BigDecimal` / GDA surface. The first six are exact and need no
+//! rounding decision at all. The last two are the only operations here that
+//! can make a value *grow*, and they are the only ones with an explicit digit
+//! budget (`max_result_digits`) checked before allocating — see that
+//! constant's doc comment for why `pow` in particular cannot be left
+//! unbounded. `pow` is deliberately integer-exponent-only; the general GDA
+//! `power` needs `exp`/`ln` on bignums and is out of scope (stated in `pow`'s
+//! doc comment).
+//!
 //! Provenance: original scaffold by the zig-libs authors (MIT), modeled
 //! after Java `BigDecimal` / IBM General Decimal Arithmetic (design
 //! reference only). The KAT vectors wired in below are drawn from the actual
 //! IBM/Mike Cowlishaw `decTest` suite v2.62 (add.decTest / multiply.decTest /
-//! quantize.decTest / rounding.decTest), "Reproduced with permission ...
-//! Copyright 1997, 2009 by International Business Machines Corporation" per
-//! https://speleotrove.com/decimal/dectest.html — see per-block provenance
-//! comments below and NOTICE.
+//! quantize.decTest / rounding.decTest inline; remainder / min / max /
+//! squareroot / power as `src/testdata/*.vec`), "Reproduced with permission
+//! ... Copyright 1997, 2009 by International Business Machines Corporation"
+//! per https://speleotrove.com/decimal/dectest.html — see per-block
+//! provenance comments below, each vector file's header, and NOTICE.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -126,6 +140,24 @@ pub const BigDecimal = struct {
 
     pub fn absVal(self: *BigDecimal) void {
         self.coeff.abs();
+    }
+
+    /// Number of significant decimal digits in the coefficient — Java
+    /// `BigDecimal.precision()` / GDA's "number of digits". Zero has
+    /// precision **1** (Java and GDA both treat `0`'s coefficient as one
+    /// digit), not 0. The sign and the exponent play no part: `-0.00123`
+    /// (coefficient `-123`) has precision 3.
+    ///
+    /// Exact, via `std.math.big.int`'s base-10 logarithm (`log10Alloc`) —
+    /// not `sizeInBaseUpperBound`, which is only an upper bound. The scratch
+    /// buffer it needs is why this takes an allocator and can fail.
+    pub fn precision(self: BigDecimal, allocator: Allocator) Allocator.Error!u32 {
+        if (self.coeff.eqlZero()) return 1;
+        // Borrow the limbs as a positive Const: log10 asserts a positive,
+        // nonzero operand, and cloning just to drop a sign bit would be
+        // wasteful on a large coefficient.
+        const mag: bigint.Const = .{ .limbs = self.coeff.limbs[0..self.coeff.len()], .positive = true };
+        return @intCast(try mag.log10Alloc(allocator) + 1);
     }
 
     // -----------------------------------------------------------------
@@ -500,6 +532,317 @@ pub const BigDecimal = struct {
     pub fn quantize(allocator: Allocator, a: BigDecimal, exponent: i32, mode: RoundingMode) Error!BigDecimal {
         return rescale(allocator, a, exponent, mode);
     }
+
+    /// Java `BigDecimal.stripTrailingZeros`. This is `normalize` under its
+    /// other name — same operation, same semantics, no second implementation:
+    /// remove exact trailing zero digits from the coefficient and raise the
+    /// exponent to compensate, leaving the value unchanged. Both names are
+    /// kept because callers arriving from Java look for one and callers
+    /// arriving from GDA (where the operation is `reduce`/`normalize`) look
+    /// for the other.
+    pub const stripTrailingZeros = normalize;
+
+    // -----------------------------------------------------------------
+    // Accessors — no arithmetic, no rounding decision.
+    // -----------------------------------------------------------------
+
+    /// Java `BigDecimal.signum` / GDA's sign: `-1`, `0`, `+1`. Reads the
+    /// coefficient's sign only — the exponent cannot change a sign, and a
+    /// zero coefficient is `0` whatever its stored sign bit (see `negate`).
+    pub fn signum(self: BigDecimal) i8 {
+        return switch (self.coeff.toConst().orderAgainstScalar(0)) {
+            .lt => -1,
+            .eq => 0,
+            .gt => 1,
+        };
+    }
+
+    /// Java `BigDecimal.scaleByPowerOfTen` — multiply by `10^n` by adjusting
+    /// the exponent alone. Exact and free: the coefficient is untouched, so
+    /// no digits are gained or lost and no rounding decision arises. Only the
+    /// resulting exponent can fail (`error.Overflow` past `i32`).
+    pub fn scaleByPowerOfTen(a: BigDecimal, n: i32) Error!BigDecimal {
+        const exp64: i64 = @as(i64, a.exponent) + @as(i64, n);
+        if (exp64 > std.math.maxInt(i32) or exp64 < std.math.minInt(i32)) return error.Overflow;
+        var r = try a.clone();
+        errdefer r.coeff.deinit();
+        r.exponent = @intCast(exp64);
+        return r;
+    }
+
+    // -----------------------------------------------------------------
+    // remainder / min / max — exact, no rounding decision.
+    // -----------------------------------------------------------------
+
+    /// GDA `remainder` / Java `BigDecimal.remainder`: the remainder of the
+    /// **truncated** integer division, `a − trunc(a/b) × b`.
+    ///
+    /// The result takes the sign of the **dividend**, never the divisor —
+    /// `-2.4 rem 1 = -0.4` while `2.4 rem -1 = 0.4` (decTest remx011/remx012).
+    /// The result exponent is `min(a.exponent, b.exponent)`, the GDA rule, so
+    /// `5 rem 2.000` is `1.000` and not `1`.
+    ///
+    /// Exact, and therefore takes no rounding mode: both operands are widened
+    /// to a common exponent (exact — pure multiplication) and the remainder of
+    /// an exact integer division is exact.
+    ///
+    /// Deliberate divergence from GDA, stated so it isn't mistaken for a bug:
+    /// GDA raises `Division_impossible` when the *integer quotient* would need
+    /// more digits than the context precision. This module has no context
+    /// precision, so it just returns the exact answer. Those decTest cases are
+    /// skipped rather than asserted — see the vector file header.
+    pub fn remainder(allocator: Allocator, a: BigDecimal, b: BigDecimal) DivError!BigDecimal {
+        if (b.isZero()) return error.DivisionByZero;
+        const lo_exp = @min(a.exponent, b.exponent);
+
+        var an = if (a.exponent == lo_exp)
+            try a.coeff.clone()
+        else
+            try scaleUp(allocator, &a.coeff, try alignShift(a.exponent, lo_exp));
+        defer an.deinit();
+        var bn = if (b.exponent == lo_exp)
+            try b.coeff.clone()
+        else
+            try scaleUp(allocator, &b.coeff, try alignShift(b.exponent, lo_exp));
+        defer bn.deinit();
+
+        var q = try Managed.init(allocator);
+        defer q.deinit();
+        var r = try Managed.init(allocator);
+        errdefer r.deinit();
+        // Truncating division: the remainder carries the dividend's sign,
+        // which is exactly the GDA/Java rule. (`divFloor` would instead take
+        // the divisor's sign — that is `modulo`, a different operation, and
+        // remx011/remx012 tell the two apart.)
+        try q.divTrunc(&r, &an, &bn);
+        return .{ .coeff = r, .exponent = lo_exp };
+    }
+
+    /// GDA `max` / Java `BigDecimal.max` — the numerically larger operand,
+    /// returned as an independent clone the caller owns.
+    ///
+    /// When the operands are numerically *equal* but differ in scale (`1.0`
+    /// vs `1`) GDA still has to name one, and the rule is not "either will
+    /// do": ties go to the operand with the **larger** exponent when the value
+    /// is positive and the **smaller** exponent when it is negative — i.e.
+    /// always the one whose representation is "further from zero" in scale
+    /// terms (decTest maxx282/maxx283). Signs never actually differ on a
+    /// numeric tie except for zeros, where GDA prefers `+0`.
+    pub fn max(allocator: Allocator, a: BigDecimal, b: BigDecimal) Error!BigDecimal {
+        return if (try pickA(allocator, a, b, true)) a.clone() else b.clone();
+    }
+
+    /// GDA `min` / Java `BigDecimal.min` — the mirror of `max`, including the
+    /// tie rule: equal values go to the **smaller** exponent when positive and
+    /// the **larger** exponent when negative.
+    pub fn min(allocator: Allocator, a: BigDecimal, b: BigDecimal) Error!BigDecimal {
+        return if (try pickA(allocator, a, b, false)) a.clone() else b.clone();
+    }
+
+    // -----------------------------------------------------------------
+    // sqrt / pow — the two operations that can GROW a value without bound,
+    // and therefore the two with explicit digit budgets. See
+    // `max_result_digits`.
+    // -----------------------------------------------------------------
+
+    /// Safety ceiling on the number of significant decimal digits `sqrt` and
+    /// `pow` will *produce*. Like `max_align_shift` this is a pragmatic guard
+    /// and **not** a General Decimal Arithmetic rule — GDA bounds results by
+    /// the context precision, which this module does not have. It exists
+    /// because `pow` in particular turns a small input into an unbounded
+    /// output: `1.1 ^ 1000000007` (a real case in the decTest `power` file)
+    /// has on the order of 10^8 decimal digits, and computing it would exhaust
+    /// memory long before returning. The budget is checked **before** any
+    /// allocation, from the operand's digit count, never after the fact.
+    ///
+    /// 100_000 digits is a ~42KB integer — orders of magnitude past any
+    /// financial or scientific use of this module, and small enough that a
+    /// mistake costs a fast error instead of the machine.
+    pub const max_result_digits: u32 = 100_000;
+
+    pub const SqrtError = Error || error{ NegativeOperand, PrecisionTooLarge };
+
+    /// GDA `square-root`: the square root of `a` **correctly rounded to
+    /// `prec` significant digits**.
+    ///
+    /// "Correctly rounded" is the whole specification and it is *not* the same
+    /// as "iterate Newton until the digits stop moving" — that gives a result
+    /// good to within an ulp, which is wrong at every point where the true
+    /// root sits near a rounding boundary. What is computed here instead is
+    /// exact: `⌊√N⌋` on an integer scaled up by `10^(2(prec+1))`
+    /// (`std.math.big.int`'s `sqrt`, Brent–Zimmermann SqrtInt), and then a
+    /// single exact integer comparison of `4N` against `((2Q+1)·10^drop)²` to
+    /// decide which side of the half-way point the true root lies on. No
+    /// floating point, no iteration-to-fixpoint, no ulp slack.
+    ///
+    /// Exponent rules, straight from GDA:
+    ///   * If the root is **exact** and fits in `prec` digits, the result
+    ///     carries the *ideal exponent* `⌊operand exponent / 2⌋` — which is
+    ///     why `√1.00` is `1.0` and not `1`, and `√4.00` is `2.0`.
+    ///   * Otherwise the result has exactly `prec` significant digits.
+    ///   * `√0` is zero at the ideal exponent (`√0E+5` = `0E+2`).
+    ///
+    /// `mode` is a generalisation: GDA fixes square-root at round-half-even.
+    /// A tie is possible only when the scaled root is an exact integer ending
+    /// in `5·10^(drop−1)`, so the mode is almost never observable — it is
+    /// exposed for consistency with the rest of the module, and the decTest
+    /// blocks are replayed under whichever mode their `rounding:` directive
+    /// names.
+    ///
+    /// `error.NegativeOperand` on a negative `a` (GDA's `Invalid_operation`);
+    /// `error.PrecisionTooLarge` when `prec` exceeds `max_result_digits`.
+    pub fn sqrt(allocator: Allocator, a: BigDecimal, prec: u32, mode: RoundingMode) SqrtError!BigDecimal {
+        if (prec == 0 or prec > max_result_digits) return error.PrecisionTooLarge;
+        if (!a.coeff.isPositive() and !a.coeff.eqlZero()) return error.NegativeOperand;
+
+        // Ideal exponent: e = 2m + t with t ∈ {0,1}, so √(c·10^e) =
+        // √(c·10^t) · 10^m and the integer part of the work is √(c·10^t).
+        const m: i64 = @divFloor(@as(i64, a.exponent), 2);
+        const t: u32 = @intCast(@as(i64, a.exponent) - 2 * m);
+
+        if (a.isZero()) {
+            var z = try Managed.init(allocator);
+            errdefer z.deinit();
+            if (m > std.math.maxInt(i32) or m < std.math.minInt(i32)) return error.Overflow;
+            return .{ .coeff = z, .exponent = @intCast(m) };
+        }
+
+        // Budget check before scaling: the working integer is
+        // c·10^(t + 2(prec+1)), whose digit count is bounded below.
+        const c_digits: u64 = try a.precision(allocator);
+        if (c_digits > max_result_digits) return error.PrecisionTooLarge;
+
+        var n0 = try scaleUp(allocator, &a.coeff, t);
+        defer n0.deinit();
+
+        // Exact-root fast path — and it must be exact in the strict sense
+        // (I² == N), not "close enough": a mis-detected exact root would emit
+        // the ideal exponent for an inexact value.
+        {
+            var exact_root = try Managed.init(allocator);
+            errdefer exact_root.deinit();
+            exact_root.sqrt(&n0) catch |err| switch (err) {
+                error.SqrtOfNegativeNumber => unreachable, // sign checked above
+                error.OutOfMemory => return error.OutOfMemory,
+            };
+            var sq = try Managed.init(allocator);
+            defer sq.deinit();
+            try sq.mul(&exact_root, &exact_root);
+            const is_exact = sq.toConst().order(n0.toConst()) == .eq;
+            const fits = is_exact and
+                (try (BigDecimal{ .coeff = exact_root, .exponent = 0 }).precision(allocator)) <= prec;
+            if (fits) {
+                if (m > std.math.maxInt(i32) or m < std.math.minInt(i32)) return error.Overflow;
+                return .{ .coeff = exact_root, .exponent = @intCast(m) };
+            }
+            exact_root.deinit();
+        }
+
+        // Rounding path. Gain k = prec+1 decimal digits of root by scaling the
+        // radicand by 10^(2k); √(N·10^2k) = √N·10^k, so ⌊√·⌋ then has at least
+        // k+1 ≥ prec+2 digits — enough to place the half-way point exactly.
+        const k: u32 = prec + 1;
+        var n = try scaleUp(allocator, &n0, 2 * k);
+        defer n.deinit();
+
+        var root = try Managed.init(allocator);
+        defer root.deinit();
+        root.sqrt(&n) catch |err| switch (err) {
+            error.SqrtOfNegativeNumber => unreachable,
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+
+        const d: u32 = try (BigDecimal{ .coeff = root, .exponent = 0 }).precision(allocator);
+        std.debug.assert(d > prec);
+        const drop: u32 = d - prec;
+
+        var ten_drop = try pow10(allocator, drop);
+        defer ten_drop.deinit();
+        var q = try Managed.init(allocator);
+        errdefer q.deinit();
+        {
+            var rem = try Managed.init(allocator);
+            defer rem.deinit();
+            try q.divTrunc(&rem, &root, &ten_drop);
+        }
+
+        // Exact half-way test on the *true* root, not on ⌊√N⌋: the midpoint
+        // between Q·10^drop and (Q+1)·10^drop is (2Q+1)·10^drop/2, so compare
+        // √N against it by comparing 4N against ((2Q+1)·10^drop)² — all
+        // integer, no rounding of the comparison itself.
+        const half: std.math.Order = blk: {
+            var mid = try Managed.init(allocator);
+            defer mid.deinit();
+            try mid.add(&q, &q);
+            try mid.addScalar(&mid, 1);
+            try mid.mul(&mid, &ten_drop);
+            try mid.mul(&mid, &mid);
+            var four_n = try Managed.init(allocator);
+            defer four_n.deinit();
+            try four_n.add(&n, &n);
+            try four_n.add(&four_n, &four_n);
+            break :blk four_n.toConst().order(mid.toConst());
+        };
+        if (roundBump(mode, half, q.isOdd(), false)) try q.addScalar(&q, 1);
+
+        var exp64: i64 = m - @as(i64, k) + @as(i64, drop);
+        // Rounding up can carry into an extra digit (…999 → 1000…): renormalise
+        // back to `prec` digits by shedding the trailing zero into the exponent.
+        if ((try (BigDecimal{ .coeff = q, .exponent = 0 }).precision(allocator)) > prec) {
+            var ten = try Managed.initSet(allocator, 10);
+            defer ten.deinit();
+            var rem = try Managed.init(allocator);
+            defer rem.deinit();
+            var nq = try Managed.init(allocator);
+            defer nq.deinit();
+            try nq.divTrunc(&rem, &q, &ten);
+            std.debug.assert(rem.eqlZero());
+            q.swap(&nq);
+            exp64 += 1;
+        }
+        if (exp64 > std.math.maxInt(i32) or exp64 < std.math.minInt(i32)) return error.Overflow;
+        return .{ .coeff = q, .exponent = @intCast(exp64) };
+    }
+
+    pub const PowError = Error || error{ NegativeExponent, ResultTooLarge };
+
+    /// `a^n` for a **non-negative integer** `n`, computed exactly — the
+    /// `java.math.BigDecimal.pow(int)` contract: the result's exponent is
+    /// `a.exponent × n` and no digit is discarded (`1.1^2` is `1.21`, not
+    /// `1.2`). `a^0` is `1` for every `a`, including zero, again as Java.
+    ///
+    /// **Scope boundary.** GDA's general `power` also admits non-integer and
+    /// negative exponents, which require `exp`/`ln` on arbitrary-precision
+    /// decimals — a transcendental-function project in its own right, not a
+    /// wrapper around `std.math.big.int.Managed.pow`. This function
+    /// deliberately implements only the integer case; a negative `n` is
+    /// `error.NegativeExponent` rather than a silently wrong answer (Java
+    /// throws `ArithmeticException` in the same situation).
+    ///
+    /// **Memory.** This is the one operation whose result grows multiplicatively
+    /// with an argument, so the digit budget is not optional: the result has at
+    /// most `precision(a) × n` digits, and that product is checked against
+    /// `max_result_digits` **before anything is allocated**. Without it,
+    /// `pow("1.1", 1000000007)` — a real decTest case — asks for a
+    /// ~10^8-digit number and takes the machine down with it.
+    pub fn pow(allocator: Allocator, a: BigDecimal, n: i32) PowError!BigDecimal {
+        if (n < 0) return error.NegativeExponent;
+        const e: u32 = @intCast(n);
+        if (e == 0) return .{ .coeff = try Managed.initSet(allocator, 1), .exponent = 0 };
+        if (a.isZero()) return .{ .coeff = try Managed.init(allocator), .exponent = 0 };
+
+        // Budget first, allocation second.
+        const digits: u64 = try a.precision(allocator);
+        if (digits * @as(u64, e) > max_result_digits) return error.ResultTooLarge;
+
+        const exp64: i64 = @as(i64, a.exponent) * @as(i64, e);
+        if (exp64 > std.math.maxInt(i32) or exp64 < std.math.minInt(i32)) return error.Overflow;
+
+        var r = try Managed.init(allocator);
+        errdefer r.deinit();
+        try r.pow(&a.coeff, e);
+        return .{ .coeff = r, .exponent = @intCast(exp64) };
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -511,15 +854,83 @@ pub const BigDecimal = struct {
 /// branch) — never a rounding decision, so — unlike `roundedDivMag` — it
 /// does not need to be a Fable stub.
 fn scaleUp(allocator: Allocator, coeff: *const Managed, shift: u32) BigDecimal.Error!Managed {
-    var ten = try Managed.initSet(allocator, 10);
-    defer ten.deinit();
-    var p = try Managed.init(allocator);
+    var p = try pow10(allocator, shift);
     defer p.deinit();
-    try p.pow(&ten, shift);
     var r = try Managed.init(allocator);
     errdefer r.deinit();
     try r.mul(coeff, &p);
     return r;
+}
+
+/// `10^k` as an exact arbitrary-precision integer. `k` is bounded by every
+/// caller (`max_align_shift` for alignment, `max_result_digits` for
+/// `sqrt`/`pow`) before it gets here.
+fn pow10(allocator: Allocator, k: u32) Allocator.Error!Managed {
+    var ten = try Managed.initSet(allocator, 10);
+    defer ten.deinit();
+    var r = try Managed.init(allocator);
+    errdefer r.deinit();
+    try r.pow(&ten, k);
+    return r;
+}
+
+/// GDA `min`/`max` operand selection: returns `true` when `a` is the answer.
+///
+/// The numeric comparison is the easy half. The half worth writing down is
+/// the tie: when `a` and `b` are numerically equal but stored at different
+/// exponents, GDA still names exactly one of them, and which one depends on
+/// the sign. For `max`, a positive tie picks the larger exponent and a
+/// negative tie the smaller (decTest maxx282/maxx283 and the `-0`/`-0.0`
+/// block); `min` mirrors both. Signs can only differ on a numeric tie when
+/// both operands are zero, where GDA prefers the positive one.
+fn pickA(allocator: Allocator, a: BigDecimal, b: BigDecimal, want_max: bool) BigDecimal.Error!bool {
+    switch (try BigDecimal.order(allocator, a, b)) {
+        .gt => return want_max,
+        .lt => return !want_max,
+        .eq => {},
+    }
+    const a_neg = a.signum() < 0 or (a.isZero() and !a.coeff.isPositive());
+    const b_neg = b.signum() < 0 or (b.isZero() and !b.coeff.isPositive());
+    if (a_neg != b_neg) return if (want_max) !a_neg else a_neg;
+    // Same sign, equal value: the exponent decides, and the sign flips which
+    // way. `max` of two positives keeps the larger exponent but `max` of two
+    // negatives keeps the smaller one (decTest maxx036 vs maxx282), and `min`
+    // mirrors both (mnmx417: `min(-0.100, -0.10)` is `-0.10`).
+    return if (a_neg)
+        (a.exponent <= b.exponent) == want_max
+    else
+        (a.exponent >= b.exponent) == want_max;
+}
+
+/// The one rounding-mode judgment call in the module, factored out of
+/// `roundedDivMag` so `sqrt` decides ties by exactly the same rule rather
+/// than growing a second, subtly different copy of this switch.
+///
+///   `half`        `2·remainder` compared against the divisor — `.lt` below
+///                 the half-way point, `.eq` an exact tie, `.gt` above it.
+///                 (For `sqrt` it is the equivalent exact comparison of the
+///                 true root against the midpoint.)
+///   `q_odd`       parity of the truncated quotient, for the `half_even`
+///                 tie-break.
+///   `result_neg`  sign the result will eventually carry — the directed modes
+///                 `ceiling`/`floor` are the only ones that depend on it.
+///
+/// Callers must only reach this with a **nonzero** discarded remainder; an
+/// exact result needs no decision and every mode agrees on it.
+fn roundBump(mode: RoundingMode, half: std.math.Order, q_odd: bool, result_neg: bool) bool {
+    return switch (mode) {
+        .up => true,
+        .down => false,
+        .ceiling => !result_neg,
+        .floor => result_neg,
+        .half_up => half != .lt,
+        .half_down => half == .gt,
+        .half_even => switch (half) {
+            .gt => true,
+            .lt => false,
+            .eq => q_odd,
+        },
+    };
 }
 
 /// `hi_exp - lo_exp` as a `u32`, capped at `max_align_shift`. Asserts
@@ -588,26 +999,13 @@ fn roundedDivMag(
     try two_r.add(&r, &r);
     const half = two_r.order(den.*);
 
-    // Mirrors root.zig `divRoundMag`'s switch exactly, mode-for-mode:
+    // `roundBump` mirrors root.zig `divRoundMag`'s switch exactly, mode-for-mode:
     //   half_up   bump on 2r >= d   (r >= d−r)          → half != .lt
     //   half_down bump on 2r >  d   (r >  d−r)          → half == .gt
     //   half_even above/below half decide; a tie rounds to even (bump iff q odd)
     //   up/down   unconditional; ceiling/floor sign-directed (q is a magnitude,
     //             so the eventual sign is `result_neg`).
-    const bump = switch (mode) {
-        .up => true,
-        .down => false,
-        .ceiling => !result_neg,
-        .floor => result_neg,
-        .half_up => half != .lt,
-        .half_down => half == .gt,
-        .half_even => switch (half) {
-            .gt => true,
-            .lt => false,
-            .eq => q.isOdd(),
-        },
-    };
-    if (bump) try q.addScalar(&q, 1);
+    if (roundBump(mode, half, q.isOdd(), result_neg)) try q.addScalar(&q, 1);
     return q;
 }
 
@@ -932,6 +1330,364 @@ test "Fable worklist: div/rescale KAT (roundedDivMag)" {
             return err;
         };
     }
+}
+
+// ---------------------------------------------------------------------------
+// Accessors, remainder, min/max — unit tests. The decTest conformance tables
+// follow below.
+// ---------------------------------------------------------------------------
+
+test "precision — significant digits, exactly at the powers of ten" {
+    const cases = [_]struct { s: []const u8, want: u32 }{
+        .{ .s = "0", .want = 1 }, // Java/GDA: zero has one digit, not zero
+        .{ .s = "0.000", .want = 1 },
+        .{ .s = "1", .want = 1 },
+        .{ .s = "9", .want = 1 },
+        .{ .s = "10", .want = 2 },
+        .{ .s = "99", .want = 2 },
+        .{ .s = "100", .want = 3 },
+        .{ .s = "999", .want = 3 },
+        .{ .s = "1000", .want = 4 },
+        .{ .s = "1001", .want = 4 },
+        // Scale and sign are irrelevant — only the coefficient counts.
+        .{ .s = "-0.00123", .want = 3 },
+        .{ .s = "1.2300", .want = 5 },
+        .{ .s = "1e100", .want = 1 },
+        .{ .s = "9" ** 100, .want = 100 },
+        .{ .s = "1" ++ "0" ** 200, .want = 201 },
+    };
+    for (cases) |c| {
+        var d = dec(c.s);
+        defer d.deinit();
+        try testing.expectEqual(c.want, try d.precision(talloc));
+    }
+}
+
+test "signum" {
+    var a = dec("-0.001");
+    defer a.deinit();
+    try testing.expectEqual(@as(i8, -1), a.signum());
+    var b = dec("0.000");
+    defer b.deinit();
+    try testing.expectEqual(@as(i8, 0), b.signum());
+    var c = dec("1e-400");
+    defer c.deinit();
+    try testing.expectEqual(@as(i8, 1), c.signum());
+    // A negated zero is still zero — the sign bit does not make it negative.
+    b.negate();
+    try testing.expectEqual(@as(i8, 0), b.signum());
+}
+
+test "scaleByPowerOfTen — exponent-only, exact, overflow is typed" {
+    var a = dec("1.23");
+    defer a.deinit();
+    var up = try BigDecimal.scaleByPowerOfTen(a, 3);
+    defer up.deinit();
+    try expectStr(up, "1230");
+    try testing.expectEqual(@as(i32, 1), up.exponent); // coefficient untouched
+    var down = try BigDecimal.scaleByPowerOfTen(a, -3);
+    defer down.deinit();
+    try expectStr(down, "0.00123");
+
+    var edge = dec("5");
+    defer edge.deinit();
+    edge.exponent = std.math.maxInt(i32) - 1;
+    try testing.expectError(error.Overflow, BigDecimal.scaleByPowerOfTen(edge, 5));
+}
+
+test "stripTrailingZeros is normalize, not a second implementation" {
+    // Same function value, so there is no way for the two to drift apart.
+    try testing.expectEqual(
+        @intFromPtr(&BigDecimal.normalize),
+        @intFromPtr(&BigDecimal.stripTrailingZeros),
+    );
+    var a = dec("600.0");
+    defer a.deinit();
+    var s = try BigDecimal.stripTrailingZeros(talloc, a);
+    defer s.deinit();
+    try expectStr(s, "600");
+    try testing.expectEqual(@as(i32, 2), s.exponent); // Java prints this as 6E+2
+}
+
+test "remainder — sign follows the dividend, exponent is min(ea, eb)" {
+    // The two mutations this pins down: taking the divisor's sign (that is
+    // `modulo`, not `remainder`), and using the dividend's exponent alone.
+    const cases = [_]struct { a: []const u8, b: []const u8, want: []const u8, exp: i32 }{
+        .{ .a = "2.4", .b = "1", .want = "0.4", .exp = -1 },
+        .{ .a = "2.4", .b = "-1", .want = "0.4", .exp = -1 }, // divisor sign ignored
+        .{ .a = "-2.4", .b = "1", .want = "-0.4", .exp = -1 }, // dividend sign kept
+        .{ .a = "-2.4", .b = "-1", .want = "-0.4", .exp = -1 },
+        .{ .a = "5", .b = "2.000", .want = "1.000", .exp = -3 }, // divisor's finer scale wins
+        .{ .a = "2.400", .b = "2", .want = "0.400", .exp = -3 },
+    };
+    for (cases) |c| {
+        var a = dec(c.a);
+        defer a.deinit();
+        var b = dec(c.b);
+        defer b.deinit();
+        var got = try BigDecimal.remainder(talloc, a, b);
+        defer got.deinit();
+        try expectStr(got, c.want);
+        try testing.expectEqual(c.exp, got.exponent);
+    }
+
+    var one = dec("1");
+    defer one.deinit();
+    var zero = dec("0");
+    defer zero.deinit();
+    try testing.expectError(error.DivisionByZero, BigDecimal.remainder(talloc, one, zero));
+
+    // Beyond any fixed-width type: an exact remainder of 200-digit operands.
+    var big_a = dec("1" ++ "0" ** 200);
+    defer big_a.deinit();
+    var big_b = dec("7");
+    defer big_b.deinit();
+    var r = try BigDecimal.remainder(talloc, big_a, big_b);
+    defer r.deinit();
+    try expectStr(r, "2"); // 10^200 mod 7 (10^6 ≡ 1 mod 7, 200 mod 6 = 2, 10^2 ≡ 2)
+}
+
+test "min/max — sign matters, magnitude alone does not" {
+    var a = dec("-5");
+    defer a.deinit();
+    var b = dec("2");
+    defer b.deinit();
+    var mx = try BigDecimal.max(talloc, a, b);
+    defer mx.deinit();
+    try expectStr(mx, "2"); // a magnitude comparison would answer -5
+    var mn = try BigDecimal.min(talloc, a, b);
+    defer mn.deinit();
+    try expectStr(mn, "-5");
+
+    // Numeric tie, different scale: GDA still names one, and which one
+    // depends on the sign. Positive → max keeps the larger exponent.
+    var p1 = dec("1.0");
+    defer p1.deinit();
+    var p2 = dec("1");
+    defer p2.deinit();
+    var tie_max = try BigDecimal.max(talloc, p1, p2);
+    defer tie_max.deinit();
+    try testing.expectEqual(@as(i32, 0), tie_max.exponent);
+    var tie_min = try BigDecimal.min(talloc, p1, p2);
+    defer tie_min.deinit();
+    try testing.expectEqual(@as(i32, -1), tie_min.exponent);
+    // Negative → mirrored.
+    var n1 = dec("-1.0");
+    defer n1.deinit();
+    var n2 = dec("-1");
+    defer n2.deinit();
+    var ntie_max = try BigDecimal.max(talloc, n1, n2);
+    defer ntie_max.deinit();
+    try testing.expectEqual(@as(i32, -1), ntie_max.exponent);
+    var ntie_min = try BigDecimal.min(talloc, n1, n2);
+    defer ntie_min.deinit();
+    try testing.expectEqual(@as(i32, 0), ntie_min.exponent);
+}
+
+test "sqrt — errors and the correctly-rounded contract" {
+    var neg = dec("-1");
+    defer neg.deinit();
+    try testing.expectError(error.NegativeOperand, BigDecimal.sqrt(talloc, neg, 9, .half_even));
+
+    var two = dec("2");
+    defer two.deinit();
+    try testing.expectError(error.PrecisionTooLarge, BigDecimal.sqrt(talloc, two, 0, .half_even));
+    try testing.expectError(
+        error.PrecisionTooLarge,
+        BigDecimal.sqrt(talloc, two, BigDecimal.max_result_digits + 1, .half_even),
+    );
+
+    // √2 to 60 digits, against the published decimal expansion. A
+    // "Newton until it stops changing" implementation is right to within an
+    // ulp and will disagree with the last digit here sooner or later; this is
+    // the one that says so.
+    var r = try BigDecimal.sqrt(talloc, two, 60, .half_even);
+    defer r.deinit();
+    try expectStr(r, "1.41421356237309504880168872420969807856967187537694807317668");
+
+    // Exact root keeps the ideal exponent ⌊e/2⌋ — √1.00 is 1.0, not 1.
+    var e1 = dec("1.00");
+    defer e1.deinit();
+    var er = try BigDecimal.sqrt(talloc, e1, 9, .half_even);
+    defer er.deinit();
+    try expectStr(er, "1.0");
+    try testing.expectEqual(@as(i32, -1), er.exponent);
+
+    // Rounding that carries into an extra digit renormalises back to `prec`.
+    var carry = dec("0.99999999999999");
+    defer carry.deinit();
+    var cr = try BigDecimal.sqrt(talloc, carry, 5, .half_even);
+    defer cr.deinit();
+    try expectStr(cr, "1.0000");
+    try testing.expectEqual(@as(u32, 5), try cr.precision(talloc));
+}
+
+test "pow — exact, and the digit budget refuses before it allocates" {
+    var a = dec("1.1");
+    defer a.deinit();
+
+    // Java BigDecimal.pow(int): exact, result exponent = a.exponent × n.
+    var p2 = try BigDecimal.pow(talloc, a, 2);
+    defer p2.deinit();
+    try expectStr(p2, "1.21");
+    var p0 = try BigDecimal.pow(talloc, a, 0);
+    defer p0.deinit();
+    try expectStr(p0, "1");
+
+    // A negative exponent is refused outright — never silently zero, never a
+    // truncated reciprocal. (Java throws here for the same reason.)
+    try testing.expectError(error.NegativeExponent, BigDecimal.pow(talloc, a, -1));
+
+    // THE memory guard. decTest power.decTest really does contain exponent
+    // 1000000007; `1.1 ^ 1000000007` has ~10^8 digits and computing it would
+    // exhaust this machine. The refusal is computed from precision(a) × n
+    // before a single limb is allocated.
+    try testing.expectError(error.ResultTooLarge, BigDecimal.pow(talloc, a, 1_000_000_007));
+    try testing.expectError(error.ResultTooLarge, BigDecimal.pow(talloc, a, 50_001)); // 2 × 50001 > 100000
+    // …and one digit under the budget still works, so the guard is a real
+    // boundary and not a blanket refusal.
+    var ok = try BigDecimal.pow(talloc, a, 50_000);
+    defer ok.deinit();
+    try testing.expectEqual(@as(i32, -50_000), ok.exponent);
+
+    // Exponent-arithmetic overflow is separate from the digit budget.
+    var tiny = dec("2e-2000000000");
+    defer tiny.deinit();
+    try testing.expectError(error.Overflow, BigDecimal.pow(talloc, tiny, 3));
+}
+
+// ---------------------------------------------------------------------------
+// decTest conformance tables — remainder / min / max / square-root / power.
+//
+// Provenance: the same IBM / Mike Cowlishaw "General Decimal Arithmetic
+// Testcases" v2.62 suite as the KAT blocks above, "Reproduced with permission
+// ... Copyright 1997, 2009 by International Business Machines Corporation"
+// (https://speleotrove.com/decimal/dectest.html) — see NOTICE.
+//
+// These tables are two to three orders of magnitude larger than the
+// hand-picked blocks above (3268 square-root cases alone), so they live in
+// `src/testdata/*.vec` and are `@embedFile`d rather than inlined. Each file's
+// header records the source file, the line format, and — case by case, with
+// counts — exactly which source cases were NOT wired and under which rule.
+// The extraction is mechanical (a script; see SPEC.md), never by eye.
+//
+// Every check asserts the **exponent** as well as the digits, because for
+// these five operations the scale of the result is part of the specification:
+// `remainder` takes min(ea, eb), `min`/`max` resolve a numeric tie by
+// exponent, `square-root` has an ideal exponent for exact roots, and `pow`'s
+// is `a.exponent × n`. A digits-only comparison would pass while all four
+// rules were wrong.
+// ---------------------------------------------------------------------------
+
+/// Line reader for `testdata/*.vec`: skips blank and `#` lines, splits the
+/// rest on `|` into exactly `n` fields.
+const VecReader = struct {
+    it: std.mem.SplitIterator(u8, .scalar),
+
+    fn init(data: []const u8) VecReader {
+        return .{ .it = std.mem.splitScalar(u8, data, '\n') };
+    }
+
+    fn next(self: *VecReader, comptime n: usize) ?[n][]const u8 {
+        while (self.it.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \t\r");
+            if (line.len == 0 or line[0] == '#') continue;
+            var fields: [n][]const u8 = undefined;
+            var parts = std.mem.splitScalar(u8, line, '|');
+            var i: usize = 0;
+            while (parts.next()) |p| : (i += 1) {
+                std.debug.assert(i < n); // malformed vector file
+                fields[i] = p;
+            }
+            std.debug.assert(i == n);
+            return fields;
+        }
+        return null;
+    }
+};
+
+fn expectVec(d: BigDecimal, want: []const u8, want_exp: []const u8) !void {
+    try expectStr(d, want);
+    try testing.expectEqual(try std.fmt.parseInt(i32, want_exp, 10), d.exponent);
+}
+
+test "decTest: remainder.decTest" {
+    var r = VecReader.init(@embedFile("testdata/remainder.vec"));
+    var n: usize = 0;
+    while (r.next(5)) |f| : (n += 1) {
+        var a = try BigDecimal.parse(talloc, f[1]);
+        defer a.deinit();
+        var b = try BigDecimal.parse(talloc, f[2]);
+        defer b.deinit();
+        var got = try BigDecimal.remainder(talloc, a, b);
+        defer got.deinit();
+        expectVec(got, f[3], f[4]) catch |err| {
+            std.debug.print("decTest {s} (remainder.decTest): {s} rem {s}\n", .{ f[0], f[1], f[2] });
+            return err;
+        };
+    }
+    try testing.expectEqual(@as(usize, 279), n); // the whole file, not a prefix
+}
+
+test "decTest: min.decTest and max.decTest" {
+    inline for (.{ "min", "max" }) |op| {
+        var r = VecReader.init(@embedFile("testdata/" ++ op ++ ".vec"));
+        var n: usize = 0;
+        while (r.next(5)) |f| : (n += 1) {
+            var a = try BigDecimal.parse(talloc, f[1]);
+            defer a.deinit();
+            var b = try BigDecimal.parse(talloc, f[2]);
+            defer b.deinit();
+            var got = if (comptime std.mem.eql(u8, op, "min"))
+                try BigDecimal.min(talloc, a, b)
+            else
+                try BigDecimal.max(talloc, a, b);
+            defer got.deinit();
+            expectVec(got, f[3], f[4]) catch |err| {
+                std.debug.print("decTest {s} ({s}.decTest): {s}, {s}\n", .{ f[0], op, f[1], f[2] });
+                return err;
+            };
+        }
+        try testing.expectEqual(@as(usize, 105), n);
+    }
+}
+
+test "decTest: squareroot.decTest" {
+    var r = VecReader.init(@embedFile("testdata/sqrt.vec"));
+    var n: usize = 0;
+    while (r.next(6)) |f| : (n += 1) {
+        var a = try BigDecimal.parse(talloc, f[1]);
+        defer a.deinit();
+        const prec = try std.fmt.parseInt(u32, f[2], 10);
+        const mode = std.meta.stringToEnum(RoundingMode, f[3]).?;
+        var got = try BigDecimal.sqrt(talloc, a, prec, mode);
+        defer got.deinit();
+        expectVec(got, f[4], f[5]) catch |err| {
+            std.debug.print(
+                "decTest {s} (squareroot.decTest): sqrt({s}) at precision {d}, {s}\n",
+                .{ f[0], f[1], prec, f[3] },
+            );
+            return err;
+        };
+    }
+    try testing.expectEqual(@as(usize, 3268), n);
+}
+
+test "decTest: power.decTest (integer exponents)" {
+    var r = VecReader.init(@embedFile("testdata/pow.vec"));
+    var n: usize = 0;
+    while (r.next(5)) |f| : (n += 1) {
+        var a = try BigDecimal.parse(talloc, f[1]);
+        defer a.deinit();
+        const e = try std.fmt.parseInt(i32, f[2], 10);
+        var got = try BigDecimal.pow(talloc, a, e);
+        defer got.deinit();
+        expectVec(got, f[3], f[4]) catch |err| {
+            std.debug.print("decTest {s} (power.decTest): {s} ^ {d}\n", .{ f[0], f[1], e });
+            return err;
+        };
+    }
+    try testing.expectEqual(@as(usize, 130), n);
 }
 
 // ── fuzz: arbitrary-precision decimal string parse, never panics ───────────

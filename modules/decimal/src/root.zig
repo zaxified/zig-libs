@@ -270,6 +270,103 @@ pub const Decimal = struct {
         return .{ .raw = @intCast(signed) };
     }
 
+    // -----------------------------------------------------------------
+    // Bridge to/from the arbitrary-precision `BigDecimal` (big.zig).
+    //
+    // The two types are a pair — fixed `i128 @ 1e12` for bounded money/ETL
+    // math, unbounded significand × 10^exponent for everything else — and a
+    // consumer has to be able to move a value between them. Both directions
+    // live here rather than on `BigDecimal` so the dependency stays one-way
+    // (root.zig already imports big.zig; big.zig imports nothing of root's).
+    //
+    // Direction asymmetry is the whole story: widening is exact and total,
+    // narrowing is neither, so only the narrowing direction takes a
+    // `RoundingMode` and returns an error union.
+    // -----------------------------------------------------------------
+
+    /// Widen to `BigDecimal`. **Exact and total** — a `Decimal` *is*
+    /// `raw × 10^-12`, which is a `BigDecimal` verbatim — so the only
+    /// failure mode is allocation.
+    ///
+    /// Boundary note: the result always carries exactly 12 fractional digits,
+    /// trailing zeros included (`1.5` widens to `1.500000000000`), because
+    /// that is this type's scale and `BigDecimal` preserves stored scale (see
+    /// its `toStringAlloc` doc). Call `BigDecimal.normalize` on the result for
+    /// the shortest equal form. Round-tripping `toBigDecimal` then
+    /// `fromBigDecimal` is the identity for every `Decimal`, in every rounding
+    /// mode — nothing is discarded in either step.
+    pub fn toBigDecimal(self: Decimal, allocator: std.mem.Allocator) std.mem.Allocator.Error!BigDecimal {
+        return .{
+            .coeff = try std.math.big.int.Managed.initSet(allocator, self.raw),
+            .exponent = -@as(i32, @intCast(scale)),
+        };
+    }
+
+    /// `Overflow` = the `BigDecimal`'s magnitude is outside this type's
+    /// ≈ ±1.7e26 range (or, pathologically, its coefficient is wider than
+    /// `BigDecimal.max_align_shift` digits — see the narrowing note below).
+    pub const FromBigError = error{Overflow} || std.mem.Allocator.Error;
+
+    /// Narrow a `BigDecimal` to this fixed-scale type. Unlike `toBigDecimal`
+    /// this is partial in two independent ways, and both are surfaced as
+    /// typed outcomes rather than silent behaviour — the module's standing
+    /// discipline (never trap, never truncate silently):
+    ///
+    ///   * **Precision** — fractional digits past the 12th cannot be stored,
+    ///     so they are *rounded* into the 12th with `mode` (never truncated;
+    ///     `mode` is applied by the same `BigDecimal.rescale` path every other
+    ///     rounding-sensitive op uses). A value smaller than half an ulp is
+    ///     not an error: it rounds to `0` under `down`/`half_up`/`half_down`/
+    ///     `half_even` and to ±1e-12 under `up`/`ceiling`/`floor` (whichever
+    ///     of the two is away from zero), exactly like `divRound` at a
+    ///     too-coarse scale.
+    ///   * **Range** — a magnitude beyond ≈ ±1.7e26 is `error.Overflow`. This
+    ///     includes the case where rounding *creates* the overflow (a value
+    ///     one ulp under the ceiling rounded with `ceiling`), because the
+    ///     range check happens after the rounding, on the final coefficient.
+    ///
+    /// Both checks are made *before* materialising any power of ten, so a
+    /// hostile input (`1e2000000000`, or a coefficient at exponent −2e9)
+    /// returns a clean error / a rounded zero instead of attempting an
+    /// astronomically large allocation.
+    ///
+    /// Pathological corner, stated for completeness: a coefficient with more
+    /// than `BigDecimal.max_align_shift` (10^6) digits whose exponent also
+    /// needs that many digits dropped hits `BigDecimal.rescale`'s alignment
+    /// ceiling and reports `error.Overflow` even though the value itself might
+    /// be in range. That is the pre-existing `max_align_shift` guard, not a
+    /// separate rule.
+    pub fn fromBigDecimal(allocator: std.mem.Allocator, b: BigDecimal, mode: RoundingMode) FromBigError!Decimal {
+        if (b.isZero()) return Decimal.zero;
+        const target: i32 = -@as(i32, @intCast(scale)); // 12 fractional digits
+        const digits: i64 = @intCast(try b.precision(allocator));
+        const result_neg = !b.coeff.isPositive();
+
+        if (b.exponent >= target) {
+            // Widening the exponent to −12 is exact; the resulting raw has
+            // `digits + shift` digits and i128 tops out at 39 of them. Checked
+            // here so `1e2000000000` errors instead of trying to build a
+            // 2-billion-digit integer on the way to a guaranteed overflow.
+            const shift: i64 = @as(i64, b.exponent) - target;
+            if (digits + shift > 39) return error.Overflow;
+        } else {
+            const drop: i64 = @as(i64, target) - @as(i64, b.exponent);
+            if (drop > digits) {
+                // |coeff| < 10^digits ≤ 10^(drop−1), so the quotient is 0 and
+                // twice the discarded remainder is strictly below 10^drop:
+                // no tie is possible and only the away-from-zero modes give a
+                // nonzero result. Identical to what `rescale` would return,
+                // without materialising 10^drop.
+                if (!roundsAwayWhenBelowHalf(result_neg, mode)) return Decimal.zero;
+                return .{ .raw = if (result_neg) -1 else 1 };
+            }
+        }
+
+        var r = try BigDecimal.rescale(allocator, b, target, mode);
+        defer r.deinit();
+        return .{ .raw = r.coeff.toConst().toInt(i128) catch return error.Overflow };
+    }
+
     pub fn order(a: Decimal, b: Decimal) std.math.Order {
         return std.math.order(a.raw, b.raw);
     }
@@ -835,6 +932,176 @@ test "quantize — GDA/Python-style exponent" {
     try expectStr(try dec("1.5").quantize(-12, .down), "1.5"); // exponent −12 = full precision
     try expectStr(try dec("1.5").quantize(-30, .down), "1.5"); // beyond precision: exact
     try testing.expectError(error.Overflow, dec("5").quantize(40, .up));
+}
+
+// ---------------------------------------------------------------------------
+// Bridge tests — Decimal <-> BigDecimal. No external vectors needed: the two
+// types' own parse/format and this type's documented range limits are the
+// oracle.
+// ---------------------------------------------------------------------------
+
+const all_modes = [_]RoundingMode{ .up, .down, .ceiling, .floor, .half_up, .half_down, .half_even };
+
+fn expectBigStr(b: BigDecimal, want: []const u8) !void {
+    const s = try b.toStringAlloc(testing.allocator);
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings(want, s);
+}
+
+test "bridge: widening is exact and carries the fixed 12-digit scale" {
+    var a = try dec("1.5").toBigDecimal(testing.allocator);
+    defer a.deinit();
+    // Trailing zeros are the point: BigDecimal preserves stored scale, and
+    // this type's scale IS 12 — so the widened form says so.
+    try expectBigStr(a, "1.500000000000");
+    try testing.expectEqual(@as(i32, -12), a.exponent);
+
+    var n = try BigDecimal.normalize(testing.allocator, a);
+    defer n.deinit();
+    try expectBigStr(n, "1.5");
+
+    // The i128 extremes widen exactly — nothing about them is special here.
+    var mx = try (Decimal{ .raw = std.math.maxInt(i128) }).toBigDecimal(testing.allocator);
+    defer mx.deinit();
+    try expectBigStr(mx, "170141183460469231731687303.715884105727");
+    var mn = try (Decimal{ .raw = std.math.minInt(i128) }).toBigDecimal(testing.allocator);
+    defer mn.deinit();
+    try expectBigStr(mn, "-170141183460469231731687303.715884105728");
+}
+
+test "bridge: round-trip is the identity, in every rounding mode" {
+    const raws = [_]i128{
+        0,                          1,                          -1,
+        Decimal.scale_factor,       -Decimal.scale_factor,       123_456_789,
+        std.math.maxInt(i128),      std.math.minInt(i128),       std.math.maxInt(i128) - 1,
+        std.math.minInt(i128) + 1,
+    };
+    for (raws) |raw| {
+        const d = Decimal{ .raw = raw };
+        var b = try d.toBigDecimal(testing.allocator);
+        defer b.deinit();
+        for (all_modes) |m| {
+            const back = try Decimal.fromBigDecimal(testing.allocator, b, m);
+            try testing.expectEqual(raw, back.raw);
+        }
+    }
+}
+
+test "bridge: narrowing rounds the 13th digit with the caller's mode" {
+    var b = try BigDecimal.parse(testing.allocator, "0.1234567890125");
+    defer b.deinit();
+    // Exact half-way at the 13th fractional digit — every mode is visible.
+    try expectStr(try Decimal.fromBigDecimal(testing.allocator, b, .half_up), "0.123456789013");
+    try expectStr(try Decimal.fromBigDecimal(testing.allocator, b, .half_down), "0.123456789012");
+    try expectStr(try Decimal.fromBigDecimal(testing.allocator, b, .half_even), "0.123456789012"); // …012 even
+    try expectStr(try Decimal.fromBigDecimal(testing.allocator, b, .up), "0.123456789013");
+    try expectStr(try Decimal.fromBigDecimal(testing.allocator, b, .down), "0.123456789012");
+    try expectStr(try Decimal.fromBigDecimal(testing.allocator, b, .ceiling), "0.123456789013");
+    try expectStr(try Decimal.fromBigDecimal(testing.allocator, b, .floor), "0.123456789012");
+
+    var nb = try BigDecimal.parse(testing.allocator, "-0.1234567890125");
+    defer nb.deinit();
+    try expectStr(try Decimal.fromBigDecimal(testing.allocator, nb, .half_up), "-0.123456789013");
+    try expectStr(try Decimal.fromBigDecimal(testing.allocator, nb, .ceiling), "-0.123456789012");
+    try expectStr(try Decimal.fromBigDecimal(testing.allocator, nb, .floor), "-0.123456789013");
+
+    // Arbitrary precision far past 12 digits, no tie: rounds, never truncates.
+    var wide = try BigDecimal.parse(testing.allocator, "1." ++ "9" ** 60);
+    defer wide.deinit();
+    try expectStr(try Decimal.fromBigDecimal(testing.allocator, wide, .half_even), "2");
+    try expectStr(try Decimal.fromBigDecimal(testing.allocator, wide, .down), "1.999999999999");
+}
+
+test "bridge: below half an ulp is a rounding decision, not an error" {
+    var tiny = try BigDecimal.parse(testing.allocator, "0.0000000000001"); // 1e-13
+    defer tiny.deinit();
+    try expectStr(try Decimal.fromBigDecimal(testing.allocator, tiny, .down), "0");
+    try expectStr(try Decimal.fromBigDecimal(testing.allocator, tiny, .half_even), "0");
+    try expectStr(try Decimal.fromBigDecimal(testing.allocator, tiny, .half_up), "0");
+    try expectStr(try Decimal.fromBigDecimal(testing.allocator, tiny, .up), "0.000000000001");
+    try expectStr(try Decimal.fromBigDecimal(testing.allocator, tiny, .ceiling), "0.000000000001");
+    try expectStr(try Decimal.fromBigDecimal(testing.allocator, tiny, .floor), "0");
+
+    var ntiny = try BigDecimal.parse(testing.allocator, "-0.0000000000001");
+    defer ntiny.deinit();
+    try expectStr(try Decimal.fromBigDecimal(testing.allocator, ntiny, .up), "-0.000000000001");
+    try expectStr(try Decimal.fromBigDecimal(testing.allocator, ntiny, .ceiling), "0");
+    try expectStr(try Decimal.fromBigDecimal(testing.allocator, ntiny, .floor), "-0.000000000001");
+    try expectStr(try Decimal.fromBigDecimal(testing.allocator, ntiny, .down), "0");
+
+    // A wildly out-of-scale exponent takes the same short-circuit — this must
+    // NOT try to materialise 10^2000000000 on the way to the answer.
+    var absurd = try BigDecimal.parse(testing.allocator, "1e-2000000000");
+    defer absurd.deinit();
+    try expectStr(try Decimal.fromBigDecimal(testing.allocator, absurd, .half_even), "0");
+    try expectStr(try Decimal.fromBigDecimal(testing.allocator, absurd, .up), "0.000000000001");
+}
+
+test "bridge: out-of-range narrowing is a typed error, checked before allocating" {
+    var big = try BigDecimal.parse(testing.allocator, "1e30");
+    defer big.deinit();
+    try testing.expectError(error.Overflow, Decimal.fromBigDecimal(testing.allocator, big, .half_even));
+
+    // Same shape, absurd magnitude: rejected on the digit-count estimate, so
+    // no 2-billion-digit integer is ever built.
+    var absurd = try BigDecimal.parse(testing.allocator, "1e2000000000");
+    defer absurd.deinit();
+    try testing.expectError(error.Overflow, Decimal.fromBigDecimal(testing.allocator, absurd, .down));
+
+    // A coefficient far wider than i128, at a benign exponent.
+    var wide = try BigDecimal.parse(testing.allocator, "9" ** 45 ++ ".5");
+    defer wide.deinit();
+    try testing.expectError(error.Overflow, Decimal.fromBigDecimal(testing.allocator, wide, .down));
+}
+
+test "bridge: rounding that creates the overflow still errors" {
+    // One ulp under the ceiling with a 13th digit: rounding up leaves the
+    // range, rounding down does not. The range check must therefore happen
+    // AFTER the rounding, not on the input.
+    var over = try BigDecimal.parse(testing.allocator, "170141183460469231731687303.7158841057275");
+    defer over.deinit();
+    try testing.expectError(error.Overflow, Decimal.fromBigDecimal(testing.allocator, over, .half_up));
+    try testing.expectError(error.Overflow, Decimal.fromBigDecimal(testing.allocator, over, .ceiling));
+    try expectStr(
+        try Decimal.fromBigDecimal(testing.allocator, over, .down),
+        "170141183460469231731687303.715884105727",
+    );
+    // The i128 minimum is asymmetric: -…105728 is representable, -…105729 is not.
+    var under = try BigDecimal.parse(testing.allocator, "-170141183460469231731687303.7158841057285");
+    defer under.deinit();
+    try testing.expectError(error.Overflow, Decimal.fromBigDecimal(testing.allocator, under, .floor));
+    try expectStr(
+        try Decimal.fromBigDecimal(testing.allocator, under, .ceiling),
+        "-170141183460469231731687303.715884105728",
+    );
+}
+
+test "bridge: the two types agree on arithmetic they can both express" {
+    const pairs = [_][2][]const u8{
+        .{ "0.1", "0.2" },
+        .{ "5.75", "3.3" },
+        .{ "-7", "2.5" },
+        .{ "1234567.891011", "-0.000000000001" },
+    };
+    for (pairs) |p| {
+        const fa = dec(p[0]);
+        const fb = dec(p[1]);
+        var ba = try fa.toBigDecimal(testing.allocator);
+        defer ba.deinit();
+        var bb = try fb.toBigDecimal(testing.allocator);
+        defer bb.deinit();
+
+        var bsum = try BigDecimal.add(testing.allocator, ba, bb);
+        defer bsum.deinit();
+        try testing.expect((try Decimal.fromBigDecimal(testing.allocator, bsum, .half_even)).eql(try fa.add(fb)));
+
+        var bprod = try BigDecimal.mul(testing.allocator, ba, bb);
+        defer bprod.deinit();
+        // BigDecimal.mul is exact at 24 fractional digits; narrowing back with
+        // the fixed type's own mode (half-away-from-zero) must reproduce
+        // Decimal.mul exactly.
+        try testing.expect((try Decimal.fromBigDecimal(testing.allocator, bprod, .half_up)).eql(try fa.mul(fb)));
+    }
 }
 
 // ── fuzz: decimal string parse, never panics ────────────────────────────────

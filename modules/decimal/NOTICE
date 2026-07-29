@@ -1,0 +1,33 @@
+decimal — third-party attribution
+====================================================================
+
+This module's own code is MIT (see the repository LICENSE). It additionally
+reproduces third-party TEST-CASE TEXT whose copyright notice must be preserved
+in any copy. Redistributing this module — alone or as part of zig-libs — must
+keep this file with it.
+
+This adds no condition beyond MIT's own: it is the same "preserve the notice"
+requirement that already applies to zig-libs' own code, owed to a different
+author. No third-party SOURCE CODE is present — only test vectors.
+
+## IBM / Mike Cowlishaw "General Decimal Arithmetic Testcases" v2.62
+
+The `BigDecimal` conformance tests reproduce a subset of the official test
+suite published at https://speleotrove.com/decimal/dectest.html:
+
+  * inline in `src/big.zig`'s test blocks — add.decTest, multiply.decTest,
+    quantize.decTest, divide.decTest, rounding.decTest
+  * extracted mechanically into `src/testdata/*.vec` — remainder.decTest,
+    min.decTest, max.decTest, squareroot.decTest, power.decTest
+
+Test IDs are kept for traceability, and each `.vec` file repeats the notice in
+its own header. The suite's terms:
+
+    Reproduced with permission ...
+    Copyright (c) 1997, 2009 by International Business Machines Corporation
+
+Only test-case text is reproduced. The implementation under test is the
+authors' own (MIT), built on `std.math.big.int`; its DESIGN references (Java
+`BigDecimal`, the IBM General Decimal Arithmetic specification, the Python
+`decimal` docs) are recorded in the repository NOTICE §2 as provenance, not as
+a condition.
