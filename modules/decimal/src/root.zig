@@ -971,9 +971,9 @@ test "bridge: widening is exact and carries the fixed 12-digit scale" {
 
 test "bridge: round-trip is the identity, in every rounding mode" {
     const raws = [_]i128{
-        0,                          1,                          -1,
-        Decimal.scale_factor,       -Decimal.scale_factor,       123_456_789,
-        std.math.maxInt(i128),      std.math.minInt(i128),       std.math.maxInt(i128) - 1,
+        0,                         1,                     -1,
+        Decimal.scale_factor,      -Decimal.scale_factor, 123_456_789,
+        std.math.maxInt(i128),     std.math.minInt(i128), std.math.maxInt(i128) - 1,
         std.math.minInt(i128) + 1,
     };
     for (raws) |raw| {

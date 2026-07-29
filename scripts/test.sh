@@ -352,6 +352,21 @@ cmd_changed() {
 
     echo "changed: $(printf '%s\n' "$files" | wc -l) file(s) changed$( [[ -n "$base_ref" ]] && echo " vs $base_ref" )"
 
+    # fmt on the CHANGED .zig files. `all` fmt-checks the whole tree, but the
+    # change-aware path used to skip fmt entirely — so a commit verified only
+    # this way could ship unformatted code, and one did (f76f360,
+    # modules/decimal/src/root.zig). Per-file, so it costs milliseconds.
+    local zig_changed
+    zig_changed=$(printf '%s\n' "$files" | grep -E '\.zig$' || true)
+    if [[ -n "$zig_changed" ]]; then
+        local existing=()
+        local f
+        while IFS= read -r f; do [[ -f "$f" ]] && existing+=("$f"); done <<< "$zig_changed"
+        if [[ ${#existing[@]} -gt 0 ]]; then
+            step "fmt check (${#existing[@]} changed file(s))" zig fmt --check "${existing[@]}"
+        fi
+    fi
+
     if [[ $trigger_all -eq 1 ]]; then
         echo "changed: build.zig / build.zig.zon / .github / scripts touched -> the module graph or the harness itself may have changed -> running ALL modules"
         cmd_all
