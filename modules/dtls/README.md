@@ -74,11 +74,20 @@ together:
   the one flight the spec explicitly excludes from implicit acknowledgement
   — so a conforming client waited forever.
 
-Still not implemented, and therefore configured off in the test peer:
-HelloRetryRequest / the stateless-cookie retry round trip (`wolfSSL_disable
-_hrr_cookie`), which a default-configured DTLS 1.3 server does perform. Also
-still single-fragment: a handshake message split across datagrams is
-rejected, not reassembled across `handleFlight` calls.
+**HelloRetryRequest** (RFC 8446 §4.1.4 / RFC 9147 §5.3) is implemented on the
+client side and proven against a **default-configured** wolfSSL server — the
+posture a stock DTLS 1.3 server ships with, which answers the first
+ClientHello with a cookie and will not proceed until it comes back. That path
+carries RFC 8446 §4.4.1's `message_hash` transcript rewrite (ClientHello1 is
+replaced by a synthetic message holding its hash, so a stateless server can
+rebuild the transcript from its cookie). Reverting the rewrite to the naive
+"CH1 || HRR || CH2" leaves every self-interop test passing and fails only the
+live test — which is why it is tested against a real peer.
+
+Still open: **serving** a HelloRetryRequest (this module's server never sends
+one, so it does no return-routability check), and cross-`handleFlight`
+fragment reassembly — a handshake message split across datagrams is rejected,
+not reassembled.
 
 **Deferred / out of scope:** full RFC 5280 §6 certification-path building
 (multi-hop chains, name constraints, revocation — `.trust_anchor` is a

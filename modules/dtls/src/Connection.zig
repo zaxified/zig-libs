@@ -230,6 +230,13 @@ pub const content_type_application_data: u8 = 23;
 /// the handshake completes.
 pub const application_epoch: u16 = 3;
 
+/// Cap on a HelloRetryRequest cookie this client will echo. RFC 8446 §4.2.2
+/// sets no limit beyond the 2-byte length field; a real server's cookie is a
+/// keyed hash plus context (wolfSSL's is well under 128 bytes). The cap keeps
+/// ClientHello2 inside the same fixed body buffer as ClientHello1 rather than
+/// letting the peer choose our stack usage.
+const max_cookie_len = 128;
+
 /// The handshake-traffic epoch (RFC 9147 §6.1): everything after ServerHello
 /// and before the application keys are installed travels under it.
 pub const handshake_epoch: u16 = 2;
@@ -261,9 +268,15 @@ pub const HandshakeError = messages.MessageError || handshake.FrameError || hand
     /// RFC 8446 §4.4.4: the peer's Finished `verify_data` doesn't match —
     /// either a wrong PSK/transcript mismatch or a tampered flight.
     FinishedVerifyFailed,
-    /// RFC 8446 §4.1.4 HelloRetryRequest was detected (the ServerHello
-    /// `random` matched the magic constant) — this engine implements the
-    /// psk_ke happy path only, not the cookie/retry round trip.
+    /// A HelloRetryRequest arrived that this engine cannot act on. The
+    /// cookie/retry round trip IS implemented for `psk_ke` clients
+    /// (`handleHelloRetryRequest`); this error is what remains:
+    ///   * an HRR in `.cert_dhe` mode — retrying there means updating the
+    ///     `key_share` to the group the server named, which this engine does
+    ///     not do;
+    ///   * an HRR with no cookie and therefore nothing to change, which RFC
+    ///     8446 §4.1.4 forbids sending in the first place. Answering it with
+    ///     a byte-identical ClientHello would be a retry loop.
     HelloRetryRequestUnsupported,
     /// A decoded handshake message had the wrong `msg_type`/content type
     /// for the state the connection is in.
@@ -561,6 +574,17 @@ pub const Connection = struct {
     /// SERVER generates + consumes them entirely within
     /// `serverProcessClientHello`. `ecdhe_public` is the wire `key_share`
     /// value. Unused (left `undefined`) in `.psk` mode. Zeroized in `deinit`.
+    /// ClientHello1's `random`, kept because RFC 8446 §4.1.2 requires
+    /// ClientHello2 to reuse it verbatim after a HelloRetryRequest.
+    client_random: [32]u8 = undefined,
+    /// `Hash(ClientHello1)`, captured before the transcript moves on, for
+    /// RFC 8446 §4.4.1's `message_hash` rewrite. Only meaningful once a
+    /// HelloRetryRequest has actually arrived.
+    client_hello1_hash: [32]u8 = undefined,
+    /// A HelloRetryRequest has already been processed. RFC 8446 §4.1.4: a
+    /// client that receives a second one MUST abort — otherwise a server
+    /// could keep a client in an unbounded retry loop.
+    saw_hello_retry_request: bool = false,
     ecdhe_secret: [32]u8 = undefined,
     ecdhe_public: [32]u8 = undefined,
     /// Whether `ecdhe_secret` currently holds live private-key material (so
@@ -621,10 +645,15 @@ pub const Connection = struct {
 
         var ch_body_buf: [512]u8 = undefined;
         const ch_body = switch (self.config.key_exchange) {
-            .psk => try self.buildClientHello(random, &ch_body_buf),
+            .psk => try self.buildClientHello(random, null, &ch_body_buf),
             .cert_dhe => try self.buildClientHelloCertDhe(random, &ch_body_buf),
         };
         self.transcript.append(@intFromEnum(messages.HandshakeType.client_hello), ch_body);
+        // ClientHello1 is the first message, so the transcript hash right
+        // now IS `Hash(ClientHello1)` — the value RFC 8446 §4.4.1's
+        // `message_hash` rewrite needs if a HelloRetryRequest arrives. It has
+        // to be captured here; once the transcript moves on it is gone.
+        self.client_hello1_hash = self.transcript.currentHash();
 
         var frag_buf: [512 + handshake.header_len]u8 = undefined;
         const fragment = try frameHandshakeMessage(@intFromEnum(messages.HandshakeType.client_hello), self.message_seq, ch_body, &frag_buf);
@@ -826,6 +855,14 @@ pub const Connection = struct {
         return out[0 .. end - 1];
     }
 
+    /// Whether this connection answered a HelloRetryRequest during its
+    /// handshake (RFC 8446 §4.1.4). Exposed because "did the retry path
+    /// actually run" is not otherwise observable from outside, and a test
+    /// that cannot tell is a test that silently stops covering it.
+    pub fn sawHelloRetryRequest(self: Connection) bool {
+        return self.saw_hello_retry_request;
+    }
+
     pub fn deinit(self: *Connection) void {
         // NOTE: do NOT follow this with `self.write_keys = .{}` (etc.) —
         // `DirKeys`'s field defaults are `undefined`, so re-assigning the
@@ -866,9 +903,19 @@ pub const Connection = struct {
     /// call). Patches in the REAL PSK binder in place of a same-length
     /// placeholder once the (still-empty-so-far) transcript's truncated hash
     /// is known (RFC 8446 §4.2.11.2).
-    fn buildClientHello(self: *Connection, random: std.Random, body_buf: []u8) HandshakeError![]u8 {
+    /// `cookie` is the HelloRetryRequest cookie to echo (RFC 8446 §4.2.2),
+    /// `null` for the first ClientHello. On a retry the `random` argument is
+    /// ignored and `self.client_random` is reused: RFC 8446 §4.1.2 requires
+    /// ClientHello2 to be ClientHello1 unmodified except for a short listed
+    /// set of changes, and the random is not on that list.
+    fn buildClientHello(self: *Connection, random: std.Random, cookie: ?[]const u8, body_buf: []u8) HandshakeError![]u8 {
         var random_bytes: [32]u8 = undefined;
-        random.bytes(&random_bytes);
+        if (cookie == null) {
+            random.bytes(&random_bytes);
+            self.client_random = random_bytes;
+        } else {
+            random_bytes = self.client_random;
+        }
 
         var cs_arr: [8]u16 = undefined;
         if (self.config.cipher_suites.len > cs_arr.len) return error.BufferTooShort;
@@ -905,22 +952,36 @@ pub const Connection = struct {
         var key_share_buf: [2]u8 = undefined;
         const key_share_ext = try messages.encodeKeyShareClientHello(&.{}, &key_share_buf);
 
+        var cookie_buf: [2 + max_cookie_len]u8 = undefined;
+        const cookie_ext: ?[]const u8 = if (cookie) |c| try messages.encodeCookieExtension(c, &cookie_buf) else null;
+
         // `pre_shared_key` MUST be the last extension (RFC 8446 §4.2.11) —
         // the binder is computed over everything that precedes it.
-        const exts = [_]messages.Extension{
-            .{ .ext_type = @intFromEnum(messages.ExtensionType.supported_versions), .data = versions_ext },
-            .{ .ext_type = @intFromEnum(messages.ExtensionType.supported_groups), .data = groups_ext },
-            .{ .ext_type = @intFromEnum(messages.ExtensionType.key_share), .data = key_share_ext },
-            .{ .ext_type = @intFromEnum(messages.ExtensionType.psk_key_exchange_modes), .data = modes_ext },
-            sigalgs_ext,
-            .{ .ext_type = @intFromEnum(messages.ExtensionType.pre_shared_key), .data = psk_ext_data },
-        };
+        var exts_buf: [7]messages.Extension = undefined;
+        var n_exts: usize = 0;
+        exts_buf[n_exts] = .{ .ext_type = @intFromEnum(messages.ExtensionType.supported_versions), .data = versions_ext };
+        n_exts += 1;
+        exts_buf[n_exts] = .{ .ext_type = @intFromEnum(messages.ExtensionType.supported_groups), .data = groups_ext };
+        n_exts += 1;
+        exts_buf[n_exts] = .{ .ext_type = @intFromEnum(messages.ExtensionType.key_share), .data = key_share_ext };
+        n_exts += 1;
+        exts_buf[n_exts] = .{ .ext_type = @intFromEnum(messages.ExtensionType.psk_key_exchange_modes), .data = modes_ext };
+        n_exts += 1;
+        exts_buf[n_exts] = sigalgs_ext;
+        n_exts += 1;
+        if (cookie_ext) |c| {
+            exts_buf[n_exts] = .{ .ext_type = @intFromEnum(messages.ExtensionType.cookie), .data = c };
+            n_exts += 1;
+        }
+        exts_buf[n_exts] = .{ .ext_type = @intFromEnum(messages.ExtensionType.pre_shared_key), .data = psk_ext_data };
+        n_exts += 1;
+        const exts = exts_buf[0..n_exts];
 
         const ch_full = try messages.encodeClientHello(.{
             .random = random_bytes,
             .legacy_session_id = &.{},
             .cipher_suites = cs_list,
-            .extensions = &exts,
+            .extensions = exts,
         }, body_buf);
 
         // RFC 8446 §4.2.11.2: binder = HMAC(finished_key,
@@ -1843,6 +1904,81 @@ pub const Connection = struct {
         return .{ .out = ack_record, .done = true };
     }
 
+    /// RFC 8446 §4.1.4 / RFC 9147 §5.3: the server refused to proceed on
+    /// ClientHello1 and asked for a retry carrying its cookie. This is how a
+    /// DTLS server does return-routability checking without keeping state,
+    /// and it is what a DEFAULT-configured DTLS 1.3 server does on the very
+    /// first datagram — so a client that cannot do this cannot talk to one.
+    ///
+    /// The response is ClientHello2: byte-identical to ClientHello1 (same
+    /// `random` — RFC 8446 §4.1.2 does not list it among the permitted
+    /// changes) plus the echoed `cookie` extension, with a fresh binder,
+    /// because the transcript it commits to has changed.
+    ///
+    /// The transcript change is the subtle part and is done by
+    /// `Transcript.resetToMessageHash`: ClientHello1 is REPLACED by a
+    /// synthetic `message_hash` message holding its hash, so the server —
+    /// which kept nothing — can rebuild the same transcript from the cookie.
+    fn handleHelloRetryRequest(
+        self: *Connection,
+        hrr_body: []const u8,
+        hrr: messages.DecodedServerHello,
+        random: std.Random,
+        now_ms: u64,
+        out: []u8,
+    ) HandshakeError!HandshakeResult {
+        // RFC 8446 §4.1.4: "If a client receives a second HelloRetryRequest
+        // in the same connection ... it MUST abort the handshake" — without
+        // this a server could keep a client retrying forever.
+        if (self.saw_hello_retry_request) return error.UnexpectedMessage;
+        if (self.config.key_exchange != .psk) return error.HelloRetryRequestUnsupported;
+
+        var cookie: ?[]const u8 = null;
+        var negotiated_version: ?[2]u8 = null;
+        for (hrr.extensions) |e| switch (e.ext_type) {
+            @intFromEnum(messages.ExtensionType.cookie) => cookie = messages.decodeCookieExtension(e.data) catch return error.Malformed,
+            @intFromEnum(messages.ExtensionType.supported_versions) => negotiated_version = messages.decodeSupportedVersionsServerHello(e.data) catch return error.Malformed,
+            else => {},
+        };
+        const version = negotiated_version orelse return error.VersionNotNegotiated;
+        if (!std.mem.eql(u8, &version, &messages.version_dtls13)) return error.UnsupportedVersion;
+
+        // A HelloRetryRequest with nothing to change is a protocol error
+        // (RFC 8446 §4.1.4: it "MUST NOT" be sent if it would not change the
+        // client's second flight). This engine offers no key share to
+        // update, so a cookie is the only thing that can change here.
+        const c = cookie orelse return error.HelloRetryRequestUnsupported;
+        if (c.len > max_cookie_len) return error.BufferTooShort;
+
+        self.saw_hello_retry_request = true;
+
+        // RFC 8446 §4.4.1: replace ClientHello1 with `message_hash`, THEN
+        // append the HelloRetryRequest, then ClientHello2. Order matters —
+        // the binder in ClientHello2 is computed over exactly this prefix.
+        self.transcript.resetToMessageHash(self.client_hello1_hash);
+        self.transcript.append(@intFromEnum(messages.HandshakeType.server_hello), hrr_body);
+
+        var ch_body_buf: [512]u8 = undefined;
+        const ch_body = try self.buildClientHello(random, c, &ch_body_buf);
+        self.transcript.append(@intFromEnum(messages.HandshakeType.client_hello), ch_body);
+
+        // RFC 9147 §5.2: ClientHello2 is a NEW handshake message, so it takes
+        // the next `message_seq` rather than reusing ClientHello1's (which is
+        // what a retransmission would do).
+        var frag_buf: [512 + handshake.header_len]u8 = undefined;
+        const fragment = try frameHandshakeMessage(@intFromEnum(messages.HandshakeType.client_hello), self.message_seq, ch_body, &frag_buf);
+        self.message_seq +%= 1;
+
+        const ch_seq = self.hs0.send_seq;
+        const record_bytes = try self.writeEpoch0Record(fragment, out);
+        self.clearFlightTracker();
+        self.markFlightSent(&.{.{ .epoch = 0, .sequence_number = ch_seq }});
+        try self.cacheFlight(record_bytes, now_ms);
+
+        // Still waiting for a ServerHello — just for the real one this time.
+        return .{ .out = record_bytes, .done = false };
+    }
+
     /// Client side of flights 2+3 (RFC 9147 §5.4/§5.5): consumes ServerHello
     /// + EncryptedExtensions + server Finished (coalesced in `datagram`),
     /// derives the handshake and (from the transcript through the server's
@@ -1867,7 +2003,8 @@ pub const Connection = struct {
 
         var ext_buf: [8]messages.Extension = undefined;
         const sh_dec = messages.decodeServerHello(sh_parsed.body, &ext_buf) catch return error.Malformed;
-        if (messages.isHelloRetryRequest(sh_dec.random)) return error.HelloRetryRequestUnsupported;
+        if (messages.isHelloRetryRequest(sh_dec.random))
+            return self.handleHelloRetryRequest(sh_parsed.body, sh_dec, random, now_ms, out);
 
         // Downgrade guard (RFC 8446 §4.2.1): the negotiated version lives ONLY
         // in `supported_versions` — every version field on the wire says DTLS
@@ -2034,7 +2171,9 @@ pub const Connection = struct {
         self.markFlightSent(all_records[0..n]);
 
         try self.installApplicationKeys(suite, ap.client, ap.server);
-        _ = now_ms; // the client needs no further retransmission once connected
+        // `now_ms` is used only on the HelloRetryRequest path above (arming
+        // the retry flight's timer); once connected the client retransmits
+        // nothing.
 
         return .{ .out = out[0..cursor], .done = true };
     }
@@ -2692,7 +2831,7 @@ test "handshake: corrupted ServerHello -> typed error, not a panic" {
     try testing.expectError(error.Malformed, client.handleFlight(corrupted[0..flight2.out.len], rnd, 0, &buf1));
 }
 
-test "handshake: HelloRetryRequest random is detected and rejected (typed error)" {
+test "handshake: a HelloRetryRequest carrying nothing to change is a typed error" {
     const cfg = Config{ .role = .client, .psk_identity = "device-1", .psk = "shared", .cipher_suites = &.{.aes_128_gcm_sha256} };
     var client = try Connection.clientInit(cfg);
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x40} ** 32);
@@ -2700,28 +2839,110 @@ test "handshake: HelloRetryRequest random is detected and rejected (typed error)
     var buf1: [1500]u8 = undefined;
     _ = try client.startHandshake(rnd, 0, &buf1);
 
-    // Hand-build a structurally valid ServerHello whose `random` is the
-    // RFC 8446 §4.1.3 HelloRetryRequest magic value — this engine
-    // implements the psk_ke happy path only, not cookie/retry.
-    var sh_body_buf: [128]u8 = undefined;
+    // A HelloRetryRequest is now honoured (see `handleHelloRetryRequest`),
+    // but only when it actually asks for something. RFC 8446 §4.1.4 forbids
+    // sending one that would not change the client's next flight; this
+    // engine offers no key share to update, so an HRR with no cookie leaves
+    // nothing to do and must not be answered with a byte-identical retry.
+    var sh_versions_buf: [2]u8 = undefined;
+    const sh_versions = try messages.encodeSupportedVersionsServerHello(messages.version_dtls13, &sh_versions_buf);
+    const datagram = try hrrDatagram(&.{.{ .ext_type = @intFromEnum(messages.ExtensionType.supported_versions), .data = sh_versions }});
+
+    var buf2: [1500]u8 = undefined;
+    try testing.expectError(error.HelloRetryRequestUnsupported, client.handleFlight(datagram.bytes[0..datagram.len], rnd, 0, &buf2));
+}
+
+test "handshake: a second HelloRetryRequest is refused (RFC 8446 §4.1.4 abort)" {
+    const cfg = Config{ .role = .client, .psk_identity = "device-1", .psk = "shared", .cipher_suites = &.{.aes_128_gcm_sha256} };
+    var client = try Connection.clientInit(cfg);
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x41} ** 32);
+    const rnd = testRandom(&csprng);
+    var buf1: [1500]u8 = undefined;
+    _ = try client.startHandshake(rnd, 0, &buf1);
+
+    var sh_versions_buf: [2]u8 = undefined;
+    const sh_versions = try messages.encodeSupportedVersionsServerHello(messages.version_dtls13, &sh_versions_buf);
+    var cookie_buf: [64]u8 = undefined;
+    const cookie_ext = try messages.encodeCookieExtension("a-real-cookie", &cookie_buf);
+    const exts = [_]messages.Extension{
+        .{ .ext_type = @intFromEnum(messages.ExtensionType.supported_versions), .data = sh_versions },
+        .{ .ext_type = @intFromEnum(messages.ExtensionType.cookie), .data = cookie_ext },
+    };
+    const datagram = try hrrDatagram(&exts);
+
+    // The first one is answered with ClientHello2 — a real, different flight.
+    var buf2: [1500]u8 = undefined;
+    const retry = try client.handleFlight(datagram.bytes[0..datagram.len], rnd, 0, &buf2);
+    try testing.expect(!retry.done);
+    try testing.expect(retry.out.len > 0);
+    try testing.expect(!std.mem.eql(u8, buf1[0..retry.out.len], retry.out));
+    try testing.expectEqual(State.wait_server_hello, client.state);
+
+    // A second one would let a server keep this client retrying forever.
+    var buf3: [1500]u8 = undefined;
+    try testing.expectError(error.UnexpectedMessage, client.handleFlight(datagram.bytes[0..datagram.len], rnd, 0, &buf3));
+}
+
+test "handshake: ClientHello2 reuses ClientHello1's random and echoes the cookie" {
+    const cfg = Config{ .role = .client, .psk_identity = "device-1", .psk = "shared", .cipher_suites = &.{.aes_128_gcm_sha256} };
+    var client = try Connection.clientInit(cfg);
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x42} ** 32);
+    const rnd = testRandom(&csprng);
+    var buf1: [1500]u8 = undefined;
+    const ch1 = try client.startHandshake(rnd, 0, &buf1);
+    var ch1_copy: [1500]u8 = undefined;
+    @memcpy(ch1_copy[0..ch1.len], ch1);
+    const ch1_random = client.client_random;
+
+    var sh_versions_buf: [2]u8 = undefined;
+    const sh_versions = try messages.encodeSupportedVersionsServerHello(messages.version_dtls13, &sh_versions_buf);
+    var cookie_buf: [64]u8 = undefined;
+    const cookie = "cookie-from-the-server";
+    const cookie_ext = try messages.encodeCookieExtension(cookie, &cookie_buf);
+    const exts = [_]messages.Extension{
+        .{ .ext_type = @intFromEnum(messages.ExtensionType.supported_versions), .data = sh_versions },
+        .{ .ext_type = @intFromEnum(messages.ExtensionType.cookie), .data = cookie_ext },
+    };
+    const datagram = try hrrDatagram(&exts);
+
+    var buf2: [1500]u8 = undefined;
+    const retry = try client.handleFlight(datagram.bytes[0..datagram.len], rnd, 0, &buf2);
+
+    // RFC 8446 §4.1.2: ClientHello2 is ClientHello1 unmodified except for a
+    // short list of permitted changes; `random` is NOT on that list, so a
+    // freshly drawn one would be a protocol violation the peer sees as a
+    // different client.
+    try testing.expectEqualSlices(u8, &ch1_random, &client.client_random);
+    // The cookie has to come back verbatim, or the stateless server cannot
+    // reconstruct the connection it refused to remember.
+    try testing.expect(std.mem.indexOf(u8, retry.out, cookie) != null);
+    // And ClientHello2 must be a NEW message, not a retransmission of
+    // ClientHello1 (RFC 9147 §5.2: retransmissions reuse `message_seq`).
+    try testing.expectEqual(@as(u16, 2), client.message_seq);
+}
+
+/// Builds a one-record datagram carrying a HelloRetryRequest with `exts` —
+/// a ServerHello whose `random` is RFC 8446 §4.1.3's magic value.
+const HrrDatagram = struct { bytes: [400]u8, len: usize };
+
+fn hrrDatagram(exts: []const messages.Extension) !HrrDatagram {
+    var sh_body_buf: [256]u8 = undefined;
     const sh_body = try messages.encodeServerHello(.{
         .random = messages.hello_retry_request_random,
         .legacy_session_id_echo = &.{},
         .cipher_suite = @intFromEnum(CipherSuite.aes_128_gcm_sha256),
-        .extensions = &.{},
+        .extensions = exts,
     }, &sh_body_buf);
 
-    var frag_buf: [128 + handshake.header_len]u8 = undefined;
+    var frag_buf: [256 + handshake.header_len]u8 = undefined;
     const fragment = try frameHandshakeMessage(@intFromEnum(messages.HandshakeType.server_hello), 0, sh_body, &frag_buf);
 
-    var record_buf: [200]u8 = undefined;
+    var result: HrrDatagram = .{ .bytes = undefined, .len = 0 };
     const hdr = record.PlaintextHeader{ .content_type = content_type_handshake, .epoch = 0, .sequence_number = 0, .length = @intCast(fragment.len) };
-    const hdr_slice = try record.encodePlaintext(hdr, &record_buf);
-    @memcpy(record_buf[hdr_slice.len..][0..fragment.len], fragment);
-    const datagram = record_buf[0 .. hdr_slice.len + fragment.len];
-
-    var buf2: [1500]u8 = undefined;
-    try testing.expectError(error.HelloRetryRequestUnsupported, client.handleFlight(datagram, rnd, 0, &buf2));
+    const hdr_slice = try record.encodePlaintext(hdr, &result.bytes);
+    @memcpy(result.bytes[hdr_slice.len..][0..fragment.len], fragment);
+    result.len = hdr_slice.len + fragment.len;
+    return result;
 }
 
 test "handshake: server handleFlight rejects the wrong state" {

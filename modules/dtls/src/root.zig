@@ -114,10 +114,13 @@
 //! CertificateVerify/CertificateRequest message bodies incl. the PSK
 //! extensions (`messages.zig`).
 //!
-//! **Out of scope (deliberate, not deferred-as-a-stub):** HelloRetryRequest
-//! / the stateless-cookie retry round trip (a HelloRetryRequest ServerHello
-//! is detected — RFC 8446 §4.1.3's magic `random` — and rejected with a
-//! typed error rather than silently mishandled); 0-RTT/early data; session
+//! **HelloRetryRequest (RFC 8446 §4.1.4):** implemented CLIENT-side and
+//! proven against a default-configured wolfSSL server. The retry carries
+//! RFC 8446 §4.4.1's `message_hash` transcript rewrite; this module's own
+//! SERVER never sends an HRR, so it does no return-routability check.
+//!
+//! **Out of scope (deliberate, not deferred-as-a-stub):** serving a
+//! HelloRetryRequest; 0-RTT/early data; session
 //! resumption (`res binder`/NewSessionTicket); key update (RFC 8446
 //! §4.6.3); and the CCM
 //! suites (Zig 0.16 std ships only a 13-byte-nonce CCM; the TLS/DTLS

@@ -145,6 +145,32 @@ fn reportPeerDiagnosis(
 // ── direction 1: our client -> wolfSSL server ──────────────────────────────
 
 test "LIVE wolfSSL peer: our client completes a real DTLS 1.3 PSK handshake against wolfSSL" {
+    try clientAgainstWolfsslServer("server", .{ .expect_hello_retry_request = false });
+}
+
+// The same handshake against a wolfSSL server that does the DEFAULT cookie
+// exchange: it answers ClientHello1 with a HelloRetryRequest and will not
+// proceed until the client comes back echoing the cookie (RFC 8446 §4.1.4 /
+// RFC 9147 §5.3). This is what a stock DTLS 1.3 server does, so until the
+// retry worked this module could not talk to one at all — the other test
+// only passes because its peer is explicitly told to skip the exchange.
+//
+// It is also the only test that exercises RFC 8446 §4.4.1's `message_hash`
+// transcript rewrite against a real peer: get that wrong and the binder in
+// ClientHello2 verifies against nothing.
+test "LIVE wolfSSL peer: our client survives a HelloRetryRequest from a default-configured wolfSSL server" {
+    try clientAgainstWolfsslServer("server-hrr", .{ .expect_hello_retry_request = true });
+}
+
+const Expect = struct {
+    /// Asserted after the handshake. Without it this test has no teeth: if
+    /// wolfSSL ever stopped sending a HelloRetryRequest in its default
+    /// configuration, the retry path would go untested and the test would
+    /// still pass — it would just be a second copy of the one above.
+    expect_hello_retry_request: bool,
+};
+
+fn clientAgainstWolfsslServer(peer_mode: []const u8, expect: Expect) !void {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const gpa = testing.allocator;
     const io = testing.io;
@@ -158,7 +184,7 @@ test "LIVE wolfSSL peer: our client completes a real DTLS 1.3 PSK handshake agai
     const port_str = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
 
     var child = try std.process.spawn(io, .{
-        .argv = &.{ "./wolfssl_peer", "server", port_str },
+        .argv = &.{ "./wolfssl_peer", peer_mode, port_str },
         .cwd = .{ .dir = tmp.dir },
         .stdin = .ignore,
         .stdout = .pipe,
@@ -212,6 +238,8 @@ test "LIVE wolfSSL peer: our client completes a real DTLS 1.3 PSK handshake agai
         };
         if (result.out.len > 0) try sock.send(io, &server_addr, result.out);
     }
+
+    try testing.expectEqual(expect.expect_hello_retry_request, conn.sawHelloRetryRequest());
 
     // Application data over the keys THIS handshake installed, decrypted by
     // an implementation that shares no code with ours.

@@ -3,6 +3,8 @@
 //
 //   cc -o wolfssl_peer wolfssl_peer.c -lwolfssl
 //   ./wolfssl_peer server <port>     # prints READY, then accepts + echoes
+//   ./wolfssl_peer server-hrr <port> # same, but with the DEFAULT cookie
+//                                    # exchange (HelloRetryRequest) left on
 //   ./wolfssl_peer client <port>     # connects, sends, expects the echo
 //
 // Deliberate configuration, each item chosen to match what this module
@@ -10,11 +12,10 @@
 //
 //   * `wolfSSL_CTX_no_dhe_psk` — psk_ke, no (EC)DHE. This module's `.psk`
 //     mode is PSK-only; wolfSSL defaults to psk_dhe_ke.
-//   * `wolfSSL_disable_hrr_cookie` — this module deliberately does NOT
-//     implement the HelloRetryRequest cookie round trip (it detects an HRR
-//     and returns a typed error). wolfSSL's DTLS server does a cookie
-//     exchange by default, so it has to be told not to. This is a real
-//     limitation of ours, recorded in SPEC.md, not a harness convenience.
+//   * `wolfSSL_disable_hrr_cookie` — only in the plain `server` mode, and
+//     only to keep one test focused on the no-retry path. `server-hrr`
+//     leaves the default cookie exchange on, which is what a stock DTLS 1.3
+//     server does.
 //   * `TLS13-AES128-GCM-SHA256` — the intersection of what both sides do.
 //     This module also has ChaCha20-Poly1305; CCM is unwired (std nonce
 //     width), which is why the CoAP-profile default suite is not used here.
@@ -64,7 +65,13 @@ static unsigned int psk_client_cb(WOLFSSL *ssl, const char *hint,
     return (unsigned int)sizeof(kPsk);
 }
 
-static int run_server(int port) {
+// `hrr_cookie` selects between the two server postures that matter here:
+//   0 — cookie exchange disabled, the shape most DTLS test harnesses use;
+//   1 — DEFAULT wolfSSL, which answers the first ClientHello with a
+//       HelloRetryRequest carrying a cookie (return-routability without
+//       server state). A client that cannot do the retry cannot talk to a
+//       stock server at all, so this mode is the one that proves it.
+static int run_server(int port, int hrr_cookie) {
     WOLFSSL_CTX *ctx = wolfSSL_CTX_new(wolfDTLSv1_3_server_method());
     if (!ctx) { fprintf(stderr, "CTX_new failed\n"); return 1; }
     wolfSSL_CTX_set_psk_server_tls13_callback(ctx, psk_server_cb);
@@ -102,7 +109,7 @@ static int run_server(int port) {
 
     WOLFSSL *ssl = wolfSSL_new(ctx);
     wolfSSL_set_fd(ssl, fd);
-    wolfSSL_disable_hrr_cookie(ssl);  // our client rejects HelloRetryRequest
+    if (!hrr_cookie) wolfSSL_disable_hrr_cookie(ssl);
     int rc = wolfSSL_accept(ssl);
     if (rc != WOLFSSL_SUCCESS) {
         int err = wolfSSL_get_error(ssl, rc);
@@ -188,7 +195,14 @@ int main(int argc, char **argv) {
     }
     wolfSSL_Init();
     int port = atoi(argv[2]);
-    int rc = strcmp(argv[1], "server") == 0 ? run_server(port) : run_client(port);
+    int rc;
+    if (strcmp(argv[1], "server") == 0) {
+        rc = run_server(port, 0);
+    } else if (strcmp(argv[1], "server-hrr") == 0) {
+        rc = run_server(port, 1);
+    } else {
+        rc = run_client(port);
+    }
     wolfSSL_Cleanup();
     return rc;
 }

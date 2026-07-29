@@ -60,6 +60,28 @@ Per-module API changes since v0.1.0 worth calling out:
   and that error's meaning narrows to "key material was named but none of it
   could be reduced to a comparable key". Same-form matching, and every
   non-HoK path, are unchanged. New sibling dependency: `x509`.
+- **`dtls`:** HelloRetryRequest (RFC 8446 §4.1.4 / RFC 9147 §5.3), client
+  side. A stock DTLS 1.3 server answers the first ClientHello with a cookie
+  and refuses to proceed until it comes back — return-routability without
+  server state — so until now this module could not complete a handshake
+  against a default-configured peer at all. `handleFlight` on a client now
+  answers an HRR with ClientHello2: the cookie echoed, ClientHello1's
+  `random` reused (RFC 8446 §4.1.2 does not list it among the permitted
+  changes), a fresh binder, and a new `message_seq` (it is a new message,
+  not a retransmission). A second HRR is refused (§4.1.4) so a server cannot
+  hold a client in a retry loop. New `Transcript.resetToMessageHash`
+  implements §4.4.1's rewrite — ClientHello1 is replaced by a synthetic
+  `message_hash` message carrying its hash, which is what lets a stateless
+  server rebuild the transcript from its own cookie. Proven against a
+  default-configured wolfSSL server (`server-hrr` peer mode), and the test
+  asserts the retry actually happened rather than trusting the peer to send
+  one. The rewrite is exactly the kind of thing only a live peer can check:
+  replacing it with the naive "CH1 || HRR || CH2" leaves every self-interop
+  test green and fails only the live test. **Not** implemented: SERVING an
+  HRR — this module's server still does no return-routability check.
+  `error.HelloRetryRequestUnsupported` narrows to the two cases that remain
+  (an HRR in `.cert_dhe` mode, or one carrying nothing to change). New
+  `Connection.sawHelloRetryRequest`.
 - **`dtls`:** live third-party interop, and the four wire defects it exposed.
   `src/wolfssl_interop.zig` runs a real DTLS 1.3 PSK handshake over loopback
   UDP against **wolfSSL 5.9.1** in both roles (our client vs its server, our

@@ -310,11 +310,15 @@ which bounds the buffer by OUR list instead of the peer's.
 
 ### Still not proven / not implemented
 
-- **HelloRetryRequest and the stateless-cookie retry round trip** — detected
-  and rejected with a typed error, never mishandled. The test peer is
-  configured with `wolfSSL_disable_hrr_cookie` because a default DTLS 1.3
-  server *does* perform the cookie exchange, so this is a real interop
-  limitation, not a harness convenience.
+- **Serving a HelloRetryRequest.** The CLIENT side is done and proven against
+  a default-configured wolfSSL server (`server-hrr` peer mode): cookie echoed,
+  ClientHello1's `random` reused per RFC 8446 §4.1.2, a second HRR refused per
+  §4.1.4, and RFC 8446 §4.4.1's `message_hash` transcript rewrite applied.
+  That rewrite is the part only a real peer can check — mutating it to the
+  naive "CH1 || HRR || CH2" keeps every self-interop test green and fails
+  only the live test, with wolfSSL reporting "binder does not verify".
+  This module's SERVER still never sends an HRR, so it performs no
+  return-routability check on the first datagram.
 - **Cross-`handleFlight` fragment reassembly** — a handshake message split
   across datagrams is rejected. wolfSSL did not split any flight at these
   sizes, so this path is still untested against a real peer.

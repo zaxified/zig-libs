@@ -67,6 +67,35 @@ pub const Transcript = struct {
         return copy.finalResult();
     }
 
+    /// RFC 8446 §4.4.1's HelloRetryRequest transcript rewrite. When a server
+    /// answers ClientHello1 with a HelloRetryRequest, the transcript is NOT
+    /// "CH1 || HRR || CH2" — CH1 is replaced by a synthetic `message_hash`
+    /// message carrying its hash:
+    ///
+    ///     Hash(message_hash || 00 00 Hash.length || Hash(ClientHello1)
+    ///          || HelloRetryRequest || ClientHello2 || ...)
+    ///
+    /// `client_hello1_hash` is the transcript hash as it stood immediately
+    /// after ClientHello1 was appended — which, CH1 being the first message,
+    /// is exactly `Hash(ClientHello1)`.
+    ///
+    /// The rewrite exists so that a stateless server, which kept nothing
+    /// between the two ClientHellos, can reconstruct the same transcript from
+    /// the cookie it handed out. Getting it wrong is invisible until a real
+    /// peer is on the other end: both sides of a self-interop suite would
+    /// simply agree on "CH1 || HRR || CH2" and every test would pass.
+    pub fn resetToMessageHash(self: *Transcript, client_hello1_hash: [32]u8) void {
+        self.hasher = Sha256.init(.{});
+        var hdr: [4]u8 = undefined;
+        writeHeader(&hdr, message_hash_type, client_hello1_hash.len);
+        self.hasher.update(&hdr);
+        self.hasher.update(&client_hello1_hash);
+    }
+
+    /// RFC 8446 §4.4.1's synthetic handshake type (254) — never sent on the
+    /// wire, only ever hashed.
+    pub const message_hash_type: u8 = 254;
+
     fn writeHeader(out: *[4]u8, msg_type: u8, len: usize) void {
         out[0] = msg_type;
         out[1] = @truncate(len >> 16);
