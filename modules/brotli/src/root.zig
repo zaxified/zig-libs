@@ -7,9 +7,11 @@
 //! panics — it returns a typed `BrotliError`. Output is bounded by
 //! `Options.max_output` (a decompression-bomb guard).
 //!
-//! Encoder: emits a valid `Content-Encoding: br` stream in store mode
-//! (uncompressed meta-blocks). It round-trips and is accepted by compliant
-//! decoders, but does not compress; see SPEC.md.
+//! Encoder: LZ77 backward references plus a per-meta-block Huffman code for
+//! literals, insert-and-copy commands and distances, with a store-mode fallback
+//! for anything that would not shrink. Roughly 2.8x on English text. Its output
+//! is checked against the reference implementation (google/brotli), not only
+//! against this module's own decoder; see SPEC.md.
 
 const std = @import("std");
 
@@ -22,13 +24,21 @@ pub const Options = decoder.Options;
 /// Decompress a complete Brotli stream. Caller owns the returned slice.
 pub const decompress = decoder.decompress;
 
-/// Compress `input` into a valid (store-mode) Brotli stream. Caller owns it.
+/// Compress `input` into a valid Brotli stream. Caller owns the returned slice.
+/// Fails only on allocation: any block that will not compress is stored
+/// verbatim, so the result is always a conformant `br` body.
 pub const compress = encoder.compress;
 
 // ===========================================================================
 // Tests
 // ===========================================================================
 const testing = std.testing;
+
+test {
+    // Live interop against the reference implementation (skips loudly when
+    // python3 / the `brotli` package is unavailable).
+    _ = @import("reference_interop.zig");
+}
 
 fn expectDecodes(comptime name: []const u8) !void {
     const plain = @embedFile("testdata/" ++ name);
@@ -190,4 +200,93 @@ test "encode: multi-block (> 16 MiB) round-trip" {
 test "encode: output is a valid stream our decoder accepts for real corpus" {
     const plain = @embedFile("testdata/alice29.txt");
     try roundTrip(plain);
+}
+
+// --- encoder: compression, and the store-mode fallback ----------------------
+
+test "encode: really compresses English text" {
+    const plain = @embedFile("testdata/alice29.txt");
+    const comp = try compress(testing.allocator, plain);
+    defer testing.allocator.free(comp);
+    // Store mode would be ~1.00; the reference manages ~2.9x at quality 1.
+    // Anything above half the original means the compressed path silently
+    // stopped being taken.
+    try testing.expect(comp.len * 2 < plain.len);
+    const back = try decompress(testing.allocator, comp, .{});
+    defer testing.allocator.free(back);
+    try testing.expectEqualSlices(u8, plain, back);
+}
+
+test "encode: incompressible input falls back to store mode" {
+    var buf: [4096]u8 = undefined;
+    var seed: u32 = 0xBADF00D;
+    for (&buf) |*b| {
+        seed = seed *% 1664525 +% 1013904223;
+        b.* = @truncate(seed >> 16);
+    }
+    const comp = try compress(testing.allocator, &buf);
+    defer testing.allocator.free(comp);
+    // Store mode costs the window bits, one meta-block header, byte alignment
+    // and the final empty meta-block — a handful of bytes, never a factor.
+    try testing.expect(comp.len <= buf.len + 8);
+    try roundTrip(&buf);
+}
+
+test "encode: output never blows up, whatever the input looks like" {
+    const gpa = testing.allocator;
+    var seed: u64 = 0x1234_5678_9abc_def0;
+    var iter: usize = 0;
+    while (iter < 60) : (iter += 1) {
+        seed = seed *% 6364136223846793005 +% 1442695040888963407;
+        const n: usize = @as(usize, @truncate(seed >> 12)) % 9000;
+        const alphabet: usize = 1 + @as(usize, @truncate(seed >> 40)) % 256;
+        const data = try gpa.alloc(u8, n);
+        defer gpa.free(data);
+        for (data) |*b| {
+            seed = seed *% 6364136223846793005 +% 1442695040888963407;
+            b.* = @intCast(@as(usize, @truncate(seed >> 21)) % alphabet);
+        }
+        const comp = try compress(gpa, data);
+        defer gpa.free(comp);
+        // Worst case is store mode plus its framing; a compressed block is only
+        // kept when it is strictly smaller than storing the same bytes.
+        try testing.expect(comp.len <= n + 16);
+        const back = try decompress(gpa, comp, .{});
+        defer gpa.free(back);
+        try testing.expectEqualSlices(u8, data, back);
+    }
+}
+
+test "encode: round-trip every input shape" {
+    const gpa = testing.allocator;
+    try roundTrip("a");
+    try roundTrip("ab");
+    try roundTrip("abc");
+    try roundTrip(&[_]u8{0} ** 5);
+    try roundTrip(&[_]u8{0xff} ** 100000);
+    {
+        // Every byte value present, so the literal code spans the alphabet.
+        var buf: [256]u8 = undefined;
+        for (&buf, 0..) |*b, i| b.* = @intCast(i);
+        try roundTrip(&buf);
+    }
+    {
+        // Matches at exactly the window edge, both sides of the wbits switch.
+        for ([_]usize{ 65519, 65520, 65521 }) |n| {
+            const buf = try gpa.alloc(u8, n + 8);
+            defer gpa.free(buf);
+            @memset(buf, 'z');
+            @memcpy(buf[0..8], "preamble");
+            @memcpy(buf[n..][0..8], "preamble");
+            try roundTrip(buf);
+        }
+    }
+    {
+        // Two meta-blocks of compressible data.
+        const alice = @embedFile("testdata/alice29.txt");
+        const buf = try gpa.alloc(u8, (1 << 20) + 5000);
+        defer gpa.free(buf);
+        for (buf, 0..) |*b, i| b.* = alice[i % alice.len];
+        try roundTrip(buf);
+    }
 }
