@@ -35,19 +35,23 @@
 //!     `.reconstruct(a0, a1, record_out)`, plus the wire codecs
 //!     `shareToBytes`/`shareFromBytes`/`answerToBytes`/`answerFromBytes`/
 //!     `reconstructFromBytes`.
+//!   - `Pir(...).Multi(k)` — **`k` records per round trip**, over `fss`'s
+//!     multi-point FSS. Same shape, plus `answerAggregate` for the query a
+//!     single multi-point inner product actually computes (`Σ_j record[α_j]`,
+//!     one record of download — an aggregate, *not* `k`-record retrieval).
+//!     ⚠ `k` is public: the share length and the answer width both reveal it.
 //!   - `Database` — a borrowed, fixed-record-length view over bytes you
 //!     already have.
 //!   - `domainBitsFor(count)` — pick `domain_bits` for a record count.
 //!
 //! ## Scoped out
 //!
-//! **Multi-index retrieval** (several records per query) needs a multi-point
-//! FSS scheme; `fss` ships only the single-point DPF, so it is not buildable
-//! here without extending `fss` first. Multi-*record*-sized retrieval — a
-//! whole block rather than a bit — needed nothing extra and is the default
-//! case: see `pir.zig`. Also out: keyword/PIR-by-keyword, answer
-//! verification against a malicious server, and batching several queries into
-//! one pass over the database.
+//! Multi-*record*-sized retrieval — a whole block rather than a bit — needed
+//! nothing extra and is the default case: see `pir.zig`. Still out:
+//! keyword/PIR-by-keyword, answer verification against a malicious server, and
+//! **sublinear** batch PIR (`Multi(k)` amortizes the database pass but still
+//! costs `k` DPF evaluations per record; the cuckoo/batch-code multi-point
+//! construction that would fix that is scoped out in `fss`).
 
 const std = @import("std");
 

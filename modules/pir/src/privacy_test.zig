@@ -289,6 +289,331 @@ test "STAT NEGATIVE CONTROL: the same statistic rejects a share that leaks the i
     try testing.expect(maxGap(&counts_a, &counts_b) >= reject_gap);
 }
 
+// ── multi-index: what k points change, and what they do not ───────────────
+//
+// The single-index battery above establishes that this module does not undo
+// the DPF's hiding property for ONE index. With k indices there are two new
+// questions, and they are not answered by repeating the old tests k times:
+//
+//   1. Does the share reveal **k** itself?
+//   2. Does it reveal anything about the **relationship** between the indices —
+//      most sharply, that two of them share a prefix, or are equal?
+//
+// Both are answered below, one of them in the affirmative. See SPEC.md
+// §"Multi-index privacy".
+
+/// `k` deterministic, mutually distinct seed pairs.
+fn detSeedsK(comptime k: usize, tag: u64) [2][k]fss.prg.Seed {
+    var s0: [k]fss.prg.Seed = undefined;
+    var s1: [k]fss.prg.Seed = undefined;
+    for (0..k) |j| {
+        const pair = detSeeds(tag *% 1_000_003 +% @as(u64, j));
+        s0[j] = pair[0];
+        s1[j] = pair[1];
+    }
+    return .{ s0, s1 };
+}
+
+test "EXACT: k IS revealed by the share length — and that is the whole leak of k" {
+    // The answer to question 1, stated as an assertion rather than buried:
+    // a multi-index share is exactly k single-index shares long, so anyone who
+    // sees one learns k. This is acceptable ONLY because k is public protocol
+    // geometry — it is a compile-time parameter, both servers are built with
+    // the same one, and it is the same for every client. It is NOT a per-query
+    // secret, and a deployment must not treat it as one.
+    const P = pir.Pir(7, 4);
+    inline for (.{ 1, 2, 5 }) |k| {
+        const M = P.Multi(k);
+        try testing.expectEqual(k * P.share_len, M.share_len);
+    }
+
+    // What the length does NOT reveal: how many records the client actually
+    // wanted. A client needing fewer than k pads with dummy indices, and every
+    // index is hidden by its own instance, so the padded share is the same
+    // length and the same shape as a full one.
+    const M = P.Multi(3);
+    const seeds = detSeedsK(3, 71);
+    var buf_a: [M.share_len]u8 = undefined;
+    var buf_b: [M.share_len]u8 = undefined;
+    const real = try M.query(.{ 11, 42, 99 }, seeds[0], seeds[1]); // 3 wanted
+    const padded = try M.query(.{ 11, 11, 11 }, seeds[0], seeds[1]); // 1 wanted
+    M.shareToBytes(real[0], &buf_a);
+    M.shareToBytes(padded[0], &buf_b);
+    try testing.expectEqual(buf_a.len, buf_b.len);
+    // …and the two are not byte-equal, i.e. padding is not a detectable
+    // constant pattern in the share.
+    try testing.expect(!std.mem.eql(u8, &buf_a, &buf_b));
+}
+
+test "EXACT: a retrieval answer reveals k; an aggregate answer does not" {
+    // The server → client direction of the same question. A k-record answer is
+    // k blocks wide, so its length reveals k too (and, again, k is public). The
+    // aggregate answer is one record-sized block WHATEVER k is — worth pinning
+    // because it is the one shape here whose size hides k.
+    const P = pir.Pir(5, 8);
+    const record_len = 20;
+    inline for (.{ 1, 2, 4 }) |k| {
+        const M = P.Multi(k);
+        try testing.expectEqual(
+            k * P.answerBytesLen(record_len),
+            try M.answerBytesLen(record_len),
+        );
+        try testing.expectEqual(P.answerWords(record_len), M.aggregateWords(record_len));
+    }
+}
+
+test "EXACT: each instance's root seed is the caller's, and the k seeds are all that differ" {
+    // The single-index structural claims, now per instance — and the threat
+    // model with k points: two colluding servers recover ALL k indices, not
+    // just one, by running the same full-domain scan per instance.
+    const P = pir.Pir(6, 4);
+    const k = 3;
+    const M = P.Multi(k);
+    const indices = [k]usize{ 41, 0, 63 };
+    const seeds = detSeedsK(k, 5);
+    const shares = try M.query(indices, seeds[0], seeds[1]);
+
+    for (0..k) |j| {
+        try testing.expectEqualSlices(u8, &seeds[0][j], &shares[0].keys[j].seed);
+        try testing.expectEqualSlices(u8, &seeds[1][j], &shares[1].keys[j].seed);
+        // correction words are shared between the two parties, per instance
+        var cw0: [M.Mpf.Dpf.Key.cw_serialized_len]u8 = undefined;
+        var cw1: [M.Mpf.Dpf.Key.cw_serialized_len]u8 = undefined;
+        shares[0].keys[j].serializeCw(&cw0);
+        shares[1].keys[j].serializeCw(&cw1);
+        try testing.expectEqualSlices(u8, &cw0, &cw1);
+    }
+
+    // The collusion attack, per instance: every index falls out.
+    var sel0: [k]M.Word = undefined;
+    var sel1: [k]M.Word = undefined;
+    var recovered: [k]?usize = @splat(null);
+    for (0..M.domain_size) |x| {
+        M.Mpf.evalEach(0, shares[0], @intCast(x), &sel0);
+        M.Mpf.evalEach(1, shares[1], @intCast(x), &sel1);
+        for (0..k) |j| {
+            if (sel0[j] +% sel1[j] != 0) {
+                try testing.expect(recovered[j] == null); // exactly one spike
+                recovered[j] = x;
+            }
+        }
+    }
+    for (indices, recovered) |want, got| try testing.expectEqual(@as(?usize, want), got);
+}
+
+test "EXACT: no correction word is shared between instances, even for related indices" {
+    // The answer to question 2, and the property that makes this construction
+    // safe to use with related indices at all. Each instance is generated from
+    // its OWN independent seed pair, so instance j's key is a function of
+    // instance j's seeds alone and the bundle's joint distribution factorises.
+    // Nothing about how the indices relate to each other survives into bytes.
+    //
+    // Checked on the three relationships that would break it if anything were
+    // shared: a long common prefix, adjacency, and outright equality.
+    const P = pir.Pir(8, 4);
+    const M = P.Multi(2);
+    const pairs = [_][2]usize{
+        .{ 0b10110000, 0b10110010 }, // 6-bit common prefix
+        .{ 0, 1 }, // adjacent: agree at every level but the last
+        .{ 99, 99 }, // identical indices
+        .{ 0, 255 }, // maximally far apart (the control)
+    };
+    for (pairs, 0..) |pair, t| {
+        const seeds = detSeedsK(2, 6100 + t);
+        const shares = try M.query(pair, seeds[0], seeds[1]);
+        var cw_a: [M.Mpf.Dpf.Key.cw_serialized_len]u8 = undefined;
+        var cw_b: [M.Mpf.Dpf.Key.cw_serialized_len]u8 = undefined;
+        shares[0].keys[0].serializeCw(&cw_a);
+        shares[0].keys[1].serializeCw(&cw_b);
+        try testing.expect(!std.mem.eql(u8, &cw_a, &cw_b));
+        // Not even one level's seed CW matches — the level-1 word is where a
+        // shared prefix would show first.
+        for (shares[0].keys[0].cw, shares[0].keys[1].cw) |ca, cb| {
+            try testing.expect(!std.mem.eql(u8, &ca.s_cw, &cb.s_cw));
+        }
+    }
+}
+
+test "EXACT: seed reuse across instances is rejected — the leak it would cause is real" {
+    // The counterweight to the test above: the cross-instance independence it
+    // asserts is bought entirely by independent seeds, and is NOT a property of
+    // the sum-of-DPFs construction on its own. Under a reused seed pair, two
+    // indices sharing a p-bit prefix produce byte-identical correction words
+    // for exactly those p levels, and a server reads the common-prefix length
+    // straight out of the share. `fss/mpf_test.zig` demonstrates that leak
+    // mechanically; here we pin that this module refuses to produce it.
+    const M = pir.Pir(8, 4).Multi(2);
+    const seeds = detSeedsK(2, 88);
+    var dup0 = seeds[0];
+    var dup1 = seeds[1];
+    dup0[1] = dup0[0];
+    dup1[1] = dup1[0];
+    try testing.expectError(error.SeedReuse, M.query(.{ 0b10110000, 0b10110010 }, dup0, dup1));
+    // and the honest scope of the guard: distinct-but-correlated seeds pass it.
+    // It catches the plumbing bug, not bad randomness.
+    var near0 = seeds[0];
+    near0[1] = near0[0];
+    near0[1][15] ^= 0x01; // one bit apart — accepted
+    _ = try M.query(.{ 0, 1 }, near0, seeds[1]);
+}
+
+test "EXACT: per-instance level-1 CW parity is index-independent; the seed CW is not" {
+    // Both single-index EXACT claims, restated per instance because that is
+    // where they now live. The parity is exactly index-independent (α cancels
+    // in BGI's formulas); the level-1 seed CW takes exactly two values across
+    // the domain, split by the top index bit, with the seeds held fixed.
+    // Privacy remains COMPUTATIONAL, per instance, for the same reason.
+    const M = pir.Pir(5, 4).Multi(2);
+    const seeds = detSeedsK(2, 9);
+    var parity: [2]?u1 = @splat(null);
+    var s_cw_top0: [2]?[16]u8 = @splat(null);
+    var s_cw_top1: [2]?[16]u8 = @splat(null);
+
+    for (0..M.domain_size) |i| {
+        // vary both slots together so every instance sees every index
+        const shares = try M.query(.{ i, M.domain_size - 1 - i }, seeds[0], seeds[1]);
+        for (0..2) |j| {
+            const c = shares[0].keys[j].cw[0];
+            const p: u1 = c.t_cw_l ^ c.t_cw_r;
+            if (parity[j]) |prev| try testing.expectEqual(prev, p) else parity[j] = p;
+
+            const idx = if (j == 0) i else M.domain_size - 1 - i;
+            const top_bit = (idx >> (5 - 1)) & 1;
+            const slot = if (top_bit == 0) &s_cw_top0[j] else &s_cw_top1[j];
+            if (slot.*) |prev| {
+                try testing.expectEqualSlices(u8, &prev, &c.s_cw);
+            } else {
+                slot.* = c.s_cw;
+            }
+        }
+    }
+    for (0..2) |j| {
+        try testing.expect(s_cw_top0[j] != null and s_cw_top1[j] != null);
+        try testing.expect(!std.mem.eql(u8, &s_cw_top0[j].?, &s_cw_top1[j].?));
+    }
+}
+
+// ── STAT (multi): does the relationship between the indices separate? ─────
+
+const PM = pir.Pir(8, 4).Multi(2);
+const multi_share_bits = PM.share_len * 8;
+
+/// How a leak is injected into a multi-index share. `.none` is the real thing.
+/// The controls are chosen to be *relationship* leaks, not just index leaks —
+/// question 2 needs a statistic proven able to detect exactly that.
+const MultiLeak = enum {
+    none,
+    /// NEGATIVE CONTROL: one bit saying "the two indices are equal".
+    indices_equal_bit,
+    /// NEGATIVE CONTROL: one bit saying "the two indices share a top bit" —
+    /// the subtlest relationship leak claimed to be detectable.
+    shared_top_bit,
+};
+
+fn sampleMultiCounts(
+    indices: [2]usize,
+    stream: u64,
+    leak: MultiLeak,
+    counts: *[multi_share_bits]u32,
+) !void {
+    @memset(counts, 0);
+    var buf: [PM.share_len]u8 = undefined;
+    for (0..m) |t| {
+        const seeds = detSeedsK(2, stream *% 1_000_003 +% @as(u64, @intCast(t)));
+        const shares = try PM.query(indices, seeds[0], seeds[1]);
+        PM.shareToBytes(shares[0], &buf);
+        switch (leak) {
+            .none => {},
+            .indices_equal_bit => buf[0] = (buf[0] & 0xFE) |
+                @intFromBool(indices[0] == indices[1]),
+            .shared_top_bit => buf[0] = (buf[0] & 0xFE) |
+                @intFromBool((indices[0] >> 7) == (indices[1] >> 7)),
+        }
+        accumulateBits(counts, &buf);
+    }
+}
+
+test "STAT: the index RELATIONSHIP does not separate one multi-index share from another" {
+    // The strongest statement about question 2 that fits in a unit test, and
+    // the pairs are the statistic: each compares two tuples whose *relationship*
+    // differs, so a leak of the relationship — rather than of an index — is
+    // what this is built to see. Same threshold and calibration as the
+    // single-index STAT test; see SPEC.md for what it does and does not cover.
+    var a: [multi_share_bits]u32 = undefined;
+    var b: [multi_share_bits]u32 = undefined;
+
+    // (i) IDENTICAL indices vs distinct ones — the sharpest relationship
+    // difference there is, and the one a shared-seed construction would fail.
+    try sampleMultiCounts(.{ 5, 5 }, 1001, .none, &a);
+    try sampleMultiCounts(.{ 5, 200 }, 2002, .none, &b);
+    try testing.expect(maxGap(&a, &b) < reject_gap);
+
+    // (ii) ADJACENT (a 7-level common prefix) vs maximally far apart, holding
+    // the first index fixed so the first instance is distributionally identical
+    // and only the relationship differs.
+    try sampleMultiCounts(.{ 0, 1 }, 3003, .none, &a);
+    try sampleMultiCounts(.{ 0, 255 }, 4004, .none, &b);
+    try testing.expect(maxGap(&a, &b) < reject_gap);
+
+    // (iii) The SAME relationship (adjacent pair) at two different places in
+    // the tree: nothing about the location may separate them either.
+    try sampleMultiCounts(.{ 0, 1 }, 5005, .none, &a);
+    try sampleMultiCounts(.{ 200, 201 }, 6006, .none, &b);
+    try testing.expect(maxGap(&a, &b) < reject_gap);
+}
+
+test "STAT NEGATIVE CONTROL: the same statistic rejects a share leaking the RELATIONSHIP" {
+    // Without these the test above proves nothing about its own sensitivity.
+    // Both controls leak one bit *about the pair* rather than about an index,
+    // which is precisely the class the multi-point case adds.
+    var a: [multi_share_bits]u32 = undefined;
+    var b: [multi_share_bits]u32 = undefined;
+
+    try sampleMultiCounts(.{ 5, 5 }, 1001, .indices_equal_bit, &a);
+    try sampleMultiCounts(.{ 5, 200 }, 2002, .indices_equal_bit, &b);
+    try testing.expect(maxGap(&a, &b) >= reject_gap);
+
+    try sampleMultiCounts(.{ 0, 1 }, 3003, .shared_top_bit, &a);
+    try sampleMultiCounts(.{ 0, 255 }, 4004, .shared_top_bit, &b);
+    try testing.expect(maxGap(&a, &b) >= reject_gap);
+}
+
+test "EXACT: a multi-index share's constant bits are the single-index census, tiled" {
+    // The concatenation must introduce NO structure of its own — no header, no
+    // separator, no padding, no per-instance counter. So the set of
+    // structurally-constant bit positions must be exactly the single-index set
+    // repeated with period `share_len`, and every other position must vary.
+    // A stray constant byte anywhere would break the periodicity and show here.
+    var seen_zero: [multi_share_bits]bool = @splat(false);
+    var seen_one: [multi_share_bits]bool = @splat(false);
+    var buf: [PM.share_len]u8 = undefined;
+    for (0..256) |t| {
+        const seeds = detSeedsK(2, 90000 + t);
+        const shares = try PM.query(.{ t & 0xFF, (t * 7 + 3) & 0xFF }, seeds[0], seeds[1]);
+        PM.shareToBytes(shares[0], &buf);
+        for (buf, 0..) |byte, i| {
+            for (0..8) |q| {
+                const pos = i * 8 + q;
+                if ((byte >> @intCast(q)) & 1 == 0) seen_zero[pos] = true else seen_one[pos] = true;
+            }
+        }
+    }
+    const sub_len = P8.share_len; // one instance's serialized length
+    for (0..multi_share_bits) |pos| {
+        const byte_idx = (pos / 8) % sub_len; // fold into one instance
+        const bit_idx = pos % 8;
+        const in_cw_region = byte_idx >= 16 and byte_idx < 16 + 8 * 18;
+        const off = if (in_cw_region) (byte_idx - 16) % 18 else 0;
+        const is_t_cw_padding = in_cw_region and (off == 16 or off == 17) and bit_idx != 0;
+        const varies = seen_zero[pos] and seen_one[pos];
+        if (is_t_cw_padding) {
+            try testing.expect(!varies and seen_zero[pos]);
+        } else {
+            try testing.expect(varies);
+        }
+    }
+}
+
 test "EXACT: which bits of a serialized share are structurally constant" {
     // A census of the encoding, not a privacy proof — but it is what makes the
     // STAT test above interpretable. The control-bit correction words are

@@ -42,6 +42,13 @@ pub const Error = error{
     ShareLengthMismatch,
     /// an answer buffer's length disagrees with the record/word geometry
     AnswerLengthMismatch,
+    /// a multi-index reconstruction buffer is not exactly `k * record_len`
+    RecordsLengthMismatch,
+    /// two of a multi-index query's `2k` root seeds are byte-identical.
+    /// Raised by `fss`'s multi-point Gen, not here: reusing a seed pair across
+    /// two of the query's instances makes the shared prefix of the two indices
+    /// readable straight out of the correction words. See `fss/mpf.zig`.
+    SeedReuse,
     /// more than `2^31` records — beyond the DPF's maximum domain
     DatabaseTooLarge,
 };

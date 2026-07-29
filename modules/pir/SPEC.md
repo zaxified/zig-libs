@@ -82,6 +82,131 @@ the record count. The server evaluates only `x < N`; since `f_{i,1}(x) = 0`
 outside `x = i`, dropping the tail of the domain changes nothing, and querying
 a valid-but-unpopulated index reconstructs to all-zero rather than erroring.
 
+## Multi-index retrieval, and the correction it required
+
+`Pir(...).Multi(k)` retrieves `k` records per round trip over `fss`'s
+multi-point FSS (`fss.Mpf`). The obvious shape — "one multi-point key, one
+inner product, one answer" — **does not retrieve `k` records**, and building to
+it would have produced a module that returns something else entirely. Composing
+a `k`-point function with this module's inner product gives
+
+```
+Σ_x f_{A,1}(x) · word_j(record[x])  =  Σ_l word_j(record[α_l])
+```
+
+— the **sum** of the `k` records, from which the individual records are
+unrecoverable. That is a useful query in its own right (its download is one
+record regardless of `k`), and it is exposed as `answerAggregate`, but it is an
+aggregate, not retrieval.
+
+Retrieval keeps the `k` instances apart: the server evaluates the components
+with `Mpf.evalEach` and accumulates `k` separate inner products, so an answer
+is `k` record-sized blocks and reconstruction yields all `k` records. There is
+no way around the download cost — `k` records of information cannot arrive in
+one record of bytes — so "one answer per server" means one *message*, `k`
+blocks wide. A test asserts the aggregate's non-invertibility directly: two
+different index tuples with the same multiset produce the same aggregate.
+
+### What carried over from the single-index case
+
+Re-checked against `k` points rather than assumed:
+
+1. **The output group is still `Z_{2^{8L}}`, not XOR**, and each component is
+   still a full pseudorandom group element rather than a selection bit. Each
+   block is the same ring inner product; nothing about the group changed.
+2. **β must still be 1**, now `k` times — `query` hard-codes `1` for every
+   point. A `β_j ≠ 1` scales block `j`'s record by `β_j`.
+3. **Record-length independence still comes free**, for the same reason as
+   before: the work is `k` evaluations per *record*, whatever the record's
+   length. What is *not* free any more is the factor `k` itself — that is the
+   cost of the chosen multi-point construction (`fss/SPEC.md`).
+4. **Repeated indices behave differently in the two shapes**, and this is the
+   one place the semantics visibly diverge. In retrieval the instances never
+   meet, so `.{7, 7}` returns record 7 in both blocks. In the summed function
+   those same points add, so the aggregate gives `2·record[7]`. That divergence
+   is exactly why retrieval uses the components and not the sum.
+
+The server makes **one pass** over the database (records outside, instances
+inside), so each record's bytes are decomposed once. That is a memory-traffic
+win only; the DPF evaluations are still `k·N`.
+
+## Multi-index privacy — does `k`, or the index relationship, leak?
+
+Two questions the single-index battery does not answer, and they are not
+answered by running the old tests `k` times.
+
+**1. Does the share reveal `k`? Yes — and that is the whole leak of `k`.** A
+multi-index share is exactly `k` single-index shares long, and a retrieval
+answer is exactly `k` blocks wide, so both lengths reveal `k` to any observer.
+This is stated as an assertion in `privacy_test.zig` rather than left implicit,
+because it is acceptable only under a condition that must hold operationally:
+`k` is **public protocol geometry** — a compile-time parameter, identical for
+every client and both servers — not a per-query secret. A deployment must not
+treat it as one.
+
+What the length does *not* reveal is **how many records the client actually
+wanted**. A client needing fewer than `k` pads with dummy indices; every index
+is hidden by its own instance, so any padding value works and the padded share
+is the same length and shape as a full one. That is the supported way to hide
+the effective count, and it is tested.
+
+The aggregate answer is the one shape whose size hides `k`: one record-sized
+block whatever `k` is.
+
+**2. Does the *relationship* between the indices leak? Not with independent
+seeds — and it would without them.** This is the sharpest question the
+multi-point case adds, and the answer has two halves that must be read
+together:
+
+- *Structurally, no.* Each instance is generated from its own independent seed
+  pair, so instance `j`'s key is a function of instance `j`'s seeds alone and
+  the bundle's joint distribution factorises. Nothing about how the indices
+  relate survives into the bytes. EXACT tests assert that no correction word is
+  shared between instances — not even one level's seed CW — for the three
+  relationships that would break it if anything were shared: a 6-bit common
+  prefix, adjacency, and **outright equal indices**.
+- *And that is bought entirely by seed independence, not by the construction.*
+  Under a reused seed pair, two indices sharing a `p`-bit prefix produce
+  byte-identical correction words for exactly those `p` levels, and a server
+  reads the common-prefix length straight out of the share.
+  `fss/mpf_test.zig` demonstrates that leak mechanically; `query` refuses to
+  produce it (`error.SeedReuse`). The guard catches the plumbing bug —
+  distinct-but-correlated seeds pass it, which a test also pins.
+
+**STAT, extended to relationships.** The two-sample bit-frequency statistic is
+reused verbatim (same `m`, same `reject_gap`, same calibration) but the *pairs*
+are chosen so that a leak of the **relationship** rather than of an index is
+what it is built to see:
+
+- identical indices `(5,5)` vs distinct `(5,200)` — the sharpest relationship
+  difference there is, and the one a seed-sharing construction fails;
+- adjacent `(0,1)` vs far apart `(0,255)`, holding the first index fixed so the
+  first instance is distributionally identical and only the relationship
+  differs;
+- the *same* relationship at two places in the tree, `(0,1)` vs `(200,201)`.
+
+Its **negative controls are relationship leaks too** — one bit carrying "the
+two indices are equal", and one carrying "the two indices share a top bit" —
+and both must be rejected by the identical code path and threshold. Without
+those the pairs above would prove nothing about the statistic's sensitivity to
+this specific class.
+
+**What it still does not establish** is unchanged from the single-index case
+and is not weakened here: nothing about computational indistinguishability, and
+nothing below the detection floor. It is a marginal, per-bit, first-order
+check. A relationship leak spread across bits, or visible only in a joint
+distribution, is invisible to it.
+
+**The per-instance claims carry over unchanged.** The level-1 control-bit CW
+parity is exactly index-independent (α cancels in BGI's formulas) *per
+instance*; the level-1 seed CW *does* depend on the top index bit *per
+instance*, taking exactly two values with the seeds held fixed. So privacy
+remains **computational** and rests on the PRG — with `k` points as with one.
+A census test also asserts that the multi-index share's structurally-constant
+bits are exactly the single-index census **tiled with period `share_len`**,
+which is what pins that the concatenation introduced no header, separator,
+padding or per-instance counter of its own.
+
 ## Threat model
 
 **The assumption.** Exactly one: the two servers do not pool their shares.
@@ -272,11 +397,14 @@ attacker-influenced zero exists downstream.
 **Two gaps in the standard workflow, stated because they affect what the fuzz
 evidence is worth:**
 
-1. `zig build test-pir --fuzz` **does not build on this Zig 0.16.0**: the
-   shipped `lib/compiler/test_runner.zig` fails to compile under `-ffuzz`
-   (`*builtin.StackTrace` vs `*const debug.StackTrace`). This is a toolchain
-   bug, not a module one, and it affects every module in the repo. So
-   `std.testing.fuzz` only ever runs its small default corpus here.
+1. ~~`zig build test-pir --fuzz` does not build on this Zig 0.16.0.~~
+   **CORRECTED.** The failure is **Debug-only**: `zig build test-pir --fuzz`
+   still fails to compile the shipped `lib/compiler/test_runner.zig` under
+   `-ffuzz` (`*builtin.StackTrace` vs `*const debug.StackTrace`, re-confirmed),
+   but **`zig build test-pir --fuzz --release=safe` builds and runs the real
+   fuzzer**. The original claim was too broad, and while it stood, the default
+   corpus was all these harnesses had ever run. They have since been run under
+   the real fuzzer; see "What the real fuzzer found" below.
 2. That corpus was measurably too thin: the deliberate count-from-input
    mutation above **was not caught by the in-repo fuzz harnesses** — only by
    the explicit unit test. Two things were done about it rather than noting it
@@ -298,7 +426,31 @@ so it has teeth. Per `CONVENTIONS.md` §7.1 this is evidence about a Debug or
 
 **No crash was found.** No bug in `fss` was found either — its `Key.fromBytes`
 takes a `*const [serialized_len]u8`, a fixed-size array pointer, so the parser
-has no length to trust in the first place.
+has no length to trust in the first place. The multi-index boundaries preserve
+that property exactly: `fss.Mpf`'s key is `k` sub-keys at compile-time-known
+offsets, `k` is a compile-time parameter rather than anything read from the
+input, and `Multi.shareFromBytes` accepts exactly one length. There is still
+no count an attacker can claim.
+
+### What the real fuzzer found
+
+With `--release=safe --fuzz` working, both modules' harnesses were run under
+the actual fuzzer rather than the default corpus. Result: **no crash, no
+panic** in either — but the fuzzer did immediately reject a wrong *assertion*
+that the default corpus had accepted, and the finding is `fss`'s, not this
+module's:
+
+> A fuzz harness asserted that decoding a key and re-encoding it reproduces the
+> input bytes. It does not. `serializeCw` writes each control-bit correction
+> word as a whole byte valued 0/1 while `fromBytes` truncates that byte to its
+> low bit, so **the encoding is not injective**: two distinct byte strings
+> decode to the same key. See `fss/SPEC.md` §"The encoding is not injective".
+
+No protocol consequence here — nothing in `pir` signs, MACs, hashes or
+deduplicates a serialized share, and a share that decodes to an equivalent key
+produces an identical answer. It is recorded because a consumer that *does* any
+of those things must canonicalize first, and because it is a concrete example
+of the default corpus being too thin to be relied on.
 
 ## Where the library stops
 
@@ -322,17 +474,20 @@ protocol modules: bytes in, bytes out, and the transport is the integrator's.
 
 ## Scoped out
 
-- **Multi-index queries** (several records per round trip). Needs a
-  multi-point FSS scheme; `fss` ships only the single-point DPF, so this is
-  blocked on extending `fss` first, not on work here. This is where the
-  implementation deliberately stopped.
+- ~~**Multi-index queries.**~~ **Built** — `Multi(k)`, above, once `fss` grew
+  `Mpf`. The blocker was correctly identified as being in `fss`, not here.
+- **Sublinear batch PIR.** `Multi(k)` amortizes the *database pass* (records
+  outside, instances inside) but still costs `k·N` DPF evaluations. The
+  cuckoo/batch-code multi-point construction would cut that to `O(N)`; it is
+  scoped out in `fss` with its revisit trigger stated there.
 - **Answer verification / malicious-server security.** A different protocol
   (authenticated or verifiable PIR), not a flag on this one.
 - **PIR by keyword.** Index lookup only; keyword PIR needs a hashing/cuckoo
   layer above this.
-- **Batch queries amortized over one database pass.** The obvious performance
-  win when a client wants several records: today each query is an independent
-  full pass.
+- **Hiding `k` itself.** `k` is public protocol geometry and the share length
+  reveals it; a client hides only its *effective* count, by padding. Making `k`
+  itself private would mean padding every share to a deployment-wide maximum,
+  which is a protocol decision above this layer.
 - **An efficient full-domain evaluator.** The server's cost is dominated by
   one `Dpf.eval` per record, each `O(domain_bits)` SHA-256 calls. `fss`'s
   scoped-out tree-reuse `evalFull` would cut that to `O(1)` amortized per

@@ -27,9 +27,11 @@ external-reference anchoring.
 | `prg.zig` | **REAL.** SHA-256 length-doubling PRG `G` + seed→group `convert` (exact byte definitions pinned in-file) |
 | `group.zig` | **REAL.** `Z2k(L)` — the `Z_{2^{8L}}` output group (add/sub/neg + byte codec) |
 | `dpf.zig` | `Dpf(n,L)`. **REAL:** `Cw`/`Key` types, `serializeCw`/`toBytes`/`fromBytes`, `evalAll`, `firstMismatch`. **FABLE CORE (implemented):** `genWithSeeds`, `eval` |
+| `mpf.zig` | `Mpf(n,L,k)` — **multi-point** FSS: `k` independent `Dpf` instances summed. No new cryptographic surface, no failure probability, keys linear in `k` |
 | `gate.zig` | The single switch (`core_implemented = true`) marking the correction-word core done |
 | `kat_vectors.zig` | Recorded independent-reference KAT vectors (the anti-self-consistency anchor) |
 | `kat_test.zig` | The deterministic verification harness + positive controls |
+| `mpf_test.zig` | The multi-point harness, incl. the KAT anchor inherited by composition and the seed-reuse leak control |
 
 ## Import
 
@@ -66,6 +68,31 @@ k0.toBytes(&buf);
 const restored = D.Key.fromBytes(&buf);
 ```
 
+### Multi-point (`k` points at once)
+
+```zig
+const M = fss.Mpf(8, 4, 3); // 3 points over {0,1}^8, output group Z_{2^32}
+
+// 2k seeds: one INDEPENDENT pair per instance. Byte-identical seeds are
+// rejected with error.SeedReuse — see Caveats for why this one is enforced.
+const keys = try M.genWithSeeds(alphas, betas, seeds0, seeds1); // [2]M.Key
+
+// eval = the multi-point function itself (the k instances summed):
+const y = M.eval(0, keys[0], x) +% M.eval(1, keys[1], x); // == Σ_j β_j·1{x==α_j}
+
+// evalEach = the k components, unsummed — what a consumer wanting k SEPARATE
+// results needs (pir's k-record retrieval is exactly this):
+var each: [3]M.Elem = undefined;
+M.evalEach(0, keys[0], x, &each);
+
+// Same codec shape as Dpf: fixed length, no count field.
+var buf: [M.Key.serialized_len]u8 = undefined; // == 3 * D.Key.serialized_len
+keys[0].toBytes(&buf);
+```
+
+Repeated points are a **multiset**: `α_j == α_l` makes the shared function
+`β_j + β_l` there. `k` is compile-time, like `n` and `L`.
+
 ## Caveats
 
 - **Seeds are caller-supplied and secret.** `genWithSeeds` takes the two root
@@ -79,6 +106,17 @@ const restored = D.Key.fromBytes(&buf);
   fixed-key AES and are not matched byte-exact — see [SPEC.md](SPEC.md).
 - **`Eval`'s control-bit-gated branches are not yet constant-time reviewed**
   (side-channel hardening is a scoped-out increment).
+- **Multi-point seeds must be independent ACROSS instances, not just within a
+  pair.** Reusing one seed pair for two instances makes the two points'
+  **shared prefix** readable from the correction words — a leak of the
+  *relationship* between the points, which is why `Mpf.genWithSeeds` rejects
+  byte-identical seeds outright. The check catches the plumbing bug only;
+  distinct-but-correlated seeds pass it and are still your bug.
+- **The key encoding is canonical on output but tolerant on input.** Each
+  control-bit CW occupies a whole byte, of which only the low bit is read back,
+  so two distinct byte strings can decode to the same key. Harmless here
+  (nothing signs or dedups a key); if you hash or compare key bytes,
+  canonicalize with `fromBytes` → `toBytes` first. See [SPEC.md](SPEC.md).
 
 ## Import graph
 
@@ -91,6 +129,7 @@ fss → std.crypto.hash.sha2.Sha256   (std-only; meta.deps = .{})
 ```
 zig build test-fss                          # Debug — all pass, no skips
 zig build test-fss -Doptimize=ReleaseFast   # all pass, no skips
+zig build test-fss --fuzz --release=safe    # the real fuzzer (NOT Debug — see SPEC.md)
 zig fmt --check modules/fss/
 ```
 

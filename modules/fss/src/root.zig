@@ -21,10 +21,20 @@
 //!   - `Dpf(n, L)` — a DPF over domain `{0,1}^n`, output group `Z_{2^{8L}}`.
 //!     `.genWithSeeds(α, β, s0, s1)` → `[2]Key`; `.eval(b, key, x)`;
 //!     `.evalAll(b, key, out)`; `.firstMismatch(...)` (verification oracle).
+//!   - `Mpf(n, L, k)` — the **multi-point** scheme: shares of a function
+//!     non-zero at `k` chosen points. `k` independent `Dpf` instances summed —
+//!     no failure probability, no new cryptographic surface, key size linear in
+//!     `k`; see `mpf.zig` for the trade-off against the cuckoo/batch-code
+//!     constructions and for what would justify revisiting it.
+//!     `.genWithSeeds(αs, βs, s0s, s1s)`, `.eval` (the summed multi-point
+//!     value) and `.evalEach` (the `k` components, unsummed — what a consumer
+//!     wanting `k` *separate* results needs).
 //!   - `prg` / `group` — the mechanical building blocks (both usable alone).
 //!
 //! Room to grow (all OUT of Phase 1, see SPEC.md): a `dcf.zig` Distributed
-//! Comparison Function, fixed-key-AES PRG, and a 2-server PIR layer.
+//! Comparison Function and a fixed-key-AES PRG. The 2-server PIR layer landed
+//! as its own module (`pir`), and multi-point FSS — listed there as
+//! "General FSS" — is `mpf.zig`.
 
 const std = @import("std");
 
@@ -45,6 +55,13 @@ const dpf = @import("dpf.zig");
 /// `Z_{2^{8L}}`. See `dpf.zig`.
 pub const Dpf = dpf.Dpf;
 
+const mpf = @import("mpf.zig");
+/// `Mpf(n, L, k)` — a 2-party `k`-point FSS scheme over `{0,1}^n`, built as
+/// `k` independent `Dpf` instances summed in the output group. See `mpf.zig`.
+pub const Mpf = mpf.Mpf;
+/// The one way `Mpf.genWithSeeds` can fail (`error.SeedReuse`). See `mpf.zig`.
+pub const GenError = mpf.GenError;
+
 pub const kat_vectors = @import("kat_vectors.zig");
 
 // Pull every submodule's tests into the test binary (CONVENTIONS.md §6
@@ -54,8 +71,10 @@ test {
     _ = prg;
     _ = group;
     _ = dpf;
+    _ = mpf;
     _ = kat_vectors;
     _ = @import("kat_test.zig");
+    _ = @import("mpf_test.zig");
 }
 
 test "meta.model_after names the BGI DPF construction" {

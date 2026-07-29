@@ -160,14 +160,116 @@ every formerly-gated test now runs as an executed assertion (all pass, no
 skips, Debug + ReleaseFast). While the flag was `false`, those tests reported **SKIP**
 (`error.SkipZigTest`) — a skip was never a pass.
 
+## Multi-point FSS (`mpf.zig`)
+
+Shares of `f_{A,B}(x) = Σ_j β_j·1{x==α_j}` — non-zero at `k` chosen points.
+This was on the scoped-out list below as part of "General FSS"; it is now
+built, and the scoped-out entry has been narrowed to what remains.
+
+### Construction chosen, and the trade-off accepted
+
+**`k` independent DPF instances, summed.** `Mpf(n,L,k).Key` is `[k]Dpf.Key`
+laid end to end; `Gen` is `k` calls to `Dpf.genWithSeeds` on `k` independent
+seed pairs; `eval` adds the `k` sub-evaluations in `Z_{2^{8L}}`. Correctness is
+distributivity, and there is no failure case.
+
+The literature's better constructions — batch codes and cuckoo-hashing
+multi-point FSS, as used under modern batch-PIR and PSI — partition the domain
+into ~`1.5k` buckets holding one point each, so the server evaluates each
+bucket over a `1/1.5k` slice of the domain: `O(N)` server work in one pass
+instead of `O(k·N)`, with keys over shorter trees. That is a real asymptotic
+win. It is not what this module does, and the reasoning is:
+
+| | sum-of-`k`-DPFs (chosen) | cuckoo / batch-code |
+|---|---|---|
+| key size | `k·O(λ·n)` — linear in `k` | `~1.5k·O(λ·(n−log k))` — mildly sublinear |
+| server work | `k` evaluations per record | ~1 evaluation per record |
+| failure probability | **none** | placement failure — a parameter to calibrate and a claim to believe |
+| new cryptographic surface | **none** — `k` uses of the anchored primitive | bucketing, stash policy, hash choice |
+| external anchor | **inherited** — each sub-key is an anchored `dpf` key | would have to be established from scratch |
+
+For a library whose only consumer (`pir`) has no throughput requirement, the
+last three rows decide it: a construction with no failure probability and no
+assumption beyond "`dpf` is a DPF" can be audited by reading it, and it
+inherits `dpf`'s byte-exact external anchor for free. A sophisticated
+construction nobody can check is worth less here than a correct one everybody
+can.
+
+**What would justify revisiting.** One thing, measured rather than assumed: a
+consumer for which `k` passes over the data dominate. Server cost is `k·N`
+evaluations of `n` SHA-256 calls; at `k=100, N=2^20` that is ~2·10⁹ hashes per
+query, and the bucketed construction earns its failure probability. Note the
+cheaper fix comes first — the scoped-out tree-reuse `evalFull` cuts each pass
+from `O(N·n)` to `O(N)` hashes with **no** new cryptography, so that budget
+should be spent before the cuckoo complexity budget is.
+
+### Seed independence is a security requirement, and is enforced
+
+The `2k` seeds must be mutually independent, and the consequence of ignoring
+that is specific rather than generic: `Gen`'s state at level `i` is a function
+of the seeds and of `α`'s bits `1..i-1`, so **under a reused seed pair, two
+indices sharing a `p`-bit prefix produce byte-identical correction words for
+exactly those `p` levels**. A server holding one key reads the pairwise
+common-prefix length of the client's points straight out of the bytes.
+`genWithSeeds` therefore rejects byte-identical seeds (`error.SeedReuse`).
+
+That guard is honest about its scope: it catches the *plumbing* bug (a caller
+looping wrong, or passing one pair `k` times). Distinct-but-correlated seeds
+pass it and remain the caller's bug — no library can test its caller's
+randomness. `mpf_test.zig` measures the leak mechanically (asserting the number
+of matching correction-word levels is *exactly* the common-prefix length, so it
+is a statement about the mechanism rather than a threshold) and asserts that
+with independent seeds not even one level's seed CW matches, for indices with a
+long common prefix and for outright equal indices.
+
+### Anchoring — the `dpf` harness extends, by composition
+
+An `Mpf` key is a concatenation of `dpf` keys, and `dpf`'s keys are pinned
+byte-exact by `kat_vectors.zig` (the independent Python re-derivation). So
+`v0` and `v3` — both `n=4, L=4` — are composed into one `Mpf(4,4,2)` key, and
+the test asserts the serialized bytes reproduce **both recorded vectors at the
+layout's offsets**, plus both recorded full-domain evaluations per instance.
+This is a genuine EXTERNAL anchor for Gen and for the encoding: the bytes came
+from outside this repo, and a reordered instance, a stray header, a shared seed
+or a wrong offset would all break it.
+
+What is **not** externally anchored, stated rather than blurred: the *summed*
+evaluation. No published vector exists for "sum of `k` BGI DPFs" under this
+module's PRG, so the sum is checked only as a re-derivation (against the
+plaintext multi-point function, and against the sum of the anchored
+components). No vector computed by this implementation is presented as an
+anchor anywhere.
+
+### The encoding is not injective (finding)
+
+Found by fuzzing under `--release=safe`, and it applies to `dpf`'s existing
+codec, not only to `mpf`'s: `serializeCw` writes each control-bit correction
+word as a **whole byte** valued 0/1, while `fromBytes` **truncates that byte to
+its low bit**. The other seven bits are ignored, so two distinct byte strings
+decode to the same key and `toBytes(fromBytes(b)) != b` in general.
+
+Consequences, none of which is a vulnerability here:
+
+- The encoding is *canonical on output* and *tolerant on input*. Re-encoding
+  normalizes, and decoding the normalized form is a fixed point — that is the
+  property the fuzz harness asserts (asserting the round-trip was the identity
+  is what surfaced this).
+- Nothing in `fss` or `pir` signs, MACs, hashes or deduplicates a serialized
+  key, so malleability has no protocol consequence today.
+- A consumer that *does* any of those things must canonicalize first
+  (`fromBytes` then `toBytes`) or it will treat equivalent keys as distinct.
+
 ## Scoped out (future increments, NOT Phase 1)
 
 - **DCF / comparison functions** — `f_{α,β}^<(x) = β if x < α else 0`
   (Boyle–Chandran–Gilboa–Jain–Kohl–Scholl et al.); a `dcf.zig` sibling reusing
   this PRG/group. The `Dpf`-now / room-for-`dcf`-later layout is why the module
   is named `fss` rather than `dpf`.
-- **General FSS** (multi-point, interval, decision-tree functions).
-- **2-server PIR** built on `EvalAll` (a query = a DPF key per server).
+- **General FSS** — interval and decision-tree functions. (Multi-point was on
+  this list and is now `mpf.zig`, above.)
+- **Sublinear multi-point FSS** — the cuckoo/batch-code construction, with the
+  revisit trigger stated above.
+- **2-server PIR** built on `EvalAll` — now its own module, `pir`.
 - **Fixed-key-AES PRG** — the performance-standard, ~10× faster than SHA-256;
   would additionally enable byte-exact interop with Google's DPF vectors.
 - **Efficient tree-reuse `evalFull`** — `O(2^n)` full-domain instead of the

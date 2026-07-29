@@ -12,12 +12,12 @@ Distributed Point Function. The DPF *is* the primitive two-server PIR is made
 of; almost everything hard lives there, and this module is the arithmetic and
 the codec that turn it into a retrieval protocol.
 
-**Status: COMPLETE for the single-index, whole-block case**, which is the case
-that the underlying DPF supports. Query construction, both servers' answer
-computation, reconstruction, and all four wire codecs are implemented and
-tested. Multi-*index* queries (several records in one round trip) are out of
-scope — they need a multi-point FSS scheme and `fss` ships only the
-single-point DPF.
+**Status: COMPLETE for single-index and multi-index retrieval.** Query
+construction, both servers' answer computation, reconstruction, and the wire
+codecs are implemented and tested for both. Multi-index retrieval (`Multi(k)`,
+several records in one round trip) rides on `fss`'s multi-point FSS
+(`fss.Mpf`) — the blocker that used to be recorded here was in `fss`, and it
+is gone.
 
 ## Read this first
 
@@ -69,6 +69,41 @@ try P.reconstruct(a0[0..n_words], a1[0..n_words], &record_out);
 
 `src/root.zig`'s last test *is* that example, so it cannot drift.
 
+### Retrieving `k` records at once
+
+```zig
+const M = P.Multi(3);   // 3 records per round trip; k is comptime
+
+// CLIENT — 2k seeds: one INDEPENDENT pair per instance, never reused.
+// Byte-identical seeds are rejected (error.SeedReuse) because reusing a pair
+// across instances would make the two indices' shared prefix readable.
+const shares = try M.query(.{ 4, 1, 6 }, seeds0, seeds1);
+
+// SERVERS — one message each, k record-sized blocks wide.
+const n_words = try M.answerWords(database.record_len);
+try M.answer(0, shares[0], database, a0[0..n_words]);
+try M.answer(1, shares[1], database, a1[0..n_words]);
+
+// CLIENT — all three records, laid end to end (block j at j*record_len).
+try M.reconstruct(a0[0..n_words], a1[0..n_words], record_len, &records_out);
+```
+
+**`k` records need `k` blocks.** A single multi-point inner product computes
+`Σ_j record[α_j]` — the *sum* of the selected records, not the records. That
+query is real and is exposed as `answerAggregate` (its download is one record
+whatever `k` is), but it cannot be inverted to the individual records, so
+retrieval keeps the `k` instances separate. See `SPEC.md`.
+
+Repeated indices are fine in retrieval (`.{7,7}` returns record 7 in both
+blocks); in the *aggregate* the same points add, to `2·record[7]`.
+
+> **`k` is public.** The share length is `k ×` the single-index length and the
+> answer is `k` blocks wide, so both reveal `k`. That is acceptable only
+> because `k` is compile-time protocol geometry, identical for every client —
+> never a per-query secret. A client wanting fewer than `k` records pads with
+> dummy indices; each index is hidden by its own instance, so padding hides the
+> *effective* count for free.
+
 ### Parameters
 
 | Parameter | Meaning |
@@ -88,6 +123,11 @@ try P.answerFromBytes(bytes, words_out);        // client parses (untrusted)
 try P.reconstructFromBytes(a0, a1, &record);    // parse + combine, no intermediate
 ```
 
+`Multi(k)` has the same shape (`shareToBytes`/`shareFromBytes`/
+`reconstructFromBytes`, the last taking `record_len` since an answer is `k`
+blocks); answers reuse the parent's `answerToBytes`/`answerFromBytes`
+unchanged, since those are length-generic.
+
 Framing them for an actual transport is the caller's job — this module has no
 sockets and no server loop (see `SPEC.md` §"Where the library stops").
 
@@ -105,8 +145,10 @@ one contiguous buffer.
 No verification. A malicious server can return any answer it likes and the
 client will reconstruct garbage without noticing — two-server PIR has no
 integrity mechanism, and nothing here pretends otherwise. No keyword lookup
-(indices only). No batching. No protection against a server that returns a
-*different database* than its peer.
+(indices only). No protection against a server that returns a *different
+database* than its peer. `Multi(k)` amortizes the database *pass* but still
+costs `k` DPF evaluations per record — sublinear batch PIR needs the
+cuckoo/batch-code multi-point construction, scoped out in `fss`.
 
 ## Verify
 
@@ -114,6 +156,7 @@ integrity mechanism, and nothing here pretends otherwise. No keyword lookup
 zig build test-pir                          # Debug
 zig build test-pir -Doptimize=ReleaseFast
 zig build test-pir -Doptimize=ReleaseSafe
+zig build test-pir --fuzz --release=safe    # the real fuzzer (NOT Debug — see SPEC.md)
 ```
 
 What the suite establishes, and what it does not, is set out in `SPEC.md`
