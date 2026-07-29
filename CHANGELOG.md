@@ -60,6 +60,37 @@ Per-module API changes since v0.1.0 worth calling out:
   and that error's meaning narrows to "key material was named but none of it
   could be reduced to a comparable key". Same-form matching, and every
   non-HoK path, are unchanged. New sibling dependency: `x509`.
+- **`dtls`:** **serving** a HelloRetryRequest — RFC 9147 §5.1's stateless
+  return-routability check, the other half of the exchange. Until now this
+  module's server answered a first ClientHello with a full flight, which
+  §5.1 names as an amplification vector: forge a victim's source address,
+  send a small ClientHello, and the server sprays a much larger flight at the
+  victim. New `Config.hello_retry` (`HelloRetryConfig`) turns the check on;
+  `null` (the default) keeps every existing caller byte-for-byte unchanged,
+  though it is **not** the posture §5.1 recommends for anything
+  internet-facing.
+  A cookie-less ClientHello now gets a HelloRetryRequest and the server keeps
+  **nothing** — no transcript, no state transition, no cached flight, and no
+  PSK-binder verification, so an unverified address costs one HMAC rather
+  than a flight or a key schedule. ClientHello2 is finished by a *brand-new*
+  `Connection` reconstructing everything from the cookie: RFC 8446 §4.4.1's
+  `message_hash` rewrite plus a byte-exact re-encoding of the server's own
+  HelloRetryRequest. The cookie is
+  `HMAC-SHA256(cookie_secret, label || peer_binding || version ||
+  cipher_suite || Hash(ClientHello1))`, checked with
+  `std.crypto.timing_safe.eql`; the new `error.CookieVerifyFailed` covers
+  every rejection cause without distinguishing them.
+  `HelloRetryConfig.peer_binding` is **caller-supplied** because the module
+  never touches a socket — the peer's address is an input, like
+  `Config.now_sec` and the `std.Random` arguments — and an empty one is
+  `error.EmptyPeerBinding` rather than a documented footgun, since a cookie
+  bound to nothing verifies from anywhere while still looking like a cookie.
+  Proven against a stock wolfSSL client, with the test structured so that
+  statelessness is what makes it pass. **Behavioral fix on the way through:**
+  the ServerHello no longer echoes the client's `legacy_session_id` — RFC
+  9147 §5 forbids it ("DTLS servers MUST NOT echo the 'legacy_session_id'
+  value from the client"; DTLS has no TLS 1.3 compatibility mode). No DTLS
+  1.3 peer is affected, since such a client sends a zero-length one.
 - **`dtls`:** HelloRetryRequest (RFC 8446 §4.1.4 / RFC 9147 §5.3), client
   side. A stock DTLS 1.3 server answers the first ClientHello with a cookie
   and refuses to proceed until it comes back — return-routability without
@@ -77,8 +108,8 @@ Per-module API changes since v0.1.0 worth calling out:
   asserts the retry actually happened rather than trusting the peer to send
   one. The rewrite is exactly the kind of thing only a live peer can check:
   replacing it with the naive "CH1 || HRR || CH2" leaves every self-interop
-  test green and fails only the live test. **Not** implemented: SERVING an
-  HRR — this module's server still does no return-routability check.
+  test green and fails only the live test. (Serving an HRR was still missing
+  at this point; the entry above closes that half.)
   `error.HelloRetryRequestUnsupported` narrows to the two cases that remain
   (an HRR in `.cert_dhe` mode, or one carrying nothing to change). New
   `Connection.sawHelloRetryRequest`.

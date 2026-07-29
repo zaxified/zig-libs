@@ -308,17 +308,45 @@ OpenSSL a similar number, so any real client was rejected as malformed. The
 list is now filtered against the schemes this module can actually select,
 which bounds the buffer by OUR list instead of the peer's.
 
+### Proven against wolfSSL: the HelloRetryRequest cookie exchange, both roles
+
+RFC 9147 §5.1's return-routability check runs in both directions against a
+real peer: our client against a default-configured wolfSSL server
+(`server-hrr` peer mode), and our server — with `Config.hello_retry` set —
+against a stock wolfSSL client. Both live tests assert the retry ACTUALLY
+happened (`Connection.sawHelloRetryRequest`), so neither can silently decay
+into a duplicate of the no-retry test if the exchange stops taking effect.
+
+Three mutations were run against the server side to check the tests have
+teeth:
+
+| mutation | caught by |
+|---|---|
+| `peer_binding` dropped from the cookie MAC | the cross-binding replay test + the cookie unit test — nothing else, and the handshake still completes |
+| RFC 8446 §4.4.1's `message_hash` rewrite skipped when rebuilding the transcript | self-interop AND the live test (wolfSSL: binder does not verify) |
+| `message_seq` not restored on the connection that handles ClientHello2 | **only** the live test — our own client ignores a ServerHello's `message_seq`, so every self-interop test stays green |
+
+The last one is the argument for the live oracle in one line: a defect that
+two `Connection`s written from the same reading of the RFC cannot see.
+
 ### Still not proven / not implemented
 
-- **Serving a HelloRetryRequest.** The CLIENT side is done and proven against
-  a default-configured wolfSSL server (`server-hrr` peer mode): cookie echoed,
-  ClientHello1's `random` reused per RFC 8446 §4.1.2, a second HRR refused per
-  §4.1.4, and RFC 8446 §4.4.1's `message_hash` transcript rewrite applied.
-  That rewrite is the part only a real peer can check — mutating it to the
-  naive "CH1 || HRR || CH2" keeps every self-interop test green and fails
-  only the live test, with wolfSSL reporting "binder does not verify".
-  This module's SERVER still never sends an HRR, so it performs no
-  return-routability check on the first datagram.
+- **A cookie-rotation overlap window.** RFC 9147 §5.1 RECOMMENDS a server be
+  able to accept the previous `cookie_secret` for a period, so clients
+  handshaking across a rotation are not dropped. `HelloRetryConfig` takes one
+  secret; a caller wanting the overlap must retry ClientHello2 under a second
+  `Connection` configured with the older secret. Workable, but it is caller
+  policy rather than something the module does.
+- **A server-side cookie expiry.** Deliberate, not missing: RFC 9147 §5.1
+  offers timestamps as an ALTERNATIVE to secret rotation, and rotation is
+  what the API exposes. A clock would also be the first one this module
+  reads.
+- **The HelloRetryRequest key_share path.** Neither role updates a
+  `key_share` in response to a retry, so `.cert_dhe` cannot do the exchange
+  in either direction (`error.HelloRetryRequestUnsupported` on the client;
+  a `.cert_dhe` server with `hello_retry` set would emit a cookie-only retry
+  its own client could not answer). The PSK path — the one this module's
+  live oracle exercises — is unaffected.
 - **Cross-`handleFlight` fragment reassembly** — a handshake message split
   across datagrams is rejected. wolfSSL did not split any flight at these
   sizes, so this path is still untested against a real peer.

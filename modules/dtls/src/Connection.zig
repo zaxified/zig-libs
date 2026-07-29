@@ -26,10 +26,17 @@
 //! Proven end-to-end by a real in-memory client↔server interop test (see
 //! this file's tests) — no external DTLS peer required.
 //!
+//! **HelloRetryRequest / the stateless-cookie exchange** (RFC 9147 §5.1,
+//! RFC 8446 §4.1.4/§4.2.2) is implemented in BOTH roles: a client always
+//! answers one (`handleHelloRetryRequest`), and a server performs the
+//! return-routability check when `Config.hello_retry` is set
+//! (`sendHelloRetryRequest`/`acceptCookie`) — off by default, so existing
+//! callers are unchanged, but the RFC's recommended posture for anything
+//! internet-facing. Both directions are proven against wolfSSL.
+//!
 //! **Deliberately out of scope** (see `startHandshake`'s doc comment and
-//! `root.zig` for the full list): HelloRetryRequest/cookie retry, 0-RTT,
-//! session resumption, key update, and (inherited from `aead.zig`) the CCM
-//! suites.
+//! `root.zig` for the full list): 0-RTT, session resumption, key update,
+//! and (inherited from `aead.zig`) the CCM suites.
 
 const std = @import("std");
 const messages = @import("messages.zig");
@@ -79,6 +86,65 @@ pub const ConfigError = error{
     EmptyPsk,
     EmptyPskIdentity,
     NoCipherSuites,
+    /// `Config.hello_retry` was set with an empty `cookie_secret`: the
+    /// cookie's MAC would be keyed by nothing, so anyone could mint one.
+    EmptyCookieSecret,
+    /// `Config.hello_retry` was set with an empty `peer_binding`. A cookie
+    /// bound to nothing is not a return-routability check — it verifies
+    /// identically no matter which address replays it, which is exactly the
+    /// property the exchange exists to deny. Rejected rather than
+    /// documented, because the resulting server would look like it was doing
+    /// the check.
+    EmptyPeerBinding,
+};
+
+/// Server-side HelloRetryRequest / stateless-cookie configuration — RFC 9147
+/// §5.1's return-routability check (the mechanism is RFC 8446 §4.1.4's
+/// HelloRetryRequest carrying a §4.2.2 `cookie`; RFC 9147 §5.3 is the
+/// ClientHello *format*, a different section).
+///
+/// **Why it exists.** A server that answers a first ClientHello with a full
+/// flight is an amplification weapon: RFC 9147 §5.1 names exactly this — an
+/// attacker forges a victim's source address, sends a small ClientHello, and
+/// the server sprays a much larger flight (a Certificate message, say) at the
+/// victim. The cookie exchange forces the peer to prove it can RECEIVE at
+/// the address it claims before the server spends a flight, a keyschedule, or
+/// a signature on it.
+///
+/// **Why the caller supplies `peer_binding`.** The cookie has to be bound to
+/// the client's transport address or it proves nothing — a cookie any client
+/// can replay from any address is not a return-routability check. But this
+/// module never touches a socket: the caller owns the datagram I/O, so the
+/// module cannot see the peer's address, in the same way it cannot read a
+/// clock (`Config.now_sec`) or draw randomness (`std.Random` arguments). The
+/// binding is therefore an input, not something discovered. This is the only
+/// honest shape: an API that promised address binding while being unable to
+/// observe an address would be lying.
+pub const HelloRetryConfig = struct {
+    /// Secret keying the cookie's HMAC. Server-side only; it never appears
+    /// on the wire in any form and must never leave the process.
+    ///
+    /// RFC 9147 §5.1: rotating this is the ONLY thing that invalidates
+    /// outstanding cookies (the design deliberately keeps no per-cookie
+    /// state), so a server that wants a bounded cookie lifetime rotates it
+    /// on that period. §5.1 recommends accepting the previous secret for an
+    /// overlap window; that is a caller-side policy here — a caller can run
+    /// the second `Connection` under the older secret if the first rejects.
+    cookie_secret: []const u8,
+    /// Caller-supplied bytes identifying the peer this datagram arrived
+    /// from — typically its packed IP address and port. The cookie's MAC
+    /// covers these, so a cookie minted for one peer does not verify for
+    /// another (RFC 9147 §5.1: "If the client's apparent IP address is
+    /// embedded in the cookie, this prevents an attacker from generating an
+    /// acceptable ClientHello apparently from another user").
+    ///
+    /// It is opaque to this module — any stable encoding works, as long as
+    /// the SAME peer yields the same bytes across the two ClientHellos and
+    /// a DIFFERENT peer cannot yield them. Including the port is what makes
+    /// it a check on a specific socket rather than a whole host.
+    ///
+    /// Must be non-empty (`error.EmptyPeerBinding`).
+    peer_binding: []const u8,
 };
 
 /// This side's certificate identity for certificate-mode authentication
@@ -192,6 +258,24 @@ pub const Config = struct {
     /// `PeerVerify.none`/`.verify_fn` or PSK-only connections.
     now_sec: i64 = 0,
 
+    /// Server only: perform RFC 9147 §5.1's return-routability check before
+    /// spending a flight on a peer — answer a cookie-less ClientHello with a
+    /// HelloRetryRequest and refuse to proceed until the cookie comes back
+    /// from the same `peer_binding`. See `HelloRetryConfig`.
+    ///
+    /// `null` (the default) is the historical behaviour: no check, and every
+    /// existing caller is unaffected. That default is deliberately the
+    /// PERMISSIVE one for source compatibility, and it is the wrong posture
+    /// for a server reachable from the open internet — RFC 9147 §5.1: "DTLS
+    /// servers SHOULD perform a cookie exchange whenever a new handshake is
+    /// being performed. ... The default SHOULD be that the exchange is
+    /// performed". Turning it on costs one extra round trip.
+    ///
+    /// Ignored on a client (a client's cookie handling is not configurable —
+    /// RFC 9147 §5.1: "Clients MUST be prepared to do a cookie exchange with
+    /// every handshake", so it is always on).
+    hello_retry: ?HelloRetryConfig = null,
+
     /// Real, non-crypto validation — catches obviously-broken configs
     /// before anything touches a keyschedule stub. PSK fields stay
     /// mandatory even in certificate mode (see the "certificate mode: what
@@ -199,6 +283,15 @@ pub const Config = struct {
     /// empty `psk` is still rejected.
     pub fn validate(self: Config) ConfigError!void {
         if (self.cipher_suites.len == 0) return error.NoCipherSuites;
+        if (self.hello_retry) |hr| {
+            // Both are security-load-bearing, and a zero-length value for
+            // either yields a cookie that still LOOKS like a cookie: without
+            // a secret anyone can mint one, without a binding anyone can
+            // replay one. Neither can be caught later — a cookie minted this
+            // way verifies perfectly.
+            if (hr.cookie_secret.len == 0) return error.EmptyCookieSecret;
+            if (hr.peer_binding.len == 0) return error.EmptyPeerBinding;
+        }
         switch (self.key_exchange) {
             .psk => {
                 if (self.psk.len == 0) return error.EmptyPsk;
@@ -232,9 +325,10 @@ pub const application_epoch: u16 = 3;
 
 /// Cap on a HelloRetryRequest cookie this client will echo. RFC 8446 §4.2.2
 /// sets no limit beyond the 2-byte length field; a real server's cookie is a
-/// keyed hash plus context (wolfSSL's is well under 128 bytes). The cap keeps
-/// ClientHello2 inside the same fixed body buffer as ClientHello1 rather than
-/// letting the peer choose our stack usage.
+/// keyed hash plus context (wolfSSL's is well under 128 bytes, and this
+/// module's own — `cookie_len` below — is 67). The cap keeps ClientHello2
+/// inside the same fixed body buffer as ClientHello1 rather than letting the
+/// peer choose our stack usage.
 const max_cookie_len = 128;
 
 /// The handshake-traffic epoch (RFC 9147 §6.1): everything after ServerHello
@@ -278,6 +372,19 @@ pub const HandshakeError = messages.MessageError || handshake.FrameError || hand
     ///     8446 §4.1.4 forbids sending in the first place. Answering it with
     ///     a byte-identical ClientHello would be a retry loop.
     HelloRetryRequestUnsupported,
+    /// RFC 9147 §5.1: a ClientHello arrived carrying a `cookie` extension
+    /// that does not authenticate under this server's `Config.hello_retry`
+    /// — a forged or tampered cookie, one minted for a DIFFERENT
+    /// `peer_binding` (the return-routability check doing its job), or one
+    /// minted under a `cookie_secret` that has since been rotated. §5.1
+    /// requires the handshake be terminated ("illegal_parameter"); this
+    /// module reports typed errors rather than sending alerts, so the
+    /// caller decides.
+    ///
+    /// Deliberately ONE error for every cause, including a structurally
+    /// wrong-sized cookie: distinguishing them would tell a prober which
+    /// half of its guess was right.
+    CookieVerifyFailed,
     /// A decoded handshake message had the wrong `msg_type`/content type
     /// for the state the connection is in.
     UnexpectedMessage,
@@ -514,6 +621,173 @@ const advertised_groups = [_]u16{
     x25519_group,
     @intFromEnum(messages.NamedGroup.secp256r1),
 };
+
+// ── RFC 9147 §5.1 stateless HelloRetryRequest cookie ─────────────────────
+//
+// The whole point of the exchange is that the server keeps NOTHING between
+// the two ClientHellos. RFC 9147 §5.1 says what that costs: "a stateless
+// server-cookie implementation requires the content or hash of the initial
+// ClientHello (and HelloRetryRequest) to be stored in the cookie", and RFC
+// 8446 §4.2.2 the same — "offload state to the client ... by storing the
+// hash of the ClientHello in the HelloRetryRequest cookie (protected with
+// some suitable integrity protection algorithm)".
+//
+// So the cookie IS the server's state, handed to a party that must not be
+// able to forge or alter it. Its layout:
+//
+//     version(1) || cipher_suite(2) || Hash(ClientHello1)(32) || mac(32)
+//
+// and the MAC covers the caller's `peer_binding` as well as those bytes:
+//
+//     mac = HMAC-SHA256(cookie_secret,
+//                       label || u16(binding.len) || binding || plaintext)
+//
+// Every field is there because something breaks without it:
+//
+//   * `Hash(ClientHello1)` — RFC 8446 §4.4.1's `message_hash` rewrite means
+//     this hash is ALL that is needed to rebuild the transcript, which is
+//     what makes statelessness possible at all (see
+//     `engine.Transcript.resetToMessageHash`).
+//   * `cipher_suite` — RFC 8446 §4.1.4 requires the ServerHello to select
+//     the same suite the HelloRetryRequest named, and the HRR's bytes are
+//     part of the transcript, so the server must reproduce them exactly.
+//     Carrying the suite means the reconstruction is AUTHENTICATED rather
+//     than re-derived from a ClientHello2 the peer controls.
+//   * `peer_binding` — the return-routability check itself. Without it a
+//     cookie minted for one address verifies from any address, which is
+//     precisely the forged-source-address case §5.1 exists to stop. It is
+//     MAC'd rather than stored: the server already knows the address of
+//     whoever is talking to it now, and echoing it back would only add
+//     bytes an attacker can read.
+//   * `version` — lets the format change without a valid old cookie being
+//     reinterpreted as a new one.
+//   * the label and the length prefix — domain separation, and no way to
+//     shift bytes between the binding and the fields that follow it.
+//
+// There is deliberately NO timestamp/expiry field. RFC 9147 §5.1 offers it
+// as an alternative to secret rotation, not in addition, and rotation is
+// what this API exposes (`HelloRetryConfig.cookie_secret`). The threat an
+// expiry would answer is a captured cookie replayed later — but a replay
+// only verifies from the same `peer_binding`, and a party at that address
+// passes the return-routability check on its own merits anyway. Adding a
+// clock would also mean this module reading one, which it does not do
+// anywhere (see `Config.now_sec`).
+
+const cookie_version: u8 = 1;
+/// `version || cipher_suite || Hash(ClientHello1)` — everything the MAC
+/// authenticates that also travels on the wire.
+const cookie_plaintext_len = 1 + 2 + 32;
+const cookie_mac_len = 32;
+const cookie_len = cookie_plaintext_len + cookie_mac_len;
+
+/// Domain separation for the cookie MAC: this key is used for nothing else
+/// today, but a caller reusing a secret across purposes should not get a
+/// collision for free.
+const cookie_mac_label = "dtls 1.3 hello retry cookie v1";
+
+const CookieContents = struct {
+    suite: CipherSuite,
+    client_hello1_hash: [32]u8,
+};
+
+/// The cookie MAC over `plaintext` (the wire-visible prefix) bound to
+/// `peer_binding`. Same function for minting and for checking — there is
+/// exactly one definition of what a valid cookie is.
+fn cookieMac(hr: HelloRetryConfig, plaintext: []const u8) [cookie_mac_len]u8 {
+    const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
+    var h = Hmac.init(hr.cookie_secret);
+    h.update(cookie_mac_label);
+    // Length-prefixed so no split between `peer_binding` and what follows it
+    // can be shifted: "1.2.3.4:8" + "0…" must not hash like "1.2.3.4:80" + "…".
+    // u64, not u16: the binding is caller-supplied and a length that
+    // SATURATED would silently reintroduce the ambiguity the prefix exists
+    // to remove.
+    var binding_len: [8]u8 = undefined;
+    std.mem.writeInt(u64, &binding_len, hr.peer_binding.len, .big);
+    h.update(&binding_len);
+    h.update(hr.peer_binding);
+    h.update(plaintext);
+    var mac: [cookie_mac_len]u8 = undefined;
+    h.final(&mac);
+    return mac;
+}
+
+/// Mints the cookie for a HelloRetryRequest. Deterministic in its inputs,
+/// which is what lets a stateless server answer a RETRANSMITTED first
+/// ClientHello with a byte-identical HelloRetryRequest instead of having to
+/// remember it had already sent one.
+fn mintCookie(hr: HelloRetryConfig, c: CookieContents, out: *[cookie_len]u8) void {
+    out[0] = cookie_version;
+    std.mem.writeInt(u16, out[1..3], @intFromEnum(c.suite), .big);
+    @memcpy(out[3..35], &c.client_hello1_hash);
+    const mac = cookieMac(hr, out[0..cookie_plaintext_len]);
+    @memcpy(out[cookie_plaintext_len..], &mac);
+}
+
+/// Authenticates `cookie` and returns what it carries, or
+/// `error.CookieVerifyFailed`. The comparison is `std.crypto.timing_safe
+/// .eql`, like every other MAC/verify_data comparison in this file — a
+/// byte-at-a-time compare here would let an attacker at the right address
+/// walk a forged MAC out one byte at a time, and the cookie is the one
+/// thing in the handshake an unauthenticated peer can make the server check
+/// repeatedly for free.
+fn openCookie(hr: HelloRetryConfig, cookie: []const u8) error{CookieVerifyFailed}!CookieContents {
+    if (cookie.len != cookie_len) return error.CookieVerifyFailed;
+    if (cookie[0] != cookie_version) return error.CookieVerifyFailed;
+    const expected = cookieMac(hr, cookie[0..cookie_plaintext_len]);
+    if (!std.crypto.timing_safe.eql([cookie_mac_len]u8, expected, cookie[cookie_plaintext_len..][0..cookie_mac_len].*))
+        return error.CookieVerifyFailed;
+    // Only AFTER the MAC: a suite value that never came from this server is
+    // not worth decoding, and `cipherSuiteFromU16` returning null for a
+    // MAC-valid cookie would mean our own `cookie_secret` was compromised.
+    const suite = cipherSuiteFromU16(std.mem.readInt(u16, cookie[1..3], .big)) orelse return error.CookieVerifyFailed;
+    return .{ .suite = suite, .client_hello1_hash = cookie[3..35].* };
+}
+
+/// Encodes the HelloRetryRequest body this server sends, and — bit for bit —
+/// re-encodes it when ClientHello2 comes back. Both call sites go through
+/// here BECAUSE it must be byte-identical: the HRR is in the transcript, so
+/// a reconstruction that differs anywhere makes every downstream secret
+/// disagree with the client's.
+///
+/// That is only sound because every input is either a constant or comes from
+/// the authenticated cookie:
+///
+///   * `random` — RFC 8446 §4.1.3's fixed HelloRetryRequest sentinel;
+///   * `legacy_session_id_echo` — always empty. RFC 9147 §5: "DTLS servers
+///     MUST NOT echo the 'legacy_session_id' value from the client" (DTLS
+///     does not use TLS 1.3's compatibility mode), so this is a constant
+///     here where in TLS it would be peer-controlled;
+///   * `cipher_suite` — from the cookie;
+///   * `supported_versions` — RFC 8446 §4.1.4 requires it, and it is the
+///     only place DTLS 1.3 is named (every wire version field says 1.2);
+///   * `cookie` — the bytes themselves, echoed back by the client.
+///
+/// RFC 8446 §4.1.4 also forbids a HelloRetryRequest carrying extensions the
+/// client did not offer, `cookie` excepted — `supported_versions` is always
+/// in a DTLS 1.3 ClientHello, so this pair is legal for any peer that got
+/// this far.
+fn encodeHelloRetryRequest(suite: CipherSuite, cookie: []const u8, body_buf: []u8) HandshakeError![]u8 {
+    var versions_buf: [2]u8 = undefined;
+    const versions = try messages.encodeSupportedVersionsServerHello(messages.version_dtls13, &versions_buf);
+    var cookie_ext_buf: [2 + max_cookie_len]u8 = undefined;
+    if (cookie.len > max_cookie_len) return error.BufferTooShort;
+    const cookie_ext = messages.encodeCookieExtension(cookie, &cookie_ext_buf) catch return error.BufferTooShort;
+    const exts = [_]messages.Extension{
+        .{ .ext_type = @intFromEnum(messages.ExtensionType.supported_versions), .data = versions },
+        .{ .ext_type = @intFromEnum(messages.ExtensionType.cookie), .data = cookie_ext },
+    };
+    return messages.encodeServerHello(.{
+        .random = messages.hello_retry_request_random,
+        .legacy_session_id_echo = &.{},
+        .cipher_suite = @intFromEnum(suite),
+        .extensions = &exts,
+    }, body_buf) catch return error.BufferTooShort;
+}
+
+/// Sized for `encodeHelloRetryRequest`'s output: a ServerHello head plus two
+/// small extensions, the larger of which is the cookie.
+const max_hrr_body_len = 128 + max_cookie_len;
 
 pub const Connection = struct {
     role: Role,
@@ -855,10 +1129,18 @@ pub const Connection = struct {
         return out[0 .. end - 1];
     }
 
-    /// Whether this connection answered a HelloRetryRequest during its
-    /// handshake (RFC 8446 §4.1.4). Exposed because "did the retry path
-    /// actually run" is not otherwise observable from outside, and a test
-    /// that cannot tell is a test that silently stops covering it.
+    /// Whether a HelloRetryRequest was part of this connection's handshake
+    /// (RFC 8446 §4.1.4 / RFC 9147 §5.1) — a client that ANSWERED one, or a
+    /// server that either SENT one or accepted the cookie that came back.
+    /// Exposed because "did the retry path actually run" is not otherwise
+    /// observable from outside, and a test that cannot tell is a test that
+    /// silently stops covering it: without this, a live-interop test whose
+    /// peer quietly stopped doing the exchange would keep passing as a
+    /// duplicate of the non-retry test.
+    ///
+    /// Note this is per-`Connection`, and a stateless server uses a fresh
+    /// `Connection` per datagram — so on the server it reports what THIS
+    /// object did, not what the handshake as a whole did.
     pub fn sawHelloRetryRequest(self: Connection) bool {
         return self.saw_hello_retry_request;
     }
@@ -1558,6 +1840,116 @@ pub const Connection = struct {
         };
     }
 
+    /// RFC 9147 §5.1, server side: a ClientHello arrived from a peer that
+    /// has not yet proved it can RECEIVE at the address it claims, so
+    /// instead of a flight it gets a HelloRetryRequest carrying a cookie.
+    ///
+    /// **What this function deliberately does NOT do** is the whole point.
+    /// It does not verify the PSK binder, does not run the key schedule,
+    /// does not touch `self.transcript`, does not advance `self.state`, and
+    /// does not cache the flight for retransmission. An unauthenticated peer
+    /// — possibly a forged source address — costs this server one HMAC and
+    /// one small datagram. RFC 9147 §5.1's second attack is the server as
+    /// amplifier; answering here with anything larger than what arrived is
+    /// the vulnerability, not the fix.
+    ///
+    /// It also stores nothing, so a caller may (and a real server should)
+    /// destroy this `Connection` the moment the bytes are sent. Because the
+    /// cookie is a deterministic function of its inputs, a RETRANSMITTED
+    /// first ClientHello produces a byte-identical HelloRetryRequest from a
+    /// brand-new `Connection` — no memory of the first one is needed.
+    ///
+    /// The one thing it must decide up front is the cipher suite: RFC 8446
+    /// §4.1.4 puts it in the HelloRetryRequest and requires the eventual
+    /// ServerHello to match, so it goes into the cookie.
+    fn sendHelloRetryRequest(
+        self: *Connection,
+        hr: HelloRetryConfig,
+        dec: messages.DecodedClientHello,
+        ch_body: []const u8,
+        out: []u8,
+    ) HandshakeError!HandshakeResult {
+        const suite = selectCipherSuite(self.config.cipher_suites, dec.cipher_suites_raw) orelse return error.NoCipherSuiteOverlap;
+
+        // `Hash(ClientHello1)` — RFC 8446 §4.4.1's `message_hash` input.
+        // Computed on a THROWAWAY transcript: `self.transcript` must stay
+        // untouched, both because this connection is about to be discarded
+        // and because the transcript ClientHello2 will be measured against
+        // does not contain ClientHello1 at all (it contains the synthetic
+        // `message_hash` message instead).
+        var scratch = engine.Transcript{};
+        scratch.append(@intFromEnum(messages.HandshakeType.client_hello), ch_body);
+        var cookie: [cookie_len]u8 = undefined;
+        mintCookie(hr, .{ .suite = suite, .client_hello1_hash = scratch.currentHash() }, &cookie);
+
+        var hrr_body_buf: [max_hrr_body_len]u8 = undefined;
+        const hrr_body = try encodeHelloRetryRequest(suite, &cookie, &hrr_body_buf);
+
+        // RFC 9147 §5.2 `message_seq` 0: the HelloRetryRequest is the first
+        // handshake message this server sends, and `acceptCookie` restores
+        // exactly this numbering on the (stateless, brand-new) connection
+        // that handles ClientHello2.
+        var frag_buf: [max_hrr_body_len + handshake.header_len]u8 = undefined;
+        const fragment = try frameHandshakeMessage(@intFromEnum(messages.HandshakeType.server_hello), 0, hrr_body, &frag_buf);
+        const record_bytes = try self.writeEpoch0Record(fragment, out);
+
+        // The one thing recorded, and only so a caller (and a test) can SEE
+        // that the retry path ran. Nothing in this engine reads it on the
+        // server side, so it is not state the handshake depends on — which
+        // matters, because this object is meant to be thrown away.
+        self.saw_hello_retry_request = true;
+        return .{ .out = record_bytes, .done = false };
+    }
+
+    /// RFC 9147 §5.1, the other half: ClientHello2 came back carrying a
+    /// cookie. Authenticate it — this is the return-routability check
+    /// completing, and the only moment at which this server learns the peer
+    /// can receive at its claimed address — then rebuild the state that was
+    /// deliberately never kept.
+    ///
+    /// "Rebuild" is the whole trick, and RFC 8446 §4.4.1's `message_hash`
+    /// rewrite is what makes it possible (RFC 9147 §5.1 spells out the
+    /// consequence: "The initial ClientHello is included in the handshake
+    /// transcript as a synthetic 'message_hash' message, so only the hash
+    /// value is needed for the handshake to complete, though the complete
+    /// HelloRetryRequest contents are needed"). Hence the transcript here is
+    ///
+    ///     message_hash(Hash(ClientHello1)) || HelloRetryRequest
+    ///
+    /// with ClientHello2 appended by the caller afterwards — the hash out of
+    /// the cookie, and the HelloRetryRequest re-encoded from the cookie by
+    /// `encodeHelloRetryRequest`. Get either wrong and the transcript
+    /// silently diverges from the client's: the binder, then every derived
+    /// secret, verifies against nothing.
+    ///
+    /// Returns the cipher suite this server already committed to in the
+    /// HelloRetryRequest.
+    fn acceptCookie(self: *Connection, hr: HelloRetryConfig, cookie: []const u8) HandshakeError!CipherSuite {
+        const contents = try openCookie(hr, cookie);
+
+        self.transcript.resetToMessageHash(contents.client_hello1_hash);
+        var hrr_body_buf: [max_hrr_body_len]u8 = undefined;
+        const hrr_body = try encodeHelloRetryRequest(contents.suite, cookie, &hrr_body_buf);
+        self.transcript.append(@intFromEnum(messages.HandshakeType.server_hello), hrr_body);
+
+        // The HelloRetryRequest occupied `message_seq` 0 and one epoch-0
+        // record, and this connection — being brand new, which is the point
+        // — has no memory of that. Restore the counters the peer has already
+        // seen, or the ServerHello arrives numbered as if it were the first
+        // thing this server ever sent.
+        //
+        // Note what a stateless server cannot do: if the first ClientHello
+        // is retransmitted, each copy is answered by a fresh connection and
+        // so re-uses epoch-0 record sequence number 0. That is inherent to
+        // RFC 9147 §5.1 (there is nowhere to count), and harmless — the
+        // records are pre-epoch-2, unprotected, and carry no anti-replay
+        // guarantee to violate.
+        self.message_seq = 1;
+        self.hs0.send_seq = 1;
+        self.saw_hello_retry_request = true;
+        return contents.suite;
+    }
+
     /// Server flight 1 (RFC 9147 §5.4): consumes a ClientHello (verifying
     /// its PSK binder), selects a cipher suite, and sends flight 2 —
     /// ServerHello (epoch 0) coalesced with {EncryptedExtensions, Finished}
@@ -1576,8 +1968,30 @@ pub const Connection = struct {
         if (parsed.msg_type != @intFromEnum(messages.HandshakeType.client_hello)) return error.UnexpectedMessage;
         const ch_body = parsed.body;
 
-        var ext_buf: [8]messages.Extension = undefined;
+        // 16, not 8: a real ClientHello is extension-rich (wolfSSL's carries
+        // several this module ignores) and ClientHello2 adds `cookie` on top,
+        // and `decodeExtensions` reports an overflow as
+        // `error.TooManyExtensions` — i.e. a perfectly ordinary retry would
+        // fail to parse.
+        var ext_buf: [16]messages.Extension = undefined;
         const dec = messages.decodeClientHello(ch_body, &ext_buf) catch return error.Malformed;
+
+        // ── RFC 9147 §5.1 return-routability, when configured. Either this
+        // ClientHello carries a cookie we minted (verify it, and rebuild the
+        // transcript it implies) or it does not (answer with a
+        // HelloRetryRequest and keep nothing). Placed HERE, before the key
+        // exchange and the binder check, deliberately: the whole point is
+        // that an unverified peer costs this server one HMAC, not a
+        // keyschedule, a signature, or a flight.
+        const retry_suite: ?CipherSuite = if (self.config.hello_retry) |hr| blk: {
+            var cookie: ?[]const u8 = null;
+            for (dec.extensions) |e| {
+                if (e.ext_type == @intFromEnum(messages.ExtensionType.cookie))
+                    cookie = messages.decodeCookieExtension(e.data) catch return error.CookieVerifyFailed;
+            }
+            const c = cookie orelse return self.sendHelloRetryRequest(hr, dec, ch_body, out);
+            break :blk try self.acceptCookie(hr, c);
+        } else null;
 
         // The ClientHello's own `signature_algorithms` (RFC 8446 §4.2.3) —
         // what schemes the CLIENT can verify — captured here (while `dec
@@ -1673,18 +2087,17 @@ pub const Connection = struct {
             },
         }
 
-        var selected: ?CipherSuite = null;
-        for (self.config.cipher_suites) |want| {
-            var it = messages.CipherSuiteIter{ .raw = dec.cipher_suites_raw };
-            while (it.next()) |offered_cs| {
-                if (offered_cs == @intFromEnum(want) and suiteParams(want) != null) {
-                    selected = want;
-                    break;
-                }
-            }
-            if (selected != null) break;
+        const suite = selectCipherSuite(self.config.cipher_suites, dec.cipher_suites_raw) orelse return error.NoCipherSuiteOverlap;
+        // RFC 8446 §4.1.4: "Servers MUST ensure that they negotiate the same
+        // cipher suite when receiving a conformant updated ClientHello", and
+        // a client MUST abort if the ServerHello's suite differs from the
+        // HelloRetryRequest's. The suite in the cookie is the one this server
+        // already committed to, and it is authenticated; re-selecting from
+        // ClientHello2 and finding something else means the peer changed its
+        // offer between the two hellos, which §4.1.2 does not permit.
+        if (retry_suite) |committed| {
+            if (suite != committed) return error.NoCipherSuiteOverlap;
         }
-        const suite = selected orelse return error.NoCipherSuiteOverlap;
 
         // ClientHello accepted (PSK binder verified, or cert-DHE key_share
         // extracted): commit it to the transcript.
@@ -1719,9 +2132,20 @@ pub const Connection = struct {
             sh_ext,
         };
         var sh_body_buf: [128]u8 = undefined;
+        // RFC 9147 §5: "DTLS implementations do not use the TLS 1.3
+        // 'compatibility mode' ... DTLS servers MUST NOT echo the
+        // 'legacy_session_id' value from the client". This used to echo
+        // `dec.legacy_session_id`, which is the TLS rule, not the DTLS one.
+        // No peer this module has met is affected (a DTLS 1.3 client sends a
+        // zero-length `legacy_session_id` — RFC 9147 §5.3 — so the bytes are
+        // unchanged), but a client with a cached pre-1.3 session ID would
+        // have seen it echoed back. It also has to be a constant for the
+        // HelloRetryRequest path to work at all: `encodeHelloRetryRequest`
+        // re-encodes the HRR from the cookie alone, and a peer-controlled
+        // field is not in the cookie.
         const sh_body = messages.encodeServerHello(.{
             .random = random_bytes,
-            .legacy_session_id_echo = dec.legacy_session_id,
+            .legacy_session_id_echo = &.{},
             .cipher_suite = @intFromEnum(suite),
             .extensions = &sh_exts,
         }, &sh_body_buf) catch return error.BufferTooShort;
@@ -2308,6 +2732,22 @@ fn replayCheckAndUpdate(seen_any: *bool, high: *u48, window: *u64, seq: u48) boo
 }
 
 // ── handshake flight engine: free (Connection-agnostic) helpers ─────────
+
+/// Server-side cipher-suite negotiation: the first of OUR preferences (most
+/// preferred first) the peer also offered and this module can actually
+/// protect records with. Factored out of `serverProcessClientHello` because
+/// RFC 8446 §4.1.4 requires the HelloRetryRequest and the eventual
+/// ServerHello to select the same suite, and the surest way to guarantee
+/// that is for both to run the same code over the same inputs.
+fn selectCipherSuite(ours: []const CipherSuite, offered_raw: []const u8) ?CipherSuite {
+    for (ours) |want| {
+        var it = messages.CipherSuiteIter{ .raw = offered_raw };
+        while (it.next()) |offered| {
+            if (offered == @intFromEnum(want) and suiteParams(want) != null) return want;
+        }
+    }
+    return null;
+}
 
 /// Safe wire-integer -> `CipherSuite` conversion. `CipherSuite` is an
 /// EXHAUSTIVE enum (no `_` catch-all arm), so `@enumFromInt` on a
@@ -2943,6 +3383,440 @@ fn hrrDatagram(exts: []const messages.Extension) !HrrDatagram {
     @memcpy(result.bytes[hdr_slice.len..][0..fragment.len], fragment);
     result.len = hdr_slice.len + fragment.len;
     return result;
+}
+
+// ── SERVING a HelloRetryRequest: RFC 9147 §5.1 return routability ────────
+//
+// A server that answers a first ClientHello with a full flight is an
+// amplification weapon (§5.1's second attack): forge a victim's source
+// address, send a small ClientHello, and the server sprays a larger flight
+// at the victim. These tests are about the mitigation actually mitigating —
+// which means most of them are about what the server REFUSES.
+
+const hrr_psk_identity = "device-behind-a-forgeable-address";
+const hrr_psk = "a-shared-pre-shared-key";
+const hrr_cookie_secret = "server-side cookie MAC key, never on the wire";
+
+fn hrrServerConfig(peer_binding: []const u8) Config {
+    return .{
+        .role = .server,
+        .psk_identity = hrr_psk_identity,
+        .psk = hrr_psk,
+        .cipher_suites = &.{.aes_128_gcm_sha256},
+        .hello_retry = .{ .cookie_secret = hrr_cookie_secret, .peer_binding = peer_binding },
+    };
+}
+
+fn hrrClientConfig(psk: []const u8) Config {
+    return .{
+        .role = .client,
+        .psk_identity = hrr_psk_identity,
+        .psk = psk,
+        .cipher_suites = &.{.aes_128_gcm_sha256},
+    };
+}
+
+/// Asserts `datagram` really is a HelloRetryRequest carrying a cookie, and
+/// returns the cookie. Without this a "the retry happened" test degrades
+/// into a second copy of the no-retry test the moment the config stops
+/// taking effect — the flight would still be well-formed and the handshake
+/// would still complete, just without the check that is the entire point.
+fn expectHelloRetryRequest(datagram: []const u8) ![]const u8 {
+    const rec = try record.decodePlaintext(datagram);
+    try testing.expectEqual(content_type_handshake, rec.content_type);
+    const fragment = datagram[record.plaintext_header_len..][0..rec.length];
+
+    var msg_buf: [512]u8 = undefined;
+    var received_buf: [512]bool = undefined;
+    const parsed = try reassembleFragment(fragment, &msg_buf, &received_buf);
+    try testing.expectEqual(@intFromEnum(messages.HandshakeType.server_hello), parsed.msg_type);
+
+    var ext_buf: [8]messages.Extension = undefined;
+    const sh = try messages.decodeServerHello(parsed.body, &ext_buf);
+    // RFC 8446 §4.1.3: a HelloRetryRequest IS a ServerHello, distinguished
+    // only by this magic `random`.
+    try testing.expect(messages.isHelloRetryRequest(sh.random));
+    // RFC 9147 §5: DTLS servers MUST NOT echo `legacy_session_id`.
+    try testing.expectEqual(@as(usize, 0), sh.legacy_session_id_echo.len);
+
+    var saw_supported_versions = false;
+    var cookie: ?[]const u8 = null;
+    for (sh.extensions) |e| switch (e.ext_type) {
+        // RFC 8446 §4.1.4: "The server's extensions MUST contain
+        // 'supported_versions'" — and in DTLS it is the ONLY place the
+        // negotiated version appears.
+        @intFromEnum(messages.ExtensionType.supported_versions) => saw_supported_versions = true,
+        @intFromEnum(messages.ExtensionType.cookie) => cookie = try messages.decodeCookieExtension(e.data),
+        else => return error.UnexpectedHelloRetryRequestExtension,
+    };
+    try testing.expect(saw_supported_versions);
+    // `datagram` is a caller buffer that outlives `msg_buf`, so hand back a
+    // slice OF IT rather than of the local copy.
+    const c = cookie orelse return error.HelloRetryRequestHasNoCookie;
+    try testing.expectEqual(@as(usize, cookie_len), c.len);
+    const tail = datagram[datagram.len - cookie_len ..];
+    try testing.expectEqualSlices(u8, c, tail);
+    return tail;
+}
+
+test "HRR server: the cookie exchange completes — and the connection that answers ClientHello2 shares NOTHING with the one that sent the retry" {
+    const binding = "203.0.113.9:51000";
+    var client = try Connection.clientInit(hrrClientConfig(hrr_psk));
+    defer client.deinit();
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x71} ** 32);
+    const rnd = testRandom(&csprng);
+    var buf1: [1500]u8 = undefined;
+    var buf2: [1500]u8 = undefined;
+
+    const ch1 = try client.startHandshake(rnd, 0, &buf1);
+    const ch1_len = ch1.len;
+
+    // Connection #1 exists only to answer ClientHello1 and be thrown away.
+    var server1 = try Connection.serverInit(hrrServerConfig(binding));
+    const hrr = try server1.handleFlight(ch1, rnd, 0, &buf2);
+    try testing.expect(!hrr.done);
+    try testing.expect(server1.sawHelloRetryRequest());
+    _ = try expectHelloRetryRequest(hrr.out);
+
+    // Nothing was committed: no state transition, no cached flight to
+    // retransmit, no transcript. A server that advanced here would be
+    // holding per-ClientHello state for an unverified address, which is
+    // RFC 9147 §5.1's FIRST attack (resource exhaustion), not just the
+    // amplification one.
+    try testing.expectEqual(State.start, server1.state);
+    try testing.expectEqual(@as(usize, 0), server1.last_flight_len);
+    try testing.expectEqual(@as(usize, 0), server1.pending_flight_count);
+    try testing.expectEqualSlices(u8, &(engine.Transcript{}).currentHash(), &server1.transcript.currentHash());
+    // And the answer is SMALLER than the question — the amplification
+    // property, stated as an assertion rather than a hope.
+    try testing.expect(hrr.out.len < ch1_len);
+
+    const ch2 = try client.handleFlight(hrr.out, rnd, 0, &buf1);
+    try testing.expect(!ch2.done);
+    try testing.expect(client.sawHelloRetryRequest());
+
+    // Statelessness, literally: server1 is destroyed, and a BRAND-NEW
+    // connection — same config, no shared memory, no shared transcript —
+    // has to be able to finish the handshake from ClientHello2 plus its own
+    // cookie alone. If anything the server needed had been kept in server1
+    // instead of in the cookie, this is where it would fail.
+    server1.deinit();
+    var server2 = try Connection.serverInit(hrrServerConfig(binding));
+    defer server2.deinit();
+
+    const flight2 = try server2.handleFlight(ch2.out, rnd, 0, &buf2);
+    try testing.expect(!flight2.done);
+    try testing.expect(server2.sawHelloRetryRequest());
+    try testing.expectEqual(State.wait_finished, server2.state);
+
+    const client_fin = try client.handleFlight(flight2.out, rnd, 0, &buf1);
+    try testing.expect(client_fin.done);
+    const server_done = try server2.handleFlight(client_fin.out, rnd, 0, &buf2);
+    try testing.expect(server_done.done);
+
+    // Identical keys on both sides = the two independently computed
+    // transcripts agree, INCLUDING RFC 8446 §4.4.1's `message_hash` rewrite
+    // and the server's re-encoding of its own HelloRetryRequest.
+    try testing.expectEqualSlices(u8, client.write_keys.key[0..client.write_keys.key_len], server2.read_keys.key[0..server2.read_keys.key_len]);
+    try testing.expectEqualSlices(u8, &client.write_keys.iv, &server2.read_keys.iv);
+
+    var wire: [256]u8 = undefined;
+    var plain: [256]u8 = undefined;
+    const msg = "application data over a return-routability-checked connection";
+    const rec = try client.send(msg, &wire);
+    try testing.expectEqualSlices(u8, msg, try server2.recv(rec, &plain));
+}
+
+test "HRR server: a cookie minted for one peer_binding does not verify from another (the return-routability check itself)" {
+    var client = try Connection.clientInit(hrrClientConfig(hrr_psk));
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x72} ** 32);
+    const rnd = testRandom(&csprng);
+    var buf1: [1500]u8 = undefined;
+    var buf2: [1500]u8 = undefined;
+
+    const ch1 = try client.startHandshake(rnd, 0, &buf1);
+    var server1 = try Connection.serverInit(hrrServerConfig("203.0.113.9:51000"));
+    const hrr = try server1.handleFlight(ch1, rnd, 0, &buf2);
+    _ = try expectHelloRetryRequest(hrr.out);
+    const ch2 = try client.handleFlight(hrr.out, rnd, 0, &buf1);
+
+    // Same cookie, same ClientHello2, byte for byte — replayed from a
+    // different address. If this were accepted, the cookie would prove only
+    // that SOMEONE somewhere had once received one, which is not a
+    // return-routability check at all: an attacker could collect a cookie
+    // over its own address and then spend it while spoofing a victim's.
+    var elsewhere = try Connection.serverInit(hrrServerConfig("198.51.100.4:51000"));
+    var buf3: [1500]u8 = undefined;
+    try testing.expectError(error.CookieVerifyFailed, elsewhere.handleFlight(ch2.out, rnd, 0, &buf3));
+
+    // Not even the port may differ — the check is on a socket, not a host.
+    var same_host_other_port = try Connection.serverInit(hrrServerConfig("203.0.113.9:51001"));
+    try testing.expectError(error.CookieVerifyFailed, same_host_other_port.handleFlight(ch2.out, rnd, 0, &buf3));
+
+    // Control: the RIGHT binding still works, so the two rejections above
+    // are about the binding and not about something else being broken.
+    var right = try Connection.serverInit(hrrServerConfig("203.0.113.9:51000"));
+    defer right.deinit();
+    _ = try right.handleFlight(ch2.out, rnd, 0, &buf3);
+}
+
+test "HRR server: a cookie minted under a different cookie_secret does not verify" {
+    var client = try Connection.clientInit(hrrClientConfig(hrr_psk));
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x73} ** 32);
+    const rnd = testRandom(&csprng);
+    var buf1: [1500]u8 = undefined;
+    var buf2: [1500]u8 = undefined;
+    var buf3: [1500]u8 = undefined;
+
+    const ch1 = try client.startHandshake(rnd, 0, &buf1);
+    var server1 = try Connection.serverInit(hrrServerConfig("203.0.113.9:51000"));
+    const hrr = try server1.handleFlight(ch1, rnd, 0, &buf2);
+    const ch2 = try client.handleFlight(hrr.out, rnd, 0, &buf1);
+
+    // RFC 9147 §5.1's defence against an attacker hoarding cookies: rotating
+    // the secret invalidates every outstanding one. That only works if a
+    // cookie minted under the old secret is actually refused.
+    var rotated = try Connection.serverInit(Config{
+        .role = .server,
+        .psk_identity = hrr_psk_identity,
+        .psk = hrr_psk,
+        .cipher_suites = &.{.aes_128_gcm_sha256},
+        .hello_retry = .{ .cookie_secret = "the NEXT cookie MAC key", .peer_binding = "203.0.113.9:51000" },
+    });
+    try testing.expectError(error.CookieVerifyFailed, rotated.handleFlight(ch2.out, rnd, 0, &buf3));
+}
+
+test "HRR server: one flipped bit anywhere in the cookie — MAC or authenticated payload — does not verify" {
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x74} ** 32);
+    const rnd = testRandom(&csprng);
+
+    // The cookie is the last `cookie_len` bytes of the HelloRetryRequest
+    // datagram (it is the last extension's payload, and the extension list
+    // ends the message), so these offsets address it directly:
+    //   * the very last byte      -> the MAC's own tail;
+    //   * `cookie_mac_len + 1` from the end -> the last byte of
+    //     `Hash(ClientHello1)`, i.e. the AUTHENTICATED PAYLOAD. That case is
+    //     the one that matters: it is what a forger would edit to make the
+    //     server rebuild a transcript for a ClientHello1 it never saw.
+    for ([_]usize{ 1, cookie_mac_len + 1 }) |from_end| {
+        var client = try Connection.clientInit(hrrClientConfig(hrr_psk));
+        var buf1: [1500]u8 = undefined;
+        var buf2: [1500]u8 = undefined;
+        var buf3: [1500]u8 = undefined;
+
+        const ch1 = try client.startHandshake(rnd, 0, &buf1);
+        var server1 = try Connection.serverInit(hrrServerConfig("203.0.113.9:51000"));
+        const hrr = try server1.handleFlight(ch1, rnd, 0, &buf2);
+        const cookie = try expectHelloRetryRequest(hrr.out);
+        try testing.expectEqual(cookie_version, cookie[0]);
+
+        var tampered: [1500]u8 = undefined;
+        @memcpy(tampered[0..hrr.out.len], hrr.out);
+        tampered[hrr.out.len - from_end] ^= 0x01;
+
+        // The client echoes whatever cookie it was handed, verbatim (RFC
+        // 8446 §4.2.2) — it has no way to tell, which is exactly why the
+        // server must not either.
+        const ch2 = try client.handleFlight(tampered[0..hrr.out.len], rnd, 0, &buf1);
+        var server2 = try Connection.serverInit(hrrServerConfig("203.0.113.9:51000"));
+        try testing.expectError(error.CookieVerifyFailed, server2.handleFlight(ch2.out, rnd, 0, &buf3));
+    }
+}
+
+test "HRR server: a GENUINE cookie with bytes appended is refused (length is exact, not a minimum)" {
+    // The sibling test above covers cookies a peer invented, and those all
+    // fail on the MAC whatever their length. This one covers the case that
+    // survives a MAC check: a REAL cookie, minted by this server for this
+    // peer, with trailing bytes stuck on the end.
+    //
+    // It exists because relaxing `openCookie`'s `cookie.len != cookie_len`
+    // to `<` — a one-character edit that looks like defensive coding —
+    // leaves every other test in this file green. The trailing bytes are
+    // unauthenticated and unused, so this is malleability rather than a
+    // break, but "the length is exact" is a property worth a test that can
+    // actually notice when it stops being true.
+    const binding = "203.0.113.9:51000";
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x79} ** 32);
+    const rnd = testRandom(&csprng);
+
+    var client = try Connection.clientInit(hrrClientConfig(hrr_psk));
+    defer client.deinit();
+    var buf1: [1500]u8 = undefined;
+    var buf2: [1500]u8 = undefined;
+    const ch1 = try client.startHandshake(rnd, 0, &buf1);
+
+    var server1 = try Connection.serverInit(hrrServerConfig(binding));
+    const hrr = try server1.handleFlight(ch1, rnd, 0, &buf2);
+    const genuine = try expectHelloRetryRequest(hrr.out);
+
+    // Re-issue the retry with one extra byte glued to the genuine cookie.
+    var extended: [cookie_len + 1]u8 = undefined;
+    @memcpy(extended[0..cookie_len], genuine);
+    extended[cookie_len] = 0x00;
+
+    var sh_versions_buf: [2]u8 = undefined;
+    const sh_versions = try messages.encodeSupportedVersionsServerHello(messages.version_dtls13, &sh_versions_buf);
+    var cookie_buf: [2 + max_cookie_len]u8 = undefined;
+    const cookie_ext = try messages.encodeCookieExtension(&extended, &cookie_buf);
+    const datagram = try hrrDatagram(&.{
+        .{ .ext_type = @intFromEnum(messages.ExtensionType.supported_versions), .data = sh_versions },
+        .{ .ext_type = @intFromEnum(messages.ExtensionType.cookie), .data = cookie_ext },
+    });
+
+    var buf3: [1500]u8 = undefined;
+    const ch2 = try client.handleFlight(datagram.bytes[0..datagram.len], rnd, 0, &buf1);
+    var server2 = try Connection.serverInit(hrrServerConfig(binding));
+    try testing.expectError(error.CookieVerifyFailed, server2.handleFlight(ch2.out, rnd, 0, &buf3));
+}
+
+test "HRR server: an attacker-invented cookie is refused, whatever its length" {
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x75} ** 32);
+    const rnd = testRandom(&csprng);
+
+    // No real HelloRetryRequest is involved: these are cookies a peer made
+    // up, delivered by pointing a client at a forged retry. A server that
+    // accepted any of them would be doing no check at all.
+    const forged = [_][]const u8{
+        "", // an empty `cookie` extension
+        "short",
+        &[_]u8{0} ** cookie_len, // right length, all zeroes
+        &[_]u8{0xff} ** (cookie_len + 1), // right shape, one byte too long
+    };
+    for (forged) |c| {
+        var client = try Connection.clientInit(hrrClientConfig(hrr_psk));
+        var buf1: [1500]u8 = undefined;
+        var buf3: [1500]u8 = undefined;
+        _ = try client.startHandshake(rnd, 0, &buf1);
+
+        var sh_versions_buf: [2]u8 = undefined;
+        const sh_versions = try messages.encodeSupportedVersionsServerHello(messages.version_dtls13, &sh_versions_buf);
+        var cookie_buf: [2 + max_cookie_len]u8 = undefined;
+        const cookie_ext = try messages.encodeCookieExtension(c, &cookie_buf);
+        const datagram = try hrrDatagram(&.{
+            .{ .ext_type = @intFromEnum(messages.ExtensionType.supported_versions), .data = sh_versions },
+            .{ .ext_type = @intFromEnum(messages.ExtensionType.cookie), .data = cookie_ext },
+        });
+        const ch2 = client.handleFlight(datagram.bytes[0..datagram.len], rnd, 0, &buf1) catch |err| {
+            // An empty cookie changes nothing about ClientHello2, which RFC
+            // 8446 §4.1.4 forbids a server from asking for — the client
+            // refuses before the server ever sees it. Still a refusal.
+            try testing.expectEqual(error.HelloRetryRequestUnsupported, err);
+            continue;
+        };
+
+        var server = try Connection.serverInit(hrrServerConfig("203.0.113.9:51000"));
+        try testing.expectError(error.CookieVerifyFailed, server.handleFlight(ch2.out, rnd, 0, &buf3));
+    }
+}
+
+test "HRR server: a wrong-PSK ClientHello still gets only a retry — no crypto is spent before return routability is proven" {
+    var client = try Connection.clientInit(hrrClientConfig("the-WRONG-psk"));
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x76} ** 32);
+    const rnd = testRandom(&csprng);
+    var buf1: [1500]u8 = undefined;
+    var buf2: [1500]u8 = undefined;
+
+    const ch1 = try client.startHandshake(rnd, 0, &buf1);
+    var server1 = try Connection.serverInit(hrrServerConfig("203.0.113.9:51000"));
+
+    // The binder is wrong, but the server must not have looked: RFC 9147
+    // §5.1's point is that an unverified address costs one HMAC over the
+    // cookie, not a key schedule. Verifying first would also make the
+    // ORDER of failures leak — a spoofing attacker could learn whether a
+    // PSK identity/binder pair was good by whether it got an HRR or a
+    // silence, at zero cost to itself.
+    const hrr = try server1.handleFlight(ch1, rnd, 0, &buf2);
+    _ = try expectHelloRetryRequest(hrr.out);
+
+    // And the check does still happen — just after the address is proven.
+    const ch2 = try client.handleFlight(hrr.out, rnd, 0, &buf1);
+    var server2 = try Connection.serverInit(hrrServerConfig("203.0.113.9:51000"));
+    var buf3: [1500]u8 = undefined;
+    try testing.expectError(error.BinderVerifyFailed, server2.handleFlight(ch2.out, rnd, 0, &buf3));
+}
+
+test "HRR server: off by default — an unconfigured server answers ClientHello1 with the full flight, exactly as before" {
+    var client = try Connection.clientInit(hrrClientConfig(hrr_psk));
+    var server = try Connection.serverInit(Config{
+        .role = .server,
+        .psk_identity = hrr_psk_identity,
+        .psk = hrr_psk,
+        .cipher_suites = &.{.aes_128_gcm_sha256},
+    });
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x77} ** 32);
+    const rnd = testRandom(&csprng);
+    var buf1: [1500]u8 = undefined;
+    var buf2: [1500]u8 = undefined;
+
+    const ch1 = try client.startHandshake(rnd, 0, &buf1);
+    const flight2 = try server.handleFlight(ch1, rnd, 0, &buf2);
+    try testing.expectEqual(State.wait_finished, server.state);
+    try testing.expect(!server.sawHelloRetryRequest());
+
+    // The first message out is a REAL ServerHello, not a retry.
+    const rec = try record.decodePlaintext(flight2.out);
+    var msg_buf: [512]u8 = undefined;
+    var received_buf: [512]bool = undefined;
+    const parsed = try reassembleFragment(flight2.out[record.plaintext_header_len..][0..rec.length], &msg_buf, &received_buf);
+    var ext_buf: [8]messages.Extension = undefined;
+    const sh = try messages.decodeServerHello(parsed.body, &ext_buf);
+    try testing.expect(!messages.isHelloRetryRequest(sh.random));
+
+    // And the client agrees it never did a retry, so the two views of "was
+    // there a cookie exchange" cannot drift apart unnoticed.
+    const client_fin = try client.handleFlight(flight2.out, rnd, 0, &buf1);
+    try testing.expect(client_fin.done);
+    try testing.expect(!client.sawHelloRetryRequest());
+}
+
+test "Config.validate: hello_retry with an empty secret or an empty binding is rejected" {
+    const base = Config{ .role = .server, .psk_identity = "id", .psk = "secret", .cipher_suites = &.{.aes_128_gcm_sha256} };
+
+    var no_secret = base;
+    no_secret.hello_retry = .{ .cookie_secret = "", .peer_binding = "203.0.113.9:51000" };
+    try testing.expectError(error.EmptyCookieSecret, Connection.serverInit(no_secret));
+
+    // The dangerous one: a cookie bound to nothing still verifies, from
+    // anywhere. Nothing downstream can catch it, so it is refused here.
+    var no_binding = base;
+    no_binding.hello_retry = .{ .cookie_secret = "k", .peer_binding = "" };
+    try testing.expectError(error.EmptyPeerBinding, Connection.serverInit(no_binding));
+}
+
+test "cookie: the MAC covers the peer binding, the ClientHello hash, and the suite — separately" {
+    const hr = HelloRetryConfig{ .cookie_secret = "k", .peer_binding = "203.0.113.9:51000" };
+    const contents = CookieContents{ .suite = .aes_128_gcm_sha256, .client_hello1_hash = [_]u8{0xab} ** 32 };
+
+    var base: [cookie_len]u8 = undefined;
+    mintCookie(hr, contents, &base);
+    const opened = try openCookie(hr, &base);
+    try testing.expectEqual(contents.suite, opened.suite);
+    try testing.expectEqualSlices(u8, &contents.client_hello1_hash, &opened.client_hello1_hash);
+
+    // A different binding, everything else identical.
+    var other_binding: [cookie_len]u8 = undefined;
+    mintCookie(.{ .cookie_secret = "k", .peer_binding = "203.0.113.9:51001" }, contents, &other_binding);
+    try testing.expect(!std.mem.eql(u8, &base, &other_binding));
+    try testing.expectError(error.CookieVerifyFailed, openCookie(hr, &other_binding));
+
+    // The length prefix on the binding: without it, splitting the binding
+    // differently would hash the same. "203.0.113.9:5100" + "0" must not
+    // collide with "203.0.113.9:51000" + "".
+    var truncated_binding: [cookie_len]u8 = undefined;
+    mintCookie(.{ .cookie_secret = "k", .peer_binding = "203.0.113.9:5100" }, contents, &truncated_binding);
+    try testing.expectError(error.CookieVerifyFailed, openCookie(hr, &truncated_binding));
+
+    // The suite is authenticated too, so a peer cannot steer the server's
+    // HelloRetryRequest reconstruction by editing it.
+    var edited_suite = base;
+    edited_suite[1] = 0x13;
+    edited_suite[2] = 0x03; // chacha20_poly1305_sha256: a suite we DO support
+    try testing.expectError(error.CookieVerifyFailed, openCookie(hr, &edited_suite));
+
+    // As is the version byte, so a future format cannot be misread as v1.
+    var edited_version = base;
+    edited_version[0] = 2;
+    try testing.expectError(error.CookieVerifyFailed, openCookie(hr, &edited_version));
 }
 
 test "handshake: server handleFlight rejects the wrong state" {

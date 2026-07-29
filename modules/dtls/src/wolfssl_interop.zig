@@ -347,3 +347,129 @@ test "LIVE wolfSSL peer: our server completes a real DTLS 1.3 PSK handshake agai
     const term = try child.wait(io);
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
 }
+
+// ── direction 2b: wolfSSL client -> our server, WITH the cookie exchange ──
+
+// RFC 9147 §5.1's return-routability check, served by us and consumed by a
+// real client. Two things can only be proven here:
+//
+//   1. that a stock DTLS 1.3 client ACCEPTS the HelloRetryRequest we emit —
+//      its `random` sentinel, its `supported_versions`, its cookie framing,
+//      and the fact that it carries no extension the client never offered
+//      (RFC 8446 §4.1.4). Our own client would accept a subtly wrong one,
+//      because it was written from the same reading of the same RFC;
+//
+//   2. that our reconstruction of the transcript is right. The server keeps
+//      nothing between the two ClientHellos, so it re-derives RFC 8446
+//      §4.4.1's `message_hash` rewrite AND re-encodes its own
+//      HelloRetryRequest from the cookie. If either differs by one byte from
+//      what the client hashed, the transcripts diverge silently and the
+//      client's binder verifies against nothing. Self-interop cannot see
+//      this: the same code would produce the same wrong answer on both
+//      sides.
+//
+// Statelessness is not asserted by inspection here — it is STRUCTURAL. The
+// `Connection` that answers the first ClientHello is destroyed before the
+// second one is read, so if anything the server needed lived in that object
+// rather than in the cookie, this handshake cannot complete.
+test "LIVE wolfSSL peer: our server serves a HelloRetryRequest, a real wolfSSL client answers it, and a BRAND-NEW connection finishes the handshake" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try buildPeer(gpa, io, tmp.dir);
+
+    const local: net.IpAddress = .{ .ip4 = .loopback(0) };
+    const sock = try local.bind(io, .{ .mode = .dgram });
+    defer sock.close(io);
+
+    var port_buf: [8]u8 = undefined;
+    const port_str = try std.fmt.bufPrint(&port_buf, "{d}", .{sock.address.getPort()});
+
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "./wolfssl_peer", "client", port_str },
+        .cwd = .{ .dir = tmp.dir },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .pipe,
+    });
+    defer child.kill(io);
+
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x6e} ** 32);
+    const rnd = testRandom(&csprng);
+
+    var out: [1500]u8 = undefined;
+    var rx: [1500]u8 = undefined;
+    var peer_addr: net.IpAddress = undefined;
+    // The caller-supplied `peer_binding`: this module never sees a socket,
+    // so the address the cookie is bound to has to come from whoever owns
+    // the I/O — here, the address `receiveTimeout` reports. Rewritten every
+    // datagram (with identical bytes, since it is the same peer), which is
+    // what a real demultiplexing server would do.
+    var binding_buf: [64]u8 = undefined;
+
+    var conn: ?Connection = null;
+    defer if (conn) |*c| c.deinit();
+    var retries_served: usize = 0;
+
+    var steps: usize = 0;
+    while (true) : (steps += 1) {
+        if (steps > 8) return error.TooManyFlights;
+        const incoming = try sock.receiveTimeout(io, &rx, deadline(io, 10_000));
+        peer_addr = incoming.from;
+        const binding = try std.fmt.bufPrint(&binding_buf, "{f}", .{incoming.from});
+
+        if (conn == null) conn = try Connection.serverInit(.{
+            .role = .server,
+            .psk_identity = psk_identity,
+            .psk = &psk,
+            .cipher_suites = &.{.aes_128_gcm_sha256},
+            .hello_retry = .{ .cookie_secret = "a live server's cookie MAC key", .peer_binding = binding },
+        });
+
+        const result = conn.?.handleFlight(incoming.data, rnd, 0, &out) catch |err| {
+            reportPeerDiagnosis(gpa, io, &child, false, "our server rejected wolfSSL's flight", err);
+            return err;
+        };
+        if (result.out.len > 0) try sock.send(io, &peer_addr, result.out);
+        if (conn.?.state == .connected) break;
+
+        // Still `.start` after a flight went out ⇒ that flight was a
+        // HelloRetryRequest and this connection committed nothing. Throw it
+        // away, exactly as a stateless server would: whatever the next
+        // ClientHello needs must be in the cookie.
+        if (conn.?.state == .start) {
+            try testing.expect(conn.?.sawHelloRetryRequest());
+            retries_served += 1;
+            conn.?.deinit();
+            conn = null;
+        }
+    }
+
+    // Without this the test would silently degrade into a duplicate of the
+    // no-cookie one if `Config.hello_retry` ever stopped taking effect: the
+    // handshake would still complete, just without the check.
+    try testing.expect(retries_served >= 1);
+
+    var plain: [1500]u8 = undefined;
+    var skipped: usize = 0;
+    const received = while (skipped <= 8) {
+        const incoming = try sock.receiveTimeout(io, &rx, deadline(io, 10_000));
+        break conn.?.recv(incoming.data, &plain) catch |err| switch (err) {
+            error.ReceivedAck, error.ReceivedPostHandshakeMessage => {
+                skipped += 1;
+                continue;
+            },
+            else => return err,
+        };
+    } else return error.NoApplicationData;
+    try testing.expectEqualStrings("hello from wolfssl client", received);
+
+    const echo = try conn.?.send(received, &out);
+    try sock.send(io, &peer_addr, echo);
+
+    const term = try child.wait(io);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+}

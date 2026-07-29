@@ -74,26 +74,46 @@ together:
   the one flight the spec explicitly excludes from implicit acknowledgement
   — so a conforming client waited forever.
 
-**HelloRetryRequest** (RFC 8446 §4.1.4 / RFC 9147 §5.3) is implemented on the
-client side and proven against a **default-configured** wolfSSL server — the
-posture a stock DTLS 1.3 server ships with, which answers the first
-ClientHello with a cookie and will not proceed until it comes back. That path
-carries RFC 8446 §4.4.1's `message_hash` transcript rewrite (ClientHello1 is
-replaced by a synthetic message holding its hash, so a stateless server can
-rebuild the transcript from its cookie). Reverting the rewrite to the naive
-"CH1 || HRR || CH2" leaves every self-interop test passing and fails only the
-live test — which is why it is tested against a real peer.
+**HelloRetryRequest / the stateless-cookie exchange** (RFC 9147 §5.1, RFC
+8446 §4.1.4/§4.2.2) is implemented in **both roles**, each proven against
+wolfSSL playing the other.
 
-Still open: **serving** a HelloRetryRequest (this module's server never sends
-one, so it does no return-routability check), and cross-`handleFlight`
-fragment reassembly — a handshake message split across datagrams is rejected,
-not reassembled.
+*Client:* always answers one — the posture a stock DTLS 1.3 server ships
+with, so without it this module could not talk to a default-configured peer
+at all.
+
+*Server:* opt in with `Config.hello_retry`. A cookie-less ClientHello is
+answered with a HelloRetryRequest and **nothing is kept** — no transcript, no
+state transition, no cached flight, and not even a PSK-binder check, because
+the whole point is that an unverified (possibly spoofed) address costs the
+server one HMAC rather than a flight. Everything needed to continue is in the
+cookie, so a *brand-new* `Connection` finishes the handshake from
+ClientHello2; that is how the live test is written, which makes statelessness
+structural rather than asserted. RFC 8446 §4.4.1's `message_hash` transcript
+rewrite is what makes it possible.
+
+The cookie is `HMAC-SHA256(cookie_secret, label || peer_binding ||
+version || cipher_suite || Hash(ClientHello1))`. `peer_binding` is
+**caller-supplied** — typically the peer's packed address and port. It has to
+be: this module never touches a socket (the caller owns the datagram I/O), so
+the peer's address is an input in the same way the clock (`Config.now_sec`)
+and randomness (`std.Random` arguments) are. A cookie that is not bound to an
+address is not a return-routability check, so an empty `peer_binding` is a
+config error rather than a documented footgun.
+
+Off by default, which is *not* what RFC 9147 §5.1 recommends ("The default
+SHOULD be that the exchange is performed") — the default is chosen for source
+compatibility. A server reachable from the open internet that leaves it off
+is an amplifier: a spoofed ClientHello makes it spray a much larger flight at
+the victim.
+
+Still open: cross-`handleFlight` fragment reassembly — a handshake message
+split across datagrams is rejected, not reassembled.
 
 **Deferred / out of scope:** full RFC 5280 §6 certification-path building
 (multi-hop chains, name constraints, revocation — `.trust_anchor` is a
 minimal one-hop check only), `CertificateEntry` extensions (OCSP/SCT),
-HelloRetryRequest's stateless-cookie retry round trip (detected and
-rejected with a typed error, not silently mishandled), 0-RTT/early data,
+0-RTT/early data,
 session resumption, key update, and the CCM suites (Zig 0.16 std ships only
 a 13-byte-nonce CCM; the TLS/DTLS profile needs a 12-byte nonce — see
 `src/aead.zig`).

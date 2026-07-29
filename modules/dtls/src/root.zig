@@ -114,13 +114,21 @@
 //! CertificateVerify/CertificateRequest message bodies incl. the PSK
 //! extensions (`messages.zig`).
 //!
-//! **HelloRetryRequest (RFC 8446 §4.1.4):** implemented CLIENT-side and
-//! proven against a default-configured wolfSSL server. The retry carries
-//! RFC 8446 §4.4.1's `message_hash` transcript rewrite; this module's own
-//! SERVER never sends an HRR, so it does no return-routability check.
+//! **HelloRetryRequest / the stateless-cookie exchange (RFC 9147 §5.1, RFC
+//! 8446 §4.1.4/§4.2.2):** implemented in BOTH roles and proven against
+//! wolfSSL in both. A client always answers one. A server performs the
+//! return-routability check when `Config.hello_retry` is set — it answers a
+//! cookie-less ClientHello with a HelloRetryRequest and keeps NOTHING,
+//! rebuilding the transcript on ClientHello2 from the cookie alone (RFC 8446
+//! §4.4.1's `message_hash` rewrite is what makes that possible). The cookie
+//! is bound to a caller-supplied `peer_binding` — this module never touches
+//! a socket, so the peer's address is an input, like `Config.now_sec` and
+//! the `std.Random` arguments. Off by default (source compatibility), which
+//! is NOT the posture RFC 9147 §5.1 recommends for an internet-facing
+//! server: without it, a spoofed ClientHello turns the server into an
+//! amplifier.
 //!
-//! **Out of scope (deliberate, not deferred-as-a-stub):** serving a
-//! HelloRetryRequest; 0-RTT/early data; session
+//! **Out of scope (deliberate, not deferred-as-a-stub):** 0-RTT/early data; session
 //! resumption (`res binder`/NewSessionTicket); key update (RFC 8446
 //! §4.6.3); and the CCM
 //! suites (Zig 0.16 std ships only a 13-byte-nonce CCM; the TLS/DTLS
