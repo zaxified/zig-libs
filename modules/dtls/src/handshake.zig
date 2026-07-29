@@ -24,8 +24,28 @@ pub const ReassembleError = error{
     /// fragment's for the same `message_seq` — the peer is lying about the
     /// message's total size mid-stream.
     InconsistentLength,
+    /// A later fragment's `msg_type` disagrees with the first fragment's
+    /// for the same `message_seq` — the peer is changing what KIND of
+    /// message this is mid-reassembly. Without this check the reassembled
+    /// body would be dispatched on whichever fragment's type the reader
+    /// happened to keep, which is an attacker-chosen decision.
+    InconsistentMessageType,
     /// `fragment_offset + fragment_length` exceeds the declared `length`.
     FragmentOutOfRange,
+    /// A fragment re-covers bytes already received for this message with
+    /// DIFFERENT content (RFC 9147 §5.2 permits overlapping fragments, but
+    /// only consistent ones — a peer legitimately re-sending a fragment
+    /// re-sends the same bytes).
+    ///
+    /// Rejected rather than resolved by "last writer wins": the handshake
+    /// transcript is a hash of the reassembled bytes, so silently letting a
+    /// later fragment rewrite earlier ones hands an off-path attacker — who
+    /// can inject unauthenticated datagrams during the handshake — a way to
+    /// steer which bytes end up hashed, and a way to make two peers disagree
+    /// about a message they both "received". Byte-identical re-delivery
+    /// (retransmission, duplication) is still accepted: only CONTRADICTION
+    /// is an error.
+    OverlappingFragment,
 };
 
 pub const header_len = 12;
@@ -159,6 +179,10 @@ pub const Reassembler = struct {
     /// only one handshake message is reassembled at a time). Returns the
     /// complete message body once every byte has arrived, `null` if more
     /// fragments are still needed.
+    ///
+    /// Re-delivery of an already-received byte range is fine as long as the
+    /// bytes AGREE; a contradicting overlap is `error.OverlappingFragment`
+    /// (see that error's doc comment for why it is not resolved silently).
     pub fn feed(self: *Reassembler, hdr: HandshakeHeader, fragment_body: []const u8) ReassembleError!?[]const u8 {
         if (fragment_body.len != hdr.fragment_length) return error.FragmentOutOfRange;
 
@@ -169,6 +193,8 @@ pub const Reassembler = struct {
             self.msg_type = hdr.msg_type;
         } else if (self.total_len.? != hdr.length) {
             return error.InconsistentLength;
+        } else if (self.msg_type != hdr.msg_type) {
+            return error.InconsistentMessageType;
         }
 
         const total: usize = self.total_len.?;
@@ -176,6 +202,14 @@ pub const Reassembler = struct {
 
         const end = @as(usize, hdr.fragment_offset) + @as(usize, hdr.fragment_length);
         if (end > total) return error.FragmentOutOfRange;
+
+        // Overlap check BEFORE any write, so a rejected fragment leaves the
+        // in-progress message exactly as it was — a partial copy followed by
+        // an error would be the "last writer wins" hole this rejects.
+        for (self.received[hdr.fragment_offset..][0..fragment_body.len], fragment_body, 0..) |already, b, i| {
+            if (already and self.buf[@as(usize, hdr.fragment_offset) + i] != b)
+                return error.OverlappingFragment;
+        }
 
         if (fragment_body.len > 0) {
             @memcpy(self.buf[hdr.fragment_offset..][0..fragment_body.len], fragment_body);
@@ -322,6 +356,55 @@ test "reassembler: fragment out of range is a typed error" {
 
     const hdr = HandshakeHeader{ .msg_type = 1, .length = 8, .message_seq = 0, .fragment_offset = 6, .fragment_length = 4 };
     try testing.expectError(error.FragmentOutOfRange, reasm.feed(hdr, "XXXX"));
+}
+
+test "reassembler: a CONTRADICTING overlap is rejected, an identical one is not" {
+    var buf: [8]u8 = undefined;
+    var received: [8]bool = undefined;
+    var reasm = Reassembler.init(&buf, &received);
+
+    const first = HandshakeHeader{ .msg_type = 11, .length = 8, .message_seq = 0, .fragment_offset = 0, .fragment_length = 4 };
+    try testing.expectEqual(@as(?[]const u8, null), try reasm.feed(first, "AAAA"));
+
+    // Byte-identical re-delivery (a retransmitted fragment) is legal.
+    try testing.expectEqual(@as(?[]const u8, null), try reasm.feed(first, "AAAA"));
+
+    // The same range with DIFFERENT bytes is a contradiction, not a retransmit.
+    const overlap = HandshakeHeader{ .msg_type = 11, .length = 8, .message_seq = 0, .fragment_offset = 2, .fragment_length = 4 };
+    try testing.expectError(error.OverlappingFragment, reasm.feed(overlap, "XXXX"));
+
+    // The rejected fragment must have written NOTHING — completing the
+    // message normally afterwards must yield the original bytes.
+    const rest = HandshakeHeader{ .msg_type = 11, .length = 8, .message_seq = 0, .fragment_offset = 4, .fragment_length = 4 };
+    const done = (try reasm.feed(rest, "BBBB")).?;
+    try testing.expectEqualSlices(u8, "AAAABBBB", done);
+}
+
+test "reassembler: a fragment that changes msg_type mid-message is rejected" {
+    var buf: [8]u8 = undefined;
+    var received: [8]bool = undefined;
+    var reasm = Reassembler.init(&buf, &received);
+
+    const a = HandshakeHeader{ .msg_type = 11, .length = 8, .message_seq = 3, .fragment_offset = 0, .fragment_length = 4 };
+    _ = try reasm.feed(a, "AAAA");
+    const b = HandshakeHeader{ .msg_type = 15, .length = 8, .message_seq = 3, .fragment_offset = 4, .fragment_length = 4 };
+    try testing.expectError(error.InconsistentMessageType, reasm.feed(b, "BBBB"));
+}
+
+test "reassembler: msg_type comes from the FIRST fragment, never a later one" {
+    // Pins which fragment decides the message type. A reader that kept the
+    // last fragment's `msg_type` would still pass every round-trip test
+    // (a well-behaved sender repeats it), so only this pins it.
+    var buf: [8]u8 = undefined;
+    var received: [8]bool = undefined;
+    var reasm = Reassembler.init(&buf, &received);
+
+    const a = HandshakeHeader{ .msg_type = 11, .length = 8, .message_seq = 3, .fragment_offset = 4, .fragment_length = 4 };
+    _ = try reasm.feed(a, "BBBB");
+    try testing.expectEqual(@as(u8, 11), reasm.msg_type);
+    const b = HandshakeHeader{ .msg_type = 11, .length = 8, .message_seq = 3, .fragment_offset = 0, .fragment_length = 4 };
+    _ = try reasm.feed(b, "AAAA");
+    try testing.expectEqual(@as(u8, 11), reasm.msg_type);
 }
 
 test "reassembler: buffer too small for declared total length" {

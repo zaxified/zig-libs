@@ -27,6 +27,7 @@ const testing = std.testing;
 
 const Connection = @import("Connection.zig").Connection;
 const Config = @import("Connection.zig").Config;
+const cert_kat = @import("certauth_kat_vectors.zig");
 
 /// Test fixtures — duplicated verbatim in `testdata/wolfssl_peer.c`. Test
 /// material only; nothing here is a default for anything.
@@ -472,4 +473,178 @@ test "LIVE wolfSSL peer: our server serves a HelloRetryRequest, a real wolfSSL c
 
     const term = try child.wait(io);
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+}
+
+// ── direction 3: our CERTIFICATE client -> a wolfSSL certificate server ───
+
+/// SEC1 `ECPrivateKey` DER (RFC 5915) for the fixture P-256 leaf, built here
+/// from the ONE piece of key material this repo stores (`cert_kat
+/// .server_secret_key_bytes`, a raw 32-byte scalar) rather than pasted in as
+/// a second encoded copy: the public point is recomputed from the scalar, so
+/// the key wolfSSL signs with cannot silently drift from the certificate the
+/// Zig side verifies against.
+fn serverKeySec1Der() [121]u8 {
+    const P256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+    const sk = P256.SecretKey.fromBytes(cert_kat.server_secret_key_bytes) catch unreachable;
+    const kp = P256.KeyPair.fromSecretKey(sk) catch unreachable;
+    const point = kp.public_key.toUncompressedSec1(); // 0x04 || X || Y, 65 bytes
+
+    var out: [121]u8 = undefined;
+    var i: usize = 0;
+    const put = struct {
+        fn f(buf: []u8, at: *usize, bytes: []const u8) void {
+            @memcpy(buf[at.*..][0..bytes.len], bytes);
+            at.* += bytes.len;
+        }
+    }.f;
+    put(&out, &i, &.{ 0x30, 0x77 }); // SEQUENCE, 119 content bytes
+    put(&out, &i, &.{ 0x02, 0x01, 0x01 }); // version = 1
+    put(&out, &i, &.{ 0x04, 0x20 }); // privateKey OCTET STRING (32)
+    put(&out, &i, &cert_kat.server_secret_key_bytes);
+    // [0] parameters: OID 1.2.840.10045.3.1.7 (prime256v1)
+    put(&out, &i, &.{ 0xa0, 0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07 });
+    // [1] publicKey: BIT STRING, 0 unused bits, uncompressed point
+    put(&out, &i, &.{ 0xa1, 0x44, 0x03, 0x42, 0x00 });
+    put(&out, &i, &point);
+    std.debug.assert(i == out.len);
+    return out;
+}
+
+/// A wolfSSL certificate server needs the leaf and its key as files; both
+/// come from this repo's own fixtures, so the anchor the Zig client trusts
+/// and the chain wolfSSL presents are the same material by construction.
+fn writeCertFixtures(io: std.Io, dir: std.Io.Dir) !void {
+    try dir.writeFile(io, .{ .sub_path = "server-cert.der", .data = &cert_kat.server_cert_der });
+    const key = serverKeySec1Der();
+    try dir.writeFile(io, .{ .sub_path = "server-key.der", .data = &key });
+}
+
+// Certificate mode had never met a third-party peer: every Certificate /
+// CertificateVerify this module had ever parsed, it had also produced. That
+// is the exact shape of the four PSK wire defects self-interop passed (see
+// `root.zig`), and it hid one more — the `.cert_dhe` ClientHello carried no
+// `supported_versions`, so a real DTLS 1.3 server negotiated 1.2 and the
+// handshake died immediately. Nothing but a live peer could report that.
+//
+// The MTU is the second half of the point. wolfSSL's Certificate message
+// here is a ~390-byte X.509 leaf plus framing; told to keep datagrams at
+// 256 bytes it MUST split that message across several of them, so this
+// handshake cannot complete at all unless the reassembly is real. Both MTUs
+// are exercised — unconstrained (one datagram per message) and constrained
+// (message-level fragmentation) — so a regression that breaks only the
+// fragmented path cannot hide behind the easy one.
+
+test "LIVE wolfSSL peer: our cert client completes a PSK-less X25519+ECDSA DTLS 1.3 handshake against wolfSSL" {
+    try certClientAgainstWolfssl(0);
+}
+
+test "LIVE wolfSSL peer: the same certificate handshake at a 256-byte peer MTU — wolfSSL fragments its Certificate and we reassemble it" {
+    try certClientAgainstWolfssl(256);
+}
+
+fn certClientAgainstWolfssl(mtu: u16) !void {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try buildPeer(gpa, io, tmp.dir);
+    try writeCertFixtures(io, tmp.dir);
+
+    const port = try freeLoopbackPort(io);
+    var port_buf: [8]u8 = undefined;
+    const port_str = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
+    var mtu_buf: [8]u8 = undefined;
+    const mtu_str = try std.fmt.bufPrint(&mtu_buf, "{d}", .{mtu});
+
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "./wolfssl_peer", "server-cert", port_str, mtu_str },
+        .cwd = .{ .dir = tmp.dir },
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    });
+    defer _ = child.wait(io) catch {};
+
+    var ready_buf: [64]u8 = undefined;
+    var stdout_reader = child.stdout.?.reader(io, &ready_buf);
+    const ready_line = stdout_reader.interface.takeDelimiterExclusive('\n') catch {
+        if (verboseSkip()) std.debug.print("\nSKIPPED: LIVE dtls wolfSSL interop: cert peer never printed READY.\n", .{});
+        return error.SkipZigTest;
+    };
+    try testing.expectEqualStrings("READY", ready_line);
+
+    const local: net.IpAddress = .{ .ip4 = .loopback(0) };
+    const sock = try local.bind(io, .{ .mode = .dgram });
+    defer sock.close(io);
+    const server_addr: net.IpAddress = .{ .ip4 = .loopback(port) };
+
+    var conn = try Connection.clientInit(.{
+        .role = .client,
+        .key_exchange = .cert_dhe,
+        .cipher_suites = &.{.aes_128_gcm_sha256},
+        // The chain wolfSSL presents must verify against OUR anchor, with
+        // OUR clock — a `.none` policy here would let the test pass on a
+        // handshake that authenticated nobody.
+        .peer_verify = .{ .trust_anchor = &cert_kat.anchor_cert_der },
+        .require_peer_cert = true,
+        .now_sec = cert_kat.valid_now_sec,
+    });
+    defer conn.deinit();
+
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x3d} ** 32);
+    const rnd = testRandom(&csprng);
+
+    var out: [1500]u8 = undefined;
+    var rx: [1500]u8 = undefined;
+
+    const client_hello = try conn.startHandshake(rnd, 0, &out);
+    try sock.send(io, &server_addr, client_hello);
+
+    var steps: usize = 0;
+    var partial_steps: usize = 0;
+    var largest_datagram: usize = 0;
+    var flight_bytes: usize = 0;
+    while (conn.state != .connected) : (steps += 1) {
+        if (steps > 16) return error.TooManyFlights;
+        const incoming = try sock.receiveTimeout(io, &rx, deadline(io, 10_000));
+        largest_datagram = @max(largest_datagram, incoming.data.len);
+        flight_bytes += incoming.data.len;
+        const result = conn.handleFlight(incoming.data, rnd, 0, &out) catch |err| {
+            reportPeerDiagnosis(gpa, io, &child, true, "wolfSSL's certificate server rejected our flight", err);
+            return err;
+        };
+        if (result.need_more_data) partial_steps += 1;
+        if (result.out.len > 0) try sock.send(io, &server_addr, result.out);
+    }
+
+    if (mtu > 0) {
+        // Every datagram stayed inside the MTU, and the certificate alone is
+        // bigger than one — so its Certificate message cannot have arrived
+        // whole in any single datagram.
+        try testing.expect(largest_datagram <= mtu);
+        try testing.expect(cert_kat.server_cert_der.len > mtu);
+        try testing.expect(flight_bytes > mtu);
+        // ...and the engine really did have to wait for more datagrams.
+        try testing.expect(partial_steps >= 1);
+    }
+
+    const msg = "hello from zig-libs, certificate mode";
+    const record = try conn.send(msg, &out);
+    try sock.send(io, &server_addr, record);
+
+    var plain: [1500]u8 = undefined;
+    var skipped: usize = 0;
+    const echoed = while (skipped <= 8) {
+        const incoming = try sock.receiveTimeout(io, &rx, deadline(io, 10_000));
+        break conn.recv(incoming.data, &plain) catch |err| switch (err) {
+            error.ReceivedAck, error.ReceivedPostHandshakeMessage => {
+                skipped += 1;
+                continue;
+            },
+            else => return err,
+        };
+    } else return error.NoApplicationData;
+    try testing.expectEqualStrings(msg, echoed);
 }

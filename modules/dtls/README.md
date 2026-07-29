@@ -52,12 +52,21 @@ fragmentation/reassembly, RFC 9147 §7 ACK + retransmission timer + flight
 bookkeeping, and the handshake message bodies incl. the PSK and cert-mode
 extensions.
 
-**Third-party interop (`src/wolfssl_interop.zig`):** a real DTLS 1.3 PSK
-handshake over a loopback UDP socket against **wolfSSL 5.9.1**, in both
-roles — our client against its server and our server against its client,
-each followed by an application-data round trip. The peer is a small C
-program compiled at test time; the tests skip loudly when `cc` or wolfSSL is
-missing (`sudo apt install libwolfssl-dev`).
+**Third-party interop (`src/wolfssl_interop.zig`):** real DTLS 1.3
+handshakes over a loopback UDP socket against **wolfSSL 5.9.1**, each
+followed by an application-data round trip. The peer is a small C program
+compiled at test time; the tests skip loudly when `cc` or wolfSSL is missing
+(`sudo apt install libwolfssl-dev`). Covered live:
+
+- **PSK, both roles** — our client against its server, our server against
+  its client;
+- **HelloRetryRequest, both roles** (see below);
+- **Certificate mode** — our `.cert_dhe` client (PSK-less X25519 (EC)DHE +
+  ECDSA P-256) against a wolfSSL certificate server, verifying its chain
+  against this repo's own trust anchor;
+- **the same certificate handshake at a 256-byte peer MTU**, where wolfSSL
+  must split its Certificate across datagrams, so it only completes if the
+  reassembly above is real.
 
 That test found four defects that self-interop is structurally incapable of
 finding, because both sides of a self-interop suite make the same mistake
@@ -73,6 +82,11 @@ together:
 - the server never sent the RFC 9147 §7 ACK for the client's final flight —
   the one flight the spec explicitly excludes from implicit acknowledgement
   — so a conforming client waited forever.
+
+Extending it to certificate mode found a fifth of exactly the same shape:
+the `.cert_dhe` ClientHello carried no `supported_versions` at all, so a real
+DTLS 1.3 server negotiated 1.2 and the handshake died on the first record.
+Self-interop never noticed, because this module's own server did not look.
 
 **HelloRetryRequest / the stateless-cookie exchange** (RFC 9147 §5.1, RFC
 8446 §4.1.4/§4.2.2) is implemented in **both roles**, each proven against
@@ -107,8 +121,31 @@ compatibility. A server reachable from the open internet that leaves it off
 is an amplifier: a spoofed ClientHello makes it spray a much larger flight at
 the victim.
 
-Still open: cross-`handleFlight` fragment reassembly — a handshake message
-split across datagrams is rejected, not reassembled.
+## Reassembly across datagrams (RFC 9147 §5.2)
+
+A flight need not arrive in one datagram, and neither does a single handshake
+message — a certificate chain routinely exceeds the path MTU, so a real peer
+fragments it. `handleFlight` therefore buffers a flight's datagrams and
+reassembles by `fragment_offset` (never by arrival order), tolerating
+out-of-order and duplicate fragments. While a flight is incomplete it returns
+`HandshakeResult.need_more_data` with an empty `out` and the connection
+**rolled back** to exactly its pre-call state, so a half-processed flight
+never leaves the state machine, transcript, key schedule or anti-replay
+windows half-advanced.
+
+Because those buffered bytes are not authenticated yet, every dimension is
+capped: 4096 bytes per flight (`error.FlightTooLarge` past that, buffer
+dropped), exactly one in-progress message (`error.InterleavedFragments` for a
+fragment of a later one), and a fragment that re-covers already-received
+bytes with *different* content is `error.OverlappingFragment` — byte-identical
+re-delivery is fine, contradiction is not, because "last writer wins" would
+let an off-path attacker steer what ends up in the transcript hash.
+
+Sending is still single-fragment: this engine never splits a message it
+emits, so it needs a peer MTU that fits the messages it sends (bounded by
+`max_cert_message_body` and friends). And what the accumulator tolerates is a
+peer that *fragments*, not one that retransmits a whole flight verbatim into
+the middle of an incomplete one — see `handleFlight`'s "KNOWN LIMIT".
 
 **Deferred / out of scope:** full RFC 5280 §6 certification-path building
 (multi-hop chains, name constraints, revocation — `.trust_anchor` is a

@@ -19,8 +19,11 @@ used to describe no longer exists in the code. PSK-mode third-party interop
 is also proven — a live wolfSSL 5.9.1 handshake in both roles, see "Live
 third-party interop" below, which lists the four wire defects that only a
 third-party peer could surface. HelloRetryRequest/0-RTT/resumption/key
-update/CCM stay explicitly out of scope, not stubbed, and certificate mode
-is still self-interop only. The rest of this SPEC
+update/CCM stay explicitly out of scope, not stubbed. Certificate mode is
+**no longer self-interop only** — a live wolfSSL certificate server is now
+part of the suite (see "Live third-party interop"), including one run at a
+256-byte peer MTU that forces wolfSSL to fragment its Certificate across
+datagrams. The rest of this SPEC
 is the original design/recon notes; the itemized 15-function checklist below
 is retained as an implementation record (all 15 are done).
 
@@ -220,15 +223,22 @@ unaffected — proven by the untouched existing suite). Summary:
   early+handshake secrets byte-for-byte. §3 is a psk_dhe_ke trace, but its
   ECDHE math is identical and its early secret is over an all-zero PSK —
   exactly this mode's construction.
-- **Self-interop only (no external vector):** the full cert-only wire FLOW
-  (ClientHello→ServerHello→{EE,[CertReq],Cert,CertVerify,Finished}→…). **No
-  public DTLS 1.3 cert-only byte-trace exists**, so this is validated by
-  in-memory client↔server interop (server-only + mutual auth + reject-teeth:
-  tampered ServerHello key_share, wrong CertificateVerify key, untrusted
-  anchor, missing key_share) — NOT against a third-party peer. Certificate
-  mode is now the ONLY remaining self-interop-only surface: PSK mode is
-  covered by the live wolfSSL test, so the same class of shared-misreading
-  defect it found there (four of them) is still possible here.
+- **Live third-party peer (no external BYTE vector):** the full cert-only
+  wire FLOW (ClientHello→ServerHello→{EE,[CertReq],Cert,CertVerify,
+  Finished}→…). **No public DTLS 1.3 cert-only byte-trace exists**, so there
+  is no KAT for the flow itself; instead it is driven end to end against a
+  live wolfSSL 5.9.1 certificate server (PSK-less X25519 (EC)DHE + an ECDSA
+  P-256 chain that must verify against this repo's own trust anchor), and
+  additionally at a 256-byte peer MTU so the Certificate arrives fragmented.
+  The in-memory client↔server suite remains for the paths a single live peer
+  cannot drive — mutual auth and the reject-teeth (tampered ServerHello
+  key_share, wrong CertificateVerify key, untrusted anchor, missing
+  key_share). Going live immediately found a defect of exactly the class
+  self-interop cannot find: the `.cert_dhe` ClientHello carried no
+  `supported_versions`, so a real server negotiated DTLS 1.2. **Still
+  self-interop only within certificate mode:** MUTUAL authentication (our
+  client's own Certificate/CertificateVerify has never been checked by a
+  third party) and our server presenting a chain to a third-party client.
 
 **Untrusted-DER hazard (unchanged, inherited):** `.cert_dhe` mode parses the
 same PEER-supplied X.509 via the same `certauth` path, so it inherits the
@@ -347,10 +357,25 @@ two `Connection`s written from the same reading of the RFC cannot see.
   a `.cert_dhe` server with `hello_retry` set would emit a cookie-only retry
   its own client could not answer). The PSK path — the one this module's
   live oracle exercises — is unaffected.
-- **Cross-`handleFlight` fragment reassembly** — a handshake message split
-  across datagrams is rejected. wolfSSL did not split any flight at these
-  sizes, so this path is still untested against a real peer.
-- **Certificate mode** — self-interop only; the live test is PSK.
+- **Send-side fragmentation.** This engine reassembles what it RECEIVES but
+  never splits what it SENDS, so it needs a peer MTU large enough for its
+  own largest message (`max_cert_message_body` and friends). A peer that
+  advertises a tiny MTU can be talked to, but cannot be talked to with a
+  large certificate chain.
+- **A whole flight RETRANSMITTED verbatim into an incomplete
+  accumulation.** Fragmentation is handled; a peer resending an entire
+  flight it already sent, mid-reassembly, is rejected and the caller must
+  restart. Redundant fragments of the message being reassembled, and
+  retransmitted copies of messages already consumed, are both absorbed. See
+  `handleFlight`'s "KNOWN LIMIT".
+- **More than ONE in-progress inbound message.** A fragment of a later
+  handshake message arriving while an earlier one is incomplete is
+  `error.InterleavedFragments` rather than buffered — the deliberate cap on
+  attacker-driven memory (see `max_flight_bytes`). No conforming sender
+  produces that ordering.
+- **Certificate mode: MUTUAL auth against a third party.** The live cert
+  test verifies wolfSSL's chain; our own client certificate has still only
+  ever been checked by our own server.
 - **A second independent stack.** wolfSSL agreeing with us rules out the
   four defects above, but a bug the two happen to share would still pass.
   mbedTLS or picotls would be the natural cross-check.

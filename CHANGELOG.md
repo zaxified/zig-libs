@@ -44,6 +44,29 @@ The collection grew 77 → 148 modules since v0.1.0. Highlights, by area:
 
 Per-module API changes since v0.1.0 worth calling out:
 
+- **`dtls`:** handshake-message reassembly across `handleFlight` calls (RFC
+  9147 §5.2). A message split across datagrams — a certificate chain past
+  the path MTU, in practice — is now buffered and reassembled by
+  `fragment_offset` (never arrival order), tolerating out-of-order and
+  duplicate fragments; `error.FragmentedMessageUnsupported` is gone.
+  `HandshakeResult` gains `need_more_data` (defaulted, so existing
+  construction sites are unaffected): while a flight is incomplete the
+  connection is rolled back to its exact pre-call state, so a half-processed
+  flight never leaves the state machine, transcript, key schedule or
+  anti-replay windows half-advanced. The buffered bytes are unauthenticated
+  at handshake time, so the surface is capped: 4 KiB per flight
+  (`error.FlightTooLarge`), exactly one in-progress message
+  (`error.InterleavedFragments`), and a fragment contradicting bytes already
+  received is `error.OverlappingFragment` rather than overwriting them
+  (byte-identical re-delivery stays legal). `handshake.Reassembler` also
+  rejects a mid-message `msg_type` change (`error.InconsistentMessageType`).
+  Certificate mode is no longer self-interop only: the live wolfSSL suite
+  gains a PSK-less `.cert_dhe` handshake against a wolfSSL certificate
+  server, plus the same handshake at a 256-byte peer MTU so the peer's
+  Certificate really is fragmented. That found one more defect of the class
+  only a third party can find — the `.cert_dhe` ClientHello carried no
+  `supported_versions`, so a real DTLS 1.3 server negotiated 1.2.
+  Sending is still single-fragment.
 - **`x509`:** new `x509.spkiOf(certificate_der)` → `x509.Spki` — a
   certificate's `SubjectPublicKeyInfo` (full TLV + algorithm OID + parameters
   + key bits) extracted over the defensive `safe.zig` walk, never through

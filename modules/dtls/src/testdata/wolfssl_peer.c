@@ -2,10 +2,19 @@
 // either role, speaking PSK-only DTLS 1.3 on loopback.
 //
 //   cc -o wolfssl_peer wolfssl_peer.c -lwolfssl
-//   ./wolfssl_peer server <port>     # prints READY, then accepts + echoes
-//   ./wolfssl_peer server-hrr <port> # same, but with the DEFAULT cookie
-//                                    # exchange (HelloRetryRequest) left on
-//   ./wolfssl_peer client <port>     # connects, sends, expects the echo
+//   ./wolfssl_peer server <port>      # prints READY, then accepts + echoes
+//   ./wolfssl_peer server-hrr <port>  # same, but with the DEFAULT cookie
+//                                     # exchange (HelloRetryRequest) left on
+//   ./wolfssl_peer client <port>      # connects, sends, expects the echo
+//   ./wolfssl_peer server-cert <port> [mtu]
+//                                     # PSK-LESS certificate server: X25519
+//                                     # (EC)DHE + an ECDSA P-256 chain read
+//                                     # from ./server-cert.der +
+//                                     # ./server-key.der (written by the Zig
+//                                     # test from ITS OWN fixtures, so both
+//                                     # sides trust exactly one blob). An
+//                                     # optional MTU makes wolfSSL fragment
+//                                     # its Certificate across datagrams.
 //
 // Deliberate configuration, each item chosen to match what this module
 // implements — a mismatch here would make the test prove nothing:
@@ -136,6 +145,103 @@ static int run_server(int port, int hrr_cookie) {
     return 0;
 }
 
+// PSK-less certificate server (RFC 8446's ordinary certificate handshake,
+// carried by DTLS 1.3): X25519 (EC)DHE for the keys, an ECDSA P-256 leaf for
+// the identity. Deliberate choices, each mirroring what the Zig side can do:
+//
+//   * groups restricted to X25519 — the only group the Zig `.cert_dhe` mode
+//     implements. Leaving wolfSSL's default list on would let it pick P-256
+//     and the test would fail for an uninteresting reason.
+//   * `wolfSSL_disable_hrr_cookie` — the Zig client answers a
+//     HelloRetryRequest in PSK mode only, so the cookie exchange is off here
+//     (the HRR path already has its own live test in PSK mode).
+//   * `WOLFSSL_VERIFY_NONE` — no client certificate is requested; this test
+//     is about verifying the SERVER's chain.
+//   * `mtu`, when non-zero — the point of the exercise: it forces wolfSSL to
+//     split its Certificate/CertificateVerify flight into several datagrams,
+//     so the Zig side must genuinely reassemble to get anywhere.
+static int run_cert_server(int port, int mtu) {
+    WOLFSSL_CTX *ctx = wolfSSL_CTX_new(wolfDTLSv1_3_server_method());
+    if (!ctx) { fprintf(stderr, "CTX_new failed\n"); return 1; }
+    if (wolfSSL_CTX_use_certificate_file(ctx, "server-cert.der",
+                                         WOLFSSL_FILETYPE_ASN1) != WOLFSSL_SUCCESS) {
+        fprintf(stderr, "use_certificate_file failed\n");
+        return 1;
+    }
+    if (wolfSSL_CTX_use_PrivateKey_file(ctx, "server-key.der",
+                                        WOLFSSL_FILETYPE_ASN1) != WOLFSSL_SUCCESS) {
+        fprintf(stderr, "use_PrivateKey_file failed\n");
+        return 1;
+    }
+    if (wolfSSL_CTX_set_cipher_list(ctx, kSuite) != WOLFSSL_SUCCESS) {
+        fprintf(stderr, "set_cipher_list failed\n");
+        return 1;
+    }
+    int groups[] = {WOLFSSL_ECC_X25519};
+    if (wolfSSL_CTX_set_groups(ctx, groups, 1) != WOLFSSL_SUCCESS) {
+        fprintf(stderr, "set_groups failed\n");
+        return 1;
+    }
+    wolfSSL_CTX_set_verify(ctx, WOLFSSL_VERIFY_NONE, NULL);
+
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons((unsigned short)port);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        perror("bind");
+        return 1;
+    }
+    printf("READY\n");
+    fflush(stdout);
+
+    char probe[1];
+    struct sockaddr_in peer = {0};
+    socklen_t peer_len = sizeof(peer);
+    if (recvfrom(fd, probe, sizeof(probe), MSG_PEEK, (struct sockaddr *)&peer,
+                 &peer_len) < 0) {
+        perror("recvfrom peek");
+        return 1;
+    }
+    if (connect(fd, (struct sockaddr *)&peer, peer_len) != 0) {
+        perror("connect");
+        return 1;
+    }
+
+    WOLFSSL *ssl = wolfSSL_new(ctx);
+    wolfSSL_set_fd(ssl, fd);
+    wolfSSL_disable_hrr_cookie(ssl);
+    if (mtu > 0 && wolfSSL_dtls_set_mtu(ssl, (unsigned short)mtu) != WOLFSSL_SUCCESS) {
+        fprintf(stderr, "dtls_set_mtu(%d) failed\n", mtu);
+        return 1;
+    }
+    int rc = wolfSSL_accept(ssl);
+    if (rc != WOLFSSL_SUCCESS) {
+        int err = wolfSSL_get_error(ssl, rc);
+        char buf[80];
+        fprintf(stderr, "accept failed: %d (%s)\n", err,
+                wolfSSL_ERR_error_string((unsigned long)err, buf));
+        return 1;
+    }
+    printf("HANDSHAKE %s\n", wolfSSL_get_cipher(ssl));
+    fflush(stdout);
+
+    char msg[256];
+    int n = wolfSSL_read(ssl, msg, sizeof(msg) - 1);
+    if (n <= 0) { fprintf(stderr, "read failed\n"); return 1; }
+    msg[n] = '\0';
+    printf("RECV %s\n", msg);
+    fflush(stdout);
+    if (wolfSSL_write(ssl, msg, n) != n) { fprintf(stderr, "write failed\n"); return 1; }
+
+    wolfSSL_shutdown(ssl);
+    wolfSSL_free(ssl);
+    wolfSSL_CTX_free(ctx);
+    close(fd);
+    return 0;
+}
+
 static int run_client(int port) {
     WOLFSSL_CTX *ctx = wolfSSL_CTX_new(wolfDTLSv1_3_client_method());
     if (!ctx) { fprintf(stderr, "CTX_new failed\n"); return 1; }
@@ -189,17 +295,21 @@ static int run_client(int port) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 3) {
-        fprintf(stderr, "usage: %s server|client <port>\n", argv[0]);
+    if (argc != 3 && argc != 4) {
+        fprintf(stderr, "usage: %s server|server-hrr|server-cert|client <port> [mtu]\n",
+                argv[0]);
         return 2;
     }
     wolfSSL_Init();
     int port = atoi(argv[2]);
+    int mtu = (argc == 4) ? atoi(argv[3]) : 0;
     int rc;
     if (strcmp(argv[1], "server") == 0) {
         rc = run_server(port, 0);
     } else if (strcmp(argv[1], "server-hrr") == 0) {
         rc = run_server(port, 1);
+    } else if (strcmp(argv[1], "server-cert") == 0) {
+        rc = run_cert_server(port, mtu);
     } else {
         rc = run_client(port);
     }

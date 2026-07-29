@@ -78,10 +78,31 @@
 //!   uses `DTLSPlaintext` for exactly those unprotected records, and a real
 //!   peer accepts it.
 //!
-//!   STILL single-fragment: a handshake message split across datagrams is
-//!   rejected rather than reassembled across `handleFlight` calls.
-//!   Certificate mode remains SELF-interop only — see `Connection.zig`'s
-//!   "certificate mode" section.
+//!   RECEIVE-side fragment REASSEMBLY across `handleFlight` calls is now
+//!   implemented (RFC 9147 §5.2): a handshake message split across
+//!   datagrams is buffered and reassembled by `fragment_offset` — never by
+//!   arrival order — tolerating out-of-order and duplicate fragments, with
+//!   the connection rolled back to its pre-call state while the flight is
+//!   still incomplete (`HandshakeResult.need_more_data`). Because those
+//!   buffered bytes are UNAUTHENTICATED at handshake time, the surface is
+//!   explicitly bounded: `max_flight_bytes` (4 KiB) buffered per flight,
+//!   exactly ONE in-progress message, and a fragment that contradicts bytes
+//!   already received is rejected (`error.OverlappingFragment`) rather than
+//!   overwriting them — see `Connection.zig`'s "incoming-flight reassembly
+//!   bounds" section for the sizing argument. SENDING is still
+//!   single-fragment: this engine never splits a message it emits.
+//!
+//!   Certificate mode is ALSO live now: `wolfssl_interop.zig` drives a
+//!   PSK-less `.cert_dhe` handshake (X25519 (EC)DHE + an ECDSA P-256 chain
+//!   verified against this repo's own trust anchor) against a real wolfSSL
+//!   certificate server, and repeats it at a 256-byte peer MTU where
+//!   wolfSSL must fragment its Certificate — so reassembly and cert mode
+//!   are proven by the same external oracle. That found a FIFTH defect of
+//!   the same shape as the four above: the `.cert_dhe` ClientHello carried
+//!   no `supported_versions`, so a real DTLS 1.3 server negotiated 1.2.
+//!   What remains self-interop only inside certificate mode is MUTUAL
+//!   authentication (our own client certificate has never been checked by a
+//!   third party) and our server presenting a chain to a third-party client.
 //!
 //! **Certificate mode (RFC 8446 §4.4, ADDITIVE):** `Connection.Config` gains
 //! optional `cert`/`peer_verify`/`request_client_cert`/`require_peer_cert`/

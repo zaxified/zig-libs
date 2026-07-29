@@ -398,14 +398,31 @@ pub const HandshakeError = messages.MessageError || handshake.FrameError || hand
     /// usable shared secret could be computed. Rejected rather than used —
     /// an identity shared secret would be catastrophic.
     KeyExchangeFailed,
-    /// A peer sent a handshake message across more than one DTLS fragment.
-    /// This engine only ever SENDS single-fragment messages (they're all
-    /// small enough), and only ever RECEIVES single-fragment messages from
-    /// itself in the loopback tests; genuine multi-datagram reassembly
-    /// across `handleFlight` calls is out of scope (`handshake.zig`'s
-    /// `Reassembler` is still exercised — see `reassembleFragment` below —
-    /// just not carried across calls).
-    FragmentedMessageUnsupported,
+    /// INTERNAL to the flight engine: the datagrams buffered so far do not
+    /// yet contain a complete flight (a handshake message is still missing
+    /// fragments, or the flight's closing message has not arrived). Never
+    /// escapes `handleFlight` — it is what makes that function roll the
+    /// connection back and answer `HandshakeResult.need_more_data` instead.
+    /// It is a member of this error set only because the internal
+    /// per-message parsers share it.
+    FlightIncomplete,
+    /// The datagrams buffered for ONE incoming flight exceed
+    /// `max_flight_bytes`. Reassembly across datagrams means holding
+    /// UNAUTHENTICATED bytes (the handshake is not yet authenticated), so
+    /// the buffer is capped and overflowing it is a typed error rather than
+    /// an ever-growing allocation: without the cap, a peer that sends
+    /// fragments forever and never completes a message is a memory-
+    /// exhaustion vector. The accumulator is dropped when this is raised;
+    /// the caller decides whether to keep the association.
+    FlightTooLarge,
+    /// A fragment of a LATER handshake message arrived while an earlier one
+    /// is still incomplete. This engine reassembles exactly ONE message at a
+    /// time (see `takeHandshakeMessage`) — that is the cap on "how many
+    /// in-progress messages may a peer make this side hold", and it is 1.
+    /// Fragments of messages this side has ALREADY consumed are skipped
+    /// (they are ordinary retransmission), so this names only the
+    /// genuinely-interleaved case, which no conforming sender produces.
+    InterleavedFragments,
 } || CertModeError;
 
 /// Certificate-mode-specific errors (RFC 8446 §4.4) — see this file's
@@ -511,20 +528,96 @@ const content_type_handshake: u8 = 22;
 /// that value.
 const content_type_ack: u8 = 26;
 
+// ── incoming-flight reassembly bounds (RFC 9147 §5.2) ────────────────────
+//
+// A handshake message may arrive split across several datagrams, so
+// `handleFlight` buffers a flight's datagrams until the flight is complete
+// (see that function). At handshake time NOTHING in those bytes is
+// authenticated yet — an off-path attacker can inject datagrams at will —
+// so every dimension of that buffering is bounded, explicitly, here:
+//
+//   * BYTES: `max_flight_bytes`. Sized from the largest flight this engine
+//     can actually process — ServerHello + EncryptedExtensions +
+//     CertificateRequest + Certificate (`max_cert_message_body`) +
+//     CertificateVerify (`max_certverify_body`) + Finished is ~2.2 KB of
+//     message bodies — plus per-fragment framing overhead (12-byte
+//     handshake header + record header + 16-byte AEAD tag per fragment,
+//     ~40 bytes each, so ~0.4 KB even at a 256-byte peer MTU), leaving
+//     roughly 1.5 KB of headroom for one retransmitted prefix landing in
+//     the same buffer. A peer that exceeds it gets `error.FlightTooLarge`
+//     and the buffer is dropped, rather than the buffer growing.
+//   * IN-PROGRESS MESSAGES: exactly ONE (`takeHandshakeMessage`
+//     reassembles a single message at a time and rejects a fragment of a
+//     later message with `error.InterleavedFragments`), so a peer cannot
+//     make this side hold N half-messages by opening N of them.
+//   * FRAGMENT COUNT: implied by the byte cap — every record consumes at
+//     least two bytes of the buffer, so the loop is bounded by it and
+//     needs no separate counter.
+//
+// These are per-`Connection` fixed arrays: no allocator, nothing grows.
+const max_flight_bytes: usize = 4096;
+
+/// Upper bound on the plaintext this engine will recover from ONE record
+/// while reassembling. A record can never be larger than the flight buffer
+/// that holds it, so this is the same number.
+const max_record_plaintext: usize = max_flight_bytes;
+
+/// Which record format the next handshake fragment is wrapped in — the two
+/// are not interchangeable and the flight engine always knows which it
+/// expects: `DTLSPlaintext` before any keys exist (ClientHello/ServerHello,
+/// RFC 9147 §4), the AEAD-protected unified header afterwards.
+const RecordKind = enum { epoch0_plaintext, epoch2_protected };
+
+/// One fully-reassembled handshake message. `body` points into the
+/// caller-supplied reassembly buffer, never into a decrypted-record scratch
+/// buffer, so it stays valid after `takeHandshakeMessage` returns.
+const TakenMessage = struct {
+    msg_type: u8,
+    body: []const u8,
+    message_seq: u16,
+};
+
+/// The epoch-2 record sequence numbers consumed while reading a flight —
+/// what an RFC 9147 §7 ACK for that flight has to name. Silently stops
+/// collecting past its capacity: an ACK naming a prefix of the flight is
+/// valid, and a peer must not be able to size this side's bookkeeping.
+const AckCollector = struct {
+    buf: [4]flight.RecordNumber = undefined,
+    len: usize = 0,
+
+    fn add(self: *AckCollector, sequence_number: u64) void {
+        if (self.len >= self.buf.len) return;
+        self.buf[self.len] = .{ .epoch = handshake_epoch, .sequence_number = sequence_number };
+        self.len += 1;
+    }
+
+    fn items(self: *const AckCollector) []const flight.RecordNumber {
+        return self.buf[0..self.len];
+    }
+};
+
+/// RFC 9147 §5.2 `message_seq` ordering, wrap-aware: is `a` strictly BEHIND
+/// `b`? A handshake uses a handful of consecutive values, so the only thing
+/// that matters is that the comparison does not misread `0` as newer than
+/// `65535` — the same "half the space is the past" convention the record
+/// layer's sequence-number reconstruction uses.
+fn messageSeqOlderThan(a: u16, b: u16) bool {
+    const delta = b -% a;
+    return delta != 0 and delta < 0x8000;
+}
+
 // ── certificate-mode sizing constants ────────────────────────────────────
 //
-// `protectHandshakeMessage`'s own `inner_buf` is a fixed 1500 bytes (this
-// engine's established "single DTLS record, single fragment" simplification
-// — see `root.zig`'s SCOPE CAVEAT), so every certificate-mode message this
-// engine SENDS must fit that ceiling too; these constants stay comfortably
-// under it while covering realistic single/short chains (proven by the
-// ECDSA P-256 chains in `Connection.zig`'s own cert-mode tests, and the
-// RSA-2048 leaf in `certauth.zig`'s standalone bridge tests). A longer
-// chain (multiple intermediates, or several KB of RSA-4096 certificates) is
-// out of scope here for the same reason real multi-fragment messages are
-// (see `FragmentedMessageUnsupported`'s doc comment) — a caller with larger
-// chains needs actual DTLS fragmentation across `handleFlight` calls, which
-// this module does not implement.
+// `protectHandshakeMessage`'s own `inner_buf` is a fixed 1500 bytes, and
+// this engine only ever SENDS single-fragment messages (it never fragments
+// on transmit — see `frameHandshakeMessage`), so every certificate-mode
+// message this engine sends must fit that ceiling; these constants stay
+// comfortably under it while covering realistic single/short chains (proven
+// by the ECDSA P-256 chains in `Connection.zig`'s own cert-mode tests, and
+// the RSA-2048 leaf in `certauth.zig`'s standalone bridge tests). Note the
+// asymmetry: RECEIVING a fragmented message IS supported (see
+// `max_flight_bytes` above); it is only the sending side that still emits
+// one fragment per message, which needs a peer MTU that fits it.
 const max_cert_message_body: usize = 1200;
 const max_certverify_body: usize = 600;
 const max_certreq_body: usize = 128;
@@ -884,6 +977,23 @@ pub const Connection = struct {
     pending_flight_buf: [8]flight.RecordNumber = undefined,
     pending_flight_count: usize = 0,
 
+    // ── incoming-flight accumulation (RFC 9147 §5.2 reassembly) ─────────
+    /// Datagrams received for the flight currently being consumed,
+    /// concatenated. Non-empty only while a flight is INCOMPLETE — every
+    /// `handleFlight` call that finishes a flight (or fails) empties it, so
+    /// the single-datagram case never carries anything between calls.
+    /// Bounded by construction; see `max_flight_bytes`.
+    rx_flight: [max_flight_bytes]u8 = undefined,
+    rx_flight_len: usize = 0,
+    /// RFC 9147 §5.2's `message_seq` of the next handshake message expected
+    /// FROM the peer (this side's own counter is `message_seq`). `null`
+    /// until the first inbound message fixes the baseline — which it must,
+    /// because a stateless server's second ClientHello arrives on a
+    /// brand-new `Connection` already carrying `message_seq = 1` (see
+    /// `acceptCookie`). Fragments below this are treated as retransmission
+    /// and skipped; fragments above it are `error.InterleavedFragments`.
+    peer_message_seq: ?u16 = null,
+
     pub const InitError = ConfigError;
 
     pub fn clientInit(config: Config) InitError!Connection {
@@ -903,6 +1013,18 @@ pub const Connection = struct {
         out: []const u8,
         /// `true` once THIS call has driven the connection to `.connected`.
         done: bool,
+        /// `true` when the datagram was CONSUMED BUT the flight is still
+        /// incomplete — a handshake message is split across datagrams (RFC
+        /// 9147 §5.2) and the rest has not arrived. `out` is empty and the
+        /// connection is byte-for-byte unchanged apart from the buffered
+        /// bytes; feed the next datagram to the same `Connection`.
+        ///
+        /// A caller that ignores this field still behaves correctly — it
+        /// sees an empty `out` and a not-`done` result, which is exactly
+        /// "send nothing, read again" — so it exists to be ASSERTED on
+        /// (a test that wants to prove reassembly really happened, rather
+        /// than that the handshake merely completed).
+        need_more_data: bool = false,
     };
 
     /// Client-only: builds and sends flight 1 (RFC 9147 §5.3) — a
@@ -951,11 +1073,78 @@ pub const Connection = struct {
     /// noise) — harmless to pass through unconditionally otherwise. Errors
     /// are always typed (a wrong PSK, a tampered record, an out-of-order
     /// message, ...) — never a panic.
+    ///
+    /// **Reassembly across calls (RFC 9147 §5.2).** A flight need not arrive
+    /// in one datagram, and a single handshake message need not either — a
+    /// certificate chain routinely exceeds the path MTU, so a real peer
+    /// fragments it. Each datagram is therefore appended to a bounded
+    /// per-connection buffer (`max_flight_bytes`) and the flight is parsed
+    /// from the accumulation. While the flight is still incomplete this
+    /// returns `need_more_data` with an empty `out`, and — this is the part
+    /// that makes it safe — the connection is ROLLED BACK to exactly the
+    /// state it had before the call, so a half-processed flight can never
+    /// leave the state machine, the transcript, the key schedule or the
+    /// anti-replay windows half-advanced. `Connection` is a self-contained
+    /// value (fixed arrays, no allocator, no pointers into itself), which is
+    /// what makes a snapshot/restore a legitimate transaction rather than a
+    /// shallow copy that aliases something.
+    ///
+    /// The cost of that simplicity is that an incomplete flight is re-parsed
+    /// from its first record when the next datagram arrives (including
+    /// re-running the AEAD on records already seen). That is bounded by
+    /// `max_flight_bytes` and happens only on the fragmented path; the
+    /// single-datagram case parses exactly once, as before.
+    ///
+    /// KNOWN LIMIT (documented, not silently broken): what the accumulation
+    /// tolerates is a peer that FRAGMENTS — the same flight arriving in
+    /// pieces. A peer that instead RETRANSMITS a whole flight it already
+    /// sent, verbatim, into the middle of an incomplete accumulation is
+    /// rejected (the duplicated records re-enter the parse out of position,
+    /// surfacing as `error.Malformed` or `error.ReplayedRecord`), and the
+    /// caller must restart the association. Redundant fragments OF THE
+    /// MESSAGE BEING REASSEMBLED are fine — that case is the ordinary one
+    /// and `handshake.Reassembler` absorbs it — as are retransmitted copies
+    /// of messages already consumed, which `takeHandshakeMessage` skips by
+    /// `message_seq`. This is no worse than the pre-reassembly engine (which
+    /// answered a retransmitted flight with `error.WrongState`), but it is
+    /// not the full RFC 9147 §5.7 receiver either.
     pub fn handleFlight(self: *Connection, datagram: []const u8, random: std.Random, now_ms: u64, out: []u8) HandshakeError!HandshakeResult {
-        return switch (self.role) {
-            .server => self.handleFlightServer(datagram, random, now_ms, out),
-            .client => self.handleFlightClient(datagram, random, now_ms, out),
+        if (datagram.len > self.rx_flight.len - self.rx_flight_len) {
+            self.rx_flight_len = 0;
+            return error.FlightTooLarge;
+        }
+        @memcpy(self.rx_flight[self.rx_flight_len..][0..datagram.len], datagram);
+        self.rx_flight_len += datagram.len;
+
+        // Taken AFTER the append, so a rollback keeps the newly-buffered
+        // bytes while undoing everything the parse below did.
+        var saved = self.*;
+        // The snapshot is a full copy of the connection, key material
+        // included; it must not outlive the call on the stack.
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&saved));
+
+        // Aliases `self.rx_flight`. Nothing on the parse path writes that
+        // field (only `handleFlight` itself does), which is what makes
+        // handing a slice of `self` to a `*Connection` method safe here.
+        const input = self.rx_flight[0..self.rx_flight_len];
+        const result = switch (self.role) {
+            .server => self.handleFlightServer(input, random, now_ms, out),
+            .client => self.handleFlightClient(input, random, now_ms, out),
+        } catch |err| switch (err) {
+            error.FlightIncomplete => {
+                self.* = saved;
+                return .{ .out = out[0..0], .done = false, .need_more_data = true };
+            },
+            // A real protocol/crypto failure ends this flight: drop the
+            // accumulation so the next datagram is not parsed as a
+            // continuation of a flight that already failed.
+            else => {
+                self.rx_flight_len = 0;
+                return err;
+            },
         };
+        self.rx_flight_len = 0;
+        return result;
     }
 
     /// Caller-clocked retransmission (RFC 9147 §5.7): if this side is
@@ -1334,7 +1523,20 @@ pub const Connection = struct {
         const ks_entries = [_]messages.KeyShareEntry{.{ .group = x25519_group, .key_exchange = &self.ecdhe_public }};
         const ks_ext = try messages.encodeKeyShareClientHello(&ks_entries, &ks_buf);
 
+        // RFC 8446 §4.2.1 / §D.1: `supported_versions` is the ONLY place a
+        // 1.3 handshake is negotiated — every version field on the wire
+        // still reads DTLS 1.2. Omitting it (as an earlier version of this
+        // function did) makes a real DTLS 1.3 server negotiate 1.2 and the
+        // handshake dies at the first record; self-interop never noticed,
+        // because this module's own server never looked. The PSK
+        // ClientHello above has carried it since the same defect was found
+        // there against wolfSSL — see `root.zig`'s note on the four wire
+        // defects self-interop passed.
+        var versions_buf: [3]u8 = undefined;
+        const versions_ext = try messages.encodeSupportedVersionsClientHello(&.{messages.version_dtls13}, &versions_buf);
+
         const exts = [_]messages.Extension{
+            .{ .ext_type = @intFromEnum(messages.ExtensionType.supported_versions), .data = versions_ext },
             .{ .ext_type = @intFromEnum(messages.ExtensionType.supported_groups), .data = groups_ext },
             sigalgs_ext,
             .{ .ext_type = @intFromEnum(messages.ExtensionType.key_share), .data = ks_ext },
@@ -1490,6 +1692,94 @@ pub const Connection = struct {
 
         if (seq_out) |p| p.* = full_seq;
         return out[0 .. end - 1];
+    }
+
+    /// Pulls exactly ONE complete handshake message out of `datagram`,
+    /// starting at record boundary `pos.*` and consuming as many records as
+    /// that takes — which is the whole point: a message split across
+    /// fragments (RFC 9147 §5.2) is reassembled here, and because
+    /// `handleFlight` concatenates a flight's datagrams before calling in,
+    /// "several records" transparently spans "several datagrams".
+    ///
+    /// Ordering is by `fragment_offset`, never by arrival: `handshake
+    /// .Reassembler` writes each fragment at its own offset and reports
+    /// completion only once every byte of `[0, length)` has arrived. A
+    /// reader that instead appended fragments in the order they showed up
+    /// would agree with itself on the happy path and silently corrupt the
+    /// transcript on a reordered one.
+    ///
+    /// `message_seq` demultiplexing (this side's view of the peer's counter
+    /// lives in `peer_message_seq`):
+    ///   * equal to the expected value — a fragment of the message being
+    ///     read;
+    ///   * BEHIND it — a retransmitted copy of a message already consumed
+    ///     (a peer that did not see this side's answer resends its whole
+    ///     flight, so this is ordinary, not an attack): skipped;
+    ///   * AHEAD of it — `error.InterleavedFragments`. Accepting it would
+    ///     mean holding a second half-built message, and one is the
+    ///     documented cap (see `max_flight_bytes`).
+    ///
+    /// Running out of records is `error.FlightIncomplete`, which is NOT a
+    /// failure — `handleFlight` turns it into "send me the next datagram".
+    /// A record whose own length field runs past the buffer IS a failure:
+    /// DTLS never splits a RECORD across datagrams, so there is no later
+    /// datagram that could complete one.
+    fn takeHandshakeMessage(
+        self: *Connection,
+        datagram: []const u8,
+        pos: *usize,
+        kind: RecordKind,
+        msg_buf: []u8,
+        received_buf: []bool,
+        acks: ?*AckCollector,
+    ) HandshakeError!TakenMessage {
+        var reasm: handshake.Reassembler = undefined;
+        var reasm_live = false;
+
+        while (true) {
+            if (pos.* >= datagram.len) return error.FlightIncomplete;
+
+            var plain_buf: [max_record_plaintext]u8 = undefined;
+            const fragment = switch (kind) {
+                .epoch0_plaintext => blk: {
+                    const rec = record.decodePlaintext(datagram[pos.*..]) catch return error.Malformed;
+                    if (rec.content_type != content_type_handshake) return error.UnexpectedMessage;
+                    const start = pos.* + record.plaintext_header_len;
+                    if (datagram.len < start + rec.length) return error.Malformed;
+                    pos.* = start + rec.length;
+                    break :blk datagram[start..][0..rec.length];
+                },
+                .epoch2_protected => blk: {
+                    var record_seq: u64 = 0;
+                    const f = try self.unprotectHandshakeMessage(datagram[pos.*..], &plain_buf, &record_seq);
+                    pos.* += try recordWireLen(datagram[pos.*..]);
+                    if (acks) |a| a.add(record_seq);
+                    break :blk f;
+                },
+            };
+
+            const hdr = handshake.decodeHeader(fragment) catch return error.Malformed;
+            if (fragment.len < handshake.header_len + hdr.fragment_length) return error.Malformed;
+            const frag_body = fragment[handshake.header_len..][0..hdr.fragment_length];
+
+            const expected = self.peer_message_seq orelse hdr.message_seq;
+            if (hdr.message_seq != expected) {
+                if (messageSeqOlderThan(hdr.message_seq, expected)) continue;
+                return error.InterleavedFragments;
+            }
+            self.peer_message_seq = expected;
+
+            if (hdr.length > msg_buf.len) return error.BufferTooShort;
+            if (!reasm_live) {
+                reasm = handshake.Reassembler.init(msg_buf[0..hdr.length], received_buf[0..hdr.length]);
+                reasm_live = true;
+            }
+
+            if (try reasm.feed(hdr, frag_body)) |body| {
+                self.peer_message_seq = expected +% 1;
+                return .{ .msg_type = reasm.msg_type, .body = body, .message_seq = expected };
+            }
+        }
     }
 
     /// RFC 9147 §7 flight bookkeeping: records the given (epoch, seq) pairs
@@ -1708,8 +1998,7 @@ pub const Connection = struct {
         /// client's final flight is the one flight the spec does NOT let a
         /// receiver acknowledge implicitly, so the server has to send these
         /// back or the peer never learns its Finished arrived.
-        acked_buf: [4]flight.RecordNumber = undefined,
-        acked_len: usize = 0,
+        acks: AckCollector = .{},
         /// The closing `Finished` message's body (its `verify_data`),
         /// consumed by this same function — see the doc comment below for
         /// why `unprotectHandshakeMessage` cannot be safely called a second
@@ -1739,8 +2028,9 @@ pub const Connection = struct {
     /// anti-replay window advances on every successful call — a second
     /// call on the same wire bytes would see its own already-accepted
     /// sequence number and spuriously fail with `error.ReplayedRecord`).
-    /// Every message consumed is reassembled (single-fragment only, like
-    /// the rest of this engine), appended to the transcript, and (for
+    /// Every message consumed is reassembled via `takeHandshakeMessage`
+    /// (so a Certificate split across datagrams — the usual case for a real
+    /// chain — is handled here), appended to the transcript, and (for
     /// Certificate/CertificateVerify) cryptographically verified via
     /// `verifyPeerCert` — so a caller that gets a successful return already
     /// has a fully-verified peer chain (if one was presented) AND the
@@ -1748,7 +2038,7 @@ pub const Connection = struct {
     ///
     /// In the pure-PSK case (no certificate-mode messages sent), the very
     /// first message found is `finished` and this behaves exactly like the
-    /// original inline `unprotectHandshakeMessage` + `reassembleFragment`
+    /// original inline `unprotectHandshakeMessage` + reassembly
     /// call it replaces — byte-for-byte the same wire behavior.
     ///
     /// `signer_side`: whose CertificateVerify this is, if one appears
@@ -1769,19 +2059,10 @@ pub const Connection = struct {
         var iterations: usize = 0;
         while (true) : (iterations += 1) {
             if (iterations >= 4) return error.Malformed; // CertReq?, Cert?, CertVerify?, Finished — never more
-            if (pos.* >= datagram.len) return error.Malformed;
 
-            var plain_buf: [max_cert_message_body + 64]u8 = undefined;
-            var record_seq: u64 = 0;
-            const fragment = try self.unprotectHandshakeMessage(datagram[pos.*..], &plain_buf, &record_seq);
-            if (result.acked_len < result.acked_buf.len) {
-                result.acked_buf[result.acked_len] = .{ .epoch = handshake_epoch, .sequence_number = record_seq };
-                result.acked_len += 1;
-            }
-            pos.* += try recordWireLen(datagram[pos.*..]);
             var msg_buf: [max_cert_message_body]u8 = undefined;
             var received_buf: [max_cert_message_body]bool = undefined;
-            const parsed = try reassembleFragment(fragment, &msg_buf, &received_buf);
+            const parsed = try self.takeHandshakeMessage(datagram, pos, .epoch2_protected, &msg_buf, &received_buf, &result.acks);
 
             if (parsed.msg_type == @intFromEnum(messages.HandshakeType.finished)) {
                 if (parsed.body.len > result.fin_buf.len) return error.Malformed;
@@ -1957,14 +2238,10 @@ pub const Connection = struct {
     /// keys). Derives (but does not yet install) the application traffic
     /// secrets. Transitions `.start` -> `.wait_finished`.
     fn serverProcessClientHello(self: *Connection, datagram: []const u8, random: std.Random, now_ms: u64, out: []u8) HandshakeError!HandshakeResult {
-        const ch_rec = record.decodePlaintext(datagram) catch return error.Malformed;
-        if (ch_rec.content_type != content_type_handshake) return error.UnexpectedMessage;
-        if (datagram.len < record.plaintext_header_len + ch_rec.length) return error.Malformed;
-        const ch_fragment = datagram[record.plaintext_header_len..][0..ch_rec.length];
-
         var msg_buf: [512]u8 = undefined;
         var received_buf: [512]bool = undefined;
-        const parsed = try reassembleFragment(ch_fragment, &msg_buf, &received_buf);
+        var ch_pos: usize = 0;
+        const parsed = try self.takeHandshakeMessage(datagram, &ch_pos, .epoch0_plaintext, &msg_buf, &received_buf, null);
         if (parsed.msg_type != @intFromEnum(messages.HandshakeType.client_hello)) return error.UnexpectedMessage;
         const ch_body = parsed.body;
 
@@ -2322,7 +2599,7 @@ pub const Connection = struct {
         // records, which §7 explicitly allows (the ACK's epoch must be equal
         // to or higher than the records it acknowledges).
         var ack_body_buf: [2 + 4 * flight.record_number_len]u8 = undefined;
-        const ack_body = flight.encodeAck(cert_result.acked_buf[0..cert_result.acked_len], &ack_body_buf) catch
+        const ack_body = flight.encodeAck(cert_result.acks.items(), &ack_body_buf) catch
             return error.BufferTooShort;
         const ack_record = try self.protectRecord(content_type_ack, ack_body, out);
         return .{ .out = ack_record, .done = true };
@@ -2414,15 +2691,10 @@ pub const Connection = struct {
     fn handleFlightClient(self: *Connection, datagram: []const u8, random: std.Random, now_ms: u64, out: []u8) HandshakeError!HandshakeResult {
         if (self.state != .wait_server_hello) return error.WrongState;
 
-        const sh_rec = record.decodePlaintext(datagram) catch return error.Malformed;
-        if (sh_rec.content_type != content_type_handshake) return error.UnexpectedMessage;
-        if (datagram.len < record.plaintext_header_len + sh_rec.length) return error.Malformed;
-        var pos: usize = record.plaintext_header_len + sh_rec.length;
-        const sh_fragment = datagram[record.plaintext_header_len..][0..sh_rec.length];
-
+        var pos: usize = 0;
         var sh_msg_buf: [256]u8 = undefined;
         var sh_received_buf: [256]bool = undefined;
-        const sh_parsed = try reassembleFragment(sh_fragment, &sh_msg_buf, &sh_received_buf);
+        const sh_parsed = try self.takeHandshakeMessage(datagram, &pos, .epoch0_plaintext, &sh_msg_buf, &sh_received_buf, null);
         if (sh_parsed.msg_type != @intFromEnum(messages.HandshakeType.server_hello)) return error.UnexpectedMessage;
 
         var ext_buf: [8]messages.Extension = undefined;
@@ -2494,13 +2766,9 @@ pub const Connection = struct {
         self.hs_write_keys = deriveDir(Hkdf, params, hst.client);
         self.hs_read_keys = deriveDir(Hkdf, params, hst.server);
 
-        if (pos >= datagram.len) return error.Malformed;
-        var ee_plain_buf: [128]u8 = undefined;
-        const ee_fragment = try self.unprotectHandshakeMessage(datagram[pos..], &ee_plain_buf, null);
-        pos += try recordWireLen(datagram[pos..]);
         var ee_msg_buf: [64]u8 = undefined;
         var ee_received_buf: [64]bool = undefined;
-        const ee_parsed = try reassembleFragment(ee_fragment, &ee_msg_buf, &ee_received_buf);
+        const ee_parsed = try self.takeHandshakeMessage(datagram, &pos, .epoch2_protected, &ee_msg_buf, &ee_received_buf, null);
         if (ee_parsed.msg_type != @intFromEnum(messages.HandshakeType.encrypted_extensions)) return error.UnexpectedMessage;
         self.transcript.append(@intFromEnum(messages.HandshakeType.encrypted_extensions), ee_parsed.body);
 
@@ -2784,17 +3052,16 @@ fn frameHandshakeMessage(msg_type: u8, message_seq: u16, body: []const u8, frag_
     return fragmenter.next(max_len, frag_out) orelse return error.BufferTooShort;
 }
 
-/// Reassembles ONE `handshake.zig` fragment (this engine never splits a
-/// message across more than one fragment, so `Reassembler.feed`'s first
-/// call always either completes the message or — if `fragment_bytes` lied
-/// about covering the whole declared length — the message is incomplete,
-/// which this engine treats as `error.FragmentedMessageUnsupported` rather
-/// than waiting for a fragment that will never come).
-fn reassembleFragment(
+/// Decodes ONE self-contained (single-fragment) handshake message from
+/// `fragment_bytes`. Used only where the message is known to be complete in
+/// one fragment because THIS engine produced it — `frameHandshakeMessage`
+/// never fragments on transmit. Receiving is the general case and goes
+/// through `Connection.takeHandshakeMessage` instead.
+fn decodeSingleFragmentMessage(
     fragment_bytes: []const u8,
     msg_buf: []u8,
     received_buf: []bool,
-) HandshakeError!struct { msg_type: u8, body: []const u8, message_seq: u16 } {
+) HandshakeError!TakenMessage {
     const hdr = handshake.decodeHeader(fragment_bytes) catch return error.Malformed;
     if (fragment_bytes.len < handshake.header_len + hdr.fragment_length) return error.Malformed;
     const frag_body = fragment_bytes[handshake.header_len..][0..hdr.fragment_length];
@@ -2802,7 +3069,7 @@ fn reassembleFragment(
 
     var reasm = handshake.Reassembler.init(msg_buf[0..hdr.length], received_buf[0..hdr.length]);
     const complete = (reasm.feed(hdr, frag_body) catch return error.Malformed) orelse
-        return error.FragmentedMessageUnsupported;
+        return error.FlightIncomplete;
     return .{ .msg_type = hdr.msg_type, .body = complete, .message_seq = hdr.message_seq };
 }
 
@@ -3078,6 +3345,420 @@ test "handshake: full client<->server loopback interop — ChaCha20-Poly1305" {
     try loopbackHandshake(.chacha20_poly1305_sha256);
 }
 
+// ── RFC 9147 §5.2 reassembly across datagrams ───────────────────────────
+//
+// Every fragment below is built BYTE BY BYTE by the two helpers that
+// follow, NOT by `handshake.Fragmenter`. That is deliberate: a test that
+// produces its fragments with the same encoder the code under test decodes
+// with stays green under any mutation both halves share — swap the
+// `fragment_offset` and `fragment_length` fields in both, and a round trip
+// still round-trips. These helpers are an independent second opinion about
+// the wire layout, pinned in turn by `handshake.zig`'s hand-built
+// golden-bytes header test and by the live wolfSSL peer.
+//
+// The acceptance criterion is also deliberately cryptographic rather than
+// structural: a ClientHello reassembled in the wrong ORDER still parses as
+// a ClientHello, but its PSK binder (computed over the reassembled body)
+// cannot verify, and a wrongly-reassembled Finished cannot match its
+// `verify_data`. So these tests fail loudly on "assembled something, just
+// not the right bytes", which a `expectEqual(body)` check on our own
+// fragmenter's output would not.
+
+/// One RFC 9147 §5.2 handshake fragment: the 12-byte header written out
+/// field by field, followed by this fragment's slice of the body.
+fn handBuiltHandshakeFragment(
+    msg_type: u8,
+    total_len: u24,
+    message_seq: u16,
+    fragment_offset: u24,
+    fragment: []const u8,
+    out: []u8,
+) []const u8 {
+    out[0] = msg_type;
+    out[1] = @truncate(total_len >> 16);
+    out[2] = @truncate(total_len >> 8);
+    out[3] = @truncate(total_len);
+    out[4] = @truncate(message_seq >> 8);
+    out[5] = @truncate(message_seq);
+    out[6] = @truncate(fragment_offset >> 16);
+    out[7] = @truncate(fragment_offset >> 8);
+    out[8] = @truncate(fragment_offset);
+    const fragment_length: u24 = @intCast(fragment.len);
+    out[9] = @truncate(fragment_length >> 16);
+    out[10] = @truncate(fragment_length >> 8);
+    out[11] = @truncate(fragment_length);
+    @memcpy(out[12..][0..fragment.len], fragment);
+    return out[0 .. 12 + fragment.len];
+}
+
+/// One epoch-0 `DTLSPlaintext` record (RFC 9147 §4) carrying `payload`,
+/// likewise written field by field.
+fn handBuiltPlaintextRecord(sequence_number: u48, payload: []const u8, out: []u8) []const u8 {
+    out[0] = 22; // ContentType.handshake
+    out[1] = 0xFE; // legacy_version = DTLS 1.2
+    out[2] = 0xFD;
+    out[3] = 0; // epoch 0
+    out[4] = 0;
+    std.mem.writeInt(u48, out[5..11], sequence_number, .big);
+    std.mem.writeInt(u16, out[11..13], @intCast(payload.len), .big);
+    @memcpy(out[13..][0..payload.len], payload);
+    return out[0 .. 13 + payload.len];
+}
+
+/// The `(msg_type, length, message_seq, body)` of the single handshake
+/// message inside an epoch-0 record this engine produced.
+const SplitSource = struct {
+    msg_type: u8,
+    total_len: u24,
+    message_seq: u16,
+    body: [1024]u8,
+    body_len: usize,
+
+    fn slice(self: *const SplitSource) []const u8 {
+        return self.body[0..self.body_len];
+    }
+};
+
+fn splitSourceFromEpoch0(record_bytes: []const u8) !SplitSource {
+    const rec = try record.decodePlaintext(record_bytes);
+    const fragment = record_bytes[record.plaintext_header_len..][0..rec.length];
+    const hdr = try handshake.decodeHeader(fragment);
+    var out: SplitSource = .{
+        .msg_type = hdr.msg_type,
+        .total_len = hdr.length,
+        .message_seq = hdr.message_seq,
+        .body = undefined,
+        .body_len = hdr.fragment_length,
+    };
+    // Only a message this engine emitted is used as a splitting source, and
+    // it never fragments on transmit — so the one fragment IS the message.
+    try testing.expectEqual(hdr.length, hdr.fragment_length);
+    @memcpy(out.body[0..out.body_len], fragment[handshake.header_len..][0..out.body_len]);
+    return out;
+}
+
+test "reassembly: a ClientHello split across two datagrams, delivered OUT OF ORDER" {
+    const psk_identity = "device-042";
+    const psk = "a-shared-pre-shared-key";
+    var client = try Connection.clientInit(.{ .role = .client, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} });
+    var server = try Connection.serverInit(.{ .role = .server, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} });
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x77} ** 32);
+    const rnd = testRandom(&csprng);
+
+    var buf1: [1500]u8 = undefined;
+    var buf2: [1500]u8 = undefined;
+    const ch = try client.startHandshake(rnd, 0, &buf1);
+    const src = try splitSourceFromEpoch0(ch);
+    const split = src.body_len / 2;
+    try testing.expect(split > 0);
+
+    // Second half FIRST — the reassembler must order by `fragment_offset`,
+    // not by arrival.
+    var frag_buf_b: [1500]u8 = undefined;
+    var rec_buf_b: [1500]u8 = undefined;
+    const tail = handBuiltHandshakeFragment(src.msg_type, src.total_len, src.message_seq, @intCast(split), src.slice()[split..], &frag_buf_b);
+    const datagram_b = handBuiltPlaintextRecord(1, tail, &rec_buf_b);
+
+    const before_state = server.state;
+    const before_message_seq = server.message_seq;
+    const before_peer_seq = server.peer_message_seq;
+    const before_transcript = server.transcript.currentHash();
+    const before_hs0 = server.hs0;
+    const before_hs2 = server.hs2;
+
+    const step1 = try server.handleFlight(datagram_b, rnd, 0, &buf2);
+    try testing.expect(step1.need_more_data);
+    try testing.expect(!step1.done);
+    try testing.expectEqual(@as(usize, 0), step1.out.len);
+
+    // The half-consumed flight must have left NOTHING behind: an incomplete
+    // flight is a transaction that rolled back, not a partially-applied one.
+    try testing.expectEqual(before_state, server.state);
+    try testing.expectEqual(before_message_seq, server.message_seq);
+    try testing.expectEqual(before_peer_seq, server.peer_message_seq);
+    const after_transcript = server.transcript.currentHash();
+    try testing.expectEqualSlices(u8, &before_transcript, &after_transcript);
+    try testing.expectEqual(before_hs0, server.hs0);
+    try testing.expectEqual(before_hs2, server.hs2);
+    try testing.expectEqual(@as(usize, 0), server.last_flight_len);
+
+    // First half second — completes the message. The PSK binder is computed
+    // over the REASSEMBLED body, so this only verifies if the two halves
+    // went back together at the right offsets.
+    var frag_buf_a: [1500]u8 = undefined;
+    var rec_buf_a: [1500]u8 = undefined;
+    const head = handBuiltHandshakeFragment(src.msg_type, src.total_len, src.message_seq, 0, src.slice()[0..split], &frag_buf_a);
+    const datagram_a = handBuiltPlaintextRecord(2, head, &rec_buf_a);
+
+    const flight2 = try server.handleFlight(datagram_a, rnd, 0, &buf2);
+    try testing.expect(!flight2.need_more_data);
+    try testing.expect(!flight2.done);
+    try testing.expectEqual(State.wait_finished, server.state);
+
+    // ...and the handshake really completes on both sides, with working keys.
+    const client_fin = try client.handleFlight(flight2.out, rnd, 0, &buf1);
+    try testing.expect(client_fin.done);
+    const server_done = try server.handleFlight(client_fin.out, rnd, 0, &buf2);
+    try testing.expect(server_done.done);
+
+    var wire: [256]u8 = undefined;
+    var plain: [256]u8 = undefined;
+    const msg = "reassembled handshake, working keys";
+    const rec = try client.send(msg, &wire);
+    try testing.expectEqualStrings(msg, try server.recv(rec, &plain));
+}
+
+test "reassembly: a THREE-fragment ClientHello, middle fragment duplicated" {
+    const psk_identity = "device-042";
+    const psk = "a-shared-pre-shared-key";
+    var client = try Connection.clientInit(.{ .role = .client, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} });
+    var server = try Connection.serverInit(.{ .role = .server, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} });
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x78} ** 32);
+    const rnd = testRandom(&csprng);
+
+    var buf1: [1500]u8 = undefined;
+    var buf2: [1500]u8 = undefined;
+    const ch = try client.startHandshake(rnd, 0, &buf1);
+    const src = try splitSourceFromEpoch0(ch);
+    const third = src.body_len / 3;
+    try testing.expect(third > 0);
+
+    const bounds = [_][2]usize{
+        .{ 0, third },
+        .{ third, 2 * third },
+        .{ 2 * third, src.body_len },
+    };
+    // Arrival order: middle, last, middle AGAIN (a duplicate — legal, RFC
+    // 9147 §5.2), first.
+    const arrival = [_]usize{ 1, 2, 1, 0 };
+
+    var seen_incomplete: usize = 0;
+    var completed: ?Connection.HandshakeResult = null;
+    for (arrival, 0..) |idx, i| {
+        var frag_buf: [1500]u8 = undefined;
+        var rec_buf: [1500]u8 = undefined;
+        const part = src.slice()[bounds[idx][0]..bounds[idx][1]];
+        const f = handBuiltHandshakeFragment(src.msg_type, src.total_len, src.message_seq, @intCast(bounds[idx][0]), part, &frag_buf);
+        const d = handBuiltPlaintextRecord(@intCast(i), f, &rec_buf);
+        const r = try server.handleFlight(d, rnd, 0, &buf2);
+        if (r.need_more_data) {
+            seen_incomplete += 1;
+        } else {
+            completed = r;
+        }
+    }
+    try testing.expectEqual(@as(usize, 3), seen_incomplete);
+    try testing.expectEqual(State.wait_finished, server.state);
+
+    const client_fin = try client.handleFlight(completed.?.out, rnd, 0, &buf1);
+    try testing.expect(client_fin.done);
+    const server_done = try server.handleFlight(client_fin.out, rnd, 0, &buf2);
+    try testing.expect(server_done.done);
+}
+
+test "reassembly: a CONTRADICTING overlapping fragment is rejected, not last-writer-wins" {
+    const psk_identity = "device-042";
+    const psk = "a-shared-pre-shared-key";
+    var client = try Connection.clientInit(.{ .role = .client, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} });
+    var server = try Connection.serverInit(.{ .role = .server, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} });
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x79} ** 32);
+    const rnd = testRandom(&csprng);
+
+    var buf1: [1500]u8 = undefined;
+    var buf2: [1500]u8 = undefined;
+    const ch = try client.startHandshake(rnd, 0, &buf1);
+    const src = try splitSourceFromEpoch0(ch);
+    const split = src.body_len / 2;
+
+    var frag_buf_a: [1500]u8 = undefined;
+    var rec_buf_a: [1500]u8 = undefined;
+    const head = handBuiltHandshakeFragment(src.msg_type, src.total_len, src.message_seq, 0, src.slice()[0..split], &frag_buf_a);
+    const datagram_a = handBuiltPlaintextRecord(0, head, &rec_buf_a);
+    try testing.expect((try server.handleFlight(datagram_a, rnd, 0, &buf2)).need_more_data);
+
+    // The same offsets again, with one byte flipped: an off-path attacker
+    // rewriting bytes the peer already sent. "Last writer wins" would let
+    // it steer what ends up in the transcript.
+    var tampered: [1024]u8 = undefined;
+    @memcpy(tampered[0..split], src.slice()[0..split]);
+    tampered[split / 2] ^= 0x01;
+    var frag_buf_c: [1500]u8 = undefined;
+    var rec_buf_c: [1500]u8 = undefined;
+    const clash = handBuiltHandshakeFragment(src.msg_type, src.total_len, src.message_seq, 0, tampered[0..split], &frag_buf_c);
+    const datagram_c = handBuiltPlaintextRecord(1, clash, &rec_buf_c);
+    try testing.expectError(error.OverlappingFragment, server.handleFlight(datagram_c, rnd, 0, &buf2));
+}
+
+test "reassembly: a fragment that changes msg_type or total length mid-message is rejected" {
+    // Both are "contradiction" cases a well-behaved sender never produces,
+    // which is exactly why they need pinning: the reassembled body would
+    // otherwise be dispatched on whichever fragment's `msg_type` the reader
+    // happened to keep, and sized by whichever `length` it happened to
+    // believe — attacker-chosen, both of them.
+    const psk_identity = "device-042";
+    const psk = "a-shared-pre-shared-key";
+    const cfg_c = Config{ .role = .client, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} };
+    const cfg_s = Config{ .role = .server, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} };
+
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x7d} ** 32);
+    const rnd = testRandom(&csprng);
+    var buf1: [1500]u8 = undefined;
+    var buf2: [1500]u8 = undefined;
+
+    var seed_client = try Connection.clientInit(cfg_c);
+    const ch = try seed_client.startHandshake(rnd, 0, &buf1);
+    const src = try splitSourceFromEpoch0(ch);
+    const split = src.body_len / 2;
+
+    const Case = struct { msg_type: u8, total_len: u24, want: anyerror };
+    const cases = [_]Case{
+        .{ .msg_type = src.msg_type +% 1, .total_len = src.total_len, .want = error.InconsistentMessageType },
+        // `+ 1`, not `- 1`: a SMALLER declared length would make the
+        // fragment's own `offset + length` overrun it, so the header would
+        // be rejected before reassembly ever sees the contradiction.
+        .{ .msg_type = src.msg_type, .total_len = src.total_len + 1, .want = error.InconsistentLength },
+    };
+
+    for (cases) |c| {
+        var server = try Connection.serverInit(cfg_s);
+        var frag_buf_a: [1500]u8 = undefined;
+        var rec_buf_a: [1500]u8 = undefined;
+        const head = handBuiltHandshakeFragment(src.msg_type, src.total_len, src.message_seq, 0, src.slice()[0..split], &frag_buf_a);
+        try testing.expect((try server.handleFlight(handBuiltPlaintextRecord(0, head, &rec_buf_a), rnd, 0, &buf2)).need_more_data);
+
+        var frag_buf_b: [1500]u8 = undefined;
+        var rec_buf_b: [1500]u8 = undefined;
+        const tail = handBuiltHandshakeFragment(c.msg_type, c.total_len, src.message_seq, @intCast(split), src.slice()[split..], &frag_buf_b);
+        try testing.expectError(c.want, server.handleFlight(handBuiltPlaintextRecord(1, tail, &rec_buf_b), rnd, 0, &buf2));
+    }
+}
+
+test "reassembly: a fragment of a LATER message while one is in progress is rejected" {
+    const psk_identity = "device-042";
+    const psk = "a-shared-pre-shared-key";
+    var client = try Connection.clientInit(.{ .role = .client, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} });
+    var server = try Connection.serverInit(.{ .role = .server, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} });
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x7a} ** 32);
+    const rnd = testRandom(&csprng);
+
+    var buf1: [1500]u8 = undefined;
+    var buf2: [1500]u8 = undefined;
+    const ch = try client.startHandshake(rnd, 0, &buf1);
+    const src = try splitSourceFromEpoch0(ch);
+    const split = src.body_len / 2;
+
+    var frag_buf_a: [1500]u8 = undefined;
+    var rec_buf_a: [1500]u8 = undefined;
+    const head = handBuiltHandshakeFragment(src.msg_type, src.total_len, src.message_seq, 0, src.slice()[0..split], &frag_buf_a);
+    try testing.expect((try server.handleFlight(handBuiltPlaintextRecord(0, head, &rec_buf_a), rnd, 0, &buf2)).need_more_data);
+
+    var frag_buf_b: [1500]u8 = undefined;
+    var rec_buf_b: [1500]u8 = undefined;
+    const next_msg = handBuiltHandshakeFragment(src.msg_type, src.total_len, src.message_seq +% 1, 0, src.slice(), &frag_buf_b);
+    try testing.expectError(
+        error.InterleavedFragments,
+        server.handleFlight(handBuiltPlaintextRecord(1, next_msg, &rec_buf_b), rnd, 0, &buf2),
+    );
+}
+
+test "reassembly: buffered bytes are capped — a peer that never completes a message gets FlightTooLarge" {
+    const psk_identity = "device-042";
+    const psk = "a-shared-pre-shared-key";
+    var client = try Connection.clientInit(.{ .role = .client, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} });
+    var server = try Connection.serverInit(.{ .role = .server, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} });
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x7b} ** 32);
+    const rnd = testRandom(&csprng);
+
+    var buf1: [1500]u8 = undefined;
+    var buf2: [1500]u8 = undefined;
+    const ch = try client.startHandshake(rnd, 0, &buf1);
+    const src = try splitSourceFromEpoch0(ch);
+
+    // One byte of a message that claims to be much longer, over and over:
+    // every datagram is well-formed and none of them completes anything.
+    var frag_buf: [1500]u8 = undefined;
+    var rec_buf: [1500]u8 = undefined;
+    const dribble = handBuiltHandshakeFragment(src.msg_type, src.total_len, src.message_seq, 0, src.slice()[0..1], &frag_buf);
+    const datagram = handBuiltPlaintextRecord(0, dribble, &rec_buf);
+
+    var i: usize = 0;
+    var overflowed: ?anyerror = null;
+    while (i < 10_000) : (i += 1) {
+        const r = server.handleFlight(datagram, rnd, 0, &buf2) catch |err| {
+            overflowed = err;
+            break;
+        };
+        try testing.expect(r.need_more_data);
+    }
+    try testing.expectEqual(@as(?anyerror, error.FlightTooLarge), overflowed);
+    // It must have taken more than a couple of datagrams — i.e. the engine
+    // really is buffering, not rejecting the second one outright.
+    try testing.expect(i > 2);
+    // Bounded by the documented cap, not by anything the peer chose.
+    try testing.expect(i <= max_flight_bytes);
+    // The accumulator is dropped, so the connection is reusable.
+    try testing.expectEqual(@as(usize, 0), server.rx_flight_len);
+}
+
+test "reassembly: an epoch-2 Finished split across datagrams, delivered OUT OF ORDER" {
+    const psk_identity = "device-042";
+    const psk = "a-shared-pre-shared-key";
+    var client = try Connection.clientInit(.{ .role = .client, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} });
+    var server = try Connection.serverInit(.{ .role = .server, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} });
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x7c} ** 32);
+    const rnd = testRandom(&csprng);
+
+    var buf1: [1500]u8 = undefined;
+    var buf2: [1500]u8 = undefined;
+    const ch = try client.startHandshake(rnd, 0, &buf1);
+    const flight2 = try server.handleFlight(ch, rnd, 0, &buf2);
+    const client_fin = try client.handleFlight(flight2.out, rnd, 0, &buf1);
+    try testing.expect(client_fin.done);
+
+    // Recover the Finished's plaintext handshake fragment through a CLONE of
+    // the server, so the real one's epoch-2 anti-replay window is untouched.
+    var probe = server;
+    var plain: [512]u8 = undefined;
+    const frag = try probe.unprotectHandshakeMessage(client_fin.out, &plain, null);
+    const hdr = try handshake.decodeHeader(frag);
+    var body: [128]u8 = undefined;
+    @memcpy(body[0..hdr.fragment_length], frag[handshake.header_len..][0..hdr.fragment_length]);
+    const body_len: usize = hdr.fragment_length;
+    const split = body_len / 2;
+    try testing.expect(split > 0);
+
+    // Re-protect the two halves under a CLONE of the client — its real
+    // handshake write keys and its next record sequence numbers, which is
+    // exactly what that client retransmitting under a smaller MTU emits.
+    var sender = client;
+    var frag_buf_b: [256]u8 = undefined;
+    var rec_buf_b: [256]u8 = undefined;
+    const tail = handBuiltHandshakeFragment(hdr.msg_type, hdr.length, hdr.message_seq, @intCast(split), body[split..body_len], &frag_buf_b);
+    const datagram_b = try sender.protectHandshakeMessage(tail, &rec_buf_b);
+
+    var frag_buf_a: [256]u8 = undefined;
+    var rec_buf_a: [256]u8 = undefined;
+    const head = handBuiltHandshakeFragment(hdr.msg_type, hdr.length, hdr.message_seq, 0, body[0..split], &frag_buf_a);
+    const datagram_a = try sender.protectHandshakeMessage(head, &rec_buf_a);
+
+    // Tail first.
+    const step1 = try server.handleFlight(datagram_b, rnd, 0, &buf2);
+    try testing.expect(step1.need_more_data);
+    try testing.expectEqual(State.wait_finished, server.state);
+
+    // Head second: only a correctly-ordered reassembly produces a
+    // `verify_data` that matches the transcript both sides computed.
+    const done = try server.handleFlight(datagram_a, rnd, 0, &buf2);
+    try testing.expect(done.done);
+    try testing.expectEqual(State.connected, server.state);
+
+    var wire: [256]u8 = undefined;
+    var plain2: [256]u8 = undefined;
+    const msg = "fragmented Finished, working keys";
+    const rec = try client.send(msg, &wire);
+    try testing.expectEqualStrings(msg, try server.recv(rec, &plain2));
+}
+
 // ── recv: RFC 9147 §4.5.1 anti-replay window (regression for F1) ────────
 //
 // Reproduces the exact scenario the audit drove by hand: a full loopback
@@ -3318,9 +3999,22 @@ test "handshake: a second HelloRetryRequest is refused (RFC 8446 §4.1.4 abort)"
     try testing.expect(!std.mem.eql(u8, buf1[0..retry.out.len], retry.out));
     try testing.expectEqual(State.wait_server_hello, client.state);
 
-    // A second one would let a server keep this client retrying forever.
+    // The SAME datagram again is a retransmission of HelloRetryRequest #1
+    // (identical `message_seq`), not a second one: the client already
+    // answered it, so it is ignored rather than acted on — no second
+    // ClientHello2, no state change, no error.
     var buf3: [1500]u8 = undefined;
-    try testing.expectError(error.UnexpectedMessage, client.handleFlight(datagram.bytes[0..datagram.len], rnd, 0, &buf3));
+    const dup = try client.handleFlight(datagram.bytes[0..datagram.len], rnd, 0, &buf3);
+    try testing.expect(dup.need_more_data);
+    try testing.expectEqual(@as(usize, 0), dup.out.len);
+    try testing.expectEqual(State.wait_server_hello, client.state);
+
+    // A genuinely SECOND HelloRetryRequest — the next `message_seq`, which
+    // is what a server that really sent another one would use — would let a
+    // server keep this client retrying forever, and MUST abort.
+    const second = try hrrDatagramSeq(&exts, 1);
+    var buf4: [1500]u8 = undefined;
+    try testing.expectError(error.UnexpectedMessage, client.handleFlight(second.bytes[0..second.len], rnd, 0, &buf4));
 }
 
 test "handshake: ClientHello2 reuses ClientHello1's random and echoes the cookie" {
@@ -3366,6 +4060,14 @@ test "handshake: ClientHello2 reuses ClientHello1's random and echoes the cookie
 const HrrDatagram = struct { bytes: [400]u8, len: usize };
 
 fn hrrDatagram(exts: []const messages.Extension) !HrrDatagram {
+    return hrrDatagramSeq(exts, 0);
+}
+
+/// `hrrDatagram` with an explicit RFC 9147 §5.2 `message_seq` — the two are
+/// not interchangeable to a receiver that tracks the peer's counter: seq 0
+/// again is a RETRANSMISSION of the same HelloRetryRequest, whereas the next
+/// seq is a genuinely NEW message.
+fn hrrDatagramSeq(exts: []const messages.Extension, message_seq: u16) !HrrDatagram {
     var sh_body_buf: [256]u8 = undefined;
     const sh_body = try messages.encodeServerHello(.{
         .random = messages.hello_retry_request_random,
@@ -3375,7 +4077,7 @@ fn hrrDatagram(exts: []const messages.Extension) !HrrDatagram {
     }, &sh_body_buf);
 
     var frag_buf: [256 + handshake.header_len]u8 = undefined;
-    const fragment = try frameHandshakeMessage(@intFromEnum(messages.HandshakeType.server_hello), 0, sh_body, &frag_buf);
+    const fragment = try frameHandshakeMessage(@intFromEnum(messages.HandshakeType.server_hello), message_seq, sh_body, &frag_buf);
 
     var result: HrrDatagram = .{ .bytes = undefined, .len = 0 };
     const hdr = record.PlaintextHeader{ .content_type = content_type_handshake, .epoch = 0, .sequence_number = 0, .length = @intCast(fragment.len) };
@@ -3428,7 +4130,7 @@ fn expectHelloRetryRequest(datagram: []const u8) ![]const u8 {
 
     var msg_buf: [512]u8 = undefined;
     var received_buf: [512]bool = undefined;
-    const parsed = try reassembleFragment(fragment, &msg_buf, &received_buf);
+    const parsed = try decodeSingleFragmentMessage(fragment, &msg_buf, &received_buf);
     try testing.expectEqual(@intFromEnum(messages.HandshakeType.server_hello), parsed.msg_type);
 
     var ext_buf: [8]messages.Extension = undefined;
@@ -3757,7 +4459,7 @@ test "HRR server: off by default — an unconfigured server answers ClientHello1
     const rec = try record.decodePlaintext(flight2.out);
     var msg_buf: [512]u8 = undefined;
     var received_buf: [512]bool = undefined;
-    const parsed = try reassembleFragment(flight2.out[record.plaintext_header_len..][0..rec.length], &msg_buf, &received_buf);
+    const parsed = try decodeSingleFragmentMessage(flight2.out[record.plaintext_header_len..][0..rec.length], &msg_buf, &received_buf);
     var ext_buf: [8]messages.Extension = undefined;
     const sh = try messages.decodeServerHello(parsed.body, &ext_buf);
     try testing.expect(!messages.isHelloRetryRequest(sh.random));
