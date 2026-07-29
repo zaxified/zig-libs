@@ -157,6 +157,7 @@ const module_list = [_]Module{
     .{ .name = "diagnostics" },
     .{ .name = "json5" },
     .{ .name = "cbor" },
+    .{ .name = "protobuf" },
     .{ .name = "webauthn", .deps = &.{ "cbor", "rsa", "p256" } },
     .{ .name = "zipstream" },
     .{ .name = "tz", .deps = &.{"datefmt"} },
