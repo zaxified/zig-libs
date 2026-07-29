@@ -28,11 +28,14 @@ different `splitSecretKey` signature.
 
 **What's implemented (all REAL, no panics — Phase 2c's prove/verify number
 theory AND Phase 2d's online signing are now implemented and tested, see the
-dedicated sections below). `zig build test-threshold_ecdsa` passes in
-ReleaseFast; in Debug the checked-path tests that need 2048-bit keys (the
-audit-F2 floor) are `SkipZigTest`-gated to keep the Debug run fast. The
-audit-F1/F2 received-parameter validation and its own reject tests run in
-BOTH modes:**
+dedicated sections below). `zig build test-threshold_ecdsa` passes, and the
+security-critical reject tests are NOT skipped in the default run: this
+module is marked `heavy` in the root `build.zig`, so a Debug request builds
+it at ReleaseSafe, where the `builtin.mode == .Debug` guards on the
+2048-bit-keygen fixtures do not fire. (Those guards still matter under
+`-Dstrict-debug`, which forces genuine Debug — that mode DOES skip them, and
+is not the CI default.) The audit-F1/F2/F3 received-parameter validation and
+its reject tests are fast and run in EVERY mode:**
 
 - **Keygen core** — `Element` (SEC1-compressed secp256k1 point codec),
   `scalarFromIndex`/`evalPolynomialAt` (Shamir, Horner's method over Zq),
@@ -82,12 +85,15 @@ reduced into Zq by the curve's constant-time `Scalar.fromBytes64`.
 
 **MtA (`mtaAliceInit`/`mtaBobResponse`/`mtaAliceFinalize`) is SEMI-HONEST
 ONLY** — correct against passive adversaries, not secure against a malicious
-party. The GG18 range proofs / MtAwc check that close that gap are Phase 2c
-(SCAFFOLDED — structs/transcript/fail-closed wiring real, prove/verify math
-stubbed; see the dedicated "Phase 2c" section below and `zkproofs.zig`'s
-module doc comment). Until that math is filled in, `mtaAliceFinalizeChecked`
-(the malicious-secure entry point) panics on every call — it is not yet a
-usable alternative to the semi-honest path, only its scaffold.
+party. The GG18 range proofs / MtAwc check that close that gap are Phase 2c,
+which is now **IMPLEMENTED** — structs, transcript, fail-closed wiring AND
+the prove/verify number theory are all real (see the dedicated "Phase 2c"
+section below and `zkproofs.zig`'s module doc comment). The malicious-secure
+entry point `mtaAliceFinalizeChecked` is a working alternative to the
+semi-honest path, not a scaffold. (This paragraph described the scaffold
+state and was left stale by the pass that implemented Phase 2c; corrected
+here, since it contradicted the rest of this file on exactly the security
+property that matters.)
 
 **Ring-Pedersen aux params' role (why Phase 2a carries this at all).**
 GG18/GG20's Phase-2b/2c zero-knowledge range proofs (proving a Paillier
@@ -162,10 +168,13 @@ internal serialization, real and round-trip-tested, not a standard.
   `L`-function big-int division *inside* `paillier.decrypt` (inherited, not
   introduced — see `paillier`'s SPEC). **MtA is semi-honest only** — see the
   boundary section; range proofs (Phase 2c) add malicious security.
-- **No signature is produced anywhere in this module.** Its output
-  (`KeyShare`s + MtA additive shares) is inert — it cannot sign anything
-  without Phase 2c (range proofs / MtAwc) and Phase 2d (the signing protocol
-  itself), both separate, later, out-of-scope.
+- **This module DOES produce signatures** — `signing.signWithShares`
+  (Phase 2d) emits a real secp256k1 ECDSA signature, and verifies it against
+  the group public key before returning (`error.SigningAborted` otherwise).
+  The keygen/MtA layers on their own are inert, but the module as a whole is
+  not. (This bullet used to read "no signature is produced anywhere in this
+  module", true only before Phase 2c/2d landed here rather than in a
+  follow-up module; corrected.)
 - **No official KAT vectors exist for threshold-ECDSA** (unlike `frost`'s
   RFC 9591 Appendix E.5) — verification here is self-consistency
   (Shamir-reconstruct-equals-original-secret, Feldman-derived-equals-
@@ -197,7 +206,8 @@ Fiat-Shamir-transformed proofs over the ring-Pedersen commitment scheme
 
 `zkproofs.zig` implements all three. The struct layouts, byte codecs, and a
 real SHA-256 Fiat-Shamir `Transcript` (domain-separated per proof kind,
-binding the verifier's `AuxParams`, the Paillier public key, every
+binding the verifier's `AuxParams`, the Paillier public key — modulus `N`
+**and** generator `Γ`, see the audit-F3 section below — every
 ciphertext/point in play, and the proof's own first-message commitments)
 are REAL and tested. The six `proveAliceRange`/`verifyAliceRange`/
 `proveBobMta`/`verifyBobMta`/`proveBobMtaWc`/`verifyBobMtaWc` functions now
@@ -258,7 +268,10 @@ space — that rests on the construction matching the paper (reviewed by
 transcription against paper + tss-lib) and on the Strong-RSA / Paillier
 hardness assumptions — nor side-channel freedom. **An independent
 cryptographic review of `zkproofs.zig` against GG18 Appendix A is
-recommended before any production signing use.**
+recommended before any production signing use — see the "Auditor brief"
+section at the end of this file for the itemized questions (A1–A7); it is
+deliberately specific, because a bare "needs audit" note is useless to the
+reviewer who eventually acts on it.**
 
 **Verifier-vs-prover aux-param ownership.** Every `verifier_aux` parameter
 is the `AuxParams` OF WHOEVER VERIFIES that proof, not the prover's own
@@ -309,7 +322,7 @@ pass every "honest accept" test trivially while leaving the vulnerability
 wide open. These reject tests are REAL and passing; they must NOT be
 weakened.
 
-**Received-parameter validation — the honesty note (audit F1/F2).** Two
+**Received-parameter validation — the honesty note (audit F1/F2/F3).** Three
 facts this SPEC previously UNDERSTATED as tidy deferred niceties, corrected
 here:
 
@@ -342,6 +355,56 @@ here:
 - **(F2) The "closed the unbounded-`β'` freedom" claim is size-conditional**
   and only holds at `N > q⁷` — now enforced (see the Bob's-proof bounds
   section above).
+- **(F3) The Fiat-Shamir transcript did not bind the Paillier generator `Γ`
+  — a grinding seam. FIXED, and the fix is BREAKING on the wire.** Fiat-
+  Shamir is only as sound as the transcript is complete: a public value that
+  is not absorbed is a value the prover may still CHANGE after the challenge
+  is fixed. `Γ` is part of the statement (`c = Γ^m · r^N mod N²`) and appears
+  in verification equation 2 (`u · c^e == Γ^{s1} · s^N`), yet
+  `Transcript.appendPaillierPublicKey` absorbed the modulus `N` ONLY. The
+  challenge was therefore invariant under a change of generator, so a prover
+  could enumerate candidate `Γ` values against ONE fixed challenge, looking
+  for a generator under which a false statement's equation closes — a search
+  that transcript binding is supposed to make as hard as breaking the Sigma
+  protocol itself. Two changes close it, and BOTH are needed:
+  - **the binding** — `appendPaillierPublicKey` now absorbs `Γ` as well as
+    `N` (each length-prefixed, so the two fields cannot be re-split
+    ambiguously). This is the general Fiat-Shamir-completeness fix.
+  - **the structural precondition** — `root.paillierGeneratorIsStandard`
+    rejects any RECEIVED Paillier key whose `Γ != N+1`, fail-closed at every
+    prove AND verify entry point (alongside the F1/F2 gates). Binding alone
+    would not help against a *degenerate* `Γ`: a generator of order smaller
+    than `N` (`Γ = 1` being the extreme) makes equation 2 stop tying `s1` to
+    the ciphertext's plaintext at all, so the `s1 <= q³` range check in
+    equation 1 would be guarding a value unrelated to what was encrypted —
+    and that is true for every challenge, ground or not. Every key
+    `paillier.generate`/`fromPrimes` produces already has `g = n+1`, so this
+    rejects only deliberately hand-built keys. Consequence:
+    `zkproofs.gammaPowWide`'s non-standard-`g` fallback branch is now DEAD
+    from the proof paths (kept only so the helper stays a total function).
+
+  **BREAKING wire change.** Absorbing a new value changes every challenge,
+  so a proof minted before this change does not verify after it, and vice
+  versa. The three domain tags were bumped `…/v1` → `…/v2`
+  (`range_proof_domain`, `mta_proof_domain`, `mta_proof_wc_domain`) to make
+  the break explicit rather than silent — a stale proof now fails as a plain
+  verification failure. This is acceptable here because the module has no
+  deployed peer and these proofs were never byte-compatible with any other
+  implementation (see the "Wire codecs" and "Verification level" notes);
+  it would NOT be acceptable after a deployment.
+
+  **What proves the binding is load-bearing** (not just that round-trips
+  still pass): a test varies ONLY `Γ` — same `N`, same aux tuple, same
+  ciphertexts, same commitments — across all three challenge functions and
+  requires the challenge to move, with a control asserting that the same `Γ`
+  supplied two different ways hashes identically. Fault injection confirms
+  the teeth: deleting the `g` append makes exactly that test RED and nothing
+  else; neutering `paillierGeneratorIsStandard` makes exactly the F3
+  fail-closed test RED and nothing else. The end-to-end form of the test
+  (prove under one `Γ`, verify under another) is not writable *because* of
+  the second half of the fix — a non-standard `Γ` is now refused before
+  either side does any arithmetic — which is why the property is asserted at
+  the challenge-function level.
 
 **Signing-safety was never in question.** Neither F1 nor F2 lets this module
 emit an INVALID signature: `signing.signWithShares`'s step-6 std-ECDSA
@@ -438,8 +501,9 @@ in an honest proof → `verifyWellFormed` rejects) and a completeness test
   `gate.aux_proofs_core_implemented` flipped `true` — see the dedicated
   "Πprm / Πmod" section above). The one residual item is an independent
   cryptographic review of the Fiat-Shamir instantiation before production
-  MPC-custody use (there is no cross-implementation KAT for Πprm/Πmod, same
-  posture as the rest of this module's proofs).
+  MPC-custody use — question **A4** in the "Auditor brief" section (there is
+  no cross-implementation KAT for Πprm/Πmod, same posture as the rest of
+  this module's proofs).
 
 ## Phase 2d — online signing (`signing.zig`, REAL end to end)
 
@@ -586,11 +650,124 @@ scope; flagged here since it was surfaced by this pass.
   identifiable-abort CULPRIT-NAMING layer is a documented "abort-only v1"
   scope cut (see the dedicated Phase 2d section above).
 
+## Auditor brief — what actually needs a human cryptographer
+
+This section exists because "needs an audit" is worth nothing to the person
+who eventually reads it. Below is what a reviewer is being ASKED, phrased as
+a property over a named construction, plus why the code cannot settle it.
+Everything NOT listed here is closed, wired fail-closed, and fault-tested —
+in particular **audit F1 (received-aux validation), F2 (the `N > q⁷`
+key-size floor) and F3 (transcript binding of `Γ` + the standard-generator
+precondition) are code work and are DONE**; they are not open audit items
+and do not need re-adjudication. Do not re-open them; do check the
+questions below, which no amount of testing can answer.
+
+**A1 — Special soundness and HVZK of the two DELIBERATE deviations from
+GG18 Appendix A.** This module does not instantiate A.3 exactly. In Bob's
+proof it samples `gamma ∈ Z_{q⁷}` where the paper samples `gamma ∈ Z_N^*`,
+adds a verifier check `t1 <= q⁷` the paper does not have, and widens
+`tau` from `Z_{q·Ñ}` to `Z_{q³·Ñ}` to compensate (both hardenings taken
+from tss-lib/GG20 practice; see the "Exact bounds used" section).
+*Property to check:* (a) special soundness — that a knowledge extractor
+still recovers a witness `(b, β', r_B)` from two accepting transcripts with
+the narrowed `gamma`, and that the extracted `β'` really is bounded by the
+new `t1 <= q⁷` check in the way the Alpha-Rays mitigation claims; (b)
+statistical HVZK — that `t2 = e·sigma + tau` with the widened `tau` still
+hides `sigma`, and quantify the statistical distance. *Why the code cannot
+settle it:* soundness quantifies over ALL provers; the test suite exercises
+honest transcripts plus a finite set of hand-crafted cheats. A passing
+reject test shows a specific cheat is caught, never that no cheat exists.
+
+**A2 — Completeness of the Fiat-Shamir transcript (post-F3).** The
+challenge now absorbs, in order: a per-proof-kind domain tag, `(Ñ, h1, h2)`,
+`(N, Γ)`, `c_A` (and `c_B` for the Bob proofs), every first-message
+commitment (`z, u, w` / `z, z1, t, v, w`), and for MtAwc the public point
+`B` and the Schnorr commitment `u1`. *Property to check:* that this is the
+full public input of the statement being proven for each of A.1/A.2/A.3 —
+i.e. that nothing remains that a prover could still vary after the challenge
+is fixed — and that the domain separation genuinely prevents transplanting a
+transcript between the three proof kinds and between this module and
+`aux_proofs.zig`'s Πprm/Πmod. Also: the challenge is SHA-256 reduced into
+`Zq` by wide reduction; confirm the resulting bias is irrelevant at the
+claimed `~1/q` soundness error. *Why the code cannot settle it:* completeness
+of a transcript is a claim about the STATEMENT, not about the program. The
+tests can show that each absorbed value changes the challenge (they do); they
+cannot show that no unabsorbed value matters.
+
+**A3 — Range-guarantee slack as actually used.** The paper concludes "the
+Verifier is convinced that `m ∈ [-q³, q³]`" from `s1 <= q³` with
+`alpha ∈ Z_{q³}`. This module's real callers feed `m ∈ Z_q` (`k_i`, the
+Lagrange-weighted `w_j`) and `β' ∈ Z_q` — far inside the bounds. *Property to
+check:* that the honest completeness error stays at the paper's negligible
+`~1/q` with these inputs, and that the gap between "proved `≤ q³`" and
+"actually `< q`" does not leave an exploitable window when the same party
+runs many MtA instances per signing round. *Why the code cannot settle it:*
+this is a statement about the amplification of a per-instance slack across
+`O(t²)` instances and many sessions — the exact shape of the Alpha-Rays
+failure class — and the module tests one instance at a time.
+
+**A4 — Fiat-Shamir instantiation of Πprm/Πmod (`aux_proofs.zig`).**
+CGGMP21 Fig.16/17 need `m = 80` independent per-round challenges. This
+module derives them by expanding ONE `zkproofs.Transcript` SHA-256 digest
+in a local deterministic counter mode. *Property to check:* that this
+expansion is a sound instantiation in the random-oracle model (the 80
+challenges must be independent, and the prover must not be able to
+influence any of them after committing). Related: `Pimod.verify` draws its
+Miller-Rabin witnesses deterministically from `SHA256(n_tilde)` — the code
+argues this is defense-in-depth only, because soundness rests on the
+per-round `z_i^N ≡ y_i` and `x_i^4 ≡ (−1)^{a_i} w^{b_i} y_i` equations;
+confirm that argument. *Why the code cannot settle it:* both are ROM
+arguments about an adversary's ability to bias a hash output.
+
+**A5 — Audit F5: is `paillier.decrypt`'s L-function division a real leak
+here? (Fix lives in `paillier`, judgment lives here.)** `paillier.decrypt`
+computes `L(x) = (x−1)/n` with `std.math.big.int`'s variable-time
+`divFloor`. The standing note that this is harmless because the decrypted
+plaintext is "masked by Bob's fresh uniform `β'` mod N, hence
+information-theoretically independent of the nonce `k`" is **NOT a sound
+justification as this module is actually wired, and should not be accepted
+at face value**: `mta.mtaBobResponseChecked` samples `β' ← Zq`, not `Z_N`,
+so the plaintext `a·b + β'` is `k_i·γ_j + β'` — a value up to `~q²` masked
+by a `~q` blind. It is not uniform over `Z_N` and it is not independent of
+`k_i`. *Property to check:* whether `divFloor`'s running time on
+`(x−1)/n` — where `x = c^λ mod n²` is essentially full-width and the
+quotient `L(x) = m·µ⁻¹ mod n` is a bijective image of the plaintext —
+actually varies with anything a network adversary can correlate against
+`k_i`, and if so, whether repeating it across the `O(t²)` MtA instances per
+signature and across sessions accumulates into a usable nonce leak. *Why
+the code cannot settle it:* this is a quantitative side-channel question
+(does limb-granularity timing carry usable information about a bijective
+function of a partially-masked secret?), and there is no dudect-class
+harness in this toolchain. Outcome should be either a constant-time exact
+division in `paillier`, or a *corrected* written rationale replacing the
+`β' mod N` one.
+
+**A6 — Protocol composition: Πprm/Πmod is not auto-exchanged online.**
+`aux_proofs.proveWellFormed`/`verifyWellFormed` close audit F1's residuosity
+gap, but they are an out-of-band SETUP artifact — the online
+`signing.runCheckedMtA` path enforces only the always-on structural floor
+`AuxParams.validate`. *Property to check:* whether a deployment that
+exchanges Πprm/Πmod once at setup, and thereafter trusts the structural
+floor per session, is sound — or whether the proofs must be re-verified
+against the tuple used in each signing session. *Why the code cannot settle
+it:* it is a question about the deployment's protocol composition, not about
+either function in isolation.
+
+**A7 — The documented "abort-only v1" cut.** Nothing here proves a party
+used the SAME `k_i`/`γ_i`/`w_i` across the different pairwise MtA sessions
+of one signing round; step 6's std-ECDSA self-check turns any inconsistency
+into `error.SigningAborted` rather than a bad signature. *Property to
+check:* that no cheat exists which is inconsistent across sessions yet still
+produces a signature step 6 accepts. *Why the code cannot settle it:* same
+"quantifies over all provers" reason as A1. (The culprit-NAMING half is a
+scope cut, not an audit question — see the Phase 2d section.)
+
 ## Backlog / deferred
 
 - Phase 2c: independent cryptographic review of `zkproofs.zig`'s implemented
-  constructions against GG18 Appendix A before production use (see the
-  dedicated Phase 2c section above for the verification-level breakdown) —
+  constructions against GG18 Appendix A before production use — see the
+  **"Auditor brief"** section above for the itemized questions (A1–A7),
+  and the dedicated Phase 2c section for the verification-level breakdown.
   Phase 2d inherits this same residual audit debt, since `signing.zig` is
   built entirely on `zkproofs.zig`'s checked MtA/MtAwc.
 - Phase 2d: GG20's full identifiable-abort culprit-naming apparatus
@@ -619,7 +796,7 @@ scope; flagged here since it was surfaced by this pass.
   `gate.aux_proofs_core_implemented` flipped `true` — see the dedicated
   "Πprm / Πmod" section above. The one residual item is an independent
   cryptographic review of the Fiat-Shamir instantiation before production
-  MPC-custody use.**
+  MPC-custody use (question **A4** in the "Auditor brief" section).**
 - Full Pedersen-style DKG (no single dealer) — a distinct follow-up module,
   not a `splitSecretKey` signature change.
 - Minimum-key-size floor: NOW ENFORCED where it matters for security — every

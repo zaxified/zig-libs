@@ -113,6 +113,17 @@ Per-module API changes since v0.1.0 worth calling out:
   Ed25519, both legacy (`Ed`) and prehashed-BLAKE2b (`ED`), including
   scrypt-encrypted secret keys and the trusted-comment global signature.
   Byte-exact against artifacts produced by the reference `minisign` binary.
+- **`threshold_ecdsa`:** the GG18 Appendix-A Fiat-Shamir transcripts now bind
+  the Paillier **generator** `Γ`, not only the modulus `N` (audit F3 — an
+  unbound public value in the verification equation is a value a prover can
+  still vary after the challenge is fixed). A companion fail-closed check,
+  `root.paillierGeneratorIsStandard`, rejects any received Paillier key whose
+  `Γ != N+1` at every prove and verify entry point, alongside the existing
+  F1/F2 gates. **BREAKING (wire):** absorbing a new value changes every
+  challenge, so proofs minted before this change do not verify after it; the
+  three Fiat-Shamir domain tags were bumped `…/v1` → `…/v2` so the break
+  surfaces as a plain verification failure. No interop is affected — these
+  proofs were never byte-compatible with any other implementation.
 
 ## v0.1.0 — 2026-07-10
 

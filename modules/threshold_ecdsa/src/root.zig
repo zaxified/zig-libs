@@ -1121,6 +1121,43 @@ pub fn paillierNMeetsFloor(pk: paillier.PublicKey) bool {
     return intCompareBytes(buf[0..n_len], &key_size_floor_bytes) == .gt;
 }
 
+/// **Audit F3 — the RECEIVED Paillier generator must be the standard
+/// `Γ = N+1`.** GG18 Appendix A's range/MtA proofs are statements about a
+/// ciphertext `c = Γ^m · r^N mod N²`, and every one of their soundness
+/// arguments assumes `Γ` generates a subgroup of order exactly `N` (that is
+/// what makes `m` well-defined mod `N` at all). A counterparty-supplied
+/// `Γ` of SMALLER order — `Γ = 1` being the extreme case — collapses the
+/// plaintext space the proof is about: verification equation 2
+/// (`u · c^e == Γ^{s1} · s^N`) stops tying `s1` to anything, so the `s1 <= q³`
+/// range bound in equation 1 is left constraining a value that no longer
+/// relates to the ciphertext's plaintext. Binding `Γ` into the Fiat-Shamir
+/// transcript (see `zkproofs.Transcript.appendPaillierPublicKey`) removes the
+/// prover's freedom to CHANGE `Γ` after seeing the challenge; this predicate
+/// removes the freedom to choose a degenerate `Γ` in the first place. Both
+/// are needed — the transcript binding is the general Fiat-Shamir-completeness
+/// fix, this is the structural precondition underneath it.
+///
+/// Every key this repo's `paillier.generate`/`fromPrimes` produces has
+/// `g = n+1` (`standardGenerator`), so this rejects only keys deliberately
+/// hand-built with an explicit non-standard `g` — which on the checked path
+/// is exactly the adversarial case. Not imposed on the generic
+/// `PublicKeys`/`KeyShare` byte codecs (they parse arbitrary wire values, the
+/// same posture the F2 floor takes).
+pub fn paillierGeneratorIsStandard(pk: paillier.PublicKey) bool {
+    var n_buf: [paillier.modulus_bytes]u8 = undefined;
+    const n_len = pk.nByteLen();
+    pk.nToBytes(n_buf[0..n_len]) catch return false;
+    const n_fe = paillier.Fe.fromBytes(pk.n_sq, n_buf[0..n_len], .big) catch return false;
+    const g_std = pk.n_sq.add(n_fe, pk.n_sq.one());
+    // Byte-exact comparison (sidesteps ff's internal Montgomery-form flag,
+    // same rationale as `zkproofs.zig`'s `pailFeEql`).
+    var got: [paillier.modulus_sq_bytes]u8 = undefined;
+    pk.g.toBytes(&got, .big) catch return false;
+    var want: [paillier.modulus_sq_bytes]u8 = undefined;
+    g_std.toBytes(&want, .big) catch return false;
+    return std.mem.eql(u8, &got, &want);
+}
+
 /// Jacobi symbol `(a / n)` for odd `n > 0` (standard reciprocity algorithm
 /// over `std.math.big.int`). Returns `-1`, `0`, or `+1`; `0` exactly when
 /// `gcd(a, n) > 1`. Variable-time — applied only to PUBLIC received aux

@@ -124,6 +124,33 @@
 //! differing in hash/encoding — see the "verification level" note above
 //! on why that rules out cross-implementation KATs.
 //!
+//! ## What the Fiat-Shamir transcript absorbs (audit F3 — BREAKING v1→v2)
+//!
+//! Fiat-Shamir is only as sound as the transcript is complete: every public
+//! value the statement mentions must be absorbed, or the prover keeps the
+//! freedom to vary that value AFTER the challenge is pinned. The three
+//! challenges (`rangeProofChallenge`/`mtaProofChallenge`/
+//! `mtaProofWcChallenge`) absorb, in order: a per-proof-kind domain tag, the
+//! verifier's ring-Pedersen tuple (`Ñ`, `h1`, `h2`), Alice's Paillier public
+//! key (`N` **and the generator `Γ`**), every ciphertext the statement is
+//! about (`c_A`; plus `c_B` for the Bob proofs), every first-message
+//! commitment the prover sends (`z`, `u`, `w` / `z`, `z1`, `t`, `v`, `w`),
+//! and — for MtAwc only — the public point `B` and the Schnorr commitment
+//! `u1`. That is the full public input of GG18 Appendix A.1/A.2/A.3.
+//!
+//! **`Γ` was the one omission (audit F3), fixed here.** Absorbing only `N`
+//! left the challenge invariant under a change of generator even though `Γ`
+//! sits inside verification equation 2 (`u · c^e == Γ^{s1} · s^N`) — a
+//! grinding seam. Two changes close it: `Transcript
+//! .appendPaillierPublicKey` now absorbs `Γ`, and
+//! `root.paillierGeneratorIsStandard` rejects any received key whose `Γ` is
+//! not the standard `N+1` at every prove AND verify entry point. The
+//! transcript revision is **BREAKING** — the domain tags moved `v1` → `v2`,
+//! so proofs minted before this change do not verify after it (and vice
+//! versa). Acceptable because nothing is deployed and these proofs were
+//! never byte-compatible with any other implementation anyway; see the
+//! "verification level" note above.
+//!
 //! ## Verifier-vs-prover aux-param ownership (the detail most likely to be
 //! gotten backwards)
 //!
@@ -555,6 +582,14 @@ fn pailFeEql(a: paillier.Fe, b: paillier.Fe) bool {
 /// non-standard caller-supplied `g`. Returns null (⇒ verifier rejects)
 /// only if `e` doesn't fit below `N²` — unreachable after the `s1 <= q³` /
 /// `t1 <= q⁷` range checks for any >= 1024-bit Paillier key.
+///
+/// **Audit F3:** the non-standard-`g` fallback branch is now DEAD from the
+/// proof paths — every prove/verify entry point rejects a key whose `Γ` is
+/// not `N+1` (`root.paillierGeneratorIsStandard`) before reaching here. It
+/// is kept rather than deleted so this helper stays a total function of its
+/// arguments (a future caller with a legitimately non-standard `Γ` gets the
+/// right answer instead of a wrong one), not because the proofs can still
+/// reach it.
 fn gammaPowWide(pk: paillier.PublicKey, e_bytes: []const u8) ?paillier.Fe {
     const nsq = pk.n_sq;
     const one = nsq.one();
@@ -607,9 +642,19 @@ fn chunkScalar(chunk: []const u8) Scalar {
 /// transcript and an `MtaProof`/`MtaProofWc` transcript can never collide
 /// even when fed an identical public-input sequence (same purpose as
 /// `bip340.hash`'s `challenge_tag`/`nonce_tag`/`aux_tag` split).
-pub const range_proof_domain = "threshold_ecdsa/zkproofs/range-proof/v1";
-pub const mta_proof_domain = "threshold_ecdsa/zkproofs/mta-proof/v1";
-pub const mta_proof_wc_domain = "threshold_ecdsa/zkproofs/mta-proof-wc/v1";
+///
+/// **BREAKING, v1 → v2 (audit F3).** The `v2` tags mark the transcript
+/// revision that additionally binds the Paillier GENERATOR `Γ` (see
+/// `Transcript.appendPaillierPublicKey`). A `v1` proof and a `v2` verifier
+/// derive different challenges, so proofs do not cross the version boundary
+/// — deliberate, and safe here because this module has no deployed peer and
+/// no cross-implementation wire compatibility to preserve (see SPEC.md's
+/// "no claimed interop wire format" note). Bumping the tag rather than
+/// silently changing the absorbed bytes means a stale proof fails as a plain
+/// verification failure, never as a subtly-mismatched challenge.
+pub const range_proof_domain = "threshold_ecdsa/zkproofs/range-proof/v2";
+pub const mta_proof_domain = "threshold_ecdsa/zkproofs/mta-proof/v2";
+pub const mta_proof_wc_domain = "threshold_ecdsa/zkproofs/mta-proof-wc/v2";
 
 /// Fiat-Shamir transcript builder: binds every public value relevant to a
 /// proof's soundness — the verifier's aux params, the ciphertexts/points
@@ -678,14 +723,44 @@ pub const Transcript = struct {
         self.appendBytes(&buf);
     }
 
-    /// Appends a Paillier public key's `n` — binds the transcript to
-    /// WHOSE Paillier key the ciphertexts above are encrypted under
-    /// (Alice's, always, in this MtA flow).
+    /// Appends a Paillier public key — BOTH `n` and the generator `Γ`
+    /// (`pk.g`). Binds the transcript to WHOSE Paillier key the ciphertexts
+    /// above are encrypted under (Alice's, always, in this MtA flow) AND to
+    /// the exact generator the verification equations will be evaluated
+    /// over.
+    ///
+    /// **Audit F3 — why `g` must be here.** A Fiat-Shamir challenge has to
+    /// commit to every public value the statement mentions; anything left
+    /// out is a value the prover may still vary AFTER the challenge is
+    /// fixed. `Γ` appears in the statement (`c = Γ^m · r^N mod N²`) and in
+    /// verification equation 2 (`u · c^e == Γ^{s1} · s^N`), yet this
+    /// function used to absorb `n` only — so `e` was invariant under a
+    /// change of `Γ`, and a prover could enumerate candidate generators
+    /// against ONE fixed challenge looking for a `Γ` under which a false
+    /// statement's equation happens to close. Absorbing `Γ` makes every
+    /// candidate generator a different challenge, which is what forces the
+    /// search to be as hard as breaking the Sigma protocol itself.
+    ///
+    /// Binding it does NOT by itself make a degenerate `Γ` harmless — a `Γ`
+    /// of order < N breaks the soundness argument no matter what the
+    /// challenge is. That is the job of the companion structural check
+    /// `root.paillierGeneratorIsStandard`, enforced fail-closed at every
+    /// prove and verify entry point. Belt (transcript) and braces
+    /// (precondition).
+    ///
+    /// `n` is appended at its own byte length and `g` at the fixed
+    /// `paillier.modulus_sq_bytes` width (`g` is an `Fe` canonical mod `n²`,
+    /// same "comptime-fixed backing width" reasoning as `appendCiphertext`);
+    /// both go through the length-prefixing `appendBytes`, so the two fields
+    /// can never be re-split ambiguously.
     pub fn appendPaillierPublicKey(self: *Transcript, pk: paillier.PublicKey) void {
         var buf: [paillier.modulus_bytes]u8 = undefined;
         const n_len = pk.nByteLen();
         pk.nToBytes(buf[0..n_len]) catch unreachable;
         self.appendBytes(buf[0..n_len]);
+        var g_buf: [paillier.modulus_sq_bytes]u8 = undefined;
+        pk.gToBytes(&g_buf) catch unreachable; // fixed-width buffer, always sufficient
+        self.appendBytes(&g_buf);
     }
 
     /// Appends a `Zq` scalar (32-byte big-endian).
@@ -926,13 +1001,15 @@ pub const RangeProof = struct {
 /// entry points (see `root.AuxParams.validate` / `root.paillierNMeetsFloor`).
 pub const ProveError = std.mem.Allocator.Error || root.AuxParams.ValidateError;
 
-/// **Audit F1 + F2 — validate the RECEIVED parameters a prover is about to
-/// commit its secret witness under.** `verifier_aux` is the counterparty's
+/// **Audit F1 + F2 + F3 — validate the RECEIVED parameters a prover is about
+/// to commit its secret witness under.** `verifier_aux` is the counterparty's
 /// broadcast ring-Pedersen tuple (a malicious one leaks the witness through
 /// the Pedersen commitment — audit F1); `alice_pk` is the Paillier key the
 /// range bounds are taken relative to (a sub-`q⁷` one makes them vacuous —
-/// audit F2). Called fail-closed at the top of every public prove entry
-/// point before any secret-touching arithmetic runs.
+/// audit F2; one with a non-standard generator `Γ` makes equation 2 stop
+/// binding `s1` to the plaintext at all — audit F3, see
+/// `root.paillierGeneratorIsStandard`). Called fail-closed at the top of
+/// every public prove entry point before any secret-touching arithmetic runs.
 fn validateReceivedParams(
     verifier_aux: root.AuxParams,
     alice_pk: paillier.PublicKey,
@@ -940,6 +1017,7 @@ fn validateReceivedParams(
 ) ProveError!void {
     try verifier_aux.validate(random);
     if (!root.paillierNMeetsFloor(alice_pk)) return error.InvalidAuxParams;
+    if (!root.paillierGeneratorIsStandard(alice_pk)) return error.InvalidAuxParams;
 }
 
 /// **GG18 Appendix A.1 "Range Proof", prover side — REAL, verified against
@@ -1127,7 +1205,11 @@ pub fn verifyAliceRange(
     // Audit F2 — key-size floor (fail closed): a range proof over a sub-q⁷
     // Paillier `N` / ring-Pedersen `Ñ` has a vacuous `s1 <= q³` bound, so
     // reject it outright rather than "verify" a proof that proves nothing.
+    // Audit F3 — same reasoning for a non-standard Paillier generator `Γ`:
+    // equation 2 below stops binding `s1` to `c_a`'s plaintext, so the range
+    // check would be guarding nothing (see `root.paillierGeneratorIsStandard`).
     if (!root.paillierNMeetsFloor(alice_pk) or !root.nTildeMeetsFloor(nt)) return false;
+    if (!root.paillierGeneratorIsStandard(alice_pk)) return false;
 
     // Degenerate-value hardening (fail closed before any arithmetic).
     if (proof.z.isZero() or proof.w.isZero() or proof.s.isZero() or proof.u.c.isZero()) return false;
@@ -1550,7 +1632,10 @@ fn verifyBobInner(
 
     // Audit F2 — key-size floor (fail closed): sub-q⁷ moduli make the
     // `s1 <= q³` / `t1 <= q⁷` bounds vacuous, so reject before verifying.
+    // Audit F3 — a non-standard generator `Γ` breaks equation 5's binding of
+    // `s1`/`t1` to the actual plaintexts (see `root.paillierGeneratorIsStandard`).
     if (!root.paillierNMeetsFloor(alice_pk) or !root.nTildeMeetsFloor(nt)) return false;
+    if (!root.paillierGeneratorIsStandard(alice_pk)) return false;
 
     // Degenerate-value hardening (fail closed before any arithmetic).
     if (proof.z.isZero() or proof.z1.isZero() or proof.t.isZero() or
@@ -2414,4 +2499,133 @@ test "audit F2: prove entry points fail-close on a sub-q⁷ modulus on the check
         const c_dummy = paillier.encrypt(pk, paillier.Fe.fromPrimitive(u32, pk.n_sq, 4) catch unreachable, paillier.Fe.fromPrimitive(u32, pk.n_sq, 5) catch unreachable) catch unreachable;
         try testing.expect(!verifyAliceRange(dummy, c_dummy, pk, good_aux));
     }
+}
+
+// -- audit F3: the Fiat-Shamir transcript binds the Paillier generator Γ --
+//
+// Two independent halves, matching the two halves of the F3 fix:
+//
+//   (a) TRANSCRIPT COMPLETENESS — vary ONLY `Γ`, hold every other public
+//       input byte-identical, and require the challenge to move. This is the
+//       test with teeth for the binding itself: delete the `g` append from
+//       `Transcript.appendPaillierPublicKey` and this test goes RED (verified
+//       by fault injection), while every other test in this file still
+//       passes. It cannot be written end-to-end (prove under one `Γ`, verify
+//       under another) because half (b) now rejects a non-standard `Γ` before
+//       either side does any arithmetic — so the challenge functions are
+//       where the property is observable.
+//   (b) STRUCTURAL PRECONDITION — a received key whose `Γ != N+1` is refused
+//       fail-closed at both the prove and the verify entry points.
+//
+// Both are FAST (no keygen: hand-built moduli, comptime composite for the
+// above-floor case), so they run in every optimize mode.
+
+test "audit F3 (a): the FS challenge binds the Paillier generator Γ, not just N" {
+    // One n, three public keys: the standard Γ = n+1 = 188, the SAME Γ
+    // supplied explicitly (control — must hash identically), and Γ = 4.
+    const n_bytes = [_]u8{187};
+    const pk_std = paillier.PublicKey.fromBytes(&n_bytes, null) catch unreachable;
+    const pk_same = paillier.PublicKey.fromBytes(&n_bytes, &[_]u8{188}) catch unreachable;
+    const pk_alt = paillier.PublicKey.fromBytes(&n_bytes, &[_]u8{4}) catch unreachable;
+
+    const aux = auxFromBytes(187, 4, 16);
+    // One fixed ciphertext/commitment set, reused verbatim across all three
+    // keys — so the ONLY varying transcript input is Γ.
+    const fe = struct {
+        fn v(pk: paillier.PublicKey, x: u32) paillier.Fe {
+            return paillier.Fe.fromPrimitive(u32, pk.n_sq, x) catch unreachable;
+        }
+    };
+    const c_a = paillier.encrypt(pk_std, fe.v(pk_std, 3), fe.v(pk_std, 5)) catch unreachable;
+    const c_b = paillier.encrypt(pk_std, fe.v(pk_std, 7), fe.v(pk_std, 9)) catch unreachable;
+    const u_ct = paillier.encrypt(pk_std, fe.v(pk_std, 11), fe.v(pk_std, 13)) catch unreachable;
+    const point = root.Element.fromPoint(root.Secp256k1.basePoint) catch unreachable;
+
+    // Alice's range proof.
+    const e_std = rangeProofChallenge(aux, pk_std, c_a, aux.h1, u_ct, aux.h2);
+    const e_same = rangeProofChallenge(aux, pk_same, c_a, aux.h1, u_ct, aux.h2);
+    const e_alt = rangeProofChallenge(aux, pk_alt, c_a, aux.h1, u_ct, aux.h2);
+    // Control: same n AND same Γ (however constructed) ⇒ same challenge.
+    try testing.expectEqualSlices(u8, &e_std.toBytes(.big), &e_same.toBytes(.big));
+    // The property: a different Γ under the same n ⇒ a different challenge.
+    try testing.expect(!std.mem.eql(u8, &e_std.toBytes(.big), &e_alt.toBytes(.big)));
+
+    // Bob's MtA proof.
+    const m_std = mtaProofChallenge(aux, pk_std, c_a, c_b, aux.h1, aux.h2, aux.h1, u_ct, aux.h2);
+    const m_alt = mtaProofChallenge(aux, pk_alt, c_a, c_b, aux.h1, aux.h2, aux.h1, u_ct, aux.h2);
+    try testing.expect(!std.mem.eql(u8, &m_std.toBytes(.big), &m_alt.toBytes(.big)));
+
+    // MtAwc.
+    const w_std = mtaProofWcChallenge(aux, pk_std, c_a, c_b, aux.h1, aux.h2, aux.h1, u_ct, aux.h2, point, point);
+    const w_alt = mtaProofWcChallenge(aux, pk_alt, c_a, c_b, aux.h1, aux.h2, aux.h1, u_ct, aux.h2, point, point);
+    try testing.expect(!std.mem.eql(u8, &w_std.toBytes(.big), &w_alt.toBytes(.big)));
+}
+
+test "audit F3 (b): prove and verify entry points fail-close on a non-standard Paillier generator" {
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x66335f67656e); // "f3_gen"
+    const random = prng.random();
+
+    // An above-floor (> q⁷) modulus so the F2 floor CANNOT be what rejects —
+    // the same comptime composite the F2 test uses, no keygen.
+    const big_composite = comptime comptimeIntBytes(256, ((1 << 1000) + 9) * ((1 << 1000) + 15));
+    const big_n = stripLeadingZeros(&big_composite);
+    const nt = root.AuxModulus.fromBytes(big_n, .big) catch unreachable;
+    const good_aux: root.AuxParams = .{
+        .n_tilde = nt,
+        .h1 = root.AuxFe.fromBytes(nt, &[_]u8{4}, .big) catch unreachable,
+        .h2 = root.AuxFe.fromBytes(nt, &[_]u8{16}, .big) catch unreachable,
+    };
+
+    const pk_std = paillier.PublicKey.fromBytes(big_n, null) catch unreachable; // Γ = N+1
+    const pk_bad = paillier.PublicKey.fromBytes(big_n, &[_]u8{4}) catch unreachable; // Γ = 4
+
+    // The predicate itself, so a failure localizes.
+    try testing.expect(root.paillierGeneratorIsStandard(pk_std));
+    try testing.expect(!root.paillierGeneratorIsStandard(pk_bad));
+
+    const a = scalarFromU64(7);
+    const r_bad = paillier.Fe.fromPrimitive(u32, pk_bad.n_sq, 3) catch unreachable;
+    try testing.expectError(error.InvalidAuxParams, proveAliceRange(allocator, a, r_bad, pk_bad, good_aux, random));
+
+    // Positive control — Γ is provably the SOLE cause of that rejection:
+    // `validateReceivedParams` has exactly three gates, and the other two
+    // pass for this very aux tuple and this very modulus. (Asserted by
+    // decomposition rather than by proving under `pk_std`: an honest proof
+    // over a 2000-bit modulus costs tens of seconds of constant-time modexp,
+    // which is not worth paying for a control the gates state exactly.)
+    try good_aux.validate(random); // gate 1 (audit F1) passes
+    try testing.expect(root.paillierNMeetsFloor(pk_bad)); // gate 2 (audit F2) passes
+    // ⇒ only gate 3 (audit F3, asserted false above) can be rejecting.
+
+    // Bob's prover shares `validateReceivedParams`.
+    const c_dummy_bad = paillier.encrypt(pk_bad, paillier.Fe.fromPrimitive(u32, pk_bad.n_sq, 1) catch unreachable, r_bad) catch unreachable;
+    try testing.expectError(error.InvalidAuxParams, proveBobMta(allocator, a, a, r_bad, c_dummy_bad, c_dummy_bad, pk_bad, good_aux, random));
+
+    // Verify side (defense in depth): both verifiers reject outright.
+    const dummy_range: RangeProof = .{
+        .z = good_aux.h1,
+        .u = c_dummy_bad,
+        .w = good_aux.h2,
+        .s = r_bad,
+        .s1 = try allocator.dupe(u8, &[_]u8{1}),
+        .s2 = try allocator.dupe(u8, &[_]u8{1}),
+    };
+    defer dummy_range.deinit(allocator);
+    try testing.expect(!verifyAliceRange(dummy_range, c_dummy_bad, pk_bad, good_aux));
+
+    const dummy_mta: MtaProof = .{
+        .z = good_aux.h1,
+        .z1 = good_aux.h2,
+        .t = good_aux.h1,
+        .v = c_dummy_bad,
+        .w = good_aux.h2,
+        .s = r_bad,
+        .s1 = try allocator.dupe(u8, &[_]u8{1}),
+        .s2 = try allocator.dupe(u8, &[_]u8{1}),
+        .t1 = try allocator.dupe(u8, &[_]u8{1}),
+        .t2 = try allocator.dupe(u8, &[_]u8{1}),
+    };
+    defer dummy_mta.deinit(allocator);
+    try testing.expect(!verifyBobMta(dummy_mta, c_dummy_bad, c_dummy_bad, pk_bad, good_aux));
 }

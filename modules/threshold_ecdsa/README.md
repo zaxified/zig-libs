@@ -37,7 +37,11 @@ conversion: `α + β ≡ a·b (mod q)`, built on `paillier`'s homomorphic ops.
 
 `zkproofs` (Phase 2c) is the GG18 Appendix A zero-knowledge layer that
 upgrades MtA to malicious security: `RangeProof`/`MtaProof`/`MtaProofWc`
-structs and byte codecs, a real SHA-256 Fiat-Shamir `Transcript`, and the
+structs and byte codecs, a real SHA-256 Fiat-Shamir `Transcript` (binding
+the verifier's aux params, the Paillier public key — modulus **and**
+generator, audit F3 — every ciphertext/point, and every first-message
+commitment; domain tags are at `v2` since the generator was added, a
+deliberate BREAKING transcript revision, see `SPEC.md`), and the
 `proveAliceRange`/`verifyAliceRange`/`proveBobMta`/`verifyBobMta`/
 `proveBobMtaWc`/`verifyBobMtaWc` API — ALL REAL, verified against the actual
 GG18 paper text (see `zkproofs.zig`'s module doc comment for the
