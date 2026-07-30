@@ -37,6 +37,9 @@ pub const wire = @import("wire.zig");
 /// Server responses (RFC 9051 §7): continuation, tagged, untagged data.
 pub const response = @import("response.zig");
 
+/// Commands (RFC 9051 §6), encode side.
+pub const command = @import("command.zig");
+
 test {
     // A `pub const x = @import(...)` re-export does NOT pull x's tests into
     // the test binary (CONVENTIONS §6.3 — this is what hid 52 never-run tests
@@ -44,6 +47,7 @@ test {
     _ = utf7;
     _ = wire;
     _ = response;
+    _ = command;
 }
 
 test "meta is well-formed" {

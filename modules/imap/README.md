@@ -5,9 +5,10 @@ socket and speaks no TLS, so it drops onto plain TCP, `std.crypto.tls.Client`,
 or a test buffer unchanged — the same seam `smtp` and `dtls` use.
 
 **Status: part 1 of 2, in progress.** Landed: the modified-UTF-7 mailbox-name
-codec, the wire grammar (decode side), and the response reader. Next: the
-command encoder and the session — `CAPABILITY` / `LOGIN` / `SELECT`. Then
-part 2: `FETCH` / `BODYSTRUCTURE` / `SEARCH` / `IDLE`.
+codec, the wire grammar (decode side), the response reader, and the command
+encoder. Next: the session that drives them — `CAPABILITY` / `LOGIN` /
+`SELECT`, including the synchronising-literal handshake. Then part 2:
+`FETCH` / `BODYSTRUCTURE` / `SEARCH` / `IDLE`.
 
 **Provenance:** a PORT of [`emersion/go-imap`](https://github.com/emersion/go-imap)
 v2 (MIT), chosen over `rust-imap` and Python `imapclient` on the transport
@@ -105,6 +106,34 @@ issues 500 and 502), and a **flag list that opens with a space** (go-imap PR
 633). Capability names are upper-cased except `IMAP4rev1` and `IMAP4rev2`,
 the only two spelled in mixed case.
 
+## Commands
+
+`command.Encoder` writes the command side, and `Tagger` hands out tags that
+never repeat on a connection so a late response can always be matched:
+
+```zig
+var e = imap.command.Encoder.init(gpa, &out, .{});
+try e.login(try tagger.next(gpa), "user", "pass");
+try e.select(try tagger.next(gpa), "INBOX", false);
+```
+
+The interesting decision is **where a literal forces the protocol to become
+synchronous**. `astring` permits quoting, so the encoder quotes — unless the
+value contains NUL, CR or LF, exceeds 4096 bytes, or carries raw UTF-8 without
+`UTF8=ACCEPT`. Then it must be a literal, and a plain literal means writing
+`{n}` and *waiting for the server's `+`* before the payload.
+
+That wait belongs to the session, so the encoder does not fake it: it returns
+`error.SyncLiteralRequired`. With `LITERAL+` (any size) or `LITERAL-` (up to
+4096) it emits `{n+}` and no wait is needed. A password containing a newline is
+therefore either a clean literal or an explicit error — never a command line
+the server will misread.
+
+Mailbox names go out as modified UTF-7, except `INBOX`, which is a bare atom in
+any case. Under `UTF8=ACCEPT` the name stays UTF-8 — but `&` is still escaped
+to `&-`, because it introduces a shift sequence even there and leaving it bare
+would silently rename the mailbox.
+
 ## Tests
 
 `zig build test-imap`. Anchoring is stated per tier (CONVENTIONS §5):
@@ -122,8 +151,12 @@ Every rule that could be quietly dropped has a test proven to fail when it is:
 four in the UTF-7 codec (alphabet, canonical-run check, null shift, surrogate
 arithmetic), six in the grammar (non-sync literal rejection, the literal cap
 firing before allocation, the trailing-space rule, the depth guard, `]` in
-astrings, INBOX case-folding), and eight in the response reader (the `\\*`
+astrings, INBOX case-folding), eight in the response reader (the `\\*`
 flag-perm wildcard, the capability exceptions, both server tolerances, the
 unknown-code skip, tagged PREAUTH/BYE rejection, the numeric prefix, and
-keeping an unknown line's remainder). Verified by planting each defect and
-watching the suite go red, then confirming the revert byte-for-byte.
+keeping an unknown line's remainder), and eight in the encoder (each rule that
+decides quoted-vs-literal, `&` escaping, the INBOX atom, quote escaping, the
+flag grammar, and `LITERAL-`'s ceiling). Verified by planting each defect and
+watching the suite go red, then confirming the revert byte-for-byte. A planted
+defect that fails to COMPILE proves nothing, so three of those were rewritten
+until they built and then failed.
