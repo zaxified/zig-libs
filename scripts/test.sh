@@ -127,8 +127,7 @@ graph_save() {
 }
 
 # Sets GRAPH_ADDED to the modules whose graph row was ADDED or ALTERED and
-# returns 0. Returns 1 only when the delta cannot be turned into a seed set:
-# no snapshot to compare against, or a module DISAPPEARED.
+# returns 0. Returns 1 only when there is no snapshot to compare against.
 #
 # A module that gained or lost a dependency is a precisely answerable question,
 # not a reason to run everything: the module itself changed shape, so retest it
@@ -136,33 +135,32 @@ graph_save() {
 # — everything built on top of it. That is the same rule the rest of this driver
 # already uses; there is nothing special about the edge having moved.
 #
-# A REMOVED module is the one case that stays conservative. What needs retesting
-# is whatever used to depend on it, and that edge exists only in the old graph —
-# so the new graph, the driver's single authority, cannot answer it. Deleting a
-# module is rare enough that paying the full run for it is the right trade.
+# ⭐ A REMOVED module needs no special case either, which is not obvious. The
+# worry is that what used to depend on it is knowable only from the OLD graph.
+# But a dependent cannot quietly survive its dependency's deletion:
+#
+#   * if the dependent's own row was updated to drop it, that row CHANGED, so
+#     the dependent is seeded here and its closure covers everything above it;
+#   * if it was not updated, it now declares a dependency on a module that does
+#     not exist — and `zig build module-graph` ABORTS (verified: deleting
+#     `protobuf` while `grpc` still names it terminates the build with SIGABRT).
+#     graph_load then refuses to guess a module set and exits, so nothing runs
+#     on a graph nobody can trust.
+#
+# So removals are simply ignored: either they are already covered, or there is
+# no working graph to test against in the first place.
 graph_added_only() {
     GRAPH_ADDED=""
     [[ -f "$GRAPH_SNAPSHOT" ]] || return 1
-    local gone gone_names alive
-    # LC_ALL=C on BOTH sorts, and it is load-bearing: `sort` collates by locale
-    # while `comm` compares bytewise, so under cs_CZ (or any non-C locale) comm
-    # reads its input as unsorted and silently returns a WRONG answer. The wrong
-    # answer here fails open — "nothing was removed, no escalation" — i.e. it
-    # would silently under-test. Caught by comm's own "file 1 is not in sorted
-    # order" warning, which is easy to miss because the result still looks
-    # plausible.
+    # Rows present now but not in the snapshot: a module that was added, or one
+    # whose row was edited (an edit shows up as a removal plus an addition, and
+    # the addition is the one that matters — it carries the current shape).
     #
-    # A row present before but not now is either a removal or an edit; an edit
-    # also shows up as an addition, so the two are told apart by whether the
-    # name still exists in the new graph.
-    gone="$(comm -23 <(LC_ALL=C sort "$GRAPH_SNAPSHOT") <(printf '%s\n' "$G_TSV" | LC_ALL=C sort))"
-    if [[ -n "$gone" ]]; then
-        gone_names="$(printf '%s\n' "$gone" | cut -f1)"
-        while IFS= read -r alive; do
-            [[ -z "$alive" ]] && continue
-            module_exists "$alive" || return 1   # genuinely deleted -> full run
-        done <<< "$gone_names"
-    fi
+    # LC_ALL=C is load-bearing, not hygiene: `sort` collates by locale while
+    # `comm` compares bytewise, so under cs_CZ comm reads its input as unsorted
+    # and silently returns a WRONG answer — one that fails open, i.e. seeds too
+    # little and under-tests. Its "file 1 is not in sorted order" warning goes
+    # to stderr and is easy to miss because the result still looks plausible.
     GRAPH_ADDED="$(comm -13 <(LC_ALL=C sort "$GRAPH_SNAPSHOT") <(printf '%s\n' "$G_TSV" | LC_ALL=C sort) | cut -f1 | tr '\n' ' ')"
     return 0
 }
@@ -499,10 +497,13 @@ cmd_changed() {
                 echo "changed: build.zig touched -> graph rows added/altered: ${GRAPH_ADDED% } (seeded; the reverse-dep closure below covers the rest)"
                 seeds="$seeds$GRAPH_ADDED"
             else
-                echo "changed: build.zig touched, but the module graph is byte-identical -> no escalation"
+                # Also the "only removals" case: nothing gained or altered a
+                # row, so there is nothing extra to seed (see graph_added_only
+                # on why a removal needs no special handling).
+                echo "changed: build.zig touched, but no module gained or altered a graph row -> nothing extra to seed"
             fi
         else
-            echo "changed: a module DISAPPEARED from the graph -> what depended on it is only knowable from the old graph -> running ALL modules"
+            echo "changed: no graph snapshot to compare against -> nothing to narrow with -> running ALL modules"
             cmd_all
             return
         fi

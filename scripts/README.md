@@ -41,9 +41,13 @@ from a diff against `BASE_REF` if you pass one (`scripts/test.sh changed main`).
 
 - `modules/<name>/**` → module `<name>`
 - `build.zig`, `build.zig.zon` → **ask the graph** (see below), not "all"
-- `.github/**`, `scripts/test.sh`, `scripts/test-lib.sh`, `scripts/capped` →
-  **all** modules: the harness or the CI lane definition is the very thing that
-  decides a narrower set, so no narrower set can be trusted
+- `.github/**`, `scripts/test.sh`, `scripts/test-lib.sh`, `scripts/capped` → a
+  **smoke set**, plus a loud note that this is not the gate. The harness is the
+  very thing that decides a narrower set, so it cannot vouch for its own
+  narrowing; instead it runs one plain and one netns-wrapped module — the two
+  classes `run_modules` actually distinguishes — to prove the select → build →
+  run → report path still works, and tells you to run `scripts/test.sh all`
+  before committing
 - `scripts/README.md`, `scripts/vm/**` → nothing; neither affects this lane
 - Root docs → no modules, but a `README.md` change still runs `check-catalog`
 
@@ -58,7 +62,8 @@ which file was saved: the last verified graph is kept at
 | Graph delta | What runs |
 |---|---|
 | Rows only ADDED | just the new modules (adding `yaml`: ~2 s, not ~510 s) |
-| Any row missing or altered | everything — a module changed shape or vanished, so every reverse-dep closure is stale |
+| A row altered (deps moved) | that module, plus its reverse-dep closure |
+| A row removed (module deleted) | nothing extra — either the dependent's own row also changed (covered above), or it now names a module that does not exist and `zig build module-graph` aborts, so no run happens at all |
 | Byte-identical | nothing extra |
 | No snapshot yet | everything — there is nothing to compare against |
 
