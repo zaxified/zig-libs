@@ -11,7 +11,7 @@ cross-project-reusable capability — a production-grade implementation of a pro
 or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
 authors' other projects depend on it, not the reverse.
 
-**Status:** 217 modules (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
+**Status:** 218 modules (Zig 0.16, green in Debug + ReleaseFast) · **MIT** (see `LICENSE`;
 third-party-derived wire formats & required attributions in `NOTICE`).
 
 ## Using a module
@@ -108,6 +108,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 | `websocket` | RFC 6455 WebSocket — opening handshake + frame layer (masking direction enforced, fragmentation, control frames, UTF-8 validation, close codes, per-frame + aggregate size caps), transport-agnostic server + client; permessage-deflate deferred | any | http |
 | `sessions` | Server-side web sessions + OWASP-hardened cookies + signed double-submit **CSRF** middleware | any | router, http, cookies, ramcache |
 | `llmclient` | Anthropic Messages API client (buffered + streaming SSE) over `http` — no third-party SDK | any | http |
+| `grpc` | **gRPC client over HTTP/2** (`grpc-over-http2` spec) — the layer between our multiplexing h2 client and our `protobuf` codec, with **no code generation**: a method is a path and its messages are ordinary Zig structs with a `pb_fields` descriptor. Length-Prefixed-Message framing (1-byte flag + 4-byte big-endian length) where a message split across DATA frames and several messages inside one are both the normal case; the full request shape (`POST /{Service}/{Method}`, `application/grpc+proto`, `te: trailers`, `grpc-timeout` with the 8-digit unit ladder rounded **up**, `grpc-accept-encoding`); **Trailers-Only** responses detected as such — a single HEADERS frame carrying the status, which is how errors usually arrive and what hangs a client that only looks for trailers after a body; status 0–16 as a non-exhaustive typed enum surfaced as **one Zig error per code**, with the percent-encoded `grpc-message` decoded; metadata including `-bin` base64 keys (raw bytes in the API, unpadded accepted on receive); **all four call shapes** — unary, server-, client-streaming and bidirectional — from one engine, because the wire does not distinguish them. Untrusted input is the design centre: the LPM length is read from the wire, so **the declared length never sizes an allocation at all**, and `max_recv_message_size` (4 MiB, gRPC's own default) is enforced the instant the 5-byte header completes — a 5-byte frame claiming 4 GiB fails `RESOURCE_EXHAUSTED` having buffered nothing. Anchored live on **Python `grpcio`** (the reference implementation): a real server on loopback driven through all four shapes, a real Trailers-Only failure, metadata both ways, a deadline it reads back, a 256 KiB reply reassembled across DATA frames — which incidentally makes it the first third-party HTTP/2 peer our h2 client has faced. 14 mutations run, each against the full suite and against an offline-only run: all die, and the three that stay *consistent* between our framer and our parser (little-endian length, flag misplaced, `-bin` sent raw) die offline only because literal byte goldens were written down — the round-trip tests beside them stay green — while against the reference the first two do not merely fail, they **hang**, which is what mis-framing really looks like on a network. **Client only** — `http`'s h2 server buffers each request to END_STREAM before dispatch, so three of the four shapes are unbuildable on it today (SPEC.md). Compression, retries, LB and gRPC-Web are not implemented | any | http, protobuf |
 
 ### Networking
 
@@ -343,13 +344,11 @@ not own, and what to reach for instead.
 |---|---|---|
 | Hardened/read-only SQLite | `vrischmann/zig-sqlite` or `karlseguin/zqlite.zig`, wrapped consumer-side | The enforcement (`authorizer`/`PRAGMA query_only`/`open_v2(READONLY)`) is raw C-API — breaks the pure-Zig/no-libc invariant |
 | Kafka | bind `librdkafka` | External C client, no pure-Zig alternative |
-| gRPC | build over our HTTP/2 + adopt `Arwalk/zig-protobuf` | Needs an external protobuf codec; no trustworthy pure-Zig gRPC exists |
 | Regex | `mnemnion/mvzr` (no captures) or `zig-utils/zig-regex` (captures) | Two mature pure-Zig libs already exist |
 | PostgreSQL (wire v3) | `karlseguin/pg.zig` | Mature MIT lib, pooling + TLS |
 | MySQL/MariaDB | `speed2exe/myzql` | Only viable option |
 | SMTP | `karlseguin/smtp_client.zig` | Mature MIT lib (TLS-1.2 caveat) |
 | WebSocket | `karlseguin/websocket.zig` | Mature MIT lib, both roles |
-| protobuf | `Arwalk/zig-protobuf` | De-facto pure-Zig implementation |
 | TOML | `mattyhall/tomlz` | Mature MIT config parser |
 | Templates | `jetzig/zmpl` (comptime-typed) / `batiati/mustache-zig` (logic-less) / `gremlin-labs/vibe-jinja` (runtime `.jinja` corpora only, pilot) | Zig comptime makes a runtime engine mostly unnecessary |
 | Structured logging | `karlseguin/log.zig` | Cleanest "just use it" |
