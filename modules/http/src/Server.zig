@@ -273,10 +273,32 @@ pub const Options = struct {
     /// with `enable_h2c`; the defaults harden an h2c server out of the box.
     /// See `h2_server.Limits`.
     h2_limits: H2Limits = .{},
+    /// Per-request opt-in to HTTP/2's **incremental request body** (only
+    /// meaningful with `enable_h2c`, or via `h2_server.serveStream`).
+    ///
+    /// On HTTP/1.1 a handler always reads the request body straight off the
+    /// socket as it arrives. HTTP/2 cannot do that by default and stay
+    /// compatible: the answers this server gives *before* a handler runs —
+    /// 413 for a body over `max_body_bytes`, 400 for a `content-length`
+    /// disagreeing with the DATA total (RFC 9113 §8.1.1) — need the whole
+    /// body first. Returning true from this predicate trades those two
+    /// pre-dispatch answers for h1's behavior on the routes that want it:
+    /// the handler starts at HEADERS and reads DATA as it lands (the two
+    /// checks still happen, but as read failures — 413 and a failed stream
+    /// respectively). Null (the default) keeps every request buffered.
+    ///
+    /// See `h2_server.Options.stream_request`.
+    h2_stream_request: ?H2StreamRequestFn = null,
 };
 
 /// Re-export of `h2_server.Limits` for `Options.h2_limits`.
 pub const H2Limits = h2s.Limits;
+
+/// Re-export of `h2_server.StreamRequestFn` for `Options.h2_stream_request`.
+pub const H2StreamRequestFn = h2s.StreamRequestFn;
+
+/// Re-export of `h2_server.RequestPreview` — what `h2_stream_request` sees.
+pub const H2RequestPreview = h2s.RequestPreview;
 
 /// `io` must support the net + concurrency vtable operations (e.g.
 /// `std.Io.Threaded`). The allocator provides per-connection buffers.
@@ -627,6 +649,7 @@ fn connMain(s: *Server, stream: net.Stream) void {
                 .on_conn_state = o.on_conn_state,
                 .on_conn_state_ctx = o.on_conn_state_ctx,
                 .limits = o.h2_limits,
+                .stream_request = o.h2_stream_request,
             }, &tr.reader, &tw.writer);
             return;
         }
@@ -1256,6 +1279,13 @@ pub const RequestBody = union(enum) {
     chunked: h1.ChunkedReader,
     /// Chunked body under a `max_body_bytes` cap.
     capped: Capped,
+    /// A body whose framing lives **outside** this union, handed over as a
+    /// ready-made reader. HTTP/2 uses it: DATA frames are not an h1 framing
+    /// at all, so the h2 serve loop decodes them itself and passes the
+    /// handler-facing stream in here (`h2_server`'s incremental request
+    /// surface). The trailer section travels via `Request.trailer_block`,
+    /// which is why `trailerBlock` is empty for this variant.
+    external: *Reader,
 
     pub fn init(head: *const h1.RequestHead, in: *Reader, scratch: []u8) RequestBody {
         return initWithTrailers(head, in, scratch, &.{});
@@ -1294,6 +1324,7 @@ pub const RequestBody = union(enum) {
             .limited => |*lr| &lr.reader,
             .chunked => |*cr| &cr.reader,
             .capped => |*cc| &cc.reader,
+            .external => |r| r,
         };
     }
 
@@ -1305,7 +1336,7 @@ pub const RequestBody = union(enum) {
         return switch (b.*) {
             .chunked => |*cr| cr.trailers(),
             .capped => |*cc| cc.inner.trailers(),
-            .none, .limited => "",
+            .none, .limited, .external => "",
         };
     }
 

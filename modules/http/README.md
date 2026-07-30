@@ -38,6 +38,8 @@ framing + the server are clean-room from RFC 7230/9110. Design refs in
    (`Options.enable_h2c`, prior knowledge), a multiplexing client
    (`Client.connectH2c`), and the bring-your-own-TLS seam
    (`h2_server.serveStream` / `Client.connectH2Over` after ALPN "h2").
+   Client *and* server are incremental in both directions — see "HTTP/2
+   client" and "HTTP/2 server" below.
 4. **DONE — API-gateway building blocks:** a reverse-proxy handler
    (`http.proxy`, see "Reverse proxy") and an opt-in multicore accept
    engine (`Options.accept_threads`, see "Multicore accept engine").
@@ -198,6 +200,78 @@ The codec works **without a socket**: `h1.RequestHead.parse` +
 `Server.serveStream` runs the whole per-connection loop over an arbitrary
 Reader/Writer pair — that is what the offline tests (and the future
 `router`) use.
+
+### HTTP/2 server: streaming in both directions
+
+The h2 serving loop (`Options.enable_h2c`, or `h2_server.serveStream` behind
+your own TLS) runs the *same* `Options.handler` as HTTP/1.1. Both directions
+stream, and both can be live on one stream at once.
+
+**Responses stream always — no opt-in, and no second code path.** The
+handler still writes an ordinary HTTP/1.1 response through `ResponseWriter`;
+what changed is that the h1→h2 re-framing now happens *as it is written*
+rather than after it. So the whole `ResponseWriter` feature set (gzip,
+ranges, conditional requests, content negotiation, response trailers) works
+on h2 unchanged — none of it knows the difference — and there is exactly one
+response engine that cannot drift from itself:
+
+```zig
+// Nothing h2-specific. Reaches the client progressively on both protocols.
+try rw.setHeader("Content-Type", "text/event-stream");
+while (try next_event()) |ev| {
+    try rw.writeAll(ev);
+    try rw.flush();     // h1: a chunk. h2: a DATA frame.
+}
+```
+
+A response that fits `response_buffer_size` is still framed exactly as
+before (HEADERS + one DATA frame carrying END_STREAM); past that it streams,
+under §5.2 flow control, without ever holding the whole body. The one visible
+consequence: a handler that fails *after* part of the body is already on the
+wire can no longer be rewritten into a clean 500 — that stream is reset with
+INTERNAL_ERROR (h1 kills the connection in the same situation).
+
+**Request bodies are buffered until END_STREAM by default, and stream
+per-route on opt-in** (`Options.h2_stream_request`). The default is not
+laziness. Two answers this server gives *before* a handler runs — 413 for a
+body over `max_body_bytes`, 400 for a `content-length` that disagrees with
+the DATA total (RFC 9113 §8.1.1) — both need the whole body first, and h1
+only manages them because it knows the length up front. Opting a route in
+trades those two pre-dispatch answers for h1's actual behavior:
+
+```zig
+fn streamUploads(_: ?*anyopaque, p: http.Server.H2RequestPreview) bool {
+    return std.mem.eql(u8, p.path(), "/upload");
+}
+// …
+.enable_h2c = true,
+.h2_stream_request = streamUploads,
+```
+
+On such a route the handler is dispatched when the HEADERS arrive and
+`req.reader()` yields DATA as it lands (blocking only when nothing has
+arrived, ending only at END_STREAM). Both checks survive as read failures
+rather than disappearing: over `max_body_bytes` still answers 413, and a
+`content-length` mismatch fails the read. `req.trailer()` /
+`iterateTrailers()` are the same surface as everywhere else — the trailer
+HEADERS frame is materialized into it once the body ends.
+
+- **Receive-side flow control differs by surface, on purpose.** A *buffered*
+  body's WINDOW_UPDATE goes back on **arrival**: nothing can consume an
+  octet before END_STREAM, so waiting for consumption would withhold exactly
+  the credit the peer needs to send the END_STREAM the dispatch is waiting
+  for — any upload past the initial 64 KiB window would deadlock. The memory
+  is bounded by `max_body_bytes` instead. A *streaming* body's credit goes
+  back on **consumption**, the same policy and the same argument as the h2
+  client's `readBody`: an octet sitting unread in our buffer is still
+  occupying us, so unread octets can never exceed the advertised window
+  however slowly the handler reads. Either policy applied to the other
+  surface is a bug.
+- **A handler that never reads the body cannot wedge the connection.** It
+  gets no stream-level credit (it is not invited to send more), and when the
+  response is done the stream is retired with RST_STREAM(NO_ERROR) — RFC
+  9113 §8.1's "complete response before the request finished" — while the
+  discarded octets' connection-window credit is handed back (§6.9.1).
 
 ## Server behavior notes
 

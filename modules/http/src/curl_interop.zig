@@ -73,6 +73,50 @@ fn trailerHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!voi
         try rw.writeAll(streamed_body);
         try rw.flush();
         try rw.setTrailer("X-Checksum", "deadbeef");
+    } else if (std.mem.eql(u8, req.path, "/stream-upload")) {
+        // The incremental REQUEST body, drained as it lands. The upload is
+        // deliberately far larger than the 64 KiB initial receive window, so
+        // it can only complete if the WINDOW_UPDATEs this surface emits on
+        // consumption are accounted correctly — nghttp2 simply stops sending
+        // otherwise and curl hits `--max-time`.
+        const r = req.reader();
+        var total: u64 = 0;
+        var reads: u64 = 0;
+        while (true) {
+            var sink: Writer = .fixed(&upload_sink);
+            const n = r.stream(&sink, .limited(upload_sink.len)) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => return error.BodyReadFailed,
+            };
+            if (n == 0) continue;
+            total += n;
+            reads += 1;
+        }
+        var out: [64]u8 = undefined;
+        try rw.writeAll(try std.fmt.bufPrint(&out, "streamed {d} in {d} reads", .{ total, reads }));
+    } else if (std.mem.eql(u8, req.path, "/stream-early")) {
+        // Answers from the first 8 octets of a large upload and never reads
+        // the rest — the RFC 9113 §8.1 "complete response before the request
+        // finished" case, which ends in RST_STREAM(NO_ERROR).
+        var buf: [8]u8 = undefined;
+        var w: Writer = .fixed(&buf);
+        const n = req.reader().stream(&w, .limited(8)) catch |err| switch (err) {
+            error.EndOfStream => 0,
+            else => return error.BodyReadFailed,
+        };
+        var out: [32]u8 = undefined;
+        try rw.writeAll(try std.fmt.bufPrint(&out, "took {d}", .{n}));
+    } else if (std.mem.eql(u8, req.path, "/stream-download")) {
+        // The incremental RESPONSE body: 64 flushed chunks, 256 KiB in all,
+        // none of which is ever held in memory as a whole. Ends without a
+        // trailer section, so END_STREAM rides an empty DATA frame — a
+        // framing only the streaming engine produces, and one a real peer
+        // has to accept or the transfer never terminates.
+        try rw.setHeader("Content-Type", "text/plain");
+        for (0..download_chunks) |_| {
+            try rw.writeAll(streamed_body);
+            try rw.flush();
+        }
     } else {
         rw.setStatus(404);
         try rw.writeAll("not found\n");
@@ -80,6 +124,19 @@ fn trailerHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!voi
 }
 
 const streamed_body = "abcdefgh" ** 512; // 4 KiB: several chunks / DATA frames
+const download_chunks = 64; // × 4 KiB = 256 KiB, far past any buffer
+const upload_bytes = 256 * 1024; // ≫ the 65 535-octet initial window
+
+/// Scratch the streaming upload is drained into (file scope: 16 KiB, and the
+/// handler runs on the connection's task).
+var upload_sink: [16 * 1024]u8 = undefined;
+
+/// `Options.h2_stream_request`: only the `/stream-*` routes take the
+/// incremental request body.
+fn streamRoutes(ctx: ?*anyopaque, preview: Server.H2RequestPreview) bool {
+    _ = ctx;
+    return std.mem.startsWith(u8, preview.path(), "/stream-");
+}
 
 fn serveWrap(s: *Server) void {
     s.serve() catch {};
@@ -157,7 +214,12 @@ const LiveServer = struct {
 };
 
 fn startServer(io: std.Io, gpa: std.mem.Allocator, l: *LiveServer, enable_h2c: bool) !void {
-    l.server = Server.init(io, gpa, .{ .handler = trailerHandler, .enable_h2c = enable_h2c });
+    l.server = Server.init(io, gpa, .{
+        .handler = trailerHandler,
+        .enable_h2c = enable_h2c,
+        .h2_stream_request = streamRoutes,
+        .max_body_bytes = 4 << 20,
+    });
     l.server.bind() catch |err| {
         l.server.deinit();
         std.debug.print("loopback bind failed ({s}), skipping\n", .{@errorName(err)});
@@ -328,6 +390,150 @@ test "LIVE curl: HTTP/2 response trailers are accepted by nghttp2 and surfaced" 
     try testing.expect(std.mem.indexOf(u8, split.after_head, "x-rows: 3") != null);
     try testing.expect(std.mem.indexOf(u8, split.head, "x-checksum: deadbeef") == null);
     // h1 framing must not have leaked into h2 (§8.2.2).
+    try testing.expect(std.mem.indexOf(u8, dump, "chunked") == null);
+}
+
+// ── HTTP/2 streaming, both directions ───────────────────────────────────────
+//
+// These are the cases the offline and loopback tests cannot honestly anchor:
+// there, our framer and our decoder are two sides of the same understanding.
+// Here nghttp2 decodes what we emit and enforces its own flow control, and
+// libcurl's uploader obeys the WINDOW_UPDATEs we send. Note the caveat in
+// this file's doc comment — exit 0 alone is weak on h2 — but it is NOT weak
+// for these two: a body larger than the initial window cannot complete
+// unless the window accounting is right, and a response whose END_STREAM
+// never lands cannot complete at all. Both failures show up as `--max-time`
+// expiring, not as a silently discarded frame.
+
+test "LIVE curl: HTTP/2 streaming upload past the initial window, consumed incrementally" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    if (!try curlHasHttp2(io, gpa, tmp.dir)) return error.SkipZigTest;
+
+    const payload = try gpa.alloc(u8, upload_bytes);
+    defer gpa.free(payload);
+    for (payload, 0..) |*b, i| b.* = @truncate('a' + i % 26);
+    try tmp.dir.writeFile(io, .{ .sub_path = "upload.bin", .data = payload });
+
+    var live: LiveServer = undefined;
+    try startServer(io, gpa, &live, true);
+    defer live.stop();
+
+    var url_buf: [96]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "{s}/stream-upload", .{live.url()});
+    const code = try runCurl(io, tmp.dir, &.{ "--http2-prior-knowledge", "-T", "upload.bin" }, url);
+    if (code != 0) {
+        const trace = try tmp.dir.readFileAlloc(io, "trace.txt", gpa, .limited(1 << 20));
+        defer gpa.free(trace);
+        std.debug.print("\ncurl exited {d}; trace tail:\n{s}\n", .{
+            code, trace[trace.len -| 2048..],
+        });
+        return error.CurlRejectedTheUpload;
+    }
+
+    const body = try tmp.dir.readFileAlloc(io, "body.txt", gpa, .limited(4096));
+    defer gpa.free(body);
+    // What curl surfaced: our handler's own count. Byte-exact against what
+    // curl uploaded, and taken in many separate reads rather than in one
+    // piece — the handler saw the body arrive.
+    var it = std.mem.tokenizeScalar(u8, body, ' ');
+    _ = it.next(); // "streamed"
+    const total = try std.fmt.parseInt(u64, it.next() orelse return error.BadReply, 10);
+    _ = it.next(); // "in"
+    const reads = try std.fmt.parseInt(u64, it.next() orelse return error.BadReply, 10);
+    try testing.expectEqual(@as(u64, upload_bytes), total);
+    try testing.expect(reads > 1);
+}
+
+test "LIVE curl: HTTP/2 a complete response before the upload finished (§8.1)" {
+    // `/stream-early` reads 8 octets of a 256 KiB upload and answers. This
+    // is only expressible on the incremental surface — a buffered one could
+    // not have answered before the last octet arrived — and it is the one
+    // case where the RST_STREAM(NO_ERROR) that follows a complete response
+    // has to be understood by a real client rather than by ours.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    if (!try curlHasHttp2(io, gpa, tmp.dir)) return error.SkipZigTest;
+
+    const payload = try gpa.alloc(u8, upload_bytes);
+    defer gpa.free(payload);
+    @memset(payload, 'k');
+    try tmp.dir.writeFile(io, .{ .sub_path = "upload.bin", .data = payload });
+
+    var live: LiveServer = undefined;
+    try startServer(io, gpa, &live, true);
+    defer live.stop();
+
+    var url_buf: [96]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "{s}/stream-early", .{live.url()});
+    const code = try runCurl(io, tmp.dir, &.{ "--http2-prior-knowledge", "-T", "upload.bin" }, url);
+    const body = try tmp.dir.readFileAlloc(io, "body.txt", gpa, .limited(4096));
+    defer gpa.free(body);
+    // The load-bearing assertion is what curl SURFACED — the response built
+    // from a partial body. curl's exit code is reported for the record
+    // (RST_STREAM after a complete response is legal but clients differ on
+    // whether they flag it).
+    if (!std.mem.eql(u8, body, "took 8")) {
+        const trace = try tmp.dir.readFileAlloc(io, "trace.txt", gpa, .limited(1 << 20));
+        defer gpa.free(trace);
+        std.debug.print("\ncurl exited {d}, body {s}; trace tail:\n{s}\n", .{
+            code, body, trace[trace.len -| 2048..],
+        });
+        return error.CurlDidNotSurfaceTheEarlyResponse;
+    }
+}
+
+test "LIVE curl: HTTP/2 a 256 KiB streamed response, ending on an empty DATA frame" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    if (!try curlHasHttp2(io, gpa, tmp.dir)) return error.SkipZigTest;
+
+    var live: LiveServer = undefined;
+    try startServer(io, gpa, &live, true);
+    defer live.stop();
+
+    var url_buf: [96]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "{s}/stream-download", .{live.url()});
+    const code = try runCurl(io, tmp.dir, &.{"--http2-prior-knowledge"}, url);
+    if (code != 0) {
+        const trace = try tmp.dir.readFileAlloc(io, "trace.txt", gpa, .limited(1 << 20));
+        defer gpa.free(trace);
+        std.debug.print("\ncurl exited {d}; trace tail:\n{s}\n", .{
+            code, trace[trace.len -| 2048..],
+        });
+        return error.CurlRejectedTheResponse;
+    }
+
+    const body = try tmp.dir.readFileAlloc(io, "body.txt", gpa, .limited(2 << 20));
+    defer gpa.free(body);
+    try testing.expectEqual(@as(usize, download_chunks * streamed_body.len), body.len);
+    for (0..download_chunks) |i|
+        try testing.expectEqualStrings(streamed_body, body[i * streamed_body.len ..][0..streamed_body.len]);
+
+    const dump = try tmp.dir.readFileAlloc(io, "head.txt", gpa, .limited(64 * 1024));
+    defer gpa.free(dump);
+    // No Content-Length: the length was never known, which is the whole
+    // point — and no h1 framing leaked across (§8.2.2).
+    try testing.expect(std.mem.indexOf(u8, dump, "HTTP/2 200") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "content-length") == null);
     try testing.expect(std.mem.indexOf(u8, dump, "chunked") == null);
 }
 

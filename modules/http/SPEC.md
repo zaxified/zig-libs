@@ -10,7 +10,25 @@ client buffer pool), plus request/response feature layers `conditional`, `body`,
 rule). Same handler serves h1 and h2 — h2 pseudo-headers map to the stock `Request`, the
 `ResponseWriter` is re-framed as HEADERS+DATA; h2 is opt-in (`enable_h2c`), off by default so the h1
 path is byte-for-byte unchanged. Streaming + backpressure: `ResponseWriter.flush()` for incremental
-output; bodies stream with flow control. `setHeader` stores the value slice **without copying** —
+output; bodies stream with flow control. **h2 server streaming, both directions:** the h1→h2
+re-framing runs *as the response is written* (`h2_server.Framer`, a `std.Io.Writer` `ResponseWriter`
+drains into) rather than over a staged copy — deliberately ONE response engine, so every
+`ResponseWriter` feature (gzip/range/conditional/conneg/trailers) is inherited rather than
+reimplemented, and a response inside `response_buffer_size` is still framed byte-identically
+(HEADERS + one END_STREAM DATA). The alternatives — a second streaming-only handler type, or an h2
+framing mode inside `ResponseWriter` — were rejected as, respectively, two engines that drift and a
+protocol branch through the type every h1 handler runs through. The cost: a handler failing after
+part of the body is on the wire gets RST_STREAM(INTERNAL_ERROR), not a rewritten 500. Request bodies
+buffer to END_STREAM by default and stream per-route via `Options.h2_stream_request`
+(`h2_server.StreamBody`); the default exists because the pre-dispatch 413 (`max_body_bytes`) and 400
+(§8.1.1 content-length vs DATA total) both need the whole body, and both survive on the streaming
+surface as read failures. **Receive-window policy is surface-dependent and must be:** buffered
+bodies credit WINDOW_UPDATE on *arrival* (consumption-based crediting would withhold the credit the
+peer needs to send the END_STREAM the dispatch waits for → deadlock above the initial window; memory
+is bounded by `max_body_bytes` instead), streaming bodies on *consumption* (same policy and argument
+as `h2_client.readBody` — unread octets then cannot exceed the advertised window). Discarded octets
+are always credited to the connection window immediately (§6.9.1), and a handler that answers
+without reading is retired with RST_STREAM(NO_ERROR) per §8.1. `setHeader` stores the value slice **without copying** —
 dynamic header values need caller-stable memory (documented per-helper). BYO-TLS seam:
 `serveStream` / `connectH2Over` + ALPN run h2/h1 over a caller-terminated (TLS) stream — TLS
 termination is out of this module. **Reverse proxy (`proxy`):** forwards over HTTP/1.1 (streaming)
@@ -78,7 +96,18 @@ before the last-chunk line fails curl outright (exit 56), and leaving END_STREAM
 frame makes curl/nghttp2 *silently discard* the trailer frame and still exit 0, so on h2 the
 load-bearing assertion is the surfacing check rather than the exit code. Offline byte goldens pin the
 h1 wire layout and the h2 END_STREAM placement; the forbidden-field policy has its own rejection
-tests for both gates. h2 upstreaming: loopback h1-proxy → h2c-backend end-to-end (forwarding headers + hop-by-hop strip +
+tests for both gates. **h2 server streaming is anchored against curl too**, which is the right
+direction here (curl is the client): a 256 KiB upload consumed incrementally — it cannot complete at
+all unless the consumption-driven WINDOW_UPDATEs are accounted right, since nghttp2 simply stops at
+the 65 535-octet initial window — a complete response produced from the first 8 octets of that
+upload (§8.1 + RST_STREAM(NO_ERROR), which curl accepts, exit 0, surfacing the early body), and a
+256 KiB flushed response whose END_STREAM rides an empty DATA frame, a framing only the streaming
+engine emits. Offline, the load-bearing assertions are about the frames actually on the wire: the
+handler answering a stream that NEVER carried END_STREAM (dispatch timing), and the split of
+returned window credit between the stream and connection windows — the only observable that
+distinguishes consumption-driven from arrival-driven crediting, since the *totals* agree either way.
+9 mutations were run and each turned tests red; the sharpest is arrival-driven crediting on the
+streaming surface (8 tests red, 2 of them curl's). h2 upstreaming: loopback h1-proxy → h2c-backend end-to-end (forwarding headers + hop-by-hop strip +
 large-body flow control + concurrent clients over one shared upstream connection + 502 on dead
 backend); pool-level multiplex (two streams in flight on one connection), sequential-reuse and
 buffer-pool reuse/bounded proofs. Run: `zig build test-http`.
