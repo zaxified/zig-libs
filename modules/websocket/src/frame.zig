@@ -478,7 +478,11 @@ test "parse: reserved opcode is rejected (close 1002)" {
 }
 
 test "parse: oversized frame is rejected (close 1009), before waiting for payload" {
-    var wire = [_]u8{ 0x82, 126, 0x00, 0x64 }; // declares len=100, no payload bytes present
+    // The declared length must exceed 125, or the 126 form is a NON-MINIMAL
+    // encoding (§5.2) and is rejected earlier as InvalidPayloadLength — which
+    // is what this test used to hit, silently, while it was dark: it declared
+    // 100 and so never reached the size check it exists to prove.
+    var wire = [_]u8{ 0x82, 126, 0x00, 0xC8 }; // declares len=200, no payload bytes present
     try testing.expectError(error.FrameTooLarge, parseFrame(&wire, .client, 50));
     try testing.expectEqual(@as(u16, 1009), closeCode(error.FrameTooLarge));
 }

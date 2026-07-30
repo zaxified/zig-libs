@@ -265,12 +265,15 @@ test "close frame surfaces code + reason and updates close_received" {
     var scratch: [16]u8 = undefined;
     var conn: Connection = .init(.client, &scratch, 1 << 20);
 
-    var body: [7]u8 = undefined;
+    // 2 status-code bytes + the 6-byte reason. The buffer was [7]u8, one short
+    // of "normal", so this test never compiled — it was dark until root.zig
+    // gained its aggregator.
+    var body: [8]u8 = undefined;
     std.mem.writeInt(u16, body[0..2], 1000, .big);
     @memcpy(body[2..], "normal");
-    var wire: [2 + 7]u8 = undefined;
+    var wire: [2 + 8]u8 = undefined;
     wire[0] = 0x88;
-    wire[1] = 7;
+    wire[1] = 8;
     @memcpy(wire[2..], &body);
 
     try testing.expect(!conn.close_received);

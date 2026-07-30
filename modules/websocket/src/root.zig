@@ -40,3 +40,17 @@ pub const frame = @import("frame.zig");
 /// aggregate message-size cap, and close-handshake tracking. See
 /// `connection.Connection`.
 pub const connection = @import("connection.zig");
+
+// Dark-tests aggregator: a bare `pub const`/`@import` re-export does NOT
+// pull a submodule's tests into the test binary — this reference does.
+//
+// Without it this module ran ZERO of its 52 tests, and had since it was
+// written. Nothing could notice: a suite total counts the tests that run, so
+// tests that never run are invisible in it. Found by a fuzz sweep, of all
+// things — `--fuzz` reports "no fuzz tests found" where a plain run reports
+// success, because a *missing* test is only loud when something demands it.
+test {
+    _ = handshake;
+    _ = frame;
+    _ = connection;
+}
