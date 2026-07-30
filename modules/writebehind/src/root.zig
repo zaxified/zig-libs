@@ -47,6 +47,19 @@
 //!     to the sink more than once; because the sink is a keyed store, a
 //!     duplicate write of the same (k, v) is idempotent. `recover()` is itself
 //!     idempotent (a second call is a no-op — the WAL is already drained).
+//!   * **A rejecting sink costs liveness, not data.** A failed sink write is
+//!     returned to the WAL and retried forever by default, so the durability
+//!     guarantee above holds against a sink that is down, full, or refusing:
+//!     `flushAll` keeps retrying rather than returning, and the record survives
+//!     a crash either way. Only an explicit `max_flush_attempts` cap trades
+//!     that for dropping poison records, and a dropped record is counted
+//!     (`poisonedCount`) and inspectable (`poisoned`).
+//!
+//!     This is the one guarantee the module shipped without: the WAL was
+//!     enqueued at `jobqueue`'s default `max_attempts` of 5, so the sixth
+//!     rejection dead-lettered an acknowledged write, no caller was told, and
+//!     `flushAll` then waited on a record that could never be dispatched. The
+//!     reference sinks never fail, so nothing noticed.
 //!
 //! ## Threading contract
 //!
@@ -304,6 +317,27 @@ pub const Options = struct {
     /// Requeue backoff after a *failed* sink write (wall ns). Default 0 = retry
     /// on the next drain with no delay.
     retry_backoff_ns: u64 = 0,
+    /// Sink-write attempts before the WAL gives up on a record and dead-letters
+    /// it. **0 (the default) = never give up**, which is what the durability
+    /// guarantee above requires: an acknowledged `put` stays retryable until the
+    /// sink accepts it, so a permanently-failing sink is a liveness problem
+    /// (`flushAll` keeps retrying at ~20 Hz) and never a data-loss one.
+    ///
+    /// Set a finite cap only if you would rather drop a record the sink keeps
+    /// rejecting — a "poison" record, e.g. a value that violates a sink-side
+    /// constraint — than block that key's queue behind it. A dropped record is
+    /// **counted and inspectable** (`poisonedCount` / `poisoned`), never silent;
+    /// treat a non-zero count as data loss that has already happened.
+    ///
+    /// This defaulted to `jobqueue`'s own `max_attempts` of 5 until 2026-07-31,
+    /// which silently dropped an acked write after five rejections while the
+    /// SPEC promised the opposite.
+    ///
+    /// Note the shutdown consequence: `deinit` runs `flushAll`, so tearing down
+    /// while the sink is refusing blocks until it accepts. `deinitNoFlush`
+    /// is the bounded exit — it leaves the WAL durable for the next process's
+    /// `recover()`.
+    max_flush_attempts: u32 = 0,
     /// WAL clocks (injectable for deterministic tests). Defaults use the OS
     /// clocks. Delivery visibility uses only `delay = 0`, so the wall clock
     /// merely needs to be non-decreasing.
@@ -350,6 +384,16 @@ pub const Coordinator = struct {
     wal: jobqueue.Queue,
     cache: ramcache.Cache,
     retry_backoff_ns: u64,
+    /// `jobqueue`'s `max_attempts` for every WAL record we enqueue; `maxInt`
+    /// when `Options.max_flush_attempts` is 0 (the default), i.e. never
+    /// dead-letter.
+    wal_max_attempts: u32,
+
+    /// Records the WAL gave up on (dead-lettered) because the sink kept
+    /// rejecting them. Only ever non-zero when a finite `max_flush_attempts`
+    /// was configured. Each one is an acknowledged write that will never reach
+    /// the sink.
+    n_poisoned: usize = 0,
 
     /// Un-acked WAL records (== writes not yet known-durable in the sink).
     /// Coordinator-thread-only. `flushAll`/`deinit` block until this is 0.
@@ -394,6 +438,10 @@ pub const Coordinator = struct {
             .wal = undefined,
             .cache = undefined,
             .retry_backoff_ns = options.retry_backoff_ns,
+            .wal_max_attempts = if (options.max_flush_attempts == 0)
+                std.math.maxInt(u32)
+            else
+                options.max_flush_attempts,
         };
 
         self.pool = try workerpool.WorkerPool.init(gpa, .{
@@ -470,7 +518,10 @@ pub const Coordinator = struct {
     /// The value is durable when this returns.
     pub fn put(self: *Coordinator, key: []const u8, value: []const u8) PutError!void {
         // Durable WAL append FIRST — after this the write survives a crash.
-        _ = self.wal.enqueue("put", value, .{ .partition = key }) catch |e| return mapWalErr(e);
+        _ = self.wal.enqueue("put", value, .{
+            .partition = key,
+            .max_attempts = self.wal_max_attempts,
+        }) catch |e| return mapWalErr(e);
         self.unflushed += 1;
         // Stage in the cache (marks the entry dirty). OOM here is non-fatal to
         // durability: the WAL record still drives the flush/recovery.
@@ -483,7 +534,10 @@ pub const Coordinator = struct {
     /// a `get` misses immediately. Eventually removed from the sink by the
     /// flusher / `recover`.
     pub fn del(self: *Coordinator, key: []const u8) PutError!void {
-        _ = self.wal.enqueue("del", "", .{ .partition = key }) catch |e| return mapWalErr(e);
+        _ = self.wal.enqueue("del", "", .{
+            .partition = key,
+            .max_attempts = self.wal_max_attempts,
+        }) catch |e| return mapWalErr(e);
         self.unflushed += 1;
         self.addTombstone(key) catch {};
         // The key's WAL delete record is not tied to a cached dirty entry, so
@@ -574,6 +628,24 @@ pub const Coordinator = struct {
     pub fn pendingCount(self: *const Coordinator) usize {
         return self.unflushed;
     }
+    /// Acknowledged writes the WAL gave up on after `max_flush_attempts` sink
+    /// rejections. **Always 0 under the default config** (attempts unlimited).
+    /// Non-zero means data loss has already happened: those writes were acked
+    /// to callers and will never reach the sink. Inspect them with `poisoned`.
+    pub fn poisonedCount(self: *const Coordinator) usize {
+        return self.n_poisoned;
+    }
+    /// The dead-lettered WAL records behind `poisonedCount` — the cache key is
+    /// `partition`, the written value `payload`. Every entry is deep-copied
+    /// into `gpa`; release the whole snapshot with `freePoisoned` (freeing just
+    /// the outer slice leaks three strings per entry).
+    pub fn poisoned(self: *Coordinator, gpa: Allocator) ![]jobqueue.DeadLetter {
+        return self.wal.deadLetterList(gpa);
+    }
+    /// Release a `poisoned` snapshot.
+    pub fn freePoisoned(gpa: Allocator, list: []jobqueue.DeadLetter) void {
+        jobqueue.Queue.freeDeadLetterList(gpa, list);
+    }
     /// Flushes currently executing on the pool.
     pub fn inFlightCount(self: *const Coordinator) usize {
         return self.in_flight.count();
@@ -614,7 +686,29 @@ pub const Coordinator = struct {
         } else {
             // Sink write failed: return the record to the WAL for retry. The key
             // stays dirty/orphan and a later `drain` re-selects it.
+            //
+            // Unless the WAL gave up on it. `nack` dead-letters a record once it
+            // has burned `max_attempts`, and then nothing will ever redeliver
+            // it: leaving `unflushed` incremented would strand `flushAll` (it
+            // waits for a record that can no longer be dispatched) and leave the
+            // key dirty forever. Default config never reaches this — attempts
+            // are unlimited — so this runs only for a caller who asked for a
+            // finite cap, and it is counted so that choice is not silent.
+            const dead_before = self.wal.deadLetterCount();
             self.wal.nack(t.lease, .{ .backoff_ns = self.retry_backoff_ns }) catch {};
+            if (self.wal.deadLetterCount() > dead_before) {
+                self.n_poisoned += 1;
+                if (self.unflushed > 0) self.unflushed -= 1;
+                // Same key-advance as the success path: a later record for this
+                // key is still good and must not be stranded behind the dropped
+                // one (it is also newer, so LWW is unaffected).
+                if (self.dequeueFor(t.key)) |lease2| {
+                    self.startFlush(t.key, lease2);
+                } else {
+                    _ = self.cache.markClean(t.key);
+                    self.removeKeySet(&self.orphans, t.key);
+                }
+            }
         }
         self.freeTask(t);
     }
@@ -1222,6 +1316,173 @@ test "oversized key / value are rejected before any durable write" {
     const big_key = "x" ** (jobqueue.max_field_len + 1);
     try testing.expectError(error.KeyTooLarge, c.put(big_key, "v"));
     try testing.expectEqual(@as(usize, 0), c.pendingCount()); // nothing enqueued
+}
+
+/// A sink that fails on purpose: the first `fail_n` writes (any key) and every
+/// write to `reject_key`. Nothing like it exists among the reference sinks —
+/// `MapSink` and `KvtreeSink` both accept essentially every write, which is why
+/// the failure contract below went unexercised.
+const FailingSink = struct {
+    lock: SpinLock = .{},
+    map: std.StringHashMapUnmanaged([]u8) = .empty,
+    gpa: Allocator,
+    /// The first `fail_n` write attempts are rejected, then writes succeed.
+    fail_n: usize = 0,
+    /// Every write to this key is rejected, forever.
+    reject_key: ?[]const u8 = null,
+    /// Total write attempts seen (accepted or not).
+    seen: usize = 0,
+
+    fn deinit(self: *FailingSink) void {
+        var it = self.map.iterator();
+        while (it.next()) |e| {
+            self.gpa.free(e.key_ptr.*);
+            self.gpa.free(e.value_ptr.*);
+        }
+        self.map.deinit(self.gpa);
+    }
+    fn sink(self: *FailingSink) Sink {
+        return .{ .ptr = self, .vtable = &vt };
+    }
+    fn get(self: *FailingSink, key: []const u8) ?[]const u8 {
+        self.lock.lock();
+        defer self.lock.unlock();
+        return self.map.get(key);
+    }
+
+    const vt = Sink.VTable{ .write = vWrite, .delete = vDelete };
+
+    fn vWrite(ptr: *anyopaque, key: []const u8, value: []const u8) anyerror!void {
+        const self: *FailingSink = @ptrCast(@alignCast(ptr));
+        self.lock.lock();
+        defer self.lock.unlock();
+        self.seen += 1;
+        if (self.seen <= self.fail_n) return error.SinkRejected;
+        if (self.reject_key) |rk| {
+            if (std.mem.eql(u8, rk, key)) return error.SinkRejected;
+        }
+        const k = try self.gpa.dupe(u8, key);
+        errdefer self.gpa.free(k);
+        const v = try self.gpa.dupe(u8, value);
+        if (try self.map.fetchPut(self.gpa, k, v)) |old| {
+            self.gpa.free(old.key);
+            self.gpa.free(old.value);
+        }
+    }
+    fn vDelete(ptr: *anyopaque, key: []const u8) anyerror!void {
+        const self: *FailingSink = @ptrCast(@alignCast(ptr));
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (self.map.fetchRemove(key)) |old| {
+            self.gpa.free(old.key);
+            self.gpa.free(old.value);
+        }
+    }
+};
+
+const FailRig = struct {
+    threaded: std.Io.Threaded,
+    sink: FailingSink,
+    wal_sim: SimStorage,
+
+    fn init(rig: *FailRig, sink: FailingSink) void {
+        rig.* = .{
+            .threaded = std.Io.Threaded.init(testing.allocator, .{}),
+            .sink = sink,
+            .wal_sim = SimStorage.init(testing.allocator),
+        };
+    }
+    fn deinit(rig: *FailRig) void {
+        rig.wal_sim.deinit();
+        rig.sink.deinit();
+        rig.threaded.deinit();
+    }
+    fn open(rig: *FailRig, max_flush_attempts: u32) !*Coordinator {
+        return Coordinator.init(testing.allocator, .{
+            .io = rig.threaded.io(),
+            .sink = rig.sink.sink(),
+            .wal_store = rig.wal_sim.storage(),
+            .wal_path = "wal.jq",
+            .max_cache_bytes = 1 << 20,
+            .max_cache_entries = 1024,
+            .n_workers = 2,
+            .max_flush_attempts = max_flush_attempts,
+        });
+    }
+};
+
+test "a sink that rejects more often than jobqueue's default cap still lands the write" {
+    // The regression test for the defect this module shipped with: the WAL was
+    // enqueued at `jobqueue`'s default `max_attempts = 5`, so the SIXTH
+    // rejection dead-lettered an already-acknowledged write and nothing ever
+    // told the caller. 12 rejections is comfortably past that cliff.
+    var rig: FailRig = undefined;
+    rig.init(.{ .gpa = testing.allocator, .fail_n = 12 });
+    defer rig.deinit();
+
+    const c = try rig.open(0); // default: never give up
+    defer c.deinit();
+
+    try c.put("k", "v");
+    c.flushAll();
+
+    const landed = rig.sink.get("k");
+    try testing.expect(landed != null); // the acked write reached the sink at all
+    try testing.expectEqualStrings("v", landed.?);
+    try testing.expectEqual(@as(usize, 0), c.poisonedCount());
+    try testing.expectEqual(@as(usize, 0), c.pendingCount());
+    try testing.expectEqual(@as(usize, 13), rig.sink.seen); // 12 failures + 1 success
+}
+
+test "an explicit attempt cap drops the record — counted, listed, and not stranded" {
+    var rig: FailRig = undefined;
+    rig.init(.{ .gpa = testing.allocator, .reject_key = "bad" });
+    defer rig.deinit();
+
+    const c = try rig.open(3); // opt in to giving up after 3 attempts
+    defer c.deinit();
+
+    try c.put("bad", "x");
+    try c.put("good", "y");
+    c.flushAll();
+
+    // The poisoned key is dropped, and saying so is the whole point: an
+    // acknowledged write did not reach the sink.
+    try testing.expectEqual(@as(usize, 1), c.poisonedCount());
+    try testing.expect(rig.sink.get("bad") == null);
+
+    const dead = try c.poisoned(testing.allocator);
+    defer Coordinator.freePoisoned(testing.allocator, dead);
+    try testing.expectEqual(@as(usize, 1), dead.len);
+    try testing.expectEqualStrings("bad", dead[0].partition);
+    try testing.expectEqualStrings("x", dead[0].payload);
+    try testing.expectEqual(@as(u32, 3), dead[0].attempts);
+
+    // An unrelated key is unaffected, and the accounting is clean — before the
+    // fix `unflushed` kept counting the dropped record forever, so `flushAll`
+    // could never reach a quiescent state again.
+    try testing.expectEqualStrings("y", rig.sink.get("good").?);
+    try testing.expectEqual(@as(usize, 0), c.pendingCount());
+}
+
+test "a second record for a poisoned key is not stranded behind it" {
+    var rig: FailRig = undefined;
+    rig.init(.{ .gpa = testing.allocator, .reject_key = "bad" });
+    defer rig.deinit();
+
+    const c = try rig.open(2);
+    defer c.deinit();
+
+    try c.put("bad", "x1");
+    try c.put("bad", "x2");
+    c.flushAll();
+
+    // Both records for the key are dropped (the sink rejects the key itself),
+    // and crucially the SECOND one was actually attempted rather than left
+    // queued behind the first — the key-advance the success path performs.
+    try testing.expectEqual(@as(usize, 2), c.poisonedCount());
+    try testing.expectEqual(@as(usize, 0), c.pendingCount());
+    try testing.expectEqual(@as(usize, 4), rig.sink.seen); // 2 records x 2 attempts
 }
 
 test "meta is well-formed" {

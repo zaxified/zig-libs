@@ -73,6 +73,12 @@ c.flushAll();     // block until the cache is clean (graceful barrier); alias: s
 - `Sink` is a small vtable (`write` / `delete` / optional `read`); implement it
   to target any durable store. `KvtreeSink` (durable) and `MapSink` (in-memory)
   are provided. A SQL sink (DL6) slots in without touching this module.
+- **A sink that rejects writes costs liveness, not data.** Failed sink writes go
+  back to the WAL and are retried indefinitely, so `flushAll` against a
+  permanently-failing sink keeps retrying rather than returning. Set
+  `max_flush_attempts` to a finite value to drop poison records instead; those
+  are then counted by `poisonedCount()` and listed by `poisoned()` — never
+  dropped silently.
 - `deinitNoFlush()` is an abrupt teardown that keeps the WAL durable and
   delegates durability to the next process's `recover()` (also the crash
   simulation used in tests).
@@ -86,4 +92,8 @@ read-shadow; sink read-through; **crash recovery** (drop the coordinator+cache
 without flushing, then `recover()` from the durable WAL → every acked write
 present, idempotent under double-recovery); the `on_evict` safety net (a dirty
 entry evicted before flush is still persisted); pool concurrency over 1000 keys;
-the real on-disk `kvtree` sink over `tmpDir`; and size-cap rejection.
+the real on-disk `kvtree` sink over `tmpDir`; size-cap rejection; and a
+deliberately **failing** sink — that an acked write survives far more rejections
+than the WAL's old attempt cap, that an explicit cap drops the record visibly
+and without stranding the queue, and that a newer record for a poisoned key is
+still flushed.

@@ -117,8 +117,24 @@ run concurrently, so the adapter must be internally thread-safe (a connection po
   terminates in a clean state. `deinit` calls `flushAll`, so even a forgotten `recover()` loses
   nothing.
 - **Sink write failure** → the record is `nack`'d back to the WAL (with `retry_backoff_ns`) and the
-  key stays dirty/orphan; a later `drain` retries. `flushAll` assumes the sink *eventually* accepts
-  writes (a permanently-failing sink would spin — that is an operational fault, not a data-loss one).
+  key stays dirty/orphan; a later `drain` retries. Retries are **unbounded by default**
+  (`max_flush_attempts = 0`), so `flushAll` against a permanently-failing sink retries at ~20 Hz and
+  does not return — an operational fault, not a data-loss one, exactly as this line has always
+  claimed.
+
+  It was not true until 2026-07-31. The WAL was enqueued at `jobqueue`'s default `max_attempts` of
+  5, so the sixth rejection **dead-lettered an acknowledged write**: gone from the sink, gone from
+  the retry path, with no error to the caller and `unflushed` still counting it (so `flushAll` could
+  never reach a quiescent state again). The two reference sinks accept essentially every write, so
+  no test drove a record to that cliff — the gap was in the *failure contract*, not in the vtable's
+  shape, which is what a review looking only at the `Sink` signature would have missed.
+
+- **Giving up is opt-in and never silent.** Set `max_flush_attempts` to a finite value to drop a
+  poison record rather than block its key behind it. A dropped record increments `poisonedCount`
+  and is retrievable via `poisoned` (key = `partition`, value = `payload`, plus the attempt count);
+  the coordinator also stops counting it as pending and advances the key's queue, so one poison
+  record does not strand the newer records behind it. **A non-zero `poisonedCount` is data loss
+  that has already happened** — it is reported, not prevented.
 
 ## Threat model / out of scope
 
