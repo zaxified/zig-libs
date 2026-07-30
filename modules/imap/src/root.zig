@@ -40,6 +40,10 @@ pub const response = @import("response.zig");
 /// Commands (RFC 9051 §6), encode side.
 pub const command = @import("command.zig");
 
+/// The client session (RFC 9051 §3): state, tag matching, literal handshake.
+pub const client = @import("client.zig");
+pub const Client = client.Client;
+
 test {
     // A `pub const x = @import(...)` re-export does NOT pull x's tests into
     // the test binary (CONVENTIONS §6.3 — this is what hid 52 never-run tests
@@ -48,6 +52,7 @@ test {
     _ = wire;
     _ = response;
     _ = command;
+    _ = client;
 }
 
 test "meta is well-formed" {

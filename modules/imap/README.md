@@ -4,11 +4,16 @@ An **IMAP4rev2 (RFC 9051) client** in pure Zig, transport-agnostic: it owns no
 socket and speaks no TLS, so it drops onto plain TCP, `std.crypto.tls.Client`,
 or a test buffer unchanged — the same seam `smtp` and `dtls` use.
 
-**Status: part 1 of 2, in progress.** Landed: the modified-UTF-7 mailbox-name
-codec, the wire grammar (decode side), the response reader, and the command
-encoder. Next: the session that drives them — `CAPABILITY` / `LOGIN` /
-`SELECT`, including the synchronising-literal handshake. Then part 2:
-`FETCH` / `BODYSTRUCTURE` / `SEARCH` / `IDLE`.
+**Status: part 1 of 2 COMPLETE.** The modified-UTF-7 codec, the wire grammar,
+the response reader, the command encoder, and the session that drives them —
+greeting, `CAPABILITY`, `LOGIN` (with the synchronising-literal handshake),
+`SELECT`/`EXAMINE`, `NOOP`, `LOGOUT`. Part 2 next: `FETCH` /
+`BODYSTRUCTURE` / `SEARCH` / `IDLE`.
+
+**Not yet anchored against a live server.** Every transcript in the tests is
+copied from RFC 9051, which pins the parsing; the *sequencing* is checked only
+against a scripted peer of our own, so it is self-anchored and says so. A real
+peer is the next thing this module owes.
 
 **Provenance:** a PORT of [`emersion/go-imap`](https://github.com/emersion/go-imap)
 v2 (MIT), chosen over `rust-imap` and Python `imapclient` on the transport
@@ -134,6 +139,37 @@ any case. Under `UTF8=ACCEPT` the name stays UTF-8 — but `&` is still escaped
 to `&-`, because it introduces a shift sequence even there and leaving it bare
 would silently rename the mailbox.
 
+## The session
+
+```zig
+var c = imap.Client.init(gpa, &reader, &writer, .{});
+defer c.deinit();
+
+_ = try c.greet();                     // capabilities often arrive here
+_ = try c.login("user", "pass");
+_ = try c.select("INBOX", false);
+// c.mailbox.exists / .flags / .permanent_flags / .uid_validity / .uid_next
+try c.logout();
+```
+
+Three things live here because nothing below can own them:
+
+- **Untagged data arrives unsolicited.** `* 23 EXISTS` can land between any two
+  responses, so "read the reply" is really "read until my tag comes back,
+  handling everything else on the way". Anything the session does not consume
+  goes to the `on_unilateral` observer.
+- **The synchronising literal is a handshake.** Write `{n}`, wait for `+`, then
+  the payload — and untagged data may arrive *before* the `+`, which a client
+  that treats the next line as the continuation gets wrong. Advertising
+  `LITERAL+` removes the round trip; the session sets the encoder's policy from
+  the capabilities the server actually sent.
+- **State gates commands.** `LOGIN` after authentication is a local error, not
+  a password sent into a session that cannot use it.
+
+A failed `SELECT` leaves **no** mailbox selected (RFC 9051 §6.3.2) — including
+when the server emitted untagged data before refusing, which is what makes
+clearing state on failure load-bearing rather than redundant.
+
 ## Tests
 
 `zig build test-imap`. Anchoring is stated per tier (CONVENTIONS §5):
@@ -154,9 +190,16 @@ firing before allocation, the trailing-space rule, the depth guard, `]` in
 astrings, INBOX case-folding), eight in the response reader (the `\\*`
 flag-perm wildcard, the capability exceptions, both server tolerances, the
 unknown-code skip, tagged PREAUTH/BYE rejection, the numeric prefix, and
-keeping an unknown line's remainder), and eight in the encoder (each rule that
+keeping an unknown line's remainder), eight in the encoder (each rule that
 decides quoted-vs-literal, `&` escaping, the INBOX atom, quote escaping, the
-flag grammar, and `LITERAL-`'s ceiling). Verified by planting each defect and
+flag grammar, and `LITERAL-`'s ceiling), and eight in the session (tag
+matching, the continuation wait, the state gate, capability-driven literal
+policy, BYE handling, response-code absorption, and both halves of the
+failed-SELECT cleanup). Verified by planting each defect and
 watching the suite go red, then confirming the revert byte-for-byte. A planted
-defect that fails to COMPILE proves nothing, so three of those were rewritten
-until they built and then failed.
+defect that fails to COMPILE proves nothing, so six of those were rewritten
+until they built and then failed — and one of them turned out to pass, which
+exposed a test with no teeth: clearing mailbox state on a failed SELECT was
+already covered by clearing it on entry, so the test could not tell the two
+apart. The transcript now emits untagged data before the refusal, which only
+the failure path can clean up.
