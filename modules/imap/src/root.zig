@@ -34,12 +34,16 @@ pub const utf7 = @import("utf7.zig");
 /// The wire grammar (RFC 9051 §9), decode side.
 pub const wire = @import("wire.zig");
 
+/// Server responses (RFC 9051 §7): continuation, tagged, untagged data.
+pub const response = @import("response.zig");
+
 test {
     // A `pub const x = @import(...)` re-export does NOT pull x's tests into
     // the test binary (CONVENTIONS §6.3 — this is what hid 52 never-run tests
     // in `websocket`). Every submodule must be named here.
     _ = utf7;
     _ = wire;
+    _ = response;
 }
 
 test "meta is well-formed" {

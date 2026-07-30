@@ -5,9 +5,9 @@ socket and speaks no TLS, so it drops onto plain TCP, `std.crypto.tls.Client`,
 or a test buffer unchanged — the same seam `smtp` and `dtls` use.
 
 **Status: part 1 of 2, in progress.** Landed: the modified-UTF-7 mailbox-name
-codec and the wire grammar (decode side). Next: the response reader on top of
-it, the command encoder, and the session — `CAPABILITY` / `LOGIN` / `SELECT`.
-Then part 2: `FETCH` / `BODYSTRUCTURE` / `SEARCH` / `IDLE`.
+codec, the wire grammar (decode side), and the response reader. Next: the
+command encoder and the session — `CAPABILITY` / `LOGIN` / `SELECT`. Then
+part 2: `FETCH` / `BODYSTRUCTURE` / `SEARCH` / `IDLE`.
 
 **Provenance:** a PORT of [`emersion/go-imap`](https://github.com/emersion/go-imap)
 v2 (MIT), chosen over `rust-imap` and Python `imapclient` on the transport
@@ -74,6 +74,37 @@ a test naming the behaviour: a space immediately before CRLF is trailing
 whitespace and not a field separator; a missing space before a parenthesised
 list is accepted; a lone LF ends a line; `body-fld-octets` of `-1` reads as 0.
 
+## Responses
+
+`response.Reader` turns each line into one of the three shapes a server can
+send — a continuation request, a tagged completion, or untagged data:
+
+```zig
+var rd = imap.response.Reader.init(arena, &stream, .{});
+switch (try rd.next()) {
+    .continuation => |text| { … },
+    .tagged => |t| { … t.tag, t.status.type, t.status.code … },
+    .data => |d| switch (d) {
+        .exists => |n| { … },
+        .flags => |f| { … },
+        .status => |s| { … },
+        .other => |o| { … o.kind, o.rest … },   // still in sync
+        else => {},
+    },
+}
+```
+
+**Anything unparsed stays in sync rather than failing.** An untagged kind this
+module does not implement yet comes back as `.other` with the line's remainder
+verbatim, and an unknown `[RESPONSE-CODE]` is skipped to its closing bracket —
+so a server extension cannot desynchronise the stream or fail a command.
+
+The tolerances are ported deliberately, each named by a test: a status response
+with **no text at all** (RFC 9051 requires one; servers omit it — go-imap
+issues 500 and 502), and a **flag list that opens with a space** (go-imap PR
+633). Capability names are upper-cased except `IMAP4rev1` and `IMAP4rev2`,
+the only two spelled in mixed case.
+
 ## Tests
 
 `zig build test-imap`. Anchoring is stated per tier (CONVENTIONS §5):
@@ -89,7 +120,10 @@ list is accepted; a lone LF ends a line; `body-fld-octets` of `-1` reads as 0.
 
 Every rule that could be quietly dropped has a test proven to fail when it is:
 four in the UTF-7 codec (alphabet, canonical-run check, null shift, surrogate
-arithmetic) and six in the grammar (non-sync literal rejection, the literal cap
+arithmetic), six in the grammar (non-sync literal rejection, the literal cap
 firing before allocation, the trailing-space rule, the depth guard, `]` in
-astrings, INBOX case-folding). Verified by planting each defect and watching
-the suite go red, then confirming the revert byte-for-byte.
+astrings, INBOX case-folding), and eight in the response reader (the `\\*`
+flag-perm wildcard, the capability exceptions, both server tolerances, the
+unknown-code skip, tagged PREAUTH/BYE rejection, the numeric prefix, and
+keeping an unknown line's remainder). Verified by planting each defect and
+watching the suite go red, then confirming the revert byte-for-byte.
