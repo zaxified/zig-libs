@@ -40,9 +40,31 @@ Changed files come from the working tree, the index and untracked files — or
 from a diff against `BASE_REF` if you pass one (`scripts/test.sh changed main`).
 
 - `modules/<name>/**` → module `<name>`
-- `build.zig`, `build.zig.zon`, `.github/**`, `scripts/**` → **all** modules,
-  because the graph or the harness itself moved
+- `build.zig`, `build.zig.zon` → **ask the graph** (see below), not "all"
+- `.github/**`, `scripts/test.sh`, `scripts/test-lib.sh`, `scripts/capped` →
+  **all** modules: the harness or the CI lane definition is the very thing that
+  decides a narrower set, so no narrower set can be trusted
+- `scripts/README.md`, `scripts/vm/**` → nothing; neither affects this lane
 - Root docs → no modules, but a `README.md` change still runs `check-catalog`
+
+### Touching `build.zig` does not mean running everything
+
+Adding a module appends one row to `module_list` and cannot affect any existing
+module, so escalating to the full ~8-minute gate for it is the driver being
+wrong, not careful. The decision is made from the **module graph**, not from
+which file was saved: the last verified graph is kept at
+`.zig-cache/ziglibs-graph.tsv` and compared row by row.
+
+| Graph delta | What runs |
+|---|---|
+| Rows only ADDED | just the new modules (adding `yaml`: ~2 s, not ~510 s) |
+| Any row missing or altered | everything — a module changed shape or vanished, so every reverse-dep closure is stale |
+| Byte-identical | nothing extra |
+| No snapshot yet | everything — there is nothing to compare against |
+
+The snapshot is written only after a run **succeeds**, so a failed run never
+promotes a graph to "known good". `build.zig` is still never parsed by this
+script; `zig build module-graph` remains the only authority.
 
 It then adds the **reverse-dependency closure**: every module that transitively
 depends on a changed one. This is the part that makes the shortcut safe —

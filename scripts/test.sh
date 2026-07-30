@@ -7,6 +7,10 @@
 # script never parses build.zig) plus the reverse-dependency closure of
 # that set, and tests only those.
 #
+# Touching build.zig does NOT by itself mean running everything: the graph is
+# compared against the last verified one, and a purely additive change (a new
+# module) tests only what was added. See the graph-snapshot block below.
+#
 # Usage:
 #   scripts/test.sh                 — same as `changed` with no BASE_REF
 #   scripts/test.sh changed [REF]   — test what changed (vs REF, or the
@@ -66,6 +70,8 @@ NETNS_MODULES="netlink genetlink nl80211 ethtool devlink tc conntrack nftables w
 G_NAMES=()
 G_HEAVY=()
 G_DEPS=()
+G_TSV=""
+GRAPH_ADDED=""
 
 # Populates G_NAMES/G_HEAVY/G_DEPS from `zig build module-graph`. Never
 # silently proceeds with an empty/partial graph — a build failure here
@@ -79,6 +85,7 @@ graph_load() {
         echo "$tsv" >&2
         exit 1
     fi
+    G_TSV="$tsv"
     local name heavy deps
     while IFS=$'\t' read -r name heavy deps; do
         [[ -z "$name" ]] && continue
@@ -90,6 +97,56 @@ graph_load() {
         echo "test.sh: 'zig build module-graph' produced zero modules — refusing to pass vacuously" >&2
         exit 1
     fi
+}
+
+# ── graph snapshot ──────────────────────────────────────────────────────────
+# Touching build.zig used to escalate straight to the full ~510 s run, on the
+# reasoning that the dependency graph might have changed. Usually it has not:
+# ADDING a module appends one row to `module_list` and cannot affect any
+# existing module. Paying the full gate for that is the driver being wrong, not
+# careful — and a gate that expensive for a routine edit is one people learn to
+# skip, which costs more than it saves.
+#
+# So the escalation is decided by the GRAPH, not by which file was saved. The
+# last known-good graph is kept beside the build cache and compared row by row:
+#
+#   rows only in the new graph        -> modules were added; test just those
+#   any row missing or altered       -> a module changed shape or vanished, and
+#                                       the reverse-dep closure can no longer be
+#                                       trusted -> full run
+#   no snapshot yet                  -> nothing to compare against -> full run
+#
+# This keeps the driver's existing rule that `zig build module-graph` is the
+# only authority on the module set; it still never parses build.zig.
+GRAPH_SNAPSHOT=".zig-cache/ziglibs-graph.tsv"
+
+graph_save() {
+    [[ -n "$G_TSV" ]] || return 0
+    mkdir -p "$(dirname "$GRAPH_SNAPSHOT")" 2>/dev/null || return 0
+    printf '%s\n' "$G_TSV" > "$GRAPH_SNAPSHOT" 2>/dev/null || true
+}
+
+# Sets GRAPH_ADDED to the names of modules the graph GAINED and returns 0, or
+# returns 1 if anything else changed (so the caller must run everything).
+# Requires graph_load to have run.
+graph_added_only() {
+    GRAPH_ADDED=""
+    [[ -f "$GRAPH_SNAPSHOT" ]] || return 1
+    local gone
+    # LC_ALL=C on BOTH sorts, and it is load-bearing: `sort` collates by locale
+    # while `comm` compares bytewise, so under cs_CZ (or any non-C locale) comm
+    # reads its input as unsorted and silently returns a WRONG answer. The wrong
+    # answer here fails open — "nothing was removed, no escalation" — i.e. it
+    # would silently under-test. Caught by comm's own "file 1 is not in sorted
+    # order" warning, which is easy to miss because the result still looks
+    # plausible.
+    #
+    # Rows present before but not now: a removal OR an edit (an edited row
+    # shows up as one removal + one addition). Either way the closure is stale.
+    gone="$(comm -23 <(LC_ALL=C sort "$GRAPH_SNAPSHOT") <(printf '%s\n' "$G_TSV" | LC_ALL=C sort))"
+    [[ -n "$gone" ]] && return 1
+    GRAPH_ADDED="$(comm -13 <(LC_ALL=C sort "$GRAPH_SNAPSHOT") <(printf '%s\n' "$G_TSV" | LC_ALL=C sort) | cut -f1 | tr '\n' ' ')"
+    return 0
 }
 
 module_exists() {
@@ -327,7 +384,7 @@ cmd_changed() {
 
     capability_check
 
-    local trigger_all=0 trigger_catalog=0
+    local trigger_all=0 trigger_catalog=0 trigger_graph=0
     local seeds=" " f name
     while IFS= read -r f; do
         [[ -z "$f" ]] && continue
@@ -337,9 +394,18 @@ cmd_changed() {
                 name="${name%%/*}"
                 case "$seeds" in *" $name "*) ;; *) seeds="$seeds$name " ;; esac
                 ;;
-            build.zig|build.zig.zon|.github/*|scripts/*)
+            build.zig|build.zig.zon)
+                # Might have changed the graph — ask the graph, do not assume.
+                trigger_graph=1
+                ;;
+            .github/*|scripts/test.sh|scripts/test-lib.sh|scripts/capped)
+                # The harness or the CI lane definition itself: no narrower set
+                # can be trusted, because what narrows it is the thing that
+                # changed.
                 trigger_all=1
                 ;;
+            scripts/*)
+                ;; # scripts/README.md, scripts/vm/** — no effect on this lane
             README.md)
                 trigger_catalog=1
                 ;;
@@ -368,12 +434,27 @@ cmd_changed() {
     fi
 
     if [[ $trigger_all -eq 1 ]]; then
-        echo "changed: build.zig / build.zig.zon / .github / scripts touched -> the module graph or the harness itself may have changed -> running ALL modules"
+        echo "changed: the harness or the CI lane definition changed -> running ALL modules"
         cmd_all
         return
     fi
 
     graph_load
+
+    if [[ $trigger_graph -eq 1 ]]; then
+        if graph_added_only; then
+            if [[ -n "${GRAPH_ADDED// /}" ]]; then
+                echo "changed: build.zig touched, but the module graph only GAINED rows -> testing those, not all: ${GRAPH_ADDED% }"
+                seeds="$seeds$GRAPH_ADDED"
+            else
+                echo "changed: build.zig touched, but the module graph is byte-identical -> no escalation"
+            fi
+        else
+            echo "changed: the module graph lost or altered a row -> every reverse-dep closure is stale -> running ALL modules"
+            cmd_all
+            return
+        fi
+    fi
 
     local -a valid_seeds=()
     for name in $seeds; do
@@ -386,6 +467,7 @@ cmd_changed() {
 
     if [[ ${#valid_seeds[@]} -eq 0 && $trigger_catalog -eq 0 ]]; then
         echo "changed: no modules affected — nothing to test"
+        graph_save
         exit 0
     fi
 
@@ -412,11 +494,13 @@ cmd_changed() {
     fi
 
     if [[ -z "$closure" ]]; then
+        graph_save
         summary
         exit 0
     fi
 
     run_modules "$closure"
+    graph_save
     summary
 }
 
@@ -436,6 +520,7 @@ cmd_all() {
     step "fmt check" zig fmt --check build.zig build.zig.zon modules
     step "check-catalog" zig build check-catalog
     run_modules "$all_mods"
+    graph_save
     summary
 }
 
