@@ -440,7 +440,143 @@ fn checkCatalog(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anye
         failed = true;
     }
 
+    checkNonGoals(readme, b, &failed);
+
     if (failed) return step.fail("catalog drift — see errors above", .{});
+}
+
+/// Non-goals gate: the "Non-goals — deliberately not built here" section must
+/// not name a capability that IS a module.
+///
+/// The catalog check above only ever reads the section that lists what we HAVE,
+/// so the section listing what we deliberately DON'T have was unguarded and
+/// rotted in one direction: five rows outlived the decision they recorded
+/// (`websocket`, `smtp` and `jinja` were still being sent to third-party libs,
+/// IMAP was "stays unbuilt" after becoming a planned port, HTTP/3 was "not
+/// researched" after being researched). `1c408e6` had fixed two neighbouring
+/// rows by hand a day earlier and missed a third one table up -- which is the
+/// argument for a gate rather than another sweep.
+///
+/// A module name counts as "named" when it occurs with non-alphanumeric
+/// characters on both sides, case-insensitively. That is deliberately narrow:
+/// it fires on `karlseguin/websocket.zig`, `smtp_client.zig` and `vibe-jinja`
+/// (the three real defects) while a name buried inside a longer word never
+/// fires, so `kv` does not match "kvtree" and `http` does not match "https".
+///
+/// What it CANNOT see is a row whose staleness has no lexical trace -- "HTTP/3
+/// (QUIC) — not researched" said nothing about `quic-crypto`, and "Templates"
+/// said nothing about `jinja` except by way of an adopt-candidate that happened
+/// to carry the name. Do not read a green gate as "the section is true"; read
+/// it as "the section names nothing we have built".
+///
+/// A legitimate cross-reference (a non-goal explaining itself in terms of a
+/// module that DOES exist, e.g. `taskqueue` folded into `jobqueue`) is exempted
+/// per name, not per line, with a trailing `<!-- non-goal-ok: name, name -->`.
+/// An exemption naming something the line does not mention is itself an error,
+/// so the exemptions cannot quietly outlive their reason either.
+fn checkNonGoals(readme: []const u8, b: *std.Build, failed: *bool) void {
+    const heading = "## Non-goals";
+    const start = std.mem.indexOf(u8, readme, heading) orelse {
+        std.log.err("README has no \"{s}\" section for the non-goals gate to check", .{heading});
+        failed.* = true;
+        return;
+    };
+    const body_start = start + heading.len;
+    const end = if (std.mem.indexOf(u8, readme[body_start..], "\n## ")) |i|
+        body_start + i
+    else
+        readme.len;
+
+    var line_no = 1 + std.mem.count(u8, readme[0..start], "\n");
+    var lines = std.mem.splitScalar(u8, readme[start..end], '\n');
+    while (lines.next()) |line| : (line_no += 1) {
+        // Search the line with its own marker cut out. The marker names
+        // modules, so leaving it in makes every exemption look justified by
+        // its own text -- and in particular makes the stale-exemption check
+        // below unable to fire at all, which is how it was first written.
+        const body = lineWithoutMarker(line, b);
+        var exempted: std.ArrayList([]const u8) = .empty;
+        for (module_list) |m| {
+            if (!mentionsName(body, m.name)) continue;
+            if (nonGoalExempt(line, m.name)) {
+                exempted.append(b.allocator, m.name) catch @panic("OOM");
+                continue;
+            }
+            std.log.err(
+                "README:{d}: the non-goals section names '{s}', but modules/{s}/ exists — " ++
+                    "either the row is stale (delete it) or the mention is a deliberate " ++
+                    "cross-reference (append `<!-- non-goal-ok: {s} -->` to the line)",
+                .{ line_no, m.name, m.name, m.name },
+            );
+            failed.* = true;
+        }
+        for (nonGoalExemptions(line, b)) |claimed| {
+            if (!containsName(exempted.items, claimed)) {
+                std.log.err(
+                    "README:{d}: `non-goal-ok: {s}` exempts a name this line does not " ++
+                        "mention as an existing module — drop it",
+                    .{ line_no, claimed },
+                );
+                failed.* = true;
+            }
+        }
+    }
+}
+
+/// True when `name` occurs in `haystack` bounded by non-alphanumeric characters
+/// on both sides, case-insensitively. The boundary rule treats `-`, `_`, `/`
+/// and `.` as separators, which is what lets `smtp` match `smtp_client.zig` and
+/// `jinja` match `vibe-jinja`, while keeping a name that is merely a prefix or
+/// an infix of a longer word (`kv` in "kvtree", `tar` in "Structured") silent.
+fn mentionsName(haystack: []const u8, name: []const u8) bool {
+    if (name.len == 0 or name.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i + name.len <= haystack.len) : (i += 1) {
+        if (!std.ascii.eqlIgnoreCase(haystack[i .. i + name.len], name)) continue;
+        if (i > 0 and std.ascii.isAlphanumeric(haystack[i - 1])) continue;
+        const after = i + name.len;
+        if (after < haystack.len and std.ascii.isAlphanumeric(haystack[after])) continue;
+        return true;
+    }
+    return false;
+}
+
+/// The line with its `<!-- non-goal-ok: … -->` marker removed, so a mention
+/// inside the marker cannot stand in for a mention in the prose.
+fn lineWithoutMarker(line: []const u8, b: *std.Build) []const u8 {
+    const marker = "<!-- non-goal-ok:";
+    const idx = std.mem.indexOf(u8, line, marker) orelse return line;
+    const tail = line[idx..];
+    const close = std.mem.indexOf(u8, tail, "-->") orelse return line[0..idx];
+    return std.mem.concat(b.allocator, u8, &.{ line[0..idx], tail[close + 3 ..] }) catch @panic("OOM");
+}
+
+/// The names listed in a line's `<!-- non-goal-ok: a, b -->` marker, or empty.
+fn nonGoalExemptions(line: []const u8, b: *std.Build) []const []const u8 {
+    const marker = "<!-- non-goal-ok:";
+    const idx = std.mem.indexOf(u8, line, marker) orelse return &.{};
+    const after = line[idx + marker.len ..];
+    const close = std.mem.indexOf(u8, after, "-->") orelse after.len;
+
+    var out: std.ArrayList([]const u8) = .empty;
+    var toks = std.mem.splitScalar(u8, after[0..close], ',');
+    while (toks.next()) |tok| {
+        const trimmed = std.mem.trim(u8, tok, " \t");
+        if (trimmed.len > 0) out.append(b.allocator, trimmed) catch @panic("OOM");
+    }
+    return out.toOwnedSlice(b.allocator) catch @panic("OOM");
+}
+
+fn nonGoalExempt(line: []const u8, name: []const u8) bool {
+    const marker = "<!-- non-goal-ok:";
+    const idx = std.mem.indexOf(u8, line, marker) orelse return false;
+    const after = line[idx + marker.len ..];
+    const close = std.mem.indexOf(u8, after, "-->") orelse after.len;
+    var toks = std.mem.splitScalar(u8, after[0..close], ',');
+    while (toks.next()) |tok| {
+        if (std.mem.eql(u8, std.mem.trim(u8, tok, " \t"), name)) return true;
+    }
+    return false;
 }
 
 /// Extract the module names in a README catalog row's Deps column (the

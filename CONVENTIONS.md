@@ -205,6 +205,14 @@ nothing about a `ReleaseFast` one. What an integrator does with that is their ca
 - **Catalog consistency is enforced**: `zig build check-catalog` (run by CI) fails when
   `build.zig`'s `module_list`, the `modules/` directory, and the README catalog table
   disagree, or when the README's module count goes stale.
+- **The Non-goals section is enforced in the other direction**: the same gate fails when
+  README's "Non-goals — deliberately not built here" names a module that exists, so a
+  decision not to build something cannot outlive the day we build it. Five rows had
+  already outlived it (`websocket`, `smtp` and `jinja` were still pointing at third-party
+  libraries) before the check existed. When a non-goal legitimately mentions a module —
+  e.g. `taskqueue` explaining that it was folded into `jobqueue` — append
+  `<!-- non-goal-ok: jobqueue -->` to that line. Exemptions are per name, and an exemption
+  for a name the line does not actually mention is itself an error.
 - **Spin-off policy — when a module leaves the monorepo: by default, never.** The
   collection's dense sibling-dependency graph is version-skew-free only because everything
   builds from one tree (Zig pins dependencies by URL+hash; two repos pinning different
