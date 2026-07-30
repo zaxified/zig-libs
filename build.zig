@@ -172,6 +172,7 @@ const module_list = [_]Module{
     .{ .name = "argsafe" },
     .{ .name = "sessions", .deps = &.{ "router", "http", "cookies", "ramcache" } },
     .{ .name = "jobqueue", .deps = &.{"kv"} },
+    .{ .name = "reconcilable", .deps = &.{"resilience"} },
     .{ .name = "llmclient", .deps = &.{"http"} },
     .{ .name = "rawsock", .deps = &.{"netaddr"} },
     .{ .name = "encoding" },
