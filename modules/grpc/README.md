@@ -1,25 +1,25 @@
 # grpc
 
-A **gRPC client** over HTTP/2, per the [`grpc-over-http2`](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md)
+A **gRPC client and server** over HTTP/2, per the [`grpc-over-http2`](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md)
 protocol specification. It is the third piece of a stack whose other two already live here:
-the multiplexing HTTP/2 client in [`http`](../http) carries the bytes, [`protobuf`](../protobuf)
-codes the messages, and this module is the layer between them — the five-byte
-Length-Prefixed-Message envelope, the header/trailer contract, the status, and the metadata.
-There is **no code generation**: a service method is a path string and its messages are ordinary
-Zig structs with a `pb_fields` descriptor.
+the multiplexing HTTP/2 client and server in [`http`](../http) carry the bytes,
+[`protobuf`](../protobuf) codes the messages, and this module is the layer between them — the
+five-byte Length-Prefixed-Message envelope, the header/trailer contract, the status, and the
+metadata. There is **no code generation**: a service method is a name and its messages are
+ordinary Zig structs with a `pb_fields` descriptor.
 
 - **Model after:** the published `grpc-over-http2` protocol specification. Verified live against
-  **Python `grpcio` 1.83** (the reference implementation), which is also the first third-party
-  HTTP/2 peer the `http` module's h2 client has talked to.
-- **Platform:** any. **Role:** client. **Concurrency:** single-owner (one task drives a channel).
+  **Python `grpcio` 1.83** (the reference implementation) in **both directions** — as the server
+  our client calls, and as the client calling our server. It is also the first third-party
+  HTTP/2 peer the `http` module's h2 client and h2 server have talked to.
+- **Platform:** any. **Role:** both. **Concurrency:** single-owner (one task drives a channel;
+  the server's handlers run on the connection's task).
 - **Deps:** `http`, `protobuf`.
 
-Provenance: the `grpc-over-http2` protocol specification is a public specification (merger
-doctrine — CONVENTIONS.md §5); clean-room, no gRPC implementation source ported or studied. The
-Python `grpcio` package is run as a black-box test oracle only. No NOTICE entry needed.
-
-**Client only.** There is no gRPC server here, and that is a scope decision with a concrete
-cause — see [SPEC.md](SPEC.md).
+Provenance: the `grpc-over-http2` protocol specification and `doc/compression.md` are public
+specifications (merger doctrine — CONVENTIONS.md §5); clean-room, no gRPC implementation source
+ported or studied. The Python `grpcio` package is run as a black-box test oracle only. No NOTICE
+entry needed.
 
 ## Quick start
 
@@ -180,24 +180,118 @@ try call.finish();
 `grpc.frame` exposes the Length-Prefixed-Message envelope on its own (`Deframer`,
 `encodeAlloc`), which is also what gRPC-Web rides on.
 
+## Server
+
+```zig
+const M = grpc.Methods(EchoRequest, EchoReply);
+
+fn unary(c: *grpc.ServerCall, req: EchoRequest) anyerror!EchoReply {
+    if (req.text.len == 0) return c.fail(.invalid_argument, "text is required");
+    return .{ .text = try std.fmt.allocPrint(c.arena, "echo:{s}", .{req.text}) };
+}
+fn ticks(s: *M.Stream, req: EchoRequest) anyerror!void {
+    var i: i32 = 0;
+    while (i < req.count) : (i += 1) try s.send(.{ .index = i });
+}
+
+var router: grpc.Router = .{ .gpa = gpa, .services = &.{.{
+    .name = "echo.Echo",
+    .methods = &.{ M.unary("Unary", unary), M.serverStreaming("ServerStream", ticks) },
+}} };
+
+var srv = http.Server.init(io, gpa, router.httpOptions(.{
+    .handler = grpc.handleHttp, .port = 50051,
+}));
+defer srv.deinit();
+try srv.listen();
+```
+
+`Router.httpOptions` wires the handler, the context and the HTTP/2 streaming predicate together
+— they all have to agree about which router they mean, and this is the one place that can
+guarantee it. It forces `enable_h2c` on, because gRPC is HTTP/2 only. Over TLS, terminate it
+yourself and call `http.h2_server.serveStream` with `Router.h2ServerOptions` instead.
+
+**Registration is a data table, not comptime reflection.** `Service(MyImpl)` scanning a struct's
+decls was rejected because the *call shape* cannot be read off a Zig signature without guessing:
+`fn(*Stream) !Rep` could be client-streaming or a unary method that likes streams, and inferring
+it means an accidental signature change silently rewrites a published method's wire contract.
+Naming the shape at the call site makes a mismatched implementation a compile error instead. A
+`.proto` service is data in every other gRPC stack, so a table also maps onto it one-to-one and
+can be assembled at run time from configuration; the methods themselves stay comptime-typed.
+
+The four constructors are `M.unary`, `M.serverStreaming`, `M.clientStreaming`,
+`M.bidiStreaming`, plus `grpc.Method.raw` for opaque byte messages. A handler fails with
+`return c.fail(.not_found, "…")` (or `c.failFmt`), reads request metadata with
+`c.metadataValue`, sends its own with `c.addInitialMetadata` /
+`c.declareTrailingMetadata` + `c.setTrailingMetadata`, and sees the client's deadline through
+`c.remaining()` / `c.expired()`.
+
+### The response contract
+
+Two legal shapes, and they are not variants of each other:
+
+| | frames |
+|---|---|
+| normal | `HEADERS(200, content-type, Trailer)` · `DATA…` · `HEADERS(grpc-status, …) END_STREAM` |
+| Trailers-Only | `HEADERS(200, content-type, grpc-status, …) END_STREAM` — **one** field block, no DATA |
+
+In the second, `grpc-status` is a *header*, not a trailer. A response is Trailers-Only exactly
+when nothing has gone out ahead of the status — which includes a **successful** call that
+produced no message, not only errors. There is one predicate for this (`head_committed`), it
+flips in one place (`commitHead`, reached only from `send`/`sendInitialMetadata`), and that
+place is the only caller of `ResponseWriter.declareTrailers`, so a response either has a trailer
+section and went through it or does not and never did.
+
+### Request validation
+
+| condition | answer |
+|---|---|
+| `:method` is not POST | **405** + `Allow: POST` (HTTP, not gRPC — a gRPC error is HTTP 200) |
+| `content-type` does not begin `application/grpc` | **415** (spec: SHOULD) |
+| malformed path, unknown service, unknown method | `grpc-status` **12 UNIMPLEMENTED**, Trailers-Only |
+| `grpc-encoding` this build cannot undo | **12 UNIMPLEMENTED** + `grpc-accept-encoding: identity` |
+| malformed `grpc-timeout` | **13 INTERNAL** — never silently ignored |
+| request message over `max_recv_message_size` | **8 RESOURCE_EXHAUSTED**, refused at the 5-byte header |
+
+### Deadlines
+
+`grpc-timeout` is parsed, surfaced (`c.remaining()`, `c.expired()`) and enforced at every engine
+boundary — before dispatch, around each `receive`, before each `send`. It cannot be enforced
+*during* a blocking body read: handlers run on the connection's task and the h2 request-body
+reader has no deadline hook, so `http`'s own `read_timeout_ms` / `request_timeout_ms` are the
+transport-level backstop. The clock is injected (`ServerOptions.clock`), so deadline tests are
+exact and never sleep.
+
 ## Verify
 
 ```bash
-zig build test-grpc --summary all      # 82 tests
+zig build test-grpc --summary all
 ```
 
-The interop tests drive **Python `grpcio`** as an external oracle: a real gRPC server is stood
-up on an ephemeral loopback port and our client makes real calls against it — all four shapes, a
-Trailers-Only failure, a status in a trailer section after a body, metadata both ways including
-`-bin`, a deadline the reference reads back, a 256 KiB reply reassembled across DATA frames, and
-the receive limit refusing an oversized one. They **skip loudly** (never silently, never as a
-failure) when the interpreter or `grpcio` is missing; set `GRPC_PYTHON` to point at a virtualenv
-and `ZIG_LIBS_VERBOSE_SKIP=1` to see skip reasons.
+The interop tests drive **Python `grpcio`** as an external oracle in **both directions**:
+
+- *our client → the reference server*: all four shapes, a Trailers-Only failure, a status in a
+  trailer section after a body, metadata both ways including `-bin`, a deadline the reference
+  reads back, a 256 KiB reply reassembled across DATA frames, and the receive limit refusing an
+  oversized one;
+- *the reference client → our server*: the same twelve observations, this time with everything
+  **we produce** under a real parser — which is the stronger direction, because a client that
+  mis-frames can still be understood by a lenient peer while a server that mis-frames cannot.
+
+Offline, the server tests put an `h2.Connection` in client role on the other end of
+`h2_server.serve` and assert on **frames**, not field values: how many HEADERS blocks, which one
+carried END_STREAM, whether a DATA frame exists at all. That is the only way to see the
+Trailers-Only distinction, since both shapes use the same field names.
+
+All of them **skip loudly** (never silently, never as a failure) when the interpreter or
+`grpcio` is missing; set `GRPC_PYTHON` to point at a virtualenv and `ZIG_LIBS_VERBOSE_SKIP=1` to
+see skip reasons.
 
 ## Not implemented
 
 Message **compression** (`grpc-encoding` other than `identity`) — a compressed frame is refused
-with `INTERNAL` rather than handed to the decoder as if it were plaintext. **Retries**, **channel
-load balancing / name resolution**, **`grpc-status-details-bin`** (the `google.rpc.Status`
-detail payload), **gRPC-Web** framing, **reflection/health** services, and a **server**. See
+rather than handed to the decoder as if it were plaintext. **Retries**, **channel load balancing
+/ name resolution**, **`grpc-status-details-bin`** (the `google.rpc.Status` detail payload),
+**gRPC-Web** framing, and **reflection/health** services. On the server: concurrent handlers (the
+h2 server runs one connection's streams sequentially) and preemptive deadline cancellation. See
 SPEC.md for why each.

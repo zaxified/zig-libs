@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: MIT
-//! grpc — a **gRPC client** over HTTP/2, per the `grpc-over-http2` protocol
-//! specification.
+//! grpc — a **gRPC client and server** over HTTP/2, per the
+//! `grpc-over-http2` protocol specification.
 //!
 //! It is the third piece of a stack whose other two already exist here: the
-//! multiplexing HTTP/2 client in `http` carries the bytes, `protobuf` codes
-//! the messages, and this module is the thin, exacting layer between them —
-//! the five-byte length prefix, the header/trailer contract, and the status.
+//! multiplexing HTTP/2 client and server in `http` carry the bytes,
+//! `protobuf` codes the messages, and this module is the thin, exacting
+//! layer between them — the five-byte length prefix, the header/trailer
+//! contract, and the status.
 //!
 //! ```zig
+//! // client
 //! var hs = try client.connectH2c("127.0.0.1", port, .{});
 //! defer hs.close();
 //! var ch = grpc.Channel.overH2Session(hs, .{});
@@ -18,21 +20,22 @@
 //! std.debug.print("{s}\n", .{reply.value.text});
 //! ```
 //!
-//! All four call shapes are supported and are the *same* engine used
-//! differently (`call.zig` explains why): `unary`, and the `Stream` type for
-//! server-streaming, client-streaming and bidirectional calls.
+//! ```zig
+//! // server
+//! const M = grpc.Methods(EchoRequest, EchoReply);
+//! var router: grpc.Router = .{ .gpa = gpa, .services = &.{.{
+//!     .name = "echo.Echo",
+//!     .methods = &.{ M.unary("Unary", myUnary), M.bidiStreaming("Bidi", myBidi) },
+//! }} };
+//! var srv = http.Server.init(io, gpa, router.httpOptions(.{
+//!     .handler = grpc.handleHttp, .port = 50051,
+//! }));
+//! try srv.listen();
+//! ```
 //!
-//! ## Client only — and why
-//!
-//! There is no gRPC **server** here, for a concrete reason: `http`'s HTTP/2
-//! server (`h2_server.zig`) accumulates a request body into `job.body` and
-//! dispatches the handler only once `job.complete` is set. It has no
-//! streaming handler surface, so a server built on it could answer unary
-//! calls and nothing else — a client-streaming or bidirectional RPC would
-//! have to buffer the whole request before the handler ever ran, which is
-//! not gRPC. Serving gRPC needs the same incremental work on the server side
-//! that the client side already had, and that is its own task. A half-server
-//! would be worse than none. See SPEC.md.
+//! All four call shapes are supported on both sides and are the *same*
+//! engine used differently (`call.zig` and `server.zig` explain why):
+//! `unary` and `Stream` on the client, `Methods(Req, Rep)` on the server.
 //!
 //! ## The security-critical part
 //!
@@ -40,21 +43,25 @@
 //! `frame.zig`: the declared length never sizes an allocation, and
 //! `Options.max_recv_message_size` (4 MiB, gRPC's own default) is enforced
 //! the instant the 5-byte header completes — a 5-byte frame claiming 4 GiB
-//! fails the call with `RESOURCE_EXHAUSTED` and buffers nothing.
+//! fails the call with `RESOURCE_EXHAUSTED` and buffers nothing. That is one
+//! `Deframer` and therefore one property, on both sides: the server enforces
+//! it against request messages exactly as the client does against replies.
 //!
 //! Provenance: clean-room from the published `grpc-over-http2` protocol
-//! specification (a public specification — CONVENTIONS.md §5); no gRPC
-//! implementation source was ported or studied. The Python `grpcio` package
-//! is run as a black-box test oracle only. No NOTICE entry needed.
+//! specification and `doc/compression.md` (public specifications —
+//! CONVENTIONS.md §5); no gRPC implementation source was ported or studied.
+//! The Python `grpcio` package is run as a black-box test oracle only, in
+//! both directions — as the server our client calls, and as the client
+//! calling our server. No NOTICE entry needed.
 
 const std = @import("std");
 const protobuf = @import("protobuf");
 
 pub const meta = .{
     .platform = .any,
-    .role = .client,
+    .role = .both,
     .concurrency = .single_owner, // one task drives a Channel's session
-    .model_after = "the grpc-over-http2 protocol specification; verified live against Python grpcio (the reference implementation)",
+    .model_after = "the grpc-over-http2 protocol specification; verified live against Python grpcio (the reference implementation), in both directions",
     .deps = .{ "http", "protobuf" },
 };
 
@@ -62,6 +69,7 @@ const call_mod = @import("call.zig");
 const frame_mod = @import("frame.zig");
 const status_mod = @import("status.zig");
 const metadata_mod = @import("metadata.zig");
+const server_mod = @import("server.zig");
 
 // ── status ──────────────────────────────────────────────────────────────────
 
@@ -219,6 +227,35 @@ pub fn unary(
     return reply;
 }
 
+// ── server ──────────────────────────────────────────────────────────────────
+
+/// Everything server-side, one namespace deep, for callers who prefer
+/// `grpc.server.Router` to the flat re-exports below.
+pub const server = server_mod;
+
+/// The routing table plus policy: hand it services and wire it into
+/// `http.Server` with `Router.httpOptions` (or `h2_server` via
+/// `Router.h2ServerOptions`). See `server.zig` for why registration is a
+/// data table rather than comptime reflection over a struct's decls.
+pub const Router = server_mod.Router;
+/// One service: the `{Service}` half of `/{Service}/{Method}`.
+pub const Service = server_mod.Service;
+/// One method. Build these with `Methods(Req, Rep)`, or `Method.raw` for a
+/// codec other than protobuf.
+pub const Method = server_mod.Method;
+/// The typed method constructors — one per call shape, so the shape is a
+/// written decision rather than something inferred from a signature.
+pub const Methods = server_mod.Methods;
+/// One server-side RPC: `receive`, `send`, `fail`, plus the metadata and
+/// deadline surfaces.
+pub const ServerCall = server_mod.Call;
+pub const ServerOptions = server_mod.Options;
+pub const ServerError = server_mod.CallError;
+/// Injected monotonic clock for `grpc-timeout` enforcement.
+pub const Clock = server_mod.Clock;
+/// `http.Server.Handler` for a `Router` — installed by `Router.httpOptions`.
+pub const handleHttp = server_mod.handleHttp;
+
 test {
     // Every submodule's tests, explicitly — a `pub const` re-export does not
     // pull them in (CONVENTIONS.md §6.3, the dark-tests rule).
@@ -228,5 +265,6 @@ test {
     _ = call_mod;
     _ = @import("call_test.zig");
     _ = @import("adversarial.zig");
+    _ = server_mod;
     _ = @import("reference_interop.zig");
 }

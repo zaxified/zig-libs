@@ -23,15 +23,36 @@
 //! trailer sections underneath these calls are all being validated against a
 //! stack that has never seen our code.
 //!
+//! ## Both directions, and why the second one is the stronger test
+//!
+//! The first half of this file points **our client** at the reference
+//! server. The second half turns it round: the reference `grpcio` **client**
+//! calls **our server** (`testdata/reference_client.py`).
+//!
+//! That direction is worth more. A client that frames wrongly can still be
+//! understood by a lenient peer — a length prefix that is one byte off is
+//! usually recoverable at the far end — but a server that frames wrongly
+//! fails visibly, because the peer has to find every message boundary, the
+//! trailer section and the status without help. Everything our server
+//! *produces* is under a real parser here: the 5-byte prefixes, the choice
+//! between a Trailers-Only field block and a trailer section, the
+//! percent-encoded `grpc-message`, and the `-bin` metadata base64.
+//!
 //! ## What is driven
 //!
-//! All four call shapes (unary, server-streaming, client-streaming,
-//! bidirectional), plus: a call that fails with a real `grpc-status` in a
-//! real **Trailers-Only** response; a call that streams messages and *then*
-//! fails, so the status arrives in a trailer section instead; metadata in
-//! both directions including `-bin` keys; `grpc-timeout` read back by the
-//! reference; a reply large enough to be split across many DATA frames; and
-//! the receive limit refusing an oversized one.
+//! In both directions: all four call shapes (unary, server-streaming,
+//! client-streaming, bidirectional), plus a call that fails with a real
+//! `grpc-status` in a real **Trailers-Only** response; a call that streams
+//! messages and *then* fails, so the status arrives in a trailer section
+//! instead; metadata in both sections including `-bin` keys; `grpc-timeout`
+//! read back by the far side; a message large enough to be split across many
+//! DATA frames; and the receive limit refusing an oversized one.
+//!
+//! Every call the Python client makes carries a deadline, and the script
+//! carries a watchdog that exits the process regardless. Mis-framing against
+//! a real peer does not fail, it **hangs** — the peer believes a bogus length
+//! and waits — so a framing bug has to surface as a timeout rather than as a
+//! stuck suite.
 //!
 //! Tests **skip loudly** (never silently, never as a failure) when the
 //! interpreter or `grpcio` is missing. Set `GRPC_PYTHON` to point at a
@@ -481,4 +502,351 @@ test "LIVE grpcio: several calls multiplexed on one HTTP/2 connection" {
     try a.finish();
     try b.finish();
     try c.finish();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// The other direction: the reference grpcio CLIENT calling OUR server.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const server = @import("server.zig");
+const frame = @import("frame.zig");
+const Writer = std.Io.Writer;
+
+const M = server.Methods(EchoRequest, EchoReply);
+
+/// The same `echo.Echo` contract `reference_server.py` implements, served by
+/// us this time — so the reference client's expectations are unchanged and
+/// only the producer of the bytes has swapped sides.
+fn srvUnary(c: *server.Call, req: EchoRequest) anyerror!EchoReply {
+    return .{
+        .text = try std.fmt.allocPrint(c.arena, "echo:{s}", .{req.text}),
+        .index = req.count,
+        .blob = req.blob,
+    };
+}
+
+fn srvServerStream(s: *M.Stream, req: EchoRequest) anyerror!void {
+    var i: i32 = 0;
+    while (i < req.count) : (i += 1) {
+        try s.send(.{
+            .text = try std.fmt.allocPrint(s.call.arena, "{s}-{d}", .{ req.text, i }),
+            .index = i,
+        });
+    }
+}
+
+fn srvClientStream(s: *M.Stream) anyerror!EchoReply {
+    var parts: std.ArrayList([]const u8) = .empty;
+    var n: i32 = 0;
+    while (try s.receive()) |*r| {
+        defer @constCast(r).deinit();
+        try parts.append(s.call.arena, try s.call.arena.dupe(u8, r.value.text));
+        n += 1;
+    }
+    return .{ .text = try std.mem.join(s.call.arena, "|", parts.items), .index = n };
+}
+
+fn srvBidi(s: *M.Stream) anyerror!void {
+    var i: i32 = 0;
+    while (try s.receive()) |*r| {
+        defer @constCast(r).deinit();
+        try s.send(.{
+            .text = try std.fmt.allocPrint(s.call.arena, "re:{s}", .{r.value.text}),
+            .index = i,
+        });
+        i += 1;
+    }
+}
+
+/// Fails before anything has gone out → a Trailers-Only response, with a
+/// trailing-metadata field alongside the status so the reference has to find
+/// that in the same field block.
+fn srvFail(c: *server.Call, req: EchoRequest) anyerror!EchoReply {
+    try c.setTrailingMetadata(.{ .name = "x-why", .value = "because" });
+    return c.fail(@enumFromInt(@as(u32, @intCast(req.count))), req.text);
+}
+
+fn srvStreamFail(s: *M.Stream, req: EchoRequest) anyerror!void {
+    var i: i32 = 0;
+    while (i < req.count) : (i += 1) {
+        try s.send(.{ .text = "partial", .index = i });
+    }
+    return s.call.failFmt(.data_loss, "gave up after {d}", .{req.count});
+}
+
+fn srvEmpty(s: *M.Stream, req: EchoRequest) anyerror!void {
+    _ = s;
+    _ = req;
+}
+
+fn srvBig(c: *server.Call, req: EchoRequest) anyerror!EchoReply {
+    const n: usize = @intCast(@max(0, req.count));
+    const blob = try c.arena.alloc(u8, n);
+    @memset(blob, 0x5a);
+    return .{ .text = "big", .index = req.count, .blob = blob };
+}
+
+fn srvMeta(c: *server.Call, req: EchoRequest) anyerror!EchoReply {
+    _ = req;
+    const probe = c.metadataValue("x-probe") orelse "-";
+    const bin: []const u8 = if (try c.metadataValueDecoded("x-probe-bin")) |d| blk: {
+        defer d.deinit(c.gpa);
+        break :blk try c.arena.dupe(u8, d.bytes);
+    } else "";
+    try c.addInitialMetadata(.{ .name = "x-echo", .value = probe });
+    try c.addInitialMetadata(.{ .name = "x-echo-bin", .value = bin });
+    try c.declareTrailingMetadata(&.{ "x-tail", "x-tail-bin" });
+    try c.setTrailingMetadata(.{ .name = "x-tail", .value = probe });
+    try c.setTrailingMetadata(.{ .name = "x-tail-bin", .value = bin });
+    return .{ .text = probe, .index = @intCast(bin.len), .blob = bin };
+}
+
+/// Reports a *band* rather than a number, so the assertion on the far side is
+/// exact against a real clock: −1 = no deadline, 1 = a deadline in
+/// (29 s, 31 s], 2 = a deadline somewhere else.
+///
+/// The band is narrow enough to be evidence and wide enough to be stable. For
+/// a 30 s call the reference sends `grpc-timeout: 30100m` — it pads the
+/// deadline by 100 ms — so the upper edge has to be above 30 s. It is 31 s
+/// and not 31 *minutes*, which is what makes the band prove the **unit** too:
+/// reading `m` as minutes instead of milliseconds turns 30100 into three
+/// weeks, and a wider band would have accepted that silently.
+fn srvDeadline(c: *server.Call, req: EchoRequest) anyerror!EchoReply {
+    _ = req;
+    // `text` carries the reference's own `grpc-timeout` rendering back, so a
+    // band that comes out wrong says *why* rather than just failing.
+    const raw = c.metadataValue("grpc-timeout") orelse "none";
+    const ns = c.remaining() orelse return .{ .text = raw, .index = -1 };
+    const in_band = ns > 29 * std.time.ns_per_s and ns <= 31 * std.time.ns_per_s;
+    return .{ .text = raw, .index = if (in_band) 1 else 2 };
+}
+
+const interop_service: server.Service = .{
+    .name = "echo.Echo",
+    .methods = &.{
+        M.unary("Unary", srvUnary),
+        M.serverStreaming("ServerStream", srvServerStream),
+        M.clientStreaming("ClientStream", srvClientStream),
+        M.bidiStreaming("Bidi", srvBidi),
+        M.unary("Fail", srvFail),
+        M.serverStreaming("StreamFail", srvStreamFail),
+        M.serverStreaming("Empty", srvEmpty),
+        M.unary("Big", srvBig),
+        M.unary("Meta", srvMeta),
+        M.unary("Deadline", srvDeadline),
+    },
+};
+
+const client_script = @embedFile("testdata/reference_client.py");
+
+/// Every `KEY\tVALUE` line the reference client printed.
+const Report = struct {
+    gpa: std.mem.Allocator,
+    text: []u8,
+
+    fn get(r: Report, key: []const u8) ?[]const u8 {
+        var it = std.mem.splitScalar(u8, r.text, '\n');
+        while (it.next()) |line| {
+            const tab = std.mem.indexOfScalar(u8, line, '\t') orelse continue;
+            if (std.mem.eql(u8, line[0..tab], key)) return line[tab + 1 ..];
+        }
+        return null;
+    }
+
+    fn expect(r: Report, key: []const u8, want: []const u8) !void {
+        const got = r.get(key) orelse {
+            std.debug.print("\nreference client never reported `{s}`; full report:\n{s}\n", .{ key, r.text });
+            return error.MissingObservation;
+        };
+        if (!std.mem.eql(u8, got, want)) {
+            std.debug.print(
+                "\n`{s}`: reference client reported `{s}`, expected `{s}`\nfull report:\n{s}\n",
+                .{ key, got, want, r.text },
+            );
+            return error.WrongObservation;
+        }
+    }
+
+    fn deinit(r: Report) void {
+        r.gpa.free(r.text);
+    }
+};
+
+fn serveWrap(s: *http.Server) void {
+    s.serve() catch {};
+}
+
+/// Stand our gRPC server up on a loopback port, run the reference client
+/// against it once, and collect everything it reported.
+fn driveReferenceClient(gpa: std.mem.Allocator) !Report {
+    if (builtin.os.tag != .linux) return skip("grpc reference interop is exercised on Linux");
+    var path_buf: [512]u8 = undefined;
+    const python = interpreter(&path_buf);
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try requireGrpcio(io, python);
+
+    var router: grpc.Router = .{
+        .gpa = gpa,
+        .services = &.{interop_service},
+        // Deliberately below the oversized request the client sends, and
+        // above everything else it sends.
+        .options = .{ .max_recv_message_size = 64 * 1024 },
+    };
+    var srv = http.Server.init(io, gpa, router.httpOptions(.{
+        .handler = grpc.handleHttp,
+        .addr = "127.0.0.1",
+        .max_body_bytes = 8 << 20,
+    }));
+    srv.bind() catch return skip("could not bind a loopback port for the gRPC server");
+    const port = srv.boundAddress().getPort();
+    const th = std.Thread.spawn(.{}, serveWrap, .{&srv}) catch {
+        srv.deinit();
+        return skip("could not spawn the serving thread");
+    };
+    defer {
+        srv.shutdown();
+        th.join();
+        srv.deinit();
+    }
+
+    var port_buf: [16]u8 = undefined;
+    const port_str = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
+
+    var child = std.process.spawn(io, .{
+        .argv = &.{ python, "-c", client_script, port_str },
+        .stdin = .close,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    }) catch return skip("could not spawn the grpcio reference client");
+
+    // Read stdout to EOF. The child cannot outlive its own watchdog, so this
+    // read terminates even if our framing wedges the RPC — which is the
+    // point: a framing bug against a real peer HANGS rather than failing.
+    var collected: std.ArrayList(u8) = .empty;
+    errdefer collected.deinit(gpa);
+    var read_buf: [4096]u8 = undefined;
+    var out_reader = child.stdout.?.reader(io, &read_buf);
+    while (true) {
+        var w: Writer = .fixed(&read_buf);
+        const n = out_reader.interface.stream(&w, .limited(read_buf.len)) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => break,
+        };
+        if (n == 0) continue;
+        try collected.appendSlice(gpa, w.buffered());
+    }
+
+    var err_buf: [8192]u8 = undefined;
+    var err_reader = child.stderr.?.reader(io, &err_buf);
+    var stderr_text: std.ArrayList(u8) = .empty;
+    defer stderr_text.deinit(gpa);
+    while (true) {
+        var w: Writer = .fixed(&err_buf);
+        const n = err_reader.interface.stream(&w, .limited(err_buf.len)) catch break;
+        if (n == 0) continue;
+        stderr_text.appendSlice(gpa, w.buffered()) catch break;
+    }
+
+    const term = child.wait(io) catch return skip("the reference client could not be waited on");
+    const text = try collected.toOwnedSlice(gpa);
+    errdefer gpa.free(text);
+    switch (term) {
+        .exited => |code| if (code != 0) {
+            std.debug.print(
+                "\nreference client exited {d}\nstdout:\n{s}\nstderr:\n{s}\n",
+                .{ code, text, stderr_text.items },
+            );
+            return error.ReferenceClientFailed;
+        },
+        else => {
+            std.debug.print("\nreference client terminated abnormally\nstderr:\n{s}\n", .{stderr_text.items});
+            return error.ReferenceClientFailed;
+        },
+    }
+    return .{ .gpa = gpa, .text = text };
+}
+
+// One server, one run of the reference client, every observation asserted.
+//
+// Deliberately a single test: standing the server up and starting a Python
+// interpreter with grpcio costs about a second, and splitting this into
+// twelve tests would pay that twelve times for no extra evidence — the
+// observations are independent of each other, and a failing one names itself.
+test "LIVE grpcio (as CLIENT): the reference drives all four shapes against OUR server" {
+    const gpa = testing.allocator;
+    const report = try driveReferenceClient(gpa);
+    defer report.deinit();
+
+    // The script ran to the end; nothing timed out.
+    try report.expect("DONE", "1");
+
+    // ── unary ──
+    try report.expect("unary.text", "echo:hello reference");
+    try report.expect("unary.index", "7");
+    try report.expect("unary.blob", "00ff10");
+    try report.expect("unary.code", "OK");
+
+    // ── server-streaming: five separate messages, deframed by the reference ──
+    try report.expect("serverstream.texts", "tick-0,tick-1,tick-2,tick-3,tick-4");
+    try report.expect("serverstream.code", "OK");
+
+    // ── client-streaming ──
+    try report.expect("clientstream.text", "a|bb|ccc");
+    try report.expect("clientstream.index", "3");
+    try report.expect("clientstream.code", "OK");
+
+    // ── bidirectional ──
+    try report.expect("bidi.texts", "re:one,re:two,re:three");
+
+    // ── an error before any message ──
+    try report.expect("fail.code", "PERMISSION_DENIED");
+    // The message contained a newline, a multi-byte UTF-8 sequence and a
+    // literal '%' — every class of byte the grpc-message ABNF forbids. The
+    // reference's percent-decoder reproduced it exactly, which is what says
+    // our ENcoder is right.
+    try report.expect("fail.details_match", "1");
+    // …and the trailing metadata that rode in the same single field block.
+    try report.expect("fail.x_why", "because");
+
+    // ── messages, then a status in a real trailer section ──
+    try report.expect("streamfail.count", "3");
+    try report.expect("streamfail.code", "DATA_LOSS");
+    try report.expect("streamfail.details", "gave up after 3");
+
+    // ── routing ──
+    try report.expect("unknown.code", "UNIMPLEMENTED");
+    try report.expect("unknown.details", "unknown method NoSuchMethod for service echo.Echo");
+
+    // ── metadata, both sections ──
+    try report.expect("meta.body_text", "probe-value");
+    try report.expect("meta.body_blob", "0001feff0a25");
+    try report.expect("meta.initial_ascii", "probe-value");
+    try report.expect("meta.initial_bin", "0001feff0a25");
+    try report.expect("meta.trailing_ascii", "probe-value");
+    try report.expect("meta.trailing_bin", "0001feff0a25");
+    // The reference reports the tail fields as TRAILING and not as initial:
+    // the two sections are really two field blocks on the wire, not one.
+    try report.expect("meta.tail_not_initial", "1");
+
+    // ── grpc-timeout ──
+    // Band 1 = the server saw a deadline in (29 s, 31 s] for a 30 s call,
+    // which needs both the value and the unit read correctly (see
+    // `srvDeadline`). The reference's own rendering, for the record — it
+    // pads the deadline by 100 ms, which is why the band is not (…, 30 s].
+    try report.expect("deadline.raw", "30100m");
+    try report.expect("deadline.band", "1");
+    try report.expect("deadline.none", "-1");
+
+    // ── a reply spanning many DATA frames ──
+    try report.expect("big.len", "49152");
+    try report.expect("big.all_5a", "1");
+
+    // ── the receive limit, against a real producer ──
+    try report.expect("toolarge.code", "RESOURCE_EXHAUSTED");
+
+    // ── a successful call with no message at all (Trailers-Only) ──
+    try report.expect("empty.count", "0");
+    try report.expect("empty.code", "OK");
 }
