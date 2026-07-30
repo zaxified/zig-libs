@@ -356,7 +356,6 @@ not own, and what to reach for instead.
 | Structured logging | `karlseguin/log.zig` | Cleanest "just use it" |
 | S3 | `lobo/aws-sdk-for-zig` | SigV4 built in |
 | Redis/Valkey | `kristoff-it/zig-okredis` (partial/alpha) | Best available design |
-| YAML (flat/nested config) | `kubkon/zig-yaml` / `pwbh/ymlz` (both partial — no anchors/tags) | Fine for config; not 1.2-complete (see full YAML below) |
 
 ### Won't build
 
@@ -364,8 +363,6 @@ not own, and what to reach for instead.
 - **`unaccent`** — fully dependent on external `uucode` tables; not included.
 - **`roquery`** — C-level SQLite hardening (authorizer/query_only enforcement); lives consumer-side over adopted zig-sqlite.
 - **`taskqueue`** — folded into `jobqueue`.
-- **`chunkframe`** — too small to be a module; a documented ~20-LOC pattern instead.
-- **YAML 1.2 (full spec)** — no adoptable complete pure-Zig implementation; the partial libs above cover config use.
-- **Jinja** — Zig comptime templating covers dev-authored use; `vibe-jinja` is a consumer-side pilot option for runtime `.jinja` corpora only.
+- **`chunkframe`** — too small to be a module: ~20 lines of clamps with no state. Written out instead at its consumer, `poc-wf-analytic/docs/DATA-PLANE.md` ("The chunk-framing pattern"), where both copies of it live.
 - **IMAP** — no mature pure-Zig lib; stays unbuilt.
 - **HTTP/3 (QUIC)** — not researched, stays dropped.
