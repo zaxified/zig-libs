@@ -38,11 +38,13 @@
 //!
 //! The security checks the sage script runs on a candidate matrix
 //! (`algorithm_1`/`2`/`3`, the infinitely-long-subspace-trail tests of
-//! Grassi-Rechberger-Schofnegger) are **not** re-run here; see `mds`'s doc
-//! comment for why that is sound for the shipped parameter sets and what it
-//! would cost to change.
+//! Grassi-Rechberger-Schofnegger) **are** re-run here, in `mds_security.zig`,
+//! and `derive` carries upstream's rejection loop. That is what makes this
+//! generator safe to point at a parameter set nobody has published constants
+//! for; see `derive`'s doc comment.
 
 const std = @import("std");
+const mds_security = @import("mds_security.zig");
 
 /// The 80-bit Grain LFSR, seeded exactly as `init_generator` does.
 ///
@@ -152,8 +154,34 @@ pub fn Tables(comptime cfg: Config) type {
         /// The `t x t` MDS matrix, in the reference script's orientation:
         /// `new[i] = Σ_j mds[i][j] * old[j]`.
         mds: [cfg.t][cfg.t]cfg.Fr,
+        /// How many candidates the rejection loop drew before one was
+        /// accepted — `1` means the first was, i.e. the security checks
+        /// changed nothing about the output. Every parameter set this module
+        /// ships is `1`, and `constants_test.zig` asserts it.
+        mds_candidates: usize,
     };
 }
+
+/// How many MDS candidates `derive` will draw before giving up. Upstream's
+/// loop is unbounded; a bound turns "hangs forever" into a reportable error.
+pub const max_mds_candidates = 64;
+
+/// Everything `derive` can fail with.
+///
+/// All three are "cannot happen for a well-formed prime field and a parameter
+/// set with any security margin at all" — they exist so that a degenerate
+/// input reports instead of hanging or panicking:
+///
+///   - `MdsCandidatesExhausted` — `max_mds_candidates` consecutive rejections;
+///   - `RootIsolationFailed` — Cantor-Zassenhaus could not split a product of
+///     distinct linear factors in 64 deterministic tries (probability ~2^-64
+///     for a random one);
+///   - `NotInvertible` — a zero appeared where the algebra says it cannot.
+pub const Error = error{
+    MdsCandidatesExhausted,
+    RootIsolationFailed,
+    NotInvertible,
+};
 
 /// Runs the generator. One Grain stream produces the round constants first and
 /// the MDS seeds second — they are one derivation, not two.
@@ -163,33 +191,41 @@ pub fn Tables(comptime cfg: Config) type {
 /// you do it), but the Zig interpreter costs roughly 18 µs per LFSR clock on
 /// the machine this was written on: ~5 s for `t = 3` alone and ~200 s for the
 /// full `t = 2..17` sweep, which is not a price a `zig build test-poseidon`
-/// should pay. At run time the whole sweep is milliseconds. circomlibjs makes
-/// the same call — its entry point is an `async buildPoseidon()` that
-/// constructs the tables at startup.
+/// should pay. circomlibjs makes the same call — its entry point is an
+/// `async buildPoseidon()` that constructs the tables at startup.
 ///
-/// ## MDS construction, and what is deliberately not re-run
+/// It is not free at run time either, and the MDS security checks below are
+/// what costs: ~2 ms at `t = 3` and ~70 ms at `t = 17` in an optimized build,
+/// roughly 12x that unoptimized. Build the instance once (`SPEC.md`
+/// §"Performance note").
+///
+/// ## MDS construction and the rejection loop
 ///
 /// The matrix is the reference script's `create_mds_p`: draw `2t` field
 /// elements (reduced, not rejection-sampled), split into `xs`/`ys`, and set
 /// `M[i][j] = (xs[i] + ys[j])^-1` — a **Cauchy matrix**, which is MDS for any
 /// `2t` pairwise-distinct entries.
 ///
-/// Upstream then loops until the candidate passes `algorithm_1`/`2`/`3`,
-/// three subspace-trail security tests needing eigenspaces and kernels over
-/// the field — a linear-algebra layer this repo has no reason to grow. That
-/// loop is only *observable* when a candidate is rejected, because a rejection
-/// consumes more Grain bits and shifts every later draw. For every parameter
-/// set this module ships the first candidate is the accepted one: the derived
-/// matrices are byte-equal to circomlib's for `t = 2..17` on BN254 and to the
-/// authors' own `.sage` files for `t = 3, 5` on BLS12-381, which could not
-/// happen if a rejection had occurred upstream. `constants_test.zig` is what
-/// holds that. Deriving parameters for a *new* `(n, t, R_F, R_P)` with this
-/// code therefore requires running the sage script alongside to confirm the
-/// first candidate was accepted — that is the honest boundary of this port,
-/// and it is why `Config` is not offered as a public "make your own Poseidon"
-/// knob in `root.zig`.
-pub fn derive(comptime cfg: Config) Tables(cfg) {
+/// Upstream's `generate_matrix` then loops until the candidate passes
+/// `algorithm_1`/`2`/`3`, the subspace-trail security tests of
+/// Grassi-Rechberger-Schofnegger. That loop is reproduced here
+/// (`mds_security.isSecure`), and it matters for one specific reason: a
+/// rejection is **not** a no-op. It consumes another `2t` Grain draws, so
+/// every later value shifts. Omitting the tests therefore silently produces
+/// the wrong parameters for any `(n, t, R_F, R_P)` where upstream happened to
+/// reject a candidate.
+///
+/// For every parameter set this module ships the first candidate is the
+/// accepted one — the derived matrices are byte-equal to circomlib's for
+/// `t = 2..17` on BN254 and to the authors' own `.sage` files for `t = 3, 5`
+/// on BLS12-381, which could not happen if a rejection had occurred upstream —
+/// so adding the loop leaves every shipped table untouched. `constants_test.zig`
+/// is what holds that.
+pub fn derive(comptime cfg: Config) Error!Tables(cfg) {
     const Fr = cfg.Fr;
+    // One instantiation per field, not one per width — see `Checks`.
+    comptime std.debug.assert(cfg.t <= mds_security.max_state_width);
+    const checks = mds_security.Checks(Fr, &cfg.modulus_be, mds_security.max_state_width);
     var lfsr: Lfsr = .init(cfg.n, cfg.t, cfg.r_f, cfg.r_p);
     const p = std.mem.readInt(u256, &cfg.modulus_be, .big);
 
@@ -207,69 +243,76 @@ pub fn derive(comptime cfg: Config) Tables(cfg) {
     var attempts: usize = 0;
     while (true) {
         attempts += 1;
-        // Not a security bound — just a guard against an infinite loop if
-        // this is ever pointed at a degenerate parameter set. Every shipped
-        // set converges on the first attempt.
-        if (attempts > 64) @panic("poseidon/grain: MDS generation did not converge");
+        // Not a security bound — a guard so that a degenerate parameter set
+        // reports instead of hanging. Upstream's `while` is unbounded; the
+        // expected number of draws is small (every shipped set converges on
+        // the first attempt), so 64 is "this cannot happen" with room to
+        // spare rather than a tuning knob.
+        if (attempts > max_mds_candidates) return error.MdsCandidatesExhausted;
 
-        var rand_list: [2 * cfg.t]Fr = undefined;
+        // ── `create_mds_p` — its own loop, and it is NOT the security one ──
+        //
+        // Upstream nests two loops. The inner one (here) redraws while the
+        // `2t` values collide or while some `xs[i] + ys[j]` is zero
+        // (`flag == False`); it never runs the algorithms. The outer one
+        // (`generate_matrix`) redraws when a *finished* matrix fails the
+        // security checks. Collapsing them would still consume the right
+        // number of Grain bits, but `mds_candidates` would stop meaning
+        // "security rejections", which is the number the tests pin.
+        var candidate: checks.Mat = undefined;
         while (true) {
-            for (&rand_list) |*e| {
-                var be: [32]u8 = undefined;
-                // Reduction, not rejection: see subtlety 1.
-                std.mem.writeInt(u256, &be, lfsr.nextNum(cfg.n), .big);
-                e.* = Fr.reduceWide(&be);
+            var rand_list: [2 * cfg.t]Fr = undefined;
+            while (true) {
+                for (&rand_list) |*e| {
+                    var be: [32]u8 = undefined;
+                    // Reduction, not rejection: see subtlety 1.
+                    std.mem.writeInt(u256, &be, lfsr.nextNum(cfg.n), .big);
+                    e.* = Fr.reduceWide(&be);
+                }
+                var dup = false;
+                for (0..2 * cfg.t) |i| {
+                    for (i + 1..2 * cfg.t) |j| {
+                        if (rand_list[i].eql(rand_list[j])) dup = true;
+                    }
+                }
+                if (!dup) break;
             }
-            var dup = false;
-            for (0..2 * cfg.t) |i| {
-                for (i + 1..2 * cfg.t) |j| {
-                    if (rand_list[i].eql(rand_list[j])) dup = true;
+
+            // Collect the t*t denominators, then invert them all with one
+            // field inversion (Montgomery's batch trick). Field inversion is
+            // by far the most expensive operation here — Fermat, a full
+            // 254-bit constant-time exponentiation — and t=17 would otherwise
+            // need 289 of them.
+            var denom: [cfg.t * cfg.t]Fr = undefined;
+            var singular = false;
+            for (0..cfg.t) |i| {
+                for (0..cfg.t) |j| {
+                    const sum = rand_list[i].add(rand_list[cfg.t + j]);
+                    if (sum.isZero()) singular = true;
+                    denom[i * cfg.t + j] = sum;
                 }
             }
-            if (!dup) break;
-        }
+            if (singular) continue; // upstream's `flag == False` path: redraw
 
-        // Collect the t*t denominators, then invert them all with one field
-        // inversion (Montgomery's batch trick). Field inversion is by far the
-        // most expensive operation here — Fermat, a full 254-bit constant-time
-        // exponentiation — and t=17 would otherwise need 289 of them.
-        var denom: [cfg.t * cfg.t]Fr = undefined;
-        var singular = false;
-        for (0..cfg.t) |i| {
-            for (0..cfg.t) |j| {
-                const sum = rand_list[i].add(rand_list[cfg.t + j]);
-                if (sum.isZero()) singular = true;
-                denom[i * cfg.t + j] = sum;
+            var inverted: [cfg.t * cfg.t]Fr = undefined;
+            checks.la.batchInv(&denom, &inverted) catch unreachable;
+            for (0..cfg.t) |i| {
+                for (0..cfg.t) |j| candidate[i][j] = inverted[i * cfg.t + j];
             }
+            break;
         }
-        if (singular) continue; // upstream's `flag == False` path: redraw
 
-        const inverted = batchInv(Fr, cfg.t * cfg.t, denom);
+        // Upstream's `generate_matrix` loop. A rejection falls through to the
+        // next iteration, which draws a fresh `2t` values — that consumption
+        // is the whole reason this cannot be skipped.
+        if (!try checks.isSecure(&candidate, cfg.t)) continue;
+
         for (0..cfg.t) |i| {
-            for (0..cfg.t) |j| out.mds[i][j] = inverted[i * cfg.t + j];
+            for (0..cfg.t) |j| out.mds[i][j] = candidate[i][j];
         }
+        out.mds_candidates = attempts;
         return out;
     }
-}
-
-/// Montgomery batch inversion: `k` inverses for one inversion plus `3(k-1)`
-/// multiplications. Every input must be non-zero (the caller checks).
-fn batchInv(comptime Fr: type, comptime k: usize, in: [k]Fr) [k]Fr {
-    var prefix: [k]Fr = undefined;
-    var acc = Fr.one;
-    for (0..k) |i| {
-        prefix[i] = acc; // product of in[0..i)
-        acc = acc.mul(in[i]);
-    }
-    var run = acc.inv() catch unreachable; // no zero inputs
-    var out: [k]Fr = undefined;
-    var i = k;
-    while (i > 0) {
-        i -= 1;
-        out[i] = prefix[i].mul(run);
-        run = run.mul(in[i]);
-    }
-    return out;
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────

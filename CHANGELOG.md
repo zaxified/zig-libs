@@ -419,12 +419,25 @@ Per-module API changes since v0.1.0 worth calling out:
   circomlib rounds `R_P` up to a multiple of `t`, and it ships Poseidon twice
   (a folded/optimized form storing the MDS transposed, and the reference
   form) — this implements the reference form, byte-compatible with both.
-  **Boundaries stated rather than glossed:** the generator's MDS
-  security checks (`algorithm_1/2/3`) are not re-implemented, which is sound
-  only because every shipped parameter set accepts its first candidate — a
-  fact proven by matching all 18 upstream tables, not assumed — so this code
-  **cannot be pointed at a new `(n, t, R_F, R_P)` and trusted** without
-  running the sage script alongside. The permutation is constant-time
+  The generator's MDS subspace-trail security checks
+  (`algorithm_1/2/3` + `check_minpoly_condition`, Grassi-Rechberger-Schofnegger)
+  and the rejection loop around them are now implemented too, on a small
+  `GF(p)` linear-algebra + polynomial layer built for the purpose
+  (`src/linalg.zig`: echelon/rank/kernel, characteristic and order polynomials,
+  pseudo-remainder gcd, Rabin irreducibility, base-field root isolation — all
+  division-free on the hot path, because a field inversion here is ~380
+  multiplications). This **removes the boundary** the module used to carry:
+  `grain.derive` no longer needs a sage run alongside to be trusted on a new
+  `(n, t, R_F, R_P)`. No shipped table changed — all 18 accept their first
+  candidate, now an assertion rather than prose. A rejection is not a no-op
+  (it consumes another `2t` Grain draws, shifting everything after it), and
+  since a 254-bit field rejects with probability ~`2^-236` — zero rejections
+  in a sweep of 816 BN254 parameter sets — that path is exercised over a small
+  prime, where a third of candidates are rejected, and cross-checked against an
+  independent sympy port of the same sage source on the verdict, the sub-code
+  and the failing round. Two provable `O(t^5)` → `O(t^3)` rewrites make it
+  affordable; both ship next to the literal transcription they are tested
+  against. The permutation is constant-time
   (fixed bounds, no data-dependent branch or index) but not
   disassembly-verified, unlike `k256`/`montint`; parameter derivation is not
   constant-time and consumes only public inputs. On BLS12-381 only the

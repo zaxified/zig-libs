@@ -60,6 +60,8 @@ one module does:
              a second copyright holder, no condition beyond MIT's own)
   decimal  — `modules/decimal/NOTICE` (IBM decTest test-case text, reproduced
              with permission; test vectors only, no source code)
+  poseidon — `modules/poseidon/NOTICE` (hadeshash reference sage script, MIT;
+             the parameter generator and the MDS acceptance checks port it)
 
 New modules that reproduce third-party code OR third-party data whose notice
 must be preserved MUST follow the same pattern: a `modules/<name>/NOTICE`
@@ -80,6 +82,19 @@ provenance records kept for honesty and for future auditability, not license
 conditions. A full provenance/license audit was completed 2026-07-09 and
 re-examined 2026-07-29 (both recorded in the project git history).
 
+  poseidon   — the Poseidon permutation and its parameter generation follow
+               eprint 2019/458 (Grassi-Khovratovich-Rechberger-Roy-Schofnegger)
+               and the subspace-trail analysis of eprint 2020/500
+               (Grassi-Rechberger-Schofnegger). The GENERATOR ports IAIK's
+               hadeshash reference sage script (MIT) — attribution in
+               `modules/poseidon/NOTICE`, not here. Design/comparison
+               reference: iden3 `circomlib` + `circomlibjs` (**LGPL-3.0**),
+               used ONLY as a comparison target — `constants_test.zig` pins
+               SHA-256 digests of tables this module derives itself and
+               documents how to re-clone circomlibjs and recompute the
+               comparison. No circomlib source or data is present, so its
+               copyleft terms do not reach this repository. The GF(p) linear
+               algebra (`linalg.zig`) is the authors' own.
   netaddr    — RFC 6724, RFC 5952 (specs); cross-checked vs Go net/addrselect
                (BSD-3-Clause, The Go Authors) + glibc getaddrinfo algorithm.
                The CIDR/prefix operations (Prefix, summarize, mergePrefixes)

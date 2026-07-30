@@ -20,6 +20,13 @@
 //!     reference sage script (`grain.zig`). It runs once per instance, in
 //!     `Perm(t).init()` — see `grain.derive` for why that is at run time and
 //!     not at comptime.
+//!   - The **MDS subspace-trail security checks** the reference generator
+//!     runs on each candidate matrix — `algorithm_1`/`2`/`3` and
+//!     `check_minpoly_condition` (`mds_security.zig`) — and the rejection
+//!     loop around them. A rejection consumes more Grain bits, so leaving
+//!     them out would silently produce the wrong parameters for any set where
+//!     upstream rejected a candidate. None of the 18 sets shipped here does,
+//!     which is why the tables are unchanged.
 //!   - Two field instantiations:
 //!     - `bn254` — circomlib's parameter set, `t = 2..17` (1..16 inputs),
 //!       which is what deployed circom circuits use;
@@ -74,6 +81,13 @@ pub const meta = .{
 /// readable and testable rather than a blob.
 pub const grain = @import("grain.zig");
 
+/// The subspace-trail security checks a candidate MDS matrix has to pass
+/// (`algorithm_1`/`2`/`3` + `check_minpoly_condition` of the reference
+/// generator), and the `GF(p)` linear algebra they are built from. Exposed for
+/// the same reason `grain` is: the rejection rule is part of "where do these
+/// numbers come from", and it should be readable and testable.
+pub const mds_security = @import("mds_security.zig");
+
 /// The generic permutation, parameterised by field + round numbers.
 pub const Permutation = @import("perm.zig").Permutation;
 
@@ -85,11 +99,16 @@ pub const bls12_381 = @import("bls12_381_poseidon.zig");
 
 test {
     _ = grain;
+    _ = mds_security;
+    _ = @import("linalg.zig");
     _ = bn254;
     _ = bls12_381;
     _ = @import("vectors_test.zig");
     _ = @import("constants_test.zig");
     _ = @import("fuzz_test.zig");
+    _ = @import("rejection_test.zig");
+    _ = @import("reference_interop.zig");
+    _ = @import("small_field.zig");
 }
 
 test "meta.deps names the two scalar fields this builds on" {

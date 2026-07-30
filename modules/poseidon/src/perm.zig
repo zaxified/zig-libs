@@ -60,8 +60,21 @@ pub fn Permutation(comptime cfg: Config) type {
 
         /// Derives the round constants and MDS matrix from the Grain LFSR.
         /// Deterministic — no entropy, no allocation, no I/O.
+        ///
+        /// Infallible **for a parameter set that produces one**, which is every
+        /// set this module exposes: `grain.derive`'s error cases are a
+        /// degenerate `(n, t, R_F, R_P)` whose MDS candidates keep getting
+        /// rejected, and they are unreachable for `bn254.Perm`/`bls12_381.Perm`
+        /// — `constants_test.zig` derives all 18 of them. Use `initChecked` if
+        /// you are driving `Permutation` from a `Config` of your own.
         pub fn init() Self {
-            const tables = grain.derive(cfg);
+            return initChecked() catch |err|
+                std.debug.panic("poseidon: parameter derivation failed: {s}", .{@errorName(err)});
+        }
+
+        /// `init` with the derivation's error surfaced rather than panicked on.
+        pub fn initChecked() grain.Error!Self {
+            const tables = try grain.derive(cfg);
             return .{ .round_constants = tables.round_constants, .mds = tables.mds };
         }
 

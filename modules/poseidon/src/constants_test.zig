@@ -197,6 +197,23 @@ test "every R_P is divisible by its t — the fingerprint of circomlib's roundin
     try std.testing.expectEqual(@as(u12, 0), bls.Perm(5).r_p % 5);
 }
 
+test "every shipped parameter set accepts its FIRST MDS candidate" {
+    // The claim `SPEC.md` used to make in prose, now an assertion. Upstream's
+    // `generate_matrix` redraws when `algorithm_1`/`2`/`3` reject a candidate,
+    // and a redraw consumes another `2t` Grain values — so if any of these
+    // were `> 1`, the constants below could not have matched circomlib's.
+    //
+    // Both directions matter. This test says the security checks change
+    // nothing here (so the pins above are unaffected by adding them), and
+    // `rejection_test.zig` says the loop is not dead code.
+    inline for (2..18) |t| {
+        const tab = try grain.derive(bn.Perm(t).config);
+        try std.testing.expectEqual(@as(usize, 1), tab.mds_candidates);
+    }
+    try std.testing.expectEqual(@as(usize, 1), (try grain.derive(bls.Perm(3).config)).mds_candidates);
+    try std.testing.expectEqual(@as(usize, 1), (try grain.derive(bls.Perm(5).config)).mds_candidates);
+}
+
 test "round-constant count is (R_F + R_P) * t for every width" {
     inline for (2..18) |t| {
         const P = bn.Perm(t).init();

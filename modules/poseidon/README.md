@@ -11,9 +11,10 @@ a proof system with nothing cheap to hash with. Poseidon is what the Merkle
 trees, commitments and Fiat-Shamir transcripts inside real circuits are
 actually made of.
 
-**Status: COMPLETE for the shipped parameter sets.** Permutation, fixed-arity
-hash, 2-to-1 compression, and the Grain-LFSR parameter generator, over two
-fields.
+**Status: COMPLETE.** Permutation, fixed-arity hash, 2-to-1 compression, and
+the Grain-LFSR parameter generator — including the MDS subspace-trail security
+checks and the rejection loop around them, so the generator can be aimed at a
+parameter set nobody has published constants for.
 
 **Model-after:** `iden3/circomlib` + `iden3/circomlibjs` (what deployed circom
 circuits use), and the Poseidon authors' own `hadeshash` sage reference.
@@ -29,9 +30,11 @@ circuits use), and the Poseidon authors' own `hadeshash` sage reference.
 > published generator rather than remembering them, and why every claim here
 > is pinned to a byte-exact external vector.
 
-> **Build the instance once.** `Perm(t).init()` runs the parameter generator.
-> It is fast (microseconds) but not free, and the result is immutable — hold
-> one per width for the life of the program.
+> **Build the instance once.** `Perm(t).init()` runs the parameter generator,
+> including the MDS security checks. That is ~2 ms at `t = 3` and ~70 ms at
+> `t = 17` in an optimized build (10x that unoptimized), and the result is
+> immutable — hold one per width for the life of the program. Do not call it
+> per hash.
 
 ## Import
 
@@ -104,8 +107,16 @@ auditor can read off upstream by eye.
 
 ### Mutation — evidence the tests bite
 
-Four deliberate breakages, each reverted, each verified restored by file
-checksum (the module is untracked, so `git diff` had nothing to compare):
+Twelve deliberate breakages, each reverted. The eight aimed at the MDS
+security checks and the rejection loop are tabulated in `SPEC.md`; the sharpest
+is *"a rejection is detected but does not consume its Grain draw"*, which still
+yields a valid, invertible, MDS, perfectly deterministic matrix and is invisible
+to every structural property — only "the accepted matrix is the k-th draw and
+differs from the first" catches it.
+
+The original four, on the permutation and the generator, each verified restored
+by file checksum (the module was untracked at the time, so `git diff` had
+nothing to compare):
 
 | mutation | result |
 |---|---|
@@ -125,13 +136,25 @@ just the three widths upstream's own suite exercises.
 ## Tests
 
 ```sh
-zig build test-poseidon                             # 30 tests, ~5 s in Debug
-zig build test-poseidon -Doptimize=ReleaseFast      # ~0.45 s
+zig build test-poseidon                             # 61 tests, ~42 s in Debug
+zig build test-poseidon -Doptimize=ReleaseFast      # ~3 s
 zig build test-poseidon --fuzz --release=safe       # injectivity harnesses
 ```
 
 `--release=safe` is not optional for `--fuzz`. Green in Debug, ReleaseSafe and
 ReleaseFast.
+
+The Debug lane is slow because `std.crypto.ff`'s constant-time multiply costs
+9.6 µs unoptimized against 0.8 µs optimized, and the MDS security checks are
+~70 000 multiplications at `t = 17`. `SPEC.md` §"Performance note" records why
+marking the module `heavy` was measured and makes it *worse*.
+
+Four tests cross-check the security checks against an independent sympy port
+of the same sage source (`src/testdata/subspace_trail.py`). They **skip
+loudly** without `python3` + `sympy`; set `ZIG_LIBS_VERBOSE_SKIP=1` to see the
+reason. That oracle is grade 2 — a second transcription by the same author,
+not external validation. `SPEC.md` §"Anchoring" is explicit about what it can
+and cannot prove.
 
 ## Not here
 
